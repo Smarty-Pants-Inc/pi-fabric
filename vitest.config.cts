@@ -55,6 +55,19 @@ if (localRealDeleteSuites.length > 0) {
   console.warn(`smarty-dev#4664: local run skips ${localRealDeleteSuites.length} native/tool or reverted deletion suites`);
 }
 
+// Generic CI checks do not own a broker. Exclude whole broker-capable suites before
+// affected-test discovery (including their fake cases); dedicated nats-* jobs run them.
+// Fake-only NATS suites stay in the generic cross-platform selection.
+const realBrokerNatsSuites = [
+  "tests/mesh-state-backend.test.ts",
+  "tests/mesh-state-backend-multiprocess.test.ts",
+  "tests/mesh-backend-migration-nats.test.ts",
+  "tests/state-backend-nats-election.test.ts",
+  "tests/nats-auth-server.test.ts",
+];
+const excludedSuites = [...localRealDeleteSuites,
+  ...(process.env.FABRIC_TEST_SKIP_NATS === "1" ? realBrokerNatsSuites : [])];
+
 // Separate policy projects avoid writing a fixture read by unrelated config tests.
 const policyConstants = (name: string) => ({
   __FABRIC_HOST_POLICY_PATH__: JSON.stringify(join(temp.TMPDIR, `host-policy-${name}`, "fabric-policy.json")),
@@ -65,7 +78,7 @@ const sharedTests = {
   env: { ...temp, ...fleet },
   setupFiles: ["./tests/fleet-isolation-setup.ts"],
   include: ["tests/**/*.test.ts"],
-  ...(localRealDeleteSuites.length > 0 ? { exclude: localRealDeleteSuites } : {}),
+  ...(excludedSuites.length > 0 ? { exclude: excludedSuites } : {}),
   // Real worker processes and cold TypeScript compilers share this suite.
   // Behavioral timeouts and performance budgets remain asserted by tests.
   testTimeout: 15_000,
@@ -91,7 +104,7 @@ module.exports = {
       {
         cacheDir,
         define: policyConstants("missing"),
-        test: { ...sharedTests, name: "default", exclude: [...localRealDeleteSuites,
+        test: { ...sharedTests, name: "default", exclude: [...excludedSuites,
           "tests/session-entry-retention.test.ts", "tests/host-policy.test.ts",
           "tests/process-slice-scope-e2e.test.ts"] },
       },

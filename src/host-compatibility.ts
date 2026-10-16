@@ -2,6 +2,7 @@ import { existsSync, readFileSync, realpathSync } from "node:fs";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { MeshIdentity } from "./mesh/store.js";
 import path from "node:path";
+import { diagnostics } from "./core/diagnostics.js";
 
 // Shared host/agent input metadata lives beside existing public policy errors so
 // eager configuration and lazy launch validation do not add a startup chunk.
@@ -321,10 +322,10 @@ export const fabricProvenanceOptions = <Options extends object | undefined>(
   if (fabricProvenanceSupported(pi)) {
     return { ...options, provenance: typeof provenance === "function" ? provenance() : provenance } as Options & { provenance: FabricTurnProvenance };
   }
-  const diagnostics = globalThis as typeof globalThis & { [key: symbol]: unknown };
-  if (diagnostics[WARNING_KEY] !== true) {
-    diagnostics[WARNING_KEY] = true;
-    console.warn("[pi-fabric] Pi does not advertise hostCapabilities.turnProvenance === 1; delivering without turn provenance (legacy behavior). Upgrade Pi to a host with turn provenance v1 support and configure global turnProvenance.fabricExtensions trust for this Fabric extension.");
+  const warningState = globalThis as typeof globalThis & { [key: symbol]: unknown };
+  if (warningState[WARNING_KEY] !== true) {
+    warningState[WARNING_KEY] = true;
+    diagnostics.warn("src/host-compatibility.ts", "[pi-fabric] Pi does not advertise hostCapabilities.turnProvenance === 1; delivering without turn provenance (legacy behavior). Upgrade Pi to a host with turn provenance v1 support and configure global turnProvenance.fabricExtensions trust for this Fabric extension.");
   }
   return options;
 };

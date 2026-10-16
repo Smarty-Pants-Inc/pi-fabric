@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { EventEmitter } from "node:events";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -14,6 +15,7 @@ import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { createMainExecutionCeilingError } from "../src/async-settlement.js";
 import { removeHostLease, writeHostLease } from "../src/topology/host-leases.js";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
+import { FileControlReader, FileTransport } from "../src/transport/file.js";
 
 const roots: string[] = [];
 const planes: FabricControlPlane[] = [];
@@ -51,6 +53,935 @@ const plane = (
 afterEach(async () => {
   await Promise.all(planes.splice(0).map((value) => value.close()));
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+});
+
+// Keep reason: #9751 is a recorded receipt-HOL failure and an outcome/ACK custody boundary.
+// Exercise the real reader, local outcome store and ACK verifier, not an implementation queue.
+describe("saved steer/followUp ACK obligations (#9751)", () => {
+  const ownerId = "host:9751-owner";
+  const senderId = "host:9751-sender";
+  const seenKey = (commandId: string) => "topology/control-seen/" +
+    createHash("sha256").update(`${ownerId}\0${commandId}`).digest("hex");
+  const gate = () => {
+    let open!: () => void;
+    const promise = new Promise<void>(resolve => { open = resolve; });
+    return { promise, open };
+  };
+  const until = (assertion: () => void) => vi.waitFor(assertion, { timeout: 3_000, interval: 20 });
+  const settled = async <T,>(promise: Promise<T>): Promise<T> => {
+    let done = false;
+    void promise.then(() => { done = true; }, () => { done = true; });
+    await until(() => expect(done).toBe(true));
+    return promise;
+  };
+  const setup = (options: Partial<FabricControlPlaneOptions> = {}, storeOptions: MeshStoreOptions = {}) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-9751-")); roots.push(root);
+    const meshRoot = path.join(root, "mesh");
+    const mesh = new MeshStore(meshRoot, 64 * 1024, 1_000, storeOptions);
+    const owner = new FabricControlPlane(mesh, identity(ownerId), {
+      enabled: true, hostId: ownerId, pollMs: 20, acknowledgementTimeoutMs: 60_000, ...options,
+    });
+    planes.push(owner);
+    const own = new MeshStore(path.join(meshRoot, "control-seen",
+      createHash("sha256").update(ownerId).digest("hex").slice(0, 32)), 64 * 1024, 1_000);
+    const command = (commandId: string, targetId = "agent:same", operation: "steer" | "followUp" = "steer") => ({
+      topic: "fabric.control.command", kind: operation, from: identity(senderId), to: ownerId,
+      data: { version: 1, commandId, targetId, operation, replyTo: senderId, ownerIncarnation: owner.incarnation,
+        message: commandId, requestCreatedAt: Date.now(), requestedAt: Date.now(), deadlineAt: Date.now() + 60_000 },
+    });
+    const saved = (commandId: string) => own.get(seenKey(commandId), { fresh: true })?.value;
+    const acks = (commandId?: string) => mesh.read({ topic: "fabric.control.ack", limit: 1_000 })
+      .filter(event => event.from.id === ownerId && (!commandId || (event.data as { commandId?: string }).commandId === commandId));
+    // A request issued by this owner can only settle when its own reader consumes an inbound ACK.
+    // This is an observable reader barrier, not a private cursor/queue diagnostic.
+    let barrierSequence = 0;
+    const inboundBarrier = async () => {
+      const message = `reader barrier ${++barrierSequence}`;
+      const request = owner.request("host:9751-peer", "agent:peer", "steer", {
+        ownerIncarnation: fixtureOwnerIncarnation, message,
+      }, "host:9751-peer");
+      void request.catch(() => undefined);
+      await until(() => expect(mesh.read({ topic: "fabric.control.command", limit: 1_000 })
+        .some(event => event.from.id === ownerId && event.to === "host:9751-peer" &&
+          (event.data as FabricControlCommand).message === message)).toBe(true));
+      const event = mesh.read({ topic: "fabric.control.command", limit: 1_000 })
+        .find(event => event.from.id === ownerId && event.to === "host:9751-peer" &&
+          (event.data as FabricControlCommand).message === message)!;
+      const data = event.data as FabricControlCommand;
+      await mesh.publish({ topic: "fabric.control.ack", kind: "accepted", from: identity("host:9751-peer"), to: ownerId,
+        data: { version: 1, commandId: data.commandId, targetId: data.targetId, ownerIncarnation: fixtureOwnerIncarnation,
+          accepted: true, messageId: "reader-advanced" } });
+      return settled(request);
+    };
+    return { root, meshRoot, mesh, own, owner, command, saved, acks, inboundBarrier };
+  };
+  const holdFirstAck = (f: ReturnType<typeof setup>) => {
+    const release = gate();
+    const publish = f.mesh.publish.bind(f.mesh);
+    let calls = 0, active = 0, highWater = 0;
+    const spy = vi.spyOn(f.mesh, "publish").mockImplementation(async input => {
+      if (input.topic !== "fabric.control.ack" || input.from.id !== ownerId) return publish(input);
+      calls++; active++; highWater = Math.max(highWater, active);
+      try {
+        if (calls === 1) await release.promise;
+        return await publish(input);
+      } finally { active--; }
+    });
+    return { release, spy, calls: () => calls, highWater: () => highWater };
+  };
+
+  // Keep reason: the recorded #9751 custody regression needs native completion-error
+  // transparency, while E1 deliberately reconciles the generic send path differently.
+  it("9751: FILE native publish and generic send preserve definite pre-append errors and permit a real retry", async () => {
+    const f = setup(), transport = new FileTransport(f.mesh, { machine: "mesh", hostId: ownerId });
+    const publish = f.mesh.publish.bind(f.mesh);
+    const exactError = Object.assign(new Error("definite pre-append refusal"), { code: "FABRIC_MESH_LOCK_TIMEOUT" });
+    const native = { ...f.command("native-definite"), id: "native:definite" };
+    const generic = f.command("generic-definite");
+    const envelope = { id: "logical:definite", kind: "command" as const,
+      to: { machine: "mesh", hostId: ownerId }, targetId: "agent:same", operation: "steer",
+      from: generic.from, body: generic.data };
+    let refuse = true;
+    const spy = vi.spyOn(f.mesh, "publish").mockImplementation(async input => {
+      if (refuse) throw exactError; // No call-through: the native append has not begun.
+      return publish(input);
+    });
+    try {
+      await expect(transport.publish(native)).rejects.toBe(exactError);
+      await expect(transport.send(envelope)).rejects.toBe(exactError);
+      expect(spy).toHaveBeenCalledTimes(2);
+      expect(spy.mock.calls[0]![0].id).toBe(native.id);
+      const failedGenericId = spy.mock.calls[1]![0].id;
+      expect(failedGenericId).toEqual(expect.any(String));
+      expect(failedGenericId).not.toBe(envelope.id);
+      expect(f.mesh.read({ limit: 1_000 })).toEqual([]);
+
+      // Neither rejected operation may be reported as successful custody. Once the
+      // definite refusal clears, explicit retries must reach the real append once each.
+      refuse = false;
+      const nativeReceipt = await transport.publish(native);
+      const genericReceipt = await transport.send(envelope);
+      const events = f.mesh.read({ limit: 1_000 });
+      expect(spy).toHaveBeenCalledTimes(4);
+      expect(events).toHaveLength(2);
+      expect(events[0]).toEqual(nativeReceipt);
+      expect(nativeReceipt).toMatchObject({ id: native.id, data: native.data });
+      expect(events.filter(event => event.id === native.id)).toHaveLength(1);
+      const genericEvent = events[1]!;
+      expect(genericEvent.id).toBe(spy.mock.calls[3]![0].id);
+      expect(genericEvent.id).not.toBe(failedGenericId);
+      expect(genericEvent.id).not.toBe(envelope.id);
+      expect(genericEvent.data).toEqual(envelope.body);
+      expect(genericReceipt).toMatchObject({ id: envelope.id, sequence: genericEvent.sequence, duplicate: false,
+        envelope: { id: envelope.id, body: envelope.body } });
+    } finally { await transport.close(); }
+  });
+
+  it("9751: FILE native publish rejects the exact post-append error while generic send resolves the positive E1 sequence", async () => {
+    const f = setup(), transport = new FileTransport(f.mesh, { machine: "mesh", hostId: ownerId });
+    const publish = f.mesh.publish.bind(f.mesh), exactError = new Error("append completed, publisher completion failed");
+    const command = f.command("native-postappend"), stamp = vi.fn(() => command.data);
+    const native = { ...command, id: "native:postappend", data: stamp };
+    const generic = f.command("generic-postappend");
+    const envelope = { id: "logical:postappend", kind: "command" as const,
+      to: { machine: "mesh", hostId: ownerId }, targetId: "agent:same", operation: "steer",
+      from: generic.from, body: generic.data };
+    const appended: MeshEvent[] = [];
+    const spy = vi.spyOn(f.mesh, "publish").mockImplementation(async input => {
+      const event = await publish(input); // Real native append and positive receipt, not a fabricated event.
+      appended.push(event);
+      throw exactError;
+    });
+    try {
+      let nativeError: unknown;
+      await transport.publish(native).catch(error => { nativeError = error; });
+      // The identical call-through fault is NOT a native error for the generic E1 port.
+      const receipt = await transport.send(envelope);
+      const events = f.mesh.read({ limit: 1_000 });
+      expect(spy).toHaveBeenCalledTimes(2);
+      expect(events).toHaveLength(2);
+      expect(events).toEqual(appended);
+      expect(spy.mock.calls[0]![0].id).toBe(native.id);
+      expect(events[0]).toMatchObject({ id: native.id, data: command.data });
+      expect(events.filter(event => event.id === native.id)).toHaveLength(1);
+      expect(stamp).toHaveBeenCalledOnce();
+      const genericEvent = events[1]!;
+      expect(genericEvent.id).toBe(spy.mock.calls[1]![0].id);
+      expect(genericEvent.id).not.toBe(envelope.id);
+      expect(genericEvent.id).not.toBe(native.id);
+      expect(genericEvent.data).toEqual(envelope.body);
+      expect(genericEvent.sequence).toBeGreaterThan(0);
+      expect(receipt).toMatchObject({ id: envelope.id, sequence: genericEvent.sequence, duplicate: false,
+        envelope: { id: envelope.id, body: envelope.body } });
+      // A positive on-disk native event must not erase the publisher's completion error.
+      expect(nativeError).toBe(exactError);
+    } finally { await transport.close(); }
+  });
+
+  it("9751: saved ACK backlog does not block ordered steer/followUp admission", async () => {
+    const f = setup(), blocked = holdFirstAck(f), order: string[] = [];
+    const sender = plane(f.meshRoot, senderId, {}, { acknowledgementTimeoutMs: 60_000 });
+    f.owner.start(command => { order.push(command.message!); return { accepted: true, messageId: command.message! }; });
+    sender.start(() => ({ accepted: false }));
+    let senderSettled = false;
+    const first = sender.request(ownerId, "agent:same", "steer", { message: "A", ownerIncarnation: f.owner.incarnation }, ownerId);
+    void first.then(() => { senderSettled = true; }, () => { senderSettled = true; });
+    try {
+      await until(() => expect(blocked.calls()).toBe(1));
+      const a = (f.mesh.read({ topic: "fabric.control.command" })[0]!.data as FabricControlCommand).commandId;
+      expect(f.saved(a)).toMatchObject({ acceptance: { accepted: true, messageId: "A" } });
+      await f.mesh.publish(f.command("B", "agent:same", "followUp"));
+      await f.mesh.publish(f.command("C", "agent:other"));
+      // These are before gate-open requirements: baseline must go RED here, not merely on elapsed time.
+      await until(() => {
+        expect(order).toEqual(["A", "B", "C"]);
+        expect(f.saved("B")).toMatchObject({ acceptance: { accepted: true, messageId: "B" } });
+        expect(f.saved("C")).toMatchObject({ acceptance: { accepted: true, messageId: "C" } });
+      });
+      await expect(f.inboundBarrier()).resolves.toMatchObject({ acknowledged: true, messageId: "reader-advanced" });
+      expect(senderSettled).toBe(false);
+      expect(f.acks()).toEqual([]);
+      expect(blocked.calls()).toBe(1); // one worker, not a detached swarm awaiting the same log lock
+      blocked.release.open();
+      await expect(settled(first)).resolves.toMatchObject({ acknowledged: true, messageId: "A" });
+      await until(() => expect(f.acks()).toHaveLength(3));
+      expect(f.acks().map(event => (event.data as { messageId: string }).messageId)).toEqual(["A", "B", "C"]);
+      expect(order).toEqual(["A", "B", "C"]);
+      expect(blocked.highWater()).toBe(1);
+    } finally { blocked.release.open(); await settled(first).catch(() => undefined); blocked.spy.mockRestore(); }
+  });
+
+  it("9751: awaited handler admission preserves same-target order", async () => {
+    const f = setup(), binding = gate(), entered = gate(), order: string[] = [];
+    // The explicit scheduler barrier drains ready promise work, not a wall-clock performance budget.
+    // A whole-handler detach runs B during this barrier while A awaits its activation binding.
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      await f.mesh.publish(f.command("A"));
+      await f.mesh.publish(f.command("B", "agent:same", "followUp"));
+      f.owner.start(async command => {
+        if (command.commandId === "A") { entered.open(); await binding.promise; }
+        order.push(command.commandId);
+        return { accepted: true, messageId: command.commandId };
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      await settled(entered.promise);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(order).toEqual([]);
+      expect(f.mesh.get(seenKey("B"), { fresh: true })).toBeUndefined();
+      binding.open();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(order).toEqual(["A", "B"]);
+      expect(f.acks().map(event => (event.data as { messageId: string }).messageId)).toEqual(["A", "B"]);
+    } finally { binding.open(); vi.useRealTimers(); }
+  });
+
+  it("9751: ACK custody caps at one active plus 99 pending without reading or claiming the 101st", async () => {
+    const f = setup(), blocked = holdFirstAck(f), order: string[] = [];
+    // Fill before start so the first real tail page is exactly the 100 admitted obligations.
+    for (let index = 1; index <= 101; index++) await f.mesh.publish(f.command(`cap:${index}`));
+    const tail = vi.spyOn(f.mesh, "tail");
+    // Suppress incidental filesystem wakes: only start and ACK settlement may wake this reader.
+    // Same fake-watch seam as control-plane-idle-wakes; no deleting child or alternate backend.
+    vi.spyOn(fs, "watch").mockImplementation(() =>
+      Object.assign(new EventEmitter(), { close: vi.fn(), unref: vi.fn() }) as unknown as fs.FSWatcher);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const timeouts = vi.spyOn(globalThis, "setTimeout");
+    f.owner.start(command => { order.push(command.commandId); return { accepted: true, messageId: command.commandId }; });
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      expect(f.saved("cap:100")).toMatchObject({ acceptance: { accepted: true } });
+      expect(order).toEqual(Array.from({ length: 100 }, (_, index) => `cap:${index + 1}`));
+      expect(blocked.calls()).toBe(1);
+      expect(f.mesh.get(seenKey("cap:101"), { fresh: true })).toBeUndefined();
+      expect(f.saved("cap:101")).toBeUndefined();
+      expect(tail.mock.results.some(result => result.type === "return" && result.value.events.some(
+        (event: MeshEvent) => event.topic === "fabric.control.command" && (event.data as FabricControlCommand).commandId === "cap:101"))).toBe(false);
+      const readsAtCapacity = tail.mock.calls.length, timersAtCapacity = timeouts.mock.calls.length;
+      const armedAtCapacity = vi.getTimerCount();
+      // Under the existing 60 s command deadlines, cross the entire 30 s retry ceiling.
+      // Capacity alone must not arm/re-arm hot backoff, even when no watcher can rescue it.
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(tail).toHaveBeenCalledTimes(readsAtCapacity);
+      expect(timeouts).toHaveBeenCalledTimes(timersAtCapacity);
+      expect(vi.getTimerCount()).toBe(armedAtCapacity);
+      blocked.release.open();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(f.acks()).toHaveLength(101); // settlement itself wakes the 101st; no filesystem hint/timer
+      expect(order).toEqual(Array.from({ length: 101 }, (_, index) => `cap:${index + 1}`));
+      expect(blocked.calls()).toBe(101);
+      expect(blocked.highWater()).toBe(1);
+    } finally {
+      blocked.release.open();
+      // Individual mockRestore() leaves Vitest's restore callback registered. Clear it
+      // while the fake clock is installed, or restoreMocks re-installs fake setTimeout
+      // in the next test after useRealTimers(), stranding every real retry timer.
+      vi.restoreAllMocks(); vi.useRealTimers();
+    }
+  }, 15_000);
+
+  it("9751: duplicate commands coalesce while their ACK is active or queued", async () => {
+    const f = setup(), blocked = holdFirstAck(f);
+    const receive = vi.fn((command: FabricControlCommand) => ({ accepted: true, messageId: command.commandId }));
+    const a = f.command("A"), b = f.command("B", "agent:same", "followUp");
+    f.owner.start(receive);
+    try {
+      await f.mesh.publish(a);
+      await until(() => expect(blocked.calls()).toBe(1));
+      await f.mesh.publish(b);
+      await until(() => expect(f.saved("B")).toMatchObject({ acceptance: { accepted: true } }));
+      await f.mesh.publish(a); await f.mesh.publish(b);
+      await expect(f.inboundBarrier()).resolves.toMatchObject({ acknowledged: true });
+      expect(receive.mock.calls.map(([command]) => command.commandId)).toEqual(["A", "B"]);
+      expect(blocked.calls()).toBe(1);
+      blocked.release.open();
+      await until(() => expect(f.acks()).toHaveLength(2));
+      await expect(f.inboundBarrier()).resolves.toMatchObject({ acknowledged: true });
+      expect(blocked.calls()).toBe(2); // no extra owned publication job for either duplicate
+      expect(f.acks("A")).toHaveLength(1); expect(f.acks("B")).toHaveLength(1);
+      expect(blocked.highWater()).toBe(1); expect(receive).toHaveBeenCalledTimes(2);
+    } finally { blocked.release.open(); blocked.spy.mockRestore(); }
+  });
+
+  it("9751: failed outcome save cannot enqueue or publish an ACK and retries without handler replay", async () => {
+    const f = setup(), release = gate(), put = MeshStore.prototype.put;
+    let failed = false;
+    const acceptance = { accepted: true, messageId: "saved-once", result: { revision: 1 } };
+    const saves: { ifVersion: number | undefined; acceptance: unknown }[] = [];
+    const receive = vi.fn(() => acceptance);
+    const save = vi.spyOn(MeshStore.prototype, "put").mockImplementation(async function (this: MeshStore, input) {
+      if (this.root === f.own.root && input.key === seenKey("save") && (input.value as { acceptance?: unknown }).acceptance) {
+        saves.push({ ifVersion: input.ifVersion, acceptance: (input.value as { acceptance: unknown }).acceptance });
+        if (!failed) {
+          failed = true; await release.promise;
+          // Reject before the real put: this attempt cannot persist an outcome.
+          throw Object.assign(new Error("Timed out waiting for the Fabric mesh lock"), { code: "FABRIC_MESH_LOCK_TIMEOUT" });
+        }
+      }
+      return put.call(this, input);
+    });
+    const publish = vi.spyOn(f.mesh, "publish");
+    f.owner.start(receive);
+    try {
+      await f.mesh.publish(f.command("save"));
+      await until(() => expect(failed).toBe(true));
+      const claim = f.own.get(seenKey("save"), { fresh: true })!;
+      expect(claim.value).not.toHaveProperty("acceptance");
+      expect(publish.mock.calls.filter(([input]) => input.topic === "fabric.control.ack")).toHaveLength(0);
+      release.open();
+      await until(() => expect(f.acks("save").length).toBeGreaterThan(0));
+      await f.inboundBarrier();
+      expect(saves).toEqual([
+        { ifVersion: claim.version, acceptance }, { ifVersion: claim.version, acceptance },
+      ]);
+      expect(f.saved("save")).toMatchObject({ acceptance });
+      // The legacy reader can re-answer its retained input after the retry. Receipt
+      // duplication is harmless; changing the saved outcome or re-running the handler is not.
+      for (const ack of f.acks("save")) expect(ack.data).toMatchObject({ ...acceptance, commandId: "save", ownerIncarnation: f.owner.incarnation });
+      expect(receive).toHaveBeenCalledOnce();
+    } finally { release.open(); save.mockRestore(); publish.mockRestore(); }
+  });
+
+  it("9751: known no-write ACK failure retries the exact saved outcome without handler replay", async () => {
+    const f = setup(), retry = gate(), publish = f.mesh.publish.bind(f.mesh);
+    const acceptance = { accepted: true, messageId: "original", result: { revision: 1 } };
+    const receive = vi.fn(() => acceptance);
+    let attempts = 0, beforeFailure: unknown;
+    const spy = vi.spyOn(f.mesh, "publish").mockImplementation(async input => {
+      if (input.topic === "fabric.control.ack" && input.from.id === ownerId) {
+        attempts++;
+        if (attempts === 1) {
+          beforeFailure = f.saved("retry");
+          // Reject before the real publish, unlike the uncertain post-append control below.
+          throw Object.assign(new Error("Timed out waiting for the Fabric mesh lock"), { code: "FABRIC_MESH_LOCK_TIMEOUT" });
+        }
+        if (attempts === 2) await retry.promise;
+      }
+      return publish(input);
+    });
+    f.owner.start(receive);
+    try {
+      await f.mesh.publish(f.command("retry"));
+      await until(() => expect(attempts).toBe(2)); // the existing real backoff must actually fire
+      expect(f.acks("retry")).toEqual([]); // the failed attempt appended nothing
+      expect(beforeFailure).toMatchObject({ acceptance });
+      expect(f.saved("retry")).toEqual(beforeFailure);
+      expect(receive).toHaveBeenCalledOnce();
+      retry.open();
+      await until(() => expect(f.acks("retry").length).toBeGreaterThan(0));
+      await f.inboundBarrier();
+      expect(attempts).toBe(f.acks("retry").length + 1); // exactly one no-write refusal, including legacy replay ACKs
+      expect(receive).toHaveBeenCalledOnce();
+      expect(f.saved("retry")).toEqual(beforeFailure);
+      for (const ack of f.acks("retry")) expect(ack.data).toMatchObject({ ...acceptance, commandId: "retry", ownerIncarnation: f.owner.incarnation });
+      f.owner.pause(); await f.owner.checkpointForRelease();
+      expect(f.owner.releaseCheckpointReceipt()).toMatchObject({ admissionHeld: true });
+    } finally { retry.open(); spy.mockRestore(); }
+  });
+
+  it("9751: uncertain ACK completion retains the saved result and permanently refuses release", async () => {
+    const f = setup(), publish = f.mesh.publish.bind(f.mesh), receive = vi.fn(() => ({ accepted: true, messageId: "uncertain", result: { private: "PRIVATE-UNCERTAIN-RESULT" } }));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    let attempts = 0;
+    const spy = vi.spyOn(f.mesh, "publish").mockImplementation(async input => {
+      const event = await publish(input);
+      if (input.topic === "fabric.control.ack" && input.from.id === ownerId && ++attempts === 1) {
+        throw new Error("ACK append completed but publication completion is unknown");
+      }
+      return event;
+    });
+    f.owner.start(receive);
+    try {
+      const original = f.command("uncertain"); await f.mesh.publish(original);
+      await until(() => expect(attempts).toBeGreaterThanOrEqual(1));
+      await expect(f.inboundBarrier()).resolves.toMatchObject({ acknowledged: true });
+      expect(f.saved("uncertain")).toMatchObject({ acceptance: { accepted: true, messageId: "uncertain" } });
+      const settledAttempts = attempts;
+      const receiptsBeforeReplay = f.acks("uncertain").length;
+      await expect(f.inboundBarrier()).resolves.toMatchObject({ acknowledged: true });
+      expect(receive).toHaveBeenCalledOnce(); expect(attempts).toBe(settledAttempts); // no hot-loop
+      await f.mesh.publish(original); // a later replay may explicitly retry the persisted answer
+      await until(() => expect(f.acks("uncertain")).toHaveLength(receiptsBeforeReplay + 1));
+      expect(receive).toHaveBeenCalledOnce();
+      f.owner.pause();
+      await expect(f.owner.checkpointForRelease()).rejects.toThrow(/unsettled publication obligations/);
+      expect(() => f.owner.releaseCheckpointReceipt()).toThrow(/unavailable|unsettled/);
+      const saved = f.saved("uncertain");
+      await expect(settled(f.owner.close())).resolves.toBeUndefined();
+      await expect(settled(f.owner.close())).resolves.toBeUndefined();
+      const notices = warn.mock.calls.map(call => call.map(String).join(" ")).filter(line => line.includes("Control close has unsettled acknowledgement obligations"));
+      expect(notices).toHaveLength(1);
+      expect(notices[0]).toContain("ACK"); expect(notices[0]).toContain("uncertain");
+      expect(notices[0]).toContain(seenKey("uncertain"));
+      expect(notices[0]).not.toContain("PRIVATE-UNCERTAIN-RESULT");
+      expect(f.saved("uncertain")).toEqual(saved);
+      await expect(f.owner.checkpointForRelease()).rejects.toThrow(/unsettled publication obligations/);
+      expect(() => f.owner.releaseCheckpointReceipt()).toThrow(/unavailable|unsettled/);
+    } finally { spy.mockRestore(); warn.mockRestore(); }
+  });
+
+  it("9751: transient second serialization failure retains completed-result custody without handler replay", async () => {
+    const f = setup();
+    let serializations = 0;
+    const receive = vi.fn(() => ({ accepted: true, messageId: "serialized-once", result: {
+      toJSON() {
+        if (++serializations === 2) throw new Error("one transient second-serialization failure");
+        return { revision: 1 };
+      },
+    } }));
+    f.owner.start(receive);
+    await f.mesh.publish(f.command("second-serialization"));
+    await until(() => expect(f.acks("second-serialization").length).toBeGreaterThan(0));
+    await f.inboundBarrier();
+    expect(serializations).toBeGreaterThan(2);
+    expect(receive).toHaveBeenCalledOnce();
+    expect(f.saved("second-serialization")).toMatchObject({ acceptance: {
+      accepted: true, messageId: "serialized-once", result: { revision: 1 },
+    } });
+    for (const ack of f.acks("second-serialization")) expect(ack.data).toMatchObject({
+      accepted: true, messageId: "serialized-once", result: { revision: 1 }, ownerIncarnation: f.owner.incarnation,
+    });
+    f.owner.pause(); await f.owner.checkpointForRelease();
+    expect(f.owner.releaseCheckpointReceipt()).toMatchObject({ admissionHeld: true });
+  });
+
+  it("9751: close resolves once with a body-free pending ACK warning while checkpoint still refuses", async () => {
+    const f = setup(), publish = f.mesh.publish.bind(f.mesh);
+    const acceptance = { accepted: true, messageId: "PRIVATE-PENDING-MESSAGE-ID", result: { private: "PRIVATE-PENDING-RESULT" } };
+    const receive = vi.fn(() => acceptance);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    let attempts = 0;
+    const spy = vi.spyOn(f.mesh, "publish").mockImplementation(async input => {
+      if (input.topic === "fabric.control.ack" && input.from.id === ownerId) {
+        attempts++;
+        throw Object.assign(new Error("Timed out waiting for the Fabric mesh lock"), { code: "FABRIC_MESH_LOCK_TIMEOUT" });
+      }
+      return publish(input);
+    });
+    f.owner.start(receive);
+    try {
+      await f.mesh.publish(f.command("pending-close"));
+      await until(() => expect(attempts).toBeGreaterThan(0));
+      f.owner.pause();
+      await expect(settled(f.owner.checkpointForRelease())).rejects.toThrow(/unsettled publication obligations/);
+      const saved = f.saved("pending-close");
+      expect(saved).toMatchObject({ acceptance, ownerIncarnation: f.owner.incarnation });
+      await expect(settled(f.owner.close())).resolves.toBeUndefined();
+      await expect(settled(f.owner.close())).resolves.toBeUndefined();
+      const notices = warn.mock.calls.map(call => call.map(String).join(" ")).filter(line => line.includes("Control close has unsettled acknowledgement obligations"));
+      expect(notices).toHaveLength(1);
+      expect(notices[0]).toContain("pending ACK"); expect(notices[0]).toContain("pending-close");
+      expect(notices[0]).toContain(seenKey("pending-close"));
+      expect(notices[0]).not.toContain(acceptance.messageId);
+      expect(notices[0]).not.toContain(acceptance.result.private);
+      expect(f.saved("pending-close")).toEqual(saved); expect(f.acks("pending-close")).toEqual([]);
+      expect(receive).toHaveBeenCalledOnce();
+      await expect(f.owner.checkpointForRelease()).rejects.toThrow(/unsettled publication obligations/);
+      expect(() => f.owner.releaseCheckpointReceipt()).toThrow(/unavailable|unsettled/);
+    } finally { spy.mockRestore(); warn.mockRestore(); }
+  });
+
+  it("9751: queued ACK publishes the exact saved acceptance despite mutation of the handler result", async () => {
+    const f = setup(), blocked = holdFirstAck(f);
+    const acceptance = { accepted: true, messageId: "stable", result: { revision: 1 } };
+    const receive = vi.fn(() => acceptance);
+    f.owner.start(receive);
+    try {
+      await f.mesh.publish(f.command("mutable"));
+      await until(() => expect(blocked.calls()).toBe(1));
+      expect(f.saved("mutable")).toMatchObject({ acceptance: { accepted: true, messageId: "stable", result: { revision: 1 } } });
+      acceptance.accepted = false; acceptance.messageId = "mutated"; acceptance.result.revision = 2;
+      expect(f.saved("mutable")).toMatchObject({ acceptance: { accepted: true, messageId: "stable", result: { revision: 1 } } });
+      blocked.release.open();
+      await until(() => expect(f.acks("mutable")).toHaveLength(1));
+      expect(f.acks("mutable")[0]!.data).toMatchObject({ accepted: true, messageId: "stable", result: { revision: 1 } });
+      expect(receive).toHaveBeenCalledOnce();
+    } finally { blocked.release.open(); blocked.spy.mockRestore(); }
+  });
+
+  it.each([
+    ["steer", "9751:predecessor"], ["followUp", "9751:predecessor"],
+    ["steer", undefined], ["followUp", undefined],
+  ] as const)("9751: saved restart %s replay with epoch %s cannot block fresh admission or the inbound reader", async (operation, oldEpoch) => {
+    const f = setup(), blocked = holdFirstAck(f);
+    const acceptance = { accepted: true, messageId: "predecessor-result", result: { revision: 7 } };
+    const original = f.command("replay-A", "agent:same", operation);
+    const a = { ...original, data: { ...original.data, ownerIncarnation: oldEpoch } };
+    await f.own.put({ key: seenKey("replay-A"), identity: identity(ownerId), ifVersion: 0, value: {
+      format: 1, hostId: ownerId, commandId: "replay-A", targetId: "agent:same",
+      ...(oldEpoch === undefined ? {} : { ownerIncarnation: oldEpoch }), expiresAt: Date.now() + 60_000, acceptance,
+    } });
+    const persisted = f.own.get(seenKey("replay-A"), { fresh: true });
+    const put = vi.spyOn(MeshStore.prototype, "put");
+    const receive = vi.fn((command: FabricControlCommand) => ({ accepted: true, messageId: command.commandId }));
+    await f.mesh.publish(a);
+    await f.mesh.publish(f.command("fresh-B", "agent:other", "followUp"));
+    f.owner.start(receive);
+    try {
+      await until(() => expect(blocked.calls()).toBe(1));
+      // Must pass before opening A: a saved predecessor is ACK-only work, not reader work.
+      await until(() => expect(f.saved("fresh-B")).toMatchObject({ acceptance: { accepted: true, messageId: "fresh-B" } }));
+      await f.mesh.publish(a); await f.mesh.publish(f.command("fresh-B", "agent:other", "followUp"));
+      await expect(f.inboundBarrier()).resolves.toMatchObject({ acknowledged: true, messageId: "reader-advanced" });
+      expect(receive.mock.calls.map(([command]) => command.commandId)).toEqual(["fresh-B"]);
+      expect(f.acks()).toEqual([]); expect(blocked.calls()).toBe(1);
+      expect(f.mesh.get(seenKey("replay-A"), { fresh: true })).toBeUndefined(); // no shared re-claim
+      expect(put.mock.calls.some(([input]) => input.key === seenKey("replay-A"))).toBe(false); // no local re-save
+      expect(f.own.get(seenKey("replay-A"), { fresh: true })).toEqual(persisted);
+      blocked.release.open();
+      await until(() => expect(f.acks()).toHaveLength(2));
+      await f.inboundBarrier();
+      expect(f.acks().map(event => (event.data as { commandId: string }).commandId)).toEqual(["replay-A", "fresh-B"]);
+      expect(f.acks("replay-A")[0]!.data).toEqual({ version: 1, commandId: "replay-A", targetId: "agent:same",
+        ...acceptance, ...(oldEpoch === undefined ? {} : { ownerIncarnation: oldEpoch }) });
+      expect(f.acks("fresh-B")[0]!.data).toMatchObject({ ownerIncarnation: f.owner.incarnation });
+      expect(f.own.get(seenKey("replay-A"), { fresh: true })).toEqual(persisted);
+      expect(blocked.calls()).toBe(2); expect(blocked.highWater()).toBe(1); expect(receive).toHaveBeenCalledOnce();
+    } finally { blocked.release.open(); put.mockRestore(); blocked.spy.mockRestore(); }
+  });
+
+  it("9751: saved restart replay shares the 100 ACK cap and leaves the next fresh command unread and unclaimed", async () => {
+    const f = setup(), blocked = holdFirstAck(f), oldEpoch = "9751:predecessor";
+    for (let index = 1; index <= 99; index++) {
+      const id = `replay-cap:${index}`, command = f.command(id, "agent:same", index % 2 ? "steer" : "followUp");
+      await f.own.put({ key: seenKey(id), identity: identity(ownerId), ifVersion: 0, value: {
+        format: 1, hostId: ownerId, commandId: id, targetId: "agent:same", ownerIncarnation: oldEpoch,
+        expiresAt: Date.now() + 60_000, acceptance: { accepted: true, messageId: id },
+      } });
+      await f.mesh.publish({ ...command, data: { ...command.data, ownerIncarnation: oldEpoch } });
+    }
+    const hundredth = await f.mesh.publish(f.command("replay-cap:100", "agent:other"));
+    const next = await f.mesh.publish(f.command("replay-cap:101", "agent:other"));
+    const tail = vi.spyOn(f.mesh, "tail"), drain = vi.spyOn(FileControlReader.prototype, "drain");
+    vi.spyOn(fs, "watch").mockImplementation(() =>
+      Object.assign(new EventEmitter(), { close: vi.fn(), unref: vi.fn() }) as unknown as fs.FSWatcher);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const timeouts = vi.spyOn(globalThis, "setTimeout");
+    const receive = vi.fn((command: FabricControlCommand) => ({ accepted: true, messageId: command.commandId }));
+    f.owner.start(receive);
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      expect(blocked.calls()).toBe(1);
+      // 99 saved replays plus this fresh save prove the whole first page reached the SAME cap.
+      expect(f.saved("replay-cap:100")).toMatchObject({ acceptance: { accepted: true } });
+      expect(receive.mock.calls.map(([command]) => command.commandId)).toEqual(["replay-cap:100"]);
+      // The real call-through reader must commit the command that fills slot 100,
+      // not strand it behind a post-handler capacity check or commit the next input.
+      const reader = drain.mock.contexts[0] as FileControlReader;
+      expect(reader.mesh).toBe(f.mesh);
+      expect(reader.lastSequence).toBe(hundredth.sequence);
+      expect(f.mesh.get(seenKey("replay-cap:101"), { fresh: true })).toBeUndefined();
+      expect(f.saved("replay-cap:101")).toBeUndefined();
+      // Strict pre-tail-page check: neither reading page two nor claiming its command is allowed.
+      expect(tail.mock.results.some(result => result.type === "return" && result.value.events.some(
+        (event: MeshEvent) => event.topic === "fabric.control.command" && (event.data as FabricControlCommand).commandId === "replay-cap:101"))).toBe(false);
+      const readsAtCapacity = tail.mock.calls.length, timersAtCapacity = timeouts.mock.calls.length;
+      const armedAtCapacity = vi.getTimerCount();
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(tail).toHaveBeenCalledTimes(readsAtCapacity);
+      expect(timeouts).toHaveBeenCalledTimes(timersAtCapacity); expect(vi.getTimerCount()).toBe(armedAtCapacity);
+      expect(blocked.calls()).toBe(1);
+      expect(receive.mock.calls.map(([command]) => command.commandId)).toEqual(["replay-cap:100"]);
+      expect(reader.lastSequence).toBe(hundredth.sequence);
+      blocked.release.open();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(f.acks()).toHaveLength(101);
+      expect(f.acks().map(event => (event.data as { commandId: string }).commandId)).toEqual(
+        Array.from({ length: 101 }, (_, index) => `replay-cap:${index + 1}`));
+      expect(receive.mock.calls.map(([command]) => command.commandId)).toEqual(["replay-cap:100", "replay-cap:101"]);
+      expect(reader.lastSequence).toBeGreaterThanOrEqual(next.sequence);
+      expect(f.saved("replay-cap:101")).toMatchObject({ acceptance: { accepted: true }, ownerIncarnation: f.owner.incarnation });
+      expect(blocked.calls()).toBe(101); expect(blocked.highWater()).toBe(1);
+    } finally {
+      blocked.release.open();
+      // Restore the timeout spy under the fake clock, before returning to real timers.
+      vi.restoreAllMocks(); vi.useRealTimers();
+    }
+  }, 15_000);
+
+  it("9751: full FILE ACK custody consumes same-page ACK, cancel and owned replay but retains the next new command", async () => {
+    const f = setup(), blocked = holdFirstAck(f), asking = gate();
+    let askSignal: AbortSignal | undefined, acknowledged = false;
+    const request = f.owner.request("host:9751-peer", "agent:peer", "steer", {
+      ownerIncarnation: fixtureOwnerIncarnation, message: "capacity ACK barrier",
+    }, "host:9751-peer");
+    void request.then(() => { acknowledged = true; }, () => undefined);
+    await until(() => expect(f.mesh.read({ topic: "fabric.control.command", limit: 1_000 })
+      .some(event => event.from.id === ownerId && (event.data as FabricControlCommand).message === "capacity ACK barrier")).toBe(true));
+    const outbound = f.mesh.read({ topic: "fabric.control.command", limit: 1_000 })
+      .find(event => event.from.id === ownerId && (event.data as FabricControlCommand).message === "capacity ACK barrier")!.data as FabricControlCommand;
+    const ask = f.command("same-page:ask");
+    await f.mesh.publish({ ...ask, kind: "ask", data: { ...ask.data, operation: "ask" } });
+    // Outbound barrier + detached ASK + 98 ACK obligations occupy page one.
+    // Page two enters below capacity, then fills it before the exempt events.
+    for (let index = 1; index <= 100; index++) await f.mesh.publish(f.command(`same-page:${index}`));
+    const ack = await f.mesh.publish({ topic: "fabric.control.ack", kind: "accepted", from: identity("host:9751-peer"), to: ownerId,
+      data: { version: 1, commandId: outbound.commandId, targetId: outbound.targetId, ownerIncarnation: fixtureOwnerIncarnation,
+        accepted: true, messageId: "same-page-ack" } });
+    const cancel = f.command("same-page:cancel");
+    const cancellation = await f.mesh.publish({ ...cancel, kind: "cancel", data: {
+      ...cancel.data, operation: "cancel", cancelCommandId: "same-page:ask",
+    } });
+    const owned = await f.mesh.publish(f.command("same-page:100"));
+    const next = await f.mesh.publish(f.command("same-page:101"));
+    const tail = vi.spyOn(f.mesh, "tail"), drain = vi.spyOn(FileControlReader.prototype, "drain");
+    vi.spyOn(fs, "watch").mockImplementation(() =>
+      Object.assign(new EventEmitter(), { close: vi.fn(), unref: vi.fn() }) as unknown as fs.FSWatcher);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const receive = vi.fn((command: FabricControlCommand, _from: MeshIdentity, signal: AbortSignal) => {
+      if (command.operation === "ask") {
+        askSignal = signal;
+        return asking.promise.then(() => ({ accepted: true, messageId: command.commandId }));
+      }
+      return { accepted: true, messageId: command.commandId };
+    });
+    f.owner.start(receive);
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      expect(f.saved("same-page:100")).toMatchObject({ acceptance: { accepted: true } });
+      expect(blocked.calls()).toBe(1);
+      expect(f.acks()).toEqual([]);
+      // Positive public effects: the actual ACK verifier settled a pending request,
+      // and the actual cancellation path aborted the still-running ASK handler.
+      expect(acknowledged).toBe(true);
+      await expect(request).resolves.toMatchObject({ acknowledged: true, messageId: "same-page-ack" });
+      expect(askSignal).toBeDefined(); expect(askSignal!.aborted).toBe(true);
+      const reader = drain.mock.contexts[0] as FileControlReader;
+      expect(reader.mesh).toBe(f.mesh);
+      expect(reader.lastSequence).toBe(owned.sequence);
+      expect(tail.mock.results.some(result => result.type === "return" &&
+        [ack.id, cancellation.id, owned.id, next.id].every(id => result.value.events.some((event: MeshEvent) => event.id === id)))).toBe(true);
+      expect(receive.mock.calls.map(([command]) => command.commandId)).toEqual([
+        "same-page:ask", ...Array.from({ length: 100 }, (_, index) => `same-page:${index + 1}`),
+      ]);
+      expect(f.mesh.get(seenKey("same-page:101"), { fresh: true })).toBeUndefined();
+      expect(f.saved("same-page:101")).toBeUndefined();
+      blocked.release.open();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(receive.mock.calls.map(([command]) => command.commandId)).toEqual([
+        "same-page:ask", ...Array.from({ length: 101 }, (_, index) => `same-page:${index + 1}`),
+      ]);
+      expect(f.saved("same-page:101")).toMatchObject({ acceptance: { accepted: true } });
+      expect(f.acks()).toHaveLength(101);
+      expect(f.acks("same-page:100")).toHaveLength(1);
+      expect(reader.lastSequence).toBeGreaterThanOrEqual(next.sequence);
+      expect(blocked.calls()).toBe(101); expect(blocked.highWater()).toBe(1);
+    } finally {
+      asking.open(); blocked.release.open();
+      vi.restoreAllMocks(); vi.useRealTimers();
+    }
+  }, 15_000);
+
+  it("9751: queued saved restart replay owns no retry timer while the existing ACK worker is blocked", async () => {
+    const f = setup(), blocked = holdFirstAck(f), oldEpoch = "9751:predecessor";
+    for (const id of ["timer-A", "timer-C"]) {
+      const command = f.command(id);
+      await f.own.put({ key: seenKey(id), identity: identity(ownerId), ifVersion: 0, value: {
+        format: 1, hostId: ownerId, commandId: id, targetId: "agent:same", ownerIncarnation: oldEpoch,
+        expiresAt: Date.now() + 60_000, acceptance: { accepted: true, messageId: id },
+      } });
+      await f.mesh.publish({ ...command, data: { ...command.data, ownerIncarnation: oldEpoch } });
+    }
+    await f.mesh.publish(f.command("timer-B", "agent:other"));
+    vi.spyOn(fs, "watch").mockImplementation(() =>
+      Object.assign(new EventEmitter(), { close: vi.fn(), unref: vi.fn() }) as unknown as fs.FSWatcher);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const timeouts = vi.spyOn(globalThis, "setTimeout"), tail = vi.spyOn(f.mesh, "tail");
+    const receive = vi.fn((command: FabricControlCommand) => ({ accepted: true, messageId: command.commandId }));
+    f.owner.start(receive);
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      expect(f.saved("timer-B")).toMatchObject({ acceptance: { accepted: true } });
+      expect(blocked.calls()).toBe(1);
+      const reads = tail.mock.calls.length, timers = timeouts.mock.calls.length, armed = vi.getTimerCount();
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(tail).toHaveBeenCalledTimes(reads); expect(timeouts).toHaveBeenCalledTimes(timers);
+      expect(vi.getTimerCount()).toBe(armed); expect(blocked.calls()).toBe(1);
+      blocked.release.open(); await vi.advanceTimersByTimeAsync(0);
+      expect(f.acks().map(event => (event.data as { commandId: string }).commandId)).toEqual(["timer-A", "timer-C", "timer-B"]);
+      expect(receive.mock.calls.map(([command]) => command.commandId)).toEqual(["timer-B"]);
+      expect(blocked.highWater()).toBe(1);
+    } finally { blocked.release.open(); vi.restoreAllMocks(); vi.useRealTimers(); }
+  });
+
+  it.each([
+    ["steer", false], ["followUp", false], ["ask", true], ["stop", true],
+  ] as const)("9751: restart %s with saved=%s stays inline and blocks later admission", async (operation, saved) => {
+    const f = setup(), blocked = holdFirstAck(f), oldEpoch = "9751:predecessor";
+    const original = f.command("inline-A");
+    const a = { ...original, kind: operation, data: { ...original.data, operation, ownerIncarnation: oldEpoch } };
+    const acceptance = { accepted: true, messageId: "inline-predecessor-result" };
+    await f.own.put({ key: seenKey("inline-A"), identity: identity(ownerId), ifVersion: 0, value: {
+      format: 1, hostId: ownerId, commandId: "inline-A", targetId: "agent:same", ownerIncarnation: oldEpoch,
+      expiresAt: Date.now() + 60_000, ...(saved ? { acceptance } : {}),
+    } });
+    const persisted = f.own.get(seenKey("inline-A"), { fresh: true });
+    await f.mesh.publish(a); await f.mesh.publish(f.command("inline-B", "agent:other"));
+    const receive = vi.fn((command: FabricControlCommand) => ({ accepted: true, messageId: command.commandId }));
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    f.owner.start(receive);
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      expect(blocked.calls()).toBe(1); expect(receive).not.toHaveBeenCalled();
+      expect(f.mesh.get(seenKey("inline-B"), { fresh: true })).toBeUndefined();
+      expect(f.saved("inline-B")).toBeUndefined(); expect(f.acks()).toEqual([]);
+      blocked.release.open(); await vi.advanceTimersByTimeAsync(0);
+      expect(f.acks()).toHaveLength(2);
+      const ack = f.acks("inline-A")[0]!.data;
+      expect(ack).toEqual({ version: 1, commandId: "inline-A", targetId: "agent:same", ownerIncarnation: oldEpoch,
+        ...(saved ? acceptance : { accepted: false, error: "Fabric control outcome is indeterminate after owner restart" }) });
+      expect(ack).not.toHaveProperty("notRun");
+      expect(receive.mock.calls.map(([command]) => command.commandId)).toEqual(["inline-B"]);
+      expect(f.own.get(seenKey("inline-A"), { fresh: true })).toEqual(persisted);
+    } finally { blocked.release.open(); vi.restoreAllMocks(); vi.useRealTimers(); }
+  });
+
+  it.each(["local", "legacy-shared"] as const)("9751: cleanup after compaction protects an already-saved %s restart replay while its ACK is owned", async source => {
+    const f = setup({}, { maxEventLogBytes: 80_000, retainedEventLogBytes: 40_000 }), blocked = holdFirstAck(f);
+    const oldEpoch = "9751:predecessor", original = f.command("replay-protected"), now = Date.now;
+    const store = source === "local" ? f.own : f.mesh;
+    const acceptance = { accepted: true, messageId: "replay-protected-result" };
+    await store.put({ key: seenKey("replay-protected"), identity: identity(ownerId), ifVersion: 0, value: {
+      format: 1, hostId: ownerId, commandId: "replay-protected", targetId: "agent:same", ownerIncarnation: oldEpoch,
+      sequence: 1, expiresAt: Date.now() + 60_000, acceptance,
+    } });
+    const persisted = store.get(seenKey("replay-protected"), { fresh: true });
+    await f.mesh.publish({ ...original, data: { ...original.data, ownerIncarnation: oldEpoch } });
+    const receive = vi.fn((command: FabricControlCommand) => ({ accepted: true, messageId: command.commandId }));
+    f.owner.start(receive);
+    try {
+      await until(() => expect(blocked.calls()).toBe(1));
+      await store.put({ key: seenKey("replay-sweep-witness"), identity: identity(ownerId), ifVersion: 0, value: {
+        format: 1, hostId: ownerId, commandId: "replay-sweep-witness", targetId: "agent:other", sequence: 1,
+        expiresAt: 0, acceptance: { accepted: true },
+      } });
+      vi.spyOn(Date, "now").mockImplementation(() => now() + 16 * 60_000);
+      for (let index = 0; index < 100; index++) await f.mesh.publish({ topic: "9751.compact", from: identity(senderId), text: "x".repeat(900) });
+      expect(f.mesh.oldestSequence()).toBeGreaterThan(1);
+      await f.mesh.publish(f.command("replay-sweep-trigger", "agent:other", "followUp"));
+      await until(() => {
+        expect(f.saved("replay-sweep-trigger")).toMatchObject({ acceptance: { accepted: true } });
+        expect(store.get(seenKey("replay-sweep-witness"), { fresh: true })).toBeUndefined();
+      });
+      expect(store.get(seenKey("replay-protected"), { fresh: true })).toEqual(persisted);
+      expect(blocked.calls()).toBe(1);
+      blocked.release.open(); await until(() => expect(f.acks("replay-protected")).toHaveLength(1));
+      expect(f.acks("replay-protected")[0]!.data).toMatchObject({ ...acceptance, ownerIncarnation: oldEpoch });
+      expect(receive.mock.calls.map(([command]) => command.commandId)).toEqual(["replay-sweep-trigger"]);
+    } finally { blocked.release.open(); vi.restoreAllMocks(); }
+  }, 15_000);
+
+  it("9751: restart replays a saved predecessor outcome without adopting the new owner epoch", async () => {
+    const f = setup(), oldEpoch = "9751:predecessor", command = f.command("restart-saved");
+    command.data.ownerIncarnation = oldEpoch;
+    await f.own.put({ key: seenKey(command.data.commandId), identity: identity(ownerId), ifVersion: 0,
+      value: { format: 1, hostId: ownerId, commandId: command.data.commandId, targetId: "agent:same", ownerIncarnation: oldEpoch,
+        expiresAt: Date.now() + 60_000, acceptance: { accepted: true, messageId: "predecessor-result" } } });
+    await f.mesh.publish(command);
+    const receive = vi.fn(() => ({ accepted: true })); f.owner.start(receive);
+    await until(() => expect(f.acks(command.data.commandId)).toHaveLength(1));
+    expect(f.acks(command.data.commandId)[0]!.data).toMatchObject({ accepted: true, messageId: "predecessor-result", ownerIncarnation: oldEpoch });
+    expect(receive).not.toHaveBeenCalled();
+  });
+
+  it("9751: restart treats a predecessor claim without an outcome as indeterminate, never notRun", async () => {
+    const f = setup(), oldEpoch = "9751:predecessor", command = f.command("restart-claim");
+    command.data.ownerIncarnation = oldEpoch;
+    await f.own.put({ key: seenKey(command.data.commandId), identity: identity(ownerId), ifVersion: 0,
+      value: { format: 1, hostId: ownerId, commandId: command.data.commandId, targetId: "agent:same", ownerIncarnation: oldEpoch,
+        expiresAt: Date.now() + 60_000 } });
+    await f.mesh.publish(command);
+    const receive = vi.fn(() => ({ accepted: true })); f.owner.start(receive);
+    await until(() => expect(f.acks(command.data.commandId)).toHaveLength(1));
+    const ack = f.acks(command.data.commandId)[0]!.data;
+    expect(ack).toMatchObject({ accepted: false, ownerIncarnation: oldEpoch, error: "Fabric control outcome is indeterminate after owner restart" });
+    expect(ack).not.toHaveProperty("notRun"); expect(receive).not.toHaveBeenCalled();
+  });
+
+  it("9751: cleanup after compaction protects outcomes whose ACK is still owned", async () => {
+    const f = setup({}, { maxEventLogBytes: 80_000, retainedEventLogBytes: 40_000 }), blocked = holdFirstAck(f);
+    const receive = vi.fn((command: FabricControlCommand) => ({ accepted: true, messageId: command.commandId }));
+    const now = Date.now;
+    f.owner.start(receive);
+    try {
+      await f.mesh.publish(f.command("protected"));
+      await until(() => expect(blocked.calls()).toBe(1));
+      expect(f.saved("protected")).toMatchObject({ acceptance: { accepted: true } });
+      // This unowned expired row is a positive sweep witness; the owned row must survive the same sweep.
+      await f.own.put({ key: seenKey("sweep-witness"), identity: identity(ownerId), ifVersion: 0, value: {
+        format: 1, hostId: ownerId, commandId: "sweep-witness", targetId: "agent:other", sequence: 1,
+        expiresAt: 0, acceptance: { accepted: true },
+      } });
+      vi.spyOn(Date, "now").mockImplementation(() => now() + 16 * 60_000);
+      for (let index = 0; index < 100; index++) await f.mesh.publish({ topic: "9751.compact", from: identity(senderId), text: "x".repeat(900) });
+      expect(f.mesh.oldestSequence()).toBeGreaterThan(1);
+      await f.mesh.publish(f.command("sweep-trigger", "agent:other", "followUp"));
+      await until(() => {
+        expect(f.saved("sweep-trigger")).toMatchObject({ acceptance: { accepted: true } });
+        expect(f.saved("sweep-witness")).toBeUndefined();
+      });
+      expect(f.saved("protected")).toMatchObject({ acceptance: { accepted: true, messageId: "protected" } });
+      expect(blocked.calls()).toBe(1);
+      blocked.release.open();
+      await until(() => expect(f.acks("protected")).toHaveLength(1));
+      expect(receive.mock.calls.map(([command]) => command.commandId)).toEqual(["protected", "sweep-trigger"]);
+    } finally { blocked.release.open(); vi.restoreAllMocks(); }
+  }, 15_000);
+
+  it("9751: lease loss at the actual ACK commit fence preserves custody until consumption resumes", async () => {
+    let canConsume = true;
+    const f = setup({ canConsumeMesh: () => canConsume }), publish = f.mesh.publish.bind(f.mesh);
+    const receive = vi.fn(() => ({ accepted: true, messageId: "lease-saved" }));
+    let fenced = false;
+    const spy = vi.spyOn(f.mesh, "publish").mockImplementation(input => publish({ ...input,
+      data: typeof input.data !== "function" ? input.data : (at: number) => {
+        if (input.topic === "fabric.control.ack" && input.from.id === ownerId && !fenced) {
+          fenced = true; canConsume = false;
+        }
+        return (input.data as (at: number) => unknown)(at); // real callback under the event writer lock
+      },
+    }));
+    f.owner.start(receive);
+    try {
+      await f.mesh.publish(f.command("lease"));
+      await until(() => expect(fenced).toBe(true));
+      expect(f.acks("lease")).toEqual([]);
+      expect(f.saved("lease")).toMatchObject({ acceptance: { accepted: true, messageId: "lease-saved" } });
+      f.owner.pause();
+      await expect(f.owner.checkpointForRelease()).rejects.toThrow(/unsettled publication obligations/);
+      canConsume = true; f.owner.resume();
+      await until(() => expect(f.acks("lease")).toHaveLength(1));
+      expect(receive).toHaveBeenCalledOnce();
+      f.owner.pause(); await f.owner.checkpointForRelease();
+      expect(f.owner.releaseCheckpointReceipt()).toMatchObject({ admissionHeld: true });
+    } finally { canConsume = true; spy.mockRestore(); }
+  });
+
+  it("9751: pause checkpoint joins a saved ACK instead of certifying a quiet handler", async () => {
+    const f = setup(), blocked = holdFirstAck(f), receive = vi.fn(() => ({ accepted: true, messageId: "pause-saved" }));
+    let checkpointSettled = false;
+    f.owner.start(receive);
+    try {
+      await f.mesh.publish(f.command("pause"));
+      await until(() => expect(blocked.calls()).toBe(1));
+      expect(f.saved("pause")).toMatchObject({ acceptance: { accepted: true } });
+      f.owner.pause();
+      const checkpoint = f.owner.checkpointForRelease();
+      void checkpoint.then(() => { checkpointSettled = true; }, () => { checkpointSettled = true; });
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(checkpointSettled).toBe(false);
+      expect(() => f.owner.releaseCheckpointReceipt()).toThrow(/unavailable|unsettled/);
+      blocked.release.open(); await settled(checkpoint);
+      expect(f.acks("pause")).toHaveLength(1);
+      expect(f.owner.releaseCheckpointReceipt()).toMatchObject({ admissionHeld: true });
+      expect(receive).toHaveBeenCalledOnce();
+    } finally { blocked.release.open(); blocked.spy.mockRestore(); }
+  });
+
+  it("9751: CLOSE JOIN drains queued ACKs across an awaited-save worker-generation handoff", async () => {
+    for (const handoff of ["after-worker-settlement", "at-worker-completion"] as const) {
+    const f = setup(), firstAck = gate(), newcomerAck = gate(), saveReturn = gate();
+    const publish = f.mesh.publish.bind(f.mesh), put = MeshStore.prototype.put;
+    const receive = vi.fn((command: FabricControlCommand) => ({ accepted: true, messageId: command.commandId }));
+    let attempts = 0, saveHeld = false, closeSettled = false;
+    const publication = vi.spyOn(f.mesh, "publish").mockImplementation(async input => {
+      let attempt = 0;
+      if (input.topic === "fabric.control.ack" && input.from.id === ownerId) {
+        attempt = ++attempts;
+        if (attempt === 1) await firstAck.promise;
+        if (attempt === 4) await newcomerAck.promise;
+      }
+      const event = await publish(input);
+      // Second schedule: D's awaited save returns exactly as C's ACK publication returns.
+      // Reader handoff and old-worker completion now compete in adjacent promise continuations.
+      if (attempt === 3 && handoff === "at-worker-completion") saveReturn.open();
+      return event;
+    });
+    const saving = vi.spyOn(MeshStore.prototype, "put").mockImplementation(async function (this: MeshStore, input) {
+      const result = await put.call(this, input); // real saved acceptance exists before this return gate
+      if (this.root === f.own.root && input.key === seenKey("D") &&
+          (input.value as { acceptance?: unknown }).acceptance && !saveHeld) {
+        saveHeld = true; await saveReturn.promise;
+      }
+      return result;
+    });
+    f.owner.start(receive);
+    try {
+      await f.mesh.publish(f.command("A"));
+      await until(() => expect(attempts).toBe(1));
+      for (const id of ["B", "C"]) {
+        await f.mesh.publish(f.command(id, "agent:same", "followUp"));
+        await until(() => expect(f.saved(id)).toMatchObject({ acceptance: { accepted: true, messageId: id } }));
+      }
+      expect(attempts).toBe(1); // A active plus two queued ACKs, not merely a single blocked handler
+      await f.mesh.publish(f.command("D"));
+      await until(() => expect(saveHeld).toBe(true));
+      expect(f.saved("D")).toMatchObject({ acceptance: { accepted: true, messageId: "D" } });
+      const close = f.owner.close();
+      void close.then(() => { closeSettled = true; }, () => { closeSettled = true; });
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(closeSettled).toBe(false);
+      firstAck.open();
+      await until(() => expect(f.acks().map(event => (event.data as { messageId: string }).messageId)).toEqual(["A", "B", "C"]));
+      if (handoff === "after-worker-settlement") {
+        // First schedule: finish the old worker while D still awaits its real save return.
+        // D then requires a newcomer generation, not another job on the original worker.
+        await new Promise<void>(resolve => setImmediate(resolve));
+        expect(attempts).toBe(3); expect(closeSettled).toBe(false);
+        saveReturn.open();
+      }
+      await until(() => expect(attempts).toBe(4));
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(closeSettled).toBe(false); // rejecting for leftover custody is not a successful CLOSE JOIN
+      expect(f.acks("D")).toEqual([]);
+      newcomerAck.open();
+      await expect(settled(close)).resolves.toBeUndefined();
+      expect(f.acks().map(event => (event.data as { messageId: string }).messageId)).toEqual(["A", "B", "C", "D"]);
+      expect(receive.mock.calls.map(([command]) => command.commandId)).toEqual(["A", "B", "C", "D"]);
+      expect(attempts).toBe(4);
+    } finally { firstAck.open(); newcomerAck.open(); saveReturn.open(); saving.mockRestore(); publication.mockRestore(); }
+    }
+  }, 15_000);
 });
 
 // Keep reason: raw control admission is a pre-publication trust boundary, including
@@ -1556,6 +2487,14 @@ describe("FabricControlPlane", () => {
       const fresh = store.listAll("topology/control-seen/").find((entry) =>
         (entry.value as { hostId?: string }).hostId === "host:receiver");
       expect(fresh?.value).toMatchObject({ explicitDeadline: true });    // new claims carry the flag
+      const bulk = Array.from({ length: 137 }, (_, n) => `command:bulk-${n}`);
+      const retiredValue = (hostId: string, commandId: string) => ({ format: 1, hostId, commandId,
+        targetId: "agent:target", expiresAt: start, explicitDeadline: true, sequence: 0 });
+      await store.writeBatch({ identity: identity("host:other"), ops: bulk.map(commandId => ({ kind: "put" as const,
+        key: seenKey("host:other", commandId), value: retiredValue("host:other", commandId) })) });
+      const own = ownStore(meshRoot, "host:receiver");
+      await own.writeBatch({ identity: identity("host:receiver"), ops: bulk.map(commandId => ({ kind: "put" as const,
+        key: seenKey("host:receiver", commandId), value: retiredValue("host:receiver", commandId) })) });
       const batches = vi.spyOn(MeshStore.prototype, "writeBatch");
       const now = Date.now;
       vi.spyOn(Date, "now").mockImplementation(() => now() - start + later);
@@ -1569,7 +2508,11 @@ describe("FabricControlPlane", () => {
       const sweeps = batches.mock.calls.filter(([input]) => input.ops.every((op) => op.kind === "delete")
         && input.ops.some((op) => op.key.startsWith("topology/control-seen/")));
       expect(sweeps.length).toBeGreaterThanOrEqual(1);
-      expect(sweeps[0]![0].ops.every((op) => op.ifVersion !== undefined)).toBe(true);   // one fenced batch
+      await vi.waitFor(() => {
+        expect(bulk.every(id => !store.get(seenKey("host:other", id), { fresh: true }))).toBe(true);
+        expect(bulk.every(id => !own.get(seenKey("host:receiver", id), { fresh: true }))).toBe(true);
+      }, { timeout: 3_000, interval: 20 });
+      expect(sweeps.every(([input]) => input.ops.length <= 64 && input.ops.every(op => op.ifVersion !== undefined))).toBe(true);
     });
 
     // review/astra on #65: a runtime before phase 1 checks the deadline only at admission and knows

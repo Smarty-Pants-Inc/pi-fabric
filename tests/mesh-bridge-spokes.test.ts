@@ -1,15 +1,16 @@
-import { createHash } from "node:crypto";
+import crypto, { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
+import { setTimeout as sleep } from "node:timers/promises";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { BRIDGE_LEASE_MS, MeshBridge, RemoteBridgeSide, serveBridgeAgent, StoreBridgeSide } from "../src/mesh/bridge.js";
+import { BRIDGE_LEASE_MS, MeshBridge, RemoteBridgeSide, serveBridgeAgent, StoreBridgeSide, type BridgePresence } from "../src/mesh/bridge.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
 import { AgentsProvider } from "../src/providers/agents-provider.js";
-import { readHostLease, writeHostLease } from "../src/topology/host-leases.js";
+import { hostLeasePath, readHostLease, writeHostLease } from "../src/topology/host-leases.js";
 import { writeParticipantFile } from "../src/topology/participant-files.js";
 
 // #11199: exercise lease-removal admission with recorded calls, never delete a lease locally.
@@ -28,6 +29,7 @@ const scratchRoots: string[] = [];
 afterEach(async () => {
   for (const close of closers.splice(0)) await close();
   vi.restoreAllMocks();
+  vi.useRealTimers();
   removals.length = 0;
   // #11199 permits hygiene of this test's own mkdtemp fixtures, not product deletion.
   for (const root of scratchRoots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
@@ -89,6 +91,12 @@ const native = async (store: MeshStore, name: string, ttl = 60_000, incarnationT
   return { identity, ownerIncarnation, host };
 };
 
+const tinyStores = () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-incarnation-"));
+  scratchRoots.push(dir);
+  return { dir, hub: new MeshStore(path.join(dir, "hub"), 64 * 1024, 100), peer: new MeshStore(path.join(dir, "peer"), 64 * 1024, 100) };
+};
+
 const fixture = async (targetTtl = 60_000, targetToken?: string,
   afterRelayDelivery?: (event: import("../src/mesh/bridge.js").BridgePublish) => Promise<void>) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-spokes-"));
@@ -121,7 +129,421 @@ const fixture = async (targetTtl = 60_000, targetToken?: string,
   return { dir, stores, mains, links, drain };
 };
 
+// RELAY-1 (Smarty-Pants-Inc/smarty-dev#10068): hold only B's hub-local mirror write.
+// The two RPC transports remain independent, so A can refresh without servicing B.
+const holdHubMirror = async (bridge: MeshBridge) => {
+  let resume!: () => void, entered!: () => void;
+  const gate = new Promise<void>(resolve => { resume = resolve; });
+  const observed = new Promise<void>(resolve => { entered = resolve; });
+  const mirror = bridge.options.local.mirror.bind(bridge.options.local);
+  vi.spyOn(bridge.options.local, "mirror").mockImplementationOnce(async (...args) => {
+    entered();
+    await gate;
+    await mirror(...args);
+  });
+  const syncing = bridge.syncPresence();
+  void syncing.catch(() => undefined);
+  await observed;
+  return async () => { resume(); await syncing; };
+};
+const sourceCursor = (bridge: MeshBridge): number =>
+  (JSON.parse(fs.readFileSync(bridge.options.cursorPath, "utf8")) as { toLocal: { after: number } }).toLocal.after;
+const relaySender = (f: Awaited<ReturnType<typeof fixture>>) => {
+  const a = f.stores.ryzen3!, source = f.mains.ryzen3!;
+  const directory = new ParticipantDirectory(a, { enabled: true, hostId: source.identity.id, rootId: source.identity.id, identity: source.identity });
+  const sender = new FabricControlPlane(a, source.identity, { enabled: true, hostId: source.identity.id,
+    acknowledgementTimeoutMs: 120_000, bridgeTimeoutMs: 120_000,
+    readMirroredOwner: (...args) => directory.mirroredControlOwner(...args) });
+  sender.start(() => ({ accepted: false }));
+  closers.push(() => sender.close());
+  return sender;
+};
+
 describe("spoke-to-spoke roots and addressed control through the hub", () => {
+  it("RELAY-1 retains A's cursor while live B's mirror is held and expired, then executes and ACKs once across retries/restart", async () => {
+    const f = await fixture();
+    const a = f.stores.ryzen3!, b = f.stores.ryzen2!, hub = f.stores.ryzen1!;
+    const source = f.mains.ryzen3!, target = f.mains.ryzen2!;
+    const sourceLink = f.links.find(link => link.bridge.options.remoteName === "ryzen3")!;
+    const destinationLink = f.links.find(link => link.bridge.options.remoteName === "ryzen2")!;
+    let now = Date.now();
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const sender = relaySender(f);
+    const receiver = new FabricControlPlane(b, target.identity, { enabled: true, hostId: target.identity.id,
+      ownerIncarnation: target.ownerIncarnation });
+    const receive = vi.fn(() => ({ accepted: true, messageId: "relay-1-recovered-on-B" }));
+    receiver.start(receive);
+    closers.push(() => receiver.close());
+    const marker = "relay-1-held-mirror-private-command";
+    const pending = sender.request(target.identity.id, target.identity.id, "followUp",
+      { message: marker, ownerIncarnation: target.ownerIncarnation }, target.identity.id,
+      { routedRemoteHost: "ryzen2", idempotencyKey: "relay-1-held-mirror-key" });
+    void pending.catch(() => undefined);
+    await vi.waitFor(() => expect(events(a, "fabric.control.command")).toHaveLength(1));
+    const command = events(a, "fabric.control.command")[0]!;
+    expect(command.data).toMatchObject({ destinationRemoteHost: "ryzen2", ownerIncarnation: target.ownerIncarnation });
+    const checkpoint = fs.readFileSync(sourceLink.bridge.options.cursorPath, "utf8");
+    const before = sourceCursor(sourceLink.bridge);
+    const release = await holdHubMirror(destinationLink.bridge);
+    try {
+      // Native leases have 40 s left; only translated bridge authority expired.
+      now += BRIDGE_LEASE_MS + 5_000;
+      expect(readHostLease(b.root, target.identity.id)!.expiresAt).toBeGreaterThan(now);
+      expect(readHostLease(hub.root, target.identity.id)!.expiresAt).toBeLessThan(now);
+      await sourceLink.bridge.syncPresence();
+      expect(sourceLink.bridge.options.local.holds!(source.identity.id, source.identity)).toBe(true);
+      await sourceLink.bridge.step();
+      expect(sourceCursor(sourceLink.bridge)).toBe(before);
+      expect(events(a, "fabric.control.ack")).toEqual([]);
+      expect(events(b, "fabric.control.command")).toEqual([]);
+      expect(events(b, "fabric.control.ack")).toEqual([]);
+      expect(receive).not.toHaveBeenCalled();
+      expect(events(hub, "fabric.control.command")).toEqual([]);
+      expect(events(hub, "fabric.control.ack")).toEqual([]);
+      expect(persistedMarkerFiles(hub.root, marker)).toEqual([]);
+      now += 1_000;
+      await sourceLink.bridge.syncPresence();
+      await sourceLink.bridge.step();
+      expect(sourceCursor(sourceLink.bridge)).toBe(before);
+      expect(events(a, "fabric.control.ack")).toEqual([]);
+      expect(receive).not.toHaveBeenCalled();
+      await release();
+      // The old held sample lands stale. A NEW B sample must authorize recovery.
+      await destinationLink.bridge.syncPresence();
+      await sourceLink.bridge.syncPresence();
+      await sourceLink.bridge.step();
+      await vi.waitFor(() => expect(events(b, "fabric.control.ack")).toHaveLength(1));
+      await destinationLink.bridge.step();
+      await sourceLink.bridge.step();
+      await expect(pending).resolves.toMatchObject({ acknowledged: true, messageId: "relay-1-recovered-on-B" });
+      expect(sourceCursor(sourceLink.bridge)).toBeGreaterThanOrEqual(command.sequence);
+      expect(receive).toHaveBeenCalledOnce();
+      expect(receive.mock.calls[0]).toEqual(expect.arrayContaining([expect.objectContaining({ message: marker }),
+        expect.objectContaining({ id: source.identity.id, verified: "bridge" })]));
+      expect(events(b, "fabric.control.command")).toHaveLength(1);
+      expect(events(b, "fabric.control.command")[0]).toMatchObject({ verification: "bridge", from: source.identity,
+        data: { bridge: { from: "ryzen3", via: "ryzen1" } } });
+      expect(events(a, "fabric.control.ack")).toHaveLength(1);
+      expect(events(a, "fabric.control.ack")[0]).toMatchObject({ from: target.identity,
+        data: { accepted: true, bridge: { from: "ryzen2", via: "ryzen1" } } });
+      await a.publish({ topic: command.topic, kind: command.kind, from: source.identity, to: target.identity.id, data: command.data });
+      await sourceLink.bridge.step();
+      // Rewind the checkpoint: real body-free receipts and durable dedupe must win.
+      fs.writeFileSync(sourceLink.bridge.options.cursorPath, checkpoint);
+      sourceLink.bridge = new MeshBridge({ ...sourceLink.bridge.options,
+        local: new StoreBridgeSide(new MeshStore(hub.root, 64 * 1024, 100), "ryzen3", () => Date.now()) });
+      await sourceLink.bridge.start();
+      await sourceLink.bridge.step();
+      await destinationLink.bridge.step();
+      await sourceLink.bridge.step();
+      expect(receive).toHaveBeenCalledOnce();
+      expect(events(b, "fabric.control.command")).toHaveLength(1);
+      expect(events(b, "fabric.control.ack")).toHaveLength(1);
+      expect(events(a, "fabric.control.ack")).toHaveLength(1);
+      expect(persistedMarkerFiles(hub.root, marker)).toEqual([]);
+      for (const receipt of events(hub, "fabric.control.command")) {
+        for (const field of ["data", "text", "message"]) expect(receipt).not.toHaveProperty(field);
+      }
+    } finally { await release(); }
+  });
+
+  it("RELAY-1 bounds unknown B authority to 15 s from the first pending event despite 1 s retries and fresh A mirrors", async () => {
+    const f = await fixture();
+    const a = f.stores.ryzen3!, b = f.stores.ryzen2!, hub = f.stores.ryzen1!;
+    const source = f.mains.ryzen3!, target = f.mains.ryzen2!;
+    const sourceLink = f.links.find(link => link.bridge.options.remoteName === "ryzen3")!;
+    const destinationLink = f.links.find(link => link.bridge.options.remoteName === "ryzen2")!;
+    let now = Date.now();
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const marker = "relay-1-bounded-unknown-private-command";
+    // Isolate the bridge grace from the sender's independent directory-stale auto-cancel.
+    // The recovery test above covers a real control-plane waiter and receiver.
+    await a.publish({ topic: "fabric.control.command", kind: "followUp", from: source.identity, to: target.identity.id,
+      data: { version: 1, commandId: "relay-1-bounded-unknown", targetId: target.identity.id, operation: "followUp",
+        replyTo: source.identity.id, requestedAt: Date.now(), deadlineAt: Date.now() + 120_000,
+        destinationRemoteHost: "ryzen2", ownerIncarnation: target.ownerIncarnation, message: marker } });
+    await vi.waitFor(() => expect(events(a, "fabric.control.command")).toHaveLength(1));
+    const command = events(a, "fabric.control.command")[0]!;
+    const before = sourceCursor(sourceLink.bridge);
+    const release = await holdHubMirror(destinationLink.bridge);
+    try {
+      now += BRIDGE_LEASE_MS + 5_000;
+      const firstPendingAt = now;
+      for (let elapsed = 0; elapsed < BRIDGE_LEASE_MS; elapsed += 1_000) {
+        now = firstPendingAt + elapsed;
+        await sourceLink.bridge.syncPresence();
+        expect(sourceLink.bridge.options.local.holds!(source.identity.id, source.identity)).toBe(true);
+        await sourceLink.bridge.step();
+        expect(sourceCursor(sourceLink.bridge), `retained at ${elapsed} ms`).toBe(before);
+        expect(events(a, "fabric.control.ack")).toEqual([]);
+        expect(events(b, "fabric.control.command")).toEqual([]);
+        expect(events(hub, "fabric.control.command")).toEqual([]);
+      }
+      now = firstPendingAt + BRIDGE_LEASE_MS + 1;
+      expect(readHostLease(b.root, target.identity.id)!.expiresAt).toBeGreaterThan(now);
+      await sourceLink.bridge.syncPresence();
+      await sourceLink.bridge.step();
+      expect(sourceCursor(sourceLink.bridge)).toBeGreaterThanOrEqual(command.sequence);
+      expect(events(a, "fabric.control.ack")).toHaveLength(1);
+      expect(events(a, "fabric.control.ack")[0]).toMatchObject({ verification: "bridge", to: source.identity.id,
+        from: { id: "bridge:ryzen1" }, data: { accepted: false, retryable: true,
+          errorCode: "FABRIC_RELAY_DESTINATION_UNAVAILABLE", bridge: { from: "ryzen1", id: command.id } } });
+      now += 1_000;
+      await sourceLink.bridge.syncPresence();
+      await sourceLink.bridge.step();
+      expect(events(a, "fabric.control.ack")).toHaveLength(1);
+      expect(events(b, "fabric.control.command")).toEqual([]);
+      expect(events(b, "fabric.control.ack")).toEqual([]);
+      expect(events(hub, "fabric.control.command")).toEqual([]);
+      expect(events(hub, "fabric.control.ack")).toEqual([]);
+      expect(persistedMarkerFiles(hub.root, marker)).toEqual([]);
+      await release();
+      await destinationLink.bridge.syncPresence();
+      await sourceLink.bridge.syncPresence();
+      await sourceLink.bridge.step();
+      await destinationLink.bridge.step();
+      await sourceLink.bridge.step();
+      expect(events(a, "fabric.control.ack")).toHaveLength(1);
+      expect(events(b, "fabric.control.command")).toEqual([]);
+      expect(events(b, "fabric.control.ack")).toEqual([]);
+      expect(events(hub, "fabric.control.command")).toEqual([]);
+    } finally { await release(); }
+  });
+
+  it.each([false, true])("fixed1s RELAY-1 run() ACKs at persisted original + 15 s before a 30 s safety wake (restart=%s)", async restart => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    const f = await fixture();
+    const a = f.stores.ryzen3!, b = f.stores.ryzen2!, hub = f.stores.ryzen1!;
+    const source = f.mains.ryzen3!, target = f.mains.ryzen2!;
+    const link = f.links.find(candidate => candidate.bridge.options.remoteName === "ryzen3")!;
+    // B stays live at its origin, but its hub projection expires without another B pass.
+    // Withhold every notification, including our own mirror and ACK writes: only the
+    // retained-boundary deadline may finish this command at the exact virtual millisecond.
+    vi.spyOn(link.bridge.options.local, "subscribeChanges").mockImplementation(() => () => undefined);
+    vi.spyOn(link.remote, "subscribeChanges").mockImplementation(async () => () => undefined);
+    vi.setSystemTime(Date.now() + BRIDGE_LEASE_MS + 5_000);
+    expect(readHostLease(b.root, target.identity.id)!.expiresAt).toBeGreaterThan(Date.now());
+    expect(readHostLease(hub.root, target.identity.id)!.expiresAt).toBeLessThan(Date.now());
+    const marker = `fixed1s-relay-deadline-private-${restart}`;
+    const command = await a.publish({ topic: "fabric.control.command", kind: "followUp", from: source.identity, to: target.identity.id,
+      data: { version: 1, commandId: `fixed1s-relay-deadline-${restart}`, targetId: target.identity.id,
+        operation: "followUp", replyTo: source.identity.id, requestedAt: Date.now(), deadlineAt: Date.now() + 120_000,
+        destinationRemoteHost: "ryzen2", ownerIncarnation: target.ownerIncarnation, message: marker } });
+    const before = sourceCursor(link.bridge);
+    link.bridge = new MeshBridge({ ...link.bridge.options, membershipRetryMs: 30_000, stopMs: 100 });
+    const cursor = () => JSON.parse(fs.readFileSync(link.bridge.options.cursorPath, "utf8")) as {
+      toLocal: { after: number; relayGrace?: { sequence: number; startedAt: number; id?: string } };
+    };
+    // Real store/stdio completion is observed without advancing fake wall time. vi.waitFor
+    // would advance timers automatically and could conceal an early or late grace ACK.
+    const observe = async (check: () => boolean) => {
+      const deadline = performance.now() + 4_000;
+      while (!check() && performance.now() < deadline) await sleep(2);
+      expect(check(), "bridge completion at fixed virtual time").toBe(true);
+    };
+    let failure: unknown;
+    const launch = () => {
+      const bridge = link.bridge;
+      const running = bridge.run().catch(error => { failure = error; });
+      closers.unshift(async () => { await bridge.stop(); await running; });
+      return { bridge, running };
+    };
+    let live = launch();
+    await observe(() => cursor().toLocal.relayGrace?.sequence === command.sequence || failure !== undefined);
+    expect(failure).toBeUndefined();
+    const original = cursor().toLocal.relayGrace!;
+    expect(original).toMatchObject({ sequence: command.sequence, startedAt: Date.now() });
+    expect(sourceCursor(link.bridge)).toBe(before);
+    expect(events(a, "fabric.control.ack")).toEqual([]);
+    if (restart) {
+      await vi.advanceTimersByTimeAsync(4_000);
+      // Stop closes stdio, so reopen the actual transport against the same durable A
+      // store. Neither the source command nor its persisted grace is rewritten.
+      await live.bridge.stop();
+      await live.running;
+      const input = new PassThrough(), output = new PassThrough();
+      const serving = serveBridgeAgent(new StoreBridgeSide(a, "ryzen1", () => Date.now()), input, output);
+      const remote = new RemoteBridgeSide(output, input);
+      closers.push(async () => { remote.close(); input.end(); await serving; output.end(); });
+      vi.spyOn(remote, "subscribeChanges").mockImplementation(async () => () => undefined);
+      link.remote = remote;
+      // stop() also seals the old local side after withdrawal; a process restart creates
+      // both side objects again rather than reusing that permanently withdrawn instance.
+      const local = new StoreBridgeSide(hub, "ryzen3", () => Date.now());
+      vi.spyOn(local, "subscribeChanges").mockImplementation(() => () => undefined);
+      link.bridge = new MeshBridge({ ...link.bridge.options, local, remote });
+      const reads = vi.spyOn(remote, "read");
+      live = launch();
+      await observe(() => reads.mock.calls.length > 0 || failure !== undefined);
+      expect(failure).toBeUndefined();
+      expect(cursor().toLocal.relayGrace).toEqual(original);
+    }
+    const deadline = original.startedAt + BRIDGE_LEASE_MS;
+    expect(Date.now()).toBeLessThan(deadline);
+    await vi.advanceTimersByTimeAsync(deadline - Date.now() - 1);
+    expect(Date.now()).toBe(deadline - 1);
+    expect(cursor().toLocal.relayGrace).toEqual(original);
+    expect(sourceCursor(link.bridge)).toBe(before);
+    expect(events(a, "fabric.control.ack")).toEqual([]);
+    expect(events(b, "fabric.control.command")).toEqual([]);
+    await vi.advanceTimersByTimeAsync(1);
+    await observe(() => (events(a, "fabric.control.ack").length === 1 && sourceCursor(link.bridge) >= command.sequence) || failure !== undefined);
+    expect(Date.now()).toBe(deadline);
+    expect(failure).toBeUndefined();
+    expect(sourceCursor(link.bridge)).toBeGreaterThanOrEqual(command.sequence);
+    expect(cursor().toLocal.relayGrace).toBeUndefined();
+    expect(events(a, "fabric.control.ack")[0]).toMatchObject({ createdAt: deadline, verification: "bridge",
+      to: source.identity.id, from: { id: "bridge:ryzen1" }, data: { accepted: false, retryable: true,
+        errorCode: "FABRIC_RELAY_DESTINATION_UNAVAILABLE", bridge: { from: "ryzen1", id: command.id } } });
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(events(a, "fabric.control.ack")).toHaveLength(1);
+    expect(events(b, "fabric.control.command")).toEqual([]);
+    expect(events(b, "fabric.control.ack")).toEqual([]);
+    expect(events(hub, "fabric.control.command")).toEqual([]);
+    expect(events(hub, "fabric.control.ack")).toEqual([]);
+    expect(persistedMarkerFiles(hub.root, marker)).toEqual([]);
+  }, 12_000);
+
+  it("RELAY-1 immediately refuses a never-seen B destination once rather than granting uncertainty grace", async () => {
+    const f = await fixture();
+    const a = f.stores.ryzen3!, b = f.stores.ryzen2!, hub = f.stores.ryzen1!;
+    const source = f.mains.ryzen3!;
+    const sourceLink = f.links.find(link => link.bridge.options.remoteName === "ryzen3")!;
+    relaySender(f);
+    const targetId = "session:never-registered-00000000";
+    const marker = "relay-1-never-seen-private-command";
+    expect(hub.get(hostKey(targetId))).toBeUndefined();
+    await a.publish({ topic: "fabric.control.command", kind: "followUp", from: source.identity, to: targetId,
+      data: { version: 1, commandId: "relay-1-never-seen", targetId, operation: "followUp", replyTo: source.identity.id,
+        requestedAt: Date.now(), deadlineAt: Date.now() + 60_000, destinationRemoteHost: "ryzen2", message: marker } });
+    const command = events(a, "fabric.control.command")[0]!;
+    await sourceLink.bridge.step();
+    expect(sourceCursor(sourceLink.bridge)).toBeGreaterThanOrEqual(command.sequence);
+    expect(events(a, "fabric.control.ack")).toHaveLength(1);
+    expect(events(a, "fabric.control.ack")[0]).toMatchObject({ verification: "bridge", to: source.identity.id,
+      from: { id: "bridge:ryzen1" }, data: { accepted: false, retryable: true,
+        errorCode: "FABRIC_RELAY_DESTINATION_UNAVAILABLE", bridge: { from: "ryzen1", id: command.id } } });
+    await sourceLink.bridge.step();
+    expect(events(a, "fabric.control.ack")).toHaveLength(1);
+    expect(events(b, "fabric.control.command")).toEqual([]);
+    expect(events(b, "fabric.control.ack")).toEqual([]);
+    expect(events(hub, "fabric.control.command")).toEqual([]);
+    expect(events(hub, "fabric.control.ack")).toEqual([]);
+    expect(persistedMarkerFiles(hub.root, marker)).toEqual([]);
+  });
+  it.each(["retained", "missing", "Infinity", "NaN", "string", "future", "null-record", "primitive-record"] as const)(
+    "RELAY-1 persists restart-bounded destination grace and repairs %s cursor metadata from local time", async mode => {
+      const f = await fixture();
+      const a = f.stores.ryzen3!, b = f.stores.ryzen2!, hub = f.stores.ryzen1!;
+      const source = f.mains.ryzen3!, target = f.mains.ryzen2!;
+      const sourceLink = f.links.find(link => link.bridge.options.remoteName === "ryzen3")!;
+      const destinationLink = f.links.find(link => link.bridge.options.remoteName === "ryzen2")!;
+      let now = Date.now();
+      vi.spyOn(Date, "now").mockImplementation(() => now);
+      const marker = `relay-1-restart-${mode}-private-command`;
+      // The sender's directory-stale auto-cancel is independent of bridge grace.
+      await a.publish({ topic: "fabric.control.command", kind: "followUp", from: source.identity, to: target.identity.id,
+        data: { version: 1, commandId: `relay-1-restart-${mode}`, targetId: target.identity.id, operation: "followUp",
+          replyTo: source.identity.id, requestedAt: now, deadlineAt: now + 120_000,
+          destinationRemoteHost: "ryzen2", ownerIncarnation: target.ownerIncarnation, message: marker } });
+      const command = events(a, "fabric.control.command")[0]!;
+      const before = sourceCursor(sourceLink.bridge);
+      const readCursor = () => JSON.parse(fs.readFileSync(sourceLink.bridge.options.cursorPath, "utf8")) as {
+        toLocal: { after: number; mark: number; offset?: number; [field: string]: unknown };
+      };
+      const graceFields = () => Object.fromEntries(Object.entries(readCursor().toLocal)
+        .filter(([field]) => !["after", "mark", "offset"].includes(field)));
+      const restart = async () => {
+        sourceLink.bridge = new MeshBridge({ ...sourceLink.bridge.options,
+          local: new StoreBridgeSide(new MeshStore(hub.root, 64 * 1024, 100), "ryzen3", () => Date.now()) });
+        await sourceLink.bridge.start();
+        await sourceLink.bridge.step();
+      };
+      const step = async () => {
+        await sourceLink.bridge.syncPresence();
+        expect(sourceLink.bridge.options.local.holds!(source.identity.id, source.identity)).toBe(true);
+        expect(readHostLease(hub.root, target.identity.id)!.expiresAt).toBeLessThan(now);
+        expect(hub.get(hostKey(target.identity.id), { fresh: true })!.value).toMatchObject({ remoteHost: "ryzen2" });
+        expect(readHostLease(b.root, target.identity.id)!.expiresAt).toBeGreaterThan(now);
+        await sourceLink.bridge.step();
+      };
+      const retained = () => {
+        expect(sourceCursor(sourceLink.bridge)).toBe(before);
+        expect(events(a, "fabric.control.ack")).toEqual([]);
+        expect(events(b, "fabric.control.command")).toEqual([]);
+      };
+      const release = await holdHubMirror(destinationLink.bridge);
+      try {
+        now += BRIDGE_LEASE_MS + 5_000;
+        const firstPendingAt = now;
+        await step();
+        retained();
+        let boundedFrom = firstPendingAt;
+        if (mode !== "retained") {
+          now += 2_000;
+          boundedFrom = now;
+          const cursor = readCursor();
+          const { after, mark, offset } = cursor.toLocal;
+          if (mode === "missing") {
+            cursor.toLocal = { after, mark, ...(offset !== undefined ? { offset } : {}) };
+          } else if (mode === "null-record" || mode === "primitive-record") {
+            const fields = Object.keys(graceFields());
+            for (const field of fields.length ? fields : ["relayGrace"]) {
+              cursor.toLocal[field] = mode === "null-record" ? null : "not-a-grace-record";
+            }
+          } else {
+            const invalid = mode === "Infinity" ? Infinity : mode === "NaN" ? NaN
+              : mode === "future" ? now + 120_000 : "not-a-local-timestamp";
+            const corrupt = (value: unknown): unknown => {
+              if (typeof value === "number" && value >= firstPendingAt) return invalid;
+              if (Array.isArray(value)) return value.map(corrupt);
+              if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, corrupt(v)]));
+              return value;
+            };
+            const fields = Object.keys(graceFields());
+            for (const field of fields) cursor.toLocal[field] = corrupt(cursor.toLocal[field]);
+            if (!fields.length) cursor.toLocal.relayGrace = { sequence: command.sequence, startedAt: invalid };
+          }
+          // JSON persists Infinity and NaN as null, exercising actual disk data.
+          fs.writeFileSync(sourceLink.bridge.options.cursorPath, JSON.stringify(cursor));
+          await restart();
+          retained();
+        }
+        const persistedGrace = graceFields();
+        now = boundedFrom + 4_000;
+        await restart();
+        await step();
+        retained();
+        expect(graceFields()).toEqual(persistedGrace);
+        now = boundedFrom + 9_000;
+        await restart();
+        await step();
+        retained();
+        expect(graceFields()).toEqual(persistedGrace);
+        now = boundedFrom + BRIDGE_LEASE_MS - 1;
+        await step();
+        retained();
+        now = boundedFrom + BRIDGE_LEASE_MS;
+        await step();
+        expect(sourceCursor(sourceLink.bridge)).toBeGreaterThanOrEqual(command.sequence);
+        expect(events(a, "fabric.control.ack")).toHaveLength(1);
+        expect(events(a, "fabric.control.ack")[0]).toMatchObject({ verification: "bridge", to: source.identity.id,
+          from: { id: "bridge:ryzen1" }, data: { accepted: false, retryable: true,
+            errorCode: "FABRIC_RELAY_DESTINATION_UNAVAILABLE", bridge: { from: "ryzen1", id: command.id } } });
+        expect(Object.keys(persistedGrace).length).toBeGreaterThan(0);
+        expect(graceFields()).toEqual({});
+        now += 1_000;
+        await restart();
+        await step();
+        expect(events(a, "fabric.control.ack")).toHaveLength(1);
+        expect(events(b, "fabric.control.command")).toEqual([]);
+        expect(events(b, "fabric.control.ack")).toEqual([]);
+        expect(events(hub, "fabric.control.command")).toEqual([]);
+        expect(events(hub, "fabric.control.ack")).toEqual([]);
+        expect(persistedMarkerFiles(hub.root, marker)).toEqual([]);
+      } finally { await release(); }
+    });
+
   it("routes a by-id followUp A -> hub -> B once, returns an origin-authenticated ACK, and keeps hub-local delivery", async () => {
     const f = await fixture();
     const a = f.stores.ryzen3!, b = f.stores.ryzen2!, hub = f.stores.ryzen1!;
@@ -229,6 +651,57 @@ describe("spoke-to-spoke roots and addressed control through the hub", () => {
     await vi.waitFor(() => expect(a.get(participantKey(root.identity.id), { fresh: true })).toBeUndefined(), { timeout: 5_000 });
     expect(directory.get(f.mains.ryzen2!.identity.id, undefined, { fresh: true })).toMatchObject({ stale: false });
     expect(failure).toBeUndefined();
+  });
+
+  // Trust boundary: already-imported non-controls are not new cross-spoke traffic or refusals.
+  // Read/tail must consume their cursor range silently, while the narrow ACK relay still works.
+  it.each([false, true])("silently filters other-link stamped non-relays but preserves ACK relay (negotiated batch=%s)", async negotiatedBatch => {
+    const f = await fixture();
+    const a = f.stores.ryzen3!, b = f.stores.ryzen2!, hub = f.stores.ryzen1!;
+    const source = f.mains.ryzen3!, target = f.mains.ryzen2!, lead = f.mains.ryzen1!;
+    if (negotiatedBatch) await Promise.all(f.links.map(link => link.remote.hello()));
+    const logs: string[] = [];
+    for (const { bridge } of f.links) bridge.options.log = message => { logs.push(message); };
+    const destination = f.links.find(link => link.bridge.options.remoteName === "ryzen2")!.bridge;
+    // Alarm routing accepts only session:<uuid>; register that real native hub recipient.
+    const alarmLead: MeshIdentity = { ...lead.identity, id: "session:00000000-0000-0000-0000-000000000001" };
+    await hub.put({ key: hostKey(alarmLead.id), identity: alarmLead,
+      value: { ...lead.host, id: alarmLead.id, rootId: alarmLead.id, identity: alarmLead } });
+    // A real byte boundary ensures the tail assertion exercises byte filtering, not its read fallback.
+    await hub.publish({ topic: "chatter", kind: "event", from: lead.identity, text: "before imports" });
+    const boundary = await destination.options.local.latestCursor!();
+    expect(boundary.offset).toBeDefined();
+    const nonRelays = [
+      { topic: "fleet.work.smarty-dev.10068", kind: "ask", to: lead.identity.id },
+      { topic: "ops.owner", kind: "pr.wake", to: lead.identity.id },
+      { topic: "fabric.alarm.mesh-outage", kind: "mesh-outage", to: alarmLead.id },
+    ];
+    for (const event of nonRelays) {
+      await a.publish({ ...event, from: source.identity, text: "hub only" });
+    }
+    await f.drain(); await f.drain();
+    for (const { topic } of nonRelays) {
+      expect(events(hub, topic)).toHaveLength(1);
+      expect(events(hub, topic)[0]).toMatchObject({ verification: "bridge", data: { bridge: { from: "ryzen3" } } });
+      expect(events(b, topic)).toEqual([]);
+    }
+    expect(await destination.options.local.read(boundary.through)).toEqual({ events: [], through: hub.latestSequence() });
+    expect(await destination.options.local.tail!(boundary.through, boundary.offset)).toEqual({
+      events: [], through: hub.latestSequence(), offset: hub.latestOffset(),
+    });
+    const cursor = JSON.parse(fs.readFileSync(destination.options.cursorPath, "utf8"));
+    expect(cursor.toRemote.after).toBe(hub.latestSequence());
+    expect(logs).toEqual([]); // in particular, no per-event "not allowed" refusals
+
+    // Counterexample: a native ACK A -> B still crosses the hub with origin authentication.
+    await a.publish({ topic: "fabric.control.ack", kind: "accepted", from: source.identity, to: target.identity.id,
+      data: { version: 1, commandId: "echo-legitimate-relay", targetId: source.identity.id, accepted: true } });
+    await f.drain(); await f.drain();
+    expect(events(b, "fabric.control.ack")).toHaveLength(1);
+    expect(events(b, "fabric.control.ack")[0]).toMatchObject({ verification: "bridge", from: source.identity,
+      to: target.identity.id, data: { commandId: "echo-legitimate-relay", accepted: true,
+        bridge: { from: "ryzen3", via: "ryzen1" } } });
+    expect(logs).toEqual([]);
   });
 
   it("forwards a control/ACK batch with origin stamps but never relays work topics between spokes", async () => {
@@ -633,5 +1106,172 @@ describe("spoke-to-spoke roots and addressed control through the hub", () => {
     await f.drain(); await f.drain();
     expect(events(b, "fabric.control.command")).toHaveLength(0);
     expect(events(hub, "fabric.control.command")).toHaveLength(0);
+  });
+
+  // Incarnation rejection is a trust-boundary fence: a reconnecting spoke's first frame must
+  // not roll back a canonical root (or partially apply removals) using a replayed older snapshot.
+  const incarnationPresence = (id: string, startedAt: number, token: string, name: string, now: number) => {
+    const identity: MeshIdentity = { id, name, kind: "main", sessionId: name };
+    const record = { format: 1 as const, id, rootId: id, identity, startedAt, updatedAt: startedAt,
+      expiresAt: now + 60_000, incarnationToken: token };
+    return { identity, hosts: [{ record, expiresAt: record.expiresAt }], participants: [{
+      format: 1 as const, id, kind: "root" as const, rootId: id, ownerHostId: id, ownerIdentityId: id,
+      ownerIncarnation: `fixture:${token}`, name, label: name.toUpperCase(), status: "idle" as const,
+      runner: "pi", transport: "host" as const, capabilities: ["steer", "followUp"], sessionId: name,
+      startedAt, updatedAt: startedAt, controlProtocol: "v1" as const,
+    }] } satisfies Pick<BridgePresence, "hosts" | "participants"> & { identity: MeshIdentity };
+  };
+
+  it("rejects a superseded first reconnect token even with a later start and preserves authority through cleanup", async () => {
+    const { dir, hub, peer: remoteStore } = tinyStores();
+    const now = Date.now(), rootId = "session:root-R-00000001";
+    const newer = incarnationPresence(rootId, now - 10, `opaque-${crypto.randomUUID()}`, "new-incarnation", now);
+    const authority = new StoreBridgeSide(hub, "ryzen2");
+    const directId = "session:direct-stale-00000001";
+    const directNewer = incarnationPresence(directId, now - 10, `opaque-${crypto.randomUUID()}`, "direct-newer", now);
+    const older = incarnationPresence(rootId, now + 120_000, `opaque-${crypto.randomUUID()}`, "replayed-old", now);
+    const directOlder = incarnationPresence(directId, now + 120_000, `opaque-${crypto.randomUUID()}`, "direct-older", now);
+    // Identity, not clock order: these tokens were genuinely held before being superseded.
+    await authority.mirror({ hosts: [...older.hosts, ...directOlder.hosts],
+      participants: [...older.participants, ...directOlder.participants] });
+    await authority.mirror({ hosts: [...newer.hosts, ...directNewer.hosts],
+      participants: [...newer.participants, ...directNewer.participants] });
+    // Legacy lease bytes cannot prove this rejection: the same-peer mirror must do it.
+    writeHostLease(hub.root, { id: directId, rootId: directId, identityId: directId,
+      updatedAt: now - 10, expiresAt: now + 60_000 });
+    const directLeaseBefore = fs.readFileSync(hostLeasePath(hub.root, directId));
+    const directReconnect = new StoreBridgeSide(hub, "ryzen2");
+    await expect(directReconnect.mirror({ hosts: directOlder.hosts, participants: directOlder.participants }))
+      .rejects.toMatchObject({ code: "FABRIC_BRIDGE_STALE_INCARNATION" });
+    await directReconnect.withdraw();
+    expect(hub.get(hostKey(directId))!.value).toMatchObject({ startedAt: now - 10,
+      incarnationToken: directNewer.hosts[0]!.record.incarnationToken });
+    expect(hub.get(participantKey(directId))!.value).toMatchObject({ name: "direct-newer" });
+    expect(fs.readFileSync(hostLeasePath(hub.root, directId))).toEqual(directLeaseBefore);
+    const newerToken = newer.hosts[0]!.record.incarnationToken;
+    writeHostLease(hub.root, { id: rootId, rootId, identityId: rootId, startedAt: now - 10, incarnationToken: newerToken,
+      bridgeSupersededTokens: [older.hosts[0]!.record.incarnationToken], updatedAt: now - 10, expiresAt: now + 60_000 });
+    const mirrorBefore = hub.get(hostKey(rootId))!.value;
+    const participantBefore = hub.get(participantKey(rootId))!.value;
+    const leasePath = hostLeasePath(hub.root, rootId);
+    const leaseBytesBefore = fs.readFileSync(leasePath);
+    // The remote is a real native store presenting the stale first frame; no mirrored rows are pre-seeded there.
+    await remoteStore.put({ key: hostKey(rootId), identity: older.identity, value: older.hosts[0]!.record });
+    const remoteParticipant = older.participants[0]!;
+    writeParticipantFile(remoteStore.root, { key: participantKey(rootId), version: 1, updatedAt: now,
+      updatedBy: older.identity, value: remoteParticipant });
+    const bridge = new MeshBridge({ localName: "ryzen1", remoteName: "ryzen2", local: authority,
+      remote: new StoreBridgeSide(remoteStore, "ryzen1"), cursorPath: path.join(dir, "cursor.json"), presenceMs: 0 });
+    await expect(bridge.start()).rejects.toMatchObject({ code: "FABRIC_BRIDGE_STALE_INCARNATION" });
+    // runBridge's fatal-start cleanup takes this same stop/withdraw path. It must not turn the
+    // rejected first frame into authority to erase the newer persisted mirror or its lease.
+    await bridge.stop();
+    expect(hub.get(hostKey(rootId))!.value).toEqual(mirrorBefore);
+    expect(hub.get(participantKey(rootId))!.value).toEqual(participantBefore);
+    expect(fs.readFileSync(leasePath)).toEqual(leaseBytesBefore);
+    expect(removals).toEqual([]);
+  });
+
+  it("admits a genuine restart after a 120-second clock rollback in one RPC presence pass, and first-link roots", async () => {
+    const { dir, hub, peer } = tinyStores();
+    const now = Date.now(), rootId = "session:root-newer-00000001";
+    const prior = incarnationPresence(rootId, now - 20, `opaque-${crypto.randomUUID()}`, "prior", now);
+    await new StoreBridgeSide(hub, "ryzen2").mirror({ hosts: prior.hosts, participants: prior.participants });
+    const replacement = incarnationPresence(rootId, prior.hosts[0]!.record.startedAt - 120_000,
+      `opaque-${crypto.randomUUID()}`, "replacement", now);
+    await peer.put({ key: hostKey(rootId), identity: replacement.identity, value: replacement.hosts[0]!.record });
+    writeParticipantFile(peer.root, { key: participantKey(rootId), version: 1, updatedAt: now,
+      updatedBy: replacement.identity, value: replacement.participants[0]! });
+    const input = new PassThrough(), output = new PassThrough();
+    const serving = serveBridgeAgent(new StoreBridgeSide(peer, "ryzen1"), input, output);
+    const remote = new RemoteBridgeSide(output, input);
+    closers.push(async () => { remote.close(); input.end(); await serving; output.end(); });
+    const local = new StoreBridgeSide(hub, "ryzen2");
+    const mirrored = vi.spyOn(local, "mirror");
+    const bridge = new MeshBridge({ localName: "ryzen1", remoteName: "ryzen2", local, remote,
+      cursorPath: path.join(dir, "rollback-cursor.json"), presenceMs: 0 });
+    await expect(bridge.start()).resolves.toBeUndefined();
+    expect(mirrored).toHaveBeenCalledOnce();
+    expect(local.holds(rootId, replacement.identity)).toBe(true);
+    await expect(bridge.syncPresence()).resolves.toBeUndefined(); // same-token retry is not latched
+    expect(hub.get(hostKey(rootId))!.value).toMatchObject({ startedAt: replacement.hosts[0]!.record.startedAt,
+      incarnationToken: replacement.hosts[0]!.record.incarnationToken });
+    expect(readHostLease(hub.root, rootId)).toMatchObject({ startedAt: replacement.hosts[0]!.record.startedAt,
+      incarnationToken: replacement.hosts[0]!.record.incarnationToken });
+    expect(hub.get(participantKey(rootId))!.value).toMatchObject({ name: "replacement" });
+
+    const firstId = "session:first-ever-00000001";
+    const first = incarnationPresence(firstId, now - 1, `opaque-${crypto.randomUUID()}`, "first", now);
+    await new StoreBridgeSide(hub, "ryzen3").mirror({ hosts: first.hosts, participants: first.participants });
+    expect(hub.get(hostKey(firstId))!.value).toMatchObject({ startedAt: now - 1 });
+    expect(hub.get(participantKey(firstId))!.value).toMatchObject({ name: "first" });
+  });
+
+  it("retains X100 through X90 metadata, admits never-seen Y95, and then rejects superseded X", async () => {
+    const { hub } = tinyStores();
+    const now = Date.now(), rootId = "session:same-token-00000001";
+    const prior = incarnationPresence(rootId, now - 30, "same-opaque-token", "same-token-prior", now);
+    await new StoreBridgeSide(hub, "ryzen3").mirror({ hosts: prior.hosts, participants: prior.participants });
+    const metadata = incarnationPresence(rootId, now - 40, "same-opaque-token", "same-token-metadata", now);
+    await expect(new StoreBridgeSide(hub, "ryzen3").mirror({ hosts: metadata.hosts, participants: metadata.participants }))
+      .resolves.toBeUndefined();
+    // Equal tokens admit changed metadata, but neither persisted authority may lose the highwater.
+    expect(hub.get(hostKey(rootId))!.value).toMatchObject({ startedAt: now - 30,
+      incarnationToken: "same-opaque-token", identity: metadata.identity });
+    expect(readHostLease(hub.root, rootId)).toMatchObject({ startedAt: now - 30, incarnationToken: "same-opaque-token" });
+    expect(hub.get(participantKey(rootId))!.value).toMatchObject({ name: "same-token-metadata" });
+    // Y95 has never been held: X100's high-water is metadata for X, not an ordering of Y.
+    const between = incarnationPresence(rootId, now - 35, "distinct-opaque-between", "new-between", now);
+    await expect(new StoreBridgeSide(hub, "ryzen3").mirror(between)).resolves.toBeUndefined();
+    expect(hub.get(hostKey(rootId))!.value).toMatchObject({ startedAt: now - 35,
+      incarnationToken: "distinct-opaque-between" });
+    const hostBefore = hub.get(hostKey(rootId));
+    const participantBefore = hub.get(participantKey(rootId));
+    const leasePath = hostLeasePath(hub.root, rootId);
+    const leaseBefore = fs.readFileSync(leasePath);
+    const reconnect = new StoreBridgeSide(hub, "ryzen3");
+    await expect(reconnect.mirror(metadata)).rejects.toMatchObject({ code: "FABRIC_BRIDGE_STALE_INCARNATION" });
+    await reconnect.withdraw();
+    expect(hub.get(hostKey(rootId))).toEqual(hostBefore);
+    expect(hub.get(participantKey(rootId))).toEqual(participantBefore);
+    expect(fs.readFileSync(leasePath)).toEqual(leaseBefore);
+    expect(removals).toEqual([]);
+
+    const newer = incarnationPresence(rootId, now - 20, "distinct-opaque-newer", "genuinely-newer", now);
+    await new StoreBridgeSide(hub, "ryzen3").mirror({ hosts: newer.hosts, participants: newer.participants });
+    expect(hub.get(hostKey(rootId))!.value).toMatchObject({ startedAt: now - 20,
+      incarnationToken: "distinct-opaque-newer", identity: newer.identity });
+    expect(readHostLease(hub.root, rootId)).toMatchObject({ startedAt: now - 20, incarnationToken: "distinct-opaque-newer" });
+    expect(hub.get(participantKey(rootId))!.value).toMatchObject({ name: "genuinely-newer" });
+  });
+
+  it("uses lease-only superseded-token history as authority without a persisted mirror", async () => {
+    const { hub } = tinyStores();
+    const now = Date.now(), rootId = "session:lease-only-00000001";
+    const old = incarnationPresence(rootId, now - 20, `opaque-${crypto.randomUUID()}`, "replayed-old", now);
+    const newer = incarnationPresence(rootId, now - 10, `opaque-${crypto.randomUUID()}`, "lease-only-newer", now);
+    writeHostLease(hub.root, { id: rootId, rootId, identityId: rootId, startedAt: now - 10,
+      incarnationToken: newer.hosts[0]!.record.incarnationToken, bridgeSupersededTokens: [old.hosts[0]!.record.incarnationToken],
+      updatedAt: now - 10, expiresAt: now + 60_000 });
+    expect(hub.get(hostKey(rootId))).toBeUndefined();
+    const leasePath = hostLeasePath(hub.root, rootId);
+    const leaseBytesBefore = fs.readFileSync(leasePath);
+    await expect(new StoreBridgeSide(hub, "ryzen2").mirror({ hosts: old.hosts, participants: old.participants })).rejects
+      .toMatchObject({ code: "FABRIC_BRIDGE_STALE_INCARNATION" });
+    expect(fs.readFileSync(leasePath)).toEqual(leaseBytesBefore);
+    expect(hub.get(hostKey(rootId))).toBeUndefined();
+    expect(hub.get(participantKey(rootId))).toBeUndefined();
+  });
+
+  it("does not treat a legacy lease-only record as incarnation authority", async () => {
+    const { hub } = tinyStores();
+    const now = Date.now(), rootId = "session:legacy-lease-00000001";
+    const incoming = incarnationPresence(rootId, now - 10, `opaque-${crypto.randomUUID()}`, "admitted", now);
+    // Deliberately seed no mirror: legacy lease bytes without startedAt/token are not proof of an incarnation.
+    writeHostLease(hub.root, { id: rootId, rootId, identityId: rootId, updatedAt: now - 20, expiresAt: now + 60_000 });
+    expect(hub.get(hostKey(rootId))).toBeUndefined();
+    await new StoreBridgeSide(hub, "ryzen2").mirror({ hosts: incoming.hosts, participants: incoming.participants });
+    expect(hub.get(hostKey(rootId))!.value).toMatchObject({ startedAt: now - 10 });
+    expect(hub.get(participantKey(rootId))!.value).toMatchObject({ name: "admitted" });
   });
 });

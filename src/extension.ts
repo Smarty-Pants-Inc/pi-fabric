@@ -1,9 +1,14 @@
 import type { Usage } from "@earendil-works/pi-ai";
+import { randomUUID } from "node:crypto";
 import { registerMainProviderRecovery } from "./main-provider-recovery.js";
+import { configureFabricDiagnostics, diagnostics, isPrincipalDiagnostics, notifyDiagnostic, setPrewalkStatus } from "./core/diagnostics.js";
 import { extensionContextLive } from "./session-liveness.js";
 import { registerIncomingMessageRenderers } from "./ui/incoming-messages.js";
 import { principalViewIncomingMode, registerPrincipalView } from "./ui/principal-view.js";
-import { rootInboxMessage, confirmedRootInboxSession, rootInboxSummary, ROOT_INBOX_CUSTOM_TYPE, type RootInboxBatch, type RootInboxReconcileOptions } from "./topology/root-inbox-shared.js";
+import {
+  rootInboxMessage, confirmedRootInboxSession, rootInboxSummary, rootInboxCarrierDigest, ROOT_INBOX_CUSTOM_TYPE,
+  type RootInboxBatch, type RootInboxReceiptSnapshot, type RootInboxReceiptVerifier, type RootInboxReconcileOptions,
+} from "./topology/root-inbox-shared.js";
 import { deliverRootInbox } from "./topology/root-inbox-delivery.js";
 import { boundModelOutput, formatResidentOutcomePriority, modelOutputBudget } from "./output-budget.js";
 import { registerFabricPrincipalCapture, registerFabricWakeCapture, fabricHostIdentity, fabricProvenanceSupported, sendFabricMessage } from "./fabric-provenance.js";
@@ -216,7 +221,8 @@ const settledCompleted = (event: unknown, context: ExtensionContext): boolean =>
 
 // Whether the session already holds an inbox batch: its cursor moves only then (smarty-dev#754).
 // Static, as on main: the build admits package-local dynamic imports only for stable entries.
-const inboxHeldBy = (context: ExtensionContext) => confirmedRootInboxSession(context.sessionManager);
+const inboxHeldBy = (context: ExtensionContext, verifier: RootInboxReceiptVerifier) =>
+  confirmedRootInboxSession(context.sessionManager, verifier);
 
 /** Expiry is observational: one line, never a triggered continuation. */
 const reportInboxExpiry = async (pi: ExtensionAPI, inbox: RootInboxBatch | undefined): Promise<void> => {
@@ -569,7 +575,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     const skipReason = await autoArmFabricPrewalk(state, context, pi);
     if (!skipReason || prewalkAutoArmNoticeShown || !context.hasUI) return;
     prewalkAutoArmNoticeShown = true;
-    context.ui.notify(skipReason, "warning");
+    notifyDiagnostic(context, "src/extension.ts", skipReason, "warning");
   };
 
   const cleanupActivationSideEffects = (): void => {
@@ -679,7 +685,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
         retry = true;
       } else {
         // Advisory evidence cannot gate the normal-form compiler.
-        console.warn(`[pi-fabric] observation pool update failed: ${error instanceof Error ? error.message : String(error)}`);
+        diagnostics.warn("src/extension.ts", `[pi-fabric] observation pool update failed: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
     if (!current()) return false;
@@ -702,7 +708,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
           setActiveCompiledSurface(saved.file);
           const previousScore = comparableCompiledSurfaceScore(loaded.file, saved.file.metricVersion);
           if (previousScore !== undefined && outcome.report.score < previousScore && context.hasUI) {
-            context.ui.notify(formatEntropyCompileNotice({
+            notifyDiagnostic(context, "src/extension.ts", formatEntropyCompileNotice({
               beforeScore: previousScore,
               afterScore: outcome.report.score,
               normalizations: saved.file.normalizations?.length ?? 0,
@@ -738,7 +744,8 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
         retry = await compileEntropyNow(request.context, request.epoch, request.signal);
       } catch (error) {
         if (request.signal.aborted || !extensionContextLive(request.context)) return;  // shutdown or dispose
-        console.warn(
+        diagnostics.warn(
+          "src/extension.ts",
           `[pi-fabric] entropy compile failed: ${
             error instanceof Error ? error.message : String(error)
           }`,
@@ -806,6 +813,43 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
   // host signal so a cancel after turn_end still invalidates the unreceived queue.
   let rootInboxRunSignal: AbortSignal | undefined;
   const queuedRootInboxIds = new Map<string, number>();
+  // Native Pi preserves details by reference from sendMessage / the legacy hook result to
+  // message_end. Serialized fields, queue leases and wake metadata are not consumption authority.
+  // Bind shown-only ids/receipts to rendered content; public nonce/receipt copies grant no new proof.
+  // The nonce registry is private to this extension instance: readers authenticate the exact content
+  // before consuming a nonce in their own traversal, never for its lifetime. Eviction fails open and
+  // causes a duplicate, never a lost event.
+  const MAX_ISSUED_ROOT_INBOX_RECEIPTS = 2_048;
+  let issuedRootInboxDetails = new WeakMap<object, RootInboxReceiptSnapshot>();
+  const issuedRootInboxReceipts = new Map<string, RootInboxReceiptSnapshot>();
+  const inboxStrings = (value: unknown): string[] => Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === "string") : [];
+  const verifyIssuedInbox: RootInboxReceiptVerifier = (details, carrier, accepted) => {
+    if (!details || typeof details !== "object") return undefined;
+    const nonce = (details as { nonce?: unknown }).nonce;
+    if (typeof nonce !== "string" || accepted.has(nonce)) return undefined;
+    const snapshot = issuedRootInboxReceipts.get(nonce);
+    if (!snapshot || snapshot.digest !== rootInboxCarrierDigest(carrier)) return undefined;
+    accepted.add(nonce);
+    return snapshot;
+  };
+  const registerIssuedInbox = (details: object, content: unknown): void => {
+    const fields = details as { ids?: unknown; receipts?: unknown; nonce?: unknown };
+    const snapshot: RootInboxReceiptSnapshot = Object.freeze({
+      ids: Object.freeze(inboxStrings(fields.ids)),
+      receipts: Object.freeze(inboxStrings(fields.receipts)),
+      digest: rootInboxCarrierDigest({ content }),
+    });
+    const nonce = randomUUID();
+    fields.nonce = nonce;
+    issuedRootInboxReceipts.set(nonce, snapshot);
+    while (issuedRootInboxReceipts.size > MAX_ISSUED_ROOT_INBOX_RECEIPTS) {
+      const oldest = issuedRootInboxReceipts.keys().next().value;
+      if (typeof oldest !== "string") break;
+      issuedRootInboxReceipts.delete(oldest);
+    }
+    issuedRootInboxDetails.set(details, snapshot);
+  };
   type InboxQueueMessage = { role?: string; customType?: string; details?: unknown };
   const inboxEventsToQueue = (inbox: RootInboxBatch, pendingMessages?: readonly InboxQueueMessage[]) => {
     const pending = new Set(inbox.events.map(event => event.id));
@@ -828,12 +872,16 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     }
     return inbox.events.filter(event => !queuedRootInboxIds.has(event.id));
   };
-  const consumeInjectedInbox = async (details: unknown): Promise<void> => {
+  const consumeInjectedInbox = async (details: unknown, carrier: unknown): Promise<void> => {
+    if (!details || typeof details !== "object") return;
+    const issued = issuedRootInboxDetails.get(details);
+    if (!issued || issued.digest !== rootInboxCarrierDigest(carrier)) {
+      diagnostics.warn("src/extension.ts", "pi-fabric: ignored unissued root-inbox carrier");
+      return;
+    }
+    issuedRootInboxDetails.delete(details); // One rendered carrier authorizes consumption once.
     if (!state.initialized) return;
-    const fields = (details && typeof details === "object" ? details : {}) as { ids?: unknown; receipts?: unknown };
-    const strings = (value: unknown): string[] => Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
-    const ids = strings(fields.ids);
-    if (ids.length) await state.consumeRootInbox(ids, strings(fields.receipts)).catch(() => undefined);
+    if (issued.ids.length) await state.consumeRootInbox(issued.ids, issued.receipts).catch(() => undefined);
   };
   const reconcileRootInbox = async (
     context: ExtensionContext, options: RootInboxReconcileOptions, pendingMessages?: readonly InboxQueueMessage[],
@@ -841,7 +889,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     // Invalidate cancelled/unreceived leases even if the durable cursor read fails.
     if (options.commitOnly) queuedRootInboxIds.clear();
     if (!state.initialized) return;
-    const inbox = await state.nextRootInbox(await inboxHeldBy(context), undefined, options).catch(() => undefined);
+    const inbox = await state.nextRootInbox(await inboxHeldBy(context, verifyIssuedInbox), undefined, options).catch(() => undefined);
     reportInboxExpiry(pi, inbox);
     if (!inbox) return;
     // Commit-only returns no deliverable events, including for an unheld pending batch.
@@ -849,8 +897,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     const events = inboxEventsToQueue(inbox, pendingMessages);
     if (options.commitOnly) return;
     if (!events.length) return;
-    deliverRootInbox(pi, events);
-    for (const event of events) queuedRootInboxIds.set(event.id, rootInboxTurn);
+    for (const id of deliverRootInbox(pi, events, undefined, registerIssuedInbox)) queuedRootInboxIds.set(id, rootInboxTurn);
   };
   const stopInboxWake = (): void => {
     // Closes the runtime's mesh-root watch and deadline timer; session_start arms them anew.
@@ -858,6 +905,8 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     inboxWake.context = undefined;
     inboxWake.again = false;
     queuedRootInboxIds.clear();
+    issuedRootInboxDetails = new WeakMap();
+    issuedRootInboxReceipts.clear();
     rootInboxRunSignal = undefined;
   };
   // A busy, settling, preflight or cancelled Main is owned by its boundary, never timer-polled.
@@ -879,11 +928,11 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     inboxWake.reading = true;
     try {
       if (!idle()) return;
-      const inbox = await state.nextRootInbox(await inboxHeldBy(context), idle);
+      const inbox = await state.nextRootInbox(await inboxHeldBy(context, verifyIssuedInbox), idle);
       await reportInboxExpiry(pi, inbox);
       // A turn that started meanwhile takes the pending batch at its own start: never a second run.
       if (inbox?.events.length && idle()) {
-        await deliverRootInbox(pi, inbox.events);
+        for (const id of deliverRootInbox(pi, inbox.events, undefined, registerIssuedInbox)) queuedRootInboxIds.set(id, rootInboxTurn);
         return undefined;
       }
       // Records: the same gate, re-checked after the read (F21).
@@ -917,6 +966,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
   };
 
   pi.on("session_start", async (event, context) => {
+    configureFabricDiagnostics(context.sessionManager?.getSessionId?.() ?? "");
     await sealScope();
     // Retire the previous session's delayed work, then reopen entropy for this one.
     retireSessionTimers();
@@ -924,7 +974,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     fabricPrewarm = undefined;
     // The pre-reload warning leaves with the redraw; say it again where the user can read it (smarty-dev#1882).
     const reloadNotice = takeReloadStoppedNotice(context.sessionManager?.getSessionId?.() ?? "", event?.reason ?? "");
-    if (reloadNotice && context.hasUI) context.ui.notify(reloadNotice, "warning");
+    if (reloadNotice && context.hasUI) notifyDiagnostic(context, "src/extension.ts", reloadNotice, "warning");
     inboxWake.context = context;
     inboxWake.armed = true;
     pendingHandoffs.clear();
@@ -940,8 +990,8 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
       compatibilityWarningShown = true;
       const warning = piHostCompatibilityWarning();
       if (warning) {
-        console.warn(`[pi-fabric] ${warning}`);
-        if (context.hasUI) context.ui.notify(warning, "warning");
+        diagnostics.warn("src/extension.ts", `[pi-fabric] ${warning}`);
+        if (context.hasUI) notifyDiagnostic(context, "src/extension.ts", warning, "warning");
       }
     }
     state.thinking.invalidate();
@@ -957,7 +1007,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
       try {
         await state.thinking.enforceBounds(context);
       } catch (error) {
-        console.warn(`[pi-fabric] thinking bounds: ${error instanceof Error ? error.message : String(error)}`);
+        diagnostics.warn("src/extension.ts", `[pi-fabric] thinking bounds: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
     // bootstrap() cancels any live arm; the borrowed Main model survives so a
@@ -973,9 +1023,9 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     try {
       if (selfReloaded && context.hasUI) {
         const notice = `${selfReloaded.owner ?? "Fabric"} reloaded: ${selfReloaded.old} → ${selfReloaded.new}`;
-        context.ui.notify(notice, "info");
+        notifyDiagnostic(context, "src/extension.ts", notice, "info");
         // Keep the notice after the TUI's own reload status line replaces it.
-        context.ui.setStatus(SELF_RELOAD_STATUS, notice);
+        context.ui.setStatus(SELF_RELOAD_STATUS, isPrincipalDiagnostics() ? undefined : notice);
       }
       const probeNonce = process.env.PI_FABRIC_RESIDENT_PROBE_NONCE;
       const residentProbe = Boolean(probeNonce && process.env.PI_FABRIC_RESIDENT_PROBE_WORKER_PID === String(process.ppid));
@@ -1037,7 +1087,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
       // Turn-scoped thinking overrides revert here, even before activation.
       await state.thinking.agentEnded(context);
     } catch (error) {
-      console.warn(`[pi-fabric] thinking revert failed: ${error instanceof Error ? error.message : String(error)}`);
+      diagnostics.warn("src/extension.ts", `[pi-fabric] thinking revert failed: ${error instanceof Error ? error.message : String(error)}`);
     }
     if (state.initialized) await state.publishHostLifecycle("pi.agent_end", event);
   });
@@ -1101,8 +1151,8 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     });
     if (!settledInPlace && state.prewalk.settleTask(sessionId)) {
       const status = state.prewalk.status();
-      context.ui.setStatus(
-        "fabric-prewalk",
+      setPrewalkStatus(
+        context,
         status.state === "armed" ? `armed → ${status.model}` : undefined,
       );
     }
@@ -1335,8 +1385,8 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
       fabricEngine,
     );
     if (warning) {
-      if (context.hasUI) context.ui.notify(warning, "warning");
-      else console.warn(`[pi-fabric] ${warning}`);
+      if (context.hasUI) notifyDiagnostic(context, "src/extension.ts", warning, "warning");
+      else diagnostics.warn("src/extension.ts", `[pi-fabric] ${warning}`);
     }
     if (!state.initialized) return;
     await state.publishHostLifecycle("pi.session_compact", event);
@@ -1414,7 +1464,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     if (epoch !== extractiveEpoch || !extractiveConfig()?.enabled || context.signal?.aborted ||
       context.sessionManager.getSessionId() !== sessionId || context.sessionManager.getLeafId() !== leaf) return;
     extractiveHistory ??= new ExtractiveHistory(extractiveConfig);
-    await extractiveHistory.prepare(context, event.prompt);
+    await extractiveHistory.prepare(context, typeof event.prompt === "string" ? event.prompt : "");
   });
 
   // The root inbox context filter (smarty-dev#8962) loads at the first request whose context holds
@@ -1443,10 +1493,11 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     // before the ack: later copies are cut, and acked events whose consuming copy was compacted away.
     const filter = inboxContext;
     const inbox = filter ? filter.filterRootInboxContext(planning.messages, {
+      verifier: verifyIssuedInbox,
       acked: (id, sequence) => state.initialized && state.rootInboxAcked(id, sequence),
-      compactedCopies: () => {
+      compactedCopies: (accepted) => {
         try {
-          return filter.rootInboxCompactedCopies(context.sessionManager.getBranch?.() ?? []);
+          return filter.rootInboxCompactedCopies(context.sessionManager.getBranch?.() ?? [], verifyIssuedInbox, accepted);
         } catch {
           return new Map();
         }
@@ -1519,7 +1570,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     // mode preserves Pi's progressive skill loading without exposing read.
     // Turn-derived: delivered via the message channel (below), never the
     // system prompt, so the cached system prefix stays byte-stable.
-    const skillReferenceGuidance = effectiveFullCodeMode
+    const skillReferenceGuidance = effectiveFullCodeMode && typeof event.prompt === "string"
       ? buildSkillReferenceGuidance(event.prompt, skills)
       : undefined;
     const currentModel = context.model
@@ -1591,7 +1642,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     );
     if (names.length === 0) return;
     const mentioned = proxyContractMentionsInSkills(
-      event.prompt,
+      typeof event.prompt === "string" ? event.prompt : "",
       event.systemPrompt,
       names,
     );
@@ -1613,15 +1664,22 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     inboxWake.context = context;
     inboxWake.armed = true;
     if (!state.initialized) return;
-    const inbox = await state.nextRootInbox(await inboxHeldBy(context), undefined, { priority: true }).catch(() => undefined);
+    const inbox = await state.nextRootInbox(await inboxHeldBy(context, verifyIssuedInbox), undefined, { priority: true }).catch(() => undefined);
     await reportInboxExpiry(pi, inbox);
     if (!inbox) return;
     const events = inboxEventsToQueue(inbox);
     if (!events.length) return;
-    for (const event of events) queuedRootInboxIds.set(event.id, rootInboxTurn);
-    // Only capable Pi consumes nextTurn after hooks; legacy Pi needs the hook result.
-    if (!fabricProvenanceSupported(pi)) return { message: rootInboxMessage(events) };
-    await deliverRootInbox(pi, events, { deliverAs: "nextTurn", triggerTurn: false });
+    // Only capable Pi consumes nextTurn after hooks; legacy Pi needs the hook result. Lease
+    // only actual rows, never the overflow summary, so withheld work is eligible next turn.
+    if (!fabricProvenanceSupported(pi)) {
+      const message = rootInboxMessage(events);
+      registerIssuedInbox(message.details, message.content);
+      for (const id of message.details.ids) queuedRootInboxIds.set(id, rootInboxTurn);
+      return { message };
+    }
+    for (const id of deliverRootInbox(pi, events, { deliverAs: "nextTurn", triggerTurn: false }, registerIssuedInbox)) {
+      queuedRootInboxIds.set(id, rootInboxTurn);
+    }
   });
 
   // An inbox message that entered a turn is consumed (R-token-waste): its events are never
@@ -1629,7 +1687,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
   pi.on("message_end", async (event) => {
     const message = event.message as unknown as { role?: string; customType?: string; details?: unknown };
     if (message.role !== "custom" || message.customType !== "pi-fabric-inbox") return undefined;
-    await consumeInjectedInbox(message.details);
+    await consumeInjectedInbox(message.details, message);
     return undefined;
   });
 
@@ -1654,7 +1712,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     let stopping = 0;
     try { stopping = state.initialized ? state.agents.runningCount() : 0; } catch { /* not initialized */ }
     if (stopping > 0 && context.hasUI) {
-      context.ui.notify(
+      notifyDiagnostic(context, "src/extension.ts",
         `${reason === "reload" ? "Reload" : "Shutdown"} stops ${stopping} running task agent${stopping === 1 ? "" : "s"}; ` +
           'each spawner gets a stopped result. Spawn with residency: "durable" to keep an agent across reloads.',
         "warning",
@@ -1698,8 +1756,8 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     if (foregroundNoticeSession === sessionId) return;
     foregroundNoticeSession = sessionId;
     const notice = `Fabric foreground policy ${formatForeground(foreground)}`;
-    if (context.hasUI) context.ui.notify(notice, "warning");
-    else console.warn(`[pi-fabric] ${notice}`);
+    if (context.hasUI) notifyDiagnostic(context, "src/extension.ts", notice, "warning");
+    else diagnostics.warn("src/extension.ts", `[pi-fabric] ${notice}`);
   });
 
   // A configured custom runner is kept even before its extension registers it
@@ -1720,8 +1778,8 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     const key = `${context.sessionManager?.getSessionId?.() ?? ""}\0${runner}`;
     if (runnerNoticeKey === key) return;
     runnerNoticeKey = key;
-    if (context.hasUI) context.ui.notify(notice, "warning");
-    else console.warn(`[pi-fabric] ${notice}`);
+    if (context.hasUI) notifyDiagnostic(context, "src/extension.ts", notice, "warning");
+    else diagnostics.warn("src/extension.ts", `[pi-fabric] ${notice}`);
   });
 
   pi.on("context_with_system", (event) => {

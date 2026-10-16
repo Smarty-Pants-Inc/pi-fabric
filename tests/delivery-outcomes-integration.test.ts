@@ -7,7 +7,8 @@ import { AgentMessageRouter, FabricParticipantNotYetMirroredError, FabricRouteAu
 import { MainAgentController } from "../src/main-agent.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { FabricControlIncarnationRequiredError, FabricControlPlane } from "../src/topology/control-plane.js";
-import { RootInbox, rootInboxMessage, rootInboxSession } from "../src/topology/root-inbox.js";
+import { RootInbox } from "../src/topology/root-inbox.js";
+import { rootInboxMessage, rootInboxSession } from "./root-inbox-issued-fixture.js";
 
 const roots: string[] = [];
 const closers: Array<() => void | Promise<void>> = [];

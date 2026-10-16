@@ -1,4 +1,5 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { diagnostics, notifyDiagnostic } from "./core/diagnostics.js";
 import { RootInbox, type RootInboxBatch, type RootInboxSession, type RootInboxReconcileOptions } from "./topology/root-inbox.js";
 import { RootInboxWatch } from "./topology/root-inbox-wake.js";
 import { MainInboxMaintenance, registerMainInbox, recordMainSuccessor, mainInboxOwns, mainInboxActive, rootPresenceAlarms, stageMainSuccessor, confirmMainSuccessor, providerDeadAlarms, providerDeadAlarmFields, admissionAlarmRecipient } from "./topology/stall-alarms.js";
@@ -58,6 +59,8 @@ import {
   DEFAULT_FABRIC_CONFIG,
   loadFabricConfig,
   liveLandlockSettings,
+  FabricMeshTransportConfigError,
+  validateFabricNatsOperatorMachine,
   type FabricConfig,
   type FabricResultFormat,
   type FabricSchemaMode,
@@ -95,6 +98,7 @@ import { extensionContextLive } from "./session-liveness.js";
 import type { FabricLifecycleEventType } from "./lifecycle/types.js";
 import { FabricControlPlane } from "./topology/control-plane.js";
 import { ParticipantDirectory } from "./topology/participant-directory.js";
+import type { FabricTransport } from "./transport/types.js";
 import { rootParticipantName, validName } from "./topology/participant-name.js";
 import { herdrNameLookup, herdrPaneId, readHerdrAgentName } from "./topology/herdr-name.js";
 import type {
@@ -118,7 +122,7 @@ import {
   runFabricHandoffAtBoundary,
   type PendingFabricHandoff,
 } from "./prewalk/handoff.js";
-import type { AgentToolResultMessage } from "./agents/types.js";
+import type { AgentRunRecord, AgentToolResultMessage } from "./agents/types.js";
 import {
   MainAgentController,
   resolveFabricIdentity,
@@ -219,7 +223,7 @@ const MAIN_ACTOR_MESH_REPLAY_MS = 10 * 60_000;
 // ctx throws, and a throw there is uncaught and exits Pi, so the notice is dropped.
 const notifyDetached = (context: ExtensionContext, message: string): void => {
   try {
-    if (context.hasUI) context.ui.notify(message, "error");
+    if (context.hasUI) notifyDiagnostic(context, "src/fabric-runtime-state.ts", message, "error");
   } catch {
     // Stale ctx: the runtime that owned this callback is closing.
   }
@@ -257,6 +261,8 @@ export class FabricRuntimeState {
   #participants: ParticipantDirectory | undefined;
   #providerParticipants = new ProviderParticipantRegistry();
   #control: FabricControlPlane | undefined;
+  #transport: FabricTransport | undefined;
+  #transportAbort: AbortController | undefined;
   #lifecycle: LifecycleBroker | undefined;
   #residency: ResidencyClient | undefined;
   #agentsProvider: AgentsProvider | undefined;
@@ -575,7 +581,7 @@ export class FabricRuntimeState {
       this.#participants?.resume();
       // smarty-dev#8881: reopen only the control poll that a disposed ctx paused, never one a
       // reload/shutdown paused (those reset this flag and replace or close the plane).
-      if (this.#controlPausedByDispose) {
+      if (this.#controlPausedByDispose && (!this.#transport || this.#participants?.canConsumeMesh())) {
         this.#controlPausedByDispose = false;
         this.#control?.resume();
       }
@@ -709,11 +715,12 @@ export class FabricRuntimeState {
     this.#cwd = context.cwd;
     const projectTrusted = this.#managedHost ? false : context.isProjectTrusted();
     this.#managedHost?.seal();
-    this.#config = this.#managedHost?.config() ?? bootstrapConfig ?? loadFabricConfig({
+    const initialConfig = this.#managedHost?.config() ?? bootstrapConfig ?? loadFabricConfig({
       cwd: context.cwd,
       agentDir: resolveAgentDir(),
       projectTrusted,
     });
+    this.#config = initialConfig.mesh.transport === "nats" ? structuredClone(initialConfig) : initialConfig;
     if (!this.#managedHost && process.platform !== "win32") {
       this.#shellJobs.durable = new DurableShellBridge(this.#shellJobs, {
         cwd: context.cwd,
@@ -886,6 +893,10 @@ export class FabricRuntimeState {
     const configuredMeshRoot = this.#config.mesh.root;
     const meshRoot = process.env.PI_FABRIC_MESH_ROOT ?? (configuredMeshRoot
       ? path.resolve(projectRoot, configuredMeshRoot) : path.join(projectRoot, ".pi", "fabric", "mesh"));
+    // NATS callbacks retain their exact activation; FILE keeps its live field lookups.
+    const natsMode = this.#config.mesh.enabled && this.#config.mesh.transport === "nats";
+    let directoryActors: ActorDirectory | undefined;
+    let directoryAgents: AgentManager | undefined;
     const mainAgent = new MainAgentController(
       this.pi,
       mainAgentId,
@@ -898,7 +909,7 @@ export class FabricRuntimeState {
         isSupervisor: (sender, rootId) => {
           if (sender.kind !== "actor") return false;
           try {
-            return isMainInterruptSupervisor(sender, rootId, this.#actors?.status(sender.id));
+            return isMainInterruptSupervisor(sender, rootId, (natsMode ? directoryActors : this.#actors)?.status(sender.id));
           } catch { return false; }
         },
       },
@@ -927,6 +938,11 @@ export class FabricRuntimeState {
     }) : undefined;
     this.#stopHerdrLookup = herdrLookup?.stop;
     herdrLookup?.start();
+    // Carrier configuration belongs to this activation, not reloadConfig's mutable object.
+    const meshConfig = this.#config.mesh.transport === "nats" ? structuredClone(this.#config.mesh) : this.#config.mesh;
+    const transportAbort = natsMode ? new AbortController() : undefined;
+    this.#transportAbort = transportAbort;
+    try {
     this.#backgroundMesh = new MeshBackgroundQueue("runtime lifecycle/compaction");
     this.#disposableMeshWrites = identity.kind === "actor" || identity.kind === "agent"
       ? new AbortController() : undefined;
@@ -937,12 +953,43 @@ export class FabricRuntimeState {
       {
         backgroundReadCacheMs: this.#config.mesh.idleReadCoalesceMs,
         readActive: () => live.read(ctx => !ctx.isIdle() || ctx.hasPendingMessages()) === true ||
-          (this.#agents?.runningCount() ?? 0) > 0 || (this.#actors?.inFlightCount() ?? 0) > 0,
+          ((natsMode ? directoryAgents : this.#agents)?.runningCount() ?? 0) > 0 ||
+          ((natsMode ? directoryActors : this.#actors)?.inFlightCount() ?? 0) > 0,
         lockProtocol: this.#config.mesh.lockProtocol,
         stateBackend: this.#config.mesh.stateBackend,
         ...(this.#disposableMeshWrites ? { writeSignal: this.#disposableMeshWrites.signal } : {}),
       },
     );
+    const hostId = identity.kind === "main" ? mainAgentId : `runtime:${sessionId}`;
+    const mesh = this.#mesh;
+    let transportStateDir: string | undefined;
+    if (meshConfig.enabled && meshConfig.transport === "nats") {
+      // Direct bootstrap callers need the same E9/E16 refusals as config loading.
+      if (meshConfig.hostTransport !== "nats") throw new FabricMeshTransportConfigError("nats", meshConfig.hostTransport ?? "file");
+      validateFabricNatsOperatorMachine(meshConfig.nats.operatorMachine, meshConfig.nats.machine);
+      transportStateDir = path.resolve(path.join(resolveAgentDir(), "fabric"));
+      const relative = path.relative(path.resolve(mesh.root), transportStateDir);
+      if (relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative))) {
+        throw new Error("Fabric transport local state directory must be outside the shared mesh root");
+      }
+      const { mkdirPrivate } = await import("./storage/private-dir.js");
+      mkdirPrivate(transportStateDir);
+      const { openFabricTransport } = await import("./transport/index.js");
+      // NatsTransport.open awaits ensureTransportConsumer before returning (inbox.ts).
+      const opened = await openFabricTransport({ config: structuredClone(meshConfig), hostId, mesh, signal: transportAbort!.signal });
+      // A teardown may have completed while the factory was still opening.
+      if (transportAbort!.signal.aborted) {
+        await opened.close();
+        transportAbort!.signal.throwIfAborted();
+      }
+      this.#transport = opened;
+      if (this.#transport.kind !== "nats" || this.#transport.self.hostId !== hostId) {
+        throw new Error("Fabric NATS transport factory returned a different carrier or owner");
+      }
+      // The actual factory/environment-resolved identity is authoritative, not config.
+      validateFabricNatsOperatorMachine(meshConfig.nats.operatorMachine, this.#transport.self.machine);
+    }
+    const transport = this.#transport;
     // The managed composition returned above without native managers or a mesh root.
     // Bind native custody to this execution session once, never to a hosted invocation context.
     if (this.#config.mesh.enabled) this.#registry.setResidentProcessWorkSession(sessionId);
@@ -951,14 +998,16 @@ export class FabricRuntimeState {
       ? new RootInbox(this.#mesh, identity, () => [mainAgentId,
           validName(live.sessionName()) ?? validName(smartyAgent) ?? herdr.name ?? ""])
       : undefined;
-    const hostId = identity.kind === "main" ? mainAgentId : `runtime:${sessionId}`;
-    const mesh = this.#mesh;
     const rootInbox = this.#rootInbox;
     let initialMeshError: unknown;
     let inboxMaintenance: MainInboxMaintenance | undefined;
     this.#participantsEpoch = epoch;
     this.#participants = new ParticipantDirectory(this.#mesh, {
+      ...(transport ? { transport } : {}),
+      ...(transportStateDir ? { transportStateDir } : {}),
       beforePublication: async () => {
+        // NATS commits its lease/view first; native activation follows start().
+        if (transport) return;
         // Hand the early acquisition failure to start() once, without another inline
         // timeout. Its existing warning/heartbeat path owns recovery from here.
         if (initialMeshError !== undefined) {
@@ -970,12 +1019,13 @@ export class FabricRuntimeState {
       },
       // Reuse committed heartbeat maintenance, never another timer/background import.
       presencePassMs: 25_000,
-      terminalActor: entry => this.#actors?.validateSessionActorTombstone(entry),
+      terminalActor: entry => (transport ? directoryActors : this.#actors)?.validateSessionActorTombstone(entry),
       presencePass: async () => {
-        await rootPresenceAlarms(this.#mesh!, identity, hostId,
-          this.#participants!.list({ scope: "project", includeStale: true, fresh: true }), this.#config!.mesh.rootPresenceAlarmMs);
+        await rootPresenceAlarms(transport ? mesh : this.#mesh!, identity, hostId,
+          (transport ? participants : this.#participants!).list({ scope: "project", includeStale: true, fresh: true }),
+          transport ? meshConfig.rootPresenceAlarmMs : this.#config!.mesh.rootPresenceAlarmMs);
         await inboxMaintenance?.run();
-        await this.#actors?.reconcileSessionOrphans();
+        await (transport ? directoryActors : this.#actors)?.reconcileSessionOrphans();
       },
       enabled: this.#config.mesh.enabled,
       hostId,
@@ -983,8 +1033,8 @@ export class FabricRuntimeState {
       identity,
       onRootCollision: collision => {
         const warning = `Duplicate live Fabric root (${collision.reason}): ${collision.name}; ${collision.ids.join(", ")}. Fixture forks must use PI_FABRIC_FIXTURE=1.`;
-        console.warn(`[pi-fabric] ${warning}`);
-        live.read(ctx => { if (ctx.hasUI) ctx.ui.notify(warning, "warning"); });
+        diagnostics.warn("src/fabric-runtime-state.ts", `[pi-fabric] ${warning}`);
+        live.read(ctx => { if (ctx.hasUI) notifyDiagnostic(ctx, "src/fabric-runtime-state.ts", warning, "warning"); });
       },
       live: live.current,
       // No live ctx to rebind to (smarty-dev#5962/#4313): the lease lapses, so say it on the fleet
@@ -1005,10 +1055,12 @@ export class FabricRuntimeState {
         : {}),
     });
     const participants = this.#participants;
-    const meshConfig = this.#config.mesh;
     const sessionFile = context.sessionManager.getSessionFile?.();
     let meshActivationReady = false;
-    this.#meshActivationReady = () => meshActivationReady && live.current();
+    // NATS consumers stay closed until native recovery and source publication commit.
+    let natsPublicationReady = !transport;
+    this.#meshActivationReady = () => meshActivationReady && live.current() &&
+      (!transport || natsPublicationReady && participants.canConsumeMesh());
     const initializeMeshActivation = async (): Promise<void> => {
       if (meshActivationReady) return;
       if (!live.current()) throw new Error("Pi Fabric mesh activation lifecycle retired");
@@ -1046,6 +1098,7 @@ export class FabricRuntimeState {
       const activationContext = live.read(ctx => ctx);
       if (!activationContext) throw new Error("Pi Fabric mesh activation lifecycle retired");
       // Custody admission and succession succeeded: only now open inbox reads/drains.
+      if (transport && !participants.canConsumeMesh()) throw new Error("Fabric NATS owner lease retired during native activation");
       rootInbox?.start();
       meshActivationReady = true;
       // A delayed activation (initial lock timeout) arms the idle wake once a current runtime set it.
@@ -1065,38 +1118,55 @@ export class FabricRuntimeState {
         if (recordedRotation || (predecessor && predecessor.id !== mainAgentId)) await inboxMaintenance.run();
       }
     };
-    try {
-      await initializeMeshActivation();
-    } catch (error) {
-      if (!isMeshWriteDeferred(error)) throw error;
-      initialMeshError = error;
+    if (!transport) {
+      try {
+        await initializeMeshActivation();
+      } catch (error) {
+        if (!isMeshWriteDeferred(error)) throw error;
+        initialMeshError = error;
+      }
+    } else {
+      // The owner lease and BOTH gap-safe watches precede every manager snapshot.
+      await participants.start();
+      if (!participants.canConsumeMesh()) throw new Error("Fabric NATS directory did not acquire a live owner lease and view");
     }
     // Capture this activation's directory: no control may claim/run before its epoch
     // commits, after failed renewal, or through a replacement generation's lease.
     const controlParticipants = participants;
+    const participantView = transport ? participants.participantView : undefined;
+    if (transport && !participantView) throw new Error("Fabric NATS participant view unavailable");
+    let controlInboxBound = false;
     this.#control = new FabricControlPlane(this.#mesh, identity, {
+      ...(transport && participantView ? { transport, participants: participantView } : {}),
       ownerIncarnation: controlParticipants.ownerIncarnation,
-      controlIncarnationFence: this.#config.mesh.controlIncarnationFence,
+      controlIncarnationFence: transport ? "enforce" : meshConfig.controlIncarnationFence,
       onUnfencedSenderWarning: message => {
         if (live.read(ctx => {
           if (!ctx.hasUI) return false;
-          ctx.ui.notify(message, "warning");
+          notifyDiagnostic(ctx, "src/fabric-runtime-state.ts", message, "warning");
           return true;
-        }) !== true) console.warn(`[pi-fabric] ${message}`);
+        }) !== true) diagnostics.warn("src/fabric-runtime-state.ts", `[pi-fabric] ${message}`);
       },
       // Both gates: this activation's custody/succession completed (main) AND its
       // directory epoch is committed under a live, renewed lease (#709).
       // smarty-dev#8881: plus bound-ctx freshness, so a disposed Main stops admitting before its
       // first heartbeat would notice.
-      canConsumeMesh: () => meshActivationReady && this.#bindingFresh() && controlParticipants.canConsumeMesh(),
+      canConsumeMesh: () => meshActivationReady && (!transport || natsPublicationReady) && this.#bindingFresh() &&
+        (!transport || live.current() && participantView?.leaseLive() === true) && controlParticipants.canConsumeMesh(),
       enabled: this.#config.mesh.enabled,
       hostId,
       pollMs: this.#config.mesh.actorPollMs,
       bridgeTimeoutMs: this.#config.mesh.bridgeControlTimeoutMs,
+      ...(transport ? { inboxLanes: meshConfig.nats.inboxLanes ?? 8,
+        relayOperatorMachine: meshConfig.nats.operatorMachine } : {}),
+      ...(meshConfig.nats.machine !== undefined
+        ? { expectedNatsInboxStream: `FABRIC_IN_${meshConfig.nats.machine}` } : {}),
+      ...(meshConfig.nats.rollbackHoldUntil !== undefined
+        ? { withdrawHoldUntil: Date.parse(meshConfig.nats.rollbackHoldUntil) } : {}),
       captureOwnerLease: (ownerHostId, ownerIdentityId, targetId) =>
-        this.#participants?.captureControlOwnerLease(ownerHostId, ownerIdentityId, targetId),
+        (transport ? controlParticipants : this.#participants)?.captureControlOwnerLease(ownerHostId, ownerIdentityId, targetId),
       readMirroredOwner: (ownerHostId, ownerIdentityId, targetId) =>
-        this.#participants?.mirroredControlOwner(ownerHostId, ownerIdentityId, targetId),
+        (transport ? controlParticipants : this.#participants)?.mirroredControlOwner(ownerHostId, ownerIdentityId, targetId),
     });
     await builtins.mesh(this.#config, this.#mesh, identity, this.#participants, this.capturedTools);
     this.#decisions = this.#config.mesh.enabled ? new DecisionStore(this.#mesh, identity) : undefined;
@@ -1183,6 +1253,7 @@ export class FabricRuntimeState {
     const completionInbox = new AgentCompletionInbox(this.pi, context,
       actorChildStore ? (ids) => actorChildStore.consumeLiveBatch(ids) : undefined);
     this.#completionInbox = completionInbox;
+    const firstSeenAgents = new Map<string, number>();
     let markStoppedDelivered = (_id: string): void => {};
     recordMainRelease(sessionId, loadedFabricRoot(import.meta.url));
     this.#agents = new AgentManager(context.cwd, agentConfig, {
@@ -1196,6 +1267,22 @@ export class FabricRuntimeState {
       projectRoot,
       hostId,
       identityId: identity.id,
+      ...(transport ? {
+        meshTransport: structuredClone({ transport: meshConfig.transport,
+          ...(meshConfig.hostTransport ? { hostTransport: meshConfig.hostTransport } : {}), nats: meshConfig.nats }),
+        taskPresence: {
+          publishBeforeLaunch: async (run: AgentRunRecord) => {
+            if (!controlInboxBound || !meshActivationReady || !natsPublicationReady || !this.#bindingFresh() || !live.current() || !participants.canConsumeMesh()) {
+              throw new Error("Fabric NATS task admission requires the bound inbox and live owner lease");
+            }
+            // Actor activations retain actor-native publication, never a synthetic task row.
+            for (const record of agentParticipantRecords([run], mainAgentId, hostId, identity.id, identity.id, firstSeenAgents)) {
+              await participants.publishBeforeLaunch({ ...record, ownerIncarnation: participants.ownerIncarnation });
+            }
+          },
+          withdraw: (id: string) => participants.withdrawBeforeLaunch(id),
+        },
+      } : {}),
       ...(ownsPersistentActorRegistry ? { completionRecipient: () => ({
         rootId: mainAgentId, sessionId, cwd: context.cwd, projectRoot, name: rootParticipantName(this.pi.getSessionName?.(), herdr.name, smartyAgent), role,
         startedAt: mainAgent.info(context).startedAt ?? Date.now(),
@@ -1271,7 +1358,7 @@ export class FabricRuntimeState {
         // Always addressed (pi-fabric#939 P2-b): the owner identity, else this Main itself; never a broadcast.
         const to = admissionAlarmRecipient(process.env.PI_FABRIC_OWNER_IDENTITY_ID, from);
         if (!to) {
-          console.warn("[pi-fabric] agent-admission alarm not published: no owner session address (the stderr line stands)");
+          diagnostics.warn("src/fabric-runtime-state.ts", "[pi-fabric] agent-admission alarm not published: no owner session address (the stderr line stands)");
           return;
         }
         // A named run's failed recovery save is an ops.owner alarm (pi-fabric#939 round 4); the held count stays a fabric.alarm.
@@ -1338,6 +1425,7 @@ export class FabricRuntimeState {
     // Runs a previous runtime of this session stopped at reload/shutdown (smarty-dev#1602):
     // wait/status answer from the record, and with notices on each result reaches the spawner once.
     const agents = this.#agents;
+    directoryAgents = agents;
     markStoppedDelivered = restoreStoppedRuns({
       entries: context.sessionManager?.getEntries?.() ?? [],
       notifyOnComplete: agentConfig.notifyOnComplete,
@@ -1346,17 +1434,17 @@ export class FabricRuntimeState {
       appendEntry: (data) => this.pi.appendEntry<StoppedAgentsEntryData>(STOPPED_AGENTS_ENTRY, data),
     });
     const canManageActor = (actorId: string, fresh = true): boolean | undefined => {
-      const participant = this.#participants?.get(actorId, undefined, { fresh });
+      const participant = (transport ? participants : this.#participants)?.get(actorId, undefined, { fresh });
       return participant ? participant.ownerHostId === hostId : undefined;
     };
     const snapshotActorOwnership = (fresh = true, actorIds?: readonly string[]): ReadonlyMap<string, boolean> =>
-      this.#participants?.actorOwnership(hostId, { fresh, ...(fresh ? {} : { actorIds }) }) ?? new Map();
+      (transport ? participants : this.#participants)?.actorOwnership(hostId, { fresh, ...(fresh ? {} : { actorIds }) }) ?? new Map();
     // Capture this generation's directory: replacement/quiesce must veto old
     // deferred slices, and new actors cannot maintain archives before publication.
-    const actorParticipants = this.#participants;
-    const canConsumeActorMesh = () => actorParticipants.canConsumeMesh();
+    const actorParticipants = participants;
+    const canConsumeActorMesh = () => (!transport || natsPublicationReady && meshActivationReady && this.#bindingFresh() && live.current()) && actorParticipants.canConsumeMesh();
     const lineageAlive = (rootId: string): boolean =>
-      this.#participants?.lineageAlive(rootId) ?? true;
+      (transport ? actorParticipants : this.#participants)?.lineageAlive(rootId) ?? true;
     const actorRoots = {
       project: path.join(meshRoot, "actors"),
       session: path.join(meshRoot, "actors", fabricSessionId),
@@ -1372,14 +1460,16 @@ export class FabricRuntimeState {
       extensionContext: context,
       update() {},
     });
+    let actorControlProvider: AgentsProvider | undefined;
     const prepareActorModelRoute = async (input: ActorModelRouteInput, signal: AbortSignal) => {
       const { prepareModelRoute } = await import("./agents/model-route-prepare.js");
       return prepareModelRoute({ ...input, signal, config: this.#config!.agents.modelRouting,
         registry: context.modelRegistry, aliases: this.#config!.models.aliases,
-        assertModelAllowed: model => this.#agents!.assertModelAllowed(model, "pi"),
+        assertModelAllowed: model => (transport ? agents : this.#agents!).assertModelAllowed(model, "pi"),
         evaluate: (request, routeSignal) => {
-          if (!this.#agentsProvider) throw new Error("Jev routing unavailable");
-          return this.#agentsProvider.routeEvaluate(request, routeSignal, { cwd: context.cwd,
+          const provider = transport ? actorControlProvider : this.#agentsProvider;
+          if (!provider) throw new Error("Jev routing unavailable");
+          return provider.routeEvaluate(request, routeSignal, { cwd: context.cwd,
             signal: routeSignal, parentToolCallId: "fabric-actor-route", nestedToolCallId: "fabric-actor-route",
             extensionContext: context, update() {} });
         } });
@@ -1398,7 +1488,7 @@ export class FabricRuntimeState {
             canManageActor,
             snapshotActorOwnership,
             canConsumeMesh: canConsumeActorMesh,
-            isOwnResidentActor: (id) => isOwnResidentActor(this.#participants!, id, mainAgentId),
+            isOwnResidentActor: (id) => isOwnResidentActor(transport ? actorParticipants : this.#participants!, id, mainAgentId),
             lineageAlive,
             claimResidency: "session",
             rootId: mainAgentId,
@@ -1441,11 +1531,13 @@ export class FabricRuntimeState {
             acquireCapabilityView: acquireActorCapabilityView,
           },
     ], actorRoots, this.#config.mesh.actorScope);
+    const actors = this.#actors;
+    directoryActors = actors;
     // A removal this Main accepted behind a run that its restart ended (a same-name create) is
     // finished here, as a resident host does at start; ownership limits it to this Main's actors.
     if (ownsPersistentActorRegistry) void this.#actors.finishPendingRemovals().catch(() => undefined);
     this.#registry.subscribeProviderChanges(() => {
-      this.#actors?.retryCapabilityWaiters();
+      (transport ? actors : this.#actors)?.retryCapabilityWaiters();
       this.#refreshRepairCatalog();
     });
     this.#lifecycle = new LifecycleBroker(
@@ -1458,8 +1550,9 @@ export class FabricRuntimeState {
         maxReadEvents: this.#config.mesh.maxReadEvents,
       },
       async (subscription, event) => {
-        if (!this.#agentsProvider) throw new Error("Fabric agents provider is unavailable");
-        await this.#agentsProvider.deliverLifecycle(subscription, event);
+        const provider = transport ? actorControlProvider : this.#agentsProvider;
+        if (!provider) throw new Error("Fabric agents provider is unavailable");
+        await provider.deliverLifecycle(subscription, event);
       },
     );
     this.#globalActors = new GlobalActorRegistry(resolveAgentDir(), this.#config.mesh.maxEventBytes);
@@ -1508,47 +1601,59 @@ export class FabricRuntimeState {
           ...(this.#paths ? { hostPath: this.#paths.residentHost } : {}),
         })
       : undefined;
-    const firstSeenAgents = new Map<string, number>();
-    if (mainAgent.local) {
+    const registerMainSource = (): void => {
+      if (!mainAgent.local) return;
       // The presence heartbeat rereads the Pi name (renames, clearing) and model through the
       // live binding only. A retired ctx keeps the last live snapshot (smarty-dev#5962).
       let rootInfo = mainAgent.info(context);
       live.sessionName();
-      const participants = this.#participants;
+      const participants = this.#participants!;
       participants.registerSource(() => {
         const current = live.read(ctx => mainAgent.info(ctx));
         rootInfo = current ?? { ...rootInfo, updatedAt: Date.now() };
         return [participants.root(rootInfo, mainAgent.interactive, mainName(), { role }, herdr.pane)];
       });
+    };
+    const registerAgentSource = (): void => {
+      this.#participants!.registerSource(() =>
+        agentParticipantRecords(
+          (transport ? agents : this.#agents!).listForUi(),
+          mainAgentId,
+          hostId,
+          identity.id,
+          identity.id,
+          firstSeenAgents,
+        ),
+      );
+    };
+    // FILE keeps source registration before start. NATS waits for native recovery.
+    if (!transport) {
+      registerMainSource();
+      registerAgentSource();
     }
-    this.#participants.registerSource(() =>
-      agentParticipantRecords(
-        this.#agents!.listForUi(),
-        mainAgentId,
-        hostId,
-        identity.id,
-        identity.id,
-        firstSeenAgents,
-      ),
-    );
+    if (transport) await initializeMeshActivation();
     // Reconcile both scopes before actor publication or control/mesh input.
-    try { await this.#actors.recoverProtectedActors(); }
+    try { await (transport ? actors : this.#actors).recoverProtectedActors(); }
     catch (error) {
       if (!(error instanceof ActorSlotRecoveryParkedError)) throw error;
-      console.warn(`[pi-fabric] ${this.#actors.slotRecoveryStatus().error?.message}`);
+      diagnostics.warn("src/fabric-runtime-state.ts", `[pi-fabric] ${(transport ? actors : this.#actors).slotRecoveryStatus().error?.message}`);
+    }
+    if (transport) {
+      registerMainSource();
+      registerAgentSource();
     }
     this.#participants.registerSource(() =>
-      this.#actors!.listOwned(true).map((actor) =>
+      (transport ? actors : this.#actors!).listOwned(true).map((actor) =>
         actorParticipantRecord(actor, mainAgentId, hostId, identity.id, identity.id),
       ),
     );
-    this.#agents.subscribeUi(() => this.#participants?.scheduleRefresh());
-    this.#actors.subscribe(() => this.#participants?.scheduleRefresh());
+    (transport ? agents : this.#agents).subscribeUi(() => (transport ? participants : this.#participants)?.scheduleRefresh());
+    (transport ? actors : this.#actors).subscribe(() => (transport ? participants : this.#participants)?.scheduleRefresh());
     let routeOwner: { client: import("./jev/client.js").JevClient; signal: AbortSignal; pending: Set<Promise<unknown>> } | undefined;
     const providerParticipants = this.#providerParticipants;
     this.#participants.registerSource(() =>
       providerParticipants.records(mainAgentId, hostId, identity.id));
-    providerParticipants.subscribe(() => this.#participants?.scheduleRefresh());
+    providerParticipants.subscribe(() => (transport ? participants : this.#participants)?.scheduleRefresh());
     const agentsProvider = new AgentsProvider(
       this.#agents,
       this.#actors,
@@ -1596,17 +1701,47 @@ export class FabricRuntimeState {
     );
     agentsProvider.providerParticipants = providerParticipants;
     this.#agentsProvider = agentsProvider;
-    this.#control.start((command, from, signal, verification) =>
-      agentsProvider.acceptControl(command, from, signal, verification));
+    actorControlProvider = agentsProvider;
+    if (transport) {
+      // Publish native recovery and sources before control/spawn admission opens.
+      await participants.refreshPresence();
+      if (!participants.canConsumeMesh()) throw new Error("Fabric NATS directory lost its owner lease before publication");
+      natsPublicationReady = true;
+    }
+    const control = this.#control;
+    const bindControlInbox = (): void => {
+      if (transport) {
+        const leaseSignal = participants.transportLeaseSignal;
+        if (!leaseSignal) throw new Error("Fabric NATS lease signal unavailable");
+        const retireInbox = (): void => {
+          controlInboxBound = false;
+          control.pause(leaseSignal.reason);
+        };
+        // Fence loss BEFORE consumers; only a new acquisition may reopen the inbox.
+        leaseSignal.addEventListener("abort", retireInbox, { once: true });
+        if (leaseSignal.aborted) { retireInbox(); leaseSignal.throwIfAborted(); }
+      }
+      control.start((command, from, signal, verification) =>
+        agentsProvider.acceptControl(command, from, signal, verification));
+      controlInboxBound = !transport || !participants.transportLeaseSignal?.aborted;
+    };
+    if (!transport) bindControlInbox();
     try {
-      await this.#participants.start();
+      if (!transport) {
+        await this.#participants.start();
+      } else {
+        if (!participants.canConsumeMesh()) throw new Error("Fabric NATS directory did not acquire a live owner lease and view");
+        bindControlInbox();
+      }
     } catch (error) {
+      if (transport) throw error;
       const detail = error instanceof Error ? error.message : String(error);
-      console.warn(
+      diagnostics.warn(
+        "src/fabric-runtime-state.ts",
         `[pi-fabric] Initial mesh publish failed (${detail}); the participant heartbeat will keep retrying.`,
       );
       if (context.hasUI) {
-        context.ui.notify(
+        notifyDiagnostic(context, "src/fabric-runtime-state.ts",
           `Pi Fabric could not reach the mesh (${detail}); retrying in the background.`,
           "warning",
         );
@@ -1765,6 +1900,14 @@ export class FabricRuntimeState {
     // A damaged artifact disables normalization and surfaces on demand.
     const compiled = this.#config.entropy.compile ? loadCompiledSurface(resolveAgentDir()) : {};
     setActiveCompiledSurface(compiled.file, this.#config.entropy.compile && !compiled.error);
+    } catch (error) {
+      if (meshConfig.enabled && meshConfig.transport === "nats") {
+        this.#meshActivationReady = () => false;
+        this.#control?.pause();
+        await this.#closeInternal().catch(() => undefined);
+      }
+      throw error;
+    }
   }
 
   async #mountExecution(context: ExtensionContext, enforceSchema: boolean): Promise<void> {
@@ -1813,7 +1956,7 @@ export class FabricRuntimeState {
         });
       });
       for (const warning of control.configuration().warnings) {
-        if (context.hasUI) context.ui.notify(warning, "warning");
+        if (context.hasUI) notifyDiagnostic(context, "src/fabric-runtime-state.ts", warning, "warning");
       }
     }
   }
@@ -2201,17 +2344,36 @@ export class FabricRuntimeState {
     this.#controlPausedByDispose = false;
     // The session lifecycle retired: stop the background heartbeat before any teardown await.
     this.#participants?.suspend();
+    const transport = this.#transport;
+    const transportAbort = this.#transportAbort;
+    const control = transport || transportAbort ? this.#control : undefined;
+    const participants = transport || transportAbort ? this.#participants : undefined;
+    if (transport || transportAbort) control?.pause();
     try {
       await this.#shutdownSteps(reason, targetSessionFile);
     } catch (error) {
-      // A failed teardown step must not leave the heartbeat timer running past this
-      // session's ctx (smarty-dev#5962): stop presence, then surface the failure.
-      await this.#participants?.close().catch(() => undefined);
+      // A failed teardown step must not leave ingress or the heartbeat running.
+      if (transport) await control?.close().catch(() => undefined);
+      await (transport ? participants : this.#participants)?.close().catch(() => undefined);
       throw error;
+    } finally {
+      if (transport || transportAbort) {
+        // Exact instances survive clearing of the live fields by shutdown steps.
+        await control?.close().catch(() => undefined);
+        await participants?.close().catch(() => undefined);
+        // CAS withdrawal needs a live carrier; retire refresh only after cleanup.
+        transportAbort?.abort();
+        if (this.#transportAbort === transportAbort) this.#transportAbort = undefined;
+        if (transport && this.#transport === transport) {
+          await transport.close();
+          this.#transport = undefined;
+        }
+      }
     }
   }
 
   async #shutdownSteps(reason?: string, targetSessionFile?: string): Promise<void> {
+    const transportAbort = this.#transportAbort;
     this.sessionApprovals.reset();
     // Disposable actor/task results and journals belong to their worker, not
     // to this runtime's advisory presence/heartbeat writes. EOF must not convoy
@@ -2263,11 +2425,23 @@ export class FabricRuntimeState {
       this.#mainAgent.sessionId && this.#mesh && this.#config?.mesh.enabled) {
       await stageMainSuccessor(this.#mesh, this.#mainAgent.id, this.#mainAgent.sessionId, targetSessionFile);
     }
+    const transport = this.#transport;
+    if (transport || transportAbort) {
+      // Release NATS ingress, directory lease, then carrier BEFORE native session custody.
+      await this.#control?.close();
+      if (reason === "exit") await this.#participants?.closeLineage();
+      else await this.#participants?.close();
+      transportAbort?.abort();
+      await transport?.close();
+      if (this.#transport === transport) this.#transport = undefined;
+    }
     try {
       await this.#registry?.close();
     } finally {
-      if (reason === "exit") await this.#participants?.closeLineage();
-      else await this.#participants?.close();
+      if (!transport) {
+        if (reason === "exit") await this.#participants?.closeLineage();
+        else await this.#participants?.close();
+      }
     }
     // Last mesh user gone: release the state database handle (sqlite, shadow). A leaked handle keeps
     // state.db open on Windows past reload and blocks mesh cleanup and migration (pi-fabric#640).
@@ -2335,7 +2509,7 @@ export class FabricRuntimeState {
     const mesh = this.#mesh, identity = this.#identity;
     const owner = process.env.PI_FABRIC_OWNER_IDENTITY_ID?.trim() || undefined;
     void this.#backgroundMesh.enqueue(() => providerDeadAlarms(mesh, identity, rootId, event, owner)).catch((error: unknown) => {
-      console.warn("[pi-fabric] provider-dead ops.owner alarm failed", error);
+      diagnostics.warn("src/fabric-runtime-state.ts", "[pi-fabric] provider-dead ops.owner alarm failed", error);
     });
   }
 
@@ -2388,6 +2562,29 @@ export class FabricRuntimeState {
   }
 
   async #closeInternal(): Promise<void> {
+    const transport = this.#transport;
+    const transportAbort = this.#transportAbort;
+    const control = transport || transportAbort ? this.#control : undefined;
+    const participants = transport || transportAbort ? this.#participants : undefined;
+    try { await this.#closeInternalSteps(); }
+    finally {
+      if (transport || transportAbort) {
+        // Also covers a rejected pending open, before a transport was assigned.
+        control?.pause();
+        await control?.close().catch(() => undefined);
+        await participants?.close().catch(() => undefined);
+        transportAbort?.abort();
+        if (this.#transportAbort === transportAbort) this.#transportAbort = undefined;
+        if (transport && this.#transport === transport) {
+          await transport.close();
+          this.#transport = undefined;
+        }
+      }
+    }
+  }
+
+  async #closeInternalSteps(): Promise<void> {
+    const transportAbort = this.#transportAbort;
     this.#stopHerdrLookup?.();
     this.#stopHerdrLookup = undefined;
     // /fabric reload and bootstrap replacement rebuild Fabric, not the creating
@@ -2430,10 +2627,19 @@ export class FabricRuntimeState {
     // Reinitialization, like shutdown, must drain workers before releasing output artifacts.
     await this.#outputArtifacts.close();
     const externalNames = new Set(this.#externalProviders.keys());
+    const transport = this.#transport;
+    if (transport || transportAbort) {
+      // Native session custody stays held until carrier teardown has completed.
+      await this.#control?.close();
+      await this.#participants?.close();
+      transportAbort?.abort();
+      await transport?.close();
+      if (this.#transport === transport) this.#transport = undefined;
+    }
     try {
       await this.#registry.close(externalNames);
     } finally {
-      await this.#participants?.close();
+      if (!transport) await this.#participants?.close();
     }
     // smarty-dev#6997: the users are drained; release the state backend before dropping the store.
     // A reload builds a new MeshStore, so the old SQLite/shadow handle would otherwise leak (and

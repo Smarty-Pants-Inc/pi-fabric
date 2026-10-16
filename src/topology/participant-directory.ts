@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { diagnostics } from "../core/diagnostics.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -7,6 +8,7 @@ import { MeshBackgroundQueue, MeshBackgroundRetry, isMeshWriteDeferred } from ".
 import { participantProject, ParticipantRoleGrant, repositoryOf } from "./project-identity.js";
 import { mainPublicationFenced, MainPublicationFencedError } from "./main-publication-fence.js";
 import type { FabricMainAgentInfo } from "../main-agent.js";
+import { DirectoryNotReadyError, TransportUnavailableError, type FabricTransport } from "../transport/types.js";
 import { assertMeshStateReadable, MeshStore, meshOutageAlarmSink, meshProcessStartedAt, type MeshBatchOperation, type MeshIdentity, type MeshStateEntry, type MeshReadOptions } from "../mesh/store.js";
 import type {
   FabricHostRecord,
@@ -56,6 +58,8 @@ import {
   meshWriterLeaseRecord,
 } from "./host-leases.js";
 import { HostLeaseLockBusyError, withHostLeaseLock } from "./host-lease-lock.js";
+import type { TransportHostLease } from "./host-leases.js";
+import type { KvParticipantDirectory, ParticipantView } from "./participant-view.js";
 import { peerLabelPrefix } from "./peer-settle.js";
 import { rootParticipantName } from "./participant-name.js";
 import { ownProcessIncarnation } from "../core/atomic-write.js";
@@ -111,6 +115,7 @@ export const MAIN_RELOAD_LEASE_MS = 180_000;
  * the lease every heartbeat interval.
  */
 const CHANGE_REFRESH_MIN_MS = 1_000;
+const NATS_TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled", "stopped", "timed_out", "done", "aborted"]);
 
 // smarty-dev#6477 L6: an idle heartbeat has nothing to write; it only needs evidence that the
 // shared state is writable now (confirmedAt; peer-settle relies on it, #24). Taking the single
@@ -198,14 +203,6 @@ function latestCommitWitness(meshRoot: string): number {
  * (the dashboard, agents.list/status/members of remote agents) show them up to this old.
  */
 const ACTIVITY_REFRESH_MS = 60_000;
-/**
- * A stopped actor refuses every message and advertises no routing capability, so a
- * lease-unaware router gains nothing from a fresh envelope; current readers take its
- * liveness from the owner's host lease. Its envelope is written when it changes (the
- * stop) and otherwise renewed only this rarely, far inside the 6 h dead-host window,
- * instead of once per heartbeat inside the locked shared write (smarty-dev#6729).
- */
-export const STOPPED_ACTOR_RENEW_MS = 60 * 60 * 1_000;
 /** Ignore noisy model activity, not actor queue/mailbox state needed for live reads (#2726). */
 const QUIET_FIELDS = {
   updatedAt: undefined,
@@ -634,8 +631,10 @@ class ParticipantPublicationChangedError extends Error {
 
 export interface ParticipantDirectoryOptions {
   enabled: boolean;
-  /** Resident owners keep actor envelope timestamps fresh for lease-unaware routing readers. */
-  renewActorParticipants?: boolean;
+  /** Select KV presence/lease lifecycle instead of FILE publication; never import FILE routes. */
+  transport?: FabricTransport;
+  /** Existing machine-local runtime state, never the shared mesh root, for the NATS lease receipt. */
+  transportStateDir?: string;
   /** Existing actor file renewal only; validate the last known lineage against
    * an atomic registry snapshot at the per-key write decision. Never admits keys. */
   actorRenewalAllowed?: (record: FabricParticipantRecord) => boolean;
@@ -711,6 +710,18 @@ type RemoteMirrorLease = { state: "none" } | { state: "ended" } | {
 export class ParticipantDirectory implements FabricParticipantSource {
   /** Distinct from PID incarnation and actor lineage; rotates on every activation/reload. */
   readonly ownerIncarnation = randomUUID();
+  #transportLease: TransportHostLease | undefined;
+  #participantView: KvParticipantDirectory | undefined;
+  readonly #natsPrelaunch = new Map<string, FabricParticipantRecord>();
+  readonly #natsPending = new Map<string, Promise<void>>();
+  readonly #natsPublished = new Map<string, FabricParticipantRecord>();
+  readonly #natsPublishedAt = new Map<string, number>();
+  readonly #natsRetired = new Set<string>();
+  #natsStarting: Promise<void> | undefined;
+  #natsClosing: Promise<void> | undefined;
+  #transportRenewing: Promise<void> | undefined;
+  #natsConfirmedAt = 0;
+  #transportLost = false;
   readonly #backgroundRefresh = new MeshBackgroundRetry("participant heartbeat/change refresh")
     .alarmsTo(meshOutageAlarmSink(() => ({ mesh: this.mesh, from: this.options.identity })));
   readonly #notifications = new MeshBackgroundQueue("participant refusal/reap");
@@ -745,13 +756,11 @@ export class ParticipantDirectory implements FabricParticipantSource {
   #retiredTicks = 0;
   #degraded = false;
   #refreshing: Promise<void> | undefined;
-  #actorRenewing: Promise<void> | undefined;
   /** Coalesce this directory's own lease writes, not an independent actor key wait. */
   #leaseRenewing: Promise<number> | undefined;
+  #lastLeaseRenewedAt = 0;
   /** Serialize only our own asynchronous lease gate users; foreign custody stays a one-shot try. */
   #leaseCommitting: Promise<void> = Promise.resolve();
-  /** Last independent file renewal of each stopped actor (see STOPPED_ACTOR_RENEW_MS). */
-  readonly #stoppedRenewedAt = new Map<string, number>();
   /** A successful sequence claim survives discarded preparations for this root. */
   #claimedPeerLabel: string | undefined;
   #refreshScheduled = false;
@@ -809,7 +818,19 @@ export class ParticipantDirectory implements FabricParticipantSource {
     readonly mesh: MeshStore,
     readonly options: ParticipantDirectoryOptions,
   ) {
-    this.#leasePredecessor = options.enabled ? hostLeasePredecessor(mesh.root, options.hostId) : undefined;
+    const nats = options.transport?.kind === "nats";
+    this.#transportLease = undefined;
+    this.#participantView = undefined;
+    this.#leasePredecessor = options.enabled && !nats ? hostLeasePredecessor(mesh.root, options.hostId) : undefined;
+    if (nats) {
+      const local = options.transportStateDir;
+      if (!local || !path.isAbsolute(local)) throw new TypeError("NATS participant directory requires an absolute transportStateDir");
+      const relative = path.relative(path.resolve(mesh.root), path.resolve(local));
+      if (relative === "" || relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative)) {
+        throw new TypeError("transportStateDir must not be within the shared mesh root");
+      }
+      if (options.transport?.self.hostId !== options.hostId) throw new TypeError("Transport hostId must match participant directory hostId");
+    }
     // Prepare the participant-file lock receipt before any publication fence. A cold
     // Darwin/Windows native identity read must never be awaited while registries are held.
     this.#ownIncarnation = options.withPublicationFence
@@ -818,7 +839,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
           return value;
         }, () => undefined)
       : Promise.resolve(undefined);
-    this.#heartbeatMs = Math.max(100, options.heartbeatMs ?? PARTICIPANT_HEARTBEAT_MS);
+    this.#heartbeatMs = nats ? PARTICIPANT_HEARTBEAT_MS : Math.max(100, options.heartbeatMs ?? PARTICIPANT_HEARTBEAT_MS);
     this.#leaseMs = Math.max(this.#heartbeatMs * 2, options.leaseMs ?? PARTICIPANT_LEASE_MS);
     // A permanent non-lock refresh failure (EACCES, a refused confirmation) must not retrigger at every
     // canConsumeMesh gate or change wake: back off up to half a heartbeat so a recovered lease stays fresh.
@@ -837,27 +858,82 @@ export class ParticipantDirectory implements FabricParticipantSource {
   /** Whether this directory currently owns an armed heartbeat timer (smarty-dev#10004). */
   get heartbeatArmed(): boolean { return this.#timer !== undefined; }
 
+  /** A1's view seam: FILE mode intentionally exposes no transport view. */
+  get participantView(): ParticipantView | undefined { return this.#participantView; }
+
+  /** Composition aborts transport consumers when this local host lease is lost. */
+  get transportLeaseSignal(): AbortSignal | undefined { return this.#transportLease?.signal; }
+
+  #isNats(): boolean { return this.options.transport?.kind === "nats"; }
+
+  #natsView(): KvParticipantDirectory {
+    const view = this.#participantView;
+    if (!view?.ready) throw new DirectoryNotReadyError();
+    return view;
+  }
+
+  #transportLostNow(error: unknown): void {
+    if (this.#transportLost) return;
+    this.#transportLost = true;
+    this.#leaseConfirmed = false;
+    this.#refreshError = error;
+    this.#routingError = error;
+    if (this.#timer) clearInterval(this.#timer);
+    this.#timer = undefined;
+    if (this.#refreshTimer) clearTimeout(this.#refreshTimer);
+    this.#refreshTimer = undefined;
+    this.#refreshScheduled = false;
+    try { this.#leaseAbort.abort(error); } catch { /* already aborted */ }
+    const view = this.#participantView;
+    if (view) void view.close().catch(() => undefined);
+  }
+
+  #renewTransportLease(): Promise<void> {
+    const lease = this.#transportLease;
+    if (!lease || this.#closed || this.#transportLost) return Promise.resolve();
+    if (this.#transportRenewing) return this.#transportRenewing;
+    const work = Promise.resolve().then(() => lease.renew(AbortSignal.timeout(5_000))).then(() => undefined).catch(error => {
+      if (!lease.live()) this.#transportLostNow(error);
+      this.#refreshError = error;
+      throw error;
+    });
+    this.#transportRenewing = work;
+    void work.finally(() => {
+      if (this.#transportRenewing === work) this.#transportRenewing = undefined;
+    }).catch(() => undefined);
+    return work;
+  }
+
   // The one heartbeat timer. Every tick reads the owner's lifecycle first and skips when it
   // retired; the background work itself runs through #runBackground (smarty-dev#5962/#10004).
   #armHeartbeat(): void {
     if (this.#timer) return;
     this.#timer = setInterval(() => {
       if (this.#closed) return;
+      if (this.#isNats()) {
+        const live = this.#live();
+        this.#lifecycleTick(live);
+        if (live) {
+          void this.#renewTransportLease().catch(() => undefined);
+          if (!this.#quiescing) void this.#refreshNats(true).catch(error => { this.#refreshError = error; });
+        }
+        return;
+      }
       const live = this.#live();
       this.#lifecycleTick(live);
       if (!live) return;
-      void this.#renewActors();
       // The retry runner coalesces shared publication, not independent liveness.
-      // Renew through per-key waits even when run() skips an in-flight refresh;
-      // shared-lock-only waits still lapse and confirmation still needs its lock.
-      if (this.#refreshing && this.#fileWork > 0 && !this.#quiescing) {
+      // An admitted resident stays live during registry/key waits without rewriting
+      // its actor files. This does not certify shared admission or advance confirmation.
+      if (this.options.enabled && !this.#quiescing &&
+        ((this.#leaseConfirmed && this.options.actorRenewalAllowed) || (this.#refreshing && this.#fileWork > 0))) {
         void this.#renewFileLease().catch(error => {
           this.#refreshError = this.#superseded ?? error;
           this.#routingReadAt = 0;
           if (this.#retiredDuring(error)) return;
           this.#backgroundRefresh.failure(error);
         });
-        return;
+        if (this.#refreshing && this.#fileWork > 0) return;
       }
       if (!this.#publicationRetryTimer && !this.#publicationRetrying) this.#runBackground(() => this.refresh());
     }, this.#heartbeatMs);
@@ -899,7 +975,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     if (this.#degraded) return;
     this.#degraded = true;
     const ticks = Math.max(this.#retiredTicks, LIFECYCLE_LOST_TICKS + 1);
-    console.warn(`[pi-fabric] participant heartbeat: the session ctx it read was retired (reload or session replacement); ` +
+    diagnostics.warn("src/topology/participant-directory.ts", `[pi-fabric] participant heartbeat: the session ctx it read was retired (reload or session replacement); ` +
       `${this.options.hostId} is degraded and its heartbeat is stopped until a live session rebinds it.`);
     try { this.options.onLifecycleLost?.(ticks); } catch { /* the warning above already surfaced it */ }
   }
@@ -924,6 +1000,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
 
   /** A live owner lifecycle rebound this directory: re-arm its single heartbeat and publish. */
   resume(): void {
+    if (this.#isNats() && !this.#transportLease?.live()) return;
     if (!this.#suspended || this.#closed || this.#superseded || !this.options.enabled) return;
     this.#suspended = false;
     this.#retiredTicks = 0;
@@ -940,7 +1017,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     }
     if (++this.#retiredTicks <= LIFECYCLE_LOST_TICKS || this.#degraded) return;
     this.#degraded = true;
-    console.warn(`[pi-fabric] participant heartbeat: no live session ctx for ${this.#retiredTicks} heartbeats; ` +
+    diagnostics.warn("src/topology/participant-directory.ts", `[pi-fabric] participant heartbeat: no live session ctx for ${this.#retiredTicks} heartbeats; ` +
       `${this.options.hostId} is degraded and its lease is not renewed until a live session rebinds it.`);
     try { this.options.onLifecycleLost?.(this.#retiredTicks); } catch { /* the warning above already surfaced it */ }
   }
@@ -954,8 +1031,67 @@ export class ParticipantDirectory implements FabricParticipantSource {
     };
   }
 
+  publishBeforeLaunch(record: FabricParticipantRecord): Promise<void> {
+    if (!this.#isNats()) return Promise.resolve();
+    const view = this.#participantView;
+    if (!view) return Promise.reject(new TransportUnavailableError("NATS participant view is unavailable"));
+    if (!this.canConsumeMesh()) return Promise.reject(new TransportUnavailableError("NATS participant admission is stopped"));
+    const owned = structuredClone(this.#natsRecord(record));
+    if (NATS_TERMINAL_STATUSES.has(owned.status)) return Promise.reject(new TransportUnavailableError("Terminal participant cannot be admitted"));
+    const previous = this.#natsPending.get(owned.id);
+    // Reserve synchronously; source selection AND commit skip pending ids. Join any
+    // earlier source pass before choosing create-only versus an already-owned CAS.
+    const pending = Promise.resolve().then(async () => {
+      await previous;
+      await this.#refreshing;
+      if (!this.canConsumeMesh()) throw new TransportUnavailableError("NATS participant admission is stopped");
+      if (this.#natsPublished.has(owned.id)) await view.publish(owned);
+      else await view.publishBeforeLaunch(owned);
+      if (!this.canConsumeMesh()) {
+        await view.remove(owned.id);
+        throw new TransportUnavailableError("NATS participant admission stopped before launch");
+      }
+      this.#natsRetired.delete(owned.id);
+      this.#natsPrelaunch.set(owned.id, owned);
+      this.#natsPublished.set(owned.id, owned);
+      this.#natsPublishedAt.set(owned.id, Date.now());
+    });
+    this.#natsPending.set(owned.id, pending);
+    void pending.finally(() => {
+      if (this.#natsPending.get(owned.id) === pending) this.#natsPending.delete(owned.id);
+    }).catch(() => undefined);
+    return pending;
+  }
+
+  withdrawBeforeLaunch(id: string): Promise<void> {
+    if (!this.#isNats()) return Promise.resolve();
+    const previous = this.#natsPending.get(id);
+    this.#natsRetired.add(id);
+    const pending = Promise.resolve().then(async () => {
+      await previous?.catch(() => undefined);
+      await this.#refreshing?.catch(() => undefined);
+      this.#natsRetired.add(id);
+      this.#natsPrelaunch.delete(id);
+      this.#natsPublished.delete(id);
+      this.#natsPublishedAt.delete(id);
+      this.#localRecords.delete(id);
+      await this.#participantView?.remove(id);
+    });
+    this.#natsPending.set(id, pending);
+    void pending.finally(() => {
+      if (this.#natsPending.get(id) === pending) this.#natsPending.delete(id);
+    }).catch(() => undefined);
+    return pending;
+  }
+
   async start(): Promise<void> {
     this.#assertLeaseActive();
+    if (this.#isNats()) {
+      if (this.#closed || this.#transportLost) throw new TransportUnavailableError("NATS directory requires a new activation");
+      if (!this.#natsStarting) this.#natsStarting = this.#startNats();
+      await this.#natsStarting;
+      return;
+    }
     if (this.#timer) return;
     if (this.#closed) {
       this.#leaseAbort = new AbortController();
@@ -985,6 +1121,50 @@ export class ParticipantDirectory implements FabricParticipantSource {
       this.#installExitHook();
     }
     await this.refresh();
+  }
+
+  async #startNats(): Promise<void> {
+    if (this.#timer) return;
+    if (!this.#transportLease || !this.#participantView) {
+      const [{ TransportHostLease }, { KvParticipantDirectory }] = await Promise.all([
+        import("./host-leases.js"), import("./participant-view.js"),
+      ]);
+      const transport = this.options.transport;
+      if (!transport || !this.options.transportStateDir) throw new Error("NATS participant carrier is incomplete");
+      const lease = new TransportHostLease({
+        kv: transport.kv("leases"), self: transport.self, rootId: this.options.rootId,
+        identityId: this.options.identity.id, incarnation: this.ownerIncarnation,
+        localStateDir: this.options.transportStateDir, onLost: error => this.#transportLostNow(error),
+      });
+      this.#transportLease = lease;
+      this.#participantView = new KvParticipantDirectory({
+        transport, lease, identityId: this.options.identity.id,
+        ownerIncarnation: this.ownerIncarnation, rootId: this.options.rootId,
+        onError: error => { this.#refreshError = error; this.#routingError = error; },
+      });
+    }
+    const lease = this.#transportLease, view = this.#participantView;
+    if (!lease || !view) throw new Error("NATS participant carrier is incomplete");
+    if (this.#closed) throw new TransportUnavailableError("Closed NATS directories require a new activation");
+    try {
+      await lease.acquire(AbortSignal.timeout(5_000));
+      if (this.#closed) throw new TransportUnavailableError("Participant directory closed during acquisition");
+      view.start();
+      this.#armHeartbeat();
+      await this.#waitNatsReady();
+      await this.refresh();
+    } catch (error) {
+      await this.#closeNats();
+      throw error;
+    }
+  }
+
+  async #waitNatsReady(): Promise<void> {
+    const view = this.#participantView;
+    if (!view) throw new DirectoryNotReadyError();
+    if (view.ready) return;
+    const signal = AbortSignal.any([this.#leaseAbort.signal, AbortSignal.timeout(10_000)]);
+    while (!view.ready) await view.whenChanged(this.options.identity.id, signal);
   }
 
   // An exit before close() finished withdrawing (a /quit or SIGTERM that ends the process
@@ -1056,13 +1236,17 @@ export class ParticipantDirectory implements FabricParticipantSource {
       "its entries now lapse with their unrenewed lease";
     try {
       if (this.options.onWithdrawalFailure) this.options.onWithdrawalFailure(message);
-      else console.warn(`[pi-fabric] ${message}`);
+      else diagnostics.warn("src/topology/participant-directory.ts", `[pi-fabric] ${message}`);
     } catch { /* A diagnostic sink never fails close(). */ }
   }
 
   // Publishes changed local records soon: at once after a quiet second, otherwise at the
   // end of that second (one write for a burst of changes).
   scheduleRefresh(): void {
+    if (this.#isNats()) {
+      this.#scheduleNatsRefresh();
+      return;
+    }
     if (this.#closed || this.#superseded || isMeshWriteDeferred(this.#refreshError) || isMeshLockTimeout(this.#refreshError)) return;
     if (this.#refreshing) {
       this.#refreshAgain = true;
@@ -1086,9 +1270,26 @@ export class ParticipantDirectory implements FabricParticipantSource {
     this.#refreshTimer.unref?.();
   }
 
+  #scheduleNatsRefresh(): void {
+    if (this.#closed || this.#suspended || this.#quiescing || this.#transportLost || this.#refreshScheduled) return;
+    if (this.#refreshing) { this.#refreshAgain = true; return; }
+    this.#refreshScheduled = true;
+    this.#refreshTimer = setTimeout(() => {
+      this.#refreshTimer = undefined;
+      this.#refreshScheduled = false;
+      if (this.#closed || this.#quiescing || this.#suspended || !this.#live()) return;
+      void this.#refreshNats(false).catch(error => { this.#refreshError = error; });
+    }, Math.max(0, this.#changeRefreshAt + CHANGE_REFRESH_MIN_MS - Date.now()));
+    this.#refreshTimer.unref?.();
+  }
+
   /** Actor mutations publish changes, not a full heartbeat or a deferred-write retry. */
   async refreshPresence(): Promise<void> {
     this.#assertLeaseActive();
+    if (this.#isNats()) {
+      await this.#refreshNats(false);
+      return;
+    }
     if (isMeshWriteDeferred(this.#refreshError) || isMeshLockTimeout(this.#refreshError)) return;
     // A setter may finish saving after an in-flight heartbeat selected its source.
     // Wait for that round, then flush the pending revision under a fresh registry
@@ -1101,9 +1302,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
       }
     }
     if (isMeshWriteDeferred(this.#refreshError) || isMeshLockTimeout(this.#refreshError)) return;
-    // Do not call refresh(): mutation callers must not masquerade as automatic
-    // heartbeats. The next full round still renews every actor envelope (#5128)
-    // and its host lease in the same single batch.
+    // Do not call refresh(): mutation callers publish changed content, not a
+    // heartbeat. The next full round verifies all rows and renews the host lease.
     await this.#runRefresh(false);
   }
 
@@ -1111,14 +1311,21 @@ export class ParticipantDirectory implements FabricParticipantSource {
   async refresh(): Promise<void> {
     if (this.#closed) return;
     this.#assertLeaseActive();
+    if (this.#isNats()) {
+      await this.#refreshNats(true);
+      return;
+    }
     // Independent file renewal must not delay shared admission or let an
     // in-flight change failure disappear before a heartbeat joins its receipt.
     // smarty-dev#8880: while a publication retry is in flight, its admission has just opened a short free
-    // mesh window. Preparation and the mesh try go first; the independent renewals start once it settles.
+    // mesh window. Preparation and the mesh try go first; the host lease renewal starts once it settles.
     const deferRenewal = this.#publicationRetrying !== undefined;
-    const renewing = deferRenewal ? undefined : this.#renewActors();
+    // Preparation owns the cancellable wait; an eager zero-wait renewal must not
+    // reject startup (or recovery) before that wait can observe close().
+    const renewing = !this.options.enabled || this.#prepareLeaseLock || deferRenewal || (this.#quiescing && this.#reloadUntil === undefined)
+      ? undefined : this.#renewFileLease();
     const join = (publication: Promise<void>): Promise<void> => deferRenewal
-      ? publication.finally(() => this.#renewActors())
+      ? publication
       : Promise.all([renewing, publication]).then(() => undefined);
     if (this.#refreshing) {
       // smarty-dev#8880: an explicit refresh does not wait for a retry's admission window; the heartbeat
@@ -1133,10 +1340,14 @@ export class ParticipantDirectory implements FabricParticipantSource {
         if (isMeshWriteDeferred(error) || isMeshLockTimeout(error)) throw error;
       }).then(() => this.refresh()));
     }
-    return join(this.#runRefresh(true));
+    return join(this.#runRefresh(true, renewing));
   }
 
-  async #runRefresh(full: boolean): Promise<void> {
+  async #runRefresh(full: boolean, leaseRenewal?: Promise<number>): Promise<void> {
+    if (this.#isNats()) {
+      await this.#refreshNats(full);
+      return;
+    }
     if (this.#closed) return;
     this.#assertLeaseActive();
     if (this.#refreshing) {
@@ -1150,10 +1361,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
     // drains it, but do not acquire any registry fence until identity is ready.
     const operation = this.#ownIncarnation.then(async () => {
       if (this.#closed) return false;
-      // The independent actor lane starts its lease write before publication.
-      // Join that write outside registry custody, never its per-key work: a slow
-      // actor key must neither stall shared admission nor retain adoption fences.
-      await this.#leaseRenewing;
+      // Join the one host lease write outside registry custody. A slow publication
+      // never turns actor rows into independent heartbeat work.
+      const leaseAt = await (leaseRenewal ?? this.#leaseRenewing);
       if (this.#closed) return false;
       if (this.options.enabled && this.#prepareLeaseLock) {
         await this.#withLeaseCommit(() => withHostLeaseLock(this.mesh, hostLeasePath(this.mesh.root, this.options.hostId), () => undefined,
@@ -1171,11 +1381,11 @@ export class ParticipantDirectory implements FabricParticipantSource {
         if (this.#closed) return false;
       }
       if (!this.options.preparePublicationFence) return this.options.withPublicationFence
-        ? this.options.withPublicationFence(() => this.#refresh(full)) : this.#refresh(full);
+        ? this.options.withPublicationFence(() => this.#refresh(full, leaseAt)) : this.#refresh(full, leaseAt);
       // A changed preparation drops every selected operation. Re-select only after
       // the old registry/mesh fences have unwound; no snapshot crosses a retry wait.
       for (let attempt = 0; ; attempt++) {
-        try { return await this.#refresh(full); }
+        try { return await this.#refresh(full, leaseAt); }
         catch (error) {
           if (!(error instanceof ParticipantPublicationChangedError) || attempt >= 4 || this.#closed) throw error;
           await new Promise(resolve => setTimeout(resolve, 0));
@@ -1198,7 +1408,10 @@ export class ParticipantDirectory implements FabricParticipantSource {
       if (!committed || this.#closed) return;
       this.#assertLeaseActive();
       // Fence delayed post-commit/confirmation continuations against a successor.
-      if (this.options.enabled && (!this.#quiescing || this.#reloadUntil !== undefined)) await this.#renewFileLease();
+      if (this.options.enabled && (!this.#quiescing || this.#reloadUntil !== undefined)) {
+        if (Date.now() - this.#lastLeaseRenewedAt >= this.#heartbeatMs) await this.#renewFileLease();
+        else await this.#withLeaseFence(() => undefined);
+      }
       // An unchanged change-refresh proves nothing about the lock. Only a committed
       // write/confirmWritable acquisition ends the background path's lock outage.
       if (this.options.enabled) this.#backgroundRefresh.success();
@@ -1318,6 +1531,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
     options: FabricParticipantListOptions = {},
     now = Date.now(),
   ): FabricParticipantInfo[] {
+    if (this.#isNats()) {
+      return this.#natsView().list(options);
+    }
     if (!this.options.enabled) {
       const byId = new Map<string, FabricParticipantInfo>();
       for (const participant of this.#localRecords.values()) {
@@ -1596,6 +1812,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     ownerIdentityId: string | undefined,
     targetId: string,
   ): { remoteHost: string; expiresAt: number; mirror?: FabricMirrorLease; bridgeStale?: true; ownerIncarnation?: string } | undefined {
+    if (this.#isNats()) return undefined;
     if (!this.options.enabled || ownerIdentityId === undefined) return undefined;
     const read = { fresh: true };
     const entry = this.#participantEntry(keyFor(PARTICIPANT_PREFIX, targetId), read);
@@ -1657,6 +1874,17 @@ export class ParticipantDirectory implements FabricParticipantSource {
 
   /** Capture owner authority once. Subsequent ACK checks only stat/read that owner's file. */
   captureControlOwnerLease(ownerHostId: string, ownerIdentityId: string, targetId: string): (() => number) | undefined {
+    if (this.#isNats()) {
+      const target = targetId === "main" ? this.options.rootId : targetId;
+      const route = this.#natsView().resolve(target);
+      if (!route || route.ownerHostId !== ownerHostId || route.ownerIdentityId !== ownerIdentityId || !route.live) return undefined;
+      return () => {
+        const current = this.#natsView().resolve(target);
+        return current?.live && current.machine === route.machine && current.ownerHostId === ownerHostId &&
+          current.ownerIdentityId === ownerIdentityId && current.ownerIncarnation === route.ownerIncarnation
+          ? Date.now() + PARTICIPANT_HEARTBEAT_MS : 0;
+      };
+    }
     const record = this.#routingOwner(targetId);
     if (!record || record.owner.id !== ownerHostId || record.owner.identity.id !== ownerIdentityId ||
       this.#routeEnded(record.participant, record.read)) return undefined;
@@ -1669,6 +1897,10 @@ export class ParticipantDirectory implements FabricParticipantSource {
 
   /** Retained presence is not authority to route a long-dead or explicitly ended session. */
   retainedRouteAllowed(id: string): boolean {
+    if (this.#isNats()) {
+      const target = id === "main" ? this.options.rootId : id;
+      return this.#natsView().resolve(target)?.live === true;
+    }
     const record = this.#routingOwner(id);
     if (!record) return false;
     const now = (this.options.routingLease?.now ?? Date.now)();
@@ -1679,6 +1911,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
   /** Recovery is resolution-only: no mesh write, ownership transfer, or delivery retry here. */
   async resolveRoutingLease(id: string, signal?: AbortSignal, budget?: MirrorLeaseWaitBudget): Promise<boolean> {
     signal?.throwIfAborted();
+    if (this.#isNats()) return this.#resolveNatsRoutingLease(id, signal);
     const record = this.#routingOwner(id);
     if (!record) return this.#resolveRemoteMirrorLease(id, signal, budget); // Unknown ids retain the ordinary resolver.
     const { participant, owner } = record;
@@ -1714,6 +1947,25 @@ export class ParticipantDirectory implements FabricParticipantSource {
       !["stopping", "reloading"].includes(refreshed.status) && currentOwner !== undefined &&
       (owner.incarnationToken !== undefined ? currentOwner.incarnationToken === owner.incarnationToken : currentOwner.startedAt === owner.startedAt) &&
       currentOwner.identity.id === owner.identity.id && currentOwner.rootId === owner.rootId && !this.#routeEnded(refreshed);
+  }
+
+  async #resolveNatsRoutingLease(id: string, signal?: AbortSignal): Promise<boolean> {
+    const view = this.#participantView;
+    if (!view || this.#closed || this.#transportLost) throw new DirectoryNotReadyError();
+    const target = id === "main" ? this.options.rootId : id;
+    const configured = this.options.routingLease?.waitMs ?? 10_000;
+    const waitMs = Number.isFinite(configured) ? Math.min(10_000, Math.max(1, configured)) : 10_000;
+    const bounded = AbortSignal.any([this.#leaseAbort.signal, AbortSignal.timeout(waitMs), ...(signal ? [signal] : [])]);
+    while (!view.ready) await view.whenChanged(target, bounded);
+    const initial = view.resolve(target);
+    if (!initial || initial.live) return initial?.live === true;
+    for (;;) {
+      await view.whenChanged(target, bounded);
+      if (!view.ready) continue;
+      const current = view.resolve(target);
+      if (!current) return false;
+      if (current.live) return true;
+    }
   }
 
   /** fv2-11703: a validated remote Main mirror, read fresh. Malformed, colliding, missing-owner or
@@ -1760,6 +2012,11 @@ export class ParticipantDirectory implements FabricParticipantSource {
   }
 
   lastKnown(id: string, now = Date.now()): { participant: FabricParticipantInfo; lapsedMs: number } | undefined {
+    if (this.#isNats()) {
+      const target = id === "main" ? this.options.rootId : id;
+      const participant = this.#natsView().list({ scope: "project", includeStale: true }).find(candidate => candidate.id === target);
+      return participant?.stale ? { participant, lapsedMs: Number.POSITIVE_INFINITY } : undefined;
+    }
     if (!this.options.enabled) return undefined;
     const target = id === "main" ? this.options.rootId : id;
     // Fresh: this answers whether a lease lapsed, so a lease file read within the listing's reuse
@@ -1777,6 +2034,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
   // refresh, so false is exact for get(id)?.local. A record left by this host's previous run, before its first
   // refresh here, counts as not published; it is removed or republished on that refresh.
   publishes(id: string): boolean {
+    if (this.#isNats()) return this.#natsPublished.has(id === "main" ? this.options.rootId : id);
     return this.#localRecords.has(id === "main" ? this.options.rootId : id);
   }
 
@@ -1795,6 +2053,12 @@ export class ParticipantDirectory implements FabricParticipantSource {
    * admission, custody and commit fences call with fresh=true.
    */
   actorOwnership(localHostId: string, options: { fresh?: boolean; actorIds?: Iterable<string> | undefined } = {}): ReadonlyMap<string, boolean> {
+    if (this.#isNats()) {
+      const ids = options.actorIds ? new Set(options.actorIds) : undefined;
+      return new Map(this.#natsView().list({ scope: "project", kinds: ["actor"], includeStale: options.fresh !== true })
+        .filter(record => !ids || ids.has(record.id))
+        .map(record => [record.id, record.ownerHostId === localHostId] as const));
+    }
     const fresh = options.fresh === true;
     const ids = !fresh && options.actorIds ? new Set(options.actorIds) : undefined;
     const cached = this.#pollOwnership;
@@ -1853,6 +2117,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
 
   get(id: string, now = Date.now(), options: { fresh?: boolean } = {}): FabricParticipantInfo | undefined {
     const target = id === "main" ? this.options.rootId : id;
+    if (this.#isNats()) return this.#natsView().get(target);
     // One record and its owner's lease, not a clone of the whole directory: actor ownership
     // checks call this per actor (smarty-dev#784). A missing or stale record takes the full
     // list, which also knows legacy roots, so the answer is the same.
@@ -1896,6 +2161,10 @@ export class ParticipantDirectory implements FabricParticipantSource {
    * Only a root-owned clean-close receipt, with no conflicting presence, proves death.
    */
   lineageAlive(rootId: string, _now = Date.now()): boolean {
+    // KV absence/TTL is never native lineage-death proof. The canary deliberately
+    // vetoes cross-root actor inheritance: F-ACTOR-INHERIT (smarty-dev, issue number pending).
+    // A KV-aware raw-presence/native-close fence is follow-on work, not TTL takeover.
+    if (this.#isNats()) return true;
     if (!this.options.enabled) return true;
     const target = rootId === "main" ? this.options.rootId : rootId;
     const key = keyFor(PARTICIPANT_PREFIX, target);
@@ -1936,6 +2205,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
   // up to two intervals; peer-settle, the decision that acts on absence, waits for a later
   // commit instead (confirmedAt). Revisit if another consumer acts on absence.
   writeStalled(now = Date.now()): Error | undefined {
+    if (this.#isNats()) {
+      return this.#transportLost || !this.#transportLease?.live() ? new Error("Fabric transport host lease is not live") : undefined;
+    }
     if (!this.options.enabled || this.#closed) return undefined;
     const error = this.#refreshError;
     if (isMeshLockTimeout(error)) {
@@ -1957,6 +2229,12 @@ export class ParticipantDirectory implements FabricParticipantSource {
 
   /** A cached negative is evidence of absence only while the directory is confirmed fresh. */
   routingUnavailable(now = Date.now()): string | undefined {
+    if (this.#isNats()) {
+      if (this.#closed) return "participant directory is closed";
+      if (this.#transportLost || !this.#transportLease?.live()) return "transport host lease is not live";
+      if (!this.#participantView?.ready) return "participant directory snapshots are not ready";
+      return undefined;
+    }
     if (!this.options.enabled) return undefined;
     if (this.#closed) return "participant directory is closed";
     if (this.#routingError !== undefined) return this.#routingError instanceof Error
@@ -1975,6 +2253,11 @@ export class ParticipantDirectory implements FabricParticipantSource {
    * Never promote this read to confirmedAt/canConsumeMesh: it renews no ownership lease.
    * A state operation, not exclusive(): the backend picks the lock (smarty-dev#6477 R3). */
   async refreshRoutingView(): Promise<void> {
+    if (this.#isNats()) {
+      if (this.#closed) throw new Error("participant directory is closed");
+      await this.#waitNatsReady();
+      return;
+    }
     if (this.#closed) throw new Error("participant directory is closed");
     if (!this.options.enabled) return;
     this.#routingReadAt = 0;
@@ -1996,6 +2279,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
   /** Resident consumers fail closed on failed/overdue renewal, not just peer visibility.
    * A file-only liveness write is not confirmation that the mesh is writable. */
   canConsumeMesh(now = Date.now()): boolean {
+    if (this.#isNats()) return !this.#closed && !this.#suspended && !this.#quiescing && !this.#transportLost &&
+      !!this.#transportLease?.live() && !!this.#participantView?.ready;
     const confirmed = !this.options.enabled || (!this.#closed && !this.#quiescing && this.#leaseConfirmed &&
       this.#refreshError === undefined && now - this.#refreshedAt < this.#heartbeatMs * 2);
     // A resumed/suspended process (or a forward wall-clock adjustment) must not
@@ -2011,6 +2296,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
 
   /** When this host last committed its heartbeat: lapses before it happened on a working mesh. */
   confirmedAt(): number {
+    if (this.#isNats()) return this.#natsConfirmedAt;
     return this.#refreshedAt;
   }
 
@@ -2029,7 +2315,28 @@ export class ParticipantDirectory implements FabricParticipantSource {
     return lapsed;
   }
 
+  #natsSelf(now: number): FabricParticipantInfo {
+    const existing = this.#localRecords.get(this.options.identity.id);
+    if (existing) return { ...existing, local: existing.ownerHostId === this.options.hostId, stale: false };
+    const published = this.#participantView?.ready ? this.#participantView.get(this.options.identity.id) : undefined;
+    if (published) return published;
+    const kind: FabricParticipantKind = this.options.identity.kind === "main" ? "root" : this.options.identity.kind;
+    return {
+      format: 1, id: this.options.identity.id, kind, rootId: this.options.rootId,
+      ownerHostId: this.options.selfOwnerHostId ?? this.options.hostId,
+      ownerIdentityId: this.options.selfOwnerIdentityId ?? this.options.identity.id,
+      ...(!this.options.selfOwnerHostId ? { ownerIncarnation: this.ownerIncarnation } : {}),
+      ...(kind === "root" ? {} : { parentId: this.options.rootId }),
+      name: this.options.identity.name, status: "running", runner: "pi", transport: "host",
+      capabilities: ["steer", "followUp", "fabric"],
+      ...(this.options.identity.sessionId ? { sessionId: this.options.identity.sessionId } : {}),
+      startedAt: this.#startedAt, updatedAt: now, controlProtocol: "v1",
+      local: (this.options.selfOwnerHostId ?? this.options.hostId) === this.options.hostId, stale: false,
+    };
+  }
+
   self(now = Date.now(), read: MeshReadOptions = {}): FabricParticipantInfo {
+    if (this.#isNats()) return this.#natsSelf(now);
     const existing =
       this.#localRecords.get(this.options.identity.id) ??
       this.#parsed(read).participants
@@ -2142,7 +2449,48 @@ export class ParticipantDirectory implements FabricParticipantSource {
     });
   }
 
+  async #quiesceNats(reason?: string): Promise<void> {
+    if (this.#closed || this.#quiescing) return;
+    if (!this.#transportLease?.live()) throw new TransportUnavailableError("NATS host lease is not live");
+    this.#quiescing = true;
+    if (reason === "reload" && this.options.identity.kind === "main" && this.options.hostId === this.options.rootId) {
+      this.#reloadUntil = Date.now() + MAIN_RELOAD_LEASE_MS;
+    }
+    await Promise.allSettled([...this.#natsPending.values()]);
+    await this.#refreshNats(true);
+  }
+
+  #closeNats(): Promise<void> {
+    if (!this.#natsClosing) this.#natsClosing = this.#finishCloseNats();
+    return this.#natsClosing;
+  }
+
+  async #finishCloseNats(): Promise<void> {
+    // Admission closes before the view withdraws and before the lease writes its clean marker.
+    this.#quiescing = true;
+    this.#closed = true;
+    this.#leaseAbort.abort();
+    if (this.#timer) clearInterval(this.#timer);
+    this.#timer = undefined;
+    if (this.#refreshTimer) clearTimeout(this.#refreshTimer);
+    this.#refreshTimer = undefined;
+    this.#refreshScheduled = false;
+    await this.#refreshing?.catch(() => undefined);
+    await Promise.allSettled([...this.#natsPending.values()]);
+    await this.#transportRenewing?.catch(() => undefined);
+    if (this.#participantView) await this.#participantView.close().catch(error => { this.#refreshError = error; });
+    if (this.#transportLease) await this.#transportLease.release(AbortSignal.timeout(5_000)).catch(error => { this.#refreshError = error; });
+    this.#natsPrelaunch.clear();
+    this.#natsPending.clear();
+    this.#natsPublished.clear();
+    this.#natsPublishedAt.clear();
+  }
+
   async quiesce(reason?: string): Promise<void> {
+    if (this.#isNats()) {
+      await this.#quiesceNats(reason);
+      return;
+    }
     if (this.#closed || this.#quiescing) return;
     this.#assertLeaseActive();
     this.#quiescing = true;
@@ -2152,7 +2500,6 @@ export class ParticipantDirectory implements FabricParticipantSource {
       this.#reloadUntil = Date.now() + MAIN_RELOAD_LEASE_MS;
     }
     try {
-      await this.#actorRenewing;
       await this.#refreshing?.catch(() => undefined);
       await this.refresh();
     } catch (error) {
@@ -2170,8 +2517,16 @@ export class ParticipantDirectory implements FabricParticipantSource {
     this.#reloadPublished = this.#reloadUntil !== undefined;
   }
 
+  async #resumeNatsLineage(): Promise<void> {
+    if (!this.options.enabled || this.options.hostId !== this.options.rootId ||
+      this.options.identity.id !== this.options.rootId || this.options.identity.kind !== "main") return;
+    const closure = this.mesh.get(keyFor(LINEAGE_CLOSURE_PREFIX, this.options.rootId), { fresh: true });
+    if (closure) await this.#withLeaseFence(() => this.mesh.delete({ key: closure.key, ifVersion: closure.version }));
+  }
+
   /** Invalidate death proof under the mesh custody lock BEFORE activation or file publication. */
   async resumeLineage(): Promise<void> {
+    if (this.#isNats()) return this.#resumeNatsLineage();
     if (!this.options.enabled || this.options.hostId !== this.options.rootId ||
       this.options.identity.id !== this.options.rootId || this.options.identity.kind !== "main") return;
     const closure = this.mesh.get(keyFor(LINEAGE_CLOSURE_PREFIX, this.options.rootId), { fresh: true });
@@ -2181,8 +2536,24 @@ export class ParticipantDirectory implements FabricParticipantSource {
     if (closure) await this.#withLeaseFence(() => this.mesh.delete({ key: closure.key, ifVersion: closure.version }));
   }
 
+  async #closeNatsLineage(): Promise<void> {
+    if (this.#closed) return;
+    try {
+      await this.#quiesceNats();
+      if (this.options.hostId === this.options.rootId && this.options.identity.id === this.options.rootId &&
+        this.options.identity.kind === "main" && this.#localRecords.get(this.options.rootId)?.kind === "root") {
+        await this.#withLeaseFence(() => this.mesh.put({
+          key: keyFor(LINEAGE_CLOSURE_PREFIX, this.options.rootId), identity: this.options.identity,
+          value: { format: 1, rootId: this.options.rootId, ownerHostId: this.options.hostId,
+            ownerIdentityId: this.options.identity.id, closedAt: Date.now() },
+        }));
+      }
+    } finally { await this.#closeNats(); }
+  }
+
   /** Explicit terminal session operation. Disposing/replacing a runtime is NOT lineage closure. */
   async closeLineage(): Promise<void> {
+    if (this.#isNats()) return this.#closeNatsLineage();
     if (this.#closed) return;
     if (!this.options.enabled || this.#reloadPublished || this.#superseded) { await this.close(); return; }
     await this.quiesce().catch(() => undefined); // Drain publication before certifying terminal closure.
@@ -2200,6 +2571,10 @@ export class ParticipantDirectory implements FabricParticipantSource {
   }
 
   async close(): Promise<void> {
+    if (this.#isNats()) {
+      await this.#closeNats();
+      return;
+    }
     if (this.#closed) return;
     this.#closed = true;
     this.#leaseAbort.abort();
@@ -2212,8 +2587,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
     if (this.#refreshTimer) clearTimeout(this.#refreshTimer);
     this.#refreshTimer = undefined;
     this.#refreshScheduled = false;
-    await this.#actorRenewing?.catch(() => undefined);
     await this.#refreshing?.catch(() => undefined);
+    await this.#leaseRenewing?.catch(() => undefined);
     await this.#notifications.close();
     if (!this.options.enabled || this.#superseded || !this.#leaseClaimed) return;
     const leaseOwner = this.#leaseOwner();
@@ -2259,7 +2634,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       }
       return ops;
     }, (ops) => this.#withLeaseFence(() => this.mesh.writeBatch({ identity: this.options.identity, ops,
-      prepare: () => { assertHostLeaseOwner(this.mesh.root, leaseOwner); return []; } })));
+      beforeCommit: () => { assertHostLeaseOwner(this.mesh.root, leaseOwner); } })));
     // A superseded incarnation owns nothing left to lapse: its successor holds the lease.
     const failed = (reason: string): void => { if (!this.#superseded) this.#withdrawalFailure(reason); };
     // A reload leaves only its root and fixed host lease; the next session_start replaces both.
@@ -2282,13 +2657,154 @@ export class ParticipantDirectory implements FabricParticipantSource {
     this.#removeExitHook();
   }
 
+  #natsRecord(candidate: FabricParticipantRecord): FabricParticipantRecord {
+    const {
+      task: _task,
+      text: _text,
+      error: _error,
+      ownerIncarnation: _incarnation,
+      ...operational
+    } = candidate as FabricParticipantRecord & { task?: unknown; text?: unknown; error?: unknown };
+    return {
+      ...operational,
+      format: 1,
+      ownerHostId: this.options.hostId,
+      ownerIdentityId: this.options.identity.id,
+      ownerIncarnation: this.ownerIncarnation,
+      ...(this.#quiescing
+        ? this.#reloadUntil !== undefined && candidate.kind === "root" && candidate.id === this.options.rootId
+          ? { status: "reloading", reloadUntil: this.#reloadUntil }
+          : { capabilities: [], status: "stopping" }
+        : {}),
+      controlProtocol: "v1",
+      livenessLeaseFiles: 1,
+    };
+  }
+
+  #natsChanged(before: FabricParticipantRecord, after: FabricParticipantRecord): boolean {
+    if (JSON.stringify({ ...before, ...QUIET_FIELDS }) !== JSON.stringify({ ...after, ...QUIET_FIELDS })) return true;
+    return Date.now() - (this.#natsPublishedAt.get(before.id) ?? 0) >= ACTIVITY_REFRESH_MS &&
+      JSON.stringify({ ...before, updatedAt: undefined }) !== JSON.stringify({ ...after, updatedAt: undefined });
+  }
+
+  async #refreshNats(full: boolean): Promise<void> {
+    if (this.#closed) return;
+    const lease = this.#transportLease, view = this.#natsView();
+    if (!lease?.live() || this.#transportLost) throw new TransportUnavailableError("NATS host lease is not live");
+    if (this.#refreshing) {
+      await this.#refreshing;
+      return this.#refreshNats(full);
+    }
+    if (!full) this.#changeRefreshAt = Date.now();
+    const assertLive = (): void => {
+      if (this.#closed || this.#transportLost || !lease.live()) throw new TransportUnavailableError("NATS host lease is not live");
+    };
+    const select = async (): Promise<void> => {
+      assertLive();
+      const valid = this.options.preparePublicationFence?.();
+      const desired = new Map<string, FabricParticipantRecord>();
+      const terminal = new Set<string>();
+      for (const snapshot of this.#sources) {
+        for (const candidate of snapshot()) {
+          if (this.#natsPending.has(candidate.id)) continue;
+          // Settlement is taken BEFORE quiesce replaces operational status.
+          if (NATS_TERMINAL_STATUSES.has(candidate.status) || candidate.stopReason !== undefined) {
+            terminal.add(candidate.id);
+            continue;
+          }
+          if (candidate.kind === "agent" && this.#natsRetired.has(candidate.id)) continue;
+          const record = this.#natsRecord(candidate);
+          if (record.kind === "actor" && this.options.actorRenewalAllowed && !this.options.actorRenewalAllowed(record)) continue;
+          desired.set(record.id, record);
+        }
+      }
+      const observed = new Set(desired.keys());
+      for (const [id, record] of this.#natsPrelaunch) {
+        if (!desired.has(id) && !terminal.has(id)) desired.set(id, record);
+      }
+      const commit = async (): Promise<void> => {
+        assertLive();
+        if (valid && !valid()) throw new ParticipantPublicationChangedError();
+        const root = desired.get(this.options.rootId);
+        this.#assertRootPublishable(root);
+        if (root?.kind === "root" && this.#localRecords.get(root.id)?.kind !== "root") await this.resumeLineage();
+        for (const id of terminal) {
+          if (this.#natsPending.has(id)) continue;
+          assertLive();
+          await view.remove(id);
+          this.#natsPublished.delete(id);
+          this.#natsPublishedAt.delete(id);
+          this.#natsPrelaunch.delete(id);
+          this.#natsRetired.add(id);
+        }
+        for (const [id, record] of desired) {
+          // Hooks reserve synchronously, even if this pass already selected its snapshot.
+          if (this.#natsPending.has(id)) continue;
+          assertLive();
+          if (valid && !valid()) throw new ParticipantPublicationChangedError();
+          this.#assertRootPublishable(record);
+          if (record.kind === "actor" && this.options.actorRenewalAllowed && !this.options.actorRenewalAllowed(record)) continue;
+          const previous = this.#natsPublished.get(id);
+          if (!previous || this.#natsChanged(previous, record)) {
+            await view.publish(record);
+            this.#natsPublished.set(id, record);
+            this.#natsPublishedAt.set(id, Date.now());
+          }
+          // A manager snapshot now contains this successfully launched/queued run.
+          if (observed.has(id)) this.#natsPrelaunch.delete(id);
+        }
+        for (const [id] of [...this.#natsPublished]) {
+          if (desired.has(id) || this.#natsPrelaunch.has(id) || this.#natsPending.has(id)) continue;
+          assertLive();
+          await view.remove(id);
+          this.#natsPublished.delete(id);
+          this.#natsPublishedAt.delete(id);
+          this.#natsRetired.add(id);
+        }
+        assertLive();
+        this.#localRecords.clear();
+        for (const [id, record] of this.#natsPublished) this.#localRecords.set(id, record);
+        this.#natsConfirmedAt = Date.now();
+        this.#leaseConfirmed = true;
+        this.#refreshError = undefined;
+        this.#routingError = undefined;
+      };
+      // Retain native registry custody, including removals. No presenceBatch or FILE
+      // lease gate participates; actors still validate their native lineage tokens.
+      if (valid && this.options.withPublicationFence) await this.options.withPublicationFence(commit);
+      else await commit();
+    };
+    // Deferring selection installs #refreshing before sources/callbacks can re-enter.
+    const operation = Promise.resolve().then(async () => {
+      await this.#ownIncarnation;
+      if (this.options.beforePublication) await this.options.beforePublication();
+      if (!this.options.preparePublicationFence && this.options.withPublicationFence) {
+        await this.options.withPublicationFence(select);
+      } else await select();
+    });
+    this.#refreshing = operation;
+    try { await operation; }
+    catch (error) { this.#refreshError = error; throw error; }
+    finally {
+      if (this.#refreshing === operation) this.#refreshing = undefined;
+      if (this.#refreshAgain) {
+        this.#refreshAgain = false;
+        this.scheduleRefresh();
+      }
+    }
+  }
+
   // Return the actual shared commit/acquisition time, not the completion time
   // of fallible post-commit file copies. An unchanged change-only refresh proves nothing.
-  async #refresh(full: boolean): Promise<number | false> {
+  async #refresh(full: boolean, initialLeaseAt?: number): Promise<number | false> {
     // Claim before capturing a publication generation, but reselect ALL sources
     // afterwards: neither a label's mesh write nor an awaited claim may leave
     // actor ownership observations selected against an older generation.
-    if (this.options.enabled && !this.#leaseClaimed) await this.#renewFileLease();
+    let leaseRenewed = initialLeaseAt !== undefined;
+    if (this.options.enabled && !this.#leaseClaimed && !leaseRenewed) {
+      initialLeaseAt = await this.#renewFileLease();
+      leaseRenewed = true;
+    }
     if (this.options.enabled && !this.#claimedPeerLabel && !this.#localRecords.get(this.options.rootId)?.label) {
       for (const source of this.#sources) {
         const root = source().find(record => record.kind === "root" && record.id === this.options.rootId);
@@ -2472,21 +2988,13 @@ export class ParticipantDirectory implements FabricParticipantSource {
       const key = keyFor(PARTICIPANT_PREFIX, record.id);
       const current = existingById.get(record.id);
       const currentFile = ownParticipant(filesByKey.get(key));
-      // A resident's fence, not its Main's lease, owns these actors. External routing
-      // readers still use participant envelope freshness; retain actor activity time
-      // in the value, and do not turn change-only refreshes into heartbeats (#5128).
-      // Shared compatibility readers still need their heartbeat envelopes;
-      // files-only actors use the independent lane instead of duplicate writes.
-      // A stopped actor is renewed only when its envelope is old (STOPPED_ACTOR_RENEW_MS);
-      // its stop and any later change still publish through the change check below.
-      const renewedAt = (filesOnly ? filesByKey.get(key) : current?.entry)?.updatedAt;
-      const renewActor = full && this.options.renewActorParticipants === true &&
-        (!filesOnly || !this.options.actorRenewalAllowed) && !this.#quiescing &&
-        record.kind === "actor" && record.rootId === this.options.rootId &&
-        (record.status !== "stopped" || renewedAt === undefined || now - renewedAt >= STOPPED_ACTOR_RENEW_MS);
-      if (!renewActor && (filesOnly
+      // A resident's fence, not its Main's lease, owns these actors. Current readers
+      // derive liveness from that host lease, so a heartbeat compares content and does
+      // not renew an unchanged row. The compatibility half-life applies only to the
+      // host/session rows whose old readers actually use their timestamps (#13645).
+      if (filesOnly
         ? !current && currentFile && JSON.stringify(currentFile) === JSON.stringify(record)
-        : current && JSON.stringify(current.participant) === JSON.stringify(record))) continue;
+        : current && JSON.stringify(current.participant) === JSON.stringify(record)) continue;
       const stateEntry = stateByKey.get(key) ?? (filesOnly ? undefined : this.mesh.get(key, read));
       // Before the switch the shared state arbitrates ownership (its compare-and-swap), so it
       // decides occupancy: a stale file of this host never hides a newer owner there, and never
@@ -2506,11 +3014,11 @@ export class ParticipantDirectory implements FabricParticipantSource {
       ) continue;
       if (filesOnly) {
         // A file write does not take the mesh lock, so it does not count as a shared change.
-        if (renewActor || current || !currentFile || withoutTime(currentFile) !== withoutTime(record)) fileWrites.push(record);
+        if (current || !currentFile || withoutTime(currentFile) !== withoutTime(record)) fileWrites.push(record);
         else if (activityOf(currentFile, record)) activityWrites.push(record);
         continue;
       }
-      if (renewActor || !current || withoutTime(current.participant) !== withoutTime(record)) changed = true;
+      if (!current || withoutTime(current.participant) !== withoutTime(record)) changed = true;
       else if (activityOf(current.participant, record)) activity = true;
       // Liveness belongs to the host lease. A host renewal or another participant's real
       // change must not republish this record just because its source stamped updatedAt.
@@ -2555,9 +3063,10 @@ export class ParticipantDirectory implements FabricParticipantSource {
       if (validPublication && !validPublication()) throw new ParticipantPublicationChangedError();
       this.#localRecords.clear();
       for (const [id, record] of desired) this.#localRecords.set(id, record);
-      // Renew before ANY per-key cleanup/write/copy, including migration and retry copies.
-      // Heartbeat calls keep renewing while #retryFile is waiting on a contended key.
-      if (!this.#quiescing || this.#reloadUntil !== undefined) await this.#renewFileLease();
+      // Keep the one host lease renewal outside the shared publication. Change-only
+      // refreshes do not enter through refresh(), so renew them here as needed.
+      if (this.options.enabled && !leaseRenewed && (!this.#quiescing || this.#reloadUntil !== undefined)) await this.#renewFileLease();
+      leaseRenewed = false;
       for (const entry of fileEntries) {
         const participant = ownParticipant(entry);
         if (participant && !desired.has(participant.id)) {
@@ -2659,7 +3168,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
             let acquiredAt = this.#confirmWithoutLock() ?? 0;
             if (acquiredAt === 0) await this.mesh.confirmWritable(at => { acquiredAt = at; touchConfirmWitness(this.mesh.root); });
             // Re-check after the lock: the threshold may have elapsed while confirming.
-            decision = decideRenewal(await this.#renewFileLease());
+            decision = decideRenewal(Date.now());
             if (decision.skip) {
               await publishDeferredFiles();
               return acquiredAt;
@@ -2700,12 +3209,15 @@ export class ParticipantDirectory implements FabricParticipantSource {
           expiresAt: this.#reloadUntil ?? leaseAt + this.#leaseMs,
         }),
       });
+      // Maintenance is independent of publication: select before custody, then retain exact
+      // row-version CAS and the fresh lease condition for each bounded candidate at commit.
+      ops.push(...compactExpiredHostRecords({ listAll: prefix => this.mesh.listAllShared(prefix, read) },
+        this.mesh.root, this.options.hostId));
       let committedAt = 0;
       const results = await this.#withLeaseFence(() => this.mesh.writeBatch({ identity: this.options.identity, ops,
-        prepare: view => {
+        beforeCommit: () => {
           assertHostLeaseOwner(this.mesh.root, this.#leaseFenceOwner());
           this.#assertRootPublishable(statePuts.get(keyFor(PARTICIPANT_PREFIX, this.options.rootId)));
-          return compactExpiredHostRecords(view, this.mesh.root, this.options.hostId);
         },
         // In-process bookkeeping only (no view, no file): it needs no state custody, so it runs as the
         // commit hook, after COMMIT on every backend. As afterCommit it cost SQLite a second
@@ -2823,52 +3335,6 @@ export class ParticipantDirectory implements FabricParticipantSource {
       return committed?.version === version && participant && isLocal(participant, this.options.hostId)
         ? committed : undefined;
     }, this.#fileLockOptions()));
-  }
-
-  /** Independent liveness lane: use ONLY the last committed local actor set,
-   * renew ONLY an existing matching ownership token, and recheck registry custody
-   * at the write decision. No creation, takeover, cleanup, shared commit, or
-   * confirmedAt advancement is permitted here. A registry waiter cannot stall it. */
-  #renewActors(): Promise<void> {
-    if (this.#actorRenewing) return this.#actorRenewing;
-    if (!this.options.enabled || !this.options.renewActorParticipants || !this.options.actorRenewalAllowed ||
-      !this.#leaseConfirmed || this.#closed || this.#quiescing) return Promise.resolve();
-    const startedAt = Date.now();
-    const owned = [...this.#localRecords.values()].filter(record => record.kind === "actor" &&
-      record.rootId === this.options.rootId && record.actorOwnershipToken !== undefined);
-    for (const id of this.#stoppedRenewedAt.keys()) {
-      if (this.#localRecords.get(id)?.status !== "stopped") this.#stoppedRenewedAt.delete(id);
-    }
-    // Stopped actors: once per instance, then every STOPPED_ACTOR_RENEW_MS (smarty-dev#6729).
-    const records = owned.filter(record => record.status !== "stopped" ||
-      startedAt - (this.#stoppedRenewedAt.get(record.id) ?? -Infinity) >= STOPPED_ACTOR_RENEW_MS);
-    const work = (async () => {
-      await this.#renewFileLease();
-      for (const record of records) {
-        if (this.#closed || this.#quiescing || this.#superseded) return;
-        if (record.status === "stopped") this.#stoppedRenewedAt.set(record.id, startedAt);
-        const key = keyFor(PARTICIPANT_PREFIX, record.id);
-        try {
-          await this.mesh.withTryLock(() => writeParticipantFileIf(this.mesh, key, current => {
-            const participant = current && participantFromEntry(current);
-            if (!current || !participant || participant.remoteHost !== undefined ||
-              participant.ownerHostId !== this.options.hostId || participant.ownerIdentityId !== this.options.identity.id ||
-              participant.rootId !== record.rootId || participant.actorOwnershipToken !== record.actorOwnershipToken ||
-              !this.options.actorRenewalAllowed!(record)) return undefined;
-            return { ...current, version: current.version + 1, updatedAt: Date.now() };
-          }, { ...this.#fileLockOptions(), ownIncarnation: this.#ownIncarnationValue, registryFenced: true }), 0);
-        } catch (error) {
-          if (error instanceof FabricHostLeaseSupersededError) throw error;
-          if (error instanceof ParticipantFileLockBusyError) this.#prepareFileLocks = true;
-          // One busy key never stops siblings. Native recovery, when needed,
-          // happens in the ordinary preparation lane outside every registry.
-        }
-      }
-    })();
-    this.#actorRenewing = work.finally(() => { this.#actorRenewing = undefined; });
-    // Timer callers are fire-and-forget but close/quiesce join this exact lane.
-    this.#actorRenewing.catch(() => undefined);
-    return this.#actorRenewing;
   }
 
   /** smarty-dev#6477 L6: confirms an idle heartbeat without the mesh lock when another commit,
@@ -3006,6 +3472,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     try { await renewHostLease(this.mesh, this.#fileLease(leaseAt),
       { claim: !this.#leaseClaimed, expected: this.#leasePredecessor, signal: this.#leaseAbort.signal,
         ownIncarnation: this.#ownIncarnationValue });
+      this.#lastLeaseRenewedAt = leaseAt;
     } catch (error) {
       if (error instanceof FabricHostLeaseSupersededError) this.#markSuperseded(error);
       if (error instanceof HostLeaseLockBusyError) this.#prepareLeaseLock = true;
@@ -3150,6 +3617,17 @@ export class ParticipantDirectory implements FabricParticipantSource {
   }
 
   #withLeaseFence<T>(operation: () => T | Promise<T>): Promise<T> {
+    if (this.#isNats()) return this.#withLeaseCommit(async () => {
+      const assertLive = (): void => {
+        if (this.#closed || this.#transportLost || !this.#transportLease?.live()) {
+          throw new TransportUnavailableError("NATS host lease is not live");
+        }
+      };
+      assertLive();
+      const result = await operation();
+      assertLive();
+      return result;
+    });
     return this.#withLeaseCommit(async () => {
       this.#assertLeaseActive();
       try { return await withOwnedHostLease(this.mesh, this.#leaseFenceOwner(), operation,

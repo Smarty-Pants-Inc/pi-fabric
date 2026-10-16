@@ -1,4 +1,5 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { configureFabricDiagnostics, diagnostics, notifyDiagnostic } from "./core/diagnostics.js";
 import type { RootInboxBatch, RootInboxSession, RootInboxReconcileOptions } from "./topology/root-inbox-shared.js";
 import { resolveAgentDir } from "./core/agent-dir.js";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -236,6 +237,7 @@ export class FabricState {
   }
 
   async bootstrap(context: ExtensionContext): Promise<void> {
+    if (!this.#managedHost) configureFabricDiagnostics(context.sessionManager?.getSessionId?.() ?? "");
     this.#shutDown = false;
     const generation = ++this.#generation;
     this.#cwd = context.cwd;
@@ -612,7 +614,7 @@ export class FabricState {
     const line = probe.reason
       ? `[pi-fabric] agents.placement startup probe: ${probe.reason}; falling back to local`
       : `[pi-fabric] agents.placement startup probe: executable ${probe.executable}; default=${placement.default}`;
-    if (startup || line !== this.#placementProbeLine) console.warn(line);
+    if (startup || line !== this.#placementProbeLine) diagnostics.warn("src/fabric-state.ts", line);
     this.#placementProbeLine = line;
   }
 
@@ -705,7 +707,7 @@ export class FabricState {
           } catch (error) {
             // Keep the bootstrapped manifest usable for repair. The live control
             // plane records this read failure and watches for a corrected file.
-            if (context.hasUI) context.ui.notify(`Pi Fabric component configuration not applied: ${error instanceof Error ? error.message : String(error)}`, "error");
+            if (context.hasUI) notifyDiagnostic(context, "src/fabric-state.ts", `Pi Fabric component configuration not applied: ${error instanceof Error ? error.message : String(error)}`, "error");
           }
         }
         // Background timers read this ctx only while this activation's lifecycle holds. The

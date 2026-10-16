@@ -5,6 +5,7 @@ export { agentServiceDescriptors } from "./agents/service-schema.js";
 export type * from "./agents/service-types.js";
 export type { AgentSpawner, AgentRunRequest, AgentRunRecord, AgentRunResult, AgentHandleInfo, AgentUsage } from "./agents/types.js";
 export { FabricModelDeniedError } from "./core/model-policy.js";
+export { FabricModelNotServedError } from "./core/model-served-error.js";
 export { FabricTargetTerminalError } from "./agents/terminal-target.js";
 export type { AgentTerminalNotice, AgentUndeliveredMessage, FabricTargetRunState } from "./agents/terminal-target.js";
 export { AgentInputError, RequiredInputMissingError } from "./host-compatibility.js";

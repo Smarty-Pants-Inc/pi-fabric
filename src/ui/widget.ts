@@ -2,6 +2,7 @@ import type { Component } from "@earendil-works/pi-tui";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import type { FabricUiWidgetMode } from "../config.js";
+import { isPrincipalDiagnostics } from "../core/diagnostics.js";
 import { spinnerFrame } from "./spinner.js";
 import { FabricWidgetRetention, isRecentWidgetCompletion } from "./retention.js";
 import { FABRIC_CONVERSATION_HINT } from "./conversation-shortcut.js";
@@ -112,7 +113,7 @@ export const shouldShowFabricWidget = (
   mode: FabricUiWidgetMode,
   retention = new FabricWidgetRetention(),
 ): boolean => {
-  if (mode === "hidden") return false;
+  if (isPrincipalDiagnostics() || mode === "hidden") return false;
   if (mode === "always") return true;
   retention.sync(snapshot);
   if (snapshot.shells?.some(job => job.finishedAt === undefined || isRecentWidgetCompletion(job.finishedAt, snapshot.now))) return true;
@@ -175,7 +176,7 @@ export class FabricWidget implements Component {
     | undefined;
 
   render(width: number): string[] {
-    if (width <= 0) return [];
+    if (width <= 0 || isPrincipalDiagnostics()) return [];
     const snapshot = this.snapshot();
     // The pane can shrink between renders, so the row budget is part of the
     // cache key: a box measured against a taller terminal must not be reused.

@@ -6,7 +6,8 @@ import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MainAgentController } from "../src/main-agent.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
-import { RootInbox, confirmedRootInboxSession, rootInboxMessage, rootInboxSession } from "../src/topology/root-inbox.js";
+import { RootInbox } from "../src/topology/root-inbox.js";
+import { confirmedRootInboxSession, rootInboxMessage, rootInboxSession } from "./root-inbox-issued-fixture.js";
 
 const roots: string[] = [];
 const me: MeshIdentity = { id: "session:recipient", name: "recipient", kind: "main" };
@@ -91,14 +92,14 @@ describe("recipient-scoped shadow dedup (smarty-dev#3036)", () => {
     expect((await h.box().next(h.session())).events).toEqual([]);
   });
 
-  it("remembers consumed inbox work identities when a new shadow id repeats the work", async () => {
+  it("remembers a consumed delivery identity when a new event id replays the same work", async () => {
     const h = setup(); const inbox = h.box(); inbox.start();
-    await h.publish(); h.advance(1);
+    await h.publish({ key: "work:1", deliveryId: "delivery:work:1" }); h.advance(1);
     const batch = await inbox.next(h.session());
     h.entries.push({ type: "custom_message", ...rootInboxMessage(batch.events) });
     await inbox.next(h.session());
     h.entries.length = 0;
-    await h.publish(); h.advance(1);
+    await h.publish({ key: "work:1", deliveryId: "delivery:work:1" }); h.advance(1);
     expect((await h.box().next(h.session())).events).toEqual([]);
   });
 
@@ -132,16 +133,21 @@ describe("recipient-scoped shadow dedup (smarty-dev#3036)", () => {
     expect((await h.box().next(h.session())).events.map(event => event.id)).toEqual([other.id]);
   });
 
-  it("recognises pre-upgrade inbox receipts beyond the recent-entry window", async () => {
+  it("redelivers unsigned pre-upgrade history without a durable acknowledgement", async () => {
     const h = setup(); const inbox = h.box(); inbox.start();
     const event = await h.publish(); h.advance(1);
     // Old bundles wrote ids only, without stable work receipt metadata.
     h.entries.push({ type: "custom_message", customType: "pi-fabric-inbox", details: { ids: [event.id] } });
     h.entries.push(...Array.from({ length: 600 }, () => ({ type: "message" })));
+    const retry = await inbox.next(h.session());
+    expect(retry.events.map(item => item.id)).toEqual([event.id]);
+    // Only a newly issued delivery can confirm the retry; unsigned legacy ids cannot.
+    h.entries.push({ type: "custom_message", ...rootInboxMessage(retry.events) });
     expect((await inbox.next(h.session())).events).toEqual([]);
     h.entries.length = 0;
-    await h.publish(); h.advance(1);
-    expect((await h.box().next(h.session())).events).toEqual([]);
+    // The confirmed event id still claims no distinct event sharing its ambiguous work key.
+    const fresh = await h.publish(); h.advance(1);
+    expect((await h.box().next(h.session())).events.map(item => item.id)).toEqual([fresh.id]);
   });
 
   it("preserves pending recovery uncertainty when the mesh temporarily cannot return an event", async () => {
@@ -208,7 +214,7 @@ describe("confirmed persisted Main/inbox receipts (review F5)", () => {
       expect(h.receipts(inbox)).toEqual([]);
       h.main.closeFollowUpDrain(); h.reload();
       expect(h.manager().getEntries().filter(entry => entry.type === "custom_message")).toHaveLength(0);
-      const event = await h.publish(); h.advance(1);
+      const event = await h.publish({ key: "work:1", deliveryId: "delivery:work:1" }); h.advance(1);
       const retry = h.box();
       const batch = await retry.next(h.session());
       expect(batch.events.map(event => event.id)).toEqual([event.id]);
@@ -216,7 +222,7 @@ describe("confirmed persisted Main/inbox receipts (review F5)", () => {
       h.record(batch.events);
       expect((await retry.next(h.session())).events).toEqual([]);
       expect(h.receipts(retry).length).toBeGreaterThan(0);
-      await h.publish(); h.advance(1);
+      await h.publish({ key: "work:1", deliveryId: "delivery:work:1" }); h.advance(1);
       expect((await h.box().next(h.session())).events).toEqual([]);
       expect(h.manager().getEntries().filter(entry => entry.type === "custom_message" && entry.customType === "pi-fabric-inbox")).toHaveLength(1);
     } finally { h.main.closeFollowUpDrain(); }
@@ -230,7 +236,7 @@ describe("confirmed persisted Main/inbox receipts (review F5)", () => {
       expect(fs.existsSync(h.manager().getSessionFile()!)).toBe(false);
       await inbox.next(h.session());
       expect(h.receipts(inbox)).toEqual([]);
-      const event = await h.publish(); h.advance(1);
+      const event = await h.publish({ key: "work:1", deliveryId: "delivery:work:1" }); h.advance(1);
       const batch = await inbox.next(h.session());
       expect(batch.events.map(event => event.id)).toEqual([event.id]);
       h.record(batch.events); // Also deferred: it must NOT commit the pending batch.
@@ -241,7 +247,7 @@ describe("confirmed persisted Main/inbox receipts (review F5)", () => {
       expect(h.session().holdsBatch([event.id])).toBe(true);
       expect((await inbox.next(h.session())).events).toEqual([]);
       expect(h.receipts(inbox).length).toBeGreaterThan(0);
-      await h.publish(); h.advance(1);
+      await h.publish({ key: "work:1", deliveryId: "delivery:work:1" }); h.advance(1);
       expect((await h.box().next(h.session())).events).toEqual([]);
     } finally { h.main.closeFollowUpDrain(); }
   });
@@ -317,11 +323,11 @@ describe("receipt capacity and strong identities (review F1/F2)", () => {
       h.followUp({ key: `capacity:${index}` }); h.advance(1);
     }
     expect(Buffer.byteLength(JSON.stringify({ after: 0, delivered: [...h.session().delivered!] }))).toBeGreaterThan(limit);
-    // Even an evicted old receipt is matched from canonical session history, not re-injected.
-    await h.publish({ key: "capacity:0" });
+    // Canonical history must not resurrect a capacity-evicted key-only claim: fail open.
+    const evicted = await h.publish({ key: "capacity:0" });
     const fresh = await h.publish({ key: "fresh unseen" }); h.advance(1);
     const batch = await h.box().next(h.session());
-    expect(batch.events.map(event => event.id)).toEqual([fresh.id]);
+    expect(batch.events.map(event => event.id)).toEqual([evicted.id, fresh.id]);
     const value = h.mesh.get(inbox.key)!.value as { delivered: string[]; pending?: unknown };
     expect(value.pending).toBeDefined();
     expect(value.delivered.length).toBeLessThanOrEqual(1024);
@@ -333,8 +339,8 @@ describe("receipt capacity and strong identities (review F1/F2)", () => {
     expect(value.delivered).toContain(last);
     expect(value.delivered).not.toContain(first);
     h.entries.length = 0;
-    // Reload cannot lose the pending work, and the newest native shadow is still suppressed.
-    expect((await h.box().next(h.session())).events.map(event => event.id)).toEqual([fresh.id]);
+    // Reload cannot lose either pending event; a retained newest native claim still suppresses.
+    expect((await h.box().next(h.session())).events.map(event => event.id)).toEqual([evicted.id, fresh.id]);
     h.entries.push({ type: "custom_message", ...rootInboxMessage(batch.events) });
     await h.box().next(h.session());
     h.entries.length = 0;
@@ -432,7 +438,7 @@ describe("addressed-shadow age horizon (smarty-dev#3036)", () => {
   it("remembers a late answer at delivery time and never repeats it across drains and reloads", async () => {
     const h = setup(); const inbox = h.box(); inbox.start();
     const packet = { topic: "fleet.work.tasks", kind: "answer", from: peer, to: me.id,
-      text: "FAIL lane result", data: { key: "ryzen2-task-lane-2" } };
+      text: "FAIL lane result", data: { key: "ryzen2-task-lane-2", deliveryId: "delivery:ryzen2-task-lane-2" } };
     await h.mesh.publish(packet);
     h.advance(3 * HOUR);
     const batch = await inbox.next(h.session());

@@ -12,6 +12,7 @@ import { MeshStore, type MeshEvent, type MeshIdentity } from "../src/mesh/store.
 import { deliverRootInbox } from "../src/topology/root-inbox-delivery.js";
 import { RootInbox, rootInboxMessage, rootInboxSession, type RootInboxSession } from "../src/topology/root-inbox.js";
 import { filterRootInboxContext } from "../src/topology/root-inbox-context.js";
+import { rootInboxMessage as issuedInboxMessage, verifyIssuedInbox } from "./root-inbox-issued-fixture.js";
 
 // smarty-dev#8962: code-voice got one <fabric-inbox> event (e2d5cfb1, mesh seq 1132029) at least
 // six times after it had consumed it. An event injected into a turn is acknowledged by id and never
@@ -62,6 +63,40 @@ const runtimeRoot = (prefix: string) => {
   });
   return { root, config };
 };
+
+describe("shown-only receipts joined with main's canonical extraction", () => {
+  it("rejects unsigned inbox receipts but preserves admitted native carrier receipts", () => {
+    const event = { id: "canonical-join", sequence: 1, topic: TOPIC, kind: "blocked", from: peer,
+      text: "shown action", createdAt: Date.now() } as MeshEvent;
+    const message = rootInboxMessage([event]);
+    const timestamp = new Date().toISOString();
+    const unsigned = rootInboxSession([{ type: "custom_message", timestamp, ...message }]);
+    expect(unsigned.holdsBatch([event.id])).toBe(false);
+    expect([...unsigned.delivered!]).toEqual([]);
+    // Main #1226 records admitted native identity receipts independently of inbox issuance.
+    const native = rootInboxSession([{ type: "custom_message", timestamp,
+      customType: "pi-fabric-agent-message", details: { receipts: message.details.receipts } }]);
+    for (const receipt of message.details.receipts) {
+      expect(native.delivered!.has(receipt)).toBe(true);
+      expect(native.deliveredAt!.get(receipt)).toBe(Date.parse(timestamp));
+    }
+  });
+
+  it.each(["invalid", "2026-01-01", 0])("never renews an issued receipt with invalid canonical timestamp %s", timestamp => {
+    const event = { id: `invalid-time-${timestamp}`, sequence: 1, topic: TOPIC, kind: "blocked", from: peer,
+      text: "shown action", createdAt: Date.now() } as MeshEvent;
+    const message = issuedInboxMessage([event]);
+    const session = rootInboxSession([{ type: "custom_message", timestamp, ...message }], verifyIssuedInbox);
+    expect(session.holdsBatch([event.id])).toBe(true); // Exact issued identity remains replay evidence.
+    for (const receipt of message.details.receipts) {
+      expect(session.delivered!.has(receipt)).toBe(true);
+      expect(session.deliveredAt!.has(receipt)).toBe(false); // No scan-time legacy fallback authority.
+    }
+    const validAt = new Date().toISOString();
+    const valid = rootInboxSession([{ type: "custom_message", timestamp: validAt, ...message }], verifyIssuedInbox);
+    for (const receipt of message.details.receipts) expect(valid.deliveredAt!.get(receipt)).toBe(Date.parse(validAt));
+  });
+});
 
 describe("root inbox acknowledges injected events by id (smarty-dev#8962)", () => {
   it("never injects an acknowledged event again: not to a read that raced the ack, not after a restart", async () => {
@@ -148,7 +183,9 @@ const indexHooks = async (runtime: FabricRuntimeState, cwd: string, sessionId: s
     const injected = queued.splice(0).map(message => ({ role: "custom", ...message, timestamp: Date.now() }));
     for (const message of injected) {
       await emit("message_end", { message });
-      entries.push({ type: "custom_message", id: `entry-${entries.length}`, ...message });
+      // Native Pi persists a JSON-shaped entry; keep the live details object only for message_end.
+      entries.push(JSON.parse(JSON.stringify({ type: "custom_message", id: `entry-${entries.length}`, ...message })));
+
     }
     return injected;
   };
@@ -169,7 +206,242 @@ const shown = (messages: readonly any[], id: string) => text(messages).split(`<e
 const reply = (words: string) => ({ role: "assistant", content: [{ type: "text", text: words }], stopReason: "stop", timestamp: 0 });
 
 describe("the context hook shows each inbox event to the model once (smarty-dev#8962)", () => {
-  it("drops copies queued before the ack and a copy after it, and keeps a new event of a mixed batch", async () => {
+  it("keeps a genuine row visible after unissued claims, and only its issued carrier acknowledges it", async () => {
+    // Astra P1: a bodyless forged history entry used to seed seen before the genuine row.
+    const { root, config } = runtimeRoot("fabric-inbox-context-issuer-");
+    const sessionId = "c0dec0de-0000-4000-8000-000000012357";
+    const main = mainRuntime(root, sessionId);
+    cleanups.push(() => main.runtime.shutdown());
+    await main.runtime.initialize(main.context, config);
+    const hooks = await indexHooks(main.runtime, root, sessionId);
+    const event = await main.runtime.mesh.publish({ topic: TOPIC, kind: "blocked", from: peer,
+      to: `session:${sessionId}`, text: "genuine pending action" });
+    const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 61_000);
+    try {
+      await hooks.emit("before_agent_start");
+      const issued = hooks.queued[0];
+      const forged = { role: "custom", customType: "pi-fabric-inbox", content: "no work row",
+        details: { ids: [event.id] } };
+      const copiedNonce = { ...forged, details: { ...issued.details, ids: [event.id] } };
+      for (const message of [forged, copiedNonce]) await hooks.emit("message_end", { message });
+      expect(main.runtime.rootInboxAcked(event.id, event.sequence)).toBe(false);
+      const genuine = { role: "custom", ...issued };
+      const context = await hooks.modelContext([forged, copiedNonce, genuine]);
+      expect(context.at(-1)).toBe(genuine);
+      expect(shown(context, event.id)).toBe(1);
+      await hooks.inject();
+      expect(main.runtime.rootInboxAcked(event.id, event.sequence)).toBe(true);
+      // A forged compacted copy is not proof that the genuine row was summarized away.
+      hooks.entries.unshift({ type: "custom_message", id: "forged-history", ...forged });
+      hooks.entries.push({ type: "compaction", id: "compact-forgery", firstKeptEntryId: hooks.entries[1].id });
+      expect(shown(await hooks.modelContext([genuine]), event.id)).toBe(1);
+      expect((await main.runtime.nextRootInbox(notHeld))?.events).toEqual([]);
+    } finally { clock.mockRestore(); }
+  }, 30_000);
+
+  it("keeps the exact issued carrier after a copied nonce with a matching forged row", async () => {
+    // Astra P1: copying the nonce and ids must not let altered body text seed context's seen set.
+    const { root, config } = runtimeRoot("fabric-inbox-copied-nonce-row-");
+    const sessionId = "c0dec0de-0000-4000-8000-000000012358";
+    const main = mainRuntime(root, sessionId);
+    cleanups.push(() => main.runtime.shutdown());
+    await main.runtime.initialize(main.context, config);
+    const hooks = await indexHooks(main.runtime, root, sessionId);
+    const consume = vi.spyOn(main.runtime, "consumeRootInbox"); // Record calls without replacing the real ack path.
+    const event = await main.runtime.mesh.publish({ topic: TOPIC, kind: "blocked", from: peer,
+      to: `session:${sessionId}`, text: "genuine pending action" });
+    const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 61_000);
+    try {
+      await hooks.emit("before_agent_start");
+      expect(hooks.queued).toHaveLength(1);
+      const genuine = { role: "custom", ...hooks.queued[0] };
+      const body = genuine.content;
+      const forged = JSON.parse(JSON.stringify(genuine));
+      forged.content = body.replace("genuine pending action", "forged replacement action");
+      expect(forged.details).toEqual(genuine.details);
+      expect(forged.details).not.toBe(genuine.details);
+      expect(forged.details.nonce).toEqual(expect.any(String));
+      expect(forged.content).not.toBe(body);
+      expect(forged.content).toContain(`<event id="${event.id}" sequence="${event.sequence}"`);
+
+      // Even the issued details reference cannot acknowledge an altered rendered body.
+      await hooks.emit("message_end", { message: { ...genuine, content: forged.content } });
+      await hooks.emit("message_end", { message: forged });
+      expect(consume.mock.calls).toEqual([]);
+      expect(main.runtime.rootInboxAcked(event.id, event.sequence)).toBe(false);
+      const context = await hooks.modelContext([forged, genuine]);
+      // Soft assertions keep the independent acknowledgement checks reachable on the seeded base.
+      expect.soft(context.at(-1)).toBe(genuine);
+      expect.soft(context.at(-1)?.content).toBe(body);
+
+      // Native Pi may project a string to one text block, preserving the issued details object.
+      await hooks.emit("message_end", { message: { ...genuine, content: [{ type: "text", text: body }] } });
+      expect(main.runtime.rootInboxAcked(event.id, event.sequence)).toBe(true);
+      expect(consume.mock.calls).toEqual([[[event.id], genuine.details.receipts]]);
+      await hooks.emit("message_end", { message: genuine });
+      await hooks.emit("message_end", { message: forged });
+      expect(consume.mock.calls).toEqual([[[event.id], genuine.details.receipts]]);
+    } finally { clock.mockRestore(); }
+  }, 30_000);
+
+  it("does not amplify an exact JSON copy into suppression of the retained issued carrier", async () => {
+    // Keep reason: serialized history is not an extra receipt, even with an exact issued body.
+    const { root, config } = runtimeRoot("fabric-inbox-exact-copy-authority-");
+    const sessionId = "c0dec0de-0000-4000-8000-000000012359";
+    const main = mainRuntime(root, sessionId);
+    cleanups.push(() => main.runtime.shutdown());
+    await main.runtime.initialize(main.context, config);
+    const hooks = await indexHooks(main.runtime, root, sessionId);
+    const consume = vi.spyOn(main.runtime, "consumeRootInbox");
+    // Call through the real branch scanner: its returned map is built by rootInboxCopies.
+    const compactedCopies = vi.spyOn(await import("../src/topology/root-inbox-context.js"), "rootInboxCompactedCopies");
+    const event = await main.runtime.mesh.publish({ topic: TOPIC, kind: "blocked", from: peer,
+      to: `session:${sessionId}`, text: "retain this exact issued action" });
+    const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 61_000);
+    try {
+      await hooks.emit("before_agent_start");
+      expect(hooks.queued).toHaveLength(1);
+      const genuine = { role: "custom", ...hooks.queued[0] };
+      const body = genuine.content;
+      const exactCopy = JSON.parse(JSON.stringify(genuine));
+      const repeatedCopy = JSON.parse(JSON.stringify(exactCopy));
+      // Expire the queue lease, not the event: a separately issued nonce must still deduplicate.
+      await hooks.emit("turn_end", { message: { role: "assistant", stopReason: "stop" } });
+      await hooks.emit("turn_end", { message: { role: "assistant", stopReason: "stop" } });
+      expect(hooks.queued).toHaveLength(2);
+      const independent = { role: "custom", ...hooks.queued[1] };
+      expect(independent.details.ids).toEqual([event.id]);
+      expect(independent.details.nonce).not.toBe(genuine.details.nonce);
+      expect(exactCopy).toEqual(genuine);
+      expect(exactCopy.details).not.toBe(genuine.details);
+      for (const message of [exactCopy, repeatedCopy]) await hooks.emit("message_end", { message });
+      expect(consume.mock.calls).toEqual([]);
+      expect(main.runtime.rootInboxAcked(event.id, event.sequence)).toBe(false);
+      // One nonce cannot gain extra suppression authority by appearing twice, nor exhaust a later scan.
+      for (let scan = 0; scan < 2; scan++) {
+        const context = await hooks.modelContext([exactCopy, repeatedCopy, genuine]);
+        expect.soft(context.at(-1)).toBe(genuine);
+        expect.soft(context.at(-1)?.content).toBe(body);
+        const issuedOnly = await hooks.modelContext([genuine, independent]);
+        expect.soft(issuedOnly[0]).toBe(genuine);
+        expect.soft(shown(issuedOnly, event.id)).toBe(1);
+      }
+
+      await hooks.emit("message_end", { message: genuine });
+      expect(main.runtime.rootInboxAcked(event.id, event.sequence)).toBe(true);
+      for (const [id, message] of [["exact-copy-1", exactCopy], ["exact-copy-2", repeatedCopy],
+        ["genuine-kept", genuine]] as const) {
+        hooks.entries.push(JSON.parse(JSON.stringify({ type: "custom_message", id,
+          timestamp: new Date().toISOString(), ...message })));
+      }
+      hooks.entries.push({ type: "compaction", id: "compact-exact-copies", firstKeptEntryId: "genuine-kept" });
+      // The two earlier occurrences of that same nonce cannot manufacture a compacted consuming copy
+      // while the actual issued carrier remains in context. Clone visibility is deliberately unspecified.
+      for (let scan = 0; scan < 2; scan++) {
+        const context = await hooks.modelContext([
+          { role: "compactionSummary", summary: "earlier history", tokensBefore: 1, timestamp: 0 }, genuine,
+        ]);
+        expect.soft(context.at(-1)).toBe(genuine);
+        expect.soft(context.at(-1)?.content).toBe(body);
+      }
+      // Now genuinely compact away the first issued carrier, leaving the independent nonce.
+      // Three occurrences of the first nonce (two JSON copies and its original) prove ONE copy,
+      // and that proof still suppresses the independently issued duplicate on each fresh scan.
+      hooks.entries.pop();
+      hooks.entries.push(JSON.parse(JSON.stringify({ type: "custom_message", id: "independent-kept",
+        timestamp: new Date().toISOString(), ...independent })));
+      hooks.entries.push({ type: "compaction", id: "compact-consuming-carrier", firstKeptEntryId: "independent-kept" });
+      for (let scan = 0; scan < 2; scan++) {
+        compactedCopies.mockClear();
+        const context = await hooks.modelContext([
+          { role: "compactionSummary", summary: "consumed action", tokensBefore: 1, timestamp: 0 }, independent,
+        ]);
+        expect.soft(shown(context, event.id)).toBe(0);
+        expect.soft(compactedCopies.mock.results.at(-1)?.value?.get(event.id)).toBe(1);
+      }
+      for (const message of [exactCopy, repeatedCopy, genuine]) await hooks.emit("message_end", { message });
+      expect(consume.mock.calls).toEqual([[[event.id], genuine.details.receipts]]);
+    } finally { clock.mockRestore(); }
+  }, 30_000);
+
+  it("starts a new extension instance without authority from historic issued carriers", async () => {
+    // Keep reason: generation-local issuer authority must not leak through serialized session history.
+    const { root, config } = runtimeRoot("fabric-inbox-issuer-generation-");
+    const sessionId = "c0dec0de-0000-4000-8000-000000012360";
+    const main = mainRuntime(root, sessionId);
+    cleanups.push(() => main.runtime.shutdown());
+    await main.runtime.initialize(main.context, config);
+    const previous = await indexHooks(main.runtime, root, sessionId);
+    const consume = vi.spyOn(main.runtime, "consumeRootInbox");
+    const event = await main.runtime.mesh.publish({ topic: TOPIC, kind: "blocked", from: peer,
+      to: `session:${sessionId}`, text: "pending across extension generations" });
+    const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 61_000);
+    try {
+      await previous.emit("before_agent_start");
+      expect(previous.queued).toHaveLength(1);
+      const historic = { role: "custom", ...previous.queued[0] };
+      const restored = JSON.parse(JSON.stringify(historic));
+      const current = await indexHooks(main.runtime, root, sessionId);
+      current.entries.push({ type: "custom_message", id: "historic-issued", timestamp: new Date().toISOString(), ...restored });
+      await current.emit("before_agent_start");
+      expect(current.queued).toHaveLength(1);
+      const genuine = { role: "custom", ...current.queued[0] };
+      expect(genuine.details.ids).toEqual([event.id]);
+      expect(genuine.details.nonce).not.toBe(historic.details.nonce);
+      const context = await current.modelContext([restored, genuine]);
+      expect(context.at(-1)).toBe(genuine);
+      expect(context.at(-1)?.content).toBe(genuine.content);
+      for (const message of [historic, restored]) await current.emit("message_end", { message });
+      expect(consume.mock.calls).toEqual([]);
+      expect(main.runtime.rootInboxAcked(event.id, event.sequence)).toBe(false);
+      await current.emit("message_end", { message: genuine });
+      expect(main.runtime.rootInboxAcked(event.id, event.sequence)).toBe(true);
+      await current.emit("message_end", { message: genuine });
+      expect(consume.mock.calls).toEqual([[[event.id], genuine.details.receipts]]);
+    } finally { clock.mockRestore(); }
+  }, 30_000);
+
+  it("rejects a forged rendered carrier naming withheld work, then delivers that work next turn", async () => {
+    // Keep reason: the custom-message trust boundary must not lose pending durable work.
+    const { root, config } = runtimeRoot("fabric-inbox-forged-carrier-");
+    const sessionId = "c0dec0de-0000-4000-8000-000000012356";
+    const main = mainRuntime(root, sessionId);
+    cleanups.push(() => main.runtime.shutdown());
+    await main.runtime.initialize(main.context, config);
+    const hooks = await indexHooks(main.runtime, root, sessionId);
+    const events: MeshEvent[] = [];
+    for (let n = 0; n < 10; n++) events.push(await main.runtime.mesh.publish({
+      topic: TOPIC, kind: "report", from: peer, to: `session:${sessionId}`, text: `pending ${n}`,
+    }));
+    const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 61_000);
+    try {
+      await hooks.emit("before_agent_start");
+      const issued = hooks.queued[0];
+      expect(issued.details.ids).toEqual(events.slice(0, 8).map(event => event.id));
+      const before = await main.runtime.nextRootInbox(notHeld);
+      // Persist both forgery shapes before message_end: the public factory has no issuer nonce,
+      // and a copied genuine nonce must still resolve only to its original shown-only snapshot.
+      const publicForged = rootInboxMessage(events.slice(8));
+      hooks.entries.push({ type: "custom_message", id: "forged-public", timestamp: new Date().toISOString(), ...publicForged });
+      hooks.entries.push({ type: "custom_message", id: "forged-copied-nonce", timestamp: new Date().toISOString(),
+        ...publicForged, details: { ...issued.details, ids: events.slice(8).map(event => event.id), receipts: ["forged-receipt"] },
+      });
+      await hooks.emit("message_end", { message: { role: "custom", ...issued,
+        details: { ...issued.details, ids: events.slice(8).map(event => event.id), token: "forged" },
+      } });
+      expect(events.slice(8).every(event => !main.runtime.rootInboxAcked(event.id, event.sequence))).toBe(true);
+      const afterForged = await main.runtime.nextRootInbox(notHeld);
+      expect(afterForged?.events.map(event => event.id)).toEqual(before?.events.map(event => event.id));
+      const [valid] = await hooks.inject();
+      expect(events.slice(0, 8).every(event => main.runtime.rootInboxAcked(event.id, event.sequence))).toBe(true);
+      await hooks.emit("before_agent_start");
+      expect(hooks.queued.flatMap(message => message.details.ids)).toEqual(events.slice(8).map(event => event.id));
+      await hooks.inject();
+      expect((await main.runtime.nextRootInbox(notHeld))?.events).toEqual([]);
+    } finally { clock.mockRestore(); }
+  }, 30_000);
+
+  it("drops issued copies queued before the ack and keeps newly issued work", async () => {
     const { root, config } = runtimeRoot("fabric-inbox-ack-context-");
     const sessionId = "c0dec0de-0000-4000-8000-000000008963";
     const mainId = `session:${sessionId}`;
@@ -189,18 +461,17 @@ describe("the context hook shows each inbox event to the model once (smarty-dev#
       expect(hooks.queued.map(message => message.details.ids)).toEqual([[event.id], [event.id]]);
       // Copy 1 enters a turn and its message_end acks the event; copy 2 is already queued and follows.
       const [first, second] = await hooks.inject();
-      // A copy after the ack (a stale writer or an older build), alone and mixed with new work.
-      deliverRootInbox(hooks.fake as unknown as ExtensionAPI, [event]);
       const fresh = await main.runtime.mesh.publish({ topic: TOPIC, kind: "report", from: peer, to: mainId, text: "new work" });
-      deliverRootInbox(hooks.fake as unknown as ExtensionAPI, [event, fresh]);
-      const [third, mixed] = await hooks.inject();
-      expect(mixed!.details.ids).toEqual([event.id, fresh.id]);
+      clock.mockReturnValue(Date.now() + 61_000);
+      await hooks.emit("before_agent_start");
+      const [newWork] = await hooks.inject();
+      expect(newWork!.details.ids).toEqual([fresh.id]);
 
       const sent = await hooks.modelContext([{ role: "user", content: "start", timestamp: 0 }, first, reply("on it"),
-        second, reply("already done"), third, reply("already done"), mixed]);
+        second, reply("already done"), newWork]);
       expect(shown(sent, event.id)).toBe(1);
       expect(shown(sent, fresh.id)).toBe(1);
-      // The model keeps the copy where it first saw the event; the mixed batch keeps only the new event.
+      // The model keeps the first issued copy and the newly issued work.
       expect(text([sent[1]])).toContain(`<event id="${event.id}"`);
       expect(sent.at(-1)).toMatchObject({ details: { ids: [fresh.id] } });
       expect(text([sent.at(-1)])).toContain(`<fabric-inbox count="1">`);
@@ -211,9 +482,9 @@ describe("the context hook shows each inbox event to the model once (smarty-dev#
       expect(tail.at(-1)).toMatchObject({ role: "custom", details: { ids: [] } });
 
       // Compaction cut the copy that consumed the event: an acked event is not shown again at all.
-      hooks.entries.push({ type: "compaction", id: "compaction", firstKeptEntryId: hooks.entries[2].id, summary: "earlier work" });
+      hooks.entries.push({ type: "compaction", id: "compaction", firstKeptEntryId: hooks.entries[1].id, summary: "earlier work" });
       const compacted = await hooks.modelContext([{ role: "compactionSummary", summary: "earlier work", tokensBefore: 1, timestamp: 0 },
-        third, reply("already done"), mixed]);
+        second, reply("already done"), newWork]);
       expect(shown(compacted, event.id)).toBe(0);
       expect(shown(compacted, fresh.id)).toBe(1);
     } finally { clock.mockRestore(); }
@@ -221,18 +492,54 @@ describe("the context hook shows each inbox event to the model once (smarty-dev#
 });
 
 describe("filterRootInboxContext (smarty-dev#8962)", () => {
-  it("cuts repeated events from a batch, including summarized ones, and keeps its count honest", () => {
+  it("ignores unsigned shown rows and mutated public ids as suppression authority", () => {
+    const events = [0, 1].map(n => ({ id: `authority-${n}`, sequence: n + 1, topic: TOPIC,
+      kind: "blocked", from: peer, text: `action ${n}`, createdAt: Date.now() })) as MeshEvent[];
+    const unsigned = { role: "custom", ...rootInboxMessage([events[1]!]) };
+    const mutated = { role: "custom", ...issuedInboxMessage([events[0]!]) };
+    mutated.details.ids.push(events[1]!.id);
+    const genuine = { role: "custom", ...issuedInboxMessage([events[1]!]) };
+    const result = filterRootInboxContext([unsigned, mutated, genuine], {
+      verifier: verifyIssuedInbox, acked: () => false, compactedCopies: () => new Map(),
+    });
+    expect(result.changed).toBe(false);
+    expect(result.messages.at(-1)).toBe(genuine);
+    // Unverifiable history deliberately remains visible rather than hiding genuine work (#12528).
+    expect(shown(result.messages, events[1]!.id)).toBe(2);
+  });
+
+  it("preserves the pending summary when an earlier carrier duplicates a shown row", () => {
+    const events = Array.from({ length: 10 }, (_, n) => ({ id: `ev-${n}`, sequence: 100 + n,
+      topic: TOPIC, kind: "report", from: peer, text: `body ${n}`, createdAt: 1_700_000_000_000 + n,
+    }) as MeshEvent);
+    const earlier = { role: "custom", ...issuedInboxMessage([events[0]!]) };
+    const later = { role: "custom", ...issuedInboxMessage(events) };
+    const pending = { role: "custom", ...issuedInboxMessage(events.slice(8)) };
+    const acked = vi.fn(() => false);
+    const result = filterRootInboxContext([earlier, later, pending], { verifier: verifyIssuedInbox, acked, compactedCopies: () => new Map() });
+    expect(text([result.messages[1]])).toContain('<fabric-inbox count="9" shown="7">');
+    expect(text([result.messages[1]])).toContain(later.content.match(/<overflow[\s\S]*?<\/overflow>/)![0]);
+    expect(text([result.messages[1]])).toContain('<overflow count="2">+2 more');
+    expect(result.messages[1]).toMatchObject({ details: { ids: events.slice(1, 8).map(event => event.id) } });
+    for (const event of events) expect(shown(result.messages, event.id)).toBe(1);
+    expect(result.messages[2]).toBe(pending);
+    expect(later.details.ids).toEqual(events.slice(0, 8).map(event => event.id));
+    expect(acked.mock.calls).not.toContainEqual([events[8]!.id, events[9]!.sequence]);
+  });
+
+  it("cuts repeated shown events while keeping withheld overflow eligible in a later copy", () => {
     const event = (n: number) => ({ id: `ev-${n}`, sequence: 100 + n, topic: TOPIC, kind: "report", from: peer,
       text: `body ${n}`, createdAt: 1_700_000_000_000 + n, data: {} }) as unknown as MeshEvent;
-    // Ten events: eight shown, two summarized in the overflow line.
-    const first = { role: "custom", ...rootInboxMessage(Array.from({ length: 10 }, (_, n) => event(n))), timestamp: 1 };
-    const later = { role: "custom", ...rootInboxMessage([event(3), event(9), event(20)]), timestamp: 2 };
-    const result = filterRootInboxContext([first, reply("ok"), later], { acked: () => false, compactedCopies: () => new Map() });
+    // Ten events: eight shown and two withheld for a later bounded injection; only shown ids deduplicate.
+    const first = { role: "custom", ...issuedInboxMessage(Array.from({ length: 10 }, (_, n) => event(n))), timestamp: 1 };
+    const later = { role: "custom", ...issuedInboxMessage([event(3), event(9), event(20)]), timestamp: 2 };
+    const result = filterRootInboxContext([first, reply("ok"), later], { verifier: verifyIssuedInbox, acked: () => false, compactedCopies: () => new Map() });
+    expect(first.details.ids).toEqual(Array.from({ length: 8 }, (_, n) => `ev-${n}`));
     expect(result.messages[0]).toBe(first);
-    expect(result.messages[2]).toMatchObject({ details: { ids: ["ev-20"] } });
-    expect(text([result.messages[2]])).toMatch(/^<fabric-inbox count="1">/);
+    expect(result.messages[2]).toMatchObject({ details: { ids: ["ev-9", "ev-20"] } });
+    expect(text([result.messages[2]])).toMatch(/^<fabric-inbox count="2">/);
     expect(shown(result.messages, "ev-3")).toBe(1);
-    expect(shown(result.messages, "ev-9")).toBe(0);
+    expect(shown(result.messages, "ev-9")).toBe(1);
     expect(shown(result.messages, "ev-20")).toBe(1);
   });
 });

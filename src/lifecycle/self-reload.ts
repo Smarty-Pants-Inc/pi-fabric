@@ -4,6 +4,7 @@ import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@e
 import { activeFabricRoot, loadedFabricRoot, releaseLabel, resolveAgentDir, SELF_RELOAD_COMMAND } from "../core/agent-dir.js";
 import type { ResourceBinding } from "./reload-target-profile.js";
 import { extensionContextLive } from "../session-liveness.js";
+import { notifyDiagnostic } from "../core/diagnostics.js";
 // Preserve the self-reload module's public selector API for callers and tests.
 export { activeFabricRoot, loadedFabricRoot, releaseLabel, SELF_RELOAD_COMMAND } from "../core/agent-dir.js";
 
@@ -372,7 +373,7 @@ export const installSelfReload = (pi: ExtensionAPI, deps: SelfReloadDeps) => {
     const heldForMs = now - held.since;
     if (held.reported || heldForMs < (deps.heldNoticeMs ?? RELOAD_HELD_NOTICE_MS)) return;
     held.reported = true;
-    if (context.hasUI) context.ui.notify(`Fabric reload to ${releaseLabel(target)} held ${Math.round(heldForMs / 60_000)} min: ${reason} (stop them or /reload)`, "warning");
+    if (context.hasUI) notifyDiagnostic(context, "src/lifecycle/self-reload.ts", `Fabric reload to ${releaseLabel(target)} held ${Math.round(heldForMs / 60_000)} min: ${reason} (stop them or /reload)`, "warning");
     deps.publishHeld?.({ reason, heldForMs, target });
   };
   const hostIdle = (context: ExtensionContext): boolean =>
@@ -429,7 +430,7 @@ export const installSelfReload = (pi: ExtensionAPI, deps: SelfReloadDeps) => {
     const target = watch?.check();
     if (!target || !autoReloadOptedOut(deps.autoReloadConfigured()) || noticed === target) return;
     noticed = target;
-    if (context.hasUI) context.ui.notify(`Newer Fabric active: ${releaseLabel(target)} (auto-reload off; /reload loads it)`, "info");
+    if (context.hasUI) notifyDiagnostic(context, "src/lifecycle/self-reload.ts", `Newer Fabric active: ${releaseLabel(target)} (auto-reload off; /reload loads it)`, "info");
   });
   pi.on("agent_settled", (event, context) => {
     stopRetry();

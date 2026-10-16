@@ -109,6 +109,38 @@ describe("shared NATS cluster readiness gate", () => {
     expect(attempt).toBeGreaterThanOrEqual(3);
   });
 
+  // Durability-only projection of PR #1090 hosted job 116595838543,
+  // 2026-10-15T18:26:35.782Z, log line 337: /varz.jetstream omits config,
+  // while the same node's /jsz.config has sync_always: true. These are not
+  // full captured bodies; identity, routes, and metadata use baseCluster.
+  it.each([
+    ["missing varz config, jsz true", undefined, true, true],
+    ["explicit varz false, jsz true", false, true, false],
+    ["missing from both", undefined, undefined, false],
+    ["null varz value, jsz true", null, true, true],
+    ["explicit varz true, jsz false", true, false, true],
+  ] as const)("handles durability config: %s", async (_label, varzSync, jszSync, ready) => {
+    const fixtures = baseCluster();
+    const baselineFetch = fetchFor(fixtures);
+    const fetch = recordedFetch(fixtures, async (node, path) => {
+      const original = await baselineFetch(`http://${node.name}.test${path}`);
+      if (node.name !== "n2" || !["/varz", "/jsz?raft=true"].includes(path)) return original;
+      const body = await original.json();
+      if (path === "/varz") {
+        body.jetstream = varzSync === undefined ? {} : { config: { sync_always: varzSync } };
+      } else if (jszSync !== undefined) {
+        body.config = { sync_always: jszSync };
+      }
+      return response(body);
+    });
+    if (ready) {
+      const result = await observe(nodes, { fetch, timeoutMs: 40 });
+      expect(result.nodes.find(node => node.name === "n2")?.syncAlways).toBe(true);
+    } else {
+      expect(await failure(fixtures, 40, fetch)).toContain("sync_always is not true");
+    }
+  });
+
   it("rejects health without JS while retaining the full health probe", async () => {
     const fixtures = baseCluster();
     const calls: string[] = [];

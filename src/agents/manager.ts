@@ -706,6 +706,8 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   /** Process teardown is an ownership obligation, even after logical settlement. */
   processStop?: Promise<void>;
   processStopPending?: boolean;
+  /** Primary loss captured before the first stop, never populated by stop's own teardown. */
+  workerGoneBeforeStop?: AgentTransportHandle;
   /** Windows settlement retains native admission until captured close and any stop join. */
   nativeReleasePending?: Promise<void>;
   /** Native-close settlement owns RUN release until joined or host-reconciled. */
@@ -4331,6 +4333,7 @@ export class AgentManager {
     const managed = this.#requireRun(id);
     // Preserve a loss proven before stop; an intentional stop is not itself loss proof.
     const goneBeforeStop = this.#actorWorkerGone(managed);
+    if (goneBeforeStop && !managed.stopRequested) managed.workerGoneBeforeStop = managed.transport;
     // A requested stop is terminal: record the intent before any transport work
     // so recovery never restarts a run the operator, a tool, or shutdown ended.
     managed.stopRequested = true;
@@ -5688,6 +5691,7 @@ export class AgentManager {
       // Install the replacement and invalidate old proof without yielding.
       managed.transport = transport;
       delete managed.workerGone;
+      delete managed.workerGoneBeforeStop;
       const owned = transport.kind === "process" ? ownedProcess(transport.sessionId) : undefined;
       if (owned) managed.ownProcess = owned;
       managed.executionExited = false;
@@ -5959,7 +5963,10 @@ export class AgentManager {
 
   /** A leader's death forbids replay, but never substitutes for the whole native/tree join. */
   async #settleGoneActorWorker(managed: ManagedAgent, record: AgentRunRecord | undefined): Promise<boolean> {
-    if ((managed.stopRequested && managed.workerGone !== managed.transport) || !this.#actorWorkerGone(managed)) return false;
+    // An explicit stop or bounded deadline owns the terminal outcome. The monitor
+    // may observe the primary disappear while the stop helper is joining the
+    // captured tree; that is stop custody, not an actor-loss result.
+    if ((managed.stopRequested && managed.workerGoneBeforeStop !== managed.transport) || !this.#actorWorkerGone(managed)) return false;
     // Preserve genuine terminal results; only missing/recoverable transport outcomes become loss.
     // Like #retryStartup, a window refusal outranks incidental auth/transport diagnostics.
     if (this.#fenceNativeTerminalAdmission(managed, record)) return false;

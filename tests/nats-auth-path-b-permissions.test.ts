@@ -79,16 +79,30 @@ describe("Path B NATS grants", () => {
       "$JS.API.CONSUMER.CREATE.FABRIC_ADV",
       "$JS.API.CONSUMER.CREATE.FABRIC_ADV.transport_dlq_operator",
       "$JS.API.CONSUMER.CREATE.FABRIC_ADV.transport_dlq_operator.>",
+      "$JS.API.CONSUMER.CREATE.FABRIC_ADV.>",
       "$JS.API.CONSUMER.DURABLE.CREATE.FABRIC_ADV.>",
       "$JS.API.CONSUMER.DELETE.FABRIC_ADV.transport_dlq_operator",
+      "$JS.API.CONSUMER.DELETE.FABRIC_ADV.>",
+      "$JS.API.CONSUMER.PAUSE.FABRIC_ADV.>",
+      "$JS.API.CONSUMER.UNPIN.FABRIC_ADV.>",
+      "$JS.API.CONSUMER.RESET.FABRIC_ADV.>",
+      "$JS.API.CONSUMER.LEADER.STEPDOWN.FABRIC_ADV.>",
+      "$JS.API.STREAM.CREATE.FABRIC_ADV",
       "$JS.API.STREAM.UPDATE.FABRIC_ADV",
       "$JS.API.STREAM.DELETE.FABRIC_ADV",
       "$JS.API.STREAM.PURGE.FABRIC_ADV",
+      "$JS.API.STREAM.MSG.DELETE.FABRIC_ADV",
+      "$JS.API.STREAM.SNAPSHOT.FABRIC_ADV",
+      "$JS.API.STREAM.RESTORE.FABRIC_ADV",
+      "$JS.API.STREAM.LEADER.STEPDOWN.FABRIC_ADV",
+      "$JS.API.STREAM.PEER.REMOVE.FABRIC_ADV",
+      "$JS.API.ACCOUNT.STREAM.MOVE.*.FABRIC_ADV",
+      "$JS.API.ACCOUNT.STREAM.CANCEL_MOVE.*.FABRIC_ADV",
     ];
     for (const role of ["principal", "agent", "maintainer", "operator"] as const) {
       const template = roleTemplateWithPathB(role, streams, ["ryzen2"]);
       for (const subject of reserved) expect(template.pub.deny, `${role}: ${subject}`).toContain(subject);
-      for (const subject of [...reserved, "$JS.API.CONSUMER.CREATE.FABRIC_ADV.transport_dlq_operator.filter", "$JS.API.CONSUMER.DURABLE.CREATE.FABRIC_ADV.transport_dlq_operator"]) {
+      for (const subject of [...reserved.map((pattern) => pattern.replace(".>", ".reader").replace(".*.", ".fixture-account.")), "$JS.API.CONSUMER.CREATE.FABRIC_ADV.transport_dlq_operator.filter", "$JS.API.CONSUMER.DURABLE.CREATE.FABRIC_ADV.transport_dlq_operator"]) {
         expect(mayPublish(template, subject), `${role}: ${subject}`).toBe(false);
       }
     }
@@ -96,12 +110,33 @@ describe("Path B NATS grants", () => {
       const base = roleTemplate(role, streams);
       const opted = roleTemplateWithPathB(role, streams);
       expect(opted.pub.allow).toEqual(base.pub.allow);
-      expect(opted.pub.deny).toEqual([...base.pub.deny, ...reserved.slice(0, 3), "$JS.API.CONSUMER.CREATE.FABRIC_ADV.>", ...reserved.slice(3)]);
+      expect(opted.pub.deny).toEqual([...base.pub.deny, ...reserved, "$JS.API.CONSUMER.MSG.NEXT.FABRIC_ADV.>"]);
+      for (const pattern of reserved) {
+        expect(pattern.split("."), "reservation uses a whole literal stream token").toContain("FABRIC_ADV");
+        for (const stream of ["OTHER", "FABRIC_ADV_OTHER"]) {
+          const subject = pattern.replace("FABRIC_ADV", stream).replace(".>", ".reader").replace(".*.", ".fixture-account.");
+          expect(opted.pub.deny.some((deny) => matches(deny, subject)), `${role}: unrelated ${subject}`).toBe(false);
+        }
+      }
       expect(opted.sub).toEqual(base.sub);
       expect(mayPublish(opted, "$JS.API.CONSUMER.CREATE.OTHER.reader")).toBe(true);
       expect(mayPublish(opted, "$JS.API.CONSUMER.DELETE.OTHER.reader")).toBe(true);
     }
     expect(roleTemplateWithPathB("break-glass", streams)).toEqual(roleTemplate("break-glass", streams));
+  });
+
+  it("reserves state-advancing advisory pulls to the operator's exact durable", () => {
+    const streams = { custodyStream: "TEST_CUSTODY", livenessStream: "TEST_LIVENESS" };
+    for (const role of ["agent", "principal", "maintainer"] as const) {
+      const template = roleTemplateWithPathB(role, streams, ["ryzen2"]);
+      expect(template.pub.deny).toContain("$JS.API.CONSUMER.MSG.NEXT.FABRIC_ADV.>");
+      expect(mayPublish(template, `$JS.API.CONSUMER.MSG.NEXT.FABRIC_ADV.${PATH_B_ADVISORY_DURABLE}`)).toBe(false);
+      expect(mayPublish(template, "$JS.API.CONSUMER.MSG.NEXT.FABRIC_ADV.other")).toBe(false);
+    }
+    const operator = roleTemplateWithPathB("operator", streams, ["ryzen2"]);
+    expect(operator.pub.deny).not.toContain("$JS.API.CONSUMER.MSG.NEXT.FABRIC_ADV.>");
+    expect(mayPublish(operator, `$JS.API.CONSUMER.MSG.NEXT.FABRIC_ADV.${PATH_B_ADVISORY_DURABLE}`)).toBe(true);
+    expect(mayPublish(operator, "$JS.API.CONSUMER.MSG.NEXT.FABRIC_ADV.other")).toBe(false);
   });
 
   it("rejects unsafe machine literals and keeps template values fresh", () => {

@@ -110,7 +110,7 @@ const log = (message: string): void => void process.stderr.write(`mesh-bridge: $
 
 const runAgent = async (flags: Map<string, string>): Promise<void> => {
   const peer = required(flags, "peer");
-  const side = new StoreBridgeSide(openBridgeStore(required(flags, "mesh"), flags), peer);
+  const side = new StoreBridgeSide(openBridgeStore(required(flags, "mesh"), flags), peer, Date.now, true);
   const logLevel = flags.get("log-level") ?? "info";
   if (logLevel !== "info" && logLevel !== "debug") throw new Error("--log-level must be info or debug");
   await side.store.prepareLock();
@@ -154,7 +154,7 @@ export const runBridge = async (
   if (!(Number.isSafeInteger(factoryRate.burst) && factoryRate.burst > 0)) throw new Error("--factory-burst must be a positive integer");
   if (!(Number.isSafeInteger(factoryRate.bytesPerMinute) && factoryRate.bytesPerMinute > 0)) throw new Error("--factory-bytes must be a positive integer of bytes a minute");
   if (!(Number.isSafeInteger(factoryRate.byteBurst) && factoryRate.byteBurst > 0)) throw new Error("--factory-byte-burst must be a positive integer");
-  const local = new StoreBridgeSide(openBridgeStore(required(flags, "mesh"), flags), remoteName);
+  const local = new StoreBridgeSide(openBridgeStore(required(flags, "mesh"), flags), remoteName, Date.now, true);
   const argv = transportCommand(flags, command);
   if (signal.aborted) return 0;
   // Prepare before starting the link, not inside a short registry/mesh try. Readiness is

@@ -3,6 +3,7 @@ import { Buffer } from "node:buffer";
 import { credsAuthenticator, type NatsConnection } from "@nats-io/nats-core";
 import { jetstream, jetstreamManager, type JetStreamClient, type JetStreamManager } from "@nats-io/jetstream";
 import { connect, type Status } from "@nats-io/transport-node";
+import { PATH_B_ADVISORY_DURABLE } from "../../mesh/nats-auth/permissions.js";
 
 export type NatsStatusListener = (status: Status) => void;
 export type SubscribeNatsStatus = (listener: NatsStatusListener) => () => void;
@@ -52,14 +53,20 @@ export const readNatsCredentials = (file: string): { readonly bytes: Uint8Array;
   return { bytes, subject, tags };
 };
 
-const isOperatorInboxGrant = (subject: string, machine: string): boolean => {
-  const tokens = subject.split(".");
-  return OPERATOR_MACHINE.test(machine) && tokens.length === 7 && tokens[0] === "fabric" && tokens[1] === "in" &&
-    /^[a-z0-9][a-z0-9-]{0,31}$/.test(tokens[2]!) && !OPERATOR_MACHINE.test(tokens[2]!) &&
-    tokens[3] === "*" && tokens[4] === "ack" && tokens[5] === "*" && tokens[6] === machine;
+const OPERATOR_API_GRANTS = new Set([
+  "$JS.API.INFO", "$SYS.REQ.USER.INFO", "$JS.API.STREAM.INFO.FABRIC_ADV",
+  `$JS.API.CONSUMER.INFO.FABRIC_ADV.${PATH_B_ADVISORY_DURABLE}`,
+  `$JS.API.CONSUMER.MSG.NEXT.FABRIC_ADV.${PATH_B_ADVISORY_DURABLE}`,
+]);
+
+const isOperatorMetadataGrant = (subject: string): boolean => {
+  if (OPERATOR_API_GRANTS.has(subject)) return true;
+  const match = subject.match(/^\$JS\.API\.(STREAM\.INFO|CONSUMER\.INFO)\.FABRIC_IN_([a-z0-9][a-z0-9-]{0,31})(\.>)?$/);
+  return !!match && !OPERATOR_MACHINE.test(match[2]!) &&
+    (match[1] === "CONSUMER.INFO" ? match[3] === ".>" : match[3] === undefined);
 };
 
-const hasForeignSourceGrant = (subject: string, machine: string, operator: boolean): boolean => {
+const hasForeignSourceGrant = (subject: string, machine: string): boolean => {
   const tokens = subject.split(".");
   const tail = tokens.at(-1) === ">";
   if ((!tail && tokens.length !== 7) || (tail && tokens.length > 7)) return false;
@@ -67,7 +74,7 @@ const hasForeignSourceGrant = (subject: string, machine: string, operator: boole
   const family = ["fabric", "in"];
   if (family.some((token, index) => fixed[index] !== undefined && fixed[index] !== "*" && fixed[index] !== token)) return false;
   if (fixed[4] !== undefined && fixed[4] !== "*" && fixed[4] !== "cmd" && fixed[4] !== "ack") return false;
-  return tail || fixed[6] !== machine || (operator && !isOperatorInboxGrant(subject, machine));
+  return tail || fixed[6] !== machine;
 };
 
 const verifyMachineIdentity = async (nc: NatsConnection, machine: string, timeoutMs: number, auth: ReturnType<typeof readNatsCredentials> | undefined): Promise<unknown> => {
@@ -76,16 +83,22 @@ const verifyMachineIdentity = async (nc: NatsConnection, machine: string, timeou
   try { value = JSON.parse(new TextDecoder().decode(response.data)); } catch { throw new Error("NATS USER.INFO response is invalid"); }
   // USER.INFO 2.11.17 returns the authenticated user and expanded permissions, not JWT tags.
   // Tie the locally decoded tag to the server-authenticated subject, then require its exact
-  // expanded own-source grant. A decoded JWT alone is never an identity proof.
-  const data = value && typeof value === "object" ? (value as { data?: { user?: unknown; permissions?: { publish?: { allow?: unknown } } } }).data : undefined;
+  // expanded own-source grant. E19's reserved operator has no source publication at all:
+  // require the fixed metadata-only API set and explicit all-ACK denial instead.
+  // A decoded JWT alone is never an identity proof.
+  const data = value && typeof value === "object" ? (value as { data?: { user?: unknown; permissions?: { publish?: { allow?: unknown; deny?: unknown } } } }).data : undefined;
   const allow = data?.permissions?.publish?.allow;
+  const deny = data?.permissions?.publish?.deny;
   const operator = auth?.tags.includes("role:maintainer") ?? false;
   const ownSourceGrant = `fabric.in.*.*.*.*.${machine}`;
   if (!auth || auth.tags.filter((tag) => tag.startsWith("machine:")).length !== 1 || !auth.tags.includes(`machine:${machine}`) || data?.user !== auth.subject ||
     !Array.isArray(allow) || !(operator
-      ? allow.some((subject) => typeof subject === "string" && isOperatorInboxGrant(subject, machine))
-      : allow.includes(ownSourceGrant)) ||
-    allow.some((subject) => typeof subject !== "string" || hasForeignSourceGrant(subject, machine, operator))) throw new Error("NATS USER.INFO machine tag mismatch");
+      ? OPERATOR_MACHINE.test(machine) && [...OPERATOR_API_GRANTS].every((subject) => allow.includes(subject)) &&
+        Array.isArray(deny) && deny.includes("$JS.ACK.>") &&
+        allow.every((subject) => typeof subject === "string" && isOperatorMetadataGrant(subject))
+      : allow.includes(ownSourceGrant) && allow.every((subject) => typeof subject === "string" && !hasForeignSourceGrant(subject, machine)))) {
+    throw new Error("NATS USER.INFO machine tag mismatch");
+  }
   return value;
 };
 

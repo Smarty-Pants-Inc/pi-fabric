@@ -1516,7 +1516,7 @@ export class FabricControlPlane {
     if (!this.#paused) this.#releaseEpoch++;
     this.#paused = true;
     if (this.#transport.kind === "nats") {
-      this.#stopNatsInbox();
+      this.#stopNatsInbox(undefined, typeof _strict === "boolean" ? undefined : _strict);
       clearTimeout(this.#natsCleanupTimer);
       this.#natsCleanupTimer = undefined;
       clearTimeout(this.#natsOutcomeRetryTimer);
@@ -2225,9 +2225,9 @@ export class FabricControlPlane {
     }).catch(() => undefined);
   }
 
-  #stopNatsInbox(session = this.#natsSession): void {
+  #stopNatsInbox(session = this.#natsSession, reason?: unknown): void {
     if (!session) return;
-    session.abort();
+    session.abort(reason);
     for (const [key, flight] of this.#natsFlights) {
       if (flight.context.session !== session || flight.started) continue;
       clearTimeout(flight.expiryTimer);

@@ -103,6 +103,27 @@ describe("MeshProvider membership", () => {
     await expect(
       provider.invoke("put", { key: "residency/deliveries/forged", value: {} }, context),
     ).rejects.toThrow("reserved for host coordination");
+    const decisionId = "00000000-0000-4000-8000-000000000001";
+    const admissionKey = `decisions/spawn-router/admissions/${decisionId}`;
+    const forgedKey = "decisions/spawn-router/admissions/00000000-0000-4000-8000-000000000002";
+    const issued = { format: 1, decisionId, binding: "native-binding", state: "issued",
+      issuedAt: Date.now(), expiresAt: Date.now() + 600_000 };
+    await expect(provider.invoke("put", { key: forgedKey, value: issued }, context))
+      .rejects.toThrow("reserved for host coordination");
+    expect(provider.store.get(forgedKey, { fresh: true })).toBeUndefined();
+    // Native state exists: neither a matching CAS version nor forged request
+    // fields may let public mesh calls reset or remove a consumed admission.
+    const consumed = await provider.store.put({ key: admissionKey, value: { ...issued, state: "consumed" }, identity });
+    await expect(provider.invoke("put", { key: admissionKey, value: issued, ifVersion: consumed.version }, context))
+      .rejects.toThrow("reserved for host coordination");
+    await expect(provider.invoke("delete", { key: admissionKey, ifVersion: consumed.version }, context))
+      .rejects.toThrow("reserved for host coordination");
+    expect(provider.store.get(admissionKey, { fresh: true })).toEqual(consumed);
+    // Reservation must not disable ordinary user-owned state.
+    await expect(provider.invoke("put", { key: "user/router-probe", value: { ready: true } }, context))
+      .resolves.toMatchObject({ value: { ready: true } });
+    await expect(provider.invoke("delete", { key: "user/router-probe" }, context))
+      .resolves.toMatchObject({ deleted: true });
     await expect(
       provider.invoke("get", { key: "residency/deliveries/private" }, context),
     ).rejects.toThrow("private host state");

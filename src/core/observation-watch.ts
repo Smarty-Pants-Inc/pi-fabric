@@ -1,4 +1,6 @@
 /** Shared carrier after bounded filesystem watcher recovery is exhausted. */
+import { diagnostics } from "./diagnostics.js";
+
 export class DegradedObservation {
   #timer: NodeJS.Timeout | undefined;
   #degraded = false;
@@ -48,7 +50,7 @@ export class DegradedObservation {
   }
 
   #warn(message: string): void {
-    try { console.warn(`[pi-fabric] ${message}`); } catch {}
+    try { diagnostics.warn("src/core/observation-watch.ts", `[pi-fabric] ${message}`); } catch {}
   }
 
   close(): void {

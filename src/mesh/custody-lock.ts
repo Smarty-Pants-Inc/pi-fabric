@@ -1,4 +1,5 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { diagnostics } from "../core/diagnostics.js";
 import fs from "node:fs";
 import path from "node:path";
 import { FOREIGN_LOCK, pinFenceLock, releaseFenceLock } from "./fence-lock.js";
@@ -126,7 +127,7 @@ export const acquireMeshCustodyLock = async (root: string, timeoutMs = CUSTODY_L
       if (await clearDeadCustodyLock(lock, readOwner, deadline, started, options.hostQualified, blocked, options.lockProtocol ?? 1)) continue;
     } catch (error) {
       if (error instanceof MeshCustodyUnrecoverableError) {
-        try { console.warn(`[pi-fabric] ALARM ${error.kind}: ${error.message}`); } catch { /* alarm never masks refusal */ }
+        try { diagnostics.warn("src/mesh/custody-lock.ts", `[pi-fabric] ALARM ${error.kind}: ${error.message}`); } catch { /* alarm never masks refusal */ }
       }
       throw error;
     }

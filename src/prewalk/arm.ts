@@ -1,5 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { FabricState } from "../fabric-state.js";
+import { setPrewalkStatus } from "../core/diagnostics.js";
 import { assertFabricModelAllowed } from "../core/model-policy.js";
 import { resolveFabricIdentity, sendFabricMessage } from "../fabric-provenance.js";
 import {
@@ -54,7 +55,7 @@ export const armFabricPrewalkSession = async (
       { deliverAs: "nextTurn" },
     );
   }
-  context.ui.setStatus("fabric-prewalk", `armed (${prewalk.mode}) → ${input.model}`);
+  setPrewalkStatus(context, `armed (${prewalk.mode}) → ${input.model}`);
 };
 
 // alwaysRearm covers unarmed starts too: every Main session (and `/fabric reload`)

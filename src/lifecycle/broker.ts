@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { diagnostics } from "../core/diagnostics.js";
 import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
 import { rethrowMeshLockTimeout } from "../core/atomic-write.js";
 import { isWatchLimitError } from "../core/watch-fallback.js";
@@ -135,7 +136,7 @@ export class LifecycleBroker {
         ? "ENOSPC: inotify watch limit, not disk space (raise fs.inotify.max_user_watches)"
         : error instanceof Error ? error.message : String(error);
       try {
-        console.warn(`[pi-fabric] lifecycle broker: mesh notifications failed for ${this.mesh.root} (${cause}); ` +
+        diagnostics.warn("src/lifecycle/broker.ts", `[pi-fabric] lifecycle broker: mesh notifications failed for ${this.mesh.root} (${cause}); ` +
           `rescanned once, re-arming in ${delay} ms with bounded retries. Normal operation has no polling; ` +
           "exhausted watches scan and re-arm once per minute.");
       } catch {}

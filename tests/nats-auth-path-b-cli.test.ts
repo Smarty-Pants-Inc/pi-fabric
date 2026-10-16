@@ -31,6 +31,19 @@ const OPERATOR_DURABLE = "transport_dlq_operator";
 const OTHER_DURABLE = "not-the-operator";
 const MESH = "0".repeat(32);
 const STATE_STREAM = `FABRIC_MESH_${MESH}`;
+const RESERVED_MUTATIONS = [
+  "$JS.API.CONSUMER.CREATE.FABRIC_ADV",
+  `$JS.API.CONSUMER.CREATE.FABRIC_ADV.${OPERATOR_DURABLE}`,
+  `$JS.API.CONSUMER.CREATE.FABRIC_ADV.${OPERATOR_DURABLE}.$JS.EVENT.ADVISORY.cli-proof`,
+  `$JS.API.CONSUMER.DURABLE.CREATE.FABRIC_ADV.${OPERATOR_DURABLE}`,
+  `$JS.API.CONSUMER.DELETE.FABRIC_ADV.${OPERATOR_DURABLE}`,
+  "$JS.API.STREAM.UPDATE.FABRIC_ADV",
+  "$JS.API.STREAM.DELETE.FABRIC_ADV",
+  "$JS.API.STREAM.PURGE.FABRIC_ADV",
+] as const;
+const CAPTURE_CONTROL = "CLI_CAPTURE_CONTROL";
+let principalIdentity: Pick<PathBUser, "publicKey" | "credsPath">;
+let normalMaintainerIdentity: Pick<PathBUser, "publicKey" | "credsPath">;
 const source = (machine: string) => `fabric.in.${machine}.run.cmd.message.${machine}`;
 const streams = { custodyStream: "CLI_FIXTURE_CUSTODY", livenessStream: "CLI_FIXTURE_LIVENESS" };
 const secretShape = /(?:^|[^A-Z2-7])S[OAUNC][A-Z2-7]{56}(?![A-Z2-7])|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/;
@@ -40,7 +53,7 @@ function mint(root: string, kind: "operator" | "account" | "user", name: string,
   // Exactly the registered `pi-fabric nats` entry, not an invented mint wrapper or in-process minter.
   const result = spawnSync(cliRuntime, [cliEntry, "nats", "mint", kind, ...flags, "--out-dir", outDir], {
     input: JSON.stringify(input), encoding: "utf8", timeout: 30_000,
-    cwd: root, env: { PATH: process.env.PATH ?? "", HOME: root, TMPDIR: root, LANG: "C" },
+    cwd: root, env: { PATH: process.env.PATH ?? "", HOME: root, TMPDIR: root, TMP: root, TEMP: root, NODE_DISABLE_COMPILE_CACHE: "1", BUN_RUNTIME_TRANSPILER_CACHE_PATH: path.join(root, "bun-transpiler-cache"), LANG: "C" },
   });
   expect(secretShape.test(`${result.stdout ?? ""}\n${result.stderr ?? ""}`), `${kind} diagnostics contain no credential bytes`).toBe(false);
   expect(result.status, `${kind}/${name} registered mint command exits successfully`).toBe(0);
@@ -71,13 +84,14 @@ function cliIdentity(root: string): PathBIdentity {
   const appAccountJwt = read("account", "account.jwt");
   const appAccount = decodeAndVerifyNatsJwt(appAccountJwt).claims.sub;
   const common = { operatorJwt, accountJwt: appAccountJwt, accountPublicKey: appAccount, ...streams, pathBMachines: PATH_B_MACHINES };
-  const user = (machine: PathBUser["machine"], role: "agent" | "maintainer", dir: string): PathBUser => {
+  const user = (machine: PathBUser["machine"], role: "agent" | "operator", dir: string): PathBUser => {
     const metadata = mint(root, "user", dir, {
       ...common, role, signingSeed: read("account", `signing-${role}.nk`),
       ...(role === "agent"
         ? { host: machine, lane: "cli-proof", session: "cli-proof", release: "cli-proof", meshes: [MESH] }
         : { machine, job: "compaction", runId: "cli-proof" }),
     });
+    expect(metadata.role).toBe(role);
     expect(typeof metadata.publicKey === "string" && metadata.publicKey.startsWith("U"), "mint returns the user public key").toBe(true);
     const credsPath = path.join(root, dir, "user.creds");
     expect(fs.readdirSync(path.join(root, dir))).toEqual(["user.creds"]);
@@ -85,13 +99,23 @@ function cliIdentity(root: string): PathBIdentity {
   };
   const machineA = user("machine-a", "agent", "runtime-a");
   const machineB = user("machine-b", "agent", "runtime-b");
-  const maintainer = user("fabric-ops", "maintainer", "messaging-operator");
-  // These roles must retain their unchanged base scopes on a Path B account. Issue only;
-  // the bootstrap below, never a break-glass client, performs fixture resource creation.
+  const maintainer = user("fabric-ops", "operator", "messaging-operator");
+  // These are real CLI users, with NO machine identity or inventory input. The signed
+  // account operator key determines the reservation; ordinary #7504 rights remain usable.
   const baseCommon = { operatorJwt, accountJwt: appAccountJwt, accountPublicKey: appAccount, ...streams };
-  mint(root, "user", "principal", {
+  const principal = mint(root, "user", "principal", {
     ...baseCommon, role: "principal", signingSeed: read("account", "signing-principal.nk"), person: "fixture", device: "fixture",
   });
+  principalIdentity = { publicKey: principal.publicKey as string, credsPath: path.join(root, "principal", "user.creds") };
+  const normalMaintainer = mint(root, "user", "normal-maintainer", {
+    ...baseCommon, role: "maintainer", signingSeed: read("account", "signing-maintainer.nk"), job: "compaction", runId: "cli-proof",
+  });
+  normalMaintainerIdentity = { publicKey: normalMaintainer.publicKey as string, credsPath: path.join(root, "normal-maintainer", "user.creds") };
+  for (const identity of [principalIdentity, normalMaintainerIdentity]) {
+    const jwt = fs.readFileSync(identity.credsPath, "utf8").match(/BEGIN NATS USER JWT-----\s*([^\s]+)/)?.[1];
+    expect(jwt).toBeDefined();
+    expect((decodeAndVerifyNatsJwt(jwt!).claims.nats.tags as string[]).some((tag) => tag.startsWith("machine:"))).toBe(false);
+  }
   mint(root, "user", "break-glass", {
     ...baseCommon, signingSeed: read("account", "signing-break-glass.nk"), person: "fixture", runId: "cli-proof", approvalRef: "fixture-approval-0001",
   }, ["--break-glass"]);
@@ -166,9 +190,13 @@ let harness: PathBHarness | undefined;
 let runtime: NatsConnection;
 let otherRuntime: NatsConnection;
 let operator: NatsConnection;
+let principal: NatsConnection;
+let normalMaintainer: NatsConnection;
 let bootstrap: NatsConnection;
 let runtimeOracle: PermissionOracle;
 let operatorOracle: PermissionOracle;
+let principalOracle: PermissionOracle;
+let normalMaintainerOracle: PermissionOracle;
 
 // CLI mint intentionally refuses Windows until private ACL verification exists (#11482).
 describe.skipIf(process.platform === "win32")("Path B CLI-issued credentials on a real nats-server", { concurrent: false, shuffle: false }, () => {
@@ -182,10 +210,14 @@ describe.skipIf(process.platform === "win32")("Path B CLI-issued credentials on 
     otherRuntime = await harness.connect(harness.users.machineB);
     operator = await harness.connect(harness.users.maintainer);
     bootstrap = await harness.connect(harness.users.bootstrap);
+    principal = await harness.connect(principalIdentity);
+    normalMaintainer = await harness.connect(normalMaintainerIdentity);
     runtimeOracle = new PermissionOracle(runtime);
     operatorOracle = new PermissionOracle(operator);
+    principalOracle = new PermissionOracle(principal);
+    normalMaintainerOracle = new PermissionOracle(normalMaintainer);
     const manager = await jetstreamManager(bootstrap);
-    for (const [name, subject] of [[STREAM_A, "fabric.in.machine-a.>"], [STREAM_B, "fabric.in.machine-b.>"], ["FABRIC_ADV", "$JS.EVENT.ADVISORY.>"]]) {
+    for (const [name, subject] of [[STREAM_A, "fabric.in.machine-a.>"], [STREAM_B, "fabric.in.machine-b.>"]]) {
       await manager.streams.add({ name: name!, subjects: [subject!], storage: StorageType.File, allow_direct: false });
     }
     await manager.streams.add({ name: STATE_STREAM, subjects: [`${STATE_STREAM}.state`, `${STATE_STREAM}.snapshot`], storage: StorageType.File, allow_direct: false });
@@ -194,26 +226,62 @@ describe.skipIf(process.platform === "win32")("Path B CLI-issued credentials on 
   }, 90_000);
   afterAll(async () => { await harness?.stop(); harness = undefined; });
 
-  it("loads CLI operator/account/runtime/maintainer files and issues principal/break-glass on a Path B account", () => {
+  it("loads CLI runtime/operator files and connects principal/normal-maintainer users without inventory", () => {
     expect(harness?.configText.includes("sync_interval: always")).toBe(true);
     expect(harness?.serverVersion).toMatch(/^\d+\.\d+\.\d+/);
     expect(harness?.users.machineA.machine).toBe("machine-a");
     expect(harness?.users.machineB.machine).toBe("machine-b");
     expect(harness?.users.maintainer.machine).toBe("fabric-ops");
+    expect(principal.isClosed()).toBe(false);
+    expect(normalMaintainer.isClosed()).toBe(false);
   });
 
-  // These precede bootstrap provisioning of the fixed advisory durable. On the old permissive
-  // template DELETE targets a nonexistent resource and CREATE has an invalid body: no destructive
-  // path or lifecycle mutation can occur even when this regression proof correctly fails.
+  // Run every reserved mutation BEFORE the stream or durable exists. A grant regression
+  // cannot destroy them. Only native PermissionViolationError counts, never API 400/404 or
+  // timeout. In particular bare CREATE's valid config.name has NO durable_name (2.11.17).
+  it.each(RESERVED_MUTATIONS)("all four nonbootstrap roles are broker-denied: %s", async (subject) => {
+    const bare = subject === "$JS.API.CONSUMER.CREATE.FABRIC_ADV";
+    const payload = subject.includes("CONSUMER.CREATE") || subject.includes("CONSUMER.DURABLE.CREATE")
+      ? JSON.stringify({ stream_name: "FABRIC_ADV", config: { name: OPERATOR_DURABLE, ...(bare ? {} : { durable_name: OPERATOR_DURABLE }), ack_policy: AckPolicy.None, filter_subject: "$JS.EVENT.ADVISORY.cli-proof" } })
+      : subject.includes("STREAM.UPDATE") ? JSON.stringify({ name: "FABRIC_ADV", subjects: ["$JS.EVENT.ADVISORY.>"], storage: StorageType.File }) : "{}";
+    for (const oracle of [runtimeOracle, principalOracle, normalMaintainerOracle, operatorOracle]) await oracle.denied(subject, payload);
+  });
+
   it.each([
-    `$JS.API.CONSUMER.CREATE.FABRIC_ADV.${OPERATOR_DURABLE}`,
-    `$JS.API.CONSUMER.CREATE.FABRIC_ADV.${OPERATOR_DURABLE}.$JS.EVENT.ADVISORY.>`,
-    `$JS.API.CONSUMER.DURABLE.CREATE.FABRIC_ADV.${OPERATOR_DURABLE}`,
-    `$JS.API.CONSUMER.DELETE.FABRIC_ADV.${OPERATOR_DURABLE}`,
     `$JS.API.CONSUMER.CREATE.FABRIC_ADV.${OTHER_DURABLE}`,
     `$JS.API.CONSUMER.DELETE.FABRIC_ADV.${OTHER_DURABLE}`,
-  ])("operator lifecycle is broker-denied: %s", async (subject) => {
+  ])("operator has no other advisory lifecycle rights: %s", async (subject) => {
     await operatorOracle.denied(subject);
+  });
+
+  it("bootstrap bare CREATE works on a different capture stream/name; principal can still create/INFO/read another stream", async () => {
+    const manager = await jetstreamManager(bootstrap);
+    await manager.streams.add({ name: CAPTURE_CONTROL, subjects: ["cli.capture.>"], storage: StorageType.File });
+    const response = await bootstrap.request(`$JS.API.CONSUMER.CREATE.${CAPTURE_CONTROL}`, JSON.stringify({
+      stream_name: CAPTURE_CONTROL, config: { name: "bare-capture-control", ack_policy: AckPolicy.None },
+    }), { timeout: API_TIMEOUT_MS });
+    const created = response.json<{ error?: unknown; name: string; config: { ack_policy: string; durable_name?: string } }>();
+    expect(created.error).toBeUndefined();
+    expect(created.name).toBe("bare-capture-control");
+    expect(created.config.ack_policy).toBe(AckPolicy.None);
+    expect(created.config.durable_name).toBeUndefined();
+    const principalManager = await jetstreamManager(principal);
+    expect((await principalManager.streams.info(CAPTURE_CONTROL)).config.name).toBe(CAPTURE_CONTROL);
+    await principalManager.consumers.add(CAPTURE_CONTROL, { name: "principal-reader", durable_name: "principal-reader", ack_policy: AckPolicy.None });
+    expect((await principalManager.consumers.info(CAPTURE_CONTROL, "principal-reader")).name).toBe("principal-reader");
+    const published = await jetstream(bootstrap).publish("cli.capture.control", "principal-readable");
+    expect((await principalManager.streams.getMessage(CAPTURE_CONTROL, { seq: published.seq }))?.string()).toBe("principal-readable");
+    const reader = await jetstream(principal).consumers.get(CAPTURE_CONTROL, "principal-reader");
+    expect((await reader.next({ expires: API_TIMEOUT_MS }))?.string()).toBe("principal-readable");
+    // No successful consumer-delete request: the template test proves that base grant remains.
+  });
+
+  it("normal maintainer retains its #7504 state/snapshot and nonreserved stream API rights", async () => {
+    const manager = await jetstreamManager(normalMaintainer);
+    await manager.streams.add({ name: "CLI_MAINTAINER_CONTROL", subjects: ["cli.maintainer.control"], storage: StorageType.File });
+    expect((await manager.streams.info("CLI_MAINTAINER_CONTROL")).config.name).toBe("CLI_MAINTAINER_CONTROL");
+    const js = jetstream(normalMaintainer);
+    for (const suffix of ["state", "snapshot"]) expect((await js.publish(`${STATE_STREAM}.${suffix}`, `maintainer-${suffix}`)).stream).toBe(STATE_STREAM);
   });
 
   it("runtime sends with its own source, pulls/ACKs its own consumer, and publishes bound state/snapshot", async () => {
@@ -266,6 +334,7 @@ describe.skipIf(process.platform === "win32")("Path B CLI-issued credentials on 
 
   it("report-only operator inspects inventory metadata and pulls its preprovisioned AckNone advisory durable without ACK authority", async () => {
     const bootstrapManager = await jetstreamManager(bootstrap);
+    await bootstrapManager.streams.add({ name: "FABRIC_ADV", subjects: ["$JS.EVENT.ADVISORY.>"], storage: StorageType.File, allow_direct: false });
     await bootstrapManager.consumers.add("FABRIC_ADV", {
       name: OPERATOR_DURABLE, durable_name: OPERATOR_DURABLE, ack_policy: AckPolicy.None,
       deliver_policy: DeliverPolicy.New, filter_subject: "$JS.EVENT.ADVISORY.cli-proof",
@@ -284,6 +353,7 @@ describe.skipIf(process.platform === "win32")("Path B CLI-issued credentials on 
     // AckNone delivery needs no acknowledgement. The operator must never publish any $JS.ACK.
     const info = await manager.consumers.info("FABRIC_ADV", OPERATOR_DURABLE);
     expect(info.config.ack_policy).toBe(AckPolicy.None);
+    expect(info.config.deliver_subject).toBeUndefined();
     expect(info.num_ack_pending).toBe(0);
   }, 15_000);
 
@@ -297,6 +367,8 @@ describe.skipIf(process.platform === "win32")("Path B CLI-issued credentials on 
     "fabric.ev.fabric-ops.fabric.ops.cli-proof",
     "$JS.API.STREAM.MSG.GET.KV_fabric_presence",
     "$JS.API.STREAM.MSG.GET.KV_fabric_leases",
+    "$KV.fabric_presence.fabric-ops.owned",
+    "$KV.fabric_leases.fabric-ops.h.owned",
     ...[STREAM_A, STREAM_B].flatMap((stream) => [
       `$JS.API.STREAM.MSG.GET.${stream}`,
       `$JS.API.DIRECT.GET.${stream}`,
@@ -308,7 +380,6 @@ describe.skipIf(process.platform === "win32")("Path B CLI-issued credentials on 
     `$JS.ACK.FABRIC_ADV.${OTHER_DURABLE}.1.1.1.1.0`,
     `$JS.ACK.${STREAM_A}.runtime-a.1.1.1.1.0`,
     "$JS.API.STREAM.CREATE.FABRIC_ADV",
-    "$JS.API.STREAM.UPDATE.FABRIC_ADV",
     "$JS.API.STREAM.DELETE.CLI_ABSENT_STREAM",
     "$JS.API.STREAM.PURGE.CLI_ABSENT_STREAM",
   ])("report-only operator private-read/relay/command/foreign-consumer/lifecycle is broker-denied: %s", async (subject) => {

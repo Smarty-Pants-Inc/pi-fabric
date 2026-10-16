@@ -32,6 +32,15 @@ afterEach(() => {
 const setup = () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-stop-merge-")); roots.push(root);
   privateDirTestHooks.platform = hostPlatform;
+  if (hostPlatform === "win32") {
+    const fsync = fs.fsyncSync.bind(fs);
+    // Only the transport branch is simulated. Native Windows has no directory
+    // fsync barrier, even while process.platform is mocked to Linux. Keep real
+    // file fsync (including durable stop intent) and all custody assertions.
+    vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+      if (!fs.fstatSync(fd).isDirectory()) fsync(fd);
+    });
+  }
   return new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: 60_000,
     maxConcurrent: 1, retainRuns: false, budgetUsd: 0, notifyOnComplete: false },
   { runRoot: path.join(root, "runs"), workerPath: path.join(root, "worker.mjs") });

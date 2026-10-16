@@ -442,7 +442,7 @@ const settled = (value: Record<string, unknown>): string =>
  * A bridge side over a mesh store on this host. `peer` names the other side: it is the
  * `remoteHost` mark on mirrored records and the `bridge.from` of events it bridges in.
  */
-interface BridgeLease { id: string; rootId: string; identityId: string; updatedAt: number; expiresAt: number; startedAt?: number; incarnationToken?: string; mirror?: FabricMirrorLease; mirrorLease?: 1 }
+interface BridgeLease { id: string; rootId: string; identityId: string; updatedAt: number; expiresAt: number; startedAt?: number; incarnationToken?: string; bridgeSupersededTokens?: string[]; bridgeSupersededTokenSeen?: Record<string, number>; historySeenFloor?: Record<string, number>; mirror?: FabricMirrorLease; mirrorLease?: 1 }
 /**
  * A removed mirror's lease identity, as its lease file carries it (root, identity, start and token).
  * A row without root, identity and incarnation (an older release's) proves no owner: it removes nothing.
@@ -453,6 +453,79 @@ const incarnationOf = (record: { startedAt?: unknown; incarnationToken?: unknown
   ...(typeof record.startedAt === "number" && Number.isFinite(record.startedAt) ? { startedAt: record.startedAt } : {}),
   ...(typeof record.incarnationToken === "string" && record.incarnationToken.length > 0 ? { incarnationToken: record.incarnationToken } : {}),
 });
+
+const BRIDGE_SUPERSEDED_TOKEN_LIMIT = 16;
+const bridgeSupersededTokensOf = (value: unknown): string[] => {
+  if (!Array.isArray(value)) return [];
+  return [...new Set(value.filter((token): token is string => typeof token === "string" && token.length > 0))]
+    .slice(-BRIDGE_SUPERSEDED_TOKEN_LIMIT);
+};
+type BridgeSupersededHistory = { tokens?: unknown; seen?: unknown };
+const bridgeSupersededSeenOf = (value: unknown): Record<string, number> => {
+  if (!isObject(value)) return {};
+  const seen: Record<string, number> = Object.create(null);
+  for (const [token, sequence] of Object.entries(value)) {
+    if (token.length > 0 && Number.isSafeInteger(sequence) && (sequence as number) >= 0) seen[token] = sequence as number;
+  }
+  return seen;
+};
+const mergeBridgeSupersededHistory = (
+  sources: readonly BridgeSupersededHistory[], additions: readonly string[] = [],
+): { tokens: string[]; seen: Record<string, number>; firstSeen: Record<string, number> } => {
+  const order: string[] = [];
+  const sequences = new Map<string, number>();
+  const origins = new Map<string, { source: number; index: number }>();
+  for (const [sourceIndex, source] of sources.entries()) {
+    for (const [token, sequence] of Object.entries(bridgeSupersededSeenOf(source.seen))) {
+      sequences.set(token, Math.min(sequences.get(token) ?? Infinity, sequence));
+    }
+    for (const [index, token] of bridgeSupersededTokensOf(source.tokens).entries()) {
+      if (!origins.has(token)) { order.push(token); origins.set(token, { source: sourceIndex, index }); }
+    }
+  }
+  let next = -1;
+  for (const sequence of sequences.values()) next = Math.max(next, sequence);
+  next += 1;
+  for (const token of additions) if (token && !order.includes(token)) {
+    origins.set(token, { source: -1, index: order.length });
+    order.push(token);
+    sequences.set(token, next++);
+  }
+  // Missing ordinals are legacy evidence: preserve each chain's order and place secondary
+  // chains before the primary chain when relative age is unknowable, so eviction favors authority.
+  const sorted = order.map(token => ({ token, origin: origins.get(token)!, sequence: sequences.get(token) }))
+    .sort((a, b) => a.sequence === undefined ? (b.sequence === undefined
+      ? b.origin.source - a.origin.source || a.origin.index - b.origin.index
+      : -1) : b.sequence === undefined ? 1
+      : a.sequence - b.sequence || b.origin.source - a.origin.source || a.origin.index - b.origin.index);
+  const retained = sorted.slice(-BRIDGE_SUPERSEDED_TOKEN_LIMIT);
+  return { tokens: retained.map(item => item.token),
+    seen: Object.fromEntries(retained.flatMap(item => item.sequence === undefined ? [] : [[item.token, item.sequence]])),
+    firstSeen: Object.fromEntries(sequences) };
+};
+
+/** Refuse only a token proven superseded by this mesh's persisted local history. */
+const olderBridgeIncarnation = (
+  incoming: { startedAt?: unknown; incarnationToken?: unknown },
+  supersededTokens: readonly string[],
+): boolean => {
+  const token = incarnationOf(incoming).incarnationToken;
+  return token !== undefined && supersededTokens.includes(token);
+};
+
+/** Same-token metadata may change, but never lowers that owner's known finite age fence. */
+const bridgeIncarnationWithFloor = (
+  incoming: { startedAt?: unknown; incarnationToken?: unknown },
+  authorities: readonly { startedAt?: number; incarnationToken?: string }[],
+): { startedAt?: number; incarnationToken?: string } => {
+  const next = incarnationOf(incoming);
+  if (next.incarnationToken === undefined) return next;
+  for (const held of authorities) {
+    if (held.incarnationToken === next.incarnationToken && held.startedAt !== undefined && Number.isFinite(held.startedAt) &&
+      (next.startedAt === undefined || held.startedAt > next.startedAt)) next.startedAt = held.startedAt;
+  }
+  return next;
+};
 
 export class StoreBridgeSide implements BridgeSide {
   // The mirror's host-lease writes and removals run after its state commit, from rows recorded in
@@ -840,6 +913,7 @@ export class StoreBridgeSide implements BridgeSide {
   }
 
   #publication(event: BridgePublish, held: string[], fromHub: boolean): Parameters<MeshStore["publish"]>[0] {
+    if (this.#staleAdmission) throw this.#staleAdmission;
     const checked = checkBridgePublish(event);
     const stamp = checked.data.bridge;
     const data = { ...checked.data, bridge: fromHub && stamp.via === this.peer
@@ -890,6 +964,7 @@ export class StoreBridgeSide implements BridgeSide {
    * id, name, kind and session id (pi-fabric#876 security pass, (b)).
    */
   holds(id: string, identity?: MeshIdentity): boolean {
+    if (this.#staleAdmission) return false;
     // Inside #heldFence, after its proof: this exact (id, identity) was checked at a revision the fence
     // proved current. Set and cleared in one synchronous segment, so no other caller can see it.
     if (this.#proven.has(id) && this.#proven.get(id) === identity) return true;
@@ -1029,6 +1104,7 @@ export class StoreBridgeSide implements BridgeSide {
 
 
   #fenced = false;
+  #staleAdmission: BridgeStaleIncarnationError | undefined;
   #inflight: Promise<void> = Promise.resolve();
 
   /**
@@ -1037,9 +1113,18 @@ export class StoreBridgeSide implements BridgeSide {
    * the withdrawal (security review round 2, F3).
    */
   mirror(presence: Pick<BridgePresence, "hosts" | "participants">, observedAt?: number, fromHub = false): Promise<void> {
+    if (this.#staleAdmission) return Promise.reject(this.#staleAdmission);
     if (this.#fenced) return Promise.resolve();
     // Only the forced-command agent sets fromHub for its trusted hub's mirror RPC.
-    const run = this.#inflight.then(() => this.#mirror(presence, false, observedAt, fromHub));
+    const run = this.#inflight.then(() => this.#mirror(presence, false, observedAt, fromHub)).catch((error: unknown) => {
+      if (error instanceof BridgeStaleIncarnationError) {
+        // This instance never acquired the newer incarnation. Fence queued writes and keep
+        // cleanup from withdrawing its predecessor's persisted authority after the refusal.
+        this.#staleAdmission = error;
+        this.#fenced = true;
+      }
+      throw error;
+    });
     this.#inflight = run.catch(() => undefined);
     return run;
   }
@@ -1047,6 +1132,7 @@ export class StoreBridgeSide implements BridgeSide {
   async withdraw(): Promise<void> {
     this.#fenced = true;
     await this.#inflight;
+    if (this.#staleAdmission) return;
     await this.#mirror({ hosts: [], participants: [] }, true);
   }
 
@@ -1099,6 +1185,15 @@ export class StoreBridgeSide implements BridgeSide {
       ...leases.map((lease) => ({ kind: "lease", key: `lease:${lease.id}`, payload: lease })),
       ...removed.map((gone) => ({ kind: "unlease", key: `lease:${gone.id}`, payload: gone })),
     ];
+    const incomingRootIds = new Set(presence.hosts.map(({ record }) => record.rootId));
+    // Match compute's normalized incarnation evidence without mutating cached lease histories.
+    const leaseIncarnationDigest = (leases: ReadonlyMap<string, FabricHostLease>): string => contentDigest(
+      [...leases.values()].filter(lease => incomingRootIds.has(lease.rootId)).map(lease => ({
+        id: lease.id, rootId: lease.rootId, ...incarnationOf(lease),
+        bridgeSupersededTokens: bridgeSupersededTokensOf(lease.bridgeSupersededTokens),
+        bridgeSupersededTokenSeen: bridgeSupersededSeenOf(lease.bridgeSupersededTokenSeen),
+      })).sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0),
+    );
     // The pass's plan on one state view: admission, reservations and the CAS versions. undefined: halted.
     const compute = (view: MeshBatchView, participantFiles: ReturnType<typeof participantFileSnapshot>):
       { ops: MeshBatchOperation[]; leases: BridgeLease[]; removed: BridgeUnlease[];
@@ -1109,12 +1204,46 @@ export class StoreBridgeSide implements BridgeSide {
         const participantEntries = view.listAll(PARTICIPANT_PREFIX);
         const scan = this.#scan(hostEntries, [...participantEntries, ...participantFiles.entries], view.listAll(BRIDGE_HANDOFF_PREFIX));
         const own = new Set(scan.presence.reserved);
+        // Same-peer mirrors are intentionally absent from reservations, but still prove a root's
+        // incarnation across new link objects. Lease authority also survives a missing state row.
+        const incarnations = new Map<string, Array<{ startedAt?: number; incarnationToken?: string }>>();
+        const superseded = new Map<string, BridgeSupersededHistory[]>();
+        const currentTokens = new Map<string, string[]>();
+        const remember = (rootId: string, record: { startedAt?: unknown; incarnationToken?: unknown;
+          bridgeSupersededTokens?: unknown; bridgeSupersededTokenSeen?: unknown }): void => {
+          const known = incarnations.get(rootId) ?? [];
+          known.push(incarnationOf(record));
+          incarnations.set(rootId, known);
+          // Union all local evidence before bounding, including an older authority's history.
+          superseded.set(rootId, [...(superseded.get(rootId) ?? []),
+            { tokens: record.bridgeSupersededTokens, seen: record.bridgeSupersededTokenSeen }]);
+          const token = incarnationOf(record).incarnationToken;
+          if (token !== undefined) currentTokens.set(rootId, [...new Set([...(currentTokens.get(rootId) ?? []), token])]);
+        };
+        for (const entry of hostEntries) {
+          const held = hostOf(entry.key, entry.value);
+          // The remote's history is not evidence. Only this link's own persisted mirror counts.
+          if (held && mirrorLinkOf(entry.value) === this.peer) remember(held.rootId, held);
+        }
+        for (const lease of scan.leases.values()) remember(lease.rootId, lease);
         const wanted = new Map<string, { value: Record<string, unknown>; identity: MeshIdentity }>();
         const hosts = new Map<string, FabricHostRecord>();
         for (const { record, expiresAt, observedAt: sourceObservedAt } of presence.hosts) {
           const relayed = remoteHostOf(record) !== undefined;
           if (relayed && (!fromHub || record.bridgeVia !== this.peer || record.remoteHost === this.peer)) continue;
           if (own.has(record.id) || own.has(record.identity.id) || own.has(record.rootId)) continue;
+          // Refuse the whole batch, rather than omitting this host from wanted: omission would
+          // delete the newer mirror, its participants and its lease in the removal pass below.
+          // Check before liveness filtering too: an expired stale frame proves no withdrawal.
+          const knownHistory = mergeBridgeSupersededHistory(superseded.get(record.rootId) ?? []);
+          // Legacy presence remains valid only until this root has local token authority.
+          // Refuse the downgrade before recovery/removal: writing a tokenless mirror would
+          // erase the current token and let its later replay reclaim participant authority.
+          if ((incarnationOf(record).incarnationToken === undefined &&
+              ((currentTokens.get(record.rootId)?.length ?? 0) > 0 || knownHistory.tokens.length > 0)) ||
+              olderBridgeIncarnation(record, knownHistory.tokens)) {
+            throw new BridgeStaleIncarnationError(record.rootId);
+          }
           // Source expiry and age are meaningful on the SOURCE clock only (#10068).
           // Keep legacy projection deadlines for older readers, but give current readers the
           // successful per-host observation. A delayed commit never makes that snapshot fresh.
@@ -1133,14 +1262,28 @@ export class StoreBridgeSide implements BridgeSide {
           const mirror: FabricMirrorLease | undefined = sampled ? { remoteHost: relayed ? record.remoteHost! : this.peer, observedAt: liveAt,
             sourceObservedAt, sourceUpdatedAt: record.updatedAt, sourceExpiresAt: expiresAt,
             ...(bridgeProcess ? { bridgeProcess } : {}) } : undefined;
-          hosts.set(record.id, record);
+          const incarnation = bridgeIncarnationWithFloor(record, incarnations.get(record.rootId) ?? []);
+          const token = incarnation.incarnationToken;
+          const priorTokens = token === undefined ? []
+            : (currentTokens.get(record.rootId) ?? []).filter(held => held !== token);
+          const history = mergeBridgeSupersededHistory(superseded.get(record.rootId) ?? [], priorTokens);
+          const { bridgeSupersededTokens: _tokens, bridgeSupersededTokenSeen: _seen, ...recordFields } = record;
+          const admitted = { ...recordFields, ...incarnation,
+            ...(history.tokens.length > 0 ? { bridgeSupersededTokens: history.tokens } : {}),
+            ...(Object.keys(history.seen).length > 0 ? { bridgeSupersededTokenSeen: history.seen } : {}) };
+          hosts.set(record.id, admitted);
           wanted.set(keyFor(HOST_PREFIX, record.id), {
-            value: { ...record, updatedAt: now, expiresAt: until, remoteHost: relayed ? record.remoteHost : this.peer,
+            value: { ...admitted, updatedAt: now, expiresAt: until, remoteHost: relayed ? record.remoteHost : this.peer,
               ...(sampled ? { mirrorLease: 1 } : {}) },
             identity: record.identity,
           });
-          // The lease carries the origin's incarnation, so a later removal can tell it from a replacement's.
-          leases.push({ id: record.id, rootId: record.rootId, identityId: record.identity.id, ...incarnationOf(record),
+          // The lease carries the same age floor as the host, including lease-only authority.
+          leases.push({ id: record.id, rootId: record.rootId, identityId: record.identity.id, ...incarnation,
+            ...(history.tokens.length > 0 ? { bridgeSupersededTokens: history.tokens } : {}),
+            ...(Object.keys(history.seen).length > 0 ? { bridgeSupersededTokenSeen: history.seen } : {}),
+            // Keep the bounded sources' first-seen evidence until the file effect completes;
+            // otherwise an evicted duplicate could reenter from disk with a later ordinal.
+            historySeenFloor: history.firstSeen,
             updatedAt: renewedAt, expiresAt: until, ...(mirror ? { mirrorLease: 1, mirror } : {}) });
         }
         for (const participant of presence.participants) {
@@ -1200,11 +1343,11 @@ export class StoreBridgeSide implements BridgeSide {
       // A stale plan rolls back and plans again; the last attempt, a backend without a revision view, and
       // a recovery pass (whose replay must run on the transaction's snapshot) plan inside, as before.
       const early = this.#recovered && attempt < MIRROR_PLAN_ATTEMPTS - 1 ? this.store.stateView() : undefined;
-      // With a handoff row, #scan reads every lease file and judges each native lease live or not at its own
-      // time (bridgeHandoffScope: a live native voids a handoff). Stamp the directory first; in the transaction,
-      // every lease must also be judged the same at the time read there, or the plan runs again.
-      const leaseStamp = early && early.view.listAll(BRIDGE_HANDOFF_PREFIX).length > 0
-        ? meshDirectoryStamp(this.store.root, HOST_LEASE_DIR) : undefined;
+      // Stamp incarnation authority before planning. Without handoffs, a moved stamp needs only
+      // incoming roots' evidence rechecked; unrelated leases and renewals do not change admission.
+      // Handoffs still require the full stamp and the scan's native lease liveness judgment.
+      const leaseStamp = early ? meshDirectoryStamp(this.store.root, HOST_LEASE_DIR) : undefined;
+      const judgesLeaseLiveness = early !== undefined && early.view.listAll(BRIDGE_HANDOFF_PREFIX).length > 0;
       const planned = early && !halted() ? compute(early.view, files) : undefined;
       const plan = this.#outbox.plan();
       try {
@@ -1217,16 +1360,25 @@ export class StoreBridgeSide implements BridgeSide {
           // (security review rounds 2/3, F1/F2), including recreation over retained tombstones.
           prepare: (view) => {
             if (halted()) return plan.stage([], []);
-            // A crashed predecessor's effects run first, on this snapshot: no separate recovery read
-            // or transaction (smarty-dev#3752: one read, lock and commit per presence pass).
-            if (!this.#recovered) plan.replay(view);
             const sameFiles = meshDirectoryStamp(this.store.root, "participants") === filesStamp;
             let result: ReturnType<typeof compute>;
             if (early && planned && sameFiles && this.store.stateUnchangedSince(early.revision, HELD_STATE_PREFIXES) &&
-              (leaseStamp === undefined || (meshDirectoryStamp(this.store.root, HOST_LEASE_DIR) === leaseStamp &&
-                sameLeaseLiveness(planned.judged.leases, planned.judged.now, this.now())))) result = planned;
+              (leaseStamp === undefined || meshDirectoryStamp(this.store.root, HOST_LEASE_DIR) === leaseStamp ||
+                (!judgesLeaseLiveness && leaseIncarnationDigest(planned.judged.leases) ===
+                  leaseIncarnationDigest(readHostLeases(this.store.root)))) &&
+              (!judgesLeaseLiveness || sameLeaseLiveness(planned.judged.leases, planned.judged.now, this.now()))) result = planned;
             else if (early) throw new MirrorPlanStale();
-            else result = compute(view, sameFiles ? files : participantFileSnapshot(this.store.root));
+            else {
+              const participantFiles = sameFiles ? files : participantFileSnapshot(this.store.root);
+              // Refuse stale presence BEFORE recovery can touch any lease file. A successful
+              // preflight then replays on this same transaction's snapshot and recomputes, so
+              // recovered lease authority participates in admission and handoff judgments too.
+              result = compute(view, participantFiles);
+              if (!this.#recovered && result && view.listAll(this.#outbox.prefix).length > 0) {
+                plan.replay(view);
+                result = compute(view, participantFiles);
+              }
+            }
             if (!result) return plan.stage([], []);
             // Cap sampled authority at its ORIGINAL translated source deadline after the lock wait.
             // A sample that expired during the wait stays expired; neither its observation nor its
@@ -1281,33 +1433,51 @@ export class StoreBridgeSide implements BridgeSide {
       Math.min(BRIDGE_LEASE_MS, sample.sourceExpiresAt - sample.sourceObservedAt) : undefined;
     if (sourceDeadline !== undefined) lease = { ...lease, expiresAt: Math.min(lease.expiresAt, sourceDeadline) };
     const onDisk = readHostLease(this.store.root, lease.id);
-    // Dedup must not preserve an inflated deadline for this EXACT owner and sample. A newer
-    // observation (even of the same source renewal) still goes through the guards below.
-    if (sample && sourceDeadline !== undefined && onDisk && onDisk.startedAt === lease.startedAt &&
-      onDisk.incarnationToken === lease.incarnationToken && onDisk.identityId === lease.identityId &&
-      onDisk.rootId === lease.rootId && onDisk.mirror?.remoteHost === sample.remoteHost &&
-      onDisk.mirror.observedAt === sample.observedAt && onDisk.mirror.sourceObservedAt === sample.sourceObservedAt &&
-      onDisk.mirror.sourceUpdatedAt === sample.sourceUpdatedAt && onDisk.mirror.sourceExpiresAt === sample.sourceExpiresAt &&
-      onDisk.expiresAt > sourceDeadline) {
-      writeHostLease(this.store.root, lease);
-      return;
+    // Recovery must not erase newer file authority while its state row is still catching up.
+    if (onDisk?.rootId === lease.rootId) {
+      // Disk history is local proof that this outbox token was superseded. An old recovery
+      // effect must not restore it over newer on-disk authority.
+      if (olderBridgeIncarnation(lease, bridgeSupersededTokensOf(onDisk.bridgeSupersededTokens))) return;
+      // A pending same-token effect may predate the disk's age floor even when it still
+      // matches the held row. Leave that authority intact for recovery's recomputation.
+      if (bridgeIncarnationWithFloor(lease, [onDisk]).startedAt !== incarnationOf(lease).startedAt) return;
     }
-    // A replayed row never shortens a lease that a later pass already renewed.
+    // Keep newer observations, but never let a lease no-op skip history repair (#7397).
     const sameIncarnation = onDisk && onDisk.startedAt === lease.startedAt && onDisk.identityId === lease.identityId &&
       onDisk.rootId === lease.rootId && onDisk.incarnationToken === lease.incarnationToken;
-    if (replay && sameIncarnation && (onDisk.mirror?.observedAt ?? onDisk.expiresAt) >=
-      (lease.mirror?.observedAt ?? lease.expiresAt)) return;
-    // Nor does a live effect of the same incarnation: concurrent mirror batches for one peer, host
-    // and incarnation can run their effects out of order, and the older one still matches start/token
-    // (smarty-dev#6939). A lease of another incarnation is replaced whatever its expiry.
-    if (onDisk && sameIncarnation && (lease.mirror
-        ? (onDisk.mirror?.observedAt ?? -Infinity) >= lease.mirror.observedAt ||
-          (onDisk.mirror?.sourceObservedAt === lease.mirror.sourceObservedAt &&
-            onDisk.mirror.sourceUpdatedAt === lease.mirror.sourceUpdatedAt &&
-            onDisk.mirror.sourceExpiresAt === lease.mirror.sourceExpiresAt)
+    const history = mergeBridgeSupersededHistory([
+      { tokens: held.bridgeSupersededTokens, seen: held.bridgeSupersededTokenSeen },
+      { tokens: lease.bridgeSupersededTokens, seen: lease.bridgeSupersededTokenSeen },
+      { seen: lease.historySeenFloor },
+      ...(onDisk?.rootId === lease.rootId ? [{ tokens: onDisk.bridgeSupersededTokens, seen: onDisk.bridgeSupersededTokenSeen }] : []),
+    ]);
+    const keepDiskLease = sameIncarnation && onDisk && (
+      (replay && (onDisk.mirror?.observedAt ?? onDisk.expiresAt) >= (sample?.observedAt ?? lease.expiresAt)) ||
+      (sample ? (onDisk.mirror?.observedAt ?? -Infinity) >= sample.observedAt ||
+        (onDisk.mirror?.sourceObservedAt === sample.sourceObservedAt &&
+          onDisk.mirror.sourceUpdatedAt === sample.sourceUpdatedAt && onDisk.mirror.sourceExpiresAt === sample.sourceExpiresAt)
+        // An older unsampled effect must retain the disk lease's whole sample, not just
+        // its timestamps. Preserve legacy ordering before merging history (#1076/#7397).
         : onDisk.expiresAt > lease.expiresAt ||
-          (onDisk.expiresAt === lease.expiresAt && onDisk.updatedAt === lease.updatedAt))) return;
-    writeHostLease(this.store.root, lease);
+          (onDisk.expiresAt === lease.expiresAt && onDisk.updatedAt >= lease.updatedAt)));
+    let base = keepDiskLease ? { ...lease, ...onDisk } : sameIncarnation && onDisk && !sample ? {
+      ...lease,
+      updatedAt: Math.max(lease.updatedAt, onDisk.updatedAt),
+      expiresAt: Math.max(lease.expiresAt, onDisk.expiresAt),
+    } : lease;
+    // Clamp the selected sample, including an inflated pre-fix disk image. Its observation and
+    // deadline stay together: max(expiry) would revive a sampled origin after its deadline (#10068).
+    if (base.mirror) base = { ...base, expiresAt: Math.min(base.expiresAt, base.mirror.observedAt +
+      Math.min(BRIDGE_LEASE_MS, base.mirror.sourceExpiresAt - base.mirror.sourceObservedAt)) };
+    const { historySeenFloor: _floor, bridgeSupersededTokens: _tokens, bridgeSupersededTokenSeen: _seen, ...leaseFields } = base;
+    const repaired = { ...leaseFields,
+      ...(history.tokens.length > 0 ? { bridgeSupersededTokens: history.tokens } : {}),
+      ...(Object.keys(history.seen).length > 0 ? { bridgeSupersededTokenSeen: history.seen } : {}) };
+    if (sameIncarnation && onDisk && onDisk.updatedAt === repaired.updatedAt && onDisk.expiresAt === repaired.expiresAt &&
+        JSON.stringify(onDisk.mirror) === JSON.stringify(repaired.mirror) &&
+        JSON.stringify(history.tokens) === JSON.stringify(bridgeSupersededTokensOf(onDisk.bridgeSupersededTokens)) &&
+        JSON.stringify(history.seen) === JSON.stringify(bridgeSupersededSeenOf(onDisk.bridgeSupersededTokenSeen))) return;
+    writeHostLease(this.store.root, repaired);
   }
 
   async bridgedIds(after: number): Promise<BridgedIds> {
@@ -1339,6 +1509,18 @@ export class StoreBridgeSide implements BridgeSide {
 
 /** An event refused at commit: its sender or target is no longer bound to this link. */
 export class BridgeOwnershipError extends Error {}
+
+export const FABRIC_BRIDGE_STALE_INCARNATION = "FABRIC_BRIDGE_STALE_INCARNATION";
+
+/** Presence refused without changing the newer persisted root or its lease. */
+export class BridgeStaleIncarnationError extends Error {
+  override readonly name = "BridgeStaleIncarnationError";
+  readonly code = FABRIC_BRIDGE_STALE_INCARNATION;
+  readonly retryable = false;
+  constructor(readonly rootId?: string) {
+    super(`Bridge presence${rootId === undefined ? "" : ` for ${rootId}`} has an older incarnation than persisted authority`);
+  }
+}
 
 /** The shape and allow-list check a side applies to every event it is asked to publish. */
 export const checkBridgePublish = (input: unknown): BridgePublish => {
@@ -1478,7 +1660,8 @@ export const serveBridgeAgent = (side: StoreBridgeSide, input: Readable, output:
             }
             reply({
               id: request.id, ok: false, error: error instanceof Error ? error.message : String(error),
-              ...(isMeshIncarnationPending(error) ? { code: MESH_INCARNATION_PENDING_CODE }
+              ...(error instanceof BridgeStaleIncarnationError ? { code: error.code }
+                : isMeshIncarnationPending(error) ? { code: MESH_INCARNATION_PENDING_CODE }
                 : isMeshSnapshotRetriesExhausted(error) ? { code: MESH_SNAPSHOT_RETRIES_EXHAUSTED_CODE }
                   : isMeshRetryableBusy(error) ? { code: MESH_LOCK_TIMEOUT_CODE } : {}),
             });
@@ -1629,6 +1812,10 @@ export class RemoteBridgeSide implements BridgeSide {
         else {
           if (response.code === FABRIC_IDEMPOTENCY_KEY_REUSED) {
             pending.reject(new FabricIdempotencyKeyReusedError());
+            return;
+          }
+          if (response.code === FABRIC_BRIDGE_STALE_INCARNATION) {
+            pending.reject(new BridgeStaleIncarnationError());
             return;
           }
           const error = new Error(`Bridge agent: ${String(response.error)}`);
@@ -1949,6 +2136,7 @@ export class MeshBridge {
   #seen = { toRemote: new Set<string>(), toLocal: new Set<string>() };
   #presenceAt = Number.NEGATIVE_INFINITY;
   #presenceSync: Promise<void> | undefined;
+  #staleAdmission: BridgeStaleIncarnationError | undefined;
   #stopped = false;
   #ready = false;
   readonly #relayDeliveries = new Set<Promise<void>>();
@@ -2056,6 +2244,7 @@ export class MeshBridge {
    * Outbound it is the hub's own event's sender.
    */
   #outbound(event: MeshEvent, rules: BridgeRules, direction: "toRemote" | "toLocal"): BridgePublish {
+    if (this.#staleAdmission) throw this.#staleAdmission;
     const data = isObject(event.data) ? event.data : {};
     // smarty-dev#9751: a hub sender that is no participant (a factory host) still gets the ACK of a command
     // this link carried out for it. Only its own authenticated address: replyTo must be the carried command's
@@ -2261,6 +2450,7 @@ export class MeshBridge {
 
   /** Mirror each side's live roots into the other; concurrent callers share one pass. */
   syncPresence(): Promise<void> {
+    if (this.#staleAdmission) return Promise.reject(this.#staleAdmission);
     if (this.#presenceSync) {
       this.options.debug?.("presence sync: joined in-flight pass");
       return this.#presenceSync;
@@ -2299,7 +2489,14 @@ export class MeshBridge {
     const results = await Promise.allSettled([this.options.remote.mirror(outbound.presence), this.options.local.mirror(remote, syncedAt)]);
     // A transient failure must not hide a simultaneous permanent/transport failure.
     const failures = results.filter((result) => result.status === "rejected");
+    const stale = failures.find(result => result.reason instanceof BridgeStaleIncarnationError);
+    if (stale) {
+      this.#staleAdmission = stale.reason as BridgeStaleIncarnationError;
+      this.#ready = false;
+    }
     const failure = failures.find((result) => !isBridgeRetryable(result.reason)) ?? failures[0];
+    // Propagate once to the CLI's existing permanent-error log; never continue routing from
+    // refused presence. stop() must fence this link without withdrawing newer authority.
     if (failure) throw failure.reason;
     // Retain only scalar deadlines from the latest admitted, sampled natives. A mirror commit
     // can outlast these while the origin keeps renewing (#10068). Missing held membership then
@@ -2395,6 +2592,7 @@ export class MeshBridge {
    * claim refused or lost in this pass is never trusted (security review round 2, F1/F2).
    */
   async #authority(refreshIfStale = true): Promise<{ local: BridgePresence; remote: Pick<BridgePresence, "hosts" | "participants"> }> {
+    if (this.#staleAdmission) throw this.#staleAdmission;
     const { local } = this.options;
     if (!local.owned) throw new Error("The hub side of a bridge must report the records it holds");
     // A page/read/write can wait on the mesh lock longer than a mirrored lease.
@@ -3180,11 +3378,14 @@ export class MeshBridge {
     await within(this.#running);
     await within(this.#directions);
     await within(Promise.allSettled([...this.#relayDeliveries]));
-    await within(this.options.remote.mirror({ hosts: [], participants: [] }));
+    // A refused reconnect acquired no right to withdraw the predecessor's projection on
+    // either side. Ordinary explicit stop still empties both mirrors exactly as before.
+    if (!this.#staleAdmission) await within(this.options.remote.mirror({ hosts: [], participants: [] }));
     this.options.remote.close?.(new Error("Bridge stopped"));
     await within(this.#running);
     await within(this.#directions);
     const { local } = this.options;
+    if (this.#staleAdmission) return;
     await (local.withdraw ? local.withdraw() : local.mirror({ hosts: [], participants: [] })).catch((error: unknown) => {
       this.#log(`local withdrawal failed: ${error instanceof Error ? error.message : String(error)}`);
     });

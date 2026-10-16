@@ -120,6 +120,12 @@ describe("real FabricControlPlane / injected carrier faults", () => {
     expect(f.seen(envelope.id)).not.toHaveProperty("acceptance");
     expect(ackRecords(f, envelope.id)).toEqual([]);
     expect(commandRecords(f)[0]?.acks).toBe(0);
+    const close = f.receiver.close.bind(f.receiver);
+    // This logical interruption rejects the real shutdown outcome write too; unlike
+    // the OS-crash suite, a rejected close is expected evidence, not successful custody.
+    vi.spyOn(f.receiver, "close").mockImplementationOnce(async () => {
+      await expect(close()).rejects.toBeInstanceOf(MeshConsumptionPausedError);
+    });
     await f.restart(); restore(); f.start(); f.replay(envelope);
     const ack = await f.ack(envelope.id); await f.settled(envelope.id);
     expect(ack).toMatchObject({ accepted: false, error: expect.stringMatching(/indeterminate|unknown/i) });
@@ -262,6 +268,7 @@ describe("real FabricControlPlane / injected carrier faults", () => {
       clock += 11 * 60_000;
       await f.publish(f.raw(first.id)); await f.settled(first.id, 2);
       expect(await f.ack(first.id, 2)).toMatchObject(saved.acceptance!);
+      const beforeConflict = f.seen(first.id)!; // An equal-body retry may extend the retention horizon.
       // Expire BOTH command and ACK broker dedupe windows. Observing THIS attempt's
       // TransportSent.envelope when duplicate=true would not prove a persisted refusal.
       clock += 11 * 60_000;
@@ -271,7 +278,7 @@ describe("real FabricControlPlane / injected carrier faults", () => {
       const refusal = await f.ack(first.id, 3); await f.settled(first.id, 3);
       expect(refusal).toMatchObject({ accepted: false, notRun: true, errorCode: "FABRIC_CONTROL_ID_CONFLICT" });
       expect(objectBody(ackRecords(f, first.id).at(-1)!.delivery.payload)).toMatchObject(refusal);
-      expect(f.seen(first.id)).toEqual(saved); // Conflict may NOT overwrite the old outcome or digest.
+      expect(f.seen(first.id)).toEqual(beforeConflict); // Conflict may NOT overwrite the old outcome or digest.
       expect(f.admissions.items.filter(command => command.commandId === first.id)).toHaveLength(1);
       expect(f.journalItems()).toHaveLength(1);
       await f.publish(f.raw(`${first.id}-new-logical-id`, { message: "different immutable input" }));

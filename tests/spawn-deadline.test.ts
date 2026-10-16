@@ -5,7 +5,6 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { AgentManager, effectiveAgentTimeoutMs } from "../src/agents/manager.js";
 import { normalizeAgentRunRequest } from "../src/agents/request.js";
-import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import type { AgentHandleInfo, AgentRunResult } from "../src/agents/types.js";
 import { ActorManager } from "../src/actors/manager.js";
 import { GlobalActorRegistry } from "../src/actors/global-registry.js";
@@ -74,37 +73,55 @@ describe("spawn hard deadlines below the configured default (#12302)", () => {
     for (const timeoutMs of [30000, 300000]) expect(normalizeAgentRunRequest({ task: "box", timeoutMs }, { runner: "pi", timeoutMs: 600000 }).timeoutMs).toBe(timeoutMs);
   });
 
-  it("keeps a persisted actor override extension-only after the configured default rises", async () => {
+  it.each([
+    [86_400_000, 86_400_000],
+    [1_800_000, 7_200_000],
+  ])("records a persisted actor's effective deadline with configured default %i", { timeout: 30000 }, async (configured, effective) => {
+    // Only inference is synthetic: persistence, actor activation, worker/Pi,
+    // process transport, deadline enforcement and terminal records are real.
     const s = setup(true);
     s.manager.config.timeoutMs = 1_800_000;
-    const created = await s.service.execute({ code: `return await agents.createActor({ name: "persisted-budget", instructions: "Wait for work.", model: "provider/session", extensions: false, timeoutMs: 7200000 });`,
+    const created = await s.service.execute({ code: `return await agents.createActor({ name: "persisted-budget", instructions: "Wait for work.", model: "provider/session", extensions: true, tools: ["write"], timeoutMs: 7200000 });`,
       signal: undefined, parentToolCallId: "actor-deadline-proof", context: s.context, onPartial() {} });
     expect(created.success, created.error).toBe(true);
     const id = (created.value as { id: string }).id;
     expect(s.actor.definition(id).timeoutMs).toBe(7_200_000);
     await s.actor.close();
-    s.manager.config.timeoutMs = 86_400_000;
+    s.manager.config.timeoutMs = configured;
     const restored = new ActorManager("deadline-proof", s.identity, s.mesh, s.config.mesh, s.manager, () => {}, {
       actorRoot: path.join(s.root, "actors"), mainAgent: s.main, persistent: true, reapDeadSessionPresence: false,
     }); actors.push(restored);
     expect(restored.definition(id).timeoutMs).toBe(7_200_000);
-    const launches: Array<{ actorId: string | undefined; timeoutMs: number }> = [];
-    // Record the real manager's final worker arguments, but launch no native process.
-    vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async request => {
-      const args = new Map<string, string>();
-      for (let i = 0; i < request.workerArguments.length; i += 2) args.set(request.workerArguments[i]!, request.workerArguments[i + 1]!);
-      launches.push({ actorId: args.get("--actor-id"), timeoutMs: Number(args.get("--timeout-ms")) });
-      throw new Error("deadline launch recorded");
-    });
-    await expect(restored.ask(id, "Probe the restored actor's budget.")).rejects.toThrow();
-    expect(launches).toEqual([{ actorId: id, timeoutMs: 86_400_000 }]);
-    const oneShot = await s.service.execute({ code: `return await agents.spawn({ task: "Probe a one-shot budget.", model: "provider/session", extensions: false, timeoutMs: 900000 });`,
-      signal: undefined, parentToolCallId: "one-shot-counterexample", context: s.context, onPartial() {} });
-    expect(oneShot.success).toBe(false); // The recording transport deliberately refuses launch.
-    expect(launches.at(-1)).toEqual({ actorId: undefined, timeoutMs: 900_000 });
-    s.manager.config.timeoutMs = 1_800_000;
-    await expect(s.manager.run({ task: "Probe a longer actor override.", actorId: id, model: "provider/session", extensions: false, timeoutMs: 7_200_000 })).rejects.toThrow("deadline launch recorded");
-    expect(launches.at(-1)).toEqual({ actorId: id, timeoutMs: 7_200_000 });
+    const activation = restored.ask(id, "Write the checkpoint, then wait for release.").catch(error => error as Error);
+    let runId!: string;
+    await vi.waitFor(() => {
+      runId = restored.status(id).inFlightRun!.id;
+      expect(s.manager.status(runId)).toMatchObject({ status: "running", partialText: "Partial deadline report." });
+    }, { timeout: 15000, interval: 20 });
+    const now = Date.now;
+    let offset = Math.min(configured, 7_200_000) + 1500;
+    vi.spyOn(Date, "now").mockImplementation(() => now() + offset);
+    // A restored two-hour override must neither shorten a raised day-long default
+    // nor lose its ability to extend the original half-hour default.
+    await expect(s.manager.wait(runId, { timeoutMs: 400 })).rejects.toThrow("still running");
+    offset = effective + 1500;
+    const result = await s.manager.wait(runId, { timeoutMs: 8000 });
+    expect(result).toMatchObject({ status: "timed_out", actorId: id, error: `Agent timed out after ${effective}ms` });
+    expect(JSON.parse(fs.readFileSync(path.join(s.root, "runs", runId, "status.json"), "utf8")))
+      .toMatchObject({ status: "timed_out", error: result.error });
+    expect(await activation).toBeInstanceOf(Error);
+    offset = 0;
+    vi.restoreAllMocks();
+    if (configured === 86_400_000) {
+      const oneShot = await s.service.execute({ code: `return await agents.spawn({ task: "Write the checkpoint, then wait for release.", model: "provider/session", extensions: true, tools: ["write"], timeoutMs: 900000 });`,
+        signal: undefined, parentToolCallId: "one-shot-counterexample", context: s.context, onPartial() {} });
+      expect(oneShot.success, oneShot.error).toBe(true);
+      const handle = oneShot.value as AgentHandleInfo;
+      await vi.waitFor(() => expect(s.manager.status(handle.id)).toMatchObject({ status: "running", partialText: "Partial deadline report." }), { timeout: 15000, interval: 20 });
+      vi.spyOn(Date, "now").mockImplementation(() => now() + 901500);
+      expect(await s.manager.wait(handle.id, { timeoutMs: 8000 }))
+        .toMatchObject({ status: "timed_out", error: "Agent timed out after 900000ms" });
+    }
   });
 
   // The clock changes only in the manager's host, after real native readiness.

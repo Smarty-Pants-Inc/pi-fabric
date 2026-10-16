@@ -81,7 +81,7 @@ async function actorFixture(proof: "ESRCH" | "different-birth") {
     const handle = await fakeManagerHeapWorker(request, 64);
     const statusFile = request.workerArguments[request.workerArguments.indexOf("--status-file") + 1]!;
     writeJsonAtomic(statusFile, { ...JSON.parse(fs.readFileSync(statusFile, "utf8")),
-      status: "running", finishedAt: undefined, sessionId: String(pid), actorId: "recorded-actor" });
+      status: "running", finishedAt: undefined, sessionId: String(pid), actorId: "recorded-actor", turns: 0 });
     return { ...handle, sessionId: String(pid), closed: closed.promise, treeClosed: tree.promise,
       // Primary liveness may end before the captured tree join completes.
       waitForClose: () => tree.promise, isAlive: async () => !gone,
@@ -93,20 +93,25 @@ async function actorFixture(proof: "ESRCH" | "different-birth") {
       } };
   });
   const f = fixture();
+  const controller = new AbortController();
   const handle = await f.manager.spawn({ task: "recorded actor activation", actorId: "recorded-actor",
-    transport: "process", extensions: false });
+    transport: "process", extensions: false }, controller.signal);
   const directory = f.manager.runDirectory(handle.id)!;
-  return { ...f, handle, directory, launch, finishTree, stopEntered,
+  return { ...f, controller, handle, directory, launch, finishTree, stopEntered,
     proofScans: () => proofScans,
     losePrimary: () => { gone = true; closed.resolve(); } };
 }
 
 describe("actor stop and finishing result custody (recorded #722)", () => {
-  it.each(["ESRCH", "different-birth"] as const)("publishes stopped, not actor loss, when stop close triggers %s proof during tree drain", async proof => {
+  it.each((["ESRCH", "different-birth"] as const).flatMap(proof =>
+    (["explicit", "caller abort"] as const).map(mode => [proof, mode] as const)))(
+    "publishes stopped, not actor loss, when stop close triggers %s proof during tree drain (%s)", async (proof, mode) => {
     const f = await actorFixture(proof);
     let stopReturned = false, waitReturned = false;
     const waiting = f.manager.wait(f.handle.id, { timeoutMs: 3_000 }).then(result => { waitReturned = true; return result; });
-    const stopping = f.manager.stop(f.handle.id).then(result => { stopReturned = true; return result; });
+    const stopResult = mode === "explicit" ? f.manager.stop(f.handle.id)
+      : (f.controller.abort(), f.manager.wait(f.handle.id, { timeoutMs: 3_000 }));
+    const stopping = stopResult.then(result => { stopReturned = true; return result; });
     void waiting.catch(() => undefined); void stopping.catch(() => undefined);
     await f.stopEntered.promise;
     await eventually(() => expect(f.proofScans()).toBeGreaterThan(0));
@@ -126,15 +131,14 @@ describe("actor stop and finishing result custody (recorded #722)", () => {
     expect(f.launch).toHaveBeenCalledOnce();
   }, 5_000);
 
-  it.each(["ESRCH", "different-birth"] as const)("preserves genuine %s primary loss observed before stop and never replays after exact tree exit", async proof => {
+  it.each(["ESRCH", "different-birth"] as const)("preserves genuine %s primary loss without stop intent and never replays after exact tree exit", async proof => {
     const f = await actorFixture(proof);
     f.losePrimary();
     await eventually(() => expect(f.proofScans()).toBeGreaterThan(0));
     expect(f.manager.isSettled(f.handle.id)).toBe(false);
     let returned = false;
-    const stopping = f.manager.stop(f.handle.id).then(result => { returned = true; return result; });
+    const stopping = f.manager.wait(f.handle.id, { timeoutMs: 3_000 }).then(result => { returned = true; return result; });
     void stopping.catch(() => undefined);
-    await f.stopEntered.promise;
     expect(returned).toBe(false);
     expect(f.onSettled).not.toHaveBeenCalled();
     expect(fs.existsSync(path.join(f.directory, "manager-result.json"))).toBe(false);
@@ -148,4 +152,20 @@ describe("actor stop and finishing result custody (recorded #722)", () => {
     expect(f.launch).toHaveBeenCalledOnce();
   }, 5_000);
 
+  it.each(["ESRCH", "different-birth"] as const)("honors durable explicit intent after %s primary loss while its tree is still held", async proof => {
+    const f = await actorFixture(proof);
+    f.losePrimary();
+    await eventually(() => expect(f.proofScans()).toBeGreaterThan(0));
+    let returned = false;
+    const stopping = f.manager.stop(f.handle.id).then(result => { returned = true; return result; });
+    void stopping.catch(() => undefined);
+    await f.stopEntered.promise;
+    expect(returned).toBe(false);
+    expect(f.onSettled).not.toHaveBeenCalled();
+    expect(fs.existsSync(path.join(f.directory, "manager-result.json"))).toBe(false);
+    f.finishTree();
+    expect(await stopping).toMatchObject({ status: "stopped", error: "Agent stopped", stopIntent: { reason: "explicit" } });
+    expect(f.onSettled).toHaveBeenCalledOnce();
+    expect(f.launch).toHaveBeenCalledOnce();
+  }, 5_000);
 });

@@ -142,7 +142,9 @@ describe("index root inbox turn/settle reconciliation (#4313)", () => {
     expect(h.cursor().pending.ids).toEqual([pending.id]);
     const newer = await h.work("behind the cancelled batch");
     await h.emit("before_agent_start"); h.consume();
-    expect(h.ids()).toEqual([first.id, pending.id]);
+    // A new prompt may offer ranked tail work alongside the recovered prefix. Nothing was
+    // retried by the aborted boundary above, and later turns must not repeat either action.
+    expect(h.ids()).toEqual([first.id, pending.id, newer.id]);
     await h.turn(); h.consume(); await h.turn();
     expect(h.ids()).toEqual([first.id, pending.id, newer.id]);
     expect(h.cursor().pending).toBeUndefined();

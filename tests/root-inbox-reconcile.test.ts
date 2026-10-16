@@ -3,7 +3,8 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
-import { RootInbox, ROOT_INBOX_ALARM_TOPIC, rootInboxMessage, rootInboxSession } from "../src/topology/root-inbox.js";
+import { RootInbox, ROOT_INBOX_ALARM_TOPIC } from "../src/topology/root-inbox.js";
+import { rootInboxMessage, rootInboxSession } from "./root-inbox-issued-fixture.js";
 
 const me: MeshIdentity = { id: "session:main", name: "Main", kind: "main" };
 const peer: MeshIdentity = { id: "session:peer", name: "Peer", kind: "main" };

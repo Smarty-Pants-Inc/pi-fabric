@@ -1,13 +1,15 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import * as fileLock from "../src/residency/file-lock.js";
 import { describe, expect, it, vi } from "vitest";
 import { MeshStore } from "../src/mesh/store.js";
 import { ActorManager } from "../src/actors/manager.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
-import { canonicalResidentWakeConfig, residentUnacknowledgedDeliveries } from "../src/residency/wake-index.js";
+import { canonicalResidentWakeConfig, residentUnacknowledgedDeliveries, ResidentWakeRecoveryReader,
+  residentWakeIndexPath, RESIDENT_WAKE_INDEX_MAX_ROOTS } from "../src/residency/wake-index.js";
 import * as wake from "../src/residency/wake.js";
 
 const from = { id: "publisher", name: "publisher", kind: "main" as const };
@@ -39,6 +41,136 @@ const maintenance = (mesh: MeshStore, launch: (file: string, config: ResidentHos
 };
 
 describe("publication wake isolation and maintenance backoff", () => {
+  it.each(["retired", "malformed", "unreadable"] as const)("round2 retries beyond a pinned first page and only drops retired routes: %s", async mode => {
+    const f = fixture(301, () => false);
+    const launch = vi.fn(async (_file: string, _config: ResidentHostConfig) => {});
+    const overflow = path.join(f.mesh.root, "wake-overflow");
+    const quarantine = path.join(f.root, "acknowledged-overflow");
+    fs.mkdirSync(overflow, { recursive: true });
+    fs.mkdirSync(quarantine);
+    // Journal roots precede overflow; the live root is selected from the REAL
+    // second page, independent of filesystem enumeration order.
+    fs.writeFileSync(residentWakeIndexPath(f.mesh.root), f.residents.slice(0, RESIDENT_WAKE_INDEX_MAX_ROOTS).map((config, n) =>
+      JSON.stringify({ format: 1, op: "pending", root: config.residencyRoot, delivery: { id: `pending-${n}`, sequence: n + 1 } }) + "\n").join(""));
+    for (const [n, config] of f.residents.entries()) {
+      if (n < RESIDENT_WAKE_INDEX_MAX_ROOTS) continue;
+      fs.writeFileSync(path.join(overflow, `${path.basename(config.residencyRoot)}.json`), JSON.stringify({
+        format: 1, op: "pending", root: config.residencyRoot, delivery: { id: `pending-${n}`, sequence: n + 1 },
+      }));
+    }
+    const reader = new ResidentWakeRecoveryReader(f.mesh.root);
+    reader.next();
+    const live = reader.next().pending.keys().next().value!;
+    reader.close();
+    const hiddenRoutes = new Set<string>();
+    for (const config of f.residents) {
+      if (config.residencyRoot === live) continue;
+      const file = path.join(config.residencyRoot, "wake-routes.json");
+      if (mode === "retired") fs.renameSync(file, `${file}.retired`);
+      else if (mode === "malformed") fs.writeFileSync(file, "not-json");
+      else hiddenRoutes.add(file);
+    }
+    const open = fs.openSync;
+    vi.spyOn(fs, "openSync").mockImplementation(((file: fs.PathLike, ...args: unknown[]) => {
+      if (hiddenRoutes.has(String(file))) throw Object.assign(new Error("unreadable route"), { code: "EACCES" });
+      return (open as (...args: unknown[]) => number)(file, ...args);
+    }) as typeof fs.openSync);
+    // #4664: prove product ACK calls and durable namespace changes, without
+    // running its native unlink. Only this fixture's overflow is quarantined.
+    const unlink = fs.unlinkSync;
+    const removed: string[] = [];
+    vi.spyOn(fs, "unlinkSync").mockImplementation(file => {
+      if (path.dirname(String(file)) !== overflow) return unlink(file);
+      removed.push(String(file));
+      fs.renameSync(file, path.join(quarantine, path.basename(String(file))));
+    });
+    try {
+      for (let n = 0; n < 8; n++) await maintenance(f.mesh, launch);
+      expect(launch).toHaveBeenCalledOnce();
+      expect(launch.mock.calls[0]?.[1]).toMatchObject({ residencyRoot: live });
+      const pending = residentUnacknowledgedDeliveries(f.mesh.root);
+      expect(pending.has(live)).toBe(false);
+      expect(pending.size).toBe(mode === "retired" ? 0 : 300);
+      expect(removed.length).toBe(mode === "retired" ? 173 : 1);
+      if (mode === "retired") expect(fs.readFileSync(residentWakeIndexPath(f.mesh.root), "utf8")).toContain('"op":"ack"');
+    } finally { f.close(); }
+  });
+
+  it.skipIf(process.platform === "win32").each([["cold", false], ["cold", true], ["warm", false], ["warm", true]] as const)(
+    "round2 publication rechecks live admission inside intent custody: %s, open=%s", async (state, staysOpen) => {
+      let allowed = false;
+      const f = fixture(1, () => allowed);
+      const config = f.residents[0]!;
+      const launch = vi.fn(async () => {});
+      const dispatch = wake.wakeResidentActors;
+      vi.spyOn(wake, "wakeResidentActors").mockImplementation((mesh, events, _launch, recovery, ...rest) =>
+        (dispatch as (...args: unknown[]) => Promise<void>)(mesh, events, launch, recovery, ...rest));
+      vi.spyOn(console, "warn").mockImplementation(() => {});
+      let release!: () => void;
+      try {
+        await f.mesh.publish({ topic: "stuck.delivery", from });
+        if (state === "warm") fs.writeFileSync(path.join(config.residencyRoot, "owner.json"), JSON.stringify({ pid: process.pid, token: "warm" }));
+        allowed = true;
+        let entered!: () => void;
+        const waiting = new Promise<void>(resolve => { entered = resolve; });
+        const held = new Promise<void>(resolve => { release = resolve; });
+        const lock = fileLock.lockFile;
+        vi.spyOn(fileLock, "lockFile").mockImplementation(async (...args) => {
+          const fd = await lock(...args);
+          if (args[0] === wake.residentWakeIntentLockPath(config.residencyRoot)) { entered(); await held; }
+          return fd;
+        });
+        const publishing = f.mesh.publish({ topic: "stuck.delivery", from });
+        await waiting;
+        expect(fs.existsSync(wake.residentWakeRequestPath(config.residencyRoot))).toBe(false);
+        allowed = staysOpen;
+        release();
+        await publishing;
+        expect(fs.existsSync(wake.residentWakeRequestPath(config.residencyRoot))).toBe(staysOpen);
+        expect(launch).toHaveBeenCalledTimes(staysOpen && state === "cold" ? 1 : 0);
+        expect(residentUnacknowledgedDeliveries(f.mesh.root).size).toBe(staysOpen ? 0 : 1);
+        expect(fs.existsSync(path.join(config.residencyRoot, "wake-failure.json"))).toBe(false);
+      } finally { release?.(); f.close(); }
+    });
+
+  it.skipIf(process.platform === "win32").each([false, true])("round2 direct helper rechecks live admission during custody, open=%s", async staysOpen => {
+    const f = fixture(1);
+    const config = f.residents[0]!;
+    const saved = { ...config, fabricExtensionPath: path.join(f.root, "extension.js") };
+    fs.writeFileSync(path.join(config.residencyRoot, "config.json"), JSON.stringify(saved));
+    const routesFile = path.join(config.residencyRoot, "wake-routes.json");
+    const routes = JSON.parse(fs.readFileSync(routesFile, "utf8"));
+    fs.writeFileSync(routesFile, JSON.stringify({ ...routes, configJson: canonicalResidentWakeConfig(saved) }));
+    let allowed = true;
+    let release!: () => void;
+    let entered!: () => void;
+    const waiting = new Promise<void>(resolve => { entered = resolve; });
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const exclusive = vi.fn(async <T>(operation: () => T): Promise<T> => f.mesh.exclusive(operation));
+    const lock = fileLock.lockFile;
+    vi.spyOn(fileLock, "lockFile").mockImplementation(async (...args) => {
+      const fd = await lock(...args);
+      if (args[0] === wake.residentWakeIntentLockPath(config.residencyRoot)) {
+        entered(); await held;
+        // A competing owner becomes warm while intent custody is held: the
+        // open-gate counterexample needs no native child to cover the request.
+        fs.writeFileSync(path.join(config.residencyRoot, "owner.json"), JSON.stringify({ pid: process.pid, token: "direct" }));
+      }
+      return fd;
+    });
+    try {
+      const direct = (wake.wakeDormantActor as (root: string, id: string, admission: { allowed: () => boolean; exclusive: typeof exclusive }) => Promise<boolean>)(
+        f.mesh.root, "actor-0", { allowed: () => allowed, exclusive });
+      await waiting;
+      expect(fs.existsSync(wake.residentWakeRequestPath(config.residencyRoot))).toBe(false);
+      allowed = staysOpen;
+      release();
+      if (staysOpen) expect(await direct).toBe(true);
+      else await expect(direct).rejects.toThrow("admission closed");
+      expect(fs.existsSync(wake.residentWakeRequestPath(config.residencyRoot))).toBe(staysOpen);
+      expect(exclusive).toHaveBeenCalledOnce();
+    } finally { release?.(); f.close(); }
+  });
   it.each([1, 3, 10])("unrelated publication does not await %i ConfigMismatch-style failed roots", async count => {
     const f = fixture(count);
     let slow = false;

@@ -519,7 +519,7 @@ export class MeshStore {
     if (!events.length || !this.#canWakeResidents() || !fs.existsSync(path.join(this.root, "residency"))) return;
     try {
       const { wakeResidentActors } = await import("../residency/wake.js");
-      await wakeResidentActors(this, events);
+      await wakeResidentActors(this, events, undefined, undefined, () => this.#canWakeResidents());
     } catch (error) {
       // Already committed: throwing would invite a duplicate publish. The durable pending
       // index and archived event survive even without a wake request; scoped startup,

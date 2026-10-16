@@ -51,6 +51,12 @@ const fixture = () => {
   const host = new ResidentHost(config, idle);
   return { root, config, host, idle };
 };
+const wakeAdmission = (config: ResidentHostConfig) => {
+  const mesh = new MeshStore(config.meshRoot, config.mesh.maxEventBytes, config.mesh.maxReadEvents);
+  let open = true; // This independent publisher, not the sleeping host, owns admission.
+  return { admission: { allowed: () => open, exclusive: mesh.exclusive.bind(mesh) },
+    close: () => { open = false; mesh.closeState(); } };
+};
 const fillWakeCapacity = (config: ResidentHostConfig): string[] => {
   const residents: string[] = [];
   for (let n = 0; n < 128; n++) {
@@ -79,9 +85,9 @@ describe("resident dormancy (smarty-dev#6782 / #2264)", () => {
   it("preserves ordinary empty-host idle exit without a persisted restart config", async () => {
     const { root, config, host, idle } = fixture();
     fs.rmSync(path.join(config.residencyRoot, "config.json"));
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
       await host.start();
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
       let now = Date.now();
       vi.spyOn(Date, "now").mockImplementation(() => now);
       await sleep(150); // An empty dead-root host retires after its continuous window (#683).
@@ -95,6 +101,7 @@ describe("resident dormancy (smarty-dev#6782 / #2264)", () => {
     const { root, config, host } = fixture();
     const file = path.join(config.residencyRoot, "config.json");
     const launch = vi.fn(async () => {});
+    const publisher = wakeAdmission(config);
     try {
       await host.start();
       const actor = await host.actors.create({ name: "config-fenced", instructions: "wait", residency: "durable" });
@@ -109,8 +116,8 @@ describe("resident dormancy (smarty-dev#6782 / #2264)", () => {
       };
       fs.writeFileSync(file, field === "unreadable" ? "{invalid json" : JSON.stringify(changed));
       expect(routesAt(config.residencyRoot)).toBeUndefined();
-      await expect(requestResidentWake(config.residencyRoot, { id: "refused" }, launch)).rejects.toBeInstanceOf(ResidentWakeConfigMismatch);
-      await expect(requestResidentWake(config.residencyRoot, { id: "refused" }, launch)).rejects.toMatchObject({
+      await expect(requestResidentWake(config.residencyRoot, { id: "refused" }, launch, undefined, publisher.admission)).rejects.toBeInstanceOf(ResidentWakeConfigMismatch);
+      await expect(requestResidentWake(config.residencyRoot, { id: "refused" }, launch, undefined, publisher.admission)).rejects.toMatchObject({
         code: "RESIDENT_WAKE_CONFIG_MISMATCH", root: config.residencyRoot,
       });
       if (process.platform !== "win32") {
@@ -122,13 +129,14 @@ describe("resident dormancy (smarty-dev#6782 / #2264)", () => {
       expect(fs.existsSync(path.join(config.residencyRoot, "owner.json"))).toBe(false);
       // Identical canonical config, even with reordered object keys, admits the ordinary wake.
       fs.writeFileSync(file, JSON.stringify(Object.fromEntries(Object.entries(config).reverse())));
-      await requestResidentWake(config.residencyRoot, { id: "accepted" }, launch);
+      await requestResidentWake(config.residencyRoot, { id: "accepted" }, launch, undefined, publisher.admission);
       expect(launch).toHaveBeenCalledOnce();
-    } finally { await host.close(); vi.restoreAllMocks(); fs.rmSync(root, { recursive: true, force: true }); }
+    } finally { publisher.close(); await host.close(); vi.restoreAllMocks(); fs.rmSync(root, { recursive: true, force: true }); }
   });
 
   it("checkpoints the dormant wake receiver with a Windows-compatible file flush handle", async () => {
     const { root, config, host } = fixture();
+    const publisher = wakeAdmission(config);
     try {
       await host.start();
       const actor = await host.actors.create({ name: "flush-receiver", instructions: "wait", residency: "durable" });
@@ -146,9 +154,9 @@ describe("resident dormancy (smarty-dev#6782 / #2264)", () => {
       expect(new ActorRegistryStore(config.actorRoot).records().find(row => row.id === actor.id)?.status).toBe("dormant");
       await host.close();
       const launch = vi.fn(async () => {});
-      await requestResidentWake(config.residencyRoot, { id: "after-flush" }, launch);
+      await requestResidentWake(config.residencyRoot, { id: "after-flush" }, launch, undefined, publisher.admission);
       expect(launch).toHaveBeenCalledOnce();
-    } finally { vi.restoreAllMocks(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
+    } finally { publisher.close(); vi.restoreAllMocks(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
   });
 
   it.skipIf(process.platform === "win32")("rechecks exact config before every delivery-owned successor", async () => {
@@ -170,13 +178,14 @@ describe("resident dormancy (smarty-dev#6782 / #2264)", () => {
     const { root, config, host } = fixture();
     const file = path.join(config.residencyRoot, "config.json");
     const launch = vi.fn(async () => {});
+    const publisher = wakeAdmission(config);
     try {
       await expect(requestResidentWake(config.residencyRoot, { id: "committed", sequence: 8 }, launch, async () => {
         fs.writeFileSync(file, JSON.stringify({ ...config, actorRoot: path.join(root, "racing-actors") }));
-      })).rejects.toMatchObject({ code: "RESIDENT_WAKE_CONFIG_MISMATCH" });
+      }, publisher.admission)).rejects.toMatchObject({ code: "RESIDENT_WAKE_CONFIG_MISMATCH" });
       expect(launch).not.toHaveBeenCalled();
       expect(readWakeJson<{ id: string }>(residentWakeRequestPath(config.residencyRoot))?.id).toBe("committed");
-    } finally { await host.close(); vi.restoreAllMocks(); fs.rmSync(root, { recursive: true, force: true }); }
+    } finally { publisher.close(); await host.close(); vi.restoreAllMocks(); fs.rmSync(root, { recursive: true, force: true }); }
   });
 
 

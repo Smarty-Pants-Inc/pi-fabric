@@ -459,7 +459,8 @@ describe("actor window batching on the durable receiver path", () => {
     try {
       expect(f.actors.status(actor.id).queued).toBe(0);
       expect(f.snapshot(actor.id).items.map(item => item.payload.id)).toEqual(events.map(event => event.id));
-      expect(removals).toBe(1);
+      expect(removals).toBe(0);
+      expect(fs.readFileSync(file, "utf8")).toBe("");
     } finally { release(); }
     await settled(f.actors, actor.id);
     expect(f.runs).toHaveLength(1);
@@ -476,7 +477,7 @@ describe("actor window batching on the durable receiver path", () => {
     const letters = fs.readFileSync(file, "utf8").trim().split("\n").map(line => JSON.parse(line));
     expect(letters.map(letter => letter.event.id)).toEqual(events.slice(18).map(event => event.id));
     expect(letters.every(letter => letter.batchQueued === true)).toBe(true);
-    // Recorded removal only: preserve the backlog bytes under a private evidence name.
+    // Guard against deletion: an exhausted backlog must remain as an empty file.
     const remove = fs.rmSync;
     const removals: string[] = [];
     vi.spyOn(fs, "rmSync").mockImplementation((target, options) => {
@@ -492,7 +493,8 @@ describe("actor window batching on the durable receiver path", () => {
     expect(again.runs).toHaveLength(events.length);
     const delivered = again.runs.map(run => JSON.parse(run.task.slice(run.task.indexOf("\n\n") + 2)).payload.id);
     expect(delivered).toEqual(events.map(event => event.id));
-    expect(removals).toEqual([file]);
+    expect(removals).toEqual([]);
+    expect(fs.readFileSync(file, "utf8")).toBe("");
     const dir = path.join(again.mesh.root, "delivery-outcomes");
     const outcomes = fs.readdirSync(dir).flatMap(name => fs.readFileSync(path.join(dir, name), "utf8").trim().split("\n").map(line => JSON.parse(line)));
     expect(outcomes.filter(outcome => events.some(event => event.id === outcome.eventId)).map(outcome => [outcome.eventId, outcome.outcome]))
@@ -523,7 +525,8 @@ describe("actor window batching on the durable receiver path", () => {
     const subjects = again.runs.filter(run => run.task.includes('"ref": "same"'));
     expect(subjects).toHaveLength(1);
     expect(subjects[0]!.task).toContain('"marker": 2');
-    expect(removals).toEqual([file]);
+    expect(removals).toEqual([]);
+    expect(fs.readFileSync(file, "utf8")).toBe("");
     const dir = path.join(again.mesh.root, "delivery-outcomes");
     const outcomes = fs.readdirSync(dir).flatMap(name => fs.readFileSync(path.join(dir, name), "utf8").trim().split("\n").map(line => JSON.parse(line)));
     expect(outcomes.filter(outcome => events.some(event => event.id === outcome.eventId)).map(outcome => [outcome.eventId, outcome.outcome]))

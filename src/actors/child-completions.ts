@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import fs, { type FSWatcher } from "node:fs";
 import path from "node:path";
+import { diagnostics } from "../core/diagnostics.js";
 import { syncDirectoryChain, withExclusiveFileLock, writeJsonAtomic } from "../core/atomic-write.js";
 import { ChildCompletionClaimLostError } from "../result-consumption.js";
 export { ChildCompletionClaimLostError } from "../result-consumption.js";
@@ -97,7 +98,7 @@ export class ActorChildCompletionWatch {
       this.#unavailable = true;
       if (!this.#warnedUnavailable) {
         this.#warnedUnavailable = true;
-        console.warn(`[pi-fabric] observation-degraded: child completion watch unavailable for ${this.directory}; using bounded 60 s durable-source scan/re-arm until native observation recovers`);
+        diagnostics.warn("src/actors/child-completions.ts", `[pi-fabric] observation-degraded: child completion watch unavailable for ${this.directory}; using bounded 60 s durable-source scan/re-arm until native observation recovers`);
       }
       this.#scheduleDegraded();
       return;
@@ -256,7 +257,7 @@ export class ActorChildCompletionStore {
     if (refused && !includedRefused) include(refused);
     const signature = `${unsafe}:${digest.toString("hex")}`;
     if (additional && signature !== this.#overflowSignature) {
-      console.warn(`[pi-fabric] ${additional} additional unsafe child completion entries retained, not read; individual warning limit ${MAX_WARNING_ENTRIES} reached in ${this.directory}`);
+      diagnostics.warn("src/actors/child-completions.ts", `[pi-fabric] ${additional} additional unsafe child completion entries retained, not read; individual warning limit ${MAX_WARNING_ENTRIES} reached in ${this.directory}`);
     }
     this.#overflowSignature = unsafe ? signature : undefined;
   }
@@ -295,7 +296,7 @@ export class ActorChildCompletionStore {
         if (!this.#warnedEntries.has(file)) {
           if (this.#warnedEntries.size < MAX_WARNING_ENTRIES) {
             this.#warnedEntries.add(file);
-            console.warn(`[pi-fabric] unsafe child completion entry retained, not read: ${file}`);
+            diagnostics.warn("src/actors/child-completions.ts", `[pi-fabric] unsafe child completion entry retained, not read: ${file}`);
           } else this.#warnOverflow(undefined, file);
         }
         throw error instanceof UnsafeCompletionEntry ? error : new UnsafeCompletionEntry("no-follow open refused");

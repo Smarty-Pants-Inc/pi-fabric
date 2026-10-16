@@ -11,6 +11,7 @@ import { residentRoot, type ResidentHostConfig } from "../src/residency/protocol
 import { MeshStore } from "../src/mesh/store.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { readParticipantFile } from "../src/topology/participant-files.js";
+import * as participantFiles from "../src/topology/participant-files.js";
 import { readHostLease } from "../src/topology/host-leases.js";
 
 const waitFor = async (predicate: () => boolean, boundMs: number, label: string) => {
@@ -21,7 +22,15 @@ const waitFor = async (predicate: () => boolean, boundMs: number, label: string)
   }
 };
 
-it("#4383 real resident actor envelopes renew on every heartbeat through another process's 30 s registry hold", async () => {
+/** Save public status on disk without flushing its presence before the heartbeat. */
+const stageStop = async (host: ResidentHost, id: string) => {
+  const refresh = vi.spyOn(host.participants, "refreshPresence").mockResolvedValue();
+  const schedule = vi.spyOn(host.participants, "scheduleRefresh").mockImplementation(() => {});
+  try { await host.actors.stop(id); }
+  finally { refresh.mockRestore(); schedule.mockRestore(); }
+};
+
+it("#13645 a host lease advances through a 30 s registry hold without rewriting unchanged actor envelopes", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "resident-registry-outage-"));
   const identity = { id: "session:outage", name: "Main", kind: "main" as const, sessionId: "outage" };
   const config: ResidentHostConfig = {
@@ -53,7 +62,15 @@ it("#4383 real resident actor envelopes renew on every heartbeat through another
     await host.participants.refresh();
     await new Promise(resolve => setTimeout(resolve, 1_100)); // drain creation's change-only publication
     const keys = actors.map(actor => "topology/participants/" + createHash("sha256").update(actor.id).digest("hex"));
-    const before = keys.map(key => readParticipantFile(config.meshRoot, key)!.updatedAt);
+    const before = keys.map(key => readParticipantFile(config.meshRoot, key)!);
+    const presenceKeys = actors.map(actor => `actors/${config.sessionId}/${actor.id}`);
+    const beforePresence = presenceKeys.map(key => host.mesh.get(key, { fresh: true })!);
+    const beforeShared = keys.map(key => host.mesh.get(key, { fresh: true }));
+    const fence = vi.spyOn(host.participants.options, "withPublicationFence");
+    // An idle round can confirm without registry custody; deliberately select a
+    // real public actor effect so this round must wait for the foreign holder.
+    await stageStop(host, actors[0]!.id);
+    expect(keys.map(key => readParticipantFile(config.meshRoot, key))).toEqual(before);
     const lock = path.join(config.actorRoot, "actors.json.lock");
     // A genuine foreign PID owns the existing registry protocol. No fake timers,
     // mocked lock, accelerated clock, or manual refresh can make this test pass.
@@ -71,23 +88,35 @@ it("#4383 real resident actor envelopes renew on every heartbeat through another
     holder.stderr!.on("data", chunk => { stderr += chunk; });
     await waitFor(() => ready, 3_000, "foreign registry holder starts");
     const confirmed = host.participants.confirmedAt();
-    let previous = before;
+    let previous = readHostLease(config.meshRoot, host.hostId)!.updatedAt;
     for (let tick = 0; tick < 5; tick++) {
-      await waitFor(() => keys.every((key, index) => (readParticipantFile(config.meshRoot, key)?.updatedAt ?? 0) > previous[index]!),
-        7_000, `independent automatic actor renewal ${tick + 1}`);
-      previous = keys.map(key => readParticipantFile(config.meshRoot, key)!.updatedAt);
+      await waitFor(() => (readHostLease(config.meshRoot, host.hostId)?.updatedAt ?? 0) > previous,
+        7_000, `automatic host lease renewal ${tick + 1}`);
+      const lease = readHostLease(config.meshRoot, host.hostId)!;
+      expect(lease.updatedAt).toBeGreaterThan(previous);
+      expect(lease.expiresAt).toBeGreaterThan(Date.now());
+      previous = lease.updatedAt;
       expect(fs.existsSync(lock)).toBe(true);
-      expect(readHostLease(config.meshRoot, host.hostId)!.updatedAt).toBeGreaterThan(confirmed);
+      expect(keys.map(key => readParticipantFile(config.meshRoot, key))).toEqual(before);
+      expect(keys.map(key => host.mesh.get(key, { fresh: true }))).toEqual(beforeShared);
+      expect(presenceKeys.map(key => host.mesh.get(key, { fresh: true }))).toEqual(beforePresence);
       for (const actor of actors) expect(observer.get(actor.id, Date.now(), { fresh: true })).toMatchObject({ stale: false, ownerHostId: host.hostId });
       // Liveness is not shared admission: the registry outage cannot falsely
       // advance the confirmed shared heartbeat while its fence is inaccessible.
       expect(host.participants.confirmedAt()).toBe(confirmed);
     }
+    expect(fence.mock.calls.some(([, ids]) => ids?.has(actors[0]!.id))).toBe(true);
     expect(await exited).toEqual({ code: 0, signal: null });
     expect(stderr).toBe("");
     expect(fs.existsSync(lock)).toBe(false);
     await host.participants.refresh();
     expect(host.participants.confirmedAt()).toBeGreaterThan(confirmed);
+    expect(readParticipantFile(config.meshRoot, keys[0]!)?.value).toMatchObject({ status: "stopped" });
+    expect(host.mesh.get(presenceKeys[0]!, { fresh: true })?.value).toMatchObject({ status: "stopped" });
+    for (let index = 1; index < actors.length; index++) {
+      expect(readParticipantFile(config.meshRoot, keys[index]!)).toEqual(before[index]);
+      expect(host.mesh.get(presenceKeys[index]!, { fresh: true })).toEqual(beforePresence[index]);
+    }
     const registry = new ActorRegistryStore(config.actorRoot);
     // A durable adoption without successor publication immediately invalidates
     // cached renewal; a full round also removes this predecessor's old envelope.
@@ -97,44 +126,41 @@ it("#4383 real resident actor envelopes renew on every heartbeat through another
     expect(readParticipantFile(config.meshRoot, keys[0]!)).toBeUndefined();
     expect(host.actors.owns(actors[0]!.id)).toBe(false);
 
-    // Fence a delayed renewal at its actual per-key decision, not just at timer
-    // selection. Rotate the token while retaining the root: a root-only guard
-    // would incorrectly renew this predecessor generation.
-    const keyLock = path.join(config.meshRoot, "participants", ".locks", keys[1]!.split("/").at(-1)!);
-    // Arm only under this test's registry custody (smarty-dev#6956). The host's
-    // interval renewal lane acquires this key on its own; if it rotated the
-    // lineage before we held the registry, the host's next fenced publication
-    // could remove the predecessor envelope before the assertion below reads it.
-    let armed = false, rotated = false;
-    let atRotation: ReturnType<typeof readParticipantFile>;
-    let delayedRenewal: Promise<void> | undefined;
-    const rename = fs.renameSync.bind(fs);
-    const receipt = vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
-      rename(from, to);
-      if (armed && !rotated && String(to) === keyLock) {
-        rotated = true;
-        // The envelope as the delayed renewal found it, read under its key receipt.
-        atRotation = readParticipantFile(config.meshRoot, keys[1]!);
-        registry.write(registry.records().map(row => row.id === actors[1]!.id
-          ? { ...row, adoptedAt: Date.now(), adoptedFrom: ["previous-generation"] } : row), { durable: true });
-      }
+    // Delay a real changed copy, then rotate its token without moving its root.
+    // The per-key decision must refuse the predecessor even without a successor file.
+    host.participants.suspend();
+    const key = keys[1]!, copyBefore = readParticipantFile(config.meshRoot, key)!;
+    await stageStop(host, actors[1]!.id);
+    let copying = false, release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const write = participantFiles.writeParticipantFileIf;
+    const receipt = vi.spyOn(participantFiles, "writeParticipantFileIf").mockImplementation(async (...args) => {
+      if (args[1] === key && !copying) { copying = true; await gate; }
+      return write(...args);
     });
+    const delayedCopy = host.participants.refresh().catch(error => error);
     try {
-      await registry.withLock(async () => {
-        armed = true;
-        delayedRenewal = host.participants.refresh();
-        // The refresh may join a renewal lane already past this key; the next
-        // interval tick then takes it. Bound by the renewal cadence, not a sleep.
-        await waitFor(() => rotated, 10_000, "lineage rotation between key acquisition and renewal write");
-        expect(atRotation).toBeDefined();
-        // No fenced publication can remove it while we hold the registry, and the
-        // rotated lineage must veto the renewal write at its per-key decision.
-        expect(readParticipantFile(config.meshRoot, keys[1]!)?.updatedAt).toBe(atRotation!.updatedAt);
-      });
-    } finally { receipt.mockRestore(); }
-    await delayedRenewal;
-    expect(readParticipantFile(config.meshRoot, keys[1]!)).toBeUndefined();
-    expect(host.actors.owns(actors[1]!.id)).toBe(false);
+      await waitFor(() => copying, 3_000, "changed publication reaches its participant-file copy");
+      expect(fs.existsSync(path.join(lock, "owner"))).toBe(false);
+      expect(host.mesh.get(key, { fresh: true })?.value).toMatchObject({ status: "stopped" });
+      expect(readParticipantFile(config.meshRoot, key)).toEqual(copyBefore);
+      await registry.withLock(() => registry.write(registry.records().map(row => row.id === actors[1]!.id
+        ? { ...row, adoptedAt: Date.now(), adoptedFrom: ["previous-generation"] } : row), { durable: true }));
+      const rotated = registry.records().find(row => row.id === actors[1]!.id)!;
+      expect(rotated.rootId).toBe(config.rootId);
+      expect(JSON.stringify([rotated.rootId, rotated.adoptedAt ?? null, rotated.adoptedFrom ?? []]))
+        .not.toBe((copyBefore.value as { actorOwnershipToken?: string }).actorOwnershipToken);
+      release();
+      expect(await delayedCopy).toBeUndefined();
+      expect(readParticipantFile(config.meshRoot, key)).toEqual(copyBefore);
+      receipt.mockRestore();
+      await host.participants.refresh();
+      expect(readParticipantFile(config.meshRoot, key)).toBeUndefined();
+      expect(host.mesh.get(key, { fresh: true })).toBeUndefined();
+      expect(host.actors.owns(actors[1]!.id)).toBe(false);
+      await host.close();
+      expect(registry.records().find(row => row.id === actors[1]!.id)).toEqual(rotated);
+    } finally { release(); await delayedCopy; receipt.mockRestore(); }
   } finally {
     vi.restoreAllMocks();
     if (holder?.exitCode === null && holder.signalCode === null) holder.kill("SIGTERM");

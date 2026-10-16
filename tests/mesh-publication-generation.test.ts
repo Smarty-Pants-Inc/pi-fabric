@@ -202,7 +202,7 @@ describe.each(["sqlite", "file"] as const)("publication generation follows the a
     } as any);
     await actors.setNice(actor.id, 7);
     // Unchanged: the first validation passes. Changed: it fails, and a fresh selection commits.
-    expect(outcomes[0]).toBe(!changed);
+    expect(outcomes[0]).toBe(changed ? "ownership" : true);
     expect(outcomes.at(-1)).toBe(true);
     expect(firstValidationFullReads).toBe(0);
     expect(new ActorRegistryStore(path.join(dir, "actors")).records().find(row => row.id === actor.id)?.nice).toBe(7);

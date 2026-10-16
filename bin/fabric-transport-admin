@@ -1,0 +1,9 @@
+#!/usr/bin/env node
+import { runTransportAdmin } from "../dist/transport/nats/index.js";
+
+try {
+  process.exitCode = await runTransportAdmin(process.argv.slice(2));
+} catch (error) {
+  process.stderr.write(`fabric-transport-admin: ${error instanceof Error ? error.message : String(error)}\n`);
+  process.exitCode = 1;
+}

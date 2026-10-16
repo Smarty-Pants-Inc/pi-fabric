@@ -785,6 +785,14 @@ interface FabricActorActivationPolicy {
   /** Non-negative safe integer milliseconds; omitted activation or 0 is off. Pending retains its original boundary on restart. */
   minIntervalMs: number;
 }
+/** Leading-edge batching of original event envelopes; 0 is the single-event default. */
+interface FabricActorBatching {
+  batchWindowMs?: number;
+  /** Maximum 1000; default 50. */
+  batchMax?: number;
+  /** Aggregate serialized event/image bytes; default 256 KiB. Single oversized events run alone. */
+  batchMaxBytes?: number;
+}
 /** Exactly one instruction source; file bytes are verified on the owning host. */
 type FabricActorInstructionsSource =
   | { instructions: string; instructionsFile?: never; sha256?: never }
@@ -794,7 +802,7 @@ interface FabricActorSlotClaim {
   key: string;
   ifVersion: number;
 }
-interface FabricActorRequestBase {
+interface FabricActorRequestBase extends FabricActorBatching {
   /** Deduplicate durable creates on the same host; reuse for retries within 10 minutes (last 256 results). */
   idempotencyKey?: string;
   /** Reuse the exact won revision with the same retry identity; never refresh after uncertainty. */
@@ -869,7 +877,7 @@ type FabricActorTemplate = Omit<FabricActorRequestBase, "validWhile" | "timeout_
 };
 // Mirror actors/types.ts: guest programs use the same live actor states and diagnostics.
 type FabricActorStatus = "dormant" | "idle" | "queued" | "preparing" | "waiting" | "running" | "stopped" | "failed" | "failing-preparation";
-interface FabricActorInfo {
+interface FabricActorInfo extends FabricActorBatching {
   /** Resolution marker (alias name or closest); does not replace the effective model. */
   via?: string;
   /** Canonical selection when via is present; session bindings may select a different model. */
@@ -1157,7 +1165,10 @@ interface FabricAgentsApi {
   setNice(args: { id: string; nice: number; scope?: "project" | "global" }): Promise<FabricActorInfo>;
   setInferenceContext(args: { id: string; inferenceContext: "full-history" | "activation"; scope?: "project" | "global" }): Promise<FabricActorInfo>;
   setCoalesceKey(args: { id: string; coalesceKey: string | null; scope?: "project" | "global" }): Promise<FabricActorInfo>;
+  setBatching(args: FabricActorBatching & { id: string; scope?: "project" | "global" }): Promise<FabricActorInfo>;
   setActivationFilter(args: { id: string; activationFilter: FabricActorActivationFilter | null; expiresAt?: number; scope?: "project" | "global" }): Promise<FabricActorInfo>;
+  /** Replace ordinary actor mesh topics; [] stops topic intake without discarding accepted work. Native slot-bound topics are immutable. Live actors require the local owner; global updates only the template. */
+  setTopics(args: { id: string; topics: string[]; scope?: "project" | "global" }): Promise<FabricActorInfo>;
   setEvents(args: { id: string; events: FabricActorHostEvent[] }): Promise<FabricActorInfo>;
   setDeliveryPolicy(args: {
     id: string;

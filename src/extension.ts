@@ -1,5 +1,6 @@
 import type { Usage } from "@earendil-works/pi-ai";
 import { registerMainProviderRecovery } from "./main-provider-recovery.js";
+import { configureFabricDiagnostics, diagnostics, isPrincipalDiagnostics, notifyDiagnostic, setPrewalkStatus } from "./core/diagnostics.js";
 import { extensionContextLive } from "./session-liveness.js";
 import { registerIncomingMessageRenderers } from "./ui/incoming-messages.js";
 import { principalViewIncomingMode, registerPrincipalView } from "./ui/principal-view.js";
@@ -569,7 +570,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     const skipReason = await autoArmFabricPrewalk(state, context, pi);
     if (!skipReason || prewalkAutoArmNoticeShown || !context.hasUI) return;
     prewalkAutoArmNoticeShown = true;
-    context.ui.notify(skipReason, "warning");
+    notifyDiagnostic(context, "src/extension.ts", skipReason, "warning");
   };
 
   const cleanupActivationSideEffects = (): void => {
@@ -679,7 +680,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
         retry = true;
       } else {
         // Advisory evidence cannot gate the normal-form compiler.
-        console.warn(`[pi-fabric] observation pool update failed: ${error instanceof Error ? error.message : String(error)}`);
+        diagnostics.warn("src/extension.ts", `[pi-fabric] observation pool update failed: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
     if (!current()) return false;
@@ -702,7 +703,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
           setActiveCompiledSurface(saved.file);
           const previousScore = comparableCompiledSurfaceScore(loaded.file, saved.file.metricVersion);
           if (previousScore !== undefined && outcome.report.score < previousScore && context.hasUI) {
-            context.ui.notify(formatEntropyCompileNotice({
+            notifyDiagnostic(context, "src/extension.ts", formatEntropyCompileNotice({
               beforeScore: previousScore,
               afterScore: outcome.report.score,
               normalizations: saved.file.normalizations?.length ?? 0,
@@ -738,7 +739,8 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
         retry = await compileEntropyNow(request.context, request.epoch, request.signal);
       } catch (error) {
         if (request.signal.aborted || !extensionContextLive(request.context)) return;  // shutdown or dispose
-        console.warn(
+        diagnostics.warn(
+          "src/extension.ts",
           `[pi-fabric] entropy compile failed: ${
             error instanceof Error ? error.message : String(error)
           }`,
@@ -917,6 +919,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
   };
 
   pi.on("session_start", async (event, context) => {
+    configureFabricDiagnostics(context.sessionManager?.getSessionId?.() ?? "");
     await sealScope();
     // Retire the previous session's delayed work, then reopen entropy for this one.
     retireSessionTimers();
@@ -924,7 +927,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     fabricPrewarm = undefined;
     // The pre-reload warning leaves with the redraw; say it again where the user can read it (smarty-dev#1882).
     const reloadNotice = takeReloadStoppedNotice(context.sessionManager?.getSessionId?.() ?? "", event?.reason ?? "");
-    if (reloadNotice && context.hasUI) context.ui.notify(reloadNotice, "warning");
+    if (reloadNotice && context.hasUI) notifyDiagnostic(context, "src/extension.ts", reloadNotice, "warning");
     inboxWake.context = context;
     inboxWake.armed = true;
     pendingHandoffs.clear();
@@ -940,8 +943,8 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
       compatibilityWarningShown = true;
       const warning = piHostCompatibilityWarning();
       if (warning) {
-        console.warn(`[pi-fabric] ${warning}`);
-        if (context.hasUI) context.ui.notify(warning, "warning");
+        diagnostics.warn("src/extension.ts", `[pi-fabric] ${warning}`);
+        if (context.hasUI) notifyDiagnostic(context, "src/extension.ts", warning, "warning");
       }
     }
     state.thinking.invalidate();
@@ -957,7 +960,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
       try {
         await state.thinking.enforceBounds(context);
       } catch (error) {
-        console.warn(`[pi-fabric] thinking bounds: ${error instanceof Error ? error.message : String(error)}`);
+        diagnostics.warn("src/extension.ts", `[pi-fabric] thinking bounds: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
     // bootstrap() cancels any live arm; the borrowed Main model survives so a
@@ -973,9 +976,9 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     try {
       if (selfReloaded && context.hasUI) {
         const notice = `${selfReloaded.owner ?? "Fabric"} reloaded: ${selfReloaded.old} → ${selfReloaded.new}`;
-        context.ui.notify(notice, "info");
+        notifyDiagnostic(context, "src/extension.ts", notice, "info");
         // Keep the notice after the TUI's own reload status line replaces it.
-        context.ui.setStatus(SELF_RELOAD_STATUS, notice);
+        context.ui.setStatus(SELF_RELOAD_STATUS, isPrincipalDiagnostics() ? undefined : notice);
       }
       const probeNonce = process.env.PI_FABRIC_RESIDENT_PROBE_NONCE;
       const residentProbe = Boolean(probeNonce && process.env.PI_FABRIC_RESIDENT_PROBE_WORKER_PID === String(process.ppid));
@@ -1037,7 +1040,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
       // Turn-scoped thinking overrides revert here, even before activation.
       await state.thinking.agentEnded(context);
     } catch (error) {
-      console.warn(`[pi-fabric] thinking revert failed: ${error instanceof Error ? error.message : String(error)}`);
+      diagnostics.warn("src/extension.ts", `[pi-fabric] thinking revert failed: ${error instanceof Error ? error.message : String(error)}`);
     }
     if (state.initialized) await state.publishHostLifecycle("pi.agent_end", event);
   });
@@ -1101,8 +1104,8 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     });
     if (!settledInPlace && state.prewalk.settleTask(sessionId)) {
       const status = state.prewalk.status();
-      context.ui.setStatus(
-        "fabric-prewalk",
+      setPrewalkStatus(
+        context,
         status.state === "armed" ? `armed → ${status.model}` : undefined,
       );
     }
@@ -1335,8 +1338,8 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
       fabricEngine,
     );
     if (warning) {
-      if (context.hasUI) context.ui.notify(warning, "warning");
-      else console.warn(`[pi-fabric] ${warning}`);
+      if (context.hasUI) notifyDiagnostic(context, "src/extension.ts", warning, "warning");
+      else diagnostics.warn("src/extension.ts", `[pi-fabric] ${warning}`);
     }
     if (!state.initialized) return;
     await state.publishHostLifecycle("pi.session_compact", event);
@@ -1654,7 +1657,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     let stopping = 0;
     try { stopping = state.initialized ? state.agents.runningCount() : 0; } catch { /* not initialized */ }
     if (stopping > 0 && context.hasUI) {
-      context.ui.notify(
+      notifyDiagnostic(context, "src/extension.ts",
         `${reason === "reload" ? "Reload" : "Shutdown"} stops ${stopping} running task agent${stopping === 1 ? "" : "s"}; ` +
           'each spawner gets a stopped result. Spawn with residency: "durable" to keep an agent across reloads.',
         "warning",
@@ -1698,8 +1701,8 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     if (foregroundNoticeSession === sessionId) return;
     foregroundNoticeSession = sessionId;
     const notice = `Fabric foreground policy ${formatForeground(foreground)}`;
-    if (context.hasUI) context.ui.notify(notice, "warning");
-    else console.warn(`[pi-fabric] ${notice}`);
+    if (context.hasUI) notifyDiagnostic(context, "src/extension.ts", notice, "warning");
+    else diagnostics.warn("src/extension.ts", `[pi-fabric] ${notice}`);
   });
 
   // A configured custom runner is kept even before its extension registers it
@@ -1720,8 +1723,8 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     const key = `${context.sessionManager?.getSessionId?.() ?? ""}\0${runner}`;
     if (runnerNoticeKey === key) return;
     runnerNoticeKey = key;
-    if (context.hasUI) context.ui.notify(notice, "warning");
-    else console.warn(`[pi-fabric] ${notice}`);
+    if (context.hasUI) notifyDiagnostic(context, "src/extension.ts", notice, "warning");
+    else diagnostics.warn("src/extension.ts", `[pi-fabric] ${notice}`);
   });
 
   pi.on("context_with_system", (event) => {

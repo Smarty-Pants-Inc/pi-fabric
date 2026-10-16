@@ -1,8 +1,10 @@
 import { invocationFabricPrincipal, snapshotFabricInvocation, fabricHostIdentity, fabricTurnProvenance, fabricWakeCause, withFabricWakeAdmission, type FabricWakeCause } from "../fabric-provenance.js";
+import { diagnostics } from "../core/diagnostics.js";
 import { createHash, randomUUID } from "node:crypto";
 import { actorInstructionsSource, resolveActorInstructions, assertActorInstructionReplacement } from "../actors/instructions-file.js";
 import { readTaskReturnAddress } from "../agents/task-return-address.js";
 import type { RouteEvaluate } from "../agents/model-route.js";
+import type { SpawnRouterAdmission } from "../agents/spawn-router.js";
 import type { JevRequest, JevResponse } from "../jev/types.js";
 import { formatAge, residentHostId, RESIDENT_HOST_FORMAT, ResidentOutcomeUnknownError, ResidentActorAuthorizationError, assertResidentActorMain, assertResidentActorToolCeiling, type ResidentActorCaller, type ResidentActorMutation } from "../residency/protocol.js";
 import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
@@ -10,7 +12,7 @@ import { ActorManager, ActorRegistryOwnershipError, parseBashTimeoutSeconds } fr
 import { slotAdmissionFor } from "../actors/slot-admission.js";
 import { participantProject, recordedProjectLead, repositoryOf, resolveProjectAgent } from "../topology/project-identity.js";
 import { GlobalActorRegistry } from "../actors/global-registry.js";
-import { isFabricActorHostEvent, normalizeActorActivation, validateActorCoalesceKey, validateActorDedupeKey, validateActorInferenceContext } from "../actors/types.js";
+import { isFabricActorHostEvent, FabricActorBatchPolicyError, normalizeActorActivation, normalizeActorBatching, validateActorCoalesceKey, validateActorDedupeKey, validateActorInferenceContext } from "../actors/types.js";
 import { normalizeActorSlotClaim } from "../actors/slot-claim.js";
 import { normalizeActorActivationFilter } from "../actors/activation-filter.js";
 import { normalizeActorRecords } from "../actors/records.js";
@@ -92,7 +94,6 @@ import {
 import {
   aliasThinking,
   FUZZY_RESOLUTION_MARKERS,
-  resolveAvailablePiModel,
   resolveFabricModel,
   type FabricModelCandidate,
 } from "../core/model-resolution.js";
@@ -338,6 +339,7 @@ const actorRequest = (
   validateActorCoalesceKey(args.coalesceKey);
   validateActorDedupeKey(args.dedupeKey);
   const activation = normalizeActorActivation(args.activation);
+  const batching = normalizeActorBatching(args);
   const slotClaim = normalizeActorSlotClaim(args.slotClaim);
   const activationFilter = args.activationFilter === undefined ? undefined : normalizeActorActivationFilter(args.activationFilter);
   const requestedKernel = checkedKernel(args.kernel);
@@ -375,6 +377,7 @@ const actorRequest = (
     ...(typeof args.coalesceKey === "string" ? { coalesceKey: args.coalesceKey } : {}),
     ...(typeof args.dedupeKey === "string" ? { dedupeKey: args.dedupeKey } : {}),
     ...(activation ? { activation } : {}),
+    ...batching,
     ...(activationFilter ? { activationFilter } : {}),
     ...(args.routeClass !== undefined ? { routeClass: args.routeClass as "status-groom" } : {}),
     ...(typeof args.protected === "boolean" ? { protected: args.protected } : {}),
@@ -447,6 +450,7 @@ export class AgentsProvider implements FabricProvider {
   readonly #router: AgentMessageRouter;
   readonly #projectLeadId: string | undefined;
   readonly #taskReturnAddress = readTaskReturnAddress();
+  readonly #creationAdmissions = new WeakMap<object, SpawnRouterAdmission>();
   readonly name = "agents";
   /** Session registry of `provider:` participants; stop/steer/followUp route there. */
   providerParticipants: ProviderParticipantRegistry | undefined;
@@ -483,7 +487,8 @@ export class AgentsProvider implements FabricProvider {
       DEFAULT_LIFECYCLE_COALESCE_MS,
       (target, batch) => this.#routeLifecycleBatch(target, batch),
       (target, batch, error) => {
-        console.warn(
+        diagnostics.warn(
+          "src/providers/agents-provider.ts",
           `[pi-fabric] lifecycle delivery to ${target} failed for ${batch.length} event(s): ` +
             (error instanceof Error ? error.message : String(error)),
         );
@@ -653,52 +658,26 @@ export class AgentsProvider implements FabricProvider {
 
   async #routeCreationDefault<T extends {
     model?: string; thinking?: AgentRunRequest["thinking"]; runner?: FabricAgentRunner;
-    name?: string; cwd?: string; complexity?: AgentRunRequest["complexity"];
+    task?: string; instructions?: string; sha256?: string;
+    name?: string; cwd?: string; complexity?: AgentRunRequest["complexity"]; residency?: AgentRunRequest["residency"];
   }>(kind: "spawn" | "actor", args: Record<string, unknown>, request: T, context: FabricInvocationContext): Promise<T> {
     const config = this.manager.config.router;
     if (config?.mode !== "shadow" && config?.mode !== "enforce") return request;
-    const self = this.participants.self();
-    const runner = request.runner ?? this.manager.config.runner;
-    const defaultModel = request.model ?? this.manager.defaultModel(runner);
-    const defaults = {
-      ...(defaultModel ? { model: defaultModel } : {}),
-      thinking: request.thinking ?? this.manager.config.thinking,
-    };
-    const { routeAgentCreation } = await import("../agents/spawn-router.js");
-    const selected = await routeAgentCreation({
-      config, meshRoot: this.actorManager.mesh.root, kind,
-      role: self.role ?? (kind === "actor" ? "actor" : "task-agent"),
-      ...(request.name !== undefined ? { name: request.name } : {}),
-      cwd: kind === "spawn" ? await this.manager.resolveCwd(request.cwd, context.signal) : this.manager.cwd,
-      project: self.projectRoot ?? self.project ?? this.manager.cwd,
-      ...(kind === "spawn" ? { task: String(args.task) }
-        : typeof args.instructions === "string" ? { task: args.instructions }
-        : typeof args.sha256 === "string" ? { taskDigest: args.sha256 } : {}),
-      parentId: self.id, defaults,
-      ...(request.complexity ? { complexity: request.complexity } : {}),
-      explicit: (typeof args.model === "string" && !!args.model.trim()) || args.thinking !== undefined,
-      validateModel: model => {
-        this.manager.assertModelAllowed(model, runner);
-        // Non-Pi configured backend defaults are known keys; otherwise require
-        // an exact visible Pi id/alias, never a ranked closest match or a refresh.
-        if (runner !== "pi" && model === this.manager.defaultModel(runner)) return model;
-        const resolved = resolveAvailablePiModel(model, {
-          aliases: this.modelsConfig().aliases,
-          available: context.extensionContext.modelRegistry.getAvailable().map(model => ({
-            provider: String(model.provider), id: String(model.id),
-          })), exact: true, closest: false,
-        });
-        const canonical = `${resolved.provider}/${resolved.id}`;
-        this.manager.assertModelAllowed(canonical, runner);
-        return canonical;
-      },
-      ...(context.signal ? { signal: context.signal } : {}),
-    });
-    if (!selected) return request;
-    // Routing is an indirect selection, not an explicit public model override.
-    const admitted = await this.#resolvePiModelArgs({ ...request, ...selected, modelSource: "route" }, context, runner, false,
-      kind === "actor" ? `actor:${(request.name ?? "").trim()}` : "task");
-    return { ...request, ...selected, ...admitted } as T;
+    const { routeProviderCreation } = await import("../agents/spawn-router.js");
+    const routed = await routeProviderCreation(this, kind, args, request, context);
+    if (!routed) return request;
+    this.#creationAdmissions.set(routed.request, routed.admission);
+    return routed.request;
+  }
+
+  async #recordCreationStartFailed(request: AgentRunRequest | FabricActorCreateRequest, kind: "spawn" | "actor"): Promise<void> {
+    const decisionId = (request as { spawnRouterDecisionId?: unknown }).spawnRouterDecisionId;
+    if (typeof decisionId !== "string" || !decisionId) return;
+    try {
+      const { recordSpawnRouterStartFailed } = await import("../agents/spawn-router.js");
+      await recordSpawnRouterStartFailed({ meshRoot: this.actorManager.mesh.root, decisionId,
+        admission: this.#creationAdmissions.get(request), spawnKind: kind, request, cwd: this.manager.cwd });
+    } catch { /* Ledger writes never change admission behavior. */ }
   }
 
   async #prepareSpawnRequest(args: Record<string, unknown>, context: FabricInvocationContext): Promise<AgentRunRequest> {
@@ -992,11 +971,14 @@ export class AgentsProvider implements FabricProvider {
       case "handoff":
         return this.handoff(args, context);
       case "spawn": {
-        const request = this.#applySeed(
-          args,
-          await this.#routeCreationDefault("spawn", args, await this.#prepareSpawnRequest(args, context), context),
-          context,
-        );
+        const routed = await this.#routeCreationDefault("spawn", args,
+          this.#applySeed(args, await this.#prepareSpawnRequest(args, context), context), context);
+        let handedOff = false;
+        const onDispatched = typeof (routed as { spawnRouterDecisionId?: unknown }).spawnRouterDecisionId === "string"
+          ? () => { handedOff = true; } : undefined;
+        try {
+        // Branch task bytes do not change, but transfer must use the router-selected model.
+        const request = args.seed === "branch" ? this.#applySeed(args, routed, context) : routed;
         if (request.residency === "durable") this.#assertUnconfinedDurable();
         const runner = request.runner ?? this.manager.config.runner;
         const transport = request.transport ?? this.manager.config.transport;
@@ -1027,9 +1009,22 @@ export class AgentsProvider implements FabricProvider {
             ? { thinkingBounds: this.manager.childThinkingBounds(request.thinkingBounds) }
             : {}),
         }, context.extensionContext.sessionManager?.getEntries?.() ?? []);
-        const handle = durableRequest.residency === "durable"
-          ? await this.#resident().spawnAgent(durableRequest, context.signal)
-          : await this.manager.spawn(durableRequest, isInteractiveMain(context.extensionContext) ? withoutMainExecutionCeiling(context.signal) : context.signal);
+        const resident = durableRequest.residency === "durable" ? this.#resident() : undefined;
+        let handle: AgentHandleInfo;
+        if (resident) {
+          // Resident custody begins only at publication, not client preparation.
+          handle = await (onDispatched ? resident.spawnAgent(durableRequest, context.signal, onDispatched)
+            : resident.spawnAgent(durableRequest, context.signal));
+        } else {
+          const signal = isInteractiveMain(context.extensionContext) ? withoutMainExecutionCeiling(context.signal) : context.signal;
+          const admission = this.#creationAdmissions.get(routed);
+          // Native admission owns preparation failures too; the provider must not consume twice.
+          handedOff = true;
+          handle = await (onDispatched
+            ? this.manager.spawn(durableRequest, signal,
+              undefined, undefined, undefined, undefined, undefined, undefined, admission)
+            : this.manager.spawn(durableRequest, signal));
+        }
         if (request.residency !== "durable") this.manager.detachSignal(handle.id);
         this.participants.scheduleRefresh();
         context.activity?.({
@@ -1042,6 +1037,10 @@ export class AgentsProvider implements FabricProvider {
           ...(request.routeDecision ? { routeDecision: request.routeDecision } : {}) };
         context.update(agentStartedMessage(receipt));
         return receipt;
+        } catch (error) {
+          if (!handedOff) await this.#recordCreationStartFailed(routed, "spawn");
+          throw error;
+        }
       }
       case "join":
       case "wait": {
@@ -1709,6 +1708,14 @@ export class AgentsProvider implements FabricProvider {
         if (args.scope === "global") return this.globalActors.update(String(args.id), { coalesceKey });
         return this.actorManager.setCoalesceKey(String(args.id), coalesceKey);
       }
+      case "setBatching": {
+        const batching = normalizeActorBatching(args);
+        if (!Object.keys(batching).length) throw new FabricActorBatchPolicyError("batchWindowMs, batchMax or batchMaxBytes is required");
+        if (args.scope === "global") return this.globalActors.update(String(args.id), batching);
+        const resident = await this.#residentActorOwner(String(args.id));
+        if (resident) return this.#setResidentActor(resident, { operation: "setBatching", id: resident.id, ...batching }, context);
+        return this.actorManager.setBatching(String(args.id), batching, checkCommit);
+      }
       case "setActivationFilter": {
         if (args.activationFilter === undefined) throw new Error("activationFilter is required (a list of presets or rules, or null to clear)");
         const activationFilter = args.activationFilter === null ? null : normalizeActorActivationFilter(args.activationFilter);
@@ -1722,6 +1729,17 @@ export class AgentsProvider implements FabricProvider {
         const resident = await this.#residentActorOwner(String(args.id), context.signal);
         if (resident) return this.#setResidentActor(resident, { operation: "setActivationFilter", id: resident.id, activationFilter, ...expiry }, context);
         return this.actorManager.setActivationFilter(String(args.id), activationFilter, checkCommit, expiresAt as number | undefined);
+      }
+      case "setTopics": {
+        if (args.scope !== undefined && args.scope !== "project" && args.scope !== "global") {
+          throw new Error(`Invalid Fabric actor topics scope: ${String(args.scope)}`);
+        }
+        if (!Array.isArray(args.topics) || [...args.topics].some((topic) => typeof topic !== "string")) {
+          throw new Error("topics must be an array of strings");
+        }
+        if (args.scope === "global") return this.globalActors.update(String(args.id), { topics: args.topics });
+        // Like setEvents, live subscription changes require this manager's ownership.
+        return this.actorManager.setTopics(String(args.id), args.topics);
       }
       case "setEvents": {
         const events = Array.isArray(args.events)
@@ -2006,6 +2024,11 @@ export class AgentsProvider implements FabricProvider {
   }
 
   async #createActor(request: FabricActorCreateRequest, context: FabricInvocationContext): Promise<FabricActorInfo> {
+    let handedOff = false;
+    const routerAdmission = this.#creationAdmissions.get(request);
+    const onDispatched = typeof (request as { spawnRouterDecisionId?: unknown }).spawnRouterDecisionId === "string"
+      ? () => { handedOff = true; } : undefined;
+    try {
     const { signal } = context;
     const checkCommit = (): void => throwIfExecutionExpired(context);
     checkCommit();
@@ -2022,6 +2045,7 @@ export class AgentsProvider implements FabricProvider {
       ...(kernel ? { kernel, pythonRuntime: this.manager.resolvePythonRuntime(request.pythonRuntime) } : {}),
       ...(principalScope ? { principalScope } : {}),
     };
+    if (routerAdmission) this.#creationAdmissions.set(request, routerAdmission);
     if (request.residency !== "durable") {
       // Reuse the host-originated outcome ledger for local actors too: publication
       // may await contended locks after the actor is already runnable/subscribed.
@@ -2053,7 +2077,9 @@ export class AgentsProvider implements FabricProvider {
         return outcome ??= new ResidentOutcomeUnknownError(command, decision, reason, signal);
       });
       try {
+        handedOff = true;
         return await this.actorManager.create(resolvedRequest, {
+          ...(routerAdmission ? { routerAdmission } : {}),
           // The protected native path invokes this synchronously at its final
           // validated SQL boundary, with the original ID on an exact retry.
           beforeCommit: (id, nativeBoundary) => {
@@ -2087,17 +2113,28 @@ export class AgentsProvider implements FabricProvider {
     // Even the first actor in an empty registry must use the authoritative
     // host's capability check and request fence. A local-create/cede path can
     // publish after cancellation with neither a decision nor a known-ID receipt.
-    if (this.residency) return this.residency.createActor(request, signal);
+    if (this.residency) return await (onDispatched ? this.residency.createActor(request, signal, onDispatched)
+      : this.residency.createActor(request, signal));
     const client = this.#residentActorClient();
     // Ordinary child handoffs need no protected caller metadata. The receiving
     // host still requires an authenticated caller for every protected topic,
     // including a request that omitted its required claim.
-    if (request.slotClaim === undefined) return client.createActor(request, signal);
-    return client.createActor(request, signal, {
-      identity: { ...this.actorManager.identity }, hostId: this.participants.self().ownerHostId,
+    if (!onDispatched && request.slotClaim === undefined) return await client.createActor(request, signal);
+    const self = this.participants.self();
+    const routerCaller = onDispatched ? { id: self.id, rootId: self.rootId, sessionId: self.sessionId ?? "",
+      ownerHostId: self.ownerHostId, ownerIdentityId: self.ownerIdentityId, kind: self.kind } : undefined;
+    if (request.slotClaim === undefined) return await client.createActor(request, signal, undefined, onDispatched, routerCaller);
+    const caller = {
+      identity: { ...this.actorManager.identity }, hostId: self.ownerHostId,
       ...(invocationFabricPrincipal(context) ? { principal: invocationFabricPrincipal(context) } : {}),
       ...(this.#toolCeiling === undefined ? {} : { toolCeiling: [...this.#toolCeiling] }),
-    });
+    };
+    return await (onDispatched ? client.createActor(request, signal, caller, onDispatched, routerCaller)
+      : client.createActor(request, signal, caller));
+    } catch (error) {
+      if (!handedOff) await this.#recordCreationStartFailed(request, "actor");
+      throw error;
+    }
   }
 
   #actorsWithLiveState(): FabricActorReadInfo[] {

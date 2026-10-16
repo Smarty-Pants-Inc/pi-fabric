@@ -23,6 +23,33 @@ const snapshot = (): FabricDashboardSnapshot => ({
 afterEach(() => vi.useRealTimers());
 
 describe("widget display-only completion retention", () => {
+  it.each([false, true])("suppresses direct principal rendering even with cached content and stable streaming=%s", stableWhileStreaming => {
+    vi.stubEnv("SMARTY_ROLE", "project-agent@x");
+    const current = snapshot();
+    current.main.status = "running";
+    current.agents = [{ ...agent("live-agent"), status: "running" }];
+    current.actors = [{ id: "actor", name: "advisor", status: "running",
+      worker: { ...agent("actor-worker"), status: "running" } } as FabricDashboardSnapshot["actors"][number]];
+    const widget = new FabricWidget(theme, () => current, 8, undefined, stableWhileStreaming);
+    try {
+      expect(shouldShowFabricWidget(current, "auto")).toBe(true);
+      expect(shouldShowFabricWidget(current, "always")).toBe(true);
+      const visible = widget.render(160);
+      expect(visible.join("\n")).toContain("live-agent");
+      expect(visible.join("\n")).toContain("advisor");
+      if (stableWhileStreaming) expect(visible).toHaveLength(8);
+
+      vi.stubEnv("SMARTY_ROLE", "org-agent@x");
+      expect(shouldShowFabricWidget(current, "auto")).toBe(false);
+      expect(shouldShowFabricWidget(current, "always")).toBe(false);
+      expect(shouldShowFabricWidget(current, "hidden")).toBe(false);
+      // Same width and snapshot must not reuse a nonprincipal render cache.
+      expect(widget.render(160)).toEqual([]);
+      widget.invalidate();
+      expect(widget.render(80)).toEqual([]);
+      expect(new FabricWidget(theme, () => current, 8, undefined, stableWhileStreaming).render(160)).toEqual([]);
+    } finally { vi.unstubAllEnvs(); }
+  });
   it.each(["completed", "failed", "stopped", "timed_out", "cancelled"])("expires %s at exactly 30 seconds and auto-hides without mutating stored data", status => {
     vi.useFakeTimers(); vi.setSystemTime(10_000);
     let current = snapshot();

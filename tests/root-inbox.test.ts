@@ -16,11 +16,12 @@ const held: RootInboxSession = { holdsBatch: () => true, holdsSteer: () => false
 const notHeld: RootInboxSession = { holdsBatch: () => false, holdsSteer: () => false };
 // A session whose entries hold the steers delivered so far (the pi-fabric-agent-message entries).
 const withSteers = (steers: Array<{ from: string; data: unknown }>): RootInboxSession => ({
+  ...rootInboxSession(steers.map(({ from, data }) => ({
+    // A current topic-scoped receipt, not an undated holdsSteer boolean, proves this claim.
+    type: "custom_message", timestamp: new Date().toISOString(), customType: "pi-fabric-agent-message",
+    details: { from: { id: from }, data: { topic: "fleet.work.pi-fabric.1", ...data as object } },
+  }))),
   holdsBatch: () => true,
-  holdsSteer: rootInboxSession(steers.map(({ from, data }) => ({
-    // The carrier names the shadow's topic: a key claims work on that topic only (#852 security P1).
-    type: "custom_message", customType: "pi-fabric-agent-message", details: { from: { id: from }, data: { topic: "fleet.work.pi-fabric.1", ...data as object } },
-  }))).holdsSteer,
 });
 
 const setup = () => {

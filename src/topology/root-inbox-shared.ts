@@ -104,8 +104,11 @@ export const crossIdentityReceipts = (fromId: string, data: unknown): string[] =
 export const eventReceipts = (event: MeshEvent): string[] => [
   eventReceipt(event.id), receipt(event.from.id, "id", event.id),
   ...(event.dedupeKey ? [receipt("", "dedupe", event.dedupeKey)] : []),
-  ...workReceipts(event.from.id, event.data, undefined),
-  ...crossIdentityReceipts(event.from.id, event.data),
+  // Control data is a protocol envelope; nested work identities belong to the native carrier.
+  ...(event.topic === "fabric.control.command" ? [] : [
+    ...workReceipts(event.from.id, event.data, undefined),
+    ...crossIdentityReceipts(event.from.id, event.data),
+  ]),
 ];
 /** What the session's own entries say it holds. */
 export interface RootInboxSession {

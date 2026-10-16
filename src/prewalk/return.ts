@@ -2,7 +2,7 @@ import type {
   ExtensionAPI,
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import { notifyDiagnostic } from "../core/diagnostics.js";
+import { notifyDiagnostic, setPrewalkStatus } from "../core/diagnostics.js";
 import type { CompactRequestIntent } from "../core/compact-controller.js";
 import { assertPrewalkModelAllowed, setModelSafely, type PrewalkModelPolicy } from "./model-switch.js";
 import { FabricModelDeniedError } from "../core/model-policy.js";
@@ -27,7 +27,7 @@ const reportReturnRefusal = (
   options?: RestoreBorrowedInPlaceMainOptions,
 ): never => {
   if (error instanceof FabricModelDeniedError) {
-    context.ui.setStatus("fabric-prewalk", `return refused → ${key}`);
+    setPrewalkStatus(context, `return refused → ${key}`);
     notifyDiagnostic(context, "src/prewalk/return.ts", `Prewalk left Main on the executor: ${error.message}`, "error", options);
   }
   throw error;
@@ -152,7 +152,7 @@ export const restoreBorrowedInPlaceMain = async (
     throw error;
   }
   if (!model) {
-    context.ui.setStatus("fabric-prewalk", `return failed → ${borrowed.returnModel}`);
+    setPrewalkStatus(context, `return failed → ${borrowed.returnModel}`);
     notifyDiagnostic(context, "src/prewalk/return.ts",
       `Prewalk left Main on the executor; could not restore unavailable model ${borrowed.returnModel}.`,
       "error",
@@ -169,7 +169,7 @@ export const restoreBorrowedInPlaceMain = async (
     throw error;
   }
   if (!restored) {
-    context.ui.setStatus("fabric-prewalk", `return failed → ${borrowed.returnModel}`);
+    setPrewalkStatus(context, `return failed → ${borrowed.returnModel}`);
     notifyDiagnostic(context, "src/prewalk/return.ts",
       `Prewalk left Main on the executor; could not return to ${borrowed.returnModel}. Check model authentication.`,
       "error",
@@ -205,7 +205,7 @@ export const settleInPlacePrewalk = async (
     // session start or /fabric reload can still restore Main. Repeated settle
     // calls find no continuation and stay quiet.
     controller.cancel();
-    context.ui.setStatus("fabric-prewalk", `return failed → ${settlement.returnModel}`);
+    setPrewalkStatus(context, `return failed → ${settlement.returnModel}`);
     notifyDiagnostic(context, "src/prewalk/return.ts",
       `Prewalk completed, but Main could not return to unavailable model ${settlement.returnModel}.`,
       "error",
@@ -213,7 +213,7 @@ export const settleInPlacePrewalk = async (
     return false;
   }
 
-  context.ui.setStatus("fabric-prewalk", `returning Main → ${settlement.returnModel}`);
+  setPrewalkStatus(context, `returning Main → ${settlement.returnModel}`);
   if (options?.compact && options.compactOnReturn !== false) {
     // Compact while the executor is still active so the restored boundary
     // model re-ingests a compacted transcript instead of the executor's full
@@ -243,7 +243,7 @@ export const settleInPlacePrewalk = async (
     // session start or /fabric reload can still restore Main. Repeated settle
     // calls find no continuation and stay quiet.
     controller.cancel();
-    context.ui.setStatus("fabric-prewalk", `return failed → ${settlement.returnModel}`);
+    setPrewalkStatus(context, `return failed → ${settlement.returnModel}`);
     notifyDiagnostic(context, "src/prewalk/return.ts",
       `Prewalk completed, but Main could not return to ${settlement.returnModel}. Check model authentication.`,
       "error",
@@ -253,8 +253,8 @@ export const settleInPlacePrewalk = async (
 
   controller.finishContinuation(sessionId, settlement.continuationId);
   const status = controller.status();
-  context.ui.setStatus(
-    "fabric-prewalk",
+  setPrewalkStatus(
+    context,
     status.state === "armed" ? `armed → ${status.model}` : undefined,
   );
   notifyDiagnostic(context, "src/prewalk/return.ts",

@@ -21,7 +21,7 @@ import type { ModelSource } from "./model-picker.js";
 import { createDashboardSnapshot } from "./snapshot.js";
 import { safeText } from "./format.js";
 import { extensionContextLive } from "../session-liveness.js";
-import { notifyDiagnostic } from "../core/diagnostics.js";
+import { isPrincipalDiagnostics, notifyDiagnostic } from "../core/diagnostics.js";
 import { isActiveStatus, type FabricDashboardSnapshot, type FabricUiActor, type FabricUiAgent } from "./types.js";
 import { FabricWidget, isFabricWidgetStreaming, shouldShowFabricWidget } from "./widget.js";
 import { FabricWidgetRetention } from "./retention.js";
@@ -887,14 +887,14 @@ export class FabricUiController {
 
   #renderWidget(context: ExtensionContext): void {
     const config = this.state.config.ui;
+    const widgetAllowed = context.mode === "tui" && !isPrincipalDiagnostics();
     const shouldShow =
-      context.mode === "tui" &&
-      shouldShowFabricWidget(this.#snapshot, config.widget, this.#widgetRetention);
+      widgetAllowed && shouldShowFabricWidget(this.#snapshot, config.widget, this.#widgetRetention);
     // Keep the above-editor component mounted for the entire streamed turn.
     // A transient status gap must not turn into a remove/add pair while Pi is
     // diff-rendering the conversation.
     const keepForStreaming =
-      context.mode === "tui" && config.widget !== "hidden" && isFabricWidgetStreaming(this.#snapshot);
+      widgetAllowed && config.widget !== "hidden" && isFabricWidgetStreaming(this.#snapshot);
     if (shouldShow || keepForStreaming) {
       if (this.#widgetMounted) return;
       this.#widgetMounted = true;

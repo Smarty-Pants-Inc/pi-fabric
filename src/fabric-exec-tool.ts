@@ -1,5 +1,5 @@
 import { fabricToolLoadout } from "./core/tool-ownership.js";
-import { notifyDiagnostic } from "./core/diagnostics.js";
+import { notifyDiagnostic, setPrewalkStatus } from "./core/diagnostics.js";
 import type { Theme, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { TSchema } from "@earendil-works/pi-ai";
 import { Container, Text, type Component } from "@earendil-works/pi-tui";
@@ -948,8 +948,8 @@ export const createFabricExecTool = (
           residentOutcomes: Object.freeze((result.residentOutcomes ?? []).map(receipt => Object.freeze({ ...receipt }))),
         });
         pendingHandoffs.set(toolCallId, pendingHandoff);
-        context.ui.setStatus(
-          "fabric-prewalk",
+        setPrewalkStatus(
+          context,
           `waiting for fabric_exec boundary → ${String(pendingHandoff.args.model ?? "executor")}`,
         );
         // The nudge budget is spent and the arm still has no plan: the handoff
@@ -964,8 +964,8 @@ export const createFabricExecTool = (
         // This boundary was withheld because the plan is still owed. Reflect the
         // planning phase instead of leaving the footer reading "armed".
         const prewalkStatus = state.prewalk.status();
-        context.ui.setStatus(
-          "fabric-prewalk",
+        setPrewalkStatus(
+          context,
           prewalkStatus.state === "armed" ? `plan awaited → ${prewalkStatus.model}` : undefined,
         );
       }

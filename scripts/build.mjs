@@ -203,6 +203,9 @@ const result = await build({
       pluginBuild.onResolve({ filter: /\/(?:model-policy|fabric-provenance)\.js$/ }, () => ({
         path: resolve("src/host-compatibility.ts"),
       }));
+      pluginBuild.onResolve({ filter: /\/diagnostics\.js$/ }, () => ({
+        path: resolve("src/core/agent-dir.ts"),
+      }));
     },
   }],
   outdir: "dist",

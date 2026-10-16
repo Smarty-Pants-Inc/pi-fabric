@@ -159,6 +159,15 @@ describe("armFabricPrewalkSession", () => {
 });
 
 describe("autoArmFabricPrewalk", () => {
+  it.each(["org-agent-test", "org-agent-kate@x", undefined, "project-agent@x"])("keeps automatic status quiet only for principal role %s", async role => {
+    vi.stubEnv("SMARTY_ROLE", role);
+    const h = makeHarness({ model: "anthropic/executor" });
+    await autoArmFabricPrewalk(h.state, h.context, h.pi);
+    expect(h.prewalk.status().state).toBe("armed");
+    expect(h.setStatus).toHaveBeenCalledWith("fabric-prewalk",
+      role?.startsWith("org-agent") ? undefined : "armed (in-place) → anthropic/executor");
+    expect(h.sendMessage.mock.calls[0]?.[0].display).toBe(false);
+  });
   it("stays silent when the prewalk master switch is off", async () => {
     const h = makeHarness({ model: "anthropic/executor", enabled: false });
 

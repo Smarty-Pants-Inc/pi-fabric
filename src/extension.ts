@@ -1,6 +1,6 @@
 import type { Usage } from "@earendil-works/pi-ai";
 import { registerMainProviderRecovery } from "./main-provider-recovery.js";
-import { configureFabricDiagnostics, diagnostics, notifyDiagnostic } from "./core/diagnostics.js";
+import { configureFabricDiagnostics, diagnostics, isPrincipalDiagnostics, notifyDiagnostic, setPrewalkStatus } from "./core/diagnostics.js";
 import { extensionContextLive } from "./session-liveness.js";
 import { registerIncomingMessageRenderers } from "./ui/incoming-messages.js";
 import { principalViewIncomingMode, registerPrincipalView } from "./ui/principal-view.js";
@@ -978,7 +978,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
         const notice = `${selfReloaded.owner ?? "Fabric"} reloaded: ${selfReloaded.old} → ${selfReloaded.new}`;
         notifyDiagnostic(context, "src/extension.ts", notice, "info");
         // Keep the notice after the TUI's own reload status line replaces it.
-        context.ui.setStatus(SELF_RELOAD_STATUS, notice);
+        context.ui.setStatus(SELF_RELOAD_STATUS, isPrincipalDiagnostics() ? undefined : notice);
       }
       const probeNonce = process.env.PI_FABRIC_RESIDENT_PROBE_NONCE;
       const residentProbe = Boolean(probeNonce && process.env.PI_FABRIC_RESIDENT_PROBE_WORKER_PID === String(process.ppid));
@@ -1104,8 +1104,8 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     });
     if (!settledInPlace && state.prewalk.settleTask(sessionId)) {
       const status = state.prewalk.status();
-      context.ui.setStatus(
-        "fabric-prewalk",
+      setPrewalkStatus(
+        context,
         status.state === "armed" ? `armed → ${status.model}` : undefined,
       );
     }

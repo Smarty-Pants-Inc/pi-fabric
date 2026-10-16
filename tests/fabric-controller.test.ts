@@ -1184,6 +1184,48 @@ describe("FabricUiController dashboard wiring", () => {
     }
   });
 
+  it.each([
+    { role: "org-agent@x", mode: "auto", visible: false },
+    { role: "org-agent@x", mode: "always", visible: false },
+    { role: "project-agent@x", mode: "auto", visible: true },
+    { role: "project-agent@x", mode: "always", visible: true },
+  ] as const)("applies $role widget visibility in $mode mode, including streaming-only gaps", ({ role, mode, visible }) => {
+    vi.stubEnv("SMARTY_ROLE", role);
+    const state = stubState();
+    Object.assign(state.config.ui, { widget: mode, maxRows: 6 });
+    vi.mocked(state.actors.list).mockReturnValue([{ ...stubActor, status: "running" } as never]);
+    vi.mocked(state.agents.list).mockReturnValue([
+      { id: "agent-1", name: "worker", status: "running", transport: "local", cwd: "/project" } as never,
+    ]);
+    const setWidget = vi.fn();
+    const context = { mode: "tui", ui: { notify: vi.fn(), setWidget } } as unknown as ExtensionContext;
+    const controller = new FabricUiController(state);
+    const mounts = () => setWidget.mock.calls.filter(([, content]) => content !== undefined);
+    try {
+      controller.start(context);
+      expect(controller.snapshot().actors[0]?.status).toBe("running");
+      expect(controller.snapshot().agents[0]?.status).toBe("running");
+      expect(mounts()).toHaveLength(visible ? 1 : 0);
+      controller.setHostStreaming(true);
+      expect(controller.snapshot().main.status).toBe("running");
+      expect(mounts()).toHaveLength(visible ? 1 : 0);
+
+      // With no Fabric work left, auto mode can mount only via keepForStreaming.
+      vi.mocked(state.actors.list).mockReturnValue([]);
+      vi.mocked(state.agents.list).mockReturnValue([]);
+      controller.stop();
+      setWidget.mockClear();
+      controller.start(context);
+      controller.setHostStreaming(true);
+      expect(controller.snapshot().main.status).toBe("running");
+      expect(controller.snapshot().actors).toEqual([]);
+      expect(controller.snapshot().agents).toEqual([]);
+      expect(mounts()).toHaveLength(visible ? 1 : 0);
+      controller.setHostStreaming(false);
+      expect(context.ui.notify).not.toHaveBeenCalled();
+    } finally { controller.stop(); vi.unstubAllEnvs(); }
+  });
+
   it("never mounts or reserves rows in explicit hidden mode despite active host and Fabric work", async () => {
     vi.useFakeTimers();
     const state = stubState();

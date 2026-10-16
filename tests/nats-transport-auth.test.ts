@@ -62,6 +62,20 @@ describe.skipIf(!binary)("authenticated Path B transport", () => {
     await connection.close();
   });
 
+  it("accepts the operator's narrower own-source ACK grant", async () => {
+    const connection = await openNatsConnection({ servers: harness.serverUrl, credentials: harness.users.maintainer.credsPath, machine: MACHINE_A });
+    await connection.close();
+  });
+
+  it.each([">", "fabric.>", "fabric.in.*.*.*.*.machine-b"])("refuses a server-expanded broader source grant: %s", async (grant) => {
+    const fixture = await createPathBHarness({ binary: binary!, additionalAgentPublish: [grant] });
+    try {
+      await expect(openNatsConnection({ servers: fixture.serverUrl, credentials: fixture.users.machineA.credsPath, machine: MACHINE_A })).rejects.toThrow("machine tag mismatch");
+    } finally {
+      await fixture.stop();
+    }
+  });
+
   it("refuses credentials bound to another configured machine", async () => {
     await expect(openNatsConnection({ servers: harness.serverUrl, credentials: harness.users.machineA.credsPath, machine: MACHINE_B })).rejects.toThrow("machine tag mismatch");
   });

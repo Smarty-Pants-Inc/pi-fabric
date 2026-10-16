@@ -121,8 +121,9 @@ export const ensureTransportConsumer = async (api: ConsumerAPI, policy: Transpor
     }
   }
   const actual = info.config;
-  if (actual.filter_subject !== policy.filterSubject || actual.ack_policy !== AckPolicy.Explicit ||
-    actual.deliver_policy !== DeliverPolicy.All || actual.ack_wait !== nanos(30_000) || actual.max_deliver !== 5 ||
+  if (actual.durable_name !== policy.durable || actual.filter_subject !== policy.filterSubject || actual.filter_subjects?.length ||
+    actual.deliver_subject || actual.headers_only || actual.ack_policy !== AckPolicy.Explicit || actual.replay_policy !== ReplayPolicy.Instant ||
+    actual.max_waiting !== 1 || actual.deliver_policy !== DeliverPolicy.All || actual.ack_wait !== nanos(30_000) || actual.max_deliver !== 5 ||
     actual.max_ack_pending !== policy.maxAckPending || (actual.inactive_threshold !== 0 && actual.inactive_threshold !== undefined) ||
     JSON.stringify(actual.backoff) !== JSON.stringify(backoff)) {
     throw new Error(`NATS consumer configuration mismatch: ${policy.durable}`);

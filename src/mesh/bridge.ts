@@ -1170,6 +1170,15 @@ export class StoreBridgeSide implements BridgeSide {
       ...leases.map((lease) => ({ kind: "lease", key: `lease:${lease.id}`, payload: lease })),
       ...removed.map((gone) => ({ kind: "unlease", key: `lease:${gone.id}`, payload: gone })),
     ];
+    const incomingRootIds = new Set(presence.hosts.map(({ record }) => record.rootId));
+    // Match compute's normalized incarnation evidence without mutating cached lease histories.
+    const leaseIncarnationDigest = (leases: ReadonlyMap<string, FabricHostLease>): string => contentDigest(
+      [...leases.values()].filter(lease => incomingRootIds.has(lease.rootId)).map(lease => ({
+        id: lease.id, rootId: lease.rootId, ...incarnationOf(lease),
+        bridgeSupersededTokens: bridgeSupersededTokensOf(lease.bridgeSupersededTokens),
+        bridgeSupersededTokenSeen: bridgeSupersededSeenOf(lease.bridgeSupersededTokenSeen),
+      })).sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0),
+    );
     // The pass's plan on one state view: admission, reservations and the CAS versions. undefined: halted.
     const compute = (view: MeshBatchView, participantFiles: ReturnType<typeof participantFileSnapshot>):
       { ops: MeshBatchOperation[]; leases: BridgeLease[]; removed: BridgeUnlease[];
@@ -1318,9 +1327,9 @@ export class StoreBridgeSide implements BridgeSide {
       // A stale plan rolls back and plans again; the last attempt, a backend without a revision view, and
       // a recovery pass (whose replay must run on the transaction's snapshot) plan inside, as before.
       const early = this.#recovered && attempt < MIRROR_PLAN_ATTEMPTS - 1 ? this.store.stateView() : undefined;
-      // Every plan now reads lease incarnation authority, even without handoffs. Stamp the
-      // directory before computing it, so a lease-only replacement invalidates admission too.
-      // With handoffs, native lease liveness must also retain the scan's judgment at commit.
+      // Stamp incarnation authority before planning. Without handoffs, a moved stamp needs only
+      // incoming roots' evidence rechecked; unrelated leases and renewals do not change admission.
+      // Handoffs still require the full stamp and the scan's native lease liveness judgment.
       const leaseStamp = early ? meshDirectoryStamp(this.store.root, HOST_LEASE_DIR) : undefined;
       const judgesLeaseLiveness = early !== undefined && early.view.listAll(BRIDGE_HANDOFF_PREFIX).length > 0;
       const planned = early && !halted() ? compute(early.view, files) : undefined;
@@ -1338,8 +1347,10 @@ export class StoreBridgeSide implements BridgeSide {
             const sameFiles = meshDirectoryStamp(this.store.root, "participants") === filesStamp;
             let result: ReturnType<typeof compute>;
             if (early && planned && sameFiles && this.store.stateUnchangedSince(early.revision, HELD_STATE_PREFIXES) &&
-              (leaseStamp === undefined || (meshDirectoryStamp(this.store.root, HOST_LEASE_DIR) === leaseStamp &&
-                (!judgesLeaseLiveness || sameLeaseLiveness(planned.judged.leases, planned.judged.now, this.now()))))) result = planned;
+              (leaseStamp === undefined || meshDirectoryStamp(this.store.root, HOST_LEASE_DIR) === leaseStamp ||
+                (!judgesLeaseLiveness && leaseIncarnationDigest(planned.judged.leases) ===
+                  leaseIncarnationDigest(readHostLeases(this.store.root)))) &&
+              (!judgesLeaseLiveness || sameLeaseLiveness(planned.judged.leases, planned.judged.now, this.now()))) result = planned;
             else if (early) throw new MirrorPlanStale();
             else {
               const participantFiles = sameFiles ? files : participantFileSnapshot(this.store.root);

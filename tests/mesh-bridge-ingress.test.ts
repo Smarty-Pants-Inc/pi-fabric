@@ -3,15 +3,15 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
-  MeshBridge, RemoteBridgeSide, serveBridgeAgent, StoreBridgeSide,
+  BRIDGE_LEASE_MS, MeshBridge, RemoteBridgeSide, serveBridgeAgent, StoreBridgeSide,
   type BridgePublish,
 } from "../src/mesh/bridge.js";
 import { watchBridgeStore } from "../src/mesh/change-notifier.js";
 import { MeshStore, type MeshEvent, type MeshIdentity } from "../src/mesh/store.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
-import { writeHostLease } from "../src/topology/host-leases.js";
+import { readHostLease, writeHostLease } from "../src/topology/host-leases.js";
 import { writeParticipantFile } from "../src/topology/participant-files.js";
 
 // Keep reason: the real stdio/file-mesh trust boundary and the ingress HOL failure path.
@@ -34,7 +34,10 @@ const cleanups: Array<() => Promise<unknown> | void> = [];
 const roots: string[] = [];
 afterEach(async () => {
   try { for (const close of cleanups.splice(0).reverse()) await close(); }
-  finally { for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); }
+  finally {
+    vi.restoreAllMocks();
+    for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 const deferred = <T>() => {
@@ -162,16 +165,18 @@ const holdService = (side: StoreBridgeSide, op: "presence" | "mirror") => {
 };
 type Hold = ReturnType<typeof holdService>;
 
-const fixture = async (legacyRpc = false) => {
+const fixture = async (legacyRpc = false, callTimeoutMs = 15_000) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-ingress-"));
   roots.push(root);
   // Explicit file backend: never inherit a developer's SQLite/live mesh configuration.
   const hub = new MeshStore(path.join(root, "hub"), 64 * 1024, 256, { stateBackend: "file" });
   const far = new MeshStore(path.join(root, "far"), 64 * 1024, 256, { stateBackend: "file" });
-  const local = new StoreBridgeSide(hub, "far"), agent = new StoreBridgeSide(far, "hub");
+  // Dynamic clocks let the expiry regression advance wall time without fake RPC timers.
+  const local = new StoreBridgeSide(hub, "far", () => Date.now()), agent = new StoreBridgeSide(far, "hub", () => Date.now());
   const input = new PassThrough(), output = new PassThrough();
-  const wire = journal<RpcFrame>(), timings = journal<RpcTiming>();
-  let buffered = "";
+  const wire = journal<RpcFrame>(), timings = journal<RpcTiming>(), logs = journal<string>();
+  const responses = journal<{ id: number; op: string; ok: boolean; eventIds: string[] }>();
+  let buffered = "", responseBuffer = "";
   input.setEncoding("utf8");
   input.on("data", (chunk: string) => {
     buffered += chunk;
@@ -179,6 +184,20 @@ const fixture = async (legacyRpc = false) => {
     while ((newline = buffered.indexOf("\n")) >= 0) {
       const line = buffered.slice(0, newline); buffered = buffered.slice(newline + 1);
       if (line.trim()) wire.push({ ...JSON.parse(line), sentAt: performance.now() } as RpcFrame);
+    }
+  });
+  output.setEncoding("utf8");
+  output.on("data", (chunk: string) => {
+    responseBuffer += chunk;
+    let newline: number;
+    while ((newline = responseBuffer.indexOf("\n")) >= 0) {
+      const line = responseBuffer.slice(0, newline); responseBuffer = responseBuffer.slice(newline + 1);
+      if (!line.trim()) continue;
+      const frame = JSON.parse(line) as { id?: number; ok?: boolean; result?: { events?: MeshEvent[] } };
+      const request = wire.entries.find(request => request.id === frame.id);
+      if (request) responses.push({ id: request.id, op: request.op, ok: frame.ok === true,
+        eventIds: (request.op === "read" || request.op === "tail") && Array.isArray(frame.result?.events)
+          ? frame.result.events.map(event => event.id) : [] });
     }
   });
   // Compatible with the three-argument base revision too; the benchmark explicitly
@@ -196,9 +215,9 @@ const fixture = async (legacyRpc = false) => {
   const serving = serveWithDebug(agent, input, servedOutput, message => {
     if (message.startsWith("bridge rpc ")) timings.push(JSON.parse(message.slice("bridge rpc ".length)) as RpcTiming);
   });
-  const remote = new RemoteBridgeSide(output, input, 15_000);
+  const remote = new RemoteBridgeSide(output, input, callTimeoutMs);
   const bridge = new MeshBridge({ localName: "hub", remoteName: "far", local, remote,
-    cursorPath: path.join(root, "cursor.json"), stopMs: 100 });
+    cursorPath: path.join(root, "cursor.json"), stopMs: 100, log: message => logs.push(message) });
   const holds: Hold[] = [], planes: FabricControlPlane[] = [];
   const acceptanceGates = new Map<string, Promise<void>>();
   let running: Promise<void> | undefined, runFailure: unknown, closed = false;
@@ -239,8 +258,8 @@ const fixture = async (legacyRpc = false) => {
     planes.push(plane);
   }
   return {
-    root, hub, far, local, agent, remote, bridge, lead, lane, hubLog, farLog, wire, timings, samples, admitted, acceptanceGates, close,
-    hold(op: "presence" | "mirror") { const hold = holdService(agent, op); holds.push(hold); return hold; },
+    root, hub, far, local, agent, remote, bridge, lead, lane, hubLog, farLog, wire, timings, logs, responses, samples, admitted, acceptanceGates, close,
+    hold(op: "presence" | "mirror", side = agent) { const hold = holdService(side, op); holds.push(hold); return hold; },
     async launch() {
       running = bridge.run().catch(error => { runFailure = error; });
       // A direction's first actual wire read occurs only after startup subscriptions
@@ -563,6 +582,164 @@ describe("mesh bridge ingress: real file meshes and stdio", () => {
       f.assertHealthy();
     } finally { accept.resolve(); hold.release(); hold.restore(); }
   });
+
+  it("run(): post-deadline inbound command and real ACK progress while the mirror is still held", async () => {
+    const f = await fixture(false, 500);
+    await f.launch();
+    const hold = f.hold("mirror");
+    churn(f, 0);
+    await within(hold.entered, "outbound mirror held past its deadline");
+    const mirrorId = f.wire.entries.filter(frame => frame.op === "mirror").at(-1)!.id;
+    try {
+      // The real mirror timer settles the pass, not the retained response slot.
+      await f.logs.wait(message => message.startsWith("bridge mirror degraded"), "real mirror deadline logged");
+      await expect(f.remote.presence()).rejects.toMatchObject({ code: "FABRIC_BRIDGE_STALE", timedOut: true });
+      expect(f.local.holds(f.lane.identity.id, f.lane.identity)).toBe(true);
+      await f.remote.latestSequence(); // The negotiated traffic lane itself is available.
+      const id = "post-deadline-inbound";
+      await inboundCommand(f, id);
+      expect(f.samples.get(id)!.admissions).toBe(1);
+      expect(f.hub.read({ topic: "fabric.control.command", after: 0, limit: 256 })).toHaveLength(1);
+      expect(f.hub.read({ topic: "fabric.control.ack", after: 0, limit: 256 })).toMatchObject([
+        { verification: "mesh", data: { commandId: id, accepted: true } },
+      ]);
+      expect(f.far.read({ topic: "fabric.control.ack", after: 0, limit: 256 })).toHaveLength(1);
+      expect(f.responses.entries.some(response => response.id === mirrorId)).toBe(false);
+      f.assertHealthy();
+    } finally { hold.release(); hold.restore(); }
+  }, 15_000);
+
+  it("run(): post-deadline real far-owner ACK reaches the hub while the mirror is still held", async () => {
+    const f = await fixture(false, 500);
+    await f.launch();
+    const id = "post-deadline-ack", sample = newSample(f, id), accept = deferred<void>();
+    f.acceptanceGates.set(id, accept.promise);
+    cleanups.push(() => accept.resolve());
+    // Deliver the actual outbound command first; only its real handler's completion is held.
+    await f.hub.publish(command(f.lead, f.lane, id));
+    await f.admitted.wait(value => value === id, "outbound command delivered before mirror deadline");
+    const hold = f.hold("mirror");
+    churn(f, 0);
+    await within(hold.entered, "outbound mirror held before ACK completion");
+    const mirrorId = f.wire.entries.filter(frame => frame.op === "mirror").at(-1)!.id;
+    try {
+      await f.logs.wait(message => message.startsWith("bridge mirror degraded"), "real mirror deadline before ACK");
+      await expect(f.remote.presence()).rejects.toMatchObject({ code: "FABRIC_BRIDGE_STALE", timedOut: true });
+      expect(f.local.holds(f.lane.identity.id, f.lane.identity)).toBe(true);
+      accept.resolve();
+      const nativeAck = await f.farLog.wait(ackFor(id), "real far ACK committed after mirror deadline");
+      expect(nativeAck.verification).toBe("mesh");
+      verifyAck(await f.hubLog.wait(ackFor(id), "post-deadline ACK ingress with mirror still held"), f.lane, f.lead, id);
+      await f.responses.wait(response => response.ok && response.eventIds.includes(nativeAck.id), "actual far ACK read response");
+      expect(sample.admissions).toBe(1);
+      expect(f.hub.read({ topic: "fabric.control.ack", after: 0, limit: 256 })).toHaveLength(1);
+      expect(f.responses.entries.some(response => response.id === mirrorId)).toBe(false);
+      f.assertHealthy();
+    } finally { accept.resolve(); hold.release(); hold.restore(); }
+  }, 15_000);
+
+  it("run(): a root born after a timed-out snapshot waits for a fresh local mirror commit", async () => {
+    const f = await fixture(false, 500);
+    await f.launch();
+    const oldMirror = f.hold("mirror");
+    churn(f, 0);
+    await within(oldMirror.entered, "old snapshot held before newcomer exists");
+    let freshLocal: Hold | undefined;
+    try {
+      await f.logs.wait(message => message.startsWith("bridge mirror degraded"), "old snapshot's real mirror deadline");
+      await expect(f.remote.presence()).rejects.toMatchObject({ code: "FABRIC_BRIDGE_STALE", timedOut: true });
+      // This root cannot have appeared in either half of the old snapshot.
+      const newcomer = await native(f.far, "new-after-deadline");
+      const id = "post-deadline-new-root", sample = newSample(f, id);
+      sample.expectedSender = newcomer.identity.id;
+      freshLocal = f.hold("mirror", f.local);
+      const origin = await f.far.publish(command(newcomer, f.lead, id));
+      await f.responses.wait(response => response.ok && response.eventIds.includes(origin.id), "new root's actual source read response");
+      await f.logs.wait(message => message.startsWith("bridge mirror degraded (toLocal)"), "new root's blocked topology refresh");
+      expect(sample.admissions).toBe(0);
+      expect(f.local.holds(newcomer.identity.id, newcomer.identity)).toBe(false);
+      expect(f.hub.read({ topic: "fabric.control.command", after: 0, limit: 256 })).toHaveLength(0);
+      expect(f.hub.read({ topic: "fabric.control.ack", after: 0, limit: 256 })).toHaveLength(0);
+      expect(f.far.read({ topic: "fabric.control.ack", after: 0, limit: 256 })).toHaveLength(0);
+
+      oldMirror.release();
+      await within(freshLocal.entered, "fresh newcomer claims held before local store critical section");
+      // New claims alone cannot authorize traffic: no committed local mirror yet.
+      expect(sample.admissions).toBe(0);
+      expect(f.local.holds(newcomer.identity.id, newcomer.identity)).toBe(false);
+      expect(f.hub.read({ topic: "fabric.control.command", after: 0, limit: 256 })).toHaveLength(0);
+      expect(f.hub.read({ topic: "fabric.control.ack", after: 0, limit: 256 })).toHaveLength(0);
+      expect(f.far.read({ topic: "fabric.control.ack", after: 0, limit: 256 })).toHaveLength(0);
+      freshLocal.release();
+      verifyAck(await f.farLog.wait(ackFor(id), "newcomer ACK after fresh local commit"), f.lead, newcomer, id);
+      expect(sample.admissions).toBe(1);
+      expect(f.local.holds(newcomer.identity.id, newcomer.identity)).toBe(true);
+      expect(f.hub.read({ topic: "fabric.control.command", after: 0, limit: 256 })).toHaveLength(1);
+      expect(f.hub.read({ topic: "fabric.control.ack", after: 0, limit: 256 })).toMatchObject([
+        { verification: "mesh", data: { commandId: id, accepted: true } },
+      ]);
+      expect(f.far.read({ topic: "fabric.control.ack", after: 0, limit: 256 })).toHaveLength(1);
+      f.assertHealthy();
+    } finally { freshLocal?.release(); freshLocal?.restore(); oldMirror.release(); oldMirror.restore(); }
+  }, 15_000);
+
+  it("run(): expired authority and the late old sample wait for a fresh local mirror commit", async () => {
+    const f = await fixture(false, 500);
+    await f.launch();
+    const oldMirror = f.hold("mirror");
+    churn(f, 0);
+    await within(oldMirror.entered, "old mirror received before expiry jump");
+    let freshLocal: Hold | undefined, freshRemote: Hold | undefined;
+    try {
+      await f.logs.wait(message => message.startsWith("bridge mirror degraded"), "real mirror deadline before expiry jump");
+      await expect(f.remote.presence()).rejects.toMatchObject({ code: "FABRIC_BRIDGE_STALE", timedOut: true });
+      expect(f.local.holds(f.lane.identity.id, f.lane.identity)).toBe(true);
+      const beforeJump = Date.now(), realNow = Date.now.bind(Date);
+      vi.spyOn(Date, "now").mockImplementation(() => realNow() + BRIDGE_LEASE_MS + 1);
+      // Only wall time moves, AFTER the real RPC deadline. Native 120 s leases stay live.
+      expect(f.local.holds(f.lane.identity.id, f.lane.identity)).toBe(false);
+      expect(f.agent.holds(f.lead.identity.id, f.lead.identity)).toBe(false);
+      freshLocal = f.hold("mirror", f.local);
+      // Hold the next agent mirror too, so its fresh commit cannot hide whether the
+      // late old mirror retained the agent's original pre-hold receivedAt stamp.
+      freshRemote = f.hold("mirror");
+      const id = "post-deadline-expired-root", sample = newSample(f, id);
+      const origin = await f.far.publish(command(f.lane, f.lead, id)); // New, valid 30 s command AFTER the jump.
+      await f.responses.wait(response => response.ok && response.eventIds.includes(origin.id), "expired root's actual source read response");
+      await f.logs.wait(message => message.startsWith("bridge mirror degraded (toLocal)"), "expired root's blocked topology refresh");
+      expect(sample.admissions).toBe(0);
+      expect(f.local.holds(f.lane.identity.id, f.lane.identity)).toBe(false);
+      expect(f.hub.read({ topic: "fabric.control.command", after: 0, limit: 256 })).toHaveLength(0);
+      expect(f.hub.read({ topic: "fabric.control.ack", after: 0, limit: 256 })).toHaveLength(0);
+      expect(f.far.read({ topic: "fabric.control.ack", after: 0, limit: 256 })).toHaveLength(0);
+
+      oldMirror.release();
+      await within(Promise.all([freshLocal.entered, freshRemote.entered]), "fresh claims held before either mirror critical section");
+      const lateLease = readHostLease(f.far.root, f.lead.identity.id)!;
+      expect(lateLease.mirror!.observedAt).toBeLessThanOrEqual(beforeJump);
+      expect(lateLease.expiresAt).toBeLessThanOrEqual(beforeJump + BRIDGE_LEASE_MS);
+      expect(lateLease.expiresAt).toBeLessThan(Date.now());
+      expect(f.agent.holds(f.lead.identity.id, f.lead.identity)).toBe(false);
+      expect(sample.admissions).toBe(0);
+      expect(f.local.holds(f.lane.identity.id, f.lane.identity)).toBe(false);
+      expect(f.hub.read({ topic: "fabric.control.command", after: 0, limit: 256 })).toHaveLength(0);
+      expect(f.hub.read({ topic: "fabric.control.ack", after: 0, limit: 256 })).toHaveLength(0);
+      expect(f.far.read({ topic: "fabric.control.ack", after: 0, limit: 256 })).toHaveLength(0);
+      freshRemote.release(); freshLocal.release();
+      verifyAck(await f.farLog.wait(ackFor(id), "expired root ACK only after fresh local commit"), f.lead, f.lane, id);
+      expect(sample.admissions).toBe(1);
+      expect(f.local.holds(f.lane.identity.id, f.lane.identity)).toBe(true);
+      expect(f.hub.read({ topic: "fabric.control.command", after: 0, limit: 256 })).toHaveLength(1);
+      expect(f.hub.read({ topic: "fabric.control.ack", after: 0, limit: 256 })).toMatchObject([
+        { verification: "mesh", data: { commandId: id, accepted: true } },
+      ]);
+      expect(f.far.read({ topic: "fabric.control.ack", after: 0, limit: 256 })).toHaveLength(1);
+      f.assertHealthy();
+    } finally {
+      freshRemote?.release(); freshRemote?.restore(); freshLocal?.release(); freshLocal?.restore();
+      oldMirror.release(); oldMirror.restore();
+    }
+  }, 15_000);
 
   it.skipIf(process.env.FABRIC_TEST_INGRESS_BENCH !== "1")("50/10: compare queue/start/dispatch before and during injected presence service delay", async () => {
     const cases = [];

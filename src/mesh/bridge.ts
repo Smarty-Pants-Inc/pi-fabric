@@ -241,6 +241,8 @@ export interface BridgeSide {
   subscribeChanges?(changed: (kind: BridgeChange) => void, failed: (error: Error) => void): (() => void) | undefined | Promise<(() => void) | undefined>;
   /** Reported hello version, required before a remote may use the pre-capability polling path. */
   readonly protocolVersion?: number | undefined;
+  /** An open, negotiated traffic lane remains usable despite a retained pending mirror. */
+  readonly pendingMirrorTraffic?: boolean;
   /** Optional v1 capability: old peers and sequence-only cursor files remain readable. */
   latestCursor?(): Promise<BridgeHead>;
   tail?(after: number, offset?: number): Promise<BridgeRead>;
@@ -1669,6 +1671,9 @@ export class RemoteBridgeSide implements BridgeSide {
   }
 
   get protocolVersion(): number | undefined { return this.#protocolVersion; }
+  get pendingMirrorTraffic(): boolean {
+    return this.#independentRpc && this.#mirrorPending !== undefined && this.#closed === undefined;
+  }
 
   async hello(changes = false): Promise<void> {
     const reply = await this.#call<{ version?: unknown; tail?: unknown; publishBatch?: unknown; changes?: unknown; independentRpc?: unknown }>("hello", {
@@ -2365,10 +2370,10 @@ export class MeshBridge {
       (this.#legacyPolling && Date.now() - this.#presenceAt >= (this.options.presenceMs ?? DEFAULT_PRESENCE_MS));
   }
 
-  /** Only preemptive traffic refreshes may leave an active notification pass alone.
-   * Missing/expired membership and commit refusals still explicitly join and revalidate. */
+  /** Only preemptive traffic refreshes may leave an active notification pass or its retained
+   * independent mirror slot alone. Missing/expired membership and commit refusals still refresh. */
   #deferPreemptivePresence(): boolean {
-    return this.#notificationMode && this.#presenceSync !== undefined;
+    return this.#notificationMode && (this.#presenceSync !== undefined || this.options.remote.pendingMirrorTraffic === true);
   }
 
   /**

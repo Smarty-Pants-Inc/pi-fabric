@@ -126,11 +126,14 @@ existing events and mirrors root presence. There is no new store or protocol.
   not bound to this link is dropped. Before refusing a lapsed mirror (including expiry while
   waiting for publication), one bounded, single-flight presence pass refreshes and revalidates
   authority. During notification-driven `run()`, traffic with live committed ownership does not
-  join an already-running presence pass merely because a preemptive refresh is due. Page,
-  batch and relay checks still reread canonical ownership; a missing/new or expired member and
-  a commit-time ownership refusal still take the existing blocking refresh and revalidation
-  path. If that explicit refresh joins a pass already in flight, it settles that pass and
-  requests or joins one new snapshot before revalidating: an older sample cannot establish
+  join an already-running presence pass merely because a preemptive refresh is due. This also
+  applies after the mirror deadline while an open transport retains that mirror's response slot
+  and has negotiated `independentRpc`: the failed pass may have settled, but live committed
+  traffic still uses the independent lane. Page, batch and relay checks still reread canonical
+  ownership; a missing/new or expired member and a commit-time ownership refusal still take the
+  existing blocking refresh and revalidation path, even while that slot remains pending. If
+  that explicit refresh joins a pass already in flight, it settles that pass and requests or
+  joins one new snapshot before revalidating: an older sample cannot establish
   fresh absence for a newly observed event. The same bound applies to retained-membership
   retries: at most the old pass plus one new pass, with no polling or deadline increase.
   Manual `step()`, startup and shutdown keep their blocking presence behavior. This is

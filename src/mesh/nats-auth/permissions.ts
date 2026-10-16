@@ -148,7 +148,7 @@ export function roleTemplate(role: NatsRole, input: RoleStreams): RoleTemplate {
 }
 
 /** Path B machine grants. This stays separate from #7504 so old roleTemplate callers remain byte-for-byte stable. */
-export type PathBRole = "agent" | "maintainer";
+export type PathBRole = "agent" | "operator";
 export interface PathBRoleTemplate extends RoleTemplate {}
 
 const PATH_B_MACHINE = /^[a-z0-9][a-z0-9-]{0,31}$/;
@@ -168,6 +168,20 @@ export const PATH_B_OPERATOR_MACHINE = "fabric-ops";
 /** Bootstrap provisions this durable; the messaging operator can bind, never create or delete it. */
 export const PATH_B_ADVISORY_DURABLE = "transport_dlq_operator";
 export const PATH_B_OPERATOR_MACHINE_PATTERN = /^fabric-ops(-[a-z0-9]+)?$/;
+
+// Reserve every server-supported creation form, including the bare API whose config.name
+// can select the fixed consumer without a durable_name. Denies override broad #7504 allows.
+const PATH_B_RESERVED_MUTATIONS = [
+  "$JS.API.CONSUMER.CREATE.FABRIC_ADV",
+  `$JS.API.CONSUMER.CREATE.FABRIC_ADV.${PATH_B_ADVISORY_DURABLE}`,
+  `$JS.API.CONSUMER.CREATE.FABRIC_ADV.${PATH_B_ADVISORY_DURABLE}.>`,
+  "$JS.API.CONSUMER.CREATE.FABRIC_ADV.>",
+  "$JS.API.CONSUMER.DURABLE.CREATE.FABRIC_ADV.>",
+  `$JS.API.CONSUMER.DELETE.FABRIC_ADV.${PATH_B_ADVISORY_DURABLE}`,
+  "$JS.API.STREAM.UPDATE.FABRIC_ADV",
+  "$JS.API.STREAM.DELETE.FABRIC_ADV",
+  "$JS.API.STREAM.PURGE.FABRIC_ADV",
+];
 
 function pathBRuntime(roleMachine: string, machines: readonly string[] = []): PathBRoleTemplate {
   if (PATH_B_OPERATOR_MACHINE_PATTERN.test(roleMachine)) fail("machine");
@@ -202,11 +216,12 @@ function pathBRuntime(roleMachine: string, machines: readonly string[] = []): Pa
     "$JS.API.DIRECT.GET.>",
     "$JS.API.CONSUMER.*.FABRIC_ADV.>",
     "$JS.API.CONSUMER.MSG.NEXT.FABRIC_ADV.>",
+    ...PATH_B_RESERVED_MUTATIONS,
   ];
   return { pub: { allow: pathBUnique(allow), deny }, sub: { allow: [ownInbox] } };
 }
 
-function pathBMaintainer(roleMachine: string, machines: readonly string[]): PathBRoleTemplate {
+function pathBOperator(roleMachine: string, machines: readonly string[]): PathBRoleTemplate {
   if (roleMachine !== PATH_B_MACHINE_TAG && !PATH_B_OPERATOR_MACHINE_PATTERN.test(roleMachine)) fail("machine");
   if (machines.length === 0) fail("machines");
   const inboxes = machines.map((machine) => {
@@ -234,6 +249,7 @@ function pathBMaintainer(roleMachine: string, machines: readonly string[]): Path
     "$JS.API.DIRECT.GET.>",
     "fabric.in.>",
     "fabric.ev.>",
+    ...PATH_B_RESERVED_MUTATIONS,
     ...inboxes.flatMap((stream) => [
       `$JS.API.STREAM.MSG.DELETE.${stream}`,
       `$JS.API.DIRECT.GET.${stream}`,
@@ -244,7 +260,15 @@ function pathBMaintainer(roleMachine: string, machines: readonly string[]): Path
 }
 
 /** Compose Path B with the existing role only when the mint input explicitly opts in. */
-export function roleTemplateWithPathB(role: NatsRole, input: RoleStreams, machines: readonly string[] = []): RoleTemplate {
+export function roleTemplateWithPathB(role: NatsRole | "operator", input: RoleStreams, machines: readonly string[] = []): RoleTemplate {
+  if (role === "operator") {
+    const path = pathBOperator(PATH_B_MACHINE_TAG, machines);
+    const base = roleTemplate("maintainer", input);
+    return {
+      pub: { allow: path.pub.allow, deny: pathBUnique([...base.pub.deny, ...path.pub.deny]) },
+      sub: { allow: path.sub.allow },
+    };
+  }
   const base = roleTemplate(role, input);
   if (role === "agent") {
     const path = pathBRuntime(PATH_B_MACHINE_TAG, machines);
@@ -253,20 +277,17 @@ export function roleTemplateWithPathB(role: NatsRole, input: RoleStreams, machin
       sub: { allow: path.sub.allow },
     };
   }
-  if (role === "maintainer") {
-    const path = pathBMaintainer(PATH_B_MACHINE_TAG, machines);
-    // The messaging operator must not inherit #7504's broad lifecycle grant.
-    // Keep the custody/liveness deny rows, but give it only its enumerated Path B rights.
-    return {
-      pub: { allow: path.pub.allow, deny: pathBUnique([...base.pub.deny, ...path.pub.deny]) },
-      sub: { allow: path.sub.allow },
-    };
-  }
-  return base;
+  if (role === "break-glass") return base;
+  // Principal and normal maintainer retain their exact #7504 allows; only the Path B
+  // advisory reservation adds denies. Emergency custody/liveness issuance is unchanged.
+  return {
+    pub: { allow: base.pub.allow, deny: pathBUnique([...base.pub.deny, ...PATH_B_RESERVED_MUTATIONS]) },
+    sub: base.sub,
+  };
 }
 
 export function pathBRoleTemplate(role: PathBRole, machine = PATH_B_MACHINE_TAG, machines: readonly string[] = []): PathBRoleTemplate {
   if (role === "agent") return pathBRuntime(pathBMachine(machine), machines);
-  if (role === "maintainer") return pathBMaintainer(pathBMachine(machine), machines);
+  if (role === "operator") return pathBOperator(pathBMachine(machine), machines);
   throw new Error("invalid Path B role");
 }

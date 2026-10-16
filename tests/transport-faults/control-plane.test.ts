@@ -526,6 +526,109 @@ describe("real FabricControlPlane / injected carrier faults", () => {
     expect(ackRecords(f, command.id)).toHaveLength(1);
   });
 
+  for (const [label, reason] of [
+    ["Error", new Error("E11 own-host lease lost")],
+    ["symbol", Symbol("E11 own-host lease cutoff")],
+    ["object", Object.freeze({ code: "E11_LEASE_LOST", source: "composition-notification" })],
+  ] as const) {
+    controlIt(`T-E11-PAUSE-REASON ${label} [SAFE local]: exact inbox abort reason precedes final ACK; durable custody survives endpoint reactivation`, async () => {
+      const f = fixture(), bound = new Receipts<AbortSignal>(), aborted = new Receipts<unknown>();
+      const order: string[] = [];
+      // Observe the signal supplied by the REAL #bindNatsInbox. Delegate the exact
+      // signal/iterator to the existing carrier observer; never create a dispatcher.
+      const inbox = f.receiverCarrier.transport.inbox.bind(f.receiverCarrier.transport);
+      const inboxSpy = vi.spyOn(f.receiverCarrier.transport, "inbox").mockImplementation(signal => {
+        bound.emit(signal);
+        signal.addEventListener("abort", () => { order.push("inbox-abort"); aborted.emit(signal.reason); }, { once: true });
+        return inbox(signal);
+      });
+      f.keep(() => inboxSpy.mockRestore());
+      const send = f.receiverCarrier.transport.send.bind(f.receiverCarrier.transport);
+      let armed = true;
+      const ackSpy = vi.spyOn(f.receiverCarrier.transport, "send").mockImplementation(async <T>(envelope: TransportEnvelope<T>, signal?: AbortSignal): Promise<TransportSent<T>> => {
+        if (envelope.kind !== "ack" || !armed) return send(envelope, signal);
+        const body = envelope.body;
+        expect(typeof body).toBe("function");
+        return send({ ...envelope, body: (at: number) => {
+          armed = false; order.push("ack-stamp");
+          f.receiver.pause(reason);
+          // The original P5 stamp still decides publication; no invented ACK result.
+          return (body as (at: number) => T)(at);
+        } }, signal);
+      });
+      f.keep(() => ackSpy.mockRestore()); f.start();
+      const inboxSignal = await bound.wait(() => true, "real receiver inbox signal");
+      expect(inboxSignal.aborted).toBe(false);
+      const commandId = `e11-reason-${label}`;
+      const envelope = await f.publish(f.raw(commandId, { eventId: `${commandId}-event` }));
+      expect(await aborted.wait(value => value === reason, "synchronous E11 inbox abort")).toBe(reason);
+      expect(inboxSignal.aborted).toBe(true); expect(inboxSignal.reason).toBe(reason);
+      await immediate();
+      expect(order).toEqual(["ack-stamp", "inbox-abort"]);
+      const original = commandRecords(f).find(record => record.delivery.payload.id === envelope.id)!;
+      expect(original.acks).toBe(0); expect(original.naks).toEqual([]); expect(original.terms).toEqual([]);
+      expect(ackRecords(f, envelope.id)).toEqual([]);
+      const outcome = f.seen(commandId)!;
+      expect(outcome.acceptance).toMatchObject({ accepted: true });
+      const custody = f.journalItems();
+      expect(custody).toEqual([expect.objectContaining({ deliveryId: commandId })]);
+      expect(f.admissions.items).toEqual([expect.objectContaining({ commandId, eventId: envelope.id })]);
+      // A named new endpoint is required by the frozen stub's single-iterator rule.
+      // This is explicit CP reactivation, NOT an E8/A2 lease-reacquisition proof.
+      ackSpy.mockRestore(); inboxSpy.mockRestore(); await f.restart(); f.start(); f.replay(envelope);
+      await f.settled(envelope.id);
+      expect(await f.ack(envelope.id)).toMatchObject(outcome.acceptance!);
+      expect(original.acks).toBe(0); // Only the explicit redelivery was acknowledged.
+      expect(f.admissions.items).toHaveLength(1); expect(f.journalItems()).toEqual(custody);
+      await f.publish(f.raw(`${commandId}-healthy`, { target: laneTargetB }));
+      await f.settled(`${commandId}-healthy`);
+      expect(f.admissions.items).toHaveLength(2); expect(f.journalItems()).toHaveLength(2);
+    });
+  }
+
+  for (const strict of [true, false]) {
+    controlIt(`T-E11-FILE-PAUSE ${strict} [SAFE local]: legacy boolean pause retains in-flight completion, holds new admission, and resume admits fresh work`, async () => {
+      const f = fixture(), entered = new Receipts<AbortSignal>(), appended = new Receipts<string>(), gate = latch();
+      f.keep(gate.release);
+      const receiverMesh = new MeshStore(f.meshRoot, 64 * 1024, 1_000, { stateBackend: "file", lockProtocol: 1 });
+      const senderMesh = new MeshStore(f.meshRoot, 64 * 1024, 1_000, { stateBackend: "file", lockProtocol: 1 });
+      const options = (hostId: string, ownerIncarnation: string): FabricControlPlaneOptions => ({
+        enabled: true, hostId, ownerIncarnation, controlIncarnationFence: "enforce", pollMs: 20, acknowledgementTimeoutMs: 120_000,
+      });
+      const receiver = new FabricControlPlane(receiverMesh, fromOwner(f), options(f.receiverOwner.hostId, f.receiver.incarnation));
+      const sender = new FabricControlPlane(senderMesh, identity(f.senderOwner.hostId), options(f.senderOwner.hostId, f.sender.incarnation));
+      cleanup.push(async () => { gate.release(); receiver.pause(); sender.pause(); await Promise.allSettled([receiver.close(), sender.close()]); receiverMesh.closeState(); senderMesh.closeState(); });
+      const publish = senderMesh.publish.bind(senderMesh);
+      vi.spyOn(senderMesh, "publish").mockImplementation(async input => {
+        const event = await publish(input);
+        if (event.topic === "fabric.control.command" && event.kind === "followUp") appended.emit(event.id);
+        return event;
+      });
+      let admissions = 0;
+      receiver.start(async (...args) => {
+        const acceptance = await f.nativeAdmission(...args);
+        if (++admissions === 1) { entered.emit(args[2]); await gate.promise; }
+        return acceptance;
+      });
+      sender.start(() => ({ accepted: false }));
+      const request = (key: string) => sender.request(f.receiverOwner.hostId, f.receiverOwner.hostId, "followUp",
+        { ownerIncarnation: receiver.incarnation, message: key }, f.receiverOwner.hostId,
+        { idempotencyKey: key, timeoutMs: 120_000 });
+      const first = request(`file-pause-${strict}-inflight`); void first.catch(() => undefined);
+      const activeSignal = await entered.wait(() => true, "actual FILE handler signal after native custody");
+      receiver.pause(strict);
+      expect(activeSignal.aborted).toBe(false); expect(f.journalItems()).toHaveLength(1);
+      gate.release(); await expect(first).resolves.toMatchObject({ acknowledged: true });
+      expect(activeSignal.aborted).toBe(false); // Boolean pause never became NATS-style cancellation.
+      const second = request(`file-pause-${strict}-held`); void second.catch(() => undefined);
+      await appended.wait(() => true, "second real FILE append while paused", 2);
+      expect(admissions).toBe(1); expect(f.journalItems()).toHaveLength(1);
+      receiver.resume(); await expect(second).resolves.toMatchObject({ acknowledged: true });
+      expect(admissions).toBe(2); expect(f.journalItems()).toHaveLength(2);
+      expect(carrierKind(receiver)).toBe("file");
+    });
+  }
+
   controlIt("T-FENCE-6: forged machine and same-machine wrong-runtime ACKs are dropped; exact owner ACK still settles", async () => {
     const f = fixture(), gate = latch(); f.keep(gate.release);
     f.start(async (...args) => { await gate.promise; return f.nativeAdmission(...args); });

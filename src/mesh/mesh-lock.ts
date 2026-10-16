@@ -331,7 +331,8 @@ export class MeshLock {
         // Arm once, before watch setup, on the same relative timer clock as both wait paths.
         // Date is lease time (it may jump); performance may be a separate diagnostic clock.
         // Lazy arming keeps uncontended acquisitions free of another clock read or timer.
-        budgetTimer ??= setTimeout(() => { budgetSpent = true; }, Math.max(0, deadline - Date.now()));
+        // Spent means strictly past the budget (+1 ms), so an attempt due exactly at the deadline still runs.
+        budgetTimer ??= setTimeout(() => { budgetSpent = true; }, Math.max(0, deadline - Date.now()) + 1);
         const pending = ticket.queued
           ? ticket.wait(ms, this.#writeAbortSignal, deadline)
           : delay(ms, this.#writeAbortSignal);

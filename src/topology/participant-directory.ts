@@ -1304,8 +1304,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
     this.#leaseConfirmed = false;
     this.#refreshedAt = Date.now();
     if (this.options.enabled) {
-      // Start before the initial publish: its per-key work can contend too. The
-      // timer also retries a failed initial publish so the host can join later.
+      // Start before the initial publish: its per-key work can contend too. A
+      // deferred publish uses the coalesced retry lane, not the idle heartbeat.
       this.#retiredTicks = 0;
       this.#degraded = false;
       this.#suspended = false;
@@ -1672,9 +1672,10 @@ export class ParticipantDirectory implements FabricParticipantSource {
   }
 
   #schedulePublicationRetry(): void {
-    if (!this.options.waitForPublicationRetry || !this.#timer || this.#closed || this.#quiescing ||
+    if ((!this.options.waitForPublicationRetry && this.#leaseConfirmed) || !this.#timer || this.#closed || this.#quiescing ||
       !(isMeshWriteDeferred(this.#refreshError) || isMeshLockTimeout(this.#refreshError)) || this.#refreshError instanceof HostLeaseLockBusyError ||
       this.#publicationRetryTimer || this.#publicationRetrying) return;
+    // Without a resident FIFO admission hook, only initial activation uses this retry lane.
     // Not tied to the heartbeat phase: one jittered, capped retry for the whole host.
     const wait = 50 + Math.floor(Math.random() * (this.#publicationRetryDelay - 50));
     this.#publicationRetryDelay = Math.min(2_000, this.#publicationRetryDelay * 2);
@@ -1697,8 +1698,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
       // occupying either actor registry; admission is not itself a heartbeat receipt.
       // Admission releases mesh BEFORE registries are taken, preserving #504/#531 and the registry -> mesh
       // lock order. Without a prepared fence, #refresh runs inside the publication fence: admit first.
-      if (!this.options.preparePublicationFence) {
-        await this.options.waitForPublicationRetry!();
+      if (!this.options.waitForPublicationRetry || !this.options.preparePublicationFence) {
+        await this.options.waitForPublicationRetry?.();
         if (this.#closed || this.#quiescing || !(isMeshWriteDeferred(this.#refreshError) || isMeshLockTimeout(this.#refreshError))) return;
         await this.refresh();
         return;

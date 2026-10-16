@@ -865,8 +865,8 @@ describe("ParticipantDirectory host leases", () => {
       }
       expect(readHostLeases(mesh.root).get(identity.id)).toMatchObject({ updatedAt: now, expiresAt: now + leaseMs });
       if (policy) expect(legacyAfter).toBeUndefined();
-      // smarty-dev#11172: a capable reader's session follows the host file TTL, never below 15 s.
-      else expect(sessionLiveness(legacyAfter, mesh.root)).toEqual({ updatedAt: now, expiresAt: now + Math.max(15_000, leaseMs) });
+      // smarty-dev#13468: the explicit 1 s heartbeat retains the fixed 15 s legacy session TTL.
+      else expect(sessionLiveness(legacyAfter, mesh.root)).toEqual({ updatedAt: now, expiresAt: now + 15_000 });
       expect(mesh.listAll("topology/participants/", { fresh: true })[0]).toEqual(participantBefore);
       expect(directory.confirmedAt()).toBe(now);
     } finally {

@@ -2,13 +2,37 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { CapturedToolCatalog } from "../src/capture/catalog.js";
 import { normalizeFabricConfig } from "../src/config.js";
 import { FabricRuntimeState } from "../src/fabric-runtime-state.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
-import { ParticipantDirectory } from "../src/topology/participant-directory.js";
+import { PARTICIPANT_HEARTBEAT_MS, ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { LIVENESS_POLICY_KEY } from "../src/topology/host-leases.js";
+
+// Each runtime/directory is closed in its test's finally block before mocks are restored.
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.unstubAllEnvs();
+});
+
+// Pi has no session-name event: renames propagate on the next heartbeat (up to 60 s).
+// As in main-heartbeat-rearm.test.ts, redirect only #armHeartbeat's production interval:
+// 5 s physical ticks, unchanged 60 s heartbeat / 180 s TTL / 120 s confirmation arithmetic.
+// No heartbeatMs override, fake clock, source polling or direct publication on rename.
+const TEST_PHYSICAL_HEARTBEAT_MS = 5_000;
+const redirectParticipantHeartbeat = () => {
+  const realSetInterval = globalThis.setInterval;
+  let redirected = 0;
+  const spy = vi.spyOn(globalThis, "setInterval").mockImplementation(((handler: () => void, delay?: number, ...args: unknown[]) => {
+    if (delay === PARTICIPANT_HEARTBEAT_MS && new Error().stack?.includes("armHeartbeat")) {
+      redirected++;
+      delay = TEST_PHYSICAL_HEARTBEAT_MS;
+    }
+    return realSetInterval(handler, delay, ...args);
+  }) as unknown as typeof setInterval);
+  return { spy, redirected: () => redirected };
+};
 
 const identity: MeshIdentity = { id: "session:owner", kind: "main", name: "main", sessionId: "owner" };
 const info = { id: identity.id, name: "Main", kind: "main", status: "idle", runner: "pi", transport: "host",
@@ -91,6 +115,7 @@ const main = (cwd: string, sessionId: string, initialName?: string) => {
 };
 
 it("lists the Pi-named Main through agents.peers/members and reaches its current name after a heartbeat rename", async () => {
+  const heartbeat = redirectParticipantHeartbeat();
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-root-name-runtime-"));
   for (const key of Object.keys(process.env)) if (key.startsWith("PI_FABRIC_")) vi.stubEnv(key, undefined);
   vi.stubEnv("PI_CODING_AGENT_DIR", path.join(root, "agent"));
@@ -108,6 +133,7 @@ it("lists the Pi-named Main through agents.peers/members and reaches its current
   try {
     await owner.runtime.initialize(owner.context, config);
     await reviewer.runtime.initialize(reviewer.context, config);
+    expect(heartbeat.redirected()).toBeGreaterThanOrEqual(2);
     const check = async (name: string) => {
       expect(await reviewer.invoke("agents.peers")).toEqual([expect.objectContaining({ id: ownerId, name })]);
       expect(await reviewer.invoke("agents.members", { kinds: ["root"] })).toEqual(expect.arrayContaining([
@@ -146,6 +172,7 @@ const acrossRoots = async (filesOnly: boolean, run: (roots: {
   owner: ReturnType<typeof main>; reviewer: ReturnType<typeof main>; duplicate: ReturnType<typeof main>;
   ownerId: string; reviewerId: string; duplicateId: string;
 }) => Promise<void>) => {
+  const heartbeat = redirectParticipantHeartbeat();
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-cross-root-name-"));
   for (const key of Object.keys(process.env)) if (key.startsWith("PI_FABRIC_")) vi.stubEnv(key, undefined);
   vi.stubEnv("PI_CODING_AGENT_DIR", path.join(root, "agent"));
@@ -173,6 +200,7 @@ const acrossRoots = async (filesOnly: boolean, run: (roots: {
     await owner.runtime.initialize(owner.context, config);
     await reviewer.runtime.initialize(reviewer.context, config);
     await duplicate.runtime.initialize(duplicate.context, config);
+    expect(heartbeat.redirected()).toBeGreaterThanOrEqual(3);
     // Prove the file-only leg really has no state/legacy participant fallback.
     if (filesOnly) {
       expect(reviewer.runtime.mesh.listAll("topology/participants/", { fresh: true })).toEqual([]);

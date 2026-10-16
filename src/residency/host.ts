@@ -1736,7 +1736,6 @@ export class ResidentHost {
       if (eligible.length > 32 && progressed) this.#requestKick = true;
     } finally {
       this.#pollingRequests = false;
-      if (!retentionV2Enabled()) this.#maintainRequests();
       await this.#checkIdle(false);
     }
   }

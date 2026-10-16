@@ -9,6 +9,7 @@ import { stageRunArchive } from "../src/agents/archive-custody.js";
 import type { AgentRunResult } from "../src/agents/types.js";
 import { readHostLease } from "../src/topology/host-leases.js";
 import { PARTICIPANT_HEARTBEAT_MS } from "../src/topology/participant-directory.js";
+import * as retentionPlatform from "../src/storage/retention-platform.js";
 import type { ResidentHostConfig } from "../src/residency/protocol.js";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
 
@@ -25,6 +26,28 @@ const fixture = () => {
 };
 
 describe("resident recovery startup and lease fence (#3864)", () => {
+  it("does not run legacy request maintenance before startup resolves", async () => {
+    const { root, config, host } = fixture();
+    const retentionV2 = vi.spyOn(retentionPlatform, "retentionV2Enabled").mockReturnValue(false);
+    const id = "c".repeat(32);
+    const run = path.join(config.residencyRoot, "runs", id);
+    const sessionFile = path.join(root, "actor", "session.jsonl");
+    fs.mkdirSync(run, { recursive: true });
+    fs.mkdirSync(path.dirname(sessionFile), { recursive: true });
+    fs.writeFileSync(sessionFile, "");
+    const result = { id, name: "private child", status: "stopped", text: "full outcome", startedAt: 1, finishedAt: 2,
+      transport: "process", sessionId: "2147483647",
+      spawner: { id: "actor:review", kind: "actor", runId: "a".repeat(32) } } as AgentRunResult;
+    fs.writeFileSync(path.join(run, "status.json"), JSON.stringify(result));
+    fs.writeFileSync(path.join(run, "events.jsonl"), "event\n");
+    stageRunArchive(run, { format: 1, kind: "shutdown", result, actorSessionFile: sessionFile, actorOnly: true, notify: true });
+    try {
+      await host.start();
+      expect(fs.existsSync(path.join(run, "archive-pending.json"))).toBe(true);
+      await vi.waitFor(() => expect(fs.existsSync(path.join(run, "archive-pending.json"))).toBe(false));
+    } finally { retentionV2.mockRestore(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
   it.each([false, true])("replays full pending child archives after readiness without weakening root custody (live=%s)", async live => {
     const { root, config, host } = fixture();
     const id = "b".repeat(32);

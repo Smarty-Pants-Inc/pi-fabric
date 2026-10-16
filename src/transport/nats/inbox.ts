@@ -57,12 +57,14 @@ export interface NatsTransportOptions extends NatsPermissionPolicy {
   readonly duplicateWindowMs?: number;
   readonly requestTimeoutMs?: number;
   readonly provision?: boolean;
+  readonly signal?: AbortSignal;
 }
 
 type OpenOptions = NatsTransportOptions | FabricTransportOptions;
 type ResolvedNatsOptions = Required<Pick<NatsTransportOptions, "servers" | "machine" | "hostId" | "credentials" | "custodyStream" | "livenessStream" | "pathBMachines" | "maxBytes" | "maxMessageBytes" | "duplicateWindowMs" | "requestTimeoutMs" | "provision">> & {
   readonly name?: string;
   readonly tls?: TlsOptions;
+  readonly signal?: AbortSignal;
 };
 
 const isDirectOptions = (options: OpenOptions): options is NatsTransportOptions => "servers" in options;
@@ -92,6 +94,7 @@ const normalizeOptions = (options: OpenOptions): ResolvedNatsOptions => {
       duplicateWindowMs: options.duplicateWindowMs ?? DEFAULT_DUPLICATE_WINDOW_MS,
       requestTimeoutMs: options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
       provision: options.provision ?? false,
+      ...(options.signal === undefined ? {} : { signal: options.signal }),
     } as ResolvedNatsOptions;
   }
   const config = options.config as unknown as { nats?: {
@@ -123,6 +126,7 @@ const normalizeOptions = (options: OpenOptions): ResolvedNatsOptions => {
     duplicateWindowMs: DEFAULT_DUPLICATE_WINDOW_MS,
     requestTimeoutMs: 5_000,
     provision: false,
+    ...(options.signal === undefined ? {} : { signal: options.signal }),
   } as ResolvedNatsOptions;
 };
 
@@ -166,6 +170,7 @@ type ReadyWaiter = {
 };
 
 const openNatsSession = async (options: ResolvedNatsOptions, signal?: AbortSignal): Promise<NatsSession> => {
+  signal?.throwIfAborted();
   const connection = await openNatsConnection({
     servers: options.servers,
     credentials: options.credentials,
@@ -176,10 +181,9 @@ const openNatsSession = async (options: ResolvedNatsOptions, signal?: AbortSigna
     pathBMachines: options.pathBMachines,
     ...(options.tls === undefined ? {} : { tls: options.tls }),
     timeoutMs: options.requestTimeoutMs,
+    ...(signal === undefined ? {} : { signal }),
   });
-  const assertAlive = (): void => {
-    if (signal?.aborted) throw new TransportUnavailableError("NATS transport reopen was cancelled");
-  };
+  const assertAlive = (): void => signal?.throwIfAborted();
   try {
     assertAlive();
     const { manager } = connection;
@@ -211,7 +215,8 @@ const openNatsSession = async (options: ResolvedNatsOptions, signal?: AbortSigna
     if (consumer.config.description !== description) throw new TransportInvalidError("transport inbox owner description mismatch");
     return { connection, js: connection.js, manager, kvStores: { leases, presence } };
   } catch (error) {
-    await connection.close();
+    await connection.close().catch(() => undefined);
+    signal?.throwIfAborted();
     throw error;
   }
 };
@@ -322,6 +327,8 @@ class NatsTransportImpl implements FabricTransport {
   readonly #closeController = new AbortController();
   #session: NatsSession | undefined;
   #closed = false;
+  #closeTask: Promise<void> | undefined;
+  readonly #onOwnerAbort = (): void => { void this.close().catch(() => undefined); };
   #terminalError: Error | undefined;
   #reconnectTask: Promise<void> | undefined;
   #epoch = 0;
@@ -340,16 +347,24 @@ class NatsTransportImpl implements FabricTransport {
       presence: new RebindingKvStore(PRESENCE_TTL_MS, () => this.#session?.kvStores.presence, (signal) => this.#waitForSession(signal), () => this.#epoch, () => this.#closed, () => this.#unavailable()),
     };
     this.#installSession(session);
+    options.signal?.addEventListener("abort", this.#onOwnerAbort, { once: true });
   }
 
   static async open(rawOptions: OpenOptions): Promise<NatsTransportImpl> {
+    rawOptions.signal?.throwIfAborted();
     const options = normalizeOptions(rawOptions);
     if (!options.hostId) throw new Error("hostId is required");
     for (const [key, value] of Object.entries(options)) {
       if (["servers", "machine", "hostId", "name", "credentials"].includes(key)) continue;
       if (typeof value === "number" && (!Number.isSafeInteger(value) || value <= 0)) throw new Error(`${key} must be positive`);
     }
-    return new NatsTransportImpl(await openNatsSession(options), options);
+    const transport = new NatsTransportImpl(await openNatsSession(options, options.signal), options);
+    // Cover an abort between acquisition and owner-listener registration.
+    if (options.signal?.aborted) {
+      await transport.close().catch(() => undefined);
+      options.signal.throwIfAborted();
+    }
+    return transport;
   }
 
   #unavailable(): Error {
@@ -419,13 +434,14 @@ class NatsTransportImpl implements FabricTransport {
       const delay = Math.min(5_000, 100 * 2 ** Math.min(attempt, 6)) + Math.floor(Math.random() * 100);
       try { await sleep(delay, undefined, { signal: this.#closeController.signal }); }
       catch { return; }
-      if (this.#closed || this.#terminalError || this.#session) return;
+      if (this.#closed || this.#closeController.signal.aborted || this.#terminalError || this.#session) return;
       try {
         const session = await openNatsSession(this.#options, this.#closeController.signal);
-        if (this.#closed) { await session.connection.close().catch(() => undefined); return; }
+        if (this.#closed || this.#closeController.signal.aborted) { await session.connection.close().catch(() => undefined); return; }
         this.#installSession(session);
         return;
       } catch (error) {
+        if (this.#closed || this.#closeController.signal.aborted) return;
         if (authorizationFailure(error)) {
           this.#terminalError = error instanceof Error ? error : new Error("NATS authorization failed");
           this.#activeInbox?.controller.abort();
@@ -518,7 +534,9 @@ class NatsTransportImpl implements FabricTransport {
     const description = JSON.stringify({ fabricHostId: this.self.hostId, machine: this.self.machine });
     try {
       while (!signal.aborted && !this.#closed) {
-        const session = await this.#waitForSession(signal);
+        let session: NatsSession;
+        try { session = await this.#waitForSession(signal); }
+        catch (error) { if (this.#closed) return; throw error; }
         if (signal.aborted || this.#closed) return;
         const controller = new AbortController();
         const queue = new Readable({ objectMode: true, read() {} });
@@ -577,6 +595,7 @@ class NatsTransportImpl implements FabricTransport {
             if (!controller.signal.aborted && !signal.aborted) throw error;
           }
           } catch (error) {
+            if (this.#closed) return;
             if (!controller.signal.aborted && (session.connection.nc.isClosed() || session.connection.nc.isDraining())) this.#loseSession(session);
             if (!(controller.signal.aborted && !signal.aborted && !this.#closed && this.#session !== session)) throw error;
           }
@@ -610,18 +629,22 @@ class NatsTransportImpl implements FabricTransport {
     return { pending: info.num_pending, ackPending: info.num_ack_pending };
   }
 
-  async close(): Promise<void> {
-    if (this.#closed) return;
+  close(): Promise<void> {
+    if (this.#closed) return this.#closeTask ?? Promise.resolve();
     this.#closed = true;
-    this.#closeController.abort();
+    this.#options.signal?.removeEventListener("abort", this.#onOwnerAbort);
+    this.#closeController.abort(this.#options.signal?.reason);
     this.#activeInbox?.controller.abort();
     this.#rejectWaiters(new TransportUnavailableError("NATS transport is closed"));
     const session = this.#session;
     this.#session = undefined;
     session?.unsubscribe?.();
-    if (session) await session.connection.close();
     const reconnect = this.#reconnectTask;
-    if (reconnect) await reconnect;
+    this.#closeTask = (async () => {
+      try { if (session) await session.connection.close(); }
+      finally { if (reconnect) await reconnect; }
+    })();
+    return this.#closeTask;
   }
 }
 

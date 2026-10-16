@@ -18,6 +18,17 @@ export class ReconnectRelay {
   readonly commands: string[] = [];
   readonly errors: Error[] = [];
   readonly url: string;
+  connectionCount = 0;
+  private readonly clients = new Set<Socket>();
+  private readonly idleWaiters = new Set<() => void>();
+  get activeConnections(): number { return this.clients.size; }
+
+  /** Native socket-close observation; callers supply their own finite deadline. */
+  whenIdle(): Promise<void> {
+    if (this.sockets.size === 0) return Promise.resolve();
+    return new Promise((resolve) => { this.idleWaiters.add(resolve); });
+  }
+
   enabled = true;
   holdVerification = false;
   private held: Array<() => void> = [];
@@ -41,11 +52,20 @@ export class ReconnectRelay {
   private track<T extends Socket>(socket: T): T {
     this.sockets.add(socket);
     socket.on("error", () => undefined); // A deliberate disconnect is part of the fixture.
-    socket.once("close", () => this.sockets.delete(socket));
+    socket.once("close", () => {
+      this.sockets.delete(socket);
+      if (this.sockets.size === 0) {
+        for (const resolve of this.idleWaiters) resolve();
+        this.idleWaiters.clear();
+      }
+    });
     return socket;
   }
 
   private accept(client: Socket): void {
+    this.connectionCount += 1;
+    this.clients.add(client);
+    client.once("close", () => this.clients.delete(client));
     this.track(client);
     if (!this.enabled) { client.destroy(); return; }
     const target = this.routeTarget;

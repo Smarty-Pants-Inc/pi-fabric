@@ -84,6 +84,16 @@ describe("real three-node NATS metadata-leader election", () => {
     const creates: ConsumerInfo[] = [];
     const placements: unknown[] = [];
     const metrics: { records: number; gets: number; elapsedMs: number }[] = [];
+    // Setup and placement have separate cumulative budgets. In particular, a healthy seed's initial NEXT may
+    // recover on the SDK's 30s pull expiry without spending the 30s allowed to find the actual fault placement.
+    let setupRemainingMs = 60_000;
+    let placementRemainingMs = 30_000;
+    const inFlight = new Set<Promise<unknown>>();
+    const track = <T,>(operation: Promise<T>): Promise<T> => {
+      inFlight.add(operation);
+      void operation.then(() => inFlight.delete(operation), () => inFlight.delete(operation));
+      return operation;
+    };
     const deferred = <T,>() => {
       let resolve!: (value: T) => void;
       const promise = new Promise<T>(yes => { resolve = yes; });
@@ -207,14 +217,47 @@ describe("real three-node NATS metadata-leader election", () => {
       fs.mkdirSync(root);
       roots.push(root);
       ownStreams.add(natsStreamName(root));
-      const { port } = await makePort();
-      const backend = await openNatsStateBackend({ root, port, replicas: 3, snapshotEvery: 0 });
-      for (let index = 0; index < records; index++) await backend.put({ key: `bootstrap/${index}`, value: { index }, identity });
-      const expected = backend.listAll();
-      expect(backend.diagnostics().nats).toMatchObject({ appliedSeq: records, knownSeq: records });
-      closeNatsStateBackend(root);
-      await port.close();
-      return { root, expected };
+      const started = performance.now();
+      if (setupRemainingMs <= 0) throw new Error(`SETUP ${name}: cumulative seed preparation budget exhausted`);
+      const deadline = started + setupRemainingMs;
+      let active = true;
+      let port: JetStreamPort | undefined;
+      const assertActive = () => {
+        if (!active || performance.now() >= deadline) throw new Error(`SETUP ${name}: seed preparation budget expired`);
+      };
+      const preparing = (async () => {
+        ({ port } = await makePort());
+        assertActive();
+        const backend = await openNatsStateBackend({ root, port, replicas: 3, snapshotEvery: 0 });
+        assertActive();
+        for (let index = 0; index < records; index++) {
+          assertActive();
+          // Exactly one write per seed key. An unknown outcome or a projector BUSY ends SETUP; never retry it.
+          await backend.put({ key: `bootstrap/${index}`, value: { index }, identity });
+        }
+        assertActive();
+        const head = (await manager.streams.info(natsStreamName(root))).state.last_seq;
+        assertActive();
+        expect(head).toBe(records);
+        // put resolves after native projection. Confirm the actual server head, not just an ACK or a fixed sleep.
+        expect(backend.diagnostics().nats).toMatchObject({ appliedSeq: head, knownSeq: head });
+        const expected = backend.listAll();
+        console.log(`NATS_BOOTSTRAP_SEED_READY ${JSON.stringify({ name, records, head, elapsedMs: performance.now() - started })}`);
+        return { root, expected };
+      })();
+      try { return await bounded(preparing, setupRemainingMs, `SETUP ${name}`); }
+      catch (error) { throw new Error(`SETUP ${name}: ${error instanceof Error ? error.message : String(error)}`, { cause: error }); }
+      finally {
+        active = false;
+        closeNatsStateBackend(root);
+        await port?.close();
+        // A deadline observes, but does not cancel, I/O. Join before final cleanup so no late open can register a
+        // prepared backend or begin another seed write after this setup has returned or failed.
+        await preparing.catch(() => undefined);
+        closeNatsStateBackend(root);
+        await port?.close();
+        setupRemainingMs -= performance.now() - started;
+      }
     };
     try {
       // Observations, not an invented one-GET or hard-millisecond performance SLA. Parent records BASE/candidate.
@@ -230,21 +273,24 @@ describe("real three-node NATS metadata-leader election", () => {
         closeNatsStateBackend(root);
         await measured.port.close();
       }
-      selectionDeadline = Date.now() + 30_000;
-      // Only successful healthy setups may advance this bounded placement precondition. ANY open/API error escapes.
-      for (let setup = 1; setup <= 32 && Date.now() < selectionDeadline; setup++) {
+      // Seed preparation is readiness-confirmed BEFORE opening this placement window. Neither its time nor a
+      // failed/ambiguous seed write may be mistaken for a failed fault-placement attempt.
+      for (let setup = 1; setup <= 32 && placementRemainingMs > 0; setup++) {
+        const { root, expected } = await makeSeed(`fault-bootstrap-${setup}`, 3);
+        const placementStarted = performance.now();
+        selectionDeadline = Date.now() + placementRemainingMs;
         const remaining = () => Math.max(1, selectionDeadline - Date.now());
-        const { root, expected } = await bounded(makeSeed(`fault-bootstrap-${setup}`, 3), remaining(), "seed placement precondition");
-        const measured = await bounded(makePort(), remaining(), "connect placement precondition");
+        const measured = await bounded(track(makePort()), remaining(), "connect placement precondition");
         selecting = true;
         const started = performance.now();
-        const opening = openNatsStateBackend({ root, port: measured.port, replicas: 3, snapshotEvery: 0 });
+        const opening = track(openNatsStateBackend({ root, port: measured.port, replicas: 3, snapshotEvery: 0 }));
         // Selection ends at the actual pre-NEXT placement event, not at a later faulted open's completion.
         const selected = await bounded(Promise.race([
           opening.then(backend => ({ backend })), faultArmed.promise.then(() => ({ fault: true as const })),
         ]), remaining(), "reopen placement precondition");
         const backend = "backend" in selected ? selected.backend : await bounded(opening, 5_500, "faulted initial open");
         selecting = false;
+        placementRemainingMs -= performance.now() - placementStarted;
         expect(backend.listAll()).toEqual(expected);
         expect(backend.diagnostics().nats).toMatchObject({ appliedSeq: 3, knownSeq: 3 });
         if (!faults) {
@@ -307,13 +353,16 @@ describe("real three-node NATS metadata-leader election", () => {
       resume(); // Must precede observer/port close and the existing fixture afterEach cleanup.
       clearTimeout(resumeTimer);
       selecting = false;
+      // Join timed-out connect/open operations before restoring instrumentation and taking the cleanup snapshot.
+      // Every product request keeps its existing finite SDK/write budget; no open is retried by this harness.
+      await Promise.allSettled([...inFlight]);
       getSpy.mockRestore();
       addSpy.mockRestore();
       for (const root of roots) closeNatsStateBackend(root);
       try { await bounded(Promise.all(ports.map(port => port.close())), 3_000, "bootstrap ports close"); }
       finally { await observer.close(); }
     }
-  }, 90_000);
+  }, 180_000); // Covers separate 60s SETUP + 30s placement + recovery; the faulted-open budget remains 5s.
 
   it.skipIf(!binary)("bounds unavailable R3 placement and recovers migrations and new-root opens when the peer returns", async () => {
     const cluster = await startNatsElectionCluster(binary!);

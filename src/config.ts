@@ -530,10 +530,10 @@ const meshNatsReplicas = (value: unknown): number => {
   throw new Error("mesh.nats.replicas must be a positive integer");
 };
 
-/** E14 messaging/rollback settings fail visibly in the same typed config-error family as E9. */
+/** Messaging/rollback settings fail visibly in the same typed config-error family as E9. */
 export class FabricMeshNatsConfigError extends Error {
   readonly code = "FABRIC_MESH_TRANSPORT_CONFIG";
-  constructor(readonly field: "operatorMachine" | "rollbackHoldUntil", requirement: string) {
+  constructor(readonly field: "operatorMachine" | "rollbackHoldUntil" | "servers" | "custodyStream" | "livenessStream" | "pathBMachines" | "tls" | "allowInsecureLoopback" | "verifyMachine", requirement: string) {
     super(`mesh.nats.${field} ${requirement}`);
     this.name = "FabricMeshNatsConfigError";
   }
@@ -544,6 +544,13 @@ export interface FabricMeshNatsConfig {
   replicas: number;
   /** Messaging connection settings. No credential is read while loading config. */
   servers?: string[];
+  /** Required literal policy mapping in NATS mode; full permission verification stays in the lazy adapter. */
+  custodyStream?: string;
+  livenessStream?: string;
+  /** Explicit runtime inventory (1..64 unique, non-operator machine literals). */
+  pathBMachines?: string[];
+  /** Required trust anchor in NATS mode. Config never reads the CA or permits verification overrides. */
+  tls?: { ca?: string; caFile?: string };
   /** Host credential file path, consumed only by the NATS adapter. */
   credentials?: string;
   /** Literal machine id; the adapter must also verify it against the credential. */
@@ -559,7 +566,7 @@ export interface FabricMeshNatsConfig {
 const meshNatsString = (value: unknown, field: "credentials" | "machine"): string | undefined => {
   if (value === undefined) return undefined;
   if (typeof value !== "string") throw new Error(`mesh.nats.${field} must be a string`);
-  if (field === "machine" && !/^[a-z0-9][a-z0-9-]{0,31}$/.test(value)) {
+  if (field === "machine" && /^[a-z0-9][a-z0-9-]{0,31}$/.exec(value)?.[0] !== value) {
     throw new Error("mesh.nats.machine must match /^[a-z0-9][a-z0-9-]{0,31}$/");
   }
   return value;
@@ -589,13 +596,75 @@ const meshNatsRollbackHoldUntil = (value: unknown): string | undefined => {
   throw new FabricMeshNatsConfigError("rollbackHoldUntil", "must be a valid UTC ISO-8601 timestamp");
 };
 
+// ponytail: minimal eager mirrors of streams()/streamName() in mesh/nats-auth/permissions.ts
+// and pathBMachines() in mesh/nats-auth/mint.ts. Do not import their permission catalog or NATS
+// dependency graph into config. connection.ts performs canonical signed-scope verification lazily.
+// Compare the full regex match, not only test(): `$` can otherwise admit a final line terminator.
+const meshNatsStream = (value: unknown, field: "custodyStream" | "livenessStream"): string => {
+  if (typeof value !== "string" || /^[A-Za-z0-9_-]{1,255}$/.exec(value)?.[0] !== value ||
+    /^(?:FABRIC_MESH_|_INBOX)/.test(value.toUpperCase())) {
+    throw new FabricMeshNatsConfigError(field, "is required in NATS mode and must be a non-reserved literal stream name");
+  }
+  return value;
+};
+
+const meshNatsPathBMachines = (value: unknown): string[] => {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 64 ||
+    [...value].some(machine => typeof machine !== "string" || /^[a-z0-9][a-z0-9-]{0,31}$/.exec(machine)?.[0] !== machine ||
+      /^fabric-ops(-[a-z0-9]+)?$/.exec(machine)?.[0] === machine) || new Set(value).size !== value.length) {
+    throw new FabricMeshNatsConfigError("pathBMachines", "is required in NATS mode and must contain 1..64 unique non-operator machine literals");
+  }
+  return [...value] as string[];
+};
+
+const meshNatsTls = (value: unknown): NonNullable<FabricMeshNatsConfig["tls"]> => {
+  if (!isJsonObject(value) || ![Object.prototype, null].includes(Object.getPrototypeOf(value)) ||
+    Reflect.ownKeys(value).some(key => key !== "ca" && key !== "caFile")) {
+    throw new FabricMeshNatsConfigError("tls", "is required in NATS mode and supports only ca and caFile");
+  }
+  const tls: NonNullable<FabricMeshNatsConfig["tls"]> = {};
+  for (const key of ["ca", "caFile"] as const) {
+    if (!Object.hasOwn(value, key)) continue;
+    const entry = value[key];
+    if (typeof entry !== "string" || !entry.trim()) {
+      throw new FabricMeshNatsConfigError("tls", "ca and caFile must be nonempty strings");
+    }
+    tls[key] = entry;
+  }
+  if (tls.ca === undefined && tls.caFile === undefined) {
+    throw new FabricMeshNatsConfigError("tls", "requires at least one of ca or caFile");
+  }
+  return tls;
+};
+
+const meshNatsServers = (value: unknown): string[] => {
+  const validServer = (server: unknown): boolean => {
+    if (typeof server !== "string") return false;
+    const match = /^tls:\/\/([A-Za-z0-9.-]+):([0-9]{1,5})$/.exec(server);
+    if (!match || match[0] !== server) return false;
+    const host = match[1]!;
+    // Mirror connection.ts's numeric/0x refusal; DNS labels also exclude IPv6, userinfo and URL syntax.
+    if (host.length > 253 || /^[0-9.]+$/.test(host) || /^0x/i.test(host)) return false;
+    const labels = (host.endsWith(".") ? host.slice(0, -1) : host).split(".");
+    return labels.every(label => /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$/.exec(label)?.[0] === label) &&
+      Number(match[2]) >= 1 && Number(match[2]) <= 65535;
+  };
+  if (!Array.isArray(value) || value.length === 0 || ![...value].every(validServer)) {
+    throw new FabricMeshNatsConfigError("servers", "must be an explicit nonempty array of tls://<DNS>:port URLs");
+  }
+  return [...value] as string[];
+};
+
 const meshNatsConfig = (value: unknown, transport: FabricMeshTransport): FabricMeshNatsConfig => {
   const nats = objectValue(value);
-  // File mode still ignores messaging settings and their inherited snapshot. E14's hold is host rollback policy.
+  // FILE ignores messaging settings and inherited snapshots. Only the existing machine and hold
+  // remain rollback authority; no machine means the exact old default shape. Invalid authority refuses.
   if (transport === "file") {
+    const machine = meshNatsString(nats.machine, "machine");
     const rollbackHoldUntil = meshNatsRollbackHoldUntil(nats.rollbackHoldUntil);
     return {
       replicas: meshNatsReplicas(nats.replicas), inboxLanes: 8,
+      ...(machine !== undefined ? { machine } : {}),
       ...(rollbackHoldUntil !== undefined ? { rollbackHoldUntil } : {}),
     };
   }
@@ -609,17 +678,24 @@ const meshNatsConfig = (value: unknown, transport: FabricMeshTransport): FabricM
     messaging = parsed;
   }
   // Inheritance replaces messaging settings, including absent optional fields, but not state-backend replicas.
-  const servers = messaging.servers;
-  if (servers !== undefined && (!Array.isArray(servers) || servers.some(server => typeof server !== "string"))) {
-    throw new Error("mesh.nats.servers must be an array of strings");
+  for (const field of ["allowInsecureLoopback", "verifyMachine"] as const) {
+    if (field in nats || field in messaging) throw new FabricMeshNatsConfigError(field, "is not supported in NATS config");
   }
+  const servers = meshNatsServers(messaging.servers);
+  const custodyStream = meshNatsStream(messaging.custodyStream, "custodyStream");
+  const livenessStream = meshNatsStream(messaging.livenessStream, "livenessStream");
+  if (custodyStream.toUpperCase() === livenessStream.toUpperCase()) {
+    throw new FabricMeshNatsConfigError("livenessStream", "must differ from custodyStream (case-insensitive)");
+  }
+  const pathBMachines = meshNatsPathBMachines(messaging.pathBMachines);
+  const tls = meshNatsTls(messaging.tls);
   const credentials = meshNatsString(messaging.credentials, "credentials");
   const machine = meshNatsString(messaging.machine, "machine");
   const operatorMachine = validateFabricNatsOperatorMachine(messaging.operatorMachine, machine);
   const rollbackHoldUntil = meshNatsRollbackHoldUntil(messaging.rollbackHoldUntil);
   return {
     replicas: meshNatsReplicas(nats.replicas),
-    ...(servers !== undefined ? { servers: [...servers as string[]] } : {}),
+    servers, custodyStream, livenessStream, pathBMachines, tls,
     ...(credentials !== undefined ? { credentials } : {}),
     ...(machine !== undefined ? { machine } : {}),
     operatorMachine,

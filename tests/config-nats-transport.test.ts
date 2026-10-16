@@ -27,6 +27,14 @@ describe.sequential("NATS transport policy and TLS configuration", () => {
     const value: Record<string, unknown> = nats(); delete value[field]; refuses(value, field);
   });
   it.each(["tls://127.0.0.1:4222", "tls://[::1]:4222", "tls://2130706433:4222", "tls://0x7f000001:4222", "nats://localhost:4222", "tls://localhost:0", "tls://localhost:65536", "tls://localhost:4222\n"])("refuses non-DNS/plaintext/invalid URL %s", server => refuses({ ...nats(), servers: [server] }, "servers"));
+  it("refuses mixed-hex, decimal-integer, octal and short IPv4 spellings after canonicalization", () => {
+    for (const host of ["127.0x0.1", "0x7f.1", "2130706433", "0177.1", "127.1"])
+      refuses({ ...nats(), servers: [`tls://${host}:4222`] }, "servers");
+  });
+  it("still accepts localhost as a DNS name without attempting credential or CA reads", () => {
+    expect(normalizeFabricConfig(config({ ...nats(), servers: ["tls://localhost:4222"] })).mesh.nats.servers)
+      .toEqual(["tls://localhost:4222"]);
+  });
   it("checks every server, including sparse lists", () => {
     refuses({ ...nats(), servers: [nats().servers[0], "tls://127.0.0.1:4222"] }, "servers");
     refuses({ ...nats(), servers: new Array(1) }, "servers");

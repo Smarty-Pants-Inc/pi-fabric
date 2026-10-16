@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { isIP } from "node:net";
 import { diagnostics } from "./core/diagnostics.js";
 import { readHostPolicy, warnAgentLandlockDisabled, type HostPolicy } from "./host-policy.js";
 export { readHostPolicy } from "./host-policy.js";
@@ -643,8 +644,11 @@ const meshNatsServers = (value: unknown): string[] => {
     const match = /^tls:\/\/([A-Za-z0-9.-]+):([0-9]{1,5})$/.exec(server);
     if (!match || match[0] !== server) return false;
     const host = match[1]!;
-    // Mirror connection.ts's numeric/0x refusal; DNS labels also exclude IPv6, userinfo and URL syntax.
-    if (host.length > 253 || /^[0-9.]+$/.test(host) || /^0x/i.test(host)) return false;
+    if (host.length > 253) return false;
+    // ponytail: a tls: URL is not WHATWG-special, so mixed-hex IPv4 survives its parser.
+    // Use the standard HTTP hostname rules before the DNS check, not another numeric-host grammar.
+    try { if (isIP(new URL(`http://${host}`).hostname) !== 0) return false; }
+    catch { return false; }
     const labels = (host.endsWith(".") ? host.slice(0, -1) : host).split(".");
     return labels.every(label => /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$/.exec(label)?.[0] === label) &&
       Number(match[2]) >= 1 && Number(match[2]) <= 65535;

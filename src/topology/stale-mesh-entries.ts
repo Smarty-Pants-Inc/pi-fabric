@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createRequire } from "node:module";
-import { isMeshStateMovedMarker, readMeshStateMovedMarker } from "../mesh/backend-fence.js";
+import { isMeshStateMovedMarker } from "../mesh/backend-fence.js";
 import { openPrivateStateDb } from "../mesh/state-gate.js";
 import type { SqliteConnection } from "../mesh/state-sqlite.js";
 import { ownProcessIncarnation, syncDirectoryChain } from "../core/atomic-write.js";
@@ -123,16 +123,21 @@ const archivedPath = (batch: string, file: ArchivedFile): string => {
   if (!dirs.includes(directory as Directory) || !tail.length) throw new Error("Archive file outside allowed directories");
   return `archive/${directory}/${batch}/${tail.join("/")}`;
 };
+const sameInode = (root: string, left: string, right: string): boolean => {
+  const a = fs.lstatSync(inside(root, left), { bigint: true });
+  const b = fs.lstatSync(inside(root, right), { bigint: true });
+  return a.isFile() && b.isFile() && a.dev === b.dev && a.ino === b.ino;
+};
 
 /** Gate refuses rather than tightening permissions: a dry-run must not chmod state. */
-const openSqlite = (root: string, readOnly: boolean): SqliteConnection => {
+const openSqlite = (root: string): SqliteConnection => {
   for (const name of ["state.db", "state.db-wal", "state.db-shm"]) {
     const file = inside(root, name), stat = fs.lstatSync(file, { throwIfNoEntry: false });
     if (stat && (!stat.isFile() || (process.platform !== "win32" && ((stat.mode & 0o077) !== 0 ||
         (typeof process.getuid === "function" && stat.uid !== process.getuid()))))) throw new Error(`SQLite path is not private: ${name}`);
   }
   const { DatabaseSync } = createRequire(import.meta.url)("node:sqlite") as typeof import("node:sqlite");
-  return openPrivateStateDb(inside(root, "state.db"), file => new DatabaseSync(file, { readOnly }) as unknown as SqliteConnection);
+  return openPrivateStateDb(inside(root, "state.db"), file => new DatabaseSync(file, { readOnly: true }) as unknown as SqliteConnection);
 };
 
 interface StateReadCache { copy?: FileCopy | undefined; raw?: Record<string, unknown> | undefined; }
@@ -140,7 +145,7 @@ interface StateReadCache { copy?: FileCopy | undefined; raw?: Record<string, unk
  * pinned private database gate, WITHOUT SqliteStateStore initialization or census.
  * A file-store snapshot is reused only after a fresh full generation check under
  * custody. Unchanged files must not be reread/parsed once per archived group. */
-const stateView = (root: string, heldDb?: SqliteConnection, keys?: readonly string[], cache?: StateReadCache): { mesh: MeshStore; stamp: string } => {
+const stateView = (root: string, keys?: readonly string[], cache?: StateReadCache): { mesh: MeshStore; stamp: string } => {
   noLinks(path.join(root, "state.json"));
   const stat = fs.lstatSync(inside(root, "state.json"), { bigint: true, throwIfNoEntry: false });
   const unchanged = !!cache?.copy && !!stat && generation(stat) === cache.copy.generation;
@@ -150,9 +155,9 @@ const stateView = (root: string, heldDb?: SqliteConnection, keys?: readonly stri
   const rootStat = fs.lstatSync(root, { bigint: true });
   let rows = object(raw?.entries), stamp = `file:${rootStat.dev}:${rootStat.ino}:${raw?.backendEpoch ?? 0}`;
   if (isMeshStateMovedMarker(raw)) {
-    const db = heldDb ?? openSqlite(root, true);
+    const db = openSqlite(root);
     try {
-      if (!heldDb) db.exec("BEGIN");
+      db.exec("BEGIN");
       const meta = new Map(db.prepare("SELECT name, value FROM meta").all().map(row => [String(row.name), row.value]));
       if (Number(meta.get("schema")) !== 1 || meta.get("backend") !== "sqlite" || Number(meta.get("epoch")) !== raw.epoch ||
           typeof meta.get("store_id") !== "string" || !String(meta.get("store_id")) ||
@@ -173,7 +178,7 @@ const stateView = (root: string, heldDb?: SqliteConnection, keys?: readonly stri
           value: JSON.parse(String(row.value)), version: Number(row.version), updatedAt: Number(row.updated_at), updatedBy: JSON.parse(String(row.updated_by)) } });
       }
       if (!exact(copy!, readCopy(root, "state.json"))) throw new Error("SQLite moved marker changed during snapshot");
-    } finally { if (!heldDb) { try { db.exec("ROLLBACK"); } finally { db.close(); } } }
+    } finally { try { db.exec("ROLLBACK"); } finally { db.close(); } }
   } else if (copy && (!raw || (raw.format !== 1 && raw.format !== 2) || !rows)) {
     throw new Error("Unknown/NATS state backend; archival refused");
   } else if (fs.existsSync(inside(root, "state.db"))) throw new Error("File/database coexistence requires a canonical moved marker");
@@ -244,9 +249,20 @@ const ownerDead = (root: string, owner: string, now: number, state: StateView, l
     finite(writer.startedAt) && !censusRecordAlive(writer.pid, writer);
 };
 
+/** SQLite facts cannot supply positive death authority: generic same-uid state
+ * writes are not lease-gated. Only a native token's independently dead LOCAL
+ * writer qualifies; canonical claims/renewals share the held target lease gate. */
+const nativeSqliteDeath = (lease: FabricHostLease | undefined): boolean => {
+  const writer = lease?.writer;
+  return !!lease && typeof lease.incarnationToken === "string" && lease.incarnationToken.length > 0 &&
+    lease.mirror === undefined && lease.mirrorLease === undefined && writer?.lockProtocol === 3 && writer.host === os.hostname() &&
+    Number.isSafeInteger(writer.pid) && writer.pid > 0 && finite(writer.startedAt) && !censusRecordAlive(writer.pid, writer);
+};
+const sqliteAuthorityReason = "SQLite candidate lacks token-bearing local protocol-3 lease with independently proven writer death";
+
 const select = (root: string, now: number, retained: string[], cache: StateReadCache): Candidate[] => {
   const cutoff = now - STALE_MESH_GRACE_MS;
-  const state = stateView(root, undefined, undefined, cache);
+  const state = stateView(root, undefined, cache);
   const leases = new Map<string, FabricHostLease>();
   const leaseCopies = new Map<string, FileCopy>();
   // An unreadable/invalid lease might be a live replacement. It vetoes this entire scan.
@@ -322,28 +338,54 @@ const select = (root: string, now: number, retained: string[], cache: StateReadC
   }
   // Pin exact owner facts/lease generation, not the store's global commit clock.
   // A previously absent S lease is pinned as absence and re-read under S's gate.
-  return candidates.map(candidate => {
+  return candidates.flatMap(candidate => {
+    if (state.stamp.startsWith("sqlite:") && !nativeSqliteDeath(leases.get(candidate.owner))) {
+      retained.push(`${candidate.files[0]!.relative}: ${sqliteAuthorityReason}`);
+      return [];
+    }
     const stateKeys = [...new Set([...ownerKeys(candidate.owner), ...(candidate.participant ? [candidate.participant] : [])])];
-    return { ...candidate, stateKeys, evidence: ownerEvidence(state, stateKeys, leaseCopies.get(candidate.owner)) };
+    return [{ ...candidate, stateKeys, evidence: ownerEvidence(state, stateKeys, leaseCopies.get(candidate.owner)) }];
   });
 };
 
 const manifestPath = (batch: string): string => `archive/manifests/${batch}.jsonl`;
+/** writeSync may legally make partial progress. Neither a torn intent nor a failed
+ * durability barrier authorizes a move. Offsets count bytes, not UTF-16 characters. */
+const writeAll = (fd: number, bytes: Buffer): void => {
+  for (let offset = 0; offset < bytes.byteLength;) {
+    const written = fs.writeSync(fd, bytes, offset, bytes.byteLength - offset);
+    if (!Number.isSafeInteger(written) || written <= 0 || written > bytes.byteLength - offset) {
+      throw new Error("Archive receipt write made invalid/zero progress");
+    }
+    offset += written;
+  }
+};
 const append = (root: string, batch: string, receipt: Receipt, exclusive = false): void => {
+  // All nonexclusive appends run under existing file custody. Reading intents is
+  // side-effect free; ONLY a custodial append may preserve/repair a torn tail.
   const file = inside(root, manifestPath(batch));
   mkdir(path.dirname(file));
-  const fd = fs.openSync(file, exclusive ? "wx" : "a", 0o600);
-  try { fs.writeSync(fd, `${JSON.stringify(receipt)}\n`); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+  const fd = fs.openSync(file, exclusive ? "wx" : "a+", 0o600);
+  try {
+    if (!exclusive) {
+      // Constant-size check, not a whole-manifest reread for every receipt.
+      const size = fs.fstatSync(fd).size, tail = Buffer.alloc(1);
+      if (!Number.isSafeInteger(size) || size <= 0 || fs.readSync(fd, tail, 0, 1, size - 1) !== 1) throw new Error("Invalid archive manifest tail");
+      if (tail[0] !== 0x0a) intents(root, batch, true);
+    }
+    writeAll(fd, Buffer.from(`${JSON.stringify(receipt)}\n`, "utf8"));
+    fs.fsyncSync(fd);
+  } finally { fs.closeSync(fd); }
   syncDirectoryChain(path.dirname(file));
 };
-const intents = (root: string, batch: string): { intents: Intent[]; completed: Set<string>; rolledBack: Set<string>; restoring: Set<string> } => {
+const intents = (root: string, batch: string, repairTailUnderCustody = false): { intents: Intent[]; completed: Set<string>; rolledBack: Set<string>; restoring: Set<string> } => {
   const copy = readCopy(root, manifestPath(batch));
   if (!copy) throw new Error(`Archive batch not found: ${batch}`);
-  const text = copy.bytes.toString("utf8");
-  // A torn tail is never interpreted as authorization. All earlier complete intents
-  // remain recoverable; refuse this damaged manifest rather than append across the tear.
-  if (!text.endsWith("\n")) throw new Error("Torn manifest tail; preserve and repair the incomplete tail before recovery");
-  const rows = text.trimEnd().split("\n").map(line => JSON.parse(line) as Receipt);
+  // Only newline-terminated records authorize work. Parse/validate EVERY complete
+  // row before repairing a tail: interior corruption must remain a hard refusal.
+  const completeEnd = copy.bytes.lastIndexOf(0x0a) + 1;
+  const text = copy.bytes.subarray(0, completeEnd).toString("utf8");
+  const rows = text.slice(0, -1).split("\n").map(line => JSON.parse(line) as Receipt);
   const header = rows.shift();
   if (header?.type !== "header" || header.format !== 1 || header.batch !== batch || header.mesh !== root) throw new Error("Manifest mesh/batch identity mismatch");
   const result: Intent[] = [], ids = new Set<string>(), completed = new Set<string>(), rolledBack = new Set<string>(), restoring = new Set<string>();
@@ -365,6 +407,23 @@ const intents = (root: string, batch: string): { intents: Intent[]; completed: S
     } else if ((row.type === "done" || row.type === "rolled-back" || row.type === "restoring") && ids.has(row.id)) {
       (row.type === "done" ? completed : row.type === "restoring" ? restoring : rolledBack).add(row.id);
     } else throw new Error("Invalid archive manifest record");
+  }
+  if (repairTailUnderCustody && completeEnd < copy.bytes.byteLength) {
+    // Retain the ENTIRE original, including exact torn bytes and its complete
+    // prefix, before shortening our own manifest. A failed backup/fsync leaves
+    // the original untouched; retry may retain another copy, never delete one.
+    const retained = inside(root, `archive/manifests/${batch}.retained-tail-${randomUUID()}`);
+    const backup = fs.openSync(retained, "wx", 0o600);
+    try { writeAll(backup, copy.bytes); fs.fsyncSync(backup); } finally { fs.closeSync(backup); }
+    syncDirectoryChain(path.dirname(retained));
+    const file = inside(root, manifestPath(batch)), fd = fs.openSync(file, fs.constants.O_RDWR | (fs.constants.O_NOFOLLOW ?? 0));
+    try {
+      if (generation(fs.fstatSync(fd, { bigint: true })) !== copy.generation ||
+          !exact(copy, readCopy(root, manifestPath(batch)))) throw new Error("Manifest changed during tail recovery");
+      fs.ftruncateSync(fd, completeEnd);
+      fs.fsyncSync(fd);
+    } finally { fs.closeSync(fd); }
+    syncDirectoryChain(path.dirname(file));
   }
   return { intents: result, completed, rolledBack, restoring };
 };
@@ -414,7 +473,7 @@ const rollback = (root: string, batch: string, intent: Intent): void => {
  * mesh -> zero-wait participant key. Never prepare native identity under custody.
  * No MeshStore construction: no census registration, backend migration or janitor. */
 const fences = async <T>(root: string, candidate: Pick<Candidate, "owner" | "participant" | "registry">,
-  operation: (heldDb?: SqliteConnection) => T): Promise<T> => {
+  operation: () => T): Promise<T> => {
   const incarnation = await ownProcessIncarnation().catch(() => undefined);
   const meshLock = new MeshLock(root, { lockProtocol: 3 }, () => undefined);
   await meshLock.ownIncarnation;
@@ -430,16 +489,12 @@ const fences = async <T>(root: string, candidate: Pick<Candidate, "owner" | "par
       const releaseCustody = await acquireMeshCustodyLock(root, 0, { ownIncarnation: incarnation, lockProtocol: 3 });
       try {
         return await meshLock.withLock(() => {
-          const run = (db?: SqliteConnection): T => candidate.participant
-            ? withParticipantFileTryLock({ root, custody: async callback => callback() }, candidate.participant, incarnation, () => operation(db))
-            : operation(db);
-          noLinks(inside(root, "state.json"));
-          if (!readMeshStateMovedMarker(root)) return run();
-          // The canonical SQLite state write fence is BEGIN IMMEDIATE. No SQL
-          // data writes, schema creation, migrations or checkpoints are issued.
-          const db = openSqlite(root, false);
-          try { db.exec("PRAGMA busy_timeout = 0"); db.exec("BEGIN IMMEDIATE"); return run(db); }
-          finally { try { db.exec("ROLLBACK"); } finally { db.close(); } }
+          // File custody only. SQLite writers do NOT share .lock; owner publications
+          // are excluded by their lease gate, not by any SQLite write reservation.
+          // In particular restore/recovery never opens the database.
+          return candidate.participant
+            ? withParticipantFileTryLock({ root, custody: async callback => callback() }, candidate.participant, incarnation, operation)
+            : operation();
         }, 0, "custody", true);
       } finally { releaseCustody(); }
     } finally { releaseLease(); }
@@ -466,8 +521,12 @@ export const archiveStaleMeshEntries = async (options: ArchiveOptions): Promise<
     const preflight = (): void => {
       for (const intent of manifest.intents.filter(item => !manifest.rolledBack.has(item.id))) for (const file of intent.files) {
         const source = readCopy(root, file.relative), archived = readCopy(root, archivedPath(batch, file));
-        if (source && !(manifest.restoring.has(intent.id) && !archived && sameBytes(source, file) &&
-            source.generation.split(":").slice(0, 2).join(":") === file.generation.split(":").slice(0, 2).join(":"))) throw new Error(`Restore collision: ${file.relative}`);
+        const restoring = manifest.restoring.has(intent.id);
+        const restoredCanonical = restoring && !!source && !archived && sameBytes(source, file) &&
+          source.generation.split(":").slice(0, 2).join(":") === file.generation.split(":").slice(0, 2).join(":");
+        const crashAfterLink = restoring && !!source && !!archived && sameBytes(source, file) && sameBytes(archived, file) &&
+          sameInode(root, file.relative, archivedPath(batch, file));
+        if (source && !restoredCanonical && !crashAfterLink) throw new Error(`Restore collision: ${file.relative}`);
         if (!source && !sameBytes(archived, file)) throw new Error(`Restore byte identity mismatch: ${file.relative}`);
       }
     };
@@ -519,24 +578,51 @@ export const archiveStaleMeshEntries = async (options: ArchiveOptions): Promise<
   // Exclusive batch manifest: an explicit existing batch never gets overwritten.
   append(root, batch, { type: "header", format: 1, mesh: root, batch }, true);
   for (const candidate of selected) {
-    await fences(root, candidate, heldDb => {
-      const state = stateView(root, heldDb, candidate.stateKeys!, stateCache), current = currentLease(root, candidate.owner);
-      // Fresh own registry, never another global actors/store scan. A newly populated
-      // registry pins its owner's evidence; selected source bytes are checked below.
-      const registry = candidate.owner.startsWith("session:")
-        ? readCopy(root, `actors/${candidate.owner.slice(8)}/actors.json`) : undefined;
-      const actors = json(registry);
-      const pinned = !!registry && (actors?.format !== 1 || !Array.isArray(actors.actors) || actors.actors.length !== 0);
-      const still = !pinned && ownerEvidence(state, candidate.stateKeys!, current.copy) === candidate.evidence &&
-        candidate.files.every(file => exact(file, readCopy(root, file.relative))) &&
-        ownerDead(root, candidate.owner, options.now ?? Date.now(), state, current.lease) &&
-        (!candidate.registry || !names(root, `actors/${candidate.registry}`).some(name => name !== "actors.json" && name !== "actors.json.lock"));
-      if (!still) { report.retained.push(`${candidate.files[0]!.relative}: generation/death evidence changed before commit`); return; }
+    await fences(root, candidate, () => {
+      // Native claim/renew/publication holds this SAME owner lease gate through
+      // its awaited state write (#withLeaseFence -> withOwnedHostLease). Generic
+      // SQLite writers do not share the gate and remain free to commit. Their
+      // facts are fresh vetoes, NOT positive process-death authority.
+      const moved = new Set<string>();
+      const files: ArchivedFile[] = candidate.files.map(file => ({ relative: file.relative, sha256: hash(file.bytes), size: file.bytes.length, generation: file.generation }));
+      const still = (): boolean => {
+        // Short read-only snapshot; ROLLBACK/close precede every receipt or move.
+        const state = stateView(root, candidate.stateKeys!, stateCache), current = currentLease(root, candidate.owner);
+        const registry = candidate.owner.startsWith("session:")
+          ? readCopy(root, `actors/${candidate.owner.slice(8)}/actors.json`) : undefined;
+        const actors = json(registry);
+        const pinned = !!registry && (actors?.format !== 1 || !Array.isArray(actors.actors) || actors.actors.length !== 0);
+        return (!state.stamp.startsWith("sqlite:") || nativeSqliteDeath(current.lease)) && !pinned &&
+          ownerEvidence(state, candidate.stateKeys!, current.copy) === candidate.evidence &&
+          candidate.files.every((file, index) => {
+            if (!moved.has(file.relative)) return exact(file, readCopy(root, file.relative));
+            const archived = readCopy(root, archivedPath(batch, files[index]!));
+            return !readCopy(root, file.relative) && sameBytes(archived, files[index]!) &&
+              archived!.generation.split(":").slice(0, 2).join(":") === file.generation.split(":").slice(0, 2).join(":");
+          }) &&
+          ownerDead(root, candidate.owner, options.now ?? Date.now(), state, current.lease) &&
+          (!candidate.registry || !names(root, `actors/${candidate.registry}`).some(name => name !== "actors.json" && name !== "actors.json.lock"));
+      };
+      if (!still()) { report.retained.push(`${candidate.files[0]!.relative}: generation/death evidence changed before commit`); return; }
       const intent: Intent = { type: "intent", id: randomUUID(), directory: candidate.directory, owner: candidate.owner,
-        reason: candidate.reason, files: candidate.files.map(file => ({ relative: file.relative, sha256: hash(file.bytes), size: file.bytes.length, generation: file.generation })) };
+        reason: candidate.reason, files };
       for (const file of intent.files) if (readCopy(root, archivedPath(batch, file))) throw new Error("Archive destination collision");
       append(root, batch, intent);
-      for (const file of intent.files) move(root, file.relative, archivedPath(batch, file), file);
+      // Manifest durability can take time. Fresh veto/death reads AFTER its fsync
+      // and before EACH move, with the SQLite reader already closed. Keep the
+      // paired inbox owner (positive file-backend death evidence) canonical until
+      // its journal has moved. Own prior moves are verified in archive, not
+      // mistaken for a vanished/replaced source or dropped death evidence.
+      const order = candidate.directory === "main-followups" ? [...intent.files].reverse() : intent.files;
+      for (const file of order) {
+        if (!still()) {
+          rollback(root, batch, intent);
+          report.retained.push(`${candidate.files[0]!.relative}: generation/death evidence changed after intent fsync/before move`);
+          return;
+        }
+        move(root, file.relative, archivedPath(batch, file), file);
+        moved.add(file.relative);
+      }
       append(root, batch, { type: "done", id: intent.id });
       report.counts[candidate.directory] += candidate.files.length;
       if (report.examples.length < 20) report.examples.push(...candidate.files.map(file => file.relative));

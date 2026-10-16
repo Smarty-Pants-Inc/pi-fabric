@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createRequire } from "node:module";
+import { spawnSync } from "node:child_process";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // Data-safety integration tests: real bytes, selection, publication, manifest and
@@ -11,7 +12,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 // Every fixture stays below the inherited absolute private TMPDIR ceiling.
 
 import { archiveStaleMeshEntries, archiveStaleMeshEntriesCli, hostLeasePastGrace, STALE_MESH_GRACE_MS } from "../src/topology/stale-mesh-entries.js";
-import { hostLeasePath, type FabricHostLease } from "../src/topology/host-leases.js";
+import { hostLeasePath, readHostLeaseCurrent, renewHostLease, FabricHostLeaseSupersededError, type FabricHostLease } from "../src/topology/host-leases.js";
+import { HostLeaseLockBusyError, type HostLeaseMesh } from "../src/topology/host-lease-lock.js";
+import { acquireMeshCustodyLock } from "../src/mesh/custody-lock.js";
 import { createHash } from "node:crypto";
 
 const digest = (text: string): string => createHash("sha256").update(text).digest("hex");
@@ -53,6 +56,109 @@ const fixture = (full = false): { root: string; owner: string; lease: FabricHost
   return { root, owner, lease: value, paths };
 };
 const bytes = (files: string[]): Buffer[] => files.map(file => fs.readFileSync(file));
+const sqliteState = (root: string): import("node:sqlite").DatabaseSync => {
+  const { DatabaseSync } = createRequire(import.meta.url)("node:sqlite") as typeof import("node:sqlite");
+  const db = new DatabaseSync(path.join(root, "state.db"));
+  retainedDatabaseConnections.push(db);
+  db.exec("PRAGMA journal_mode=WAL; CREATE TABLE meta(name TEXT PRIMARY KEY, value); CREATE TABLE kv(key TEXT PRIMARY KEY, value TEXT, version INTEGER, updated_at INTEGER, updated_by TEXT, bytes INTEGER)");
+  const set = db.prepare("INSERT INTO meta(name,value) VALUES (?,?)");
+  for (const [key, value] of [["schema", 1], ["backend", "sqlite"], ["epoch", 3], ["commit_no", 1], ["store_id", "writer-probe"]] as const) set.run(key, value);
+  put(root, "state.json", { format: "sqlite", movedTo: "state.db", backend: "sqlite", epoch: 3 });
+  for (const suffix of ["", "-wal", "-shm"]) fs.chmodSync(path.join(root, `state.db${suffix}`), 0o600);
+  return db;
+};
+const separateSqliteWriter = (root: string, key: string): void => {
+  const child = spawnSync(process.execPath, ["-e", `
+    const { DatabaseSync } = require('node:sqlite');
+    const db = new DatabaseSync(process.argv[1]);
+    db.exec('PRAGMA busy_timeout=0; BEGIN IMMEDIATE');
+    db.prepare('INSERT OR REPLACE INTO kv VALUES (?, ?, ?, ?, ?, ?)').run(process.argv[2],
+      JSON.stringify({ unrelated: true }), 1, Date.now(), JSON.stringify({ id: 'session:other', kind: 'main' }), 0);
+    db.exec("UPDATE meta SET value=value+1 WHERE name='commit_no'; COMMIT");
+  `, path.join(root, "state.db"), key], { timeout: 5_000, encoding: "utf8" });
+  expect(child.error).toBeUndefined();
+  expect(child.status, child.stderr).toBe(0);
+};
+const observeSqliteReaders = () => {
+  const sqlite = createRequire(import.meta.url)("node:sqlite") as typeof import("node:sqlite");
+  const Native = sqlite.DatabaseSync, live = new Set<import("node:sqlite").DatabaseSync>(), statements: string[] = [];
+  const opens = vi.spyOn(sqlite, "DatabaseSync").mockImplementation(function (...args: ConstructorParameters<typeof Native>) {
+    const db = new Native(...args), exec = db.exec.bind(db), close = db.close.bind(db);
+    live.add(db);
+    db.exec = sql => { statements.push(sql); exec(sql); };
+    db.close = () => { try { close(); } finally { live.delete(db); } };
+    return db;
+  } as unknown as typeof Native);
+  return { opens, live, statements };
+};
+/** A fixture adapter using MeshStore.leaseCustody's exact legacy/domain preference
+ * and its REAL custody lock, without constructing a store/census or fake mutex. */
+const leaseGateMesh = (root: string, entered: () => void): HostLeaseMesh => ({
+  root,
+  async leaseCustody(file, operation, timeoutMs = 0, options = {}) {
+    const name = digest(path.basename(file)), legacy = path.join(root, "host-lease-commits", name);
+    const domain = fs.existsSync(legacy) ? legacy : path.join(root, "host-lease-commits", name.slice(0, 16));
+    const release = await acquireMeshCustodyLock(domain, timeoutMs, { ...options, hostQualified: true, lockProtocol: 3 });
+    try { entered(); return await operation(); } finally { release(); }
+  },
+});
+/** Independent process: unlike a same-turn async contender, this really attempts
+ * the canonical claim WHILE the parent's synchronous move holds S's gate. */
+const busyCanonicalClaim = (root: string, replacement: FabricHostLease, expected: FabricHostLease): void => {
+  const child = spawnSync(process.execPath, ["--input-type=module", "-e", `
+    import fs from 'node:fs'; import path from 'node:path'; import { createHash, randomUUID } from 'node:crypto';
+    import { createJiti } from 'jiti'; import { pathToFileURL } from 'node:url';
+    const root = process.argv[1], replacement = JSON.parse(process.argv[2]), expected = JSON.parse(process.argv[3]);
+    // Retain lock staging/receipts, just as the parent test does; no byte deletion.
+    fs.rmSync = target => {
+      const file = String(target);
+      if (!file.startsWith(root + path.sep)) throw new Error('child removal outside fixture refused');
+      if (fs.existsSync(file)) fs.renameSync(file, file + '.test-retained-' + randomUUID());
+    };
+    fs.rmdirSync = () => { throw new Error('child directory deletion refused'); };
+    const unlink = fs.unlinkSync.bind(fs);
+    fs.unlinkSync = file => {
+      if (fs.lstatSync(file).nlink <= 1) throw new Error('child byte deletion refused');
+      unlink(file);
+    };
+    const jiti = createJiti(pathToFileURL(process.cwd() + '/index.js').href);
+    const { renewHostLease } = await jiti.import(path.join(process.cwd(), 'src/topology/host-leases.ts'));
+    const { acquireMeshCustodyLock } = await jiti.import(path.join(process.cwd(), 'src/mesh/custody-lock.ts'));
+    const { HostLeaseLockBusyError } = await jiti.import(path.join(process.cwd(), 'src/topology/host-lease-lock.ts'));
+    let entered = false;
+    const mesh = { root, async leaseCustody(file, operation, timeoutMs = 0, options = {}) {
+      const hash = createHash('sha256').update(path.basename(file)).digest('hex');
+      const legacy = path.join(root, 'host-lease-commits', hash);
+      const domain = fs.existsSync(legacy) ? legacy : path.join(root, 'host-lease-commits', hash.slice(0, 16));
+      const release = await acquireMeshCustodyLock(domain, timeoutMs, { ...options, hostQualified: true, lockProtocol: 3 });
+      try { entered = true; return await operation(); } finally { release(); }
+    } };
+    try { await renewHostLease(mesh, replacement, { claim: true, expected, timeoutMs: 0 }); throw new Error('claim crossed held gate'); }
+    catch (error) {
+      if (!(error instanceof HostLeaseLockBusyError) || entered) throw error;
+      process.stdout.write('canonical-claim-busy-before-entry');
+    }
+  `, root, JSON.stringify(replacement), JSON.stringify(expected)], {
+    cwd: path.resolve(import.meta.dirname, ".."), timeout: 10_000, encoding: "utf8",
+  });
+  expect(child.error).toBeUndefined();
+  expect(child.status, child.stderr).toBe(0);
+  expect(child.stdout).toBe("canonical-claim-busy-before-entry");
+};
+/** Inject at the actual receipt syscall, including old string-write implementations. */
+const receiptWrites = (inject: (write: { type: string; bytes: Buffer; offset: number; length: number;
+  write: (length: number) => number }) => number) => {
+  const original = fs.writeSync.bind(fs);
+  return vi.spyOn(fs, "writeSync").mockImplementation(((fd: number, data: unknown, ...args: unknown[]) => {
+    if (typeof data !== "string" && !Buffer.isBuffer(data)) return Reflect.apply(original, fs, [fd, data, ...args]);
+    const buffer = typeof data === "string" ? Buffer.from(data, "utf8") : data;
+    if (!buffer.toString("utf8").startsWith('{"type":')) return Reflect.apply(original, fs, [fd, data, ...args]);
+    const type = String(JSON.parse(buffer.toString("utf8")).type);
+    const offset = typeof data === "string" ? 0 : Number(args[0] ?? 0);
+    const length = typeof data === "string" ? buffer.byteLength : Number(args[1] ?? buffer.byteLength - offset);
+    return inject({ type, bytes: buffer, offset, length, write: count => original(fd, buffer, offset, count) });
+  }) as typeof fs.writeSync);
+};
 
 beforeEach(() => {
   const base = process.env.TMPDIR;
@@ -157,6 +263,216 @@ describe("offline reversible stale mesh archive", () => {
     await expect(archiveStaleMeshEntries({ mesh: f.root, mode: "dry-run", now })).rejects.toThrow(/epoch/);
     // Intentionally retain the live fixture connection: native SQLite last-close
     // WAL/SHM cleanup must not delete test artifacts. No product data SQL is written.
+  });
+
+  it("opens every SQLite observation read-only and vetoes a changed exact owner with short read transactions", async () => {
+    const f = fixture(true), before = bytes(f.paths), writer = sqliteState(f.root);
+    const sqlite = createRequire(import.meta.url)("node:sqlite") as typeof import("node:sqlite");
+    const Native = sqlite.DatabaseSync;
+    const opens = vi.spyOn(sqlite, "DatabaseSync").mockImplementation(function (...args: ConstructorParameters<typeof Native>) {
+      return new Native(...args);
+    } as unknown as typeof Native);
+    const sql = vi.spyOn(Native.prototype, "exec");
+    const report = await archiveStaleMeshEntries({ mesh: f.root, mode: "apply", now, afterSelection: () => {
+      // Counterexample: generic SQLite state mutation needs neither lease custody
+      // nor file/shared .lock. Read-only archival cannot claim to exclude it.
+      writer.exec("BEGIN IMMEDIATE");
+      writer.prepare("INSERT INTO kv VALUES (?, ?, ?, ?, ?, ?)").run(`topology/hosts/${digest(f.owner)}`,
+        JSON.stringify({ id: f.owner, expiresAt: now + 60_000 }), 1, now, JSON.stringify({ id: f.owner, kind: "main" }), 0);
+      writer.exec("COMMIT");
+    } });
+    expect(opens.mock.calls.length).toBeGreaterThan(0);
+    expect(opens.mock.calls.every(call => call[1]?.readOnly === true)).toBe(true);
+    // Separate the explicit generic writer from archival's own SQL.
+    const reads = sql.mock.calls.filter((_, index) => sql.mock.contexts[index] !== writer).map(call => call[0]);
+    expect(reads.length).toBeGreaterThan(2);
+    expect(reads.every(statement => statement === "BEGIN" || statement === "ROLLBACK")).toBe(true);
+    expect(reads.filter(statement => statement === "BEGIN")).toHaveLength(reads.length / 2);
+    expect(Object.values(report.counts).every(count => count === 0)).toBe(true);
+    expect(report.retained.join(" ")).toContain("changed");
+    expect(bytes(f.paths)).toEqual(before);
+  });
+
+  it("allows a separate real SQLite writer at the ACTUAL apply source-to-archive link with all readers closed", async () => {
+    const f = fixture(), before = bytes(f.paths), db = sqliteState(f.root), observed = observeSqliteReaders();
+    const link = fs.linkSync.bind(fs), sync = fs.fsyncSync.bind(fs);
+    let atApplyLink = false;
+    vi.spyOn(fs, "fsyncSync").mockImplementation(fd => { expect(observed.live.size).toBe(0); sync(fd); });
+    vi.spyOn(fs, "linkSync").mockImplementation((from, to) => {
+      if (String(from) === f.paths[0] && String(to).includes(`${path.sep}archive${path.sep}host-leases${path.sep}`)) {
+        atApplyLink = true;
+        expect(observed.live.size).toBe(0);
+        separateSqliteWriter(f.root, "unrelated/at-apply-link");
+      }
+      link(from, to);
+    });
+    const applied = await archiveStaleMeshEntries({ mesh: f.root, mode: "apply", now });
+    expect(atApplyLink).toBe(true);
+    expect(applied.counts["host-leases"]).toBe(1);
+    expect(observed.opens.mock.calls.every(call => call[1]?.readOnly === true)).toBe(true);
+    expect(observed.statements.every(sql => sql === "BEGIN" || sql === "ROLLBACK")).toBe(true);
+    expect(observed.statements.filter(sql => sql === "BEGIN")).toHaveLength(observed.statements.length / 2);
+    expect(db.prepare("SELECT value FROM meta WHERE name='commit_no'").get()?.value).toBe(2);
+    await archiveStaleMeshEntries({ mesh: f.root, mode: "restore", batch: applied.batch! });
+    expect(bytes(f.paths)).toEqual(before);
+  });
+
+  it("freshly vetoes exact-owner state changed DURING intent fsync before any apply source moves", async () => {
+    const f = fixture(true), before = bytes(f.paths), db = sqliteState(f.root), observed = observeSqliteReaders();
+    const sync = fs.fsyncSync.bind(fs), link = fs.linkSync.bind(fs);
+    let intentWritten = false, changed = false, sourceLinks = 0;
+    receiptWrites(call => { if (call.type === "intent") intentWritten = true; return call.write(call.length); });
+    vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+      expect(observed.live.size).toBe(0);
+      if (intentWritten && !changed) {
+        changed = true;
+        db.exec("BEGIN IMMEDIATE");
+        db.prepare("INSERT INTO kv VALUES (?, ?, ?, ?, ?, ?)").run(`topology/hosts/${digest(f.owner)}`,
+          JSON.stringify({ id: f.owner, rootId: f.owner, identity: { id: f.owner }, expiresAt: now + 60_000 }),
+          1, now, JSON.stringify({ id: f.owner, kind: "main" }), 0);
+        db.exec("COMMIT");
+      }
+      sync(fd);
+    });
+    vi.spyOn(fs, "linkSync").mockImplementation((from, to) => {
+      if (f.paths.includes(String(from))) sourceLinks++;
+      link(from, to);
+    });
+    const applied = await archiveStaleMeshEntries({ mesh: f.root, mode: "apply", now });
+    expect(changed).toBe(true);
+    expect(sourceLinks).toBe(0);
+    expect(Object.values(applied.counts).every(count => count === 0)).toBe(true);
+    expect(applied.retained.join(" ")).toContain("after intent fsync");
+    expect(observed.statements.every(sql => sql === "BEGIN" || sql === "ROLLBACK")).toBe(true);
+    expect(bytes(f.paths)).toEqual(before);
+    expect(fs.readFileSync(path.join(f.root, "archive/manifests", `${applied.batch}.jsonl`), "utf8")).toContain('"type":"rolled-back"');
+  });
+
+  it("rechecks between paired moves and rolls back its own archived journal if fresh owner facts veto the owner move", async () => {
+    const f = fixture(true), pair = f.paths.slice(2, 4), before = bytes(pair), db = sqliteState(f.root);
+    const unlink = vi.mocked(fs.unlinkSync).getMockImplementation()!;
+    let changed = false;
+    vi.mocked(fs.unlinkSync).mockImplementation(file => {
+      unlink(file);
+      if (!changed && String(file) === f.paths[3]) {
+        changed = true;
+        db.prepare("INSERT INTO kv VALUES (?, ?, ?, ?, ?, ?)").run(`topology/hosts/${digest(f.owner)}`,
+          JSON.stringify({ id: f.owner, expiresAt: now + 60_000 }), 1, now, JSON.stringify({ id: f.owner, kind: "main" }), 0);
+      }
+    });
+    let applied;
+    try { applied = await archiveStaleMeshEntries({ mesh: f.root, mode: "apply", now }); }
+    finally { vi.mocked(fs.unlinkSync).mockImplementation(unlink); }
+    expect(changed).toBe(true);
+    expect(applied.counts["main-followups"]).toBe(0);
+    expect(bytes(pair)).toEqual(before);
+    expect(applied.retained.join(" ")).toContain("before move");
+    const rows = fs.readFileSync(path.join(f.root, "archive/manifests", `${applied.batch}.jsonl`), "utf8")
+      .trimEnd().split("\n").map(line => JSON.parse(line));
+    const intent = rows.find(row => row.type === "intent" && row.directory === "main-followups");
+    expect(rows.some(row => row.type === "rolled-back" && row.id === intent.id)).toBe(true);
+  });
+
+  it("keeps a concurrent canonical S claim outside a two-file move until the entire pair is gone", async () => {
+    const f = fixture(true); sqliteState(f.root);
+    const batch = "claim-fence", pair = f.paths.slice(2, 4), link = fs.linkSync.bind(fs);
+    const unlink = vi.mocked(fs.unlinkSync).getMockImplementation()!;
+    const replacement = { ...f.lease, incarnationToken: randomUUID(), expiresAt: now + 60_000,
+      writer: { ...f.lease.writer!, pid: process.pid } };
+    let wholePairMoved = false, entered = 0;
+    const mesh = leaseGateMesh(f.root, () => {
+      entered++;
+      expect(wholePairMoved).toBe(true);
+      for (const file of pair) {
+        expect(fs.existsSync(file)).toBe(false);
+        expect(fs.existsSync(path.join(f.root, "archive/main-followups", batch, path.basename(file)))).toBe(true);
+      }
+    });
+    let claim: Promise<{ error?: unknown }> | undefined;
+    vi.spyOn(fs, "linkSync").mockImplementation((from, to) => {
+      if (String(from) === f.paths[3] && !claim) {
+        const gateHash = digest(path.basename(f.paths[0]!));
+        expect(fs.existsSync(path.join(f.root, "host-lease-commits", gateHash.slice(0, 16), "custody.lock"))).toBe(true);
+        busyCanonicalClaim(f.root, replacement, f.lease);
+        claim = renewHostLease(mesh, replacement, { claim: true, expected: f.lease, timeoutMs: 0 })
+          .then(() => ({}), error => ({ error }));
+      }
+      link(from, to);
+    });
+    vi.mocked(fs.unlinkSync).mockImplementation(file => {
+      unlink(file);
+      if (String(file) === f.paths[2]) wholePairMoved = true; // owner LAST; journal was already moved.
+    });
+    let applied;
+    try { applied = await archiveStaleMeshEntries({ mesh: f.root, mode: "apply", batch, now }); }
+    finally { vi.mocked(fs.unlinkSync).mockImplementation(unlink); }
+    expect(applied.counts["main-followups"]).toBe(2);
+    expect(claim).toBeDefined();
+    const first = await claim!;
+    if (first.error) {
+      // Canonical claim is zero-budget: Busy (or predecessor CAS superseded if
+      // it enters after archival) is a receipt, not a promise that waits forever.
+      expect(first.error instanceof HostLeaseLockBusyError || first.error instanceof FabricHostLeaseSupersededError).toBe(true);
+      await renewHostLease(mesh, replacement, { claim: true, expected: readHostLeaseCurrent(f.root, f.owner), timeoutMs: 0 });
+    }
+    expect(entered).toBeGreaterThan(0);
+    expect(readHostLeaseCurrent(f.root, f.owner)?.incarnationToken).toBe(replacement.incarnationToken);
+  }, 30_000);
+
+  it.each(["no-token", "protocol-2", "no-lease"])("retains only SQLite candidates lacking native lease authority (%s), with a dry-run reason", async kind => {
+    const f = fixture(true); sqliteState(f.root);
+    if (kind === "no-lease") fs.renameSync(f.paths[0]!, `${f.paths[0]}.retained`);
+    else {
+      const value = { ...f.lease, writer: { ...f.lease.writer!, lockProtocol: kind === "protocol-2" ? 2 : 3 } };
+      if (kind === "no-token") delete value.incarnationToken;
+      writeLease(f.root, value);
+    }
+    const retained = bytes(f.paths.filter(file => fs.existsSync(file)));
+    const dry = await archiveStaleMeshEntries({ mesh: f.root, mode: "dry-run", now });
+    expect(Object.values(dry.counts).every(count => count === 0)).toBe(true);
+    expect(dry.retained.join(" ")).toContain("token-bearing local protocol-3 lease");
+    const applied = await archiveStaleMeshEntries({ mesh: f.root, mode: "apply", now });
+    expect(applied.counts).toEqual(dry.counts);
+    expect(bytes(f.paths.filter(file => fs.existsSync(file)))).toEqual(retained);
+    expect(fs.existsSync(path.join(f.root, "archive"))).toBe(false);
+  });
+
+  it("restores SQLite-backed meshes without opening a database or blocking a separate real writer at manifest fsync and link", async () => {
+    const f = fixture(), before = bytes(f.paths);
+    const applied = await archiveStaleMeshEntries({ mesh: f.root, mode: "apply", now });
+    const db = sqliteState(f.root);
+    const sqlite = createRequire(import.meta.url)("node:sqlite") as typeof import("node:sqlite");
+    const opens = vi.spyOn(sqlite, "DatabaseSync").mockImplementation(() => { throw new Error("restore must not open SQLite"); });
+    let commits = 0;
+    const writer = (): void => {
+      const child = spawnSync(process.execPath, ["-e", `
+        const { DatabaseSync } = require('node:sqlite');
+        const db = new DatabaseSync(process.argv[1]);
+        db.exec("PRAGMA busy_timeout=0; BEGIN IMMEDIATE; UPDATE meta SET value=value+1 WHERE name='commit_no'; COMMIT");
+      `, path.join(f.root, "state.db")], { timeout: 5_000, encoding: "utf8" });
+      expect(child.error).toBeUndefined();
+      expect(child.status, child.stderr).toBe(0);
+      commits++;
+    };
+    const descriptors = new Map<number, string>(), open = fs.openSync.bind(fs), sync = fs.fsyncSync.bind(fs), link = fs.linkSync.bind(fs);
+    vi.spyOn(fs, "openSync").mockImplementation(((...args: Parameters<typeof fs.openSync>) => {
+      const fd = Reflect.apply(open, fs, args); descriptors.set(fd, String(args[0])); return fd;
+    }) as typeof fs.openSync);
+    let atReceipt = false, atLink = false;
+    vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+      if (!atReceipt && descriptors.get(fd)?.endsWith(`${applied.batch}.jsonl`)) { atReceipt = true; writer(); }
+      sync(fd);
+    });
+    vi.spyOn(fs, "linkSync").mockImplementation((from, to) => {
+      if (String(to) === f.paths[0]) { atLink = true; writer(); }
+      link(from, to);
+    });
+    await archiveStaleMeshEntries({ mesh: f.root, mode: "restore", batch: applied.batch! });
+    expect(atReceipt && atLink).toBe(true);
+    expect(opens).not.toHaveBeenCalled();
+    expect(commits).toBe(2);
+    expect(db.prepare("SELECT value FROM meta WHERE name='commit_no'").get()?.value).toBe(3);
+    expect(bytes(f.paths)).toEqual(before);
   });
 
   it("archives stale S projections while preserving live X's own lease even when X.rootId is S", async () => {
@@ -299,7 +615,7 @@ describe("offline reversible stale mesh archive", () => {
     expect(fs.existsSync(path.join(f.root, "archive/host-leases", result.batch!, path.basename(f.paths[0]!)))).toBe(true);
   });
 
-  it("does one whole-store SQLite scan and bounded direct owner queries, without global relisting per group", async () => {
+  it("does one whole-store SQLite scan and bounded direct owner queries, without per-group global relisting", async () => {
     const f = fixture(), ownerCount = 24;
     for (let index = 1; index < ownerCount; index++) writeLease(f.root, lease(`host:dead-${index}`));
     const { DatabaseSync } = createRequire(import.meta.url)("node:sqlite") as typeof import("node:sqlite");
@@ -320,8 +636,9 @@ describe("offline reversible stale mesh archive", () => {
     expect(result.counts["host-leases"]).toBe(ownerCount);
     const kvQueries = queries.mock.calls.map(call => String(call[0])).filter(sql => /FROM kv\b/.test(sql));
     expect(kvQueries.filter(sql => !sql.includes("WHERE key = ?"))).toHaveLength(1);
-    expect(kvQueries.filter(sql => sql.includes("WHERE key = ?")).length).toBeGreaterThanOrEqual(ownerCount);
-    expect(kvQueries.length).toBeLessThanOrEqual(1 + ownerCount * 4);
+    expect(kvQueries.filter(sql => sql.includes("WHERE key = ?")).length).toBeGreaterThanOrEqual(ownerCount * 2);
+    // At most four exact keys per owner, before intent and again after its fsync.
+    expect(kvQueries.length).toBeLessThanOrEqual(1 + ownerCount * 8);
     for (const directory of ["host-leases", "actors", "participants", "main-followups"]) {
       const scans = lists.mock.calls.filter(call => String(call[0]) === path.join(f.root, directory));
       expect(scans.length, `${directory}: no per-group global relist`).toBeLessThanOrEqual(2);
@@ -345,6 +662,54 @@ describe("offline reversible stale mesh archive", () => {
     await expect(archiveStaleMeshEntries({ mesh: f.root, mode: "restore", batch: applied.batch! })).rejects.toThrow(/collision/);
     expect(fs.readFileSync(f.paths[0]!, "utf8")).toBe("new-owner-bytes");
     expect(fs.existsSync(f.paths[1]!)).toBe(false);
+  });
+
+  it("resumes restore after canonical link succeeds but archive unlink crashes", async () => {
+    const f = fixture(), before = fs.readFileSync(f.paths[0]!);
+    const applied = await archiveStaleMeshEntries({ mesh: f.root, mode: "apply", now });
+    const archived = path.join(f.root, "archive/host-leases", applied.batch!, path.basename(f.paths[0]!));
+    const unlink = fs.unlinkSync;
+    vi.spyOn(fs, "unlinkSync").mockImplementationOnce(() => { throw new Error("injected restore crash"); });
+    await expect(archiveStaleMeshEntries({ mesh: f.root, mode: "restore", batch: applied.batch! }))
+      .rejects.toThrow("injected restore crash");
+    fs.unlinkSync = unlink;
+    expect(fs.readFileSync(f.paths[0]!)).toEqual(before);
+    expect(fs.readFileSync(archived)).toEqual(before);
+    expect(fs.lstatSync(f.paths[0]!).ino).toBe(fs.lstatSync(archived).ino);
+    const resumed = await archiveStaleMeshEntries({ mesh: f.root, mode: "restore", batch: applied.batch! });
+    expect(resumed.counts["host-leases"]).toBe(1);
+    expect(fs.readFileSync(f.paths[0]!)).toEqual(before);
+    expect(fs.existsSync(archived)).toBe(false);
+  });
+
+  it("keeps a different-inode same-byte canonical replacement as a restore collision", async () => {
+    const f = fixture(), before = fs.readFileSync(f.paths[0]!);
+    const applied = await archiveStaleMeshEntries({ mesh: f.root, mode: "apply", now });
+    const archived = path.join(f.root, "archive/host-leases", applied.batch!, path.basename(f.paths[0]!));
+    fs.writeFileSync(f.paths[0]!, before, { mode: 0o600 });
+    expect(fs.readFileSync(f.paths[0]!)).toEqual(before);
+    expect(fs.lstatSync(f.paths[0]!).ino).not.toBe(fs.lstatSync(archived).ino);
+    await expect(archiveStaleMeshEntries({ mesh: f.root, mode: "restore", batch: applied.batch! }))
+      .rejects.toThrow(/collision/);
+    expect(fs.readFileSync(f.paths[0]!)).toEqual(before);
+    expect(fs.readFileSync(archived)).toEqual(before);
+  });
+
+  it("resumes a multi-file restore when the later pair is left double-named", async () => {
+    const f = fixture(true), before = bytes(f.paths);
+    const applied = await archiveStaleMeshEntries({ mesh: f.root, mode: "apply", now });
+    const archivedJournal = path.join(f.root, "archive/main-followups", applied.batch!, "ended.json");
+    const unlink = vi.mocked(fs.unlinkSync).getMockImplementation()!;
+    vi.mocked(fs.unlinkSync).mockImplementation(file => {
+      if (String(file) === archivedJournal) throw new Error("injected multi-file restore crash");
+      return unlink(file);
+    });
+    try {
+      await expect(archiveStaleMeshEntries({ mesh: f.root, mode: "restore", batch: applied.batch! }))
+        .rejects.toThrow("injected multi-file restore crash");
+    } finally { vi.mocked(fs.unlinkSync).mockImplementation(unlink); }
+    await archiveStaleMeshEntries({ mesh: f.root, mode: "restore", batch: applied.batch! });
+    expect(bytes(f.paths)).toEqual(before);
   });
 
   it("does not overwrite an existing apply destination", async () => {
@@ -384,6 +749,116 @@ describe("offline reversible stale mesh archive", () => {
     expect(fs.readFileSync(path.join(f.root, "archive/manifests/crash.jsonl"), "utf8")).toContain("rolled-back");
     await archiveStaleMeshEntries({ mesh: f.root, mode: "restore", batch: applied.batch! });
     expect(fs.readFileSync(f.paths[0]!)).toEqual(bytesBefore);
+  });
+
+  it("rejects a different-inode same-byte source after an intent-only apply crash", async () => {
+    const f = fixture(), before = fs.readFileSync(f.paths[0]!), link = fs.linkSync.bind(fs);
+    vi.spyOn(fs, "linkSync").mockImplementation((from, to) => {
+      if (String(from) === f.paths[0]) throw new Error("injected before source link");
+      link(from, to);
+    });
+    await expect(archiveStaleMeshEntries({ mesh: f.root, mode: "apply", batch: "intent-only", now }))
+      .rejects.toThrow("injected before source link");
+    vi.mocked(fs.linkSync).mockRestore();
+    fs.renameSync(f.paths[0]!, `${f.paths[0]}.original-retained`);
+    fs.writeFileSync(f.paths[0]!, before, { mode: 0o600 });
+    await expect(archiveStaleMeshEntries({ mesh: f.root, mode: "apply", now })).rejects.toThrow(/Recovery source changed/);
+    expect(fs.readFileSync(f.paths[0]!)).toEqual(before);
+    expect(fs.readFileSync(`${f.paths[0]}.original-retained`)).toEqual(before);
+  });
+
+  it("fully writes short byte-buffer receipts and durably records intent before any source link", async () => {
+    const f = fixture(true);
+    f.paths.push(writeLease(f.root, lease("host:é🚦")));
+    const before = bytes(f.paths), originalSync = fs.fsyncSync.bind(fs), link = fs.linkSync.bind(fs);
+    let intentFd: number | undefined, durableIntent = false, links = 0;
+    // A separate fd observer proves the intent's fsync precedes each move.
+    vi.spyOn(fs, "fsyncSync").mockImplementation(fd => { originalSync(fd); if (fd === intentFd) durableIntent = true; });
+    const open = fs.openSync.bind(fs);
+    vi.spyOn(fs, "openSync").mockImplementation(((...args: Parameters<typeof fs.openSync>) => {
+      const fd = Reflect.apply(open, fs, args);
+      if (String(args[0]).endsWith(".jsonl")) intentFd = fd;
+      return fd;
+    }) as typeof fs.openSync);
+    const writes = receiptWrites(call => {
+      if (call.type === "intent" && call.offset === 0) durableIntent = false;
+      return call.write(Math.min(7, call.length));
+    });
+    vi.spyOn(fs, "linkSync").mockImplementation((from, to) => {
+      if (String(to).includes(`${path.sep}archive${path.sep}`)) { expect(durableIntent).toBe(true); links++; }
+      link(from, to);
+    });
+    const applied = await archiveStaleMeshEntries({ mesh: f.root, mode: "apply", batch: "short-writes", now });
+    expect(links).toBe(f.paths.length);
+    expect(writes.mock.calls.length).toBeGreaterThan(20);
+    writes.mockRestore();
+    expect((await archiveStaleMeshEntries({ mesh: f.root, mode: "apply", now })).counts["host-leases"]).toBe(0);
+    await archiveStaleMeshEntries({ mesh: f.root, mode: "restore", batch: applied.batch! });
+    expect(bytes(f.paths)).toEqual(before);
+  });
+
+  it.each(["intent-zero", "intent-throw", "done-zero", "done-throw"])("recovers %s without losing earlier complete intents or torn trace bytes", async failure => {
+    const f = fixture(true), before = bytes(f.paths), batch = `torn-${failure}`;
+    const targetType = failure.startsWith("intent") ? "intent" : "done";
+    let seen = 0, target: Buffer | undefined, failed = false;
+    const writes = receiptWrites(call => {
+      if (call.type === targetType && call.offset === 0 && !target && ++seen === 2) target = call.bytes;
+      if (!failed && target?.equals(call.bytes)) {
+        if (call.offset === 0) return call.write(failure.endsWith("throw") ? call.length - 1 : 13);
+        failed = true;
+        if (failure.endsWith("throw")) throw new Error("injected receipt failure");
+        return 0;
+      }
+      return call.write(call.length);
+    });
+    try {
+      await expect(archiveStaleMeshEntries({ mesh: f.root, mode: "apply", batch, now })).rejects.toThrow(/receipt/);
+    } finally { writes.mockRestore(); }
+    expect(failed).toBe(true);
+    const manifestFile = path.join(f.root, "archive/manifests", `${batch}.jsonl`);
+    const damaged = fs.readFileSync(manifestFile), completeEnd = damaged.lastIndexOf(0x0a) + 1;
+    const complete = damaged.subarray(0, completeEnd);
+    expect(complete.toString("utf8")).toContain('"type":"done"'); // Prior actor intent/completion survives.
+    expect(fs.existsSync(f.paths[4]!)).toBe(false);
+    if (targetType === "intent") expect(fs.existsSync(f.paths[1]!)).toBe(true); // No unauthorized participant move.
+    else expect(fs.existsSync(f.paths[1]!)).toBe(false); // Complete intent, torn completion: rollback then reselect.
+    const retry = await archiveStaleMeshEntries({ mesh: f.root, mode: "apply", batch: `retry-${failure}`, now });
+    expect(retry.counts).toEqual({ "host-leases": 1, participants: 1, "main-followups": 2, actors: 0 });
+    await archiveStaleMeshEntries({ mesh: f.root, mode: "restore", batch: retry.batch! });
+    await archiveStaleMeshEntries({ mesh: f.root, mode: "restore", batch });
+    expect(bytes(f.paths)).toEqual(before);
+    const repaired = fs.readFileSync(manifestFile);
+    expect(repaired.subarray(0, complete.byteLength)).toEqual(complete);
+    const retained = fs.readdirSync(path.dirname(manifestFile)).filter(name => name.startsWith(`${batch}.retained-tail-`));
+    expect(retained.some(name => fs.readFileSync(path.join(path.dirname(manifestFile), name)).equals(damaged))).toBe(true);
+    expect((await archiveStaleMeshEntries({ mesh: f.root, mode: "restore", batch })).counts)
+      .toEqual({ "host-leases": 0, participants: 0, "main-followups": 0, actors: 0 });
+  });
+
+  it("does not trim or repair a torn trailing receipt during noncustodial restore preflight", async () => {
+    const f = fixture(), applied = await archiveStaleMeshEntries({ mesh: f.root, mode: "apply", batch: "preflight-tail", now });
+    const manifestFile = path.join(f.root, "archive/manifests/preflight-tail.jsonl");
+    fs.appendFileSync(manifestFile, '{"type":"restoring","id":"uncommitted-tail"}');
+    const damaged = fs.readFileSync(manifestFile);
+    put(f.root, path.relative(f.root, f.paths[0]!), "canonical replacement collision");
+    const trims = vi.spyOn(fs, "ftruncateSync");
+    await expect(archiveStaleMeshEntries({ mesh: f.root, mode: "restore", batch: applied.batch! })).rejects.toThrow(/collision/);
+    expect(trims).not.toHaveBeenCalled();
+    expect(fs.readFileSync(manifestFile)).toEqual(damaged);
+    expect(fs.readdirSync(path.dirname(manifestFile)).some(name => name.includes("retained-tail"))).toBe(false);
+  });
+
+  it("rejects complete interior corruption without trimming any trace bytes", async () => {
+    const f = fixture(), before = fs.readFileSync(f.paths[0]!);
+    const applied = await archiveStaleMeshEntries({ mesh: f.root, mode: "apply", batch: "interior", now });
+    const manifestFile = path.join(f.root, "archive/manifests/interior.jsonl");
+    fs.appendFileSync(manifestFile, '{"type":"done",BROKEN}\n{"type":"done"');
+    const damaged = fs.readFileSync(manifestFile);
+    await expect(archiveStaleMeshEntries({ mesh: f.root, mode: "apply", now })).rejects.toThrow();
+    await expect(archiveStaleMeshEntries({ mesh: f.root, mode: "restore", batch: applied.batch! })).rejects.toThrow();
+    expect(fs.readFileSync(manifestFile)).toEqual(damaged);
+    expect(fs.existsSync(f.paths[0]!)).toBe(false);
+    expect(fs.readFileSync(path.join(f.root, "archive/host-leases/interior", path.basename(f.paths[0]!)))).toEqual(before);
   });
 
   it("rejects symlink roots, source entries, archive parents and traversal batch names", async () => {

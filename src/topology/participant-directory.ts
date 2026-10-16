@@ -845,7 +845,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
           if (this.#retiredDuring(error)) return;
           this.#backgroundRefresh.failure(error);
         });
-        return;
+        if (this.#refreshing && this.#fileWork > 0) return;
       }
       if (!this.#publicationRetryTimer && !this.#publicationRetrying) this.#runBackground(() => this.refresh());
     }, this.#heartbeatMs);

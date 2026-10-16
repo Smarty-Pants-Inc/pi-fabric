@@ -581,6 +581,8 @@ const hostedOnlySuites = ["tests/actor-child-completion-idle-preflight.test.ts",
   "tests/agents-provider.test.ts", "tests/residency-commit-fence.test.ts", "tests/residency-stopped-writer-retention.test.ts",
   "tests/residency.test.ts", "tests/routed-session-boundaries.test.ts", "tests/stall-alarms.test.ts",
   "tests/task-write-policy.test.ts", "tests/temp-run-sweep.test.ts", "tests/verified-remove-windows.test.ts", "tests/windows-temp-root-native.test.ts"];
+const realBrokerNatsSuites = ["tests/mesh-state-backend.test.ts", "tests/mesh-state-backend-multiprocess.test.ts",
+  "tests/mesh-backend-migration-nats.test.ts", "tests/state-backend-nats-election.test.ts", "tests/nats-auth-server.test.ts"];
 const guardableSuites = ["tests/actor-directory.test.ts",
   "tests/mesh-backend-migration-nats.test.ts",
   "tests/state-backend-nats.test.ts", "tests/residency-operator-actors.test.ts", "tests/mesh-publish-batch-hold.test.ts",
@@ -606,9 +608,12 @@ const out = { include: project.test.include, exclude: project.test.exclude ?? []
 console.log("CONFIG:" + JSON.stringify(out));
 `;
 
-it.each([[undefined, false], ["false", false], ["true", true]] as const)(
-  "vitest.config.cts keeps native/tool, Bun and reverted deletion hosted-only (GITHUB_ACTIONS=%s)", (value, hosted) => {
-    const env: NodeJS.ProcessEnv = { ...process.env, GITHUB_ACTIONS: value,
+it.each([[undefined, false, "0"], ["false", false, "0"], ["true", true, "0"],
+  [undefined, false, "1"], ["false", false, "1"], ["true", true, "1"]] as const)(
+  "vitest.config.cts keeps native/tool, Bun and reverted deletion hosted-only (GITHUB_ACTIONS=%s, hosted=%s, FABRIC_TEST_SKIP_NATS=%s)", (value, hosted, skipNats) => {
+    // The broker capability gate is independent of deletion safety. Pin both
+    // branches instead of inheriting the outer generic-CI job's NATS skip flag.
+    const env: NodeJS.ProcessEnv = { ...process.env, GITHUB_ACTIONS: value, FABRIC_TEST_SKIP_NATS: skipNats,
       NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --experimental-transform-types` };
     if (value === undefined) delete env.GITHUB_ACTIONS;
     const result = runChild(`config-child-${value}.mjs`, configChild,
@@ -619,11 +624,15 @@ it.each([[undefined, false], ["false", false], ["true", true]] as const)(
       rootExclude: string[]; suites: string[]; projects: Array<{ name: string; exclude: string[] }> };
     expect(output.include).toEqual(["tests/**/*.test.ts"]);
     const required = hosted ? [] : hostedOnlySuites;
+    const brokerExcluded = skipNats === "1" ? realBrokerNatsSuites : [];
     expect(output.suites).toEqual(required);
-    expect(output.rootExclude).toEqual(required);
+    expect(output.rootExclude).toEqual([...required, ...brokerExcluded]);
     for (const project of output.projects) {
       for (const suite of hostedOnlySuites) expect(project.exclude.includes(suite), `${project.name}: ${suite}`).toBe(!hosted);
-      for (const suite of guardableSuites) expect(project.exclude, `${project.name}: guarded Node fs stays local`).not.toContain(suite);
+      for (const suite of realBrokerNatsSuites) expect(project.exclude.includes(suite), `${project.name}: broker capability`).toBe(skipNats === "1");
+      for (const suite of guardableSuites.filter(suite => !brokerExcluded.includes(suite))) {
+        expect(project.exclude, `${project.name}: guarded Node fs stays local`).not.toContain(suite);
+      }
     }
     // Native/tool and Bun counterexamples stay excluded; a guarded actor suite and the migration suites
     // no longer disappear just because they import deleting product code (pi-fabric#1151).

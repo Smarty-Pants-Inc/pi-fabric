@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import type { Consumer, ConsumerAPI, ConsumerInfo, Consumers } from "@nats-io/jetstream";
+import type { Consumer, ConsumerAPI, ConsumerInfo, Consumers, JetStreamClient } from "@nats-io/jetstream";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { importMeshStateToNats } from "../src/mesh/backend-migration-nats.js";
 import { selectNatsSyncAlways } from "../src/mesh/nats-monitor-config.js";
@@ -11,8 +11,11 @@ import { startNatsElectionCluster, stopNatsElectionCluster, type NatsElectionClu
 const binary = process.env.NATS_BIN?.trim();
 const identity: MeshIdentity = { id: "election-test", name: "election-test", kind: "agent" };
 const clusters: NatsElectionCluster[] = [];
-afterEach(async () => {
+afterEach(async context => {
+  const state = context.task.result?.state; // Vitest 4 sets pass/fail before afterEach hooks run.
   for (const cluster of clusters.splice(0)) {
+    // Capture BEFORE stopAll's SIGCONT/SIGTERM and scratch removal; never throws, so cleanup always follows.
+    await cluster.captureDiagnostics(context.task.name, state);
     await stopNatsElectionCluster(cluster);
     console.log(`NATS_ELECTION_CLEANUP ${JSON.stringify(cluster.cleanupReceipt())}`);
   }
@@ -162,6 +165,7 @@ describe("real three-node NATS metadata-leader election", () => {
       clearTimeout(resumeTimer);
       const ok = paused.child.kill("SIGCONT"); // Only the fixture's owned direct ChildProcess, never PID/name discovery.
       resumedAt = performance.now();
+      cluster.trace("fault.resume", { node: paused.name, ok, pausedAt, resumedAt });
       resumed.resolve();
       expect(ok, "owned R1 receiver SIGCONT").toBe(true);
     };
@@ -197,6 +201,7 @@ describe("real three-node NATS metadata-leader election", () => {
           const placement = { setup: placements.length + 1, stream: args[0], consumer: info.name, createLeader: ack!.cluster?.leader,
             consumerHost: host!.name, streamLeader: streamHost!.name, connectedSeed: seedNode.name, qualifies };
           placements.push(placement);
+          cluster.trace("bootstrap.placement", placement);
           console.log(`NATS_BOOTSTRAP_PLACEMENT ${JSON.stringify(placement)}`);
           if (!selecting || Date.now() >= selectionDeadline) throw new Error("placement precondition expired before first NEXT; no fault issued");
           if (qualifies) {
@@ -209,6 +214,9 @@ describe("real three-node NATS metadata-leader election", () => {
             faultInfo = info;
             faults++;
             pausedAt = performance.now();
+            cluster.trace("fault.select", { stream: args[0], pausedAt,
+              consumer: { name: info.name, created: info.created, cluster: info.cluster, delivered: info.delivered, num_pending: info.num_pending, num_waiting: info.num_waiting },
+              streamInfo: { cluster: stream.cluster, state: stream.state, replicas: stream.config.num_replicas } });
             resumeTimer = setTimeout(resume, 6_000); // One finite fault duration; finally also resumes on failed assertions.
             expect(host!.child.kill("SIGSTOP"), "owned R1 receiver SIGSTOP").toBe(true);
             faultArmed.resolve();
@@ -221,14 +229,24 @@ describe("real three-node NATS metadata-leader election", () => {
     const makePort = async () => {
       const port = await connectJetStream([cluster.seedUrl], { monitoringUrl: cluster.seedMonitorUrl, replicas: 3 });
       ports.push(port);
+      const publish = port.publish.bind(port); // Metadata only (size/id/expect); same promise returned, no added await.
+      port.publish = (subject, data, options) => {
+        cluster.trace("port.publish.start", { subject, bytes: data.byteLength, msgID: options.msgID, expect: options.expectLastSequence });
+        const pending = publish(subject, data, options);
+        pending.then(ack => cluster.trace("port.publish.ack", { msgID: options.msgID, seq: ack.seq, duplicate: ack.duplicate }),
+          error => cluster.trace("port.publish.error", { msgID: options.msgID, error: error instanceof Error ? `${error.name}: ${error.message}` : String(error) }));
+        return pending;
+      };
       const get = port.getMessage.bind(port);
       let gets = 0;
       port.getMessage = (...args: Parameters<JetStreamPort["getMessage"]>) => { gets++; return get(...args); };
       const consume = port.consume.bind(port);
       port.consume = (stream, after, onMessage, onError) => consume(stream, after, message => {
         onMessage(message);
+        cluster.trace("port.consume.message", { stream, seq: message.seq });
         if (stream === faultStream && message.seq <= 3) {
           received.push(message.seq);
+          cluster.trace("fault.received", { seq: message.seq, received: received.length });
           if (received.length === 3) lateHistory.resolve();
         }
       }, onError);
@@ -244,7 +262,11 @@ describe("real three-node NATS metadata-leader election", () => {
       ownStreams.add(natsStreamName(root));
       const { port } = await makePort();
       const backend = await openNatsStateBackend({ root, port, replicas: 3, snapshotEvery: 0 });
-      for (let index = 0; index < records; index++) await backend.put({ key: `bootstrap/${index}`, value: { index }, identity });
+      for (let index = 0; index < records; index++) {
+        cluster.trace("backend.put.start", { root: name, index });
+        await backend.put({ key: `bootstrap/${index}`, value: { index }, identity });
+        cluster.trace("backend.put.done", { root: name, index });
+      }
       const expected = backend.listAll();
       expect(backend.diagnostics().nats).toMatchObject({ appliedSeq: records, knownSeq: records });
       closeNatsStateBackend(root);
@@ -280,6 +302,7 @@ describe("real three-node NATS metadata-leader election", () => {
         ]), remaining(), "reopen placement precondition");
         const backend = "backend" in selected ? selected.backend : await bounded(opening, 5_500, "faulted initial open");
         selecting = false;
+        cluster.trace("bootstrap.open.settled", { setup, faults, elapsedMs: performance.now() - started, nats: backend.diagnostics().nats });
         expect(backend.listAll()).toEqual(expected);
         expect(backend.diagnostics().nats).toMatchObject({ appliedSeq: 3, knownSeq: 3 });
         if (!faults) {
@@ -304,7 +327,9 @@ describe("real three-node NATS metadata-leader election", () => {
         expect((await faultConsumer!.info(false)).name).toBe(faultInfo!.name);
         expect((await manager.consumers.info(faultStream!, faultInfo!.name)).created).toBe(faultInfo!.created);
         const entry = expected[0]!;
+        cluster.trace("fault.cas.start", { key: entry.key, ifVersion: entry.version, nats: backend.diagnostics().nats });
         await backend.put({ key: entry.key, ifVersion: entry.version, value: { resumed: true }, identity });
+        cluster.trace("fault.cas.done", { nats: backend.diagnostics().nats });
         expect(backend.get(entry.key)).toMatchObject({ value: { resumed: true }, version: entry.version + 1 });
         expect(backend.diagnostics().nats).toMatchObject({ appliedSeq: 4, knownSeq: 4 });
         expect(creates.filter(info => info.stream_name === faultStream)).toHaveLength(2);
@@ -320,6 +345,13 @@ describe("real three-node NATS metadata-leader election", () => {
       resume(); // Must precede observer/port close and the existing fixture afterEach cleanup.
       clearTimeout(resumeTimer);
       selecting = false;
+      if (faultStream) { // Diagnostic only: failing stream/consumer INFO before observer/ports close.
+        const infos = await bounded(Promise.allSettled([manager.streams.info(faultStream),
+          faultInfo ? manager.consumers.info(faultStream, faultInfo.name) : Promise.resolve(undefined)]), 1_000, "diagnostic fault INFO").catch(error => error);
+        cluster.trace("finally.faultInfo", Array.isArray(infos) ? { stream: infos[0].status === "fulfilled" ? { cluster: infos[0].value.cluster, state: infos[0].value.state } : String(infos[0].reason),
+          consumer: infos[1].status === "fulfilled" ? infos[1].value && { name: infos[1].value.name, cluster: infos[1].value.cluster, delivered: infos[1].value.delivered, num_pending: infos[1].value.num_pending, num_waiting: infos[1].value.num_waiting } : String(infos[1].reason) }
+          : { error: String(infos) });
+      }
       getSpy.mockRestore();
       addSpy.mockRestore();
       for (const root of roots) closeNatsStateBackend(root);
@@ -339,13 +371,14 @@ describe("real three-node NATS metadata-leader election", () => {
     const migrationRoot = path.join(cluster.root, "fault-migration");
     const unavailableRoot = path.join(cluster.root, "placement-unavailable");
     const ownStreams = new Set([root, ...faultRoots, migrationRoot, unavailableRoot].map(natsStreamName));
-    const [{ connect }, { jetstreamManager }] = await Promise.all([import("@nats-io/transport-node"), import("@nats-io/jetstream")]);
+    const [{ connect }, { jetstream, jetstreamManager }] = await Promise.all([import("@nats-io/transport-node"), import("@nats-io/jetstream")]);
     const successfulCreates: { stream: string; ms: number; healthy: boolean }[] = [];
     const qualifiedOpens: string[] = [];
     const correlationErrors: string[] = [];
     let pausedNode: string | undefined;
     let observer: Awaited<ReturnType<typeof connect>> | undefined;
     let restoreCreateSpy: (() => void) | undefined;
+    let restorePublishSpy: (() => void) | undefined;
     try {
     observer = await connect({ servers: [cluster.seedUrl], ignoreClusterUpdates: true, reconnect: false, timeout: 1_000 });
     const manager = await jetstreamManager(observer, { timeout: 1_000 });
@@ -360,8 +393,14 @@ describe("real three-node NATS metadata-leader election", () => {
       const requestPausedNode = pausedNode;
       const started = performance.now();
       // Recording only: always execute the real API with its original receiver, arguments, errors and ACK.
-      const ack = await originalAdd.apply(this, args);
+      let ack: ConsumerInfo;
+      try { ack = await originalAdd.apply(this, args); }
+      catch (error: unknown) {
+        if (measured) cluster.trace("create.error", { stream, name, requestPausedNode, error: error instanceof Error ? error.message : String(error) });
+        throw error;
+      }
       const ms = performance.now() - started;
+      if (measured) cluster.trace("create.ack", { stream, name, leader: ack.cluster?.leader, ms, requestPausedNode });
       if (measured) {
         const leader = cluster.nodes.find(node => node.name === ack.cluster?.leader || node.metaId === ack.cluster?.leader);
         if (!name || ack.stream_name !== stream || ack.name !== name || ack.config?.name !== name
@@ -375,6 +414,23 @@ describe("real three-node NATS metadata-leader election", () => {
       return ack;
     });
     restoreCreateSpy = () => createSpy.mockRestore();
+    const publishPrototype = Object.getPrototypeOf(jetstream(observer)) as JetStreamClient;
+    const originalPublish = publishPrototype.publish;
+    const ownStateSubjects = new Set([...ownStreams].map(stream => `${stream}.state`));
+    const publishSpy = vi.spyOn(publishPrototype, "publish").mockImplementation(function (this: JetStreamClient,
+      ...args: Parameters<JetStreamClient["publish"]>) {
+      const [subject, payload, options] = args;
+      if (!ownStateSubjects.has(subject)) return originalPublish.apply(this, args);
+      const msgID = options?.msgID;
+      const expectLastSequence = options?.expect?.lastSequence;
+      const bytes = payload === undefined ? 0 : typeof payload === "string" ? Buffer.byteLength(payload) : payload.byteLength;
+      cluster.trace("sdk.publish.start", { subject, bytes, msgID, expectLastSequence });
+      const pending = originalPublish.apply(this, args);
+      pending.then(ack => cluster.trace("sdk.publish.ack", { subject, msgID, seq: ack.seq, duplicate: ack.duplicate }),
+        error => cluster.trace("sdk.publish.error", { subject, msgID, error: error instanceof Error ? `${error.name}: ${error.message}` : String(error) }));
+      return pending;
+    });
+    restorePublishSpy = () => publishSpy.mockRestore();
     const seedBackend = await openNatsStateBackend({ root, ...options, maxEventBytes: 64 * 1024 });
     qualifiedOpens.push(initial.stream);
     try {
@@ -464,11 +520,13 @@ describe("real three-node NATS metadata-leader election", () => {
         raw = await connectJetStream([survivingSeed], { monitoringUrl: cluster.seedMonitorUrl, replicas: 3 });
         sequence = await raw.lastSequence(initial.stream);
       });
+      cluster.trace("election.paused", { leader: leader.name, pausedAt, seed: cluster.seedUrl });
       expect(cluster.seedUrl).not.toBe(leader.clientUrl);
       let peerStates: Awaited<ReturnType<typeof observePeerElection>> | undefined;
       let peerObservationError: string | undefined;
       try { peerStates = await observePeerElection(cluster, leader.name, pausedAt + 14_500); }
       catch (error) { peerObservationError = error instanceof Error ? error.message : String(error); }
+      cluster.trace("election.peers", { peerStates, peerObservationError });
       expect(peerStates, peerObservationError ?? "healthy peers did not elect a different metadata leader").toBeDefined();
       // NATS 2.14.7 selectPeerGroup intentionally allows R3 on two live peers when the third's config/stats
       // are known. Missing peer metadata instead returns 10005. Both are valid; neither may degrade to R1.
@@ -478,6 +536,7 @@ describe("real three-node NATS metadata-leader election", () => {
       const placement = await importMeshStateToNats(unavailableRoot, { ...migrationOptions!, placementTimeoutMs }).then(
         value => ({ kind: "success-r3" as const, value }), error => ({ kind: "unavailable" as const, error }));
       const elapsedMs = Date.now() - startedAt;
+      cluster.trace("election.placement", { branch: placement.kind, elapsedMs });
       console.log(`NATS_PLACEMENT_OUTCOME ${JSON.stringify({ branch: placement.kind, placementTimeoutMs, elapsedMs })}`);
       expect(elapsedMs).toBeLessThan(placementTimeoutMs + 2_000);
       expect(resumedAt, "placement must settle before the safety SIGCONT").toBe(0);
@@ -574,6 +633,7 @@ describe("real three-node NATS metadata-leader election", () => {
         `missing real CREATE call/ACK samples for qualified opens of ${stream}`).toBeGreaterThanOrEqual(qualifiedOpens.filter(name => name === stream).length);
     }
     } finally {
+      restorePublishSpy?.();
       restoreCreateSpy?.();
       // close() tears down the local socket without a protocol drain. Bound even an unexpected SDK stall.
       let closeTimer: ReturnType<typeof setTimeout> | undefined;

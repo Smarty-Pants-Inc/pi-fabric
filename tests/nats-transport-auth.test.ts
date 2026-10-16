@@ -33,7 +33,7 @@ const MACHINE_B = "machine-b";
 let harness: PathBHarness;
 
 describe.skipIf(!binary)("authenticated Path B transport", () => {
-  beforeAll(async () => { harness = await createPathBHarness({ binary: binary! }); });
+  beforeAll(async () => { harness = await createPathBHarness({ binary: binary!, tls: {} }); });
   afterAll(async () => { await harness?.stop(); });
 
   it("carries a command and its admission ACK between two authenticated machine runtimes", async () => {
@@ -90,7 +90,7 @@ describe.skipIf(!binary)("authenticated Path B transport", () => {
   });
 
   it("refuses a valid report-only operator with an extra private-message subscription", async () => {
-    const fixture = await createPathBHarness({ binary: binary!, additionalOperatorSubscribe: ["fabric.in.>"] });
+    const fixture = await createPathBHarness({ binary: binary!, tls: {}, additionalOperatorSubscribe: ["fabric.in.>"] });
     try {
       const authenticated = await fixture.connect(fixture.users.maintainer);
       await authenticated.close();
@@ -134,7 +134,7 @@ describe.skipIf(!binary)("authenticated Path B transport", () => {
   });
 
   it.each([">", "fabric.>", "fabric.in.*.*.*.*.machine-b", "$JS.API.STREAM.NAMES", "fabric.in.*.*.*.*.machine-a.>"])("refuses a server-expanded extra publish grant: %s", async (grant) => {
-    const fixture = await createPathBHarness({ binary: binary!, additionalAgentPublish: [grant] });
+    const fixture = await createPathBHarness({ binary: binary!, tls: {}, additionalAgentPublish: [grant] });
     try {
       await expect(openNatsConnection(fixture.runtimeOptions(fixture.users.machineA))).rejects.toThrow();
     } finally {
@@ -143,7 +143,7 @@ describe.skipIf(!binary)("authenticated Path B transport", () => {
   });
 
   it.each([">", "fabric.>", "_INBOX.>"])("refuses an extra subscribe grant: %s", async (grant) => {
-    const fixture = await createPathBHarness({ binary: binary!, additionalAgentSubscribe: [grant] });
+    const fixture = await createPathBHarness({ binary: binary!, tls: {}, additionalAgentSubscribe: [grant] });
     try {
       await expect(openNatsConnection(fixture.runtimeOptions(fixture.users.machineA))).rejects.toThrow();
     } finally {
@@ -152,7 +152,7 @@ describe.skipIf(!binary)("authenticated Path B transport", () => {
   });
 
   it.each(["$JS.API.DIRECT.GET.>", "$JS.API.STREAM.DELETE.>", "$JS.API.STREAM.CREATE.FABRIC_CUSTODY"])("refuses a removed publish deny: %s", async (subject) => {
-    const fixture = await createPathBHarness({ binary: binary!, removeAgentDeny: [subject] });
+    const fixture = await createPathBHarness({ binary: binary!, tls: {}, removeAgentDeny: [subject] });
     try {
       await expect(openNatsConnection(fixture.runtimeOptions(fixture.users.machineA))).rejects.toThrow();
     } finally {
@@ -161,7 +161,7 @@ describe.skipIf(!binary)("authenticated Path B transport", () => {
   });
 
   it("matches the complete merged template expanded over multiple signed mesh tags", async () => {
-    const fixture = await createPathBHarness({ binary: binary!, additionalAgentMeshes: ["abcdef0123456789abcdef0123456789"] });
+    const fixture = await createPathBHarness({ binary: binary!, tls: {}, additionalAgentMeshes: ["abcdef0123456789abcdef0123456789"] });
     try {
       const connection = await openNatsConnection(fixture.runtimeOptions(fixture.users.machineA));
       expect(connection.userInfo).toBeDefined();
@@ -203,17 +203,39 @@ describe.skipIf(!binary)("authenticated Path B transport", () => {
   });
 
   describe("plaintext policy", () => {
-    it("refuses plaintext by default without the explicit test-only loopback opt-in", async () => {
-      const { allowInsecureLoopback: _optIn, ...strict } = harness.runtimeOptions(harness.users.machineA) as ConnectionOptions & { allowInsecureLoopback?: boolean };
-      await expect(openNatsConnection(strict)).rejects.toThrow();
+    let plaintext: PathBHarness;
+    beforeAll(async () => { plaintext = await createPathBHarness({ binary: binary! }); });
+    afterAll(async () => { await plaintext?.stop(); });
+    it("the public connection and transport APIs refuse even numeric-loopback plaintext", async () => {
+      const strict = plaintext.runtimeOptions(plaintext.users.machineA);
+      await expect(openNatsConnection(strict)).rejects.toThrow("requires tls://");
+      await expect(openNatsTransport({ ...strict, hostId: "public-plaintext" })).rejects.toThrow("requires tls://");
+      for (const allowInsecureLoopback of [true, false, undefined]) {
+        const legacy = { ...strict, allowInsecureLoopback };
+        await expect(openNatsConnection(legacy as unknown as ConnectionOptions)).rejects.toThrow("not supported");
+        await expect(openNatsTransport({ ...legacy, hostId: "public-legacy" } as unknown as Parameters<typeof openNatsTransport>[0])).rejects.toThrow("not supported");
+      }
     });
-    it("never reads the loopback escape from the environment", async () => {
-      const { allowInsecureLoopback: _optIn, ...strict } = harness.runtimeOptions(harness.users.machineA) as ConnectionOptions & { allowInsecureLoopback?: boolean };
+    it("never reads a plaintext or CA escape from the environment", async () => {
+      const strict = plaintext.runtimeOptions(plaintext.users.machineA);
       for (const name of ["PI_FABRIC_NATS_ALLOW_INSECURE_LOOPBACK", "PI_FABRIC_ALLOW_INSECURE_LOOPBACK", "NATS_ALLOW_INSECURE_LOOPBACK"]) vi.stubEnv(name, "1");
-      try { await expect(openNatsConnection(strict)).rejects.toThrow(); } finally { vi.unstubAllEnvs(); }
+      vi.stubEnv("PI_FABRIC_NATS_CA_FILE", harness.tls!.caFile);
+      try {
+        await expect(openNatsConnection(strict)).rejects.toThrow("requires tls://");
+        const { tls: _tls, ...noExplicitCa } = harness.runtimeOptions(harness.users.machineA) as ConnectionOptions;
+        await expect(openNatsConnection(noExplicitCa)).rejects.toThrow();
+      } finally { vi.unstubAllEnvs(); }
     });
-    it("ignores allowInsecureLoopback in mesh transport config (only a direct option may opt in)", async () => {
-      const { allowInsecureLoopback: _optIn, ...strict } = harness.runtimeOptions(harness.users.machineA) as ConnectionOptions & { allowInsecureLoopback?: boolean };
+    it.each(["NODE_EXTRA_CA_CERTS", "NODE_TLS_REJECT_UNAUTHORIZED", "SSL_CERT_FILE", "SSL_CERT_DIR"])("refuses ambient TLS trust override %s even with otherwise valid TLS", async (name) => {
+      vi.stubEnv(name, name === "NODE_TLS_REJECT_UNAUTHORIZED" ? "0" : harness.tls!.caFile);
+      try {
+        const options = harness.runtimeOptions(harness.users.machineA);
+        await expect(openNatsConnection(options)).rejects.toThrow(`refuses ${name}`);
+        await expect(openNatsTransport({ ...options, hostId: "ambient-trust" })).rejects.toThrow(`refuses ${name}`);
+      } finally { vi.unstubAllEnvs(); }
+    });
+    it("refuses allowInsecureLoopback in mesh transport config", async () => {
+      const strict = harness.runtimeOptions(harness.users.machineA);
       const nats = { ...strict, allowInsecureLoopback: true };
       // mesh.transport is the selector; mesh.nats is its sibling policy/config object.
       const config = { nats, transport: "nats" };
@@ -229,10 +251,10 @@ describe.skipIf(!binary)("authenticated Path B transport", () => {
         await expect(openNatsTransport(options as unknown as Parameters<typeof openNatsTransport>[0])).rejects.toThrow();
       }
     });
-    it("refuses a non-numeric-loopback plaintext URL even with the opt-in", async () => {
-      const port = new URL(harness.serverUrl).port;
-      for (const servers of [`nats://localhost:${port}`, "nats://192.0.2.1:4222", "nats://example.invalid:4222", [harness.serverUrl, "nats://192.0.2.1:4222"]]) {
-        await expect(openNatsConnection({ ...harness.runtimeOptions(harness.users.machineA), servers, timeoutMs: 1_000 })).rejects.toThrow();
+    it("refuses plaintext URLs without an explicit TLS configuration", async () => {
+      const port = new URL(plaintext.serverUrl).port;
+      for (const servers of [`nats://localhost:${port}`, "nats://192.0.2.1:4222", "nats://example.invalid:4222", [plaintext.serverUrl, "nats://192.0.2.1:4222"]]) {
+        await expect(openNatsConnection({ ...plaintext.runtimeOptions(plaintext.users.machineA), servers, timeoutMs: 1_000 })).rejects.toThrow("requires tls://");
       }
     });
   });
@@ -260,7 +282,7 @@ describe.skipIf(!binary)("authenticated Path B transport over verified TLS", () 
     const connection = await openNatsConnection(tlsOptions(tlsHarness, "localhost"));
     expect(connection.userInfo).toBeDefined();
     await connection.close();
-    for (const host of ["127.0.0.1", "[::1]"]) {
+    for (const host of ["127.0.0.1", "127.0x0.1", "0x7f.1", "2130706433", "0177.0.0.1", "[::1]"]) {
       await expect(openNatsConnection(tlsOptions(tlsHarness, host))).rejects.toThrow("use the certificate DNS name");
     }
   });
@@ -345,7 +367,7 @@ describe.skipIf(!binary)("authenticated Path B transport over verified TLS", () 
     await secured.close();
     const plaintext = await createPathBHarness({ binary: binary! });
     try {
-      await expect(openNatsConnection({ ...plaintext.runtimeOptions(plaintext.users.machineA), allowInsecureLoopback: false,
+      await expect(openNatsConnection({ ...plaintext.runtimeOptions(plaintext.users.machineA),
         servers: `nats://localhost:${new URL(plaintext.serverUrl).port}`, tls: {}, timeoutMs: 1_000 })).rejects.toThrow();
     } finally { await plaintext.stop(); }
   });

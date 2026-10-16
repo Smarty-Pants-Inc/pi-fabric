@@ -407,4 +407,4 @@ jobs:
       - name: Hosted authenticated NATS T2/T8 and Path B grants (source CLI)
         env:
           NATS_AUTH_REQUIRED: '1'
-        run: bunx vitest run tests/nats-auth-server.test.ts tests/nats-auth-path-b-*.test.ts tests/nats-messaging.test.ts tests/nats-transport-auth.test.ts tests/nats-inbox-faults.test.ts tests/nats-kv-watch.test.ts tests/nats-dead-letter.test.ts --retry=0
+        run: bunx vitest run tests/nats-auth-server.test.ts tests/nats-auth-path-b-*.test.ts tests/nats-messaging.test.ts tests/nats-transport-auth.test.ts tests/nats-inbox-faults.test.ts tests/nats-kv-watch.test.ts tests/nats-dead-letter.test.ts tests/nats-reconnect-auth.test.ts --retry=0

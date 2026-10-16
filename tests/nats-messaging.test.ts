@@ -30,13 +30,13 @@ const transports: Array<{ close(): Promise<void> }> = [];
 const provisionAs = async (fixture: PathBHarness): Promise<void> => {
   for (const [name, value] of Object.entries(fixture.adminEnv(fixture.users.bootstrap))) vi.stubEnv(name, value);
   try {
-    expect(await runTransportAdmin(["provision", "--allow-insecure-loopback", "--machines", PATH_B_MACHINES.join(",")])).toBe(0);
+    expect(await runTransportAdmin(["provision", "--ca-file", fixture.tls!.caFile, "--machines", PATH_B_MACHINES.join(",")])).toBe(0);
   } finally { vi.unstubAllEnvs(); }
 };
 
 beforeAll(async () => {
   if (!binary) return;
-  shared = await createPathBHarness({ binary });
+  shared = await createPathBHarness({ binary, tls: {} });
   await provisionAs(shared);
 }, 30_000);
 
@@ -119,7 +119,7 @@ describe.skipIf(!binary)("real nats-server Path B module", () => {
 
   it("sends, dedupes, redelivers, confirms ACKs and captures max-delivery advisories", async () => {
     // This selected integration path uses actual role credentials and default USER.INFO verification.
-    const fixture = await createPathBHarness({ binary });
+    const fixture = await createPathBHarness({ binary, tls: {} });
     const opened: Array<{ close(): Promise<void> }> = [];
     const signal = new AbortController();
     try {

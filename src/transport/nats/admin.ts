@@ -59,10 +59,6 @@ const caFileArg = (args: readonly string[]): { readonly tls?: { readonly caFile:
   return { tls: { caFile } };
 };
 
-/** Explicit CLI flag only (tests): never configuration or environment. */
-const insecureLoopbackArg = (args: readonly string[]): { readonly allowInsecureLoopback?: true } =>
-  args.includes("--allow-insecure-loopback") ? { allowInsecureLoopback: true } : {};
-
 const operatorMachineArg = (args: readonly string[]): string => {
   const index = args.indexOf("--operator-machine");
   const machine = index < 0 ? "fabric-ops" : args[index + 1];
@@ -110,7 +106,6 @@ async function provision(args: readonly string[]): Promise<void> {
     credentials: requiredEnv("PI_FABRIC_NATS_CREDENTIALS"),
     name: "fabric-transport-admin",
     ...caFileArg(args),
-    ...insecureLoopbackArg(args),
   });
   try {
     // This is deliberately first: advisories are otherwise lost before the operator consumer exists.
@@ -138,7 +133,6 @@ async function drain(args: readonly string[]): Promise<void> {
     ...policyFromEnv(args),
     name: "fabric-transport-admin-drain",
     ...caFileArg(args),
-    ...insecureLoopbackArg(args),
   });
   try {
     const info = await connection.manager.consumers.info(transportInboxStream(machine), transportDurableName(hostId));
@@ -171,7 +165,6 @@ async function orphan(args: readonly string[]): Promise<void> {
     ...policyFromEnv(args),
     name: "fabric-transport-admin-orphan-report",
     ...caFileArg(args),
-    ...insecureLoopbackArg(args),
   });
   try {
     const stream = transportInboxStream(targetMachine);
@@ -200,7 +193,6 @@ async function dlq(args: readonly string[]): Promise<void> {
     ...policyFromEnv(args),
     name: "fabric-transport-admin-dlq",
     ...caFileArg(args),
-    ...insecureLoopbackArg(args),
   });
   const controller = new AbortController();
   const stop = (): void => controller.abort();
@@ -225,6 +217,7 @@ async function dlq(args: readonly string[]): Promise<void> {
 }
 
 export async function runTransportAdmin(args: readonly string[]): Promise<number> {
+  if (args.includes("--allow-insecure-loopback")) throw new Error("--allow-insecure-loopback is not supported");
   const [command] = args;
   if (command === "provision") await provision(args);
   else if (command === "drain") await drain(args);

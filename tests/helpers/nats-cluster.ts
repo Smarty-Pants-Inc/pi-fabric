@@ -84,6 +84,9 @@ export interface PathBTlsFiles {
   readonly caFile: string;
   /** A second, unrelated CA that never signed the server certificate. */
   readonly untrustedCaFile: string;
+  /** Fixture server keypair, used only by the test fault relay. */
+  readonly certFile: string;
+  readonly keyFile: string;
 }
 
 function openssl(cwd: string, args: readonly string[]): void {
@@ -408,7 +411,10 @@ export class PathBHarness {
         users,
         configText: fullConfig,
         binary,
-        ...(tlsFiles ? { tls: { caFile: tlsFiles.caFile, untrustedCaFile: tlsFiles.untrustedCaFile } } : {}),
+        ...(tlsFiles ? { tls: {
+          caFile: tlsFiles.caFile, untrustedCaFile: tlsFiles.untrustedCaFile,
+          certFile: tlsFiles.certFile, keyFile: tlsFiles.keyFile,
+        } } : {}),
       });
       await harness.start();
       return harness;
@@ -471,14 +477,15 @@ export class PathBHarness {
     return nc;
   }
 
-  /** Runtime (agent) options for the plaintext loopback fixture: exact policy plus the test-only loopback opt-in. */
+  /** Runtime (agent) options: TLS fixtures use the certificate DNS identity; default raw auth fixtures stay plaintext. */
   runtimeOptions(user: Pick<PathBUser, "machine" | "credsPath">) {
+    const port = new URL(this.serverUrl).port;
     return {
-      servers: this.serverUrl,
+      servers: this.tls ? `tls://localhost:${port}` : this.serverUrl,
       credentials: user.credsPath,
       machine: user.machine,
       ...PATH_B_PERMISSION_POLICY,
-      ...(this.tls ? { tls: { caFile: this.tls.caFile } } : { allowInsecureLoopback: true as const }),
+      ...(this.tls ? { tls: { caFile: this.tls.caFile } } : {}),
     };
   }
 
@@ -487,9 +494,10 @@ export class PathBHarness {
     return { ...this.runtimeOptions(user), role: "operator" as const };
   }
 
-  /** Admin CLI environment for this fixture; tests pair it with the explicit --allow-insecure-loopback flag. */
+  /** Admin CLI environment; TLS callers supply the CA path explicitly on the command line. */
   adminEnv(user: Pick<PathBUser, "machine" | "credsPath">): Record<string, string> {
-    return { ...PATH_B_POLICY_ENV, PI_FABRIC_NATS_SERVERS: this.serverUrl, PI_FABRIC_NATS_CREDENTIALS: user.credsPath, PI_FABRIC_MACHINE: user.machine };
+    const port = new URL(this.serverUrl).port;
+    return { ...PATH_B_POLICY_ENV, PI_FABRIC_NATS_SERVERS: this.tls ? `tls://localhost:${port}` : this.serverUrl, PI_FABRIC_NATS_CREDENTIALS: user.credsPath, PI_FABRIC_MACHINE: user.machine };
   }
 
   async userInfoFieldPaths(user: PathBUser): Promise<string[]> {

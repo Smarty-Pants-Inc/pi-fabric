@@ -103,6 +103,27 @@ describe("dead sessions' actor presence (smarty-dev#448)", () => {
     expect(batch).not.toHaveBeenCalled();
   });
 
+  it("yields custody every 64 deletions and keeps a renewed entry in a later batch", async () => {
+    const { mesh } = store();
+    await mesh.writeBatch({ identity: writer, ops: Array.from({ length: 137 }, (_, n) => ({
+      kind: "put" as const, key: `actors/dead/a${n}`, value: { id: `a${n}` },
+    })) });
+    const original = mesh.writeBatch.bind(mesh);
+    const sizes: number[] = [];
+    let active = false;
+    vi.spyOn(mesh, "writeBatch").mockImplementation(async input => {
+      expect(active).toBe(false); active = true;
+      sizes.push(input.ops.length);
+      try {
+        if (sizes.length === 1) await presence(mesh, "dead", "a70");
+        return await original(input);
+      } finally { active = false; }
+    });
+    expect(await reapDeadSessionPresence(mesh, writer, { ownSessionId: "mine", now: Date.now() + 2 * DAY })).toBe(136);
+    expect(sizes).toEqual([64, 64, 9]);
+    expect(mesh.listAll("actors/", { fresh: true }).map(entry => entry.key)).toEqual(["actors/dead/a70"]);
+  });
+
   it("runs on a persistent manager's retention sweep, and not on a secondary scope manager", async () => {
     const { root, mesh } = store();
     await presence(mesh, "gone", "a1");

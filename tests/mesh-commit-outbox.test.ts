@@ -221,6 +221,40 @@ describe("CommitOutbox", () => {
     }
   });
 
+  it.each(["file", "sqlite"] as const)("bounds retirement and keeps failed batches and newer recordings pending (%s)", async backend => {
+    const mesh = new MeshStore(meshRoot(), 64 * 1024, 100, { stateBackend: backend });
+    const log: string[] = [];
+    const outbox = new CommitOutbox(mesh, "bounded-retire", identity, effects(log));
+    try {
+      const plan = outbox.plan();
+      await mesh.writeBatch({ identity, ops: [], prepare: () => plan.stage([], Array.from({ length: 137 }, (_, n) => ({
+        kind: "touch", key: `k${n}`, payload: { n },
+      })), { durable: true }), afterCommit: view => { plan.run(view); } });
+      const original = mesh.writeBatch.bind(mesh), sizes: number[] = [];
+      const batch = vi.spyOn(mesh, "writeBatch").mockImplementation(async input => {
+        sizes.push(input.ops.length);
+        if (sizes.length === 2) throw new Error("retirement interrupted");
+        return original(input);
+      });
+      await expect(outbox.retire()).rejects.toThrow("retirement interrupted");
+      expect(sizes).toEqual([64, 64]);
+      expect(outbox.retiring).toBe(73);
+      expect(mesh.listAll(outbox.prefix, { fresh: true })).toHaveLength(73);
+      batch.mockRestore();
+      // A newer recording after that failure cannot be retired by the old version fence.
+      const newer = outbox.plan();
+      await mesh.writeBatch({ identity, ops: [], prepare: () => newer.stage([], [{ kind: "touch", key: "k100", payload: { n: 999 } }], { durable: true }) });
+      // stage() folds at most 64 independent retirements into the new atomic commit.
+      expect(mesh.listAll(outbox.prefix, { fresh: true })).toHaveLength(9);
+      await outbox.retire();
+      expect(outbox.retiring).toBe(0);
+      expect(mesh.listAll(outbox.prefix, { fresh: true }).map(entry => entry.key)).toEqual([outbox.rowKey("k100")]);
+      expect(await outbox.recover()).toBe(1);
+      expect(log.at(-1)).toBe("999:replay");
+      expect(mesh.listAll(outbox.prefix, { fresh: true })).toEqual([]);
+    } finally { mesh.closeState(); }
+  });
+
   it("does not take the lock to recover when nothing is pending", async () => {
     const mesh = store();
     const outbox = new CommitOutbox(mesh, "scope-d", identity, effects([]));

@@ -555,13 +555,22 @@ export class MeshLock {
     }
   }
 
-  // Complete dead/different-incarnation receipts recover immediately. Empty ownerless
-  // directories recover only after the grace, using atomic rmdir (never recursive removal
-  // or rename): an owner published after our last comparison makes rmdir fail closed.
-  // Torn/corrupt receipts and nonempty unrecorded directories remain protected.
-  // smarty-dev#9569: a protocol-3 record names its holder's PID namespace; pid evidence (ESRCH, another incarnation)
-  // is used only for a holder of OUR namespace. A foreign or unprovable one is never reclaimed here (`note` says why).
-  async #clearStaleLock(ownerPath: string, deadline: () => number, note: StaleLockNote = {}): Promise<boolean> {
+  // A dead/other-incarnation complete receipt recovers at once, an empty ownerless directory after the grace (atomic
+  // rmdir: a late owner fails it closed); torn receipts and nonempty unrecorded directories stay. smarty-dev#9569: pid
+  // evidence only for OUR PID namespace (foreign/unprovable: `note`). smarty-dev#9501: `expected` = exact owner bytes
+  // after the read; its namespace must come from the owner, never a mutable receipt.
+  // `beforeRename` is synchronous, restartable retirement of that exact owner's dependent receipt, not another death
+  // proof. It runs only AFTER the sole death/namespace/root proof and BEFORE detaching the canonical owner. A throw
+  // keeps that owner available to reprove on rerun; a kill after the native rename cannot strand its FIFO ticket.
+  // The public API accepts the original numeric deadline and the internal live getter used by guest-bounded recovery.
+  async clearStaleLock(ownerPath: string, deadline: number | (() => number), note: StaleLockNote = {},
+    expected?: { owner: string; namespace: string; beforeRename?: () => void }): Promise<boolean> {
+    const deadlineAt = typeof deadline === "function" ? deadline : () => deadline;
+    return this.#clearStaleLock(ownerPath, deadlineAt, note, expected);
+  }
+
+  async #clearStaleLock(ownerPath: string, deadline: () => number, note: StaleLockNote = {},
+    expected?: { owner: string; namespace: string; beforeRename?: () => void }): Promise<boolean> {
     delete note.verdict; delete note.namespace; delete note.token; // describes the CURRENT holder only
     const invocation = meshInvocationStorage.getStore();
     const hasTime = (): boolean => !invocation || invocation.detached || deadline() > Date.now();
@@ -575,6 +584,7 @@ export class MeshLock {
         catch (error) { if (errorCode(error) === "ENOENT") return undefined; throw error; }
       };
       const owner = readOwner();
+      if (expected && owner !== expected.owner) return false;
       if (owner === undefined) {
         if (Date.now() - stat.mtimeMs <= this.#staleLockMs) return false;
         const current = fs.lstatSync(this.#lockPath);
@@ -586,6 +596,7 @@ export class MeshLock {
         // directory swapped in after this judgment loses no data and no custody: an ownerless directory grants none,
         // and a protocol-1 initializer enters only after its `wx` owner write and its lstat identity recheck of its own
         // mkdir, which fail (ENOENT / identity) if this rmdir took its directory. Any published owner makes it ENOTEMPTY.
+        if (!hasTime()) return false;
         fs.rmdirSync(this.#lockPath);
         // Retain a nonempty recovery receipt, without ever renaming a live canonical.
         // Inode reuse may revisit the same receipt; that must not undo successful recovery.
@@ -606,24 +617,26 @@ export class MeshLock {
         createdText.trim() !== "" && Number.isFinite(Number(createdText));
       if (!validOwner) return false;
       const recordNamespace = fields.length === 6 ? fields[4]! : null;
-      // pi-fabric#923 (fabric-store decisions): under protocol 3 a record without a namespace (a v1/v2 holder) is
-      // UNPROVEN: its pid may name nothing here although it is alive in another namespace. There is no previous-boot
-      // inference either (VM clones share a machine id): such holders are recovered only by the operator.
-      if (recordNamespace === null && this.#lockProtocol === 3) {
+      // pi-fabric#923: under protocol 3 a record without a namespace (v1/v2 holder) is UNPROVEN (its pid may be alive in
+      // another namespace); no previous-boot inference (VM clones share a machine id): operator recovery only.
+      // A forged receipt can make a LIVE foreign legacy holder look dead locally; never upgrade its namespace.
+      if (recordNamespace === null && (this.#lockProtocol === 3 || expected)) {
         note.verdict = "unproven"; note.namespace = ""; note.token = token!;
         return false;
       }
-      if (recordNamespace !== null) {
+      const ns = recordNamespace;
+      if (expected && ns !== expected.namespace) { note.verdict = "unproven"; note.namespace = ns ?? ""; note.token = token!; return false; }
+      if (ns !== null) {
         if (!hasTime()) return false;
         const namespaces = await import("../core/pid-namespace.js");
         if (!hasTime()) return false;
         const own = await namespaces.ownNamespaceForReclaim(deadline(), Boolean(this.#tryLockScope.getStore()?.active));
         if (!hasTime()) return false;
         // pid evidence only for our own namespace AND a host-local root (pi-fabric#923 round 3).
-        const result = namespaces.reclaimVerdict(recordNamespace, own, this.root);
+        const result = namespaces.reclaimVerdict(ns, own, this.root);
         pin = result.pin;
         if (!hasTime()) return false;
-        if (result.verdict !== "pid") { note.verdict = result.verdict; note.namespace = recordNamespace; note.token = token!; return false; }
+        if (result.verdict !== "pid") { note.verdict = result.verdict; note.namespace = ns; note.token = token!; return false; }
       }
       if (!hasTime()) return false;
       if (processAlive(pid)) {
@@ -633,7 +646,7 @@ export class MeshLock {
         // holder evidence/recovery, then publication selects under fresh fences.
         if (this.#tryLockScope.getStore()?.active) return false;
         const remaining = deadline() - Date.now();
-        if (remaining <= 0) return false;
+        if (remaining <= 0 || !hasTime()) return false;
         let timer: ReturnType<typeof setTimeout> | undefined;
         let actualStart: string | undefined;
         try {
@@ -645,7 +658,7 @@ export class MeshLock {
             new Promise<undefined>(resolve => { timer = setTimeout(() => resolve(undefined), remaining); }),
           ]);
         } finally { clearTimeout(timer); }
-        if (Date.now() >= deadline() || !actualStart || actualStart === recordedStart) return false;
+        if (Date.now() >= deadline() || !hasTime() || !actualStart || actualStart === recordedStart) return false;
       }
       if (!hasTime()) return false;
       const unchanged = (): boolean => {
@@ -654,7 +667,16 @@ export class MeshLock {
       };
       if (!unchanged()) return false;
       // pi-fabric#923 round 5: the root checked as host-local must still be the root this path names, right now.
-      if (pin && !pin.unchanged()) { note.verdict = "unproven"; note.namespace = recordNamespace ?? ""; note.token = token!; return false; }
+      if (pin && !pin.unchanged()) { note.verdict = "unproven"; note.namespace = ns ?? ""; note.token = token!; return false; }
+      if (!hasTime()) return false;
+      // The callback may have stalled at a native syscall: recheck the exact owner, directory and host-local root
+      // immediately before detaching. This is the same proof's identity fence, never a second death decision.
+      if (expected?.beforeRename) {
+        expected.beforeRename();
+        if (!hasTime()) return false;
+        if (!unchanged()) return false;
+        if (pin && !pin.unchanged()) { note.verdict = "unproven"; note.namespace = ns ?? ""; note.token = token!; return false; }
+      }
       if (!hasTime()) return false;
       const fence = `${this.#lockPath}.dead.${createHash("sha256").update(`${stat.dev}:${stat.ino}:${owner}`).digest("hex")}`;
       // ponytail: retain this tiny nonempty directory permanently. A paused old cleaner

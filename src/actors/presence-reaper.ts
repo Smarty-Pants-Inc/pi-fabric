@@ -64,7 +64,7 @@ export const deadSessionPresence = (
     alive.has(session) || entries.some((entry) => entry.updatedAt > cutoff) ? [] : entries);
 };
 
-/** Deletes dead sessions' presence in one batch, each fenced to the version it was seen at. */
+/** Independently version-fenced deletes; yield state custody between bounded batches. */
 export const reapDeadSessionPresence = async (
   mesh: Pick<MeshStore, "listAll" | "writeBatch"> & { root?: string },
   identity: MeshIdentity,
@@ -72,9 +72,13 @@ export const reapDeadSessionPresence = async (
 ): Promise<number> => {
   const dead = deadSessionPresence(mesh, options);
   if (dead.length === 0) return 0;
-  const results = await mesh.writeBatch({
-    identity,
-    ops: dead.map((entry) => ({ kind: "delete" as const, key: entry.key, ifVersion: entry.version, onConflict: "skip" as const })),
-  });
-  return results.filter((result) => result.applied).length;
+  let removed = 0;
+  for (let start = 0; start < dead.length; start += 64) {
+    const results = await mesh.writeBatch({
+      identity,
+      ops: dead.slice(start, start + 64).map((entry) => ({ kind: "delete" as const, key: entry.key, ifVersion: entry.version, onConflict: "skip" as const })),
+    });
+    removed += results.filter((result) => result.applied).length;
+  }
+  return removed;
 };

@@ -2153,9 +2153,11 @@ export class AgentManager {
     // The run path is only allocated after model preparation and the resident commit fence.
     // Routed dispatch is the exception: its central namespace must be published before queueing.
     const runDirectory = path.join(this.#runRoot, id);
-    const runPin = request.routeDecision ? pinRunDirectory(runDirectory) : undefined;
+    let runPin: RunDirectoryPin | undefined;
     if (request.routeDecision) {
       createHostTaskRun(runDirectory);
+      // Bind the identity immediately after central allocation; no hook may intervene.
+      runPin = pinRunDirectory(runDirectory);
       if (managerRunTestHooks.afterRunAllocation) await managerRunTestHooks.afterRunAllocation(runDirectory);
     }
     const name = safeName(request.name ?? request.task.split("\n", 1)[0] ?? "Fabric agent");

@@ -18,7 +18,7 @@ const position = (text: string, needle: string) => {
   return at;
 };
 const writerNames = new Set([
-  "bindSession", "initializeTaskControlDirectory", "mkdirPrivate", "trackArchiveSource",
+  "bindSession", "createHostTaskRun", "initializeTaskControlDirectory", "mkdirPrivate", "trackArchiveSource",
   "writeForkSession", "writeHandoffSession", "writeJsonAtomic", "writePrivateFileAtomic", "writeRunRecord",
 ]);
 const pathnameWriter = (name: string | undefined) => Boolean(name && (/^(?:write|append|mkdir|rename|unlink|rm|copy(?:File|Sync)|truncate|open|createWrite|link|symlink|chmod|utimes|mkdtemp)/i.test(name) || writerNames.has(name)));
@@ -54,6 +54,8 @@ const MANAGER_WRITES = [
   "fs.writeFileSync(schemaFile, JSON.stringify(request.schema, null, 2), { encoding: \"utf8\", mode: 0o600 })",
   "mkdirPrivate(tmpdir, this.#trustRoot())",
   "initializeTaskControlDirectory(runDirectory)",
+  "createHostTaskRun(runDirectory)",
+  "writePolicyDispositionAudit(logFile, id, runner, writePolicy)",
   "fs.appendFileSync(logFile, JSON.stringify({ type, ts: Date.now(), id, runner, ...(policy ? { policy } : {}), ...(warning ? { warning } : {}) }) + \"\\n\", { mode: 0o600 })",
   "routeDispatch?.bindSession(agentCwd)",
   "writeForkSession(request.forkSeed, agentCwd, path.join(runDirectory, \"fork-session\"), request.thinkingTransfer)",

@@ -350,6 +350,161 @@ describe("distinct same-key mesh events (smarty-dev#12140)", () => {
     await reloaded.close();
   });
 
+  it.each(
+    (["key", "ref"] as const).flatMap(kind =>
+      ([
+        ["missing", undefined], ["null", null], ["invalid string", "not-a-timestamp"],
+        ["numeric string", "1700000000000"], ["NaN", Number.NaN],
+        ["positive infinity", Number.POSITIVE_INFINITY], ["negative infinity", Number.NEGATIVE_INFINITY],
+        ["zero", 0], ["negative", -1], ["fractional", 0.5], ["negative fractional", -0.5],
+      ] as const).flatMap(([timestamp, at]) =>
+        [false, true].map(reconcile => [kind, timestamp, at, reconcile] as const))),
+  )("never revives a spent %s claim with %s fallbackAt (value: %s; empty reconciliation: %s)", async (kind, _timestamp, at, reconcile) => {
+    const h = setup();
+    const claim = createHash("sha256").update(JSON.stringify([watcher.id, `native-topic-${kind}`, JSON.stringify([TOPIC, KEY])])).digest("hex");
+    const observedAt = Date.now() - 10;
+    const key = h.box().key;
+    await h.mesh.put({ key, identity: me, value: { after: h.mesh.latestSequence(), delivered: [claim], deliveredAt: [observedAt],
+      fallbacks: [claim], ...(at === undefined ? {} : { fallbackAt: [at] }) } });
+    expect(h.entries).toEqual([]); // A fresh persisted native claim remains; its fallback is already spent.
+    if (reconcile) {
+      const initial = h.box();
+      expect((await initial.next(h.session(), { commitOnly: true })).events).toEqual([]);
+      await initial.close();
+    }
+    const first = await h.publish("first distinct work after malformed spent marker", { [kind]: KEY });
+    const second = await h.publish("second distinct same-key work after malformed spent marker", { [kind]: KEY });
+    const recovered = h.box();
+    const batch = await recovered.next(h.session());
+    expect(ids(batch.events)).toEqual([first.id, second.id]);
+    await h.take(recovered, batch.events);
+    await recovered.close();
+    h.entries.length = 0;
+    h.replay(first);
+    h.replay(second);
+    const third = await h.publish("third distinct work after spent-marker reload", { [kind]: KEY });
+    const fourth = await h.publish("fourth distinct same-key work after spent-marker reload", { [kind]: KEY });
+    const reloaded = h.box();
+    const later = await reloaded.next(h.session());
+    expect(ids(later.events)).toEqual([third.id, fourth.id]);
+    await h.take(reloaded, later.events);
+    await reloaded.close();
+    h.entries.length = 0;
+    h.replay(third);
+    h.replay(fourth);
+    const replayed = h.box();
+    expect((await replayed.next(h.session())).events).toEqual([]);
+    await replayed.close();
+  });
+
+  it.each(["key", "ref"] as const)("retains an undated spent %s marker before canonical history restores its native claim", async (kind) => {
+    const h = setup();
+    h.main.deliverAgent({ from: watcher, message: "already spent native work", delivery: "steer", data: { [kind]: KEY, topic: TOPIC } });
+    const claim = createHash("sha256").update(JSON.stringify([watcher.id, `native-topic-${kind}`, JSON.stringify([TOPIC, KEY])])).digest("hex");
+    const key = h.box().key;
+    // No persisted claim can supply the retention age. The marker must survive until
+    // #remember sees canonical history; retaining it does not prove a delivery occurred.
+    await h.mesh.put({ key, identity: me, value: { after: h.mesh.latestSequence(), fallbacks: [claim] } });
+    const initial = h.box();
+    expect((await initial.next(h.session(), { commitOnly: true })).events).toEqual([]);
+    await initial.close();
+    h.entries.length = 0;
+    const first = await h.publish("first new work after restoring a spent claim", { [kind]: KEY });
+    const second = await h.publish("second new work after restoring a spent claim", { [kind]: KEY });
+    const recovered = h.box();
+    const batch = await recovered.next(h.session());
+    expect(ids(batch.events)).toEqual([first.id, second.id]);
+    await h.take(recovered, batch.events);
+    await recovered.close();
+  });
+
+  it.each((["key", "ref"] as const).flatMap(kind =>
+    [undefined, "not-a-timestamp"].map(at => [kind, at] as const),
+  ))("retires a spent %s marker with fallbackAt %s through its newer restored canonical claim", async (kind, at) => {
+    const h = setup(0, { horizonMs: 100 });
+    const now = Date.now(), observedAt = now + 50;
+    h.main.deliverAgent({ from: watcher, message: "already spent near-future native work", delivery: "steer",
+      data: { [kind]: KEY, topic: TOPIC } });
+    h.entries[0] = { ...(h.entries[0] as object), timestamp: new Date(observedAt).toISOString() };
+    const session = () => rootInboxSession(h.entries.map(projectRootInboxReceipt));
+    const claim = createHash("sha256").update(JSON.stringify([watcher.id, `native-topic-${kind}`, JSON.stringify([TOPIC, KEY])])).digest("hex");
+    const key = h.box().key;
+    // The persisted marker has no delivered claim from which #load can recover its age.
+    await h.mesh.put({ key, identity: me, value: { after: h.mesh.latestSequence(), fallbacks: [claim],
+      ...(at === undefined ? {} : { fallbackAt: [at] }) } });
+    const initial = h.box();
+    expect((await initial.next(session(), { commitOnly: true })).events).toEqual([]);
+    await initial.close();
+    type Cursor = { delivered: string[]; deliveredAt: number[]; fallbacks: string[]; fallbackAt: number[]; fallbackThrough?: number };
+    const restored = h.mesh.get(key)!.value as Cursor;
+    expect(restored.fallbacks).toEqual([claim]);
+    expect(restored.fallbackAt).toEqual([now]);
+    // Main also retains its exact deliveryId receipt; check the native claim's aligned age.
+    expect(restored.delivered).toContain(claim);
+    expect(restored.deliveredAt[restored.delivered.indexOf(claim)]).toBe(observedAt);
+
+    h.advance(101); // Marker expired, but the restored native claim is only 51ms old.
+    expect(session().deliveredAt?.get(claim)).toBe(observedAt); // Keep canonical history.
+    const recovered = h.box();
+    expect((await recovered.next(session(), { commitOnly: true })).events).toEqual([]);
+    const expired = h.mesh.get(key)!.value as Cursor;
+    expect(expired.fallbacks).toEqual([]);
+    expect(expired.delivered).toContain(claim);
+    expect(expired.fallbackThrough).toBeGreaterThanOrEqual(observedAt);
+    const first = await h.publish("first distinct work after marker expiry", { [kind]: KEY });
+    const second = await h.publish("second distinct work after marker expiry", { [kind]: KEY });
+    const batch = await recovered.next(session());
+    expect(ids(batch.events)).toEqual([first.id, second.id]);
+    await h.take(recovered, batch.events);
+    await recovered.close();
+    h.entries.splice(1); // Retain only the canonical native carrier, not inbox carriers.
+    h.replay(first);
+    h.replay(second);
+    const reloaded = h.box();
+    expect((await reloaded.next(session())).events).toEqual([]);
+    await reloaded.close();
+  });
+
+  it.each((["key", "ref"] as const).flatMap(kind =>
+    ([[4096, 42], [128 * 1024, 1100]] as const).map(([maxEventBytes, count]) => [kind, maxEventBytes, count] as const),
+  ))("retires a capacity-evicted spent %s marker through its newer claim at %i bytes (%i markers)", async (kind, maxEventBytes, count) => {
+    const h = setup(0, { maxEventBytes });
+    const now = Date.now(), observedAt = now + 50;
+    const hash = (value: string) => createHash("sha256").update(JSON.stringify([watcher.id, `native-topic-${kind}`, JSON.stringify([TOPIC, value])])).digest("hex");
+    const claim = hash(KEY);
+    h.main.deliverAgent({ from: watcher, message: "already spent native work", delivery: "steer", data: { [kind]: KEY, topic: TOPIC } });
+    h.entries[0] = { ...(h.entries[0] as object), timestamp: new Date(observedAt).toISOString() };
+    const fallbacks = [claim, ...Array.from({ length: count - 1 }, (_, i) => hash(`newer-marker-${i}`))];
+    const seed = { after: h.mesh.latestSequence(), delivered: [claim], deliveredAt: [observedAt], fallbacks,
+      fallbackAt: [now, ...fallbacks.slice(1).map(() => now + 1)] };
+    const key = h.box().key;
+    await h.mesh.put({ key, identity: me, value: seed });
+    const initial = h.box();
+    expect((await initial.next(h.session(), { commitOnly: true })).events).toEqual([]);
+    await initial.close();
+    const saved = h.mesh.get(key)!.value as typeof seed & { fallbackThrough?: number };
+    expect(saved.fallbacks).not.toContain(claim);
+    expect(saved.delivered).toContain(claim);
+    expect(saved.fallbackThrough).toBeGreaterThanOrEqual(observedAt);
+    expect(saved.delivered.length + saved.fallbacks.length).toBeLessThanOrEqual(1024);
+    expect(Buffer.byteLength(JSON.stringify(saved), "utf8")).toBeLessThanOrEqual(Math.floor(maxEventBytes * 0.75));
+    // New receipts must be newer than the deliberately future-dated capacity seed.
+    h.advance(51);
+    const first = await h.publish("first distinct work after marker eviction", { [kind]: KEY });
+    const second = await h.publish("second distinct work after marker eviction", { [kind]: KEY });
+    const recovered = h.box();
+    const batch = await recovered.next(h.session());
+    expect(ids(batch.events)).toEqual([first.id, second.id]);
+    await h.take(recovered, batch.events);
+    await recovered.close();
+    h.entries.splice(1);
+    h.replay(first);
+    h.replay(second);
+    const reloaded = h.box();
+    expect((await reloaded.next(h.session())).events).toEqual([]);
+    await reloaded.close();
+  });
+
   it("fails open for direct holdsSteer evidence without a deliveredAt timestamp", async () => {
     const h = setup(); const inbox = h.box(); inbox.start();
     h.main.deliverAgent({ from: watcher, message: "legacy native work", delivery: "steer", data: { topic: TOPIC, key: KEY } });

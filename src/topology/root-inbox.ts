@@ -543,11 +543,14 @@ export class RootInbox {
     const before = this.#delivered.size + this.#fallbacks.size;
     const cutoff = this.#now() - this.#horizon();
     const state = this.#state!;
-    const retire = (at: number): void => {
-      state.fallbackThrough = Math.max(state.fallbackThrough ?? Number.NEGATIVE_INFINITY, at);
+    const retire = (id: string, at: number): void => {
+      // A restored canonical claim can be newer than its spent marker (clock skew or
+      // an undated marker). Retiring only the marker's age would revive that claim.
+      state.fallbackThrough = Math.max(state.fallbackThrough ?? Number.NEGATIVE_INFINITY, at,
+        this.#delivered.get(id) ?? Number.NEGATIVE_INFINITY);
     };
     for (const [id, at] of this.#fallbacks) if (at < cutoff) {
-      retire(at);
+      retire(id, at);
       this.#fallbacks.delete(id);
     }
     const all: Array<["delivered" | "fallback", string, number]> = [
@@ -557,7 +560,7 @@ export class RootInbox {
     const entries = all.slice(-MAX_DELIVERED_RECEIPTS);
     // Hashes do not expose receipt kind. Retire every evicted timestamp conservatively;
     // the watermark affects only legacy fallback, never the exact-ID checks above it.
-    for (const [, , at] of all.slice(0, -MAX_DELIVERED_RECEIPTS)) retire(at);
+    for (const [, id, at] of all.slice(0, -MAX_DELIVERED_RECEIPTS)) retire(id, at);
     const baseThrough = state.fallbackThrough;
     const assign = (offset: number): void => {
       if (baseThrough === undefined) delete state.fallbackThrough;
@@ -570,7 +573,7 @@ export class RootInbox {
       state.fallbacks = fallbacks.map(([, id]) => id);
       state.fallbackAt = fallbacks.map(([, , at]) => at);
       // Include the final watermark in every byte-budget candidate, not after sizing it.
-      for (const [, , at] of entries.slice(0, offset)) retire(at);
+      for (const [, id, at] of entries.slice(0, offset)) retire(id, at);
     };
     // Account for the actual cursor and pending IDs too. Byte-size (not count) protects
     // configured small mesh values; count also caps memory at the default/larger limit.
@@ -663,11 +666,16 @@ export class RootInbox {
       return typeof at === "number" && Number.isFinite(at) && Number.isInteger(at) && at > 0 && at <= this.#now() + 60_000
         ? [[id, at] as [string, number]] : [];
     }));
-    // Fallbacks are spent markers, not delivery proof. Keep even future-dated markers:
-    // dropping one could resurrect a current key/ref claim; #fallbacks.has must still fail open.
-    this.#fallbacks = new Map((this.#state.fallbacks ?? []).flatMap((id, index) => {
-      const at = value?.fallbackAt?.[index];
-      return typeof at === "number" && Number.isFinite(at) ? [[id, at] as [string, number]] : [];
+    // Fallbacks are spent markers, not delivery proof. Keep every string marker, even
+    // with a missing/malformed age: dropping or immediately expiring it could resurrect
+    // a fresh key/ref claim. Future ages are intentionally retained. Invalid ages use
+    // the claim's valid observation time (or now) only for retention/eviction bookkeeping.
+    this.#fallbacks = new Map((Array.isArray(value?.fallbacks) ? value.fallbacks : []).flatMap((id, index) => {
+      if (typeof id !== "string") return [];
+      const time = value?.fallbackAt?.[index];
+      const at = typeof time === "number" && Number.isFinite(time) && Number.isInteger(time) && time > 0
+        ? time : this.#delivered.get(id) ?? this.#now();
+      return [[id, at] as [string, number]];
     }));
     if (typeof value?.fallbackThrough === "number" && Number.isFinite(value.fallbackThrough)) {
       this.#state.fallbackThrough = value.fallbackThrough;

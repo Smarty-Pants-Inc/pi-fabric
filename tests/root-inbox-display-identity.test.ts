@@ -129,10 +129,27 @@ describe("root inbox display identity projection (smarty-dev#12140)", () => {
     expect(h.render(inbox([event("command-shadow", peer, { commandId: "native-command", key: "same-work" })]))).toEqual([]);
   });
 
+  it("hides a command-id shadow matching native details.data.commandId", () => {
+    const h = harness();
+    h.setBranch([entry(native(peer, { data: { commandId: "native-command", topic: "fleet.work", key: "same-work" } }))]);
+    expect(h.render(inbox([event("command-shadow", peer, { commandId: "native-command", key: "same-work" })]))).toEqual([]);
+  });
+
+  it("shows a different command-id event sharing the native topic and key", () => {
+    const h = harness();
+    h.setBranch([entry(native(peer, { data: { commandId: "native-command", topic: "fleet.work", key: "same-work" } }))]);
+    const rendered = h.render(inbox([event("distinct-command", peer, { commandId: "different-command", key: "same-work" })]));
+    expect(rendered).toHaveLength(1);
+    expect(plain(rendered!.join("\n"))).toContain("shadow duplicate");
+  });
+
   it.each([
     ["different commandId with the same sender, topic and key", native(peer, { deliveryId: "native-command", data: { topic: "fleet.work", key: "same-work" } }), event("distinct-command", peer, { commandId: "new-command", key: "same-work" })],
     ["commandId sender mismatch", native(peer, { deliveryId: "native-command" }), event("command-sender", other, { commandId: "native-command" })],
     ["deliveryId outranks a same commandId", native(peer, { deliveryId: "native-command" }), event("command-precedence", peer, { deliveryId: "distinct-delivery", commandId: "native-command", key: "same-work" })],
+    ["native commandId yields to a distinct deliveryId", native(peer, { data: { commandId: "native-command", topic: "fleet.work", key: "same-work" } }), event("command-delivery-precedence", peer, { deliveryId: "distinct-delivery", commandId: "native-command", key: "same-work" })],
+    ["native commandId yields to a distinct messageId", native(peer, { data: { commandId: "native-command", topic: "fleet.work", key: "same-work" } }), event("command-message-precedence", peer, { messageId: "distinct-message", commandId: "native-command", key: "same-work" })],
+    ["native commandId sender mismatch", native(peer, { data: { commandId: "native-command", topic: "fleet.work", key: "same-work" } }), event("command-sender-mismatch", other, { commandId: "native-command", key: "same-work" })],
     ["malformed commandId with the same key", native(peer, { data: { topic: "fleet.work", key: "same-work" } }), event("invalid-command", peer, { commandId: 1, key: "same-work" })],
     ["distinct explicit identity with the same key", native(peer, { data: { messageId: "native-id", key: "same-work" } }), event("distinct", peer, { messageId: "shadow-id", key: "same-work" })],
     ["sender mismatch", native(peer, { deliveryId: "cross-sender" }), event("sender", other, { messageId: "cross-sender" })],

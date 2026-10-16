@@ -1,3 +1,4 @@
+import { diagnostics } from "../core/diagnostics.js";
 import {
   FABRIC_WORKFLOW_ITEM_EVENT,
   type FabricWorkflowItemEventV1,
@@ -5,11 +6,13 @@ import {
 } from "../protocol.js";
 
 import { isWorkflowItemId, WORKFLOW_ITEM_ID_MAX_CHARS } from "./store.js";
+import { detachedPreview } from "../core/preview.js";
 
 export { isWorkflowItemId, WORKFLOW_ITEM_ID_MAX_CHARS };
 export const WORKFLOW_ITEM_META_MAX_BYTES = 2 * 1024;
 const MAX_META_DEPTH = 8;
 const MAX_LABEL_CHARS = 120;
+const MAX_CACHED_LABEL_BYTES = 2 * 1024 * 1024;
 
 const statuses = new Set<FabricWorkflowItemStatusV1>([
   "pending",
@@ -27,7 +30,7 @@ const legacyItemId = (value: unknown): string | undefined => {
     .slice(0, WORKFLOW_ITEM_ID_MAX_CHARS)
     .replace(/[^a-zA-Z0-9._:-]+/g, "-")
     .replace(/^-+|-+$/g, "");
-  return safe || undefined;
+  return safe ? detachedPreview(safe, safe.length) : undefined;
 };
 
 const isPlainData = (value: unknown, depth: number): boolean => {
@@ -94,6 +97,7 @@ type EmitEvent = (channel: string, data: unknown) => void;
 export class FabricWorkflowItemTransitions {
   readonly #statuses = new Map<string, FabricWorkflowItemStatusV1>();
   readonly #labels = new Map<string, string>();
+  #labelBytes = 0;
 
   constructor(
     readonly invocationId: string,
@@ -107,13 +111,28 @@ export class FabricWorkflowItemTransitions {
   }
 
   record(input: WorkflowItemTransitionInput, label: unknown): void {
-    const from = this.#statuses.get(input.id);
-    this.#statuses.set(input.id, input.status);
+    // Stable identity is lossless, but may itself be a slice of guest input.
+    const id = detachedPreview(input.id, input.id.length);
+    const from = this.#statuses.get(id);
+    this.#statuses.set(id, input.status);
     if (typeof label === "string" && label.trim()) {
-      this.#labels.set(input.id, label.trim().slice(0, MAX_LABEL_CHARS));
+      const preview = detachedPreview(label.trim(), MAX_LABEL_CHARS);
+      this.#labelBytes += 2 * (preview.length - (this.#labels.get(id)?.length ?? 0));
+      this.#labels.set(id, preview);
+      if (this.#labelBytes > MAX_CACHED_LABEL_BYTES) {
+        // Only optional label prose shrinks. Every stable item/status survives
+        // pressure and still receives its exact terminal transition.
+        const limit = Math.floor(MAX_CACHED_LABEL_BYTES / 2 / this.#labels.size);
+        this.#labelBytes = 0;
+        for (const [itemId, value] of this.#labels) {
+          const bounded = value.length <= limit ? value : detachedPreview(value, limit);
+          this.#labels.set(itemId, bounded);
+          this.#labelBytes += 2 * bounded.length;
+        }
+      }
     }
     if (from === input.status) return;
-    this.#send(input.id, from, input.status, input.meta);
+    this.#send(id, from, input.status, input.meta);
   }
 
   /** Mirrors the activity store: only running items settle with the run. */
@@ -148,9 +167,7 @@ export class FabricWorkflowItemTransitions {
     try {
       this.emit(FABRIC_WORKFLOW_ITEM_EVENT, event);
     } catch (error) {
-      console.warn(
-        `[pi-fabric] workflow item event listener failed: ${error instanceof Error ? error.message : String(error)}`,
-      );
+      diagnostics.warn("src/activity/workflow-items.ts", `[pi-fabric] workflow item event listener failed: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 }

@@ -1,7 +1,8 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { ModelRuntime } from "@earendil-works/pi-coding-agent";
+import { pathToFileURL } from "node:url";
+import { DefaultResourceLoader, ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 import fabricProviderBridge, {
   parseModelKey,
@@ -9,6 +10,7 @@ import fabricProviderBridge, {
   PROVIDER_BRIDGE_MODEL_ENV,
   resolveExtensionProviders,
 } from "../src/agents/provider-bridge.js";
+import { hostBundleSdkEntry, loadHostSdk } from "../src/core/host-sdk.js";
 
 const roots: string[] = [];
 afterAll(() => {
@@ -70,6 +72,31 @@ describe("extension provider bridge", () => {
     expect(parseModelKey("bare")).toBeUndefined();
     expect(parseModelKey("/id")).toBeUndefined();
     expect(parseModelKey("provider/")).toBeUndefined();
+  });
+
+  it("uses the bundled Pi CLI's own SDK entry instead of evaluating the unbundled package", async () => {
+    const pkg = fs.realpathSync(path.resolve("node_modules/@earendil-works/pi-coding-agent"));
+    const bundle = path.join(pkg, "dist", "bundle");
+    expect(hostBundleSdkEntry(path.join(bundle, "cli.js"))).toBe(path.join(bundle, "index.js"));
+    const sdk = await loadHostSdk(path.join(bundle, "cli.js"));
+    const bundled = await import(pathToFileURL(path.join(bundle, "index.js")).href) as typeof sdk;
+    expect(sdk.DefaultResourceLoader).toBe(bundled.DefaultResourceLoader);
+    expect(sdk.DefaultResourceLoader).not.toBe(DefaultResourceLoader);
+    for (const name of ["ModelRuntime", "SettingsManager", "hasTrustRequiringProjectResources", "ProjectTrustStore",
+      "DefaultPackageManager", "getAgentDir"] as const) expect(typeof sdk[name]).toBe("function");
+
+    // Unbundled CLIs, the durable worker, embeds, and look-alike paths keep the package entry.
+    const lookalike = path.join(fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "fabric-bridge-host-"))), "dist", "bundle");
+    roots.push(path.dirname(path.dirname(lookalike)));
+    fs.mkdirSync(lookalike, { recursive: true });
+    fs.writeFileSync(path.join(lookalike, "..", "..", "package.json"), '{"name":"not-pi"}');
+    fs.writeFileSync(path.join(lookalike, "cli.js"), "");
+    fs.writeFileSync(path.join(lookalike, "index.js"), "");
+    for (const host of [path.join(pkg, "dist", "cli.js"), path.resolve("src/durable/worker.ts"),
+      path.join(lookalike, "cli.js"), path.join(bundle, "missing", "cli.js"), undefined]) {
+      expect(hostBundleSdkEntry(host)).toBeUndefined();
+    }
+    expect((await loadHostSdk(path.join(pkg, "dist", "cli.js"))).DefaultResourceLoader).toBe(DefaultResourceLoader);
   });
 
   it("does not infer registration authority from an extension's provider-matching path", async () => {
@@ -145,4 +172,54 @@ describe("extension provider bridge", () => {
     expect(loads("pi-acme-provider")).toEqual([]);
     expect(moduleLoaded("pi-acme-provider")).toBe(false);
   });
+});
+
+const repo = path.resolve(import.meta.dirname, "..");
+const BUNDLED_ENTRY = path.join(repo, "node_modules", "pi-coralbricks-provider", "index.ts");
+
+describe("resolveExtensionProviders with the bundled provider", () => {
+  const tempDir = (prefix: string): string => {
+    const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
+    roots.push(dir);
+    return dir;
+  };
+  afterEach(() => vi.unstubAllGlobals());
+
+  async function setup(packageEntry: unknown) {
+    const agentDir = tempDir("fabric-bridge-agent-");
+    const cwd = tempDir("fabric-bridge-cwd-");
+    fs.writeFileSync(path.join(agentDir, "settings.json"), JSON.stringify({ packages: [packageEntry] }));
+    vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
+    vi.stubEnv("CORALBRICKS_API_KEY", "");
+    vi.stubGlobal("fetch", async () => { throw new Error("the bridge must stay offline"); });
+    const sdk = await import("@earendil-works/pi-coding-agent");
+    const probed: string[] = [];
+    const recording = {
+      ...sdk,
+      DefaultResourceLoader: class extends sdk.DefaultResourceLoader {
+        constructor(options: ConstructorParameters<typeof sdk.DefaultResourceLoader>[0]) {
+          probed.push(...(options.additionalExtensionPaths ?? []));
+          super(options);
+        }
+      },
+    } as typeof sdk;
+    return { agentDir, cwd, sdk: recording, probed };
+  }
+
+  // The disabled-extension bridge never executes registration code, not even
+  // Fabric's bundled provider package: an extensions: false child fails closed.
+  it("does not execute the bundled coralbricks provider for an extensions: false child", async () => {
+    const { agentDir, cwd, sdk, probed } = await setup(repo);
+    expect(fs.existsSync(BUNDLED_ENTRY)).toBe(true);
+    await expect(resolveExtensionProviders({ model: "coralbricks/deepseek-v4.1-flash-fast", cwd, agentDir }, sdk))
+      .rejects.toMatchObject({ name: "ProviderNotFoundError", code: "PROVIDER_NOT_FOUND", provider: "coralbricks" });
+    expect(probed).toEqual([]);
+  }, 30_000);
+
+  it("fails closed when the user filters the bundled provider out", async () => {
+    const { agentDir, cwd, sdk, probed } = await setup({ source: repo, extensions: ["!node_modules/pi-coralbricks-provider/**"] });
+    await expect(resolveExtensionProviders({ model: "coralbricks/glm-5.3-fast", cwd, agentDir }, sdk))
+      .rejects.toThrow(/needs provider "coralbricks"[\s\S]*extensions: true/);
+    expect(probed).toEqual([]);
+  }, 30_000);
 });

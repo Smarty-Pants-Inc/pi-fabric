@@ -226,6 +226,37 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
     expect(inboxMessages()).toHaveLength(1);
   }, 60_000);
 
+  it("shows a sequence-31 blocker first and retains unseen overflow through a failed real turn (#12356)", async () => {
+    const { session, faux, inboxMessages, missedWork } = await start(100_000, false, { persisted: true });
+    session.setAutoRetryEnabled(false);
+    const info = Array.from({ length: 30 }, (_, index) =>
+      missedWork(`priority-info-${index}`, undefined, 0, "info"));
+    const blocked = missedWork("priority-blocked-31", undefined, 0, "blocked");
+    const ids = () => inboxMessages().flatMap(message =>
+      (message as { details?: { ids?: string[] } }).details?.ids ?? []);
+    let firstContext: unknown;
+    faux.setResponses([(context) => {
+      firstContext = context.messages;
+      expect(ids()).toEqual([blocked, ...info.slice(0, 7)]);
+      for (const id of info.slice(7)) expect(JSON.stringify(context.messages)).not.toContain(id);
+      return fauxAssistantMessage("pause after seeing only the rendered rows", {
+        stopReason: "error", errorMessage: "test failure without automatic retry",
+      });
+    }]);
+    await session.prompt("show actionable work first");
+    expect(JSON.stringify(firstContext)).toContain(blocked);
+    expect(ids()).toEqual([blocked, ...info.slice(0, 7)]);
+    // A failed turn acknowledges what actually entered inference, never its overflow summary.
+    // The next explicit prompt must still deliver all 23 unseen infos, without replaying the eight.
+    faux.setResponses(Array.from({ length: 6 }, () => fauxAssistantMessage("read the remaining work")));
+    await session.prompt("resume and drain retained work");
+    expect(ids()).toHaveLength(31);
+    expect(new Set(ids())).toEqual(new Set([blocked, ...info]));
+    faux.setResponses([fauxAssistantMessage("nothing repeated")]);
+    await session.prompt("check once more");
+    expect(ids()).toHaveLength(31);
+  }, 60_000);
+
   it("reconciles 50 steer-driven turns inside one real run, without duplicate inbox IDs (#4313)", async () => {
     const { session, faux, inboxMessages, missedWork, meshRoot } = await start(100_000, false, { persisted: true });
     const { MeshStore } = await import("../src/mesh/store.js");

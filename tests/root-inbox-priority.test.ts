@@ -31,8 +31,8 @@ const setup = () => {
     hostCapabilities: { turnProvenance: 1 },
     sendMessage: (message: unknown) => sent.push(message as InboxMessage),
   } as unknown as ExtensionAPI;
-  const box = () => {
-    const inbox = new RootInbox(mesh, me, () => [me.id], { now: Date.now, steerGraceMs: 0, wakeCooldownMs: 0 });
+  const box = (steerGraceMs = 0) => {
+    const inbox = new RootInbox(mesh, me, () => [me.id], { now: Date.now, steerGraceMs, wakeCooldownMs: 0 });
     inboxes.push(inbox);
     return inbox;
   };
@@ -374,5 +374,58 @@ describe("root inbox priority and displayed-only overflow (smarty-dev#12356)", (
     const messages = await h.inject(inbox, due.events);
     expect(messageIds(messages)).toEqual([schedule.id]);
     expect((await inbox.next(h.session())).events).toEqual([]);
+  });
+
+  it("ranks exact-session work past the grace only at main's priority boundary and retains overflow across reload", async () => {
+    const h = setup();
+    let inbox = h.box(60_000);
+    inbox.start();
+    const events: MeshEvent[] = [];
+    for (let index = 0; index < 30; index++) events.push(await h.publish("info", `young info ${index}`));
+    const blocked = await h.publish("blocked", "young exact-session action");
+    events.push(blocked);
+    // An active-turn read retains main's native-steer grace; a new run deliberately bypasses it.
+    expect((await inbox.next(notHeld)).events).toEqual([]);
+    const first = messageIds(await h.inject(inbox, (await inbox.next(notHeld, { priority: true })).events));
+    expect(first[0]).toBe(blocked.id);
+    expect(first).toHaveLength(8);
+    await inbox.close();
+    inbox = h.box(60_000);
+    const fresh = await h.publish("blocker", "fresh exact-session action over retained overflow");
+    events.push(fresh);
+    const consumed = [...first];
+    for (let turn = 0; turn < 8; turn++) {
+      const batch = await inbox.next(h.session(), { priority: true });
+      if (!batch.events.length) break;
+      const shown = messageIds(await h.inject(inbox, batch.events));
+      if (turn === 0) expect(shown[0]).toBe(fresh.id);
+      consumed.push(...shown);
+    }
+    expect(consumed).toHaveLength(events.length);
+    expect(new Set(consumed)).toEqual(new Set(ids(events)));
+    expect((await inbox.next(h.session(), { priority: true })).events).toEqual([]);
+  });
+
+  it.each(["key", "ref"] as const)("shares main's one-use native %s claim across the prefix and ranked tail", async kind => {
+    const h = setup();
+    let inbox = h.box(60_000);
+    inbox.start();
+    const claim = { [kind]: "native-one-use", topic: TOPIC };
+    const nativeEntries = [{ type: "custom_message", customType: "pi-fabric-agent-message",
+      timestamp: new Date().toISOString(), details: { id: `native-${kind}`, from: { id: peer.id }, data: claim } }];
+    const session = () => rootInboxSession([...nativeEntries, ...h.entries]);
+    const legacy = await h.publish("info", "already delivered native legacy shadow", claim);
+    for (let index = 0; index < 20; index++) await h.publish("info", `pinned info ${index}`);
+    const blocked = await h.publish("blocked", "distinct same-claim tail action", claim);
+    const first = await inbox.next(session(), { priority: true });
+    expect(ids(first.events)).not.toContain(legacy.id);
+    expect(messageIds(await h.inject(inbox, first.events))[0]).toBe(blocked.id);
+    await inbox.close();
+    inbox = h.box(60_000);
+    const fresh = await h.publish("blocked", "new same-claim action after reload", claim);
+    const second = await inbox.next(session(), { priority: true });
+    expect(ids(second.events)).not.toContain(legacy.id);
+    expect(ids(second.events)).not.toContain(blocked.id);
+    expect(messageIds(await h.inject(inbox, second.events))[0]).toBe(fresh.id);
   });
 });

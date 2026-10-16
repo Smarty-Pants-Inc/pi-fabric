@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import * as atomic from "../src/core/atomic-write.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { ActorManager } from "../src/actors/manager.js";
+import { ActorDirectory } from "../src/actors/directory.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore } from "../src/mesh/store.js";
@@ -144,8 +145,8 @@ describe("native identity cannot retain registry custody past a bounded mesh try
     const mesh = new MeshStore(path.join(base, "mesh"), 65536, 100, { lockProtocol: 2 });
     const begin = performance.now();
     await registry.withLock(async () => {
-      await expect(mesh.withTryLock(() => mesh.confirmWritable(), 50)).rejects.toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
-      await expect(mesh.exclusive(() => undefined, 0)).rejects.toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
+      await expect(mesh.withTryLock(() => mesh.confirmWritable(), 50)).rejects.toMatchObject({ code: "FABRIC_MESH_INCARNATION_PENDING" });
+      await expect(mesh.exclusive(() => undefined, 0)).rejects.toMatchObject({ code: "FABRIC_MESH_INCARNATION_PENDING" });
     });
     const registryHeldMs = performance.now() - begin;
     expect(registryHeldMs).toBeLessThan(150);
@@ -178,23 +179,49 @@ describe("native identity cannot retain registry custody past a bounded mesh try
         rootId: config.rootId, residency: "durable", runner: "pi", status: "idle", scope: i ? "session" : "project", events: [], topics: [], messages: [] };
       fs.writeFileSync(path.join(actorRoot, "actors.json"), JSON.stringify({ format: 1, actors: [row] })); return row;
     });
+    // This fixture observes bounded publication, not autonomous idle-to-dormant changes.
+    vi.spyOn(ActorDirectory.prototype, "hasDormantIdleActor").mockReturnValue(false);
     const host = new ResidentHost(config); hosts.push(host); await host.start(); await pause(20); await host.participants.refresh();
     expect(host.actors.listOwned()).toHaveLength(2);
+    // An idle heartbeat needs no actor batch or registry custody. Leave genuine
+    // mutations pending in BOTH scopes so this try must fence both registries.
+    const schedule = vi.spyOn(host.participants, "scheduleRefresh").mockImplementation(() => {});
+    const flush = vi.spyOn(host.participants, "refreshPresence").mockResolvedValue();
+    try {
+      await Promise.all(rows.map(row => host.actors.setInstructions(row.id, "pending change before bounded try")));
+    } finally { flush.mockRestore(); schedule.mockRestore(); }
+    expect(new Set(host.actors.presenceBatch(false).actorIds)).toEqual(new Set(rows.map(row => row.id)));
+    // Ordinary retry admission may legitimately look up native identity outside
+    // registry custody. Keep it outside this bounded-try observation window.
+    let releaseRetry!: () => void;
+    const retryGate = new Promise<void>(resolve => { releaseRetry = resolve; });
+    vi.spyOn(host.participants.options, "waitForPublicationRetry").mockImplementation(() => retryGate);
     const incarnation = (await atomic.processIncarnation(process.pid))!;
     const held = holder(host.mesh, incarnation);
     let entered!: () => void;
     const started = new Promise<void>(resolve => { entered = resolve; });
     const read = vi.spyOn(atomic, "processIncarnation").mockImplementation(() => slowRead(incarnation));
     const writeBatch = host.mesh.writeBatch.bind(host.mesh);
+    const actorKeys = new Set(rows.map(row => `actors/${config.sessionId}/${row.id}`));
+    let selected = false;
     vi.spyOn(host.mesh, "writeBatch").mockImplementation(input => {
-      for (const actorRoot of [config.actorRoot, config.sessionActorRoot!]) {
-        expect(fs.existsSync(path.join(actorRoot, "actors.json.lock", "owner"))).toBe(true);
+      const changed = input.ops.filter(op => op.kind === "put" && actorKeys.has(op.key));
+      // Recovery admission is also a batch, but deliberately owns no registry.
+      // Observe the changed publication itself, not an unrelated retry fence.
+      if (!selected && changed.length > 0) {
+        selected = true;
+        expect(new Set(changed.map(op => op.key))).toEqual(actorKeys);
+        expect(host.mesh.tryLockBudgetMs).toBe(50);
+        for (const actorRoot of [config.actorRoot, config.sessionActorRoot!]) {
+          expect(fs.existsSync(path.join(actorRoot, "actors.json.lock", "owner"))).toBe(true);
+        }
+        entered();
       }
-      entered(); return writeBatch(input);
+      return writeBatch(input);
     });
     const refresh = host.participants.refresh().catch(error => error);
     try {
-      await started;
+      await Promise.race([started, refresh.then(result => { throw new Error("refresh settled before selecting both actor changes", { cause: result }); })]);
       const begin = performance.now();
       await Promise.all(rows.map(row => host.actors.setInstructions(row.id, "durably changed during native lookup")));
       const setterMs = performance.now() - begin;
@@ -206,6 +233,10 @@ describe("native identity cannot retain registry custody past a bounded mesh try
       expect(setterMs).toBeLessThan(150);
       intact(host.mesh, held); await Promise.all(nativeReads); intact(host.mesh, held);
       console.log(JSON.stringify({ entrypoint: "ResidentHost refresh -> real setters in both scopes", protocol, simulatedNativeMs: 1200, setterMs, mutationDurable: true }));
-    } finally { await refresh; fs.rmSync(held.lock, { recursive: true, force: true }); }
+    } finally {
+      await refresh;
+      fs.rmSync(held.lock, { recursive: true, force: true });
+      releaseRetry();
+    }
   }, 10000);
 });

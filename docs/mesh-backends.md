@@ -40,6 +40,14 @@ protocol violation: the projector fails closed.
 files) and a non-loopback monitoring URL `https://`; plaintext refuses before connecting
 (`FABRIC_MESH_STATE_NATS_INSECURE`). Loopback (127.0.0.0/8, ::1, localhost) may be plaintext.
 - **Streams:** one per mesh root, `FABRIC_MESH_` plus 32 hex characters of the SHA-256 of the root's realpath.
+- **Replica placement:** an open or migration uses its explicit `replicas`, else the agent-layer
+`mesh.nats.replicas`. It never silently lowers that value. JetStream `err_code: 10005` (no suitable peers for
+placement, such as an offline peer) retries within `placementTimeoutMs`, default **30 000 ms**: enough for a normal
+peer restart and metadata election, the same scale as cluster readiness. One budget from the first create covers
+placement retries, backoff, subsequent pending requests and post-create leader readiness. Exhaustion throws
+`MeshStateNatsUnavailableError` (`FABRIC_MESH_STATE_NATS_UNAVAILABLE`, `reason: "placement-unavailable"`,
+`natsErrCode: 10005`), with the original sanitized cause. Other API/configuration/permission errors do not gain retries;
+the existing bounded transport-election/lost-ack handling is unchanged. Restore the peers, then retry the operation.
 - **A lost ack:** the CAS stored the batch, if at all, at exactly its base sequence plus 1. After a retry fails the
 CAS, the backend reads that one message and compares the batch id, so the batch is never run twice. If a purge
 removed that message meanwhile, the outcome is unknown (`FABRIC_MESH_STATE_NATS_OUTCOME_UNKNOWN`), never a rerun.
@@ -64,6 +72,59 @@ sequence and loops (3 times), then the backend fails closed (`FABRIC_MESH_STATE_
 cross-writer write fence, the migration flag and the conformance suite against a real server are phase 2. fabric-v2 plugs in by setting `STATE_BACKEND_FACTORIES.nats`
 to `{ unavailable?, create }`, where `create` returns a `StateBackend`. Its `unavailable` must
 also refuse (throw), never return a reason, for the same reason.
+
+### Initial ordered-consumer creation (smarty-dev#12900)
+
+A healthy R3 **stream** leader does not prove that an ordered **consumer** can answer. The pinned
+`@nats-io/jetstream` 3.4.0 SDK's `ConsumersImpl.ordered`
+([`lib/jsmstream_api.js`, lines 155–212](https://unpkg.com/@nats-io/jetstream@3.4.0/lib/jsmstream_api.js))
+creates a separate R1 memory consumer, normally with a five-minute inactivity threshold. NATS server 2.14.7's
+[`createGroupForConsumer`](https://github.com/nats-io/nats-server/blob/v2.14.7/server/jetstream_cluster.go#L9714-L9748)
+randomly selects an R1 peer from stream peers whose `nodeInfo.offline` is false; that is not a check that the peer's
+stream replica is current. A paused peer can still be eligible. Repeating CREATE with the same consumer name can
+therefore keep reaching the same stuck assignment even when the stream already has a healthy leader.
+
+The adapter creates only its own new ordered ephemeral consumers: `consumers.get(stream, options)`, never a durable
+or shared consumer name. During an initial backend open, after stream ensure, the backend starts its projector, loads any
+snapshot, records the highest stream sequence known at that point, and catches up already-stored messages to that fixed
+known head beside the live consumer. That initial catch-up uses the existing `lockTimeoutMs` budget (default **5 000 ms**)
+and one deadline; it is an initial-open operation only and does not extend a post-open write waiter's budget.
+
+After an ensure, only the first consumer creation shares that ensure's existing readiness deadline: **10 000 ms**
+across leader readiness and initial consumer creation, or the already-running placement deadline if CREATE encountered
+`10005` (the **30 000 ms** default placement contract is unchanged). An existing-stream ensure carries its
+leader-readiness deadline forward too; consume does not renew it. Snapshot reads and other work between ensure and
+consume also spend the remaining wall-clock budget.
+
+Each initial `get` is raced against **1 000 ms**, capped by the shared deadline. A timeout abandons that UUID/name and
+retries with a new UUID after the existing bounded 100 ms backoff; an abandoned name is never resent and a late
+successful reply is never consumed. No new adapter `get` starts at or after the deadline. Pending SDK requests cannot
+be cancelled by this race and may still create an orphan later. The adapter does **not** delete abandoned consumers;
+it passes `inactive_threshold: 10_000` **milliseconds** on initial creation so the server can reap them. The SDK
+converts that option to nanoseconds. Its later ordered-consumer resets still hard-code five minutes
+([`lib/consumer.js`, around line 795](https://unpkg.com/@nats-io/jetstream@3.4.0/lib/consumer.js)); those resets are unchanged.
+The server's [pull-consumer inactivity check](https://github.com/nats-io/nats-server/blob/v2.14.7/server/consumer.go#L2190-L2212)
+retains consumers with valid waiting pull interest and resets the inactivity timer; the short initial threshold is
+not a ten-second lifetime for an actively pulling consumer. Reaping also requires the assigned server to run again.
+
+Only a fresh stream created or reconciled by the **same open** tolerates consumer CREATE `10059` while its metadata
+propagates. Those retries retain their name because a missing stream has no consumer assignment. Existing-stream,
+second-consume and running-consumer `10059` errors remain fatal. Non-timeout transient transport failures such as
+NoResponders retain their existing three-failure bound and options/name; timeout rotations use the one shared deadline
+instead. Other API/authentication/permission error classification is unchanged. Exhausting the initial budget throws
+`MeshStateNatsUnavailableError` with `reason: "consumer-bootstrap-unavailable"`; `natsErrCode: 10059` is attached only
+when that fresh-stream error was observed. No stream replicas are lowered. The SDK client still uses its
+normal **5 s** API timeout, not a 1 s client-wide override: ordinary reads, publishes, subsequent consumes and running
+consumer operations do not acquire the bootstrap attempt timeout.
+
+With one paused-but-eligible peer out of three, roughly nine full one-second attempts fit in the ten-second budget
+with backoff. Under an independent uniform-choice approximation, all nine selecting that peer has probability
+`(1/3)^9` (about 0.0051%). Real placement and timing need not be independent or uniform, and the final attempt may be
+shortened by the deadline. This is bounded recovery, **not guaranteed success**: typed unavailability is legitimate.
+The deterministic tests cover budgets, identity rotation, late replies and fatal-error boundaries. Real-cluster
+acceptance is in `tests/state-backend-nats-election.test.ts`: a 15 s idle interval, the same consumer before and after
+idle, a read after idle, and recorded API latencies. Run outcomes and actual latency percentiles belong in the PR
+artifacts, not this static contract.
 
 ### Required nats-server configuration (pi-fabric#907)
 

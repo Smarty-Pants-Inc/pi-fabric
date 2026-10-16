@@ -3,8 +3,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
-import { deadHostRecords, reapDeadHostRecords } from "../src/topology/host-reaper.js";
+import { MeshStore, type MeshBatchOperation, type MeshBatchView, type MeshIdentity, type MeshStateEntry } from "../src/mesh/store.js";
+import { DIRECTORY_RETENTION_MS, deadHostRecords, reapDeadHostRecords } from "../src/topology/host-reaper.js";
+import type { FabricParticipantRecord } from "../src/topology/types.js";
 import { readHostLeases, writeHostLease } from "../src/topology/host-leases.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { writeParticipantFile } from "../src/topology/participant-files.js";
@@ -20,10 +21,10 @@ afterEach(async () => {
 
 const HOUR = 60 * 60 * 1000;
 const writer: MeshIdentity = { id: "session:writer", name: "main", kind: "main", sessionId: "writer" };
-const store = () => {
+const store = (stateBackend: "file" | "sqlite" = "file") => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-host-reaper-"));
   roots.push(root);
-  return new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
+  return new MeshStore(path.join(root, "mesh"), 64 * 1024, 100, { stateBackend });
 };
 const hostKey = (id: string) => "topology/hosts/" + createHash("sha256").update(id).digest("hex");
 const host = (mesh: MeshStore, id: string, expiresAt: number) =>
@@ -34,6 +35,106 @@ const keys = (records: Array<{ entry: { key: string } }>) => records.map((record
 
 const participantKey = (id: string) => "topology/participants/" + createHash("sha256").update(id).digest("hex");
 const inboxKey = (id: string) => "topology/inbox/" + createHash("sha256").update(id).digest("hex").slice(0, 32);
+
+// Keep reason: data safety and the private-receipt trust boundary in PR #1180.
+// Recorded-call probe ONLY: no real MeshStore, filesystem root, or deletion is used.
+describe("legacy actor tombstone retention", () => {
+  const now = 3 * DIRECTORY_RETENTION_MS;
+  const fixture = () => {
+    const entries = new Map<string, MeshStateEntry>();
+    const privateHistory = new Map<string, FabricParticipantRecord>();
+    const probes: Array<{ op: MeshBatchOperation; eligible: boolean }> = [];
+    const proof = { authenticated: true, beforeWrite: () => {} };
+    const get = (key: string) => entries.get(key);
+    const listAll = (prefix: string) => [...entries.values()].filter(entry => entry.key.startsWith(prefix));
+    const view: MeshBatchView = { get, listAll, version: key => get(key)?.version ?? 0 };
+    const writeBatch = vi.fn<MeshStore["writeBatch"]>(async input => {
+      proof.beforeWrite();
+      const ops = [...input.ops, ...(input.prepare?.(view) ?? [])];
+      for (const op of ops) {
+        const current = get(op.key);
+        probes.push({ op, eligible: op.kind === "delete" && current?.version === op.ifVersion &&
+          (op.condition?.(get) ?? true) });
+      }
+      input.beforeCommit?.();
+      // Record eligibility, but never apply an operation or invoke a deletion backend.
+      return ops.map(op => ({ key: op.key, version: get(op.key)?.version ?? 0, applied: false }));
+    });
+    const mesh = { listAll, writeBatch, custody: vi.fn() };
+    const add = (id: string, settledAt: number, authenticated = true) => {
+      const entry: MeshStateEntry = { key: `actors/gone/${id}`, version: 11, updatedBy: writer,
+        updatedAt: now + DIRECTORY_RETENTION_MS,
+        value: { id, status: "stopped", stopReason: "owner-root-gone", settledAt: now + DIRECTORY_RETENTION_MS } };
+      entries.set(entry.key, entry);
+      if (authenticated) privateHistory.set(entry.key, {
+        format: 1, id, kind: "actor", rootId: "session:gone", ownerHostId: "session:gone",
+        ownerIdentityId: "session:gone", name: id, status: "stopped", stopReason: "owner-root-gone",
+        runner: "pi", transport: "host", capabilities: [], controlProtocol: "legacy",
+        startedAt: 1, updatedAt: now, settledAt,
+      });
+      return entry;
+    };
+    const terminalActor = vi.fn((entry: MeshStateEntry) => proof.authenticated ? privateHistory.get(entry.key) : undefined);
+    const reap = () => reapDeadHostRecords(mesh, writer, { ownHostId: "own", now, terminalActor });
+    return { entries, privateHistory, probes, proof, writeBatch, add, terminalActor, reap };
+  };
+
+  it("records expiry by immutable private time, retaining fresh/live/forged actors and private history", async () => {
+    const f = fixture();
+    const expired = f.add("expired", now - DIRECTORY_RETENTION_MS - 1);
+    const boundary = f.add("boundary", now - DIRECTORY_RETENTION_MS);
+    const fresh = f.add("fresh", now - DIRECTORY_RETENTION_MS + 1);
+    // An old public timestamp cannot prematurely expire a fresh private receipt either.
+    fresh.updatedAt = 1;
+    fresh.value = { ...(fresh.value as object), settledAt: 1 };
+    const forged = f.add("forged", now - DIRECTORY_RETENTION_MS - 1, false);
+    forged.updatedAt = 1;
+    forged.value = { ...(forged.value as object), settledAt: 1 };
+    const live = f.add("live", now - DIRECTORY_RETENTION_MS - 1, false);
+    live.value = { id: "live", status: "running" };
+    f.add("future-private-time", now + 1);
+    f.add("invalid-private-time", NaN);
+    const historyBefore = structuredClone(f.privateHistory);
+    const entriesBefore = structuredClone(f.entries);
+
+    expect(await f.reap()).toBe(0); // No actual removal: only record the proposed transaction.
+    expect(f.writeBatch).toHaveBeenCalledOnce();
+    expect(f.probes.filter(probe => probe.eligible).map(probe => probe.op.key)).toEqual([expired.key, boundary.key]);
+    expect(f.probes.map(probe => probe.op)).toEqual([expired, boundary].map(entry => ({
+      kind: "delete", key: entry.key, ifVersion: entry.version, onConflict: "skip", condition: expect.any(Function),
+    })));
+    expect(f.privateHistory).toEqual(historyBefore);
+    expect(f.entries).toEqual(entriesBefore);
+    expect(f.terminalActor.mock.calls.filter(([entry]) => entry.key === expired.key)).toHaveLength(2);
+  });
+
+  it.each(["revoked private proof", "fresh private settlement", "changed public marker", "new envelope version"])(
+    "vetoes an expired selection at commit after %s", async change => {
+      const f = fixture();
+      const entry = f.add("expired", now - DIRECTORY_RETENTION_MS - 1);
+      f.proof.beforeWrite = () => {
+        if (change === "revoked private proof") f.proof.authenticated = false;
+        if (change === "fresh private settlement") f.privateHistory.set(entry.key, { ...f.privateHistory.get(entry.key)!, settledAt: now });
+        if (change === "changed public marker") f.entries.set(entry.key, { ...entry, value: { id: "expired", status: "running" } });
+        if (change === "new envelope version") f.entries.set(entry.key, { ...entry, version: entry.version + 1 });
+      };
+      expect(await f.reap()).toBe(0);
+      expect(f.writeBatch).toHaveBeenCalledOnce();
+      expect(f.probes).toHaveLength(1);
+      expect(f.probes[0]!.eligible).toBe(false);
+      expect(f.entries.has(entry.key)).toBe(true);
+    },
+  );
+
+  it("does not schedule any transaction for fresh or unauthenticated legacy tombstones", async () => {
+    const f = fixture();
+    f.add("fresh", now - 1);
+    f.add("forged", 1, false);
+    expect(await f.reap()).toBe(0);
+    expect(f.writeBatch).not.toHaveBeenCalled();
+    expect(f.entries.size).toBe(2);
+  });
+});
 
 describe("stale directory bookkeeping", () => {
   // F1 (#410): a cursor can be unchanged for days while its owner is still addressable.
@@ -334,7 +435,7 @@ describe("records of dead hosts", () => {
   });
 
   // smarty-dev#6477 L2b (R11): file leases are read before the state transaction; a lease file
-  // written in between moves the directory stamp, so the transaction reads them again.
+  // written in between moves the directory stamp, so the backend re-reads outside custody.
   it("keeps a host whose file lease renews between the pre-read and the commit", async () => {
     const mesh = store();
     const now = Date.now();
@@ -356,18 +457,58 @@ describe("records of dead hosts", () => {
     writeHostLease(mesh.root, { id: "dead", rootId: "dead", identityId: "dead", updatedAt: now - 8 * HOUR, expiresAt: now - 7 * HOUR });
     const original = mesh.writeBatch.bind(mesh);
     let insideReads = -1;
-    vi.spyOn(mesh, "writeBatch").mockImplementationOnce(async (input) => {
+    vi.spyOn(mesh, "writeBatch").mockImplementationOnce(input => original({ ...input, prepare: (view, files) => {
       const readdir = vi.spyOn(fs, "readdirSync");
       try {
-        return await original({ ...input, prepare: (view) => {
-          const ops = input.prepare?.(view) ?? [];
-          insideReads = readdir.mock.calls.filter(([dir]) => String(dir).endsWith("host-leases")).length;
-          return ops;
-        } });
+        const ops = input.prepare?.(view, files) ?? [];
+        insideReads = readdir.mock.calls.filter(([dir]) => String(dir).endsWith("host-leases")).length;
+        return ops;
       } finally { readdir.mockRestore(); }
-    });
+    } }));
     expect(await reapDeadHostRecords(mesh, writer, { ownHostId: "own", now })).toBe(1);
     expect(insideReads).toBe(0);
+  });
+
+  describe.each(["file", "sqlite"] as const)("%s reaper file-read bracket", stateBackend => {
+    it.each([false, true])("retries one changed lease scan outside custody and defers exhaustion (exhausted=%s)", async exhausted => {
+      const mesh = store(stateBackend), now = Date.now();
+      await host(mesh, "dead", now - 7 * HOUR);
+      await participant(mesh, "dead-root", "dead");
+      writeHostLease(mesh.root, { id: "dead", rootId: "dead", identityId: "dead", updatedAt: now - 8 * HOUR, expiresAt: now - 7 * HOUR });
+      const selected = readHostLeases(mesh.root).get("dead");
+      const original = mesh.writeBatch.bind(mesh);
+      let stamps = 0, reads = 0, prepares = 0, inside = false;
+      vi.spyOn(mesh, "writeBatch").mockImplementationOnce(input => {
+        expect(input.fileRead?.retries).toBe(1);
+        const files = input.fileRead!;
+        return original({ ...input, fileRead: { ...files,
+          read: () => { expect(inside).toBe(false); reads++; return files.read(); },
+          stamp: () => {
+            // The third stamp is checked under state custody. Only an unrelated lease changes;
+            // every selected target gate and its exact-version proof remain held and unchanged.
+            stamps++;
+            if (stamps === 3 || (exhausted && stamps === 6)) writeHostLease(mesh.root, {
+              id: `unrelated-${stamps}`, rootId: "elsewhere", identityId: "elsewhere", updatedAt: now, expiresAt: now + 60_000,
+            });
+            return files.stamp();
+          } }, prepare: (view, value) => {
+          inside = true; prepares++;
+          const readdir = vi.spyOn(fs, "readdirSync");
+          try {
+            const ops = input.prepare?.(view, value) ?? [];
+            expect(readdir.mock.calls.filter(([dir]) => String(dir).endsWith("host-leases"))).toHaveLength(0);
+            return ops;
+          } finally { readdir.mockRestore(); inside = false; }
+        } });
+      });
+      try {
+        expect(await reapDeadHostRecords(mesh, writer, { ownHostId: "own", now })).toBe(exhausted ? 0 : 2);
+        expect(reads).toBe(2); expect(prepares).toBe(exhausted ? 0 : 1);
+        expect(mesh.get(hostKey("dead")) !== undefined).toBe(exhausted);
+        expect(mesh.get("topology/participants/dead-root") !== undefined).toBe(exhausted);
+        expect(readHostLeases(mesh.root).get("dead")).toEqual(exhausted ? selected : undefined);
+      } finally { mesh.closeState(); }
+    });
   });
 
   it("keeps an orphan participant whose host appears before the delete commits", async () => {

@@ -53,11 +53,13 @@ if (mode === 'launch') {
 `;
 const fixture = (pollCommand = false, timeoutMs = 1_000, resolveInheritedSessionPins?: () => InheritedSessionPin[] | undefined, live = false) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-placement-")); roots.push(root);
+  // Remote cwd fixtures are siblings of the caller's private TMPDIR, not its descendants.
+  const callerTmp = path.join(root, "caller-tmp"); fs.mkdirSync(callerTmp); vi.stubEnv("TMPDIR", callerTmp);
   const profile = path.join(root, "profile"); fs.mkdirSync(profile); vi.stubEnv("PI_CODING_AGENT_DIR", profile);
   const launcher = path.join(root, "launcher.mjs"); fs.writeFileSync(launcher, fake);
   const results = path.join(root, "results");
   const raw = {
-    default: "remote", command: [process.execPath, launcher, "launch", results, "{id}", "--host", "auto", "--minutes", "{minutes}", "--cwd", "{cwd}", "--model", "{model}", "--thinking", "{thinking}", "--", "{task}"],
+    default: "remote", sharedMounts: [root], command: [process.execPath, launcher, "launch", results, "{id}", "--host", "auto", "--minutes", "{minutes}", "--cwd", "{cwd}", "--model", "{model}", "--thinking", "{thinking}", "--", "{task}"],
     ...(pollCommand ? { resultCommand: [process.execPath, launcher, "poll", results, "{id}"] } : { resultDirectory: path.join(results, "{id}") }),
     // Cancellation and its receipt each launch Node; 300ms is not a portable startup budget.
     cancelCommand: [process.execPath, launcher, "cancel", results, "{id}"], pollIntervalMs: 10, commandTimeoutMs: 5_000,
@@ -191,6 +193,27 @@ describe("host process task placement", () => {
     fs.writeFileSync(path.join(f.profile,"fabric.json"), JSON.stringify({agents:{placement:f.raw}}));
     fs.writeFileSync(path.join(f.root,".pi/fabric.json"), JSON.stringify({agents:{placement:{...f.raw,default:"local",capabilities:["github-write"]}}}));
     expect(loadFabricConfig({cwd:f.root,agentDir:f.profile,projectTrusted:true}).agents.placement).toEqual(f.config.placement);
+  });
+  it("keeps an existing local-only cwd on the Main host before considering remote placement", async () => {
+    const f = fixture();
+    const localRoot = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-placement-local-cwd-")); roots.push(localRoot);
+    const cwd = path.join(localRoot, "scratch"); fs.mkdirSync(cwd);
+    expect(fs.existsSync(cwd)).toBe(true);
+    const handle = await f.manager.spawn({ task: "local scratch", cwd, transport: "process" });
+    const result = await f.manager.wait(handle.id);
+    expect(result).toMatchObject({ status: "completed", text: "LOCAL", cwd: fs.realpathSync(cwd) });
+    const events = fs.readFileSync(path.join(f.manager.runDirectory(result.id)!, "events.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    expect(events.filter(line => line.type.startsWith("placement."))).toEqual([expect.objectContaining({ type: "placement.local" })]);
+    expect(fs.existsSync(f.results)).toBe(false);
+  });
+  it("keeps a task with local-only writableRoots on the Main host before remote placement", async () => {
+    const f = fixture();
+    const localRoot = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-placement-local-write-")); roots.push(localRoot);
+    const result = await f.manager.run({ task: "local writable root", writableRoots: [localRoot], transport: "process" });
+    expect(result).toMatchObject({ status: "completed", text: "LOCAL" });
+    const events = fs.readFileSync(path.join(f.manager.runDirectory(result.id)!, "events.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    expect(events.filter(line => line.type.startsWith("placement."))).toEqual([expect.objectContaining({ type: "placement.local" })]);
+    expect(fs.existsSync(f.results)).toBe(false);
   });
   it("uses changed host placement on the next spawn without stopping a running task", async () => {
     const f = fixture(false, 10_000, undefined, true);

@@ -1,4 +1,5 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { configureFabricDiagnostics, diagnostics, notifyDiagnostic } from "./core/diagnostics.js";
 import type { RootInboxBatch, RootInboxSession, RootInboxReconcileOptions } from "./topology/root-inbox-shared.js";
 import { resolveAgentDir } from "./core/agent-dir.js";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -92,6 +93,7 @@ export class FabricState {
   #activatingRuntime: FabricRuntimeState | undefined;
   #activation: Promise<FabricRuntimeState> | undefined;
   #recordsWake: (() => Promise<void>) | undefined;
+  #rootInboxWake: (() => Promise<void>) | undefined;
   #activationGeneration: number | undefined;
   #config: FabricConfig | undefined;
   #provisionalConfig: FabricConfig | undefined;
@@ -235,6 +237,7 @@ export class FabricState {
   }
 
   async bootstrap(context: ExtensionContext): Promise<void> {
+    if (!this.#managedHost) configureFabricDiagnostics(context.sessionManager?.getSessionId?.() ?? "");
     this.#shutDown = false;
     const generation = ++this.#generation;
     this.#cwd = context.cwd;
@@ -375,6 +378,20 @@ export class FabricState {
     this.#recordsWake = wake;
     const current = this.#current();
     if (current) current.recordsWake = wake;
+  }
+
+  /**
+   * The host's gated idle root inbox wake (smarty-dev#4313). Only the current (fully activated)
+   * runtime arms it, from mesh-root file events and one exact-deadline timer; unset closes both.
+   */
+  setRootInboxWake(wake: (() => Promise<void>) | undefined): void {
+    this.#rootInboxWake = wake;
+    if (this.#runtime) this.#runtime.rootInboxWake = wake;
+  }
+
+  /** One coalesced idle inbox read through the armed watch; false when none is armed. */
+  requestRootInboxWake(): boolean {
+    return this.#runtime?.requestRootInboxWake() ?? false;
   }
 
   async nextRecordsInboxMessage(entries: readonly unknown[]): Promise<{ customType: string; content: string; display: boolean; details: { ids: string[] } } | undefined> {
@@ -568,7 +585,7 @@ export class FabricState {
     const line = probe.reason
       ? `[pi-fabric] agents.placement startup probe: ${probe.reason}; falling back to local`
       : `[pi-fabric] agents.placement startup probe: executable ${probe.executable}; default=${placement.default}`;
-    if (startup || line !== this.#placementProbeLine) console.warn(line);
+    if (startup || line !== this.#placementProbeLine) diagnostics.warn("src/fabric-state.ts", line);
     this.#placementProbeLine = line;
   }
 
@@ -579,6 +596,8 @@ export class FabricState {
   async shutdown(reason?: string, targetSessionFile?: string): Promise<void> {
     this.#shutDown = true;
     this.sessionApprovals.reset();
+    // Close the idle inbox watch and its deadline before any await (the runtime closes it again).
+    if (this.#runtime) this.#runtime.rootInboxWake = undefined;
     this.#deactivationHook?.();
     const generation = ++this.#generation;
     const activation = this.#activation;
@@ -623,6 +642,7 @@ export class FabricState {
     // Reinitialization/session switches reuse this facade. Stop the old UI before
     // initialize() awaits teardown and state getters start rejecting (smarty-dev#4383).
     if (existing) this.#deactivationHook?.();
+    if (existing) existing.rootInboxWake = undefined;
     this.#runtime = undefined;
     let candidate: FabricRuntimeState | undefined;
     const assertCurrent = (): void => {
@@ -658,7 +678,7 @@ export class FabricState {
           } catch (error) {
             // Keep the bootstrapped manifest usable for repair. The live control
             // plane records this read failure and watches for a corrected file.
-            if (context.hasUI) context.ui.notify(`Pi Fabric component configuration not applied: ${error instanceof Error ? error.message : String(error)}`, "error");
+            if (context.hasUI) notifyDiagnostic(context, "src/fabric-state.ts", `Pi Fabric component configuration not applied: ${error instanceof Error ? error.message : String(error)}`, "error");
           }
         }
         // Background timers read this ctx only while this activation's lifecycle holds. The
@@ -681,6 +701,8 @@ export class FabricState {
         this.#runtime = candidate;
         this.#activatingRuntime = undefined;
         this.#everActivated = true;
+        // Armed only now that the runtime is current; its first read covers work published before.
+        candidate.rootInboxWake = this.#rootInboxWake;
         try {
           if (config.mesh.enabled && context.isProjectTrusted() &&
             resolveFabricIdentity(context.sessionManager.getSessionId()).identity.kind === "main") {

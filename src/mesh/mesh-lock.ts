@@ -1,5 +1,5 @@
-import { createLockEvents, createLockStats, lockHeldEventThreshold, type MeshLockClass } from "./commit-stats.js";
-import { MeshLockTicket } from "./lock-queue.js";
+import { createLockEvents, createLockStats, lockHeldEventThreshold, type LockEventStore, type MeshLockClass } from "./commit-stats.js";
+import { meshLockQueueDirectory, MeshLockTicket } from "./lock-queue.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { retryDelayMs } from "../core/retry-backoff.js";
 import type { MeshLockProtocol } from "../config.js";
@@ -7,7 +7,7 @@ import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import {
-  alarmForeignHolder, MeshLockForeignHolderError, MeshLockTimeoutError, ownProcessIncarnation, processIncarnation, validProcessIncarnation, type StaleLockNote,
+  alarmForeignHolder, MeshIncarnationPendingError, MeshLockForeignHolderError, MeshLockTimeoutError, ownProcessIncarnation, processIncarnation, validProcessIncarnation, type StaleLockNote,
 } from "../core/atomic-write.js";
 import { FOREIGN_LOCK, pinFenceLock, releaseFenceLock } from "./fence-lock.js";
 import { verifiedRemove } from "../storage/verified-remove.js";
@@ -41,6 +41,46 @@ export const lockOwnerPid = (ownerPath: string): number | undefined => {
 
 const LOCK_TIMEOUT_MS = 10_000;
 const STALE_LOCK_MS = 30_000;
+
+/** A wait budget exhausted before FIFO admission, not a failed acquisition of the canonical lock. */
+export class MeshLockQueueExpiredError extends MeshLockTimeoutError {
+  readonly preLockCode = "FABRIC_MESH_LOCK_QUEUE_EXPIRED";
+  readonly kind = "pre-lock";
+  readonly retryable = true;
+  constructor(readonly lockPath: string, readonly waitersAhead: number | undefined, readonly waitedMs: number) {
+    super("", 0, 0);
+    this.name = "MeshLockQueueExpiredError";
+    this.message = `${this.preLockCode} (code ${this.code}): Fabric mesh lock ${lockPath} expired in the FIFO queue before its turn, ` +
+      `${waitersAhead === undefined ? "waiter count unavailable" : `${waitersAhead} waiters ahead`}, waited ${waitedMs} ms`;
+  }
+}
+
+// Diagnostic snapshot only: admission remains MeshLockTicket's decision. Count matching receipts before our exact
+// token; a concurrent removal or an unreadable directory makes the count unavailable, never an invented number.
+const queueWaitersAhead = (root: string, token: string): number | undefined => {
+  try {
+    const receipts = fs.readdirSync(meshLockQueueDirectory(root)).filter(name => /^\d{24}-\d+-[a-f0-9-]+$/.test(name)).sort();
+    const index = receipts.findIndex(name => name.endsWith(`-${process.pid}-${token}`));
+    return index < 0 ? undefined : index;
+  } catch { return undefined; }
+};
+
+/** Both canonical mesh and SQLite writers start relative waits after ticket setup. Expiry before any acquisition
+ * stays a FIFO refusal: close admission before emitting its separate event, never a contention counter/event. */
+export const createMeshLockAdmission = (root: string, token: string, budgetMs: number,
+  options: { passStalledHead?: boolean; stalledHeadBypassLock?: string } = {}, now: () => number = Date.now) => {
+  const ticket = new MeshLockTicket(root, token, budgetMs, options);
+  const startedAt = now();
+  return {
+    ticket, startedAt, deadline: startedAt + Math.max(0, budgetMs),
+    expire(lockPath: string, eventRoot: string, store: LockEventStore, lockClass: MeshLockClass): MeshLockQueueExpiredError {
+      const refusal = new MeshLockQueueExpiredError(lockPath, queueWaitersAhead(root, token), Math.max(0, now() - startedAt));
+      ticket.close();
+      lockEvents?.queueExpired(eventRoot, store, lockClass, refusal.waitedMs, refusal.waitersAhead);
+      return refusal;
+    },
+  };
+};
 
 // Keep the normal global timer seam (including diagnostic/test clocks). An
 // aborted lifetime clears its referenced retry timer instead of awaiting the lock.
@@ -180,7 +220,7 @@ export class MeshLock {
 
   /** Bound every mesh acquisition in this async step via the existing FIFO/try path.
    * Registry -> mesh publication retains custody through source selection and copies,
-   * but a busy mesh throws its typed timeout after a short try so the caller can
+   * but a busy or unprepared mesh throws its typed refusal after a short try so the caller can
    * release registry fences and retry the whole step. This acquires NO lock itself.
    * Reset the shared scope receipt on exit: escaped async work must not inherit it. */
   async withTryLock<T>(operation: () => Promise<T>, timeoutMs = 0): Promise<T> {
@@ -197,7 +237,7 @@ export class MeshLock {
   // Global actor-custody order: actor registries (sorted path), then mesh.
   // Mesh critical sections are synchronous: never await a registry mutation
   // here or wrap resident async controls in this second/innermost lock.
-  // `bounded` marks an explicit try (lock stats only); a scoped withTryLock is one too. A
+  // `bounded` marks an explicit try (preparation refusal and lock stats); a scoped withTryLock is one too. A
   // reduced remaining budget from an ordinary caller is never a try.
   withLock<T>(operation: () => T, lockTimeoutMs = this.#lockTimeoutMs, lockClass: MeshLockClass = "other",
     bounded = false): Promise<T> {
@@ -221,23 +261,22 @@ export class MeshLock {
     let holdMs = -1;
     let failedWaitMs = -1;
     this.#writeAbortSignal?.throwIfAborted();
-    fs.mkdirSync(this.root, { recursive: true, mode: 0o700 });
     // A registry-fenced publisher gets only a short try, never the ordinary wait.
     // Async-local scope leaves concurrent ordinary callers on their own budget.
     const scope = this.#tryLockScope.getStore();
     const budget = scope?.active ? Math.min(scope.timeoutMs, lockTimeoutMs) : lockTimeoutMs;
-    const ownerPath = path.join(this.#lockPath, "owner");
     if (this.#lockProtocol >= 2 && !this.#ownIncarnationReady &&
-      (scope?.active || lockTimeoutMs < this.#lockTimeoutMs)) {
-      // Fails closed before the common accounting below: count it once here. It never tried .lock,
-      // so it is no wait-timeout event (and reads no owner record for one): nobody made it wait.
-      lockStats?.failed(this.root, lockClass, performance.now() - lockWaitStart, Boolean(scope?.active) || bounded);
-      throw new MeshLockTimeoutError(describeLockHolder(ownerPath), 0, 0);
+      (bounded || scope?.active || lockTimeoutMs < this.#lockTimeoutMs)) {
+      // Fail closed without awaiting native preparation under custody. This never tried .lock:
+      // no owner probe, failed-acquisition stats, or wait-timeout event belongs to it.
+      throw new MeshIncarnationPendingError();
     }
+    fs.mkdirSync(this.root, { recursive: true, mode: 0o700 });
+    const ownerPath = path.join(this.#lockPath, "owner");
     const startTime = this.#lockProtocol >= 2
       ? this.#ownIncarnationReady ? this.#ownStartTime : await this.#ownIncarnation
       : undefined;
-    const deadline = Date.now() + Math.min(this.#lockTimeoutMs, Math.max(0, budget));
+    const waitMs = Math.min(this.#lockTimeoutMs, Math.max(0, budget));
     const token = randomUUID();
     // Protocol 3 (smarty-dev#9569): the start line is always present (empty: unknown) and the PID namespace follows
     // on its own line (empty: unknown, which no reclaimer may treat as its own). Six fields: a reader from before
@@ -273,7 +312,12 @@ export class MeshLock {
         // Already replaced/removed, unreadable, or cleanup failed: never delete canonical.
       }
     };
-    const ticket = new MeshLockTicket(this.root, token, deadline - Date.now());
+    // smarty-dev#9805: only the canonical mesh lock opts into the early free-lock bypass of a stalled head.
+    const admission = createMeshLockAdmission(this.root, token, waitMs, { stalledHeadBypassLock: this.#lockPath });
+    const { ticket, deadline } = admission;
+    let budgetSpent = false;
+    let budgetTimer: ReturnType<typeof setTimeout> | undefined;
+    // The shared admission helper fixes the relative budget only after setup; expiry cannot grant admission.
     try {
       // Attempts and the largest gap between two of them: a large gap means this waiter stalled
       // (no CPU); many attempts with small gaps mean it kept losing the race (smarty-dev#816).
@@ -281,15 +325,52 @@ export class MeshLock {
       let maxGapMs = 0;
       let lastAttemptAt = Date.now();
       let retryAttempt = 0;
+      let waited = false;
+      let waitSetupExpired = false;
+      const wait = async (ms: number): Promise<void> => {
+        // Arm once, before watch setup, on the same relative timer clock as both wait paths.
+        // Date is lease time (it may jump); performance may be a separate diagnostic clock.
+        // Lazy arming keeps uncontended acquisitions free of another clock read or timer.
+        // Spent means strictly past the budget (+1 ms), so an attempt due exactly at the deadline still runs.
+        budgetTimer ??= setTimeout(() => { budgetSpent = true; }, Math.max(0, deadline - Date.now()) + 1);
+        const pending = ticket.queued
+          ? ticket.wait(ms, this.#writeAbortSignal, deadline)
+          : delay(ms, this.#writeAbortSignal);
+        // Invocation includes synchronous watch setup: retain its fixed-deadline refusal.
+        // After yielding, wall-clock lease time can jump independently of the relative timer.
+        waitSetupExpired = Date.now() > deadline;
+        await pending;
+        waited = true;
+      };
+      const timeout = (): MeshLockTimeoutError => {
+        // Keep a foreign-holder refusal typed even when the deadline is crossed during a wait.
+        if (blocked.verdict) {
+          const refused = new MeshLockForeignHolderError(describeLockHolder(ownerPath), attempts, maxGapMs, blocked.verdict,
+            blocked.namespace ?? "", this.#lockPath, blocked.token ?? "");
+          alarmForeignHolder(refused);
+          return refused;
+        }
+        return new MeshLockTimeoutError(describeLockHolder(ownerPath), attempts, maxGapMs);
+      };
       while (true) {
         this.#writeAbortSignal?.throwIfAborted();
         if (!ticket.mayContend()) {
-          if (Date.now() >= deadline) throw new MeshLockTimeoutError(describeLockHolder(ownerPath), attempts, maxGapMs);
-          // Woken when the predecessor's receipt goes; the short poll is only a safety net.
-          await ticket.wait(Math.min(20, Math.max(0, deadline - Date.now())), this.#writeAbortSignal);
-          continue;
+          if (!budgetSpent && Date.now() < deadline) {
+            // Woken when the predecessor's receipt goes; the short poll is only a safety net.
+            await wait(Math.min(20, Math.max(0, deadline - Date.now())));
+            continue;
+          }
+          // Expiry never grants FIFO admission: only an eligible head may probe at its deadline. Keep the legacy
+          // retry code, but report this zero-acquisition refusal separately from real lock contention.
+          throw admission.expire(this.#lockPath, this.root, "mesh-lock", lockClass);
         }
         const attemptAt = Date.now();
+        // Both waits can spend the budget in setup or resume late, even on a release signal.
+        // Keep the initial eligible probe; once we have waited, timer expiry is not admission.
+        if (waited && (waitSetupExpired || budgetSpent)) {
+          if (attempts === 0 && ticket.queued) throw admission.expire(this.#lockPath, this.root, "mesh-lock", lockClass);
+          throw timeout();
+        }
         if (attempts > 0) maxGapMs = Math.max(maxGapMs, attemptAt - lastAttemptAt);
         attempts += 1;
         lastAttemptAt = attemptAt;
@@ -351,21 +432,12 @@ export class MeshLock {
           const code = errorCode(error);
           if (code !== "EEXIST" && (this.#lockProtocol === 1 ||
             (code !== "ENOTEMPTY" && code !== "EPERM" && code !== "EACCES"))) throw error;
-          if (await this.#clearStaleLock(ownerPath, deadline, blocked)) continue;
-          if (Date.now() >= deadline) {
-            // The holder was not reclaimed because its namespace is not ours (or unprovable): say so, typed.
-            if (blocked.verdict) {
-              const refused = new MeshLockForeignHolderError(describeLockHolder(ownerPath), attempts, maxGapMs, blocked.verdict,
-                blocked.namespace ?? "", this.#lockPath, blocked.token ?? "");
-              alarmForeignHolder(refused);
-              throw refused;
-            }
-            throw new MeshLockTimeoutError(describeLockHolder(ownerPath), attempts, maxGapMs);
-          }
+          if (await this.clearStaleLock(ownerPath, deadline, blocked)) continue;
+          if (Date.now() >= deadline) throw timeout();
           // Only the FIFO head probes promptly, woken when .lock is released. After the bounded
           // admission fallback, full jitter spreads plain contenders; the deadline bounds every sleep.
-          if (ticket.queued) await ticket.wait(Math.min(10, Math.max(0, deadline - Date.now())), this.#writeAbortSignal);
-          else await delay(retryDelayMs(retryAttempt++, 20, 250, deadline - Date.now()), this.#writeAbortSignal);
+          await wait(ticket.queued ? Math.min(10, Math.max(0, deadline - Date.now()))
+            : retryDelayMs(retryAttempt++, 20, 250, deadline - Date.now()));
         }
       }
       pin = pinFenceLock(this.#lockPath, ownerRecord);
@@ -395,9 +467,12 @@ export class MeshLock {
         if (timed) holdMs = performance.now() - lockHeldAt;
       }
     } catch (error) {
-      if (timed && lockHeldAt < 0 && error instanceof MeshLockTimeoutError) failedWaitMs = performance.now() - lockWaitStart;
+      if (timed && lockHeldAt < 0 && error instanceof MeshLockTimeoutError && !(error instanceof MeshLockQueueExpiredError)) {
+        failedWaitMs = performance.now() - lockWaitStart;
+      }
       throw error;
     } finally {
+      clearTimeout(budgetTimer);
       ticket.close();
       // Recorded after the ticket closes, so bookkeeping never delays a FIFO follower.
       if (holdMs >= 0) {
@@ -412,13 +487,15 @@ export class MeshLock {
     }
   }
 
-  // Complete dead/different-incarnation receipts recover immediately. Empty ownerless
-  // directories recover only after the grace, using atomic rmdir (never recursive removal
-  // or rename): an owner published after our last comparison makes rmdir fail closed.
-  // Torn/corrupt receipts and nonempty unrecorded directories remain protected.
-  // smarty-dev#9569: a protocol-3 record names its holder's PID namespace; pid evidence (ESRCH, another incarnation)
-  // is used only for a holder of OUR namespace. A foreign or unprovable one is never reclaimed here (`note` says why).
-  async #clearStaleLock(ownerPath: string, deadline: number, note: StaleLockNote = {}): Promise<boolean> {
+  // A dead/other-incarnation complete receipt recovers at once, an empty ownerless directory after the grace (atomic
+  // rmdir: a late owner fails it closed); torn receipts and nonempty unrecorded directories stay. smarty-dev#9569: pid
+  // evidence only for OUR PID namespace (foreign/unprovable: `note`). smarty-dev#9501: `expected` = exact owner bytes
+  // after the read; its namespace must come from the owner, never a mutable receipt.
+  // `beforeRename` is synchronous, restartable retirement of that exact owner's dependent receipt, not another death
+  // proof. It runs only AFTER the sole death/namespace/root proof and BEFORE detaching the canonical owner. A throw
+  // keeps that owner available to reprove on rerun; a kill after the native rename cannot strand its FIFO ticket.
+  async clearStaleLock(ownerPath: string, deadline: number, note: StaleLockNote = {},
+    expected?: { owner: string; namespace: string; beforeRename?: () => void }): Promise<boolean> {
     delete note.verdict; delete note.namespace; delete note.token; // describes the CURRENT holder only
     let pin: { unchanged(): boolean; close(): void } | undefined;
     try {
@@ -429,6 +506,7 @@ export class MeshLock {
         catch (error) { if (errorCode(error) === "ENOENT") return undefined; throw error; }
       };
       const owner = readOwner();
+      if (expected && owner !== expected.owner) return false;
       if (owner === undefined) {
         if (Date.now() - stat.mtimeMs <= this.#staleLockMs) return false;
         const current = fs.lstatSync(this.#lockPath);
@@ -460,20 +538,22 @@ export class MeshLock {
         createdText.trim() !== "" && Number.isFinite(Number(createdText));
       if (!validOwner) return false;
       const recordNamespace = fields.length === 6 ? fields[4]! : null;
-      // pi-fabric#923 (fabric-store decisions): under protocol 3 a record without a namespace (a v1/v2 holder) is
-      // UNPROVEN: its pid may name nothing here although it is alive in another namespace. There is no previous-boot
-      // inference either (VM clones share a machine id): such holders are recovered only by the operator.
-      if (recordNamespace === null && this.#lockProtocol === 3) {
+      // pi-fabric#923: under protocol 3 a record without a namespace (v1/v2 holder) is UNPROVEN (its pid may be alive in
+      // another namespace); no previous-boot inference (VM clones share a machine id): operator recovery only.
+      // A forged receipt can make a LIVE foreign legacy holder look dead locally; never upgrade its namespace.
+      if (recordNamespace === null && (this.#lockProtocol === 3 || expected)) {
         note.verdict = "unproven"; note.namespace = ""; note.token = token!;
         return false;
       }
-      if (recordNamespace !== null) {
+      const ns = recordNamespace;
+      if (expected && ns !== expected.namespace) { note.verdict = "unproven"; note.namespace = ns ?? ""; note.token = token!; return false; }
+      if (ns !== null) {
         const namespaces = await import("../core/pid-namespace.js");
         const own = await namespaces.ownNamespaceForReclaim(deadline, Boolean(this.#tryLockScope.getStore()?.active));
         // pid evidence only for our own namespace AND a host-local root (pi-fabric#923 round 3).
-        const result = namespaces.reclaimVerdict(recordNamespace, own, this.root);
+        const result = namespaces.reclaimVerdict(ns, own, this.root);
         pin = result.pin;
-        if (result.verdict !== "pid") { note.verdict = result.verdict; note.namespace = recordNamespace; note.token = token!; return false; }
+        if (result.verdict !== "pid") { note.verdict = result.verdict; note.namespace = ns; note.token = token!; return false; }
       }
       if (processAlive(pid)) {
         if (!validProcessIncarnation(recordedStart)) return false;
@@ -502,7 +582,14 @@ export class MeshLock {
       };
       if (!unchanged()) return false;
       // pi-fabric#923 round 5: the root checked as host-local must still be the root this path names, right now.
-      if (pin && !pin.unchanged()) { note.verdict = "unproven"; note.namespace = recordNamespace ?? ""; note.token = token!; return false; }
+      if (pin && !pin.unchanged()) { note.verdict = "unproven"; note.namespace = ns ?? ""; note.token = token!; return false; }
+      expected?.beforeRename?.();
+      // The callback may have stalled at a native syscall: recheck the exact owner, directory and host-local root
+      // immediately before detaching. This is the same proof's identity fence, never a second death decision.
+      if (expected?.beforeRename) {
+        if (!unchanged()) return false;
+        if (pin && !pin.unchanged()) { note.verdict = "unproven"; note.namespace = ns ?? ""; note.token = token!; return false; }
+      }
       const fence = `${this.#lockPath}.dead.${createHash("sha256").update(`${stat.dev}:${stat.ino}:${owner}`).digest("hex")}`;
       // ponytail: retain this tiny nonempty directory permanently. A paused old cleaner
       // cannot rename a successor over the same fence (native EEXIST/ENOTEMPTY). Deleting

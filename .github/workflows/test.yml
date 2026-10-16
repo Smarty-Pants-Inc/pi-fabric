@@ -11,6 +11,11 @@ permissions:
 
 jobs:
   check:
+    # Real-broker suites belong to nats-state-conformance and nats-auth, not the
+    # generic affected/smoke selection on either platform. Scope this to check
+    # so the dedicated jobs keep their broker-required gates and explicit lists.
+    env:
+      FABRIC_TEST_SKIP_NATS: '1'
     strategy:
       fail-fast: false
       matrix:
@@ -260,55 +265,15 @@ jobs:
             } > "$conf"
             nohup "$NATS_BIN" -c "$conf" > "$RUNNER_TEMP/nats-$i.log" 2>&1 &
           done
-          # Bounded readiness: every node healthy (full /healthz: JetStream current, meta leader known),
-          # fsync on every write, every peer routed and one JetStream meta leader agreed by every node.
-          # NATS 2.10+ route pooling opens several connections per peer, so routes are checked as
-          # num_routes >= nodes-1 and >= nodes-1 distinct remote server IDs, parsed as JSON (not regex).
-          # One wall-clock deadline bounds the whole wait, including every curl.
-          deadline=$((SECONDS + 30))
-          fetch() {
-            local left=$((deadline - SECONDS))
-            [ "$left" -gt 0 ] || return 1
-            curl -fsS --max-time $((left < 2 ? left : 2)) "$1"
-          }
-          check() {
-            node -e '
-              const [mode, nodes] = [process.argv[1], Number(process.argv[2])];
-              let d;
-              try { d = JSON.parse(require("fs").readFileSync(0, "utf8")); } catch { process.exit(1); }
-              if (mode === "sync") process.exit(d?.jetstream?.config?.sync_always === true ? 0 : 1);
-              if (mode === "routes") {
-                const peers = new Set((d.routes ?? []).map((r) => r.remote_id).filter(Boolean));
-                process.exit(d.num_routes >= nodes - 1 && peers.size >= nodes - 1 ? 0 : 1);
-              }
-              if (mode === "leader") {
-                const leader = d?.meta_cluster?.leader;
-                if (typeof leader !== "string" || leader === "") process.exit(1);
-                console.log(leader);
-                process.exit(0);
-              }
-              process.exit(2);
-            ' "$@"
-          }
-          ready() {
-            local leader="" i port node_leader
-            for i in $(seq 1 "$nodes"); do
-              port=$((8221 + i))
-              fetch "http://127.0.0.1:$port/healthz" > /dev/null 2>&1 || return 1
-              fetch "http://127.0.0.1:$port/varz" | check sync || return 1
-              [ "$nodes" -eq 1 ] && continue
-              fetch "http://127.0.0.1:$port/routez" | check routes "$nodes" || return 1
-              node_leader=$(fetch "http://127.0.0.1:$port/jsz" | check leader) || return 1
-              if [ -z "$leader" ]; then leader="$node_leader"; elif [ "$leader" != "$node_leader" ]; then return 1; fi
-            done
-            echo "NATS $NATS_STATE_PROFILE ready: $nodes node(s)${leader:+, meta leader $leader}"
-          }
-          while [ "$SECONDS" -lt "$deadline" ]; do
-            ready && exit 0
-            sleep 0.2
+          # Shared bounded readiness: the CLI performs one absolute 60 s gate with
+          # 200 ms monitor polling, full and JS-only health, syncAlways, identities,
+          # distinct peer routes, and current/online JetStream metadata replicas.
+          # It prints every per-node response and derived failure before this step exits.
+          monitors=()
+          for i in $(seq 1 "$nodes"); do
+            monitors+=("n$i=http://127.0.0.1:$((8221 + i))")
           done
-          echo "NATS $NATS_STATE_PROFILE did not become ready within 30s" >&2
-          exit 1
+          node scripts/nats-cluster-readiness.mjs "${monitors[@]}"
       - name: StateBackend conformance on nats (${{ matrix.profile }})
         env:
           NATS_SERVER_REQUIRED: '1'
@@ -444,7 +409,7 @@ jobs:
             tar -xzf "$archive"
           )
           echo "NATS_BIN=$stage/nats-server-v${version}-linux-amd64/nats-server" >> "$GITHUB_ENV"
-      - name: Hosted authenticated NATS T2/T8 slice
+      - name: Hosted authenticated NATS T2/T8 and Path B grants (source CLI)
         env:
           NATS_AUTH_REQUIRED: '1'
-        run: bunx vitest run tests/nats-auth-server.test.ts --retry=0
+        run: bunx vitest run tests/nats-auth-server.test.ts tests/nats-auth-path-b-*.test.ts --retry=0

@@ -398,7 +398,43 @@ const scratchProofImport = async (options: Options, io: { census?: MeshWriterCen
   }
 };
 
-interface Gate { stop?: () => void; ownStateDbFds?: string[]; switchId: string; required: RequiredReader[]; readiness: ReaderReadiness; final?: ReaderReadiness; checked: string[] }
+interface Gate { stop?: () => void; ownStateDbFds?: string[]; switchId: string; required: RequiredReader[]; readiness: ReaderReadiness; final?: ReaderReadiness;
+  accepted: ReaderReadiness["unready"]; checked: string[] }
+
+/** The one post-commit alarm for a switch that accepted unready readers (smarty-dev#9436). */
+export const MESH_SWITCH_OVERRIDE_ALARM_TOPIC = "fabric.alarm.mesh-switch-override";
+
+/** Publish outside the migration fence, using the same MeshStore alarm path as mesh health alarms. */
+const distinctReaders = (readers: ReaderReadiness["unready"]): ReaderReadiness["unready"] =>
+  [...new Map(readers.map(reader => [reader.name, reader])).values()];
+
+// ponytail: basenames keep the cause readable; directories are the sensitive part of shared alarm reasons.
+const pathFreeAlarmReason = (reason: string): string =>
+  reason.replace(/(^|[\s()[\];,"'])((?:\/|[A-Za-z]:[\\/])[^\s()[\];,"']*)/g, (_match, prefix: string, token: string) => {
+    const file = token.replace(/[:.]+$/, "");
+    return prefix + path.win32.basename(file) + token.slice(file.length);
+  });
+
+const publishSwitchOverrideAlarm = async (options: Options, gate: Gate, accepted: ReaderReadiness["unready"], epoch: number): Promise<void> => {
+  const { MeshStore, meshAlarmRecipient } = await import("./store.js");
+  const to = meshAlarmRecipient();
+  const uniqueAccepted = distinctReaders(accepted).map(reader => ({ ...reader, reason: pathFreeAlarmReason(reader.reason) }));
+  const names = uniqueAccepted.map(reader => `${reader.name} (${reader.reason})`).join("; ");
+  if (!to) throw new Error("no owning-lead alarm recipient (PI_FABRIC_MESH_ALARM_TO or SMARTY_LEAD_SESSION must be session:<uuid>)");
+  const store = new MeshStore(options.root, 256 * 1024, 500, { lockProtocol: options.lockProtocol, canWakeResidents: () => false });
+  try {
+    await store.publish({
+      topic: MESH_SWITCH_OVERRIDE_ALARM_TOPIC,
+      kind: "mesh-switch-override",
+      dedupeKey: `mesh-switch-override:${gate.switchId}`,
+      to,
+      from: { id: `fabric-mesh-backend:${process.pid}`, name: "fabric-mesh-backend", kind: "agent" },
+      text: `fabric-mesh-backend ${options.command} accepted unready reader(s) after switch ${gate.switchId}: ${names}`,
+      data: { switchId: gate.switchId, command: options.command, epoch,
+        acceptedUnready: uniqueAccepted.map(reader => ({ name: reader.name, reason: reader.reason })), checkedUnderFence: gate.checked },
+    });
+  } finally { store.closeState(); }
+};
 
 /**
  * The readiness gate of a switch to sqlite (smarty-dev#7815). The required readers come from the
@@ -463,7 +499,7 @@ const openGate = async (options: Options, library: MeshBackendOptions, builtins:
     warn(`fabric-mesh-backend: reader ${reader.name} not ready: ${reader.reason}${options.acceptUnready.includes(reader.name) ? " (accepted by --accept-unready)" : ""}\n`);
   }
   const readiness = evaluate(window, "", required);
-  const gate: Gate = { switchId: randomUUID(), required, readiness, checked: [], stop: () => fencedWatch?.stop() };
+  const gate: Gate = { switchId: randomUUID(), required, readiness, accepted: [], checked: [], stop: () => fencedWatch?.stop() };
   try {
     recordSwitch(options.root, { switchId: gate.switchId, phase: "intent", command: options.command, backend: "sqlite", from: backend, ...window,
       required, requireReader: options.requireReaders, acceptUnready: options.acceptUnready, readersReady: readiness.ready, acceptedUnready: readiness.unready });
@@ -490,6 +526,7 @@ const openGate = async (options: Options, library: MeshBackendOptions, builtins:
     underFence = true;
     outer?.(commit);
     gate.final = evaluate(commit, ` (under the fence, before the ${commit.phase} commit)`);
+    gate.accepted.push(...gate.final.unready);
     gate.checked.push(commit.phase);
     if (ownFds) gate.ownStateDbFds = ownFds;
   };
@@ -590,17 +627,43 @@ export const main = async (argv: string[], io: {
       return status.fenceHolds && "source" in status.reader ? 0 : 3;
     }
     // The readiness gate (smarty-dev#7815): every registered reader proved the target backend.
+    if (options.command === "import" || options.command === "cutover") {
+      // smarty-dev#9501: the exact rerun of a killed import recovers its own .lock before the gate's census (lazy
+      // module, import-fence-receipt.ts); anything but an exact receipt match leaves the root to the gate.
+      const { root, lockProtocol } = options;
+      const recovered = await import("./import-fence-receipt.js").then(module => module.recoverKilledImportLock(root, lockProtocol), () => undefined);
+      if (recovered) warn(`fabric-mesh-backend: ${recovered}\n`);
+    }
     if (options.command === "import" || options.command === "cutover") gate = await openGate(options, library, io.builtinReaders ?? BUILTIN_READERS,
       io.gateCensus ?? meshWriterCensusSync(options.root), io.procScan ?? {}, io.leaseProbe ?? {}, warn);
     const result: Record<string, unknown> = { ...(await (options.command === "import" ? importMeshState(options.root, library)
       : options.command === "cutover" ? cutoverMeshState(options.root, library)
         : options.command === "rollback" ? rollbackMeshState(options.root, library)
           : abortMeshRollback(options.root, library))) };
+    let overrideAlarmFailure: string | undefined;
     if (gate) {
       const final = gate.final ?? gate.readiness;
       result.readers = { switchId: gate.switchId, ready: final.ready, acceptedUnready: final.unready, checkedUnderFence: gate.checked };
+      // Outcome append attempted, then alarm; the alarm does not depend on the append succeeding.
+      // A post-commit alarm failure never changes the switch record.
       result.switchRecord = closeGate(options.root, gate, warn, { ok: true, epoch: result.epoch, converged: result.converged,
         checkedUnderFence: gate.checked, ownStateDbFds: gate.ownStateDbFds, required: gate.final?.required ?? gate.required, readersReady: final.ready, acceptedUnready: final.unready });
+      const accepted = distinctReaders(gate.accepted);
+      if (accepted.length > 0) {
+        try {
+          await publishSwitchOverrideAlarm(options, gate, accepted, Number(result.epoch));
+        } catch (error) {
+          overrideAlarmFailure = error instanceof Error ? error.message : String(error);
+          const names = accepted.map(reader => `${reader.name} (${reader.reason})`).join("; ");
+          warn(`fabric-mesh-backend: ${MESH_SWITCH_OVERRIDE_ALARM_TOPIC} publish failed after committed switch ${gate.switchId}; `
+            + `accepted readers: ${names}; switch remains committed: ${overrideAlarmFailure}\n`);
+        }
+      }
+    }
+    if (overrideAlarmFailure !== undefined) {
+      if (options.json) write(`${JSON.stringify({ command: options.command, ok: false, committed: true, error: overrideAlarmFailure, ...result, alarms }, null, 2)}\n`);
+      else write(`${options.command} committed, but ${MESH_SWITCH_OVERRIDE_ALARM_TOPIC} failed: ${overrideAlarmFailure}\n`);
+      return 1;
     }
     write(`${options.json ? JSON.stringify({ command: options.command, ok: true, ...result, alarms }, null, 2) : formatResult(options.command, result)}\n`);
     return 0;

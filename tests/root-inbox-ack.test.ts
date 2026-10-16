@@ -64,6 +64,40 @@ const runtimeRoot = (prefix: string) => {
   return { root, config };
 };
 
+describe("shown-only receipts joined with main's canonical extraction", () => {
+  it("rejects unsigned inbox receipts but preserves admitted native carrier receipts", () => {
+    const event = { id: "canonical-join", sequence: 1, topic: TOPIC, kind: "blocked", from: peer,
+      text: "shown action", createdAt: Date.now() } as MeshEvent;
+    const message = rootInboxMessage([event]);
+    const timestamp = new Date().toISOString();
+    const unsigned = rootInboxSession([{ type: "custom_message", timestamp, ...message }]);
+    expect(unsigned.holdsBatch([event.id])).toBe(false);
+    expect([...unsigned.delivered!]).toEqual([]);
+    // Main #1226 records admitted native identity receipts independently of inbox issuance.
+    const native = rootInboxSession([{ type: "custom_message", timestamp,
+      customType: "pi-fabric-agent-message", details: { receipts: message.details.receipts } }]);
+    for (const receipt of message.details.receipts) {
+      expect(native.delivered!.has(receipt)).toBe(true);
+      expect(native.deliveredAt!.get(receipt)).toBe(Date.parse(timestamp));
+    }
+  });
+
+  it.each(["invalid", "2026-01-01", 0])("never renews an issued receipt with invalid canonical timestamp %s", timestamp => {
+    const event = { id: `invalid-time-${timestamp}`, sequence: 1, topic: TOPIC, kind: "blocked", from: peer,
+      text: "shown action", createdAt: Date.now() } as MeshEvent;
+    const message = issuedInboxMessage([event]);
+    const session = rootInboxSession([{ type: "custom_message", timestamp, ...message }], verifyIssuedInbox);
+    expect(session.holdsBatch([event.id])).toBe(true); // Exact issued identity remains replay evidence.
+    for (const receipt of message.details.receipts) {
+      expect(session.delivered!.has(receipt)).toBe(true);
+      expect(session.deliveredAt!.has(receipt)).toBe(false); // No scan-time legacy fallback authority.
+    }
+    const validAt = new Date().toISOString();
+    const valid = rootInboxSession([{ type: "custom_message", timestamp: validAt, ...message }], verifyIssuedInbox);
+    for (const receipt of message.details.receipts) expect(valid.deliveredAt!.get(receipt)).toBe(Date.parse(validAt));
+  });
+});
+
 describe("root inbox acknowledges injected events by id (smarty-dev#8962)", () => {
   it("never injects an acknowledged event again: not to a read that raced the ack, not after a restart", async () => {
     const { root, config } = runtimeRoot("fabric-inbox-ack-runtime-");

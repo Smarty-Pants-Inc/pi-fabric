@@ -1,4 +1,5 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { diagnostics } from "../core/diagnostics.js";
 import fs from "node:fs";
 import path from "node:path";
 import { FOREIGN_LOCK, pinFenceLock, releaseFenceLock } from "./fence-lock.js";
@@ -69,7 +70,6 @@ export const acquireMeshCustodyLock = async (root: string, timeoutMs = CUSTODY_L
   fs.mkdirSync(root, { recursive: true, mode: 0o700 });
   const lock = path.join(root, MESH_CUSTODY_LOCK_NAME);
   const ownerPath = path.join(lock, "owner");
-  const deadline = Date.now() + Math.max(0, timeoutMs);
   const token = randomUUID();
   // Keep full UUID ownership receipts; only transient filesystem names need a short token.
   const pathToken = randomBytes(4).toString("hex");
@@ -93,6 +93,9 @@ export const acquireMeshCustodyLock = async (root: string, timeoutMs = CUSTODY_L
     catch (error) { if (errorCode(error) === "ENOENT") return undefined; throw error; }
   };
   const blocked: StaleLockNote = {};
+  // The relative wait budget starts at the first acquisition attempt, after setup (incarnation and PID-namespace
+  // reads): slow setup must not spend it before the lock was tried.
+  const deadline = Date.now() + Math.max(0, timeoutMs);
   let attempts = 0;
   let maxGapMs = 0;
   let lastAttemptAt = Date.now();
@@ -124,7 +127,7 @@ export const acquireMeshCustodyLock = async (root: string, timeoutMs = CUSTODY_L
       if (await clearDeadCustodyLock(lock, readOwner, deadline, started, options.hostQualified, blocked, options.lockProtocol ?? 1)) continue;
     } catch (error) {
       if (error instanceof MeshCustodyUnrecoverableError) {
-        try { console.warn(`[pi-fabric] ALARM ${error.kind}: ${error.message}`); } catch { /* alarm never masks refusal */ }
+        try { diagnostics.warn("src/mesh/custody-lock.ts", `[pi-fabric] ALARM ${error.kind}: ${error.message}`); } catch { /* alarm never masks refusal */ }
       }
       throw error;
     }

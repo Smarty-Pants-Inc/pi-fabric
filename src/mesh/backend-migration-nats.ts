@@ -79,6 +79,11 @@ export interface MeshNatsMigrationOptions {
   maxPayloadBytes?: number;
   lockTimeoutMs?: number;
   lockProtocol?: 1 | 2;
+  /** As openNatsStateBackend: create with these replicas; refuse an existing stream with other replicas.
+   * Omitted: the real client reads the agent-layer fabric.json mesh.nats.replicas; an injected port decides. */
+  replicas?: number;
+  /** Real-client placement budget in milliseconds (default 30 000); exhausted: typed unavailable, never fewer replicas. */
+  placementTimeoutMs?: number;
   /** Synchronous crash-point hook (tests stop the tool here). */
   onStep?: (step: MeshBackendStep) => void;
 }
@@ -240,7 +245,8 @@ const run = async <T>(root: string, options: MeshNatsMigrationOptions, gateVersi
       }
       const subject = `${stream}.state`;
       // The backend's subjects and message cap (pi-fabric#907): the root's open refuses a stream without max_msg_size.
-      await port.ensureStream(stream, [subject, `${stream}.snapshot`], { maxMsgSize: MAX_MESSAGE_BYTES });
+      await port.ensureStream(stream, [subject, `${stream}.snapshot`], { maxMsgSize: MAX_MESSAGE_BYTES,
+        ...(options.replicas === undefined ? {} : { replicas: options.replicas }) });
       return body(port, stream, subject);
     });
   } finally { if (owned) await port.close().catch(() => undefined); }

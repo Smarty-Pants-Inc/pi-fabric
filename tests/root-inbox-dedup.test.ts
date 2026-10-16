@@ -323,11 +323,11 @@ describe("receipt capacity and strong identities (review F1/F2)", () => {
       h.followUp({ key: `capacity:${index}` }); h.advance(1);
     }
     expect(Buffer.byteLength(JSON.stringify({ after: 0, delivered: [...h.session().delivered!] }))).toBeGreaterThan(limit);
-    // Even an evicted old receipt is matched from canonical session history, not re-injected.
-    await h.publish({ key: "capacity:0" });
+    // Canonical history must not resurrect a capacity-evicted key-only claim: fail open.
+    const evicted = await h.publish({ key: "capacity:0" });
     const fresh = await h.publish({ key: "fresh unseen" }); h.advance(1);
     const batch = await h.box().next(h.session());
-    expect(batch.events.map(event => event.id)).toEqual([fresh.id]);
+    expect(batch.events.map(event => event.id)).toEqual([evicted.id, fresh.id]);
     const value = h.mesh.get(inbox.key)!.value as { delivered: string[]; pending?: unknown };
     expect(value.pending).toBeDefined();
     expect(value.delivered.length).toBeLessThanOrEqual(1024);
@@ -339,8 +339,8 @@ describe("receipt capacity and strong identities (review F1/F2)", () => {
     expect(value.delivered).toContain(last);
     expect(value.delivered).not.toContain(first);
     h.entries.length = 0;
-    // Reload cannot lose the pending work, and the newest native shadow is still suppressed.
-    expect((await h.box().next(h.session())).events.map(event => event.id)).toEqual([fresh.id]);
+    // Reload cannot lose either pending event; a retained newest native claim still suppresses.
+    expect((await h.box().next(h.session())).events.map(event => event.id)).toEqual([evicted.id, fresh.id]);
     h.entries.push({ type: "custom_message", ...rootInboxMessage(batch.events) });
     await h.box().next(h.session());
     h.entries.length = 0;

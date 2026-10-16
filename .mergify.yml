@@ -1,3 +1,8 @@
+# Follow smarty-dev's .mergify.yml auto-queue pattern for ready PRs.
+# `hold` is the opt-out; every queue keeps the same required checks.
+merge_protections_settings:
+  auto_merge_conditions: true
+
 merge_queue:
   mode: serial
   # Two speculative batches at once (chief-of-staff GO 10-12 01:42Z): a bisect or a slow batch no longer
@@ -7,12 +12,10 @@ merge_queue:
   reset_on_external_merge: always
 
 # smarty-dev's plain rule (smarty-dev#865): the PR, its required checks and this queue are the
-# review. The Astra reviewer queues a ready PR after its success verdict; `hold` and DO NOT LAND
-# titles keep a PR out. queue_conditions require both review verdicts on the reviewed head. Only a
-# PR head carries review statuses, and Mergify's in-place update (merging main into the queued
-# PR, smarty-dev#455) makes a new head that never gets them. So merge_conditions only refuse a
-# failed review, as smarty-dev's .mergify.yml does (smarty-dev#440, #1537), and still require
-# fresh CI on the updated head (smarty-dev#2974).
+# review. Mergify queues a ready PR once queue_conditions pass; `hold` and DO NOT LAND
+# titles keep a PR out. merge_conditions recheck CI and opt-out vetoes on the updated head
+# (smarty-dev#2974), but review statuses only refuse failed reviews: queue updates create
+# a new head with no review statuses (smarty-dev#455).
 queue_rules:
   - name: default
     # ponytail: one Ubuntu+Windows run takes ~30 min under fleet load, so a serial queue of N PRs takes N
@@ -24,11 +27,14 @@ queue_rules:
     checks_timeout: 180 min
     merge_method: merge
     queue_conditions:
+      - -label ~= (?i)^(hold|do[ -]?not[ -]?merge|dnm|freeze|frozen)$
+      - -label ~= (?i)^(wip|work[ -]?in[ -]?progress|do[ -]?not[ -]?land|never[ -]?land)$
       - base = main
       - -draft
       - -label = hold
       - -title ~= (?i)do not land
       - check-success = review/astra
+      - -check-failure = review/security  # a failed security verdict refuses admission, label or not
       - check-success = check (ubuntu-latest)
       - or:
           - check-success = review/security
@@ -36,13 +42,18 @@ queue_rules:
               - -head ~= ^sync/upstream-
               - -label = needs-security-pass
     merge_conditions:
+      # Label and title opt-outs added after queueing stop the merge.
+      # Review statuses here only refuse a FAILED review: an in-place or batch update
+      # makes a new head with no review statuses (smarty-dev#455).
+      # queue_conditions require the reviews on the reviewed head.
+      - -check-failure = review/astra
+      - -label ~= (?i)^(hold|do[ -]?not[ -]?merge|dnm|freeze|frozen)$
+      - -label ~= (?i)^(wip|work[ -]?in[ -]?progress|do[ -]?not[ -]?land|never[ -]?land)$
       - base = main
-      - -draft
       - -label = hold
       - -title ~= (?i)do not land
-      - check-success = check (ubuntu-latest)
-      - -check-failure = review/astra
       - -check-failure = review/security
+      - check-success = check (ubuntu-latest)
 
 # Queue order (smarty-dev#6477, Paul 10-08: the SQLite store is the fleet's top priority and gets the merge
 # queue's top tier). A fleet-top PR is queued ahead of p0, and a p0 PR ahead of the rest. Neither interrupts a

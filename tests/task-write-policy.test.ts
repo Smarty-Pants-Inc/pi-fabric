@@ -56,7 +56,7 @@ const now=Date.now(); fs.writeFileSync(args.get('--status-file'),JSON.stringify(
     fs.writeFileSync(launcher, `import fs from 'node:fs'; import path from 'node:path';
 const [mode,id]=process.argv.slice(2); if(mode==='launch'){const dir=path.join(${JSON.stringify(results)},id);fs.mkdirSync(dir,{recursive:true});fs.writeFileSync(path.join(dir,'result.md'),'REMOTE');fs.writeFileSync(path.join(dir,'rc'),'0');console.log('RYZEN2_TASK_ACCEPTED '+id+' on testhost');}`);
     remote = normalizeFabricConfig({ agents: { placement: {
-      default: "remote", command: [process.execPath, launcher, "launch", "{id}", "{task}"],
+      default: "remote", sharedMounts: [cwd], command: [process.execPath, launcher, "launch", "{id}", "{task}"],
       resultDirectory: path.join(results, "{id}"), cancelCommand: [process.execPath, launcher, "cancel", "{id}"],
       commandTimeoutMs: 5_000, pollIntervalMs: 10,
     } } }).agents.placement;
@@ -258,12 +258,31 @@ describe("local process task write default", () => {
 
   it("preserves default remote placement and logs the missing forwarding rather than claiming confinement", async () => {
     const f = fixture(true);
+    // Keep cwd portable while all writes remain beneath the runner-owned fixture root.
+    const callerTmp = path.join(f.root, "caller-tmp");
+    fs.mkdirSync(callerTmp);
+    vi.stubEnv("TMPDIR", callerTmp);
     const handle = await f.manager.spawn({ task: "remote probe", transport: "process" });
     expect(await f.manager.wait(handle.id)).toMatchObject({ status: "completed", text: "REMOTE" });
     expect(f.events(handle.id).filter(event => event.type.startsWith("write_policy.")))
       .toEqual([expect.objectContaining({ type: "write_policy.remote_unconfined" })]);
     expect(f.events(handle.id).some(event => event.type === "placement.remote")).toBe(true);
     expect(fs.existsSync(path.join(f.cwd, "inside.txt"))).toBe(false);
+  });
+
+  it("keeps default remote placement local under caller TMPDIR despite sharedMounts and logs the local write policy", async () => {
+    const f = fixture(true);
+    expect(path.relative(fs.realpathSync(os.tmpdir()), f.cwd)).not.toMatch(/^\.\.(?:[/\\]|$)/);
+    const { result, value } = await report(f);
+    expect(value.policy).toEqual({ readOnly: false, writableRoots: [f.cwd, value.tmpdir].sort(), shell: "unconfined" });
+    expect(value.probes.map((probe: { allowed: boolean }) => probe.allowed)).toEqual([true, true, false]);
+    expect(fs.readFileSync(path.join(f.cwd, "inside.txt"), "utf8")).toBe("probe");
+    expect(fs.existsSync(f.outside)).toBe(false);
+    expect(f.events(result.id).filter(event => event.type.startsWith("write_policy.")))
+      .toEqual([expect.objectContaining({ type: "write_policy.default", policy: value.policy })]);
+    expect(f.events(result.id).filter(event => event.type.startsWith("placement.")))
+      .toEqual([expect.objectContaining({ type: "placement.local", reason: expect.stringContaining("caller-local cwd") })]);
+    expect(fs.existsSync(path.join(f.root, "placed"))).toBe(false);
   });
 
   it("pins an explicit policy local instead of silently dropping it at remote placement", async () => {

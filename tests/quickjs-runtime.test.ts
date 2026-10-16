@@ -1,11 +1,13 @@
 import { describe, expect, it, vi } from "vitest";
 import { QuickJsRuntime } from "../src/runtime/quickjs-runtime.js";
 import { FabricModelDeniedError } from "../src/core/model-policy.js";
+import { FabricIdempotencyKeyReusedError } from "../src/mesh/control-idempotency.js";
 import { FabricInterruptNotAuthorizedError, FabricInterruptRateLimitedError } from "../src/interrupt-authority.js";
-import { FabricControlStaleIncarnationError, STALE_INCARNATION_ERROR } from "../src/topology/control-plane.js";
+import { FabricControlStaleIncarnationError, FabricRelayDestinationUnavailableError, STALE_INCARNATION_ERROR } from "../src/topology/control-plane.js";
 import { classifyPiBashError } from "../src/core/pi-bash-error.js";
 import { MeshLockTimeoutError, MESH_LOCK_TIMEOUT_CODE } from "../src/core/atomic-write.js";
 import { transpileFabricCodeWithSourceMap } from "../src/runtime/type-checker.js";
+import { JevTransientHttpError } from "../src/jev/validation.js";
 import * as typeChecker from "../src/runtime/type-checker.js";
 import { ExecutionDeadline } from "../src/runtime/execution-deadline.js";
 import { executeAfterAdmission } from "./helpers/admission-clock.js";
@@ -70,6 +72,47 @@ catch (error) { return { name: error.name, code: typeof error.code, extra: typeo
       const result = await new QuickJsRuntime().execute('try { await agents.spawn({ task: "review" }); } catch (error) { return { name: error.name, code: error.code, secret: error.secret }; }', async () => { throw error; }, options);
       expect(result.value).toEqual(error instanceof FabricModelDeniedError ? { name: "FabricModelDeniedError", code: "FABRIC_MODEL_DENIED" } : { name: "FabricModelDeniedError" });
     }
+  });
+  it("never lets host guestFields replace or add to vetted Fabric error metadata", async () => {
+    const error = Object.assign(new FabricModelDeniedError("provider/denied"), { guestFields: { code: 7, status: 403 } });
+    const result = await new QuickJsRuntime().execute('try { await agents.spawn({ task: "review" }); } catch (error) { return { name: error.name, code: error.code, status: typeof error.status }; }', async () => { throw error; }, options);
+    expect(result.value).toEqual({ name: "FabricModelDeniedError", code: "FABRIC_MODEL_DENIED", status: "undefined" });
+  });
+  const numericProbe = "try { await tools.call({ ref: 'fixture.fail' }); } catch (error) { const e = error as Record<string, unknown>; return [e.message, e.status, e.retryAfterMs, e.secret, Object.hasOwn(e, 'retryAfterMs')]; } return null;";
+  it("copies finite status and retryAfterMs only from the trusted Jev transient error", async () => {
+    const usage = { input_tokens: 1, output_tokens: 0 };
+    const withRetry = Object.assign(new JevTransientHttpError("HTTP 429", usage, 429, 1500), { secret: 1 });
+    const first = await new QuickJsRuntime().execute(numericProbe, async () => { throw withRetry; }, options);
+    expect(first.terminationReason, first.error).toBe("completed");
+    expect(first.value).toEqual(["HTTP 429", 429, 1500, null, true]);
+    const second = await new QuickJsRuntime().execute(numericProbe, async () => { throw new JevTransientHttpError("HTTP 503", usage, 503, undefined); }, options);
+    expect(second.value).toEqual(["HTTP 503", 503, null, null, false]);
+  });
+  it("never copies numeric metadata from an ordinary host error spoof", async () => {
+    const spoof = Object.assign(new Error("denied"), { status: 200, retryAfterMs: 0, guestFields: { status: 200, retryAfterMs: 0 } });
+    const result = await new QuickJsRuntime().execute(numericProbe, async () => { throw spoof; }, options);
+    expect(result.terminationReason, result.error).toBe("completed");
+    expect(result.value).toEqual(["denied", null, null, null, false]);
+  });
+  it("never invokes getters while reading host error metadata", async () => {
+    const getter = vi.fn(() => ({ status: 200, retryAfterMs: 0 }));
+    const plain = new Error("getter");
+    Object.defineProperty(plain, "guestFields", { get: getter });
+    Object.defineProperty(plain, "status", { get: getter });
+    const trusted = new JevTransientHttpError("HTTP 502", { input_tokens: 1, output_tokens: 0 }, 502, undefined);
+    Object.defineProperty(trusted, "retryAfterMs", { get: getter });
+    const statusGetter = vi.fn(() => 200);
+    const accessorStatus = new JevTransientHttpError("HTTP 500", { input_tokens: 1, output_tokens: 0 }, 500, 10);
+    Object.defineProperty(accessorStatus, "status", { get: statusGetter });
+    const values: unknown[] = [];
+    for (const error of [plain, trusted, accessorStatus]) {
+      const result = await new QuickJsRuntime().execute(numericProbe, async () => { throw error; }, options);
+      expect(result.terminationReason, result.error).toBe("completed");
+      values.push(result.value);
+    }
+    expect(values).toEqual([["getter", null, null, null, false], ["HTTP 502", 502, null, null, false], ["HTTP 500", null, 10, null, true]]);
+    expect(getter).not.toHaveBeenCalled();
+    expect(statusGetter).not.toHaveBeenCalled();
   });
   it("rejects memory limits that overflow the WASM32 size_t", async () => {
     const result = await new QuickJsRuntime().execute(
@@ -244,10 +287,75 @@ catch (error) { return { name: error.name, code: typeof error.code, extra: typeo
     expect(calls).toEqual(Array(2).fill({ id: "session:test", message: "unchanged", idempotencyKey: "original-key" }));
   });
 
-  it("never bridges invalid, oversized, inherited, unrelated or getter retry keys", async () => {
+  it("carries only safe relay refusal metadata through public guest followUp calls", async () => {
+    const error = Object.assign(new FabricRelayDestinationUnavailableError("session:test", "original-key"), {
+      notRun: true, notDelivered: true, secret: "host-only",
+    });
+    const hostCall = vi.fn(async () => { throw error; });
+    const result = await new QuickJsRuntime().execute(
+      `const failures = [];
+       for (const followUp of [agents.followUp, args => tools.call({ ref: "agents.followUp", args })]) {
+         try { await followUp({ id: "session:test", message: "unchanged", idempotencyKey: "original-key" }); }
+         catch (error) { failures.push({ name: error.name, code: error.code, retryable: error.retryable,
+           idempotencyKey: error.idempotencyKey, isError: error instanceof Error,
+           notRun: typeof error.notRun, notDelivered: typeof error.notDelivered,
+           keys: Object.keys(error).sort() }); }
+       } return failures;`, hostCall, options,
+    );
+    expect(result.error).toBeUndefined();
+    expect(result.value).toEqual(Array(2).fill({ name: "FabricRelayDestinationUnavailableError",
+      code: "FABRIC_RELAY_DESTINATION_UNAVAILABLE", retryable: true, idempotencyKey: "original-key", isError: true,
+      notRun: "undefined", notDelivered: "undefined", keys: ["code", "idempotencyKey", "message", "name", "retryable"] }));
+    expect(hostCall.mock.calls).toHaveLength(2);
+  });
+
+  it("carries only the typed idempotency conflict contract through public guest followUp calls", async () => {
+    const error = Object.assign(new FabricIdempotencyKeyReusedError("original-key"), {
+      secret: "host-only", cause: { secret: "nested-host-only" }, fingerprint: "host-only",
+    });
+    const hostCall = vi.fn(async (_ref: string) => { throw error; });
+    const result = await new QuickJsRuntime().execute(
+      `const failures = [];
+       for (const followUp of [agents.followUp, args => tools.call({ ref: "agents.followUp", args })]) {
+         try { await followUp({ id: "session:test", message: "different input", idempotencyKey: "original-key" }); }
+         catch (error) { failures.push({ name: error.name, code: error.code, message: error.message,
+           retryable: error.retryable, idempotencyKey: error.idempotencyKey, isError: error instanceof Error,
+           secret: typeof error.secret, cause: typeof error.cause, fingerprint: typeof error.fingerprint,
+           keys: Object.keys(error).sort() }); }
+       } return failures;`, hostCall, options,
+    );
+    expect(result.error).toBeUndefined();
+    expect(result.value).toEqual(Array(2).fill({ name: "FabricIdempotencyKeyReusedError",
+      code: "FABRIC_IDEMPOTENCY_KEY_REUSED", message: "Fabric idempotency key reused with different input",
+      retryable: false, idempotencyKey: "original-key", isError: true,
+      secret: "undefined", cause: "undefined", fingerprint: "undefined",
+      keys: ["code", "idempotencyKey", "message", "name", "retryable"] }));
+    expect(hostCall.mock.calls.map(([ref]) => ref)).toEqual(["agents.followUp", "fabric.$call"]);
+  });
+
+  it("does not invoke a typed idempotency conflict retryable getter", async () => {
     const getter = vi.fn(() => { throw new Error("must not invoke a getter"); });
-    const make = (key: unknown) => Object.assign(new Error("stale"), {
-      name: "FabricParticipantStaleError", code: "FABRIC_PARTICIPANT_STALE", retryable: true, idempotencyKey: key,
+    const error = new FabricIdempotencyKeyReusedError("original-key");
+    Object.defineProperty(error, "retryable", { get: getter });
+    const result = await new QuickJsRuntime().execute(
+      `try { await agents.followUp({ id: "session:test", message: "different input", idempotencyKey: "original-key" }); }
+       catch (error) { return { name: error.name, code: error.code, retryable: error.retryable,
+         idempotencyKey: error.idempotencyKey }; }`, async () => { throw error; }, options,
+    );
+    expect(result.error).toBeUndefined();
+    expect(result.value).toEqual({ name: "FabricIdempotencyKeyReusedError", code: "FABRIC_IDEMPOTENCY_KEY_REUSED",
+      idempotencyKey: "original-key" });
+    expect(getter).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["FABRIC_PARTICIPANT_STALE", "FabricParticipantStaleError"],
+    ["FABRIC_RELAY_DESTINATION_UNAVAILABLE", "FabricRelayDestinationUnavailableError"],
+    ["FABRIC_IDEMPOTENCY_KEY_REUSED", "FabricIdempotencyKeyReusedError"],
+  ])("never bridges invalid, oversized, inherited, unrelated or getter retry keys for %s", async (code, name) => {
+    const getter = vi.fn(() => { throw new Error("must not invoke a getter"); });
+    const make = (key: unknown) => Object.assign(new Error("retryable refusal"), {
+      name, code, retryable: code !== "FABRIC_IDEMPOTENCY_KEY_REUSED", idempotencyKey: key,
     });
     const errors = [make(""), make("x".repeat(201)), make(7), make(null), make("x".repeat(200)), make("getter"), make("inherited"), make("unrelated")];
     Object.defineProperty(errors[5], "idempotencyKey", { get: getter });
@@ -284,6 +392,7 @@ catch (error) { return { name: error.name, code: typeof error.code, extra: typeo
   it.each([
     ["FABRIC_CONTROL_INCARNATION_REQUIRED", "FabricControlIncarnationRequiredError"],
     ["FABRIC_CONTROL_STALE_INCARNATION", "FabricControlStaleIncarnationError"],
+    ["FABRIC_RELAY_DESTINATION_UNAVAILABLE", "FabricRelayDestinationUnavailableError"],
     ["FABRIC_PARTICIPANT_NOT_YET_MIRRORED", "FabricParticipantNotYetMirroredError"],
     ["FABRIC_PARTICIPANT_NON_INTERACTIVE", "FabricParticipantNonInteractiveError"],
     ["FABRIC_TASK_ESCALATION_TARGET_DENIED", "TaskEscalationTargetError"],
@@ -320,20 +429,28 @@ catch (error) { return { name: error.name, code: typeof error.code, extra: typeo
     let call = 0;
     const result = await new QuickJsRuntime().execute(
       `const failures = [];
-       for (let i = 0; i < 3; i++) {
+       for (let i = 0; i < 8; i++) {
          try { await tools.call({ ref: "demo.error" }); }
-         catch (error) { failures.push({ name: error.name, code: error.code, retryable: error.retryable, secret: error.secret }); }
+         catch (error) { failures.push({ name: error.name, code: error.code, retryable: error.retryable,
+           idempotencyKey: error.idempotencyKey, secret: error.secret }); }
        }
        return failures;`,
       async () => {
         const index = call++;
         if (index === 0) throw Object.assign(new Error("mismatch"), { name: "RangeError", code: "FABRIC_PROJECT_LEAD_INVALID", retryable: true });
         if (index === 1) throw Object.assign(new Error("non-string"), { name: 7, code: "FABRIC_PROJECT_LEAD_INVALID", retryable: true });
+        if (index === 3) throw Object.assign(new Error("relay mismatch"), { name: "RangeError", code: "FABRIC_RELAY_DESTINATION_UNAVAILABLE", retryable: true, idempotencyKey: "must-not-cross" });
+        if (index === 4) throw Object.assign(new Error("unknown relay code"), { name: "FabricRelayDestinationUnavailableError", code: "HOST_SECRET", retryable: true, idempotencyKey: "must-not-cross" });
+        if (index === 5) throw Object.assign(new Error("conflict mismatch"), { name: "RangeError", code: "FABRIC_IDEMPOTENCY_KEY_REUSED", retryable: false, idempotencyKey: "must-not-cross" });
+        if (index === 6) throw Object.assign(new Error("unknown conflict code"), { name: "FabricIdempotencyKeyReusedError", code: "HOST_SECRET", retryable: false, idempotencyKey: "must-not-cross" });
+        if (index === 7) throw { name: "FabricIdempotencyKeyReusedError", code: "FABRIC_IDEMPOTENCY_KEY_REUSED", retryable: false, idempotencyKey: "must-not-cross", secret: "not-guest-data" };
         throw { name: "FabricProjectLeadInvalidError", code: "FABRIC_PROJECT_LEAD_INVALID", retryable: true, secret: "not-guest-data" };
       }, options,
     );
     expect(result.error).toBeUndefined();
-    expect(result.value).toEqual([{ name: "RangeError" }, { name: "Error" }, { name: "Error" }]);
+    expect(result.value).toEqual([{ name: "RangeError" }, { name: "Error" }, { name: "Error" },
+      { name: "RangeError" }, { name: "FabricRelayDestinationUnavailableError" },
+      { name: "RangeError" }, { name: "FabricIdempotencyKeyReusedError" }, { name: "Error" }]);
   });
 
   it.each(["bash", "powershell"])("keeps vetted Fabric fields and %s exit metadata together", async (tool) => {

@@ -280,10 +280,13 @@ describe("durable explicit-stop recovery", () => {
         fs.writeFileSync(argument("--status-file"), JSON.stringify({
           id: argument("--id"), actorId, name: argument("--name"), task: "retry gap", status: "failed",
           runner: "pi", transport: "process", cwd: argument("--cwd"), startedAt: Date.now(), updatedAt: Date.now(),
-          sessionId: "2147483000", error: "Agent transport exited without a result", turns: 0, toolCalls: 0,
+          sessionId: String(replacementPid), error: "Agent transport exited without a result", turns: 0, toolCalls: 0,
           text: "", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
         }));
-        return { kind: "process", sessionId: "2147483000", isAlive: async () => false,
+        // Main forbids retry once host identity proves an actor worker gone. A live
+        // identity plus a transport failure is the counterexample that may still retry.
+        // All transport stops below are mocked: this parent PID is never signaled.
+        return { kind: "process", sessionId: String(replacementPid), isAlive: async () => false,
           closed: Promise.resolve(), stop: async () => {} } as Awaited<ReturnType<ProcessTransport["launch"]>>;
       }
       enteredLaunch();
@@ -342,6 +345,9 @@ describe("durable explicit-stop recovery", () => {
       expect(launch).toHaveBeenCalledTimes(2);
       releaseStop();
       expect(await stopping).toMatchObject({ status: "stopped", finishedAt: result.finishedAt });
+      expect(JSON.parse(fs.readFileSync(statusFile, "utf8"))).toMatchObject({
+        id: handle.id, status: "stopped", stopIntent: { reason: "explicit" }, sessionId: String(replacementPid),
+      });
       // The original owner has now discharged archive intent. A fresh owner must
       // retain the replacement's exact identity from the terminal status snapshot.
       const third = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents }, {

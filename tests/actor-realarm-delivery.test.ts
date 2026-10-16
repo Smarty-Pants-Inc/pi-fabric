@@ -136,7 +136,7 @@ const installStopRecovery = (s: ReturnType<typeof setup>, reason: "explicit" | "
     // context at this boundary, using the actual host-authored activation ID, not a result.
     const quotedId = /^  "id": ("(?:[^"\\]|\\.)*")$/m.exec(request.task)?.[1];
     const activationId = request.activationId ?? (quotedId ? JSON.parse(quotedId) as string : undefined);
-    expect(activationId).toBeDefined();
+    if (!activationId) throw new Error("Host-authored activation ID is missing");
     args[0] = { ...request, activationId };
     birth = "1";
     const id = (directories.length + 1).toString(16).padStart(32, "0");

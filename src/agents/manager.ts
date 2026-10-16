@@ -5503,6 +5503,8 @@ export class AgentManager {
 
   /** A leader's death forbids replay, but never substitutes for the whole native/tree join. */
   async #settleGoneActorWorker(managed: ManagedAgent, record: AgentRunRecord | undefined): Promise<boolean> {
+    // An intentional stop owns its verdict even when host identity also proves death.
+    if (readRunStopIntent(managed.runDirectory) !== undefined) return false;
     if ((managed.stopRequested && managed.workerGone !== managed.transport) || !this.#actorWorkerGone(managed)) return false;
     // Preserve genuine terminal results; only missing/recoverable transport outcomes become loss.
     // Like #retryStartup, a window refusal outranks incidental auth/transport diagnostics.
@@ -5603,6 +5605,8 @@ export class AgentManager {
         if (await this.#resumeStopped(managed, record, deadline)) continue;
         // A relaunch that failed is terminal: no fallback launch may run after it.
         if (!managed.relaunchFailure && await this.#retryStartup(managed, record, deadline)) continue;
+        // A stop can cancel an already-launched retry: never publish its predecessor's stale record.
+        if (managed.transport !== watchedTransport) continue;
         if (await this.#settleGoneActorWorker(managed, record)) {
           if (managed.settled) return;
           await delay(AGENT_STATUS_POLL_INTERVAL_MS);
@@ -5728,6 +5732,7 @@ export class AgentManager {
               managed.lastRetriedTransportFailure = failed;
               continue;
             }
+            if (managed.transport !== watchedTransport) continue;
             await this.#noteUnconfirmedExit(managed);
             const settled = (managed.relaunchFailure ?? failed) as AgentRunResult;
             writeRecord(managed.statusFile, settled);

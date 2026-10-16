@@ -761,6 +761,8 @@ export class FabricControlPlane {
   #natsActiveLanes = 0;
   #natsSession: AbortController | undefined;
   #natsInbox: Promise<void> | undefined;
+  #natsInboxRetryTimer: NodeJS.Timeout | undefined;
+  #natsInboxRetryDelayMs = 1_000;
   #natsWorkingTimer: NodeJS.Timeout | undefined;
   #natsCleanupTimer: NodeJS.Timeout | undefined;
   #natsCleanupAt = Infinity;
@@ -1537,6 +1539,8 @@ export class FabricControlPlane {
     this.#paused = true;
     if (this.#transport.kind === "nats") {
       this.#stopNatsInbox(undefined, typeof _strict === "boolean" ? undefined : _strict);
+      clearTimeout(this.#natsInboxRetryTimer);
+      this.#natsInboxRetryTimer = undefined;
       clearTimeout(this.#natsCleanupTimer);
       this.#natsCleanupTimer = undefined;
       clearTimeout(this.#natsOutcomeRetryTimer);
@@ -2212,11 +2216,21 @@ export class FabricControlPlane {
   #natsSessionLive(session: AbortController): boolean {
     if (session.signal.aborted || this.#natsSession !== session || this.#closed || this.#paused || !this.options.enabled) return false;
     try {
-      if (this.options.canConsumeMesh?.() !== false && this.options.participants!.leaseLive()) return true;
-    } catch { /* An unavailable lease cannot authorize consumption. */ }
-    // E11: composition normally calls pause(reason) at the exact lease cutoff.
-    // This local check is a second fence, never authority to reacquire or auto-resume.
-    this.pause(new MeshConsumptionPausedError());
+      if (!this.options.participants!.leaseLive()) {
+        // E11: actual lease loss is latched, never a retry or auto-resume.
+        this.pause(new MeshConsumptionPausedError());
+        return false;
+      }
+      if (this.options.canConsumeMesh?.() !== false) return true;
+    } catch {
+      // Unknown gate/lease errors cannot authorize consumption or retry.
+      this.pause(new MeshConsumptionPausedError());
+      return false;
+    }
+    // Watch reset/readiness is an admission hold, not loss of the live lease.
+    // Abort this iterator without clearing any explicit pause or bypassing gates.
+    this.#stopNatsInbox(session);
+    this.#bindNatsInbox(true);
     return false;
   }
 
@@ -2247,13 +2261,27 @@ export class FabricControlPlane {
     this.#scheduleNatsSeenCleanup();
   }
 
-  #bindNatsInbox(): void {
-    if (this.#natsInbox || this.#closed || this.#paused || !this.#started) return;
+  #bindNatsInbox(retry = false): void {
+    if (this.#closed || this.#paused || !this.#started || !this.options.enabled) return;
+    if (retry) {
+      if (this.#natsInboxRetryTimer) return;
+      // B exposes no public reopen event. A failed entry/iteration or live
+      // readiness hold alone arms one bounded one-shot; healthy idle never polls.
+      this.#natsInboxRetryTimer = setTimeout(() => {
+        this.#natsInboxRetryTimer = undefined;
+        this.#bindNatsInbox();
+      }, this.#natsInboxRetryDelayMs);
+      this.#natsInboxRetryTimer.unref();
+      this.#natsInboxRetryDelayMs = Math.min(30_000, this.#natsInboxRetryDelayMs * 2);
+      return;
+    }
+    if (this.#natsInbox || this.#natsInboxRetryTimer) return;
     if (this.#natsOutcomes.size) { this.#scheduleNatsOutcomeRetry(); return; }
     try {
-      if (this.options.canConsumeMesh?.() === false || !this.options.participants!.leaseLive()) {
+      if (!this.options.participants!.leaseLive()) {
         this.pause(new MeshConsumptionPausedError()); return;
       }
+      if (this.options.canConsumeMesh?.() === false) { this.#bindNatsInbox(true); return; }
     } catch (error) { this.pause(error); return; }
     const session = new AbortController();
     this.#natsSession = session;
@@ -2262,17 +2290,28 @@ export class FabricControlPlane {
         // A resumed iterator shares the bound with any still-settling old-session work.
         await this.#waitNatsCapacity(session);
         if (!this.#natsSessionLive(session)) return;
-        for await (const delivery of this.#transport.inbox(session.signal)) {
-          if (!this.#natsSessionLive(session)) break; // leave even this just-yielded delivery unacked
-          const receipt: NatsControlReceipt = { delivery, session, workingUntil: Infinity };
-          this.#natsReceipts.add(receipt);
-          this.#trackNatsWork(this.#receiveNats(receipt));
-          await this.#waitNatsCapacity(session);
-        }
+        const inbox = this.#transport.inbox(session.signal)[Symbol.asyncIterator]();
+        try {
+          for (;;) {
+            const next = await inbox.next();
+            if (next.done) return; // normal termination is not retryable
+            if (!this.#natsSessionLive(session)) return; // leave this delivery unacked
+            this.#natsInboxRetryDelayMs = 1_000;
+            const receipt: NatsControlReceipt = { delivery: next.value, session, workingUntil: Infinity };
+            this.#natsReceipts.add(receipt);
+            this.#trackNatsWork(this.#receiveNats(receipt));
+            await this.#waitNatsCapacity(session);
+          }
+        } finally { await inbox.return?.(); } // join before opening another iterator
       } catch (error) {
         if (!session.signal.aborted) {
           try { console.warn(`[pi-fabric] NATS control inbox stopped: ${error instanceof Error ? error.message : String(error)}`); } catch {}
-          this.pause(error);
+          if (isObject(error) && error.code === "FABRIC_TRANSPORT_UNAVAILABLE") {
+            if (this.#natsSessionLive(session)) {
+              this.#stopNatsInbox(session);
+              this.#bindNatsInbox(true);
+            }
+          } else this.pause(error);
         }
       } finally {
         if (!session.signal.aborted) this.pause(new TransportUnavailableError("NATS control inbox ended"));
@@ -2754,6 +2793,7 @@ export class FabricControlPlane {
 
   async #closeNats(): Promise<void> {
     this.#closed = true; this.#started = false;
+    clearTimeout(this.#natsInboxRetryTimer); this.#natsInboxRetryTimer = undefined;
     for (const cancel of this.#resendWaits) cancel();
     clearInterval(this.#natsWorkingTimer); this.#natsWorkingTimer = undefined;
     clearTimeout(this.#natsCleanupTimer); this.#natsCleanupTimer = undefined;

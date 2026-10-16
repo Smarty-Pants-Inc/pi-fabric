@@ -41,6 +41,12 @@ describe.sequential("NATS transport policy and TLS configuration", () => {
   });
   it.each(["allowInsecureLoopback", "verifyMachine"])("never exposes the direct-fixture bypass %s in config", field => refuses({ ...nats(), [field]: false }, field));
   it.each([{ rejectUnauthorized: false }, { checkServerIdentity: "override" }, { servername: "other" }, {}, { caFile: "" }])("refuses unsafe or empty TLS options %j", tls => refuses({ ...nats(), tls }, "tls"));
+  it("typed-refuses a relative CA file even when an inline CA is present", () => {
+    refuses({ ...nats(), tls: { caFile: "certs/ca.pem" } }, "tls");
+    refuses({ ...nats(), tls: { ca: "fixture PEM", caFile: "certs/ca.pem" } }, "tls");
+    expect(() => normalizeFabricConfig(config({ ...nats(), tls: { caFile: "certs/ca.pem" } })))
+      .toThrow("caFile must be an absolute path");
+  });
   it("accepts explicit inline CA, file CA, or both without credential/CA I/O", () => {
     for (const tls of [{ ca: "fixture PEM" }, { caFile: "/not-read/ca.pem" }, { ca: "fixture PEM", caFile: "/not-read/ca.pem" }])
       expect(normalizeFabricConfig(config({ ...nats(), tls })).mesh.nats.tls).toEqual(tls);

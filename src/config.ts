@@ -630,6 +630,9 @@ const meshNatsTls = (value: unknown): NonNullable<FabricMeshNatsConfig["tls"]> =
     if (typeof entry !== "string" || !entry.trim()) {
       throw new FabricMeshNatsConfigError("tls", "ca and caFile must be nonempty strings");
     }
+    if (key === "caFile" && !path.isAbsolute(entry)) {
+      throw new FabricMeshNatsConfigError("tls", "caFile must be an absolute path");
+    }
     tls[key] = entry;
   }
   if (tls.ca === undefined && tls.caFile === undefined) {

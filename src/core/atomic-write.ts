@@ -740,11 +740,18 @@ export const isMeshSnapshotRetriesExhausted = (error: unknown): error is Error &
   error instanceof Error && "code" in error && error.code === MESH_SNAPSHOT_RETRIES_EXHAUSTED_CODE;
 
 /** A failed acquisition wrote nothing. Foreground callers must see this error, not a retry. */
+/** smarty-dev#10072: a gap between attempts this long means the waiter itself was not running (event-loop or paging stall). */
+export const MESH_LOCK_STALLED_GAP_MS = 1_000;
+
 export class MeshLockTimeoutError extends Error {
   readonly code = MESH_LOCK_TIMEOUT_CODE;
+  /** smarty-dev#10072: the waiter stalled (largest gap >= 1 s), so this timeout may not be contention; meters count it apart. */
+  readonly stalled: boolean;
   constructor(readonly holder: string, readonly attempts: number, readonly maxGapMs: number) {
-    super(`${MESH_LOCK_TIMEOUT_CODE}: Timed out waiting for the Fabric mesh lock${holder} after ${attempts} attempts, largest gap between attempts ${maxGapMs} ms`);
+    const stalled = maxGapMs >= MESH_LOCK_STALLED_GAP_MS;
+    super(`${MESH_LOCK_TIMEOUT_CODE}: Timed out waiting for the Fabric mesh lock${holder} after ${attempts} attempts, largest gap between attempts ${maxGapMs} ms${stalled ? `, waiter stalled ${maxGapMs} ms` : ""}`);
     this.name = "MeshLockTimeoutError";
+    this.stalled = stalled;
   }
 }
 

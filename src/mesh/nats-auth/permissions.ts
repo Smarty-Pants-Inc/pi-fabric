@@ -254,7 +254,7 @@ export function roleTemplateWithPathB(role: NatsRole, input: RoleStreams, machin
   if (role === "agent") {
     const path = pathBRuntime(PATH_B_MACHINE_TAG, machines);
     return {
-      pub: { allow: path.pub.allow, deny: pathBUnique([...base.pub.deny, ...path.pub.deny]) },
+      pub: { allow: pathBUnique([...base.pub.allow, ...path.pub.allow]), deny: pathBUnique([...base.pub.deny, ...path.pub.deny]) },
       sub: { allow: path.sub.allow },
     };
   }

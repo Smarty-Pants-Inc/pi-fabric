@@ -45,7 +45,7 @@ const fixture = () => {
 // (especially malformed inventory and reserved identities) without issuing invalid live grants.
 // CLI-to-real-broker coverage separately proves that valid minted files actually enforce it.
 describe("Path B opt-in mint policy", () => {
-  it("binds the machine tag and standalone runtime template without changing legacy templates", () => {
+  it("binds the machine tag and adds runtime grants while keeping legacy state and snapshot grants", () => {
     const { account, common } = fixture();
     const input = {
       ...common,
@@ -65,7 +65,10 @@ describe("Path B opt-in mint policy", () => {
     const accountClaims = claims(common.accountJwt);
     const agent = accountClaims.nats.signing_keys.find((entry: any) => entry.role === "agent");
     expect(agent.template.pub.allow).toContain("fabric.in.*.*.*.*.{{tag(machine)}}");
-    expect(agent.template.pub.allow).not.toContain("FABRIC_MESH_{{tag(mesh)}}.state");
+    expect(agent.template.pub.allow).toContain("FABRIC_MESH_{{tag(mesh)}}.state");
+    expect(agent.template.pub.allow).toContain("FABRIC_MESH_{{tag(mesh)}}.snapshot");
+    for (const subject of roleTemplate("agent", streams).pub.allow) expect(agent.template.pub.allow).toContain(subject);
+    for (const subject of roleTemplate("agent", streams).pub.deny) expect(agent.template.pub.deny).toContain(subject);
     expect(agent.description).toMatch(/^path-b\/[a-f0-9]{64}$/);
     expect(() => mintNatsUser({ ...input, host: "ryzen5" }, clock)).toThrow();
     expect(() => mintNatsUser({ ...input, pathBMachines: ["ryzen2", "ryzen5"] }, clock)).toThrow();

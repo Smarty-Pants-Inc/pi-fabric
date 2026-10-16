@@ -31,6 +31,61 @@ export const lockStats = createLockStats();
 export const lockEvents = createLockEvents();
 const timed = lockStats !== undefined || lockEvents !== undefined;
 
+/** Leave a small execution-budget margin for the guest to catch a typed lock refusal. */
+const MESH_INVOCATION_DEADLINE_MARGIN_MS = 5;
+
+interface MeshInvocationContext {
+  readonly signal?: AbortSignal;
+  /** Live epoch deadline: host-call floors and human waits may move it. */
+  readonly deadlineAt: () => number;
+  /** Failed, cancelled, or expired dispatches cannot leave escaped writers. */
+  closed: boolean;
+  /** Successful dispatches preserve ordinary detached handles and refresh timers. */
+  detached: boolean;
+  readonly expired: boolean;
+}
+
+const meshInvocationStorage = new AsyncLocalStorage<MeshInvocationContext>();
+
+export const withMeshInvocationContext = async <T>(
+  context: Omit<MeshInvocationContext, "closed" | "detached" | "expired">,
+  operation: () => T | Promise<T>,
+  // Dispatchers can require canonical success even when a failed call resolves.
+  confirmSuccess: () => boolean = () => true,
+): Promise<T> => {
+  // A successful detached handle must not keep the caller's eventual runtime
+  // abort attached to mesh work that was already waiting when the handle returned.
+  const lifetime = context.signal ? new AbortController() : undefined;
+  const scope: MeshInvocationContext = {
+    ...context,
+    ...(lifetime ? { signal: lifetime.signal } : {}),
+    closed: false,
+    detached: false,
+    get expired(): boolean {
+      return this.closed || (!this.detached && (this.signal?.aborted === true || this.deadlineAt() <= Date.now()));
+    },
+  };
+  const onAbort = (): void => { if (!scope.detached) lifetime?.abort(context.signal?.reason); };
+  if (context.signal?.aborted) onAbort();
+  else context.signal?.addEventListener("abort", onAbort, { once: true });
+  return meshInvocationStorage.run(scope, async () => {
+    try {
+      const value = await operation();
+      // Confirmed detached work outlives its caller; only unsuccessful dispatches
+      // permanently close the inherited scope. A sibling never shares this object.
+      if (scope.expired || !confirmSuccess()) scope.closed = true;
+      else scope.detached = true;
+      return value;
+    } catch (error) {
+      scope.closed = true;
+      throw error;
+    } finally {
+      context.signal?.removeEventListener("abort", onAbort);
+      if (!scope.detached) scope.closed = true;
+    }
+  });
+};
+
 /** The pid a `.lock` owner record names (its second line), when readable. */
 export const lockOwnerPid = (ownerPath: string): number | undefined => {
   try {

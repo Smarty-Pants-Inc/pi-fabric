@@ -6300,6 +6300,7 @@ export class AgentManager {
         exitCode: managed.finalAnswerResult.exitCode,
       } : {}),
       ...managed.runRoute,
+      ...(managed.lostContact ? { lostContact: managed.lostContact } : {}),
       ...(includeSaveFailure && managed.settlementSaveFailure
         ? { warnings: [...(record.warnings ?? []), managed.settlementSaveFailure.warning] }
         : {}),

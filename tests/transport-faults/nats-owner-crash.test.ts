@@ -11,13 +11,13 @@ import { describe, expect, it } from "vitest";
 import { DEFAULT_FABRIC_CONFIG } from "../../src/config.js";
 import { MeshStore } from "../../src/mesh/store.js";
 import { controlBodyFingerprint } from "../../src/mesh/control-idempotency.js";
-import { FabricControlPlane, type FabricControlCommand, type FabricControlAcceptance, type FabricControlResult } from "../../src/topology/control-plane.js";
+import { FabricControlPlane, type FabricControlCommand, type FabricControlAcceptance, type FabricControlResult, type FabricControlRequestOptions } from "../../src/topology/control-plane.js";
 import { openFabricTransport } from "../../src/transport/index.js";
 import { openNatsConnection } from "../../src/transport/nats/connection.js";
 import { openNatsKvForMachine } from "../../src/transport/nats/kv.js";
 import { ensureTransportStream } from "../../src/transport/nats/provision.js";
 import { ADVISORY_CAPTURE_STREAM, transportAdvisoryStreamSubject, transportDurableName, transportInboxStream, transportInboxStreamSubject } from "../../src/transport/nats/subjects.js";
-import type { FabricTransport, TransportSent } from "../../src/transport/types.js";
+import type { FabricTransport, TransportDelivery, TransportEnvelope, TransportSent } from "../../src/transport/types.js";
 import { createPathBHarness, resolveNatsBinary, type PathBHarness } from "../helpers/nats-cluster.js";
 import { same } from "../helpers/owned-processes.js";
 import { OwnedNatsOwner, knownParticipants } from "./control-fixtures/nats-owner.js";
@@ -32,6 +32,26 @@ type Seen = { commandId: string; hostId: string; targetId: string; bodyDigest: s
 type Item = { id: string; deliveryId: string; message: string; handed?: true; inboxEventId?: string };
 type Observation = { type: string; commandId: string; pid: number };
 type Settlement = { ok: true; value: FabricControlResult } | { ok: false; error: unknown };
+type Incoming = Pick<TransportDelivery<TransportEnvelope>, "sourceMachine" | "verification" | "sequence" | "attempt" | "payload">;
+// Real delivery/ACK and PubAck events drive these waits; the timer is failure-only.
+function receiptLog<T>(label: string) {
+  const items: T[] = [], waiters = new Set<(item: T) => void>();
+  return {
+    items,
+    push(item: T) { items.push(item); for (const waiter of [...waiters]) waiter(item); },
+    async receipt(predicate: (item: T) => boolean): Promise<T> {
+      const previous = items.find(predicate);
+      if (previous !== undefined) return previous;
+      let waiter: ((item: T) => void) | undefined;
+      try {
+        return await bounded(new Promise<T>(resolve => {
+          waiter = item => { if (predicate(item)) resolve(item); };
+          waiters.add(waiter);
+        }), label, 20_000);
+      } finally { if (waiter) waiters.delete(waiter); }
+    },
+  };
+}
 function track(request: Promise<FabricControlResult>) {
   const observation = { settlements: 0 };
   const result = request.then((value): Settlement => { observation.settlements++; return { ok: true, value }; },
@@ -62,7 +82,9 @@ async function fixture() {
   const meshes: MeshStore[] = [];
   let carrier: FabricTransport | undefined, sender: FabricControlPlane | undefined;
   const commands: TransportSent[] = [];
-  const incoming: Array<{ sourceMachine: string; body: unknown }> = [];
+  const incoming: Incoming[] = [];
+  const senderAcks = receiptLog<Incoming>("actual sender delivery.ack returned");
+  const cancellationSends = receiptLog<TransportSent>("actual cancellation PubAck returned");
   let ownerEpoch = "not-ready";
   let release!: () => void;
   const intakeGate = new Promise<void>(resolve => { release = resolve; });
@@ -124,16 +146,22 @@ async function fixture() {
       send: async (envelope, signal) => {
         const sent = await real.send(envelope, signal);
         if (envelope.kind === "command" && envelope.operation === "followUp") commands.push(sent);
+        if (envelope.kind === "command" && envelope.operation === "cancel") cancellationSends.push(sent);
         return sent;
       },
       inbox: async function* (signal) {
         for await (const delivery of real.inbox(signal)) {
-          incoming.push({ sourceMachine: delivery.sourceMachine, body: delivery.payload.body });
+          const receipt: Incoming = { sourceMachine: delivery.sourceMachine, verification: delivery.verification,
+            sequence: delivery.sequence, attempt: delivery.attempt, payload: delivery.payload };
+          incoming.push(receipt);
           // A receive scheduling gate, NOT sender.pause(): NATS pause would refuse sends.
           // This holds the real ACK before CP settlement; it neither forges nor consumes it.
           await intakeGate;
           if (signal.aborted) break;
-          yield delivery;
+          yield { ...delivery, ack: async () => {
+            await delivery.ack(); // Delegate the ORIGINAL real broker double-ACK before emitting a receipt.
+            senderAcks.push(receipt);
+          } };
         }
       },
       kv: bucket => real.kv(bucket), drainState: signal => real.drainState(signal), close: () => real.close(),
@@ -148,13 +176,16 @@ async function fixture() {
     sender.start(() => { throw new Error("Sender is not a native recipient"); });
     return {
       server, root, paths, commands, incoming, release, close,
+      senderAck: (eventId: string) => senderAcks.receipt(item => item.payload.id === `ack:${eventId}`),
+      cancellation: (id: string) => cancellationSends.receipt(item => command(item).cancelCommandId === id),
+      cancellations: cancellationSends.items,
       launch: (boundary?: CrashBoundary) => {
         const child = new OwnedNatsOwner(repository, root, children.length, server.serverUrl, server.users.machineB.credsPath, boundary);
         children.push(child); return child;
       },
       epoch: (value: unknown) => { ownerEpoch = String(value); },
-      request: (key: string, incarnation: string) => sender!.request(OWNER_HOST_ID, TARGET_ID, "followUp",
-        { ownerIncarnation: incarnation, message: "retain this real Main followUp" }, OWNER_HOST_ID, { idempotencyKey: key }),
+      request: (key: string, incarnation: string, options: Pick<FabricControlRequestOptions, "signal" | "timeoutMs"> = {}) => sender!.request(OWNER_HOST_ID, TARGET_ID, "followUp",
+        { ownerIncarnation: incarnation, message: "retain this real Main followUp" }, OWNER_HOST_ID, { ...options, idempotencyKey: key }),
       record: (id: string): Seen | undefined => seen.get(seenKey(id), { fresh: true })?.value as Seen | undefined,
       journal: (): Item[] => fs.existsSync(paths.journal)
         ? (JSON.parse(fs.readFileSync(paths.journal, "utf8")) as { items: Item[] }).items : [],
@@ -178,7 +209,116 @@ function noConsumption(f: Awaited<ReturnType<typeof fixture>>) {
 }
 
 // No broad missing-source/integration skip: only absent optional server and POSIX prerequisite.
-describe.skipIf(process.platform === "win32")("native NATS owner OS death / frozen T-B2a,b,c", () => {
+describe.skipIf(process.platform === "win32")("native NATS owner OS death / T-B2a,b,c + E24", () => {
+  it.skipIf(!binary && !required)("E24 stored successful outcome settles a new CURRENT-epoch public same-key caller after OS death", async () => {
+    if (!binary) throw new Error("NATS_AUTH_REQUIRED=1: missing nats-server; set absolute NATS_BIN");
+    const f = await fixture();
+    try {
+      const first = f.launch();
+      const ready = await first.receipt(message => message.type === "ready");
+      expect(ready).toMatchObject({ pid: first.child.pid, ownerHostId: OWNER_HOST_ID, meshRoot: f.paths.mesh,
+        journal: f.paths.journal, carrier: "nats", machine: "machine-b", nativeConsumption: false });
+      f.epoch(ready.incarnation);
+      f.release();
+      const original = track(f.request("e24-stored-success", String(ready.incarnation)));
+      const result = accepted(await original.settled);
+      expect(f.commands).toHaveLength(1);
+      const sent = f.commands[0]!, body = command(sent), id = body.commandId;
+      expect(sent.id).not.toBe(id);
+      expect(sent.duplicate).toBe(false);
+      expect(body).toMatchObject({ ownerIncarnation: ready.incarnation, targetId: TARGET_ID, operation: "followUp" });
+      const initialDelivery = await first.receipt(message => message.type === "delivery" && message.commandId === id);
+      expect(initialDelivery).toMatchObject({ sourceMachine: "machine-a", verification: "bridge", attempt: 1,
+        sequence: sent.sequence, payload: sent.envelope });
+      const initialFinal = await first.receipt(message => message.type === "final-ack" && message.commandId === id);
+      expect(initialFinal.drain).toEqual({ pending: 0, ackPending: 0 });
+      expect((await f.senderAck(sent.id)).payload.body).toMatchObject({ ownerIncarnation: ready.incarnation,
+        accepted: true, messageId: result.messageId });
+      const stored = f.record(id)!;
+      expect(stored).toMatchObject({ carrier: "nats", commandId: id, hostId: OWNER_HOST_ID, targetId: TARGET_ID,
+        ownerIncarnation: ready.incarnation, bodyDigest: controlBodyFingerprint(body, sent.envelope.principal),
+        acceptance: { accepted: true, messageId: result.messageId, triggered: false } });
+      expect(stored.writtenAt).toBeGreaterThan(0);
+      const custody = f.journal();
+      expect(custody).toMatchObject([{ id: result.messageId, deliveryId: id, inboxEventId: sent.id }]);
+      expect(custody).toHaveLength(1);
+      expect(f.observations().filter(item => item.type === "handler" && item.commandId === id)).toHaveLength(1);
+      expect(original.observation.settlements).toBe(1);
+      noConsumption(f);
+      const birth = first.ownership();
+      expect(birth.pid).toBe(ready.pid);
+      expect(birth.started).not.toBe("");
+      expect(await first.killAndJoin()).toEqual({ code: null, signal: "SIGKILL" });
+      expect(same(birth)).toBe(false);
+      expect(first.diagnostics()).toBe("");
+      expect(f.record(id)).toEqual(stored);
+      expect(f.journal()).toEqual(custody);
+      const before = await consumerInfo(f.server);
+      expect(before.num_pending).toBe(0);
+      expect(before.num_ack_pending).toBe(0);
+
+      const restarted = f.launch();
+      const resumed = await restarted.receipt(message => message.type === "ready");
+      restarted.ownership();
+      expect(resumed).toMatchObject({ ownerHostId: OWNER_HOST_ID, meshRoot: f.paths.mesh, journal: f.paths.journal });
+      expect(resumed.incarnation).not.toBe(ready.incarnation);
+      f.epoch(resumed.incarnation);
+      // A new public invocation captures CURRENT authority; no raw replay or altered digest.
+      const retry = track(f.request("e24-stored-success", String(resumed.incarnation)));
+      const retryPubAck = await restarted.receipt(message => message.type === "puback" && message.commandId === id);
+      // Counterexample-first: pre-E24 source stamps OLD here and fails, without treating
+      // the pending request's eventual timeout (or any harness deadline) as product proof.
+      expect(retryPubAck.sent).toMatchObject({ duplicate: false, envelope: { body: {
+        commandId: id, ownerIncarnation: resumed.incarnation, originalOwnerIncarnation: ready.incarnation,
+        bodyDigest: stored.bodyDigest, accepted: true, messageId: result.messageId } } });
+      expect(accepted(await retry.settled)).toEqual(result);
+      expect(f.commands).toHaveLength(2);
+      const retrySent = f.commands[1]!;
+      expect(command(retrySent)).toMatchObject({ commandId: id, ownerIncarnation: resumed.incarnation });
+      expect(retrySent.id).not.toBe(sent.id);
+      expect(retrySent.id).not.toBe(id);
+      expect(retrySent.duplicate).toBe(false);
+      expect(controlBodyFingerprint(command(retrySent), retrySent.envelope.principal)).toBe(stored.bodyDigest);
+      expect(retryPubAck.sent).toMatchObject({ id: `ack:${retrySent.id}` });
+      const currentAck = await f.senderAck(retrySent.id);
+      expect(currentAck).toMatchObject({ sourceMachine: "machine-b", verification: "bridge",
+        payload: { from: { id: OWNER_HOST_ID }, body: { ownerIncarnation: resumed.incarnation,
+          originalOwnerIncarnation: ready.incarnation, accepted: true, messageId: result.messageId } } });
+      const retryFinal = await restarted.receipt(message => message.type === "final-ack" && message.commandId === id);
+      expect(retryFinal.drain).toEqual({ pending: 0, ackPending: 0 });
+      expect(f.record(id)).toMatchObject({ ownerIncarnation: ready.incarnation, bodyDigest: stored.bodyDigest,
+        acceptance: stored.acceptance! });
+      expect(f.journal().filter(item => item.deliveryId === id)).toMatchObject([{ id: result.messageId, inboxEventId: sent.id }]);
+      expect(f.journal()).toHaveLength(1);
+      expect(f.observations().filter(item => item.type === "handler" && item.commandId === id)).toHaveLength(1);
+
+      const independent = track(f.request("e24-independent", String(resumed.incarnation)));
+      const fresh = accepted(await independent.settled);
+      expect(f.commands).toHaveLength(3);
+      const freshId = command(f.commands[2]!).commandId;
+      expect(freshId).not.toBe(id);
+      expect(fresh.messageId).not.toBe(result.messageId);
+      const freshFinal = await restarted.receipt(message => message.type === "final-ack" && message.commandId === freshId);
+      expect(freshFinal.drain).toEqual({ pending: 0, ackPending: 0 });
+      expect(f.record(freshId)).toMatchObject({ ownerIncarnation: resumed.incarnation,
+        acceptance: { accepted: true, messageId: fresh.messageId } });
+      expect(f.journal().filter(item => item.deliveryId === freshId)).toMatchObject([{ id: fresh.messageId }]);
+      expect(f.journal()).toHaveLength(2);
+      expect(f.observations().filter(item => item.type === "handler")).toHaveLength(2);
+      const after = await consumerInfo(f.server);
+      expect(after.name).toBe(before.name);
+      expect(after.created).toBe(before.created);
+      expect(after.num_pending).toBe(0);
+      expect(after.num_ack_pending).toBe(0);
+      expect(original.observation.settlements).toBe(1);
+      expect(retry.observation.settlements).toBe(1);
+      expect(independent.observation.settlements).toBe(1);
+      expect(f.cancellations).toHaveLength(0);
+      expect(f.incoming.every(item => item.sourceMachine === "machine-b")).toBe(true);
+      noConsumption(f);
+      expect(restarted.diagnostics()).toBe("");
+    } finally { await f.close(); }
+  }, 180_000);
   it.skipIf(!binary && !required).each([
     ["claim", "T-B2a durable create-only claim before handler"],
     ["custody", "T-B2b actual Main durable custody before outcome"],
@@ -192,7 +332,8 @@ describe.skipIf(process.platform === "win32")("native NATS owner OS death / froz
       expect(ready).toMatchObject({ pid: first.child.pid, ownerHostId: OWNER_HOST_ID, meshRoot: f.paths.mesh,
         journal: f.paths.journal, carrier: "nats", machine: "machine-b", nativeConsumption: false });
       f.epoch(ready.incarnation);
-      const original = track(f.request(`native-${boundary}`, String(ready.incarnation)));
+      const observation = new AbortController();
+      const original = track(f.request(`native-${boundary}`, String(ready.incarnation), { signal: observation.signal }));
       const fence = await first.receipt(message => message.type === "boundary" && message.point === boundary);
       expect(f.commands).toHaveLength(1);
       const sent = f.commands[0]!, body = command(sent), id = body.commandId;
@@ -212,7 +353,8 @@ describe.skipIf(process.platform === "win32")("native NATS owner OS death / froz
       if (boundary === "ack") {
         expect(stored.acceptance).toMatchObject({ accepted: true, messageId: custody[0]!.id });
         expect(fence.sent).toMatchObject({ id: `ack:${sent.id}`, duplicate: false,
-          envelope: { body: { bodyDigest: stored.bodyDigest, accepted: true, messageId: custody[0]!.id } } });
+          envelope: { body: { ownerIncarnation: ready.incarnation,
+            bodyDigest: stored.bodyDigest, accepted: true, messageId: custody[0]!.id } } });
       } else expect(stored.acceptance).toBeUndefined();
       expect(f.observations().filter(item => item.type === "final-ack-call")).toEqual([]);
       expect((await consumerInfo(f.server)).num_ack_pending).toBe(1);
@@ -234,8 +376,8 @@ describe.skipIf(process.platform === "win32")("native NATS owner OS death / froz
       restarted.ownership();
       expect(resumed).toMatchObject({ ownerHostId: OWNER_HOST_ID, meshRoot: f.paths.mesh, journal: f.paths.journal });
       expect(resumed.incarnation).not.toBe(ready.incarnation);
-      // Retain the ORIGINAL request's route/epoch snapshot for its unchanged same-key retry.
-      // This manual view deliberately models retained retry authority, not live directory re-resolution.
+      f.epoch(resumed.incarnation); // All NEW public callers resolve the CURRENT successor.
+      // The already pending original attempt still owns its OLD captured epoch (P6 unchanged).
       // No NAK, raw replay, fabricated claim/outcome or shortened broker policy. Native
       // production ack_wait after SIGKILL produces this retained delivery (same bytes/seq).
       const replay = await restarted.receipt(message => message.type === "delivery" && message.commandId === id);
@@ -244,7 +386,7 @@ describe.skipIf(process.platform === "win32")("native NATS owner OS death / froz
       const replayAck = await restarted.receipt(message => message.type === "puback" && message.commandId === id);
       expect(replayAck.sent).toMatchObject({ id: `ack:${sent.id}`, duplicate: boundary === "ack",
         envelope: { from: { id: OWNER_HOST_ID }, to: { machine: "machine-a", hostId: SENDER_HOST_ID },
-          body: { commandId: id, ownerIncarnation: ready.incarnation, bodyDigest: stored.bodyDigest,
+          body: { commandId: id, ownerIncarnation: resumed.incarnation, originalOwnerIncarnation: ready.incarnation, bodyDigest: stored.bodyDigest,
             ...(boundary === "ack" ? { accepted: true, messageId: custody[0]!.id } : { accepted: false, error: indeterminate }) } } });
       const finalAck = await restarted.receipt(message => message.type === "final-ack" && message.commandId === id);
       expect(finalAck.drain).toEqual({ pending: 0, ackPending: 0 });
@@ -253,38 +395,86 @@ describe.skipIf(process.platform === "win32")("native NATS owner OS death / froz
       expect(rebound.created).toBe(before.created);
       expect(rebound.num_pending).toBe(0);
       expect(rebound.num_ack_pending).toBe(0);
-      f.release(); // Original real sender only settles after exact process death/close + replay.
-      const result = await original.settled;
-      if (boundary === "ack") expect(accepted(result).messageId).toBe(custody[0]!.id);
-      else unknown(result);
+      const replayedRecord = f.record(id)!, replayedJournal = f.journal();
+      expect(replayedRecord.ownerIncarnation).toBe(ready.incarnation); // Stored provenance never migrates.
+      f.release();
+      const delivered = await f.senderAck(sent.id); // P6 has run AND the actual broker double-ACK returned.
+      expect(delivered).toMatchObject({ sourceMachine: "machine-b", verification: "bridge",
+        payload: { id: `ack:${sent.id}`, from: { id: OWNER_HOST_ID },
+          body: { commandId: id, bodyDigest: stored.bodyDigest,
+            ownerIncarnation: boundary === "ack" ? ready.incarnation : resumed.incarnation } } });
+      let originalSuccess: FabricControlResult | undefined;
+      if (boundary === "ack") {
+        // Its OLD ACK was really PubAcked before death; the duplicate replay send cannot
+        // replace those broker bytes. That valid OLD pending attempt may settle normally.
+        originalSuccess = accepted(await original.settled);
+        expect(originalSuccess.messageId).toBe(custody[0]!.id);
+        expect(f.cancellations).toHaveLength(0);
+      } else {
+        expect(delivered.payload.body).toMatchObject({ originalOwnerIncarnation: ready.incarnation,
+          accepted: false, error: indeterminate });
+        expect(original.observation.settlements).toBe(0); // CURRENT replay cannot settle OLD pending.
+        observation.abort(); // End observation explicitly, never wait for the 120 s product timeout.
+        const cancelled = await original.settled;
+        expect(cancelled.ok).toBe(false);
+        if (cancelled.ok) throw new Error("Stale pending must remain outcome unknown on cancellation");
+        expect(cancelled.error).toMatchObject({ message: `Remote Fabric request cancelled: ${TARGET_ID}` });
+        expect(cancelled.error).not.toMatchObject({ notRun: true });
+        expect(cancelled.error).not.toMatchObject({ notDelivered: true });
+        const cancellation = await f.cancellation(id), cancelBody = command(cancellation);
+        expect(cancelBody).toMatchObject({ operation: "cancel", cancelCommandId: id,
+          targetId: TARGET_ID, ownerIncarnation: ready.incarnation });
+        expect(cancelBody.commandId).not.toBe(id);
+        expect(cancellation.id).not.toBe(sent.id);
+        const cancelAck = await restarted.receipt(message => message.type === "final-ack" && message.commandId === cancelBody.commandId);
+        expect(cancelAck.drain).toEqual({ pending: 0, ackPending: 0 });
+        const cancelledDelivery = await f.senderAck(cancellation.id);
+        expect(cancelledDelivery.payload.body).toMatchObject({ accepted: false, notRun: true,
+          errorCode: "FABRIC_CONTROL_STALE_INCARNATION", ownerIncarnation: resumed.incarnation,
+          staleIncarnation: ready.incarnation }); // Refuses the CANCEL, not the original followUp.
+        expect(f.record(cancelBody.commandId)).toBeUndefined(); // Old-epoch cancel cannot create a claim.
+        expect(f.record(id)).toEqual(replayedRecord); // Nor mutate the original claim/outcome.
+        expect(f.journal()).toEqual(replayedJournal);
+        expect(f.observations().filter(item => item.type === "handler" && item.commandId === cancelBody.commandId)).toEqual([]);
+        expect(f.cancellations).toHaveLength(1);
+      }
       expect(original.observation.settlements).toBe(1);
 
-      // PUBLIC unchanged same-key retry: new carrier event, same logical key, stored result.
-      // Exact original input/epoch: a newly resolved epoch would be a changed attempt and
-      // cannot accept an ACK attesting the old epoch (actual A1 sender verifier).
+      // PUBLIC same-key retry: CURRENT directory epoch, unchanged semantic digest, new event.
       const after = restarted.receipts.length;
-      const retry = track(f.request(`native-${boundary}`, String(ready.incarnation)));
+      const retry = track(f.request(`native-${boundary}`, String(resumed.incarnation)));
+      const retryAck = await restarted.receipt(message => message.type === "puback" && message.commandId === id, after);
+      expect(retryAck.sent).toMatchObject({ duplicate: false, envelope: { body: {
+        ownerIncarnation: resumed.incarnation, originalOwnerIncarnation: ready.incarnation, bodyDigest: stored.bodyDigest } } });
       const retried = await retry.settled;
-      if (boundary === "ack") expect(accepted(retried)).toEqual(accepted(result));
+      if (boundary === "ack") expect(accepted(retried)).toEqual(originalSuccess);
       else unknown(retried);
-      await restarted.receipt(message => message.type === "final-ack" && message.commandId === id, after);
+      const retryFinal = await restarted.receipt(message => message.type === "final-ack" && message.commandId === id, after);
+      expect(retryFinal.drain).toEqual({ pending: 0, ackPending: 0 });
       expect(f.commands).toHaveLength(2);
-      expect(command(f.commands[1]!).commandId).toBe(id);
+      expect(command(f.commands[1]!)).toMatchObject({ commandId: id, ownerIncarnation: resumed.incarnation });
       expect(f.commands[1]!.id).not.toBe(sent.id);
+      expect(f.commands[1]!.duplicate).toBe(false);
+      expect(retryAck.sent).toMatchObject({ id: `ack:${f.commands[1]!.id}` });
+      const currentReply = await f.senderAck(f.commands[1]!.id);
+      expect(currentReply).toMatchObject({ sourceMachine: "machine-b", verification: "bridge",
+        payload: { body: { commandId: id, ownerIncarnation: resumed.incarnation,
+          originalOwnerIncarnation: ready.incarnation, bodyDigest: stored.bodyDigest } } });
       expect(controlBodyFingerprint(command(f.commands[1]!), f.commands[1]!.envelope.principal)).toBe(stored.bodyDigest);
       expect(retry.observation.settlements).toBe(1);
       expect(original.observation.settlements).toBe(1);
-      expect(f.record(id)?.acceptance).toMatchObject(boundary === "ack" ? stored.acceptance! : { accepted: false, error: indeterminate });
+      expect(f.record(id)).toMatchObject({ ownerIncarnation: ready.incarnation,
+        acceptance: boundary === "ack" ? stored.acceptance! : { accepted: false, error: indeterminate } });
       expect(f.journal().filter(item => item.deliveryId === id).map(item => item.id)).toEqual(custody.map(item => item.id));
       expect(f.observations().filter(item => item.type === "handler" && item.commandId === id)).toHaveLength(boundary === "claim" ? 0 : 1);
 
-      f.epoch(resumed.incarnation); // Only the independent key resolves the new activation.
       const independent = track(f.request(`native-${boundary}-independent`, String(resumed.incarnation)));
       const fresh = accepted(await independent.settled);
       expect(f.commands).toHaveLength(3);
       const freshId = command(f.commands[2]!).commandId;
       expect(freshId).not.toBe(id);
-      await restarted.receipt(message => message.type === "final-ack" && message.commandId === freshId);
+      const freshFinal = await restarted.receipt(message => message.type === "final-ack" && message.commandId === freshId);
+      expect(freshFinal.drain).toEqual({ pending: 0, ackPending: 0 });
       expect(f.record(freshId)?.acceptance).toMatchObject({ accepted: true, messageId: fresh.messageId });
       expect(f.journal().filter(item => item.deliveryId === freshId)).toMatchObject([{ id: fresh.messageId }]);
       expect(f.journal()).toHaveLength(boundary === "claim" ? 1 : 2);

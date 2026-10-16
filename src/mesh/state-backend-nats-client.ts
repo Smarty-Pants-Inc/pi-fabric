@@ -236,7 +236,8 @@ export const connectJetStream = async (servers: string[], options: ConnectJetStr
       let syncAlways: boolean | undefined;
       if (options.monitoringUrl) {
         const monitoringUrl = options.monitoringUrl;
-        // One unchanged 5s budget for /varz and the optional /jsz fallback, including response bodies (#13112).
+        // One unchanged 5s budget for /varz and /jsz, including response bodies (#13112). Both are always read:
+        // an explicit false from either vetoes.
         const signal = AbortSignal.timeout(5_000);
         let onAbort!: () => void;
         const aborted = new Promise<never>((_, reject) => {
@@ -252,8 +253,7 @@ export const connectJetStream = async (servers: string[], options: ConnectJetStr
         };
         try {
           const varz = await monitor("/varz");
-          syncAlways = selectNatsSyncAlways(varz);
-          if (syncAlways === undefined) syncAlways = selectNatsSyncAlways(varz, await monitor("/jsz?raft=true"));
+          syncAlways = selectNatsSyncAlways(varz, await monitor("/jsz?raft=true"));
         } catch (error) { throw redactNatsError(error); }
         finally { signal.removeEventListener("abort", onAbort); }
       }

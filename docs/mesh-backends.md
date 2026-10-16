@@ -272,8 +272,14 @@ Not tested:
   design, not from the bench.
 
 The default `sync_interval` (2 min) is 30–260x faster, but an acked write then survives only a
-process crash. The nats factory must refuse a server that reports `sync_always: false` in
-`/varz`, unless the operator explicitly accepts that durability.
+process crash. The nats factory reads both `/varz.jetstream.config.sync_always` and
+`/jsz.config.sync_always` from the same server. An explicit `false` in either report means the
+server is not durable, even when the other says `true`. At least one report must be `true` and
+neither may be `false` to report durability; missing in both is unknown. The factory refuses
+non-durable or unknown servers unless the operator explicitly accepts periodic sync. That
+existing opt-in never makes `sync()` report durability. Both monitoring endpoints must return
+valid JSON objects within the same 5 s monitor budget; an unavailable or invalid report fails
+closed, even when the other reports `true`.
 
 ## Network prerequisite for a multi-host cluster
 

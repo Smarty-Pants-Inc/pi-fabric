@@ -57,16 +57,31 @@ describe("NATS adapter monitor sync_always observation (#13112)", () => {
     expect(String(error instanceof Error ? error.message : error)).not.toContain("sync_always");
   });
 
-  it("keeps an explicit /varz false authoritative and never requests /jsz", async () => {
-    serve({ "/varz": json(varzWith(false)), "/jsz?raft=true": json(jszWith(true)) });
+  // Replies are factories: every observe/open gets fresh Responses, never a consumed body.
+  const open = () => openNatsStateBackend({ ...endpoint, root: path.join(os.tmpdir(), "nats-monitor-never-created") })
+    .then(() => undefined, (caught: unknown) => caught);
+  const message = (error: unknown) => String(error instanceof Error ? error.message : error);
+
+  it.each([
+    ["/varz false, /jsz true", false, true],
+    ["/varz true, /jsz false", true, false],
+  ] as const)("reads both sources and any explicit false vetoes: %s", async (_label, varzSync, jszSync) => {
+    serve({ "/varz": () => json(varzWith(varzSync)), "/jsz?raft=true": () => json(jszWith(jszSync)) });
     expect(await observe()).toBe(false);
-    expect(paths()).toEqual(["/varz"]);
+    expect(paths()).toEqual(["/varz", "/jsz?raft=true"]);
+    expect(message(await open())).toMatch(/sync_always \(got false\)/);
   });
 
-  it("keeps an explicit /varz true authoritative and never requests /jsz", async () => {
-    serve({ "/varz": json(varzWith(true)), "/jsz?raft=true": json(jszWith(false)) });
+  it.each([
+    ["/varz true, /jsz true", varzWith(true), jszWith(true)],
+    ["/varz true, /jsz missing", varzWith(true), jszWith(undefined)],
+    ["/varz missing, /jsz true", VARZ_WITHOUT_CONFIG, jszWith(true)],
+  ] as const)("accepts a healthy durable shape after reading both: %s", async (_label, varzBody, jszBody) => {
+    serve({ "/varz": () => json(varzBody), "/jsz?raft=true": () => json(jszBody) });
     expect(await observe()).toBe(true);
-    expect(paths()).toEqual(["/varz"]);
+    expect(paths()).toEqual(["/varz", "/jsz?raft=true"]);
+    // Any later failure (the fake JetStream manager has no streams API) is fine; the sync_always refusal is not.
+    expect(message(await open())).not.toContain("sync_always");
   });
 
   it("reports undefined when both omit the policy, and the open still refuses", async () => {
@@ -90,6 +105,11 @@ describe("NATS adapter monitor sync_always observation (#13112)", () => {
 
   it("rejects a non-OK /jsz fallback instead of reporting an absent policy", async () => {
     serve({ "/varz": json(VARZ_WITHOUT_CONFIG), "/jsz?raft=true": json(jszWith(true), 500) });
+    await expect(observe()).rejects.toThrow(/500/);
+  });
+
+  it("rejects a non-OK /jsz even when /varz reports true", async () => {
+    serve({ "/varz": json(varzWith(true)), "/jsz?raft=true": json(jszWith(true), 500) });
     await expect(observe()).rejects.toThrow(/500/);
   });
 

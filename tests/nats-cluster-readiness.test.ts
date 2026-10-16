@@ -90,8 +90,14 @@ describe("selectNatsSyncAlways (#13112, shared with the product adapter)", () =>
   const varz = (value: unknown) => ({ jetstream: { config: { sync_always: value } } });
   const jsz = (value: unknown) => ({ config: { sync_always: value } });
   it.each([
-    ["varz false wins over jsz true", varz(false), jsz(true), false],
-    ["varz true wins over jsz false", varz(true), jsz(false), true],
+    ["varz false vetoes jsz true", varz(false), jsz(true), false],
+    ["jsz false vetoes varz true", varz(true), jsz(false), false],
+    ["both true is true", varz(true), jsz(true), true],
+    ["varz true with jsz missing is true", varz(true), {}, true],
+    ["varz true with no jsz supplied is true", varz(true), undefined, true],
+    ["varz true with non-boolean jsz is true", varz(true), jsz("false"), true],
+    ["varz false with jsz missing is false", varz(false), {}, false],
+    ["non-boolean varz does not veto jsz true", varz("false"), jsz(true), true],
     ["missing varz config falls back to jsz true", { jetstream: {} }, jsz(true), true],
     ["missing varz config falls back to jsz false", { jetstream: {} }, jsz(false), false],
     ["null varz value falls back", varz(null), jsz(true), true],
@@ -140,7 +146,9 @@ describe("shared NATS cluster readiness gate", () => {
     ["explicit varz false, jsz true", false, true, false],
     ["missing from both", undefined, undefined, false],
     ["null varz value, jsz true", null, true, true],
-    ["explicit varz true, jsz false", true, false, true],
+    ["explicit varz true, jsz false", true, false, false],
+    ["explicit varz true, jsz true", true, true, true],
+    ["explicit varz true, jsz missing", true, undefined, true],
   ] as const)("handles durability config: %s", async (_label, varzSync, jszSync, ready) => {
     const fixtures = baseCluster();
     const baselineFetch = fetchFor(fixtures);
@@ -242,11 +250,34 @@ describe("shared NATS cluster readiness gate", () => {
     expect(error).toContain("NATS cluster not formed");
   });
 
-  it("does not require leader, routes, or jsz for a single node", async () => {
+  it("does not require leader or routes for a single node, but reads jsz sync_always", async () => {
     const single = [{ name: "solo", monitorUrl: "http://solo.test/" }];
     const fixture = [{ name: "solo", id: "solo-id", syncAlways: true, health: { full: "ok", js: "ok" } }];
-    const result = await observe(single, { fetch: fetchFor(fixture), timeoutMs: 100 });
+    const calls: string[] = [];
+    const baseline = fetchFor(fixture);
+    const fetch: typeof globalThis.fetch = async (input, init) => { calls.push(endpoint(input).path); return baseline(input, init); };
+    const result = await observe(single, { fetch, timeoutMs: 100 });
     expect(result.nodes).toHaveLength(1);
     expect(result.metaLeader).toBeUndefined();
+    expect(calls).toContain("/jsz?raft=true");
+    expect(calls).not.toContain("/routez");
+  });
+
+  it.each([
+    ["varz true, jsz false", true, false],
+    ["varz false, jsz true", false, true],
+  ] as const)("refuses a single node whose sync_always sources conflict: %s", async (_label, varzSync, jszSync) => {
+    const single = [{ name: "solo", monitorUrl: "http://solo.test/" }];
+    const fixture = [{ name: "solo", id: "solo-id", syncAlways: varzSync, health: { full: "ok", js: "ok" } }];
+    const baseline = fetchFor(fixture);
+    const fetch: typeof globalThis.fetch = async (input, init) => {
+      const original = await baseline(input, init);
+      if (endpoint(input).path !== "/jsz?raft=true") return original;
+      return response({ ...(await original.json()), config: { sync_always: jszSync } });
+    };
+    let error = "";
+    try { await observe(single, { fetch, timeoutMs: 40 }); }
+    catch (caught) { error = caught instanceof Error ? caught.message : String(caught); }
+    expect(error).toContain("sync_always is not true");
   });
 });

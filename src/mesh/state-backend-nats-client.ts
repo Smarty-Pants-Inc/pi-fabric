@@ -353,9 +353,11 @@ export const connectJetStream = async (servers: string[], options: ConnectJetStr
       return message ? { seq: message.seq, data: message.data, ...(msgID ? { msgID } : {}) } : undefined;
     },
     purge: async (stream, beforeSeq) => { await jsm.streams.purge(stream, { seq: beforeSeq }); },
-    publish: async (subject, data, { expectLastSequence, msgID }) => {
+    publish: async (subject, data, { expectLastSequence, msgID, timeoutMs }) => {
       try {
-        const ack = await js.publish(subject, data, { msgID, expect: { lastSequence: expectLastSequence } });
+        // The backend bounds each attempt (smarty-dev#13112); omitted, the SDK's 5s default.
+        const ack = await js.publish(subject, data, { msgID, expect: { lastSequence: expectLastSequence },
+          ...(timeoutMs === undefined ? {} : { timeout: timeoutMs }) });
         return { seq: ack.seq, duplicate: ack.duplicate };
       } catch (error) {
         if (apiCode(error) === WRONG_LAST_SEQUENCE) throw new NatsWrongLastSequenceError(expectLastSequence, (error as Error).message);

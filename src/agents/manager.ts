@@ -1686,7 +1686,8 @@ export class AgentManager {
 
   async #recordSpawnRouterStart(request: AgentRunRequest, agentId: string, model: string | undefined, thinking: AgentRunRequest["thinking"], sessionFile?: string, managed?: ManagedAgent, admission?: SpawnRouterAdmission): Promise<void> {
     const decisionId = (request as AgentRunRequest & { spawnRouterDecisionId?: unknown }).spawnRouterDecisionId;
-    const meshRoot = this.#meshRoot ?? admission?.mesh.root;
+    // The authenticated admission names the issuer ledger; an inherited env root may belong to another host.
+    const meshRoot = admission?.mesh.root ?? this.#meshRoot;
     if (typeof decisionId !== "string" || !decisionId || !meshRoot) return;
     try {
       const { recordSpawnRouterStart } = await import("./spawn-router.js");
@@ -1706,7 +1707,7 @@ export class AgentManager {
 
   async #recordSpawnRouterStartUnknown(request: AgentRunRequest, admission?: SpawnRouterAdmission): Promise<void> {
     const decisionId = (request as AgentRunRequest & { spawnRouterDecisionId?: unknown }).spawnRouterDecisionId;
-    const meshRoot = this.#meshRoot ?? admission?.mesh.root;
+    const meshRoot = admission?.mesh.root ?? this.#meshRoot;
     if (typeof decisionId !== "string" || !decisionId || !meshRoot) return;
     try {
       const { recordSpawnRouterStartUnknown } = await import("./spawn-router.js");
@@ -1716,7 +1717,7 @@ export class AgentManager {
 
   async #recordSpawnRouterStartFailed(request: AgentRunRequest, admission?: SpawnRouterAdmission): Promise<void> {
     const decisionId = (request as AgentRunRequest & { spawnRouterDecisionId?: unknown }).spawnRouterDecisionId;
-    const meshRoot = this.#meshRoot ?? admission?.mesh.root;
+    const meshRoot = admission?.mesh.root ?? this.#meshRoot;
     if (typeof decisionId !== "string" || !decisionId || !meshRoot) return;
     try {
       const { recordSpawnRouterStartFailed } = await import("./spawn-router.js");

@@ -2038,13 +2038,13 @@ export class AgentsProvider implements FabricProvider {
     // Ordinary child handoffs need no protected caller metadata. The receiving
     // host still requires an authenticated caller for every protected topic,
     // including a request that omitted its required claim.
+    if (!onDispatched && request.slotClaim === undefined) return await client.createActor(request, signal);
     const self = this.participants.self();
     const routerCaller = onDispatched ? { id: self.id, rootId: self.rootId, sessionId: self.sessionId ?? "",
       ownerHostId: self.ownerHostId, ownerIdentityId: self.ownerIdentityId, kind: self.kind } : undefined;
-    if (request.slotClaim === undefined) return await (onDispatched ? client.createActor(request, signal, undefined, onDispatched, routerCaller)
-      : client.createActor(request, signal));
+    if (request.slotClaim === undefined) return await client.createActor(request, signal, undefined, onDispatched, routerCaller);
     const caller = {
-      identity: { ...this.actorManager.identity }, hostId: this.participants.self().ownerHostId,
+      identity: { ...this.actorManager.identity }, hostId: self.ownerHostId,
       ...(invocationFabricPrincipal(context) ? { principal: invocationFabricPrincipal(context) } : {}),
       ...(this.#toolCeiling === undefined ? {} : { toolCeiling: [...this.#toolCeiling] }),
     };

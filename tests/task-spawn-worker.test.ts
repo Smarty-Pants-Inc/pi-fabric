@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { RpcClient } from "@earendil-works/pi-coding-agent";
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
+import { parseFakeOpenAIRequest, probeFakeOpenAIServer } from "./fake-openai-server.js";
 
 // Real dist/worker.js -> installed Pi CLI -> compiled Fabric extension ->
 // actual QuickJS fabric_exec -> actual agents provider. Inference is the only
@@ -35,7 +36,8 @@ describe.skipIf(!installedWorker)("task-agent spawn authority in a real process 
       let body = "";
       request.on("data", chunk => { body += chunk; });
       request.on("end", () => {
-        const payload = JSON.parse(body) as { model: string; messages: unknown[] };
+        const payload = parseFakeOpenAIRequest(body);
+        if (!payload) { response.writeHead(400); response.end("Bad Request"); return; }
         const transcript = JSON.stringify(payload.messages); messages.push({ model: payload.model, transcript });
         const hasToolResult = payload.messages.some(message => (message as { role?: string }).role === "tool");
         const isToolCall = payload.model === "main" && !hasToolResult;
@@ -60,6 +62,8 @@ describe.skipIf(!installedWorker)("task-agent spawn authority in a real process 
     await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve)); servers.push(server);
     const address = server.address();
     if (!address || typeof address === "string") throw new Error("loopback server did not bind TCP");
+    await probeFakeOpenAIServer(address.port);
+    expect(messages).toHaveLength(0);
     fs.writeFileSync(path.join(agentDir, "models.json"), JSON.stringify({ providers: { proof: {
       baseUrl: `http://127.0.0.1:${address.port}/v1`, apiKey: "offline-test", api: "openai-completions",
       models: ["main", "child"].map(id => ({ id, name: id, reasoning: false, input: ["text"], contextWindow: 32000,
@@ -113,7 +117,8 @@ describe.skipIf(!installedWorker)("task-agent spawn authority in a real process 
       let body = "";
       request.on("data", chunk => { body += chunk; });
       request.on("end", () => {
-        const payload = JSON.parse(body) as { model: string; messages: unknown[] };
+        const payload = parseFakeOpenAIRequest(body);
+        if (!payload) { response.writeHead(400); response.end("Bad Request"); return; }
         observed.push(payload.messages);
         requestCount++;
         const delta = requestCount === 1
@@ -132,6 +137,9 @@ describe.skipIf(!installedWorker)("task-agent spawn authority in a real process 
     await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve)); servers.push(server);
     const address = server.address();
     if (!address || typeof address === "string") throw new Error("loopback server did not bind TCP");
+    await probeFakeOpenAIServer(address.port);
+    expect(requestCount).toBe(0);
+    expect(observed).toHaveLength(0);
     const models = JSON.parse(fs.readFileSync(path.join(agentDir, "models.json"), "utf8"));
     models.providers.proof.baseUrl = `http://127.0.0.1:${address.port}/v1`;
     fs.writeFileSync(path.join(agentDir, "models.json"), JSON.stringify(models));

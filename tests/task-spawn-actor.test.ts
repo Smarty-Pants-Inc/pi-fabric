@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { ResidentHost } from "../src/residency/host.js";
 import { RESIDENT_HOST_FORMAT, residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
+import { parseFakeOpenAIRequest, probeFakeOpenAIServer } from "./fake-openai-server.js";
 
 // Keep all run evidence in a retained temp tree. No rm/unlink cleanup: the
 // scoped no-delete guard must never need to intercept this test's cleanup.
@@ -35,7 +36,8 @@ describe.skipIf(!installedRuntime)("real resident actor process task-spawn autho
       let body = "";
       request.on("data", chunk => { body += chunk; });
       request.on("end", () => {
-        const payload = JSON.parse(body) as { model: string; messages: unknown[] };
+        const payload = parseFakeOpenAIRequest(body);
+        if (!payload) { response.writeHead(400); response.end("Bad Request"); return; }
         requests.push(payload);
         const hasToolResult = payload.messages.some(message => (message as { role?: string }).role === "tool");
         const isSpawnTurn = payload.model === "main" && !hasToolResult;
@@ -57,6 +59,8 @@ describe.skipIf(!installedRuntime)("real resident actor process task-spawn autho
     await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve)); servers.push(server);
     const address = server.address();
     if (!address || typeof address === "string") throw new Error("loopback inference server did not bind");
+    await probeFakeOpenAIServer(address.port);
+    expect(requests).toHaveLength(0);
     fs.writeFileSync(path.join(profile, "models.json"), JSON.stringify({ providers: { proof: {
       baseUrl: `http://127.0.0.1:${address.port}/v1`, apiKey: "offline-test", api: "openai-completions",
       models: ["main", "child"].map(id => ({ id, name: id, reasoning: false, input: ["text"], contextWindow: 32000,

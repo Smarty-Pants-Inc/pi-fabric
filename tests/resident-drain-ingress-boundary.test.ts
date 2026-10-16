@@ -76,7 +76,7 @@ describe("resident control admission versus accepted receipt custody", () => {
     vi.spyOn(MeshStore.prototype, "writeBatch").mockImplementation(async function(this: MeshStore, input) {
       const shared = this.root === mesh.root;
       const local = this.root.startsWith(path.join(mesh.root, "control-seen"));
-      const match = input.prepare && !suspended && ((stage !== "after-local" && shared) || (stage === "after-local" && local));
+      const match = input.beforeCommit && !suspended && ((stage !== "after-local" && shared) || (stage === "after-local" && local));
       if (!match) return write.call(this, input);
       suspended = true;
       if (stage === "shared-lock") {
@@ -248,7 +248,7 @@ describe("resident control admission versus accepted receipt custody", () => {
     let suspended = false;
     vi.spyOn(MeshStore.prototype, "writeBatch").mockImplementation(async function(this: MeshStore, input) {
       const committed = await write.call(this, input);
-      if (!suspended && input.prepare && this.root.startsWith(path.join(mesh.root, "control-seen"))) {
+      if (!suspended && input.beforeCommit && this.root.startsWith(path.join(mesh.root, "control-seen"))) {
         suspended = true; reached.resolve(); await release.promise;
       }
       return committed;

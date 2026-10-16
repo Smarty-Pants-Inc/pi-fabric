@@ -315,7 +315,8 @@ export class MeshLock {
     // smarty-dev#9805: only the canonical mesh lock opts into the early free-lock bypass of a stalled head.
     const admission = createMeshLockAdmission(this.root, token, waitMs, { stalledHeadBypassLock: this.#lockPath });
     const { ticket, deadline } = admission;
-    const elapsedDeadline = performance.now() + waitMs;
+    let budgetSpent = false;
+    let budgetTimer: ReturnType<typeof setTimeout> | undefined;
     // The shared admission helper fixes the relative budget only after setup; expiry cannot grant admission.
     try {
       // Attempts and the largest gap between two of them: a large gap means this waiter stalled
@@ -327,6 +328,10 @@ export class MeshLock {
       let waited = false;
       let waitSetupExpired = false;
       const wait = async (ms: number): Promise<void> => {
+        // Arm once, before watch setup, on the same relative timer clock as both wait paths.
+        // Date is lease time (it may jump); performance may be a separate diagnostic clock.
+        // Lazy arming keeps uncontended acquisitions free of another clock read or timer.
+        budgetTimer ??= setTimeout(() => { budgetSpent = true; }, Math.max(0, deadline - Date.now()));
         const pending = ticket.queued
           ? ticket.wait(ms, this.#writeAbortSignal, deadline)
           : delay(ms, this.#writeAbortSignal);
@@ -349,7 +354,7 @@ export class MeshLock {
       while (true) {
         this.#writeAbortSignal?.throwIfAborted();
         if (!ticket.mayContend()) {
-          if (Date.now() < deadline) {
+          if (!budgetSpent && Date.now() < deadline) {
             // Woken when the predecessor's receipt goes; the short poll is only a safety net.
             await wait(Math.min(20, Math.max(0, deadline - Date.now())));
             continue;
@@ -360,8 +365,8 @@ export class MeshLock {
         }
         const attemptAt = Date.now();
         // Both waits can spend the budget in setup or resume late, even on a release signal.
-        // Keep initial/exact-deadline probes; asynchronous waits spend monotonic, not wall time.
-        if (waited && (waitSetupExpired || performance.now() > elapsedDeadline)) {
+        // Keep the initial eligible probe; once we have waited, timer expiry is not admission.
+        if (waited && (waitSetupExpired || budgetSpent)) {
           if (attempts === 0 && ticket.queued) throw admission.expire(this.#lockPath, this.root, "mesh-lock", lockClass);
           throw timeout();
         }
@@ -466,6 +471,7 @@ export class MeshLock {
       }
       throw error;
     } finally {
+      clearTimeout(budgetTimer);
       ticket.close();
       // Recorded after the ticket closes, so bookkeeping never delays a FIFO follower.
       if (holdMs >= 0) {

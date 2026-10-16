@@ -229,27 +229,56 @@ describe("#4383 resident host presence batch", () => {
     }
   }, 10000);
 
-  it("unwinds registry custody when dead participant-key recovery finds a busy mesh", async () => {
+  it.each([false, true])("unwinds registry custody when dead participant-key recovery finds a busy mesh (recorded deletes=%s)", async recorded => {
     const { host, config, records } = await fixture(true);
-    const registry = new ActorRegistryStore(config.actorRoot);
-    await registry.withLock(() => registry.write(registry.records().map(row => row.id === records[0]!.id
-      ? { ...row, name: "changed during dead-key recovery" } : row)));
+    const key = participantKey(records[0]!.id);
+    const before = readParticipantFile(config.meshRoot, key)!;
+    const file = path.join(config.meshRoot, "participants", key.slice("topology/participants/".length) + ".json");
+    // Repair of a missing committed file must acquire this key BEFORE shared
+    // confirmation. A registry-only name edit does not update an owned actor,
+    // and an unchanged heartbeat correctly never visits its participant key.
+    fs.renameSync(file, `${file}.fixture-held`);
     const keyLock = path.join(config.meshRoot, "participants", ".locks", createHash("sha256").update(records[0]!.id).digest("hex"));
+    const deadOwner = "2147483647\n\ndead-key\n";
+    const deletedReceipts: string[] = [];
+    if (recorded) {
+      const remove = fs.rmSync;
+      vi.spyOn(fs, "rmSync").mockImplementation((target, options) => {
+        if (String(target).startsWith(`${keyLock}.`) && String(target).endsWith(".dead")) {
+          deletedReceipts.push(fs.readFileSync(path.join(String(target), "owner"), "utf8"));
+          return; // Record this key's detached deletion; never execute it locally.
+        }
+        remove(target, options);
+      });
+    }
     fs.mkdirSync(keyLock, { recursive: true });
-    fs.writeFileSync(path.join(keyLock, "owner"), "2147483647\n\ndead-key\n");
+    fs.writeFileSync(path.join(keyLock, "owner"), deadOwner);
     const child = spawn(process.execPath, [path.resolve("tests/fixtures/hold-mesh-lock.mjs"), config.meshRoot, "3000"],
       { stdio: ["ignore", "pipe", "inherit"] });
     const exited = new Promise<number | null>((resolve, reject) => { child.once("error", reject); child.once("close", resolve); });
     try {
       await new Promise<void>((resolve, reject) => { child.stdout.once("data", () => resolve()); child.once("error", reject); });
+      const custody = host.mesh.custody.bind(host.mesh);
+      const recovery = vi.spyOn(host.mesh, "custody").mockImplementationOnce((operation, timeout) => {
+        expect(fs.readFileSync(path.join(keyLock, "owner"), "utf8")).toBe(deadOwner);
+        expect(fs.existsSync(path.join(config.actorRoot, "actors.json.lock", "owner"))).toBe(true);
+        expect(host.mesh.tryLockBudgetMs).toBe(50);
+        return custody(operation, timeout);
+      });
       const started = performance.now();
       await expect(host.participants.refresh()).rejects.toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
+      expect(recovery).toHaveBeenCalledOnce(); // it was key recovery, not an earlier shared batch
+      recovery.mockRestore();
       await new ActorRegistryStore(config.actorRoot).withLock(() => undefined);
       expect(performance.now() - started).toBeLessThan(1000);
-      expect(fs.existsSync(keyLock)).toBe(true); // no recovery without mesh custody
+      expect(fs.readFileSync(path.join(keyLock, "owner"), "utf8")).toBe(deadOwner); // no recovery without mesh custody
+      expect(deletedReceipts).toEqual([]);
+      expect(readParticipantFile(config.meshRoot, key)).toBeUndefined();
       expect(await exited).toBe(0);
       await host.participants.refresh();
       expect(fs.existsSync(keyLock)).toBe(false);
+      expect(readParticipantFile(config.meshRoot, key)?.value).toEqual(before.value);
+      if (recorded) expect(deletedReceipts).toContain(deadOwner);
     } finally { await exited; }
   }, 10000);
 

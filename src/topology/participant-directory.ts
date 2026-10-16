@@ -1103,7 +1103,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
     // smarty-dev#8880: while a publication retry is in flight, its admission has just opened a short free
     // mesh window. Preparation and the mesh try go first; the host lease renewal starts once it settles.
     const deferRenewal = this.#publicationRetrying !== undefined;
-    const renewing = !this.options.enabled || deferRenewal || (this.#quiescing && this.#reloadUntil === undefined)
+    // Preparation owns the cancellable wait; an eager zero-wait renewal must not
+    // reject startup (or recovery) before that wait can observe close().
+    const renewing = !this.options.enabled || this.#prepareLeaseLock || deferRenewal || (this.#quiescing && this.#reloadUntil === undefined)
       ? undefined : this.#renewFileLease();
     const join = (publication: Promise<void>): Promise<void> => deferRenewal
       ? publication

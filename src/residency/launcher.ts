@@ -691,6 +691,9 @@ async function superviseResident(configPath: string, options: ResidentSuperviseO
   };
   const recoverIfWedged = async (candidate: Attempt): Promise<void> => {
     const launchConfig = candidate.spec?.config ?? config;
+    // NATS wedge detection is OFF until 'NATS-mode resident watchdog: wedge detection from KV lease evidence'
+    // (smarty-dev issue filed, number pending); FILE lease bytes cannot authorize NATS watchdog custody.
+    if (launchConfig.mesh?.transport === "nats") return;
     const watchdog = launchConfig.watchdog;
     if (!watchdogSupported || watchdog?.enabled === false || candidate.watchdogGivenUp || Date.now() < nextWatchdogAt || candidate.native.exited) return;
     nextWatchdogAt = Date.now() + numberSetting(watchdog?.intervalMs, 30_000, 1);

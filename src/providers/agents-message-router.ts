@@ -13,12 +13,13 @@ import type { MeshIdentity } from "../mesh/store.js";
 import type { FabricInvocationContext } from "../protocol.js";
 import { controlOwnerIncarnation, warnUnfencedControlDelivery, controlActorBindingOptions, FabricControlStaleIncarnationError, type FabricControlPlane, type FabricControlCommand, type FabricControlAcceptance } from "../topology/control-plane.js";
 import type { FabricParticipantInfo, FabricParticipantSource } from "../topology/types.js";
+import type { ParticipantRoute, ParticipantView } from "../topology/participant-view.js";
 import type { FabricAgentRunner } from "../config.js";
 import type { ResidencyClient } from "../residency/client.js";
 import fs from "node:fs";
 import { randomUUID } from "node:crypto";
 import { FabricParticipantStaleError, type MirrorLeaseWaitBudget } from "../topology/host-leases.js";
-import { FabricPeerLeaseStaleError } from "../agents/peer-lease-stale.js";
+import { FabricPeerLeaseStaleError, PEER_LEASE_WAIT_MS } from "../agents/peer-lease-stale.js";
 import path from "node:path";
 import { kernelFenceAvailable } from "../residency/file-lock.js";
 import { processAlive } from "../storage/scratch.js";
@@ -128,8 +129,26 @@ class LeaseResolutionRequired extends Error {
   constructor(readonly targetId: string, readonly original: Error, readonly authority?: FabricParticipantInfo) { super(original.message, { cause: original }); }
 }
 
+/** Private lookup refusal: unlike an ACK failure, this may take one bounded presence wait. */
+class PresenceResolutionRequired extends FabricDirectoryUnavailableError {
+  constructor(readonly targetId: string, readonly original: Error, readonly authority?: ParticipantRoute) {
+    super(original.message, original);
+  }
+}
+
+interface RouterWaitBudget extends MirrorLeaseWaitBudget {
+  presenceAuthority?: { targetId: string; route: ParticipantRoute };
+}
+
+const snapshotRoute = (route: ParticipantRoute): ParticipantRoute => ({ ...route, capabilities: [...route.capabilities] });
+const samePresenceOwner = (left: ParticipantRoute, right: ParticipantRoute): boolean =>
+  left.machine === right.machine && left.ownerHostId === right.ownerHostId &&
+  left.ownerIdentityId === right.ownerIdentityId && left.ownerIncarnation === right.ownerIncarnation;
+
 export class AgentMessageRouter {
   readonly #taskReturnAddress = readTaskReturnAddress();
+  /** Preserve authenticated machine/owner/epoch across asynchronous actor resolution. */
+  readonly #presenceRoutes = new WeakMap<FabricParticipantInfo, ParticipantRoute>();
   #legacyDeliveryCount = 0;
   /** Retained dormant wake routes this router resolved; only they may take the one wake resend. */
   readonly #dormantRoutes = new WeakSet<FabricParticipantInfo>();
@@ -140,12 +159,138 @@ export class AgentMessageRouter {
     readonly participants: Pick<FabricParticipantSource, "get" | "scheduleRefresh" | "writeStalled" | "lastKnown"> & Partial<Pick<FabricParticipantSource, "peers" | "list" | "lineageAlive" | "routingUnavailable" | "refreshRoutingView" | "retainedRouteAllowed">> & {
       resolveRoutingLease?: (id: string, signal?: AbortSignal, budget?: MirrorLeaseWaitBudget) => Promise<boolean>;
     },
-    readonly control: Pick<FabricControlPlane, "request"> | undefined,
+    readonly control: (Pick<FabricControlPlane, "request"> & {
+      readonly transportKind?: "file" | "nats";
+      readonly participantView?: ParticipantView | undefined;
+    }) | undefined,
     readonly resolvePiRunBinding: (binding: FabricActorRunBinding, runner: FabricAgentRunner, context: FabricInvocationContext, requiredPin?: boolean, role?: string) => FabricActorRunBinding | Promise<FabricActorRunBinding>,
     readonly residency?: Pick<ResidencyClient, "ensureActor" | "hostId"> & { options: { config: { rootId: string; meshRoot: string } } },
     readonly spawner = boundAgentSpawner(),
   ) {}
+
+  get #nats(): boolean { return this.control?.transportKind === "nats"; }
+
+  #presenceRoute(id: string, authority?: ParticipantRoute): ParticipantRoute | undefined {
+    const view = this.control?.participantView;
+    const reason = this.#directoryUnavailable();
+    if (!view || reason) throw new FabricDirectoryUnavailableError(reason ?? "NATS participant view is unavailable");
+    let route: ParticipantRoute | undefined;
+    try { route = view.resolve(id); }
+    catch (error) {
+      const unavailable = new FabricDirectoryUnavailableError(error instanceof Error ? error.message : String(error), error);
+      if (error instanceof Error && "code" in error && error.code === "FABRIC_DIRECTORY_NOT_READY") {
+        throw new PresenceResolutionRequired(id, unavailable, authority);
+      }
+      throw unavailable;
+    }
+    if (route && authority && !samePresenceOwner(route, authority)) throw new FabricRouteAuthorityError(id);
+    return route;
+  }
+
+  #validatePresence(participant: FabricParticipantInfo, budget?: RouterWaitBudget, capability?: string): void {
+    if (!this.#nats) return;
+    const pin = budget?.presenceAuthority;
+    if (pin && pin.targetId !== participant.id) throw new FabricRouteAuthorityError(participant.id);
+    const selected = this.#presenceRoutes.get(participant);
+    const route = this.#presenceRoute(participant.id, pin?.route ?? selected);
+    if (!route || !route.live) throw new PresenceResolutionRequired(participant.id,
+      new FabricParticipantStaleError(participant.id, 0), pin?.route ?? selected ?? (route && snapshotRoute(route)));
+    if ((selected && !samePresenceOwner(selected, route)) ||
+        participant.ownerHostId !== route.ownerHostId || participant.ownerIdentityId !== route.ownerIdentityId ||
+        participant.ownerIncarnation !== route.ownerIncarnation) throw new FabricRouteAuthorityError(participant.id);
+    if (capability && !route.capabilities.includes(capability)) throw unsupported(participant, capability);
+  }
+
+  async #waitForPresence(required: PresenceResolutionRequired, signal: AbortSignal | undefined, budget: RouterWaitBudget): Promise<void> {
+    signal?.throwIfAborted();
+    if (budget.waited) throw required.original;
+    const view = this.control?.participantView;
+    if (!view) throw new FabricDirectoryUnavailableError("NATS participant view is unavailable");
+    budget.waited = true;
+    const id = required.targetId;
+    let authority = budget.presenceAuthority?.targetId === id ? budget.presenceAuthority.route : required.authority;
+    let refusal = required.original;
+    const controller = new AbortController();
+    const timeout = new Error("Fabric presence wait budget exhausted");
+    const abort = (): void => controller.abort(signal!.reason);
+    signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted) abort();
+    const timer = setTimeout(() => controller.abort(timeout), PEER_LEASE_WAIT_MS);
+    try {
+      for (;;) {
+        controller.signal.throwIfAborted();
+        // Arm before resolving: a put/ready between the read and the wait cannot be lost.
+        const changed = view.whenChanged(id, controller.signal);
+        void changed.catch(() => {}); // A successful read still aborts and cleans up the armed waiter.
+        try {
+          const route = this.#presenceRoute(id, authority);
+          if (route) {
+            authority ??= snapshotRoute(route);
+            budget.presenceAuthority = { targetId: id, route: authority };
+            if (route.live) return;
+            refusal = new FabricParticipantStaleError(id, 0);
+          }
+        } catch (error) {
+          if (!(error instanceof PresenceResolutionRequired)) throw error;
+          refusal = error.original;
+        }
+        await changed;
+      }
+    } catch (error) {
+      signal?.throwIfAborted();
+      if (controller.signal.aborted && controller.signal.reason === timeout) throw refusal;
+      if (error instanceof FabricDirectoryUnavailableError || error instanceof FabricRouteAuthorityError) throw error;
+      throw new FabricDirectoryUnavailableError(error instanceof Error ? error.message : String(error), error);
+    } finally {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", abort);
+      controller.abort();
+    }
+  }
+
+  async #withPresence<T>(operation: (authority?: FabricParticipantInfo, budget?: RouterWaitBudget) => Promise<T>, id: string | undefined, recoverLease: boolean, signal?: AbortSignal): Promise<T> {
+    const budget: RouterWaitBudget = {};
+    const attempt = (): Promise<T> => {
+      signal?.throwIfAborted();
+      const target = budget.presenceAuthority?.targetId ?? id ?? this.mainAgent.id;
+      const route = this.#presenceRoute(target, budget.presenceAuthority?.route);
+      if (route) {
+        budget.presenceAuthority ??= { targetId: target, route: snapshotRoute(route) };
+        if (!route.live) throw new PresenceResolutionRequired(target, new FabricParticipantStaleError(target, 0), budget.presenceAuthority.route);
+      } else if (budget.presenceAuthority) {
+        throw new PresenceResolutionRequired(target, new FabricRouteAuthorityError(target), budget.presenceAuthority.route);
+      }
+      return operation(undefined, budget);
+    };
+    try { return await attempt(); }
+    catch (error) {
+      signal?.throwIfAborted();
+      // Only our private lookup refusal may replay resolution, never control.request's ACK failure.
+      if (!(error instanceof PresenceResolutionRequired)) throw error;
+      if (!recoverLease) throw error.original;
+      await this.#waitForPresence(error, signal, budget);
+      try { return await attempt(); }
+      catch (retryError) {
+        if (retryError instanceof PresenceResolutionRequired) throw retryError.original;
+        throw retryError;
+      }
+    }
+  }
+
   #get(id: string, fresh = false): FabricParticipantInfo | undefined {
+    if (this.#nats) {
+      const route = this.#presenceRoute(id);
+      if (!route) return undefined;
+      if (!route.live) throw new PresenceResolutionRequired(id, new FabricParticipantStaleError(id, 0), snapshotRoute(route));
+      // A2's directory supplies metadata; only the KV view supplies routable authority.
+      const participant = this.#directoryRead(() => this.participants.get(id, undefined, { fresh: true }));
+      if (!participant || participant.ownerHostId !== route.ownerHostId || participant.ownerIdentityId !== route.ownerIdentityId ||
+          participant.ownerIncarnation !== route.ownerIncarnation) throw new FabricRouteAuthorityError(id);
+      const resolved = { ...participant, stale: false,
+        capabilities: participant.capabilities.filter(capability => route.capabilities.includes(capability)) };
+      this.#presenceRoutes.set(resolved, snapshotRoute(route));
+      return resolved;
+    }
     // Discovery can use its cached view, but sender admission must refresh positive records
     // too: a cached epoch cannot authorize control after a target reloads or downgrades.
     const participant = this.#directoryRead(() => fresh
@@ -157,6 +302,9 @@ export class AgentMessageRouter {
   }
 
   #unknownParticipant(id: string, label?: string, authority?: FabricParticipantInfo): Error {
+    if (this.#nats) return new PresenceResolutionRequired(id,
+      new Error(`Unknown ${label ?? "Fabric participant"}: ${id} (no live record in NATS presence)`),
+      authority && this.#presenceRoutes.get(authority));
     // One lastKnown snapshot classifies the error and pins the pre-wait remote root authority.
     const known = this.#directoryRead(() => this.participants.lastKnown?.(id));
     const peers = this.participants.peers?.bind(this.participants);
@@ -169,6 +317,10 @@ export class AgentMessageRouter {
 
   async #resolveRoutingLease(id: string, signal?: AbortSignal, budget?: MirrorLeaseWaitBudget): Promise<boolean | undefined> {
     signal?.throwIfAborted();
+    if (this.#nats) {
+      await this.#waitForPresence(new PresenceResolutionRequired(id, new FabricParticipantStaleError(id, 0)), signal, budget ?? {});
+      return true;
+    }
     try {
       const resolved = await this.participants.resolveRoutingLease?.(id, signal, budget);
       signal?.throwIfAborted();
@@ -195,14 +347,21 @@ export class AgentMessageRouter {
   }
 
   #directoryUnavailable(): string | undefined {
+    if (this.#nats) {
+      const view = this.control?.participantView;
+      if (!view) return "NATS participant view is unavailable";
+      try { return view.leaseLive() ? undefined : "NATS control owner lease is not live"; }
+      catch (error) { return error instanceof Error ? error.message : String(error); }
+    }
     return this.participants.routingUnavailable
       ? this.participants.routingUnavailable()
       : this.participants.writeStalled?.()?.message;
   }
 
-  async #withDirectory<T>(operation: (authority?: FabricParticipantInfo, budget?: MirrorLeaseWaitBudget) => Promise<T>, id?: string, recoverLease = true, signal?: AbortSignal): Promise<T> {
+  async #withDirectory<T>(operation: (authority?: FabricParticipantInfo, budget?: RouterWaitBudget) => Promise<T>, id?: string, recoverLease = true, signal?: AbortSignal): Promise<T> {
     signal?.throwIfAborted();
-    const budget: MirrorLeaseWaitBudget = {};
+    if (this.#nats) return this.#withPresence(operation, id, recoverLease, signal);
+    const budget: RouterWaitBudget = {};
     let authority: FabricParticipantInfo | undefined;
     const retry = (pin = authority): Promise<T> => operation(pin, budget).catch(error => {
       if (error instanceof LeaseResolutionRequired) throw error.original;
@@ -270,6 +429,7 @@ export class AgentMessageRouter {
   }
 
   #lapsedRoot(id: string): FabricParticipantInfo | undefined {
+    if (this.#nats) return undefined; // KV has no retained file/mirror lease route.
     // A write-stalled mesh explains the lapse, and delivery needs the mesh: report the stall.
     const reason = this.#directoryUnavailable();
     if (reason) throw new FabricDirectoryUnavailableError(reason);
@@ -286,7 +446,7 @@ export class AgentMessageRouter {
   #eligibleRetainedRoot(root: FabricParticipantInfo): boolean {
     // Names and exact ids share the same lease-independent native eligibility. A stalled
     // writer, reload/exit, dead lineage or lapsed bridge must never gain a new route by name.
-    if (this.#directoryUnavailable() || root.kind !== "root") return false;
+    if (this.#nats || this.#directoryUnavailable() || root.kind !== "root") return false;
     // Reload leases are a hard bound, not an ordinary heartbeat flap; an exit is never routable.
     if (["reloading", "stopping"].includes(root.status)) return false;
     // A mirrored lease lapses when the mesh bridge stops: nothing would carry the reply, so the
@@ -296,6 +456,10 @@ export class AgentMessageRouter {
   }
 
   #rootRouteSnapshot(id: string, authority?: FabricParticipantInfo): FabricParticipantInfo | undefined {
+    if (this.#nats) {
+      const fresh = this.#get(id, true);
+      return fresh?.kind === "root" ? fresh : undefined;
+    }
     // A pinned pre-wait authority replaces the cached view: a post-wait recache must not re-select a replacement.
     const cached = authority?.id === id && authority.kind === "root" ? authority : this.#directoryRead(() => this.participants.get(id));
     const fresh = this.#directoryRead(() => this.participants.get(id, undefined, { fresh: true })) ?? this.#lapsedRoot(id);
@@ -353,7 +517,10 @@ export class AgentMessageRouter {
     const root = matches[0];
     // Retained-only names still require native owner authority; a name is not an alias
     // for an exact predecessor id and never grants delivery capability.
-    if (!root || (root.stale && !this.#eligibleRetainedRoot(root))) return target;
+    if (this.#nats && root) {
+      if (!this.#get(root.id, true)) throw this.#unknownParticipant(root.id);
+    } else if (!root || (root.stale && !this.#eligibleRetainedRoot(root))) return target;
+    if (!root) return target;
     // Do not let a published root name shadow an existing actor name or unique id prefix.
     // Reuse the actor resolver (including its ambiguity checks), without changing its route.
     let actorId: string | undefined;
@@ -471,6 +638,7 @@ export class AgentMessageRouter {
   /** Only this root's non-owned durable actors can wait out a dead or ownerless local lock.
    * Live/corrupt holders and unrelated routing errors retain the ordinary failure path. */
   async #withDurableRecovery<T>(id: string, operation: (recovering?: boolean) => Promise<T>): Promise<T> {
+    if (this.#nats) return operation();
     // Ownerless recovery needs the first integer millisecond strictly after the
     // stale boundary, plus the full final mesh write-timeout budget.
     let deadline = Date.now() + RESIDENT_MESH_STALE_WINDOW_MS + 1 + 10_000;
@@ -555,7 +723,7 @@ export class AgentMessageRouter {
     provenLocal = false,
     recoverLease = true,
     authority?: FabricParticipantInfo,
-    budget?: MirrorLeaseWaitBudget,
+    budget?: RouterWaitBudget,
   ): Promise<FabricAgentMessageResult> {
     context?.signal?.throwIfAborted();
     const provenance = fabricTurnProvenance(options.from ?? this.actorManager.identity, kind, "mesh", options.principal);
@@ -605,9 +773,9 @@ export class AgentMessageRouter {
       }
       let participant = remoteRoot ?? this.#rootRouteSnapshot(this.mainAgent.id, authority);
       if (!participant) {
-        throw this.participants.writeStalled?.() ?? this.#unknownParticipant(this.mainAgent.id, "Fabric Main participant");
+        throw (!this.#nats ? this.participants.writeStalled?.() : undefined) ?? this.#unknownParticipant(this.mainAgent.id, "Fabric Main participant");
       }
-      if (participant.stale && this.participants.resolveRoutingLease) {
+      if (!this.#nats && participant.stale && this.participants.resolveRoutingLease) {
         if (!await this.#resolveRoutingLease(participant.id, context?.signal, budget)) throw this.#unknownParticipant(participant.id);
         const refreshed = this.#rootRouteSnapshot(participant.id, participant);
         if (!refreshed || refreshed.ownerHostId !== participant.ownerHostId || refreshed.ownerIdentityId !== participant.ownerIdentityId) {
@@ -615,12 +783,13 @@ export class AgentMessageRouter {
         }
         participant = refreshed;
       }
-      if (participant.remoteHost && participant.bridgeStale) throw new LeaseResolutionRequired(participant.id,
+      if (!this.#nats && participant.remoteHost && participant.bridgeStale) throw new LeaseResolutionRequired(participant.id,
         new FabricPeerLeaseStaleError(participant.id, participant.remoteHost, 0), participant);
       if (participant.interactive === false) throw new FabricParticipantNonInteractiveError(participant.id);
       if (!participant.capabilities.includes(kind)) throw unsupported(participant, kind);
       const ownerIncarnation = controlOwnerIncarnation(participant);
       if (ownerIncarnation === undefined && (!this.control || participant.controlProtocol === "legacy")) {
+        if (this.#nats) throw new FabricRouteAuthorityError(participant.id);
         if (options.priority) throw new Error("interrupt priority requires the Fabric Main control protocol");
         warnUnfencedControlDelivery(kind, participant.id, ++this.#legacyDeliveryCount);
         return context?.signal || options.principal
@@ -628,6 +797,7 @@ export class AgentMessageRouter {
           : this.actorManager.steerRemote(participant.id, message, kind, data);
       }
       if (!this.control) throw new Error("Fabric control plane is unavailable");
+      this.#validatePresence(participant, budget, kind);
       return this.control.request(
         participant.ownerHostId,
         participant.id,
@@ -647,7 +817,7 @@ export class AgentMessageRouter {
         participant.ownerIdentityId,
         {
           ...(context?.signal ? { signal: context.signal } : {}),
-          routedRemoteHost: participant.remoteHost ?? null,
+          ...(!this.#nats ? { routedRemoteHost: participant.remoteHost ?? null } : {}),
           ...(budget?.waited ? { mirrorLeaseWaitBudget: budget } : {}),
           ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
           ...(participant.status === "reloading" && typeof participant.reloadUntil === "number"
@@ -697,7 +867,8 @@ export class AgentMessageRouter {
         // Terminal tasks advertise no ingress capability. Their still-live exact
         // owner must nevertheless answer with the typed final receipt refusal.
         // Revalidate authority; stale/withdrawn/replaced owners never gain a route.
-        const fresh = this.#directoryRead(() => this.participants.get(remoteAgent!.id, undefined, { fresh: true }));
+        const fresh = this.#nats ? this.#get(remoteAgent.id, true)
+          : this.#directoryRead(() => this.participants.get(remoteAgent!.id, undefined, { fresh: true }));
         if (!fresh || fresh.stale || fresh.kind !== "agent" || fresh.runner !== "pi" || fresh.transport !== "process" ||
             !terminalAgentStatuses.has(fresh.status) || fresh.finalAnswerReceiptId !== remoteAgent.finalAnswerReceiptId ||
             fresh.startedAt !== remoteAgent.startedAt || fresh.ownerHostId !== remoteAgent.ownerHostId ||
@@ -710,13 +881,14 @@ export class AgentMessageRouter {
       const ownerIncarnation = controlOwnerIncarnation(remoteAgent);
       if (!this.control) throw new Error("Fabric control plane is unavailable");
       context?.activity?.({ type: "entity", id: remoteAgent.id, kind: "agent", name: remoteAgent.name });
+      this.#validatePresence(remoteAgent, budget, nativeTerminalTask ? undefined : kind);
       return this.control.request(
         remoteAgent.ownerHostId,
         remoteAgent.id,
         kind,
         { message, data, principal: options.principal, ownerIncarnation },
         remoteAgent.ownerIdentityId,
-        { idempotencyKey: options.idempotencyKey, routedRemoteHost: remoteAgent.remoteHost ?? null, ...(context?.signal ? { signal: context.signal } : {}) },
+        { idempotencyKey: options.idempotencyKey, ...(!this.#nats ? { routedRemoteHost: remoteAgent.remoteHost ?? null } : {}), ...(context?.signal ? { signal: context.signal } : {}) },
       );
     }
     // Persistent actors consume both delivery modes through their serial mailbox.
@@ -726,7 +898,7 @@ export class AgentMessageRouter {
       target = await this.#resolveActorMessageTarget(id, recoverLease);
     } catch (error) {
       if (error instanceof Error && /Unknown Fabric actor/.test(error.message)) {
-        throw this.participants.writeStalled?.() ?? this.#unknownParticipant(id);
+        throw (!this.#nats ? this.participants.writeStalled?.() : undefined) ?? this.#unknownParticipant(id);
       }
       throw error;
     }
@@ -762,6 +934,7 @@ export class AgentMessageRouter {
       throw new Error(`Fabric actor owner ${participant.ownerHostId} does not support session bindings`);
     }
     if (ownerIncarnation === undefined && (!this.control || participant.controlProtocol === "legacy")) {
+      if (this.#nats) throw new FabricRouteAuthorityError(participant.id);
       if (needsBinding) throw new Error(`Fabric actor owner ${participant.ownerHostId} has no binding control channel`);
       warnUnfencedControlDelivery(kind, participant.id, ++this.#legacyDeliveryCount);
       return context?.signal || options.principal
@@ -776,6 +949,7 @@ export class AgentMessageRouter {
       if (needsBinding && !owner.capabilities.includes("actor-bindings")) {
         throw new Error(`Fabric actor owner ${owner.ownerHostId} does not support session bindings`);
       }
+      this.#validatePresence(owner, budget, kind);
       return control.request(
         owner.ownerHostId,
         owner.id,
@@ -793,7 +967,7 @@ export class AgentMessageRouter {
         },
         owner.ownerIdentityId,
         {
-          idempotencyKey: options.idempotencyKey, routedRemoteHost: owner.remoteHost ?? null,
+          idempotencyKey: options.idempotencyKey, ...(!this.#nats ? { routedRemoteHost: owner.remoteHost ?? null } : {}),
           // Retained dormant authority has no live-owner ACK window yet. Its committed
           // command must include bounded cold startup, formerly waited out in preflight.
           ...(owner.stale ? { timeoutMs: 90_000 } : {}),
@@ -825,7 +999,7 @@ export class AgentMessageRouter {
     try {
       return await send(addressed);
     } catch (error) {
-      if (!(error instanceof FabricControlStaleIncarnationError) || !this.#dormantRoutes.has(addressed)) throw error;
+      if (this.#nats || !(error instanceof FabricControlStaleIncarnationError) || !this.#dormantRoutes.has(addressed)) throw error;
       let current: FabricParticipantInfo | undefined;
       let fresh: string | undefined;
       try {
@@ -962,8 +1136,12 @@ export class AgentMessageRouter {
       this.manager.status(command.targetId);
       const result =
         command.operation === "steer"
-          ? this.manager.steer(command.targetId, message, command.data, provenance)
-          : this.manager.followUp(command.targetId, message, command.data, provenance);
+          ? this.#nats
+            ? this.manager.steer(command.targetId, message, command.data, provenance, { idempotencyKey: command.commandId })
+            : this.manager.steer(command.targetId, message, command.data, provenance)
+          : this.#nats
+            ? this.manager.followUp(command.targetId, message, command.data, provenance, undefined, { idempotencyKey: command.commandId })
+            : this.manager.followUp(command.targetId, message, command.data, provenance);
       if (result.undelivered) throw new FabricTargetTerminalError(command.targetId, result.undelivered.finalAnswerReceiptId, result.undelivered.runState);
       return { accepted: true, messageId: result.messageId,
         ...(result.warning ? { warning: result.warning } : {}) };
@@ -996,13 +1174,18 @@ export class AgentMessageRouter {
   /** A lease can still look fresh after SIGKILL. For this root's non-owned durable
    * actors, check the real owner before delivery, not just participant freshness. */
   async resolveActorMessageTarget(id: string, signal?: AbortSignal): Promise<ReturnType<AgentMessageRouter["resolveActorTarget"]>> {
-    return this.#withDirectory(() => this.#resolveActorMessageTarget(id), id, true, signal);
+    return this.#withDirectory(async (_authority, budget) => {
+      const target = await this.#resolveActorMessageTarget(id);
+      if (target.participant) this.#validatePresence(target.participant, budget);
+      return target;
+    }, id, true, signal);
   }
 
   async #resolveActorMessageTarget(id: string, recoverLease = true): Promise<ReturnType<AgentMessageRouter["resolveActorTarget"]>> {
     if (id.trim().startsWith("session:")) throw this.#unknownParticipant(id, "Fabric Main participant");
     const meshRoot = this.residency?.options.config.meshRoot ?? this.actorManager.mesh?.root;
     const definition = this.resolveActorTarget(id, false);
+    if (this.#nats) return definition; // No file wake route, lock recovery or lease takeover.
     if (meshRoot && definition.actor?.residency === "durable" &&
         ["dormant", "failed", "failing-preparation"].includes(definition.actor.status) &&
         !this.actorManager.owns?.(definition.actor.id) && !definition.participant) {
@@ -1035,6 +1218,11 @@ export class AgentMessageRouter {
   async resolveParticipantFresh(id: string, signal?: AbortSignal): Promise<FabricParticipantInfo | undefined> {
     return this.#withDirectory(async (authority, budget) => {
       const known = this.#get(id);
+      if (this.#nats) {
+        if (!known) throw this.#unknownParticipant(id);
+        this.#validatePresence(known, budget);
+        return known;
+      }
       if (known?.kind === "root" && known.remoteHost || authority?.kind === "root" && authority.remoteHost) {
         const fresh = this.#rootRouteSnapshot(id, authority ?? known);
         if (fresh?.bridgeStale) throw new LeaseResolutionRequired(id,
@@ -1053,7 +1241,11 @@ export class AgentMessageRouter {
 
   /** Async callers revalidate an overdue/uninitialized view before resolving ownership. */
   async resolveActorTargetFresh(id: string, signal?: AbortSignal): Promise<ReturnType<AgentMessageRouter["resolveActorTarget"]>> {
-    return this.#withDirectory(async () => this.resolveActorTarget(id), id, true, signal);
+    return this.#withDirectory(async (_authority, budget) => {
+      const target = this.resolveActorTarget(id);
+      if (target.participant) this.#validatePresence(target.participant, budget);
+      return target;
+    }, id, true, signal);
   }
 
   resolveActorTarget(id: string, recoverLease = true): {
@@ -1071,11 +1263,14 @@ export class AgentMessageRouter {
     if (!actor && (!participant || participant.kind !== "actor")) {
       throw this.#unknownParticipant(id, "Fabric actor");
     }
+    if (this.#nats && actor && !participant && !(this.actorManager.owns?.(actor.id) ?? false)) {
+      throw this.#unknownParticipant(actor.id);
+    }
     // A passive/project definition is not execution ownership. A retained exact
     // owner hidden by lease filtering must take the same pre-publication grace
     // path as an unknown target, before resident activation/replacement is tried.
     // Truly ownerless definitions keep their existing activation/status behavior.
-    if (recoverLease && actor && !participant && !(this.actorManager.owns?.(actor.id) ?? false) &&
+    if (!this.#nats && recoverLease && actor && !participant && !(this.actorManager.owns?.(actor.id) ?? false) &&
       this.participants.resolveRoutingLease &&
       this.#directoryRead(() => this.participants.lastKnown?.(actor.id))?.participant.kind === "actor") {
       // Preserve the exact resolved ID through #route's unknown-actor fallback.

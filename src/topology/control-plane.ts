@@ -22,8 +22,9 @@ import { watchBridgeStore } from "../mesh/change-notifier.js";
 import type { FabricMessageSender } from "../protocol.js";
 import { eventReceipts } from "./root-inbox-shared.js";
 import { FileTransport } from "../transport/file.js";
-import { TransportUncertainError, TransportUnavailableError, TransportUnsupportedError, type FabricTransport, type TransportDelivery, type TransportDrainState, type TransportEnvelope, type TransportSent } from "../transport/types.js";
+import { TransportInvalidError, TransportUncertainError, TransportUnavailableError, TransportUnsupportedError, type FabricTransport, type TransportDelivery, type TransportDrainState, type TransportEnvelope, type TransportSent } from "../transport/types.js";
 import type { ParticipantRoute, ParticipantView } from "./participant-view.js";
+import { readNatsDrainReceipt } from "./nats-drain-receipt.js";
 
 const CONTROL_TOPIC = "fabric.control.command";
 const ACK_TOPIC = "fabric.control.ack";
@@ -357,6 +358,10 @@ interface FabricControlSeenRecord {
   /** The command event's sequence, or an upper bound for a record moved from the shared state. */
   sequence?: number;
   acceptance?: FabricControlAcceptance;
+  /** NATS claims/outcomes need a covering drain receipt instead of file-log evidence (E17). */
+  carrier?: "nats";
+  /** NATS-only epoch ms, restamped on each successful CAS write, not on a conflicting retry. */
+  writtenAt?: number;
   /** NATS-only immutable wire digest; never computed from hydrated command metadata. */
   bodyDigest?: string;
   /** Authenticated return authority, retained locally with the NATS claim. */
@@ -401,6 +406,10 @@ export interface FabricControlPlaneOptions {
   participants?: ParticipantView;
   /** NATS keyed-lane concurrency; composition supplies mesh.nats.inboxLanes (default 8, minimum 1). */
   inboxLanes?: number;
+  /** Required in NATS mode: reserved fabric-ops[-suffix] credential machine, injected by composition. */
+  relayOperatorMachine?: string;
+  /** Rollback withdrawal hold, epoch ms; composition converts mesh.nats.rollbackHoldUntil (E14-X1). */
+  withdrawHoldUntil?: number;
   /** Missing epochs are admitted with sender warnings by default during mixed-release rollout. */
   controlIncarnationFence?: MeshControlIncarnationFence;
   /** Must match this activation's participant directory. */
@@ -565,20 +574,9 @@ interface OwnedControlCommand {
   running?: boolean;
 }
 
-/** Canonical JSON must sort even integer-looking object keys lexically. JSON.stringify
- * alone reorders those keys. Normalize once to the actual JSON wire semantics first. */
-const natsControlBodyDigest = (body: unknown, principal?: FabricPrincipal): string => {
-  const input = isObject(body) ? body : {};
-  const immutable: Record<string, unknown> = { principal };
-  for (const field of ["operation", "targetId", "ownerIncarnation", "message", "data", "wakeCause",
-    "triggerTurn", "priority", "binding", "bindingProvenance", "cancelCommandId"]) immutable[field] = input[field];
-  const canonical = (value: unknown): string => {
-    if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
-    if (isObject(value)) return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${canonical(value[key])}`).join(",")}}`;
-    return JSON.stringify(value)!;
-  };
-  return createHash("sha256").update(canonical(JSON.parse(JSON.stringify(immutable))), "utf8").digest("hex");
-};
+/** Opaque transport event token, not the logical commandId; never accept an empty/header-unsafe id. */
+const isNatsControlEventId = (value: unknown): value is string =>
+  typeof value === "string" && value.length > 0 && !/[\s\u0000-\u001f\u007f]/.test(value);
 
 interface NatsControlContext {
   command: FabricControlCommand;
@@ -729,6 +727,7 @@ export class FabricControlPlane {
   readonly #bridgeTimeoutMs: number;
   readonly #inboxLanes: number;
   readonly #transport: FabricTransport;
+  readonly #relayOperatorMachine: string | undefined;
   // File-only access stays behind the legacy branches, including reader/cursor semantics.
   get #fileTransport(): FileTransport {
     if (!(this.#transport instanceof FileTransport)) throw new TransportUnsupportedError("Not a file control carrier");
@@ -829,10 +828,17 @@ export class FabricControlPlane {
       if (!options.participants || transport.self.hostId !== options.hostId) {
         throw new TransportUnsupportedError("NATS control requires ParticipantView and its own runtime inbox");
       }
+      const operatorMachine = options.relayOperatorMachine;
+      if (typeof operatorMachine !== "string" || !/^[a-z0-9][a-z0-9-]{0,31}$/.test(operatorMachine) ||
+          !/^fabric-ops(-[a-z0-9]+)?$/.test(operatorMachine) ||
+          operatorMachine !== operatorMachine.trim() || operatorMachine === transport.self.machine) {
+        throw new TransportInvalidError("NATS control requires relayOperatorMachine: a valid reserved fabric-ops operator machine, distinct from this host");
+      }
     } else if (!(transport instanceof FileTransport)) {
       throw new TransportUnsupportedError("File control requires FileTransport");
     }
     this.#transport = transport;
+    this.#relayOperatorMachine = transport.kind === "nats" ? options.relayOperatorMachine : undefined;
     // The file reader replays the retained log from its current generation. Durable claims
     // recover unclaimed commands and make interrupted outcomes explicit without re-execution.
     this.#lastSequence = transport instanceof FileTransport ? transport.reader.lastSequence : 0;
@@ -1377,6 +1383,8 @@ export class FabricControlPlane {
    * holds it, and the outcome stays unknown.
    */
   async #withdrawUnclaimed(commandId: string, pending: PendingControlRequest): Promise<boolean> {
+    // E14-X1: a NATS-era local claim cannot be disproved by winning the shared file claim.
+    if (this.options.withdrawHoldUntil !== undefined && Date.now() < this.options.withdrawHoldUntil) return false;
     const key = controlSeenKey(pending.ownerHostId, commandId);
     const expired = (record: FabricControlSeenRecord | undefined): boolean =>
       record?.hostId === pending.ownerHostId && record.commandId === commandId && record.targetId === pending.targetId &&
@@ -1550,15 +1558,33 @@ export class FabricControlPlane {
     this.#releaseCheckpoint = { epoch, state };
   }
 
+  /** E14-X1/E17: only a complete, host-bound receipt covering the last NATS write permits a skip. */
+  #releaseNeedsFileEvidence(value: unknown): boolean {
+    const record = controlSeenRecord(value);
+    if (record?.carrier !== "nats") return true; // File-only hosts never read a receipt.
+    const unproven = (): Error => new Error("NATS control has an unproven drain receipt; retain A");
+    if (typeof record.writtenAt !== "number" || !Number.isFinite(record.writtenAt) || record.writtenAt < 0) throw unproven();
+    let receipt: ReturnType<typeof readNatsDrainReceipt>;
+    try { receipt = readNatsDrainReceipt(this.#seen.root); } catch { throw unproven(); }
+    if (!receipt || receipt.version !== 1 || receipt.complete !== true || receipt.hostId !== this.options.hostId ||
+        !Number.isFinite(receipt.completedAt) || receipt.completedAt < record.writtenAt) throw unproven();
+    return false;
+  }
+
   #readReleaseState(): unknown {
     if (this.#transport.kind === "nats") {
       // The synchronous receipt API cannot perform a fresh broker RPC. This is the
       // drain snapshot acquired by checkpointForRelease, explicitly scoped as such.
       return { localOutcomes: this.#readNatsReleaseOutcomes(), drain: this.#natsReleaseDrain };
     }
-    const localOutcomes = this.#seen.listAll(CONTROL_SEEN_PREFIX, { fresh: true }).sort((a, b) => a.key.localeCompare(b.key));
+    // E17 supersedes E14's unconditional skip, including for marked records with an outcome.
+    const localOutcomes = this.#seen.listAll(CONTROL_SEEN_PREFIX, { fresh: true })
+      .filter(entry => this.#releaseNeedsFileEvidence(entry.value)).sort((a, b) => a.key.localeCompare(b.key));
     const sharedClaims = this.mesh.listAll(CONTROL_SEEN_PREFIX, { fresh: true })
-      .filter(entry => controlSeenRecord(entry.value)?.hostId === this.options.hostId).sort((a, b) => a.key.localeCompare(b.key));
+      .filter(entry => {
+        const record = controlSeenRecord(entry.value);
+        return record?.hostId === this.options.hostId && this.#releaseNeedsFileEvidence(record);
+      }).sort((a, b) => a.key.localeCompare(b.key));
     const acknowledgements: MeshEvent[] = [];
     const commands = new Map<number, MeshEvent>();
     let offset = 0, read = 0;
@@ -2025,7 +2051,7 @@ export class FabricControlPlane {
       ...(input.binding !== undefined ? { binding: input.binding } : {}),
       ...(input.bindingProvenance !== undefined ? { bindingProvenance: input.bindingProvenance } : {}),
     };
-    const bodyFingerprint = natsControlBodyDigest(commandBody, input.principal);
+    const bodyFingerprint = controlBodyFingerprint(commandBody, input.principal);
     const existing = this.#pending.get(commandId);
     if (existing) {
       if (existing.bodyFingerprint !== bodyFingerprint) throw Object.assign(new Error("Fabric control id reused with different input"), { code: "FABRIC_CONTROL_ID_CONFLICT", notRun: true });
@@ -2036,11 +2062,14 @@ export class FabricControlPlane {
       Math.floor(options.timeoutMs ?? this.#ackTimeoutMs)));
     const timeoutMs = Math.min(NATS_HORIZON_MS, Math.max(this.#pollMs * 4, originalTimeoutMs - retryBudgetSpentMs));
     const ackGraceMs = Math.min(MAX_CONTROL_ACK_GRACE_MS, 2 * timeoutMs);
+    // E14.1: caller retries get new broker events; logical dedupe remains control-seen alone.
+    // Any same-request republish must reuse this id and the resolved bytes, never restamp them.
+    const commandEventId = randomUUID();
     let pending!: PendingControlRequest;
     const acceptance = new Promise<FabricControlAcceptance>((resolve, reject) => {
       pending = { resolve, reject, ownerHostId: owner.ownerHostId, ownerIdentityId: owner.ownerIdentityId,
         ownerMachine: owner.machine, ownerIncarnation: owner.ownerIncarnation, operation, targetId,
-        commandPublished: false, requestCreatedAt, idempotencyKey, bodyFingerprint, commandEventId: commandId };
+        commandPublished: false, requestCreatedAt, idempotencyKey, bodyFingerprint, commandEventId };
       this.#pending.set(commandId, pending);
       pending.timer = setTimeout(() => this.#timeoutPending(commandId), timeoutMs + ackGraceMs);
       pending.timer.unref();
@@ -2058,7 +2087,7 @@ export class FabricControlPlane {
     });
     void acceptance.catch(() => undefined);
     try {
-      const publishing = this.#sendNats({ id: commandId, kind: "command", to: { machine: owner.machine, hostId: owner.ownerHostId },
+      const publishing = this.#sendNats({ id: commandEventId, kind: "command", to: { machine: owner.machine, hostId: owner.ownerHostId },
         targetId, operation, from: this.identity, principal: input.principal,
         body: (committedAt: number): FabricControlCommand => {
           // P1 and P2: never revive a cleared request or an aborted observation before publication.
@@ -2105,13 +2134,13 @@ export class FabricControlPlane {
     if (!pending.commandPublished) { pending.cancellationRequested = true; return; }
     if (pending.cancellationPublished) return;
     pending.cancellationPublished = true;
-    const now = Date.now(), cancelCommandId = randomUUID();
+    const now = Date.now(), cancelCommandId = randomUUID(), cancelEventId = randomUUID();
     const body: FabricControlCommand = { version: 1, commandId: cancelCommandId, targetId: pending.targetId,
       operation: "cancel", cancelCommandId: commandId, replyTo: this.options.hostId,
       ownerIncarnation: pending.ownerIncarnation, requestCreatedAt: pending.requestCreatedAt,
       requestedAt: now, deadlineAt: now + Math.min(NATS_HORIZON_MS, this.#bridgeTimeoutMs) };
     await this.#backgroundCancellations.enqueue(async () => Date.now() > body.deadlineAt! ? undefined : this.#sendNats({
-      id: cancelCommandId, kind: "command", to: { machine: pending.ownerMachine!, hostId: pending.ownerHostId },
+      id: cancelEventId, kind: "command", to: { machine: pending.ownerMachine!, hostId: pending.ownerHostId },
       targetId: pending.targetId, operation: "cancel", from: this.identity, body,
     }));
   }
@@ -2234,7 +2263,16 @@ export class FabricControlPlane {
       const from = envelope && ownDataRecord(envelope.from);
       const to = envelope && ownDataRecord(envelope.to);
       const body = envelope && ownDataRecord(envelope.body);
-      if (!envelope || !from || !to || !body || typeof envelope.id !== "string" ||
+      // Operator credentials take the relay-only path, regardless of the untrusted from label.
+      // Relay-shaped traffic from a runtime credential is dropped by the same strict verifier.
+      if (delivery.sourceMachine === this.#relayOperatorMachine ||
+          typeof envelope?.id === "string" && envelope.id.startsWith("relay:") ||
+          body?.errorCode === RELAY_DESTINATION_UNAVAILABLE || body?.errorCode === FABRIC_IDEMPOTENCY_KEY_REUSED) {
+        this.#acceptNatsRelayRefusal(delivery);
+        this.#assertNatsSession(session);
+        await delivery.ack(); return;
+      }
+      if (!envelope || !from || !to || !body || !isNatsControlEventId(envelope.id) ||
           typeof envelope.targetId !== "string" || typeof envelope.operation !== "string" ||
           typeof from.id !== "string" || !from.id || to.machine !== this.#transport.self.machine ||
           to.hostId !== this.options.hostId || !/^[a-z0-9][a-z0-9-]{0,31}$/.test(delivery.sourceMachine)) {
@@ -2246,7 +2284,7 @@ export class FabricControlPlane {
         this.#assertNatsSession(session);
         await delivery.ack(); return;
       }
-      if (envelope.kind !== "command" || envelope.id !== body.commandId || envelope.targetId !== body.targetId ||
+      if (envelope.kind !== "command" || !isNatsControlEventId(body.commandId) || envelope.targetId !== body.targetId ||
           envelope.operation !== body.operation || typeof body.requestedAt !== "number" || !Number.isFinite(body.requestedAt) ||
           typeof body.deadlineAt !== "number" || !Number.isFinite(body.deadlineAt) || body.deadlineAt < body.requestedAt ||
           typeof body.replyTo !== "string" || !body.replyTo) {
@@ -2254,6 +2292,7 @@ export class FabricControlPlane {
       }
       // Snapshot the raw admitted wire body before commandFromEvent hydrates wake metadata.
       const wire = JSON.parse(JSON.stringify(delivery.payload)) as TransportEnvelope;
+      const bodyDigest = controlBodyFingerprint(wire.body, wire.principal);
       const event = { id: wire.id, sequence: delivery.sequence, createdAt: (body.requestedAt as number),
         topic: CONTROL_TOPIC, kind: wire.operation, to: this.options.hostId, from: wire.from,
         principal: wire.principal, ...(wire.sender ? { sender: wire.sender } : {}),
@@ -2262,8 +2301,7 @@ export class FabricControlPlane {
       if (!command || !command.commandId || !command.targetId) { await terminate("Malformed NATS control body"); return; }
       const deadlineAt = Math.min(command.deadlineAt!, command.requestedAt + NATS_HORIZON_MS);
       receipt.workingUntil = deadlineAt + MAX_CONTROL_ACK_GRACE_MS;
-      const context: NatsControlContext = { command, event, sourceMachine: delivery.sourceMachine, deadlineAt,
-        bodyDigest: natsControlBodyDigest(wire.body, wire.principal), session };
+      const context: NatsControlContext = { command, event, sourceMachine: delivery.sourceMachine, deadlineAt, bodyDigest, session };
       if (!this.#natsSenderVerified(context)) {
         await this.#sendNatsAcknowledgement(context, { accepted: false, error: "Fabric control sender is unverified",
           errorCode: "FABRIC_SENDER_UNVERIFIED", notRun: true });
@@ -2365,14 +2403,40 @@ export class FabricControlPlane {
     this.#trackNatsWork(settling);
   }
 
+  #acceptNatsRelayRefusal(delivery: TransportDelivery<TransportEnvelope>): void {
+    const envelope = ownDataRecord(delivery.payload);
+    const to = envelope && ownDataRecord(envelope.to);
+    const data = envelope && ownDataRecord(envelope.body);
+    const pending = data && typeof data.commandId === "string" ? this.#pending.get(data.commandId) : undefined;
+    const fields = ["version", "commandId", "commandEventId", "targetId", "accepted", "error", "errorCode", "retryable"];
+    if (delivery.sourceMachine !== this.#relayOperatorMachine || !envelope || !to || !data || !pending ||
+        pending.ownerMachine === undefined || envelope.kind !== "ack" || envelope.operation !== "rejected" ||
+        to.machine !== this.#transport.self.machine || to.hostId !== this.options.hostId ||
+        envelope.id !== `relay:${pending.commandEventId}` || data.commandEventId !== pending.commandEventId ||
+        envelope.targetId !== pending.targetId || data.targetId !== pending.targetId ||
+        Object.keys(data).length !== fields.length || fields.some(field => !Object.hasOwn(data, field)) ||
+        data.version !== 1 || data.accepted !== false || data.errorCode !== RELAY_DESTINATION_UNAVAILABLE ||
+        data.error !== "Relay destination unavailable" || data.retryable !== true) {
+      try { console.warn("[pi-fabric] Dropped invalid or unauthorized NATS operator relay refusal"); } catch {}
+      return;
+    }
+    this.#clearPending(data.commandId as string);
+    // NATS retains no UDS relay authority or late ACK cache. This is outcome unknown, never notRun.
+    pending.reject(new FabricRelayDestinationUnavailableError(pending.targetId, pending.idempotencyKey));
+  }
+
   #acceptNatsAcknowledgement(delivery: TransportDelivery<TransportEnvelope>): void {
     const envelope = delivery.payload, data = ownDataRecord(envelope.body);
-    if (!data || typeof data.commandId !== "string" || envelope.id !== `ack:${data.commandId}` ||
+    if (!data || typeof data.commandId !== "string" || !envelope.id.startsWith("ack:") ||
+        !isNatsControlEventId(envelope.id.slice(4)) || typeof data.bodyDigest !== "string" || !/^[0-9a-f]{64}$/.test(data.bodyDigest) ||
+        data.errorCode === RELAY_DESTINATION_UNAVAILABLE || data.errorCode === FABRIC_IDEMPOTENCY_KEY_REUSED ||
         envelope.targetId !== data.targetId || data.version !== 1 || typeof data.accepted !== "boolean" ||
         envelope.operation !== (data.accepted ? "accepted" : "rejected")) return;
     const pending = this.#pending.get(data.commandId);
-    if (!pending || pending.ownerMachine !== delivery.sourceMachine || envelope.from.id !== pending.ownerHostId ||
-        data.targetId !== pending.targetId) return;
+    // P6 mirrors e931dbc8's ownerIdentityId and the paired from:this.identity ACK stamp.
+    // Do NOT bind the ACK to pending.commandEventId: an earlier digest-equal attempt may settle this retry.
+    if (!pending || pending.ownerMachine !== delivery.sourceMachine || envelope.from.id !== pending.ownerIdentityId ||
+        data.targetId !== pending.targetId || data.bodyDigest !== pending.bodyFingerprint) return;
     if (data.ownerIncarnation !== pending.ownerIncarnation && !(data.accepted === false && data.notRun === true &&
         data.errorCode === CONTROL_STALE_INCARNATION && data.error === STALE_INCARNATION_ERROR && isIncarnation(data.ownerIncarnation) &&
         (data.staleIncarnation === pending.ownerIncarnation || data.staleIncarnation === null))) return;
@@ -2387,16 +2451,15 @@ export class FabricControlPlane {
   async #sendNatsAcknowledgement(context: NatsControlContext, acceptance: FabricControlAcceptance,
     ownerIncarnation: string | null = this.incarnation, staleIncarnation?: string | null): Promise<void> {
     const { command, session } = context;
-    await this.#sendNats({ id: `ack:${command.commandId}`, kind: "ack",
+    await this.#sendNats({ id: `ack:${context.event.id}`, kind: "ack",
       to: { machine: context.sourceMachine, hostId: command.replyTo }, targetId: command.targetId,
-      // P6 names the runtime inbox owner, not its agent/actor participant identity.
-      // In particular, runtime:<sid> differs from a task child's actual run id.
-      // This ACK-only stamp never changes command sender/presence authority.
-      operation: acceptance.accepted ? "accepted" : "rejected", from: { ...this.identity, id: this.options.hostId },
+      // P6's ownerIdentityId is this identity, not the potentially different runtime inbox hostId.
+      operation: acceptance.accepted ? "accepted" : "rejected", from: this.identity,
       body: () => {
         // P5: the lease/pause predicate is inside the same-tick stamp, not before an await.
         this.#assertNatsSession(session);
         return { ...acceptance, version: 1, commandId: command.commandId, targetId: command.targetId,
+          bodyDigest: context.bodyDigest,
           ...(ownerIncarnation !== null ? { ownerIncarnation } : {}),
           ...(staleIncarnation !== undefined ? { staleIncarnation } : {}) };
       },
@@ -2405,13 +2468,20 @@ export class FabricControlPlane {
 
   async #persistNatsOutcome(key: string, retained: NatsRetainedOutcome): Promise<void> {
     try {
-      await this.#seen.put({ key, value: retained.record, identity: this.identity, ifVersion: retained.version });
+      await this.#seen.writeBatch({ identity: this.identity, ops: [{ kind: "put", key, ifVersion: retained.version,
+        value: (writtenAt: number) => {
+          // Evaluated under the local lock AFTER CAS: a conflicting retry keeps the last attempted stamp.
+          retained.record = { ...retained.record, carrier: "nats", writtenAt };
+          return retained.record;
+        } }] });
     } catch (error) {
       // A write can have committed before its observer failed. Only a positive local
       // readback of this exact result reconciles it; never rerun a completed handler.
       let confirmed: FabricControlSeenRecord | undefined;
       try { confirmed = controlSeenRecord(this.#seen.get(key, { fresh: true })?.value); } catch {}
-      if (!confirmed?.acceptance || confirmed.hostId !== retained.record.hostId || confirmed.commandId !== retained.record.commandId ||
+      if (!confirmed?.acceptance || confirmed.carrier !== "nats" || typeof retained.record.writtenAt !== "number" ||
+          !Number.isFinite(retained.record.writtenAt) || confirmed.writtenAt !== retained.record.writtenAt ||
+          confirmed.hostId !== retained.record.hostId || confirmed.commandId !== retained.record.commandId ||
           confirmed.targetId !== retained.record.targetId || confirmed.ownerIncarnation !== retained.record.ownerIncarnation ||
           confirmed.bodyDigest !== retained.record.bodyDigest || confirmed.sourceMachine !== retained.record.sourceMachine ||
           confirmed.requesterId !== retained.record.requesterId || confirmed.expiresAt < retained.record.expiresAt ||
@@ -2460,7 +2530,7 @@ export class FabricControlPlane {
           errorCode: CONTROL_STALE_INCARNATION, notRun: true }, this.incarnation, command.ownerIncarnation ?? null);
         return;
       }
-      record = { format: 1, hostId: this.options.hostId, commandId: command.commandId, targetId: command.targetId,
+      record = { format: 1, carrier: "nats", hostId: this.options.hostId, commandId: command.commandId, targetId: command.targetId,
         ownerIncarnation: this.incarnation, expiresAt: deadlineAt + NATS_HORIZON_MS, explicitDeadline: true,
         bodyDigest: context.bodyDigest, sourceMachine: context.sourceMachine, requesterId: context.event.from.id };
       let claimVersion: number;
@@ -2468,7 +2538,7 @@ export class FabricControlPlane {
         // The ONLY claim lock is #seen's local lock. Check the lease under that lock,
         // immediately before the create, even without a supplied canConsumeMesh hook.
         const results = await this.#seen.writeBatch({ identity: this.identity, ops: [{ kind: "put", key,
-          value: record, ifVersion: 0 }], beforeCommit: () => {
+          value: (writtenAt: number) => (record = { ...record!, carrier: "nats", writtenAt }), ifVersion: 0 }], beforeCommit: () => {
           this.#assertNatsSession(session);
           if (!this.#natsSenderVerified(context)) throw new MeshConsumptionPausedError();
         } });
@@ -2531,7 +2601,7 @@ export class FabricControlPlane {
     }
     const acceptance = record.acceptance ?? { accepted: false, error: "Fabric control outcome is indeterminate after owner restart" };
     if (!record.acceptance || record.expiresAt < context.deadlineAt + NATS_HORIZON_MS) {
-      const outcome: NatsRetainedOutcome = { version, record: { ...record, acceptance,
+      const outcome: NatsRetainedOutcome = { version, record: { ...record, carrier: "nats", acceptance,
         expiresAt: Math.max(record.expiresAt, context.deadlineAt + NATS_HORIZON_MS) } };
       this.#natsOutcomes.set(key, outcome);
       await this.#persistNatsOutcome(key, outcome);
@@ -2547,7 +2617,7 @@ export class FabricControlPlane {
       try {
         for (const entry of this.#seen.listAll(CONTROL_SEEN_PREFIX, { fresh: true })) {
           const record = controlSeenRecord(entry.value);
-          if (record?.bodyDigest !== undefined && !this.#natsFlights.has(entry.key) && !this.#natsOutcomes.has(entry.key)) {
+          if ((record?.carrier === "nats" || record?.bodyDigest !== undefined) && !this.#natsFlights.has(entry.key) && !this.#natsOutcomes.has(entry.key)) {
             expiresAt = Math.min(expiresAt, record.expiresAt);
           }
         }
@@ -2562,7 +2632,7 @@ export class FabricControlPlane {
         const now = Date.now();
         const stale = this.#seen.listAll(CONTROL_SEEN_PREFIX, { fresh: true }).filter(entry => {
           const record = controlSeenRecord(entry.value);
-          return record?.bodyDigest !== undefined && record.expiresAt < now && !this.#natsFlights.has(entry.key) && !this.#natsOutcomes.has(entry.key);
+          return (record?.carrier === "nats" || record?.bodyDigest !== undefined) && record.expiresAt < now && !this.#natsFlights.has(entry.key) && !this.#natsOutcomes.has(entry.key);
         });
         for (let start = 0; start < stale.length && !this.#closed && !this.#paused; start += 64) {
           await this.#seen.writeBatch({ identity: this.identity, ops: stale.slice(start, start + 64).map(entry => ({
@@ -2586,7 +2656,9 @@ export class FabricControlPlane {
   }
 
   #readNatsReleaseOutcomes(): unknown {
-    const localOutcomes = this.#seen.listAll(CONTROL_SEEN_PREFIX, { fresh: true }).sort((a, b) => a.key.localeCompare(b.key));
+    // E17: in-process joins/drain do not replace a receipt covering each marked record's last write.
+    const localOutcomes = this.#seen.listAll(CONTROL_SEEN_PREFIX, { fresh: true })
+      .filter(entry => this.#releaseNeedsFileEvidence(entry.value)).sort((a, b) => a.key.localeCompare(b.key));
     if (localOutcomes.some(entry => !controlSeenRecord(entry.value)?.acceptance)) throw new Error("NATS control has a local claim without a durable outcome");
     return localOutcomes;
   }
@@ -3014,17 +3086,17 @@ export class FabricControlPlane {
     // A restarting owner replays the retained log from its start, so a record stays while its
     // command is still in the log: past its expiry, and below the log's oldest sequence.
     const oldest = this.mesh.oldestSequence();
-    if (oldest !== undefined) {
-      const stale = this.#seen.listAll(CONTROL_SEEN_PREFIX).filter((entry) => {
-        const record = controlSeenRecord(entry.value);
-        return !record || (record.expiresAt < now && record.sequence !== undefined && record.sequence < oldest);
+    const stale = this.#seen.listAll(CONTROL_SEEN_PREFIX).filter((entry) => {
+      const record = controlSeenRecord(entry.value);
+      // E14-X1: NATS records have no file-log replay obligation, even with an empty file log.
+      if (record?.carrier === "nats") return record.expiresAt < now;
+      return oldest !== undefined && (!record || (record.expiresAt < now && record.sequence !== undefined && record.sequence < oldest));
+    });
+    for (let start = 0; start < stale.length; start += 64) {
+      await this.#seen.writeBatch({
+        identity: this.identity,
+        ops: stale.slice(start, start + 64).map((entry) => ({ kind: "delete" as const, key: entry.key, ifVersion: entry.version, onConflict: "skip" as const })),
       });
-      for (let start = 0; start < stale.length; start += 64) {
-        await this.#seen.writeBatch({
-          identity: this.identity,
-          ops: stale.slice(start, start + 64).map((entry) => ({ kind: "delete" as const, key: entry.key, ifVersion: entry.version, onConflict: "skip" as const })),
-        });
-      }
     }
     if (now - this.#legacySeenCleanupAt >= LEGACY_SEEN_CLEANUP_MS) {
       this.#legacySeenCleanupAt = now;

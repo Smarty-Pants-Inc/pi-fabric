@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { setTimeout as settle } from "node:timers/promises";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_FABRIC_CONFIG, RESIDENT_IDLE_EXIT_MS } from "../src/config.js";
 import { MeshStore } from "../src/mesh/store.js";
@@ -10,19 +11,21 @@ import { residentRoot, type ResidentHostConfig } from "../src/residency/protocol
 import { hostLeasePath, readHostLeaseCurrent, writeHostLease } from "../src/topology/host-leases.js";
 import { MAIN_RELOAD_LEASE_MS, ParticipantDirectory } from "../src/topology/participant-directory.js";
 
-// Windows runs the legacy retention path (retentionV2Enabled() is false on win32), which applies
-// config.json policy edits only at its 60 s request-retention sample. Tests that depend on that
-// cadence run both paths on every platform, so a Windows-only difference shows up on Linux too.
+// Windows runs legacy retention (retentionV2Enabled() is false on win32).
+// Config replacements now arrive through the same root watch in both modes;
+// exercise both on every platform so a Windows-only difference is visible.
 const platform = vi.hoisted(() => ({ retentionV2: process.platform !== "win32" }));
 vi.mock("../src/storage/retention-platform.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../src/storage/retention-platform.js")>()),
   retentionV2Enabled: () => platform.retentionV2,
 }));
-const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
+const sleep = (ms: number) => settle(ms);
+const PRESENCE_SAMPLE_MS = 60_000;
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => {
   vi.restoreAllMocks();
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
+  vi.useRealTimers();
   platform.retentionV2 = process.platform !== "win32";
 });
 
@@ -38,15 +41,26 @@ async function fixture(idleExitMs = RESIDENT_IDLE_EXIT_MS) {
   fs.mkdirSync(config.residencyRoot, { recursive: true });
   const configPath = path.join(config.residencyRoot, "config.json");
   fs.writeFileSync(configPath, JSON.stringify(config));
-  let now = Date.now(), exited = 0;
-  vi.spyOn(Date, "now").mockImplementation(() => now);
+  const startedAt = Date.now();
+  let exited = 0;
+  // Advance Date together with each deadline, not to the end of a whole window
+  // before running its timers: a fixed clock 1 ms before expiry would repeatedly
+  // re-arm that same 1 ms deadline. Native I/O settles use the real timer above.
+  vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
   const log = vi.spyOn(console, "error").mockImplementation(() => {});
   const host = new ResidentHost(config, () => { exited++; });
   cleanups.push(async () => { await host.close(); fs.rmSync(root, { recursive: true, force: true }); });
   await host.start();
-  await sleep(150); // Actual request ticks, deterministic host clock.
-  return { root, config, configPath, host, log, exited: () => exited, now: () => now,
-    advance: async (ms: number) => { now += ms; await sleep(150); } };
+  await sleep(150); // Startup settles; deterministic host clock.
+  return { root, config, configPath, host, log, exited: () => exited, now: () => Date.now(),
+    // Move the host clock, fire every deadline armed within it, then let the event work settle.
+    advance: async (ms: number) => { await vi.advanceTimersByTimeAsync(ms); await sleep(150); },
+    // Root liveness has no event: the participant presence pass re-samples it at most once a minute
+    // (smarty-dev#11172 trade-off; formerly every 50 ms tick). One pass starts a dead-root window.
+    sample: async () => {
+      const untilNextPass = PRESENCE_SAMPLE_MS - (Date.now() - startedAt) % PRESENCE_SAMPLE_MS;
+      await vi.advanceTimersByTimeAsync(untilNextPass); await sleep(150);
+    } };
 }
 
 function rootLease(f: Awaited<ReturnType<typeof fixture>>, expiresAt: number) {
@@ -83,14 +97,15 @@ describe("resident dead-root idle retirement (smarty-dev#6086)", () => {
     await f.advance(5_000);
     expect(f.exited()).toBe(0);
     fs.rmSync(hostLeasePath(f.config.meshRoot, f.config.rootId));
-    await f.advance(1_000); // first absent-root sample
+    // The known lease's expiry is a real deadline, earlier than the next presence pass.
+    await f.advance(5_001); // first absent-root sample at the former lease's expiry
     await f.advance(1_999);
     expect(f.exited()).toBe(0);
     rootLease(f, f.now() + 10_000); // before final fresh exit validation
     await f.advance(1);
     expect(f.exited()).toBe(0);
     fs.rmSync(hostLeasePath(f.config.meshRoot, f.config.rootId));
-    await f.advance(1_000);
+    await f.advance(10_000); // the renewed lease's already-armed expiry
     await f.advance(2_000);
     expect(f.exited()).toBe(1);
   });
@@ -112,7 +127,7 @@ describe("resident dead-root idle retirement (smarty-dev#6086)", () => {
     expect(f.exited()).toBe(0);
     await f.advance(2);
     expect(f.exited()).toBe(0);
-    await f.advance(1_000); // observe expiry after the bounded root-observation cache
+    await f.sample(); // observe expiry at the next presence pass
     await f.advance(2_000);
     expect(f.exited()).toBe(1);
   });
@@ -125,7 +140,9 @@ describe("resident dead-root idle retirement (smarty-dev#6086)", () => {
     expect(f.host.actors.hasOwnedActors()).toBe(true);
     expect(f.exited()).toBe(0);
     await f.host.actors.remove(actor.id);
-    await f.advance(1_000);
+    // Removal emits the real actor-change event: its idle window starts now,
+    // not at the old minute-long presence sample. Do not skip that whole window.
+    await sleep(150);
     await f.advance(1_999);
     expect(f.exited()).toBe(0);
     await f.advance(1);
@@ -146,7 +163,8 @@ describe("resident dead-root idle retirement (smarty-dev#6086)", () => {
     await f.advance(10_000);
     expect(f.exited()).toBe(0);
     fs.rmSync(file);
-    await f.advance(1_000);
+    if (directory === "requests") await sleep(150); // real queue-removal event
+    else await f.sample(); // processing has no watcher; next presence pass observes removal
     await f.advance(1_999);
     expect(f.exited()).toBe(0);
     await f.advance(1);
@@ -176,18 +194,19 @@ describe("resident dead-root idle retirement (smarty-dev#6086)", () => {
       fs.renameSync(f.configPath + ".tmp", f.configPath);
     };
     replacePolicy(2_000);
-    await f.advance(1_000);
+    await sleep(150); // receive the native config replacement before firing its deadline
     await f.advance(1_999);
     expect(f.exited()).toBe(0);
     replacePolicy(0);
+    await sleep(150);
     await f.advance(1);
     await f.advance(10_000);
     expect(f.exited()).toBe(0);
     replacePolicy(2_000);
-    // Legacy retention applies the edit at its next 60 s sample; v2 within one maintenance tick.
-    if (!retentionV2) await f.advance(60_000);
-    await f.advance(1_000);
-    await f.advance(2_000);
+    await sleep(150); // both retention paths consume the real config event
+    await f.advance(1_999);
+    expect(f.exited()).toBe(0);
+    await f.advance(1);
     expect(f.exited()).toBe(1);
   });
 
@@ -197,7 +216,7 @@ describe("resident dead-root idle retirement (smarty-dev#6086)", () => {
     await f.advance(10_000);
     expect(f.exited()).toBe(0);
     agents.mockRestore();
-    await f.advance(1_000);
+    await f.sample();
     await f.advance(2_000);
     expect(f.exited()).toBe(1);
   });

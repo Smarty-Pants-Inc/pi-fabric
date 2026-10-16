@@ -4,7 +4,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MeshLockTimeoutError } from "../src/core/atomic-write.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
-import { MAIN_RELOAD_LEASE_MS, ParticipantDirectory } from "../src/topology/participant-directory.js";
+import { DEFAULT_PARTICIPANT_LEASE_MS, MAIN_RELOAD_LEASE_MS, PARTICIPANT_HEARTBEAT_MS, ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { LIVENESS_POLICY_KEY, readHostLeases } from "../src/topology/host-leases.js";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
 
@@ -14,6 +14,10 @@ import type { FabricParticipantRecord } from "../src/topology/types.js";
 // new one starts only at the next session_start. The explicit reload grace written at
 // quiesce("reload") must outlast a slow reload, yet stay bounded so a Main that dies
 // mid-reload still lapses.
+// Deliberate contract change (#6729 gate 1 -> #13468): after successful reload the ordinary FILE
+// TTL is now 3 x heartbeat, not <=30 s, to keep idle work at <=5 wakes/300 s. Without a clean exit,
+// a dead Main can therefore remain visible for up to ~180 s instead of ~30 s. Reload visibility
+// and the independently bounded dead-reload deadline below are unchanged.
 
 const roots: string[] = [];
 const cleanup: Array<() => Promise<unknown> | unknown> = [];
@@ -83,15 +87,26 @@ describe("Main lease through a slow autoReload (smarty-dev#6729)", () => {
       if (elapsed < delayMs) f.advance(5_000);
     }
 
-    // The new release's first heartbeat replaces the grace with an ordinary short lease.
+    // The new release's first heartbeat replaces the grace with the configured ordinary lease.
     const fresh = f.release();
     await fresh.start();
     const seen = f.seen();
     expect(seen).toMatchObject({ status: "idle", stale: false });
     expect(seen?.reloadUntil).toBeUndefined();
     const lease = readHostLeases(f.meshRoot).get(identity.id)!;
-    expect(lease.expiresAt - Date.now()).toBeLessThanOrEqual(30_000);
-    expect(lease.session?.expiresAt ?? 0).toBeLessThanOrEqual(Date.now() + 30_000);
+    expect(DEFAULT_PARTICIPANT_LEASE_MS).toBe(3 * PARTICIPANT_HEARTBEAT_MS);
+    expect(lease.expiresAt - lease.updatedAt).toBe(DEFAULT_PARTICIPANT_LEASE_MS);
+    expect(lease.session!.expiresAt - lease.session!.updatedAt).toBe(DEFAULT_PARTICIPANT_LEASE_MS);
+
+    // A dead successor has no heartbeat or cleanup: it stays live just before its configured
+    // ordinary deadline, then disappears. The longer idle lease is bounded, not immortal.
+    fresh.suspend();
+    f.advance(lease.expiresAt - Date.now() - 1_000);
+    expect(f.seen()).toMatchObject({ status: "idle", stale: false });
+    expect(f.listed()).toContain(identity.id);
+    f.advance(lease.expiresAt - Date.now() + 1);
+    expect(f.seen()).toBeUndefined();
+    expect(f.listed()).not.toContain(identity.id);
   }, 60_000);
 
   // smarty-dev#6729 re-soak of 61dc81be: hub Mains' host lease FILE was missing for 80-116 s.
@@ -133,8 +148,21 @@ describe("Main lease through a slow autoReload (smarty-dev#6729)", () => {
     const fresh = f.release();
     await fresh.start();
     expect(f.seen()).toMatchObject({ status: "idle", stale: false });
-    expect(readHostLeases(f.meshRoot).get(identity.id)!.expiresAt - Date.now()).toBeLessThanOrEqual(30_000);
+    const lease = readHostLeases(f.meshRoot).get(identity.id)!;
+    expect(lease.expiresAt - lease.updatedAt).toBe(DEFAULT_PARTICIPANT_LEASE_MS);
   }, 60_000);
+
+  it.each([false, true])("a clean Main exit releases presence immediately (files-only policy: %s)", async (filesOnly) => {
+    const f = await fixture(filesOnly);
+    const main = f.release();
+    await main.start();
+    expect(f.seen()).toMatchObject({ status: "idle", stale: false });
+    expect(f.listed()).toContain(identity.id);
+    await main.close(); // Normal close, no reload grace and no clock advance.
+    expect(f.seen()).toBeUndefined();
+    expect(f.listed()).not.toContain(identity.id);
+    expect(readHostLeases(f.meshRoot).get(identity.id)).toBeUndefined();
+  });
 
   it.each([false, true])("a Main that dies mid-reload lapses once the bounded grace ends (files-only policy: %s)", async (filesOnly) => {
     // Long enough for a minute-plus reload on a loaded host, short enough to bound a dead Main.

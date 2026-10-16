@@ -54,6 +54,7 @@ const setup = async () => {
     if (now !== undefined) scans++;
   });
   let due: ReturnType<typeof vi.spyOn> | undefined;
+  let nextDueAt: ReturnType<typeof vi.spyOn> | undefined;
   const participants = mainParticipants(config);
   await participants.start();
   await host.start();
@@ -72,10 +73,15 @@ const setup = async () => {
       // conservative incomplete snapshot or transient targeted-proof timeout.
       host.agents.retentionReferences({ now: time, budgetMs: 100 });
       due ??= vi.spyOn(ResidentRequestRetention.prototype, "due"); due.mockReturnValue(true);
-      await waitFor(() => scans > before && (!until || until())); due.mockReturnValue(false);
+      nextDueAt ??= vi.spyOn(ResidentRequestRetention.prototype, "nextDueAt"); nextDueAt.mockReturnValue(0);
+      // There is no request poll to notice a changed test clock. Deliver the real
+      // config event, then let the deadline scheduler run the native sweeper.
+      fs.writeFileSync(path.join(config.residencyRoot, "config.json"), JSON.stringify(config));
+      try { await waitFor(() => scans > before && (!until || until())); }
+      finally { due.mockReturnValue(false); nextDueAt.mockReturnValue(undefined); }
     },
     close: async () => {
-      due?.mockRestore(); sweep.mockRestore();
+      due?.mockRestore(); nextDueAt?.mockRestore(); sweep.mockRestore();
       await client.close(); await host.close(); await participants.close(); vi.restoreAllMocks();
       fs.rmSync(root, { recursive: true, force: true });
     },

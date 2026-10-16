@@ -111,6 +111,12 @@ export class ActorDirectory extends ActorManager {
     return () => { first(); second(); };
   }
 
+  override subscribeMeshPoll(listener: () => void): () => void {
+    const first = super.subscribeMeshPoll(listener);
+    const second = this.#secondary.subscribeMeshPoll(listener);
+    return () => { first(); second(); };
+  }
+
   override retryCapabilityWaiters(): void { super.retryCapabilityWaiters(); this.#secondary.retryCapabilityWaiters(); }
   override resumeQueued(): void { super.resumeQueued(); this.#secondary.resumeQueued(); }
   override hasDormantIdleActor(protectedIds: ReadonlySet<string> = new Set()): boolean {
@@ -269,6 +275,10 @@ export class ActorDirectory extends ActorManager {
   override inFlightActorIds(): string[] { return [...super.inFlightActorIds(), ...this.#secondary.inFlightActorIds()]; }
   override reportStuckPreparing(...args: Parameters<ActorManager["reportStuckPreparing"]>): number { return super.reportStuckPreparing(...args) + this.#secondary.reportStuckPreparing(...args); }
   override inFlightCount(): number { return super.inFlightCount() + this.#secondary.inFlightCount(); }
+  override nextStuckPreparingAt(...args: Parameters<ActorManager["nextStuckPreparingAt"]>): number | undefined {
+    const [primary, secondary] = [super.nextStuckPreparingAt(...args), this.#secondary.nextStuckPreparingAt(...args)];
+    return primary === undefined ? secondary : secondary === undefined ? primary : Math.min(primary, secondary);
+  }
   override releaseCustodyCount(): number {
     return super.releaseCustodyCount() + this.#secondary.releaseCustodyCount() + (this.#orphanReconcilePending ? 1 : 0) + this.#orphanRetirements.size;
   }

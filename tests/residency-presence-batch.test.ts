@@ -15,6 +15,18 @@ import { residentRoot, type ResidentHostConfig } from "../src/residency/protocol
 import { hostLeasePath, LIVENESS_POLICY_KEY, readHostLease } from "../src/topology/host-leases.js";
 import { readParticipantFile } from "../src/topology/participant-files.js";
 
+// Keep the contention/TTL fixture on its explicit 5 s / 15 s clock. Production's
+// minute heartbeat is intentional (#1164); these period-bounded lock scenarios
+// exercise the existing configurable ParticipantDirectory path, not that default.
+vi.mock("../src/topology/participant-directory.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/topology/participant-directory.js")>();
+  return { ...actual, ParticipantDirectory: class extends actual.ParticipantDirectory {
+    constructor(...[mesh, options]: ConstructorParameters<typeof actual.ParticipantDirectory>) {
+      super(mesh, { ...options, heartbeatMs: 5_000 });
+    }
+  } };
+});
+
 const nativePlatform = Object.getOwnPropertyDescriptor(process, "platform")!;
 const roots: string[] = [], hosts: ResidentHost[] = [];
 afterEach(async () => {

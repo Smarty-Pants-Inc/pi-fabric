@@ -9,6 +9,7 @@ import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import { readPiSessionHeader } from "../core/pi-session-header.js";
 import { ActorMeshMonitor } from "./mesh-monitor.js";
+import { watchBridgeStore } from "../mesh/change-notifier.js";
 import { ActorSessionResetCancelledError } from "./session-reset-error.js";
 import { MeshBackgroundQueue, MeshBackgroundRetry, ownProcessIncarnation } from "../core/atomic-write.js";
 import { prepareParticipantFileLock, withParticipantFileTryLock } from "../topology/participant-files.js";
@@ -185,6 +186,11 @@ interface SettledWindow {
   timer?: NodeJS.Timeout;
 }
 
+interface ActorOwnershipSnapshot extends ReadonlyMap<string, boolean> {
+  /** Earliest lease/reload deadline from the observation that produced this poll map. */
+  observedDeadline?(actorIds?: Iterable<string>): number;
+}
+
 interface ManagedActor extends FabricActorBatching {
   id: string;
   name: string;
@@ -330,6 +336,8 @@ const MAIN_REVISION_EVENTS: ReadonlySet<FabricActorHostEvent> = new Set([
 ]);
 const ORPHAN_ADOPTION_RETRY_MS = 30_000;
 const RETENTION_SWEEP_INTERVAL_MS = 15 * 60 * 1_000;
+/** smarty-dev#11172: a one-shot owner-poll retry only while upkeep is owed (dirty filter state, unwritten or unconfirmed delivery outcomes). */
+const OWED_UPKEEP_RETRY_MS = 5_000;
 /** One mesh-wide run-retention sweep per mesh per day, whichever owner claims it (smarty-dev#3252). Daily, not hourly
  * (smarty-dev#7916, measured on Ryzen 1 2026-10-11: each sweep took 30-35 min at ~0.7 core, so hourly cost ~0.4 core
  * on average). It collects runs older than the 7-day archive TTL, so a daily cadence loses nothing. */
@@ -818,6 +826,7 @@ export class ActorManager {
   readonly #canManageActor: ((id: string, fresh?: boolean) => boolean | undefined) | undefined;
   readonly #snapshotActorOwnership: ((fresh?: boolean, actorIds?: readonly string[]) => ReadonlyMap<string, boolean>) | undefined;
   #directoryOwnership: ReadonlyMap<string, boolean> | undefined;
+  #directoryOwnershipDeadline = Number.POSITIVE_INFINITY;
   /** A poll map's exact requested ids; an id outside them has no opinion there, not "no owner" (fv2-11107 F1). */
   #directoryOwnershipScope: ReadonlySet<string> | undefined;
   #directoryLineages: Map<string, boolean> | undefined;
@@ -834,6 +843,9 @@ export class ActorManager {
   readonly #project: string | undefined;
   readonly #role: string | undefined;
   readonly #meshMonitor: ActorMeshMonitor;
+  readonly #ownershipWatchCloses: Array<() => void> = [];
+  #ownershipRecoveryTimer: NodeJS.Timeout | undefined;
+  #ownershipRecoveryAt: number | undefined;
   readonly #records = new Map<string, ActorRecords>();
   readonly #relayParticipantSteering: boolean;
   readonly #deadSessionReap: boolean | { deadAfterMs: number };
@@ -866,7 +878,11 @@ export class ActorManager {
   readonly #adoptionGraceMs: number;
   readonly #listeners = new Set<() => void>();
   readonly #meshListeners = new Set<() => void>();
+  readonly #meshPollListeners = new Set<() => void>();
   #retentionTimer: NodeJS.Timeout | undefined;
+  /** The nearest owed beforePoll deadline (filter expiry or upkeep retry); never armed while nothing is owed. */
+  #upkeepTimer: NodeJS.Timeout | undefined;
+  #upkeepDueAt: number | undefined;
   /** One unref'd wake per transient activation block, to republish its actor record at expiry. */
   readonly #blockExpiryTimers = new Map<string, { at: number; timer: NodeJS.Timeout }>();
   readonly #meshRetentionSweepPath: string | undefined;
@@ -1137,6 +1153,7 @@ export class ActorManager {
         }
         this.#confirmDeliveryOutcomes();
         this.#flushFilterState();
+        this.#armUpkeep();
         // Preserve deferred events while halted; fencing remains manager-owned.
         if (!this.#halted) this.#reconcileChildCompletions();
         return !this.#halted;
@@ -1158,8 +1175,14 @@ export class ActorManager {
         else if (!event.topic.startsWith("fabric.control.")) return this.#dispatchMeshEvent(event);
         return event.topic === "fabric.steer" ? true : "ignored";
       },
+      onPollComplete: () => {
+        for (const listener of this.#meshPollListeners) {
+          try { listener(); } catch { /* Observers must not interrupt the monitor. */ }
+        }
+      },
     });
     this.#meshMonitor.start();
+    if (this.#persistent && meshConfig.enabled && this.#canManageActor) this.#watchOwnership();
     this.#presenceRetryMs = options.presenceRetryMs ?? PRESENCE_RETRY_MS;
     this.#meshOutageAlarmMs = options.meshOutageAlarmMs;
     this.#preparationTimeoutMs = Math.max(1, options.preparationTimeoutMs ?? ACTOR_PREPARATION_TIMEOUT_MS);
@@ -1174,6 +1197,76 @@ export class ActorManager {
     this.#orphanPresenceTimer.unref();
   }
 
+  /** Accepted backlog has passed the event cursor. Registry close/claim writes and owner
+   * lease/presence/state changes must therefore wake ownership independently of that log.
+   * These are hints only: beforePoll and the adoption commit still recheck fresh authority. */
+  #watchOwnership(): void {
+    const wake = (): void => this.#meshMonitor.maintain();
+    const failed = (error: unknown): void => {
+      if (this.#closing) return;
+      console.warn(`[pi-fabric] actor ownership notifications unavailable; recovering at observed lease expiry: ${errorText(error)}`);
+      this.#meshMonitor.watchUnavailable();
+    };
+    try {
+      this.#ownershipWatchCloses.push(watchBridgeStore(this.mesh.root, kind => {
+        if (kind !== "events") wake();
+      }, failed));
+    } catch (error) { failed(error); }
+    try {
+      // Watch the parent: atomic actors.json replacements must not detach observation.
+      fs.mkdirSync(this.#actorRoot, { recursive: true });
+      const watcher = fs.watch(this.#actorRoot, { persistent: false }, (_event, name) => {
+        if (name === null || String(name) === "actors.json") wake();
+      });
+      watcher.on("error", error => { watcher.close(); failed(error); });
+      watcher.on("close", () => failed(new Error("actor registry watch closed")));
+      this.#ownershipWatchCloses.push(() => watcher.close());
+    } catch (error) { failed(error); }
+    // NATS has no local state-file edge; its applied-projection notification is the carrier.
+    try { this.#ownershipWatchCloses.push(this.mesh.subscribeStateChanges(wake)); }
+    catch (error) { failed(error); }
+    // Subscribe before rereading: cover changes between construction and watch registration.
+    this.#armOwnershipRecovery();
+    wake();
+  }
+
+  #armOwnershipRecovery(fresh = true): void {
+    // A crash emits no file edge, and lineageAlive exposes neither a death subscription nor
+    // a lease deadline. Only adoption-eligible foreign lineages need a one-shot wake at the
+    // expiry observed by the participant-directory poll map.
+    const eligible = [...this.#actors.values()].filter(actor => actor.rootId !== this.#rootId &&
+      actor.residency === this.#claimResidency &&
+      (actor.project === undefined || actor.project === this.#project && this.#role === "project-agent"));
+    const waiting = this.#persistent && !!this.#canManageActor && !this.#closing && eligible.length > 0;
+    if (!waiting) {
+      if (this.#ownershipRecoveryTimer) clearTimeout(this.#ownershipRecoveryTimer);
+      this.#ownershipRecoveryTimer = undefined;
+      this.#ownershipRecoveryAt = undefined;
+      return;
+    }
+    // Fresh authority reads have no poll observation. Keep the last observed deadline;
+    // only a new poll observation may replace it (or clear it when no deadline remains).
+    if (fresh) return;
+    const snapshot = this.#directoryOwnership as ActorOwnershipSnapshot | undefined;
+    const ids = eligible.map(actor => actor.id);
+    const observedDeadline = snapshot?.observedDeadline?.(ids);
+    if (observedDeadline === undefined || !Number.isFinite(observedDeadline) || observedDeadline < Date.now()) {
+      if (this.#ownershipRecoveryTimer) clearTimeout(this.#ownershipRecoveryTimer);
+      this.#ownershipRecoveryTimer = undefined;
+      this.#ownershipRecoveryAt = undefined;
+      return;
+    }
+    if (this.#ownershipRecoveryTimer && this.#ownershipRecoveryAt === observedDeadline) return;
+    if (this.#ownershipRecoveryTimer) clearTimeout(this.#ownershipRecoveryTimer);
+    this.#ownershipRecoveryAt = observedDeadline;
+    this.#ownershipRecoveryTimer = setTimeout(() => {
+      this.#ownershipRecoveryTimer = undefined;
+      this.#ownershipRecoveryAt = undefined;
+      if (!this.#closing) this.#meshMonitor.maintain();
+    }, Math.min(2_147_483_647, Math.max(1, observedDeadline + 1 - Date.now())));
+    this.#ownershipRecoveryTimer.unref();
+  }
+
   subscribe(listener: () => void): () => void {
     this.#listeners.add(listener);
     return () => this.#listeners.delete(listener);
@@ -1183,6 +1276,12 @@ export class ActorManager {
   subscribeMesh(listener: () => void): () => void {
     this.#meshListeners.add(listener);
     return () => this.#meshListeners.delete(listener);
+  }
+
+  /** smarty-dev#11172: a monitor log read completed (cursor updated, no longer polling). */
+  subscribeMeshPoll(listener: () => void): () => void {
+    this.#meshPollListeners.add(listener);
+    return () => { this.#meshPollListeners.delete(listener); };
   }
 
   retryCapabilityWaiters(): void {
@@ -2150,6 +2249,7 @@ export class ActorManager {
     actor.updatedAt = Date.now();
     this.#filterQueued(actor);
     this.#replayDeadLetters(actor);
+    this.#armUpkeep();
     await this.#publishPresence(actor, true);
     return this.#publicInfo(actor);
   }
@@ -3911,6 +4011,10 @@ export class ActorManager {
   }
 
   async #close(): Promise<void> {
+    if (this.#ownershipRecoveryTimer) clearTimeout(this.#ownershipRecoveryTimer);
+    this.#ownershipRecoveryTimer = undefined;
+    this.#ownershipRecoveryAt = undefined;
+    for (const close of this.#ownershipWatchCloses.splice(0)) close();
     this.#meshMonitor.close();
     // Join native watch closes before any owned file can be released.
     const watches = [...this.#childCompletionWatches.values()];
@@ -3934,6 +4038,8 @@ export class ActorManager {
     this.#orphanPresenceTimer = undefined;
     if (this.#retentionTimer) clearInterval(this.#retentionTimer);
     this.#retentionTimer = undefined;
+    if (this.#upkeepTimer) clearTimeout(this.#upkeepTimer);
+    this.#upkeepTimer = this.#upkeepDueAt = undefined;
     for (const { timer } of this.#blockExpiryTimers.values()) clearTimeout(timer);
     this.#blockExpiryTimers.clear();
     // Cancellation is monotonic: pending claims must settle before the enclosing
@@ -3946,6 +4052,7 @@ export class ActorManager {
     await this.#retentionSweep;
     this.#listeners.clear();
     this.#meshListeners.clear();
+    this.#meshPollListeners.clear();
     if (this.#persistent) {
       this.#refreshOwnership();
       const owned = [...this.#actors.values()].filter((actor) => this.#canManageCached(actor.id));
@@ -4766,6 +4873,7 @@ export class ActorManager {
           continue;
         }
         this.#inFlight.set(actor.id, item);
+        if (item.outcomeSend) this.#armUpkeep(); // its inference-start receipt is owed
         // Only after tracking (or checkpointing a skip): admission must never
         // persist a snapshot with the dequeued item absent from queue/inFlight.
         queueMicrotask(() => this.#resumeSettledWindows(actor.id));
@@ -5971,7 +6079,57 @@ export class ActorManager {
     this.#filterStateDirty = false;
     this.#filterStateSave = this.#saveActors().catch(() => {
       this.#filterStateDirty = true;
-    }).finally(() => { this.#filterStateSave = undefined; });
+    }).finally(() => { this.#filterStateSave = undefined; this.#armUpkeep(); });
+  }
+
+  /**
+   * smarty-dev#11172: the monitor has no healthy idle tick, so beforePoll's deadline work owns a
+   * one-shot wake: the earliest managed activation-filter expiry, or a retry while filter telemetry,
+   * a delivery-outcome append or an inference-start confirmation is still owed. Nothing owed: no timer.
+   */
+  #armUpkeep(): void {
+    if (this.#closing) return;
+    const now = Date.now();
+    const owed = this.#filterStateDirty || this.#pendingDeliveryOutcomes.size > 0 ||
+      [...this.#inFlight.values()].some((item) => item.outcomeSend !== undefined);
+    let dueAt = owed ? now + OWED_UPKEEP_RETRY_MS : Infinity;
+    for (const actor of this.#actors.values()) {
+      if (actor.activationFilterExpiresAt !== undefined && this.#canManageCached(actor.id)) dueAt = Math.min(dueAt, actor.activationFilterExpiresAt);
+    }
+    if (dueAt === Infinity) {
+      if (this.#upkeepTimer) clearTimeout(this.#upkeepTimer);
+      this.#upkeepTimer = this.#upkeepDueAt = undefined;
+      return;
+    }
+    if (this.#upkeepTimer && this.#upkeepDueAt! <= dueAt) return;
+    if (this.#upkeepTimer) clearTimeout(this.#upkeepTimer);
+    this.#upkeepDueAt = dueAt;
+    this.#upkeepTimer = setTimeout(() => {
+      this.#upkeepTimer = this.#upkeepDueAt = undefined;
+      // The monitor's gated poll runs beforePoll, which does the work and re-arms what remains.
+      if (!this.#closing) this.#meshMonitor.schedule();
+    }, Math.min(Math.max(0, dueAt - now), 2_147_000_000));
+    this.#upkeepTimer.unref();
+  }
+
+  /**
+   * smarty-dev#11172: when reportStuckPreparing(thresholdMs) can next notify, or undefined. Mirrors its
+   * filters: only un-notified, actively preparing episodes owe a deadline; a permit wait pauses the clock
+   * (its waiting-to-active transition publishes presence, which emits a change for the caller to re-ask).
+   */
+  nextStuckPreparingAt(thresholdMs: number, now = Date.now()): number | undefined {
+    if (this.#halted || this.#closing || !(thresholdMs > 0)) return undefined;
+    let dueAt: number | undefined;
+    for (const actor of this.#draining.values()) {
+      const preparing = actor.preparing;
+      const episode = this.#stuckPreparing.get(actor.id);
+      if (!preparing || !episode || episode.notified || episode.activeSince === undefined || preparing.phase === "waiting" ||
+        actor.status === "stopped" || actor.removal) continue;
+      if (episode.itemId !== this.#inFlight.get(actor.id)?.id || !this.#canManageCached(actor.id)) continue;
+      const at = now + Math.max(0, thresholdMs - this.#preparationActiveMs(episode, now));
+      dueAt = dueAt === undefined ? at : Math.min(dueAt, at);
+    }
+    return dueAt;
   }
 
   #recordFiltered(actor: ManagedActor, item: Pick<ActorQueueItem, "id" | "source" | "payload"> & { coalesceKey?: string }, ruleId: string): void {
@@ -5989,6 +6147,7 @@ export class ActorManager {
       lastAt: now,
     };
     this.#filterStateDirty = true;
+    this.#armUpkeep();
     actor.filteredCount = (actor.filteredCount ?? 0) + 1;
     actor.lastFilteredAt = now;
     actor.updatedAt = now;
@@ -8025,7 +8184,10 @@ export class ActorManager {
       pending.push({ ...send, outcome, reason, at: Date.now() });
       this.#pendingDeliveryOutcomes.set(actorId, pending);
       // FAILED is terminal: its tombstone/removal must be durable before append.
-      if (!this.#persistQueue(actorId, true) && outcome === "failed" && this.#persistent) return;
+      if (!this.#persistQueue(actorId, true) && outcome === "failed" && this.#persistent) {
+        this.#armUpkeep();
+        return;
+      }
     }
     this.#flushDeliveryOutcomes(actorId);
   }
@@ -8035,7 +8197,10 @@ export class ActorManager {
     if (!pending) return;
     // A prior write may have failed. Re-establish the failure fence before any
     // deferred FAILED append, including restored pending-receipt snapshots.
-    if (this.#persistent && pending.some(record => record.outcome === "failed") && !this.#persistQueue(actorId, true)) return;
+    if (this.#persistent && pending.some(record => record.outcome === "failed") && !this.#persistQueue(actorId, true)) {
+      this.#armUpkeep();
+      return;
+    }
     let index = 0;
     while (index < pending.length) {
       const record = pending[index]!;
@@ -8047,7 +8212,7 @@ export class ActorManager {
           : undefined;
         // Reconfirm an existing receipt's durability without adding a new line.
         appendDeliveryOutcome(this.mesh.root, record, observed ?? record.outcome, record.reason, record.at);
-      } catch { return; } // Retained in the queue envelope, independently of runnable work.
+      } catch { this.#armUpkeep(); return; } // Retained in the queue envelope, independently of runnable work.
       // Keep terminal evidence while a failed predecessor unlink can replay an
       // unmarked copy, but do not block later independent outcome receipts.
       if (record.outcome === "failed" && this.#takenOver.get(actorId)?.size) index++;
@@ -8710,9 +8875,15 @@ export class ActorManager {
     const scope = fresh ? undefined : new Set(this.#actors.keys());
     this.#directoryOwnership = scope ? this.#snapshotActorOwnership(false, [...scope]) : this.#snapshotActorOwnership(true);
     this.#directoryOwnershipScope = scope;
+    this.#directoryOwnershipDeadline = (this.#directoryOwnership as ActorOwnershipSnapshot).observedDeadline?.() ?? Number.POSITIVE_INFINITY;
     this.#directoryLineages = new Map();
     try { return operation(); }
-    finally { this.#directoryOwnership = undefined; this.#directoryOwnershipScope = undefined; this.#directoryLineages = undefined; }
+    finally {
+      this.#directoryOwnership = undefined;
+      this.#directoryOwnershipScope = undefined;
+      this.#directoryOwnershipDeadline = Number.POSITIVE_INFINITY;
+      this.#directoryLineages = undefined;
+    }
   }
 
   #ownershipDecision(id: string, fresh = true): boolean {
@@ -8731,8 +8902,8 @@ export class ActorManager {
     if (this.#directoryOwnership && this.#directoryOwnershipScope && !this.#directoryOwnershipScope.has(id)) {
       try { return this.#canManageActor?.(id, true) === true; } catch { return false; }
     }
-    const decision = this.#directoryOwnership ? this.#directoryOwnership.get(id)
-      : fresh ? this.#canManageActor?.(id) : this.#canManageActor?.(id, false);
+    const decision = this.#directoryOwnership && Date.now() < this.#directoryOwnershipDeadline ? this.#directoryOwnership.get(id)
+      : this.#directoryOwnership || fresh ? this.#canManageActor?.(id, true) : this.#canManageActor?.(id, false);
 
     // The participant directory is authoritative when it has a live opinion.
     if (decision === false) return false;
@@ -8790,7 +8961,8 @@ export class ActorManager {
     // A record from before projects were recorded keeps the old rule.
     if (actor.project !== undefined && (this.#project !== actor.project || this.#role !== "project-agent")) return;
     // Only when the directory has no live opinion about the actor itself.
-    if ((this.#directoryOwnership ? this.#directoryOwnership.get(actor.id) : this.#canManageActor(actor.id)) !== undefined) return;
+    if ((this.#directoryOwnership && Date.now() < this.#directoryOwnershipDeadline
+      ? this.#directoryOwnership.get(actor.id) : this.#canManageActor(actor.id)) !== undefined) return;
     // Only when the lineage root itself is provably dead. This refuses
     // lineages a racing winner already claimed and advertised, even when the
     // winner persisted before we loaded and its actor presence has not
@@ -8904,7 +9076,8 @@ export class ActorManager {
   #refreshOwnership(id?: string, fresh = true): void {
     // Registry synchronization runs first on polls. With no local actors there is nothing
     // to fence, adopt or restore, so do not build a fleet-wide ownership snapshot (#2039).
-    if (this.#actors.size === 0 || !this.#canManageActor || this.#reloadingOwnership) return;
+    if (this.#actors.size === 0) { this.#armOwnershipRecovery(); return; }
+    if (!this.#canManageActor || this.#reloadingOwnership) return;
     this.#withOwnershipRead(() => this.#refreshOwnershipNow(id, fresh), fresh);
   }
 
@@ -8932,6 +9105,7 @@ export class ActorManager {
       }
       if (!next) this.#maybeAdoptOrphan(actor);
     }
+    this.#armOwnershipRecovery(fresh);
     if (!acquired || !this.#persistent || this.#closing) {
       if (acquired && !this.#closing) queueMicrotask(() => this.#resumeSettledWindows());
       this.#scheduleRestoreParked();

@@ -54,6 +54,7 @@ import {
   withOwnedHostLease,
   type FabricHostLease,
   STATE_LEASE_RENEW_MS,
+  TRANSPORT_HOST_LEASE_RENEW_MS,
   renewHostLease,
   meshWriterLeaseRecord,
 } from "./host-leases.js";
@@ -95,7 +96,21 @@ const LEGACY_ACTOR_PREFIX = "actors/";
 const LEGACY_RENEWAL_PREFIXES = [HOST_PREFIX, LEGACY_SESSION_PREFIX, PARTICIPANT_PREFIX] as const;
 // list() (the root-collision report) also reads the legacy actor records.
 const ROOT_COLLISION_PREFIXES = [HOST_PREFIX, PARTICIPANT_PREFIX, LEGACY_SESSION_PREFIX, LEGACY_ACTOR_PREFIX] as const;
-const PARTICIPANT_HEARTBEAT_MS = 5_000;
+/**
+ * smarty-dev#11172 (R-no-polling, chief-of-staff ruling): an idle host renews its lease at most once
+ * every 60 s, against a 180 s TTL (DEFAULT_PARTICIPANT_LEASE_MS). The 1:3 heartbeat:TTL ratio of
+ * the old 5 s / 15 s pair is kept, so canConsumeMesh/confirmation (2 heartbeats) stays inside the lease.
+ */
+export const PARTICIPANT_HEARTBEAT_MS = 60_000;
+/** Default host lease TTL (and capable Main session TTL in its own host file), smarty-dev#11172. */
+export const DEFAULT_PARTICIPANT_LEASE_MS = 3 * PARTICIPANT_HEARTBEAT_MS;
+/**
+ * The old 5 s cadence, used only while a live pre-capability reader needs the fixed 15 s `sessions/`
+ * TTL (LEGACY_ROOT_LEASE_MS): a deadline-bounded one-shot timer, never an idle poll (smarty-dev#11172).
+ */
+export const LEGACY_HEARTBEAT_MS = 5_000;
+/** The mesh-root names a state commit renames or writes: file `state.json`, SQLite `state.db` + WAL/journal. */
+const JOIN_WAKE_FILES = new Set(["state.json", "state.db", "state.db-wal", "state.db-journal"]);
 // ponytail: bounded; it covers a few publish holds at today's ~250 ms (smarty-dev#8305); still far
 // under LOCK_TIMEOUT_MS 10 s. At 250 ms one hold ahead of the refresh failed the send (smarty-dev#6477).
 export const ROUTING_REFRESH_LOCK_BUDGET_MS = 2_000;
@@ -690,7 +705,7 @@ export interface ParticipantDirectoryOptions {
    * lifecycle to read (smarty-dev#5962/#4313). The lease is no longer renewed, so the owner
    * must say so visibly instead of vanishing from the directory in silence.
    */
-  onLifecycleLost?: (ticks: number) => void;
+  onLifecycleLost?: (ticks: number, reason?: string) => void;
 }
 
 /** Heartbeats a retired lifecycle may skip quietly (a rebind is normally immediate). */
@@ -701,6 +716,25 @@ export const isStaleExtensionContextError = (error: unknown): boolean =>
   error instanceof Error && /extension ctx is stale after session replacement or reload/.test(error.message);
 
 export type ParticipantSnapshotSource = () => FabricParticipantRecord[];
+
+/** The ownership map may carry the exact expiry observed while it was prepared for polling. */
+export interface ActorOwnershipMap extends ReadonlyMap<string, boolean> {
+  observedDeadline(actorIds?: Iterable<string>): number;
+}
+
+const ownershipMap = (
+  entries: Iterable<readonly [string, boolean]>,
+  observation?: ActorOwnershipObservation,
+): ActorOwnershipMap => {
+  const map = new Map(entries) as unknown as ActorOwnershipMap;
+  const deadline = observation?.deadline() ?? Number.POSITIVE_INFINITY;
+  Object.defineProperty(map, "observedDeadline", { value: (actorIds?: Iterable<string>): number => {
+    if (!observation || actorIds === undefined) return deadline;
+    observation.scope(actorIds);
+    return observation.deadline();
+  } });
+  return map;
+};
 
 type RemoteMirrorLease = { state: "none" } | { state: "ended" } | {
   state: "live" | "expired" | "lapsed"; ownerHostId: string; ownerIdentityId: string; rootId: string;
@@ -812,6 +846,19 @@ export class ParticipantDirectory implements FabricParticipantSource {
    * least once per lease period (#leaseMs), the safety net of the existing heartbeat timer.
    */
   #legacyRenewals: (PeerSignals & { required: boolean; until: number }) | undefined;
+  /** smarty-dev#11172: when the live old reader that needs our 15 s `sessions/` renewals lapses. */
+  #legacyCadenceUntil: number | undefined;
+  #legacyTimer: ReturnType<typeof setTimeout> | undefined;
+  /** smarty-dev#11172: stops the state-change wake that notices an old reader joining between heartbeats. */
+  #joinWake: (() => void) | undefined;
+  /** The state token the join wake last checked (one check per commit, however many notifications). */
+  #joinWakeToken: object | undefined;
+  /** Its last answer: only a false-to-true edge refreshes, so our own commits cannot loop it. */
+  #joinWakeRequired = false;
+  /** The one runtime re-registration this armed join watch may spend (#11172 CODE-3/SEC-1). */
+  #joinWatchRearmed = false;
+  /** The join carrier is gone: heartbeat stopped and mesh consumption fenced until a fresh arm. */
+  #joinWakeLost = false;
   #rootCollisionPass: (PeerSignals & { local: string }) | undefined;
 
   constructor(
@@ -839,8 +886,10 @@ export class ParticipantDirectory implements FabricParticipantSource {
           return value;
         }, () => undefined)
       : Promise.resolve(undefined);
-    this.#heartbeatMs = nats ? PARTICIPANT_HEARTBEAT_MS : Math.max(100, options.heartbeatMs ?? PARTICIPANT_HEARTBEAT_MS);
-    this.#leaseMs = Math.max(this.#heartbeatMs * 2, options.leaseMs ?? PARTICIPANT_LEASE_MS);
+    this.#heartbeatMs = nats ? TRANSPORT_HOST_LEASE_RENEW_MS : Math.max(100, options.heartbeatMs ?? PARTICIPANT_HEARTBEAT_MS);
+    // NATS has its own fixed transport lease; explicit FILE overrides retain their short TTL.
+    this.#leaseMs = Math.max(this.#heartbeatMs * 2, options.leaseMs ??
+      (nats || options.heartbeatMs !== undefined ? PARTICIPANT_LEASE_MS : DEFAULT_PARTICIPANT_LEASE_MS));
     // A permanent non-lock refresh failure (EACCES, a refused confirmation) must not retrigger at every
     // canConsumeMesh gate or change wake: back off up to half a heartbeat so a recovered lease stays fresh.
     const half = Math.floor(this.#heartbeatMs / 2);
@@ -904,11 +953,147 @@ export class ParticipantDirectory implements FabricParticipantSource {
     return work;
   }
 
-  // The one heartbeat timer. Every tick reads the owner's lifecycle first and skips when it
-  // retired; the background work itself runs through #runBackground (smarty-dev#5962/#10004).
+  // The one heartbeat timer. #1277 lease-only presence renewal shares this driver:
+  // renewHostLease has no renewal event to subscribe to; refreshPresence is change-only.
+  // Every tick checks the owner's lifecycle before background work (smarty-dev#5962/#10004).
   #armHeartbeat(): void {
     if (this.#timer) return;
-    this.#timer = setInterval(() => {
+    this.#timer = setInterval(() => this.#heartbeatTick(), this.#heartbeatMs);
+    this.#timer.unref();
+    try { this.#armJoinWake(); } catch (error) {
+      // No reliable old-reader join carrier: never keep a long heartbeat without it.
+      clearInterval(this.#timer);
+      this.#timer = undefined;
+      throw error;
+    }
+  }
+
+  /**
+   * smarty-dev#11172: an old reader that joins between our 60 s heartbeats needs our fixed-TTL
+   * `sessions/` entry within its 15 s. Old releases always commit mesh state (their host record and
+   * `sessions/` entry), so a commit notification wakes one check: the root watch on the exact files
+   * the backends commit (file: the `state.json` rename; SQLite: `state.db`/`-wal`/`-journal`) plus the
+   * store's native change hook (NATS). No timer and no polling. Every other root write is ignored.
+   * Our own commits wake it too, so each commit token is checked once, and only a
+   * false-to-true answer refreshes. That refresh then arms the deadline-bounded legacy cadence.
+   */
+  #armJoinWake(): void {
+    if (this.#joinWake || this.#heartbeatMs <= LEGACY_HEARTBEAT_MS) return;
+    const wake = (): void => this.#joinCheck();
+    let watcher: fs.FSWatcher | undefined;
+    let stopped = false;
+    // The watch is the required cross-process carrier (file/SQLite): the default 60 s heartbeat is
+    // only safe beside an old reader's 15 s TTL while it works. No timer and no polling replace it:
+    // a failed registration retries once synchronously, a lost watch re-registers once, then fail closed.
+    const register = (): fs.FSWatcher => {
+      const next = fs.watch(this.mesh.root, { persistent: false }, (_event, name) => {
+        if (name === null || JOIN_WAKE_FILES.has(String(name))) wake();
+      });
+      const lost = (error?: unknown): void => {
+        if (stopped || watcher !== next) return;
+        watcher = undefined;
+        try { next.close(); } catch { /* already closed */ }
+        if (!this.#joinWatchRearmed) {
+          this.#joinWatchRearmed = true;
+          try { watcher = register(); } catch (rearm) { this.#joinWakeFailed(rearm); return; }
+          wake(); // one bounded state check for a commit missed while the watch was down
+          return;
+        }
+        this.#joinWakeFailed(error ?? new Error("join watch closed"));
+      };
+      next.on("error", lost);
+      next.on("close", () => lost());
+      return next;
+    };
+    try { watcher = register(); } catch {
+      try { watcher = register(); } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        throw new Error(`participant join watch on ${this.mesh.root} could not be registered (${detail})`);
+      }
+    }
+    let unsubscribe: (() => void) | undefined;
+    try { unsubscribe = this.mesh.subscribeStateChanges?.(wake); } catch { unsubscribe = undefined; }
+    this.#joinWatchRearmed = false;
+    this.#joinWakeLost = false;
+    this.#joinWakeToken = undefined;
+    this.#joinWakeRequired = false;
+    this.#joinWake = () => {
+      stopped = true;
+      const current = watcher;
+      watcher = undefined;
+      try { current?.close(); } catch { /* already closed */ }
+      unsubscribe?.();
+    };
+  }
+
+  /**
+   * The join carrier failed twice: stop serving the long-heartbeat compatibility guarantee rather
+   * than leave a 15 s `sessions/` entry advertised with a 60 s refresh. The heartbeat stops (the
+   * entries lapse with their TTLs), mesh consumption is fenced, and the owner hears it once
+   * through the existing lifecycle-lost path. A live rebind (resume/start) arms afresh.
+   */
+  #joinWakeFailed(error: unknown): void {
+    if (this.#closed || this.#joinWakeLost) return;
+    this.#joinWakeLost = true;
+    this.suspend();
+    this.#degraded = true;
+    const detail = error instanceof Error ? error.message : String(error);
+    console.warn(`[pi-fabric] participant join watch on ${this.mesh.root} failed (${detail}); ` +
+      `${this.options.hostId} is degraded and its heartbeat is stopped until a live session rebinds it.`);
+    try { this.options.onLifecycleLost?.(Math.max(this.#retiredTicks, LIFECYCLE_LOST_TICKS + 1), "participant join watch failed"); } catch { /* warned above */ }
+  }
+
+  #stopJoinWake(): void {
+    this.#joinWake?.();
+    this.#joinWake = undefined;
+  }
+
+  #joinCheck(): void {
+    if (!this.#timer || this.#closed || this.#quiescing || this.#superseded || typeof this.mesh.stateToken !== "function") return;
+    try {
+      const token = this.mesh.stateToken();
+      if (token === this.#joinWakeToken) return;
+      this.#joinWakeToken = token;
+      const required = this.#legacyRenewalsRequired(Date.now(), token);
+      const joined = required && !this.#joinWakeRequired;
+      this.#joinWakeRequired = required;
+      // One full compatibility tick now (a change refresh renews nothing when no record changed).
+      if (joined) this.#heartbeatTick(true);
+    } catch { /* A hint only: the next heartbeat or commit checks again. */ }
+  }
+
+  #cancelLegacyCadence(): void {
+    if (this.#legacyTimer) clearTimeout(this.#legacyTimer);
+    this.#legacyTimer = undefined;
+  }
+
+  /**
+   * smarty-dev#11172: while a live pre-capability reader still needs our fixed-TTL `sessions/` entry,
+   * add one tick at the old cadence after each refresh, until that reader's own lease deadline.
+   * Without such a reader nothing is armed, so an idle host wakes only on its heartbeat.
+   */
+  #armLegacyCadence(): void {
+    const until = this.#legacyCadenceUntil;
+    const expired = until !== undefined && Date.now() > until;
+    // The obligation lapsed or this directory stopped: drop a pending tick rather than keep it.
+    if (!this.#timer || this.#closed || this.#quiescing || this.#superseded ||
+      this.#heartbeatMs <= LEGACY_HEARTBEAT_MS || until === undefined || expired) {
+      this.#cancelLegacyCadence();
+      // A failed refresh may never reach the renewal scan: do not let the expired reader
+      // consume the next join edge. No deadline (e.g. no legacyPut) is not an expired one.
+      if (expired) this.#joinWakeRequired = false;
+      return;
+    }
+    if (this.#legacyTimer) return;
+    this.#legacyTimer = setTimeout(() => {
+      this.#legacyTimer = undefined;
+      if (this.#timer) this.#heartbeatTick(true);
+    }, LEGACY_HEARTBEAT_MS);
+    this.#legacyTimer.unref?.();
+  }
+
+  #heartbeatTick(legacy = false): void {
+    {
       if (this.#closed) return;
       if (this.#isNats()) {
         const live = this.#live();
@@ -920,7 +1105,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
         return;
       }
       const live = this.#live();
-      this.#lifecycleTick(live);
+      // A compatibility tick is no heartbeat: it must not speed up lost-lifecycle detection.
+      if (!legacy) this.#lifecycleTick(live);
       if (!live) return;
       // The retry runner coalesces shared publication, not independent liveness.
       // An admitted resident stays live during registry/key waits without rewriting
@@ -936,8 +1122,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
         if (this.#refreshing && this.#fileWork > 0) return;
       }
       if (!this.#publicationRetryTimer && !this.#publicationRetrying) this.#runBackground(() => this.refresh());
-    }, this.#heartbeatMs);
-    this.#timer.unref();
+    }
   }
 
   /**
@@ -992,6 +1177,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
       this.#timer = undefined;
       this.#suspended = true;
     }
+    this.#cancelLegacyCadence();
+    this.#stopJoinWake();
     if (this.#refreshTimer) clearTimeout(this.#refreshTimer);
     this.#refreshTimer = undefined;
     this.#refreshScheduled = false;
@@ -1005,7 +1192,12 @@ export class ParticipantDirectory implements FabricParticipantSource {
     this.#suspended = false;
     this.#retiredTicks = 0;
     this.#degraded = false;
-    this.#armHeartbeat();
+    try { this.#armHeartbeat(); } catch (error) {
+      this.#suspended = true;
+      this.#joinWakeLost = false; // report this failed re-arm too
+      this.#joinWakeFailed(error);
+      return;
+    }
     this.scheduleRefresh();
   }
 
@@ -1112,8 +1304,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
     this.#leaseConfirmed = false;
     this.#refreshedAt = Date.now();
     if (this.options.enabled) {
-      // Start before the initial publish: its per-key work can contend too. The
-      // timer also retries a failed initial publish so the host can join later.
+      // Start before the initial publish: its per-key work can contend too. A
+      // deferred publish uses the coalesced retry lane, not the idle heartbeat.
       this.#retiredTicks = 0;
       this.#degraded = false;
       this.#suspended = false;
@@ -1470,6 +1662,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
         if (!writeDeferred) this.scheduleRefresh();
       }
       if (writeDeferred) this.#schedulePublicationRetry();
+      this.#armLegacyCadence();
     }
   }
 
@@ -1479,9 +1672,10 @@ export class ParticipantDirectory implements FabricParticipantSource {
   }
 
   #schedulePublicationRetry(): void {
-    if (!this.options.waitForPublicationRetry || !this.#timer || this.#closed || this.#quiescing ||
+    if ((!this.options.waitForPublicationRetry && this.#leaseConfirmed) || !this.#timer || this.#closed || this.#quiescing ||
       !(isMeshWriteDeferred(this.#refreshError) || isMeshLockTimeout(this.#refreshError)) || this.#refreshError instanceof HostLeaseLockBusyError ||
       this.#publicationRetryTimer || this.#publicationRetrying) return;
+    // Without a resident FIFO admission hook, only initial activation uses this retry lane.
     // Not tied to the heartbeat phase: one jittered, capped retry for the whole host.
     const wait = 50 + Math.floor(Math.random() * (this.#publicationRetryDelay - 50));
     this.#publicationRetryDelay = Math.min(2_000, this.#publicationRetryDelay * 2);
@@ -1504,8 +1698,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
       // occupying either actor registry; admission is not itself a heartbeat receipt.
       // Admission releases mesh BEFORE registries are taken, preserving #504/#531 and the registry -> mesh
       // lock order. Without a prepared fence, #refresh runs inside the publication fence: admit first.
-      if (!this.options.preparePublicationFence) {
-        await this.options.waitForPublicationRetry!();
+      if (!this.options.waitForPublicationRetry || !this.options.preparePublicationFence) {
+        await this.options.waitForPublicationRetry?.();
         if (this.#closed || this.#quiescing || !(isMeshWriteDeferred(this.#refreshError) || isMeshLockTimeout(this.#refreshError))) return;
         await this.refresh();
         return;
@@ -2052,10 +2246,10 @@ export class ParticipantDirectory implements FabricParticipantSource {
    * observation then never validates, so such a poll always lists. Validation, not authority:
    * admission, custody and commit fences call with fresh=true.
    */
-  actorOwnership(localHostId: string, options: { fresh?: boolean; actorIds?: Iterable<string> | undefined } = {}): ReadonlyMap<string, boolean> {
+  actorOwnership(localHostId: string, options: { fresh?: boolean; actorIds?: Iterable<string> | undefined } = {}): ActorOwnershipMap {
     if (this.#isNats()) {
       const ids = options.actorIds ? new Set(options.actorIds) : undefined;
-      return new Map(this.#natsView().list({ scope: "project", kinds: ["actor"], includeStale: options.fresh !== true })
+      return ownershipMap(this.#natsView().list({ scope: "project", kinds: ["actor"], includeStale: options.fresh !== true })
         .filter(record => !ids || ids.has(record.id))
         .map(record => [record.id, record.ownerHostId === localHostId] as const));
     }
@@ -2067,7 +2261,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       try { cached.observation.scope(ids); valid = cached.observation.unchanged(); } catch { valid = false; }
       // Only the validated (scoped) ids: an unscoped entry of the old map is unobserved and could
       // resurrect ownership that moved; absent ids have no directory opinion.
-      if (valid) return new Map([...ids].flatMap((id) => cached.map.has(id) ? [[id, cached.map.get(id)!] as const] : []));
+      if (valid) return ownershipMap([...ids].flatMap((id) => cached.map.has(id) ? [[id, cached.map.get(id)!] as const] : []), cached.observation);
     }
     if (!fresh) this.#pollOwnership = undefined;
     // Observe BEFORE the decision (observeActorOwnership contract): a change in between invalidates.
@@ -2098,8 +2292,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
     };
     const listed = this.list({ scope: "project", ...(fresh ? { fresh: true } : {}) });
     const map = toMap(listed);
-    if (!ids || !observation) return map;
-    if (!exactFor(listed, { fresh: false })) return map;
+    if (!ids || !observation) return ownershipMap(map);
+    if (!exactFor(listed, { fresh: false })) return ownershipMap(map, observation);
     // The non-fresh list may come from a parse cached BEFORE the observation (listReadCacheMs):
     // its map need not correspond to the observed facts. Arm only from a list read AFTER the
     // observation (fresh), re-checked for exactness on a fresh parse, and only if the observed
@@ -2110,9 +2304,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
       const freshListed = this.list({ scope: "project", fresh: true });
       if (exactFor(freshListed, { fresh: true }) && observation.unchanged()) armed = toMap(freshListed);
     } catch { armed = undefined; }
-    if (!armed) return map;
+    if (!armed) return ownershipMap(map, observation);
     this.#pollOwnership = { hostId: localHostId, ids, map: armed, observation };
-    return armed;
+    return ownershipMap(armed, observation);
   }
 
   get(id: string, now = Date.now(), options: { fresh?: boolean } = {}): FabricParticipantInfo | undefined {
@@ -2281,7 +2475,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
   canConsumeMesh(now = Date.now()): boolean {
     if (this.#isNats()) return !this.#closed && !this.#suspended && !this.#quiescing && !this.#transportLost &&
       !!this.#transportLease?.live() && !!this.#participantView?.ready;
-    const confirmed = !this.options.enabled || (!this.#closed && !this.#quiescing && this.#leaseConfirmed &&
+    const confirmed = !this.options.enabled || (!this.#closed && !this.#quiescing && !this.#joinWakeLost && this.#leaseConfirmed &&
       this.#refreshError === undefined && now - this.#refreshedAt < this.#heartbeatMs * 2);
     // A resumed/suspended process (or a forward wall-clock adjustment) must not
     // wait a full heartbeat interval before trying to confirm its lapsed lease.
@@ -2495,6 +2689,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
     this.#assertLeaseActive();
     this.#quiescing = true;
     this.#cancelPublicationRetry();
+    this.#cancelLegacyCadence();
+    this.#stopJoinWake();
     await this.#publicationRetrying;
     if (reason === "reload" && this.options.identity.kind === "main" && this.options.hostId === this.options.rootId) {
       this.#reloadUntil = Date.now() + MAIN_RELOAD_LEASE_MS;
@@ -2584,6 +2780,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
     if (this.#timer) clearInterval(this.#timer);
     this.#timer = undefined;
     this.#suspended = false;
+    this.#cancelLegacyCadence();
+    this.#stopJoinWake();
     if (this.#refreshTimer) clearTimeout(this.#refreshTimer);
     this.#refreshTimer = undefined;
     this.#refreshScheduled = false;
@@ -2939,6 +3137,10 @@ export class ParticipantDirectory implements FabricParticipantSource {
         value: (leaseAt: number) => ({ ...legacyValue, updatedAt: leaseAt }),
       };
     }
+    // smarty-dev#11172: only a live old reader of this fixed-TTL entry needs the old cadence.
+    this.#legacyCadenceUntil = legacyPut && legacyRenewalsRequired
+      ? this.#legacyRenewals?.until ?? now + PARTICIPANT_LEASE_MS : undefined;
+    this.#joinWakeRequired = legacyRenewalsRequired;
 
     const ownParticipant = (entry: MeshStateEntry | undefined): FabricParticipantRecord | undefined => {
       const participant = entry && participantFromEntry(entry);
@@ -3146,7 +3348,14 @@ export class ParticipantDirectory implements FabricParticipantSource {
             JSON.stringify(host.identity) === JSON.stringify(this.options.identity) &&
             host.incarnationToken === this.#incarnationToken;
           if (!hostValid) return { skip: false, host: true, session: false };
-          if (!this.#legacyRenewalsRequired(leaseAt, snapshot)) return { skip: true, host: false, session: false };
+          const legacyRequired = this.#legacyRenewalsRequired(leaseAt, snapshot);
+          // A join wake may share this in-flight heartbeat after preparation saw no old reader.
+          // Carry the post-confirmation answer into its cadence too, not just the state renewal:
+          // the wake has already spent its false-to-true edge and will not refresh us again.
+          this.#legacyCadenceUntil = legacyPut && legacyRequired
+            ? this.#legacyRenewals?.until ?? leaseAt + PARTICIPANT_LEASE_MS : undefined;
+          this.#joinWakeRequired = legacyRequired;
+          if (!legacyRequired) return { skip: true, host: false, session: false };
           const legacy = root && legacySessionKey ? this.mesh.get(legacySessionKey, read) : undefined;
           // The host retains its configured policy cadence (10 min under hostLeases: files).
           const hostDue = hostPolicyFilesOnly
@@ -3377,8 +3586,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
    * reloading Main from every listing until the commit landed, 10-55 s under lock load. Keep it.
    * Its reloadUntil still bounds the listing if this release never commits.
    * The predecessor's own recorded expiry decides, not a relation to this release's #leaseMs: a
-   * fixed 180 s reload lease never outlasts leaseMs >= 180 s (or heartbeatMs >= 90 s), which made
-   * the guard dead under that config (#663 round 2). Before this incarnation's host record commits,
+   * fixed Main reload lease may outlast the current leaseMs, so this guard must not infer it from
+   * the heartbeat/lease ratio (#663 round 2). Before this incarnation's host record commits,
    * its own lease file pairs with no host record. Keep only a matching predecessor's reload
    * lease, never an ordinary heartbeat or a lease after our own host record has committed.
    * Reload is explicit in new leases; older leases extended the fixed Main session TTL.
@@ -3398,7 +3607,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
       (lease.reloadUntil === lease.expiresAt ||
         // Older releases extended the fixed Main session TTL without an explicit reload marker.
         (lease.reloadUntil === undefined && lease.session?.expiresAt === lease.expiresAt &&
-          lease.session.expiresAt !== lease.session.updatedAt + PARTICIPANT_LEASE_MS));
+          lease.session.expiresAt !== lease.session.updatedAt + PARTICIPANT_LEASE_MS &&
+          // smarty-dev#11172: an ordinary lease whose session follows the host TTL is no reload lease.
+          lease.session.hostTtl !== 1));
   }
 
   #assertLeaseActive(): void {
@@ -3413,6 +3624,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
     this.#routingReadAt = 0;
     if (this.#timer) clearInterval(this.#timer);
     this.#timer = undefined;
+    this.#cancelLegacyCadence();
+    this.#stopJoinWake();
     if (this.#refreshTimer) clearTimeout(this.#refreshTimer);
     this.#refreshTimer = undefined;
     this.#refreshScheduled = false;
@@ -3427,6 +3640,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
 
   #fileLease(leaseAt: number): FabricHostLease {
     const root = this.#localRecords.get(this.options.rootId);
+    const legacySession = this.options.heartbeatMs !== undefined && this.#heartbeatMs <= LEGACY_HEARTBEAT_MS;
     return {
       id: this.options.hostId,
       rootId: this.options.rootId,
@@ -3441,7 +3655,11 @@ export class ParticipantDirectory implements FabricParticipantSource {
           id: root.sessionId,
           startedAt: root.startedAt,
           updatedAt: leaseAt,
-          expiresAt: this.#reloadUntil ?? leaseAt + PARTICIPANT_LEASE_MS,
+          // smarty-dev#13468: capable default readers follow the host TTL, never below 15 s.
+          // Explicit legacy-cadence overrides and old `sessions/` readers retain the fixed 15 s TTL.
+          expiresAt: this.#reloadUntil ?? leaseAt + (legacySession
+            ? PARTICIPANT_LEASE_MS : Math.max(PARTICIPANT_LEASE_MS, this.#leaseMs)),
+          hostTtl: 1,
         },
       } : {}),
       updatedAt: leaseAt,

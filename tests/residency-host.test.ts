@@ -678,7 +678,12 @@ describe("Astra resident lease delivery fence", () => {
       const seenRoot = path.join(config.meshRoot, "control-seen", createHash("sha256").update(host.hostId).digest("hex").slice(0, 32));
       const seen = new MeshStore(seenRoot, 65536, 1000);
       expect(seen.listAll("topology/control-seen/").every(entry => !(entry.value as { sequence?: number }).sequence)).toBe(true);
+      // The lease recovers. A gated control plane keeps its work #dirty with no timer and reopens on the
+      // presence/lease notification of that recovery, a host-lease renewal. This case used to get it
+      // from the next 5 s heartbeat (just within the 5 s ACK budget). With the 60 s heartbeat
+      // (smarty-dev#11172), the recovery is made explicit: the refresh that renews the lease file.
       healthy = true;
+      await host.participants.refresh();
       expect(await result).toMatchObject({ acknowledged: true, messageId: "lease-delivery-once" });
       expect(tell).toHaveBeenCalledOnce();
     } finally {

@@ -7,7 +7,7 @@ import { ActorManager } from "../src/actors/manager.js";
 import { GlobalActorRegistry } from "../src/actors/global-registry.js";
 import { AgentsProvider } from "../src/providers/agents-provider.js";
 import { MeshStore } from "../src/mesh/store.js";
-import { ParticipantDirectory } from "../src/topology/participant-directory.js";
+import { DEFAULT_PARTICIPANT_LEASE_MS, ParticipantDirectory } from "../src/topology/participant-directory.js";
 import type { FabricMainAgentTarget } from "../src/main-agent.js";
 import type { FabricInvocationContext } from "../src/protocol.js";
 import { ResidentActorClient } from "../src/residency/actor-client.js";
@@ -301,7 +301,7 @@ it.each(["closed", "reloading", "stale"] as const)("verified peer Main stop pres
       // Keep the real published root, but observe it after its lease expires.
       // Omitting includeStale in the source guard would grant peer stop here.
       const list = f.host.participants.list.bind(f.host.participants);
-      vi.spyOn(f.host.participants, "list").mockImplementation((options, now = Date.now()) => list(options, now + 60_000));
+      vi.spyOn(f.host.participants, "list").mockImplementation((options, now = Date.now()) => list(options, now + DEFAULT_PARTICIPANT_LEASE_MS + 1));
       expect(f.host.participants.list({ scope: "project", kinds: ["root"], includeStale: true, fresh: true })
         .find(root => root.id === f.identity.id)?.stale).toBe(true);
     }

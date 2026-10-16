@@ -27,6 +27,18 @@ const scheduledByHost = (stack: string): boolean => {
   const timer = frames.findIndex(frame => frame.includes("at setTimeout "));
   return timer >= 0 && (frames[timer + 1]?.includes("ResidentHost.") ?? false);
 };
+// Named obligation (#6782/#2264): dormancy has NO quiet-period or safety timer. smarty-dev#11172's
+// event-driven maintenance deadline (#scheduleMaintenance: a real retention sample/slice or the root
+// lease expiry) is independently owned work, not a dormancy timer, so it is excluded by provenance.
+const dormancyTimerByHost = (stack: string): boolean => {
+  if (!scheduledByHost(stack)) return false;
+  const frames = stack.split("\n");
+  const caller = frames[frames.findIndex(frame => frame.includes("at setTimeout ")) + 1] ?? "";
+  return !caller.includes("ResidentHost.#scheduleMaintenance");
+};
+// The proven wake watcher (wake.ts) versus the host's own residency-root config watcher (#11172).
+const wakeProofWatch = (stack: string): boolean => stack.includes("assertResidentWakeWatch");
+const hostRootWatch = (stack: string): boolean => stack.includes("ResidentHost.#watchRoot");
 const until = async (done: () => boolean, ms = 8_000) => {
   const started = performance.now();
   while (!done() && performance.now() - started < ms) await sleep(20);
@@ -215,10 +227,14 @@ describe("resident dormancy (smarty-dev#6782 / #2264)", () => {
     const watch = fs.watch;
     const watchers: fs.FSWatcher[] = [];
     const closes: ReturnType<typeof vi.spyOn>[] = [];
+    const rootWatchers: fs.FSWatcher[] = [];
     let next: ResidentHost | undefined;
     vi.spyOn(fs, "watch").mockImplementation((...args: Parameters<typeof fs.watch>) => {
       const watcher = watch(...args);
-      if (args[0] === config.residencyRoot) { watchers.push(watcher); closes.push(vi.spyOn(watcher, "close")); }
+      const stack = new Error().stack ?? "";
+      // Count only the native PROOF watcher; the host's config watcher is a different obligation.
+      if (args[0] === config.residencyRoot && wakeProofWatch(stack)) { watchers.push(watcher); closes.push(vi.spyOn(watcher, "close")); }
+      else if (args[0] === config.residencyRoot && hostRootWatch(stack)) rootWatchers.push(watcher);
       return watcher;
     });
     try {
@@ -237,6 +253,9 @@ describe("resident dormancy (smarty-dev#6782 / #2264)", () => {
       expect(watchers).toHaveLength(2);
       await next.close();
       expect(closes[1]).toHaveBeenCalledOnce();
+      // Each host owned exactly one config watcher of its own, separate from the proof.
+      expect(rootWatchers).toHaveLength(2);
+      expect(rootWatchers.every(watcher => !watchers.includes(watcher))).toBe(true);
     } finally { await next?.close(); await host.close(); vi.restoreAllMocks(); fs.rmSync(root, { recursive: true, force: true }); }
   });
 
@@ -296,6 +315,8 @@ describe("resident dormancy (smarty-dev#6782 / #2264)", () => {
   });
 
   it("rechecks capacity under the publication lock at the final host exit boundary", async () => {
+    // Real deadline clock: host timers and Date advance together; only explicit jumps skip ahead.
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"], shouldAdvanceTime: true });
     const { root, config, host, idle } = fixture();
     const wake = await import("../src/residency/wake.js");
     vi.spyOn(wake, "wakeResidentActors").mockResolvedValue();
@@ -305,18 +326,17 @@ describe("resident dormancy (smarty-dev#6782 / #2264)", () => {
       const actor = await host.actors.create({ name: "late-capacity", instructions: "wait", residency: "durable" });
       await until(() => host.actors.status(actor.id).status === "dormant");
       const residents = fillWakeCapacity(config); // capacity fills AFTER the actor's admission
-      const now = Date.now();
-      vi.spyOn(Date, "now").mockImplementation(() => now + 31_000);
+      await vi.advanceTimersByTimeAsync(31_000);
       await until(() => warn.mock.calls.some(([line]) => String(line).includes("wake capacity")));
       expect(idle).not.toHaveBeenCalled();
       expect(fs.existsSync(residentSleepingPath(config.residencyRoot))).toBe(false);
       expect(readWakeJson<{ pid: number }>(path.join(config.residencyRoot, "owner.json"))?.pid).toBe(process.pid);
       await host.mesh.exclusive(() => fs.rmSync(residents[0]!, { recursive: true, force: true }));
-      vi.spyOn(Date, "now").mockImplementation(() => now + 62_000);
+      await vi.advanceTimersByTimeAsync(31_000);
       await until(() => idle.mock.calls.length === 1);
       expect(fs.existsSync(residentSleepingPath(config.residencyRoot))).toBe(true);
       expect(warn.mock.calls.filter(([line]) => String(line).includes("wake capacity"))).toHaveLength(1);
-    } finally { await host.close(); vi.restoreAllMocks(); fs.rmSync(root, { recursive: true, force: true }); }
+    } finally { vi.useRealTimers(); await host.close(); vi.restoreAllMocks(); fs.rmSync(root, { recursive: true, force: true }); }
   });
 
   it("waits for native watcher close before releasing the owner, including concurrent close callers", async () => {
@@ -387,6 +407,7 @@ describe("resident dormancy (smarty-dev#6782 / #2264)", () => {
   });
 
   it("waits for mesh catch-up before pausing clean exit without restarting the idle window", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"], shouldAdvanceTime: true });
     const { root, host, idle } = fixture();
     let caughtUp = false;
     try {
@@ -396,16 +417,18 @@ describe("resident dormancy (smarty-dev#6782 / #2264)", () => {
       const current = host.actors.meshCaughtUp.bind(host.actors);
       vi.spyOn(host.actors, "meshCaughtUp").mockImplementation(() => caughtUp && current());
       const checkpoint = vi.spyOn(host.actors, "checkpointForRelease");
-      const now = Date.now();
-      vi.spyOn(Date, "now").mockImplementation(() => now + 31_000);
+      // The real idle deadline fires while the monitor is still behind.
+      await vi.advanceTimersByTimeAsync(31_000);
       await sleep(150);
       expect(idle).not.toHaveBeenCalled();
       expect(checkpoint).not.toHaveBeenCalled();
       caughtUp = true;
-      // No new clock advance or quiet-period timer: the same idle window must finish.
+      // No new clock advance or quiet-period timer: an ignored publication's final monitor read
+      // completes catch-up, and the same elapsed idle window finishes on that event.
+      await host.mesh.publish({ topic: "test.ignored-catchup", from: { id: "publisher", name: "publisher", kind: "main" }, data: {} });
       await until(() => idle.mock.calls.length === 1);
       expect(checkpoint).toHaveBeenCalledOnce();
-    } finally { vi.restoreAllMocks(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
+    } finally { vi.useRealTimers(); vi.restoreAllMocks(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
   });
 
   it("marks an idle actor dormant without losing its subscriptions, then reaches clean host exit", async () => {
@@ -432,9 +455,8 @@ describe("resident dormancy (smarty-dev#6782 / #2264)", () => {
   });
 
   it("keeps the host alive for a dormant actor's pending schedule, wakes it once at the due time, then idle-exits", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"], shouldAdvanceTime: true });
     const { root, host, idle } = fixture();
-    const realNow = Date.now.bind(Date);
-    let offset = 0;
     const seen: string[] = [];
     try {
       await host.start();
@@ -442,11 +464,10 @@ describe("resident dormancy (smarty-dev#6782 / #2264)", () => {
       const actor = await host.actors.create({ name: "scheduled-listener", instructions: "process", residency: "durable", topics: ["test.scheduled"] });
       await until(() => host.actors.status(actor.id).status === "dormant");
       expect(host.actors.hasActiveDurableActor()).toBe(false);
-      vi.spyOn(Date, "now").mockImplementation(() => realNow() + offset);
       const from = { id: "scheduler", name: "scheduler", kind: "main" as const };
       await host.mesh.schedule({ topic: "test.scheduled", from, data: { mark: "dormant-due" }, dueAt: Date.now() + 60_000, key: "dormant-due" });
       // Past the 30 s dormant idle window but before the due time: the pending schedule holds the host.
-      offset = 31_000;
+      await vi.advanceTimersByTimeAsync(31_000);
       await sleep(1_500);
       expect(idle).not.toHaveBeenCalled();
       expect(host.actors.status(actor.id).status).toBe("dormant");
@@ -464,11 +485,11 @@ describe("resident dormancy (smarty-dev#6782 / #2264)", () => {
       expect(seen).toHaveLength(1);
       expect(idle).not.toHaveBeenCalled();
       // No pending schedule: the host idle-exits as before.
-      offset += 31_000;
+      await vi.advanceTimersByTimeAsync(31_000);
       await until(() => idle.mock.calls.length === 1);
       expect(idle.mock.calls[0]?.[0]).toBe("dormant");
       expect(seen).toHaveLength(1);
-    } finally { vi.restoreAllMocks(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
+    } finally { vi.useRealTimers(); vi.restoreAllMocks(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
   }, 30_000);
 
   it("never makes a session-scoped durable actor dormant; it stays idle as before #774", async () => {
@@ -560,9 +581,12 @@ describe("resident dormancy (smarty-dev#6782 / #2264)", () => {
         timers.push({ delay: args[1], stack: new Error().stack ?? "" });
         return timeout(...args);
       }) as typeof setTimeout);
+      const eligibleAt = performance.now();
       await host.actors.setEvents(actor.id, []);
       await until(() => host.actors.status(actor.id).status === "dormant");
-      expect(timers.filter(timer => scheduledByHost(timer.stack))).toEqual([]);
+      // Immediately at the eligibility event: no clock advance, no quiet period.
+      expect(performance.now() - eligibleAt).toBeLessThan(1_000);
+      expect(timers.filter(timer => dormancyTimerByHost(timer.stack))).toEqual([]);
       expect(new ActorRegistryStore(config.actorRoot).records().find(row => row.id === actor.id)?.status).toBe("dormant");
     } finally { vi.restoreAllMocks(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
   });
@@ -597,7 +621,7 @@ describe("resident dormancy (smarty-dev#6782 / #2264)", () => {
       expect(host.actors.inFlightCount()).toBe(0);
       expect(runs).toHaveBeenCalledTimes(1);
       expect(runs.mock.calls[0]![0].task).toContain("exactly one racing delivery");
-      expect(timers.filter(stack => scheduledByHost(stack))).toEqual([]);
+      expect(timers.filter(stack => dormancyTimerByHost(stack))).toEqual([]);
     } finally { prove(); finish(); vi.restoreAllMocks(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
   });
 

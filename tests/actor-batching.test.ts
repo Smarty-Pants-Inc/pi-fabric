@@ -959,6 +959,43 @@ describe("round 2 batch failure and recovery interleavings", () => {
     expect(receipts.filter(record => record.eventId === fresh.id).map(record => record.outcome)).toEqual(["delivered"]);
   });
 
+  it.each(["fence", "append"] as const)("retries an owed FAILED %s without another event, then cancels idle upkeep", async failure => {
+    const f = await fixture(undefined, 32, true, { canConsumeMesh: () => true });
+    const actor = await create(f.actors, { batchWindowMs: 0 });
+    fakeClock();
+    const timers = vi.spyOn(globalThis, "setTimeout");
+    f.runStub.mockRejectedValueOnce(new Error("recorded terminal refusal"));
+    const rename = fs.renameSync;
+    const fence = vi.spyOn(fs, "renameSync").mockImplementation((source, destination) => {
+      if (failure === "fence" && String(destination).includes("queue-") && fs.readFileSync(source, "utf8").includes('"terminalFailed"')) {
+        throw Object.assign(new Error("recorded terminal-fence refusal"), { code: "EIO" });
+      }
+      return rename(source, destination);
+    });
+    const append = deliveryOutcomes.appendDeliveryOutcome;
+    const receipt = vi.spyOn(deliveryOutcomes, "appendDeliveryOutcome").mockImplementation((...args) => {
+      if (failure === "append" && args[2] === "failed") throw new Error("recorded receipt append refusal");
+      return append(...args);
+    });
+    const failed = { ...f.event({ ref: "owed-failure" }), to: actor.id };
+    expect(f.monitor.callbacks.onEvent(failed)).toBe(true);
+    await settled(f.actors, actor.id);
+    const send = { eventId: failed.id, to: actor.id, from: failed.from.id, mode: "publish" as const };
+    expect(deliveryOutcomes.hasDeliveryOutcome(f.mesh.root, send, "failed")).toBe(false);
+    expect(timers.mock.calls.some(([, delay]) => delay === 5_000)).toBe(true);
+    fence.mockRestore(); receipt.mockRestore();
+    // The monitor's real beforePoll work is selected by the one owed upkeep wake, not a new event.
+    const scheduled = vi.mocked(ActorMeshMonitor.prototype.schedule);
+    scheduled.mockClear();
+    scheduled.mockImplementation(function (this: ActorMeshMonitor) { this.callbacks.beforePoll(); });
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(deliveryOutcomes.hasDeliveryOutcome(f.mesh.root, send, "failed")).toBe(true);
+    expect(f.runStub).toHaveBeenCalledTimes(1); // terminal work was never replayed
+    scheduled.mockClear();
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(scheduled).not.toHaveBeenCalled(); // no obligation remains, so no idle timer
+  });
+
   it("never appends FAILED when its terminal fence cannot checkpoint, then flushes it after durable removal", async () => {
     const f = await fixture();
     const actor = await create(f.actors, { batchWindowMs: 0 });

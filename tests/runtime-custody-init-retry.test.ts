@@ -75,6 +75,7 @@ it.each(["custody.lock", ".lock"])("initializes under a live foreign %s timeout 
   void exited.catch(() => undefined);
   const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
   const custody = vi.spyOn(custodyLocks, "acquireMeshCustodyLock");
+  const refresh = vi.spyOn(ParticipantDirectory.prototype, "refresh");
   const attachDrain = vi.spyOn(MainAgentController.prototype, "attachFollowUpDrain");
   let released = false;
   try {
@@ -95,7 +96,7 @@ it.each(["custody.lock", ".lock"])("initializes under a live foreign %s timeout 
     expect(initialWarnings()).toHaveLength(1);
     expect(f.notify).toHaveBeenCalledExactlyOnceWith(expect.stringMatching(/could not reach the mesh.*retrying in the background/), "warning");
     expect(readHostLeases(f.meshRoot).has(`session:${f.sessionId}`)).toBe(false);
-    // No explicit refresh/ensure/reload: a heartbeat retries the pending activation itself.
+    // No explicit refresh/ensure/reload: pending work retries independently of the 60 s idle heartbeat.
     await vi.waitFor(() => expect(custody.mock.calls.length).toBeGreaterThanOrEqual(2), { timeout: 8_000, interval: 25 });
     holder.stdin.end("release\n");
     await exited;
@@ -110,6 +111,12 @@ it.each(["custody.lock", ".lock"])("initializes under a live foreign %s timeout 
     ]);
     expect(initialWarnings()).toHaveLength(1);
     expect(f.notify).toHaveBeenCalledTimes(1);
+    // Drain the successful receipt, then cross the retry lane's 2 s cap. It must
+    // stop when pending work commits, rather than becoming an idle poll.
+    await Promise.allSettled(refresh.mock.results.map(result => result.value));
+    const refreshes = refresh.mock.calls.length;
+    await new Promise(resolve => setTimeout(resolve, 2_100));
+    expect(refresh).toHaveBeenCalledTimes(refreshes);
   } finally {
     if (!released) {
       holder.stdin.end("release\n");

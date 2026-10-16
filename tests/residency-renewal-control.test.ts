@@ -9,7 +9,7 @@ import { MeshStore } from "../src/mesh/store.js";
 import { ResidentActorClient } from "../src/residency/actor-client.js";
 import { ResidentHost } from "../src/residency/host.js";
 import { residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
-import { ParticipantDirectory } from "../src/topology/participant-directory.js";
+import { PARTICIPANT_HEARTBEAT_MS, ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { readHostLease } from "../src/topology/host-leases.js";
 import { readParticipantFile } from "../src/topology/participant-files.js";
 
@@ -25,6 +25,25 @@ const waitFor = async (predicate: () => boolean, boundMs: number, label: string,
     onWait();
     await new Promise(resolve => setTimeout(resolve, 10));
   }
+};
+
+// smarty-dev#11172 default participant heartbeat is 60 s (TTL 180 s, confirmation 120 s).
+// This test proves physical timer/lock interleaving across several real heartbeats, so only the
+// ParticipantDirectory #armHeartbeat interval physically fires every TEST_PHYSICAL_HEARTBEAT_MS.
+// Every directory keeps the production 60 s heartbeat, 180 s lease and 120 s confirmation
+// arithmetic: no heartbeatMs option (which would also select the legacy 15 s TTL), no fake clock.
+const TEST_PHYSICAL_HEARTBEAT_MS = 5_000;
+const redirectParticipantHeartbeat = () => {
+  const realSetInterval = globalThis.setInterval;
+  let redirected = 0;
+  const spy = vi.spyOn(globalThis, "setInterval").mockImplementation(((handler: () => void, delay?: number, ...args: unknown[]) => {
+    if (delay === PARTICIPANT_HEARTBEAT_MS && new Error().stack?.includes("armHeartbeat")) {
+      redirected++;
+      delay = TEST_PHYSICAL_HEARTBEAT_MS;
+    }
+    return realSetInterval(handler, delay, ...args);
+  }) as unknown as typeof setInterval);
+  return { spy, redirected: () => redirected };
 };
 
 /** Save a real public status change, leaving publication for the heartbeat. */
@@ -61,8 +80,11 @@ it("completes a real resident setter overlapped with automatic changed publicati
   let mutation: Promise<unknown> | undefined;
   const spies: Array<{ mockRestore(): void }> = [];
   try {
+    const heartbeat = redirectParticipantHeartbeat();
+    spies.push(heartbeat.spy);
     await main.start();
     await host.start();
+    expect(heartbeat.redirected()).toBeGreaterThanOrEqual(2); // main + resident host, never a legacy cadence
     const actor = await client.createActor({ name: "concurrent-review", instructions: "wait", residency: "durable" });
     const sibling = await client.createActor({ name: "pending-review", instructions: "wait", residency: "durable" });
     await host.participants.refresh();

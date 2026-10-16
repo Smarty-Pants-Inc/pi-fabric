@@ -1,5 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { EventEmitter } from "node:events";
 import fs from "node:fs";
 import { projectOf } from "../src/topology/project-identity.js";
 import os from "node:os";
@@ -7,7 +8,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { MeshBackgroundRetry } from "../src/core/atomic-write.js";
-import { confirmWitnessPlatform, ParticipantDirectory, ROUTING_REFRESH_LOCK_BUDGET_MS } from "../src/topology/participant-directory.js";
+import { confirmWitnessPlatform, DEFAULT_PARTICIPANT_LEASE_MS, PARTICIPANT_HEARTBEAT_MS, ParticipantDirectory, ROUTING_REFRESH_LOCK_BUDGET_MS } from "../src/topology/participant-directory.js";
 import { MeshLock } from "../src/mesh/mesh-lock.js";
 import { writeParticipantFile } from "../src/topology/participant-files.js";
 import { actorParticipantRecord } from "../src/topology/records.js";
@@ -864,6 +865,7 @@ describe("ParticipantDirectory host leases", () => {
       }
       expect(readHostLeases(mesh.root).get(identity.id)).toMatchObject({ updatedAt: now, expiresAt: now + leaseMs });
       if (policy) expect(legacyAfter).toBeUndefined();
+      // smarty-dev#13468: the explicit 1 s heartbeat retains the fixed 15 s legacy session TTL.
       else expect(sessionLiveness(legacyAfter, mesh.root)).toEqual({ updatedAt: now, expiresAt: now + 15_000 });
       expect(mesh.listAll("topology/participants/", { fresh: true })[0]).toEqual(participantBefore);
       expect(directory.confirmedAt()).toBe(now);
@@ -1111,6 +1113,45 @@ describe("ParticipantDirectory actor operational counters", () => {
         expect.soft(read()).toMatchObject({ ...stable, actorQueued: queued, actorMessages: messages });
       }
     });
+  });
+});
+
+describe("ParticipantDirectory ownership deadlines", () => {
+  it.each(["lease", "reload"] as const)("bounds poll reuse by the observed %s deadline and observes renewal", async kind => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-ownership-deadline-"));
+    roots.push(root);
+    const meshRoot = path.join(root, "mesh");
+    const identity: MeshIdentity = { id: "session:owner", name: "main", kind: "main", sessionId: "owner" };
+    const actorId = "actor:deadline";
+    let reloadUntil = Date.now() + 10_000;
+    const owner = createDirectory(meshRoot, identity, identity.id, () => [{
+      ...agentRecord(actorId, identity.id, identity.id, identity.id), kind: "actor", transport: "host",
+      ...(kind === "reload" ? { status: "reloading", reloadUntil } : {}),
+    }], steadyLease);
+    const reader = createDirectory(meshRoot, { id: "session:reader", name: "main", kind: "main" }, "session:reader", () => [], steadyLease);
+    await owner.refresh(); // No heartbeat: only explicit renewals may change the observed deadline.
+    const options = { actorIds: [actorId] };
+    const fileLease = readHostLeases(meshRoot).get(identity.id)!;
+    const deadline = kind === "reload" ? reloadUntil : fileLease.expiresAt;
+    let now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+    const first = reader.actorOwnership(identity.id, options);
+    expect(first.get(actorId)).toBe(true);
+    expect(first.observedDeadline()).toBe(deadline);
+    expect(first.observedDeadline([actorId])).toBe(deadline);
+    now = deadline - 1;
+    try {
+      expect(reader.actorOwnership(identity.id, options).get(actorId)).toBe(true);
+      now = deadline + 1;
+      expect(reader.actorOwnership(identity.id, options).has(actorId)).toBe(false);
+      // A renewal must produce a new observation, never extend the old map's authority.
+      reloadUntil = now + 30_000;
+      await owner.refresh();
+      const renewed = reader.actorOwnership(identity.id, options);
+      expect(renewed.get(actorId)).toBe(true);
+      expect(renewed.observedDeadline()).toBeGreaterThan(deadline);
+      expect(first.observedDeadline()).toBe(deadline);
+    } finally { clock.mockRestore(); }
   });
 });
 
@@ -2568,5 +2609,509 @@ describe("idle confirmations without the mesh lock (smarty-dev#6477 L6)", () => 
     expect(raced).toBe(1);
     expect(truncations.mock.calls.some(([fd]) => fd === witnessFd)).toBe(false);
     expect(fs.readFileSync(witness, "utf8")).toBe("keep");    // the swapped-in file was not truncated
+  });
+});
+
+// smarty-dev#11172 — Decision C: common, unit-level (real MeshStore files, injected clock/timer spies), not E2E.
+// Reason: real incident #11172 (R-no-polling): the idle participant lease heartbeat woke every Main and resident
+// every 5 s; chief-of-staff refused an idle-wake allowlist entry. Failure boundaries: an old reader that joins between
+// 60 s heartbeats (state-commit wake, file + SQLite), and a stale compatibility tick (cancel paths). The E2E proof is the
+// idle-wake gate (docs/idle-wake-gate.md), main and resident modes, owner fv2-11172wake/event-lead: overall <= 1 wake/s
+// and no non-allowed site > 1/min.
+describe("ParticipantDirectory default lease cadence (smarty-dev#11172)", () => {
+  const owned: Array<{ mesh: MeshStore; directory: ParticipantDirectory }> = [];
+  afterEach(async () => {
+    // Close the borrowed store after its publisher, before Windows fixture-root cleanup.
+    for (const { mesh, directory } of owned.splice(0)) {
+      try { await directory.close(); } finally { mesh.closeState(); }
+    }
+  });
+  // Deliver the production root-watch callback after a real commit, not after a wall-clock wait.
+  const stateCommitWatch = (mesh: MeshStore) => {
+    let listener: ((event: string, name: string) => void) | undefined;
+    const realWatch = fs.watch;
+    const spy = vi.spyOn(fs, "watch").mockImplementation(((target: fs.PathLike, ...rest: unknown[]) => {
+      if (String(target) !== mesh.root) return (realWatch as any)(target, ...rest);
+      listener = rest.at(-1) as typeof listener;
+      return fakeWatcher();
+    }) as typeof fs.watch);
+    return {
+      notify: (name = mesh.stateBackend === "sqlite" ? "state.db-wal" : "state.json") => {
+        expect(listener).toBeTypeOf("function");
+        listener!("change", name);
+      },
+      restore: () => spy.mockRestore(),
+    };
+  };
+  const settledRefresh = async (refresh: Promise<void>) => {
+    await refresh;
+    // Clear the background runner's in-flight guard before testing the no-loop counterexamples.
+    await new Promise<void>(resolve => setImmediate(resolve));
+  };
+  const identityOf = (name: string): MeshIdentity => ({ id: `session:${name}`, name: "main", kind: "main", sessionId: name });
+  const fixture = (name: string, stateBackend: "file" | "sqlite" = "file") => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-11172-"));
+    roots.push(root);
+    const identity = identityOf(name);
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 1_000, { stateBackend });
+    // No heartbeatMs/leaseMs: the production defaults.
+    const directory = new ParticipantDirectory(mesh, { enabled: true, hostId: identity.id, rootId: identity.id, identity, reapDeadHosts: false });
+    directory.registerSource(() => [rootRecord(identity.id, identity.id, name)]);
+    directories.push(directory);
+    owned.push({ mesh, directory });
+    return { mesh, identity, directory };
+  };
+  const addStateOnlyReader = async (mesh: MeshStore, now: number) => {
+    const peer = identityOf("state-only");
+    await mesh.put({ key: "sessions/state-only", identity: peer, value: { id: peer.id, sessionId: "state-only",
+      cwd: "/tmp/project", startedAt: now, status: "idle" } });
+  };
+
+  it("heartbeats every 60 s with a 180 s host and Main session TTL, fencing consumption after two beats", async () => {
+    const { mesh, identity, directory } = fixture("idle");
+    const intervals = vi.spyOn(globalThis, "setInterval");
+    const timeouts = vi.spyOn(globalThis, "setTimeout");
+    try {
+      await directory.start();
+      expect(PARTICIPANT_HEARTBEAT_MS).toBe(60_000);
+      expect(DEFAULT_PARTICIPANT_LEASE_MS).toBe(3 * PARTICIPANT_HEARTBEAT_MS);
+      expect(intervals.mock.calls.map(([, ms]) => ms)).toEqual([PARTICIPANT_HEARTBEAT_MS]);
+      const lease = readHostLeases(mesh.root).get(identity.id)!;
+      expect(lease.expiresAt - lease.updatedAt).toBe(180_000);
+      // A capable reader takes the Main session from this file: it must not lapse after 15 s.
+      expect(lease.session).toMatchObject({ expiresAt: lease.expiresAt, hostTtl: 1 });
+      expect(sessionLiveness(mesh.get("sessions/idle", { fresh: true })!, mesh.root).expiresAt).toBe(lease.session!.expiresAt);
+      expect(directory.canConsumeMesh()).toBe(true);
+      // Without an old reader no extra cadence timer exists: the idle host wakes only on its heartbeat.
+      expect(timeouts.mock.calls.filter(([, ms]) => ms === 5_000)).toHaveLength(0);
+      const confirmationDeadline = directory.confirmedAt() + 2 * PARTICIPANT_HEARTBEAT_MS;
+      expect(confirmationDeadline).toBeLessThan(lease.expiresAt);
+      expect(directory.canConsumeMesh(confirmationDeadline - 1)).toBe(true);
+      // Record the recovery request without actually renewing: elapsed confirmation must fail closed
+      // even while the host and capable Main session leases still have one heartbeat remaining.
+      const refresh = vi.spyOn(directory, "refresh").mockResolvedValue();
+      try {
+        expect(directory.canConsumeMesh(confirmationDeadline)).toBe(false);
+        expect(directory.canConsumeMesh(confirmationDeadline + 1)).toBe(false);
+        await new Promise<void>(resolve => setImmediate(resolve));
+        expect(refresh).toHaveBeenCalledOnce();
+      } finally { refresh.mockRestore(); }
+    } finally {
+      intervals.mockRestore();
+      timeouts.mockRestore();
+    }
+  });
+
+  it("keeps the fixed 15 s sessions/ entry renewed at the old cadence only while a state-only reader is live", async () => {
+    const { mesh, directory } = fixture("mixed");
+    let now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+    const timeouts = vi.spyOn(globalThis, "setTimeout");
+    const legacyTicks = () => timeouts.mock.calls.filter(([, ms]) => ms === 5_000).length;
+    try {
+      await addStateOnlyReader(mesh, now);
+      await directory.start();
+      expect(legacyTicks()).toBe(1);                          // one deadline-bounded tick, not a poll
+      const startedAt = now;
+      for (let tick = 1; tick <= 3; tick++) {
+        now = startedAt + tick * 5_000;
+        await addStateOnlyReader(mesh, now);                   // the old reader keeps renewing
+        const armed = timeouts.mock.calls.filter(([, ms]) => ms === 5_000).at(-1)!;
+        (armed[0] as () => void)();                            // fire the armed tick (no 5 s real wait)
+        // Each legacy tick renews the fixed-TTL entry and re-arms exactly one next tick.
+        await vi.waitFor(() => expect(legacyTicks()).toBe(tick + 1));
+        expect(now - mesh.get("sessions/mixed", { fresh: true })!.updatedAt).toBeLessThan(15_000);
+      }
+      // The reader stops renewing: past its 15 s deadline nothing more is armed.
+      now += 20_000;
+      const before = legacyTicks();
+      (timeouts.mock.calls.filter(([, ms]) => ms === 5_000).at(-1)![0] as () => void)();
+      await directory.refresh();
+      expect(legacyTicks()).toBe(before);
+    } finally {
+      clock.mockRestore();
+      timeouts.mockRestore();
+    }
+  });
+
+  // Failure boundary (#11172 review): an old reader joining AFTER a normal lease cached
+  // legacy-needed=false saw our 15 s sessions/ entry lapse for up to one 60 s heartbeat.
+  for (const backend of ["file", "sqlite"] as const) {
+    it(`a state-only reader joining between heartbeats wakes one prompt refresh through the ${backend} state commit, without a loop`, async () => {
+      const { mesh, directory } = fixture("join", backend);
+      if (mesh.stateBackend !== backend) return; // no node:sqlite here: nothing to prove for this backend
+      const commits = stateCommitWatch(mesh);
+      // Another store instance on the same root: its own snapshot cache, its own commits (as another process).
+      const other = new MeshStore(mesh.root, 64 * 1024, 1_000, { stateBackend: backend });
+      let now = Date.now();
+      const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+      const timeouts = vi.spyOn(globalThis, "setTimeout");
+      const legacyTicks = () => timeouts.mock.calls.filter(([, ms]) => ms === 5_000).length;
+      try {
+        await directory.start();
+        expect(legacyTicks()).toBe(0);
+        const scheduled = vi.spyOn(directory, "refresh");
+        // 20 s into the 60 s heartbeat: our fixed-TTL sessions/ entry already looks dead to an old reader.
+        now += 20_000;
+        const joinedAt = now;
+        await addStateOnlyReader(other, joinedAt);
+        commits.notify("events.jsonl"); // a non-state notification must not carry the join
+        expect(scheduled).not.toHaveBeenCalled();
+        commits.notify();
+        expect(scheduled).toHaveBeenCalledOnce();
+        await settledRefresh(scheduled.mock.results[0]!.value);
+        expect(mesh.get("sessions/join", { fresh: true })!.updatedAt).toBe(joinedAt);
+        expect(legacyTicks()).toBe(1);
+        commits.notify(); // our own publication and its duplicate must not loop
+        commits.notify();
+        await other.put({ key: "unrelated/join-control", identity: identityOf("writer"), value: true });
+        commits.notify();
+        expect(scheduled).toHaveBeenCalledTimes(1);
+        expect(legacyTicks()).toBe(1);
+      } finally {
+        clock.mockRestore();
+        timeouts.mockRestore();
+        commits.restore();
+        if (backend === "sqlite") other.closeState();
+      }
+    }, 15_000);
+  }
+
+  it.each(["file", "sqlite"] as const)("does not turn unrelated %s commits into idle refreshes or compatibility timers", async backend => {
+    const { mesh, directory } = fixture("no-old-reader", backend);
+    const commits = stateCommitWatch(mesh);
+    const other = new MeshStore(mesh.root, 64 * 1024, 1_000, { stateBackend: backend });
+    const timeouts = vi.spyOn(globalThis, "setTimeout");
+    const intervals = vi.spyOn(globalThis, "setInterval");
+    try {
+      await directory.start();
+      const before = mesh.get("sessions/no-old-reader", { fresh: true });
+      const scheduled = vi.spyOn(directory, "refresh");
+      const tokens = vi.spyOn(mesh, "stateToken");
+      await other.put({ key: "unrelated/join-control", identity: identityOf("writer"), value: { changed: true } });
+      commits.notify();
+      expect(tokens).toHaveBeenCalled();
+      expect(scheduled).not.toHaveBeenCalled();
+      expect(timeouts.mock.calls.filter(([, ms]) => ms === 5_000)).toHaveLength(0);
+      expect(intervals.mock.calls.map(([, ms]) => ms)).toEqual([60_000]);
+      expect(mesh.get("sessions/no-old-reader", { fresh: true })).toEqual(before);
+    } finally {
+      timeouts.mockRestore();
+      intervals.mockRestore();
+      commits.restore();
+      if (backend === "sqlite") other.closeState();
+    }
+  });
+
+  // CODE-1: a failed final tick must not leave A's join edge latched after its cadence expires.
+  // Keep reason: transient pre-read failure + reader expiry is not cheaply reachable in a user flow.
+  it.each(["file", "sqlite"] as const)("wakes exactly once for reader B after A expires and its final %s compatibility refresh fails", async backend => {
+    const { mesh, directory } = fixture("expiry-join", backend);
+    const commits = stateCommitWatch(mesh);
+    expect(mesh.stateBackend).toBe(backend);
+    const other = new MeshStore(mesh.root, 64 * 1024, 1_000, { stateBackend: backend });
+    let now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+    const timeouts = vi.spyOn(globalThis, "setTimeout");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const legacyTicks = () => timeouts.mock.calls.filter(([, ms]) => ms === 5_000).length;
+    try {
+      await directory.start();
+      const scheduled = vi.spyOn(directory, "refresh");
+      now += 30_000;
+      await addStateOnlyReader(other, now);
+      commits.notify();
+      expect(scheduled).toHaveBeenCalledOnce();
+      await settledRefresh(scheduled.mock.results[0]!.value);
+      expect(legacyTicks()).toBe(1);
+      now += 15_001; // A's fixed lease has expired; no intervening commit clears its latch.
+      const failure = new Error("final compatibility refresh failed before canonical read");
+      directory.options.beforePublication = async () => { throw failure; };
+      const tick = timeouts.mock.calls.findIndex(([, ms]) => ms === 5_000);
+      clearTimeout(timeouts.mock.results[tick]!.value);
+      (timeouts.mock.calls[tick]![0] as () => void)();
+      await expect(scheduled.mock.results.at(-1)!.value).rejects.toBe(failure);
+      await vi.waitFor(() => expect(warn).toHaveBeenCalledOnce()); // background retry recorded the failure
+      expect(legacyTicks()).toBe(1); // the expired cadence was cancelled, not re-polled
+      delete directory.options.beforePublication;
+      scheduled.mockClear();
+      now += 1_001; // the existing non-transient background backoff, not another heartbeat
+      const peer = identityOf("reader-b");
+      await other.put({ key: "sessions/reader-b", identity: peer, value: { id: peer.id, sessionId: "reader-b",
+        cwd: "/tmp/project", startedAt: now, status: "idle" } });
+      commits.notify();
+      expect(scheduled).toHaveBeenCalledOnce();
+      await settledRefresh(scheduled.mock.results[0]!.value);
+      expect(mesh.get("sessions/expiry-join", { fresh: true })!.updatedAt).toBe(now);
+      expect(legacyTicks()).toBe(2);
+      commits.notify(); // own publication
+      // B's refresh commits to the same watch; neither that own commit nor unrelated commits loop.
+      const tokens = vi.spyOn(mesh, "stateToken");
+      await other.put({ key: "unrelated/expiry-join-control", identity: identityOf("writer"), value: true });
+      commits.notify();
+      expect(tokens).toHaveBeenCalled();
+      expect(scheduled).toHaveBeenCalledOnce();
+      expect(legacyTicks()).toBe(2);
+    } finally {
+      delete directory.options.beforePublication;
+      clock.mockRestore();
+      timeouts.mockRestore();
+      warn.mockRestore();
+      commits.restore();
+      if (backend === "sqlite") other.closeState();
+    }
+  });
+
+  it.each(["file", "sqlite"] as const)("does not reset the join latch for successful %s refreshes without a legacy session to publish", async backend => {
+    const { mesh, identity, directory } = fixture("no-legacy-put", backend);
+    const commits = stateCommitWatch(mesh);
+    expect(mesh.stateBackend).toBe(backend);
+    const other = new MeshStore(mesh.root, 64 * 1024, 1_000, { stateBackend: backend });
+    let status = "idle";
+    directory.registerSource(() => {
+      const record = { ...rootRecord(identity.id, identity.id, "no-legacy-put"), status };
+      delete record.cwd;
+      delete record.sessionId;
+      return [record];
+    });
+    const timeouts = vi.spyOn(globalThis, "setTimeout");
+    try {
+      await directory.start();
+      const scheduled = vi.spyOn(directory, "refresh");
+      await addStateOnlyReader(other, Date.now());
+      commits.notify();
+      expect(scheduled).toHaveBeenCalledOnce();
+      await settledRefresh(scheduled.mock.results[0]!.value);
+      commits.notify(); // own publication
+      status = "running";
+      await directory.refresh(); // real own state commit, but still no legacyPut/cadence
+      commits.notify();
+      const tokens = vi.spyOn(mesh, "stateToken");
+      await other.put({ key: "unrelated/no-legacy-put", identity: identityOf("writer"), value: true });
+      commits.notify();
+      expect(tokens).toHaveBeenCalled();
+      expect(scheduled).toHaveBeenCalledTimes(2); // join + explicit refresh only
+      expect(mesh.get("sessions/no-legacy-put", { fresh: true })).toBeUndefined();
+      expect(timeouts.mock.calls.filter(([, ms]) => ms === 5_000)).toHaveLength(0);
+    } finally {
+      timeouts.mockRestore();
+      commits.restore();
+      if (backend === "sqlite") other.closeState();
+    }
+  });
+
+  // The join wake can share an idle refresh whose preparation still saw no old reader.
+  // Its post-confirmation read must carry BOTH the session renewal and compatibility deadline.
+  it.each(["file", "sqlite"] as const)("keeps the join deadline when the %s commit wake joins an in-flight confirmation", async backend => {
+    const { mesh, directory } = fixture("confirm-join", backend);
+    const commits = stateCommitWatch(mesh);
+    const other = new MeshStore(mesh.root, 64 * 1024, 1_000, { stateBackend: backend });
+    let now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+    const timeouts = vi.spyOn(globalThis, "setTimeout");
+    const legacyTicks = () => timeouts.mock.calls.filter(([, ms]) => ms === 5_000).length;
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    let entered!: () => void;
+    const confirming = new Promise<void>(resolve => { entered = resolve; });
+    const confirm = mesh.confirmWritable.bind(mesh);
+    let refreshing: Promise<void> | undefined;
+    try {
+      await directory.start();
+      now += 30_000;
+      vi.spyOn(mesh, "confirmWritable").mockImplementationOnce(async callback => {
+        entered();
+        await held;
+        await confirm(callback);
+      });
+      refreshing = directory.refresh();
+      await confirming;
+      const scheduled = vi.spyOn(directory, "refresh");
+      await addStateOnlyReader(other, now);
+      commits.notify();
+      expect(scheduled).toHaveBeenCalledTimes(1);
+      release();
+      await refreshing;
+      await settledRefresh(scheduled.mock.results[0]!.value);
+      expect(mesh.get("sessions/confirm-join", { fresh: true })!.updatedAt).toBe(now);
+      expect(legacyTicks()).toBe(1);
+      commits.notify(); // own publication
+      expect(scheduled).toHaveBeenCalledTimes(1); // own publication does not wake another refresh
+      expect(legacyTicks()).toBe(1);
+    } finally {
+      release();
+      await refreshing;
+      clock.mockRestore();
+      timeouts.mockRestore();
+      commits.restore();
+      if (backend === "sqlite") other.closeState();
+    }
+  });
+
+  it("control: without the root watch the joining reader waits for the heartbeat (the watch is the carrier)", async () => {
+    const { mesh, directory } = fixture("unwatched");
+    const other = new MeshStore(mesh.root, 64 * 1024, 1_000);
+    const realWatch = fs.watch;
+    const watched = vi.spyOn(fs, "watch").mockImplementation(((target: fs.PathLike, ...rest: unknown[]) =>
+      String(target) === mesh.root ? new (class extends (Object as any) { close() {} on() { return this; } })()
+        : (realWatch as any)(target, ...rest)) as typeof fs.watch);
+    try {
+      await directory.start();
+      const scheduled = vi.spyOn(directory, "refresh");
+      await addStateOnlyReader(other, Date.now());
+      await new Promise((resolve) => setTimeout(resolve, 1_000));
+      expect(scheduled).not.toHaveBeenCalled();
+    } finally {
+      watched.mockRestore();
+    }
+  });
+
+  // CODE-3/SEC-1 (#11172 audit): the root watch is the required join carrier for the 60 s default; its
+  // failure must fail closed, never fall back to a timer or poll. Decision C: unit-level, fs.watch stubbed.
+  const fakeWatcher = () => {
+    const emitter = new EventEmitter() as EventEmitter & { close: () => void };
+    emitter.close = vi.fn();
+    return emitter;
+  };
+  const stubRootWatch = (root: string, plan: Array<"throw" | "fake">) => {
+    const realWatch = fs.watch;
+    const made: ReturnType<typeof fakeWatcher>[] = [];
+    let calls = 0;
+    const spy = vi.spyOn(fs, "watch").mockImplementation(((target: fs.PathLike, ...rest: unknown[]) => {
+      if (String(target) !== root) return (realWatch as any)(target, ...rest);
+      const step = plan[calls++] ?? "throw";
+      if (step === "throw") throw Object.assign(new Error("ENOSPC: watch limit"), { code: "ENOSPC" });
+      const watcher = fakeWatcher();
+      made.push(watcher);
+      return watcher;
+    }) as typeof fs.watch);
+    return { spy, made, calls: () => calls };
+  };
+  const noTimers = () => {
+    const timeouts = vi.spyOn(globalThis, "setTimeout");
+    const intervals = vi.spyOn(globalThis, "setInterval");
+    return {
+      created: () => [...timeouts.mock.calls, ...intervals.mock.calls].map(([, ms]) => ms),
+      restore: () => { timeouts.mockRestore(); intervals.mockRestore(); },
+    };
+  };
+
+  it("retries a failed join-watch registration once synchronously and then serves normally", async () => {
+    const { mesh, directory } = fixture("retry-ok");
+    const watch = stubRootWatch(mesh.root, ["throw", "fake"]);
+    try {
+      await directory.start();
+      expect(watch.calls()).toBe(2);
+      expect(directory.heartbeatArmed).toBe(true);
+      expect(directory.canConsumeMesh()).toBe(true);
+    } finally { watch.spy.mockRestore(); }
+  });
+
+  it("rejects start and cancels the heartbeat when the join watch cannot be registered twice, without publishing", async () => {
+    const { mesh, directory } = fixture("retry-fail");
+    const watch = stubRootWatch(mesh.root, ["throw", "throw"]);
+    const timers = noTimers();
+    const clears = vi.spyOn(globalThis, "clearInterval");
+    try {
+      await expect(directory.start()).rejects.toThrow(/join watch .* could not be registered/);
+      expect(watch.calls()).toBe(2);                       // exactly one synchronous retry
+      expect(directory.heartbeatArmed).toBe(false);
+      expect(clears).toHaveBeenCalledTimes(1);              // the 60 s heartbeat was cancelled
+      expect(timers.created().filter((ms) => ms !== 60_000)).toEqual([]); // no degraded retry timer/poll
+      expect(mesh.get("sessions/retry-fail", { fresh: true })).toBeUndefined(); // never advertised
+      expect(directory.canConsumeMesh()).toBe(false);
+    } finally {
+      watch.spy.mockRestore();
+      timers.restore();
+      clears.mockRestore();
+    }
+  });
+
+  it("re-registers a watch lost to a native error once and checks the state once", async () => {
+    const { mesh, directory } = fixture("rearm");
+    const watch = stubRootWatch(mesh.root, ["fake", "fake"]);
+    try {
+      await directory.start();
+      const timers = noTimers();
+      const tokens = vi.spyOn(mesh, "stateToken");
+      try {
+        watch.made[0]!.emit("error", new Error("EPERM"));
+        expect(watch.made[0]!.close).toHaveBeenCalled();
+        expect(watch.calls()).toBe(2);
+        expect(tokens).toHaveBeenCalledTimes(1);            // one bounded state check, no loop
+        expect(timers.created()).toEqual([]);              // no recovery timer
+        expect(directory.heartbeatArmed).toBe(true);
+        expect(directory.degraded).toBe(false);
+        expect(directory.canConsumeMesh()).toBe(true);
+      } finally {
+        tokens.mockRestore();
+        timers.restore();
+      }
+    } finally { watch.spy.mockRestore(); }
+  });
+
+  it("fails closed after a second watch loss: degraded, heartbeat stopped, consumption fenced, owner told once", async () => {
+    const identity = identityOf("lost");
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-11172-"));
+    roots.push(root);
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 1_000);
+    const lost = vi.fn();
+    const directory = new ParticipantDirectory(mesh, { enabled: true, hostId: identity.id, rootId: identity.id, identity,
+      reapDeadHosts: false, onLifecycleLost: lost });
+    directory.registerSource(() => [rootRecord(identity.id, identity.id, "lost")]);
+    directories.push(directory);
+    const watch = stubRootWatch(mesh.root, ["fake", "fake"]);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      await directory.start();
+      const timers = noTimers();
+      try {
+        watch.made[0]!.emit("close");                       // unexpected close: the one re-arm
+        watch.made[1]!.emit("error", new Error("EIO"));    // repeated failure: fail closed
+        watch.made[1]!.emit("close");                       // trailing close is not a third event
+        expect(watch.calls()).toBe(2);
+        expect(directory.degraded).toBe(true);
+        expect(directory.heartbeatArmed).toBe(false);
+        expect(directory.canConsumeMesh()).toBe(false);
+        expect(lost).toHaveBeenCalledTimes(1);
+        expect(lost).toHaveBeenCalledWith(expect.any(Number), "participant join watch failed");
+        expect(timers.created()).toEqual([]);
+      } finally { timers.restore(); }
+    } finally {
+      watch.spy.mockRestore();
+      warn.mockRestore();
+    }
+  });
+
+  it("cancels the compatibility tick on suspend, on close and when the old reader lapses", async () => {
+    const { mesh, directory } = fixture("cancel");
+    let now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+    const timeouts = vi.spyOn(globalThis, "setTimeout");
+    const clears = vi.spyOn(globalThis, "clearTimeout");
+    const armed = () => timeouts.mock.results.filter((_r, index) => timeouts.mock.calls[index]![1] === 5_000).at(-1)!.value;
+    try {
+      await addStateOnlyReader(mesh, now);
+      await directory.start();
+      let handle = armed();
+      directory.suspend();
+      expect(clears).toHaveBeenCalledWith(handle);
+      directory.resume();
+      await directory.refresh();
+      handle = armed();
+      // The reader lapses: the next refresh drops the pending tick instead of keeping it.
+      now += 20_000;
+      await directory.refresh();
+      expect(clears).toHaveBeenCalledWith(handle);
+      await addStateOnlyReader(mesh, now);
+      await directory.refresh();
+      handle = armed();
+      await directory.close();
+      expect(clears).toHaveBeenCalledWith(handle);
+    } finally {
+      clock.mockRestore();
+      timeouts.mockRestore();
+      clears.mockRestore();
+    }
   });
 });

@@ -6,7 +6,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { CapturedToolCatalog } from "../src/capture/catalog.js";
 import { FabricState } from "../src/fabric-state.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
-import { ParticipantDirectory } from "../src/topology/participant-directory.js";
+import { PARTICIPANT_HEARTBEAT_MS, ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { readHostLeases } from "../src/topology/host-leases.js";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
 
@@ -41,6 +41,25 @@ const invalidatable = <T extends object>(target: T): { value: T; invalidate: () 
 };
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// smarty-dev#11172 moved the default participant heartbeat to 60 s (TTL 180 s, confirmation 120 s).
+// The reload/new cases prove several real successor heartbeats inside 16 s, so only the
+// ParticipantDirectory #armHeartbeat interval physically fires every TEST_PHYSICAL_HEARTBEAT_MS.
+// Every directory keeps the production 60 s heartbeat, 180 s lease and 120 s confirmation
+// arithmetic: no heartbeatMs option (which would also select the legacy 15 s TTL), no fake clock.
+const TEST_PHYSICAL_HEARTBEAT_MS = 5_000;
+const redirectParticipantHeartbeat = () => {
+  const realSetInterval = globalThis.setInterval;
+  let redirected = 0;
+  const spy = vi.spyOn(globalThis, "setInterval").mockImplementation(((handler: () => void, delay?: number, ...args: unknown[]) => {
+    if (delay === PARTICIPANT_HEARTBEAT_MS && new Error().stack?.includes("armHeartbeat")) {
+      redirected++;
+      delay = TEST_PHYSICAL_HEARTBEAT_MS;
+    }
+    return realSetInterval(handler, delay, ...args);
+  }) as unknown as typeof setInterval);
+  return { spy, redirected: () => redirected };
+};
 
 const harness = () => {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-main-hb-"));
@@ -97,6 +116,8 @@ describe("a Main's own heartbeat across reload and session replacement (smarty-d
   ])("after %s the Main's lease keeps renewing (age < 15 s) with no stale-ctx error", async (reason, firstId, nextId) => {
     const h = harness();
     const warn = vi.spyOn(console, "warn");
+    // Default 60 s heartbeat (smarty-dev#11172): physically 5 s, production lease arithmetic unchanged.
+    const heartbeat = redirectParticipantHeartbeat();
     const faults: unknown[] = [];
     const onFault = (error: unknown) => { faults.push(error); };
     process.on("uncaughtException", onFault);
@@ -109,6 +130,8 @@ describe("a Main's own heartbeat across reload and session replacement (smarty-d
     await h.sessionStart(one.state, first.value as unknown as ExtensionContext);
     await one.state.ensure(first.value as unknown as ExtensionContext);
     expect(h.leaseAge(`session:${firstId}`)).toBeLessThan(2_000);
+    const armedFirst = heartbeat.redirected();
+    expect(armedFirst).toBeGreaterThanOrEqual(1);
 
     // Pi: session_shutdown to the old generation, then invalidate its ctx and pi.
     await one.state.shutdown(reason);
@@ -120,8 +143,9 @@ describe("a Main's own heartbeat across reload and session replacement (smarty-d
     const next = h.session(nextId);
     await h.sessionStart(two.state, next.value as unknown as ExtensionContext);
 
-    // Three heartbeats (5 s) with no Fabric tool use in the successor.
+    // Three physical heartbeats (5 s, redirected from the 60 s default) with no Fabric tool use in the successor.
     await sleep(16_000);
+    expect(heartbeat.redirected()).toBeGreaterThan(armedFirst); // the successor re-armed its own timer
     expect(h.leaseAge(`session:${nextId}`)).toBeLessThan(15_000);
     expect(staleWarnings(warn)).toEqual([]);
     expect(faults.map(String)).toEqual([]);
@@ -224,14 +248,16 @@ describe("a Main's own heartbeat across reload and session replacement (smarty-d
     await h.sessionStart(one.state, first.value as unknown as ExtensionContext);
     await one.state.ensure(first.value as unknown as ExtensionContext);
     const [directory] = directories;
-    const lost = (directory as unknown as { options: { onLifecycleLost?: (ticks: number) => void } }).options.onLifecycleLost;
+    const lost = (directory as unknown as { options: { onLifecycleLost?: (ticks: number, reason?: string) => void } }).options.onLifecycleLost;
     expect(lost).toBeTypeOf("function");
-    lost!(3);
+    // smarty-dev#11172: watcher failure uses the same receiver, with its actual reason and Main attribution.
+    lost!(3, "participant join watch failed");
     const mesh = new MeshStore(h.meshRoot, 64 * 1024, 1_000);
     await vi.waitFor(() => {
       const events = mesh.read({ topic: "ops.fabric.presence" });
       expect(JSON.stringify(events)).toContain("fabric.presence.degraded");
       expect(JSON.stringify(events)).toContain(`session:${sessionId}`);
+      expect(JSON.stringify(events)).toContain('"reason":"participant join watch failed"');
     }, { timeout: 3_000 });
   }, 20_000);
 });

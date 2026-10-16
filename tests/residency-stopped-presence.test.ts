@@ -7,8 +7,8 @@ import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore, type MeshBatchOperation } from "../src/mesh/store.js";
 import { ResidentHost } from "../src/residency/host.js";
 import { residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
-import { LIVENESS_POLICY_KEY } from "../src/topology/host-leases.js";
-import { ParticipantDirectory } from "../src/topology/participant-directory.js";
+import { LIVENESS_POLICY_KEY, readHostLease } from "../src/topology/host-leases.js";
+import { DEFAULT_PARTICIPANT_LEASE_MS, ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { readParticipantFile } from "../src/topology/participant-files.js";
 
 // smarty-dev#6729 / #6477: an idle resident heartbeat must not rewrite the presence of
@@ -121,7 +121,13 @@ describe("resident heartbeat with stopped actors (smarty-dev#6729)", () => {
     const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
     try {
       host.participants.suspend();
-      now += 16_000;
+      const lease = readHostLease(config.meshRoot, host.hostId)!;
+      // #13468 deliberately replaces #6729's 15 s ordinary expiry with three minute-heartbeats.
+      // Keep the crash bound exact, and prove both sides of the configured deadline.
+      expect(lease.expiresAt - lease.updatedAt).toBe(DEFAULT_PARTICIPANT_LEASE_MS);
+      now = lease.expiresAt - 1;
+      expect(observer.get(id, undefined, { fresh: true })).toMatchObject({ stale: false });
+      now = lease.expiresAt + 1;
       expect(observer.get(id, undefined, { fresh: true })).toBeUndefined();
       expect(host.mesh.get(presenceKey(id), { fresh: true })!.version).toBe(presence.version);
       expect(host.mesh.get(participantKey(id), { fresh: true })?.version).toBe(participant?.version);

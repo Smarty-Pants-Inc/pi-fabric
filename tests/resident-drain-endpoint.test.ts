@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore } from "../src/mesh/store.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
+import { FabricControlPlane } from "../src/topology/control-plane.js";
 import { ResidentHost, runResidentHostFromConfigPath } from "../src/residency/host.js";
 import { processStartTime } from "../src/residency/process-identity.js";
 import { newResidentRequestId } from "../src/residency/request-expiry.js";
@@ -467,5 +468,78 @@ describe.skipIf(process.platform !== "linux")("owner-authenticated cooperative r
       expect(() => assertAutomaticReleaseRecovery()).toThrow(/unavailable/);
       expect(f.idle).not.toHaveBeenCalled();
     } finally { await f.close(); }
+  });
+
+  // Decision C: incident smarty-dev#11172 removed the timer that hid a lost final-settlement wake.
+  // E2E: idle-wakes gate, owner fv2-11172wake/event-lead; both modes <=1 wake/s, no site >1/min.
+  it("11172 drain hold releases queued request, config event, and due schedule after final control settlement", async () => {
+    const f = await fixture();
+    const entered = deferred(), release = deferred();
+    // Main is the real sender; the resident owner must not count its own outgoing ACK wait as drain custody.
+    const sender = new FabricControlPlane(f.mesh, f.intent.caller.identity,
+      { enabled: true, hostId: f.config.rootId, canConsumeMesh: () => f.participants.canConsumeMesh() });
+    sender.start(async () => ({ accepted: false, error: "fixture Main does not accept commands" }));
+    let control: Promise<unknown> | undefined, queued: Promise<ResidentCommandResponse> | undefined;
+    const configPath = path.join(f.config.residencyRoot, "config.json");
+    const replacementPath = `${configPath}.${randomUUID()}.tmp`;
+    try {
+      const target = await f.send({ format: 1, operation: "createActor", requestId: randomUUID(), rootId: f.config.rootId,
+        createdAt: Date.now(), caller: f.intent.caller,
+        request: { name: "drain-control-target", instructions: "Retained mailbox target; never activated", residency: "durable",
+          delivery: "mailbox", triggerTurn: false } });
+      expect(target.ok).toBe(true); expect(target.actor?.id).toEqual(expect.any(String));
+      const resolveBinding = f.host.actors.resolveActivationBinding.bind(f.host.actors);
+      vi.spyOn(f.host.actors, "resolveActivationBinding").mockImplementation(async (...args) => {
+        entered.resolve(); await release.promise; return resolveBinding(...args);
+      });
+      control = sender.request(f.host.hostId, target.actor!.id, "followUp",
+        { message: "held precut mailbox obligation", triggerTurn: false }, f.host.hostId);
+      await Promise.race([entered.promise, new Promise<never>((_, reject) => setTimeout(() => reject(new Error("control admission did not enter")), 2_000))]);
+      const held = await f.drain({ timeoutMs: 4_000 });
+      expect(held).toMatchObject({ ok: true, drain: { phase: "held", outcome: "held", admissionHeld: true, terminal: false } });
+      const maintenanceSample = vi.spyOn(f.host.actors, "nextStuckPreparingAt");
+      const queuedRequestId = randomUUID();
+      queued = f.send({ format: 1, operation: "createActor", requestId: queuedRequestId, rootId: f.config.rootId,
+        createdAt: Date.now(), caller: f.intent.caller,
+        request: { name: "drain-queued-create", instructions: "Queued after the real drain hold", residency: "durable",
+          delivery: "mailbox", triggerTurn: false } });
+      const queuedPath = path.join(f.config.residencyRoot, "requests", `${queuedRequestId}.json`);
+      expect(fs.existsSync(queuedPath)).toBe(true);
+      let admitted = false;
+      void queued.then(() => { admitted = true; });
+      const replacement = { ...f.config, mesh: { ...f.config.mesh, residentIdleExitMs: 1_234 },
+        retention: { ...f.config.retention, oneShotRunMs: f.config.retention.oneShotRunMs + 1 } };
+      fs.writeFileSync(replacementPath, JSON.stringify(replacement), { mode: 0o600 }); fs.renameSync(replacementPath, configPath);
+      const topic = `drain.merge.${randomUUID().replaceAll("-", "")}`;
+      const scheduleKey = `drain-merge-${randomUUID()}`;
+      await f.mesh.schedule({ topic, kind: "held-maintenance", from: f.intent.caller.identity, text: "must wait for resume",
+        dueAt: Date.now() + 200, key: scheduleKey });
+      await new Promise(resolve => setTimeout(resolve, 450));
+      expect(admitted).toBe(false);
+      expect(fs.existsSync(queuedPath)).toBe(true);
+      expect(f.host.actors.listOwned().some(actor => actor.name === "drain-queued-create")).toBe(false);
+      expect(f.mesh.scheduled({ topic })).toHaveLength(1);
+      expect(f.mesh.read({ topic })).toHaveLength(0);
+      expect(maintenanceSample).not.toHaveBeenCalled();
+      // Resume the original binding and the real precut withReleaseAdmission/ACK settlement.
+      // No watcher callback, timer advance, fresh request, or synthetic wake is supplied.
+      release.resolve();
+      await expect(control).resolves.toMatchObject({ acknowledged: true });
+      expect(await f.terminal(held.drain!)).toMatchObject({ outcome: "containment-unavailable", code: "CONTAINMENT_UNAVAILABLE",
+        admissionHeld: false, terminal: true });
+      expect(await queued).toMatchObject({ ok: true, actor: { name: "drain-queued-create" } });
+      await new Promise(resolve => setTimeout(resolve, 250));
+      expect(f.mesh.scheduled({ topic })).toHaveLength(0);
+      expect(f.mesh.read({ topic })).toHaveLength(1);
+      expect(maintenanceSample).toHaveBeenCalled();
+      expect(f.idle).not.toHaveBeenCalled();
+    } finally {
+      release.resolve();
+      void control?.catch(() => undefined);
+      void queued?.catch(() => undefined);
+      if (fs.existsSync(replacementPath)) fs.rmSync(replacementPath, { force: true });
+      await sender.close();
+      await f.close();
+    }
   });
 });

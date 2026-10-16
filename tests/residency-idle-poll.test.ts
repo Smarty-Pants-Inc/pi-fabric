@@ -37,6 +37,11 @@ const fixture = (onIdle: () => void = () => {}) => {
 };
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+// smarty-dev#11172: no request tick. Deadlines (idle window, maintenance, presence pass) are armed
+// against the host clock; fake timers fire them as the mocked clock moves. shouldAdvanceTime keeps
+// startup's real waits progressing. Root liveness is re-sampled by the presence pass (<= 1/min).
+const PRESENCE_SAMPLE_MS = 60_000;
+const fakeTimers = () => vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"], shouldAdvanceTime: true });
 const waitUntil = async (done: () => boolean, ms = 5_000) => {
   for (let waited = 0; waited < ms && !done(); waited += 20) await sleep(20);
   return done();
@@ -56,6 +61,7 @@ describe("idle resident host polling (smarty-dev#6729)", () => {
     // The host's own clock drives the one-second reuse; real 50 ms ticks keep running.
     // Measuring against wall time made the bound depend on how fast the runner was.
     const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+    fakeTimers();
     const reads = vi.spyOn(fs, "readFileSync");
     const configReads = () => reads.mock.calls.filter(([read]) => String(read) === file).length;
     try {
@@ -80,21 +86,24 @@ describe("idle resident host polling (smarty-dev#6729)", () => {
         try { return active(); } finally { inCheck--; }
       });
       reads.mockClear();
-      // About 20 request ticks with the clock still: at most the one current observation the
-      // reused one needs. Before: one check (and one fleet-wide listing) on every tick.
+      // One second of real time with the clock still: at most the one current observation the
+      // reused one needs. Before: one check (and one fleet-wide listing) on every 50 ms tick.
       await sleep(1_000);
       const first = checks.mock.calls.length;
       expect(first).toBeLessThanOrEqual(1);
+      // smarty-dev#11172: with no tick, advancing the clock and every armed timer adds at most one
+      // check per second (zero without a deadline or event); the per-tick counterexample stays rejected.
       for (let second = 1; second <= 2; second++) {
         now += 1_000;
-        expect(await waitUntil(() => checks.mock.calls.length >= first + second)).toBe(true);
+        await vi.advanceTimersByTimeAsync(1_000);
         await sleep(500);
-        expect(checks.mock.calls.length).toBe(first + second);
+        expect(checks.mock.calls.length).toBeLessThanOrEqual(first + second);
       }
       expect(checkListings).toBe(checks.mock.calls.length);
       // Before: the 100 ms maintenance tick re-read and parsed the unchanged config.json each time.
       expect(configReads()).toBe(0);
     } finally {
+      vi.useRealTimers();
       clock.mockRestore();
       reads.mockRestore();
       await host.close();
@@ -194,31 +203,30 @@ describe("idle resident host polling (smarty-dev#6729)", () => {
     let now = Date.now();
     // Freeze before construction/startup: fence and recovery latency are not idle time.
     const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+    fakeTimers();
+    const advance = async (ms: number) => { now += ms; await vi.advanceTimersByTimeAsync(ms); await sleep(200); };
     const { root, host } = fixture(() => { idled++; });
     try {
       await host.start();
       let active = false;
       const checks = vi.spyOn(host.actors, "hasOwnedActors").mockImplementation(() => active);
       await sleep(200); // Start the continuously dead-and-empty observation window.
-      // Just short of the idle window: the next tick takes a current (inactive) observation.
-      now += 29_950;
-      await sleep(200);
+      // Just short of the idle window: no exit.
+      await advance(29_950);
       expect(idled).toBe(0);
-      // An actor wakes; the reused observation still says inactive, and the window has elapsed.
+      // An actor wakes; the reused observation still says inactive, and the window deadline elapses.
       active = true;
       const before = checks.mock.calls.length;
-      now += 100;
-      await sleep(200);
+      await advance(100);
       expect(checks.mock.calls.length).toBeGreaterThan(before);
       expect(idled).toBe(0);
       // Truly idle for the whole window again: the host exits.
       active = false;
-      now += 1_000;
-      await sleep(200); // First confirmed zero-actor sample starts the new window.
-      now += 30_100;
-      await sleep(200);
+      await advance(PRESENCE_SAMPLE_MS); // First confirmed zero-actor sample (presence pass) starts the new window.
+      await advance(30_100);
       expect(idled).toBeGreaterThan(0);
     } finally {
+      vi.useRealTimers();
       clock.mockRestore();
       await host.close();
       fs.rmSync(root, { recursive: true, force: true });
@@ -230,11 +238,14 @@ describe("idle resident host polling (smarty-dev#6729)", () => {
     const { root, host } = fixture(() => { idled++; });
     let now = Date.now();
     const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+    fakeTimers();
+    const settle = async () => { await vi.advanceTimersByTimeAsync(0); await sleep(200); };
     try {
       await host.start();
       await sleep(200);
-      // Close to the idle window with no actor: the next tick caches an inactive observation.
+      // Close to the idle window with no actor: an inactive observation is cached.
       now += 29_000;
+      await vi.advanceTimersByTimeAsync(29_000);
       await sleep(200);
       expect(idled).toBe(0);
       const sampledAt = now;
@@ -257,16 +268,20 @@ describe("idle resident host polling (smarty-dev#6729)", () => {
       const ended = now;
       // Past the window since the host started, but only 1.1 s after the run ended.
       now += 1_100;
-      await sleep(200);
+      await vi.advanceTimersByTimeAsync(1_100);
+      await settle();
       expect(idled).toBe(0);
       now = ended + 29_900;
-      await sleep(200);
+      await vi.advanceTimersByTimeAsync(28_800);
+      await settle();
       expect(idled).toBe(0);
       // The full window after the run ended: the host exits.
       now = ended + 30_100;
-      await sleep(200);
+      await vi.advanceTimersByTimeAsync(200);
+      await settle();
       expect(idled).toBeGreaterThan(0);
     } finally {
+      vi.useRealTimers();
       clock.mockRestore();
       await host.close();
       fs.rmSync(root, { recursive: true, force: true });

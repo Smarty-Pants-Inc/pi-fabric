@@ -5,8 +5,8 @@ import { isMeshIncarnationPending, isMeshSnapshotRetriesExhausted, isMeshLockTim
 import fs from "node:fs";
 import path from "node:path";
 import type { Readable, Writable } from "node:stream";
-import { readFileRetrying, writeJsonAtomic } from "../core/atomic-write.js";
-import { type FabricHostLease, type FabricMirrorLease, MIRROR_FRESH_MS, hostLeaseExpiry, hostLeasePath, hostLiveness, readHostLease, readHostLeases, removeHostLeaseIf, STATE_LEASE_RENEW_MS, writeHostLease } from "../topology/host-leases.js";
+import { ownProcessIncarnation, readPhysicalHostIdentity, readFileRetrying, writeJsonAtomic } from "../core/atomic-write.js";
+import { type BridgeLeaseProcess, type FabricHostLease, type FabricMirrorLease, MIRROR_FRESH_MS, hostLeaseExpiry, hostLeasePath, hostLiveness, readHostLease, readHostLeases, removeHostLeaseIf, STATE_LEASE_RENEW_MS, writeHostLease } from "../topology/host-leases.js";
 import { meshDirectoryStamp } from "../topology/publication-generation.js";
 import type { FabricHostRecord, FabricParticipantRecord } from "../topology/types.js";
 import { ROOT_ID_PREFIX } from "../topology/root-inbox-shared.js";
@@ -131,6 +131,8 @@ export const isBridgedTopic = (event: Pick<MeshEvent, "topic" | "kind"> & { to?:
   event.topic === "fabric.control.ack" ||
   isWorkTopic(event.topic) ||
   (event.topic === "ops.owner" && (event.kind === "pr.wake" || event.kind === "inbox.age.alarm")) ||
+  (event.topic === "ops.owner" && (event.kind === "bridge.lease.alarm" || event.kind === "bridge.lease.recovered") &&
+    isMeshAlarmTarget(event.to)) ||
   (event.topic === FABRIC_MESH_OUTAGE_ALARM_TOPIC && (event.kind === "mesh-outage" || event.kind === "mesh-recovered") &&
     isMeshAlarmTarget(event.to));
 
@@ -456,11 +458,14 @@ export class StoreBridgeSide implements BridgeSide {
   // replays them on its own snapshot (CommitOutboxPlan.replay) before it stages anything.
   readonly #outbox: CommitOutbox;
   #recovered = false;
+  #leaseProcess: Promise<BridgeLeaseProcess | undefined> | undefined;
 
   constructor(
     readonly store: MeshStore,
     readonly peer: string,
     readonly now: () => number = Date.now,
+    /** CLI link/agent processes opt in; reference/manual adapters keep their existing lease shape. */
+    readonly monitorLease = false,
   ) {
     if (!validBridgeName(peer)) throw new Error(`Invalid bridge peer name: ${peer}`);
     assertBridgeStateBackend(store.root, store.stateBackend);
@@ -1077,6 +1082,13 @@ export class StoreBridgeSide implements BridgeSide {
     // observedAt counts as now: NaN would admit every lapsed host and -Infinity would resurrect
     // one for a full lease (independent review, P2).
     const liveAt = typeof observedAt === "number" && Number.isFinite(observedAt) ? Math.min(now, observedAt) : now;
+    // Stamp the existing mirror lease with LOCAL writer evidence, outside state custody.
+    // A peer's claimed pid/host is never used, including for one-hop re-exports.
+    const bridgeProcess = this.monitorLease ? await (this.#leaseProcess ??= (async () => {
+      const host = readPhysicalHostIdentity();
+      const incarnation = await ownProcessIncarnation();
+      return host && incarnation ? { ...host, link: this.peer, pid: process.pid, incarnation } : undefined;
+    })()) : undefined;
     let leases: BridgeLease[] = [];
     let removed: BridgeUnlease[] = [];
     // One idempotency key per host: a later lease write or removal supersedes an earlier one.
@@ -1116,7 +1128,8 @@ export class StoreBridgeSide implements BridgeSide {
           if (!sampled && until <= now) continue;
           const renewedAt = sampled ? record.updatedAt : Math.min(record.updatedAt, now);
           const mirror: FabricMirrorLease | undefined = sampled ? { remoteHost: relayed ? record.remoteHost! : this.peer, observedAt: liveAt,
-            sourceObservedAt, sourceUpdatedAt: record.updatedAt, sourceExpiresAt: expiresAt } : undefined;
+            sourceObservedAt, sourceUpdatedAt: record.updatedAt, sourceExpiresAt: expiresAt,
+            ...(bridgeProcess ? { bridgeProcess } : {}) } : undefined;
           hosts.set(record.id, record);
           wanted.set(keyFor(HOST_PREFIX, record.id), {
             value: { ...record, updatedAt: now, expiresAt: until, remoteHost: relayed ? record.remoteHost : this.peer,

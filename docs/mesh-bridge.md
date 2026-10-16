@@ -98,6 +98,19 @@ existing events and mirrors root presence. There is no new store or protocol.
   https://github.com/Smarty-Pants-Inc/smarty-dev/issues/7886.
   A rewritten log invalidates the offset generation and reconciles by sequence (from the archive
   when available) before returning to byte tails.
+- Link stall alarms reuse the existing `host-leases/<host-hash>.json` mirror observation
+  (`mirror.observedAt`), not a cursor heartbeat or a new bridge timer. With mirrored roots,
+  existing source/lease deadlines renew that observation even without event traffic. The
+  owner's committed presence-maintenance pass checks for more than three missed 15 s
+  freshness intervals while the locally recorded bridge process is still the same live
+  incarnation on this machine and boot. It publishes one `ops.owner` `bridge.lease.alarm`
+  naming the physical link and lease-lapse age; a fresh lease clears/re-arms that episode
+  and emits `bridge.lease.recovered`. Both use the existing mesh-health session recipient
+  (`PI_FABRIC_MESH_ALARM_TO`, otherwise `SMARTY_LEAD_SESSION`); without one the existing
+  structured mesh-outage journal sink carries the alarm. The sweep never refreshes a lease,
+  sends a probe or restarts a unit. A link with no mirrored roots has no lease to lose and
+  keeps the empty-idle contract. Historical leases without local bridge-process evidence
+  are not monitored until that link completes a new mirror pass.
 - The remote is not trusted. An event from it crosses only when all of these are true:
   - its sender is a live native participant or host identity of the remote;
   - no hub record, live or not, uses that id;

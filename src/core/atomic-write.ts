@@ -904,7 +904,7 @@ const mirrorMeshJournalLine = (line: string): void => {
     child.stdin.end(`${line}\n`);
   } catch (error) { fail(error); }
 };
-const emitMeshJournalAlarm = (alarm: Parameters<typeof meshJournalAlarmLine>[0]): void => {
+export const emitMeshJournalAlarm = (alarm: Parameters<typeof meshJournalAlarmLine>[0]): void => {
   const line = meshJournalAlarmLine(alarm);
   diagnostics.warn("src/core/atomic-write.ts", line);
   mirrorMeshJournalLine(line);

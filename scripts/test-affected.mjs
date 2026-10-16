@@ -94,7 +94,11 @@ if (direct.length === 0 && related.length === 0) {
 // vitest 4: `related` is a subcommand, not a `run` flag.
 const runs = [];
 if (related.length > 0) runs.push(["vitest", "related", ...related]);
-if (direct.length > 0) runs.push(["vitest", "run", ...direct]);
+// ponytail: vitest.config.cts computes exclusions with temp/env side effects, not a
+// reusable export. Let Vitest own discovery for suites covered by dedicated CI jobs.
+// Trade-off: any empty direct selection passes; actual test failures still fail.
+// Keep this off the related run so its existing no-tests behavior is unchanged.
+if (direct.length > 0) runs.push(["vitest", "run", "--passWithNoTests", ...direct]);
 console.log(
   `${base ? `vs ${base}` : "dirty tree"}: ${related.length} changed source file(s), ${direct.length} changed test file(s)`,
 );

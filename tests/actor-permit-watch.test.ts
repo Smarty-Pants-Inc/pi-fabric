@@ -41,6 +41,9 @@ interface Worker {
   record: AgentRunRecord;
   statusFile: string;
   nativeClose: () => void;
+  // Optional independent native/tree joins; absent preserves the original fake.
+  closeJoin?: Promise<void>;
+  stopJoin?: Promise<void>;
   closeStarted: boolean;
   closeJoined: boolean;
   primaryProofScans: number;
@@ -120,6 +123,7 @@ beforeEach(() => {
         // not an immediate uncertainty failure at logical settlement.
         worker.closeStarted = true;
         await closed;
+        if (worker.closeJoin) await worker.closeJoin;
         if (worker.alive || worker.descendants || worker.debt) throw new Error("Native custody still open");
         worker.closeJoined = true;
       },
@@ -127,6 +131,7 @@ beforeEach(() => {
       stop: async () => {
         if (worker.alive || worker.descendants || worker.debt) throw new Error("Owned tree exit unconfirmed");
         await closed;
+        if (worker.stopJoin) await worker.stopJoin;
       },
     };
   });
@@ -819,6 +824,173 @@ describe("actor worker permit release (#9031)", () => {
       }
       // Cancel queued receipts; a RED early launch may have promoted one
       // before the snapshot flush, so leave that fake to afterEach's drain.
+      try {
+        for (const waiting of snapshot(f).waiting) await f.agents.stop(waiting.runId, { consume: false }).catch(() => undefined);
+      } finally { Object.defineProperty(process, "platform", platform); }
+    }
+  });
+
+  it.each([
+    ["ESRCH", false],
+    ["different-birth", false],
+    ["ESRCH", true],
+    ["different-birth", true],
+  ] as const)("Windows close callback before terminal read retains RUN through captured close (proof=%s, pending stop=%s)", async (primaryProof, pendingStop) => {
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    const launch = vi.mocked(ProcessTransport.prototype.launch).getMockImplementation()!;
+    const calls: Array<{ operation: string; pid: number }> = [];
+    let resumeMonitor!: () => void;
+    const monitorGate = new Promise<void>(resolve => { resumeMonitor = resolve; });
+    let releaseClose!: () => void;
+    const closeJoin = new Promise<void>(resolve => { releaseClose = resolve; });
+    let releaseStop!: () => void;
+    const stopJoin = new Promise<void>(resolve => { releaseStop = resolve; });
+    let firstId: string | undefined;
+    let monitorHeld = false;
+    let closeDelivered!: Promise<void>;
+    vi.mocked(ProcessTransport.prototype.launch).mockImplementation(async request => {
+      const handle = await launch(request);
+      const worker = workers.get(Number(handle.sessionId))!;
+      firstId ??= request.id;
+      const firstAttempt = request.id === firstId;
+      if (firstAttempt) {
+        worker.closeJoin = closeJoin;
+        if (pendingStop) worker.stopJoin = stopJoin;
+      }
+      calls.push({ operation: "launch", pid: worker.pid });
+      return { ...handle,
+        isAlive: async () => {
+          if (firstAttempt && !monitorHeld) {
+            // The monitor already read RUNNING and installed its closed callback.
+            // Hold its existing liveness await so that callback MUST run before
+            // the next terminal read/#settleGoneActorWorker can install a fence.
+            const alive = await handle.isAlive();
+            monitorHeld = true;
+            calls.push({ operation: "monitor-liveness-held", pid: worker.pid });
+            // Registered after the real monitor's callback: FIFO promise delivery
+            // makes this a receipt that the real callback has already run.
+            closeDelivered = handle.closed!.then(() => {
+              calls.push({ operation: "closed-callback-delivered", pid: worker.pid });
+            });
+            await monitorGate;
+            calls.push({ operation: "monitor-liveness-resumed", pid: worker.pid });
+            return alive;
+          }
+          return handle.isAlive();
+        },
+        waitForClose: async () => {
+          calls.push({ operation: "close-join-started", pid: worker.pid });
+          await handle.waitForClose!();
+          calls.push({ operation: "close-join-settled", pid: worker.pid });
+        },
+        stop: async () => {
+          calls.push({ operation: "stop-started", pid: worker.pid });
+          await handle.stop();
+          calls.push({ operation: "stop-joined", pid: worker.pid });
+        },
+      };
+    });
+    const f = fixture();
+    let first: Worker | undefined;
+    let stopping: Promise<unknown> | undefined;
+    try {
+      Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+      const actor = await create(f, "closed-before-terminal-read");
+      const answer = f.actors.ask(actor.id, "terminal result before captured native joins");
+      void answer.catch(() => undefined);
+      first = await launched(f, actor.id);
+      await eventually(() => expect(monitorHeld).toBe(true));
+      const next = await blockedSuccessor(f);
+      const thirdActor = await create(f, "second-queued-successor");
+      const thirdAnswer = f.actors.ask(thirdActor.id, "only one successor may acquire RUN");
+      void thirdAnswer.catch(() => undefined);
+      await eventually(() => expect(snapshot(f).waiting).toHaveLength(2));
+
+      // Terminal publication, host death and passive close occur in one turn.
+      // Passive closed is deliberately NOT the captured waitForClose/stop join.
+      calls.push({ operation: "terminal-published", pid: first.pid });
+      save(first, { status: "completed", text: "finished", finishedAt: Date.now(), updatedAt: Date.now(), exitCode: 0 });
+      first.alive = false;
+      if (primaryProof === "ESRCH") first.identityAlive = false;
+      else { first.identityAlive = true; first.birth = "67890"; }
+      first.nativeClose();
+      await closeDelivered;
+      expect(calls.filter(call => call.pid === first!.pid).map(call => call.operation)).toEqual([
+        "launch", "monitor-liveness-held", "terminal-published", "closed-callback-delivered",
+      ]);
+      expect(first.closeStarted).toBe(false); // Monitor is still before the terminal read.
+      expect(first.closeJoined).toBe(false);
+      await observe(); // Let real semaphore promotion/snapshot I/O expose an early release.
+      console.info("closed-before-terminal-read pending evidence", JSON.stringify({ primaryProof, pendingStop, admission: snapshot(f), calls }));
+      expect(workers.size, "P1: closed callback cannot admit a successor before the terminal read/native join").toBe(1);
+      expect(snapshot(f).held.map(held => held.runId)).toEqual([first.launch.id]);
+      expect(snapshot(f).waiting).toHaveLength(2);
+
+      resumeMonitor();
+      await eventually(() => expect(first!.closeStarted).toBe(true));
+      await expect(answer).resolves.toMatchObject({ text: "finished" });
+      expect(first.closeJoined).toBe(false);
+      if (pendingStop) {
+        // A stop begun after logical settlement adds a SEPARATE tree-helper join.
+        // Even successful waitForClose cannot discharge that pending obligation.
+        stopping = f.agents.stop(first.launch.id, { consume: false });
+        void stopping.catch(() => undefined);
+        await eventually(() => expect(calls.some(call => call.operation === "stop-started" && call.pid === first!.pid)).toBe(true));
+      }
+      const scan = first.launch.onUnconfirmedExit!;
+      expect(scan).toBeTypeOf("function");
+      scan("recorded repeated host-death observation while captured close is pending");
+      scan("recorded repeated host-death observation while captured close is pending");
+      await observe();
+      expect(first.closeJoined).toBe(false);
+      expect(workers.size, "pending captured close retains actual RUN despite repeated proof").toBe(1);
+      expect(snapshot(f).held.map(held => held.runId)).toEqual([first.launch.id]);
+      expect(snapshot(f).waiting).toHaveLength(2);
+
+      releaseClose();
+      await eventually(() => expect(first!.closeJoined).toBe(true));
+      if (pendingStop) {
+        await observe();
+        expect(calls.some(call => call.operation === "stop-joined" && call.pid === first!.pid)).toBe(false);
+        expect(workers.size, "joined close cannot bypass the separately pending stop join").toBe(1);
+        expect(snapshot(f).held.map(held => held.runId)).toEqual([first.launch.id]);
+        expect(snapshot(f).waiting).toHaveLength(2);
+        releaseStop();
+        await stopping;
+      }
+      const second = await launched(f, next.actor.id);
+      await eventually(() => expect(snapshot(f).waiting).toHaveLength(1));
+      expect(workers.size, "settled native joins admit exactly ONE of two queued successors").toBe(2);
+      expect(snapshot(f).held.map(held => held.runId)).toEqual([second.launch.id]);
+
+      // Repeated proof, repeated passive close, and late/repeated explicit stop
+      // must not release the old admission again while the successor owns RUN.
+      first.nativeClose();
+      first.nativeClose();
+      scan("recorded late host-death observation after native joins");
+      scan("recorded late host-death observation after native joins");
+      await f.agents.stop(first.launch.id, { consume: false });
+      await f.agents.stop(first.launch.id, { consume: false });
+      await observe();
+      expect(workers.size).toBe(2);
+      expect(snapshot(f).held.map(held => held.runId)).toEqual([second.launch.id]);
+      expect(snapshot(f).waiting).toHaveLength(1);
+      expect([...workers.values()].filter(worker => worker.launch.id === first!.launch.id)).toHaveLength(1);
+      console.info("closed-before-terminal-read evidence", JSON.stringify({ primaryProof, pendingStop, admission: snapshot(f), calls }));
+      complete(second);
+      await expect(next.answer).resolves.toMatchObject({ text: "finished" });
+      const third = await launched(f, thirdActor.id);
+      expect(workers.size).toBe(3);
+      complete(third);
+      await expect(thirdAnswer).resolves.toMatchObject({ text: "finished" });
+      await eventually(() => expect(snapshot(f).held).toEqual([]));
+    } finally {
+      // RED must also return every synthetic join to afterEach; no signal/delete.
+      resumeMonitor();
+      releaseClose();
+      releaseStop();
+      if (first) complete(first);
+      await stopping?.catch(() => undefined);
       try {
         for (const waiting of snapshot(f).waiting) await f.agents.stop(waiting.runId, { consume: false }).catch(() => undefined);
       } finally { Object.defineProperty(process, "platform", platform); }

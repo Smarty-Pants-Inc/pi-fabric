@@ -63,6 +63,31 @@ beforeEach(() => {
 afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); });
 
 describe.each([120_000, 0])("Main non-retryable provider recovery (flushMs=%s, smarty-dev#8742)", (flushMs) => {
+  it.each(["org-agent@x", "ordinary-agent"])("shows the own-turn rejection and terminal alarm for %s without provider text", role => {
+    vi.stubEnv("SMARTY_ROLE", role);
+    const h = setup(flushMs);
+    const secret = "FAKE-SECRET-visible-409";
+    const errorMessage = `409 ${JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: `compaction_affinity_missing ${secret}` } })}`;
+    try {
+      h.emit("agent_start", {});
+      h.emit("turn_end", errorTurn(errorMessage));
+      expect(h.notify).toHaveBeenCalledExactlyOnceWith(
+        "Provider rejected Main's request as non-retryable (409 invalid_request_error: compaction_affinity_missing); compacting once to recover", "warning");
+      h.settleError();
+      h.emit("agent_settled", { outcome: "error" });
+      expect(h.notify).toHaveBeenCalledTimes(1);
+      vi.advanceTimersByTime(0);
+      expect(h.compactions).toHaveLength(1);
+      h.notify.mockClear();
+      h.emit("session_compact_failed", { reason: "manual", aborted: false, willRetry: false, errorMessage: `Compaction failed: ${secret}` });
+      h.compactions[0]!.onError?.(new Error(secret));
+      h.emit("agent_settled", { outcome: "error" });
+      expect(h.notify).toHaveBeenCalledExactlyOnceWith(expect.stringMatching(/^provider-dead \(non-retryable: 409 invalid_request_error: compaction_affinity_missing\): the recovery compaction failed/), "warning");
+      expect(JSON.stringify(h.notify.mock.calls)).not.toMatch(/undefined|FAKE-SECRET/);
+      expect(h.alarms).toHaveLength(1);
+    } finally { h.main.closeFollowUpDrain(); vi.unstubAllEnvs(); }
+  });
+
   it("compacts once at idle, releases the held work once, and recovers on success", () => {
     const h = setup(flushMs);
     h.emit("turn_end", errorTurn(affinity));

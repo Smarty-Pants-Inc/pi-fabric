@@ -5,6 +5,7 @@ import type { ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it, vi } from "vitest";
 import type { CapturedToolCatalog } from "../src/capture/catalog.js";
 import { DEFAULT_FABRIC_CONFIG, loadFabricConfig } from "../src/config.js";
+import { fabricDiagnosticsFile, flushFabricDiagnostics } from "../src/core/diagnostics.js";
 import type { FabricLifecycleLease, FabricState } from "../src/fabric-state.js";
 import type { ModelSource } from "../src/ui/model-picker.js";
 import {
@@ -47,6 +48,56 @@ const buildItems = (keepVisibleCandidates: string[] = ["fabric_exec"]) =>
   });
 
 describe("FabricSettingsComponent", () => {
+  it.each(["org-agent@x", "project-agent@x"])("keeps a typed settings command response visible for %s", async role => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "principal-settings-response-"));
+    vi.stubEnv("SMARTY_ROLE", role); vi.stubEnv("PI_CODING_AGENT_DIR", path.join(root, "agent"));
+    const notify = vi.fn();
+    const state = { config: structuredClone(DEFAULT_FABRIC_CONFIG), ensure: async () => liveLease } as unknown as FabricState;
+    const context = { mode: "print", cwd: root, isProjectTrusted: () => false, ui: { notify } } as unknown as ExtensionContext;
+    try {
+      await openFabricSettings(context, { state, applyFabricMode() {}, capturedTools: { list: () => [] } as unknown as CapturedToolCatalog });
+      expect(notify).toHaveBeenCalledExactlyOnceWith("Fabric settings require an interactive UI", "warning");
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  it.each(["org-agent@x", "project-agent@x"])("routes lazy settings discovery failures privately only for %s", async role => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "settings-discovery-diagnostics-"));
+    vi.stubEnv("SMARTY_ROLE", role);
+    vi.stubEnv("PI_CODING_AGENT_DIR", path.join(root, "agent"));
+    const config = structuredClone(DEFAULT_FABRIC_CONFIG); config.agents.runner = "claude";
+    const claudeModels = vi.fn(async () => { throw new Error("runtime unavailable"); });
+    const state = { config, ensure: async () => liveLease, agents: { claudeModels } } as unknown as FabricState;
+    const context = { mode: "tui", cwd: root, isProjectTrusted: () => true,
+      modelRegistry: { getAvailable: () => fakeModelSource.models },
+      sessionManager: { getSessionId: () => "settings-discovery" }, ui: {
+        notify: vi.fn(), custom: vi.fn(async (factory) => {
+          const component = factory({}, theme, {}, () => {}) as FabricSettingsComponent;
+          expect(claudeModels).not.toHaveBeenCalled();
+          const list = component.settingsList as any;
+          list.selectedIndex = list.items.findIndex((item: { id: string }) => item.id === "agents");
+          list.activateItem();
+          expect(claudeModels).toHaveBeenCalledOnce();
+          const agents = list.submenuComponent.settingsList;
+          agents.selectedIndex = agents.items.findIndex((item: { id: string }) => item.id === "agents.claude.model");
+          agents.activateItem();
+          await new Promise(resolve => setImmediate(resolve));
+        }),
+      } } as unknown as ExtensionContext;
+    try {
+      await openFabricSettings(context, { state, applyFabricMode() {}, capturedTools: { list: () => [] } as unknown as CapturedToolCatalog });
+      await flushFabricDiagnostics();
+      if (role.startsWith("org-agent")) {
+        expect(context.ui.notify).not.toHaveBeenCalled();
+        const lines = fs.readFileSync(fabricDiagnosticsFile("settings-discovery"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+        expect(lines.filter(line => line.source === "src/ui/settings.ts")).toEqual([expect.objectContaining({ level: "warning",
+          message: "Claude model discovery failed: runtime unavailable" })]);
+      } else {
+        expect(context.ui.notify).toHaveBeenCalledExactlyOnceWith("Claude model discovery failed: runtime unavailable", "warning");
+        expect(fs.existsSync(fabricDiagnosticsFile("settings-discovery"))).toBe(false);
+      }
+    } finally { await flushFabricDiagnostics(); vi.unstubAllEnvs(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
   it("populates Claude models asynchronously without requiring startup discovery", async () => {
     const source: ModelSource = {
       models: [{ provider: "claude", id: "configured" }],
@@ -896,14 +947,19 @@ describe("FabricSettingsComponent", () => {
     } } as unknown as FabricState;
     let staleReads = 0;
     const context = { mode: "tui", cwd: root, isProjectTrusted: () => true,
-      modelRegistry: { getAvailable: () => fakeModelSource.models }, ui: { notify: vi.fn(), custom: async () => {} },
+      modelRegistry: { getAvailable: () => fakeModelSource.models }, ui: { notify: vi.fn(), custom: async (factory: (tui: unknown, theme: Theme, keys: unknown, done: () => void) => FabricSettingsComponent) => {
+        const component = factory({}, theme, {}, () => {}) as FabricSettingsComponent;
+        const list = component.settingsList as any;
+        list.selectedIndex = list.items.findIndex((item: { id: string }) => item.id === "agents");
+        list.activateItem();
+      } },
     } as unknown as ExtensionContext;
     try {
       await openFabricSettings(context, { state, applyFabricMode() {}, capturedTools: { list: () => [] } as unknown as CapturedToolCatalog });
+      expect(reject).toBeTypeOf("function");
       sessionApprovals.generation++;
       Object.defineProperty(context, "ui", { get() { staleReads++; throw new Error("stale ctx"); } });
-      // Discovery is lazy (upstream): with the picker never opened there is no background work.
-      reject?.(new Error("old discovery failed"));
+      reject(new Error("old discovery failed"));
       await new Promise(resolve => setImmediate(resolve));
       expect(staleReads).toBe(0);
     } finally { vi.unstubAllEnvs(); fs.rmSync(root, { recursive: true, force: true }); }

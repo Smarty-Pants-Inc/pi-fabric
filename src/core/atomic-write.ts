@@ -11,6 +11,7 @@ export const bashProcessEnvironment = (environment: NodeJS.ProcessEnv = process.
     ? { PI_FABRIC_LANDLOCK_WRITES: environment.PI_FABRIC_LANDLOCK_WRITES } : {}),
 });
 import { retryDelayMs } from "./retry-backoff.js";
+import { diagnostics } from "./diagnostics.js";
 import { randomUUID } from "node:crypto";
 import childProcess from "node:child_process";
 import fs from "node:fs";
@@ -803,7 +804,7 @@ export const alarmForeignHolder = (error: MeshLockForeignHolderError): void => {
   const key = `${error.lockPath}\n${error.holderToken}`;
   if (alarmedHolders.has(key)) return;
   alarmedHolders.add(key);
-  try { console.warn(`[pi-fabric] ALARM ${error.foreignCode}: ${error.message}`); } catch { /* an alarm never masks the refusal */ }
+  try { diagnostics.warn("src/core/atomic-write.ts", `[pi-fabric] ALARM ${error.foreignCode}: ${error.message}`); } catch { /* an alarm never masks the refusal */ }
 };
 
 // Compatible with older stores and the bridge's deliberately narrow error wire.
@@ -905,7 +906,7 @@ const mirrorMeshJournalLine = (line: string): void => {
 };
 const emitMeshJournalAlarm = (alarm: Parameters<typeof meshJournalAlarmLine>[0]): void => {
   const line = meshJournalAlarmLine(alarm);
-  console.warn(line);
+  diagnostics.warn("src/core/atomic-write.ts", line);
   mirrorMeshJournalLine(line);
 };
 
@@ -1054,7 +1055,7 @@ export class MeshBackgroundRetry {
     // Final summary: retries suppressed after the last line are reported once the window
     // has passed, so an outage that ends inside a window is not silently dropped. It takes
     // that window's single line; a later outage inside it is counted, not printed.
-    console.warn(`[pi-fabric] ${this.label}: ${this.#recoveryMessage} (${this.#suppressed} similar retries suppressed in the last ${Math.floor(elapsedMs / 1_000)}s)`);
+    diagnostics.warn("src/core/atomic-write.ts", `[pi-fabric] ${this.label}: ${this.#recoveryMessage} (${this.#suppressed} similar retries suppressed in the last ${Math.floor(elapsedMs / 1_000)}s)`);
     this.#lastReportedAt = now;
     this.#suppressed = 0;
   }
@@ -1071,7 +1072,7 @@ export class MeshBackgroundRetry {
         return false;
       }
       this.#resetBackoff();
-      console.warn(`[pi-fabric] ${this.label}: background operation failed: ${message}`);
+      diagnostics.warn("src/core/atomic-write.ts", `[pi-fabric] ${this.label}: background operation failed: ${message}`);
       return false;
     }
     this.#delay = Math.min(this.maxMs, Math.max(this.minMs, this.#delay * 2));
@@ -1099,7 +1100,7 @@ export class MeshBackgroundRetry {
     if (elapsedMs >= this.warningWindowMs) {
       const summary = this.#suppressed > 0
         ? ` (${this.#suppressed} similar retries suppressed in the last ${Math.floor(elapsedMs / 1_000)}s)` : "";
-      console.warn(`[pi-fabric] ${this.label}: ${refusal ?? (isMeshLockTimeout(error) ? "mesh lock timeout" : "mesh WAL cap")}; retrying in ${delayMs} ms: ${meshDeferredSummary(error)}${summary}`);
+      diagnostics.warn("src/core/atomic-write.ts", `[pi-fabric] ${this.label}: ${refusal ?? (isMeshLockTimeout(error) ? "mesh lock timeout" : "mesh WAL cap")}; retrying in ${delayMs} ms: ${meshDeferredSummary(error)}${summary}`);
       this.#lastReportedAt = now;
       this.#suppressed = 0;
     } else {
@@ -1120,7 +1121,7 @@ export class MeshBackgroundRetry {
     }
     const summary = this.#failureSuppressed > 0
       ? ` (${this.#failureSuppressed} similar failures suppressed in the last ${Math.floor(elapsedMs / 1_000)}s)` : "";
-    console.warn(`[pi-fabric] ${this.label}: background operation failed: ${message}; retrying in ${this.#failureDelay} ms${summary}`);
+    diagnostics.warn("src/core/atomic-write.ts", `[pi-fabric] ${this.label}: background operation failed: ${message}; retrying in ${this.#failureDelay} ms${summary}`);
     this.#failureMessage = message;
     this.#failureReportedAt = now;
     this.#failureSuppressed = 0;
@@ -1160,7 +1161,7 @@ export class MeshBackgroundQueue {
     // Bounded best-effort notifications. Durable protocol cursors are not stored here.
     if (this.#pending.length >= 1_000) {
       this.#failed = true;
-      console.warn("[pi-fabric] background mesh notification queue full; dropping newest notification");
+      diagnostics.warn("src/core/atomic-write.ts", "[pi-fabric] background mesh notification queue full; dropping newest notification");
       return Promise.resolve();
     }
     const admission = new Promise<void>(resolve => this.#pending.push({ operation, attempted: resolve }));

@@ -3,6 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { actorInstructionsSource, resolveActorInstructions, assertActorInstructionReplacement } from "../actors/instructions-file.js";
 import { readTaskReturnAddress } from "../agents/task-return-address.js";
 import type { RouteEvaluate } from "../agents/model-route.js";
+import type { SpawnRouterAdmission } from "../agents/spawn-router.js";
 import type { JevRequest, JevResponse } from "../jev/types.js";
 import { formatAge, residentHostId, RESIDENT_HOST_FORMAT, ResidentOutcomeUnknownError, ResidentActorAuthorizationError, assertResidentActorMain, assertResidentActorToolCeiling, type ResidentActorCaller, type ResidentActorMutation } from "../residency/protocol.js";
 import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
@@ -92,7 +93,6 @@ import {
 import {
   aliasThinking,
   FUZZY_RESOLUTION_MARKERS,
-  resolveAvailablePiModel,
   resolveFabricModel,
   type FabricModelCandidate,
 } from "../core/model-resolution.js";
@@ -448,6 +448,7 @@ export class AgentsProvider implements FabricProvider {
   readonly #router: AgentMessageRouter;
   readonly #projectLeadId: string | undefined;
   readonly #taskReturnAddress = readTaskReturnAddress();
+  readonly #creationAdmissions = new WeakMap<object, SpawnRouterAdmission>();
   readonly name = "agents";
   /** Session registry of `provider:` participants; stop/steer/followUp route there. */
   providerParticipants: ProviderParticipantRegistry | undefined;
@@ -613,59 +614,25 @@ export class AgentsProvider implements FabricProvider {
 
   async #routeCreationDefault<T extends {
     model?: string; thinking?: AgentRunRequest["thinking"]; runner?: FabricAgentRunner;
+    task?: string; instructions?: string; sha256?: string;
     name?: string; cwd?: string; complexity?: AgentRunRequest["complexity"]; residency?: AgentRunRequest["residency"];
   }>(kind: "spawn" | "actor", args: Record<string, unknown>, request: T, context: FabricInvocationContext): Promise<T> {
     const config = this.manager.config.router;
     if (config?.mode !== "shadow" && config?.mode !== "enforce") return request;
-    const self = this.participants.self();
-    const runner = request.runner ?? this.manager.config.runner;
-    const defaultModel = request.model ?? this.manager.defaultModel(runner);
-    const defaults = {
-      ...(defaultModel ? { model: defaultModel } : {}),
-      thinking: request.thinking ?? this.manager.config.thinking,
-    };
-    const { routeAgentCreation } = await import("../agents/spawn-router.js");
-    const selected = await routeAgentCreation({
-      config, meshRoot: this.actorManager.mesh.root, kind,
-      role: self.role ?? (kind === "actor" ? "actor" : "task-agent"),
-      ...(request.name !== undefined ? { name: request.name } : {}),
-      cwd: kind === "spawn" ? await this.manager.resolveCwd(request.cwd, context.signal) : this.manager.cwd,
-      project: self.projectRoot ?? self.project ?? this.manager.cwd,
-      ...(kind === "spawn" ? { task: String(args.task) }
-        : typeof args.instructions === "string" ? { task: args.instructions }
-        : typeof args.sha256 === "string" ? { taskDigest: args.sha256 } : {}),
-      parentId: self.id, defaults,
-      ...(request.complexity ? { complexity: request.complexity } : {}),
-      explicit: (typeof args.model === "string" && !!args.model.trim()) || args.thinking !== undefined,
-      validateModel: model => {
-        this.manager.assertModelAllowed(model, runner);
-        // Non-Pi configured backend defaults are known keys; otherwise require
-        // an exact visible Pi id/alias, never a ranked closest match or a refresh.
-        if (runner !== "pi" && model === this.manager.defaultModel(runner)) return model;
-        const resolved = resolveAvailablePiModel(model, {
-          aliases: this.modelsConfig().aliases,
-          available: context.extensionContext.modelRegistry.getAvailable().map(model => ({
-            provider: String(model.provider), id: String(model.id),
-          })), exact: true, closest: false,
-        });
-        const canonical = `${resolved.provider}/${resolved.id}`;
-        this.manager.assertModelAllowed(canonical, runner);
-        return canonical;
-      },
-      ...(context.signal ? { signal: context.signal } : {}),
-    });
-    if (!selected) return request;
-    const { decisionId } = selected;
-    return { ...request, ...selected.selected, spawnRouterDecisionId: decisionId,
-      ...(kind === "spawn" && request.residency !== "durable" ? { meshRoot: this.actorManager.mesh.root } : {}) };
+    const { routeProviderCreation } = await import("../agents/spawn-router.js");
+    const routed = await routeProviderCreation(this, kind, args, request, context);
+    if (!routed) return request;
+    this.#creationAdmissions.set(routed.request, routed.admission);
+    return routed.request;
   }
 
-  async #recordCreationStartFailed(request: AgentRunRequest | FabricActorCreateRequest): Promise<void> {
+  async #recordCreationStartFailed(request: AgentRunRequest | FabricActorCreateRequest, kind: "spawn" | "actor"): Promise<void> {
     const decisionId = (request as { spawnRouterDecisionId?: unknown }).spawnRouterDecisionId;
     if (typeof decisionId !== "string" || !decisionId) return;
     try {
       const { recordSpawnRouterStartFailed } = await import("../agents/spawn-router.js");
-      await recordSpawnRouterStartFailed({ meshRoot: this.actorManager.mesh.root, decisionId });
+      await recordSpawnRouterStartFailed({ meshRoot: this.actorManager.mesh.root, decisionId,
+        admission: this.#creationAdmissions.get(request), spawnKind: kind, request, cwd: this.manager.cwd });
     } catch { /* Ledger writes never change admission behavior. */ }
   }
 
@@ -944,12 +911,14 @@ export class AgentsProvider implements FabricProvider {
       case "handoff":
         return this.handoff(args, context);
       case "spawn": {
-        const routed = await this.#routeCreationDefault("spawn", args, await this.#prepareSpawnRequest(args, context), context);
+        const routed = await this.#routeCreationDefault("spawn", args,
+          this.#applySeed(args, await this.#prepareSpawnRequest(args, context), context), context);
         let handedOff = false;
         const onDispatched = typeof (routed as { spawnRouterDecisionId?: unknown }).spawnRouterDecisionId === "string"
           ? () => { handedOff = true; } : undefined;
         try {
-        const request = this.#applySeed(args, routed, context);
+        // Branch task bytes do not change, but transfer must use the router-selected model.
+        const request = args.seed === "branch" ? this.#applySeed(args, routed, context) : routed;
         if (request.residency === "durable") this.#assertUnconfinedDurable();
         const runner = request.runner ?? this.manager.config.runner;
         const transport = request.transport ?? this.manager.config.transport;
@@ -981,12 +950,21 @@ export class AgentsProvider implements FabricProvider {
             : {}),
         }, context.extensionContext.sessionManager?.getEntries?.() ?? []);
         const resident = durableRequest.residency === "durable" ? this.#resident() : undefined;
-        // Local admission owns its outcome immediately; resident custody begins only at publication.
-        if (!resident) handedOff = true;
-        const handle = resident
-          ? await (onDispatched ? resident.spawnAgent(durableRequest, context.signal, onDispatched)
-            : resident.spawnAgent(durableRequest, context.signal))
-          : await this.manager.spawn(durableRequest, isInteractiveMain(context.extensionContext) ? withoutMainExecutionCeiling(context.signal) : context.signal);
+        let handle: AgentHandleInfo;
+        if (resident) {
+          // Resident custody begins only at publication, not client preparation.
+          handle = await (onDispatched ? resident.spawnAgent(durableRequest, context.signal, onDispatched)
+            : resident.spawnAgent(durableRequest, context.signal));
+        } else {
+          const signal = isInteractiveMain(context.extensionContext) ? withoutMainExecutionCeiling(context.signal) : context.signal;
+          const admission = this.#creationAdmissions.get(routed);
+          // Native admission owns preparation failures too; the provider must not consume twice.
+          handedOff = true;
+          handle = await (onDispatched
+            ? this.manager.spawn(durableRequest, signal,
+              undefined, undefined, undefined, undefined, undefined, undefined, admission)
+            : this.manager.spawn(durableRequest, signal));
+        }
         if (request.residency !== "durable") this.manager.detachSignal(handle.id);
         this.participants.scheduleRefresh();
         context.activity?.({
@@ -1000,7 +978,7 @@ export class AgentsProvider implements FabricProvider {
         context.update(agentStartedMessage(receipt));
         return receipt;
         } catch (error) {
-          if (!handedOff) await this.#recordCreationStartFailed(routed);
+          if (!handedOff) await this.#recordCreationStartFailed(routed, "spawn");
           throw error;
         }
       }
@@ -1966,6 +1944,7 @@ export class AgentsProvider implements FabricProvider {
 
   async #createActor(request: FabricActorCreateRequest, context: FabricInvocationContext): Promise<FabricActorInfo> {
     let handedOff = false;
+    const routerAdmission = this.#creationAdmissions.get(request);
     const onDispatched = typeof (request as { spawnRouterDecisionId?: unknown }).spawnRouterDecisionId === "string"
       ? () => { handedOff = true; } : undefined;
     try {
@@ -1985,6 +1964,7 @@ export class AgentsProvider implements FabricProvider {
       ...(kernel ? { kernel, pythonRuntime: this.manager.resolvePythonRuntime(request.pythonRuntime) } : {}),
       ...(principalScope ? { principalScope } : {}),
     };
+    if (routerAdmission) this.#creationAdmissions.set(request, routerAdmission);
     if (request.residency !== "durable") {
       // Reuse the host-originated outcome ledger for local actors too: publication
       // may await contended locks after the actor is already runnable/subscribed.
@@ -2018,6 +1998,7 @@ export class AgentsProvider implements FabricProvider {
       try {
         handedOff = true;
         return await this.actorManager.create(resolvedRequest, {
+          ...(routerAdmission ? { routerAdmission } : {}),
           // The protected native path invokes this synchronously at its final
           // validated SQL boundary, with the original ID on an exact retry.
           beforeCommit: (id, nativeBoundary) => {
@@ -2057,17 +2038,20 @@ export class AgentsProvider implements FabricProvider {
     // Ordinary child handoffs need no protected caller metadata. The receiving
     // host still requires an authenticated caller for every protected topic,
     // including a request that omitted its required claim.
-    if (request.slotClaim === undefined) return await (onDispatched ? client.createActor(request, signal, undefined, onDispatched)
+    const self = this.participants.self();
+    const routerCaller = onDispatched ? { id: self.id, rootId: self.rootId, sessionId: self.sessionId ?? "",
+      ownerHostId: self.ownerHostId, ownerIdentityId: self.ownerIdentityId, kind: self.kind } : undefined;
+    if (request.slotClaim === undefined) return await (onDispatched ? client.createActor(request, signal, undefined, onDispatched, routerCaller)
       : client.createActor(request, signal));
     const caller = {
       identity: { ...this.actorManager.identity }, hostId: this.participants.self().ownerHostId,
       ...(invocationFabricPrincipal(context) ? { principal: invocationFabricPrincipal(context) } : {}),
       ...(this.#toolCeiling === undefined ? {} : { toolCeiling: [...this.#toolCeiling] }),
     };
-    return await (onDispatched ? client.createActor(request, signal, caller, onDispatched)
+    return await (onDispatched ? client.createActor(request, signal, caller, onDispatched, routerCaller)
       : client.createActor(request, signal, caller));
     } catch (error) {
-      if (!handedOff) await this.#recordCreationStartFailed(request);
+      if (!handedOff) await this.#recordCreationStartFailed(request, "actor");
       throw error;
     }
   }

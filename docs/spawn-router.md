@@ -127,7 +127,8 @@ one-release compatibility alias with exactly the same value as `requested`;
 remove it in a future release. A valid `pick` includes its canonical
 model/thinking and optional sanitized reason/version codes.
 
-The admitting manager appends exactly one start outcome. Only the start line's
+For an authenticated admission, the admitting manager appends at most one
+attributed start outcome. Only the start line's
 `model` and `thinking` describe the final **applied binding**, after native model
 preparation and clamping for a task, or the admitted binding for an idle actor:
 
@@ -160,8 +161,8 @@ atomic write because a publication error can itself be ambiguous.
 | name | type | meaning | when null |
 | --- | --- | --- | --- |
 | `ts` | string | Timestamp of this ledger line. | Never. |
-| `decisionId` | string | UUID joining the decision to its start outcome. | Never. |
-| `kind` | `"decision"`, `"start"`, or `"start-failed"` | Ledger line type; not the spawn type. | Never. |
+| `decisionId` | string or null | UUID joining the decision to its start outcome. | Null on a refusal of a malformed ID. |
+| `kind` | `"decision"`, `"start"`, `"start-failed"`, or `"start-refused"` | Ledger line type; not the spawn type. | Never. |
 | `spawnKind` | `"spawn"` or `"actor"` | Public admission type; decision only. | Never. |
 | `mode` | `"shadow"` or `"enforce"` | Enabled router mode; decision only. | Never. |
 | `commandDigest` | string | SHA-256 of `JSON.stringify(command)`, never raw argv; decision only. | Never. |
@@ -173,7 +174,7 @@ atomic write because a publication error can itself be ambiguous.
 | `actual` | object | One-release alias equal to `requested`; decision only, removed in a future release. | Never. |
 | `fallbackReason` | string or null | Fixed router error when an error keeps the default; decision only. | No error-caused default fallback. |
 | `latencyMs` | number | Router decision latency in milliseconds; decision only. | Never. |
-| `error` | string or null | Fixed router code on a decision; fixed `"start-failed"` on failure; absent on a start. | Decision without an error. |
+| `error` | string or null | Fixed router code on a decision; `"start-failed"` on creation failure; one of the admission refusal codes below on `start-refused`; absent on a start. | Decision without an error. |
 | `agentId` | string or null | Admitted agent or actor id; start outcomes only. | Unknown on failed creation. |
 | `sessionId` | string or null | Native Pi session header id, never transport PID or parent session. | No native session known at this boundary. |
 | `launch` | object | Manager launch metadata; start outcomes only. | Never; unknown members are null. |
@@ -185,6 +186,69 @@ atomic write because a publication error can itself be ambiguous.
 | `thinking` | string or null | Final clamped task thinking or admitted actor thinking. | Binding unknown; null on start-failed. |
 | `verified` | boolean | Own observation of a written running record at registration. | Never; false for idle actor birth and start-failed. |
 | `evidenceRef` | string or null | Written status path relative to mesh (may use `..` for a local run root outside mesh). | No observed status record; null on start-failed. |
+
+## Authenticated, single-use attribution
+
+The decision UUID alone is not authority. At issuance, the router persists an
+admission in the **existing MeshStore**, under the host-reserved
+`decisions/spawn-router/admissions/<UUID>` namespace. Public `mesh.put` and
+`mesh.delete` cannot mint or reset these keys. Admissions expire after 10 minutes;
+issuance prunes expired entries under the same transaction and refuses new
+admission storage at 4096 retained entries. This is an attribution bound, not a
+launch limit. Consumed entries remain until expiry so replays have a fixed code.
+
+The SHA-256 binding covers the requester session, target root and native host,
+spawning participant role, spawn/actor kind, canonical cwd, requested model and
+thinking, runner, name, and task/instruction digest. Relative task cwd is resolved
+from the original manager **base cwd**, not from the already-selected router cwd.
+File-backed actor instructions bind their verified SHA-256 without disclosing the
+file path or reading the file at the origin. Seeded tasks bind the submitted task
+bytes after seeding. Admission state retains only the binding digest and bounded
+issuance metadata, never task text or raw requester/target details.
+
+The provider snapshots host-owned caller identity once before routing awaits and
+passes it to local managers separately from request fields. Resident task callers
+use the existing caller-bound spawn envelope and native directory authentication.
+Actor proxies carry a separate, host-captured `routerCaller` envelope solely for
+attribution: the receiver checks its ID, session, root, kind and owner against the
+fresh native participant directory, then constructs authority from that directory
+entry and its own target root/host. It grants no actor creation, mutation or
+supervisor authority and adds no launch-policy check.
+
+Both successful and failed start writers atomically compare and consume
+`issued → consumed` through `MeshStore.writeBatch` and the entry version CAS.
+Only one concurrent writer can attribute an outcome. A missing, expired, damaged
+or unavailable admission gives `decision-unknown`; an already-consumed admission
+gives `decision-replayed`; a binding or caller-authority mismatch gives
+`decision-mismatch`. Refusals append `kind: "start-refused"`, the fixed error,
+and null agent/session/model/thinking/launch/evidence fields with
+`verified: false`. They never append an attributed `start` or `start-failed`.
+**Actual launch remains fail-open; attribution is fail-closed.** A request without
+a decision ID keeps the original path, with no router import or state/log write.
+A crash after consume but before ledger append can lose an outcome, never mint a
+second successful attribution; this meter is not an exactly-once launch journal.
+
+### Host-only integration API
+
+`SpawnRouterAdmission` contains `{ mesh, requesterSessionId, role, targetRootId,
+targetHostId }`. These are native caller/target snapshots, never action arguments
+or task/actor request fields. Direct integrations and fixtures must pass:
+
+- To `routeAgentCreation`: `admission`, `admissionRequest` (the actual prepared
+  request before any router override), and `admissionCwd` (manager base cwd).
+- To `recordSpawnRouterStart` or `recordSpawnRouterStartFailed`: the same native
+  `admission`, `spawnKind`, final submitted `request` (including the selected
+  override), and base `cwd`, in addition to the existing receipt fields.
+- To `AgentManager.spawn`: optional **ninth native argument** `routerAdmission`.
+  The eighth argument remains the authenticated task return address.
+- To `ActorManager.create`: native options field `routerAdmission`, propagated by
+  `ActorDirectory`. Neither manager reads admission identity from the request.
+- Nested actor proxies accept host-only `routerCaller` as the fifth argument of
+  `ResidentActorClient.createActor`; the receiving host independently validates it.
+
+`routeProviderCreation` keeps provider routing preparation lazy;
+`authenticatedSpawnRouterAdmission` constructs receiver authority only after
+fresh directory validation. Missing authority never falls back to request fields.
 
 Join a decision and its start outcome **only by `decisionId`**; do not join on
 task text, model, timestamps, command digest, or launch identifiers. Ledger

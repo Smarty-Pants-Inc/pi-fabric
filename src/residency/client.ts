@@ -561,6 +561,9 @@ export class ResidencyClient {
     const response = await this.#command({
       format: RESIDENT_HOST_FORMAT,
       operation: "createActor",
+      ...(typeof (request as { spawnRouterDecisionId?: unknown }).spawnRouterDecisionId === "string"
+        ? { routerCaller: { id: self.id, rootId: self.rootId, sessionId: self.sessionId ?? "",
+          ownerHostId: self.ownerHostId, ownerIdentityId: self.ownerIdentityId, kind: self.kind } } : {}),
       ...(idempotencyKey === undefined ? {} : { idempotencyKey }),
       requestId: randomUUID(),
       rootId: this.options.config.rootId,

@@ -5,11 +5,19 @@ import { createHash } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { loadFabricConfig, normalizeFabricConfig } from "../src/config.js";
 import { normalizeAgentRouterConfig } from "../src/agents/router-config.js";
-import { recordSpawnRouterStart, recordSpawnRouterStartFailed, routeAgentCreation, type SpawnRouterRequest } from "../src/agents/spawn-router.js";
+import { recordSpawnRouterStart, recordSpawnRouterStartFailed, routeAgentCreation, type SpawnRouterAdmission, type SpawnRouterRequest } from "../src/agents/spawn-router.js";
+import { MeshStore } from "../src/mesh/store.js";
 
 const roots: string[] = [];
+const meshes = new Map<string, MeshStore>();
 const root = (): string => { const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-spawn-router-")); roots.push(dir); return dir; };
-afterEach(() => { for (const dir of roots.splice(0)) fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }); vi.restoreAllMocks(); vi.unstubAllEnvs(); });
+const admissionFor = (dir: string): SpawnRouterAdmission => {
+  let mesh = meshes.get(dir);
+  if (!mesh) { mesh = new MeshStore(dir, 64 * 1024, 100, { stateBackend: "file" }); meshes.set(dir, mesh); }
+  return { mesh, requesterSessionId: "router-parent", role: "task-agent",
+    targetRootId: "session:router-parent", targetHostId: "session:router-parent" };
+};
+afterEach(() => { for (const mesh of meshes.values()) mesh.closeState(); meshes.clear(); for (const dir of roots.splice(0)) fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }); vi.restoreAllMocks(); vi.unstubAllEnvs(); });
 const pick = { model: "provider/model-b", thinking: "high", reason: "normal.implementation", policyVersion: "1.0.0" };
 const defaults = { model: "provider/model-a", thinking: "medium" as const };
 const command = (dir: string, body = `process.stdout.write(${JSON.stringify(JSON.stringify(pick))});`): string[] => [
@@ -30,7 +38,7 @@ const decisions = (dir: string): Array<Record<string, any>> => {
   for (const entry of entries) {
     const keys = entry.kind === "decision"
       ? ["ts", "decisionId", "kind", "spawnKind", "mode", "commandDigest", "decision", "pick", "requested", "actual", "fallbackReason", "latencyMs", "error"]
-      : ["ts", "kind", "decisionId", "agentId", "sessionId", "launch", "host", "model", "thinking", "verified", "evidenceRef", ...(entry.kind === "start-failed" ? ["error"] : [])];
+      : ["ts", "kind", "decisionId", "agentId", "sessionId", "launch", "host", "model", "thinking", "verified", "evidenceRef", ...(entry.kind === "start-failed" || entry.kind === "start-refused" ? ["error"] : [])];
     expect(Object.keys(entry).sort()).toEqual(keys.sort());
     if (entry.kind === "decision") {
       expect(entry.actual).toEqual(entry.requested);
@@ -66,23 +74,295 @@ describe("spawn router configuration", () => {
 });
 
 describe("native spawn router receipts", () => {
-  const managerFor = async (dir: string) => {
+  const managerFor = async (dir: string, options: { mainAgentId?: string; hostId?: string } = {}) => {
     const { AgentManager } = await import("../src/agents/manager.js");
     const { DEFAULT_FABRIC_CONFIG } = await import("../src/config.js");
     return new AgentManager(dir, { ...DEFAULT_FABRIC_CONFIG.agents, ...defaults, budgetUsd: 0, maxConcurrent: 1,
       transport: "process", extensions: false, sessionExport: false }, {
       runRoot: path.join(dir, "runs"), meshRoot: dir,
       workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
+      mainAgentId: "session:router-parent", hostId: "session:router-parent", identityId: "session:router-parent", ...options,
     });
   };
+  type NativeRequest = Parameters<Awaited<ReturnType<typeof managerFor>>["spawn"]>[0] & { spawnRouterDecisionId?: string };
+  const spawnAdmitted = (manager: Awaited<ReturnType<typeof managerFor>>, creation: NativeRequest,
+    admission: SpawnRouterAdmission = admissionFor(manager.cwd)) => manager.spawn(creation,
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined, admission);
+  const routeNative = (dir: string,
+    creation: NonNullable<Parameters<typeof routeAgentCreation>[0]["admissionRequest"]>,
+    overrides: Partial<Parameters<typeof routeAgentCreation>[0]> = {}) => routeAgentCreation({
+      ...options(dir), admission: admissionFor(dir), admissionRequest: creation, admissionCwd: dir, ...overrides,
+    });
+  const expectRefused = (entry: Record<string, any>, decisionId: string,
+    error: "decision-unknown" | "decision-replayed" | "decision-mismatch") => {
+    expect(entry).toEqual({ ts: expect.any(String), kind: "start-refused", decisionId,
+      agentId: null, sessionId: null, model: null, thinking: null, ...unverifiedStart, error });
+  };
+
+  it("refuses a consumed decision on a second real native spawn without changing either worker", async () => {
+    const dir = root(); const manager = await managerFor(dir);
+    try {
+      const admitted = { task: "private native replay brief 🦉", name: "replay child", ...defaults };
+      const route = (await routeNative(dir, admitted, { explicit: true }))!;
+      const creation = { ...admitted, spawnRouterDecisionId: route.decisionId };
+      const first = await spawnAdmitted(manager, creation);
+      expect(await manager.wait(first.id)).toMatchObject({ status: "completed", ...defaults });
+      const second = await spawnAdmitted(manager, creation);
+      expect(second.id).not.toBe(first.id);
+      expect(await manager.wait(second.id)).toMatchObject({ status: "completed", ...defaults });
+      const log = decisions(dir);
+      expect(log).toHaveLength(3);
+      expect(log[1]).toMatchObject({ kind: "start", decisionId: route.decisionId, agentId: first.id });
+      expectRefused(log[2]!, route.decisionId, "decision-replayed");
+      expect(JSON.stringify(log)).not.toContain(admitted.task);
+    } finally { await manager.close(); }
+  });
+
+  it.each([
+    ["task", { task: "different private brief" }],
+    ["name", { name: "different child" }],
+    ["model", { model: pick.model }],
+    ["thinking", { thinking: "low" as const }],
+    ["cwd", { cwd: "other" }],
+  ] as const)("refuses a different native %s body without burning the valid decision", async (_field, changed) => {
+    const dir = root(); const manager = await managerFor(dir); fs.mkdirSync(path.join(dir, "other"));
+    try {
+      const admitted = { task: "private bound native brief", name: "bound child", ...defaults };
+      const route = (await routeNative(dir, admitted, { explicit: true }))!;
+      const creation = { ...admitted, spawnRouterDecisionId: route.decisionId };
+      const different = await spawnAdmitted(manager, { ...creation, ...changed });
+      expect(await manager.wait(different.id)).toMatchObject({ status: "completed", ...changed,
+        ...("cwd" in changed ? { cwd: fs.realpathSync(path.join(dir, changed.cwd)) } : {}) });
+      expectRefused(decisions(dir)[1]!, route.decisionId, "decision-mismatch");
+      const valid = await spawnAdmitted(manager, creation);
+      expect((await manager.wait(valid.id)).status).toBe("completed");
+      const log = decisions(dir);
+      expect(log).toHaveLength(3);
+      expect(log[2]).toMatchObject({ kind: "start", decisionId: route.decisionId, agentId: valid.id, ...defaults });
+      expect(log.filter(entry => entry.kind === "start")).toHaveLength(1);
+    } finally { await manager.close(); }
+  });
+
+  it.each(["requesterSessionId", "role"] as const)(
+    "refuses a different authenticated %s without burning the valid decision", async field => {
+      const dir = root(); const manager = await managerFor(dir);
+      try {
+        const admitted = { task: "private caller-bound brief", ...defaults };
+        const admission = admissionFor(dir);
+        const route = (await routeNative(dir, admitted, { explicit: true }))!;
+        const creation = { ...admitted, spawnRouterDecisionId: route.decisionId };
+        const different = await spawnAdmitted(manager, creation, { ...admission, [field]: `${admission[field]}-other` });
+        expect((await manager.wait(different.id)).status).toBe("completed");
+        expectRefused(decisions(dir)[1]!, route.decisionId, "decision-mismatch");
+        const valid = await spawnAdmitted(manager, creation, admission);
+        expect((await manager.wait(valid.id)).status).toBe("completed");
+        expect(decisions(dir)).toHaveLength(3);
+        expect(decisions(dir)[2]).toMatchObject({ kind: "start", decisionId: route.decisionId, agentId: valid.id });
+      } finally { await manager.close(); }
+    },
+  );
+
+  it.each(["targetRootId", "targetHostId"] as const)(
+    "refuses a different native %s without burning the valid decision", async field => {
+      const dir = root(); const admission = admissionFor(dir); const manager = await managerFor(dir);
+      const otherManager = await managerFor(dir, field === "targetRootId"
+        ? { mainAgentId: `${admission.targetRootId}-other` } : { hostId: `${admission.targetHostId}-other` });
+      try {
+        const admitted = { task: "private target-bound brief", ...defaults };
+        const route = (await routeNative(dir, admitted, { explicit: true }))!;
+        const creation = { ...admitted, spawnRouterDecisionId: route.decisionId };
+        // Supplying the issued target cannot disguise the receiving manager's actual target.
+        const different = await spawnAdmitted(otherManager, creation, admission);
+        expect((await otherManager.wait(different.id)).status).toBe("completed");
+        expectRefused(decisions(dir)[1]!, route.decisionId, "decision-mismatch");
+        expect(admission.mesh.get(`decisions/spawn-router/admissions/${route.decisionId}`, { fresh: true })?.value)
+          .toMatchObject({ state: "issued" });
+        const valid = await spawnAdmitted(manager, creation, admission);
+        expect((await manager.wait(valid.id)).status).toBe("completed");
+        const log = decisions(dir);
+        expect(log).toHaveLength(3);
+        expect(log[2]).toMatchObject({ kind: "start", decisionId: route.decisionId, agentId: valid.id });
+      } finally { await Promise.all([manager.close(), otherManager.close()]); }
+    },
+  );
+
+  it("caller-supplied target fields cannot override the native manager's configured target", async () => {
+    const dir = root(); const manager = await managerFor(dir);
+    try {
+      const admitted = { task: "private supplied target counterexample", ...defaults };
+      const admission = admissionFor(dir);
+      const route = (await routeNative(dir, admitted, { explicit: true }))!;
+      const child = await spawnAdmitted(manager, { ...admitted, spawnRouterDecisionId: route.decisionId }, {
+        ...admission, targetRootId: `${admission.targetRootId}-other`, targetHostId: `${admission.targetHostId}-other`,
+      });
+      expect((await manager.wait(child.id)).status).toBe("completed");
+      const log = decisions(dir);
+      expect(log).toHaveLength(2);
+      expect(log[1]).toMatchObject({ kind: "start", decisionId: route.decisionId, agentId: child.id });
+    } finally { await manager.close(); }
+  });
+
+  it("invalid native admission remains a mismatch without burning the valid decision", async () => {
+    const dir = root(); const manager = await managerFor(dir);
+    try {
+      const admitted = { task: "private invalid authority control", ...defaults };
+      const admission = admissionFor(dir);
+      const route = (await routeNative(dir, admitted, { explicit: true }))!;
+      const creation = { ...admitted, spawnRouterDecisionId: route.decisionId };
+      const invalid = await spawnAdmitted(manager, creation, { ...admission, role: "" });
+      expect((await manager.wait(invalid.id)).status).toBe("completed");
+      expectRefused(decisions(dir)[1]!, route.decisionId, "decision-mismatch");
+      const valid = await spawnAdmitted(manager, creation, admission);
+      expect((await manager.wait(valid.id)).status).toBe("completed");
+      const log = decisions(dir);
+      expect(log).toHaveLength(3);
+      expect(log[2]).toMatchObject({ kind: "start", decisionId: route.decisionId, agentId: valid.id });
+    } finally { await manager.close(); }
+  });
+
+  it.each([false, true])("an unknown ID is refused with native authority=%s while the real worker completes", async authenticated => {
+    const dir = root(); const manager = await managerFor(dir);
+    try {
+      const unknown = "00000000-0000-4000-8000-000000000000";
+      const creation = { task: "private unknown decision brief", ...defaults, spawnRouterDecisionId: unknown };
+      const child = await (authenticated ? spawnAdmitted(manager, creation) : manager.spawn(creation));
+      expect(await manager.wait(child.id)).toMatchObject({ status: "completed", ...defaults });
+      const log = decisions(dir);
+      expect(log).toHaveLength(1);
+      expectRefused(log[0]!, unknown, "decision-unknown");
+      expect(JSON.stringify(log)).not.toContain(creation.task);
+    } finally { await manager.close(); }
+  });
+
+  it("request-body authority cannot substitute for the manager's native admission argument", async () => {
+    const dir = root(); const manager = await managerFor(dir);
+    try {
+      const admitted = { task: "private forged body authority", ...defaults };
+      const admission = admissionFor(dir);
+      const route = (await routeNative(dir, admitted, { explicit: true }))!;
+      const creation = { ...admitted, spawnRouterDecisionId: route.decisionId, routerAdmission: admission };
+      const forged = await manager.spawn(creation);
+      expect((await manager.wait(forged.id)).status).toBe("completed");
+      expectRefused(decisions(dir)[1]!, route.decisionId, "decision-unknown");
+      const valid = await spawnAdmitted(manager, creation, admission);
+      expect((await manager.wait(valid.id)).status).toBe("completed");
+      expect(decisions(dir)[2]).toMatchObject({ kind: "start", decisionId: route.decisionId, agentId: valid.id });
+    } finally { await manager.close(); }
+  });
+
+  it("two native managers and separate mesh handles consume one persisted decision exactly once", async () => {
+    const dir = root(); const firstManager = await managerFor(dir); const secondManager = await managerFor(dir);
+    const secondMesh = new MeshStore(dir, 64 * 1024, 100, { stateBackend: "file" });
+    try {
+      const admitted = { task: "private concurrent native brief", ...defaults };
+      const admission = admissionFor(dir);
+      const route = (await routeNative(dir, admitted, { explicit: true }))!;
+      const creation = { ...admitted, spawnRouterDecisionId: route.decisionId };
+      const children = await Promise.all([
+        spawnAdmitted(firstManager, creation, admission),
+        spawnAdmitted(secondManager, creation, { ...admission, mesh: secondMesh }),
+      ]);
+      expect(new Set(children.map(child => child.id)).size).toBe(2);
+      const results = await Promise.all([firstManager.wait(children[0]!.id), secondManager.wait(children[1]!.id)]);
+      expect(results.map(result => result.status)).toEqual(["completed", "completed"]);
+      const log = decisions(dir);
+      expect(log).toHaveLength(3);
+      const starts = log.filter(entry => entry.kind === "start");
+      expect(starts).toHaveLength(1);
+      expect(starts[0]).toMatchObject({ decisionId: route.decisionId, ...defaults });
+      expect(children.map(child => child.id)).toContain(starts[0]!.agentId);
+      const refused = log.filter(entry => entry.kind === "start-refused");
+      expect(refused).toHaveLength(1);
+      expectRefused(refused[0]!, route.decisionId, "decision-replayed");
+    } finally { await Promise.all([firstManager.close(), secondManager.close()]); secondMesh.closeState(); }
+  });
+
+  it("issuance and consumption survive closing and reopening the mesh handle", async () => {
+    const dir = root(); const manager = await managerFor(dir);
+    try {
+      const admitted = { task: "private persisted admission", ...defaults };
+      const route = (await routeNative(dir, admitted, { explicit: true }))!;
+      const key = `decisions/spawn-router/admissions/${route.decisionId}`;
+      admissionFor(dir).mesh.closeState(); meshes.delete(dir);
+      const admission = admissionFor(dir);
+      expect(admission.mesh.get(key, { fresh: true })?.value).toMatchObject({ decisionId: route.decisionId, state: "issued" });
+      const creation = { ...admitted, spawnRouterDecisionId: route.decisionId };
+      const first = await spawnAdmitted(manager, creation, admission);
+      expect((await manager.wait(first.id)).status).toBe("completed");
+      admission.mesh.closeState(); meshes.delete(dir);
+      const reopened = admissionFor(dir);
+      expect(reopened.mesh.get(key, { fresh: true })?.value).toMatchObject({ decisionId: route.decisionId, state: "consumed" });
+      const second = await spawnAdmitted(manager, creation, reopened);
+      expect((await manager.wait(second.id)).status).toBe("completed");
+      expectRefused(decisions(dir)[2]!, route.decisionId, "decision-replayed");
+    } finally { await manager.close(); }
+  });
+
+  it("refuses an expired persisted issuance at its exact TTL boundary without blocking the native worker", async () => {
+    const dir = root(); const manager = await managerFor(dir);
+    try {
+      const admitted = { task: "private expiring admission", ...defaults };
+      const admission = admissionFor(dir);
+      const route = (await routeNative(dir, admitted, { explicit: true }))!;
+      const issued = admission.mesh.get(`decisions/spawn-router/admissions/${route.decisionId}`, { fresh: true })!.value as {
+        issuedAt: number; expiresAt: number;
+      };
+      expect(issued.expiresAt - issued.issuedAt).toBe(10 * 60_000);
+      const clock = vi.spyOn(Date, "now").mockReturnValue(issued.expiresAt);
+      const child = await (async () => {
+        try { return await spawnAdmitted(manager, { ...admitted, spawnRouterDecisionId: route.decisionId }, admission); }
+        finally { clock.mockRestore(); }
+      })();
+      expect((await manager.wait(child.id)).status).toBe("completed");
+      const log = decisions(dir);
+      expect(log).toHaveLength(2);
+      expectRefused(log[1]!, route.decisionId, "decision-unknown");
+    } finally { await manager.close(); }
+  });
+
+  it.each([false, true])("no-ID native spawn is unchanged with native authority=%s", async authenticated => {
+    const dir = root(); const manager = await managerFor(dir);
+    try {
+      const creation = { task: "plain no-ID control", extensions: false, ...defaults };
+      const child = await (authenticated ? spawnAdmitted(manager, creation) : manager.spawn(creation));
+      expect(await manager.wait(child.id)).toMatchObject({ status: "completed", ...defaults });
+      expect(fs.existsSync(path.join(dir, "router"))).toBe(false);
+    } finally { await manager.close(); }
+  });
+
+  it("the real provider attributes a relative child cwd resolved exactly once by the native manager", async () => {
+    const dir = root(); const manager = await managerFor(dir); const childCwd = path.join(dir, "child");
+    fs.mkdirSync(childCwd);
+    const { AgentsProvider } = await import("../src/providers/agents-provider.js");
+    const admission = admissionFor(dir);
+    manager.config.router = { command: [], mode: "shadow" };
+    const self = { id: admission.targetRootId, rootId: admission.targetRootId, sessionId: admission.requesterSessionId,
+      ownerHostId: admission.targetHostId, ownerIdentityId: admission.targetRootId, role: admission.role, kind: "root" };
+    const provider = new AgentsProvider(manager, { mesh: admission.mesh, identity: { ...self, kind: "main" } } as any,
+      {} as any, { id: self.id, local: true } as any, { self: () => self, scheduleRefresh() {} } as any,
+      undefined, {} as any);
+    try {
+      const creation = { task: "relative cwd control", cwd: "child", model: defaults.model, transport: "process", extensions: false };
+      const child = await provider.invoke("spawn", creation, { cwd: dir,
+        extensionContext: { modelRegistry: { getAvailable: () => [{ provider: "provider", id: "model-a" }] } }, update() {}, activity() {},
+      } as any) as { id: string; cwd: string };
+      expect(child.cwd).toBe(fs.realpathSync(childCwd));
+      expect(await manager.wait(child.id)).toMatchObject({ status: "completed", cwd: fs.realpathSync(childCwd) });
+      const log = decisions(dir);
+      expect(log).toHaveLength(2);
+      expect(log[1]).toMatchObject({ kind: "start", decisionId: log[0]!.decisionId, agentId: child.id });
+    } finally { await manager.close(); }
+  });
+
   it.each(["off", "shadow", "enforce", "explicit"] as const)("%s joins the real manager's applied binding to the real decision ledger", async mode => {
     const dir = root(); const opts = options(dir); const manager = await managerFor(dir);
     try {
-      const route = await routeAgentCreation({ ...opts, explicit: mode === "explicit",
+      const admitted = { task: "native receipt", extensions: false };
+      const route = await routeNative(dir, admitted, { explicit: mode === "explicit",
         config: { ...opts.config, mode: mode === "explicit" ? "enforce" : mode } });
-      const creation = { task: "native receipt", extensions: false, ...route?.selected,
+      const creation = { ...admitted, ...route?.selected,
         ...(route ? { spawnRouterDecisionId: route.decisionId } : {}) };
-      const child = await manager.spawn(creation);
+      const child = await spawnAdmitted(manager, creation);
       await manager.wait(child.id);
       if (mode === "off") { expect(fs.existsSync(path.join(dir, "router"))).toBe(false); return; }
       const log = decisions(dir);
@@ -118,10 +398,10 @@ describe("native spawn router receipts", () => {
       return handle;
     });
     try {
-      const route = (await routeAgentCreation(options(dir)))!;
-      const creation = { task: recordFirst ? "HANG" : JSON.stringify({ fakeWorkerBootGate: release }),
-        ...route.selected, spawnRouterDecisionId: route.decisionId };
-      const child = await manager.spawn(creation);
+      const admitted = { task: recordFirst ? "HANG" : JSON.stringify({ fakeWorkerBootGate: release }) };
+      const route = (await routeNative(dir, admitted))!;
+      const creation = { ...admitted, ...route.selected, spawnRouterDecisionId: route.decisionId };
+      const child = await spawnAdmitted(manager, creation);
       const start = decisions(dir)[1]!;
       expect(start).toMatchObject({ verified: recordFirst, launch: { runId: child.id, pid: expect.any(Number) },
         evidenceRef: recordFirst ? path.join("runs", child.id, "status.json") : null });
@@ -134,11 +414,12 @@ describe("native spawn router receipts", () => {
     const dir = root(); const manager = await managerFor(dir);
     const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
-      const route = (await routeAgentCreation(options(dir)))!;
+      const admitted = { task: "receipt unavailable" };
+      const route = (await routeNative(dir, admitted))!;
       const file = path.join(dir, "router", "decisions.jsonl");
       fs.renameSync(file, file + ".saved"); fs.mkdirSync(file);
-      const creation = { task: "receipt unavailable", ...route.selected, spawnRouterDecisionId: route.decisionId };
-      const child = await manager.spawn(creation);
+      const creation = { ...admitted, ...route.selected, spawnRouterDecisionId: route.decisionId };
+      const child = await spawnAdmitted(manager, creation);
       expect(child).toMatchObject({ model: pick.model, thinking: pick.thinking });
       expect((await manager.wait(child.id)).status).toBe("completed");
       expect(warning).toHaveBeenCalledWith("[pi-fabric] spawn router decision log unavailable");
@@ -147,9 +428,10 @@ describe("native spawn router receipts", () => {
   it("records the manager's clamped thinking, not the router's requested thinking", async () => {
     const dir = root(); const manager = await managerFor(dir);
     try {
-      const route = (await routeAgentCreation(options(dir)))!;
-      const creation = { task: "clamped receipt", ...route.selected, thinkingBounds: { max: "low" as const }, spawnRouterDecisionId: route.decisionId };
-      const child = await manager.spawn(creation); await manager.wait(child.id);
+      const admitted = { task: "clamped receipt", thinkingBounds: { max: "low" as const } };
+      const route = (await routeNative(dir, admitted))!;
+      const creation = { ...admitted, ...route.selected, spawnRouterDecisionId: route.decisionId };
+      const child = await spawnAdmitted(manager, creation); await manager.wait(child.id);
       expect(decisions(dir)[0]).toMatchObject({ requested: { model: pick.model, thinking: pick.thinking }, actual: { model: pick.model, thinking: pick.thinking } });
       expect(decisions(dir)[1]).toMatchObject({ kind: "start", decisionId: route.decisionId, model: pick.model, thinking: "low" });
     } finally { await manager.close(); }
@@ -157,11 +439,12 @@ describe("native spawn router receipts", () => {
   it("uses an existing native Pi session header, never the process or parent session id", async () => {
     const dir = root(); const manager = await managerFor(dir);
     try {
-      const route = (await routeAgentCreation(options(dir)))!;
       const sessionFile = path.join(dir, "seed-session.jsonl");
       fs.writeFileSync(sessionFile, JSON.stringify({ type: "session", id: "native-pi-session", cwd: dir, timestamp: new Date().toISOString(), version: 3 }) + "\n");
-      const creation = { task: "seeded receipt", ...route.selected, sessionFile, spawnRouterDecisionId: route.decisionId };
-      const child = await manager.spawn(creation); await manager.wait(child.id);
+      const admitted = { task: "seeded receipt", sessionFile };
+      const route = (await routeNative(dir, admitted))!;
+      const creation = { ...admitted, ...route.selected, spawnRouterDecisionId: route.decisionId };
+      const child = await spawnAdmitted(manager, creation); await manager.wait(child.id);
       expect(decisions(dir)[1]).toMatchObject({ kind: "start", decisionId: route.decisionId, agentId: child.id, sessionId: "native-pi-session" });
     } finally { await manager.close(); }
   });
@@ -169,9 +452,10 @@ describe("native spawn router receipts", () => {
     const dir = root(); const manager = await managerFor(dir);
     try {
       const first = await manager.spawn({ task: "HANG", extensions: false });
-      const route = (await routeAgentCreation(options(dir)))!;
-      const creation = { task: "queued receipt", ...route.selected, spawnRouterDecisionId: route.decisionId };
-      const child = await manager.spawn(creation);
+      const admitted = { task: "queued receipt" };
+      const route = (await routeNative(dir, admitted))!;
+      const creation = { ...admitted, ...route.selected, spawnRouterDecisionId: route.decisionId };
+      const child = await spawnAdmitted(manager, creation);
       expect(child.status).toBe("queued");
       expect(decisions(dir)).toHaveLength(1);
       await manager.stop(first.id);
@@ -184,9 +468,10 @@ describe("native spawn router receipts", () => {
     const dir = root(); const manager = await managerFor(dir);
     try {
       await manager.spawn({ task: "HANG", extensions: false });
-      const route = (await routeAgentCreation(options(dir)))!;
-      const creation = { task: "cancelled queued receipt", ...route.selected, spawnRouterDecisionId: route.decisionId };
-      const child = await manager.spawn(creation);
+      const admitted = { task: "cancelled queued receipt" };
+      const route = (await routeNative(dir, admitted))!;
+      const creation = { ...admitted, ...route.selected, spawnRouterDecisionId: route.decisionId };
+      const child = await spawnAdmitted(manager, creation);
       expect(child.status).toBe("queued"); expect(decisions(dir)).toHaveLength(1);
       await manager.stop(child.id); await manager.wait(child.id);
       const log = decisions(dir);
@@ -197,37 +482,73 @@ describe("native spawn router receipts", () => {
   it("a real manager preparation failure writes exactly one fixed start-failed record", async () => {
     const dir = root(); const manager = await managerFor(dir);
     try {
-      const route = (await routeAgentCreation(options(dir)))!;
+      const admitted = { task: "private native failure text" };
+      const route = (await routeNative(dir, admitted))!;
       vi.spyOn(manager, "prepareModelForAdmission").mockRejectedValue(new Error("private native failure text"));
-      const creation = { task: "private native failure text", ...route.selected, spawnRouterDecisionId: route.decisionId };
-      await expect(manager.spawn(creation)).rejects.toThrow("private native failure text");
+      const creation = { ...admitted, ...route.selected, spawnRouterDecisionId: route.decisionId };
+      await expect(spawnAdmitted(manager, creation)).rejects.toThrow("private native failure text");
       expect(decisions(dir)).toHaveLength(2);
       expect(decisions(dir)[1]).toEqual({ ts: expect.any(String), kind: "start-failed", decisionId: route.decisionId,
         agentId: null, sessionId: null, model: null, thinking: null, ...unverifiedStart, error: "start-failed" });
       expect(JSON.stringify(decisions(dir))).not.toContain(creation.task);
     } finally { await manager.close(); }
   });
+  it.each(["provider", "manager"] as const)("a real public provider %s preparation failure writes one start-failed and no replay refusal", async stage => {
+    const dir = root(); const manager = await managerFor(dir);
+    const { AgentsProvider } = await import("../src/providers/agents-provider.js");
+    const admission = admissionFor(dir);
+    manager.config.router = { command: [], mode: "shadow" };
+    const self = { id: admission.targetRootId, rootId: admission.targetRootId, sessionId: admission.requesterSessionId,
+      ownerHostId: admission.targetHostId, ownerIdentityId: admission.targetRootId, role: admission.role, kind: "root" };
+    const provider = new AgentsProvider(manager, { mesh: admission.mesh, identity: { ...self, kind: "main" } } as any,
+      {} as any, { id: self.id, local: true } as any, { self: () => self, scheduleRefresh() {} } as any,
+      undefined, {} as any);
+    const failure = new Error("private public spawn preparation failure");
+    const spawn = vi.spyOn(manager, "spawn");
+    const preparation = stage === "provider"
+      ? vi.spyOn(manager, "resolveKernel").mockImplementation(() => { throw failure; })
+      : vi.spyOn(manager, "prepareModelForAdmission").mockRejectedValue(failure);
+    try {
+      const creation = { task: "private public provider failure task", model: defaults.model, transport: "process", extensions: false };
+      await expect(provider.invoke("spawn", creation, { cwd: dir,
+        extensionContext: { modelRegistry: { getAvailable: () => [{ provider: "provider", id: "model-a" }] } }, update() {}, activity() {},
+      } as any)).rejects.toBe(failure);
+      expect(preparation).toHaveBeenCalledOnce();
+      expect(spawn).toHaveBeenCalledTimes(stage === "manager" ? 1 : 0);
+      const log = decisions(dir);
+      expect(log).toHaveLength(2);
+      expect(log[0]).toMatchObject({ kind: "decision", spawnKind: "spawn" });
+      expect(log[1]).toEqual({ ts: expect.any(String), kind: "start-failed", decisionId: log[0]!.decisionId,
+        agentId: null, sessionId: null, model: null, thinking: null, ...unverifiedStart, error: "start-failed" });
+      expect(log.filter(entry => entry.kind === "start-failed")).toHaveLength(1);
+      expect(log.filter(entry => entry.kind === "start-refused")).toHaveLength(0);
+      expect(admission.mesh.get(`decisions/spawn-router/admissions/${log[0]!.decisionId}`, { fresh: true })?.value)
+        .toMatchObject({ state: "consumed" });
+      expect(JSON.stringify(log)).not.toContain(creation.task);
+      expect(JSON.stringify(log)).not.toContain(failure.message);
+    } finally { await manager.close(); }
+  });
   it.each(["shadow", "enforce", "default", "explicit"] as const)("%s actor creation records its binding without inventing a Pi session id or pinning defaults", async mode => {
     const dir = root(); const manager = await managerFor(dir);
     const { ActorManager } = await import("../src/actors/manager.js");
-    const { MeshStore } = await import("../src/mesh/store.js");
     const { DEFAULT_FABRIC_CONFIG } = await import("../src/config.js");
-    const mesh = new MeshStore(dir, DEFAULT_FABRIC_CONFIG.mesh.maxEventBytes, 100);
-    const actors = new ActorManager("owner-session", { id: "session:owner-session", name: "main", kind: "main", sessionId: "owner-session" },
+    const mesh = admissionFor(dir).mesh;
+    const actors = new ActorManager("router-parent", { id: "session:router-parent", name: "main", kind: "main", sessionId: "router-parent" },
       mesh, DEFAULT_FABRIC_CONFIG.mesh, manager, () => {}, { actorRoot: path.join(dir, "actors"), persistent: false, reapDeadSessionPresence: false });
     try {
       const opts = options(dir);
-      const route = (await routeAgentCreation({ ...opts, kind: "actor", explicit: mode === "explicit",
+      const admitted = { name: "receipt actor", instructions: "private actor task" };
+      const route = (await routeNative(dir, admitted, { kind: "actor", explicit: mode === "explicit",
         config: { ...opts.config, mode: mode === "shadow" ? "shadow" : "enforce", ...(mode === "default" ? { command: [] } : {}) } }))!;
-      const creation = { name: "receipt actor", instructions: "private actor task", ...route.selected, spawnRouterDecisionId: route.decisionId };
-      const actor = await actors.create(creation);
+      const creation = { ...admitted, ...route.selected, spawnRouterDecisionId: route.decisionId };
+      const actor = await actors.create(creation, { routerAdmission: admissionFor(dir) });
       expect(decisions(dir)).toHaveLength(2);
       expect(decisions(dir)[1]).toEqual({ ts: expect.any(String), kind: "start", decisionId: route.decisionId, agentId: actor.id,
         sessionId: null, ...unverifiedStart, ...(mode === "enforce" ? { model: pick.model, thinking: pick.thinking } : defaults) });
       if (mode === "explicit") {
-        const refused = (await routeAgentCreation({ ...opts, kind: "actor", explicit: true }))!;
+        const refused = (await routeNative(dir, admitted, { kind: "actor", explicit: true }))!;
         const duplicate = { ...creation, spawnRouterDecisionId: refused.decisionId };
-        await expect(actors.create(duplicate)).rejects.toThrow();
+        await expect(actors.create(duplicate, { routerAdmission: admissionFor(dir) })).rejects.toThrow();
         const log = decisions(dir);
         expect(log).toHaveLength(4);
         expect(log[3]).toMatchObject({ kind: "start-failed", decisionId: refused.decisionId, verified: false, error: "start-failed" });
@@ -281,6 +602,9 @@ describe("durable provider spawn router handoff receipts", () => {
     // The fake receiver cannot execute durable work, even in a confined runner.
     vi.stubEnv("PI_FABRIC_WRITE_POLICY", "");
     const identity = { id: "session:receipt-probe", kind: "main", name: "main", sessionId: "receipt-probe" };
+    const { residentHostId } = await import("../src/residency/protocol.js");
+    const admission = { ...admissionFor(dir), requesterSessionId: identity.sessionId,
+      targetRootId: identity.id, targetHostId: residentHostId(identity.id) };
     const config = { ...DEFAULT_FABRIC_CONFIG.agents };
     delete config.model;
     const manager = new AgentManager(dir, {
@@ -289,14 +613,16 @@ describe("durable provider spawn router handoff receipts", () => {
     }, { runRoot: path.join(dir, "runs"), meshRoot: dir });
     const failure = new Error(stage === "before" ? "local client preparation rejected before dispatch"
       : stage === "rejected" ? "native receiver rejected admission" : "response uncertain after native admission");
-    const receive = vi.fn(async (creation: { spawnRouterDecisionId?: string }, _signal?: AbortSignal, onDispatched?: () => void) => {
+    const receive = vi.fn(async (creation: NonNullable<Parameters<typeof routeAgentCreation>[0]["admissionRequest"]> & { spawnRouterDecisionId?: string }, _signal?: AbortSignal, onDispatched?: () => void) => {
       const decisionId = creation.spawnRouterDecisionId;
       expect(decisionId).toEqual(expect.any(String));
       if (stage === "before") throw failure;
       expect(onDispatched).toEqual(expect.any(Function));
       onDispatched!();
-      if (stage === "rejected") await recordSpawnRouterStartFailed({ meshRoot: dir, decisionId: decisionId! });
-      else await recordSpawnRouterStart({ meshRoot: dir, decisionId: decisionId!, agentId: "native-record", sessionId: null,
+      const attribution = { meshRoot: dir, decisionId: decisionId!, admission,
+        spawnKind: action === "spawn" ? "spawn" as const : "actor" as const, request: creation, cwd: dir };
+      if (stage === "rejected") await recordSpawnRouterStartFailed(attribution);
+      else await recordSpawnRouterStart({ ...attribution, agentId: "native-record", sessionId: null,
         model: "provider/applied", thinking: "low" });
       throw failure;
     });
@@ -305,7 +631,7 @@ describe("durable provider spawn router handoff receipts", () => {
       ownerIdentityId: identity.id, cwd: dir, role: "task-agent" }), scheduleRefresh() {} };
     // As in the recorded probe, unused actor/lifecycle services are inert: no
     // timer-owning managers or disposal paths are needed for rejected calls.
-    const provider = new AgentsProvider(manager, { mesh: { root: dir }, identity } as any, {} as any,
+    const provider = new AgentsProvider(manager, { mesh: admission.mesh, identity } as any, {} as any,
       { id: identity.id, local: true } as any, participants as any, undefined, {} as any, undefined, residency as any);
     const privateName = "private durable receipt name";
     const privateTask = "private durable receipt task 🦉";
@@ -469,10 +795,14 @@ describe("external spawn router behavior", () => {
   });
   it.each(["shadow", "enforce"] as const)("writes one applied start line joined by decisionId in %s mode", async mode => {
     const dir = root();
-    const result = await routeAgentCreation({ ...options(dir), config: { ...options(dir).config, mode } });
+    const admission = admissionFor(dir);
+    const admitted = { task: "applied start" };
+    const result = await routeAgentCreation({ ...options(dir), config: { ...options(dir).config, mode },
+      admission, admissionRequest: admitted });
     expect(result).toBeDefined();
     await recordSpawnRouterStart({ meshRoot: dir, decisionId: result!.decisionId, agentId: "agent-1", sessionId: null,
-      model: result!.model ?? null, thinking: result!.thinking });
+      model: result!.model ?? null, thinking: result!.thinking, admission, spawnKind: "spawn",
+      request: { ...admitted, ...result!.selected }, cwd: dir });
     const log = decisions(dir);
     expect(log).toHaveLength(2);
     expect(log[1]).toEqual({ ts: expect.any(String), kind: "start", decisionId: result!.decisionId,
@@ -481,15 +811,22 @@ describe("external spawn router behavior", () => {
   });
   it("writes an explicit applied start line and a fixed start failure", async () => {
     const dir = root();
-    const result = await routeAgentCreation({ ...options(dir), explicit: true });
+    const admission = admissionFor(dir);
+    const admitted = { name: "explicit actor", instructions: "private actor instructions" };
+    const result = await routeAgentCreation({ ...options(dir), kind: "actor", explicit: true,
+      admission, admissionRequest: admitted });
     await recordSpawnRouterStart({ meshRoot: dir, decisionId: result!.decisionId, agentId: "actor-1", sessionId: "pi-1",
-      model: defaults.model, thinking: defaults.thinking });
+      model: defaults.model, thinking: defaults.thinking, admission, spawnKind: "actor", request: admitted, cwd: dir });
     const log = decisions(dir);
     expect(log[1]).toMatchObject({ kind: "start", decisionId: result!.decisionId, agentId: "actor-1", sessionId: "pi-1",
       model: defaults.model, thinking: defaults.thinking });
     const failedDir = root();
-    const failed = await routeAgentCreation({ ...options(failedDir), explicit: true });
-    await recordSpawnRouterStartFailed({ meshRoot: failedDir, decisionId: failed!.decisionId });
+    const failedAdmission = admissionFor(failedDir);
+    const failedRequest = { task: "private failed request" };
+    const failed = await routeAgentCreation({ ...options(failedDir), explicit: true,
+      admission: failedAdmission, admissionRequest: failedRequest });
+    await recordSpawnRouterStartFailed({ meshRoot: failedDir, decisionId: failed!.decisionId,
+      admission: failedAdmission, spawnKind: "spawn", request: failedRequest, cwd: failedDir });
     expect(decisions(failedDir)[1]).toEqual({ ts: expect.any(String), kind: "start-failed", decisionId: failed!.decisionId,
       agentId: null, sessionId: null, model: null, thinking: null, ...unverifiedStart, error: "start-failed" });
   });

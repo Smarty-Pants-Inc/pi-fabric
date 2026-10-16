@@ -32,6 +32,7 @@ import { PARTICIPANT_NAME_PATTERN as ACTOR_NAME_PATTERN } from "../topology/part
 import { AgentLaunchPreparationTimeoutError, AgentManager } from "../agents/manager.js";
 import type { AgentRunRecord, AgentRunRequest, AgentRunResult } from "../agents/types.js";
 import type { ModelRouteDecision } from "../agents/model-route.js";
+import type { SpawnRouterAdmission } from "../agents/spawn-router.js";
 
 import { readJsonlPage } from "../log-tail.js";
 import { ActorChildCompletionStore, ActorChildCompletionWatch, ChildCompletionClaimLostError } from "./child-completions.js";
@@ -1200,7 +1201,7 @@ export class ActorManager {
     }
   }
 
-  async #recordSpawnRouterStart(request: FabricActorRequest, actor: ManagedActor): Promise<void> {
+  async #recordSpawnRouterStart(request: FabricActorRequest, actor: ManagedActor, admission?: SpawnRouterAdmission): Promise<void> {
     const decisionId = (request as FabricActorRequest & { spawnRouterDecisionId?: unknown }).spawnRouterDecisionId;
     if (typeof decisionId !== "string" || !decisionId) return;
     try {
@@ -1210,19 +1211,19 @@ export class ActorManager {
       if (actor.runner === "pi" || actor.runner === "pi-durable") {
         try { sessionId = readPiSessionHeader(actor.sessionFile)?.id ?? null; } catch { /* No native session yet. */ }
       }
-      await recordSpawnRouterStart({ meshRoot: this.mesh.root, decisionId, agentId: actor.id,
+      await recordSpawnRouterStart({ meshRoot: this.mesh.root, decisionId, admission, spawnKind: "actor", request, cwd: this.agents.cwd, agentId: actor.id,
         sessionId,
         model: binding.model ?? actor.model ?? this.agents.defaultModel(actor.runner) ?? null,
         thinking: binding.thinking ?? actor.thinking ?? this.agents.config.thinking });
     } catch { /* Ledger writes never change actor creation. */ }
   }
 
-  async #recordSpawnRouterStartFailed(request: FabricActorRequest): Promise<void> {
+  async #recordSpawnRouterStartFailed(request: FabricActorRequest, admission?: SpawnRouterAdmission): Promise<void> {
     const decisionId = (request as FabricActorRequest & { spawnRouterDecisionId?: unknown }).spawnRouterDecisionId;
     if (typeof decisionId !== "string" || !decisionId) return;
     try {
       const { recordSpawnRouterStartFailed } = await import("../agents/spawn-router.js");
-      await recordSpawnRouterStartFailed({ meshRoot: this.mesh.root, decisionId });
+      await recordSpawnRouterStartFailed({ meshRoot: this.mesh.root, decisionId, admission, spawnKind: "actor", request, cwd: this.agents.cwd });
     } catch { /* Ledger writes never change actor creation. */ }
   }
 
@@ -1237,8 +1238,10 @@ export class ActorManager {
    */
   async create(
     request: FabricActorRequest,
-    { asRegistryOwner = false, beforeCommit, beforeMaterialize, checkActive, onCommit, supervisorOwner = this.identity }: {
+    { asRegistryOwner = false, beforeCommit, beforeMaterialize, checkActive, onCommit, supervisorOwner = this.identity, routerAdmission }: {
       asRegistryOwner?: boolean;
+      /** Native-only authenticated attribution, independent of supervisor/launch authority. */
+      routerAdmission?: SpawnRouterAdmission;
       /** Host-only: verified resident creator, never request fields. */
       supervisorOwner?: MeshIdentity;
       /** Protected creates require a SYNCHRONOUS final request-acceptance fence.
@@ -1252,6 +1255,8 @@ export class ActorManager {
     } = {},
   ): Promise<FabricActorInfo> {
     ++this.#pendingCreates;
+    routerAdmission = routerAdmission && { ...routerAdmission, targetRootId: this.#rootId,
+      targetHostId: this.agents.runtimeHostId ?? routerAdmission.targetHostId };
     const routerDecisionId = (request as FabricActorRequest & { spawnRouterDecisionId?: unknown }).spawnRouterDecisionId;
     let routerStartSettled = typeof routerDecisionId !== "string" || routerDecisionId.length === 0;
     let reservedName: string | undefined;
@@ -1456,7 +1461,7 @@ export class ActorManager {
       }
       if (!routerStartSettled) {
         routerStartSettled = true;
-        await this.#recordSpawnRouterStart(request, actor);
+        await this.#recordSpawnRouterStart(request, actor, routerAdmission);
       }
     await this.#publishPresence(actor);
     await this.#publishSlotCreated(actor);
@@ -1469,7 +1474,7 @@ export class ActorManager {
     } catch (error) {
       if (!routerStartSettled) {
         routerStartSettled = true;
-        await this.#recordSpawnRouterStartFailed(request);
+        await this.#recordSpawnRouterStartFailed(request, routerAdmission);
       }
       throw error;
     } finally {

@@ -612,6 +612,7 @@ globalThis.agents = Object.freeze({
   setCoalesceKey: (args) => __call("agents.setCoalesceKey", args),
   setBatching: (args) => __call("agents.setBatching", args),
   setActivationFilter: (args) => __call("agents.setActivationFilter", args),
+  setTopics: (args) => __call("agents.setTopics", args),
   setEvents: (args) => __call("agents.setEvents", args),
   setDeliveryPolicy: (args) => __call("agents.setDeliveryPolicy", args),
   clearMessages: (args) => __call("agents.clearMessages", args),

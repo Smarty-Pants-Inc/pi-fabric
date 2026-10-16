@@ -70,8 +70,21 @@ return await agents.create(name="auth-supervisor", instructions="Watch until the
 - `events` observe public Pi lifecycle events asynchronously; synthetic tool_error is supported. Observers cannot block/mutate the originating event. Host event images attach automatically, with credential-shaped fields redacted from persisted envelopes. Topics subscribe to durable mesh channels.
 - `coalesce` defaults on. Native tool allowlists persist; an empty list disables optional tools, not Pi's host-required fabric_exec when extensions remain enabled.
 - `setInstructions`, `setTools`, `setEvents`, `setDeliveryPolicy` update future activations. Model/thinking use per-call override → session binding → project default → configured default. `setModel`/`setThinking` default to session scope; project defaults require owner authority.
+- `await agents.setTopics(id=..., topics=[...], scope="project")` replaces the exact mesh-topic list and removes duplicates. Scope is optional: omitted/`"project"` requires the local actor owner, like `setEvents`, with no resident/remote forwarding; `"global"` updates only the template, not existing live imports. The list is required; malformed lists, non-string entries and names rejected by actor creation fail without clearing subscriptions. `topics=[]` stops topic-matched intake while accepted work drains, without changing the queue, overflow, current run, claims or filters. Direct messages, explicitly addressed mesh events and host-event subscriptions are unchanged. The replacement persists and refreshes the existing monitor without resetting its cursor or replaying already-passed events.
 - `actors`, `actorStatus`, `messages`, and `log` inspect state/history. `remove` deletes through the owner. Use discovered schemas for scope and bounded history options; avoid transcript dumps.
 - Python must not supply guest callback predicates (`validWhile`, handoff predicates); those are not native Python host-call functions. Use supported host fields and explicit checks instead.
+
+Native slot-bound actors have immutable topics: `setTopics` refuses them with `FABRIC_ACTOR_SLOT_CLAIM_REFUSED` (`reason: "invalid"`) before mutation. The setter also refuses an ordinary actor's transition into protected slot topics. Protected-actor drain support is tracked in [smarty-dev#13463](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/13463).
+
+For topic drain-only on an ordinary (non-slot) actor during maintenance, keep a receipt containing the prior list:
+
+```python
+actor = await agents.actorStatus(id="work-reviewer")
+await agents.setTopics(id=actor["id"], topics=[])
+return {"id": actor["id"], "resumeTopics": actor["topics"]}
+```
+
+In a later invocation restore the saved list, for example `await agents.setTopics(id="work-reviewer", topics=["org.work.v1"])`. A new `org.work.v1` broadcast is then eligible again: an empty list is not a permanent stop. Matching reads live topics at dispatch, so an event not yet consumed can see the restored list. Other intake remains active throughout; this does not guarantee idle.
 
 ## Recursive work and handoff
 

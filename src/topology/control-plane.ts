@@ -1,4 +1,5 @@
 import { appendDeliveryOutcome, type DeliverySend } from "../mesh/delivery-outcomes.js";
+import { diagnostics } from "../core/diagnostics.js";
 import { controlBodyFingerprint, FABRIC_IDEMPOTENCY_KEY_REUSED, FabricIdempotencyKeyReusedError } from "../mesh/control-idempotency.js";
 import type { MeshControlIncarnationFence } from "../config.js";
 import { FabricBridgeStaleError, FabricParticipantStaleError, mirroredOwnerRoutingStatus, participantLeaseGraceMs, waitForMirroredLeaseRenewal, type FabricMirrorLease, type MirrorLeaseWaitBudget } from "./host-leases.js";
@@ -93,7 +94,7 @@ export const controlOwnerIncarnation = (participant: {
 };
 /** One-line counted diagnostic; a legacy route remains authorized by its existing checks. */
 export const warnUnfencedControlDelivery = (operation: FabricControlOperation, targetId: string, count: number): void => {
-  console.warn(`[pi-fabric] Unfenced legacy control delivery count=${count} operation=${operation} target=${JSON.stringify(targetId)}`);
+  diagnostics.warn("src/topology/control-plane.ts", `[pi-fabric] Unfenced legacy control delivery count=${count} operation=${operation} target=${JSON.stringify(targetId)}`);
 };
 const DEFAULT_RESULT_TIMEOUT_MS = 60 * 60 * 1_000;
 const MAX_CONTROL_TIMEOUT_MS = 24 * 60 * 60 * 1_000 + 60_000;
@@ -1547,7 +1548,7 @@ export class FabricControlPlane {
       this.#stopStateChanges = this.mesh.subscribeStateChanges(() => this.#wake());
     } catch (error) {
       // Not fatal: the fs watch and own-publish wakes still drain; say so once.
-      try { console.warn(`[pi-fabric] control plane: mesh state change subscription failed (${error instanceof Error ? error.message : String(error)}); relying on mesh directory notifications.`); } catch {}
+      try { diagnostics.warn("src/topology/control-plane.ts", `[pi-fabric] control plane: mesh state change subscription failed (${error instanceof Error ? error.message : String(error)}); relying on mesh directory notifications.`); } catch {}
     }
   }
 
@@ -1563,7 +1564,7 @@ export class FabricControlPlane {
         ? "ENOSPC: inotify watch limit, not disk space (raise fs.inotify.max_user_watches)"
         : error instanceof Error ? error.message : String(error);
       try {
-        console.warn(`[pi-fabric] control plane: mesh notifications failed for ${this.mesh.root} (${cause}); ` +
+        diagnostics.warn("src/topology/control-plane.ts", `[pi-fabric] control plane: mesh notifications failed for ${this.mesh.root} (${cause}); ` +
           `rescanned once, re-arming in ${delay} ms with bounded retries. Normal operation has no polling; ` +
           "exhausted watches scan and re-arm once per minute; a sender's own ACK deadline still settles its request.");
       } catch {}
@@ -2053,7 +2054,7 @@ export class FabricControlPlane {
     const message = `Unfenced legacy sender delivery count=${count} sender=${JSON.stringify(from.id)} operation=${command.operation} target=${JSON.stringify(command.targetId)} mesh.controlIncarnationFence=warn`;
     try {
       if (this.options.onUnfencedSenderWarning) this.options.onUnfencedSenderWarning(message);
-      else console.warn(`[pi-fabric] ${message}`);
+      else diagnostics.warn("src/topology/control-plane.ts", `[pi-fabric] ${message}`);
     } catch { /* A diagnostic sink never fails an admitted delivery. */ }
   }
 

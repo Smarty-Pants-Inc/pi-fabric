@@ -390,15 +390,15 @@ export class MeshLock {
     // smarty-dev#9805: only the canonical mesh lock opts into the early free-lock bypass of a stalled head.
     const admission = createMeshLockAdmission(this.root, token, waitMs, { stalledHeadBypassLock: this.#lockPath });
     const { ticket } = admission;
-    // Preserve ordinary timing: the relative budget begins after ticket setup.
-    const deadline = (): number => Math.min(
-      admission.deadline,
-      boundedInvocation && !boundedInvocation.detached
-        ? boundedInvocation.closed || boundedInvocation.signal?.aborted
-          ? Number.NEGATIVE_INFINITY
-          : boundedInvocation.deadlineAt() - MESH_INVOCATION_DEADLINE_MARGIN_MS
-        : admission.deadline,
-    );
+    // Guest time is a live absolute bound: host-call floors, human waits and successful detachment may move it.
+    const invocationDeadline = (): number => boundedInvocation && !boundedInvocation.detached
+      ? boundedInvocation.closed || boundedInvocation.signal?.aborted
+        ? Number.NEGATIVE_INFINITY
+        : boundedInvocation.deadlineAt() - MESH_INVOCATION_DEADLINE_MARGIN_MS
+      : Number.POSITIVE_INFINITY;
+    const deadline = (): number => Math.min(admission.deadline, invocationDeadline());
+    let budgetSpent = false;
+    let budgetTimer: ReturnType<typeof setTimeout> | undefined;
     // The shared admission helper fixes the relative budget only after setup; expiry cannot grant admission.
     try {
       // Attempts and the largest gap between two of them: a large gap means this waiter stalled
@@ -407,15 +407,41 @@ export class MeshLock {
       let maxGapMs = 0;
       let lastAttemptAt = Date.now();
       let retryAttempt = 0;
+      let waited = false;
+      let waitSetupExpired = false;
+      const wait = async (ms: number): Promise<void> => {
+        // Only the ordinary relative budget owns this once-armed timer. Latching a guest deadline here would
+        // ignore later host-call floors, human waits or successful detachment. Arm before synchronous watch setup.
+        // Spent means strictly past the budget (+1 ms), so an eligible probe exactly at the deadline still runs.
+        budgetTimer ??= setTimeout(() => { budgetSpent = true; }, Math.max(0, admission.deadline - Date.now()) + 1);
+        const pending = ticket.queued
+          ? ticket.wait(ms, waitSignal, deadline())
+          : delay(ms, waitSignal);
+        // Watch setup spends the fixed ordinary deadline; a later wall-clock jump during the async wait does not.
+        // Guest expiry is always checked live, never latched across a deadline extension or detachment.
+        waitSetupExpired = Date.now() > admission.deadline;
+        await pending;
+        waited = true;
+      };
+      const timeout = (): MeshLockTimeoutError => {
+        // Keep a foreign-holder refusal typed even when the deadline is crossed during a wait.
+        if (blocked.verdict) {
+          const refused = new MeshLockForeignHolderError(describeLockHolder(ownerPath), attempts, maxGapMs, blocked.verdict,
+            blocked.namespace ?? "", this.#lockPath, blocked.token ?? "");
+          alarmForeignHolder(refused);
+          return refused;
+        }
+        return new MeshLockTimeoutError(describeLockHolder(ownerPath), attempts, maxGapMs);
+      };
       while (true) {
         this.#writeAbortSignal?.throwIfAborted();
         assertInvocationAvailable();
-        if (boundedInvocation && !boundedInvocation.detached && waitMs > 0 && deadline() <= Date.now()) throw invocationTimeout();
+        if (boundedInvocation && !boundedInvocation.detached && waitMs > 0 && invocationDeadline() <= Date.now()) throw invocationTimeout();
         if (!ticket.mayContend()) {
           const remaining = deadline() - Date.now();
-          if (remaining > 0) {
+          if (!budgetSpent && remaining > 0) {
             // Woken when the predecessor's receipt goes; the short poll is only a safety net.
-            await ticket.wait(Math.min(20, remaining), waitSignal);
+            await wait(Math.min(20, remaining));
             continue;
           }
           // Expiry never grants FIFO admission: only an eligible head may probe at its deadline. Keep the legacy
@@ -424,6 +450,12 @@ export class MeshLock {
           throw admission.expire(this.#lockPath, this.root, "mesh-lock", lockClass);
         }
         const attemptAt = Date.now();
+        // Both waits can spend the budget in setup or resume late, even on a release signal.
+        // Keep the initial eligible probe; once we have waited, timer expiry is not admission.
+        if (waited && (waitSetupExpired || budgetSpent)) {
+          if (attempts === 0 && ticket.queued) throw admission.expire(this.#lockPath, this.root, "mesh-lock", lockClass);
+          throw timeout();
+        }
         if (attempts > 0) maxGapMs = Math.max(maxGapMs, attemptAt - lastAttemptAt);
         attempts += 1;
         lastAttemptAt = attemptAt;
@@ -486,23 +518,14 @@ export class MeshLock {
           if (code !== "EEXIST" && (this.#lockProtocol === 1 ||
             (code !== "ENOTEMPTY" && code !== "EPERM" && code !== "EACCES"))) throw error;
           if (await this.#clearStaleLock(ownerPath, deadline, blocked)) continue;
-          if (Date.now() >= deadline()) {
-            // The holder was not reclaimed because its namespace is not ours (or unprovable): say so, typed.
-            if (blocked.verdict) {
-              const refused = new MeshLockForeignHolderError(describeLockHolder(ownerPath), attempts, maxGapMs, blocked.verdict,
-                blocked.namespace ?? "", this.#lockPath, blocked.token ?? "");
-              alarmForeignHolder(refused);
-              throw refused;
-            }
-            throw new MeshLockTimeoutError(describeLockHolder(ownerPath), attempts, maxGapMs);
-          }
+          if (Date.now() >= deadline()) throw timeout();
           // Only the FIFO head probes promptly, woken when .lock is released. After the bounded
           // admission fallback, full jitter spreads plain contenders; the deadline bounds every sleep.
-          if (ticket.queued) await ticket.wait(Math.min(10, Math.max(0, deadline() - Date.now())), waitSignal);
-          else await delay(retryDelayMs(retryAttempt++, 20, 250, Math.max(0, deadline() - Date.now())), waitSignal);
+          await wait(ticket.queued ? Math.min(10, Math.max(0, deadline() - Date.now()))
+            : retryDelayMs(retryAttempt++, 20, 250, Math.max(0, deadline() - Date.now())));
         }
       }
-      if (boundedInvocation && !boundedInvocation.detached && waitMs > 0 && deadline() <= Date.now()) {
+      if (boundedInvocation && !boundedInvocation.detached && waitMs > 0 && invocationDeadline() <= Date.now()) {
         releaseOwned();
         throw invocationTimeout();
       }
@@ -541,6 +564,7 @@ export class MeshLock {
       }
       throw error;
     } finally {
+      clearTimeout(budgetTimer);
       ticket.close();
       // Recorded after the ticket closes, so bookkeeping never delays a FIFO follower.
       if (holdMs >= 0) {

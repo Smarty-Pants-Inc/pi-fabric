@@ -3,11 +3,12 @@ import path from "node:path";
 import { jetstream, jetstreamManager } from "@nats-io/jetstream";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { openNatsConnection } from "../src/transport/nats/connection.js";
+import { runTransportAdmin } from "../src/transport/nats/admin.js";
 import { openNatsTransport } from "../src/transport/nats/inbox.js";
 import { openNatsKvForMachine } from "../src/transport/nats/kv.js";
 import { ensureTransportStream } from "../src/transport/nats/provision.js";
 import { ADVISORY_CAPTURE_STREAM, transportAdvisoryStreamSubject, transportInboxStream, transportInboxStreamSubject } from "../src/transport/nats/subjects.js";
-import { createPathBHarness, resolveNatsBinary, type PathBHarness, type PathBUser } from "./helpers/nats-cluster.js";
+import { createPathBHarness, PATH_B_POLICY_ENV, resolveNatsBinary, type PathBHarness, type PathBUser } from "./helpers/nats-cluster.js";
 
 // Focused ownership simulation: the credential reader must use same-fd fstat; we only perturb the uid of
 // one call, never chown on the host. All other fs behavior is the real module.
@@ -347,5 +348,125 @@ describe.skipIf(!binary)("authenticated Path B transport over verified TLS", () 
       await expect(openNatsConnection({ ...plaintext.runtimeOptions(plaintext.users.machineA), allowInsecureLoopback: false,
         servers: `nats://localhost:${new URL(plaintext.serverUrl).port}`, tls: {}, timeoutMs: 1_000 })).rejects.toThrow();
     } finally { await plaintext.stop(); }
+  });
+});
+
+describe.skipIf(!binary)("authenticated Path B transport admin TLS CLI", () => {
+  let tlsHarness: PathBHarness;
+  const hostId = "admin-tls-host";
+  const machines = `${MACHINE_A},${MACHINE_B}`;
+
+  beforeAll(async () => {
+    tlsHarness = await createPathBHarness({ binary: binary!, tls: {} });
+  }, 90_000);
+  afterAll(async () => { await tlsHarness?.stop(); });
+
+  const dnsServer = (): string => `tls://localhost:${new URL(tlsHarness.serverUrl).port}`;
+  const caFile = (): string => tlsHarness.tls!.caFile;
+  const adminEnv = (
+    user: Pick<PathBUser, "machine" | "credsPath">,
+    servers: string,
+    extra: Readonly<Record<string, string>> = {},
+  ): Record<string, string> => ({
+    ...PATH_B_POLICY_ENV,
+    PI_FABRIC_NATS_SERVERS: servers,
+    PI_FABRIC_NATS_CREDENTIALS: user.credsPath,
+    PI_FABRIC_MACHINE: user.machine,
+    ...extra,
+  });
+  const withEnv = async <T>(env: Readonly<Record<string, string>>, action: () => Promise<T>): Promise<T> => {
+    const previous = new Map<string, string | undefined>();
+    for (const [key, value] of Object.entries(env)) {
+      previous.set(key, process.env[key]);
+      process.env[key] = value;
+    }
+    try { return await action(); }
+    finally {
+      for (const [key, value] of previous) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  };
+  const runAdmin = (env: Readonly<Record<string, string>>, args: readonly string[]): Promise<number> =>
+    withEnv(env, () => runTransportAdmin(args));
+  const provisionArgs = (ca: string): string[] => ["provision", "--machines", machines, "--ca-file", ca];
+  const provision = (): Promise<number> => runAdmin(
+    adminEnv(tlsHarness.users.bootstrap, dnsServer()),
+    provisionArgs(caFile()),
+  );
+  const openMachineConsumer = async (id: string) => openNatsTransport({
+    ...tlsHarness.runtimeOptions(tlsHarness.users.machineA),
+    servers: dnsServer(),
+    hostId: id,
+  });
+
+  it("provision succeeds with an absolute CA file and DNS server URL", async () => {
+    expect(path.isAbsolute(caFile())).toBe(true);
+    await expect(provision()).resolves.toBe(0);
+  });
+
+  it("drain succeeds with an existing machine-A consumer over verified TLS", async () => {
+    await provision();
+    const runtime = await openMachineConsumer(hostId);
+    try {
+      await expect(runAdmin(
+        adminEnv(tlsHarness.users.machineA, dnsServer(), { PI_FABRIC_HOST_ID: hostId }),
+        ["drain", "--ca-file", caFile()],
+      )).resolves.toBe(0);
+    } finally { await runtime.close(); }
+  });
+
+  it("orphan succeeds with the operator over verified TLS", async () => {
+    await provision();
+    const runtime = await openMachineConsumer(hostId);
+    try {
+      await expect(runAdmin(
+        adminEnv(tlsHarness.users.maintainer, dnsServer()),
+        ["orphan", "--machine", MACHINE_A, "--host-id", hostId, "--ca-file", caFile()],
+      )).resolves.toBe(0);
+    } finally { await runtime.close(); }
+  });
+
+  it("dlq --once succeeds and finishes a finite pull when there are no advisories", async () => {
+    await provision();
+    await expect(runAdmin(
+      adminEnv(tlsHarness.users.maintainer, dnsServer(), { PI_FABRIC_DLQ_PATH: path.join(tlsHarness.root, "admin-dlq.jsonl") }),
+      ["dlq", "--once", "--ca-file", caFile()],
+    )).resolves.toBe(0);
+  }, 10_000);
+
+  it("refuses every admin command when the CA file flag is absent", async () => {
+    const cases: Array<[string, Readonly<Record<string, string>>, string[]]> = [
+      ["provision", adminEnv(tlsHarness.users.bootstrap, dnsServer()), ["provision", "--machines", machines]],
+      ["drain", adminEnv(tlsHarness.users.machineA, dnsServer(), { PI_FABRIC_HOST_ID: hostId }), ["drain"]],
+      ["orphan", adminEnv(tlsHarness.users.maintainer, dnsServer()), ["orphan", "--machine", MACHINE_A, "--host-id", hostId]],
+      ["dlq", adminEnv(tlsHarness.users.maintainer, dnsServer()), ["dlq", "--once"]],
+    ];
+    for (const [, env, args] of cases) await expect(runAdmin(env, args)).rejects.toThrow();
+  });
+
+  it("refuses every admin command when the CA file flag is paired with an IP URL", async () => {
+    const cases: Array<[string, Readonly<Record<string, string>>, string[]]> = [
+      ["provision", adminEnv(tlsHarness.users.bootstrap, tlsHarness.serverUrl), provisionArgs(caFile())],
+      ["drain", adminEnv(tlsHarness.users.machineA, tlsHarness.serverUrl, { PI_FABRIC_HOST_ID: hostId }), ["drain", "--ca-file", caFile()]],
+      ["orphan", adminEnv(tlsHarness.users.maintainer, tlsHarness.serverUrl), ["orphan", "--machine", MACHINE_A, "--host-id", hostId, "--ca-file", caFile()]],
+      ["dlq", adminEnv(tlsHarness.users.maintainer, tlsHarness.serverUrl), ["dlq", "--once", "--ca-file", caFile()]],
+    ];
+    for (const [, env, args] of cases) await expect(runAdmin(env, args)).rejects.toThrow(/certificate DNS name|IP|numeric/i);
+  });
+
+  it("rejects missing, relative, and duplicate CA flags before broker setup for all commands", async () => {
+    const cases: Array<[Readonly<Record<string, string>>, readonly string[]]> = [
+      [adminEnv(tlsHarness.users.bootstrap, dnsServer()), ["provision", "--machines", machines]],
+      [adminEnv(tlsHarness.users.machineA, dnsServer(), { PI_FABRIC_HOST_ID: hostId }), ["drain"]],
+      [adminEnv(tlsHarness.users.maintainer, dnsServer()), ["orphan", "--machine", MACHINE_A, "--host-id", hostId]],
+      [adminEnv(tlsHarness.users.maintainer, dnsServer()), ["dlq", "--once"]],
+    ];
+    for (const [env, base] of cases) {
+      await expect(runAdmin(env, [...base, "--ca-file"])).rejects.toThrow(/ca-file/i);
+      await expect(runAdmin(env, [...base, "--ca-file", "relative-ca.pem"])).rejects.toThrow(/ca-file/i);
+      await expect(runAdmin(env, [...base, "--ca-file", caFile(), "--ca-file", caFile()])).rejects.toThrow(/ca-file/i);
+    }
   });
 });

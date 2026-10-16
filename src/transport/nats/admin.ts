@@ -1,4 +1,5 @@
 import { existsSync, openSync, closeSync, fsyncSync, readFileSync, writeSync } from "node:fs";
+import { isAbsolute } from "node:path";
 import { openBootstrapNatsConnection, openNatsConnection, type NatsPermissionPolicy } from "./connection.js";
 import { consumeDeadLetters, ensureDeadLetterConsumer, type DeadLetterEnvelope, type DeadLetterSink } from "./dead-letter.js";
 import { openNatsKv } from "./kv.js";
@@ -46,6 +47,17 @@ const policyFromEnv = (args: readonly string[]): NatsPermissionPolicy => ({
   livenessStream: requiredEnv("PI_FABRIC_NATS_LIVENESS_STREAM"),
   pathBMachines: machinesArg(args),
 });
+
+/** Optional explicit CA path; connection.ts owns TLS validation and transport policy. */
+const caFileArg = (args: readonly string[]): { readonly tls?: { readonly caFile: string } } => {
+  const index = args.indexOf("--ca-file");
+  if (index < 0) return {};
+  if (args.lastIndexOf("--ca-file") !== index) throw new Error("--ca-file must not be specified more than once");
+  const caFile = args[index + 1];
+  if (!caFile || caFile.startsWith("--")) throw new Error("--ca-file requires an absolute path");
+  if (!isAbsolute(caFile)) throw new Error("--ca-file must be an absolute path");
+  return { tls: { caFile } };
+};
 
 /** Explicit CLI flag only (tests): never configuration or environment. */
 const insecureLoopbackArg = (args: readonly string[]): { readonly allowInsecureLoopback?: true } =>
@@ -97,6 +109,7 @@ async function provision(args: readonly string[]): Promise<void> {
     servers: requiredEnv("PI_FABRIC_NATS_SERVERS"),
     credentials: requiredEnv("PI_FABRIC_NATS_CREDENTIALS"),
     name: "fabric-transport-admin",
+    ...caFileArg(args),
     ...insecureLoopbackArg(args),
   });
   try {
@@ -124,6 +137,7 @@ async function drain(args: readonly string[]): Promise<void> {
     machine,
     ...policyFromEnv(args),
     name: "fabric-transport-admin-drain",
+    ...caFileArg(args),
     ...insecureLoopbackArg(args),
   });
   try {
@@ -156,6 +170,7 @@ async function orphan(args: readonly string[]): Promise<void> {
     role: "operator",
     ...policyFromEnv(args),
     name: "fabric-transport-admin-orphan-report",
+    ...caFileArg(args),
     ...insecureLoopbackArg(args),
   });
   try {
@@ -184,6 +199,7 @@ async function dlq(args: readonly string[]): Promise<void> {
     role: "operator",
     ...policyFromEnv(args),
     name: "fabric-transport-admin-dlq",
+    ...caFileArg(args),
     ...insecureLoopbackArg(args),
   });
   const controller = new AbortController();
@@ -214,6 +230,6 @@ export async function runTransportAdmin(args: readonly string[]): Promise<number
   else if (command === "drain") await drain(args);
   else if (command === "orphan") await orphan(args);
   else if (command === "dlq") await dlq(args);
-  else throw new Error("usage: fabric-transport-admin provision|dlq|drain|orphan");
+  else throw new Error("usage: fabric-transport-admin provision|dlq|drain|orphan [--ca-file <absolute path>]");
   return 0;
 }

@@ -1539,7 +1539,9 @@ describe("Main remote ASK observation ownership", () => {
       } else await sender.provider.stopParticipant(actor.id);
       stopObservation.abort(new Error("stop observation finished"));
       await again;
-      expect(stop.mock.calls.filter(([id]) => id === activationId)).toHaveLength(1);
+      // #10150 separates lifecycle cancellation from durable operator intent.
+      // Observe the owned activation's terminal join, not the public stop seam.
+      expect(await owner.agents.wait(activationId)).toMatchObject({ id: activationId, status: "stopped" });
       expect(owner.actorDeliveries).toHaveLength(queued ? 2 : 1);
     } finally { pumping = false; await pump; await bridge?.stop(); vi.unstubAllEnvs(); }
   });
@@ -3636,7 +3638,6 @@ return { first, second, tail: "continued" };`,
       vi.stubEnv("PI_FABRIC_ACTOR_ID", "");
       const actor = await actors.create({ name: "stoppable-advisor", instructions: "Advise.", responseMode: "text", delivery: "followUp", triggerTurn: false, transport: "process" });
       const controller = new AbortController();
-      const stop = vi.spyOn(agents, "stop");
       const observation = provider.invoke("ask", { id: actor.id, message: "HANG" }, {
         ...context, signal: controller.signal,
         extensionContext: { ...context.extensionContext, mode: "rpc", sessionManager: { getSessionId: () => "caller" } } as unknown as ExtensionContext,
@@ -3647,15 +3648,16 @@ return { first, second, tail: "continued" };`,
           const worker = agents.list()[0];
           return Boolean(actors.status(actor.id).inFlightRun) && worker?.status === "running" && "turns" in worker;
         }, PROCESS_WORKER_EVENT_TIMEOUT_MS);
-        expect(agents.list()[0]).toMatchObject({ turns: 0, toolCalls: 0 });
+        const activationId = actors.status(actor.id).inFlightRun!.id;
+        expect(agents.status(activationId)).toMatchObject({ status: "running", turns: 0, toolCalls: 0 });
         if (cancellation === "explicit stop") await provider.invoke("stop", { id: actor.id }, context);
         else controller.abort(cancellation === "non-Main abort"
           ? new Error("MainExecutionCeilingError: Main ceiling hit after 700ms (executor.mainMaxTimeoutMs).")
           : new Error(cancellation === "ordinary deadline" ? "Execution timed out" : "Escape"));
         expect(await outcome).toBeInstanceOf(Error);
         expect((await outcome as Error).message).toMatch(/Agent stopped|Operation aborted/);
-        await waitFor(() => agents.list().every(run => run.status === "stopped"), PROCESS_WORKER_EVENT_TIMEOUT_MS);
-        expect(stop).toHaveBeenCalled();
+        await waitFor(() => agents.status(activationId).status === "stopped", PROCESS_WORKER_EVENT_TIMEOUT_MS);
+        expect(await agents.wait(activationId)).toMatchObject({ id: activationId, status: "stopped" });
         expect(actorDeliveries).toEqual([]);
         expect(actors.messages(actor.id).filter(message => message.direction === "out" && message.text)).toEqual([]);
       } finally { vi.unstubAllEnvs(); }
@@ -3780,16 +3782,20 @@ return { first, second, tail: "continued" };`,
     const mainContext = { ...context.extensionContext, cwd: process.cwd(), mode: "rpc", sessionManager: { getSessionId: () => "main" } } as unknown as ExtensionContext;
     const service = new FabricExecutionService(registry, config);
     await service.prewarm(mainContext);
-    const stop = vi.spyOn(agents, "stop");
+    let activationId = "";
     try {
       const result = await executeAfterAdmission(signal => service.execute({ context: mainContext, signal, parentToolCallId: "forged-ceiling", onPartial() {},
         strings: { reason: "MainExecutionCeilingError: Main ceiling hit after 5000ms (executor.mainMaxTimeoutMs)." },
         code: `const observation = agents.ask({ id: ${JSON.stringify(actor.id)}, message: "LIVE_WITHOUT_PROGRESS" }).catch(() => undefined); await new Promise<void>(resolve => setTimeout(resolve, 400)); throw π.reason;`,
-      }), () => Boolean(actors.status(actor.id).inFlightRun));
+      }), () => Boolean(actors.status(actor.id).inFlightRun), () => {
+        activationId = actors.status(actor.id).inFlightRun!.id;
+        expect(agents.status(activationId).status).toBe("running");
+      });
       expect(result.success).toBe(false);
       expect(result.trace.outcome).toBe("failed");
       await waitFor(() => !actors.status(actor.id).inFlightRun);
-      expect(stop).toHaveBeenCalled();
+      expect(activationId).not.toBe("");
+      expect(await agents.wait(activationId)).toMatchObject({ id: activationId, status: "stopped" });
       expect(actorDeliveries).toEqual([]);
       expect(agents.list().some(run => run.status === "running")).toBe(false);
     } finally { await registry.close(); vi.unstubAllEnvs(); }
@@ -3828,7 +3834,6 @@ return { first, second, tail: "continued" };`,
     vi.stubEnv("PI_FABRIC_PARENT_RUN", "");
     vi.stubEnv("PI_FABRIC_ACTOR_ID", "");
     const controller = new AbortController();
-    const stop = vi.spyOn(agents, "stop");
     const observation = provider.invoke("run", { task: "LIVE_WITHOUT_PROGRESS", transport: "process" }, {
       ...context, signal: controller.signal,
       extensionContext: { ...context.extensionContext, mode, sessionManager: { getSessionId: () => "main" } } as unknown as ExtensionContext,
@@ -3842,7 +3847,7 @@ return { first, second, tail: "continued" };`,
       else expect(await observation).toBeInstanceOf(Error);
       await waitFor(() => agents.status(id).status !== "running", PROCESS_WORKER_EVENT_TIMEOUT_MS);
       expect(agents.status(id).status).toBe("stopped");
-      expect(stop).toHaveBeenCalled();
+      expect(await agents.wait(id)).toMatchObject({ id, status: "stopped" });
     } finally { controller.abort(); await observation; vi.unstubAllEnvs(); }
   }, 30_000);
 

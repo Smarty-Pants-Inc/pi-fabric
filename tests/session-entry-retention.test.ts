@@ -2,7 +2,8 @@ import { setImmediate } from "node:timers/promises";
 import { describe, expect, it } from "vitest";
 import { restoreStoppedRuns, STOPPED_AGENTS_ENTRY, type StoppedAgentsEntryData } from "../src/agents/stopped-runs.js";
 import type { AgentRunResult } from "../src/agents/types.js";
-import { rootInboxSession, ROOT_INBOX_CUSTOM_TYPE } from "../src/topology/root-inbox.js";
+import { ROOT_INBOX_CUSTOM_TYPE } from "../src/topology/root-inbox.js";
+import { registerIssuedInbox, rootInboxSession } from "./root-inbox-issued-fixture.js";
 
 // About 50 MiB of distinct heap payload, not repeated strings/ropes. Each fixture
 // returns only WeakRefs to history so the test itself cannot be its strong holder.
@@ -44,9 +45,12 @@ const deliveryFixture = (notifyOnComplete: boolean) => {
 const inboxFixture = () => {
   const entries = largeHistory();
   const ids = ["a", "b"];
+  const details = { ids };
+  // Model the extension's private issuer, without retaining the original ids/history.
+  registerIssuedInbox(details);
   entries.push({
     type: "custom_message", customType: ROOT_INBOX_CUSTOM_TYPE,
-    details: { ids },
+    details,
   });
   const carried = { from: { id: "peer" }, data: { key: " work ", topic: " fleet.work.x " } };
   entries.push({ type: "custom_message", customType: "pi-fabric-agent-message", details: { items: [carried] } });
@@ -84,7 +88,14 @@ describe("session-entry consumers release canonical history (smarty-dev#2177)", 
 
   it.each(["root"] as const)("preserves collective split receipts and lookback boundaries in the %s view", () => {
     const customType = ROOT_INBOX_CUSTOM_TYPE;
-    const batch = (ids: string[]) => ({ type: "custom_message", customType, details: { ids } });
+    const batch = (ids: string[]) => {
+      const details = { ids };
+      registerIssuedInbox(details);
+      return { type: "custom_message", customType, details };
+    };
+    // Serialized ids without an issuance must not gain batch authority.
+    expect(rootInboxSession([{ type: "custom_message", customType, details: { ids: ["unsigned"] } }])
+      .holdsBatch(["unsigned"])).toBe(false);
     const entries = [batch(["old"]), ...Array<unknown>(500).fill({ type: "message" }), batch(["a"]), batch(["b"])];
     const session = rootInboxSession(entries);
     expect(session.holdsBatch(["old"])).toBe(false);

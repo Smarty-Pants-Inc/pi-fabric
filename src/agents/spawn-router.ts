@@ -77,6 +77,8 @@ export interface SpawnRouterStartOptions {
 
 /** Fixed, privacy-safe code used when admission created no started record. */
 export const SPAWN_ROUTER_START_FAILED = "start-failed";
+/** Fixed, privacy-safe code used when native launch custody is unresolved. */
+export const SPAWN_ROUTER_START_UNKNOWN = "start-unknown";
 export interface SpawnRouterRequest {
   kind: "spawn" | "actor";
   role: string;
@@ -289,6 +291,20 @@ export const recordSpawnRouterStartFailed = async (options: Pick<SpawnRouterStar
     agentId: null, sessionId: null, launch: { runId: null, pid: null, processStartTime: null },
     host: hostname(), model: null, thinking: null, verified: false, evidenceRef: null,
     error: SPAWN_ROUTER_START_FAILED,
+  });
+};
+
+/** A native launch may have started a worker without returning a confirmable handle. */
+export const recordSpawnRouterStartUnknown = async (options: Pick<SpawnRouterStartOptions,
+  "meshRoot" | "decisionId" | "admission" | "spawnKind" | "request" | "cwd">): Promise<void> => {
+  if (!options.decisionId) return;
+  const refusal = await consumeAdmission(options);
+  if (refusal) { await recordAttributionRefused(options, refusal); return; }
+  await appendStartRecord(options.meshRoot, {
+    ts: new Date().toISOString(), kind: "start-unknown", decisionId: options.decisionId,
+    agentId: null, sessionId: null, launch: { runId: null, pid: null, processStartTime: null },
+    host: hostname(), model: null, thinking: null, verified: false, evidenceRef: null,
+    error: SPAWN_ROUTER_START_UNKNOWN,
   });
 };
 

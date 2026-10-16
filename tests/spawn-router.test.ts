@@ -38,7 +38,7 @@ const decisions = (dir: string): Array<Record<string, any>> => {
   for (const entry of entries) {
     const keys = entry.kind === "decision"
       ? ["ts", "decisionId", "kind", "spawnKind", "mode", "commandDigest", "decision", "pick", "requested", "actual", "fallbackReason", "latencyMs", "error"]
-      : ["ts", "kind", "decisionId", "agentId", "sessionId", "launch", "host", "model", "thinking", "verified", "evidenceRef", ...(entry.kind === "start-failed" || entry.kind === "start-refused" ? ["error"] : [])];
+      : ["ts", "kind", "decisionId", "agentId", "sessionId", "launch", "host", "model", "thinking", "verified", "evidenceRef", ...(entry.kind === "start-failed" || entry.kind === "start-unknown" || entry.kind === "start-refused" ? ["error"] : [])];
     expect(Object.keys(entry).sort()).toEqual(keys.sort());
     if (entry.kind === "decision") {
       expect(entry.actual).toEqual(entry.requested);
@@ -493,6 +493,47 @@ describe("native spawn router receipts", () => {
       expect(JSON.stringify(decisions(dir))).not.toContain(creation.task);
     } finally { await manager.close(); }
   });
+  it("a real unknown native launch writes one privacy-safe start-unknown and retains custody", async () => {
+    const dir = root(); const manager = await managerFor(dir);
+    const { ProcessTransport } = await import("../src/agents/transports/process-transport.js");
+    const original = ProcessTransport.prototype.launch;
+    const launched: Array<{ stop(): Promise<void> }> = [];
+    const spy = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async function (this: InstanceType<typeof ProcessTransport>, launch) {
+      const handle = await original.call(this, launch);
+      launched.push(handle);
+      throw Object.assign(new Error("private launch uncertainty"), { launchOutcome: "unknown" });
+    });
+    try {
+      const admitted = { task: "private unknown native launch", ...defaults };
+      const route = (await routeNative(dir, admitted))!;
+      const creation = { ...admitted, ...route.selected, spawnRouterDecisionId: route.decisionId };
+      const uncertain = await spawnAdmitted(manager, creation);
+      expect(uncertain).toMatchObject({ status: "queued", heldPermits: 1 });
+      expect(manager.heldPermits()).toBe(1);
+      expect(manager.hasRunCustody(uncertain.id)).toBe(true);
+      expect(manager.retentionCustodyVeto(uncertain.id)).toBe(true);
+      // Unknown custody is queued, not a registered run; use the manager's configured run root.
+      expect(fs.existsSync(path.join(dir, "runs", uncertain.id, "unresolved-worker.json"))).toBe(true);
+      const waiting = await manager.spawn({ task: "second native launch", transport: "process" });
+      expect(waiting.status).toBe("queued");
+      expect(spy).toHaveBeenCalledOnce();
+      expect(decisions(dir)[1]).toEqual({ ts: expect.any(String), kind: "start-unknown", decisionId: route.decisionId,
+        agentId: null, sessionId: null, model: null, thinking: null, ...unverifiedStart, error: "start-unknown" });
+      await recordSpawnRouterStart({ meshRoot: dir, decisionId: route.decisionId, agentId: "replay", sessionId: null,
+        model: null, thinking: null, admission: admissionFor(dir), spawnKind: "spawn", request: creation, cwd: dir });
+      const log = decisions(dir);
+      expect(log.filter(entry => entry.kind === "start-unknown")).toHaveLength(1);
+      expect(log.filter(entry => entry.kind === "start-failed" || entry.kind === "start")).toHaveLength(0);
+      expect(log.at(-1)).toMatchObject({ kind: "start-refused", decisionId: route.decisionId, error: "decision-replayed" });
+      await manager.stop(waiting.id);
+      await expect(manager.stop(uncertain.id)).rejects.toThrow(/execution exit unconfirmed/);
+    } finally {
+      spy.mockRestore();
+      await expect(manager.close()).rejects.toThrow(/execution exit unconfirmed/);
+      for (const handle of launched) await handle.stop();
+    }
+  });
+
   it.each(["provider", "manager"] as const)("a real public provider %s preparation failure writes one start-failed and no replay refusal", async stage => {
     const dir = root(); const manager = await managerFor(dir);
     const { AgentsProvider } = await import("../src/providers/agents-provider.js");

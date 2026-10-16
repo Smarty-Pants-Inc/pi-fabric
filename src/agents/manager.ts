@@ -1704,6 +1704,16 @@ export class AgentManager {
     } catch { /* Ledger writes never change launch behavior. */ }
   }
 
+  async #recordSpawnRouterStartUnknown(request: AgentRunRequest, admission?: SpawnRouterAdmission): Promise<void> {
+    const decisionId = (request as AgentRunRequest & { spawnRouterDecisionId?: unknown }).spawnRouterDecisionId;
+    const meshRoot = this.#meshRoot ?? admission?.mesh.root;
+    if (typeof decisionId !== "string" || !decisionId || !meshRoot) return;
+    try {
+      const { recordSpawnRouterStartUnknown } = await import("./spawn-router.js");
+      await recordSpawnRouterStartUnknown({ meshRoot, decisionId, admission, spawnKind: "spawn", request, cwd: this.cwd });
+    } catch { /* Ledger writes never change launch behavior. */ }
+  }
+
   async #recordSpawnRouterStartFailed(request: AgentRunRequest, admission?: SpawnRouterAdmission): Promise<void> {
     const decisionId = (request as AgentRunRequest & { spawnRouterDecisionId?: unknown }).spawnRouterDecisionId;
     const meshRoot = this.#meshRoot ?? admission?.mesh.root;
@@ -2587,7 +2597,7 @@ export class AgentManager {
           void (obligation as { closed?: Promise<unknown> }).closed?.then(() => this.#releaseProvenGone(), () => this.#releaseProvenGone());
           if (!routerStartState.settled) {
             routerStartState.settled = true;
-            await this.#recordSpawnRouterStartFailed(request, routerStartState.admission);
+            await this.#recordSpawnRouterStartUnknown(request, routerStartState.admission);
           }
           return this.#queuedInfo(queued);
         }

@@ -151,6 +151,14 @@ start shape: preserve `ts`, `decisionId`, and `host`; set unknown `agentId`,
 `verified` to false, and `evidenceRef` to null. Add only the fixed
 `error: "start-failed"`, never exception text.
 
+If the native transport launch outcome is unknown after launch custody may have
+been created, append `kind: "start-unknown"` with that same null receipt shape
+and only the fixed `error: "start-unknown"`. It is neither success attribution
+nor evidence that a worker started; unresolved cleanup and admission custody
+remain in force until the existing proof path confirms the worker is gone. The
+same admission is consumed once, so a replay is refused rather than recorded as
+another outcome.
+
 For durable calls, local validation and host-startup failures are recorded by
 the provider. Receipt custody transfers only at the native client's existing
 request-publication fence, via an optional host-only callback (never a wire
@@ -162,7 +170,7 @@ atomic write because a publication error can itself be ambiguous.
 | --- | --- | --- | --- |
 | `ts` | string | Timestamp of this ledger line. | Never. |
 | `decisionId` | string or null | UUID joining the decision to its start outcome. | Null on a refusal of a malformed ID. |
-| `kind` | `"decision"`, `"start"`, `"start-failed"`, or `"start-refused"` | Ledger line type; not the spawn type. | Never. |
+| `kind` | `"decision"`, `"start"`, `"start-failed"`, `"start-unknown"`, or `"start-refused"` | Ledger line type; not the spawn type. | Never. |
 | `spawnKind` | `"spawn"` or `"actor"` | Public admission type; decision only. | Never. |
 | `mode` | `"shadow"` or `"enforce"` | Enabled router mode; decision only. | Never. |
 | `commandDigest` | string | SHA-256 of `JSON.stringify(command)`, never raw argv; decision only. | Never. |
@@ -174,18 +182,18 @@ atomic write because a publication error can itself be ambiguous.
 | `actual` | object | One-release alias equal to `requested`; decision only, removed in a future release. | Never. |
 | `fallbackReason` | string or null | Fixed router error when an error keeps the default; decision only. | No error-caused default fallback. |
 | `latencyMs` | number | Router decision latency in milliseconds; decision only. | Never. |
-| `error` | string or null | Fixed router code on a decision; `"start-failed"` on creation failure; one of the admission refusal codes below on `start-refused`; absent on a start. | Decision without an error. |
+| `error` | string or null | Fixed router code on a decision; `"start-failed"` on creation failure; `"start-unknown"` when native launch custody is unresolved; one of the admission refusal codes below on `start-refused`; absent on a start. | Decision without an error. |
 | `agentId` | string or null | Admitted agent or actor id; start outcomes only. | Unknown on failed creation. |
 | `sessionId` | string or null | Native Pi session header id, never transport PID or parent session. | No native session known at this boundary. |
 | `launch` | object | Manager launch metadata; start outcomes only. | Never; unknown members are null. |
-| `launch.runId` | string or null | Known manager run id. | No native run or unknown; null on start-failed. |
-| `launch.pid` | number or null | Manager's captured local process PID. | No local process or unknown; null on start-failed. |
-| `launch.processStartTime` | string or null | Manager's captured process birth identity. | Unavailable; null on start-failed. |
+| `launch.runId` | string or null | Known manager run id. | No native run or unknown; null on start-failed/start-unknown. |
+| `launch.pid` | number or null | Manager's captured local process PID. | No local process or unknown; null on start-failed/start-unknown. |
+| `launch.processStartTime` | string or null | Manager's captured process birth identity. | Unavailable; null on start-failed/start-unknown. |
 | `host` | string | `os.hostname()` on the admitting host. | Never. |
-| `model` | string or null | Final prepared task model or admitted actor model, not the request alias. | Binding unknown; null on start-failed. |
-| `thinking` | string or null | Final clamped task thinking or admitted actor thinking. | Binding unknown; null on start-failed. |
-| `verified` | boolean | Own observation of a written running record at registration. | Never; false for idle actor birth and start-failed. |
-| `evidenceRef` | string or null | Written status path relative to mesh (may use `..` for a local run root outside mesh). | No observed status record; null on start-failed. |
+| `model` | string or null | Final prepared task model or admitted actor model, not the request alias. | Binding unknown; null on start-failed/start-unknown. |
+| `thinking` | string or null | Final clamped task thinking or admitted actor thinking. | Binding unknown; null on start-failed/start-unknown. |
+| `verified` | boolean | Own observation of a written running status record at registration. | Never; false for idle actor birth, start-failed, and start-unknown. |
+| `evidenceRef` | string or null | Written status path relative to mesh (may use `..` for a local run root outside mesh). | No observed status record; null on start-failed/start-unknown. |
 
 ## Authenticated, single-use attribution
 
@@ -215,15 +223,16 @@ fresh native participant directory, then constructs authority from that director
 entry and its own target root/host. It grants no actor creation, mutation or
 supervisor authority and adds no launch-policy check.
 
-Both successful and failed start writers atomically compare and consume
+All attributed start-outcome writers atomically compare and consume
 `issued → consumed` through `MeshStore.writeBatch` and the entry version CAS.
 Only one concurrent writer can attribute an outcome. A missing, expired, damaged
 or unavailable admission gives `decision-unknown`; an already-consumed admission
 gives `decision-replayed`; a binding or caller-authority mismatch gives
 `decision-mismatch`. Refusals append `kind: "start-refused"`, the fixed error,
 and null agent/session/model/thinking/launch/evidence fields with
-`verified: false`. They never append an attributed `start` or `start-failed`.
-**Actual launch remains fail-open; attribution is fail-closed.** A request without
+`verified: false`. They never append an attributed `start`, `start-failed`, or `start-unknown`.
+**Actual launch remains fail-open; attribution is fail-closed.** A `start-unknown`
+line is a privacy-safe custody meter, not an exactly-once launch journal. A request without
 a decision ID keeps the original path, with no router import or state/log write.
 A crash after consume but before ledger append can lose an outcome, never mint a
 second successful attribution; this meter is not an exactly-once launch journal.

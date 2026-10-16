@@ -9,7 +9,7 @@ import type { AgentMessageRouter } from "../src/providers/agents-message-router.
 import {
   adapterKinds, boundedReceipt, commandEnvelope, contractTiming, createStubBus, faultGate, FaultHooks,
   identity, loadControlPlane, loseNextPublishAck, openRealAdapterPair, owner, resolvedRetry, withFaults,
-  type AdapterKind, type CommandBody, type FabricTransport, type RealBrokerOutage, type RealKvReadiness, type RealPairOptions,
+  type AdapterKind, type CommandBody, type FabricTransport, type RealBrokerOutage, type RealCapacityBoundary, type RealKvReadiness, type RealPairOptions,
   type StubTransport, type TransportBucket, type TransportDelivery, type TransportEnvelope,
   type TransportKvEntry, type TransportKvEvent,
 } from "./helpers/transport-harness.js";
@@ -30,6 +30,8 @@ import type { ParticipantRoute as Route, ParticipantView as View } from "../src/
  * Expected skips / coverage metadata, not green E2E evidence:
  * - FILE/NATS use the current product factory. NATS uses B's createPathBHarness with fresh
  *   server/keys/state per pair, bootstrap-only resource creation, then two distinct runtime JWTs.
+ *   T11 opens that matching default policy FIRST, then explicitly faults only its isolated
+ *   stream's byte/message-size ceilings. This is not tiny production-default policy coverage.
  *   Missing real-server prerequisites and actual A1 NATS dispatch are explicit dependency skips.
  * - Lost-PubAck injection is STUB ONLY. Successful real PubAck followed by a wrapper throw is
  *   not B1 loss evidence. Real T3 below checks resolved same-id retry bytes, not lost PubAck.
@@ -38,9 +40,10 @@ import type { ParticipantRoute as Route, ParticipantView as View } from "../src/
  * - T7 authenticated operator relay/DLQ is DEFERRED-E19: the operator is report-only.
  *   T8 NATS now owns a real transparent TCP cut + same-store server restart, retaining the
  *   original factory policy and live iterator. FILE/stub have no broker outage simulation.
- *   T11/T13/T16/T21/T22 still need optional integrations. T11 is STOPPED at the missing
- *   production alarm receipt; a caught capacity error is NOT an operator alarm. Missing fixtures
- *   are skipped, never replaced by a synthetic admission/lease/operator/rollback implementation.
+ *   E25 T11 uses the real sender's typed refusal PLUS actual report-only operator bytes/max_bytes;
+ *   no separate alarm emitter is required (follow-on #13951). T13/T16/T21/T22 still need optional
+ *   integrations. Missing fixtures are skipped, never replaced by a synthetic admission/lease/
+ *   operator/rollback implementation.
  * - T4/T5 use a native-custody test callback invoked by the REAL control plane. This tests its
  *   claim/outcome/ACK machinery, NOT Main/Pi consumption, AgentManager fsync or power-loss safety.
  * - T20 is focused control parity; unchanged control-plane/router suites must ALSO run. It does
@@ -78,6 +81,7 @@ interface Pair {
   reopenReceiver?(): Promise<FabricTransport>;
   kvReadiness?: RealKvReadiness;
   brokerOutage?: RealBrokerOutage;
+  capacityBoundary?: RealCapacityBoundary;
   now(): number; advance(ms: number): void;
   close(): Promise<void>;
 }
@@ -111,7 +115,6 @@ interface Integration {
   };
   broker?: {
     restart(): Promise<void>; disconnect(): Promise<void>; reconnect(): Promise<void>;
-    setCapacity(bytes: number): Promise<void>; alarmCodes(): Promise<readonly string[]>;
     probe(verb: string, subject: string): Promise<"allowed" | "denied">;
     foreignMachine: string; foreignUser: string; ownInbox: string;
   };
@@ -198,6 +201,7 @@ async function realPair(kind: "file" | "nats", skip: Skip, options?: RealPairOpt
   const pair: Pair = { sender: wrap(raw.sender), receiver: wrap(raw.receiver), raw, hooks,
     ...(raw.kvReadiness ? { kvReadiness: raw.kvReadiness } : {}),
     ...(raw.brokerOutage ? { brokerOutage: raw.brokerOutage } : {}),
+    ...(raw.capacityBoundary ? { capacityBoundary: raw.capacityBoundary } : {}),
     now: Date.now, advance: () => { throw new Error("real carrier fixture has no virtual clock capability"); },
     reopenReceiver: async () => { pair.receiver = wrap(await raw.reopenReceiver()); return pair.receiver; },
     close: () => raw.close() };
@@ -619,17 +623,48 @@ describe.each(adapterKinds)("transport conformance / %s", kind => {
     // Do not manufacture that evidence by throwing after a successful product send.
   });
 
-  test("T11 DiscardNew capacity: typed not-persisted refusal and alarm, no eviction", async (p, signal, skip) => {
-    const broker = integrations[kind]?.broker;
-    if (!broker) skip("STOP T11: inbox.ts send/publishFailure only throws TransportCapacityError; no production alarm receipt is exposed on that traced path. Tiny direct maxBytes is not the fixed 1GiB factory policy; never record caught errors as alarmCodes");
-    await broker!.setCapacity(2048);
-    const kept = await p.sender.send(command(p));
-    await expect(p.sender.send(command(p, nextId("T11"), { message: "x".repeat(4096) })))
-      .rejects.toMatchObject({ code: "FABRIC_TRANSPORT_CAPACITY", persisted: false });
-    expect(await broker!.alarmCodes()).toContain("FABRIC_TRANSPORT_CAPACITY");
-    const delivered = await next(stream(p, signal)); expect(payloadMinimum(delivered.payload)).toEqual(payloadMinimum(kept.envelope)); await delivered.ack();
-    expect(await p.receiver.drainState()).toEqual({ pending: 0, ackPending: 0 });
-  });
+  test("T11 E25 isolated byte-ceiling FAULT: real capacity refusal + report-only operator limit, no eviction", async (p, signal, skip) => {
+    if (kind !== "nats") skip("T11 E25 requires a real JetStream capacity refusal/operator report; no FILE/stub capacity model");
+    const boundary = p.capacityBoundary;
+    if (!boundary) throw new Error("T11 requires its pair-owned real capacity fault/report fixture, not a synthetic alarm");
+    const { TransportCapacityError } = await import("../src/transport/types.js");
+    // Both factory carriers already opened against the exact bootstrap-provisioned 1GiB
+    // policy with signed machine JWT + USER.INFO verification. No direct-open override or
+    // runtime privilege expansion. ONLY the following explicit isolated-stream fault is tiny.
+    const kept = await p.sender.send(command(p, "T11-kept-0001"));
+    const before = await boundary.report();
+    expect(before).toMatchObject({ max_bytes: 1_073_741_824, max_msg_size: 1_048_576,
+      discard: "new", max_age: 0, messages: 1, first_seq: kept.sequence, last_seq: kept.sequence });
+    expect(before.bytes).toBeGreaterThan(0); expect(before.bytes).toBeLessThan(before.max_bytes);
+    const fault = await boundary.limitToStoredBytes(); // admin UPDATE + INFO, closed before send
+    expect(fault).toEqual({ ...before, max_bytes: before.bytes,
+      max_msg_size: Math.min(before.max_msg_size, before.bytes) });
+    const full = await boundary.report(); // actual E19 maintainer STREAM.INFO, connection closed
+    expect(full).toEqual(fault); expect(full.bytes).toBe(full.max_bytes);
+
+    // Same normal-size resolved envelope, distinct same-length id: capacity refusal must NOT
+    // be an oversized-message probe. No body restamp/fill loop, no dedupe hit or payload inflation.
+    const refused = { ...kept.envelope, id: "T11-deny-0002",
+      body: { ...kept.envelope.body, commandId: "T11-deny-0002" } };
+    const wireBytes = (value: unknown) => new TextEncoder().encode(JSON.stringify(value)).byteLength;
+    expect(wireBytes(refused)).toBe(wireBytes(kept.envelope));
+    expect(wireBytes(refused)).toBeLessThanOrEqual(full.max_msg_size);
+    const refusal = p.sender.send(refused);
+    await expect(refusal).rejects.toBeInstanceOf(TransportCapacityError);
+    await expect(refusal).rejects.toMatchObject({ code: "FABRIC_TRANSPORT_CAPACITY", persisted: false });
+    // Real server state: no second persistence and no DiscardOld eviction, BEFORE consuming.
+    const after = await boundary.report();
+    expect(after).toEqual(full); expect(after.bytes).toBe(after.max_bytes);
+    const delivered = await next(stream(p, signal));
+    expect(delivered).toMatchObject({ sequence: kept.sequence, attempt: 1,
+      sourceMachine: p.sender.self.machine, verification: "bridge" });
+    expect(payloadMinimum(delivered.payload)).toEqual(payloadMinimum(kept.envelope));
+    expect(JSON.stringify(delivered.payload)).toBe(JSON.stringify(kept.envelope));
+    await delivered.ack(); // real adapter's confirmed broker ACK, not an application ACK model
+    expect(await p.receiver.drainState(signal)).toEqual({ pending: 0, ackPending: 0 });
+    // E25 = sender refusal + E15 metadata report. Production alarm emitter is #13951;
+    // this fault policy is NOT evidence of a tiny production factory configuration.
+  }, TIMEOUT, { capacityBoundary: true });
 
   test("T12 KV lease CAS: bucket-wide revisions, renew/release/conflict, last-write TTL; no takeover authority", async (p, _signal, skip) => {
     if (kind === "file") skip("file kv() is explicitly unsupported; file directory parity is T20");

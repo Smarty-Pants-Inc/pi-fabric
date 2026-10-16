@@ -660,7 +660,30 @@ export interface RealBrokerOutage {
   reconnect(): Promise<void>;
   state(): Promise<RealBrokerState>;
 }
-export interface RealPairOptions { readonly brokerOutage?: boolean }
+/** E25 metadata only, obtained with the actual E19 report-only operator JWT. */
+export interface RealCapacityReport {
+  readonly bytes: number;
+  readonly max_bytes: number;
+  readonly max_msg_size: number;
+  readonly messages: number;
+  readonly first_seq: number;
+  readonly last_seq: number;
+  readonly discard: string;
+  readonly max_age: number;
+}
+export interface RealCapacityBoundary {
+  /** Explicit isolated-stream policy FAULT, not a production-default policy proof.
+   * Requires exactly one retained message; one UPDATE + readback, never fill/poll/purge.
+   */
+  limitToStoredBytes(): Promise<RealCapacityReport>;
+  /** Separate, closed report-only operator connection; never reads message bodies. */
+  report(): Promise<RealCapacityReport>;
+}
+export interface RealPairOptions {
+  readonly brokerOutage?: boolean;
+  /** Open the unchanged factory policy FIRST, then allow an explicit T11 byte-limit fault. */
+  readonly capacityBoundary?: boolean;
+}
 
 /** Transparent TCP only: no NATS frame parsing, client-method override, synthetic error or
  * delivery engine. The listener and BOTH ends of every owned pipe close on cut, including
@@ -732,6 +755,7 @@ export interface RealAdapterPair {
   readonly receiver: FabricTransport;
   readonly kvReadiness?: RealKvReadiness;
   readonly brokerOutage?: RealBrokerOutage;
+  readonly capacityBoundary?: RealCapacityBoundary;
   reopenReceiver(): Promise<FabricTransport>;
   close(): Promise<void>;
 }
@@ -957,8 +981,52 @@ export async function openRealAdapterPair(kind: "file" | "nats", required = fals
         },
       };
     }
+    let capacityBoundary: RealCapacityBoundary | undefined;
+    if (server && options.capacityBoundary) {
+      const { transportInboxStream } = await import("../../src/transport/nats/subjects.js");
+      const stream = transportInboxStream(receiver.self.machine);
+      const metadata = (info: import("@nats-io/jetstream").StreamInfo): RealCapacityReport => ({
+        bytes: info.state.bytes, max_bytes: info.config.max_bytes, max_msg_size: info.config.max_msg_size,
+        messages: info.state.messages, first_seq: info.state.first_seq, last_seq: info.state.last_seq,
+        discard: info.config.discard, max_age: info.config.max_age,
+      });
+      capacityBoundary = {
+        limitToStoredBytes: async () => {
+          // Bootstrap was closed before BOTH factory opens (including E12 USER.INFO).
+          // This new admin connection exists ONLY for the explicitly labelled capacity fault.
+          // It neither expands runtime/operator grants nor mutates any consumer or message.
+          const admin = await server!.connect(server!.users.bootstrap);
+          try {
+            const { jetstreamManager } = await import("@nats-io/jetstream");
+            const manager = await jetstreamManager(admin);
+            const before = await boundedReceipt(manager.streams.info(stream), "T11 fault: read stored byte count");
+            if (before.state.messages !== 1 || before.state.bytes <= 0 || before.config.discard !== "new") {
+              throw new Error("T11 capacity fault requires one retained message in a DiscardNew stream");
+            }
+            // The server requires max_msg_size <= max_bytes. Stored bytes include message
+            // overhead, so this ceiling still admits the same normal-sized envelope by size.
+            // Only these two limits change; retention, age, subjects, dedupe and ACK policy do not.
+            const bytes = before.state.bytes;
+            await boundedReceipt(manager.streams.update(stream, {
+              max_bytes: bytes, max_msg_size: Math.min(before.config.max_msg_size, bytes),
+            }), "T11 fault: set isolated stream ceiling to actual stored bytes");
+            return metadata(await boundedReceipt(manager.streams.info(stream), "T11 fault: policy/state readback"));
+          } finally { await admin.close(); }
+        },
+        report: async () => {
+          const operator = await server!.connect(server!.users.maintainer);
+          try {
+            const { jetstreamManager } = await import("@nats-io/jetstream");
+            // E19 permits STREAM.INFO, not account administration or a message read.
+            const manager = await jetstreamManager(operator, { checkAPI: false });
+            return metadata(await boundedReceipt(manager.streams.info(stream), "T11 E15 report-only operator STREAM.INFO"));
+          } finally { await operator.close(); }
+        },
+      };
+    }
     return { status: "ready", pair: { sender, get receiver() { return receiver; },
       ...(kvReadiness ? { kvReadiness } : {}), ...(brokerOutage ? { brokerOutage } : {}),
+      ...(capacityBoundary ? { capacityBoundary } : {}),
       reopenReceiver: async () => { await boundedReceipt(receiver.close(), "close receiver before durable reopen"); receiver = await open("receiver"); return receiver; },
       close: cleanup } };
   } catch (error) { await cleanup(); throw error; }

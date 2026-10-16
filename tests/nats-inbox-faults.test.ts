@@ -10,7 +10,7 @@ import { ensureTransportStream } from "../src/transport/nats/provision.js";
 import { openNatsKvForMachine } from "../src/transport/nats/kv.js";
 import { transportDurableName, transportInboxStream, transportInboxStreamSubject } from "../src/transport/nats/subjects.js";
 import {
-  TransportCapacityError, TransportDeniedError, TransportInvalidError, TransportUncertainError,
+  TransportCapacityError, TransportInvalidError, TransportUncertainError,
   type FabricTransport, type TransportDelivery, type TransportEnvelope,
 } from "../src/transport/types.js";
 import { createPathBHarness, resolveNatsBinary, type PathBHarness, type PathBUser } from "./helpers/nats-cluster.js";
@@ -19,7 +19,7 @@ const MAX_BYTES = 1_073_741_824;
 const MAX_MESSAGE_BYTES = 1_048_576;
 const ACK_WAIT_MS = 30_000;
 const binary = resolveNatsBinary();
-if (!binary) throw new Error("nats-inbox-faults requires a real nats-server (set NATS_BIN)");
+if (!binary && process.env.NATS_AUTH_REQUIRED === "1") throw new Error("NATS_AUTH_REQUIRED=1 but no nats-server executable was found");
 
 // Every delivery/termination wait has a deadline; timers are only safety nets. Normal
 // evidence comes from actual NATS frames, delivered messages and consumer/stream info.
@@ -162,9 +162,9 @@ async function pendingIs(receiver: FabricTransport, ackPending: number, pending 
   expect({ pending: info.num_pending, ackPending: info.num_ack_pending }).toEqual({ pending, ackPending });
 }
 
-describe("real machine-authenticated inbox faults", () => {
+describe.skipIf(!binary)("real machine-authenticated inbox faults", () => {
   beforeAll(async () => {
-    fixture = await createPathBHarness({ binary });
+    fixture = await createPathBHarness({ binary: binary! });
     expect(fixture.configText).toContain("sync_interval: always");
     const bootstrap = await fixture.connect(fixture.users.bootstrap);
     const { jetstream, jetstreamManager } = await import("@nats-io/jetstream");
@@ -282,8 +282,12 @@ describe("real machine-authenticated inbox faults", () => {
     const stream = await inspector.manager.streams.info(transportInboxStream("machine-b"));
     expect(stream.config).toMatchObject({ retention: "limits", storage: "file", discard: "new", num_replicas: 1,
       max_age: 0, max_bytes: MAX_BYTES, max_msg_size: MAX_MESSAGE_BYTES, allow_direct: false });
-    expect((await inspector.manager.streams.getMessage(stream.config.name, { seq: a.sequence }))?.seq).toBe(a.sequence);
-    expect((await inspector.manager.streams.getMessage(stream.config.name, { seq: b.sequence }))?.seq).toBe(b.sequence);
+    // E19's report-only inspector cannot read private bodies. Bootstrap verifies
+    // retained Limits records independently; no product operation uses this authority.
+    const { jetstreamManager } = await import("@nats-io/jetstream");
+    const bootstrap = await jetstreamManager(await fixture.connect(fixture.users.bootstrap));
+    expect((await bootstrap.streams.getMessage(stream.config.name, { seq: a.sequence }))?.seq).toBe(a.sequence);
+    expect((await bootstrap.streams.getMessage(stream.config.name, { seq: b.sequence }))?.seq).toBe(b.sequence);
     signal.abort();
     expect((await bounded(iterator.next(), "restart iterator end")).done).toBe(true);
   }, 40_000);
@@ -426,19 +430,19 @@ describe("real machine-authenticated inbox faults", () => {
     expect((await bounded(iterator.next(), "validation iterator end")).done).toBe(true);
   }, 20_000);
 
-  it("returns typed oversize/denied/capacity refusals from actual local or broker boundaries, never uncertain", async () => {
+  it("returns typed oversize/capacity refusals and refuses a report-only operator as a runtime", async () => {
     const sender = await open(fixture.users.machineA, "refusal-sender");
     const receiver = await open(fixture.users.machineB, "refusal-receiver");
     const initial = (await inspector.manager.streams.info(transportInboxStream("machine-b"))).state.last_seq;
     await expect(sender.send(envelope(sender, receiver, "oversize-local", "x".repeat(MAX_MESSAGE_BYTES))))
       .rejects.toMatchObject({ code: "FABRIC_TRANSPORT_INVALID", persisted: false });
-    // Isolate the publish refusal mapper from USER.INFO verification: even an explicitly
-    // misconfigured/bypassed operator connection cannot publish a private command. All
-    // normal runtime transports in this suite retain the default verifyMachine=true.
+    // E19 removed even KV read authority from the operator. A deliberately bypassed
+    // USER.INFO check cannot turn that report-only credential into a runtime: binding
+    // its required KV resources is broker-denied before any private command publish.
     const prepared = await open(fixture.users.machineA, "denied-publisher");
     await prepared.close();
-    const denied = await open(fixture.users.maintainer, "denied-publisher", { machine: "machine-a", verifyMachine: false });
-    await expect(denied.send(envelope(denied, receiver, "denied-command"))).rejects.toBeInstanceOf(TransportDeniedError);
+    await expect(open(fixture.users.maintainer, "denied-publisher", { machine: "machine-a", verifyMachine: false }))
+      .rejects.toThrow(/permission|authorization/i);
     expect((await inspector.manager.streams.info(transportInboxStream("machine-b"))).state.last_seq).toBe(initial);
 
     // Keep every frozen stream property. Capacity is exhausted by real file-backed bytes,

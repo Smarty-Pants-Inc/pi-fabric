@@ -59,8 +59,10 @@ const validatePrefix = (prefix: string): void => {
 
 const decodeValue = <V>(key: string, value: Uint8Array, revision: number): TransportKvEntry<V> => {
   const [machine] = splitKey(key);
-  const parsed = JSON.parse(new TextDecoder().decode(value)) as { owner?: unknown; value?: V };
-  if (!parsed || typeof parsed.owner !== "string" || !("value" in parsed)) throw new TransportInvalidError("invalid KV value");
+  let parsed: { owner?: unknown; value?: V };
+  try { parsed = JSON.parse(new TextDecoder().decode(value)) as typeof parsed; }
+  catch (cause) { throw new TransportInvalidError("invalid KV value", { cause }); }
+  if (!parsed || typeof parsed.owner !== "string" || parsed.owner.length === 0 || !("value" in parsed)) throw new TransportInvalidError("invalid KV value");
   return { key, machine, owner: parsed.owner, value: parsed.value as V, revision };
 };
 const decode = <V>(entry: KvEntry): TransportKvEntry<V> => decodeValue(entry.key, entry.value, entry.revision);
@@ -126,7 +128,11 @@ export class NatsKvStore implements TransportKv {
     abort(signal);
     this.#assertWriter(key, ifRevision, true);
     if (typeof owner !== "string" || owner.length === 0) throw new TransportInvalidError("KV owner must be non-empty");
-    const encoded = JSON.stringify({ owner, value });
+    let encoded: string;
+    try {
+      encoded = JSON.stringify({ owner, value });
+      if (!("value" in JSON.parse(encoded))) throw new Error("value is not JSON serializable");
+    } catch (cause) { throw new TransportInvalidError("invalid KV value", { cause }); }
     if (new TextEncoder().encode(encoded).byteLength > KV_MAX_VALUE_SIZE) throw new TransportInvalidError("KV value is too large");
     let revision: number;
     try {

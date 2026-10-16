@@ -414,4 +414,4 @@ jobs:
         env:
           NATS_AUTH_REQUIRED: '1'
           FABRIC_NATIVE_PRODUCT_DELETE_HOSTED: '1'
-        run: FABRIC_TRANSPORT_HOSTED_PRESENCE_RESET=1 bunx vitest run tests/nats-auth-server.test.ts tests/nats-auth-path-b-*.test.ts tests/transport-conformance.test.ts tests/transport-faults/broker-inbox.test.ts tests/transport-faults/nats-owner-crash.test.ts tests/transport-faults/nats-native-boundaries.test.ts tests/transport-faults/e14-control.test.ts tests/transport-faults/presence-leases.test.ts --retry=0 --cache=false
+        run: FABRIC_TRANSPORT_HOSTED_PRESENCE_RESET=1 bunx vitest run tests/nats-auth-server.test.ts tests/nats-auth-path-b-*.test.ts tests/nats-messaging.test.ts tests/nats-transport-auth.test.ts tests/nats-inbox-faults.test.ts tests/nats-kv-watch.test.ts tests/nats-dead-letter.test.ts tests/transport-conformance.test.ts tests/transport-faults/broker-inbox.test.ts tests/transport-faults/nats-owner-crash.test.ts tests/transport-faults/nats-native-boundaries.test.ts tests/transport-faults/e14-control.test.ts tests/transport-faults/presence-leases.test.ts --retry=0 --cache=false

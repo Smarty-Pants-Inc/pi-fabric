@@ -1,6 +1,6 @@
 import { existsSync, openSync, closeSync, fsyncSync, readFileSync, writeSync } from "node:fs";
 import { openNatsConnection } from "./connection.js";
-import { consumeDeadLetters, type DeadLetterEnvelope, type DeadLetterSink } from "./dead-letter.js";
+import { consumeDeadLetters, ensureDeadLetterConsumer, type DeadLetterEnvelope, type DeadLetterSink } from "./dead-letter.js";
 import { openNatsKv } from "./kv.js";
 import { ensureTransportStream, type TransportStreamPolicy } from "./provision.js";
 import {
@@ -40,22 +40,41 @@ const machinesArg = (args: readonly string[]): string[] => {
   return machines;
 };
 
+const operatorMachineArg = (args: readonly string[]): string => {
+  const index = args.indexOf("--operator-machine");
+  const machine = index < 0 ? "fabric-ops" : args[index + 1];
+  if (!machine || !/^fabric-ops(-[a-z0-9]+)?$/.test(machine)) {
+    throw new Error("--operator-machine must be in the fabric-ops namespace");
+  }
+  return validateMachine(machine);
+};
+
+// Dedupe is an internal stable tuple, never a persisted ID or advisory-supplied field.
+const captureKey = (record: DeadLetterEnvelope): string => JSON.stringify([record.stream, record.consumer, record.stream_seq]);
 const jsonLineSink = (file: string): DeadLetterSink => {
   const seen = new Set<string>();
   if (existsSync(file)) {
     for (const line of readFileSync(file, "utf8").split("\n")) {
       if (!line) continue;
-      try { const id = (JSON.parse(line) as { id?: unknown }).id; if (typeof id === "string") seen.add(id); } catch { /* retain the append-only log */ }
+      try {
+        const record = JSON.parse(line) as DeadLetterEnvelope | null;
+        if (record && typeof record.stream === "string" && typeof record.consumer === "string" &&
+          Number.isSafeInteger(record.stream_seq) && record.stream_seq > 0 &&
+          Number.isSafeInteger(record.deliveries) && record.deliveries >= 5) seen.add(captureKey(record));
+      } catch { /* retain the append-only log */ }
     }
   }
   return {
     async put(envelope: DeadLetterEnvelope): Promise<void> {
-      if (seen.has(envelope.id)) return;
-      const record = JSON.stringify({ ...envelope, original: envelope.original ? Buffer.from(envelope.original).toString("base64") : undefined });
+      const key = captureKey(envelope);
+      if (seen.has(key)) return;
+      // Whitelist at the persistence boundary, even if a caller later grows the in-memory type.
+      const record = JSON.stringify({ stream: envelope.stream, consumer: envelope.consumer,
+        stream_seq: envelope.stream_seq, deliveries: envelope.deliveries });
       const fd = openSync(file, "a", 0o600);
       try { writeSync(fd, `${record}\n`); fsyncSync(fd); }
       finally { closeSync(fd); }
-      seen.add(envelope.id);
+      seen.add(key);
     },
   };
 };
@@ -74,6 +93,7 @@ async function provision(args: readonly string[]): Promise<void> {
   try {
     // This is deliberately first: advisories are otherwise lost before the operator consumer exists.
     await ensureTransportStream(connection.manager, streamPolicy(ADVISORY_CAPTURE_STREAM, [transportAdvisoryStreamSubject], 30 * 24 * 60 * 60_000, 64 * 1024));
+    await ensureDeadLetterConsumer(connection.manager);
     await openNatsKv(connection.js, { bucket: "fabric_leases", ttlMs: 15_000, markerTtlMs: 5 * 60_000 });
     await openNatsKv(connection.js, { bucket: "fabric_presence", ttlMs: 10 * 60_000, markerTtlMs: 5 * 60_000 });
     for (const target of machines) {
@@ -97,14 +117,52 @@ async function drain(args: readonly string[]): Promise<void> {
   });
   try {
     const info = await connection.manager.consumers.info(transportInboxStream(machine), transportDurableName(hostId));
-    process.stdout.write(`${JSON.stringify({ machine, hostId, pending: info.num_pending, ackPending: info.num_ack_pending })}\n`);
+    process.stdout.write(`${JSON.stringify({ machine, hostId, pending: info.num_pending, ackPending: info.num_ack_pending, ackFloor: info.ack_floor })}\n`);
+  } finally {
+    await connection.close();
+  }
+}
+
+async function orphan(args: readonly string[]): Promise<void> {
+  const valueArg = (flag: string): string | undefined => {
+    const index = args.indexOf(flag);
+    if (index < 0) return undefined;
+    const value = args[index + 1]?.trim();
+    if (!value || value.startsWith("--")) throw new Error(`${flag} requires a value`);
+    return value;
+  };
+  const target = valueArg("--machine");
+  if (!target) throw new Error("orphan requires --machine <inbox-machine>");
+  const targetMachine = validateMachine(target);
+  if (!machinesArg(args).includes(targetMachine)) throw new Error("orphan inbox machine is outside the configured inventory");
+  const hostId = valueArg("--host-id") ?? process.env.PI_FABRIC_HOST_ID?.trim();
+  if (!hostId) throw new Error("orphan requires --host-id or PI_FABRIC_HOST_ID");
+  const machine = operatorMachineArg(args);
+  const connection = await openNatsConnection({
+    servers: requiredEnv("PI_FABRIC_NATS_SERVERS"),
+    credentials: requiredEnv("PI_FABRIC_NATS_CREDENTIALS"),
+    machine,
+    name: "fabric-transport-admin-orphan-report",
+  });
+  try {
+    const stream = transportInboxStream(targetMachine);
+    const consumer = transportDurableName(hostId);
+    // E15: report one explicitly named inbox only. These counters/floors are NOT an exact pending
+    // sequence set or proof of lease absence. No disposition, pull, ACK, delete or purge is attempted.
+    const info = await connection.manager.consumers.info(stream, consumer);
+    process.stdout.write(`${JSON.stringify({
+      ok: true, mode: "report-only", disposition: "none", machine: targetMachine, hostId, stream, consumer,
+      pending: info.num_pending, ackPending: info.num_ack_pending, ackFloor: info.ack_floor,
+      num_pending: info.num_pending, num_ack_pending: info.num_ack_pending, ack_floor: info.ack_floor,
+    })}\n`);
   } finally {
     await connection.close();
   }
 }
 
 async function dlq(args: readonly string[]): Promise<void> {
-  const machine = validateMachine(requiredEnv("PI_FABRIC_MACHINE"));
+  const machine = operatorMachineArg(args);
+  const machines = machinesArg(args);
   const connection = await openNatsConnection({
     servers: requiredEnv("PI_FABRIC_NATS_SERVERS"),
     credentials: requiredEnv("PI_FABRIC_NATS_CREDENTIALS"),
@@ -116,13 +174,14 @@ async function dlq(args: readonly string[]): Promise<void> {
   process.once("SIGINT", stop);
   process.once("SIGTERM", stop);
   try {
+    const audit = jsonLineSink(process.env.PI_FABRIC_DLQ_PATH?.trim() || "fabric-dead-letters.jsonl");
     const count = await consumeDeadLetters({
       manager: connection.manager,
       js: connection.js,
       signal: controller.signal,
       once: args.includes("--once"),
-      sink: jsonLineSink(process.env.PI_FABRIC_DLQ_PATH?.trim() || "fabric-dead-letters.jsonl"),
-      machines: machinesArg(args),
+      sink: audit,
+      machines,
     });
     process.stdout.write(`${JSON.stringify({ ok: true, captured: count })}\n`);
   } finally {
@@ -136,7 +195,7 @@ export async function runTransportAdmin(args: readonly string[]): Promise<number
   const [command] = args;
   if (command === "provision") await provision(args);
   else if (command === "drain") await drain(args);
-  else if (command === "orphan") throw new Error("orphan disposition is not implemented; no messages were acknowledged or removed");
+  else if (command === "orphan") await orphan(args);
   else if (command === "dlq") await dlq(args);
   else throw new Error("usage: fabric-transport-admin provision|dlq|drain|orphan");
   return 0;

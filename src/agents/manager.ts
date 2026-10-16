@@ -376,6 +376,12 @@ export const effectiveAgentTimeoutMs = (
   );
 };
 
+/** Host-only native custody identity. NATS control handlers pass their commandId here;
+ * retries must keep the same key and immutable input. File mode ignores it. */
+export interface AgentTaskControlAdmission {
+  idempotencyKey: string;
+}
+
 /** Host-only actor setup budget. Starts after admission and ends before transport launch. */
 export interface AgentLaunchPreparationOptions {
   timeoutMs: number;
@@ -4146,18 +4152,19 @@ export class AgentManager {
     return copyFabricPrincipal(this.#runs.get(id)?.outputPrincipal);
   }
 
-  steer(id: string, message: string, data?: unknown, provenance?: FabricTurnProvenance): AgentSteerResult {
+  steer(id: string, message: string, data?: unknown, provenance?: FabricTurnProvenance,
+    admission?: AgentTaskControlAdmission): AgentSteerResult {
     // Hosted runs take messages through their adapter (upstream runner contract).
     if (this.#runs.get(id)?.hosted) return this.#deliverMessage(id, "steer", message, data);
     this.#requireSteerable(id);
-    return this.#appendSteer(id, { type: "steer", message, data, provenance });
+    return this.#appendSteer(id, { type: "steer", message, data, provenance }, admission);
   }
 
   followUp(id: string, message: string, data?: unknown, provenance?: FabricTurnProvenance,
-    options?: { deadlineMs: number }): AgentSteerResult {
+    options?: { deadlineMs: number }, admission?: AgentTaskControlAdmission): AgentSteerResult {
     if (this.#runs.get(id)?.hosted && !options) return this.#deliverMessage(id, "followUp", message, data);
     this.#requireSteerable(id, "followUp");
-    if (!options) return this.#appendSteer(id, { type: "follow_up", message, data, provenance });
+    if (!options) return this.#appendSteer(id, { type: "follow_up", message, data, provenance }, admission);
     const managed = this.#requireRun(id);
     if (managed.runner !== "pi") throw new Error("Delivery deadlines require a local Pi task agent");
     if (!Number.isSafeInteger(options.deadlineMs) || options.deadlineMs < 1) throw new Error("deadlineMs must be a positive safe integer");
@@ -4168,7 +4175,7 @@ export class AgentManager {
     mkdirPrivate(path.dirname(file), this.#trustRoot());
     fs.writeFileSync(file, JSON.stringify({ messageId, deadlineAt }), { mode: 0o600 });
     let receipt: AgentSteerResult;
-    try { receipt = this.#appendSteer(id, { type: "follow_up", message, data, provenance, followUpId: messageId, deadlineAt }); }
+    try { receipt = this.#appendSteer(id, { type: "follow_up", message, data, provenance, followUpId: messageId, deadlineAt }, admission); }
     catch (error) { fs.unlinkSync(file); throw error; }
     const entries = this.#followUps.get(id) ?? new Map<string, AgentFollowUpDelivery>();
     entries.set(messageId, { messageId, deadlineAt, state: receipt.undelivered ? "cancelled" : "queued" });
@@ -4326,7 +4333,7 @@ export class AgentManager {
       ...(admission.sender ? { sender: admission.sender } : {}) };
   }
 
-  #appendSteer(id: string, entry: Omit<AgentSteerEntry, "id" | "ts">): AgentSteerResult {
+  #appendSteer(id: string, entry: Omit<AgentSteerEntry, "id" | "ts">, _admission?: AgentTaskControlAdmission): AgentSteerResult {
     const managed = this.#requireRun(id);
     this.#observeFinalAnswer(managed);
     if (managed.finalAnswer) throw this.#terminalError(managed);

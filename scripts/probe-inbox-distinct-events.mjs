@@ -367,8 +367,9 @@ try {
 
   // Separate explicit-identity control: the primary incident events above carry only data.key.
   const controlId = `CONTROL-${randomUUID()}`;
+  const baselineControl = { settled: settled().length, inferences: inferences().length };
   const control = await proveNativeDelivery(await publishDurably({ key: watcherKey, deliveryId: controlId,
-    text: `ANSWER_CONTROL_${randomUUID()}` }), { settled: settled().length, inferences: inferences().length });
+    text: `ANSWER_CONTROL_${randomUUID()}` }), baselineControl);
   const baselineNegative = { settled: settled().length, inferences: inferences().length, wakes: wakes().length };
   const replayText = `EXPLICIT_DELIVERYID_REPLAY_${randomUUID()}`;
   const unaddressedText = `UNADDRESSED_EVENT_${randomUUID()}`;

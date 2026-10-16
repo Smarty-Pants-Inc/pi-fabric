@@ -396,10 +396,10 @@ export const meshAlarmRecipient = (env: NodeJS.ProcessEnv = process.env): string
 };
 
 /** The MeshBackgroundRetry.alarmsTo sink of an owner: resolved at alarm time (owners assign their mesh after field init). */
-export const meshOutageAlarmSink = (owner: () => { mesh: Pick<MeshStore, "publish"> | undefined; from: MeshIdentity | undefined }) =>
+export const meshOutageAlarmSink = (owner: () => { mesh: Pick<MeshStore, "publish"> | undefined; from: MeshIdentity | undefined }, env: NodeJS.ProcessEnv = process.env) =>
   (alarm: MeshOutageAlarm): Promise<unknown> | void => {
     const { mesh, from } = owner();
-    const to = meshAlarmRecipient();
+    const to = meshAlarmRecipient(env);
     if (!mesh || !from || !to) return; // no recipient: the stderr line is the only sink, never a broadcast
     return mesh.publish({ topic: FABRIC_MESH_OUTAGE_ALARM_TOPIC, to, kind: `mesh-${alarm.state}`, from,
       text: `${alarm.label}: mesh writes ${alarm.state === "outage" ? "deferred" : "recovered"} after ${Math.floor(alarm.durationMs / 1_000)}s`,

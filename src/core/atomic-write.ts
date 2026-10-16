@@ -154,6 +154,8 @@ export interface AtomicWriteOptions {
   renameRetryDelayMs?: number;
   /** External ownership CAS after staging, immediately before EACH rename attempt. A throw leaves the target untouched. */
   beforeRename?: () => void;
+  /** Durable only: the post-rename directory barrier; default (and every other caller) syncDirectoryChain. */
+  syncDirectory?: (directory: string) => void;
 }
 
 const RETRYABLE_RENAME_CODES = new Set(["EPERM", "EACCES", "EEXIST", "EBUSY"]);
@@ -315,6 +317,9 @@ export const syncPathNamespaceDurable = (target: string, receipt: Inode | undefi
   syncPathNamespace(target, receipt);
 };
 
+/** The checked complete-namespace identity syncPathNamespace compares (not a durability receipt). */
+export const namespaceKey = (target: string, receipt?: Inode): string => JSON.stringify(namespaceSnapshot(target, receipt).entries);
+
 export const syncPathNamespace = (target: string, receipt?: Inode): void => {
   const before = namespaceSnapshot(target, receipt);
   if (namespaceBarrierAvailable()) {
@@ -335,7 +340,7 @@ export const syncPathNamespace = (target: string, receipt?: Inode): void => {
       }
     }
   }
-  if (JSON.stringify(namespaceSnapshot(target, receipt).entries) !== JSON.stringify(before.entries)) {
+  if (namespaceKey(target, receipt) !== JSON.stringify(before.entries)) {
     throw new Error("Namespace changed during durability barriers");
   }
 };
@@ -355,7 +360,7 @@ export const syncPathNamespaceAsync = async (target: string, receipt: Inode): Pr
       } finally { await handle.close(); }
     }
   }
-  if (JSON.stringify(namespaceSnapshot(target, receipt).entries) !== JSON.stringify(before.entries)) {
+  if (namespaceKey(target, receipt) !== JSON.stringify(before.entries)) {
     throw new Error("Namespace changed during durability barriers");
   }
 };
@@ -455,7 +460,7 @@ export const writeFileAtomic = (
       });
     }
     renameAtomic(temporary, filePath, options);
-    if (options?.durable) syncDirectoryChain(directory);
+    if (options?.durable) (options.syncDirectory ?? syncDirectoryChain)(directory);
   } finally {
     // No-op right after a successful rename; removes the temp on failure.
     try { fs.rmSync(temporary, { force: true }); } finally { release(); }

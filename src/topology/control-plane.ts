@@ -20,6 +20,7 @@ import { isWatchLimitError } from "../core/watch-fallback.js";
 import { DegradedObservation } from "../core/observation-watch.js";
 import { watchBridgeStore } from "../mesh/change-notifier.js";
 import type { FabricMessageSender } from "../protocol.js";
+import { eventReceipts } from "./root-inbox-shared.js";
 
 const CONTROL_TOPIC = "fabric.control.command";
 const ACK_TOPIC = "fabric.control.ack";
@@ -145,6 +146,10 @@ export interface FabricControlCommand {
   cancelCommandId?: string;
   /** Target activation captured by the sender before publication waits. */
   ownerIncarnation?: string | undefined;
+  /** Root inbox identity of this admitted command event, captured from its mesh envelope. */
+  inboxTopic?: string;
+  inboxKey?: string;
+  inboxReceipts?: string[];
   /** Immutable sender request origin, captured before any publication/lock wait. */
   requestCreatedAt?: number;
   /** Commit time: preserves the existing full delivery/ACK budget after lock waits. */
@@ -313,10 +318,18 @@ const commandFromEvent = (event: MeshEvent): FabricControlCommand | undefined =>
   }
   // Sender diagnostics are never evidence. Derive only from the admitted envelope.
   // A sender stamp is host-set on the event; a payload-supplied one is forged and dropped.
-  const { sender: _forged, ...command } = data;
+  // Work claims belong in typed nested data, never an unknown outer command key.
+  const { sender: _forged, inboxTopic: _topic, inboxKey: _key, inboxReceipts: _receipts, key: _workKey, ...command } = data;
   const wakeCause = data.operation === "steer" || data.operation === "followUp"
     ? fabricWakeCause(event.from, data.operation, event.topic, event.id) : undefined;
-  return withFabricWakeAdmission({ ...command, eventId: event.id, wakeCause, principal: event.verification === "mesh" || event.verification === "bridge"
+  return withFabricWakeAdmission({ ...command, eventId: event.id,
+    ...(wakeCause ? {
+      inboxTopic: event.topic,
+      // Keep authenticated event/dedupe receipts, not raw outer key/ref/id work claims.
+      // Explicit nested data remains intact for the native carrier's own work claims.
+      inboxReceipts: eventReceipts({ ...event, data: undefined }),
+    } : {}),
+    wakeCause, principal: event.verification === "mesh" || event.verification === "bridge"
     ? copyFabricPrincipal(event.principal) : undefined, ...(event.sender ? { sender: event.sender } : {}) } as unknown as FabricControlCommand, wakeCause ? [wakeCause] : []);
 };
 
@@ -631,10 +644,9 @@ export class FabricControlPlane {
       if (admission) this.#assertAdmission();
       return store.put(input);
     }
-    const results = await store.writeBatch({ identity: this.identity, ops: [], prepare: () => {
+    const results = await store.writeBatch({ identity: this.identity, ops: [{ kind: "put", ...input }], beforeCommit: () => {
       if (admission) this.#assertAdmission();
       else assertMeshConsumption(this.options.canConsumeMesh);
-      return [{ kind: "put", ...input }];
     } });
     return { version: results[0]!.version };
   }
@@ -2205,10 +2217,10 @@ export class FabricControlPlane {
         const record = controlSeenRecord(entry.value);
         return !record || (record.expiresAt < now && record.sequence !== undefined && record.sequence < oldest);
       });
-      if (stale.length > 0) {
+      for (let start = 0; start < stale.length; start += 64) {
         await this.#seen.writeBatch({
           identity: this.identity,
-          ops: stale.map((entry) => ({ kind: "delete" as const, key: entry.key, ifVersion: entry.version, onConflict: "skip" as const })),
+          ops: stale.slice(start, start + 64).map((entry) => ({ kind: "delete" as const, key: entry.key, ifVersion: entry.version, onConflict: "skip" as const })),
         });
       }
     }
@@ -2260,11 +2272,13 @@ export class FabricControlPlane {
       dead.push(...unflagged.filter(({ record }) => !record || !retained.has(record.commandId)));
     }
     if (dead.length === 0) return;
-    // One write for the whole sweep, each delete fenced to the version it saw.
-    await this.mesh.writeBatch({
-      identity: this.identity,
-      ops: dead.map(({ entry }) => ({ kind: "delete" as const, key: entry.key, ifVersion: entry.version, onConflict: "skip" as const })),
-    });
+    // Independent claim retirements: keep each hold bounded, preserving every version fence.
+    for (let start = 0; start < dead.length; start += 64) {
+      await this.mesh.writeBatch({
+        identity: this.identity,
+        ops: dead.slice(start, start + 64).map(({ entry }) => ({ kind: "delete" as const, key: entry.key, ifVersion: entry.version, onConflict: "skip" as const })),
+      });
+    }
   }
 
   async #publishAcknowledgement(

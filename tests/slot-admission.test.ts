@@ -234,7 +234,209 @@ describe.runIf(process.platform === "linux")("native fresh authority binding", (
   });
 });
 
+// Observe real SQL prepare/validation; only schedule a competing connection before BEGIN.
+const observeAdmissionPlan = (mesh: MeshStore, between?: () => Promise<void>) => {
+  const sequence: string[] = [];
+  const stateView = mesh.stateView.bind(mesh), unchanged = mesh.stateUnchangedSince.bind(mesh), writeBatch = mesh.writeBatch.bind(mesh);
+  vi.spyOn(mesh, "stateView").mockImplementation(() => {
+    sequence.push("plan");
+    const snapshot = stateView();
+    if (!snapshot) return snapshot;
+    return { ...snapshot, view: { ...snapshot.view, listAll: prefix => {
+      sequence.push("plan-scan");
+      return snapshot.view.listAll(prefix);
+    } } };
+  });
+  const validation = vi.spyOn(mesh, "stateUnchangedSince").mockImplementation((revision, prefixes) => {
+    const valid = unchanged(revision, prefixes);
+    sequence.push(`validate:${valid}`);
+    return valid;
+  });
+  let first = true;
+  vi.spyOn(mesh, "writeBatch").mockImplementation(async batch => {
+    if (first) {
+      first = false;
+      if (between) { sequence.push("race"); await between(); }
+    }
+    return writeBatch({ ...batch, prepare: (view, fileValue) => {
+      sequence.push("BEGIN");
+      return batch.prepare?.({ ...view, listAll: prefix => {
+        sequence.push("transaction-scan");
+        return view.listAll(prefix);
+      } }, fileValue) ?? [];
+    } });
+  });
+  return { sequence, validation };
+};
+
 describe.runIf(process.platform === "linux")("same-transaction permanent actor-birth ledger", () => {
+  it("lets another native connection commit during ledger parsing but not at final acceptance", async () => {
+    const f = await fresh(), nextKey = key.replace(/base$/, "r2");
+    const nextNames = ["demo-r2-review-astra", "demo-r2-security-astra"];
+    const nextClaim = await f.mesh.put({ key: nextKey, identity: caller, value: { ...(f.claim.value as object), generation: "r2", names: nextNames } });
+    const incumbent = f.input("actor:incumbent", 0, nextClaim.version);
+    incumbent.request.slotClaim.key = nextKey; incumbent.request.name = nextNames[0]!; incumbent.spec.name = incumbent.request.name;
+    incumbent.request.idempotencyKey = "incumbent-request";
+    const marker = "slot-ledger-native-writer-probe";
+    incumbent.request.instructions = marker + "x".repeat(32_000); incumbent.spec.instructions = incumbent.request.instructions;
+    await f.coordinator.admit(incumbent);
+    const writer = openNodeSqlite(path.join(f.mesh.root, "state.db"));
+    let parsedLedger = false;
+    try {
+      // Test-only table, never authoritative KV: prove a second connection really commits
+      // while readPair/listAll parses the occupied ledger, without bypassing its change feed.
+      writer.exec("CREATE TABLE slot_plan_write_probe (value INTEGER NOT NULL)");
+      const parse = JSON.parse;
+      vi.spyOn(JSON, "parse").mockImplementation((text, reviver) => {
+        const result = parse(text, reviver);
+        if (!parsedLedger && text.includes(marker)) {
+          parsedLedger = true;
+          writer.exec("BEGIN IMMEDIATE");
+          writer.exec("INSERT INTO slot_plan_write_probe VALUES (1)");
+          writer.exec("COMMIT");
+        }
+        return result;
+      });
+      const callback = vi.fn(() => {
+        expect(parsedLedger).toBe(true);
+        let blocked = false;
+        try { writer.exec("BEGIN IMMEDIATE"); }
+        catch (error) { blocked = /locked|busy/i.test(String(error)); }
+        finally { if (writer.isTransaction) writer.exec("ROLLBACK"); }
+        expect(blocked).toBe(true);
+      });
+      expect(await f.coordinator.admit({ ...f.input(), beforeCommit: callback })).toMatchObject({ actorId: "actor:review-1" });
+      expect(writer.prepare("SELECT value FROM slot_plan_write_probe").get()).toMatchObject({ value: 1 });
+      expect(callback).toHaveBeenCalledOnce();
+      expect(f.mesh.listAll(SLOT_ADMISSION_PREFIX)).toHaveLength(2);
+    } finally {
+      if (writer.isTransaction) writer.exec("ROLLBACK");
+      writer.close();
+    }
+  });
+
+  it("plans the ledger outside the writer and ignores commits outside its read dependencies", async () => {
+    const f = await fresh(), other = meshAt(f.mesh.root), callback = vi.fn();
+    const observed = observeAdmissionPlan(f.mesh, async () => { await other.put({ key: "unrelated/status", value: true, identity: caller }); });
+    expect(await f.coordinator.admit({ ...f.input(), beforeCommit: callback })).toMatchObject({ actorId: "actor:review-1", reused: false });
+    expect(observed.sequence).toEqual(["plan", "plan-scan", "race", "BEGIN", "validate:true"]);
+    expect(observed.validation).toHaveBeenCalledWith(expect.any(String), [key, SLOT_ADMISSION_PREFIX]);
+    expect(callback).toHaveBeenCalledExactlyOnceWith("actor:review-1");
+    expect(f.mesh.get(admissionKey)?.value).toMatchObject({ roles: { review: { actorId: "actor:review-1" } } });
+  });
+
+  it("snapshots normalized request, specification and attribution before waiting for the writer", async () => {
+    const f = await fresh(), input = { ...f.input(), caller: { ...caller } };
+    observeAdmissionPlan(f.mesh, async () => {
+      input.request.slotClaim.ifVersion += 100;
+      input.request.idempotencyKey = "mutated-request"; input.request.name = "mutated-name";
+      input.caller.id = "session:spoofed"; input.spec.rootId = input.caller.id;
+      input.spec.instructions = "Mutated during acquisition";
+    });
+    expect(await f.coordinator.admit(input)).toMatchObject({ actorId: "actor:review-1", spec: {
+      rootId: caller.id, name: names[0], instructions: "Resolved instructions (not a file reference)",
+    } });
+    expect(f.mesh.get(admissionKey)?.value).toMatchObject({ rootId: caller.id, roles: { review: { requestKey: "birth-0" } } });
+  });
+
+  it("bounds real stale-plan retries and preserves the current pair with a final locked plan", async () => {
+    const f = await fresh(), other = meshAt(f.mesh.root), callback = vi.fn();
+    await f.coordinator.admit(f.input("actor:security", 1));
+    const writeBatch = f.mesh.writeBatch.bind(f.mesh);
+    let attempts = 0;
+    vi.spyOn(f.mesh, "writeBatch").mockImplementation(async batch => {
+      expect(++attempts).toBeLessThanOrEqual(3);
+      const current = other.get(admissionKey)!;
+      await other.put({ key: admissionKey, value: { ...(current.value as object), race: attempts }, identity: caller, ifVersion: current.version });
+      return writeBatch(batch);
+    });
+    expect(await f.coordinator.admit({ ...f.input(), beforeCommit: callback })).toMatchObject({ actorId: "actor:review-1", reused: false });
+    expect(attempts).toBe(3);
+    expect(callback).toHaveBeenCalledExactlyOnceWith("actor:review-1");
+    expect(f.mesh.get(admissionKey)?.value).toMatchObject({ race: 3, roles: {
+      review: { actorId: "actor:review-1", state: "admitted" }, security: { actorId: "actor:security", state: "admitted" },
+    } });
+  });
+
+  it("rejects a claim ABA committed by another connection between planning and BEGIN without accepting", async () => {
+    const f = await fresh(), other = meshAt(f.mesh.root), callback = vi.fn();
+    const observed = observeAdmissionPlan(f.mesh, async () => {
+      await other.delete({ key, ifVersion: f.claim.version });
+      const replacement = await other.put({ key, value: f.claim.value, identity: caller });
+      expect(replacement.version).toBeGreaterThan(f.claim.version);
+    });
+    await expect(f.coordinator.admit({ ...f.input(), beforeCommit: callback })).rejects.toMatchObject({ reason: "stale" });
+    expect(observed.sequence).toEqual(["plan", "plan-scan", "race", "BEGIN", "validate:false", "plan"]);
+    expect(callback).not.toHaveBeenCalled();
+    expect(f.mesh.get(admissionKey)).toBeUndefined();
+  });
+
+  it.each(["request key", "actor ID"])("fences a phantom new pair with the same root-scoped %s", async conflict => {
+    const f = await fresh(), other = meshAt(f.mesh.root), callback = vi.fn();
+    const nextKey = key.replace(/base$/, "r2"), nextAdmissionKey = admissionKey.replace(/base$/, "r2");
+    const nextNames = ["demo-r2-review-astra", "demo-r2-security-astra"];
+    const nextClaim = await other.put({ key: nextKey, identity: caller, value: { ...(f.claim.value as object), generation: "r2", names: nextNames } });
+    const rival = f.input(conflict === "actor ID" ? "actor:review-1" : "actor:phantom", 0, nextClaim.version);
+    rival.request.slotClaim.key = nextKey; rival.request.name = nextNames[0]!; rival.spec.name = rival.request.name;
+    if (conflict === "actor ID") rival.request.idempotencyKey = "phantom-request";
+    const observed = observeAdmissionPlan(f.mesh, async () => { await slotAdmissionFor(other).admit(rival); });
+    await expect(f.coordinator.admit({ ...f.input(), beforeCommit: callback })).rejects.toMatchObject({ reason: "occupied" });
+    expect(observed.sequence).toEqual(["plan", "plan-scan", "race", "BEGIN", "validate:false", "plan", "plan-scan"]);
+    expect(callback).not.toHaveBeenCalled();
+    expect(f.mesh.get(admissionKey)).toBeUndefined();
+    expect(f.mesh.get(nextAdmissionKey)?.value).toMatchObject({ roles: { review: { actorId: rival.actorId } } });
+    expect(f.mesh.listAll(SLOT_ADMISSION_PREFIX)).toHaveLength(1);
+  });
+
+  it("replans an exact competing original request after its claim was deleted, accepting only its original ID", async () => {
+    const f = await fresh(), other = meshAt(f.mesh.root), callback = vi.fn();
+    const observed = observeAdmissionPlan(f.mesh, async () => {
+      await slotAdmissionFor(other).admit(f.input("actor:winning-original"));
+      await other.delete({ key, ifVersion: f.claim.version });
+    });
+    const result = await f.coordinator.admit({ ...f.input("actor:discarded"), beforeCommit: callback });
+    expect(result).toMatchObject({ actorId: "actor:winning-original", spec: { id: "actor:winning-original" }, reused: true });
+    expect(observed.sequence).toEqual(["plan", "plan-scan", "race", "BEGIN", "validate:false", "plan", "BEGIN", "validate:true"]);
+    expect(callback).toHaveBeenCalledExactlyOnceWith("actor:winning-original");
+    expect(f.mesh.get(key)).toBeUndefined();
+    expect(f.mesh.listAll(SLOT_ADMISSION_PREFIX)).toHaveLength(1);
+    expect(f.coordinator.isCurrent("actor:winning-original", [routes[0]!.topic], f.binding.registryRoots[1]!)).toBe(true);
+  });
+
+  it("retains admission tombstone CAS revisions in a detached plan", async () => {
+    const f = await fresh();
+    const prior = await f.mesh.put({ key: admissionKey, value: {}, identity: caller });
+    const tombstone = await f.mesh.delete({ key: admissionKey, ifVersion: prior.version });
+    const observed = observeAdmissionPlan(f.mesh);
+    expect(await f.coordinator.admit(f.input())).toMatchObject({ actorId: "actor:review-1" });
+    expect(f.mesh.get(admissionKey)!.version).toBeGreaterThan(tombstone.version!);
+    expect(observed.sequence).toEqual(["plan", "plan-scan", "BEGIN", "validate:true"]);
+  });
+
+  it("uses the live absent-key CAS when unrelated tombstone eviction is invisible to prefix validation", async () => {
+    const f = await fresh(), callback = vi.fn();
+    const prior = await f.mesh.put({ key: admissionKey, value: {}, identity: caller });
+    const tombstone = await f.mesh.delete({ key: admissionKey, ifVersion: prior.version });
+    const other = new MeshStore(f.mesh.root, 64 * 1024, 10_000, { stateBackend: "sqlite", maxStateTombstones: 0 });
+    meshes.push(other);
+    const observed = observeAdmissionPlan(f.mesh, async () => {
+      await other.put({ key: "unrelated/evict", value: true, identity: caller });
+      await other.delete({ key: "unrelated/evict" });
+    });
+    expect(await f.coordinator.admit({ ...f.input(), beforeCommit: callback })).toMatchObject({ actorId: "actor:review-1", reused: false });
+    expect(observed.sequence).toEqual(["plan", "plan-scan", "race", "BEGIN", "validate:true"]);
+    expect(callback).toHaveBeenCalledExactlyOnceWith("actor:review-1");
+    expect(f.mesh.get(admissionKey)!.version).toBeGreaterThan(tombstone.version!);
+  });
+
+  it("keeps the native authority fence at the final write boundary after detached planning", async () => {
+    const f = await fresh(), callback = vi.fn();
+    const observed = observeAdmissionPlan(f.mesh, async () => { installPolicy([]); });
+    await expect(f.coordinator.admit({ ...f.input(), beforeCommit: callback })).rejects.toMatchObject({ reason: "authority-unavailable" });
+    expect(observed.sequence).toEqual(["plan", "plan-scan", "race", "BEGIN", "validate:true"]);
+    expect(callback).not.toHaveBeenCalled();
+    expect(f.mesh.get(admissionKey)).toBeUndefined();
+  });
   it("rejects missing, malformed, stale, foreign and multi-slot claims before the acceptance callback or any intent", async () => {
     const f = await fresh();
     const callback = vi.fn();
@@ -286,6 +488,31 @@ describe.runIf(process.platform === "linux")("same-transaction permanent actor-b
     expect(receiver.isCurrent("actor:review-1", [routes[0]!.topic], f.binding.registryRoots[1]!)).toBe(true);
     expect(await receiver.recoverable(f.binding.registryRoots[0]!)).toEqual([]);
     expect(fs.existsSync(path.join(f.binding.registryRoots[1]!, "actors.json"))).toBe(false); // ledger-only replay
+  });
+
+  it("clones large recovery specs after custody and returns detached snapshots", async () => {
+    const f = await fresh(), input = f.input();
+    input.request.instructions = "x".repeat(20_000); input.spec.instructions = input.request.instructions;
+    await f.coordinator.admit(input);
+    let preparing = false, copies = 0;
+    const original = f.mesh.writeBatch.bind(f.mesh), stringify = JSON.stringify;
+    const batch = vi.spyOn(f.mesh, "writeBatch").mockImplementation(input => original({ ...input,
+      prepare: (view, files) => {
+        preparing = true;
+        try { return input.prepare?.(view, files) ?? []; }
+        finally { preparing = false; }
+      } }));
+    const encode = vi.spyOn(JSON, "stringify").mockImplementation((value, replacer, space) => {
+      if (value?.kind === "pair") { expect(preparing).toBe(false); copies++; }
+      return stringify(value, replacer, space);
+    });
+    try {
+      const recovered = await f.coordinator.recoverable(input.registryRoot);
+      expect(copies).toBeGreaterThan(0);
+      expect(recovered[0]?.spec.instructions).toBe(input.request.instructions);
+      recovered[0]!.spec.instructions = "mutated reader copy";
+      expect((await f.coordinator.recoverable(input.registryRoot))[0]?.spec.instructions).toBe(input.request.instructions);
+    } finally { encode.mockRestore(); batch.mockRestore(); }
   });
 
   it("serializes competing same-role births and keeps one durable incarnation", async () => {

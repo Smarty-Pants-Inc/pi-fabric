@@ -5,6 +5,8 @@ export { MeshBatchConflictError, MeshDedupeRecoveryError, MeshDedupeStoreFullErr
   MeshSnapshotRetriesExhaustedError, MeshStore, MESH_INCARNATION_PENDING_CODE, MESH_SNAPSHOT_RETRIES_EXHAUSTED_CODE,
   isMeshIncarnationPending, isMeshSnapshotRetriesExhausted } from "./mesh/store.js";
 export { MeshCustodyUnrecoverableError } from "./mesh/custody-lock.js";
+export { meshOutageAlarmSink, meshAlarmRecipient } from "./mesh/store.js";
+export { meshStateBackendFromMarker } from "./mesh/backend-fence.js";
 export type { FabricPrincipal, FabricPrincipalAuthorityCheck } from "./fabric-provenance.js";
 export type {
   MeshBatchOperation,

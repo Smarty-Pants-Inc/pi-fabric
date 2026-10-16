@@ -81,8 +81,13 @@ const isExtensionRunnerConstructor = (value: unknown): value is ExtensionRunnerC
 // pi >= 0.84.3 loads the CLI from dist/bundle/cli.js, whose rollup chunks carry
 // their own ExtensionRunner class identity — the library-level patch alone
 // never fires because the live host runner is an instance of the bundle's copy.
-// Importing each chunk inside the running CLI is a Node module-cache hit, so
-// scanning the bundle is free and yields the class the host actually runs.
+// Only runner-bearing chunks belong in this scan: worker entrypoints can throw
+// on the Main thread, and Node keeps their evaluation Error (and lazy stack) forever.
+const logImportFailure = (file: string, error: unknown): void => {
+  // Reading the stack releases V8 CallSiteInfo receivers before the cached Error outlives this Main.
+  const diagnostic = error instanceof Error ? error.stack ?? error.message : String(error);
+  console.warn(`[pi-fabric] skipped runner import ${file}: ${diagnostic}`);
+};
 export const bundleExtensionRunnerConstructors = async (
   bundleDir: string,
 ): Promise<ExtensionRunnerConstructor[]> => {
@@ -97,15 +102,18 @@ export const bundleExtensionRunnerConstructors = async (
   const constructors = new Set<ExtensionRunnerConstructor>();
   for (const file of files) {
     if (!file.endsWith(".js")) continue;
+    const filePath = path.join(chunksDir, file);
     try {
-      const module = (await import(pathToFileURL(path.join(chunksDir, file)).href)) as Record<
+      // Public method names survive bundling/minification; worker-only image/native chunks do not export a runner.
+      if (!readFileSync(filePath, "utf8").includes("getAllRegisteredTools")) continue;
+      const module = (await import(pathToFileURL(filePath).href)) as Record<
         string,
         unknown
       >;
       for (const exported of Object.values(module)) {
         if (isExtensionRunnerConstructor(exported)) constructors.add(exported);
       }
-    } catch { /* chunk not importable in this realm (worker entries, natives); skip */ }
+    } catch (error) { logImportFailure(filePath, error); }
   }
   return [...constructors];
 };
@@ -255,7 +263,8 @@ const exportedExtensionRunner = async (entry: string): Promise<ExtensionRunnerCo
   try {
     const module = (await import(pathToFileURL(entry).href)) as { ExtensionRunner?: unknown };
     return isExtensionRunnerConstructor(module.ExtensionRunner) ? [module.ExtensionRunner] : [];
-  } catch {
+  } catch (error) {
+    logImportFailure(entry, error);
     return []; // Entry not importable in this realm; skip it.
   }
 };
@@ -273,20 +282,21 @@ const exportedExtensionRunner = async (entry: string): Promise<ExtensionRunnerCo
 const packageExtensionRunnerConstructors = async (
   packageRoot: string,
   entry: string | undefined,
+  includeBundle: boolean,
 ): Promise<ExtensionRunnerConstructor[]> => {
   const distDirectory = path.join(packageRoot, "dist");
   const bundleDirectory = path.join(distDirectory, "bundle");
   if (entry && isWithin(bundleDirectory, entry)) {
     const bundled = await exportedExtensionRunner(path.join(bundleDirectory, "index.js"));
     // Bundles without an SDK entry export the class from a chunk only.
-    return bundled.length > 0 ? bundled : bundleExtensionRunnerConstructors(bundleDirectory);
+    return bundled.length > 0 || !includeBundle ? bundled : bundleExtensionRunnerConstructors(bundleDirectory);
   }
   const unbundled = await exportedExtensionRunner(path.join(distDirectory, "index.js"));
   if (entry && isWithin(distDirectory, entry)) return unbundled;
-  return [...unbundled, ...(await bundleExtensionRunnerConstructors(bundleDirectory))];
+  return [...unbundled, ...(includeBundle ? await bundleExtensionRunnerConstructors(bundleDirectory) : [])];
 };
 
-const extensionRunnerConstructors = async (): Promise<ExtensionRunnerConstructor[]> => {
+const extensionRunnerConstructors = async (includeBundle: boolean): Promise<ExtensionRunnerConstructor[]> => {
   const constructors = new Set<ExtensionRunnerConstructor>();
   // The validated, locked task-entry/durable-worker registration (#8606).
   const registered = registeredHostExtensionRunner();
@@ -298,7 +308,7 @@ const extensionRunnerConstructors = async (): Promise<ExtensionRunnerConstructor
   );
   const entry = process.argv[1] ? realPath(process.argv[1]) : undefined;
   for (const packageRoot of packageRoots) {
-    for (const Runner of await packageExtensionRunnerConstructors(packageRoot, entry)) {
+    for (const Runner of await packageExtensionRunnerConstructors(packageRoot, entry, includeBundle)) {
       constructors.add(Runner);
     }
   }
@@ -310,7 +320,7 @@ const extensionRunnerConstructors = async (): Promise<ExtensionRunnerConstructor
         ExtensionRunner?: ExtensionRunnerConstructor;
       };
       if (hostModule.ExtensionRunner) constructors.add(hostModule.ExtensionRunner);
-    } catch { /* host unavailable in this realm; tool capture stays inert */ }
+    } catch (error) { logImportFailure("@earendil-works/pi-coding-agent", error); }
   }
   return [...constructors];
 };
@@ -318,7 +328,8 @@ const extensionRunnerConstructors = async (): Promise<ExtensionRunnerConstructor
 export const installRegisteredToolCapture = async (
   options: RegisteredToolCaptureOptions,
 ): Promise<RegisteredToolCaptureController> => {
-  const hubs = (await extensionRunnerConstructors()).map(captureHub);
+  const initialPolicy = options.initialPolicy ?? DEFAULT_FABRIC_CONFIG.capture;
+  const hubs = new Set((await extensionRunnerConstructors(initialPolicy.enabled)).map(captureHub));
   const anchorToken = {};
   Object.defineProperty(options.anchorDefinition, ANCHOR_SYMBOL, {
     value: anchorToken,
@@ -326,8 +337,9 @@ export const installRegisteredToolCapture = async (
     enumerable: true,
     writable: false,
   });
-  let policy = clonePolicy(options.initialPolicy ?? DEFAULT_FABRIC_CONFIG.capture);
+  let policy = clonePolicy(initialPolicy);
   let disposed = false;
+  let bundledCapture: Promise<void> | undefined = initialPolicy.enabled ? Promise.resolve() : undefined;
 
   const listener: ToolCaptureListener = (tools, runner) => {
     if (disposed) return tools;
@@ -348,6 +360,15 @@ export const installRegisteredToolCapture = async (
     setPolicy(config) {
       policy = clonePolicy(config);
       if (!policy.enabled) options.catalog.clear();
+      else bundledCapture ??= extensionRunnerConstructors(true).then((constructors) => {
+        if (disposed) return;
+        for (const Runner of constructors) {
+          const hub = captureHub(Runner);
+          if (!hubs.has(hub)) { hubs.add(hub); hub.listeners.add(listener); }
+        }
+        options.onCatalogRefresh?.();
+      });
+      return bundledCapture;
     },
     dispose() {
       if (disposed) return;

@@ -11,7 +11,7 @@ import type { ResidentHostConfig, ResidentHostOwner } from "./protocol.js";
 import type { FabricActorInfo } from "../actors/types.js";
 import type { FabricParticipantInfo, FabricParticipantRecord } from "../topology/types.js";
 import { readWakeJson, residentOwnerLive, residentOwnerSleeping, routesAt, residentDirectories, residentDeliveryMatches,
-  acknowledgeResidentDelivery, assertResidentWakeConfig, retainedRoutesAt, residentUnacknowledgedDeliveries, ResidentWakeConfigMismatch, RESIDENT_WAKE_INDEX_MAX_ROOTS, ResidentWakeRecoveryReader, RESIDENT_WAKE_RECOVERY_MAX_BYTES, type ResidentWakeRecoveryBatch, type WakeDelivery } from "./wake-index.js";
+  acknowledgeResidentDelivery, assertResidentWakeConfig, retainedRoutesAt, residentUnacknowledgedDelivery, residentWakeRetryCandidates, ResidentWakeConfigMismatch, RESIDENT_WAKE_INDEX_MAX_ROOTS, ResidentWakeRecoveryReader, RESIDENT_WAKE_RECOVERY_MAX_BYTES, type ResidentWakeRecoveryBatch, type WakeDelivery } from "./wake-index.js";
 export { readWakeJson, residentOwnerLive, residentOwnerSleeping, ResidentWakeConfigMismatch } from "./wake-index.js";
 
 /** Sleep needs archive retention even on a mesh that previously used only a bounded live log. */
@@ -46,6 +46,8 @@ const wakeFailurePath = (root: string): string => path.join(root, "wake-failure.
 /** Failed wakes are retried by existing maintenance, not unrelated publications. */
 export const RESIDENT_WAKE_RETRY_MIN_MS = 1_000;
 export const RESIDENT_WAKE_RETRY_MAX_MS = 60_000;
+/** Bound delivery/config/receipt inspection per sweep, independent of backlog size. */
+export const RESIDENT_WAKE_RETRY_MAX_CANDIDATES = 128;
 const RESIDENT_WAKE_ATTEMPT_LEASE_MS = 120_000;
 interface ResidentWakeFailure {
   format: 1;
@@ -67,7 +69,6 @@ const wakeRetryDelay = (failures: number): number => Math.min(RESIDENT_WAKE_RETR
 const wakeFailures = (failure: ResidentWakeFailure | undefined): number =>
   Number.isSafeInteger(failure?.failures) && failure!.failures! >= 0 ? failure!.failures! : 0;
 const residentWakeRetrySweeps = new Map<string, Promise<void>>();
-const residentWakeRetryCursors = new Map<string, number>();
 
 /** Failure durability precedes index ACK, including failures before intent writing. */
 const recordResidentWakeFailure = async (mesh: ResidentWakeMesh, root: string, delivery: WakeDelivery,
@@ -392,6 +393,11 @@ export async function wakeResidentActors(mesh: Pick<MeshStore, "root" | "listAll
     if (!canWake()) break;
     if (!recovery && attempted >= RESIDENT_WAKE_INDEX_MAX_ROOTS) break; // Overflow stays pending for the next drain.
     let delivery: { id: string; sequence?: number } | undefined;
+    let acknowledged = false;
+    const onIntentWritten = async (written: ResidentWakeRequest): Promise<void> => {
+      await acknowledge(root, written);
+      acknowledged = true;
+    };
     try {
       // Reject foreign paths before opening their retained config or route files.
       if (recovery && root !== recovery.config.residencyRoot) { recovery.ignored++; continue; }
@@ -409,7 +415,7 @@ export async function wakeResidentActors(mesh: Pick<MeshStore, "root" | "listAll
         if (covered) {
           delivery = covered;
           attempted++;
-          await requestResidentWake(root, covered, launch, written => acknowledge(root, written), admission);
+          await requestResidentWake(root, covered, launch, onIntentWritten, admission);
         }
         continue;
       }
@@ -422,11 +428,18 @@ export async function wakeResidentActors(mesh: Pick<MeshStore, "root" | "listAll
         (request && JSON.stringify(sleeping?.request) !== JSON.stringify(request) ? request : undefined);
       if (delivery) {
         attempted++;
-        await requestResidentWake(root, delivery, launch, written => acknowledge(root, written), admission);
+        await requestResidentWake(root, delivery, launch, onIntentWritten, admission);
         fs.rmSync(wakeFailurePath(root), { force: true });
       }
     } catch (error) {
-      if (error instanceof ResidentWakeAdmissionClosed) return; // Revocation is not a root failure or an ACK.
+      if (error instanceof ResidentWakeAdmissionClosed) {
+        // Admission can close while the intent ACK waits for custody (or during
+        // runtime preparation). Once ACKed, the index no longer discovers this
+        // cold root: retain the existing failure receipt for maintenance retry.
+        // Before ACK the original pending watermark already owns that nudge.
+        if (acknowledged && delivery) await recordResidentWakeFailure(mesh, root, delivery, error, Date.now());
+        return;
+      }
       // One failed root must never abort the others or turn a committed publish into a retry.
       // The durable nudge survives spawn failure; a separate receipt retains write failures too.
       if (delivery) await recordResidentWakeFailure(mesh, root, delivery, error, Date.now());
@@ -444,28 +457,22 @@ export async function retryResidentWakes(mesh: ResidentWakeMesh,
   const running = residentWakeRetrySweeps.get(key);
   if (running) return running;
   const sweep = (async () => {
-    const pending = await mesh.exclusive(() => {
-      if (!canWake()) return new Map<string, WakeDelivery>();
-      return residentUnacknowledgedDeliveries(mesh.root); // Every bounded page, including overflow.
+    const candidates = await mesh.exclusive(() => {
+      if (!canWake()) return [];
+      return residentWakeRetryCandidates(mesh.root); // Bounded pages; next sweep resumes the cursor.
     });
     if (!canWake()) return;
-    const candidates = [...new Set([...pending.keys(),
-      ...residentDirectories(mesh.root).filter(root => wakeFailureAt(root) !== undefined)])];
-    if (!candidates.length) return;
-    const offset = (residentWakeRetryCursors.get(key) ?? 0) % candidates.length;
-    const rotated = [...candidates.slice(offset), ...candidates.slice(0, offset)];
-    residentWakeRetryCursors.set(key, (offset + Math.min(RESIDENT_WAKE_INDEX_MAX_ROOTS, rotated.length)) % candidates.length);
     const attempts: Array<{ root: string; delivery: WakeDelivery; claimId: string }> = [];
-    for (const root of rotated.slice(0, RESIDENT_WAKE_INDEX_MAX_ROOTS)) {
+    for (const root of candidates.slice(0, RESIDENT_WAKE_RETRY_MAX_CANDIDATES)) {
       if (!canWake()) break;
       const claimId = randomUUID();
       try {
         const delivery = await mesh.exclusive(() => {
           if (!canWake()) return;
           const prior = wakeFailureAt(root);
-          // Re-read ALL pages under the claim lock; later overflow must not be
-          // starved here after it has entered the fair candidate rotation.
-          const current = residentUnacknowledgedDeliveries(mesh.root).get(root);
+          // Revalidate this candidate only; never multiply full-backlog I/O by
+          // the number of claims while publications wait for mesh custody.
+          const current = residentUnacknowledgedDelivery(mesh.root, root);
           if (!retainedRoutesAt(root)) {
             // Only an absent route is retired. Malformed/unreadable metadata is
             // not proof of retirement and must retain its durable delivery.

@@ -12,7 +12,7 @@ import type { MeshReadOptions, MeshStateEntry, MeshBatchResult, MeshBatchView } 
 import { createStateBackend, isMeshStateWalCap, type MeshStateBackendKind, type StateBackend, type StateBackendBatchInput,
   type StateBackendDiagnostics } from "./state-backend.js";
 import { EventLog, type MeshEvent, type MeshIdentity, type MeshPublishInput, type MeshTailResult } from "./event-log.js";
-import { indexResidentDeliveries, type WakeSubscription } from "../residency/wake-index.js";
+import { closeResidentWakeRetryCursor, indexResidentDeliveries, type WakeSubscription } from "../residency/wake-index.js";
 import { writeFileAtomic } from "../core/atomic-write.js";
 import type { FabricMessageSender } from "../protocol.js";
 import { copyFabricPrincipal, type FabricPrincipal } from "../fabric-provenance.js";
@@ -473,6 +473,7 @@ export class MeshStore {
 
   /** Releases the state database handle (sqlite, shadow); the file backend holds none. */
   closeState(): void {
+    closeResidentWakeRetryCursor(this.root);
     this.#state.close();
     // A closed sqlite backend cannot reopen and a closed shadow writes only through .lock: this
     // store no longer needs the record. Another open store of this process keeps it.

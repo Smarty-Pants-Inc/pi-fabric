@@ -9,7 +9,8 @@ import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
 import { canonicalResidentWakeConfig, residentUnacknowledgedDeliveries, ResidentWakeRecoveryReader,
-  residentWakeIndexPath, RESIDENT_WAKE_INDEX_MAX_ROOTS } from "../src/residency/wake-index.js";
+  residentWakeIndexPath, RESIDENT_WAKE_INDEX_MAX_ROOTS, RESIDENT_WAKE_RETRY_SCAN_MAX_PAGES,
+  RESIDENT_WAKE_RETRY_SCAN_PAGE_ENTRIES } from "../src/residency/wake-index.js";
 import * as wake from "../src/residency/wake.js";
 
 const from = { id: "publisher", name: "publisher", kind: "main" as const };
@@ -95,6 +96,113 @@ describe("publication wake isolation and maintenance backoff", () => {
       if (mode === "retired") expect(fs.readFileSync(residentWakeIndexPath(f.mesh.root), "utf8")).toContain('"op":"ack"');
     } finally { f.close(); }
   });
+
+  it("round3 bounds retry candidates and reads only one overflow root per claim custody", async () => {
+    const f = fixture(301, () => false);
+    const overflow = path.join(f.mesh.root, "wake-overflow");
+    const quarantine = path.join(f.root, "claimed-overflow");
+    fs.mkdirSync(overflow, { recursive: true });
+    fs.mkdirSync(quarantine);
+    for (const [n, config] of f.residents.entries()) {
+      fs.writeFileSync(path.join(overflow, `${path.basename(config.residencyRoot)}.json`), JSON.stringify({
+        format: 1, op: "pending", root: config.residencyRoot, delivery: { id: `bounded-${n}`, sequence: n + 1 },
+      }));
+    }
+    const heldReads: Array<Set<string>> = [];
+    let currentReads: Set<string> | undefined;
+    const exclusive = f.mesh.exclusive.bind(f.mesh);
+    vi.spyOn(f.mesh, "exclusive").mockImplementation(async <T>(operation: () => T, timeout?: number): Promise<T> =>
+      exclusive(() => {
+        const reads = new Set<string>();
+        heldReads.push(reads);
+        currentReads = reads;
+        try { return operation(); } finally { currentReads = undefined; }
+      }, timeout));
+    const open = fs.openSync;
+    vi.spyOn(fs, "openSync").mockImplementation(((file: fs.PathLike, ...args: unknown[]) => {
+      if (path.dirname(String(file)) === overflow) currentReads?.add(String(file));
+      return (open as (...args: unknown[]) => number)(file, ...args);
+    }) as typeof fs.openSync);
+    // Record the real ACK namespace change without executing native deletion (#4664).
+    const unlink = fs.unlinkSync;
+    vi.spyOn(fs, "unlinkSync").mockImplementation(file => {
+      if (path.dirname(String(file)) === overflow) fs.renameSync(file, path.join(quarantine, path.basename(String(file))));
+      else unlink(file);
+    });
+    const launch = vi.fn(async (_file: string, _config: ResidentHostConfig) => {});
+    try {
+      await maintenance(f.mesh, launch);
+      expect(launch).toHaveBeenCalledTimes(wake.RESIDENT_WAKE_RETRY_MAX_CANDIDATES ?? RESIDENT_WAKE_INDEX_MAX_ROOTS);
+      // Discovery consumes at most K pages. Every subsequent claim/ACK custody
+      // validates one keyed overflow record, never all pending pages.
+      expect(heldReads[0]!.size).toBeLessThanOrEqual((RESIDENT_WAKE_RETRY_SCAN_MAX_PAGES ?? 1) *
+        (RESIDENT_WAKE_RETRY_SCAN_PAGE_ENTRIES ?? RESIDENT_WAKE_INDEX_MAX_ROOTS));
+      expect(Math.max(...heldReads.slice(1).map(reads => reads.size))).toBeLessThanOrEqual(1);
+      expect(residentUnacknowledgedDeliveries(f.mesh.root).size).toBe(301 - RESIDENT_WAKE_INDEX_MAX_ROOTS);
+    } finally { f.close(); }
+  });
+
+  it("round3 page cursor reaches all 5000 pinned roots with bounded custody work", async () => {
+    const f = fixture(5_000, () => false);
+    const overflow = path.join(f.mesh.root, "wake-overflow");
+    fs.mkdirSync(overflow, { recursive: true });
+    const now = Date.now();
+    for (const [n, config] of f.residents.entries()) {
+      const delivery = { id: `fair-${n}`, sequence: n + 1 };
+      fs.writeFileSync(path.join(overflow, `${path.basename(config.residencyRoot)}.json`), JSON.stringify({
+        format: 1, op: "pending", root: config.residencyRoot, delivery,
+      }));
+      fs.writeFileSync(path.join(config.residencyRoot, "wake-failure.json"), JSON.stringify({
+        format: 1, delivery, nextRetryAt: now + 86_400_000,
+      }));
+    }
+    const visited = new Set<string>();
+    const discoveryReads: number[] = [], claimReads: number[] = [], heldMs: number[] = [];
+    let transaction: { discovery: boolean; reads: number } | undefined;
+    let calls = 0;
+    const exclusive = f.mesh.exclusive.bind(f.mesh);
+    vi.spyOn(f.mesh, "exclusive").mockImplementation(async <T>(operation: () => T, timeout?: number): Promise<T> => {
+      const discovery = calls++ === 0;
+      return exclusive(() => {
+        transaction = { discovery, reads: 0 };
+        const start = performance.now();
+        try { return operation(); }
+        finally {
+          heldMs.push(performance.now() - start);
+          (discovery ? discoveryReads : claimReads).push(transaction.reads);
+          transaction = undefined;
+        }
+      }, timeout);
+    });
+    const open = fs.openSync;
+    vi.spyOn(fs, "openSync").mockImplementation(((file: fs.PathLike, ...args: unknown[]) => {
+      if (transaction && path.dirname(String(file)) === overflow) {
+        transaction.reads++;
+        const limit = transaction.discovery ? (RESIDENT_WAKE_RETRY_SCAN_MAX_PAGES ?? 1) *
+          (RESIDENT_WAKE_RETRY_SCAN_PAGE_ENTRIES ?? RESIDENT_WAKE_INDEX_MAX_ROOTS) : 1;
+        if (transaction.reads > limit) throw new Error(`retry custody exceeded ${limit} overflow files (observed ${transaction.reads})`);
+        if (!transaction.discovery) visited.add(path.basename(String(file)));
+      }
+      return (open as (...args: unknown[]) => number)(file, ...args);
+    }) as typeof fs.openSync);
+    const launch = vi.fn(async (_file: string, _config: ResidentHostConfig) => {});
+    try {
+      const sweeps = Math.ceil(f.residents.length / (wake.RESIDENT_WAKE_RETRY_MAX_CANDIDATES ?? RESIDENT_WAKE_INDEX_MAX_ROOTS));
+      for (let sweep = 0; sweep < sweeps; sweep++) {
+        calls = 0;
+        await maintenance(f.mesh, launch, now);
+      }
+      expect(visited.size).toBe(5_000); // First pages remain pinned throughout; later pages cannot starve.
+      expect(Math.max(...discoveryReads)).toBeLessThanOrEqual((RESIDENT_WAKE_RETRY_SCAN_MAX_PAGES ?? 1) *
+        (RESIDENT_WAKE_RETRY_SCAN_PAGE_ENTRIES ?? RESIDENT_WAKE_INDEX_MAX_ROOTS));
+      expect(Math.max(...claimReads)).toBeLessThanOrEqual(1);
+      expect(launch).not.toHaveBeenCalled(); // Backoff is still authoritative.
+      expect(residentUnacknowledgedDeliveries(f.mesh.root).size).toBe(5_000);
+      console.info(JSON.stringify({ probe: "5000-root-custody", sweeps, rootsVisited: visited.size,
+        maxDiscoveryFiles: Math.max(...discoveryReads), maxClaimFiles: Math.max(...claimReads),
+        totalHeldMs: heldMs.reduce((sum, ms) => sum + ms, 0), maxHeldMs: Math.max(...heldMs) }));
+    } finally { f.close(); }
+  }, 30_000);
 
   it.skipIf(process.platform === "win32").each([["cold", false], ["cold", true], ["warm", false], ["warm", true]] as const)(
     "round2 publication rechecks live admission inside intent custody: %s, open=%s", async (state, staysOpen) => {

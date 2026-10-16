@@ -230,11 +230,11 @@ export class ResidentWakeRecoveryReader {
     try { this.#directory = fs.opendirSync(path.join(meshRoot, "wake-overflow"), { bufferSize: 1 }); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
   }
-  next(): ResidentWakeRecoveryBatch {
+  next(maxEntries = RESIDENT_WAKE_RECOVERY_MAX_ENTRIES): ResidentWakeRecoveryBatch {
     const batch: ResidentWakeRecoveryBatch = { pending: new Map(), entries: 0,
       bytes: this.#first ? RESIDENT_WAKE_INDEX_MAX_BYTES : 0 };
     this.#first = false;
-    while (!this.done && batch.entries < RESIDENT_WAKE_RECOVERY_MAX_ENTRIES &&
+    while (!this.done && batch.entries < Math.min(maxEntries, RESIDENT_WAKE_RECOVERY_MAX_ENTRIES) &&
         batch.bytes + 1024 <= RESIDENT_WAKE_RECOVERY_MAX_BYTES) {
       if (!this.#journalDone) {
         const record = this.#journal.next();
@@ -285,6 +285,72 @@ export function indexResidentDeliveries(meshRoot: string, event: MeshEvent, life
       writeFileAtomic(overflowPath(meshRoot, record.root), text, { durable: true });
     }
   }
+}
+
+/** Maintenance consumes one bounded page per sweep; retained readers carry the next-page cursor. */
+export const RESIDENT_WAKE_RETRY_SCAN_MAX_PAGES = 1;
+export const RESIDENT_WAKE_RETRY_SCAN_PAGE_ENTRIES = RESIDENT_WAKE_INDEX_MAX_ROOTS;
+class ResidentWakeRetryCursor {
+  readonly pending: ResidentWakeRecoveryReader;
+  directory: fs.Dir | undefined;
+  done = false;
+  constructor(readonly meshRoot: string) { this.pending = new ResidentWakeRecoveryReader(meshRoot); }
+  next(): string[] {
+    if (!this.pending.done) {
+      const batch = this.pending.next(RESIDENT_WAKE_RETRY_SCAN_PAGE_ENTRIES);
+      if (batch.entries || !this.pending.done) return [...batch.pending.keys()];
+    }
+    // Receipt-only roots share the same streaming bound; never list/read all
+    // failure receipts to discover this sweep's candidates.
+    if (!this.directory) {
+      try { this.directory = fs.opendirSync(path.join(this.meshRoot, "residency"), { bufferSize: 1 }); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    }
+    const roots: string[] = [];
+    for (let entries = 0; entries < RESIDENT_WAKE_RETRY_SCAN_PAGE_ENTRIES; entries++) {
+      const entry = this.directory?.readSync();
+      if (!entry) { this.close(); break; }
+      if (entry.isDirectory()) roots.push(path.join(this.meshRoot, "residency", entry.name));
+    }
+    return roots;
+  }
+  close(): void {
+    this.done = true;
+    this.pending.close();
+    this.directory?.closeSync();
+    this.directory = undefined;
+  }
+}
+const retryCursors = new Map<string, ResidentWakeRetryCursor>();
+/** Release native directory custody when a mesh closes, or when evicting an idle cursor. */
+export function closeResidentWakeRetryCursor(meshRoot: string): void {
+  const key = path.resolve(meshRoot);
+  retryCursors.get(key)?.close();
+  retryCursors.delete(key);
+}
+/** Caller holds mesh custody. Both payload reads AND directory iteration are page-bounded. */
+export function residentWakeRetryCandidates(meshRoot: string): string[] {
+  const key = path.resolve(meshRoot);
+  let cursor = retryCursors.get(key);
+  if (!cursor) {
+    if (retryCursors.size >= 32) closeResidentWakeRetryCursor(retryCursors.keys().next().value!);
+    cursor = new ResidentWakeRetryCursor(meshRoot);
+    retryCursors.set(key, cursor);
+  }
+  const roots = new Set<string>();
+  try {
+    for (let page = 0; page < RESIDENT_WAKE_RETRY_SCAN_MAX_PAGES && !cursor.done; page++)
+      for (const root of cursor.next()) roots.add(root);
+    return [...roots];
+  } catch (error) { closeResidentWakeRetryCursor(meshRoot); throw error; }
+  finally { if (cursor.done) closeResidentWakeRetryCursor(meshRoot); }
+}
+
+/** One root only, under mesh custody: the bounded journal plus that root's keyed overflow record. */
+export function residentUnacknowledgedDelivery(meshRoot: string, root: string): WakeDelivery | undefined {
+  if (path.dirname(root) !== path.join(meshRoot, "residency")) throw new Error("Invalid resident wake root");
+  const pending = indexAt(meshRoot).pending.get(root);
+  return readOverflow(meshRoot, `${path.basename(root)}.json`) ?? pending;
 }
 
 export function residentUnacknowledgedDeliveries(meshRoot: string): Map<string, WakeDelivery> {

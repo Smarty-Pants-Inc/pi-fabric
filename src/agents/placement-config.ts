@@ -1,3 +1,4 @@
+import { diagnostics } from "../core/diagnostics.js";
 import path from "node:path";
 import fs from "node:fs";
 import { AgentInputError, normalizeAgentCapabilityTokens } from "../host-compatibility.js";
@@ -121,7 +122,7 @@ export const liveAgentPlacement = (file: string, initial?: AgentPlacementConfig)
       lastError = undefined;
     } catch (error) {
       const message = String(error);
-      if (message !== lastError) console.warn(`[pi-fabric] agents.placement live refresh failed (${file}); retaining last valid policy: ${message}`);
+      if (message !== lastError) diagnostics.warn("src/agents/placement-config.ts", `[pi-fabric] agents.placement live refresh failed (${file}); retaining last valid policy: ${message}`);
       lastError = message;
     }
     return current;

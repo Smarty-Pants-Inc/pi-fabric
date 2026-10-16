@@ -12,6 +12,7 @@ export const registerFabricFixture = (pi: ExtensionAPI): boolean => {
   if (!fixturePiHostSupported(version)) {
     // Pi catches extension factory errors and continues without that extension. A throw
     // would therefore discard these guards and start an unrestricted fixture session.
+    // This is an explicit user-facing safety refusal, not an internal diagnostic: keep it outside the diagnostics sweep.
     console.error(`[pi-fabric] Refusing read-only fixture: requires Pi >= ${MINIMUM_FIXTURE_PI_HOST_VERSION} with fail-closed RPC/TUI user shell interception; detected ${version ?? "unknown host"}. Upgrade Pi or use a verifiable Pi CLI host.`);
     process.exit(1);
   }

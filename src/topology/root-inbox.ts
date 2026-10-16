@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { diagnostics } from "../core/diagnostics.js";
 import { appendDeliveryOutcome } from "../mesh/delivery-outcomes.js";
 import { MeshBackgroundQueue } from "../core/atomic-write.js";
 import type { MeshEvent, MeshIdentity, MeshStore } from "../mesh/store.js";
@@ -84,7 +85,7 @@ const wakeCooldownMs = (): number => {
   if (value <= MAX_WAKE_COOLDOWN_MS) return value;
   if (!warnedWakeCooldownCap) {
     warnedWakeCooldownCap = true;
-    console.warn(`[pi-fabric] PI_FABRIC_INBOX_WAKE_COOLDOWN_MS=${value} exceeds ${MAX_WAKE_COOLDOWN_MS}; using ${MAX_WAKE_COOLDOWN_MS}`);
+    diagnostics.warn("src/topology/root-inbox.ts", `[pi-fabric] PI_FABRIC_INBOX_WAKE_COOLDOWN_MS=${value} exceeds ${MAX_WAKE_COOLDOWN_MS}; using ${MAX_WAKE_COOLDOWN_MS}`);
   }
   return MAX_WAKE_COOLDOWN_MS;
 };
@@ -163,7 +164,7 @@ export class RootInbox {
     let skippedStale = 0;
     if (state.pending && options.turnEnd) await this.#alarmPending(state).catch(error => {
       // An observational alarm must never keep confirmed work wedged behind publication.
-      console.warn(`[pi-fabric] root inbox alarm: ${error instanceof Error ? error.message : String(error)}`);
+      diagnostics.warn("src/topology/root-inbox.ts", `[pi-fabric] root inbox alarm: ${error instanceof Error ? error.message : String(error)}`);
     });
     // An ack can land while this read awaits the mesh: it may commit this very batch.
     const held = state.pending;
@@ -308,7 +309,7 @@ export class RootInbox {
           "delivered", "consumed by Main inbox as itself", this.#now());
       } catch (error) {
         // Observational evidence must never undo the ack that keeps the event from re-injection.
-        console.warn(`[pi-fabric] root inbox delivery outcome: ${error instanceof Error ? error.message : String(error)}`);
+        diagnostics.warn("src/topology/root-inbox.ts", `[pi-fabric] root inbox delivery outcome: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
   }

@@ -1,4 +1,5 @@
 import type { ExtensionRunner, RegisteredTool, SourceInfo, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { diagnostics } from "../core/diagnostics.js";
 import { wrapRegisteredToolForCapture } from "./wrapper.js";
 import type { FabricToolCaptureConfig } from "../config.js";
 import type { FabricRisk } from "../protocol.js";
@@ -211,7 +212,8 @@ export class CapturedToolCatalog {
       if (!this.#hostVisibilityReady) return undefined;
       if (!this.#visibilityFailureWarned) {
         this.#visibilityFailureWarned = true;
-        console.warn(
+        diagnostics.warn(
+          "src/capture/catalog.ts",
           `pi-fabric: reading Pi's active tool set failed (${visibilityErrorLabel(error)}); hiding extension tools not known to be visible`,
         );
       }

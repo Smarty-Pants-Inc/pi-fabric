@@ -320,9 +320,11 @@ async function publishUnhosted(root: string, config: ResidentHostConfig, outage:
     durationMs: Math.max(0, Date.now() - outage.since), topic: RESIDENT_UNHOSTED_TOPIC, ...data }));
   try {
     // Alarm-time only: neither MeshStore nor its transitive closure belongs in launcher startup.
-    const { MeshStore, meshOutageAlarmSink, meshAlarmRecipient } = await import("../mesh/store.js");
-    if (!meshAlarmRecipient()) { unhostedDiagnostic(root, "no configured session alarm sink; stderr only"); return; }
-    const { meshStateBackendFromMarker } = await import("../mesh/backend-fence.js");
+    const { MeshStore, meshOutageAlarmSink, meshAlarmRecipient, meshStateBackendFromMarker } = await import("../mesh.js");
+    // This launcher knows the actor-owning root session; never replace an explicit env target.
+    const alarmEnv = !process.env.PI_FABRIC_MESH_ALARM_TO && !process.env.SMARTY_LEAD_SESSION
+      ? { ...process.env, SMARTY_LEAD_SESSION: config.rootId } : process.env;
+    if (!meshAlarmRecipient(alarmEnv)) { unhostedDiagnostic(root, "no configured session alarm sink; stderr only"); return; }
     const mesh = new MeshStore(config.meshRoot, config.mesh?.maxEventBytes ?? 64 * 1024, config.mesh?.maxReadEvents ?? 100,
       { lockProtocol: config.mesh?.lockProtocol, stateBackend: meshStateBackendFromMarker(config.meshRoot, config.mesh?.stateBackend),
         canWakeResidents: () => false, lockTimeoutMs: 1_000 });
@@ -333,7 +335,7 @@ async function publishUnhosted(root: string, config: ResidentHostConfig, outage:
         mesh: { publish: input => mesh.publish({ ...input, topic: RESIDENT_UNHOSTED_TOPIC, kind: `resident-unhosted-${state}`,
           text: `Resident ${config.rootId} ${state}: ${actorCount} actors, ${outage.reason}`, data,
           dedupeKey: `resident-unhosted:${outage.id}:${state}:${outage.reason}`, durable: true }) },
-      }));
+      }), alarmEnv);
       await sink({ label: "resident unhosted", state, sinceMs: outage.since, durationMs: Math.max(0, Date.now() - outage.since) });
     } finally { mesh.closeState(); }
   } catch (error) { unhostedDiagnostic(root, error); }

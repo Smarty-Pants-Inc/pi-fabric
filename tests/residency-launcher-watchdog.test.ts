@@ -80,10 +80,10 @@ class FakeChild extends EventEmitter {
   }
 }
 
-const fixture = (settings: ResidentHostConfig["watchdog"] = {}, alwaysStall = false, noLease = false, actorCount = 1) => {
+const fixture = (settings: ResidentHostConfig["watchdog"] = {}, alwaysStall = false, noLease = false, actorCount = 1, rootId = "fixture-root") => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "launcher-wedge-unit-"));
   const config = { cwd: root, piBinary: path.join(root, "fixture.mjs"), residencyRoot: root,
-    rootId: "fixture-root", sessionId: "fixture-session", meshRoot: path.join(root, "mesh"), actorRoot: path.join(root, "actors"),
+    rootId, sessionId: "fixture-session", meshRoot: path.join(root, "mesh"), actorRoot: path.join(root, "actors"),
     mesh: { actorScope: "project", maxEventBytes: 64 * 1024, maxReadEvents: 100, stateBackend: "file" },
     watchdog: { intervalMs: 50, stallMs: 100, coldStartMs: 0, ...settings } } as ResidentHostConfig;
   fs.mkdirSync(config.actorRoot);
@@ -298,6 +298,24 @@ describe.skipIf(process.platform === "win32")("launcher resident-unhosted alarm"
       expect(alarms(f)).toEqual([]);
       publish.mockRestore(); await vi.advanceTimersByTimeAsync(300_000); await settleAlarms();
       expect(alarms(f)).toEqual([]); // Persisted attempt is not a delivery receipt; stderr is the fallback.
+    } finally { await f.close(); }
+  }, 20_000);
+
+  it.each([
+    { configured: "", lead: "", expected: "session:aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee" },
+    { configured: "", lead: ALARM_TO, expected: ALARM_TO },
+    { configured: ALARM_TO, lead: "session:99999999-8888-4777-8666-555555555555", expected: ALARM_TO },
+    { configured: "org", lead: "", expected: undefined },
+  ])("routes to the root session only when the existing env targets are absent ($configured, $lead)", async ({ configured, lead, expected }) => {
+    alarmClock(); vi.stubEnv("PI_FABRIC_MESH_ALARM_TO", configured); vi.stubEnv("SMARTY_LEAD_SESSION", lead);
+    const f = fixture({}, true, false, 1, "session:aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee");
+    try {
+      await vi.advanceTimersByTimeAsync(500);
+      await vi.advanceTimersByTimeAsync(outage(f).since + 300_000 - Date.now()); await settleAlarms();
+      expect(alarms(f)).toEqual(expected ? [expect.objectContaining({ to: expected,
+        data: expect.objectContaining({ root: f.config.rootId, state: "outage" }) })] : []);
+      expect(process.env.PI_FABRIC_MESH_ALARM_TO).toBe(configured);
+      expect(process.env.SMARTY_LEAD_SESSION).toBe(lead); // Fallback must not mutate process-wide routing.
     } finally { await f.close(); }
   }, 20_000);
 

@@ -43,12 +43,13 @@ describe("Path B NATS grants", () => {
     expect(template.sub.allow).toEqual(["_INBOX.{{subject()}}.>"]);
   });
 
-  it("gives the operator read and relay rights without stream lifecycle authority", () => {
+  it("gives the operator metadata and fixed advisory rights without reads, relays or lifecycle authority", () => {
     const template = pathBRoleTemplate("maintainer", PATH_B_OPERATOR_MACHINE, ["ryzen2"]);
     expect(mayPublish(template, "$JS.API.STREAM.CREATE.FABRIC_IN_ryzen2")).toBe(false);
     expect(mayPublish(template, "$JS.API.STREAM.UPDATE.FABRIC_ADV")).toBe(false);
     expect(mayPublish(template, "$JS.API.STREAM.INFO.FABRIC_IN_ryzen2")).toBe(true);
-    expect(mayPublish(template, `$JS.ACK.FABRIC_ADV.${PATH_B_ADVISORY_DURABLE}.1.1`)).toBe(true);
+    expect(mayPublish(template, `$JS.ACK.FABRIC_ADV.${PATH_B_ADVISORY_DURABLE}.1.1`)).toBe(false);
+    expect(template.pub.deny).toContain("$JS.ACK.>");
     expect(mayPublish(template, `$JS.API.CONSUMER.INFO.FABRIC_ADV.${PATH_B_ADVISORY_DURABLE}`)).toBe(true);
     expect(mayPublish(template, `$JS.API.CONSUMER.MSG.NEXT.FABRIC_ADV.${PATH_B_ADVISORY_DURABLE}`)).toBe(true);
     for (const subject of [
@@ -60,7 +61,11 @@ describe("Path B NATS grants", () => {
     ]) expect(mayPublish(template, subject), subject).toBe(false);
     expect(mayPublish(template, "$JS.API.STREAM.DELETE.FABRIC_IN_ryzen2")).toBe(false);
     expect(mayPublish(template, "$JS.API.STREAM.PURGE.FABRIC_EV")).toBe(false);
-    expect(mayPublish(template, "fabric.in.ryzen2.owner.ack.target.fabric-ops")).toBe(true);
+    expect(mayPublish(template, "fabric.in.ryzen2.owner.ack.target.fabric-ops")).toBe(false);
+    expect(mayPublish(template, "$JS.API.CONSUMER.INFO.FABRIC_IN_ryzen2.rt_owner")).toBe(true);
+    expect(mayPublish(template, "$JS.API.STREAM.MSG.GET.FABRIC_IN_ryzen2")).toBe(false);
+    expect(mayPublish(template, "$JS.API.STREAM.MSG.GET.KV_fabric_leases")).toBe(false);
+    expect(mayPublish(template, "fabric.ev.fabric-ops.fabric.ops.dlq")).toBe(false);
     expect(mayPublish(template, "fabric.in.ryzen4.owner.ack.target.fabric-ops")).toBe(false);
     expect(mayPublish(template, "fabric.in.ryzen2.owner.ack.target.ryzen1")).toBe(false);
     expect(mayPublish(template, "fabric.in.ryzen2.owner.cmd.target.fabric-ops")).toBe(false);
@@ -72,7 +77,7 @@ describe("Path B NATS grants", () => {
     expect(() => pathBRoleTemplate("agent", "ryzen.1")).toThrow("invalid machine");
     expect(() => pathBRoleTemplate("agent", PATH_B_OPERATOR_MACHINE)).toThrow("invalid machine");
     expect(() => pathBRoleTemplate("agent", "fabric-ops-canary")).toThrow("invalid machine");
-    expect(pathBRoleTemplate("maintainer", "fabric-ops-canary", ["ryzen2"]).pub.allow).toContain("fabric.in.ryzen2.*.ack.*.fabric-ops-canary");
+    expect(pathBRoleTemplate("maintainer", "fabric-ops-canary", ["ryzen2"]).pub.allow).toContain("$JS.API.CONSUMER.MSG.NEXT.FABRIC_ADV.transport_dlq_operator");
     expect(() => pathBRoleTemplate("maintainer", "ryzen1", ["ryzen2"])).toThrow("invalid machine");
     const first = pathBRoleTemplate("agent");
     first.pub.allow.push("fabric.in.>");

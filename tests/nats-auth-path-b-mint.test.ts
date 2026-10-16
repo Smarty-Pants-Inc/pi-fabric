@@ -121,11 +121,13 @@ describe("Path B opt-in mint policy", () => {
       expect(operator.template.pub.allow.some((subject: string) => subject.startsWith(`$JS.API.STREAM.${verb}.`))).toBe(false);
     }
     expect(operator.template.pub.allow).not.toContain("$JS.ACK.FABRIC_IN_ryzen2.>");
-    expect(operator.template.pub.allow).toContain("$JS.ACK.FABRIC_ADV.transport_dlq_operator.>");
+    expect(operator.template.pub.allow.some((subject: string) => subject.startsWith("$JS.ACK."))).toBe(false);
+    expect(operator.template.pub.deny).toContain("$JS.ACK.>");
     expect(operator.template.pub.allow.some((subject: string) => /^\$JS\.API\.CONSUMER\.(CREATE|DELETE)\./.test(subject))).toBe(false);
-    expect(operator.template.pub.allow).toContain("$JS.API.STREAM.MSG.GET.FABRIC_IN_ryzen2");
-    expect(operator.template.pub.allow).toContain("fabric.in.ryzen2.*.ack.*.{{tag(machine)}}");
-    expect(operator.template.pub.allow).toContain("fabric.in.ryzen4.*.ack.*.{{tag(machine)}}");
+    expect(operator.template.pub.allow).not.toContain("$JS.API.STREAM.MSG.GET.FABRIC_IN_ryzen2");
+    expect(operator.template.pub.allow).toContain("$JS.API.CONSUMER.INFO.FABRIC_IN_ryzen2.>");
+    expect(operator.template.pub.allow).not.toContain("fabric.in.ryzen2.*.ack.*.{{tag(machine)}}");
+    expect(operator.template.pub.allow).not.toContain("fabric.in.ryzen4.*.ack.*.{{tag(machine)}}");
     expect(operator.template.pub.allow).not.toContain("fabric.in.*.*.ack.*.{{tag(machine)}}");
     const { machine: omitted, ...withoutMachine } = input;
     expect(omitted).toBeDefined();

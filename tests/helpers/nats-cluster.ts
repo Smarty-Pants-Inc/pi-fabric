@@ -33,8 +33,20 @@ export interface PathBUsers {
   readonly bootstrap: PathBUser;
 }
 
+/** Test-only identity injection: broker/process/config ownership stays with this harness. */
+export interface PathBIdentity {
+  readonly operatorJwt: string;
+  readonly systemAccount: string;
+  readonly systemAccountJwt: string;
+  readonly appAccount: string;
+  readonly appAccountJwt: string;
+  readonly users: PathBUsers;
+}
+
 export interface PathBHarnessOptions {
   readonly binary?: string;
+  /** Issue real CLI artifacts without changing the default hand-built fault-injection fixture. */
+  readonly identityFactory?: (root: string) => PathBIdentity | Promise<PathBIdentity>;
   /** Deliberately misissued grants for fail-closed identity-check tests. */
   readonly additionalAgentPublish?: readonly string[];
 }
@@ -202,72 +214,80 @@ export class PathBHarness {
     try {
       const listenPort = await freeLoopbackPort(used);
       const monitorPort = await freeLoopbackPort(used);
-      const operatorIdentity = pairOf(nkeys.createOperator());
-      const operatorSigning = pairOf(nkeys.createOperator());
-      const systemAccountPair = pairOf(nkeys.createAccount());
-      const appAccountPair = pairOf(nkeys.createAccount());
-      const agentSigning = pairOf(nkeys.createAccount());
-      const maintainerSigning = pairOf(nkeys.createAccount());
-      const bootstrapSigning = pairOf(nkeys.createAccount());
-      const machineA = pairOf(nkeys.createUser());
-      const machineB = pairOf(nkeys.createUser());
-      const maintainer = pairOf(nkeys.createUser());
-      const bootstrap = pairOf(nkeys.createUser());
-      pairs.push(operatorIdentity, operatorSigning, systemAccountPair, appAccountPair, agentSigning, maintainerSigning, bootstrapSigning, machineA, machineB, maintainer, bootstrap);
-      const now = Math.floor(Date.now() / 1_000);
-      const clock = { nowSeconds: () => Math.floor(Date.now() / 1_000) };
-      const systemAccount = systemAccountPair.getPublicKey();
-      const appAccount = appAccountPair.getPublicKey();
-      const operatorJwt = encodeOperatorJwt(
-        { name: "path-b-fixture", signingKeys: [operatorSigning.getPublicKey()], systemAccount },
-        signerOf(operatorIdentity),
-        clock,
-      );
-      const systemAccountJwt = encodeAccountJwt(
-        { name: "SYS", subject: systemAccount, signingKeys: [], limits: SYSTEM_LIMITS },
-        signerOf(operatorSigning),
-        clock,
-      );
-      const agentTemplate = pathBRoleTemplate("agent", "{{tag(machine)}}", PATH_B_MACHINES);
-      const scopedKeys: ScopedSigningKey[] = [
-        { key: agentSigning.getPublicKey(), role: "agent", template: { ...agentTemplate, pub: { ...agentTemplate.pub, allow: [...agentTemplate.pub.allow, ...(options.additionalAgentPublish ?? [])] } } },
-        {
-          key: maintainerSigning.getPublicKey(),
-          role: "maintainer",
-          template: pathBRoleTemplate("maintainer", PATH_B_OPERATOR_MACHINE, PATH_B_MACHINES),
-        },
-        {
-          key: bootstrapSigning.getPublicKey(),
-          role: "maintainer",
-          template: { pub: { allow: [">"], deny: [] }, sub: { allow: ["_INBOX.{{subject()}}.>"] } },
-        },
-      ];
-      const appAccountJwt = encodeAccountJwt(
-        { name: "path-b-app", subject: appAccount, signingKeys: scopedKeys, limits: ACCOUNT_LIMITS },
-        signerOf(operatorSigning),
-        clock,
-      );
-      const user = (pair: KeyPair, machine: PathBUser["machine"], signer: KeyPair, role: "agent" | "maintainer", name: string, fileName: string): PathBUser => {
-        const jwt = encodeUserJwt(
-          {
-            name,
-            subject: pair.getPublicKey(),
-            issuerAccount: appAccount,
-            tags: [`role:${role}`, `machine:${machine}`],
-            expiresAt: now + 3_600,
-          },
-          signerOf(signer),
+      const createIdentity = async (): Promise<PathBIdentity> => {
+        if (options.identityFactory) return options.identityFactory(root);
+        const operatorIdentity = pairOf(nkeys.createOperator());
+        const operatorSigning = pairOf(nkeys.createOperator());
+        const systemAccountPair = pairOf(nkeys.createAccount());
+        const appAccountPair = pairOf(nkeys.createAccount());
+        const agentSigning = pairOf(nkeys.createAccount());
+        const maintainerSigning = pairOf(nkeys.createAccount());
+        const bootstrapSigning = pairOf(nkeys.createAccount());
+        const machineA = pairOf(nkeys.createUser());
+        const machineB = pairOf(nkeys.createUser());
+        const maintainer = pairOf(nkeys.createUser());
+        const bootstrap = pairOf(nkeys.createUser());
+        pairs.push(operatorIdentity, operatorSigning, systemAccountPair, appAccountPair, agentSigning, maintainerSigning, bootstrapSigning, machineA, machineB, maintainer, bootstrap);
+        const now = Math.floor(Date.now() / 1_000);
+        const clock = { nowSeconds: () => Math.floor(Date.now() / 1_000) };
+        const systemAccount = systemAccountPair.getPublicKey();
+        const appAccount = appAccountPair.getPublicKey();
+        const operatorJwt = encodeOperatorJwt(
+          { name: "path-b-fixture", signingKeys: [operatorSigning.getPublicKey()], systemAccount },
+          signerOf(operatorIdentity),
           clock,
         );
-        const credsPath = path.join(root, fileName);
-        fs.writeFileSync(credsPath, formatUserCreds(jwt, pair.getSeed()), { flag: "wx", mode: 0o600 });
-        fs.chmodSync(credsPath, 0o600);
-        return { machine, publicKey: pair.getPublicKey(), credsPath };
+        const systemAccountJwt = encodeAccountJwt(
+          { name: "SYS", subject: systemAccount, signingKeys: [], limits: SYSTEM_LIMITS },
+          signerOf(operatorSigning),
+          clock,
+        );
+        const agentTemplate = pathBRoleTemplate("agent", "{{tag(machine)}}", PATH_B_MACHINES);
+        const scopedKeys: ScopedSigningKey[] = [
+          { key: agentSigning.getPublicKey(), role: "agent", template: { ...agentTemplate, pub: { ...agentTemplate.pub, allow: [...agentTemplate.pub.allow, ...(options.additionalAgentPublish ?? [])] } } },
+          {
+            key: maintainerSigning.getPublicKey(),
+            role: "maintainer",
+            template: pathBRoleTemplate("maintainer", PATH_B_OPERATOR_MACHINE, PATH_B_MACHINES),
+          },
+          {
+            key: bootstrapSigning.getPublicKey(),
+            role: "maintainer",
+            template: { pub: { allow: [">"], deny: [] }, sub: { allow: ["_INBOX.{{subject()}}.>"] } },
+          },
+        ];
+        const appAccountJwt = encodeAccountJwt(
+          { name: "path-b-app", subject: appAccount, signingKeys: scopedKeys, limits: ACCOUNT_LIMITS },
+          signerOf(operatorSigning),
+          clock,
+        );
+        const user = (pair: KeyPair, machine: PathBUser["machine"], signer: KeyPair, role: "agent" | "maintainer", name: string, fileName: string): PathBUser => {
+          const jwt = encodeUserJwt(
+            {
+              name,
+              subject: pair.getPublicKey(),
+              issuerAccount: appAccount,
+              tags: [`role:${role}`, `machine:${machine}`],
+              expiresAt: now + 3_600,
+            },
+            signerOf(signer),
+            clock,
+          );
+          const credsPath = path.join(root, fileName);
+          fs.writeFileSync(credsPath, formatUserCreds(jwt, pair.getSeed()), { flag: "wx", mode: 0o600 });
+          fs.chmodSync(credsPath, 0o600);
+          return { machine, publicKey: pair.getPublicKey(), credsPath };
+        };
+        const machineAUser = user(machineA, "machine-a", agentSigning, "agent", "agent/path-b/machine-a", "machine-a.creds");
+        const machineBUser = user(machineB, "machine-b", agentSigning, "agent", "agent/path-b/machine-b", "machine-b.creds");
+        const maintainerUser = user(maintainer, PATH_B_OPERATOR_MACHINE, maintainerSigning, "maintainer", "maintainer/path-b", "maintainer.creds");
+        const bootstrapUser = user(bootstrap, PATH_B_OPERATOR_MACHINE, bootstrapSigning, "maintainer", "bootstrap/path-b", "bootstrap.creds");
+        return {
+          operatorJwt, systemAccount, systemAccountJwt, appAccount, appAccountJwt,
+          users: { machineA: machineAUser, machineB: machineBUser, maintainer: maintainerUser, bootstrap: bootstrapUser },
+        };
       };
-      const machineAUser = user(machineA, "machine-a", agentSigning, "agent", "agent/path-b/machine-a", "machine-a.creds");
-      const machineBUser = user(machineB, "machine-b", agentSigning, "agent", "agent/path-b/machine-b", "machine-b.creds");
-      const maintainerUser = user(maintainer, PATH_B_OPERATOR_MACHINE, maintainerSigning, "maintainer", "maintainer/path-b", "maintainer.creds");
-      const bootstrapUser = user(bootstrap, PATH_B_OPERATOR_MACHINE, bootstrapSigning, "maintainer", "bootstrap/path-b", "bootstrap.creds");
+      const { operatorJwt, systemAccount, systemAccountJwt, appAccount, appAccountJwt, users } = await createIdentity();
       const storeDir = path.join(root, "store");
       const resolverDir = path.join(root, "resolver");
       fs.mkdirSync(storeDir, { mode: 0o700 });
@@ -291,7 +311,7 @@ export class PathBHarness {
         root,
         serverUrl: `nats://127.0.0.1:${listenPort}`,
         monitorUrl: `http://127.0.0.1:${monitorPort}`,
-        users: { machineA: machineAUser, machineB: machineBUser, maintainer: maintainerUser, bootstrap: bootstrapUser },
+        users,
         configText,
         binary,
       });

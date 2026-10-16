@@ -96,6 +96,10 @@ describe("skill reference guidance", () => {
     ).toBeUndefined();
   });
 
+  it("ignores non-string prompts", () => {
+    expect(buildSkillReferenceGuidance(undefined, skills)).toBeUndefined();
+  });
+
   it("ignores ordinary prompts and malformed expanded blocks", () => {
     expect(buildSkillReferenceGuidance("Run /grilling", skills)).toBeUndefined();
     expect(

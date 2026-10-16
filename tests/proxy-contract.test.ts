@@ -33,6 +33,11 @@ describe("proxy contract reminder", () => {
     expect(isRewritableCapturedToolName("grep")).toBe(false);
   });
 
+  it("ignores non-string skill text", () => {
+    expect(extractSkillRegions(undefined)).toBe("");
+    expect(proxyContractMentionsInSkills(undefined, "", ["fovea_focus"])).toEqual([]);
+  });
+
   it("reads bare names only from skill envelopes, not from user prose", () => {
     const names = ["fovea_sketch", "fovea_focus", "fovea_dwell", "fovea_impact"];
     const prompt = ["survey this repo before I touch auth", foveaSkill].join("\n");

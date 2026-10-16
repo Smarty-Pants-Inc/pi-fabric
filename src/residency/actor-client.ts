@@ -20,6 +20,7 @@ import {
   type ResidentHostOwner,
   assertResidentActorToolCeiling,
   type ResidentActorCaller,
+  type ResidentRouterCaller,
   ResidentOutcomeUnknownError,
   readResidentRequestDecision,
   registerResidentCancellation,
@@ -124,7 +125,7 @@ export class ResidentActorClient {
     return response.slotStatus;
   }
 
-  async createActor(request: FabricActorCreateRequest, signal?: AbortSignal, caller?: ResidentActorCaller, onDispatched?: () => void): Promise<FabricActorInfo> {
+  async createActor(request: FabricActorCreateRequest, signal?: AbortSignal, caller?: ResidentActorCaller, onDispatched?: () => void, routerCaller?: ResidentRouterCaller): Promise<FabricActorInfo> {
     const { idempotencyKey, ...creationRequest } = request;
     const response = await this.#send({
       format: RESIDENT_HOST_FORMAT,
@@ -134,6 +135,7 @@ export class ResidentActorClient {
       rootId: this.#rootId,
       request: creationRequest,
       ...(caller ? { caller } : {}),
+      ...(routerCaller ? { routerCaller: { ...routerCaller } } : {}),
       createdAt: Date.now(),
     }, signal, onDispatched);
     if (!response.actor) throw new Error("Resident host returned no actor from createActor");

@@ -590,8 +590,10 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   processStopPending?: boolean;
   /** Windows settlement retains native admission until captured close and any stop join. */
   nativeReleasePending?: Promise<void>;
-  /** Native-close settlement owns RUN release, including after its join ends uncertain. */
+  /** Native-close settlement owns RUN release until joined or host-reconciled. */
   nativeAdmissionFenced?: boolean;
+  /** Exact captured join rejected or exhausted its close/stop bound; fresh host proof may release RUN only. */
+  nativeAdmissionReconcile?: AgentTransportHandle;
   /**
    * Its owner gave it up (a stopped or removed actor): nobody wants its result, so a worker that
    * dies is not relaunched and the run ends failed (smarty-dev#2184 item 8b). A caller that only
@@ -2747,13 +2749,16 @@ export class AgentManager {
     for (const managed of this.#runs.values()) {
       // A replacement may already be creating a worker while transport still names
       // the old attempt. Its death cannot discharge the replacement's admission.
-      // A normal Windows settlement already assigned release to its native-close/stop
-      // join. Primary death cannot bypass that join, even after it ends uncertain.
-      if (!managed.actorId || managed.relaunchPending || managed.nativeAdmissionFenced || !managed.admissionRelease) continue;
+      // A normal Windows settlement owns release until its captured close/stop
+      // joins. Rejection or the existing close bound permits reconciliation, not
+      // release: every later scan must re-establish fresh host-owned death proof.
+      if (!managed.actorId || managed.relaunchPending || !managed.admissionRelease) continue;
+      const nativeFenced = managed.nativeAdmissionFenced;
+      if (nativeFenced && managed.nativeAdmissionReconcile !== managed.transport) continue;
       // Every proof-triggered scan (close, admission, or native debt) can beat
       // the monitor's next status read. Establish terminal ownership here too,
       // before host primary-death proof can bypass its captured native join.
-      if (this.#fenceNativeTerminalAdmission(managed) || !this.#actorWorkerGone(managed)) continue;
+      if ((!nativeFenced && this.#fenceNativeTerminalAdmission(managed)) || !this.#actorWorkerGone(managed, nativeFenced)) continue;
       const permit = managed.admissionRelease;
       delete managed.heldPermit;
       permit();
@@ -5395,13 +5400,15 @@ export class AgentManager {
     this.#terminalNoticeOutbox.route(managed.runDirectory);
   }
 
-  #actorWorkerGone(managed: ManagedAgent): boolean {
+  #actorWorkerGone(managed: ManagedAgent, recheck = false): boolean {
     if (!managed.actorId || managed.hosted || managed.transport.kind !== "process" || !managed.ownProcess) return false;
     // ownProcess is absent throughout replacement creation, and stays absent
     // after an UNKNOWN launch. Even cached old proof has no authority in that gap.
     const transport = managed.transport;
     const identity = this.#workerIdentities.get(transport);
     if (!identity || managed.ownProcess.pid !== identity.pid || !Number.isSafeInteger(identity.pid) || identity.pid <= 1 || identity.pid === process.pid) return false;
+    // A proof collected before native reconciliation cannot discharge its join.
+    if (recheck) delete managed.workerGone;
     if (managed.workerGone === transport) return true;
     try { process.kill(identity.pid, 0); }
     catch (error) {
@@ -5421,8 +5428,8 @@ export class AgentManager {
     const candidate = record ?? readRecord(managed.statusFile);
     if (candidate?.id !== managed.id || !terminalWorkerResult(candidate)) return false;
     // Existing lost-worker/debt custody keeps its intentional RUN-only proof
-    // path. A normal terminal path, once claimed, stays fenced even if its
-    // captured native close/stop join subsequently becomes uncertain.
+    // path. A normal terminal path stays fenced until the captured close/stop
+    // joins or a rejected/bounded join is reconciled with fresh host proof.
     managed.nativeAdmissionFenced = true;
     return true;
   }
@@ -5720,21 +5727,39 @@ export class AgentManager {
       const processStop = managed.processStop;
       const release = managed.release;
       managed.release = () => {
+        let timer: ReturnType<typeof setTimeout> | undefined;
         const pending = Promise.resolve().then(async () => {
-          await transport.waitForClose!();
-          await processStop;
-          if (managed.transport !== transport) return;
-          // Stop may have begun after settlement, while native close was pending.
-          await managed.processStop;
-          if (managed.transport !== transport) return;
+          // Native events drive the normal path. One safety-net deadline uses
+          // the existing stop/close budget; a hung join cannot hide RUN forever.
+          const joined = await Promise.race([
+            (async () => {
+              await transport.waitForClose!();
+              await processStop;
+              if (managed.transport !== transport) return false;
+              // Stop may have begun after settlement, while native close was pending.
+              await managed.processStop;
+              return managed.transport === transport;
+            })(),
+            new Promise<never>((_, reject) => {
+              timer = setTimeout(() => reject(new Error("Worker exit confirmation timed out")), TRANSPORT_EXIT_GRACE_MS * 7);
+            }),
+          ]);
+          if (timer) clearTimeout(timer);
+          if (!joined) return;
           await this.#noteUnconfirmedExit(managed);
           if (managed.transport === transport && !managed.lostContact) {
             fs.rmSync(path.join(managed.runDirectory, "images.json"), { force: true });
             release();
           }
         }).catch(error => {
-          if (managed.transport === transport) this.#markLost(managed, error instanceof Error ? error.message : String(error));
+          if (managed.transport === transport) {
+            // Eligibility is not proof. #markLost scans the same host PID/birth
+            // path now, and subsequent admission/native events retry if alive.
+            managed.nativeAdmissionReconcile = transport;
+            this.#markLost(managed, error instanceof Error ? error.message : String(error));
+          }
         }).finally(() => {
+          if (timer) clearTimeout(timer);
           if (managed.nativeReleasePending === pending) delete managed.nativeReleasePending;
           this.#retentionRevision++;
         });

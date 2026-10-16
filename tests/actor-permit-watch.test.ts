@@ -259,6 +259,198 @@ function deferredRetry() {
   return { calls, release };
 }
 
+// Test-side statement of the existing manager stop/close contract, NOT a
+// shortened product timeout (manager.ts: TRANSPORT_EXIT_GRACE_MS * 7).
+const TRANSPORT_EXIT_GRACE_MS = 1_000;
+const nativeJoinBoundMs = TRANSPORT_EXIT_GRACE_MS * 7;
+type NativeJoin = "close" | "stop";
+function joinGate() {
+  let resolve!: () => void;
+  let reject!: (error: Error) => void;
+  const promise = new Promise<void>((done, fail) => { resolve = done; reject = fail; });
+  return { promise, resolve, reject };
+}
+
+// Leave polling, snapshot I/O and vi.waitFor on REAL timers. Only the exact
+// native 7000 ms deadline is deliverable by this clock; no broad timer advance.
+function nativeJoinClock() {
+  const schedule = globalThis.setTimeout;
+  const cancel = globalThis.clearTimeout;
+  const started = Date.now();
+  let now = started;
+  const deadlines = new Map<ReturnType<typeof setTimeout>, () => void>();
+  const date = vi.spyOn(Date, "now").mockImplementation(() => now);
+  const timeout = vi.spyOn(globalThis, "setTimeout").mockImplementation(((
+    callback: (...args: unknown[]) => void, milliseconds?: number, ...args: unknown[]
+  ) => {
+    if (milliseconds !== nativeJoinBoundMs) return schedule(callback, milliseconds, ...args);
+    const timer = schedule(() => { deadlines.delete(timer); callback(...args); }, milliseconds);
+    deadlines.set(timer, () => { cancel(timer); deadlines.delete(timer); callback(...args); });
+    return timer;
+  }) as typeof setTimeout);
+  const clear = vi.spyOn(globalThis, "clearTimeout").mockImplementation(timer => {
+    deadlines.delete(timer as ReturnType<typeof setTimeout>);
+    cancel(timer);
+  });
+  return {
+    beforeBound: () => { now = started + nativeJoinBoundMs - 1; },
+    expire: () => {
+      now = started + nativeJoinBoundMs;
+      // Snapshot: callbacks may schedule other work, which is NOT auto-fired.
+      for (const deliver of [...deadlines.values()]) deliver();
+    },
+    restore: () => {
+      for (const timer of deadlines.keys()) cancel(timer);
+      deadlines.clear();
+      clear.mockRestore(); timeout.mockRestore(); date.mockRestore();
+    },
+  };
+}
+
+// Normal terminal settlement captures BOTH independent native obligations. A
+// stop ACK can carry stopDebt, just like the native transport; it is not a
+// whole-tree exit receipt. Only the first worker's first stop is gated.
+async function withTerminalJoins(
+  fault: NativeJoin,
+  priorGone: boolean,
+  check: (context: {
+    f: Fixture; actor: Awaited<ReturnType<typeof create>>; first: Worker;
+    next: Awaited<ReturnType<typeof blockedSuccessor>>;
+    third: Awaited<ReturnType<typeof create>>; thirdAnswer: ReturnType<ActorManager["ask"]>;
+    close: ReturnType<typeof joinGate>; stop: ReturnType<typeof joinGate>;
+    calls: string[]; scan: () => void; clock: ReturnType<typeof nativeJoinClock>;
+    stopping: Promise<unknown>;
+  }) => Promise<void>,
+) {
+  const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+  const launch = vi.mocked(ProcessTransport.prototype.launch).getMockImplementation()!;
+  const close = joinGate(), stop = joinGate();
+  const calls: string[] = [];
+  let firstPid: number | undefined;
+  let stopCaptured = false;
+  let draining = false;
+  vi.mocked(ProcessTransport.prototype.launch).mockImplementation(async request => {
+    const handle = await launch(request);
+    const worker = workers.get(Number(handle.sessionId))!;
+    firstPid ??= worker.pid;
+    if (worker.pid !== firstPid) return handle;
+    worker.closeJoin = close.promise;
+    return { ...handle,
+      waitForClose: async () => {
+        calls.push("close-started");
+        try { await handle.waitForClose!(); calls.push("close-joined"); }
+        catch (error) { calls.push("close-rejected"); throw error; }
+      },
+      stop: async () => {
+        if (draining || stopCaptured) return handle.stop();
+        stopCaptured = true;
+        calls.push("stop-started");
+        try { await stop.promise; calls.push("stop-joined"); }
+        catch (error) { calls.push("stop-rejected"); throw error; }
+      },
+    };
+  });
+  const f = fixture();
+  let first: Worker | undefined;
+  let stopping: Promise<unknown> | undefined;
+  let clock: ReturnType<typeof nativeJoinClock> | undefined;
+  try {
+    Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+    const actor = await create(f, "terminal-native-reconciliation");
+    const answer = f.actors.ask(actor.id, "terminal result, independent captured native joins");
+    void answer.catch(() => undefined);
+    first = await launched(f, actor.id);
+    const next = await blockedSuccessor(f);
+    const third = await create(f, "terminal-native-second-successor");
+    const thirdAnswer = f.actors.ask(third.id, "must not launch on a duplicate old release");
+    void thirdAnswer.catch(() => undefined);
+    await eventually(() => expect(snapshot(f).waiting).toHaveLength(2));
+
+    clock = nativeJoinClock();
+    first.alive = false;
+    first.identityAlive = !priorGone;
+    save(first, { status: "completed", text: "finished", finishedAt: Date.now(), updatedAt: Date.now(), exitCode: 0 });
+    await eventually(() => expect(first!.closeStarted).toBe(true));
+    await expect(answer).resolves.toMatchObject({ text: "finished" });
+    // Passive close is distinct from the gated waitForClose receipt.
+    first.nativeClose();
+    stopping = f.agents.stop(first.launch.id, { consume: false });
+    void stopping.catch(() => undefined);
+    await eventually(() => expect(calls).toContain("stop-started"));
+    expect(calls).toContain("close-started");
+    if (fault === "stop") {
+      close.resolve();
+      await eventually(() => expect(first!.closeJoined).toBe(true));
+    }
+    // Debt appears AFTER normal terminal admission has captured both joins.
+    // Neither a rejected join nor primary death can erase this tree custody.
+    first.descendants = true;
+    first.debt = "recorded native tree close unconfirmed";
+    if (fault === "close") {
+      stop.resolve();
+      await stopping;
+    }
+    expect(workers.size).toBe(1);
+    expect(snapshot(f).held.map(held => held.runId)).toEqual([first.launch.id]);
+    expect(snapshot(f).waiting).toHaveLength(2);
+    const scan = () => first!.launch.onUnconfirmedExit!(first!.debt ?? "recorded late native observation");
+    expect(first.launch.onUnconfirmedExit).toBeTypeOf("function");
+    await check({ f, actor, first, next, third, thirdAnswer, close, stop, calls, scan, clock, stopping });
+  } finally {
+    clock?.restore();
+    draining = true;
+    close.resolve();
+    stop.resolve();
+    if (first) { delete first.closeJoin; complete(first); }
+    await stopping?.catch(() => undefined);
+    try {
+      // A RED leaked fence must not strand the real queued actor receipts.
+      for (const waiting of snapshot(f).waiting) await f.agents.stop(waiting.runId, { consume: false }).catch(() => undefined);
+    } finally { Object.defineProperty(process, "platform", platform); }
+  }
+}
+
+async function reconciledExactlyOnce(
+  context: Parameters<Parameters<typeof withTerminalJoins>[2]>[0], proofScansBefore: number,
+) {
+  const { f, actor, first, next, third, thirdAnswer, close, stop, scan, stopping } = context;
+  const second = await launched(f, next.actor.id);
+  // Check BEFORE retention queries, repeated scans or late explicit stops can
+  // themselves probe this PID and disguise a stale cached proof at release.
+  expect(first.primaryProofScans, "reconciliation must obtain fresh host proof before admission").toBeGreaterThan(proofScansBefore);
+  await eventually(() => expect(snapshot(f).waiting).toHaveLength(1));
+  expect(workers.size, "reconciliation admits only ONE of two queued successors").toBe(2);
+  expect(f.agents.heldPermits()).toBe(0);
+  expect(first.descendants).toBe(true);
+  expect(first.debt).toBeDefined();
+  expect(f.agents.retentionCustodyVeto(first.launch.id)).toBe(true);
+  expect(f.agents.retentionCustodyVeto(actor.id)).toBe(true);
+  expect(f.agents.status(first.launch.id).status).toBe("completed");
+
+  scan(); scan();
+  // Now supply the separate tree exit/late successful join, not merely RUN
+  // proof. Its settlement/stop continuations must not release admission twice.
+  first.descendants = false;
+  delete first.debt;
+  close.resolve(); stop.resolve();
+  await stopping.catch(() => undefined);
+  first.nativeClose(); first.nativeClose();
+  await f.agents.stop(first.launch.id, { consume: false });
+  await f.agents.stop(first.launch.id, { consume: false });
+  scan(); scan();
+  await observe();
+  expect(workers.size, "late joins and repeated proof cannot discharge old RUN twice").toBe(2);
+  expect(snapshot(f).held.map(held => held.runId)).toEqual([second.launch.id]);
+  expect(snapshot(f).waiting).toHaveLength(1);
+  complete(second);
+  await expect(next.answer).resolves.toMatchObject({ text: "finished" });
+  const last = await launched(f, third.id);
+  expect(workers.size).toBe(3);
+  complete(last);
+  await expect(thirdAnswer).resolves.toMatchObject({ text: "finished" });
+  await eventually(() => expect(snapshot(f).held).toEqual([]));
+}
+
 describe("actor worker permit release (#9031)", () => {
   it.each(["absent", "reused"] as const)("host-proven %s worker releases real admission and launches the next activation", async mode => {
     const f = fixture();
@@ -746,10 +938,7 @@ describe("actor worker permit release (#9031)", () => {
     }
   });
 
-  it.each([
-    ["confirmed", "ESRCH"],
-    ["uncertain", "different-birth"],
-  ] as const)("Windows terminal %s close keeps RUN fenced across %s primary-death proof until the captured native close joins", async (closeOutcome, primaryProof) => {
+  it.each(["ESRCH", "different-birth"] as const)("Windows terminal confirmed close keeps RUN fenced across %s primary-death proof until the captured native close joins", async primaryProof => {
     const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
     const f = fixture();
     let first: Worker | undefined;
@@ -781,40 +970,14 @@ describe("actor worker permit release (#9031)", () => {
       expect(first.closeStarted).toBe(true);
       await expect(answer).resolves.toMatchObject({ text: "finished" });
 
-      if (closeOutcome === "confirmed") {
-        first.nativeClose();
-        await eventually(() => expect(first!.closeJoined).toBe(true));
-        const second = await launched(f, next.actor.id);
-        expect(workers.size, "confirmed native close admits exactly one successor").toBe(2);
-        expect([...workers.values()].filter(worker => worker.launch.id === second.launch.id)).toHaveLength(1);
-        complete(second);
-        await expect(next.answer).resolves.toMatchObject({ text: "finished" });
-        await eventually(() => expect(snapshot(f).held).toEqual([]));
-      } else {
-        // Repeated host-proof scans and a late uncertain captured close must
-        // not erase the terminal path's persistent native-admission fence.
-        first.debt = "native tree close unconfirmed";
-        const scan = first.launch.onUnconfirmedExit!;
-        expect(scan).toBeTypeOf("function");
-        scan(first.debt);
-        scan(first.debt);
-        await observe();
-        expect(first.closeJoined).toBe(false);
-        expect(snapshot(f).held.map(held => held.runId)).toEqual([first.launch.id]);
-        expect(snapshot(f).waiting).toHaveLength(1);
-        expect(workers.size).toBe(1);
-
-        first.nativeClose();
-        scan(first.debt);
-        scan(first.debt);
-        await observe();
-        expect(first.closeJoined, "uncertain close is not joined custody").toBe(false);
-        expect(f.agents.retentionCustodyVeto(first.launch.id)).toBe(true);
-        expect(f.agents.heldPermits()).toBe(1);
-        expect(snapshot(f).held.map(held => held.runId)).toEqual([first.launch.id]);
-        expect(snapshot(f).waiting).toHaveLength(1);
-        expect(workers.size, "late uncertain close cannot launch the queued successor").toBe(1);
-      }
+      first.nativeClose();
+      await eventually(() => expect(first!.closeJoined).toBe(true));
+      const second = await launched(f, next.actor.id);
+      expect(workers.size, "confirmed native close admits exactly one successor").toBe(2);
+      expect([...workers.values()].filter(worker => worker.launch.id === second.launch.id)).toHaveLength(1);
+      complete(second);
+      await expect(next.answer).resolves.toMatchObject({ text: "finished" });
+      await eventually(() => expect(snapshot(f).held).toEqual([]));
     } finally {
       if (first) {
         first.alive = false;
@@ -829,6 +992,78 @@ describe("actor worker permit release (#9031)", () => {
       } finally { Object.defineProperty(process, "platform", platform); }
     }
   });
+
+  it.each(["close", "stop"] as const)("Windows terminal uncertain %s join reconciles fresh host death exactly once without releasing tree custody", async fault => {
+    await withTerminalJoins(fault, false, async context => {
+      const { f, first, close, stop, calls, scan } = context;
+      first.probeError = "EPERM";
+      first.birth = "67890"; // Birth mismatch cannot override an uncertain PID probe.
+      (fault === "close" ? close : stop).reject(new Error("recorded captured join uncertain"));
+      await eventually(() => expect(calls).toContain(`${fault}-rejected`));
+      scan(); scan();
+      await observe();
+      expect(snapshot(f).held.map(held => held.runId)).toEqual([first.launch.id]);
+      expect(snapshot(f).waiting).toHaveLength(2);
+      expect(workers.size).toBe(1);
+
+      delete first.probeError;
+      first.identityAlive = false;
+      const probes = first.primaryProofScans;
+      scan(); scan();
+      await reconciledExactlyOnce(context, probes);
+    });
+  }, 15_000);
+
+  it.each(["close", "stop"] as const)("Windows terminal hung %s join releases RUN once on fresh gone proof at the existing native deadline", async fault => {
+    await withTerminalJoins(fault, false, async context => {
+      const { f, first, clock, scan } = context;
+      first.identityAlive = false;
+      clock.beforeBound();
+      scan(); scan();
+      await observe();
+      expect(workers.size, "host death cannot bypass a still-pending captured join before 7000 ms").toBe(1);
+      expect(snapshot(f).held.map(held => held.runId)).toEqual([first.launch.id]);
+      expect(snapshot(f).waiting).toHaveLength(2);
+      const probes = first.primaryProofScans;
+      clock.expire(); // ONLY the actual native deadline callback, no external scan.
+      await reconciledExactlyOnce(context, probes);
+    });
+  }, 15_000);
+
+  it.each([
+    ["close", "alive", false], ["stop", "alive", false],
+    ["close", "alive", true], ["stop", "alive", true],
+    ["close", "unknown", true], ["stop", "unknown", true],
+  ] as const)("Windows terminal hung %s join re-probes %s host proof after the bound without a busy loop (prior gone=%s)", async (fault, proof, priorGone) => {
+    await withTerminalJoins(fault, priorGone, async context => {
+      const { f, first, clock, scan } = context;
+      first.identityAlive = true;
+      first.birth = proof === "alive" ? "12345" : "67890";
+      if (proof === "unknown") first.probeError = "EPERM";
+      const probes = first.primaryProofScans;
+      clock.expire();
+      await eventually(() => expect(first.primaryProofScans, "timeout must re-probe, not reuse a prior gone receipt").toBeGreaterThan(probes));
+      expect(workers.size).toBe(1);
+      expect(snapshot(f).held.map(held => held.runId)).toEqual([first.launch.id]);
+      expect(snapshot(f).waiting).toHaveLength(2);
+
+      const atBound = first.primaryProofScans;
+      scan(); // A later EXTERNAL event must retry the exact PID/birth proof.
+      await eventually(() => expect(first.primaryProofScans).toBeGreaterThan(atBound));
+      const afterExternalScan = first.primaryProofScans;
+      await observe();
+      expect(first.primaryProofScans, "alive/unknown reconciliation must not self-reschedule a proof loop").toBe(afterExternalScan);
+      expect(workers.size).toBe(1);
+      expect(snapshot(f).held.map(held => held.runId)).toEqual([first.launch.id]);
+      expect(snapshot(f).waiting).toHaveLength(2);
+
+      delete first.probeError;
+      first.identityAlive = false;
+      const beforeRecovery = first.primaryProofScans;
+      scan();
+      await reconciledExactlyOnce(context, beforeRecovery);
+    });
+  }, 15_000);
 
   it.each([
     ["ESRCH", false],

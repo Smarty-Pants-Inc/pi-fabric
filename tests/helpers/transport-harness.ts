@@ -1,8 +1,10 @@
 // Frozen CONTRACT-v2 §§1,3–5,7,11 + erratum E1. Test scaffolding, not a carrier implementation.
 // Keep reason: data safety and cross-machine trust-boundary fault tests.
-// No eager product, NATS, vitest, config, environment, filesystem or server setup imports.
+// Only lightweight port errors and E16a's existing fingerprint load eagerly; no carrier,
+// NATS, vitest, config, environment, filesystem or server setup imports.
 import { AsyncLocalStorage } from "node:async_hooks";
-import { createHash } from "node:crypto";
+import { controlBodyFingerprint } from "../../src/mesh/control-idempotency.js";
+import type { FabricControlCommand } from "../../src/topology/control-plane.js";
 import type { MeshIdentity } from "../../src/mesh/event-log.js";
 import type { FabricPrincipal } from "../../src/fabric-provenance.js";
 import type { FabricMessageSender } from "../../src/protocol.js";
@@ -36,7 +38,8 @@ export function identity(id = "session:transport-sender"): MeshIdentity {
   return { id, name: "transport-test", kind: "main" };
 }
 
-export interface CommandBody {
+type CommandSemantics = Pick<FabricControlCommand, "wakeCause" | "triggerTurn" | "priority" | "binding" | "bindingProvenance">;
+export interface CommandBody extends CommandSemantics {
   readonly version: 1;
   readonly commandId: string;
   readonly targetId: string;
@@ -48,7 +51,7 @@ export interface CommandBody {
   readonly message?: string;
   readonly data?: unknown;
 }
-export interface CommandOptions {
+export interface CommandOptions extends CommandSemantics {
   readonly id?: string;
   readonly to?: TransportOwner;
   readonly from?: MeshIdentity;
@@ -81,6 +84,11 @@ export function commandEnvelope(options: CommandOptions = {}): TransportEnvelope
       replyTo: options.replyTo ?? from.id, requestedAt: committedAt, deadlineAt: committedAt + timeoutMs,
       ...(options.message === undefined ? {} : { message: options.message }),
       ...(options.data === undefined ? {} : { data: options.data }),
+      ...(options.wakeCause === undefined ? {} : { wakeCause: options.wakeCause }),
+      ...(options.triggerTurn === undefined ? {} : { triggerTurn: options.triggerTurn }),
+      ...(options.priority === undefined ? {} : { priority: options.priority }),
+      ...(options.binding === undefined ? {} : { binding: options.binding }),
+      ...(options.bindingProvenance === undefined ? {} : { bindingProvenance: options.bindingProvenance }),
     })),
   };
 }
@@ -126,20 +134,41 @@ export function canonicalJson(value: unknown): string {
   };
   return encode(JSON.parse(wire));
 }
-/** §3.2 only. Unlike the legacy controlBodyFingerprint this INCLUDES ownerIncarnation.
- * Attempt timestamps/ids/routes are excluded; the principal comes from the captured envelope.
- * This is a test oracle, not an authorization decision or a transport-level dedupe rule.
+/** E16a supersedes §3.2's provisional field list. Use the SAME production canonical input
+ * and semantic projection, including its principal handling; no independent digest policy.
+ * Epoch/route authentication is separate. This oracle never authorizes or admits a command.
  */
-export function bodyDigest(body: Pick<CommandBody, "operation" | "targetId" | "ownerIncarnation" | "message" | "data">,
-  principal?: FabricPrincipal): string {
-  return createHash("sha256").update(canonicalJson({ operation: body.operation, targetId: body.targetId,
-    ownerIncarnation: body.ownerIncarnation, message: body.message, data: body.data, principal })).digest("hex");
+export function bodyDigest(body: unknown, principal?: FabricPrincipal): string {
+  return controlBodyFingerprint(body, principal);
 }
 
 const abortReason = (signal: AbortSignal): unknown => signal.reason ?? new Error("Transport harness aborted");
 const positiveDuration = (ms: number): void => {
   if (!Number.isFinite(ms) || ms <= 0 || ms > 2_147_483_647) throw new RangeError("A finite positive timeout is required");
 };
+/** A receipt deadline, never a polling interval. The underlying operation is still owned by
+ * its caller: timeout does not cancel it, return an iterator, or turn cleanup into success.
+ */
+export async function boundedReceipt<T>(receipt: Promise<T>, label: string, timeoutMs = 5_000): Promise<T> {
+  positiveDuration(timeoutMs);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([receipt, new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => reject(new Error(`bounded transport receipt deadline: ${label}`)), timeoutMs);
+    })]);
+  } finally { if (timer !== undefined) clearTimeout(timer); }
+}
+async function signalReceipt<T>(receipt: Promise<T>, signal: AbortSignal): Promise<T> {
+  signal.throwIfAborted();
+  let cancel: (() => void) | undefined;
+  try {
+    return await Promise.race([receipt, new Promise<never>((_resolve, reject) => {
+      cancel = () => reject(abortReason(signal));
+      signal.addEventListener("abort", cancel, { once: true });
+      if (signal.aborted) cancel();
+    })]);
+  } finally { if (cancel) signal.removeEventListener("abort", cancel); }
+}
 /** Event-driven, bounded observation; cancellation does NOT ack/nak in-hand deliveries. */
 export async function collectInbox(transport: FabricTransport, options: {
   readonly count: number; readonly timeoutMs?: number; readonly signal?: AbortSignal;
@@ -312,7 +341,8 @@ export interface StubKv extends TransportKv {
   /** Inject a watch gap: reset, fresh snapshot, exactly one ready. */
   resetWatches(): void;
 }
-const jsonCopy = <T>(value: T): T => JSON.parse(canonicalJson(value)) as T;
+// Carrier copies preserve JSON wire order; only controlBodyFingerprint canonicalizes policy input.
+const jsonCopy = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
 const matchesKvPrefix = (key: string, prefix: string): boolean => {
   const pattern = prefix.split("."), tokens = key.split(".");
   return pattern.every((token, index) => token === ">" ? index < tokens.length
@@ -599,16 +629,213 @@ export async function loadAdapterCases(specs: readonly AdapterSpec[]): Promise<A
   }
 }
 
+/** Scheduling/administrative probes only. All watch events come from B's NatsKvStore and
+ * the installed official ordered consumer, authenticated as the SAME machine as receiver.
+ * This is not an adapter override, a second watch engine, or a marker-after-data hold hook.
+ */
+export interface RealKvConsumptionProbe {
+  readonly store: TransportKv;
+  readonly created: Promise<void>;
+  release(): Promise<void>;
+  expiry(key: string, revision: number, signal: AbortSignal): Promise<number>;
+  close(): Promise<void>;
+}
+export interface RealKvReadiness {
+  reset(bucket: TransportBucket, prefix: string, signal: AbortSignal): Promise<void>;
+  holdConsumption(bucket: TransportBucket, prefix: string, signal: AbortSignal): Promise<RealKvConsumptionProbe>;
+}
+/** Actual factory carriers, retaining concrete FILE identity. Each NATS pair owns a fresh
+ * Path B server/keys/store. close() is always the actual port operation, without a
+ * pre-close iterator-return workaround for the superseded raw-consumer yield deadlock.
+ */
+export interface RealAdapterPair {
+  readonly sender: FabricTransport;
+  readonly receiver: FabricTransport;
+  readonly kvReadiness?: RealKvReadiness;
+  reopenReceiver(): Promise<FabricTransport>;
+  close(): Promise<void>;
+}
+export type RealAdapterPairResult =
+  | { readonly status: "ready"; readonly pair: RealAdapterPair }
+  | { readonly status: "skip"; readonly reason: string };
+
+export async function openRealAdapterPair(kind: "file" | "nats", required = false): Promise<RealAdapterPairResult> {
+  const unavailable = (reason: string): RealAdapterPairResult => {
+    if (required) throw new Error(`${kind} transport required: ${reason}`);
+    return { status: "skip", reason };
+  };
+  // Import B's fixture only on actual NATS use; no state-backend/admin carrier is involved.
+  const natsModule = kind === "nats" ? await import("./nats-cluster.js") : undefined;
+  const binary = natsModule?.resolveNatsBinary();
+  if (kind === "nats" && !binary) return unavailable("Path B real-server prerequisite missing: set absolute NATS_BIN");
+  const [{ mkdtempSync, rmSync }, { tmpdir }, { join }, { DEFAULT_FABRIC_CONFIG }, { MeshStore }] = await Promise.all([
+    import("node:fs"), import("node:os"), import("node:path"), import("../../src/config.js"), import("../../src/mesh/store.js"),
+  ]);
+  const root = mkdtempSync(join(tmpdir(), "fabric-transport-conformance-"));
+  const mesh = new MeshStore(root, DEFAULT_FABRIC_CONFIG.mesh.maxEventBytes, DEFAULT_FABRIC_CONFIG.mesh.maxReadEvents,
+    { stateBackend: "file", canWakeResidents: () => false });
+  let server: import("./nats-cluster.js").PathBHarness | undefined;
+  const opened = new Set<FabricTransport>();
+  const probes = new Set<RealKvConsumptionProbe>();
+  let cleaning: Promise<void> | undefined;
+  const cleanup = (): Promise<void> => cleaning ??= (async () => {
+    const errors: unknown[] = [];
+    const settle = async (operations: Promise<unknown>[]) => {
+      for (const result of await Promise.allSettled(operations)) if (result.status === "rejected") errors.push(result.reason);
+    };
+    try {
+      // B's callback consumer must close independently of public yields. Do not return
+      // inboxes here to make close succeed; T-CLOSE-SUSPENDED checks that contract directly.
+      await settle([...opened].map(port => boundedReceipt(port.close(), "close actual fixture transport")));
+      await settle([...probes].map(probe => boundedReceipt(probe.close(), "close KV scheduling probe")));
+    } finally {
+      // Even a broken return()/close() cannot strand this fixture's real child at Vitest's deadline.
+      try { await server?.stop(); }
+      finally { mesh.closeState(); rmSync(root, { recursive: true, force: true }); }
+    }
+    if (errors.length) throw new AggregateError(errors, "real transport fixture cleanup failed");
+  })();
+  try {
+    if (kind === "nats") {
+      server = await natsModule!.createPathBHarness({ binary: binary! });
+      const [{ jetstream, jetstreamManager }, { ensureTransportStream }, { openNatsKvForMachine }, subjects] = await Promise.all([
+        import("@nats-io/jetstream"), import("../../src/transport/nats/provision.js"),
+        import("../../src/transport/nats/kv.js"), import("../../src/transport/nats/subjects.js"),
+      ]);
+      // This bootstrap connection only provisions; close it before opening either runtime
+      // carrier. The reset probe below uses a SEPARATE admin connection solely for its fault.
+      const bootstrap = await server.connect(server.users.bootstrap);
+      try {
+        const manager = await jetstreamManager(bootstrap), js = jetstream(bootstrap);
+        const policy = { maxBytes: 1_073_741_824, maxAgeMs: 0, maxMessageBytes: 1_048_576,
+          duplicateWindowMs: contractTiming.duplicateWindowMs, replicas: 1 as const };
+        await ensureTransportStream(manager, { ...policy, name: subjects.ADVISORY_CAPTURE_STREAM,
+          subjects: [subjects.transportAdvisoryStreamSubject], maxAgeMs: 30 * 86_400_000, maxMessageBytes: 65_536 });
+        await openNatsKvForMachine(js, "leases", "machine-a", true);
+        await openNatsKvForMachine(js, "presence", "machine-a", true);
+        for (const machine of ["machine-a", "machine-b"]) {
+          await ensureTransportStream(manager, { ...policy, name: subjects.transportInboxStream(machine),
+            subjects: [subjects.transportInboxStreamSubject(machine)] });
+        }
+      } finally { await bootstrap.close(); }
+    }
+    const open = async (side: "sender" | "receiver"): Promise<FabricTransport> => {
+      const user = side === "sender" ? server?.users.machineA : server?.users.machineB;
+      // A2 may not yet declare mesh.nats; this is the CURRENT factory's actual runtime input.
+      const config = { ...DEFAULT_FABRIC_CONFIG.mesh, transport: kind,
+        ...(server && user ? { nats: { servers: server.serverUrl, machine: user.machine, credentials: user.credsPath } } : {})
+      } as FabricTransportOptions["config"];
+      const result = await openAdapter({ kind, options: { config, mesh, hostId: `session:${side}` },
+        exportName: "openFabricTransport", natsReady: kind === "nats", required });
+      if (result.status === "skip") throw new Error(result.reason);
+      opened.add(result.transport);
+      return result.transport;
+    };
+    const sender = await open("sender");
+    let receiver = await open("receiver");
+    const kvReadiness: RealKvReadiness | undefined = server ? {
+      reset: async (bucket, prefix, signal) => {
+        signal.throwIfAborted();
+        const admin = await server!.connect(server!.users.bootstrap);
+        try {
+          const { jetstreamManager } = await import("@nats-io/jetstream");
+          const manager = await jetstreamManager(admin), stream = `KV_fabric_${bucket}`;
+          const subject = `$KV.fabric_${bucket}.${prefix}`;
+          const active = [];
+          // One bounded LIST, not consumer-info polling. Delete ONLY the exact live watch.
+          for await (const info of manager.consumers.list(stream)) {
+            const filters = info.config.filter_subjects ?? [info.config.filter_subject];
+            if (info.push_bound && info.config.deliver_policy === "last_per_subject" && filters.includes(subject)) active.push(info);
+          }
+          if (active.length !== 1) throw new Error(`expected one active ordered ${bucket} watch, found ${active.length}`);
+          signal.throwIfAborted();
+          const deleted = await signalReceipt(manager.consumers.delete(stream, active[0]!.name), signal);
+          if (!deleted) throw new Error("real ordered watch consumer was not deleted");
+        } finally { await admin.close(); }
+      },
+      holdConsumption: async (bucket, prefix, signal) => {
+        signal.throwIfAborted();
+        const [{ openNatsConnection }, { openNatsKvForMachine }, { DeliverPolicy }] = await Promise.all([
+          import("../../src/transport/nats/connection.js"), import("../../src/transport/nats/kv.js"), import("@nats-io/jetstream"),
+        ]);
+        const user = server!.users.machineB;
+        const connection = await openNatsConnection({ servers: server!.serverUrl, credentials: user.credsPath, machine: user.machine });
+        const gate = faultGate();
+        let created!: () => void;
+        const creation = new Promise<void>(resolve => { created = resolve; });
+        const observers = new Set<import("@nats-io/jetstream").ConsumerMessages>();
+        const consumers = connection.js.consumers;
+        const getPushConsumer: typeof consumers.getPushConsumer = async (...args) => {
+          if (args[0] !== `KV_fabric_${bucket}` || !args[1] || typeof args[1] !== "object" ||
+            !("filter_subjects" in args[1]) || args[1].filter_subjects !== `$KV.fabric_${bucket}.${prefix}`) {
+            throw new Error("consume hold must address only its requested real ordered watch");
+          }
+          const consumer = await consumers.getPushConsumer(...args);
+          // Same seam as B's real KV suite: hold ONLY consume(), not metadata, callbacks,
+          // statuses, pending counts or event order. No client-side event buffer is installed.
+          return {
+            info: cached => consumer.info(cached), delete: () => consumer.delete(),
+            isPullConsumer: () => consumer.isPullConsumer(), isPushConsumer: () => consumer.isPushConsumer(),
+            consume: async options => {
+              created(); await gate.wait(signal); signal.throwIfAborted();
+              return consumer.consume(options);
+            },
+          };
+        };
+        const client = Object.create(connection.js) as typeof connection.js;
+        Object.defineProperty(client, "consumers", { value: { getPushConsumer } });
+        let closingProbe: Promise<void> | undefined;
+        try {
+          const store = await openNatsKvForMachine(client, bucket, user.machine, false, connection.onStatus);
+          const probe: RealKvConsumptionProbe = {
+            store, created: creation, release: async () => { gate.release(); },
+            expiry: async (key, revision, expirySignal) => {
+              if (!key.startsWith(`${user.machine}.`)) throw new Error("expiry probe requires own-machine key");
+              expirySignal.throwIfAborted();
+              let expired!: (revision: number) => void;
+              const marker = new Promise<number>(resolve => { expired = resolve; });
+              const consumer = await consumers.getPushConsumer(`KV_fabric_${bucket}`, {
+                filter_subjects: `$KV.fabric_${bucket}.${key}`, deliver_policy: DeliverPolicy.LastPerSubject,
+              });
+              const messages = await consumer.consume({ callback: msg => {
+                if (msg.headers?.get("Nats-Marker-Reason") === "MaxAge" && msg.info.streamSequence > revision) expired(msg.info.streamSequence);
+              } });
+              observers.add(messages);
+              try { return await signalReceipt(marker, expirySignal); }
+              finally { await messages.close(); observers.delete(messages); }
+            },
+            close: () => closingProbe ??= (async () => {
+              gate.release();
+              try { await Promise.all([...observers].map(observer => observer.close())); }
+              finally {
+                try { await boundedReceipt(connection.close(), "drain real KV probe connection"); }
+                finally { await connection.nc.close(); }
+              }
+            })(),
+          };
+          probes.add(probe);
+          return probe;
+        } catch (error) { gate.release(); await connection.close(); throw error; }
+      },
+    } : undefined;
+    return { status: "ready", pair: { sender, get receiver() { return receiver; },
+      ...(kvReadiness ? { kvReadiness } : {}),
+      reopenReceiver: async () => { await boundedReceipt(receiver.close(), "close receiver before durable reopen"); receiver = await open("receiver"); return receiver; },
+      close: cleanup } };
+  } catch (error) { await cleanup(); throw error; }
+}
+
 export type ControlPlaneDependency =
   | { readonly status: "available"; readonly module: Pick<typeof import("../../src/topology/control-plane.js"), "FabricControlPlane"> }
   | { readonly status: "unavailable"; readonly dependency: "A1-control-plane"; readonly reason: string };
-/** T4/T5/T17/T18 and all admission/fault scenarios instantiate the REAL class.
- * The public transportKind getter is A1's integration seam; port types alone are insufficient.
- * Explicit confirmation without that seam fails instead of testing a silently ignored option.
- * Import failures are failures, never unavailable dependencies.
+/** T4/T5/T17/T18 instantiate the REAL class. The getter is only a structural check:
+ * callers supplying a carrier must also probe the actual constructor/start boundary. This runs
+ * on the integrated A1 dispatcher without an environment opt-in; an older pinned A1 may refuse
+ * the carrier. Only its typed unsupported refusal becomes missing coverage; all other failures stay failures.
  */
 export async function loadControlPlane(options: {
   readonly transportIntegrated?: boolean; readonly required?: boolean;
+  readonly probe?: (Class: typeof import("../../src/topology/control-plane.js").FabricControlPlane) => void | Promise<void>;
 } = {}): Promise<ControlPlaneDependency> {
   const module = await import("../../src/topology/control-plane.js");
   if (typeof module.FabricControlPlane !== "function") throw new TypeError("Actual FabricControlPlane export is missing");
@@ -617,6 +844,13 @@ export async function loadControlPlane(options: {
     const reason = "A1 FabricControlPlane transport integration unavailable: public transportKind getter is absent. "
       + "T4/T5/T17/T18 and fault scenarios require the actual FabricControlPlane, not stub admission logic.";
     if (options.required || options.transportIntegrated) throw new Error(reason);
+    return { status: "unavailable", dependency: "A1-control-plane", reason };
+  }
+  try { await options.probe?.(module.FabricControlPlane); }
+  catch (error) {
+    if (!(error instanceof Error) || !("code" in error) || error.code !== "FABRIC_TRANSPORT_UNSUPPORTED") throw error;
+    const reason = `A1 real carrier dispatch unavailable: ${error.message}`;
+    if (options.required || options.transportIntegrated) throw new Error(reason, { cause: error });
     return { status: "unavailable", dependency: "A1-control-plane", reason };
   }
   return { status: "available", module: { FabricControlPlane: module.FabricControlPlane } };

@@ -60,6 +60,8 @@ describe("Path B NATS grants", () => {
   it("rejects unsafe machine literals and keeps template values fresh", () => {
     expect(() => pathBRoleTemplate("agent", "ryzen.1")).toThrow("invalid machine");
     expect(() => pathBRoleTemplate("agent", PATH_B_OPERATOR_MACHINE)).toThrow("invalid machine");
+    expect(() => pathBRoleTemplate("agent", "fabric-ops-canary")).toThrow("invalid machine");
+    expect(pathBRoleTemplate("maintainer", "fabric-ops-canary", ["ryzen2"]).pub.allow).toContain("fabric.in.ryzen2.*.ack.*.fabric-ops-canary");
     expect(() => pathBRoleTemplate("maintainer", "ryzen1", ["ryzen2"])).toThrow("invalid machine");
     const first = pathBRoleTemplate("agent");
     first.pub.allow.push("fabric.in.>");

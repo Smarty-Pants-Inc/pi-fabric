@@ -37,9 +37,24 @@ const RESERVED_MUTATIONS = [
   `$JS.API.CONSUMER.CREATE.FABRIC_ADV.${OPERATOR_DURABLE}.$JS.EVENT.ADVISORY.cli-proof`,
   `$JS.API.CONSUMER.DURABLE.CREATE.FABRIC_ADV.${OPERATOR_DURABLE}`,
   `$JS.API.CONSUMER.DELETE.FABRIC_ADV.${OPERATOR_DURABLE}`,
+  `$JS.API.CONSUMER.DELETE.FABRIC_ADV.${OTHER_DURABLE}`,
+  `$JS.API.CONSUMER.PAUSE.FABRIC_ADV.${OPERATOR_DURABLE}`,
+  `$JS.API.CONSUMER.UNPIN.FABRIC_ADV.${OPERATOR_DURABLE}`,
+  // RESET exists in 2.14.7, not 2.11.17: raw publish must still be permission-denied.
+  `$JS.API.CONSUMER.RESET.FABRIC_ADV.${OPERATOR_DURABLE}`,
+  `$JS.API.CONSUMER.LEADER.STEPDOWN.FABRIC_ADV.${OPERATOR_DURABLE}`,
+  "$JS.API.STREAM.CREATE.FABRIC_ADV",
   "$JS.API.STREAM.UPDATE.FABRIC_ADV",
   "$JS.API.STREAM.DELETE.FABRIC_ADV",
   "$JS.API.STREAM.PURGE.FABRIC_ADV",
+  "$JS.API.STREAM.MSG.DELETE.FABRIC_ADV",
+  "$JS.API.STREAM.SNAPSHOT.FABRIC_ADV",
+  "$JS.API.STREAM.RESTORE.FABRIC_ADV",
+  "$JS.API.STREAM.LEADER.STEPDOWN.FABRIC_ADV",
+  "$JS.API.STREAM.PEER.REMOVE.FABRIC_ADV",
+  // System-account-only APIs; these app users must fail at authorization, not dispatch.
+  "$JS.API.ACCOUNT.STREAM.MOVE.fixture-account.FABRIC_ADV",
+  "$JS.API.ACCOUNT.STREAM.CANCEL_MOVE.fixture-account.FABRIC_ADV",
 ] as const;
 const CAPTURE_CONTROL = "CLI_CAPTURE_CONTROL";
 let principalIdentity: Pick<PathBUser, "publicKey" | "credsPath">;
@@ -241,10 +256,29 @@ describe.skipIf(process.platform === "win32")("Path B CLI-issued credentials on 
   // timeout. In particular bare CREATE's valid config.name has NO durable_name (2.11.17).
   it.each(RESERVED_MUTATIONS)("all four nonbootstrap roles are broker-denied: %s", async (subject) => {
     const bare = subject === "$JS.API.CONSUMER.CREATE.FABRIC_ADV";
+    const config = { name: "FABRIC_ADV", subjects: ["$JS.EVENT.ADVISORY.>"], storage: StorageType.File };
     const payload = subject.includes("CONSUMER.CREATE") || subject.includes("CONSUMER.DURABLE.CREATE")
       ? JSON.stringify({ stream_name: "FABRIC_ADV", config: { name: OPERATOR_DURABLE, ...(bare ? {} : { durable_name: OPERATOR_DURABLE }), ack_policy: AckPolicy.None, filter_subject: "$JS.EVENT.ADVISORY.cli-proof" } })
-      : subject.includes("STREAM.UPDATE") ? JSON.stringify({ name: "FABRIC_ADV", subjects: ["$JS.EVENT.ADVISORY.>"], storage: StorageType.File }) : "{}";
+      : subject.includes("CONSUMER.PAUSE") ? JSON.stringify({ pause_until: "2099-01-01T00:00:00Z" })
+      : subject.includes("CONSUMER.UNPIN") ? JSON.stringify({ group: "cli-proof" })
+      : subject.includes("CONSUMER.RESET") || subject.includes("STREAM.MSG.DELETE") ? JSON.stringify({ seq: 1 })
+      : subject.includes("STREAM.CREATE") ? "{" // Even a regressed grant must not create ADV before later delete probes.
+      : subject.includes("STREAM.UPDATE") ? JSON.stringify(config)
+      // Invalid snapshot/restore inputs prevent even a grant regression from starting either job.
+      : subject.includes("STREAM.SNAPSHOT") ? JSON.stringify({ deliver_subject: "" })
+      : subject.includes("STREAM.RESTORE") ? JSON.stringify({ config: { name: "" }, state: {} })
+      : subject.includes("STREAM.PEER.REMOVE") ? JSON.stringify({ peer: "cli-absent-peer" })
+      : subject.includes("ACCOUNT.STREAM.MOVE") ? JSON.stringify({ server: "cli-absent-peer" }) : "{}";
     for (const oracle of [runtimeOracle, principalOracle, normalMaintainerOracle, operatorOracle]) await oracle.denied(subject, payload);
+  });
+
+  // AckNone NEXT advances the shared report cursor. The operator is intentionally excluded;
+  // its exact fixed-durable pull is the later positive control. ADV does not exist yet here.
+  it.each([OPERATOR_DURABLE, OTHER_DURABLE])("nonoperator advisory pull is broker-denied: %s", async (durable) => {
+    const subject = `$JS.API.CONSUMER.MSG.NEXT.FABRIC_ADV.${durable}`;
+    for (const oracle of [runtimeOracle, principalOracle, normalMaintainerOracle]) {
+      await oracle.denied(subject, JSON.stringify({ batch: 1, no_wait: true }));
+    }
   });
 
   it.each([

@@ -169,8 +169,16 @@ export const PATH_B_OPERATOR_MACHINE = "fabric-ops";
 export const PATH_B_ADVISORY_DURABLE = "transport_dlq_operator";
 export const PATH_B_OPERATOR_MACHINE_PATTERN = /^fabric-ops(-[a-z0-9]+)?$/;
 
-// Reserve every server-supported creation form, including the bare API whose config.name
-// can select the fixed consumer without a durable_name. Denies override broad #7504 allows.
+// Administrative mutations inventoried against both pinned upstream API constant tables:
+// https://raw.githubusercontent.com/nats-io/nats-server/v2.11.17/server/jetstream_api.go
+// https://raw.githubusercontent.com/nats-io/nats-server/v2.14.7/server/jetstream_api.go
+// CREATE (including bare config.name), DELETE, PAUSE/UNPIN/RESET, leader/peer changes,
+// message deletion and RESTORE change advisory state; RESET is absent in 2.11.17 but reserved.
+// SNAPSHOT is read-like but mutates store snapshot-in-progress state, so reserve it too.
+// System-account MOVE/CANCEL_MOVE carry a stream token; account-wide admin/templates do not
+// and are not granted. INFO/list/GET remain reads. MSG.NEXT advances AckNone consumer state:
+// denied separately to nonoperators, while the operator retains its fixed durable pull.
+// Schedules/counters use data-publish headers, not additional API forms (v2.14.7 stream.go).
 const PATH_B_RESERVED_MUTATIONS = [
   "$JS.API.CONSUMER.CREATE.FABRIC_ADV",
   `$JS.API.CONSUMER.CREATE.FABRIC_ADV.${PATH_B_ADVISORY_DURABLE}`,
@@ -178,9 +186,22 @@ const PATH_B_RESERVED_MUTATIONS = [
   "$JS.API.CONSUMER.CREATE.FABRIC_ADV.>",
   "$JS.API.CONSUMER.DURABLE.CREATE.FABRIC_ADV.>",
   `$JS.API.CONSUMER.DELETE.FABRIC_ADV.${PATH_B_ADVISORY_DURABLE}`,
+  "$JS.API.CONSUMER.DELETE.FABRIC_ADV.>",
+  "$JS.API.CONSUMER.PAUSE.FABRIC_ADV.>",
+  "$JS.API.CONSUMER.UNPIN.FABRIC_ADV.>",
+  "$JS.API.CONSUMER.RESET.FABRIC_ADV.>",
+  "$JS.API.CONSUMER.LEADER.STEPDOWN.FABRIC_ADV.>",
+  "$JS.API.STREAM.CREATE.FABRIC_ADV",
   "$JS.API.STREAM.UPDATE.FABRIC_ADV",
   "$JS.API.STREAM.DELETE.FABRIC_ADV",
   "$JS.API.STREAM.PURGE.FABRIC_ADV",
+  "$JS.API.STREAM.MSG.DELETE.FABRIC_ADV",
+  "$JS.API.STREAM.SNAPSHOT.FABRIC_ADV",
+  "$JS.API.STREAM.RESTORE.FABRIC_ADV",
+  "$JS.API.STREAM.LEADER.STEPDOWN.FABRIC_ADV",
+  "$JS.API.STREAM.PEER.REMOVE.FABRIC_ADV",
+  "$JS.API.ACCOUNT.STREAM.MOVE.*.FABRIC_ADV",
+  "$JS.API.ACCOUNT.STREAM.CANCEL_MOVE.*.FABRIC_ADV",
 ];
 
 function pathBRuntime(roleMachine: string, machines: readonly string[] = []): PathBRoleTemplate {
@@ -281,7 +302,7 @@ export function roleTemplateWithPathB(role: NatsRole | "operator", input: RoleSt
   // Principal and normal maintainer retain their exact #7504 allows; only the Path B
   // advisory reservation adds denies. Emergency custody/liveness issuance is unchanged.
   return {
-    pub: { allow: base.pub.allow, deny: pathBUnique([...base.pub.deny, ...PATH_B_RESERVED_MUTATIONS]) },
+    pub: { allow: base.pub.allow, deny: pathBUnique([...base.pub.deny, ...PATH_B_RESERVED_MUTATIONS, "$JS.API.CONSUMER.MSG.NEXT.FABRIC_ADV.>"]) },
     sub: base.sub,
   };
 }

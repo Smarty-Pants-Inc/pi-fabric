@@ -10,7 +10,7 @@ import { ActorManager, ActorRegistryOwnershipError, parseBashTimeoutSeconds } fr
 import { slotAdmissionFor } from "../actors/slot-admission.js";
 import { participantProject, recordedProjectLead, repositoryOf, resolveProjectAgent } from "../topology/project-identity.js";
 import { GlobalActorRegistry } from "../actors/global-registry.js";
-import { isFabricActorHostEvent, normalizeActorActivation, validateActorCoalesceKey, validateActorDedupeKey, validateActorInferenceContext } from "../actors/types.js";
+import { isFabricActorHostEvent, FabricActorBatchPolicyError, normalizeActorActivation, normalizeActorBatching, validateActorCoalesceKey, validateActorDedupeKey, validateActorInferenceContext } from "../actors/types.js";
 import { normalizeActorSlotClaim } from "../actors/slot-claim.js";
 import { normalizeActorActivationFilter } from "../actors/activation-filter.js";
 import { normalizeActorRecords } from "../actors/records.js";
@@ -337,6 +337,7 @@ const actorRequest = (
   validateActorCoalesceKey(args.coalesceKey);
   validateActorDedupeKey(args.dedupeKey);
   const activation = normalizeActorActivation(args.activation);
+  const batching = normalizeActorBatching(args);
   const slotClaim = normalizeActorSlotClaim(args.slotClaim);
   const activationFilter = args.activationFilter === undefined ? undefined : normalizeActorActivationFilter(args.activationFilter);
   const requestedKernel = checkedKernel(args.kernel);
@@ -374,6 +375,7 @@ const actorRequest = (
     ...(typeof args.coalesceKey === "string" ? { coalesceKey: args.coalesceKey } : {}),
     ...(typeof args.dedupeKey === "string" ? { dedupeKey: args.dedupeKey } : {}),
     ...(activation ? { activation } : {}),
+    ...batching,
     ...(activationFilter ? { activationFilter } : {}),
     ...(args.routeClass !== undefined ? { routeClass: args.routeClass as "status-groom" } : {}),
     ...(typeof args.protected === "boolean" ? { protected: args.protected } : {}),
@@ -1637,6 +1639,14 @@ export class AgentsProvider implements FabricProvider {
         }
         if (args.scope === "global") return this.globalActors.update(String(args.id), { coalesceKey });
         return this.actorManager.setCoalesceKey(String(args.id), coalesceKey);
+      }
+      case "setBatching": {
+        const batching = normalizeActorBatching(args);
+        if (!Object.keys(batching).length) throw new FabricActorBatchPolicyError("batchWindowMs, batchMax or batchMaxBytes is required");
+        if (args.scope === "global") return this.globalActors.update(String(args.id), batching);
+        const resident = await this.#residentActorOwner(String(args.id));
+        if (resident) return this.#setResidentActor(resident, { operation: "setBatching", id: resident.id, ...batching }, context);
+        return this.actorManager.setBatching(String(args.id), batching, checkCommit);
       }
       case "setActivationFilter": {
         if (args.activationFilter === undefined) throw new Error("activationFilter is required (a list of presets or rules, or null to clear)");

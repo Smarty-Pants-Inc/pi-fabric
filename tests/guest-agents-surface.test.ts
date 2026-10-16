@@ -186,6 +186,26 @@ describe("guest agents surface", () => {
     expect(result.terminationReason).toBe("completed");
     expect(calls).toEqual([]);
   });
+  it.each([false, true])("types actor window batching and the live setter (fullCodeMode=%s)", fullCodeMode => {
+    const code = `const actor = await agents.create({ name: "supervisor", instructions: "Observe.", batchWindowMs: 300000, batchMax: 50, batchMaxBytes: 262144 });
+      const updated = await agents.setBatching({ id: actor.id, batchWindowMs: 0, batchMaxBytes: 4096 });
+      const window: number | undefined = updated.batchWindowMs;
+      const max: number | undefined = actor.batchMax;
+      const bytes: number | undefined = updated.batchMaxBytes;
+      return { window, max, bytes };`;
+    expect(typeCheckFabricCode(code, guestTypeDeclarations(fullCodeMode), true).errors).toEqual([]);
+    expect(typeCheckFabricCode('await agents.setBatching({ id: "actor", batchMax: "50" });', guestTypeDeclarations(fullCodeMode), true).errors.length).toBeGreaterThan(0);
+    expect(typeCheckFabricCode('await agents.setBatching({ id: "actor", batchMaxBytes: "4096" });', guestTypeDeclarations(fullCodeMode), true).errors.length).toBeGreaterThan(0);
+  });
+  it("bridges the batching setter through the public provider", async () => {
+    const calls: Array<{ ref: string; args: unknown }> = [];
+    const result = await new QuickJsRuntime().execute('return await agents.setBatching({ id: "actor", batchWindowMs: 300000, batchMax: 50, batchMaxBytes: 262144 });',
+      async (ref, args) => { calls.push({ ref, args }); return { batchWindowMs: 300000, batchMax: 50, batchMaxBytes: 262144 }; },
+      { timeoutMs: 5000, memoryLimitBytes: 32 * 1024 * 1024 });
+    expect(result.terminationReason).toBe("completed");
+    expect(calls).toEqual([{ ref: "agents.setBatching", args: { id: "actor", batchWindowMs: 300000, batchMax: 50, batchMaxBytes: 262144 } }]);
+    expect(result.value).toEqual({ batchWindowMs: 300000, batchMax: 50, batchMaxBytes: 262144 });
+  });
   it.each([false, true])("types per-filter telemetry and expiry (fullCodeMode=%s)", fullCodeMode => {
     const code = `await agents.setActivationFilter({ id: "reviewer", activationFilter: ["hold"], expiresAt: Date.now() + 60000 });
       const actor = await agents.actorStatus({ id: "reviewer" });

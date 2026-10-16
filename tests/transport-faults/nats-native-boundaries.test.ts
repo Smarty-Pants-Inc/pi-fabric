@@ -91,7 +91,9 @@ class NativeRpc {
   readonly pending = new Map<string, { resolve(value: any): void; reject(error: Error): void }>();
   readonly listeners = new Set<() => void>();
   stderr = ""; closed = false;
-  constructor(root: string, env: NodeJS.ProcessEnv, cli: string, sessionFile?: string) {
+  bootstrap: unknown;
+  bootstrapFailure: unknown;
+  constructor(readonly root: string, env: NodeJS.ProcessEnv, cli: string, sessionFile?: string) {
     this.child = spawn(process.execPath, [cli, "--mode", "rpc", "--offline", "--no-extensions", "--no-skills", "--no-context-files",
       "--no-prompt-templates", "--no-themes", "--approve", "-e", FIXTURE, "--provider", "boundary-offline", "--model", "offline",
       "--thinking", "off", "--tools", "", "--session-dir", path.join(root, "sessions"), ...(sessionFile ? ["--session", sessionFile] : [])],
@@ -123,14 +125,46 @@ class NativeRpc {
     this.child.stderr!.on("data", chunk => { this.stderr += chunk.toString(); });
     natives.push(this);
   }
-  async request(value: Record<string, unknown>): Promise<any> {
-    const id = randomUUID();
+  async ready(root: string, stage: string): Promise<Record<string, any>> {
     try {
-      return await bounded(new Promise<any>((resolve, reject) => {
+      return await observe(root, () => {
+        const starting = path.join(root, "nats-completion-starting.json");
+        if (fs.existsSync(starting)) {
+          const receipt = json(starting);
+          if (receipt.pid === this.child.pid) this.bootstrap = receipt;
+        }
+        const failed = path.join(root, "nats-completion-failed.json");
+        if (fs.existsSync(failed)) {
+          const failure = json(failed);
+          if (failure.pid === this.child.pid) {
+            this.bootstrapFailure = failure;
+            throw new Error(`Native bootstrap failed: ${JSON.stringify(failure)}`);
+          }
+        }
+        const extensionError = this.events.find(event => event.type === "extension_error");
+        if (extensionError) throw new Error(`Native extension failed: ${JSON.stringify(extensionError)}`);
+        if (this.closed) throw new Error(`Native closed before ready: ${this.stderr}`);
+        const value = json(path.join(root, "nats-completion-ready.json"));
+        return value.pid === this.child.pid ? value : undefined;
+      }, `${stage} native ready`);
+    } catch (cause) {
+      throw new Error(`${stage} native ready (pid ${this.child.pid}): ${String(cause)}; ` +
+        `bootstrap=${JSON.stringify(this.bootstrap) ?? "not observed"}; stderr=${this.stderr}`, { cause });
+    }
+  }
+  async request(value: Record<string, unknown>): Promise<any> {
+    const id = randomUUID(); const firstEvent = this.events.length;
+    try {
+      const result = await bounded(new Promise<any>((resolve, reject) => {
         if (this.closed) { reject(new Error(`Native Pi already closed: ${this.stderr}`)); return; }
         this.pending.set(id, { resolve, reject });
         this.child.stdin!.write(JSON.stringify({ ...value, id }) + "\n");
-      }), `RPC ${value.type}`);
+      }), `RPC ${value.type}${typeof value.message === "string" ? ` ${value.message}` : ""}`);
+      // Pi reports a throwing extension command as extension_error followed by a
+      // handled prompt response. A successful RPC alone is not command success.
+      const failure = this.events.slice(firstEvent).find(event => event.type === "extension_error");
+      if (failure) throw new Error(`Native extension command failed: ${JSON.stringify(failure)}`);
+      return result;
     } finally { this.pending.delete(id); }
   }
   async settled(): Promise<void> {
@@ -349,7 +383,20 @@ const seenFiles = (root: string): string[] => {
     ? seenFiles(path.join(root, entry.name)) : entry.isFile() && entry.name.endsWith(".json") ? [path.join(root, entry.name)] : []);
 };
 
-afterEach(async () => {
+afterEach(async context => {
+  if (context.task.result?.state === "fail") {
+    // Preserve per-invocation native attribution/bootstrap and actual broker monitor facts
+    // before teardown removes scratch. No credential contents or inferred success receipts.
+    for (const rpc of natives) {
+      console.error("NATS_NATIVE_FAILURE", JSON.stringify({ pid: rpc.child.pid, closed: rpc.closed,
+        stderr: rpc.stderr, extensionErrors: rpc.events.filter(event => event.type === "extension_error"),
+        bootstrap: rpc.bootstrap, failure: rpc.bootstrapFailure }));
+    }
+    for (const h of brokers) {
+      try { console.error("NATS_NATIVE_BROKER_FAILURE", JSON.stringify(await h.diagnostics())); }
+      catch (error) { console.error("NATS_NATIVE_BROKER_DIAGNOSTIC_ERROR", String(error)); }
+    }
+  }
   let failure: unknown;
   const processes = natives.splice(0);
   for (const rpc of processes) {
@@ -393,6 +440,30 @@ afterEach(async () => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 }, 90_000);
 
+/** Harness-only probes: no native runtime starts and no product deletion is forwarded.
+ * Keep: a reported observer namespace failure and insufficient bootstrap reporting; no B4/B5 custody proof is claimed. */
+describe("NATS native boundary harness observations", () => {
+  it("watches the empty attempts namespace before the producer writes its first candidate", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-nats-observer-probe-")); roots.push(root);
+    const attempts = path.join(root, "agent-completions", "attempts");
+    fs.mkdirSync(attempts, { recursive: true, mode: 0o700 });
+    const file = path.join(attempts, "candidate.json");
+    const observed = observeJson(file);
+    fs.writeFileSync(file, JSON.stringify({ probe: "producer-only-bytes" }));
+    expect(await observed).toEqual({ probe: "producer-only-bytes" });
+  });
+  it("reports the current invocation bootstrap failure, not a stale ready from another PID", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-nats-bootstrap-probe-")); roots.push(root);
+    fs.writeFileSync(path.join(root, "nats-completion-ready.json"), JSON.stringify({ pid: -1 }));
+    fs.writeFileSync(path.join(root, "nats-completion-starting.json"), JSON.stringify({ pid: process.pid, stage: "initialize" }));
+    fs.writeFileSync(path.join(root, "nats-completion-failed.json"), JSON.stringify({ pid: process.pid, stage: "initialize", error: "probe failure" }));
+    // A receiver for the reporting method only, never a replacement Pi/manager/exit oracle.
+    const rpc = Object.assign(Object.create(NativeRpc.prototype) as NativeRpc,
+      { root, child: { pid: process.pid }, events: [], closed: false, stderr: "probe stderr" });
+    await expect(rpc.ready(root, "exact-session resume")).rejects.toThrow(/exact-session resume.*Native bootstrap failed.*probe failure.*probe stderr/);
+  });
+});
+
 /** Root-public trace: FabricRuntimeState.initialize constructs the session
  * AgentManager and real ResidencyClient/CompletionJournal/AgentCompletionInbox;
  * registry agents.spawn -> AgentsProvider derives native attribution and chooses
@@ -421,7 +492,7 @@ describe.skipIf(!HOSTED_PRODUCT_DELETE)("HOSTED AUTHOR-ONLY E4 native NATS B4 â€
         npm_config_cache: path.join(REPO, ".local/cache/npm"), PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", FABRIC_NATIVE_BOUNDARY_ROOT: root,
         PI_FABRIC_RUN_ROOT: path.join(root, "runs"), PI_FABRIC_SESSION_ID: "" };
       const rpc = new NativeRpc(root, env, cli);
-      const ready = await observeJson(path.join(root, "nats-completion-ready.json"), row => row.pid === rpc.child.pid);
+      const ready = await rpc.ready(root, `B4(${mode}) initial`);
       expect(ready).toMatchObject({ carrier: "nats", hostTransport: "nats", stateBackend: "file", observationHealth: [] });
       await rpc.request({ type: "prompt", message: "Persist this exact B4 native parent session." }); await rpc.settled();
       expect(ready.nats).toMatchObject(nats);
@@ -634,7 +705,7 @@ describe.skipIf(!HOSTED_PRODUCT_DELETE)("HOSTED AUTHOR-ONLY E4 native NATS B5 â€
       }
       if (variant === "durable-host-kill") env.NODE_OPTIONS = residentObserver(root, env.NODE_OPTIONS);
       const first = new NativeRpc(root, env, cli);
-      const ready = await observeJson(path.join(root, "nats-completion-ready.json"), row => row.pid === first.child.pid);
+      const ready = await first.ready(root, `${variant} initial`);
       expect(ready).toMatchObject({ carrier: "nats", hostTransport: "nats", stateBackend: "file", observationHealth: [] });
       await first.request({ type: "prompt", message: "Persist this exact E4 native parent session." }); await first.settled();
       expect(ready.nats).toMatchObject(nats);
@@ -694,6 +765,9 @@ describe.skipIf(!HOSTED_PRODUCT_DELETE)("HOSTED AUTHOR-ONLY E4 native NATS B5 â€
         id, name: `${digest(id)}.json` }));
       const directory = path.join(manifest.meshRoot, "agent-completions");
       fs.mkdirSync(directory, { recursive: true });
+      // Observer setup only: the worker creates the candidate file at finality. fs.watch
+      // cannot watch a missing attempts/ directory; no completion bytes are made.
+      if (variant === "session-main-kill") fs.mkdirSync(path.join(directory, "attempts"), { recursive: true, mode: 0o700 });
       const name = `${digest(id)}.json`; const envelopeFile = path.join(directory, name);
       const receiptFile = path.join(directory, "receipts", name); const archiveFile = path.join(directory, "archive", name);
       const claimKey = `residency/completion-claims/${digest(id)}`;
@@ -772,7 +846,7 @@ describe.skipIf(!HOSTED_PRODUCT_DELETE)("HOSTED AUTHOR-ONLY E4 native NATS B5 â€
       // Foreign native Main uses the same host credential and shared root, but
       // no PID/TTL/placement metadata transfers exact recipient ownership.
       const foreign = new NativeRpc(root, env, cli);
-      const other = await observeJson(path.join(root, "nats-completion-ready.json"), row => row.pid === foreign.child.pid);
+      const other = await foreign.ready(root, `${variant} foreign`);
       expect(other.main.id).not.toBe(hostId); expect(other.sessionId).not.toBe(state.sessionId);
       await foreign.request({ type: "prompt", message: "/native-nats-completion-checkpoint" });
       expect(rows(path.join(root, "nats-completion-enqueued.jsonl"))).toEqual([]);
@@ -786,7 +860,7 @@ describe.skipIf(!HOSTED_PRODUCT_DELETE)("HOSTED AUTHOR-ONLY E4 native NATS B5 â€
       // event; never delete a lease or manufacture clean predecessor evidence.
       await waitLeaseGone(leases, "machine-a", hostId);
       const resumed = new NativeRpc(root, env, cli, state.sessionFile);
-      const resumedReady = await observeJson(path.join(root, "nats-completion-ready.json"), row => row.pid === resumed.child.pid);
+      const resumedReady = await resumed.ready(root, `${variant} exact-session resume`);
       expect(resumedReady.main.id).toBe(hostId); expect(resumedReady.sessionId).toBe(state.sessionId);
       if (variant === "durable-host-kill") {
         // A terminal journal need not auto-start an empty resident. Explicitly
@@ -850,7 +924,7 @@ describe.skipIf(!HOSTED_PRODUCT_DELETE)("HOSTED AUTHOR-ONLY E4 native NATS B5 â€
       }
       await resumed.crash(log); await waitLeaseGone(leases, "machine-a", hostId);
       const again = new NativeRpc(root, env, cli, state.sessionFile);
-      const againReady = await observeJson(path.join(root, "nats-completion-ready.json"), row => row.pid === again.child.pid);
+      const againReady = await again.ready(root, `${variant} second exact-session resume`);
       expect(againReady.main.id).toBe(hostId); expect((await again.request({ type: "get_state" })).sessionId).toBe(state.sessionId);
       await again.request({ type: "prompt", message: "/native-nats-completion-checkpoint" });
       expect(enqueues()).toHaveLength(1); expect(deliveries()).toHaveLength(1); expect(carriers()).toHaveLength(1);

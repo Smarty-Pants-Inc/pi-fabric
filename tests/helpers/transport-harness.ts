@@ -641,6 +641,8 @@ export interface RealKvConsumptionProbe {
   close(): Promise<void>;
 }
 export interface RealKvReadiness {
+  /** Read-only failure context; never called on a passing test path. */
+  diagnostics?(): Promise<unknown>;
   reset(bucket: TransportBucket, prefix: string, signal: AbortSignal): Promise<void>;
   holdConsumption(bucket: TransportBucket, prefix: string, signal: AbortSignal): Promise<RealKvConsumptionProbe>;
 }
@@ -863,7 +865,9 @@ export async function openRealAdapterPair(kind: "file" | "nats", required = fals
     };
     const sender = await open("sender");
     let receiver = await open("receiver");
+    const resetReceipts: unknown[] = [];
     const kvReadiness: RealKvReadiness | undefined = server ? {
+      diagnostics: async () => ({ broker: await server!.diagnostics(), resets: [...resetReceipts] }),
       reset: async (bucket, prefix, signal) => {
         signal.throwIfAborted();
         const { openBootstrapNatsConnection } = await import("../../src/transport/nats/connection.js");
@@ -878,9 +882,14 @@ export async function openRealAdapterPair(kind: "file" | "nats", required = fals
             const filters = info.config.filter_subjects ?? [info.config.filter_subject];
             if (info.push_bound && info.config.deliver_policy === "last_per_subject" && filters.includes(subject)) active.push(info);
           }
+          resetReceipts.push({ bucket, prefix, active: active.map(info => ({ name: info.name,
+            created: info.created, config: { filter_subject: info.config.filter_subject,
+              idle_heartbeat: info.config.idle_heartbeat, deliver_policy: info.config.deliver_policy },
+            num_pending: info.num_pending, delivered: info.delivered })) });
           if (active.length !== 1) throw new Error(`expected one active ordered ${bucket} watch, found ${active.length}`);
           signal.throwIfAborted();
           const deleted = await signalReceipt(manager.consumers.delete(stream, active[0]!.name), signal);
+          resetReceipts.push({ bucket, consumer: active[0]!.name, deleted, at: Date.now() });
           if (!deleted) throw new Error("real ordered watch consumer was not deleted");
         } finally { await admin.close(); }
       },

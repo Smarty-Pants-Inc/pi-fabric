@@ -123,6 +123,9 @@ function tapWatch(kv: TransportKv) {
       observations.filter(item => item.event.type === "reset").indexOf(row) === index, `real reset ${index}`, 75_000),
     put: (key: string, revision: number) => wait(row => row.event.type === "put" &&
       row.event.entry.key === key && row.event.entry.revision === revision, "actual put reaches directory"),
+    diagnostics: () => observations.map(row => row.event.type === "put"
+      ? { type: row.event.type, key: row.event.entry.key, revision: row.event.entry.revision }
+      : row.event),
     releaseAll: () => { for (const row of observations) row.release(); },
   };
 }
@@ -268,6 +271,15 @@ describe("A2 real authenticated watch → manually-composed ParticipantView", ()
         expect(view.resolve(record.id)).toMatchObject({ machine: pair.sender.self.machine,
           ownerIncarnation: record.ownerIncarnation, capabilities: ["stop"] });
         expect(composed.errors).toEqual([]);
+      } catch (error) {
+        // Failure-only observations; no extra watch, retry, readiness or consumer mutation.
+        try {
+          console.error("NATS_PRESENCE_RESET_FAILURE", JSON.stringify({ pid: process.pid,
+            broker: await pair.kvReadiness?.diagnostics?.(), ready: composed?.view.ready,
+            presence: composed?.taps.presence.diagnostics(), leases: composed?.taps.leases.diagnostics(),
+            errors: composed?.errors.map(error => String(error)) }));
+        } catch (diagnosticError) { console.error("NATS_PRESENCE_RESET_DIAGNOSTIC_ERROR", String(diagnosticError)); }
+        throw error;
       } finally {
         try { await composed?.close(); } finally { await pair.close(); }
       }

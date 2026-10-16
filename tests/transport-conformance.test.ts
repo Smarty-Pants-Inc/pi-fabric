@@ -165,19 +165,22 @@ async function ready(iterator: AsyncIterator<TransportKvEvent>): Promise<Transpo
   }
   throw new Error("watch did not become ready within 100 receipts");
 }
-/** Exact snapshot oracle, not a directory or a readiness implementation. No entry order assumed.
- * In particular, the final put is still DATA; a separate next() must yield the marker.
+/** Exact snapshot oracle, not a directory or a readiness implementation. No data order assumed.
+ * Last-per-subject NATS snapshots include retained tombstones as well as live puts. Both are
+ * DATA: require every expected receipt, then a separate ready; never filter another watched key.
  */
-async function snapshotThenReady(iterator: AsyncIterator<TransportKvEvent>, expected: readonly TransportKvEntry[]): Promise<void> {
-  const entries: TransportKvEntry[] = [];
-  for (let i = 0; i < expected.length; i++) {
+async function snapshotThenReady(iterator: AsyncIterator<TransportKvEvent>, expected: readonly TransportKvEntry[],
+  tombstones: readonly Extract<TransportKvEvent, { type: "gone" }>[] = []): Promise<void> {
+  const data: TransportKvEvent[] = [];
+  const expectedData: TransportKvEvent[] = [...expected.map(entry => ({ type: "put" as const, entry })), ...tombstones];
+  for (let i = 0; i < expectedData.length; i++) {
     const event = await next(iterator);
-    expect(event.type, `snapshot entry ${i + 1}/${expected.length} must precede ready`).toBe("put");
-    if (event.type !== "put") throw new Error("snapshot ended before all entries were applied");
-    entries.push(event.entry);
+    expect(["put", "gone"], `snapshot data ${i + 1}/${expectedData.length} must precede ready`).toContain(event.type);
+    data.push(event);
   }
-  const byKey = (a: TransportKvEntry, b: TransportKvEntry) => a.key.localeCompare(b.key);
-  expect(entries.sort(byKey)).toEqual([...expected].sort(byKey));
+  const key = (event: TransportKvEvent) => event.type === "put" ? event.entry.key : event.type === "gone" ? event.key : "";
+  const byKey = (a: TransportKvEvent, b: TransportKvEvent) => key(a).localeCompare(key(b));
+  expect(data.sort(byKey)).toEqual(expectedData.sort(byKey));
   expect(await next(iterator), "snapshot completion is its own receipt").toEqual({ type: "ready" });
 }
 function stream(pair: Pair, signal: AbortSignal, port = pair.receiver): AsyncIterator<Message> {
@@ -293,6 +296,25 @@ async function control(pair: Pair, skip: Skip, handler?: FabricControlHandler) {
       } finally { cleanup(); }
     } };
 }
+
+describe("T-READY exact snapshot oracle", () => {
+  const entry: TransportKvEntry = { key: "machine-b.p.live", machine: "machine-b", owner: "owner#snapshot", value: { live: true }, revision: 2 };
+  const deleted: Extract<TransportKvEvent, { type: "gone" }> = {
+    type: "gone", key: "machine-b.p.deleted", machine: "machine-b", revision: 4, reason: "deleted",
+  };
+  const iterator = (events: TransportKvEvent[]) => (async function* () { yield* events; })()[Symbol.asyncIterator]();
+  it("requires exact live entries and retained tombstones, in either data order, before a separate marker", async () => {
+    for (const data of [[{ type: "put" as const, entry }, deleted], [deleted, { type: "put" as const, entry }]]) {
+      await snapshotThenReady(iterator([...data, { type: "ready" }]), [entry], [deleted]);
+    }
+  });
+  it("rejects early ready, missing or unexpected tombstones, and stale tombstone revisions", async () => {
+    await expect(snapshotThenReady(iterator([{ type: "put", entry }, { type: "ready" }]), [entry], [deleted])).rejects.toThrow();
+    await expect(snapshotThenReady(iterator([{ type: "put", entry }, deleted, { type: "ready" }]), [entry])).rejects.toThrow();
+    await expect(snapshotThenReady(iterator([{ type: "put", entry }, { ...deleted, revision: 3 }, { type: "ready" }]), [entry], [deleted])).rejects.toThrow();
+    await expect(snapshotThenReady(iterator([{ type: "ready" }, { type: "put", entry }, deleted]), [entry], [deleted])).rejects.toThrow();
+  });
+});
 
 describe.each(adapterKinds)("transport conformance / %s", kind => {
   function readinessCapability<T>(value: T | undefined, skip: Skip, reason: string): T {
@@ -766,12 +788,18 @@ describe.each(adapterKinds)("transport conformance / %s", kind => {
       { key: other, machine, owner: writer, value: otherValue, revision: third },
     ]);
     expect(await kv.delete(other, third, signal)).toBe(true);
-    expect(await next(iterator), "the replacement ready occurs once, not again on a live delete")
-      .toMatchObject({ type: "gone", key: other, reason: "deleted" });
+    const deleted = await next(iterator);
+    expect(deleted, "the replacement ready occurs once, not again on a live delete")
+      .toMatchObject({ type: "gone", key: other, machine, reason: "deleted" });
+    if (deleted.type !== "gone") throw new Error("live deletion must yield its own tombstone receipt");
+    expect(deleted.revision).toBeGreaterThan(third);
     // A second reset must snapshot current storage, not replay the deleted old snapshot member.
     await reset("presence", prefix, AbortSignal.any([signal, AbortSignal.timeout(5_000)]));
     expect(await next(iterator, kind === "nats" ? 75_000 : 5_000)).toEqual({ type: "reset" });
-    await snapshotThenReady(iterator, [{ key, machine, owner: writer, value: updated, revision: second }]);
+    // The real last-per-subject snapshot retains the exact newer DEL for `other`. The stub
+    // snapshots only live entries. Require the broker tombstone rather than silently skipping
+    // it (or filtering to `key`), so stale resurrection and missing ready still fail.
+    await snapshotThenReady(iterator, [{ key, machine, owner: writer, value: updated, revision: second }], kind === "nats" ? [deleted] : []);
     const final = await kv.put(key, writer, { generation: 4 }, second, signal);
     expect(await next(iterator)).toMatchObject({ type: "put", entry: { key, revision: final, value: { generation: 4 } } });
     // These are PORT receipts. Real A2 reset→not-ready→new ready view composition is covered

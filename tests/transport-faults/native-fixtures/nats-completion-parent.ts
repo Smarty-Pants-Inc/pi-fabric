@@ -53,6 +53,26 @@ export default function natsCompletionParent(pi: ExtensionAPI): void {
   // observers of its real launches/publications, not a second manager/engine.
   const b4 = new Map<string, { run: string; mode: string; native: AgentTransportHandle; primaryClosed: boolean; treeClosed: boolean | null }>();
   let faultId: string | undefined;
+  let successorSpawn: Promise<AgentHandleInfo> | undefined;
+  let successorFailure: unknown;
+  // NATS spawn resolves only AFTER presence admission and native launch. Observe
+  // the actual manager's queued state while retaining that same transaction;
+  // awaiting its return here would deadlock the held predecessor's test gate.
+  const observeSuccessorQueue = async (start: () => Promise<AgentHandleInfo>): Promise<AgentHandleInfo> => {
+    let queued!: (handle: AgentHandleInfo) => void;
+    const receipt = new Promise<AgentHandleInfo>(resolve => { queued = resolve; });
+    const check = () => {
+      const handle = runtime.agents.list().find(row => row.name === "native-nats-b4-successor" && row.status === "queued");
+      if (handle) queued(handle as AgentHandleInfo);
+    };
+    const unsubscribe = runtime.agents.subscribeUi(check);
+    try {
+      successorSpawn = start();
+      void successorSpawn.catch(error => { successorFailure = error; });
+      check();
+      return await Promise.race([receipt, successorSpawn]);
+    } finally { unsubscribe(); }
+  };
   const gate = path.join(root, "nats-b4-worker-exit-gate.json");
   const launch = ProcessTransport.prototype.launch;
   ProcessTransport.prototype.launch = async function (this: ProcessTransport, request) {
@@ -198,6 +218,7 @@ export default function natsCompletionParent(pi: ExtensionAPI): void {
       // a parallel/new drainer beside production's serialized delivery pass.
       await Promise.all([...passes]);
       if (journalFailure) throw journalFailure;
+      if (successorFailure) throw successorFailure;
       runtime.completionIdleSignal();
     } finally { clearTimeout(timer); }
   };
@@ -211,13 +232,26 @@ export default function natsCompletionParent(pi: ExtensionAPI): void {
     config.agents = { ...config.agents, runner: "pi", transport: "process", maxConcurrent: 1, budgetUsd: 0,
       timeoutMs: 60_000, retainRuns: true, sessionExport: false, notifyOnComplete: true, nice: 19 };
     config.mcp.enabled = false; config.memory.enabled = false; config.jev.enabled = false; config.records.enabled = false;
-    await runtime.initialize(ctx, config);
-    await checkpoint();
     const sessionId = ctx.sessionManager.getSessionId();
-    output("nats-completion-ready.json", { pid: process.pid, sessionId, main: runtime.mainAgentInfo(ctx),
-      meshRoot: runtime.mesh.root, carrier: runtime.config.mesh.transport, hostTransport: runtime.config.mesh.hostTransport,
-      nats: runtime.config.mesh.nats,
-      stateBackend: runtime.config.mesh.stateBackend, observationHealth: runtime.observationHealth() });
+    let stage = "initialize";
+    const starting = () => output("nats-completion-starting.json", { pid: process.pid, sessionId, stage,
+      // Native attribution selectors only, never credentials or the NATS config.
+      inherited: Object.fromEntries(["PI_FABRIC_SESSION_ID", "PI_FABRIC_MAIN_AGENT_ID", "PI_FABRIC_PARENT_RUN",
+        "PI_FABRIC_ACTOR_ID", "PI_FABRIC_RUN_ROOT"].map(key => [key, process.env[key] ?? null])) });
+    try {
+      starting();
+      await runtime.initialize(ctx, config);
+      stage = "completion checkpoint"; starting();
+      await checkpoint();
+      output("nats-completion-ready.json", { pid: process.pid, sessionId, main: runtime.mainAgentInfo(ctx),
+        meshRoot: runtime.mesh.root, carrier: runtime.config.mesh.transport, hostTransport: runtime.config.mesh.hostTransport,
+        nats: runtime.config.mesh.nats,
+        stateBackend: runtime.config.mesh.stateBackend, observationHealth: runtime.observationHealth() });
+    } catch (error) {
+      output("nats-completion-failed.json", { pid: process.pid, sessionId, stage,
+        error: error instanceof Error ? error.stack ?? error.message : String(error) });
+      throw error;
+    }
   });
   pi.registerCommand("native-nats-completion-spawn", { description: "Spawn through the actual runtime provider", handler: async (args, ctx) => {
     const residency = args.trim() || "durable";
@@ -243,13 +277,14 @@ export default function natsCompletionParent(pi: ExtensionAPI): void {
   pi.registerCommand("native-nats-b4-spawn", { description: "Spawn B4 through the actual root registry", handler: async (args, ctx) => {
     const mode = args.trim();
     if (!["i", "ii", "iii", "successor"].includes(mode)) throw new Error("Unknown B4 case");
-    const handle = await runtime.registry.invoke("agents.spawn", {
+    const start = () => runtime.registry.invoke("agents.spawn", {
       name: `native-nats-b4-${mode}`, task: `Return the native NATS E4 B4 ${mode} same-machine result.`,
       model: "boundary-offline/offline", thinking: "off", residency: "session", runner: "pi", transport: "process",
       needs: ["local"], extensions: false, tools: [],
     }, { cwd: ctx.cwd, extensionContext: ctx, signal: AbortSignal.timeout(60_000),
       parentToolCallId: "native-nats-e4-b4", nestedToolCallId: `native-nats-e4-b4-${mode}`,
-      approve: async () => {}, audits: [], maxResultChars: 32_000, update() {} }) as AgentHandleInfo;
+      approve: async () => {}, audits: [], maxResultChars: 32_000, update() {} }) as Promise<AgentHandleInfo>;
+    const handle = mode === "successor" ? await observeSuccessorQueue(start) : await start();
     output(`nats-b4-spawn-${mode}.json`, { pid: process.pid, handle, run: runtime.agents.runDirectory(handle.id) });
   } });
   pi.registerCommand("native-nats-b4-status", { description: "Observe root manager public status without foreground consumption", handler: async id => {
@@ -274,6 +309,9 @@ export default function natsCompletionParent(pi: ExtensionAPI): void {
     await runtime.agents.stop(id.trim(), { consume: false });
     await entry.native.closed;
     await entry.native.treeClosed;
+    // The earlier queued snapshot was not a successful NATS spawn receipt. Join
+    // the real registry invocation now that native exit can release its permit.
+    await successorSpawn;
     output("nats-b4-joined.json", { id: id.trim(), status: runtime.agents.status(id.trim()),
       veto: runTreeResourceVeto(entry.run, 0, undefined, true, true) ?? null });
   } });

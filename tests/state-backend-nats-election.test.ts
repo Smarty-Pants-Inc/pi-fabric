@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { importMeshStateToNats } from "../src/mesh/backend-migration-nats.js";
 import { closeNatsStateBackend, MeshStateNatsUnavailableError, natsStreamName, openNatsStateBackend, type JetStreamPort } from "../src/mesh/state-backend-nats.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
-import { startNatsElectionCluster, stopNatsElectionCluster, type NatsElectionCluster } from "./helpers/nats-election-cluster.js";
+import { startNatsElectionCluster, stopNatsElectionCluster, waitForNatsElectionReadiness, type NatsElectionCluster } from "./helpers/nats-election-cluster.js";
 
 const binary = process.env.NATS_BIN?.trim();
 const identity: MeshIdentity = { id: "election-test", name: "election-test", kind: "agent" };
@@ -53,6 +53,39 @@ const observePeerElection = async (cluster: NatsElectionCluster, paused: string,
   }
   throw new Error(`healthy peers did not agree on a new metadata leader before SIGCONT: ${JSON.stringify(last)}`);
 };
+describe("election monitor readiness contract", () => {
+  // Keep: a trust boundary. The real backend reads /varz only; /jsz cannot authorize its durable open.
+  it("waits for /varz sync_always even when /jsz and the metadata quorum are already ready", async () => {
+    const nodes = [1, 2, 3].map(index => ({ name: `election-${index}`, monitorUrl: `http://127.0.0.1:${8200 + index}` }));
+    const varzReads = new Map<string, number>();
+    const fetchMonitor: typeof fetch = async input => {
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      const node = nodes.find(candidate => new URL(candidate.monitorUrl).origin === url.origin)!;
+      const peers = nodes.filter(candidate => candidate !== node);
+      if (url.pathname === "/varz") {
+        const reads = (varzReads.get(node.name) ?? 0) + 1;
+        varzReads.set(node.name, reads);
+        // The first response lacks exactly the fact required by the product, but /jsz has it below.
+        return Response.json({ server_name: node.name, server_id: `id-${node.name}`,
+          jetstream: { config: reads === 1 ? {} : { sync_always: true } } });
+      }
+      if (url.pathname === "/routez") return Response.json({ num_routes: 2,
+        routes: peers.map(peer => ({ remote_id: `id-${peer.name}` })) });
+      if (url.pathname === "/jsz") return Response.json({ config: { sync_always: true },
+        meta_cluster: { leader: nodes[0]!.name, cluster_size: 3,
+          replicas: nodes.slice(1).map(peer => ({ name: peer.name, current: true, offline: false })) } });
+      return Response.json({ status: "ok" });
+    };
+    const ready = await waitForNatsElectionReadiness(nodes, { fetch: fetchMonitor, timeoutMs: 2_000 });
+    expect(ready.metaLeader).toBe("election-1");
+    expect(ready.nodes.every(node => node.problems.length === 0)).toBe(true);
+    for (const node of ready.nodes) {
+      const server = node.diagnostics.server as { body: { jetstream: { config: { sync_always?: boolean } } } };
+      expect(server.body.jetstream.config.sync_always, `${node.name} /varz must authorize the real backend open`).toBe(true);
+    }
+  });
+});
+
 describe("real three-node NATS metadata-leader election", () => {
   // Keep: #11950/#13112's real R3-history / silent R1-receiver split, without changing CREATE or pull budgets.
   it.skipIf(!binary)("bootstraps exact R3 history while the actual distinct R1 consumer host is paused before first NEXT", async () => {

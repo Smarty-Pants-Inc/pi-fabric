@@ -66,6 +66,16 @@ const indexedOutcomes = (file: string): Readonly<OutcomeIndex> => {
   } finally { fs.closeSync(fd); }
 };
 
+/** Read-only terminal receipt lookup; reuse the same incremental index as append deduplication. */
+export const hasDeliveryOutcome = (meshRoot: string, send: DeliverySend, outcome: DeliveryOutcome): boolean => {
+  const directory = path.join(meshRoot, "delivery-outcomes");
+  let names: string[];
+  try { names = fs.readdirSync(directory); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return false; throw error; }
+  const key = outcomeKey({ ...send, outcome });
+  return names.some(name => /^\d{8}\.jsonl$/.test(name) && indexedOutcomes(path.join(directory, name)).keys.has(key));
+};
+
 /** Keep the newest half of each limit behind one marker carrying the cumulative dropped count. */
 const compactPartition = (file: string, limits: DeliveryOutcomeLimits, at: number): void => {
   let dropped = 0;

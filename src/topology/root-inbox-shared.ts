@@ -230,11 +230,12 @@ const inboxReceiptSession = (entries: Iterable<readonly [number, unknown]>, coun
       }
       // Mixed-version inbox messages carried only globally unique mesh event ids.
       for (const id of entry.details.ids) if (typeof id === "string") remember(eventReceipt(id), at);
-      if (Array.isArray(entry.details.receipts)) {
-        for (const id of entry.details.receipts) if (typeof id === "string") remember(id, at);
-      }
     }
-    if (entry.customType !== AGENT_MESSAGE_CUSTOM_TYPE) continue;
+    const agent = entry.customType === AGENT_MESSAGE_CUSTOM_TYPE;
+    if ((entry.customType === ROOT_INBOX_CUSTOM_TYPE || agent) && Array.isArray(entry.details?.receipts)) {
+      for (const id of entry.details.receipts) if (typeof id === "string") remember(id, at);
+    }
+    if (!agent) continue;
     // A batch of followUps (smarty-dev#1495) carries each one in items.
     const carried: Carried[] = Array.isArray(entry.details?.items) ? entry.details.items as Carried[] : [entry.details ?? {}];
     for (const item of carried) {

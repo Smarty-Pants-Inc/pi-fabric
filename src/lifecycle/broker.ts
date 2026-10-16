@@ -236,10 +236,9 @@ export class LifecycleBroker {
       updatedAt: now,
       createdBy: structuredClone(this.identity),
     };
-    await this.mesh.writeBatch({ identity: this.identity, ops: [], prepare: () => {
-      this.#assertSubscriptionAdmission();
-      return [{ kind: "put", key: subscriptionKey(subscription.id), value: subscription, ifVersion: 0 }];
-    } });
+    await this.mesh.writeBatch({ identity: this.identity,
+      ops: [{ kind: "put", key: subscriptionKey(subscription.id), value: subscription, ifVersion: 0 }],
+      beforeCommit: () => this.#assertSubscriptionAdmission() });
     this.#wake();
     return structuredClone(subscription);
   }
@@ -265,10 +264,9 @@ export class LifecycleBroker {
     const key = subscriptionKey(id.trim());
     const entry = this.mesh.get(key, { fresh: true });
     if (!entry || !lifecycleSubscriptionFromValue(entry.value)) return { removed: false };
-    const [result] = await this.mesh.writeBatch({ identity: this.identity, ops: [], prepare: () => {
-      this.#assertSubscriptionAdmission();
-      return [{ kind: "delete", key, ifVersion: entry.version }];
-    } });
+    const [result] = await this.mesh.writeBatch({ identity: this.identity,
+      ops: [{ kind: "delete", key, ifVersion: entry.version }],
+      beforeCommit: () => this.#assertSubscriptionAdmission() });
     return { removed: result?.applied === true };
   }
 

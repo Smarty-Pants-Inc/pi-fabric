@@ -431,6 +431,9 @@ export interface FabricRetentionConfig {
   legacyRunArchiveAgeMs?: number;
 }
 
+/** Aggregate serialized event/image budget for an opt-in actor batch; single oversized events run alone. */
+export const DEFAULT_ACTOR_BATCH_MAX_BYTES = 256 * 1024;
+
 export interface FabricActorsConfig {
   /** Reset an actor's Pi session at a run boundary once its file exceeds this many bytes; 0 disables. */
   maxSessionBytes: number;

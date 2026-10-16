@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import type { FabricActorRequest } from "./types.js";
 import type { MeshIdentity } from "../mesh/event-log.js";
-import type { MeshStateEntry } from "../mesh/state-file.js";
+import type { MeshBatchOperation, MeshBatchView, MeshStateEntry } from "../mesh/state-file.js";
 import type { MeshStore } from "../mesh/store.js";
 import { ActorSlotClaimRefusedError, NativeSlotAuthority, matchSlotTopic,
   type SlotRefusalReason, type SlotStatus, type SlotTopic } from "./slot-authority.js";
@@ -65,6 +65,8 @@ export class ActorSlotCreateUncertainError extends Error {
 const object = (value: unknown): value is Record<string, unknown> => !!value && typeof value === "object" && !Array.isArray(value);
 const nonempty = (value: unknown): value is string => typeof value === "string" && value.length > 0;
 const positive = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) > 0;
+const ADMISSION_PLAN_ATTEMPTS = 3;
+const ADMISSION_PLAN_STALE = Symbol("slot admission plan stale");
 function refuse(reason: SlotRefusalReason, message: string): never { throw new ActorSlotClaimRefusedError(reason, message); }
 
 /** Strict recoverable JSON, with canonical object order for stable immutable request fingerprints. */
@@ -187,7 +189,9 @@ export class SlotAdmissionCoordinator {
     let reused = false;
     let boundaryEntered = false;
     try {
-      await this.mesh.writeBatch({ identity: input.caller, ops: [], prepare: view => {
+      const prepare = (view: MeshBatchView): MeshBatchOperation[] => {
+        selected = undefined;
+        reused = false;
         const old = view.get(addr.admissionKey);
         let pair: Pair | undefined = old ? readPair(old, binding.authorityGeneration) : undefined;
         if (pair && (pair.claimKey !== token.key || pair.claimVersion !== token.ifVersion || pair.rootId !== input.caller.id
@@ -238,12 +242,33 @@ export class SlotAdmissionCoordinator {
         pair.roles[roleName] = selected;
         this.#validateBytes(pair);
         return [{ kind: "put", key: addr.admissionKey, value: pair, ifVersion: old?.version ?? view.version(addr.admissionKey) }];
-      }, beforeCommit: () => {
-        this.#authority.assert(input.registryRoot);
-        if (!selected) throw new Error("Slot transaction did not select an actor identity");
-        boundaryEntered = true;
-        input.beforeCommit?.(selected.actorId);
-      } });
+      };
+      for (let attempt = 0; ; attempt += 1) {
+        // Plan scans/JSON copies before BEGIN IMMEDIATE. Validate the WHOLE ledger prefix,
+        // not just the rows seen: a newly inserted pair can steal this root's request key
+        // or actor ID. The claim key also fences ownership, revision and deletion/ABA.
+        // As in the mesh mirror planner, bounded stale retries end with the original
+        // transactional path, preserving progress without trusting an unvalidated plan.
+        const early = attempt < ADMISSION_PLAN_ATTEMPTS - 1 ? this.mesh.stateView() : undefined;
+        const planned = early ? prepare(early.view) : undefined;
+        try {
+          await this.mesh.writeBatch({ identity: input.caller, ops: [], prepare: view => {
+            if (!early) return prepare(view);
+            if (!this.mesh.stateUnchangedSince(early.revision, [addr.key, SLOT_ADMISSION_PREFIX])) throw ADMISSION_PLAN_STALE;
+            // Prefix feeds do not name evicted tombstones. Presence/content is validated,
+            // but an absent key's retained CAS revision may now be zero: use the live slot.
+            return planned!.map(op => ({ ...op, ifVersion: view.version(op.key) }));
+          }, beforeCommit: () => {
+            this.#authority.assert(input.registryRoot);
+            if (!selected) throw new Error("Slot transaction did not select an actor identity");
+            boundaryEntered = true;
+            input.beforeCommit?.(selected.actorId);
+          } });
+          break;
+        } catch (error) {
+          if (error !== ADMISSION_PLAN_STALE) throw error;
+        }
+      }
       // No actor success/projection may precede this keyed-state barrier, including exact retry.
       await this.mesh.stateBackendHandle.sync(5_000);
       this.#authority.assert(input.registryRoot);

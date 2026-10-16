@@ -28,7 +28,8 @@
  * retried ASYNCHRONOUSLY with short jittered sleeps capped at 4 ms, and the waiter joins the existing advisory
  * `MeshLockTicket` FIFO (keyed on `state.db`, separate from the `.lock` queue) after `fifoAfterMs` (default 25 ms).
  * The FIFO head waits inside SQLite's busy handler for HEAD_BUSY_MS (5 ms: node:sqlite runs it synchronously, so it
- * is an event-loop stall, kept within the existing busy_timeout clamp) and re-polls after 1 ms.
+ * is an event-loop stall, kept within the existing busy_timeout clamp) and re-polls after 1 ms. Ineligible non-heads
+ * wake on their predecessor's receipt removal, with a 20 ms safety net for missed events and stalled-head checks.
  * Mixed releases (smarty-dev#10516): the default is the contest of the releases before pi-fabric#936 (8d0af4b0),
  * 25 ms without a ticket and then the FIFO, so on a shared store a writer does no worse than they do. Strict FIFO
  * (smarty-dev#9805: with `fifoAfterMs: 0` a newcomer that finds anyone queued takes its ticket before its first
@@ -557,6 +558,8 @@ const WRITER_YIELD_BUDGET_MS = 250;
 // handler synchronously, so this blocks the event loop; 5 ms (the busy_timeout clamp) plus a 1 ms re-poll.
 const HEAD_BUSY_MS = 5;
 const HEAD_REPOLL_MS = 1;
+// Non-heads wake when their predecessor leaves at BEGIN; bounded safety net for missed events/stalled heads.
+const NONHEAD_REPOLL_MS = 20;
 // The dead-flag reclaim's claim file (removeDeadFlag) keeps its own, unchanged staleness.
 const CHECKPOINT_FLAG_CLAIM_STALE_MS = 1_000;
 // After a busy maintainer/emergency TRUNCATE this store makes no new attempt for this long (a maintainer: at most
@@ -1825,9 +1828,12 @@ export class SqliteStateStore {
           if (ticket) this.#stats.fifoJoins += 1;
         }
         const cap = Math.min(4, 2 ** Math.min(attempts - 1, 2));
-        // The FIFO head re-polls at once (it alone may contend); everyone else keeps the jittered sleep.
+        // The FIFO head re-polls at once; plain contenders keep their jittered sleep.
         const head = headWaitMs > 0;
-        await delay(Math.min(deadline - now, head ? HEAD_REPOLL_MS : cap * (0.5 + Math.random() / 2)), this.#signal);
+        // Only non-heads use ticket.wait: its head watcher expects a directory/.lock, not this state.db.
+        // Receipt removal is their normal wake; avoid every queued writer re-statting WAL/flags every 2..4 ms.
+        if (ticket && !eligible) await ticket.wait(Math.min(deadline - now, NONHEAD_REPOLL_MS), this.#signal);
+        else await delay(Math.min(deadline - now, head ? HEAD_REPOLL_MS : cap * (0.5 + Math.random() / 2)), this.#signal);
         if (yielding) yieldedMs += performance.now() - iteration;
       }
     } finally {

@@ -21,12 +21,25 @@ const WINDOW = 272_000;
 const OVERFLOW = "Context exceeds window: estimated 272511 input tokens, window 272000";
 const PROVIDER_OVERFLOW = "prompt is too long: 280000 tokens > 272000 maximum";
 const STREAM_DISCONNECT = "cliproxyapi/gpt-6-luna: stream error: stream disconnected before completion: stream closed before response.completed";
+const PROVIDER_OVERLOAD = "cliproxyapi/gpt-6-luna: Our servers are currently overloaded. Please try again later.";
 const QUOTED = 'Tool "read" failed: the log line says "Context exceeds window: estimated 272511 input tokens, window 272000"';
 const args = process.argv.slice(2);
 const arg = (name) => (args.includes(name) ? args[args.indexOf(name) + 1] : undefined);
 const sessionFile = arg("--session");
 const [provider, ...rest] = (arg("--model") ?? "test/overflow").split("/");
-const model = { provider, id: rest.join("/"), contextWindow: WINDOW };
+const model = { provider, id: rest.join("/"), contextWindow: WINDOW,
+  ...(process.env.FAKE_PI_RESPONSES === "1" ? { api: "openai-responses" } : {}) };
+// The relevant native Responses shape: reasoning items are direct input[] entries,
+// never JSON hidden under messages[]. Other fixture scenarios keep their old payload.
+const payloadFor = context => model.api === "openai-responses" ? { input: context.messages.flatMap(message => {
+  if (message.role === "assistant") return message.content.flatMap(block => block.type === "thinking" && block.thinkingSignature
+    ? [JSON.parse(block.thinkingSignature)] : block.type === "toolCall"
+      ? [{ type: "function_call", call_id: block.id, name: block.name, arguments: JSON.stringify(block.arguments) }]
+      : block.type === "text" ? [{ role: "assistant", content: block.text }] : []);
+  if (message.role === "toolResult") return [{ type: "function_call_output", call_id: message.toolCallId,
+    output: message.content.map(block => block.text ?? "").join("") }];
+  return [{ role: message.role, content: message.content }];
+}) } : { messages: context.messages };
 const emit = (event) => process.stdout.write(JSON.stringify(event) + "\n");
 const entries = (file = sessionFile) => file && fs.existsSync(file)
   ? fs.readFileSync(file, "utf8").split("\n").filter(Boolean).map((line) => {
@@ -35,7 +48,9 @@ const entries = (file = sessionFile) => file && fs.existsSync(file)
   : [];
 const append = (message) => {
   if (sessionFile) fs.appendFileSync(sessionFile, JSON.stringify({
-    type: "message", id: randomUUID().slice(0, 8), parentId: null, timestamp: new Date().toISOString(), message,
+    type: "message", id: randomUUID().slice(0, 8),
+    parentId: process.env.FAKE_PI_RESPONSES === "1" ? entries().findLast(entry => entry.type === "message")?.id ?? null : null,
+    timestamp: new Date().toISOString(), message,
   }) + "\n");
 };
 // #10049: only the RPC transport/provider boundary is simulated. Load the actual
@@ -43,18 +58,18 @@ const append = (message) => {
 let activation;
 if (process.env.PI_FABRIC_ACTIVATION_HOOK) {
   const { default: hook } = await import(pathToFileURL(process.env.PI_FABRIC_ACTIVATION_HOOK).href);
-  const { buildSessionContext } = await import("@earendil-works/pi-coding-agent");
+  const { buildSessionContext, convertToLlm } = await import("@earendil-works/pi-coding-agent");
   const handlers = new Map();
   await hook({ on(name, handler) { handlers.set(name, handler); } });
   const dispatch = async (_model, context, options) => {
-    await options.onPayload({ messages: context.messages }, model);
+    await options.onPayload(payloadFor(context), model);
     if (process.env.FAKE_PI_LOG) fs.appendFileSync(`${process.env.FAKE_PI_LOG}.requests`, "request\n");
   };
   const provider = { stream: dispatch, streamSimple: dispatch };
   const ctx = { mode: "rpc", model, sessionManager: { getBranch: entries },
     modelRegistry: { getAll: () => [model], getProvider: () => provider } };
   await handlers.get("session_start")({}, ctx);
-  activation = { handlers, ctx, provider, messages: () => buildSessionContext(entries()).messages };
+  activation = { handlers, ctx, provider, convertToLlm, messages: () => buildSessionContext(entries()).messages };
 }
 const decoder = new StringDecoder("utf8");
 let buffer = "";
@@ -94,7 +109,7 @@ process.stdin.on("data", async (chunk) => {
       if (process.env.FAKE_PI_LOG) {
         fs.appendFileSync(process.env.FAKE_PI_LOG, JSON.stringify({
           history, overflow, session: journal.find((entry) => entry.type === "session")?.id,
-          marker: (task.match(/\b(?:PREFLIGHT_ALWAYS|PREFLIGHT_ON_HISTORY|OVERFLOW_ALWAYS|PROVIDER_OVERFLOW_ON_HISTORY|TOOL_THEN_OVERFLOW_ON_HISTORY|OVERFLOW_ON_HISTORY|SILENT_OVERFLOW|STREAM_DISCONNECT_ONCE|QUOTED_PHRASE|FILL_CONTEXT_85|FILL_CONTEXT|[A-Z]+_REVIEW)\b/g) ?? []).join(","),
+          marker: (task.match(/\b(?:PREFLIGHT_ALWAYS|PREFLIGHT_ON_HISTORY|OVERFLOW_ALWAYS|PROVIDER_OVERFLOW_ON_HISTORY|TOOL_THEN_OVERFLOW_ON_HISTORY|OVERFLOW_ON_HISTORY|SILENT_OVERFLOW|STREAM_DISCONNECT_ONCE|OVERLOAD_NATIVE_RETRY|QUOTED_PHRASE|FILL_CONTEXT_85|FILL_CONTEXT|[A-Z]+_REVIEW)\b/g) ?? []).join(","),
         }) + "\n");
       }
       append({ role: "user", content: task, timestamp: Date.now() });
@@ -108,6 +123,81 @@ process.stdin.on("data", async (chunk) => {
           onPayload: async payload => preflight ? { ...payload, carriedContext: task.includes("PREFLIGHT_ALWAYS")
             ? "x".repeat(WINDOW * 8) : JSON.stringify(journal) } : payload,
         });
+      }
+      if (task.includes("OVERLOAD_NATIVE_RETRY")) {
+        if (!activation) throw new Error("OVERLOAD_NATIVE_RETRY requires the actual activation hook");
+        // #14075: model the retained native frames inside ONE activation/worker, not an
+        // ActorManager replay. The provider transport is offline; the retry admission below
+        // runs the actual hook, its estimator and its nonce-bound refusal protocol.
+        const trace = event => {
+          if (process.env.FAKE_PI_LOG) fs.appendFileSync(`${process.env.FAKE_PI_LOG}.native`, `${JSON.stringify(event)}\n`);
+        };
+        const call = { type: "toolCall", id: "call-overload-read", name: "read", arguments: { path: "synthetic-history.txt" } };
+        const toolTurn = { role: "assistant", provider, model: model.id,
+          api: model.api,
+          content: [{ type: "thinking", thinking: "brief reasoning", thinkingSignature: JSON.stringify({ type: "reasoning",
+            id: "rs_14075", encrypted_content: "h".repeat(1_128_000) }) }, call], stopReason: "toolUse",
+          usage: { input: 190_000, output: 11_471, cacheRead: 0, cacheWrite: 0, totalTokens: 201_471 }, timestamp: Date.now() };
+        append(toolTurn);
+        // Keep the synthetic megabyte ciphertext in the real journal/payload/hook,
+        // not the offline RPC diagnostic copy (the worker needs usage + tool calls).
+        const rpcToolTurn = { ...toolTurn, content: [{ type: "thinking", thinking: "brief reasoning" }, call] };
+        emit({ type: "message_end", message: rpcToolTurn });
+        // Bind the successful report and its emitted opaque item to the initial dispatch.
+        // Empty toolResults isolates admission from activation compaction.
+        await activation.handlers.get("turn_end")({ message: toolTurn, toolResults: [], context: { contextMessages: activation.messages() } });
+        emit({ type: "tool_execution_start", toolCallId: call.id, toolName: call.name, args: call.arguments });
+        const toolResult = { role: "toolResult", toolCallId: call.id, toolName: call.name,
+          content: [{ type: "text", text: "t".repeat(6144) }], isError: false, timestamp: Date.now() };
+        append(toolResult);
+        emit({ type: "tool_execution_end", toolCallId: call.id, toolName: call.name,
+          result: { content: toolResult.content }, isError: false });
+        emit({ type: "message_end", message: toolResult });
+        emit({ type: "turn_end", message: rpcToolTurn, toolResults: [toolResult] });
+        trace({ type: "tool_turn", stopReason: toolTurn.stopReason, totalTokens: toolTurn.usage.totalTokens, toolResultBytes: 6144 });
+        // Keep stream frames ordered before the hook's synchronous protocol writes/exit.
+        await new Promise(resolve => process.stdout.write("", resolve));
+        const beforeError = await activation.handlers.get("context")({ messages: activation.messages() });
+        await activation.handlers.get("before_provider_headers")({}, activation.ctx);
+        await activation.provider.streamSimple(model, { messages: activation.convertToLlm(beforeError.messages) }, { onPayload: payload => payload });
+        trace({ type: "pre_overload_admitted" });
+        const usageMode = process.env.FAKE_PI_OVERLOAD_USAGE ?? "zero";
+        const error = { role: "assistant", provider, model: model.id, api: model.api, content: [], stopReason: "error", errorMessage: PROVIDER_OVERLOAD,
+          ...(usageMode === "absent" ? {} : { usage: { input: usageMode === "present" ? 201_471 : 0,
+            output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: usageMode === "present" ? 201_471 : 0 } }), timestamp: Date.now() };
+        append(error);
+        emit({ type: "turn_start" });
+        emit({ type: "message_end", message: error });
+        emit({ type: "turn_end", message: error, toolResults: [] });
+        await activation.handlers.get("turn_end")({ message: error, toolResults: [], context: { contextMessages: activation.messages() } });
+        trace({ type: "overload", stopReason: error.stopReason, errorMessage: error.errorMessage, usage: error.usage });
+        emit({ type: "agent_end", willRetry: true });
+        const retry = { type: "auto_retry_start", attempt: 1, maxAttempts: 3, delayMs: 0, errorMessage: PROVIDER_OVERLOAD };
+        emit(retry); trace(retry);
+        emit({ type: "agent_start" });
+        emit({ type: "turn_start" });
+        // Native Pi omits the failed attempt from the next model projection, while
+        // keeping it in raw history. Preserve that distinction without editing the journal.
+        const context = activation.messages().filter(message => message !== error &&
+          !(message.role === "assistant" && message.stopReason === "error"));
+        const projected = await activation.handlers.get("context")({ messages: context });
+        const messages = activation.convertToLlm(projected.messages);
+        const { estimateContextTokens, estimateTextTokens } = await import("@earendil-works/pi-ai/utils/estimate");
+        trace({ type: "retry_admission", nativeEstimate: estimateContextTokens(messages),
+          rawPayloadEstimate: estimateTextTokens(JSON.stringify(payloadFor({ messages }))), contextWindow: WINDOW });
+        await new Promise(resolve => process.stdout.write("", resolve));
+        await activation.handlers.get("before_provider_headers")({}, activation.ctx);
+        await activation.provider.streamSimple(model, { messages }, { onPayload: payload => payload });
+        trace({ type: "retry_admitted" });
+        const answer = { role: "assistant", provider, model: model.id, api: model.api, content: [{ type: "text", text: "verdict: ok" }], stopReason: "stop",
+          usage: { input: 203_300, output: 10, cacheRead: 0, cacheWrite: 0, totalTokens: 203_310 }, timestamp: Date.now() };
+        append(answer);
+        emit({ type: "message_end", message: answer });
+        emit({ type: "turn_end", message: answer, toolResults: [] });
+        emit({ type: "auto_retry_end", success: true, attempt: 1 });
+        emit({ type: "agent_end" });
+        emit({ type: "agent_settled", outcome: "completed" });
+        continue;
       }
       if (silent) {
         // The provider accepted more input than the window and still answered "stop".

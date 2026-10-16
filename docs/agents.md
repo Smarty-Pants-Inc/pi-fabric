@@ -1399,6 +1399,53 @@ The configuration is returned in actor status and definitions and survives globa
 
 Stop, removal, redefinition and a user halt cancel pending trailing work so it cannot return on restart. Manager close cancels all live timers and prevents delivery from the closed manager; for persistent actors it suspends pending delivery in the queue snapshot for the next manager, as it does already-admitted queue items. A timer rechecks current actor ownership and lifecycle before admission. Configure the interval at creation (or in the template before import).
 
+#### Batch matched observations
+
+Set `batchWindowMs` on `agents.create`, or update a live actor with
+`agents.setBatching({ id, batchWindowMs: 300_000, batchMax: 50, batchMaxBytes: 262_144 })`.
+All three options survive global template export/import. `batchWindowMs` defaults
+to `0`, which keeps single-event behavior; `batchMax` defaults to `50` (maximum
+`1000`), and `batchMaxBytes` defaults to `256 KiB`. Values are safe integers: the
+window is non-negative and both limits are positive. Invalid settings throw
+`FabricActorBatchPolicyError` with code `FABRIC_ACTOR_BATCH_POLICY_INVALID`.
+
+With a positive window, the first queued matched observation anchors its
+expiry. Later arrivals do not extend it. At expiry, `batchMax` events or the
+aggregate byte boundary, one activation receives an array of the existing `{ source, payload, id }` input
+envelopes in FIFO order. Each payload retains its original ref, kind and data.
+Filtering still runs per event before admission and before execution. Positive
+batching suspends replacement-style `coalesce` and `coalesceKey`, so all matched
+observations are retained. An explicitly configured `activation.minIntervalMs`
+still performs its separate settlement admission before the queue.
+
+Direct asks/messages, mesh `steer` or `ask` kinds, Main-origin mesh messages,
+and host `input`/`user_bash` bypass the window. Pending observations run first
+(in groups bounded by `batchMax` and `batchMaxBytes`); the urgent item then runs
+separately without a window. An unlaunched preparation retry keeps its older
+batch ahead of an already pending bypass; ordinary retries retain queue rotation. This keeps FIFO order and the caller's binding and attribution. Main
+is the existing lead/person message identity; Fabric does not infer roles from
+message text or data. Normal actor serialization and admission still apply.
+
+The existing queue checkpoints every original event before any window opens.
+Queue limits, overflow, dead letters, completed-key history and delivery
+receipts count individual events, never batches. Restart restores the original
+IDs and deadline; overdue work runs immediately. Before transport launch, a
+durable manifest binds `activationId` to every original `batchIds` member,
+including one-event batches. The same manifest leads the run's task file, so
+ENODEV saved-answer recovery matches its explicit activation ID, not array
+indentation. Restart cannot append new events to that activation. Other
+interrupted runs retain the existing per-event, at-least-once recovery policy.
+
+The byte budget counts serialized envelopes, images, hydrated wake text and
+member IDs. Collection stops before adding an event that would cross it. A
+single oversized event runs alone, never with its neighbors. A completed-key
+repeat stays pending until its earlier occurrence completes successfully; a
+failed earlier batch cannot discard that repeat. A single unref'd
+timer per actor wakes the queue while a window is open; there is no timer per
+event. Setting the window to `0` releases pending work without replacing an
+active activation. Mixed-trust batches keep each input's trust marking and
+cannot inherit a different input's output principal.
+
 #### Activation filter
 
 An actor that runs a model on every event spends most runs on events it always ignores. Set `activationFilter` to a list of skip rules. Fabric checks each queued mesh or host event against the rules just before it would run the model. When a rule matches, Fabric skips the event with no model call. A rule only skips: it never acts, replies or changes the event. Direct messages (`ask`, `tell`) are never filtered. Fabric checks an event when it arrives, before it can join or replace a queued item, and again just before the run (for items queued before the filter was set). So a skipped event never replaces a queued one by `coalesceKey`: a comment edit that arrives while its comment's creation waits in the queue is skipped, and the creation still runs.

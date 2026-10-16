@@ -359,6 +359,9 @@ describe("resident terminal event retention", () => {
       await host.start();
       expect(fs.readFileSync(path.join(old, "events.jsonl")).equals(log)).toBe(true);
       vi.spyOn(host.agents, "retentionReferences").mockReturnValue(new Set(["held"]));
+      // This fixture substitutes a completed reference snapshot. Keep its new
+      // admission observer consistent; partial-cursor safety is covered separately.
+      vi.spyOn(host.agents, "retentionReferencesReady").mockReturnValue(true);
       write(actorRoot, ".", "actors", { actors: [{ id: "actor", lastRunId: "latest" }] });
       const deadline = Date.now() + 2000;
       while (fs.statSync(path.join(old, "events.jsonl")).size > 256 * 1024 && Date.now() < deadline) {

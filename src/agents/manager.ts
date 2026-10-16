@@ -27,7 +27,7 @@ import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
 import { readFileRetrying, renameAtomic, syncDirectoryChain, trackTemporary, writeJsonAtomic } from "../core/atomic-write.js";
 import { discardWorkerCompletion, type CompletionRecipient } from "./completion-journal.js";
 import { processStartTime } from "../residency/process-identity.js";
-import { countUnknownEnodevStarts, enodevDelivered, enodevUnresolvedRuns, noteEnodevDelivered, peekEnodevRun, settleEnodevRun,
+import { assertRecoveryAllowed, recoveryRunDirectories, recoverySlice, countUnknownEnodevStarts, enodevDelivered, enodevUnresolvedRuns, noteEnodevDelivered, peekEnodevRun, settleEnodevRun,
   settleGoneEnodevLaunch, settleLostEnodevRun, ownedProcess, provenGoneEnodevLaunch, goneEnodevOutcome, savedEnodevAnswer, recoverDurableActorStop, type OwnedProcess } from "./enodev-recovery.js";
 import {
   DEFAULT_FABRIC_CONFIG,
@@ -1340,7 +1340,11 @@ export class AgentManager {
   /** Results of runs a previous runtime of this session stopped at reload/shutdown. */
   readonly #previousRuns = new Map<string, PreviousRun>();
   #previousRunBytes = 0;
-  #enodevRuns: string[] | undefined;
+  #enodevRuns: Set<string> | undefined;
+  #enodevPreparation: Promise<void> | undefined;
+  readonly #enodevUnknownStarts = new Map<string, {
+    iterator: Iterator<string>; starts: number; alarm: boolean; unknown: boolean; done: boolean;
+  }>();
   readonly #enodevCommits = new Map<string, { directory: string; actorId: string; activationId: string }>();
   /** pi-fabric#939 round 3: runs THIS manager settled through #912's recovery (it removed their markers itself). */
   readonly #enodevSettledHere = new Set<string>();
@@ -3395,19 +3399,34 @@ export class AgentManager {
   /**
    * Re-attach hosted runs persisted under this run root, as after a resident
    * host restart. Recovery calls `attach`, never `start`: a run the adapter
-   * cannot vouch for settles failed with outcome "indeterminate".
+   * cannot vouch for settles failed with outcome "indeterminate". Resident
+   * startup supplies its durable hosted metadata IDs, not the historical run
+   * directory. Omitted candidates preserve explicit standalone recovery.
    */
-  async recoverHostedRuns(): Promise<string[]> {
-    let entries: string[];
-    try {
-      entries = fs.readdirSync(this.#runRoot);
-    } catch {
-      return [];
-    }
+  async recoverHostedRuns(candidates?: readonly string[], options: {
+    signal?: AbortSignal;
+    canRecover?: () => boolean;
+    shouldRecover?: (id: string) => boolean;
+    budgetMs?: number;
+    maxEntries?: number;
+  } = {}): Promise<string[]> {
+    const scan = { ...options, canRecover: () => !this.#closing && options.canRecover?.() !== false };
+    const check = () => assertRecoveryAllowed(scan);
+    check();
+    // Even an explicit list can contain thousands of non-hosted statuses. No synchronous prefix sweep.
+    await new Promise<void>(resolve => setImmediate(resolve));
+    check();
     const recovered: string[] = [];
-    for (const entry of entries) {
-      while (this.#releasePaused) await this.#waitForRelease();
-      if (this.#closing || this.#runs.has(entry) || !/^[0-9a-f]{32}$/.test(entry)) continue;
+    const slice = recoverySlice(options);
+    const entries = candidates ?? recoveryRunDirectories(this.#runRoot, scan);
+    for await (const candidate of entries) {
+      const pause = slice();
+      if (pause) await pause;
+      check();
+      while (this.#releasePaused) { await this.#waitForRelease(options.signal); check(); }
+      check();
+      const entry = candidates === undefined ? path.basename(candidate) : candidate;
+      if (this.#runs.has(entry) || !/^[0-9a-f]{32}$/.test(entry) || options.shouldRecover?.(entry) === false) continue;
       const runDirectory = path.join(this.#runRoot, entry);
       const statusFile = path.join(runDirectory, "status.json");
       const record = readRecord(statusFile);
@@ -3434,6 +3453,7 @@ export class AgentManager {
         }
       }
       if (refusal || adapter?.kind !== "hosted") {
+        check();
         const now = Date.now();
         const { currentTool: _tool, blockedOn: _blocked, sleeping: _sleeping, ...rest } = record;
         writeRecord(statusFile, {
@@ -3459,12 +3479,23 @@ export class AgentManager {
         record,
         this.#hostedHooks(() => managed),
       );
+      if (options.shouldRecover?.(entry) === false) continue;
+      check();
+      // Another recovery may have adopted while the directory cursor was suspended.
+      if (this.#runs.has(entry)) continue;
       managed = this.#adoptHosted(hosted, { release: () => {}, recovered: true });
-      await hosted.attach();
-      while (this.#releasePaused) await this.#waitForRelease();
-      void this.#monitor(managed, Math.max(0, state.context.deadlineAt - Date.now()));
+      try {
+        check();
+        await hosted.attach();
+        check();
+        while (this.#releasePaused) { await this.#waitForRelease(options.signal); check(); }
+      } finally {
+        // Adoption transfers custody even if attach or a later lifecycle gate fails.
+        void this.#monitor(managed, Math.max(0, state.context.deadlineAt - Date.now()));
+      }
       recovered.push(entry);
     }
+    check();
     return recovered;
   }
 
@@ -3493,13 +3524,33 @@ export class AgentManager {
     onQueued?: (handle: AgentHandleInfo) => void,
     preparation?: AgentLaunchPreparationOptions,
   ): Promise<AgentRunResult> {
-    while (this.#releasePaused && !request.residentStartupProbe) await this.#waitForRelease(signal);
-    if (request.actorId && request.activationId && !signal?.aborted && (!authorize || authorize())) {
-      const stopped = await recoverDurableActorStop(this.#runRoot, request.actorId, request.activationId, this.#closeAbort.signal);
+    const recoveryOptions = {
+      ...(signal ? { signal } : {}),
+      canRecover: () => !this.#closing && (!authorize || authorize()),
+      beforeRecover: (): Promise<void> | undefined => {
+        if (!this.#releasePaused || request.residentStartupProbe) return undefined;
+        return (async () => {
+          while (this.#releasePaused && !request.residentStartupProbe) await this.#waitForRelease(signal);
+          assertRecoveryAllowed(recoveryOptions);
+        })();
+      },
+    };
+    const released = recoveryOptions.beforeRecover();
+    if (released) await released;
+    if (request.actorId && request.activationId && !this.#closing && !signal?.aborted && (!authorize || authorize())) {
+      let savedStopDirectory: string | undefined;
+      const stopped = await recoverDurableActorStop(this.#runRoot, request.actorId, request.activationId, this.#closeAbort.signal,
+        { ...recoveryOptions, onSavedAnswer: directory => { savedStopDirectory = directory; } });
+      const resumed = recoveryOptions.beforeRecover();
+      if (resumed) await resumed;
+      assertRecoveryAllowed(recoveryOptions);
       if (stopped) return stopped;
+      const recovered = await this.#recoverEnodevRun(request, signal, authorize, savedStopDirectory);
+      const releasedAgain = recoveryOptions.beforeRecover();
+      if (releasedAgain) await releasedAgain;
+      assertRecoveryAllowed(recoveryOptions);
+      if (recovered) return recovered;
     }
-    const recovered = this.#recoverEnodevRun(request, signal, authorize);
-    if (recovered) return recovered;
     const handle = await this.spawn(request, signal, authorize, undefined, onOutputPrincipalDowngrade, onSpawned, preparation);
     const queued = this.#queued.get(handle.id);
     if (queued && !queued.terminal && !queued.preparing) onQueued?.(this.#queuedInfo(queued));
@@ -3882,6 +3933,13 @@ export class AgentManager {
     return refs;
   }
 
+  /** A partial cursor protects via wildcard hints but must not admit resident
+   * collection. A completed wildcard still uses the collector's existing
+   * independent fresh checks; legacy callers retain their previous behavior. */
+  retentionReferencesReady(now = Date.now()): boolean {
+    return !retentionV2Enabled() || this.#referenceScan.current(this.#retentionGeneration(), now);
+  }
+
   // Windows scope cut: verbatim main 9387af87 implementation.
   #mainRetentionReferences(): Set<string> {
     const refs = new Set<string>();
@@ -4081,7 +4139,9 @@ export class AgentManager {
               // passes; otherwise a delta inflates the actor overflow fence.
             }
           }
-          if (expired()) yield;
+          // Count cached/skipped entries too: a warm watermark must not turn
+          // maxEntries into an unbounded directory walk within one time slice.
+          yield;
         }
       } catch { protect("*"); return; }
       finally { try { directory?.closeSync(); } catch { protect("*"); } }
@@ -4090,7 +4150,7 @@ export class AgentManager {
       for (const [id, prepared] of this.#retentionWatermark) {
         index(id, prepared.actorId);
         if (prepared.held) protect(typeof prepared.actorId === "string" && /^[A-Za-z0-9_-]+$/.test(prepared.actorId) ? id : "*", prepared.actorId);
-        if (expired()) yield;
+        yield;
       }
       // A native cursor may miss additions behind its slot, including changes
       // during the suspended hint phase. Re-open for new identities only.
@@ -4224,20 +4284,30 @@ export class AgentManager {
   // pi-fabric#912 round 3: the shortcut runs only for an authorized, unaborted request (the same gate spawn applies;
   // otherwise spawn refuses it and the marker is untouched), and it settles nothing: the actor commits after it
   // delivered the answer (commitEnodevRecovery). An uncommitted recovery keeps the marker and the answer.
-  #recoverEnodevRun(request: AgentRunRequest, signal?: AbortSignal, authorize?: () => boolean): AgentRunResult | undefined {
+  async #recoverEnodevRun(request: AgentRunRequest, signal?: AbortSignal, authorize?: () => boolean, freshStopDirectory?: string): Promise<AgentRunResult | undefined> {
     if (!request.actorId || !request.activationId) return undefined;
     // The receipt is Linux ENODEV evidence, but replay needs no Linux APIs:
     // peekEnodevRun still requires a provably dead worker on every platform.
-    if (signal?.aborted || (authorize && !authorize())) return undefined;
-    this.#enodevRuns ??= enodevUnresolvedRuns(this.#runRoot);
-    for (const directory of this.#enodevRuns) {
+    const options = { ...(signal ? { signal } : {}), canRecover: () => !this.#closing && (!authorize || authorize()) };
+    assertRecoveryAllowed(options);
+    await this.prepareEnodevRecovery();
+    assertRecoveryAllowed(options);
+    // A stop written after the once-only negative scan may carry a completed answer too.
+    if (freshStopDirectory) this.#enodevRuns!.add(freshStopDirectory);
+    const slice = recoverySlice();
+    for (const directory of this.#enodevRuns!) {
+      const pause = slice();
+      if (pause) await pause;
+      assertRecoveryAllowed(options);
+      while (this.#releasePaused && !request.residentStartupProbe) { await this.#waitForRelease(signal); assertRecoveryAllowed(options); }
+      assertRecoveryAllowed(options);
       const result = peekEnodevRun(directory, request.actorId, request.activationId);
       if (!result) continue;
       if (result.status === "stopped" || result.status === "timed_out") {
         const settled = settleEnodevRun(directory, request.actorId, request.activationId);
         if (settled) {
           this.#enodevSettledHere.add(result.id);
-          this.#enodevRuns = this.#enodevRuns.filter(other => other !== directory);
+          this.#enodevRuns!.delete(directory);
           const resultFile = path.join(directory, MANAGER_RESULT_FILE);
           const fingerprint = writePrivateJsonAtomic(resultFile, settled);
           this.#rememberPreviousRun(settled, resultFile, fingerprint);
@@ -4279,7 +4349,7 @@ export class AgentManager {
     if (!settleEnodevRun(pending.directory, pending.actorId, pending.activationId)) return false;
     this.#enodevSettledHere.add(runId);
     this.#enodevCommits.delete(runId);
-    this.#enodevRuns = (this.#enodevRuns ?? []).filter(other => other !== pending.directory);
+    this.#enodevRuns?.delete(pending.directory);
     this.#retentionRevision++;
     this.#releaseProvenGone(); // smarty-dev#9855: same step as the settle
     return true;
@@ -4290,15 +4360,30 @@ export class AgentManager {
    * restored queue) will never be claimed by a run request: settle it as lost once its worker is proven gone, so
    * retention can collect it. One log line per run.
    */
-  settleLostEnodevRuns(actorId: string, pending: ReadonlySet<string>): void {
+  async settleLostEnodevRuns(actorId: string, pending: ReadonlySet<string> | (() => ReadonlySet<string>),
+    canRecover?: () => boolean): Promise<void> {
     if (process.platform !== "linux") return;
-    this.#enodevRuns ??= enodevUnresolvedRuns(this.#runRoot);
-    for (const directory of this.#enodevRuns) {
-      const activationId = settleLostEnodevRun(directory, actorId, pending);
+    const options = { canRecover: () => !this.#closing && !this.#releasePaused && canRecover?.() !== false };
+    assertRecoveryAllowed(options);
+    await this.prepareEnodevRecovery();
+    assertRecoveryAllowed(options);
+    const slice = recoverySlice();
+    let protectedIds = typeof pending === "function" ? pending() : pending;
+    for (const directory of this.#enodevRuns!) {
+      const pause = slice();
+      if (pause) {
+        await pause;
+        assertRecoveryAllowed(options);
+        protectedIds = typeof pending === "function" ? pending() : pending;
+      }
+      assertRecoveryAllowed(options);
+      const activationId = settleLostEnodevRun(directory, actorId, protectedIds);
       if (activationId === undefined) continue;
       this.#enodevSettledHere.add(path.basename(directory));
-      this.#enodevRuns = this.#enodevRuns.filter(other => other !== directory);
+      this.#enodevRuns!.delete(directory);
       this.#retentionRevision++;
+      // Keep proof and permit release in the same synchronous step, including interrupted sweeps.
+      this.#releaseProvenGone();
       if (enodevDelivered(directory, path.basename(directory), activationId)) {
         diagnostics.warn("src/agents/manager.ts", `[pi-fabric] actor ${actorId}: run ${path.basename(directory)} settled as delivered: its activation ` +
           `${activationId} was delivered and acknowledged before a restart (ENODEV, smarty-dev#8935)`);
@@ -4307,14 +4392,48 @@ export class AgentManager {
       diagnostics.warn("src/agents/manager.ts", `[pi-fabric] actor ${actorId}: run ${path.basename(directory)} settled as lost: its activation ${activationId} ` +
         "is no longer pending and its worker exit was unconfirmed (ENODEV, smarty-dev#8935)");
     }
-    this.#releaseProvenGone(); // smarty-dev#9855: a run this settle proved gone frees its held permit in the same step
+    assertRecoveryAllowed(options);
+    this.#releaseProvenGone();
   }
 
-  /** pi-fabric#912: counts consecutive starts whose queue state for `actorId` was unknown in its ENODEV markers. */
-  countUnknownEnodevStarts(actorId: string, unknown: boolean): { starts: number; alarm: boolean } {
+  /** Shared first-use discovery; an observer's abort never cancels another actor's preparation. */
+  prepareEnodevRecovery(): Promise<void> {
+    if (!this.#enodevPreparation) {
+      const preparation = enodevUnresolvedRuns(this.#runRoot, { signal: this.#closeAbort.signal,
+        canRecover: () => !this.#closing }).then(directories => { this.#enodevRuns = directories; });
+      this.#enodevPreparation = preparation;
+      void preparation.catch(() => {
+        // An incomplete/error scan is never an empty-root proof; actual first use retries.
+        if (this.#enodevPreparation === preparation) this.#enodevPreparation = undefined;
+      });
+    }
+    return this.#enodevPreparation;
+  }
+
+  /** Once per host/actor, with a resumable cursor so interruption cannot increment a marker twice. */
+  async countUnknownEnodevStarts(actorId: string, unknown: boolean, canRecover?: () => boolean): Promise<{ starts: number; alarm: boolean }> {
     if (process.platform !== "linux") return { starts: 0, alarm: false };
-    this.#enodevRuns ??= enodevUnresolvedRuns(this.#runRoot);
-    return countUnknownEnodevStarts(this.#enodevRuns, actorId, unknown);
+    const options = { canRecover: () => !this.#closing && !this.#releasePaused && canRecover?.() !== false };
+    assertRecoveryAllowed(options);
+    await this.prepareEnodevRecovery();
+    assertRecoveryAllowed(options);
+    let progress = this.#enodevUnknownStarts.get(actorId);
+    if (!progress) {
+      progress = { iterator: this.#enodevRuns!.values(), starts: 0, alarm: false, unknown, done: false };
+      this.#enodevUnknownStarts.set(actorId, progress);
+    }
+    const slice = recoverySlice();
+    while (!progress.done) {
+      const pause = slice();
+      if (pause) await pause;
+      assertRecoveryAllowed(options);
+      const next = progress.iterator.next();
+      if (next.done) { progress.done = true; break; }
+      const count = countUnknownEnodevStarts([next.value], actorId, progress.unknown);
+      progress.starts = Math.max(progress.starts, count.starts);
+      progress.alarm ||= count.alarm;
+    }
+    return { starts: progress.starts, alarm: progress.alarm };
   }
 
   #previousRun(id: string): AgentRunResult | undefined {

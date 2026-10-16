@@ -578,6 +578,7 @@ export const ACTOR_STOPPED_ALARM_AFTER_MS = 10 * 60 * 1000;
 export const ACTOR_UNKNOWN_BLOCK_ALARM_AFTER_MS = 30 * 60 * 1000;
 /** An in-flight run is stuck past max(this, 2x the actor's p95 run time) when its worker is gone. */
 export const ACTOR_RUN_STUCK_MIN_MS = 30 * 60 * 1000;
+
 /** Bounds of an actor's dead-letter file (smarty-dev#816): past them, the oldest entries drop, counted. */
 export const ACTOR_DEAD_LETTER_MAX_ENTRIES = 10_000;
 export const ACTOR_DEAD_LETTER_MAX_BYTES = 50 * 1024 * 1024;
@@ -777,6 +778,11 @@ export class ActorManager {
   // snapshot taken before the load (a passive view, or the empty queue a new owner parks before
   // it reloads) would replace or delete the owner's accepted work (review/astra F1 on #79).
   readonly #ownQueueRead = new Set<string>();
+  /** First-load observations survive reloads; discovery starts only at a ready maintenance/resume boundary. */
+  readonly #enodevStartup = new Map<string, {
+    rootId: string; residency: FabricParticipantResidency; unknown: boolean; pending: ReadonlySet<string>; counted?: boolean;
+  }>();
+  readonly #enodevStartupActive = new Map<string, Promise<boolean>>();
   // smarty-dev#1065: callerless work past an actor's queue limit waits here, in order, instead of
   // holding the mesh cursor for every actor of this manager (or being lost in live mode).
   readonly #overflow = new Map<string, ActorQueueItem[]>();
@@ -1145,6 +1151,7 @@ export class ActorManager {
         this.#refreshOwnership(undefined, false);
         for (const actor of this.#actors.values()) {
           if (this.#canManageCached(actor.id)) {
+            if (this.#enodevStartup.has(actor.id)) void this.#recoverStartupEnodev(actor);
             this.#expireActivationFilter(actor);
             // Retry our admitted retirement after cursor progress, not an arbitrary shared
             // backlog discovered by a same-root creator's residency fallback (#11107).
@@ -1216,7 +1223,7 @@ export class ActorManager {
     this.#settledRestoreReady = true;
     this.#syncActorsFromRegistry();
     this.#refreshOwnership();
-    if (this.#initialRetentionPending) this.#startRetentionSweep();
+    if (this.#initialRetentionPending || this.#enodevStartup.size) this.#startRetentionSweep();
     this.#scheduleRestoreParked();
     this.#resumeSettledWindows();
     for (const actor of this.#actors.values()) {
@@ -3203,7 +3210,7 @@ export class ActorManager {
   /** Release custody also includes accepted setup and ownership work, not additional runs. */
   releaseCustodyCount(): number {
     // Use the scope-local count: ActorDirectory aggregates both managers separately.
-    return this.#inFlightRunCount() + this.#pendingCreates + this.#adoptionPending.size;
+    return this.#inFlightRunCount() + this.#pendingCreates + this.#adoptionPending.size + this.#enodevStartupActive.size;
   }
 
   /**
@@ -3754,7 +3761,7 @@ export class ActorManager {
     this.#settledRestoreReady = true;
     this.#scheduleRestoreParked();
     this.#resumeSettledWindows();
-    if (this.#initialRetentionPending) this.#startRetentionSweep();
+    if (this.#initialRetentionPending || this.#enodevStartup.size) this.#startRetentionSweep();
     for (const actor of this.#actors.values()) if (actor.queue.length) this.#ensureDrain(actor);
     this.#meshMonitor.schedule();
   }
@@ -3968,6 +3975,7 @@ export class ActorManager {
     await this.#filterStateSave;
     await this.#notifications.close();
     await this.#retentionSweep;
+    await Promise.allSettled([...this.#enodevStartupActive.values()]);
     this.#listeners.clear();
     this.#meshListeners.clear();
     if (this.#persistent) {
@@ -4732,6 +4740,12 @@ export class ActorManager {
     let retryDrain = false;
     let retryDelay = this.#preparationRetryMs;
     try {
+      // Serialize ready background loss judgment before shifting restored work.
+      // A mesh-consumption hold does not revoke the existing direct receiver path;
+      // leave its startup debt protected by the original full queue snapshot until
+      // maintenance resumes, rather than blocking an explicitly admitted call.
+      if (this.#canConsumeMesh?.() !== false && this.#enodevStartup.has(actor.id) &&
+          !await this.#recoverStartupEnodev(actor)) { retryDrain = true; return; }
       while (
         actor.queue.length > 0 &&
         (!this.#releasePaused || (!this.#releaseStrict && actor.queue.some((item) => item.resolve || item.reject))) &&
@@ -6749,10 +6763,10 @@ export class ActorManager {
     return record ? { workerStatusHint: { untrusted: true, status } } : {};
   }
 
-  /** p95 wall time of the actor's archived finished runs (runs/<id>/status.json), when it has any. */
+  /** p95 wall time of the bounded sample of archived finished runs, when it has any. */
   #p95RunMs(actor: ManagedActor): number | undefined {
     const durations: number[] = [];
-    for (const runId of this.#logs.retainedRunIds(actor).slice(-200)) {
+    for (const runId of this.#logs.retainedRunIdsForP95(actor)) {
       const record = readRunRecord(path.join(path.dirname(actor.sessionFile), "runs", runId, "status.json"));
       if (record && Number.isFinite(record.startedAt) && Number.isFinite(record.finishedAt) && record.finishedAt! >= record.startedAt) {
         durations.push(record.finishedAt! - record.startedAt);
@@ -6864,6 +6878,54 @@ export class ActorManager {
     })();
   }
 
+  #enodevPendingIds(actor: ManagedActor): Set<string> {
+    return new Set([...actor.queue, ...(this.#overflow.get(actor.id) ?? []), ...(this.#parked.get(actor.id) ?? []),
+      ...(this.#deferredHandoffs.get(actor.id) ?? []), ...this.#inFlightItems(actor.id)].map(item => item.id));
+  }
+
+  #recoverStartupEnodev(actor: ManagedActor): Promise<boolean> {
+    const obligation = this.#enodevStartup.get(actor.id);
+    if (!obligation) return Promise.resolve(true);
+    const active = this.#enodevStartupActive.get(actor.id);
+    if (active) return active;
+    const current = () => !this.#closing && !this.#releasePaused && !this.#halted && this.#canConsumeMesh?.() !== false &&
+      this.#actors.get(actor.id) === actor && actor.rootId === obligation.rootId && actor.residency === obligation.residency &&
+      actor.rootId === this.#rootId && (this.#claimResidency ?? actor.residency) === actor.residency &&
+      this.#slotCurrent(actor) && this.#ownershipDecision(actor.id);
+    if (!current()) return Promise.resolve(false);
+    const pending = (async () => {
+      // Readiness/first-idle gets its own turn before deferred filesystem discovery, even for an idle actor.
+      await new Promise<void>(resolve => setImmediate(resolve));
+      if (!current()) return false;
+      if (!obligation.counted) {
+        const count = await this.agents.countUnknownEnodevStarts?.(actor.id, obligation.unknown, current) ?? { starts: 0, alarm: false };
+        if (!current()) return false;
+        obligation.counted = true;
+        if (obligation.unknown && count.starts > 0) {
+          const text = `actor ${actor.name} (${actor.id}): a queue file is unreadable, so its ENODEV-unconfirmed runs ` +
+            `stay unsettled (start ${count.starts} in a row; smarty-dev#8935)`;
+          diagnostics.warn("src/actors/manager.ts", `[pi-fabric] ${text}`);
+          if (count.alarm) void this.mesh.publish({ topic: "ops.owner", kind: "actor.alarm", from: this.identity, to: actor.rootId,
+            text, data: { actorId: actor.id, reason: "enodev-queue-unknown", starts: count.starts } }).catch(() => undefined);
+        }
+      }
+      if (!obligation.unknown) {
+        await this.agents.settleLostEnodevRuns?.(actor.id, () => {
+          // Refresh only within each synchronous slice: neither the restored snapshot nor today's partial queue alone is enough.
+          if (!current() || !this.#queueStatesReadable(actor)) throw new Error("Actor startup recovery authority changed");
+          return new Set([...obligation.pending, ...this.#enodevPendingIds(actor)]);
+        }, current);
+        if (!current()) return false;
+      }
+      if (this.#enodevStartup.get(actor.id) === obligation) this.#enodevStartup.delete(actor.id);
+      return true;
+    })().catch(() => false).finally(() => {
+      if (this.#enodevStartupActive.get(actor.id) === pending) this.#enodevStartupActive.delete(actor.id);
+    });
+    this.#enodevStartupActive.set(actor.id, pending);
+    return pending;
+  }
+
   #startRetentionSweep(): void {
     if (this.#retentionSweep || this.#closing || this.#releaseStrict) return;
     const sweep = this.#sweepRetainedRuns().catch(() => undefined);
@@ -6881,6 +6943,11 @@ export class ActorManager {
     // but re-enter the publication/ownership fences between Windows actors.
     const batchSize = ACTOR_RETENTION_BATCH_SIZE[process.platform === "win32" ? "win32" : "other"];
     for (let offset = 0; offset < actors.length; offset += batchSize) {
+      if (this.#closing || this.#releaseStrict || this.#canConsumeMesh?.() === false) return;
+      // Idle actors owe startup bookkeeping too; no activation is required to drive it.
+      for (const actor of actors.slice(offset, offset + batchSize)) {
+        if (this.#enodevStartup.has(actor.id)) await this.#recoverStartupEnodev(actor);
+      }
       if (this.#closing || this.#releaseStrict || this.#canConsumeMesh?.() === false) return;
       this.#withOwnershipRead(() => {
         for (const actor of actors.slice(offset, offset + batchSize)) {
@@ -7940,25 +8007,10 @@ export class ActorManager {
     // of that actor settles, its markers stay and count the start; one line per start, ops.owner from the third.
     for (const actor of firstLoads) {
       if (!claimed.has(actor.id)) continue;
-      const unknown = !this.#queueStatesReadable(actor);
-      let count = { starts: 0, alarm: false };
-      try { count = this.agents.countUnknownEnodevStarts?.(actor.id, unknown) ?? count; } catch { /* the count only reports */ }
-      const { starts } = count;
-      if (unknown) {
-        if (starts > 0) {
-          const text = `actor ${actor.name} (${actor.id}): a queue file is unreadable, so its ENODEV-unconfirmed runs ` +
-            `stay unsettled (start ${starts} in a row; smarty-dev#8935)`;
-          diagnostics.warn("src/actors/manager.ts", `[pi-fabric] ${text}`);
-          // One alarm, when the (saturating) count reaches its threshold.
-          if (count.alarm) void this.mesh.publish({ topic: "ops.owner", kind: "actor.alarm", from: this.identity, to: actor.rootId,
-            text, data: { actorId: actor.id, reason: "enodev-queue-unknown", starts } }).catch(() => undefined);
-        }
-        continue;
-      }
-      const pending = new Set([...actor.queue, ...(this.#overflow.get(actor.id) ?? []), ...(this.#parked.get(actor.id) ?? []),
-        ...(this.#deferredHandoffs.get(actor.id) ?? []), ...this.#inFlightItems(actor.id)]
-        .map(item => item.id));
-      try { this.agents.settleLostEnodevRuns?.(actor.id, pending); } catch { /* retention keeps the veto; next start retries */ }
+      this.#enodevStartup.set(actor.id, {
+        rootId: actor.rootId, residency: actor.residency, unknown: !this.#queueStatesReadable(actor),
+        pending: this.#enodevPendingIds(actor),
+      });
     }
     if (added > 0) this.#emitChange();
     this.#scheduleRestoreParked();

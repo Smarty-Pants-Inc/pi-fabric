@@ -7,6 +7,7 @@ import { MeshBackgroundQueue, MeshBackgroundRetry, isMeshWriteDeferred } from ".
 import { participantProject, ParticipantRoleGrant, repositoryOf } from "./project-identity.js";
 import { mainPublicationFenced, MainPublicationFencedError } from "./main-publication-fence.js";
 import type { FabricMainAgentInfo } from "../main-agent.js";
+import type { FabricTransport } from "../transport/types.js";
 import { assertMeshStateReadable, MeshStore, meshOutageAlarmSink, meshProcessStartedAt, type MeshBatchOperation, type MeshIdentity, type MeshStateEntry, type MeshReadOptions } from "../mesh/store.js";
 import type {
   FabricHostRecord,
@@ -634,6 +635,9 @@ class ParticipantPublicationChangedError extends Error {
 
 export interface ParticipantDirectoryOptions {
   enabled: boolean;
+  /** KV carrier injection. Parent composition wires KvParticipantDirectory with the acquired lease;
+   * this option alone never activates a second presence writer or imports FILE records into KV. */
+  transport?: FabricTransport;
   /** Resident owners keep actor envelope timestamps fresh for lease-unaware routing readers. */
   renewActorParticipants?: boolean;
   /** Existing actor file renewal only; validate the last known lineage against

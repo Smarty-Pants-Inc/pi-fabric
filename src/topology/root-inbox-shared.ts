@@ -52,10 +52,11 @@ export interface RootInboxReconcileOptions {
   priority?: boolean;
 }
 
-export const workKey = (data: unknown): string | undefined => {
-  const key = data && typeof data === "object" ? (data as { key?: unknown }).key : undefined;
-  return typeof key === "string" && key.trim() ? key.trim() : undefined;
+const trimmedField = (data: unknown, field: string): string | undefined => {
+  const value = data && typeof data === "object" ? (data as Record<string, unknown>)[field] : undefined;
+  return typeof value === "string" ? value.trim() || undefined : undefined;
 };
+export const workKey = (data: unknown): string | undefined => trimmedField(data, "key");
 
 const receipt = (fromId: string, kind: string, value: string): string =>
   createHash("sha256").update(JSON.stringify([fromId, kind, value])).digest("hex");
@@ -63,10 +64,10 @@ const receipt = (fromId: string, kind: string, value: string): string =>
 /** Delivery identity precedence: deliveryId > messageId > commandId > work-key/ref fallbacks. */
 export const deliveryIdentity = (data: unknown): { kind: string; value: string } | undefined => {
   if (!data || typeof data !== "object") return undefined;
-  const fields = data as Record<string, unknown>;
-  if (typeof fields.deliveryId === "string" && fields.deliveryId) return { kind: "delivery", value: fields.deliveryId };
-  if (typeof fields.messageId === "string" && fields.messageId) return { kind: "id", value: fields.messageId };
-  if (typeof fields.commandId === "string" && fields.commandId) return { kind: "delivery", value: fields.commandId };
+  for (const field of ["deliveryId", "messageId", "commandId"]) {
+    const value = (data as Record<string, unknown>)[field];
+    if (typeof value === "string" && value) return { kind: field === "messageId" ? "id" : "delivery", value };
+  }
   return undefined;
 };
 /**
@@ -79,20 +80,15 @@ export const deliveryIdentity = (data: unknown): { kind: string; value: string }
 /** Native carriers claim topic-scoped work; mesh events retain their own identities. */
 export const topicWorkReceipt = (fromId: string, kind: "key" | "ref", topic: string, value: string): string =>
   receipt(fromId, `native-topic-${kind}`, JSON.stringify([topic, value]));
-/** The topic a native carrier names for its work (data.topic); without one its key/ref claims nothing. */
-const carrierTopic = (data: unknown): string | undefined => {
-  const topic = data && typeof data === "object" ? (data as { topic?: unknown }).topic : undefined;
-  return typeof topic === "string" && topic.trim() ? topic.trim() : undefined;
-};
 const workReceipts = (fromId: string, data: unknown, topic: string | undefined): string[] => {
-  if (!data || typeof data !== "object") return [];
   const identity = deliveryIdentity(data);
   if (identity) return [receipt(fromId, identity.kind, identity.value)];
-  if (topic === undefined) return [];
-  const fields = data as Record<string, unknown>;
-  const key = workKey(data);
-  const ref = typeof fields.ref === "string" && fields.ref.trim() ? fields.ref.trim() : undefined;
-  return key ? [topicWorkReceipt(fromId, "key", topic, key)] : ref ? [topicWorkReceipt(fromId, "ref", topic, ref)] : [];
+  // Only native carriers supply a topic; mesh events must never claim key/ref work.
+  if (topic !== undefined) for (const kind of ["key", "ref"] as const) {
+    const value = trimmedField(data, kind);
+    if (value) return [topicWorkReceipt(fromId, kind, topic, value)];
+  }
+  return [];
 };
 export const eventReceipt = (id: string): string => receipt("", "event", id);
 /**
@@ -105,19 +101,18 @@ export const crossIdentityReceipts = (fromId: string, data: unknown): string[] =
   if (!identity) return [];
   return [receipt(fromId, identity.kind === "delivery" ? "id" : "delivery", identity.value)];
 };
-export const eventReceipts = (event: MeshEvent): string[] => {
-  const identity = deliveryIdentity(event.data);
-  return [
-    eventReceipt(event.id), receipt(event.from.id, "id", event.id),
-    ...(event.dedupeKey ? [receipt("", "dedupe", event.dedupeKey)] : []),
-    ...(identity ? [receipt(event.from.id, identity.kind, identity.value), ...crossIdentityReceipts(event.from.id, event.data)] : []),
-  ];
-};
+export const eventReceipts = (event: MeshEvent): string[] => [
+  eventReceipt(event.id), receipt(event.from.id, "id", event.id),
+  ...(event.dedupeKey ? [receipt("", "dedupe", event.dedupeKey)] : []),
+  ...workReceipts(event.from.id, event.data, undefined),
+  ...crossIdentityReceipts(event.from.id, event.data),
+];
 /** What the session's own entries say it holds. */
 export interface RootInboxSession {
   /** Inbox messages collectively holding all of these event ids. */
   holdsBatch(ids: readonly string[]): boolean;
-  /** An identity-less agent carrier for this work key/topic; suppression also needs a dated receipt. */
+  /** Agent-carrier presence for this sender/key/topic, including explicit identities.
+   * Legacy suppression additionally requires a matching, dated native-topic receipt. */
   holdsSteer(fromId: string, key: string, topic: string): boolean;
   /** Confirmed native/inbox receipts from the whole history, not the recent-entry window. */
   delivered?: ReadonlySet<string>;
@@ -196,7 +191,7 @@ export const rootInboxSession = (entries: readonly unknown[], lookback = 500): R
 /** Only canonical native UTC ISO or integer epoch-ms can date a receipt claim. */
 const canonicalReceiptTimestamp = (value: unknown): number | undefined => {
   const at = typeof value === "number" ? value
-    : typeof value === "string" && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value) ? Date.parse(value)
+    : typeof value === "string" && value.length === 24 ? Date.parse(value)
     : Number.NaN;
   if (!Number.isInteger(at) || at <= 0 || at > Date.now() + 60_000) return undefined;
   if (typeof value === "string" && new Date(at).toISOString() !== value) return undefined;
@@ -241,21 +236,19 @@ const inboxReceiptSession = (entries: Iterable<readonly [number, unknown]>, coun
     for (const item of carried) {
       const fromId = item?.from?.id;
       const key = workKey(item?.data);
-      const topic = carrierTopic(item?.data);
-      const identity = deliveryIdentity(item?.data);
-      const topLevelDeliveryId = typeof item?.deliveryId === "string" && item.deliveryId ? item.deliveryId : undefined;
+      // A native carrier without data.topic claims no key/ref work.
+      const topic = trimmedField(item?.data, "topic");
+      const explicit = !!deliveryIdentity(item?.data) || (typeof item?.deliveryId === "string" && !!item.deliveryId);
       if (typeof fromId !== "string") continue;
       // A caller-supplied top-level deliveryId is explicit-only too; retain data identity
       // receipts when present, but do not record a native-topic key/ref for this carrier.
-      for (const id of workReceipts(fromId, item.data, topLevelDeliveryId === undefined ? topic : undefined)) remember(id, at);
+      for (const id of workReceipts(fromId, item.data, explicit ? undefined : topic)) remember(id, at);
       if (typeof item.id === "string") remember(receipt(fromId, "id", item.id), at);
       if (typeof item.deliveryId === "string") remember(receipt(fromId, "delivery", item.deliveryId), at);
-      // An identity-bearing carrier has only its explicit receipt as suppression evidence. It
-      // must not create a key-only holdsSteer claim that could shadow an ambiguous legacy event.
-      // A carrier without a topic claims no work key: its shadow is injected (fail open).
-      // item.id is Main's generated envelope id, not a work claim. A caller-supplied
-      // top-level deliveryId is stable identity, however, so it is explicit-only too.
-      if (identity || topLevelDeliveryId !== undefined || key === undefined || topic === undefined) continue;
+      // Presence is independent of suppression authority: explicit carriers also hold this
+      // sender/topic/key, but only identity-less carriers above can record native-topic receipts.
+      // holdsSteer alone never suppresses work; a matching, dated native-topic receipt is mandatory.
+      if (key === undefined || topic === undefined) continue;
       const keys = steers.get(fromId) ?? new Set<string>();
       keys.add(JSON.stringify([topic, key]));
       steers.set(fromId, keys);

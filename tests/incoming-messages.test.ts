@@ -171,12 +171,35 @@ describe("incoming Fabric display projection", () => {
       details: { to: "principal", items: [first.details, { from: { id: "session:org", name: "org" }, delivery: "followUp" }] } };
     expect(plain(h.render(burst)![0]!)).toBe(" ↳ Build & Test +1 sender: [2 agent/followUp] Peer status");
     h.setBranch([entry(message())]);
-    const shadow = inbox([event("shadow", "SHADOW_DUPLICATE")]);
+    // A real shadow keeps the delivered source message id, not merely its work key.
+    const shadow = inbox([event("shadow", "SHADOW_DUPLICATE", { key: "same-work", messageId: "native-1" })]);
     expect(h.render(shadow)).toEqual([]);
     expect(h.render(shadow, true)).toBeUndefined();
     // Non-org sessions retain the existing recipient/sender exceptions, even with principal view on.
     vi.stubEnv("PI_FABRIC_ROLE", "project"); vi.stubEnv("SMARTY_ROLE", "org-agent");
     expect(h.render(burst)).toBeUndefined();
+  });
+
+  it("preserves distinct durable events sharing sender, topic and work key, but hides event-id replays (smarty-dev#12140)", () => {
+    vi.stubEnv("PI_FABRIC_ROLE", "org"); vi.stubEnv("SMARTY_ROLE", "task-agent");
+    const h = harness("collapsed");
+    const first = event("durable-first", "First durable notification");
+    const second = { ...event("durable-second", "Second durable notification"), sequence: 2 };
+    // Both source events share the helper's sender, topic and same-work key.
+    expect(plain(h.render(inbox([first, second]))![0]!))
+      .toBe(" ↳ Build & Test: [2 work] First durable notification");
+    const firstInbox = inbox([first]);
+    const secondInbox = { ...inbox([second]), timestamp: firstInbox.timestamp + 1 };
+    h.setBranch([entry(firstInbox)]);
+    expect(plain(h.render(secondInbox)![0]!))
+      .toBe(" ↳ Build & Test: [1 work] Second durable notification");
+    h.setBranch([entry(firstInbox), entry(secondInbox)]);
+    expect(plain(h.render(secondInbox)![0]!))
+      .toBe(" ↳ Build & Test: [1 work] Second durable notification"); // Never hide the original carrier itself.
+    const replay = { ...inbox([second]), timestamp: secondInbox.timestamp + 60_000 };
+    expect(h.render(replay)).toEqual([]);
+    // A different mesh sequence does not turn the same source event id into new work.
+    expect(h.render({ ...inbox([{ ...second, sequence: 3 }]), timestamp: replay.timestamp + 1 })).toEqual([]);
   });
 
   it("uses the exact native current rendering when expanded and can collapse again", () => {

@@ -167,17 +167,23 @@ describe("distinct same-key mesh events (smarty-dev#12140)", () => {
   it.each(["commandId", "deliveryId", "messageId"] as const)("fails open for a fresh %s carrier's ambiguous key-only shadow, but suppresses exact identity and envelope replays", async (identity) => {
     const h = setup(); const inbox = h.box(); inbox.start();
     h.main.deliverAgent({ from: watcher, message: "native identity-bearing work", delivery: "steer",
-      data: { topic: TOPIC, key: KEY, [identity]: "native-identity" } });
+      data: { topic: TOPIC, key: KEY, ref: KEY, [identity]: "native-identity" } });
     await h.publish("exact native identity shadow", { key: KEY, [identity]: "native-identity" });
     const ambiguous = await h.publish("ambiguous key-only shadow");
     const distinct = await h.publish("different explicit identity", { key: KEY, [identity]: "distinct-identity" });
     h.advance(1);
     const session = rootInboxSession(h.entries.map(projectRootInboxReceipt));
-    // Option (a): key-only shadows and genuinely distinct key-only work are indistinguishable.
-    // Fail open for BOTH; an identity-bearing carrier must never also claim its topic/key.
+    // Option (a): key-only fixtures and genuinely distinct key-only work are indistinguishable.
+    // Fail open for BOTH; real shadows retain identity, and explicit carriers get no key/ref receipt.
+    for (const kind of ["key", "ref"] as const) {
+      const fallback = createHash("sha256").update(JSON.stringify([watcher.id, `native-topic-${kind}`, JSON.stringify([TOPIC, KEY])])).digest("hex");
+      expect(session.delivered?.has(fallback)).toBe(false);
+      expect(session.deliveredAt?.has(fallback)).toBe(false);
+    }
     const woke = await inbox.wake(session, () => true);
     expect(ids(woke?.events)).toEqual([ambiguous.id, distinct.id]);
-    expect(session.holdsSteer(watcher.id, KEY, TOPIC)).toBe(false);
+    // Why true: presence includes explicit carriers; an ambiguous key-only fixture is not a real identity-preserving shadow.
+    expect(session.holdsSteer(watcher.id, KEY, TOPIC)).toBe(true);
     await h.take(inbox, woke!.events);
     await inbox.close();
 
@@ -208,7 +214,8 @@ describe("distinct same-key mesh events (smarty-dev#12140)", () => {
     const later = await h.publish("later distinct key-only work");
     const woke = await recovered.wake(session, () => true);
     expect(ids(woke?.events)).toEqual([later.id]);
-    expect(session.holdsSteer(watcher.id, KEY, TOPIC)).toBe(false);
+    // Why true: canonical carrier presence survives expiry, but cannot suppress new key-only work without a dated native-topic receipt.
+    expect(session.holdsSteer(watcher.id, KEY, TOPIC)).toBe(true);
     await h.take(recovered, woke!.events);
     await recovered.close();
     h.replay(later);
@@ -231,7 +238,9 @@ describe("distinct same-key mesh events (smarty-dev#12140)", () => {
       for (const session of [h.session(), rootInboxSession(h.entries.map(projectRootInboxReceipt))]) {
         expect(session.delivered?.has(exact)).toBe(true);
         expect(session.delivered?.has(fallback)).toBe(false);
-        expect(session.holdsSteer(watcher.id, KEY, TOPIC)).toBe(false);
+        expect(session.deliveredAt?.has(fallback)).toBe(false);
+        // Why true: top-level deliveryId excludes fallback authority, not presence; key-only work is not an exact shadow.
+        expect(session.holdsSteer(watcher.id, KEY, TOPIC)).toBe(true);
       }
       await inbox.next(rootInboxSession(h.entries.map(projectRootInboxReceipt)), { commitOnly: true });
       const saved = h.mesh.get(inbox.key)!.value as { delivered: string[]; fallbacks?: string[] };

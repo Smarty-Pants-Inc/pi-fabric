@@ -72,6 +72,8 @@ export interface PathBHarnessOptions {
   readonly additionalAgentMeshes?: readonly string[];
   /** Deliberately misissued extra subscribe allows for fail-closed identity-check tests. */
   readonly additionalAgentSubscribe?: readonly string[];
+  /** Deliberately widened operator subscriptions; production operator remains metadata-only. */
+  readonly additionalOperatorSubscribe?: readonly string[];
   /** Deliberately removed agent publish denies for fail-closed identity-check tests. */
   readonly removeAgentDeny?: readonly string[];
   /** Serve client TLS from an owned ephemeral test CA (openssl subprocess). Server cert SANs default to localhost/127.0.0.1. */
@@ -316,12 +318,13 @@ export class PathBHarness {
         );
         // Fully merged #1276 templates (no copied grants); only the explicit fault options perturb the agent template.
         const streams = { custodyStream: PATH_B_PERMISSION_POLICY.custodyStream, livenessStream: PATH_B_PERMISSION_POLICY.livenessStream };
+        const operatorTemplate = roleTemplateWithPathB("operator", streams, PATH_B_MACHINES);
         const scopedKeys: ScopedSigningKey[] = [
           { key: agentSigning.getPublicKey(), role: "agent", template: faultedAgentTemplate(options) },
           {
             key: maintainerSigning.getPublicKey(),
             role: "operator",
-            template: roleTemplateWithPathB("operator", streams, PATH_B_MACHINES),
+            template: { ...operatorTemplate, sub: { allow: [...operatorTemplate.sub.allow, ...(options.additionalOperatorSubscribe ?? [])] } },
           },
           { key: principalSigning.getPublicKey(), role: "principal", template: roleTemplateWithPathB("principal", streams, PATH_B_MACHINES) },
           {

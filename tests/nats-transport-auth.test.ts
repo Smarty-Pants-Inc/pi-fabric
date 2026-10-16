@@ -88,6 +88,15 @@ describe.skipIf(!binary)("authenticated Path B transport", () => {
     await expect(openNatsConnection(harness.runtimeOptions(harness.users.maintainer))).rejects.toThrow();
   });
 
+  it("refuses a valid report-only operator with an extra private-message subscription", async () => {
+    const fixture = await createPathBHarness({ binary: binary!, additionalOperatorSubscribe: ["fabric.in.>"] });
+    try {
+      const authenticated = await fixture.connect(fixture.users.maintainer);
+      await authenticated.close();
+      await expect(openNatsConnection(fixture.operatorOptions())).rejects.toThrow("machine tag mismatch");
+    } finally { await fixture.stop(); }
+  });
+
   it("refuses bootstrap authority as the report-only operator despite a matching signed machine tag", async () => {
     await expect(openNatsConnection(harness.operatorOptions(harness.users.bootstrap))).rejects.toThrow();
   });
@@ -123,7 +132,7 @@ describe.skipIf(!binary)("authenticated Path B transport", () => {
     await expect(openNatsConnection({ ...harness.runtimeOptions(harness.users.machineA), custodyStream: "OTHER_CUSTODY" })).rejects.toThrow();
   });
 
-  it.each([">", "fabric.>", "fabric.in.*.*.*.*.machine-b", "$JS.API.STREAM.NAMES"])("refuses a server-expanded extra publish grant: %s", async (grant) => {
+  it.each([">", "fabric.>", "fabric.in.*.*.*.*.machine-b", "$JS.API.STREAM.NAMES", "fabric.in.*.*.*.*.machine-a.>"])("refuses a server-expanded extra publish grant: %s", async (grant) => {
     const fixture = await createPathBHarness({ binary: binary!, additionalAgentPublish: [grant] });
     try {
       await expect(openNatsConnection(fixture.runtimeOptions(fixture.users.machineA))).rejects.toThrow();

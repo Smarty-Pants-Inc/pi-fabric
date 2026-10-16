@@ -1,7 +1,9 @@
 // Real Path B data-safety/trust-boundary regressions. No mocked broker, shortened AckWait,
 // consumer deletion, product credentials, or destructive operator operation.
 import { Buffer } from "node:buffer";
+import fs from "node:fs";
 import { createConnection, createServer, type AddressInfo, type Socket } from "node:net";
+import { connect as tlsConnect, createSecureContext, TLSSocket } from "node:tls";
 import { setTimeout as delay } from "node:timers/promises";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { openNatsConnection, type NatsConnectionHandle } from "../src/transport/nats/connection.js";
@@ -13,7 +15,7 @@ import {
   TransportCapacityError, TransportInvalidError, TransportUncertainError,
   type FabricTransport, type TransportDelivery, type TransportEnvelope,
 } from "../src/transport/types.js";
-import { createPathBHarness, resolveNatsBinary, type PathBHarness, type PathBUser } from "./helpers/nats-cluster.js";
+import { createPathBHarness, resolveNatsBinary, type PathBHarness, type PathBTlsFiles, type PathBUser } from "./helpers/nats-cluster.js";
 
 const MAX_BYTES = 1_073_741_824;
 const MAX_MESSAGE_BYTES = 1_048_576;
@@ -46,27 +48,52 @@ class WireFaults {
   private dropAck = false;
   private losePubAck = false;
   private readonly lostReplies = new Set<string>();
-  private readonly listener = createServer((client) => {
-    const upstream = createConnection({ host: this.upstream.hostname, port: Number(this.upstream.port) });
-    this.sockets.add(client); this.sockets.add(upstream);
-    client.on("error", () => upstream.destroy());
-    upstream.on("error", () => client.destroy());
-    client.on("close", () => { this.sockets.delete(client); upstream.destroy(); });
-    upstream.on("close", () => { this.sockets.delete(upstream); client.destroy(); });
-    this.pipe(client, upstream, true);
-    this.pipe(upstream, client, false);
-  });
-  private constructor(private readonly upstream: URL) {}
+  private readonly listener = createServer((client) => this.accept(client));
+  private constructor(private readonly upstream: URL, private readonly tls: PathBTlsFiles) {}
   url = "";
 
-  static async open(serverUrl: string): Promise<WireFaults> {
-    const proxy = new WireFaults(new URL(serverUrl));
+  static async open(serverUrl: string, tls: PathBTlsFiles): Promise<WireFaults> {
+    const proxy = new WireFaults(new URL(serverUrl), tls);
     await new Promise<void>((resolve, reject) => {
       proxy.listener.once("error", reject);
       proxy.listener.listen(0, "127.0.0.1", resolve);
     });
-    proxy.url = `nats://127.0.0.1:${(proxy.listener.address() as AddressInfo).port}`;
+    proxy.url = `tls://localhost:${(proxy.listener.address() as AddressInfo).port}`;
     return proxy;
+  }
+
+  private track<T extends Socket>(socket: T): T {
+    this.sockets.add(socket);
+    socket.on("error", () => undefined);
+    socket.once("close", () => this.sockets.delete(socket));
+    return socket;
+  }
+
+  private accept(client: Socket): void {
+    this.track(client);
+    const upstream = this.track(createConnection({ host: this.upstream.hostname, port: Number(this.upstream.port) }));
+    client.once("close", () => upstream.destroy());
+    upstream.once("close", () => client.destroy());
+    let info = Buffer.alloc(0);
+    const readInfo = (chunk: Buffer): void => {
+      info = Buffer.concat([info, chunk]);
+      const end = info.indexOf("\r\n");
+      if (end < 0) return;
+      upstream.removeListener("data", readInfo);
+      if (!info.subarray(0, end).toString().startsWith("INFO ") || info.length !== end + 2) {
+        client.destroy(); upstream.destroy(); return;
+      }
+      client.write(info);
+      const secureClient = this.track(new TLSSocket(client, { isServer: true, secureContext: createSecureContext({
+        cert: fs.readFileSync(this.tls.certFile), key: fs.readFileSync(this.tls.keyFile),
+      }) }));
+      const secureUpstream = this.track(tlsConnect({ socket: upstream, servername: "localhost", ca: fs.readFileSync(this.tls.caFile), rejectUnauthorized: true }));
+      secureClient.once("close", () => secureUpstream.destroy());
+      secureUpstream.once("close", () => secureClient.destroy());
+      this.pipe(secureClient, secureUpstream, true);
+      this.pipe(secureUpstream, secureClient, false);
+    };
+    upstream.on("data", readInfo);
   }
 
   loseNextAck(): void { this.dropAck = true; }
@@ -164,7 +191,7 @@ async function pendingIs(receiver: FabricTransport, ackPending: number, pending 
 
 describe.skipIf(!binary)("real machine-authenticated inbox faults", () => {
   beforeAll(async () => {
-    fixture = await createPathBHarness({ binary: binary! });
+    fixture = await createPathBHarness({ binary: binary!, tls: {} });
     expect(fixture.configText).toContain("sync_interval: always");
     const bootstrap = await fixture.connect(fixture.users.bootstrap);
     const { jetstream, jetstreamManager } = await import("@nats-io/jetstream");
@@ -232,7 +259,7 @@ describe.skipIf(!binary)("real machine-authenticated inbox faults", () => {
   }, 50_000);
 
   it("drops an actual outgoing broker ACK (not a NAK or omitted ACK), times out and redelivers", async () => {
-    const proxy = await WireFaults.open(fixture.serverUrl); proxies.push(proxy);
+    const proxy = await WireFaults.open(fixture.serverUrl, fixture.tls!); proxies.push(proxy);
     const sender = await open(fixture.users.machineA, "lost-ack-sender");
     const receiver = await open(fixture.users.machineB, "lost-ack-receiver", { servers: proxy.url });
     const signal = new AbortController();
@@ -293,7 +320,7 @@ describe.skipIf(!binary)("real machine-authenticated inbox faults", () => {
   }, 40_000);
 
   it("working() extends real AckWait; no delivery at the original timeout, then redelivery when progress stops", async () => {
-    const proxy = await WireFaults.open(fixture.serverUrl); proxies.push(proxy);
+    const proxy = await WireFaults.open(fixture.serverUrl, fixture.tls!); proxies.push(proxy);
     const sender = await open(fixture.users.machineA, "working-sender");
     const receiver = await open(fixture.users.machineB, "working-receiver", { servers: proxy.url });
     const signal = new AbortController();
@@ -375,7 +402,7 @@ describe.skipIf(!binary)("real machine-authenticated inbox faults", () => {
   }, 15_000);
 
   it("lost PubAck is uncertain with the exact frozen body; no blind retry, same-id retry dedupes", async () => {
-    const proxy = await WireFaults.open(fixture.serverUrl); proxies.push(proxy);
+    const proxy = await WireFaults.open(fixture.serverUrl, fixture.tls!); proxies.push(proxy);
     const sender = await open(fixture.users.machineA, "uncertain-sender", { servers: proxy.url });
     const receiver = await open(fixture.users.machineB, "uncertain-receiver");
     const body = { text: "frozen-before-wire" };

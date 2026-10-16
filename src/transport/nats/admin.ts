@@ -1,4 +1,5 @@
 import { existsSync, openSync, closeSync, fsyncSync, readFileSync, writeSync } from "node:fs";
+import { isAbsolute } from "node:path";
 import { openBootstrapNatsConnection, openNatsConnection, type NatsPermissionPolicy } from "./connection.js";
 import { consumeDeadLetters, ensureDeadLetterConsumer, type DeadLetterEnvelope, type DeadLetterSink } from "./dead-letter.js";
 import { openNatsKv } from "./kv.js";
@@ -47,9 +48,16 @@ const policyFromEnv = (args: readonly string[]): NatsPermissionPolicy => ({
   pathBMachines: machinesArg(args),
 });
 
-/** Explicit CLI flag only (tests): never configuration or environment. */
-const insecureLoopbackArg = (args: readonly string[]): { readonly allowInsecureLoopback?: true } =>
-  args.includes("--allow-insecure-loopback") ? { allowInsecureLoopback: true } : {};
+/** Optional explicit CA path; connection.ts owns TLS validation and transport policy. */
+const caFileArg = (args: readonly string[]): { readonly tls?: { readonly caFile: string } } => {
+  const index = args.indexOf("--ca-file");
+  if (index < 0) return {};
+  if (args.lastIndexOf("--ca-file") !== index) throw new Error("--ca-file must not be specified more than once");
+  const caFile = args[index + 1];
+  if (!caFile || caFile.startsWith("--")) throw new Error("--ca-file requires an absolute path");
+  if (!isAbsolute(caFile)) throw new Error("--ca-file must be an absolute path");
+  return { tls: { caFile } };
+};
 
 const operatorMachineArg = (args: readonly string[]): string => {
   const index = args.indexOf("--operator-machine");
@@ -97,7 +105,7 @@ async function provision(args: readonly string[]): Promise<void> {
     servers: requiredEnv("PI_FABRIC_NATS_SERVERS"),
     credentials: requiredEnv("PI_FABRIC_NATS_CREDENTIALS"),
     name: "fabric-transport-admin",
-    ...insecureLoopbackArg(args),
+    ...caFileArg(args),
   });
   try {
     // This is deliberately first: advisories are otherwise lost before the operator consumer exists.
@@ -124,7 +132,7 @@ async function drain(args: readonly string[]): Promise<void> {
     machine,
     ...policyFromEnv(args),
     name: "fabric-transport-admin-drain",
-    ...insecureLoopbackArg(args),
+    ...caFileArg(args),
   });
   try {
     const info = await connection.manager.consumers.info(transportInboxStream(machine), transportDurableName(hostId));
@@ -156,7 +164,7 @@ async function orphan(args: readonly string[]): Promise<void> {
     role: "operator",
     ...policyFromEnv(args),
     name: "fabric-transport-admin-orphan-report",
-    ...insecureLoopbackArg(args),
+    ...caFileArg(args),
   });
   try {
     const stream = transportInboxStream(targetMachine);
@@ -184,7 +192,7 @@ async function dlq(args: readonly string[]): Promise<void> {
     role: "operator",
     ...policyFromEnv(args),
     name: "fabric-transport-admin-dlq",
-    ...insecureLoopbackArg(args),
+    ...caFileArg(args),
   });
   const controller = new AbortController();
   const stop = (): void => controller.abort();
@@ -209,11 +217,12 @@ async function dlq(args: readonly string[]): Promise<void> {
 }
 
 export async function runTransportAdmin(args: readonly string[]): Promise<number> {
+  if (args.includes("--allow-insecure-loopback")) throw new Error("--allow-insecure-loopback is not supported");
   const [command] = args;
   if (command === "provision") await provision(args);
   else if (command === "drain") await drain(args);
   else if (command === "orphan") await orphan(args);
   else if (command === "dlq") await dlq(args);
-  else throw new Error("usage: fabric-transport-admin provision|dlq|drain|orphan");
+  else throw new Error("usage: fabric-transport-admin provision|dlq|drain|orphan [--ca-file <absolute path>]");
   return 0;
 }

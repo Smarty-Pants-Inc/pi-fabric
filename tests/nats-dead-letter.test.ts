@@ -11,8 +11,9 @@ import { ensureTransportStream } from "../src/transport/nats/provision.js";
 import { ADVISORY_CAPTURE_STREAM, transportAdvisoryStreamSubject, transportDurableName, transportInboxFilter, transportInboxStream, transportInboxSubject } from "../src/transport/nats/subjects.js";
 import { createPathBHarness, openJetStream, resolveNatsBinary, PATH_B_MACHINES, PATH_B_POLICY_ENV, type PathBHarness, type PathBUser } from "./helpers/nats-cluster.js";
 
-// Admin CLI: explicit test-only plaintext flag (never config/env) plus the expected-policy environment.
-const INSECURE = "--allow-insecure-loopback";
+// Admin CLI: every real Path B suite uses the fixture CA and DNS TLS identity.
+const caArgs = (fixture: PathBHarness): readonly string[] => ["--ca-file", fixture.tls!.caFile];
+const serverArg = (fixture: PathBHarness): string => fixture.runtimeOptions(fixture.users.bootstrap).servers as string;
 
 // Keep reasons: trust boundary (real report-only credential), data safety (metadata only),
 // and AckNone crash semantics across the broker/operator boundary. No broadened runtime role.
@@ -106,20 +107,20 @@ async function noPublicStream() {
 function adminCapture(file: string) {
   vi.stubEnv("PI_FABRIC_NATS_CREDENTIALS", fixture.users.maintainer.credsPath);
   vi.stubEnv("PI_FABRIC_DLQ_PATH", file);
-  return runTransportAdmin(["dlq", "--once", INSECURE, "--machines", PATH_B_MACHINES.join(",")]);
+  return runTransportAdmin(["dlq", "--once", ...caArgs(fixture), "--machines", PATH_B_MACHINES.join(",")]);
 }
 
 beforeEach(async () => {
   if (!binary) throw new Error("real DLQ tests require NATS_BIN or nats-server on PATH");
-  fixture = await createPathBHarness({ binary });
+  fixture = await createPathBHarness({ binary, tls: {} });
   bootstrap = await openJetStream(await fixture.connect(fixture.users.bootstrap));
   // Exercise the real provisioning path under the fixture-only bootstrap credential.
   // Neither runtime nor messaging operator receives any stream administration grant.
   vi.stubEnv("PI_FABRIC_MACHINE", "machine-a");
-  vi.stubEnv("PI_FABRIC_NATS_SERVERS", fixture.serverUrl);
+  vi.stubEnv("PI_FABRIC_NATS_SERVERS", serverArg(fixture));
   vi.stubEnv("PI_FABRIC_NATS_CREDENTIALS", fixture.users.bootstrap.credsPath);
   for (const [name, value] of Object.entries(PATH_B_POLICY_ENV)) vi.stubEnv(name, value);
-  await runTransportAdmin(["provision", INSECURE, "--machines", PATH_B_MACHINES.join(",")]);
+  await runTransportAdmin(["provision", ...caArgs(fixture), "--machines", PATH_B_MACHINES.join(",")]);
   captured.length = 0;
   permissionErrors.length = 0;
   connections = [];
@@ -139,7 +140,7 @@ afterEach(async () => {
 describe.skipIf(!binary)("standard durable MAX_DELIVERIES operator with actual Path B operator credentials", () => {
   it("refuses a missing bootstrap-owned advisory durable without trying to create or repair it", async () => {
     if (!binary) throw new Error("missing real nats-server binary");
-    const missing = await createPathBHarness({ binary });
+    const missing = await createPathBHarness({ binary, tls: {} });
     let restricted: NatsConnectionHandle | undefined;
     try {
       const seed = await openJetStream(await missing.connect(missing.users.bootstrap));
@@ -154,7 +155,7 @@ describe.skipIf(!binary)("standard durable MAX_DELIVERIES operator with actual P
   });
   it("UPGRADE: bootstrap adds the missing AckNone durable, operator reports, repeat bootstrap is a no-op", async () => {
     if (!binary) throw new Error("missing real nats-server binary");
-    const upgrade = await createPathBHarness({ binary });
+    const upgrade = await createPathBHarness({ binary, tls: {} });
     try {
       const seed = await openJetStream(await upgrade.connect(upgrade.users.bootstrap));
       await ensureTransportStream(seed.manager, {
@@ -164,9 +165,9 @@ describe.skipIf(!binary)("standard durable MAX_DELIVERIES operator with actual P
       });
       await expect(seed.manager.consumers.info(ADVISORY_CAPTURE_STREAM, OPERATOR_DURABLE)).rejects.toThrow(/consumer not found/i);
       vi.stubEnv("PI_FABRIC_MACHINE", upgrade.users.bootstrap.machine);
-      vi.stubEnv("PI_FABRIC_NATS_SERVERS", upgrade.serverUrl);
+      vi.stubEnv("PI_FABRIC_NATS_SERVERS", serverArg(upgrade));
       vi.stubEnv("PI_FABRIC_NATS_CREDENTIALS", upgrade.users.bootstrap.credsPath);
-      expect(await runTransportAdmin(["provision", INSECURE, "--machines", PATH_B_MACHINES.join(",")])).toBe(0);
+      expect(await runTransportAdmin(["provision", ...caArgs(upgrade), "--machines", PATH_B_MACHINES.join(",")])).toBe(0);
       const created = await seed.manager.consumers.info(ADVISORY_CAPTURE_STREAM, OPERATOR_DURABLE);
       expect(created.config.ack_policy).toBe(AckPolicy.None);
       const record = { stream: transportInboxStream("machine-b"), consumer: transportDurableName("upgrade"), stream_seq: 1, deliveries: 5 };
@@ -175,11 +176,11 @@ describe.skipIf(!binary)("standard durable MAX_DELIVERIES operator with actual P
       const log = path.join(upgrade.root, "upgrade-report.jsonl");
       vi.stubEnv("PI_FABRIC_NATS_CREDENTIALS", upgrade.users.maintainer.credsPath);
       vi.stubEnv("PI_FABRIC_DLQ_PATH", log);
-      expect(await runTransportAdmin(["dlq", "--once", INSECURE, "--machines", PATH_B_MACHINES.join(",")])).toBe(0);
+      expect(await runTransportAdmin(["dlq", "--once", ...caArgs(upgrade), "--machines", PATH_B_MACHINES.join(",")])).toBe(0);
       expect(JSON.parse(readFileSync(log, "utf8"))).toEqual(record);
       const before = await seed.manager.consumers.info(ADVISORY_CAPTURE_STREAM, OPERATOR_DURABLE);
       vi.stubEnv("PI_FABRIC_NATS_CREDENTIALS", upgrade.users.bootstrap.credsPath);
-      expect(await runTransportAdmin(["provision", INSECURE, "--machines", PATH_B_MACHINES.join(",")])).toBe(0);
+      expect(await runTransportAdmin(["provision", ...caArgs(upgrade), "--machines", PATH_B_MACHINES.join(",")])).toBe(0);
       const after = await seed.manager.consumers.info(ADVISORY_CAPTURE_STREAM, OPERATOR_DURABLE);
       expect(after.created).toBe(created.created);
       expect(after.config).toEqual(before.config);
@@ -198,7 +199,7 @@ describe.skipIf(!binary)("standard durable MAX_DELIVERIES operator with actual P
     { deliver_subject: "_INBOX.push-drift" },
   ])("refuses drift without bootstrap or operator repair: %j", async (drift) => {
     if (!binary) throw new Error("missing real nats-server binary");
-    const isolated = await createPathBHarness({ binary });
+    const isolated = await createPathBHarness({ binary, tls: {} });
     let restricted: NatsConnectionHandle | undefined;
     try {
       const seed = await openJetStream(await isolated.connect(isolated.users.bootstrap));
@@ -317,7 +318,7 @@ describe.skipIf(!binary)("standard durable MAX_DELIVERIES operator with actual P
       output += typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8");
       return true;
     });
-    try { expect(await runTransportAdmin(["drain", INSECURE])).toBe(0); }
+    try { expect(await runTransportAdmin(["drain", ...caArgs(fixture)])).toBe(0); }
     finally { stdout.mockRestore(); }
     expect(JSON.parse(output)).toEqual({ machine: "machine-b", hostId, pending: info.num_pending, ackPending: info.num_ack_pending, ackFloor: info.ack_floor });
     expect((await storedMessage(bootstrap.manager, test.sent.stream, test.sent.seq)).json()).toEqual(test.wire);
@@ -350,7 +351,7 @@ describe.skipIf(!binary)("standard durable MAX_DELIVERIES operator with actual P
       return true;
     });
     try {
-      expect(await runTransportAdmin(["orphan", INSECURE, "--machine", "machine-b", "--host-id", hostId, "--machines", PATH_B_MACHINES.join(",")])).toBe(0);
+      expect(await runTransportAdmin(["orphan", ...caArgs(fixture), "--machine", "machine-b", "--host-id", hostId, "--machines", PATH_B_MACHINES.join(",")])).toBe(0);
     } finally { stdout.mockRestore(); }
     expect(JSON.parse(output)).toEqual({
       ok: true, mode: "report-only", disposition: "none", machine: "machine-b", hostId, stream, consumer: durable,
@@ -371,9 +372,9 @@ describe.skipIf(!binary)("standard durable MAX_DELIVERIES operator with actual P
 
   it("refuses unnamed/out-of-inventory orphan reports rather than enumerating private consumers", async () => {
     vi.stubEnv("PI_FABRIC_HOST_ID", "");
-    await expect(runTransportAdmin(["orphan", INSECURE])).rejects.toThrow("--machine");
-    await expect(runTransportAdmin(["orphan", INSECURE, "--machine", "ungranted-machine", "--host-id", "runtime:test", "--machines", PATH_B_MACHINES.join(",")])).rejects.toThrow("outside the configured inventory");
-    await expect(runTransportAdmin(["orphan", INSECURE, "--machine", "machine-b", "--machines", PATH_B_MACHINES.join(",")])).rejects.toThrow("--host-id");
+    await expect(runTransportAdmin(["orphan", ...caArgs(fixture)])).rejects.toThrow("--machine");
+    await expect(runTransportAdmin(["orphan", ...caArgs(fixture), "--machine", "ungranted-machine", "--host-id", "runtime:test", "--machines", PATH_B_MACHINES.join(",")])).rejects.toThrow("outside the configured inventory");
+    await expect(runTransportAdmin(["orphan", ...caArgs(fixture), "--machine", "machine-b", "--machines", PATH_B_MACHINES.join(",")])).rejects.toThrow("--host-id");
     await noPublicStream();
   });
 

@@ -1,5 +1,5 @@
 export { openNatsTransport } from "./inbox.js";
-export { openNatsConnection, readNatsCredentials } from "./connection.js";
+export { NatsAuthorizationError, openNatsConnection, readNatsCredentials } from "./connection.js";
 export type { NatsConnectionHandle, NatsConnectionOptions } from "./connection.js";
 export {
   KV_MARKER_TTL_MS,

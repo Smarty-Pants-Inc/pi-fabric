@@ -3,11 +3,12 @@ import path from "node:path";
 import { jetstream, jetstreamManager } from "@nats-io/jetstream";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { openNatsConnection } from "../src/transport/nats/connection.js";
+import { runTransportAdmin } from "../src/transport/nats/admin.js";
 import { openNatsTransport } from "../src/transport/nats/inbox.js";
 import { openNatsKvForMachine } from "../src/transport/nats/kv.js";
 import { ensureTransportStream } from "../src/transport/nats/provision.js";
 import { ADVISORY_CAPTURE_STREAM, transportAdvisoryStreamSubject, transportInboxStream, transportInboxStreamSubject } from "../src/transport/nats/subjects.js";
-import { createPathBHarness, resolveNatsBinary, type PathBHarness, type PathBUser } from "./helpers/nats-cluster.js";
+import { createPathBHarness, PATH_B_POLICY_ENV, resolveNatsBinary, type PathBHarness, type PathBUser } from "./helpers/nats-cluster.js";
 
 // Focused ownership simulation: the credential reader must use same-fd fstat; we only perturb the uid of
 // one call, never chown on the host. All other fs behavior is the real module.
@@ -32,7 +33,7 @@ const MACHINE_B = "machine-b";
 let harness: PathBHarness;
 
 describe.skipIf(!binary)("authenticated Path B transport", () => {
-  beforeAll(async () => { harness = await createPathBHarness({ binary: binary! }); });
+  beforeAll(async () => { harness = await createPathBHarness({ binary: binary!, tls: {} }); });
   afterAll(async () => { await harness?.stop(); });
 
   it("carries a command and its admission ACK between two authenticated machine runtimes", async () => {
@@ -89,7 +90,7 @@ describe.skipIf(!binary)("authenticated Path B transport", () => {
   });
 
   it("refuses a valid report-only operator with an extra private-message subscription", async () => {
-    const fixture = await createPathBHarness({ binary: binary!, additionalOperatorSubscribe: ["fabric.in.>"] });
+    const fixture = await createPathBHarness({ binary: binary!, tls: {}, additionalOperatorSubscribe: ["fabric.in.>"] });
     try {
       const authenticated = await fixture.connect(fixture.users.maintainer);
       await authenticated.close();
@@ -133,7 +134,7 @@ describe.skipIf(!binary)("authenticated Path B transport", () => {
   });
 
   it.each([">", "fabric.>", "fabric.in.*.*.*.*.machine-b", "$JS.API.STREAM.NAMES", "fabric.in.*.*.*.*.machine-a.>"])("refuses a server-expanded extra publish grant: %s", async (grant) => {
-    const fixture = await createPathBHarness({ binary: binary!, additionalAgentPublish: [grant] });
+    const fixture = await createPathBHarness({ binary: binary!, tls: {}, additionalAgentPublish: [grant] });
     try {
       await expect(openNatsConnection(fixture.runtimeOptions(fixture.users.machineA))).rejects.toThrow();
     } finally {
@@ -142,7 +143,7 @@ describe.skipIf(!binary)("authenticated Path B transport", () => {
   });
 
   it.each([">", "fabric.>", "_INBOX.>"])("refuses an extra subscribe grant: %s", async (grant) => {
-    const fixture = await createPathBHarness({ binary: binary!, additionalAgentSubscribe: [grant] });
+    const fixture = await createPathBHarness({ binary: binary!, tls: {}, additionalAgentSubscribe: [grant] });
     try {
       await expect(openNatsConnection(fixture.runtimeOptions(fixture.users.machineA))).rejects.toThrow();
     } finally {
@@ -151,7 +152,7 @@ describe.skipIf(!binary)("authenticated Path B transport", () => {
   });
 
   it.each(["$JS.API.DIRECT.GET.>", "$JS.API.STREAM.DELETE.>", "$JS.API.STREAM.CREATE.FABRIC_CUSTODY"])("refuses a removed publish deny: %s", async (subject) => {
-    const fixture = await createPathBHarness({ binary: binary!, removeAgentDeny: [subject] });
+    const fixture = await createPathBHarness({ binary: binary!, tls: {}, removeAgentDeny: [subject] });
     try {
       await expect(openNatsConnection(fixture.runtimeOptions(fixture.users.machineA))).rejects.toThrow();
     } finally {
@@ -160,7 +161,7 @@ describe.skipIf(!binary)("authenticated Path B transport", () => {
   });
 
   it("matches the complete merged template expanded over multiple signed mesh tags", async () => {
-    const fixture = await createPathBHarness({ binary: binary!, additionalAgentMeshes: ["abcdef0123456789abcdef0123456789"] });
+    const fixture = await createPathBHarness({ binary: binary!, tls: {}, additionalAgentMeshes: ["abcdef0123456789abcdef0123456789"] });
     try {
       const connection = await openNatsConnection(fixture.runtimeOptions(fixture.users.machineA));
       expect(connection.userInfo).toBeDefined();
@@ -202,17 +203,39 @@ describe.skipIf(!binary)("authenticated Path B transport", () => {
   });
 
   describe("plaintext policy", () => {
-    it("refuses plaintext by default without the explicit test-only loopback opt-in", async () => {
-      const { allowInsecureLoopback: _optIn, ...strict } = harness.runtimeOptions(harness.users.machineA) as ConnectionOptions & { allowInsecureLoopback?: boolean };
-      await expect(openNatsConnection(strict)).rejects.toThrow();
+    let plaintext: PathBHarness;
+    beforeAll(async () => { plaintext = await createPathBHarness({ binary: binary! }); });
+    afterAll(async () => { await plaintext?.stop(); });
+    it("the public connection and transport APIs refuse even numeric-loopback plaintext", async () => {
+      const strict = plaintext.runtimeOptions(plaintext.users.machineA);
+      await expect(openNatsConnection(strict)).rejects.toThrow("requires tls://");
+      await expect(openNatsTransport({ ...strict, hostId: "public-plaintext" })).rejects.toThrow("requires tls://");
+      for (const allowInsecureLoopback of [true, false, undefined]) {
+        const legacy = { ...strict, allowInsecureLoopback };
+        await expect(openNatsConnection(legacy as unknown as ConnectionOptions)).rejects.toThrow("not supported");
+        await expect(openNatsTransport({ ...legacy, hostId: "public-legacy" } as unknown as Parameters<typeof openNatsTransport>[0])).rejects.toThrow("not supported");
+      }
     });
-    it("never reads the loopback escape from the environment", async () => {
-      const { allowInsecureLoopback: _optIn, ...strict } = harness.runtimeOptions(harness.users.machineA) as ConnectionOptions & { allowInsecureLoopback?: boolean };
+    it("never reads a plaintext or CA escape from the environment", async () => {
+      const strict = plaintext.runtimeOptions(plaintext.users.machineA);
       for (const name of ["PI_FABRIC_NATS_ALLOW_INSECURE_LOOPBACK", "PI_FABRIC_ALLOW_INSECURE_LOOPBACK", "NATS_ALLOW_INSECURE_LOOPBACK"]) vi.stubEnv(name, "1");
-      try { await expect(openNatsConnection(strict)).rejects.toThrow(); } finally { vi.unstubAllEnvs(); }
+      vi.stubEnv("PI_FABRIC_NATS_CA_FILE", harness.tls!.caFile);
+      try {
+        await expect(openNatsConnection(strict)).rejects.toThrow("requires tls://");
+        const { tls: _tls, ...noExplicitCa } = harness.runtimeOptions(harness.users.machineA) as ConnectionOptions;
+        await expect(openNatsConnection(noExplicitCa)).rejects.toThrow();
+      } finally { vi.unstubAllEnvs(); }
     });
-    it("ignores allowInsecureLoopback in mesh transport config (only a direct option may opt in)", async () => {
-      const { allowInsecureLoopback: _optIn, ...strict } = harness.runtimeOptions(harness.users.machineA) as ConnectionOptions & { allowInsecureLoopback?: boolean };
+    it.each(["NODE_EXTRA_CA_CERTS", "NODE_TLS_REJECT_UNAUTHORIZED", "SSL_CERT_FILE", "SSL_CERT_DIR"])("refuses ambient TLS trust override %s even with otherwise valid TLS", async (name) => {
+      vi.stubEnv(name, name === "NODE_TLS_REJECT_UNAUTHORIZED" ? "0" : harness.tls!.caFile);
+      try {
+        const options = harness.runtimeOptions(harness.users.machineA);
+        await expect(openNatsConnection(options)).rejects.toThrow(`refuses ${name}`);
+        await expect(openNatsTransport({ ...options, hostId: "ambient-trust" })).rejects.toThrow(`refuses ${name}`);
+      } finally { vi.unstubAllEnvs(); }
+    });
+    it("refuses allowInsecureLoopback in mesh transport config", async () => {
+      const strict = harness.runtimeOptions(harness.users.machineA);
       const nats = { ...strict, allowInsecureLoopback: true };
       // mesh.transport is the selector; mesh.nats is its sibling policy/config object.
       const config = { nats, transport: "nats" };
@@ -228,10 +251,10 @@ describe.skipIf(!binary)("authenticated Path B transport", () => {
         await expect(openNatsTransport(options as unknown as Parameters<typeof openNatsTransport>[0])).rejects.toThrow();
       }
     });
-    it("refuses a non-numeric-loopback plaintext URL even with the opt-in", async () => {
-      const port = new URL(harness.serverUrl).port;
-      for (const servers of [`nats://localhost:${port}`, "nats://192.0.2.1:4222", "nats://example.invalid:4222", [harness.serverUrl, "nats://192.0.2.1:4222"]]) {
-        await expect(openNatsConnection({ ...harness.runtimeOptions(harness.users.machineA), servers, timeoutMs: 1_000 })).rejects.toThrow();
+    it("refuses plaintext URLs without an explicit TLS configuration", async () => {
+      const port = new URL(plaintext.serverUrl).port;
+      for (const servers of [`nats://localhost:${port}`, "nats://192.0.2.1:4222", "nats://example.invalid:4222", [plaintext.serverUrl, "nats://192.0.2.1:4222"]]) {
+        await expect(openNatsConnection({ ...plaintext.runtimeOptions(plaintext.users.machineA), servers, timeoutMs: 1_000 })).rejects.toThrow("requires tls://");
       }
     });
   });
@@ -259,7 +282,7 @@ describe.skipIf(!binary)("authenticated Path B transport over verified TLS", () 
     const connection = await openNatsConnection(tlsOptions(tlsHarness, "localhost"));
     expect(connection.userInfo).toBeDefined();
     await connection.close();
-    for (const host of ["127.0.0.1", "[::1]"]) {
+    for (const host of ["127.0.0.1", "127.0x0.1", "0x7f.1", "2130706433", "0177.0.0.1", "[::1]"]) {
       await expect(openNatsConnection(tlsOptions(tlsHarness, host))).rejects.toThrow("use the certificate DNS name");
     }
   });
@@ -344,8 +367,128 @@ describe.skipIf(!binary)("authenticated Path B transport over verified TLS", () 
     await secured.close();
     const plaintext = await createPathBHarness({ binary: binary! });
     try {
-      await expect(openNatsConnection({ ...plaintext.runtimeOptions(plaintext.users.machineA), allowInsecureLoopback: false,
+      await expect(openNatsConnection({ ...plaintext.runtimeOptions(plaintext.users.machineA),
         servers: `nats://localhost:${new URL(plaintext.serverUrl).port}`, tls: {}, timeoutMs: 1_000 })).rejects.toThrow();
     } finally { await plaintext.stop(); }
+  });
+});
+
+describe.skipIf(!binary)("authenticated Path B transport admin TLS CLI", () => {
+  let tlsHarness: PathBHarness;
+  const hostId = "admin-tls-host";
+  const machines = `${MACHINE_A},${MACHINE_B}`;
+
+  beforeAll(async () => {
+    tlsHarness = await createPathBHarness({ binary: binary!, tls: {} });
+  }, 90_000);
+  afterAll(async () => { await tlsHarness?.stop(); });
+
+  const dnsServer = (): string => `tls://localhost:${new URL(tlsHarness.serverUrl).port}`;
+  const caFile = (): string => tlsHarness.tls!.caFile;
+  const adminEnv = (
+    user: Pick<PathBUser, "machine" | "credsPath">,
+    servers: string,
+    extra: Readonly<Record<string, string>> = {},
+  ): Record<string, string> => ({
+    ...PATH_B_POLICY_ENV,
+    PI_FABRIC_NATS_SERVERS: servers,
+    PI_FABRIC_NATS_CREDENTIALS: user.credsPath,
+    PI_FABRIC_MACHINE: user.machine,
+    ...extra,
+  });
+  const withEnv = async <T>(env: Readonly<Record<string, string>>, action: () => Promise<T>): Promise<T> => {
+    const previous = new Map<string, string | undefined>();
+    for (const [key, value] of Object.entries(env)) {
+      previous.set(key, process.env[key]);
+      process.env[key] = value;
+    }
+    try { return await action(); }
+    finally {
+      for (const [key, value] of previous) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  };
+  const runAdmin = (env: Readonly<Record<string, string>>, args: readonly string[]): Promise<number> =>
+    withEnv(env, () => runTransportAdmin(args));
+  const provisionArgs = (ca: string): string[] => ["provision", "--machines", machines, "--ca-file", ca];
+  const provision = (): Promise<number> => runAdmin(
+    adminEnv(tlsHarness.users.bootstrap, dnsServer()),
+    provisionArgs(caFile()),
+  );
+  const openMachineConsumer = async (id: string) => openNatsTransport({
+    ...tlsHarness.runtimeOptions(tlsHarness.users.machineA),
+    servers: dnsServer(),
+    hostId: id,
+  });
+
+  it("provision succeeds with an absolute CA file and DNS server URL", async () => {
+    expect(path.isAbsolute(caFile())).toBe(true);
+    await expect(provision()).resolves.toBe(0);
+  });
+
+  it("drain succeeds with an existing machine-A consumer over verified TLS", async () => {
+    await provision();
+    const runtime = await openMachineConsumer(hostId);
+    try {
+      await expect(runAdmin(
+        adminEnv(tlsHarness.users.machineA, dnsServer(), { PI_FABRIC_HOST_ID: hostId }),
+        ["drain", "--ca-file", caFile()],
+      )).resolves.toBe(0);
+    } finally { await runtime.close(); }
+  });
+
+  it("orphan succeeds with the operator over verified TLS", async () => {
+    await provision();
+    const runtime = await openMachineConsumer(hostId);
+    try {
+      await expect(runAdmin(
+        adminEnv(tlsHarness.users.maintainer, dnsServer()),
+        ["orphan", "--machine", MACHINE_A, "--host-id", hostId, "--ca-file", caFile()],
+      )).resolves.toBe(0);
+    } finally { await runtime.close(); }
+  });
+
+  it("dlq --once succeeds and finishes a finite pull when there are no advisories", async () => {
+    await provision();
+    await expect(runAdmin(
+      adminEnv(tlsHarness.users.maintainer, dnsServer(), { PI_FABRIC_DLQ_PATH: path.join(tlsHarness.root, "admin-dlq.jsonl") }),
+      ["dlq", "--once", "--ca-file", caFile()],
+    )).resolves.toBe(0);
+  }, 10_000);
+
+  it("refuses every admin command when the CA file flag is absent", async () => {
+    const cases: Array<[string, Readonly<Record<string, string>>, string[]]> = [
+      ["provision", adminEnv(tlsHarness.users.bootstrap, dnsServer()), ["provision", "--machines", machines]],
+      ["drain", adminEnv(tlsHarness.users.machineA, dnsServer(), { PI_FABRIC_HOST_ID: hostId }), ["drain"]],
+      ["orphan", adminEnv(tlsHarness.users.maintainer, dnsServer()), ["orphan", "--machine", MACHINE_A, "--host-id", hostId]],
+      ["dlq", adminEnv(tlsHarness.users.maintainer, dnsServer()), ["dlq", "--once"]],
+    ];
+    for (const [, env, args] of cases) await expect(runAdmin(env, args)).rejects.toThrow();
+  });
+
+  it("refuses every admin command when the CA file flag is paired with an IP URL", async () => {
+    const cases: Array<[string, Readonly<Record<string, string>>, string[]]> = [
+      ["provision", adminEnv(tlsHarness.users.bootstrap, tlsHarness.serverUrl), provisionArgs(caFile())],
+      ["drain", adminEnv(tlsHarness.users.machineA, tlsHarness.serverUrl, { PI_FABRIC_HOST_ID: hostId }), ["drain", "--ca-file", caFile()]],
+      ["orphan", adminEnv(tlsHarness.users.maintainer, tlsHarness.serverUrl), ["orphan", "--machine", MACHINE_A, "--host-id", hostId, "--ca-file", caFile()]],
+      ["dlq", adminEnv(tlsHarness.users.maintainer, tlsHarness.serverUrl), ["dlq", "--once", "--ca-file", caFile()]],
+    ];
+    for (const [, env, args] of cases) await expect(runAdmin(env, args)).rejects.toThrow(/certificate DNS name|IP|numeric/i);
+  });
+
+  it("rejects missing, relative, and duplicate CA flags before broker setup for all commands", async () => {
+    const cases: Array<[Readonly<Record<string, string>>, readonly string[]]> = [
+      [adminEnv(tlsHarness.users.bootstrap, dnsServer()), ["provision", "--machines", machines]],
+      [adminEnv(tlsHarness.users.machineA, dnsServer(), { PI_FABRIC_HOST_ID: hostId }), ["drain"]],
+      [adminEnv(tlsHarness.users.maintainer, dnsServer()), ["orphan", "--machine", MACHINE_A, "--host-id", hostId]],
+      [adminEnv(tlsHarness.users.maintainer, dnsServer()), ["dlq", "--once"]],
+    ];
+    for (const [env, base] of cases) {
+      await expect(runAdmin(env, [...base, "--ca-file"])).rejects.toThrow(/ca-file/i);
+      await expect(runAdmin(env, [...base, "--ca-file", "relative-ca.pem"])).rejects.toThrow(/ca-file/i);
+      await expect(runAdmin(env, [...base, "--ca-file", caFile(), "--ca-file", caFile()])).rejects.toThrow(/ca-file/i);
+    }
   });
 });

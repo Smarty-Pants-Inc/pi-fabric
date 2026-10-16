@@ -3,10 +3,18 @@ import { Buffer } from "node:buffer";
 import { isIP } from "node:net";
 import { credsAuthenticator, type NatsConnection } from "@nats-io/nats-core";
 import { jetstream, jetstreamManager, type JetStreamClient, type JetStreamManager } from "@nats-io/jetstream";
-import { connect, type NodeConnectionOptions, type Status, type TlsOptions } from "@nats-io/transport-node";
+import { AuthorizationError, PermissionViolationError, connect, type NodeConnectionOptions, type Status, type TlsOptions } from "@nats-io/transport-node";
 import { pathBMachines } from "../../mesh/nats-auth/mint.js";
 import { PATH_B_OPERATOR_MACHINE_PATTERN, roleTemplateWithPathB } from "../../mesh/nats-auth/permissions.js";
 import { validateMachine } from "./subjects.js";
+import { TransportUnavailableError } from "../types.js";
+
+/** Persistent identity/scope verification failure. The connection is closed, not retried. */
+export class NatsAuthorizationError extends Error {
+  readonly code = "FABRIC_NATS_AUTHORIZATION";
+  readonly persisted = false;
+  constructor(message: string, options?: ErrorOptions) { super(message, options); this.name = "NatsAuthorizationError"; }
+}
 
 export type NatsStatusListener = (status: Status) => void;
 export type SubscribeNatsStatus = (listener: NatsStatusListener) => () => void;
@@ -22,8 +30,6 @@ interface NatsTransportSecurityOptions {
   readonly servers: string | readonly string[];
   /** Official transport-node TLS options. Only the documented fields are forwarded; verification cannot be disabled. */
   readonly tls?: TlsOptions;
-  /** Test-only: plaintext to numeric loopback servers (127.0.0.1 / ::1). Never read from config or environment. */
-  readonly allowInsecureLoopback?: boolean;
   readonly name?: string;
   readonly timeoutMs?: number;
 }
@@ -46,9 +52,23 @@ export interface NatsConnectionHandle {
   readonly js: JetStreamClient;
   readonly manager: JetStreamManager;
   readonly userInfo?: unknown;
+  /** Native reconnect is disabled. Resolves a typed retryable error on loss; explicit close resolves void. */
+  closed(): Promise<void | Error>;
   onStatus: SubscribeNatsStatus;
   close(): Promise<void>;
 }
+
+const connectionFailure = (cause: unknown, message: string): Error => {
+  let error = cause;
+  for (let depth = 0; error && depth < 6; depth += 1) {
+    if (error instanceof NatsAuthorizationError) return error;
+    if (error instanceof AuthorizationError || error instanceof PermissionViolationError) {
+      return new NatsAuthorizationError(message, { cause });
+    }
+    error = error instanceof Error ? error.cause : undefined;
+  }
+  return new TransportUnavailableError(message, { cause });
+};
 
 const USER_NKEY = /^U[A-Z2-7]{55}$/;
 const MESH = /^[0-9a-f]{32}$/;
@@ -132,7 +152,7 @@ const tlsOptions = (value: unknown): NonNullable<NodeConnectionOptions["tls"]> =
   return out as NonNullable<NodeConnectionOptions["tls"]>;
 };
 
-const parseServer = (server: unknown): { readonly tls: boolean; readonly loopback: boolean; readonly numeric: boolean } => {
+const parseServer = (server: unknown): { readonly tls: boolean; readonly numeric: boolean } => {
   // Strict charset so WHATWG URL and the nats-core host:port parser cannot disagree (no userinfo, whitespace, %, \\).
   if (typeof server !== "string" || !/^[A-Za-z0-9.:[\]/_-]+$/.test(server)) throw new Error("invalid NATS server URL");
   const scheme = /^([a-z][a-z0-9+.-]*):\/\//i.exec(server)?.[1]?.toLowerCase();
@@ -142,26 +162,19 @@ const parseServer = (server: unknown): { readonly tls: boolean; readonly loopbac
   if (url.username || url.password || (url.pathname !== "" && url.pathname !== "/") || url.search || url.hash || !url.hostname) {
     throw new Error("invalid NATS server URL");
   }
-  const host = url.hostname.replace(/^\[(.*)\]$/, "$1");
-  return {
-    tls: scheme === "tls",
-    loopback: url.hostname === "127.0.0.1" || url.hostname === "[::1]",
-    numeric: isIP(host) !== 0 || /^[0-9.]+$/.test(host) || /^0x/i.test(host) || host.includes(":"),
-  };
+  // NATS URLs are non-special: use WHATWG's HTTP host parser to normalize legacy hex/octal/short IPv4 first.
+  const host = new URL(`http://${url.hostname}`).hostname.replace(/^\[(.*)\]$/, "$1");
+  return { tls: scheme === "tls", numeric: isIP(host) !== 0 };
 };
 
-/** TLS is mandatory unless the direct test-only loopback opt-in applies to numeric loopback servers without TLS input. */
+/** Production and tests use the same mandatory DNS-verified TLS path. */
 const transportSecurity = (options: NatsTransportSecurityOptions): Pick<NodeConnectionOptions, "servers" | "tls" | "ignoreClusterUpdates"> => {
+  for (const key of ["NODE_EXTRA_CA_CERTS", "NODE_TLS_REJECT_UNAUTHORIZED", "SSL_CERT_FILE", "SSL_CERT_DIR"]) {
+    if (process.env[key] !== undefined) throw new Error(`NATS refuses ${key}; configure trust explicitly with tls.caFile`);
+  }
   const servers = typeof options.servers === "string" ? [options.servers] : Array.isArray(options.servers) ? [...options.servers] as string[] : [];
   if (servers.length === 0) throw new Error("NATS servers are required");
   const parsed = servers.map(parseServer);
-  const insecure = options.allowInsecureLoopback;
-  if (insecure !== undefined && typeof insecure !== "boolean") throw new Error("allowInsecureLoopback must be a boolean");
-  if (insecure === true && options.tls === undefined && !parsed.some((server) => server.tls)) {
-    if (!parsed.every((server) => server.loopback)) throw new Error("allowInsecureLoopback requires numeric loopback NATS servers");
-    // Pin the validated servers: cluster discovery must not add a plaintext remote route.
-    return { servers, tls: null, ignoreClusterUpdates: true };
-  }
   if (options.tls === undefined && parsed.some((server) => !server.tls)) throw new Error("NATS requires tls:// servers or explicit tls options");
   // ponytail: transport-node 3.4 startTLS leaves tlsName empty for literal IPs, so Node checks 'localhost' instead.
   // Use the certificate DNS name rather than bespoke TLS identity plumbing; pin all configured cluster endpoints.
@@ -219,24 +232,28 @@ const sameSet = (actual: ReadonlySet<string>, expected: ReadonlySet<string>): bo
   actual.size === expected.size && [...expected].every((subject) => actual.has(subject));
 
 const verifyIdentity = async (nc: NatsConnection, timeoutMs: number, auth: ReturnType<typeof readNatsCredentials>, expected: ExpectedPermissions): Promise<unknown> => {
-  const response = await nc.request("$SYS.REQ.USER.INFO", new Uint8Array(), { timeout: timeoutMs });
+  const response = await nc.request("$SYS.REQ.USER.INFO", new Uint8Array(), { timeout: timeoutMs }).catch((cause: unknown) => {
+    throw connectionFailure(cause, "NATS USER.INFO verification is unavailable");
+  });
   let value: unknown;
-  try { value = JSON.parse(new TextDecoder().decode(response.data)); } catch { throw new Error("NATS USER.INFO response is invalid"); }
+  try { value = JSON.parse(new TextDecoder().decode(response.data)); } catch (cause) {
+    throw new NatsAuthorizationError("NATS USER.INFO response is invalid", { cause });
+  }
   // USER.INFO returns the authenticated user and expanded permissions, not JWT tags. Tie the locally decoded tags to
   // the server-authenticated subject, then require the exact expanded scope: no missing, extra or response rights.
   const data = isPlainObject(value) && isPlainObject(value.data) ? value.data : undefined;
   const permissions = data?.permissions;
   if (!data || data.user !== auth.subject || !isPlainObject(permissions) ||
-    Object.keys(permissions).some((key) => key !== "publish" && key !== "subscribe")) throw new Error(MISMATCH);
+    Object.keys(permissions).some((key) => key !== "publish" && key !== "subscribe")) throw new NatsAuthorizationError(MISMATCH);
   const publish = permissionLists(permissions.publish);
   const subscribe = permissionLists(permissions.subscribe);
   if (!publish || !subscribe || !sameSet(publish.allow, expected.pubAllow) || !sameSet(publish.deny, expected.pubDeny) ||
-    !sameSet(subscribe.allow, expected.subAllow) || !sameSet(subscribe.deny, expected.subDeny)) throw new Error(MISMATCH);
+    !sameSet(subscribe.allow, expected.subAllow) || !sameSet(subscribe.deny, expected.subDeny)) throw new NatsAuthorizationError(MISMATCH);
   return value;
 };
 
 const refuseBypass = (options: object): void => {
-  for (const key of ["verifyMachine", "inboxPrefix"]) if (key in options) throw new Error(`NATS connection option ${key} is not supported`);
+  for (const key of ["verifyMachine", "inboxPrefix", "allowInsecureLoopback"]) if (key in options) throw new Error(`NATS connection option ${key} is not supported`);
 };
 
 const open = async (
@@ -253,20 +270,27 @@ const open = async (
     ...security,
     ...(options.name ? { name: options.name } : {}),
     timeout: timeoutMs,
-    reconnect: true,
-    maxReconnectAttempts: -1,
-    reconnectTimeWait: 100,
+    // A new physical connection must pass USER.INFO before any JS/KV client is exposed.
+    // Native reconnect replays subscriptions/outbound frames before asynchronous status observers run.
+    // The transport owner must reopen through openNatsConnection and recreate its clients instead.
+    reconnect: false,
+    maxReconnectAttempts: 0,
     authenticator: credsAuthenticator(auth.bytes),
     inboxPrefix: `_INBOX.${auth.subject}`,
-  });
+  }).catch((cause: unknown) => { throw connectionFailure(cause, "NATS connection failed"); });
   try {
     const userInfo = verify ? await verify(nc, timeoutMs, auth) : undefined;
     const manager = await jetstreamManager(nc, { timeout: timeoutMs });
     const js = jetstream(nc, { timeout: timeoutMs });
     const listeners = new Set<NatsStatusListener>();
+    let closing = false;
+    const closed = nc.closed().then((cause) => closing ? undefined
+      : new TransportUnavailableError("NATS connection lost; reopen and reverify before use", { cause }));
     const statusTask = (async () => {
       for await (const status of nc.status()) {
-        for (const listener of listeners) listener(status);
+        for (const listener of listeners) {
+          try { listener(status); } catch { /* One observer must not prevent shutdown. */ }
+        }
       }
     })();
     return {
@@ -274,9 +298,11 @@ const open = async (
       js,
       manager,
       ...(userInfo === undefined ? {} : { userInfo }),
+      closed: () => closed,
       onStatus: (listener) => { listeners.add(listener); return () => { listeners.delete(listener); }; },
       close: async () => {
-        await nc.drain().catch(() => undefined);
+        closing = true;
+        await nc.close();
         await statusTask;
         listeners.clear();
       },
@@ -298,7 +324,8 @@ export const openNatsConnection = async (options: NatsConnectionOptions): Promis
   let expected: ExpectedPermissions | undefined;
   return open(options, (nc, timeoutMs, auth) => verifyIdentity(nc, timeoutMs, auth, expected!), (auth) => {
     // Fail closed before dialing: missing/invalid policy or a signed identity that cannot match.
-    expected = expectedPermissions(role, machine, policy, auth);
+    try { expected = expectedPermissions(role, machine, policy, auth); }
+    catch (cause) { throw new NatsAuthorizationError("NATS signed identity / permission policy mismatch", { cause }); }
   });
 };
 

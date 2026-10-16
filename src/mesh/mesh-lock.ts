@@ -276,7 +276,12 @@ export class MeshLock {
     const startTime = this.#lockProtocol >= 2
       ? this.#ownIncarnationReady ? this.#ownStartTime : await this.#ownIncarnation
       : undefined;
-    const waitMs = Math.min(this.#lockTimeoutMs, Math.max(0, budget));
+    // A guest-bound acquisition must finish before the invocation deadline; preserve the
+    // ordinary lock budget for non-guest callers. The margin leaves time to surface refusal.
+    const guestWaitMs = boundedInvocation
+      ? Math.max(0, boundedInvocation.deadlineAt() - Date.now() - MESH_INVOCATION_DEADLINE_MARGIN_MS)
+      : this.#lockTimeoutMs;
+    const waitMs = Math.min(this.#lockTimeoutMs, Math.max(0, budget), guestWaitMs);
     const token = randomUUID();
     // Protocol 3 (smarty-dev#9569): the start line is always present (empty: unknown) and the PID namespace follows
     // on its own line (empty: unknown, which no reclaimer may treat as its own). Six fields: a reader from before

@@ -1086,7 +1086,7 @@ export const createFabricExecTool = (
             failureProgress ?? "",
             repeat.warn ? fabricRepeatWarnText(repeat.count, FABRIC_REPEAT_BLOCK) : "",
           ],
-        } : undefined,
+        } : priorityOutput,
       )).text;
       // In-place prewalk continuation arrives as an in-band context message on
       // this boundary turn, so the loop must keep running: the executor's first

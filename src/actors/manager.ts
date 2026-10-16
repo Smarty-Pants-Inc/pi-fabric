@@ -6274,15 +6274,17 @@ export class ActorManager {
 
   #writeDeadLetters(actorId: string, entries: readonly ActorDeadLetter[]): void {
     const file = this.#deadLetterFile(actorId);
-    const temporary = `${file}.${process.pid}.tmp`;
-    // Empty files also use the atomic rewrite; accepted entries are never removed by deletion.
-    const fd = fs.openSync(temporary, "w", 0o600);
-    try {
-      fs.writeFileSync(fd, entries.map((entry) => `${JSON.stringify(entry)}\n`).join(""));
-      fs.fsyncSync(fd);
-    } finally { fs.closeSync(fd); }
-    fs.renameSync(temporary, file);
-    syncPathNamespace(file);
+    if (entries.length === 0) fs.rmSync(file, { force: true });
+    else {
+      const temporary = `${file}.${process.pid}.tmp`;
+      // Synced before the rename: a spill must be durable before the queue file forgets it.
+      const fd = fs.openSync(temporary, "w", 0o600);
+      try {
+        fs.writeFileSync(fd, entries.map((entry) => `${JSON.stringify(entry)}\n`).join(""));
+        fs.fsyncSync(fd);
+      } finally { fs.closeSync(fd); }
+      fs.renameSync(temporary, file);
+    }
     this.#deadLetters.set(actorId, entries.length);
   }
 

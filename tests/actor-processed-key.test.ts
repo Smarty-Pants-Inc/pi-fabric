@@ -310,8 +310,7 @@ describe("durable actor opt-in occurrence dedupeKey (smarty-dev#7710)", () => {
     const second = setup(first.root);
     await settled(second.actors, actor.id, 2);
     expect(outputs(second.actors, actor.id)).toHaveLength(2);
-    // Replay atomically rewrites even an empty backlog; accepted work is never removed by deletion.
-    expect(fs.readFileSync(file, "utf8")).toBe("");
+    expect(fs.existsSync(file)).toBe(false);
   });
 
   it("does not mark failed activations processed", async () => {

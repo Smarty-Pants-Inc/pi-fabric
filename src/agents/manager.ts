@@ -521,8 +521,12 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   runRoute: AgentRunRouteMetadata;
   /** smarty-dev#9855: the admission permit a lost-contact process run holds until it is proven gone (once-only). */
   heldPermit?: () => void;
+  /** Actual once-only RUN admission, independent of result and execution/tree custody. */
+  admissionRelease?: () => void;
   /** pi-fabric#939: the worker pid and birth this manager recorded at launch; the only proof source for release. */
   ownProcess?: OwnedProcess;
+  /** Monotonic host proof bound to this exact actor transport, never a status-file identity. */
+  workerGone?: AgentTransportHandle;
   /** pi-fabric#939 round 2: its saved answer was delivered to the spawner after an unconfirmed exit (once). */
   recoveredAnswer?: boolean;
   /** Round 3: that delivery's save succeeded; only its completed mark is left. */
@@ -587,6 +591,10 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   processStopPending?: boolean;
   /** Windows settlement retains native admission until captured close and any stop join. */
   nativeReleasePending?: Promise<void>;
+  /** Native-close settlement owns RUN release until joined or host-reconciled. */
+  nativeAdmissionFenced?: boolean;
+  /** Exact captured join rejected or exhausted its close/stop bound; fresh host proof may release RUN only. */
+  nativeAdmissionReconcile?: AgentTransportHandle;
   /**
    * Its owner gave it up (a stopped or removed actor): nobody wants its result, so a worker that
    * dies is not relaunched and the run ends failed (smarty-dev#2184 item 8b). A caller that only
@@ -652,6 +660,12 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
 
 // Construct outside spawn/preparation: deferred native custody must not keep
 // the request-bearing launch context alive through a shared lexical context.
+const createAdmissionRelease = (managed: ManagedAgent, release: () => void): (() => void) =>
+  once(() => {
+    delete managed.admissionRelease;
+    release();
+  });
+
 const executionFencedRelease = (managed: ManagedAgent, release: () => void): (() => void) =>
   () => {
     if (managed.executionExited) release();
@@ -713,6 +727,13 @@ const transportExitedWithoutResult = (error: string | undefined): boolean =>
 const recoverableStop = (record: AgentRunRecord): boolean =>
   record.status === "stopped" ||
   (record.status === "failed" && transportExitedWithoutResult(record.error));
+
+/** A genuine terminal verdict, not a transport outcome eligible for recovery. */
+const terminalWorkerResult = (candidate: AgentRunRecord | undefined): boolean =>
+  candidate !== undefined && terminalStatuses.has(candidate.status) &&
+    (candidate.status === "completed" || candidate.errorCode === "CONTEXT_OVERFLOW" ||
+      /Context exceeds window:/i.test(candidate.error ?? "") ||
+      (!recoverableStop(candidate) && !transportExitedWithoutResult(candidate.error) && !retryablePiStartupError(candidate.error)));
 
 const MAX_RESUME_NOTE_CHARS = 2_000;
 
@@ -2528,8 +2549,9 @@ export class AgentManager {
           usageEmitted: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
         };
         // lifecycle.release avoids referencing managed in its own initializer;
-        // install the fence synchronously before listeners or external registration.
-        managed.release = executionFencedRelease(managed, release);
+        // bind the once-only admission and fence before listeners or registration.
+        managed.admissionRelease = createAdmissionRelease(managed, release);
+        managed.release = executionFencedRelease(managed, managed.admissionRelease);
         if (signal && (!queued || authorize)) {
           managed.abortHandler = this.#handleCallerAbort.bind(this, id);
           signal.addEventListener("abort", managed.abortHandler, { once: true });
@@ -2736,8 +2758,34 @@ export class AgentManager {
    * gone keeps its permit. Evaluated where permits are acquired (spawn) and held; no timer.
    */
   #releaseProvenGone(): number {
-    if (process.platform !== "linux") return 0;
     let released = 0;
+    // Actor primary death frees ONLY its still-held actual RUN admission, even
+    // after logical settlement with native debt. Native descendants, unresolved
+    // markers and same-session custody stay joined. Ordinary tasks retain the
+    // exact ENODEV recovery below; heldPermit registration is not a prerequisite.
+    for (const managed of this.#runs.values()) {
+      // A replacement may already be creating a worker while transport still names
+      // the old attempt. Its death cannot discharge the replacement's admission.
+      // A normal Windows settlement owns release until its captured close/stop
+      // joins. Rejection or the existing close bound permits reconciliation, not
+      // release: every later scan must re-establish fresh host-owned death proof.
+      if (!managed.actorId || managed.relaunchPending || !managed.admissionRelease) continue;
+      const nativeFenced = managed.nativeAdmissionFenced;
+      if (nativeFenced && managed.nativeAdmissionReconcile !== managed.transport) continue;
+      // Every proof-triggered scan (close, admission, or native debt) can beat
+      // the monitor's next status read. Establish terminal ownership here too,
+      // before host primary-death proof can bypass its captured native join.
+      if ((!nativeFenced && this.#fenceNativeTerminalAdmission(managed)) || !this.#actorWorkerGone(managed, nativeFenced)) continue;
+      const permit = managed.admissionRelease;
+      delete managed.heldPermit;
+      permit();
+      released++;
+    }
+    if (process.platform !== "linux") {
+      if (released) this.#invalidateUiList();
+      if (this.heldPermits() * 2 < this.config.maxConcurrent) this.#admissionAlarmAt = undefined;
+      return released;
+    }
     for (const queued of this.#queued.values()) {
       if (!queued.heldPermit) continue;
       const directory = path.join(this.#runRoot, queued.info.id);
@@ -4039,6 +4087,8 @@ export class AgentManager {
     const previous = this.#previousRun(id);
     if (previous) return previous;
     const managed = this.#requireRun(id);
+    // Preserve a loss proven before stop; an intentional stop is not itself loss proof.
+    const goneBeforeStop = this.#actorWorkerGone(managed);
     // A requested stop is terminal: record the intent before any transport work
     // so recovery never restarts a run the operator, a tool, or shutdown ended.
     managed.stopRequested = true;
@@ -4058,6 +4108,9 @@ export class AgentManager {
     if (managed.settled) return consumeSettled ? this.wait(id) : this.#settledResult(managed);
     managed.background = false;
     const terminal = readRecord(managed.statusFile);
+    if (goneBeforeStop && await this.#settleGoneActorWorker(managed, terminal ?? existing) && managed.settled) {
+      return consumeSettled ? this.wait(id) : this.#settledResult(managed);
+    }
     // A force-killed worker (notably on Windows) may leave only running status.
     // Its session telemetry can be newer than the monitor's last poll. Preserve
     // that snapshot, or the pre-stop one if stopping removed the status file,
@@ -4761,6 +4814,9 @@ export class AgentManager {
    * cannot erase the outstanding Windows tree-helper obligation. */
   #stopManagedTransport(managed: ManagedAgent): Promise<void> {
     if (managed.transport.kind !== "process") return managed.transport.stop();
+    // A stop can synchronously report native debt/close before the monitor
+    // observes terminal status. Claim its normal terminal join before that work.
+    this.#fenceNativeTerminalAdmission(managed);
     if (managed.processStop) return managed.processStop;
     managed.processStopPending = true;
     let resolve!: () => void;
@@ -4875,6 +4931,8 @@ export class AgentManager {
   }
 
   #markLost(managed: ManagedAgent, reason: string): void {
+    // A manager-side failure must not erase a normal terminal join's ownership.
+    this.#fenceNativeTerminalAdmission(managed);
     managed.lostContact = reason;
     try {
       markUnresolvedWorker(managed.runDirectory, reason, {
@@ -4883,6 +4941,14 @@ export class AgentManager {
         ...(managed.transport.sessionId ? { sessionId: managed.transport.sessionId } : {}),
       });
     } catch { /* the in-memory mark still guards this manager */ }
+    // Monitor failures can stop before #settle, whose actor publication fence
+    // also precedes normal held-permit registration. Keep the raw admission
+    // visible here, without substituting result settlement for native custody.
+    if (managed.actorId && managed.transport.kind === "process" && managed.admissionRelease) {
+      managed.heldPermit ??= managed.admissionRelease;
+      this.#releaseProvenGone();
+      this.#checkHeldPermits();
+    }
   }
 
   async #transportAliveUntil(transport: AgentTransportHandle, deadline: number): Promise<boolean> {
@@ -4922,6 +4988,7 @@ export class AgentManager {
     deadline: number,
   ): Promise<boolean> {
     if (
+      this.#actorWorkerGone(managed) ||
       managed.launch.workerArguments.includes("--judgment") ||
       managed.transport.relaunchable === false ||
       managed.hosted ||
@@ -4977,6 +5044,7 @@ export class AgentManager {
     deadline: number,
   ): Promise<boolean> {
     if (
+      this.#actorWorkerGone(managed) ||
       managed.launch.workerArguments.includes("--judgment") ||
       managed.transport.relaunchable === false ||
       // Fabric never re-prompts a hosted run, and only its own worker
@@ -5030,7 +5098,13 @@ export class AgentManager {
     const pending = Promise.resolve().then(() => this.#relaunchAttempt(managed, record, resume, deadline));
     managed.relaunchPending = pending;
     try { return await pending; }
-    finally { delete managed.relaunchPending; }
+    finally {
+      delete managed.relaunchPending;
+      // Actor retry completion is an event, not a poll: a retry refused before
+      // launch can now release its old proven-dead attempt. Launch rejections
+      // retain the existing missing-ownProcess fence below.
+      if (managed.actorId) this.#releaseProvenGone();
+    }
   }
 
   async #relaunchAttempt(
@@ -5040,7 +5114,7 @@ export class AgentManager {
     deadline = Infinity,
   ): Promise<boolean> {
     try {
-      const cancelled = () => managed.settled || this.#closing || managed.stopRequested || managed.abandoned || Date.now() >= deadline;
+      const cancelled = () => this.#actorWorkerGone(managed) || managed.settled || this.#closing || managed.stopRequested || managed.abandoned || Date.now() >= deadline;
       while (this.#releasePaused) await this.#waitForRelease(managed.abortSignal);
       if (cancelled()) return false;
       if (managed.runner === "pi" || managed.runner === "pi-durable") {
@@ -5150,9 +5224,10 @@ export class AgentManager {
       // until the launch resolves, so nothing can be proven gone in between (or ever, if the launch is unknown).
       delete managed.ownProcess;
       const transport = await this.#launchTransport(managed.adapter, managed.launch);
-      // Stop receipts belong to one transport attempt, not the run id. Install
-      // the replacement and its fresh custody together, after launch resolves.
+      // Stop/death receipts belong to one transport attempt, not the run id.
+      // Install the replacement and invalidate old proof without yielding.
       managed.transport = transport;
+      delete managed.workerGone;
       const owned = transport.kind === "process" ? ownedProcess(transport.sessionId) : undefined;
       if (owned) managed.ownProcess = owned;
       managed.executionExited = false;
@@ -5342,6 +5417,72 @@ export class AgentManager {
     this.#terminalNoticeOutbox.route(managed.runDirectory);
   }
 
+  #actorWorkerGone(managed: ManagedAgent, recheck = false): boolean {
+    if (!managed.actorId || managed.hosted || managed.transport.kind !== "process" || !managed.ownProcess) return false;
+    // ownProcess is absent throughout replacement creation, and stays absent
+    // after an UNKNOWN launch. Even cached old proof has no authority in that gap.
+    const transport = managed.transport;
+    const identity = this.#workerIdentities.get(transport);
+    if (!identity || managed.ownProcess.pid !== identity.pid || !Number.isSafeInteger(identity.pid) || identity.pid <= 1 || identity.pid === process.pid) return false;
+    // A proof collected before native reconciliation cannot discharge its join.
+    if (recheck) delete managed.workerGone;
+    if (managed.workerGone === transport) return true;
+    try { process.kill(identity.pid, 0); }
+    catch (error) {
+      // EPERM and every other probe error are unknown, not permission to compare births.
+      if ((error as NodeJS.ErrnoException).code === "ESRCH") managed.workerGone = transport;
+      return managed.workerGone === transport;
+    }
+    const current = processStartTime(identity.pid);
+    if (identity.startTime?.trim() && current?.trim() && current !== identity.startTime) managed.workerGone = transport;
+    return managed.workerGone === transport;
+  }
+
+  /** Transfer normal Windows terminal admission before ANY primary-death release scan. */
+  #fenceNativeTerminalAdmission(managed: ManagedAgent, record?: AgentRunRecord): boolean {
+    if (managed.finalAnswer || managed.transport.kind !== "process" || process.platform !== "win32" ||
+        !managed.transport.waitForClose || managed.launchCancelled || managed.transport.lostContact?.() || managed.lostContact) return false;
+    const candidate = record ?? readRecord(managed.statusFile);
+    if (candidate?.id !== managed.id || !terminalWorkerResult(candidate)) return false;
+    // Existing lost-worker/debt custody keeps its intentional RUN-only proof
+    // path. A normal terminal path stays fenced until the captured close/stop
+    // joins or a rejected/bounded join is reconciled with fresh host proof.
+    managed.nativeAdmissionFenced = true;
+    return true;
+  }
+
+  /** A leader's death forbids replay, but never substitutes for the whole native/tree join. */
+  async #settleGoneActorWorker(managed: ManagedAgent, record: AgentRunRecord | undefined): Promise<boolean> {
+    if ((managed.stopRequested && managed.workerGone !== managed.transport) || !this.#actorWorkerGone(managed)) return false;
+    // Preserve genuine terminal results; only missing/recoverable transport outcomes become loss.
+    // Like #retryStartup, a window refusal outranks incidental auth/transport diagnostics.
+    if (this.#fenceNativeTerminalAdmission(managed, record)) return false;
+    // Nonterminal primary loss releases only RUN, even while its tree remains live.
+    this.#releaseProvenGone();
+    // Primary loss is not a stop request: descendants may still own the native
+    // session, including after actor abandonment. Observe their voluntary exit
+    // before joining; #drainExecution would otherwise actively kill that tree.
+    // The existing close wake/status monitor retries this bounded observation.
+    try {
+      if (!managed.executionExited &&
+          await this.#transportAliveUntil(managed.transport, Date.now() + TRANSPORT_EXIT_GRACE_MS)) return true;
+      if (terminalWorkerResult(record)) return false;
+      await this.#drainExecution(managed);
+    } catch { return true; }
+    if (!managed.executionExited) return true;
+    // Final publication may race the join. Do not replace a committed success (or
+    // genuine worker failure) with the earlier running/missing snapshot's loss.
+    const joined = readRecord(managed.statusFile);
+    const result = joined && terminalWorkerResult(joined)
+      ? this.#withTransportMetadata(joined, managed) as AgentRunResult
+      : { ...failedRecord(managed, "failed", "Actor worker is proven gone; execution was lost and will not be automatically relaunched"),
+        startedAt: joined?.startedAt ?? record?.startedAt ?? Date.now() };
+    if (!terminalWorkerResult(joined)) writeRecord(managed.statusFile, result);
+    await this.#captureWorktree(managed);
+    this.#settle(managed, result);
+    return true;
+  }
+
   async #monitor(managed: ManagedAgent, timeoutMs: number): Promise<void> {
     const deadline = Date.now() + timeoutMs + TRANSPORT_EXIT_GRACE_MS;
     let firstObservedDeadAt: number | undefined;
@@ -5355,7 +5496,12 @@ export class AgentManager {
         const transport = watchedTransport = managed.transport;
         nativeClosePending = false;
         void transport.closed?.then(() => {
-          if (managed.transport !== transport || managed.settled) return;
+          if (managed.transport !== transport) return;
+          // An earlier monitor failure may have left only lost-contact custody.
+          // This exact current close is an event to recheck host PID/birth proof,
+          // never proof by itself and never permission to publish an actor result.
+          if (managed.actorId) this.#releaseProvenGone();
+          if (managed.settled) return;
           nativeClosePending = true;
           wake?.();
         }, () => { /* notification is not exit proof */ });
@@ -5390,6 +5536,11 @@ export class AgentManager {
           this.#invalidateUiList();
         }
       }
+      if (await this.#settleGoneActorWorker(managed, record)) {
+        if (managed.settled) return;
+        await delay(AGENT_STATUS_POLL_INTERVAL_MS);
+        continue;
+      }
       if (managed.recursive) this.#nestedAgents(managed);
       this.#pruneRetainedUiRecords();
       if (record?.runnerSessionId) {
@@ -5402,6 +5553,11 @@ export class AgentManager {
         if (await this.#resumeStopped(managed, record, deadline)) continue;
         // A relaunch that failed is terminal: no fallback launch may run after it.
         if (!managed.relaunchFailure && await this.#retryStartup(managed, record, deadline)) continue;
+        if (await this.#settleGoneActorWorker(managed, record)) {
+          if (managed.settled) return;
+          await delay(AGENT_STATUS_POLL_INTERVAL_MS);
+          continue;
+        }
         // Terminal publication may precede a worker's final native-session flush.
         // Give normal process exit a bounded observation window before stop():
         // on Windows SIGTERM is destructive, not a cooperative flush request.
@@ -5506,6 +5662,11 @@ export class AgentManager {
                 ? `Agent transport exited without a result; ${diagnostic}`
                 : "Agent transport exited without a result",
             );
+            if (await this.#settleGoneActorWorker(managed, failed)) {
+              if (managed.settled) return;
+              await delay(AGENT_STATUS_POLL_INTERVAL_MS);
+              continue;
+            }
             if (await this.#resumeStopped(managed, failed, deadline)) continue;
             if (!managed.relaunchFailure && await this.#retryStartup(managed, failed, deadline)) {
               managed.lastRetriedTransportFailure = failed;
@@ -5540,6 +5701,7 @@ export class AgentManager {
 
   #settle(managed: ManagedAgent, result: AgentRunResult): void {
     if (managed.settled) return;
+    this.#fenceNativeTerminalAdmission(managed, result);
     if (managed.worktreeResult) result.worktreeResult = managed.worktreeResult;
     // Every terminal path (including explicit stop and lost transport) gets a
     // final unthrottled read before freezing the nested status tree.
@@ -5551,11 +5713,16 @@ export class AgentManager {
     if (managed.actorId && !managed.executionExited &&
         !(managed.transport.kind === "process" && process.platform === "win32" &&
           managed.transport.waitForClose && !managed.launchCancelled &&
-          (!managed.transport.lostContact?.() || this.#hasNativeStopDebt(managed)))) return;
+          (!managed.transport.lostContact?.() || this.#hasNativeStopDebt(managed)))) {
+      const lost = managed.transport.lostContact?.() ?? managed.lostContact;
+      if (lost) this.#markLost(managed, lost);
+      return;
+    }
     this.#drainLifecycle(managed);
     const lost = managed.transport.lostContact?.();
     if (lost) this.#markLost(managed, lost);
-    if (managed.transport.kind === "process" && managed.lostContact) {
+    if (managed.transport.kind === "process" && managed.lostContact &&
+        (!managed.actorId || managed.admissionRelease)) {
       // Reporting a terminal result is allowed; releasing native admission is not.
       // An uncertain Windows tree can still contain untracked native descendants.
       // smarty-dev#9855: the permit is held, not lost: a later proof of exit releases it once.
@@ -5567,24 +5734,54 @@ export class AgentManager {
       const transport = managed.transport;
       void transport.closed?.then(() => this.#releaseProvenGone(), () => this.#releaseProvenGone());
     }
-    if (!managed.finalAnswer && managed.transport.kind === "process" && process.platform === "win32" &&
-        managed.transport.waitForClose && !managed.lostContact && !managed.processStop) {
-      // The logical result can precede native close. Keep its permit while a
-      // later explicit stop may still acquire a Windows tree-helper obligation.
+    if (!managed.executionExited && !managed.finalAnswer && managed.transport.kind === "process" && process.platform === "win32" &&
+        managed.transport.waitForClose && !managed.lostContact && !managed.launchCancelled) {
+      // A completed host drain already joined and proved exit; do not reopen its release fence.
+      // The logical result can precede native close. An existing stop is also
+      // an ownership obligation, not a reason to omit the native release join.
+      // This ownership outlives nativeReleasePending when close is unconfirmed.
+      managed.nativeAdmissionFenced = true;
+      const transport = managed.transport;
+      const processStop = managed.processStop;
       const release = managed.release;
       managed.release = () => {
-        managed.nativeReleasePending = Promise.resolve().then(async () => {
-          await managed.transport.waitForClose!();
-          // Stop may have begun after settlement, while native close was pending.
-          await managed.processStop;
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const pending = Promise.resolve().then(async () => {
+          // Native events drive the normal path. One safety-net deadline uses
+          // the existing stop/close budget; a hung join cannot hide RUN forever.
+          const joined = await Promise.race([
+            (async () => {
+              await transport.waitForClose!();
+              await processStop;
+              if (managed.transport !== transport) return false;
+              // Stop may have begun after settlement, while native close was pending.
+              await managed.processStop;
+              return managed.transport === transport;
+            })(),
+            new Promise<never>((_, reject) => {
+              timer = setTimeout(() => reject(new Error("Worker exit confirmation timed out")), TRANSPORT_EXIT_GRACE_MS * 7);
+            }),
+          ]);
+          if (timer) clearTimeout(timer);
+          if (!joined) return;
           await this.#noteUnconfirmedExit(managed);
-          if (!managed.lostContact) {
+          if (managed.transport === transport && !managed.lostContact) {
             fs.rmSync(path.join(managed.runDirectory, "images.json"), { force: true });
             release();
           }
         }).catch(error => {
-          this.#markLost(managed, error instanceof Error ? error.message : String(error));
-        }).finally(() => { delete managed.nativeReleasePending; this.#retentionRevision++; });
+          if (managed.transport === transport) {
+            // Eligibility is not proof. #markLost scans the same host PID/birth
+            // path now, and subsequent admission/native events retry if alive.
+            managed.nativeAdmissionReconcile = transport;
+            this.#markLost(managed, error instanceof Error ? error.message : String(error));
+          }
+        }).finally(() => {
+          if (timer) clearTimeout(timer);
+          if (managed.nativeReleasePending === pending) delete managed.nativeReleasePending;
+          this.#retentionRevision++;
+        });
+        managed.nativeReleasePending = pending;
       };
     }
     if (!beginAgentSettlement(managed)) return;

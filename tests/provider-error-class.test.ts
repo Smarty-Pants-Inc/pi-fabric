@@ -54,6 +54,43 @@ describe("classifyProviderError (smarty-dev#8742)", () => {
     expect(classifyProviderError(failed(errorMessage))?.retryable).toBe(true);
   });
 
+  // Retry decisions follow status/structured fields, not affinity tokens echoed in prose.
+  it("keeps 503 retryable when body.message echoes compaction_affinity_missing", () => {
+    const secret = "SECRET-fake-provider-key echoed private prompt";
+    const errorMessage = `503 ${JSON.stringify({ message: `upstream quoted: ${affinity}; ${secret}` })}`;
+    const verdict = classifyProviderError(failed(errorMessage))!;
+    expect(verdict.short).toBe("503: compaction_affinity_missing");
+    expect(JSON.stringify(verdict)).not.toMatch(/SECRET|private prompt|fake-provider-key/);
+    expect(verdict).toMatchObject({ retryable: true, status: 503, basis: "status" });
+  });
+
+  it.each([408, 429, 500, 503, 529, 599])("keeps HTTP %s retryable despite structured affinity code or type", (status) => {
+    for (const field of ["code", "type"]) {
+      const errorMessage = `${status} ${JSON.stringify({ [field]: "compaction_affinity_missing" })}`;
+      expect(classifyProviderError(failed(errorMessage))).toMatchObject({ retryable: true, status, basis: "status" });
+    }
+  });
+
+  it.each(["code", "type"])("keeps 400 body.%s affinity non-retryable", (field) => {
+    const errorMessage = `400 ${JSON.stringify({ [field]: "compaction_affinity_missing" })}`;
+    expect(classifyProviderError(failed(errorMessage))).toMatchObject({ retryable: false, status: 400, basis: "body" });
+  });
+
+  it("uses the normal 400 status rule when only body.message quotes affinity", () => {
+    const errorMessage = `400 ${JSON.stringify({ message: `request quoted: ${affinity}` })}`;
+    expect(classifyProviderError(failed(errorMessage))).toMatchObject({ retryable: false, status: 400, basis: "status" });
+  });
+
+  it("keeps 400 rate_limit_error retryable when its message merely mentions affinity", () => {
+    expect(classifyProviderError(failed(anthropic(400, "rate_limit_error", `rate limited; quoted: ${affinity}`))))
+      .toMatchObject({ retryable: true, status: 400, basis: "body" });
+  });
+
+  it("does not use raw-text affinity fallback when a parsed body.message survives without status", () => {
+    const errorMessage = JSON.stringify({ message: `upstream quoted: ${affinity}` });
+    expect(classifyProviderError(failed(errorMessage))).toMatchObject({ retryable: true, basis: "default" });
+  });
+
   it("keeps a provider plan limit (Pi provider_limit diagnostic) on backoff", () => {
     expect(classifyProviderError(failed("429 smarty_limit", { diagnostics: [{ type: "provider_limit", timestamp: 1 }] })))
       .toMatchObject({ retryable: true, basis: "diagnostic" });

@@ -55,51 +55,19 @@ const completionSamples = () => ["ryzen2", "ryzen4"].map((host, index) => ({
 }));
 
 const recordedStoreDir = (host, hostId) => `/recorded/${host}/control-seen/${createHash("sha256").update(hostId).digest("hex").slice(0, 32)}`;
-const rollbackTranscript = ({ host = "ryzen2", unknown = false, drained = false, uncorrelatedAck = false,
-  flippedAt = "2026-10-16T08:00:00.000Z" } = {}) => {
+// E20 authorizing probe fixture: INFO 0/0 only, no body inventory or relay transcript.
+const rollbackTranscript = ({ host = "ryzen2", flippedAt = "2026-10-16T08:00:00.000Z" } = {}) => {
   const request = { host, runtimeIds: ["session:a", "runtime:b"],
     drainReceiptStores: ["session:a", "runtime:b"].map(hostId => ({ hostId, storeDir: recordedStoreDir(host, hostId) })) }, calls = [];
-  const commands = drained ? [] : [
-    { commandId: "cmd:queued", replyTo: "reply:q", classification: "queued" },
-    { commandId: "cmd:admitted", replyTo: "reply:a", classification: "admitted", storedOutcome: { accepted: true } },
-    { commandId: "cmd:terminal", replyTo: "reply:t", classification: "terminal", storedOutcome: { code: "FABRIC_TARGET_TERMINAL" } },
-    ...(unknown ? [{ commandId: "cmd:unknown", replyTo: "reply:u", classification: "unknown" }] : []),
-  ];
-  const states = [{ runtimeId: "session:a", stream: `FABRIC_IN_${host}`, pending: commands.length, ackPending: drained ? 0 : 1 },
-    { runtimeId: "runtime:b", stream: `FABRIC_IN_${host}`, pending: drained ? 0 : 1, ackPending: 0 }];
-  const messages = commands.map((command, index) => ({ runtimeId: "session:a", sequence: index + 1, kind: "command",
-    commandId: command.commandId, commandEventId: `event:${command.commandId}`, replyTo: command.replyTo,
-    claim: command.classification === "queued" ? "absent" : command.classification === "unknown" ? "pending" : "outcome",
-    ...(command.storedOutcome ? { outcome: command.storedOutcome } : {}),
-    ...(command.classification === "terminal" ? { terminal: true } : {}),
-  }));
-  if (!drained) messages.push({ runtimeId: "session:a", sequence: commands.length + 1, kind: "ack",
-    ...(uncorrelatedAck ? {} : { commandEventId: "event:cmd:queued" }) },
-    { ...messages[0], runtimeId: "runtime:b", sequence: 1, commandEventId: "event:cmd:queued:second-request" });
+  const states = request.runtimeIds.map(runtimeId => ({ runtimeId, stream: `FABRIC_IN_${host}`, pending: 0, ackPending: 0 }));
   const add = (kind, payload, result) => calls.push({ action: { kind, host, runtimeIds: request.runtimeIds, ...payload }, result });
   add("pause-admission", {}, { paused: true, spawnsRefused: true, receiversDraining: true,
     code: "FABRIC_TRANSPORT_DRAINING", notRun: true, persisted: false, runtimeIds: request.runtimeIds, hostInventoryComplete: true });
   add("drain", { waitLimitMs: 120000 }, { elapsedMs: 120000, states });
-  add("classify-retained", { states }, { complete: true, pausedInventoryStable: true, controlSeenStoreUnchanged: true, messages });
-  const commandMessages = messages.filter(m => m.kind === "command");
-  commandMessages.forEach((message, index) => {
-    const command = commands.find(c => c.commandId === message.commandId);
-    add("relay-outcome-unknown", {
-      disposition: { commandId: command.commandId, commandEventId: message.commandEventId, runtimeId: message.runtimeId,
-        classification: command.classification, relayId: `relay:${message.commandEventId}`,
-        code: "FABRIC_RELAY_DESTINATION_UNAVAILABLE", outcome: "outcome-unknown", retry: "same-key-once-after-flip" }, replyTo: command.replyTo,
-    }, { id: `relay:${message.commandEventId}`, persisted: true, sequence: index + 1 });
-  });
-  const writes = request.drainReceiptStores.map(({ hostId, storeDir }) => {
-    const state = states.find(s => s.runtimeId === hostId);
-    const eventIds = [...new Set(commandMessages.filter(m => m.runtimeId === hostId).map(m => m.commandEventId))];
-    return { storeDir, receipt: { version: 1, hostId,
-      flippedAt: { from: "actual-flip-boundary", format: "epoch-ms" },
-      completedAt: { from: "drain-completed-at-boundary", format: "epoch-ms" },
-      complete: !(uncorrelatedAck && hostId === "session:a" && !drained),
-      consumer: { stream: state.stream, numPending: state.pending, numAckPending: state.ackPending },
-      dispositions: eventIds.map(commandEventId => ({ commandEventId, disposition: "relay" })) } };
-  });
+  const writes = request.drainReceiptStores.map(({ hostId, storeDir }) => ({ storeDir, receipt: { version: 1, hostId,
+    flippedAt: { from: "actual-flip-boundary", format: "epoch-ms" },
+    completedAt: { from: "drain-completed-at-boundary", format: "epoch-ms" }, complete: true,
+    consumer: { stream: `FABRIC_IN_${host}`, numPending: 0, numAckPending: 0 }, dispositions: [] } }));
   for (const write of writes) add("write-nats-drain-receipt", {
     module: "dist/topology/nats-drain-receipt.js", api: "writeNatsDrainReceipt", storeDir: write.storeDir,
     receipt: { ...write.receipt, flippedAt: Date.parse(flippedAt), completedAt: Date.parse(flippedAt) + 1 },
@@ -115,15 +83,8 @@ const rollbackTranscript = ({ host = "ryzen2", unknown = false, drained = false,
     hostConfigWrite: { atomic: true, persisted: true, flippedAt, set: { "mesh.transport": "file",
       "mesh.nats.rollbackHoldUntil": new Date(Date.parse(flippedAt) + 172800000).toISOString() } },
   });
-  add("reconcile-command-ids", { commands, preserveControlSeen: true, maxSameKeyRetries: 1, retainCompletions: true }, {
-    controlSeenStoreUnchanged: true, completionJournalRetained: true, completionJournalUnchanged: true,
-    results: commands.map(command => ({ commandId: command.commandId, commandIdUnchanged: true, claimPreserved: true,
-      sameKeyRetries: command.classification === "unknown" ? 0 : 1, effectCount: command.classification === "unknown" ? null : 1,
-      handlerReexecuted: false, disposition: command.classification === "queued" ? "admitted-once" :
-        command.classification === "unknown" ? "held-unknown" : "stored-outcome",
-      ...(command.storedOutcome ? { outcome: command.storedOutcome } : {}),
-      ...(command.classification === "unknown" ? {} : { receiptId: `recorded:effect:${command.commandId}` }),
-    })),
+  add("reconcile-command-ids", { commands: [], preserveControlSeen: true, maxSameKeyRetries: 0, retainCompletions: true }, {
+    controlSeenStoreUnchanged: true, completionJournalRetained: true, completionJournalUnchanged: true, results: [],
   });
   add("retain-audit", {}, { streamsKept: true, consumersKept: true, fabricAdvKept: true,
     controlSeenKept: true, nativeCustodyKept: true, deletedOrPurged: false });
@@ -436,31 +397,70 @@ test("T-ROLLBACK an uncertain pause stops before drain, flip or same-key retry",
   assert.equal(result.audit[0].status, "uncertain");
 });
 
-test("E4 T-ROLLBACK exact full replay reconciles only control and retains native completion journals unchanged on either host", async () => {
-  for (const host of ["ryzen2", "ryzen4"]) {
-    const transcript = rollbackTranscript({ host }), report = await replayRollback(transcript);
-    assert.equal(report.verdict, "reconciled");
-    assert.equal(report.evidenceKind, "recorded-probe-only");
-    assert.equal(report.e2eProven, false);
-    assert.equal(report.fullyDrained, false);
-    assert.equal(report.audit.length, transcript.calls.length);
-    assert.deepEqual(report.dispositions.map(d => d.classification), ["queued", "admitted", "terminal", "queued"]);
-    assert.equal(report.retainedAcks.length, 1);
-    assert.equal(report.reconciliation.completionJournalRetained, true);
-    assert.equal(report.reconciliation.completionJournalUnchanged, true);
-    assert.equal(Object.hasOwn(report.reconciliation, "completionResendCarrier"), false);
+// Keep reason: E19/E20 authority and data-safety boundary; probes are NOT live drain/release proof.
+test("E20 plan omits classification/relay and limits reconciliation to empty inventory", () => {
+  const plan = rollbackPlan({ host: "ryzen2", runtimeIds: ["session:a"] });
+  assert.deepEqual(plan.steps.map(s => s.action), ["pause-admission", "drain", "write-nats-drain-receipt",
+    "flip-to-file", "reconcile-command-ids", "retain-audit"]);
+  assert.match(plan.steps.find(s => s.action === "drain").require, /INFO counters only/);
+  assert.match(plan.steps.find(s => s.action === "reconcile-command-ids").require, /empty/);
+  for (const action of ["inbox MSG.GET/DIRECT.GET", "classify-retained", "relay publish", "consumer create/delete", "automatic retry/unpause"]) {
+    assert.ok(plan.forbidden.includes(action));
   }
 });
 
-test("E4 T-ROLLBACK rejects completion carrier/control-seen inventory before relay or flip", async () => {
-  for (const mutation of [m => { m.operation = "completion"; }, m => { m.commandId = "completion:run"; }]) {
+test("E20 any nonzero counter on either runtime blocks before receipt/flip in probe AND live modes", async () => {
+  for (const host of ["ryzen2", "ryzen4"]) for (const index of [0, 1]) for (const field of ["pending", "ackPending"]) {
+    for (const drainReceiptMode of ["probe", "live"]) for (const elapsed of [0, 120000]) {
+      const transcript = rollbackTranscript({ host }), seen = [];
+      const drain = transcript.calls.find(c => c.action.kind === "drain").result;
+      drain.states[index][field] = 1; drain.elapsedMs = elapsed;
+      const adapter = recordedAdapter(transcript.calls);
+      const report = await runRollback(transcript.request, async (action, options) => {
+        seen.push(action.kind);
+        return adapter.execute(action, options);
+      }, { dryRun: false, evidenceKind: "injected-unverified", drainReceiptMode });
+      assert.equal(report.verdict, "blocked");
+      assert.equal(report.phase, "drain");
+      assert.equal(report.code, "FABRIC_CANARY_ROLLBACK_DRAIN_NOT_EMPTY");
+      assert.equal(report.outcome, "outcome-unknown");
+      assert.deepEqual(seen, ["pause-admission", "drain"]);
+      assert.deepEqual(report.audit.map(a => a.action.kind), seen);
+      assert.deepEqual(report.drainStates, drain.states);
+      assert.deepEqual(report.drainReceiptWrites, []);
+      assert.deepEqual(report.dispositions, []);
+      assert.equal(Object.hasOwn(report, "reconciliation"), false);
+      assert.equal(Object.hasOwn(report, "notRun"), false);
+      assert.equal(Object.hasOwn(report, "notDelivered"), false);
+      assert.equal(report.e2eProven, false); assert.equal(report.releaseProven, false);
+      assert.match(report.error, /owner to drain \(or restart it\)/);
+      assert.match(report.error, /new explicit operator action/);
+      assert.match(report.error, /owner cannot run, a person decides/);
+      assert.match(report.recovery, /No auto-resume, retry, unpause or cleanup/);
+      assert.throws(adapter.finish, /unused recorded calls/);
+    }
+  }
+});
+
+test("E20 historical classification/relay calls are non-authorizing and stay unconsumed", async () => {
+  for (const nonzero of [false, true]) {
     const transcript = rollbackTranscript();
-    mutation(transcript.calls.find(c => c.action.kind === "classify-retained").result.messages[0]);
-    const report = await replayRollback(transcript);
+    if (nonzero) transcript.calls[1].result.states[0].ackPending = 1;
+    // Negative-only legacy sentinels, not an executable historical relay fixture.
+    transcript.calls.splice(2, 0,
+      { action: { kind: "classify-retained", host: "ryzen2", runtimeIds: transcript.request.runtimeIds }, result: { complete: true } },
+      { action: { kind: "relay-outcome-unknown", host: "ryzen2", runtimeIds: transcript.request.runtimeIds }, result: { persisted: true } });
+    const adapter = recordedAdapter(transcript.calls), seen = [];
+    const report = await runRollback(transcript.request, async (action, options) => {
+      seen.push(action.kind); return adapter.execute(action, options);
+    }, { dryRun: false, evidenceKind: "recorded-probe-only" });
     assert.equal(report.verdict, "blocked");
-    assert.equal(report.phase, "classify");
-    assert.match(report.error, /E4 completion has no carrier/);
-    assert.deepEqual(report.audit.map(a => a.action.kind), ["pause-admission", "drain", "classify-retained"]);
+    assert.equal(seen.includes("classify-retained"), false);
+    assert.equal(seen.includes("relay-outcome-unknown"), false);
+    assert.deepEqual(report.drainReceiptWrites, []);
+    assert.equal(Object.hasOwn(report, "reconciliation"), false);
+    assert.throws(adapter.finish, /unused recorded calls/);
+    if (nonzero) assert.deepEqual(seen, ["pause-admission", "drain"]);
   }
 });
 
@@ -476,25 +476,13 @@ test("E4 T-ROLLBACK refuses completion resends or changed/unretained journals", 
   }
 });
 
-test("T-ROLLBACK unknown claims stay operator-held without retry or reexecution", async () => {
-  const report = await replayRollback(rollbackTranscript({ unknown: true }));
-  assert.equal(report.verdict, "needs-operator");
-  assert.equal(report.e2eProven, false);
-  const unknown = report.reconciliation.results.find(r => r.commandId === "cmd:unknown");
-  assert.equal(unknown.sameKeyRetries, 0);
-  assert.equal(unknown.handlerReexecuted, false);
-  assert.equal(unknown.effectCount, null);
-  assert.equal(unknown.disposition, "held-unknown");
-  assert.equal(report.audit.at(-1).action.kind, "retain-audit");
-});
-
-test("T-ROLLBACK preserves full drain, inventory, old-writer and same-key safety gates", async () => {
+test("E20 preserves old-writer, empty-reconciliation and audit safety gates", async () => {
   for (const [kind, mutation, phase] of [
-    ["drain", r => { r.elapsedMs = 119999; }, "drain"],
-    ["classify-retained", r => { r.messages.pop(); }, "classify"],
     ["flip-to-file", r => { r.oldNatsWritersStopped = false; }, "flip"],
-    ["reconcile-command-ids", r => { r.results[0].sameKeyRetries = 2; }, "reconcile"],
-    ["reconcile-command-ids", r => { r.results[1].handlerReexecuted = true; }, "reconcile"],
+    ["flip-to-file", r => { r.fileAdmissionReady = false; }, "flip"],
+    ["flip-to-file", r => { r.fileRuntimeIds = r.fileRuntimeIds.slice(0, 1); }, "flip"],
+    ["reconcile-command-ids", r => { r.results.push({ commandId: "unexpected", sameKeyRetries: 1 }); }, "reconcile"],
+    ["reconcile-command-ids", r => { r.controlSeenStoreUnchanged = false; }, "reconcile"],
     ["retain-audit", r => { r.deletedOrPurged = true; }, "retain"],
   ]) {
     const transcript = rollbackTranscript(); mutation(transcript.calls.find(c => c.action.kind === kind).result);
@@ -502,39 +490,33 @@ test("T-ROLLBACK preserves full drain, inventory, old-writer and same-key safety
     assert.equal(report.verdict, "blocked");
     assert.equal(report.phase, phase);
     assert.equal(report.audit.at(-1).action.kind, kind);
-    assert.equal(report.e2eProven, false);
+    assert.equal(report.e2eProven, false); assert.equal(report.releaseProven, false);
   }
 });
 
-// Keep reason: E16c/E17 release trust boundary and local custody data safety.
-// These assert the orchestrator's fail-closed decisions, NOT A1's fsync implementation or release predicate.
-test("E17 recorded writer calls follow exhaustive classification and EVERY event relay, before the atomic flip", async () => {
-  for (const host of ["ryzen2", "ryzen4"]) {
-    const transcript = rollbackTranscript({ host, unknown: true });
+// Keep reason: E17 writer trust boundary/local custody safety, NOT fsync or release-predicate proof.
+test("E20 0/0 exact replay writes empty complete E17 receipts before atomic flip, then reconciles nothing", async () => {
+  for (const host of ["ryzen2", "ryzen4"]) for (const elapsed of [0, 120000]) {
+    const transcript = rollbackTranscript({ host }); transcript.calls[1].result.elapsedMs = elapsed;
     const report = await replayRollback(transcript);
-    assert.equal(report.verdict, "needs-operator"); // A drain disposition is not a native handler outcome.
-    assert.equal(report.releaseProven, false);
-    assert.equal(report.drainReceiptMode, "probe");
-    const kinds = report.audit.map(a => a.action.kind);
-    const firstWrite = kinds.indexOf("write-nats-drain-receipt"), flip = kinds.indexOf("flip-to-file");
-    assert.ok(firstWrite > kinds.indexOf("classify-retained"));
-    assert.ok(firstWrite > kinds.lastIndexOf("relay-outcome-unknown"));
-    assert.ok(firstWrite < flip);
+    assert.equal(report.verdict, "reconciled");
+    assert.equal(report.evidenceKind, "recorded-probe-only");
+    assert.equal(report.e2eProven, false); assert.equal(report.releaseProven, false);
+    assert.equal(report.fullyDrained, true); assert.equal(report.drainReceiptMode, "probe");
+    assert.deepEqual(report.dispositions, []);
+    assert.deepEqual(report.audit.map(a => a.action.kind), ["pause-admission", "drain",
+      "write-nats-drain-receipt", "write-nats-drain-receipt", "flip-to-file", "reconcile-command-ids", "retain-audit"]);
+    assert.equal(report.audit.length, transcript.calls.length);
     assert.equal(report.drainReceiptWrites.length, transcript.request.runtimeIds.length);
     for (const write of report.drainReceiptWrites) {
       const configured = transcript.request.drainReceiptStores.find(s => s.hostId === write.receipt.hostId);
       assert.equal(write.storeDir, configured.storeDir);
-      // Exact numeric argument to A1's actual (storeDir, NatsDrainReceipt) => void API.
-      // A1 validates shape only; exhaustive coverage remains this orchestrator's responsibility.
-      const session = configured.hostId === "session:a";
+      // Independent expected numeric (storeDir, NatsDrainReceipt) => void API argument.
       assert.deepEqual(write.receipt, {
         version: 1, hostId: configured.hostId,
         flippedAt: Date.parse("2026-10-16T08:00:00.000Z"),
-        completedAt: Date.parse("2026-10-16T08:00:00.000Z") + 1,
-        complete: true,
-        consumer: { stream: `FABRIC_IN_${host}`, numPending: session ? 4 : 1, numAckPending: session ? 1 : 0 },
-        dispositions: (session ? ["event:cmd:queued", "event:cmd:admitted", "event:cmd:terminal", "event:cmd:unknown"] :
-          ["event:cmd:queued:second-request"]).map(commandEventId => ({ commandEventId, disposition: "relay" })),
+        completedAt: Date.parse("2026-10-16T08:00:00.000Z") + 1, complete: true,
+        consumer: { stream: `FABRIC_IN_${host}`, numPending: 0, numAckPending: 0 }, dispositions: [],
       });
       assert.equal(write.persistence, "recorded-unverified");
       const call = report.audit.find(a => a.action.kind === "write-nats-drain-receipt" && a.action.storeDir === write.storeDir);
@@ -542,59 +524,31 @@ test("E17 recorded writer calls follow exhaustive classification and EVERY event
         module: "dist/topology/nats-drain-receipt.js", api: "writeNatsDrainReceipt", storeDir: write.storeDir, receipt: write.receipt });
       assert.deepEqual(call.result, { apiInvoked: true, persistence: "recorded-unverified" });
     }
-    const ids = report.drainReceiptWrites.flatMap(w => w.receipt.dispositions.map(d => d.commandEventId));
-    assert.ok(ids.includes("event:cmd:queued"));
-    assert.ok(ids.includes("event:cmd:queued:second-request"));
-    assert.ok(ids.includes("event:cmd:unknown"));
-    assert.equal(report.dispositions.filter(d => d.commandId === "cmd:queued").length, 2);
+    const reconciliation = report.audit.find(a => a.action.kind === "reconcile-command-ids");
+    assert.deepEqual(reconciliation.action, { kind: "reconcile-command-ids", host, runtimeIds: transcript.request.runtimeIds,
+      commands: [], preserveControlSeen: true, maxSameKeyRetries: 0, retainCompletions: true });
+    assert.deepEqual(report.reconciliation.results, []);
+    assert.equal(report.reconciliation.completionJournalRetained, true);
+    assert.equal(report.reconciliation.completionJournalUnchanged, true);
+    assert.equal(Object.hasOwn(report.reconciliation, "completionResendCarrier"), false);
   }
 });
 
-test("E17 actual 0/0 permits complete receipt with no invented command dispositions", async () => {
-  const report = await replayRollback(rollbackTranscript({ drained: true }));
-  assert.equal(report.verdict, "reconciled");
-  assert.equal(report.fullyDrained, true);
-  assert.equal(report.releaseProven, false);
-  assert.equal(report.audit.some(a => a.action.kind === "relay-outcome-unknown"), false);
-  for (const write of report.drainReceiptWrites) {
-    assert.equal(write.receipt.complete, true);
-    assert.deepEqual(write.receipt.dispositions, []);
-    assert.deepEqual(write.receipt.consumer, { stream: "FABRIC_IN_ryzen2", numPending: 0, numAckPending: 0 });
-    assert.equal(write.persistence, "recorded-unverified");
-  }
-});
-
-test("E17 partial or failed drain/classification/relay never reaches the custody writer", async () => {
-  for (const [kind, mutation] of [
-    ["drain", r => { r.states[0].pending = -1; }],
-    ["drain", r => { delete r.states[0].stream; }],
-    ["drain", r => { r.states[0].stream = "FABRIC_IN_ryzen4"; }],
-    ["classify-retained", r => { r.complete = false; }],
-    ["classify-retained", r => { delete r.messages[0].commandEventId; }],
-    ["relay-outcome-unknown", r => { r.persisted = false; }],
-    ["relay-outcome-unknown", r => { r.id = "relay:cmd:queued"; }],
+test("E20 malformed or incomplete INFO drain receipts never reach the writer or flip", async () => {
+  for (const mutation of [
+    r => { r.states[0].pending = -1; }, r => { r.states[1].ackPending = 0.5; },
+    r => { r.states[0].pending = Number.MAX_SAFE_INTEGER + 1; }, r => { delete r.states[1].ackPending; },
+    r => { delete r.states[0].stream; }, r => { r.states[0].stream = "FABRIC_IN_ryzen4"; },
+    r => { r.states.pop(); }, r => { r.states[1] = r.states[0]; },
+    r => { r.states[1].runtimeId = "foreign:runtime"; },
+    r => { r.elapsedMs = 120001; }, r => { r.elapsedMs = -1; },
   ]) {
-    const transcript = rollbackTranscript({ unknown: true });
-    mutation(transcript.calls.find(c => c.action.kind === kind).result);
+    const transcript = rollbackTranscript(); mutation(transcript.calls[1].result);
     const report = await replayRollback(transcript);
-    assert.equal(report.verdict, "blocked");
+    assert.equal(report.verdict, "blocked"); assert.equal(report.phase, "drain");
     assert.equal(report.releaseProven, false);
     assert.deepEqual(report.drainReceiptWrites, []);
-    assert.equal(report.audit.some(a => a.action.kind === "write-nats-drain-receipt"), false);
-    assert.equal(report.audit.some(a => a.action.kind === "flip-to-file"), false);
-  }
-});
-
-test("E17 queued and unknown claims without their actual event relay cannot authorize a receipt", async () => {
-  for (const commandId of ["cmd:queued", "cmd:unknown"]) {
-    const transcript = rollbackTranscript({ unknown: true });
-    transcript.calls.find(c => c.action.kind === "relay-outcome-unknown" && c.action.disposition.commandId === commandId).result.persisted = false;
-    const report = await replayRollback(transcript);
-    assert.equal(report.verdict, "blocked");
-    assert.equal(report.phase, "disposition");
-    assert.equal(report.releaseProven, false);
-    assert.deepEqual(report.drainReceiptWrites, []);
-    assert.equal(report.audit.some(a => a.action.kind === "write-nats-drain-receipt"), false);
+    assert.deepEqual(report.audit.map(a => a.action.kind), ["pause-admission", "drain"]);
   }
 });
 
@@ -617,21 +571,6 @@ test("E17 uncertain second writer keeps the first receipt audit but never consum
   assert.equal(Object.hasOwn(report.audit.at(-1), "result"), false);
   assert.equal(Object.hasOwn(report, "reconciliation"), false);
   assert.equal(report.releaseProven, false);
-});
-
-test("E17 retained uncorrelated message writes INCOMPLETE and vetoes the config flip/release claim", async () => {
-  const transcript = rollbackTranscript({ uncorrelatedAck: true });
-  const report = await replayRollback(transcript);
-  assert.equal(report.verdict, "blocked");
-  assert.equal(report.code, "FABRIC_CANARY_ROLLBACK_DRAIN_RECEIPT_UNVERIFIED");
-  assert.equal(report.phase, "drain-receipt");
-  assert.equal(report.releaseProven, false);
-  assert.equal(report.drainReceiptWrites[0].receipt.complete, false);
-  assert.match(report.error, /incomplete per-commandEventId/);
-  assert.equal(report.audit.at(-1).action.kind, "flip-to-file");
-  assert.equal(report.audit.at(-1).status, "uncertain");
-  assert.equal(Object.hasOwn(report.audit.at(-1), "result"), false); // no recorded config write consumed
-  assert.equal(Object.hasOwn(report, "reconciliation"), false);
 });
 
 test("E17 missing, mesh-root, relative, duplicate and foreign-host store bindings fail before pause", async () => {
@@ -658,8 +597,8 @@ test("E17 exact replay rejects foreign, stale-time, incomplete and falsely persi
     c => { c.action.storeDir = recordedStoreDir("ryzen2", "foreign:host"); },
     c => { c.action.receipt.hostId = "foreign:host"; },
     c => { c.action.receipt.complete = false; },
-    c => { c.action.receipt.consumer.numPending = 0; },
-    c => { c.action.receipt.dispositions.pop(); },
+    c => { c.action.receipt.consumer.numPending = 1; },
+    c => { c.action.receipt.dispositions.push({ commandEventId: "legacy:event", disposition: "relay" }); },
     c => { c.action.receipt.completedAt = c.action.receipt.flippedAt - 1; },
     c => { c.action.receipt.flippedAt = -1; },
     c => { c.result = { apiInvoked: true, persistence: "built-writer-returned" }; },
@@ -721,4 +660,8 @@ test("T-ROLLBACK recorded-call replay requires exact calls and refuses unused re
   const adapter = recordedAdapter([{ action: { kind: "drain" }, result: { pending: 0 } }]);
   assert.throws(adapter.finish, /unused recorded calls/);
   await assert.rejects(adapter.execute({ kind: "flip-to-file" }), /does not match/);
+  const transcript = rollbackTranscript();
+  // An appended historical relay is not silently accepted after a valid 0/0 replay either.
+  transcript.calls.push({ action: { kind: "relay-outcome-unknown" }, result: { persisted: true } });
+  await assert.rejects(replayRollback(transcript), /unused recorded calls/);
 });

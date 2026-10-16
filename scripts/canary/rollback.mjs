@@ -31,25 +31,14 @@ function validateDrainStores(request) {
   return stores.map(({ hostId, storeDir }) => ({ hostId, storeDir }));
 }
 
-function receiptWritePlan(stores, states, messages, relays) {
+function receiptWritePlan(stores, states) {
   return stores.map(({ hostId, storeDir }) => {
     const state = states.find((s) => s.runtimeId === hostId);
-    const remaining = messages.filter((m) => m.runtimeId === hostId);
-    const entries = new Map();
-    for (const message of remaining) {
-      // An ACK is covered only if its commandEventId also has an actual durable relay.
-      // An uncorrelated retained ACK (or legacy/missing event id) cannot manufacture completion.
-      if (text(message.commandEventId) && relays.has(`${hostId}\0${message.commandEventId}`)) {
-        entries.set(message.commandEventId, { commandEventId: message.commandEventId, disposition: "relay" });
-      }
-    }
-    const zero = state.pending === 0 && state.ackPending === 0;
-    const complete = zero || (remaining.length > 0 && remaining.every((m) => entries.has(m.commandEventId)));
+    requireThat(state.pending === 0 && state.ackPending === 0, "E20 complete receipt requires actual 0/0 counters");
     return { storeDir, receipt: { version: 1, hostId,
       flippedAt: { from: "actual-flip-boundary", format: "epoch-ms" },
-      completedAt: { from: "drain-completed-at-boundary", format: "epoch-ms" }, complete,
-      consumer: { stream: state.stream, numPending: state.pending, numAckPending: state.ackPending },
-      dispositions: [...entries.values()] } };
+      completedAt: { from: "drain-completed-at-boundary", format: "epoch-ms" }, complete: true,
+      consumer: { stream: state.stream, numPending: 0, numAckPending: 0 }, dispositions: [] } };
   });
 }
 
@@ -75,19 +64,6 @@ function validateFileConfigWrite(write) {
     "E14.3 host-config receipt must set BOTH mesh.transport=file and mesh.nats.rollbackHoldUntil=flippedAt+48h (canonical UTC ISO); missing, malformed or stale holds are not proof");
 }
 
-/** @typedef {"queued"|"admitted"|"unknown"|"terminal"} AdmissionClass */
-/**
- * @typedef {Object} CommandDisposition
- * @property {string} commandId Carrier-independent dedupe key, never replaced on retry.
- * @property {string} commandEventId Stored envelope id; every same-key caller retry has its own event.
- * @property {string} runtimeId Destination control-plane hostId.
- * @property {AdmissionClass} classification
- * @property {"FABRIC_RELAY_DESTINATION_UNAVAILABLE"} code
- * @property {"outcome-unknown"} outcome
- * @property {string} relayId Stable relay:<commandEventId> key.
- * @property {"same-key-once-after-flip"} retry
- */
-
 function validateRequest(request) {
   requireThat(request && ["ryzen2", "ryzen4"].includes(request.host), "rollback host must be ryzen2 or ryzen4 (errata E3)");
   requireThat(Array.isArray(request.runtimeIds) && request.runtimeIds.length > 0 &&
@@ -101,21 +77,20 @@ export function rollbackPlan(request) {
     steps: [
       { phase: "pause", action: "pause-admission", host: request.host, runtimeIds: request.runtimeIds,
         require: "new spawns refused; new sends FABRIC_TRANSPORT_DRAINING/notRun before persistence; receivers continue draining" },
-      { phase: "drain", action: "drain", waitLimitMs: 120000, require: "drainState pending=0, ackPending=0 on EVERY runtime, or classify after bounded timeout" },
-      { phase: "classify", action: "classify-retained", require: "complete operator MSG.GET inventory, joined to carrier-independent control-seen; no ack or mutation",
-        classes: { queued: "no claim", admitted: "claim with outcome", unknown: "claim without outcome", terminal: "claim with terminal outcome" } },
-      { phase: "disposition", action: "relay-outcome-unknown", require: "one durable idempotent relay:<commandEventId> per remaining command event, including admitted and terminal; retain ACK envelopes" },
+      { phase: "drain", action: "drain", waitLimitMs: 120000,
+        require: "INFO counters only: pending=0, ackPending=0 on EVERY runtime; any nonzero result is BLOCKED/outcome-unknown, preserving pause and audit for a new explicit operator retry after the owner drains or restarts; if the owner cannot run, a person decides" },
       { phase: "drain-receipt", action: "write-nats-drain-receipt", module: DRAIN_WRITER_MODULE, api: DRAIN_WRITER_API,
-        require: "mandatory beforeFlip hook inside flip-to-file, AFTER all drain/classification/relay work and BEFORE its atomic config write; explicit drainReceiptStores per runtime hostId; built writer only in live mode, exact API-call replay with NO writes in probe mode; incomplete receipt vetoes flip" },
+        require: "mandatory beforeFlip hook inside flip-to-file, AFTER actual 0/0 drain and BEFORE its atomic config write; complete:true, dispositions:[]; explicit drainReceiptStores per runtime hostId; built writer only in live mode, exact API-call replay with NO writes in probe mode" },
       { phase: "flip", action: "flip-to-file", hostConfigWrite: fileConfigWrite(),
         require: "ONE atomic host-config write sets mesh.transport=file AND mesh.nats.rollbackHoldUntil=actual flip+48h UTC ISO (24h deadline cap + H=24h); reload ALL runtimes with that hold, confirm old NATS writers stopped before file admission is ready; bridge stays up and resumes file presence mirrors" },
-      { phase: "reconcile", action: "reconcile-command-ids", require: "same commandId/control-seen store; at most one same-key retry; never re-run an unresolved claim; native same-root completion journal retained unchanged; no completion carrier replay" },
+      { phase: "reconcile", action: "reconcile-command-ids", require: "empty command inventory and empty results only; no retry; same control-seen store and native same-root completion journal retained unchanged; no completion carrier replay" },
       { phase: "retain", action: "retain-audit", require: "keep streams, consumers, FABRIC_ADV, control-seen and ALL native custody/consumption journals" },
     ],
     withdrawHold: { deadlineCapMs: ROLLBACK_DEADLINE_CAP_MS, retryHorizonMs: ROLLBACK_RETRY_HORIZON_MS, durationMs: ROLLBACK_HOLD_MS },
     forbidden: ["delete", "purge", "ack remaining messages as cleanup", "new-id retry", "automatic TTL takeover", "stop event bridge",
       "split transport/hold config writes", "reuse an existing rollback hold without refreshing to flip+48h",
-      "completion carrier replay", "completion control-seen claim"],
+      "completion carrier replay", "completion control-seen claim", "inbox MSG.GET/DIRECT.GET", "classify-retained",
+      "relay publish", "consumer create/delete", "automatic retry/unpause"],
     note: "This is a per-host control/presence rollback, not fleet cutover or file-surface retirement. E4 completions have no transport rollback; native envelopes, attempts, receipts, archives and claims stay unchanged.",
   };
 }
@@ -157,14 +132,14 @@ export async function runRollback(request, commandAdapter, { dryRun = true, evid
   const plan = rollbackPlan(request);
   if (dryRun) return plan; // Does not even inspect or call the adapter.
   requireThat(typeof commandAdapter === "function", "explicit execution needs an injected command adapter");
-  const audit = [], dispositions = [], retainedAcks = [], drainReceiptWrites = [];
-  let phase = "drain-receipt", writeNatsDrainReceipt;
+  const audit = [], drainReceiptWrites = [];
+  let phase = "drain-receipt", writeNatsDrainReceipt, drainStates;
   let operationStopped = false;
   const live = drainReceiptMode === "live";
   const call = async (kind, payload = {}, timeoutMs = 30000, hooks = {}) => {
     const action = structuredClone({ kind, host: request.host, runtimeIds: [...request.runtimeIds], ...payload });
     // Only these semantic actions exist. There is no arbitrary command, deletion, purge or ack hook.
-    requireThat(["pause-admission", "drain", "classify-retained", "relay-outcome-unknown", "write-nats-drain-receipt", "flip-to-file",
+    requireThat(["pause-admission", "drain", "write-nats-drain-receipt", "flip-to-file",
       "reconcile-command-ids", "retain-audit"].includes(kind), "forbidden adapter action");
     const controller = new AbortController();
     let timer;
@@ -207,55 +182,13 @@ export async function runRollback(request, commandAdapter, { dryRun = true, evid
       sameSet(drain.states.map((s) => s.runtimeId), request.runtimeIds), "invalid bounded host drain receipt");
     for (const state of drain.states) requireThat(state.stream === `FABRIC_IN_${request.host}` && count(state.pending) && count(state.ackPending),
       "invalid same-host stream/pending/ackPending");
-    const fullyDrained = drain.states.every((s) => s.pending === 0 && s.ackPending === 0);
-    requireThat(fullyDrained || drain.elapsedMs === 120000, "must allow the full two-minute drain before classifying nonzero queues");
-    phase = "classify";
-    const inventory = await call("classify-retained", { states: drain.states });
-    requireThat(inventory?.complete === true && inventory.pausedInventoryStable === true &&
-      inventory.controlSeenStoreUnchanged === true && Array.isArray(inventory.messages), "classification needs a complete stable MSG.GET/control-seen inventory");
-    const sequences = new Set(), commands = new Map(), events = new Map(), relays = new Set();
-    for (const message of inventory.messages) {
-      requireThat(message && request.runtimeIds.includes(message.runtimeId) && Number.isSafeInteger(message.sequence) && message.sequence > 0 &&
-        ["command", "ack"].includes(message.kind), "invalid retained envelope");
-      requireThat(message.operation !== "completion" && !(text(message.commandId) && message.commandId.startsWith("completion:")),
-        "E4 completion has no carrier envelope or control-seen claim; completion:<runId> is reserved, not reconciled");
-      const sequenceKey = `${message.runtimeId}:${message.sequence}`;
-      requireThat(!sequences.has(sequenceKey), "duplicate retained sequence"); sequences.add(sequenceKey);
-      if (message.kind === "ack") {
-        retainedAcks.push({ runtimeId: message.runtimeId, sequence: message.sequence, disposition: "retained-for-audit" });
-        continue;
-      }
-      requireThat(text(message.commandId) && text(message.commandEventId) && text(message.replyTo) && ["absent", "outcome", "pending"].includes(message.claim),
-        "command must have its stored envelope commandEventId, an explicit claim state and replyTo");
-      if (message.claim === "outcome") requireThat(message.outcome !== undefined && message.outcome !== null,
-        "admitted command requires its durable stored outcome");
-      else requireThat(message.outcome === undefined && message.terminal !== true, "queued/unknown command cannot claim a known outcome");
-      const classification = message.claim === "absent" ? "queued" : message.claim === "pending" ? "unknown" : message.terminal === true ? "terminal" : "admitted";
-      const value = { commandId: message.commandId, replyTo: message.replyTo, classification,
-        ...(message.claim === "outcome" ? { storedOutcome: message.outcome } : {}) };
-      if (commands.has(message.commandId)) requireThat(isDeepStrictEqual(commands.get(message.commandId), value), "conflicting duplicate command classification");
-      commands.set(message.commandId, value);
-      const eventKey = `${message.runtimeId}\0${message.commandEventId}`;
-      const event = { ...value, commandEventId: message.commandEventId, runtimeId: message.runtimeId };
-      if (events.has(eventKey)) requireThat(isDeepStrictEqual(events.get(eventKey), event), "conflicting duplicate commandEventId");
-      events.set(eventKey, event);
-    }
-    for (const state of drain.states) requireThat(inventory.messages.filter((m) => m.runtimeId === state.runtimeId).length === state.pending + state.ackPending,
-      `incomplete retained envelope inventory for ${state.runtimeId}`);
-    phase = "disposition";
-    for (const command of events.values()) {
-      /** @type {CommandDisposition} */
-      const disposition = { commandId: command.commandId, commandEventId: command.commandEventId, runtimeId: command.runtimeId,
-        classification: command.classification, relayId: `relay:${command.commandEventId}`,
-        code: "FABRIC_RELAY_DESTINATION_UNAVAILABLE", outcome: "outcome-unknown", retry: "same-key-once-after-flip" };
-      const receipt = await call("relay-outcome-unknown", { disposition, replyTo: command.replyTo });
-      requireThat(receipt?.id === disposition.relayId && receipt.persisted === true &&
-        Number.isSafeInteger(receipt.sequence) && receipt.sequence > 0, "relay needs a durable correlated PubAck before flip");
-      dispositions.push({ ...disposition, receipt });
-      relays.add(`${command.runtimeId}\0${command.commandEventId}`);
+    drainStates = drain.states.map(({ runtimeId, stream, pending, ackPending }) => ({ runtimeId, stream, pending, ackPending }));
+    if (!drainStates.every((s) => s.pending === 0 && s.ackPending === 0)) {
+      throw blocked("FABRIC_CANARY_ROLLBACK_DRAIN_NOT_EMPTY",
+        "BLOCKED: nonzero INFO counters; preserve admission pause and audit. Wait for the owner to drain (or restart it), then retry only by new explicit operator action. If the owner cannot run, a person decides.");
     }
     phase = "drain-receipt";
-    const writes = receiptWritePlan(stores, drain.states, inventory.messages, relays);
+    const writes = receiptWritePlan(stores, drainStates);
     if (live) {
       try {
         const module = await import(new URL(`../../${DRAIN_WRITER_MODULE}`, import.meta.url).href);
@@ -291,7 +224,6 @@ export async function runRollback(request, commandAdapter, { dryRun = true, evid
         drainReceiptWrites.push({ storeDir: write.storeDir, receipt, persistence: result.persistence });
       }
       if (operationStopped || hookViolated) throw drainBlocked("receipt boundary stopped or invoked more than once; flip is vetoed");
-      if (!writes.every((w) => w.receipt.complete)) throw drainBlocked("incomplete per-commandEventId dispositions; release is unproven and flip is vetoed");
       hookFinished = true;
       phase = "flip";
     };
@@ -308,40 +240,20 @@ export async function runRollback(request, commandAdapter, { dryRun = true, evid
       flip.notDelivered !== true && flip.notRun !== true && flip.code !== "CONTROL_NOT_DELIVERED",
       "flip must prove a host-wide reload with the hold, old-writer stop and retained event bridge before reconciliation; no not-delivered/not-run assertion");
     phase = "reconcile";
-    const reconciliation = await call("reconcile-command-ids", { commands: [...commands.values()],
-      preserveControlSeen: true, maxSameKeyRetries: 1, retainCompletions: true }, 120000);
+    const reconciliation = await call("reconcile-command-ids", { commands: [],
+      preserveControlSeen: true, maxSameKeyRetries: 0, retainCompletions: true }, 120000);
     requireThat(reconciliation?.controlSeenStoreUnchanged === true && reconciliation.completionJournalRetained === true &&
       reconciliation.completionJournalUnchanged === true && !Object.hasOwn(reconciliation, "completionResendCarrier") &&
-      Array.isArray(reconciliation.results) && sameSet(reconciliation.results.map((r) => r.commandId), [...commands.keys()]),
-      "every retained control command needs a reconciliation disposition; native completion journal stays unchanged, with no resend carrier");
-    let unresolved = 0;
-    for (const result of reconciliation.results) {
-      const command = commands.get(result.commandId);
-      requireThat(count(result.sameKeyRetries) && result.sameKeyRetries <= 1 && result.commandIdUnchanged === true &&
-        result.claimPreserved === true && (result.effectCount === null || (count(result.effectCount) && result.effectCount <= 1)),
-        "same-id retry, preserved claim and zero double effects required");
-      if (["admitted", "terminal"].includes(command.classification)) {
-        requireThat(result.disposition === "stored-outcome" && isDeepStrictEqual(result.outcome, command.storedOutcome) &&
-          result.handlerReexecuted === false, "admitted/terminal retry must return the stored outcome, not execute again");
-      } else if (command.classification === "unknown") {
-        requireThat(result.disposition === "held-unknown" && result.handlerReexecuted === false && result.sameKeyRetries === 0,
-          "claim without outcome is held for operator resolution, never re-executed");
-      } else requireThat(["admitted-once", "held-queued"].includes(result.disposition), "queued command must be admitted once or explicitly held");
-      if (result.disposition.startsWith("held-")) unresolved++;
-      else requireThat(result.effectCount !== null && text(result.receiptId), "settled reconciliation needs effect evidence and a receipt");
-      if (result.disposition === "admitted-once") requireThat(result.sameKeyRetries === 1 && result.effectCount === 1 && result.handlerReexecuted === false,
-        "a queued command may execute once only through its same-key retry");
-      if (result.disposition === "held-queued") requireThat(result.sameKeyRetries === 0 && result.handlerReexecuted === false && result.effectCount === 0,
-        "a queued hold must prove nonexecution and must not disguise a retry");
-    }
+      Array.isArray(reconciliation.results) && reconciliation.results.length === 0,
+      "E20 reconciliation requires empty inventory/results; native completion journal stays unchanged, with no resend carrier");
     phase = "retain";
     const retained = await call("retain-audit");
     requireThat(retained?.streamsKept === true && retained.consumersKept === true && retained.fabricAdvKept === true &&
       retained.controlSeenKept === true && retained.nativeCustodyKept === true && retained.deletedOrPurged === false,
       "all audit and native custody surfaces must be kept");
-    return { schema: "fabric-canary-rollback-report/v1", verdict: unresolved ? "needs-operator" : "reconciled",
+    return { schema: "fabric-canary-rollback-report/v1", verdict: "reconciled",
       evidenceKind, e2eProven: false, releaseProven: false, drainReceiptMode, drainReceiptWrites,
-      request, fullyDrained, dispositions, retainedAcks, reconciliation, audit,
+      request, fullyDrained: true, drainStates, dispositions: [], reconciliation, audit,
       admission: "file admission ready only after old NATS writers stopped; re-enable NATS is a separate operator-controlled rollout" };
   } catch (error) {
     operationStopped = true;
@@ -349,7 +261,7 @@ export async function runRollback(request, commandAdapter, { dryRun = true, evid
       releaseProven: false, drainReceiptMode, drainReceiptWrites,
       code: error.rollbackCode ?? (phase === "flip" ? "FABRIC_CANARY_ROLLBACK_FLIP_UNVERIFIED" :
         phase === "drain-receipt" ? "FABRIC_CANARY_ROLLBACK_DRAIN_RECEIPT_UNVERIFIED" : "FABRIC_CANARY_ROLLBACK_BLOCKED"),
-      outcome: "outcome-unknown", phase, request, dispositions, retainedAcks, audit, error: error.message,
+      outcome: "outcome-unknown", phase, request, drainStates, dispositions: [], audit, error: error.message,
       recovery: "Stop here. Preserve receipts and ids; independently inspect uncertain actions before any continuation. No auto-resume, retry, unpause or cleanup." };
   }
 }

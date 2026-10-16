@@ -220,7 +220,9 @@ describe.skipIf(process.platform === "win32")("Path B CLI-issued credentials on 
     return;
   }
   beforeAll(async () => {
-    harness = await createPathBHarness({ binary, identityFactory: cliIdentity });
+    harness = await createPathBHarness({ binary, identityFactory: cliIdentity, tls: { dnsNames: ["localhost"], ipAddresses: [] } });
+    // The fixture listens on loopback; every connection verifies its DNS-only certificate.
+    Object.defineProperty(harness, "serverUrl", { value: `tls://localhost:${new URL(harness.serverUrl).port}` });
     runtime = await harness.connect(harness.users.machineA);
     otherRuntime = await harness.connect(harness.users.machineB);
     operator = await harness.connect(harness.users.maintainer);
@@ -243,6 +245,8 @@ describe.skipIf(process.platform === "win32")("Path B CLI-issued credentials on 
 
   it("loads CLI runtime/operator files and connects principal/normal-maintainer users without inventory", () => {
     expect(harness?.configText.includes("sync_interval: always")).toBe(true);
+    expect(harness?.serverUrl).toMatch(/^tls:\/\/localhost:/);
+    expect(harness?.tls?.caFile).toBeTruthy();
     expect(harness?.serverVersion).toMatch(/^\d+\.\d+\.\d+/);
     expect(harness?.users.machineA.machine).toBe("machine-a");
     expect(harness?.users.machineB.machine).toBe("machine-b");

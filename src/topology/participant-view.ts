@@ -443,6 +443,23 @@ export class KvParticipantDirectory implements ParticipantView {
         }
         this.#assertWritable(); // Reads may outlive the monotonic lease window.
         revision = await this.#update(key, copy, current.revision); // One CAS; never retry/adopt a lost revision.
+        try {
+          // KV has no cross-bucket transaction. Validate the exact lease revision
+          // again after the CAS, before remembering or admitting this publication.
+          const confirmed = await this.#leases.get<unknown>(leaseKey, this.#signal());
+          const confirmedLease = confirmed && leaseValue(confirmed);
+          if (!confirmed || confirmed.key !== currentLease.key || confirmed.revision !== currentLease.revision ||
+            confirmed.owner !== currentLease.owner || !confirmedLease || canonicalJson(confirmedLease) !== canonicalJson(lease)) {
+            throw new TransportUnavailableError("Owner lease changed during root succession");
+          }
+          this.#assertWritable();
+        } catch (error) {
+          // Restore only our successful CAS revision, even if local authority is
+          // now aborted. A newer presence writer wins; never retry or delete it.
+          try { await this.#presence.put(key, current.owner, predecessor, revision, this.#signal(true)); }
+          catch (undoError) { this.#report(undoError); }
+          throw new TransportUnavailableError("Owner lease no longer authorizes root succession", { cause: error });
+        }
       }
       return this.#admitted(key, copy, revision);
     });

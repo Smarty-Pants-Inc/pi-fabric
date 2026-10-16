@@ -18,7 +18,7 @@ import { NatsKvStore } from "../src/transport/nats/kv.js";
 import { runTransportAdmin } from "../src/transport/nats/admin.js";
 import { KvParticipantDirectory } from "../src/topology/participant-view.js";
 import type { FabricKvHostLease, FabricParticipantRecord } from "../src/topology/types.js";
-import type { FabricTransport, TransportKvEntry } from "../src/transport/types.js";
+import type { FabricTransport, TransportKv, TransportKvEntry } from "../src/transport/types.js";
 import { createPathBHarness, PATH_B_MACHINES, resolveNatsBinary, type PathBHarness } from "./helpers/nats-cluster.js";
 
 const binary = resolveNatsBinary();
@@ -90,6 +90,119 @@ async function routeReady(view: KvParticipantDirectory, id: string) {
   while (!view.ready) await view.whenChanged(id, signal);
   while (!view.resolve(id)?.live) await view.whenChanged(id, signal);
   return view.resolve(id)!;
+}
+
+type ParticipantRoute = NonNullable<ReturnType<KvParticipantDirectory["resolve"]>>;
+type KvGetCall = { key: string; entry: TransportKvEntry<unknown> | undefined; store: NatsKvStore };
+type KvPutCall = { key: string; owner: string; value: unknown; ifRevision: number; store: NatsKvStore };
+type KvPutHook = (call: KvPutCall) => Promise<void> | void;
+let successionFixtureNumber = 0;
+
+async function directoryReady(view: KvParticipantDirectory, id: string, timeoutMs = 5_000): Promise<void> {
+  const signal = AbortSignal.timeout(timeoutMs);
+  while (!view.ready) await view.whenChanged(id, signal);
+}
+
+async function routeEventually(view: KvParticipantDirectory, id: string,
+  predicate: (route: ParticipantRoute) => boolean, timeoutMs = 5_000): Promise<ParticipantRoute> {
+  const signal = AbortSignal.timeout(timeoutMs);
+  for (;;) {
+    if (!view.ready) { await view.whenChanged(id, signal); continue; }
+    const route = view.resolve(id);
+    if (route && predicate(route)) return route;
+    await view.whenChanged(id, signal);
+  }
+}
+
+/** A real KV watch barrier for broker expiry; no timer stands in for the 15s TTL. */
+function armLeaseGone(kv: TransportKv, leaseKey: string) {
+  const stop = new AbortController();
+  let readyResolve!: () => void;
+  let readyReject!: (error: unknown) => void;
+  const ready = new Promise<void>((resolve, reject) => { readyResolve = resolve; readyReject = reject; });
+  const gone = (async () => {
+    let seen = false;
+    try {
+      const signal = AbortSignal.any([stop.signal, AbortSignal.timeout(30_000)]);
+      for await (const event of kv.watch(">", signal)) {
+        if (event.type === "ready") readyResolve();
+        if (event.type === "gone" && event.key === leaseKey) {
+          expect(event.reason).toBe("expired");
+          seen = true;
+          readyResolve();
+          return;
+        }
+      }
+      if (!seen) throw new Error(`lease expiry watch ended before ${leaseKey}`);
+    } catch (error) {
+      readyReject(error);
+      throw error;
+    } finally { stop.abort(); }
+  })();
+  return { ready, gone };
+}
+
+function installKvHooks(onPut: KvPutHook) {
+  const gets: KvGetCall[] = [], puts: KvPutCall[] = [];
+  const rawGet = NatsKvStore.prototype.get;
+  const rawPut = NatsKvStore.prototype.put;
+  vi.spyOn(NatsKvStore.prototype, "get").mockImplementation(async function <V>(this: NatsKvStore, entryKey: string, signal?: AbortSignal) {
+    const entry = await rawGet.call(this, entryKey, signal);
+    gets.push({ key: entryKey, entry: entry as TransportKvEntry<unknown> | undefined, store: this });
+    return entry as TransportKvEntry<V> | undefined;
+  });
+  vi.spyOn(NatsKvStore.prototype, "put").mockImplementation(async function <V>(this: NatsKvStore,
+    entryKey: string, owner: string, value: V, ifRevision: number, signal?: AbortSignal) {
+    const call: KvPutCall = { key: entryKey, owner, value, ifRevision, store: this };
+    puts.push(call);
+    await onPut(call);
+    return rawPut.call(this, entryKey, owner, value, ifRevision, signal);
+  });
+  return { gets, puts, rawPut };
+}
+
+function participant(id: string, incarnation: string, name: string, now: number): FabricParticipantRecord {
+  return { format: 1, id, rootId: id, kind: "root", ownerHostId: id, ownerIdentityId: id,
+    ownerIncarnation: incarnation, sessionId: id, name, status: "idle", runner: "pi", transport: "host",
+    capabilities: ["followUp"], controlProtocol: "v1", startedAt: now, updatedAt: now + 1 };
+}
+function hostLease(id: string, incarnation: string, now: number): FabricKvHostLease {
+  return { id, identityId: id, rootId: id, incarnation, pid: process.pid, pidStartTime: "12345",
+    bootId: "tls-succession-fixture", updatedAt: now, expiresAt: now + 15_000 };
+}
+
+async function successionFixture(label: string, incarnation = `successor-${label}`) {
+  const serial = ++successionFixtureNumber;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), `presence-boundary-${label}-${serial}-`));
+  const id = `session:presence-boundary-${label}-${serial}`;
+  const transport = await openFabricTransport({ config: configFor(root, "machine-a").mesh, hostId: id,
+    mesh: new MeshStore(path.join(root, "mesh"), 65_536, 1_000) });
+  const presence = transport.kv("presence"), leases = transport.kv("leases");
+  const now = Date.now();
+  const predecessor = participant(id, `predecessor-${label}-${serial}`, "predecessor", now - 2_000);
+  const successor = participant(id, incarnation, "successor", now);
+  const pkey = key("machine-a", "p", id), hkey = key("machine-a", "h", id);
+  const predecessorOwner = `${id}#${predecessor.ownerIncarnation}`;
+  const successorOwner = `${id}#${successor.ownerIncarnation}`;
+  const oldRevision = await presence.put(pkey, predecessorOwner, predecessor, 0);
+  const initialLease = hostLease(id, incarnation, now);
+  const initialLeaseRevision = await leases.put(hkey, successorOwner, initialLease, 0);
+  const leaseAbort = new AbortController();
+  const gate = { live: () => true, signal: leaseAbort.signal };
+  const view = new KvParticipantDirectory({ transport, lease: gate, identityId: id, rootId: id,
+    ownerIncarnation: incarnation, operationTimeoutMs: 30_000 });
+  // Only the observer identity differs: every KV operation still uses this real,
+  // authenticated transport (class methods must retain their original receiver).
+  const observerTransport: FabricTransport = { kind: transport.kind,
+    self: { machine: transport.self.machine, hostId: `${id}-observer` },
+    kv: transport.kv.bind(transport), send: transport.send.bind(transport), inbox: transport.inbox.bind(transport),
+    drainState: transport.drainState.bind(transport), close: transport.close.bind(transport) };
+  const observer = new KvParticipantDirectory({ transport: observerTransport, lease: gate, identityId: "observer",
+    rootId: "observer", ownerIncarnation: `observer-${serial}` });
+  view.start(); observer.start();
+  await Promise.all([directoryReady(view, id), directoryReady(observer, id)]);
+  return { root, id, transport, presence, leases, pkey, hkey, predecessor, successor, initialLease,
+    predecessorOwner, successorOwner, oldRevision, initialLeaseRevision, view, observer, leaseAbort };
 }
 
 // This first test is FULL runtime bootstrap/receiver coverage, not a hand-built receiver:
@@ -211,5 +324,179 @@ describe.skipIf(!binary || process.platform !== "linux")("#14115 real authentica
       expect(stored!.value).toEqual(records[winner]);
       expect(await routeReady(views[winner]!, id)).toMatchObject({ live: true, ownerIncarnation: incarnation });
     } finally { await Promise.all(views.map(view => view.close())); await transport.close(); }
+  }, 15_000);
+
+  it("rechecks a replaced lease after the succession CAS and restores the predecessor without deleting", async () => {
+    const f = await successionFixture("replacement");
+    const replacementIncarnation = "rightful-replacement";
+    const replacementLease = hostLease(f.id, replacementIncarnation, Date.now());
+    const replacementOwner = `${f.id}#${replacementIncarnation}`;
+    let raceSeen = false, initialReadSeen = false, replacementLeaseRevision = 0;
+    const hooks = installKvHooks(async call => {
+      if (call.key !== f.pkey || call.ifRevision <= 0 || raceSeen) return;
+      raceSeen = true;
+      initialReadSeen = hooks.gets.some(read => read.key === f.hkey && read.entry?.revision === f.initialLeaseRevision);
+      replacementLeaseRevision = await hooks.rawPut.call(hooks.gets.find(read => read.key === f.hkey)!.store, f.hkey, replacementOwner, replacementLease, f.initialLeaseRevision);
+    });
+    try {
+      await expect(f.view.publish(f.successor)).rejects.toMatchObject({ code: "FABRIC_TRANSPORT_UNAVAILABLE" });
+      expect(raceSeen).toBe(true);
+      expect(initialReadSeen, "the CAS hook must run after the direct initial lease read").toBe(true);
+      expect(replacementLeaseRevision).toBeGreaterThan(f.initialLeaseRevision);
+      const stored = await f.presence.get<FabricParticipantRecord>(f.pkey);
+      expect(stored).toMatchObject({ key: f.pkey, owner: f.predecessorOwner, value: f.predecessor });
+      expect(stored!.revision).toBeGreaterThan(f.oldRevision);
+      const presencePuts = hooks.puts.filter(call => call.key === f.pkey && call.ifRevision > 0);
+      expect(presencePuts).toHaveLength(2);
+      expect(presencePuts[0]).toMatchObject({ owner: f.successorOwner, ifRevision: f.oldRevision, value: f.successor });
+      expect(presencePuts[1]).toMatchObject({ owner: f.predecessorOwner, value: f.predecessor });
+      expect(presencePuts[1]!.ifRevision).toBeGreaterThan(f.oldRevision);
+      expect(deletes.filter(item => item.key === f.pkey)).toEqual([]);
+      expect(await routeEventually(f.observer, f.id, route => !route.live && route.ownerIncarnation === f.predecessor.ownerIncarnation))
+        .toMatchObject({ live: false, ownerIncarnation: f.predecessor.ownerIncarnation });
+    } finally {
+      f.leaseAbort.abort();
+      await Promise.allSettled([f.view.close(), f.observer.close()]);
+      await f.transport.close();
+    }
+  }, 25_000);
+
+  it("waits for the real 15-second lease expiry, then undoes the fenced succession CAS", async () => {
+    const f = await successionFixture("expiry");
+    const expiry = armLeaseGone(f.leases, f.hkey);
+    await expiry.ready;
+    let raceSeen = false, initialReadSeen = false;
+    const hooks = installKvHooks(async call => {
+      if (call.key !== f.pkey || call.ifRevision <= 0 || raceSeen) return;
+      raceSeen = true;
+      initialReadSeen = hooks.gets.some(read => read.key === f.hkey && read.entry?.revision === f.initialLeaseRevision);
+      await expiry.gone;
+    });
+    try {
+      await expect(f.view.publish(f.successor)).rejects.toMatchObject({ code: "FABRIC_TRANSPORT_UNAVAILABLE" });
+      expect(raceSeen).toBe(true);
+      expect(initialReadSeen).toBe(true);
+      expect(await f.leases.get(f.hkey)).toBeUndefined();
+      expect(hooks.gets.some(read => read.key === f.hkey && read.entry === undefined),
+        "the post-CAS lease read must observe broker expiry").toBe(true);
+      const stored = await f.presence.get<FabricParticipantRecord>(f.pkey);
+      expect(stored).toMatchObject({ key: f.pkey, owner: f.predecessorOwner, value: f.predecessor });
+      const presencePuts = hooks.puts.filter(call => call.key === f.pkey && call.ifRevision > 0);
+      expect(presencePuts).toHaveLength(2);
+      expect(presencePuts[0]).toMatchObject({ owner: f.successorOwner, ifRevision: f.oldRevision, value: f.successor });
+      expect(presencePuts[1]).toMatchObject({ owner: f.predecessorOwner, value: f.predecessor });
+      expect(deletes.filter(item => item.key === f.pkey)).toEqual([]);
+      expect(await routeEventually(f.observer, f.id, route => !route.live && route.ownerIncarnation === f.predecessor.ownerIncarnation))
+        .toMatchObject({ live: false, ownerIncarnation: f.predecessor.ownerIncarnation });
+    } finally {
+      f.leaseAbort.abort();
+      await Promise.allSettled([f.view.close(), f.observer.close()]);
+      await f.transport.close();
+    }
+  }, 40_000);
+
+  it("leaves a rightful new lease holder untouched when the predecessor undo loses its presence CAS", async () => {
+    const f = await successionFixture("undo-loss");
+    const rightfulIncarnation = "rightful-cas-winner";
+    const rightfulOwner = `${f.id}#${rightfulIncarnation}`;
+    const rightfulLease = hostLease(f.id, rightfulIncarnation, Date.now());
+    const rightfulRecord = participant(f.id, rightfulIncarnation, "rightful-winner", Date.now());
+    let positiveSeen = false, undoRaceSeen = false, initialReadSeen = false;
+    let rightfulPresenceRevision = 0, replacementLeaseRevision = 0;
+    const hooks = installKvHooks(async call => {
+      if (call.key !== f.pkey || call.ifRevision <= 0) return;
+      if (!positiveSeen) {
+        positiveSeen = true;
+        initialReadSeen = hooks.gets.some(read => read.key === f.hkey && read.entry?.revision === f.initialLeaseRevision);
+        replacementLeaseRevision = await hooks.rawPut.call(hooks.gets.find(read => read.key === f.hkey)!.store, f.hkey, rightfulOwner, rightfulLease, f.initialLeaseRevision);
+        return;
+      }
+      if (!undoRaceSeen && call.owner === f.predecessorOwner) {
+        undoRaceSeen = true;
+        rightfulPresenceRevision = await hooks.rawPut.call(call.store, f.pkey, rightfulOwner, rightfulRecord, call.ifRevision);
+      }
+    });
+    try {
+      await expect(f.view.publish(f.successor)).rejects.toMatchObject({ code: "FABRIC_TRANSPORT_UNAVAILABLE" });
+      expect(positiveSeen).toBe(true);
+      expect(undoRaceSeen).toBe(true);
+      expect(initialReadSeen).toBe(true);
+      expect(replacementLeaseRevision).toBeGreaterThan(f.initialLeaseRevision);
+      expect(rightfulPresenceRevision).toBeGreaterThan(f.oldRevision);
+      const stored = await f.presence.get<FabricParticipantRecord>(f.pkey);
+      expect(stored).toMatchObject({ key: f.pkey, owner: rightfulOwner, value: rightfulRecord });
+      expect(stored!.revision).toBe(rightfulPresenceRevision);
+      const presencePuts = hooks.puts.filter(call => call.key === f.pkey && call.ifRevision > 0);
+      expect(presencePuts).toHaveLength(2);
+      expect(presencePuts[0]).toMatchObject({ owner: f.successorOwner, ifRevision: f.oldRevision, value: f.successor });
+      expect(presencePuts[1]).toMatchObject({ owner: f.predecessorOwner, value: f.predecessor });
+      expect(deletes.filter(item => item.key === f.pkey)).toEqual([]);
+      expect(await routeEventually(f.observer, f.id, route => route.live && route.ownerIncarnation === rightfulIncarnation))
+        .toMatchObject({ live: true, ownerIncarnation: rightfulIncarnation });
+    } finally {
+      f.leaseAbort.abort();
+      await Promise.allSettled([f.view.close(), f.observer.close()]);
+      await f.transport.close();
+    }
+  }, 25_000);
+
+  it("refuses a same-owner lease renewal because the direct lease revision changed", async () => {
+    const f = await successionFixture("renewal");
+    // Identical JSON and owner isolate the revision fence from all field checks:
+    // a real broker rewrite still renews its TTL and must invalidate this attempt.
+    const renewedLease = { ...f.initialLease };
+    let raceSeen = false, initialReadSeen = false, renewedLeaseRevision = 0;
+    const hooks = installKvHooks(async call => {
+      if (call.key !== f.pkey || call.ifRevision <= 0 || raceSeen) return;
+      raceSeen = true;
+      initialReadSeen = hooks.gets.some(read => read.key === f.hkey && read.entry?.revision === f.initialLeaseRevision);
+      renewedLeaseRevision = await hooks.rawPut.call(hooks.gets.find(read => read.key === f.hkey)!.store, f.hkey, f.successorOwner, renewedLease, f.initialLeaseRevision);
+    });
+    try {
+      await expect(f.view.publish(f.successor)).rejects.toMatchObject({ code: "FABRIC_TRANSPORT_UNAVAILABLE" });
+      expect(raceSeen).toBe(true);
+      expect(initialReadSeen).toBe(true);
+      expect(renewedLeaseRevision).toBeGreaterThan(f.initialLeaseRevision);
+      const stored = await f.presence.get<FabricParticipantRecord>(f.pkey);
+      expect(stored).toMatchObject({ key: f.pkey, owner: f.predecessorOwner, value: f.predecessor });
+      const presencePuts = hooks.puts.filter(call => call.key === f.pkey && call.ifRevision > 0);
+      expect(presencePuts).toHaveLength(2);
+      expect(presencePuts[0]).toMatchObject({ owner: f.successorOwner, ifRevision: f.oldRevision, value: f.successor });
+      expect(presencePuts[1]).toMatchObject({ owner: f.predecessorOwner, value: f.predecessor });
+      expect(deletes.filter(item => item.key === f.pkey)).toEqual([]);
+      expect(await routeEventually(f.observer, f.id, route => !route.live && route.ownerIncarnation === f.predecessor.ownerIncarnation))
+        .toMatchObject({ live: false, ownerIncarnation: f.predecessor.ownerIncarnation });
+    } finally {
+      f.leaseAbort.abort();
+      await Promise.allSettled([f.view.close(), f.observer.close()]);
+      await f.transport.close();
+    }
+  }, 25_000);
+
+  it("routes only a matching presence and lease pair after watches catch up", async () => {
+    const f = await successionFixture("reader");
+    try {
+      const stale = await routeEventually(f.observer, f.id, route => !route.live && route.ownerIncarnation === f.predecessor.ownerIncarnation);
+      expect(stale).toMatchObject({ live: false, ownerIncarnation: f.predecessor.ownerIncarnation });
+      const revision = await f.presence.put(f.pkey, f.successorOwner, f.successor, f.oldRevision);
+      expect(revision).toBeGreaterThan(f.oldRevision);
+      const live = await routeEventually(f.observer, f.id, route => route.live && route.ownerIncarnation === f.successor.ownerIncarnation);
+      expect(live).toMatchObject({ live: true, ownerHostId: f.id, ownerIdentityId: f.id, ownerIncarnation: f.successor.ownerIncarnation });
+      const rightfulIncarnation = "reader-rightful-holder", rightfulOwner = `${f.id}#${rightfulIncarnation}`;
+      await f.leases.put(f.hkey, rightfulOwner, hostLease(f.id, rightfulIncarnation, Date.now()), f.initialLeaseRevision);
+      // This transition is driven by the lease watch, not a delay or presence write:
+      // the previously live takeover row becomes non-live once that watch catches up.
+      expect(await routeEventually(f.observer, f.id, route => !route.live && route.ownerIncarnation === f.successor.ownerIncarnation))
+        .toMatchObject({ live: false, ownerIncarnation: f.successor.ownerIncarnation });
+      const rightfulRecord = participant(f.id, rightfulIncarnation, "reader-rightful", Date.now());
+      await f.presence.put(f.pkey, rightfulOwner, rightfulRecord, revision);
+      expect(await routeEventually(f.observer, f.id, route => route.live && route.ownerIncarnation === rightfulIncarnation))
+        .toMatchObject({ live: true, ownerIncarnation: rightfulIncarnation });
+      expect(deletes.filter(item => item.key === f.pkey)).toEqual([]);
+    } finally {
+      f.leaseAbort.abort();
+      await Promise.allSettled([f.view.close(), f.observer.close()]);
+      await f.transport.close();
+    }
   }, 15_000);
 });

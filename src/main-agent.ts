@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { diagnostics, notifyDiagnostic, notifyPrincipalDiagnosticOnce, resetPrincipalDiagnosticTurn } from "./core/diagnostics.js";
 import { appendDeliveryOutcome, type DeliverySend, type DeliveryOutcome } from "./mesh/delivery-outcomes.js";
 import type { AgentFollowUpRunningWarning } from "./agents/types.js";
 import fs from "node:fs";
@@ -70,6 +71,11 @@ export interface FabricMainAgentDeliveryRequest {
   wakeCause?: FabricWakeCause | undefined;
   /** Receiving route metadata, never hydrated from command/message data. */
   admissionTopic?: string | undefined;
+  /** Host-hydrated origin metadata for a root-inbox event shadow. */
+  inboxEventId?: string | undefined;
+  inboxTopic?: string | undefined;
+  inboxKey?: string | undefined;
+  inboxReceipts?: string[] | undefined;
   data?: unknown;
   /**
    * A stable id of the sender's durable record (a resident actor's delivery record). Main journals
@@ -299,6 +305,11 @@ export interface HeldAgentMessage {
   /** Receiving-envelope route snapshots, never rehydrated from serialized wake causes. */
   admissionTopic?: string;
   admissionKey?: string;
+  /** Host-hydrated origin event identity and receipts; journaled with the native carrier for replay. */
+  inboxEventId?: string;
+  inboxTopic?: string;
+  inboxKey?: string;
+  inboxReceipts?: string[];
   /** A multi-source or differently classified producer has no reconstructable single envelope. */
   unattributedOnReplay?: true;
   message: string;
@@ -354,10 +365,20 @@ const agentMessageBlock = (item: HeldAgentMessage, delivery: FabricMainAgentDeli
   "</fabric-agent-message>",
 ].filter((line): line is string => Boolean(line)).join("\n");
 
-const itemBytes = (item: HeldAgentMessage): number =>
-  Buffer.byteLength(item.message) + (item.data === undefined ? 0 : Buffer.byteLength(JSON.stringify(item.data))) +
-  (item.deliveryId === undefined ? 0 : Buffer.byteLength(JSON.stringify(item.deliveryId))) +
-  (item.supersedes === undefined ? 0 : Buffer.byteLength(JSON.stringify(item.supersedes)));
+/** Preserve explicit data; otherwise carry the admitted event's work claim at native handoff. */
+const nativeItemData = (item: HeldAgentMessage): unknown =>
+  item.data === undefined && item.inboxKey !== undefined
+    ? { key: item.inboxKey, topic: item.inboxTopic } : item.data;
+
+const itemBytes = (item: HeldAgentMessage): number => {
+  const data = nativeItemData(item);
+  return Buffer.byteLength(item.message) + (data === undefined ? 0 : Buffer.byteLength(JSON.stringify(data))) +
+    // The retained key and native data are separate serialized representations: charge both.
+    (item.inboxKey === undefined ? 0 : Buffer.byteLength(JSON.stringify(item.inboxKey))) +
+    (item.deliveryId === undefined ? 0 : Buffer.byteLength(JSON.stringify(item.deliveryId))) +
+    (item.supersedes === undefined ? 0 : Buffer.byteLength(JSON.stringify(item.supersedes))) +
+    (item.inboxReceipts === undefined ? 0 : Buffer.byteLength(JSON.stringify(item.inboxReceipts)));
+};
 
 type SessionEntryLike = { id?: unknown; parentId?: unknown; type?: string; customType?: string; details?: { id?: unknown; items?: unknown } };
 
@@ -729,6 +750,11 @@ export class MainAgentController implements FabricMainAgentTarget {
       ...(unattributedOnReplay ? { unattributedOnReplay: true } : {}),
       ...(admissionTopic ? { admissionTopic } : {}),
       ...(admissionKey ? { admissionKey } : {}),
+      ...(typeof request.inboxEventId === "string" ? { inboxEventId: request.inboxEventId } : {}),
+      ...(typeof request.inboxTopic === "string" ? { inboxTopic: request.inboxTopic } : {}),
+      ...(typeof request.inboxKey === "string" ? { inboxKey: request.inboxKey } : {}),
+      ...(Array.isArray(request.inboxReceipts) && request.inboxReceipts.every((id) => typeof id === "string")
+        ? { inboxReceipts: [...request.inboxReceipts] } : {}),
       ...((request.verification === "mesh" || request.verification === "bridge") &&
         mainSenderClaimAllowed(sender, deliveryId, request.source) ? {
         provenance: fabricTurnProvenance(sender, request.delivery === "nextTurn" ? "actor" : request.delivery, request.verification, request.principal),
@@ -825,6 +851,11 @@ export class MainAgentController implements FabricMainAgentTarget {
         // The replacement journals every superseded delivery id until the carrier is consumed.
         item.supersedes = [...(replaced.supersedes ?? []), ...(replaced.deliveryId === undefined ? [] : [replaced.deliveryId])];
         item.supersededSends = [...(replaced.supersededSends ?? []), ...(replaced.outcomeSend ? [replaced.outcomeSend] : [])];
+        // Preserve every superseded source receipt. Admission charges the merged metadata
+        // before replacing or consuming the held item; refuse over-budget merges, never truncate.
+        if (replaced.inboxReceipts?.length) {
+          item.inboxReceipts = [...new Set([...replaced.inboxReceipts, ...(item.inboxReceipts ?? [])])];
+        }
       }
       // Charge the proposed ancestry before mutating or acknowledging either carrier.
       this.#admit(item, replaced);
@@ -1045,8 +1076,8 @@ export class MainAgentController implements FabricMainAgentTarget {
       if (pending && !pending.warned) {
         pending.warned = true;
         const message = `Cannot persist Main halt index ${this.#consumedPath()}; keeping Main halted across reload and retrying at the next opportunity`;
-        console.warn(`[pi-fabric] ${message}`, error);
-        try { if (this.#context?.hasUI) this.#context.ui.notify(message, "warning"); } catch { /* diagnostics must not lift the stop */ }
+        diagnostics.warn("src/main-agent.ts", `[pi-fabric] ${message}`, error);
+        try { if (this.#context?.hasUI) notifyDiagnostic(this.#context, "src/main-agent.ts", message, "warning"); } catch { /* diagnostics must not lift the stop */ }
       }
     }
   }
@@ -1181,7 +1212,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     const root = this.meshRoot ?? (this.#journal ? path.dirname(path.dirname(this.#journal)) : undefined);
     if (!send || !root) return true;
     try { appendDeliveryOutcome(root, send, outcome, reason); return true; }
-    catch (error) { console.warn("[pi-fabric] cannot append Main delivery outcome; retaining journal", error); return false; }
+    catch (error) { diagnostics.warn("src/main-agent.ts", "[pi-fabric] cannot append Main delivery outcome; retaining journal", error); return false; }
   }
 
   #recordSuperseded(item: HeldAgentMessage): boolean {
@@ -1247,7 +1278,7 @@ export class MainAgentController implements FabricMainAgentTarget {
       if ((error as { code?: unknown } | null)?.code !== "ENOENT") {
         this.#halted = true;
         this.#haltIndexUnknown = true;
-        console.warn(`[pi-fabric] cannot read halt index ${this.#consumedPath()}; keeping Main halted until user input`, error);
+        diagnostics.warn("src/main-agent.ts", `[pi-fabric] cannot read halt index ${this.#consumedPath()}; keeping Main halted until user input`, error);
       }
     }
     let items: HeldAgentMessage[] = [];
@@ -1258,7 +1289,7 @@ export class MainAgentController implements FabricMainAgentTarget {
         for (const item of parsed.items as HeldAgentMessage[]) {
           const sender = senderIdentity(item?.from);
           if (typeof item?.id !== "string" || typeof item.message !== "string" || typeof item.sentAt !== "number" || !sender) {
-            console.warn(`[pi-fabric] dropped a malformed followUp from the journal: ${String((item as { id?: unknown } | null)?.id)}`);
+            diagnostics.warn("src/main-agent.ts", `[pi-fabric] dropped a malformed followUp from the journal: ${String((item as { id?: unknown } | null)?.id)}`);
             continue;
           }
           // A policy this runtime cannot read is dropped: the item is then released as a held
@@ -1361,6 +1392,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     on("input", (event: { source?: string }, ctx) => {
       this.#context = ctx;
       if (event.source === "extension") return;
+      resetPrincipalDiagnosticTurn(this.pi, ctx);
       this.#peerSteerInFlight = false;
       this.#interruptUsedThisTurn = false;
       this.#interruptResume = false;
@@ -1391,7 +1423,7 @@ export class MainAgentController implements FabricMainAgentTarget {
         this.#providerStateDirty = true;
         this.#trySave(true);
         const dead = this.#providerDead;
-        if (failure && !failure.retryable) this.#recordNonRetryable(failure);
+        if (failure && !failure.retryable) this.#recordNonRetryable(failure, ctx);
         // An unclassified incident's one post-compaction attempt failed the same way: hold again, no second alarm.
         else if (this.#runUnclassified && dead?.kind === "unclassified" && dead.phase === "probation") this.#raiseProviderDead("unclassified-repeated");
         else this.#recordProviderFailure(true);
@@ -1502,7 +1534,8 @@ export class MainAgentController implements FabricMainAgentTarget {
       if (event.reason === "manual") this.#wakeWhenIdle();
       else this.#stopOperation();
     });
-    on("agent_start", () => {
+    on("agent_start", (_event, ctx) => {
+      resetPrincipalDiagnosticTurn(this.pi, ctx);
       // The HOLD-induced restart belongs to the interrupted turn, not a fresh abort budget.
       if (!this.#interruptResume) this.#interruptUsedThisTurn = false;
       this.#interruptResume = false;
@@ -1680,7 +1713,8 @@ export class MainAgentController implements FabricMainAgentTarget {
       } catch (error) {
         this.#consume(this.#held.splice(index, 1)[0]!);
         count--;
-        console.warn(
+        diagnostics.warn(
+          "src/main-agent.ts",
           `[pi-fabric] dropped undeliverable followUp ${item.id} from ${String(item.from?.id)}: ` +
             (error instanceof Error ? error.message : String(error)),
         );
@@ -1893,9 +1927,13 @@ export class MainAgentController implements FabricMainAgentTarget {
     return `${label.length > room ? `${label.slice(0, room - 1)}…` : label}${state}`;
   }
 
-  #notify(message: string, level: "info" | "warning"): void {
-    if (level === "warning") console.warn(`[pi-fabric] ${message}`);
-    try { if (this.#context?.hasUI) this.#context.ui.notify(message, level); } catch { /* diagnostics only */ }
+  #notify(message: string, level: "info" | "warning", context = this.#context, onceKey?: string): void {
+    if (level === "warning") diagnostics.warn("src/main-agent.ts", `[pi-fabric] ${message}`);
+    try {
+      if (!context?.hasUI) return;
+      if (this.local && onceKey) notifyPrincipalDiagnosticOnce(this.pi, context, onceKey, message, level);
+      else notifyDiagnostic(context, "src/main-agent.ts", message, level);
+    } catch { /* diagnostics only */ }
   }
 
   /**
@@ -1903,7 +1941,7 @@ export class MainAgentController implements FabricMainAgentTarget {
    * compaction_affinity_missing). Retrying the same context fails the same way, so this never
    * enters backoff: compact once at idle, allow one attempt, then alarm.
    */
-  #recordNonRetryable(failure: ProviderErrorClass): void {
+  #recordNonRetryable(failure: ProviderErrorClass, context = this.#context): void {
     this.#providerAttemptInFlight = false;
     this.#stopProviderWake();
     const dead = this.#providerDead;
@@ -1929,7 +1967,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     this.#providerReleaseUntil = undefined;
     this.#stopWake();
     this.#providerStateDirty = true;
-    this.#notify(`Provider rejected Main's request as non-retryable (${error}); compacting once to recover`, "warning");
+    this.#notify(`Provider rejected Main's request as non-retryable (${error}); compacting once to recover`, "warning", context, "provider-non-retryable");
     this.#armProviderDeadTimer();
   }
 
@@ -2122,7 +2160,7 @@ export class MainAgentController implements FabricMainAgentTarget {
       : "the one retry after compaction failed again";
     // Fixed text and allowlisted tokens only; the provider's own error text stays in the session log.
     const message = `${providerDeadLabel(dead)}: ${why}. The provider's error text is in the session log. Held peer messages stay journalled and ops.owner is alarmed; fix the provider, then send any input to resume.`;
-    this.#notify(message, "warning");
+    this.#notify(message, "warning", this.#context, "provider-dead-terminal");
     try {
       this.onProviderDead?.({
         kind: dead.kind, error: dead.error, ...(dead.status === undefined ? {} : { status: dead.status }),
@@ -2132,7 +2170,7 @@ export class MainAgentController implements FabricMainAgentTarget {
         held: this.#held.map(item => ({ id: item.id, from: item.from.id, sentAt: item.sentAt })),
       });
     } catch (error) {
-      console.warn("[pi-fabric] provider-dead alarm failed", error);
+      diagnostics.warn("src/main-agent.ts", "[pi-fabric] provider-dead alarm failed", error);
     }
   }
 
@@ -2237,17 +2275,24 @@ export class MainAgentController implements FabricMainAgentTarget {
     // Each item keeps its own delivery mark: a flushed batch goes in as a steer, but it holds followUps.
     const delivery: FabricMainAgentDelivery = flushed ? "followUp" : deliverAs;
     const blocks = items.map((item) => agentMessageBlock(item, delivery));
-    const itemDetails = (item: HeldAgentMessage) => ({
-      id: item.id,
-      from: item.from,
-      delivery,
-      sentAt: new Date(item.sentAt).toISOString(),
-      ...(item.replacedAt === undefined ? {} : { replacedAt: new Date(item.replacedAt).toISOString() }),
-      ...(item.chain === undefined ? {} : { chain: item.chain, generation: item.generation, replaces: item.replaces }),
-      ...(item.data === undefined ? {} : { data: item.data }),
-      ...(item.deliveryId === undefined ? {} : { deliveryId: item.deliveryId }),
-      ...(item.supersedes?.length ? { supersedes: item.supersedes } : {}),
-    });
+    const itemDetails = (item: HeldAgentMessage) => {
+      // Use the same native shape admission charged, including synthesized work claims.
+      const data = nativeItemData(item);
+      return {
+        id: item.id,
+        from: item.from,
+        delivery,
+        sentAt: new Date(item.sentAt).toISOString(),
+        ...(item.replacedAt === undefined ? {} : { replacedAt: new Date(item.replacedAt).toISOString() }),
+        ...(item.chain === undefined ? {} : { chain: item.chain, generation: item.generation, replaces: item.replaces }),
+        ...(data === undefined ? {} : { data }),
+        ...(item.deliveryId === undefined ? {} : { deliveryId: item.deliveryId }),
+        ...(item.inboxEventId === undefined ? {} : { inboxEventId: item.inboxEventId }),
+        ...(item.inboxTopic === undefined ? {} : { inboxTopic: item.inboxTopic }),
+        ...(item.inboxKey === undefined ? {} : { inboxKey: item.inboxKey }),
+        ...(item.supersedes?.length ? { supersedes: item.supersedes } : {}),
+      };
+    };
     const first = items[0]!;
     const provenance = this.#provenance(first);
     const options = { deliverAs, triggerTurn };
@@ -2267,6 +2312,8 @@ export class MainAgentController implements FabricMainAgentTarget {
         details: {
           ...itemDetails(first),
           ...(items.length > 1 ? { id: randomUUID(), items: items.map(itemDetails) } : {}),
+          ...(items.some((item) => item.inboxReceipts?.length)
+            ? { receipts: items.flatMap((item) => item.inboxReceipts ?? []) } : {}),
           triggerTurn,
           ...(flushed ? { flushed: true } : {}),
         },

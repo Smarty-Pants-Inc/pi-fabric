@@ -8,9 +8,11 @@ import { expect, it, vi } from "vitest";
 import { readHostLease } from "../src/topology/host-leases.js";
 import { readParticipantFile } from "../src/topology/participant-files.js";
 import { residentRoot } from "../src/residency/protocol.js";
+import { MeshStore } from "../src/mesh/store.js";
+import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 
 // Explicit compiled-artifact receipt: FABRIC_PRESENCE_REAL_CLI=1 bunx vitest run tests/residency-presence-cli.test.ts
-it.runIf(process.env.FABRIC_PRESENCE_REAL_CLI === "1")("renews both durable actor scopes after native Main exit and recovers from real >timeout mesh contention", async () => {
+it.runIf(process.env.FABRIC_PRESENCE_REAL_CLI === "1")("keeps both actor scopes discoverable by host lease after native Main exit and real >timeout mesh contention", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "presence-cli-"));
   const evidence = process.env.FABRIC_PRESENCE_EVIDENCE_DIR;
   const cli = path.resolve("node_modules/@earendil-works/pi-coding-agent/dist/cli.js");
@@ -29,6 +31,7 @@ it.runIf(process.env.FABRIC_PRESENCE_REAL_CLI === "1")("renews both durable acto
   const clients: RpcClient[] = [];
   let owner: { pid: number; hostId: string; fabricExtensionPath?: string; handover?: { launcher: { pid: number } } } | undefined;
   let holder: ChildProcess | undefined, holderExit: Promise<void> | undefined;
+  let observer: ParticipantDirectory | undefined;
   let holderOutput = "";
   const wait = async (predicate: () => boolean, timeout = 20000) => vi.waitFor(() => expect(predicate()).toBe(true), { timeout, interval: 50 });
   const makeClient = (session?: string) => {
@@ -80,21 +83,26 @@ it.runIf(process.env.FABRIC_PRESENCE_REAL_CLI === "1")("renews both durable acto
     await main.stop();
     expect(alive(ready.pid)).toBe(false);
     const before = readHostLease(meshRoot, owner!.hostId)!.updatedAt;
-    const actorsRenewedAfter = (stamp: number) => actors.every(actor => {
-      const key = "topology/participants/" + createHash("sha256").update(actor.id).digest("hex");
-      return (readParticipantFile(meshRoot, key)?.updatedAt ?? 0) > stamp;
+    observer = new ParticipantDirectory(new MeshStore(meshRoot, 65_536, 1_000), {
+      enabled: true, identity: { id: "cli-proof-observer", name: "observer", kind: "agent" },
+      hostId: "cli-proof-observer", rootId: "cli-proof-observer", reapDeadHosts: false,
     });
-    await wait(() => (readHostLease(meshRoot, owner!.hostId)?.updatedAt ?? 0) > before && actorsRenewedAfter(before));
+    const actorsDiscoverable = () => actors.every(actor => {
+      const record = observer!.get(actor.id, Date.now(), { fresh: true });
+      return record?.kind === "actor" && record.stale === false && record.ownerHostId === owner!.hostId &&
+        record.rootId === ready.rootId;
+    });
+    await wait(() => (readHostLease(meshRoot, owner!.hostId)?.updatedAt ?? 0) > before && actorsDiscoverable());
     const renewed = readHostLease(meshRoot, owner!.hostId)!;
-    for (const actor of actors) {
-      const key = "topology/participants/" + createHash("sha256").update(actor.id).digest("hex");
-      expect(readParticipantFile(meshRoot, key)?.updatedAt).toBeGreaterThan(before);
-    }
+    expect(renewed.expiresAt).toBeGreaterThan(Date.now());
+    for (const actor of actors) expect(observer.get(actor.id, Date.now(), { fresh: true })).toMatchObject({
+      id: actor.id, kind: "actor", rootId: ready.rootId, ownerHostId: owner!.hostId, stale: false,
+    });
     const participantReceipts = () => actors.map(actor => ({ id: actor.id, scope: actor.scope,
       participant: readParticipantFile(meshRoot, "topology/participants/" + createHash("sha256").update(actor.id).digest("hex")) }));
     receipts.owner = owner;
     receipts.afterMainExit = { mainPid: ready.pid, residentPid: owner!.pid, before, renewed, participants: participantReceipts() };
-    console.info(`native Main exited pid=${ready.pid}; resident pid=${owner!.pid} renewed host and all 12 actor participants across project/session scopes`);
+    console.info(`native Main exited pid=${ready.pid}; resident pid=${owner!.pid} renewed its host lease; all 12 actors remain discoverable across project/session scopes`);
     // Real public restoration in another native Main of the same persisted session.
     const restoredMain = makeClient(ready.sessionFile); await restoredMain.start();
     receipts.restored = await proofTurn(restoredMain, "RESTORE_PRESENCE");
@@ -131,18 +139,19 @@ it.runIf(process.env.FABRIC_PRESENCE_REAL_CLI === "1")("renews both durable acto
     const timeoutLog = fs.readFileSync(path.join(configDir, "child-stderr.log"), "utf8");
     expect(timeoutLog).toContain("FABRIC_MESH_LOCK_TIMEOUT");
     expect(releasedAt - held.start).toBeGreaterThan(10000);
-    await wait(() => (readHostLease(meshRoot, owner!.hostId)?.updatedAt ?? 0) > stale && actorsRenewedAfter(stale));
+    await wait(() => (readHostLease(meshRoot, owner!.hostId)?.updatedAt ?? 0) > stale && actorsDiscoverable());
     const recovered = readHostLease(meshRoot, owner!.hostId)!;
+    expect(recovered.expiresAt).toBeGreaterThan(Date.now());
     receipts.realContention = { held, releasedAt, heldMs: releasedAt - held.start, timedOut: true,
       lockWaitSamples: during.length, distinctAcquisitions: acquisitions,
       actorCount: actors.length, before: stale, recovered, participants: participantReceipts() };
     console.info(holderOutput.trim());
     console.info(`real lock contention: ${during.length} syscall samples, ${acquisitions.length} shared acquisition(s), 12 actors, recovery lease=${recovered.updatedAt}`);
-    for (const actor of actors) {
-      const key = "topology/participants/" + createHash("sha256").update(actor.id).digest("hex");
-      expect(readParticipantFile(meshRoot, key)?.updatedAt).toBeGreaterThan(stale);
-    }
+    for (const actor of actors) expect(observer.get(actor.id, Date.now(), { fresh: true })).toMatchObject({
+      id: actor.id, kind: "actor", rootId: ready.rootId, ownerHostId: owner!.hostId, stale: false,
+    });
   } finally {
+    await observer?.close(); observer?.mesh.closeState();
     await Promise.all(clients.map(client => client.stop().catch(() => undefined)));
     // A failed creation assertion may still have launched a resident; always recover its own-root receipt.
     if (!owner && fs.existsSync(path.join(root, "main-ready.json"))) {

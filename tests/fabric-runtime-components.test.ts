@@ -3,6 +3,9 @@ import os from "node:os";
 import path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it, vi } from "vitest";
+import { ActorDirectory } from "../src/actors/directory.js";
+import { ActorSlotRecoveryParkedError } from "../src/actors/slot-recovery.js";
+import { configureFabricDiagnostics, fabricDiagnosticsFile, flushFabricDiagnostics } from "../src/core/diagnostics.js";
 import { CapturedToolCatalog } from "../src/capture/catalog.js";
 import { normalizeFabricConfig } from "../src/config.js";
 import type { FabricExecutionResult } from "../src/execution-service.js";
@@ -17,6 +20,53 @@ import {
 } from "../src/protocol.js";
 
 describe("Fabric runtime provider components", () => {
+  it("keeps parked actor recovery diagnostics private to the principal session log", async () => {
+    const cwd = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-runtime-recovery-diagnostics-")));
+    fs.mkdirSync(path.join(cwd, ".pi"), { recursive: true });
+    vi.stubEnv("PI_CODING_AGENT_DIR", path.join(cwd, "agent"));
+    vi.stubEnv("PI_FABRIC_PROJECT_ROOT", cwd);
+    vi.stubEnv("SMARTY_ROLE", "org-agent");
+    configureFabricDiagnostics("parked-recovery-session");
+    const pi = { events: { emit: vi.fn() }, getThinkingLevel: () => "off", sendMessage: vi.fn() } as unknown as ExtensionAPI;
+    const context = {
+      cwd, hasUI: true, isProjectTrusted: () => true, isIdle: () => true, hasPendingMessages: () => false,
+      modelRegistry: { find: vi.fn(), getApiKeyAndHeaders: vi.fn() },
+      sessionManager: { getSessionId: () => "parked-recovery-session", getSessionFile: () => undefined, getBranch: () => [], getLeafId: () => undefined },
+      ui: { setStatus: vi.fn(), notify: vi.fn() },
+    } as unknown as ExtensionContext;
+    const config = normalizeFabricConfig({
+      mesh: { enabled: false }, mcp: { enabled: false, cache: { enabled: false } }, memory: { enabled: false },
+      agents: { enabled: false }, residency: { enabled: false }, prewalk: { enabled: false, alwaysRearm: false },
+    });
+    const fixture = path.join(cwd, "unused.mjs");
+    fs.writeFileSync(fixture, "export default {};");
+    const parked = new ActorSlotRecoveryParkedError([new Error("authority unavailable")]);
+    const recover = vi.spyOn(ActorDirectory.prototype, "recoverProtectedActors").mockRejectedValueOnce(parked);
+    const status = vi.spyOn(ActorDirectory.prototype, "slotRecoveryStatus").mockReturnValue({
+      ready: false, error: { code: "FABRIC_ACTOR_SLOT_RECOVERY_PARKED", message: parked.message },
+    });
+    const warning = vi.spyOn(console, "warn");
+    const runtime = new FabricRuntimeState(pi, new CapturedToolCatalog(), {
+      paths: { extension: fixture, worker: fixture, residentHost: fixture, skills: cwd },
+    });
+    try {
+      await runtime.initialize(context, config);
+      await flushFabricDiagnostics();
+      expect(recover).toHaveBeenCalledOnce();
+      expect(warning).not.toHaveBeenCalled();
+      const log = fs.readFileSync(fabricDiagnosticsFile("parked-recovery-session"), "utf8");
+      expect(log).toContain("Protected actors remain parked: authority unavailable");
+      expect(context.ui.notify).not.toHaveBeenCalledWith(expect.stringContaining("Protected actors remain parked"), expect.anything());
+    } finally {
+      warning.mockRestore();
+      status.mockRestore();
+      recover.mockRestore();
+      await runtime.shutdown();
+      vi.unstubAllEnvs();
+      fs.rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
   it("activates every enabled built-in component before execution and discovery", async () => {
     const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-runtime-components-"));
     fs.mkdirSync(path.join(cwd, ".pi"), { recursive: true });

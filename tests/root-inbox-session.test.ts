@@ -78,7 +78,7 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
     const inboxMessages = () => session.messages.filter((message) =>
       message.role === "custom" && (message as { customType?: string }).customType === "pi-fabric-inbox");
     // A peer's shadow record from two minutes ago, whose steer never arrived.
-    const missedWork = (text: string, to: string | null = `session:${session.sessionManager.getSessionId()}`, ageMs = 120_000, kind = "handoff") => {
+    const missedWork = (text: string, to: string | null = `session:${session.sessionManager.getSessionId()}`, ageMs = 120_000, kind = "handoff", deliveryId?: string) => {
       const id = randomUUID();
       const log = path.join(meshRoot, "events.jsonl");
       const lines = fs.existsSync(log) ? fs.readFileSync(log, "utf8").trim().split("\n").filter(Boolean) : [];
@@ -87,7 +87,7 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
         id, sequence, topic: "fleet.work.pi-fabric.1", kind,
         from: { id: "session:peer", name: "main", kind: "main", sessionId: "peer" },
         ...(to ? { to } : {}),
-        text, data: { ref: "Smarty-Pants-Inc/pi-fabric#1", key: text }, createdAt: Date.now() - ageMs,
+        text, data: { ref: "Smarty-Pants-Inc/pi-fabric#1", key: text, ...(deliveryId ? { deliveryId } : {}) }, createdAt: Date.now() - ageMs,
       })}\n`);
       fs.writeFileSync(path.join(meshRoot, "sequence"), String(sequence));
       return id;
@@ -115,7 +115,7 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
     try {
       await expect(session.sendCustomMessage({
         customType: "pi-fabric-agent-message", content: "native write failed", display: true,
-        details: { id: "failed-native", from: { id: "session:peer" }, data: { key: "retry unseen work" } },
+        details: { id: "failed-native", from: { id: "session:peer" }, data: { key: "retry unseen work", deliveryId: "delivery:retry-unseen-work" } },
       }, { triggerTurn: false })).rejects.toThrow();
       expect(session.sessionManager.getEntries().some(entry => entry.type === "custom_message" &&
         entry.customType === "pi-fabric-agent-message")).toBe(true);
@@ -128,7 +128,7 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
     await session.prompt("drain before shadow");
     expect(receipts()).toEqual(before);
     expect(fs.readFileSync(file, "utf8")).not.toContain("failed-native");
-    h.missedWork("retry unseen work");
+    h.missedWork("retry unseen work", undefined, 120_000, "handoff", "delivery:retry-unseen-work");
     await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
     session.dispose();
     sessions.splice(sessions.indexOf(session), 1);
@@ -147,7 +147,7 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
     expect(inbox()).toHaveLength(1);
     expect(JSON.stringify(inbox()[0])).toContain("retry unseen work");
     expect(receipts().length).toBeGreaterThan(before.length);
-    h.missedWork("retry unseen work"); // A confirmed inbox receipt suppresses the new shadow id.
+    h.missedWork("retry unseen work", undefined, 120_000, "handoff", "delivery:retry-unseen-work"); // The explicit delivery identity marks a true shadow.
     faux.setResponses([fauxAssistantMessage("no duplicate")]);
     await reloaded.prompt("redelivery");
     expect(inbox()).toHaveLength(1);

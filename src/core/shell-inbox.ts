@@ -2,6 +2,7 @@ import type { ContextEvent, ExtensionAPI, ExtensionContext } from "@earendil-wor
 import type { FabricShellJobEvent, FabricShellJobStore } from "./shell-jobs.js";
 import { fabricProvenanceSupported, sendFabricMessage } from "../fabric-provenance.js";
 import { extensionContextLive } from "../session-liveness.js";
+import { notifyDiagnostic } from "./diagnostics.js";
 
 export const SHELL_MESSAGE_TYPE = "pi-fabric-shell-event";
 export const SHELL_AWARENESS_MESSAGE_TYPE = "pi-fabric-shell-awareness";
@@ -190,7 +191,10 @@ export class ShellEventInbox {
     if (this.#context.hasUI) {
       const rows = batch.slice(0, 3).map(({ job, type }) => `Shell ${job.id.slice(0, 8)} ${type === "monitor" ? "event" : job.status}: ${clean(job.description ?? job.command).slice(0, 100)}`);
       if (batch.length > 3) rows.push(`+${batch.length - 3} more · /fabric tasks`);
-      this.#context.ui.notify(rows.join("\n"), batch.some(({ job }) => job.status === "failed" || job.status === "timed_out") ? "warning" : "info");
+      const message = rows.join("\n");
+      if (batch.some(({ job }) => job.status === "failed" || job.status === "timed_out")) {
+        notifyDiagnostic(this.#context, "src/core/shell-inbox.ts", message, "warning");
+      } else this.#context.ui.notify(message, "info");
     }
   }
 

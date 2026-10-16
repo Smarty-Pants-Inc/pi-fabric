@@ -216,6 +216,7 @@ for (const kind of ["Main", "proxy"] as const) {
       { operation: "setInstructions", id: "", instructions: "New persona" },
       { operation: "setModel", id: "", model: "fixture/visible", scope: "project" },
       { operation: "setThinking", id: "", thinking: "high", scope: "session" },
+      { operation: "setBatching", id: "", batchWindowMs: 300_000, batchMax: 50 },
       { operation: "setActivationFilter", id: "", activationFilter: null },
       { operation: "setTools", id: "", tools: ["read", "bash"] },
     ];

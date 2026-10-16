@@ -76,14 +76,13 @@ describe("resident actor participant renewal without a Main", () => {
       let prior = initial.updatedAt;
       for (let period = 1; period <= 3; period++) {
         now += PERIOD_MS;
-        // A timestamp-only management write keeps the actor idle. dd65 carried this
-        // on each shared heartbeat; RC2's timestamp-only skip is independently red.
+        // A timestamp-only management write keeps the actor idle. It may update
+        // legacy actor state, but the participant envelope remains content-stable.
         if (touch) await host.actors.setInstructions(actor.id, "wait");
         await host.participants.refresh();
         const record = readParticipantFile(config.meshRoot, key)!;
-        // Factory routing reads the participant envelope timestamp, not actor activity time.
-        expect.soft(record.updatedAt, `period ${period}`).toBeGreaterThan(prior);
-        expect.soft(record.updatedAt, `period ${period}`).toBe(now);
+        // Native routing reads the owner host lease, not participant envelope age.
+        expect(record.updatedAt, `period ${period}`).toBe(prior);
         expect(record.value).toMatchObject({ kind: "actor", rootId: config.rootId, ownerHostId: host.hostId, status: "idle" });
         expect(observer.get(actor.id, undefined, { fresh: true })).toMatchObject({ stale: false, ownerHostId: host.hostId });
         expect(observer.get(config.rootId, undefined, { fresh: true })).toBeUndefined();
@@ -149,7 +148,7 @@ describe("resident actor participant renewal without a Main", () => {
       fs.rmSync(root, { recursive: true, force: true });
     }
   });
-  it.each(["shared", "files"] as const)("fences delayed renewal against adoption at the write (%s)", async (mode) => {
+  it.each(["shared", "files"] as const)("fences changed publication against adoption at the write (%s)", async (mode) => {
     const { root, config, host, observer } = fixture();
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
@@ -162,8 +161,12 @@ describe("resident actor participant renewal without a Main", () => {
       await host.start();
       const actor = await host.actors.create({ name: "delayed-review", instructions: "wait", residency: "durable" });
       await host.participants.refresh();
-      // Gate before the actual write. Shared publication retains custody;
-      // independent file renewal permits adoption and must recheck its token.
+      const beforeFile = readParticipantFile(config.meshRoot, participantKey(actor.id))!;
+      const registry = new ActorRegistryStore(config.actorRoot);
+      await registry.withLock(() => registry.write(registry.records().map(record => record.id === actor.id
+        ? { ...record, name: "changed-review" } : record)));
+      // Gate a real public-content change before its actual write. Shared publication
+      // retains custody; deferred file publication rechecks lineage after custody.
       const batch = host.mesh.writeBatch.bind(host.mesh);
       const writeFile = participantFiles.writeParticipantFileIf;
       const wait = mode === "shared"
@@ -175,7 +178,6 @@ describe("resident actor participant renewal without a Main", () => {
         });
       renewal = host.participants.refresh();
       await selected;
-      const registry = new ActorRegistryStore(config.actorRoot);
       let adopted = false;
       adoption = registry.withLock(() => {
         registry.write(registry.records().map((record) => record.id === actor.id
@@ -186,9 +188,9 @@ describe("resident actor participant renewal without a Main", () => {
       expect(adopted).toBe(mode === "files"); // only shared publication retains registry custody
       release(); await renewal; await adoption;
       if (mode === "files") {
-        // The resumed independent write cannot refresh a predecessor after
-        // adoption, even though no successor participant has appeared yet.
-        expect(readParticipantFile(config.meshRoot, participantKey(actor.id))).toBeUndefined();
+        // The deferred changed publication must not overwrite the old token's file
+        // after adoption. Ordinary registry-fenced refresh then withdraws it.
+        expect(readParticipantFile(config.meshRoot, participantKey(actor.id))).toEqual(beforeFile);
       }
       wait.mockRestore();
       const adoptedRow = registry.records().find((record) => record.id === actor.id);

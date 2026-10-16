@@ -8,7 +8,7 @@ import { writeJsonAtomic } from "../core/atomic-write.js";
 import type { FabricAgentTransport } from "../config.js";
 import { isFabricThinking, type FabricThinking } from "../thinking.js";
 import { resolveActorDeliveryPolicy } from "./delivery-policy.js";
-import { FABRIC_ACTOR_HOST_EVENTS, normalizeDeadLetterReplayMaxAgeMs, normalizeActorActivation, validateActorCoalesceKey, validateActorDedupeKey, validateActorInferenceContext } from "./types.js";
+import { FABRIC_ACTOR_HOST_EVENTS, MAX_ACTOR_BATCH_EVENTS, normalizeDeadLetterReplayMaxAgeMs, normalizeActorActivation, normalizeActorBatching, validateActorCoalesceKey, validateActorDedupeKey, validateActorInferenceContext } from "./types.js";
 import { normalizeActorActivationFilter, type FabricActorActivationFilter } from "./activation-filter.js";
 import { normalizeActorRecords } from "./records.js";
 import type {
@@ -223,6 +223,12 @@ export class GlobalActorRegistry {
       responseMode: patch.responseMode ?? existing.responseMode,
       triggerTurn: patch.triggerTurn ?? existing.triggerTurn,
       coalesce: patch.coalesce ?? existing.coalesce,
+      ...normalizeActorBatching({
+        ...(existing.batchWindowMs !== undefined ? { batchWindowMs: existing.batchWindowMs } : {}),
+        ...(existing.batchMax !== undefined ? { batchMax: existing.batchMax } : {}),
+        ...(existing.batchMaxBytes !== undefined ? { batchMaxBytes: existing.batchMaxBytes } : {}),
+        ...normalizeActorBatching(patch),
+      }),
       ...(patch.activation !== undefined
         ? { activation: patch.activation }
         : existing.activation !== undefined ? { activation: existing.activation } : {}),
@@ -331,6 +337,7 @@ export class GlobalActorRegistry {
       responseMode: def.responseMode,
       triggerTurn: def.triggerTurn,
       coalesce: def.coalesce,
+      ...normalizeActorBatching(def),
       ...(def.residency ? { residency: def.residency } : {}),
       runner: def.runner,
       ...(def.kernel ? { kernel: def.kernel } : {}),
@@ -414,6 +421,7 @@ export class GlobalActorRegistry {
     validateActorDedupeKey(def.dedupeKey);
     const activation = normalizeActorActivation(def.activation);
     const deadLetterReplayMaxAgeMs = normalizeDeadLetterReplayMaxAgeMs(def.deadLetterReplayMaxAgeMs);
+    const batching = normalizeActorBatching(def);
     const activationFilter = def.activationFilter === undefined ? undefined : normalizeActorActivationFilter(def.activationFilter);
     const records = normalizeActorRecords(def.records);
     const requires = normalizeRequirements(def.requires);
@@ -451,6 +459,7 @@ export class GlobalActorRegistry {
       ...(def.coalesceKey !== undefined ? { coalesceKey: def.coalesceKey } : {}),
       ...(def.dedupeKey !== undefined ? { dedupeKey: def.dedupeKey } : {}),
       ...(activation ? { activation } : {}),
+      ...batching,
       ...(activationFilter?.length ? { activationFilter } : {}),
       ...(deadLetterReplayMaxAgeMs !== undefined ? { deadLetterReplayMaxAgeMs } : {}),
       ...(validWhile ? { validWhile } : {}),
@@ -609,6 +618,9 @@ export class GlobalActorRegistry {
         ...(activation ? { activation } : {}),
         ...(typeof record.deadLetterReplayMaxAgeMs === "number" && Number.isSafeInteger(record.deadLetterReplayMaxAgeMs) && record.deadLetterReplayMaxAgeMs >= 0
           ? { deadLetterReplayMaxAgeMs: record.deadLetterReplayMaxAgeMs } : {}),
+        ...(Number.isSafeInteger(record.batchWindowMs) && (record.batchWindowMs as number) >= 0 ? { batchWindowMs: record.batchWindowMs as number } : {}),
+        ...(Number.isSafeInteger(record.batchMax) && (record.batchMax as number) > 0 && (record.batchMax as number) <= MAX_ACTOR_BATCH_EVENTS ? { batchMax: record.batchMax as number } : {}),
+        ...(Number.isSafeInteger(record.batchMaxBytes) && (record.batchMaxBytes as number) > 0 ? { batchMaxBytes: record.batchMaxBytes as number } : {}),
         // Kept as stored, even when unreadable: #noteFilter disables it instead (smarty-dev#1579).
         ...(record.activationFilter !== undefined ? { activationFilter: record.activationFilter } : {}),
         ...(validWhile ? { validWhile } : {}),

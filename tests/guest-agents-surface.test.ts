@@ -24,6 +24,43 @@ const names = (block: string, pattern: RegExp): Set<string> =>
 const IMPLEMENTED = AGENTS_ACTION_DESCRIPTORS.map((descriptor) => descriptor.name);
 
 describe("guest agents surface", () => {
+  // #6087 admission data safety / guest-host trust boundary: clearing topics
+  // must remain an explicit typed mutation, not lose [] or scope in transit.
+  it.each([false, true])("types setTopics replacements and rejects malformed subscriptions (fullCodeMode=%s)", fullCodeMode => {
+    const declarations = guestTypeDeclarations(fullCodeMode);
+    const code = `const local = await agents.setTopics({ id: "reviewer", topics: [] });
+      const template = await agents.setTopics({ id: "template", scope: "global", topics: ["github.pulls"] });
+      const localTopics: string[] = local.topics;
+      const templateTopics: string[] = template.topics;
+      return { localTopics, templateTopics };`;
+    expect(typeCheckFabricCode(code, declarations, true).errors).toEqual([]);
+    for (const args of ['{ id: "reviewer" }', '{ id: "reviewer", topics: "github.pulls" }', '{ id: "reviewer", topics: [42] }']) {
+      expect(typeCheckFabricCode(`await agents.setTopics(${args});`, declarations, true).errors.length).toBeGreaterThan(0);
+    }
+    const descriptor = AGENTS_ACTION_DESCRIPTORS.find(action => action.name === "setTopics")!;
+    expect(descriptor.inputSchema).toMatchObject({ required: ["id", "topics"],
+      properties: { topics: { type: "array", items: { type: "string" } } } });
+  });
+
+  it("bridges empty local and non-empty global setTopics without dropping the scope or empty array", async () => {
+    const calls: Array<{ ref: string; args: unknown }> = [];
+    const result = await new QuickJsRuntime().execute(
+      `const local = await agents.setTopics({ id: "reviewer", topics: [] });
+       const template = await agents.setTopics({ id: "template", scope: "global", topics: ["github.pulls"] });
+       return { local, template };`,
+      async (ref, args) => {
+        calls.push({ ref, args });
+        return { id: (args as { id: string }).id, topics: (args as { topics: string[] }).topics };
+      },
+      { timeoutMs: 5_000, memoryLimitBytes: 32 * 1024 * 1024 },
+    );
+    expect(result.terminationReason).toBe("completed");
+    expect(calls).toEqual([
+      { ref: "agents.setTopics", args: { id: "reviewer", topics: [] } },
+      { ref: "agents.setTopics", args: { id: "template", scope: "global", topics: ["github.pulls"] } },
+    ]);
+    expect(result.value).toEqual({ local: { id: "reviewer", topics: [] }, template: { id: "template", topics: ["github.pulls"] } });
+  });
   it.each([false, true])("types exact slot claim and retry identity on create/import (fullCodeMode=%s)", fullCodeMode => {
     const declarations = guestTypeDeclarations(fullCodeMode);
     const code = `const slotClaim: FabricActorSlotClaim = { key: "factory/review-slots/v1/example/repo/1/base", ifVersion: 7 };
@@ -185,6 +222,26 @@ describe("guest agents surface", () => {
     }, { timeoutMs: 5000, memoryLimitBytes: 32 * 1024 * 1024 });
     expect(result.terminationReason).toBe("completed");
     expect(calls).toEqual([]);
+  });
+  it.each([false, true])("types actor window batching and the live setter (fullCodeMode=%s)", fullCodeMode => {
+    const code = `const actor = await agents.create({ name: "supervisor", instructions: "Observe.", batchWindowMs: 300000, batchMax: 50, batchMaxBytes: 262144 });
+      const updated = await agents.setBatching({ id: actor.id, batchWindowMs: 0, batchMaxBytes: 4096 });
+      const window: number | undefined = updated.batchWindowMs;
+      const max: number | undefined = actor.batchMax;
+      const bytes: number | undefined = updated.batchMaxBytes;
+      return { window, max, bytes };`;
+    expect(typeCheckFabricCode(code, guestTypeDeclarations(fullCodeMode), true).errors).toEqual([]);
+    expect(typeCheckFabricCode('await agents.setBatching({ id: "actor", batchMax: "50" });', guestTypeDeclarations(fullCodeMode), true).errors.length).toBeGreaterThan(0);
+    expect(typeCheckFabricCode('await agents.setBatching({ id: "actor", batchMaxBytes: "4096" });', guestTypeDeclarations(fullCodeMode), true).errors.length).toBeGreaterThan(0);
+  });
+  it("bridges the batching setter through the public provider", async () => {
+    const calls: Array<{ ref: string; args: unknown }> = [];
+    const result = await new QuickJsRuntime().execute('return await agents.setBatching({ id: "actor", batchWindowMs: 300000, batchMax: 50, batchMaxBytes: 262144 });',
+      async (ref, args) => { calls.push({ ref, args }); return { batchWindowMs: 300000, batchMax: 50, batchMaxBytes: 262144 }; },
+      { timeoutMs: 5000, memoryLimitBytes: 32 * 1024 * 1024 });
+    expect(result.terminationReason).toBe("completed");
+    expect(calls).toEqual([{ ref: "agents.setBatching", args: { id: "actor", batchWindowMs: 300000, batchMax: 50, batchMaxBytes: 262144 } }]);
+    expect(result.value).toEqual({ batchWindowMs: 300000, batchMax: 50, batchMaxBytes: 262144 });
   });
   it.each([false, true])("types per-filter telemetry and expiry (fullCodeMode=%s)", fullCodeMode => {
     const code = `await agents.setActivationFilter({ id: "reviewer", activationFilter: ["hold"], expiresAt: Date.now() + 60000, deadLetterReplayMaxAgeMs: 0 });

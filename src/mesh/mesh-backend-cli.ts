@@ -627,6 +627,13 @@ export const main = async (argv: string[], io: {
       return status.fenceHolds && "source" in status.reader ? 0 : 3;
     }
     // The readiness gate (smarty-dev#7815): every registered reader proved the target backend.
+    if (options.command === "import" || options.command === "cutover") {
+      // smarty-dev#9501: the exact rerun of a killed import recovers its own .lock before the gate's census (lazy
+      // module, import-fence-receipt.ts); anything but an exact receipt match leaves the root to the gate.
+      const { root, lockProtocol } = options;
+      const recovered = await import("./import-fence-receipt.js").then(module => module.recoverKilledImportLock(root, lockProtocol), () => undefined);
+      if (recovered) warn(`fabric-mesh-backend: ${recovered}\n`);
+    }
     if (options.command === "import" || options.command === "cutover") gate = await openGate(options, library, io.builtinReaders ?? BUILTIN_READERS,
       io.gateCensus ?? meshWriterCensusSync(options.root), io.procScan ?? {}, io.leaseProbe ?? {}, warn);
     const result: Record<string, unknown> = { ...(await (options.command === "import" ? importMeshState(options.root, library)

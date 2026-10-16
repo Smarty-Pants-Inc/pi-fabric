@@ -544,7 +544,7 @@ export interface FabricMeshNatsConfig {
   /** Stream num_replicas on create; an existing stream with a different count is refused (default 1). */
   replicas: number;
   /** Messaging connection settings. No credential is read while loading config. */
-  servers?: string[];
+  servers?: string | string[];
   /** Required literal policy mapping in NATS mode; full permission verification stays in the lazy adapter. */
   custodyStream?: string;
   livenessStream?: string;
@@ -656,10 +656,11 @@ const meshNatsServers = (value: unknown): string[] => {
     return labels.every(label => /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$/.exec(label)?.[0] === label) &&
       Number(match[2]) >= 1 && Number(match[2]) <= 65535;
   };
-  if (!Array.isArray(value) || value.length === 0 || ![...value].every(validServer)) {
-    throw new FabricMeshNatsConfigError("servers", "must be an explicit nonempty array of tls://<DNS>:port URLs");
+  const servers = typeof value === "string" ? [value] : value;
+  if (!Array.isArray(servers) || servers.length === 0 || ![...servers].every(validServer)) {
+    throw new FabricMeshNatsConfigError("servers", "must be a tls://<DNS>:port URL or an explicit nonempty array of those URLs");
   }
-  return [...value] as string[];
+  return [...servers] as string[];
 };
 
 const meshNatsConfig = (value: unknown, transport: FabricMeshTransport): FabricMeshNatsConfig => {

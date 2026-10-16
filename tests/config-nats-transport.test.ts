@@ -23,6 +23,21 @@ describe.sequential("NATS transport policy and TLS configuration", () => {
     expect(actual.pathBMachines).not.toBe(input.pathBMachines); expect(actual.tls).not.toBe(input.tls);
     expect(input).toEqual(before);
   });
+  it("normalizes a single server string and applies identical DNS/TLS/IP validation to either shape", () => {
+    const server = nats().servers[0]!, input = { ...nats(), servers: server }, before = structuredClone(input);
+    const mesh = normalizeFabricConfig(config(input)).mesh;
+    expect(mesh.nats.servers).toEqual([server]);
+    const child = childMeshTransportEnvironment({ ...mesh, nats: { ...mesh.nats, servers: server } }, {});
+    expect(JSON.parse(child.PI_FABRIC_MESH_NATS!).servers).toEqual([server]);
+    expect(input).toEqual(before);
+    for (const unsafe of ["", "tls://-host:4222", "tls://bad..dns:4222", "tls://127.0.0.1:4222",
+      "tls://[::1]:4222", "tls://127.0x0.1:4222", "tls://0x7f.1:4222", "tls://2130706433:4222",
+      "tls://0x7f000001:4222", "tls://0177.1:4222", "tls://127.1:4222", "nats://localhost:4222",
+      "tls://localhost:0", "tls://localhost:65536", "tls://localhost:4222\n"]) {
+      refuses({ ...nats(), servers: unsafe }, "servers");
+      refuses({ ...nats(), servers: [unsafe] }, "servers");
+    }
+  });
   it.each(["operatorMachine", "servers", "custodyStream", "livenessStream", "pathBMachines", "tls"])("typed-refuses missing required %s", field => {
     const value: Record<string, unknown> = nats(); delete value[field]; refuses(value, field);
   });

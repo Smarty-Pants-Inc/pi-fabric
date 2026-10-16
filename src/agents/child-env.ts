@@ -26,7 +26,7 @@ export const childMeshTransportEnvironment = (
     const { servers, credentials, machine, inboxLanes, operatorMachine, rollbackHoldUntil,
       custodyStream, livenessStream, pathBMachines, tls } = mesh.nats;
     child.PI_FABRIC_MESH_NATS = JSON.stringify({
-      servers: servers === undefined ? undefined : [...servers],
+      servers: servers === undefined ? undefined : typeof servers === "string" ? [servers] : [...servers],
       credentials, machine, inboxLanes: inboxLanes ?? 8, operatorMachine, rollbackHoldUntil,
       custodyStream, livenessStream,
       pathBMachines: pathBMachines === undefined ? undefined : [...pathBMachines],

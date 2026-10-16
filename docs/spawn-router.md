@@ -156,7 +156,7 @@ been created, append `kind: "start-unknown"` with that same null receipt shape
 and only the fixed `error: "start-unknown"`. It is neither success attribution
 nor evidence that a worker started; unresolved cleanup and admission custody
 remain in force until the existing proof path confirms the worker is gone. The
-same admission is consumed once, so a replay is refused rather than recorded as
+same admission is consumed once, so a replay is refused and is not recorded as
 another outcome.
 
 For durable calls, local validation and host-startup failures are recorded by

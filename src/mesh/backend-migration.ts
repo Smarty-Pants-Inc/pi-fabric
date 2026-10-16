@@ -116,7 +116,7 @@ export type MeshBackendStep =
   | "rollback-flag" | "rollback-export-temp" | "rollback-verify" | "rollback-switch" | "rollback-replace"
   | "abort-rollback" | "cutover-reconcile" | "cutover-copy" | "cutover-marker" | "cutover-flag"
   // file <-> nats (backend-migration-nats.ts, smarty-dev#9670)
-  | "nats-import-begin" | "nats-import-chunk" | "nats-import-verify" | "nats-copy" | "nats-marker" | "nats-import-commit"
+  | "nats-intent" | "nats-import-begin" | "nats-import-chunk" | "nats-import-verify" | "nats-copy" | "nats-marker" | "nats-import-commit"
   | "nats-retire" | "nats-export-temp" | "nats-replace";
 
 export interface MeshCensusWriter { pid: number; release: string; mode: string }

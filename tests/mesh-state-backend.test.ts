@@ -12,7 +12,7 @@ import { fakeJetStream } from "./helpers/nats-jetstream-fake.js";
 import { MeshStateRetiredError, openNodeSqlite, SqliteStateStore } from "../src/mesh/state-sqlite.js";
 import { MeshBatchConflictError, MeshStore, type MeshBatchOperation, type MeshIdentity, type MeshStateEntry,
   type MeshStoreOptions } from "../src/mesh/store.js";
-import { itFor, prepareNatsRoot, reportNatsSkip } from "./helpers/nats-state-server.js";
+import { itFor, markNatsRoot, prepareNatsRoot, reportNatsSkip } from "./helpers/nats-state-server.js";
 
 const identity: MeshIdentity = { id: "tester", name: "tester", kind: "agent" };
 const other: MeshIdentity = { id: "other", name: "other", kind: "actor" };
@@ -275,12 +275,14 @@ describe.each(["file", "sqlite", "nats"] as const)("R11 callbacks on the %s back
 describe("nats refuses a bridge: the interim R20 fence decision (smarty-dev#7504, smarty-dev#9725)", () => {
   it("a root where a bridge holds events refuses nats with the named error; a root without a bridge opens", async () => {
     const bridged = tempRoot("nats-bridged");
+    markNatsRoot(bridged);
     const backend = await openNatsStateBackend({ root: bridged, port: fakeJetStream().port() });
     await backend.put({ key: "topology/hosts/remote-1", value: { format: 1, id: "remote-1", remoteHost: "peer-a" }, identity });
     expect(() => open(bridged, { stateBackend: "nats" })).toThrow(MeshStateNatsBridgeRefusedError);
     expect(() => open(bridged, { stateBackend: "nats" })).toThrow(/FABRIC_MESH_STATE_NATS_BRIDGE_REFUSED: .*topology\/hosts\/remote-1 is mirrored from peer-a.*smarty-dev#9725/);
 
     const plain = tempRoot("nats-plain");
+    markNatsRoot(plain);
     const local = await openNatsStateBackend({ root: plain, port: fakeJetStream().port() });
     await local.put({ key: "topology/hosts/local-1", value: { format: 1, id: "local-1" }, identity });
     const store = open(plain, { stateBackend: "nats" });

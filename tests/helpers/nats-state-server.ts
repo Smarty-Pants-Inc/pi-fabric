@@ -9,11 +9,13 @@
 // writes mesh.nats.replicas into this file's PRIVATE PI_CODING_AGENT_DIR/fabric.json, which scripts/test-temp.ts
 // creates fresh per test file; spawned children inherit that env and so read the same config. Any existing config
 // there is preserved; the path is validated as the private test fleet's agent dir before the write.
-import { existsSync, readFileSync, realpathSync, renameSync, writeFileSync } from "node:fs";
+import fs, { existsSync, readFileSync, realpathSync, renameSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
+import { encodeMeshStateNatsMarker } from "../../src/mesh/backend-fence.js";
+import { connectJetStream } from "../../src/mesh/state-backend-nats-client.js";
 import { it } from "vitest";
-import { openNatsStateBackend, type NatsStateBackend } from "../../src/mesh/state-backend-nats.js";
+import { MAX_MESSAGE_BYTES, natsStreamName, openNatsStateBackend, type NatsStateBackend } from "../../src/mesh/state-backend-nats.js";
 
 const profiles = { single: 1, cluster: 3 } as const;
 const rawProfile = process.env.NATS_STATE_PROFILE;
@@ -76,10 +78,28 @@ export const itFor = (kind: string) => it.skipIf(kind === "nats" && !natsConfigu
 /** One visible skipped case per suite that says why its nats cases did not run. */
 export const reportNatsSkip = (): void => { if (!natsConfigured) it.skip(natsSkipReason, () => undefined); };
 
+/**
+ * Makes `root` a NATS root for a test: the NATS moved marker over state.json (smarty-dev#9690: a root opens only the
+ * stream its marker names). The stream defaults to the root's own (natsStreamName, pi-fabric#937: root-bound); a test of
+ * the refusal may name another. A real migration does this through importMeshStateToNats.
+ */
+export const markNatsRoot = (root: string, stream?: string): void => {
+  fs.mkdirSync(root, { recursive: true, mode: 0o700 });
+  // After mkdir: natsStreamName canonicalizes an existing root through its realpath.
+  fs.writeFileSync(path.join(root, "state.json"), encodeMeshStateNatsMarker(stream ?? natsStreamName(root), 1), { mode: 0o600 });
+};
+
 /** Prepares the root's NATS backend, so `new MeshStore(root, …, { stateBackend: "nats" })` gets it. Its stream is
  * derived from the root (pi-fabric#937): each test's fresh root has its own, so cases never share state on the server. */
-export const prepareNatsRoot = (root: string, options: { lockTimeoutMs?: number } = {}): Promise<NatsStateBackend> => {
+export const prepareNatsRoot = async (root: string, options: { lockTimeoutMs?: number } = {}): Promise<NatsStateBackend> => {
   if (!natsConfigured) throw new Error(natsSkipReason);
+  fs.mkdirSync(root, { recursive: true, mode: 0o700 });
+  const stream = natsStreamName(root);
+  // The root's open never creates a stream (smarty-dev#9690): a test creates it, as a migration would (the profile's
+  // replicas from the private fabric.json written above).
+  const port = await connectJetStream([natsServerUrl!]);
+  try { await port.ensureStream(stream, [`${stream}.state`, `${stream}.snapshot`], { maxMsgSize: MAX_MESSAGE_BYTES }); } finally { await port.close(); }
+  if (!fs.existsSync(path.join(root, "state.json"))) markNatsRoot(root, stream);
   return openNatsStateBackend({ root, servers: [natsServerUrl!], monitoringUrl: natsMonitorUrl!,
     ...(options.lockTimeoutMs === undefined ? {} : { lockTimeoutMs: options.lockTimeoutMs }) });
 };

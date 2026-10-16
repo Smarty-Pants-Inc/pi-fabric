@@ -226,7 +226,12 @@ and `rollbackMeshStateFromNats` run steps 2-4 for a file root (no `state.db`, ep
 and `retire` is epoch 2). A sqlite root refuses: roll it back to file first (`rollbackMeshState`),
 then import. The details:
 
-- `import-begin` also records the source digest and `readGeneration`.
+- **Per-switch stream (smarty-dev#9690):** each import uses a new stream
+  `natsStreamName(root)_<switch id>`. Under the fence the import first writes it to
+  `state.json.nats-intent` (0600, exclusive, read back), then creates it. A rerun takes it from the
+  intent, or after the marker from the marker. The commit removes the intent. A `beforeCommit` hook
+  (the reader-readiness gate) runs before the marker and before `import-commit`; a throw stops that step.
+- `import-begin` also records the source digest, `readGeneration` and the switch id.
 - The chunks are deterministic batch records: entries in key order, then tombstones in eviction
   order, at most 512 KiB of changes each, with fixed message ids.
 - The source is kept at `state.json.nats-cutover-<E+1>` before the marker goes in.
@@ -238,6 +243,38 @@ then import. The details:
 - **Rollback:** it retires the stream and exports the projection through the `state.json`
   encoder into `state.json.nats-rollback-<E+2>-<uuid>.tmp`. It reads the temp back, checks the digest
   and renames it over the marker. A rerun redoes the export, or only verifies after the rename.
+  Both normal completion and a converged rerun remove this rolled-back switch's own intent, so a new import chooses
+  a new stream. An intent naming another staged switch is left intact.
+  The CLI's `rollback --stream S` stays validated against the root (`natsStreamName(root)` or its per-switch
+  `natsStreamName(root)_<switch id>`) and is mapped to the migration's switch id: a per-switch name selects its id, the
+  fixed-root name selects no id (the earlier layout). With a marker present, an `S` that is not the marker's stream
+  refuses before anything is recorded; without one (a finished rollback's rerun) `S` picks the retired stream to verify.
+- **Opening a root on NATS (decision B):** `openNatsStateBackend` opens the stream its valid own-root NATS marker
+  names, never creating it. A root with no file state at all (no `state.json*`, no `state.db*`, no intent and no kept
+  copy; an absent root too) bootstraps its fixed-root stream `natsStreamName(root)` through the normal create,
+  replicas and readiness path, as before. Everything else refuses and nothing is bootstrapped: live file state, a staged
+  import (`state.json.nats-intent`), leftovers without a marker, a partial, truncated or malformed marker, a marker for
+  another root's stream, and any unreadable entry (its own error, e.g. EACCES). The decision is rechecked after the
+  stream is opened (same kind, stream, marker epoch/time and root `dev:ino`). An existing root's admission takes
+  `custody.lock` only, never the mesh `.lock`, excluding modern migration/rollback writers. A busy custody holder
+  gives `MeshLockTimeoutError` (`FABRIC_MESH_LOCK_TIMEOUT`): retry the open later, with no silent fallback or queued
+  wait behind that holder. A future host must bound its own backoff and overall deadline for NEW open calls, then
+  fail closed; `MeshLockForeignHolderError` is fatal despite its timeout ancestry. Never retry permission, corruption,
+  transport or unknown-outcome errors as admission contention. Under custody, admission checks the current stream
+  head and refuses a lagging or retired projection, then rechecks the marker and registers without an intervening
+  await. Stream replay stays outside custody; the final metadata read can hold custody for about 15.2 s under the
+  client's existing bounded request retries, temporarily excluding lifecycle writers. Concurrent successful opens
+  own independent handles; registering or closing one never closes another opener's handle. The last successful
+  registration is the selector's current backend; closing that owner removes only its own entry. As before, a stream
+  still importing can return an inactive handle: its projection must cover the current head, but all reads and writes
+  refuse until import-commit. This does not relax any marker or migration-fence check.
+  An absent root is never created. An observed change closes the backend and refuses, with nothing registered.
+  This recheck is not a durable file-side fence: a concurrent or later file writer can still race the fresh-root
+  bootstrap (known inherited gap smarty-dev#13524). Do not run a file writer and a NATS backend on the same empty
+  root until that durable fence is implemented.
+- **Fixed-root preflight:** before a new import writes its intent or a stream, the root's fixed-root stream is
+  checked: if it exists and is not retired (live state of a bootstrapped root), the import refuses and never forks it.
+  An absent or retired fixed-root stream lets the new switch begin.
 - **Files:** every file is created with O_CREAT|O_EXCL|O_NOFOLLOW at 0600 and checked as our own
   regular file. An existing kept copy must be ours and hold the source's digest, else the import refuses.
 - **Limits (`LIMIT: FABRIC_MESH_NATS_MIGRATION_LIMIT`):** `maxReplay` stream messages,
@@ -245,7 +282,29 @@ then import. The details:
   backend bounds them), and `maxPayloadBytes` per import chunk (default 1 MiB, the server default),
   checked before `import-begin`. A rollback counts its own `retire` record against `maxReplay`. A
   limit refuses before any retire, rename or commit.
-- **Not built:** the sqlite-direct path and abort (`unretire`).
+- **CLI and the reader gate (smarty-dev#9690):**
+  - `fabric-mesh-backend import --to nats --nats-server URL --accept-old-release-gap` stages S, then runs the #7815
+    gate under the fence before the marker and before `import-commit`.
+  - Each required reader proves `nats` with `reader-proof --backend nats --stream S`: a real read of the staged S on
+    the proof-only path. The proof binds the switch id, S, its creation time, the head, the full digest and the
+    target (`cluster-or-server/domain/account`, the account from `$SYS.REQ.USER.INFO`).
+  - The preflight refuses only readers no proof can fix. A stopped projector deletes its consumer at once.
+  - `--abandon` deletes exactly the intent's unfinished S and the intent. A present state.json must be readable,
+    unambiguous file state: malformed markers, truncated/invalid state and unreadable state refuse before any stream
+    inspection or deletion. An absent state.json is allowed for a crash before the source read.
+  - The gate checks the binding even when no reader is required: S must be this root's stream
+    (`isNatsStreamForRoot`), the server must report the target account, and S's `import-begin` must carry the
+    challenge nonce (an import begun without one is abandoned and redone).
+  - A rerun after the marker reopens the gate: before `import-commit` it checks again; a finished commit only
+    converges (verified, no commit, no check). A malformed NATS marker refuses `import --to nats`, `--abandon` and `rollback`.
+  - `rollback` of a NATS root is ungated and recorded. Its `--stream S` (only to verify a finished rollback, once
+    the marker is gone) must be this root's stream and needs `--nats-server`; any other stream is a usage error (exit 2).
+  - `--stream` is accepted only by `reader-proof --backend nats` and `rollback`, always root-bound.
+  - A marked root opens only the stream its marker names (`create: false`); reads refuse while S is importing.
+- **Deployment gate (pi-fabric#907):** before a fleet root moves, the install's nats-server ACLs let only
+  credentialed fleet hosts publish to and purge or delete the state streams, and allow `$SYS.REQ.USER.INFO`.
+  Owner: fabric-store.
+- **Not built:** the sqlite-direct path and `unretire`.
 
 The local locks fence only this host. Other hosts are fenced by the stream itself, because every
 nats write carries an expected sequence. Each host's `.lock` and the census still stop its

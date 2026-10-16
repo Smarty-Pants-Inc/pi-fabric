@@ -13,6 +13,9 @@ import { MeshLock } from "../src/mesh/mesh-lock.js";
 import { assertMeshStateReadable, decodeMeshStateFile, encodeMeshStateFile, type MeshStateFile } from "../src/mesh/state-file.js";
 import { legacyReadState } from "./fixtures/legacy-mesh-state-04930dfd.js";
 import { legacyReadState8d0af4b0 } from "./fixtures/legacy-mesh-state-8d0af4b0.js";
+import { isMeshStateNatsMarker } from "../src/mesh/backend-fence.js";
+import { openNatsStateBackend } from "../src/mesh/state-backend-nats.js";
+import { fakeJetStream } from "./helpers/nats-jetstream-fake.js";
 import { MeshStateRetiredError, openNodeSqlite, SqliteStateStore } from "../src/mesh/state-sqlite.js";
 import { MeshStore, type MeshBatchOperation, type MeshIdentity } from "../src/mesh/store.js";
 
@@ -549,6 +552,59 @@ describe("the NATS moved marker and backend=nats (smarty-dev#7504, docs/mesh-bac
     // This release never takes it for the SQLite marker (which would open state.db).
     expect(readMeshStateMovedMarker(root)).toBeUndefined();
     expect(readMeshStateNatsMarker(root)?.natsStream).toBe("FABRIC_MESH_X");
+  });
+
+  it("a NATS-shaped marker with an invalid stream fails closed on tolerant reads too, never an empty mesh (smarty-dev#9747)", async () => {
+    for (const natsStream of ["a.b", 42, ""]) {
+      const root = tempRoot("nats-malformed");
+      await seedFileRoot(root);
+      const statePath = path.join(root, "state.json");
+      fs.writeFileSync(statePath, JSON.stringify({ format: "sqlite", movedTo: "state.db", backend: "sqlite", epoch: 1, at: "x", natsStream }));
+      const bytes = fs.readFileSync(statePath);
+      expect(readMeshStateNatsMarker(root)).toBeUndefined();
+      expect(readMeshStateMovedMarker(root)).toBeUndefined();
+      // The tolerant read (recoverDamage) and the strict one both refuse.
+      expect(() => decodeMeshStateFile(statePath, 64 * 1024 * 1024, true)).toThrow(/moved marker with an invalid natsStream/);
+      expect(() => decodeMeshStateFile(statePath, 64 * 1024 * 1024, false)).toThrow(MeshBackendFenceError);
+      expect(() => fileStore(root).get("seed/solo")).toThrow(/invalid natsStream/);
+      expect(() => assertMeshStateReadable(root)).toThrow(MeshBackendFenceError);
+      expect(() => resolveMeshStateSource(root)).toThrow(/invalid natsStream/);
+      await expect(SqliteStateStore.open(root, 64 * 1024, 1_000)).rejects.toThrow();
+      expect(fs.existsSync(path.join(root, "state.db"))).toBe(false);
+      expect(fs.readFileSync(statePath)).toEqual(bytes);
+    }
+  });
+
+  it("a partial NATS marker (valid stream, but a missing or bad field, or an extra key) is refused, never routed (pi-fabric#927)", async () => {
+    const valid = JSON.parse(encodeMeshStateNatsMarker("FABRIC_MESH_X", 1)) as Record<string, unknown>;
+    const partials: Record<string, unknown>[] = [
+      { ...valid, at: undefined }, { ...valid, at: 5 }, { ...valid, at: "yesterday" }, { ...valid, extra: true }, { ...valid, epoch: "1" },
+      // pi-fabric#927 round 3: calendar-invalid instants that a regex and Date.parse accept or roll over.
+      { ...valid, at: "2026-02-30T00:00:00Z" }, { ...valid, at: "2026-02-30T00:00:00.000Z" }, { ...valid, at: "2026-13-01T00:00:00.000Z" },
+      // A real instant in a non-canonical form (offset, no millis) is not the encoder's form either.
+      { ...valid, at: "2026-10-11T20:00:00+02:00" }, { ...valid, at: "2026-10-11T20:00:00Z" },
+    ];
+    // The encoder's own form stays valid.
+    expect(isMeshStateNatsMarker({ ...valid, at: "2026-02-28T23:59:59.999Z" })).toBe(true);
+    expect(isMeshStateNatsMarker({ ...valid, at: "2028-02-29T00:00:00.000Z" })).toBe(true);
+    for (const partial of partials) {
+      const root = tempRoot("nats-partial");
+      await seedFileRoot(root);
+      fs.writeFileSync(path.join(root, "state.json"), JSON.stringify(partial));
+      expect(readMeshStateNatsMarker(root)).toBeUndefined();
+      expect(() => decodeMeshStateFile(path.join(root, "state.json"), 64 * 1024 * 1024, true)).toThrow(MeshBackendFenceError);
+      expect(() => resolveMeshStateSource(root)).toThrow(MeshBackendFenceError);
+      await expect(openNatsStateBackend({ root, port: fakeJetStream().port() })).rejects.toThrow(/has no NATS moved marker/);
+    }
+  });
+
+  it("human status names the NATS stream of the marker (smarty-dev#9747)", async () => {
+    const root = tempRoot("nats-status");
+    await seedFileRoot(root);
+    fs.writeFileSync(path.join(root, "state.json"), encodeMeshStateNatsMarker("FABRIC_MESH_X", 1));
+    let out = "";
+    await main(["status", "--root", root], { stdout: (text) => { out += text; }, stderr: () => undefined });
+    expect(out).toMatch(/state\.json\s+moved marker \(backend=nats, stream FABRIC_MESH_X, at epoch 1\)/);
   });
 
   it("refuses a stream name NATS would not accept", () => {

@@ -165,8 +165,36 @@ export interface MeshStateNatsMarker {
   natsStream: string;
 }
 
+/**
+ * The WHOLE NATS marker (pi-fabric#927 round 1): exactly its six keys, each of its type; anything else (a missing or
+ * invalid `at`, an extra key) is a malformed marker, which every read refuses (never routed to a stream).
+ */
+const NATS_MARKER_KEYS = ["at", "backend", "epoch", "format", "movedTo", "natsStream"];
+/**
+ * `at` is the canonical UTC form the encoder writes (`Date#toISOString`, `YYYY-MM-DDTHH:MM:SS.mmmZ`) and a real calendar
+ * instant: it must round-trip exactly, so 2026-02-30 or month 13 (which Date.parse rolls over or rejects) refuse.
+ */
+const isCanonicalInstant = (at: string): boolean => {
+  const time = Date.parse(at);
+  return Number.isFinite(time) && new Date(time).toISOString() === at;
+};
 export const isMeshStateNatsMarker = (value: unknown): value is MeshStateNatsMarker =>
-  hasMovedMarkerShape(value) && typeof value.natsStream === "string" && /^[A-Za-z0-9_-]{1,255}$/.test(value.natsStream);
+  hasMovedMarkerShape(value)
+  && Object.keys(value).sort().join(",") === NATS_MARKER_KEYS.join(",")
+  && typeof value.natsStream === "string" && /^[A-Za-z0-9_-]{1,255}$/.test(value.natsStream)
+  && typeof value.at === "string" && isCanonicalInstant(value.at);
+
+/**
+ * The SQLite marker's shape with a `natsStream` that is not a valid stream name (smarty-dev#9747): neither marker, and
+ * never state either. Every read fails closed on it (a tolerant read would otherwise see damage, so an EMPTY mesh).
+ */
+export const isMalformedNatsMarker = (value: unknown): boolean =>
+  // Any document with a `natsStream` that is not the whole valid marker (pi-fabric#927: a bad epoch too): no state file
+  // has that key, so it is a damaged or partial marker, never damage to read as an empty mesh.
+  typeof value === "object" && value !== null && !Array.isArray(value) && Object.hasOwn(value, "natsStream") && !isMeshStateNatsMarker(value);
+
+export const meshStateMalformedMarkerError = (file: string): MeshBackendFenceError =>
+  new MeshBackendFenceError(`Fabric mesh state.json is a moved marker with an invalid natsStream: ${file} is not state; repair the marker`);
 
 /** The NATS marker's exact bytes (field order fixed: the SQLite marker's fields first). */
 export const encodeMeshStateNatsMarker = (stream: string, epoch: number, at = new Date().toISOString()): string => {
@@ -220,6 +248,13 @@ export const readMeshStateNatsMarker = (root: string): MeshStateNatsMarker | und
   } catch { return undefined; }
 };
 
+/** Whether `<root>/state.json` is a NATS-shaped marker with an invalid stream (a bounded read). */
+export const stateFileIsMalformedNatsMarker = (root: string): boolean => {
+  const head = readStateHead(path.join(path.resolve(root), STATE_JSON));
+  if (!head?.complete) return false;
+  try { return isMalformedNatsMarker(JSON.parse(head.head)); } catch { return false; }
+};
+
 /** Shared marker/meta authority; only the offline caller requires deep file validation, never config. */
 const resolveMeshStateBackend = (root: string, documentProblem?: (value: unknown) => string | undefined): MeshStateBackendKind | undefined => {
   let document: unknown;
@@ -232,6 +267,9 @@ const resolveMeshStateBackend = (root: string, documentProblem?: (value: unknown
       document = head?.complete ? JSON.parse(head.head) as unknown : undefined;
     }
   } catch (error) { unreadable = (error as NodeJS.ErrnoException).code === "ENOENT" ? "state.json is missing" : `state.json is unreadable: ${String(error)}`; }
+  // smarty-dev#9747: a malformed NATS marker is neither marker nor state; it never yields to database meta or a file
+  // envelope (offline refuses; bootstrap falls back and the selected store's fence refuses it).
+  if (isMalformedNatsMarker(document)) throw new Error(meshStateMalformedMarkerError(path.join(root, STATE_JSON)).message);
   const marker = isMeshStateNatsMarker(document) ? { backend: "nats" as const, epoch: document.epoch }
     : isMeshStateMovedMarker(document) ? { backend: "sqlite" as const, epoch: document.epoch } : undefined;
   const database = fs.lstatSync(path.join(root, STATE_DB), { throwIfNoEntry: false });
@@ -327,6 +365,9 @@ export const meshStateSourceOf = (root: string, backend: string, epoch: number, 
   // neither file nor sqlite state: file and sqlite readers and writers fail closed and name the stream.
   const nats = readMeshStateNatsMarker(root);
   if (nats) throw meshFenceAlarm(options, root, meshStateMovedToNatsError(path.join(path.resolve(root), STATE_JSON), nats).message, { backend, epoch, fileEpoch: nats.epoch });
+  if (stateFileIsMalformedNatsMarker(root)) {
+    throw meshFenceAlarm(options, root, meshStateMalformedMarkerError(path.join(path.resolve(root), STATE_JSON)).message, { backend, epoch });
+  }
   if (backend === "nats") {
     throw meshFenceAlarm(options, root, `Fabric mesh state.db says backend=nats at epoch ${epoch}: the state is on a NATS stream; this release must run in nats mode`, { backend, epoch });
   }

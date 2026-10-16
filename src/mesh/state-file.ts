@@ -13,7 +13,8 @@ import { MeshSyncNotDurableError } from "./not-durable.js";
 import { captureStoragePut, captureStorageDelete, storageRevision } from "../verified/storage.js";
 import { verifiedRemove } from "../storage/verified-remove.js";
 import { delay, errorCode, type MeshLock, type MeshStoreContext } from "./mesh-lock.js";
-import { assertFileStateWritable, isMeshStateMovedMarker, isMeshStateNatsMarker, meshStateMovedError, meshStateMovedToNatsError, readMeshStateMovedMarker,
+import { assertFileStateWritable, isMalformedNatsMarker, isMeshStateMovedMarker, isMeshStateNatsMarker, meshStateMalformedMarkerError, meshStateMovedError,
+  meshStateMovedToNatsError, readMeshStateMovedMarker,
   type MeshStateMovedMarker, type MeshStateNatsMarker } from "./backend-fence.js";
 import type { MeshIdentity } from "./event-log.js";
 import type { MeshStateFileRead, StateBackend, StateBackendBatchInput, StateBackendDiagnostics } from "./state-backend.js";
@@ -210,14 +211,17 @@ const readState = (
   }
   if (!serialized.trim() && recoverDamage) return emptyState();
   let moved: MeshStateMovedMarker | MeshStateNatsMarker | undefined;
+  let malformed = false;
   try {
     const parsed: unknown = JSON.parse(serialized);
     if (isMeshStateFile(parsed)) {
       observed?.(serialized);
       return parsed;
     }
-    if (!isMeshStateMovedMarker(parsed) && !isMeshStateNatsMarker(parsed)) throw new Error("invalid state format");
-    moved = parsed;
+    // smarty-dev#9747: a NATS-shaped marker with an invalid stream is never damage (a tolerant read would be EMPTY).
+    malformed = isMalformedNatsMarker(parsed);
+    if (!malformed && !isMeshStateMovedMarker(parsed) && !isMeshStateNatsMarker(parsed)) throw new Error("invalid state format");
+    if (!malformed) moved = parsed as MeshStateMovedMarker | MeshStateNatsMarker;
   } catch (error) {
     // Failed parsing must not silently erase the allocation clock. Read-only
     // startup can tolerate damage, but mutations require a repaired snapshot.
@@ -230,6 +234,7 @@ const readState = (
   // pi-fabric#627 review round 3: cutover's moved marker (backend-fence.ts). Never state, damage or an
   // empty mesh, for strict and tolerant reads alike: this file-mode store fails closed (a write is
   // refused before it stages anything; a reader does not report false absence).
+  if (malformed || moved === undefined) throw meshStateMalformedMarkerError(filePath);
   throw isMeshStateNatsMarker(moved) ? meshStateMovedToNatsError(filePath, moved) : meshStateMovedError(filePath, moved);
 };
 

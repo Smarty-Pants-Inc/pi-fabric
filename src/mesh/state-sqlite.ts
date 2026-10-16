@@ -118,7 +118,8 @@ import path from "node:path";
 import { MeshLockTimeoutError } from "../core/atomic-write.js";
 import { diagnostics } from "../core/diagnostics.js";
 import { captureStorageDelete, captureStoragePut, storageRevision, type StorageTransition } from "../verified/storage.js";
-import { encodeMeshStateMovedMarker, isMeshStateMovedMarker, isMeshStateNatsMarker, meshStateMovedToNatsError, readMeshStateMovedMarker } from "./backend-fence.js";
+import { encodeMeshStateMovedMarker, isMalformedNatsMarker, isMeshStateMovedMarker, isMeshStateNatsMarker, meshStateMalformedMarkerError, meshStateMovedToNatsError,
+  readMeshStateMovedMarker } from "./backend-fence.js";
 import { holdMeshFence, holdMeshFenceSync } from "./fence-lock.js";
 import { type MeshLockTicket, meshLockQueueBusy, meshLockQueueDirectory } from "./lock-queue.js";
 import { createMeshLockAdmission, lockStats } from "./mesh-lock.js";
@@ -203,6 +204,7 @@ const classifyStateFile = (file: string): "absent" | "empty" | "marker" | "popul
   if (isMeshStateMovedMarker(parsed)) return "marker";
   // smarty-dev#7504: the state moved to a NATS stream; sqlite mode must never create a fresh database over it.
   if (isMeshStateNatsMarker(parsed)) throw meshStateMovedToNatsError(file, parsed);
+  if (isMalformedNatsMarker(parsed)) throw meshStateMalformedMarkerError(file); // smarty-dev#9747: never "empty"
   if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
     const state = parsed as { entries?: unknown; versions?: unknown; tombstoneOrder?: unknown; highWater?: unknown };
     const empty = (value: unknown): boolean => value === undefined || value === null

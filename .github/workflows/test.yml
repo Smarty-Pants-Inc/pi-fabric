@@ -232,6 +232,14 @@ jobs:
             tar -xzf "$archive"
           )
           echo "NATS_BIN=$stage/nats-server-v${version}-linux-amd64/nats-server" >> "$GITHUB_ENV"
+      # The real-bin E2E (smarty-dev#9690) runs bin/fabric-mesh-backend, which loads dist/. The build requires
+      # the pinned native toolchain on Linux (smarty-dev#8121), the same as the check and mesh-lock-bench jobs.
+      - name: Fetch the pinned native toolchain
+        run: node scripts/native-toolchain.mjs fetch
+      - name: Build
+        env:
+          FABRIC_NATIVE_CC_PINNED: "1"
+        run: bun run build
       - name: Start nats-server ${{ matrix.profile }} (loopback, JetStream sync always, monitor ports)
         shell: bash
         env:
@@ -275,7 +283,7 @@ jobs:
           NATS_STATE_PROFILE: ${{ matrix.profile }}
           NATS_SERVER_URL: nats://127.0.0.1:4222
           NATS_MONITOR_URL: http://127.0.0.1:8222
-        run: bunx vitest run --retry=0 tests/mesh-state-backend.test.ts tests/mesh-state-backend-multiprocess.test.ts tests/mesh-backend-migration-nats.test.ts
+        run: bunx vitest run --retry=0 tests/mesh-state-backend.test.ts tests/mesh-state-backend-multiprocess.test.ts tests/mesh-backend-migration-nats.test.ts tests/mesh-backend-nats-readiness.test.ts tests/mesh-backend-nats-e2e.test.ts
       - name: State backend through a forced metadata-leader election
         if: matrix.profile == 'cluster'
         # The fixture owns another three-node cluster on unique ports, so only its own leader is paused.

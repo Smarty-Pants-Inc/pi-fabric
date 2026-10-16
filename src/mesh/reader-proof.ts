@@ -10,11 +10,46 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { importMeshState, meshBackendStatus, readMeshStateMovedMarker } from "./backend-migration.js";
+import { importMeshState, meshBackendStatus, meshSnapshotDigest, readMeshStateMovedMarker } from "./backend-migration.js";
+import { snapshotOf } from "./backend-migration-nats.js";
+import { assertNatsMaxPayload, assertNatsServerSupported, connectNatsEndpoint, isNatsStreamForRoot, NatsStateBackend, natsTargetOf,
+  type NatsEndpointOptions } from "./state-backend-nats.js";
 import { holdMeshFence } from "./fence-lock.js";
 import { MeshStore } from "./store.js";
 
-export type ReaderBackend = "file" | "sqlite";
+export type ReaderBackend = "file" | "sqlite" | "nats";
+
+/**
+ * What a `nats` proof is bound to (smarty-dev#9690 design, "The nats proof"): one switch's staged stream, read in full
+ * on one target. The gate compares every field with the switch's own values; any difference is unready.
+ */
+export interface NatsProofBind {
+  /** The switch id: 32 lowercase hex, also in the stream's `import-begin`. */
+  switchId: string;
+  /** The staged stream S. */
+  stream: string;
+  /** S's creation time as the server reports it (an ISO 8601 string): a recreated S has another. */
+  streamCreated: string;
+  /** The stream head the reader applied. */
+  head: number;
+  /** `meshSnapshotDigest` of the full snapshot it served (entries, versions, tombstones, high water). */
+  digest: string;
+  /** The target T: cluster (or server) name, JetStream domain and user account, as `cluster/domain/account`. */
+  target: string;
+}
+const BIND_FIELDS = ["switchId", "stream", "streamCreated", "head", "digest", "target"] as const;
+
+/** The gate's side of the binding: the bound fields plus the switch's nonce, read from the stream (never from disk). */
+export type NatsGateBind = NatsProofBind & { nonce: string | undefined };
+
+/**
+ * pi-fabric#927 round 1, the challenge: the import writes a fresh random nonce into the staged stream's `import-begin`
+ * only. A proof answers it with sha256 over the nonce, the switch id and the reader's own name and release, so it
+ * counts only for a reader that read the stream for this switch, and cannot be copied to another reader's proof.
+ * The nonce itself is never written to a proof, the mesh directory, a record or the output.
+ */
+export const natsProofChallenge = (nonce: string, switchId: string, name: string, release: string): string =>
+  createHash("sha256").update(`fabric-mesh-nats-proof/1\n${nonce}\n${switchId}\n${name}\n${release}\n`).digest("hex");
 
 /** The read path of `fabric-mesh-backend reader-proof`: Fabric's MeshStore. */
 export const FABRIC_IMPLEMENTATION = "fabric-meshstore";
@@ -30,6 +65,15 @@ export interface ReaderProof {
   backends: ReaderBackend[];
   provedAt: string;
   provedEpoch: number;
+  /** Required with `nats` (and only then): the switch binding (NatsProofBind). */
+  switchId?: string;
+  stream?: string;
+  streamCreated?: string;
+  head?: number;
+  digest?: string;
+  target?: string;
+  /** Required with `nats`: natsProofChallenge(the stream's nonce, switchId, name, release). */
+  challenge?: string;
 }
 
 /** A non-Fabric reader the gate always requires when it is installed here, with its TRUSTED release root. */
@@ -60,7 +104,11 @@ export const PROOF_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 export const PROOF_MAX_SKEW_MS = 5 * 60 * 1000;
 
 const NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
-const KEYS = new Set(["name", "implementation", "version", "installRoot", "release", "backends", "provedAt", "provedEpoch"]);
+const KEYS = new Set(["name", "implementation", "version", "installRoot", "release", "backends", "provedAt", "provedEpoch", ...BIND_FIELDS, "challenge"]);
+const SWITCH_ID = /^[0-9a-f]{32}$/;
+const STREAM = /^[A-Za-z0-9_-]{1,255}$/; // the NATS marker's stream rule (backend-fence.ts)
+const DIGEST = /^sha256:[0-9a-f]{64}$/;
+const TARGET = /^[^/\s]+\/[^/\s]*\/[^/\s]+$/;
 const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/;
 export const isReaderName = (name: string): boolean => NAME.test(name);
 export const readersDir = (root: string): string => path.join(root, "readers");
@@ -536,8 +584,21 @@ export const parseProof = (text: string, name: string): ReaderProof | string => 
   if (typeof proof.version !== "string" || proof.version.trim() === "") return "invalid proof: version";
   if (proof.installRoot !== undefined && typeof proof.installRoot !== "string") return "invalid proof: installRoot";
   if (typeof proof.release !== "string" || proof.release.trim() === "") return "invalid proof: release";
-  if (!Array.isArray(proof.backends) || proof.backends.length === 0 || !proof.backends.every(item => item === "file" || item === "sqlite")) {
-    return "invalid proof: backends must be a non-empty list of file, sqlite";
+  if (!Array.isArray(proof.backends) || proof.backends.length === 0 || !proof.backends.every(item => item === "file" || item === "sqlite" || item === "nats")) {
+    return "invalid proof: backends must be a non-empty list of file, sqlite, nats";
+  }
+  // A nats proof carries its whole switch binding; any other proof carries none of it.
+  if (proof.backends.includes("nats")) {
+    if (typeof proof.switchId !== "string" || !SWITCH_ID.test(proof.switchId)) return "invalid proof: switchId (32 lowercase hex)";
+    if (typeof proof.stream !== "string" || !STREAM.test(proof.stream)) return "invalid proof: stream";
+    if (typeof proof.streamCreated !== "string" || !ISO.test(proof.streamCreated) || !Number.isFinite(Date.parse(proof.streamCreated))) return "invalid proof: streamCreated is not ISO 8601";
+    if (typeof proof.head !== "number" || !Number.isSafeInteger(proof.head) || proof.head < 1) return "invalid proof: head";
+    if (typeof proof.digest !== "string" || !DIGEST.test(proof.digest)) return "invalid proof: digest";
+    if (typeof proof.target !== "string" || !TARGET.test(proof.target)) return "invalid proof: target (cluster/domain/account)";
+    if (typeof proof.challenge !== "string" || !/^[0-9a-f]{64}$/.test(proof.challenge)) return "invalid proof: challenge (64 lowercase hex)";
+  } else {
+    const bound = [...BIND_FIELDS, "challenge" as const].filter(field => proof[field] !== undefined);
+    if (bound.length > 0) return `invalid proof: ${bound.join(", ")} only with backends nats`;
   }
   if (typeof proof.provedAt !== "string" || !ISO.test(proof.provedAt) || !Number.isFinite(Date.parse(proof.provedAt))) return "invalid proof: provedAt is not ISO 8601";
   if (typeof proof.provedEpoch !== "number" || !Number.isSafeInteger(proof.provedEpoch) || proof.provedEpoch < 0) return "invalid proof: provedEpoch";
@@ -572,8 +633,20 @@ const loadRegistry = (root: string, euid: number | undefined): Map<string, Reade
 };
 
 /** Why a parsed proof does not prove `backend` for this switch, or undefined. */
-const proofProblem = (proof: ReaderProof, backend: string, window: { fromEpoch: number; toEpoch: number }, now: number): string | undefined => {
+const proofProblem = (proof: ReaderProof, backend: string, window: { fromEpoch: number; toEpoch: number }, now: number,
+  bind?: NatsGateBind): string | undefined => {
   if (!proof.backends.includes(backend as ReaderBackend)) return `missing ${backend} (has ${proof.backends.join(",")})`;
+  if (backend === "nats") {
+    // A nats proof proves one staged stream of one switch on one target: every bound field must be the switch's.
+    if (!bind) return "a nats proof needs the switch binding (the gate has none)";
+    for (const field of BIND_FIELDS) {
+      if (proof[field] !== bind[field]) return `bound to another ${field}: proved ${JSON.stringify(proof[field])}, the switch has ${JSON.stringify(bind[field])}`;
+    }
+    if (bind.nonce === undefined) return "the switch's stream has no challenge nonce (an import begun before it: abandon it and import again)";
+    if (proof.challenge !== natsProofChallenge(bind.nonce, bind.switchId, proof.name, proof.release)) {
+      return "the challenge does not answer this switch's nonce for this reader (the proof did not read the staged stream)";
+    }
+  }
   // fromEpoch: proved before the switch; toEpoch: proved while this switch was in progress (a crashed importing).
   if (proof.provedEpoch < window.fromEpoch) return `stale: proved at epoch ${proof.provedEpoch}, the switch starts at ${window.fromEpoch}`;
   if (proof.provedEpoch !== window.fromEpoch && proof.provedEpoch !== window.toEpoch) {
@@ -591,7 +664,7 @@ const proofProblem = (proof: ReaderProof, backend: string, window: { fromEpoch: 
  * unreadable, not a directory, foreign-owned or group/other-writable.
  */
 export const readerReadiness = (root: string, backend: string, required: readonly RequiredReader[],
-  window: { fromEpoch: number; toEpoch: number }, now = Date.now(), euid = process.geteuid?.()): ReaderReadiness => {
+  window: { fromEpoch: number; toEpoch: number }, now = Date.now(), euid = process.geteuid?.(), bind?: NatsGateBind): ReaderReadiness => {
   // No POSIX owner (Windows): no proof or registry can be verified, so the gate refuses outright; the
   // caller turns this into a refusal no --accept-unready lifts (Windows ACL checks: smarty-dev#7548).
   if (euid === undefined) throw new Error("the readiness gate cannot verify reader proofs on this platform (no POSIX owner; Windows ACL checks: smarty-dev#7548)");
@@ -613,12 +686,12 @@ export const readerReadiness = (root: string, backend: string, required: readonl
         if (proof === undefined) reason = `no proof from installed reader ${reader.name} (release ${release})`;
         else if (typeof proof === "string") reason = proof;
         else if (proof.release !== release) reason = `release mismatch: proved ${proof.release}, installed ${release} (${reader.installRoot})`;
-        else reason = proofProblem(proof, backend, window, now);
+        else reason = proofProblem(proof, backend, window, now, bind);
       }
     } else {
       const candidates = [...proofs.values()].filter((proof): proof is ReaderProof =>
         typeof proof !== "string" && proof.implementation === FABRIC_IMPLEMENTATION && proof.release === reader.release);
-      const problems = candidates.map(proof => proofProblem(proof, backend, window, now));
+      const problems = candidates.map(proof => proofProblem(proof, backend, window, now, bind));
       if (candidates.length === 0) reason = `no proof from installed reader fabric release ${reader.release} (live: ${reader.writers.join("; ")})`;
       else if (!problems.includes(undefined)) reason = problems.join("; ");
     }
@@ -684,26 +757,93 @@ const provedRead = async (root: string, backend: ReaderBackend): Promise<number>
 };
 
 /**
+ * Where a `nats` proof reads: the staged stream S, and a port (tests) or this host's NATS connection settings: the same
+ * endpoint options the backend's open and the migration use (servers, monitoringUrl, tls, lookup, replicas, placement).
+ */
+export interface NatsProofTarget extends NatsEndpointOptions {
+  stream: string;
+  /** Host-only: accept a server that does not report `sync_always` (as openNatsStateBackend and the migration). */
+  acceptPeriodicSync?: boolean;
+}
+
+/** The staged stream must be this root's (fixed or per-switch, pi-fabric#937): checked before any connection. */
+const assertProofStreamForRoot = (root: string, stream: string): void => {
+  if (!isNatsStreamForRoot(root, stream)) throw new Error(`the NATS stream ${stream} is not this mesh root's: proof not written`);
+};
+
+/**
+ * smarty-dev#9690: the `nats` proof is a real read of the staged stream S through THIS release's backend: its own
+ * consumer (so the real permissions on S), its projector, on the proof-only path that may read while S is importing
+ * (writes still refuse). It binds what it read: the switch id of S's `import-begin`, S, S's creation time (unchanged
+ * across the read), the head, the full digest (entries, versions, tombstones, high water) and the target identity.
+ */
+const provedNatsRead = async (root: string, target: NatsProofTarget): Promise<{ entries: number; bind: NatsProofBind; nonce: string }> => {
+  assertProofStreamForRoot(root, target.stream);
+  // The backend's own endpoint path (pi-fabric#918 round 8): every URL validated (awaited) and plaintext ones pinned to
+  // their one loopback resolution before any connect; a remote server without authentication refused before any read.
+  const { acceptPeriodicSync, stream: _stream, ...endpoint } = target;
+  const { port, owned, server } = await connectNatsEndpoint(endpoint);
+  let backend: NatsStateBackend | undefined;
+  try {
+    assertNatsServerSupported(server.version);
+    if (server.syncAlways !== true && acceptPeriodicSync !== true) {
+      throw new Error(`nats-server does not report sync_always (got ${String(server.syncAlways)}): proof not written`);
+    }
+    assertNatsMaxPayload(server);
+    const identity = natsTargetOf(server);
+    if (identity === undefined) throw new Error("the NATS server does not report this user's account ($SYS.REQ.USER.INFO): proof not written");
+    const before = await port.streamInfo(target.stream);
+    if (!before) throw new Error(`the NATS stream ${target.stream} does not exist: proof not written`);
+    const begin = await port.getMessage(target.stream, 1);
+    const recorded = begin ? JSON.parse(Buffer.from(begin.data).toString("utf8")) as { type?: string; switch?: unknown; nonce?: unknown } : undefined;
+    const switchId = recorded?.switch;
+    if (typeof switchId !== "string") throw new Error(`the NATS stream ${target.stream} has no import-begin with a switch id: proof not written`);
+    if (typeof recorded?.nonce !== "string") throw new Error(`the NATS stream ${target.stream} has no challenge nonce: proof not written`);
+    const nonce = recorded.nonce;
+    backend = await NatsStateBackend.open({ port, stream: target.stream, subject: `${target.stream}.state`, snapshotSubject: `${target.stream}.snapshot`,
+      maxEventBytes: 1024 * 1024, create: false, readImporting: true, snapshotEvery: 0,
+      ...(target.replicas === undefined ? {} : { replicas: target.replicas }) });
+    const snapshot = backend.stateToken() as Parameters<typeof snapshotOf>[0];
+    const entries = backend.listAll("", { snapshot }).length;
+    if (entries !== snapshot.entries.size) throw new Error(`read ${entries} entries, the snapshot holds ${snapshot.entries.size}: proof not written`);
+    const after = await port.streamInfo(target.stream);
+    if (after?.created !== before.created) throw new Error(`the NATS stream ${target.stream} was recreated during the read: proof not written`);
+    return { entries, nonce, bind: { switchId, stream: target.stream, streamCreated: before.created, head: snapshot.seq,
+      digest: meshSnapshotDigest(snapshotOf(snapshot)), target: identity } };
+  } finally {
+    if (backend) backend.close(); // closes the port too
+    else if (owned) await port.close().catch(() => undefined);
+  }
+};
+
+/**
  * `reader-proof --backend B`: THIS Fabric release reads B for real, then writes `readers/<name>.json`
  * (default `fabric-<release>`) with its release, under the migration fence.
  */
 export const proveFabricReader = async (root: string, input: { backend: ReaderBackend; name?: string; version?: string; now?: Date;
+  /** `nats`: the staged stream and this host's connection (host flags, never read from the mesh directory). */
+  nats?: NatsProofTarget;
   /** Test hook: runs between the read and the epoch re-sample. */
   afterRead?: () => void }):
   Promise<{ file: string; proof: ReaderProof; entries: number }> => {
+  if (input.backend === "nats" && !input.nats) throw new Error("reader-proof --backend nats needs the staged stream (--stream) and the NATS servers");
   const release = ownFabricRelease();
   const name = input.name ?? `fabric-${release.slice(0, 40)}`.slice(0, 64);
   if (!isReaderName(name) || !name.startsWith("fabric")) throw new Error(`Bad Fabric reader name ${JSON.stringify(name)} (fabric*, letters, digits, . _ -)`);
+  // pi-fabric#937: a foreign root's stream is never proven, refused before the fence or any connection.
+  if (input.backend === "nats") assertProofStreamForRoot(path.resolve(root), input.nats!.stream);
   // The fence first, then the epoch, the read and the epoch again: the proof records only an epoch that
   // bracketed the read (a switch needs the same fence, so a change means the read is not that epoch's).
   return holdMeshFence(root, { lockTimeoutMs: FENCE_MS }, async () => {
     const { epoch } = await meshBackendStatus(root);
-    const entries = await provedRead(root, input.backend);
+    const nats = input.backend === "nats" ? await provedNatsRead(path.resolve(root), input.nats!) : undefined;
+    const entries = nats ? nats.entries : await provedRead(root, input.backend);
     input.afterRead?.();
     const after = (await meshBackendStatus(root)).epoch;
     if (after !== epoch) throw new Error(`the mesh epoch changed during the read (${epoch} -> ${after}): proof not written`);
     const proof: ReaderProof = { name, implementation: FABRIC_IMPLEMENTATION, version: input.version ?? packageVersion(), release,
-      backends: [input.backend], provedAt: (input.now ?? new Date()).toISOString(), provedEpoch: epoch };
+      backends: [input.backend], provedAt: (input.now ?? new Date()).toISOString(), provedEpoch: epoch,
+      ...(nats ? { ...nats.bind, challenge: natsProofChallenge(nats.nonce, nats.bind.switchId, name, release) } : {}) };
     return { file: writeProof(root, proof), proof, entries };
   });
 };

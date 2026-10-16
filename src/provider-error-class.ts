@@ -130,9 +130,10 @@ export const classifyProviderError = (turn: FailedTurn | undefined): ProviderErr
     const short = head && code ? `${head}: ${code}` : head || code || (basis === "default" ? "unclassified" : "unknown provider error");
     return { retryable, ...(status === undefined ? {} : { status }), ...(type ? { type } : {}), ...(code ? { code } : {}), short, basis };
   };
-  if (body?.code === AFFINITY || body?.type === AFFINITY || body?.message?.includes(AFFINITY)) return verdict(false, "body");
+  const structuredAffinity = body?.code === AFFINITY || body?.type === AFFINITY;
   if (status !== undefined) {
     if (status === 408 || status === 429 || status >= 500) return verdict(true, "status");
+    if (structuredAffinity) return verdict(false, "body");
     const bodyType = body?.type ?? body?.code;
     if (status === 409) return bodyType !== undefined && NON_RETRYABLE_TYPES.has(bodyType) ? verdict(false, "body") : verdict(true, "status");
     if (bodyType !== undefined && RETRYABLE_TYPES.has(bodyType)) return verdict(true, "body");
@@ -141,10 +142,11 @@ export const classifyProviderError = (turn: FailedTurn | undefined): ProviderErr
     if (routingMiss(status, body, message)) return verdict(true, body ? "body" : "text");
     return verdict(false, bodyType === undefined ? "status" : "body");
   }
-  // ponytail: last resort, raw text. A message with no status or body (a gateway that drops both,
+  if (structuredAffinity) return verdict(false, "body");
+  // ponytail: last resort, raw text, only with no status and no body (a gateway that drops both,
   // a provider that rewrites the error) is matched on the gateway's exact error token only; any
   // other unstructured error is "default": backoff, but Main counts consecutive ones and alarms
   // after three (smarty-dev#8742), so an unrecognised dead provider is loud, not silent.
-  if (message.includes(AFFINITY)) return verdict(false, "text");
+  if (body === undefined && message.includes(AFFINITY)) return verdict(false, "text");
   return verdict(true, "default");
 };

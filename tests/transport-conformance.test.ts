@@ -10,7 +10,8 @@ import {
   adapterKinds, commandEnvelope, contractTiming, createStubBus, faultGate, FaultHooks,
   identity, loadControlPlane, loseNextPublishAck, openAdapter, owner, resolvedRetry, withFaults,
   type AdapterKind, type AdapterSpec, type CommandBody, type FabricTransport,
-  type StubTransport, type TransportDelivery, type TransportEnvelope, type TransportKvEvent,
+  type StubTransport, type TransportBucket, type TransportDelivery, type TransportEnvelope,
+  type TransportKvEntry, type TransportKvEvent,
 } from "./helpers/transport-harness.js";
 import type { ParticipantRoute as Route, ParticipantView as View } from "../src/topology/participant-view.js";
 
@@ -38,6 +39,14 @@ import type { ParticipantRoute as Route, ParticipantView as View } from "../src/
  *   T-MIX and nonzero-drain classification remain tests/transport-faults/ and canary obligations.
  * - §10.3 N={1,4,16,64}, 1 cmd/s/sender, 10 min/step, per-target/N p50/p95/p99, KV write rate,
  *   PubAck p95 and separate B3 latency belong to T-P95, not CI/stub latency assertions.
+ * - E6 T-READY on the stub proves §1 event ordering ONLY. Its snapshot is synchronously queued;
+ *   changing storage while that queue is consumed is not a real in-flight broker snapshot.
+ *   Scripted resetKvWatches() is NOT ordered-consumer reset/reconnect proof. Real NATS snapshot
+ *   races/reset/expiry require the explicit kvReadiness fixture below; required mode fails if absent.
+ * - E6 supersedes draft §4.4's isUpdate/keys() readiness recipe. Only the explicit ready event
+ *   completes a snapshot; neither its last put nor a keys()/get() result is a readiness barrier.
+ *   Actual A2 resolve() → DirectoryNotReadyError before initial ready and between reset/new ready
+ *   remains pending the real A2 watch/view composition API. No test-local directory stands in for it.
  * - No events port, automatic TTL takeover, file fallback or same-host isolation claim.
  */
 
@@ -56,7 +65,28 @@ interface Pair {
  * The default registry is empty: these dependencies are deliberately visible as skipped coverage.
  */
 interface Integration {
+  /** Fresh isolated cohort per test, including initially empty presence/leases buckets. */
   pair(): Promise<Pair>;
+  /** B-owned fixture operations on this pair's REAL ordered push watch, never event synthesis.
+   * These are test composition hooks, not guessed production exports. Missing hooks are explicit
+   * skipped coverage, or failures for mandatory NATS T-READY with FABRIC_TRANSPORT_REQUIRED=1.
+   * Hooks must honor their finite signal; releasing a held boundary must also be bounded.
+   */
+  kvReadiness?: {
+    /** Arm before watch(): hold its true snapshot-complete boundary, allowing snapshot puts out.
+     * Preserve the ordered source (including concurrent tombstones); do not replace/wrap the
+     * adapter with a second watch engine. release() is idempotent, including after signal abort.
+     */
+    holdSnapshot?(bucket: TransportBucket, prefix: string, signal: AbortSignal): Promise<{ release(): Promise<void> }>;
+    /** Reset the active ordered consumer for this bucket/prefix, not just the inbox connection.
+     * Resolve after injecting the real reset; public reset/snapshot/ready receipts are read below.
+     */
+    reset?(bucket: TransportBucket, prefix: string, signal: AbortSignal): Promise<void>;
+    /** Await actual server MaxAge expiry of this revision while the snapshot boundary is held.
+     * No fabricated gone, explicit delete, bucket-policy change or local fake timer as TTL proof.
+     */
+    expire?(bucket: TransportBucket, key: string, revision: number, signal: AbortSignal): Promise<void>;
+  };
   broker?: {
     restart(): Promise<void>; disconnect(): Promise<void>; reconnect(): Promise<void>;
     setCapacity(bytes: number): Promise<void>; alarmCodes(): Promise<readonly string[]>;
@@ -95,6 +125,21 @@ async function ready(iterator: AsyncIterator<TransportKvEvent>): Promise<Transpo
     if (event.type === "ready") return result;
   }
   throw new Error("watch did not become ready within 100 receipts");
+}
+/** Exact snapshot oracle, not a directory or a readiness implementation. No entry order assumed.
+ * In particular, the final put is still DATA; a separate next() must yield the marker.
+ */
+async function snapshotThenReady(iterator: AsyncIterator<TransportKvEvent>, expected: readonly TransportKvEntry[]): Promise<void> {
+  const entries: TransportKvEntry[] = [];
+  for (let i = 0; i < expected.length; i++) {
+    const event = await next(iterator);
+    expect(event.type, `snapshot entry ${i + 1}/${expected.length} must precede ready`).toBe("put");
+    if (event.type !== "put") throw new Error("snapshot ended before all entries were applied");
+    entries.push(event.entry);
+  }
+  const byKey = (a: TransportKvEntry, b: TransportKvEntry) => a.key.localeCompare(b.key);
+  expect(entries.sort(byKey)).toEqual([...expected].sort(byKey));
+  expect(await next(iterator), "snapshot completion is its own receipt").toEqual({ type: "ready" });
 }
 function stream(pair: Pair, signal: AbortSignal): AsyncIterator<Message> {
   return pair.receiver.inbox(signal)[Symbol.asyncIterator]();
@@ -196,6 +241,11 @@ async function control(pair: Pair, skip: Skip, handler?: FabricControlHandler) {
 }
 
 describe.each(adapterKinds)("transport conformance / %s", kind => {
+  function readinessCapability<T>(value: T | undefined, skip: Skip, reason: string): T {
+    if (value !== undefined) return value;
+    if (kind === "nats" && required) throw new Error(`mandatory NATS T-READY fixture missing: ${reason}`);
+    return skip(reason);
+  }
   function test(name: string, run: (pair: Pair, signal: AbortSignal, skip: Skip) => Promise<void>) {
     it(name, async context => {
       const skip: Skip = reason => { context.skip(reason); throw new Error("Vitest skip unexpectedly returned"); };
@@ -425,6 +475,146 @@ describe.each(adapterKinds)("transport conformance / %s", kind => {
     const pending = iterator.next(); const newer = await kv.put(key, "owner#one", { id: "two" }, revision);
     expect(await next({ next: () => pending })).toMatchObject({ type: "put", entry: { revision: newer } });
   });
+
+  test("T-READY empty bucket: explicit ready, then live puts without another ready", async (p, signal, skip) => {
+    if (kind === "file") skip("file adapter has no KV capability; T-READY is not file directory parity");
+    const kv = p.receiver.kv("presence"), machine = p.receiver.self.machine;
+    // Integration.pair() must supply empty isolated buckets; no keys() emptiness inference.
+    const iterator = kv.watch(`${machine}.>`, signal)[Symbol.asyncIterator]();
+    expect(await next(iterator), "an empty snapshot still has a completion receipt").toEqual({ type: "ready" });
+    const key = `${machine}.p.${nextId("ready-empty")}`, writer = "owner#ready-empty";
+    const first = await kv.put(key, writer, { generation: 1 }, 0, signal);
+    expect(await next(iterator)).toEqual({ type: "put", entry: { key, machine, owner: writer, value: { generation: 1 }, revision: first } });
+    const second = await kv.put(key, writer, { generation: 2 }, first, signal);
+    expect(await next(iterator)).toEqual({ type: "put", entry: { key, machine, owner: writer, value: { generation: 2 }, revision: second } });
+    // Live receipts fence the one marker without a silence/sleep assertion or background reader.
+  });
+
+  test("T-READY final snapshot entry is data: full snapshot, separate ready exactly once, then live", async (p, signal, skip) => {
+    if (kind === "file") skip("file adapter has no KV capability");
+    const kv = p.receiver.kv("presence"), machine = p.receiver.self.machine, writer = "owner#ready-snapshot";
+    const expected: TransportKvEntry[] = [];
+    for (let i = 0; i < 3; i++) {
+      const key = `${machine}.p.${nextId("ready-snapshot")}`, value = { id: i };
+      const revision = await kv.put(key, writer, value, 0, signal);
+      expected.push({ key, machine, owner: writer, value, revision });
+    }
+    const iterator = kv.watch(`${machine}.>`, signal)[Symbol.asyncIterator]();
+    await snapshotThenReady(iterator, expected);
+    const key = `${machine}.p.${nextId("ready-live")}`, revision = await kv.put(key, writer, { live: true }, 0, signal);
+    expect(await next(iterator), "no duplicate ready between snapshot and first live change")
+      .toEqual({ type: "put", entry: { key, machine, owner: writer, value: { live: true }, revision } });
+    expect(await kv.delete(key, revision, signal)).toBe(true);
+    expect(await next(iterator), "no extra ready after entering live mode").toMatchObject({ type: "gone", key, reason: "deleted" });
+  });
+
+  test("T-READY reset: reset precedes a fresh full snapshot and one new ready, never continuous readiness", async (p, signal, skip) => {
+    if (kind === "file") skip("file adapter has no KV capability");
+    const fixture = integrations[kind]?.kvReadiness;
+    const reset: (bucket: TransportBucket, prefix: string, signal: AbortSignal) => Promise<void> =
+      p.bus ? async () => { p.bus!.resetKvWatches(); }
+      : readinessCapability(fixture?.reset?.bind(fixture), skip,
+        "B real ordered-consumer reset hook absent; scripted stub reset is §1 ordering only");
+    const kv = p.receiver.kv("presence"), machine = p.receiver.self.machine, prefix = `${machine}.>`, writer = "owner#ready-reset";
+    const key = `${machine}.p.${nextId("ready-reset")}`, value = { generation: 1 };
+    const first = await kv.put(key, writer, value, 0, signal);
+    const iterator = kv.watch(prefix, signal)[Symbol.asyncIterator]();
+    await snapshotThenReady(iterator, [{ key, machine, owner: writer, value, revision: first }]);
+    const updated = { generation: 2 }, second = await kv.put(key, writer, updated, first, signal);
+    expect(await next(iterator)).toMatchObject({ type: "put", entry: { key, revision: second, value: updated } });
+    const other = `${machine}.p.${nextId("ready-reset-other")}`, otherValue = { generation: 3 };
+    const third = await kv.put(other, writer, otherValue, 0, signal);
+    expect(await next(iterator)).toMatchObject({ type: "put", entry: { key: other, revision: third } });
+    await reset("presence", prefix, AbortSignal.any([signal, AbortSignal.timeout(5_000)]));
+    expect(await next(iterator), "ready must be invalidated before any replacement snapshot data").toEqual({ type: "reset" });
+    await snapshotThenReady(iterator, [
+      { key, machine, owner: writer, value: updated, revision: second },
+      { key: other, machine, owner: writer, value: otherValue, revision: third },
+    ]);
+    expect(await kv.delete(other, third, signal)).toBe(true);
+    expect(await next(iterator), "the replacement ready occurs once, not again on a live delete")
+      .toMatchObject({ type: "gone", key: other, reason: "deleted" });
+    // A second reset must snapshot current storage, not replay the deleted old snapshot member.
+    await reset("presence", prefix, AbortSignal.any([signal, AbortSignal.timeout(5_000)]));
+    expect(await next(iterator)).toEqual({ type: "reset" });
+    await snapshotThenReady(iterator, [{ key, machine, owner: writer, value: updated, revision: second }]);
+    const final = await kv.put(key, writer, { generation: 4 }, second, signal);
+    expect(await next(iterator)).toMatchObject({ type: "put", entry: { key, revision: final, value: { generation: 4 } } });
+    // These are PORT receipts. Actual A2 resolve() must throw FABRIC_DIRECTORY_NOT_READY after
+    // reset until the new marker; testing that awaits the real watch/view composition fixture.
+  });
+
+  for (const reason of ["deleted", "expired"] as const) {
+    test(`T-READY ${reason} during snapshot: gone is retained before live puts, stale data cannot resurrect`, async (p, signal, skip) => {
+      if (kind === "file") skip("file adapter has no KV capability");
+      const fixture = integrations[kind]?.kvReadiness;
+      const holdSnapshot = p.bus ? undefined : readinessCapability(fixture?.holdSnapshot?.bind(fixture), skip,
+        "B ordered-push snapshot-boundary hold hook absent; no real concurrent snapshot proof");
+      const expire = reason === "expired" && !p.bus ? readinessCapability(fixture?.expire?.bind(fixture), skip,
+        "B real MaxAge-during-snapshot receipt hook absent; no synthetic expiry as broker proof") : undefined;
+      const bucket = reason === "expired" ? "leases" : "presence";
+      const kv = p.receiver.kv(bucket), machine = p.receiver.self.machine, prefix = `${machine}.>`;
+      const writer = "owner#ready-race", token = bucket === "leases" ? "h" : "p";
+      const expected: TransportKvEntry[] = [];
+      for (let i = 0; i < 3; i++) {
+        const key = `${machine}.${token}.${nextId("ready-race")}`, value = { generation: 1, id: i };
+        const revision = await kv.put(key, writer, value, 0, signal);
+        expected.push({ key, machine, owner: writer, value, revision });
+      }
+      // For a real adapter, arm B's actual boundary gate BEFORE opening the watch. For the stub,
+      // this is only a queued-snapshot interleaving: no gate, server, hidden-reset or timer proof.
+      const bounded = AbortSignal.any([signal, AbortSignal.timeout(Math.min(kv.ttlMs + 10_000, 30_000))]);
+      const held = holdSnapshot ? await holdSnapshot(bucket, prefix, bounded) : undefined;
+      try {
+        const iterator = kv.watch(prefix, signal)[Symbol.asyncIterator]();
+        const first = await next(iterator);
+        expect(first.type, "race must begin with snapshot data, not ready").toBe("put");
+        if (first.type !== "put") throw new Error("no snapshot entry available for concurrent mutation");
+        expect(expected).toContainEqual(first.entry);
+        // Mutate a DIFFERENT, still-unconsumed snapshot key. Mutating only the first key would
+        // miss an adapter replaying stale buffered data after applying a tombstone.
+        const victim = expected.find(entry => entry.key !== first.entry.key)!;
+        if (reason === "deleted") expect(await kv.delete(victim.key, victim.revision, signal)).toBe(true);
+        else if (p.bus) p.advance(kv.ttlMs + 1);
+        else await expire!(bucket, victim.key, victim.revision, bounded);
+        const liveKey = `${machine}.${token}.${nextId("ready-after-gone")}`, liveValue = { live: true };
+        const liveRevision = await kv.put(liveKey, writer, liveValue, 0, signal);
+        await held?.release();
+        const events: TransportKvEvent[] = [first];
+        let sawLive = false;
+        for (let i = 0; i < 20; i++) {
+          const event = await next(iterator); events.push(event);
+          expect(event.type, "a mutation during a held snapshot is not a watch reset").not.toBe("reset");
+          if (event.type === "put" && event.entry.key === liveKey) {
+            expect(event.entry).toEqual({ key: liveKey, machine, owner: writer, value: liveValue, revision: liveRevision });
+            sawLive = true; break;
+          }
+        }
+        expect(sawLive, "bounded live-put fence was not delivered").toBe(true);
+        expect(events.filter(event => event.type === "ready"), "one completion marker despite concurrent removal")
+          .toEqual([{ type: "ready" }]);
+        const goneAt = events.findIndex(event => event.type === "gone" && event.key === victim.key);
+        expect(goneAt, "gone must not be lost or deferred past the subsequent live put").toBeGreaterThan(0);
+        const gone = events[goneAt];
+        expect(gone).toMatchObject({ type: "gone", key: victim.key, machine, reason });
+        if (gone?.type !== "gone") throw new Error("missing snapshot-race tombstone");
+        expect(gone.revision).toBeGreaterThan(victim.revision);
+        expect(liveRevision).toBeGreaterThan(gone.revision);
+        expect(events.slice(goneAt + 1).filter(event => event.type === "put" && event.entry.key === victim.key),
+          "no buffered snapshot put may resurrect a key after its gone").toEqual([]);
+        expect(await kv.get(victim.key, signal)).toBeUndefined(); // Storage check, NOT readiness.
+        const replacement = { generation: 2, afterGone: true };
+        const replacementRevision = await kv.put(victim.key, writer, replacement, 0, signal);
+        expect(replacementRevision).toBeGreaterThan(liveRevision);
+        expect(await next(iterator), "only a new successful put may bring the removed key back")
+          .toEqual({ type: "put", entry: { key: victim.key, machine, owner: writer, value: replacement, revision: replacementRevision } });
+        const fenceRevision = await kv.put(liveKey, writer, { live: "after-replacement" }, liveRevision, signal);
+        expect(await next(iterator), "no late stale snapshot data or second ready after the replacement")
+          .toMatchObject({ type: "put", entry: { key: liveKey, revision: fenceRevision, value: { live: "after-replacement" } } });
+        expect(await kv.get(victim.key, signal)).toEqual({ key: victim.key, machine, owner: writer, value: replacement, revision: replacementRevision });
+      } finally { await held?.release(); }
+    });
+  }
 
   test("T15 delete/MaxAge expiry markers: gone reasons, machine and monotonic revisions", async (p, signal, skip) => {
     if (kind === "file") skip("file adapter has no KV capability");

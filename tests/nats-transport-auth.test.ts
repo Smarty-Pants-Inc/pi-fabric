@@ -8,6 +8,7 @@ import { ADVISORY_CAPTURE_STREAM, transportAdvisoryStreamSubject, transportInbox
 import { createPathBHarness, resolveNatsBinary, type PathBHarness } from "./helpers/nats-cluster.js";
 
 const binary = resolveNatsBinary();
+if (!binary && process.env.NATS_AUTH_REQUIRED === "1") throw new Error("NATS_AUTH_REQUIRED=1 but no nats-server executable was found");
 const MACHINE_A = "machine-a";
 const MACHINE_B = "machine-b";
 let harness: PathBHarness;
@@ -62,9 +63,14 @@ describe.skipIf(!binary)("authenticated Path B transport", () => {
     await connection.close();
   });
 
-  it("accepts the operator's narrower own-source ACK grant", async () => {
+  it("accepts the reserved report-only operator with fixed metadata rights and all-ACK denial", async () => {
     const connection = await openNatsConnection({ servers: harness.serverUrl, credentials: harness.users.maintainer.credsPath, machine: harness.users.maintainer.machine });
     await connection.close();
+  });
+
+  it("refuses bootstrap authority as the report-only operator despite a matching signed machine tag", async () => {
+    await expect(openNatsConnection({ servers: harness.serverUrl, credentials: harness.users.bootstrap.credsPath,
+      machine: harness.users.maintainer.machine })).rejects.toThrow("machine tag mismatch");
   });
 
   it.each([">", "fabric.>", "fabric.in.*.*.*.*.machine-b"])("refuses a server-expanded broader source grant: %s", async (grant) => {

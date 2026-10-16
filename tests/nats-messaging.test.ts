@@ -1,9 +1,9 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { createServer } from "node:net";
-import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { AckPolicy, DeliverPolicy, ReplayPolicy } from "@nats-io/jetstream";
 import { openNatsConnection } from "../src/transport/nats/connection.js";
 import {
@@ -13,6 +13,8 @@ import {
 } from "../src/transport/nats/kv.js";
 import { openNatsTransport } from "../src/transport/nats/inbox.js";
 import { consumeDeadLetters, type DeadLetterEnvelope } from "../src/transport/nats/dead-letter.js";
+import { runTransportAdmin } from "../src/transport/nats/admin.js";
+import { createPathBHarness, PATH_B_MACHINES, resolveNatsBinary } from "./helpers/nats-cluster.js";
 import { ensureTransportConsumer } from "../src/transport/nats/provision.js";
 import {
   transportAdvisoryStreamSubject,
@@ -21,7 +23,8 @@ import {
   transportInboxStream,
 } from "../src/transport/nats/subjects.js";
 
-const binary = process.env.NATS_BIN?.trim() || "/home/paul/.local/bin/nats-server";
+const binary = resolveNatsBinary() ?? "";
+if (!binary && process.env.NATS_AUTH_REQUIRED === "1") throw new Error("NATS_AUTH_REQUIRED=1 but no nats-server executable was found");
 const wait = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 const freePort = async (): Promise<number> => {
   const server = createServer();
@@ -50,7 +53,7 @@ let serverUrl = "";
 const transports: Array<{ close(): Promise<void> }> = [];
 
 beforeAll(async () => {
-  if (!existsSync(binary)) return;
+  if (!binary) return;
   root = mkdtempSync(path.join(process.env.TMPDIR || os.tmpdir(), "pi-fabric-nats-transport-"));
   mkdirSync(path.join(root, "store"), { mode: 0o700 });
   const port = await freePort();
@@ -72,7 +75,7 @@ afterAll(async () => {
   if (root) rmSync(root, { recursive: true, force: true });
 });
 
-describe.skipIf(!existsSync(binary))("real nats-server Path B module", () => {
+describe.skipIf(!binary)("real nats-server Path B module", () => {
   it("requires the USER.INFO machine check unless explicitly disabled", async () => {
     await expect(openNatsConnection({ servers: serverUrl, name: "test-user-info", machine: "ryzen1" })).rejects.toThrow();
     const connection = await openNatsConnection({ servers: serverUrl, name: "test-user-info-disabled", machine: "ryzen1", verifyMachine: false });
@@ -140,51 +143,64 @@ describe.skipIf(!existsSync(binary))("real nats-server Path B module", () => {
   });
 
   it("sends, dedupes, redelivers, confirms ACKs and captures max-delivery advisories", async () => {
-    const sender = await openNatsTransport({ servers: serverUrl, machine: "ryzen1", hostId: "sender-messages", verifyMachine: false });
-    const receiver = await openNatsTransport({ servers: serverUrl, machine: "ryzen2", hostId: "receiver-messages", verifyMachine: false });
-    transports.push(sender, receiver);
+    // This selected integration path uses actual role credentials and default USER.INFO verification.
+    const fixture = await createPathBHarness({ binary });
+    const opened: Array<{ close(): Promise<void> }> = [];
     const signal = new AbortController();
-    const iterator = receiver.inbox(signal.signal)[Symbol.asyncIterator]();
-    const envelope = {
-      id: "message-stable-id", kind: "command" as const, to: receiver.self, targetId: "target-messages", operation: "followUp",
-      from: { id: sender.self.hostId, name: "sender", kind: "main" as const }, body: { text: "real broker" },
-    };
-    const sent = await sender.send(envelope);
-    expect((await sender.send(envelope))).toMatchObject({ sequence: sent.sequence, duplicate: true });
-    const first = (await iterator.next()).value!;
-    expect(first).toMatchObject({ attempt: 1, sourceMachine: "ryzen1", sequence: sent.sequence, payload: { id: envelope.id } });
-    first.working();
-    first.nak();
-    const redelivered = (await iterator.next()).value!;
-    expect(redelivered.attempt).toBe(2);
-    await redelivered.ack();
-    expect(await receiver.drainState()).toEqual({ pending: 0, ackPending: 0 });
-
-    const duplicateIterator = receiver.inbox(signal.signal)[Symbol.asyncIterator]();
-    await expect(duplicateIterator.next()).rejects.toMatchObject({ code: "FABRIC_TRANSPORT_INVALID" });
-    const admin = await openNatsConnection({ servers: serverUrl, verifyMachine: false });
-    const dlqAbort = new AbortController();
-    const captured: DeadLetterEnvelope[] = [];
-    const capture = consumeDeadLetters({ manager: admin.manager, js: admin.js, machines: ["ryzen1", "ryzen2"],
-      signal: dlqAbort.signal, once: true, sink: { put: async (record) => { captured.push(record); } } });
     try {
+      vi.stubEnv("PI_FABRIC_MACHINE", fixture.users.bootstrap.machine);
+      vi.stubEnv("PI_FABRIC_NATS_SERVERS", fixture.serverUrl);
+      vi.stubEnv("PI_FABRIC_NATS_CREDENTIALS", fixture.users.bootstrap.credsPath);
+      await runTransportAdmin(["provision", "--machines", PATH_B_MACHINES.join(",")]);
+      vi.unstubAllEnvs();
+      const sender = await openNatsTransport({ servers: fixture.serverUrl, machine: "machine-a", hostId: "sender-messages",
+        credentials: fixture.users.machineA.credsPath });
+      opened.push(sender);
+      const receiver = await openNatsTransport({ servers: fixture.serverUrl, machine: "machine-b", hostId: "receiver-messages",
+        credentials: fixture.users.machineB.credsPath });
+      opened.push(receiver);
+      const operator = await openNatsConnection({ servers: fixture.serverUrl, machine: fixture.users.maintainer.machine,
+        credentials: fixture.users.maintainer.credsPath });
+      opened.push(operator);
+      expect((await operator.manager.consumers.info("FABRIC_ADV", "transport_dlq_operator")).config.ack_policy).toBe(AckPolicy.None);
+      const iterator = receiver.inbox(signal.signal)[Symbol.asyncIterator]();
+      const envelope = {
+        id: "message-stable-id", kind: "command" as const, to: receiver.self, targetId: "target-messages", operation: "followUp",
+        from: { id: sender.self.hostId, name: "sender", kind: "main" as const }, body: { text: "real broker" },
+      };
+      const sent = await sender.send(envelope);
+      expect((await sender.send(envelope))).toMatchObject({ sequence: sent.sequence, duplicate: true });
+      const first = (await iterator.next()).value!;
+      expect(first).toMatchObject({ attempt: 1, sourceMachine: "machine-a", sequence: sent.sequence, payload: { id: envelope.id } });
+      first.working();
+      first.nak();
+      const redelivered = (await iterator.next()).value!;
+      expect(redelivered.attempt).toBe(2);
+      await redelivered.ack();
+      expect(await receiver.drainState()).toEqual({ pending: 0, ackPending: 0 });
+      const duplicateIterator = receiver.inbox(signal.signal)[Symbol.asyncIterator]();
+      await expect(duplicateIterator.next()).rejects.toMatchObject({ code: "FABRIC_TRANSPORT_INVALID" });
+
       const doomed = await sender.send({ ...envelope, id: "message-max-deliveries" });
       for (let attempt = 1; attempt <= 5; attempt += 1) {
         const delivery = (await iterator.next()).value!;
         expect(delivery.attempt).toBe(attempt);
         delivery.nak();
       }
-      const pending = iterator.next();
-      expect(await capture).toBe(1);
-      expect(captured).toHaveLength(1);
-      expect(captured[0]).toMatchObject({ stream: "FABRIC_IN_ryzen2", streamSequence: doomed.sequence, originalExpired: false, deliveries: 5 });
+      const pending = iterator.next(); // Triggers the broker's standard exhaustion advisory.
+      const captured: DeadLetterEnvelope[] = [];
+      expect(await consumeDeadLetters({ manager: operator.manager, js: operator.js, machines: PATH_B_MACHINES,
+        signal: signal.signal, once: true, sink: { async put(record) { captured.push(record); } } })).toBe(1);
+      expect(captured).toEqual([{ stream: "FABRIC_IN_machine-b", consumer: transportDurableName(receiver.self.hostId),
+        stream_seq: doomed.sequence, deliveries: 5 }]);
       signal.abort();
       expect((await pending).done).toBe(true);
+      await iterator.return?.();
     } finally {
       signal.abort();
-      dlqAbort.abort();
-      await iterator.return?.();
-      await admin.close();
+      vi.unstubAllEnvs();
+      await Promise.all(opened.map((connection) => connection.close()));
+      await fixture.stop();
     }
   }, 30_000);
 

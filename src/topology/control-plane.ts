@@ -2612,7 +2612,9 @@ export class FabricControlPlane {
       this.#natsOutcomes.set(key, outcome);
       await this.#persistNatsOutcome(key, outcome);
     }
-    await this.#sendNatsAcknowledgement(context, acceptance, record.ownerIncarnation ?? null);
+    // The responder authenticates this attempt; the retained epoch is history, not ACK authority.
+    const replay = { ...acceptance, originalOwnerIncarnation: record.ownerIncarnation ?? null };
+    await this.#sendNatsAcknowledgement(context, replay);
   }
 
   #scheduleNatsSeenCleanup(expiresAt?: number): void {

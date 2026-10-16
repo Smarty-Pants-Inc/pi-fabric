@@ -288,6 +288,9 @@ jobs:
       - name: Publish retry deduplication on R3
         if: matrix.profile == 'cluster'
         run: bunx vitest run --retry=0 tests/state-backend-nats-publish-dedupe.test.ts
+      - name: Lost first pull recovery on R3
+        if: matrix.profile == 'cluster'
+        run: bunx vitest run --retry=0 tests/state-backend-nats-pull-recovery.test.ts
       - name: Server logs (all nodes)
         if: failure()
         shell: bash

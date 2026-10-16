@@ -13,7 +13,8 @@ import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import type { FabricInvocationContext } from "../src/protocol.js";
 import { AgentsProvider } from "../src/providers/agents-provider.js";
 import { MeshProvider } from "../src/providers/mesh-provider.js";
-import { RootInbox, rootInboxMessage, rootInboxSession } from "../src/topology/root-inbox.js";
+import { RootInbox, rootInboxSession as unsignedRootInboxSession } from "../src/topology/root-inbox.js";
+import { rootInboxMessage, rootInboxSession } from "./root-inbox-issued-fixture.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
 import { eventReceipts } from "../src/topology/root-inbox-shared.js";
 import { AgentMessageRouter } from "../src/providers/agents-message-router.js";
@@ -248,6 +249,7 @@ describe("round-1 native root inbox read provenance", () => {
       expect(batch.events).toHaveLength(mixed ? 2 : 1);
       const message = rootInboxMessage(batch.events);
       expect(message.details).toEqual({
+        nonce: expect.any(String),
         ids: batch.events.map(event => event.id),
         receipts: batch.events.flatMap(event => [
           ["", "event", event.id],
@@ -255,6 +257,8 @@ describe("round-1 native root inbox read provenance", () => {
         ].map(fields => createHash("sha256").update(JSON.stringify(fields)).digest("hex"))),
       });
       manager.appendCustomMessageEntry(message.customType, message.content, message.display, message.details);
+      // The same public carrier cannot settle work without its private issuer verifier.
+      expect((await inbox.next(unsignedRootInboxSession(manager.getEntries()))).events).toEqual(batch.events);
       expect((await inbox.next(rootInboxSession(manager.getEntries()))).events).toEqual([]);
       const result = await provider.invoke("publish", { topic: "team", text: mixed ? `${text}; head abc1234` : text }, invocation(manager));
       expect(result).toHaveProperty("notice", notice); // The self echo is not a read; the peer event is.

@@ -11,6 +11,11 @@ permissions:
 
 jobs:
   check:
+    # Real-broker suites belong to nats-state-conformance and nats-auth, not the
+    # generic affected/smoke selection on either platform. Scope this to check
+    # so the dedicated jobs keep their broker-required gates and explicit lists.
+    env:
+      FABRIC_TEST_SKIP_NATS: '1'
     strategy:
       fail-fast: false
       matrix:
@@ -404,7 +409,7 @@ jobs:
             tar -xzf "$archive"
           )
           echo "NATS_BIN=$stage/nats-server-v${version}-linux-amd64/nats-server" >> "$GITHUB_ENV"
-      - name: Hosted authenticated NATS T2/T8 slice
+      - name: Hosted authenticated NATS T2/T8 and Path B grants (source CLI)
         env:
           NATS_AUTH_REQUIRED: '1'
-        run: bunx vitest run tests/nats-auth-server.test.ts --retry=0
+        run: bunx vitest run tests/nats-auth-server.test.ts tests/nats-auth-path-b-*.test.ts --retry=0

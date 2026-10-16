@@ -7,6 +7,7 @@ import { detachedPreview } from "../core/preview.js";
 import type { FabricIncomingMessageMode } from "../config.js";
 import { safeText } from "./format.js";
 import { highlightCode } from "./highlight.js";
+import { deliveryIdentity } from "../topology/root-inbox-shared.js";
 
 export const INCOMING_MESSAGE_TYPES = [
   "pi-fabric-agent-message", // Includes mail.inbound follow-up notices.
@@ -120,8 +121,8 @@ class DeliveredDisplayIndex {
         // Work keys/refs claim work on the carrier's named topic only, as in root-inbox.ts
         // (#852 security P1); a carrier without data.topic hides no shadow by key or ref.
         const topic = typeof data.topic === "string" && data.topic.trim() ? data.topic.trim() : undefined;
-        if (typeof data.deliveryId === "string" && data.deliveryId) add("delivery", data.deliveryId);
-        else if (typeof data.messageId === "string" && data.messageId) add("id", data.messageId);
+        const identity = deliveryIdentity(data);
+        if (identity) add(identity.kind, identity.value);
         else if (typeof data.key === "string" && data.key.trim()) { if (topic) add("topic-key", JSON.stringify([topic, data.key.trim()])); }
         else if (typeof data.ref === "string" && data.ref.trim() && topic) add("topic-ref", JSON.stringify([topic, data.ref.trim()]));
       }

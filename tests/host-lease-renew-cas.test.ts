@@ -182,6 +182,28 @@ describe.each(["file", "sqlite"] as const)("%s host lease CAS", stateBackend => 
     fs.writeFileSync(path.join(lock, "owner"), `gate\n999999999\n1\n\n${physical.machineId}\n${physical.bootId}\n`);
     await renewHostLease(s.mesh, s.lease, { claim: true }); expect(s.read()).toEqual(s.lease);
   });
+  it("waits for initial lease preparation outside publication custody, then admits on release", async () => {
+    const s = setup(stateBackend); const lock = s.hold();
+    const publication = vi.fn();
+    const directory = new ParticipantDirectory(s.mesh, { enabled: true, hostId: s.lease.id, rootId: s.lease.rootId,
+      identity: { id: s.lease.identityId, name: "owner", kind: "agent" }, reapDeadHosts: false,
+      withPublicationFence: publish => { publication(); return publish(); } });
+    directories.push(directory);
+    let settled = false;
+    const starting = directory.start().finally(() => { settled = true; });
+    // Attach the failure observer before yielding: an eager renewal regression must
+    // fail this receipt rather than produce an unhandled startup rejection.
+    const admitted = expect(starting).resolves.toBeUndefined();
+    await new Promise(resolve => setTimeout(resolve, 10));
+    expect(settled).toBe(false);
+    expect(publication).not.toHaveBeenCalled();
+    expect(s.read()).toBeUndefined();
+    fs.renameSync(lock, `${lock}.fixture-released`);
+    await admitted;
+    expect(publication).toHaveBeenCalledOnce();
+    expect(s.read()).toMatchObject({ id: s.lease.id, identityId: s.lease.identityId });
+    expect(directory.canConsumeMesh()).toBe(true);
+  });
   it("close cancels a waiting directory preparation and publishes no lease", async () => {
     const s = setup(stateBackend); const lock = s.hold();
     const directory = new ParticipantDirectory(s.mesh, { enabled: true, hostId: s.lease.id, rootId: s.lease.rootId,

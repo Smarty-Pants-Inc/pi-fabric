@@ -1,4 +1,5 @@
 import path from "node:path";
+import { diagnostics } from "../core/diagnostics.js";
 import type { PiNativeMcpTools } from "./pi-native-mcp.js";
 import type {
   Runtime,
@@ -639,7 +640,8 @@ export class McpProvider implements FabricProvider {
             this.#servers.set(name, this.#toWorking(parsed, false));
           }
         }
-        console.warn(
+        diagnostics.warn(
+          "src/providers/mcp-provider.ts",
           "[pi-fabric] MCP config could not be parsed; serving last-known cached MCP tools.",
         );
       }

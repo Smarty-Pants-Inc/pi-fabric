@@ -241,6 +241,8 @@ export interface BridgeSide {
   subscribeChanges?(changed: (kind: BridgeChange) => void, failed: (error: Error) => void): (() => void) | undefined | Promise<(() => void) | undefined>;
   /** Reported hello version, required before a remote may use the pre-capability polling path. */
   readonly protocolVersion?: number | undefined;
+  /** An open, negotiated traffic lane remains usable despite a retained pending mirror. */
+  readonly pendingMirrorTraffic?: boolean;
   /** Optional v1 capability: old peers and sequence-only cursor files remain readable. */
   latestCursor?(): Promise<BridgeHead>;
   tail?(after: number, offset?: number): Promise<BridgeRead>;
@@ -613,7 +615,8 @@ export class StoreBridgeSide implements BridgeSide {
     for (const [index, event] of page.entries()) {
       if (event.sequence > after && isBridgedTopic(event) && !isRelayReceipt(event) &&
           !(event.verification === "bridge" && event.topic === "fabric.control.command" && !isObject(event.data)) && (!hasBridgeField(event) ||
-          (event.verification === "bridge" && bridgeStampOf(event)?.from !== this.peer && !hasHubHop(event)))) {
+          (event.verification === "bridge" && (event.topic === "fabric.control.command" || event.topic === "fabric.control.ack") &&
+            bridgeStampOf(event)?.from !== this.peer && !hasHubHop(event)))) {
         const size = Buffer.byteLength(JSON.stringify(event), "utf8");
         if (size > pageBytes) {
           skipped.push({ id: event.id, sequence: event.sequence, topic: event.topic, bytes: size });
@@ -1268,7 +1271,7 @@ export class StoreBridgeSide implements BridgeSide {
             // Keep the bounded sources' first-seen evidence until the file effect completes;
             // otherwise an evicted duplicate could reenter from disk with a later ordinal.
             historySeenFloor: history.firstSeen,
-            updatedAt: renewedAt, expiresAt: until, mirrorLease: 1, ...(mirror ? { mirror } : {}) });
+            updatedAt: renewedAt, expiresAt: until, ...(mirror ? { mirrorLease: 1, mirror } : {}) });
         }
         for (const participant of presence.participants) {
           const owner = hosts.get(participant.ownerHostId);
@@ -1534,6 +1537,14 @@ type RpcOp = "hello" | "latestSequence" | "latestCursor" | "tail" | "read" | "pr
 
 interface RpcRequest { id: number; op: RpcOp; args?: unknown }
 
+/** Diagnostic class only: never used to grant authority or bypass publication fences. */
+const rpcKind = (request: RpcRequest): string => {
+  const events = request.op === "publish" ? [request.args] : request.op === "publishBatch" && Array.isArray(request.args) ? request.args : [];
+  if (events.length && events.every(event => isObject(event) && event.topic === "fabric.control.command")) return "control";
+  if (events.length && events.every(event => isObject(event) && event.topic === "fabric.control.ack")) return "ack";
+  return request.op === "mirror" || request.op === "presence" ? request.op : events.length ? "publish" : "read";
+};
+
 const lines = (input: Readable, onLine: (line: string) => void, onEnd: (error?: Error) => void): void => {
   let buffered = "";
   input.setEncoding("utf8");
@@ -1566,9 +1577,13 @@ const lines = (input: Readable, onLine: (line: string) => void, onEnd: (error?: 
  * only the side operations above against its own mesh, and applies the same allow-list and the
  * pinned peer name to everything it is asked to write. Resolves when the input ends.
  */
-export const serveBridgeAgent = (side: StoreBridgeSide, input: Readable, output: Writable): Promise<void> =>
+export const serveBridgeAgent = (side: StoreBridgeSide, input: Readable, output: Writable,
+  debug?: (message: string) => void): Promise<void> =>
   new Promise((resolve) => {
-    let queue = Promise.resolve();
+    // As with run()'s independent directions (#9751), serialize only related work.
+    // hello fences later topology snapshots; all reads/publications retain one FIFO.
+    const queues = { topology: Promise.resolve(), traffic: Promise.resolve() };
+    const pending = debug ? { topology: 0, traffic: 0 } : undefined;
     let closed = false;
     let unsubscribe: (() => void) | undefined;
     const dispose = (): void => {
@@ -1584,36 +1599,43 @@ export const serveBridgeAgent = (side: StoreBridgeSide, input: Readable, output:
       closed = true;
       dispose(); // also dispose a subscription returned after a reentrant finish()
       if (wasClosed) return;
-      void queue.then(() => { dispose(); resolve(); });
+      void Promise.allSettled([queues.topology, queues.traffic]).then(() => { dispose(); resolve(); });
     };
     lines(
       input,
       (line) => {
-        const receivedAt = Date.now(); // Receiver clock BEFORE the serial dispatch/lock wait.
-        queue = queue.then(async () => {
-          if (closed) return; // stdin may have ended while this request was queued
-          let request: RpcRequest;
-          try {
-            request = JSON.parse(line) as RpcRequest;
-          } catch {
-            reply({ id: null, ok: false, error: "Malformed bridge request" });
-            return;
-          }
+        const receivedAt = Date.now(); // Receiver clock BEFORE either lane's dispatch/lock wait.
+        const queuedAt = debug ? performance.now() : 0;
+        let request: RpcRequest;
+        try {
+          request = JSON.parse(line) as RpcRequest;
+        } catch {
+          reply({ id: null, ok: false, error: "Malformed bridge request" });
+          return;
+        }
+        const lane = request?.op === "hello" || request?.op === "presence" || request?.op === "mirror" ? "topology" : "traffic";
+        // Requests ahead in THIS lane, including its in-service request; unrelated work
+        // must not inflate a traffic queue depth while a topology service is held.
+        const queueDepth = pending ? pending[lane]++ : 0;
+        queues[lane] = queues[lane].then(async () => {
+          if (closed) { if (pending) pending[lane]--; return; } // stdin ended while queued
+          const startedAt = debug ? performance.now() : 0;
+          let result: unknown;
           try {
             // Attach stdin listeners immediately, but prepare before the first hello/snapshot/write.
             // The store refuses rather than waits if a library caller already owns a bounded scope.
             await side.store.prepareLock();
             if (closed) { finish(); return; }
             if (request.op === "hello" && isObject(request.args) && request.args.changes === true && !unsubscribe) {
-              // Unsolicited frames, never a hanging wait RPC ahead of publish in this FIFO.
-              // Install before hello's response and all subsequent snapshot requests.
+              // Unsolicited frames, never a hanging wait RPC ahead of publish.
+              // This topology FIFO installs before hello's response and later snapshots.
               unsubscribe = side.subscribeChanges(
                 (kind) => reply({ notification: "change", kind }),
                 (error) => { reply({ notification: "failure", error: error.message }); input.destroy(error); finish(); },
               );
               if (closed) { finish(); return; }
             }
-            const result = await dispatch(side, request, receivedAt);
+            result = await dispatch(side, request, receivedAt);
             if (closed) { finish(); return; }
             reply({ id: request.id, ok: true, result });
           } catch (error) {
@@ -1630,6 +1652,18 @@ export const serveBridgeAgent = (side: StoreBridgeSide, input: Readable, output:
                 : isMeshSnapshotRetriesExhausted(error) ? { code: MESH_SNAPSHOT_RETRIES_EXHAUSTED_CODE }
                   : isMeshRetryableBusy(error) ? { code: MESH_LOCK_TIMEOUT_CODE } : {}),
             });
+          } finally {
+            if (debug) {
+              const endedAt = performance.now();
+              pending![lane]--;
+              const presence = request.op === "mirror" ? request.args : request.op === "presence" ? result : undefined;
+              debug(`bridge rpc ${JSON.stringify({ id: request.id, op: request.op, kind: rpcKind(request), queueDepth,
+                queuedAt, startedAt, endedAt, queueMs: startedAt - queuedAt, runMs: endedAt - startedAt,
+                requestBytes: Buffer.byteLength(line, "utf8"),
+                ...(isObject(presence) && Array.isArray(presence.hosts) && Array.isArray(presence.participants)
+                  ? { hosts: presence.hosts.length, participants: presence.participants.length,
+                    presenceBytes: Buffer.byteLength(JSON.stringify(presence), "utf8") } : {}) })}`);
+            }
           }
         });
       },
@@ -1668,7 +1702,7 @@ const dispatch = async (side: StoreBridgeSide, request: RpcRequest, receivedAt: 
     case "hello": return {
       version: isObject(request.args) && request.args.version === BRIDGE_PROTOCOL_VERSION
         ? BRIDGE_PROTOCOL_VERSION : LEGACY_BRIDGE_PROTOCOL_VERSION,
-      tail: true, publishBatch: typeof side.publishBatch === "function", changes: true,
+      tail: true, publishBatch: typeof side.publishBatch === "function", changes: true, independentRpc: true,
     };
     case "latestSequence": return side.latestSequence();
     case "latestCursor": return side.latestCursor();
@@ -1706,6 +1740,7 @@ const isBridgeRetryable = (error: unknown): boolean => error instanceof BridgeMi
 export class RemoteBridgeSide implements BridgeSide {
   #next = 1;
   #supportsTail = false;
+  #independentRpc = false;
   #protocolVersion: number | undefined;
   #changesReady: Promise<void> | undefined;
   readonly #subscribers = new Set<{ changed: (kind: BridgeChange) => void; failed: (error: Error) => void }>();
@@ -1797,9 +1832,11 @@ export class RemoteBridgeSide implements BridgeSide {
 
   #call<T>(op: RpcOp, args?: unknown): Promise<T> {
     if (this.#closed) return Promise.reject(this.#closed);
-    // The remote dispatches serially. Do not let queued reads/publications time out behind a
-    // slow mirror, or accumulate repeated mirrors whose late writes would refresh old data.
-    if (this.#mirrorPending) return Promise.reject(this.#mirrorPending.error);
+    // Legacy agents have one global FIFO. Negotiated agents can serve traffic while
+    // mirroring, but never enqueue more topology work behind the one pending mirror.
+    if (this.#mirrorPending && (!this.#independentRpc || op === "hello" || op === "presence" || op === "mirror")) {
+      return Promise.reject(this.#mirrorPending.error);
+    }
     const id = this.#next++;
     return new Promise<T>((resolve, reject) => {
       if (op === "mirror") this.#mirrorPending = { id, error: new BridgeMirrorDeferredError(false, this.callTimeoutMs) };
@@ -1821,9 +1858,12 @@ export class RemoteBridgeSide implements BridgeSide {
   }
 
   get protocolVersion(): number | undefined { return this.#protocolVersion; }
+  get pendingMirrorTraffic(): boolean {
+    return this.#independentRpc && this.#mirrorPending !== undefined && this.#closed === undefined;
+  }
 
   async hello(changes = false): Promise<void> {
-    const reply = await this.#call<{ version?: unknown; tail?: unknown; publishBatch?: unknown; changes?: unknown }>("hello", {
+    const reply = await this.#call<{ version?: unknown; tail?: unknown; publishBatch?: unknown; changes?: unknown; independentRpc?: unknown }>("hello", {
       version: BRIDGE_PROTOCOL_VERSION, ...(changes ? { changes: true } : {}),
     });
     if (reply?.version !== BRIDGE_PROTOCOL_VERSION && reply?.version !== LEGACY_BRIDGE_PROTOCOL_VERSION) {
@@ -1833,6 +1873,8 @@ export class RemoteBridgeSide implements BridgeSide {
       throw new Error(`Bridge agent changed protocol ${this.#protocolVersion} to ${reply.version}; refusing protocol downgrade`);
     }
     this.#protocolVersion = reply.version;
+    // Both ordinary hello and automatic notification setup negotiate dispatch isolation.
+    this.#independentRpc = reply.independentRpc === true;
     // Notification setup must not silently switch a caller's chosen read/publication mode.
     // The CLI explicitly negotiates tail/batch; manual legacy users may have disabled them.
     if (!changes) {
@@ -2396,7 +2438,24 @@ export class MeshBridge {
   /** Mirror each side's live roots into the other; concurrent callers share one pass. */
   syncPresence(): Promise<void> {
     if (this.#staleAdmission) return Promise.reject(this.#staleAdmission);
-    return this.#presenceSync ??= this.#syncPresence().finally(() => { this.#presenceSync = undefined; });
+    if (this.#presenceSync) {
+      this.options.debug?.("presence sync: joined in-flight pass");
+      return this.#presenceSync;
+    }
+    const startedAt = this.options.debug ? performance.now() : 0;
+    return this.#presenceSync = this.#syncPresence().finally(() => {
+      this.#presenceSync = undefined;
+      this.options.debug?.(`presence sync: settled after ${performance.now() - startedAt} ms`);
+    });
+  }
+
+  /** A pass already in flight may have sampled before this membership miss.
+   * Settle it, then request/join one new sample before treating absence as definitive.
+   * Failures still propagate; no polling or extra retry loop. */
+  async #refreshMembership(): Promise<void> {
+    const joined = this.#presenceSync !== undefined;
+    await this.syncPresence();
+    if (joined) await this.syncPresence();
   }
 
   async #syncPresence(): Promise<void> {
@@ -2412,6 +2471,7 @@ export class MeshBridge {
       participants: [...local.participants, ...relays.participants.map(record => ({ ...record, bridgeVia: this.options.localName }))],
     });
     if (outbound.dropped) this.#log(`presence: ${outbound.dropped} hosts pass the frame budget and are not mirrored`);
+    this.options.debug?.(`presence sync: inbound ${remote.hosts.length} hosts/${remote.participants.length} participants; outbound ${outbound.presence.hosts.length} hosts/${outbound.presence.participants.length} participants`);
     // Both settle before a failure is reported, so no local write outlives this pass.
     const results = await Promise.allSettled([this.options.remote.mirror(outbound.presence), this.options.local.mirror(remote, syncedAt)]);
     // A transient failure must not hide a simultaneous permanent/transport failure.
@@ -2507,6 +2567,12 @@ export class MeshBridge {
       (this.#legacyPolling && Date.now() - this.#presenceAt >= (this.options.presenceMs ?? DEFAULT_PRESENCE_MS));
   }
 
+  /** Only preemptive traffic refreshes may leave an active notification pass or its retained
+   * independent mirror slot alone. Missing/expired membership and commit refusals still refresh. */
+  #deferPreemptivePresence(): boolean {
+    return this.#notificationMode && (this.#presenceSync !== undefined || this.options.remote.pendingMirrorTraffic === true);
+  }
+
   /**
    * Who may be reached and who may speak across, read after the mirror step and again for every
    * page: only the peer's records this side holds now, still clear of every reserved hub id. A
@@ -2519,7 +2585,7 @@ export class MeshBridge {
     // A page/read/write can wait on the mesh lock longer than a mirrored lease.
     // Refresh once before denying stale authority, sharing the normal presence pass.
     // Store lock and transport call timeouts bound it; no retry loop or fresh-message RPC.
-    if (refreshIfStale && (this.#presenceDue() || this.#leaseVersion !== this.#syncedLeaseVersion ||
+    if (refreshIfStale && !this.#deferPreemptivePresence() && (this.#presenceDue() || this.#leaseVersion !== this.#syncedLeaseVersion ||
       (!this.#notificationMode && Date.now() - this.#presenceAt > DEFAULT_PRESENCE_MS))) await this.syncPresence();
     const [presence, owned] = await Promise.all([local.presence(), local.owned()]);
     return { local: presence, remote: admitPresence(owned, new Set(presence.reserved)) };
@@ -2675,8 +2741,9 @@ export class MeshBridge {
       if (Date.now() < membershipRetryAt && !graceDue) return { forwarded, dropped };
       delete this.#membershipRetryAt[direction];
       // Expiration invalidates the observation, never the event: sample again before rereading
-      // its unchanged source boundary. Failed/deferred mirrors retain that boundary too.
-      await this.syncPresence();
+      // its unchanged source boundary. A pre-existing pass alone cannot prove fresh absence.
+      // Failed/deferred mirrors retain that boundary too.
+      await this.#refreshMembership();
       passRefreshed = true;
     }
     if (direction === "toLocal" && this.#factoryWaiting) {
@@ -2697,7 +2764,7 @@ export class MeshBridge {
       // Reconcile latched origin changes/expiry even on a filtered page.
       const retainedRefresh = passRefreshed && retainedBoundary !== undefined && cursor.after < retainedBoundary &&
         this.#presenceVersion === this.#syncedPresenceVersion && this.#leaseVersion === this.#syncedLeaseVersion;
-      if (!retainedRefresh && this.#presenceDue()) {
+      if (!retainedRefresh && !this.#deferPreemptivePresence() && this.#presenceDue()) {
         await this.syncPresence();
         passRefreshed = true;
       }
@@ -2716,7 +2783,7 @@ export class MeshBridge {
         // legacy peers retain the single-event refresh/refusal path below.
         if (target.publishBatch && candidateLimit > 1 && page.events.length - index > 1 && !seen.has(event.id) &&
           !isRelayReceipt(event) && !this.#isRelayCommand(event, rules, direction)) {
-          if (this.#presenceDue()) {
+          if (!this.#deferPreemptivePresence() && this.#presenceDue()) {
             await this.syncPresence();
             passRefreshed = true;
             rules = await authority(false);
@@ -2788,8 +2855,8 @@ export class MeshBridge {
         const refresh = async (): Promise<void> => {
           refreshed = true;
           passRefreshed = true;
-          await this.syncPresence();
-          // This event gets one refresh, even if that pass itself waited on a lock.
+          await this.#refreshMembership();
+          // At most the pre-existing pass plus one new snapshot; then canonical authority.
           rules = await authority(false);
         };
         let reason = this.#refusal(event, rules, direction);
@@ -2823,7 +2890,7 @@ export class MeshBridge {
         }
         if (relayCommand && relaySenderAllowed) {
           if (!seen.has(event.id)) {
-            if (this.#presenceDue()) await refresh();
+            if (!this.#deferPreemptivePresence() && this.#presenceDue()) await refresh();
             const result = await this.#relayCommand(event, rules);
             if (result.pending) {
               this.#deferMembership(direction, event);
@@ -2852,7 +2919,7 @@ export class MeshBridge {
         } else if (!seen.has(event.id)) {
           // A long backlog still reconciles origin updates; a lapsed held mirror gets the
           // existing one-refresh commit refusal path, never an idle renewal timer.
-          if (this.#presenceDue()) {
+          if (!this.#deferPreemptivePresence() && this.#presenceDue()) {
             await this.syncPresence();
             passRefreshed = true;
           }

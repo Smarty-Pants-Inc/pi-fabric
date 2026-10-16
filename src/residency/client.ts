@@ -1,4 +1,5 @@
 import { snapshotTaskReturnAddress } from "../agents/task-return-address.js";
+import { diagnostics } from "../core/diagnostics.js";
 import { withFabricWakeAdmission, fabricWakeCause } from "../fabric-provenance.js";
 import { randomUUID } from "node:crypto";
 import { CompletionJournal, completionRecipientFromRun, completionConsumed, consumeCompletion, legacyCompletionConsumed, saveCompletion, type CompletionRecipient, type CompletionSummary } from "../agents/completion-journal.js";
@@ -561,6 +562,9 @@ export class ResidencyClient {
     const response = await this.#command({
       format: RESIDENT_HOST_FORMAT,
       operation: "createActor",
+      ...(typeof (request as { spawnRouterDecisionId?: unknown }).spawnRouterDecisionId === "string"
+        ? { routerCaller: { id: self.id, rootId: self.rootId, sessionId: self.sessionId ?? "",
+          ownerHostId: self.ownerHostId, ownerIdentityId: self.ownerIdentityId, kind: self.kind } } : {}),
       ...(idempotencyKey === undefined ? {} : { idempotencyKey }),
       requestId: randomUUID(),
       rootId: this.options.config.rootId,
@@ -1389,7 +1393,7 @@ export class ResidencyClient {
       const cause = (error as NodeJS.ErrnoException | undefined)?.code === "ENOSPC"
         ? "ENOSPC: inotify watch limit, not disk space (raise fs.inotify.max_user_watches)"
         : error instanceof Error ? error.message : String(error);
-      console.warn(`[pi-fabric] resident delivery: filesystem notifications failed for ${this.options.config.residencyRoot} (${cause}); ` +
+      diagnostics.warn("src/residency/client.ts", `[pi-fabric] resident delivery: filesystem notifications failed for ${this.options.config.residencyRoot} (${cause}); ` +
         `rescanned now and re-arming at most ${WATCH_REARM_ATTEMPTS} times with backoff. Normal operation has no polling; ` +
         "exhausted watches scan and re-arm once per minute.");
     }
@@ -1511,7 +1515,7 @@ export class ResidencyClient {
     } catch (error) {
       if (isMeshWriteDeferred(error)) throw error; // Let the owned background retry back off the outage.
       const diagnostic = `Fabric completion remains pending: ${String(error).slice(0, 1000)}`;
-      if (diagnostic !== this.#completionFault) console.warn(diagnostic);
+      if (diagnostic !== this.#completionFault) diagnostics.warn("src/residency/client.ts", diagnostic);
       this.#completionFault = diagnostic;
     }
   }

@@ -1129,22 +1129,63 @@ describe.each(adapterKinds)("transport conformance / %s", kind => {
     if (kind !== "file") skip("requires actual file adapter and integrated production control plane");
     const cp = await control(p, skip);
     try {
-      // Inject at the REAL MeshStore boundary after its native append has returned a positive
-      // event receipt. FileTransport.publish must reconcile this as persisted under frozen E1.
-      // This is a post-commit receipt failure, not a broker PubAck/connection failure simulation.
+      const [{ FileTransport }, { TransportUncertainError }] = await Promise.all([
+        import("../src/transport/file.js"), import("../src/transport/types.js"),
+      ]);
+      // FILE CP deliberately uses legacy publish, not generic send reconciliation.
+      // Inject only AFTER the real shared mesh append; never pre-label the error uncertain.
       const mesh = cp.sender.mesh, publish = mesh.publish.bind(mesh);
-      let injected = false;
+      const postAppendError = new Error("injected post-append wake/receipt timeout");
+      let injected = false, original: Awaited<ReturnType<typeof publish>> | undefined;
       const spy = vi.spyOn(mesh, "publish").mockImplementation(async input => {
         const event = await publish(input);
-        if (!injected && input.topic === "fabric.control.command") {
-          injected = true; throw new Error("injected post-append wake/receipt timeout");
+        if (!injected && input.topic === "fabric.control.command" && input.kind !== "cancel") {
+          expect(mesh.read({ topic: input.topic }).some(stored => stored.id === event.id)).toBe(true);
+          original ??= event;
+          injected = true; throw postAppendError;
         }
         return event;
       });
       try {
-        const key = nextId("E1"), first = await cp.request(key);
+        const key = nextId("E1");
+        await expect(cp.request(key)).rejects.toBe(postAppendError);
+        expect(injected).toBe(true); expect(original).toBeDefined();
+        const stored = original!;
+        const body = stored.data as import("../src/topology/control-plane.js").FabricControlCommand;
+        const adapter = p.raw!.sender;
+        expect(adapter).toBeInstanceOf(FileTransport);
+        expect((adapter as InstanceType<typeof FileTransport>).mesh).toBe(mesh);
+        // A fresh failure exercises actual send's append fence/readback using the CP's
+        // real immutable body and envelope. E1 permits a fresh native event id.
+        injected = false;
+        const portResult = await adapter.send({ id: body.commandId, kind: "command", operation: stored.kind,
+          to: p.raw!.receiver.self, targetId: body.targetId, from: stored.from,
+          ...(stored.principal ? { principal: stored.principal } : {}),
+          ...(stored.sender ? { sender: stored.sender } : {}), body }).then(
+          value => ({ value, error: undefined }), (error: unknown) => ({ value: undefined, error }));
+        expect(injected).toBe(true);
+        if (portResult.error !== undefined) {
+          expect(portResult.error).toBeInstanceOf(TransportUncertainError);
+          expect(portResult.error).toMatchObject({ code: "FABRIC_TRANSPORT_UNCERTAIN", id: body.commandId, resolvedBody: body });
+          expect(portResult.error).not.toHaveProperty("persisted", false);
+          expect(portResult.error).not.toHaveProperty("notDelivered", true);
+        } else {
+          expect(portResult.value?.sequence).toBeGreaterThan(0);
+          expect(portResult.value?.envelope.body).toEqual(body);
+        }
+        spy.mockRestore();
+        const first = await cp.request(key);
         expect(injected).toBe(true); expect(first).toMatchObject({ acknowledged: true });
         expect(await cp.request(key)).toEqual(first); expect(cp.admitted).toHaveLength(1);
+        const commands = mesh.read({ topic: "fabric.control.command", limit: 100 }).filter(event => event.kind !== "cancel");
+        expect(commands).toHaveLength(4); // legacy failure, send, CP retry, equal-outcome retry.
+        expect(new Set(commands.map(event => event.id)).size).toBe(4);
+        expect(new Set(commands.map(event => (event.data as typeof body).commandId))).toEqual(new Set([body.commandId]));
+        const acknowledgements = mesh.read({ topic: "fabric.control.ack", limit: 100 });
+        expect(acknowledgements.length).toBeGreaterThan(0);
+        const receipts = acknowledgements.map(event => event.data as { commandId: string; messageId: string });
+        expect(new Set(receipts.map(receipt => receipt.commandId))).toEqual(new Set([body.commandId]));
+        expect(new Set(receipts.map(receipt => receipt.messageId))).toEqual(new Set([first.messageId]));
       } finally { spy.mockRestore(); }
     } finally { await cp.close(); }
   });

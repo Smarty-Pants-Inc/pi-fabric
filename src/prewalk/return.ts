@@ -2,7 +2,7 @@ import type {
   ExtensionAPI,
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import { notifyDiagnostic, setPrewalkStatus } from "../core/diagnostics.js";
+import { isPrincipalDiagnostics, notifyDiagnostic, setPrewalkStatus } from "../core/diagnostics.js";
 import type { CompactRequestIntent } from "../core/compact-controller.js";
 import { assertPrewalkModelAllowed, setModelSafely, type PrewalkModelPolicy } from "./model-switch.js";
 import { FabricModelDeniedError } from "../core/model-policy.js";
@@ -27,7 +27,9 @@ const reportReturnRefusal = (
   options?: RestoreBorrowedInPlaceMainOptions,
 ): never => {
   if (error instanceof FabricModelDeniedError) {
-    setPrewalkStatus(context, `return refused → ${key}`);
+    setPrewalkStatus(context, `return refused → ${key}`, {
+      returnFailure: { model: key, reason: "policy refused" },
+    });
     notifyDiagnostic(context, "src/prewalk/return.ts", `Prewalk left Main on the executor: ${error.message}`, "error", options);
   }
   throw error;
@@ -152,7 +154,9 @@ export const restoreBorrowedInPlaceMain = async (
     throw error;
   }
   if (!model) {
-    setPrewalkStatus(context, `return failed → ${borrowed.returnModel}`);
+    setPrewalkStatus(context, `return failed → ${borrowed.returnModel}`, {
+      returnFailure: { model: borrowed.returnModel, reason: "model unavailable" },
+    });
     notifyDiagnostic(context, "src/prewalk/return.ts",
       `Prewalk left Main on the executor; could not restore unavailable model ${borrowed.returnModel}.`,
       "error",
@@ -169,7 +173,9 @@ export const restoreBorrowedInPlaceMain = async (
     throw error;
   }
   if (!restored) {
-    setPrewalkStatus(context, `return failed → ${borrowed.returnModel}`);
+    setPrewalkStatus(context, `return failed → ${borrowed.returnModel}`, {
+      returnFailure: { model: borrowed.returnModel, reason: "authentication failed" },
+    });
     notifyDiagnostic(context, "src/prewalk/return.ts",
       `Prewalk left Main on the executor; could not return to ${borrowed.returnModel}. Check model authentication.`,
       "error",
@@ -179,6 +185,9 @@ export const restoreBorrowedInPlaceMain = async (
   }
 
   if (recovered) controller.clearBorrowed();
+  // Recovery has no normal settlement status update. Clear its principal failure
+  // on success without changing the legacy nonprincipal recovery status.
+  if (isPrincipalDiagnostics()) setPrewalkStatus(context, undefined);
   notifyDiagnostic(context, "src/prewalk/return.ts", `Restored Main to ${borrowed.returnModel} after in-place prewalk.`, "info", options);
   return true;
 };
@@ -205,7 +214,9 @@ export const settleInPlacePrewalk = async (
     // session start or /fabric reload can still restore Main. Repeated settle
     // calls find no continuation and stay quiet.
     controller.cancel();
-    setPrewalkStatus(context, `return failed → ${settlement.returnModel}`);
+    setPrewalkStatus(context, `return failed → ${settlement.returnModel}`, {
+      returnFailure: { model: settlement.returnModel, reason: "model unavailable" },
+    });
     notifyDiagnostic(context, "src/prewalk/return.ts",
       `Prewalk completed, but Main could not return to unavailable model ${settlement.returnModel}.`,
       "error",
@@ -243,7 +254,9 @@ export const settleInPlacePrewalk = async (
     // session start or /fabric reload can still restore Main. Repeated settle
     // calls find no continuation and stay quiet.
     controller.cancel();
-    setPrewalkStatus(context, `return failed → ${settlement.returnModel}`);
+    setPrewalkStatus(context, `return failed → ${settlement.returnModel}`, {
+      returnFailure: { model: settlement.returnModel, reason: "authentication failed" },
+    });
     notifyDiagnostic(context, "src/prewalk/return.ts",
       `Prewalk completed, but Main could not return to ${settlement.returnModel}. Check model authentication.`,
       "error",

@@ -87,11 +87,26 @@ let draining: Promise<void> | undefined;
 let exitFlushRegistered = false;
 
 export const isPrincipalDiagnostics = (): boolean => process.env.SMARTY_ROLE?.startsWith("org-agent") === true;
-/** Background progress is not a reply to a principal's command. */
+/** Background progress stays quiet; an owed Main return failure must remain visible. */
 export const setPrewalkStatus = (
   context: { ui: { setStatus(key: string, text: string | undefined): void } },
   text: string | undefined,
-): void => context.ui.setStatus("fabric-prewalk", isPrincipalDiagnostics() ? undefined : text);
+  options: { returnFailure?: {
+    model: string;
+    reason: "model unavailable" | "authentication failed" | "policy refused";
+  } } = {},
+): void => {
+  if (!isPrincipalDiagnostics()) {
+    context.ui.setStatus("fabric-prewalk", text);
+    return;
+  }
+  const failure = options.returnFailure;
+  // Render only the captured model and a fixed reason, never a provider error.
+  const model = failure?.model.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ").trim() || "unknown model";
+  context.ui.setStatus("fabric-prewalk", failure
+    ? `RETURN FAILURE → ${model}: ${failure.reason} (Main remains on executor)`
+    : undefined);
+};
 
 export const fabricDiagnosticsFile = (id: string): string =>
   path.join(resolveAgentDir(), "fabric", "diagnostics", `${encodeURIComponent(id)}.jsonl`);

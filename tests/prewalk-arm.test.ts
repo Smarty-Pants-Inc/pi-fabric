@@ -3,6 +3,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import type { FabricPrewalkMode } from "../src/config.js";
 import type { FabricState } from "../src/fabric-state.js";
 import { armFabricPrewalkSession, autoArmFabricPrewalk } from "../src/prewalk/arm.js";
+import { setPrewalkStatus } from "../src/core/diagnostics.js";
 import { PrewalkController } from "../src/prewalk/controller.js";
 import { PREWALK_ARMED_MESSAGE_TYPE, prewalkArmedPrompt } from "../src/prewalk/messages.js";
 import type { FabricThinking } from "../src/thinking.js";
@@ -159,6 +160,21 @@ describe("armFabricPrewalkSession", () => {
 });
 
 describe("autoArmFabricPrewalk", () => {
+  it.each(["org-agent@x", "project-agent@x"])("hides only principal progress without changing legacy statuses (%s)", role => {
+    vi.stubEnv("SMARTY_ROLE", role);
+    const h = makeHarness();
+    for (const text of [
+      "running → anthropic/executor",
+      "continuing Main → anthropic/executor",
+      "returning Main → anthropic/frontier",
+      "armed → anthropic/executor",
+      undefined,
+    ]) {
+      setPrewalkStatus(h.context, text);
+      expect(h.setStatus).toHaveBeenLastCalledWith("fabric-prewalk", role.startsWith("org-agent") ? undefined : text);
+    }
+  });
+
   it.each(["org-agent-test", "org-agent-kate@x", undefined, "project-agent@x"])("keeps automatic status quiet only for principal role %s", async role => {
     vi.stubEnv("SMARTY_ROLE", role);
     const h = makeHarness({ model: "anthropic/executor" });

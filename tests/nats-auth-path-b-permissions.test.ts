@@ -1,0 +1,65 @@
+import { describe, expect, it } from "vitest";
+import { pathBRoleTemplate } from "../src/mesh/nats-auth/permissions.js";
+
+const matches = (pattern: string, subject: string): boolean => {
+  const p = pattern.split("."), s = subject.split(".");
+  for (let i = 0; i < p.length; i += 1) {
+    if (p[i] === ">") return s.length > i;
+    if (i >= s.length || (p[i] !== "*" && p[i] !== s[i])) return false;
+  }
+  return p.length === s.length;
+};
+const mayPublish = (template: ReturnType<typeof pathBRoleTemplate>, subject: string): boolean =>
+  template.pub.allow.some(pattern => matches(pattern, subject)) && !template.pub.deny.some(pattern => matches(pattern, subject));
+
+describe("Path B NATS grants", () => {
+  it("keeps agent application and API writes bound to its machine tag", () => {
+    const template = pathBRoleTemplate("agent", "ryzen1");
+    expect(mayPublish(template, "fabric.in.ryzen2.abcd.cmd.1234.ryzen1")).toBe(true);
+    expect(mayPublish(template, "fabric.in.ryzen2.abcd.cmd.1234.ryzen2")).toBe(false);
+    expect(mayPublish(template, "fabric.ev.ryzen1.fleet.work.topic")).toBe(false);
+    expect(mayPublish(template, "fabric.ev.ryzen2.fleet.work.topic")).toBe(false);
+    expect(mayPublish(template, "$JS.API.CONSUMER.MSG.NEXT.FABRIC_IN_ryzen1.rt_x")).toBe(true);
+    expect(mayPublish(template, "$JS.API.CONSUMER.MSG.NEXT.FABRIC_IN_ryzen2.rt_x")).toBe(false);
+    expect(mayPublish(template, "$JS.ACK.FABRIC_IN_ryzen1.rt_x.1.1")).toBe(true);
+    expect(mayPublish(template, "$JS.ACK.FABRIC_IN_ryzen2.rt_x.1.1")).toBe(false);
+    expect(mayPublish(template, "$KV.fabric_presence.ryzen1.participant.x")).toBe(true);
+    expect(mayPublish(template, "$KV.fabric_presence.ryzen2.participant.x")).toBe(false);
+  });
+
+  it("refuses private inbox reads and all runtime stream administration", () => {
+    const template = pathBRoleTemplate("agent", "ryzen1");
+    for (const subject of [
+      "$JS.API.STREAM.MSG.GET.FABRIC_IN_ryzen1",
+      "$JS.API.DIRECT.GET.FABRIC_IN_ryzen1",
+      "$JS.API.STREAM.DELETE.FABRIC_IN_ryzen1",
+      "$JS.API.STREAM.CREATE.FABRIC_IN_ryzen1",
+      "$JS.API.CONSUMER.MSG.NEXT.FABRIC_ADV.operator",
+    ]) expect(mayPublish(template, subject), subject).toBe(false);
+    expect(template.pub.deny).not.toContain("$JS.API.STREAM.MSG.GET.FABRIC_IN_*");
+    expect(template.pub.deny).not.toContain("$JS.API.DIRECT.GET.FABRIC_IN_*.>");
+    expect(template.sub.allow).toEqual(["_INBOX.{{subject()}}.>"]);
+  });
+
+  it("gives the operator read and relay rights without stream lifecycle authority", () => {
+    const template = pathBRoleTemplate("maintainer", "ryzen1", ["ryzen2"]);
+    expect(mayPublish(template, "$JS.API.STREAM.CREATE.FABRIC_IN_ryzen2")).toBe(false);
+    expect(mayPublish(template, "$JS.API.STREAM.UPDATE.FABRIC_ADV")).toBe(false);
+    expect(mayPublish(template, "$JS.API.STREAM.INFO.FABRIC_IN_ryzen2")).toBe(true);
+    expect(mayPublish(template, "$JS.ACK.FABRIC_ADV.operator.1.1")).toBe(true);
+    expect(mayPublish(template, "$JS.API.STREAM.DELETE.FABRIC_IN_ryzen2")).toBe(false);
+    expect(mayPublish(template, "$JS.API.STREAM.PURGE.FABRIC_EV")).toBe(false);
+    expect(mayPublish(template, "fabric.in.ryzen2.owner.ack.target.ryzen1")).toBe(true);
+    expect(mayPublish(template, "fabric.in.ryzen2.owner.cmd.target.ryzen1")).toBe(false);
+    expect(mayPublish(template, "$JS.API.STREAM.MSG.DELETE.FABRIC_IN_ryzen2")).toBe(false);
+    expect(mayPublish(template, "$JS.API.DIRECT.GET.FABRIC_IN_ryzen2")).toBe(false);
+  });
+
+  it("rejects unsafe machine literals and keeps template values fresh", () => {
+    expect(() => pathBRoleTemplate("agent", "ryzen.1")).toThrow("invalid machine");
+    const first = pathBRoleTemplate("agent");
+    first.pub.allow.push("fabric.in.>");
+    expect(pathBRoleTemplate("agent").pub.allow).not.toContain("fabric.in.>");
+    expect(() => pathBRoleTemplate("other" as never, "ryzen1")).toThrow("invalid Path B role");
+  });
+});

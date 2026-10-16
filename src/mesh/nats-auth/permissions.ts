@@ -146,3 +146,122 @@ export function roleTemplate(role: NatsRole, input: RoleStreams): RoleTemplate {
     sub: { allow: [OWN_INBOX] },
   };
 }
+
+/** Path B machine grants. This stays separate from #7504 so old roleTemplate callers remain byte-for-byte stable. */
+export type PathBRole = "agent" | "maintainer";
+export interface PathBRoleTemplate extends RoleTemplate {}
+
+const PATH_B_MACHINE = /^[a-z0-9][a-z0-9-]{0,31}$/;
+const PATH_B_MACHINE_TAG = "{{tag(machine)}}";
+
+function pathBMachine(value: string): string {
+  if (value !== PATH_B_MACHINE_TAG && !PATH_B_MACHINE.test(value)) fail("machine");
+  return value;
+}
+
+function pathBUnique(values: string[]): string[] {
+  return [...new Set(values)];
+}
+
+function pathBRuntime(roleMachine: string, machines: readonly string[] = []): PathBRoleTemplate {
+  const inbox = `FABRIC_IN_${roleMachine}`;
+  const privateInboxes = roleMachine === PATH_B_MACHINE_TAG ? machines.map((machine) => `FABRIC_IN_${pathBMachine(machine)}`) : [inbox];
+  const ownInbox = `_INBOX.{{subject()}}.>`;
+  const allow = [
+    `fabric.in.*.*.*.*.${roleMachine}`,
+    `$JS.API.STREAM.INFO.${inbox}`,
+    ...["CREATE", "INFO", "MSG.NEXT", "DELETE"].map((verb) => `$JS.API.CONSUMER.${verb}.${inbox}.>`),
+    `$JS.ACK.${inbox}.>`,
+    `$KV.fabric_presence.${roleMachine}.>`,
+    `$KV.fabric_leases.${roleMachine}.>`,
+    "$JS.API.STREAM.INFO.KV_fabric_presence",
+    "$JS.API.STREAM.INFO.KV_fabric_leases",
+    "$JS.API.STREAM.MSG.GET.KV_fabric_presence",
+    "$JS.API.STREAM.MSG.GET.KV_fabric_leases",
+    ...["CREATE", "INFO", "DELETE"].flatMap((verb) => [
+      `$JS.API.CONSUMER.${verb}.KV_fabric_presence.>`,
+      `$JS.API.CONSUMER.${verb}.KV_fabric_leases.>`,
+    ]),
+    JS_INFO,
+    USER_INFO,
+  ];
+  const deny = [
+    "$JS.API.STREAM.CREATE.>",
+    "$JS.API.STREAM.UPDATE.>",
+    "$JS.API.STREAM.DELETE.>",
+    "$JS.API.STREAM.PURGE.>",
+    ...privateInboxes.map((stream) => `$JS.API.STREAM.MSG.GET.${stream}`),
+    "$JS.API.STREAM.MSG.DELETE.>",
+    "$JS.API.DIRECT.GET.>",
+    "$JS.API.CONSUMER.*.FABRIC_ADV.>",
+    "$JS.API.CONSUMER.MSG.NEXT.FABRIC_ADV.>",
+  ];
+  return { pub: { allow: pathBUnique(allow), deny }, sub: { allow: [ownInbox] } };
+}
+
+function pathBMaintainer(roleMachine: string, machines: readonly string[]): PathBRoleTemplate {
+  if (machines.length === 0) fail("machines");
+  const inboxes = machines.map((machine) => {
+    if (!PATH_B_MACHINE.test(machine)) fail("machines");
+    return `FABRIC_IN_${machine}`;
+  });
+  const allow = [
+    "$JS.API.STREAM.INFO.FABRIC_ADV",
+    "$JS.ACK.FABRIC_ADV.>",
+    "$JS.API.STREAM.INFO.FABRIC_EV",
+    ...inboxes.flatMap((stream) => [
+      `$JS.API.STREAM.INFO.${stream}`,
+      `$JS.API.STREAM.MSG.GET.${stream}`,
+    ]),
+    "$JS.API.STREAM.INFO.KV_fabric_presence",
+    "$JS.API.STREAM.MSG.GET.KV_fabric_presence",
+    "$JS.API.STREAM.INFO.KV_fabric_leases",
+    "$JS.API.STREAM.MSG.GET.KV_fabric_leases",
+    ...["CREATE", "INFO", "MSG.NEXT", "DELETE"].map((verb) => `$JS.API.CONSUMER.${verb}.FABRIC_ADV.>`),
+    ...inboxes.flatMap((stream) => [`$JS.API.CONSUMER.INFO.${stream}.>`]),
+    `fabric.in.*.*.ack.*.${roleMachine}`,
+    `fabric.ev.${roleMachine}.fabric.ops.>`,
+    JS_INFO,
+    USER_INFO,
+  ];
+  const deny = [
+    "$JS.API.STREAM.CREATE.>",
+    "$JS.API.STREAM.UPDATE.>",
+    "$JS.API.STREAM.DELETE.>",
+    "$JS.API.STREAM.PURGE.>",
+    ...inboxes.flatMap((stream) => [
+      `$JS.API.STREAM.MSG.DELETE.${stream}`,
+      `$JS.API.DIRECT.GET.${stream}`,
+      `$JS.API.DIRECT.GET.${stream}.>`,
+    ]),
+  ];
+  return { pub: { allow: pathBUnique(allow), deny }, sub: { allow: [`_INBOX.{{subject()}}.>`] } };
+}
+
+/** Compose Path B with the existing role only when the mint input explicitly opts in. */
+export function roleTemplateWithPathB(role: NatsRole, input: RoleStreams, machines: readonly string[] = []): RoleTemplate {
+  const base = roleTemplate(role, input);
+  if (role === "agent") {
+    const path = pathBRuntime(PATH_B_MACHINE_TAG, machines);
+    return {
+      pub: { allow: path.pub.allow, deny: pathBUnique([...base.pub.deny, ...path.pub.deny]) },
+      sub: { allow: path.sub.allow },
+    };
+  }
+  if (role === "maintainer") {
+    const path = pathBMaintainer(PATH_B_MACHINE_TAG, machines);
+    // The messaging operator must not inherit #7504's broad lifecycle grant.
+    // Keep the custody/liveness deny rows, but give it only its enumerated Path B rights.
+    return {
+      pub: { allow: path.pub.allow, deny: pathBUnique([...base.pub.deny, ...path.pub.deny]) },
+      sub: { allow: path.sub.allow },
+    };
+  }
+  return base;
+}
+
+export function pathBRoleTemplate(role: PathBRole, machine = PATH_B_MACHINE_TAG, machines: readonly string[] = []): PathBRoleTemplate {
+  if (role === "agent") return pathBRuntime(pathBMachine(machine), machines);
+  if (role === "maintainer") return pathBMaintainer(pathBMachine(machine), machines);
+  throw new Error("invalid Path B role");
+}

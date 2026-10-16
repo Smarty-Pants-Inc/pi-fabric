@@ -89,10 +89,23 @@ export const countUnknownEnodevStarts = (directories: readonly string[], actorId
   return { starts: highest, alarm };
 };
 
-/** The actor activation a run served: the top-level `id` of the item JSON its task carries (ActorManager#runRequest). */
+/** Host-authored first line of task.txt; input data cannot impersonate this manifest. */
+export const ACTOR_ACTIVATION_HEADER = "Fabric activation: ";
+
+/** The immutable activation ID, independent of whether the input is an object or array. */
 const activationOf = (directory: string): string | undefined => {
   try {
-    const quoted = /^  "id": ("(?:[^"\\]|\\.)*")$/m.exec(fs.readFileSync(path.join(directory, "task.txt"), "utf8"))?.[1];
+    const task = fs.readFileSync(path.join(directory, "task.txt"), "utf8");
+    if (task.startsWith(ACTOR_ACTIVATION_HEADER)) {
+      const manifest: unknown = JSON.parse(task.split("\n", 1)[0]!.slice(ACTOR_ACTIVATION_HEADER.length));
+      if (typeof manifest !== "object" || manifest === null || Array.isArray(manifest)) return undefined;
+      const { activationId, batchIds } = manifest as Record<string, unknown>;
+      return typeof activationId === "string" && activationId.length > 0 && Array.isArray(batchIds) &&
+        batchIds.length > 0 && batchIds[0] === activationId && batchIds.every(id => typeof id === "string" && id.length > 0) &&
+        new Set(batchIds).size === batchIds.length ? activationId : undefined;
+    }
+    // Legacy single-event tasks remain recoverable. Never fall back from a malformed manifest.
+    const quoted = /^  "id": ("(?:[^"\\]|\\.)*")$/m.exec(task)?.[1];
     return quoted === undefined ? undefined : JSON.parse(quoted) as string;
   } catch { return undefined; }
 };

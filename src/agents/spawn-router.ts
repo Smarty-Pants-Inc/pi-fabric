@@ -1,15 +1,38 @@
 import { diagnostics } from "../core/diagnostics.js";
 import { execFile, spawn } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { lstat, mkdir, open, rename } from "node:fs/promises";
 import { hostname } from "node:os";
 import path from "node:path";
+import { readPiSessionHeader } from "../core/pi-session-header.js";
 import { isFabricThinking, type FabricThinking } from "../thinking.js";
 import type { FabricAgentRouterConfig } from "./router-config.js";
 
 export interface SpawnRouterBinding { model?: string; thinking: FabricThinking }
+export interface SpawnRouterResult extends SpawnRouterBinding {
+  decisionId: string;
+  /** Only an enforce pick overrides the request; defaults remain dynamic. */
+  selected?: SpawnRouterBinding;
+}
 export interface SpawnRouterPick extends SpawnRouterBinding { model: string; reason?: string; policyVersion?: string }
+
+export interface SpawnRouterStartOptions {
+  meshRoot: string;
+  decisionId: string;
+  agentId: string;
+  sessionId: string | null;
+  /** Host-only seed/header lookup; never persisted in the ledger. */
+  sessionFile?: string;
+  model: string | null;
+  thinking: FabricThinking | null;
+  launch?: { runId: string | null; pid: number | null; processStartTime: string | null };
+  verified?: boolean;
+  evidenceRef?: string | null;
+}
+
+/** Fixed, privacy-safe code used when admission created no started record. */
+export const SPAWN_ROUTER_START_FAILED = "start-failed";
 export interface SpawnRouterRequest {
   kind: "spawn" | "actor";
   role: string;
@@ -102,6 +125,40 @@ const writeDecision = async (dir: string, record: string): Promise<void> => {
   finally { if (ledgerWrites.get(dir) === pending) ledgerWrites.delete(dir); }
 };
 
+const appendStartRecord = async (meshRoot: string, record: Record<string, unknown>): Promise<void> => {
+  try {
+    await writeDecision(path.join(meshRoot, "router"), `${JSON.stringify(record)}\n`);
+  } catch {
+    // A read-only/full mesh must not change or fail a spawn.
+    console.warn("[pi-fabric] spawn router decision log unavailable");
+  }
+};
+
+/** Append the applied binding after its agent/actor record exists. */
+export const recordSpawnRouterStart = async (options: SpawnRouterStartOptions): Promise<void> => {
+  let sessionId = options.sessionId;
+  if (options.sessionFile) {
+    try { sessionId = readPiSessionHeader(options.sessionFile)?.id ?? sessionId; } catch { /* No native session yet. */ }
+  }
+  await appendStartRecord(options.meshRoot, {
+    ts: new Date().toISOString(), kind: "start", decisionId: options.decisionId,
+    agentId: options.agentId, sessionId,
+    launch: options.launch ?? { runId: null, pid: null, processStartTime: null },
+    host: hostname(), model: options.model, thinking: options.thinking,
+    verified: options.verified === true, evidenceRef: options.evidenceRef ?? null,
+  });
+};
+
+/** Append one fixed, task-free failure when admission did not create a record. */
+export const recordSpawnRouterStartFailed = async (options: Pick<SpawnRouterStartOptions, "meshRoot" | "decisionId">): Promise<void> => {
+  await appendStartRecord(options.meshRoot, {
+    ts: new Date().toISOString(), kind: "start-failed", decisionId: options.decisionId,
+    agentId: null, sessionId: null, launch: { runId: null, pid: null, processStartTime: null },
+    host: hostname(), model: null, thinking: null, verified: false, evidenceRef: null,
+    error: SPAWN_ROUTER_START_FAILED,
+  });
+};
+
 // Join retirement, not close: descendants may retain inherited pipes forever.
 const runRouter = (command: string[], input: SpawnRouterRequest, timeoutMs: number, signal?: AbortSignal): Promise<string> =>
   new Promise((resolve, reject) => {
@@ -185,7 +242,7 @@ const runRouter = (command: string[], input: SpawnRouterRequest, timeoutMs: numb
     if (signal?.aborted) abort();
   });
 
-/** First-use adapter only. Undefined means preserve the original static binding. */
+/** First-use adapter only. Off returns no receipt; only selected overrides defaults. */
 export const routeAgentCreation = async (options: {
   config: FabricAgentRouterConfig;
   meshRoot: string;
@@ -202,7 +259,7 @@ export const routeAgentCreation = async (options: {
   explicit: boolean;
   validateModel: (model: string) => string;
   signal?: AbortSignal;
-}): Promise<SpawnRouterBinding | undefined> => {
+}): Promise<SpawnRouterResult | undefined> => {
   const config = options.config;
   const mode = config.mode ?? "off";
   if (mode !== "shadow" && mode !== "enforce") return undefined;
@@ -220,9 +277,8 @@ export const routeAgentCreation = async (options: {
     ...(options.complexity ? { requestedComplexity: options.complexity } : {}),
     host: hostname(), defaults: { model: options.defaults.model ?? null, thinking: options.defaults.thinking },
   };
-  // The digest joins request metadata without storing raw task text in the log.
-  const { task: _task, ...privateRequest } = request;
-  const requestDigest = digest(JSON.stringify(privateRequest));
+  // Identify policy commands without storing executable paths or arguments.
+  const commandDigest = digest(JSON.stringify(config.command));
   const started = performance.now();
   let pick: SpawnRouterPick | null = null;
   let actual = request.defaults;
@@ -254,10 +310,13 @@ export const routeAgentCreation = async (options: {
       error = cause instanceof Error ? cause.message : "router-error";
     }
   }
+  const decisionId = randomUUID();
   const decision = {
-    ts: new Date().toISOString(), requestDigest, kind: request.kind, mode,
+    ts: new Date().toISOString(), decisionId, kind: "decision", spawnKind: request.kind, mode, commandDigest,
     decision: options.explicit ? "explicit" : selected ? "enforce" : "default",
-    pick, actual, latencyMs: Math.round((performance.now() - started) * 1000) / 1000, error,
+    pick, requested: actual, actual, // `actual` is the one-release compatibility alias of `requested`.
+    fallbackReason: !options.explicit && !selected ? error : null,
+    latencyMs: Math.round((performance.now() - started) * 1000) / 1000, error,
   };
   try {
     const dir = path.join(options.meshRoot, "router");
@@ -266,5 +325,9 @@ export const routeAgentCreation = async (options: {
     // A read-only/full mesh must not change launch selection or fail the spawn.
     diagnostics.warn("src/agents/spawn-router.ts", "[pi-fabric] spawn router decision log unavailable");
   }
-  return selected;
+  const binding: SpawnRouterBinding = {
+    ...(actual.model ? { model: actual.model } : {}),
+    thinking: actual.thinking,
+  };
+  return { ...binding, decisionId, ...(selected ? { selected } : {}) };
 };

@@ -15,7 +15,7 @@ import path from "node:path";
 import type { FabricOwnedModelGuidance } from "../components/model-guidance.js";
 import type { FabricModelAliases, FabricModelCandidate } from "../core/model-resolution.js";
 import type { FabricActorsConfig, FabricAgentConfig, FabricMeshConfig, FabricRetentionConfig } from "../config.js";
-import type { FabricActorInfo, FabricActorCreateRequest, FabricActorBindingScope, FabricActorActivationFilter } from "../actors/types.js";
+import type { FabricActorInfo, FabricActorCreateRequest, FabricActorBindingScope, FabricActorActivationFilter, FabricActorBatching } from "../actors/types.js";
 import type { FabricThinking } from "../thinking.js";
 import type { AgentHandleInfo, AgentRunRequest, FabricRunOutcome } from "../agents/types.js";
 import type { FabricKernel, FabricResidentOutcomeReceipt } from "../runtime/kernel.js";
@@ -580,6 +580,7 @@ export type ResidentActorMutation =
   | { operation: "setTools"; id: string; tools: string[] }
   | { operation: "setModel"; id: string; model?: string; modelReason?: string; scope: FabricActorBindingScope }
   | { operation: "setThinking"; id: string; thinking?: FabricThinking; scope: FabricActorBindingScope }
+  | ({ operation: "setBatching"; id: string } & FabricActorBatching)
   | { operation: "setActivationFilter"; id: string; activationFilter: FabricActorActivationFilter | null; expiresAt?: number };
 
 type ResidentActorMutationCommand = ResidentActorMutation & {
@@ -638,7 +639,7 @@ export const residentCommandForOwner = (command: ResidentCommand, owner: Residen
 const LEGACY_RESIDENT_COMMANDS = ["spawn", "foreground", "cleanup", "createActor", "removeActor"] as const;
 export const RESIDENT_COMMANDS = [
   "spawnBound", "foreground", "cleanup", "createActor", "removeActor", "actors", "actorStatus", "slotStatus", "setInstructions", "setModel",
-  "setThinking", "setTools", "setActivationFilter", "resetSession", "stop", "releaseChange", "releaseDrain", "operatorActor",
+  "setThinking", "setTools", "setBatching", "setActivationFilter", "resetSession", "stop", "releaseChange", "releaseDrain", "operatorActor",
 ] as const satisfies readonly ResidentCommand["operation"][];
 
 export const isResidentCommandOperation = (operation: unknown): operation is ResidentCommand["operation"] =>

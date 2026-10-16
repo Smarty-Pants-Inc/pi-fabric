@@ -124,7 +124,7 @@ export class ResidentActorClient {
     return response.slotStatus;
   }
 
-  async createActor(request: FabricActorCreateRequest, signal?: AbortSignal, caller?: ResidentActorCaller): Promise<FabricActorInfo> {
+  async createActor(request: FabricActorCreateRequest, signal?: AbortSignal, caller?: ResidentActorCaller, onDispatched?: () => void): Promise<FabricActorInfo> {
     const { idempotencyKey, ...creationRequest } = request;
     const response = await this.#send({
       format: RESIDENT_HOST_FORMAT,
@@ -135,7 +135,7 @@ export class ResidentActorClient {
       request: creationRequest,
       ...(caller ? { caller } : {}),
       createdAt: Date.now(),
-    }, signal);
+    }, signal, onDispatched);
     if (!response.actor) throw new Error("Resident host returned no actor from createActor");
     return response.actor;
   }
@@ -166,7 +166,7 @@ export class ResidentActorClient {
       requestId: randomUUID(), rootId: this.#rootId, createdAt: Date.now() }, signal);
   }
 
-  async #send(command: ResidentCommand, signal?: AbortSignal): Promise<ResidentCommandResponse> {
+  async #send(command: ResidentCommand, signal?: AbortSignal, onDispatched?: () => void): Promise<ResidentCommandResponse> {
     // Do not pull the optional handover/artifact engine into idle proxy startup.
     const drainProtocol = command.operation === "releaseDrain" ? await import("./drain.js") : undefined;
     if (!this.isLive()) throw new Error("Root resident host is not live");
@@ -223,6 +223,8 @@ export class ResidentActorClient {
     try {
       throwIfAborted(signal);
       dispatched = true; // Publication failure may itself be ambiguous; never infer no effects.
+      // Host-only receipt custody follows the native publication fence.
+      try { onDispatched?.(); } catch { /* Observers cannot change dispatch. */ }
       writeJsonAtomic(path.join(this.#requestsPath, `${command.requestId}.json`), command);
       // Unref'd as before: a standalone caller (the fabric-actors CLI) keeps its own ref'd deadline timer.
       deadlineTimer = setTimeout(() => { expired = true; notify(); }, this.commandTimeoutMs);

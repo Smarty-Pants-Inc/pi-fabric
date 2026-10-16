@@ -288,7 +288,7 @@ export class ProcessTransport implements AgentTransportAdapter {
     request = { ...request, ...(needs !== undefined ? { needs } : {}), ...(requires !== undefined ? { requires } : {}) };
     const placement = this.#placement();
     if (placement) {
-      const preflightDeadline = Date.now() + Math.min(placement.commandTimeoutMs, 8_000);
+      const preflightDeadline = Date.now() + Math.min(placement.commandTimeoutMs, 5_000);
       const capabilities = normalizeAgentCapabilityTokens(placement.capabilities, "agents.placement.capabilities")!;
       const unmet = (needs ?? []).filter(need => !capabilities.includes(need));
       let reason = request.needs?.includes("local") ? "reserved need: local pins to the Main host"

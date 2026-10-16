@@ -7,6 +7,7 @@ import { isMeshRetryableBusy } from "../mesh/state-backend.js";
 import { cancellationError, preserveCancellationOutcome, runAbortable, settleWithin, shareCancellationEffects } from "../async-settlement.js";
 import { piBashExitMetadata } from "../core/pi-bash-error.js";
 import { FabricModelDeniedError } from "../core/model-policy.js";
+import { FabricModelNotServedError } from "../core/model-served-error.js";
 import { FabricTargetTerminalError } from "../agents/terminal-target.js";
 import { JevTransientHttpError } from "../jev/validation.js";
 import { PI_ARGUMENT_NORMALIZATION_SOURCE } from "../core/pi-arguments.js";
@@ -63,6 +64,7 @@ const guestFabricErrorMetadata = (error: unknown): Record<string, string | boole
   if (!(error instanceof Error)) return undefined;
   // Preserve only the fixed policy classification, never arbitrary Error fields.
   if (error instanceof FabricModelDeniedError) return { name: "FabricModelDeniedError", code: "FABRIC_MODEL_DENIED" };
+  if (error instanceof FabricModelNotServedError) return { name: "FabricModelNotServedError", code: "FABRIC_MODEL_NOT_SERVED" };
   if (error instanceof FabricTargetTerminalError) return {
     name: "FabricTargetTerminalError", code: "FABRIC_TARGET_TERMINAL",
     targetId: error.targetId, finalAnswerReceiptId: error.finalAnswerReceiptId,
@@ -608,6 +610,7 @@ globalThis.agents = Object.freeze({
   setNice: (args) => __call("agents.setNice", args),
   setInferenceContext: (args) => __call("agents.setInferenceContext", args),
   setCoalesceKey: (args) => __call("agents.setCoalesceKey", args),
+  setBatching: (args) => __call("agents.setBatching", args),
   setActivationFilter: (args) => __call("agents.setActivationFilter", args),
   setEvents: (args) => __call("agents.setEvents", args),
   setDeliveryPolicy: (args) => __call("agents.setDeliveryPolicy", args),

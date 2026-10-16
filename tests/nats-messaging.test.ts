@@ -4,6 +4,7 @@ import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:
 import os from "node:os";
 import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { AckPolicy, DeliverPolicy, ReplayPolicy } from "@nats-io/jetstream";
 import { openNatsConnection } from "../src/transport/nats/connection.js";
 import {
   LEASE_TTL_MS,
@@ -122,6 +123,21 @@ describe.skipIf(!existsSync(binary))("real nats-server Path B module", () => {
       await admin.close();
     }
   }, 30_000);
+
+  it("refuses a pre-existing runtime durable with a broader inbox filter", async () => {
+    const admin = await openNatsConnection({ servers: serverUrl, verifyMachine: false });
+    try {
+      const hostId = "runtime-drifted-consumer";
+      await admin.manager.consumers.add(transportInboxStream("ryzen1"), {
+        durable_name: transportDurableName(hostId), filter_subject: "fabric.in.ryzen1.>", ack_policy: AckPolicy.Explicit,
+        deliver_policy: DeliverPolicy.All,
+        replay_policy: ReplayPolicy.Instant,
+        ack_wait: 30_000_000_000, max_deliver: 5, backoff: [30_000_000_000, 30_000_000_000, 30_000_000_000, 30_000_000_000, 30_000_000_000], max_ack_pending: 128, max_waiting: 1,
+      });
+      await expect(openNatsTransport({ servers: serverUrl, machine: "ryzen1", hostId, verifyMachine: false })).rejects.toThrow("consumer configuration mismatch");
+      expect((await admin.manager.consumers.info(transportInboxStream("ryzen1"), transportDurableName(hostId))).config.filter_subject).toBe("fabric.in.ryzen1.>");
+    } finally { await admin.close(); }
+  });
 
   it("sends, dedupes, redelivers, confirms ACKs and captures max-delivery advisories", async () => {
     const sender = await openNatsTransport({ servers: serverUrl, machine: "ryzen1", hostId: "sender-messages", verifyMachine: false });

@@ -35,6 +35,8 @@ export interface PathBUsers {
 
 export interface PathBHarnessOptions {
   readonly binary?: string;
+  /** Deliberately misissued grants for fail-closed identity-check tests. */
+  readonly additionalAgentPublish?: readonly string[];
 }
 
 interface KeyPair {
@@ -226,8 +228,9 @@ export class PathBHarness {
         signerOf(operatorSigning),
         clock,
       );
+      const agentTemplate = pathBRoleTemplate("agent", "{{tag(machine)}}", PATH_B_MACHINES);
       const scopedKeys: ScopedSigningKey[] = [
-        { key: agentSigning.getPublicKey(), role: "agent", template: pathBRoleTemplate("agent", "{{tag(machine)}}", PATH_B_MACHINES) },
+        { key: agentSigning.getPublicKey(), role: "agent", template: { ...agentTemplate, pub: { ...agentTemplate.pub, allow: [...agentTemplate.pub.allow, ...(options.additionalAgentPublish ?? [])] } } },
         {
           key: maintainerSigning.getPublicKey(),
           role: "maintainer",

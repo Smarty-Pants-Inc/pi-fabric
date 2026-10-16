@@ -19,7 +19,9 @@ afterEach(async () => {
 });
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 const waitForStopped = async (child: { pid?: number | undefined }, deadline: number): Promise<void> => {
-  if (process.platform !== "linux" || child.pid === undefined) return;
+  if (process.platform !== "linux" || child.pid === undefined) {
+    throw new Error("NATS_STOP_PROOF_UNAVAILABLE: SIGSTOP stopped-state proof needs Linux /proc and an owned child PID");
+  }
   while (Date.now() < deadline) {
     try {
       const stat = fs.readFileSync(`/proc/${child.pid}/stat`, "utf8");
@@ -68,7 +70,8 @@ const observePeerElection = async (cluster: NatsElectionCluster, paused: string,
 };
 describe("real three-node NATS metadata-leader election", () => {
   // Keep: #11950/#13112's real R3-history / silent R1-receiver split, without changing CREATE or pull budgets.
-  it.skipIf(!binary)("bootstraps exact R3 history while the actual distinct R1 consumer host is paused before first NEXT", async () => {
+  // Skip reason off Linux: SIGSTOP stopped-state proof needs Linux /proc.
+  it.skipIf(process.platform !== "linux" || !binary)("bootstraps exact R3 history while the actual distinct R1 consumer host is paused before first NEXT", async () => {
     const cluster = await startNatsElectionCluster(binary!);
     clusters.push(cluster); // Existing afterEach owns native child exit/scratch receipts on every outcome.
     const [{ connect }, { jetstream, jetstreamManager }, { connectJetStream }] = await Promise.all([

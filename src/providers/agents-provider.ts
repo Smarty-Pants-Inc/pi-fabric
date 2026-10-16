@@ -12,7 +12,7 @@ import { ActorManager, ActorRegistryOwnershipError, parseBashTimeoutSeconds } fr
 import { slotAdmissionFor } from "../actors/slot-admission.js";
 import { participantProject, recordedProjectLead, repositoryOf, resolveProjectAgent } from "../topology/project-identity.js";
 import { GlobalActorRegistry } from "../actors/global-registry.js";
-import { isFabricActorHostEvent, FabricActorBatchPolicyError, normalizeActorActivation, normalizeActorBatching, validateActorCoalesceKey, validateActorDedupeKey, validateActorInferenceContext } from "../actors/types.js";
+import { isFabricActorHostEvent, FabricActorBatchPolicyError, normalizeDeadLetterReplayMaxAgeMs, normalizeActorActivation, normalizeActorBatching, validateActorCoalesceKey, validateActorDedupeKey, validateActorInferenceContext } from "../actors/types.js";
 import { normalizeActorSlotClaim } from "../actors/slot-claim.js";
 import { normalizeActorActivationFilter } from "../actors/activation-filter.js";
 import { normalizeActorRecords } from "../actors/records.js";
@@ -338,6 +338,7 @@ const actorRequest = (
   validateActorCoalesceKey(args.coalesceKey);
   validateActorDedupeKey(args.dedupeKey);
   const activation = normalizeActorActivation(args.activation);
+  const deadLetterReplayMaxAgeMs = normalizeDeadLetterReplayMaxAgeMs(args.deadLetterReplayMaxAgeMs);
   const batching = normalizeActorBatching(args);
   const slotClaim = normalizeActorSlotClaim(args.slotClaim);
   const activationFilter = args.activationFilter === undefined ? undefined : normalizeActorActivationFilter(args.activationFilter);
@@ -378,6 +379,7 @@ const actorRequest = (
     ...(activation ? { activation } : {}),
     ...batching,
     ...(activationFilter ? { activationFilter } : {}),
+    ...(deadLetterReplayMaxAgeMs !== undefined ? { deadLetterReplayMaxAgeMs } : {}),
     ...(args.routeClass !== undefined ? { routeClass: args.routeClass as "status-groom" } : {}),
     ...(typeof args.protected === "boolean" ? { protected: args.protected } : {}),
     ...(typeof args.idempotencyKey === "string" ? { idempotencyKey: args.idempotencyKey } : {}),
@@ -1652,16 +1654,18 @@ export class AgentsProvider implements FabricProvider {
       case "setActivationFilter": {
         if (args.activationFilter === undefined) throw new Error("activationFilter is required (a list of presets or rules, or null to clear)");
         const activationFilter = args.activationFilter === null ? null : normalizeActorActivationFilter(args.activationFilter);
+        const deadLetterReplayMaxAgeMs = normalizeDeadLetterReplayMaxAgeMs(args.deadLetterReplayMaxAgeMs);
+        const replayAge = deadLetterReplayMaxAgeMs === undefined ? {} : { deadLetterReplayMaxAgeMs };
         const expiresAt = args.expiresAt;
         if (expiresAt !== undefined && (typeof expiresAt !== "number" || !Number.isFinite(expiresAt))) throw new Error("expiresAt must be finite epoch milliseconds");
         if (args.scope === "global") {
           if (expiresAt !== undefined) throw new Error("expiresAt is only supported for live actors");
-          return this.globalActors.update(String(args.id), { activationFilter });
+          return this.globalActors.update(String(args.id), { activationFilter, ...replayAge });
         }
         const expiry = expiresAt === undefined ? {} : { expiresAt };
         const resident = await this.#residentActorOwner(String(args.id), context.signal);
-        if (resident) return this.#setResidentActor(resident, { operation: "setActivationFilter", id: resident.id, activationFilter, ...expiry }, context);
-        return this.actorManager.setActivationFilter(String(args.id), activationFilter, checkCommit, expiresAt as number | undefined);
+        if (resident) return this.#setResidentActor(resident, { operation: "setActivationFilter", id: resident.id, activationFilter, ...expiry, ...replayAge }, context);
+        return this.actorManager.setActivationFilter(String(args.id), activationFilter, checkCommit, expiresAt as number | undefined, deadLetterReplayMaxAgeMs);
       }
       case "setTopics": {
         if (args.scope !== undefined && args.scope !== "project" && args.scope !== "global") {

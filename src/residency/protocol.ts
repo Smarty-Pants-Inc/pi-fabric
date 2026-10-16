@@ -586,7 +586,7 @@ export type ResidentActorMutation =
   | { operation: "setModel"; id: string; model?: string; modelReason?: string; scope: FabricActorBindingScope }
   | { operation: "setThinking"; id: string; thinking?: FabricThinking; scope: FabricActorBindingScope }
   | ({ operation: "setBatching"; id: string } & FabricActorBatching)
-  | { operation: "setActivationFilter"; id: string; activationFilter: FabricActorActivationFilter | null; expiresAt?: number };
+  | { operation: "setActivationFilter"; id: string; activationFilter: FabricActorActivationFilter | null; expiresAt?: number; deadLetterReplayMaxAgeMs?: number };
 
 type ResidentActorMutationCommand = ResidentActorMutation & {
   caller?: ResidentActorCaller;

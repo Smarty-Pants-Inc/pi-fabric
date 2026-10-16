@@ -326,8 +326,12 @@ describe("root Main stays in the directory listing through a reload under lock l
     const kept = readHostLeases(f.meshRoot).get(identity.id)!;
     expect(kept.reloadUntil).toBe(kept.expiresAt);
     if (legacy) {
+      // Historical writers had neither the explicit reload deadline marker nor the
+      // ordinary host-TTL capability marker. Keeping hostTtl would fabricate a new
+      // ordinary long lease, which the reload recognizer correctly must not infer.
       const { reloadUntil: _reloadUntil, ...oldLease } = kept;
-      writeHostLease(f.meshRoot, oldLease);
+      const { hostTtl: _hostTtl, ...session } = oldLease.session!;
+      writeHostLease(f.meshRoot, { ...oldLease, session });
     }
     f.advance(kept.expiresAt - Date.now() - (legacy ? 5_000 : 15_000));
     const next = await reimport();

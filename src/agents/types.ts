@@ -200,6 +200,8 @@ export interface AgentCompactionStatus {
 }
 
 export interface AgentRunRecord {
+  /** Manager-owned durable intent distinguishing operator/deadline stops from worker checkpoints. */
+  stopIntent?: { reason: "explicit" | "deadline"; requestedAt: number };
   /** Canonical Fabric package root selected for the process worker at spawn time. */
   fabricRelease?: string;
   /** Admitted memory-capped task cgroup (smarty-dev#8257); absent when uncapped. */
@@ -230,6 +232,8 @@ export interface AgentRunRecord {
   /** True when the current input failed stable digest verification. */
   promptRetentionMismatch?: boolean;
   status: AgentRunStatus;
+  /** Native execution contact or exit is unconfirmed; logical status is unchanged. */
+  lostContact?: string;
   /** One-based FIFO admission position; present only while queued. */
   queuePosition?: number;
   runner: FabricAgentRunner;
@@ -512,6 +516,8 @@ export interface AgentTransportLaunch {
   placementLocalReason?: string | undefined;
   /** Report the default policy's actual local/remote launch boundary once; host-owned audit only. */
   onWritePolicyDisposition?: (disposition: "local" | "remote") => void;
+  /** Host-only carrier inheritance, after the worker environment is assembled. */
+  childEnvironment?: (environment: NodeJS.ProcessEnv) => NodeJS.ProcessEnv;
   /** Manager close or explicit run/actor revocation, never a returned queued receipt's guest deadline. */
   signal?: AbortSignal | undefined;
   /** Host activation generation check. Recheck after preparation, immediately before worker creation. */

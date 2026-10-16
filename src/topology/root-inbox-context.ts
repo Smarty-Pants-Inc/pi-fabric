@@ -1,12 +1,12 @@
-import { ROOT_INBOX_CUSTOM_TYPE } from "./root-inbox-shared.js";
+import { ROOT_INBOX_CUSTOM_TYPE, type RootInboxReceiptVerifier } from "./root-inbox-shared.js";
 
 /**
  * The model sees each root inbox event once (smarty-dev#8962). The inbox acks an event as soon as
  * its message enters a turn, but copies Pi had already queued before that ack (a second followUp
  * after a lease expiry, a nextTurn plus a followUp, a stale writer's read) are still injected and
  * kept in the session. Only the request changes here; the session keeps every message.
- * - The first copy of an event id in the context is kept: that is where the model saw it. Every
- *   later copy is dropped.
+ * - The first issued copy with a shown row is kept; later issued copies are dropped. Unverifiable
+ *   history cannot suppress work: possible redelivery is safer than loss (smarty-dev#12528).
  * - An acked event (acked id, or at or below the high-water mark) is dropped from every copy when the
  *   context no longer holds the copy that consumed it: compaction summarized a copy of it away.
  * - A mixed batch keeps its other events: only the dropped events are cut from it.
@@ -14,15 +14,18 @@ import { ROOT_INBOX_CUSTOM_TYPE } from "./root-inbox-shared.js";
  *   short line takes its place, so the request still ends on the user's side.
  */
 export interface RootInboxContextOptions {
+  /** Only the private issuer's shown-only snapshot may suppress another carrier. */
+  verifier: RootInboxReceiptVerifier;
   /** The root inbox acked this event: its id is in the acked set or its sequence at or below the mark. */
   acked: (id: string, sequence?: number) => boolean;
   /** Inbox copies per event id that compaction cut from the context; read only for an acked event. */
-  compactedCopies: () => ReadonlyMap<string, number>;
+  compactedCopies: (accepted: Set<string>) => ReadonlyMap<string, number>;
 }
 
 // Event text is XML-escaped (root-inbox.ts rootInboxMessage), so it cannot close an element early.
 const EVENT = /\n?<event id="([^"]*)" sequence="(\d+)"[\s\S]*?<\/event>/g;
 const OVERFLOW = /\n?<overflow count="\d+">[\s\S]*?<\/overflow>/;
+const OVERFLOW_COUNT = /<overflow count="(\d+)">/;
 const OVERFLOW_RANGE = /<overflow count="\d+">[^<]*?\(sequence (\d+)-(\d+)/;
 const HEADER = /<fabric-inbox count="\d+"(?: shown="\d+")?>/;
 const NOTHING_NEW = `<fabric-inbox count="0">Nothing new: this delivery repeated work events you already received.</fabric-inbox>`;
@@ -30,13 +33,15 @@ const NOTHING_NEW = `<fabric-inbox count="0">Nothing new: this delivery repeated
 const record = (value: unknown): Record<string, unknown> | undefined =>
   value && typeof value === "object" ? value as Record<string, unknown> : undefined;
 
-/** The event ids of a root inbox message, or undefined for any other message. */
-const inboxIds = (message: unknown): string[] | undefined => {
+/** Unissued history and ids without a shown row cannot hide genuine work (smarty-dev#12356). */
+const inboxIds = (message: unknown, verifier: RootInboxReceiptVerifier, accepted: Set<string>): string[] | undefined => {
   const fields = record(message);
   if (fields?.role !== "custom" && fields?.type !== "custom_message") return undefined;
   if (fields.customType !== ROOT_INBOX_CUSTOM_TYPE) return undefined;
-  const ids = record(fields.details)?.ids;
-  return Array.isArray(ids) ? [...new Set(ids.filter((id): id is string => typeof id === "string"))] : undefined;
+  const ids = verifier(fields.details, fields, accepted)?.ids;
+  if (!ids?.length) return undefined;
+  const shown = eventSequences(fields.content).shown;
+  return [...new Set(ids.filter((id) => shown.has(id)))];
 };
 
 const texts = (content: unknown): string[] => typeof content === "string" ? [content]
@@ -45,42 +50,54 @@ const texts = (content: unknown): string[] => typeof content === "string" ? [con
     return typeof text === "string" ? [text] : [];
   }) : [];
 
-/** Shown events carry their sequence; summarized ones get the overflow range's upper bound. */
-const eventSequences = (content: unknown): { shown: Map<string, number>; overflow?: number } => {
+/** Pending summary counts are independent of shown-only ids and legacy sequence bounds. */
+const eventSequences = (content: unknown): { shown: Map<string, number>; overflowCount: number; overflowSequence?: number } => {
   const shown = new Map<string, number>();
-  let overflow: number | undefined;
+  let overflowCount = 0;
+  let overflowSequence: number | undefined;
   for (const text of texts(content)) {
     for (const match of text.matchAll(EVENT)) shown.set(match[1]!, Number(match[2]));
+    const count = OVERFLOW_COUNT.exec(text);
+    if (count) overflowCount = Number(count[1]);
     const range = OVERFLOW_RANGE.exec(text);
-    if (range) overflow = Number(range[2]);
+    if (range) overflowSequence = Number(range[2]);
   }
-  return { shown, ...(overflow === undefined ? {} : { overflow }) };
+  return { shown, overflowCount, ...(overflowSequence === undefined ? {} : { overflowSequence }) };
 };
 
 /** How many root inbox copies of each event id these session entries (or messages) hold. */
-export const rootInboxCopies = (entries: readonly unknown[]): Map<string, number> => {
+export const rootInboxCopies = (
+  entries: readonly unknown[], verifier: RootInboxReceiptVerifier, accepted = new Set<string>(),
+): Map<string, number> => {
   const copies = new Map<string, number>();
-  for (const entry of entries) for (const id of inboxIds(entry) ?? []) copies.set(id, (copies.get(id) ?? 0) + 1);
+  for (const entry of entries) for (const id of inboxIds(entry, verifier, accepted) ?? []) copies.set(id, (copies.get(id) ?? 0) + 1);
   return copies;
 };
 
 /**
- * Inbox copies per event id that the latest compaction on this branch summarized out of the context:
- * every entry before its first kept entry, as Pi's buildContextEntries projects it.
+ * Count issuances wholly summarized out by the latest compaction, not serialized occurrences.
+ * A nonce authenticated anywhere in the retained branch cannot also prove a compacted copy.
  */
-export const rootInboxCompactedCopies = (branch: readonly unknown[]): Map<string, number> => {
+export const rootInboxCompactedCopies = (
+  branch: readonly unknown[], verifier: RootInboxReceiptVerifier, accepted = new Set<string>(),
+): Map<string, number> => {
   let compaction = -1;
   branch.forEach((entry, index) => { if (record(entry)?.type === "compaction") compaction = index; });
   if (compaction < 0) return new Map();
   const firstKept = record(branch[compaction])?.firstKeptEntryId;
   const kept = branch.findIndex((entry, index) => index < compaction && record(entry)?.id === firstKept);
-  return rootInboxCopies(branch.slice(0, kept < 0 ? compaction : kept));
+  const cut = kept < 0 ? compaction : kept;
+  // Retained-first accounting protects exact copies even outside a context traversal.
+  // Isolate this scan so branch evidence cannot spend later context messages' nonces.
+  const scan = new Set(accepted);
+  for (const entry of branch.slice(cut)) inboxIds(entry, verifier, scan);
+  return rootInboxCopies(branch.slice(0, cut), verifier, scan);
 };
 
-const cutEvents = (text: string, drop: ReadonlySet<string>, shown: number, overflow: number, dropOverflow: boolean): string => {
+const cutEvents = (text: string, drop: ReadonlySet<string>, shown: number, overflow: number): string => {
   let next = text.replace(EVENT, (element, id: string) => drop.has(id) ? "" : element);
-  if (dropOverflow) next = next.replace(OVERFLOW, "");
-  else next = next.replace(/<overflow count="\d+">\+\d+ more/, `<overflow count="${overflow}">+${overflow} more`);
+  // Removing shown duplicates cannot deliver or reduce the original pending summary.
+  if (overflow === 0) next = next.replace(OVERFLOW, "");
   return next.replace(HEADER, `<fabric-inbox count="${shown + overflow}"${overflow ? ` shown="${shown}"` : ""}>`);
 };
 
@@ -88,13 +105,13 @@ export const filterRootInboxContext = <Message>(
   messages: Message[],
   options: RootInboxContextOptions,
 ): { messages: Message[]; changed: boolean } => {
-  const copies = rootInboxCopies(messages);
-  if (!copies.size) return { messages, changed: false };
   let compacted: ReadonlyMap<string, number> | undefined;
+  // Compaction evidence inherits these accepted nonces without spending later context rows.
+  const accepted = new Set<string>();
   // Acked, and the copy that consumed it was compacted away: the model saw it before this context.
   const consumedEarlier = (id: string, sequence: number | undefined): boolean => {
     if (!options.acked(id, sequence)) return false;
-    compacted ??= options.compactedCopies();
+    compacted ??= options.compactedCopies(accepted);
     return (compacted.get(id) ?? 0) > 0;
   };
   const seen = new Set<string>();
@@ -102,7 +119,7 @@ export const filterRootInboxContext = <Message>(
   let changed = false;
   let droppedLast: Message | undefined;
   messages.forEach((message, index) => {
-    const ids = inboxIds(message);
+    const ids = inboxIds(message, options.verifier, accepted);
     if (!ids?.length) {
       filtered.push(message);
       return;
@@ -111,7 +128,7 @@ export const filterRootInboxContext = <Message>(
     const sequences = eventSequences(fields.content);
     const drop = new Set<string>();
     for (const id of ids) {
-      if (seen.has(id) || consumedEarlier(id, sequences.shown.get(id) ?? sequences.overflow)) drop.add(id);
+      if (seen.has(id) || consumedEarlier(id, sequences.shown.get(id) ?? sequences.overflowSequence)) drop.add(id);
       else seen.add(id);
     }
     if (!drop.size) {
@@ -119,14 +136,14 @@ export const filterRootInboxContext = <Message>(
       return;
     }
     changed = true;
-    if (drop.size === ids.length) {
+    if (drop.size === ids.length && sequences.overflowCount === 0) {
       if (index === messages.length - 1) droppedLast = message;
       return;
     }
     const kept = ids.filter((id) => !drop.has(id));
     const shown = kept.filter((id) => sequences.shown.has(id)).length;
-    const overflow = kept.length - shown;
-    const edit = (text: string) => cutEvents(text, drop, shown, overflow, overflow === 0);
+    const overflow = sequences.overflowCount;
+    const edit = (text: string) => cutEvents(text, drop, shown, overflow);
     const content = typeof fields.content === "string" ? edit(fields.content)
       : Array.isArray(fields.content) ? fields.content.map((part) => {
         const text = record(part)?.type === "text" ? record(part)!.text : undefined;

@@ -930,7 +930,7 @@ describe("ActorManager presence under a stalled mesh lock", () => {
     const start = vi.spyOn(ActorMeshMonitor.prototype, "start").mockImplementation(function (this: ActorMeshMonitor) {
       dispatch = this.callbacks.onEvent;
     });
-    const decisions = vi.fn((_id: string) => true as boolean | undefined);
+    const decisions = vi.fn((_id: string, _fresh?: boolean) => true as boolean | undefined);
     const schedule = vi.spyOn(ActorMeshMonitor.prototype, "schedule").mockImplementation(() => {});
     const ids: string[] = [];
     const snapshot = vi.fn((_fresh = true) => new Map(ids.map(id => [id, true])));
@@ -949,7 +949,7 @@ describe("ActorManager presence under a stalled mesh lock", () => {
         expect(decisions).toHaveBeenCalledTimes(batched ? 0 : 8);
         expect(snapshot).toHaveBeenCalledTimes(batched ? 1 : 0);
         if (batched) expect(snapshot).toHaveBeenCalledWith(true);
-        for (const call of decisions.mock.calls) expect(call).toHaveLength(1); // fresh authority
+        expect(decisions.mock.calls).toEqual(batched ? [] : ids.map(id => [id, true])); // exact fresh authority
         decisions.mockClear(); snapshot.mockClear();
         dispatch(event);
         expect(snapshot).not.toHaveBeenCalled();

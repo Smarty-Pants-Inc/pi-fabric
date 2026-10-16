@@ -753,9 +753,9 @@ export class SqliteStateBackend implements StateBackend {
       const bracket = fileRead ? bracketFileRead(fileRead) : undefined;
       const userPrepare = input.prepare;
       let claimsTouched = input.ops.some(op => op.key.startsWith("factory/review-slots/v1/"));
-      const prepare = fileRead || userPrepare ? (view: MeshBatchView): MeshBatchOperation[] => {
+      const prepare = fileRead || userPrepare ? (view: MeshBatchView, preparedFileRead = bracket?.value): MeshBatchOperation[] => {
         if (fileRead && (!bracket || fileRead.stamp() !== bracket.stamp)) throw FILE_READ_CHANGED;
-        const prepared = userPrepare?.(view, bracket?.value) ?? [];
+        const prepared = userPrepare?.(view, preparedFileRead) ?? [];
         claimsTouched ||= prepared.some(op => op.key.startsWith("factory/review-slots/v1/"));
         return prepared;
       } : undefined;

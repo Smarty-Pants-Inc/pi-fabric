@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { diagnostics } from "../core/diagnostics.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -899,7 +900,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     if (this.#degraded) return;
     this.#degraded = true;
     const ticks = Math.max(this.#retiredTicks, LIFECYCLE_LOST_TICKS + 1);
-    console.warn(`[pi-fabric] participant heartbeat: the session ctx it read was retired (reload or session replacement); ` +
+    diagnostics.warn("src/topology/participant-directory.ts", `[pi-fabric] participant heartbeat: the session ctx it read was retired (reload or session replacement); ` +
       `${this.options.hostId} is degraded and its heartbeat is stopped until a live session rebinds it.`);
     try { this.options.onLifecycleLost?.(ticks); } catch { /* the warning above already surfaced it */ }
   }
@@ -940,7 +941,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     }
     if (++this.#retiredTicks <= LIFECYCLE_LOST_TICKS || this.#degraded) return;
     this.#degraded = true;
-    console.warn(`[pi-fabric] participant heartbeat: no live session ctx for ${this.#retiredTicks} heartbeats; ` +
+    diagnostics.warn("src/topology/participant-directory.ts", `[pi-fabric] participant heartbeat: no live session ctx for ${this.#retiredTicks} heartbeats; ` +
       `${this.options.hostId} is degraded and its lease is not renewed until a live session rebinds it.`);
     try { this.options.onLifecycleLost?.(this.#retiredTicks); } catch { /* the warning above already surfaced it */ }
   }
@@ -1056,7 +1057,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       "its entries now lapse with their unrenewed lease";
     try {
       if (this.options.onWithdrawalFailure) this.options.onWithdrawalFailure(message);
-      else console.warn(`[pi-fabric] ${message}`);
+      else diagnostics.warn("src/topology/participant-directory.ts", `[pi-fabric] ${message}`);
     } catch { /* A diagnostic sink never fails close(). */ }
   }
 
@@ -2259,7 +2260,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       }
       return ops;
     }, (ops) => this.#withLeaseFence(() => this.mesh.writeBatch({ identity: this.options.identity, ops,
-      prepare: () => { assertHostLeaseOwner(this.mesh.root, leaseOwner); return []; } })));
+      beforeCommit: () => { assertHostLeaseOwner(this.mesh.root, leaseOwner); } })));
     // A superseded incarnation owns nothing left to lapse: its successor holds the lease.
     const failed = (reason: string): void => { if (!this.#superseded) this.#withdrawalFailure(reason); };
     // A reload leaves only its root and fixed host lease; the next session_start replaces both.
@@ -2700,12 +2701,15 @@ export class ParticipantDirectory implements FabricParticipantSource {
           expiresAt: this.#reloadUntil ?? leaseAt + this.#leaseMs,
         }),
       });
+      // Maintenance is independent of publication: select before custody, then retain exact
+      // row-version CAS and the fresh lease condition for each bounded candidate at commit.
+      ops.push(...compactExpiredHostRecords({ listAll: prefix => this.mesh.listAllShared(prefix, read) },
+        this.mesh.root, this.options.hostId));
       let committedAt = 0;
       const results = await this.#withLeaseFence(() => this.mesh.writeBatch({ identity: this.options.identity, ops,
-        prepare: view => {
+        beforeCommit: () => {
           assertHostLeaseOwner(this.mesh.root, this.#leaseFenceOwner());
           this.#assertRootPublishable(statePuts.get(keyFor(PARTICIPANT_PREFIX, this.options.rootId)));
-          return compactExpiredHostRecords(view, this.mesh.root, this.options.hostId);
         },
         // In-process bookkeeping only (no view, no file): it needs no state custody, so it runs as the
         // commit hook, after COMMIT on every backend. As afterCommit it cost SQLite a second

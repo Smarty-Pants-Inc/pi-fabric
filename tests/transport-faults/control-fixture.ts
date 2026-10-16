@@ -195,26 +195,40 @@ export const seenPrefix = "topology/control-seen/";
 export const seenKey = (hostId: string, id: string) => seenPrefix + createHash("sha256").update(`${hostId}\0${id}`).digest("hex");
 export const seenRoot = (root: string, hostId: string) => path.join(root, "control-seen", createHash("sha256").update(hostId).digest("hex").slice(0, 32));
 
-/** Spies surround ACTUAL MeshStore commits; they do not supply claims or outcomes. Supports
- * both source write paths (#putFenced's put and lease-fenced writeBatch). */
-export function persistedBoundary(root: string, hook: (phase: "before" | "after", value: Seen) => void | Promise<void>): () => void {
+/** Observe ACTUAL MeshStore commits, including E17's commit-time value callbacks.
+ * Never preview/restamp a callback: the backend invokes it once at its real CAS boundary,
+ * and receives its exact generated value. Before hooks are synchronous (no await under
+ * the store lock); an async delay belongs outside writeBatch, as in T-X3d. */
+export function persistedBoundary(root: string, hook: (phase: "before" | "after", value: Seen) => void): () => void {
   const match = (value: unknown): value is Seen => typeof value === "object" && value !== null &&
     Reflect.get(value, "format") === 1 && typeof Reflect.get(value, "commandId") === "string";
   const put = MeshStore.prototype.put;
   const putSpy = vi.spyOn(MeshStore.prototype, "put").mockImplementation(async function(this: MeshStore, input) {
     const watched = path.resolve(this.root) === path.resolve(root) && input.key.startsWith(seenPrefix) && match(input.value);
-    if (watched) await hook("before", input.value as Seen);
+    if (watched) hook("before", input.value as Seen);
     const result = await put.call(this, input);
-    if (watched) await hook("after", input.value as Seen);
+    if (watched) hook("after", input.value as Seen);
     return result;
   });
   const batch = MeshStore.prototype.writeBatch;
   const batchSpy = vi.spyOn(MeshStore.prototype, "writeBatch").mockImplementation(async function(this: MeshStore, input) {
-    const values = path.resolve(this.root) === path.resolve(root) ? input.ops.flatMap(op =>
-      op.kind === "put" && op.key.startsWith(seenPrefix) && match(op.value) ? [op.value] : []) : [];
-    for (const value of values) await hook("before", value);
-    const result = await batch.call(this, input);
-    for (const value of values) await hook("after", value);
+    if (path.resolve(this.root) !== path.resolve(root)) return batch.call(this, input);
+    const values: Seen[] = [];
+    const ops = input.ops.map(op => {
+      if (op.kind !== "put" || !op.key.startsWith(seenPrefix)) return op;
+      const original = op.value;
+      if (typeof original !== "function") {
+        if (match(original)) { hook("before", original); values.push(original); }
+        return op;
+      }
+      return { ...op, value: (writtenAt: number) => {
+        const value: unknown = original(writtenAt);
+        if (match(value)) { hook("before", value); values.push(value); }
+        return value;
+      } };
+    });
+    const result = await batch.call(this, { ...input, ops });
+    for (const value of values) hook("after", value);
     return result;
   });
   return () => { putSpy.mockRestore(); batchSpy.mockRestore(); };
@@ -267,7 +281,8 @@ export class ControlFixture {
     const mesh = new MeshStore(root, 64 * 1024, 1_000, { stateBackend: "file", lockProtocol: 1 }); this.stores.push(mesh);
     const options: InjectedOptions = { enabled: true, hostId: self.hostId, ownerIncarnation: incarnation,
       controlIncarnationFence: "enforce", pollMs: 20, acknowledgementTimeoutMs: 120_000,
-      transport: carrier.transport, participants, inboxLanes: this.lanes };
+      transport: carrier.transport, participants, inboxLanes: this.lanes,
+      ...(carrier.transport.kind === "nats" ? { relayOperatorMachine: "fabric-ops" } : {}) };
     const plane = new FabricControlPlane(mesh, identity(self.hostId), options); this.planes.push(plane);
     expect(carrierKind(plane), "A1 must USE the injected carrier, not silently use the file log").toBe(carrier.transport.kind);
     expect(Reflect.get(plane, "participantView"), "A1 must expose the injected frozen ParticipantView").toBe(participants);
@@ -304,11 +319,14 @@ export class ControlFixture {
       if (route.ownerHostId === this.receiverOwner.hostId) this.route(id, route.capabilities);
     }
   }
-  raw(id: string, options: { target?: string; operation?: string; timeoutMs?: number; message?: string; incarnation?: string } = {}): TransportEnvelope {
-    return commandEnvelope({ id, to: this.receiverOwner, from: identity(this.senderOwner.hostId),
+  // Raw scenarios may intentionally choose equal ids; request() never does. eventId lets
+  // boundary tests exercise distinct ids without rewriting any generated semantic body fields.
+  raw(commandId: string, options: { eventId?: string; target?: string; operation?: string; timeoutMs?: number; message?: string; incarnation?: string } = {}): TransportEnvelope {
+    const envelope = commandEnvelope({ id: commandId, to: this.receiverOwner, from: identity(this.senderOwner.hostId),
       targetId: options.target ?? this.receiverOwner.hostId, operation: options.operation ?? "followUp",
       ownerIncarnation: options.incarnation ?? this.receiver.incarnation, timeoutMs: options.timeoutMs ?? 120_000,
       message: options.message ?? "control fault input" });
+    return { ...envelope, id: options.eventId ?? commandId };
   }
   async publish(envelope: TransportEnvelope): Promise<ResolvedEnvelope> {
     return (await this.senderCarrier.transport.send(envelope)).envelope;
@@ -316,15 +334,17 @@ export class ControlFixture {
   replay(envelope: ResolvedEnvelope, attempt = 2) {
     return this.receiverCarrier.raw.enqueue(envelope, { sourceMachine: this.senderOwner.machine, verification: "bridge", attempt });
   }
-  async ack(id: string, count = 1): Promise<Record<string, unknown>> {
-    return objectBody((await this.receiverCarrier.sent.wait(sent => sent.envelope.kind === "ack" && sent.id === `ack:${id}`, `ACK PubAck ${id}`, count)).envelope);
+  // Carrier receipts are keyed by commandEventId; no logical-id remapping here.
+  async ack(commandEventId: string, count = 1): Promise<Record<string, unknown>> {
+    return objectBody((await this.receiverCarrier.sent.wait(sent => sent.envelope.kind === "ack" && sent.id === `ack:${commandEventId}`, `ACK PubAck ${commandEventId}`, count)).envelope);
   }
-  async settled(id: string, count = 1): Promise<void> {
-    await this.receiverCarrier.acked.wait(receipt => receipt.id === id, `broker ack ${id}`, count);
+  async settled(commandEventId: string, count = 1): Promise<void> {
+    await this.receiverCarrier.acked.wait(receipt => receipt.id === commandEventId, `broker ack ${commandEventId}`, count);
   }
-  seen(id: string): Seen | undefined {
+  // Native custody/control-seen are keyed by logical commandId, not the carrier id.
+  seen(commandId: string): Seen | undefined {
     const store = new MeshStore(seenRoot(this.meshRoot, this.receiverOwner.hostId), 64 * 1024, 1_000, { stateBackend: "file", lockProtocol: 1 });
-    try { return store.get(seenKey(this.receiverOwner.hostId, id), { fresh: true })?.value as Seen | undefined; }
+    try { return store.get(seenKey(this.receiverOwner.hostId, commandId), { fresh: true })?.value as Seen | undefined; }
     finally { store.closeState(); }
   }
   journalItems(): HeldAgentMessage[] {

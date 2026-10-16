@@ -2,9 +2,10 @@
 // Source integration only. Explicit replay is carrier stimulus, not a simulated broker/dispatcher.
 // B2a/b/c below inject logical interruptions at real boundaries; they do NOT claim SIGKILL/power-loss proof.
 // Deliberately NOT registered as passing scenarios: T-X3e needs the real broker's retained
-// max_deliver advisory and production operator publisher; T-MIX needs A2's carrier-filtered
+// max_deliver advisory; E19's operator is report-only, with NO inbox reads or relay publisher.
+// E20 rollback requires a 0/0 drain, never a relay disposition. T-MIX needs A2's carrier-filtered
 // directory/host-switch integration. Full T-ROLLBACK additionally needs the admission-drain
-// and queued/unknown/terminal operator classification surface. T-LOCK task custody needs a
+// and atomic 0/0-only host flip surface (E20). T-LOCK task custody needs a
 // real pre-admitted AgentManager run, not a synthetic task journal. Native 40 s synchronous
 // write blocking and OS process-death boundaries are not proven by the X3d/B2 slices here.
 import path from "node:path";
@@ -17,7 +18,7 @@ import { TransportUnavailableError, type TransportEnvelope, type TransportSent }
 import { bodyDigest, contractTiming, identity, type CommandBody, type ResolvedEnvelope } from "../helpers/transport-harness.js";
 import {
   A1_REASON, ControlFixture, Receipts, assertA1, carrierKind, fromOwner, latch, laneTargetA, laneTargetB, actorTargetA, actorTargetB,
-  objectBody, persistedBoundary, resolved, seenRoot, transportIntegrated, transportRequired,
+  objectBody, persistedBoundary, resolved, seenKey, seenRoot, transportIntegrated, transportRequired,
 } from "./control-fixture.js";
 
 const fixtures: ControlFixture[] = [];
@@ -42,14 +43,14 @@ function virtualClock(): void {
   vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
   vi.setSystemTime(new Date(1_800_000_000_000));
 }
-function ackRecords(f: ControlFixture, id: string) {
-  return f.senderCarrier.raw.records.filter(record => record.delivery.payload.id === `ack:${id}`);
+function ackRecords(f: ControlFixture, commandEventId: string) {
+  return f.senderCarrier.raw.records.filter(record => record.delivery.payload.id === `ack:${commandEventId}`);
 }
 function commandRecords(f: ControlFixture) {
   return f.receiverCarrier.raw.records.filter(record => record.delivery.payload.kind === "command" && record.delivery.payload.operation !== "cancel");
 }
-function hasAck(f: ControlFixture, id: string): boolean {
-  return f.receiverCarrier.sent.items.some(sent => sent.id === `ack:${id}`);
+function hasAck(f: ControlFixture, commandEventId: string): boolean {
+  return f.receiverCarrier.sent.items.some(sent => sent.id === `ack:${commandEventId}`);
 }
 
 // Counterexamples are deliberately part of each scenario: a fence must not ban a healthy
@@ -57,15 +58,44 @@ function hasAck(f: ControlFixture, id: string): boolean {
 describe("real FabricControlPlane / injected carrier faults", () => {
   controlIt("A1 seam selects the injected carrier and retains native Main custody before final ack", async () => {
     const f = fixture(); f.start();
-    const result = await f.sender.request(f.receiverOwner.hostId, f.receiverOwner.hostId, "followUp",
-      { ownerIncarnation: f.receiver.incarnation, message: "native held followUp" }, f.receiverOwner.hostId,
-      { idempotencyKey: "native-positive", timeoutMs: 120_000 });
+    const input = { ownerIncarnation: f.receiver.incarnation, message: "native held followUp",
+      data: { work: { id: "semantic-input", values: [1, false, null] } }, triggerTurn: false };
+    const send = () => f.sender.request(f.receiverOwner.hostId, f.receiverOwner.hostId, "followUp",
+      input, f.receiverOwner.hostId, { idempotencyKey: "native-positive", timeoutMs: 120_000 });
+    const result = await send();
     expect(result).toMatchObject({ acknowledged: true, queued: true });
     const sent = f.senderCarrier.sent.items.find(sent => sent.envelope.kind === "command")!;
+    const wire = objectBody(sent.envelope), commandId = wire.commandId as string;
+    expect(commandId).toBeTypeOf("string"); expect(commandId).not.toBe(sent.id);
+    expect(wire).toMatchObject({ ...input, version: 1, targetId: f.receiverOwner.hostId,
+      operation: "followUp", replyTo: f.senderOwner.hostId,
+      requestedAt: expect.any(Number), requestCreatedAt: expect.any(Number), deadlineAt: expect.any(Number) });
+    expect(f.admissions.items).toEqual([expect.objectContaining({ ...input, commandId, eventId: sent.id })]);
     await f.settled(sent.id);
     expect(carrierKind(f.receiver)).toBe("nats");
-    expect(f.journalItems()).toEqual([expect.objectContaining({ deliveryId: sent.id, message: "native held followUp" })]);
-    expect(f.seen(sent.id)?.acceptance).toMatchObject({ accepted: true, messageId: result.messageId });
+    expect(f.journalItems()).toEqual([expect.objectContaining({ deliveryId: commandId, message: input.message, data: input.data })]);
+    expect(f.seen(commandId)?.acceptance).toMatchObject({ accepted: true, messageId: result.messageId });
+    expect(f.seen(commandId)?.bodyDigest).toBe(bodyDigest(wire, sent.envelope.principal));
+    expect(await f.ack(sent.id)).toMatchObject({ commandId, bodyDigest: bodyDigest(wire, sent.envelope.principal) });
+    const nativeItems = f.journalItems();
+    // An immediate same-key caller retry is a NEW event, not a broker duplicate; only
+    // the logical control-seen claim prevents a second native admission.
+    expect(await send()).toMatchObject({ acknowledged: true, messageId: result.messageId });
+    const retry = f.senderCarrier.sent.items.filter(receipt => receipt.envelope.kind === "command")[1]!;
+    expect(retry.id).not.toBe(sent.id); expect(retry.duplicate).toBe(false);
+    expect(retry.sequence).toBeGreaterThan(sent.sequence);
+    expect(objectBody(retry.envelope).commandId).toBe(commandId);
+    await f.settled(retry.id);
+    expect(await f.ack(retry.id)).toMatchObject({ commandId, accepted: true, messageId: result.messageId });
+    expect(f.admissions.items).toHaveLength(1); expect(f.journalItems()).toEqual(nativeItems);
+    // The same semantic input with an independent logical key must still reach custody.
+    await expect(f.sender.request(f.receiverOwner.hostId, f.receiverOwner.hostId, "followUp", input,
+      f.receiverOwner.hostId, { idempotencyKey: "native-independent", timeoutMs: 120_000 }))
+      .resolves.toMatchObject({ acknowledged: true });
+    const independent = f.senderCarrier.sent.items.filter(receipt => receipt.envelope.kind === "command")[2]!;
+    await f.settled(independent.id);
+    expect(objectBody(independent.envelope).commandId).not.toBe(commandId);
+    expect(f.admissions.items).toHaveLength(2); expect(f.journalItems()).toHaveLength(2);
     expect(f.nativeSends).not.toHaveBeenCalled(); // B2, not B3/native consumption.
     expect(f.receiver.mesh.read({ topic: "fabric.control.command" })).toEqual([]);
     expect(f.receiver.mesh.read({ topic: "fabric.control.ack" })).toEqual([]);
@@ -81,10 +111,13 @@ describe("real FabricControlPlane / injected carrier faults", () => {
       }
     });
     f.keep(restore); f.start();
-    const envelope = await f.publish(f.raw("claim-interruption"));
-    await interrupted.wait(id => id === envelope.id, "persisted claim interruption");
-    const claim = f.seen(envelope.id);
-    expect(claim).toMatchObject({ format: 1, commandId: envelope.id, hostId: f.receiverOwner.hostId });
+    const commandId = "claim-interruption";
+    const envelope = await f.publish(f.raw(commandId, { eventId: "claim-interruption-event" }));
+    expect(objectBody(envelope).commandId).toBe(commandId); expect(envelope.id).not.toBe(commandId);
+    await interrupted.wait(id => id === commandId, "persisted claim interruption");
+    const claim = f.seen(commandId);
+    expect(claim).toMatchObject({ format: 1, commandId, hostId: f.receiverOwner.hostId,
+      bodyDigest: bodyDigest(envelope.body, envelope.principal), carrier: "nats", writtenAt: expect.any(Number) });
     expect(claim).not.toHaveProperty("acceptance");
     expect(f.journalItems()).toEqual([]);
     expect(f.admissions.items).toEqual([]);
@@ -96,9 +129,13 @@ describe("real FabricControlPlane / injected carrier faults", () => {
     await f.settled(envelope.id);
     expect(f.admissions.items).toEqual([]);
     expect(f.journalItems()).toEqual([]);
-    expect(f.seen(envelope.id)?.commandId).toBe(claim?.commandId);
+    expect(f.seen(commandId)?.commandId).toBe(claim?.commandId);
     expect(ackRecords(f, envelope.id)).toHaveLength(1); // One persisted disposition, no invented acceptance.
-    await f.publish(f.raw("after-claim-new-id")); await f.settled("after-claim-new-id");
+    const retry = await f.publish(f.raw(commandId, { eventId: "claim-interruption-retry" }));
+    await f.settled(retry.id);
+    expect(await f.ack(retry.id)).toMatchObject({ commandId, accepted: false, error: expect.stringMatching(/indeterminate|unknown/i) });
+    expect(f.admissions.items).toEqual([]); expect(f.journalItems()).toEqual([]);
+    await f.publish(f.raw("after-claim-new-id", { target: laneTargetB })); await f.settled("after-claim-new-id");
     expect(f.journalItems()).toHaveLength(1); // A different logical command must remain admissible.
   });
 
@@ -113,11 +150,14 @@ describe("real FabricControlPlane / injected carrier faults", () => {
       }
     });
     f.keep(restore); f.start();
-    const envelope = await f.publish(f.raw("custody-interruption"));
-    await interrupted.wait(id => id === envelope.id, "outcome write interrupted after Main custody");
+    const commandId = "custody-interruption";
+    const envelope = await f.publish(f.raw(commandId, { eventId: "custody-interruption-event" }));
+    expect(objectBody(envelope).commandId).toBe(commandId); expect(envelope.id).not.toBe(commandId);
+    await interrupted.wait(id => id === commandId, "outcome write interrupted after Main custody");
     const nativeItems = f.journalItems();
-    expect(nativeItems).toEqual([expect.objectContaining({ deliveryId: envelope.id })]);
-    expect(f.seen(envelope.id)).not.toHaveProperty("acceptance");
+    expect(nativeItems).toEqual([expect.objectContaining({ deliveryId: commandId })]);
+    expect(f.admissions.items).toEqual([expect.objectContaining({ commandId, eventId: envelope.id })]);
+    expect(f.seen(commandId)).not.toHaveProperty("acceptance");
     expect(ackRecords(f, envelope.id)).toEqual([]);
     expect(commandRecords(f)[0]?.acks).toBe(0);
     const close = f.receiver.close.bind(f.receiver);
@@ -130,11 +170,18 @@ describe("real FabricControlPlane / injected carrier faults", () => {
     const ack = await f.ack(envelope.id); await f.settled(envelope.id);
     expect(ack).toMatchObject({ accepted: false, error: expect.stringMatching(/indeterminate|unknown/i) });
     expect(ack).not.toHaveProperty("notRun", true); // Custody EXISTS; never tell the sender it is safe to mint a new id.
-    expect(f.admissions.items.filter(command => command.commandId === envelope.id)).toHaveLength(1);
+    expect(f.admissions.items.filter(command => command.commandId === commandId)).toHaveLength(1);
     expect(f.journalItems()).toEqual(nativeItems);
     expect(f.nativeSends).not.toHaveBeenCalled();
     expect(ackRecords(f, envelope.id)).toHaveLength(1);
     expect(objectBody(ackRecords(f, envelope.id)[0]!.delivery.payload)).toMatchObject(ack);
+    const retry = await f.publish(f.raw(commandId, { eventId: "custody-interruption-retry" }));
+    await f.settled(retry.id);
+    expect(await f.ack(retry.id)).toMatchObject(ack);
+    expect(f.admissions.items).toHaveLength(1); expect(f.journalItems()).toEqual(nativeItems);
+    await f.publish(f.raw("after-custody-new-id", { target: laneTargetB })); await f.settled("after-custody-new-id");
+    expect(f.admissions.items).toHaveLength(2);
+    expect(f.journalItems()).toEqual([...nativeItems, expect.objectContaining({ deliveryId: "after-custody-new-id" })]);
   });
 
   controlIt("T-B2c: interrupt after ACK PubAck but BEFORE broker ack; replay returns stored outcome and one sender settlement", async () => {
@@ -145,9 +192,11 @@ describe("real FabricControlPlane / injected carrier faults", () => {
       { idempotencyKey: "ack-puback-interruption", timeoutMs: 120_000 }).then(value => { settlements++; return value; });
     void request.catch(() => undefined);
     const sent = await f.senderCarrier.sent.wait(receipt => receipt.envelope.kind === "command", "real request publish");
+    const commandId = objectBody(sent.envelope).commandId as string;
+    expect(commandId).not.toBe(sent.id);
     const record = commandRecords(f).find(record => record.delivery.payload.id === sent.id)!;
     const spy = vi.spyOn(record.delivery, "ack").mockImplementation(async () => {
-      expect(f.seen(sent.id)?.acceptance).toMatchObject({ accepted: true });
+      expect(f.seen(commandId)?.acceptance).toMatchObject({ accepted: true });
       expect(ackRecords(f, sent.id)).toHaveLength(1); // ACK already persisted by the carrier.
       f.receiver.pause(); interrupted.emit(sent.id); throw new MeshConsumptionPausedError();
     });
@@ -155,12 +204,12 @@ describe("real FabricControlPlane / injected carrier faults", () => {
     await interrupted.wait(id => id === sent.id, "post ACK PubAck interruption");
     const result = await request;
     expect(record.acks).toBe(0); expect(settlements).toBe(1);
-    const outcome = f.seen(sent.id)?.acceptance;
+    const outcome = f.seen(commandId)?.acceptance;
     await f.restart(); f.start(); f.replay(sent.envelope);
     expect(await f.ack(sent.id)).toMatchObject(outcome!); await f.settled(sent.id);
     expect(f.receiverCarrier.sent.items.find(receipt => receipt.id === `ack:${sent.id}`)?.duplicate).toBe(true);
-    expect(f.journalItems()).toEqual([expect.objectContaining({ deliveryId: sent.id, id: result.messageId })]);
-    expect(f.admissions.items.filter(command => command.commandId === sent.id)).toHaveLength(1);
+    expect(f.journalItems()).toEqual([expect.objectContaining({ deliveryId: commandId, id: result.messageId })]);
+    expect(f.admissions.items.filter(command => command.commandId === commandId)).toHaveLength(1);
     expect(ackRecords(f, sent.id)).toHaveLength(1);
     expect(f.senderCarrier.delivered.items.filter(receipt => receipt.id === `ack:${sent.id}`)).toHaveLength(1);
     expect(settlements).toBe(1);
@@ -169,20 +218,21 @@ describe("real FabricControlPlane / injected carrier faults", () => {
   controlIt("T-X3a: +11 minute same-id SAME-BODY restamped retry outlives broker dedupe and retains the 24 h claim", async () => {
     let clock = Date.now(); vi.spyOn(Date, "now").mockImplementation(() => clock);
     const f = fixture(); f.start();
-    const first = await f.publish(f.raw("retry-after-window")); await f.settled(first.id);
-    const saved = f.seen(first.id)!;
+    const commandId = "retry-after-window";
+    const first = await f.publish(f.raw(commandId)); await f.settled(first.id);
+    const saved = f.seen(commandId)!;
     expect(saved.expiresAt).toBeGreaterThanOrEqual(Number(objectBody(first).deadlineAt) + contractTiming.retryHorizonMs);
     expect(saved.bodyDigest).toBe(bodyDigest(first.body as CommandBody, first.principal));
     clock += 11 * 60_000;
-    const retry = await f.publish(f.raw(first.id));
+    const retry = await f.publish(f.raw(commandId));
     expect(objectBody(retry).requestedAt).not.toBe(objectBody(first).requestedAt);
     expect(objectBody(retry).deadlineAt).not.toBe(objectBody(first).deadlineAt);
     expect(f.senderCarrier.sent.items.filter(receipt => receipt.id === first.id).map(receipt => receipt.duplicate)).toEqual([false, false]);
     const ack = await f.ack(first.id, 2); await f.settled(first.id, 2);
     expect(ack).toMatchObject(saved.acceptance!);
-    expect(f.admissions.items.filter(command => command.commandId === first.id)).toHaveLength(1);
+    expect(f.admissions.items.filter(command => command.commandId === commandId)).toHaveLength(1);
     expect(f.journalItems()).toHaveLength(1);
-    expect(f.seen(first.id)?.bodyDigest).toBe(saved.bodyDigest);
+    expect(f.seen(commandId)?.bodyDigest).toBe(saved.bodyDigest);
   });
 
   controlIt("T-X3b: ACK carrier outage after durable outcome; explicit redelivery recovers one real request", async () => {
@@ -201,13 +251,15 @@ describe("real FabricControlPlane / injected carrier faults", () => {
       { idempotencyKey: "lost-ack", timeoutMs: 120_000 }).then(value => { settlements++; return value; });
     void request.catch(() => undefined);
     const sent = await f.senderCarrier.sent.wait(receipt => receipt.envelope.kind === "command", "real command publish");
+    const commandId = objectBody(sent.envelope).commandId as string;
+    expect(commandId).not.toBe(sent.id);
     await lost.wait(id => id === `ack:${sent.id}`, "ACK outage");
-    expect(f.seen(sent.id)?.acceptance).toMatchObject({ accepted: true });
+    expect(f.seen(commandId)?.acceptance).toMatchObject({ accepted: true });
     expect(ackRecords(f, sent.id)).toEqual([]); expect(settlements).toBe(0);
     spy.mockRestore(); await f.restart(); f.start(); f.replay(sent.envelope);
     expect(await request).toMatchObject({ acknowledged: true });
     await f.receiverCarrier.acked.wait(receipt => receipt.id === sent.id && receipt.attempt === 2, "redelivery final ack");
-    expect(f.admissions.items.filter(command => command.commandId === sent.id)).toHaveLength(1);
+    expect(f.admissions.items.filter(command => command.commandId === commandId)).toHaveLength(1);
     expect(f.journalItems()).toHaveLength(1); expect(ackRecords(f, sent.id)).toHaveLength(1); expect(settlements).toBe(1);
   });
 
@@ -219,42 +271,53 @@ describe("real FabricControlPlane / injected carrier faults", () => {
       { idempotencyKey: "long-ask", timeoutMs: 120_000 });
     void result.catch(() => undefined);
     const command = await f.admissions.wait(() => true, "ASK admission");
-    const original = commandRecords(f).find(record => record.delivery.payload.id === command.commandId)!;
+    const commandEventId = command.eventId!;
+    expect(commandEventId).toBeTypeOf("string"); expect(commandEventId).not.toBe(command.commandId);
+    const original = commandRecords(f).find(record => record.delivery.payload.id === commandEventId)!;
     await vi.advanceTimersByTimeAsync(30_000);
     const duplicate = f.replay(original.delivery.payload as ResolvedEnvelope);
-    await f.receiverCarrier.delivered.wait(receipt => receipt.id === command.commandId && receipt.attempt === 2, "in-flight duplicate pulled");
+    await f.receiverCarrier.delivered.wait(receipt => receipt.id === commandEventId && receipt.attempt === 2, "in-flight duplicate pulled");
     await vi.advanceTimersByTimeAsync(30_000);
     expect(original.working).toBeGreaterThanOrEqual(5);
     expect(duplicate.working).toBeGreaterThanOrEqual(2);
-    const ticks = f.receiverCarrier.working.items.filter(receipt => receipt.id === command.commandId && receipt.attempt === 1).map(receipt => receipt.at);
+    const ticks = f.receiverCarrier.working.items.filter(receipt => receipt.id === commandEventId && receipt.attempt === 1).map(receipt => receipt.at);
     expect(ticks[0]! - command.requestedAt).toBeLessThanOrEqual(contractTiming.workingEveryMs);
     for (let index = 1; index < ticks.length; index++) expect(ticks[index]! - ticks[index - 1]!).toBeLessThanOrEqual(contractTiming.workingEveryMs);
     expect(Date.now() - ticks.at(-1)!).toBeLessThanOrEqual(contractTiming.workingEveryMs);
     expect(original.acks).toBe(0); expect(duplicate.acks).toBe(0);
     expect(f.admissions.items).toHaveLength(1);
     gate.release(); expect(await result).toEqual({ answer: 42 });
-    await f.settled(command.commandId, 2);
+    await f.settled(commandEventId, 2);
     expect(original.acks).toBe(1); expect(duplicate.acks).toBe(1);
-    expect(ackRecords(f, command.commandId)).toHaveLength(1);
+    expect(ackRecords(f, commandEventId)).toHaveLength(1);
     expect(f.seen(command.commandId)?.acceptance).toMatchObject({ accepted: true, result: { answer: 42 } });
     // The stub records WPI calls only. Real nats-server T6 must separately prove no automatic redelivery.
   });
 
-  controlIt("T-X3d (B2 persistence slice): a real control-seen outcome write delayed 40 s gets working() until its commit", async () => {
+  controlIt("T-X3d (logical B2 persistence slice): a real control-seen outcome commit delayed 40 s gets working() until commit", async () => {
     virtualClock(); const f = fixture(), gate = latch(), entered = new Receipts<string>(); f.keep(gate.release);
-    const restore = persistedBoundary(seenRoot(f.meshRoot, f.receiverOwner.hostId), async (phase, value) => {
-      if (phase === "before" && value.commandId === "slow-outcome-write" && value.acceptance) {
-        entered.emit(value.commandId); await gate.promise;
+    const commandId = "slow-outcome-write", commandEventId = "slow-outcome-event";
+    const root = seenRoot(f.meshRoot, f.receiverOwner.hostId), key = seenKey(f.receiverOwner.hostId, commandId);
+    const batch = MeshStore.prototype.writeBatch;
+    // Delay entry to the ACTUAL outcome CAS batch outside its lock. Do not evaluate
+    // its value callback early, or claim that JS timers progress during synchronous IO.
+    const spy = vi.spyOn(MeshStore.prototype, "writeBatch").mockImplementation(async function(this: MeshStore, input) {
+      if (path.resolve(this.root) === path.resolve(root) && input.ops.some(op =>
+        op.kind === "put" && op.key === key && op.ifVersion !== undefined && op.ifVersion > 0)) {
+        entered.emit(commandId); await gate.promise;
       }
+      return batch.call(this, input);
     });
-    f.keep(restore); f.start(); await f.publish(f.raw("slow-outcome-write"));
-    await entered.wait(() => true, "real outcome put before commit");
+    f.keep(() => spy.mockRestore()); f.start();
+    await f.publish(f.raw(commandId, { eventId: commandEventId }));
+    await entered.wait(id => id === commandId, "real outcome batch before commit");
     expect(f.journalItems()).toHaveLength(1); expect(f.seen("slow-outcome-write")).not.toHaveProperty("acceptance");
     await vi.advanceTimersByTimeAsync(40_000);
     const record = commandRecords(f)[0]!;
     expect(record.working).toBeGreaterThanOrEqual(3); expect(record.acks).toBe(0);
-    expect(hasAck(f, "slow-outcome-write")).toBe(false);
-    gate.release(); await f.settled("slow-outcome-write");
+    expect(record.delivery.payload.id).toBe(commandEventId);
+    expect(hasAck(f, commandEventId)).toBe(false);
+    gate.release(); await f.settled(commandEventId);
     expect(f.seen("slow-outcome-write")?.acceptance).toMatchObject({ accepted: true });
     expect(f.admissions.items).toHaveLength(1); expect(f.journalItems()).toHaveLength(1);
   });
@@ -263,26 +326,27 @@ describe("real FabricControlPlane / injected carrier faults", () => {
     controlIt(`T-IDCONFLICT: changed ${changed} is notRun, but unchanged restamped retries remain observable`, async () => {
       let clock = Date.now(); vi.spyOn(Date, "now").mockImplementation(() => clock);
       const f = fixture(); f.start();
-      const first = await f.publish(f.raw(`conflict-${changed}`)); await f.settled(first.id);
-      const saved = f.seen(first.id)!;
+      const commandId = `conflict-${changed}`;
+      const first = await f.publish(f.raw(commandId)); await f.settled(first.id);
+      const saved = f.seen(commandId)!;
       clock += 11 * 60_000;
-      await f.publish(f.raw(first.id)); await f.settled(first.id, 2);
+      await f.publish(f.raw(commandId)); await f.settled(first.id, 2);
       expect(await f.ack(first.id, 2)).toMatchObject(saved.acceptance!);
-      const beforeConflict = f.seen(first.id)!; // An equal-body retry may extend the retention horizon.
+      const beforeConflict = f.seen(commandId)!; // An equal-body retry may extend the retention horizon.
       // Expire BOTH command and ACK broker dedupe windows. Observing THIS attempt's
       // TransportSent.envelope when duplicate=true would not prove a persisted refusal.
       clock += 11 * 60_000;
-      const attempt = resolved(f.raw(first.id));
+      const attempt = resolved(f.raw(commandId));
       const changedBody = { ...objectBody(attempt), [changed]: changed === "message" ? "different immutable input" : { changed: true } };
       await f.publish({ ...attempt, body: changedBody });
       const refusal = await f.ack(first.id, 3); await f.settled(first.id, 3);
       expect(refusal).toMatchObject({ accepted: false, notRun: true, errorCode: "FABRIC_CONTROL_ID_CONFLICT" });
       expect(objectBody(ackRecords(f, first.id).at(-1)!.delivery.payload)).toMatchObject(refusal);
-      expect(f.seen(first.id)).toEqual(beforeConflict); // Conflict may NOT overwrite the old outcome or digest.
-      expect(f.admissions.items.filter(command => command.commandId === first.id)).toHaveLength(1);
+      expect(f.seen(commandId)).toEqual(beforeConflict); // Conflict may NOT overwrite the old outcome or digest.
+      expect(f.admissions.items.filter(command => command.commandId === commandId)).toHaveLength(1);
       expect(f.journalItems()).toHaveLength(1);
-      await f.publish(f.raw(`${first.id}-new-logical-id`, { message: "different immutable input" }));
-      await f.settled(`${first.id}-new-logical-id`);
+      await f.publish(f.raw(`${commandId}-new-logical-id`, { message: "different immutable input" }));
+      await f.settled(`${commandId}-new-logical-id`);
       expect(f.journalItems()).toHaveLength(2);
     });
   }
@@ -347,14 +411,15 @@ describe("real FabricControlPlane / injected carrier faults", () => {
     });
     await f.publish(f.raw("lane-head"));
     await f.admissions.wait(command => command.commandId === "lane-head", "stalled lane head");
-    const expired = await f.publish(f.raw("queued-expired", { timeoutMs: 12_000 }));
+    const expiredCommandId = "queued-expired";
+    const expired = await f.publish(f.raw(expiredCommandId, { eventId: "queued-expired-event", timeoutMs: 12_000 }));
     await f.receiverCarrier.delivered.wait(receipt => receipt.id === expired.id, "queued delivery");
     await vi.advanceTimersByTimeAsync(13_000);
     expect(await f.ack(expired.id)).toMatchObject({ accepted: false, error: "Fabric control command expired", notRun: true });
     await f.settled(expired.id);
     expect(hasAck(f, "lane-head")).toBe(false);
     expect(f.admissions.items.map(command => command.commandId)).toEqual(["lane-head"]);
-    expect(f.seen(expired.id)?.acceptance).toMatchObject({ accepted: false, notRun: true });
+    expect(f.seen(expiredCommandId)?.acceptance).toMatchObject({ accepted: false, notRun: true });
     expect(f.journalItems()).toEqual([]);
     await f.publish(f.raw("queued-fresh"));
     gate.release(); await f.settled("lane-head"); await f.settled("queued-fresh");
@@ -422,7 +487,9 @@ describe("real FabricControlPlane / injected carrier faults", () => {
     const oldCommand = f.senderCarrier.sent.items.find(receipt => receipt.envelope.kind === "command" && receipt.envelope.operation !== "cancel")!;
     expect(await f.ack(oldCommand.id)).toMatchObject({ accepted: false, notRun: true, errorCode: "FABRIC_CONTROL_STALE_INCARNATION" });
     expect(f.admissions.items).toEqual([]); expect(f.journalItems()).toEqual([]);
-    expect(f.seen(oldCommand.id)).toBeUndefined();
+    const oldCommandId = objectBody(oldCommand.envelope).commandId as string;
+    expect(oldCommandId).not.toBe(oldCommand.id);
+    expect(f.seen(oldCommandId)).toBeUndefined();
     await expect(f.sender.request(f.receiverOwner.hostId, f.receiverOwner.hostId, "followUp",
       { ownerIncarnation: f.receiver.incarnation }, f.receiverOwner.hostId, { idempotencyKey: "fresh-incarnation" }))
       .resolves.toMatchObject({ acknowledged: true });
@@ -443,11 +510,12 @@ describe("real FabricControlPlane / injected carrier faults", () => {
       } }, signal);
     });
     f.keep(() => spy.mockRestore()); f.start();
-    const command = await f.publish(f.raw("pause-ack-fence"));
+    const commandId = "pause-ack-fence";
+    const command = await f.publish(f.raw(commandId, { eventId: "pause-ack-fence-event" }));
     await stamped.wait(id => id === `ack:${command.id}`, "pause in ACK stamp"); await immediate();
     expect(ackRecords(f, command.id)).toEqual([]);
     expect(commandRecords(f)[0]?.acks).toBe(0);
-    expect(f.seen(command.id)?.acceptance).toMatchObject({ accepted: true });
+    expect(f.seen(commandId)?.acceptance).toMatchObject({ accepted: true });
     expect(f.journalItems()).toHaveLength(1);
     // Reopen a carrier endpoint for reactivation: the frozen helper permits only ONE
     // iterator per endpoint. Do not emulate a second iterator or an inbox dispatcher here.
@@ -467,20 +535,29 @@ describe("real FabricControlPlane / injected carrier faults", () => {
       { idempotencyKey: "ack-provenance", timeoutMs: 120_000 }).finally(() => { settled = true; });
     void request.catch(() => undefined);
     const command = await f.admissions.wait(() => true, "pending real request");
-    const ack = (id: string, fromId: string): TransportEnvelope => ({ id, kind: "ack", to: f.senderOwner,
+    const commandEventId = command.eventId!;
+    const sent = await f.senderCarrier.sent.wait(receipt => receipt.id === commandEventId, "correlated real request publish");
+    const digest = bodyDigest(sent.envelope.body, sent.envelope.principal);
+    expect(commandEventId).not.toBe(command.commandId);
+    // Both negatives are otherwise valid E14 ACKs for THIS event and logical body.
+    // Invalid ids/missing digests would only test shape rejection, not P6 provenance.
+    const ack = (fromId: string): TransportEnvelope => ({ id: `ack:${commandEventId}`, kind: "ack", to: f.senderOwner,
       targetId: command.targetId, operation: "accepted", from: identity(fromId), body: {
         version: 1, commandId: command.commandId, targetId: command.targetId, ownerIncarnation: f.receiver.incarnation,
-        accepted: true, messageId: "forged-result",
+        bodyDigest: digest, accepted: true, messageId: "forged-result",
       } });
-    const wrongMachine = f.senderCarrier.raw.enqueue(resolved(ack("forged-machine", f.receiverOwner.hostId)),
+    const wrongMachine = f.senderCarrier.raw.enqueue(resolved(ack(f.receiverOwner.hostId)),
       { sourceMachine: "test-attacker", verification: "bridge" });
-    await f.senderCarrier.acked.wait(receipt => receipt.id === "forged-machine", "forged ACK dropped/acked");
+    await f.senderCarrier.acked.wait(receipt => receipt.id === `ack:${commandEventId}` && receipt.sequence === wrongMachine.delivery.sequence,
+      "forged ACK dropped/acked");
     expect(wrongMachine.acks).toBe(1); expect(settled).toBe(false);
-    f.senderCarrier.raw.enqueue(resolved(ack("forged-runtime", "session:other-runtime")),
+    const wrongRuntime = f.senderCarrier.raw.enqueue(resolved(ack("session:other-runtime")),
       { sourceMachine: f.receiverOwner.machine, verification: "bridge" });
-    await f.senderCarrier.acked.wait(receipt => receipt.id === "forged-runtime", "wrong runtime ACK dropped/acked");
-    expect(settled).toBe(false);
-    gate.release(); const result = await request; await f.settled(command.commandId);
+    await f.senderCarrier.acked.wait(receipt => receipt.id === `ack:${commandEventId}` && receipt.sequence === wrongRuntime.delivery.sequence,
+      "wrong runtime ACK dropped/acked");
+    expect(wrongRuntime.acks).toBe(1); expect(settled).toBe(false);
+    gate.release(); const result = await request; await f.settled(commandEventId);
+    expect(await f.ack(commandEventId)).toMatchObject({ commandId: command.commandId, bodyDigest: digest, accepted: true });
     expect(result).toMatchObject({ acknowledged: true }); expect(result.messageId).not.toBe("forged-result");
     expect(f.seen(command.commandId)?.acceptance?.messageId).toBe(result.messageId);
     expect(f.journalItems()).toHaveLength(1);
@@ -495,7 +572,8 @@ describe("real FabricControlPlane / injected carrier faults", () => {
       await f.locks.storage.run(probe, () => f.receiver.mesh.put({ key: "fault-suite/lock-probe", identity: fromOwner(f), value: 1 }));
       expect(probe.locks).toEqual([path.join(f.meshRoot, ".lock")]);
       f.start();
-      const envelope = await f.publish(f.raw(`lock-${operation}`, { operation }));
+      const commandId = `lock-${operation}`;
+      const envelope = await f.publish(f.raw(commandId, { eventId: `lock-${operation}-event`, operation }));
       await f.settled(envelope.id);
       const spans = f.locks.spans.filter(span => span.id === envelope.id);
       expect(spans).toHaveLength(1);
@@ -503,7 +581,7 @@ describe("real FabricControlPlane / injected carrier faults", () => {
       expect(spans[0]?.localLocks.length, "a zero from an unpropagated/empty ALS span is NOT evidence").toBeGreaterThan(0);
       expect(spans[0]?.locks).toEqual([]);
       expect(spans[0]?.globalAttempts, "even a failed global lock wait violates I-LOCK").toEqual([]);
-      expect(f.seen(envelope.id)?.acceptance).toMatchObject({ accepted: true });
+      expect(f.seen(commandId)?.acceptance).toMatchObject({ accepted: true });
       if (operation === "followUp") expect(f.journalItems()).toHaveLength(1);
       if (operation === "steer") expect(f.nativeSends).toHaveBeenCalledOnce();
       if (operation === "stop") expect(f.nativeAbort).toHaveBeenCalledOnce();
@@ -569,8 +647,9 @@ describe("real FabricControlPlane / injected carrier faults", () => {
 
   controlIt("T-ROLLBACK reconciliation slice: a NATS-admitted id retried through the actual FILE carrier returns the same local outcome", async () => {
     const f = fixture(); f.start();
-    const envelope = await f.publish(f.raw("rollback-admitted")); await f.settled(envelope.id);
-    const saved = f.seen(envelope.id)!;
+    const commandId = "rollback-admitted";
+    const envelope = await f.publish(f.raw(commandId, { eventId: "rollback-admitted-event" })); await f.settled(envelope.id);
+    const saved = f.seen(commandId)!;
     expect(saved.acceptance).toMatchObject({ accepted: true });
     expect(await f.receiverCarrier.transport.drainState()).toEqual({ pending: 0, ackPending: 0 });
     f.receiver.pause(); await f.receiver.close(); await f.receiverCarrier.raw.close();
@@ -587,13 +666,13 @@ describe("real FabricControlPlane / injected carrier faults", () => {
     });
     await mesh.publish({ topic: "fabric.control.command", kind: envelope.operation, to: f.receiverOwner.hostId,
       from: envelope.from, data: { ...objectBody(envelope), requestedAt: Date.now(), deadlineAt: Date.now() + 120_000 } });
-    const ack = await acked.wait(value => typeof value === "object" && value !== null && Reflect.get(value, "commandId") === envelope.id, "FILE replay ACK");
+    const ack = await acked.wait(value => typeof value === "object" && value !== null && Reflect.get(value, "commandId") === commandId, "FILE replay ACK");
     expect(ack).toMatchObject(saved.acceptance!);
     expect(admissions).not.toHaveBeenCalled();
-    expect(f.journalItems()).toEqual([expect.objectContaining({ deliveryId: envelope.id })]);
-    expect(f.seen(envelope.id)).toEqual(saved);
+    expect(f.journalItems()).toEqual([expect.objectContaining({ deliveryId: commandId })]);
+    expect(f.seen(commandId)).toEqual(saved);
     // This is the carrier-independent control-seen reconciliation boundary ONLY. It does not
-    // claim the host admission switch, operator classification, unknown/queued/terminal ids,
+    // claim the host admission switch, INFO 0/0 drain, atomic 48h hold propagation,
     // bridge restart, or an installed-host rollback rehearsal.
   });
 });

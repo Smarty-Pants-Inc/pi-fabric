@@ -29,7 +29,9 @@ export const rewritableHiddenCapturedToolNames = (
 const mentionPattern = (name: string): RegExp =>
   new RegExp(`(?<![\\w.])${escapeRegex(name)}(?![\\w])`);
 
-export const extractSkillRegions = (text: string): string => {
+export const extractSkillRegions = (text: unknown): string => {
+  if (typeof text !== "string") return "";
+
   const regions: string[] = [];
   for (const match of text.matchAll(SKILL_REGION)) {
     const region = match[0];
@@ -44,8 +46,8 @@ export const capturedToolMentions = (
 ): string[] => names.filter((name) => mentionPattern(name).test(text));
 
 export const proxyContractMentionsInSkills = (
-  prompt: string,
-  systemPrompt: string,
+  prompt: unknown,
+  systemPrompt: unknown,
   names: readonly string[],
 ): string[] => {
   const envelope = `${extractSkillRegions(prompt)}\n${extractSkillRegions(systemPrompt)}`;

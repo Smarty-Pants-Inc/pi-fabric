@@ -405,7 +405,7 @@ export class KvParticipantDirectory implements ParticipantView {
     return this.#remember(key, record, revision);
   }
 
-  /** On-change publication. Existing rows use only the revision this helper actually owns. */
+  /** On-change publication; only an initial own-root create may succeed a fenced predecessor. */
   publish(record: FabricParticipantRecord): Promise<KvPresencePublication> {
     const copy = this.#ownRecord(record), key = this.#key(copy.id);
     return this.#serial(key, async () => {
@@ -416,7 +416,34 @@ export class KvParticipantDirectory implements ParticipantView {
         performance.now() - owned.writtenAt < KV_PRESENCE_REFRESH_MS) {
         return { key, revision: owned.revision, rollback: () => this.#serial(key, () => this.#removeRevision(key, owned.revision)) };
       }
-      const revision = await this.#update(key, copy, owned?.revision ?? 0);
+      let revision: number;
+      try { revision = await this.#update(key, copy, owned?.revision ?? 0); }
+      catch (error) {
+        // Only the initial own-root create may replace a predecessor. Children,
+        // owned revisions and same-incarnation conflicts never acquire a read revision.
+        if (owned || errorCode(error) !== "FABRIC_KV_CONFLICT" || copy.kind !== "root" ||
+          copy.id !== this.options.rootId || copy.id !== this.options.identityId) throw error;
+        const current = await this.#presence.get<unknown>(key, this.#signal());
+        const predecessor = current && presenceValue(current);
+        if (!current || current.key !== key || !predecessor || predecessor.kind !== "root" ||
+          predecessor.id !== copy.id || predecessor.rootId !== copy.rootId ||
+          predecessor.ownerHostId !== copy.ownerHostId || predecessor.ownerIdentityId !== copy.ownerIdentityId ||
+          predecessor.sessionId !== copy.sessionId || predecessor.ownerIncarnation === copy.ownerIncarnation) {
+          throw new TransportInvalidError("Presence create conflict is not an owned predecessor root");
+        }
+        // Custody's clean/native-exit proof plus exclusive lease create establishes
+        // succession, not UUID ordering or a possibly stale lease watch snapshot.
+        const leaseKey = `${this.options.transport.self.machine}.h.${tokenFor(copy.ownerHostId)}`;
+        const currentLease = await this.#leases.get<unknown>(leaseKey, this.#signal());
+        const lease = currentLease && leaseValue(currentLease);
+        if (!currentLease || currentLease.key !== leaseKey || currentLease.owner !== this.#owner() || !lease ||
+          lease.id !== copy.ownerHostId || lease.rootId !== copy.rootId ||
+          lease.identityId !== copy.ownerIdentityId || lease.incarnation !== copy.ownerIncarnation) {
+          throw new TransportUnavailableError("Current owner lease does not authorize root succession");
+        }
+        this.#assertWritable(); // Reads may outlive the monotonic lease window.
+        revision = await this.#update(key, copy, current.revision); // One CAS; never retry/adopt a lost revision.
+      }
       return this.#admitted(key, copy, revision);
     });
   }

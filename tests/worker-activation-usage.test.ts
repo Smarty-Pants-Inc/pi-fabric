@@ -21,7 +21,7 @@ type Model = { provider: string; id: string; api: string; contextWindow: number 
 // mutate: the awaited callback edits payload.input[at] in place (creating it when absent) and returns undefined.
 type Step = { op: "dispatch"; model?: Partial<Model>; payload: Record<string, unknown>; replace?: Record<string, unknown>;
   mutate?: { at: number; set: Record<string, unknown> } }
-  | { op: "report"; model?: Partial<Model>; usage?: Record<string, number>; stopReason?: string; tools?: boolean; content?: unknown[] };
+  | { op: "report"; model?: Partial<Model>; usage?: Record<string, number>; stopReason?: string; errorMessage?: string; tools?: boolean; content?: unknown[] };
 
 const M: Model = { provider: "p", id: "m", api: "openai-responses", contextWindow: W };
 // 40,000 opaque chars: 11.4k (3.5) / 10k (4) tokens by characters, above the window, but billed by provider usage.
@@ -33,6 +33,7 @@ const U = { role: "user", content: "SMALL" };
 const base = (extra: Record<string, unknown> = {}, user = "SMALL") => ({ model: "m", input: [
   { role: "user", content: user }, R], ...extra });
 const usage = (total: number) => ({ input: total - 100, output: 100, cacheRead: 0, cacheWrite: 0, totalTokens: total });
+const zeroUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0 };
 const report = (total: number, rest: Partial<Extract<Step, { op: "report" }>> = {}): Step => ({ op: "report", usage: usage(total), ...rest });
 const x = (chars: number) => "x".repeat(chars);
 // A native Responses thinking block: thinkingSignature is the JSON reasoning output item (shared adapter).
@@ -79,7 +80,8 @@ function run(steps: Step[]) {
         }});
       } else {
         await handlers.get('turn_end')({type: 'turn_end', toolResults: [], message: {role: 'assistant', content: step.content ?? [],
-          provider: model.provider, model: model.id, api: model.api, stopReason: step.stopReason ?? 'stop', usage: step.usage, timestamp: 1}});
+          provider: model.provider, model: model.id, api: model.api, stopReason: step.stopReason ?? 'stop',
+          errorMessage: step.errorMessage, usage: step.usage, timestamp: 1}});
       }
     }
   `);
@@ -160,12 +162,42 @@ describe("activation window provider-usage anchor (smarty-dev#10560)", () => {
     admits(run([...seed(), report(3_000), { op: "dispatch", model: { contextWindow: 16_000 }, payload: base({ more: x(24_000) }) }]), 3);
   }, GUARD_MS);
 
-  it("refuses opaque history after invalid, zero, error, aborted or ambiguous reports; visible small requests still fit", () => {
+  // Recorded catch: smarty-dev#14075. An overload retry has no new usage report, but still
+  // carries reasoning already covered by the preceding successful same-model response.
+  it.each([
+    { stopReason: "error", usage: undefined },
+    { stopReason: "error", usage: zeroUsage },
+    { stopReason: "error", usage: usage(3_000) },
+    { stopReason: "aborted", usage: zeroUsage },
+    { stopReason: "stop", usage: zeroUsage },
+  ])("14075 retains the last good usage anchor across a $stopReason non-report ($usage)", nonReport => {
+    const failed: Extract<Step, { op: "report" }> = { op: "report", stopReason: nonReport.stopReason,
+      ...(nonReport.usage ? { usage: nonReport.usage } : {}),
+      errorMessage: "cliproxyapi/gpt-6-luna: Our servers are currently overloaded. Please try again later." };
+    const retry: Step = { op: "dispatch", payload: base({ toolResult: x(6_000) }) };
+    const r = run([...seed(), failed, retry]);
+    admits(r, 3);
+    expect(r.sent[2]).toBe(JSON.stringify(retry.payload));
+    // The failed/zero turn supplies no authority on its own, including output signatures.
+    refuses(run([{ op: "dispatch", payload: small() }, { ...failed, content: [sig(R)] }, retry]), 1);
+  }, GUARD_MS);
+
+  it("14075 still charges new growth and uncovered reasoning in full after an overload", () => {
+    const failed: Step = { op: "report", stopReason: "error",
+      errorMessage: "cliproxyapi/gpt-6-luna: Our servers are currently overloaded. Please try again later.",
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0 }, content: [sig(R2)] };
+    refuses(run([...seed(), failed, { op: "dispatch", payload: base({ more: x(24_000) }) }]), 2);
+    // Multiple retries retain the original growth baseline, not the most recent unreported dispatch.
+    refuses(run([...seed(), failed, { op: "dispatch", payload: base({ more: x(10_000) }) }, failed,
+      { op: "dispatch", payload: base({ more: x(24_000) }) }]), 3);
+    refuses(run([...seed(), failed, { op: "dispatch", payload: { model: "m", input: [U, R, R2] } }]), 2);
+  }, GUARD_MS);
+
+  it("refuses opaque history after malformed or ambiguous reports; visible small requests still fit", () => {
     const grow: Step = { op: "dispatch", payload: base({ more: x(3_000) }) };
     const visible: Step = { op: "dispatch", payload: small({ more: x(3_000) }) };
-    for (const bad of [report(3_000, { stopReason: "error" }), report(3_000, { stopReason: "aborted" }), report(0),
-      report(3_000, { usage: { ...usage(3_000), input: -1 } }), report(3_000, { usage: { output: 3_000 } as never }),
-      { op: "report" } as Step]) {
+    for (const bad of [report(3_000, { usage: { ...usage(3_000), input: -1 } }),
+      report(3_000, { usage: { output: 3_000 } as never }), { op: "report" } as Step]) {
       refuses(run([...seed(), bad, grow]), 2);
       admits(run([...seed(), bad, visible]), 3);
       // An invalid report after a valid one is not rescued by the earlier anchor.

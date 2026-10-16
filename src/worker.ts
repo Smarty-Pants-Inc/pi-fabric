@@ -1843,8 +1843,23 @@ const main = async (): Promise<void> => {
     }
     // smarty-dev#3238 round 2: the activation window's own window refusal, typed by its bound frame.
     if (activationWindow && event.type === "fabric_activation_window_refusal") {
-      if (event.runId === options.id && event.nonce === activationNonce && event.protocol === 1 &&
-          event.hook === activationHookPath && event.code === "context-overflow") contextOverflowSignal = true;
+      if (!terminalStatus && event.runId === options.id && event.nonce === activationNonce && event.protocol === 1 &&
+          event.hook === activationHookPath && event.code === "context-overflow") {
+        contextOverflowSignal = true;
+        // A native retry preserves its prior provider error until another assistant response.
+        // This bound refusal is the terminal cause, not that stale transient (#14075 CODE-01).
+        // Only finite numeric details may reach the error, never arbitrary frame/provider text.
+        const { tokens, contextWindow } = event;
+        const estimate = typeof tokens === "number" && Number.isFinite(tokens) && tokens >= 0 &&
+          typeof contextWindow === "number" && Number.isFinite(contextWindow) && contextWindow > 0
+          ? `: estimated ${tokens} input tokens, window ${contextWindow}` : "";
+        terminalStatus = "failed";
+        terminalError = `Fabric activation window failed: Context exceeds window${estimate}`;
+        record.error = terminalError;
+        sawAgentError = true;
+        update();
+        killChild();
+      }
       return;
     }
     if (residentProbeNonce && event.type === "fabric_resident_extension_ready") {

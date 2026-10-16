@@ -542,7 +542,7 @@ export const ACTOR_ALARM_KINDS: readonly ActorAlarmKind[] = ["actor-activation-b
 /** Public alarm reasons are closed codes, including when an episode was restored from disk. */
 const actorAlarmReason = (reason: unknown): string => typeof reason === "string" && [
   "unknown", "context-overflow", "auth", "permission", "security-policy", "quota", "invalid-request",
-  "provider-transient", "activation-window-lost", "child-exit-before-admission", "preparation-timeout", "failing-preparation",
+  "provider-transient", "activation-window-lost", "child-exit-before-admission", "preparation-timeout", "failing-preparation", "registry-update-vetoed", "registry-changed-repeatedly",
   "relaunch", "stop", "error", "worker-unverified", "run-dir-missing", "worker-gone", "worker-pid-reused",
 ].includes(reason) ? reason : "unknown";
 /** Mesh key of an actor's alarm claim for one kind; the blocked kind keeps its #7782 key. */
@@ -697,17 +697,24 @@ const restoredActivationBlock = (stored: { reason: string; code: string; since: 
         classification: complete ? "permanent: context window exceeded (complete run evidence)"
           : "fail-closed: legacy overflow lacks complete matching run evidence; explicit session reset required" };
   }
-  const rederive = legacyOverflow !== undefined || typeof stored.classification !== "string" || REDERIVED_BLOCK_CODES.has(stored.code);
-  const derived = legacyOverflow ?? (!rederive ? { code: stored.code, classification: stored.classification as string }
-    : (({ code, classification }) => ({ code, classification: code === stored.code && typeof stored.classification === "string"
+  // Older veto writers persisted the Actor preparation wrapper as the public reason. Always
+  // normalize a known veto, even with a classification; only exact canonical reasons survive.
+  const knownVeto = stored.code === "registry-update-vetoed";
+  const knownRegistryChanged = stored.code === "registry-changed-repeatedly";
+  const rederive = knownVeto || knownRegistryChanged || legacyOverflow !== undefined || typeof stored.classification !== "string" || REDERIVED_BLOCK_CODES.has(stored.code);
+  const derived: { code: string; classification: string; reason?: string | undefined } = legacyOverflow ?? (!rederive ? { code: stored.code, classification: stored.classification as string }
+    : (({ code, classification, reason }) => ({ code, reason, classification: !knownVeto && !knownRegistryChanged && code === stored.code && typeof stored.classification === "string"
       ? stored.classification : `${classification} (re-derived from an older record's stored reason)` }))(
-      classifyActivationFailure({ lastError: stored.reason, preparation: stored.code === "failing-preparation" ||
-        stored.code === "preparation-timeout" })));
+      classifyActivationFailure({ lastError: stored.reason,
+        error: (knownVeto || knownRegistryChanged) && typeof stored.classification === "string" ? stored.classification : undefined,
+        persistedRegistryVeto: knownVeto ? "known-code" : REDERIVED_BLOCK_CODES.has(stored.code) ? "legacy" : undefined,
+        persistedRegistryChangedRepeatedly: knownRegistryChanged ? "known-code" : REDERIVED_BLOCK_CODES.has(stored.code) ? "legacy" : undefined,
+        preparation: stored.code === "failing-preparation" || stored.code === "preparation-timeout" })));
   const transient = TRANSIENT_ACTIVATION_BLOCK_CODES.has(derived.code);
-  return { reason: stored.reason, code: derived.code, class: activationBlockClass(derived.code), since: stored.since,
+  return { reason: derived.reason ?? (knownVeto || knownRegistryChanged ? derived.classification : stored.reason), code: derived.code, class: activationBlockClass(derived.code), since: stored.since,
     blockedAt: finitePositive(stored.blockedAt) ? stored.blockedAt : stored.since, count: stored.count,
     classification: derived.classification, ...(overflowEvidence ? { overflowEvidence } : {}),
-    ...(transient && finitePositive(stored.retryAt) ? { retryAt: stored.retryAt } : {}),
+    ...(transient ? { retryAt: finitePositive(stored.retryAt) ? stored.retryAt : stored.since + activationBlockBackoffMs(stored.count) } : {}),
     ...(transient && finitePositive(stored.backoffMs) ? { backoffMs: stored.backoffMs } : {}) };
 };
 type ActorDeadLetter = { at: number; source: string; event: MeshEvent; batchQueued?: true; supersededSends?: DeliverySend[] };
@@ -728,13 +735,14 @@ export class ActorPreparationTimeoutError extends ActorPreparationError {
   }
 }
 
-/** smarty-dev#6509: a preparation deadline or deferred mesh write blocks as transient,
- * never for good. The existing preparation-timeout block is the retryable category. */
-const preparationRetryable = (error: unknown): boolean => {
+/** Only known preparation deadlines/deferred mesh writes and registry vetoes may expire.
+ * Keep the typed veto distinct: it committed nothing, but is not a timeout. */
+const preparationFailureKind = (error: unknown): true | "timeout" | ActorRegistryUpdateVetoedError => {
   for (let cause: unknown = error, depth = 0; cause instanceof Error && depth < 4; cause = cause.cause, depth++) {
-    if (cause instanceof ActorPreparationTimeoutError || cause instanceof AgentLaunchPreparationTimeoutError || Boolean(isMeshWriteDeferred(cause))) return true;
+    if (cause instanceof ActorRegistryUpdateVetoedError) return cause;
+    if (cause instanceof ActorPreparationTimeoutError || cause instanceof AgentLaunchPreparationTimeoutError || Boolean(isMeshWriteDeferred(cause))) return "timeout";
   }
-  return false;
+  return true;
 };
 
 export class ActorManager {
@@ -5141,6 +5149,7 @@ export class ActorManager {
           }
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
+          const preparationKind = preparationFailureKind(error);
           if (error instanceof AgentLaunchPreparationTimeoutError && error.launchOutcome === "unlaunched") {
             this.#slotLaunchUnknown.delete(actor.id);
           }
@@ -5216,7 +5225,7 @@ export class ActorManager {
                 Math.min(item.preparationAttempts ?? 0, ACTOR_PREPARATION_BACKOFF.length) - 1]!;
               if ((item.preparationAttempts ?? 0) > ACTOR_PREPARATION_MAX_RETRIES) {
                 this.#noteFailedActivation(actor, message, runId, false, ACTOR_FAILURE_NOTICE_AFTER,
-                  preparationRetryable(error) ? "timeout" : true);
+                  preparationKind);
               }
             }
             retryDrain = true;
@@ -5237,7 +5246,8 @@ export class ActorManager {
           item.reject?.(error instanceof ActorContextOverflowError ? error : new Error(message));
           this.#noteFailedActivation(actor, message, runId, abortController.signal.aborted || runStopped,
             retryPreparation && (item.preparationAttempts ?? 0) >= ACTOR_PREPARATION_MAX_RETRIES ? ACTOR_FAILURE_NOTICE_AFTER : 0,
-            false, error instanceof ActorContextOverflowError, runEvidence, item.overflowRetried === true);
+            preparationKind instanceof ActorRegistryUpdateVetoedError ? preparationKind : false,
+            error instanceof ActorContextOverflowError, runEvidence, item.overflowRetried === true);
           // A callerless event that failed here is not retried: it is dropped (smarty-dev#9332).
           if (!item.resolve && !item.reject && !abortController.signal.aborted && !runStopped) {
             for (const event of this.#batchItems(actor.id, item)) this.#noteDroppedEvent(actor, event, message, runId);
@@ -5397,7 +5407,7 @@ export class ActorManager {
   // Counts consecutive failed activations and, once per streak, tells the owner's Main:
   // a blind supervisor is otherwise silent for as long as it stays broken.
   #noteFailedActivation(actor: ManagedActor, error: string, runId: string | undefined, interrupted: boolean, countFloor = 0,
-    preparation: boolean | "timeout" = false, contextOverflowCode = false, evidence?: readonly string[], overflowRetried = false): void {
+    preparation: boolean | "timeout" | ActorRegistryUpdateVetoedError = false, contextOverflowCode = false, evidence?: readonly string[], overflowRetried = false): void {
     // An interrupt (ESC), a stop or a shutdown is not a failing actor, and a notice that
     // starts a turn must never cut through the stop-the-world halt.
     if (interrupted || this.#halted || this.#closing) return;
@@ -5417,7 +5427,9 @@ export class ActorManager {
     // smarty-dev#3238 round 2: context-overflow comes only from the run's typed CONTEXT_OVERFLOW code.
     // Fail closed (smarty-dev#8487): only an explicitly transient cause may expire.
     const failure = classifyManagerActivationFailure({ lastError, error, evidence,
-      preparation: preparation === true, preparationTimeout: preparation === "timeout" }, contextOverflowCode && !preparation);
+      preparation: preparation === true, preparationTimeout: preparation === "timeout",
+      registryVeto: preparation instanceof ActorRegistryUpdateVetoedError ? preparation.reason : false },
+      contextOverflowCode && !preparation);
     const classified = contextOverflowCode && !preparation && !CONTRADICTORY_OVERFLOW_CODES.has(failure.code)
       ? { code: "context-overflow", transient: false, classification: "permanent: context window exceeded (typed CONTEXT_OVERFLOW run code)" }
       : failure;
@@ -5426,7 +5438,7 @@ export class ActorManager {
       ? { code: "unknown", transient: false,
         classification: `fail-closed: overflow text without the run's typed CONTEXT_OVERFLOW code (${classified.classification})` }
       : classified;
-    const reason = lastError.slice(0, 300);
+    const reason = failure.reason ?? lastError.slice(0, 300);
     const previous = actor.activationBlocked;
     const now = Date.now();
     const count = previous?.code === code ? previous.count + 1 : 1;
@@ -7292,13 +7304,19 @@ export class ActorManager {
         const states = owned.map(actor => ({ actor, updatedAt: actor.updatedAt, status: actor.status,
           append: this.#unarchivedMessages.get(actor), count: this.#unarchivedMessages.get(actor)?.length }));
         return { actors, durable: removedIds.size > 0 || options?.durable === true || this.#registrySaveDurable,
-          validate: () => (options?.assertHeld?.(), !signal?.aborted) && revision === this.#registrySaveRevision && ownership.unchanged() &&
-            states.every(({ actor, updatedAt, status, append, count }) => this.#actors.get(actor.id) === actor &&
+          validate: () => {
+            options?.assertHeld?.();
+            if (signal?.aborted) return "cancelled";
+            if (revision !== this.#registrySaveRevision) return "revision";
+            if (!ownership.unchanged()) return "ownership";
+            return states.every(({ actor, updatedAt, status, append, count }) => this.#actors.get(actor.id) === actor &&
               actor.updatedAt === updatedAt && actor.status === status && !this.#ceded.has(actor.id) &&
               // update() invokes validate under registry custody in BOTH the
               // optimistic path and its fallback. No pre-await check is authority.
               (actor.removal !== undefined || this.#slotCurrent(actor)) &&
-              !this.#finishCalls.has(actor.id) && append === this.#unarchivedMessages.get(actor) && append?.length === count),
+              !this.#finishCalls.has(actor.id) && append === this.#unarchivedMessages.get(actor) && append?.length === count)
+              ? true : "actor-state";
+          },
           value: { owned, revoked, actors, saved, revision,
             appends: new Map(owned.map(actor => [actor, [...(this.#unarchivedMessages.get(actor) ?? [])]])) } };
       });

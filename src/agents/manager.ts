@@ -5717,8 +5717,9 @@ export class AgentManager {
       const transport = managed.transport;
       void transport.closed?.then(() => this.#releaseProvenGone(), () => this.#releaseProvenGone());
     }
-    if (!managed.finalAnswer && managed.transport.kind === "process" && process.platform === "win32" &&
+    if (!managed.executionExited && !managed.finalAnswer && managed.transport.kind === "process" && process.platform === "win32" &&
         managed.transport.waitForClose && !managed.lostContact && !managed.launchCancelled) {
+      // A completed host drain already joined and proved exit; do not reopen its release fence.
       // The logical result can precede native close. An existing stop is also
       // an ownership obligation, not a reason to omit the native release join.
       // This ownership outlives nativeReleasePending when close is unconfirmed.

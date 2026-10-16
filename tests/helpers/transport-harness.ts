@@ -821,16 +821,20 @@ export async function openRealAdapterPair(kind: "file" | "nats", required = fals
   })();
   try {
     if (kind === "nats") {
-      server = await natsModule!.createPathBHarness({ binary: binary!, tls: {} });
-      const [{ jetstream, jetstreamManager }, { ensureTransportStream }, { openNatsKvForMachine }, subjects] = await Promise.all([
-        import("@nats-io/jetstream"), import("../../src/transport/nats/provision.js"),
+      server = await natsModule!.createPathBHarness({ binary: binary!, tls: { dnsNames: ["localhost"], ipAddresses: [] } });
+      const [{ X509Certificate }, { readFileSync }] = await Promise.all([import("node:crypto"), import("node:fs")]);
+      if (!server.tls || new X509Certificate(readFileSync(server.tls.certFile)).subjectAltName !== "DNS:localhost") {
+        throw new Error("C fixture requires the actual server certificate to have only DNS:localhost, never an IP SAN");
+      }
+      const [{ openBootstrapNatsConnection }, { ensureTransportStream }, { openNatsKvForMachine }, subjects] = await Promise.all([
+        import("../../src/transport/nats/connection.js"), import("../../src/transport/nats/provision.js"),
         import("../../src/transport/nats/kv.js"), import("../../src/transport/nats/subjects.js"),
       ]);
       // This bootstrap connection only provisions; close it before opening either runtime
       // carrier. The reset probe below uses a SEPARATE admin connection solely for its fault.
-      const bootstrap = await server.connect(server.users.bootstrap);
+      const bootstrap = await openBootstrapNatsConnection(server.runtimeOptions(server.users.bootstrap));
       try {
-        const manager = await jetstreamManager(bootstrap), js = jetstream(bootstrap);
+        const { manager, js } = bootstrap;
         const policy = { maxBytes: 1_073_741_824, maxAgeMs: 0, maxMessageBytes: 1_048_576,
           duplicateWindowMs: contractTiming.duplicateWindowMs, replicas: 1 as const };
         await ensureTransportStream(manager, { ...policy, name: subjects.ADVISORY_CAPTURE_STREAM,
@@ -862,10 +866,11 @@ export async function openRealAdapterPair(kind: "file" | "nats", required = fals
     const kvReadiness: RealKvReadiness | undefined = server ? {
       reset: async (bucket, prefix, signal) => {
         signal.throwIfAborted();
-        const admin = await server!.connect(server!.users.bootstrap);
+        const { openBootstrapNatsConnection } = await import("../../src/transport/nats/connection.js");
+        const admin = await openBootstrapNatsConnection(server!.runtimeOptions(server!.users.bootstrap));
         try {
-          const { jetstreamManager } = await import("@nats-io/jetstream");
-          const manager = await jetstreamManager(admin), stream = `KV_fabric_${bucket}`;
+          const { manager } = admin;
+          const stream = `KV_fabric_${bucket}`;
           const subject = `$KV.fabric_${bucket}.${prefix}`;
           const active = [];
           // One bounded LIST, not consumer-info polling. Delete ONLY the exact live watch.
@@ -1004,10 +1009,10 @@ export async function openRealAdapterPair(kind: "file" | "nats", required = fals
           // Bootstrap was closed before BOTH factory opens (including E12 USER.INFO).
           // This new admin connection exists ONLY for the explicitly labelled capacity fault.
           // It neither expands runtime/operator grants nor mutates any consumer or message.
-          const admin = await server!.connect(server!.users.bootstrap);
+          const { openBootstrapNatsConnection } = await import("../../src/transport/nats/connection.js");
+          const admin = await openBootstrapNatsConnection(server!.runtimeOptions(server!.users.bootstrap));
           try {
-            const { jetstreamManager } = await import("@nats-io/jetstream");
-            const manager = await jetstreamManager(admin);
+            const { manager } = admin;
             const before = await boundedReceipt(manager.streams.info(stream), "T11 fault: read stored byte count");
             if (before.state.messages !== 1 || before.state.bytes <= 0 || before.config.discard !== "new") {
               throw new Error("T11 capacity fault requires one retained message in a DiscardNew stream");
@@ -1023,11 +1028,11 @@ export async function openRealAdapterPair(kind: "file" | "nats", required = fals
           } finally { await admin.close(); }
         },
         report: async () => {
-          const operator = await server!.connect(server!.users.maintainer);
+          const { openNatsConnection } = await import("../../src/transport/nats/connection.js");
+          const operator = await openNatsConnection(server!.operatorOptions());
           try {
-            const { jetstreamManager } = await import("@nats-io/jetstream");
             // E19 permits STREAM.INFO, not account administration or a message read.
-            const manager = await jetstreamManager(operator, { checkAPI: false });
+            const { manager } = operator;
             return metadata(await boundedReceipt(manager.streams.info(stream), "T11 E15 report-only operator STREAM.INFO"));
           } finally { await operator.close(); }
         },

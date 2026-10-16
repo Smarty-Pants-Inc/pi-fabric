@@ -226,7 +226,7 @@ const broker = async (ctx: TestContext) => {
   for (const file of ["dist/worker.js", "dist/index.js", "dist/native/manifest.json", "dist/residency/launcher.js", "dist/residency/pi-entry.js"]) {
     if (!fs.existsSync(path.join(REPO, file))) throw new Error(`Required native artifact missing: ${file}; parent must build`);
   }
-  const h = await createPathBHarness({ binary, tls: {} }); brokers.push(h);
+  const h = await createPathBHarness({ binary, tls: { dnsNames: ["localhost"], ipAddresses: [] } }); brokers.push(h);
   const machineOptions = h.runtimeOptions(h.users.machineA);
   // Separate bootstrap credential is used ONLY for provisioning, then closed.
   // Neither native runtime receives it. No operator body read or relay grant.

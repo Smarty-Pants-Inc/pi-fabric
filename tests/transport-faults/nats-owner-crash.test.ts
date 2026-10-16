@@ -74,7 +74,7 @@ function unknown(result: Settlement): void {
 }
 
 async function fixture() {
-  const server = await createPathBHarness({ binary: binary!, tls: {} });
+  const server = await createPathBHarness({ binary: binary!, tls: { dnsNames: ["localhost"], ipAddresses: [] } });
   const root = path.join(server.root, "native-owner");
   const paths = fixturePaths(root);
   const children: OwnedNatsOwner[] = [];

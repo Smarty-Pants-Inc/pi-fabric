@@ -91,7 +91,7 @@ function command(to: FabricTransport["self"], id: string): TransportEnvelope {
 
 /** Fresh server/store per case; setup authority is never supplied to a runtime. */
 async function fixture() {
-  const harness = await createPathBHarness({ binary: binary!, tls: {} });
+  const harness = await createPathBHarness({ binary: binary!, tls: { dnsNames: ["localhost"], ipAddresses: [] } });
   const transports: FabricTransport[] = [];
   const meshes: MeshStore[] = [];
   const abort = new AbortController();

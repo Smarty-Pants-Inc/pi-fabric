@@ -241,6 +241,26 @@ describe("Path B real nats-server authorization", () => {
     const js = jetstream(nc);
     const oracle = new PermissionOracle(nc);
     const advisorySubject = "$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES.FABRIC_IN_machine-a.rt_fixture";
+    // Probe mutations before either reserved resource exists: a broken grant cannot
+    // destroy the bootstrap stream/durable. Bare CREATE uses name, NOT durable_name.
+    const runtime = await harness.connect(harness.users.machineA);
+    const runtimeOracle = new PermissionOracle(runtime);
+    const bareConfig = JSON.stringify({ stream_name: "FABRIC_ADV", config: { name: PATH_B_ADVISORY_DURABLE, ack_policy: AckPolicy.None } });
+    for (const subject of [
+      "$JS.API.CONSUMER.CREATE.FABRIC_ADV",
+      `$JS.API.CONSUMER.CREATE.FABRIC_ADV.${PATH_B_ADVISORY_DURABLE}`,
+      `$JS.API.CONSUMER.CREATE.FABRIC_ADV.${PATH_B_ADVISORY_DURABLE}.filter`,
+      `$JS.API.CONSUMER.DURABLE.CREATE.FABRIC_ADV.${PATH_B_ADVISORY_DURABLE}`,
+      `$JS.API.CONSUMER.DELETE.FABRIC_ADV.${PATH_B_ADVISORY_DURABLE}`,
+      "$JS.API.STREAM.UPDATE.FABRIC_ADV",
+      "$JS.API.STREAM.DELETE.FABRIC_ADV",
+      "$JS.API.STREAM.PURGE.FABRIC_ADV",
+      "$JS.API.CONSUMER.CREATE.FABRIC_ADV.other_operator",
+      "$JS.API.CONSUMER.DELETE.FABRIC_ADV.other_operator",
+    ]) {
+      await expectDenied(oracle, "publish", subject, () => nc.publish(subject, bareConfig));
+      await expectDenied(runtimeOracle, "publish", subject, () => runtime.publish(subject, bareConfig));
+    }
     await bootstrap.streams.add(streamConfig("FABRIC_ADV", "$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES.>"));
     for (const name of [PATH_B_ADVISORY_DURABLE, "other_operator"]) {
       await bootstrap.consumers.add("FABRIC_ADV", {
@@ -252,11 +272,6 @@ describe("Path B real nats-server authorization", () => {
     expect(before.config.ack_policy).toBe(AckPolicy.None);
     expect(before.config.deliver_subject).toBeUndefined();
     for (const subject of [
-      `$JS.API.CONSUMER.CREATE.FABRIC_ADV.${PATH_B_ADVISORY_DURABLE}`,
-      `$JS.API.CONSUMER.CREATE.FABRIC_ADV.${PATH_B_ADVISORY_DURABLE}.filter`,
-      "$JS.API.CONSUMER.CREATE.FABRIC_ADV.other_operator",
-      `$JS.API.CONSUMER.DELETE.FABRIC_ADV.${PATH_B_ADVISORY_DURABLE}`,
-      "$JS.API.CONSUMER.DELETE.FABRIC_ADV.other_operator",
       "$JS.API.CONSUMER.MSG.NEXT.FABRIC_ADV.other_operator",
       "$JS.API.CONSUMER.INFO.FABRIC_ADV.other_operator",
       "$JS.ACK.FABRIC_ADV.other_operator.1.1.1.1.0",

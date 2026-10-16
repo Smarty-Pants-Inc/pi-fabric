@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { PATH_B_ADVISORY_DURABLE, PATH_B_OPERATOR_MACHINE, pathBRoleTemplate } from "../src/mesh/nats-auth/permissions.js";
+import { PATH_B_ADVISORY_DURABLE, PATH_B_OPERATOR_MACHINE, pathBRoleTemplate, roleTemplate, roleTemplateWithPathB } from "../src/mesh/nats-auth/permissions.js";
 
 const matches = (pattern: string, subject: string): boolean => {
   const p = pattern.split("."), s = subject.split(".");
@@ -44,7 +44,7 @@ describe("Path B NATS grants", () => {
   });
 
   it("gives the operator metadata and fixed advisory rights without reads, relays or lifecycle authority", () => {
-    const template = pathBRoleTemplate("maintainer", PATH_B_OPERATOR_MACHINE, ["ryzen2"]);
+    const template = pathBRoleTemplate("operator", PATH_B_OPERATOR_MACHINE, ["ryzen2"]);
     expect(mayPublish(template, "$JS.API.STREAM.CREATE.FABRIC_IN_ryzen2")).toBe(false);
     expect(mayPublish(template, "$JS.API.STREAM.UPDATE.FABRIC_ADV")).toBe(false);
     expect(mayPublish(template, "$JS.API.STREAM.INFO.FABRIC_IN_ryzen2")).toBe(true);
@@ -73,12 +73,43 @@ describe("Path B NATS grants", () => {
     expect(mayPublish(template, "$JS.API.DIRECT.GET.FABRIC_IN_ryzen2")).toBe(false);
   });
 
+  it("reserves all advisory mutation forms for every opted-in nonbootstrap role without narrowing normal maintainer allows", () => {
+    const streams = { custodyStream: "TEST_CUSTODY", livenessStream: "TEST_LIVENESS" };
+    const reserved = [
+      "$JS.API.CONSUMER.CREATE.FABRIC_ADV",
+      "$JS.API.CONSUMER.CREATE.FABRIC_ADV.transport_dlq_operator",
+      "$JS.API.CONSUMER.CREATE.FABRIC_ADV.transport_dlq_operator.>",
+      "$JS.API.CONSUMER.DURABLE.CREATE.FABRIC_ADV.>",
+      "$JS.API.CONSUMER.DELETE.FABRIC_ADV.transport_dlq_operator",
+      "$JS.API.STREAM.UPDATE.FABRIC_ADV",
+      "$JS.API.STREAM.DELETE.FABRIC_ADV",
+      "$JS.API.STREAM.PURGE.FABRIC_ADV",
+    ];
+    for (const role of ["principal", "agent", "maintainer", "operator"] as const) {
+      const template = roleTemplateWithPathB(role, streams, ["ryzen2"]);
+      for (const subject of reserved) expect(template.pub.deny, `${role}: ${subject}`).toContain(subject);
+      for (const subject of [...reserved, "$JS.API.CONSUMER.CREATE.FABRIC_ADV.transport_dlq_operator.filter", "$JS.API.CONSUMER.DURABLE.CREATE.FABRIC_ADV.transport_dlq_operator"]) {
+        expect(mayPublish(template, subject), `${role}: ${subject}`).toBe(false);
+      }
+    }
+    for (const role of ["principal", "maintainer"] as const) {
+      const base = roleTemplate(role, streams);
+      const opted = roleTemplateWithPathB(role, streams);
+      expect(opted.pub.allow).toEqual(base.pub.allow);
+      expect(opted.pub.deny).toEqual([...base.pub.deny, ...reserved.slice(0, 3), "$JS.API.CONSUMER.CREATE.FABRIC_ADV.>", ...reserved.slice(3)]);
+      expect(opted.sub).toEqual(base.sub);
+      expect(mayPublish(opted, "$JS.API.CONSUMER.CREATE.OTHER.reader")).toBe(true);
+      expect(mayPublish(opted, "$JS.API.CONSUMER.DELETE.OTHER.reader")).toBe(true);
+    }
+    expect(roleTemplateWithPathB("break-glass", streams)).toEqual(roleTemplate("break-glass", streams));
+  });
+
   it("rejects unsafe machine literals and keeps template values fresh", () => {
     expect(() => pathBRoleTemplate("agent", "ryzen.1")).toThrow("invalid machine");
     expect(() => pathBRoleTemplate("agent", PATH_B_OPERATOR_MACHINE)).toThrow("invalid machine");
     expect(() => pathBRoleTemplate("agent", "fabric-ops-canary")).toThrow("invalid machine");
-    expect(pathBRoleTemplate("maintainer", "fabric-ops-canary", ["ryzen2"]).pub.allow).toContain("$JS.API.CONSUMER.MSG.NEXT.FABRIC_ADV.transport_dlq_operator");
-    expect(() => pathBRoleTemplate("maintainer", "ryzen1", ["ryzen2"])).toThrow("invalid machine");
+    expect(pathBRoleTemplate("operator", "fabric-ops-canary", ["ryzen2"]).pub.allow).toContain("$JS.API.CONSUMER.MSG.NEXT.FABRIC_ADV.transport_dlq_operator");
+    expect(() => pathBRoleTemplate("operator", "ryzen1", ["ryzen2"])).toThrow("invalid machine");
     const first = pathBRoleTemplate("agent");
     first.pub.allow.push("fabric.in.>");
     expect(pathBRoleTemplate("agent").pub.allow).not.toContain("fabric.in.>");

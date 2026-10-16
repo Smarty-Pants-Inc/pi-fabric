@@ -34,7 +34,7 @@ export type Clock = EncodeClock;
 
 export interface ScopedSigningKey {
   key: string;
-  role: NatsRole;
+  role: NatsRole | "operator";
   template: RoleTemplate;
   description?: string;
 }
@@ -124,7 +124,7 @@ const TAG = /^[a-z][a-z0-9_-]{0,31}:[a-z0-9][a-z0-9._-]{0,127}$/;
 const MESH_TAG_VALUE = /^[0-9a-f]{32}$/;
 // One NATS subject, optionally with `{{subject()}}` / `{{tag(x)}}` / `{{name()}}` templates; no whitespace.
 const SUBJECT = /^[A-Za-z0-9_$*>{}().:-]+$/;
-const ROLES: readonly string[] = ["agent", "principal", "maintainer", "break-glass"];
+const ROLES: readonly string[] = ["agent", "principal", "maintainer", "break-glass", "operator"];
 
 const utf8 = new TextEncoder();
 const strictUtf8 = new TextDecoder("utf-8", { fatal: true });

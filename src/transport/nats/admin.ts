@@ -1,6 +1,6 @@
 import { existsSync, openSync, closeSync, fsyncSync, readFileSync, writeSync } from "node:fs";
 import { openNatsConnection } from "./connection.js";
-import { consumeDeadLetters, createDeadLetterPublisher, ensureDeadLetterConsumer, type DeadLetterEnvelope, type DeadLetterSink } from "./dead-letter.js";
+import { consumeDeadLetters, ensureDeadLetterConsumer, type DeadLetterEnvelope, type DeadLetterSink } from "./dead-letter.js";
 import { openNatsKv } from "./kv.js";
 import { ensureTransportStream, type TransportStreamPolicy } from "./provision.js";
 import {
@@ -49,22 +49,32 @@ const operatorMachineArg = (args: readonly string[]): string => {
   return validateMachine(machine);
 };
 
+// Dedupe is an internal stable tuple, never a persisted ID or advisory-supplied field.
+const captureKey = (record: DeadLetterEnvelope): string => JSON.stringify([record.stream, record.consumer, record.stream_seq]);
 const jsonLineSink = (file: string): DeadLetterSink => {
   const seen = new Set<string>();
   if (existsSync(file)) {
     for (const line of readFileSync(file, "utf8").split("\n")) {
       if (!line) continue;
-      try { const id = (JSON.parse(line) as { id?: unknown }).id; if (typeof id === "string") seen.add(id); } catch { /* retain the append-only log */ }
+      try {
+        const record = JSON.parse(line) as DeadLetterEnvelope | null;
+        if (record && typeof record.stream === "string" && typeof record.consumer === "string" &&
+          Number.isSafeInteger(record.stream_seq) && record.stream_seq > 0 &&
+          Number.isSafeInteger(record.deliveries) && record.deliveries >= 5) seen.add(captureKey(record));
+      } catch { /* retain the append-only log */ }
     }
   }
   return {
     async put(envelope: DeadLetterEnvelope): Promise<void> {
-      if (seen.has(envelope.id)) return;
-      const record = JSON.stringify({ ...envelope, original: envelope.original ? Buffer.from(envelope.original).toString("base64") : undefined });
+      const key = captureKey(envelope);
+      if (seen.has(key)) return;
+      // Whitelist at the persistence boundary, even if a caller later grows the in-memory type.
+      const record = JSON.stringify({ stream: envelope.stream, consumer: envelope.consumer,
+        stream_seq: envelope.stream_seq, deliveries: envelope.deliveries });
       const fd = openSync(file, "a", 0o600);
       try { writeSync(fd, `${record}\n`); fsyncSync(fd); }
       finally { closeSync(fd); }
-      seen.add(envelope.id);
+      seen.add(key);
     },
   };
 };
@@ -89,9 +99,6 @@ async function provision(args: readonly string[]): Promise<void> {
     for (const target of machines) {
       await ensureTransportStream(connection.manager, streamPolicy(transportInboxStream(target), [transportInboxStreamSubject(target),], 0));
     }
-    // No runtime events port in v1; the operator still needs a durable home for public dispositions/alarms.
-    // Only this separately authorized bootstrap command creates streams, never dlq/orphan.
-    await ensureTransportStream(connection.manager, streamPolicy("FABRIC_EV", ["fabric.ev.>"], 0));
     process.stdout.write(`${JSON.stringify({ ok: true, advisory: ADVISORY_CAPTURE_STREAM, machines })}\n`);
   } finally {
     await connection.close();
@@ -167,20 +174,13 @@ async function dlq(args: readonly string[]): Promise<void> {
   process.once("SIGINT", stop);
   process.once("SIGTERM", stop);
   try {
-    const publisher = createDeadLetterPublisher({ js: connection.js, machine, machines });
     const audit = jsonLineSink(process.env.PI_FABRIC_DLQ_PATH?.trim() || "fabric-dead-letters.jsonl");
     const count = await consumeDeadLetters({
       manager: connection.manager,
       js: connection.js,
       signal: controller.signal,
       once: args.includes("--once"),
-      sink: {
-        async put(envelope): Promise<void> {
-          // A local log is an audit copy, not the public durable disposition or relay receipt.
-          await publisher.put(envelope);
-          await audit.put(envelope);
-        },
-      },
+      sink: audit,
       machines,
     });
     process.stdout.write(`${JSON.stringify({ ok: true, captured: count })}\n`);

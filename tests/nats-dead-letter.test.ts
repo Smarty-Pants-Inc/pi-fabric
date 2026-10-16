@@ -5,13 +5,16 @@ import { AckPolicy, DeliverPolicy, ReplayPolicy, type JetStreamClient, type JetS
 import { PermissionViolationError, type NatsConnection } from "@nats-io/transport-node";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { runTransportAdmin } from "../src/transport/nats/admin.js";
-import { consumeDeadLetters, createDeadLetterPublisher, deadLetterId, type DeadLetterEnvelope } from "../src/transport/nats/dead-letter.js";
-import { ADVISORY_CAPTURE_STREAM, transportDurableName, transportInboxFilter, transportInboxStream, transportInboxSubject } from "../src/transport/nats/subjects.js";
-import { createPathBHarness, openJetStream, resolveNatsBinary, PATH_B_MACHINES, type PathBHarness } from "./helpers/nats-cluster.js";
+import { consumeDeadLetters, ensureDeadLetterConsumer, type DeadLetterEnvelope, type DeadLetterSink } from "../src/transport/nats/dead-letter.js";
+import { openNatsConnection, type NatsConnectionHandle } from "../src/transport/nats/connection.js";
+import { ensureTransportStream } from "../src/transport/nats/provision.js";
+import { ADVISORY_CAPTURE_STREAM, transportAdvisoryStreamSubject, transportDurableName, transportInboxFilter, transportInboxStream, transportInboxSubject } from "../src/transport/nats/subjects.js";
+import { createPathBHarness, openJetStream, resolveNatsBinary, PATH_B_MACHINES, type PathBHarness, type PathBUser } from "./helpers/nats-cluster.js";
 
-// Keep reasons: trust boundary (credential-bound routing), data safety (no original ACK/delete),
-// and crash recovery across the broker/operator boundary. No external server or broadened role.
+// Keep reasons: trust boundary (real report-only credential), data safety (metadata only),
+// and AckNone crash semantics across the broker/operator boundary. No broadened runtime role.
 const binary = resolveNatsBinary();
+if (!binary && process.env.NATS_AUTH_REQUIRED === "1") throw new Error("NATS_AUTH_REQUIRED=1 but no nats-server executable was found");
 const API_TIMEOUT_MS = 2_500;
 const OPERATOR_DURABLE = "transport_dlq_operator";
 let fixture: PathBHarness;
@@ -20,6 +23,18 @@ let operator: { manager: JetStreamManager; js: JetStreamClient };
 let operatorNc: NatsConnection;
 let sender: { manager: JetStreamManager; js: JetStreamClient };
 let receiver: { manager: JetStreamManager; js: JetStreamClient };
+let connections: NatsConnectionHandle[] = [];
+const captured: DeadLetterEnvelope[] = [];
+const permissionErrors: string[] = [];
+
+async function verified(user: PathBUser, harness = fixture): Promise<NatsConnectionHandle> {
+  const connection = await openNatsConnection({ servers: harness.serverUrl, credentials: user.credsPath, machine: user.machine });
+  connections.push(connection);
+  connection.onStatus((event) => {
+    if (event.type === "error" && event.error instanceof PermissionViolationError) permissionErrors.push(event.error.subject);
+  });
+  return connection;
+}
 
 async function storedMessage(manager: JetStreamManager, stream: string, seq: number) {
   const msg = await manager.streams.getMessage(stream, { seq });
@@ -27,18 +42,21 @@ async function storedMessage(manager: JetStreamManager, stream: string, seq: num
   return msg;
 }
 
-async function capture(sink = createDeadLetterPublisher({ js: operator.js, machine: "fabric-ops", machines: PATH_B_MACHINES })): Promise<number> {
-  return consumeDeadLetters({ ...operator, sink, machines: PATH_B_MACHINES, signal: AbortSignal.timeout(10_000), once: true });
+async function capture(sink: DeadLetterSink = { async put(record) { captured.push(record); } }): Promise<number> {
+  const count = await consumeDeadLetters({ ...operator, sink, machines: PATH_B_MACHINES, signal: AbortSignal.timeout(10_000), once: true });
+  await connections.find((connection) => connection.js === operator.js)!.nc.flush();
+  expect(permissionErrors).toEqual([]); // Includes forbidden ACK/NAK/TERM attempts on malformed records.
+  return count;
 }
 
-async function exhaust(options: { kind?: "command" | "ack"; corruptSource?: boolean; sourceMachine?: "machine-a" | "machine-b" } = {}) {
+async function exhaust() {
   const hostId = `runtime:${randomUUID()}`;
   const replyTo = `session:${randomUUID()}`;
   const commandId = randomUUID();
   const commandEventId = randomUUID();
   const targetId = randomUUID();
-  const kind = options.kind ?? "command";
-  const sourceMachine = options.sourceMachine ?? "machine-a";
+  const kind = "command";
+  const sourceMachine = "machine-a";
   const durable = transportDurableName(hostId);
   await receiver.manager.consumers.add(transportInboxStream("machine-b"), {
     durable_name: durable, filter_subject: transportInboxFilter("machine-b", hostId),
@@ -46,20 +64,19 @@ async function exhaust(options: { kind?: "command" | "ack"; corruptSource?: bool
     ack_wait: 30_000_000_000, max_deliver: 5, max_ack_pending: 128,
   });
   const envelope = {
-    id: kind === "command" ? commandEventId : `ack:${commandEventId}`, kind,
-    to: { machine: "machine-b", hostId }, targetId, operation: kind === "command" ? "followUp" : "accepted",
+    id: commandEventId, kind,
+    to: { machine: "machine-b", hostId }, targetId, operation: "followUp",
     from: { id: replyTo, name: "sender", kind: "main" }, createdAt: Date.now(),
-    body: kind === "command" ? {
+    body: {
       version: 1, commandId, targetId, operation: "followUp", replyTo,
       requestedAt: Date.now(), deadlineAt: Date.now() + 60_000,
       message: "private command payload must not leak to the public DLQ",
-      // This untrusted field must never select the relay machine.
       sourceMachine: "machine-b",
-    } : { version: 1, commandId, targetId, accepted: true },
+    },
   };
-  const wire = { format: 1, sourceMachine: options.corruptSource ? "machine-b" : sourceMachine, envelope };
-  const subject = transportInboxSubject("machine-b", hostId, kind === "command" ? "cmd" : "ack", targetId, sourceMachine);
-  const sent = await (sourceMachine === "machine-a" ? sender : receiver).js.publish(subject, JSON.stringify(wire), { msgID: envelope.id });
+  const wire = { format: 1, sourceMachine, envelope };
+  const subject = transportInboxSubject("machine-b", hostId, "cmd", targetId, sourceMachine);
+  const sent = await sender.js.publish(subject, JSON.stringify(wire), { msgID: envelope.id });
   const consumer = await receiver.js.consumers.get(transportInboxStream("machine-b"), durable);
   for (let attempt = 1; attempt <= 5; attempt += 1) {
     const msg = await consumer.next({ expires: API_TIMEOUT_MS });
@@ -73,22 +90,19 @@ async function exhaust(options: { kind?: "command" | "ack"; corruptSource?: bool
   expect(adv.state.messages).toBe(1);
   const advisory = await storedMessage(bootstrap.manager, ADVISORY_CAPTURE_STREAM, adv.state.last_seq);
   const letter: DeadLetterEnvelope = {
-    id: deadLetterId({ stream: sent.stream, consumer: durable, streamSeq: sent.seq }),
-    stream: sent.stream, consumer: durable, streamSequence: sent.seq, deliveries: 5,
-    original: Buffer.from(JSON.stringify(wire)), originalSubject: subject, originalExpired: false,
-    advisory: advisory.json(),
+    stream: sent.stream, consumer: durable, stream_seq: sent.seq, deliveries: 5,
   };
   return { sent, durable, subject, wire, replyTo, commandId, commandEventId, targetId, advisory, letter };
 }
 
-async function publicRecords() {
-  const info = await bootstrap.manager.streams.info("FABRIC_EV");
-  const records: Array<{ subject: string; id: string; topic: string; data: Record<string, unknown>; sourceMachine: string }> = [];
-  for (let seq = info.state.first_seq; seq <= info.state.last_seq && info.state.messages > 0; seq += 1) {
-    const msg = await storedMessage(bootstrap.manager, "FABRIC_EV", seq);
-    records.push({ ...msg.json<{ id: string; topic: string; data: Record<string, unknown>; sourceMachine: string }>(), subject: msg.subject });
-  }
-  return records;
+async function noPublicStream() {
+  await expect(bootstrap.manager.streams.info("FABRIC_EV")).rejects.toThrow(/stream not found/i);
+}
+
+function adminCapture(file: string) {
+  vi.stubEnv("PI_FABRIC_NATS_CREDENTIALS", fixture.users.maintainer.credsPath);
+  vi.stubEnv("PI_FABRIC_DLQ_PATH", file);
+  return runTransportAdmin(["dlq", "--once", "--machines", PATH_B_MACHINES.join(",")]);
 }
 
 beforeEach(async () => {
@@ -101,116 +115,139 @@ beforeEach(async () => {
   vi.stubEnv("PI_FABRIC_NATS_SERVERS", fixture.serverUrl);
   vi.stubEnv("PI_FABRIC_NATS_CREDENTIALS", fixture.users.bootstrap.credsPath);
   await runTransportAdmin(["provision", "--machines", PATH_B_MACHINES.join(",")]);
+  captured.length = 0;
+  permissionErrors.length = 0;
+  connections = [];
+  operator = await verified(fixture.users.maintainer);
+  // Separate native connection exposes real permission events without consuming the handle's monitor.
   operatorNc = await fixture.connect(fixture.users.maintainer);
-  operator = await openJetStream(operatorNc);
-  sender = await openJetStream(await fixture.connect(fixture.users.machineA));
-  receiver = await openJetStream(await fixture.connect(fixture.users.machineB));
+  sender = await verified(fixture.users.machineA);
+  receiver = await verified(fixture.users.machineB);
 }, 60_000);
 
 afterEach(async () => {
   vi.unstubAllEnvs();
+  await Promise.all(connections.map((connection) => connection.close()));
   if (fixture) await fixture.stop();
 });
 
-describe("standard durable MAX_DELIVERIES operator with actual Path B operator credentials", () => {
+describe.skipIf(!binary)("standard durable MAX_DELIVERIES operator with actual Path B operator credentials", () => {
   it("refuses a missing bootstrap-owned advisory durable without trying to create or repair it", async () => {
     if (!binary) throw new Error("missing real nats-server binary");
     const missing = await createPathBHarness({ binary });
+    let restricted: NatsConnectionHandle | undefined;
     try {
       const seed = await openJetStream(await missing.connect(missing.users.bootstrap));
       await seed.manager.streams.add({ name: ADVISORY_CAPTURE_STREAM, subjects: ["$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES.>"] });
-      const restricted = await openJetStream(await missing.connect(missing.users.maintainer));
+      restricted = await openNatsConnection({ servers: missing.serverUrl, machine: missing.users.maintainer.machine,
+        credentials: missing.users.maintainer.credsPath });
       await expect(consumeDeadLetters({ ...restricted, machines: PATH_B_MACHINES,
         sink: { async put() { throw new Error("no advisory should be delivered"); } },
         once: true, signal: AbortSignal.timeout(5_000),
       })).rejects.toThrow(/consumer not found/i);
       expect(await seed.manager.consumers.list(ADVISORY_CAPTURE_STREAM).next()).toEqual([]);
-    } finally { await missing.stop(); }
+    } finally { await restricted?.close(); await missing.stop(); }
   });
-  it("recovers retained advisories after operator downtime and durably publishes a DLQ, owner alarm and outcome-unknown relay", async () => {
+  it("UPGRADE: bootstrap adds the missing AckNone durable, operator reports, repeat bootstrap is a no-op", async () => {
+    if (!binary) throw new Error("missing real nats-server binary");
+    const upgrade = await createPathBHarness({ binary });
+    try {
+      const seed = await openJetStream(await upgrade.connect(upgrade.users.bootstrap));
+      await ensureTransportStream(seed.manager, {
+        name: ADVISORY_CAPTURE_STREAM, subjects: [transportAdvisoryStreamSubject],
+        maxBytes: 1_073_741_824, maxAgeMs: 30 * 24 * 60 * 60_000,
+        maxMessageBytes: 64 * 1024, duplicateWindowMs: 10 * 60_000, replicas: 1,
+      });
+      await expect(seed.manager.consumers.info(ADVISORY_CAPTURE_STREAM, OPERATOR_DURABLE)).rejects.toThrow(/consumer not found/i);
+      vi.stubEnv("PI_FABRIC_MACHINE", upgrade.users.bootstrap.machine);
+      vi.stubEnv("PI_FABRIC_NATS_SERVERS", upgrade.serverUrl);
+      vi.stubEnv("PI_FABRIC_NATS_CREDENTIALS", upgrade.users.bootstrap.credsPath);
+      expect(await runTransportAdmin(["provision", "--machines", PATH_B_MACHINES.join(",")])).toBe(0);
+      const created = await seed.manager.consumers.info(ADVISORY_CAPTURE_STREAM, OPERATOR_DURABLE);
+      expect(created.config.ack_policy).toBe(AckPolicy.None);
+      const record = { stream: transportInboxStream("machine-b"), consumer: transportDurableName("upgrade"), stream_seq: 1, deliveries: 5 };
+      await seed.js.publish(`$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES.${record.stream}.${record.consumer}`,
+        JSON.stringify({ type: "io.nats.jetstream.advisory.v1.max_deliver", ...record }));
+      const log = path.join(upgrade.root, "upgrade-report.jsonl");
+      vi.stubEnv("PI_FABRIC_NATS_CREDENTIALS", upgrade.users.maintainer.credsPath);
+      vi.stubEnv("PI_FABRIC_DLQ_PATH", log);
+      expect(await runTransportAdmin(["dlq", "--once", "--machines", PATH_B_MACHINES.join(",")])).toBe(0);
+      expect(JSON.parse(readFileSync(log, "utf8"))).toEqual(record);
+      const before = await seed.manager.consumers.info(ADVISORY_CAPTURE_STREAM, OPERATOR_DURABLE);
+      vi.stubEnv("PI_FABRIC_NATS_CREDENTIALS", upgrade.users.bootstrap.credsPath);
+      expect(await runTransportAdmin(["provision", "--machines", PATH_B_MACHINES.join(",")])).toBe(0);
+      const after = await seed.manager.consumers.info(ADVISORY_CAPTURE_STREAM, OPERATOR_DURABLE);
+      expect(after.created).toBe(created.created);
+      expect(after.config).toEqual(before.config);
+      expect([after.delivered, after.ack_floor, after.num_pending, after.num_ack_pending])
+        .toEqual([before.delivered, before.ack_floor, before.num_pending, before.num_ack_pending]);
+    } finally { await upgrade.stop(); }
+  }, 60_000);
+
+  it.each([
+    { ack_policy: AckPolicy.Explicit },
+    { filter_subject: "$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES.FABRIC_IN_machine-a.>" },
+    { deliver_policy: DeliverPolicy.New },
+    { replay_policy: ReplayPolicy.Original },
+    { inactive_threshold: 60_000_000_000 },
+    { headers_only: true },
+    { deliver_subject: "_INBOX.push-drift" },
+  ])("refuses drift without bootstrap or operator repair: %j", async (drift) => {
+    if (!binary) throw new Error("missing real nats-server binary");
+    const isolated = await createPathBHarness({ binary });
+    let restricted: NatsConnectionHandle | undefined;
+    try {
+      const seed = await openJetStream(await isolated.connect(isolated.users.bootstrap));
+      await seed.manager.streams.add({ name: ADVISORY_CAPTURE_STREAM, subjects: [transportAdvisoryStreamSubject] });
+      await seed.manager.consumers.add(ADVISORY_CAPTURE_STREAM, {
+        durable_name: OPERATOR_DURABLE, filter_subject: transportAdvisoryStreamSubject,
+        ack_policy: AckPolicy.None, deliver_policy: DeliverPolicy.All, replay_policy: ReplayPolicy.Instant, ...drift,
+      });
+      const before = await seed.manager.consumers.info(ADVISORY_CAPTURE_STREAM, OPERATOR_DURABLE);
+      restricted = await openNatsConnection({ servers: isolated.serverUrl, machine: isolated.users.maintainer.machine,
+        credentials: isolated.users.maintainer.credsPath });
+      await expect(consumeDeadLetters({ ...restricted, machines: PATH_B_MACHINES,
+        sink: { async put() { throw new Error("must not pull drifted consumer"); } }, once: true,
+        signal: AbortSignal.timeout(5_000),
+      })).rejects.toThrow("configuration drift");
+      await expect(ensureDeadLetterConsumer(seed.manager)).rejects.toThrow("configuration drift");
+      expect((await seed.manager.consumers.info(ADVISORY_CAPTURE_STREAM, OPERATOR_DURABLE)).config).toEqual(before.config);
+    } finally { await restricted?.close(); await isolated.stop(); }
+  }, 60_000);
+  it("captures exactly standard MAX5 metadata while preserving the private inbox (E19)", async () => {
     const test = await exhaust();
     const before = await receiver.manager.consumers.info(test.sent.stream, test.durable);
     expect(await capture()).toBe(1);
-    const records = await publicRecords();
-    expect(records).toHaveLength(2);
-    expect(records[0]).toMatchObject({ id: test.letter.id, topic: "fabric.ops.dlq", sourceMachine: "fabric-ops", subject: "fabric.ev.fabric-ops.fabric.ops.dlq",
-      data: { stream: test.sent.stream, consumer: test.durable, streamSequence: test.sent.seq, disposition: "outcome-unknown" } });
-    expect(records[1]).toMatchObject({ id: `${test.letter.id}:alarm`, topic: "fabric.ops.owner.alarm" });
-    expect(JSON.stringify(records)).not.toContain("private command payload");
-    const stored = await storedMessage(bootstrap.manager, transportInboxStream("machine-a"), 1);
-    expect(stored.subject).toBe(transportInboxSubject("machine-a", test.replyTo, "ack", test.targetId, "fabric-ops"));
-    const relay = stored.json<{ format: number; sourceMachine: string; envelope: { id: string; body: Record<string, unknown> } }>();
-    expect(relay).toMatchObject({ format: 1, sourceMachine: "fabric-ops", envelope: { id: `relay:${test.commandEventId}`, kind: "ack", operation: "rejected", to: { machine: "machine-a", hostId: test.replyTo } } });
-    expect(test.commandEventId).not.toBe(test.commandId);
-    expect(relay.envelope.id).not.toBe(`relay:${test.commandId}`);
-    expect(relay.envelope.body).toEqual({
-      version: 1, commandId: test.commandId, commandEventId: test.commandEventId, targetId: test.targetId, accepted: false,
-      error: "Relay destination unavailable", errorCode: "FABRIC_RELAY_DESTINATION_UNAVAILABLE", retryable: true,
-    });
-    expect(relay.envelope.body).not.toHaveProperty("notRun");
-    expect(relay.envelope.body).not.toHaveProperty("notDelivered");
-    expect(relay.envelope.body).not.toHaveProperty("ownerIncarnation");
-    const operatorInfo = await operator.manager.consumers.info(ADVISORY_CAPTURE_STREAM, OPERATOR_DURABLE);
-    expect(operatorInfo.num_ack_pending).toBe(0);
-    expect(operatorInfo.config.max_deliver).toBe(-1);
+    expect(captured).toEqual([test.letter]);
+    const info = await operator.manager.consumers.info(ADVISORY_CAPTURE_STREAM, OPERATOR_DURABLE);
+    expect(info.config).toMatchObject({ durable_name: OPERATOR_DURABLE, ack_policy: AckPolicy.None,
+      deliver_policy: DeliverPolicy.All, replay_policy: ReplayPolicy.Instant, filter_subject: transportAdvisoryStreamSubject });
+    expect(info.config.deliver_subject).toBeUndefined();
+    expect(info.config.inactive_threshold ?? 0).toBe(0);
+    expect(info.num_ack_pending).toBe(0);
     expect((await storedMessage(bootstrap.manager, test.sent.stream, test.sent.seq)).json()).toEqual(test.wire);
-    const ownerInfo = await receiver.manager.consumers.info(test.sent.stream, test.durable);
-    expect(ownerInfo.ack_floor.stream_seq).toBe(0);
-    expect({ pending: ownerInfo.num_pending, ackPending: ownerInfo.num_ack_pending, ackFloor: ownerInfo.ack_floor }).toEqual({ pending: before.num_pending, ackPending: before.num_ack_pending, ackFloor: before.ack_floor });
-
-    // A second retained copy of the same advisory gets reconciled by all three stable Nats-Msg-Id values.
-    await bootstrap.js.publish(test.advisory.subject, test.advisory.data);
-    expect(await capture()).toBe(1);
-    expect(await publicRecords()).toEqual(records);
-    expect((await bootstrap.manager.streams.info(transportInboxStream("machine-a"))).state.messages).toBe(1);
+    const after = await receiver.manager.consumers.info(test.sent.stream, test.durable);
+    expect([after.num_pending, after.num_ack_pending, after.ack_floor]).toEqual([before.num_pending, before.num_ack_pending, before.ack_floor]);
+    expect((await bootstrap.manager.streams.info(transportInboxStream("machine-a"))).state.messages).toBe(0);
+    await noPublicStream();
   }, 30_000);
 
-  it("reserves the whole operator namespace and accepts literal fabric-ops role variants (E16b)", () => {
-    expect(() => createDeadLetterPublisher({ js: operator.js, machine: "machine-a", machines: PATH_B_MACHINES })).toThrow("fabric-ops namespace operator");
-    expect(() => createDeadLetterPublisher({ js: operator.js, machine: "fabric-ops", machines: [...PATH_B_MACHINES, "fabric-ops"] })).toThrow("excluding the fabric-ops namespace");
-    expect(() => createDeadLetterPublisher({ js: operator.js, machine: "fabric-ops", machines: [...PATH_B_MACHINES, "fabric-ops-other1"] })).toThrow("excluding the fabric-ops namespace");
-    expect(() => createDeadLetterPublisher({ js: operator.js, machine: "fabric-ops-canary2", machines: PATH_B_MACHINES })).not.toThrow();
-    expect(() => createDeadLetterPublisher({ js: operator.js, machines: PATH_B_MACHINES })).not.toThrow();
-  });
-
-  it("can publish from an operator machine outside the runtime inventory without widening its grants", async () => {
-    const test = await exhaust({ sourceMachine: "machine-b" });
-    const publisher = createDeadLetterPublisher({ js: operator.js, machine: "fabric-ops", machines: ["machine-b"] });
-    expect(await capture(publisher)).toBe(1);
-    expect((await publicRecords())[0]?.data.disposition).toBe("outcome-unknown");
-    const relay = await storedMessage(bootstrap.manager, transportInboxStream("machine-b"), 2);
-    expect(relay.subject).toBe(transportInboxSubject("machine-b", test.replyTo, "ack", test.targetId, "fabric-ops"));
-    expect(relay.json()).toMatchObject({ sourceMachine: "fabric-ops", envelope: { id: `relay:${test.commandEventId}`, to: { machine: "machine-b", hostId: test.replyTo } } });
-  });
-
-  it("uses the real admin dlq path, not a local-JSONL-only substitute", async () => {
+  it("persists only four fields and dedupes JSONL by tuple across CLI invocations", async () => {
     const test = await exhaust();
     const audit = path.join(fixture.root, "dead-letters.jsonl");
-    vi.stubEnv("PI_FABRIC_MACHINE", "machine-a");
-    vi.stubEnv("PI_FABRIC_NATS_SERVERS", fixture.serverUrl);
-    vi.stubEnv("PI_FABRIC_NATS_CREDENTIALS", fixture.users.maintainer.credsPath);
-    vi.stubEnv("PI_FABRIC_DLQ_PATH", audit);
-    expect(await runTransportAdmin(["dlq", "--once", "--machines", PATH_B_MACHINES.join(",")])).toBe(0);
-    expect(await publicRecords()).toHaveLength(2);
-    expect((await bootstrap.manager.streams.info(transportInboxStream("machine-a"))).state.messages).toBe(1);
-    const local = JSON.parse(readFileSync(audit, "utf8")) as Record<string, unknown>;
-    expect(local.id).toBe(test.letter.id);
-    expect(local.originalSubject).toBe(test.subject);
+    expect(await adminCapture(audit)).toBe(0);
+    const extra = { ...test.advisory.json<Record<string, unknown>>(), id: "untrusted-id", body: "private", reason: "invented", deliveries: 6 };
+    await bootstrap.js.publish(test.advisory.subject, JSON.stringify(extra));
+    expect(await adminCapture(audit)).toBe(0);
+    expect(readFileSync(audit, "utf8").trim().split("\n").map((line) => JSON.parse(line))).toEqual([test.letter]);
+    // A distinct tuple must not collide with the duplicate's supplied ID or field ordering.
+    await bootstrap.js.publish(test.advisory.subject, JSON.stringify({ ...extra, stream_seq: test.sent.seq + 1 }));
+    expect(await adminCapture(audit)).toBe(0);
+    expect(readFileSync(audit, "utf8").trim().split("\n").map((line) => JSON.parse(line))).toEqual([
+      test.letter, { ...test.letter, stream_seq: test.sent.seq + 1, deliveries: 6 },
+    ]);
+    await noPublicStream();
   }, 30_000);
-
-  it("publishes only a DLQ and alarm for an exhausted ACK, never a relay-of-a-relay", async () => {
-    await exhaust({ kind: "ack" });
-    expect(await capture()).toBe(1);
-    expect((await publicRecords())[0]?.data.disposition).toBe("ack-exhausted");
-    expect((await bootstrap.manager.streams.info(transportInboxStream("machine-a"))).state.messages).toBe(0);
-  });
-
-  it("does not trust a sourceMachine field that disagrees with the credential-bound original subject", async () => {
-    await exhaust({ corruptSource: true });
-    expect(await capture()).toBe(1);
-    expect((await publicRecords())[0]?.data.disposition).toBe("invalid-original");
-    expect((await bootstrap.manager.streams.info(transportInboxStream("machine-a"))).state.messages).toBe(0);
-  });
 
   it("rejects advisory inventory/subject/shape attacks before a valid retained advisory", async () => {
     const consumer = transportDurableName("malformed");
@@ -221,38 +258,48 @@ describe("standard durable MAX_DELIVERIES operator with actual Path B operator c
     await bootstrap.js.publish(subject, JSON.stringify({ ...base, consumer: transportDurableName("somebody-else") }));
     await bootstrap.js.publish(subject, JSON.stringify({ ...base, stream_seq: -1 }));
     await bootstrap.js.publish(subject, JSON.stringify({ ...base, deliveries: 4 }));
-    // A valid advisory with an original which genuinely isn't present: alarm without an invented relay route.
-    await bootstrap.js.publish(subject, JSON.stringify(base));
+    // --once takes just one record even when it is malformed; no speculative next delivery.
+    for (let index = 0; index < 5; index += 1) {
+      expect(await capture()).toBe(0);
+      expect(captured).toEqual([]);
+    }
+    await bootstrap.js.publish(subject, JSON.stringify({ ...base, body: "private", reason: "not metadata" }));
     expect(await capture()).toBe(1);
-    const records = await publicRecords();
-    expect(records).toHaveLength(2);
-    expect(records[0]?.data).toMatchObject({ originalExpired: true, disposition: "original-unavailable" });
+    expect(captured).toEqual([{ stream: base.stream, consumer, stream_seq: 1, deliveries: 5 }]);
     expect((await operator.manager.consumers.info(ADVISORY_CAPTURE_STREAM, OPERATOR_DURABLE)).num_ack_pending).toBe(0);
     expect((await bootstrap.manager.streams.info(transportInboxStream("machine-a"))).state.messages).toBe(0);
   });
 
-  it("does not ACK an advisory or invent a relay when the broker refuses a required public alarm publication", async () => {
-    await exhaust();
-    // Only the fixture bootstrap scope changes this owned stream's capacity. The operator just publishes.
-    await bootstrap.manager.streams.update("FABRIC_EV", { max_msgs: 1 });
-    await expect(capture()).rejects.toBeInstanceOf(Error);
-    expect((await publicRecords()).map((record) => record.topic)).toEqual(["fabric.ops.dlq"]);
-    expect((await operator.manager.consumers.info(ADVISORY_CAPTURE_STREAM, OPERATOR_DURABLE)).num_ack_pending).toBe(1);
-    expect((await bootstrap.manager.streams.info(transportInboxStream("machine-a"))).state.messages).toBe(0);
-  });
-
-  it("does not ACK the advisory if a disposition fails after PubAck; a retry reconciles the durable publications", async () => {
+  it("does not prefetch the next AckNone record; untaken advisories survive server restart", async () => {
     const test = await exhaust();
-    const publisher = createDeadLetterPublisher({ js: operator.js, machine: "fabric-ops", machines: PATH_B_MACHINES });
-    await expect(capture({ async put(letter) { await publisher.put(letter); throw new Error("crash after publication before advisory ACK"); } })).rejects.toThrow("crash after publication");
-    expect((await operator.manager.consumers.info(ADVISORY_CAPTURE_STREAM, OPERATOR_DURABLE)).num_ack_pending).toBe(1);
-    expect(await publicRecords()).toHaveLength(2);
-    // Restart the operator, preserving its durable consumer. AckWait is 30 s, no private pull or ACK workaround.
-    expect(await consumeDeadLetters({ ...operator, sink: publisher, machines: PATH_B_MACHINES, signal: AbortSignal.timeout(40_000), once: true })).toBe(1);
-    expect(await publicRecords()).toHaveLength(2);
-    expect((await bootstrap.manager.streams.info(transportInboxStream("machine-a"))).state.messages).toBe(1);
-    expect((await operator.manager.consumers.info(ADVISORY_CAPTURE_STREAM, OPERATOR_DURABLE)).num_ack_pending).toBe(0);
-    expect((await storedMessage(bootstrap.manager, test.sent.stream, test.sent.seq)).json()).toEqual(test.wire);
+    await bootstrap.js.publish(test.advisory.subject, JSON.stringify({ ...test.advisory.json<Record<string, unknown>>(), stream_seq: test.sent.seq + 1 }));
+    expect(await capture()).toBe(1);
+    expect((await operator.manager.consumers.info(ADVISORY_CAPTURE_STREAM, OPERATOR_DURABLE)).num_pending).toBe(1);
+    await Promise.all(connections.map((connection) => connection.close()));
+    connections = [];
+    await fixture.restart();
+    bootstrap = await openJetStream(await fixture.connect(fixture.users.bootstrap));
+    operator = await verified(fixture.users.maintainer);
+    expect(await capture()).toBe(1);
+    expect(captured).toEqual([test.letter, { ...test.letter, stream_seq: test.sent.seq + 1 }]);
+    expect((await operator.manager.streams.info(ADVISORY_CAPTURE_STREAM)).state.messages).toBe(2);
+  }, 60_000);
+
+  it("does not redeliver a taken record after sink crash/restart, but Limits retains it", async () => {
+    const test = await exhaust();
+    await expect(capture({ async put() { throw new Error("sink crash"); } })).rejects.toThrow("sink crash");
+    await Promise.all(connections.map((connection) => connection.close()));
+    connections = [];
+    await fixture.restart();
+    bootstrap = await openJetStream(await fixture.connect(fixture.users.bootstrap));
+    operator = await verified(fixture.users.maintainer);
+    expect(await capture()).toBe(0);
+    expect(captured).toEqual([]);
+    const info = await operator.manager.consumers.info(ADVISORY_CAPTURE_STREAM, OPERATOR_DURABLE);
+    expect([info.num_pending, info.num_ack_pending]).toEqual([0, 0]);
+    // INFO gives retention counts, not authority to reconstruct exact records from those counts.
+    expect((await operator.manager.streams.info(ADVISORY_CAPTURE_STREAM)).state.messages).toBe(1);
+    expect((await storedMessage(bootstrap.manager, ADVISORY_CAPTURE_STREAM, test.advisory.seq)).json()).toEqual(test.advisory.json());
   }, 60_000);
 
   it("drain reports real pending, ACK-pending and ACK floor without inventing a rollback receipt (E16c)", async () => {
@@ -315,7 +362,7 @@ describe("standard durable MAX_DELIVERIES operator with actual Path B operator c
     expect(policy.config.max_bytes).toBe(1_073_741_824);
     expect(policy.state.messages).toBe(3);
     expect(await Promise.all(sent.map(async (ack) => (await storedMessage(bootstrap.manager, stream, ack.seq)).string()))).toEqual(["retained-orphan-message-1", "retained-orphan-message-2", "retained-orphan-message-3"]);
-    expect((await bootstrap.manager.streams.info("FABRIC_EV")).state.messages).toBe(0);
+    await noPublicStream();
     expect((await bootstrap.manager.streams.info(transportInboxStream("machine-a"))).state.messages).toBe(0);
   });
 
@@ -324,13 +371,23 @@ describe("standard durable MAX_DELIVERIES operator with actual Path B operator c
     await expect(runTransportAdmin(["orphan"])).rejects.toThrow("--machine");
     await expect(runTransportAdmin(["orphan", "--machine", "ungranted-machine", "--host-id", "runtime:test", "--machines", PATH_B_MACHINES.join(",")])).rejects.toThrow("outside the configured inventory");
     await expect(runTransportAdmin(["orphan", "--machine", "machine-b", "--machines", PATH_B_MACHINES.join(",")])).rejects.toThrow("--host-id");
-    expect((await bootstrap.manager.streams.info("FABRIC_EV")).state.messages).toBe(0);
+    await noPublicStream();
   });
 
-  it("the actual operator cannot list/pull/ack/delete private consumers or administer streams", async () => {
+  it("T-OPS-NOREAD: actual operator denies private reads, every ACK form, relay/events and lifecycle", async () => {
     const test = await exhaust();
     const before = await receiver.manager.consumers.info(test.sent.stream, test.durable);
     const subjects = [
+      ...[...PATH_B_MACHINES.map(transportInboxStream), ADVISORY_CAPTURE_STREAM, "UNLISTED_PRIVATE"].flatMap((stream) => [
+        `$JS.API.STREAM.MSG.GET.${stream}`, `$JS.API.DIRECT.GET.${stream}`, `$JS.API.DIRECT.GET.${stream}.private.subject`,
+        ...["+ACK", "-NAK", "+TERM"].map((_, index) => `$JS.ACK.${stream}.probe.${index + 1}.1.1.1.0`),
+      ]),
+      `$JS.ACK.${ADVISORY_CAPTURE_STREAM}.${OPERATOR_DURABLE}.1.1.1.1.0`,
+      transportInboxSubject("machine-a", "session:denied-relay", "ack", "target-denied", "fabric-ops"),
+      "fabric.ev.fabric-ops.fabric.ops.dlq",
+      "fabric.ev.fabric-ops.fabric.ops.owner.alarm",
+      "$JS.API.CONSUMER.INFO.FABRIC_IN_unlisted.other",
+      "$JS.API.STREAM.INFO.FABRIC_IN_unlisted",
       `$JS.API.CONSUMER.LIST.${test.sent.stream}`,
       `$JS.API.CONSUMER.MSG.NEXT.${test.sent.stream}.${test.durable}`,
       `$JS.ACK.${test.sent.stream}.${test.durable}.1.1.1.1.0`,
@@ -355,7 +412,10 @@ describe("standard durable MAX_DELIVERIES operator with actual Path B operator c
       return denied;
     })();
     try {
-      subjects.forEach((subject) => operatorNc.publish(subject, "{}"));
+      subjects.forEach((subject) => {
+        const ackIndex = subject.startsWith("$JS.ACK.") ? Number(subject.split(".").at(-5)) - 1 : -1;
+        operatorNc.publish(subject, ["+ACK", "-NAK", "+TERM"][ackIndex] ?? "{}");
+      });
       await operatorNc.flush();
       const timeout = AbortSignal.timeout(5_000);
       const denied = await Promise.race([errors, new Promise<never>((_, reject) => timeout.addEventListener("abort", () => reject(new Error("missing operator permission denial")), { once: true }))]);
@@ -364,6 +424,6 @@ describe("standard durable MAX_DELIVERIES operator with actual Path B operator c
     const after = await receiver.manager.consumers.info(test.sent.stream, test.durable);
     expect({ pending: after.num_pending, ackPending: after.num_ack_pending, ackFloor: after.ack_floor }).toEqual({ pending: before.num_pending, ackPending: before.num_ack_pending, ackFloor: before.ack_floor });
     expect((await storedMessage(bootstrap.manager, test.sent.stream, test.sent.seq)).json()).toEqual(test.wire);
-    expect((await bootstrap.manager.streams.info("FABRIC_EV")).state.messages).toBe(0);
+    await noPublicStream();
   }, 30_000);
 });

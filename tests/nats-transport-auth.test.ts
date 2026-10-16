@@ -8,6 +8,7 @@ import { ADVISORY_CAPTURE_STREAM, transportAdvisoryStreamSubject, transportInbox
 import { createPathBHarness, resolveNatsBinary, type PathBHarness } from "./helpers/nats-cluster.js";
 
 const binary = resolveNatsBinary();
+if (!binary && process.env.NATS_AUTH_REQUIRED === "1") throw new Error("NATS_AUTH_REQUIRED=1 but no nats-server executable was found");
 const MACHINE_A = "machine-a";
 const MACHINE_B = "machine-b";
 let harness: PathBHarness;

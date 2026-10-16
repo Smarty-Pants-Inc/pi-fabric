@@ -15,6 +15,7 @@ import { createPathBHarness, resolveNatsBinary, type PathBHarness } from "./help
 // Keep: the real broker is the trust/data-safety boundary. Only this fixture's
 // ephemeral store and consumers are deleted/restarted; no product server is used.
 const binary = resolveNatsBinary();
+if (!binary && process.env.NATS_AUTH_REQUIRED === "1") throw new Error("NATS_AUTH_REQUIRED=1 but no nats-server executable was found");
 const A = "machine-a";
 const B = "machine-b";
 const OWNER = "runtime-watch#one";

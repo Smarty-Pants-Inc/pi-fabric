@@ -89,7 +89,7 @@ const verifyMachineIdentity = async (nc: NatsConnection, machine: string, timeou
   const data = value && typeof value === "object" ? (value as { data?: { user?: unknown; permissions?: { publish?: { allow?: unknown; deny?: unknown } } } }).data : undefined;
   const allow = data?.permissions?.publish?.allow;
   const deny = data?.permissions?.publish?.deny;
-  const operator = auth?.tags.includes("role:maintainer") ?? false;
+  const operator = auth?.tags.includes("role:operator") ?? false;
   const ownSourceGrant = `fabric.in.*.*.*.*.${machine}`;
   if (!auth || auth.tags.filter((tag) => tag.startsWith("machine:")).length !== 1 || !auth.tags.includes(`machine:${machine}`) || data?.user !== auth.subject ||
     !Array.isArray(allow) || !(operator

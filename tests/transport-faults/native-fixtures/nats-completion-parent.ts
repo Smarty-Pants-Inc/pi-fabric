@@ -12,6 +12,8 @@ import type { AgentHandleInfo, AgentTransportHandle } from "../../../src/agents/
 import { ProcessTransport } from "../../../src/agents/transports/process-transport.js";
 import { runTreeResourceVeto, canRemoveTerminalRun } from "../../../src/storage/retention.js";
 import { residentRoot } from "../../../src/residency/protocol.js";
+import { ResidencyClient } from "../../../src/residency/client.js";
+import { residentProcessAlive } from "../../../src/residency/process-identity.js";
 
 /** Real native Pi context -> production FabricRuntimeState.initialize -> production
  * AgentsProvider -> root session manager (B4), or ResidencyClient -> compiled
@@ -39,6 +41,14 @@ export default function natsCompletionParent(pi: ExtensionAPI): void {
     residentHost: path.join(repo, "dist/residency/launcher.js"), skills: path.join(repo, "skillsets"),
   } });
   let context: ExtensionContext;
+  // Capture ONLY the client initialize() constructs, not another composition.
+  // The explicit recovery command below delegates its public ensureHost().
+  let resident: ResidencyClient | undefined;
+  const startResident = ResidencyClient.prototype.start;
+  ResidencyClient.prototype.start = function (this: ResidencyClient) {
+    if (this.options.config.meshRoot === meshRoot) resident = this;
+    return startResident.call(this);
+  };
   // Session B4 uses the manager initialize() actually constructed. These are
   // observers of its real launches/publications, not a second manager/engine.
   const b4 = new Map<string, { run: string; mode: string; native: AgentTransportHandle; primaryClosed: boolean; treeClosed: boolean | null }>();
@@ -153,6 +163,17 @@ export default function natsCompletionParent(pi: ExtensionAPI): void {
       receiptRenames.set(destination, ++sequence);
       return;
     }
+    if (path.dirname(destination) === path.join(meshRoot, "agent-completions")) {
+      const candidateFile = path.join(meshRoot, "agent-completions", "attempts", path.basename(destination));
+      if (fs.existsSync(candidateFile)) {
+        const candidate = JSON.parse(fs.readFileSync(candidateFile, "utf8"));
+        append("nats-completion-promotions.jsonl", { seam: "E4_OBSERVE_NATIVE_ATTEMPT_PROMOTION", pid: process.pid,
+          sessionId: context.sessionManager.getSessionId(), candidate,
+          supervisorAlive: residentProcessAlive(candidate.supervisor.pid, candidate.supervisor.processStartedAt),
+          receiptPresent: fs.existsSync(path.join(meshRoot, "agent-completions", "receipts", path.basename(destination))),
+          envelopePresentBeforeRename: fs.existsSync(destination) });
+      }
+    }
     if (path.dirname(destination) === path.join(meshRoot, "agent-completions", "archive")) {
       const receiptFile = path.join(meshRoot, "agent-completions", "receipts", path.basename(destination));
       const bodySyncSequence = syncedInodes.get(inode(fs.statSync(receiptFile))) ?? 0;
@@ -197,18 +218,26 @@ export default function natsCompletionParent(pi: ExtensionAPI): void {
       meshRoot: runtime.mesh.root, carrier: runtime.config.mesh.transport, hostTransport: runtime.config.mesh.hostTransport,
       stateBackend: runtime.config.mesh.stateBackend, observationHealth: runtime.observationHealth() });
   });
-  pi.registerCommand("native-nats-completion-spawn", { description: "Spawn through the actual runtime provider", handler: async (_args, ctx) => {
+  pi.registerCommand("native-nats-completion-spawn", { description: "Spawn through the actual runtime provider", handler: async (args, ctx) => {
+    const residency = args.trim() || "durable";
+    if (residency !== "durable" && residency !== "session") throw new Error("Unknown B5 residency");
     // Host-authorized fixture command, not generated code or model authorization.
     // The registry/provider still derives real caller attribution and native scope.
     const handle = await runtime.registry.invoke("agents.spawn", {
       task: "Return the native NATS E4 same-machine result.", model: "boundary-offline/offline", thinking: "off",
-      residency: "durable", runner: "pi", transport: "process", needs: ["local"], extensions: false, tools: [],
+      residency, runner: "pi", transport: "process", needs: ["local"], extensions: false, tools: [],
     }, { cwd: ctx.cwd, extensionContext: ctx, signal: AbortSignal.timeout(60_000),
       parentToolCallId: "native-nats-e4", nestedToolCallId: "native-nats-e4-spawn",
       approve: async () => {}, audits: [], maxResultChars: 32_000, update() {} }) as AgentHandleInfo;
     const rootId = runtime.mainAgentInfo(ctx).id;
     output("nats-completion-spawned.json", { pid: process.pid, handle,
-      run: path.join(residentRoot(meshRoot, rootId), "runs", handle.id), residencyRoot: residentRoot(meshRoot, rootId) });
+      run: residency === "durable" ? path.join(residentRoot(meshRoot, rootId), "runs", handle.id) : runtime.agents.runDirectory(handle.id),
+      residencyRoot: residentRoot(meshRoot, rootId), residency });
+  } });
+  pi.registerCommand("native-nats-resident-ensure", { description: "Recover through initialize's actual ResidencyClient and compiled launcher", handler: async () => {
+    if (!resident) throw new Error("Actual runtime ResidencyClient was not observed");
+    const owner = await resident.ensureHost();
+    output("nats-resident-restarted.json", { pid: process.pid, owner });
   } });
   pi.registerCommand("native-nats-b4-spawn", { description: "Spawn B4 through the actual root registry", handler: async (args, ctx) => {
     const mode = args.trim();
@@ -257,6 +286,7 @@ export default function natsCompletionParent(pi: ExtensionAPI): void {
     finally {
       AgentCompletionInbox.prototype.enqueue = enqueue; CompletionJournal.prototype.drain = drain;
       CompletionJournal.prototype.save = save; ProcessTransport.prototype.launch = launch;
+      ResidencyClient.prototype.start = startResident;
       fs.fsyncSync = sync; fs.renameSync = rename;
     }
   });

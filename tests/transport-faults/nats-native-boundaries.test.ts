@@ -7,7 +7,7 @@ import path from "node:path";
 import http from "node:http";
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it, type TestContext } from "vitest";
 import { createPathBHarness, openJetStream, resolveNatsBinary, type PathBHarness } from "../helpers/nats-cluster.js";
 import { launchLog, same, stopAllOwned, type LaunchLog, type Owned } from "../helpers/owned-processes.js";
@@ -19,6 +19,7 @@ import { DEFAULT_FABRIC_CONFIG } from "../../src/config.js";
 import { runTreeResourceVeto, canRemoveTerminalRun } from "../../src/storage/retention.js";
 import type { CompletionEnvelope } from "../../src/agents/completion-journal.js";
 import { residentHostId } from "../../src/residency/protocol.js";
+import { readResidentGenerationExit } from "../../src/residency/generation-exit.js";
 
 /** E4 B4/B5 composition check; keep: native custody trust boundary + data safety.
  * Main uses the actual source FabricRuntimeState.initialize with a real native Pi
@@ -258,6 +259,77 @@ const waitLeaseGone = async (leases: NatsKvStore, machine: string, hostId: strin
     }
     throw new Error("lease watch ended before predecessor absence");
   } finally { clearTimeout(timer); abort.abort(); }
+};
+/** Installed only by the hosted host-kill variant, before any native root starts.
+ * Named observers in the ACTUAL compiled host/launcher; no import of source
+ * custody code into those processes and no replacement producer/exit API.
+ * rm(attempt) is saveCompletion's final operation AFTER the durable source save.
+ * ChildProcess close comes from the launcher's actual owned native child.
+ * This generated observer is test scratch, never an executable model answer.
+ */
+const residentObserver = (root: string, inherited: string | undefined): string => {
+  const file = path.join(root, "resident-boundary-observer.mjs");
+  fs.writeFileSync(file, String.raw`import fs from "node:fs";
+import path from "node:path";
+import { ChildProcess } from "node:child_process";
+if (process.env.GITHUB_ACTIONS !== "true" || process.env.FABRIC_NATIVE_PRODUCT_DELETE_HOSTED !== "1") {
+  throw new Error("HOSTED AUTHOR-ONLY: resident boundary observer");
+}
+const root = process.env.FABRIC_NATIVE_BOUNDARY_ROOT;
+const directory = path.join(root, "mesh", "agent-completions");
+const read = file => { try { return JSON.parse(fs.readFileSync(file, "utf8")); } catch { return undefined; } };
+const pins = () => read(path.join(root, "independent-births.json"));
+const birth = pid => {
+  try { const stat = fs.readFileSync("/proc/" + pid + "/stat", "utf8");
+    return stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19]; } catch { return undefined; }
+};
+const append = (file, value) => fs.appendFileSync(path.join(root, file), JSON.stringify(value) + "\n");
+const inode = stat => stat.dev + ":" + stat.ino;
+let sequence = 0;
+const bodies = new Map(), directories = new Map(), renames = new Map();
+const sync = fs.fsyncSync, rename = fs.renameSync, rm = fs.rmSync;
+fs.fsyncSync = function (fd) {
+  const result = sync.call(this, fd);
+  let file; try { file = fs.readlinkSync("/proc/self/fd/" + fd); } catch { return result; }
+  if (!file.startsWith(path.join(root, "mesh") + path.sep)) return result;
+  const stat = fs.fstatSync(fd), at = ++sequence;
+  if (stat.isDirectory()) directories.set(file, at); else bodies.set(inode(stat), at);
+  return result;
+};
+fs.renameSync = function (source, target) {
+  const destination = String(target);
+  if (path.dirname(destination) === directory) {
+    directories.delete(directory);
+    const result = rename.call(this, source, target);
+    renames.set(destination, ++sequence); return result;
+  }
+  return rename.call(this, source, target);
+};
+fs.rmSync = function (...args) {
+  const result = rm.apply(this, args);
+  const pinned = pins();
+  if (!pinned || process.pid !== pinned.ownerBirth.pid || birth(process.pid) !== pinned.ownerBirth.started ||
+      String(args[0]) !== path.join(directory, "attempts", pinned.name)) return result;
+  const sourceFile = path.join(directory, pinned.name), source = read(sourceFile);
+  if (!source || source.result.id !== pinned.id) return result;
+  append("nats-resident-saves.jsonl", { seam: "E4_OBSERVE_RESIDENT_SOURCE_SAVE", pid: process.pid,
+    birth: birth(process.pid), source, bodySyncSequence: bodies.get(inode(fs.statSync(sourceFile))) ?? 0,
+    sourceRenameSequence: renames.get(sourceFile) ?? 0, directorySyncSequence: directories.get(directory) ?? 0,
+    saveTailSequence: ++sequence, receiptPresent: fs.existsSync(path.join(directory, "receipts", pinned.name)) });
+  return result;
+};
+const emit = ChildProcess.prototype.emit;
+ChildProcess.prototype.emit = function (event, ...args) {
+  const result = emit.call(this, event, ...args);
+  const pinned = event === "close" && pins();
+  if (pinned && this.pid === pinned.ownerBirth.pid) {
+    append("nats-resident-closes.jsonl", { seam: "E4_OBSERVE_LAUNCHER_NATIVE_CLOSE", observerPid: process.pid,
+      observerBirth: birth(process.pid), pid: this.pid, ownerBirth: pinned.ownerBirth, code: args[0], signal: args[1] });
+  }
+  return result;
+};
+`);
+  return `${inherited ?? ""} --import=${pathToFileURL(file).href}`;
 };
 const seenFiles = (root: string): string[] => {
   if (!fs.existsSync(root)) return [];
@@ -519,13 +591,15 @@ describe.skipIf(!HOSTED_PRODUCT_DELETE)("HOSTED AUTHOR-ONLY E4 native NATS B4 â€
 });
 
 describe.skipIf(!HOSTED_PRODUCT_DELETE)("HOSTED AUTHOR-ONLY E4 native NATS B5 â€” actual roots, unchanged same-machine FILE journal", () => {
-  for (const variant of ["durable-close", "durable-main-kill"] as const) {
+  for (const variant of ["durable-close", "durable-main-kill", "durable-host-kill", "session-main-kill"] as const) {
     it(`${variant}: exact native-session restart consumes same-root durable child once, receipt durable BEFORE archive`, async ctx => {
       const transport = await broker(ctx); if (!transport) throw new Error("missing broker fixture");
       const { h, leases, presence, manager, noCompletionCarrier } = transport;
       const cli = path.join(REPO, "node_modules/@earendil-works/pi-coding-agent/dist/cli.js");
       if (!fs.existsSync(cli)) throw new Error("Pinned native Pi CLI is missing; not an optional broker skip");
-      const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-nats-native-e4-")); roots.push(root);
+      const remaining = variant === "durable-host-kill" || variant === "session-main-kill";
+      const root = fs.mkdtempSync(path.join(remaining ? path.join(REPO, ".local") : os.tmpdir(), "fabric-nats-native-e4-")); roots.push(root);
+      if (remaining) fs.mkdirSync(path.join(root, "runs"), { mode: 0o700 });
       const model = await loopback(root); const log = launchLog(root); logs.push(log);
       const nats = { replicas: 1, servers: [h.serverUrl], machine: "machine-a", credentials: h.users.machineA.credsPath,
         operatorMachine: "fabric-ops", inboxLanes: 8 };
@@ -539,6 +613,12 @@ describe.skipIf(!HOSTED_PRODUCT_DELETE)("HOSTED AUTHOR-ONLY E4 native NATS B5 â€
         PI_FABRIC_MACHINE: "machine-a", PI_FABRIC_NATS_SERVERS: h.serverUrl, PI_FABRIC_NATS_CREDENTIALS: h.users.machineA.credsPath,
         VITE_CACHE_DIR: path.join(REPO, ".local/cache/vite"), XDG_CACHE_HOME: path.join(REPO, ".local/cache/xdg"),
         npm_config_cache: path.join(REPO, ".local/cache/npm"), PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", FABRIC_NATIVE_BOUNDARY_ROOT: root };
+      if (remaining) {
+        const temporary = path.join(root, "tmp"); fs.mkdirSync(temporary, { mode: 0o700 });
+        Object.assign(env, { TMPDIR: temporary, TMP: temporary, TEMP: temporary,
+          PI_FABRIC_RUN_ROOT: path.join(root, "runs"), PI_FABRIC_SESSION_ID: "" });
+      }
+      if (variant === "durable-host-kill") env.NODE_OPTIONS = residentObserver(root, env.NODE_OPTIONS);
       const first = new NativeRpc(root, env, cli);
       const ready = await observeJson(path.join(root, "nats-completion-ready.json"), row => row.pid === first.child.pid);
       expect(ready).toMatchObject({ carrier: "nats", hostTransport: "nats", stateBackend: "file", observationHealth: [] });
@@ -560,23 +640,43 @@ describe.skipIf(!HOSTED_PRODUCT_DELETE)("HOSTED AUTHOR-ONLY E4 native NATS B5 â€
       expect(consumer.config.filter_subject).toBe(transportInboxFilter("machine-a", hostId));
       await noCompletionCarrier();
       model.holdNext();
-      await first.request({ type: "prompt", message: "/native-nats-completion-spawn" });
+      await first.request({ type: "prompt", message: `/native-nats-completion-spawn${variant === "session-main-kill" ? " session" : ""}` });
       const admission = await observeJson(path.join(root, "nats-completion-spawned.json"));
       const id = admission.handle.id as string; const run = admission.run as string;
       await model.requestAt(1);
       const workerBirth = assertLocal(run, log);
       const manifest = json(path.join(run, "completion-recipient.json"));
       expect(manifest).toMatchObject({ meshRoot: path.join(root, "mesh"), recipient: { rootId: hostId, sessionId: state.sessionId } });
-      const config = json(path.join(admission.residencyRoot, "config.json"));
-      expect(config.mesh).toMatchObject({ transport: "nats", hostTransport: "nats", stateBackend: "file", nats });
-      const owner = json(path.join(admission.residencyRoot, "owner.json")); const ownerBirth = identity(log, owner.pid);
+      let owner: Record<string, any> | undefined; let ownerBirth: Owned | undefined; let launcherBirth: Owned | undefined;
       const residentId = residentHostId(hostId);
-      expect((await leases.get<Record<string, any>>(`machine-a.h.${token(residentId)}`))?.value.pid).toBe(ownerBirth.pid);
-      expect(manifest.supervisor.pid).toBe(ownerBirth.pid);
-      const residentConsumer = await manager.consumers.info(transportInboxStream("machine-a"), transportDurableName(residentId));
-      expect(residentConsumer.config.filter_subject).toBe(transportInboxFilter("machine-a", residentId));
+      if (variant !== "session-main-kill") {
+        const config = json(path.join(admission.residencyRoot, "config.json"));
+        expect(config.mesh).toMatchObject({ transport: "nats", hostTransport: "nats", stateBackend: "file", nats });
+        owner = json<Record<string, any>>(path.join(admission.residencyRoot, "owner.json")); ownerBirth = identity(log, owner.pid);
+        expect((await leases.get<Record<string, any>>(`machine-a.h.${token(residentId)}`))?.value.pid).toBe(ownerBirth.pid);
+        expect(manifest.supervisor.pid).toBe(ownerBirth.pid);
+        const residentConsumer = await manager.consumers.info(transportInboxStream("machine-a"), transportDurableName(residentId));
+        expect(residentConsumer.config.filter_subject).toBe(transportInboxFilter("machine-a", residentId));
+        if (variant === "durable-host-kill") {
+          expect(owner.processStartTime).toBe(ownerBirth.started);
+          expect(manifest.supervisor.processStartedAt).toBe(ownerBirth.started);
+          launcherBirth = identity(log, owner.handover.launcher.pid);
+          expect(owner.handover.launcher.processStartTime).toBe(launcherBirth.started);
+        }
+      } else {
+        expect(admission.residency).toBe("session");
+        expect(run).toBe(path.join(root, "runs", id));
+        expect(manifest.supervisor).toEqual({ pid: parentBirth.pid, processStartedAt: parentBirth.started });
+        expect((await presence.get<Record<string, any>>(`machine-a.p.${token(id)}`))?.value)
+          .toMatchObject({ id, ownerHostId: hostId });
+        expect(fs.existsSync(path.join(admission.residencyRoot, "owner.json"))).toBe(false);
+      }
+      expect(json(path.join(run, "status.json")).processStartTime).toBe(workerBirth.started);
+      expect(manifest.recipient).toMatchObject({ rootId: hostId, sessionId: state.sessionId, cwd: root, projectRoot: root });
+      expect(manifest.recipient.name).toEqual(expect.stringMatching(/\S/)); expect(manifest.recipient.startedAt).toBeGreaterThan(0);
       // Record custody BEFORE any kill, using each child's independent launch log.
-      fs.writeFileSync(path.join(root, "independent-births.json"), JSON.stringify({ parentBirth, workerBirth, ownerBirth }));
+      fs.writeFileSync(path.join(root, "independent-births.json"), JSON.stringify({ parentBirth, workerBirth, ownerBirth, launcherBirth,
+        id, name: `${digest(id)}.json` }));
       const directory = path.join(manifest.meshRoot, "agent-completions");
       fs.mkdirSync(directory, { recursive: true });
       const name = `${digest(id)}.json`; const envelopeFile = path.join(directory, name);
@@ -591,14 +691,65 @@ describe.skipIf(!HOSTED_PRODUCT_DELETE)("HOSTED AUTHOR-ONLY E4 native NATS B5 â€
       expect(same(parentBirth)).toBe(false);
       expect(json(parentCustodyFile!)).toMatchObject({ ownerHostId: hostId, pid: parentBirth.pid,
         processStartTime: parentBirth.started, releasedCleanly: variant === "durable-close" });
-      expect(same(workerBirth)).toBe(true); expect(same(ownerBirth)).toBe(true);
+      expect(same(workerBirth)).toBe(true); if (ownerBirth) expect(same(ownerBirth)).toBe(true);
       model.release(1);
-      const envelope = await observeJson(envelopeFile) as unknown as CompletionEnvelope;
-      expect(fs.readdirSync(directory).filter(file => /^[a-f0-9]{64}\.json$/.test(file))).toEqual([name]);
+      const attemptFile = path.join(directory, "attempts", name);
+      let candidate: Record<string, any> | undefined;
+      let envelope: CompletionEnvelope;
+      let settled: Record<string, any>;
+      if (variant === "session-main-kill") {
+        await observeJson(attemptFile);
+        // Worker may save at finality AND again after its native child closes.
+        // Wait for persisted exit before pinning the final candidate's bytes.
+        await observe(run, () => runTreeResourceVeto(run, 0, undefined, true, true) === undefined ? true : undefined,
+          "orphan session worker persisted native exit");
+        expect(same(workerBirth)).toBe(false);
+        candidate = json<Record<string, any>>(attemptFile);
+        expect(candidate).toMatchObject({ format: 1, recipient: manifest.recipient,
+          supervisor: { pid: parentBirth.pid, processStartedAt: parentBirth.started }, result: { id, status: "completed" } });
+        expect(fs.existsSync(envelopeFile)).toBe(false);
+        expect(fs.existsSync(path.join(run, "manager-result.json"))).toBe(false); // Dead manager did not settle.
+        // Expected bytes come from the real worker candidate, never a test save.
+        envelope = { format: 1, recipient: candidate.recipient, result: candidate.result };
+        settled = json(path.join(run, "status.json"));
+      } else {
+        envelope = await observeJson(envelopeFile) as unknown as CompletionEnvelope;
+        expect(fs.readdirSync(directory).filter(file => /^[a-f0-9]{64}\.json$/.test(file))).toEqual([name]);
+        settled = await observeJson(path.join(run, "manager-result.json"));
+      }
       expect(envelope.recipient).toEqual(manifest.recipient); expect(envelope.result.id).toBe(id);
-      const settled = await observeJson(path.join(run, "manager-result.json")); const answer = json(path.join(run, "final-answer.json"));
+      const answer = json(path.join(run, "final-answer.json"));
       expect(envelope.result).toMatchObject({ status: settled.status, text: answer.text, finalAnswerReceipt: { id: answer.id } });
       expect(envelope.result.status).toBe("completed");
+      if (remaining) expect(envelope.result).toMatchObject({ mainAgentId: hostId, fabricSessionId: state.sessionId,
+        spawner: { id: hostId, kind: "main" } });
+      if (variant === "durable-host-kill") {
+        const saves = await observe(root, () => rows(path.join(root, "nats-resident-saves.jsonl")).find(row => row.source.result.id === id),
+          "compiled resident source save tail AFTER real durability barriers");
+        expect(saves).toMatchObject({ seam: "E4_OBSERVE_RESIDENT_SOURCE_SAVE", pid: ownerBirth!.pid,
+          birth: ownerBirth!.started, source: envelope, receiptPresent: false });
+        expect(saves.bodySyncSequence).toBeGreaterThan(0);
+        expect(saves.bodySyncSequence).toBeLessThan(saves.sourceRenameSequence);
+        expect(saves.sourceRenameSequence).toBeLessThan(saves.directorySyncSequence);
+        expect(saves.directorySyncSequence).toBeLessThan(saves.saveTailSequence);
+        expect(same(parentBirth)).toBe(false); expect(fs.existsSync(receiptFile)).toBe(false);
+        // Kill ONLY the independently pinned host, never its process group or
+        // launcher/worker. Actual launcher close below is the exit proof.
+        expect(killRecorded(log, ownerBirth!.pid)).toEqual(ownerBirth);
+        const closed = await observe(root, () => rows(path.join(root, "nats-resident-closes.jsonl")).find(row => row.pid === ownerBirth!.pid),
+          "owning compiled launcher actual resident ChildProcess close");
+        expect(closed).toMatchObject({ seam: "E4_OBSERVE_LAUNCHER_NATIVE_CLOSE", pid: ownerBirth!.pid, ownerBirth,
+          observerPid: launcherBirth!.pid, observerBirth: launcherBirth!.started, code: null, signal: "SIGKILL" });
+        const generationExit = await observe(path.join(admission.residencyRoot, "generations"),
+          () => readResidentGenerationExit(admission.residencyRoot, owner!.token), "launcher-owned exact generation exit record");
+        expect(generationExit).toMatchObject({ generation: owner!.token, writer: "launcher", pid: ownerBirth!.pid,
+          code: null, signal: "SIGKILL" });
+        expect(same(ownerBirth!)).toBe(false); expect(json(envelopeFile)).toEqual(envelope);
+        expect(fs.existsSync(receiptFile)).toBe(false);
+        await observe(run, () => runTreeResourceVeto(run, 0, undefined, true, true) === undefined ? true : undefined,
+          "retained durable worker exit after resident host death");
+        await waitLeaseGone(leases, "machine-a", residentId);
+      }
       expect(fs.existsSync(receiptFile)).toBe(false);
       expect(rows(path.join(root, "nats-completion-enqueued.jsonl"))).toEqual([]);
       await noCompletionCarrier();
@@ -610,7 +761,11 @@ describe.skipIf(!HOSTED_PRODUCT_DELETE)("HOSTED AUTHOR-ONLY E4 native NATS B5 â€
       expect(other.main.id).not.toBe(hostId); expect(other.sessionId).not.toBe(state.sessionId);
       await foreign.request({ type: "prompt", message: "/native-nats-completion-checkpoint" });
       expect(rows(path.join(root, "nats-completion-enqueued.jsonl"))).toEqual([]);
-      expect(fs.existsSync(receiptFile)).toBe(false); expect(json(envelopeFile)).toEqual(envelope);
+      expect(fs.existsSync(receiptFile)).toBe(false);
+      if (variant === "session-main-kill") {
+        expect(json(attemptFile)).toEqual(candidate); expect(fs.existsSync(envelopeFile)).toBe(false);
+        expect(rows(path.join(root, "nats-completion-promotions.jsonl"))).toEqual([]);
+      } else expect(json(envelopeFile)).toEqual(envelope);
       await foreign.crash(log);
       // SIGKILL leaves E8's unclean receipt intact. Wait on the REAL KV expiry
       // event; never delete a lease or manufacture clean predecessor evidence.
@@ -618,6 +773,27 @@ describe.skipIf(!HOSTED_PRODUCT_DELETE)("HOSTED AUTHOR-ONLY E4 native NATS B5 â€
       const resumed = new NativeRpc(root, env, cli, state.sessionFile);
       const resumedReady = await observeJson(path.join(root, "nats-completion-ready.json"), row => row.pid === resumed.child.pid);
       expect(resumedReady.main.id).toBe(hostId); expect(resumedReady.sessionId).toBe(state.sessionId);
+      if (variant === "durable-host-kill") {
+        // A terminal journal need not auto-start an empty resident. Explicitly
+        // recover through THIS runtime's real client, not a second host object.
+        await resumed.request({ type: "prompt", message: "/native-nats-resident-ensure" });
+        const recovered = json(path.join(root, "nats-resident-restarted.json"));
+        expect(recovered.pid).toBe(resumed.child.pid);
+        const nextOwner = recovered.owner; expect(nextOwner.hostId).toBe(residentId); expect(nextOwner.token).not.toBe(owner!.token);
+        const nextBirth = identity(log, nextOwner.pid);
+        expect(nextOwner.processStartTime).toBe(nextBirth.started);
+        const nextLauncher = identity(log, nextOwner.handover.launcher.pid);
+        expect(nextOwner.handover.launcher.processStartTime).toBe(nextLauncher.started);
+        expect(nextLauncher.pid).not.toBe(launcherBirth!.pid);
+        expect((await leases.get<Record<string, any>>(`machine-a.h.${token(residentId)}`))?.value)
+          .toMatchObject({ pid: nextBirth.pid, pidStartTime: nextBirth.started });
+        expect((await manager.consumers.info(transportInboxStream("machine-a"), transportDurableName(residentId))).config.filter_subject)
+          .toBe(transportInboxFilter("machine-a", residentId));
+        // Recovery preserves the saved result; no rerun of the settled child.
+        expect(json(path.join(run, "completion-recipient.json"))).toEqual(manifest);
+        expect(json(path.join(run, "manager-result.json"))).toEqual(settled);
+        expect(log.owned().filter(row => row.argv.includes(id) && row.argv.some(arg => arg.endsWith("worker.js")))).toEqual([workerBirth]);
+      }
       const receipt = await observe<Record<string, any>>(directory, () => fs.existsSync(receiptFile) ? json(receiptFile) : undefined, "native inbox consumed receipt");
       expect(receipt).toMatchObject({ id, sessionId: state.sessionId }); expect(receipt.consumedAt).toBeGreaterThan(0);
       await observe(directory, () => fs.existsSync(archiveFile) && !fs.existsSync(envelopeFile) ? true : undefined, "archive after receipt");
@@ -631,6 +807,14 @@ describe.skipIf(!HOSTED_PRODUCT_DELETE)("HOSTED AUTHOR-ONLY E4 native NATS B5 â€
         result: { id, status: settled.status, finalAnswerReceipt: { id: answer.id } } });
       expect(deliveries()).toHaveLength(1);
       const archived = json<CompletionEnvelope>(archiveFile); expect(archived).toEqual(envelope);
+      if (variant === "session-main-kill") {
+        const promotions = rows(path.join(root, "nats-completion-promotions.jsonl")).filter(row => row.candidate.result.id === id);
+        expect(promotions).toHaveLength(1);
+        expect(promotions[0]).toMatchObject({ seam: "E4_OBSERVE_NATIVE_ATTEMPT_PROMOTION", pid: resumed.child.pid,
+          sessionId: state.sessionId, candidate, supervisorAlive: false, receiptPresent: false, envelopePresentBeforeRename: false });
+        expect(archived.result).toEqual(candidate!.result);
+        expect(json(path.join(run, "completion-recipient.json"))).toEqual(manifest);
+      }
       const order = rows(path.join(root, "nats-completion-order.jsonl")).filter(row => row.receipt.id === id);
       expect(order.length).toBeGreaterThan(0);
       expect(order[0]).toMatchObject({ pid: resumed.child.pid, event: "before-archive", receipt, source: envelope,
@@ -655,6 +839,8 @@ describe.skipIf(!HOSTED_PRODUCT_DELETE)("HOSTED AUTHOR-ONLY E4 native NATS B5 â€
       expect(againReady.main.id).toBe(hostId); expect((await again.request({ type: "get_state" })).sessionId).toBe(state.sessionId);
       await again.request({ type: "prompt", message: "/native-nats-completion-checkpoint" });
       expect(enqueues()).toHaveLength(1); expect(deliveries()).toHaveLength(1); expect(carriers()).toHaveLength(1);
+      if (variant === "session-main-kill") expect(rows(path.join(root, "nats-completion-promotions.jsonl"))
+        .filter(row => row.candidate.result.id === id)).toHaveLength(1);
       expect(mesh.get(claimKey, { fresh: true })).toBeUndefined(); expect(json(receiptFile)).toEqual(receipt);
       await noCompletionCarrier(); await again.crash(log);
     }, 180_000);

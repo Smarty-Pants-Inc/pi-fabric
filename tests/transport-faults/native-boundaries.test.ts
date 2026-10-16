@@ -40,10 +40,10 @@ import { launchLog, same, stopAllOwned, type LaunchLog } from "../helpers/owned-
  * - E4 B5: same-root producer/admission manifest/journal/native Pi inbox.
  *   File-mode source classes are composed explicitly by the fixture. This is
  *   NOT the full fabric-runtime-state composition, a two-host canary, or NATS
- *   evidence. Actual-root NATS durable-close/Main-kill B5 cases now live in
- *   nats-native-boundaries.test.ts, which also authors actual-root session B4
- *   kill/held-final/stop-failure cases (execution coverage must be earned there).
- *   Remaining NATS B5 variants stay explicit gaps.
+ *   evidence. Actual-root NATS B5 durable-close/Main-kill/host-kill and session
+ *   Main-kill/attempt-promotion cases live in nats-native-boundaries.test.ts,
+ *   alongside actual-root session B4 kill/held-final/stop-failure cases.
+ *   All are HOSTED AUTHOR-ONLY; runtime coverage must still be earned there.
  *   No B5 completion ENVELOPE crosses a machine. Remote placement can return
  *   result data to a local manager; these cases pin needs:["local"] instead.
  *   No completion operation, remote ledger, validator or receipt protocol.
@@ -56,11 +56,6 @@ const REQUIRED = process.env.FABRIC_TRANSPORT_REQUIRED === "1";
 const DEADLINE_MS = 30_000;
 const MAIN_MARKER = "NATIVE_MAIN_JOURNAL_REPLAY_ONCE";
 const TASK_MARKER = "NATIVE_TASK_B3_UNCONSUMED_FOLLOW_UP";
-const NATS_DEPENDENCY = "Remaining E4 NATS variant is not authored here. Actual A2 runtime/resident roots exist; " +
-  "nats-native-boundaries.test.ts composes durable-close and durable-main-kill B5 through them with a real JWT broker. " +
-  "NATS B4 kill/held-final/stop-failure is authored there but not implied to have run; " +
-  "B5 durable-host-kill and session-main-kill still need their own actual-root cases. " +
-  "Setting a carrier env on this FILE fixture is not coverage; no passing substitute.";
 const digest = (id: string) => createHash("sha256").update(id).digest("hex");
 const completionFiles = (meshRoot: string, id: string) => {
   const directory = path.join(meshRoot, "agent-completions"); const name = `${digest(id)}.json`;
@@ -911,10 +906,9 @@ describe("E4 T-B5 — file carrier's unchanged same-root completion custody, nat
   }
 });
 
-describe("E4 remaining NATS variants — explicit coverage gaps, NOT a passing substitute", () => {
-  // Actual-root B4 and durable-close/Main-kill B5: nats-native-boundaries.test.ts.
-  // Authorship is not a runtime PASS; both hosted authorization flags still gate it.
-  for (const testCase of ["B5 durable-host-kill", "B5 session-main-kill"]) {
-    it(`${testCase} still needs an authored actual-root NATS case`, ctx => unavailable(ctx, NATS_DEPENDENCY));
-  }
-});
+// All E4 B4/B5 variants now have actual-root NATS bodies in
+// nats-native-boundaries.test.ts. Only the two obsolete NOT-AUTHORED gap rows
+// were removed; every FILE proof body above is unchanged. Remaining REAL gaps:
+// hosted execution of those authored bodies (local guard SKIPs earn no native
+// evidence), independent final review, two-host canary, and power-loss durability.
+// Carrier env alone on this FILE fixture still proves none of those.

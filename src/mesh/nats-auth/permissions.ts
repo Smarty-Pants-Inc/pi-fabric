@@ -165,6 +165,8 @@ function pathBUnique(values: string[]): string[] {
 
 /** Reserved operator principal, deliberately not a host in the runtime inventory (E14). */
 export const PATH_B_OPERATOR_MACHINE = "fabric-ops";
+/** Bootstrap provisions this durable; the messaging operator can bind, never create or delete it. */
+export const PATH_B_ADVISORY_DURABLE = "transport_dlq_operator";
 export const PATH_B_OPERATOR_MACHINE_PATTERN = /^fabric-ops(-[a-z0-9]+)?$/;
 
 function pathBRuntime(roleMachine: string, machines: readonly string[] = []): PathBRoleTemplate {
@@ -213,7 +215,7 @@ function pathBMaintainer(roleMachine: string, machines: readonly string[]): Path
   });
   const allow = [
     "$JS.API.STREAM.INFO.FABRIC_ADV",
-    "$JS.ACK.FABRIC_ADV.>",
+    `$JS.ACK.FABRIC_ADV.${PATH_B_ADVISORY_DURABLE}.>`,
     "$JS.API.STREAM.INFO.FABRIC_EV",
     ...inboxes.flatMap((stream) => [
       `$JS.API.STREAM.INFO.${stream}`,
@@ -223,7 +225,7 @@ function pathBMaintainer(roleMachine: string, machines: readonly string[]): Path
     "$JS.API.STREAM.MSG.GET.KV_fabric_presence",
     "$JS.API.STREAM.INFO.KV_fabric_leases",
     "$JS.API.STREAM.MSG.GET.KV_fabric_leases",
-    ...["CREATE", "INFO", "MSG.NEXT", "DELETE"].map((verb) => `$JS.API.CONSUMER.${verb}.FABRIC_ADV.>`),
+    ...["INFO", "MSG.NEXT"].map((verb) => `$JS.API.CONSUMER.${verb}.FABRIC_ADV.${PATH_B_ADVISORY_DURABLE}`),
     ...inboxes.flatMap((stream) => [`$JS.API.CONSUMER.INFO.${stream}.>`]),
     ...machines.map((machine) => `fabric.in.${machine}.*.ack.*.${roleMachine}`),
     `fabric.ev.${roleMachine}.fabric.ops.>`,
@@ -235,6 +237,8 @@ function pathBMaintainer(roleMachine: string, machines: readonly string[]): Path
     "$JS.API.STREAM.UPDATE.>",
     "$JS.API.STREAM.DELETE.>",
     "$JS.API.STREAM.PURGE.>",
+    "$JS.API.CONSUMER.CREATE.>",
+    "$JS.API.CONSUMER.DELETE.>",
     ...inboxes.flatMap((stream) => [
       `$JS.API.STREAM.MSG.DELETE.${stream}`,
       `$JS.API.DIRECT.GET.${stream}`,

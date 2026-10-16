@@ -10,6 +10,7 @@ import {
 import { PermissionViolationError } from "@nats-io/transport-node";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createPathBHarness, resolveNatsBinary, type PathBHarness } from "./helpers/nats-cluster.js";
+import { PATH_B_ADVISORY_DURABLE } from "../src/mesh/nats-auth/permissions.js";
 
 const API_TIMEOUT_MS = 2_500;
 const DENIAL_TIMEOUT_MS = 2_000;
@@ -224,8 +225,48 @@ describe("Path B real nats-server authorization", () => {
       await expectDenied(machineAOracle, "publish", subject, () => machineANc.publish(subject, "{}"));
     }
 
-    expect(await machineAManager.consumers.delete(STREAM_A, "machine-a-consumer")).toBe(true);
   }, 90_000);
+
+  it("binds only the bootstrap-provisioned advisory durable and refuses all operator consumer lifecycle authority", async () => {
+    if (!harness) throw new Error("Path B harness was not initialized");
+    const bootstrap = await jetstreamManager(await harness.connect(harness.users.bootstrap));
+    const bootstrapJs = jetstream(await harness.connect(harness.users.bootstrap));
+    const nc = await harness.connect(harness.users.maintainer);
+    const manager = await jetstreamManager(nc);
+    const js = jetstream(nc);
+    const oracle = new PermissionOracle(nc);
+    const advisorySubject = "$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES.FABRIC_IN_machine-a.rt_fixture";
+    await bootstrap.streams.add(streamConfig("FABRIC_ADV", "$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES.>"));
+    for (const name of [PATH_B_ADVISORY_DURABLE, "other_operator"]) {
+      await bootstrap.consumers.add("FABRIC_ADV", {
+        durable_name: name, filter_subject: "$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES.>",
+        ack_policy: AckPolicy.Explicit, deliver_policy: DeliverPolicy.All,
+      });
+    }
+    const before = await bootstrap.consumers.info("FABRIC_ADV", PATH_B_ADVISORY_DURABLE);
+    for (const subject of [
+      `$JS.API.CONSUMER.CREATE.FABRIC_ADV.${PATH_B_ADVISORY_DURABLE}`,
+      `$JS.API.CONSUMER.CREATE.FABRIC_ADV.${PATH_B_ADVISORY_DURABLE}.filter`,
+      "$JS.API.CONSUMER.CREATE.FABRIC_ADV.other_operator",
+      `$JS.API.CONSUMER.DELETE.FABRIC_ADV.${PATH_B_ADVISORY_DURABLE}`,
+      "$JS.API.CONSUMER.DELETE.FABRIC_ADV.other_operator",
+      "$JS.API.CONSUMER.MSG.NEXT.FABRIC_ADV.other_operator",
+      "$JS.API.CONSUMER.INFO.FABRIC_ADV.other_operator",
+      "$JS.ACK.FABRIC_ADV.other_operator.1.1.1.1.0",
+    ]) await expectDenied(oracle, "publish", subject, () => nc.publish(subject, "{}"));
+    const sent = await bootstrapJs.publish(advisorySubject, "retained advisory");
+    const fixed = await js.consumers.get("FABRIC_ADV", PATH_B_ADVISORY_DURABLE);
+    const delivery = await fixed.next({ expires: API_TIMEOUT_MS });
+    expect(delivery?.string()).toBe("retained advisory");
+    if (!delivery) throw new Error("fixed advisory durable did not deliver");
+    expect(await delivery.ackAck()).toBe(true);
+    const after = await manager.consumers.info("FABRIC_ADV", PATH_B_ADVISORY_DURABLE);
+    expect(after.created).toBe(before.created);
+    expect(after.config).toEqual(before.config);
+    expect(after.num_ack_pending).toBe(0);
+    expect(after.ack_floor.stream_seq).toBe(sent.seq);
+    expect((await bootstrap.consumers.info("FABRIC_ADV", "other_operator")).num_pending).toBe(1);
+  }, 30_000);
 
   it("restarts its owned server without losing the synchronous JetStream store", async () => {
     if (!harness) throw new Error("Path B harness was not initialized");

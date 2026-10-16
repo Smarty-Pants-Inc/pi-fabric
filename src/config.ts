@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import { readHostPolicy, warnAgentLandlockDisabled, type HostPolicy } from "./host-policy.js";
+export { readHostPolicy } from "./host-policy.js";
 import type { ModelRoutingConfig } from "./agents/model-route.js";
 import { parsePerCallRouting } from "./agents/per-call-config.js";
 import { normalizeAgentRouterConfig, type FabricAgentRouterConfig } from "./agents/router-config.js";
@@ -429,6 +430,9 @@ export interface FabricRetentionConfig {
   /** Minimum terminal finishedAt age before legacy retirement (default 48 hours). */
   legacyRunArchiveAgeMs?: number;
 }
+
+/** Aggregate serialized event/image budget for an opt-in actor batch; single oversized events run alone. */
+export const DEFAULT_ACTOR_BATCH_MAX_BYTES = 256 * 1024;
 
 export interface FabricActorsConfig {
   /** Reset an actor's Pi session at a run boundary once its file exceeds this many bytes; 0 disables. */

@@ -339,18 +339,20 @@ export class AgentMessageRouter {
   #messageTarget(id: string): string {
     const target = this.#sessionTarget(id);
     if (this.mainAgent.matches(target) || this.#get(target) || this.#lapsedRoot(target) || target.trim().startsWith("session:")) return target;
-    // A published name survives an ordinary lease lapse just like its exact session id.
-    // Use fresh raw presence, but add only eligible retained native roots to the live set.
-    const matches = this.participants.list
+    // A live publication supersedes retained names from predecessor sessions (#10720).
+    // Without a live match, preserve the bounded native lease-grace route and ambiguity checks.
+    const named = this.participants.list
       ? this.#directoryRead(() => this.participants.list!({ scope: "project", kinds: ["root"], includeStale: true, fresh: true }))
       .filter((participant) => participant.name === target)
       : [];
+    const live = named.filter((participant) => !participant.stale);
+    const matches = live.length ? live : named;
     if (matches.length > 1) {
       throw new Error(`Ambiguous Fabric participant: ${id} (${matches.map((participant) => participant.id).sort().join(", ")}); use an exact id`);
     }
     const root = matches[0];
-    // Presence without current owner authority still makes a selector ambiguous. Never
-    // silently choose a same-named replacement just because one lease is unavailable.
+    // Retained-only names still require native owner authority; a name is not an alias
+    // for an exact predecessor id and never grants delivery capability.
     if (!root || (root.stale && !this.#eligibleRetainedRoot(root))) return target;
     // Do not let a published root name shadow an existing actor name or unique id prefix.
     // Reuse the actor resolver (including its ambiguity checks), without changing its route.
@@ -928,6 +930,10 @@ export class AgentMessageRouter {
         delivery: command.operation,
         ...(command.priority ? { priority: command.priority } : {}),
         deliveryId: command.commandId,
+        ...(command.eventId === undefined ? {} : { inboxEventId: command.eventId }),
+        ...(command.inboxTopic === undefined ? {} : { inboxTopic: command.inboxTopic }),
+        ...(command.inboxKey === undefined ? {} : { inboxKey: command.inboxKey }),
+        ...(command.inboxReceipts === undefined ? {} : { inboxReceipts: command.inboxReceipts }),
         outcomeSend: { eventId: command.eventId ?? command.commandId, to: this.mainAgent.id, from: from.id, mode: command.operation },
         ...(typeof command.triggerTurn === "boolean"
           ? { triggerTurn: command.triggerTurn }

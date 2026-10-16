@@ -24,6 +24,73 @@ const names = (block: string, pattern: RegExp): Set<string> =>
 const IMPLEMENTED = AGENTS_ACTION_DESCRIPTORS.map((descriptor) => descriptor.name);
 
 describe("guest agents surface", () => {
+  it.each([false, true])("types exact slot claim and retry identity on create/import (fullCodeMode=%s)", fullCodeMode => {
+    const declarations = guestTypeDeclarations(fullCodeMode);
+    const code = `const slotClaim: FabricActorSlotClaim = { key: "factory/review-slots/v1/example/repo/1/base", ifVersion: 7 };
+      const revision: number = slotClaim.ifVersion;
+      const idempotencyKey: string = "claim-7-review";
+      await agents.create({ name: "review", instructions: "Review.", slotClaim, idempotencyKey });
+      await agents.createActor({ name: "alias-review", instructions: "Review.", slotClaim, idempotencyKey });
+      await agents.import({ id: "template", as: "review", slotClaim, idempotencyKey });
+      return revision;`;
+    expect(typeCheckFabricCode(code, declarations, true).errors).toEqual([]);
+    for (const method of ["create", "createActor", "import"]) {
+      const target = method === "import" ? 'id: "template"' : 'name: "review", instructions: "Review."';
+      for (const fields of [
+        'slotClaim: { key: "claim", ifVersion: "7" }',
+        'slotClaim: { key: 7, ifVersion: 7 }',
+        'idempotencyKey: 7',
+      ]) expect(typeCheckFabricCode(`await agents.${method}({ ${target}, ${fields} });`, declarations, true).errors.length).toBeGreaterThan(0);
+    }
+  });
+
+  // Keep: trust boundary (#1199). Read-only preflight must reach the selected
+  // native host, and never accept caller-authored authority configuration.
+  it.each([false, true])("types read-only slotStatus diagnostics (fullCodeMode=%s)", fullCodeMode => {
+    const declarations = guestTypeDeclarations(fullCodeMode);
+    const code = `const options: FabricSlotStatusOptions = { residency: "durable" };
+      const status: FabricSlotStatus = await agents.slotStatus(options);
+      await agents.slotStatus();
+      await agents.slotStatus({ residency: "session" });
+      const protocol: "slot-admission-v1" = status.protocol;
+      const enforcement: "enforced" | "unenforced" | "blocked" = status.enforcement;
+      const reason: "nats-backend" | "existing-authority" | "not-configured" | "unsupported-authority" | "authority-unavailable" | undefined = status.reason;
+      const gap: "smarty-dev#7991" | undefined = status.gap;
+      const backend: string = status.backend;
+      const authorityGeneration: string | undefined = status.authorityGeneration;
+      const hubRootId: string | undefined = status.hubRootId;
+      const routesDigest: string | undefined = status.routesDigest;
+      const meshRoot: string | undefined = status.meshRoot;
+      const database: Readonly<{ canonicalPath: string; device: string; inode: string }> | undefined = status.databaseFileIdentity;
+      const phase: "enforce" | undefined = status.phase;
+      const issue: "smarty-dev#13036" | undefined = status.issue;
+      return { protocol, enforcement, reason, gap, backend, authorityGeneration, hubRootId, routesDigest, meshRoot, database, phase, issue };`;
+    expect(typeCheckFabricCode(code, declarations, true).errors).toEqual([]);
+    for (const invalid of [
+      'await agents.slotStatus({ residency: "global" });',
+      'await agents.slotStatus({ authorityGeneration: "forged" });',
+      'const options: FabricSlotStatusOptions = {}; options.residency = "durable";',
+      'const status = await agents.slotStatus(); status.enforcement = "enforced";',
+      'const status = await agents.slotStatus(); if (status.databaseFileIdentity) status.databaseFileIdentity.inode = "forged";',
+    ]) expect(typeCheckFabricCode(invalid, declarations, true).errors.length).toBeGreaterThan(0);
+  });
+
+  it("bridges slotStatus defaults and residency to the public provider and returns native diagnostics", async () => {
+    const calls: Array<{ ref: string; args: unknown }> = [];
+    const status = { protocol: "slot-admission-v1", enforcement: "blocked", backend: "sqlite", reason: "authority-unavailable" };
+    const result = await new QuickJsRuntime().execute(`return [await agents.slotStatus(),
+      await agents.slotStatus({ residency: "session" }), await agents.slotStatus({ residency: "durable" })];`,
+      async (ref, args) => { calls.push({ ref, args }); return status; },
+      { timeoutMs: 5000, memoryLimitBytes: 32 * 1024 * 1024 });
+    expect(result.terminationReason).toBe("completed");
+    expect(result.value).toEqual([status, status, status]);
+    expect(calls).toEqual([
+      { ref: "agents.slotStatus", args: {} },
+      { ref: "agents.slotStatus", args: { residency: "session" } },
+      { ref: "agents.slotStatus", args: { residency: "durable" } },
+    ]);
+  });
+
   it.each(["send", "steer"])("repairs agents.%s targets without relaxing the existing guard", method => {
     expect(messageTargetArgs(method, { to: "session:peer", message: "HOLD", priority: "interrupt" }))
       .toEqual({ id: "session:peer", message: "HOLD", priority: "interrupt" });
@@ -118,6 +185,26 @@ describe("guest agents surface", () => {
     }, { timeoutMs: 5000, memoryLimitBytes: 32 * 1024 * 1024 });
     expect(result.terminationReason).toBe("completed");
     expect(calls).toEqual([]);
+  });
+  it.each([false, true])("types actor window batching and the live setter (fullCodeMode=%s)", fullCodeMode => {
+    const code = `const actor = await agents.create({ name: "supervisor", instructions: "Observe.", batchWindowMs: 300000, batchMax: 50, batchMaxBytes: 262144 });
+      const updated = await agents.setBatching({ id: actor.id, batchWindowMs: 0, batchMaxBytes: 4096 });
+      const window: number | undefined = updated.batchWindowMs;
+      const max: number | undefined = actor.batchMax;
+      const bytes: number | undefined = updated.batchMaxBytes;
+      return { window, max, bytes };`;
+    expect(typeCheckFabricCode(code, guestTypeDeclarations(fullCodeMode), true).errors).toEqual([]);
+    expect(typeCheckFabricCode('await agents.setBatching({ id: "actor", batchMax: "50" });', guestTypeDeclarations(fullCodeMode), true).errors.length).toBeGreaterThan(0);
+    expect(typeCheckFabricCode('await agents.setBatching({ id: "actor", batchMaxBytes: "4096" });', guestTypeDeclarations(fullCodeMode), true).errors.length).toBeGreaterThan(0);
+  });
+  it("bridges the batching setter through the public provider", async () => {
+    const calls: Array<{ ref: string; args: unknown }> = [];
+    const result = await new QuickJsRuntime().execute('return await agents.setBatching({ id: "actor", batchWindowMs: 300000, batchMax: 50, batchMaxBytes: 262144 });',
+      async (ref, args) => { calls.push({ ref, args }); return { batchWindowMs: 300000, batchMax: 50, batchMaxBytes: 262144 }; },
+      { timeoutMs: 5000, memoryLimitBytes: 32 * 1024 * 1024 });
+    expect(result.terminationReason).toBe("completed");
+    expect(calls).toEqual([{ ref: "agents.setBatching", args: { id: "actor", batchWindowMs: 300000, batchMax: 50, batchMaxBytes: 262144 } }]);
+    expect(result.value).toEqual({ batchWindowMs: 300000, batchMax: 50, batchMaxBytes: 262144 });
   });
   it.each([false, true])("types per-filter telemetry and expiry (fullCodeMode=%s)", fullCodeMode => {
     const code = `await agents.setActivationFilter({ id: "reviewer", activationFilter: ["hold"], expiresAt: Date.now() + 60000 });

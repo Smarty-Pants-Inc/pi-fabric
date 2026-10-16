@@ -68,6 +68,7 @@ export type CommitOutboxHandler = (payload: any, view: MeshBatchView, replay: bo
 /** `stamp` names the exact recording: an afterCommit retires the row only while it still holds it. */
 interface OutboxRow { format: 1; scope: string; kind: string; key: string; payload: unknown; recordedAt: number; stamp?: string }
 
+const RETIRE_BATCH_SIZE = 64;
 const digest = (text: string): string => createHash("sha256").update(text).digest("hex");
 
 const rowOf = (value: unknown): OutboxRow | undefined => {
@@ -178,8 +179,12 @@ export class CommitOutbox {
       const value: OutboxRow = { format: 1, scope: this.scope, kind, key, payload, recordedAt, stamp };
       staged.push({ kind: "put", key: row, value });
     }
+    let retiring = 0;
     for (const [row, version] of this.#done) {
-      if (!byRow.has(row)) staged.push({ kind: "delete", key: row, ifVersion: version, onConflict: "skip" });
+      if (!byRow.has(row)) {
+        staged.push({ kind: "delete", key: row, ifVersion: version, onConflict: "skip" });
+        if (++retiring === RETIRE_BATCH_SIZE) break;
+      }
     }
     return { ops: staged, staged: plan };
   }
@@ -222,16 +227,19 @@ export class CommitOutbox {
     return ran;
   }
 
-  /** Deletes the rows whose effects ran, in one commit. A row recorded again since keeps its newer
-   * version (the delete is version-fenced), and is deleted once that effect runs. */
+  /** Independently version-fenced retirement, yielding custody every 64 rows. A newer recording
+   * survives; a failed batch leaves its rows and every later batch pending for retry. */
   async retire(): Promise<void> {
     if (this.#done.size === 0) return;
     const done = [...this.#done];
-    await this.mesh.writeBatch({
-      identity: this.identity,
-      ops: done.map(([key, version]): MeshBatchOperation => ({ kind: "delete", key, ifVersion: version, onConflict: "skip" })),
-    });
-    for (const [key, version] of done) if (this.#done.get(key) === version) this.#done.delete(key);
+    for (let start = 0; start < done.length; start += RETIRE_BATCH_SIZE) {
+      const batch = done.slice(start, start + RETIRE_BATCH_SIZE);
+      await this.mesh.writeBatch({
+        identity: this.identity,
+        ops: batch.map(([key, version]): MeshBatchOperation => ({ kind: "delete", key, ifVersion: version, onConflict: "skip" })),
+      });
+      for (const [key, version] of batch) if (this.#done.get(key) === version) this.#done.delete(key);
+    }
   }
 
   /** `stamp`: the recording a staged effect ran; the row is retired only if it still holds that one.

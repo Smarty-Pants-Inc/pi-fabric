@@ -54,6 +54,13 @@ export interface FabricParticipantRecord {
   /** Outside capabilities so old format-1 parsers can read the advertisement. */
   livenessLeaseFiles?: 1;
   status: string;
+  /** Authenticated, capability-free terminal history of a session actor. */
+  stopReason?: "owner-root-gone";
+  ownerRootGoneAt?: number;
+  ownerRootGoneBy?: string;
+  settledAt?: number;
+  retiredAt?: number;
+  retiredBy?: string;
   /** Root records: the writing Main process (pid, host, Linux /proc start ticks), so an operator tool can
    * tell a live Main from a reused pid (smarty-dev#7817). Absent on older writers: identity unavailable. */
   mainProcess?: { pid: number; host: string; startTime?: string };

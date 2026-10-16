@@ -387,9 +387,18 @@ export const renewHostLease = async (mesh: HostLeaseMesh, lease: FabricHostLease
     ? Object.hasOwn(options, "expected") ? options.expected : hostLeasePredecessor(mesh.root, lease.id)
     : undefined;
   if (expected && expected.incarnationToken === undefined && expected.expiresAt > Date.now()) {
+    const deadline = Date.now() + (options.timeoutMs ?? Number.POSITIVE_INFINITY);
     const waitMs = Math.min(expected.expiresAt - Date.now(), options.timeoutMs ?? Number.POSITIVE_INFINITY);
     if (waitMs <= 0) throw new FabricHostLeaseLegacyBusyError(lease.id, expected.expiresAt);
     await waitForLegacyExpiry(waitMs, options.signal); // ONE wake, never a renewal/poll loop.
+    // The timer runs on libuv's monotonic loop clock (started from the iteration's cached time); Date.now() is the
+    // truncated wall clock. So the wake can land ~1 ms (more after synchronous work) before expiresAt, and the commit
+    // would then refuse a lease that is about to expire. One bounded catch-up wake for the remainder, never a loop.
+    // The +1 ms covers a sub-millisecond gap between the two clocks on the catch-up wake itself.
+    if (expected.expiresAt > Date.now()) {
+      const remainder = Math.min(expected.expiresAt - Date.now() + 1, deadline - Date.now());
+      if (remainder > 0) await waitForLegacyExpiry(remainder, options.signal);
+    }
   }
   try {
     await withHostLeaseLock(mesh, hostLeasePath(mesh.root, lease.id), () => {

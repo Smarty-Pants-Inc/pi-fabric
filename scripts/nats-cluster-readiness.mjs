@@ -85,7 +85,7 @@ function summarize(observations) {
       healthJs: healthJs?.status ?? null,
       serverId: server?.server_id ?? null,
       serverName: server?.server_name ?? null,
-      syncAlways: server?.jetstream?.config?.sync_always === true,
+      syncAlways: (server?.jetstream?.config?.sync_always ?? jetstream?.config?.sync_always) === true,
       routeCount: routez?.num_routes ?? null,
       peers,
       leader: metaCluster?.leader ?? null,

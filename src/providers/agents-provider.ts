@@ -7,9 +7,11 @@ import type { JevRequest, JevResponse } from "../jev/types.js";
 import { formatAge, residentHostId, RESIDENT_HOST_FORMAT, ResidentOutcomeUnknownError, ResidentActorAuthorizationError, assertResidentActorMain, assertResidentActorToolCeiling, type ResidentActorCaller, type ResidentActorMutation } from "../residency/protocol.js";
 import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
 import { ActorManager, ActorRegistryOwnershipError, parseBashTimeoutSeconds } from "../actors/manager.js";
+import { slotAdmissionFor } from "../actors/slot-admission.js";
 import { participantProject, recordedProjectLead, repositoryOf, resolveProjectAgent } from "../topology/project-identity.js";
 import { GlobalActorRegistry } from "../actors/global-registry.js";
-import { isFabricActorHostEvent, normalizeActorActivation, validateActorCoalesceKey, validateActorDedupeKey, validateActorInferenceContext } from "../actors/types.js";
+import { isFabricActorHostEvent, FabricActorBatchPolicyError, normalizeActorActivation, normalizeActorBatching, validateActorCoalesceKey, validateActorDedupeKey, validateActorInferenceContext } from "../actors/types.js";
+import { normalizeActorSlotClaim } from "../actors/slot-claim.js";
 import { normalizeActorActivationFilter } from "../actors/activation-filter.js";
 import { normalizeActorRecords } from "../actors/records.js";
 import type {
@@ -95,9 +97,10 @@ import {
   type FabricModelCandidate,
 } from "../core/model-resolution.js";
 import { resolvePiModel, resolvePiRoutePin, ModelRoutePinError } from "../core/model-refresh.js";
+import { FabricModelNotServedError } from "../core/model-served-error.js";
 import { loadModelUsage } from "../core/model-usage.js";
 import { AGENTS_ACTION_DESCRIPTORS } from "./agents-actions.js";
-import { mainExecutionCeilingAbortReason, registerCancellationEffect, throwIfExecutionExpired, withoutMainExecutionCeiling } from "../async-settlement.js";
+import { mainExecutionCeilingAbortReason, recordResidentOutcome, registerCancellationEffect, throwIfExecutionExpired, withoutMainExecutionCeiling } from "../async-settlement.js";
 import {
   AGENT_WAIT_MAX_MS,
   AgentWaitBoundError,
@@ -143,7 +146,7 @@ const displaySafeCwd = (cwd: string): string => {
 };
 
 const agentStartedMessage = (handle: AgentHandleInfo): string =>
-  `Agent ${handle.name} started via ${handle.runner}/${handle.transport}${handle.attachCommand ? ` · ${handle.attachCommand}` : ""} · cwd ${displaySafeCwd(handle.cwd)}`;
+  `Agent ${handle.name} started via ${handle.runner}/${handle.transport}${handle.attachCommand ? ` · ${handle.attachCommand}` : ""} · cwd ${displaySafeCwd(handle.cwd)}${handle.modelVerification === "unverified" ? " · model unverified" : ""}`;
 
 // Resolve source and executor reasoning channels for the trajectory handoff
 // boundary. The executor model must be registered to transfer at all; an
@@ -334,6 +337,8 @@ const actorRequest = (
   validateActorCoalesceKey(args.coalesceKey);
   validateActorDedupeKey(args.dedupeKey);
   const activation = normalizeActorActivation(args.activation);
+  const batching = normalizeActorBatching(args);
+  const slotClaim = normalizeActorSlotClaim(args.slotClaim);
   const activationFilter = args.activationFilter === undefined ? undefined : normalizeActorActivationFilter(args.activationFilter);
   const requestedKernel = checkedKernel(args.kernel);
   const kernelRequest = {
@@ -370,10 +375,12 @@ const actorRequest = (
     ...(typeof args.coalesceKey === "string" ? { coalesceKey: args.coalesceKey } : {}),
     ...(typeof args.dedupeKey === "string" ? { dedupeKey: args.dedupeKey } : {}),
     ...(activation ? { activation } : {}),
+    ...batching,
     ...(activationFilter ? { activationFilter } : {}),
     ...(args.routeClass !== undefined ? { routeClass: args.routeClass as "status-groom" } : {}),
     ...(typeof args.protected === "boolean" ? { protected: args.protected } : {}),
     ...(typeof args.idempotencyKey === "string" ? { idempotencyKey: args.idempotencyKey } : {}),
+    ...(slotClaim ? { slotClaim } : {}),
     ...(args.residency === "session" || args.residency === "durable"
       ? { residency: args.residency }
       : {}),
@@ -606,7 +613,7 @@ export class AgentsProvider implements FabricProvider {
 
   async #routeCreationDefault<T extends {
     model?: string; thinking?: AgentRunRequest["thinking"]; runner?: FabricAgentRunner;
-    name?: string; cwd?: string; complexity?: AgentRunRequest["complexity"];
+    name?: string; cwd?: string; complexity?: AgentRunRequest["complexity"]; residency?: AgentRunRequest["residency"];
   }>(kind: "spawn" | "actor", args: Record<string, unknown>, request: T, context: FabricInvocationContext): Promise<T> {
     const config = this.manager.config.router;
     if (config?.mode !== "shadow" && config?.mode !== "enforce") return request;
@@ -647,11 +654,37 @@ export class AgentsProvider implements FabricProvider {
       },
       ...(context.signal ? { signal: context.signal } : {}),
     });
-    return selected ? { ...request, ...selected } : request;
+    if (!selected) return request;
+    const { decisionId } = selected;
+    return { ...request, ...selected.selected, spawnRouterDecisionId: decisionId,
+      ...(kind === "spawn" && request.residency !== "durable" ? { meshRoot: this.actorManager.mesh.root } : {}) };
+  }
+
+  async #recordCreationStartFailed(request: AgentRunRequest | FabricActorCreateRequest): Promise<void> {
+    const decisionId = (request as { spawnRouterDecisionId?: unknown }).spawnRouterDecisionId;
+    if (typeof decisionId !== "string" || !decisionId) return;
+    try {
+      const { recordSpawnRouterStartFailed } = await import("../agents/spawn-router.js");
+      await recordSpawnRouterStartFailed({ meshRoot: this.actorManager.mesh.root, decisionId });
+    } catch { /* Ledger writes never change admission behavior. */ }
   }
 
   async #prepareSpawnRequest(args: Record<string, unknown>, context: FabricInvocationContext): Promise<AgentRunRequest> {
-    if (args.model !== "auto") return this.#runRequest(args, context, false);
+    if (args.model !== "auto") {
+      try { return await this.#runRequest(args, context, false); }
+      catch (error) {
+        const runner = args.runner ?? this.manager.config.runner;
+        const transport = args.transport ?? this.manager.config.transport;
+        if ((runner === "pi" || runner === "pi-durable") && (transport === "process" || transport === "auto") &&
+          error instanceof Error && (error.message.includes("is not available to this Pi session") ||
+            error.message.includes("closest-match resolution is refused"))) {
+          const selector = typeof args.model === "string" ? args.model : this.manager.defaultModel(runner) ??
+            (context.extensionContext.model ? `${context.extensionContext.model.provider}/${context.extensionContext.model.id}` : "unknown");
+          throw new FabricModelNotServedError(selector, context.extensionContext.model?.provider, error.message);
+        }
+        throw error;
+      }
+    }
     const runner = args.runner ?? this.manager.config.runner;
     const transport = args.transport ?? this.manager.config.transport;
     if (runner !== "pi" || transport !== "process" || (args.residency !== undefined && args.residency !== "session") ||
@@ -911,12 +944,22 @@ export class AgentsProvider implements FabricProvider {
       case "handoff":
         return this.handoff(args, context);
       case "spawn": {
-        const request = this.#applySeed(
-          args,
-          await this.#routeCreationDefault("spawn", args, await this.#prepareSpawnRequest(args, context), context),
-          context,
-        );
+        const routed = await this.#routeCreationDefault("spawn", args, await this.#prepareSpawnRequest(args, context), context);
+        let handedOff = false;
+        const onDispatched = typeof (routed as { spawnRouterDecisionId?: unknown }).spawnRouterDecisionId === "string"
+          ? () => { handedOff = true; } : undefined;
+        try {
+        const request = this.#applySeed(args, routed, context);
         if (request.residency === "durable") this.#assertUnconfinedDurable();
+        const runner = request.runner ?? this.manager.config.runner;
+        const transport = request.transport ?? this.manager.config.transport;
+        let modelVerification: AgentHandleInfo["modelVerification"];
+        if ((runner === "pi" || runner === "pi-durable") && (transport === "process" || transport === "auto")) {
+          const { verifyPiSpawnModel } = await import("../core/model-served.js");
+          modelVerification = request.model
+            ? await verifyPiSpawnModel(request.model, context.extensionContext.modelRegistry) : "unverified";
+          (isInteractiveMain(context.extensionContext) ? withoutMainExecutionCeiling(context.signal) : context.signal)?.throwIfAborted();
+        }
         const kernel = this.manager.resolveKernel(request);
         const { kernel: _requestedKernel, ...requestWithScope } = request;
         // The resident host has no session scope: send the derived scope in full.
@@ -937,8 +980,12 @@ export class AgentsProvider implements FabricProvider {
             ? { thinkingBounds: this.manager.childThinkingBounds(request.thinkingBounds) }
             : {}),
         }, context.extensionContext.sessionManager?.getEntries?.() ?? []);
-        const handle = durableRequest.residency === "durable"
-          ? await this.#resident().spawnAgent(durableRequest, context.signal)
+        const resident = durableRequest.residency === "durable" ? this.#resident() : undefined;
+        // Local admission owns its outcome immediately; resident custody begins only at publication.
+        if (!resident) handedOff = true;
+        const handle = resident
+          ? await (onDispatched ? resident.spawnAgent(durableRequest, context.signal, onDispatched)
+            : resident.spawnAgent(durableRequest, context.signal))
           : await this.manager.spawn(durableRequest, isInteractiveMain(context.extensionContext) ? withoutMainExecutionCeiling(context.signal) : context.signal);
         if (request.residency !== "durable") this.manager.detachSignal(handle.id);
         this.participants.scheduleRefresh();
@@ -948,8 +995,14 @@ export class AgentsProvider implements FabricProvider {
           kind: "agent",
           name: handle.name,
         });
-        context.update(agentStartedMessage(handle));
-        return request.routeDecision ? { ...handle, routeDecision: request.routeDecision } : handle;
+        const receipt = { ...handle, ...(modelVerification ? { modelVerification } : {}),
+          ...(request.routeDecision ? { routeDecision: request.routeDecision } : {}) };
+        context.update(agentStartedMessage(receipt));
+        return receipt;
+        } catch (error) {
+          if (!handedOff) await this.#recordCreationStartFailed(routed);
+          throw error;
+        }
       }
       case "join":
       case "wait": {
@@ -1299,6 +1352,12 @@ export class AgentsProvider implements FabricProvider {
           ? this.residency!.cleanupAgent(id, args.deleteBranch === true, context.signal)
           : this.manager.cleanup(id, args.deleteBranch === true);
       }
+      case "slotStatus": {
+        if (args.residency === undefined || args.residency === "session") return slotAdmissionFor(this.actorManager.mesh).status();
+        if (args.residency !== "durable") throw new Error("agents.slotStatus residency must be session or durable");
+        // Selected-host RPC, not the origin's status or desired resident config.
+        return (this.residency ?? this.#residentActorClient()).slotStatus(context.signal);
+      }
       case "createActor":
       case "create": {
         const admitted = await this.#admitActorRequest(
@@ -1602,6 +1661,14 @@ export class AgentsProvider implements FabricProvider {
         if (args.scope === "global") return this.globalActors.update(String(args.id), { coalesceKey });
         return this.actorManager.setCoalesceKey(String(args.id), coalesceKey);
       }
+      case "setBatching": {
+        const batching = normalizeActorBatching(args);
+        if (!Object.keys(batching).length) throw new FabricActorBatchPolicyError("batchWindowMs, batchMax or batchMaxBytes is required");
+        if (args.scope === "global") return this.globalActors.update(String(args.id), batching);
+        const resident = await this.#residentActorOwner(String(args.id));
+        if (resident) return this.#setResidentActor(resident, { operation: "setBatching", id: resident.id, ...batching }, context);
+        return this.actorManager.setBatching(String(args.id), batching, checkCommit);
+      }
       case "setActivationFilter": {
         if (args.activationFilter === undefined) throw new Error("activationFilter is required (a list of presets or rules, or null to clear)");
         const activationFilter = args.activationFilter === null ? null : normalizeActorActivationFilter(args.activationFilter);
@@ -1645,6 +1712,17 @@ export class AgentsProvider implements FabricProvider {
       }
       case "remove": {
         if (args.scope === "global") return this.globalActors.remove(String(args.id));
+        // Foreign terminal history has its own retirement path; never widen removeActor.
+        const retired = await this.actorManager.retireSessionOrphan(String(args.id), () => {
+          checkCommit();
+          const caller = this.actorManager.identity, self = this.participants.self();
+          if (!this.mainAgent.local || this.mainAgent.interactive === false || caller.kind !== "main" ||
+              caller.id !== this.mainAgent.id || self.kind !== "root" || self.id !== caller.id || self.rootId !== caller.id ||
+              self.ownerIdentityId !== caller.id || self.ownerHostId !== caller.id || self.stale) {
+            throw new Error("Only the live native Main can retire an orphan actor record");
+          }
+        });
+        if (retired) return retired;
         const cleanup = this.actorManager.cleanupObligation(String(args.id));
         if (cleanup) {
           if (this.actorManager.owns(cleanup.id)) return this.actorManager.remove(cleanup.id);
@@ -1698,7 +1776,11 @@ export class AgentsProvider implements FabricProvider {
         if (!def) throw new Error(`Unknown global actor: ${key}`);
         const as =
           typeof args.as === "string" && args.as.trim() ? args.as.trim() : undefined;
-        const request = this.globalActors.toRequest(def, as);
+        // A token belongs to this materialization, never to the reusable template.
+        const request = { ...this.globalActors.toRequest(def, as),
+          ...(args.slotClaim === undefined ? {} : { slotClaim: normalizeActorSlotClaim(args.slotClaim) }),
+          ...(typeof args.idempotencyKey === "string" ? { idempotencyKey: args.idempotencyKey } : {}),
+        };
         const resolvedRequest = await this.#admitActorRequest(
           actorRequest(request as unknown as Record<string, unknown>, context, this.manager, true, this.callerThinking()), context,
         );
@@ -1883,6 +1965,10 @@ export class AgentsProvider implements FabricProvider {
   }
 
   async #createActor(request: FabricActorCreateRequest, context: FabricInvocationContext): Promise<FabricActorInfo> {
+    let handedOff = false;
+    const onDispatched = typeof (request as { spawnRouterDecisionId?: unknown }).spawnRouterDecisionId === "string"
+      ? () => { handedOff = true; } : undefined;
+    try {
     const { signal } = context;
     const checkCommit = (): void => throwIfExecutionExpired(context);
     checkCommit();
@@ -1914,25 +2000,76 @@ export class AgentsProvider implements FabricProvider {
       };
       const { instructionsFile: _file, sha256: _digest, ...base } = request;
       const resolvedRequest: FabricActorRequest = { ...base, instructions: resolveActorInstructions(request, this.manager.config.instructionsRoot) };
-      return this.actorManager.create(resolvedRequest, {
-        // Validate ownership before predecessor removal as well as insertion.
-        beforeCommit: () => { checkCommit(); creationOwnerHostId(); }, checkActive: checkCommit,
-        onCommit: (id) => {
-          const ownerHostId = creationOwnerHostId();
-          const decision = { requestId: command.requestId, state: "committed" as const, id, ownerHostId };
-          let outcome: ResidentOutcomeUnknownError | undefined;
-          registerCancellationEffect(signal, reason =>
-            outcome ??= new ResidentOutcomeUnknownError(command, decision, reason, signal));
-        },
+      // A claim is not proof of native admission: ordinary topics may carry one.
+      // Only the manager's protected SQL callback establishes that boundary.
+      let nativeBoundaryObserved = false;
+      let nativeUncertainError: Error | undefined;
+      let decision: { requestId: string; state: "committed"; id: string; ownerHostId: string } | undefined;
+      let outcome: ResidentOutcomeUnknownError | undefined;
+      let dispatched = true;
+      registerCancellationEffect(signal, reason => {
+        if (!dispatched) return undefined;
+        // Native checkActive can fail before the boundary notification. Preserve
+        // that uncertainty and its recorded selected ID, not a fabricated commit.
+        if (!decision && nativeUncertainError) return nativeUncertainError;
+        if (!nativeBoundaryObserved && !decision) return undefined;
+        return outcome ??= new ResidentOutcomeUnknownError(command, decision, reason, signal);
       });
+      try {
+        handedOff = true;
+        return await this.actorManager.create(resolvedRequest, {
+          // The protected native path invokes this synchronously at its final
+          // validated SQL boundary, with the original ID on an exact retry.
+          beforeCommit: (id, nativeBoundary) => {
+            // Observe entry before checking cancellation, but never record a
+            // committed decision if the request-acceptance check itself fails.
+            if (nativeBoundary === true) nativeBoundaryObserved = true;
+            checkCommit();
+            const ownerHostId = creationOwnerHostId();
+            if (nativeBoundary === true) decision = { requestId: command.requestId, state: "committed", id, ownerHostId };
+          }, checkActive: checkCommit,
+          onCommit: (id) => {
+            decision = { requestId: command.requestId, state: "committed", id, ownerHostId: creationOwnerHostId() };
+          },
+        });
+      } catch (error) {
+        const failure = error as { code?: unknown; actorId?: string } | undefined;
+        if (failure?.code === "FABRIC_ACTOR_SLOT_CREATE_UNCERTAIN") {
+          if (error instanceof Error) nativeUncertainError = error;
+          const actorId = failure.actorId ?? decision?.id;
+          recordResidentOutcome(signal, { requestId: command.requestId, state: "unknown", operation: "createActor", entityKind: "actor",
+            ...(actorId ? { id: actorId } : {}) });
+        }
+        if (failure?.code === "FABRIC_ACTOR_SLOT_CLAIM_REFUSED") dispatched = false;
+        else if ((nativeBoundaryObserved || decision) && signal?.aborted) {
+          throw outcome ??= new ResidentOutcomeUnknownError(command, decision, error, signal);
+        }
+        throw error;
+      }
     }
     this.#assertUnconfinedDurable();
     // Even the first actor in an empty registry must use the authoritative
     // host's capability check and request fence. A local-create/cede path can
     // publish after cancellation with neither a decision nor a known-ID receipt.
-    return this.residency
-      ? this.residency.createActor(request, signal)
-      : this.#residentActorClient().createActor(request, signal);
+    if (this.residency) return await (onDispatched ? this.residency.createActor(request, signal, onDispatched)
+      : this.residency.createActor(request, signal));
+    const client = this.#residentActorClient();
+    // Ordinary child handoffs need no protected caller metadata. The receiving
+    // host still requires an authenticated caller for every protected topic,
+    // including a request that omitted its required claim.
+    if (request.slotClaim === undefined) return await (onDispatched ? client.createActor(request, signal, undefined, onDispatched)
+      : client.createActor(request, signal));
+    const caller = {
+      identity: { ...this.actorManager.identity }, hostId: this.participants.self().ownerHostId,
+      ...(invocationFabricPrincipal(context) ? { principal: invocationFabricPrincipal(context) } : {}),
+      ...(this.#toolCeiling === undefined ? {} : { toolCeiling: [...this.#toolCeiling] }),
+    };
+    return await (onDispatched ? client.createActor(request, signal, caller, onDispatched)
+      : client.createActor(request, signal, caller));
+    } catch (error) {
+      if (!handedOff) await this.#recordCreationStartFailed(request);
+      throw error;
+    }
   }
 
   #actorsWithLiveState(): FabricActorReadInfo[] {

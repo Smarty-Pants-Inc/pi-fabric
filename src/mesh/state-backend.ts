@@ -201,6 +201,12 @@ export interface StateDivergence {
  */
 export interface StateBackend {
   readonly kind: MeshStateBackendKind;
+  /** Native opened-connection attestation; absence is unsupported for enforced slot admission. */
+  attestDatabaseFile?(): import("./state-sqlite.js").SqliteFileIdentity;
+  /** Fresh-bootstrap seal in native SQLite metadata, never a public mesh KV value. */
+  slotAuthorityBinding?(): string | undefined;
+  /** Native-only final SQLite claim-write fence, installed by the memoized slot coordinator. */
+  installSlotClaimGuard?(guard: () => void): void;
 
   get(key: string, options?: MeshReadOptions): MeshStateEntry | undefined;
   list(prefix?: string, limit?: number, options?: MeshReadOptions): MeshStateEntry[];
@@ -627,6 +633,7 @@ export class SqliteStateBackend implements StateBackend {
   #snapshot: SqliteSnapshot | undefined;
   #busyTimeouts = 0;
   #closed = false;
+  #slotClaimGuard: (() => void) | undefined;
 
   constructor(context: MeshStoreContext, options: CreateStateBackendOptions = {}, root = context.root,
     storeOptions: SqliteStateStoreOptions = sqliteOptions(options)) {
@@ -640,6 +647,14 @@ export class SqliteStateBackend implements StateBackend {
   get store(): SqliteStateStore { return this.#open(); }
 
   get database(): string { return path.join(this.root, "state.db"); }
+
+  attestDatabaseFile(): import("./state-sqlite.js").SqliteFileIdentity {
+    return this.#open().attestDatabaseFile();
+  }
+
+  slotAuthorityBinding(): string | undefined { return this.#open().slotAuthorityBinding(); }
+
+  installSlotClaimGuard(guard: () => void): void { this.#slotClaimGuard = guard; }
 
   // ------------------------------------------------------------ reads
 
@@ -720,11 +735,13 @@ export class SqliteStateBackend implements StateBackend {
   // ------------------------------------------------------------ writes
 
   async put(input: StateBackendPutInput): Promise<MeshStateEntry> {
-    return this.#write((store) => store.put(input));
+    return this.#write((store) => store.put({ ...input, ...(this.#slotClaimGuard && input.key.startsWith("factory/review-slots/v1/")
+      ? { beforeCommit: () => this.#slotClaimGuard!() } : {}) }));
   }
 
   async delete(input: StateBackendDeleteInput): Promise<{ deleted: boolean; version?: number }> {
-    return this.#write((store) => store.delete(input));
+    return this.#write((store) => store.delete({ ...input, ...(this.#slotClaimGuard && input.key.startsWith("factory/review-slots/v1/")
+      ? { beforeCommit: () => this.#slotClaimGuard!() } : {}) }));
   }
 
   async writeBatch(input: StateBackendBatchInput): Promise<MeshBatchResult[]> {
@@ -735,10 +752,17 @@ export class SqliteStateBackend implements StateBackend {
     for (let attempt = 0; ; attempt += 1) {
       const bracket = fileRead ? bracketFileRead(fileRead) : undefined;
       const userPrepare = input.prepare;
-      const prepare = fileRead || userPrepare ? (view: MeshBatchView): MeshBatchOperation[] => {
+      let claimsTouched = input.ops.some(op => op.key.startsWith("factory/review-slots/v1/"));
+      const prepare = fileRead || userPrepare ? (view: MeshBatchView, preparedFileRead = bracket?.value): MeshBatchOperation[] => {
         if (fileRead && (!bracket || fileRead.stamp() !== bracket.stamp)) throw FILE_READ_CHANGED;
-        return userPrepare?.(view, bracket?.value) ?? [];
+        const prepared = userPrepare?.(view, preparedFileRead) ?? [];
+        claimsTouched ||= prepared.some(op => op.key.startsWith("factory/review-slots/v1/"));
+        return prepared;
       } : undefined;
+      const beforeCommit = (): void => {
+        if (claimsTouched) this.#slotClaimGuard?.();
+        input.beforeCommit?.();
+      };
       let results: MeshBatchResult[];
       try {
         if (fileRead && !bracket) throw FILE_READ_CHANGED;
@@ -746,7 +770,7 @@ export class SqliteStateBackend implements StateBackend {
           identity: input.identity, ops: input.ops,
           ...(prepare ? { prepare } : {}),
           ...(input.afterCommit ? { afterCommit: input.afterCommit } : {}),
-          ...(input.beforeCommit ? { beforeCommit: input.beforeCommit } : {}),
+          ...(input.beforeCommit || this.#slotClaimGuard ? { beforeCommit } : {}),
           ...(input.lockClass ? { lockClass: input.lockClass } : {}),
         }));
       } catch (error) {

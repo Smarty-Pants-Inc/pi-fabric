@@ -135,6 +135,8 @@ const result = await agents.wait({ id: handle.id });
 
 The reserved need `needs: ["local"]` **always pins spawn/run to the Main's host**, even when `agents.placement.default` is `"remote"`. `"local"` is never a launcher capability: host config validation refuses `capabilities: ["local"]` with `AgentInputError` (`code: "FABRIC_AGENT_INPUT_ERROR"`, `field: "agents.placement.capabilities"`). Needs and launcher capabilities are NFKC-normalized, lowercased, split on commas/Unicode White_Space, validated as [a-z0-9._-] tokens, and deduplicated before matching. Thus `LOCAL`, ` local `, and `local,compute` also pin to Main and are refused as capability declarations. Other needs absent from the configured target's guaranteed capabilities keep the task local. Do not claim capabilities that `--host auto` cannot guarantee on **every** candidate host. Each configured local fallback appends one `placement.local` JSON line with its reason to the run's existing `events.jsonl`; remote launches append `placement.remote` and their terminal `placement.result`. Actor activations, routed/inherited sessions, resolved account pins, effectively disabled extensions (including `agents.extensions: false` when run omits the request setting), recursive or durable runs, non-Pi runners, and unsupported worker features stay local. This is the Main task path, not actor-pass offload.
 
+Before choosing a remote host, placement keeps caller-local working directories on Main: the caller's temporary directory, `/srv/scratch`, and `~/.local/state` stay local even beneath a configured `sharedMounts` root. The check includes canonical paths and missing descendants; an explicit or inherited write policy also stays local to preserve its writable roots. Other existing caller directories must be inside a host-declared shared root to be eligible for remote placement. For the fleet launcher, target cwd/input existence is checked in the existing read-only SSH preflight, with a total preflight budget of at most five seconds. A missing target cwd gives a typed, known-unlaunched refusal naming the path and `needs: ["local"]`; it never starts the launcher or retries after an uncertain remote launch.
+
 `agents.spawn` and `agents.run` also accept optional `requires: [absolutePath, ...]` to preflight named inputs on the **selected execution host** before starting its worker/model. The array may contain at most **64** paths; every entry must be a literal absolute path, contain no `.` or `..` path segments, line breaks or control characters (including NUL), and occupy at most **4096 UTF-8 bytes**. Entry validation errors identify the `requires[index]` and the violated rule. Invalid declarations and missing local inputs throw `AgentInputError` (`code: "FABRIC_AGENT_INPUT_ERROR"`, `field: "requires"`, `launchOutcome: "unlaunched"`). Local process placement checks existence before worker launch, including placement fallback and unconfigured hosts. Files and directories are both accepted. Non-process session transports currently cannot retain execution custody and are disabled; any nonempty `requires` declaration selecting one of them is refused centrally by the manager with the same typed, known-unlaunched error before preparation or launch, whether the transport is requested or configured.
 
 ```ts
@@ -1042,6 +1044,8 @@ Local process-transport Pi task agents launched by `agents.spawn()` (including `
 
 An explicit `readOnly`, `writableRoots`, or `shell` request replaces the task default, subject to inherited confinement below. `writePolicy: "unrestricted"` opts out, writes a `write_policy.unrestricted` event before launch, and cannot be combined with those explicit fields. It cannot escape a caller's existing confinement.
 
+For writable local process tasks, `TMPDIR`, `TMP`, and `TEMP` are set before the worker starts, so native temporary files such as Pi's large-output spills stay inside the existing write grant. Fabric keeps a caller's `TMPDIR` when both its lexical and real paths are inside a granted root. Otherwise it creates a private `0700` directory beneath a granted root other than the cwd, falling back to the last root. The default task's dedicated `--tmpdir` takes precedence. No root is added to the policy; read-only, empty-root, and unrestricted launches keep their previous temporary environment.
+
 `agents.run()` and `agents.spawn()` accept `readOnly?: boolean`, `writableRoots?: string[]`, and `shell?: "deny" | "unconfined"` for Pi children. Setting any of them creates an explicit write policy:
 
 - `readOnly: true` refuses every `write` and `edit`.
@@ -1395,6 +1399,53 @@ The configuration is returned in actor status and definitions and survives globa
 
 Stop, removal, redefinition and a user halt cancel pending trailing work so it cannot return on restart. Manager close cancels all live timers and prevents delivery from the closed manager; for persistent actors it suspends pending delivery in the queue snapshot for the next manager, as it does already-admitted queue items. A timer rechecks current actor ownership and lifecycle before admission. Configure the interval at creation (or in the template before import).
 
+#### Batch matched observations
+
+Set `batchWindowMs` on `agents.create`, or update a live actor with
+`agents.setBatching({ id, batchWindowMs: 300_000, batchMax: 50, batchMaxBytes: 262_144 })`.
+All three options survive global template export/import. `batchWindowMs` defaults
+to `0`, which keeps single-event behavior; `batchMax` defaults to `50` (maximum
+`1000`), and `batchMaxBytes` defaults to `256 KiB`. Values are safe integers: the
+window is non-negative and both limits are positive. Invalid settings throw
+`FabricActorBatchPolicyError` with code `FABRIC_ACTOR_BATCH_POLICY_INVALID`.
+
+With a positive window, the first queued matched observation anchors its
+expiry. Later arrivals do not extend it. At expiry, `batchMax` events or the
+aggregate byte boundary, one activation receives an array of the existing `{ source, payload, id }` input
+envelopes in FIFO order. Each payload retains its original ref, kind and data.
+Filtering still runs per event before admission and before execution. Positive
+batching suspends replacement-style `coalesce` and `coalesceKey`, so all matched
+observations are retained. An explicitly configured `activation.minIntervalMs`
+still performs its separate settlement admission before the queue.
+
+Direct asks/messages, mesh `steer` or `ask` kinds, Main-origin mesh messages,
+and host `input`/`user_bash` bypass the window. Pending observations run first
+(in groups bounded by `batchMax` and `batchMaxBytes`); the urgent item then runs
+separately without a window. An unlaunched preparation retry keeps its older
+batch ahead of an already pending bypass; ordinary retries retain queue rotation. This keeps FIFO order and the caller's binding and attribution. Main
+is the existing lead/person message identity; Fabric does not infer roles from
+message text or data. Normal actor serialization and admission still apply.
+
+The existing queue checkpoints every original event before any window opens.
+Queue limits, overflow, dead letters, completed-key history and delivery
+receipts count individual events, never batches. Restart restores the original
+IDs and deadline; overdue work runs immediately. Before transport launch, a
+durable manifest binds `activationId` to every original `batchIds` member,
+including one-event batches. The same manifest leads the run's task file, so
+ENODEV saved-answer recovery matches its explicit activation ID, not array
+indentation. Restart cannot append new events to that activation. Other
+interrupted runs retain the existing per-event, at-least-once recovery policy.
+
+The byte budget counts serialized envelopes, images, hydrated wake text and
+member IDs. Collection stops before adding an event that would cross it. A
+single oversized event runs alone, never with its neighbors. A completed-key
+repeat stays pending until its earlier occurrence completes successfully; a
+failed earlier batch cannot discard that repeat. A single unref'd
+timer per actor wakes the queue while a window is open; there is no timer per
+event. Setting the window to `0` releases pending work without replacing an
+active activation. Mixed-trust batches keep each input's trust marking and
+cannot inherit a different input's output principal.
+
 #### Activation filter
 
 An actor that runs a model on every event spends most runs on events it always ignores. Set `activationFilter` to a list of skip rules. Fabric checks each queued mesh or host event against the rules just before it would run the model. When a rule matches, Fabric skips the event with no model call. A rule only skips: it never acts, replies or changes the event. Direct messages (`ask`, `tell`) are never filtered. Fabric checks an event when it arrives, before it can join or replace a queued item, and again just before the run (for items queued before the filter was set). So a skipped event never replaces a queued one by `coalesceKey`: a comment edit that arrives while its comment's creation waits in the queue is skipped, and the creation still runs.
@@ -1743,7 +1794,7 @@ return rlm.query({
 });
 ```
 
-`rlm.query()` calls `agents.run({ runner: "pi", recursive: true })` by default (an explicit `runner: "pi-durable"` uses the durable worker) with Fabric enabled in the child; it accepts `cwd?: string` and `worktree?: boolean`, just like one-shot agent runs. Recursive spawning means Fabric agent composition, not recursive filesystem traversal. Fabric rejects Claude runners for recursive use. It also rejects recursion at `agents.maxDepth`. This setting accepts any non-negative safe integer, and `0` disables child spawning. Approval for the initial recursive call delegates only the `agent` risk capability to recursive children. It does not delegate approvals for network access, execution, or writes. Each Fabric process applies its own configured concurrency and timeout limits. When `agents.budgetUsd` is set, a shared append-only cost ledger limits total spending across the recursion tree. Each node writes the cost of its children to one ledger file that it receives through the environment. A node rejects a new child when accumulated spending reaches the budget. This check is best effort. Concurrent children can pass the check before another child records cost, so the tree can exceed the limit slightly. Use `agents.maxPerExecution` as the race-free ceiling. Results and live status for each recursive child include a `budget` summary with `limit`, `spent`, `remaining`, and `tokens`. Fabric keeps the latest bounded nested-agent status tree in memory. Session-owned nested agents stop when their owning Pi child exits; a detached spawn does not outlive that owner. The child manager leaves nested status and transcript files with the enclosing run so completed leaves remain inspectable in **Topology · Run** and `/fabric chat`. The enclosing run's cleanup, retention, or root-session shutdown removes those artifacts. Every terminal path refreshes the nested tree. A descendant without a retained terminal result is shown as failed with an owner-ended diagnostic, not indefinitely running; Fabric does not invent a successful result or rewrite the worker's status file. Independently durable descendants retain their own lifecycle. Fabric releases the snapshot when the parent run is cleaned up or the Fabric session shuts down.
+`rlm.query()` calls `agents.run({ runner: "pi", recursive: true })` by default (an explicit `runner: "pi-durable"` uses the durable worker) with Fabric enabled in the child; it accepts `cwd?: string` and `worktree?: boolean`, just like one-shot agent runs. Recursive spawning means Fabric agent composition, not recursive filesystem traversal. Fabric rejects Claude runners for recursive use. It also rejects recursion at `agents.maxDepth`. This setting accepts any non-negative safe integer, and `0` disables child spawning. Approval for the initial recursive call delegates only the `agent` risk capability to recursive children. It does not delegate approvals for network access, execution, or writes. Each Fabric process applies its own configured concurrency and timeout limits. When `agents.budgetUsd` is set, a shared append-only cost ledger limits total spending across the recursion tree. Each node writes the cost of its children to one ledger file that it receives through the environment. A node rejects a new child when accumulated spending reaches the budget. This check is best effort. Concurrent children can pass the check before another child records cost, so the tree can exceed the limit slightly. Use `agents.maxPerExecution` as the race-free ceiling. Results and live status for each recursive child include a `budget` summary with `limit`, `spent`, `remaining`, and `tokens`. Fabric keeps the latest bounded nested-agent status tree in memory. Session-owned nested agents stop when their owning Pi child exits; a detached spawn does not outlive that owner. The child manager leaves nested status and transcript files with the enclosing run so completed leaves remain inspectable in **Topology · Run** and `/fabric chat`. The enclosing run's cleanup, retention, or root-session shutdown removes those artifacts. Every terminal path refreshes the nested tree once before settlement and freezes that snapshot in the authenticated parent result. Nested status written after the parent settles does not enrich or replace that result, even if native teardown is still running. A descendant without a retained terminal result is shown as failed with an owner-ended diagnostic, not indefinitely running; Fabric does not invent a successful result or rewrite the worker's status file. Independently durable descendants retain their own lifecycle. Fabric releases the snapshot when the parent run is cleaned up or the Fabric session shuts down.
 
 `agents.nice` (0-19, default `0`) lowers the CPU priority of every child agent, and its IO priority on Linux (`ionice -c2 -n7`). The child's bash tools inherit it. A per-call `nice` on `agents.run`/`agents.spawn`, `agents.create({ nice })` or `agents.setNice({ id, nice })` for an actor can only raise it above the configured value, never lower it; it is clamped to 19. Details: [configuration](configuration.md).
 

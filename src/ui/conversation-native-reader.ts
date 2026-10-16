@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { detachedPreview } from "../core/preview.js";
 import { createHash } from "node:crypto";
 import { NativeReaderEventReplay } from "./conversation-native-reader-replay.js";
 import { NativeReaderCheckpoint } from "./conversation-native-reader-checkpoint.js";
@@ -189,7 +190,7 @@ const messageKey = (message: NativeAgentMessage): string => {
 
 const clipError = (error: unknown): string => {
   const text = error instanceof Error ? error.message : String(error);
-  return text.length > MAX_ERROR_CHARS ? `${text.slice(0, MAX_ERROR_CHARS)}…` : text;
+  return text.length > MAX_ERROR_CHARS ? `${detachedPreview(text, MAX_ERROR_CHARS)}…` : detachedPreview(text, MAX_ERROR_CHARS);
 };
 
 interface RecordPage {

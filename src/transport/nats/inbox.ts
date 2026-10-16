@@ -263,7 +263,7 @@ class RebindingKvStore implements TransportKv {
     let first = true;
     let lastEpoch = -1;
     let resetEmittedEpoch: number | undefined;
-    while (!signal.aborted) {
+    while (!signal.aborted && !this.closed()) {
       const currentEpoch = this.epoch();
       const store = this.current();
       if (!first && (!store || currentEpoch !== lastEpoch) && resetEmittedEpoch !== currentEpoch) {
@@ -280,8 +280,9 @@ class RebindingKvStore implements TransportKv {
       const iterator = bound.watch<V>(prefix, signal)[Symbol.asyncIterator]();
       let reset = false;
       try {
-        while (!signal.aborted) {
+        while (!signal.aborted && !this.closed()) {
           const result = await iterator.next();
+          if (signal.aborted || this.closed()) return;
           if (result.done) break;
           if (result.value.type === "reset") {
             reset = true;

@@ -178,6 +178,41 @@ async function sendAfterReopen(runtime: FabricTransport, envelope: TransportEnve
 }
 
 describe.skipIf(!binary || process.platform === "win32")("verified transport reopen against real TLS brokers", () => {
+  it.each(["explicit", "owner"] as const)("suppresses buffered KV and inbox deliveries after %s close", async (kind) => {
+    const owner = new AbortController();
+    const f = await fixture(false, owner.signal);
+    const watchAbort = new AbortController();
+    let watcher: AsyncIterator<unknown> | undefined;
+    let inbox: AsyncIterator<unknown> | undefined;
+    try {
+      const kv = f.runtime.kv("presence");
+      await kv.put("machine-a.h.buffer-a", HOST, { n: 1 }, 0);
+      await kv.put("machine-a.h.buffer-b", HOST, { n: 2 }, 0);
+      watcher = kv.watch("machine-a.h.*", watchAbort.signal)[Symbol.asyncIterator]();
+      expect((await bounded(watcher.next(), "live buffered snapshot")).value).toMatchObject({ type: "put", entry: { value: { n: 1 } } });
+      await f.runtime.send(command("buffered-inbox-a"));
+      await f.runtime.send(command("buffered-inbox-b"));
+      const typedInbox = f.runtime.inbox(f.abort.signal)[Symbol.asyncIterator]();
+      inbox = typedInbox;
+      const first = (await bounded(typedInbox.next(), "live buffered inbox")).value!;
+      expect(first.payload.id).toBe("buffered-inbox-a");
+      await first.ack();
+      if (kind === "owner") owner.abort();
+      else await f.runtime.close();
+      await bounded(f.relays[0]!.whenIdle(), "closed buffered transport socket");
+      expect((await bounded(watcher.next(), "closed buffered KV")).done).toBe(true);
+      expect((await bounded(typedInbox.next(), "closed buffered inbox")).done).toBe(true);
+      expect(watchAbort.signal.aborted).toBe(false);
+      expect(f.abort.signal.aborted).toBe(false);
+      const fresh = kv.watch("machine-a.h.*", watchAbort.signal)[Symbol.asyncIterator]();
+      expect((await bounded(fresh.next(), "fresh watch after close")).done).toBe(true);
+    } finally {
+      watchAbort.abort(); f.abort.abort();
+      await watcher?.return?.(); await inbox?.return?.();
+      await f.close();
+    }
+  }, 30_000);
+
   it("refuses an already-aborted factory owner before any socket or client protocol, while a live owner works", async () => {
     const f = await prepareFixture(false);
     try {

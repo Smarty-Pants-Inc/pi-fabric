@@ -463,6 +463,9 @@ export interface ResidentTaskCaller {
   returnAddress: TaskReturnAddress;
 }
 
+/** Host-captured attribution identity; the receiver must independently validate its live directory entry. */
+export type ResidentRouterCaller = Omit<ResidentTaskCaller, "returnAddress">;
+
 /** Verify the envelope against the same live owner directory used by native control. */
 export const assertResidentTaskCaller = (
   caller: ResidentTaskCaller | undefined,
@@ -536,6 +539,8 @@ interface ResidentCreateActorCommand {
   request: FabricActorCreateRequest;
   /** Optional verified owning Main; old/non-Main creators mint no interrupt delegation. */
   caller?: ResidentActorCaller;
+  /** Attribution only: never grants creation, mutation or supervisor authority. */
+  routerCaller?: ResidentRouterCaller;
   createdAt: number;
 }
 

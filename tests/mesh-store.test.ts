@@ -1605,7 +1605,9 @@ describe("MeshStore lock recovery", () => {
     const result = store.exclusive(operation);
     expect(operation).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(1_000);
-    const waits = timers.mock.calls.map(([, wait]) => Number(wait));
+    // One fixed relative budget timer (budget + 1 ms) precedes the unchanged polling cadence.
+    const [budget, ...waits] = timers.mock.calls.map(([, wait]) => Number(wait));
+    expect(budget).toBe(2_001);
     expect(waits.slice(0, 6)).toEqual([10, 10, 10, 10, 10, 10]);
     expect(waits.length).toBeLessThanOrEqual(101); // only the head probes at this cadence
     expect(waits.every((wait) => wait >= 0 && wait <= 250)).toBe(true);
@@ -1629,7 +1631,8 @@ describe("MeshStore lock recovery", () => {
     const error = await result;
     expect(error).toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
     expect((error as Error).message).toMatch(/after 11 attempts, largest gap between attempts 19 ms$/);
-    expect(timers.mock.calls.map(([, wait]) => Number(wait))).toEqual([...Array(8).fill(10), 19, 1]);
+    // One fixed relative budget timer (budget + 1 ms) precedes the unchanged bounded retry cadence.
+    expect(timers.mock.calls.map(([, wait]) => Number(wait))).toEqual([101, ...Array(8).fill(10), 19, 1]);
     expect(operation).not.toHaveBeenCalled();
     expect(fs.existsSync(lockPath)).toBe(true); // a live holder is never swept, even beyond stale age
     expect(vi.getTimerCount()).toBe(0);
@@ -1641,8 +1644,9 @@ describe("MeshStore lock recovery", () => {
     const second = store.exclusive(operation).catch((error: unknown) => error);
     await vi.advanceTimersByTimeAsync(100);
     await second;
-    expect(timers.mock.calls.slice(0, 8).every(([, wait]) => wait === 10)).toBe(true);
-    expect(timers.mock.calls.slice(8).every(([, wait]) => wait === 0)).toBe(true);
+    expect(timers.mock.calls[0]?.[1]).toBe(101);
+    expect(timers.mock.calls.slice(1, 9).every(([, wait]) => wait === 10)).toBe(true);
+    expect(timers.mock.calls.slice(9).every(([, wait]) => wait === 0)).toBe(true);
     expect(vi.getTimerCount()).toBe(0);
   });
 

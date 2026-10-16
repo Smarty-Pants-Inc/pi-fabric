@@ -52,6 +52,10 @@ const primaryEntryPoints = [
 // path lets a session that loaded the previous index resolve delayed modules
 // after the installed package is replaced, while preserving lazy evaluation.
 const lazyEntryPoints = [
+  // Principal diagnostics load their private file sink only on the first diverted line.
+  "src/core/diagnostics-log.ts",
+  // Command registration is eager; the subcommand implementation loads on invocation.
+  "src/commands/fabric-handler.ts",
   // Native installer bootstrap; never exposed as a guest authority grant.
   "src/actors/slot-authority.ts",
   // Import-only per-materialization claim parsing, not idle registration work.
@@ -207,6 +211,9 @@ const result = await build({
     setup(pluginBuild) {
       pluginBuild.onResolve({ filter: /\/(?:model-policy|fabric-provenance)\.js$/ }, () => ({
         path: resolve("src/host-compatibility.ts"),
+      }));
+      pluginBuild.onResolve({ filter: /\/diagnostics\.js$/ }, () => ({
+        path: resolve("src/core/agent-dir.ts"),
       }));
     },
   }],

@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { diagnostics } from "../core/diagnostics.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -986,7 +987,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     if (this.#degraded) return;
     this.#degraded = true;
     const ticks = Math.max(this.#retiredTicks, LIFECYCLE_LOST_TICKS + 1);
-    console.warn(`[pi-fabric] participant heartbeat: the session ctx it read was retired (reload or session replacement); ` +
+    diagnostics.warn("src/topology/participant-directory.ts", `[pi-fabric] participant heartbeat: the session ctx it read was retired (reload or session replacement); ` +
       `${this.options.hostId} is degraded and its heartbeat is stopped until a live session rebinds it.`);
     try { this.options.onLifecycleLost?.(ticks); } catch { /* the warning above already surfaced it */ }
   }
@@ -1028,7 +1029,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     }
     if (++this.#retiredTicks <= LIFECYCLE_LOST_TICKS || this.#degraded) return;
     this.#degraded = true;
-    console.warn(`[pi-fabric] participant heartbeat: no live session ctx for ${this.#retiredTicks} heartbeats; ` +
+    diagnostics.warn("src/topology/participant-directory.ts", `[pi-fabric] participant heartbeat: no live session ctx for ${this.#retiredTicks} heartbeats; ` +
       `${this.options.hostId} is degraded and its lease is not renewed until a live session rebinds it.`);
     try { this.options.onLifecycleLost?.(this.#retiredTicks); } catch { /* the warning above already surfaced it */ }
   }
@@ -1247,7 +1248,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       "its entries now lapse with their unrenewed lease";
     try {
       if (this.options.onWithdrawalFailure) this.options.onWithdrawalFailure(message);
-      else console.warn(`[pi-fabric] ${message}`);
+      else diagnostics.warn("src/topology/participant-directory.ts", `[pi-fabric] ${message}`);
     } catch { /* A diagnostic sink never fails close(). */ }
   }
 

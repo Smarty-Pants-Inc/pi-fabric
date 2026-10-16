@@ -30,13 +30,17 @@ export class FileControlReader {
     paused: () => boolean,
     canConsume?: () => boolean,
     onConsumed?: (event: MeshEvent) => void,
+    beforePage?: () => boolean,
+    beforeEvent?: (event: MeshEvent) => boolean,
   ): Promise<boolean> {
     while (canConsume?.() !== false) {
+      if (beforePage?.() === false) return false;
       const tail = this.mesh.tail(this.#offset, 100);
       for (const event of tail.events) {
         if (paused() || canConsume?.() === false) return false;
         if (event.sequence <= this.#lastSequence) continue;
         if (isControl(event, this.hostId)) {
+          if (beforeEvent?.(event) === false) return false;
           this.#inHand.add(event.sequence);
           try {
             const handling = accept(event);

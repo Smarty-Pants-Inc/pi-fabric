@@ -2,6 +2,7 @@ import type { FabricState } from "../fabric-state.js";
 import type { CapturedToolCatalog } from "../capture/catalog.js";
 import type { ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { resolveAgentDir } from "../core/agent-dir.js";
+import { notifyDiagnostic } from "../core/diagnostics.js";
 import {
   type FabricConfigScope,
   loadFabricConfigForScope,
@@ -172,7 +173,7 @@ export async function openFabricSettings(
       void populateClaudeModelSource(claudeModelSource, () => deps.state.agents.claudeModels()).catch((error: unknown) => {
         // A replaced session's late failure must not reach a stale UI (#5962).
         if (live() && deps.state.config.agents.runner === "claude") {
-          context.ui.notify(`Claude model discovery failed: ${error instanceof Error ? error.message : String(error)}`, "warning");
+          notifyDiagnostic(context, "src/ui/settings.ts", `Claude model discovery failed: ${error instanceof Error ? error.message : String(error)}`, "warning");
         }
       });
     }

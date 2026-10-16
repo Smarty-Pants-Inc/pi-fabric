@@ -97,7 +97,7 @@ describe("Path B real nats-server authorization", () => {
     harness = await createPathBHarness({ binary });
   }, 60_000);
 
-  it("expands machine tags and enforces runtime, consumer, inbox, and KV boundaries", async () => {
+  it("T-OPS-NOREAD: expands machine tags and enforces runtime, report-only operator, inbox and KV boundaries", async () => {
     if (!harness) throw new Error("Path B harness was not initialized");
     const fixture = harness;
     const maintainerNc = await fixture.connect(fixture.users.maintainer);
@@ -151,8 +151,11 @@ describe("Path B real nats-server authorization", () => {
     // The JWT machine tag expands {{tag(machine)}}: own source publish and own consumer pull/ack work.
     const ownPublish = await machineAJs.publish(sourceSubject(MACHINE_A), "machine-a-owned");
     expect(ownPublish.stream).toBe(STREAM_A);
-    // E14: E7 denies stream lifecycle, not the literal operator MSG.GET right.
-    expect((await operatorManager.streams.getMessage(STREAM_A, { seq: ownPublish.seq }))?.string()).toBe("machine-a-owned");
+    // E19: the operator can inspect counters/configuration, never retained private bodies.
+    expect((await operatorManager.streams.info(STREAM_A)).config.name).toBe(STREAM_A);
+    expect((await operatorManager.consumers.info(STREAM_A, "machine-a-consumer")).name).toBe("machine-a-consumer");
+    await expectDenied(maintainerOracle, "publish", `$JS.API.STREAM.MSG.GET.${STREAM_A}`,
+      () => operatorManager.streams.getMessage(STREAM_A, { seq: ownPublish.seq }));
     const ownConsumerClient = await machineAJs.consumers.get(STREAM_A, "machine-a-consumer");
     const ownMessage = await ownConsumerClient.next({ expires: API_TIMEOUT_MS });
     expect(ownMessage?.string()).toBe("machine-a-owned");
@@ -162,9 +165,10 @@ describe("Path B real nats-server authorization", () => {
 
     const foreignPublish = await machineBJs.publish(sourceSubject(MACHINE_B), "machine-b-owned");
     expect(foreignPublish.stream).toBe(STREAM_B);
-    expect((await operatorManager.streams.getMessage(STREAM_B, { seq: foreignPublish.seq }))?.string()).toBe("machine-b-owned");
-    const relay = await jetstream(maintainerNc).publish(`fabric.in.${MACHINE_B}.run.ack.message.fabric-ops`, "operator-relay");
-    expect(relay.stream).toBe(STREAM_B);
+    await expectDenied(maintainerOracle, "publish", `$JS.API.STREAM.MSG.GET.${STREAM_B}`,
+      () => operatorManager.streams.getMessage(STREAM_B, { seq: foreignPublish.seq }));
+    const relaySubject = `fabric.in.${MACHINE_B}.run.ack.message.fabric-ops`;
+    await expectDenied(maintainerOracle, "publish", relaySubject, () => maintainerNc.publish(relaySubject, "operator-relay"));
     const outsideInventory = "fabric.in.machine-c.run.ack.message.fabric-ops";
     await expectDenied(maintainerOracle, "publish", outsideInventory, () => maintainerNc.publish(outsideInventory, "outside-inventory"));
     const foreignMessage = await machineBNc.request(`$JS.API.CONSUMER.MSG.NEXT.${STREAM_B}.machine-b-consumer`, JSON.stringify({ batch: 1 }), { timeout: API_TIMEOUT_MS, noMux: true, reply: `_INBOX.${fixture.users.machineB.publicKey}.foreign-pull` });
@@ -196,6 +200,7 @@ describe("Path B real nats-server authorization", () => {
     for (const stream of [STREAM_A, STREAM_B]) {
       for (const subject of [`$JS.API.STREAM.MSG.GET.${stream}`, `$JS.API.DIRECT.GET.${stream}`, `$JS.API.DIRECT.GET.${stream}.fabric.in.any`, `$JS.API.STREAM.MSG.DELETE.${stream}`]) {
         await expectDenied(machineAOracle, "publish", subject, () => machineANc.publish(subject, JSON.stringify({ seq: 1 })));
+        await expectDenied(maintainerOracle, "publish", subject, () => maintainerNc.publish(subject, JSON.stringify({ seq: 1 })));
       }
     }
     await expectDenied(machineAOracle, "publish", `$JS.API.STREAM.INFO.${STREAM_B}`, () => machineAManager.streams.info(STREAM_B));
@@ -240,10 +245,12 @@ describe("Path B real nats-server authorization", () => {
     for (const name of [PATH_B_ADVISORY_DURABLE, "other_operator"]) {
       await bootstrap.consumers.add("FABRIC_ADV", {
         durable_name: name, filter_subject: "$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES.>",
-        ack_policy: AckPolicy.Explicit, deliver_policy: DeliverPolicy.All,
+        ack_policy: AckPolicy.None, deliver_policy: DeliverPolicy.All,
       });
     }
     const before = await bootstrap.consumers.info("FABRIC_ADV", PATH_B_ADVISORY_DURABLE);
+    expect(before.config.ack_policy).toBe(AckPolicy.None);
+    expect(before.config.deliver_subject).toBeUndefined();
     for (const subject of [
       `$JS.API.CONSUMER.CREATE.FABRIC_ADV.${PATH_B_ADVISORY_DURABLE}`,
       `$JS.API.CONSUMER.CREATE.FABRIC_ADV.${PATH_B_ADVISORY_DURABLE}.filter`,
@@ -253,13 +260,16 @@ describe("Path B real nats-server authorization", () => {
       "$JS.API.CONSUMER.MSG.NEXT.FABRIC_ADV.other_operator",
       "$JS.API.CONSUMER.INFO.FABRIC_ADV.other_operator",
       "$JS.ACK.FABRIC_ADV.other_operator.1.1.1.1.0",
+      `$JS.ACK.FABRIC_ADV.${PATH_B_ADVISORY_DURABLE}.1.1.1.1.0`,
+      "$JS.ACK.FABRIC_IN_machine-a.rt_owner.1.1.1.1.0",
+      "$JS.ACK.arbitrary",
     ]) await expectDenied(oracle, "publish", subject, () => nc.publish(subject, "{}"));
     const sent = await bootstrapJs.publish(advisorySubject, "retained advisory");
     const fixed = await js.consumers.get("FABRIC_ADV", PATH_B_ADVISORY_DURABLE);
     const delivery = await fixed.next({ expires: API_TIMEOUT_MS });
     expect(delivery?.string()).toBe("retained advisory");
     if (!delivery) throw new Error("fixed advisory durable did not deliver");
-    expect(await delivery.ackAck()).toBe(true);
+    // AckNone pull is accepted by nats-server 2.11.17; reporting never acknowledges any subject.
     const after = await manager.consumers.info("FABRIC_ADV", PATH_B_ADVISORY_DURABLE);
     expect(after.created).toBe(before.created);
     expect(after.config).toEqual(before.config);

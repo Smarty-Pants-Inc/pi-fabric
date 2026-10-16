@@ -217,8 +217,8 @@ function canonical(value: unknown): string {
  * - agent input uses its existing `host` field as the machine; it must be in pathBMachines.
  * - maintainer input adds `machine`, in /^fabric-ops(-[a-z0-9]+)?$/ (default choice "fabric-ops").
  *   This is a reserved role namespace, not a host; it is forbidden in pathBMachines and agent credentials.
- *   Operator ACK publication enumerates the destination machines; there is no wildcard destination.
- *   Operator credentials are read/relay only; stream provisioning uses a separate bootstrap authority.
+ *   The canary operator is metadata/report-only (E19): no inbox reads or relay publication.
+ *   It binds one bootstrap-owned advisory durable; provisioning uses a separate bootstrap authority.
  * Neither input contains secrets in argv/environment: existing CLI stdin JSON and artifact rules apply.
  * A fleet-policy JSON can retain its existing `hosts` map and add pathBMachines, then mint Path B
  * agent users only for those host keys. Other hosts keep their existing #7504 account/credentials.

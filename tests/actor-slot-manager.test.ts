@@ -220,7 +220,7 @@ describe("manager protected birth/recovery seam", () => {
     hold.resolve();
     await recovering;
     expect(directory.status(id).queued).toBe(1);
-    expect(fs.readFileSync(deadLetter, "utf8")).toBe("");
+    expect(fs.existsSync(deadLetter)).toBe(false);
     expect(runner).not.toHaveBeenCalled();
   });
 

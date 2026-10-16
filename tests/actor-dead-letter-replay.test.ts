@@ -3,11 +3,14 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
+import type { AgentRunRequest, AgentRunResult } from "../src/agents/types.js";
 import { ACTOR_DEAD_LETTER_ARCHIVE_MAX_BYTES, ActorManager } from "../src/actors/manager.js";
+import { ActorMeshMonitor } from "../src/actors/mesh-monitor.js";
 import { GlobalActorRegistry } from "../src/actors/global-registry.js";
 import { DEFAULT_DEAD_LETTER_REPLAY_MAX_AGE_MS, normalizeDeadLetterReplayMaxAgeMs, type FabricActorRequest } from "../src/actors/types.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore, type MeshEvent, type MeshIdentity } from "../src/mesh/store.js";
+import { normalizeScope, senderStamp } from "../src/scope.js";
 import { AGENTS_ACTION_DESCRIPTORS } from "../src/providers/agents-actions.js";
 
 const closers: Array<() => Promise<void>> = [];
@@ -86,6 +89,115 @@ describe("dead-letter replay age and current activation filter (#10630)", () => 
     expect(manager.status(w.actor.id).deadLetterReplayMaxAgeMs).toBe(DEFAULT_DEAD_LETTER_REPLAY_MAX_AGE_MS);
   });
 
+  it.each([0, 2049])("does not resurrect an expired dead letter after a crash with a lagging saved mesh cursor (#1065) (padding: %i)", async paddingCount => {
+    // Data-safety regression: entry.at is expired but the mesh envelope is recent enough
+    // for normal saved-cursor catch-up. Archival must not erase the only restart seed
+    // until this monitor has safely passed the event and checkpointed that boundary.
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "dead-letter-cursor-crash-"));
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
+    const cursorPath = path.join(root, "actor-mesh-cursor.json");
+    const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, { runRoot: path.join(root, "runs") });
+    closers.push(() => agents.close());
+    const runs: AgentRunRequest[] = [];
+    vi.spyOn(agents, "run").mockImplementation(async (request, signal) => {
+      runs.push(request);
+      await new Promise<void>(resolve => {
+        if (signal?.aborted) resolve();
+        else signal?.addEventListener("abort", () => resolve(), { once: true });
+      });
+      throw new Error("held cursor regression run aborted");
+    });
+    let polling = false;
+    let monitor!: ActorMeshMonitor;
+    const start = ActorMeshMonitor.prototype.start;
+    vi.spyOn(ActorMeshMonitor.prototype, "start").mockImplementation(function (this: ActorMeshMonitor) {
+      monitor = this;
+      if (polling) start.call(this);
+    });
+    const open = () => {
+      const manager = new ActorManager("cursor-crash", identity, mesh,
+        { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20, actorQueueLimit: 16 }, agents, () => {},
+        { actorRoot: path.join(root, "actors"), persistent: true, closeGraceMs: 0, meshRetentionSweepPath: false,
+          meshCursorPath: cursorPath, meshReplayAgeMs: 60_000, canConsumeMesh: () => polling });
+      closers.push(() => manager.close());
+      return manager;
+    };
+    const initial = open();
+    const actor = await initial.create({ name: "cursor-backlog", instructions: "Supervise.", topics: ["team.work"],
+      coalesce: false, batchWindowMs: 0 });
+    await initial.close();
+    await mesh.publish({ topic: "unrelated.cursor-anchor", from: identity, kind: "anchor", text: "before expired work" });
+    const laggingCursor = { format: 1, ...mesh.latestCursor() };
+    const stale = await mesh.publish({ topic: "team.work", from: identity, kind: "work", text: "expired backlog, recent envelope" });
+    const entry: Entry = { at: Date.now() - DEFAULT_DEAD_LETTER_REPLAY_MAX_AGE_MS - 60_000, source: "mesh:team.work", event: stale };
+    const paddingEntries: Entry[] = [];
+    // Publish real recent envelopes so saved-cursor catch-up encounters every stale ID.
+    // publishBatch can commit a prefix, so advance only by its returned events.
+    while (paddingEntries.length < paddingCount) {
+      const events = await mesh.publishBatch(Array.from({ length: Math.min(256, paddingCount - paddingEntries.length) }, () => ({
+        topic: "team.work", from: identity, kind: "work", text: "p",
+      })));
+      expect(events.length).toBeGreaterThan(0);
+      paddingEntries.push(...events.map(event => ({ at: entry.at, source: entry.source, event })));
+    }
+    const staleEntries = [entry, ...paddingEntries];
+    const staleIds = new Set(staleEntries.map(value => value.event.id));
+    // The large row must exercise the delivery-seed bound, not archive rotation.
+    expect(Buffer.byteLength(staleEntries.map(value => `${JSON.stringify(value)}\n`).join("")))
+      .toBeLessThanOrEqual(1024 * 1024);
+    const liveBacklog = await mesh.publish({ topic: "team.work", from: identity, kind: "work", text: "fresh backlog must replay even while the cursor lags" });
+    const liveEntry: Entry = { at: Date.now(), source: "mesh:team.work", event: liveBacklog };
+    const directory = path.join(root, "actors", actor.id);
+    const file = path.join(directory, "dead-letter.jsonl");
+    const archive = path.join(directory, "dead-letter.archive.jsonl");
+    const queued = () => fs.readdirSync(directory)
+      .filter(name => name.startsWith("queue-") && name.endsWith(".json"))
+      .flatMap(name => (JSON.parse(fs.readFileSync(path.join(directory, name), "utf8")) as {
+        items: Array<{ payload: MeshEvent }>;
+      }).items.map(item => item.payload.id));
+    fs.writeFileSync(cursorPath, JSON.stringify(laggingCursor));
+    fs.writeFileSync(file, [...staleEntries, liveEntry].map(value => `${JSON.stringify(value)}\n`).join(""));
+
+    const beforeCrash = open();
+    await beforeCrash.setActivationFilter(actor.id, null); // real archival/rewrite opportunity
+    // The monitor never started and consumption was held, so close cannot flush a newer
+    // cursor. This is the process-loss boundary, not a graceful cursor checkpoint.
+    await beforeCrash.close();
+    const crashBacklog = readLines<Entry>(file);
+    const crashArchive = readLines<Entry>(archive);
+    const crashQueued = queued();
+    expect(JSON.parse(fs.readFileSync(cursorPath, "utf8"))).toEqual(laggingCursor);
+
+    const fresh = await mesh.publish({ topic: "team.work", from: identity, kind: "work", text: "unrelated fresh work must still deliver" });
+    polling = true;
+    const restarted = open(); // real start, readCursor, saved-cursor catch-up and dispatch
+    await waitFor(() => queued().includes(fresh.id));
+    await waitFor(() => restarted.meshCaughtUp());
+    expect(queued().filter(id => staleIds.has(id))).toEqual([]);
+    expect(runs.filter(request => staleEntries.some(value => request.task.includes(value.event.id)))).toEqual([]);
+    expect(crashBacklog).toEqual(staleEntries);
+    expect(crashArchive).toEqual([]);
+    expect(crashQueued).toContain(liveBacklog.id); // only stale archival waits for the cursor
+    expect(crashQueued.filter(id => staleIds.has(id))).toEqual([]);
+    await waitFor(() => runs.some(request => request.task.includes(liveBacklog.id)));
+
+    // The existing monitor lifecycle must retry after catch-up; no direct replay callback
+    // and no second timer is needed. Its safe cursor can now authorize durable archival.
+    monitor.schedule();
+    await waitFor(() => readLines<Entry>(file).length === 0 && readLines<Entry>(archive).length === staleEntries.length);
+    const saved = JSON.parse(fs.readFileSync(cursorPath, "utf8")) as { last: { sequence: number; id: string } };
+    const lastStale = staleEntries.at(-1)!.event;
+    expect(saved.last.sequence).toBeGreaterThanOrEqual(lastStale.sequence);
+    if (saved.last.sequence === lastStale.sequence) expect(saved.last.id).toBe(lastStale.id);
+    expect(readLines<Entry>(archive)).toEqual(staleEntries);
+    expect(readLines<Entry>(file)).toEqual([]);
+    await restarted.setActivationFilter(actor.id, null); // another replay opportunity cannot re-archive it
+    expect(readLines<Entry>(archive)).toEqual(staleEntries);
+    expect(readLines<Entry>(file)).toEqual([]);
+    expect(queued().filter(id => staleIds.has(id))).toEqual([]);
+    expect(runs.filter(request => staleEntries.some(value => request.task.includes(value.event.id)))).toEqual([]);
+  });
+
   it("bounds the stale archive, rotates one generation, and notices dropped older data", async () => {
     const w = await backlog();
     const oldArchive = Buffer.alloc(ACTOR_DEAD_LETTER_ARCHIVE_MAX_BYTES - 16, 0x78);
@@ -100,8 +212,30 @@ describe("dead-letter replay age and current activation filter (#10630)", () => 
     expect(fs.readFileSync(`${w.archive}.1`)).toEqual(oldArchive);
     expect(readLines<Entry>(w.archive)).toEqual(w.entries);
     expect(manager.messages(w.actor.id)).toContainEqual(expect.objectContaining({
-      data: expect.objectContaining({ reason: "dead_letter_archive", deadLetterArchiveDropped: 1 }),
+      data: expect.objectContaining({ reason: "dead_letter_archive", deadLetterArchiveDroppedBytes: ACTOR_DEAD_LETTER_ARCHIVE_MAX_BYTES + 16 }),
     }));
+  });
+
+  it("counts discarded current-prefix and overwritten malformed backup bytes exactly once", async () => {
+    const w = await backlog();
+    const retainedHistory = Buffer.from(`${JSON.stringify(w.entries[0])}\n`);
+    const discardedPrefix = Buffer.concat([Buffer.alloc(ACTOR_DEAD_LETTER_ARCHIVE_MAX_BYTES + 16, 0x78), Buffer.from("\n")]);
+    const oldBackup = Buffer.alloc(ACTOR_DEAD_LETTER_ARCHIVE_MAX_BYTES + 31, 0xff);
+    fs.writeFileSync(w.archive, Buffer.concat([discardedPrefix, retainedHistory]));
+    fs.writeFileSync(`${w.archive}.1`, oldBackup);
+    for (const entry of w.entries) entry.at = Date.now() - DEFAULT_DEAD_LETTER_REPLAY_MAX_AGE_MS - 60_000;
+    fs.writeFileSync(w.file, w.entries.map(entry => `${JSON.stringify(entry)}\n`).join(""));
+    const manager = w.open();
+    await waitFor(() => receipts(manager, w.actor.id).length === 1);
+    expect(fs.readFileSync(`${w.archive}.1`)).toEqual(retainedHistory);
+    expect(readLines<Entry>(w.archive)).toEqual(w.entries);
+    const notice = manager.messages(w.actor.id).find(message =>
+      (message.data as { reason?: unknown } | undefined)?.reason === "dead_letter_archive");
+    expect(notice?.data).toEqual(expect.objectContaining({
+      deadLetterArchiveDroppedBytes: discardedPrefix.length + oldBackup.length,
+      deadLetterArchiveRotated: true,
+    }));
+    expect(notice?.data).not.toHaveProperty("deadLetterArchiveDropped");
   });
 
   it.each(["EPERM", "EIO"])("syncs the writable fallback backup before truncating, but refuses other rename failures (%s)", async code => {
@@ -168,6 +302,7 @@ describe("dead-letter replay age and current activation filter (#10630)", () => 
       const prefix = entries.slice(0, -archivedCount);
       // The preceding batch was completely archived before installing any new work.
       if (batch > 0) expect(readLines(w.file)).toEqual([]);
+      const overwrittenBackupBytes = fs.existsSync(`${w.archive}.1`) ? fs.statSync(`${w.archive}.1`).size : 0;
       fs.writeFileSync(w.file, entries.map(entry => JSON.stringify(entry) + "\n").join(""));
       const manager = w.open();
       // Replay is synchronous up to the presence write. Close immediately, before queued
@@ -186,7 +321,8 @@ describe("dead-letter replay age and current activation filter (#10630)", () => 
       if (batch > 0) {
         expect(fs.statSync(`${w.archive}.1`).size).toBeLessThanOrEqual(ACTOR_DEAD_LETTER_ARCHIVE_MAX_BYTES);
         expect(readLines<Entry>(`${w.archive}.1`)).toEqual(previous);
-        expect(notices.at(-1)?.data).toEqual(expect.objectContaining({ deadLetterArchiveDropped: 1 }));
+        expect(notices.at(-1)?.data).toEqual(expect.objectContaining({ deadLetterArchiveDroppedBytes: overwrittenBackupBytes }));
+        expect(notices.at(-1)?.data).not.toHaveProperty("deadLetterArchiveDropped");
       }
 
       const restarted = w.open();
@@ -499,6 +635,140 @@ describe("dead-letter replay age and current activation filter (#10630)", () => 
     for (const action of ["create", "setActivationFilter"]) {
       const descriptor = AGENTS_ACTION_DESCRIPTORS.find(item => item.name === action)!;
       expect(descriptor.inputSchema.properties).toHaveProperty("deadLetterReplayMaxAgeMs");
+    }
+  });
+});
+
+const replayActorScope = normalizeScope({ principal: { id: "actor-owner" }, grants: [{ resource: "mesh:team.work", actions: ["read"] }] });
+const replayForeignScope = normalizeScope({ principal: { id: "other-owner" }, grants: [{ resource: "mesh:team.work", actions: ["read"] }] });
+const replayCases = [
+  { key: "foreign", mode: "foreign" as const, sender: senderStamp(replayForeignScope), scope: replayActorScope },
+  { key: "foreign-unscoped", mode: "foreign" as const, sender: senderStamp(replayForeignScope), scope: undefined },
+  { key: "legacy", mode: "legacy" as const, sender: undefined, scope: replayActorScope },
+  { key: "same", mode: "same" as const, sender: senderStamp(replayActorScope), scope: replayActorScope },
+] as const;
+type ReplayCase = (typeof replayCases)[number];
+type ReplayFrame = { source: string; payload: MeshEvent; id: string; untrusted?: true };
+const replayFrame = (request: AgentRunRequest): ReplayFrame => {
+  const separator = request.task.lastIndexOf("\n\n");
+  return JSON.parse(request.task.slice(separator + 2)) as ReplayFrame;
+};
+
+// Hold one real activation, fill queue+overflow, let the final event take the persistent
+// dead-letter path, then restart while its replayed activation is held.
+const senderReplayFixture = async (scenario: ReplayCase) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "dead-letter-sender-replay-"));
+  const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
+  const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, { runRoot: path.join(root, "runs") });
+  const runs: AgentRunRequest[] = [];
+  let release!: () => void;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  let replayId: string | undefined;
+  let releaseReplay!: () => void;
+  const replayHeld = new Promise<void>(resolve => { releaseReplay = resolve; });
+  vi.spyOn(agents, "run").mockImplementation(async (request, signal, onSpawned) => {
+    runs.push(request);
+    const id = `recorded-${runs.length}`;
+    onSpawned?.({ id, name: "recorded", status: "running", runner: "pi", transport: "process", cwd: process.cwd() });
+    const aborted = new Promise<void>(resolve => signal?.addEventListener("abort", () => resolve(), { once: true }));
+    if (runs.length === 1) await Promise.race([held, aborted]);
+    if (replayId && request.task.includes(replayId)) await Promise.race([replayHeld, aborted]);
+    return { id, name: "recorded", task: request.task, status: "completed", runner: "pi", transport: "process", cwd: process.cwd(),
+      startedAt: Date.now(), updatedAt: Date.now(), turns: 1, toolCalls: 0, inferenceStarted: true, text: "",
+      value: { action: "silent" }, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } } satisfies AgentRunResult;
+  });
+  let monitor!: ActorMeshMonitor;
+  vi.spyOn(ActorMeshMonitor.prototype, "start").mockImplementation(function (this: ActorMeshMonitor) { monitor = this; });
+  const open = () => new ActorManager("sender-replay", identity, mesh,
+    { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20, actorQueueLimit: 1 }, agents, () => {},
+    { actorRoot: path.join(root, "actors"), persistent: true, closeGraceMs: 0, meshRetentionSweepPath: false, canConsumeMesh: () => false });
+  let manager = open();
+  closers.push(async () => { await manager.close(); await agents.close(); });
+  const actor = await manager.create({ name: `sender-${scenario.key}`, instructions: "Inspect.", topics: ["team.work"], coalesce: false,
+    batchWindowMs: 0, ...(scenario.scope ? { principalScope: scenario.scope } : {}) });
+  const dir = path.join(root, "actors", actor.id);
+  const queue = () => {
+    const name = fs.readdirSync(dir).find(file => file.startsWith("queue-") && file.endsWith(".json"));
+    return name ? JSON.parse(fs.readFileSync(path.join(dir, name), "utf8")) as { items: Array<{ payload: MeshEvent; sender?: ReturnType<typeof senderStamp> }> } : { items: [] };
+  };
+  let sequence = 0;
+  const from: MeshIdentity = { id: "agent:sender", name: "sender", kind: "agent" };
+  const makeEvent = (id: string, ref: string, sender = scenario.sender): MeshEvent => ({
+    id, sequence: ++sequence, topic: "team.work", kind: "work", from, data: { ref }, verification: "mesh",
+    principal: { id: "principal:sender", binding: "voice-call" }, createdAt: Date.now(),
+    ...(sender === undefined ? {} : { sender }),
+  });
+  const deliver = (event: MeshEvent) => { if (monitor.callbacks.onEvent(event) !== true) throw new Error("event not accepted"); };
+  deliver(makeEvent(`${scenario.key}-blocker`, "blocker", senderStamp(replayActorScope)));
+  await waitFor(() => runs.length === 1);
+  const live = makeEvent(`${scenario.key}-live`, "live");
+  deliver(live);
+  await waitFor(() => queue().items.some(item => item.payload.id === live.id));
+  for (let index = 0; index < 8; index++) deliver(makeEvent(`${scenario.key}-filler-${index}`, `filler-${index}`));
+  const replay = makeEvent(`${scenario.key}-replay`, "replay");
+  replayId = replay.id;
+  deliver(replay);
+  const deadLetter = path.join(dir, "dead-letter.jsonl");
+  const letters = readLines<Entry>(deadLetter);
+  expect(letters).toHaveLength(1);
+  expect(letters[0]!.event).toEqual(replay);
+  const persistedLive = queue().items.find(item => item.payload.id === live.id);
+  expect(persistedLive).toBeDefined();
+  release();
+  await waitFor(() => runs.some(request => { try { return replayFrame(request).payload.id === replay.id; } catch { return false; } }));
+  const liveRequest = runs.find(request => { try { return replayFrame(request).payload.id === live.id; } catch { return false; } })!;
+  const replayRequest = runs.find(request => { try { return replayFrame(request).payload.id === replay.id; } catch { return false; } })!;
+  await manager.close();
+  const persistedRestart = queue().items.find(item => item.payload.id === replay.id);
+  expect(persistedRestart).toBeDefined();
+  manager = open();
+  await waitFor(() => runs.filter(request => { try { return replayFrame(request).payload.id === replay.id; } catch { return false; } }).length >= 2);
+  const restartedRequest = runs.filter(request => { try { return replayFrame(request).payload.id === replay.id; } catch { return false; } }).at(-1)!;
+  releaseReplay();
+  return { actor, live, replay, letters, persistedLive: persistedLive!, persistedRestart: persistedRestart!, liveRequest, replayRequest, restartedRequest, scope: scenario.scope };
+};
+
+describe("dead-letter replay preserves mesh sender trust framing (#14094)", () => {
+  it.each(replayCases)("keeps $key sender identity and trust framing across live admission and replay", async scenario => {
+    const result = await senderReplayFixture(scenario);
+    const live = replayFrame(result.liveRequest), replay = replayFrame(result.replayRequest), restarted = replayFrame(result.restartedRequest);
+    const liveHeader = result.liveRequest.task.slice(0, result.liveRequest.task.indexOf("\n\n"));
+    const replayHeader = result.replayRequest.task.slice(0, result.replayRequest.task.indexOf("\n\n"));
+    const restartedHeader = result.restartedRequest.task.slice(0, result.restartedRequest.task.indexOf("\n\n"));
+    expect(replayHeader).toBe(liveHeader);
+    expect(restartedHeader).toBe(liveHeader);
+    // The live checkpoint and restart checkpoint both carry sender separately from the full
+    // MeshEvent payload; a missing legacy sender remains absent rather than being synthesized.
+    if (scenario.sender) {
+      expect(result.persistedLive.payload.sender).toEqual(scenario.sender);
+      expect(result.persistedLive.sender).toEqual(scenario.sender);
+      expect(result.letters[0]!.event.sender).toEqual(scenario.sender);
+      expect(result.persistedRestart.sender).toEqual(scenario.sender);
+    } else {
+      expect(result.persistedLive.payload).not.toHaveProperty("sender");
+      expect(result.persistedLive).not.toHaveProperty("sender");
+      expect(result.letters[0]!.event).not.toHaveProperty("sender");
+      expect(result.persistedRestart).not.toHaveProperty("sender");
+    }
+    expect(result.letters[0]!.event).toEqual(result.replay);
+    expect(live.payload).toEqual(result.live);
+    expect(replay.payload).toEqual(result.replay);
+    expect(result.liveRequest.inheritedScope).toEqual(result.scope);
+    expect(result.replayRequest.inheritedScope).toEqual(result.scope);
+    expect(result.restartedRequest.inheritedScope).toEqual(result.scope);
+    expect(result.replayRequest.provenance).toEqual(result.liveRequest.provenance);
+    expect(result.restartedRequest.provenance).toEqual(result.replayRequest.provenance);
+    expect(restarted.payload).toEqual(result.replay);
+    if (scenario.mode === "foreign" || scenario.mode === "legacy") {
+      expect(liveHeader).toContain("UNTRUSTED input from a different or narrower principal");
+      expect(live.untrusted).toBe(true);
+      expect(replay.untrusted).toBe(true);
+      expect(restarted.untrusted).toBe(true);
+    } else {
+      expect(liveHeader).not.toContain("UNTRUSTED");
+      expect(live).not.toHaveProperty("untrusted");
+      expect(replay).not.toHaveProperty("untrusted");
+      expect(restarted).not.toHaveProperty("untrusted");
     }
   });
 });

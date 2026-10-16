@@ -779,6 +779,8 @@ export class ActorManager {
   // smarty-dev#816: entries in each actor's dead-letter file (read lazily), the oldest dropped
   // by the bound, and when each actor last raised its dead-letter owner alarm.
   readonly #deadLetters = new Map<string, number>();
+  /** Active backlog identities, bounded by its cap, independent of the recent-delivery LRU. */
+  readonly #deadLetterEventIds = new Map<string, Set<string>>();
   readonly #deadLettersDropped = new Map<string, number>();
   readonly #deadLetterAlarms = new Map<string, number>();
   // Predecessor queue files taken over, deleted only after this lineage's durable destination receipt.
@@ -1136,7 +1138,11 @@ export class ActorManager {
         this.#syncActorsFromRegistry();
         this.#refreshOwnership(undefined, false);
         for (const actor of this.#actors.values()) {
-          if (this.#canManageCached(actor.id)) this.#expireActivationFilter(actor);
+          if (this.#canManageCached(actor.id)) {
+            this.#expireActivationFilter(actor);
+            // Retry stale retirement after the monitor has consumed its previously saved gap.
+            this.#replayDeadLetters(actor);
+          }
         }
         this.#confirmDeliveryOutcomes();
         this.#flushFilterState();
@@ -3704,6 +3710,7 @@ export class ActorManager {
         throw error;
       }
       this.#revoked.add(actor.id);
+      this.#deadLetterEventIds.delete(actor.id);
       this.#processedKeys.delete(actor.id);
       this.#clearSettledWindows(actor.id);
       this.#emitChange();
@@ -6142,7 +6149,7 @@ export class ActorManager {
         (event.from.id === actor.id && !addressed)) continue;
       if (!this.#canManageCached(actor.id)) continue;
       const delivery = `${actor.id}\0${event.id}`;
-      if (this.#delivered.has(delivery)) continue;
+      if (this.#delivered.has(delivery) || this.#hasDeadLetterDelivery(actor.id, event.id)) continue;
       try {
         if (event.topic === RESIDENT_HOST_EVENT_TOPIC && addressed) {
           this.#acceptRelayedHostEvent(actor, event);
@@ -6150,7 +6157,7 @@ export class ActorManager {
           if (this.#hasProcessedKey(actor, `mesh:${event.topic}`, event)) {
             // Do not advance the mesh cursor past a memory-only completion fence.
             if (!this.#persistQueue(actor.id, true)) throw new ActorQueueCheckpointError(actor);
-          } else this.#enqueue(actor, `mesh:${event.topic}`, event, { ...this.#meshEnqueueOptions(actor, event), sender: event.sender ?? null });
+          } else this.#enqueue(actor, `mesh:${event.topic}`, event, this.#meshEnqueueOptions(actor, event));
         }
         this.#delivered.add(delivery);
         handedOn = true;
@@ -6203,6 +6210,9 @@ export class ActorManager {
     // Recomputed on a dead-letter replay too, so a replayed addressed event keeps its outcome.
     const addressed = event.to === actor.id || event.to === actor.name;
     return {
+      // Replay must carry the same stamp as live ingress; null preserves legacy UNKNOWN,
+      // rather than letting #enqueue attribute an unstamped remote event to this process.
+      sender: event.sender ?? null,
       ...(event.verification === "mesh" || event.verification === "bridge"
         ? { provenance: fabricTurnProvenance(event.from, "actor", event.verification, event.principal) } : {}),
       ownershipChecked: true,
@@ -6227,8 +6237,11 @@ export class ActorManager {
 
   #readDeadLetters(actorId: string): ActorDeadLetter[] {
     let text: string;
-    try { text = fs.readFileSync(this.#deadLetterFile(actorId), "utf8"); } catch { return []; }
-    return text.split("\n").flatMap((line) => {
+    try { text = fs.readFileSync(this.#deadLetterFile(actorId), "utf8"); } catch {
+      this.#deadLetterEventIds.set(actorId, new Set());
+      return [];
+    }
+    const entries = text.split("\n").flatMap((line) => {
       if (!line) return [];
       try {
         const value = JSON.parse(line) as Partial<ActorDeadLetter>;
@@ -6239,6 +6252,8 @@ export class ActorManager {
           : [];
       } catch { return []; }                                  // a torn final line from a crash
     });
+    this.#deadLetterEventIds.set(actorId, new Set(entries.map(entry => entry.event.id)));
+    return entries;
   }
 
   #coalesceDeadLetters(actor: ManagedActor, entries: readonly ActorDeadLetter[]): ActorDeadLetter[] {
@@ -6266,6 +6281,12 @@ export class ActorManager {
     return result;
   }
 
+  #hasDeadLetterDelivery(actorId: string, eventId: string): boolean {
+    if (!this.#persistent) return false;
+    if (!this.#deadLetterEventIds.has(actorId)) this.#readDeadLetters(actorId);
+    return this.#deadLetterEventIds.get(actorId)?.has(eventId) ?? false;
+  }
+
   #deadLetterCount(actorId: string): number {
     let count = this.#deadLetters.get(actorId);
     if (count === undefined) this.#deadLetters.set(actorId, count = this.#readDeadLetters(actorId).length);
@@ -6286,6 +6307,7 @@ export class ActorManager {
       fs.renameSync(temporary, file);
     }
     this.#deadLetters.set(actorId, entries.length);
+    this.#deadLetterEventIds.set(actorId, new Set(entries.map(entry => entry.event.id)));
   }
 
   #noticeDeadLetter(actor: ManagedActor, text: string, data: Record<string, unknown>): void {
@@ -6306,18 +6328,18 @@ export class ActorManager {
     } catch { /* best effort: the notice stays in the actor's messages */ }
   }
 
-  #appendDeadLetterArchive(actor: ManagedActor, stale: readonly ActorDeadLetter[]): { rotated: boolean; dropped: number; archived: number } {
+  #appendDeadLetterArchive(actor: ManagedActor, stale: readonly ActorDeadLetter[]): { rotated: boolean; droppedBytes: number; archived: number } {
     const archive = path.join(path.dirname(this.#deadLetterFile(actor.id)), "dead-letter.archive.jsonl");
     const backup = `${archive}.1`;
     const lines = stale.map((entry) => `${JSON.stringify(entry)}\n`);
     const lineBytes = (line: string) => Buffer.byteLength(line);
-    const readTail = (file: string): { data: Buffer; dropped: number } => {
+    const readTail = (file: string): { data: Buffer; droppedBytes: number } => {
       let size: number;
       try { size = fs.statSync(file).size; } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === "ENOENT") return { data: Buffer.alloc(0), dropped: 0 };
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return { data: Buffer.alloc(0), droppedBytes: 0 };
         throw error;
       }
-      if (size <= ACTOR_DEAD_LETTER_ARCHIVE_MAX_BYTES) return { data: fs.readFileSync(file), dropped: 0 };
+      if (size <= ACTOR_DEAD_LETTER_ARCHIVE_MAX_BYTES) return { data: fs.readFileSync(file), droppedBytes: 0 };
       const fd = fs.openSync(file, "r");
       try {
         const buffer = Buffer.alloc(ACTOR_DEAD_LETTER_ARCHIVE_MAX_BYTES);
@@ -6325,7 +6347,8 @@ export class ActorManager {
         const read = fs.readSync(fd, buffer, 0, buffer.length, offset);
         const tail = buffer.subarray(0, read);
         const boundary = tail.indexOf(0x0a);
-        return { data: boundary < 0 ? Buffer.alloc(0) : tail.subarray(boundary + 1), dropped: 1 };
+        const data = boundary < 0 ? Buffer.alloc(0) : tail.subarray(boundary + 1);
+        return { data, droppedBytes: size - data.length };
       } finally { fs.closeSync(fd); }
     };
     const writeDurable = (file: string, data: Buffer): void => {
@@ -6355,14 +6378,15 @@ export class ActorManager {
     }
     // An oversized newest entry cannot fit even in an empty archive. Do not rotate
     // existing history or claim progress while all of this stale input stays pending.
-    if (start === lines.length) return { rotated: false, dropped: 0, archived: 0 };
+    if (start === lines.length) return { rotated: false, droppedBytes: 0, archived: 0 };
     const current = readTail(archive);
     const incomingBytes = bytes;
-    const rotate = current.dropped > 0 || (current.data.length > 0 && current.data.length + incomingBytes > ACTOR_DEAD_LETTER_ARCHIVE_MAX_BYTES);
-    let dropped = current.dropped;
+    const rotate = current.droppedBytes > 0 || (current.data.length > 0 && current.data.length + incomingBytes > ACTOR_DEAD_LETTER_ARCHIVE_MAX_BYTES);
+    let droppedBytes = current.droppedBytes;
     if (rotate) {
       const previousBackup = readTail(backup);
-      dropped += previousBackup.dropped + (previousBackup.data.length > 0 ? 1 : 0);
+      // The entire previous generation is overwritten, including any oversized prefix.
+      droppedBytes += previousBackup.droppedBytes + previousBackup.data.length;
       writeDurable(backup, current.data);
       const archiveFd = fs.openSync(archive, "w", 0o600);
       try { fs.fsyncSync(archiveFd); } finally { fs.closeSync(archiveFd); }
@@ -6374,7 +6398,7 @@ export class ActorManager {
       try { fs.writeFileSync(fd, text); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
       syncPathNamespace(archive);
     }
-    return { rotated: rotate, dropped, archived: lines.length - start };
+    return { rotated: rotate, droppedBytes, archived: lines.length - start };
   }
 
   // Keyed entries replace their prior dead letter; unkeyed entries stay append-only. Past the
@@ -6384,6 +6408,7 @@ export class ActorManager {
   #appendDeadLetter(actor: ManagedActor, source: string, event: MeshEvent): void {
     const file = this.#deadLetterFile(actor.id);
     let count = this.#deadLetterCount(actor.id);
+    if (!this.#deadLetterEventIds.has(actor.id)) this.#readDeadLetters(actor.id);
     try {
       fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
       const entry: ActorDeadLetter = { at: Date.now(), source, event,
@@ -6395,6 +6420,7 @@ export class ActorManager {
       } else {
         fs.appendFileSync(file, `${JSON.stringify(entry)}\n`, { mode: 0o600 });
         this.#deadLetters.set(actor.id, ++count);
+        this.#deadLetterEventIds.get(actor.id)!.add(event.id);
       }
       if (count > ACTOR_DEAD_LETTER_MAX_ENTRIES || fs.statSync(file).size > ACTOR_DEAD_LETTER_MAX_BYTES) {
         const entries = this.#readDeadLetters(actor.id);
@@ -6446,16 +6472,18 @@ export class ActorManager {
       return true;
     });
     let archivedStale = 0;
-    if (stale.length) {
+    // Keep stale identities in the active backlog until the monitor durably holds their
+    // consumed prefix. Otherwise a crash could offer archived work again as a fresh event.
+    if (stale.length && this.#meshMonitor.checkpointPast(stale.map(entry => entry.event))) {
       try {
         const archive = this.#appendDeadLetterArchive(actor, stale);
         archivedStale = archive.archived;
-        if (archive.dropped > 0) {
+        if (archive.droppedBytes > 0) {
           const text = `Fabric host notice: actor ${actor.name} rotated its stale dead-letter archive at ` +
-            `${ACTOR_DEAD_LETTER_ARCHIVE_MAX_BYTES} bytes and dropped ${archive.dropped} older archived event(s).`;
+            `${ACTOR_DEAD_LETTER_ARCHIVE_MAX_BYTES} bytes and discarded ${archive.droppedBytes} bytes of older archived data.`;
           this.#noticeDeadLetter(actor, text, {
             reason: "dead_letter_archive",
-            deadLetterArchiveDropped: archive.dropped,
+            deadLetterArchiveDroppedBytes: archive.droppedBytes,
             deadLetterArchiveRotated: archive.rotated,
           });
         }
@@ -6514,7 +6542,10 @@ export class ActorManager {
           source: "actor:dead-letter-replay", createdAt: Date.now(),
           data: { replayed: added, archivedStale, filterSkipped, remaining: remaining.length },
         });
-      } catch { this.#deadLetters.delete(actor.id); }
+      } catch {
+        this.#deadLetters.delete(actor.id);
+        this.#deadLetterEventIds.delete(actor.id);
+      }
     }
     this.#ensureDrain(actor);
   }
@@ -6541,6 +6572,7 @@ export class ActorManager {
       ]));
     } catch {
       this.#deadLetters.delete(actor.id);
+      this.#deadLetterEventIds.delete(actor.id);
       return items;
     }
     return items.slice(0, from);
@@ -7545,6 +7577,7 @@ export class ActorManager {
           `Fabric actor ${actor.name} (${actor.id}) reloaded from its registry`);
       }
       this.#actors.clear();
+      this.#deadLetterEventIds.clear();
       this.#ownership.clear();
       this.#locallyCreated.clear();
       this.#loadActors();
@@ -7569,6 +7602,7 @@ export class ActorManager {
         `Fabric actor ${actor.name} (${actor.id}) is not owned by this host`);
       replaced.push(actor);
       this.#actors.delete(id);
+      this.#deadLetterEventIds.delete(id);
       this.#ownership.delete(id);
       this.#locallyCreated.delete(id);
     }
@@ -8021,6 +8055,7 @@ export class ActorManager {
             activation: item.activation, binding: item.binding, bindingMode: item.bindingMode, bindingVersion: 2,
             principalLineageVersion: 1,
             ...(item.provenance ? { provenance: item.provenance } : {}),
+            ...(item.sender !== undefined ? { sender: item.sender } : {}),
             ...(item.images ? { images: item.images } : {}),
             ...(item.coalesceKey ? { coalesceKey: item.coalesceKey } : {}),
             ...(item.settledDeliveryId ? { settledDeliveryId: item.settledDeliveryId } : {}),
@@ -8539,6 +8574,8 @@ export class ActorManager {
         payload: value.payload,
         createdAt: value.createdAt,
         ...(provenance ? { provenance } : {}),
+        // Missing legacy stamps remain UNKNOWN; never substitute this process's authority.
+        ...(value.sender !== undefined ? { sender: value.sender } : {}),
         activation: shift(value.activation as FabricActorActivation),
         // Old mesh/host bindings were enqueue-time defaults. Old direct bindings may be
         // genuine resolved caller views: preserve them conservatively. Unmarked version 2
@@ -9084,6 +9121,7 @@ export class ActorManager {
           `Fabric actor ${actor.name} (${actor.id}) reloaded when its ownership returned`);
       }
       this.#actors.clear();
+      this.#deadLetterEventIds.clear();
       this.#ownership.clear();
       this.#locallyCreated.clear();
       this.#loadActors();
@@ -9233,6 +9271,8 @@ export class ActorManager {
         if (item.outcomeSend) first.outcomeSend = item.outcomeSend;
         else delete first.outcomeSend;
         first.payload = item.payload;
+        if (item.sender !== undefined) first.sender = item.sender;
+        else delete first.sender;
         first.provenance = item.provenance ? structuredClone(item.provenance) : undefined;
         if (item.images) first.images = item.images;
         else delete first.images;

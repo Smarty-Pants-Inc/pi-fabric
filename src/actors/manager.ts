@@ -6738,7 +6738,11 @@ export class ActorManager {
     // smarty-dev#9508: joined, so close's await of #retentionSweep covers script preparation and a pending acquire.
     if (this.#persistent && this.meshConfig.enabled) {
       await this.#startMeshRetentionSweep();
-      if (this.#closing || this.#releaseStrict) return;
+      if (this.#closing || this.#releaseStrict || this.#canConsumeMesh?.() === false) return;
+      // Startup already owns a bounded, scoped recovery reader. Do not race it with
+      // a second mesh-wide scan; retries begin on the next existing 15-minute tick.
+      if (!this.#initialRetentionPending) await this.mesh.retryResidentWakes();
+      if (this.#closing || this.#releaseStrict || this.#canConsumeMesh?.() === false) return;
     }
     if (this.#deadSessionReap && this.#persistent && this.meshConfig.enabled) {
       void this.#notifications.enqueue(() => reapDeadSessionPresence(this.mesh, this.identity, {

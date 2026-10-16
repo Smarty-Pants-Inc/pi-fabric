@@ -89,6 +89,9 @@ const lazyEntryPoints = [
   "src/topology/host-leases.ts",
   "src/topology/participant-view.ts",
   "src/mesh/custody-lock.ts",
+  // Carrier selection and its first-use NATS module have stable lazy paths.
+  "src/transport/index.ts",
+  "src/transport/nats/index.ts",
   "src/thinking-control.ts",
   "src/compaction/owner.ts",
   "src/compaction/orphan-repair.ts",

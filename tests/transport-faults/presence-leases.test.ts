@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { performance } from "node:perf_hooks";
 import { describe, expect, it, vi } from "vitest";
+import { IdleHeartbeatMonitor } from "@nats-io/nats-core/internal";
 import {
   readLocalHostLeaseProcessProof, transportHostLeasePredecessorExited, TransportHostLease,
   TRANSPORT_HOST_LEASE_SAFETY_MS, TRANSPORT_HOST_LEASE_TTL_MS,
@@ -19,6 +20,7 @@ import {
   boundedReceipt, createStubKv, faultGate, openRealAdapterPair, owner,
   type RealAdapterPair,
 } from "../helpers/transport-harness.js";
+import { formatNatsDiagnostic } from "../helpers/nats-diagnostics.js";
 
 /**
  * CONTRACT-v2 §§1,4,11,13; E6/E8/E11/E12/E19/E20.
@@ -57,6 +59,13 @@ import {
 const required = process.env.NATS_AUTH_REQUIRED === "1";
 const linux = process.platform === "linux";
 const cutoffMs = TRANSPORT_HOST_LEASE_TTL_MS - TRANSPORT_HOST_LEASE_SAFETY_MS;
+// @nats-io/jetstream 3.4.0: jsmstream_api sets 30s idle_heartbeat;
+// pushconsumer starts IdleHeartbeatMonitor with maxOut=2. The core monitor counts
+// a miss only when age > interval, so data just after creation needs maxOut+1 ticks.
+const ORDERED_PUSH_HEARTBEAT_MS = 30_000;
+const ORDERED_PUSH_MAX_OUT = 2;
+const RESET_SCHEDULING_MARGIN_MS = 15_000;
+const RESET_OBSERVATION_MS = (ORDERED_PUSH_MAX_OUT + 1) * ORDERED_PUSH_HEARTBEAT_MS + RESET_SCHEDULING_MARGIN_MS;
 const token = (id: string): string => createHash("sha256").update(id).digest("hex").slice(0, 32);
 function localDirectory(): string {
   const dir = mkdtempSync(join(tmpdir(), "fabric-transport-lease-"));
@@ -120,7 +129,7 @@ function tapWatch(kv: TransportKv) {
     marker: (index = 0) => wait(row => row.event.type === "ready" &&
       observations.filter(item => item.event.type === "ready").indexOf(row) === index, `real ready marker ${index}`),
     reset: (index = 0) => wait(row => row.event.type === "reset" &&
-      observations.filter(item => item.event.type === "reset").indexOf(row) === index, `real reset ${index}`, 75_000),
+      observations.filter(item => item.event.type === "reset").indexOf(row) === index, `real reset ${index}`, RESET_OBSERVATION_MS),
     put: (key: string, revision: number) => wait(row => row.event.type === "put" &&
       row.event.entry.key === key && row.event.entry.revision === revision, "actual put reaches directory"),
     diagnostics: () => observations.map(row => row.event.type === "put"
@@ -191,6 +200,46 @@ async function compose(pair: RealAdapterPair, full: boolean) {
     throw error;
   }
 }
+
+/** Dependency timing probe only; no broker or product delete/release path is run.
+ * Keep: the hosted reset wait expired before the pinned monitor was obliged to report. */
+describe("presence reset observation budget (actual pinned heartbeat monitor)", () => {
+  it("allows the 90s timer phase while retaining a finite reset observation deadline", async () => {
+    vi.useFakeTimers(); vi.setSystemTime(0);
+    const callbacks: number[] = [];
+    let monitor: IdleHeartbeatMonitor | undefined;
+    try {
+      const missed = new Promise<number>(resolve => {
+        // Same 30s/maxOut=2 settings used by the pinned ordered push consumer.
+        monitor = new IdleHeartbeatMonitor(ORDERED_PUSH_HEARTBEAT_MS, count => {
+          callbacks.push(count); resolve(count); return true;
+        }, { maxOut: ORDERED_PUSH_MAX_OUT });
+      });
+      const outcome = boundedReceipt(missed, "actual heartbeat reset observation", RESET_OBSERVATION_MS)
+        .then(value => ({ value }), error => ({ error: String(error) }));
+      await vi.advanceTimersByTimeAsync(1); monitor!.work();
+      // A tick increments misses only for age > interval, not age >= interval.
+      await vi.advanceTimersByTimeAsync(74_999);
+      expect(callbacks).toEqual([]);
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(callbacks).toEqual([2]);
+      expect(await outcome).toEqual({ value: 2 });
+    } finally { monitor?.cancel(); vi.useRealTimers(); }
+  });
+  it("still rejects a missing reset at the finite observation deadline", async () => {
+    vi.useFakeTimers();
+    try {
+      let settled = false;
+      const outcome = boundedReceipt(new Promise<never>(() => {}), "missing reset", RESET_OBSERVATION_MS)
+        .then(() => "unexpected success", error => { settled = true; return String(error); });
+      await vi.advanceTimersByTimeAsync(RESET_OBSERVATION_MS - 1);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(await outcome).toMatch(/bounded transport receipt deadline: missing reset/);
+      expect(settled).toBe(true);
+    } finally { vi.useRealTimers(); }
+  });
+});
 
 describe("A2 real authenticated watch → manually-composed ParticipantView", () => {
   for (const full of [false, true]) {
@@ -266,7 +315,7 @@ describe("A2 real authenticated watch → manually-composed ParticipantView", ()
         const replacement = { ...record, capabilities: ["stop"] as FabricParticipantRecord["capabilities"], updatedAt: Date.now() };
         const restored = await pair.sender.kv("presence").put(key, senderLease.owner, replacement, revision, AbortSignal.timeout(5_000));
         await consumed(await taps.presence.put(key, restored));
-        // The remote lease may legitimately expire during two 30s heartbeat reset detections.
+        // The remote lease may legitimately expire during two bounded heartbeat reset detections.
         // Route identity/capabilities still prove only this new publication restored the row.
         expect(view.resolve(record.id)).toMatchObject({ machine: pair.sender.self.machine,
           ownerIncarnation: record.ownerIncarnation, capabilities: ["stop"] });
@@ -274,11 +323,11 @@ describe("A2 real authenticated watch → manually-composed ParticipantView", ()
       } catch (error) {
         // Failure-only observations; no extra watch, retry, readiness or consumer mutation.
         try {
-          console.error("NATS_PRESENCE_RESET_FAILURE", JSON.stringify({ pid: process.pid,
+          console.error("NATS_PRESENCE_RESET_FAILURE", formatNatsDiagnostic({ pid: process.pid,
             broker: await pair.kvReadiness?.diagnostics?.(), ready: composed?.view.ready,
             presence: composed?.taps.presence.diagnostics(), leases: composed?.taps.leases.diagnostics(),
-            errors: composed?.errors.map(error => String(error)) }));
-        } catch (diagnosticError) { console.error("NATS_PRESENCE_RESET_DIAGNOSTIC_ERROR", String(diagnosticError)); }
+            errors: composed?.errors }));
+        } catch (diagnosticError) { console.error("NATS_PRESENCE_RESET_DIAGNOSTIC_ERROR", formatNatsDiagnostic(diagnosticError)); }
         throw error;
       } finally {
         try { await composed?.close(); } finally { await pair.close(); }

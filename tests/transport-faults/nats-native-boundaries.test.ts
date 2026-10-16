@@ -21,6 +21,7 @@ import { runTreeResourceVeto, canRemoveTerminalRun } from "../../src/storage/ret
 import type { CompletionEnvelope } from "../../src/agents/completion-journal.js";
 import { residentHostId } from "../../src/residency/protocol.js";
 import { readResidentGenerationExit } from "../../src/residency/generation-exit.js";
+import { formatNatsDiagnostic, NATS_DIAGNOSTIC_FIELD_LIMIT } from "../helpers/nats-diagnostics.js";
 
 /** E4 B4/B5 composition check; keep: native custody trust boundary + data safety.
  * Main uses the actual source FabricRuntimeState.initialize with a real native Pi
@@ -100,12 +101,12 @@ class NativeRpc {
     { cwd: root, env, stdio: ["pipe", "pipe", "pipe"], timeout: 180_000, killSignal: "SIGKILL" });
     this.exit = new Promise(resolve => this.child.once("close", (code, signal) => {
       this.closed = true;
-      for (const pending of this.pending.values()) pending.reject(new Error(`Native Pi closed ${code}/${signal}: ${this.stderr}`));
+      for (const pending of this.pending.values()) pending.reject(new Error(`Native Pi closed ${code}/${signal}: ${formatNatsDiagnostic({ stderr: this.stderr })}`));
       this.pending.clear(); for (const notify of this.listeners) notify(); resolve({ code, signal });
     }));
     this.child.on("error", error => {
       this.stderr += `\n${error.message}`;
-      for (const pending of this.pending.values()) pending.reject(error);
+      for (const pending of this.pending.values()) pending.reject(new Error(formatNatsDiagnostic(error)));
     });
     let tail = "";
     this.child.stdout!.on("data", chunk => {
@@ -117,7 +118,7 @@ class NativeRpc {
         this.events.push(event);
         if (event.type === "response") {
           const pending = this.pending.get(event.id); this.pending.delete(event.id);
-          if (pending) event.success ? pending.resolve(event.data) : pending.reject(new Error(event.error));
+          if (pending) event.success ? pending.resolve(event.data) : pending.reject(new Error(formatNatsDiagnostic({ error: event.error })));
         }
         for (const notify of this.listeners) notify();
       }
@@ -138,32 +139,34 @@ class NativeRpc {
           const failure = json(failed);
           if (failure.pid === this.child.pid) {
             this.bootstrapFailure = failure;
-            throw new Error(`Native bootstrap failed: ${JSON.stringify(failure)}`);
+            throw new Error(`Native bootstrap failed: ${formatNatsDiagnostic(failure)}`);
           }
         }
         const extensionError = this.events.find(event => event.type === "extension_error");
-        if (extensionError) throw new Error(`Native extension failed: ${JSON.stringify(extensionError)}`);
-        if (this.closed) throw new Error(`Native closed before ready: ${this.stderr}`);
+        if (extensionError) throw new Error(`Native extension failed: ${formatNatsDiagnostic(extensionError)}`);
+        if (this.closed) throw new Error(`Native closed before ready: ${formatNatsDiagnostic({ stderr: this.stderr })}`);
         const value = json(path.join(root, "nats-completion-ready.json"));
         return value.pid === this.child.pid ? value : undefined;
       }, `${stage} native ready`);
     } catch (cause) {
-      throw new Error(`${stage} native ready (pid ${this.child.pid}): ${String(cause)}; ` +
-        `bootstrap=${JSON.stringify(this.bootstrap) ?? "not observed"}; stderr=${this.stderr}`, { cause });
+      // Do not attach the raw cause: Vitest prints Error.cause separately.
+      throw new Error(`${stage} native ready (pid ${this.child.pid}): ${formatNatsDiagnostic({
+        error: cause, bootstrap: this.bootstrap, stderr: this.stderr,
+      })}`);
     }
   }
   async request(value: Record<string, unknown>): Promise<any> {
     const id = randomUUID(); const firstEvent = this.events.length;
     try {
       const result = await bounded(new Promise<any>((resolve, reject) => {
-        if (this.closed) { reject(new Error(`Native Pi already closed: ${this.stderr}`)); return; }
+        if (this.closed) { reject(new Error(`Native Pi already closed: ${formatNatsDiagnostic({ stderr: this.stderr })}`)); return; }
         this.pending.set(id, { resolve, reject });
         this.child.stdin!.write(JSON.stringify({ ...value, id }) + "\n");
       }), `RPC ${value.type}${typeof value.message === "string" ? ` ${value.message}` : ""}`);
       // Pi reports a throwing extension command as extension_error followed by a
       // handled prompt response. A successful RPC alone is not command success.
       const failure = this.events.slice(firstEvent).find(event => event.type === "extension_error");
-      if (failure) throw new Error(`Native extension command failed: ${JSON.stringify(failure)}`);
+      if (failure) throw new Error(`Native extension command failed: ${formatNatsDiagnostic(failure)}`);
       return result;
     } finally { this.pending.delete(id); }
   }
@@ -173,7 +176,7 @@ class NativeRpc {
       await bounded(new Promise<void>((resolve, reject) => {
         check = () => {
           if (this.events.some(event => event.type === "agent_settled")) resolve();
-          else if (this.closed) reject(new Error(`Native Pi closed before settlement: ${this.stderr}`));
+          else if (this.closed) reject(new Error(`Native Pi closed before settlement: ${formatNatsDiagnostic({ stderr: this.stderr })}`));
         };
         this.listeners.add(check); check();
       }), "native baseline settlement");
@@ -184,7 +187,7 @@ class NativeRpc {
     if (this.closed) return;
     this.child.stdin!.end();
     const result = await bounded(this.exit, "native cooperative close/join", 15_000);
-    if (result.code !== 0 || result.signal) throw new Error(`Native graceful close failed ${JSON.stringify(result)}: ${this.stderr}`);
+    if (result.code !== 0 || result.signal) throw new Error(`Native graceful close failed ${JSON.stringify(result)}: ${formatNatsDiagnostic({ stderr: this.stderr })}`);
   }
   async crash(log: LaunchLog): Promise<void> {
     if (this.closed) return;
@@ -385,16 +388,16 @@ const seenFiles = (root: string): string[] => {
 
 afterEach(async context => {
   if (context.task.result?.state === "fail") {
-    // Preserve per-invocation native attribution/bootstrap and actual broker monitor facts
-    // before teardown removes scratch. No credential contents or inferred success receipts.
+    // Select/redact/bound actual failure facts before teardown removes scratch.
+    // Never print raw native stderr, extension errors, bootstrap objects or monitor replies.
     for (const rpc of natives) {
-      console.error("NATS_NATIVE_FAILURE", JSON.stringify({ pid: rpc.child.pid, closed: rpc.closed,
+      console.error("NATS_NATIVE_FAILURE", formatNatsDiagnostic({ pid: rpc.child.pid, closed: rpc.closed,
         stderr: rpc.stderr, extensionErrors: rpc.events.filter(event => event.type === "extension_error"),
         bootstrap: rpc.bootstrap, failure: rpc.bootstrapFailure }));
     }
     for (const h of brokers) {
-      try { console.error("NATS_NATIVE_BROKER_FAILURE", JSON.stringify(await h.diagnostics())); }
-      catch (error) { console.error("NATS_NATIVE_BROKER_DIAGNOSTIC_ERROR", String(error)); }
+      try { console.error("NATS_NATIVE_BROKER_FAILURE", formatNatsDiagnostic(await h.diagnostics())); }
+      catch (error) { console.error("NATS_NATIVE_BROKER_DIAGNOSTIC_ERROR", formatNatsDiagnostic(error)); }
     }
   }
   let failure: unknown;
@@ -443,6 +446,31 @@ afterEach(async context => {
 /** Harness-only probes: no native runtime starts and no product deletion is forwarded.
  * Keep: a reported observer namespace failure and insufficient bootstrap reporting; no B4/B5 custody proof is claimed. */
 describe("NATS native boundary harness observations", () => {
+  it("allowlists, redacts and bounds seed-bearing failure output before printing", () => {
+    const seed = `SU${"A".repeat(56)}`;
+    const jwt = `eyJhbGciOiJIUzI1NiJ9.${"a".repeat(40)}.${"b".repeat(40)}`;
+    const credentialPath = "/private/runtime/machine-a.creds";
+    const token = "short-sensitive-token";
+    const error = new Error(`KV conflict ${seed} ${jwt} ${credentialPath} token=${token}`);
+    const output = formatNatsDiagnostic({ pid: 123, closed: false, bootstrap: { stage: "initialize",
+      inherited: { PI_FABRIC_SESSION_ID: "", PI_FABRIC_NATS_CREDENTIALS: credentialPath } },
+      failure: { error }, stderr: `-----BEGIN NATS USER JWT-----\n${jwt}\n------END NATS USER JWT------\n${seed}`,
+      extensionErrors: [{ type: "extension_error", error: `Bearer ${token}`, credentials: seed }],
+      credentials: { seed, jwt, credentialPath }, config: { credentials: credentialPath, sync_always: true } });
+    for (const secret of [seed, jwt, credentialPath, token]) expect(output).not.toContain(secret);
+    expect(output).not.toContain('"credentials"');
+    expect(output).not.toContain("PI_FABRIC_NATS_CREDENTIALS");
+    for (const credentialFile of ["operator.creds", "machine.jwt", "user.seed", "client.key", "auth.json"]) {
+      expect(formatNatsDiagnostic({ error: `cannot read ${credentialFile}` })).not.toContain(credentialFile);
+    }
+    expect(JSON.parse(output)).toMatchObject({ pid: 123, closed: false, bootstrap: { stage: "initialize",
+      inherited: { PI_FABRIC_SESSION_ID: "" } },
+      failure: { error: { message: expect.stringContaining("KV conflict") } }, config: { sync_always: true } });
+    const long = JSON.parse(formatNatsDiagnostic({ stderr: "safe message ".repeat(1_000),
+      errors: Array.from({ length: 100 }, () => "safe error") }));
+    expect(long.stderr.length).toBeLessThanOrEqual(NATS_DIAGNOSTIC_FIELD_LIMIT);
+    expect(long.errors).toHaveLength(16);
+  });
   it("watches the empty attempts namespace before the producer writes its first candidate", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-nats-observer-probe-")); roots.push(root);
     const attempts = path.join(root, "agent-completions", "attempts");
@@ -451,6 +479,19 @@ describe("NATS native boundary harness observations", () => {
     const observed = observeJson(file);
     fs.writeFileSync(file, JSON.stringify({ probe: "producer-only-bytes" }));
     expect(await observed).toEqual({ probe: "producer-only-bytes" });
+  });
+  it("does not leak a seed through native bootstrap rejection or Error.cause", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-nats-redaction-probe-")); roots.push(root);
+    const seed = `SU${"B".repeat(56)}`;
+    fs.writeFileSync(path.join(root, "nats-completion-failed.json"), JSON.stringify({ pid: process.pid,
+      stage: "initialize", error: `probe failure ${seed}` }));
+    const rpc = Object.assign(Object.create(NativeRpc.prototype) as NativeRpc,
+      { root, child: { pid: process.pid }, events: [], closed: false, stderr: `probe stderr ${seed}` });
+    const failure = await rpc.ready(root, "exact-session resume").catch(error => error as Error);
+    expect(failure).toBeInstanceOf(Error);
+    expect(String(failure)).toMatch(/exact-session resume.*probe failure.*probe stderr/);
+    expect(String(failure)).not.toContain(seed);
+    expect(failure.cause).toBeUndefined();
   });
   it("reports the current invocation bootstrap failure, not a stale ready from another PID", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-nats-bootstrap-probe-")); roots.push(root);

@@ -14,6 +14,7 @@ import { runTreeResourceVeto, canRemoveTerminalRun } from "../../../src/storage/
 import { residentRoot } from "../../../src/residency/protocol.js";
 import { ResidencyClient } from "../../../src/residency/client.js";
 import { residentProcessAlive } from "../../../src/residency/process-identity.js";
+import { formatNatsDiagnostic } from "../../helpers/nats-diagnostics.js";
 
 /** Real native Pi context -> production FabricRuntimeState.initialize -> production
  * AgentsProvider -> root session manager (B4), or ResidencyClient -> compiled
@@ -248,9 +249,10 @@ export default function natsCompletionParent(pi: ExtensionAPI): void {
         nats: runtime.config.mesh.nats,
         stateBackend: runtime.config.mesh.stateBackend, observationHealth: runtime.observationHealth() });
     } catch (error) {
-      output("nats-completion-failed.json", { pid: process.pid, sessionId, stage,
-        error: error instanceof Error ? error.stack ?? error.message : String(error) });
-      throw error;
+      const safeFailure = formatNatsDiagnostic({ pid: process.pid, sessionId, stage, error });
+      fs.writeFileSync(path.join(root, "nats-completion-failed.json"), safeFailure);
+      // Pi also prints/reports the thrown error; never rethrow the raw credential-bearing cause.
+      throw new Error(safeFailure);
     }
   });
   pi.registerCommand("native-nats-completion-spawn", { description: "Spawn through the actual runtime provider", handler: async (args, ctx) => {

@@ -1,5 +1,5 @@
 import type { AssistantMessage } from "@earendil-works/pi-ai";
-import { notifyDiagnostic } from "./core/diagnostics.js";
+import { notifyDiagnostic, notifyPrincipalDiagnosticOnce, resetPrincipalDiagnosticTurn } from "./core/diagnostics.js";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { resolveFabricIdentity, sendFabricMessage } from "./fabric-provenance.js";
 import { extensionContextLive } from "./session-liveness.js";
@@ -21,11 +21,11 @@ export const registerMainProviderRecovery = (pi: ExtensionAPI, options: {
     timer = undefined;
   };
   const reset = (): void => { cancel(); retried = false; reported = false; };
-  pi.on("agent_start", cancel);
-  pi.on("input", cancel);
-  pi.on("session_start", reset);
+  pi.on("agent_start", (_event, context) => { resetPrincipalDiagnosticTurn(pi, context); cancel(); });
+  pi.on("input", (_event, context) => { resetPrincipalDiagnosticTurn(pi, context); cancel(); });
+  pi.on("session_start", (_event, context) => { resetPrincipalDiagnosticTurn(pi, context); reset(); });
   pi.on("session_shutdown", reset);
-  pi.on("session_before_switch", reset);
+  pi.on("session_before_switch", (_event, context) => { resetPrincipalDiagnosticTurn(pi, context); reset(); });
   pi.on("session_tree", reset);
   pi.on("agent_settled", async (event, context) => {
     cancel();
@@ -55,7 +55,13 @@ export const registerMainProviderRecovery = (pi: ExtensionAPI, options: {
     const { classifyProviderError } = await import("./provider-error-class.js");
     if (!live()) return;
     // A blind retry of a request the provider rejects as non-retryable fails the same way.
-    if (classifyProviderError(last)?.retryable === false && options.ownsNonRetryable?.() === true) { reset(); return; }
+    const classified = classifyProviderError(last);
+    if (classified?.retryable === false && options.ownsNonRetryable?.() === true) {
+      const message = `Provider rejected Main's request as non-retryable (${classified.short}); compacting once to recover`;
+      if (context.hasUI) notifyPrincipalDiagnosticOnce(pi, context, "provider-non-retryable", message, "warning");
+      reset();
+      return;
+    }
     // Optional provider utilities must not enter registration's eager graph.
     const { isContextOverflow } = await import("@earendil-works/pi-ai/compat");
     if (!live() || context.signal?.aborted || options.halted() ||

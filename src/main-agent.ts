@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { diagnostics, notifyDiagnostic } from "./core/diagnostics.js";
+import { diagnostics, notifyDiagnostic, notifyPrincipalDiagnosticOnce, resetPrincipalDiagnosticTurn } from "./core/diagnostics.js";
 import { appendDeliveryOutcome, type DeliverySend, type DeliveryOutcome } from "./mesh/delivery-outcomes.js";
 import type { AgentFollowUpRunningWarning } from "./agents/types.js";
 import fs from "node:fs";
@@ -1392,6 +1392,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     on("input", (event: { source?: string }, ctx) => {
       this.#context = ctx;
       if (event.source === "extension") return;
+      resetPrincipalDiagnosticTurn(this.pi, ctx);
       this.#peerSteerInFlight = false;
       this.#interruptUsedThisTurn = false;
       this.#interruptResume = false;
@@ -1422,7 +1423,7 @@ export class MainAgentController implements FabricMainAgentTarget {
         this.#providerStateDirty = true;
         this.#trySave(true);
         const dead = this.#providerDead;
-        if (failure && !failure.retryable) this.#recordNonRetryable(failure);
+        if (failure && !failure.retryable) this.#recordNonRetryable(failure, ctx);
         // An unclassified incident's one post-compaction attempt failed the same way: hold again, no second alarm.
         else if (this.#runUnclassified && dead?.kind === "unclassified" && dead.phase === "probation") this.#raiseProviderDead("unclassified-repeated");
         else this.#recordProviderFailure(true);
@@ -1533,7 +1534,8 @@ export class MainAgentController implements FabricMainAgentTarget {
       if (event.reason === "manual") this.#wakeWhenIdle();
       else this.#stopOperation();
     });
-    on("agent_start", () => {
+    on("agent_start", (_event, ctx) => {
+      resetPrincipalDiagnosticTurn(this.pi, ctx);
       // The HOLD-induced restart belongs to the interrupted turn, not a fresh abort budget.
       if (!this.#interruptResume) this.#interruptUsedThisTurn = false;
       this.#interruptResume = false;
@@ -1925,9 +1927,13 @@ export class MainAgentController implements FabricMainAgentTarget {
     return `${label.length > room ? `${label.slice(0, room - 1)}…` : label}${state}`;
   }
 
-  #notify(message: string, level: "info" | "warning"): void {
+  #notify(message: string, level: "info" | "warning", context = this.#context, onceKey?: string): void {
     if (level === "warning") diagnostics.warn("src/main-agent.ts", `[pi-fabric] ${message}`);
-    try { if (this.#context?.hasUI) notifyDiagnostic(this.#context, "src/main-agent.ts", message, level); } catch { /* diagnostics only */ }
+    try {
+      if (!context?.hasUI) return;
+      if (this.local && onceKey) notifyPrincipalDiagnosticOnce(this.pi, context, onceKey, message, level);
+      else notifyDiagnostic(context, "src/main-agent.ts", message, level);
+    } catch { /* diagnostics only */ }
   }
 
   /**
@@ -1935,7 +1941,7 @@ export class MainAgentController implements FabricMainAgentTarget {
    * compaction_affinity_missing). Retrying the same context fails the same way, so this never
    * enters backoff: compact once at idle, allow one attempt, then alarm.
    */
-  #recordNonRetryable(failure: ProviderErrorClass): void {
+  #recordNonRetryable(failure: ProviderErrorClass, context = this.#context): void {
     this.#providerAttemptInFlight = false;
     this.#stopProviderWake();
     const dead = this.#providerDead;
@@ -1961,7 +1967,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     this.#providerReleaseUntil = undefined;
     this.#stopWake();
     this.#providerStateDirty = true;
-    this.#notify(`Provider rejected Main's request as non-retryable (${error}); compacting once to recover`, "warning");
+    this.#notify(`Provider rejected Main's request as non-retryable (${error}); compacting once to recover`, "warning", context, "provider-non-retryable");
     this.#armProviderDeadTimer();
   }
 
@@ -2154,7 +2160,7 @@ export class MainAgentController implements FabricMainAgentTarget {
       : "the one retry after compaction failed again";
     // Fixed text and allowlisted tokens only; the provider's own error text stays in the session log.
     const message = `${providerDeadLabel(dead)}: ${why}. The provider's error text is in the session log. Held peer messages stay journalled and ops.owner is alarmed; fix the provider, then send any input to resume.`;
-    this.#notify(message, "warning");
+    this.#notify(message, "warning", this.#context, "provider-dead-terminal");
     try {
       this.onProviderDead?.({
         kind: dead.kind, error: dead.error, ...(dead.status === undefined ? {} : { status: dead.status }),

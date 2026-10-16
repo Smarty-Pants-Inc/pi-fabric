@@ -207,3 +207,50 @@ export const notifyDiagnostic = (
     enqueue(level, source, message);
   } catch {}
 };
+
+// Own-turn notices may be observed both at turn_end and agent_settled. Keep the de-duplication
+// state on the resident Pi object so the two hooks share one marker without making actor notices
+// globally visible. A new input/run/session clears the marker at the owning call site.
+type PrincipalNoticeState = { sessionId: string | undefined; keys: Set<string> };
+const PRINCIPAL_NOTICE_STATE = Symbol.for("pi-fabric.principal-notice-state.v1");
+const principalNoticeStates = (): WeakMap<object, PrincipalNoticeState> =>
+  ((globalThis as Record<symbol, unknown>)[PRINCIPAL_NOTICE_STATE] ??= new WeakMap<object, PrincipalNoticeState>()) as WeakMap<object, PrincipalNoticeState>;
+
+const principalNoticeState = (
+  owner: object,
+  context: { sessionManager?: { getSessionId?(): string } },
+): PrincipalNoticeState => {
+  const states = principalNoticeStates();
+  const sessionId = context.sessionManager?.getSessionId?.();
+  let state = states.get(owner);
+  if (!state || state.sessionId !== sessionId) {
+    state = { sessionId, keys: new Set<string>() };
+    states.set(owner, state);
+  }
+  return state;
+};
+
+/** Clear own-turn visible notice markers at a real new run/input/session boundary. */
+export const resetPrincipalDiagnosticTurn = (
+  owner: object,
+  context: { sessionManager?: { getSessionId?(): string } },
+): void => { principalNoticeState(owner, context).keys.clear(); };
+
+/** Show one allowlisted own-turn notice, shared by Main's turn_end and settlement fallback. */
+export const notifyPrincipalDiagnosticOnce = (
+  owner: object,
+  context: { ui: { notify(message: string, level?: Level): void }; sessionManager?: { getSessionId?(): string } },
+  key: string,
+  message: string,
+  level: Level = "warning",
+): boolean => {
+  const state = principalNoticeState(owner, context);
+  if (state.keys.has(key)) return false;
+  try {
+    context.ui.notify(message, level);
+    state.keys.add(key);
+    return true;
+  } catch {
+    return false;
+  }
+};

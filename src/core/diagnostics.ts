@@ -9,4 +9,6 @@ export {
   flushFabricDiagnostics,
   diagnostics,
   notifyDiagnostic,
+  notifyPrincipalDiagnosticOnce,
+  resetPrincipalDiagnosticTurn,
 } from "./agent-dir.js";

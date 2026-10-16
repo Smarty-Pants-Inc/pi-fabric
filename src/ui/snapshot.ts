@@ -116,7 +116,20 @@ export const createDashboardSnapshot = (
   // read displayOnly, and the state listing opts in directly. Deciders keep bound reads.
   const participants = typeof state.participantInfos === "function"
     ? state.participantInfos({ scope: "project", background: true }) : [];
-  const actorRecords = state.actors.list();
+  // Listings can include foreign session-orphan/cleanup rows with no local details,
+  // or lose an actor to a registry refresh. Reconcile before caching the view.
+  const actorRecords = state.actors.list().flatMap((actor) => {
+    try {
+      return [{
+        ...actor,
+        instructions: state.actors.instructions(actor.id),
+        recentMessages: state.actors.messages(actor.id, 12),
+      }];
+    } catch (error) {
+      if (error instanceof Error && error.message === `Unknown Fabric actor: ${actor.id}`) return [];
+      throw error;
+    }
+  });
   const main = state.mainAgentInfo(context);
   const peers = typeof state.peerInfos === "function" ? state.peerInfos({ background: true }) : [];
   const globalActors = state.globalActors.list();
@@ -229,8 +242,6 @@ export const createDashboardSnapshot = (
       const worker = workerByActor.get(actor.id);
       return {
         ...actor,
-        instructions: state.actors.instructions(actor.id),
-        recentMessages: state.actors.messages(actor.id, 12),
         ...(participant
           ? { ownerHostId: participant.ownerHostId, local: participant.local }
           : {}),

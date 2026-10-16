@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { SCRATCH_OWNER_FILE, sweepScratch } from "../src/storage/scratch.js";
 import { platformRemovalSkips, startRemovalTally, stopRemovalTally, verifiedRemove } from "../src/storage/verified-remove.js";
 import { spawnSync } from "node:child_process";
-import { pathToFileURL } from "node:url";
+import { build } from "esbuild";
 
 // pi-fabric#1014 SEC P2-2: off Linux, managed scratch keeps main's (c0b67ef) path-based removal after every candidate
 // recheck; the verified helper's platform/no-uid refusal stays for every other deleter, now counted and logged with a
@@ -174,15 +174,19 @@ describe("remaining platform refusals and failed removals are counted and warned
     expect(warn.mock.calls.filter(args => String(args[0]).includes(reason))).toEqual([]);
   });
 
-  it("a short process that exits naturally right after a platform skip still emits the counted warning", () => {
+  it("a short process that exits naturally right after a platform skip still emits the counted warning", async () => {
+    // Bundle the transitive .js -> .ts source graph, as in diagnostics-exit.test.ts; native Node cannot resolve it.
     // Child: forced darwin makes verifiedRemove refuse before any filesystem operation; no product operation runs.
-    const helper = pathToFileURL(path.resolve("src/storage/verified-remove.ts")).href;
-    const child = spawnSync(process.execPath.includes("bun") ? "node" : process.execPath, ["--input-type=module", "-e", [
-      `const m = await import(${JSON.stringify(helper)});`,
+    const driver = path.join(sandbox(), "verified-remove-probe.mjs");
+    await build({ stdin: { contents: [
+      `import { verifiedRemove } from ${JSON.stringify(path.resolve("src/storage/verified-remove.ts"))};`,
       `Object.defineProperty(process, "platform", { value: "darwin" });`,
-      `const r = m.verifiedRemove("/nonexistent/scratch-probe", undefined, { deleter: "probe" });`,
+      `const r = verifiedRemove("/nonexistent/scratch-probe", undefined, { deleter: "probe" });`,
       `if (r.removed) process.exitCode = 3;`,
-    ].join("\n")], { encoding: "utf8", timeout: 20_000 });
+    ].join("\n"), resolveDir: process.cwd() }, outfile: driver, bundle: true, packages: "external",
+      platform: "node", format: "esm", logLevel: "silent" });
+    const child = spawnSync(process.execPath.includes("bun") ? "node" : process.execPath, [driver],
+      { encoding: "utf8", timeout: 20_000 });
     expect(child.status).toBe(0);
     // Native Windows has no getuid, so the ownership refusal fires before the platform one; the reason is not
     // what this case proves, only that the first counted warning is written before a natural exit.

@@ -7,6 +7,7 @@ import { MeshStore } from "../src/mesh/store.js";
 import { MeshLockTimeoutError } from "../src/core/atomic-write.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { hostLeasePath, readHostLeaseCurrent } from "../src/topology/host-leases.js";
+import { readParticipantFile } from "../src/topology/participant-files.js";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
 
 const directories: ParticipantDirectory[] = [], stores: MeshStore[] = [], roots: string[] = [];
@@ -64,12 +65,13 @@ describe.each(["file", "sqlite"] as const)("%s host-lease owner fence (smarty-de
 
   });
 
-  it("drains independent actor renewal before preparing its own contended custody gate", async () => {
+  it("renews the host lease without rewriting an unchanged actor participant", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "lease-preparation-order-")); roots.push(root);
+    let now = Date.now(); vi.spyOn(Date, "now").mockImplementation(() => now);
     const mesh = new MeshStore(root, 65_536, 100, { stateBackend }); stores.push(mesh);
     const identity = { id: "7313-owner", name: "owner", kind: "agent" as const };
     const directory = new ParticipantDirectory(mesh, { enabled: true, hostId, rootId: "7313-root", identity,
-      reapDeadHosts: false, live: () => false, renewActorParticipants: true, actorRenewalAllowed: () => true });
+      reapDeadHosts: false, live: () => false });
     directories.push(directory);
     const actor: FabricParticipantRecord = { format: 1, id: "7313-actor", rootId: "7313-root", kind: "actor",
       name: "actor", status: "idle", ownerHostId: hostId, ownerIdentityId: identity.id, actorOwnershipToken: "lineage",
@@ -77,6 +79,17 @@ describe.each(["file", "sqlite"] as const)("%s host-lease owner fence (smarty-de
       startedAt: Date.now(), updatedAt: Date.now() };
     directory.registerSource(() => [actor]);
     await directory.start();
+    const key = "topology/participants/" + createHash("sha256").update(actor.id).digest("hex");
+    const before = readParticipantFile(root, key)!;
+    const beforeLease = readHostLeaseCurrent(root, hostId)!;
+    now += 5_000;
+    await directory.refresh();
+    expect(readParticipantFile(root, key)).toEqual(before);
+    expect(readHostLeaseCurrent(root, hostId)!.updatedAt).toBe(now);
+    expect(now).toBeGreaterThan(beforeLease.updatedAt);
+
+    // A failed host renewal requests custody preparation. The next renewal must
+    // finish before preparation tries its own gate, even without an actor lane.
     const file = hostLeasePath(root, hostId);
     let entered!: () => void, release!: () => void;
     const waiting = new Promise<void>(resolve => { entered = resolve; });
@@ -85,9 +98,6 @@ describe.each(["file", "sqlite"] as const)("%s host-lease owner fence (smarty-de
     await waiting;
     try { await expect(directory.refresh()).rejects.toMatchObject({ busyCode: "FABRIC_HOST_LEASE_LOCK_BUSY" }); }
     finally { release(); await holder; }
-
-    // The failed renewal requests preparation. Pause the next independent renewal
-    // while it owns REAL custody; preparation must not attempt that same gate yet.
     let renewing!: () => void, resume!: () => void;
     const renewalEntered = new Promise<void>(resolve => { renewing = resolve; });
     const paused = new Promise<void>(resolve => { resume = resolve; });
@@ -107,7 +117,6 @@ describe.each(["file", "sqlite"] as const)("%s host-lease owner fence (smarty-de
       expect(await pending).toBeUndefined();
       expect(directory.canConsumeMesh()).toBe(true);
     } finally { resume(); await pending; }
-
   });
 
   it.each(["7313-owner", "7313-other"])("rejects a superseded explicit heartbeat (successor identity %s)", async identity => {
@@ -191,7 +200,10 @@ describe.each(["file", "sqlite"] as const)("%s host-lease owner fence (smarty-de
     expect(s.old.directory.canConsumeMesh()).toBe(false);
   });
 
-  it.each([false, true])("fences a delayed confirmation (timeout: %s) after the successor claims", async fail => {
+  it.each([
+    { fail: false, elapsed: 0 }, { fail: true, elapsed: 0 },
+    { fail: false, elapsed: 100 }, { fail: true, elapsed: 100 },
+  ])("fences a delayed confirmation (%j) after the successor claims", async ({ fail, elapsed }) => {
     const s = await setup(stateBackend);
     const prior = s.old.directory.confirmedAt();
     let release!: () => void, entered!: () => void;
@@ -206,7 +218,7 @@ describe.each(["file", "sqlite"] as const)("%s host-lease owner fence (smarty-de
     try {
       await waiting;
       const successor = await s.make(); const lease = s.read(), host = successor.mesh.get(hostKey, { fresh: true });
-      s.advance(100); release();
+      s.advance(elapsed); release();
       expect(await pending).toMatchObject({ code: "FABRIC_HOST_LEASE_SUPERSEDED", retryable: false });
       expect(s.read()).toEqual(lease);
       expect(successor.mesh.get(hostKey, { fresh: true })).toEqual(host);

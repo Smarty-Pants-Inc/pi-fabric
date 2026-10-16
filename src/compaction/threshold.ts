@@ -1,5 +1,6 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { FabricConfig } from "../config.js";
+import { notifyDiagnostic } from "../core/diagnostics.js";
 
 export const modelCompactionKey = (
   model: Pick<NonNullable<ExtensionContext["model"]>, "provider" | "id"> | undefined,
@@ -27,7 +28,7 @@ const runThresholdCompact = (
     onComplete: () => resolve(true),
     onError: (error) => {
       if (context.hasUI) {
-        context.ui.notify(`Fabric threshold compaction failed: ${error.message}`, "warning");
+        notifyDiagnostic(context, "src/compaction/threshold.ts", `Fabric threshold compaction failed: ${error.message}`, "warning");
       }
       resolve(false);
     },

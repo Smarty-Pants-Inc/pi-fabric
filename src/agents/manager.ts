@@ -1,7 +1,10 @@
 import { childProcessEnvironment } from "../core/atomic-write.js";
+import { diagnostics } from "../core/diagnostics.js";
+import { detachedPreview } from "../core/preview.js";
 import { copyFabricPrincipal, copyFabricProvenance, type FabricPrincipal, type FabricTurnProvenance } from "../fabric-provenance.js";
 import { createHash, randomUUID } from "node:crypto";
 import { taskReturnAddressArguments, type TaskReturnAddress } from "./task-return-address.js";
+import type { SpawnRouterAdmission } from "./spawn-router.js";
 import { AgentWaitBoundError, describeWaitBound } from "./wait-bound.js";
 import { normalizeAgentRequires } from "./input-validation.js";
 import { AgentInputError, normalizeAgentCapabilityTokens } from "../host-compatibility.js";
@@ -277,6 +280,26 @@ const once = (release: () => void): (() => void) => {
   let done = false;
   return () => { if (!done) { done = true; release(); } };
 };
+// The transport launch keeps this callback for the worker's lifetime. Build it at
+// module scope so it captures only these audit fields, never run()'s lexical
+// Context (request.task and every other launch-time value).
+const writePolicyDispositionAudit = (
+  logFile: string, id: string, runner: string, writePolicy: FabricWritePolicy | undefined,
+): ((disposition: "local" | "remote") => void) => {
+  let logged = false;
+  return (disposition) => {
+    if (logged) return;
+    logged = true;
+    const local = disposition === "local";
+    const policy = local ? writePolicy : undefined;
+    const warning = local
+      ? "Shell writes are unconfined by the task write policy (native bash/powershell and nested pi.bash); any Fabric Landlock settings are independent and may grant wider roots."
+      : "Remote one-shot placement cannot forward task write roots or scratch yet; remote task remains unrestricted.";
+    fs.appendFileSync(logFile, JSON.stringify({ type: local ? "write_policy.default" : "write_policy.remote_unconfined",
+      ts: Date.now(), id, runner, ...(policy ? { policy } : {}), warning,
+    }) + "\n", { mode: 0o600 });
+  };
+};
 // These adapters conflate CLI/socket errors with absent sessions and have no
 // checked exit receipt. Scope-cut release/collection rather than trust false.
 const uncheckedExternalExit = (transport: Pick<AgentTransportHandle, "kind">): boolean =>
@@ -288,7 +311,16 @@ const MAX_UI_TEXT_CHARS = 16_000;
 const MAX_UI_ERROR_CHARS = 8_000;
 const MAX_UI_VALUE_CHARS = 64_000;
 const MAX_RETAINED_UI_RUNS = 240;
+// Split the payload budget between internal snapshots and the public UI-list cache.
+const MAX_RETAINED_UI_BYTES = 2 * 1024 * 1024;
+const MAX_RETAINED_UI_SNAPSHOT_BYTES = MAX_RETAINED_UI_BYTES / 2;
 const MAX_RETAINED_RUN_HANDLES = 1_000;
+const MAX_PREVIOUS_RUN_BYTES = 2 * 1024 * 1024;
+const PRIVATE_FILE_FINGERPRINT_BYTES = 256;
+// Manager-owned immutable terminal outcome; worker status can still be rewritten
+// during native close, after host schema validation has already settled the task.
+const MANAGER_RESULT_FILE = "manager-result.json";
+const MANAGER_NESTED_FILE = "manager-nested.json";
 const MAX_LOG_SUMMARY_CHARS = 7_000;
 const MAX_LOG_DETAIL_CHARS = 900;
 const RETENTION_SWEEP_INTERVAL_MS = 15 * 60 * 1_000;
@@ -320,8 +352,27 @@ const promptMetadata = (task: string, promptPath: string): AgentPromptMetadata =
  * and no directory fsync. */
 const NATIVE_WINDOWS_FILESYSTEM = process.platform === "win32";
 
+/** Constant-sized proof of one manager-origin private publication. */
+interface PrivateFileFingerprint {
+  dev: number;
+  ino: number;
+  size: number;
+  mtimeMs: number;
+  ctimeMs: number;
+  sha256: string;
+}
+
+const fingerprintFromStat = (stat: fs.Stats, sha256: string): PrivateFileFingerprint => ({
+  dev: stat.dev,
+  ino: stat.ino,
+  size: stat.size,
+  mtimeMs: stat.mtimeMs,
+  ctimeMs: stat.ctimeMs,
+  sha256,
+});
+
 /** Write private task/provenance bytes without ever following a planted link. */
-const writePrivateFileAtomic = (filePath: string, bytes: Uint8Array): void => {
+const writePrivateFileAtomic = (filePath: string, bytes: Uint8Array): PrivateFileFingerprint => {
   const temporary = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
   const releaseTemporary = trackTemporary(temporary);
   const noFollow = fs.constants.O_NOFOLLOW ?? 0;
@@ -334,15 +385,28 @@ const writePrivateFileAtomic = (filePath: string, bytes: Uint8Array): void => {
       offset += written;
     }
     fs.fsyncSync(fd);
+    // The digest is fixed from manager-origin bytes BEFORE rename. Keep the
+    // descriptor through rename so ctime is pinned from the original inode even
+    // on filesystems where rename changes it; a worker replacement cannot alter
+    // this descriptor's identity or stats.
+    const sha256 = createHash("sha256").update(bytes).digest("hex");
+    renameAtomic(temporary, filePath);
+    const fingerprint = fingerprintFromStat(fs.fstatSync(fd), sha256);
+    if (!NATIVE_WINDOWS_FILESYSTEM) syncDirectoryChain(path.dirname(filePath));
     fs.closeSync(fd);
     fd = undefined;
-    renameAtomic(temporary, filePath);
-    if (!NATIVE_WINDOWS_FILESYSTEM) syncDirectoryChain(path.dirname(filePath));
+    return fingerprint;
   } finally {
     if (fd !== undefined) fs.closeSync(fd);
     try { fs.rmSync(temporary, { force: true }); } catch { /* The committed file is already authoritative. */ }
     releaseTemporary();
   }
+};
+
+const writePrivateJsonAtomic = (filePath: string, value: unknown): PrivateFileFingerprint => {
+  const serialized = JSON.stringify(value, null, 2);
+  if (serialized === undefined) throw new Error(`Could not serialize ${filePath}`);
+  return writePrivateFileAtomic(filePath, Buffer.from(serialized, "utf8"));
 };
 
 /** Verify the retained task is still the exact admitted brief. The open descriptor,
@@ -539,8 +603,12 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   runRoute: AgentRunRouteMetadata;
   /** smarty-dev#9855: the admission permit a lost-contact process run holds until it is proven gone (once-only). */
   heldPermit?: () => void;
+  /** Actual once-only RUN admission, independent of result and execution/tree custody. */
+  admissionRelease?: () => void;
   /** pi-fabric#939: the worker pid and birth this manager recorded at launch; the only proof source for release. */
   ownProcess?: OwnedProcess;
+  /** Monotonic host proof bound to this exact actor transport, never a status-file identity. */
+  workerGone?: AgentTransportHandle;
   /** pi-fabric#939 round 2: its saved answer was delivered to the spawner after an unconfirmed exit (once). */
   recoveredAnswer?: boolean;
   /** Round 3: that delivery's save succeeded; only its completed mark is left. */
@@ -588,6 +656,16 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   stopRequested: boolean;
   finalAnswer?: FinalAnswerReceipt;
   finalAnswerResult?: AgentRunResult;
+  /** Full immutable published outcome, demand-loaded after settlement. */
+  settledResultFile?: string;
+  /** Constant-sized proof of the manager-origin result publication. */
+  resultFingerprint?: PrivateFileFingerprint;
+  /** Status of the associated validated final-answer outcome after its full copy is evicted. */
+  finalAnswerStatus?: AgentRunResult["status"];
+  /** Bounded scalar facts of the published outcome, read only after close collected its file. */
+  settledSummary?: SettledSummary;
+  /** Set only after a manager-owned close collection removed the validated result file (no-follow absence). */
+  resultCollected?: boolean;
   finalAnswerCompletion?: Promise<void>;
   terminalNoticeSeen?: Set<string>;
   /** Process teardown is an ownership obligation, even after logical settlement. */
@@ -595,6 +673,10 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   processStopPending?: boolean;
   /** Windows settlement retains native admission until captured close and any stop join. */
   nativeReleasePending?: Promise<void>;
+  /** Native-close settlement owns RUN release until joined or host-reconciled. */
+  nativeAdmissionFenced?: boolean;
+  /** Exact captured join rejected or exhausted its close/stop bound; fresh host proof may release RUN only. */
+  nativeAdmissionReconcile?: AgentTransportHandle;
   /**
    * Its owner gave it up (a stopped or removed actor): nobody wants its result, so a worker that
    * dies is not relaunched and the run ends failed (smarty-dev#2184 item 8b). A caller that only
@@ -640,6 +722,8 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   worktreeResult?: AgentWorktreeResult;
   nestedSnapshot?: AgentRunRecord[];
   nestedSnapshotAt?: number;
+  /** A UI eviction preserved legacy descendants outside their removed source tree. */
+  nestedSnapshotSaved?: true;
   /** Routed child dialogs in flight; aborted at settlement. */
   questions?: AbortController;
   questionDecisionId?: string;
@@ -655,6 +739,20 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
    *  is identical whether the stream arrived live or only at settle. */
   usageEmitted: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number };
 }
+
+// Construct outside spawn/preparation: deferred native custody must not keep
+// the request-bearing launch context alive through a shared lexical context.
+const createAdmissionRelease = (managed: ManagedAgent, release: () => void): (() => void) =>
+  once(() => {
+    delete managed.admissionRelease;
+    release();
+  });
+
+const executionFencedRelease = (managed: ManagedAgent, release: () => void): (() => void) =>
+  () => {
+    if (managed.executionExited) release();
+    else managed.executionRelease = release;
+  };
 
 interface QueuedAgent {
   /** Host-owned admission address, including terminal outcomes with no launch manifest. */
@@ -714,6 +812,13 @@ const recoverableStop = (record: AgentRunRecord): boolean =>
   record.status === "stopped" ||
   (record.status === "failed" && transportExitedWithoutResult(record.error));
 
+/** A genuine terminal verdict, not a transport outcome eligible for recovery. */
+const terminalWorkerResult = (candidate: AgentRunRecord | undefined): boolean =>
+  candidate !== undefined && terminalStatuses.has(candidate.status) &&
+    (candidate.status === "completed" || candidate.errorCode === "CONTEXT_OVERFLOW" ||
+      /Context exceeds window:/i.test(candidate.error ?? "") ||
+      (!recoverableStop(candidate) && !transportExitedWithoutResult(candidate.error) && !retryablePiStartupError(candidate.error)));
+
 const MAX_RESUME_NOTE_CHARS = 2_000;
 
 const setWorkerArgument = (args: string[], name: string, value: string): void => {
@@ -742,7 +847,7 @@ const resumeTask = (
     "Inspect the current state first, do not redo work that is already done, and carry the task through to completion.",
     ...(summary ? [`Last observed run activity: ${summary}`] : []),
   ].join(" ");
-  return `${note.slice(0, MAX_RESUME_NOTE_CHARS)}\n\n${task}`;
+  return `${detachedPreview(note, MAX_RESUME_NOTE_CHARS)}\n\n${task}`;
 };
 
 const retryablePiStartupError = (error: string | undefined): boolean =>
@@ -752,10 +857,7 @@ const retryablePiStartupError = (error: string | undefined): boolean =>
   );
 
 const safeName = (value: string): string =>
-  value
-    .replace(/[\r\n\t]+/g, " ")
-    .trim()
-    .slice(0, MAX_NAME_LENGTH) || "Fabric agent";
+  detachedPreview(value.replace(/[\r\n\t]+/g, " ").trim(), MAX_NAME_LENGTH) || "Fabric agent";
 
 // Retained disk records omit task fields; public/UI readers still receive strings.
 // Never reconstruct a prompt from provenance or another retained field.
@@ -764,6 +866,12 @@ const normalizeRecordTasks = (record: AgentRunRecord): AgentRunRecord => ({
   task: record.task ?? "",
   ...(record.nestedAgents ? { nestedAgents: record.nestedAgents.map(normalizeRecordTasks) } : {}),
 });
+
+/** True only for a confirmed ENOENT from lstat; a dangling entry or other error is not absence. */
+const pathAbsentNoFollow = (file: string): boolean => {
+  try { fs.lstatSync(file); return false; }
+  catch (error) { return (error as NodeJS.ErrnoException).code === "ENOENT"; }
+};
 
 const readRecord = (filePath: string): AgentRunRecord | undefined => {
   try {
@@ -776,44 +884,157 @@ const readRecord = (filePath: string): AgentRunRecord | undefined => {
   }
 };
 
+/** Read only the exact manager publication proved by its original descriptor. */
+const readPrivateFileBytes = (
+  filePath: string,
+  expectedPath: string,
+  expected: PrivateFileFingerprint | undefined,
+): Buffer | undefined => {
+  if (!expected || path.resolve(filePath) !== path.resolve(expectedPath)) return undefined;
+  const noFollow = fs.constants.O_NOFOLLOW ?? 0;
+  const nonBlocking = fs.constants.O_NONBLOCK ?? 0;
+  let fd: number | undefined;
+  try {
+    // Reject a known non-regular/link entry before opening; O_NONBLOCK also
+    // closes the replacement-to-FIFO race before fstat can establish its type.
+    const candidate = ownedStat(filePath);
+    if (!candidate?.isFile()) return undefined;
+    fd = fs.openSync(filePath, fs.constants.O_RDONLY | noFollow | nonBlocking);
+    const before = fs.fstatSync(fd);
+    if (!before.isFile() || before.nlink !== 1 ||
+        (!NATIVE_WINDOWS_FILESYSTEM && (before.mode & 0o777) !== 0o600) ||
+        before.dev !== expected.dev || before.ino !== expected.ino || before.size !== expected.size ||
+        before.mtimeMs !== expected.mtimeMs || before.ctimeMs !== expected.ctimeMs) return undefined;
+    const bytes = Buffer.allocUnsafe(before.size);
+    for (let offset = 0; offset < bytes.byteLength;) {
+      const read = fs.readSync(fd, bytes, offset, bytes.byteLength - offset, offset);
+      if (read <= 0) return undefined;
+      offset += read;
+    }
+    const after = fs.fstatSync(fd);
+    const current = ownedStat(filePath);
+    if (!current || !after.isFile() || after.nlink !== 1 ||
+        before.dev !== after.dev || before.ino !== after.ino || before.uid !== after.uid ||
+        before.mode !== after.mode || before.nlink !== after.nlink || before.size !== after.size ||
+        before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs ||
+        current.dev !== after.dev || current.ino !== after.ino || current.uid !== after.uid ||
+        current.mode !== after.mode || current.nlink !== after.nlink || current.size !== after.size ||
+        current.mtimeMs !== after.mtimeMs || current.ctimeMs !== after.ctimeMs ||
+        createHash("sha256").update(bytes).digest("hex") !== expected.sha256) return undefined;
+    return bytes;
+  } catch {
+    return undefined;
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+};
+
+const readAuthenticatedRecord = (
+  filePath: string,
+  expectedPath: string,
+  expected: PrivateFileFingerprint | undefined,
+): AgentRunRecord | undefined => {
+  const bytes = readPrivateFileBytes(filePath, expectedPath, expected);
+  if (!bytes) return undefined;
+  try {
+    const parsed: unknown = JSON.parse(bytes.toString("utf8"));
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
+    const record = parsed as AgentRunRecord;
+    return { ...normalizeRecordTasks(record), runner: isFabricRunnerId(record.runner) ? record.runner : "pi" };
+  } catch {
+    return undefined;
+  }
+};
+
+const uiText = (text: string, max: number): string =>
+  detachedPreview(text, max) + (text.length > max ? "…" : "");
+
 const boundedUiValue = (value: unknown): unknown => {
   if (value === undefined) return undefined;
   try {
     const serialized = JSON.stringify(value);
-    if (serialized.length <= MAX_UI_VALUE_CHARS) return JSON.parse(serialized) as unknown;
+    if (serialized.length <= MAX_UI_VALUE_CHARS) {
+      return JSON.parse(detachedPreview(serialized, MAX_UI_VALUE_CHARS)) as unknown;
+    }
     return {
       fabricTruncated: true,
       originalChars: serialized.length,
-      preview: serialized.slice(0, MAX_UI_VALUE_CHARS - 100),
+      preview: detachedPreview(serialized, MAX_UI_VALUE_CHARS - 100),
     };
   } catch {
-    return String(value).slice(0, MAX_UI_VALUE_CHARS);
+    return uiText(String(value), MAX_UI_VALUE_CHARS);
   }
 };
 
-const compactUiRecord = (record: AgentRunRecord): AgentRunRecord => {
+// Copy metadata too: even a short path/label may itself be a slice of a large
+// worker buffer. Keep object/array shapes for dashboard consumers; full API
+// results always come from the disk record, never this projection.
+const detachedUiMetadata = (value: unknown, depth = 0): unknown => {
+  if (typeof value === "string") return uiText(value, MAX_UI_TEXT_CHARS);
+  if (value === null || typeof value !== "object") return value;
+  if (depth >= 8) return undefined;
+  if (Array.isArray(value)) return value.slice(0, 256).map(item => detachedUiMetadata(item, depth + 1));
+  return Object.fromEntries(Object.entries(value).slice(0, 64)
+    .map(([key, item]) => [detachedPreview(key, MAX_UI_TEXT_CHARS), detachedUiMetadata(item, depth + 1)]));
+};
+
+const compactUiRecord = (record: AgentRunRecord, depth = 0): AgentRunRecord => {
   const { task, text, error, value, nestedAgents, ...rest } = record;
   return {
-    ...rest,
-    task:
-      task.length <= MAX_UI_TEXT_CHARS
-        ? task
-        : `${task.slice(0, MAX_UI_TEXT_CHARS)}…`,
-    text: text.length <= MAX_UI_TEXT_CHARS ? text : `${text.slice(0, MAX_UI_TEXT_CHARS)}…`,
-    ...(error
-      ? {
-          error:
-            error.length <= MAX_UI_ERROR_CHARS
-              ? error
-              : `${error.slice(0, MAX_UI_ERROR_CHARS)}…`,
-        }
-      : {}),
+    ...Object.fromEntries(Object.entries(rest).map(([key, item]) =>
+      [detachedPreview(key, MAX_UI_TEXT_CHARS), detachedUiMetadata(item)])) as typeof rest,
+    task: uiText(task, MAX_UI_TEXT_CHARS),
+    text: uiText(text, MAX_UI_TEXT_CHARS),
+    ...(error !== undefined ? { error: uiText(error, MAX_UI_ERROR_CHARS) } : {}),
     ...(value !== undefined ? { value: boundedUiValue(value) } : {}),
-    ...(nestedAgents && nestedAgents.length > 0
-      ? { nestedAgents: nestedAgents.map((nested) => compactUiRecord(nested)) }
+    ...(depth < 8 && nestedAgents && nestedAgents.length > 0
+      ? { nestedAgents: nestedAgents.slice(0, 200).map((nested) => compactUiRecord(nested, depth + 1)) }
       : {}),
   };
 };
+
+// Conservative UTF-16 payload accounting (including JSON keys/escapes). The
+// weak memo is safe for immutable projections and does not own their lifetime.
+const uiPayloadSizes = new WeakMap<object, number>();
+const uiPayloadBytes = (value: object): number => {
+  const known = uiPayloadSizes.get(value);
+  if (known !== undefined) return known;
+  const bytes = JSON.stringify(value).length * 2;
+  uiPayloadSizes.set(value, bytes);
+  return bytes;
+};
+
+interface PreviousRunSummary {
+  id: string;
+  name: string;
+  status: AgentRunResult["status"];
+  runner: AgentRunResult["runner"];
+  actorId?: string;
+  finalAnswerReceipt?: AgentRunResult["finalAnswerReceipt"];
+  error?: string;
+}
+
+/** Scalar manager-validated terminal facts. Never a substitute for the disk result while it exists. */
+interface SettledSummary {
+  status: AgentRunResult["status"];
+  startedAt: number;
+  updatedAt: number;
+  finishedAt?: number;
+  exitCode?: number | null;
+  error?: string;
+  turns: number;
+  toolCalls: number;
+  usage: AgentRunResult["usage"];
+}
+
+const SETTLED_SUMMARY_ERROR_CHARS = 1_000;
+
+interface PreviousRun {
+  summary: PreviousRunSummary;
+  resultFile: string;
+  fingerprint: PrivateFileFingerprint;
+  bytes: number;
+}
 
 type RetainedPromptRecord = Omit<AgentRunRecord, "task" | "nestedAgents"> & {
   nestedAgents?: RetainedPromptRecord[];
@@ -1027,6 +1248,16 @@ export class AgentManager {
   readonly #queued = new Map<string, QueuedAgent>();
   readonly #queuedStarts = new Set<Promise<void>>();
   readonly #semaphore: AgentAdmission;
+  readonly #admissionSnapshotPath: string | undefined;
+  readonly #admissionOwners = new Map<string, {
+    actorId: string | null; actorName: string | null; runId: string;
+    acquiredAt: number; lastProgressAt: number; statusStamp?: string;
+  }>();
+  readonly #admissionWaiting = new Map<string, {
+    actorId: string | null; actorName: string | null; runId: string; since: number;
+  }>();
+  #admissionSnapshotTimer: NodeJS.Timeout | undefined;
+  #admissionSnapshotClosed = false;
   readonly #worktrees = new WorktreeManager();
   readonly #runRoot: string;
   readonly #managedTempRoot: boolean;
@@ -1069,7 +1300,8 @@ export class AgentManager {
   readonly #onStoppedAtClose: ((results: AgentRunResult[]) => void) | undefined;
   readonly #onSettled: ((result: AgentRunResult, admittedRecipient?: CompletionRecipient) => void) | undefined;
   /** Results of runs a previous runtime of this session stopped at reload/shutdown. */
-  readonly #previousRuns = new Map<string, AgentRunResult>();
+  readonly #previousRuns = new Map<string, PreviousRun>();
+  #previousRunBytes = 0;
   #enodevRuns: string[] | undefined;
   readonly #enodevCommits = new Map<string, { directory: string; actorId: string; activationId: string }>();
   /** pi-fabric#939 round 3: runs THIS manager settled through #912's recovery (it removed their markers itself). */
@@ -1180,6 +1412,8 @@ export class AgentManager {
       claudeBinary?: string;
       vedaBinary?: string;
       runRoot?: string;
+      /** Host-only, read-only projection of this manager's native admission pool. */
+      admissionSnapshotPath?: string;
       fullCodeMode?: boolean;
       kernel?: () => FabricKernel;
       pythonRuntime?: () => FabricPythonRuntime;
@@ -1225,6 +1459,7 @@ export class AgentManager {
     } = {},
   ) {
     this.#semaphore = new AgentAdmission(config.maxConcurrent, Infinity, config.maxDepth);
+    this.#admissionSnapshotPath = options.admissionSnapshotPath;
     this.#managedTempRoot = options.runRoot === undefined && process.env.PI_FABRIC_RUN_ROOT === undefined;
     this.#inheritedRunRoot = options.runRoot === undefined && process.env.PI_FABRIC_RUN_ROOT !== undefined;
     // Canonicalize only the host-created default root, before allocating any run id.
@@ -1309,6 +1544,72 @@ export class AgentManager {
       markRunRootActive(this.#runRoot);
       // Allocate ownership now; scan only on actual agent use or close.
     }
+    // Replace a previous host's projection immediately, not behind a pending debounce.
+    this.#flushAdmissionSnapshot();
+  }
+
+  #scheduleAdmissionSnapshot(): void {
+    if (!this.#admissionSnapshotPath) return;
+    // A late native exit can discharge custody after close returned/failed.
+    if (this.#admissionSnapshotClosed) { this.#flushAdmissionSnapshot(); return; }
+    if (this.#admissionSnapshotTimer) return;
+    // One bounded, coalesced write; observations never create a progress timer.
+    this.#admissionSnapshotTimer = setTimeout(() => this.#flushAdmissionSnapshot(), 25);
+    this.#admissionSnapshotTimer.unref();
+  }
+
+  #flushAdmissionSnapshot(): void {
+    if (this.#admissionSnapshotTimer) clearTimeout(this.#admissionSnapshotTimer);
+    this.#admissionSnapshotTimer = undefined;
+    if (!this.#admissionSnapshotPath) return;
+    try {
+      writeJsonAtomic(this.#admissionSnapshotPath, {
+        format: 1, writtenAt: Date.now(), cap: this.#semaphore.concurrency,
+        held: [...this.#admissionOwners.values()].map(({ statusStamp: _stamp, ...owner }) => owner),
+        waiting: [...this.#admissionWaiting.values()],
+      });
+    } catch { /* Observability must never affect admission or native custody. */ }
+  }
+
+  #ownAdmission(
+    info: { id: string; actorId?: string | undefined; actorName?: string | undefined },
+    release: () => void,
+  ): () => void {
+    if (!this.#admissionSnapshotPath) return release;
+    const now = Date.now();
+    this.#admissionWaiting.delete(info.id);
+    this.#admissionOwners.set(info.id, {
+      actorId: info.actorId ?? null, actorName: info.actorName ?? null,
+      runId: info.id, acquiredAt: now, lastProgressAt: now,
+    });
+    this.#scheduleAdmissionSnapshot();
+    return once(() => {
+      // Follow the actual permit, not logical settlement or actor running state.
+      try { release(); }
+      finally {
+        this.#admissionOwners.delete(info.id);
+        this.#scheduleAdmissionSnapshot();
+      }
+    });
+  }
+
+  #noteAdmissionProgress(id: string): void {
+    const owner = this.#admissionOwners.get(id);
+    if (!owner) return;
+    owner.lastProgressAt = Math.max(owner.lastProgressAt, Date.now());
+    this.#scheduleAdmissionSnapshot();
+  }
+
+  #observeAdmissionStatus(id: string, record: AgentRunRecord): void {
+    const owner = this.#admissionOwners.get(id);
+    if (!owner) return;
+    // Bounded metadata only: no prompt/output retention, and no polling-time stamp.
+    const stamp = JSON.stringify([record.updatedAt, record.status, record.turns, record.toolCalls,
+      record.currentTool, record.currentToolStartedAt, record.runnerSessionId,
+      record.usage.input, record.usage.output, record.usage.cacheRead, record.usage.cacheWrite, record.usage.cost]);
+    if (owner.statusStamp === stamp) return;
+    owner.statusStamp = stamp;
+    this.#noteAdmissionProgress(id);
   }
 
   /** This runtime's creation host, not a child participant's upstream owner. */
@@ -1498,12 +1799,57 @@ export class AgentManager {
     return runtime;
   }
 
+  async #recordSpawnRouterStart(request: AgentRunRequest, agentId: string, model: string | undefined, thinking: AgentRunRequest["thinking"], sessionFile?: string, managed?: ManagedAgent, admission?: SpawnRouterAdmission): Promise<void> {
+    const decisionId = (request as AgentRunRequest & { spawnRouterDecisionId?: unknown }).spawnRouterDecisionId;
+    // The authenticated admission names the issuer ledger; an inherited env root may belong to another host.
+    const meshRoot = admission?.mesh.root ?? this.#meshRoot;
+    if (typeof decisionId !== "string" || !decisionId || !meshRoot) return;
+    try {
+      const { recordSpawnRouterStart } = await import("./spawn-router.js");
+      const observed = managed && readRecord(managed.statusFile);
+      const record = observed?.id === agentId ? observed : undefined;
+      const pi = ["pi", "pi-durable"].includes(request.runner ?? this.config.runner);
+      await recordSpawnRouterStart({ meshRoot, decisionId, admission, spawnKind: "spawn", request, cwd: this.cwd,
+        agentId, sessionId: pi ? record?.runnerSessionId ?? null : null,
+        ...(sessionFile && pi ? { sessionFile } : {}),
+        model: model ?? null, thinking: thinking ?? null,
+        launch: { runId: managed?.id ?? null, pid: managed?.ownProcess?.pid ?? null,
+          processStartTime: managed?.ownProcess?.started ?? null },
+        verified: record?.status === "running" && managed?.settled === false && !managed.launchCancelled,
+        evidenceRef: record && managed ? path.relative(meshRoot, managed.statusFile) : null });
+    } catch { /* Ledger writes never change launch behavior. */ }
+  }
+
+  async #recordSpawnRouterStartUnknown(request: AgentRunRequest, admission?: SpawnRouterAdmission): Promise<void> {
+    const decisionId = (request as AgentRunRequest & { spawnRouterDecisionId?: unknown }).spawnRouterDecisionId;
+    const meshRoot = admission?.mesh.root ?? this.#meshRoot;
+    if (typeof decisionId !== "string" || !decisionId || !meshRoot) return;
+    try {
+      const { recordSpawnRouterStartUnknown } = await import("./spawn-router.js");
+      await recordSpawnRouterStartUnknown({ meshRoot, decisionId, admission, spawnKind: "spawn", request, cwd: this.cwd });
+    } catch { /* Ledger writes never change launch behavior. */ }
+  }
+
+  async #recordSpawnRouterStartFailed(request: AgentRunRequest, admission?: SpawnRouterAdmission): Promise<void> {
+    const decisionId = (request as AgentRunRequest & { spawnRouterDecisionId?: unknown }).spawnRouterDecisionId;
+    const meshRoot = admission?.mesh.root ?? this.#meshRoot;
+    if (typeof decisionId !== "string" || !decisionId || !meshRoot) return;
+    try {
+      const { recordSpawnRouterStartFailed } = await import("./spawn-router.js");
+      await recordSpawnRouterStartFailed({ meshRoot, decisionId, admission, spawnKind: "spawn", request, cwd: this.cwd });
+    } catch { /* Ledger writes never change launch behavior. */ }
+  }
+
   /** authorize is host-only activation authority; unlike a guest deadline it survives queuing.
    * beforeCommit is a separate resident-host mutation fence, checked after model preparation.
    * callerReturnAddress is a validated resident caller snapshot, never a task request field.
    */
-  spawn(request: AgentRunRequest, signal?: AbortSignal, authorize?: () => boolean, beforeCommit?: (id: string) => void, onOutputPrincipalDowngrade?: () => void, onLaunched?: (handle: AgentHandleInfo) => void, preparation?: AgentLaunchPreparationOptions, callerReturnAddress?: TaskReturnAddress): Promise<AgentHandleInfo> {
-    if (this.#closing) return Promise.reject(new Error("Fabric agent manager is closing"));
+  spawn(request: AgentRunRequest, signal?: AbortSignal, authorize?: () => boolean, beforeCommit?: (id: string) => void, onOutputPrincipalDowngrade?: () => void, onLaunched?: (handle: AgentHandleInfo) => void, preparation?: AgentLaunchPreparationOptions, callerReturnAddress?: TaskReturnAddress, routerAdmission?: SpawnRouterAdmission): Promise<AgentHandleInfo> {
+    // Only a native argument may carry caller authority. Task-supplied fields are ignored.
+    routerAdmission = routerAdmission && { ...routerAdmission,
+      targetRootId: this.#mainAgentId ?? routerAdmission.targetRootId,
+      targetHostId: this.#hostId ?? routerAdmission.targetHostId };
+    if (this.#closing) return this.#recordSpawnRouterStartFailed(request, routerAdmission).then(() => { throw new Error("Fabric agent manager is closing"); });
     // smarty-dev#9855: at admission, free the permits of launches now proven gone, before asking for one.
     this.#releaseProvenGone();
     // pi-fabric#939 P2-a: the 6 h re-alarm is also due on every admission attempt, where a stuck state is felt.
@@ -1511,13 +1857,23 @@ export class AgentManager {
     // This is a host-only no-inference worker flag, never a guest admission override.
     const probe = request.residentStartupProbe === true && (request.runner ?? this.config.runner) === "pi" &&
       (request.transport ?? this.config.transport) === "process" && !request.sessionSeed && !request.actorId;
-    if (request.residentStartupProbe && !probe) return Promise.reject(new Error("Invalid resident startup probe"));
+    if (request.residentStartupProbe && !probe) return this.#recordSpawnRouterStartFailed(request, routerAdmission).then(() => { throw new Error("Invalid resident startup probe"); });
     request = { ...request };
     const returnAddress = callerReturnAddress && structuredClone(callerReturnAddress);
+    const routerDecisionId = (request as AgentRunRequest & { spawnRouterDecisionId?: unknown }).spawnRouterDecisionId;
+    const routerStart = { settled: typeof routerDecisionId !== "string" || routerDecisionId.length === 0, admission: routerAdmission };
     const pending = (async () => {
-      while (this.#releasePaused && !probe) await this.#waitForRelease(signal);
-      if (this.#closing) throw new Error("Fabric agent manager is closing");
-      return this.#spawn(request, signal, authorize, beforeCommit, onOutputPrincipalDowngrade, onLaunched, preparation, returnAddress);
+      try {
+        while (this.#releasePaused && !probe) await this.#waitForRelease(signal);
+        if (this.#closing) throw new Error("Fabric agent manager is closing");
+        return await this.#spawn(request, signal, authorize, beforeCommit, onOutputPrincipalDowngrade, onLaunched, preparation, returnAddress, routerStart);
+      } catch (error) {
+        if (!routerStart.settled) {
+          routerStart.settled = true;
+          await this.#recordSpawnRouterStartFailed(request, routerStart.admission);
+        }
+        throw error;
+      }
     })();
     this.#spawns.add(pending);
     void pending.then(() => this.#spawns.delete(pending), () => this.#spawns.delete(pending));
@@ -1589,7 +1945,27 @@ export class AgentManager {
     return childThinkingBounds(this.#thinkingBounds?.() ?? {}, requested);
   }
 
-  async #spawn(request: AgentRunRequest, signal?: AbortSignal, authorize?: () => boolean, beforeCommit?: (id: string) => void, onOutputPrincipalDowngrade?: () => void, onLaunched?: (handle: AgentHandleInfo) => void, preparation?: AgentLaunchPreparationOptions, callerReturnAddress?: TaskReturnAddress): Promise<AgentHandleInfo> {
+  // Stored launch callbacks bind only custody/authority facts, never a spawn
+  // closure whose lexical ancestors also contain the full task request.
+  #handleUnconfirmedExit(id: string, runDirectory: string, transport: AgentTransportAdapter["kind"], reason: string): void {
+    const managed = this.#runs.get(id);
+    if (managed) this.#markLost(managed, reason);
+    else {
+      // Cancelled/in-flight launches have no registered owner yet.
+      try { markUnresolvedWorker(runDirectory, reason, { runId: id, transport }); } catch { /* launch cleanup remains pending */ }
+    }
+  }
+
+  #assertLaunchAuthorized(id: string, authorize?: () => boolean): true {
+    if (authorize && !authorize()) {
+      // Preserve queued revocation as stopped rather than a launch failure.
+      this.#queued.get(id)?.abort.abort();
+      throw new Error("Agent activation no longer authorized");
+    }
+    return true;
+  }
+
+  async #spawn(request: AgentRunRequest, signal?: AbortSignal, authorize?: () => boolean, beforeCommit?: (id: string) => void, onOutputPrincipalDowngrade?: () => void, onLaunched?: (handle: AgentHandleInfo) => void, preparation?: AgentLaunchPreparationOptions, callerReturnAddress?: TaskReturnAddress, routerStart?: { settled: boolean; admission?: SpawnRouterAdmission | undefined }): Promise<AgentHandleInfo> {
     if (!this.config.enabled) throw new Error("Agents are disabled in Fabric configuration");
     if (this.#currentDepth >= this.config.maxDepth) {
       throw new Error(`Fabric agent depth limit reached (${this.config.maxDepth})`);
@@ -1774,23 +2150,18 @@ export class AgentManager {
     assertRunPathSafe(path.join(this.#runRoot, id), this.#inheritedRunRoot);
     // Count accepted requests, including queued ones, exactly once.
     this.#semaphore.admit(this.#currentDepth + 1);
-    // Exclusive fresh allocation is the host witness; publish current-only authority before route/custody/task writes.
+    // The run path is only allocated after model preparation and the resident commit fence.
+    // Routed dispatch is the exception: its central namespace must be published before queueing.
     const runDirectory = path.join(this.#runRoot, id);
-    createHostTaskRun(runDirectory);
-    // Routed dispatch binds the allocated identity once; route controls themselves are central (smarty-dev#12444).
     const runPin = request.routeDecision ? pinRunDirectory(runDirectory) : undefined;
-    if (managerRunTestHooks.afterRunAllocation) await managerRunTestHooks.afterRunAllocation(runDirectory);
+    if (request.routeDecision) {
+      createHostTaskRun(runDirectory);
+      if (managerRunTestHooks.afterRunAllocation) await managerRunTestHooks.afterRunAllocation(runDirectory);
+    }
     const name = safeName(request.name ?? request.task.split("\n", 1)[0] ?? "Fabric agent");
     const prompt = promptMetadata(request.task, path.join(this.#runRoot, id, "task.txt"));
     const callerSignal = signal;
-    const assertAuthorized = (): void => {
-      if (authorize && !authorize()) {
-        // Mark revocation before throwing so a queued receipt settles as stopped,
-        // not a launch failure, even if only the generation/state check changed.
-        this.#queued.get(id)?.abort.abort();
-        throw new Error("Agent activation no longer authorized");
-      }
-    };
+    const assertAuthorized = this.#assertLaunchAuthorized.bind(this, id, authorize);
     let routeDispatch: ReturnType<typeof import("./model-route.js")["prepareRouteDispatch"]> | undefined;
     if (request.routeDecision) {
       const { prepareRouteDispatch } = await import("./model-route.js");
@@ -1800,6 +2171,7 @@ export class AgentManager {
         ? { model: request.routeDecision.model, effort: request.routeDecision.effort } : request.routeDecision.pin) });
       model = routePin.model;
     }
+    const routerStartState = routerStart ?? { settled: true, admission: undefined };
     const startPrepared = async (release: () => void, signal = admissionSignal): Promise<AgentHandleInfo> => {
       try {
         while (this.#releasePaused && !request.residentStartupProbe) await this.#waitForRelease(signal);
@@ -1830,6 +2202,13 @@ export class AgentManager {
       // A real replacement directory is not an alias: require the original allocation identity too.
       runPin?.use(() => undefined);
       if (managerRunTestHooks.afterLateRunCheck) await managerRunTestHooks.afterLateRunCheck(runDirectory);
+      // Main's resident commit fence must be able to veto before any run bytes exist.
+      // Routed dispatch already allocated its central namespace before queueing; ordinary
+      // runs allocate only now, after preparation and before custody/task writes.
+      if (!request.routeDecision) {
+        createHostTaskRun(runDirectory);
+        if (managerRunTestHooks.afterRunAllocation) await managerRunTestHooks.afterRunAllocation(runDirectory);
+      }
       // 0700 whatever the umask (smarty-dev#9016): a login shell's umask 002 made run directories 0775, which
       // verified retention refuses (group-writable). Only directories it creates are changed.
       mkdirPrivate(runDirectory, this.#trustRoot());
@@ -1920,15 +2299,7 @@ export class AgentManager {
         } else if (defaultTaskWritePolicy && !applyTaskWriteDefault) {
           auditWritePolicy("write_policy.unsupported", `${runnerAdapter.label} does not enforce task write roots; launch remains unrestricted.`);
         }
-        let dispositionLogged = false;
-        const onWritePolicyDisposition = (disposition: "local" | "remote"): void => {
-          if (dispositionLogged) return;
-          dispositionLogged = true;
-          if (disposition === "local") auditWritePolicy("write_policy.default",
-            "Shell writes are unconfined by the task write policy (native bash/powershell and nested pi.bash); any Fabric Landlock settings are independent and may grant wider roots.", writePolicy);
-          else auditWritePolicy("write_policy.remote_unconfined",
-            "Remote one-shot placement cannot forward task write roots or scratch yet; remote task remains unrestricted.");
-        };
+        const onWritePolicyDisposition = writePolicyDispositionAudit(logFile, id, runner, writePolicy);
         const parentSessionId = this.#sessionId?.();
         const parentRunId = this.#parentLineage?.runId ?? (this.#currentDepth > 0 ? process.env.PI_FABRIC_PARENT_RUN : undefined);
         const lineage: FabricAgentLineage = {
@@ -2016,7 +2387,7 @@ export class AgentManager {
           ...(scope ? { scope } : {}),
         };
         if (hostedAdapter) {
-          return await this.#startHosted(hostedAdapter, launchContext, {
+          const handle = await this.#startHosted(hostedAdapter, launchContext, {
             request,
             release,
             signal,
@@ -2027,6 +2398,11 @@ export class AgentManager {
             ...(branch ? { branch } : {}),
             ...(worktree ? { worktree } : {}),
           });
+          if (!routerStartState.settled) {
+            routerStartState.settled = true;
+            await this.#recordSpawnRouterStart(request, handle.id, launchContext.model, launchContext.thinking, undefined, this.#runs.get(handle.id), routerStartState.admission);
+          }
+          return handle;
         }
         const sessionExportDir = resolveSessionExportDir(this.config);
         const sessionExportFile = sessionExportDir
@@ -2207,15 +2583,8 @@ export class AgentManager {
                     ? "requested worker features cannot be preserved by one-shot placement"
                     : timeoutMs > 240 * 60_000 ? "launcher supports at most 240 minutes" : undefined,
           signal,
-          onUnconfirmedExit: (reason) => {
-            const managed = this.#runs.get(id);
-            if (managed) this.#markLost(managed, reason);
-            else {
-              // Cancelled/in-flight launches have no registered owner yet.
-              try { markUnresolvedWorker(runDirectory, reason, { runId: id, transport: adapter.kind }); } catch { /* launch cleanup remains pending */ }
-            }
-          },
-          ...(authorize ? { authorize: () => { assertAuthorized(); return true; } } : {}),
+          onUnconfirmedExit: this.#handleUnconfirmedExit.bind(this, id, runDirectory, adapter.kind),
+          ...(authorize ? { authorize: assertAuthorized } : {}),
         };
         if (this.#closing) throw new Error("Fabric agent manager is closing");
         if (signal?.aborted) throw new Error("Agent launch aborted");
@@ -2270,10 +2639,6 @@ export class AgentManager {
           launch: { ...launch, signal: authorize ? signal : undefined },
           startupAttempts: 1,
           ...lifecycle,
-          release: () => {
-            if (managed.executionExited) release();
-            else managed.executionRelease = release;
-          },
           abortSignal: queued && !authorize ? undefined : signal,
           abortHandler: undefined,
           ...(model ? { model } : {}),
@@ -2305,8 +2670,12 @@ export class AgentManager {
           },
           usageEmitted: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
         };
+        // lifecycle.release avoids referencing managed in its own initializer;
+        // bind the once-only admission and fence before listeners or registration.
+        managed.admissionRelease = createAdmissionRelease(managed, release);
+        managed.release = executionFencedRelease(managed, managed.admissionRelease);
         if (signal && (!queued || authorize)) {
-          managed.abortHandler = () => this.#handleCallerAbort(id);
+          managed.abortHandler = this.#handleCallerAbort.bind(this, id);
           signal.addEventListener("abort", managed.abortHandler, { once: true });
         }
         this.#runs.set(id, managed);
@@ -2330,6 +2699,10 @@ export class AgentManager {
         } });
         // A queued receipt is not a worker. Notify only after launch and registration.
         try { onLaunched?.(handle); } catch { /* observers must not undo a launched worker */ }
+        if (!routerStartState.settled) {
+          routerStartState.settled = true;
+          await this.#recordSpawnRouterStart(request, id, model, thinking, sessionFile, managed, routerStartState.admission);
+        }
         return handle;
       } catch (error) {
         // An unconfirmed launch may have started a worker that already uses the worktree
@@ -2368,6 +2741,10 @@ export class AgentManager {
           // pi-fabric#939 round 3: event-driven, no polling. The launched process's own close event re-checks the
           // proof; a release wakes the admission waiters through the semaphore.
           void (obligation as { closed?: Promise<unknown> }).closed?.then(() => this.#releaseProvenGone(), () => this.#releaseProvenGone());
+          if (!routerStartState.settled) {
+            routerStartState.settled = true;
+            await this.#recordSpawnRouterStartUnknown(request, routerStartState.admission);
+          }
           return this.#queuedInfo(queued);
         }
         release();
@@ -2384,12 +2761,16 @@ export class AgentManager {
     const start = async (release: () => void, signal = admissionSignal): Promise<AgentHandleInfo> => {
       try { return await startPrepared(release, signal); }
       catch (error) {
+        if (!routerStartState.settled) {
+          routerStartState.settled = true;
+          await this.#recordSpawnRouterStartFailed(request, routerStartState.admission);
+        }
         // Cover preparation writes and worktree creation as well as transport failures,
         // without releasing admission while an unconfirmed worker retains custody.
         if ((error as { launchOutcome?: string } | undefined)?.launchOutcome !== "unknown") release();
         if ((error as { launchOutcome?: string } | undefined)?.launchOutcome !== "unknown" && !this.#queued.has(id) && !isUnsafeRunPathError(error)) {
           try { routeDispatch?.outcome({ status: signal?.aborted ? "stopped" : "failed" }); }
-          catch (saveError) { if (isUnsafeRunPathError(saveError)) throw saveError; console.warn(`[pi-fabric] Pre-worker route outcome save failed; files retained at ${path.join(this.#runRoot, id)}: ${String(saveError)}`); }
+          catch (saveError) { diagnostics.warn("src/agents/manager.ts", `[pi-fabric] Pre-worker route outcome save failed; files retained at ${path.join(this.#runRoot, id)}: ${String(saveError)}`); }
         }
         throw error;
       }
@@ -2401,7 +2782,10 @@ export class AgentManager {
       catch (saveError) { if (isUnsafeRunPathError(saveError)) throw saveError; /* storage does not block cancellation */ }
       throw error;
     }
-    if (release) return start(release).catch((error) => { release(); throw error; });
+    if (release) {
+      const ownedRelease = this.#ownAdmission({ id, actorId: request.actorId, actorName: request.actorName }, release);
+      return start(ownedRelease).catch((error) => { ownedRelease(); throw error; });
+    }
     return this.#enqueue({
       ...createRunRouteMetadata({ ...routeFacts, runner, transport: request.transport ?? this.config.transport }),
       id, name, status: "queued", runner, transport: request.transport ?? this.config.transport,
@@ -2418,7 +2802,12 @@ export class AgentManager {
       ...(request.capabilityRequirements ? { capabilityRequirements: [...request.capabilityRequirements] } : {}),
       ...(request.capabilityDigest ? { capabilityDigest: request.capabilityDigest } : {}),
       ...(request.runnerSessionId ? { runnerSessionId: request.runnerSessionId } : {}),
-    }, request.task, start, authorize ? callerSignal : undefined, routeDispatch?.outcome, completionRecipient);
+    }, request.task, start, authorize ? callerSignal : undefined, routeDispatch?.outcome, completionRecipient, routerStartState.settled ? undefined : async () => {
+      if (!routerStartState.settled) {
+        routerStartState.settled = true;
+        await this.#recordSpawnRouterStartFailed(request, routerStartState.admission);
+      }
+    });
   }
 
   #enqueue(
@@ -2428,6 +2817,7 @@ export class AgentManager {
     ownerSignal?: AbortSignal,
     routeOutcome?: (result: AgentRunResult) => void,
     completionRecipient?: CompletionRecipient,
+    onStartFailed?: () => Promise<void>,
   ): AgentHandleInfo {
     const abort = new AbortController();
     // Guest receipts belong to the session, not a program deadline. Host-owned
@@ -2438,11 +2828,16 @@ export class AgentManager {
     const queued: QueuedAgent = { info, task, enqueuedAt: Date.now(), abort, result, resolve, background: false,
       ...(routeOutcome ? { routeOutcome } : {}), ...(completionRecipient ? { completionRecipient } : {}) };
     this.#queued.set(info.id, queued);
+    if (this.#admissionSnapshotPath) {
+      this.#admissionWaiting.set(info.id, { actorId: info.actorId ?? null, actorName: info.actorName ?? null,
+        runId: info.id, since: queued.enqueuedAt });
+      this.#scheduleAdmissionSnapshot();
+    }
     const admission = this.#semaphore.acquire("native", signal);
     const pending = (async () => {
       let release: (() => void) | undefined;
       try {
-        release = await admission;
+        release = this.#ownAdmission(info, await admission);
         while (this.#releasePaused) await this.#waitForRelease(signal);
         if (signal.aborted) throw new Error("Agent launch aborted");
         await start(release, signal);
@@ -2455,6 +2850,7 @@ export class AgentManager {
         }
         release?.();
         if (isUnsafeRunPathError(error)) queued.runPathUnsafe = true;
+        await onStartFailed?.();
         this.#settleQueued(queued, signal.aborted ? "stopped" : "failed", error);
       }
     })();
@@ -2487,8 +2883,34 @@ export class AgentManager {
    * gone keeps its permit. Evaluated where permits are acquired (spawn) and held; no timer.
    */
   #releaseProvenGone(): number {
-    if (process.platform !== "linux") return 0;
     let released = 0;
+    // Actor primary death frees ONLY its still-held actual RUN admission, even
+    // after logical settlement with native debt. Native descendants, unresolved
+    // markers and same-session custody stay joined. Ordinary tasks retain the
+    // exact ENODEV recovery below; heldPermit registration is not a prerequisite.
+    for (const managed of this.#runs.values()) {
+      // A replacement may already be creating a worker while transport still names
+      // the old attempt. Its death cannot discharge the replacement's admission.
+      // A normal Windows settlement owns release until its captured close/stop
+      // joins. Rejection or the existing close bound permits reconciliation, not
+      // release: every later scan must re-establish fresh host-owned death proof.
+      if (!managed.actorId || managed.relaunchPending || !managed.admissionRelease) continue;
+      const nativeFenced = managed.nativeAdmissionFenced;
+      if (nativeFenced && managed.nativeAdmissionReconcile !== managed.transport) continue;
+      // Every proof-triggered scan (close, admission, or native debt) can beat
+      // the monitor's next status read. Establish terminal ownership here too,
+      // before host primary-death proof can bypass its captured native join.
+      if ((!nativeFenced && this.#fenceNativeTerminalAdmission(managed)) || !this.#actorWorkerGone(managed, nativeFenced)) continue;
+      const permit = managed.admissionRelease;
+      delete managed.heldPermit;
+      permit();
+      released++;
+    }
+    if (process.platform !== "linux") {
+      if (released) this.#invalidateUiList();
+      if (this.heldPermits() * 2 < this.config.maxConcurrent) this.#admissionAlarmAt = undefined;
+      return released;
+    }
     for (const queued of this.#queued.values()) {
       if (!queued.heldPermit) continue;
       const directory = path.join(this.#runRoot, queued.info.id);
@@ -2598,7 +3020,7 @@ export class AgentManager {
         heldPermits: this.heldPermits(), maxConcurrent: this.config.maxConcurrent, at: Date.now(),
         message: `run ${runId}: its recovered answer could not be saved for its spawner; its admission permit stays held ` +
           "while the save is retried (smarty-dev#9855)" };
-      console.warn(`[pi-fabric] ${alarm.message}`);
+      diagnostics.warn("src/agents/manager.ts", `[pi-fabric] ${alarm.message}`);
       try { this.#onAdmissionAlarm?.(structuredClone(alarm)); } catch { /* the stderr line stands */ }
     }
     const tries = managed.recoveryRetries ?? 0;
@@ -2626,11 +3048,12 @@ export class AgentManager {
     const alarm: AgentAdmissionAlarm = { heldPermits: held, maxConcurrent: this.config.maxConcurrent, at: now,
       message: `${held} of ${this.config.maxConcurrent} agent admission permits are held by launches whose exit is ` +
         "unconfirmed; new spawns queue behind them (smarty-dev#9855)" };
-    console.warn(`[pi-fabric] ${alarm.message}`);
+    diagnostics.warn("src/agents/manager.ts", `[pi-fabric] ${alarm.message}`);
     try { this.#onAdmissionAlarm?.(structuredClone(alarm)); } catch { /* the stderr line stands */ }
   }
 
   #settleQueued(queued: QueuedAgent, status: "stopped" | "failed", error: unknown): void {
+    if (this.#admissionWaiting.delete(queued.info.id)) this.#scheduleAdmissionSnapshot();
     if (queued.terminal) return;
     this.#retentionRevision++;
     const now = Date.now();
@@ -2695,7 +3118,7 @@ export class AgentManager {
       } catch (error) { failure = error; }
     }
     const warning = `Routing outcome save failed; queued run retained: ${String(failure)}`;
-    if (!queued.routeSaveFailure) console.warn(`[pi-fabric] ${warning}`);
+    if (!queued.routeSaveFailure) diagnostics.warn("src/agents/manager.ts", `[pi-fabric] ${warning}`);
     queued.terminal.warnings = [...(queued.terminal.warnings ?? []).filter(item => item !== queued.routeSaveFailure), warning];
     queued.routeSaveFailure = warning;
     this.#invalidateUiList();
@@ -2976,7 +3399,7 @@ export class AgentManager {
 
   /** Side-effect-free settlement join for preparation before a durable mutation fence. */
   async join(id: string): Promise<void> {
-    if (this.#previousRun(id)) return;
+    if (this.#hasPreviousRun(id)) return;
     const managed = this.#requireRun(id);
     if (!managed.settled) {
       if (!managed.result) throw new Error(`Agent ${id} has no pending result`);
@@ -3027,9 +3450,44 @@ export class AgentManager {
     return result;
   }
 
+  #readResult(managed: ManagedAgent): AgentRunRecord | undefined {
+    // A failed publication retains the manager's validated full outcome for retry.
+    // Worker status remains progress only: it cannot replace a settled outcome.
+    if (managed.settlementSaveFailure) return structuredClone(managed.settlementSaveFailure.result);
+    if (!managed.settledResultFile) {
+      if (!managed.settled) return readRecord(managed.statusFile);
+      throw Object.assign(new Error(`Fabric agent ${managed.id} has no published terminal result`),
+        { code: "FABRIC_MISSING_RESULT" as const });
+    }
+    const expectedFile = path.join(managed.runDirectory, MANAGER_RESULT_FILE);
+    const result = readAuthenticatedRecord(managed.settledResultFile, expectedFile, managed.resultFingerprint);
+    if (result && result.id === managed.id && terminalStatuses.has(result.status)) return result;
+    // Close's whole-tree collection is the only owned path that removes the published
+    // file while the handle stays readable. Only its recorded provenance (validated
+    // exact file, successful removal, no-follow absence) authorizes the bounded summary.
+    // An unexpected absence, dangling entry, corrupt or foreign file still fails loudly.
+    if (!result && this.#closing && managed.executionExited && managed.settledSummary && managed.resultCollected &&
+        pathAbsentNoFollow(managed.settledResultFile)) return this.#collectedResult(managed, managed.settledSummary);
+    throw Object.assign(new Error(`Fabric agent ${managed.id} has no saved terminal result at ${managed.settledResultFile}`),
+      { code: "FABRIC_MISSING_RESULT" as const });
+  }
+
+  /** Only manager-owned bounded facts survive owned collection, never worker status or UI snapshots. */
+  #collectedResult(managed: ManagedAgent, summary: SettledSummary): AgentRunRecord {
+    return {
+      ...managed.runRoute, id: managed.id, name: managed.name, task: "", status: summary.status, runner: managed.runner,
+      transport: managed.transport.kind, cwd: managed.cwd, startedAt: summary.startedAt, updatedAt: summary.updatedAt,
+      turns: summary.turns, toolCalls: summary.toolCalls, text: "", usage: { ...summary.usage },
+      ...(summary.finishedAt !== undefined ? { finishedAt: summary.finishedAt } : {}),
+      ...(summary.exitCode !== undefined ? { exitCode: summary.exitCode } : {}),
+      ...(summary.error !== undefined ? { error: summary.error } : {}),
+      warnings: ["Run files were collected at close; this is the manager's bounded terminal summary, not the exact result"],
+    };
+  }
+
   /** Observe a settled outcome, independently of foreground consumption receipts. */
   #settledResult(managed: ManagedAgent): AgentRunResult {
-    const record = managed.finalAnswerResult ?? readRecord(managed.statusFile) ?? managed.latestRecord;
+    const record = managed.finalAnswerResult ?? this.#readResult(managed) ?? managed.latestRecord;
     if (!record || !terminalStatuses.has(record.status)) {
       throw new Error(`Agent ${managed.id} settled without a result`);
     }
@@ -3068,7 +3526,7 @@ export class AgentManager {
 
   /** A terminal worker status is provisional until its retry supervisor settles the run. */
   isSettled(id: string): boolean {
-    if (this.#previousRun(id)) return true;
+    if (this.#hasPreviousRun(id)) return true;
     const queued = this.#queued.get(id);
     return queued ? queued.terminal !== undefined : this.#requireRun(id).settled;
   }
@@ -3080,15 +3538,20 @@ export class AgentManager {
   }
 
   markForeground(id: string): void {
-    if (!this.isSettled(id)) return;
+    // A deferred publication can outlive bounded summary/handle retention. Its
+    // preparation receipt already certified settlement; never drop that debt.
+    if (!this.#foregroundPrepared.has(id) && !this.isSettled(id)) return;
     if (!this.#foregroundPrepared.has(id)) this.prepareForeground(id);
     this.#foregroundDelivered.add(id); // Publication happened; cleanup cannot make a later abandon unread.
-    if (!this.#previousRun(id)) {
-      const queued = this.#queued.get(id);
-      if (queued) queued.background = false;
-      else this.#requireRun(id).background = false;
-    }
+    const queued = this.#queued.get(id);
+    if (queued) queued.background = false;
+    const managed = this.#runs.get(id);
+    if (managed) managed.background = false;
     this.#onResultConsumed?.(id);
+    if (!managed && !queued && !this.#hasPreviousRun(id)) {
+      this.#foregroundPrepared.delete(id);
+      this.#foregroundDelivered.delete(id);
+    }
   }
 
   abandonForeground(id: string): void {
@@ -3097,7 +3560,7 @@ export class AgentManager {
       this.#pendingAbandonment.add(id);
       this.#retryAbandonment(id);
     }
-    if (!this.#previousRun(id)) this.detachSignal(id);
+    if (!this.#hasPreviousRun(id) && (this.#runs.has(id) || this.#queued.has(id))) this.detachSignal(id);
   }
 
   #retryAbandonment(id: string): void {
@@ -3161,7 +3624,7 @@ export class AgentManager {
     managed.background = true;
     // A fast worker may settle before agents.spawn returns and detaches it.
     if (managed.settled) {
-      const record = readRecord(managed.statusFile) ?? managed.latestRecord;
+      const record = this.#readResult(managed) ?? managed.latestRecord;
       if (record && terminalStatuses.has(record.status)) {
         this.#notifyBackgroundComplete(managed, this.#withTransportMetadata(record, managed) as AgentRunResult);
       }
@@ -3184,6 +3647,7 @@ export class AgentManager {
    * host-synthesized stop or transport-death record resets the counters to zero.
    */
   #observeProgress(managed: ManagedAgent, record: AgentRunRecord): void {
+    this.#observeAdmissionStatus(managed.id, record);
     const seen = managed.observedProgress;
     if (record.turns > seen.turns) seen.turns = record.turns;
     if (record.toolCalls > seen.toolCalls) seen.toolCalls = record.toolCalls;
@@ -3195,13 +3659,17 @@ export class AgentManager {
   status(id: string): AgentRunRecord | AgentHandleInfo {
     const queued = this.#queued.get(id);
     if (queued) return queued.terminal ? structuredClone(queued.terminal) : this.#queuedInfo(queued);
-    const previous = this.#previousRuns.get(id);
-    if (previous && !this.#runs.has(id)) {
-      const directory = path.join(this.#runRoot, previous.id);
-      this.#terminalNoticeOutbox.recover(directory);
-      const view = previous.runner === "pi" && !previous.actorId && previous.finalAnswerReceipt ? this.#refusalView(directory) : {};
-      const { undeliveredMessages: _messages, undeliveredMessagesTotal: _total, undeliveredMessagesTruncated: _truncated, ...safe } = previous;
-      return structuredClone({ ...safe, ...view });
+    const previous = this.#previousRun(id);
+    if (previous) {
+      const retained = this.#previousRuns.get(id);
+      if (retained) {
+        const directory = path.dirname(retained.resultFile);
+        this.#terminalNoticeOutbox.recover(directory);
+        const view = previous.runner === "pi" && !previous.actorId && previous.finalAnswerReceipt ? this.#refusalView(directory) : {};
+        const { undeliveredMessages: _messages, undeliveredMessagesTotal: _total, undeliveredMessagesTruncated: _truncated, ...safe } = previous;
+        return structuredClone({ ...safe, ...view });
+      }
+      return structuredClone(previous);
     }
     const managed = this.#requireRun(id);
     // A recorded receipt makes unconsumed admissions final now, not at native exit.
@@ -3209,9 +3677,7 @@ export class AgentManager {
       try { this.#refuseUnreadTerminalControls(managed); } catch { /* The exit scan retries from durable sources. */ }
     }
     this.#routeTerminalNotices(managed);
-    const record = managed.finalAnswerResult ?? (managed.settled
-      ? readRecord(managed.statusFile) ?? managed.latestRecord
-      : managed.latestRecord ?? readRecord(managed.statusFile));
+    const record = managed.finalAnswerResult ?? this.#readResult(managed) ?? managed.latestRecord;
     if (!record) {
       const info = this.#handleInfo(managed, "running");
       const deliveries = this.#checkFollowUps(managed);
@@ -3219,9 +3685,15 @@ export class AgentManager {
       if (managed.finalAnswer) Object.assign(info, this.#refusalView(managed.runDirectory));
       return info;
     }
-    managed.latestRecord = record;
-    if (!managed.latestUiRecord) {
-      managed.latestUiRecord = compactUiRecord(record);
+    this.#observeAdmissionStatus(managed.id, record);
+    const compact = compactUiRecord(record);
+    const ui = managed.latestUiRecord;
+    managed.latestRecord = compact;
+    // A status read can refresh the cache before the monitor's next poll. Keep the
+    // UI projection in step, or the monitor's change check never republishes it.
+    if (!ui || ui.updatedAt !== compact.updatedAt || ui.status !== compact.status ||
+        ui.runnerSessionId !== compact.runnerSessionId || ui.currentTool !== compact.currentTool) {
+      managed.latestUiRecord = compact;
       this.#invalidateUiList();
     }
     const result = structuredClone(this.#withTransportMetadata(record, managed));
@@ -3242,27 +3714,46 @@ export class AgentManager {
     const runs = [...this.#runs.values()];
     const active = runs.filter((managed) => !managed.settled);
     const settled = runs.filter((managed) => managed.settled);
-    const retainedSettledCount = Math.max(0, MAX_RETAINED_UI_RUNS - active.length);
-    const retainedSettled =
-      retainedSettledCount > 0 ? settled.slice(-retainedSettledCount) : [];
-    const visible = new Set([...active, ...retainedSettled]);
-    const value = runs
-      .filter((managed) => visible.has(managed))
-      .map((managed) => {
-        let record = managed.latestUiRecord;
-        if (!record) {
-          const latest = managed.latestRecord ?? readRecord(managed.statusFile);
-          if (!latest) return this.#handleInfo(managed, "running");
-          managed.latestRecord = latest;
-          record = compactUiRecord(latest);
-          managed.latestUiRecord = record;
-        }
-        return structuredClone(
-          compactUiRecord(this.#withTransportMetadata(record, managed)),
-        );
-      });
-    value.push(...[...this.#queued.keys()].map((id) => this.status(id)));
-    this.#uiListCache = { revision: this.#uiListRevision, value };
+    const listBudget = MAX_RETAINED_UI_BYTES - MAX_RETAINED_UI_SNAPSHOT_BYTES;
+    const selected = new Map<string, AgentRunRecord | AgentHandleInfo>();
+    let bytes = 4;
+    const projection = (managed: ManagedAgent): AgentRunRecord | AgentHandleInfo => {
+      let record = managed.latestUiRecord;
+      if (!record) {
+        const latest = managed.latestRecord ?? this.#readResult(managed);
+        if (!latest) return this.#handleInfo(managed, "running");
+        record = compactUiRecord(latest);
+        managed.latestRecord = record;
+        managed.latestUiRecord = record;
+      }
+      return compactUiRecord(this.#withTransportMetadata(record, managed));
+    };
+    // Live ownership always stays visible. If its detailed snapshot cannot fit,
+    // display the handle; never omit an active agent in favour of old results.
+    for (const managed of active) {
+      let record = projection(managed);
+      if (bytes + uiPayloadBytes(record) + 2 > listBudget) record = this.#handleInfo(managed, "running");
+      selected.set(managed.id, record);
+      bytes += uiPayloadBytes(record) + 2;
+    }
+    const queuedValue = [...this.#queued.values()].map(queued =>
+      queued.terminal ? compactUiRecord(queued.terminal) : this.#queuedInfo(queued));
+    for (const record of queuedValue) bytes += uiPayloadBytes(record) + 2;
+    const settledCount = Math.max(0, MAX_RETAINED_UI_RUNS - active.length - queuedValue.length);
+    for (const managed of (settledCount > 0 ? settled.slice(-settledCount) : []).reverse()) {
+      if (selected.size - active.length >= settledCount) break;
+      const record = projection(managed);
+      const size = uiPayloadBytes(record) + 2;
+      if (bytes + size > listBudget) break;
+      selected.set(managed.id, record);
+      bytes += size;
+    }
+    const value = runs.flatMap(managed => selected.has(managed.id) ? [selected.get(managed.id)!] : []);
+    value.push(...queuedValue);
+    this.#pruneRetainedUiRecords();
+    // An unusually large live/queued handle set remains queryable, but is not
+    // retained as an over-budget UI-list cache.
+    this.#uiListCache = bytes <= listBudget ? { revision: this.#uiListRevision, value } : undefined;
     return value;
   }
 
@@ -3549,11 +4040,71 @@ export class AgentManager {
     return structuredClone(value);
   }
 
-  /** Runs a previous runtime of this session stopped; wait/status return them, not Unknown. */
+  /** Runs a previous runtime stopped; keep exact outcomes on disk, not in the index. */
   restorePreviousRuns(results: AgentRunResult[]): void {
     for (const result of results) {
-      if (!this.#runs.has(result.id)) this.#previousRuns.set(result.id, structuredClone(result));
+      if (this.#runs.has(result.id)) continue;
+      // Session-carried results may outlive their original temporary run root.
+      // Validate the path component before creating a new private disk backing.
+      if (!/^[A-Za-z0-9_-]{1,256}$/.test(result.id)) throw new Error("Invalid restored Fabric agent id");
+      const directory = path.join(this.#runRoot, result.id);
+      mkdirPrivate(directory, this.#trustRoot());
+      const statusFile = path.join(directory, "status.json");
+      // Publish BEFORE dropping any full in-memory result. A failed save throws,
+      // leaving the old index/result intact and the caller's archive unconsumed.
+      writeJsonAtomic(statusFile, result, { space: 2, durable: true });
+      // A restored archive is a new publication, not a replacement for any
+      // original or restored generation still authenticated by another manager.
+      const resultFile = path.join(directory, `manager-restored-result-${randomUUID()}.json`);
+      const fingerprint = writePrivateJsonAtomic(resultFile, result);
+      this.#rememberPreviousRun(result, resultFile, fingerprint);
     }
+  }
+
+  #rememberPreviousRun(result: AgentRunResult, resultFile: string, fingerprint: PrivateFileFingerprint): void {
+    const summary: PreviousRunSummary = {
+      id: detachedPreview(result.id, result.id.length),
+      name: uiText(result.name, MAX_NAME_LENGTH),
+      status: result.status,
+      runner: result.runner,
+      ...(result.actorId ? { actorId: uiText(result.actorId, MAX_UI_TEXT_CHARS) } : {}),
+      ...(result.finalAnswerReceipt ? { finalAnswerReceipt: {
+        id: detachedPreview(result.finalAnswerReceipt.id, result.finalAnswerReceipt.id.length),
+        recordedAt: result.finalAnswerReceipt.recordedAt,
+      } } : {}),
+      ...(result.error !== undefined ? { error: uiText(result.error, MAX_UI_ERROR_CHARS) } : {}),
+    };
+    this.#dropPreviousRun(result.id);
+    // The result stays on disk; only this bounded summary, path and fixed proof
+    // remain indexed in memory. Do not charge the retained result payload to heap.
+    const bytes = uiPayloadBytes(summary) + resultFile.length * 2 + PRIVATE_FILE_FINGERPRINT_BYTES;
+    this.#previousRuns.set(summary.id, { summary, resultFile, fingerprint, bytes });
+    this.#previousRunBytes += bytes;
+    while (this.#previousRuns.size > MAX_RETAINED_RUN_HANDLES || this.#previousRunBytes > MAX_PREVIOUS_RUN_BYTES) {
+      this.#forgetRunMetadata(this.#previousRuns.keys().next().value!);
+    }
+  }
+
+  #dropPreviousRun(id: string): void {
+    const previous = this.#previousRuns.get(id);
+    if (!previous) return;
+    this.#previousRunBytes -= previous.bytes;
+    this.#previousRuns.delete(id);
+  }
+
+  #forgetRunMetadata(id: string): void {
+    this.#dropPreviousRun(id);
+    if (this.#runs.has(id) || this.#queued.has(id)) return;
+    if (!this.#foregroundPrepared.has(id) || this.#foregroundDelivered.has(id)) {
+      this.#foregroundPrepared.delete(id);
+      this.#foregroundDelivered.delete(id);
+    }
+    for (const messageId of this.#followUps.get(id)?.keys() ?? []) this.#clearFollowUpTimer(messageId);
+    this.#followUps.delete(id);
+  }
+
+  #hasPreviousRun(id: string): boolean {
+    return !this.#runs.has(id) && this.#previousRuns.has(id);
   }
 
   /** Running (not settled) task agents: what a reload or shutdown would stop. */
@@ -3571,7 +4122,9 @@ export class AgentManager {
   // otherwise spawn refuses it and the marker is untouched), and it settles nothing: the actor commits after it
   // delivered the answer (commitEnodevRecovery). An uncommitted recovery keeps the marker and the answer.
   #recoverEnodevRun(request: AgentRunRequest, signal?: AbortSignal, authorize?: () => boolean): AgentRunResult | undefined {
-    if (!request.actorId || !request.activationId || process.platform !== "linux") return undefined;
+    if (!request.actorId || !request.activationId) return undefined;
+    // The receipt is Linux ENODEV evidence, but replay needs no Linux APIs:
+    // peekEnodevRun still requires a provably dead worker on every platform.
     if (signal?.aborted || (authorize && !authorize())) return undefined;
     this.#enodevRuns ??= enodevUnresolvedRuns(this.#runRoot);
     for (const directory of this.#enodevRuns) {
@@ -3597,12 +4150,21 @@ export class AgentManager {
   commitEnodevRecovery(runId: string): boolean {
     const pending = this.#enodevCommits.get(runId);
     if (!pending) return false;
+    const recovered = peekEnodevRun(pending.directory, pending.actorId, pending.activationId);
+    if (!recovered) return false;
+    // Keep the original recovery authority and obligation until both publication
+    // and its bounded authenticated index exist. Disk-only results are never adopted.
+    const result = { ...recovered, enodevDelivered: true };
+    const resultFile = path.join(pending.directory, MANAGER_RESULT_FILE);
+    const fingerprint = writePrivateJsonAtomic(resultFile, result);
+    this.#rememberPreviousRun(result, resultFile, fingerprint);
+    // Pin peek's finishedAt and truncated receipt in the secondary status record
+    // so settle's later observation cannot select a different terminal timestamp.
+    writeJsonAtomic(path.join(pending.directory, "status.json"), result, { durable: true });
+    if (!settleEnodevRun(pending.directory, pending.actorId, pending.activationId)) return false;
+    this.#enodevSettledHere.add(runId);
     this.#enodevCommits.delete(runId);
-    const result = settleEnodevRun(pending.directory, pending.actorId, pending.activationId);
-    if (result) this.#enodevSettledHere.add(runId);
-    if (!result) return false;
     this.#enodevRuns = (this.#enodevRuns ?? []).filter(other => other !== pending.directory);
-    this.#previousRuns.set(result.id, structuredClone(result));
     this.#retentionRevision++;
     this.#releaseProvenGone(); // smarty-dev#9855: same step as the settle
     return true;
@@ -3623,11 +4185,11 @@ export class AgentManager {
       this.#enodevRuns = this.#enodevRuns.filter(other => other !== directory);
       this.#retentionRevision++;
       if (enodevDelivered(directory, path.basename(directory), activationId)) {
-        console.warn(`[pi-fabric] actor ${actorId}: run ${path.basename(directory)} settled as delivered: its activation ` +
+        diagnostics.warn("src/agents/manager.ts", `[pi-fabric] actor ${actorId}: run ${path.basename(directory)} settled as delivered: its activation ` +
           `${activationId} was delivered and acknowledged before a restart (ENODEV, smarty-dev#8935)`);
         continue;
       }
-      console.warn(`[pi-fabric] actor ${actorId}: run ${path.basename(directory)} settled as lost: its activation ${activationId} ` +
+      diagnostics.warn("src/agents/manager.ts", `[pi-fabric] actor ${actorId}: run ${path.basename(directory)} settled as lost: its activation ${activationId} ` +
         "is no longer pending and its worker exit was unconfirmed (ENODEV, smarty-dev#8935)");
     }
     this.#releaseProvenGone(); // smarty-dev#9855: a run this settle proved gone frees its held permit in the same step
@@ -3643,7 +4205,12 @@ export class AgentManager {
   #previousRun(id: string): AgentRunResult | undefined {
     const previous = this.#runs.has(id) ? undefined : this.#previousRuns.get(id);
     if (!previous) return undefined;
-    return structuredClone(previous);
+    const record = readAuthenticatedRecord(previous.resultFile, previous.resultFile, previous.fingerprint);
+    if (!record || record.id !== id || !terminalStatuses.has(record.status)) {
+      throw Object.assign(new Error(`Fabric agent ${id} has no saved terminal result at ${previous.resultFile}`),
+        { code: "FABRIC_MISSING_RESULT" as const });
+    }
+    return record as AgentRunResult;
   }
 
   async stop(id: string, options: { consume?: boolean } = {}): Promise<AgentRunResult> {
@@ -3663,9 +4230,11 @@ export class AgentManager {
       if (queued.cleanupPending) throw new Error(`Agent ${id} execution exit unconfirmed; custody retained: ${queued.cleanupPending}`);
       return queued.result;
     }
-    const previous = this.#previousRuns.get(id);
-    if (previous && !this.#runs.has(id)) return structuredClone(previous);
+    const previous = this.#previousRun(id);
+    if (previous) return previous;
     const managed = this.#requireRun(id);
+    // Preserve a loss proven before stop; an intentional stop is not itself loss proof.
+    const goneBeforeStop = this.#actorWorkerGone(managed);
     // A requested stop is terminal: record the intent before any transport work
     // so recovery never restarts a run the operator, a tool, or shutdown ended.
     managed.stopRequested = true;
@@ -3685,13 +4254,16 @@ export class AgentManager {
     if (managed.settled) return consumeSettled ? this.wait(id) : this.#settledResult(managed);
     managed.background = false;
     const terminal = readRecord(managed.statusFile);
+    if (goneBeforeStop && await this.#settleGoneActorWorker(managed, terminal ?? existing) && managed.settled) {
+      return consumeSettled ? this.wait(id) : this.#settledResult(managed);
+    }
     // A force-killed worker (notably on Windows) may leave only running status.
     // Its session telemetry can be newer than the monitor's last poll. Preserve
     // that snapshot, or the pre-stop one if stopping removed the status file,
     // before synthesizing a terminal result.
     const observed = terminal ?? existing;
     if (observed) {
-      managed.latestRecord = observed;
+      managed.latestRecord = compactUiRecord(observed);
       if (observed.runnerSessionId) managed.runnerSessionId = observed.runnerSessionId;
     }
     // Stop intent and tree custody are separate: uncertainty keeps the worker's
@@ -3722,6 +4294,7 @@ export class AgentManager {
       const cleaned = await this.#worktrees.cleanup(id, deleteBranch);
       if (!this.config.retainRuns) await this.#removeRunTree(runDirectory);
       this.#queued.delete(id);
+      this.#forgetRunMetadata(id);
       this.#invalidateUiList();
       return { cleaned: cleaned || !fs.existsSync(runDirectory) };
     }
@@ -3760,8 +4333,7 @@ export class AgentManager {
       await this.#removeRunTree(managed.runDirectory);
     }
     this.#runs.delete(id);
-    for (const messageId of this.#followUps.get(id)?.keys() ?? []) this.#clearFollowUpTimer(messageId);
-    this.#followUps.delete(id);
+    this.#forgetRunMetadata(id);
     this.#pruneRetainedUiRecords();
     this.#invalidateUiList();
     return { cleaned: cleaned || !fs.existsSync(managed.runDirectory) };
@@ -3773,7 +4345,7 @@ export class AgentManager {
     const logFile = path.join(runDirectory, "events.jsonl");
     const lines = Math.max(1, Math.min(opts.lines ?? 200, 5000));
     const page = readJsonlPage(logFile, lines, opts.before, undefined, opts.beforeGeneration);
-    const statusRecord = readRecord(path.join(runDirectory, "status.json"));
+    const statusRecord = this.#readResult(managed);
     return {
       id,
       runDirectory,
@@ -3878,7 +4450,7 @@ export class AgentManager {
   // turn channel to steer into. Reject steer/follow-up here so callers learn
   // at call time instead of the command being silently dropped by the worker.
   #requireSteerable(id: string, kind: "steer" | "followUp" = "steer"): void {
-    const previous = this.#previousRun(id);
+    const previous = this.#runs.has(id) ? undefined : this.#previousRuns.get(id)?.summary;
     if (previous?.runner === "pi" && previous.finalAnswerReceipt && !previous.actorId) {
       throw new FabricTargetTerminalError(previous.id, previous.finalAnswerReceipt.id,
         terminalStatuses.has(previous.status) ? previous.status as AgentRunResult["status"] : "final-answer-recorded");
@@ -3957,10 +4529,14 @@ export class AgentManager {
 
   /** Name the run state: the validated result status, or pending while the receipt's result settles. */
   #terminalError(managed: ManagedAgent): FabricTargetTerminalError {
-    return new FabricTargetTerminalError(managed.id, managed.finalAnswer!.id, managed.finalAnswerResult?.status ?? "final-answer-pending");
+    return new FabricTargetTerminalError(managed.id, managed.finalAnswer!.id,
+      managed.finalAnswerResult?.status ?? managed.finalAnswerStatus ?? "final-answer-pending");
   }
 
   #runDeletionPaths(runDirectory: string): string[] {
+    // A preparation/commit rejection may never have allocated a run path. Match
+    // main's no-op cleanup for that case; an existing path still gets full control validation.
+    if (!fs.lstatSync(runDirectory, { throwIfNoEntry: false })) return [];
     // Judge every path first, then remove the run before its host metadata.
     // A failed run removal must not leave a protected run with erased controls.
     // Controls: the CENTRAL directory (outside the run tree), a validated old
@@ -4084,6 +4660,7 @@ export class AgentManager {
         managed.onOutputPrincipalDowngrade?.();
       }
     }
+    // The central route namespace is the sole steering admission channel.
     appendTerminalAdmission(managed.runDirectory, line);
     const undelivered = entry.type === "steer" || entry.type === "follow_up"
       ? this.#appendRaceRefusal(managed, messageId, entry.type === "steer" ? "steer" : "followUp") : undefined;
@@ -4233,6 +4810,9 @@ export class AgentManager {
     return this.#closePromise ??= this.#close().catch(error => {
       this.#closePromise = undefined; // retain exact custody for a later close retry
       throw error;
+    }).finally(() => {
+      this.#admissionSnapshotClosed = true;
+      this.#flushAdmissionSnapshot();
     });
   }
 
@@ -4310,8 +4890,13 @@ export class AgentManager {
           // Only sweep-owned managed roots retain unsuccessful terminal prompts.
           // Explicit roots (including judge runs) and completed runs keep whole-tree
           // deletion. Retention errors preserve custody rather than authorize deletion.
+          // Validate the exact result before any collection attempt, including
+          // explicit roots: an unexpected loss keeps custody and a loud refusal.
+          if (managed.settledResultFile && !this.#exactResultPresent(managed)) return;
           if (await this.#retainTerminalPromptRecord(managed).catch(() => true)) return;
           await this.#removeRunTree(managed.runDirectory).catch(() => undefined);
+          // A no-op removal or remaining/dangling entry is not collection.
+          if (managed.settledResultFile && pathAbsentNoFollow(managed.settledResultFile)) managed.resultCollected = true;
         }));
     }
     // A failed stop is not authority to delete a child's working files.
@@ -4416,7 +5001,10 @@ export class AgentManager {
       // Retry settlement saves first; pending deliveries and unsafe contents still veto expiry.
       if (!canRemoveTerminalRun(managed.runDirectory)) continue;
       await this.#removeRunTree(managed.runDirectory).catch(() => undefined);
-      if (!fs.existsSync(managed.runDirectory)) this.#runs.delete(managed.id);
+      if (!fs.existsSync(managed.runDirectory)) {
+        this.#runs.delete(managed.id);
+        this.#forgetRunMetadata(managed.id);
+      }
     }
     if (expired.length > 0) {
       this.#pruneRetainedUiRecords();
@@ -4468,6 +5056,9 @@ export class AgentManager {
    * cannot erase the outstanding Windows tree-helper obligation. */
   #stopManagedTransport(managed: ManagedAgent): Promise<void> {
     if (managed.transport.kind !== "process") return managed.transport.stop();
+    // A stop can synchronously report native debt/close before the monitor
+    // observes terminal status. Claim its normal terminal join before that work.
+    this.#fenceNativeTerminalAdmission(managed);
     if (managed.processStop) return managed.processStop;
     managed.processStopPending = true;
     let resolve!: () => void;
@@ -4582,6 +5173,8 @@ export class AgentManager {
   }
 
   #markLost(managed: ManagedAgent, reason: string): void {
+    // A manager-side failure must not erase a normal terminal join's ownership.
+    this.#fenceNativeTerminalAdmission(managed);
     managed.lostContact = reason;
     try {
       markUnresolvedWorker(managed.runDirectory, reason, {
@@ -4590,6 +5183,14 @@ export class AgentManager {
         ...(managed.transport.sessionId ? { sessionId: managed.transport.sessionId } : {}),
       });
     } catch { /* the in-memory mark still guards this manager */ }
+    // Monitor failures can stop before #settle, whose actor publication fence
+    // also precedes normal held-permit registration. Keep the raw admission
+    // visible here, without substituting result settlement for native custody.
+    if (managed.actorId && managed.transport.kind === "process" && managed.admissionRelease) {
+      managed.heldPermit ??= managed.admissionRelease;
+      this.#releaseProvenGone();
+      this.#checkHeldPermits();
+    }
   }
 
   async #transportAliveUntil(transport: AgentTransportHandle, deadline: number): Promise<boolean> {
@@ -4629,6 +5230,7 @@ export class AgentManager {
     deadline: number,
   ): Promise<boolean> {
     if (
+      this.#actorWorkerGone(managed) ||
       managed.launch.workerArguments.includes("--judgment") ||
       managed.transport.relaunchable === false ||
       managed.hosted ||
@@ -4684,6 +5286,7 @@ export class AgentManager {
     deadline: number,
   ): Promise<boolean> {
     if (
+      this.#actorWorkerGone(managed) ||
       managed.launch.workerArguments.includes("--judgment") ||
       managed.transport.relaunchable === false ||
       // Fabric never re-prompts a hosted run, and only its own worker
@@ -4737,7 +5340,13 @@ export class AgentManager {
     const pending = Promise.resolve().then(() => this.#relaunchAttempt(managed, record, resume, deadline));
     managed.relaunchPending = pending;
     try { return await pending; }
-    finally { delete managed.relaunchPending; }
+    finally {
+      delete managed.relaunchPending;
+      // Actor retry completion is an event, not a poll: a retry refused before
+      // launch can now release its old proven-dead attempt. Launch rejections
+      // retain the existing missing-ownProcess fence below.
+      if (managed.actorId) this.#releaseProvenGone();
+    }
   }
 
   async #relaunchAttempt(
@@ -4747,7 +5356,7 @@ export class AgentManager {
     deadline = Infinity,
   ): Promise<boolean> {
     try {
-      const cancelled = () => managed.settled || this.#closing || managed.stopRequested || managed.abandoned || Date.now() >= deadline;
+      const cancelled = () => this.#actorWorkerGone(managed) || managed.settled || this.#closing || managed.stopRequested || managed.abandoned || Date.now() >= deadline;
       while (this.#releasePaused) await this.#waitForRelease(managed.abortSignal);
       if (cancelled()) return false;
       if (managed.runner === "pi" || managed.runner === "pi-durable") {
@@ -4857,9 +5466,10 @@ export class AgentManager {
       // until the launch resolves, so nothing can be proven gone in between (or ever, if the launch is unknown).
       delete managed.ownProcess;
       const transport = await this.#launchTransport(managed.adapter, managed.launch);
-      // Stop receipts belong to one transport attempt, not the run id. Install
-      // the replacement and its fresh custody together, after launch resolves.
+      // Stop/death receipts belong to one transport attempt, not the run id.
+      // Install the replacement and invalidate old proof without yielding.
       managed.transport = transport;
+      delete managed.workerGone;
       const owned = transport.kind === "process" ? ownedProcess(transport.sessionId) : undefined;
       if (owned) managed.ownProcess = owned;
       managed.executionExited = false;
@@ -4913,7 +5523,7 @@ export class AgentManager {
         error: `${record.error ?? "Agent run failed"} · relaunch failed: ${retryError}`,
       }, managed, false);
       writeRecord(managed.statusFile, failed);
-      managed.latestRecord = failed;
+      managed.latestRecord = compactUiRecord(failed);
       managed.relaunchFailure = failed;
       return false;
     }
@@ -4923,12 +5533,16 @@ export class AgentManager {
   #observeFinalAnswer(managed: ManagedAgent): boolean {
     if (managed.actorId || managed.runner !== "pi" || managed.transport.kind !== "process") return false;
     if (managed.finalAnswer) return true;
+    // Settlement already authenticated its outcome; a later worker receipt
+    // cannot create a new finalAnswerResult or replace that terminal boundary.
+    if (managed.settled) return false;
     let observedReceipt: FinalAnswerReceipt | undefined;
     try { observedReceipt = readFinalAnswerReceipt(managed.runDirectory, managed.id); }
     catch { return false; /* Unsafe metadata grants no finality, but must not block native stop/drain. */ }
     if (!observedReceipt) return false;
     const receipt = observedReceipt;
-    managed.finalAnswer = receipt; // Fence synchronous ingress before any validation yields.
+    managed.finalAnswer = { ...receipt, text: "" }; // Fence ingress; the receipt's full text stays on disk.
+    this.#noteAdmissionProgress(managed.id);
     managed.finalAnswerCompletion = (async () => {
       let snapshot = readRecord(managed.statusFile) ?? managed.latestRecord;
       {
@@ -4949,6 +5563,9 @@ export class AgentManager {
         finishedAt: receipt.recordedAt,
       } as AgentRunResult;
       if (record.status === "completed") record.text = receipt.text;
+      // Native-close continuations share this receipt's lexical context. They
+      // need its identity, not a second full answer while custody is pending.
+      receipt.text = "";
       const schemaIndex = managed.launch.workerArguments.indexOf("--schema-file");
       if (schemaIndex >= 0 && record.status === "completed") {
         if (managed.launch.workerArguments.includes("--reply-tool") &&
@@ -5047,6 +5664,72 @@ export class AgentManager {
     this.#terminalNoticeOutbox.route(managed.runDirectory);
   }
 
+  #actorWorkerGone(managed: ManagedAgent, recheck = false): boolean {
+    if (!managed.actorId || managed.hosted || managed.transport.kind !== "process" || !managed.ownProcess) return false;
+    // ownProcess is absent throughout replacement creation, and stays absent
+    // after an UNKNOWN launch. Even cached old proof has no authority in that gap.
+    const transport = managed.transport;
+    const identity = this.#workerIdentities.get(transport);
+    if (!identity || managed.ownProcess.pid !== identity.pid || !Number.isSafeInteger(identity.pid) || identity.pid <= 1 || identity.pid === process.pid) return false;
+    // A proof collected before native reconciliation cannot discharge its join.
+    if (recheck) delete managed.workerGone;
+    if (managed.workerGone === transport) return true;
+    try { process.kill(identity.pid, 0); }
+    catch (error) {
+      // EPERM and every other probe error are unknown, not permission to compare births.
+      if ((error as NodeJS.ErrnoException).code === "ESRCH") managed.workerGone = transport;
+      return managed.workerGone === transport;
+    }
+    const current = processStartTime(identity.pid);
+    if (identity.startTime?.trim() && current?.trim() && current !== identity.startTime) managed.workerGone = transport;
+    return managed.workerGone === transport;
+  }
+
+  /** Transfer normal Windows terminal admission before ANY primary-death release scan. */
+  #fenceNativeTerminalAdmission(managed: ManagedAgent, record?: AgentRunRecord): boolean {
+    if (managed.finalAnswer || managed.transport.kind !== "process" || process.platform !== "win32" ||
+        !managed.transport.waitForClose || managed.launchCancelled || managed.transport.lostContact?.() || managed.lostContact) return false;
+    const candidate = record ?? readRecord(managed.statusFile);
+    if (candidate?.id !== managed.id || !terminalWorkerResult(candidate)) return false;
+    // Existing lost-worker/debt custody keeps its intentional RUN-only proof
+    // path. A normal terminal path stays fenced until the captured close/stop
+    // joins or a rejected/bounded join is reconciled with fresh host proof.
+    managed.nativeAdmissionFenced = true;
+    return true;
+  }
+
+  /** A leader's death forbids replay, but never substitutes for the whole native/tree join. */
+  async #settleGoneActorWorker(managed: ManagedAgent, record: AgentRunRecord | undefined): Promise<boolean> {
+    if ((managed.stopRequested && managed.workerGone !== managed.transport) || !this.#actorWorkerGone(managed)) return false;
+    // Preserve genuine terminal results; only missing/recoverable transport outcomes become loss.
+    // Like #retryStartup, a window refusal outranks incidental auth/transport diagnostics.
+    if (this.#fenceNativeTerminalAdmission(managed, record)) return false;
+    // Nonterminal primary loss releases only RUN, even while its tree remains live.
+    this.#releaseProvenGone();
+    // Primary loss is not a stop request: descendants may still own the native
+    // session, including after actor abandonment. Observe their voluntary exit
+    // before joining; #drainExecution would otherwise actively kill that tree.
+    // The existing close wake/status monitor retries this bounded observation.
+    try {
+      if (!managed.executionExited &&
+          await this.#transportAliveUntil(managed.transport, Date.now() + TRANSPORT_EXIT_GRACE_MS)) return true;
+      if (terminalWorkerResult(record)) return false;
+      await this.#drainExecution(managed);
+    } catch { return true; }
+    if (!managed.executionExited) return true;
+    // Final publication may race the join. Do not replace a committed success (or
+    // genuine worker failure) with the earlier running/missing snapshot's loss.
+    const joined = readRecord(managed.statusFile);
+    const result = joined && terminalWorkerResult(joined)
+      ? this.#withTransportMetadata(joined, managed) as AgentRunResult
+      : { ...failedRecord(managed, "failed", "Actor worker is proven gone; execution was lost and will not be automatically relaunched"),
+        startedAt: joined?.startedAt ?? record?.startedAt ?? Date.now() };
+    if (!terminalWorkerResult(joined)) writeRecord(managed.statusFile, result);
+    await this.#captureWorktree(managed);
+    this.#settle(managed, result);
+    return true;
+  }
+
   async #monitor(managed: ManagedAgent, timeoutMs: number): Promise<void> {
     const deadline = Date.now() + timeoutMs + TRANSPORT_EXIT_GRACE_MS;
     let firstObservedDeadAt: number | undefined;
@@ -5060,7 +5743,12 @@ export class AgentManager {
         const transport = watchedTransport = managed.transport;
         nativeClosePending = false;
         void transport.closed?.then(() => {
-          if (managed.transport !== transport || managed.settled) return;
+          if (managed.transport !== transport) return;
+          // An earlier monitor failure may have left only lost-contact custody.
+          // This exact current close is an event to recheck host PID/birth proof,
+          // never proof by itself and never permission to publish an actor result.
+          if (managed.actorId) this.#releaseProvenGone();
+          if (managed.settled) return;
           nativeClosePending = true;
           wake?.();
         }, () => { /* notification is not exit proof */ });
@@ -5080,8 +5768,10 @@ export class AgentManager {
       this.#checkFollowUps(managed, record);
       if (record) {
         this.#observeProgress(managed, record);
-        const previous = managed.latestRecord;
-        managed.latestRecord = record;
+        // Compare with the published UI projection: status() may already have
+        // refreshed latestRecord from the same disk record.
+        const previous = managed.latestUiRecord;
+        managed.latestRecord = compactUiRecord(record);
         if (
           !previous ||
           previous.updatedAt !== record.updatedAt ||
@@ -5089,11 +5779,17 @@ export class AgentManager {
           previous.runnerSessionId !== record.runnerSessionId ||
           previous.currentTool !== record.currentTool
         ) {
-          managed.latestUiRecord = compactUiRecord(record);
+          managed.latestUiRecord = managed.latestRecord;
           this.#invalidateUiList();
         }
       }
+      if (await this.#settleGoneActorWorker(managed, record)) {
+        if (managed.settled) return;
+        await delay(AGENT_STATUS_POLL_INTERVAL_MS);
+        continue;
+      }
       if (managed.recursive) this.#nestedAgents(managed);
+      this.#pruneRetainedUiRecords();
       if (record?.runnerSessionId) {
         managed.runnerSessionId = record.runnerSessionId;
       }
@@ -5104,6 +5800,11 @@ export class AgentManager {
         if (await this.#resumeStopped(managed, record, deadline)) continue;
         // A relaunch that failed is terminal: no fallback launch may run after it.
         if (!managed.relaunchFailure && await this.#retryStartup(managed, record, deadline)) continue;
+        if (await this.#settleGoneActorWorker(managed, record)) {
+          if (managed.settled) return;
+          await delay(AGENT_STATUS_POLL_INTERVAL_MS);
+          continue;
+        }
         // Terminal publication may precede a worker's final native-session flush.
         // Give normal process exit a bounded observation window before stop():
         // on Windows SIGTERM is destructive, not a cooperative flush request.
@@ -5208,6 +5909,11 @@ export class AgentManager {
                 ? `Agent transport exited without a result; ${diagnostic}`
                 : "Agent transport exited without a result",
             );
+            if (await this.#settleGoneActorWorker(managed, failed)) {
+              if (managed.settled) return;
+              await delay(AGENT_STATUS_POLL_INTERVAL_MS);
+              continue;
+            }
             if (await this.#resumeStopped(managed, failed, deadline)) continue;
             if (!managed.relaunchFailure && await this.#retryStartup(managed, failed, deadline)) {
               managed.lastRetriedTransportFailure = failed;
@@ -5242,6 +5948,7 @@ export class AgentManager {
 
   #settle(managed: ManagedAgent, result: AgentRunResult): void {
     if (managed.settled) return;
+    this.#fenceNativeTerminalAdmission(managed, result);
     if (managed.worktreeResult) result.worktreeResult = managed.worktreeResult;
     // Every terminal path (including explicit stop and lost transport) gets a
     // final unthrottled read before freezing the nested status tree.
@@ -5253,13 +5960,18 @@ export class AgentManager {
     if (managed.actorId && !managed.executionExited &&
         !(managed.transport.kind === "process" && process.platform === "win32" &&
           managed.transport.waitForClose && !managed.launchCancelled &&
-          (!managed.transport.lostContact?.() || this.#hasNativeStopDebt(managed)))) return;
+          (!managed.transport.lostContact?.() || this.#hasNativeStopDebt(managed)))) {
+      const lost = managed.transport.lostContact?.() ?? managed.lostContact;
+      if (lost) this.#markLost(managed, lost);
+      return;
+    }
     this.#drainLifecycle(managed);
     // The result boundary reports unconsumed admissions as run-ended now, before native exit.
     if (managed.finalAnswer) try { this.#refuseUnreadTerminalControls(managed); } catch { /* exit scan retries */ }
     const lost = managed.transport.lostContact?.();
     if (lost) this.#markLost(managed, lost);
-    if (managed.transport.kind === "process" && managed.lostContact) {
+    if (managed.transport.kind === "process" && managed.lostContact &&
+        (!managed.actorId || managed.admissionRelease)) {
       // Reporting a terminal result is allowed; releasing native admission is not.
       // An uncertain Windows tree can still contain untracked native descendants.
       // smarty-dev#9855: the permit is held, not lost: a later proof of exit releases it once.
@@ -5271,24 +5983,54 @@ export class AgentManager {
       const transport = managed.transport;
       void transport.closed?.then(() => this.#releaseProvenGone(), () => this.#releaseProvenGone());
     }
-    if (!managed.finalAnswer && managed.transport.kind === "process" && process.platform === "win32" &&
-        managed.transport.waitForClose && !managed.lostContact && !managed.processStop) {
-      // The logical result can precede native close. Keep its permit while a
-      // later explicit stop may still acquire a Windows tree-helper obligation.
+    if (!managed.executionExited && !managed.finalAnswer && managed.transport.kind === "process" && process.platform === "win32" &&
+        managed.transport.waitForClose && !managed.lostContact && !managed.launchCancelled) {
+      // A completed host drain already joined and proved exit; do not reopen its release fence.
+      // The logical result can precede native close. An existing stop is also
+      // an ownership obligation, not a reason to omit the native release join.
+      // This ownership outlives nativeReleasePending when close is unconfirmed.
+      managed.nativeAdmissionFenced = true;
+      const transport = managed.transport;
+      const processStop = managed.processStop;
       const release = managed.release;
       managed.release = () => {
-        managed.nativeReleasePending = Promise.resolve().then(async () => {
-          await managed.transport.waitForClose!();
-          // Stop may have begun after settlement, while native close was pending.
-          await managed.processStop;
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const pending = Promise.resolve().then(async () => {
+          // Native events drive the normal path. One safety-net deadline uses
+          // the existing stop/close budget; a hung join cannot hide RUN forever.
+          const joined = await Promise.race([
+            (async () => {
+              await transport.waitForClose!();
+              await processStop;
+              if (managed.transport !== transport) return false;
+              // Stop may have begun after settlement, while native close was pending.
+              await managed.processStop;
+              return managed.transport === transport;
+            })(),
+            new Promise<never>((_, reject) => {
+              timer = setTimeout(() => reject(new Error("Worker exit confirmation timed out")), TRANSPORT_EXIT_GRACE_MS * 7);
+            }),
+          ]);
+          if (timer) clearTimeout(timer);
+          if (!joined) return;
           await this.#noteUnconfirmedExit(managed);
-          if (!managed.lostContact) {
+          if (managed.transport === transport && !managed.lostContact) {
             fs.rmSync(path.join(managed.runDirectory, "images.json"), { force: true });
             release();
           }
         }).catch(error => {
-          this.#markLost(managed, error instanceof Error ? error.message : String(error));
-        }).finally(() => { delete managed.nativeReleasePending; this.#retentionRevision++; });
+          if (managed.transport === transport) {
+            // Eligibility is not proof. #markLost scans the same host PID/birth
+            // path now, and subsequent admission/native events retry if alive.
+            managed.nativeAdmissionReconcile = transport;
+            this.#markLost(managed, error instanceof Error ? error.message : String(error));
+          }
+        }).finally(() => {
+          if (timer) clearTimeout(timer);
+          if (managed.nativeReleasePending === pending) delete managed.nativeReleasePending;
+          this.#retentionRevision++;
+        });
+        managed.nativeReleasePending = pending;
       };
     }
     if (!beginAgentSettlement(managed)) return;
@@ -5326,6 +6068,8 @@ export class AgentManager {
     const reported = this.#withTransportMetadata(result, managed) as AgentRunResult;
     finishAgentSettlement(managed, reported);
     managed.task = "";
+    delete managed.lastRetriedTransportFailure;
+    delete managed.relaunchFailure;
     this.#notifyBackgroundComplete(managed, reported);
   }
 
@@ -5488,6 +6232,14 @@ export class AgentManager {
   #saveSettledResult(managed: ManagedAgent, result: AgentRunResult): boolean {
     try {
       const full = this.#withTransportMetadata(result, managed, false) as AgentRunResult;
+      // The worker can still rewrite status.json during native teardown. Publish
+      // our exact validated outcome to a manager-only file before dropping full
+      // completion caches; a failed save retains the full retry/custody debt.
+      const resultFile = path.join(managed.runDirectory, MANAGER_RESULT_FILE);
+      const fingerprint = writePrivateJsonAtomic(resultFile, full);
+      managed.settledResultFile = resultFile;
+      managed.resultFingerprint = fingerprint;
+      delete managed.resultCollected;
       if (managed.routeOutcome || this.#onSettled) this.#stageArchive(managed.runDirectory, full, "settlement", undefined, !managed.routeOutcome);
       managed.routeOutcome?.(result);
       this.#onSettled?.(full);
@@ -5495,6 +6247,16 @@ export class AgentManager {
       else if (this.#onStoppedAtClose && !this.#closing) commitRunArchive(managed.runDirectory);
       if (managed.settlementSaveFailure) this.#retentionRevision++;
       delete managed.settlementSaveFailure;
+      managed.settledSummary = {
+        status: full.status, startedAt: full.startedAt, updatedAt: full.updatedAt, turns: full.turns, toolCalls: full.toolCalls,
+        usage: { ...full.usage },
+        ...(full.finishedAt !== undefined ? { finishedAt: full.finishedAt } : {}),
+        ...(full.exitCode !== undefined ? { exitCode: full.exitCode } : {}),
+        ...(full.error !== undefined ? { error: uiText(full.error, SETTLED_SUMMARY_ERROR_CHARS) } : {}),
+      };
+      // Main's terminal refusal reports the associated validated status; keep only that scalar.
+      if (managed.finalAnswerResult) managed.finalAnswerStatus = managed.finalAnswerResult.status;
+      delete managed.finalAnswerResult;
       return true;
     } catch (error) {
       managed.settlementSaveFailure = {
@@ -5509,8 +6271,12 @@ export class AgentManager {
 
   async #retainTerminalPromptRecord(managed: ManagedAgent): Promise<boolean> {
     if (!this.#managedTempRoot) return false;
-    const record = readRecord(managed.statusFile) ?? managed.latestRecord;
+    // The manager's exact validated outcome governs retention. A worker can still
+    // have written a completed status.json after host validation failed the run.
+    const record = this.#readResult(managed) ?? managed.latestRecord;
     if (!record || (record.status !== "failed" && record.status !== "stopped" && record.status !== "timed_out")) return false;
+    const resultFile = managed.settledResultFile;
+    const keepResult = resultFile === path.join(managed.runDirectory, MANAGER_RESULT_FILE) && this.#exactResultPresent(managed);
     const promptFile = path.join(managed.runDirectory, "task.txt");
     const stat = ownedStat(promptFile);
     const expectedSha256 = managed.inputSha256 ?? record.inputSha256;
@@ -5526,15 +6292,27 @@ export class AgentManager {
     }
     // Persist the manager's authoritative metadata before removing every other
     // artifact. A verified current task.txt and status.json are the complete
-    // retained proof; a mismatch retains status.json only.
+    // retained proof; a mismatch drops task.txt. The manager's exact outcome stays
+    // beside status.json with only its task fields removed; every other field is
+    // kept uncompacted. status.json stays compact and taskless.
+    if (keepResult && resultFile) managed.resultFingerprint = writePrivateJsonAtomic(resultFile, omitRetainedTasks(record));
     writeJsonAtomic(managed.statusFile, omitRetainedTasks(compactUiRecord(this.#withTransportMetadata(record, managed, false))), { space: 2 });
     for (const entry of fs.readdirSync(managed.runDirectory)) {
-      if (entry === "status.json" || (entry === "task.txt" && currentMatches)) continue;
+      if (entry === "status.json" || (entry === "task.txt" && currentMatches) || (entry === MANAGER_RESULT_FILE && keepResult)) continue;
       await removeTree(path.join(managed.runDirectory, entry));
     }
     // Once an unsuccessful run has a retained status, never fall back to deleting its
     // whole tree. Any cleanup error propagates to the close custody fence.
     return true;
+  }
+
+  /** The manager's own exact terminal result file (no replacement/mutation/symlink). */
+  #exactResultPresent(managed: ManagedAgent): boolean {
+    const file = managed.settledResultFile;
+    const expectedFile = path.join(managed.runDirectory, MANAGER_RESULT_FILE);
+    if (!file || path.resolve(file) !== path.resolve(expectedFile)) return false;
+    const result = readAuthenticatedRecord(file, expectedFile, managed.resultFingerprint);
+    return result?.id === managed.id && terminalStatuses.has(result.status);
   }
 
   #canCollect(managed: ManagedAgent): boolean {
@@ -5591,23 +6369,29 @@ export class AgentManager {
         const parsed = JSON.parse(line) as Record<string, unknown>;
         if (parsed.version !== 1 || typeof parsed.occurredAt !== "number") continue;
         if (parsed.event === "message.refused") {
+          this.#noteAdmissionProgress(managed.id);
           this.#retainTerminalNotice(managed, parsed.data);
           continue;
         }
         if (parsed.event === "question") {
+          this.#noteAdmissionProgress(managed.id);
           this.#routeChildQuestion(managed, parsed.data);
           continue;
         }
         if (parsed.event === "tokens.usage") {
           if (!Object.prototype.hasOwnProperty.call(parsed, "data")) continue;
           const usage = tokenUsagePayloadFromValue(parsed.data);
-          if (usage) this.#onTokenUsage(managed, usage, parsed.occurredAt);
+          if (usage) {
+            this.#noteAdmissionProgress(managed.id);
+            this.#onTokenUsage(managed, usage, parsed.occurredAt);
+          }
           continue;
         }
         if (
           !isFabricLifecycleEventType(parsed.event) ||
           !parsed.event.startsWith("pi.")
         ) continue;
+        this.#noteAdmissionProgress(managed.id);
         this.#emitLifecycle(
           managed,
           parsed.event,
@@ -5716,6 +6500,7 @@ export class AgentManager {
     occurredAt: number,
     options: { status?: string; data?: unknown } = {},
   ): void {
+    if (event === "run.spawned" || event === "run.resumed") this.#noteAdmissionProgress(managed.id);
     if (!this.#onLifecycle) return;
     try {
       this.#onLifecycle({
@@ -5799,19 +6584,55 @@ export class AgentManager {
 
   #pruneRetainedUiRecords(): void {
     const settled = [...this.#runs.values()].filter((managed) => managed.settled);
-    const evicted = settled.slice(0, -MAX_RETAINED_RUN_HANDLES);
-    for (const managed of evicted) {
+    let handlesChanged = false;
+    for (const managed of settled.slice(0, -MAX_RETAINED_RUN_HANDLES)) {
       if (managed.executionExited && !managed.settlementSaveFailure && !managed.processStopPending &&
-          !managed.nativeReleasePending && !managed.lostContact && !hasUnresolvedWorker(managed.runDirectory)) this.#runs.delete(managed.id);
+          !managed.nativeReleasePending && !managed.lostContact && !hasUnresolvedWorker(managed.runDirectory) &&
+          !this.#terminalNoticeOutbox.hasPending(managed.runDirectory) &&
+          !this.#pendingAbandonment.has(managed.id) &&
+          (!this.#foregroundPrepared.has(managed.id) || this.#foregroundDelivered.has(managed.id))) {
+        this.#runs.delete(managed.id);
+        this.#forgetRunMetadata(managed.id);
+        handlesChanged = true;
+      }
     }
-    const retained = evicted.length > 0 ? settled.slice(evicted.length) : settled;
-    if (retained.length <= MAX_RETAINED_UI_RUNS) return;
-    for (const managed of retained.slice(0, -MAX_RETAINED_UI_RUNS)) {
+    const runs = [...this.#runs.values()];
+    const recent = [
+      ...runs.filter(managed => !managed.settled).reverse(),
+      ...runs.filter(managed => managed.settled).reverse(),
+    ];
+    let bytes = 0, count = 0;
+    for (const managed of recent) {
+      const snapshots = new Set<object>([managed.latestRecord, managed.latestUiRecord, managed.nestedSnapshot]
+        .filter((value): value is AgentRunRecord | AgentRunRecord[] => value !== undefined));
+      const size = [...snapshots].reduce((total, record) => total + uiPayloadBytes(record), 0);
+      if (size > 0 && count < MAX_RETAINED_UI_RUNS && bytes + size <= MAX_RETAINED_UI_SNAPSHOT_BYTES) {
+        bytes += size;
+        count++;
+        continue;
+      }
+      // Legacy nested workers can remove their source directories. Preserve
+      // that historical tree on disk before evicting its last cached copy.
+      if (managed.nestedSnapshot && !managed.settledResultFile) {
+        try {
+          writeJsonAtomic(path.join(managed.runDirectory, MANAGER_NESTED_FILE),
+            { id: managed.id, nestedAgents: managed.nestedSnapshot }, { durable: true });
+          managed.nestedSnapshotSaved = true;
+        } catch {
+          // A failed preservation is a data/custody debt, not eviction authority.
+          delete managed.latestRecord;
+          delete managed.latestUiRecord;
+          continue;
+        }
+      }
+      // Snapshot eviction is not handle/execution eviction. API reads reload
+      // disk records; admission, receipt fences and save/teardown debts stay owned.
       delete managed.latestRecord;
       delete managed.latestUiRecord;
       delete managed.nestedSnapshot;
       delete managed.nestedSnapshotAt;
     }
+    if (handlesChanged) this.#invalidateUiList();
   }
 
   #invalidateUiList(): void {
@@ -5829,7 +6650,7 @@ export class AgentManager {
   #requireRun(id: string): ManagedAgent {
     const managed = this.#runs.get(id);
     if (!managed) {
-      const previous = this.#previousRuns.get(id);
+      const previous = this.#previousRuns.get(id)?.summary;
       if (previous) {
         throw new Error(`Fabric agent ${previous.name} (${id}) is ${previous.status}: ${previous.error ?? "no error"}; it has no running target`);
       }
@@ -5883,6 +6704,14 @@ export class AgentManager {
   // Retain a bounded tree even when legacy workers removed their nested run
   // directories. Terminal-owner reconciliation prevents cached active ghosts.
   #nestedAgents(managed: ManagedAgent, force = false): AgentRunRecord[] {
+    if (managed.nestedSnapshot === undefined && managed.nestedSnapshotSaved) {
+      const saved = managed.settledResultFile
+        ? this.#readResult(managed)
+        : readRecord(path.join(managed.runDirectory, MANAGER_NESTED_FILE));
+      if (saved?.id === managed.id && Array.isArray(saved.nestedAgents) && saved.nestedAgents.length > 0) {
+        managed.nestedSnapshot = saved.nestedAgents.map(record => compactUiRecord(record));
+      }
+    }
     const now = Date.now();
     const needsInitialDiscovery =
       managed.nestedSnapshot === undefined &&
@@ -5893,7 +6722,9 @@ export class AgentManager {
       managed.nestedSnapshotAt !== undefined &&
       now - managed.nestedSnapshotAt < NESTED_SNAPSHOT_POLL_MS
     ) {
-      return managed.nestedSnapshot ? structuredClone(managed.nestedSnapshot) : [];
+      const snapshot = managed.nestedSnapshot;
+      this.#pruneRetainedUiRecords();
+      return snapshot ? structuredClone(snapshot) : [];
     }
     managed.nestedSnapshotAt = now;
     const discovered = readNestedAgents(managed.runDirectory);
@@ -5901,14 +6732,17 @@ export class AgentManager {
       managed.nestedSnapshot = discovered;
       this.#invalidateUiList();
     }
-    return managed.nestedSnapshot ? structuredClone(managed.nestedSnapshot) : [];
+    const snapshot = managed.nestedSnapshot;
+    this.#pruneRetainedUiRecords();
+    return snapshot ? structuredClone(snapshot) : [];
   }
 
   #withTransportMetadata(record: AgentRunRecord, managed: ManagedAgent, includeSaveFailure = true): AgentRunRecord {
-    const nestedAgents = reconcileNestedAgents(this.#nestedAgents(
-      managed,
-      terminalStatuses.has(record.status) && !managed.settled,
-    ), record);
+    // Settlement freezes the authenticated nested tree. Later worker snapshots
+    // cannot enrich it, and collected summaries deliberately carry no tree.
+    const observedNested = managed.settled ? [] : this.#nestedAgents(managed,
+      terminalStatuses.has(record.status));
+    const nestedAgents = reconcileNestedAgents(observedNested.length > 0 ? observedNested : record.nestedAgents ?? [], record);
     const budget = this.#budgetSummary();
     const { logFile: _logFile, nestedAgents: _nestedAgents, undeliveredMessages: _messages,
       undeliveredMessagesTotal: _total, undeliveredMessagesTruncated: _truncated, ...safeRecord } = record;

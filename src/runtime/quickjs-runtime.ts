@@ -7,7 +7,9 @@ import { isMeshRetryableBusy } from "../mesh/state-backend.js";
 import { cancellationError, preserveCancellationOutcome, runAbortable, settleWithin, shareCancellationEffects } from "../async-settlement.js";
 import { piBashExitMetadata } from "../core/pi-bash-error.js";
 import { FabricModelDeniedError } from "../core/model-policy.js";
+import { FabricModelNotServedError } from "../core/model-served-error.js";
 import { FabricTargetTerminalError } from "../agents/terminal-target.js";
+import { JevTransientHttpError } from "../jev/validation.js";
 import { PI_ARGUMENT_NORMALIZATION_SOURCE } from "../core/pi-arguments.js";
 import { PI_CORE_TOOL_NAMES } from "../core/pi-tools.js";
 import { HumanWaitDeadlinePause } from "./deadline-pause.js";
@@ -51,7 +53,10 @@ const GUEST_FABRIC_ERROR_NAMES: Readonly<Record<string, string>> = Object.freeze
   FABRIC_TASK_CONTROL_UNSAFE: "FabricTaskControlDirectoryError",
   FABRIC_STEER_JOURNAL_INVALID: "FabricSteerJournalError",
   FABRIC_PARTICIPANT_STALE: "FabricParticipantStaleError",
+  FABRIC_RELAY_DESTINATION_UNAVAILABLE: "FabricRelayDestinationUnavailableError",
+  FABRIC_IDEMPOTENCY_KEY_REUSED: "FabricIdempotencyKeyReusedError",
   FABRIC_PARTICIPANT_NOT_YET_MIRRORED: "FabricParticipantNotYetMirroredError",
+  FABRIC_PEER_LEASE_STALE: "FabricPeerLeaseStaleError",
   FABRIC_PARTICIPANT_NON_INTERACTIVE: "FabricParticipantNonInteractiveError",
   FABRIC_TASK_ESCALATION_TARGET_DENIED: "TaskEscalationTargetError",
   FABRIC_PROJECT_AGENT_UNRESOLVED: "FabricProjectAgentUnresolvedError",
@@ -62,6 +67,7 @@ const guestFabricErrorMetadata = (error: unknown): Record<string, string | boole
   if (!(error instanceof Error)) return undefined;
   // Preserve only the fixed policy classification, never arbitrary Error fields.
   if (error instanceof FabricModelDeniedError) return { name: "FabricModelDeniedError", code: "FABRIC_MODEL_DENIED" };
+  if (error instanceof FabricModelNotServedError) return { name: "FabricModelNotServedError", code: "FABRIC_MODEL_NOT_SERVED" };
   if (error instanceof FabricTargetTerminalError) return {
     name: "FabricTargetTerminalError", code: "FABRIC_TARGET_TERMINAL",
     targetId: error.targetId, finalAnswerReceiptId: error.finalAnswerReceiptId,
@@ -73,7 +79,7 @@ const guestFabricErrorMetadata = (error: unknown): Record<string, string | boole
   const metadata: Record<string, string | boolean> = { name, code };
   const retryable = Object.getOwnPropertyDescriptor(error, "retryable")?.value;
   if (typeof retryable === "boolean") metadata.retryable = retryable;
-  if (code === "FABRIC_PARTICIPANT_STALE") {
+  if (code === "FABRIC_PARTICIPANT_STALE" || code === "FABRIC_RELAY_DESTINATION_UNAVAILABLE" || code === "FABRIC_IDEMPOTENCY_KEY_REUSED") {
     // The public message schema bounds retry keys to 1-200 chars. Read only own
     // data properties: never invoke a host getter or export unrelated metadata.
     const key = Object.getOwnPropertyDescriptor(error, "idempotencyKey")?.value;
@@ -598,6 +604,7 @@ globalThis.agents = Object.freeze({
   setFollowUpMode: (args) => __call("agents.setFollowUpMode", args),
   compact: (args) => __call("agents.compact", args),
   actorStatus: (args) => __call("agents.actorStatus", args),
+  slotStatus: (args = {}) => __call("agents.slotStatus", args),
   instructions: (args) => __call("agents.instructions", args),
   setModel: (args) => __call("agents.setModel", args),
   switchModel: (args) => __call("agents.switchModel", args),
@@ -606,7 +613,9 @@ globalThis.agents = Object.freeze({
   setNice: (args) => __call("agents.setNice", args),
   setInferenceContext: (args) => __call("agents.setInferenceContext", args),
   setCoalesceKey: (args) => __call("agents.setCoalesceKey", args),
+  setBatching: (args) => __call("agents.setBatching", args),
   setActivationFilter: (args) => __call("agents.setActivationFilter", args),
+  setTopics: (args) => __call("agents.setTopics", args),
   setEvents: (args) => __call("agents.setEvents", args),
   setDeliveryPolicy: (args) => __call("agents.setDeliveryPolicy", args),
   clearMessages: (args) => __call("agents.clearMessages", args),
@@ -1230,6 +1239,18 @@ export class QuickJsRuntime {
                     metadata.dispose();
                   }
                 }
+                // Only the trusted Jev transient HTTP error may expose numeric
+                // status/retryAfterMs. They never replace vetted metadata: each
+                // key is still assigned once.
+                for (const [key, value] of trustedJevErrorFields(error)) {
+                  if (safeMetadata && Object.hasOwn(safeMetadata, key)) continue;
+                  const field = context.newNumber(value);
+                  try {
+                    context.setProp(errorHandle, key, field);
+                  } finally {
+                    field.dispose();
+                  }
+                }
                 promise.reject(errorHandle);
               } finally {
                 errorHandle.dispose();
@@ -1485,4 +1506,21 @@ export class QuickJsRuntime {
       disposeQuickJsContext(context);
     }
   }
+}
+
+/**
+ * Numeric HTTP metadata from the trusted Jev transient error class only.
+ * Arbitrary host errors (including a `guestFields` map) never set numeric
+ * fields. Reads own data-property descriptors, so no accessor is invoked.
+ */
+function trustedJevErrorFields(error: unknown): Array<[string, number]> {
+  if (!(error instanceof JevTransientHttpError)) return [];
+  const fields: Array<[string, number]> = [];
+  for (const key of ["status", "retryAfterMs"] as const) {
+    const descriptor = Object.getOwnPropertyDescriptor(error, key);
+    if (!descriptor || !("value" in descriptor)) continue;
+    const value: unknown = descriptor.value;
+    if (typeof value === "number" && Number.isFinite(value)) fields.push([key, value]);
+  }
+  return fields;
 }

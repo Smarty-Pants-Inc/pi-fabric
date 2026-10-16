@@ -1,11 +1,13 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { loadFabricConfig, normalizeFabricConfig } from "../src/config.js";
 import { preflightFleetPlacement, placementLocalPathReason } from "../src/agents/transports/placement-preflight.js";
 import type { AgentTransportLaunch } from "../src/agents/types.js";
+import { AgentInputError } from "../src/agents/input-validation.js";
 
 const roots: string[] = [];
 afterEach(() => {
@@ -13,8 +15,11 @@ afterEach(() => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
-function fixture(options: { candidates?: string[]; pickerExit?: number; sshExit?: number } = {}) {
+function fixture(options: { candidates?: string[]; pickerExit?: number; sshExit?: number; executeRemote?: boolean } = {}) {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-placement-affinity-")); roots.push(base);
+  // The test runner allocates outside /srv/scratch; caller TMPDIR is private, not the portable workspace.
+  const callerTmp = path.join(base, "caller-tmp"); fs.mkdirSync(callerTmp);
+  vi.stubEnv("TMPDIR", callerTmp);
   const root = path.join(base, "install");
   const mkdir = (file: string) => fs.mkdirSync(path.dirname(file), { recursive: true });
   const write = (file: string, text: string) => { mkdir(file); fs.writeFileSync(file, text); };
@@ -29,14 +34,17 @@ function fixture(options: { candidates?: string[]; pickerExit?: number; sshExit?
     "sys.stdout.write('\\0'.join(['', '', '', '0'] + [p for file in paths for p in [file, file]]) + '\\0')",
   ].join("\n"));
   const bin = path.join(root, "bin"); fs.mkdirSync(bin, { recursive: true });
-  const fleet = path.join(bin, "smarty-task-ryzen2"); write(fleet, "#!/bin/sh\nexit 99\n"); fs.chmodSync(fleet, 0o700);
+  const fleet = path.join(bin, "smarty-task-ryzen2");
+  write(fleet, "#!/bin/sh\nprintf 'called\\n' >> \"$LAUNCH_CALLS\"\nprintf 'RYZEN2_TASK_ACCEPTED affinity on ryzen2\\n'\n"); fs.chmodSync(fleet, 0o700);
   const picker = path.join(base, "smarty-pick-host-fixture");
-  write(picker, `#!/bin/sh\nprintf '%s\\n' "$CANDIDATES"\nprintf 'eligible0=1 eligible1=1\\n' >&2\nexit "${options.pickerExit ?? 0}"\n`); fs.chmodSync(picker, 0o700);
+  write(picker, `#!/bin/sh\nprintf 'called\\n' >> "$PICKER_CALLS"\nprintf '%s\\n' "$CANDIDATES"\nprintf 'eligible0=1 eligible1=1\\n' >&2\nexit "${options.pickerExit ?? 0}"\n`); fs.chmodSync(picker, 0o700);
   const pathBin = path.join(base, "path"); fs.mkdirSync(pathBin);
   const python = path.join(pathBin, "python3");
   write(python, "#!/bin/sh\nexec /usr/bin/python3 \"$@\"\n"); fs.chmodSync(python, 0o700);
   const ssh = path.join(pathBin, "ssh");
-  write(ssh, `#!/bin/sh\nprintf 'called\\n' >> "$SSH_CALLS"\n${options.sshExit === 3 ? "printf 'PREFLIGHT_MISSING 1\\n'" : ":"}\nexit "${options.sshExit ?? 0}"\n`); fs.chmodSync(ssh, 0o700);
+  write(ssh, `#!/bin/sh\nprintf 'called\\n' >> "$SSH_CALLS"\n${options.executeRemote
+    ? 'for remote in "$@"; do :; done\nexec sh -c "$remote"'
+    : `${options.sshExit === 3 ? "printf 'PREFLIGHT_MISSING 1\\n'" : ":"}\nexit "${options.sshExit ?? 0}"`}\n`); fs.chmodSync(ssh, 0o700);
   const cwd = path.join(base, "workspace"); fs.mkdirSync(cwd);
   const config = normalizeFabricConfig({ agents: { placement: {
     default: "remote", command: [fleet, "--host", "auto", "--cwd", cwd, "--", "task"],
@@ -46,13 +54,27 @@ function fixture(options: { candidates?: string[]; pickerExit?: number; sshExit?
   const env = {
     ...process.env, PATH: `${pathBin}:${process.env.PATH}`,
     CANDIDATES: (options.candidates ?? ["ryzen2", "ryzen3"]).join("\n"),
-    SSH_CALLS: path.join(base, "ssh-calls"),
+    SSH_CALLS: path.join(base, "ssh-calls"), PICKER_CALLS: path.join(base, "picker-calls"), LAUNCH_CALLS: path.join(base, "launch-calls"),
   };
   const request = (cwdPath = cwd, needs: string[] = [], withRequires = true): AgentTransportLaunch => ({
     id: "affinity", name: "affinity", cwd: cwdPath, workerPath: "unused", workerArguments: [], needs,
     ...(withRequires ? { requires: [path.join(base, "target-only", "corpus.dat")] } : {}),
   });
-  return { base, root, cwd, config, env, request, picker, sshCalls: path.join(base, "ssh-calls") };
+  return { base, root, cwd, callerTmp, config, env, request, picker, sshCalls: env.SSH_CALLS, pickerCalls: env.PICKER_CALLS, launchCalls: env.LAUNCH_CALLS };
+}
+
+function localWorkerRequest(f: ReturnType<typeof fixture>, cwd = f.cwd) {
+  for (const key of ["PATH", "CANDIDATES", "SSH_CALLS", "PICKER_CALLS", "LAUNCH_CALLS"] as const) vi.stubEnv(key, f.env[key]);
+  const runDir = path.join(f.base, "run"); fs.mkdirSync(runDir);
+  const taskFile = path.join(runDir, "task.txt"); fs.writeFileSync(taskFile, "portable task");
+  const marker = path.join(runDir, "local-worker.txt");
+  const workerPath = path.join(f.base, "worker.mjs");
+  fs.writeFileSync(workerPath, `import fs from 'node:fs'; fs.writeFileSync(${JSON.stringify(marker)}, 'LOCAL');`);
+  const events = path.join(runDir, "events.jsonl");
+  const request = { ...f.request(cwd, [], false), workerPath, workerArguments: [
+    "--task-file", taskFile, "--status-file", path.join(runDir, "status.json"), "--log-file", events, "--timeout-ms", "1000",
+  ] };
+  return { request, marker, events };
 }
 
 // The installed fleet protocol is POSIX-only; Windows has no /usr/bin/python3 or shell launcher.
@@ -71,7 +93,7 @@ describe.skipIf(process.platform === "win32")("installed fleet placement affinit
     const config = { ...f.config, command, ...(kind === "timeout" ? { commandTimeoutMs: 100 } : {}),
       ...(kind === "missing" ? { pickerCommand: [path.join(f.base, "absent-picker")] } : {}) };
     if (kind === "timeout") fs.writeFileSync(f.picker, "#!/bin/sh\nsleep 5\n");
-    vi.stubEnv("CANDIDATES", f.env.CANDIDATES); vi.stubEnv("PATH", f.env.PATH); vi.stubEnv("SSH_CALLS", f.sshCalls);
+    vi.stubEnv("CANDIDATES", f.env.CANDIDATES); vi.stubEnv("PATH", f.env.PATH); vi.stubEnv("SSH_CALLS", f.sshCalls); vi.stubEnv("PICKER_CALLS", f.pickerCalls);
     const runDir = path.join(f.base, "run"); fs.mkdirSync(runDir);
     const taskFile = path.join(runDir, "task.txt"); fs.writeFileSync(taskFile, "portable task");
     const marker = path.join(runDir, "local-worker.txt");
@@ -123,6 +145,75 @@ describe.skipIf(process.platform === "win32")("installed fleet placement affinit
     await expect(preflightFleetPlacement(f.request(), { ...f.config, commandTimeoutMs: 100 }, f.config.command, "task", f.env)).rejects.toThrow(/host=auto/);
     expect(Date.now() - started).toBeLessThan(2_000);
     expect(fs.existsSync(f.sshCalls)).toBe(false);
+  });
+
+  it("keeps caller TMPDIR beneath a declared shared ancestor local before any remote subprocess", async () => {
+    const f = fixture();
+    const cwd = path.join(f.callerTmp, "task"); fs.mkdirSync(cwd);
+    const local = localWorkerRequest(f, cwd);
+    const handle = await new ProcessTransport(undefined, { ...f.config, sharedMounts: [f.base] }).launch(local.request);
+    await handle.waitForClose?.();
+    expect(fs.readFileSync(local.marker, "utf8")).toBe("LOCAL");
+    expect(fs.readFileSync(local.events, "utf8")).toContain("caller-local cwd");
+    for (const file of [f.pickerCalls, f.sshCalls, f.launchCalls]) expect(fs.existsSync(file)).toBe(false);
+  });
+
+  it("keeps a portable shared Git repo remote after the same target-cwd SSH check", async () => {
+    const f = fixture({ executeRemote: true });
+    execFileSync("git", ["init", "--quiet", f.cwd]);
+    const local = localWorkerRequest(f);
+    const result = path.join(f.base, "results", "affinity"); fs.mkdirSync(result, { recursive: true });
+    fs.writeFileSync(path.join(result, "rc"), "0"); fs.writeFileSync(path.join(result, "result.md"), "REMOTE");
+    const handle = await new ProcessTransport(undefined, { ...f.config, sharedMounts: [f.base] }).launch(local.request);
+    expect(handle.sessionId).toBe("placement:affinity");
+    expect(await handle.isAlive()).toBe(false);
+    expect(fs.readFileSync(local.events, "utf8")).toContain('"type":"placement.remote"');
+    expect(fs.existsSync(local.marker)).toBe(false);
+    for (const file of [f.pickerCalls, f.sshCalls, f.launchCalls]) expect(fs.readFileSync(file, "utf8")).toBe("called\n");
+  });
+
+  it("refuses a target-only missing cwd as known-unlaunched before the launcher or local worker", async () => {
+    const f = fixture({ executeRemote: true });
+    const cwd = path.join(f.base, "target-only", "missing-cwd");
+    const local = localWorkerRequest(f, cwd);
+    const config = { ...f.config, command: f.config.command.map(entry => entry === f.cwd ? "{cwd}" : entry) };
+    const started = Date.now();
+    const pending = new ProcessTransport(undefined, config).launch(local.request);
+    await expect(pending).rejects.toBeInstanceOf(AgentInputError);
+    await expect(pending).rejects.toMatchObject({ field: "placement", launchOutcome: "unlaunched" });
+    await expect(pending).rejects.toThrow(cwd);
+    await expect(pending).rejects.toThrow("needs:['local']");
+    expect(Date.now() - started).toBeLessThan(5_000);
+    expect(fs.readFileSync(f.sshCalls, "utf8")).toBe("called\n");
+    expect(fs.existsSync(f.launchCalls)).toBe(false);
+    expect(fs.existsSync(local.marker)).toBe(false);
+  });
+
+  it("fences lexical and canonical local-root descendants, but not prefix siblings", () => {
+    const f = fixture();
+    const home = path.join(f.base, "home"); fs.mkdirSync(home);
+    vi.spyOn(os, "homedir").mockReturnValue(home);
+    const state = path.join(home, ".local", "state"); fs.mkdirSync(state, { recursive: true });
+    const config = { ...f.config, sharedMounts: [f.base] };
+    for (const root of [f.callerTmp, state]) {
+      const sibling = `${root}-sibling`; fs.mkdirSync(sibling);
+      expect(placementLocalPathReason(sibling, config)).toBeUndefined();
+      expect(placementLocalPathReason(root, config)).toContain("caller-local cwd");
+      expect(placementLocalPathReason(path.join(root, "missing", "child"), config)).toContain("caller-local cwd");
+      const alias = `${root}-alias`; fs.symlinkSync(root, alias, "dir");
+      expect(placementLocalPathReason(alias, config)).toContain("caller-local cwd");
+      expect(placementLocalPathReason(path.join(alias, "missing", "child"), config)).toContain("caller-local cwd");
+      const escape = path.join(root, "escape"); fs.symlinkSync(f.cwd, escape, "dir");
+      expect(placementLocalPathReason(escape, config)).toContain("caller-local cwd");
+    }
+    const danglingAlias = path.join(f.base, "missing-tmp-alias");
+    fs.symlinkSync(path.join(f.callerTmp, "not-created"), danglingAlias, "dir");
+    expect(placementLocalPathReason(path.join(danglingAlias, "child"), config)).toContain("caller-local cwd");
+    const tmpAlias = path.join(f.base, "tmp-alias"); fs.symlinkSync(f.callerTmp, tmpAlias, "dir");
+    vi.stubEnv("TMPDIR", tmpAlias);
+    expect(placementLocalPathReason(path.join(f.callerTmp, "missing"), config)).toContain("caller-local cwd");
+    expect(placementLocalPathReason("/srv/scratch/missing/child", config)).toContain("caller-local cwd");
+    expect(placementLocalPathReason("/srv/scratch-sibling/missing", config)).toBeUndefined();
   });
 
   it("pins shared-root paths but not prefix siblings or symlink escapes", () => {

@@ -241,11 +241,53 @@ export function normalizeActorActivation(value: unknown): FabricActorActivationP
   return { minIntervalMs };
 }
 
+/** Window batching retains each observation; 0 keeps single-event activation. */
+export interface FabricActorBatching {
+  batchWindowMs?: number;
+  batchMax?: number;
+  /** Aggregate serialized event/image budget; default 256 KiB. One oversized event runs alone. */
+  batchMaxBytes?: number;
+}
+
+export const MAX_ACTOR_BATCH_EVENTS = 1_000;
+
+export class FabricActorBatchPolicyError extends Error {
+  readonly code = "FABRIC_ACTOR_BATCH_POLICY_INVALID";
+  constructor(message: string) {
+    super(message);
+    this.name = "FabricActorBatchPolicyError";
+  }
+}
+
+export function normalizeActorBatching(value: unknown): FabricActorBatching {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) throw new FabricActorBatchPolicyError("Invalid actor batching policy");
+  const input = value as Record<string, unknown>;
+  const result: FabricActorBatching = {};
+  for (const key of ["batchWindowMs", "batchMax", "batchMaxBytes"] as const) {
+    const number = input[key];
+    if (number === undefined) continue;
+    if (typeof number !== "number" || !Number.isSafeInteger(number) || number < (key === "batchWindowMs" ? 0 : 1) ||
+        (key === "batchMax" && number > MAX_ACTOR_BATCH_EVENTS)) {
+      throw new FabricActorBatchPolicyError(`${key} must be a ${key === "batchWindowMs" ? "non-negative" : "positive"} safe integer${key === "batchMax" ? ` <= ${MAX_ACTOR_BATCH_EVENTS}` : ""}`);
+    }
+    result[key] = number;
+  }
+  return result;
+}
+
+/** Exact authoritative claim revision, never a request-supplied caller identity. */
+export interface FabricActorSlotClaim {
+  key: string;
+  ifVersion: number;
+}
+
 /** Public creation input; file instructions are resolved only by the actor owner. */
 export type FabricActorCreateRequest = Omit<FabricActorRequest, "instructions"> & import("./instructions-file.js").FabricActorInstructionsSource;
-export interface FabricActorRequest {
-  /** Resident-host create deduplication key; reuse on retry (host-local, bounded retention). */
+export interface FabricActorRequest extends FabricActorBatching {
+  /** Stable creation retry identity; mandatory for enforced protected slot births. Resident-host retries reuse it. */
   idempotencyKey?: string;
+  /** Exact revision won by the authenticated Main on the native slot authority. */
+  slotClaim?: FabricActorSlotClaim;
   /** Storage and visibility boundary. Defaults to mesh.actorScope for compatibility. */
   scope?: FabricActorStorageScope;
   name: string;
@@ -332,9 +374,15 @@ export interface FabricActorSessionOrphan {
   role?: string;
   /** Durable mesh receipt acknowledged; absent means retry publication on the next read/event. */
   alarmPublishedAt?: number;
+  /** PRIVATE registry generation/outbox. Public tombstone fields are never authority. */
+  directorySettlement?: { by: string; at: number; settledAt?: number; retiredAt?: number; retiredBy?: string;
+    /** Compatibility with already persisted outboxes. */
+    previous?: { by: string; at: number; settledAt?: number; retiredAt?: number; retiredBy?: string };
+    /** Only receipts for the still-persisted legacy/shared/file copies, never an intent journal. */
+    persisted?: Array<{ by: string; at: number; settledAt?: number; retiredAt?: number; retiredBy?: string }> };
 }
 
-export interface FabricActorInfo {
+export interface FabricActorInfo extends FabricActorBatching {
   id: string;
   scope: FabricActorStorageScope;
   name: string;
@@ -508,7 +556,8 @@ export interface FabricActorDirective {
 }
 
 export interface FabricActorDeliveryRequest {
-  actor: FabricActorInfo;
+  /** Routing identity only: host alarms must not carry the diagnostic actor view. */
+  actor: Pick<FabricActorInfo, "id" | "name"> & Partial<Pick<FabricActorInfo, "status" | "rootId" | "ownerSessionId" | "project">>;
   message: FabricActorMessage;
   delivery: Exclude<FabricActorDelivery, "mailbox">;
   triggerTurn: boolean;

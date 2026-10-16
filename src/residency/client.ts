@@ -1,4 +1,5 @@
 import { snapshotTaskReturnAddress } from "../agents/task-return-address.js";
+import { diagnostics } from "../core/diagnostics.js";
 import { withFabricWakeAdmission, fabricWakeCause } from "../fabric-provenance.js";
 import { randomUUID } from "node:crypto";
 import { CompletionJournal, completionRecipientFromRun, completionConsumed, consumeCompletion, legacyCompletionConsumed, saveCompletion, type CompletionRecipient, type CompletionSummary } from "../agents/completion-journal.js";
@@ -54,6 +55,10 @@ import {
   readResidentRequestDecision,
   registerResidentCancellation,
   residentRequestExpiredOutcome,
+  residentCreateMayBeProtected,
+  residentSlotResponseError,
+  ResidentSlotError,
+  type ResidentSlotStatus,
   commitResidentRequest,
   RESIDENT_HOST_FORMAT,
   RESIDENT_ACTOR_COMMAND_FORMAT,
@@ -535,7 +540,18 @@ export class ResidencyClient {
     await this.#waitForParticipant(id, "actor");
   }
 
-  async createActor(request: FabricActorCreateRequest, signal?: AbortSignal): Promise<FabricActorInfo> {
+  /** Read the selected live resident's actual native store; do not start a host. */
+  async slotStatus(signal?: AbortSignal): Promise<ResidentSlotStatus> {
+    if (!this.#liveOwner()) throw new Error("Root resident host is not live");
+    const response = await this.#command({
+      format: RESIDENT_ACTOR_COMMAND_FORMAT, operation: "slotStatus", requestId: randomUUID(),
+      rootId: this.options.config.rootId, createdAt: Date.now(),
+    }, signal);
+    if (!response.slotStatus) throw new Error("Resident host returned no native slot status");
+    return response.slotStatus;
+  }
+
+  async createActor(request: FabricActorCreateRequest, signal?: AbortSignal, onDispatched?: () => void): Promise<FabricActorInfo> {
     const { idempotencyKey, ...creationRequest } = request;
     await this.ensureHost();
     const self = this.options.participants.self();
@@ -546,13 +562,16 @@ export class ResidencyClient {
     const response = await this.#command({
       format: RESIDENT_HOST_FORMAT,
       operation: "createActor",
+      ...(typeof (request as { spawnRouterDecisionId?: unknown }).spawnRouterDecisionId === "string"
+        ? { routerCaller: { id: self.id, rootId: self.rootId, sessionId: self.sessionId ?? "",
+          ownerHostId: self.ownerHostId, ownerIdentityId: self.ownerIdentityId, kind: self.kind } } : {}),
       ...(idempotencyKey === undefined ? {} : { idempotencyKey }),
       requestId: randomUUID(),
       rootId: this.options.config.rootId,
       request: creationRequest,
       ...(caller ? { caller } : {}),
       createdAt: Date.now(),
-    }, signal);
+    }, signal, onDispatched);
     if (!response.actor) throw new Error("Fabric resident host returned no actor");
     await this.#waitForParticipant(response.actor.id, "actor", signal).catch((error) => {
       throw new ResidentOutcomeUnknownError({
@@ -603,7 +622,7 @@ export class ResidencyClient {
     return response.actors;
   }
 
-  async spawnAgent(request: AgentRunRequest, signal?: AbortSignal): Promise<AgentHandleInfo> {
+  async spawnAgent(request: AgentRunRequest, signal?: AbortSignal, onDispatched?: () => void): Promise<AgentHandleInfo> {
     // Capture at the public call from the host-owned participant, never from request fields.
     // Snapshot policy at runtime construction, before a task can change ambient state.
     const self = this.options.participants.self();
@@ -650,6 +669,7 @@ export class ResidencyClient {
         createdAt: Date.now(),
       },
       signal,
+      onDispatched,
     );
     if (!response.handle) throw new Error("Fabric resident host returned no agent handle");
     await this.#waitForParticipant(response.handle.id, "agent", signal).catch((error) => {
@@ -907,7 +927,7 @@ export class ResidencyClient {
     }
   }
 
-  async #command(command: ResidentCommand, signal?: AbortSignal): Promise<ResidentCommandResponse> {
+  async #command(command: ResidentCommand, signal?: AbortSignal, onDispatched?: () => void): Promise<ResidentCommandResponse> {
     const owner = this.#liveOwner();
     if (!owner) throw new Error("Root resident host is not live");
     assertResidentCommandSupported(owner, command.operation);
@@ -917,9 +937,14 @@ export class ResidencyClient {
     command = prepareResidentCreationCommand(owner, command);
     throwIfAborted(signal);
     command = residentCommandForOwner(command, owner);
-    registerResidentCancellation(signal, this.options.config.residencyRoot, command);
+    let dispatched = false;
+    registerResidentCancellation(signal, this.options.config.residencyRoot, command, () => dispatched);
     const responsePath = path.join(this.#responsesPath, `${command.requestId}.json`);
     try {
+      throwIfAborted(signal);
+      dispatched = true; // A failed publication can still have reached the selected host.
+      // Host-only receipt custody follows this same fence, never earlier preparation.
+      try { onDispatched?.(); } catch { /* Observers cannot change dispatch. */ }
       atomicWrite(path.join(this.#requestsPath, `${command.requestId}.json`), command);
       const deadline = Date.now() + (this.options.commandTimeoutMs ?? COMMAND_TIMEOUT_MS);
       while (Date.now() < deadline) {
@@ -928,6 +953,11 @@ export class ResidencyClient {
         if (response?.format === RESIDENT_HOST_FORMAT && response.requestId === command.requestId) {
           if (acknowledgeResidentResponse(this.options.config.residencyRoot, response, Date.now(), command.format)) fs.rmSync(responsePath, { force: true });
           if (!response.ok) {
+            const slotError = residentSlotResponseError(response, signal);
+            if (slotError) {
+              if (slotError.code === "FABRIC_ACTOR_SLOT_CLAIM_REFUSED") dispatched = false;
+              throw slotError;
+            }
             if (command.operation === "resetSession" && response.errorCode === "ACTOR_SESSION_RESET_CANCELLED") {
               throw new ActorSessionResetCancelledError(command.id, response.error, command.requestId);
             }
@@ -956,7 +986,11 @@ export class ResidencyClient {
         ` (${command.operation})${note ? `: ${note}` : ""}`);
     } catch (error) {
       // This acknowledged terminal response is known, unlike a lost post-commit reply.
-      if (error instanceof ActorSessionResetCancelledError) throw error;
+      if (error instanceof ActorSessionResetCancelledError || error instanceof ResidentSlotError) throw error;
+      // The protected receiver upgrades every post-accept failure to distinct
+      // slot uncertainty, so these terminal native refusals retain their codes.
+      if (error instanceof ResidentActorAuthorizationError || error instanceof ResidentCommandUnsupportedError ||
+          error instanceof FabricModelDeniedError) { dispatched = false; throw error; }
       if (error instanceof ResidentRequestExpiredError) throw residentRequestExpiredOutcome(this.options.config.residencyRoot, command, signal);
       let decision;
       try {
@@ -968,7 +1002,9 @@ export class ResidencyClient {
         try { known = readResidentRequestDecision(this.options.config.residencyRoot, command.requestId); } catch { /* unreadable fence */ }
         throw new ResidentOutcomeUnknownError(command, known, fenceError, signal);
       }
-      if (decision.state === "committed") throw new ResidentOutcomeUnknownError(command, decision, error, signal);
+      if (decision.state === "committed" || (dispatched && residentCreateMayBeProtected(command))) {
+        throw new ResidentOutcomeUnknownError(command, decision, error, signal);
+      }
       throw error;
     }
   }
@@ -1357,7 +1393,7 @@ export class ResidencyClient {
       const cause = (error as NodeJS.ErrnoException | undefined)?.code === "ENOSPC"
         ? "ENOSPC: inotify watch limit, not disk space (raise fs.inotify.max_user_watches)"
         : error instanceof Error ? error.message : String(error);
-      console.warn(`[pi-fabric] resident delivery: filesystem notifications failed for ${this.options.config.residencyRoot} (${cause}); ` +
+      diagnostics.warn("src/residency/client.ts", `[pi-fabric] resident delivery: filesystem notifications failed for ${this.options.config.residencyRoot} (${cause}); ` +
         `rescanned now and re-arming at most ${WATCH_REARM_ATTEMPTS} times with backoff. Normal operation has no polling; ` +
         "exhausted watches scan and re-arm once per minute.");
     }
@@ -1479,7 +1515,7 @@ export class ResidencyClient {
     } catch (error) {
       if (isMeshWriteDeferred(error)) throw error; // Let the owned background retry back off the outage.
       const diagnostic = `Fabric completion remains pending: ${String(error).slice(0, 1000)}`;
-      if (diagnostic !== this.#completionFault) console.warn(diagnostic);
+      if (diagnostic !== this.#completionFault) diagnostics.warn("src/residency/client.ts", diagnostic);
       this.#completionFault = diagnostic;
     }
   }

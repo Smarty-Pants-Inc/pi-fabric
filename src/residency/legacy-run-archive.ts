@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { diagnostics } from "../core/diagnostics.js";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import { setImmediate as yieldTurn } from "node:timers/promises";
@@ -336,7 +337,7 @@ export class ResidentLegacyRunArchive {
       // Truthful degraded mode: no polling. One rescan, bounded one-shot re-arms,
       // then the 60s degraded full-pass deadline alone. ENOSPC here is the inotify limit.
       const cause = isWatchLimitError(error) ? "inotify watch limit reached (fs.inotify.max_user_watches), not disk space" : String(error);
-      console.warn(`[fabric] legacy run archive watcher on ${path.join(this.root, "runs")} failed: ${cause}; ` +
+      diagnostics.warn("src/residency/legacy-run-archive.ts", `[fabric] legacy run archive watcher on ${path.join(this.root, "runs")} failed: ${cause}; ` +
         `rescanning once and re-arming with bounded backoff (${REARM_ATTEMPTS} attempts), then full passes every ${LEGACY_ARCHIVE_DEADLINE_MS / 1000}s`);
     }
     this.#rescan();

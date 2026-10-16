@@ -407,7 +407,7 @@ describe("fleet model policy (#2490)", () => {
     delete (provider.participants as Partial<FabricParticipantSource>).self;
     const actor = await provider.invoke("create", { name: "minimal-topology", instructions: "Review." }, context) as FabricActorInfo;
     expect(actors.owns(actor.id)).toBe(true);
-    if (process.platform === "linux") {
+    if (process.platform === "linux" || process.platform === "darwin" || process.platform === "win32") {
       await provider.invoke("remove", { id: actor.id }, context);
       expect(actors.list()).toEqual([]);
     } else {
@@ -415,7 +415,7 @@ describe("fleet model policy (#2490)", () => {
       fs.appendFileSync(historyFile, `${JSON.stringify({ testHistory: "standalone Main removal" })}\n`);
       const historyBeforeRemoval = fs.readFileSync(historyFile, "utf8");
       const removal = await provider.invoke("remove", { id: actor.id }, context) as { removed: boolean; cleaned?: boolean; pending?: string };
-      // Off Linux the fence refusal follows registry revocation but precedes tree/presence deletion; follow-up smarty-dev#11335.
+      // On unsupported platforms fence refusal follows revocation but precedes tree/presence deletion; smarty-dev#11335.
       const pending = `removal cleanup failed: Root actor tree deletion needs the Main publication fence, which this platform (${process.platform}) lacks (smarty-dev#8090); follow-up smarty-dev#11335; the root ${identity.id} actor tree is kept (a later remove or host start finishes it)`;
       expect(removal).toEqual({ removed: true, cleaned: false, pending });
       expect(actors.list()).toEqual([expect.objectContaining({ id: actor.id, rootId: identity.id, status: "stopped",
@@ -533,7 +533,7 @@ describe("fleet model policy (#2490)", () => {
           provider.participants, provider.control, provider.lifecycle, undefined, undefined, false,
         ));
         // The returned receipt supplies the exact public cleanup key; an uncancelled control still returns a handle.
-        if (process.platform === "linux") {
+        if (process.platform === "linux" || process.platform === "darwin" || process.platform === "win32") {
           expect((await execute(`return await agents.remove({ id: ${JSON.stringify(id)} });`)).success).toBe(true);
           expect(actors.list()).toEqual([]); expect(mesh.listAll("actors/test/")).toEqual([]);
         } else {
@@ -542,7 +542,7 @@ describe("fleet model policy (#2490)", () => {
           const historyBeforeRemoval = fs.readFileSync(historyFile, "utf8");
           const removed = await execute(`return await agents.remove({ id: ${JSON.stringify(id)} });`);
           expect(removed.success).toBe(true);
-          // Off Linux the fence refusal follows registry revocation but precedes tree/presence deletion; follow-up smarty-dev#11335.
+          // On unsupported platforms fence refusal follows revocation but precedes tree/presence deletion; smarty-dev#11335.
           const pending = `removal cleanup failed: Root actor tree deletion needs the Main publication fence, which this platform (${process.platform}) lacks (smarty-dev#8090); follow-up smarty-dev#11335; the root ${provider.mainAgent.id} actor tree is kept (a later remove or host start finishes it)`;
           expect(removed.value).toEqual({ removed: true, cleaned: false, pending });
           expect(actors.list()).toEqual([expect.objectContaining({ id, rootId: provider.mainAgent.id, status: "stopped",
@@ -557,7 +557,7 @@ describe("fleet model policy (#2490)", () => {
         expect(control.success).toBe(true); expect(control.residentOutcomes).toBeUndefined();
         expect(control.value).toMatchObject({ name: request.name, status: "idle" });
         const controlId = (control.value as FabricActorInfo).id;
-        if (process.platform === "linux") {
+        if (process.platform === "linux" || process.platform === "darwin" || process.platform === "win32") {
           expect((await execute(`return await agents.remove({ id: ${JSON.stringify(controlId)} });`)).success).toBe(true);
           expect(actors.list()).toEqual([]); expect(mesh.listAll("actors/test/")).toEqual([]);
         } else {
@@ -566,7 +566,7 @@ describe("fleet model policy (#2490)", () => {
           const controlHistoryBeforeRemoval = fs.readFileSync(controlHistoryFile, "utf8");
           const controlRemoved = await execute(`return await agents.remove({ id: ${JSON.stringify(controlId)} });`);
           expect(controlRemoved.success).toBe(true);
-          // Off Linux the fence refusal follows registry revocation but precedes tree/presence deletion; follow-up smarty-dev#11335.
+          // On unsupported platforms fence refusal follows revocation but precedes tree/presence deletion; smarty-dev#11335.
           const pending = `removal cleanup failed: Root actor tree deletion needs the Main publication fence, which this platform (${process.platform}) lacks (smarty-dev#8090); follow-up smarty-dev#11335; the root ${provider.mainAgent.id} actor tree is kept (a later remove or host start finishes it)`;
           expect(controlRemoved.value).toEqual({ removed: true, cleaned: false, pending });
           expect(actors.list()).toEqual(expect.arrayContaining([
@@ -1377,11 +1377,11 @@ describe("#169 round 1 agents.remove cleanup routing", () => {
       state.control, state.lifecycle, undefined, { removeActor } as unknown as ResidencyClient);
     await expect(provider.invoke("remove", { id: actor.id }, context)).resolves.toMatchObject({ removed: true });
     expect(removeActor).toHaveBeenCalledExactlyOnceWith(actor.id, context.signal);
-    if (process.platform === "linux") {
+    if (process.platform === "linux" || process.platform === "darwin" || process.platform === "win32") {
     expect(fs.existsSync(dir)).toBe(false);
     expect(await provider.invoke("actors", {}, context)).not.toContainEqual(expect.objectContaining({ id: actor.id }));
     } else {
-      // Off Linux the routed retry is refused before any delete (smarty-dev#8090; follow-up smarty-dev#11335).
+      // On unsupported platforms the routed retry refuses before any delete (smarty-dev#8090; follow-up smarty-dev#11335).
       expect(fs.existsSync(dir)).toBe(true);
       await expect(owner.remove(actor.id)).resolves.toEqual({ removed: true, cleaned: false,
         pending: `removal cleanup failed: Root actor tree deletion needs the Main publication fence, which this platform (${process.platform}) lacks (smarty-dev#8090); follow-up smarty-dev#11335; the root ${state.identity.id} actor tree is kept (a later remove or host start finishes it)` });
@@ -1416,7 +1416,7 @@ describe("#169 round 1 agents.remove cleanup routing", () => {
       fs.writeFileSync(successor.sessionFile!, "successor history\n");
       await expect(provider.invoke("remove", { id: actor.id.slice(0, 12) }, context)).rejects.toThrow();
       failing.mockRestore();
-      if (process.platform === "linux") {
+      if (process.platform === "linux" || process.platform === "darwin" || process.platform === "win32") {
       await expect(provider.invoke("remove", { id: actor.id }, context)).resolves.toMatchObject({ removed: true });
       expect(directory.pendingRemovals()).toEqual([]);
       expect(fs.existsSync(dir)).toBe(false);
@@ -1424,7 +1424,7 @@ describe("#169 round 1 agents.remove cleanup routing", () => {
       expect(directory.status("retry worker").id).toBe(successor.id);
       expect(await provider.invoke("actors", {}, context)).not.toContainEqual(expect.objectContaining({ id: actor.id }));
       } else {
-        // Off Linux the retry is refused before any delete (smarty-dev#8090; follow-up smarty-dev#11335): tree kept, pending.
+        // On unsupported platforms the retry refuses before any delete (smarty-dev#8090; follow-up smarty-dev#11335): tree kept, pending.
         await expect(provider.invoke("remove", { id: actor.id }, context)).resolves.toMatchObject({
           removed: true, cleaned: false,
           pending: `removal cleanup failed: Root actor tree deletion needs the Main publication fence, which this platform (${process.platform}) lacks (smarty-dev#8090); follow-up smarty-dev#11335; the root ${state.identity.id} actor tree is kept (a later remove or host start finishes it)`,
@@ -3237,7 +3237,7 @@ describe("AgentsProvider runner support", () => {
       invocationContext,
     ) as { id: string; cwd: string };
     expect(handle.cwd).toBe(canonical);
-    expect(updates.some((message) => message.endsWith(`cwd ${canonical}`))).toBe(true);
+    expect(updates.some((message) => message.endsWith(`cwd ${canonical} · model unverified`))).toBe(true);
     await provider.invoke("wait", { id: handle.id }, invocationContext);
     await provider.invoke("cleanup", { id: handle.id }, invocationContext);
   });
@@ -3274,7 +3274,7 @@ describe("AgentsProvider runner support", () => {
       invocationContext,
     ) as { id: string; cwd: string };
     expect(handle.cwd).toBe(canonical);
-    expect(updates.some((message) => message.endsWith(`cwd ${shown}`))).toBe(true);
+    expect(updates.some((message) => message.endsWith(`cwd ${shown} · model unverified`))).toBe(true);
     expect(updates.every((message) => !/[\u0000-\u001f\u007f]/.test(message))).toBe(true);
     expect(updates.every((message) => message.length < 512)).toBe(true);
     await provider.invoke("wait", { id: handle.id }, invocationContext);
@@ -5254,6 +5254,63 @@ describe("AgentsProvider global actors", () => {
     await expect(provider.invoke("create", { ...createRequest, name: "bad-window", inferenceContext: "invalid" }, context)).rejects.toThrow();
   });
 
+  it.each(["project", "global"] as const)("replaces and clears %s topic subscriptions without changing the other scope", async scope => {
+    const { provider, actors, globalActors, root } = setup();
+    const local = await actors.create({ name: "topics-local", instructions: "Work.", topics: ["topics.local"] });
+    const template = globalActors.create({ name: "topics-global", instructions: "Work.", topics: ["topics.global"] });
+    const id = scope === "global" ? template.id : local.id;
+    const read = () => scope === "global" ? globalActors.resolve(id)! : actors.status(id);
+    expect(await provider.invoke("setTopics", { id, scope, topics: ["topics.new", "topics.new", "topics.other"] }, context))
+      .toMatchObject({ id, topics: ["topics.new", "topics.other"] });
+    expect(read().topics).toEqual(["topics.new", "topics.other"]);
+    expect(scope === "global" ? actors.status(local.id).topics : globalActors.resolve(template.id)!.topics)
+      .toEqual(scope === "global" ? ["topics.local"] : ["topics.global"]);
+    expect(await provider.invoke("setTopics", { id, scope, topics: [] }, context)).toMatchObject({ id, topics: [] });
+    expect(read().topics).toEqual([]);
+    if (scope === "global") {
+      const reopened = new GlobalActorRegistry(root, 64 * 1024);
+      expect(reopened.resolve(id)!.topics).toEqual([]);
+      expect(reopened.toRequest(reopened.resolve(id)!).topics).toEqual([]);
+      const imported = await provider.invoke("import", { id, as: "topics-imported" }, context) as FabricActorInfo;
+      expect(actors.status(imported.id).topics).toEqual([]);
+    }
+  });
+
+  it.each(["project", "global"] as const)("validates %s setTopics before mutating the definition", async scope => {
+    const { provider, actors, globalActors } = setup();
+    const request = { name: "topics-validation", instructions: "Work.", topics: ["topics.original"] };
+    const actor = scope === "global" ? globalActors.create(request) : await actors.create(request);
+    const read = () => scope === "global" ? globalActors.resolve(actor.id)! : actors.status(actor.id);
+    for (const topics of [undefined, null, "topics.string", 7, {}, [null], [7], [""], ["bad topic"], ["x".repeat(129)], ["topics.valid", "bad topic"]]) {
+      await expect(provider.invoke("setTopics", { id: actor.id, scope, ...(topics === undefined ? {} : { topics }) }, context)).rejects.toThrow();
+      expect(read().topics).toEqual(["topics.original"]);
+    }
+  });
+
+  it("validates and persists direct globalActors.update topics, including an empty replacement", () => {
+    const { globalActors, root } = setup();
+    const template = globalActors.create({ name: "topics-update", instructions: "Work.", topics: ["topics.original"] });
+    expect(globalActors.update(template.id, { topics: ["topics.updated", "topics.updated"] }).topics).toEqual(["topics.updated"]);
+    expect(new GlobalActorRegistry(root, 64 * 1024).resolve(template.id)!.topics).toEqual(["topics.updated"]);
+    for (const topics of [["bad topic"], [""], ["topics.valid", "bad topic"]]) {
+      expect(() => globalActors.update(template.id, { topics })).toThrow(/topic/);
+      expect(globalActors.resolve(template.id)!.topics).toEqual(["topics.updated"]);
+      expect(new GlobalActorRegistry(root, 64 * 1024).resolve(template.id)!.topics).toEqual(["topics.updated"]);
+    }
+    expect(globalActors.update(template.id, { topics: [] }).topics).toEqual([]);
+    expect(new GlobalActorRegistry(root, 64 * 1024).resolve(template.id)!.topics).toEqual([]);
+  });
+
+  it("refuses setTopics after canonical actor ownership moves without altering subscriptions or work", async () => {
+    let owned = true;
+    const { provider, actors, agents } = setup([], [], undefined, { canManageActor: () => owned });
+    const actor = await actors.create({ name: "topics-owner", instructions: "Work.", topics: ["topics.original"] });
+    owned = false;
+    await expect(provider.invoke("setTopics", { id: actor.id, topics: [] }, context)).rejects.toThrow("owned by another host");
+    expect(actors.status(actor.id)).toMatchObject({ topics: ["topics.original"], queued: 0 });
+    expect(agents.list()).toEqual([]);
+  });
+
   it("updates tool allowlists for project actors and global templates", async () => {
     const { provider, actors, globalActors } = setup();
     const actor = (await provider.invoke("create", createRequest, context)) as { id: string };
@@ -6601,9 +6658,46 @@ describe("external spawn router hook (#2890)", () => {
     });`, inputPath];
     const state = setup([], [], undefined, { agentsConfig: { ...configured, ...agentsConfig,
       router: { command, mode, timeoutMs: 400 } } });
-    const logs = () => fs.readFileSync(path.join(state.mesh.root, "router/decisions.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    const logs = () => {
+      const entries = fs.readFileSync(path.join(state.mesh.root, "router/decisions.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+      for (const entry of entries) {
+        const keys = entry.kind === "decision"
+          ? ["ts", "decisionId", "kind", "spawnKind", "mode", "commandDigest", "decision", "pick", "requested", "actual", "fallbackReason", "latencyMs", "error"]
+          : ["ts", "kind", "decisionId", "agentId", "sessionId", "launch", "host", "model", "thinking", "verified", "evidenceRef", ...(entry.kind === "start-failed" ? ["error"] : [])];
+        expect(Object.keys(entry).sort()).toEqual(keys.sort());
+        if (entry.kind === "decision") {
+          expect(entry.commandDigest).toBe(createHash("sha256").update(JSON.stringify(command)).digest("hex"));
+          expect(entry.requested).toEqual(entry.actual);
+          expect(entry.fallbackReason).toBe(entry.decision === "default" ? entry.error : null);
+        } else expect(Object.keys(entry.launch).sort()).toEqual(["pid", "processStartTime", "runId"]);
+      }
+      return entries;
+    };
     const requests = () => fs.readFileSync(inputPath, "utf8").trim().split("\n").map(line => JSON.parse(line));
     return { ...state, dir, inputPath, logs, requests };
+  };
+  const decisionId = expect.stringMatching(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+  const expectStarted = (state: ReturnType<typeof routerSetup>, child: { id: string },
+    actual: { model: string; thinking: string }, decision: Record<string, unknown>, sessionId: string | null = null) => {
+    const entries = state.logs();
+    const { kind: spawnKind, ...fields } = decision;
+    expect(entries).toEqual([
+      expect.objectContaining({ decisionId, kind: "decision", spawnKind, ...fields }),
+      { ts: expect.any(String), kind: "start", decisionId: entries[0]?.decisionId,
+        agentId: child.id, sessionId, ...actual, host: os.hostname(), launch: entries[1]?.launch,
+        verified: expect.any(Boolean), evidenceRef: entries[1]?.evidenceRef },
+    ]);
+    if (spawnKind === "actor") expect(entries[1]).toMatchObject({
+      launch: { runId: null, pid: null, processStartTime: null }, verified: false, evidenceRef: null });
+    else expect(entries[1].launch.runId).toBe(child.id);
+    if (entries[1].verified) expect(entries[1].evidenceRef).toEqual(expect.any(String));
+    expect(entries[0]).not.toHaveProperty("task");
+  };
+  const nativeActorSessionId = (actor: FabricActorInfo): string | null => {
+    if (!actor.sessionFile || !fs.existsSync(actor.sessionFile)) return null;
+    const header = fs.readFileSync(actor.sessionFile, "utf8").split("\n").filter(Boolean)
+      .map(line => JSON.parse(line)).find(entry => entry.type === "session");
+    return typeof header?.id === "string" ? header.id : null;
   };
   it.each(["off", "shadow", "enforce"] as const)("%s selects the expected actual worker model/thinking", async mode => {
     const state = routerSetup(mode);
@@ -6615,7 +6709,7 @@ describe("external spawn router hook (#2890)", () => {
       expect(fs.existsSync(state.inputPath)).toBe(false);
       expect(fs.existsSync(path.join(state.mesh.root, "router"))).toBe(false);
     } else {
-      expect(state.logs()).toEqual([expect.objectContaining({ actual, pick, error: null })]);
+      expectStarted(state, child, actual, { kind: "spawn", actual, pick, error: null });
       expect(state.requests()).toEqual([expect.objectContaining({ kind: "spawn", name: "normal child", requestedComplexity: "normal", parentId: state.identity.id,
         defaults: { model: "provider/model-a", thinking: "medium" } })]);
       expect(state.requests()[0]).not.toHaveProperty("task");
@@ -6632,7 +6726,7 @@ describe("external spawn router hook (#2890)", () => {
     const actual = mode === "enforce" ? { model: pick.model, thinking: pick.thinking } : { model: "provider/model-a", thinking: "medium" };
     expect(await state.agents.wait(child.id)).toMatchObject({ ...actual, status: "completed" });
     expect(state.requests()).toEqual([expect.objectContaining({ kind: "spawn", requestedComplexity: "delicate" })]);
-    expect(state.logs()).toEqual([expect.objectContaining({ actual, pick, error: null })]);
+    expectStarted(state, child, actual, { kind: "spawn", actual, pick, error: null });
   });
   it.each([
     [{ model: "provider/project", thinking: "low" }, { model: "provider/project", thinking: "low" }],
@@ -6642,7 +6736,7 @@ describe("external spawn router hook (#2890)", () => {
     const child = await state.provider.invoke("spawn", { task: "explicit", ...overrides }, context) as AgentHandleInfo;
     expect(child).toMatchObject(actual); await state.agents.wait(child.id);
     expect(fs.existsSync(state.inputPath)).toBe(false);
-    expect(state.logs()).toEqual([expect.objectContaining({ decision: "explicit", pick: null, actual, error: null })]);
+    expectStarted(state, child, actual, { kind: "spawn", decision: "explicit", pick: null, actual, error: null });
   });
   it.each([
     ["process.stdout.write('garbage');", "invalid-json"],
@@ -6654,14 +6748,15 @@ describe("external spawn router hook (#2890)", () => {
     const child = await state.provider.invoke("spawn", { task: "fallback" }, context) as AgentHandleInfo;
     const actual = { model: "provider/model-a", thinking: "medium" };
     expect(child).toMatchObject(actual); expect(await state.agents.wait(child.id)).toMatchObject({ status: "completed", ...actual });
-    expect(state.logs()).toEqual([expect.objectContaining({ actual, error })]);
+    expectStarted(state, child, actual, { kind: "spawn", actual, error });
   });
   it("does not fuzzy-match or bypass host deny policy for a router pick", async () => {
     for (const model of ["provider/modle-b", "provider/model-b"]) {
       const state = routerSetup("enforce", `process.stdout.write(JSON.stringify({ model: ${JSON.stringify(model)}, thinking: 'high' }));`, { deniedModels: ["provider/model-b"] });
       const child = await state.provider.invoke("spawn", { task: "protected fallback" }, context) as AgentHandleInfo;
       expect(child.model).toBe("provider/model-a"); await state.agents.wait(child.id);
-      expect(state.logs()[0]).toMatchObject({ error: "unknown-or-denied-model" });
+      expectStarted(state, child, { model: "provider/model-a", thinking: "medium" },
+        { kind: "spawn", error: "unknown-or-denied-model" });
     }
   });
   const inheritedSpawn = async (state: ReturnType<typeof routerSetup>) => {
@@ -6678,14 +6773,16 @@ describe("external spawn router hook (#2890)", () => {
     const child = await inheritedSpawn(state);
     expect(child).toMatchObject({ model: "provider/session", thinking: "max" });
     expect(state.requests()[0]).toMatchObject({ defaults: { model: "provider/session", thinking: "max" } });
-    expect(state.logs()).toEqual([expect.objectContaining({ decision: "default", pick, actual: { model: "provider/session", thinking: "max" }, error: null })]);
+    const actual = { model: "provider/session", thinking: "max" };
+    expectStarted(state, child, actual, { kind: "spawn", decision: "default", pick, actual, error: null });
   });
   it("lets an enforce pick override the inherited static default", async () => {
     const state = routerSetup("enforce", undefined, {}, {});
     const child = await inheritedSpawn(state);
     expect(child).toMatchObject({ model: pick.model, thinking: pick.thinking });
     expect(state.requests()[0]).toMatchObject({ defaults: { model: "provider/session", thinking: "max" } });
-    expect(state.logs()).toEqual([expect.objectContaining({ decision: "enforce", pick, actual: { model: pick.model, thinking: pick.thinking }, error: null })]);
+    const actual = { model: pick.model, thinking: pick.thinking };
+    expectStarted(state, child, actual, { kind: "spawn", decision: "enforce", pick, actual, error: null });
   });
   // #699: a configured agents.model wins over the inherited binding as the static default; the router still runs.
   it.each(["shadow", "enforce"] as const)("%s: a configured agents.model wins over the inherited model as the router's static default", async mode => {
@@ -6694,7 +6791,7 @@ describe("external spawn router hook (#2890)", () => {
     const actual = mode === "enforce" ? { model: pick.model, thinking: pick.thinking } : { model: "provider/model-a", thinking: "medium" };
     expect(child).toMatchObject(actual);
     expect(state.requests()[0]).toMatchObject({ defaults: { model: "provider/model-a", thinking: "medium" } });
-    expect(state.logs()).toEqual([expect.objectContaining({ decision: mode === "enforce" ? "enforce" : "default", pick, actual, error: null })]);
+    expectStarted(state, child, actual, { kind: "spawn", decision: mode === "enforce" ? "enforce" : "default", pick, actual, error: null });
   });
   it.each(["create", "createActor"])("%s shares the hook once and freezes the enforce binding", async action => {
     const state = routerSetup("enforce");
@@ -6702,7 +6799,49 @@ describe("external spawn router hook (#2890)", () => {
     expect(actor).toMatchObject({ model: pick.model, thinking: pick.thinking });
     expect(state.actors.definition(actor.id)).toMatchObject({ model: pick.model, thinking: pick.thinking });
     expect(state.requests()).toEqual([expect.objectContaining({ kind: "actor", taskLength: Buffer.byteLength("private actor instructions") })]);
-    expect(state.logs()).toHaveLength(1);
+    const actual = { model: pick.model, thinking: pick.thinking };
+    expectStarted(state, actor, actual, { kind: "actor", decision: "enforce", actual, pick, error: null }, nativeActorSessionId(actor));
+  });
+  it.each([
+    ["shadow", "shadow", undefined, {}],
+    ["enforce", "enforce", undefined, {}],
+    ["default", "enforce", "process.stdout.write('garbage');", {}],
+    ["explicit", "enforce", undefined, { thinking: "low" }],
+  ] as const)("%s actor defaults stay dynamic unless enforce selected a binding", async (decision, mode, body, overrides) => {
+    const state = routerSetup(mode, body);
+    const actor = await state.provider.invoke("create", { name: "dynamic router actor", instructions: "Work.", ...overrides }, context) as FabricActorInfo;
+    const pinned = decision === "enforce";
+    const actual = pinned ? { model: pick.model, thinking: pick.thinking }
+      : { model: "provider/model-a", thinking: decision === "explicit" ? "low" : "medium" };
+    const definition = state.actors.definition(actor.id);
+    if (pinned) expect(definition).toMatchObject(actual);
+    else {
+      expect(definition.model).toBeUndefined();
+      if (decision === "explicit") expect(definition.thinking).toBe("low");
+      else expect(definition.thinking).toBeUndefined();
+    }
+    expectStarted(state, actor, actual, { kind: "actor", decision: pinned ? "enforce" : decision === "explicit" ? "explicit" : "default",
+      actual, pick: decision === "default" || decision === "explicit" ? null : pick,
+      error: decision === "default" ? "invalid-json" : null }, nativeActorSessionId(actor));
+    // Simulate a live defaults reload after creation, not an actor-specific setter.
+    state.agents.config.model = "provider/project-default";
+    state.agents.config.thinking = "minimal";
+    const next = pinned ? actual : { model: "provider/project-default", thinking: decision === "explicit" ? "low" : "minimal" };
+    const reply = await state.provider.invoke("ask", { id: actor.id, message: "Use the current binding." }, context) as { runId: string };
+    expect(state.agents.status(reply.runId)).toMatchObject({ ...next, status: "completed" });
+    // Activations use their effective defaults but must not route creation again.
+    expect(state.logs()).toHaveLength(2);
+    if (decision === "explicit") expect(fs.existsSync(state.inputPath)).toBe(false);
+    else expect(state.requests()).toHaveLength(1);
+  });
+  it("records the manager's clamped thinking at start rather than the router pick", async () => {
+    const state = routerSetup("enforce");
+    const child = await state.provider.invoke("spawn", { task: "bounded thinking", transport: "process", thinkingBounds: { max: "low" } }, context) as AgentHandleInfo;
+    const actual = { model: pick.model, thinking: "low" };
+    expect(child).toMatchObject(actual);
+    expect(await state.agents.wait(child.id)).toMatchObject({ ...actual, status: "completed" });
+    expectStarted(state, child, actual, { kind: "spawn", decision: "enforce", pick,
+      actual: { model: pick.model, thinking: pick.thinking }, error: null });
   });
   it.each(["complex", "delicate"] as const)("forwards the selected model and %s complexity to a durable spawn without a second router call", async complexity => {
     const state = routerSetup("enforce");
@@ -6710,8 +6849,17 @@ describe("external spawn router hook (#2890)", () => {
     (state.provider as unknown as { residency: ResidencyClient }).residency = { spawnAgent } as unknown as ResidencyClient;
     const child = await state.provider.invoke("spawn", { task: "durable", complexity, residency: "durable" }, context) as AgentHandleInfo;
     expect(child).toMatchObject({ model: pick.model, thinking: pick.thinking });
-    expect(spawnAgent).toHaveBeenCalledWith(expect.objectContaining({ model: pick.model, thinking: pick.thinking, complexity }), undefined);
-    expect(state.requests()).toEqual([expect.objectContaining({ requestedComplexity: complexity })]); expect(state.logs()).toHaveLength(1);
+    // This fake never enters the native manager: only the decision exists locally.
+    const entries = state.logs();
+    expect(entries).toHaveLength(1);
+    expect(entries).toEqual([expect.objectContaining({ decisionId, kind: "decision", spawnKind: "spawn", decision: "enforce",
+      actual: { model: pick.model, thinking: pick.thinking }, pick, error: null })]);
+    expect(spawnAgent).toHaveBeenCalledTimes(1);
+    expect(spawnAgent).toHaveBeenCalledWith(expect.objectContaining({ model: pick.model, thinking: pick.thinking, complexity,
+      spawnRouterDecisionId: entries[0].decisionId }), undefined, expect.any(Function));
+    // The native resident receiver rejects meshRoot: keep its own configured root.
+    expect(spawnAgent.mock.calls[0]![0]).not.toHaveProperty("meshRoot");
+    expect(state.requests()).toEqual([expect.objectContaining({ requestedComplexity: complexity })]);
   });
   it("global templates and ordinary agents.run do not invoke the spawn-only router", async () => {
     const state = routerSetup("enforce");
@@ -6719,6 +6867,46 @@ describe("external spawn router hook (#2890)", () => {
     await state.provider.invoke("run", { task: "one-off" }, context);
     expect(fs.existsSync(state.inputPath)).toBe(false);
     expect(fs.existsSync(path.join(state.mesh.root, "router"))).toBe(false);
+  });
+  it("records one privacy-safe start failure when the native manager rejects a public spawn", async () => {
+    const state = routerSetup("enforce");
+    const task = "private failed spawn task must not enter the ledger";
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    try {
+      await expect(state.provider.invoke("spawn", { task, transport: "tmux" }, context))
+        .rejects.toThrow("Fabric agent transport tmux is disabled");
+      expect(launch).not.toHaveBeenCalled();
+      expect(state.agents.list()).toEqual([]);
+      const entries = state.logs();
+      expect(entries).toEqual([
+        expect.objectContaining({ decisionId, kind: "decision", spawnKind: "spawn", decision: "enforce", pick,
+          actual: { model: pick.model, thinking: pick.thinking }, error: null }),
+        { ts: expect.any(String), kind: "start-failed", decisionId: entries[0]?.decisionId,
+          agentId: null, sessionId: null, launch: { runId: null, pid: null, processStartTime: null }, host: os.hostname(),
+          model: null, thinking: null, verified: false, evidenceRef: null, error: "start-failed" },
+      ]);
+      expect(state.requests()).toHaveLength(1);
+      expect(entries.every(entry => !Object.prototype.hasOwnProperty.call(entry, "task"))).toBe(true);
+      expect(JSON.stringify(entries)).not.toContain(task);
+      expect(JSON.stringify(entries)).not.toContain("detached execution custody");
+    } finally { launch.mockRestore(); }
+  });
+  it.each(["spawn", "create"] as const)("%s records a fixed failure if preparation rejects after routing but before native handoff", async action => {
+    const state = routerSetup("enforce");
+    const resolve = state.agents.resolveKernel.bind(state.agents);
+    vi.spyOn(state.agents, "resolveKernel").mockImplementation(request => {
+      if (fs.existsSync(state.inputPath)) throw new Error("private preparation failure");
+      return resolve(request);
+    });
+    const spawn = vi.spyOn(state.agents, "spawn");
+    const create = vi.spyOn(state.actors, "create");
+    const args = action === "spawn" ? { task: "private preparation failure" } : { name: "failed actor", instructions: "private preparation failure" };
+    await expect(state.provider.invoke(action, args, context)).rejects.toThrow("private preparation failure");
+    expect(spawn).not.toHaveBeenCalled(); expect(create).not.toHaveBeenCalled();
+    const entries = state.logs();
+    expect(entries).toHaveLength(2);
+    expect(entries[1]).toMatchObject({ kind: "start-failed", decisionId: entries[0].decisionId, verified: false, error: "start-failed" });
+    expect(JSON.stringify(entries)).not.toContain("private preparation failure");
   });
   it("validates complexity before command or launch", async () => {
     const state = routerSetup("enforce"); const launch = vi.spyOn(state.agents, "spawn");

@@ -20,10 +20,15 @@ import {
   type ResidentHostOwner,
   assertResidentActorToolCeiling,
   type ResidentActorCaller,
+  type ResidentRouterCaller,
   ResidentOutcomeUnknownError,
   readResidentRequestDecision,
   registerResidentCancellation,
   residentRequestExpiredOutcome,
+  residentCreateMayBeProtected,
+  residentSlotResponseError,
+  ResidentSlotError,
+  type ResidentSlotStatus,
   RESIDENT_HOST_FORMAT,
   RESIDENT_ACTOR_COMMAND_FORMAT,
   residentHostStateNote,
@@ -110,7 +115,17 @@ export class ResidentActorClient {
     return response.actors;
   }
 
-  async createActor(request: FabricActorCreateRequest, signal?: AbortSignal): Promise<FabricActorInfo> {
+  /** Query only the loaded selected host; never boot a host for a preflight. */
+  async slotStatus(signal?: AbortSignal): Promise<ResidentSlotStatus> {
+    const response = await this.#send({
+      format: RESIDENT_ACTOR_COMMAND_FORMAT, operation: "slotStatus", requestId: randomUUID(),
+      rootId: this.#rootId, createdAt: Date.now(),
+    }, signal);
+    if (!response.slotStatus) throw new Error("Resident host returned no native slot status");
+    return response.slotStatus;
+  }
+
+  async createActor(request: FabricActorCreateRequest, signal?: AbortSignal, caller?: ResidentActorCaller, onDispatched?: () => void, routerCaller?: ResidentRouterCaller): Promise<FabricActorInfo> {
     const { idempotencyKey, ...creationRequest } = request;
     const response = await this.#send({
       format: RESIDENT_HOST_FORMAT,
@@ -119,8 +134,10 @@ export class ResidentActorClient {
       requestId: randomUUID(),
       rootId: this.#rootId,
       request: creationRequest,
+      ...(caller ? { caller } : {}),
+      ...(routerCaller ? { routerCaller: { ...routerCaller } } : {}),
       createdAt: Date.now(),
-    }, signal);
+    }, signal, onDispatched);
     if (!response.actor) throw new Error("Resident host returned no actor from createActor");
     return response.actor;
   }
@@ -151,7 +168,7 @@ export class ResidentActorClient {
       requestId: randomUUID(), rootId: this.#rootId, createdAt: Date.now() }, signal);
   }
 
-  async #send(command: ResidentCommand, signal?: AbortSignal): Promise<ResidentCommandResponse> {
+  async #send(command: ResidentCommand, signal?: AbortSignal, onDispatched?: () => void): Promise<ResidentCommandResponse> {
     // Do not pull the optional handover/artifact engine into idle proxy startup.
     const drainProtocol = command.operation === "releaseDrain" ? await import("./drain.js") : undefined;
     if (!this.isLive()) throw new Error("Root resident host is not live");
@@ -175,7 +192,8 @@ export class ResidentActorClient {
     command = prepareResidentCreationCommand(owner, command);
     throwIfAborted(signal);
     command = residentCommandForOwner(command, owner);
-    registerResidentCancellation(signal, this.#residencyDir, command);
+    let dispatched = false;
+    registerResidentCancellation(signal, this.#residencyDir, command, () => dispatched);
     fs.mkdirSync(this.#requestsPath, { recursive: true });
     fs.mkdirSync(this.#responsesPath, { recursive: true });
     const responsePath = path.join(this.#responsesPath, `${command.requestId}.json`);
@@ -205,6 +223,10 @@ export class ResidentActorClient {
       throw new Error(`Cannot watch the resident host's responses (${error instanceof Error ? error.message : String(error)}); no request was dispatched`);
     }
     try {
+      throwIfAborted(signal);
+      dispatched = true; // Publication failure may itself be ambiguous; never infer no effects.
+      // Host-only receipt custody follows the native publication fence.
+      try { onDispatched?.(); } catch { /* Observers cannot change dispatch. */ }
       writeJsonAtomic(path.join(this.#requestsPath, `${command.requestId}.json`), command);
       // Unref'd as before: a standalone caller (the fabric-actors CLI) keeps its own ref'd deadline timer.
       deadlineTimer = setTimeout(() => { expired = true; notify(); }, this.commandTimeoutMs);
@@ -223,6 +245,11 @@ export class ResidentActorClient {
         if (response?.format === RESIDENT_HOST_FORMAT && response.requestId === command.requestId) {
           if (acknowledgeResidentResponse(this.#residencyDir, response, Date.now(), command.format)) fs.rmSync(responsePath, { force: true });
           if (!response.ok) {
+            const slotError = residentSlotResponseError(response, signal);
+            if (slotError) {
+              if (slotError.code === "FABRIC_ACTOR_SLOT_CLAIM_REFUSED") dispatched = false;
+              throw slotError;
+            }
             if (command.operation === "resetSession" && response.errorCode === "ACTOR_SESSION_RESET_CANCELLED") {
               throw new ActorSessionResetCancelledError(command.id, response.error, command.requestId);
             }
@@ -245,7 +272,11 @@ export class ResidentActorClient {
       throw new Error(`Timed out waiting for resident host actor response (${command.operation})${note ? `: ${note}` : ""}`);
     } catch (error) {
       // This acknowledged terminal response is known, unlike a lost post-commit reply.
-      if (error instanceof ActorSessionResetCancelledError) throw error;
+      if (error instanceof ActorSessionResetCancelledError || error instanceof ResidentSlotError) throw error;
+      // These negotiated terminal errors are native pre-effect refusals. The
+      // protected host transports any post-accept failure as slot uncertainty.
+      if (error instanceof ResidentActorAuthorizationError || error instanceof ResidentCommandUnsupportedError ||
+          error instanceof FabricModelDeniedError) { dispatched = false; throw error; }
       if (error instanceof ResidentRequestExpiredError) throw residentRequestExpiredOutcome(this.#residencyDir, command, signal);
       let decision;
       try {
@@ -256,7 +287,9 @@ export class ResidentActorClient {
         try { known = readResidentRequestDecision(this.#residencyDir, command.requestId); } catch { /* unreadable fence */ }
         throw new ResidentOutcomeUnknownError(command, known, fenceError, signal);
       }
-      if (decision.state === "committed") throw new ResidentOutcomeUnknownError(command, decision, error, signal);
+      if (decision.state === "committed" || (dispatched && residentCreateMayBeProtected(command))) {
+        throw new ResidentOutcomeUnknownError(command, decision, error, signal);
+      }
       throw error;
     } finally { cleanup(); }
   }

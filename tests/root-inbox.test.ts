@@ -16,11 +16,12 @@ const held: RootInboxSession = { holdsBatch: () => true, holdsSteer: () => false
 const notHeld: RootInboxSession = { holdsBatch: () => false, holdsSteer: () => false };
 // A session whose entries hold the steers delivered so far (the pi-fabric-agent-message entries).
 const withSteers = (steers: Array<{ from: string; data: unknown }>): RootInboxSession => ({
+  ...rootInboxSession(steers.map(({ from, data }) => ({
+    // A current topic-scoped receipt, not an undated holdsSteer boolean, proves this claim.
+    type: "custom_message", timestamp: new Date().toISOString(), customType: "pi-fabric-agent-message",
+    details: { from: { id: from }, data: { topic: "fleet.work.pi-fabric.1", ...data as object } },
+  }))),
   holdsBatch: () => true,
-  holdsSteer: rootInboxSession(steers.map(({ from, data }) => ({
-    // The carrier names the shadow's topic: a key claims work on that topic only (#852 security P1).
-    type: "custom_message", customType: "pi-fabric-agent-message", details: { from: { id: from }, data: { topic: "fleet.work.pi-fabric.1", ...data as object } },
-  }))).holdsSteer,
 });
 
 const setup = () => {
@@ -188,7 +189,7 @@ describe("RootInbox.wake", () => {
     const { mesh, clock, inbox, work, texts } = setup();
     const box = inbox(60_000);
     await box.next(held);
-    await work("addressed");
+    await work("addressed", "fabric-v2");
     expect(await box.wake(held, idle)).toBeUndefined();            // inside the steer grace
     clock.advance(61_000);
     const batch = await box.wake(notHeld, idle);
@@ -234,7 +235,7 @@ describe("RootInbox.wake", () => {
     ]);
     expect((await box.next(rootInboxSession(entries))).events).toEqual([]);
     await box.close();
-    expect(wakes(mesh).map(event => event.data)).toEqual([{ count: 1, reason: "idle", ids: [fresh.id] }]);
+    expect(wakes(mesh).map(event => event.data)).toEqual([{ count: 1, reason: "addressed", ids: [fresh.id] }]);
   });
 
   it("never wakes for a broadcast without `to`, or for an event to someone else", async () => {
@@ -261,11 +262,11 @@ describe("RootInbox.wake", () => {
     const { clock, inbox, work, texts } = setup();
     const box = inbox(0);
     await box.next(held);
-    await work("first");
+    await work("first", "fabric-v2");
     clock.advance(1);
     expect(texts((await box.wake(held, idle))!.events)).toEqual(["first"]);
     clock.advance(60_000);
-    await work("a minute later");
+    await work("a minute later", "fabric-v2");
     clock.advance(1);
     expect(await box.wake(held, idle)).toBeUndefined();
     // The held-back event is not pending, so a p0 behind it still wakes at once, with both.
@@ -275,7 +276,7 @@ describe("RootInbox.wake", () => {
     await work("steer kind", me.id, "fleet.work.pi-fabric.3", "s", "steer");
     clock.advance(1);
     expect(texts((await box.wake(held, idle))!.events)).toEqual(["steer kind"]);
-    await work("later");
+    await work("later", "fabric-v2");
     clock.advance(4 * 60_000);
     expect(await box.wake(held, idle)).toBeUndefined();
     clock.advance(60_000);
@@ -300,17 +301,17 @@ describe("RootInbox.wake", () => {
     const { mesh, clock, inbox, work, texts } = setup();
     const box = inbox(0);
     await box.next(held);
-    await work("first");
+    await work("first", "fabric-v2");
     clock.advance(1);
     expect(await box.wake(held, idle)).toBeDefined();               // the cooldown starts here
-    for (let index = 1; index <= 20; index++) await work(`item ${index}`);
+    for (let index = 1; index <= 20; index++) await work(`item ${index}`, "fabric-v2");
     await work("urgent", me.id, "fleet.work.pi-fabric.2", "urgent", "p0");
     clock.advance(1);
     const first = await box.wake(held, idle);
     expect(first!.events).toHaveLength(20);
     // The settle of that run brings the next batch, with the urgent event: none is skipped.
     expect(texts((await box.next(held)).events)).toEqual(["urgent"]);
-    for (let index = 1; index <= 4; index++) await work(`${index}${"x".repeat(9_000)}`);
+    for (let index = 1; index <= 4; index++) await work(`${index}${"x".repeat(9_000)}`, "fabric-v2");
     await work("urgent steer", me.id, "fleet.work.pi-fabric.3", "s", "steer");
     clock.advance(1);
     expect((await box.wake(held, idle))!.events).toHaveLength(4);
@@ -318,7 +319,7 @@ describe("RootInbox.wake", () => {
     await new Promise((resolve) => setTimeout(resolve, 50));
     expect(wakes(mesh).map((event) => (event.data as { reason: string }).reason)).toEqual(["idle", "p0", "p0"]);
     // Without an urgent event, a full batch inside the cooldown still waits.
-    for (let index = 1; index <= 21; index++) await work(`plain ${index}`);
+    for (let index = 1; index <= 21; index++) await work(`plain ${index}`, "fabric-v2");
     clock.advance(1);
     expect(await box.wake(held, idle)).toBeUndefined();
   });

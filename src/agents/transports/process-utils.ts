@@ -322,8 +322,13 @@ export const spawnDetached = async (
   // The new tree-custody protocol is unsupported on Windows. Even an internal
   // caller requesting it must get only the legacy native worker-exit contract.
   const tracksExecution = executionCustodian && process.platform !== "win32";
-  // Scope admission execs in place: the captured PID and custody IPC stay owned.
-  const scopeRoot = scope ? fs.mkdtempSync(path.join(os.tmpdir(), "fabric-scope-")) : undefined;
+  // Use the prepared child scratch, not the parent's possibly replaced TMPDIR.
+  const temporary = environment?.TMPDIR ?? os.tmpdir();
+  // Canonicalize natively before joining marker paths (including symlink/..).
+  const scopeParent = fs.realpathSync.native(path.isAbsolute(temporary) ? temporary : `${cwd}${path.sep}${temporary}`);
+  if (!fs.statSync(scopeParent).isDirectory()) throw new Error("Scope temporary path is not a directory");
+  fs.accessSync(scopeParent, fs.constants.W_OK | fs.constants.X_OK);
+  const scopeRoot = fs.mkdtempSync(path.join(scopeParent, "fabric-scope-"));
   const marker = scopeRoot ? path.join(scopeRoot, "admitted") : undefined;
   // Capped task scopes get their own unit name; uncapped explicit scopes keep the old one.
   const memoryMaxBytes = scope?.memoryMaxBytes === undefined ? undefined : assertMemoryMaxBytes(scope.memoryMaxBytes);

@@ -28,7 +28,8 @@
  * retried ASYNCHRONOUSLY with short jittered sleeps capped at 4 ms, and the waiter joins the existing advisory
  * `MeshLockTicket` FIFO (keyed on `state.db`, separate from the `.lock` queue) after `fifoAfterMs` (default 25 ms).
  * The FIFO head waits inside SQLite's busy handler for HEAD_BUSY_MS (5 ms: node:sqlite runs it synchronously, so it
- * is an event-loop stall, kept within the existing busy_timeout clamp) and re-polls after 1 ms.
+ * is an event-loop stall, kept within the existing busy_timeout clamp) and re-polls after 1 ms. Ineligible non-heads
+ * wake on their predecessor's receipt removal, with a 20 ms safety net for missed events and stalled-head checks.
  * Mixed releases (smarty-dev#10516): the default is the contest of the releases before pi-fabric#936 (8d0af4b0),
  * 25 ms without a ticket and then the FIFO, so on a shared store a writer does no worse than they do. Strict FIFO
  * (smarty-dev#9805: with `fifoAfterMs: 0` a newcomer that finds anyone queued takes its ticket before its first
@@ -115,11 +116,12 @@ import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { MeshLockTimeoutError } from "../core/atomic-write.js";
+import { diagnostics } from "../core/diagnostics.js";
 import { captureStorageDelete, captureStoragePut, storageRevision, type StorageTransition } from "../verified/storage.js";
 import { encodeMeshStateMovedMarker, isMeshStateMovedMarker, isMeshStateNatsMarker, meshStateMovedToNatsError, readMeshStateMovedMarker } from "./backend-fence.js";
 import { holdMeshFence, holdMeshFenceSync } from "./fence-lock.js";
 import { type MeshLockTicket, meshLockQueueBusy, meshLockQueueDirectory } from "./lock-queue.js";
-import { createMeshLockAdmission } from "./mesh-lock.js";
+import { createMeshLockAdmission, lockStats } from "./mesh-lock.js";
 import { processStartTime, residentProcessAlive } from "../residency/process-identity.js";
 import { verifiedRemove } from "../storage/verified-remove.js";
 // From the domain modules, not the store.ts facade: store.ts loads this module through state-backend.ts (L2a).
@@ -143,7 +145,15 @@ export interface SqliteStatement {
   all(...params: SqliteValue[]): SqliteRow[];
 }
 
+export interface SqliteFileIdentity {
+  canonicalPath: string;
+  device: string;
+  inode: string;
+}
+
 export interface SqliteConnection {
+  /** Native driver evidence for the actual opened main database, not a configured filename. */
+  attestDatabaseFile?(): SqliteFileIdentity;
   exec(sql: string): void;
   prepare(sql: string): SqliteStatement;
   close(): void;
@@ -528,6 +538,48 @@ export interface SqliteStateChanges {
   changes: Array<{ commit: number; key: string; version: number; deleted: boolean }>;
 }
 
+type BatchConflictPolicy = "skip" | "abort" | ((current: MeshStateEntry | undefined) => "skip" | "abort");
+type CapturedBatchOperation =
+  | Readonly<{
+      index: number;
+      kind: "put";
+      key: string;
+      value: unknown | ((now: number) => unknown);
+      identity: MeshIdentity;
+      ifVersion: number | undefined;
+      onConflict: BatchConflictPolicy | undefined;
+      condition: undefined;
+    }>
+  | Readonly<{
+      index: number;
+      kind: "delete";
+      key: string;
+      value: undefined;
+      identity: undefined;
+      ifVersion: number | undefined;
+      onConflict: BatchConflictPolicy | undefined;
+      condition: ((current: (key: string) => MeshStateEntry | undefined) => boolean) | undefined;
+    }>;
+
+const snapshotBatchOperation = (operation: MeshBatchOperation, index: number,
+  batchIdentity: MeshIdentity): CapturedBatchOperation => {
+  const kind = operation.kind;
+  const key = operation.key;
+  const ifVersion = operation.ifVersion;
+  const onConflict = operation.onConflict;
+  if (kind === "put") {
+    const value = operation.value;
+    const identity = operation.identity ?? batchIdentity;
+    return Object.freeze({ index, kind, key, value, identity, ifVersion, onConflict, condition: undefined });
+  }
+  const condition = operation.condition;
+  return Object.freeze({ index, kind, key, value: undefined, identity: undefined, ifVersion, onConflict, condition });
+};
+
+const snapshotBatchOperations = (operations: readonly MeshBatchOperation[], batchIdentity: MeshIdentity,
+  offset = 0): CapturedBatchOperation[] => operations.map((operation, index) =>
+  snapshotBatchOperation(operation, offset + index, batchIdentity));
+
 const SCHEMA_VERSION = 1;
 const DEFAULT_MAX_STATE_BYTES = 32 * 1024 * 1024;
 const DEFAULT_MAX_STATE_TOMBSTONES = 1_000;
@@ -549,6 +601,8 @@ const WRITER_YIELD_BUDGET_MS = 250;
 // handler synchronously, so this blocks the event loop; 5 ms (the busy_timeout clamp) plus a 1 ms re-poll.
 const HEAD_BUSY_MS = 5;
 const HEAD_REPOLL_MS = 1;
+// Non-heads wake when their predecessor leaves at BEGIN; bounded safety net for missed events/stalled heads.
+const NONHEAD_REPOLL_MS = 20;
 // The dead-flag reclaim's claim file (removeDeadFlag) keeps its own, unchanged staleness.
 const CHECKPOINT_FLAG_CLAIM_STALE_MS = 1_000;
 // After a busy maintainer/emergency TRUNCATE this store makes no new attempt for this long (a maintainer: at most
@@ -583,7 +637,7 @@ const checkpointLogLevel = (option: CheckpointLogLevel | undefined): CheckpointL
   return process.stderr.isTTY ? "off" : "info";
 };
 const writeCheckpointLog = (line: string): void => {
-  try { process.stderr.write(`${line}\n`); } catch { /* observability only */ }
+  try { diagnostics.stderr("src/mesh/state-sqlite.ts", `${line}\n`); } catch { /* observability only */ }
 };
 const round1 = (ms: number): number => Math.round(ms * 10) / 10;
 // ponytail: 96 MiB, not 256: with a pinned reader every commit above 64 MiB stalls ~400 ms, so the cap must act
@@ -623,6 +677,26 @@ export const validateMeshStateKey = (key: string): void => {
   if (!KEY_PATTERN.test(key) || unsafeSegment) throw new Error(`Invalid Fabric mesh key: ${key}`);
 };
 
+/**
+ * Linux evidence captured at the native open. Never open/close a second plain-fs descriptor
+ * for state.db: POSIX would drop this process's SQLite locks. stat/readlink of /proc fds is safe.
+ * SQLite can share its main fd between connections; only evidence from OUR native opener may
+ * vouch for that case. An adapter without actual-connection evidence cannot enforce slots.
+ */
+const nativeDatabaseFds = new Map<number, { device: string; inode: string; users: number }>();
+const databaseFds = (file: string): Map<number, SqliteFileIdentity> => {
+  const found = new Map<number, SqliteFileIdentity>();
+  for (const name of fs.readdirSync("/proc/self/fd")) {
+    const fd = Number(name);
+    try {
+      if (fs.readlinkSync(`/proc/self/fd/${name}`) !== file) continue;
+      const stat = fs.statSync(`/proc/self/fd/${name}`, { bigint: true });
+      if (stat.isFile()) found.set(fd, { canonicalPath: file, device: String(stat.dev), inode: String(stat.ino) });
+    } catch { /* Descriptor closed by another native subsystem; it is not evidence. */ }
+  }
+  return found;
+};
+
 /** The default driver: node:sqlite `DatabaseSync` behind the `SqliteConnection` adapter surface. */
 export const openNodeSqlite: SqliteOpener = (file) => {
   // Loaded at first use (AGENTS.md startup budget). Bun 1.4 also provides node:sqlite.
@@ -630,8 +704,47 @@ export const openNodeSqlite: SqliteOpener = (file) => {
   try { sqlite = process.getBuiltinModule?.("node:sqlite"); }
   catch (error) { throw new MeshStateUnsupportedError("node:sqlite is unavailable in this runtime (Node >= 22.13 required)", { cause: error }); }
   if (!sqlite?.DatabaseSync) throw new MeshStateUnsupportedError("node:sqlite is unavailable in this runtime (Node >= 22.13 required)");
+  // Attestation is optional for ordinary state. Non-Linux runtimes retain their existing behavior.
+  let canonical: string | undefined;
+  let before: Map<number, SqliteFileIdentity> | undefined;
+  if (process.platform === "linux") try {
+    try { canonical = fs.realpathSync(file); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      canonical = path.join(fs.realpathSync(path.dirname(file)), path.basename(file));
+    }
+    before = databaseFds(canonical);
+  } catch { /* Ordinary SQLite remains usable without /proc; enforced slots fail closed. */ }
   const database = new sqlite.DatabaseSync(file, { timeout: 0 });
+  const descriptors: Array<[number, SqliteFileIdentity]> = [];
+  let after: Map<number, SqliteFileIdentity> | undefined;
+  if (canonical && before) try { after = databaseFds(canonical); } catch { /* No attestation. */ }
+  if (after) {
+    for (const [fd, identity] of after) {
+      const known = nativeDatabaseFds.get(fd);
+      if (before!.has(fd) && (!known || known.device !== identity.device || known.inode !== identity.inode)) continue;
+      descriptors.push([fd, identity]);
+      nativeDatabaseFds.set(fd, { ...identity, users: (known?.users ?? 0) + 1 });
+    }
+  }
+  let closed = false;
   return {
+    attestDatabaseFile: () => {
+      if (closed || !canonical || descriptors.length === 0) throw new Error("SQLite connection has no Linux main-file fd attestation");
+      const main = database.prepare("PRAGMA database_list").all().find(row => row.name === "main");
+      if (main?.file !== canonical || fs.realpathSync(file) !== canonical) throw new Error("SQLite main database path changed");
+      const current = fs.lstatSync(file, { bigint: true });
+      if (!current.isFile()) throw new Error("SQLite main database is not a regular file");
+      for (const [fd, identity] of descriptors) {
+        try {
+          const opened = fs.statSync(`/proc/self/fd/${fd}`, { bigint: true });
+          if (opened.isFile() && String(opened.dev) === identity.device && String(opened.ino) === identity.inode
+            && String(current.dev) === identity.device && String(current.ino) === identity.inode
+            && fs.readlinkSync(`/proc/self/fd/${fd}`) === canonical) return { ...identity };
+        } catch { /* Try the other descriptor captured at this connection's native open. */ }
+      }
+      throw new Error("SQLite opened main-file inode no longer matches its path");
+    },
     exec: (sql) => { database.exec(sql); },
     prepare: (sql) => {
       const statement = database.prepare(sql);
@@ -641,7 +754,15 @@ export const openNodeSqlite: SqliteOpener = (file) => {
         all: (...params) => statement.all(...params),
       };
     },
-    close: () => { database.close(); },
+    close: () => {
+      if (closed) return;
+      database.close();
+      closed = true;
+      for (const [fd, identity] of descriptors) {
+        const known = nativeDatabaseFds.get(fd);
+        if (known?.device === identity.device && known.inode === identity.inode && --known.users === 0) nativeDatabaseFds.delete(fd);
+      }
+    },
     get isTransaction() { return database.isTransaction; },
   };
 };
@@ -961,6 +1082,36 @@ export class SqliteStateStore {
     this.#assertReadable();
   }
 
+  /** Actual native connection evidence. No fs open/close of the database is involved. */
+  attestDatabaseFile(): SqliteFileIdentity {
+    this.#assertOpen();
+    if (!this.#db.attestDatabaseFile) throw new Error("SQLite adapter cannot attest its opened database inode");
+    return this.#db.attestDatabaseFile();
+  }
+
+  /** Host bootstrap seal, outside public KV and therefore not writable through mesh tools. */
+  slotAuthorityBinding(): string | undefined {
+    this.#assertReadable();
+    const value = this.#sql.metaGet.get("slot_admission_binding")?.value;
+    return typeof value === "string" ? value : undefined;
+  }
+
+  /**
+   * Native fresh bootstrap ONLY, after the installer won O_EXCL creation of state.db.
+   * Empty after a restart is NOT freshness. The caller must never call this on an existing file.
+   */
+  async initializeSlotAuthority(binding: string, beforeCommit: () => void): Promise<void> {
+    await this.#write("other", tx => {
+      if (tx.highWater !== 0 || tx.commit !== 0 || this.#sql.metaGet.get("slot_admission_binding")
+        || Number(this.#sql.kvCount.get()?.n) !== 0 || Number(this.#sql.tombCount.get()?.n) !== 0) {
+        throw new Error("Existing SQLite authority cannot be enabled; smarty-dev#13036");
+      }
+      this.#db.prepare("INSERT INTO meta(name, value) VALUES ('slot_admission_binding', ?)").run(binding);
+      tx.finish = true;
+      tx.beforeCommit = beforeCommit;
+    });
+  }
+
   /** Cheap per-connection "did another connection commit?" counter (PRAGMA data_version). */
   dataVersion(): number {
     this.#assertOpen();
@@ -1056,11 +1207,12 @@ export class SqliteStateStore {
 
   // ---------------------------------------------------------------- writes
 
-  async put(input: { key: string; value: unknown; identity: MeshIdentity; ifVersion?: number }): Promise<MeshStateEntry> {
-    const { key, value, identity, ifVersion } = input;
+  async put(input: { key: string; value: unknown; identity: MeshIdentity; ifVersion?: number; beforeCommit?: () => void }): Promise<MeshStateEntry> {
+    const { key, value, identity, ifVersion, beforeCommit } = input;
     validateMeshStateKey(key);
     const request = captureStoragePut({ key, value, identity, ifVersion }, this.maxEventBytes);
     return this.#write("put/delete", (tx) => {
+      if (beforeCommit) tx.beforeCommit = beforeCommit;
       const slot = this.#slot(request.key);
       const plan = request.transition(slot.present, slot.version, tx.highWater);
       if (plan.kind !== "put") throw new Error("Invalid verified storage put plan");
@@ -1068,11 +1220,12 @@ export class SqliteStateStore {
     });
   }
 
-  async delete(input: { key: string; ifVersion?: number }): Promise<{ deleted: boolean; version?: number }> {
-    const { key, ifVersion } = input;
+  async delete(input: { key: string; ifVersion?: number; beforeCommit?: () => void }): Promise<{ deleted: boolean; version?: number }> {
+    const { key, ifVersion, beforeCommit } = input;
     validateMeshStateKey(key);
     const request = captureStorageDelete({ key, ifVersion });
     return this.#write<{ deleted: boolean; version?: number }>("put/delete", (tx) => {
+      if (beforeCommit) tx.beforeCommit = beforeCommit;
       const slot = this.#slot(request.key);
       const plan = request.transition(slot.present, slot.version, tx.highWater);
       if (plan.kind === "unchanged") return { deleted: false };
@@ -1098,19 +1251,38 @@ export class SqliteStateStore {
     lockClass?: "bridge";
   }): Promise<MeshBatchResult[]> {
     const lockClass: MeshLockClass = input.lockClass === "bridge" ? "bridge" : "writeBatch";
-    for (const op of input.ops) validateMeshStateKey(op.key);
-    if (input.ops.length === 0 && !input.prepare && !input.afterCommit && !input.beforeCommit) return [];
+    const batchIdentity = input.identity;
+    const prepare = input.prepare;
+    const afterCommit = input.afterCommit;
+    const beforeCommit = input.beforeCommit;
+    // Snapshot every caller operation before any serialization. Later toJSON hooks may mutate
+    // the caller's operations or input.ops; the frozen descriptors are the only operations used below.
+    const callerOps = snapshotBatchOperations(input.ops, batchIdentity);
+    for (const op of callerOps) validateMeshStateKey(op.key);
+    if (callerOps.length === 0 && !prepare && !afterCommit && !beforeCommit) return [];
+    // Static, unconditional caller payloads are captured once. CAS puts are deliberately absent:
+    // their value (and identity) is captured only after the locked CAS decision, so skipped values
+    // never invoke toJSON.
+    const captured = new Map<CapturedBatchOperation, ReturnType<typeof captureStoragePut> | { error: unknown }>();
+    for (const op of callerOps) {
+      if (op.kind !== "put" || typeof op.value === "function" || op.ifVersion !== undefined) continue;
+      try { captured.set(op, captureStoragePut({ key: op.key, value: op.value, identity: op.identity }, this.maxEventBytes)); }
+      catch (error) { captured.set(op, { error }); }
+    }
     let committed: number | undefined;
     const results = await this.#write(lockClass, (tx) => {
-      if (input.beforeCommit) tx.beforeCommit = input.beforeCommit;
+      if (beforeCommit) tx.beforeCommit = beforeCommit;
       const view = this.#view();
       const started = performance.now();
-      const prepared = input.prepare?.(view) ?? [];
+      const prepared = prepare?.(view) ?? [];
       if (typeof (prepared as unknown as { then?: unknown }).then === "function") {
         throw new Error("Fabric mesh writeBatch prepare must be synchronous");
       }
       this.#stats.maxPrepareMs = Math.max(this.#stats.maxPrepareMs, performance.now() - started);
-      const ops = [...input.ops, ...prepared];
+      // Prepare is one phase: snapshot all generated descriptors before any value or identity
+      // serialization. Caller descriptors were captured before entering this transaction.
+      const preparedOps = snapshotBatchOperations(prepared, batchIdentity, callerOps.length);
+      const ops = callerOps.concat(preparedOps);
       for (const op of ops) validateMeshStateKey(op.key);
       const results: MeshBatchResult[] = [];
       const now = Date.now();
@@ -1127,12 +1299,14 @@ export class SqliteStateStore {
           results.push({ key: op.key, applied: false, version: slot.version });
           continue;
         }
-        const request = op.kind === "delete"
+        const ready = captured.get(op);
+        if (ready && "error" in ready) throw ready.error;
+        const request = ready ?? (op.kind === "delete"
           ? captureStorageDelete({ key: op.key, ifVersion: op.ifVersion })
           : captureStoragePut({
-            key: op.key, ifVersion: op.ifVersion, identity: op.identity ?? input.identity,
-            value: typeof op.value === "function" ? (op.value as (now: number) => unknown)(now) : op.value,
-          }, this.maxEventBytes);
+            key: op.key, ifVersion: op.ifVersion, identity: op.identity,
+            value: typeof op.value === "function" ? op.value(now) : op.value,
+          }, this.maxEventBytes));
         const plan = request.transition(slot.present, slot.version, tx.highWater);
         if (plan.kind === "unchanged") {
           results.push({ key: op.key, applied: false, version: slot.version });
@@ -1145,14 +1319,13 @@ export class SqliteStateStore {
       if (tx.changes.length > 0) committed = tx.commit + 1;
       // A write-free batch still validates external ownership before its legacy effect.
       // Run that effect on the exact snapshot, preserving the write-free contract.
-      else if (input.afterCommit) {
-        input.beforeCommit?.();
-        this.#timedAfterCommit(input.afterCommit, view);
+      else if (afterCommit) {
+        beforeCommit?.();
+        this.#timedAfterCommit(afterCommit, view);
       }
       return results;
     });
-    if (committed !== undefined && input.afterCommit) {
-      const afterCommit = input.afterCommit;
+    if (committed !== undefined && afterCommit) {
       this.#stats.afterCommitReacquired += 1;
       await this.#write(lockClass, (tx) => {
         if (tx.commit !== committed) this.#stats.afterCommitIntervened += 1;
@@ -1676,8 +1849,9 @@ export class SqliteStateStore {
             if (headWaitMs > this.#busyTimeoutMs) this.#db.exec(`PRAGMA busy_timeout = ${this.#busyTimeoutMs}`);
           }
           if (begun) {
-            this.#stats.maxWaitMs = Math.max(this.#stats.maxWaitMs, performance.now() - started);
-            this.#window.maxWaitMs = Math.max(this.#window.maxWaitMs, performance.now() - started);
+            const waitMs = performance.now() - started;
+            this.#stats.maxWaitMs = Math.max(this.#stats.maxWaitMs, waitMs);
+            this.#window.maxWaitMs = Math.max(this.#window.maxWaitMs, waitMs);
             // smarty-dev#6100: the SQLite writer lock is the exclusion; the advisory receipt only orders waiters.
             // Leave the queue now, so post-COMMIT work (SQLite's autocheckpoint fsync inside COMMIT, the emergency
             // checkpoint) never keeps the next waiter from contending.
@@ -1685,7 +1859,7 @@ export class SqliteStateStore {
             ticket = undefined;
             this.#writesWaiting -= 1;
             waiting = false;
-            return this.#run(body, lockClass);
+            return this.#run(body, lockClass, waitMs);
           }
         }
         const now = performance.now();
@@ -1705,7 +1879,9 @@ export class SqliteStateStore {
           // ticket at the head (pi-fabric#905 review round 3).
           ticket?.close();
           ticket = undefined;
-          if (!scope?.active && budget > 0) lockEvents?.waitTimeout(this.root, "sqlite", lockClass, now - started, walWriterPid(this.file));
+          const tried = Boolean(scope?.active) || budget <= 0;
+          lockStats?.failed(this.root, lockClass, now - started, tried);
+          if (!tried) lockEvents?.waitTimeout(this.root, "sqlite", lockClass, now - started, walWriterPid(this.file));
           throw new MeshLockTimeoutError(` (SQLite state ${this.file})`, attempts, Math.round(maxGap));
         }
         if (!ticket && now - started >= this.#fifoAfterMs) {
@@ -1715,9 +1891,12 @@ export class SqliteStateStore {
           if (ticket) this.#stats.fifoJoins += 1;
         }
         const cap = Math.min(4, 2 ** Math.min(attempts - 1, 2));
-        // The FIFO head re-polls at once (it alone may contend); everyone else keeps the jittered sleep.
+        // The FIFO head re-polls at once; plain contenders keep their jittered sleep.
         const head = headWaitMs > 0;
-        await delay(Math.min(deadline - now, head ? HEAD_REPOLL_MS : cap * (0.5 + Math.random() / 2)), this.#signal);
+        // Only non-heads use ticket.wait: its head watcher expects a directory/.lock, not this state.db.
+        // Receipt removal is their normal wake; avoid every queued writer re-statting WAL/flags every 2..4 ms.
+        if (ticket && !eligible) await ticket.wait(Math.min(deadline - now, NONHEAD_REPOLL_MS), this.#signal);
+        else await delay(Math.min(deadline - now, head ? HEAD_REPOLL_MS : cap * (0.5 + Math.random() / 2)), this.#signal);
         if (yielding) yieldedMs += performance.now() - iteration;
       }
     } finally {
@@ -1753,7 +1932,7 @@ export class SqliteStateStore {
   }
 
   // The synchronous body between BEGIN IMMEDIATE (already taken) and COMMIT.
-  #run<T>(body: (tx: Tx) => T, lockClass: MeshLockClass): T {
+  #run<T>(body: (tx: Tx) => T, lockClass: MeshLockClass, waitMs: number): T {
     const began = performance.now();
     this.#inTransaction = true;
     this.#stats.transactions += 1;
@@ -1784,6 +1963,8 @@ export class SqliteStateStore {
       const hold = performance.now() - began;
       this.#stats.totalHoldMs += hold;
       this.#stats.maxHoldMs = Math.max(this.#stats.maxHoldMs, hold);
+      // One sample per actual SQLite transaction, including rollback, after releasing its writer lock.
+      lockStats?.acquired(this.root, lockClass, waitMs, hold);
       this.#heldEvent(lockClass, hold);
       if (committed && changed) {
         // data_version does not change for this connection's own commits. Metadata-only

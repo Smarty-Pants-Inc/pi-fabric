@@ -148,7 +148,7 @@ console.log(JSON.stringify({ root, configRoot, paths: Object.fromEntries(keys.ma
 
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
-test.each(["vitest.config.ts", "tests/fleet-isolation-setup.ts"])(
+test.each(["vitest.config.cts", "tests/fleet-isolation-setup.ts"])(
   "%s fences inherited fleet paths before real source initialization and config writes",
   (entry) => {
     const sentinel = fs.mkdtempSync(path.join(tmpdir(), "fleet-isolation-sentinel-"));

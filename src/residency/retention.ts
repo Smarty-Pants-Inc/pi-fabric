@@ -347,6 +347,9 @@ export class ResidentRequestRetention {
       if (kind === "runs") {
         // The request-proof wildcard is not an exit receipt for any particular run.
         const retainedRuns = this.#runReferences!.ids;
+        // A stopped writer can still have a manager-owned handle (pi-fabric#1122).
+        // Keep its run before archive recovery, compaction or removal, as in V2.
+        if (this.custody?.run(entry.name)) continue;
         // Replay one untracked run (and its nested sources) under the host fence,
         // before any compaction/deletion. Never walk the archive during startup
         // or discharge the custody of a live manager's in-memory settlement.

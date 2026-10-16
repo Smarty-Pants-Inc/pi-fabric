@@ -38,6 +38,57 @@ function writeStatus(text) {
   }
 }
 
+// Opt-in boot gate: arm the watcher before announcing entry so a test can
+// hold transport launch apart from the worker's very first status publication.
+const bootGateMatch = task.match(/"fakeWorkerBootGate":\s*("(?:\\.|[^"\\])*")/);
+if (bootGateMatch) {
+  const release = JSON.parse(bootGateMatch[1]);
+  await new Promise((resolve, reject) => {
+    const watcher = fs.watch(path.dirname(release), () => {
+      if (fs.existsSync(release)) finish();
+    });
+    const timeout = setTimeout(() => finish(new Error("Fake worker boot gate timed out")), 10_000);
+    function finish(error) {
+      clearTimeout(timeout);
+      watcher.close();
+      if (error) reject(error); else resolve();
+    }
+    watcher.on("error", finish);
+    fs.writeFileSync(`${release}.entered`, "ready");
+    if (fs.existsSync(release)) finish();
+  });
+}
+
+// Opt-in live-run gate: unlike the boot gate, this publishes a real running
+// worker before waiting. Topic-mutation tests can release inference explicitly,
+// rather than relying on LIVE_WITH_PROGRESS's wall-clock completion window.
+const finishGateMatch = task.match(/"fakeWorkerFinishGate":\s*("(?:\\.|[^"\\])*")/);
+if (finishGateMatch) {
+  const release = JSON.parse(finishGateMatch[1]);
+  await new Promise((resolve, reject) => {
+    const watcher = fs.watch(path.dirname(release), () => {
+      if (fs.existsSync(release)) finish();
+    });
+    const timeout = setTimeout(() => finish(new Error("Fake worker finish gate timed out")), 15_000);
+    function finish(error) {
+      clearTimeout(timeout);
+      watcher.close();
+      if (error) reject(error); else resolve();
+    }
+    watcher.on("error", finish);
+    const now = Date.now();
+    writeStatus(JSON.stringify({
+      id: args.get("id"), name: args.get("name"), task, status: "running",
+      runner: args.get("runner") ?? "pi", transport: args.get("transport"),
+      cwd: args.get("cwd"), startedAt: now, updatedAt: now,
+      turns: 1, toolCalls: 0, text: "", exitCode: null,
+      usage: { input: 1, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
+    }));
+    fs.writeFileSync(`${release}.entered`, "running");
+    if (fs.existsSync(release)) finish();
+  });
+}
+
 if (task.includes("HANG_WITH_PROGRESS")) {
   // A run that has done work (so an abort detaches it) and never finishes on its own:
   // only a stop or a kill ends it (smarty-dev#1113).

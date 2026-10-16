@@ -1,6 +1,8 @@
+import { diagnostics } from "../core/diagnostics.js";
 import fs from "node:fs";
 import path from "node:path";
 import { syncDirectoryChain } from "../core/atomic-write.js";
+import { detachedPreview } from "../core/preview.js";
 import type { FabricMeshConfig, FabricRetentionConfig } from "../config.js";
 import type { MeshStore } from "../mesh/store.js";
 import { pruneActorRunArchives, pruneActorSessionBackups } from "../storage/retention.js";
@@ -345,7 +347,7 @@ const serializedBytes = (value: unknown): number =>
   Buffer.byteLength(JSON.stringify(value), "utf8");
 
 const truncateUtf8 = (value: string, maxBytes: number, suffix = ""): string => {
-  if (Buffer.byteLength(value, "utf8") <= maxBytes) return value;
+  if (Buffer.byteLength(value, "utf8") <= maxBytes) return detachedPreview(value, value.length);
   const boundedSuffix = Buffer.byteLength(suffix, "utf8") <= maxBytes
     ? suffix
     : truncateUtf8(suffix, maxBytes);
@@ -357,11 +359,11 @@ const truncateUtf8 = (value: string, maxBytes: number, suffix = ""): string => {
     if (Buffer.byteLength(value.slice(0, middle), "utf8") <= available) low = middle;
     else high = middle - 1;
   }
-  return `${value.slice(0, low)}${boundedSuffix}`;
+  return `${detachedPreview(value, low)}${boundedSuffix}`;
 };
 
 const boundedActorText = (value: string, maxBytes: number): string => {
-  if (serializedBytes({ text: value }) <= maxBytes) return value;
+  if (serializedBytes({ text: value }) <= maxBytes) return detachedPreview(value, value.length);
   const suffix = serializedBytes({ text: ACTOR_TRUNCATION_SUFFIX }) <= maxBytes
     ? ACTOR_TRUNCATION_SUFFIX
     : "";
@@ -375,7 +377,7 @@ const boundedActorText = (value: string, maxBytes: number): string => {
       high = middle - 1;
     }
   }
-  return `${value.slice(0, low)}${suffix}`;
+  return `${detachedPreview(value, low)}${suffix}`;
 };
 
 const boundedActorData = (data: unknown, maxBytes: number): unknown => {
@@ -428,7 +430,7 @@ export class ActorLogStore {
     const anchor = actorsAt > 0 ? sessionDirectory.slice(0, actorsAt) : sessionDirectory;
     try { held = openPrivateDir(dest, anchor); }
     catch (error) {
-      console.warn(`[pi-fabric] actor run ${runId} not archived: ${(error as Error).message}`);
+      diagnostics.warn("src/actors/log-store.ts", `[pi-fabric] actor run ${runId} not archived: ${(error as Error).message}`);
       return;
     }
     try {
@@ -449,8 +451,8 @@ export class ActorLogStore {
         const src = path.join(runDirectory, file);
         if (!fs.existsSync(src)) continue;
         try {
-          if (!writeArchiveFile(held, file, { source: src })) console.warn(`[pi-fabric] actor run ${runId}: archive entry ${file} exists and is not our regular file; not written`);
-        } catch (error) { console.warn(`[pi-fabric] actor run ${runId}: archive entry ${file} not written: ${(error as Error).message}`); }
+          if (!writeArchiveFile(held, file, { source: src })) diagnostics.warn("src/actors/log-store.ts", `[pi-fabric] actor run ${runId}: archive entry ${file} exists and is not our regular file; not written`);
+        } catch (error) { diagnostics.warn("src/actors/log-store.ts", `[pi-fabric] actor run ${runId}: archive entry ${file} not written: ${(error as Error).message}`); }
       }
       const nested = path.join(runDirectory, "nested");
       if (fs.existsSync(nested)) {
@@ -496,7 +498,7 @@ export class ActorLogStore {
           }
           assertArchiveRunIdentity(dest, held);
         } catch (error) {
-          if ((error as NodeJS.ErrnoException).code === "EEXIST") console.warn(`[pi-fabric] actor run ${runId}: archive nested/ exists; not copied again`);
+          if ((error as NodeJS.ErrnoException).code === "EEXIST") diagnostics.warn("src/actors/log-store.ts", `[pi-fabric] actor run ${runId}: archive nested/ exists; not copied again`);
           else throw error; // incomplete control transfer never confirms archival
         }
       }
@@ -544,7 +546,7 @@ export class ActorLogStore {
     const dataBytes = hasText && hasData ? contentBytes - textBytes : contentBytes;
     if (bounded.text) {
       const contextBounded = bounded.text.length > this.config.eventContextChars
-        ? `${bounded.text.slice(0, this.config.eventContextChars)}${ACTOR_TRUNCATION_SUFFIX}`
+        ? `${detachedPreview(bounded.text, this.config.eventContextChars)}${ACTOR_TRUNCATION_SUFFIX}`
         : bounded.text;
       bounded.text = boundedActorText(contextBounded, textBytes);
     }

@@ -1125,7 +1125,7 @@ export class StoreBridgeSide implements BridgeSide {
           });
           // The lease carries the origin's incarnation, so a later removal can tell it from a replacement's.
           leases.push({ id: record.id, rootId: record.rootId, identityId: record.identity.id, ...incarnationOf(record),
-            updatedAt: renewedAt, expiresAt: until, mirrorLease: 1, ...(mirror ? { mirror } : {}) });
+            updatedAt: renewedAt, expiresAt: until, ...(mirror ? { mirrorLease: 1, mirror } : {}) });
         }
         for (const participant of presence.participants) {
           const owner = hosts.get(participant.ownerHostId);

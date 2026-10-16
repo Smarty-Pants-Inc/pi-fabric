@@ -529,6 +529,15 @@ const meshNatsReplicas = (value: unknown): number => {
   throw new Error("mesh.nats.replicas must be a positive integer");
 };
 
+/** E14 messaging/rollback settings fail visibly in the same typed config-error family as E9. */
+export class FabricMeshNatsConfigError extends Error {
+  readonly code = "FABRIC_MESH_TRANSPORT_CONFIG";
+  constructor(readonly field: "operatorMachine" | "rollbackHoldUntil", requirement: string) {
+    super(`mesh.nats.${field} ${requirement}`);
+    this.name = "FabricMeshNatsConfigError";
+  }
+}
+
 export interface FabricMeshNatsConfig {
   /** Stream num_replicas on create; an existing stream with a different count is refused (default 1). */
   replicas: number;
@@ -538,6 +547,10 @@ export interface FabricMeshNatsConfig {
   credentials?: string;
   /** Literal machine id; the adapter must also verify it against the credential. */
   machine?: string;
+  /** Reserved fabric-ops[-<lowercase alphanumeric>] relay source token; required for NATS, never this runtime's machine. */
+  operatorMachine?: string;
+  /** UTC ISO-8601 withdrawal hold, also honored after rollback to file. Composition roots convert to epoch ms. */
+  rollbackHoldUntil?: string;
   /** Parallel inbox lanes; normalized configs supply 8, with a minimum of 1. */
   inboxLanes?: number;
 }
@@ -551,10 +564,45 @@ const meshNatsString = (value: unknown, field: "credentials" | "machine"): strin
   return value;
 };
 
+/** Shared E16b guard: roots validate before NATS open and again against transport.self.machine after open. */
+export const validateFabricNatsOperatorMachine = (value: unknown, machine?: string): string => {
+  // Require the whole reserved literal: JavaScript's $ also matches just before a final newline.
+  if (typeof value !== "string" || value.length > 32 || /^fabric-ops(-[a-z0-9]+)?$/.exec(value)?.[0] !== value) {
+    throw new FabricMeshNatsConfigError("operatorMachine", "is required in NATS mode and must match /^fabric-ops(-[a-z0-9]+)?$/");
+  }
+  if (value === machine) {
+    throw new FabricMeshNatsConfigError("operatorMachine", "must differ from mesh.nats.machine");
+  }
+  return value;
+};
+
+const meshNatsRollbackHoldUntil = (value: unknown): string | undefined => {
+  if (value === undefined) return undefined;
+  // Date.parse alone accepts local times and normalizes impossible dates (e.g. February 30).
+  // Keep the original UTC string, including its precision, for the composition roots.
+  const match = typeof value === "string"
+    ? /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?(?:Z|\+00:00)$/.exec(value)
+    : null;
+  if (typeof value === "string" && match && match[0] === value && Number.isFinite(Date.parse(value))) {
+    const [, year, month, day, hour, minute, second] = match;
+    const date = new Date(Date.parse(value));
+    if (date.getUTCFullYear() === Number(year) && date.getUTCMonth() + 1 === Number(month)
+      && date.getUTCDate() === Number(day) && Number(hour) < 24 && Number(minute) < 60
+      && (second === undefined || Number(second) < 60)) return value;
+  }
+  throw new FabricMeshNatsConfigError("rollbackHoldUntil", "must be a valid UTC ISO-8601 timestamp");
+};
+
 const meshNatsConfig = (value: unknown, transport: FabricMeshTransport): FabricMeshNatsConfig => {
   const nats = objectValue(value);
-  // File-mode config previously ignored all messaging settings; keep that behavior unchanged.
-  if (transport === "file") return { replicas: meshNatsReplicas(nats.replicas), inboxLanes: 8 };
+  // File mode still ignores messaging settings and their inherited snapshot. E14's hold is host rollback policy.
+  if (transport === "file") {
+    const rollbackHoldUntil = meshNatsRollbackHoldUntil(nats.rollbackHoldUntil);
+    return {
+      replicas: meshNatsReplicas(nats.replicas), inboxLanes: 8,
+      ...(rollbackHoldUntil !== undefined ? { rollbackHoldUntil } : {}),
+    };
+  }
   let messaging = nats;
   const raw = process.env.PI_FABRIC_MESH_NATS;
   if (transport === "nats" && raw !== undefined) {
@@ -571,11 +619,15 @@ const meshNatsConfig = (value: unknown, transport: FabricMeshTransport): FabricM
   }
   const credentials = meshNatsString(messaging.credentials, "credentials");
   const machine = meshNatsString(messaging.machine, "machine");
+  const operatorMachine = validateFabricNatsOperatorMachine(messaging.operatorMachine, machine);
+  const rollbackHoldUntil = meshNatsRollbackHoldUntil(messaging.rollbackHoldUntil);
   return {
     replicas: meshNatsReplicas(nats.replicas),
     ...(servers !== undefined ? { servers: [...servers as string[]] } : {}),
     ...(credentials !== undefined ? { credentials } : {}),
     ...(machine !== undefined ? { machine } : {}),
+    operatorMachine,
+    ...(rollbackHoldUntil !== undefined ? { rollbackHoldUntil } : {}),
     inboxLanes: boundedInteger(messaging.inboxLanes, 8, 1, Number.MAX_SAFE_INTEGER),
   };
 };

@@ -23,8 +23,10 @@ export const childMeshTransportEnvironment = (
   delete child.PI_FABRIC_MESH_NATS;
   if (mesh.hostTransport !== undefined) child.PI_FABRIC_MESH_HOST_TRANSPORT = mesh.hostTransport;
   if (mesh.transport === "nats") {
-    const { servers, credentials, machine, inboxLanes } = mesh.nats;
-    child.PI_FABRIC_MESH_NATS = JSON.stringify({ servers, credentials, machine, inboxLanes: inboxLanes ?? 8 });
+    const { servers, credentials, machine, inboxLanes, operatorMachine, rollbackHoldUntil } = mesh.nats;
+    child.PI_FABRIC_MESH_NATS = JSON.stringify({
+      servers, credentials, machine, inboxLanes: inboxLanes ?? 8, operatorMachine, rollbackHoldUntil,
+    });
   }
   return child;
 };

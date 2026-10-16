@@ -14,9 +14,9 @@ export {
   openNatsKvForMachine,
 } from "./kv.js";
 export type { NatsKvEntry, NatsKvEvent, NatsKvPolicy, NatsKvStore } from "./kv.js";
-export { consumeDeadLetters, deadLetterId } from "./dead-letter.js";
+export { consumeDeadLetters, createDeadLetterPublisher, deadLetterId, ensureDeadLetterConsumer } from "./dead-letter.js";
 export { runTransportAdmin } from "./admin.js";
-export type { DeadLetterEnvelope, DeadLetterOperatorOptions, DeadLetterSink, MaxDeliverAdvisory } from "./dead-letter.js";
+export type { DeadLetterEnvelope, DeadLetterOperatorOptions, DeadLetterPublisherOptions, DeadLetterSink, MaxDeliverAdvisory } from "./dead-letter.js";
 export type { NatsTransportOptions } from "./inbox.js";
 export {
   ADVISORY_CAPTURE_STREAM,

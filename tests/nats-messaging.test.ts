@@ -12,7 +12,7 @@ import {
   openNatsKv,
 } from "../src/transport/nats/kv.js";
 import { openNatsTransport } from "../src/transport/nats/inbox.js";
-import { consumeDeadLetters, type DeadLetterEnvelope } from "../src/transport/nats/dead-letter.js";
+import { consumeDeadLetters, ensureDeadLetterConsumer, type DeadLetterEnvelope } from "../src/transport/nats/dead-letter.js";
 import { ensureTransportConsumer } from "../src/transport/nats/provision.js";
 import {
   transportAdvisoryStreamSubject,
@@ -165,6 +165,7 @@ describe.skipIf(!existsSync(binary))("real nats-server Path B module", () => {
     const admin = await openNatsConnection({ servers: serverUrl, verifyMachine: false });
     const dlqAbort = new AbortController();
     const captured: DeadLetterEnvelope[] = [];
+    await ensureDeadLetterConsumer(admin.manager);
     const capture = consumeDeadLetters({ manager: admin.manager, js: admin.js, machines: ["ryzen1", "ryzen2"],
       signal: dlqAbort.signal, once: true, sink: { put: async (record) => { captured.push(record); } } });
     try {

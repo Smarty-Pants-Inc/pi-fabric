@@ -9,6 +9,7 @@ import { ResidentHost } from "../src/residency/host.js";
 import { residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
 import * as wake from "../src/residency/wake.js";
 import * as index from "../src/residency/wake-index.js";
+import * as fileLock from "../src/residency/file-lock.js";
 
 const fixture = () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-wake-recovery-"));
@@ -33,6 +34,53 @@ const overflow = (meshRoot: string, root: string, id: string, sequence = 1) => {
 };
 
 describe("bounded own-root resident startup recovery", () => {
+  it.skipIf(process.platform === "win32").each([false, true])("round2 startup recovery rechecks host lifecycle during intent custody, open=%s", async staysOpen => {
+    const f = fixture();
+    const seed = new ResidentHost(f.config, () => {});
+    const mesh = new MeshStore(f.config.meshRoot, 65_536, 100, { canWakeResidents: () => false });
+    let host: ResidentHost | undefined;
+    let release!: () => void;
+    let closing: Promise<void> | undefined;
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await seed.start();
+      const actor = await seed.actors.create({ name: "round2-listener", instructions: "listen", residency: "durable", topics: ["recovery.topic"] });
+      await vi.waitFor(() => expect(index.retainedRoutesAt(f.config.residencyRoot)?.actors.some(route => route.id === actor.id)).toBe(true));
+      seed.actors.pauseForRelease(); await seed.actors.checkpointForRelease(); await seed.close();
+      await wake.ensureResidentWakeArchive(mesh);
+      const event = await mesh.publish({ topic: "recovery.topic", from: f.from });
+      host = new ResidentHost(f.config, () => {});
+      let recovering = false;
+      const dispatch = wake.wakeResidentActors;
+      vi.spyOn(wake, "wakeResidentActors").mockImplementation(async (...args) => {
+        recovering = !!args[3];
+        try { await dispatch(...args); } finally { recovering = false; }
+      });
+      const lock = fileLock.lockFile;
+      let entered!: () => void;
+      const waiting = new Promise<void>(resolve => { entered = resolve; });
+      const held = new Promise<void>(resolve => { release = resolve; });
+      let heldOnce = false;
+      vi.spyOn(fileLock, "lockFile").mockImplementation(async (...args) => {
+        const fd = await lock(...args);
+        if (recovering && !heldOnce && args[0] === wake.residentWakeIntentLockPath(f.config.residencyRoot)) {
+          heldOnce = true; entered(); await held;
+        }
+        return fd;
+      });
+      const starting = host.start();
+      await waiting;
+      expect(fs.existsSync(wake.residentWakeRequestPath(f.config.residencyRoot))).toBe(false);
+      if (!staysOpen) closing = host.close(); // #closed flips synchronously while custody is suspended.
+      release();
+      await starting;
+      await closing;
+      expect(fs.existsSync(wake.residentWakeRequestPath(f.config.residencyRoot))).toBe(staysOpen);
+      if (staysOpen) expect(wake.readWakeJson<{ id: string }>(wake.residentWakeRequestPath(f.config.residencyRoot))?.id).toBe(event.id);
+      else expect(index.residentUnacknowledgedDeliveries(mesh.root).get(f.config.residencyRoot)?.id).toBe(event.id);
+      expect(fs.existsSync(path.join(f.config.residencyRoot, "wake-failure.json"))).toBe(false);
+    } finally { release?.(); await closing; await host?.close(); await seed.close(); mesh.closeState(); vi.restoreAllMocks(); fs.rmSync(f.root, { recursive: true, force: true }); }
+  });
   it("publishes readiness after at most 256 of 10,000 overflow entries, then visits every entry exactly once in yielding batches", async () => {
     const f = fixture();
     const host = new ResidentHost(f.config, () => {});

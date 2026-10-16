@@ -2648,9 +2648,17 @@ export class ResidentHost {
         // that commit (no preliminary stop: its run already ended). Never for stop, dry-run or an alias.
         const finishing = candidates.length === 0 && command.action === "remove" && command.dryRun !== true
           ? this.actors.finishingRemoval(command.id) : undefined;
+        // #10189: exact-id operator remove may finish this root's cleanup of any residency.
+        // The row is revoked: no stop, alias resolution or dry-run mutation.
+        const legacy = candidates.length === 0 && command.action === "remove" && command.dryRun !== true && !finishing
+          ? this.actors.cleanupObligation(command.id) : undefined;
         if (finishing && finishing.rootId === this.config.rootId && finishing.residency === "durable") {
           // Same lease veto, then this request's commit, as the stop-first path's callback.
           const pending = this.#removeResidentActor(finishing.id, requestId, id => { check(); commit(id); }, true);
+          boundaryAdmitted?.();
+          response = await pending;
+        } else if (legacy && legacy.id === command.id && legacy.rootId === this.config.rootId) {
+          const pending = this.#removeResidentActor(legacy.id, requestId, id => { check(); commit(id); }, true);
           boundaryAdmitted?.();
           response = await pending;
         } else if (candidates.length !== 1) {
@@ -2775,7 +2783,10 @@ export class ResidentHost {
 
   async #removeResidentActor(id: string, requestId: string, commit: (id: string) => void, operator = false): Promise<ResidentCommandResponse> {
     const cleanup = this.actors.cleanupObligation(id);
-    if (!this.actors.owns(id) || (cleanup && cleanup.residency !== "durable")) {
+    // Only an explicit operator request can waive durable ownership for this root's cleanup (#10189).
+    // The manager rechecks eligibility and requires the host's fenced final check.
+    const operatorCleanup = operator === true && cleanup !== undefined && cleanup.rootId === this.config.rootId;
+    if (!operatorCleanup && (!this.actors.owns(id) || (cleanup && cleanup.residency !== "durable"))) {
       throw new Error(`Resident host does not own ${id}`);
     }
     // smarty-dev#2184 item 8: stop now and return; the removal finishes behind its run.

@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { jetstream, type JetStreamClient } from "@nats-io/jetstream";
-import type { NatsConnection } from "@nats-io/transport-node";
+import { connect, credsAuthenticator, type NatsConnection } from "@nats-io/transport-node";
 import { expect, vi } from "vitest";
 import { DEFAULT_FABRIC_CONFIG } from "../../../src/config.js";
 import { MeshStore, type MeshEvent } from "../../../src/mesh/store.js";
@@ -154,6 +154,11 @@ export class ControlScene {
     await this.senderCarrier.transport.send(this.rawCommand(id));
     await committed.wait(record => record.commandId === id, "real create-only NATS claim");
     await this.owner.close(); restore();
+    // Retire the test-owned interrupted input with a confirmed broker ACK after
+    // CP closure, without manufacturing an outcome or relay disposition.
+    const delivery = await this.ownerCarrier.delivered.wait(item => item.payload.id === id, "interrupted claim delivery");
+    await delivery.ack();
+    expect(await this.ownerCarrier.transport.drainState()).toEqual({ pending: 0, ackPending: 0 });
     const record = this.seen(id)!;
     blocked(record.carrier === "nats", "A1 E14.3 must mark NATS claims carrier:nats");
     blocked(typeof record.writtenAt === "number" && Number.isFinite(record.writtenAt),
@@ -177,6 +182,14 @@ export class ControlScene {
 }
 
 export interface OperatorUser { machine: string; publicKey: string; credsPath: string }
+/** Observation sockets use the same DNS identity and CA as verified runtimes. */
+async function brokerConnection(broker: PathBHarness, user: PathBUser): Promise<NatsConnection> {
+  const options = broker.runtimeOptions(user);
+  blocked(broker.tls && path.isAbsolute(broker.tls.caFile), "B TLS fixture requires an absolute CA path");
+  return connect({ servers: options.servers, tls: { caFile: broker.tls.caFile },
+    authenticator: credsAuthenticator(Uint8Array.from(fs.readFileSync(user.credsPath))),
+    inboxPrefix: `_INBOX.${user.publicKey}`, reconnect: false, timeout: 2_500 });
+}
 export class BrokerScene extends ControlScene {
   private constructor(root: string, sender: FabricTransport, owner: FabricTransport,
     readonly broker: PathBHarness, readonly runtimeA: NatsConnection, readonly runtimeB: NatsConnection) {
@@ -185,15 +198,15 @@ export class BrokerScene extends ControlScene {
   static async open(): Promise<BrokerScene> {
     // No skipIf or environment opt-out: missing binary is a hard prerequisite failure.
     let broker: PathBHarness;
-    try { broker = await createPathBHarness(); }
+    try { broker = await createPathBHarness({ tls: { dnsNames: ["localhost"], ipAddresses: [] } }); }
     catch (cause) { throw new Error("BLOCKED-ON-SOURCE/PREREQUISITE: real Path B JWT broker is mandatory for E14", { cause }); }
-    const opened: FabricTransport[] = [];
+    const opened: FabricTransport[] = [], sockets: NatsConnection[] = [];
     try {
       expect(broker.users.machineA.machine).toBe("machine-a"); expect(broker.users.machineB.machine).toBe("machine-b");
       expect(broker.users.machineA.publicKey).not.toBe(broker.users.machineB.publicKey);
       expect(broker.users.machineA.publicKey).not.toBe(broker.users.bootstrap.publicKey);
       expect(broker.users.machineB.publicKey).not.toBe(broker.users.bootstrap.publicKey);
-      const bootstrap = await broker.connect(broker.users.bootstrap);
+      const bootstrap = await brokerConnection(broker, broker.users.bootstrap);
       try {
         const { manager, js } = await openJetStream(bootstrap);
         const policy = (name: string, subjects: string[], maxAgeMs = 0, maxMessageBytes = 1_048_576) => ({
@@ -212,15 +225,21 @@ export class BrokerScene extends ControlScene {
       for (const [self, user] of [[senderOwner, broker.users.machineA], [receiverOwner, broker.users.machineB]] as const) {
         const mesh = new MeshStore(path.join(root, `factory-${self.machine}`), 1_048_576, 1_000, { stateBackend: "file", canWakeResidents: () => false });
         try {
+          const runtime = broker.runtimeOptions(user);
+          expect(new URL(runtime.servers).hostname).toBe("localhost");
           const config = { ...DEFAULT_FABRIC_CONFIG.mesh, transport: "nats" as const, hostTransport: "nats" as const,
-            nats: { ...DEFAULT_FABRIC_CONFIG.mesh.nats, servers: [broker.serverUrl], machine: user.machine,
-              credentials: user.credsPath, operatorMachine: OPERATOR_MACHINE } };
+            nats: { ...DEFAULT_FABRIC_CONFIG.mesh.nats, ...runtime, servers: [runtime.servers],
+              operatorMachine: OPERATOR_MACHINE } };
           opened.push(await openFabricTransport({ config, mesh, hostId: self.hostId }));
         } finally { mesh.closeState(); }
       }
-      const runtimeA = await broker.connect(broker.users.machineA), runtimeB = await broker.connect(broker.users.machineB);
+      const runtimeA = await brokerConnection(broker, broker.users.machineA); sockets.push(runtimeA);
+      const runtimeB = await brokerConnection(broker, broker.users.machineB); sockets.push(runtimeB);
       return new BrokerScene(root, opened[0]!, opened[1]!, broker, runtimeA, runtimeB);
-    } catch (error) { await Promise.allSettled(opened.map(port => port.close())); await broker.stop(); throw error; }
+    } catch (error) {
+      await Promise.allSettled([...opened.map(port => port.close()), ...sockets.map(nc => nc.close())]);
+      await broker.stop(); throw error;
+    }
   }
   async streamState(machine = receiverOwner.machine) {
     const nc = machine === senderOwner.machine ? this.runtimeA : this.runtimeB;
@@ -248,12 +267,16 @@ export class BrokerScene extends ControlScene {
   }
   async publishAck(envelope: TransportEnvelope, source: "operator" | "machine-a" | "machine-b"): Promise<void> {
     const user = source === "operator" ? this.operatorUser() : source === "machine-a" ? this.broker.users.machineA : this.broker.users.machineB;
-    const nc = await this.broker.connect(user as PathBUser);
+    const nc = await brokerConnection(this.broker, user as PathBUser);
     try { await publishWire(jetstream(nc), envelope, user.machine); }
     finally { await nc.close(); }
   }
   override async close(): Promise<void> {
-    try { await super.close(); } finally { await this.broker.stop(); }
+    try { await super.close(); }
+    finally {
+      try { await Promise.all([this.runtimeA.close(), this.runtimeB.close()]); }
+      finally { await this.broker.stop(); }
+    }
   }
 }
 async function publishWire(js: JetStreamClient, envelope: TransportEnvelope, sourceMachine: string): Promise<void> {
@@ -305,6 +328,7 @@ export class FileScene {
     this.mesh = new MeshStore(this.root, 1_048_576, 1_000, { stateBackend: "file", canWakeResidents: () => false });
     const options = (hostId: string, ownerIncarnation: string): E14Options => ({
       enabled: true, hostId, ownerIncarnation, controlIncarnationFence: "enforce", pollMs: 20, acknowledgementTimeoutMs: 100,
+      expectedNatsInboxStream: transportInboxStream(hostId === receiverOwner.hostId ? receiverOwner.machine : senderOwner.machine),
       ...(withdrawHoldUntil === undefined ? {} : { withdrawHoldUntil }),
     });
     this.sender = new FabricControlPlane(this.mesh, identity(senderOwner.hostId), options(senderOwner.hostId, senderEpoch));
@@ -336,7 +360,8 @@ export class FileScene {
   async readbackPlane(): Promise<FabricControlPlane> {
     this.owner.pause(); await this.owner.close();
     const plane = new FabricControlPlane(this.mesh, identity(receiverOwner.hostId), { enabled: true, hostId: receiverOwner.hostId,
-      ownerIncarnation: ownerEpoch, acknowledgementTimeoutMs: 100, pollMs: 20 });
+      ownerIncarnation: ownerEpoch, acknowledgementTimeoutMs: 100, pollMs: 20,
+      expectedNatsInboxStream: transportInboxStream(receiverOwner.machine) });
     plane.pause(); return plane;
   }
   async close(): Promise<void> {
@@ -351,9 +376,10 @@ export class FileScene {
  * This is the CP rollback composition slice, not A2's installed-host switch/config-parser proof. */
 export function writeRollbackFlip(root: string, flipAt = Date.now()): { file: string; holdUntil: number } {
   const file = path.join(root, "e14-host-config.json"), temporary = `${file}.next`;
-  const document = { mesh: { transport: "file", nats: { rollbackHoldUntil: new Date(flipAt + HOLD_MS).toISOString() } } };
+  const document = { mesh: { transport: "file", nats: { machine: receiverOwner.machine,
+    rollbackHoldUntil: new Date(flipAt + HOLD_MS).toISOString() } } };
   fs.writeFileSync(temporary, JSON.stringify(document), { mode: 0o600 }); fs.renameSync(temporary, file);
   const saved = JSON.parse(fs.readFileSync(file, "utf8")) as typeof document;
-  expect(saved.mesh.transport).toBe("file");
+  expect(saved.mesh.transport).toBe("file"); expect(saved.mesh.nats.machine).toBe(receiverOwner.machine);
   return { file, holdUntil: Date.parse(saved.mesh.nats.rollbackHoldUntil) };
 }

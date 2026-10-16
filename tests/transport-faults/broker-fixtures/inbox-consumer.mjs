@@ -42,11 +42,10 @@ try {
   const { openNatsConnection } = await jiti.import(source("../../../src/transport/nats/connection.ts"));
   const { DEFAULT_FABRIC_CONFIG } = await jiti.import(source("../../../src/config.ts"));
   const { MeshStore } = await jiti.import(source("../../../src/mesh/store.ts"));
-  const servers = process.env.FABRIC_BROKER_URL;
-  const credentials = process.env.FABRIC_BROKER_CREDS;
+  const runtimeOptions = JSON.parse(process.env.FABRIC_BROKER_OPTIONS ?? "null");
   const hostId = process.env.FABRIC_BROKER_HOST;
-  if (!servers || !credentials || !hostId) throw new Error("Node consumer configuration is incomplete");
-  const connection = await openNatsConnection({ servers, credentials, machine: "machine-b" });
+  if (!runtimeOptions || runtimeOptions.machine !== "machine-b" || !hostId) throw new Error("Node consumer configuration is incomplete");
+  const connection = await openNatsConnection(runtimeOptions);
   try {
     const info = connection.userInfo?.data;
     if (info?.user !== process.env.FABRIC_BROKER_USER ||
@@ -60,7 +59,7 @@ try {
   transport = await openFabricTransport({
     config: {
       ...DEFAULT_FABRIC_CONFIG.mesh, root: meshRoot, transport: "nats",
-      nats: { ...DEFAULT_FABRIC_CONFIG.mesh.nats, servers, credentials, machine: "machine-b" },
+      nats: { ...DEFAULT_FABRIC_CONFIG.mesh.nats, ...runtimeOptions },
     },
     hostId, mesh,
   });

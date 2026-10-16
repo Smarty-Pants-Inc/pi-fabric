@@ -216,6 +216,7 @@ export default function natsCompletionParent(pi: ExtensionAPI): void {
     const sessionId = ctx.sessionManager.getSessionId();
     output("nats-completion-ready.json", { pid: process.pid, sessionId, main: runtime.mainAgentInfo(ctx),
       meshRoot: runtime.mesh.root, carrier: runtime.config.mesh.transport, hostTransport: runtime.config.mesh.hostTransport,
+      nats: runtime.config.mesh.nats,
       stateBackend: runtime.config.mesh.stateBackend, observationHealth: runtime.observationHealth() });
   });
   pi.registerCommand("native-nats-completion-spawn", { description: "Spawn through the actual runtime provider", handler: async (args, ctx) => {

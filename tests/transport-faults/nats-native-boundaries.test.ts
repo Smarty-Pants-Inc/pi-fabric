@@ -9,13 +9,14 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it, type TestContext } from "vitest";
-import { createPathBHarness, openJetStream, resolveNatsBinary, type PathBHarness } from "../helpers/nats-cluster.js";
+import { createPathBHarness, resolveNatsBinary, type PathBHarness } from "../helpers/nats-cluster.js";
+import { openBootstrapNatsConnection, openNatsConnection, type NatsConnectionHandle } from "../../src/transport/nats/connection.js";
 import { launchLog, same, stopAllOwned, type LaunchLog, type Owned } from "../helpers/owned-processes.js";
 import { ensureTransportStream } from "../../src/transport/nats/provision.js";
 import { openNatsKv, type NatsKvStore } from "../../src/transport/nats/kv.js";
 import { transportDurableName, transportInboxFilter, transportInboxStream } from "../../src/transport/nats/subjects.js";
 import { MeshStore } from "../../src/mesh/store.js";
-import { DEFAULT_FABRIC_CONFIG } from "../../src/config.js";
+import { DEFAULT_FABRIC_CONFIG, type FabricMeshNatsConfig } from "../../src/config.js";
 import { runTreeResourceVeto, canRemoveTerminalRun } from "../../src/storage/retention.js";
 import type { CompletionEnvelope } from "../../src/agents/completion-journal.js";
 import { residentHostId } from "../../src/residency/protocol.js";
@@ -73,6 +74,15 @@ const observeJson = (file: string, accepts: (value: Record<string, any>) => bool
   observe(path.dirname(file), () => { const value = json(file); return accepts(value) ? value : undefined; }, file);
 const roots: string[] = []; const logs: LaunchLog[] = []; const natives: NativeRpc[] = [];
 const brokers: PathBHarness[] = []; const servers: http.Server[] = []; const meshes: MeshStore[] = [];
+const observers: NatsConnectionHandle[] = [];
+const nativeNatsSettings = (h: PathBHarness) => {
+  const options = h.runtimeOptions(h.users.machineA);
+  expect(options.servers).toMatch(/^tls:\/\/localhost:\d+$/);
+  expect(options.tls).toEqual({ caFile: h.tls?.caFile });
+  expect(path.isAbsolute(options.tls?.caFile ?? "")).toBe(true);
+  return { ...options, servers: [options.servers], replicas: 1,
+    operatorMachine: "fabric-ops", inboxLanes: 8 } satisfies FabricMeshNatsConfig;
+};
 
 class NativeRpc {
   readonly child: ChildProcess;
@@ -216,12 +226,14 @@ const broker = async (ctx: TestContext) => {
   for (const file of ["dist/worker.js", "dist/index.js", "dist/native/manifest.json", "dist/residency/launcher.js", "dist/residency/pi-entry.js"]) {
     if (!fs.existsSync(path.join(REPO, file))) throw new Error(`Required native artifact missing: ${file}; parent must build`);
   }
-  const h = await createPathBHarness({ binary }); brokers.push(h);
+  const h = await createPathBHarness({ binary, tls: {} }); brokers.push(h);
+  const machineOptions = h.runtimeOptions(h.users.machineA);
   // Separate bootstrap credential is used ONLY for provisioning, then closed.
   // Neither native runtime receives it. No operator body read or relay grant.
-  const bootstrap = await h.connect(h.users.bootstrap);
+  const bootstrap = await openBootstrapNatsConnection({ servers: machineOptions.servers,
+    ...(machineOptions.tls === undefined ? {} : { tls: machineOptions.tls }), credentials: h.users.bootstrap.credsPath });
   try {
-    const { manager, js } = await openJetStream(bootstrap);
+    const { manager, js } = bootstrap;
     const policy = (name: string, subjects: string[], maxAgeMs: number, maxMessageBytes = 1_048_576) => ({
       name, subjects, maxBytes: 1_073_741_824, maxAgeMs, maxMessageBytes, duplicateWindowMs: 600_000, replicas: 1,
     });
@@ -232,8 +244,8 @@ const broker = async (ctx: TestContext) => {
       await ensureTransportStream(manager, policy(transportInboxStream(machine), [`fabric.in.${machine}.>`], 0));
     }
   } finally { await bootstrap.close(); }
-  const a = await h.connect(h.users.machineA); const b = await h.connect(h.users.machineB);
-  const ajs = await openJetStream(a); const bjs = await openJetStream(b);
+  const ajs = await openNatsConnection(machineOptions); observers.push(ajs);
+  const bjs = await openNatsConnection(h.runtimeOptions(h.users.machineB)); observers.push(bjs);
   const leases = await openNatsKv(ajs.js, { bucket: "fabric_leases" }, false);
   const presence = await openNatsKv(ajs.js, { bucket: "fabric_presence" }, false);
   // Limits retention keeps acknowledged messages: last_seq==0 proves no envelope
@@ -371,6 +383,9 @@ afterEach(async () => {
     server.closeAllConnections();
     try { await bounded(new Promise<void>(resolve => server.close(() => resolve())), "loopback close", 5_000); } catch (error) { failure ??= error; }
   }
+  for (const observer of observers.splice(0)) {
+    try { await bounded(observer.close(), "verified broker observer close", 5_000); } catch (error) { failure ??= error; }
+  }
   // Always release the OWNED broker, including native/setup/assertion failures.
   for (const h of brokers.splice(0)) { try { await bounded(h.stop(), "owned broker stop", 10_000); } catch (error) { failure ??= error; } }
   for (const mesh of meshes.splice(0)) mesh.closeState();
@@ -395,14 +410,13 @@ describe.skipIf(!HOSTED_PRODUCT_DELETE)("HOSTED AUTHOR-ONLY E4 native NATS B4 â€
       const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-nats-native-b4-")); roots.push(root);
       fs.mkdirSync(path.join(root, "runs"), { mode: 0o700 });
       const model = await loopback(root); const log = launchLog(root); logs.push(log);
-      const nats = { replicas: 1, servers: [h.serverUrl], machine: "machine-a", credentials: h.users.machineA.credsPath,
-        operatorMachine: "fabric-ops", inboxLanes: 8 };
+      const nats = nativeNatsSettings(h);
       fs.writeFileSync(path.join(root, "nats-settings.json"), JSON.stringify(nats), { mode: 0o600 });
       const env: NodeJS.ProcessEnv = { ...process.env, ...log.env, PI_CODING_AGENT_DIR: model.agent,
         PI_FABRIC_NODE_BINARY: process.execPath, PI_FABRIC_PI_BINARY: cli, PI_FABRIC_MESH_ROOT: path.join(root, "mesh"),
         PI_FABRIC_PROJECT_ROOT: root, PI_FABRIC_MESH_TRANSPORT: "nats", PI_FABRIC_MESH_HOST_TRANSPORT: "nats",
         PI_FABRIC_MESH_STATE_BACKEND: "file", PI_FABRIC_MESH_NATS: JSON.stringify(nats),
-        PI_FABRIC_MACHINE: "machine-a", PI_FABRIC_NATS_SERVERS: h.serverUrl, PI_FABRIC_NATS_CREDENTIALS: h.users.machineA.credsPath,
+        PI_FABRIC_MACHINE: nats.machine, PI_FABRIC_NATS_SERVERS: nats.servers[0], PI_FABRIC_NATS_CREDENTIALS: nats.credentials,
         VITE_CACHE_DIR: path.join(REPO, ".local/cache/vite"), XDG_CACHE_HOME: path.join(REPO, ".local/cache/xdg"),
         npm_config_cache: path.join(REPO, ".local/cache/npm"), PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", FABRIC_NATIVE_BOUNDARY_ROOT: root,
         PI_FABRIC_RUN_ROOT: path.join(root, "runs"), PI_FABRIC_SESSION_ID: "" };
@@ -410,6 +424,7 @@ describe.skipIf(!HOSTED_PRODUCT_DELETE)("HOSTED AUTHOR-ONLY E4 native NATS B4 â€
       const ready = await observeJson(path.join(root, "nats-completion-ready.json"), row => row.pid === rpc.child.pid);
       expect(ready).toMatchObject({ carrier: "nats", hostTransport: "nats", stateBackend: "file", observationHealth: [] });
       await rpc.request({ type: "prompt", message: "Persist this exact B4 native parent session." }); await rpc.settled();
+      expect(ready.nats).toMatchObject(nats);
       const state = await rpc.request({ type: "get_state" });
       expect(state.sessionId).toBe(ready.sessionId); expect(typeof state.sessionFile).toBe("string");
       const parentBirth = identity(log, rpc.child.pid!); const hostId = ready.main.id as string;
@@ -601,8 +616,7 @@ describe.skipIf(!HOSTED_PRODUCT_DELETE)("HOSTED AUTHOR-ONLY E4 native NATS B5 â€
       const root = fs.mkdtempSync(path.join(remaining ? path.join(REPO, ".local") : os.tmpdir(), "fabric-nats-native-e4-")); roots.push(root);
       if (remaining) fs.mkdirSync(path.join(root, "runs"), { mode: 0o700 });
       const model = await loopback(root); const log = launchLog(root); logs.push(log);
-      const nats = { replicas: 1, servers: [h.serverUrl], machine: "machine-a", credentials: h.users.machineA.credsPath,
-        operatorMachine: "fabric-ops", inboxLanes: 8 };
+      const nats = nativeNatsSettings(h);
       fs.writeFileSync(path.join(root, "nats-settings.json"), JSON.stringify(nats), { mode: 0o600 });
       // Host stamp AND actual machine creds: neither setting only an env carrier
       // nor changing mesh.stateBackend constitutes NATS composition evidence.
@@ -610,7 +624,7 @@ describe.skipIf(!HOSTED_PRODUCT_DELETE)("HOSTED AUTHOR-ONLY E4 native NATS B5 â€
         PI_FABRIC_NODE_BINARY: process.execPath, PI_FABRIC_PI_BINARY: cli, PI_FABRIC_MESH_ROOT: path.join(root, "mesh"),
         PI_FABRIC_PROJECT_ROOT: root, PI_FABRIC_MESH_TRANSPORT: "nats", PI_FABRIC_MESH_HOST_TRANSPORT: "nats",
         PI_FABRIC_MESH_STATE_BACKEND: "file", PI_FABRIC_MESH_NATS: JSON.stringify(nats),
-        PI_FABRIC_MACHINE: "machine-a", PI_FABRIC_NATS_SERVERS: h.serverUrl, PI_FABRIC_NATS_CREDENTIALS: h.users.machineA.credsPath,
+        PI_FABRIC_MACHINE: nats.machine, PI_FABRIC_NATS_SERVERS: nats.servers[0], PI_FABRIC_NATS_CREDENTIALS: nats.credentials,
         VITE_CACHE_DIR: path.join(REPO, ".local/cache/vite"), XDG_CACHE_HOME: path.join(REPO, ".local/cache/xdg"),
         npm_config_cache: path.join(REPO, ".local/cache/npm"), PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", FABRIC_NATIVE_BOUNDARY_ROOT: root };
       if (remaining) {
@@ -623,6 +637,7 @@ describe.skipIf(!HOSTED_PRODUCT_DELETE)("HOSTED AUTHOR-ONLY E4 native NATS B5 â€
       const ready = await observeJson(path.join(root, "nats-completion-ready.json"), row => row.pid === first.child.pid);
       expect(ready).toMatchObject({ carrier: "nats", hostTransport: "nats", stateBackend: "file", observationHealth: [] });
       await first.request({ type: "prompt", message: "Persist this exact E4 native parent session." }); await first.settled();
+      expect(ready.nats).toMatchObject(nats);
       const state = await first.request({ type: "get_state" });
       expect(state.sessionId).toBe(ready.sessionId); expect(typeof state.sessionFile).toBe("string");
       const hostId = ready.main.id as string;

@@ -415,11 +415,21 @@ test("E20 any nonzero counter on either runtime blocks before receipt/flip in pr
       const transcript = rollbackTranscript({ host }), seen = [];
       const drain = transcript.calls.find(c => c.action.kind === "drain").result;
       drain.states[index][field] = 1; drain.elapsedMs = elapsed;
+      // E17 release can accept a counted-disposition receipt, but E20's flip
+      // decision must still refuse the actual nonempty drain. This extra
+      // declaration cannot authorize a config write or change the carrier.
+      drain.receipt = { version: 1, hostId: drain.states[index].runtimeId,
+        flippedAt: Date.now(), completedAt: Date.now(), complete: true,
+        consumer: { stream: drain.states[index].stream, numPending: 1, numAckPending: 0 },
+        dispositions: [{ commandEventId: "retained:event", disposition: "completed" }] };
+      let hostTransport = "nats";
       const adapter = recordedAdapter(transcript.calls);
       const report = await runRollback(transcript.request, async (action, options) => {
         seen.push(action.kind);
+        if (action.kind === "flip-to-file") hostTransport = "file";
         return adapter.execute(action, options);
       }, { dryRun: false, evidenceKind: "injected-unverified", drainReceiptMode });
+      assert.equal(hostTransport, "nats");
       assert.equal(report.verdict, "blocked");
       assert.equal(report.phase, "drain");
       assert.equal(report.code, "FABRIC_CANARY_ROLLBACK_DRAIN_NOT_EMPTY");

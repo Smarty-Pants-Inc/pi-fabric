@@ -13,6 +13,7 @@ import { setImmediate as immediate } from "node:timers/promises";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MeshStore } from "../../src/mesh/store.js";
 import { FabricControlPlane, type FabricControlCommand, type FabricControlPlaneOptions } from "../../src/topology/control-plane.js";
+import { FileTransport } from "../../src/transport/file.js";
 import { MeshConsumptionPausedError } from "../../src/topology/mesh-consumption.js";
 import { TransportUnavailableError, type TransportEnvelope, type TransportSent } from "../../src/transport/types.js";
 import { bodyDigest, contractTiming, identity, type CommandBody, type ResolvedEnvelope } from "../helpers/transport-harness.js";
@@ -727,18 +728,31 @@ describe("real FabricControlPlane / injected carrier faults", () => {
       { idempotencyKey: "file-postcommit", timeoutMs: 120_000 });
     const first = await send().then(value => ({ value, error: undefined }), (error: unknown) => ({ value: undefined, error }));
     expect(injected).toBe(true);
-    if (first.error !== undefined) {
-      expect(first.error).toMatchObject({ code: "FABRIC_TRANSPORT_UNCERTAIN" });
-      expect(first.error).not.toHaveProperty("persisted", false);
-      expect(first.error).not.toHaveProperty("notDelivered", true);
-    } else expect(first.value).toMatchObject({ acknowledged: true });
+    // FILE CP deliberately preserves its legacy publish error; it bypasses the
+    // generic adapter reconciliation path. E1's typed guarantee is send's.
+    if (first.error !== undefined) expect(first.error).toMatchObject({ code: "ETIMEDOUT" });
+    else expect(first.value).toMatchObject({ acknowledged: true });
+    const original = senderMesh.read({ topic: "fabric.control.command", limit: 100 })[0]!;
+    const originalBody = original.data as FabricControlCommand;
+    const adapter = new FileTransport(senderMesh, f.senderOwner);
+    cleanup.push(() => adapter.close());
+    injected = false;
+    const portResult = await adapter.send({ id: originalBody.commandId, kind: "command", operation: "followUp",
+      to: f.receiverOwner, targetId: f.receiverOwner.hostId, from: original.from, body: originalBody }).then(
+      value => ({ value, error: undefined }), (error: unknown) => ({ value: undefined, error }));
+    expect(injected).toBe(true);
+    if (portResult.error !== undefined) {
+      expect(portResult.error).toMatchObject({ code: "FABRIC_TRANSPORT_UNCERTAIN" });
+      expect(portResult.error).not.toHaveProperty("persisted", false);
+      expect(portResult.error).not.toHaveProperty("notDelivered", true);
+    } else expect(portResult.value?.sequence).toBeGreaterThan(0);
     spy.mockRestore();
     const result = await send();
     expect(result).toMatchObject({ acknowledged: true });
     const commands = senderMesh.read({ topic: "fabric.control.command", limit: 100 }).filter(event => event.kind !== "cancel");
-    expect(commands).toHaveLength(2);
-    expect(commands[0]?.id).not.toBe(commands[1]?.id);
-    expect((commands[0]?.data as FabricControlCommand).commandId).toBe((commands[1]?.data as FabricControlCommand).commandId);
+    expect(commands).toHaveLength(3); // legacy request, adapter send, same-key CP retry.
+    expect(new Set(commands.map(event => event.id)).size).toBe(3);
+    expect(new Set(commands.map(event => (event.data as FabricControlCommand).commandId))).toEqual(new Set([originalBody.commandId]));
     expect(f.journalItems()).toEqual([expect.objectContaining({ id: result.messageId })]);
     expect(admissions).toHaveBeenCalledOnce();
     const acknowledgements = senderMesh.read({ topic: "fabric.control.ack", limit: 100 });

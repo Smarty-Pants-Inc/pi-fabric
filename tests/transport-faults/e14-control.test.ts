@@ -23,11 +23,10 @@ import { identity } from "../helpers/transport-harness.js";
 import { resolveNatsBinary } from "../helpers/nats-cluster.js";
 import { MeshStore } from "../../src/mesh/store.js";
 import { FabricControlPlane } from "../../src/topology/control-plane.js";
-import { writeNatsDrainReceipt } from "../../src/topology/nats-drain-receipt.js";
 import { controlBodyFingerprint } from "../../src/mesh/control-idempotency.js";
 import { normalizeFabricConfig } from "../../src/config.js";
 import { createNatsOperator, createNatsAccount, mintNatsUser, NatsMintError } from "../../src/mesh/nats-auth/mint.js";
-import { drainApi, lastWrite, receiptFor, writeDrain } from "./e14-fixtures/drain.js";
+import { drainApi, lastWrite, receiptFor, receiptFromDrain, writeDrain } from "./e14-fixtures/drain.js";
 import { latch, seenRoot } from "./control-fixture.js";
 import {
   BrokerScene, FileScene, Receipts, blocked, noDefiniteNonDelivery, objectBody,
@@ -398,7 +397,9 @@ brokerDescribe("E14.2 real broker / operator source is credential-bound", () => 
 describe("E16b / A2 config and B mint namespace public dependencies", () => {
   it("T-CONFIG-OPS-MISBIND: runtime machine/missing/invalid operator config is typed refusal; reserved operator config is accepted", () => {
     const config = (operatorMachine: unknown, machine = "machine-a") => ({ mesh: { enabled: true,
-      transport: "nats", hostTransport: "nats", nats: { replicas: 1, servers: ["nats://127.0.0.1:4222"],
+      transport: "nats", hostTransport: "nats", nats: { replicas: 1, servers: ["tls://localhost:4222"],
+        custodyStream: "E14_CUSTODY", livenessStream: "E14_LIVE", pathBMachines: ["machine-a", "machine-b"],
+        tls: { caFile: "/e14-fixture-not-opened/ca.pem" },
         credentials: "/e14-fixture-not-opened/runtime.creds", machine,
         ...(operatorMachine === undefined ? {} : { operatorMachine }) } } });
     for (const operator of ["fabric-ops", "fabric-ops-canary1"]) {
@@ -425,7 +426,7 @@ describe("E16b / A2 config and B mint namespace public dependencies", () => {
       return new TextDecoder().decode(artifact.bytes).trim(); // Memory only, NEVER printed or written.
     };
     const operatorJwt = text(operator.artifacts, "operator.jwt"), operatorSigningSeed = text(operator.artifacts, "operator-signing.nk");
-    const attempt = (machine: string, role: "agent" | "maintainer") => {
+    const attempt = (machine: string, role: "agent" | "operator") => {
       const pathBMachines = role === "agent" ? [machine] : ["machine-a", "machine-b"];
       const account = createNatsAccount({ name: "e14-account", operatorJwt, operatorSigningSeed,
         jetstream: { memStorage: 0, diskStorage: 4_294_967_296, streams: 64, consumers: 256 },
@@ -439,13 +440,13 @@ describe("E16b / A2 config and B mint namespace public dependencies", () => {
     };
     // Healthy controls prevent an unrelated broken key/template setup from earning negative proof.
     expect(attempt("machine-a", "agent").metadata.role).toBe("agent");
-    expect(attempt("fabric-ops", "maintainer").metadata.role).toBe("maintainer");
+    expect(attempt("fabric-ops", "operator").metadata.role).toBe("operator");
     for (const machine of ["fabric-ops", "fabric-ops-canary1"]) {
       let failure: unknown; try { attempt(machine, "agent"); } catch (error) { failure = error; }
       blocked(failure instanceof NatsMintError, "B E16b runtime mint/account inventory must refuse the entire reserved fabric-ops namespace");
     }
     for (const machine of ["machine-a", "ryzen1", "fabric-ops-a-b"]) {
-      let failure: unknown; try { attempt(machine, "maintainer"); } catch (error) { failure = error; }
+      let failure: unknown; try { attempt(machine, "operator"); } catch (error) { failure = error; }
       blocked(failure instanceof NatsMintError, "B E16b messaging operator minter must refuse machine outside ^fabric-ops(-[a-z0-9]+)?$");
     }
   });
@@ -484,6 +485,7 @@ describe("E22/E17 RECORDED-CALL / SAFE local public CP predicates (NOT resident-
     const rollback = new FabricControlPlane(n.ownerMesh, identity(receiverOwner.hostId), {
       enabled: true, hostId: receiverOwner.hostId, ownerIncarnation: ownerEpoch, pollMs: 20,
       controlIncarnationFence: "enforce", withdrawHoldUntil: Date.now() + HOLD_MS,
+      expectedNatsInboxStream: `FABRIC_IN_${receiverOwner.machine}`,
     });
     rollback.pause(); dispose.push(() => rollback.close());
     const planes = [n.owner, rollback];
@@ -491,6 +493,7 @@ describe("E22/E17 RECORDED-CALL / SAFE local public CP predicates (NOT resident-
     // A clean in-memory/broker drain is not an E17 persisted last-write receipt.
     for (const plane of planes) await expect(plane.checkpointForRelease()).rejects.toThrow(/unproven drain receipt|retain A/i);
     const directory = seenRoot(root, receiverOwner.hostId), writtenAt = lastWrite([outcome]);
+    const built = await drainApi("dist");
     const complete = receiptFor([outcome], { flippedAt: writtenAt, completedAt: writtenAt });
     expect(complete.consumer).toMatchObject({ numPending: 0, numAckPending: 0 });
     expect(complete.dispositions).toEqual([]); // E19/E20: no canary relay/disposition shortcut.
@@ -499,10 +502,10 @@ describe("E22/E17 RECORDED-CALL / SAFE local public CP predicates (NOT resident-
       ["incomplete", { complete: false }],
       ["stale", { flippedAt: writtenAt - 1, completedAt: writtenAt - 1 }],
     ] as const) {
-      writeNatsDrainReceipt(directory, { ...complete, ...patch });
+      built.writeNatsDrainReceipt(directory, { ...complete, ...patch });
       for (const plane of planes) await expect(plane.checkpointForRelease(), label).rejects.toThrow(/unproven drain receipt|retain A/i);
     }
-    writeNatsDrainReceipt(directory, complete); // Equality covers the last real outcome write.
+    built.writeNatsDrainReceipt(directory, complete); // Equality covers the last real outcome write.
     let omitted: "none" | "original-input" | "matching-acks" = "none";
     const tail = n.ownerMesh.tail.bind(n.ownerMesh);
     vi.spyOn(n.ownerMesh, "tail").mockImplementation((...args) => {
@@ -653,21 +656,22 @@ describe("E14-X1 / actual public FILE withdraw, release and cleanup", () => {
     const n = await broker(); n.start();
     await n.request("release-nats-outcome"); const sent = await n.command(); e14Event(sent);
     const outcome = await stored(n, sent), claim = await n.claimWithoutOutcome();
+    const complete = await receiptFromDrain([outcome, claim], n.ownerCarrier.transport);
     await n.retire();
     expect(outcome).toMatchObject({ carrier: "nats", acceptance: { accepted: true } });
     expect(claim).toMatchObject({ carrier: "nats" }); expect(claim).not.toHaveProperty("acceptance");
     const flip = writeRollbackFlip(n.ownerMesh.root), f = files(n.ownerMesh.root, flip.holdUntil);
     // No receipt: NATS records are NOT an unconditional release bypass (E16c).
     f.owner.pause();
-    await expect(f.owner.checkpointForRelease()).rejects.toThrow();
-    await writeDrain(f.root, receiptFor([outcome, claim], { complete: false,
-      consumer: { stream: "FABRIC_IN_machine-b", numPending: 0, numAckPending: 1 } }));
-    await expect(f.owner.checkpointForRelease()).rejects.toThrow();
-    // Complete disposition of the remaining generated claim is E17's alternative to 0/0.
-    await writeDrain(f.root, receiptFor([outcome, claim], {
+    await expect(f.owner.checkpointForRelease()).rejects.toMatchObject({ code: "FABRIC_NATS_DRAIN_UNPROVEN" });
+    await writeDrain(f.root, { ...complete, complete: false });
+    await expect(f.owner.checkpointForRelease()).rejects.toMatchObject({ code: "FABRIC_NATS_DRAIN_UNPROVEN" });
+    await writeDrain(f.root, { ...complete,
       consumer: { stream: "FABRIC_IN_machine-b", numPending: 0, numAckPending: 1 },
-      dispositions: [{ commandEventId: claim.commandId, disposition: "relay" }],
-    }));
+      dispositions: [{ commandEventId: claim.commandId, disposition: "relay" }] });
+    await expect(f.owner.checkpointForRelease()).rejects.toMatchObject({ code: "FABRIC_NATS_DRAIN_UNPROVEN" });
+    // Canary rollback uses actual sampled 0/0 with no disposition shortcut.
+    await writeDrain(f.root, complete);
     try { await f.owner.checkpointForRelease(); }
     catch (cause) { throw new Error("BLOCKED-ON-SOURCE: E17 complete correct-host drain receipt must cover NATS records through writtenAt", { cause }); }
     expect(f.owner.releaseCheckpointReceipt()).toMatchObject({ admissionHeld: true });
@@ -695,16 +699,16 @@ describe("E14-X1 / actual public FILE withdraw, release and cleanup", () => {
   brokerIt("T-DRAIN-RECEIPT E17: absent/torn/invalid/foreign-host/incomplete/stale proof retains generated claims; complete covering proof releases", { timeout: 90_000 }, async () => {
     const n = await broker(); n.start();
     await n.request("drain-outcome"); const sent = await n.command(); e14Event(sent);
-    const outcome = await stored(n, sent), claim = await n.claimWithoutOutcome(); await n.retire();
-    const records = [outcome, claim], writtenAt = lastWrite(records), root = n.ownerMesh.root;
+    const outcome = await stored(n, sent), claim = await n.claimWithoutOutcome();
+    const records = [outcome, claim], complete = await receiptFromDrain(records, n.ownerCarrier.transport);
+    await n.retire();
+    const writtenAt = lastWrite(records), root = n.ownerMesh.root;
     const source = await drainApi("source"), built = await drainApi("dist");
     const local = seenStore(root); const directory = local.root; local.closeState();
     const file = built.natsDrainReceiptPath(directory);
     expect(file).toBe(path.join(directory, "nats-drain-receipt.json"));
     expect(source.natsDrainReceiptPath(directory)).toBe(file);
     const f = files(root, writeRollbackFlip(root).holdUntil); f.owner.pause();
-    const complete = receiptFor(records, { consumer: null,
-      dispositions: [{ commandEventId: sent.id, disposition: "completed" }, { commandEventId: claim.commandId, disposition: "relay" }] });
     const variants: Array<{ label: string; corrupt?: string; patch?: Record<string, unknown> }> = [
       { label: "absent" },
       { label: "torn", corrupt: '{"version":1,"hostId":' },
@@ -714,6 +718,15 @@ describe("E14-X1 / actual public FILE withdraw, release and cleanup", () => {
       { label: "foreign-host", patch: { hostId: "session:foreign-host" } },
       { label: "incomplete", patch: { complete: false, consumer: { stream: "FABRIC_IN_machine-b", numPending: 1, numAckPending: 1 }, dispositions: [] } },
       { label: "stale", patch: { flippedAt: writtenAt - 2, completedAt: writtenAt - 1 } },
+      { label: "null-consumer-dispositions", patch: { consumer: null,
+        dispositions: [{ commandEventId: claim.commandId, disposition: "relay" }] } },
+      { label: "ack-pending-disposition", patch: {
+        consumer: { stream: "FABRIC_IN_machine-b", numPending: 0, numAckPending: 1 },
+        dispositions: [{ commandEventId: claim.commandId, disposition: "relay" }] } },
+      { label: "zero-with-disposition", patch: { dispositions: [{ commandEventId: claim.commandId, disposition: "completed" }] } },
+      { label: "wrong-stream", patch: { consumer: { stream: "FABRIC_IN_machine-a", numPending: 0, numAckPending: 0 } } },
+      { label: "reversed-timeline", patch: { flippedAt: complete.completedAt + 1 } },
+      { label: "future-timeline", patch: { flippedAt: Date.now() + HOUR, completedAt: Date.now() + HOUR } },
     ];
     for (const variant of variants) {
       // Legitimate receipt setup ALWAYS uses the built writer. Raw writes ONLY inject on-disk
@@ -726,7 +739,7 @@ describe("E14-X1 / actual public FILE withdraw, release and cleanup", () => {
       if (["absent", "torn", "invalid-json", "invalid-schema", "unknown-version"].includes(variant.label)) {
         expect(source.readNatsDrainReceipt(directory), variant.label).toBeUndefined();
       }
-      await expect(f.owner.checkpointForRelease(), variant.label).rejects.toThrow();
+      await expect(f.owner.checkpointForRelease(), variant.label).rejects.toMatchObject({ code: "FABRIC_NATS_DRAIN_UNPROVEN" });
       expect(() => f.owner.releaseCheckpointReceipt(), variant.label).toThrow();
       expect(readSeen(root, claim.commandId)).toEqual(claim);
     }
@@ -742,11 +755,10 @@ describe("E14-X1 / actual public FILE withdraw, release and cleanup", () => {
   brokerIt("T-ROLLBACK-CLEANUP: real NATS records expire without FILE sequence; file-era records retain their log rule", { timeout: 90_000 }, async () => {
     const n = await broker(); n.start();
     await n.request("cleanup-nats-outcome"); const sent = await n.command(); e14Event(sent);
-    const outcome = await stored(n, sent), claim = await n.claimWithoutOutcome(); await n.retire();
-    await writeDrain(n.ownerMesh.root, receiptFor([outcome, claim], {
-      consumer: { stream: "FABRIC_IN_machine-b", numPending: 0, numAckPending: 1 },
-      dispositions: [{ commandEventId: claim.commandId, disposition: "relay" }],
-    }));
+    const outcome = await stored(n, sent), claim = await n.claimWithoutOutcome();
+    const complete = await receiptFromDrain([outcome, claim], n.ownerCarrier.transport);
+    await n.retire();
+    await writeDrain(n.ownerMesh.root, complete);
     const flip = writeRollbackFlip(n.ownerMesh.root), f = files(n.ownerMesh.root, flip.holdUntil);
     // Generate a genuine file-era outcome, not a seeded acceptance/claim substitute.
     f.start(); await f.request("cleanup-file-outcome"); const fileEvent = await f.command();

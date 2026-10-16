@@ -6,14 +6,13 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { jetstream, jetstreamManager } from "@nats-io/jetstream";
 import { describe, expect, it } from "vitest";
 import { DEFAULT_FABRIC_CONFIG } from "../../src/config.js";
 import { MeshStore } from "../../src/mesh/store.js";
 import { controlBodyFingerprint } from "../../src/mesh/control-idempotency.js";
 import { FabricControlPlane, type FabricControlCommand, type FabricControlAcceptance, type FabricControlResult, type FabricControlRequestOptions } from "../../src/topology/control-plane.js";
 import { openFabricTransport } from "../../src/transport/index.js";
-import { openNatsConnection } from "../../src/transport/nats/connection.js";
+import { openBootstrapNatsConnection, openNatsConnection } from "../../src/transport/nats/connection.js";
 import { openNatsKvForMachine } from "../../src/transport/nats/kv.js";
 import { ensureTransportStream } from "../../src/transport/nats/provision.js";
 import { ADVISORY_CAPTURE_STREAM, transportAdvisoryStreamSubject, transportDurableName, transportInboxStream, transportInboxStreamSubject } from "../../src/transport/nats/subjects.js";
@@ -75,7 +74,7 @@ function unknown(result: Settlement): void {
 }
 
 async function fixture() {
-  const server = await createPathBHarness({ binary: binary! });
+  const server = await createPathBHarness({ binary: binary!, tls: {} });
   const root = path.join(server.root, "native-owner");
   const paths = fixturePaths(root);
   const children: OwnedNatsOwner[] = [];
@@ -108,9 +107,9 @@ async function fixture() {
   })();
   try {
     fs.mkdirSync(root);
-    const bootstrap = await server.connect(server.users.bootstrap);
+    const bootstrap = await openBootstrapNatsConnection(server.runtimeOptions(server.users.bootstrap));
     try {
-      const manager = await jetstreamManager(bootstrap), js = jetstream(bootstrap);
+      const { manager, js } = bootstrap;
       const policy = { maxBytes: 1_073_741_824, maxAgeMs: 0, maxMessageBytes: 1_048_576,
         duplicateWindowMs: 600_000, replicas: 1 as const };
       await ensureTransportStream(manager, { ...policy, name: ADVISORY_CAPTURE_STREAM,
@@ -121,11 +120,11 @@ async function fixture() {
         ...policy, name: transportInboxStream(machine), subjects: [transportInboxStreamSubject(machine)],
       });
     } finally { await bootstrap.close(); }
-    expect(bootstrap.isClosed()).toBe(true); // Setup authority closed BEFORE opening either runtime.
+    expect(bootstrap.nc.isClosed()).toBe(true); // Setup authority closed BEFORE opening either runtime.
     expect(server.configText).toContain("sync_interval: always");
     // E12: signed JWT machine tag + server-authenticated subject + expanded exact source grant.
     for (const user of [server.users.machineA, server.users.machineB]) {
-      const connection = await openNatsConnection({ servers: server.serverUrl, credentials: user.credsPath, machine: user.machine });
+      const connection = await openNatsConnection(server.runtimeOptions(user));
       try {
         expect(connection.userInfo).toMatchObject({ data: { user: user.publicKey } });
         const info = connection.userInfo as { data: { permissions: { publish: { allow: string[] } } } };
@@ -136,8 +135,8 @@ async function fixture() {
     const seen = new MeshStore(paths.seen, 1_048_576, 1_000, { stateBackend: "file" });
     meshes.push(senderMesh, seen);
     const config = { ...DEFAULT_FABRIC_CONFIG.mesh, transport: "nats" as const,
-      nats: { ...DEFAULT_FABRIC_CONFIG.mesh.nats, servers: [server.serverUrl], machine: "machine-a",
-        credentials: server.users.machineA.credsPath, operatorMachine: "fabric-ops" } };
+      nats: { ...DEFAULT_FABRIC_CONFIG.mesh.nats, ...server.runtimeOptions(server.users.machineA),
+        operatorMachine: "fabric-ops" } };
     carrier = await openFabricTransport({ config, mesh: senderMesh, hostId: SENDER_HOST_ID });
     const real = carrier;
     expect(real.self).toEqual({ machine: "machine-a", hostId: SENDER_HOST_ID });
@@ -180,7 +179,7 @@ async function fixture() {
       cancellation: (id: string) => cancellationSends.receipt(item => command(item).cancelCommandId === id),
       cancellations: cancellationSends.items,
       launch: (boundary?: CrashBoundary) => {
-        const child = new OwnedNatsOwner(repository, root, children.length, server.serverUrl, server.users.machineB.credsPath, boundary);
+        const child = new OwnedNatsOwner(repository, root, children.length, server.runtimeOptions(server.users.machineB), boundary);
         children.push(child); return child;
       },
       epoch: (value: unknown) => { ownerEpoch = String(value); },
@@ -195,9 +194,9 @@ async function fixture() {
   } catch (error) { await close(); throw error; }
 }
 async function consumerInfo(server: PathBHarness) {
-  const runtime = await server.connect(server.users.machineB);
+  const runtime = await openNatsConnection(server.runtimeOptions(server.users.machineB));
   try {
-    const manager = await jetstreamManager(runtime);
+    const { manager } = runtime;
     return await manager.consumers.info(transportInboxStream("machine-b"), transportDurableName(OWNER_HOST_ID));
   } finally { await runtime.close(); }
 }

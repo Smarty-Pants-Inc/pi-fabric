@@ -735,7 +735,7 @@ async function openOutageProxy(upstreamUrl: string) {
   if (!address || typeof address === "string") { await cut(); throw new Error("outage proxy has no loopback address"); }
   const port = address.port;
   return {
-    url: `nats://127.0.0.1:${port}`,
+    url: `tls://localhost:${port}`,
     cut,
     resume: async () => {
       if (server.listening) return;
@@ -821,7 +821,7 @@ export async function openRealAdapterPair(kind: "file" | "nats", required = fals
   })();
   try {
     if (kind === "nats") {
-      server = await natsModule!.createPathBHarness({ binary: binary! });
+      server = await natsModule!.createPathBHarness({ binary: binary!, tls: {} });
       const [{ jetstream, jetstreamManager }, { ensureTransportStream }, { openNatsKvForMachine }, subjects] = await Promise.all([
         import("@nats-io/jetstream"), import("../../src/transport/nats/provision.js"),
         import("../../src/transport/nats/kv.js"), import("../../src/transport/nats/subjects.js"),
@@ -846,9 +846,10 @@ export async function openRealAdapterPair(kind: "file" | "nats", required = fals
     }
     const open = async (side: "sender" | "receiver"): Promise<FabricTransport> => {
       const user = side === "sender" ? server?.users.machineA : server?.users.machineB;
+      const runtimeOptions = server && user ? server.runtimeOptions(user) : undefined;
       const config: FabricTransportOptions["config"] = { ...DEFAULT_FABRIC_CONFIG.mesh, transport: kind,
-        ...(server && user ? { nats: { ...DEFAULT_FABRIC_CONFIG.mesh.nats, servers: [proxy?.url ?? server.serverUrl],
-          machine: user.machine, credentials: user.credsPath, operatorMachine: "fabric-ops" } } : {})
+        ...(runtimeOptions ? { nats: { ...DEFAULT_FABRIC_CONFIG.mesh.nats, ...runtimeOptions,
+          servers: proxy?.url ?? runtimeOptions.servers, operatorMachine: "fabric-ops" } } : {})
       };
       const result = await openAdapter({ kind, options: { config, mesh, hostId: `session:${side}` },
         exportName: "openFabricTransport", natsReady: kind === "nats", required });
@@ -884,7 +885,7 @@ export async function openRealAdapterPair(kind: "file" | "nats", required = fals
           import("../../src/transport/nats/connection.js"), import("../../src/transport/nats/kv.js"), import("@nats-io/jetstream"),
         ]);
         const user = server!.users.machineB;
-        const connection = await openNatsConnection({ servers: server!.serverUrl, credentials: user.credsPath, machine: user.machine });
+        const connection = await openNatsConnection(server!.runtimeOptions(user));
         const gate = faultGate();
         let created!: () => void;
         const creation = new Promise<void>(resolve => { created = resolve; });
@@ -951,8 +952,8 @@ export async function openRealAdapterPair(kind: "file" | "nats", required = fals
       const user = server.users.machineB;
       // Read-only CONSUMER.INFO/status observer under the receiver's actual runtime JWT.
       // E12 remains on, just as in both factory carriers. No bootstrap survives setup.
-      const connection = outageConnection = await openNatsConnection({
-        servers: proxy.url, credentials: user.credsPath, machine: user.machine,
+      let connection = outageConnection = await openNatsConnection({
+        ...server.runtimeOptions(user), servers: proxy.url,
       });
       const afterStatus = async (type: "disconnect" | "reconnect", operation: () => Promise<void>) => {
         let observed!: () => void;
@@ -967,8 +968,16 @@ export async function openRealAdapterPair(kind: "file" | "nats", required = fals
         disconnect: () => afterStatus("disconnect", () => proxy!.cut()),
         restart: () => boundedReceipt(server!.restart(), "restart owned Path B server with same persistent root", 30_000),
         reconnect: async () => {
-          await afterStatus("reconnect", () => proxy!.resume());
-          await boundedReceipt(connection.nc.flush(), "flush reconnected runtime observer");
+          // B disables transparent client reconnect: every new physical socket
+          // must pass TLS and signed/USER.INFO verification again. Reopen only
+          // this read-only observer; the SAME production inbox iterator owns
+          // its independent verified reconnect path and retained redelivery.
+          await proxy!.resume();
+          await connection.close();
+          connection = outageConnection = await boundedReceipt(openNatsConnection({
+            ...server!.runtimeOptions(user), servers: proxy!.url,
+          }), "fully verified runtime observer reopen after owned network change", 10_000);
+          await boundedReceipt(connection.nc.flush(), "flush verified reopened runtime observer");
         },
         state: async () => {
           const info = await boundedReceipt(connection.manager.consumers.info(

@@ -4,6 +4,7 @@ import path from "node:path";
 import { launchLog, same, type LaunchLog, type Owned } from "../../helpers/owned-processes.js";
 import { bounded, type CrashBoundary, type OwnerReceipt, OWNER_HOST_ID, SENDER_HOST_ID } from "./paths.js";
 import type { ParticipantView } from "../../../src/topology/participant-view.js";
+import type { NatsConnectionOptions } from "../../../src/transport/nats/connection.js";
 
 /** MANUAL routing/lease fixture, not KvParticipantDirectory or production composition-root proof.
  * Only these two known identities are live. No lease acquisition/takeover claim is made. */
@@ -35,7 +36,7 @@ export class OwnedNatsOwner {
   private stderr = "";
   private readonly script: string;
 
-  constructor(repository: string, root: string, generation: number, serverUrl: string, credentials: string, boundary?: CrashBoundary) {
+  constructor(repository: string, root: string, generation: number, runtimeOptions: NatsConnectionOptions, boundary?: CrashBoundary) {
     if (process.release.name !== "node" || "bun" in process.versions || !/^node(?:\.exe)?$/i.test(path.basename(process.execPath))) {
       throw new Error("NATS owner-crash proof requires a Node test runner");
     }
@@ -46,7 +47,7 @@ export class OwnedNatsOwner {
     const env: NodeJS.ProcessEnv = { ...process.env, ...this.launches.env, TMPDIR: temporary, TMP: temporary, TEMP: temporary,
       VITE_CACHE_DIR: path.join(repository, ".local/cache/vite"), XDG_CACHE_HOME: path.join(repository, ".local/cache/xdg"),
       npm_config_cache: path.join(repository, ".local/cache/npm"), JITI_FS_CACHE: "false",
-      PI_FABRIC_MESH_STATE_BACKEND: "file", FABRIC_OWNER_SERVER: serverUrl, FABRIC_OWNER_CREDENTIALS: credentials };
+      PI_FABRIC_MESH_STATE_BACKEND: "file", FABRIC_OWNER_OPTIONS: JSON.stringify(runtimeOptions) };
     if (process.env.NODE_OPTIONS && !env.NODE_OPTIONS?.startsWith(process.env.NODE_OPTIONS)) throw new Error("Lost inherited NODE_OPTIONS guard");
     this.child = spawn(process.execPath, [this.script, repository, root, boundary ?? "none"], {
       cwd: repository, env, stdio: ["ignore", "ignore", "pipe", "ipc"],

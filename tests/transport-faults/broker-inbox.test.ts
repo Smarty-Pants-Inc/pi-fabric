@@ -9,12 +9,11 @@ import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { fileURLToPath } from "node:url";
 import { setTimeout as sleep } from "node:timers/promises";
-import { jetstream, jetstreamManager, type JetStreamManager } from "@nats-io/jetstream";
 import { describe, expect, it } from "vitest";
 import { DEFAULT_FABRIC_CONFIG } from "../../src/config.js";
 import { MeshStore } from "../../src/mesh/store.js";
 import { openFabricTransport } from "../../src/transport/index.js";
-import { openNatsConnection } from "../../src/transport/nats/connection.js";
+import { openBootstrapNatsConnection, openNatsConnection } from "../../src/transport/nats/connection.js";
 import { openNatsKvForMachine } from "../../src/transport/nats/kv.js";
 import { ensureTransportStream } from "../../src/transport/nats/provision.js";
 import {
@@ -92,14 +91,13 @@ function command(to: FabricTransport["self"], id: string): TransportEnvelope {
 
 /** Fresh server/store per case; setup authority is never supplied to a runtime. */
 async function fixture() {
-  const harness = await createPathBHarness({ binary: binary! });
+  const harness = await createPathBHarness({ binary: binary!, tls: {} });
   const transports: FabricTransport[] = [];
   const meshes: MeshStore[] = [];
   const abort = new AbortController();
   try {
-    const bootstrap = await harness.connect(harness.users.bootstrap);
-    const manager = await jetstreamManager(bootstrap);
-    const js = jetstream(bootstrap);
+    const bootstrap = await openBootstrapNatsConnection(harness.runtimeOptions(harness.users.bootstrap));
+    const { manager, js } = bootstrap;
     const policy = {
       maxBytes: 1_073_741_824, maxAgeMs: 0, maxMessageBytes: 1_048_576,
       duplicateWindowMs: 600_000, replicas: 1 as const,
@@ -119,9 +117,7 @@ async function fixture() {
     await bootstrap.close();
 
     const verifyUser = async (user: PathBUser): Promise<void> => {
-      const connection = await openNatsConnection({
-        servers: harness.serverUrl, credentials: user.credsPath, machine: user.machine,
-      });
+      const connection = await openNatsConnection(harness.runtimeOptions(user));
       try {
         // This makes a real USER.INFO request and binds the signed subject and machine grant.
         expect(connection.userInfo).toMatchObject({ data: { user: user.publicKey } });
@@ -140,8 +136,7 @@ async function fixture() {
       const config = {
         ...DEFAULT_FABRIC_CONFIG.mesh, root, transport: "nats",
         nats: {
-          ...DEFAULT_FABRIC_CONFIG.mesh.nats, servers: [harness.serverUrl],
-          machine: user.machine, credentials: user.credsPath,
+          ...DEFAULT_FABRIC_CONFIG.mesh.nats, ...harness.runtimeOptions(user),
         },
       } as FabricTransportOptions["config"];
       const transport = await openFabricTransport({ config, hostId, mesh });
@@ -176,9 +171,9 @@ async function fixture() {
  * No mock, patched validator, runtime policy option, or relaxed security credential.
  */
 async function setAckWait(harness: PathBHarness, waitMs: number): Promise<void> {
-  const bootstrap = await harness.connect(harness.users.bootstrap);
+  const bootstrap = await openBootstrapNatsConnection(harness.runtimeOptions(harness.users.bootstrap));
   try {
-    const manager = await jetstreamManager(bootstrap);
+    const { manager } = bootstrap;
     const stream = transportInboxStream("machine-b");
     const durable = transportDurableName(B_HOST);
     const before = await manager.consumers.info(stream, durable);
@@ -201,9 +196,9 @@ async function setAckWait(harness: PathBHarness, waitMs: number): Promise<void> 
 
 async function consumerInfo(harness: PathBHarness) {
   // State receipts after setup use the destination's runtime principal, not bootstrap.
-  const runtime = await harness.connect(harness.users.machineB);
+  const runtime = await openNatsConnection(harness.runtimeOptions(harness.users.machineB));
   try {
-    const manager: JetStreamManager = await jetstreamManager(runtime);
+    const { manager } = runtime;
     return await manager.consumers.info(transportInboxStream("machine-b"), transportDurableName(B_HOST));
   } finally { await runtime.close(); }
 }
@@ -392,8 +387,7 @@ describe.skipIf(!binary)("authenticated real broker inbox faults (carrier only, 
           XDG_CACHE_HOME: path.join(childRoot, "xdg"),
           npm_config_cache: path.join(childRoot, "npm-cache"),
           JITI_FS_CACHE: path.join(childRoot, "jiti"),
-          FABRIC_BROKER_URL: f.harness.serverUrl,
-          FABRIC_BROKER_CREDS: f.harness.users.machineB.credsPath,
+          FABRIC_BROKER_OPTIONS: JSON.stringify(f.harness.runtimeOptions(f.harness.users.machineB)),
           FABRIC_BROKER_USER: f.harness.users.machineB.publicKey,
           FABRIC_BROKER_HOST: B_HOST,
         },

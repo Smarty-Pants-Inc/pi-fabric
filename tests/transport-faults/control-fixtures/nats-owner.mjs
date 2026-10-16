@@ -64,9 +64,10 @@ MeshStore.prototype.writeBatch = async function (input) {
   return result;
 };
 const mesh = new MeshStore(paths.mesh, 1_048_576, 1_000, { stateBackend: "file", canWakeResidents: () => false });
+const runtimeOptions = JSON.parse(process.env.FABRIC_OWNER_OPTIONS ?? "null");
+if (!runtimeOptions || runtimeOptions.machine !== "machine-b") throw new Error("NATS owner configuration is incomplete");
 const config = { ...DEFAULT_FABRIC_CONFIG.mesh, root: paths.mesh, transport: "nats",
-  nats: { ...DEFAULT_FABRIC_CONFIG.mesh.nats, servers: [process.env.FABRIC_OWNER_SERVER],
-    machine: "machine-b", credentials: process.env.FABRIC_OWNER_CREDENTIALS, operatorMachine: "fabric-ops" } };
+  nats: { ...DEFAULT_FABRIC_CONFIG.mesh.nats, ...runtimeOptions, operatorMachine: "fabric-ops" } };
 const real = await openFabricTransport({ config, mesh, hostId: OWNER_HOST_ID });
 if (real.kind !== "nats" || real.self.machine !== "machine-b") throw new Error("Wrong actual carrier");
 // Transparent public-operation observers only: actual send resolves after js.publish PubAck;

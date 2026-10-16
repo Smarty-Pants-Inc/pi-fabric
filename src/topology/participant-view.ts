@@ -476,8 +476,15 @@ export class KvParticipantDirectory implements ParticipantView {
 
   async #removeRevision(key: string, revision: number): Promise<boolean> {
     // Stop renewal even if the deletion is uncertain or a foreign revision already won.
-    if (this.#owned.get(key)?.revision === revision) this.#owned.delete(key);
-    return this.#presence.delete(key, revision, this.#signal(true));
+    const owned = this.#owned.get(key);
+    if (owned?.revision === revision) this.#owned.delete(key);
+    try { return await this.#presence.delete(key, revision, this.#signal(true)); }
+    catch (error) {
+      // remove() cannot retry after #owned was retired. Preserve the exact-record
+      // cleanup intent instead of leaving a terminal row routable until its TTL.
+      if (owned?.revision === revision) this.#queueCleanup(key, owned.record);
+      throw error;
+    }
   }
 
   /** Terminal cleanup never reads a revision and then takes somebody else's row. */

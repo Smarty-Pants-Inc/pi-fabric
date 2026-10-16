@@ -21,6 +21,9 @@ import { DegradedObservation } from "../core/observation-watch.js";
 import { watchBridgeStore } from "../mesh/change-notifier.js";
 import type { FabricMessageSender } from "../protocol.js";
 import { eventReceipts } from "./root-inbox-shared.js";
+import { FileTransport } from "../transport/file.js";
+import { TransportUnsupportedError, type FabricTransport } from "../transport/types.js";
+import type { ParticipantView } from "./participant-view.js";
 
 const CONTROL_TOPIC = "fabric.control.command";
 const ACK_TOPIC = "fabric.control.ack";
@@ -379,6 +382,10 @@ class MirrorLeaseAdmissionRequired extends Error {
 }
 
 export interface FabricControlPlaneOptions {
+  /** FileTransport until the NATS control dispatcher is implemented; caller owns its lifetime. */
+  transport?: FabricTransport;
+  /** Exposed for carrier-aware callers; file-mode admission retains its existing gates. */
+  participants?: ParticipantView;
   /** Missing epochs are admitted with sender warnings by default during mixed-release rollout. */
   controlIncarnationFence?: MeshControlIncarnationFence;
   /** Must match this activation's participant directory. */
@@ -653,7 +660,7 @@ export class FabricControlPlane {
   readonly #pollMs: number;
   readonly #ackTimeoutMs: number;
   readonly #bridgeTimeoutMs: number;
-  #offset: number;
+  readonly #fileTransport: FileTransport;
   #lastSequence: number;
   // Drains run at start, on mesh event-log notifications and after this process's own
   // publishes. Idle has no timer: #retryTimer exists only for retained work (a failed or
@@ -726,11 +733,18 @@ export class FabricControlPlane {
       // control-seen stays on the file backend (smarty-dev#6477 R20).
       { lockProtocol: mesh.lockProtocol, stateBackend: "file" },
     );
-    // Replay the retained log from its current generation. Durable claims
+    const transport = options.transport ?? new FileTransport(mesh, { machine: "mesh", hostId: options.hostId });
+    if (!(transport instanceof FileTransport)) {
+      throw new TransportUnsupportedError("Fabric control currently requires FileTransport; NATS dispatch is not implemented");
+    }
+    this.#fileTransport = transport;
+    // The file reader replays the retained log from its current generation. Durable claims
     // recover unclaimed commands and make interrupted outcomes explicit without re-execution.
-    this.#offset = 0;
-    this.#lastSequence = 0;
+    this.#lastSequence = transport.reader.lastSequence;
   }
+
+  get transportKind(): FabricTransport["kind"] { return this.#fileTransport.kind; }
+  get participantView(): ParticipantView | undefined { return this.options.participants; }
 
   start(handler: FabricControlHandler): void {
     this.#handler = handler;
@@ -1090,7 +1104,7 @@ export class FabricControlPlane {
     try {
       // Settlement must not wait for the original publish or a best-effort cancellation.
       // The publish still completes once, and then cancels if settlement won while in flight.
-      const publishOnce = () => this.mesh.publish({
+      const publishOnce = () => this.#fileTransport.publish({
         id: commandEventId,
         topic: CONTROL_TOPIC,
         kind: operation,
@@ -1372,7 +1386,7 @@ export class FabricControlPlane {
     };
     await this.#backgroundCancellations.enqueue(async () => {
       if (Date.now() > expiresAt) return undefined;
-      const event = await this.mesh.publish(cancellation);
+      const event = await this.#fileTransport.publish(cancellation);
       this.#wake();
       return event;
     });
@@ -1682,30 +1696,24 @@ export class FabricControlPlane {
     for (const owned of this.#ownedCommands.values()) {
       if (!owned.running && (!this.#paused || owned.acceptance)) await this.#acceptCommand(owned.event);
     }
-    while (this.options.canConsumeMesh?.() !== false) {
-      const tail = this.mesh.tail(this.#offset, 100);
-      for (const event of tail.events) {
-        if (this.#paused || this.options.canConsumeMesh?.() === false) return false;
-        if (event.sequence <= this.#lastSequence) continue;
-        // An event is consumed only once handled: a command that hit a lock timeout throws,
-        // and the next poll reads this page again from it (smarty-dev#424). Each retry is
-        // bounded by the command's deadline plus the acknowledgement grace.
-        if (event.to === this.options.hostId) {
-          if (event.topic === ACK_TOPIC) {
-            // A hub speaks only for relay infrastructure, never for the destination owner.
-            const envelope = ownDataRecord(event);
-            const data = envelope && ownDataRecord(envelope.data);
-            if (data?.errorCode === RELAY_DESTINATION_UNAVAILABLE || data?.errorCode === FABRIC_IDEMPOTENCY_KEY_REUSED) this.#acceptRelayRefusal(event);
-            else if (data) this.#acceptAcknowledgement(event);
-          } else if (event.topic === CONTROL_TOPIC) await this.#acceptCommand(event);
-        }
-        if (this.options.canConsumeMesh?.() === false) return false;
-        this.#lastSequence = event.sequence;
+    // The reader commits a sequence only once handling succeeds; a failed command
+    // leaves its page/offset for the bounded retry (smarty-dev#424). Keep ACKs
+    // synchronous: awaiting an ACK callback would yield before its cursor commit.
+    const complete = await this.#fileTransport.reader.drain(event => {
+      if (event.topic === ACK_TOPIC) {
+        // A hub speaks only for relay infrastructure, never for the destination owner.
+        const envelope = ownDataRecord(event);
+        const data = envelope && ownDataRecord(envelope.data);
+        if (data?.errorCode === RELAY_DESTINATION_UNAVAILABLE || data?.errorCode === FABRIC_IDEMPOTENCY_KEY_REUSED) this.#acceptRelayRefusal(event);
+        else if (data) this.#acceptAcknowledgement(event);
+        return;
       }
-      this.#offset = tail.nextOffset;
-      if (tail.events.length < 100) break;
-    }
-    if (this.#paused || this.options.canConsumeMesh?.() === false) return false;
+      return this.#acceptCommand(event);
+    }, () => this.#paused, () => this.options.canConsumeMesh?.() !== false, event => {
+      // Release readback needs evidence at the exact cursor commit, not after an await.
+      this.#lastSequence = event.sequence;
+    });
+    if (!complete) return false;
     await this.#cleanupSeen(Date.now()).catch(rethrowMeshLockTimeout);
     return true;
   }
@@ -2288,7 +2296,7 @@ export class FabricControlPlane {
     // null explicitly attests that this command arrived without an epoch.
     staleIncarnation?: string | null,
   ): Promise<void> {
-    await this.mesh.publish({
+    await this.#fileTransport.publish({
         topic: ACK_TOPIC,
         kind: acceptance.accepted ? "accepted" : "rejected",
         from: this.identity,

@@ -62,10 +62,25 @@ const fixture = () => {
     if (id) closures.get(id)!(); else for (const close of closures.values()) close();
   }, launch };
 };
+// A transport handle is not worker readiness. Read and validate in the retry,
+// then carry the snapshot into synchronous append spies (which cannot await).
+const runningSnapshot = (run: string) => vi.waitFor(() => {
+  const snapshot = JSON.parse(fs.readFileSync(path.join(run, "status.json"), "utf8"));
+  expect(snapshot).toMatchObject({ status: "running", id: path.basename(run) });
+  return snapshot;
+}, { timeout: 3000 });
+const gatedHang = async (f: ReturnType<typeof fixture>) => {
+  const gate = path.join(f.root, "worker-boot-release");
+  const task = await f.host.agents.spawn({ task: JSON.stringify({ task: "HANG", fakeWorkerBootGate: gate }), transport: "process" });
+  const run = f.host.agents.runDirectory(task.id)!;
+  await vi.waitFor(() => expect(fs.existsSync(`${gate}.entered`)).toBe(true), { timeout: 3000 });
+  expect(fs.existsSync(path.join(run, "status.json"))).toBe(false);
+  expect(fs.existsSync(path.join(run, "final-answer.json"))).toBe(false);
+  return { task, run, release: () => fs.writeFileSync(gate, "release") };
+};
 const freeze = async (host: ResidentHost, id: string) => {
   const run = host.agents.runDirectory(id)!;
-  await vi.waitFor(() => expect(fs.existsSync(path.join(run, "status.json"))).toBe(true));
-  const snapshot = JSON.parse(fs.readFileSync(path.join(run, "status.json"), "utf8"));
+  const snapshot = await runningSnapshot(run);
   const receipt = saveFinalAnswerReceipt(run, id, "durable final answer");
   writeJsonAtomic(path.join(run, "status.json"), { ...snapshot, status: "completed", text: receipt.text,
     finalAnswerReceipt: { id: receipt.id, recordedAt: receipt.recordedAt }, finishedAt: receipt.recordedAt });
@@ -109,8 +124,9 @@ describe("resident ordinary-task terminal notices", () => {
     let appendSpy: ReturnType<typeof vi.spyOn> | undefined;
     try {
       await f.host.start(); sender.start(() => ({ accepted: false }));
-      const task = await f.host.agents.spawn({ task: "HANG", transport: "process" });
-      const run = f.host.agents.runDirectory(task.id)!;
+      const { task, run, release } = await gatedHang(f);
+      release();
+      const snapshot = await runningSnapshot(run);
       const journal = path.join(run, "steer.jsonl");
       const allowed = await sender.request(f.host.hostId, task.id, "steer", { message: "before final" }, f.host.identity.id);
       expect(allowed).toMatchObject({ acknowledged: true });
@@ -126,7 +142,6 @@ describe("resident ordinary-task terminal notices", () => {
       appendSpy = vi.spyOn(fs, "appendFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, data: string | Uint8Array, options?: fs.WriteFileOptions) => {
         if (file === journal && !receipt) {
           racingId = JSON.parse(String(data)).id;
-          const snapshot = JSON.parse(fs.readFileSync(path.join(run, "status.json"), "utf8"));
           receipt = saveFinalAnswerReceipt(run, task.id, "durable final answer");
           writeJsonAtomic(path.join(run, "status.json"), { ...snapshot, status: "completed", text: receipt.text,
             finalAnswerReceipt: { id: receipt.id, recordedAt: receipt.recordedAt }, finishedAt: receipt.recordedAt });
@@ -161,6 +176,99 @@ describe("resident ordinary-task terminal notices", () => {
       appendSpy?.mockRestore(); f.close(); await sender.close(); await f.host.close(); f.launch.mockRestore();
       // Retain this race proof; no real fixture deletion in the local path.
     }
+  });
+
+  // Decision C: only the manager's append-race receipt is mocked to pin a resolved
+  // run state; the resident host, control planes and sender error are real.
+  it.each(["steer", "followUp"] as const)("returns a typed %s refusal when the append target disappears after final publication", async delivery => {
+    const f = fixture();
+    const who: MeshIdentity = { id: f.config.rootId, name: "Root sender", kind: "main" };
+    const sender = new FabricControlPlane(new MeshStore(f.config.meshRoot, 65536, 1000), who,
+      { enabled: true, hostId: who.id, pollMs: 20, acknowledgementTimeoutMs: 2000 });
+    let appendSpy: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      await f.host.start(); sender.start(() => ({ accepted: false }));
+      const { task, run, release } = await gatedHang(f);
+      release();
+      const snapshot = await runningSnapshot(run);
+      const journal = path.join(run, "steer.jsonl");
+      const append = fs.appendFileSync;
+      let receipt: ReturnType<typeof saveFinalAnswerReceipt> | undefined;
+      appendSpy = vi.spyOn(fs, "appendFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, data: string | Uint8Array, options?: fs.WriteFileOptions) => {
+        if (file === journal && !receipt) {
+          receipt = saveFinalAnswerReceipt(run, task.id, "durable final answer");
+          writeJsonAtomic(path.join(run, "status.json"), { ...snapshot, status: "completed", text: receipt.text,
+            finalAnswerReceipt: { id: receipt.id, recordedAt: receipt.recordedAt }, finishedAt: receipt.recordedAt });
+          const error = new Error("append target disappeared during terminal transition") as NodeJS.ErrnoException;
+          error.code = "ENOENT";
+          throw error;
+        }
+        return append(file, data, options);
+      }) as typeof fs.appendFileSync);
+      await expect(sender.request(f.host.hostId, task.id, delivery, { message: "racing final" }, f.host.identity.id))
+        .rejects.toMatchObject({ code: "FABRIC_TARGET_TERMINAL", deliveryStatus: "undelivered", targetId: task.id,
+          reason: "run-ended", runState: "completed", message: expect.stringContaining("undelivered: task already finished") });
+      expect(receipt).toBeDefined();
+    } finally {
+      appendSpy?.mockRestore(); await sender.close(); await f.host.close();
+    }
+  });
+
+  // Real relay counterexamples: neither a pre-receipt filesystem failure nor
+  // an unrelated append error after publication is evidence of terminal refusal.
+  it.each((["steer", "followUp"] as const).flatMap(delivery =>
+    (["boot-read", "append-ENOENT", "append-EACCES-after-final"] as const).map(fault => [delivery, fault] as const)
+  ))("%s preserves %s as a nonterminal relay rejection", async (delivery, fault) => {
+    const f = fixture();
+    const who: MeshIdentity = { id: f.config.rootId, name: "Root sender", kind: "main" };
+    const sender = new FabricControlPlane(new MeshStore(f.config.meshRoot, 65536, 1000), who,
+      { enabled: true, hostId: who.id, pollMs: 20, acknowledgementTimeoutMs: 2000 });
+    let appendSpy: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      await f.host.start(); sender.start(() => ({ accepted: false }));
+      const { task, run, release } = await gatedHang(f);
+      const snapshot = fault === "boot-read" ? undefined : (release(), await runningSnapshot(run));
+      const journal = path.join(run, "steer.jsonl");
+      const append = fs.appendFileSync;
+      let injected: unknown;
+      let receipt: ReturnType<typeof saveFinalAnswerReceipt> | undefined;
+      appendSpy = vi.spyOn(fs, "appendFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, data: string | Uint8Array, options?: fs.WriteFileOptions) => {
+        if (file !== journal) return append(file, data, options);
+        try {
+          if (fault === "boot-read") {
+            // Exact merged-base ordering: synchronous read BEFORE receipt creation.
+            // The gate makes its original boot race deterministic, without CPU load.
+            JSON.parse(fs.readFileSync(path.join(run, "status.json"), "utf8"));
+            receipt = saveFinalAnswerReceipt(run, task.id, "must not be published before readiness");
+          }
+          if (fault === "append-EACCES-after-final") {
+            receipt = saveFinalAnswerReceipt(run, task.id, "durable final answer");
+            writeJsonAtomic(path.join(run, "status.json"), { ...snapshot, status: "completed", text: receipt.text,
+              finalAnswerReceipt: { id: receipt.id, recordedAt: receipt.recordedAt }, finishedAt: receipt.recordedAt });
+          }
+          const code = fault === "append-EACCES-after-final" ? "EACCES" : "ENOENT";
+          throw Object.assign(new Error(`${code}: injected genuine append failure`), { code });
+        } catch (error) { injected = error; throw error; }
+      }) as typeof fs.appendFileSync);
+      const rejection = await sender.request(f.host.hostId, task.id, delivery, { message: "filesystem counterexample" }, f.host.identity.id)
+        .then(() => { throw new Error("Unexpected ACK"); }, error => error);
+      expect(injected).toMatchObject({ code: fault === "append-EACCES-after-final" ? "EACCES" : "ENOENT" });
+      expect(rejection.message).toBe((injected as Error).message);
+      expect(rejection.code).not.toBe("FABRIC_TARGET_TERMINAL");
+      expect(rejection.finalAnswerReceiptId).toBeUndefined();
+      expect(fs.existsSync(journal)).toBe(false);
+      expect(fs.existsSync(path.join(run, "final-answer.json"))).toBe(fault === "append-EACCES-after-final");
+      if (fault === "boot-read") {
+        expect(injected).toMatchObject({ syscall: "open", path: path.join(run, "status.json") });
+        expect(receipt).toBeUndefined();
+        expect(fs.existsSync(path.join(run, "status.json"))).toBe(false);
+        appendSpy.mockRestore();
+        release();
+        await runningSnapshot(run);
+        expect(await sender.request(f.host.hostId, task.id, delivery, { message: "before final" }, f.host.identity.id))
+          .toMatchObject({ acknowledged: true });
+      }
+    } finally { appendSpy?.mockRestore(); await sender.close(); await f.host.close(); }
   });
 
   // Decision C: only the manager's append-race receipt is mocked to pin a resolved

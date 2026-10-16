@@ -269,7 +269,7 @@ describe("actor registry owner attribution", () => {
   it.each([
     ["src/actors/manager.ts", /\}, "manager-update"\);/],
     ["src/actors/manager.ts", /\}\), 0\), "manager-adoption"\);/],
-    ["src/actors/session-orphans.ts", /\}\)\), 0\), "session-orphans-reconcile"\);/],
+    ["src/actors/session-orphans.ts", /\}\)\), 0\), 0, \{ ownIncarnation: incarnation \}\), "session-orphans-reconcile"\);/],
     ["src/actors/session-orphans.ts", /\}, "session-orphans-ack"\);/],
     ["src/actors/remove-offline.ts", /\}, undefined, "remove-offline"\);/],
     ["src/storage/retention-cli.ts", /\.withLock\(\(\) => prune\(rootId, veto\), undefined, "retention"\)/],

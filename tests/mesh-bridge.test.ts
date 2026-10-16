@@ -17,6 +17,7 @@ import {
   type BridgeSide,
   BRIDGE_LEASE_MS,
   BridgeOwnershipError,
+  BridgeMirrorDeferredError,
   checkBridgePublish,
   DEFAULT_FACTORY_RATE,
   isBridgedTopic,
@@ -360,7 +361,8 @@ describe("presence mirror under contention (smarty-dev#2761)", () => {
       enabled: true, hostId: lane.hostId, rootId: lane.hostId, identity: lane.identity,
     });
     expect(directory.mirroredControlOwner(root.hostId, root.identity.id, root.identity.id))
-      .toEqual({ remoteHost: "forge", expiresAt: now + BRIDGE_LEASE_MS });
+      .toMatchObject({ remoteHost: "forge", expiresAt: now + BRIDGE_LEASE_MS,
+        mirror: { remoteHost: "forge", observedAt: now, sourceObservedAt: now, sourceUpdatedAt: now } });
     expect(directory.list({ scope: "project", fresh: true }).find((participant) => participant.id === root.identity.id))
       .toMatchObject({ stale: false });
     expect(presence).toHaveBeenCalledTimes(3);
@@ -579,7 +581,7 @@ describe("presence mirror under contention (smarty-dev#2761)", () => {
     expect(on(hub, "fabric.control.ack")).toHaveLength(0);
   });
 
-  it("bounds publication expiry recovery to one refresh and two pre-append attempts", async () => {
+  it("bounds publication expiry recovery to one refresh and two pre-append attempts, deferring a live origin without advancing its cursor", async () => {
     let now = 1_800_000_000_000;
     vi.spyOn(Date, "now").mockImplementation(() => now);
     const { hub, far, bridge, remote, logs } = setup(undefined, { presenceMs: 60_000 });
@@ -587,19 +589,35 @@ describe("presence mirror under contention (smarty-dev#2761)", () => {
     const root = await addRoot(far, "remote", 3_000);
     await bridge.start();
     await bridge.syncPresence();
-    await far.publish({ topic: "fabric.control.ack", kind: "ack", from: root.identity, to: lane.hostId, data: { targetId: root.hostId } });
+    const source = await far.publish({ topic: "fabric.control.ack", kind: "ack", from: root.identity, to: lane.hostId, data: { targetId: root.hostId } });
     const publish = hub.publish.bind(hub);
+    let induceExpiry = true;
     const publications = vi.spyOn(hub, "publish").mockImplementation(async (input) => {
-      now += 3_100;
-      writeHostLease(far.root, { id: root.hostId, rootId: root.hostId, identityId: root.identity.id, updatedAt: now, expiresAt: now + 3_000 });
+      if (induceExpiry) {
+        now += 3_100;
+        writeHostLease(far.root, { id: root.hostId, rootId: root.hostId, identityId: root.identity.id, updatedAt: now, expiresAt: now + 3_000 });
+      }
       return publish(input);
     });
     const presence = vi.spyOn(remote, "presence");
-    expect(await bridge.step()).toMatchObject({ toLocal: 0, dropped: 1 });
+    const deferred = await bridge.step().catch(error => {
+      expect(error).toBeInstanceOf(BridgeMirrorDeferredError);
+      return undefined;
+    });
+    if (deferred) expect(deferred).toMatchObject({ toLocal: 0, dropped: 0 });
     expect(publications).toHaveBeenCalledTimes(2);
     expect(presence).toHaveBeenCalledTimes(1);
     expect(on(hub, "fabric.control.ack")).toHaveLength(0);
-    expect(logs.join("\n")).toContain("no longer bound to bridge link");
+    const saved = () => JSON.parse(fs.readFileSync(bridge.options.cursorPath, "utf8")) as { toLocal: { after: number } };
+    expect(saved().toLocal.after).toBeLessThan(source.sequence);
+    expect(logs.some(line => line.includes(source.id) && /dropped|refused/.test(line))).toBe(false);
+    induceExpiry = false;
+    await bridge.syncPresence();
+    expect(await bridge.step()).toMatchObject({ toLocal: 1, dropped: 0 });
+    expect(on(hub, "fabric.control.ack").map(event => (event.data as { bridge: { id: string } }).bridge.id)).toEqual([source.id]);
+    expect(saved().toLocal.after).toBeGreaterThanOrEqual(source.sequence);
+    expect(await bridge.step()).toMatchObject({ toLocal: 0, dropped: 0 });
+    expect(on(hub, "fabric.control.ack")).toHaveLength(1);
   });
 
   it("single-flights a stale authority refresh across 100 concurrent refusal passes and never refreshes fresh messages", async () => {

@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import { writeJsonAtomic } from "../core/atomic-write.js";
+import { detachedPreview } from "../core/preview.js";
 import type {
   FabricHostedLiveness,
   FabricHostedReporter,
@@ -110,10 +111,10 @@ export const readHostedRunState = (filePath: string): HostedRunState | undefined
 };
 
 const boundedText = (value: string, max: number): string =>
-  value.length <= max ? value : value.slice(-max);
+  detachedPreview(value.length <= max ? value : value.slice(-max), max);
 
 const questionText = (value: unknown, max: number): string | undefined =>
-  typeof value === "string" ? value.slice(0, max) : undefined;
+  typeof value === "string" ? detachedPreview(value, max) : undefined;
 
 /**
  * One adapter-owned run. Fabric spawns no process: this object writes the same
@@ -339,7 +340,7 @@ export class HostedRun {
       record.toolCalls = Math.max(record.toolCalls, Math.floor(update.toolCalls));
     }
     if (update.currentTool === null) delete record.currentTool;
-    else if (typeof update.currentTool === "string") record.currentTool = update.currentTool.slice(0, MAX_TOOL_CHARS);
+    else if (typeof update.currentTool === "string") record.currentTool = detachedPreview(update.currentTool, MAX_TOOL_CHARS);
     if (typeof update.text === "string") record.text = boundedText(update.text, MAX_TEXT_CHARS);
     this.#write();
   }
@@ -440,7 +441,7 @@ export class HostedRun {
       status,
       text: output,
       ...(value !== undefined ? { value } : {}),
-      ...(status === "completed" ? {} : { error: output.slice(0, MAX_ERROR_CHARS) || `Hosted run ${status}` }),
+      ...(status === "completed" ? {} : { error: detachedPreview(output, MAX_ERROR_CHARS) || `Hosted run ${status}` }),
     });
   }
 
@@ -459,7 +460,7 @@ export class HostedRun {
     const now = Date.now();
     const record: AgentRunRecord = { ...this.#record, ...patch, finishedAt: now };
     if (typeof record.text === "string") record.text = boundedText(record.text, MAX_TEXT_CHARS);
-    if (record.error) record.error = record.error.slice(0, MAX_ERROR_CHARS);
+    if (record.error) record.error = detachedPreview(record.error, MAX_ERROR_CHARS);
     delete record.currentTool;
     delete record.blockedOn;
     delete record.sleeping;

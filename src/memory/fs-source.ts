@@ -100,32 +100,67 @@ const resolveSessionFile = (root: string, sessionKey: string): string | null => 
   return resolved;
 };
 
-/** Content-sensitive revision matching the filesystem index fingerprintSource
- *  convention: SHA-256 over the raw file bytes, so an mtime-only touch keeps
- *  the revision while any content change invalidates follow pointers. */
-const revisionForContent = (content: string): string =>
-  crypto.createHash("sha256").update(content).digest("hex");
+/** Content-sensitive revision matching the historical filesystem source:
+ * SHA-256 over the UTF-8-decoded file string. An mtime-only touch keeps the
+ * revision while any content change invalidates follow pointers. */
+const revisionForFile = async (file: string): Promise<string> => {
+  const hash = crypto.createHash("sha256");
+  const input = fs.createReadStream(file, { encoding: "utf8" });
+  try {
+    for await (const chunk of input) hash.update(chunk);
+    return hash.digest("hex");
+  } finally {
+    input.destroy();
+  }
+};
 
 const sessionIdFor = (file: string, header: { sessionId?: string } | null): string =>
   header?.sessionId || path.basename(file, ".jsonl");
 
-/** Parse JSONL with the same tolerance as normalizeSession: blank and
- *  unparsable lines are skipped; only plain object records are kept. */
-const parseRecords = (content: string): MemorySourceRecord[] => {
+/** Hash and parse the same decoded stream: reopening after hashing can pair
+ * a stale revision with newer records. Hash raw decoded chunks, not parsed
+ * records, so whitespace, invalid lines and malformed UTF-8 remain significant.
+ * Only the unfinished line is buffered alongside the full parsed records. */
+const parseRecords = async (
+  file: string,
+  signal?: AbortSignal,
+): Promise<{ revision: string; records: MemorySourceRecord[] }> => {
+  const input = fs.createReadStream(file, { encoding: "utf8", signal });
+  const hash = crypto.createHash("sha256");
   const records: MemorySourceRecord[] = [];
-  for (const line of content.split("\n")) {
+  let pending = "";
+  const parseLine = (line: string): void => {
+    signal?.throwIfAborted();
     const trimmed = line.trim();
-    if (!trimmed) continue;
+    if (!trimmed) return;
     try {
       const parsed: unknown = JSON.parse(trimmed);
       if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
         records.push(parsed as MemorySourceRecord);
       }
     } catch {
-      continue;
+      // Match normalizeSession's tolerant handling of torn/invalid lines.
     }
+  };
+  try {
+    for await (const chunk of input) {
+      signal?.throwIfAborted();
+      hash.update(chunk);
+      pending += chunk;
+      let newline = pending.indexOf("\n");
+      while (newline !== -1) {
+        parseLine(pending.slice(0, newline));
+        pending = pending.slice(newline + 1);
+        newline = pending.indexOf("\n");
+      }
+    }
+    signal?.throwIfAborted();
+    if (pending.length > 0) parseLine(pending);
+    return { revision: hash.digest("hex"), records };
+  } finally {
+    pending = "";
+    input.destroy();
   }
-  return records;
 };
 
 /** Build a filesystem adapter for one configured source entry. */
@@ -142,9 +177,9 @@ export const createFileSystemMemorySource = (
       const descriptors: MemorySourceSessionDescriptor[] = [];
       for (const found of discovered.slice(0, boundedLimit)) {
         signal?.throwIfAborted();
-        let content: string;
+        let revision: string;
         try {
-          content = fs.readFileSync(found.file, "utf8");
+          revision = await revisionForFile(found.file);
         } catch {
           continue;
         }
@@ -152,7 +187,7 @@ export const createFileSystemMemorySource = (
         descriptors.push({
           sessionKey: found.sessionKey,
           sessionId: sessionIdFor(found.file, header),
-          revision: revisionForContent(content),
+          revision,
           metadata: {
             sessionId: sessionIdFor(found.file, header),
             cwd: header?.cwd ?? "",
@@ -174,23 +209,26 @@ export const createFileSystemMemorySource = (
       signal?.throwIfAborted();
       const file = resolveSessionFile(options.root, sessionKey);
       if (!file) return null;
-      let content: string;
+      let parsed: Awaited<ReturnType<typeof parseRecords>>;
       try {
-        content = fs.readFileSync(file, "utf8");
+        parsed = await parseRecords(file, signal);
       } catch {
+        if (signal?.aborted) signal.throwIfAborted();
         return null;
       }
+      // Keep the existing bounded (8,192-byte) header-reader semantics.
       const header = readSessionHeader(file);
+      const { revision, records } = parsed;
       return {
         sessionKey,
         sessionId: sessionIdFor(file, header),
-        revision: revisionForContent(content),
+        revision,
         metadata: {
           sessionId: sessionIdFor(file, header),
           cwd: header?.cwd ?? "",
           updatedAt: statMtimeMs(file),
         },
-        records: parseRecords(content),
+        records,
       } satisfies MemorySourceSnapshot;
     },
   });

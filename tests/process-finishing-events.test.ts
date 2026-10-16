@@ -221,8 +221,13 @@ it.skipIf(process.platform === "win32").each([false, true])("retains failed cust
   await vi.advanceTimersByTimeAsync(0);
   const result = await f.manager.wait(f.handle.id);
   expect(result).toMatchObject({ status: "failed", text: "QUIESCENT", errorCode: "CUSTODY_UNCONFIRMED" });
-  fs.writeFileSync(f.statusFile, JSON.stringify({ ...result, status: "completed", text: "late worker write" }));
+  const lateWorkerWrite = JSON.stringify({ ...result, status: "completed", text: "late worker write" });
+  fs.writeFileSync(f.statusFile, lateWorkerWrite);
+  // Neither worker progress nor the older unauthenticated custody snapshot may
+  // override main's manager-owned, authenticated settlement publication.
+  fs.writeFileSync(path.join(path.dirname(f.statusFile), "custody-failure.json"), lateWorkerWrite);
   expect(f.manager.status(f.handle.id)).toMatchObject({ status: "failed", text: "QUIESCENT", errorCode: "CUSTODY_UNCONFIRMED" });
+  expect(await f.manager.wait(f.handle.id)).toMatchObject({ status: "failed", text: "QUIESCENT", errorCode: "CUSTODY_UNCONFIRMED" });
   expect(f.manager.listForUi().find(run => run.id === f.handle.id)?.status).toBe("failed");
   const next = await f.manager.spawn({ task: "must not overlap failed custody", transport: "process" });
   expect(next.status).toBe("queued");

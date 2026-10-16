@@ -213,11 +213,15 @@ console.log(JSON.stringify({ ops: Object.keys(ops), results, nodeOptions: proces
 
 const runRootChild = `
 import fs from "node:fs";
-const [root, sibling] = process.argv.slice(2);
-let siblingError = null;
-try { fs.rmSync(sibling); } catch (error) { siblingError = error.message; }
+const [root, sibling, outside] = process.argv.slice(2);
+const statusTemp = sibling + ".tmp";
+let siblingError = null, outsideError = null;
+fs.writeFileSync(statusTemp, "status");
+try { fs.renameSync(statusTemp, sibling); } catch (error) { siblingError = error.message; }
+try { fs.rmSync(outside); } catch (error) { outsideError = error.message; }
 fs.rmSync(root, { recursive: true, force: true });
-console.log(JSON.stringify({ siblingError, rootExists: fs.existsSync(root) }));
+console.log(JSON.stringify({ siblingError, outsideError, status: fs.existsSync(sibling) ? fs.readFileSync(sibling, "utf8") : null,
+  rootExists: fs.existsSync(root) }));
 `;
 
 // The recorder replaces every deleter BEFORE the explicit guard import, so report mode wraps the
@@ -502,23 +506,19 @@ it("keeps native Windows deletion hosted-only without invoking its test callback
   }
 });
 
-// smarty-dev#11145 / #4664: product suites that delete real paths run only hosted. The config derives them by
-// scanning test sources for its exported markers; this file keeps the original six plus every actor-remove suite
-// and ActorDirectory's deleting suite as an independent floor. Non-deleting imports stay eligible locally.
-const originalSuites = ["tests/residency-operator-actors.test.ts", "tests/mesh-publish-batch-hold.test.ts",
-  "tests/verified-remove-windows.test.ts", "tests/verified-remove.test.ts", "tests/verified-remove-secondary.test.ts",
-  "tests/scratch-platform-retention.test.ts"];
-const testsDir = new URL("./", import.meta.url);
-const actorRemoveSuites = (fs.readdirSync(testsDir, { recursive: true }) as string[])
-  .map((name) => String(name).split(sep).join("/"))
-  .filter((name) => /(^|\/)actor-remove-[^/]*\.test\.ts$/.test(name))
-  .map((name) => `tests/${name}`).sort();
-const ownSuite = "tests/test-deletion-guard.test.ts";
-// Imports only the real vitest.config.ts (type-only Vitest edge erased); no test file or callback runs. The child
-// also writes a pseudo tests root under the private TMPDIR whose nested suite carries the config's first marker
-// (taken from the config at runtime), a direct receiver.removeActor() call (no deletion import), and an arbitrarily
-// named ActorDirectory receiver.remove() call. Fixtures remain source text, never imported/executed; read-only uses,
-// type-only imports, comment/string mentions and an unrelated directory.remove() stay eligible.
+// smarty-dev#11145 / #4664: native/tool deletion, Bun children that ignore the guard import (#13001),
+// and the outside-TMPDIR fixture caught by the revert rule stay hosted-only. Exercise the real config
+// in a child (no test callbacks execute), including the newly guardable local path.
+const hostedOnlySuites = ["tests/actor-child-completion-idle-preflight.test.ts", "tests/actor-manager.test.ts",
+  "tests/actor-remove-dead-root.test.ts", "tests/agent-manager.test.ts", "tests/agent-release-observation.test.ts",
+  "tests/agents-provider.test.ts", "tests/residency-commit-fence.test.ts", "tests/residency-stopped-writer-retention.test.ts",
+  "tests/residency.test.ts", "tests/routed-session-boundaries.test.ts", "tests/stall-alarms.test.ts",
+  "tests/task-write-policy.test.ts", "tests/temp-run-sweep.test.ts", "tests/verified-remove-windows.test.ts", "tests/windows-temp-root-native.test.ts"];
+const guardableSuites = ["tests/actor-directory.test.ts",
+  "tests/mesh-backend-migration-nats.test.ts",
+  "tests/state-backend-nats.test.ts", "tests/residency-operator-actors.test.ts", "tests/mesh-publish-batch-hold.test.ts",
+  "tests/verified-remove.test.ts", "tests/verified-remove-secondary.test.ts", "tests/scratch-platform-retention.test.ts",
+  "tests/test-deletion-guard.test.ts", "tests/test-fleet-isolation.test.ts"];
 const configChild = `
 import fs from "node:fs";
 import { registerHooks } from "node:module";
@@ -529,73 +529,40 @@ registerHooks({ resolve(specifier, context, nextResolve) {
   }
   return nextResolve(specifier, context);
 }});
-const [configUrl, fixtureRoot] = process.argv.slice(2);
+const [configUrl] = process.argv.slice(2);
 const mod = await import(configUrl);
 const config = mod.default;
 const project = config.test.projects.find((entry) => entry.test.name === "default");
 const out = { include: project.test.include, exclude: project.test.exclude ?? [], rootExclude: config.test.exclude ?? [],
-  exported: typeof mod.productDeletionSuites === "function" && Array.isArray(mod.productDeletionMarkers)
-    && mod.productDeletionMarkers.length > 0 };
-if (out.exported) {
-  const text = mod.productDeletionMarkers[0];
-  out.markerFound = typeof text === "string" && text.length > 0;
-  if (out.markerFound) {
-    fs.mkdirSync(fixtureRoot + "/nested", { recursive: true });
-    const entry = "import { main } from " + JSON.stringify("../src/" + text + ".js") + ";\\n";
-    fs.writeFileSync(fixtureRoot + "/nested/marker.test.ts", entry);
-    fs.writeFileSync(fixtureRoot + "/nested/helper.ts", entry);
-    fs.writeFileSync(fixtureRoot + "/comment.test.ts", "/* " + text + " main.removeActor(id) */\\n");
-    fs.writeFileSync(fixtureRoot + "/string.test.ts", "const marker = " + JSON.stringify(text) + "; const call = 'main.removeActor(id)';\\n");
-    fs.writeFileSync(fixtureRoot + "/receiver-remove-actor.test.ts", "export const run = (main, id) => main.removeActor(id);\\n");
-    fs.writeFileSync(fixtureRoot + "/directory-remove.test.ts", 'import { ActorDirectory } from "../src/actors/directory.js";\\nexport const run = (base, roots) => { const catalog = new ActorDirectory(base, roots, "project"); return catalog.remove("id"); };\\n');
-    fs.writeFileSync(fixtureRoot + "/directory-read.test.ts", 'import { ActorDirectory } from "../src/actors/directory.js";\\nexport const read = (base, roots) => { const catalog = new ActorDirectory(base, roots, "project"); return [catalog.status("id"), catalog.list()]; }; /* catalog.remove("id") */ const mention = "catalog.remove(id)";\\n');
-    fs.writeFileSync(fixtureRoot + "/directory-type-import.test.ts", 'import type { ActorDirectory } from "../src/actors/directory.js";\\nexport const run = (catalog: ActorDirectory) => catalog.remove("id");\\n');
-    fs.writeFileSync(fixtureRoot + "/directory-type-specifier.test.ts", 'import { type ActorDirectory } from "../src/actors/directory.js";\\nexport const run = (catalog: ActorDirectory) => catalog.remove("id");\\n');
-    fs.writeFileSync(fixtureRoot + "/unrelated-directory-remove.test.ts", 'export const run = (directory) => directory.remove("id");\\n');
-    fs.writeFileSync(fixtureRoot + "/mesh-import.test.ts", 'import { MeshStore } from "../src/mesh/store.js";\\n');
-    fs.writeFileSync(fixtureRoot + "/type-import.test.ts", "import type { Options } from " + JSON.stringify("../src/" + text + ".js") + ";\\n");
-    fs.writeFileSync(fixtureRoot + "/type-specifier.test.ts", "import { type Options } from " + JSON.stringify("../src/" + text + ".js") + ";\\n");
-    fs.writeFileSync(fixtureRoot + "/neutral.test.ts", "export const neutral = 1;\\n");
-    out.fixture = mod.productDeletionSuites(fixtureRoot);
-  }
-  out.suites = mod.productDeletionSuites();
-}
+  suites: mod.productDeletionSuites(),
+  projects: config.test.projects.map(entry => ({ name: entry.test.name, exclude: entry.test.exclude ?? [] })) };
 console.log("CONFIG:" + JSON.stringify(out));
 `;
 
 it.each([[undefined, false], ["false", false], ["true", true]] as const)(
-  "vitest.config.ts selects real-delete suites only when GITHUB_ACTIONS=%s is hosted", (value, selected) => {
+  "vitest.config.cts keeps native/tool, Bun and reverted deletion hosted-only (GITHUB_ACTIONS=%s)", (value, hosted) => {
     const env: NodeJS.ProcessEnv = { ...process.env, GITHUB_ACTIONS: value,
       NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --experimental-transform-types` };
     if (value === undefined) delete env.GITHUB_ACTIONS;
-    const fixtureRoot = mkdtempSync(join(fixtures, "pseudo-tests-"));
-    expect(inside(privateTemp, fixtureRoot)).toBe(true);
     const result = runChild(`config-child-${value}.mjs`, configChild,
-      [new URL("../vitest.config.ts", import.meta.url).href, fixtureRoot], env);
+      [new URL("../vitest.config.cts", import.meta.url).href], env);
     const line = result.stdout.split(/\r?\n/).find((entry) => entry.startsWith("CONFIG:"));
     expect(line, result.stdout + result.stderr).toBeDefined();
     const output = JSON.parse(line!.slice("CONFIG:".length)) as { include: string[]; exclude: string[];
-      rootExclude: string[]; exported: boolean; markerFound?: boolean; fixture?: string[]; suites?: string[] };
+      rootExclude: string[]; suites: string[]; projects: Array<{ name: string; exclude: string[] }> };
     expect(output.include).toEqual(["tests/**/*.test.ts"]);
-    expect(output.exported, "vitest.config.ts must export productDeletionSuites() and non-empty productDeletionMarkers")
-      .toBe(true);
-    expect(output.markerFound, "first deletion marker must be usable as fixture source").toBe(true);
-    expect(actorRemoveSuites).toContain("tests/actor-remove-dead-root.test.ts");
-    const required = [...originalSuites, ...actorRemoveSuites, "tests/actor-directory.test.ts"];
-    if (selected) {
-      expect(output.suites).toEqual([]);
-      expect(output.fixture).toEqual([]);
-      expect(required.filter((suite) => output.exclude.includes(suite) || output.rootExclude.includes(suite))).toEqual([]);
-    } else {
-      const suites = output.suites!;
-      expect(suites).toEqual(expect.arrayContaining(required));
-      expect(suites).not.toContain(ownSuite);
-      expect(suites).not.toContain("tests/test-fleet-isolation.test.ts");
-      for (const suite of suites) expect(suite).toMatch(/^tests\/(?:[^/\\]+\/)*[^/\\]+\.test\.ts$/);
-      expect(suites.filter((suite) => !output.exclude.includes(suite))).toEqual([]);
-      expect(output.fixture).toEqual(["tests/directory-remove.test.ts", "tests/nested/marker.test.ts",
-        "tests/receiver-remove-actor.test.ts"]);
+    const required = hosted ? [] : hostedOnlySuites;
+    expect(output.suites).toEqual(required);
+    expect(output.rootExclude).toEqual(required);
+    for (const project of output.projects) {
+      for (const suite of hostedOnlySuites) expect(project.exclude.includes(suite), `${project.name}: ${suite}`).toBe(!hosted);
+      for (const suite of guardableSuites) expect(project.exclude, `${project.name}: guarded Node fs stays local`).not.toContain(suite);
     }
+    // Native/tool and Bun counterexamples stay excluded; a guarded actor suite and the migration suites
+    // no longer disappear just because they import deleting product code (pi-fabric#1151).
+    expect(output.exclude.includes("tests/verified-remove-windows.test.ts")).toBe(!hosted);
+    expect(output.exclude.includes("tests/temp-run-sweep.test.ts")).toBe(!hosted);
+    expect(output.exclude).not.toContain("tests/actor-directory.test.ts");
   });
 
 describe("deletion guard in child processes", () => {
@@ -635,18 +602,24 @@ describe("deletion guard in child processes", () => {
     expectExternalIntact();
   });
 
-  it("captures the child's narrower TMPDIR at installation and permits exit cleanup of that root", () => {
+  it("keeps the inherited private ceiling when a child narrows TMPDIR for atomic status rename", () => {
     requireGuard();
-    const root = mkdtempSync(join(fixtures, "child-root-"));
-    const sibling = join(fixtures, "child-sibling.txt");
+    const run = mkdtempSync(join(fixtures, "child-run-"));
+    const root = join(run, "tmp");
+    const sibling = join(run, "status.json");
+    mkdirSync(root);
+    writeFileSync(sibling, "old status");
     writeFileSync(join(root, "cache.json"), "x");
-    writeFileSync(sibling, "sibling");
-    const result = runChild("run-root-child.mjs", runRootChild, [root, sibling],
+    const result = runChild("run-root-child.mjs", runRootChild, [root, sibling, externalFile],
       { ...process.env, GITHUB_ACTIONS: "false", TMPDIR: root, TMP: root, TEMP: root });
-    const output = JSON.parse(result.stdout.trim()) as { siblingError: string | null; rootExists: boolean };
-    expect(output.siblingError).toMatch(refusal);
+    const output = JSON.parse(result.stdout.trim()) as
+      { siblingError: string | null; outsideError: string | null; status: string | null; rootExists: boolean };
+    expect(output.siblingError).toBeNull();
+    expect(output.outsideError).toMatch(refusal);
+    expect(output.status).toBe("status");
     expect(output.rootExists).toBe(false);
-    expect(fs.readFileSync(sibling, "utf8")).toBe("sibling");
+    expect(fs.readFileSync(sibling, "utf8")).toBe("status");
+    expectExternalIntact();
   });
 
   it("reports once without throwing under GITHUB_ACTIONS=true and never reaches the real deleter", () => {

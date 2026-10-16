@@ -6,7 +6,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { Readable, Writable } from "node:stream";
 import { readFileRetrying, writeJsonAtomic } from "../core/atomic-write.js";
-import { type FabricHostLease, hostLeaseExpiry, hostLeasePath, hostLiveness, readHostLease, readHostLeases, removeHostLeaseIf, STATE_LEASE_RENEW_MS, writeHostLease } from "../topology/host-leases.js";
+import { type FabricHostLease, type FabricMirrorLease, MIRROR_FRESH_MS, hostLeaseExpiry, hostLeasePath, hostLiveness, readHostLease, readHostLeases, removeHostLeaseIf, STATE_LEASE_RENEW_MS, writeHostLease } from "../topology/host-leases.js";
 import { meshDirectoryStamp } from "../topology/publication-generation.js";
 import type { FabricHostRecord, FabricParticipantRecord } from "../topology/types.js";
 import { ROOT_ID_PREFIX } from "../topology/root-inbox-shared.js";
@@ -16,20 +16,24 @@ import { CommitOutbox, type CommitOutboxEffect } from "./commit-outbox.js";
 import { assertBridgeStateBackend, isMeshRetryableBusy, isMeshStateBusy, isMeshStateWalCap } from "./state-backend.js";
 import { watchBridgeStore, type BridgeChange } from "./change-notifier.js";
 import { BRIDGE_BATCH_MAX_EVENTS } from "./event-log.js";
+import { controlBodyFingerprint, FABRIC_IDEMPOTENCY_KEY_REUSED, FabricIdempotencyKeyReusedError } from "./control-idempotency.js";
 import { HUB_FACTORY_RECIPIENT, isAddressedHubFactoryEvent, isWorkTopic, parseWorkTopic } from "./bridge-topics.js";
 export { HUB_FACTORY_RECIPIENT, isWorkTopic, parseWorkTopic } from "./bridge-topics.js";
 
 /**
  * Fabric mesh bridge v1 (smarty-dev#2004). Each host keeps its own mesh; one bridge process on the
  * hub (Dev1) links it to one remote host's mesh over a stdio transport (ssh to a forced command
- * that runs `mesh-bridge agent`). No new store or protocol: the bridge republishes allow-listed
- * mesh events and mirrors each side's live root presence into the other side.
+ * that runs `mesh-bridge agent`). The bridge republishes allow-listed mesh events and mirrors
+ * each side's live root presence. Cross-spoke commands use delivery-only hub-link IPC rather
+ * than a hub body log; the destination reuses its own existing stdio link and mesh store.
  *
  * Trust: the hub side is trusted; the remote side is not. An event from the remote crosses only
  * when its sender is a live participant native to the remote (and no hub record uses its id), and
- * its recipient is native to the hub, or is the hub factory's role address `factory` on a work
- * event or owner wake (smarty-dev#9352). Unaddressed WAIT/ETA issue records also cross to the
- * factory (smarty-dev#9349), not other broadcasts. Mirrored records never replace a native record. The one
+ * its recipient is native to the hub, a canonical root held on another link (control/ACK only),
+ * or the hub factory's role address `factory` on a work event or owner wake (smarty-dev#9352).
+ * The trusted hub re-exports other links' roots and carries their controls one final hop.
+ * Unaddressed WAIT/ETA issue records also cross to the factory (smarty-dev#9349), not other
+ * broadcasts. Mirrored records never replace a native record. The one
  * exception to "no hub record uses its id" is a hub-written handoff (smarty-dev#9074, below).
  */
 
@@ -38,16 +42,21 @@ export const BRIDGE_PROTOCOL_VERSION = 2;
 const LEGACY_BRIDGE_PROTOCOL_VERSION = 1;
 const HOST_PREFIX = "topology/hosts/";
 const PARTICIPANT_PREFIX = "topology/participants/";
-/** A mirrored host lease lasts this long past its last renewal, so a dead bridge lapses it. */
-export const BRIDGE_LEASE_MS = 15_000;
+/** Freshness bound for an observation from one physical bridge peer. */
+export const BRIDGE_LEASE_MS = MIRROR_FRESH_MS;
 /** How long a held publish retries a busy SQLite state write fence before the loop backs off. */
 const BRIDGE_FENCE_RETRY_MS = 5_000;
 const DEFAULT_PRESENCE_MS = 5_000;
+/** A retained source event revalidates after this delay; this is NOT an event/authority TTL. */
+const DEFAULT_MEMBERSHIP_RETRY_MS = 1_000;
+/** A missed change notification is only a safety net: its retry backs off to this bound. */
+const MEMBERSHIP_RETRY_MAX_MS = 30_000;
 /** Transitional mixed-version exception only: remove after all fleet agents support changes. */
 const LEGACY_POLL_MS = 250;
 /** Commands whose ACK this link relays back to a non-participant hub sender (smarty-dev#9751). */
 const MAX_AWAITING_ACKS = 4_096;
 type Direction = "toRemote" | "toLocal";
+type DirectionWakeReason = "real" | "safety" | "grace" | "sync" | "other";
 /** How long a carried command's ACK may still be relayed back (smarty-dev#9751). */
 const AWAITING_ACK_MS = 15 * 60_000;
 /** A relayed ACK goes back only to one session or factory host: never an org, topic or broadcast name. */
@@ -77,6 +86,15 @@ const MAX_RPC_LINE_BYTES = 16 * 1024 * 1024;
 /** A read page's event bytes stay under this, well inside one frame with its JSON envelope. */
 export const BRIDGE_PAGE_BYTES = 8 * 1024 * 1024;
 const NAME_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$/;
+const RELAY_UNAVAILABLE_CODE = "FABRIC_RELAY_DESTINATION_UNAVAILABLE";
+const RELAY_RECEIPT_PREFIX = "bridge-relay-receipt:";
+const relayUnavailable = (): Error & { code: string; retryable: true } =>
+  Object.assign(new Error("Relay destination unavailable"), { code: RELAY_UNAVAILABLE_CODE, retryable: true as const });
+
+/** A host-only receipt has no payload or bridge stamp and must never be forwarded as a command. */
+const isRelayReceipt = (event: Pick<MeshEvent, "id" | "dedupeKey" | "verification">): boolean =>
+  event.verification === "bridge" && ((typeof event.id === "string" && event.id.startsWith(RELAY_RECEIPT_PREFIX)) ||
+    (typeof event.dedupeKey === "string" && event.dedupeKey.startsWith(RELAY_RECEIPT_PREFIX)));
 
 const keyFor = (prefix: string, id: string): string => prefix + createHash("sha256").update(id).digest("hex");
 
@@ -96,6 +114,9 @@ const participantFileSnapshot = (root: string): { entries: readonly MeshStateEnt
 
 const isObject = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
+
+const isIdempotencyKeyReused = (error: unknown): boolean =>
+  isObject(error) && error.code === FABRIC_IDEMPOTENCY_KEY_REUSED;
 
 const isIdentity = (value: unknown): value is MeshIdentity =>
   isObject(value) && typeof value.id === "string" && value.id.length > 0 && typeof value.name === "string" &&
@@ -152,21 +173,26 @@ const UNADDRESSED_LOG_MS = 60_000;
 /** The count line names at most this many distinct topics. */
 const UNADDRESSED_TOPICS = 10;
 
-/** The stamp a bridged event carries; an event with one is never forwarded again (no loops). */
-export const bridgeStampOf = (event: Pick<MeshEvent, "data">): { from: string; id: string } | undefined => {
+/** Origin and cursor-recovery event id; a trusted hub may add one final `via` hop. */
+export const bridgeStampOf = (event: Pick<MeshEvent, "data">): { from: string; id: string; via?: string } | undefined => {
   const stamp = isObject(event.data) ? event.data.bridge : undefined;
   return isObject(stamp) && typeof stamp.from === "string" && typeof stamp.id === "string"
-    ? { from: stamp.from, id: stamp.id }
+    ? { from: stamp.from, id: stamp.id, ...(typeof stamp.via === "string" ? { via: stamp.via } : {}) }
     : undefined;
 };
 
 const hasBridgeField = (event: Pick<MeshEvent, "data">): boolean =>
   isObject(event.data) && Object.hasOwn(event.data, "bridge");
 
+const hasHubHop = (event: Pick<MeshEvent, "data">): boolean =>
+  isObject(event.data) && isObject(event.data.bridge) && Object.hasOwn(event.data.bridge, "via");
+
 export interface BridgeHost {
   record: FabricHostRecord;
   /** The effective lease expiry on the source (the later of state and file lease). */
   expiresAt: number;
+  /** Source clock at the native lease read; absent on older bridge agents. */
+  observedAt?: number;
 }
 
 export interface BridgePresence {
@@ -202,7 +228,7 @@ export interface BridgePublish {
   from: MeshIdentity;
   to: string;
   text?: string;
-  data: Record<string, unknown> & { bridge: { from: string; id: string } };
+  data: Record<string, unknown> & { bridge: { from: string; id: string; via?: string } };
 }
 
 /** One side of the bridge: the local mesh directly, or the remote one through the agent. */
@@ -219,12 +245,20 @@ export interface BridgeSide {
   latestCursor?(): Promise<BridgeHead>;
   tail?(after: number, offset?: number): Promise<BridgeRead>;
   presence(): Promise<BridgePresence>;
+  /** Hub-local only: live direct mirrors owned by other links, never re-exported mirrors. */
+  relayPresence?(): Promise<Pick<BridgePresence, "hosts" | "participants">>;
+  /** Direct origin of a held root on another link, for captured control destinations. */
+  relayOrigin?(id: string): string | undefined;
+  /** Hub-local only: a structurally attributable projection whose authority is stale; never routing authority. */
+  relayStaleOrigin?(id: string): string | undefined;
   /** Publish a bridged event; with `held`, only if this link holds each of those ids at commit. */
   publish(event: BridgePublish, held?: string[]): Promise<{ sequence: number }>;
+  /** Hub-local only: persist a payload-free successful relay receipt under the sender fence. */
+  recordRelay?(event: BridgePublish, held?: string[]): Promise<{ sequence: number }>;
   /** Optional capability: returns a durably committed, ordered prefix (1..256 events). */
   publishBatch?(events: Array<{ event: BridgePublish; held?: string[] }>): Promise<Array<{ sequence: number }>>;
   /** Whether this link holds a live mirror answering to the id (the hub side only). */
-  holds?(id: string): boolean;
+  holds?(id: string, identity?: MeshIdentity): boolean;
   /** Whether this link has a mirror record for the id, even if its lease lapsed (hub only). */
   mirrored?(id: string): boolean;
   /**
@@ -248,6 +282,11 @@ const BRIDGED_IDS_PAGE = 50_000;
 
 const remoteHostOf = (value: unknown): string | undefined =>
   isObject(value) && typeof value.remoteHost === "string" ? value.remoteHost : undefined;
+
+/** A re-export belongs to its immediate hub link, but routes and ACKs retain its origin. */
+const mirrorLinkOf = (value: unknown): string | undefined =>
+  remoteHostOf(value) !== undefined && isObject(value) && typeof value.bridgeVia === "string"
+    ? value.bridgeVia : remoteHostOf(value);
 
 const hostOf = (key: string, value: unknown): FabricHostRecord | undefined => {
   if (!isObject(value) || value.format !== 1 || typeof value.id !== "string") return undefined;
@@ -399,15 +438,17 @@ const settled = (value: Record<string, unknown>): string =>
  * A bridge side over a mesh store on this host. `peer` names the other side: it is the
  * `remoteHost` mark on mirrored records and the `bridge.from` of events it bridges in.
  */
-interface BridgeLease { id: string; rootId: string; identityId: string; updatedAt: number; expiresAt: number; startedAt?: number }
+interface BridgeLease { id: string; rootId: string; identityId: string; updatedAt: number; expiresAt: number; startedAt?: number; incarnationToken?: string; mirror?: FabricMirrorLease; mirrorLease?: 1 }
 /**
- * A removed mirror's lease identity, as its lease file carries it (root, identity, incarnation).
+ * A removed mirror's lease identity, as its lease file carries it (root, identity, start and token).
  * A row without root, identity and incarnation (an older release's) proves no owner: it removes nothing.
  */
-interface BridgeUnlease { key: string; id: string; rootId?: string; identityId?: string; startedAt?: number }
+interface BridgeUnlease { key: string; id: string; rootId?: string; identityId?: string; startedAt?: number; incarnationToken?: string }
 
-const incarnationOf = (record: { startedAt?: unknown }): { startedAt?: number } =>
-  typeof record.startedAt === "number" && Number.isFinite(record.startedAt) ? { startedAt: record.startedAt } : {};
+const incarnationOf = (record: { startedAt?: unknown; incarnationToken?: unknown }): { startedAt?: number; incarnationToken?: string } => ({
+  ...(typeof record.startedAt === "number" && Number.isFinite(record.startedAt) ? { startedAt: record.startedAt } : {}),
+  ...(typeof record.incarnationToken === "string" && record.incarnationToken.length > 0 ? { incarnationToken: record.incarnationToken } : {}),
+});
 
 export class StoreBridgeSide implements BridgeSide {
   // The mirror's host-lease writes and removals run after its state commit, from rows recorded in
@@ -433,7 +474,8 @@ export class StoreBridgeSide implements BridgeSide {
         // A lease without an incarnation is a mirror lease of an earlier release (or a writer from
         // before lease incarnations): root and identity decide it, as before.
         removeHostLeaseIf(this.store.root, gone.id, (lease) => lease.id === gone.id && lease.rootId === gone.rootId &&
-          lease.identityId === gone.identityId && (lease.startedAt === undefined || lease.startedAt === gone.startedAt));
+          lease.identityId === gone.identityId && lease.incarnationToken === gone.incarnationToken &&
+          (lease.startedAt === undefined || lease.startedAt === gone.startedAt));
       },
     });
   }
@@ -496,7 +538,9 @@ export class StoreBridgeSide implements BridgeSide {
     let offset = offsets?.start;
     let complete = true;
     for (const [index, event] of page.entries()) {
-      if (event.sequence > after && isBridgedTopic(event) && !hasBridgeField(event)) {
+      if (event.sequence > after && isBridgedTopic(event) && !isRelayReceipt(event) &&
+          !(event.verification === "bridge" && event.topic === "fabric.control.command" && !isObject(event.data)) && (!hasBridgeField(event) ||
+          (event.verification === "bridge" && bridgeStampOf(event)?.from !== this.peer && !hasHubHop(event)))) {
         const size = Buffer.byteLength(JSON.stringify(event), "utf8");
         if (size > pageBytes) {
           skipped.push({ id: event.id, sequence: event.sequence, topic: event.topic, bytes: size });
@@ -515,6 +559,49 @@ export class StoreBridgeSide implements BridgeSide {
 
   async presence(): Promise<BridgePresence> {
     return this.#presenceSnapshot();
+  }
+
+  #relayProjection(id: string): FabricHostRecord | undefined {
+    const entry = this.store.get(keyFor(HOST_PREFIX, id), { fresh: true });
+    const host = entry && hostOf(entry.key, entry.value);
+    return host && host.remoteHost !== undefined && host.remoteHost !== this.peer && host.bridgeVia === undefined &&
+      CANONICAL_ID.test(id) && host.rootId === id && host.identity.id === id &&
+      !participantFilePresent(this.store.root, keyFor(PARTICIPANT_PREFIX, id)) &&
+      entry!.updatedBy.id === host.identity.id ? host : undefined;
+  }
+
+  relayOrigin(id: string): string | undefined {
+    const host = this.#relayProjection(id);
+    return host && hostLeaseExpiry(readHostLeases(this.store.root), host) > this.now() ? host.remoteHost : undefined;
+  }
+
+  relayStaleOrigin(id: string): string | undefined {
+    const host = this.#relayProjection(id);
+    return host && hostLeaseExpiry(readHostLeases(this.store.root), host) <= this.now() ? host.remoteHost : undefined;
+  }
+
+  async relayPresence(): Promise<Pick<BridgePresence, "hosts" | "participants">> {
+    const hosts: BridgeHost[] = [];
+    const leases = readHostLeases(this.store.root);
+    for (const entry of this.store.listAll(HOST_PREFIX, { fresh: true })) {
+      const host = hostOf(entry.key, entry.value);
+      if (!host || host.remoteHost === undefined || host.remoteHost === this.peer || host.bridgeVia !== undefined ||
+          !CANONICAL_ID.test(host.id) || host.rootId !== host.id || host.identity.id !== host.id ||
+          participantFilePresent(this.store.root, keyFor(PARTICIPANT_PREFIX, host.id)) ||
+          entry.updatedBy.id !== host.identity.id) continue;
+      const liveness = hostLiveness(leases, host);
+      const observedAt = this.now();
+      if (liveness.expiresAt > observedAt) hosts.push({ record: { ...host, ...liveness }, expiresAt: liveness.expiresAt, observedAt });
+    }
+    const owners = new Map(hosts.map(host => [host.record.id, host.record]));
+    const participants = this.store.listAll(PARTICIPANT_PREFIX, { fresh: true }).flatMap(entry => {
+      const participant = participantOf(entry.key, entry.value);
+      const owner = participant && owners.get(participant.ownerHostId);
+      return participant && owner && participant.kind === "root" && participant.remoteHost === owner.remoteHost &&
+        participant.bridgeVia === undefined && participant.id === owner.id && participant.rootId === owner.rootId &&
+        participant.ownerIdentityId === owner.identity.id && entry.updatedBy.id === owner.identity.id ? [participant] : [];
+    });
+    return { hosts, participants };
   }
 
   #presenceSnapshot(): BridgePresence {
@@ -537,17 +624,24 @@ export class StoreBridgeSide implements BridgeSide {
       // without waiting for traffic. Exclude our renewal fields: our own mirror writes then
       // cause at most one settling pass, never a self-sustaining lease-write feedback loop.
       const mirrored = [...this.store.listAll(HOST_PREFIX, { fresh: true }), ...this.store.listAll(PARTICIPANT_PREFIX, { fresh: true })]
-        .filter(entry => remoteHostOf(entry.value) === this.peer)
+        .filter(entry => mirrorLinkOf(entry.value) === this.peer)
         .map(entry => {
           const host = hostOf(entry.key, entry.value);
           const lease = host && leases.get(host.id);
           return { key: entry.key, value: isObject(entry.value) && entry.key.startsWith(HOST_PREFIX) ? settled(entry.value) : entry.value,
             updatedBy: entry.updatedBy,
-            ...(host ? { lease: lease ? { id: lease.id, rootId: lease.rootId, identityId: lease.identityId, startedAt: lease.startedAt } : null } : {}) };
+            ...(host ? { lease: lease ? { id: lease.id, rootId: lease.rootId, identityId: lease.identityId,
+              startedAt: lease.startedAt, incarnationToken: lease.incarnationToken } : null } : {}) };
         }).sort((a, b) => a.key.localeCompare(b.key));
       const native = this.#presenceSnapshot();
+      // Other links' mirror additions/removals must wake the hub's exporting links.
+      const relays = [...this.store.listAll(HOST_PREFIX, { fresh: true }), ...this.store.listAll(PARTICIPANT_PREFIX, { fresh: true })]
+        .filter(entry => remoteHostOf(entry.value) !== undefined && mirrorLinkOf(entry.value) !== this.peer)
+        .map(entry => ({ key: entry.key, value: entry.key.startsWith(HOST_PREFIX) && isObject(entry.value)
+          ? settled(entry.value) : entry.value, updatedBy: entry.updatedBy }));
       const topology = { ...native, hosts: native.hosts.map(host => settled(host.record as unknown as Record<string, unknown>)) };
-      return { native, digest: contentDigest({ native, mirrored }), topology: contentDigest({ topology, mirrored }) };
+      const content = { ...native, hosts: native.hosts.map(({ observedAt: _observedAt, ...host }) => host) };
+      return { native, digest: contentDigest({ native: content, mirrored, relays }), topology: contentDigest({ topology, mirrored, relays }) };
     };
     // A WAL write can be observed before the writer's COMMIT/wal-index publication. A
     // read then sees old state and may receive no later fs event. Fence the observation
@@ -640,7 +734,7 @@ export class StoreBridgeSide implements BridgeSide {
     // mirrors (security review F1/F2). Only natives are this side's presence.
     for (const entry of hostEntries) {
       const mark = remoteHostOf(entry.value);
-      if (mark === this.peer) continue;
+      if (mirrorLinkOf(entry.value) === this.peer) continue;
       const host = hostOf(entry.key, entry.value);
       if (!host) {
         if (isObject(entry.value) && typeof entry.value.id === "string") reserved.add(entry.value.id);
@@ -652,13 +746,13 @@ export class StoreBridgeSide implements BridgeSide {
       const expiresAt = liveness.expiresAt;
       // Carry effective renewal time as well as expiry, with the same incarnation fence.
       const record = { ...host, ...liveness };
-      if (expiresAt > now) hosts.push({ record, expiresAt });
+      if (expiresAt > now) hosts.push({ record, expiresAt, observedAt: now });
     }
     const live = new Map(hosts.map((host) => [host.record.id, host.record]));
     const participants = new Map<string, { record: FabricParticipantRecord; updatedAt: number }>();
     for (const entry of participantEntries) {
       const mark = remoteHostOf(entry.value);
-      if (mark === this.peer) continue;
+      if (mirrorLinkOf(entry.value) === this.peer) continue;
       const participant = participantOf(entry.key, entry.value);
       if (!participant) {
         if (isObject(entry.value) && typeof entry.value.id === "string") reserved.add(entry.value.id);
@@ -689,15 +783,33 @@ export class StoreBridgeSide implements BridgeSide {
     return [...this.store.listAll(PARTICIPANT_PREFIX, { fresh: true }), ...readParticipantFiles(this.store.root, { maxAgeMs: 0 })];
   }
 
-  async publish(event: BridgePublish, held: string[] = []): Promise<{ sequence: number }> {
+  async publish(event: BridgePublish, held: string[] = [], fromHub = false): Promise<{ sequence: number }> {
     await this.store.prepareLock();
-    const published = await this.#fenceRetry(() => this.store.publish(this.#publication(event, held)));
+    const published = await this.#fenceRetry(() => this.store.publish(this.#publication(event, held, fromHub)));
     return { sequence: published.sequence };
   }
 
-  async publishBatch(events: Array<{ event: BridgePublish; held?: string[] }>): Promise<Array<{ sequence: number }>> {
+  async recordRelay(event: BridgePublish, held: string[] = [event.from.id]): Promise<{ sequence: number }> {
+    const checked = checkBridgePublish(event);
+    const stamp = checked.data.bridge;
+    if (checked.topic !== "fabric.control.command" || stamp.from !== this.peer || hasHubHop(checked)) {
+      throw new BridgeOwnershipError("Invalid relay receipt origin");
+    }
+    // The dedupe receipt stores this envelope too: NEVER pass the command body to store.publish.
+    const key = `${RELAY_RECEIPT_PREFIX}${encodeURIComponent(this.peer)}:${encodeURIComponent(stamp.id)}`;
     await this.store.prepareLock();
-    const published = await this.#fenceRetry(() => this.store.publishBatch(events.map(({ event, held }) => this.#publication(event, held ?? []))));
+    const published = await this.#fenceRetry(() => this.store.publish({
+      id: key, dedupeKey: key, topic: checked.topic, kind: checked.kind,
+      from: { ...checked.from, verified: "bridge" }, to: checked.to, durable: true,
+      ...this.#heldFence([...new Set([checked.from.id, ...held])], checked.from),
+      // createdAt is stamped by the host store at commit; no data/text/message/principal.
+    }));
+    return { sequence: published.sequence };
+  }
+
+  async publishBatch(events: Array<{ event: BridgePublish; held?: string[] }>, fromHub = false): Promise<Array<{ sequence: number }>> {
+    await this.store.prepareLock();
+    const published = await this.#fenceRetry(() => this.store.publishBatch(events.map(({ event, held }) => this.#publication(event, held ?? [], fromHub))));
     return published.map(({ sequence }) => ({ sequence }));
   }
 
@@ -712,20 +824,34 @@ export class StoreBridgeSide implements BridgeSide {
       try {
         return await publish();
       } catch (error) {
-        if (!isMeshStateBusy(error) || Date.now() >= deadline) throw error;
+        if (isIdempotencyKeyReused(error) || !isMeshStateBusy(error) || Date.now() >= deadline) throw error;
         const cap = Math.min(25, 2 ** Math.min(attempt, 5));
         await new Promise((resolve) => setTimeout(resolve, cap * (0.5 + Math.random() / 2)));
       }
     }
   }
 
-  #publication(event: BridgePublish, held: string[]): Parameters<MeshStore["publish"]>[0] {
+  #publication(event: BridgePublish, held: string[], fromHub: boolean): Parameters<MeshStore["publish"]>[0] {
     const checked = checkBridgePublish(event);
-    const data = { ...checked.data, bridge: { from: this.peer, id: checked.data.bridge.id } };
+    const stamp = checked.data.bridge;
+    const data = { ...checked.data, bridge: fromHub && stamp.via === this.peer
+      ? stamp : { from: this.peer, id: stamp.id } };
     return {
       ...checked,
       // The cursor advances only after the destination confirms its append durably.
       durable: true,
+      // Only controls need durable retry receipts. Ordinary events retain the batched
+      // live-log barrier and cursor reconciliation, without per-event receipt writes.
+      // Commands use the logical command id; ACKs use the original bridge stamp.
+      ...(checked.topic === "fabric.control.command" || checked.topic === "fabric.control.ack"
+        ? { dedupeKey: `bridge-publish:${contentDigest(checked.topic === "fabric.control.command" &&
+          typeof checked.data.commandId === "string" && checked.data.commandId.length > 0
+          ? [data.bridge.from, checked.from.id, checked.data.commandId]
+          : [data.bridge.from, data.bridge.id])}` } : {}),
+      // Host-only: bind the destination receipt to canonical semantic input, never a
+      // wire-supplied fingerprint. Hub recordRelay envelopes deliberately omit it.
+      ...(checked.topic === "fabric.control.command"
+        ? { dedupeFingerprint: controlBodyFingerprint(checked.data, checked.principal) } : {}),
       from: { ...checked.from, verified: "bridge" },
       // The data is fixed, so the store encodes it before the lock (smarty-dev#6729); the
       // ownership check is its admission step. Evaluated under the mesh lock that commits the
@@ -850,14 +976,18 @@ export class StoreBridgeSide implements BridgeSide {
     const now = this.now();
     const hostEntry = this.store.get(keyFor(HOST_PREFIX, id), { fresh: true });
     const participantEntry = this.store.get(keyFor(PARTICIPANT_PREFIX, id), { fresh: true });
-    if (!hostEntry || remoteHostOf(hostEntry.value) !== this.peer) return 0;
-    if (participantEntry && remoteHostOf(participantEntry.value) !== this.peer) return 0;
+    if (!hostEntry || mirrorLinkOf(hostEntry.value) !== this.peer) return 0;
+    if (participantEntry && mirrorLinkOf(participantEntry.value) !== this.peer) return 0;
     // A native's own file, readable or not (fail closed, security pass S3 on #142).
     if (participantFilePresent(this.store.root, keyFor(PARTICIPANT_PREFIX, id))) return 0;
     const host = hostOf(hostEntry.key, hostEntry.value);
     if (!host || host.id !== id || host.identity.id !== id || host.rootId !== id || hostEntry.updatedBy.id !== id) return 0;
     if (identity && !sameIdentity(host.identity, identity)) return 0;
-    const until = hostLeaseExpiry(readHostLeases(this.store.root), host);
+    // hostLeaseExpiry consults only leases.get(host.id) (host.id === id above), and a lease file is
+    // valid only under its own id's name: read that one file, not the whole lease directory (a
+    // readdir plus a stat per fleet lease, per held event, on Windows where listings are never cached).
+    const lease = readHostLease(this.store.root, id);
+    const until = hostLeaseExpiry(new Map<string, FabricHostLease>(lease ? [[id, lease]] : []), host);
     if (until <= now) return 0;
     if (participantEntry) {
       const participant = participantOf(participantEntry.key, participantEntry.value);
@@ -867,7 +997,7 @@ export class StoreBridgeSide implements BridgeSide {
   }
 
   mirrored(id: string): boolean {
-    return remoteHostOf(this.store.get(keyFor(HOST_PREFIX, id), { fresh: true })?.value) === this.peer;
+    return mirrorLinkOf(this.store.get(keyFor(HOST_PREFIX, id), { fresh: true })?.value) === this.peer;
   }
 
   // Every id this side holds that is not this link's mirror, read now, under the same handoffs.
@@ -879,7 +1009,7 @@ export class StoreBridgeSide implements BridgeSide {
     const reserved = new Set<string>(handoffs.reserved);
     for (const entries of [hostEntries, participantEntries]) {
       for (const entry of entries) {
-        if (remoteHostOf(entry.value) === this.peer || !isObject(entry.value)) continue;
+        if (mirrorLinkOf(entry.value) === this.peer || !isObject(entry.value)) continue;
         const value = entry.value;
         const ids = ["id", "rootId", "ownerHostId", "ownerIdentityId", "sessionId", "name"].map((field) => value[field]);
         if (isIdentity(value.identity)) ids.push(value.identity.id);
@@ -898,9 +1028,10 @@ export class StoreBridgeSide implements BridgeSide {
    * and each write checks the fence, so a mirror in flight cannot restore a record or lease after
    * the withdrawal (security review round 2, F3).
    */
-  mirror(presence: Pick<BridgePresence, "hosts" | "participants">, observedAt?: number): Promise<void> {
+  mirror(presence: Pick<BridgePresence, "hosts" | "participants">, observedAt?: number, fromHub = false): Promise<void> {
     if (this.#fenced) return Promise.resolve();
-    const run = this.#inflight.then(() => this.#mirror(presence, false, observedAt));
+    // Only the forced-command agent sets fromHub for its trusted hub's mirror RPC.
+    const run = this.#inflight.then(() => this.#mirror(presence, false, observedAt, fromHub));
     this.#inflight = run.catch(() => undefined);
     return run;
   }
@@ -916,7 +1047,7 @@ export class StoreBridgeSide implements BridgeSide {
     const leases = readHostLeases(this.store.root);
     const hosts: BridgeHost[] = [];
     for (const entry of this.store.listAll(HOST_PREFIX, { fresh: true })) {
-      if (remoteHostOf(entry.value) !== this.peer) continue;
+      if (mirrorLinkOf(entry.value) !== this.peer) continue;
       const host = hostOf(entry.key, entry.value);
       if (!host || entry.updatedBy.id !== host.identity.id) continue;
       const expiresAt = hostLeaseExpiry(leases, host);
@@ -925,7 +1056,7 @@ export class StoreBridgeSide implements BridgeSide {
     const live = new Map(hosts.map((host) => [host.record.id, host.record]));
     const participants: FabricParticipantRecord[] = [];
     for (const entry of this.store.listAll(PARTICIPANT_PREFIX, { fresh: true })) {
-      if (remoteHostOf(entry.value) !== this.peer) continue;
+      if (mirrorLinkOf(entry.value) !== this.peer) continue;
       const participant = participantOf(entry.key, entry.value);
       const owner = participant && live.get(participant.ownerHostId);
       if (
@@ -936,7 +1067,7 @@ export class StoreBridgeSide implements BridgeSide {
     return { hosts, participants };
   }
 
-  async #mirror(presence: Pick<BridgePresence, "hosts" | "participants">, final: boolean, observedAt?: number): Promise<void> {
+  async #mirror(presence: Pick<BridgePresence, "hosts" | "participants">, final: boolean, observedAt?: number, fromHub = false): Promise<void> {
     await this.store.prepareLock();
     const halted = (): boolean => this.#fenced && !final;
     const now = this.now();
@@ -965,38 +1096,45 @@ export class StoreBridgeSide implements BridgeSide {
         const own = new Set(scan.presence.reserved);
         const wanted = new Map<string, { value: Record<string, unknown>; identity: MeshIdentity }>();
         const hosts = new Map<string, FabricHostRecord>();
-        for (const { record, expiresAt } of presence.hosts) {
-          // Only a peer's natives are mirrored; a record another link mirrored is never relayed.
-          if (remoteHostOf(record) !== undefined) continue;
+        for (const { record, expiresAt, observedAt: sourceObservedAt } of presence.hosts) {
+          const relayed = remoteHostOf(record) !== undefined;
+          if (relayed && (!fromHub || record.bridgeVia !== this.peer || record.remoteHost === this.peer)) continue;
           if (own.has(record.id) || own.has(record.identity.id) || own.has(record.rootId)) continue;
-          // A mirror never outlives its origin (smarty-dev#6477): it keeps the origin's absolute
-          // expiry, capped at one BRIDGE_LEASE_MS from this sync so a dead bridge still lapses it.
-          // A mirror never renews: its lease carries the origin's last renewal, not this sync.
-          // Liveness is judged when the snapshot was requested (liveAt); the origin's remaining
-          // life is then counted from this commit, so a slow pass does not lapse a live mirror.
-          // That shift is at most this pass's latency (zero when no observedAt is given) and never
-          // more than one BRIDGE_LEASE_MS, so a stalled pass cannot keep a dead origin's mirror
-          // alive longer than one lease past the origin (independent review, P2). A mirror that
-          // the capped shift leaves already lapsed is not written: it is dropped like any other.
-          if (!Number.isFinite(expiresAt) || expiresAt <= liveAt) continue;
-          const until = Math.min(expiresAt + Math.min(now - liveAt, BRIDGE_LEASE_MS), now + BRIDGE_LEASE_MS);
-          if (until <= now) continue;
-          const renewedAt = Math.min(record.updatedAt, now);
+          // Source expiry and age are meaningful on the SOURCE clock only (#10068).
+          // Keep legacy projection deadlines for older readers, but give current readers the
+          // successful per-host observation. A delayed commit never makes that snapshot fresh.
+          const sampled = typeof sourceObservedAt === "number" && Number.isFinite(sourceObservedAt);
+          if (!Number.isFinite(expiresAt) || expiresAt <= (sampled ? sourceObservedAt : liveAt)) continue;
+          // A sampled origin's remaining life is a SOURCE-clock duration, anchored at liveAt (this
+          // clock, before the source read it), so liveAt + remaining never overstates the origin.
+          // Never extend sampled authority for pass latency: retain an expired projection for
+          // routing attribution, but readers judge its translated deadline bridge-stale. Older
+          // unsampled peers retain the bounded latency allowance (smarty-dev#6477).
+          const origin = sampled ? liveAt + Math.min(BRIDGE_LEASE_MS, expiresAt - sourceObservedAt) : expiresAt;
+          const until = sampled ? origin
+            : Math.min(origin + Math.min(now - liveAt, BRIDGE_LEASE_MS), now + BRIDGE_LEASE_MS);
+          if (!sampled && until <= now) continue;
+          const renewedAt = sampled ? record.updatedAt : Math.min(record.updatedAt, now);
+          const mirror: FabricMirrorLease | undefined = sampled ? { remoteHost: relayed ? record.remoteHost! : this.peer, observedAt: liveAt,
+            sourceObservedAt, sourceUpdatedAt: record.updatedAt, sourceExpiresAt: expiresAt } : undefined;
           hosts.set(record.id, record);
           wanted.set(keyFor(HOST_PREFIX, record.id), {
-            value: { ...record, updatedAt: now, expiresAt: until, remoteHost: this.peer },
+            value: { ...record, updatedAt: now, expiresAt: until, remoteHost: relayed ? record.remoteHost : this.peer,
+              ...(sampled ? { mirrorLease: 1 } : {}) },
             identity: record.identity,
           });
           // The lease carries the origin's incarnation, so a later removal can tell it from a replacement's.
           leases.push({ id: record.id, rootId: record.rootId, identityId: record.identity.id, ...incarnationOf(record),
-            updatedAt: renewedAt, expiresAt: until });
+            updatedAt: renewedAt, expiresAt: until, mirrorLease: 1, ...(mirror ? { mirror } : {}) });
         }
         for (const participant of presence.participants) {
           const owner = hosts.get(participant.ownerHostId);
-          if (!owner || participant.kind !== "root" || own.has(participant.id) || remoteHostOf(participant) !== undefined) continue;
+          if (!owner || participant.kind !== "root" || own.has(participant.id)) continue;
+          if (remoteHostOf(participant) !== undefined && (!fromHub || participant.bridgeVia !== this.peer ||
+              participant.remoteHost !== owner.remoteHost)) continue;
           if (owner.identity.id !== participant.ownerIdentityId || owner.rootId !== participant.rootId) continue;
           wanted.set(keyFor(PARTICIPANT_PREFIX, participant.id), {
-            value: { ...participant, remoteHost: this.peer },
+            value: { ...participant, remoteHost: participant.remoteHost ?? this.peer },
             identity: owner.identity,
           });
         }
@@ -1006,7 +1144,7 @@ export class StoreBridgeSide implements BridgeSide {
           const existing = mirrored.get(key);
           // Never replace a native record, or another bridge's mirror (anti-spoofing); a native may be
           // only in its own file (smarty-dev#2004).
-          if (existing && remoteHostOf(existing.value) !== this.peer) continue;
+          if (existing && mirrorLinkOf(existing.value) !== this.peer) continue;
           if (participantFiles.present(key)) continue;
           if (
             existing && isObject(existing.value) && settled(existing.value) === settled(value) &&
@@ -1020,7 +1158,7 @@ export class StoreBridgeSide implements BridgeSide {
         }
         for (const [key, { value, version }] of mirrored) {
           if (halted()) return undefined;
-          if (wanted.has(key) || remoteHostOf(value) !== this.peer) continue;
+          if (wanted.has(key) || mirrorLinkOf(value) !== this.peer) continue;
           if (key.startsWith(HOST_PREFIX) && isObject(value) && typeof value.id === "string") {
             const gone = hostOf(key, value);
             removed.push(gone
@@ -1074,10 +1212,28 @@ export class StoreBridgeSide implements BridgeSide {
             else if (early) throw new MirrorPlanStale();
             else result = compute(view, sameFiles ? files : participantFileSnapshot(this.store.root));
             if (!result) return plan.stage([], []);
-            ({ leases, removed } = result);
+            // Cap sampled authority at its ORIGINAL translated source deadline after the lock wait.
+            // A sample that expired during the wait stays expired; neither its observation nor its
+            // authority is renewed by committing it (#10068; independent review P2).
+            const deadlines = new Map<string, number>();
+            leases = result.leases.map((lease) => {
+              const sample = lease.mirror;
+              if (!sample) return lease;
+              const origin = sample.observedAt + Math.min(BRIDGE_LEASE_MS, sample.sourceExpiresAt - sample.sourceObservedAt);
+              const until = Math.min(lease.expiresAt, origin);
+              deadlines.set(keyFor(HOST_PREFIX, lease.id), until);
+              return { ...lease, expiresAt: until };
+            });
+            removed = result.removed;
+            // The changed host row, when this pass writes one, carries the lease's own deadline.
+            const ops = deadlines.size === 0 ? result.ops : result.ops.map((op) => {
+              const until = op.kind === "put" ? deadlines.get(op.key) : undefined;
+              return op.kind === "put" && until !== undefined && isObject(op.value)
+                ? { ...op, value: { ...op.value, expiresAt: until } } : op;
+            });
             // A changing commit records its lease effects in the same commit; a lease-only renewal
             // commits nothing, records nothing and loses nothing in a crash (the next pass redoes it).
-            return plan.stage(result.ops, effects());
+            return plan.stage(ops, effects());
           },
           // After the commit, on the committed owner, never a fresh per-record state read.
           afterCommit: (view) => { plan.run(view, halted); },
@@ -1094,23 +1250,47 @@ export class StoreBridgeSide implements BridgeSide {
 
   #applyLease(lease: BridgeLease, view: MeshBatchView, replay: boolean): void {
     const entry = view.get(keyFor(HOST_PREFIX, lease.id));
-    const held = entry && remoteHostOf(entry.value) === this.peer ? hostOf(entry.key, entry.value) : undefined;
+    const held = entry && mirrorLinkOf(entry.value) === this.peer ? hostOf(entry.key, entry.value) : undefined;
     if (!held || held.identity.id !== lease.identityId || held.rootId !== lease.rootId) return;
     // Only the incarnation the lease was planned for: an overlapping writer may have installed a
-    // replacement mirror (same id, root and identity, new startedAt) since this batch committed,
+    // replacement mirror (same id, root and identity, new start/token) since this batch committed,
     // and a stale effect must not overwrite its lease (pi-fabric#640 review round 2). A row of an
     // earlier release carries no incarnation and proves none: it is discarded, and a later pass
     // renews the lease of whichever mirror is held then (pi-fabric#640 review round 3).
-    if (typeof lease.startedAt !== "number" || lease.startedAt !== held.startedAt) return;
+    if (typeof lease.startedAt !== "number" || lease.startedAt !== held.startedAt ||
+      lease.incarnationToken !== held.incarnationToken) return;
+    // Every effect, including a pre-fix outbox replay, keeps the original sampled deadline.
+    const sample = lease.mirror;
+    const sourceDeadline = sample ? sample.observedAt +
+      Math.min(BRIDGE_LEASE_MS, sample.sourceExpiresAt - sample.sourceObservedAt) : undefined;
+    if (sourceDeadline !== undefined) lease = { ...lease, expiresAt: Math.min(lease.expiresAt, sourceDeadline) };
     const onDisk = readHostLease(this.store.root, lease.id);
+    // Dedup must not preserve an inflated deadline for this EXACT owner and sample. A newer
+    // observation (even of the same source renewal) still goes through the guards below.
+    if (sample && sourceDeadline !== undefined && onDisk && onDisk.startedAt === lease.startedAt &&
+      onDisk.incarnationToken === lease.incarnationToken && onDisk.identityId === lease.identityId &&
+      onDisk.rootId === lease.rootId && onDisk.mirror?.remoteHost === sample.remoteHost &&
+      onDisk.mirror.observedAt === sample.observedAt && onDisk.mirror.sourceObservedAt === sample.sourceObservedAt &&
+      onDisk.mirror.sourceUpdatedAt === sample.sourceUpdatedAt && onDisk.mirror.sourceExpiresAt === sample.sourceExpiresAt &&
+      onDisk.expiresAt > sourceDeadline) {
+      writeHostLease(this.store.root, lease);
+      return;
+    }
     // A replayed row never shortens a lease that a later pass already renewed.
-    if (replay && (onDisk?.expiresAt ?? -Infinity) >= lease.expiresAt) return;
+    const sameIncarnation = onDisk && onDisk.startedAt === lease.startedAt && onDisk.identityId === lease.identityId &&
+      onDisk.rootId === lease.rootId && onDisk.incarnationToken === lease.incarnationToken;
+    if (replay && sameIncarnation && (onDisk.mirror?.observedAt ?? onDisk.expiresAt) >=
+      (lease.mirror?.observedAt ?? lease.expiresAt)) return;
     // Nor does a live effect of the same incarnation: concurrent mirror batches for one peer, host
-    // and incarnation can run their effects out of order, and the older one still matches startedAt
+    // and incarnation can run their effects out of order, and the older one still matches start/token
     // (smarty-dev#6939). A lease of another incarnation is replaced whatever its expiry.
-    if (onDisk && onDisk.startedAt === lease.startedAt && onDisk.identityId === lease.identityId &&
-      onDisk.rootId === lease.rootId && (onDisk.expiresAt > lease.expiresAt ||
-        (onDisk.expiresAt === lease.expiresAt && onDisk.updatedAt === lease.updatedAt))) return;
+    if (onDisk && sameIncarnation && (lease.mirror
+        ? (onDisk.mirror?.observedAt ?? -Infinity) >= lease.mirror.observedAt ||
+          (onDisk.mirror?.sourceObservedAt === lease.mirror.sourceObservedAt &&
+            onDisk.mirror.sourceUpdatedAt === lease.mirror.sourceUpdatedAt &&
+            onDisk.mirror.sourceExpiresAt === lease.mirror.sourceExpiresAt)
+        : onDisk.expiresAt > lease.expiresAt ||
+          (onDisk.expiresAt === lease.expiresAt && onDisk.updatedAt === lease.updatedAt))) return;
     writeHostLease(this.store.root, lease);
   }
 
@@ -1124,7 +1304,14 @@ export class StoreBridgeSide implements BridgeSide {
       const page = this.store.read({ after: cursor, limit: this.store.maxReadEvents });
       for (const event of page) {
         const stamp = bridgeStampOf(event);
-        if (stamp?.from === this.peer) ids.push(stamp.id);
+        if ((stamp?.via ?? stamp?.from) === this.peer) ids.push(stamp!.id);
+        else if (isRelayReceipt(event)) {
+          const prefix = `${RELAY_RECEIPT_PREFIX}${encodeURIComponent(this.peer)}:`;
+          const key = event.id.startsWith(prefix) ? event.id : event.dedupeKey;
+          if (key?.startsWith(prefix)) {
+            try { ids.push(decodeURIComponent(key.slice(prefix.length))); } catch { /* malformed receipt grants no recovery */ }
+          }
+        }
       }
       if (page.length < this.store.maxReadEvents) return { ids, through: page.at(-1)?.sequence ?? cursor, done: true };
       cursor = page.at(-1)!.sequence;
@@ -1220,6 +1407,7 @@ export const serveBridgeAgent = (side: StoreBridgeSide, input: Readable, output:
     lines(
       input,
       (line) => {
+        const receivedAt = Date.now(); // Receiver clock BEFORE the serial dispatch/lock wait.
         queue = queue.then(async () => {
           if (closed) return; // stdin may have ended while this request was queued
           let request: RpcRequest;
@@ -1243,10 +1431,16 @@ export const serveBridgeAgent = (side: StoreBridgeSide, input: Readable, output:
               );
               if (closed) { finish(); return; }
             }
-            const result = await dispatch(side, request);
+            const result = await dispatch(side, request, receivedAt);
             if (closed) { finish(); return; }
             reply({ id: request.id, ok: true, result });
           } catch (error) {
+            if (isIdempotencyKeyReused(error)) {
+              // Exact code only; never forward the store's key, causes or payload.
+              reply({ id: request.id, ok: false, code: FABRIC_IDEMPOTENCY_KEY_REUSED,
+                error: "Fabric idempotency key reused with different input" });
+              return;
+            }
             reply({
               id: request.id, ok: false, error: error instanceof Error ? error.message : String(error),
               ...(isMeshIncarnationPending(error) ? { code: MESH_INCARNATION_PENDING_CODE }
@@ -1266,23 +1460,25 @@ const numberArg = (args: unknown, name: string): number => {
   return value;
 };
 
-const presenceArg = (args: unknown): Pick<BridgePresence, "hosts" | "participants"> => {
+const presenceArg = (args: unknown, hub: string): Pick<BridgePresence, "hosts" | "participants"> => {
   if (!isObject(args) || !Array.isArray(args.hosts) || !Array.isArray(args.participants)) {
     throw new Error("Bridge presence is invalid");
   }
   const hosts = args.hosts.flatMap((host): BridgeHost[] => {
     if (!isObject(host) || typeof host.expiresAt !== "number" || !isObject(host.record)) return [];
     const record = hostOf(keyFor(HOST_PREFIX, String(host.record.id)), host.record);
-    return record && remoteHostOf(record) === undefined ? [{ record, expiresAt: host.expiresAt }] : [];
+    return record && (remoteHostOf(record) === undefined || (record.bridgeVia === hub && record.remoteHost !== hub))
+      ? [{ record, expiresAt: host.expiresAt,
+        ...(typeof host.observedAt === "number" && Number.isFinite(host.observedAt) ? { observedAt: host.observedAt } : {}) }] : [];
   });
   const participants = args.participants.flatMap((value): FabricParticipantRecord[] => {
     const record = isObject(value) ? participantOf(keyFor(PARTICIPANT_PREFIX, String(value.id)), value) : undefined;
-    return record && remoteHostOf(record) === undefined ? [record] : [];
+    return record && (remoteHostOf(record) === undefined || (record.bridgeVia === hub && record.remoteHost !== hub)) ? [record] : [];
   });
   return { hosts, participants };
 };
 
-const dispatch = async (side: StoreBridgeSide, request: RpcRequest): Promise<unknown> => {
+const dispatch = async (side: StoreBridgeSide, request: RpcRequest, receivedAt: number): Promise<unknown> => {
   switch (request.op) {
     // Unversioned v1 clients must still accept a new agent during host-by-host rollout.
     // New clients request v2 explicitly; only a reported v1 peer can lack notifications.
@@ -1297,19 +1493,31 @@ const dispatch = async (side: StoreBridgeSide, request: RpcRequest): Promise<unk
       isObject(request.args) && request.args.offset !== undefined ? numberArg(request.args, "offset") : undefined);
     case "read": return side.read(numberArg(request.args, "after"));
     case "presence": return { ...boundPresence(await side.presence()).presence, reserved: [] };
-    case "publish": return side.publish(checkBridgePublish(request.args));
+    case "publish": return side.publish(checkBridgePublish(request.args), [], true);
     case "publishBatch": {
       if (!Array.isArray(request.args) || !request.args.length || request.args.length > 256) throw new Error("Invalid bridge publish batch");
       // Remote wire never accepts held IDs: those are hub-local ownership fences.
-      return side.publishBatch(request.args.map(event => ({ event: checkBridgePublish(event) })));
+      return side.publishBatch(request.args.map(event => ({ event: checkBridgePublish(event) })), true);
     }
-    case "mirror": return side.mirror(presenceArg(request.args));
+    case "mirror": return side.mirror(presenceArg(request.args, side.peer), receivedAt, true);
     case "bridgedIds": return side.bridgedIds(numberArg(request.args, "after"));
     default: throw new Error(`Unknown bridge operation: ${String(request.op)}`);
   }
 };
 
 class BridgeLegacyNotificationsError extends Error {}
+
+/** One mirror stays in flight after its deadline; retries must not queue more RPCs behind it. */
+export class BridgeMirrorDeferredError extends Error {
+  readonly code: string;
+  constructor(readonly timedOut: boolean, timeoutMs: number) {
+    super(timedOut ? `Fabric bridge-stale: Bridge agent did not answer mirror within ${timeoutMs} ms; retrying with backoff` :
+      "Bridge mirror is still in flight; retrying with backoff");
+    this.name = "BridgeMirrorDeferredError";
+    this.code = timedOut ? "FABRIC_BRIDGE_STALE" : "FABRIC_BRIDGE_MIRROR_PENDING";
+  }
+}
+const isBridgeRetryable = (error: unknown): boolean => error instanceof BridgeMirrorDeferredError || isMeshRetryableBusy(error);
 
 /** The hub's view of the remote side, over the transport's stdio. */
 export class RemoteBridgeSide implements BridgeSide {
@@ -1320,13 +1528,15 @@ export class RemoteBridgeSide implements BridgeSide {
   readonly #subscribers = new Set<{ changed: (kind: BridgeChange) => void; failed: (error: Error) => void }>();
   publishBatch?: NonNullable<BridgeSide["publishBatch"]>;
   #closed: Error | undefined;
+  #mirrorPending: { id: number; error: BridgeMirrorDeferredError } | undefined;
   readonly #pending = new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void }>();
   readonly #onClosed: (error: Error) => void;
   readonly closed: Promise<Error>;
 
   /**
-   * Every call has a deadline: a remote that stops answering closes the transport, so an
-   * untrusted peer never decides whether the bridge can stop (security review F3).
+   * Every call has a deadline. A slow mirror degrades this host without closing the transport;
+   * exactly one mirror remains in flight until its late answer or close(). Other RPC deadlines
+   * remain fatal. stop() still bounds its waits and closes the transport (security review F3).
    */
   constructor(readonly input: Readable, readonly output: Writable, readonly callTimeoutMs = DEFAULT_CALL_TIMEOUT_MS) {
     let onClosed!: (error: Error) => void;
@@ -1356,8 +1566,23 @@ export class RemoteBridgeSide implements BridgeSide {
         const pending = typeof response.id === "number" ? this.#pending.get(response.id) : undefined;
         if (!pending) return;
         this.#pending.delete(response.id as number);
+        const mirrorPending = this.#mirrorPending;
+        if (mirrorPending && mirrorPending.id === response.id) {
+          const late = mirrorPending.error.timedOut;
+          this.#mirrorPending = undefined;
+          if (late && response.ok !== true && response.code !== MESH_LOCK_TIMEOUT_CODE &&
+            response.code !== MESH_INCARNATION_PENDING_CODE && response.code !== MESH_SNAPSHOT_RETRIES_EXHAUSTED_CODE) {
+            this.close(new Error(`Bridge agent: ${String(response.error)}`));
+            return;
+          }
+          if (late) for (const subscriber of this.#subscribers) subscriber.changed("presence");
+        }
         if (response.ok === true) pending.resolve(response.result);
         else {
+          if (response.code === FABRIC_IDEMPOTENCY_KEY_REUSED) {
+            pending.reject(new FabricIdempotencyKeyReusedError());
+            return;
+          }
           const error = new Error(`Bridge agent: ${String(response.error)}`);
           // Only allow-listed store refusal codes, never arbitrary peer error properties.
           if (response.code === MESH_LOCK_TIMEOUT_CODE || response.code === MESH_INCARNATION_PENDING_CODE ||
@@ -1375,6 +1600,7 @@ export class RemoteBridgeSide implements BridgeSide {
     this.#closed = error;
     for (const pending of this.#pending.values()) pending.reject(error);
     this.#pending.clear();
+    this.#mirrorPending = undefined;
     this.#onClosed(error);
     for (const subscriber of this.#subscribers) subscriber.failed(error);
     this.#subscribers.clear();
@@ -1384,12 +1610,20 @@ export class RemoteBridgeSide implements BridgeSide {
 
   #call<T>(op: RpcOp, args?: unknown): Promise<T> {
     if (this.#closed) return Promise.reject(this.#closed);
+    // The remote dispatches serially. Do not let queued reads/publications time out behind a
+    // slow mirror, or accumulate repeated mirrors whose late writes would refresh old data.
+    if (this.#mirrorPending) return Promise.reject(this.#mirrorPending.error);
     const id = this.#next++;
     return new Promise<T>((resolve, reject) => {
-      const timer = setTimeout(
-        () => this.close(new Error(`Bridge agent did not answer ${op} within ${this.callTimeoutMs} ms`)),
-        this.callTimeoutMs,
-      );
+      if (op === "mirror") this.#mirrorPending = { id, error: new BridgeMirrorDeferredError(false, this.callTimeoutMs) };
+      const timer = setTimeout(() => {
+        if (op !== "mirror") { this.close(new Error(`Bridge agent did not answer ${op} within ${this.callTimeoutMs} ms`)); return; }
+        const error = new BridgeMirrorDeferredError(true, this.callTimeoutMs);
+        this.#mirrorPending = { id, error };
+        // Keep this one response slot: its late ACK releases the gate, but never renews a
+        // hub observation. The loop retries a NEW presence snapshot after backoff.
+        reject(error);
+      }, this.callTimeoutMs);
       const settle = <V>(done: (value: V) => void) => (value: V): void => {
         clearTimeout(timer);
         done(value);
@@ -1459,6 +1693,15 @@ export class RemoteBridgeSide implements BridgeSide {
 // ---------------------------------------------------------------------------------------------
 // The bridge loop.
 
+interface RelayGraceCursor {
+  /** The retained event's source sequence; this is local cursor state, not peer authority. */
+  sequence: number;
+  /** Local wall-clock start of the bounded grace window. */
+  startedAt: number;
+  /** Optional event binding for cursor files written by newer bridges. */
+  id?: string;
+}
+
 interface DirectionCursor {
   /** The last source sequence handled. */
   after: number;
@@ -1466,6 +1709,8 @@ interface DirectionCursor {
   offset?: number;
   /** The destination sequence of the last event bridged in (restart dedupe starts after it). */
   mark: number;
+  /** Optional v1 cursor extension: one retained relay boundary's local grace start. */
+  relayGrace?: RelayGraceCursor;
 }
 
 interface CursorFile {
@@ -1484,12 +1729,16 @@ export interface MeshBridgeOptions {
   local: BridgeSide;
   remote: BridgeSide;
   cursorPath: string;
+  /** Delivery-only hub-link IPC. Missing/unavailable fails closed for cross-spoke commands. */
+  relay?: (destinationRemote: string, event: BridgePublish) => Promise<void>;
   /** Transitional legacy-remote polling only; new/new run() never polls. */
   pollMs?: number;
   /** Manual step() cadence only; run() follows origin updates and source expiry. */
   presenceMs?: number;
   /** Bound on each wait in stop(); the remote cannot hold a stop longer. */
   stopMs?: number;
+  /** Initial missed-notification safety delay (default 1 s), doubled up to 30 s. Never expires/drops the event. */
+  membershipRetryMs?: number;
   /** First wait after a WAL-cap refusal (then doubling to 30 s). Default 1 s; tests lower it. */
   walCapRetryMinMs?: number;
   log?: (message: string) => void;
@@ -1554,12 +1803,12 @@ export const admitPresence = (
   // v1 bridges Main roots only, whose host id, identity id and root id are one id (security
   // review round 4, F2): a host that splits them is refused, so one id names one owner.
   const hosts = claimed.hosts.filter(({ record }) =>
-    record.identity.id === record.id && record.rootId === record.id &&
+    record.identity.id === record.id && record.rootId === record.id && record.bridgeVia === undefined &&
     CANONICAL_ID.test(record.id) && !reserved.has(record.id));
   const admitted = new Map(hosts.map(({ record }) => [record.id, record]));
   const participants = claimed.participants.filter((participant) => {
     const owner = admitted.get(participant.ownerHostId);
-    return participant.kind === "root" && owner !== undefined && participant.id === owner.id &&
+    return participant.kind === "root" && participant.bridgeVia === undefined && owner !== undefined && participant.id === owner.id &&
       owner.identity.id === participant.ownerIdentityId && owner.rootId === participant.rootId &&
       ![participant.id, participant.rootId, participant.ownerIdentityId, participant.sessionId]
         .some((id) => typeof id === "string" && reserved.has(id));
@@ -1619,11 +1868,18 @@ const sameIdentity = (a: MeshIdentity, b: MeshIdentity): boolean =>
 
 /** What one direction's forwarding is checked against: the link's authority for that page. */
 interface BridgeRules {
+  /** Direct native addresses: hub-local natives inbound, the peer's records outbound. Only these may hold a full ACK at the hub. */
   recipients: Set<string>;
+  /** Inbound only: other links' canonical addresses (remoteAddresses(relays)); routable through the hub, never hub-local. */
+  relayRecipients?: Set<string>;
   senders?: Set<string>;
   /** Inbound only: each admitted sender's canonical identity (senderIdentities). */
   identities?: Map<string, MeshIdentity>;
   reserved?: Set<string>;
+  /** Outbound only: ids proven native to the hub or reserved by another link, not this peer. */
+  reservedRecipients?: Set<string>;
+  /** Direct other-link origins, never supplied by an untrusted remote. */
+  relayOrigins?: Map<string, string>;
 }
 
 const senders = (presence: Pick<BridgePresence, "hosts" | "participants">): Set<string> => {
@@ -1639,6 +1895,8 @@ export class MeshBridge {
   #presenceAt = Number.NEGATIVE_INFINITY;
   #presenceSync: Promise<void> | undefined;
   #stopped = false;
+  #ready = false;
+  readonly #relayDeliveries = new Set<Promise<void>>();
   #wake: (() => void) | undefined;
   #notificationMode = false;
   #changesPending = false;
@@ -1656,9 +1914,20 @@ export class MeshBridge {
   #directions: Promise<void> = Promise.resolve();
   readonly #directionPending: Record<Direction, boolean> = { toRemote: false, toLocal: false };
   readonly #directionBackoff: Record<Direction, boolean> = { toRemote: false, toLocal: false };
-  readonly #directionWake: Partial<Record<Direction, () => void>> = {};
+  readonly #directionMirrorBackoff: Record<Direction, boolean> = { toRemote: false, toLocal: false };
+  readonly #directionWake: Partial<Record<Direction, (reason?: DirectionWakeReason) => void>> = {};
+  readonly #directionWakeReason: Partial<Record<Direction, DirectionWakeReason>> = {};
+  /** The retained-boundary retry kind currently being consumed by a direction pass. */
+  readonly #membershipAttempt: Partial<Record<Direction, "safety" | "grace">> = {};
+  /** Next missed-notification delay; a real notification clears it, sync completion does not. */
+  readonly #membershipSafetyDelay: Partial<Record<Direction, number>> = {};
+  /** Last sampled, admitted source deadlines: evidence to WAIT only, never authority to publish. */
+  #sampledDeadlines = new Map<string, number>();
+  /** At most one pending boundary per direction. Bodies stay in the durable source, before its cursor. */
+  readonly #membershipRetryAt: Partial<Record<Direction, number>> = {};
+  readonly #membershipSequence: Partial<Record<Direction, number>> = {};
   /** Events not addressed across since the last count line (smarty-dev#9352). */
-  #unaddressed = { count: 0, toRemote: 0, toLocal: 0, factory: 0, topics: new Set<string>(), more: false };
+  #unaddressed = { count: 0, toRemote: 0, toLocal: 0, factory: 0, safety: 0, topics: new Set<string>(), more: false };
   #unaddressedLoggedAt = Number.NEGATIVE_INFINITY;
   /** The factory exception's token buckets (pi-fabric#876 review, P1-2; security pass, (c)). */
   readonly #factoryRate: Required<FactoryRate>;
@@ -1679,6 +1948,9 @@ export class MeshBridge {
       if (!validBridgeName(name)) throw new Error(`Invalid bridge name: ${name}`);
     }
     if (options.localName === options.remoteName) throw new Error("Bridge side names must differ");
+    if (options.membershipRetryMs !== undefined && !(Number.isSafeInteger(options.membershipRetryMs) && options.membershipRetryMs > 0)) {
+      throw new Error("membershipRetryMs needs a positive integer");
+    }
     const given = options.factoryRate ?? DEFAULT_FACTORY_RATE;
     const rate: Required<FactoryRate> = {
       perMinute: given.perMinute, burst: given.burst,
@@ -1755,17 +2027,24 @@ export class MeshBridge {
       }
       from = identity;
     }
+    // Sanitize legacy hub-log relays too. A current destination bridge must not replay
+    // old private ACK text/results that reached the hub before the first-hop restriction.
+    const relayedAck = event.topic === "fabric.control.ack" &&
+      (direction === "toLocal" ? !rules.recipients.has(event.to!) :
+        event.verification === "bridge" && bridgeStampOf(event)?.from !== this.options.localName);
     return {
       topic: event.topic, kind: event.kind, from,
       // ponytail: keep the required-recipient wire schema; only an admitted inbound record needs a role address.
       to: direction === "toLocal" && event.to === undefined && isHubFactoryEvent(event) ? HUB_FACTORY_RECIPIENT : event.to!,
       ...(event.verification === "mesh" || event.verification === "bridge" ? { principal: event.principal } : {}),
-      ...(event.text !== undefined ? { text: event.text } : {}),
+      ...(event.text !== undefined && !relayedAck ? { text: event.text } : {}),
       // An ACK that crosses only through the relay (its address is no hub recipient) carries just the outcome
       // fields, never the command's result payload (pi-fabric#928 SEC P1).
-      data: { ...(direction === "toLocal" && event.topic === "fabric.control.ack" && !rules.recipients.has(event.to!)
+      data: { ...(relayedAck
         ? Object.fromEntries(Object.entries(data).filter(([field]) => RELAYED_ACK_FIELDS.has(field))) : data),
-      bridge: { from: direction === "toRemote" ? this.options.localName : this.options.remoteName, id: event.id } },
+      bridge: direction === "toRemote" && bridgeStampOf(event)
+        ? { ...bridgeStampOf(event)!, via: this.options.localName }
+        : { from: direction === "toRemote" ? this.options.localName : this.options.remoteName, id: event.id } },
     } as BridgePublish;
   }
 
@@ -1823,17 +2102,29 @@ export class MeshBridge {
    */
   #reportUnaddressed(): void {
     const unaddressed = this.#unaddressed;
-    if (unaddressed.count === 0) return;
+    if (unaddressed.count === 0 && unaddressed.safety === 0) return;
     const now = this.#now();
     if (now - this.#unaddressedLoggedAt < UNADDRESSED_LOG_MS) return;
     this.#unaddressedLoggedAt = now;
-    this.#unaddressed = { count: 0, toRemote: 0, toLocal: 0, factory: 0, topics: new Set<string>(), more: false };
+    this.#unaddressed = { count: 0, toRemote: 0, toLocal: 0, factory: 0, safety: 0, topics: new Set<string>(), more: false };
     this.#log(`bridge: ${unaddressed.count} events not addressed across (topics: ${[...unaddressed.topics].join(", ")}${
-      unaddressed.more ? ", ..." : ""}; toRemote ${unaddressed.toRemote}, toLocal ${unaddressed.toLocal} (to factory ${unaddressed.factory}))`);
+      unaddressed.more ? ", ..." : ""}; toRemote ${unaddressed.toRemote}, toLocal ${unaddressed.toLocal} (to factory ${unaddressed.factory})${
+        unaddressed.safety > 0 ? `; safety wakes advancing retained boundaries ${unaddressed.safety}` : ""})`);
+  }
+
+  async #reconcileSeen(): Promise<void> {
+    const cursor = this.#cursor!; // start() initialized it, or run() already observed readiness.
+    const [toRemote, toLocal] = await Promise.all([
+      allBridgedIds(this.options.remote, cursor.toRemote.mark),
+      allBridgedIds(this.options.local, cursor.toLocal.mark),
+    ]);
+    this.#seen = { toRemote, toLocal };
   }
 
   /** Restore event recovery and reconcile live participants on every (re)connect. */
   async start(): Promise<void> {
+    if (this.#stopped) throw relayUnavailable();
+    this.#ready = false;
     // Cursors recover events, not presence. A reconnect may follow lease expiry or pruning,
     // even when this instance's previous presence pass would not yet be due (#5036).
     this.#presenceAt = Number.NEGATIVE_INFINITY;
@@ -1860,15 +2151,52 @@ export class MeshBridge {
       };
       this.#save();
     }
-    const [toRemote, toLocal] = await Promise.all([
-      allBridgedIds(remote, this.#cursor.toRemote.mark),
-      allBridgedIds(local, this.#cursor.toLocal.mark),
-    ]);
-    this.#seen = { toRemote, toLocal };
+    await this.#reconcileSeen();
     // Read CURRENT natives (including participants/ files), never a saved projection set.
     // Reconcile against the destination under its lock: unchanged digests skip state writes,
     // but lost records must be recreated and missing sources must not have their lease renewed.
     await this.syncPresence();
+    if (!this.#stopped) this.#ready = true;
+  }
+
+  /**
+   * Destination-link admission for authenticated delivery-only IPC. The sourceRemote is
+   * supplied by the UDS registry, never inferred from the event. No hub publication here.
+   */
+  deliverRelay(sourceRemote: string, input: BridgePublish): Promise<void> {
+    const work = this.#deliverRelay(sourceRemote, input).catch((error: unknown) => {
+      if (isIdempotencyKeyReused(error)) throw new FabricIdempotencyKeyReusedError();
+      throw relayUnavailable();
+    });
+    this.#relayDeliveries.add(work);
+    void work.then(() => this.#relayDeliveries.delete(work), () => this.#relayDeliveries.delete(work));
+    return work;
+  }
+
+  async #deliverRelay(sourceRemote: string, input: BridgePublish): Promise<void> {
+    const { local, remote, localName, remoteName } = this.options;
+    const ready = (): boolean => this.#ready && !this.#stopped && !this.#notificationError;
+    if (!ready() || !validBridgeName(sourceRemote) || sourceRemote === remoteName || sourceRemote === localName) throw relayUnavailable();
+    const pub = checkBridgePublish(input);
+    const stamp = pub.data.bridge;
+    if (pub.topic !== "fabric.control.command" || stamp.from !== sourceRemote || hasHubHop(pub) || !stamp.id ||
+      pub.data.destinationRemoteHost !== remoteName || typeof pub.data.commandId !== "string" || !pub.data.commandId) throw relayUnavailable();
+    // One normal refresh when due, then fresh hub authority; no remote-supplied origin maps.
+    const { remote: owned } = await this.#authority();
+    const relays = await local.relayPresence?.() ?? { hosts: [], participants: [] };
+    const identities = senderIdentities(relays);
+    const identity = identities.get(pub.from.id);
+    const rules: BridgeRules = { recipients: remoteAddresses(owned),
+      relayOrigins: new Map(relays.hosts.map(host => [host.record.id, host.record.remoteHost!])) };
+    const event: MeshEvent = { ...pub, id: stamp.id, sequence: 0, createdAt: this.#now(), verification: "bridge" };
+    if (!ready() || !identity || !sameIdentity(identity, pub.from) || this.#refusal(event, rules, "toRemote") ||
+      local.relayOrigin?.(pub.from.id) !== sourceRemote || !local.holds?.(pub.to)) throw relayUnavailable();
+    // Reuse this destination's OWN connected remote side, preserving the original source
+    // event id. The destination store's commandId dedupe survives lost UDS receipts/retries.
+    const receipt = await remote.publish({ ...pub, from: identity, data: { ...pub.data, bridge: { ...stamp, via: localName } } });
+    // A fulfilled RPC is not confirmation by itself. Missing/malformed receipts are
+    // delivery-unknown, just like a lost response, and cannot authorize a hub envelope.
+    if (!Number.isSafeInteger(receipt?.sequence) || receipt.sequence <= 0) throw relayUnavailable();
   }
 
   #save(): void {
@@ -1888,14 +2216,25 @@ export class MeshBridge {
     const [local, claimed] = await Promise.all([this.options.local.presence(), this.options.remote.presence()]);
     const remote = admitPresence(claimed, new Set(local.reserved));
     if (this.#stopped) return;
-    const outbound = boundPresence(local);
+    const relays = await this.options.local.relayPresence?.() ?? { hosts: [], participants: [] };
+    const outbound = boundPresence({
+      hosts: [...local.hosts, ...relays.hosts.map(host => ({ ...host, record: { ...host.record, bridgeVia: this.options.localName } }))],
+      participants: [...local.participants, ...relays.participants.map(record => ({ ...record, bridgeVia: this.options.localName }))],
+    });
     if (outbound.dropped) this.#log(`presence: ${outbound.dropped} hosts pass the frame budget and are not mirrored`);
     // Both settle before a failure is reported, so no local write outlives this pass.
     const results = await Promise.allSettled([this.options.remote.mirror(outbound.presence), this.options.local.mirror(remote, syncedAt)]);
     // A transient failure must not hide a simultaneous permanent/transport failure.
     const failures = results.filter((result) => result.status === "rejected");
-    const failure = failures.find((result) => !isMeshRetryableBusy(result.reason)) ?? failures[0];
+    const failure = failures.find((result) => !isBridgeRetryable(result.reason)) ?? failures[0];
     if (failure) throw failure.reason;
+    // Retain only scalar deadlines from the latest admitted, sampled natives. A mirror commit
+    // can outlast these while the origin keeps renewing (#10068). Missing held membership then
+    // means bridge-stale, not proof of a foreign sender. This map can only defer, NEVER admit.
+    this.#sampledDeadlines = new Map(remote.hosts.flatMap(({ record, expiresAt, observedAt }) =>
+      remoteHostOf(record) === undefined && typeof observedAt === "number" && Number.isFinite(observedAt) &&
+        Number.isFinite(expiresAt) && expiresAt > observedAt
+        ? [[record.id, syncedAt + Math.min(BRIDGE_LEASE_MS, expiresAt - observedAt)] as const] : []));
     // A lock-delayed write must not make an old snapshot look freshly observed.
     this.#presenceAt = syncedAt;
     this.#syncedPresenceVersion = presenceVersion;
@@ -1905,10 +2244,63 @@ export class MeshBridge {
     // still needs its capped, held projection to remain live: one lease deadline, 1 s before
     // the 15 s mirror cap (transport/commit headroom), not an unconditional 5 s presence loop.
     // Source expiry itself is reconciled once. No hosts means no deadline at all.
-    const expiries = [...local.hosts, ...claimed.hosts]
-      .map(host => host.expiresAt).filter(expiry => Number.isFinite(expiry) && expiry > syncedAt);
+    const expiries = [...local.hosts, ...claimed.hosts, ...relays.hosts]
+      .map(host => typeof host.observedAt === "number" && Number.isFinite(host.observedAt)
+        ? syncedAt + host.expiresAt - host.observedAt : host.expiresAt)
+      .filter(expiry => Number.isFinite(expiry) && expiry > syncedAt);
     this.#expiryAt = Math.min(Infinity, ...expiries,
       ...(expiries.some(expiry => expiry > syncedAt + BRIDGE_LEASE_MS) ? [syncedAt + BRIDGE_LEASE_MS - 1_000] : []));
+    // A completed mirror invalidates pending membership observations immediately, even when
+    // no new event arrives. It releases the boundary, but is not itself a real wake: keep the
+    // missed-notification safety backoff and do not bypass an existing direction backoff.
+    for (const direction of ["toRemote", "toLocal"] as const) {
+      if (this.#membershipRetryAt[direction] === undefined) continue;
+      delete this.#membershipRetryAt[direction];
+      this.#directionPending[direction] = true;
+      if (this.#directionWakeReason[direction] !== "real") this.#directionWakeReason[direction] = "sync";
+      if (!this.#directionBackoff[direction]) this.#directionWake[direction]?.("sync");
+    }
+  }
+
+  /** Only an expired sampled projection makes these membership failures inconclusive. */
+  #staleMembership(event: MeshEvent, rules: BridgeRules, direction: Direction, reason?: string): boolean {
+    if (reason !== undefined && reason !== "sender is not a live participant of the remote" &&
+      reason !== "ack target is not bound to this link" && !(reason === "not addressed across" && direction === "toRemote")) return false;
+    // #refusal checks routing before body shape. A missing recipient must not hide a
+    // structural violation; nor may an already-bridged work/echo become pending membership.
+    if (!isIdentity(event.from) || (event.data !== undefined && !isObject(event.data)) ||
+      this.#destinationRefusal(event, direction)) return false;
+    const ids = direction === "toRemote" ? [event.to] : [event.from.id,
+      ...(event.topic === "fabric.control.ack" ? [isObject(event.data) ? event.data.targetId : undefined] : [])];
+    // ANY current native/other-link reservation defeats uncertainty, including an ACK's
+    // other held id. Noncanonical/missing ACK targets are structural, not a stale mirror.
+    const reserved = direction === "toRemote" ? rules.reservedRecipients : rules.reserved;
+    if (!ids.every(id => typeof id === "string" && CANONICAL_ID.test(id) && !reserved?.has(id))) return false;
+    return ids.some(id => (this.#sampledDeadlines.get(id as string) ?? Infinity) <= Date.now());
+  }
+
+  #deferMembership(direction: Direction, event: MeshEvent): void {
+    const previous = this.#membershipSequence[direction];
+    const initial = Math.min(this.options.membershipRetryMs ?? DEFAULT_MEMBERSHIP_RETRY_MS, MEMBERSHIP_RETRY_MAX_MS);
+    const current = this.#membershipSafetyDelay[direction] ?? initial;
+    const delay = this.#membershipAttempt[direction] === "safety"
+      ? Math.min(current * 2, MEMBERSHIP_RETRY_MAX_MS) : current;
+    this.#membershipRetryAt[direction] = Date.now() + delay;
+    // A safety wake doubles only after it actually gets a retained pass. A grace wake and
+    // sync completion preserve the current safety delay; a real wake clears it before here.
+    this.#membershipSafetyDelay[direction] = delay;
+    if (previous !== event.sequence) {
+      this.options.debug?.(`${direction}: bridge membership pending for ${event.topic} ${event.id}; source cursor retained, nothing dropped`);
+    }
+    // Expiry alone never consumes the event. The next successful source sample decides
+    // anew: stale evidence waits again; current absence or a proven foreign identity refuses.
+    this.#membershipSequence[direction] = event.sequence;
+  }
+
+  #wakeRetainedMembership(direction: Direction): void {
+    if (this.#membershipRetryAt[direction] === undefined && this.#membershipSequence[direction] === undefined) return;
+    delete this.#membershipSafetyDelay[direction];
+    this.#membershipRetryAt[direction] = Date.now();
   }
 
   #presenceDue(): boolean {
@@ -1948,13 +2340,18 @@ export class MeshBridge {
   #direction(direction: Direction): Promise<{ forwarded: number; dropped: number }> {
     return direction === "toRemote"
       ? this.#forward("toRemote", this.options.local, this.options.remote, async (refreshIfStale = true) => {
-        const { remote } = await this.#authority(refreshIfStale);
-        return { recipients: remoteAddresses(remote) };
+        const { local, remote } = await this.#authority(refreshIfStale);
+        const relays = await this.options.local.relayPresence?.();
+        return { recipients: remoteAddresses(remote), reservedRecipients: new Set(local.reserved),
+          relayOrigins: new Map(relays?.hosts.map(host => [host.record.id, host.record.remoteHost!])) };
       })
       : this.#forward("toLocal", this.options.remote, this.options.local, async (refreshIfStale = true) => {
         const { local, remote } = await this.#authority(refreshIfStale);
         // The remote is untrusted: its sender (and an ack's target) must be bound to this link.
-        return { recipients: addresses(local), senders: senders(remote), identities: senderIdentities(remote), reserved: new Set(local.reserved) };
+        const relays = await this.options.local.relayPresence?.();
+        return { recipients: addresses(local), relayRecipients: remoteAddresses(relays ?? { hosts: [], participants: [] }),
+          senders: senders(remote), identities: senderIdentities(remote), reserved: new Set(local.reserved),
+          relayOrigins: new Map(relays?.hosts.map(host => [host.record.id, host.record.remoteHost!])) };
       });
   }
 
@@ -1970,43 +2367,85 @@ export class MeshBridge {
     let walCapDelay: number | undefined;
     let reported = false; // one log line per busy streak, as run() logs its own
     while (running()) {
+      const wakeReason = this.#directionWakeReason[direction];
+      delete this.#directionWakeReason[direction];
+      // A notification can arrive during a pass, before the direction has a wait callback.
+      // Reapply its release after that pass's deferral rather than losing it to a new timer.
+      if (wakeReason === "real") this.#wakeRetainedMembership(direction);
+      else if (wakeReason === "sync") delete this.#membershipRetryAt[direction];
+      const retainedBefore = this.#membershipSequence[direction];
+      const cursorBefore = this.#cursor?.[direction].after ?? 0;
+      if (wakeReason === "safety" || wakeReason === "grace") this.#membershipAttempt[direction] = wakeReason;
+      else delete this.#membershipAttempt[direction];
       this.#directionPending[direction] = false;
       this.#directionBackoff[direction] = false;
+      this.#directionMirrorBackoff[direction] = false;
+      const presenceVersion = this.#presenceVersion;
       let delay: number | undefined;
+      let delayReason: DirectionWakeReason = "other";
       try {
         await this.#direction(direction);
+        if (wakeReason === "safety" && retainedBefore !== undefined && retainedBefore > cursorBefore &&
+            (this.#cursor?.[direction].after ?? cursorBefore) >= retainedBefore) {
+          this.#unaddressed.safety += 1;
+          this.#reportUnaddressed();
+        }
         retryMs = LOCK_RETRY_MIN_MS;
         walCapDelay = undefined;
         reported = false;
-        // A factory-rate deferral retries when its token is due: one timer, no notification needed.
-        if (direction === "toLocal" && this.#factoryWaiting) delay = Math.max(0, this.#factoryRetryAt - this.#now());
-        if (this.#legacyPolling) delay = Math.min(delay ?? Infinity, this.options.pollMs ?? LEGACY_POLL_MS);
+        // ponytail: back off only retained work to recover a missed notification without idle polling.
+        const membershipRetryAt = this.#membershipRetryAt[direction];
+        if (membershipRetryAt !== undefined) {
+          delay = Math.max(0, membershipRetryAt - Date.now());
+          delayReason = "safety";
+        }
+        if (direction === "toLocal" && this.#factoryWaiting) {
+          const factoryDelay = Math.max(0, this.#factoryRetryAt - this.#now());
+          if (delay === undefined || factoryDelay < delay) { delay = factoryDelay; delayReason = "other"; }
+        }
+        if (this.#legacyPolling) {
+          const pollDelay = this.options.pollMs ?? LEGACY_POLL_MS;
+          if (delay === undefined || pollDelay < delay) { delay = pollDelay; delayReason = "other"; }
+        }
       } catch (error) {
         if (!running()) return;
-        if (!isMeshRetryableBusy(error)) {
+        if (isIdempotencyKeyReused(error) || !isBridgeRetryable(error)) {
           this.#notificationError ??= error instanceof Error ? error : new Error(String(error));
           this.#wake?.();
           return;
         }
-        this.#directionBackoff[direction] = true;
-        if (isMeshStateWalCap(error)) delay = walCapDelay = walCapRetryDelay(walCapDelay, this.options.walCapRetryMinMs);
+        this.#directionMirrorBackoff[direction] = error instanceof BridgeMirrorDeferredError;
+        // A late ACK may arrive while the other half of syncPresence is still settling.
+        // Its already-latched wake must also bypass the mirror backoff installed here.
+        this.#directionBackoff[direction] = !(this.#directionMirrorBackoff[direction] && this.#presenceVersion !== presenceVersion);
+        if (error instanceof BridgeMirrorDeferredError || isMeshStateWalCap(error))
+          delay = walCapDelay = walCapRetryDelay(walCapDelay, this.options.walCapRetryMinMs);
         else delay = retryMs;
         retryMs = Math.min(retryMs * 2, LOCK_RETRY_MAX_MS);
         if (!reported) {
-          this.#log(`${meshBusyLabel(error)} (${direction}); retrying in ${delay} ms: ${(error as Error).message}`);
+          this.#log(`${error instanceof BridgeMirrorDeferredError ? "bridge mirror degraded" : meshBusyLabel(error)} (${direction}); retrying in ${delay} ms: ${(error as Error).message}`);
           reported = true;
         }
       }
+      delete this.#membershipAttempt[direction];
       if (!running()) return;
       if (this.#directionPending[direction] && !this.#directionBackoff[direction]) continue;
       await new Promise<void>((resolve) => {
         let timer: ReturnType<typeof setTimeout> | undefined;
-        this.#directionWake[direction] = () => {
+        let graceTimer: ReturnType<typeof setTimeout> | undefined;
+        const wake = (reason: DirectionWakeReason = "other"): void => {
           if (timer !== undefined) clearTimeout(timer);
+          if (graceTimer !== undefined) clearTimeout(graceTimer);
           delete this.#directionWake[direction];
+          this.#directionWakeReason[direction] = reason;
           resolve();
         };
-        if (delay !== undefined) timer = setTimeout(() => this.#directionWake[direction]?.(), Math.min(delay, 2_147_483_647));
+        this.#directionWake[direction] = wake;
+        if (delay !== undefined) timer = setTimeout(() => this.#directionWake[direction]?.(delayReason), Math.min(delay, 2_147_483_647));
+        // RELAY-1 owns an exact persisted deadline, separate from the safety/lock backoff.
+        // An expired grace is never rearmed when its source sender still lacks authority.
+        const graceAt = this.#relayGraceAt(direction);
+        if (graceAt !== undefined) graceTimer = setTimeout(() => wake("grace"), Math.min(Math.max(0, graceAt - Date.now()), 2_147_483_647));
       });
     }
   }
@@ -2021,6 +2460,27 @@ export class MeshBridge {
     const seen = this.#seen[direction];
     let forwarded = 0;
     let dropped = 0;
+    const retainedBoundary = this.#membershipSequence[direction];
+    let passRefreshed = false;
+    if (cursor.relayGrace && Number.isSafeInteger(cursor.relayGrace.sequence) && cursor.relayGrace.sequence <= cursor.after) {
+      delete cursor.relayGrace;
+      this.#save();
+    }
+    if ((this.#membershipSequence[direction] ?? Infinity) <= cursor.after) {
+      delete this.#membershipSequence[direction];
+      delete this.#membershipRetryAt[direction];
+      delete this.#membershipSafetyDelay[direction];
+    }
+    const membershipRetryAt = this.#membershipRetryAt[direction];
+    if (membershipRetryAt !== undefined) {
+      const graceDue = this.#relayGraceExpired(direction);
+      if (Date.now() < membershipRetryAt && !graceDue) return { forwarded, dropped };
+      delete this.#membershipRetryAt[direction];
+      // Expiration invalidates the observation, never the event: sample again before rereading
+      // its unchanged source boundary. Failed/deferred mirrors retain that boundary too.
+      await this.syncPresence();
+      passRefreshed = true;
+    }
     if (direction === "toLocal" && this.#factoryWaiting) {
       // A factory-rate deferral holds this link's inbound drain, in order, until its token is due;
       // until then a pass does not even reread the page.
@@ -2037,10 +2497,15 @@ export class MeshBridge {
       const page = await (source.tail?.(start, startOffset) ?? source.read(start));
       // Even filtered/skip-only reads can carry this drain past the mirrors' lease.
       // Reconcile latched origin changes/expiry even on a filtered page.
-      if (this.#presenceDue()) await this.syncPresence();
-      // Authority reads are deliberately canonical (copied-marker ABA), so idle pages
-      // avoid them; every page with events retains the same fresh authority checks.
-      let rules: BridgeRules = page.events.length ? await authority() : { recipients: new Set<string>() };
+      const retainedRefresh = passRefreshed && retainedBoundary !== undefined && cursor.after < retainedBoundary &&
+        this.#presenceVersion === this.#syncedPresenceVersion && this.#leaseVersion === this.#syncedLeaseVersion;
+      if (!retainedRefresh && this.#presenceDue()) {
+        await this.syncPresence();
+        passRefreshed = true;
+      }
+      // Reuse only this retained boundary's completed sample; real changes and later pages
+      // still refresh normally. Canonical owned()/holds() checks are never skipped.
+      let rules: BridgeRules = page.events.length ? await authority(!retainedRefresh) : { recipients: new Set<string>() };
       for (const skip of Array.isArray(page.skipped) ? page.skipped : []) {
         dropped += 1;
         this.#log(`${direction}: skipped ${skip.topic} ${skip.id} (sequence ${skip.sequence}): ${skip.bytes} bytes pass the ${BRIDGE_PAGE_BYTES}-byte frame budget`);
@@ -2051,9 +2516,11 @@ export class MeshBridge {
         if (this.#stopped) return { forwarded, dropped };
         // Batch only a contiguous, already-admitted prefix. Refusals, lapsed authority and
         // legacy peers retain the single-event refresh/refusal path below.
-        if (target.publishBatch && candidateLimit > 1 && page.events.length - index > 1 && !seen.has(event.id)) {
+        if (target.publishBatch && candidateLimit > 1 && page.events.length - index > 1 && !seen.has(event.id) &&
+          !isRelayReceipt(event) && !this.#isRelayCommand(event, rules, direction)) {
           if (this.#presenceDue()) {
             await this.syncPresence();
+            passRefreshed = true;
             rules = await authority(false);
           }
           if (this.#stopped) return { forwarded, dropped };
@@ -2066,7 +2533,8 @@ export class MeshBridge {
           let spendingBytes = 0;
           let bytes = 0;
           for (const candidate of page.events.slice(index, index + candidateLimit)) {
-            if (candidate.sequence <= cursor.after || seen.has(candidate.id) || this.#refusal(candidate, rules, direction)) break;
+            if (candidate.sequence <= cursor.after || seen.has(candidate.id) || isRelayReceipt(candidate) ||
+              this.#isRelayCommand(candidate, rules, direction) || this.#refusal(candidate, rules, direction)) break;
             if (direction === "toRemote" && this.options.local.holds && !this.options.local.holds(candidate.to!)) break;
             const data = isObject(candidate.data) ? candidate.data : {};
             const item = {
@@ -2091,7 +2559,7 @@ export class MeshBridge {
             try { committed = await target.publishBatch(candidates); }
             catch (error) {
               // No admitted prefix: let the original path refresh/drop this one event.
-              if (!(error instanceof BridgeOwnershipError) && !isPermanent(error)) throw error;
+              if (isIdempotencyKeyReused(error) || (!(error instanceof BridgeOwnershipError) && !isPermanent(error))) throw error;
             }
             if (committed) {
               if (!Array.isArray(committed) || !committed.length || committed.length > candidates.length ||
@@ -2118,9 +2586,10 @@ export class MeshBridge {
             }
           }
         }
-        let refreshed = false;
+        let refreshed = passRefreshed && retainedBoundary === event.sequence;
         const refresh = async (): Promise<void> => {
           refreshed = true;
+          passRefreshed = true;
           await this.syncPresence();
           // This event gets one refresh, even if that pass itself waited on a lock.
           rules = await authority(false);
@@ -2132,10 +2601,48 @@ export class MeshBridge {
         // A file notification may still be queued when a later event append is already
         // readable. Refresh a newly observed canonical address once before dropping it;
         // admission/holds still use the committed projection, never the sender's claim.
-        if (lapsedId && (this.options.local.mirrored?.(lapsedId) ||
+        if (!refreshed && lapsedId && (this.options.local.mirrored?.(lapsedId) ||
           (this.#notificationMode && CANONICAL_ID.test(lapsedId)))) {
           await refresh();
           reason = this.#refusal(event, rules, direction);
+        }
+        if (reason && this.#staleMembership(event, rules, direction, reason)) {
+          this.#deferMembership(direction, event);
+          if (cursor.after > start) this.#save();
+          return { forwarded, dropped };
+        }
+        // Cross-spoke commands never enter either hub body-publication seam. Even a
+        // missing/lapsed destination gets its refusal only on the original source link.
+        const relayCommand = this.#isRelayCommand(event, rules, direction);
+        const relaySenderAllowed = relayCommand && this.#relaySenderAllowed(event, rules);
+        // If both ends are stale, retain the source uncertainty first. The destination
+        // observation is only a bounded wait signal; it never admits the sender.
+        if (relayCommand && this.#relayDestinationStale(event, rules) && !relaySenderAllowed) {
+          this.#relayGracePending(event);
+          this.#deferMembership(direction, event);
+          if (cursor.after > start) this.#save();
+          return { forwarded, dropped };
+        }
+        if (relayCommand && relaySenderAllowed) {
+          if (!seen.has(event.id)) {
+            if (this.#presenceDue()) await refresh();
+            const result = await this.#relayCommand(event, rules);
+            if (result.pending) {
+              this.#deferMembership(direction, event);
+              if (cursor.after > start) this.#save();
+              return { forwarded, dropped };
+            }
+            if (result.delivered) {
+              if (result.sequence !== undefined) cursor.mark = Math.max(cursor.mark, result.sequence);
+              forwarded += 1;
+            } else dropped += 1;
+            this.#clearRelayGrace(direction, event);
+          }
+          cursor.after = event.sequence;
+          this.#save();
+          seen.delete(event.id);
+          await new Promise<void>(resolve => setImmediate(resolve));
+          continue;
         }
         if (reason) {
           if (reason !== "not addressed across") {
@@ -2147,8 +2654,12 @@ export class MeshBridge {
         } else if (!seen.has(event.id)) {
           // A long backlog still reconciles origin updates; a lapsed held mirror gets the
           // existing one-refresh commit refusal path, never an idle renewal timer.
-          if (this.#presenceDue()) await this.syncPresence();
+          if (this.#presenceDue()) {
+            await this.syncPresence();
+            passRefreshed = true;
+          }
           if (this.#stopped) return { forwarded, dropped };
+          let factorySpend = 0;
           if (this.#viaFactory(event, rules, direction)) {
             const size = Buffer.byteLength(JSON.stringify(this.#outbound(event, rules, direction)), "utf8");
             if (!this.#factoryAffords(0, 0, size)) {
@@ -2159,8 +2670,7 @@ export class MeshBridge {
               if (cursor.after > start) this.#save();
               return { forwarded, dropped };
             }
-            this.#factoryTokens -= 1;
-            this.#factoryBytes -= size;
+            factorySpend = size;
           }
           try {
             // Revalidated for each event after the awaits before it: an inbound event commits only
@@ -2186,12 +2696,16 @@ export class MeshBridge {
               // Ownership errors happen before append, under the publish lock. A mirror can
               // lapse during that wait: refresh once, reread authority, then retry once.
               const ids = direction === "toLocal" ? held : [event.to!];
-              if (!(error instanceof BridgeOwnershipError) || refreshed || this.#destinationRefusal(event, direction) ||
+              if (isIdempotencyKeyReused(error) || !(error instanceof BridgeOwnershipError) || refreshed || this.#destinationRefusal(event, direction) ||
                   !ids.some((id) => this.options.local.mirrored?.(id))) throw error;
               await refresh();
               if (this.#stopped) return { forwarded, dropped };
               if (this.#refusal(event, rules, direction)) throw error;
               published = await publish();
+            }
+            if (factorySpend > 0) {
+              this.#factoryTokens -= 1;
+              this.#factoryBytes -= factorySpend;
             }
             seen.add(event.id);
             cursor.mark = Math.max(cursor.mark, published.sequence);
@@ -2204,7 +2718,19 @@ export class MeshBridge {
             // Legacy/singleton drains must also give waiting writers a turn after checkpoint.
             await new Promise<void>(resolve => setImmediate(resolve));
           } catch (error) {
-            // Too large or refused by the far side: never retried, or it would stall the source.
+            if (error instanceof BridgeOwnershipError) {
+              // Keep the two-attempt/one-refresh bound. An origin can renew throughout BOTH
+              // lock waits; expiry is not a foreign identity. Recheck current reservations so
+              // a proven takeover still refuses, and otherwise retry from the durable cursor.
+              rules = await authority(false);
+              const currentReason = this.#refusal(event, rules, direction);
+              if (this.#staleMembership(event, rules, direction, currentReason)) {
+                this.#deferMembership(direction, event);
+                if (cursor.after > start) this.#save();
+                return { forwarded, dropped };
+              }
+            }
+            // Structural/permanent refusals still advance; sampled membership uncertainty does not.
             if (!isPermanent(error)) throw error;
             dropped += 1;
             this.#log(`${direction}: refused ${event.topic} ${event.id}: ${(error as Error).message}`);
@@ -2221,6 +2747,127 @@ export class MeshBridge {
       if (!moved) break;
     }
     return { forwarded, dropped };
+  }
+
+  #isRelayCommand(event: MeshEvent, rules: BridgeRules, direction: Direction): boolean {
+    return direction === "toLocal" && event.topic === "fabric.control.command" && typeof event.to === "string" &&
+      CANONICAL_ID.test(event.to) && !rules.recipients.has(event.to);
+  }
+
+  #relaySenderAllowed(event: MeshEvent, rules: BridgeRules): boolean {
+    return !hasBridgeField(event) && !isRelayReceipt(event) && isIdentity(event.from) && isObject(event.data) &&
+      !rules.reserved?.has(event.from.id) && rules.senders?.has(event.from.id) === true && rules.identities?.has(event.from.id) === true;
+  }
+
+  #staleRelaySender(event: MeshEvent, rules: BridgeRules): boolean {
+    if (hasBridgeField(event) || isRelayReceipt(event) || !isIdentity(event.from) || !isObject(event.data) ||
+        !CANONICAL_ID.test(event.from.id) || rules.reserved?.has(event.from.id)) return false;
+    return (this.#sampledDeadlines.get(event.from.id) ?? Infinity) <= Date.now();
+  }
+
+  #relayDestinationStale(event: MeshEvent, rules: BridgeRules): boolean {
+    if (typeof event.to !== "string" || !isObject(event.data) ||
+        (!this.#relaySenderAllowed(event, rules) && !this.#staleRelaySender(event, rules))) return false;
+    const origin = this.options.local.relayStaleOrigin?.(event.to);
+    return origin !== undefined && event.data.destinationRemoteHost === origin;
+  }
+
+  #relayGraceAt(direction: Direction): number | undefined {
+    if (direction !== "toLocal") return undefined;
+    const retained = this.#cursor?.toLocal.relayGrace;
+    if (!isObject(retained) || !Number.isSafeInteger(retained.sequence) || retained.sequence <= (this.#cursor?.toLocal.after ?? 0) ||
+        !Number.isFinite(retained.startedAt) || retained.startedAt < 0) return undefined;
+    const deadline = retained.startedAt + BRIDGE_LEASE_MS;
+    return Number.isFinite(deadline) && Date.now() < deadline ? deadline : undefined;
+  }
+
+  #relayGraceExpired(direction: Direction): boolean {
+    if (direction !== "toLocal") return false;
+    const retained = this.#cursor?.toLocal.relayGrace;
+    if (!isObject(retained) || !Number.isSafeInteger(retained.sequence) || retained.sequence <= (this.#cursor?.toLocal.after ?? 0) ||
+        !Number.isFinite(retained.startedAt) || retained.startedAt < 0) return false;
+    const deadline = retained.startedAt + BRIDGE_LEASE_MS;
+    return Number.isFinite(deadline) && Date.now() >= deadline;
+  }
+
+  #relayGracePending(event: MeshEvent): boolean {
+    const cursor = this.#cursor!.toLocal;
+    const retained = cursor.relayGrace;
+    const wallNow = Date.now();
+    const now = Number.isFinite(wallNow) && wallNow >= 0 ? wallNow : 0;
+    const sameEvent = isObject(retained) && Number.isSafeInteger(retained.sequence) && retained.sequence > 0 &&
+      retained.sequence === event.sequence && (retained.id === undefined || retained.id === event.id);
+    const validStart = isObject(retained) && Number.isFinite(retained.startedAt) && retained.startedAt >= 0 &&
+      retained.startedAt <= now && Number.isFinite(retained.startedAt + BRIDGE_LEASE_MS);
+    // Repair legacy/malformed/future records from the local clock, never a peer timestamp.
+    if (!sameEvent || !validStart) {
+      cursor.relayGrace = { sequence: event.sequence, startedAt: now, id: event.id };
+      this.#save();
+      return true;
+    }
+    return now < retained.startedAt + BRIDGE_LEASE_MS;
+  }
+
+  #clearRelayGrace(direction: Direction, event: MeshEvent): void {
+    const cursor = this.#cursor![direction];
+    const retained = cursor.relayGrace;
+    if (retained?.sequence === event.sequence && (retained.id === undefined || retained.id === event.id)) {
+      delete cursor.relayGrace;
+    }
+  }
+
+  async #relayCommand(event: MeshEvent, rules: BridgeRules): Promise<{ delivered: boolean; sequence?: number; pending?: boolean }> {
+    const { local, remote, relay, localName, remoteName } = this.options;
+    const pub = this.#outbound(event, rules, "toLocal");
+    const destination = rules.relayOrigins?.get(pub.to);
+    const senderHeld = local.holds?.(pub.from.id, pub.from);
+    // Do not turn a source sender's expired sampled projection into an unavailable ACK
+    // and consume its command. This is a wait, not permission to bypass the sender fence.
+    if (!senderHeld &&
+      (this.#staleMembership(event, rules, "toLocal", this.#refusal(event, rules, "toLocal")) ||
+        (this.#relayDestinationStale(event, rules) && this.#staleRelaySender(event, rules)))) return { delivered: false, pending: true };
+    const staleDestination = this.#relayDestinationStale(event, rules);
+    if (staleDestination && this.#relayGracePending(event)) return { delivered: false, pending: true };
+    try {
+      if (this.#stopped || !this.#ready || this.#notificationError || this.#refusal(event, rules, "toLocal") || !relay ||
+        !destination || destination === remoteName || destination === localName ||
+        pub.data.destinationRemoteHost !== destination || local.relayOrigin?.(pub.to) !== destination ||
+        !senderHeld) throw relayUnavailable();
+      await relay(destination, pub);
+    } catch (error) {
+      // A destination can lapse after the first admission but before its own held fence.
+      // The same bounded grace defers, never routes, that stale observation.
+      if (!isIdempotencyKeyReused(error) && this.#relayDestinationStale(event, rules) && this.#relayGracePending(event)) {
+        return { delivered: false, pending: true };
+      }
+      // Timeout remains ambiguous. A typed conflict is a fixed, nonretryable source-local
+      // refusal; neither case exposes owner assertions, arbitrary errors, body or hash.
+      const refusal = isIdempotencyKeyReused(error)
+        ? { error: "Fabric idempotency key reused with different input", errorCode: FABRIC_IDEMPOTENCY_KEY_REUSED, retryable: false }
+        : { error: "Relay destination unavailable", errorCode: RELAY_UNAVAILABLE_CODE, retryable: true };
+      await remote.publish({
+        topic: "fabric.control.ack", kind: "ack",
+        from: { id: `bridge:${localName}`, name: "mesh-bridge", kind: "main" }, to: pub.from.id,
+        data: { version: 1, commandId: pub.data.commandId, targetId: pub.data.targetId,
+          accepted: false, ...refusal,
+          bridge: { from: localName, id: event.id } },
+      });
+      return { delivered: false };
+    }
+    // Only a confirmed destination receipt permits a hub envelope. Its sequence is LOCAL;
+    // the destination sequence is deliberately absent from the delivery-only relay API.
+    let receipt: { sequence: number } | undefined;
+    try { receipt = await local.recordRelay?.(pub, [pub.from.id]); }
+    catch (error) {
+      if (!(error instanceof BridgeOwnershipError)) throw error;
+      const { local: presence, remote: owned } = await this.#authority(false);
+      const current = { ...rules, senders: senders(owned), identities: senderIdentities(owned), reserved: new Set(presence.reserved) };
+      if (!this.#staleMembership(event, current, "toLocal", this.#refusal(event, current, "toLocal"))) throw error;
+      // Destination dedupe covers retry after delivery but before the fenced hub receipt.
+      return { delivered: false, pending: true };
+    }
+    if (receipt && (!Number.isSafeInteger(receipt.sequence) || receipt.sequence <= 0)) throw new Error("Invalid relay receipt");
+    return { delivered: true, ...(receipt ? { sequence: receipt.sequence } : {}) };
   }
 
   /** An inbound ACK for a command this link carried out, addressed to that command's replyTo (smarty-dev#9751). */
@@ -2241,17 +2888,27 @@ export class MeshBridge {
     const destination = event.data.destinationRemoteHost;
     if (destination === null) return "command destination is native and must not cross a bridge";
     if (typeof destination !== "string") return "command destinationRemoteHost is not a string or null";
-    const intended = direction === "toRemote" ? this.options.remoteName : this.options.localName;
+    const intended = direction === "toRemote" ? this.options.remoteName
+      : (typeof event.to === "string" ? this.options.local.relayOrigin?.(event.to) : undefined) ?? this.options.localName;
     if (destination !== intended) return `command destination is not bound to bridge link ${intended}`;
     return undefined;
   }
 
   #refusal(event: MeshEvent, rules: BridgeRules, direction: "toRemote" | "toLocal"): string | undefined {
-    if (!isBridgedTopic(event) || hasBridgeField(event)) return "not allowed";
+    if (!isBridgedTopic(event) || isRelayReceipt(event) ||
+      (event.verification === "bridge" && event.topic === "fabric.control.command" && !isObject(event.data))) return "not allowed";
+    if (hasBridgeField(event)) {
+      const stamp = bridgeStampOf(event);
+      if (direction !== "toRemote" || event.verification !== "bridge" || !stamp || hasHubHop(event) ||
+          (event.topic !== "fabric.control.command" && event.topic !== "fabric.control.ack") ||
+          stamp.from === this.options.remoteName || rules.relayOrigins?.get(event.from.id) !== stamp.from) return "not allowed";
+    }
+    if (direction === "toLocal" && typeof event.to === "string" && rules.relayOrigins?.has(event.to) &&
+        event.topic !== "fabric.control.command" && event.topic !== "fabric.control.ack") return "not allowed";
     // The hub factory reads by topic: addressed work/owner wakes and unaddressed WAIT/ETA issue
     // records cross within its rate bound. The latter gain `to: factory` only on the hub copy
     // (smarty-dev#9349); no other broadcast does, and never hub to remote.
-    if (!((typeof event.to === "string" && rules.recipients.has(event.to)) ||
+    if (!((typeof event.to === "string" && (rules.recipients.has(event.to) || rules.relayRecipients?.has(event.to))) ||
       (direction === "toLocal" && (isHubFactoryEvent(event) || this.#awaitedAck(event))))) {
       return "not addressed across";
     }
@@ -2271,6 +2928,7 @@ export class MeshBridge {
 
   /** Follow notifications until stop() or failure. No timer is armed for empty idle.
    * Timer inventory: source/held-mirror expiry and pending half-lease flush (one shot);
+   * retained stale-membership safety net (1 s..30 s backoff), plus exact persisted relay grace;
    * actual lock/SQLite busy, including WAL notification commit settlement (100 ms..2 s);
    * WAL-cap refusal (1 s..30 s); explicitly negotiated legacy-only 250 ms polling.
    * Held-publication fence retries, RPC deadlines and stop
@@ -2283,14 +2941,18 @@ export class MeshBridge {
     let walCapLoggedAt = Number.NEGATIVE_INFINITY;
     let walCapDelay: number | undefined;
     let backingOff = false;
+    let mirrorBackingOff = false;
     // smarty-dev#9751: once start() has loaded the cursors, each direction runs in its own loop (#directionLoop),
     // which also does that direction's catch-up: no sequential drain first.
     let ended = false;
     const running = (): boolean => !this.#stopped && !ended;
-    const wakeDirections = (): void => {
+    const wakeDirections = (retainedOnly = false): void => {
       for (const direction of ["toRemote", "toLocal"] as const) {
+        if (retainedOnly && (this.#membershipSequence[direction] ?? 0) <= (this.#cursor?.[direction].after ?? 0)) continue;
+        this.#wakeRetainedMembership(direction);
         this.#directionPending[direction] = true;
-        if (!this.#directionBackoff[direction]) this.#directionWake[direction]?.();
+        this.#directionWakeReason[direction] = "real";
+        if (!this.#directionBackoff[direction]) this.#directionWake[direction]?.("real");
       }
     };
     this.#notificationMode = true;
@@ -2301,10 +2963,19 @@ export class MeshBridge {
         // One pending half-lease flush coalesces every lane's heartbeat. Further renewals
         // neither reschedule it nor take a lock; actual routed work refreshes immediately.
         if (firstPending && !backingOff) this.#wake?.();
+        wakeDirections(true);
         return;
       }
       this.#changesPending = true;
-      if (kind === "presence") this.#presenceVersion++;
+      if (kind === "presence") {
+        this.#presenceVersion++;
+        // A late mirror ACK already emits presence in RemoteBridgeSide. Do not leave it
+        // waiting behind the degraded-mirror backoff (up to 30 s). WAL/lock backoff is intact.
+        if (mirrorBackingOff) backingOff = false;
+        for (const direction of ["toRemote", "toLocal"] as const) {
+          if (this.#directionMirrorBackoff[direction]) this.#directionBackoff[direction] = false;
+        }
+      }
       if (!backingOff) this.#wake?.();
       wakeDirections();
     };
@@ -2316,6 +2987,7 @@ export class MeshBridge {
       while (!this.#stopped) {
         if (this.#notificationError) throw this.#notificationError;
         this.#changesPending = false; // changes during any await below stay latched
+        const presenceVersion = this.#presenceVersion;
         const pass = (async () => {
           const sides = [this.options.local, this.options.remote];
           while (unsubscribers.length < sides.length && !this.#stopped) {
@@ -2333,8 +3005,15 @@ export class MeshBridge {
             unsubscribers.push(unsubscribe ?? (() => undefined));
           }
           if (this.#stopped) return;
-          if (!started) await this.start();
-          else if (this.#presenceDue()) await this.syncPresence();
+          if (!started) {
+            if (!this.#ready) await this.start();
+            else {
+              // Subscription setup can race an append: recover IDs again without
+              // resetting already-ready cursors or losing their committed marks.
+              await this.#reconcileSeen();
+              await this.syncPresence();
+            }
+          } else if (this.#presenceDue()) await this.syncPresence();
         })();
         // stop() needs a settlement fence, not a second rejection of a failed pass.
         this.#running = pass.then(() => undefined, () => undefined);
@@ -2342,6 +3021,7 @@ export class MeshBridge {
         backingOff = false;
         try {
           await pass;
+          mirrorBackingOff = false;
           reportedTimeout = false;
           walCapDelay = undefined;
           retryMs = LOCK_RETRY_MIN_MS;
@@ -2356,16 +3036,17 @@ export class MeshBridge {
           if (this.#legacyPolling) delay = Math.min(delay ?? Infinity, this.options.pollMs ?? LEGACY_POLL_MS);
         } catch (error) {
           if (this.#stopped) return;
-          if (!isMeshRetryableBusy(error)) throw error;
-          backingOff = true;
+          if (!isBridgeRetryable(error)) throw error;
+          mirrorBackingOff = error instanceof BridgeMirrorDeferredError;
+          backingOff = !(mirrorBackingOff && this.#presenceVersion !== presenceVersion);
           delay = retryMs;
           retryMs = Math.min(retryMs * 2, LOCK_RETRY_MAX_MS);
-          if (isMeshStateWalCap(error)) {
+          if (error instanceof BridgeMirrorDeferredError || isMeshStateWalCap(error)) {
             walCapDelay = walCapRetryDelay(walCapDelay, this.options.walCapRetryMinMs);
             delay = walCapDelay;
             const now = Date.now();
             if (now - walCapLoggedAt >= WAL_CAP_LOG_MS) {
-              this.#log(`mesh state WAL cap; retrying in ${delay} ms: ${meshDeferredSummary(error)}`); // no reader pids
+              this.#log(`${error instanceof BridgeMirrorDeferredError ? "bridge mirror degraded" : "mesh state WAL cap"}; retrying in ${delay} ms: ${meshDeferredSummary(error)}`); // no reader pids
               walCapLoggedAt = now;
             }
           } else if (!reportedTimeout) {
@@ -2388,6 +3069,7 @@ export class MeshBridge {
       }
     } finally {
       ended = true;
+      this.#ready = false;
       for (const direction of ["toRemote", "toLocal"] as const) this.#directionWake[direction]?.();
       for (const unsubscribe of unsubscribers) unsubscribe();
       this.#notificationMode = false;
@@ -2412,10 +3094,12 @@ export class MeshBridge {
       } finally { if (timer !== undefined) clearTimeout(timer); }
     };
     this.#stopped = true;
+    this.#ready = false;
     this.#wake?.();
     for (const direction of ["toRemote", "toLocal"] as const) this.#directionWake[direction]?.();
     await within(this.#running);
     await within(this.#directions);
+    await within(Promise.allSettled([...this.#relayDeliveries]));
     await within(this.options.remote.mirror({ hosts: [], participants: [] }));
     this.options.remote.close?.(new Error("Bridge stopped"));
     await within(this.#running);
@@ -2440,6 +3124,6 @@ const allBridgedIds = async (side: BridgeSide, after: number): Promise<Set<strin
 };
 
 const isPermanent = (error: unknown): boolean =>
-  !isMeshIncarnationPending(error) && !isMeshSnapshotRetriesExhausted(error) &&
+  !isIdempotencyKeyReused(error) && !isMeshIncarnationPending(error) && !isMeshSnapshotRetriesExhausted(error) &&
   !isMeshLockTimeout(error) && (error instanceof BridgeOwnershipError ||
     error instanceof Error && /exceeds|not allowed|no bridge stamp|no recipient|no sender|Invalid mesh topic/i.test(error.message));

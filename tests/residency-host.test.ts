@@ -7,7 +7,7 @@ import { describe, expect, it, vi } from "vitest";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { ActorLogStore } from "../src/actors/log-store.js";
 import { ACTOR_RETENTION_BATCH_SIZE } from "../src/actors/manager.js";
-import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
+import { DEFAULT_FABRIC_CONFIG, FabricMeshNatsConfigError, normalizeFabricConfig } from "../src/config.js";
 import { execFileSync, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { routeAgentCreation } from "../src/agents/spawn-router.js";
@@ -55,6 +55,77 @@ const fixture = (retention: Partial<ResidentHostConfig["retention"]> = {}, canon
   const host = new ResidentHost(config, idle);
   return { root, config, host, idle };
 };
+
+// Audit P P2: the public resident config boundary must enforce the shared NATS policy.
+describe("direct resident NATS config boundary", () => {
+  beforeEach(() => installInProcessResidentFence(true));
+  const direct = () => {
+    const f = fixture();
+    for (const key of ["PI_FABRIC_MESH_NATS", "PI_FABRIC_MESH_TRANSPORT", "PI_FABRIC_MESH_HOST_TRANSPORT"]) vi.stubEnv(key, undefined);
+    vi.stubEnv("PI_CODING_AGENT_DIR", path.join(f.root, "agent"));
+    f.config.mesh = { ...f.config.mesh, transport: "nats", hostTransport: "nats", maxEventBytes: 777,
+      nats: { replicas: 1, machine: "direct-host", operatorMachine: "fabric-ops",
+        servers: "tls://nats.example.invalid:4222", custodyStream: "DIRECT_CUSTODY", livenessStream: "DIRECT_LIVENESS",
+        pathBMachines: ["direct-host"], tls: { caFile: path.join(f.root, "unread-ca.pem") } } };
+    return f;
+  };
+
+  it.each(["relative caFile", "missing tls", "numeric IP", "missing policy field"] as const)("refuses %s with the normalizer's typed error before factory entry", async defect => {
+    const f = direct();
+    const nats = f.config.mesh.nats;
+    if (defect === "relative caFile") nats.tls = { caFile: "relative.pem" };
+    if (defect === "missing tls") delete nats.tls;
+    if (defect === "numeric IP") nats.servers = "tls://127.0.0.1:4222";
+    if (defect === "missing policy field") delete nats.custodyStream;
+    let expected: unknown;
+    try { normalizeFabricConfig({ mesh: f.config.mesh }); } catch (error) { expected = error; }
+    expect(expected).toBeInstanceOf(FabricMeshNatsConfigError);
+    const transport = await import("../src/transport/index.js");
+    const open = vi.spyOn(transport, "openFabricTransport").mockRejectedValue(new Error("unexpected direct factory entry"));
+    const host = new ResidentHost(f.config);
+    try {
+      await expect(host.start()).rejects.toMatchObject({ name: (expected as Error).name,
+        message: (expected as Error).message, code: "FABRIC_MESH_TRANSPORT_CONFIG", field: (expected as FabricMeshNatsConfigError).field });
+      expect(open).not.toHaveBeenCalled();
+      expect(host.agents).toBeUndefined();
+    } finally {
+      await host.close(); await f.host.close(); open.mockRestore(); vi.unstubAllEnvs();
+      fs.rmSync(f.root, { recursive: true, force: true });
+    }
+  });
+
+  it("normalizes valid raw NATS at the actual factory seam without aliasing input or changing other mesh values", async () => {
+    const f = direct();
+    const input = structuredClone(f.config);
+    const expected = normalizeFabricConfig({ mesh: f.config.mesh }).mesh.nats;
+    const sentinel = new Error("direct NATS normalized factory sentinel (before KV)");
+    const transport = await import("../src/transport/index.js");
+    const open = vi.spyOn(transport, "openFabricTransport").mockRejectedValue(sentinel);
+    const host = new ResidentHost(f.config);
+    // Mutation after construction cannot change the NATS activation snapshot.
+    f.config.mesh.nats.pathBMachines!.push("caller-mutated");
+    try {
+      await expect(host.start()).rejects.toBe(sentinel);
+      expect(open).toHaveBeenCalledOnce();
+      const options = open.mock.calls[0]![0];
+      expect(options.config).toEqual({ ...input.mesh, nats: expected });
+      expect(options.config.nats.servers).toEqual(["tls://nats.example.invalid:4222"]);
+      expect(options.config.nats.inboxLanes).toBe(8);
+      expect(options.config).not.toBe(host.config.mesh);
+      expect(options.config.nats).not.toBe(host.config.mesh.nats);
+      expect(options.config.nats.tls).not.toBe(host.config.mesh.nats.tls);
+      expect(options.config.nats.pathBMachines).not.toBe(host.config.mesh.nats.pathBMachines);
+      options.config.nats.pathBMachines!.push("factory-mutated");
+      expect(host.config.mesh.nats.pathBMachines).toEqual(["direct-host"]);
+      expect(f.config.mesh.nats.servers).toBe(input.mesh.nats.servers);
+      expect(f.config.mesh.nats.pathBMachines).toEqual(["direct-host", "caller-mutated"]);
+      expect(options.signal?.aborted).toBe(true);
+    } finally {
+      await host.close(); await f.host.close(); open.mockRestore(); vi.unstubAllEnvs();
+      fs.rmSync(f.root, { recursive: true, force: true });
+    }
+  });
+});
 
 describe("watchdog custody at host admission", () => {
   it("refuses custody before initialization and releases the acquired host fence", async () => {

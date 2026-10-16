@@ -22,15 +22,17 @@ afterEach(async () => {
   for (const exit of exits.splice(0)) exit();
   await Promise.all(managers.splice(0).map(manager => manager.close()));
   vi.restoreAllMocks();
+  vi.unstubAllEnvs();
 });
 
-const harness = (retainRuns = true, parentPolicy?: (root: string, workspace: string) => FabricWritePolicy) => {
+const harness = (retainRuns = true, parentPolicy?: (root: string, workspace: string) => FabricWritePolicy, nats = false) => {
   const notices: AgentTerminalNotice[] = [];
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "steer-ended-"));
   const workspace = path.join(root, "workspace"); fs.mkdirSync(workspace);
   const records = new Map<string, AgentRunRecord>();
   const closures = new Map<string, () => void>();
   if (parentPolicy) vi.stubEnv("PI_FABRIC_WRITE_POLICY", JSON.stringify(parentPolicy(root, workspace)));
+  if (nats) vi.stubEnv("XDG_STATE_HOME", path.join(process.cwd(), ".local", "central-test-state", path.basename(root)));
   const launch = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async request => {
     const args = new Map<string, string>();
     for (let i = 0; i < request.workerArguments.length; i += 2) args.set(request.workerArguments[i]!, request.workerArguments[i + 1]!);
@@ -48,7 +50,9 @@ const harness = (retainRuns = true, parentPolicy?: (root: string, workspace: str
       waitForClose: () => closed, isAlive: async () => alive, stop: async () => { await closed; } };
   });
   const manager = new AgentManager(workspace, { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent: 1, budgetUsd: 0, retainRuns },
-    { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root, onTerminalNotice: notice => { notices.push(notice); } });
+    { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root, onTerminalNotice: notice => { notices.push(notice); },
+      ...(nats ? { meshTransport: { ...DEFAULT_FABRIC_CONFIG.mesh, transport: "nats" as const },
+        taskPresence: { async publishBeforeLaunch() {}, async withdraw() {} } } : {}) });
   managers.push(manager);
   const finish = (id: string, text: string) => {
     const receipt = saveFinalAnswerReceipt(path.join(root, id), id, text);
@@ -64,6 +68,63 @@ const waitUntil = async (condition: () => boolean) => {
 };
 const sender = { id: "session:original-sender", name: "Original", kind: "main" as const, verified: "mesh" as const };
 const provenance = { v: 1 as const, channel: "fabric" as const, via: "steer" as const, sender };
+
+// Keep: central control custody and idempotent owner admission are a data-safety boundary.
+// The native launch/presence seams are recorded; the manager and control filesystem are real.
+// Real central publication must rename outside TMPDIR; local deletion policy forbids that path.
+describe.skipIf(process.env.GITHUB_ACTIONS !== "true")("NATS custody in the central control namespace after main merge", () => {
+  it("retries a sync-uncertain keyed admission once, rejects changed input, and keeps FILE semantics", async () => {
+    const h = harness(true, undefined, true);
+    const handle = await h.manager.spawn({ task: "NATS custody", transport: "process" });
+    const directory = path.join(h.root, handle.id), journal = taskSteerFile(directory);
+    const sync = vi.spyOn(fs, "fdatasyncSync").mockImplementationOnce(() => { throw new Error("injected sync uncertainty"); });
+    const key = { idempotencyKey: "same-owner-command" };
+    expect(() => h.manager.steer(handle.id, "one logical input", undefined, provenance, key))
+      .toThrow(expect.objectContaining({ code: "FABRIC_TASK_CUSTODY_UNCERTAIN" }));
+    sync.mockRestore();
+    const receipt = h.manager.steer(handle.id, "one logical input", undefined, provenance, key);
+    expect(h.manager.steer(handle.id, "one logical input", undefined, provenance, key).messageId).toBe(receipt.messageId);
+    expect(() => h.manager.steer(handle.id, "changed input", undefined, provenance, key))
+      .toThrow(expect.objectContaining({ code: "FABRIC_CONTROL_ID_CONFLICT" }));
+    expect(fs.readFileSync(journal, "utf8").trim().split("\n").map(line => JSON.parse(line)))
+      .toEqual([expect.objectContaining({ id: receipt.messageId, message: "one logical input" })]);
+    expect(readTerminalAdmissions(directory).byId.has(receipt.messageId)).toBe(true);
+    expect(fs.existsSync(path.join(directory, "steer.jsonl"))).toBe(false);
+    h.finish(handle.id, "done"); h.close(handle.id);
+
+    const file = harness(), ordinary = await file.manager.spawn({ task: "FILE counterexample", transport: "process" });
+    const first = file.manager.steer(ordinary.id, "same input", undefined, provenance, key);
+    expect(file.manager.steer(ordinary.id, "same input", undefined, provenance, key).messageId).not.toBe(first.messageId);
+    file.finish(ordinary.id, "done"); file.close(ordinary.id);
+  });
+
+  it("retries a tracked follow-up without extending its deadline or duplicating its central row", async () => {
+    const h = harness(true, undefined, true), handle = await h.manager.spawn({ task: "NATS follow-up", transport: "process" });
+    const key = { idempotencyKey: "same-follow-up" };
+    const first = h.manager.followUp(handle.id, "later", undefined, provenance, { deadlineMs: 60_000 }, key);
+    const retry = h.manager.followUp(handle.id, "later", undefined, provenance, { deadlineMs: 120_000 }, key);
+    expect(retry).toMatchObject({ messageId: first.messageId, deadlineAt: first.deadlineAt });
+    expect(fs.readFileSync(taskSteerFile(path.join(h.root, handle.id)), "utf8").trim().split("\n")).toHaveLength(1);
+    h.finish(handle.id, "done"); h.close(handle.id);
+  });
+
+  it("attributes a final-answer race during NATS append to the original sender before native exit", async () => {
+    const h = harness(true, undefined, true), handle = await h.manager.spawn({ task: "NATS final race", transport: "process" });
+    const journal = taskSteerFile(path.join(h.root, handle.id)), write = fs.writeSync;
+    let final: ReturnType<typeof h.finish> | undefined;
+    const append = vi.spyOn(fs, "writeSync").mockImplementation(((fd: number, ...args: unknown[]) => {
+      if (!final && fs.fstatSync(fd).ino === fs.statSync(journal).ino) final = h.finish(handle.id, "done");
+      return (write as (...args: unknown[]) => number)(fd, ...args);
+    }) as typeof fs.writeSync);
+    const receipt = h.manager.steer(handle.id, "racing input", undefined, provenance, { idempotencyKey: "race" });
+    append.mockRestore();
+    expect(receipt.undelivered).toMatchObject({ code: "FABRIC_TARGET_TERMINAL", delivery: "steer", sender,
+      messageId: receipt.messageId, finalAnswerReceiptId: final!.id });
+    expect(h.manager.hasRunCustody(handle.id)).toBe(true);
+    expect((await h.manager.wait(handle.id)).text).toBe("done");
+    h.close(handle.id);
+  });
+});
 
 describe("steer/followUp after an ordinary Pi task's final answer", () => {
   it.each(["steer", "followUp"] as const)("%s: final recorded between ingress pre-check and append is run-ended in the receipt and status, before native exit", async kind => {

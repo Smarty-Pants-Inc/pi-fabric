@@ -503,9 +503,12 @@ export const FABRIC_RETENTION_SWEEP_LOCK_ALARM_TOPIC = "fabric.alarm.retention-s
 export const ACTOR_CONTEXT_RESET_RATIO = 0.8;
 /** One explicit notice per event that overflowed a fresh session, on the actor's own output path. */
 export const ACTOR_ACTIVATION_OVERFLOW_KIND = "actor.activation.overflow";
+/** Stable public refusal code for an activation item that cannot fit a fresh session. */
+export const ACTOR_CONTEXT_OVERFLOW_ITEM_CODE = "context-overflow-item";
 /** A failed run the worker typed CONTEXT_OVERFLOW, carried to the drain's failure notice (smarty-dev#3238). */
 class ActorContextOverflowError extends Error {
   readonly code = "CONTEXT_OVERFLOW";
+  readonly data = { code: ACTOR_CONTEXT_OVERFLOW_ITEM_CODE, errorCode: this.code } as const;
 }
 export const ACTOR_ACTIVATION_OVERFLOW_REASON = "no verdict (context overflow)";
 const refRecord = (value: unknown): Record<string, unknown> | undefined =>
@@ -5044,7 +5047,7 @@ export class ActorManager {
                 createdAt: Date.now(),
                 action: "silent",
                 error: reason,
-                data: { runError: reason, runId: result.id, ...(contextOverflow ? { errorCode: "CONTEXT_OVERFLOW" } : {}) },
+                data: { runError: reason, runId: result.id, ...(contextOverflow ? { code: ACTOR_CONTEXT_OVERFLOW_ITEM_CODE, errorCode: "CONTEXT_OVERFLOW" } : {}) },
                 runId: result.id,
                 usage: result.usage,
               };
@@ -5242,7 +5245,7 @@ export class ActorManager {
             source: item.source,
             createdAt: Date.now(),
             error: message,
-            ...(error instanceof ActorContextOverflowError ? { data: { errorCode: error.code } } : {}),
+            ...(error instanceof ActorContextOverflowError ? { data: error.data } : {}),
           };
           this.#recordMessage(this.#liveActor(actor), failed);
           item.reject?.(error instanceof ActorContextOverflowError ? error : new Error(message));
@@ -5402,7 +5405,8 @@ export class ActorManager {
       from: { id: actor.id, name: actor.name, kind: "actor", sessionId: this.sessionId },
       text: `${actor.name}: ${ACTOR_ACTIVATION_OVERFLOW_REASON}${where}.`,
       data: { actorId: actor.id, actorName: actor.name, eventRef, reason: ACTOR_ACTIVATION_OVERFLOW_REASON,
-        ...(runId ? { runId } : {}), error: actorAlarmReason("context-overflow") },
+        code: ACTOR_CONTEXT_OVERFLOW_ITEM_CODE, error: actorAlarmReason("context-overflow"),
+        ...(runId ? { runId } : {}) },
     }).catch(() => undefined);
   }
 
@@ -5480,12 +5484,12 @@ export class ActorManager {
     const notice: FabricActorMessage = {
       id: randomUUID(), actorId: actor.id, actorName: actor.name, direction: "out",
       source: "fabric-host", createdAt: Date.now(), action: "message", text,
-      ...(contextOverflow ? { data: { reason: "context_window", ...(runId ? { runId } : {}) } } : {}),
+      ...(contextOverflow ? { data: { code: ACTOR_CONTEXT_OVERFLOW_ITEM_CODE, errorCode: "CONTEXT_OVERFLOW", reason: "context_window", ...(runId ? { runId } : {}) } } : {}),
     };
     if (contextOverflow) {
       this.#recordMessage(this.#liveActor(actor), notice);
       void this.mesh.publish({ topic: "ops.owner", kind: "actor.alarm", from: this.identity, to: actor.rootId,
-        text, data: { actorId: actor.id, reason: "context_window", ...(runId ? { runId } : {}) } }).catch(() => undefined);
+        text, data: { actorId: actor.id, code: ACTOR_CONTEXT_OVERFLOW_ITEM_CODE, errorCode: "CONTEXT_OVERFLOW", reason: "context_window", ...(runId ? { runId } : {}) } }).catch(() => undefined);
     }
     void this.#publishNotification({
       topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, kind: "actor-activation-blocked", from: this.identity,

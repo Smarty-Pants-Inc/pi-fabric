@@ -1,8 +1,3 @@
-import { spawn, type ChildProcess } from "node:child_process";
-import { createServer } from "node:net";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
-import os from "node:os";
-import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { AckPolicy, DeliverPolicy, ReplayPolicy } from "@nats-io/jetstream";
 import { openNatsConnection } from "../src/transport/nats/connection.js";
@@ -14,7 +9,7 @@ import {
 import { openNatsTransport } from "../src/transport/nats/inbox.js";
 import { consumeDeadLetters, type DeadLetterEnvelope } from "../src/transport/nats/dead-letter.js";
 import { runTransportAdmin } from "../src/transport/nats/admin.js";
-import { createPathBHarness, PATH_B_MACHINES, resolveNatsBinary } from "./helpers/nats-cluster.js";
+import { createPathBHarness, openJetStream, PATH_B_MACHINES, resolveNatsBinary, type PathBHarness } from "./helpers/nats-cluster.js";
 import { ensureTransportConsumer } from "../src/transport/nats/provision.js";
 import {
   transportAdvisoryStreamSubject,
@@ -26,72 +21,51 @@ import {
 const binary = resolveNatsBinary() ?? "";
 if (!binary && process.env.NATS_AUTH_REQUIRED === "1") throw new Error("NATS_AUTH_REQUIRED=1 but no nats-server executable was found");
 const wait = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
-const freePort = async (): Promise<number> => {
-  const server = createServer();
-  await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve); });
-  const address = server.address();
-  if (!address || typeof address === "string") throw new Error("port reservation failed");
-  await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
-  return address.port;
-};
-const ready = async (url: string, child: ChildProcess): Promise<void> => {
-  const deadline = Date.now() + 20_000;
-  while (Date.now() < deadline) {
-    if (child.exitCode !== null || child.signalCode !== null) throw new Error("nats-server exited before readiness");
-    try {
-      const response = await fetch(`${url}/healthz?js-enabled-only=true`);
-      if (response.status === 200) return;
-    } catch { /* server is still starting */ }
-    await wait(100);
-  }
-  throw new Error("nats-server readiness timeout");
-};
 
-let root = "";
-let server: ChildProcess | undefined;
-let serverUrl = "";
+// Formerly an anonymous server with verifyMachine:false; now the scoped Path B fixture with real agent
+// credentials, exact policy and the test-only loopback opt-in. Fixture-only bootstrap inspects config.
+let shared: PathBHarness;
 const transports: Array<{ close(): Promise<void> }> = [];
+
+const provisionAs = async (fixture: PathBHarness): Promise<void> => {
+  for (const [name, value] of Object.entries(fixture.adminEnv(fixture.users.bootstrap))) vi.stubEnv(name, value);
+  try {
+    expect(await runTransportAdmin(["provision", "--allow-insecure-loopback", "--machines", PATH_B_MACHINES.join(",")])).toBe(0);
+  } finally { vi.unstubAllEnvs(); }
+};
 
 beforeAll(async () => {
   if (!binary) return;
-  root = mkdtempSync(path.join(process.env.TMPDIR || os.tmpdir(), "pi-fabric-nats-transport-"));
-  mkdirSync(path.join(root, "store"), { mode: 0o700 });
-  const port = await freePort();
-  const monitor = await freePort();
-  serverUrl = `nats://127.0.0.1:${port}`;
-  const config = `port: ${port}\nhttp: ${monitor}\njetstream: {store_dir: ${JSON.stringify(path.join(root, "store"))}, sync_interval: always}\n`;
-  const configPath = path.join(root, "nats.conf");
-  writeFileSync(configPath, config, { mode: 0o600 });
-  server = spawn(binary, ["-c", configPath], { cwd: root, stdio: ["ignore", "pipe", "pipe"] });
-  await ready(`http://127.0.0.1:${monitor}`, server);
+  shared = await createPathBHarness({ binary });
+  await provisionAs(shared);
 }, 30_000);
 
 afterAll(async () => {
   await Promise.all(transports.map((transport) => transport.close()));
-  if (server && server.exitCode === null && server.signalCode === null) {
-    server.kill("SIGTERM");
-    await new Promise<void>((resolve) => server!.once("exit", () => resolve()));
-  }
-  if (root) rmSync(root, { recursive: true, force: true });
+  await shared?.stop();
 });
 
 describe.skipIf(!binary)("real nats-server Path B module", () => {
-  it("requires the USER.INFO machine check unless explicitly disabled", async () => {
-    await expect(openNatsConnection({ servers: serverUrl, name: "test-user-info", machine: "ryzen1" })).rejects.toThrow();
-    const connection = await openNatsConnection({ servers: serverUrl, name: "test-user-info-disabled", machine: "ryzen1", verifyMachine: false });
+  it("requires the USER.INFO machine check with no runtime bypass", async () => {
+    const { credentials: _unused, ...anonymous } = shared.runtimeOptions(shared.users.machineA);
+    await expect(openNatsConnection({ ...anonymous, name: "test-user-info" } as unknown as Parameters<typeof openNatsConnection>[0])).rejects.toThrow();
+    await expect(openNatsConnection({ ...shared.runtimeOptions(shared.users.machineA), machine: "machine-b" })).rejects.toThrow();
+    await expect(openNatsConnection({ ...shared.runtimeOptions(shared.users.machineB), name: "test-user-info-bypass",
+      verifyMachine: false, machine: "machine-a" } as unknown as Parameters<typeof openNatsConnection>[0])).rejects.toThrow();
+    const connection = await openNatsConnection({ ...shared.runtimeOptions(shared.users.machineA), name: "test-user-info" });
+    expect(connection.userInfo).toBeDefined();
     await connection.close();
   });
 
   it("checks bounded provisioning order and reads the actual consumer configuration", async () => {
     const transport = await openNatsTransport({
-      servers: serverUrl,
-      machine: "ryzen1",
+      ...shared.runtimeOptions(shared.users.machineA),
       hostId: "runtime-provision",
       name: "test-provision",
-      verifyMachine: false,
     });
     transports.push(transport);
-    const admin = await openNatsConnection({ servers: serverUrl, name: "test-inspector", verifyMachine: false });
+    const inspector = await shared.connect(shared.users.bootstrap);
+    const admin = await openJetStream(inspector);
     try {
       const advisory = await admin.manager.streams.info("FABRIC_ADV");
       expect(advisory.config.subjects).toEqual([transportAdvisoryStreamSubject]);
@@ -100,7 +74,7 @@ describe.skipIf(!binary)("real nats-server Path B module", () => {
       expect(advisory.config.discard).toBe("new");
       expect(advisory.config.max_age).toBe(30 * 24 * 60 * 60 * 1_000 * 1_000_000);
 
-      const inbox = await admin.manager.streams.info(transportInboxStream("ryzen1"));
+      const inbox = await admin.manager.streams.info(transportInboxStream("machine-a"));
       expect(inbox.config.max_age).toBe(0);
       expect(inbox.config.max_bytes).toBe(1_073_741_824);
       expect(inbox.config.max_msg_size).toBe(1_048_576);
@@ -108,9 +82,9 @@ describe.skipIf(!binary)("real nats-server Path B module", () => {
 
       const durable = transportDurableName("runtime-provision");
       const consumer = await ensureTransportConsumer(admin.manager.consumers, {
-        stream: transportInboxStream("ryzen1"),
+        stream: transportInboxStream("machine-a"),
         durable,
-        filterSubject: transportInboxFilter("ryzen1", "runtime-provision"),
+        filterSubject: transportInboxFilter("machine-a", "runtime-provision"),
         description: "test consumer",
         maxAckPending: 128,
       });
@@ -120,26 +94,27 @@ describe.skipIf(!binary)("real nats-server Path B module", () => {
       expect(consumer.config.max_deliver).toBe(5);
       expect(consumer.config.max_ack_pending).toBe(128);
       expect(consumer.config.inactive_threshold ?? 0).toBe(0);
-      expect(consumer.config.filter_subject).toBe(transportInboxFilter("ryzen1", "runtime-provision"));
+      expect(consumer.config.filter_subject).toBe(transportInboxFilter("machine-a", "runtime-provision"));
       expect(await transport.drainState()).toEqual({ pending: 0, ackPending: 0 });
     } finally {
-      await admin.close();
+      await inspector.close();
     }
   }, 30_000);
 
   it("refuses a pre-existing runtime durable with a broader inbox filter", async () => {
-    const admin = await openNatsConnection({ servers: serverUrl, verifyMachine: false });
+    const inspector = await shared.connect(shared.users.bootstrap);
+    const admin = await openJetStream(inspector);
     try {
       const hostId = "runtime-drifted-consumer";
-      await admin.manager.consumers.add(transportInboxStream("ryzen1"), {
-        durable_name: transportDurableName(hostId), filter_subject: "fabric.in.ryzen1.>", ack_policy: AckPolicy.Explicit,
+      await admin.manager.consumers.add(transportInboxStream("machine-a"), {
+        durable_name: transportDurableName(hostId), filter_subject: "fabric.in.machine-a.>", ack_policy: AckPolicy.Explicit,
         deliver_policy: DeliverPolicy.All,
         replay_policy: ReplayPolicy.Instant,
         ack_wait: 30_000_000_000, max_deliver: 5, backoff: [30_000_000_000, 30_000_000_000, 30_000_000_000, 30_000_000_000, 30_000_000_000], max_ack_pending: 128, max_waiting: 1,
       });
-      await expect(openNatsTransport({ servers: serverUrl, machine: "ryzen1", hostId, verifyMachine: false })).rejects.toThrow("consumer configuration mismatch");
-      expect((await admin.manager.consumers.info(transportInboxStream("ryzen1"), transportDurableName(hostId))).config.filter_subject).toBe("fabric.in.ryzen1.>");
-    } finally { await admin.close(); }
+      await expect(openNatsTransport({ ...shared.runtimeOptions(shared.users.machineA), hostId })).rejects.toThrow("consumer configuration mismatch");
+      expect((await admin.manager.consumers.info(transportInboxStream("machine-a"), transportDurableName(hostId))).config.filter_subject).toBe("fabric.in.machine-a.>");
+    } finally { await inspector.close(); }
   });
 
   it("sends, dedupes, redelivers, confirms ACKs and captures max-delivery advisories", async () => {
@@ -148,19 +123,12 @@ describe.skipIf(!binary)("real nats-server Path B module", () => {
     const opened: Array<{ close(): Promise<void> }> = [];
     const signal = new AbortController();
     try {
-      vi.stubEnv("PI_FABRIC_MACHINE", fixture.users.bootstrap.machine);
-      vi.stubEnv("PI_FABRIC_NATS_SERVERS", fixture.serverUrl);
-      vi.stubEnv("PI_FABRIC_NATS_CREDENTIALS", fixture.users.bootstrap.credsPath);
-      await runTransportAdmin(["provision", "--machines", PATH_B_MACHINES.join(",")]);
-      vi.unstubAllEnvs();
-      const sender = await openNatsTransport({ servers: fixture.serverUrl, machine: "machine-a", hostId: "sender-messages",
-        credentials: fixture.users.machineA.credsPath });
+      await provisionAs(fixture);
+      const sender = await openNatsTransport({ ...fixture.runtimeOptions(fixture.users.machineA), hostId: "sender-messages" });
       opened.push(sender);
-      const receiver = await openNatsTransport({ servers: fixture.serverUrl, machine: "machine-b", hostId: "receiver-messages",
-        credentials: fixture.users.machineB.credsPath });
+      const receiver = await openNatsTransport({ ...fixture.runtimeOptions(fixture.users.machineB), hostId: "receiver-messages" });
       opened.push(receiver);
-      const operator = await openNatsConnection({ servers: fixture.serverUrl, machine: fixture.users.maintainer.machine,
-        credentials: fixture.users.maintainer.credsPath });
+      const operator = await openNatsConnection(fixture.operatorOptions());
       opened.push(operator);
       expect((await operator.manager.consumers.info("FABRIC_ADV", "transport_dlq_operator")).config.ack_policy).toBe(AckPolicy.None);
       const iterator = receiver.inbox(signal.signal)[Symbol.asyncIterator]();
@@ -206,11 +174,9 @@ describe.skipIf(!binary)("real nats-server Path B module", () => {
 
   it("uses fixed bucket TTLs, CAS heartbeats, takeover after expiry, and a ready presence watch", async () => {
     const transport = await openNatsTransport({
-      servers: serverUrl,
-      machine: "ryzen2",
+      ...shared.runtimeOptions(shared.users.machineA),
       hostId: "runtime-kv",
       name: "test-kv",
-      verifyMachine: false,
     });
     transports.push(transport);
     const leases = transport.kv("leases");
@@ -218,7 +184,7 @@ describe.skipIf(!binary)("real nats-server Path B module", () => {
     expect(leases.ttlMs).toBe(LEASE_TTL_MS);
     expect(presence.ttlMs).toBe(PRESENCE_TTL_MS);
 
-    const leaseKey = "ryzen2.h.lease-test";
+    const leaseKey = "machine-a.h.lease-test";
     const first = await leases.put(leaseKey, "runtime-kv#one", { pid: 1 }, 0);
     expect((await leases.get<{ pid: number }>(leaseKey))?.value).toEqual({ pid: 1 });
     await expect(leases.put(leaseKey, "runtime-kv#two", { pid: 2 }, first - 1)).rejects.toMatchObject({ code: "FABRIC_KV_CONFLICT" });
@@ -227,9 +193,9 @@ describe.skipIf(!binary)("real nats-server Path B module", () => {
     expect(await leases.delete(leaseKey, renewed)).toBe(true);
 
     const controller = new AbortController();
-    const iterator = presence.watch("ryzen2.>", controller.signal)[Symbol.asyncIterator]();
+    const iterator = presence.watch("machine-a.>", controller.signal)[Symbol.asyncIterator]();
     expect(await iterator.next()).toEqual({ done: false, value: { type: "ready" } });
-    const presenceKey = "ryzen2.p.participant-test";
+    const presenceKey = "machine-a.p.participant-test";
     const presenceRevision = await presence.put(presenceKey, "runtime-kv#one", { live: true }, 0);
     expect((await iterator.next()).value).toMatchObject({ type: "put", entry: { key: presenceKey, revision: presenceRevision } });
     expect(await presence.delete(presenceKey, presenceRevision)).toBe(true);
@@ -237,17 +203,19 @@ describe.skipIf(!binary)("real nats-server Path B module", () => {
     controller.abort();
     await iterator.return?.();
 
-    const admin = await openNatsConnection({ servers: serverUrl, name: "test-kv-expiry", verifyMachine: false });
+    // Bucket creation is administration: the fixture-only bootstrap owns this custom-TTL bucket.
+    const inspector = await shared.connect(shared.users.bootstrap);
     try {
+      const admin = await openJetStream(inspector);
       const bucket = `TEST_LEASE_${Date.now()}`;
-      const expiring = (await openNatsKv(admin.js, { bucket, ttlMs: 1_000, markerTtlMs: 1_000 })).withMachine("ryzen2");
-      const key = "ryzen2.h.takeover-test";
+      const expiring = (await openNatsKv(admin.js, { bucket, ttlMs: 1_000, markerTtlMs: 1_000 })).withMachine("machine-a");
+      const key = "machine-a.h.takeover-test";
       await expiring.put(key, "runtime-kv#one", { pid: 1 }, 0);
       await wait(2_500);
       expect(await expiring.get(key)).toBeUndefined();
       expect(await expiring.put(key, "runtime-kv#two", { pid: 2 }, 0)).toBeGreaterThan(0);
     } finally {
-      await admin.close();
+      await inspector.close();
     }
   }, 30_000);
 });

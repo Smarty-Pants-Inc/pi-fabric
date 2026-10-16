@@ -133,8 +133,8 @@ const proxies: WireFaults[] = [];
 let inspector: NatsConnectionHandle;
 
 async function open(user: PathBUser, hostId: string, overrides: Partial<NatsTransportOptions> = {}): Promise<FabricTransport> {
-  const transport = await openNatsTransport({ servers: fixture.serverUrl, machine: user.machine, hostId,
-    credentials: user.credsPath, requestTimeoutMs: 1_500, ...overrides });
+  const transport = await openNatsTransport({ ...fixture.runtimeOptions(user), hostId,
+    requestTimeoutMs: 1_500, ...overrides });
   transports.push(transport);
   return transport;
 }
@@ -171,7 +171,7 @@ describe.skipIf(!binary)("real machine-authenticated inbox faults", () => {
     const manager = await jetstreamManager(bootstrap);
     const js = jetstream(bootstrap);
     // Bootstrap only seeds resources. All product send/pull/ACK/drain calls below use
-    // the unmodified, real machine credentials and verifyMachine=true (the default).
+    // the unmodified, real machine credentials, exact policy and strict agent verification.
     await ensureTransportStream(manager, { name: "FABRIC_ADV", subjects: ["$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES.>"],
       maxBytes: 64 * 1024 * 1024, maxAgeMs: 30 * 24 * 60 * 60_000, maxMessageBytes: 64 * 1024, duplicateWindowMs: 600_000 });
     await openNatsKvForMachine(js, "leases", "machine-a");
@@ -180,7 +180,7 @@ describe.skipIf(!binary)("real machine-authenticated inbox faults", () => {
       name: transportInboxStream(user.machine), subjects: [transportInboxStreamSubject(user.machine)],
       maxBytes: MAX_BYTES, maxAgeMs: 0, maxMessageBytes: MAX_MESSAGE_BYTES, duplicateWindowMs: 600_000, replicas: 1,
     })));
-    inspector = await openNatsConnection({ servers: fixture.serverUrl, credentials: fixture.users.maintainer.credsPath });
+    inspector = await openNatsConnection(fixture.operatorOptions());
   }, 60_000);
 
   afterEach(async () => {
@@ -264,7 +264,7 @@ describe.skipIf(!binary)("real machine-authenticated inbox faults", () => {
     const before = await consumerInfo(receiver);
     await Promise.all([sender.close(), receiver.close(), inspector.close()]);
     await fixture.restart();
-    inspector = await openNatsConnection({ servers: fixture.serverUrl, credentials: fixture.users.maintainer.credsPath });
+    inspector = await openNatsConnection(fixture.operatorOptions());
     const reopened = await open(fixture.users.machineB, "restart-receiver");
     const rebound = await consumerInfo(reopened);
     expect(rebound.name).toBe(before.name);
@@ -340,8 +340,7 @@ describe.skipIf(!binary)("real machine-authenticated inbox faults", () => {
   }, 15_000);
 
   it("enforces E14/E16's operator USER.INFO grant boundary (legacy broad fixture is explicitly refused)", async () => {
-    const checking = openNatsConnection({ servers: fixture.serverUrl, credentials: fixture.users.maintainer.credsPath,
-      machine: fixture.users.maintainer.machine });
+    const checking = openNatsConnection(fixture.operatorOptions());
     if (!/^fabric-ops(?:-[a-z0-9]+)?$/.test(fixture.users.maintainer.machine)) {
       // This worktree predates the parent-owned E14 helper change. It must not turn the
       // legacy broad ACK grant into an exception to the new verification boundary.
@@ -436,13 +435,13 @@ describe.skipIf(!binary)("real machine-authenticated inbox faults", () => {
     const initial = (await inspector.manager.streams.info(transportInboxStream("machine-b"))).state.last_seq;
     await expect(sender.send(envelope(sender, receiver, "oversize-local", "x".repeat(MAX_MESSAGE_BYTES))))
       .rejects.toMatchObject({ code: "FABRIC_TRANSPORT_INVALID", persisted: false });
-    // E19 removed even KV read authority from the operator. A deliberately bypassed
-    // USER.INFO check cannot turn that report-only credential into a runtime: binding
-    // its required KV resources is broker-denied before any private command publish.
+    // E19 removed even KV read authority from the operator. An unknown verifyMachine:false
+    // property cannot turn that report-only credential into a runtime: the strict agent
+    // check refuses it before any private command publish (no runtime bypass remains).
     const prepared = await open(fixture.users.machineA, "denied-publisher");
     await prepared.close();
-    await expect(open(fixture.users.maintainer, "denied-publisher", { machine: "machine-a", verifyMachine: false }))
-      .rejects.toThrow(/permission|authorization/i);
+    await expect(open(fixture.users.maintainer, "denied-publisher", { machine: "machine-a", verifyMachine: false } as Partial<NatsTransportOptions>))
+      .rejects.toThrow();
     expect((await inspector.manager.streams.info(transportInboxStream("machine-b"))).state.last_seq).toBe(initial);
 
     // Keep every frozen stream property. Capacity is exhausted by real file-backed bytes,

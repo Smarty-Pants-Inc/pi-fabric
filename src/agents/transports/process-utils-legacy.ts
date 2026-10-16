@@ -287,7 +287,7 @@ export const spawnDetached = async (
   /** Ordinary workers need time to run their five-second execution-child cleanup. */
   termGraceMs = STOP_TERM_MS,
   executionCustodian = false,
-): Promise<{ pid: number; closed: Promise<void>; stop(): Promise<void>; isAlive(): Promise<boolean>; lostContact(): string | undefined; stopDebt?(): string | undefined; waitForClose(): Promise<void> }> => {
+): Promise<{ pid: number; closed: Promise<void>; primaryExit?: Promise<void>; stop(): Promise<void>; isAlive(): Promise<boolean>; lostContact(): string | undefined; stopDebt?(): string | undefined; forcedCleanupCount?(): number; remainingDescendantCount?(): number; waitForClose(): Promise<void> }> => {
   const runtime = await resolveScriptRuntime(runtimeOptionsForWorker(workerPath));
   const treeOwner = process.platform === "linux" ? await import("../../residency/launcher-owner.js") : undefined;
   assertTransportLaunchAllowed(authority);
@@ -321,9 +321,14 @@ export const spawnDetached = async (
   // Exit is latched: after the worker/group empties its numeric id is not identity.
   let exited = false;
   let force: ReturnType<typeof setTimeout> | undefined;
-  child.once("exit", () => { exited = true; clearTimeout(force); });
-  const closed = new Promise<void>((resolve) => child.once("close", () => resolve()));
+  const primaryExit = new Promise<void>(resolve => child.once("exit", () => {
+    exited = true; clearTimeout(force); resolve();
+  }));
+  let nativeClosed = false;
+  const closed = new Promise<void>((resolve) => child.once("close", () => { nativeClosed = true; resolve(); }));
+  const forcedDescendants = new Set<string>();
   let stopping: Promise<void> | undefined;
+  const passiveCloseWakeups = new Set<() => void>();
   let lost: string | undefined;
   const unconfirmed = (reason: string): void => {
     if (lost !== undefined) return;
@@ -440,9 +445,9 @@ export const spawnDetached = async (
     if (process.platform === "linux") members();
     else if (process.platform !== "win32") await portableMembers();
     const settled = async (): Promise<boolean> => {
-      if (process.platform === "linux") return members().length === 0 && exited && !(executionPending && groups.size === 1);
+      if (process.platform === "linux") return members().length === 0 && nativeClosed && !(executionPending && groups.size === 1);
       const remaining = process.platform === "win32" ? [] : await portableMembers();
-      if (!exited || executionPending || portableUncertain) return false;
+      if (!nativeClosed || executionPending || portableUncertain) return false;
       return remaining.length === 0;
     };
     const signal = (value: NodeJS.Signals): void => {
@@ -458,6 +463,11 @@ export const spawnDetached = async (
         // Refresh birth anchors immediately before EACH signal, not only once
         // before signalling several independently detached execution groups.
         if (process.platform === "linux" && !members().some((member) => member.group === -target)) continue;
+        if (process.platform === "linux") {
+          for (const member of members()) if (member.group === -target && member.pid !== pid) {
+            forcedDescendants.add(`${member.pid}:${member.started}`);
+          }
+        }
         try { process.kill(target, value); }
         catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
       }
@@ -493,18 +503,34 @@ export const spawnDetached = async (
   const handle = {
     pid,
     closed,
+    ...(process.platform === "win32" ? { primaryExit } : {}),
     lostContact: () => lost,
     stopDebt: () => stopFailed ? undefined : lost,
+    forcedCleanupCount: () => forcedDescendants.size,
+    remainingDescendantCount: () => {
+      if (process.platform !== "linux") return executionPending ? 1 : 0;
+      try { return Math.max(members().filter(member => member.pid !== pid).length, executionPending ? 1 : 0); }
+      catch { return Math.max(1, owned.size - 1); }
+    },
     async waitForClose() {
+      if (stopping) { await stopping; return; }
       let deadline: ReturnType<typeof setTimeout> | undefined;
+      let wake: (() => void) | undefined;
       try {
         await Promise.race([closed, new Promise<void>(resolve => {
+          // Exact stop owns its own close/tree bound. Yield passive observers
+          // without latching debt; the manager joins its managed.processStop.
+          wake = () => { clearTimeout(deadline); resolve(); };
+          passiveCloseWakeups.add(wake);
           deadline = setTimeout(() => {
             unconfirmed("Owned process worker did not confirm native close within 7000ms");
             resolve();
           }, 7_000);
         })]);
-      } finally { clearTimeout(deadline); }
+      } finally {
+        clearTimeout(deadline);
+        if (wake) passiveCloseWakeups.delete(wake);
+      }
     },
     stop() {
       if (stopping) return stopping;
@@ -568,13 +594,17 @@ export const spawnDetached = async (
       stopping = pending;
       // POSIX ownership/exit failures remain retryable on the exact same handle.
       void pending.catch(() => { stopFailed = true; if (stopping === pending) stopping = undefined; });
+      // Publish the exact join before waking observers, and cancel their
+      // deadlines synchronously before any passive timeout can establish debt.
+      for (const wake of passiveCloseWakeups) wake();
+      passiveCloseWakeups.clear();
       return pending;
     },
     async isAlive() {
       // A dead custodian is not proof its retained execution groups stopped.
       // The manager must not use it to admit an overlapping replacement.
-      if (exited) return process.platform === "linux" ? members().length > 0 || (executionPending && groups.size === 1)
-        : executionPending || portableUncertain || (process.platform !== "win32" && (await portableMembers()).length > 0);
+      if (exited) return !nativeClosed || (process.platform === "linux" ? members().length > 0 || (executionPending && groups.size === 1)
+        : executionPending || portableUncertain || (process.platform !== "win32" && (await portableMembers()).length > 0));
       if (processIsAlive(pid)) {
         // Retain observed descendants before a launcher can exit ahead of its Pi child.
         if (process.platform === "linux") { try { members(); } catch { /* stop must fail closed */ } }
@@ -584,13 +614,11 @@ export const spawnDetached = async (
       // Gone once is gone for good: the probe can see the exit before the "exit" event
       // (Windows), and any later answer for this number is another process.
       exited = true;
-      return process.platform === "linux" ? members().length > 0 || (executionPending && groups.size === 1)
-        : executionPending || portableUncertain || (process.platform !== "win32" && (await portableMembers()).length > 0);
+      return !nativeClosed || (process.platform === "linux" ? members().length > 0 || (executionPending && groups.size === 1)
+        : executionPending || portableUncertain || (process.platform !== "win32" && (await portableMembers()).length > 0));
     },
   };
   if (scope && marker) {
-    let nativeClosed = false;
-    void closed.then(() => { nativeClosed = true; });
     const admissionDeadline = Date.now() + 5_000;
     try {
       while (!fs.existsSync(marker) && !nativeClosed && Date.now() < admissionDeadline && !authority?.signal?.aborted) {

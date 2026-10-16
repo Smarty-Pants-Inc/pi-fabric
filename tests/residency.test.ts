@@ -1486,7 +1486,8 @@ describe("durable completion receipts", () => {
     markUnresolvedWorker(seeded.runDirectory, "the Herdr server has been unreachable for 300 s");
     const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent });
     try {
-      await expect(client.cleanupAgent(seeded.id)).rejects.toThrow(/may still be running/);
+      expect(client.statusAgent(seeded.id).status).toBe("finishing");
+      await expect(client.cleanupAgent(seeded.id)).rejects.toThrow(/running durable/);
       expect(fs.existsSync(seeded.runDirectory)).toBe(true);
       expect(fs.existsSync(seeded.metadataPath)).toBe(true);
     } finally {
@@ -1607,7 +1608,8 @@ describe("durable completion receipts", () => {
     markUnresolvedWorker(path.join(seeded.runDirectory, "nested", "child"), "the Herdr server has been unreachable for 300 s");
     const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent });
     try {
-      await expect(client.cleanupAgent(seeded.id)).rejects.toThrow(/may still be running/);
+      expect(client.statusAgent(seeded.id).status).toBe("finishing");
+      await expect(client.cleanupAgent(seeded.id)).rejects.toThrow(/running durable/);
       expect(fs.existsSync(path.join(seeded.runDirectory, "nested", "child"))).toBe(true);
     } finally {
       await client.close();
@@ -1776,6 +1778,9 @@ describe("durable completion receipts", () => {
     const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent });
     try {
       expect(client.settledAgent(seeded.id)).toBeUndefined();
+      expect(client.statusAgent(seeded.id)).toMatchObject({ status: "finishing", text: "authoritative full result" });
+      expect(client.completionSettled(seeded.id)).toBe(false);
+      await expect(client.waitAgent(seeded.id, AbortSignal.timeout(30))).rejects.toThrow(/aborted/);
       const resultPath = residentResultPath(state.config.residencyRoot, seeded.id);
       fs.mkdirSync(path.dirname(resultPath), { recursive: true });
       fs.writeFileSync(resultPath, JSON.stringify({ ...seeded.result, status: "completed" }));
@@ -1783,6 +1788,43 @@ describe("durable completion receipts", () => {
       fs.rmSync(resultPath);
       fs.rmSync(ownerPath);
       expect(client.settledAgent(seeded.id)).toMatchObject({ status: "stopped" });
+    } finally {
+      await client.close();
+      await state.participants.close();
+    }
+  });
+
+  it("exposes a raw running worker's native finishing milestone without settling its result", async () => {
+    const state = await rootHarness("worker-finishing-milestone");
+    const seeded = await seedCompletion(state, "running");
+    const statusFile = path.join(seeded.runDirectory, "status.json");
+    fs.writeFileSync(statusFile, JSON.stringify({ ...seeded.result, finishingAt: Date.now() }));
+    const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent });
+    try {
+      expect(client.statusAgent(seeded.id)).toMatchObject({ status: "finishing", text: "authoritative full result" });
+      expect(client.completionSettled(seeded.id)).toBe(false);
+      await expect(client.waitAgent(seeded.id, AbortSignal.timeout(30))).rejects.toThrow(/aborted/);
+      fs.writeFileSync(statusFile, JSON.stringify({ ...seeded.result, status: "completed" }));
+      expect((await client.waitAgent(seeded.id)).status).toBe("completed");
+    } finally {
+      await client.close();
+      await state.participants.close();
+    }
+  });
+
+  it("masks an orphan terminal process candidate while persisted tree custody still sees a live writer", async () => {
+    const state = await rootHarness("orphan-finishing-tree");
+    const seeded = await seedCompletion(state);
+    const statusFile = path.join(seeded.runDirectory, "status.json");
+    fs.writeFileSync(statusFile, JSON.stringify({ ...seeded.result, sessionId: String(process.pid) }));
+    const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent });
+    try {
+      expect(client.statusAgent(seeded.id)).toMatchObject({ status: "finishing", text: "authoritative full result" });
+      expect(client.completionSettled(seeded.id)).toBe(false);
+      await expect(client.waitAgent(seeded.id, AbortSignal.timeout(30))).rejects.toThrow(/aborted/);
+      fs.writeFileSync(statusFile, JSON.stringify(seeded.result)); // captured persisted writer is now absent
+      expect(client.statusAgent(seeded.id).status).toBe("completed");
+      expect((await client.waitAgent(seeded.id)).status).toBe("completed");
     } finally {
       await client.close();
       await state.participants.close();

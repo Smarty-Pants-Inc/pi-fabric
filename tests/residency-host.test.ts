@@ -444,6 +444,100 @@ describe("resident actor spawn router attribution", () => {
   });
 });
 
+describe("resident default cwd attribution", () => {
+  it("attributes omitted durable cwd from a Main subdir while refusing an explicit cwd change", async () => {
+    const { root, config, host } = fixture({}, true);
+    const mainCwd = path.join(root, "subdir");
+    fs.mkdirSync(mainCwd);
+    const binding = { model: "fixture/visible", thinking: "medium" as const };
+    config.cwd = root; config.projectRoot = root;
+    config.workerPath = path.resolve("tests/fixtures/fake-worker.mjs");
+    config.agents = { ...config.agents, ...binding, budgetUsd: 0, maxConcurrent: 1,
+      transport: "process", extensions: false, sessionExport: false };
+    config.piModels = { available: [{ provider: "fixture", id: "visible" }], aliases: {}, defaultModel: binding.model };
+    fs.writeFileSync(path.join(config.residencyRoot, "config.json"), JSON.stringify(config));
+    const { AgentManager } = await import("../src/agents/manager.js");
+    const mainManager = new AgentManager(mainCwd, config.agents, {
+      runRoot: path.join(root, "main-runs"), meshRoot: config.meshRoot, workerPath: config.workerPath,
+      mainAgentId: config.rootId, hostId: config.rootId, identityId: config.rootId,
+    });
+    const identity = { id: config.rootId, name: "Main", kind: "main" as const, sessionId: config.sessionId };
+    const mesh = new MeshStore(config.meshRoot, 65536, 1000);
+    const participants = new ParticipantDirectory(mesh, {
+      enabled: true, hostId: config.rootId, rootId: config.rootId, identity,
+    });
+    const caller: ResidentRouterCaller = { id: config.rootId, rootId: config.rootId, sessionId: config.sessionId,
+      ownerHostId: config.rootId, ownerIdentityId: config.rootId, kind: "root" };
+    participants.registerSource(() => [{
+      ...caller, format: 1, name: "Main", status: "idle", residency: "session", runner: "pi", transport: "host",
+      cwd: mainManager.cwd, capabilities: [], startedAt: Date.now(), updatedAt: Date.now(), controlProtocol: "v1",
+    }]);
+    const client = new ResidencyClient({ config, mesh, participants, commandTimeoutMs: 5_000,
+      mainAgent: { id: config.rootId, local: true } as FabricMainAgentTarget });
+    const actors = new ResidentActorClient(config.meshRoot, config.rootId, 5_000);
+    const ledger = (): Array<Record<string, unknown>> => fs.readFileSync(path.join(config.meshRoot, "router", "decisions.jsonl"), "utf8")
+      .trim().split("\n").map(line => JSON.parse(line));
+    const issue = async (kind: "spawn" | "actor", request: {
+      name: string; task?: string; instructions?: string; cwd?: string; residency: "durable";
+      model: string; thinking: "medium";
+    }) => {
+      const role = kind === "spawn" ? "task-agent" : "actor";
+      const routed = await routeAgentCreation({ config: { command: [], mode: "shadow" }, meshRoot: config.meshRoot,
+        kind, role, name: request.name, cwd: kind === "spawn" ? await mainManager.resolveCwd(request.cwd) : mainManager.cwd,
+        project: root, task: request.task ?? request.instructions ?? "", parentId: caller.id, defaults: binding,
+        explicit: true, validateModel: model => model,
+        admission: { mesh, requesterSessionId: caller.sessionId, role, targetRootId: config.rootId, targetHostId: host.hostId },
+        admissionRequest: request, admissionCwd: mainManager.cwd });
+      expect(routed).toBeDefined();
+      return routed!.decisionId;
+    };
+    try {
+      await participants.start(); await host.start();
+      expect(mainManager.cwd).toBe(mainCwd);
+      expect(host.agents.cwd).toBe(root);
+      const task = { name: "default-cwd-task", task: "Private durable cwd fixture task.", residency: "durable" as const, ...binding };
+      const taskDecision = await issue("spawn", task);
+      const routedTask = { ...task, spawnRouterDecisionId: taskDecision };
+      const launched = await client.spawnAgent(routedTask);
+      expect(await host.agents.wait(launched.id)).toMatchObject({ status: "completed", cwd: fs.realpathSync(root) });
+      const actor = { name: "default-cwd-actor", instructions: "Private idle cwd fixture actor.", residency: "durable" as const, ...binding };
+      const actorDecision = await issue("actor", actor);
+      const routedActor = { ...actor, spawnRouterDecisionId: actorDecision };
+      const created = await actors.createActor(routedActor, undefined, undefined, undefined, caller);
+      expect(await actors.actorStatus(created.id)).toMatchObject({ residency: "durable", status: expect.stringMatching(/^(idle|dormant)$/), ...binding });
+      expect(host.actors.owns(created.id)).toBe(true);
+      // Idle actor participants do not publish cwd; their native manager owns it.
+      expect(host.actors.agents.cwd).toBe(root);
+      for (const [decisionId, agentId] of [[taskDecision, launched.id], [actorDecision, created.id]]) {
+        const outcomes = ledger().filter(entry => entry.decisionId === decisionId && entry.kind !== "decision");
+        expect(outcomes).toHaveLength(1);
+        expect(outcomes[0]).toMatchObject({ kind: "start", decisionId, agentId, ...binding });
+        expect(mesh.get(`decisions/spawn-router/admissions/${decisionId}`, { fresh: true })?.value).toMatchObject({ state: "consumed" });
+      }
+      expect(ledger().some(entry => entry.kind === "start-refused")).toBe(false);
+      // Explicit cwd still binds its canonical location, even for a durable task.
+      const explicit = { ...task, name: "explicit-cwd-task", cwd: mainCwd };
+      const explicitDecision = await issue("spawn", explicit);
+      const changedRequest = { ...explicit, cwd: root, spawnRouterDecisionId: explicitDecision };
+      const changed = await client.spawnAgent(changedRequest);
+      expect(await host.agents.wait(changed.id)).toMatchObject({ status: "completed", cwd: fs.realpathSync(root) });
+      expect(ledger().filter(entry => entry.decisionId === explicitDecision && entry.kind !== "decision"))
+        .toEqual([expect.objectContaining({ kind: "start-refused", error: "decision-mismatch" })]);
+      expect(mesh.get(`decisions/spawn-router/admissions/${explicitDecision}`, { fresh: true })?.value).toMatchObject({ state: "issued" });
+      const validRequest = { ...explicit, spawnRouterDecisionId: explicitDecision };
+      const valid = await client.spawnAgent(validRequest);
+      expect(await host.agents.wait(valid.id)).toMatchObject({ status: "completed", cwd: fs.realpathSync(mainCwd) });
+      expect(ledger().filter(entry => entry.decisionId === explicitDecision && entry.kind === "start"))
+        .toEqual([expect.objectContaining({ agentId: valid.id, ...binding })]);
+      expect(JSON.stringify(ledger())).not.toContain(task.task);
+      expect(JSON.stringify(ledger())).not.toContain(actor.instructions);
+    } finally {
+      await client.close(); await mainManager.close(); await host.close(); await participants.close();
+      mesh.closeState(); fs.rmSync(root, { recursive: true, force: true });
+    }
+  }, 20_000);
+});
+
 describe("resident maintenance readiness attachment", () => {
   it("waits for the published live generation before one accepted create, without another launcher", async () => {
     const { root, config, host } = fixture();

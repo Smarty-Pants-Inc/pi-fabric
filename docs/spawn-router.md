@@ -209,6 +209,12 @@ The SHA-256 binding covers the requester session, target root and native host,
 spawning participant role, spawn/actor kind, canonical cwd, requested model and
 thinking, runner, name, and task/instruction digest. Relative task cwd is resolved
 from the original manager **base cwd**, not from the already-selected router cwd.
+For a durable request with omitted `cwd`, the cwd binding is null: the native
+resident supplies its own configured cwd (normally the repository root), which
+need not match the caller's base directory. This omission remains distinct from
+any explicit cwd. Local omitted cwd still binds the caller's canonical base;
+explicit task cwd still binds its canonical resolved location, including for
+durable tasks. This changes attribution only, never launch cwd selection.
 File-backed actor instructions bind their verified SHA-256 without disclosing the
 file path or reading the file at the origin. Seeded tasks bind the submitted task
 bytes after seeding. Admission state retains only the binding digest and bounded

@@ -31,6 +31,7 @@ interface AdmissionRequest {
   runner?: string | undefined;
   name?: string | undefined;
   cwd?: string | undefined;
+  residency?: AgentRunRequest["residency"] | undefined;
   task?: string | undefined;
   instructions?: string | undefined;
   sha256?: string | undefined;
@@ -113,7 +114,10 @@ const canonicalCwd = (cwd: string): string => {
 const admissionDigest = (admission: SpawnRouterAdmission, kind: "spawn" | "actor", request: AdmissionRequest, cwd: string): string =>
   digest(JSON.stringify({ requesterSessionId: admission.requesterSessionId, targetRootId: admission.targetRootId,
     targetHostId: admission.targetHostId, role: admission.role, kind,
-    cwd: canonicalCwd(kind === "spawn" ? path.resolve(cwd, request.cwd ?? ".") : cwd),
+    // Omitted durable cwd belongs to the resident, not the caller's base directory.
+    // Keep omission distinct from every explicit cwd; local defaults still bind the base.
+    cwd: request.residency === "durable" && request.cwd === undefined ? null
+      : canonicalCwd(kind === "spawn" ? path.resolve(cwd, request.cwd ?? ".") : cwd),
     model: request.model?.trim() || null, thinking: request.thinking ?? null, runner: request.runner ?? null,
     name: request.name?.trim() ?? null,
     taskDigest: kind === "spawn" ? digest(request.task ?? "")

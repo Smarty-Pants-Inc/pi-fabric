@@ -146,3 +146,169 @@ export function roleTemplate(role: NatsRole, input: RoleStreams): RoleTemplate {
     sub: { allow: [OWN_INBOX] },
   };
 }
+
+/** Path B machine grants. This stays separate from #7504 so old roleTemplate callers remain byte-for-byte stable. */
+export type PathBRole = "agent" | "operator";
+export interface PathBRoleTemplate extends RoleTemplate {}
+
+const PATH_B_MACHINE = /^[a-z0-9][a-z0-9-]{0,31}$/;
+const PATH_B_MACHINE_TAG = "{{tag(machine)}}";
+
+function pathBMachine(value: string): string {
+  if (value !== PATH_B_MACHINE_TAG && !PATH_B_MACHINE.test(value)) fail("machine");
+  return value;
+}
+
+function pathBUnique(values: string[]): string[] {
+  return [...new Set(values)];
+}
+
+/** Reserved operator principal, deliberately not a host in the runtime inventory (E14). */
+export const PATH_B_OPERATOR_MACHINE = "fabric-ops";
+/** Bootstrap provisions this durable; the messaging operator can bind, never create or delete it. */
+export const PATH_B_ADVISORY_DURABLE = "transport_dlq_operator";
+export const PATH_B_OPERATOR_MACHINE_PATTERN = /^fabric-ops(-[a-z0-9]+)?$/;
+
+// Administrative mutations inventoried against both pinned upstream API constant tables:
+// https://raw.githubusercontent.com/nats-io/nats-server/v2.11.17/server/jetstream_api.go
+// https://raw.githubusercontent.com/nats-io/nats-server/v2.14.7/server/jetstream_api.go
+// CREATE (including bare config.name), DELETE, PAUSE/UNPIN/RESET, leader/peer changes,
+// message deletion and RESTORE change advisory state; RESET is absent in 2.11.17 but reserved.
+// SNAPSHOT is read-like but mutates store snapshot-in-progress state, so reserve it too.
+// System-account MOVE/CANCEL_MOVE carry a stream token; account-wide admin/templates do not
+// and are not granted. INFO/list/GET remain reads. MSG.NEXT advances AckNone consumer state:
+// denied separately to nonoperators, while the operator retains its fixed durable pull.
+// Schedules/counters use data-publish headers, not additional API forms (v2.14.7 stream.go).
+const PATH_B_RESERVED_MUTATIONS = [
+  "$JS.API.CONSUMER.CREATE.FABRIC_ADV",
+  `$JS.API.CONSUMER.CREATE.FABRIC_ADV.${PATH_B_ADVISORY_DURABLE}`,
+  `$JS.API.CONSUMER.CREATE.FABRIC_ADV.${PATH_B_ADVISORY_DURABLE}.>`,
+  "$JS.API.CONSUMER.CREATE.FABRIC_ADV.>",
+  "$JS.API.CONSUMER.DURABLE.CREATE.FABRIC_ADV.>",
+  `$JS.API.CONSUMER.DELETE.FABRIC_ADV.${PATH_B_ADVISORY_DURABLE}`,
+  "$JS.API.CONSUMER.DELETE.FABRIC_ADV.>",
+  "$JS.API.CONSUMER.PAUSE.FABRIC_ADV.>",
+  "$JS.API.CONSUMER.UNPIN.FABRIC_ADV.>",
+  "$JS.API.CONSUMER.RESET.FABRIC_ADV.>",
+  "$JS.API.CONSUMER.LEADER.STEPDOWN.FABRIC_ADV.>",
+  "$JS.API.STREAM.CREATE.FABRIC_ADV",
+  "$JS.API.STREAM.UPDATE.FABRIC_ADV",
+  "$JS.API.STREAM.DELETE.FABRIC_ADV",
+  "$JS.API.STREAM.PURGE.FABRIC_ADV",
+  "$JS.API.STREAM.MSG.DELETE.FABRIC_ADV",
+  "$JS.API.STREAM.SNAPSHOT.FABRIC_ADV",
+  "$JS.API.STREAM.RESTORE.FABRIC_ADV",
+  "$JS.API.STREAM.LEADER.STEPDOWN.FABRIC_ADV",
+  "$JS.API.STREAM.PEER.REMOVE.FABRIC_ADV",
+  "$JS.API.ACCOUNT.STREAM.MOVE.*.FABRIC_ADV",
+  "$JS.API.ACCOUNT.STREAM.CANCEL_MOVE.*.FABRIC_ADV",
+];
+
+function pathBRuntime(roleMachine: string, machines: readonly string[] = []): PathBRoleTemplate {
+  if (PATH_B_OPERATOR_MACHINE_PATTERN.test(roleMachine)) fail("machine");
+  const inbox = `FABRIC_IN_${roleMachine}`;
+  const privateInboxes = roleMachine === PATH_B_MACHINE_TAG ? machines.map((machine) => `FABRIC_IN_${pathBMachine(machine)}`) : [inbox];
+  const ownInbox = `_INBOX.{{subject()}}.>`;
+  const allow = [
+    `fabric.in.*.*.*.*.${roleMachine}`,
+    `$JS.API.STREAM.INFO.${inbox}`,
+    ...["CREATE", "INFO", "MSG.NEXT", "DELETE"].map((verb) => `$JS.API.CONSUMER.${verb}.${inbox}.>`),
+    `$JS.ACK.${inbox}.>`,
+    `$KV.fabric_presence.${roleMachine}.>`,
+    `$KV.fabric_leases.${roleMachine}.>`,
+    "$JS.API.STREAM.INFO.KV_fabric_presence",
+    "$JS.API.STREAM.INFO.KV_fabric_leases",
+    "$JS.API.STREAM.MSG.GET.KV_fabric_presence",
+    "$JS.API.STREAM.MSG.GET.KV_fabric_leases",
+    ...["CREATE", "INFO", "DELETE"].flatMap((verb) => [
+      `$JS.API.CONSUMER.${verb}.KV_fabric_presence.>`,
+      `$JS.API.CONSUMER.${verb}.KV_fabric_leases.>`,
+    ]),
+    JS_INFO,
+    USER_INFO,
+  ];
+  const deny = [
+    "$JS.API.STREAM.CREATE.>",
+    "$JS.API.STREAM.UPDATE.>",
+    "$JS.API.STREAM.DELETE.>",
+    "$JS.API.STREAM.PURGE.>",
+    ...privateInboxes.map((stream) => `$JS.API.STREAM.MSG.GET.${stream}`),
+    "$JS.API.STREAM.MSG.DELETE.>",
+    "$JS.API.DIRECT.GET.>",
+    "$JS.API.CONSUMER.*.FABRIC_ADV.>",
+    "$JS.API.CONSUMER.MSG.NEXT.FABRIC_ADV.>",
+    ...PATH_B_RESERVED_MUTATIONS,
+  ];
+  return { pub: { allow: pathBUnique(allow), deny }, sub: { allow: [ownInbox] } };
+}
+
+function pathBOperator(roleMachine: string, machines: readonly string[]): PathBRoleTemplate {
+  if (roleMachine !== PATH_B_MACHINE_TAG && !PATH_B_OPERATOR_MACHINE_PATTERN.test(roleMachine)) fail("machine");
+  if (machines.length === 0) fail("machines");
+  const inboxes = machines.map((machine) => {
+    if (!PATH_B_MACHINE.test(machine) || PATH_B_OPERATOR_MACHINE_PATTERN.test(machine)) fail("machines");
+    return `FABRIC_IN_${machine}`;
+  });
+  const allow = [
+    "$JS.API.STREAM.INFO.FABRIC_ADV",
+    ...inboxes.map((stream) => `$JS.API.STREAM.INFO.${stream}`),
+    ...["INFO", "MSG.NEXT"].map((verb) => `$JS.API.CONSUMER.${verb}.FABRIC_ADV.${PATH_B_ADVISORY_DURABLE}`),
+    ...inboxes.flatMap((stream) => [`$JS.API.CONSUMER.INFO.${stream}.>`]),
+
+    JS_INFO,
+    USER_INFO,
+  ];
+  const deny = [
+    "$JS.API.STREAM.CREATE.>",
+    "$JS.API.STREAM.UPDATE.>",
+    "$JS.API.STREAM.DELETE.>",
+    "$JS.API.STREAM.PURGE.>",
+    "$JS.API.CONSUMER.CREATE.>",
+    "$JS.API.CONSUMER.DELETE.>",
+    "$JS.ACK.>",
+    "$JS.API.STREAM.MSG.GET.>",
+    "$JS.API.DIRECT.GET.>",
+    "fabric.in.>",
+    "fabric.ev.>",
+    ...PATH_B_RESERVED_MUTATIONS,
+    ...inboxes.flatMap((stream) => [
+      `$JS.API.STREAM.MSG.DELETE.${stream}`,
+      `$JS.API.DIRECT.GET.${stream}`,
+      `$JS.API.DIRECT.GET.${stream}.>`,
+    ]),
+  ];
+  return { pub: { allow: pathBUnique(allow), deny }, sub: { allow: [`_INBOX.{{subject()}}.>`] } };
+}
+
+/** Compose Path B with the existing role only when the mint input explicitly opts in. */
+export function roleTemplateWithPathB(role: NatsRole | "operator", input: RoleStreams, machines: readonly string[] = []): RoleTemplate {
+  if (role === "operator") {
+    const path = pathBOperator(PATH_B_MACHINE_TAG, machines);
+    const base = roleTemplate("maintainer", input);
+    return {
+      pub: { allow: path.pub.allow, deny: pathBUnique([...base.pub.deny, ...path.pub.deny]) },
+      sub: { allow: path.sub.allow },
+    };
+  }
+  const base = roleTemplate(role, input);
+  if (role === "agent") {
+    const path = pathBRuntime(PATH_B_MACHINE_TAG, machines);
+    return {
+      pub: { allow: pathBUnique([...base.pub.allow, ...path.pub.allow]), deny: pathBUnique([...base.pub.deny, ...path.pub.deny]) },
+      sub: { allow: path.sub.allow },
+    };
+  }
+  if (role === "break-glass") return base;
+  // Principal and normal maintainer retain their exact #7504 allows; only the Path B
+  // advisory reservation adds denies. Emergency custody/liveness issuance is unchanged.
+  return {
+    pub: { allow: base.pub.allow, deny: pathBUnique([...base.pub.deny, ...PATH_B_RESERVED_MUTATIONS, "$JS.API.CONSUMER.MSG.NEXT.FABRIC_ADV.>"]) },
+    sub: base.sub,
+  };
+}
+
+export function pathBRoleTemplate(role: PathBRole, machine = PATH_B_MACHINE_TAG, machines: readonly string[] = []): PathBRoleTemplate {
+  if (role === "agent") return pathBRuntime(pathBMachine(machine), machines);
+  if (role === "operator") return pathBOperator(pathBMachine(machine), machines);
+  throw new Error("invalid Path B role");
+}

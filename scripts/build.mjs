@@ -234,7 +234,7 @@ const hostProvided = /^(?:typebox|@sinclair\/typebox|@(?:earendil-works|mariozec
 // index.js, and a split build would carve that out of index.js into one more startup chunk.
 const standalone = await build({
   entryPoints: ["src/worker.ts", "src/memory/file-worker.ts", "src/storage/sweep-main.ts", "src/storage/retention-cli.ts",
-    "src/mesh/mesh-backend-cli.ts"],
+    "src/mesh/mesh-backend-cli.ts", "src/topology/stale-mesh-entries.ts"],
   outdir: "dist",
   outbase: "src",
   entryNames: "[dir]/[name]",

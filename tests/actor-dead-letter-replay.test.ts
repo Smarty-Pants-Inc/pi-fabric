@@ -446,9 +446,14 @@ describe("dead-letter replay age and current activation filter (#10630)", () => 
     const w = await backlog();
     let failRewrite = true;
     const rename = fs.renameSync;
+    const remove = fs.rmSync;
     vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
       if (String(to) === w.file && failRewrite) throw new Error("injected crash after archive append");
       return rename(from, to);
+    });
+    vi.spyOn(fs, "rmSync").mockImplementation((target, options) => {
+      if (String(target) === w.file && failRewrite) throw new Error("injected crash during empty-backlog removal");
+      return remove(target, options);
     });
     const manager = w.open();
     await waitFor(() => readLines(w.archive).length >= 6 && w.queued().length === 4);

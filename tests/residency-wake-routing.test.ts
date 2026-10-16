@@ -174,7 +174,7 @@ describe("resident event wake routing", () => {
     } finally { await plane.close(); f.close(); }
   });
 
-  it.each(["spawn", "write"] as const)("isolates a per-root %s failure and retries it on the next unrelated delivery", async failure => {
+  it.each(["spawn", "write"] as const)("isolates a per-root %s failure and retries it on the retention sweep", async failure => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-wake-retry-"));
     const mesh = new MeshStore(path.join(root, "mesh"), 65_536, 100);
     const roots = ["first", "second"].map(name => {
@@ -213,6 +213,9 @@ describe("resident event wake routing", () => {
       fs.writeFileSync(wake.residentSleepingPath(roots[1]!), JSON.stringify({ request: wake.readWakeJson(wake.residentWakeRequestPath(roots[1]!)) }));
       const before = launch.mock.calls.length;
       await mesh.publish({ topic: "unrelated.retry.trigger", from });
+      expect(launch.mock.calls.length).toBe(before); // Unrelated publication owns no retry work.
+      const retryAt = wake.readWakeJson<{ nextRetryAt: number }>(path.join(roots[0]!, "wake-failure.json"))!.nextRetryAt;
+      await wake.retryResidentWakes(mesh, launch, retryAt);
       expect(launch.mock.calls.length).toBe(before + 1);
       expect(path.dirname(launch.mock.calls.at(-1)![0])).toBe(roots[0]);
       expect(wake.readWakeJson<{ id: string }>(wake.residentWakeRequestPath(roots[0]!))?.id).toBe(committed.id);

@@ -1122,11 +1122,14 @@ export class ResidentHost {
   }
 
   async #recoverWakeBatch(batch: ResidentWakeRecoveryBatch): Promise<void> {
-    if (this.#drain || this.#staged) throw new Error(HOST_CLOSING_RETRY);
+    const canRecover = (): boolean => !this.#closed && !this.#drain && !this.#staged && !this.#handover;
+    if (!canRecover()) throw new Error(HOST_CLOSING_RETRY);
     this.#admissions++;
     try {
       const recovery = { config: this.config, ownedActors: this.actors.listOwned(true), batch, ignored: 0 };
-      await wakeResidentActors(this.mesh, [], undefined, recovery);
+      // Scoped own-root recovery precedes #ready; ordinary publication's gate
+      // intentionally remains closed, while lifecycle revocation is still live.
+      await wakeResidentActors(this.mesh, [], undefined, recovery, canRecover);
       this.#wakeRecoveryIgnored += recovery.ignored;
     } finally { this.#admissions--; this.#scheduleIdleCheck(); }
   }

@@ -52,20 +52,22 @@ export interface RootInboxReconcileOptions {
   priority?: boolean;
 }
 
-export const workKey = (data: unknown): string | undefined => {
-  const key = data && typeof data === "object" ? (data as { key?: unknown }).key : undefined;
-  return typeof key === "string" && key.trim() ? key.trim() : undefined;
+const trimmedField = (data: unknown, field: string): string | undefined => {
+  const value = data && typeof data === "object" ? (data as Record<string, unknown>)[field] : undefined;
+  return typeof value === "string" ? value.trim() || undefined : undefined;
 };
+export const workKey = (data: unknown): string | undefined => trimmedField(data, "key");
 
 const receipt = (fromId: string, kind: string, value: string): string =>
   createHash("sha256").update(JSON.stringify([fromId, kind, value])).digest("hex");
 
-/** A delivery identity outranks work-key/ref fallbacks, never the other way around. */
+/** Delivery identity precedence: deliveryId > messageId > commandId > work-key/ref fallbacks. */
 export const deliveryIdentity = (data: unknown): { kind: string; value: string } | undefined => {
   if (!data || typeof data !== "object") return undefined;
-  const fields = data as Record<string, unknown>;
-  if (typeof fields.deliveryId === "string" && fields.deliveryId) return { kind: "delivery", value: fields.deliveryId };
-  if (typeof fields.messageId === "string" && fields.messageId) return { kind: "id", value: fields.messageId };
+  for (const field of ["deliveryId", "messageId", "commandId"]) {
+    const value = (data as Record<string, unknown>)[field];
+    if (typeof value === "string" && value) return { kind: field === "messageId" ? "id" : "delivery", value };
+  }
   return undefined;
 };
 /**
@@ -75,22 +77,18 @@ export const deliveryIdentity = (data: unknown): { kind: string; value: string }
  * topic-less kinds ("key", "ref") are never matched again: without a verifiable topic the event
  * is injected, because a duplicate shadow is cheap and a lost event is not.
  */
+/** Native carriers claim topic-scoped work; mesh events retain their own identities. */
 export const topicWorkReceipt = (fromId: string, kind: "key" | "ref", topic: string, value: string): string =>
-  receipt(fromId, `topic-${kind}`, JSON.stringify([topic, value]));
-/** The topic a native carrier names for its work (data.topic); without one its key/ref claims nothing. */
-const carrierTopic = (data: unknown): string | undefined => {
-  const topic = data && typeof data === "object" ? (data as { topic?: unknown }).topic : undefined;
-  return typeof topic === "string" && topic.trim() ? topic.trim() : undefined;
-};
+  receipt(fromId, `native-topic-${kind}`, JSON.stringify([topic, value]));
 const workReceipts = (fromId: string, data: unknown, topic: string | undefined): string[] => {
-  if (!data || typeof data !== "object") return [];
   const identity = deliveryIdentity(data);
   if (identity) return [receipt(fromId, identity.kind, identity.value)];
-  if (topic === undefined) return [];
-  const fields = data as Record<string, unknown>;
-  const key = workKey(data);
-  const ref = typeof fields.ref === "string" && fields.ref.trim() ? fields.ref.trim() : undefined;
-  return key ? [topicWorkReceipt(fromId, "key", topic, key)] : ref ? [topicWorkReceipt(fromId, "ref", topic, ref)] : [];
+  // Only native carriers supply a topic; mesh events must never claim key/ref work.
+  if (topic !== undefined) for (const kind of ["key", "ref"] as const) {
+    const value = trimmedField(data, kind);
+    if (value) return [topicWorkReceipt(fromId, kind, topic, value)];
+  }
+  return [];
 };
 export const eventReceipt = (id: string): string => receipt("", "event", id);
 /**
@@ -105,16 +103,19 @@ export const crossIdentityReceipts = (fromId: string, data: unknown): string[] =
 };
 export const eventReceipts = (event: MeshEvent): string[] => [
   eventReceipt(event.id), receipt(event.from.id, "id", event.id),
-  // Host-only publication keys are mesh-wide, even when a different maintenance owner
-  // retries. Carry the key into recipient-scoped confirmed session/inbox receipts too.
   ...(event.dedupeKey ? [receipt("", "dedupe", event.dedupeKey)] : []),
-  ...workReceipts(event.from.id, event.data, event.topic),
+  // Control data is a protocol envelope; nested work identities belong to the native carrier.
+  ...(event.topic === "fabric.control.command" ? [] : [
+    ...workReceipts(event.from.id, event.data, undefined),
+    ...crossIdentityReceipts(event.from.id, event.data),
+  ]),
 ];
 /** What the session's own entries say it holds. */
 export interface RootInboxSession {
   /** Inbox messages collectively holding all of these event ids. */
   holdsBatch(ids: readonly string[]): boolean;
-  /** An agent message (a steer or follow-up) from this sender that carried this work key and topic. */
+  /** Agent-carrier presence for this sender/key/topic, including explicit identities.
+   * Legacy suppression additionally requires a matching, dated native-topic receipt. */
   holdsSteer(fromId: string, key: string, topic: string): boolean;
   /** Confirmed native/inbox receipts from the whole history, not the recent-entry window. */
   delivered?: ReadonlySet<string>;
@@ -135,7 +136,7 @@ export const projectRootInboxReceipt = (value: unknown): unknown => {
     return {
       id: row.id, chain: row.chain, deliveryId: row.deliveryId,
       ...(from ? { from: { id: from.id } } : {}),
-      ...(data ? { data: { key: data.key, ref: data.ref, topic: data.topic, deliveryId: data.deliveryId, messageId: data.messageId } } : {}),
+      ...(data ? { data: { key: data.key, ref: data.ref, topic: data.topic, deliveryId: data.deliveryId, messageId: data.messageId, commandId: data.commandId } } : {}),
     };
   };
   const entry = object(value);
@@ -145,8 +146,6 @@ export const projectRootInboxReceipt = (value: unknown): unknown => {
     type: entry.type, id: entry.id, timestamp: entry.timestamp, customType: entry.customType,
     ...(details ? { details: {
       ...carried(details), ids: details.ids, receipts: details.receipts,
-      // Keep malformed shapes unchanged: consumers retain their existing
-      // validation/failure behavior; projection must not manufacture a receipt.
       items: Array.isArray(details.items) ? details.items.map(carried) : details.items,
     } } : {}),
   };
@@ -192,24 +191,36 @@ export const confirmedRootInboxSession = (manager: SessionReceiptManager): RootI
 export const rootInboxSession = (entries: readonly unknown[], lookback = 500): RootInboxSession =>
   inboxReceiptSession(Object.keys(entries).map((key): [number, unknown] => [Number(key), entries[Number(key)]]), entries.length, lookback);
 
+/** Only canonical native UTC ISO or integer epoch-ms can date a receipt claim. */
+const canonicalReceiptTimestamp = (value: unknown): number | undefined => {
+  const at = typeof value === "number" ? value
+    : typeof value === "string" && value.length === 24 ? Date.parse(value)
+    : Number.NaN;
+  if (!Number.isInteger(at) || at <= 0 || at > Date.now() + 60_000) return undefined;
+  if (typeof value === "string" && new Date(at).toISOString() !== value) return undefined;
+  return at;
+};
+
 const inboxReceiptSession = (entries: Iterable<readonly [number, unknown]>, count: number, lookback = 500): RootInboxSession => {
   const batchIds = new Set<string>();
   let hasBatch = false;
   const steers = new Map<string, Set<string>>();
   const delivered = new Set<string>();
   const deliveredAt = new Map<string, number>();
-  const remember = (id: string, at: number): void => {
+  const remember = (id: string, at: number | undefined): void => {
     delivered.add(id);
-    deliveredAt.set(id, Math.max(deliveredAt.get(id) ?? Number.NEGATIVE_INFINITY, at));
+    if (at !== undefined) deliveredAt.set(id, Math.max(deliveredAt.get(id) ?? Number.NEGATIVE_INFINITY, at));
   };
   // Persisted snapshots contain receipts only, with original history positions. All-history
   // identities/legacy steers are needed for dedup; only batch presence uses a lookback.
   for (const [index, value] of [...entries].reverse()) {
     type Carried = { from?: { id?: unknown }; data?: unknown; id?: unknown; deliveryId?: unknown };
-    const entry = value as { timestamp?: string; type?: string; customType?: string; details?: Carried & { ids?: unknown; items?: unknown; receipts?: unknown } } | undefined;
+    const entry = value as { timestamp?: unknown; type?: string; customType?: string; details?: Carried & { ids?: unknown; items?: unknown; receipts?: unknown } } | undefined;
     if (entry?.type !== "custom_message") continue;
-    const parsedAt = Date.parse(entry.timestamp ?? "");
-    const at = Number.isFinite(parsedAt) ? parsedAt : Date.now();
+    // A missing/invalid canonical timestamp is not evidence that a legacy key/ref claim is
+    // current. Keep the receipt for exact identity replay checks, but never silently renew its
+    // one-use key fallback with the scan time.
+    const at = canonicalReceiptTimestamp(entry.timestamp);
     if (entry.customType === ROOT_INBOX_CUSTOM_TYPE && Array.isArray(entry.details?.ids)) {
       if (index >= Math.max(0, count - lookback)) {
         hasBatch = true;
@@ -217,22 +228,29 @@ const inboxReceiptSession = (entries: Iterable<readonly [number, unknown]>, coun
       }
       // Mixed-version inbox messages carried only globally unique mesh event ids.
       for (const id of entry.details.ids) if (typeof id === "string") remember(eventReceipt(id), at);
-      if (Array.isArray(entry.details.receipts)) {
-        for (const id of entry.details.receipts) if (typeof id === "string") remember(id, at);
-      }
     }
-    if (entry.customType !== AGENT_MESSAGE_CUSTOM_TYPE) continue;
+    const agent = entry.customType === AGENT_MESSAGE_CUSTOM_TYPE;
+    if ((entry.customType === ROOT_INBOX_CUSTOM_TYPE || agent) && Array.isArray(entry.details?.receipts)) {
+      for (const id of entry.details.receipts) if (typeof id === "string") remember(id, at);
+    }
+    if (!agent) continue;
     // A batch of followUps (smarty-dev#1495) carries each one in items.
     const carried: Carried[] = Array.isArray(entry.details?.items) ? entry.details.items as Carried[] : [entry.details ?? {}];
     for (const item of carried) {
       const fromId = item?.from?.id;
       const key = workKey(item?.data);
-      const topic = carrierTopic(item?.data);
+      // A native carrier without data.topic claims no key/ref work.
+      const topic = trimmedField(item?.data, "topic");
+      const explicit = !!deliveryIdentity(item?.data) || (typeof item?.deliveryId === "string" && !!item.deliveryId);
       if (typeof fromId !== "string") continue;
-      for (const id of workReceipts(fromId, item.data, topic)) remember(id, at);
+      // A caller-supplied top-level deliveryId is explicit-only too; retain data identity
+      // receipts when present, but do not record a native-topic key/ref for this carrier.
+      for (const id of workReceipts(fromId, item.data, explicit ? undefined : topic)) remember(id, at);
       if (typeof item.id === "string") remember(receipt(fromId, "id", item.id), at);
       if (typeof item.deliveryId === "string") remember(receipt(fromId, "delivery", item.deliveryId), at);
-      // A carrier without a topic claims no work key: its shadow is injected (fail open).
+      // Presence is independent of suppression authority: explicit carriers also hold this
+      // sender/topic/key, but only identity-less carriers above can record native-topic receipts.
+      // holdsSteer alone never suppresses work; a matching, dated native-topic receipt is mandatory.
       if (key === undefined || topic === undefined) continue;
       const keys = steers.get(fromId) ?? new Set<string>();
       keys.add(JSON.stringify([topic, key]));
@@ -330,6 +348,6 @@ export const rootInboxMessage = (input: readonly MeshEvent[], extra?: readonly M
     "</fabric-inbox>",
   ].join("\n"),
   display: true,
-  details: { ids: all.map((event) => event.id), receipts: all.flatMap(eventReceipts) },
+  details: { ids: all.map((event) => event.id), receipts: rest.concat(events).flatMap(eventReceipts) },
   };
 };

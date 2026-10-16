@@ -1856,6 +1856,7 @@ describe("ParticipantDirectory", () => {
       "session:local",
       "agent:local",
     ]);
+    expect(readHostLeases(directory.mesh.root).has(identity.id)).toBe(false);
   });
 
   it("recovers via heartbeat when the initial publish fails at startup", async () => {

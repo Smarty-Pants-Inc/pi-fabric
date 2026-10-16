@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { FabricModelDeniedError } from "../core/model-policy.js";
+import { notifyDiagnostic, setPrewalkStatus } from "../core/diagnostics.js";
 import { sendFabricMessage } from "../fabric-provenance.js";
 import type {
   ExtensionAPI,
@@ -260,7 +261,7 @@ const runInPlacePrewalk = async (
 ): Promise<Record<string, unknown>> => {
   const modelKey = String(pending.args.model ?? "");
   assertPrewalkModelAllowed(modelKey, policy);
-  context.ui.setStatus("fabric-prewalk", `switching Main → ${modelKey}`);
+  setPrewalkStatus(context, `switching Main → ${modelKey}`);
   const model = modelForKey(modelKey, context);
   assertPrewalkModelAllowed(`${model.provider}/${model.id}`, policy);
   // Snapshot the pre-switch reasoning channel and branch. In-place handoff
@@ -375,11 +376,11 @@ const runInPlacePrewalk = async (
   }
 
   controller.beginContinuation(continuationId, returnModelKey, continuationMessage);
-  context.ui.notify(
+  notifyDiagnostic(context, "src/prewalk/handoff.ts",
     `Prewalk is continuing in Main with ${modelKey}, then returning to ${returnModelKey}.`,
     "info",
   );
-  context.ui.setStatus("fabric-prewalk", `continuing Main → ${modelKey}`);
+  setPrewalkStatus(context, `continuing Main → ${modelKey}`);
   return {
     prewalk: true,
     mode: "in-place",
@@ -401,8 +402,8 @@ export const runFabricHandoffAtBoundary = async (
 ): Promise<Record<string, unknown>> => {
   const model = String(pending.args.model ?? "");
   const inPlace = pending.kind === "prewalk-in-place";
-  context.ui.setStatus(
-    "fabric-prewalk",
+  setPrewalkStatus(
+    context,
     inPlace ? `switching Main → ${model}` : `handing off trajectory → ${model}`,
   );
   try {
@@ -428,7 +429,7 @@ export const runFabricHandoffAtBoundary = async (
       nestedToolCallId: pending.audit.nestedToolCallId,
       extensionContext: context,
       update(message) {
-        context.ui.setStatus("fabric-prewalk", message);
+        setPrewalkStatus(context, message);
         activity?.({ type: "progress", message });
       },
       ...(activity ? { activity } : {}),
@@ -474,8 +475,8 @@ export const runFabricHandoffAtBoundary = async (
     if (!continuing && pending.kind === "explicit") {
       queueHandoffCompletion(extension, pending.args, result);
     }
-    context.ui.setStatus(
-      "fabric-prewalk",
+    setPrewalkStatus(
+      context,
       continuing ? "handoff failed; executor continuing directly"
         : completed ? "trajectory executor implemented" : `trajectory ${String(result.status ?? "failed")}`,
     );
@@ -511,7 +512,7 @@ export const runFabricHandoffAtBoundary = async (
     if (!continuing && pending.kind === "explicit") {
       queueHandoffCompletion(extension, pending.args, failure);
     }
-    context.ui.setStatus("fabric-prewalk", continuing ? "handoff failed; executor continuing directly"
+    setPrewalkStatus(context, continuing ? "handoff failed; executor continuing directly"
       : inPlace ? "in-place continuation failed" : "trajectory handoff failed");
     return {
       ...(pending.kind.startsWith("prewalk-")
@@ -527,7 +528,7 @@ export const runFabricHandoffAtBoundary = async (
     if (!inPlace) {
       const status = controller.completeTask();
       if (status.state === "armed") {
-        context.ui.setStatus("fabric-prewalk", `armed → ${status.model}`);
+        setPrewalkStatus(context, `armed → ${status.model}`);
       }
     }
   }

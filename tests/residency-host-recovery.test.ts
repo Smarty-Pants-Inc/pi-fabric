@@ -8,6 +8,7 @@ import { ActorChildCompletionStore } from "../src/actors/child-completions.js";
 import { stageRunArchive } from "../src/agents/archive-custody.js";
 import type { AgentRunResult } from "../src/agents/types.js";
 import { readHostLease } from "../src/topology/host-leases.js";
+import { PARTICIPANT_HEARTBEAT_MS } from "../src/topology/participant-directory.js";
 import type { ResidentHostConfig } from "../src/residency/protocol.js";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
 
@@ -126,11 +127,11 @@ describe("resident recovery startup and lease fence (#3864)", () => {
       await host.participants.refresh();
       expect(host.participants.canConsumeMesh()).toBe(true);
       await vi.waitFor(() => expect(tail!.mock.results.some((result: { value?: { events?: Array<{ id: string }> } }) => result.value?.events?.some((row: { id: string }) => row.id === event.id))).toBe(true), { timeout: 3_000 });
-      // smarty-dev#11172: the default heartbeat is 60 s, so confirmation lasts two heartbeats (120 s).
+      // smarty-dev#11172: confirmation lasts two production heartbeats.
       // The recovered confirmation still admits inside that window and lapses just past it.
       const confirmed = host.participants.confirmedAt();
-      expect(host.participants.canConsumeMesh(confirmed + 110_000)).toBe(true);
-      expect(host.participants.canConsumeMesh(confirmed + 120_001)).toBe(false);
+      expect(host.participants.canConsumeMesh(confirmed + PARTICIPANT_HEARTBEAT_MS * 2 - 1_000)).toBe(true);
+      expect(host.participants.canConsumeMesh(confirmed + PARTICIPANT_HEARTBEAT_MS * 2 + 1)).toBe(false);
     } finally { writes?.mockRestore(); confirmations?.mockRestore(); tail?.mockRestore(); lifecycle?.mockRestore(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
   });
 });

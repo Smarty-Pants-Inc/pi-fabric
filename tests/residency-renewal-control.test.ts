@@ -27,10 +27,10 @@ const waitFor = async (predicate: () => boolean, boundMs: number, label: string,
   }
 };
 
-// smarty-dev#11172 moved the default participant heartbeat to 60 s (TTL 180 s, confirmation 120 s).
+// smarty-dev#11172 moved the default participant heartbeat to 30 s (TTL 90 s, confirmation 60 s).
 // This test proves physical timer/lock interleaving across several real heartbeats, so only the
 // ParticipantDirectory #armHeartbeat interval physically fires every TEST_PHYSICAL_HEARTBEAT_MS.
-// Every directory keeps the production 60 s heartbeat, 180 s lease and 120 s confirmation
+// Every directory keeps the production 30 s heartbeat, 90 s lease and 60 s confirmation
 // arithmetic: no heartbeatMs option (which would also select the legacy 15 s TTL), no fake clock.
 const TEST_PHYSICAL_HEARTBEAT_MS = 5_000;
 const redirectParticipantHeartbeat = () => {
@@ -46,7 +46,14 @@ const redirectParticipantHeartbeat = () => {
   return { spy, redirected: () => redirected };
 };
 
-it("completes a real resident setter overlapped with automatic shared renewal, the next heartbeat, and a stale renewal refusal", async () => {
+/** Save a real public status change, leaving publication for the heartbeat. */
+const stageStop = async (host: ResidentHost, id: string) => {
+  const refresh = vi.spyOn(host.participants, "refreshPresence").mockResolvedValue();
+  try { await host.actors.stop(id); }
+  finally { refresh.mockRestore(); }
+};
+
+it("completes a real resident setter overlapped with automatic changed publication, an effect-free heartbeat, and stale publication refusal", async () => {
   // No fake clocks, timer advancement, manual refresh after arming, or lock adapters.
   // Gates only arrange interleaving; production registry/mesh locks and commits run.
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-renewal-control-"));
@@ -79,6 +86,7 @@ it("completes a real resident setter overlapped with automatic shared renewal, t
     await host.start();
     expect(heartbeat.redirected()).toBeGreaterThanOrEqual(2); // main + resident host, never a legacy cadence
     const actor = await client.createActor({ name: "concurrent-review", instructions: "wait", residency: "durable" });
+    const sibling = await client.createActor({ name: "pending-review", instructions: "wait", residency: "durable" });
     await host.participants.refresh();
     // Drain the creation's change-only publication before arming the timer probe.
     await new Promise(resolve => setTimeout(resolve, 1_100));
@@ -87,6 +95,13 @@ it("completes a real resident setter overlapped with automatic shared renewal, t
     const sessionLock = path.join(config.sessionActorRoot!, "actors.json.lock", "owner");
     const meshLock = path.join(config.meshRoot, ".lock", "owner");
     const initial = readParticipantFile(config.meshRoot, key)!;
+    const registry = new ActorRegistryStore(config.actorRoot);
+    // Leave the status change for the AUTOMATIC full heartbeat, not the registry
+    // watch's earlier change-only flush. Restore scheduling once that batch is selected.
+    const changeFlush = vi.spyOn(host.participants, "scheduleRefresh").mockImplementation(() => {});
+    spies.push(changeFlush);
+    await stageStop(host, actor.id);
+    expect(readParticipantFile(config.meshRoot, key)).toEqual(initial);
     let automaticStarted = 0, automaticCompleted = 0, selected = false, sawBothLocks = false;
     const refresh = host.participants.refresh.bind(host.participants);
     spies.push(vi.spyOn(host.participants, "refresh").mockImplementation(async () => {
@@ -96,9 +111,11 @@ it("completes a real resident setter overlapped with automatic shared renewal, t
     }));
     const batch = host.mesh.writeBatch.bind(host.mesh);
     spies.push(vi.spyOn(host.mesh, "writeBatch").mockImplementation(async input => {
-      const overlap = automaticStarted === 1 && !selected;
+      const overlap = automaticStarted === 1 && !selected && input.ops.some(op => op.key === key && op.kind === "put");
       if (overlap) {
+        expect(input.ops.find(op => op.key === key && op.kind === "put")).toMatchObject({ kind: "put", value: { status: "stopped" } });
         selected = true;
+        changeFlush.mockRestore();
         await releaseHeartbeat.promise;
       }
       return batch({ ...input, afterCommit: view => {
@@ -142,25 +159,31 @@ it("completes a real resident setter overlapped with automatic shared renewal, t
     expect(sawBothLocks).toBe(true);
     const afterMutation = readParticipantFile(config.meshRoot, key)!;
     expect(afterMutation.updatedAt).toBeGreaterThan(initial.updatedAt);
+    expect(afterMutation.value).toMatchObject({ status: "stopped" });
+    const afterPresence = host.mesh.get(`actors/${config.sessionId}/${actor.id}`, { fresh: true })!;
+    const afterLease = readHostLease(config.meshRoot, host.hostId)!;
     await waitFor(() => automaticCompleted >= 2, 6_500, "next automatic heartbeat completes",
       () => expect(host.participants.canConsumeMesh()).toBe(true));
-    expect(readParticipantFile(config.meshRoot, key)!.updatedAt).toBeGreaterThan(afterMutation.updatedAt);
-    expect(readHostLease(config.meshRoot, host.hostId)!.updatedAt).toBeGreaterThan(afterMutation.updatedAt);
+    expect(readParticipantFile(config.meshRoot, key)).toEqual(afterMutation);
+    expect(host.mesh.get(`actors/${config.sessionId}/${actor.id}`, { fresh: true })).toEqual(afterPresence);
+    expect(readHostLease(config.meshRoot, host.hostId)!.updatedAt).toBeGreaterThan(afterLease.updatedAt);
 
-    // Hold real registry custody across the next automatic renewal's acquisition.
-    // Adoption wins before that renewal can read its source; the old cached directory
-    // must not resurrect the stale participant, even without successor publication.
-    const registry = new ActorRegistryStore(config.actorRoot);
+    // Adoption precedes a pending public change's registry-fenced publication.
+    // Cached directory content must not resurrect it without successor publication.
+    const staleFlush = vi.spyOn(host.participants, "scheduleRefresh").mockImplementation(() => {});
+    spies.push(staleFlush);
+    await stageStop(host, sibling.id);
     let adoptedRow: Record<string, unknown> | undefined;
     const next = automaticStarted + 1;
     await registry.withLock(async () => {
-      await waitFor(() => automaticStarted >= next, 6_500, "automatic stale renewal waits for registry custody",
+      await waitFor(() => automaticStarted >= next, 6_500, "automatic stale publication meets registry custody",
         () => expect(host.participants.canConsumeMesh()).toBe(true));
       registry.write(registry.records().map(row => row.id === actor.id
         ? { ...row, rootId: "session:successor", adoptedAt: Date.now(), adoptedFrom: [config.rootId] } : row));
       adoptedRow = registry.records().find(row => row.id === actor.id);
+      staleFlush.mockRestore();
     });
-    await waitFor(() => automaticCompleted >= next, 1_500, "stale renewal completes without republishing",
+    await waitFor(() => automaticCompleted >= next, 1_500, "stale publication completes without republishing",
       () => expect(host.participants.canConsumeMesh()).toBe(true));
     expect(readParticipantFile(config.meshRoot, key)).toBeUndefined();
     expect(host.mesh.get(key, { fresh: true })).toBeUndefined();

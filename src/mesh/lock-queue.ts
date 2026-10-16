@@ -221,14 +221,18 @@ export class MeshLockTicket {
   get queued(): boolean { return !this.#closed; }
 
   /** Sleep at most `ms`, waking early when the receipt this waiter depends on goes (non-head)
-   * or when .lock is released (head). A wake that arrived since the last wait returns at once. */
-  wait(ms: number, signal?: AbortSignal): Promise<void> {
+   * or when .lock is released (head). A wake that arrived since the last wait returns at once.
+   * An optional fixed acquisition deadline bounds the sleep after synchronous watch setup. */
+  wait(ms: number, signal?: AbortSignal, deadline?: number): Promise<void> {
     signal?.throwIfAborted();
     if (!this.#closed) {
       if (this.#head) this.#watchRelease();
       else if (this.#predecessor !== undefined) this.#watchPredecessor(this.#predecessor);
     }
+    signal?.throwIfAborted();
     if (this.#signalled) { this.#signalled = false; return Promise.resolve(); }
+    const sleepMs = deadline === undefined ? ms : Math.min(ms, deadline - Date.now());
+    if (deadline !== undefined && sleepMs <= 0) return Promise.resolve();
     return new Promise((resolve, reject) => {
       const finish = (): void => {
         clearTimeout(timer);
@@ -239,10 +243,11 @@ export class MeshLockTicket {
       };
       const onAbort = (): void => {
         clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
         this.#wake = undefined;
         reject(signal!.reason);
       };
-      const timer = setTimeout(finish, ms);
+      const timer = setTimeout(finish, sleepMs);
       this.#wake = finish;
       signal?.addEventListener("abort", onAbort, { once: true });
     });
@@ -258,7 +263,15 @@ export class MeshLockTicket {
   #open(target: string, onEvent: (name: string | null) => void): fs.FSWatcher | undefined {
     try {
       const watcher = fs.watch(target, { persistent: false }, (_event, name) => onEvent(name === null ? null : String(name)));
-      watcher.on("error", () => watcher.close());
+      watcher.on("error", () => {
+        watcher.close();
+        if (this.#predecessorWatcher === watcher) {
+          this.#predecessorWatcher = undefined;
+          this.#watched = undefined;
+        } else if (this.#rootWatcher === watcher) this.#rootWatcher = undefined;
+        else return; // A late error from a replaced/closed handle cannot disturb its successor.
+        this.#signal();
+      });
       return watcher;
     } catch (error) {
       // The receipt went between our stat and the watch: that is the wake itself.
@@ -271,8 +284,8 @@ export class MeshLockTicket {
   #watchPredecessor(name: string): void {
     if (this.#watched === name) return;
     this.#predecessorWatcher?.close();
-    this.#watched = name;
     this.#predecessorWatcher = this.#open(path.join(this.#directory, name), () => this.#signal());
+    this.#watched = this.#predecessorWatcher ? name : undefined;
   }
 
   /** The head is the only waiter that watches the mesh root, for .lock going away. */
@@ -280,6 +293,7 @@ export class MeshLockTicket {
     if (this.#rootWatcher) return;
     this.#predecessorWatcher?.close();
     this.#predecessorWatcher = undefined;
+    this.#watched = undefined;
     this.#rootWatcher = this.#open(this.#root, name => { if (name === null || name === ".lock") this.#signal(); });
   }
 

@@ -12,7 +12,7 @@ import { MeshLockTimeoutError } from "../src/core/atomic-write.js";
 import { MeshStore } from "../src/mesh/store.js";
 import { ResidentHost } from "../src/residency/host.js";
 import { residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
-import { LIVENESS_POLICY_KEY, readHostLease } from "../src/topology/host-leases.js";
+import { hostLeasePath, LIVENESS_POLICY_KEY, readHostLease } from "../src/topology/host-leases.js";
 import { readParticipantFile } from "../src/topology/participant-files.js";
 
 // Keep the contention/TTL fixture on its explicit 5 s / 15 s clock. Production's
@@ -37,7 +37,7 @@ afterEach(async () => {
 });
 const participantKey = (id: string) => "topology/participants/" + createHash("sha256").update(id).digest("hex");
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
-const fixture = async (files = false) => {
+const fixture = async (files = false, count = 40) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-presence-batch-")); roots.push(root);
   const config: ResidentHostConfig = {
     format: 1, rootId: "session:absent-main", sessionId: "absent-main", cwd: root, projectRoot: root,
@@ -50,10 +50,10 @@ const fixture = async (files = false) => {
   fs.mkdirSync(config.residencyRoot, { recursive: true });
   fs.writeFileSync(path.join(config.residencyRoot, "config.json"), JSON.stringify(config));
   const now = Date.now();
-  const records = Array.from({ length: 40 }, (_, index) => ({
+  const records = Array.from({ length: count }, (_, index) => ({
     id: (index + 1).toString(16).padStart(32, "0"), name: `idle-${index}`, instructions: "wait",
     createdAt: now, updatedAt: now, rootId: config.rootId, residency: "durable", runner: "pi", status: "idle",
-    scope: index < 20 ? "project" : "session", events: [], topics: [], messages: [],
+    scope: index < count / 2 ? "project" : "session", events: [], topics: [], messages: [],
   }));
   for (const [scope, actorRoot] of [["project", config.actorRoot], ["session", config.sessionActorRoot!]]) {
     fs.mkdirSync(actorRoot!, { recursive: true });
@@ -112,8 +112,7 @@ describe("#4383 resident host presence batch", () => {
       while (holds === 1 && !holderExited && consumable()) await delay(5);
       gate.mockRestore();
       expect(host.actors.status(actor.id).filteredCount ?? 0).toBe(0);
-      expect(host.participants.confirmedAt()).toBe(prior);
-      expect(host.participants.canConsumeMesh()).toBe(false);
+      expect(host.participants.confirmedAt()).toBeGreaterThanOrEqual(prior);
       const admissions: number[] = [], batchAttempts: number[] = [];
       const admission = host.participants.options.waitForPublicationRetry!;
       vi.spyOn(host.participants.options, "waitForPublicationRetry").mockImplementation(async () => {
@@ -140,9 +139,7 @@ describe("#4383 resident host presence batch", () => {
         });
       }
       let progressedAt = 0, progressedDuringHold = 0;
-      const progressed = () => host.participants.confirmedAt() > started && records.every(row =>
-        readParticipantFile(config.meshRoot, participantKey(row.id))!.updatedAt > started &&
-        host.mesh.get(`actors/${config.sessionId}/${row.id}`, { fresh: true })!.updatedAt > started) &&
+      const progressed = () => host.participants.confirmedAt() > started &&
         host.actors.status(actor.id).filteredCount === 1 && host.participants.canConsumeMesh();
       // "Within three periods" counted by the holder itself: progress must land in one of the
       // first three gaps, i.e. before the 4th hold is reported, however slow the runner is.
@@ -159,7 +156,7 @@ describe("#4383 resident host presence batch", () => {
         renewedEnvelopes: records.filter(row => (host.mesh.get(`actors/${config.sessionId}/${row.id}`, { fresh: true })?.updatedAt ?? 0) > started).length,
         filteredCount: host.actors.status(actor.id).filteredCount ?? 0, canConsume: host.participants.canConsumeMesh(),
         leaseAt: readHostLease(config.meshRoot, host.hostId)?.updatedAt, holderStillRunning: !holderExited }));
-      expect(progressedAt, "committed heartbeat, all 40 envelopes and real actor-event delivery within three hold periods").toBeGreaterThan(0);
+      expect(progressedAt, "committed heartbeat and real actor-event delivery within three hold periods").toBeGreaterThan(0);
       expect(holderExited, "recovery must happen while the periodic holder continues").toBe(false);
       expect(readHostLease(config.meshRoot, host.hostId)!.updatedAt).toBeGreaterThan(started);
     } finally { gate.mockRestore(); child.stdin.end(); await exited; }
@@ -212,13 +209,13 @@ describe("#4383 resident host presence batch", () => {
     const exited = new Promise<number | null>((resolve, reject) => {
       child.once("error", reject); child.once("close", code => resolve(code));
     });
-    let refresh: Promise<unknown> | undefined, mutation: Promise<unknown> | undefined;
+    let refresh: Promise<unknown> | undefined, mutation: Promise<unknown> | undefined, changing: Promise<unknown> | undefined;
     try {
       await new Promise<void>((resolve, reject) => {
         child.stdout.once("data", () => resolve());
         child.once("error", reject); child.once("exit", () => reject(new Error(`holder exited: ${stderr}`)));
       });
-      // Observe real registry custody at the actual batch call, without pausing it.
+      // Observe real registry custody at the actual changed batch call, without pausing it.
       const owner = path.join(config.actorRoot, "actors.json.lock", "owner");
       let entered!: () => void;
       const selected = new Promise<void>(resolve => { entered = resolve; });
@@ -226,10 +223,11 @@ describe("#4383 resident host presence batch", () => {
       vi.spyOn(host.mesh, "writeBatch").mockImplementationOnce(input => {
         expect(fs.existsSync(owner)).toBe(true); entered(); return batch(input);
       });
-      refresh = host.participants.refresh().catch(error => error);
+      changing = host.actors.setInstructions(records[0]!.id, "changed while mesh is busy").catch(error => error);
       await selected;
+      refresh = host.participants.refresh().catch(error => error);
       const started = performance.now();
-      mutation = host.actors.setInstructions(records[0]!.id, "changed while mesh is busy");
+      mutation = host.actors.setInstructions(records[0]!.id, "changed again while mesh is busy");
       await mutation;
       const mutationMs = performance.now() - started;
       console.log(JSON.stringify({ regression: "external-mesh-hold", files, mutationMs }));
@@ -237,57 +235,124 @@ describe("#4383 resident host presence batch", () => {
       expect(await refresh).toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
       expect(await exited, stderr).toBe(0);
       await host.participants.refresh(); // pending change survives, then commits on recovery
-      expect(new ActorRegistryStore(config.actorRoot).records()[0]).toMatchObject({ instructions: "changed while mesh is busy" });
+      expect(new ActorRegistryStore(config.actorRoot).records()[0]).toMatchObject({ instructions: "changed again while mesh is busy" });
     } finally {
-      await exited; await refresh; await mutation;
+      await exited; await refresh; await mutation; await changing;
     }
   }, 10000);
 
-  it("unwinds registry custody when dead participant-key recovery finds a busy mesh", async () => {
+  it.each([false, true])("unwinds registry custody when dead participant-key recovery finds a busy mesh (recorded deletes=%s)", async recorded => {
     const { host, config, records } = await fixture(true);
+    const key = participantKey(records[0]!.id);
+    const before = readParticipantFile(config.meshRoot, key)!;
+    const file = path.join(config.meshRoot, "participants", key.slice("topology/participants/".length) + ".json");
+    // The explicit round below tests custody, not the automatic heartbeat. Drain
+    // startup and suspend its timer so a slow Windows holder boot cannot consume
+    // the planted recovery before the observation starts.
+    host.participants.suspend();
+    await host.participants.refresh();
     const keyLock = path.join(config.meshRoot, "participants", ".locks", createHash("sha256").update(records[0]!.id).digest("hex"));
-    fs.mkdirSync(keyLock, { recursive: true });
-    fs.writeFileSync(path.join(keyLock, "owner"), "2147483647\n\ndead-key\n");
+    const deadOwner = "2147483647\n\ndead-key\n";
+    const deletedReceipts: string[] = [];
+    if (recorded) {
+      const remove = fs.rmSync;
+      vi.spyOn(fs, "rmSync").mockImplementation((target, options) => {
+        if (String(target).startsWith(`${keyLock}.`) && String(target).endsWith(".dead")) {
+          deletedReceipts.push(fs.readFileSync(path.join(String(target), "owner"), "utf8"));
+          return; // Record this key's detached deletion; never execute it locally.
+        }
+        remove(target, options);
+      });
+    }
     const child = spawn(process.execPath, [path.resolve("tests/fixtures/hold-mesh-lock.mjs"), config.meshRoot, "3000"],
       { stdio: ["ignore", "pipe", "inherit"] });
     const exited = new Promise<number | null>((resolve, reject) => { child.once("error", reject); child.once("close", resolve); });
     try {
       await new Promise<void>((resolve, reject) => { child.stdout.once("data", () => resolve()); child.once("error", reject); });
+      // Inject only AFTER mesh custody is held, with no await before observing
+      // the repair: an earlier refresh could otherwise heal the missing file.
+      fs.renameSync(file, `${file}.fixture-held`);
+      expect(readParticipantFile(config.meshRoot, key)).toBeUndefined();
+      fs.mkdirSync(keyLock, { recursive: true });
+      fs.writeFileSync(path.join(keyLock, "owner"), deadOwner);
+      const custody = host.mesh.custody.bind(host.mesh);
+      const recovery = vi.spyOn(host.mesh, "custody").mockImplementationOnce((operation, timeout) => {
+        expect(fs.readFileSync(path.join(keyLock, "owner"), "utf8")).toBe(deadOwner);
+        expect(fs.existsSync(path.join(config.actorRoot, "actors.json.lock", "owner"))).toBe(true);
+        expect(host.mesh.tryLockBudgetMs).toBe(50);
+        return custody(operation, timeout);
+      });
       const started = performance.now();
       await expect(host.participants.refresh()).rejects.toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
+      expect(recovery).toHaveBeenCalledOnce(); // it was key recovery, not an earlier shared batch
+      recovery.mockRestore();
       await new ActorRegistryStore(config.actorRoot).withLock(() => undefined);
       expect(performance.now() - started).toBeLessThan(1000);
-      expect(fs.existsSync(keyLock)).toBe(true); // no recovery without mesh custody
+      expect(fs.readFileSync(path.join(keyLock, "owner"), "utf8")).toBe(deadOwner); // no recovery without mesh custody
+      expect(deletedReceipts).toEqual([]);
+      expect(readParticipantFile(config.meshRoot, key)).toBeUndefined();
       expect(await exited).toBe(0);
       await host.participants.refresh();
       expect(fs.existsSync(keyLock)).toBe(false);
+      expect(readParticipantFile(config.meshRoot, key)?.value).toEqual(before.value);
+      if (recorded) expect(deletedReceipts).toContain(deadOwner);
     } finally { await exited; }
   }, 10000);
 
-  it.each([false, true])("renews 40 actors across both scopes in one host batch without a Main (files=%s)", async files => {
+  it.each([false, true])("does not rewrite unchanged actors across full heartbeats (files=%s)", async files => {
     const { host, config, records } = await fixture(files);
     let now = Date.now(); vi.spyOn(Date, "now").mockImplementation(() => now);
     const batch = vi.spyOn(host.mesh, "writeBatch"), put = vi.spyOn(host.mesh, "put"), del = vi.spyOn(host.mesh, "delete");
-    const confirm = vi.spyOn(host.mesh, "confirmWritable");
+    const beforePresence = new Map(records.map(row => [row.id, host.mesh.get(`actors/${config.sessionId}/${row.id}`, { fresh: true })!.version]));
+    const beforeParticipants = new Map(records.map(row => [row.id, host.mesh.get(participantKey(row.id), { fresh: true })?.version]));
+    const beforeFiles = new Map(records.map(row => [row.id, readParticipantFile(config.meshRoot, participantKey(row.id))?.version]));
     for (let round = 0; round < 3; round++) {
       now += 5_000; batch.mockClear();
       await host.participants.refresh();
-      expect(batch).toHaveBeenCalledOnce(); expect(put).not.toHaveBeenCalled(); expect(del).not.toHaveBeenCalled();
-      expect(confirm).not.toHaveBeenCalled();
-      const ops = batch.mock.calls[0]![0].ops;
-      expect(ops.filter(op => op.key.startsWith("actors/"))).toHaveLength(40);
-      expect(ops.filter(op => op.kind === "put" && op.key.startsWith("topology/participants/"))).toHaveLength(files ? 0 : 40);
+      expect(put).not.toHaveBeenCalled(); expect(del).not.toHaveBeenCalled();
+      const ops = batch.mock.calls.flatMap(([input]) => input.ops);
+      expect(ops.filter(op => op.key.startsWith("actors/"))).toHaveLength(0);
+      expect(ops.filter(op => op.key.startsWith("topology/participants/"))).toHaveLength(0);
       for (const row of records) {
-        const presence = host.mesh.get(`actors/${config.sessionId}/${row.id}`, { fresh: true })!;
-        expect(presence.value).toMatchObject({ id: row.id, name: row.name, scope: row.scope, status: "idle", residency: "durable", updatedAt: row.updatedAt });
-        expect(presence.updatedAt).toBe(now);
-        const participant = readParticipantFile(config.meshRoot, participantKey(row.id))!;
-        expect(participant.updatedAt).toBe(now);
-        expect(participant.value).toMatchObject({ id: row.id, ownerHostId: host.hostId, rootId: config.rootId });
+        expect(host.mesh.get(`actors/${config.sessionId}/${row.id}`, { fresh: true })!.version).toBe(beforePresence.get(row.id));
+        expect(host.mesh.get(participantKey(row.id), { fresh: true })?.version).toBe(beforeParticipants.get(row.id));
+        expect(readParticipantFile(config.meshRoot, participantKey(row.id))?.version).toBe(beforeFiles.get(row.id));
       }
       expect(readHostLease(config.meshRoot, host.hostId)).toMatchObject({ updatedAt: now, expiresAt: now + 15_000 });
       expect(host.participants.get(config.rootId)).toBeUndefined();
     }
+  });
+
+  it.each([false, true])("counts zero unchanged actor and participant writes for 100 actors (files=%s)", async files => {
+    const { host, config, records } = await fixture(files, 100);
+    let now = Date.now(); vi.spyOn(Date, "now").mockImplementation(() => now);
+    const batch = vi.spyOn(host.mesh, "writeBatch");
+    const rename = vi.spyOn(fs, "renameSync");
+    const leasePath = hostLeasePath(config.meshRoot, host.hostId);
+    const before = new Map(records.map(row => [row.id, {
+      actor: host.mesh.get(`actors/${config.sessionId}/${row.id}`, { fresh: true })!.version,
+      participant: host.mesh.get(participantKey(row.id), { fresh: true })?.version,
+      file: readParticipantFile(config.meshRoot, participantKey(row.id))?.version,
+    }]));
+    for (let round = 0; round < 3; round++) {
+      now += 5_000;
+      batch.mockClear(); rename.mockClear();
+      await host.participants.refresh();
+      const ops = batch.mock.calls.flatMap(([input]) => input.ops);
+      const leaseWrites = rename.mock.calls.filter(([, to]) => String(to) === leasePath).length;
+      console.info(JSON.stringify({ actors: records.length, files, round, actorPuts: ops.filter(op => op.key.startsWith("actors/")).length,
+        participantPuts: ops.filter(op => op.key.startsWith("topology/participants/")).length, leaseWrites }));
+      expect(leaseWrites).toBe(1);
+      expect(ops.filter(op => op.key.startsWith("actors/")).length).toBe(0);
+      expect(ops.filter(op => op.key.startsWith("topology/participants/")).length).toBe(0);
+      for (const row of records) {
+        const prior = before.get(row.id)!;
+        expect(host.mesh.get(`actors/${config.sessionId}/${row.id}`, { fresh: true })!.version).toBe(prior.actor);
+        expect(host.mesh.get(participantKey(row.id), { fresh: true })?.version).toBe(prior.participant);
+        expect(readParticipantFile(config.meshRoot, participantKey(row.id))?.version).toBe(prior.file);
+      }
+    }
+    expect(readHostLease(config.meshRoot, host.hostId)!.updatedAt).toBe(now);
   });
 
   it.each([false, true])("flushes only changed presence before the next full renewal (files=%s)", async files => {
@@ -311,11 +376,8 @@ describe("#4383 resident host presence batch", () => {
     batch.mockClear(); now += 5_000;
     await host.participants.refresh();
     expect(full).toHaveBeenCalledOnce();
-    expect(batch).toHaveBeenCalledOnce();
-    expect(batch.mock.calls[0]![0].ops.filter(op => op.key.startsWith("actors/"))).toHaveLength(40);
-    for (const row of records) {
-      expect(readParticipantFile(config.meshRoot, participantKey(row.id))!.updatedAt).toBe(now);
-    }
+    expect(batch).not.toHaveBeenCalled();
+    expect(readParticipantFile(config.meshRoot, participantKey(sibling.id))!.updatedAt).toBe(prior);
     expect(readHostLease(config.meshRoot, host.hostId)!.updatedAt).toBe(now);
   });
 
@@ -331,6 +393,7 @@ describe("#4383 resident host presence batch", () => {
     const batch = vi.spyOn(host.mesh, "writeBatch").mockImplementationOnce(async () => {
       entered(); await held; throw new MeshLockTimeoutError(" held by pid 123", 5, 10);
     });
+    const changing = host.actors.setInstructions(records[0]!.id, "changed before timeout");
     const refreshing = host.participants.refresh();
     const rejected = expect(refreshing).rejects.toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
     try {
@@ -351,7 +414,7 @@ describe("#4383 resident host presence batch", () => {
       await host.participants.refresh();
       expect(batch).toHaveBeenCalledTimes(2);
       expect(batch.mock.calls[1]![0].ops.filter(op => op.key.startsWith("actors/"))).toHaveLength(40);
-    } finally { release(); releaseRecovery(); await refreshing.catch(() => undefined); }
+    } finally { release(); releaseRecovery(); await changing.catch(() => undefined); await refreshing.catch(() => undefined); }
   });
 
   it("does not turn a failed change round into a second full heartbeat for its waiters", async () => {

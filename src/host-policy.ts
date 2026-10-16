@@ -1,3 +1,4 @@
+import { diagnostics } from "./core/diagnostics.js";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -19,7 +20,7 @@ let warnedAgentDisabled = false;
 export const warnAgentLandlockDisabled = (): void => {
   if (warnedAgentDisabled) return;
   warnedAgentDisabled = true;
-  console.warn(`[pi-fabric] agent-dir executor.landlock.disabled is not trusted host policy; ignored; provision ${HOST_POLICY_PATH} as root`);
+  diagnostics.warn("src/host-policy.ts", `[pi-fabric] agent-dir executor.landlock.disabled is not trusted host policy; ignored; provision ${HOST_POLICY_PATH} as root`);
 };
 
 const trustedMode = (stat: fs.Stats): boolean => stat.uid === 0 && (stat.mode & 0o022) === 0;
@@ -108,14 +109,14 @@ export const readHostPolicy = (): HostPolicy => {
     if (missing) {
       if (!warnedMissing) {
         warnedMissing = true;
-        console.warn(`[pi-fabric] ${HOST_POLICY_PATH} is missing; agent-dir authority relaxations are disabled. Hosts must provision root-owned policy.`);
+        diagnostics.warn("src/host-policy.ts", `[pi-fabric] ${HOST_POLICY_PATH} is missing; agent-dir authority relaxations are disabled. Hosts must provision root-owned policy.`);
       }
       return { status: "missing" };
     }
     if (!warnedInvalid) {
       warnedInvalid = true;
       const reason = error instanceof Error ? error.message : String(error);
-      console.warn(`[pi-fabric] ignoring untrusted or unreadable host policy at ${HOST_POLICY_PATH}: ${reason}; strict Landlock enforce, no authority relaxations or escapes`);
+      diagnostics.warn("src/host-policy.ts", `[pi-fabric] ignoring untrusted or unreadable host policy at ${HOST_POLICY_PATH}: ${reason}; strict Landlock enforce, no authority relaxations or escapes`);
     }
     return { status: "invalid" };
   } finally {

@@ -40,7 +40,8 @@ import { launchLog, same, stopAllOwned, type LaunchLog } from "../helpers/owned-
  * - E4 B5: same-root producer/admission manifest/journal/native Pi inbox.
  *   File-mode source classes are composed explicitly by the fixture. This is
  *   NOT the full fabric-runtime-state composition, a two-host canary, or NATS
- *   evidence. NATS cases explicitly skip/required-fail until A2 is available.
+ *   evidence. Actual-root NATS durable-close/Main-kill B5 cases now live in
+ *   nats-native-boundaries.test.ts; remaining NATS variants stay explicit gaps.
  *   No B5 completion ENVELOPE crosses a machine. Remote placement can return
  *   result data to a local manager; these cases pin needs:["local"] instead.
  *   No completion operation, remote ledger, validator or receipt protocol.
@@ -53,10 +54,10 @@ const REQUIRED = process.env.FABRIC_TRANSPORT_REQUIRED === "1";
 const DEADLINE_MS = 30_000;
 const MAIN_MARKER = "NATIVE_MAIN_JOURNAL_REPLAY_ONCE";
 const TASK_MARKER = "NATIVE_TASK_B3_UNCONSUMED_FOLLOW_UP";
-const NATS_DEPENDENCY = "E4 NATS coverage BLOCKED: this base has no src/transport/index.ts or A2 native runtime/resident composition. " +
-  "Setting PI_FABRIC_MESH_TRANSPORT=nats on these file-only classes is not carrier coverage. " +
-  "Run the identical native B4/B5 custody cases through A2 with a real broker and inspect all FABRIC_IN_<machine> streams " +
-  "and control-seen for absence of completion operations/claims. No fake carrier or passing NATS claim.";
+const NATS_DEPENDENCY = "Remaining E4 NATS variant is not authored here. Actual A2 runtime/resident roots exist; " +
+  "nats-native-boundaries.test.ts composes durable-close and durable-main-kill B5 through them with a real JWT broker. " +
+  "NATS B4 kill/stop-failure, durable-host-kill and session-main-kill still need their own actual-root cases. " +
+  "Setting a carrier env on this FILE fixture is not coverage; no passing substitute.";
 const digest = (id: string) => createHash("sha256").update(id).digest("hex");
 const completionFiles = (meshRoot: string, id: string) => {
   const directory = path.join(meshRoot, "agent-completions"); const name = `${digest(id)}.json`;
@@ -907,8 +908,9 @@ describe("E4 T-B5 — file carrier's unchanged same-root completion custody, nat
   }
 });
 
-describe("E4 identical B4/B5 assertions under NATS — dependency coverage, NOT a passing substitute", () => {
-  for (const testCase of ["B4(i)", "B4(ii)", "B4(iii)", "B5 durable-close", "B5 durable-main-kill", "B5 durable-host-kill", "B5 session-main-kill"]) {
-    it(`${testCase} requires A2's actual native NATS composition and broker evidence`, ctx => unavailable(ctx, NATS_DEPENDENCY));
+describe("E4 remaining NATS variants — explicit coverage gaps, NOT a passing substitute", () => {
+  // Durable-close/Main-kill B5 routing: nats-native-boundaries.test.ts.
+  for (const testCase of ["B4(i)", "B4(ii)", "B4(iii)", "B5 durable-host-kill", "B5 session-main-kill"]) {
+    it(`${testCase} still needs an authored actual-root NATS case`, ctx => unavailable(ctx, NATS_DEPENDENCY));
   }
 });

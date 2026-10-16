@@ -3,10 +3,13 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
+import type { AgentRunRequest, AgentRunResult } from "../src/agents/types.js";
 import { ActorManager } from "../src/actors/manager.js";
+import { ActorMeshMonitor } from "../src/actors/mesh-monitor.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
-import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
+import { MeshStore, type MeshEvent, type MeshIdentity } from "../src/mesh/store.js";
+import { normalizeScope, senderStamp } from "../src/scope.js";
 
 const roots: string[] = [];
 const closers: Array<() => Promise<void>> = [];
@@ -358,6 +361,95 @@ describe("actor coalesceKey for mesh events", () => {
     const tasks = runTasks(root, actors, actor.id).filter((task) => task.includes('"number":'));
     expect(tasks.map((task) => task.match(/rev-[a-z]+/)![0])).toEqual(["rev-b", "rev-x"]);   // PR 1 in its first place
   }, 30_000);
+
+  // Trust boundary: retroactive coalescing must carry the winning payload's authority,
+  // including after bootstrap. The reversed row also rejects an unconditional sender copy.
+  it.each([
+    { label: "older trusted then newer foreign", olderTrusted: true, reverse: false },
+    { label: "older foreign then newer trusted", olderTrusted: false, reverse: false },
+    { label: "newer foreign before an older trusted sequence", olderTrusted: true, reverse: true },
+  ])("$label retains the winning sender through restore and retroactive coalescing", async ({ olderTrusted, reverse }) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-coalesce-trust-"));
+    roots.push(root);
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
+    const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "runs"),
+    });
+    const runs: AgentRunRequest[] = [];
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const run = vi.spyOn(agents, "run").mockImplementation(async (request, signal, onSpawned) => {
+      runs.push(request);
+      const id = `coalesce-trust-${runs.length}`;
+      onSpawned?.({ id, name: "recorded", status: "running", runner: "pi", transport: "process", cwd: process.cwd() });
+      await new Promise<void>((resolve, reject) => {
+        const abort = () => reject(new Error("held coalescing test run aborted"));
+        signal?.addEventListener("abort", abort, { once: true });
+        if (signal?.aborted) abort();
+        void held.then(() => { signal?.removeEventListener("abort", abort); resolve(); });
+      });
+      return { id, name: "recorded", task: request.task, status: "completed", runner: "pi", transport: "process", cwd: process.cwd(),
+        startedAt: Date.now(), updatedAt: Date.now(), turns: 1, toolCalls: 0, inferenceStarted: true, text: "",
+        value: { action: "silent" }, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } } satisfies AgentRunResult;
+    });
+    let monitor!: ActorMeshMonitor;
+    const start = vi.spyOn(ActorMeshMonitor.prototype, "start").mockImplementation(function (this: ActorMeshMonitor) { monitor = this; });
+    const open = () => new ActorManager("test", identity, mesh, { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, agents, () => {}, {
+      actorRoot: path.join(root, "actors"), persistent: true, closeGraceMs: 1_000,
+      meshRetentionSweepPath: false, canConsumeMesh: () => false,
+    });
+    let actors = open();
+    closers.push(async () => {
+      release();
+      try { await actors.close(); await agents.close(); }
+      finally { run.mockRestore(); start.mockRestore(); }
+    });
+    const actor = await actors.create({ name: "trust-coalescer", instructions: "Inspect.", topics: ["coalesce.trust"], coalesce: false, batchWindowMs: 0 });
+    const dir = path.join(root, "actors", actor.id);
+    const queuedMesh = () => fs.readdirSync(dir).filter(name => /^queue-.+\.json$/.test(name)).flatMap(name =>
+      (JSON.parse(fs.readFileSync(path.join(dir, name), "utf8")) as {
+        items: Array<{ source: string; payload: MeshEvent; sender?: ReturnType<typeof senderStamp> }>;
+      }).items.filter(item => item.source === "mesh:coalesce.trust"));
+    const trusted = senderStamp(undefined);
+    const foreign = senderStamp(normalizeScope({ principal: { id: "foreign-owner" }, grants: [{ resource: "mesh:coalesce.trust", actions: ["write"] }] }));
+    actors.tell(actor.id, "coalesce-blocker");
+    await waitFor(() => runs.length === 1);
+    const older = await mesh.publish({ topic: "coalesce.trust", from, sender: olderTrusted ? trusted : foreign, data: { key: "same", revision: "older" } });
+    const newer = await mesh.publish({ topic: "coalesce.trust", from, sender: olderTrusted ? foreign : trusted, data: { key: "same", revision: "newer" } });
+    expect(newer.sequence).toBeGreaterThan(older.sequence);
+    const admitted = reverse ? [newer, older] : [older, newer];
+    // Drive the real monitor admission callback, without a watcher/timing race.
+    for (const event of admitted) expect(monitor.callbacks.onEvent(event)).toBe(true);
+    expect(actors.status(actor.id).queued).toBe(2);
+    expect(queuedMesh().map(item => [item.payload, item.sender])).toEqual(admitted.map(event => [event, event.sender]));
+
+    await actors.close(); // Abort the blocker, leaving both accepted mesh items checkpointed.
+    actors = open();
+    await waitFor(() => runs.length === 2); // The restored blocker holds the queue again.
+    expect(actors.status(actor.id).queued).toBe(2);
+    expect(queuedMesh().map(item => [item.payload, item.sender])).toEqual(admitted.map(event => [event, event.sender]));
+    await actors.setCoalesceKey(actor.id, "key"); // Actual #mergeCoalesced, not enqueue replacement.
+    expect(actors.status(actor.id).queued).toBe(1);
+    const selected = queuedMesh();
+    expect(selected).toHaveLength(1);
+    expect(selected[0]!.payload).toEqual(newer);
+    release();
+    await waitFor(() => runs.length === 3 && actors.status(actor.id).status === "idle");
+    const task = runs[2]!.task;
+    const header = task.split("\n\n").find(part => part.startsWith("Fabric actor message from "))!;
+    const frame = JSON.parse(task.slice(task.lastIndexOf("\n\n") + 2)) as { source: string; payload: MeshEvent; untrusted?: true };
+    expect(frame.source).toBe("mesh:coalesce.trust");
+    expect(frame.payload).toEqual(newer);
+    expect(frame.payload.sender).toEqual(newer.sender);
+    if (olderTrusted) {
+      expect(header).toContain("UNTRUSTED input from a different or narrower principal");
+      expect(frame.untrusted).toBe(true);
+    } else {
+      expect(header).toBe("Fabric actor message from mesh:coalesce.trust:");
+      expect(frame).not.toHaveProperty("untrusted");
+    }
+    expect(selected[0]!.sender).toEqual(newer.sender);
+  });
 
   // A HANG run in flight is aborted by the ownership loss and retried first when ownership returns,
   // so PR 1's parked event cannot start, however the polls interleave (review/astra on #86: a

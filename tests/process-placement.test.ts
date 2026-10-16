@@ -343,10 +343,31 @@ describe("host process task placement", () => {
     fs.writeFileSync(path.join(f.results,h.id,"result.md"),"FINAL"); fs.writeFileSync(path.join(f.results,h.id,"rc"),"0");
     expect((await f.manager.wait(h.id)).text).toBe("FINAL");
   });
-  it("cancels at the task deadline and maps a timeout via agents.wait", async () => {
-    const f=fixture(true); const h=await f.manager.spawn({task:"pending",transport:"process"});
+  it("preserves confirmed exitCode when the manager deadline cancels placement first", async () => {
+    const f=fixture(true);
+    const realLaunch=ProcessTransport.prototype.launch;
+    vi.spyOn(ProcessTransport.prototype,"launch").mockImplementation(async function(this: ProcessTransport, request) {
+      const handle=await realLaunch.call(this,request);
+      const statusFile=request.workerArguments[request.workerArguments.indexOf("--status-file")+1]!;
+      const {deadline}=JSON.parse(fs.readFileSync(path.join(path.dirname(statusFile),"placement.json"),"utf8"));
+      // Expire the manager before its first liveness poll; no startup-time sleep.
+      vi.spyOn(Date,"now").mockReturnValue(deadline);
+      return handle;
+    });
+    const h=await f.manager.spawn({task:"pending",transport:"process"});
     expect(await f.manager.wait(h.id)).toMatchObject({status:"timed_out",exitCode:124});
     expect(fs.existsSync(path.join(f.results,h.id,"cancelled"))).toBe(true);
+    const events=fs.readFileSync(path.join(f.manager.runDirectory(h.id)!,"events.jsonl"),"utf8").trim().split("\n").map(line=>JSON.parse(line));
+    // Transport-owned timeout would report timed_out here, not stopped.
+    expect(events).toContainEqual(expect.objectContaining({type:"placement.result",status:"stopped",rc:"124"}));
+  });
+  it("keeps explicit manager.stop stopped with a confirmed native exitCode 124", async () => {
+    const f=fixture(true,60_000); const h=await f.manager.spawn({task:"pending",transport:"process"});
+    expect(await f.manager.stop(h.id)).toMatchObject({status:"stopped",exitCode:124});
+    expect(await f.manager.wait(h.id)).toMatchObject({status:"stopped",exitCode:124});
+    expect(fs.existsSync(path.join(f.results,h.id,"cancelled"))).toBe(true);
+    const events=fs.readFileSync(path.join(f.manager.runDirectory(h.id)!,"events.jsonl"),"utf8").trim().split("\n").map(line=>JSON.parse(line));
+    expect(events).toContainEqual(expect.objectContaining({type:"placement.result",status:"stopped",rc:"124"}));
   });
   it("bounds broken polling and reports timeout debt without claiming remote exit", async () => {
     const f=fixture(true); f.config.placement.resultCommand=[process.execPath,f.launcher,"bad-poll",f.results,"{id}"];

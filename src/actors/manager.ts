@@ -32,6 +32,7 @@ import type { FabricParticipantRecord, FabricParticipantResidency } from "../top
 import { PARTICIPANT_NAME_PATTERN as ACTOR_NAME_PATTERN } from "../topology/participant-name.js";
 import { AgentLaunchPreparationTimeoutError, AgentManager } from "../agents/manager.js";
 import type { AgentRunRecord, AgentRunRequest, AgentRunResult } from "../agents/types.js";
+import { isRecoveredDurableStop } from "../agents/enodev-recovery.js";
 import type { ModelRouteDecision } from "../agents/model-route.js";
 import type { SpawnRouterAdmission } from "../agents/spawn-router.js";
 
@@ -4821,7 +4822,8 @@ export class ActorManager {
         let enodevRecovered = false; // a saved answer handed back, not a run: nothing to protect from a repeat
         let enodevDelivered = false; // its durable delivery receipt is written; commit after the queue ack
         let handoffConsumed = false;
-        // A run ended by a stop (agents.stop, a signal) is interrupted, not failing.
+        // Stops and recovered durable terminal stops are interrupted, not failing.
+        // Ordinary deadlines still fail; recovery provenance is host-only object identity.
         let runStopped = false;
         let capabilityLease: FabricCapabilityViewLease | undefined;
         let committedRefs: string[] | undefined;
@@ -4981,7 +4983,7 @@ export class ActorManager {
           // rerun, whatever happens to ownership afterwards.
           runCompleted = result.status === "completed";
           enodevRecovered = result.enodevRecovered === true;
-          runStopped = result.status === "stopped";
+          runStopped = result.status === "stopped" || isRecoveredDurableStop(result);
           const cancelled = actor.cancelAbort === abortController;
           if (cancelled) delete actor.cancelAbort;
           // A caller hears the run's own outcome; an event without one is recorded dropped.

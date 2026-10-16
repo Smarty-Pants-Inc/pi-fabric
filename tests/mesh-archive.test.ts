@@ -5,7 +5,8 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MESH_ARCHIVE_CONFIG, MeshArchive, MeshArchiveRecoveryChanged, archiveFileName, currentBoot } from "../src/mesh/archive.js";
 import { MeshStore, type MeshEvent, type MeshIdentity } from "../src/mesh/store.js";
-import { RootInbox, rootInboxMessage, rootInboxSession } from "../src/topology/root-inbox.js";
+import { RootInbox, rootInboxSession as unsignedRootInboxSession } from "../src/topology/root-inbox.js";
+import { rootInboxMessage, rootInboxSession } from "./root-inbox-issued-fixture.js";
 
 // smarty-dev#754 (Paul's decision 2): every mesh event goes into plain append-only files, one per
 // topic and UTC day. An event is archived durably before it goes live, and the live append
@@ -427,7 +428,11 @@ describe("mesh event archive", () => {
     const batch = await recipientInbox.next(rootInboxSession([]));
     expect(batch.events).toEqual([ordinary, keyed.event]);
     expect(batch.through).toBe(unrelated?.sequence ?? 3);
-    const delivered = rootInboxSession([{ type: "custom_message", ...rootInboxMessage(batch.events) }]);
+    const entry = { type: "custom_message", ...rootInboxMessage(batch.events) };
+    // Public receipt fields alone cannot commit the recovered suffix.
+    expect((await recipientInbox.next(unsignedRootInboxSession([entry]))).events).toEqual(batch.events);
+    expect(restarted.get(recipientInbox.key)?.value).toMatchObject({ after: 1, pending: { ids: batch.events.map(event => event.id) } });
+    const delivered = rootInboxSession([entry]);
     expect((await recipientInbox.next(delivered)).events).toEqual([]);
     expect(restarted.get(recipientInbox.key)?.value).toMatchObject({ after: batch.through });
     expect((await inbox(new MeshStore(root, store.maxEventBytes, store.maxReadEvents)).next(delivered)).events).toEqual([]);

@@ -3,10 +3,22 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { confirmedSessionEntries, confirmedSessionReceiptSnapshot, type SessionReceiptManager } from "../src/core/session-receipts.js";
-import { confirmedMainInboxIds, confirmedRootInboxSession, projectRootInboxReceipt, rootInboxSession } from "../src/topology/root-inbox.js";
+import { confirmedMainInboxIds, projectRootInboxReceipt } from "../src/topology/root-inbox.js";
+import { confirmedRootInboxSession, registerIssuedInbox, rootInboxSession } from "./root-inbox-issued-fixture.js";
 
 const matches = (line: string) => line.includes("pi-fabric-inbox") || line.includes("pi-fabric-agent-message");
-const receipt = (id: string) => JSON.stringify({ type: "custom_message", customType: "pi-fabric-inbox", timestamp: "2026-01-01T00:00:00.000Z", details: { ids: [id] } }) + "\n";
+// Cache the test-owned issuance so byte-rewrite and partial-line probes keep deterministic bytes.
+const issuedReceipts = new Map<string, string>();
+const receipt = (id: string): string => {
+  const cached = issuedReceipts.get(id);
+  if (cached) return cached;
+  const entry = { type: "custom_message", customType: "pi-fabric-inbox", timestamp: "2026-01-01T00:00:00.000Z",
+    content: "test-owned issued receipt", details: { ids: [id] } };
+  registerIssuedInbox(entry.details, entry.content);
+  const line = JSON.stringify(entry) + "\n";
+  issuedReceipts.set(id, line);
+  return line;
+};
 const other = JSON.stringify({ type: "message", message: { role: "user", content: "unrelated" } }) + "\n";
 const roots: string[] = [];
 afterEach(() => { vi.restoreAllMocks(); for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });

@@ -108,7 +108,7 @@ describe("core override prompt guidance", () => {
     try {
       const { default: piFabric } = await import("../src/index.js");
       await piFabric(pi);
-      const handler = (event: { systemPrompt: string; prompt: string; systemPromptOptions: { skills: unknown[] } }, context: unknown) =>
+      const handler = (event: { systemPrompt: string; prompt?: string; systemPromptOptions: { skills: unknown[] } }, context: unknown) =>
         emitBeforeAgentStart(handlers, event, context);
       const result = await handler({
         systemPrompt: "base system",
@@ -155,6 +155,13 @@ describe("core override prompt guidance", () => {
           },
         ];
         const modelContext = { model: { provider: "deepseek", id: "deepseek-chat" } };
+        const noPromptResult = await handler({
+          systemPrompt: "base system",
+          systemPromptOptions: { skills },
+        }, modelContext);
+        expect(noPromptResult.systemPromptOptions.sections.skills).toContain("Use `pi.read` inside `fabric_exec`");
+        expect(noPromptResult.systemPromptOptions.sections.fabric_execution).toContain("Pi Fabric full code mode");
+
         const guidedEvent = {
           systemPrompt: "base system",
           prompt: "inspect source",

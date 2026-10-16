@@ -99,7 +99,7 @@ import { MeshConsumptionPausedError, assertMeshConsumption } from "../topology/m
 import { ParticipantDirectory } from "../topology/participant-directory.js";
 import type { FabricTransport } from "../transport/types.js";
 import { hostLeasePath, readHostLeaseCurrent } from "../topology/host-leases.js";
-import { RESIDENT_IDLE_EXIT_MS, FabricMeshTransportConfigError, validateFabricNatsOperatorMachine } from "../config.js";
+import { RESIDENT_IDLE_EXIT_MS, FabricMeshTransportConfigError, normalizeFabricConfig, validateFabricNatsOperatorMachine } from "../config.js";
 import { residentIdleExitPath, type ResidentIdleExit } from "./idle-exit.js";
 import { rootPresenceAlarms } from "../topology/stall-alarms.js";
 import { actorParticipantRecord, agentParticipantRecords } from "../topology/records.js";
@@ -437,6 +437,11 @@ export class ResidentHost {
   async #prepareNatsTransport(): Promise<string> {
     // Direct ResidentHost callers do not necessarily pass through config normalization.
     if (this.config.mesh.hostTransport !== "nats") throw new FabricMeshTransportConfigError("nats", this.config.mesh.hostTransport ?? "file");
+    const normalized = normalizeFabricConfig({ mesh: this.config.mesh }).mesh;
+    // Environment resolution must never turn this NATS activation into FILE policy.
+    if (normalized.transport !== "nats") throw new FabricMeshTransportConfigError("nats", normalized.transport);
+    // Only messaging settings are normalized; retain every other raw host mesh setting.
+    this.config.mesh.nats = normalized.nats;
     validateFabricNatsOperatorMachine(this.config.mesh.nats.operatorMachine, this.config.mesh.nats.machine);
     this.mesh = this.#createMesh();
     const { resolveAgentDir } = await import("../core/agent-dir.js");

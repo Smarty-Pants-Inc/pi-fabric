@@ -126,7 +126,8 @@ describe("ActorManager ownership notifications", () => {
       await waitFor(() => successor!.messages(actor.id).filter(message => message.direction === "out" && !message.error).length === 2);
       expect(successor!.messages(actor.id).filter(message => message.direction === "out" && !message.error)).toHaveLength(2);
       expect(registryRoot()).toBe("session:successor");
-      if (edge === "crash") expect(Date.now() - (ownerDeadline - DEFAULT_PARTICIPANT_LEASE_MS - 17_000)).toBeLessThan(120_000);
+      // Preserve the old 90 s lease + 17 s late renewal + 13 s settlement = 120 s bound.
+      if (edge === "crash") expect(Date.now() - ownerDeadline).toBeLessThan(13_000);
       expect(run.mock.calls.map(([request]) => request.task).filter(task => task.includes("backlog-a"))).toHaveLength(1);
       expect(run.mock.calls.map(([request]) => request.task).filter(task => task.includes("backlog-b"))).toHaveLength(1);
     } finally {

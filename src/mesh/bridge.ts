@@ -1242,8 +1242,10 @@ export class StoreBridgeSide implements BridgeSide {
           const priorTokens = token === undefined ? []
             : (currentTokens.get(record.rootId) ?? []).filter(held => held !== token);
           const history = mergeBridgeSupersededHistory(superseded.get(record.rootId) ?? [], priorTokens);
-          const admitted = { ...record, ...incarnation, bridgeSupersededTokens: history.tokens,
-            bridgeSupersededTokenSeen: history.seen };
+          const { bridgeSupersededTokens: _tokens, bridgeSupersededTokenSeen: _seen, ...recordFields } = record;
+          const admitted = { ...recordFields, ...incarnation,
+            ...(history.tokens.length > 0 ? { bridgeSupersededTokens: history.tokens } : {}),
+            ...(Object.keys(history.seen).length > 0 ? { bridgeSupersededTokenSeen: history.seen } : {}) };
           hosts.set(record.id, admitted);
           wanted.set(keyFor(HOST_PREFIX, record.id), {
             value: { ...admitted, updatedAt: now, expiresAt: until, remoteHost: relayed ? record.remoteHost : this.peer,
@@ -1252,7 +1254,8 @@ export class StoreBridgeSide implements BridgeSide {
           });
           // The lease carries the same age floor as the host, including lease-only authority.
           leases.push({ id: record.id, rootId: record.rootId, identityId: record.identity.id, ...incarnation,
-            bridgeSupersededTokens: history.tokens, bridgeSupersededTokenSeen: history.seen,
+            ...(history.tokens.length > 0 ? { bridgeSupersededTokens: history.tokens } : {}),
+            ...(Object.keys(history.seen).length > 0 ? { bridgeSupersededTokenSeen: history.seen } : {}),
             // Keep the bounded sources' first-seen evidence until the file effect completes;
             // otherwise an evicted duplicate could reenter from disk with a later ordinal.
             historySeenFloor: history.firstSeen,
@@ -1439,9 +1442,10 @@ export class StoreBridgeSide implements BridgeSide {
     // deadline stay together: max(expiry) would revive a sampled origin after its deadline (#10068).
     if (base.mirror) base = { ...base, expiresAt: Math.min(base.expiresAt, base.mirror.observedAt +
       Math.min(BRIDGE_LEASE_MS, base.mirror.sourceExpiresAt - base.mirror.sourceObservedAt)) };
-    const { historySeenFloor: _floor, ...leaseFields } = base;
-    const repaired = { ...leaseFields, bridgeSupersededTokens: history.tokens,
-      bridgeSupersededTokenSeen: history.seen };
+    const { historySeenFloor: _floor, bridgeSupersededTokens: _tokens, bridgeSupersededTokenSeen: _seen, ...leaseFields } = base;
+    const repaired = { ...leaseFields,
+      ...(history.tokens.length > 0 ? { bridgeSupersededTokens: history.tokens } : {}),
+      ...(Object.keys(history.seen).length > 0 ? { bridgeSupersededTokenSeen: history.seen } : {}) };
     if (sameIncarnation && onDisk && onDisk.updatedAt === repaired.updatedAt && onDisk.expiresAt === repaired.expiresAt &&
         JSON.stringify(onDisk.mirror) === JSON.stringify(repaired.mirror) &&
         JSON.stringify(history.tokens) === JSON.stringify(bridgeSupersededTokensOf(onDisk.bridgeSupersededTokens)) &&

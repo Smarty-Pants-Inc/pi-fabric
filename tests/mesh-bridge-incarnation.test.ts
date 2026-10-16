@@ -163,11 +163,16 @@ describe("bridge incarnation admission at persisted trust boundaries (smarty-dev
         participants: [{ ...participant, name: "same-A-renewed" }] };
       const side = new StoreBridgeSide(restarted, "ryzen2", () => NOW + 1_000);
       await expect(side.mirror(renewed)).resolves.toBeUndefined();
-      expect(restarted.get(hostKey(identity.id), { fresh: true })?.value).toMatchObject({
-        incarnationToken: host.incarnationToken, bridgeSupersededTokens: [],
-      });
-      expect(readHostLease(restarted.root, identity.id)).toMatchObject({ incarnationToken: host.incarnationToken,
-        bridgeSupersededTokens: [], updatedAt: NOW + 1_000, expiresAt: NOW + 1_000 + BRIDGE_LEASE_MS });
+      const renewedHost = restarted.get(hostKey(identity.id), { fresh: true })?.value;
+      const renewedLease = readHostLease(restarted.root, identity.id);
+      const rawLease = JSON.parse(fs.readFileSync(hostLeasePath(restarted.root, identity.id), "utf8"));
+      expect(renewedHost).toMatchObject({ incarnationToken: host.incarnationToken });
+      expect(renewedLease).toMatchObject({ incarnationToken: host.incarnationToken,
+        updatedAt: NOW + 1_000, expiresAt: NOW + 1_000 + BRIDGE_LEASE_MS });
+      for (const record of [renewedHost, renewedLease, rawLease]) {
+        expect(record).not.toHaveProperty("bridgeSupersededTokens");
+        expect(record).not.toHaveProperty("bridgeSupersededTokenSeen");
+      }
       expect(restarted.get(participantKey(identity.id), { fresh: true })?.value).toMatchObject({ name: "same-A-renewed" });
       expect(side.holds(identity.id, identity)).toBe(true);
       expect(removals).toEqual([]);

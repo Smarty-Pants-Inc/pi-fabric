@@ -476,6 +476,44 @@ const meshStateBackend = (value: unknown, env = process.env.PI_FABRIC_MESH_STATE
   throw new Error(`mesh.stateBackend must be ${MESH_STATE_BACKEND_KIND_LIST}`);
 };
 
+/** Control carrier, independent of the keyed mesh state backend. */
+export type FabricMeshTransport = "file" | "nats";
+
+export class FabricMeshTransportConfigError extends Error {
+  readonly code = "FABRIC_MESH_TRANSPORT_CONFIG";
+  constructor(readonly requested: FabricMeshTransport, readonly hostTransport: FabricMeshTransport) {
+    super(`mesh.transport (${requested}) differs from mesh.hostTransport (${hostTransport}); refusing mixed carriers on this host`);
+    this.name = "FabricMeshTransportConfigError";
+  }
+}
+
+const meshTransport = (value: unknown, env = process.env.PI_FABRIC_MESH_TRANSPORT): FabricMeshTransport => {
+  // Match stateBackend: only the environment is trimmed/case-folded; a blank override is absent.
+  const override = env?.trim().toLowerCase();
+  if (override) {
+    if (override === "file" || override === "nats") return override;
+    throw new Error(`PI_FABRIC_MESH_TRANSPORT must be file or nats (got ${JSON.stringify(env)})`);
+  }
+  if (value === undefined) return "file";
+  if (value === "file" || value === "nats") return value;
+  throw new Error("mesh.transport must be file or nats");
+};
+
+const meshHostTransport = (value: unknown): FabricMeshTransport | undefined => {
+  if (value !== undefined && value !== "file" && value !== "nats") {
+    throw new Error("mesh.hostTransport must be file or nats");
+  }
+  // This is an inherited stamp, not an override of the host's own stamp.
+  const inherited = process.env.PI_FABRIC_MESH_HOST_TRANSPORT;
+  if (inherited !== undefined && inherited !== "file" && inherited !== "nats") {
+    throw new Error("PI_FABRIC_MESH_HOST_TRANSPORT must be file or nats");
+  }
+  if (value !== undefined && inherited !== undefined && value !== inherited) {
+    throw new FabricMeshTransportConfigError(value, inherited);
+  }
+  return value ?? inherited;
+};
+
 /** Host rollout policy for controls whose sender omits the destination epoch. */
 export type MeshControlIncarnationFence = "warn" | "enforce";
 const meshControlIncarnationFence = (value: unknown): MeshControlIncarnationFence => {
@@ -491,10 +529,103 @@ const meshNatsReplicas = (value: unknown): number => {
   throw new Error("mesh.nats.replicas must be a positive integer");
 };
 
+/** E14 messaging/rollback settings fail visibly in the same typed config-error family as E9. */
+export class FabricMeshNatsConfigError extends Error {
+  readonly code = "FABRIC_MESH_TRANSPORT_CONFIG";
+  constructor(readonly field: "operatorMachine" | "rollbackHoldUntil", requirement: string) {
+    super(`mesh.nats.${field} ${requirement}`);
+    this.name = "FabricMeshNatsConfigError";
+  }
+}
+
 export interface FabricMeshNatsConfig {
   /** Stream num_replicas on create; an existing stream with a different count is refused (default 1). */
   replicas: number;
+  /** Messaging connection settings. No credential is read while loading config. */
+  servers?: string[];
+  /** Host credential file path, consumed only by the NATS adapter. */
+  credentials?: string;
+  /** Literal machine id; the adapter must also verify it against the credential. */
+  machine?: string;
+  /** Reserved fabric-ops[-<lowercase alphanumeric>] relay source token; required for NATS, never this runtime's machine. */
+  operatorMachine?: string;
+  /** UTC ISO-8601 withdrawal hold, also honored after rollback to file. Composition roots convert to epoch ms. */
+  rollbackHoldUntil?: string;
+  /** Parallel inbox lanes; normalized configs supply 8, with a minimum of 1. */
+  inboxLanes?: number;
 }
+
+const meshNatsString = (value: unknown, field: "credentials" | "machine"): string | undefined => {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string") throw new Error(`mesh.nats.${field} must be a string`);
+  if (field === "machine" && !/^[a-z0-9][a-z0-9-]{0,31}$/.test(value)) {
+    throw new Error("mesh.nats.machine must match /^[a-z0-9][a-z0-9-]{0,31}$/");
+  }
+  return value;
+};
+
+/** Shared E16b guard: roots validate before NATS open and again against transport.self.machine after open. */
+export const validateFabricNatsOperatorMachine = (value: unknown, machine?: string): string => {
+  // Require the whole reserved literal: JavaScript's $ also matches just before a final newline.
+  if (typeof value !== "string" || value.length > 32 || /^fabric-ops(-[a-z0-9]+)?$/.exec(value)?.[0] !== value) {
+    throw new FabricMeshNatsConfigError("operatorMachine", "is required in NATS mode and must match /^fabric-ops(-[a-z0-9]+)?$/");
+  }
+  if (value === machine) {
+    throw new FabricMeshNatsConfigError("operatorMachine", "must differ from mesh.nats.machine");
+  }
+  return value;
+};
+
+const meshNatsRollbackHoldUntil = (value: unknown): string | undefined => {
+  if (value === undefined) return undefined;
+  // Minimal eager shape/calendar check only. Date.parse normalizes impossible dates;
+  // compare the UTC date, and retain the literal precision for lazy root conversion.
+  if (typeof value === "string" &&
+    /^\d{4}-\d{2}-\d{2}T(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d+)?)?(?:Z|\+00:00)$/.exec(value)?.[0] === value) {
+    const instant = Date.parse(value);
+    if (Number.isFinite(instant) && new Date(instant).toISOString().slice(0, 10) === value.slice(0, 10)) return value;
+  }
+  throw new FabricMeshNatsConfigError("rollbackHoldUntil", "must be a valid UTC ISO-8601 timestamp");
+};
+
+const meshNatsConfig = (value: unknown, transport: FabricMeshTransport): FabricMeshNatsConfig => {
+  const nats = objectValue(value);
+  // File mode still ignores messaging settings and their inherited snapshot. E14's hold is host rollback policy.
+  if (transport === "file") {
+    const rollbackHoldUntil = meshNatsRollbackHoldUntil(nats.rollbackHoldUntil);
+    return {
+      replicas: meshNatsReplicas(nats.replicas), inboxLanes: 8,
+      ...(rollbackHoldUntil !== undefined ? { rollbackHoldUntil } : {}),
+    };
+  }
+  let messaging = nats;
+  const raw = process.env.PI_FABRIC_MESH_NATS;
+  if (transport === "nats" && raw !== undefined) {
+    let parsed: unknown;
+    try { parsed = JSON.parse(raw); }
+    catch { throw new Error("PI_FABRIC_MESH_NATS must be a JSON object"); }
+    if (!isJsonObject(parsed)) throw new Error("PI_FABRIC_MESH_NATS must be a JSON object");
+    messaging = parsed;
+  }
+  // Inheritance replaces messaging settings, including absent optional fields, but not state-backend replicas.
+  const servers = messaging.servers;
+  if (servers !== undefined && (!Array.isArray(servers) || servers.some(server => typeof server !== "string"))) {
+    throw new Error("mesh.nats.servers must be an array of strings");
+  }
+  const credentials = meshNatsString(messaging.credentials, "credentials");
+  const machine = meshNatsString(messaging.machine, "machine");
+  const operatorMachine = validateFabricNatsOperatorMachine(messaging.operatorMachine, machine);
+  const rollbackHoldUntil = meshNatsRollbackHoldUntil(messaging.rollbackHoldUntil);
+  return {
+    replicas: meshNatsReplicas(nats.replicas),
+    ...(servers !== undefined ? { servers: [...servers as string[]] } : {}),
+    ...(credentials !== undefined ? { credentials } : {}),
+    ...(machine !== undefined ? { machine } : {}),
+    operatorMachine,
+    ...(rollbackHoldUntil !== undefined ? { rollbackHoldUntil } : {}),
+    inboxLanes: boundedInteger(messaging.inboxLanes, 8, 1, Number.MAX_SAFE_INTEGER),
+  };
+};
 
 export const RESIDENT_IDLE_EXIT_MS = 10 * 60_000;
 
@@ -505,7 +636,11 @@ export interface FabricMeshConfig {
   lockProtocol: MeshLockProtocol;
   /** Keyed-state backend: "file" (default), "shadow", "sqlite" or "nats" (refused until built); env PI_FABRIC_MESH_STATE_BACKEND overrides. */
   stateBackend: MeshStateBackend;
-  /** NATS state-backend settings; only read when stateBackend is "nats". */
+  /** Control carrier; default file, env PI_FABRIC_MESH_TRANSPORT overrides. */
+  transport: FabricMeshTransport;
+  /** Explicit per-host rollout stamp. A differing runtime carrier is refused. */
+  hostTransport?: FabricMeshTransport;
+  /** NATS state-backend and messaging settings; selecting either remains independent. */
   nats: FabricMeshNatsConfig;
   enabled: boolean;
   root?: string;
@@ -844,7 +979,8 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     controlIncarnationFence: "warn",
     lockProtocol: 1,
     stateBackend: "file",
-    nats: { replicas: 1 },
+    transport: "file",
+    nats: { replicas: 1, inboxLanes: 8 },
     enabled: true,
     announce: false,
     actorScope: "project",
@@ -1222,6 +1358,12 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
   const retention = objectValue(input.retention);
   const actors = objectValue(input.actors);
   const mesh = objectValue(input.mesh);
+  const carrier = meshTransport(mesh.transport);
+  const hostTransport = meshHostTransport(mesh.hostTransport);
+  // An unstamped host is on today's file carrier; selecting NATS never silently flips the host.
+  if (carrier !== (hostTransport ?? "file")) {
+    throw new FabricMeshTransportConfigError(carrier, hostTransport ?? "file");
+  }
   const memory = objectValue(input.memory);
   const extractive = objectValue(memory.extractive);
   const memorySources = memorySourcesValue(memory.sources);
@@ -1787,7 +1929,9 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
       controlIncarnationFence: meshControlIncarnationFence(mesh.controlIncarnationFence),
       lockProtocol: meshLockProtocol(mesh.lockProtocol),
       stateBackend: meshStateBackend(mesh.stateBackend),
-      nats: { replicas: meshNatsReplicas(objectValue(mesh.nats).replicas) },
+      transport: carrier,
+      ...(hostTransport !== undefined ? { hostTransport } : {}),
+      nats: meshNatsConfig(mesh.nats, carrier),
       enabled: booleanValue(mesh.enabled, DEFAULT_FABRIC_CONFIG.mesh.enabled),
       ...(meshRoot ? { root: meshRoot } : {}),
       announce: booleanValue(mesh.announce, DEFAULT_FABRIC_CONFIG.mesh.announce),
@@ -2240,6 +2384,7 @@ const resolveFabricConfig = (
       document.agents = agents;
       const mesh = { ...objectValue(document.mesh) };
       delete mesh.controlIncarnationFence; // Host-only: a workspace cannot weaken the fence.
+      delete mesh.hostTransport; // A workspace cannot replace or clear the host's rollout stamp.
       document.mesh = mesh;
       const executor = { ...objectValue(document.executor) };
       const landlock = { ...objectValue(executor.landlock) };

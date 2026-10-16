@@ -1,11 +1,35 @@
 import fs from "node:fs";
 import path from "node:path";
+import type { FabricMeshConfig } from "../config.js";
 import { isInside, readWritePolicy, type FabricWritePolicy } from "./write-guard.js";
 
 export { readWritePolicy, type FabricWritePolicy };
 
 const MAX_WRITABLE_ROOTS = 32;
 const MAX_ROOT_CHARS = 4_096;
+
+/**
+ * Carry the resolved parent's carrier into a local task child, even when the child
+ * loads a different workspace config. Call after assembling the child's base env.
+ * This copies the environment; it never reads credentials or changes stateBackend.
+ * NATS inheritance contains only messaging settings, not state-backend replicas.
+ */
+export const childMeshTransportEnvironment = (
+  mesh: Pick<FabricMeshConfig, "transport" | "hostTransport" | "nats">,
+  environment: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv => {
+  const child: NodeJS.ProcessEnv = { ...environment, PI_FABRIC_MESH_TRANSPORT: mesh.transport };
+  delete child.PI_FABRIC_MESH_HOST_TRANSPORT;
+  delete child.PI_FABRIC_MESH_NATS;
+  if (mesh.hostTransport !== undefined) child.PI_FABRIC_MESH_HOST_TRANSPORT = mesh.hostTransport;
+  if (mesh.transport === "nats") {
+    const { servers, credentials, machine, inboxLanes, operatorMachine, rollbackHoldUntil } = mesh.nats;
+    child.PI_FABRIC_MESH_NATS = JSON.stringify({
+      servers, credentials, machine, inboxLanes: inboxLanes ?? 8, operatorMachine, rollbackHoldUntil,
+    });
+  }
+  return child;
+};
 
 /** Stable PI_FABRIC_LINEAGE contract for a child process. */
 export interface FabricAgentLineage {

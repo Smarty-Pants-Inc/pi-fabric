@@ -514,6 +514,8 @@ export interface AgentTransportLaunch {
   placementLocalReason?: string | undefined;
   /** Report the default policy's actual local/remote launch boundary once; host-owned audit only. */
   onWritePolicyDisposition?: (disposition: "local" | "remote") => void;
+  /** Host-only carrier inheritance, after the worker environment is assembled. */
+  childEnvironment?: (environment: NodeJS.ProcessEnv) => NodeJS.ProcessEnv;
   /** Manager close or explicit run/actor revocation, never a returned queued receipt's guest deadline. */
   signal?: AbortSignal | undefined;
   /** Host activation generation check. Recheck after preparation, immediately before worker creation. */

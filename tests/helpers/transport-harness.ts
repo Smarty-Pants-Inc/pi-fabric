@@ -721,10 +721,10 @@ export async function openRealAdapterPair(kind: "file" | "nats", required = fals
     }
     const open = async (side: "sender" | "receiver"): Promise<FabricTransport> => {
       const user = side === "sender" ? server?.users.machineA : server?.users.machineB;
-      // A2 may not yet declare mesh.nats; this is the CURRENT factory's actual runtime input.
-      const config = { ...DEFAULT_FABRIC_CONFIG.mesh, transport: kind,
-        ...(server && user ? { nats: { servers: server.serverUrl, machine: user.machine, credentials: user.credsPath } } : {})
-      } as FabricTransportOptions["config"];
+      const config: FabricTransportOptions["config"] = { ...DEFAULT_FABRIC_CONFIG.mesh, transport: kind,
+        ...(server && user ? { nats: { ...DEFAULT_FABRIC_CONFIG.mesh.nats, servers: [server.serverUrl],
+          machine: user.machine, credentials: user.credsPath, operatorMachine: "fabric-ops" } } : {})
+      };
       const result = await openAdapter({ kind, options: { config, mesh, hostId: `session:${side}` },
         exportName: "openFabricTransport", natsReady: kind === "nats", required });
       if (result.status === "skip") throw new Error(result.reason);

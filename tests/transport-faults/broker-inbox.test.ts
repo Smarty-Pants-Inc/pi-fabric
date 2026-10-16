@@ -140,12 +140,11 @@ async function fixture() {
       const root = path.join(harness.root, `mesh-${meshes.length}`);
       const mesh = new MeshStore(root, 1_048_576, 100, { stateBackend: "file" });
       meshes.push(mesh);
-      // A2's public config typing has not landed on this pin. Preserve defaults and provide
-      // only the carrier selector and machine credentials consumed by the current factory.
+      // Use A2's public configuration shape; real machine verification stays enabled.
       const config = {
         ...DEFAULT_FABRIC_CONFIG.mesh, root, transport: "nats",
         nats: {
-          ...DEFAULT_FABRIC_CONFIG.mesh.nats, servers: harness.serverUrl,
+          ...DEFAULT_FABRIC_CONFIG.mesh.nats, servers: [harness.serverUrl],
           machine: user.machine, credentials: user.credsPath,
         },
       } as FabricTransportOptions["config"];

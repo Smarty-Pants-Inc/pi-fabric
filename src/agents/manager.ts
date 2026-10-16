@@ -5446,6 +5446,7 @@ export class AgentManager {
       }
       managed.finalAnswerStatus = record.status;
       managed.latestRecord = compactUiRecord(record);
+      managed.latestUiRecord = managed.latestRecord;
       snapshot = undefined;
       record = undefined;
       this.#invalidateUiList();

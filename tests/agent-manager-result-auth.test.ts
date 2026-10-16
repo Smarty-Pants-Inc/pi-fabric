@@ -325,6 +325,47 @@ describe("authenticated manager terminal results", () => {
     }
   });
 
+  it("publishes monitor-validated schema failure to UI while native close still holds settlement", async () => {
+    let alive = true, release!: () => void;
+    const closed = new Promise<void>(resolve => { release = () => { alive = false; resolve(); }; });
+    releases.push(release);
+    vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async request => {
+      const handle = await fakeManagerHeapWorker(request, 64, false,
+        { closed, alive: () => alive, stop: () => closed });
+      const statusFile = request.workerArguments[request.workerArguments.indexOf("--status-file") + 1]!;
+      const record = JSON.parse(fs.readFileSync(statusFile, "utf8"));
+      writeJsonAtomic(statusFile, { ...record, status: "running", finishedAt: undefined });
+      return handle;
+    });
+    const runRoot = root(), onSettled = vi.fn();
+    const manager = new AgentManager(process.cwd(), {
+      ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, maxConcurrent: 1, retainRuns: true, sessionExport: false,
+    }, { runRoot, workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), fullCodeMode: false, onSettled });
+    managers.push(manager);
+    const handle = await manager.spawn({ task: "monitor-only UI validation", transport: "process", extensions: false,
+      schema: { type: "object", properties: { output: { type: "boolean" } }, required: ["output"] } });
+    expect(manager.listForUi()).toEqual([expect.objectContaining({ id: handle.id, status: "running" })]);
+    let waitReleased = false;
+    const waited = manager.wait(handle.id).then(result => { waitReleased = true; return result; });
+    const directory = path.join(runRoot, handle.id), statusFile = path.join(directory, "status.json");
+    const record = JSON.parse(fs.readFileSync(statusFile, "utf8"));
+    const receipt = saveFinalAnswerReceipt(directory, handle.id, record.text);
+    writeJsonAtomic(statusFile, { ...record, status: "completed", finishedAt: receipt.recordedAt,
+      finalAnswerReceipt: { id: receipt.id, recordedAt: receipt.recordedAt } });
+    // Only the real monitor may observe/validate the receipt: status() would
+    // repair the UI cache itself and hide the regression under test.
+    const resultFile = path.join(directory, "manager-result.json");
+    await vi.waitFor(() => expect(fs.existsSync(resultFile)).toBe(true));
+    const sealed = JSON.parse(fs.readFileSync(resultFile, "utf8"));
+    expect(sealed).toMatchObject({ status: "failed", error: expect.stringMatching(/Structured agent output was invalid/) });
+    expect({ alive, waitReleased }).toEqual({ alive: true, waitReleased: false });
+    expect(onSettled).not.toHaveBeenCalled();
+    expect(manager.listForUi()).toEqual([expect.objectContaining({ id: handle.id, status: "finishing", error: sealed.error })]);
+    release();
+    const result = await waited;
+    expect(result).toMatchObject({ status: "failed", error: sealed.error, finalAnswerReceipt: sealed.finalAnswerReceipt });
+  });
+
   it("refuses worker replacement with same-ID completed across finishing and native close after host validation failed", async () => {
     let alive = true, release!: () => void;
     const closed = new Promise<void>(resolve => { release = () => { alive = false; resolve(); }; });

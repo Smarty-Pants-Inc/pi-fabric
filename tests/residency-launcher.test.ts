@@ -2,9 +2,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { execFile, spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { observeResidentOwner } from "../src/residency/launcher-owner.js";
+import { MeshStore } from "../src/mesh/store.js";
 
 const launcherPath = path.resolve("dist/residency/launcher.js");
 const hasLauncher = fs.existsSync(launcherPath);
@@ -101,6 +102,114 @@ describe.skipIf(!hasLauncher || process.platform === "win32")("resident launcher
         [present]: "present",
       });
     } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+// #10068: fake timers kept the test runner alive after supervise returned and hid the native-process loss.
+// Keep: the real launcher/child lifetime and durable MeshStore boundary are the regression target here.
+describe.skipIf(!hasLauncher || process.platform === "win32")("resident launcher native unhosted alarm", () => {
+  it("commits its own-root outage before native exit, without IPC keepalive or respawning", { timeout: 25_000 }, async () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-launcher-unhosted-"));
+    const root = path.join(base, "resident");
+    const meshRoot = path.join(base, "mesh");
+    const actorRoot = path.join(base, "actors");
+    const sessionId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    const rootId = `session:${sessionId}`;
+    const hostId = `resident:${createHash("sha256").update(rootId).digest("hex").slice(0, 24)}`;
+    const childRuns = path.join(base, "child-runs.jsonl");
+    const hostBinary = path.join(base, "exiting-host.mjs");
+    fs.mkdirSync(root); fs.mkdirSync(actorRoot);
+    fs.writeFileSync(path.join(actorRoot, "actors.json"), JSON.stringify({ format: 1,
+      actors: [{ id: "native-unhosted-actor", rootId, residency: "durable", status: "waiting" }] }));
+    fs.writeFileSync(hostBinary, `import fs from 'node:fs';
+fs.appendFileSync(${JSON.stringify(childRuns)}, JSON.stringify({ pid: process.pid }) + '\\n');
+process.exit(23);
+`);
+    const configPath = path.join(root, "config.json");
+    fs.writeFileSync(configPath, JSON.stringify({ cwd: base, piBinary: hostBinary, rootId, sessionId,
+      residencyRoot: root, meshRoot, actorRoot, watchdog: { enabled: false },
+      mesh: { actorScope: "project", maxEventBytes: 64 * 1024, maxReadEvents: 100, stateBackend: "file" } }));
+    // Deliberately no 'ipc' stdio: nothing in the test may keep the launcher alive to finish a late alarm.
+    // The native exit event is the normal completion source; this finite process deadline only bounds failure.
+    const launcher = spawn(process.execPath, [launcherPath, "--config", configPath], {
+      cwd: base, stdio: ["ignore", "ignore", "pipe"], timeout: 15_000, killSignal: "SIGKILL",
+      env: { ...process.env, PI_FABRIC_MESH_ALARM_TO: "session:11111111-2222-4333-8444-555555555555",
+        SMARTY_LEAD_SESSION: "session:99999999-8888-4777-8666-555555555555" },
+    });
+    let stderr = "";
+    launcher.stderr?.on("data", chunk => { stderr = `${stderr}${String(chunk)}`.slice(-16_384); });
+    const exited = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
+      launcher.once("error", reject);
+      launcher.once("exit", (code, signal) => resolve({ code, signal }));
+    });
+    try {
+      expect(await exited, stderr).toEqual({ code: 23, signal: null });
+      expect(launcher.connected).toBe(false);
+      // Read immediately after OS process exit: no sleep, retry, synthetic clock, or in-process supervisor.
+      const mesh = new MeshStore(meshRoot, 64 * 1024, 100, { stateBackend: "file", canWakeResidents: () => false });
+      try {
+        const events = mesh.read({ topic: "fabric.alarm.resident-unhosted" });
+        expect(events, stderr).toEqual([expect.objectContaining({ topic: "fabric.alarm.resident-unhosted",
+          kind: "resident-unhosted-outage", to: rootId, from: expect.objectContaining({ id: hostId }),
+          data: expect.objectContaining({ root: rootId, residency: root, actorCount: 1, reason: "child-exit",
+            since: expect.any(Number), state: "outage", hostId, episodeId: expect.any(String), advisory: true }) })]);
+        expect(events[0]!.from).not.toHaveProperty("verified"); // Correlation only; no sender authentication is claimed.
+      } finally { mesh.closeState(); }
+      expect(fs.readFileSync(childRuns, "utf8").trim().split("\n")).toHaveLength(1);
+      const rows = fs.readFileSync(path.join(root, "launcher.log"), "utf8").trim().split("\n")
+        .map(line => JSON.parse(line) as { event: string });
+      expect(rows.filter(row => row.event === "child-spawned")).toHaveLength(1);
+    } finally {
+      if (launcher.exitCode === null && launcher.signalCode === null) launcher.kill("SIGKILL");
+      await exited.catch(() => undefined);
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+});
+
+// Recovery's new maintenance proof must not tighten the separate legacy startup waiter.
+describe.skipIf(!hasLauncher || process.platform === "win32")("resident launcher legacy startup readiness", () => {
+  it("still forwards startup readiness for a live legacy owner without maintenanceReady or a receipt", { timeout: 25_000 }, async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-launcher-legacy-ready-"));
+    const hostBinary = path.join(root, "legacy-host.mjs");
+    fs.writeFileSync(hostBinary, `import fs from 'node:fs'; import path from 'node:path';
+const root = ${JSON.stringify(root)};
+const token = process.env.PI_FABRIC_RESIDENT_GENERATION;
+fs.writeFileSync(path.join(root, 'owner.json'), JSON.stringify({ pid: process.pid, token }));
+process.send?.({ event: 'resident-ready', root, token });
+// IPC readiness drives the test; this finite fixture lifetime also bounds a broken startup waiter.
+setTimeout(() => process.exit(0), 10_000);
+`);
+    const configPath = path.join(root, "config.json");
+    fs.writeFileSync(configPath, JSON.stringify({ cwd: root, piBinary: hostBinary, watchdog: { enabled: false } }));
+    // IPC is intentional only in this startup-compatibility test, never in the native-exit regression above.
+    const launcher = spawn(process.execPath, [launcherPath, "--config", configPath], {
+      cwd: root, stdio: ["ignore", "ignore", "ignore", "ipc"], timeout: 15_000, killSignal: "SIGTERM",
+    });
+    const exited = new Promise<void>((resolve, reject) => {
+      launcher.once("error", reject); launcher.once("exit", () => resolve());
+    });
+    const ready = new Promise<unknown>((resolve, reject) => {
+      launcher.on("message", value => {
+        const event = (value as { event?: string }).event;
+        if (event === "resident-ready") resolve(value);
+        else if (event === "resident-startup-failed" || event === "resident-wake-pending") reject(new Error(`Legacy startup refused: ${JSON.stringify(value)}`));
+      });
+      launcher.once("error", reject);
+      launcher.once("exit", () => reject(new Error("Launcher exited before forwarding legacy startup readiness")));
+    });
+    try {
+      const receipt = await ready;
+      const owner = JSON.parse(fs.readFileSync(path.join(root, "owner.json"), "utf8")) as { token: string; maintenanceReady?: number };
+      expect(receipt).toMatchObject({ event: "resident-ready", root, token: owner.token });
+      expect(owner.maintenanceReady).toBeUndefined();
+      expect(fs.existsSync(path.join(root, "maintenance-ready.json"))).toBe(false);
+    } finally {
+      if (launcher.connected) launcher.disconnect();
+      if (launcher.exitCode === null && launcher.signalCode === null) launcher.kill("SIGTERM");
+      await exited.catch(() => undefined);
       fs.rmSync(root, { recursive: true, force: true });
     }
   });

@@ -183,11 +183,20 @@ process.stdin.on("data", async (chunk) => {
         const projected = await activation.handlers.get("context")({ messages: context });
         const messages = activation.convertToLlm(projected.messages);
         const { estimateContextTokens, estimateTextTokens } = await import("@earendil-works/pi-ai/utils/estimate");
-        trace({ type: "retry_admission", nativeEstimate: estimateContextTokens(messages),
-          rawPayloadEstimate: estimateTextTokens(JSON.stringify(payloadFor({ messages }))), contextWindow: WINDOW });
         await new Promise(resolve => process.stdout.write("", resolve));
         await activation.handlers.get("before_provider_headers")({}, activation.ctx);
-        await activation.provider.streamSimple(model, { messages }, { onPayload: payload => payload });
+        await activation.provider.streamSimple(model, { messages }, { onPayload: payload => {
+          // Grow ONLY the final retry callback replacement. The real hook must inspect
+          // this visible input after the callback, not a fabricated refusal or raw journal.
+          const growth = process.env.FAKE_PI_OVERLOAD_RETRY_GROWTH === "1";
+          const retryPayload = growth ? { ...payload, input: [...payload.input,
+            { role: "user", content: "g".repeat(1_000_000) }] } : payload;
+          trace({ type: "retry_admission", nativeEstimate: estimateContextTokens(messages),
+            rawPayloadEstimate: estimateTextTokens(JSON.stringify(retryPayload)), contextWindow: WINDOW,
+            ...(growth ? { retryGrowthChars: 1_000_000,
+              unexpandedRawPayloadEstimate: estimateTextTokens(JSON.stringify(payload)) } : {}) });
+          return retryPayload;
+        } });
         trace({ type: "retry_admitted" });
         const answer = { role: "assistant", provider, model: model.id, api: model.api, content: [{ type: "text", text: "verdict: ok" }], stopReason: "stop",
           usage: { input: 203_300, output: 10, cacheRead: 0, cacheWrite: 0, totalTokens: 203_310 }, timestamp: Date.now() };

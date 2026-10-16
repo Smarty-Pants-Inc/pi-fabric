@@ -709,6 +709,59 @@ describe("actor context overflow (smarty-dev#3238, offline Pi child)", () => {
     expect(fs.readFileSync(path.join(s.dir, "prompts.jsonl.requests"), "utf8")).toBe("request\nrequest\nrequest\n");
   }, TEST_GUARD_MS);
 
+  // Keep reason: #14075 trust boundary/data safety. A REAL bound refusal on a
+  // native retry must replace the previous overload error, without replaying its tool.
+  it("14075 reports bound overflow after native overload retry payload growth without transient backoff", async () => {
+    vi.stubEnv("FAKE_PI_RESPONSES", "1");
+    vi.stubEnv("FAKE_PI_OVERLOAD_USAGE", "zero");
+    vi.stubEnv("FAKE_PI_OVERLOAD_RETRY_GROWTH", "1");
+    const s = setup();
+    s.recordResults();
+    const actor = await s.create("overload-bound-refusal", { inferenceContext: "activation", model: "cliproxyapi/gpt-6-luna" });
+    const outcome = await s.actors.ask(actor.id, "OVERLOAD_NATIVE_RETRY", { pr: 14075 }).catch(error => error);
+    // A genuine overflow resets routing at settlement (but never replays this item).
+    // Wait for that cleanup; the baseline's wrong transient block stays inspectable.
+    await waitFor(() => s.actors.inFlightCount() === 0 &&
+      s.actors.status(actor.id).activationBlocked?.code !== "context-overflow");
+    const trace = fs.readFileSync(path.join(s.dir, "prompts.jsonl.native"), "utf8").split("\n").filter(Boolean)
+      .map(line => JSON.parse(line) as Record<string, any>);
+    const terminalFrames = s.results.flatMap(result => result.logFile && fs.existsSync(result.logFile)
+      ? fs.readFileSync(result.logFile, "utf8").split("\n").filter(line => /fabric_activation_window|auto_retry|worker_stderr/.test(line)) : []);
+    console.info("14075 bound retry refusal evidence", JSON.stringify({ trace,
+      results: s.results.map(({ status, errorCode, error, toolCalls }) => ({ status, errorCode, error, toolCalls })),
+      blocked: s.actors.status(actor.id).activationBlocked, resets: resets(s.actors, actor.id),
+      overflowNotices: s.overflowEvents().length, ownerAlarms: s.ownerAlarms().length,
+      terminalFrames: terminalFrames.map(line => line.slice(0, 1500)) }));
+    expect(trace[0]).toEqual({ type: "tool_turn", stopReason: "toolUse", totalTokens: 201_471, toolResultBytes: 6144 });
+    expect(trace[1]).toEqual({ type: "pre_overload_admitted" });
+    expect(trace[2]).toMatchObject({ type: "overload", stopReason: "error",
+      errorMessage: "cliproxyapi/gpt-6-luna: Our servers are currently overloaded. Please try again later.",
+      usage: { totalTokens: 0 } });
+    expect(trace[3]).toMatchObject({ type: "auto_retry_start", attempt: 1, maxAttempts: 3 });
+    expect(trace[4]).toMatchObject({ type: "retry_admission", contextWindow: 272_000, retryGrowthChars: 1_000_000,
+      nativeEstimate: { usageTokens: 201_471 } });
+    expect(trace[4]!.nativeEstimate.tokens).toBeLessThan(272_000);
+    expect(trace[4]!.rawPayloadEstimate).toBeGreaterThan(trace[4]!.unexpandedRawPayloadEstimate + 200_000);
+    expect(trace).toHaveLength(5); // The real hook exits before retry dispatch/admission.
+    expect(terminalFrames.join("\n")).toContain('"type":"fabric_activation_window_refusal"');
+    expect(terminalFrames.join("\n")).toContain('"code":"context-overflow"');
+    expect(s.results).toEqual([expect.objectContaining({ status: "failed", errorCode: "CONTEXT_OVERFLOW", toolCalls: 1 })]);
+    expect(s.prompts()).toEqual([{ history: false, overflow: false, session: expect.any(String), marker: "OVERLOAD_NATIVE_RETRY" }]);
+    expect(fs.readFileSync(path.join(s.dir, "prompts.jsonl.requests"), "utf8")).toBe("request\nrequest\n");
+    // RED on 99ebe5c1: the typed refusal still carries the stale overload wording,
+    // so ActorManager contradicts CONTEXT_OVERFLOW and applies provider-transient backoff.
+    expect.soft(s.results[0]!.error).toContain("Fabric activation window failed: Context exceeds window");
+    expect.soft(outcome).toBeInstanceOf(Error);
+    expect.soft((outcome as Error).message).toContain("Fabric activation window failed: Context exceeds window");
+    expect.soft(s.overflowEvents()).toHaveLength(1);
+    expect.soft(s.ownerAlarms()).toHaveLength(1);
+    expect.soft(s.alarms).toHaveLength(1);
+    expect.soft(s.actors.status(actor.id).activationBlocked).toBeUndefined();
+    expect.soft(s.actors.messages(actor.id, 50)).toContainEqual(expect.objectContaining({
+      data: expect.objectContaining({ contextOverflow: expect.objectContaining({ retry: false, toolCalls: 1 }) }),
+    }));
+  }, TEST_GUARD_MS);
+
   it("14075 still types a genuinely oversized actual-hook payload as CONTEXT_OVERFLOW", async () => {
     const s = setup();
     s.recordResults();

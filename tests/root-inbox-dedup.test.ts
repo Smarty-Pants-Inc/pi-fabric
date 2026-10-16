@@ -6,7 +6,8 @@ import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MainAgentController } from "../src/main-agent.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
-import { RootInbox, confirmedRootInboxSession, rootInboxMessage, rootInboxSession } from "../src/topology/root-inbox.js";
+import { RootInbox } from "../src/topology/root-inbox.js";
+import { confirmedRootInboxSession, rootInboxMessage, rootInboxSession } from "./root-inbox-issued-fixture.js";
 
 const roots: string[] = [];
 const me: MeshIdentity = { id: "session:recipient", name: "recipient", kind: "main" };
@@ -132,15 +133,19 @@ describe("recipient-scoped shadow dedup (smarty-dev#3036)", () => {
     expect((await h.box().next(h.session())).events.map(event => event.id)).toEqual([other.id]);
   });
 
-  it("recognises pre-upgrade inbox receipts by event id, not an ambiguous work key", async () => {
+  it("redelivers unsigned pre-upgrade history without a durable acknowledgement", async () => {
     const h = setup(); const inbox = h.box(); inbox.start();
     const event = await h.publish(); h.advance(1);
     // Old bundles wrote ids only, without stable work receipt metadata.
     h.entries.push({ type: "custom_message", customType: "pi-fabric-inbox", details: { ids: [event.id] } });
     h.entries.push(...Array.from({ length: 600 }, () => ({ type: "message" })));
+    const retry = await inbox.next(h.session());
+    expect(retry.events.map(item => item.id)).toEqual([event.id]);
+    // Only a newly issued delivery can confirm the retry; unsigned legacy ids cannot.
+    h.entries.push({ type: "custom_message", ...rootInboxMessage(retry.events) });
     expect((await inbox.next(h.session())).events).toEqual([]);
     h.entries.length = 0;
-    // The legacy receipt names only the first event id; its ambiguous work key claims no new event.
+    // The confirmed event id still claims no distinct event sharing its ambiguous work key.
     const fresh = await h.publish(); h.advance(1);
     expect((await h.box().next(h.session())).events.map(item => item.id)).toEqual([fresh.id]);
   });

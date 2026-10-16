@@ -24,7 +24,7 @@ const fixture = () => {
 };
 
 describe("archive-coupled resident wake retry index", () => {
-  it.each(["memory", "disk"] as const)("double write failure retries exactly once on an unrelated commit from the %s index", async source => {
+  it.each(["memory", "disk"] as const)("double write failure retries exactly once on the retention sweep from the %s index", async source => {
     const f = fixture();
     let fail = true;
     let requestFailures = 0, receiptFailures = 0;
@@ -70,6 +70,8 @@ describe("archive-coupled resident wake retry index", () => {
       vi.spyOn(MeshArchive.prototype, "lookupEntry").mockImplementation(() => { throw new Error("archive scan forbidden"); });
       vi.spyOn(f.mesh, "read").mockImplementation(() => { throw new Error("mesh event scan forbidden"); });
       await f.mesh.publish({ topic: "unrelated.retry.trigger", from: f.from });
+      expect(launch).not.toHaveBeenCalled();
+      await (await import("../src/residency/wake.js")).retryResidentWakes(f.mesh, launch, Date.now() + 60_000);
       expect(launch).toHaveBeenCalledOnce();
       expect(wake.readWakeJson<{ id: string }>(wake.residentWakeRequestPath(f.resident))?.id).toBe(delivered.id);
       expect(index.residentUnacknowledgedDeliveries(f.mesh.root).size).toBe(0);
@@ -102,6 +104,9 @@ describe("archive-coupled resident wake retry index", () => {
       });
       fs.writeFileSync(configFile, saved);
       await f.mesh.publish({ topic: "unrelated.config-repaired", from: f.from });
+      expect(launch).not.toHaveBeenCalled();
+      const retryAt = wake.readWakeJson<{ nextRetryAt: number }>(path.join(f.resident, "wake-failure.json"))!.nextRetryAt;
+      await activeWake.retryResidentWakes(f.mesh, launch, retryAt);
       expect(launch).toHaveBeenCalledOnce();
       expect(wake.readWakeJson<{ id: string }>(wake.residentWakeRequestPath(f.resident))?.id).toBe(event.id);
       await f.mesh.publish({ topic: "unrelated.after-repair", from: f.from });
@@ -126,7 +131,7 @@ describe("archive-coupled resident wake retry index", () => {
 
   it.each([
     [128, "single"], [129, "single"], [257, "single"], [129, "batch"], [129, "matching-retry"],
-  ] as const)("publishes to %i roots via %s without partial append and drains overflow on the next delivery", async (count, mode) => {
+  ] as const)("publishes to %i roots via %s without partial append and drains overflow on the retention sweep", async (count, mode) => {
     const f = fixture();
     const residents = [f.resident];
     for (let n = 1; n < count; n++) {
@@ -169,6 +174,8 @@ describe("archive-coupled resident wake retry index", () => {
         expect(wake.readWakeJson<{ id: string }>(wake.residentWakeRequestPath(overflowRoot))?.id).toBe(next.id);
         expect(index.residentUnacknowledgedDeliveries(f.mesh.root).size).toBe(1);
         await f.mesh.publish({ topic: "unrelated.final-matching-drain", from: f.from });
+        expect(launch).toHaveBeenCalledTimes(256);
+        await activeWake.retryResidentWakes(f.mesh, launch);
         expect(launch).toHaveBeenCalledTimes(257);
         expect(index.residentUnacknowledgedDeliveries(f.mesh.root).size).toBe(0);
         for (const committed of f.mesh.read()) {
@@ -185,8 +192,10 @@ describe("archive-coupled resident wake retry index", () => {
         const drain = freshWake.wakeResidentActors;
         vi.spyOn(freshWake, "wakeResidentActors").mockImplementation((store, events) => drain(store, events, launch));
         await f.mesh.publish({ topic: "unrelated.overflow-drain", from: f.from });
+        expect(launch).toHaveBeenCalledTimes(128);
+        await freshWake.retryResidentWakes(f.mesh, launch);
         expect(launch).toHaveBeenCalledTimes(Math.min(count, 256));
-        if (count > 256) await f.mesh.publish({ topic: "unrelated.final-drain", from: f.from });
+        if (count > 256) await freshWake.retryResidentWakes(f.mesh, launch);
         expect(launch).toHaveBeenCalledTimes(count);
         expect(freshIndex.residentUnacknowledgedDeliveries(f.mesh.root).size).toBe(0);
       }

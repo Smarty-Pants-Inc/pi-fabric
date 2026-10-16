@@ -522,10 +522,19 @@ export class MeshStore {
       await wakeResidentActors(this, events);
     } catch (error) {
       // Already committed: throwing would invite a duplicate publish. The durable pending
-      // index and archived event survive even without a wake request; startup or the next
-      // publish retries the drain. Report failure rather than inventing delivery.
+      // index and archived event survive even without a wake request; scoped startup,
+      // maintenance or the next matching publish retries it. Report failure rather than inventing delivery.
       diagnostics.warn("src/mesh/store.ts", `[pi-fabric] resident wake deferred: ${String(error)}`);
     }
+  }
+
+  /** Existing owner maintenance cadence only; respect publication's resident admission gate. */
+  async retryResidentWakes(): Promise<void> {
+    if (!this.#canWakeResidents() || !fs.existsSync(path.join(this.root, "residency"))) return;
+    const { retryResidentWakes } = await import("../residency/wake.js");
+    // Import preparation may have yielded to staging, drain or handover.
+    if (!this.#canWakeResidents()) return;
+    await retryResidentWakes(this);
   }
 
   #scheduleDue(now = Date.now()): boolean {

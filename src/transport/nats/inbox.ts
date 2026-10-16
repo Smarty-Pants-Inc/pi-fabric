@@ -1,4 +1,5 @@
 import { Buffer } from "node:buffer";
+import { Readable } from "node:stream";
 import {
   type ConsumerMessages,
   type JsMsg,
@@ -35,7 +36,7 @@ const DEFAULT_MAX_MESSAGE_BYTES = 1_048_576;
 const DEFAULT_DUPLICATE_WINDOW_MS = 10 * 60 * 1_000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 5_000;
 const utf8 = new TextEncoder();
-const clone = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
+const validMessageId = (id: string): boolean => id.length > 0 && id === id.trim() && !/[\u0000-\u001f\u007f]/.test(id);
 
 /** Direct options keep the module independently testable; the factory passes FabricTransportOptions. */
 export interface NatsTransportOptions {
@@ -181,13 +182,15 @@ class NatsTransportImpl implements FabricTransport {
       await ensureTransportStream(manager, streamPolicy(transportInboxStream(options.machine), [transportInboxStreamSubject(options.machine)], options, {
         maxAgeMs: 0,
       }), options.provision);
-      await ensureTransportConsumer(manager.consumers, {
+      const description = JSON.stringify({ fabricHostId: options.hostId, machine: options.machine });
+      const consumer = await ensureTransportConsumer(manager.consumers, {
         stream: transportInboxStream(options.machine),
         durable: transportDurableName(options.hostId),
         filterSubject: transportInboxFilter(options.machine, options.hostId),
-        description: JSON.stringify({ fabricHostId: options.hostId, machine: options.machine }),
+        description,
         maxAckPending: 128,
       });
+      if (consumer.config.description !== description) throw new TransportInvalidError("transport inbox owner description mismatch");
       return new NatsTransportImpl(connection, options, { leases, presence });
     } catch (error) {
       await connection.close();
@@ -205,12 +208,24 @@ class NatsTransportImpl implements FabricTransport {
     this.#assertOpen();
     signal?.throwIfAborted();
     if (!isTransportEnvelope(envelope)) throw new TransportInvalidError("invalid transport envelope");
+    if (!validMessageId(envelope.id)) throw new TransportInvalidError("invalid transport message id");
     const committedAt = Date.now();
+    // Evaluate a stamp before the serialization boundary so its original error is never
+    // replaced by a JSON/UTF-8 error. The resolved body is then used for this publish.
     const body = typeof envelope.body === "function" ? (envelope.body as (at: number) => T)(committedAt) : envelope.body;
-    const resolved = { ...clone(envelope), body, createdAt: committedAt } as TransportSent<T>["envelope"];
-    const kind = envelope.kind === "command" ? "cmd" : "ack";
-    const subject = transportInboxSubject(envelope.to.machine, envelope.to.hostId, kind, envelope.targetId, this.self.machine);
-    const bytes = utf8.encode(JSON.stringify({ format: 1, sourceMachine: this.self.machine, envelope: resolved }));
+    let resolved: TransportSent<T>["envelope"];
+    let bytes: Uint8Array;
+    try {
+      const json = JSON.stringify({ format: 1, sourceMachine: this.self.machine, envelope: { ...envelope, body, createdAt: committedAt } });
+      bytes = utf8.encode(json);
+      // Snapshot the actual wire representation once. Caller mutation while waiting for a
+      // PubAck must not change the resolvedBody needed for a same-id uncertain retry.
+      resolved = (JSON.parse(json) as { envelope: TransportSent<T>["envelope"] }).envelope;
+    } catch (error) {
+      throw new TransportInvalidError("transport envelope is not serializable", { cause: error });
+    }
+    const kind = resolved.kind === "command" ? "cmd" : "ack";
+    const subject = transportInboxSubject(resolved.to.machine, resolved.to.hostId, kind, resolved.targetId, this.self.machine);
     if (bytes.byteLength > this.#options.maxMessageBytes) throw new TransportInvalidError(`transport envelope exceeds ${this.#options.maxMessageBytes} bytes`);
     return { resolved, subject, bytes };
   }
@@ -220,15 +235,15 @@ class NatsTransportImpl implements FabricTransport {
     let ack;
     try {
       ack = await this.#js.publish(prepared.subject, prepared.bytes, {
-        msgID: envelope.id,
+        msgID: prepared.resolved.id,
         timeout: this.#options.requestTimeoutMs,
-        expect: { streamName: this.#streamFor(envelope.to.machine) },
+        expect: { streamName: this.#streamFor(prepared.resolved.to.machine) },
       });
     } catch (error) {
-      throw publishFailure(error, envelope.id, prepared.resolved.body);
+      throw publishFailure(error, prepared.resolved.id, prepared.resolved.body);
     }
-    if (signal?.aborted) throw new TransportUncertainError(envelope.id, prepared.resolved.body, { cause: signal.reason });
-    return { id: envelope.id, sequence: ack.seq, duplicate: ack.duplicate, envelope: prepared.resolved };
+    if (signal?.aborted) throw new TransportUncertainError(prepared.resolved.id, prepared.resolved.body, { cause: signal.reason });
+    return { id: prepared.resolved.id, sequence: ack.seq, duplicate: ack.duplicate, envelope: prepared.resolved };
   }
 
   #streamFor(machine: string): string { return transportInboxStream(validateMachine(machine)); }
@@ -256,25 +271,36 @@ class NatsTransportImpl implements FabricTransport {
     if (this.#inboxActive) throw new TransportInvalidError("only one inbox iterator is allowed per transport");
     this.#inboxActive = true;
     let messages: ConsumerMessages | undefined;
-    const stop = (): void => { if (messages) void messages.close(); };
+    const queue = new Readable({ objectMode: true, read() {} });
+    const end = (): void => { if (!queue.destroyed && !queue.readableEnded) queue.push(null); };
+    const stop = (): void => { end(); if (messages) void messages.close(); };
     signal.addEventListener("abort", stop, { once: true });
     this.#closeController.signal.addEventListener("abort", stop, { once: true });
     try {
-    const durable = transportDurableName(this.self.hostId);
-    const filter = transportInboxFilter(this.self.machine, this.self.hostId);
-    const info = await ensureTransportConsumer(this.#manager.consumers, {
-      stream: this.#stream,
-      durable,
-      filterSubject: filter,
-      description: JSON.stringify({ fabricHostId: this.self.hostId, machine: this.self.machine }),
-      maxAckPending: 128,
-    });
-    if (info.config.filter_subject !== filter) throw new Error("transport inbox filter mismatch");
-    const consumer = await this.#js.consumers.get(this.#stream, durable);
-    messages = await consumer.consume({ max_messages: 16 });
-    this.#inboxMessages.add(messages);
-    if (signal.aborted || this.#closed) { await messages.close(); return; }
-      for await (const msg of messages) {
+      const durable = transportDurableName(this.self.hostId);
+      const filter = transportInboxFilter(this.self.machine, this.self.hostId);
+      const description = JSON.stringify({ fabricHostId: this.self.hostId, machine: this.self.machine });
+      const info = await ensureTransportConsumer(this.#manager.consumers, {
+        stream: this.#stream,
+        durable,
+        filterSubject: filter,
+        description,
+        maxAckPending: 128,
+      });
+      if (info.config.filter_subject !== filter || info.config.description !== description) {
+        throw new TransportInvalidError("transport inbox owner/filter mismatch");
+      }
+      const consumer = await this.#js.consumers.get(this.#stream, durable);
+      // The NATS raw iterator queues its close behind the next iteration. A caller
+      // holding a yielded delivery would deadlock close(). Callback mode closes
+      // independently; the broker's max_ack_pending bounds this unacked queue.
+      messages = await consumer.consume({ max_messages: 16, callback: (msg) => {
+        if (!signal.aborted && !this.#closed && !queue.destroyed) queue.push(msg);
+      } });
+      this.#inboxMessages.add(messages);
+      void messages.closed().then((error) => { if (error) queue.destroy(error); else end(); });
+      if (signal.aborted || this.#closed) { await messages.close(); return; }
+      for await (const msg of queue as AsyncIterable<JsMsg>) {
         if (signal.aborted || this.#closed) break;
         let decoded;
         try { decoded = this.#decode(msg); }
@@ -303,6 +329,7 @@ class NatsTransportImpl implements FabricTransport {
       signal.removeEventListener("abort", stop);
       this.#closeController.signal.removeEventListener("abort", stop);
       if (messages) { this.#inboxMessages.delete(messages); await messages.close(); }
+      queue.destroy();
       this.#inboxActive = false;
     }
   }

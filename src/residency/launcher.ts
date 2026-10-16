@@ -515,7 +515,7 @@ export async function supervise(configPath: string, options: { signal?: AbortSig
       const owner = readOwner();
       const maintenance = readWakeJson<{ token?: string }>(path.join(root, "maintenance-ready.json"));
       if (owner && owner.pid === child.pid && owner.token === receipt.token && owner.readyAt > 0 && residentOwnerLive(root) && !residentOwnerSleeping(root) &&
-          (owner.maintenanceReady !== 1 || maintenance?.token === owner.token)) residentChildReady(root, launchConfig);
+          maintenance?.token === owner.token) residentChildReady(root, launchConfig);
     });
     child.once("error", (error) => { trace("child-error", { message: error.message, kind }); writeFailure(root, attempt.generation, error); });
     if (process.connected && process.send) {

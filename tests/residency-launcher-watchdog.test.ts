@@ -219,7 +219,17 @@ describe.skipIf(process.platform === "win32")("launcher resident-unhosted alarm"
       child.emit("message", { event: "resident-ready", root: f.root, token: "wrong-generation" });
       child.ready("wrong-maintenance-token"); await settleAlarms();
       expect(alarms(f)).toHaveLength(1);
-      child.ready(); await settleAlarms();
+      const ownerFile = path.join(f.root, "owner.json");
+      const legacyOwner = JSON.parse(fs.readFileSync(ownerFile, "utf8"));
+      delete legacyOwner.maintenanceReady; // RUA-1: a legacy/malformed flag cannot bypass the token proof.
+      fs.writeFileSync(ownerFile, JSON.stringify(legacyOwner));
+      const ready = () => child.emit("message", { event: "resident-ready", root: f.root, token: legacyOwner.token });
+      ready(); await settleAlarms(); expect(alarms(f)).toHaveLength(1);
+      const maintenanceFile = path.join(f.root, "maintenance-ready.json");
+      fs.unlinkSync(maintenanceFile);
+      ready(); await settleAlarms(); expect(alarms(f)).toHaveLength(1);
+      fs.writeFileSync(maintenanceFile, JSON.stringify({ token: legacyOwner.token }));
+      ready(); await settleAlarms(); // Missing legacy flag is allowed only with the exact maintenance receipt.
       expect(alarms(f).map(row => (row.data as { state: string }).state)).toEqual(["outage", "recovered"]);
       expect(alarms(f)[1]!.data).toEqual({ root: f.config.rootId, residency: f.root, actorCount: 1,
         reason: "custody", since: (alarms(f)[0]!.data as { since: number }).since, state: "recovered" });

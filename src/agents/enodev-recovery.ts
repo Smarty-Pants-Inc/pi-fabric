@@ -27,6 +27,11 @@ export const ENODEV_UNRESOLVED_REASON = "Owned scope observation failed: Error: 
 const RUN_ID = /^[a-f0-9]{32}$/;
 const MAX_FILE = 4 * 1024 * 1024;
 
+// Host-only provenance: neither worker fields nor serialized checkpoints can mark a result.
+const recoveredDurableStops = new WeakSet<AgentRunResult>();
+/** Only stopped/timed_out objects returned by recoverDurableActorStop carry this identity. */
+export const isRecoveredDurableStop = (result: AgentRunResult): boolean => recoveredDurableStops.has(result);
+
 const readJson = (file: string): Record<string, unknown> | undefined => {
   try {
     const stat = ownedStat(file);
@@ -115,6 +120,11 @@ const waitForStoppedWorker = (directory: string, currentRecord: () => Record<str
     };
     if (closeSignal.aborted) return;
     try { watcher = fs.watch(directory, check); watcher.unref(); watcher.on("error", () => { watcher?.close(); }); } catch { /* identity fallback below */ }
+    // ponytail: R-no-polling exception pi-fabric#1193: run-file events are primary; no process-exit
+    // event survives the dead host's lost transport/cgroup descriptors, and Node has no pidfd binding.
+    // One unref'd absolute 60s identity check per recovered stop, never rearmed: bounded run-file reads,
+    // kill(pid, 0) and /proc birth checks. It cannot launch Main or wake a resident on its own.
+    // Recovered terminal stops settle this activation quietly; saved completed answers retain delivery.
     timer = setTimeout(check, 60_000);
     timer.unref();
     closeSignal.addEventListener("abort", cleanup, { once: true });
@@ -161,15 +171,17 @@ export const recoverDurableActorStop = async (runRoot: string, actorId: string, 
     const recoveredIntent = readRunStopIntent(directory, record) ?? intent;
     if (record.status !== "running" && record.status !== "queued") {
       if (!["completed", "failed", "stopped", "timed_out"].includes(String(record.status))) continue;
-      const outcome = { ...record, stopIntent: recoveredIntent };
+      const outcome = { ...record, stopIntent: recoveredIntent } as unknown as AgentRunResult;
       writeJsonAtomic(path.join(directory, "status.json"), outcome, { durable: true });
-      return outcome as unknown as AgentRunResult;
+      if (outcome.status === "stopped" || outcome.status === "timed_out") recoveredDurableStops.add(outcome);
+      return outcome;
     }
     const outcome = { ...record, ...uncleanReceipt(record), status: recoveredIntent.reason === "explicit" ? "stopped" : "timed_out",
       error: recoveredIntent.reason === "explicit" ? "Agent stopped" : "Agent timed out",
-      stopIntent: recoveredIntent, finishedAt: Date.now() };
+      stopIntent: recoveredIntent, finishedAt: Date.now() } as unknown as AgentRunResult;
     writeJsonAtomic(path.join(directory, "status.json"), outcome, { durable: true });
-    return outcome as unknown as AgentRunResult;
+    recoveredDurableStops.add(outcome);
+    return outcome;
   }
   return undefined;
 };

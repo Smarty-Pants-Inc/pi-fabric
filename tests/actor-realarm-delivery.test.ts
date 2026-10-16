@@ -7,6 +7,10 @@ import {
 } from "../src/actors/manager.js";
 import type { FabricActorDeliveryRequest } from "../src/actors/types.js";
 import { AgentManager } from "../src/agents/manager.js";
+import { isRecoveredDurableStop } from "../src/agents/enodev-recovery.js";
+import { ProcessTransport } from "../src/agents/transports/process-transport.js";
+import type { AgentRunResult } from "../src/agents/types.js";
+import * as processIdentity from "../src/residency/process-identity.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 
@@ -59,7 +63,8 @@ const setup = () => {
     workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "runs"),
   });
   // Inject the source failure, not the alarm or receipt machinery; no worker process is needed.
-  vi.spyOn(agents, "run").mockRejectedValue(new Error(SOURCE_ERROR));
+  const realRun = agents.run.bind(agents);
+  const run = vi.spyOn(agents, "run").mockRejectedValue(new Error(SOURCE_ERROR));
   const identity: MeshIdentity = { id: "session:test", name: "main", kind: "main", sessionId: "test" };
   // Snapshot the complete emitted request at the callback boundary, before anything can change it.
   const delivered: string[] = [];
@@ -79,13 +84,13 @@ const setup = () => {
   const alarms = (id: string) => mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, limit: 100 })
     .filter(event => event.kind === "actor-activation-blocked" && (event.data as { actorId?: string }).actorId === id);
   const repeats = (id: string) => alarms(id).filter(event => (event.data as { repeat?: boolean }).repeat);
-  const fail = async (count: number) => {
+  const fail = async (count: number, code = "unknown") => {
     const actor = await actors.create({ name: "blocked", instructions: "Respond.", responseMode: "text", delivery: "mailbox" });
     for (let run = 0; run < count; run++) {
       await actors.ask(actor.id, "go").catch(() => undefined);
       await waitFor(() => !actors.status(actor.id).inFlightRun && !actors.status(actor.id).preparing);
     }
-    expect(actors.status(actor.id).activationBlocked).toMatchObject({ code: "unknown", count });
+    expect(actors.status(actor.id).activationBlocked).toMatchObject({ code, count });
     return { actor, since: actors.status(actor.id).activationBlocked!.since,
       key: actorAlarmKey(actor.id, "actor-activation-blocked") };
   };
@@ -101,8 +106,179 @@ const setup = () => {
     delivered.length = 0;
     return blocked;
   };
-  return { root, mesh, actors, makeActors, clock, onDeliver, delivered, alarms, repeats, fail, block };
+  return { root, mesh, agents, realRun, run, actors, makeActors, clock, onDeliver, delivered, alarms, repeats, fail, block };
 };
+
+// Keep reason: a durable stop crosses AgentManager -> ActorManager with host-only provenance.
+// A recovered observation deadline must not become either a failure-streak or dropped-event alarm.
+const installStopRecovery = (s: ReturnType<typeof setup>, reason: "explicit" | "deadline" = "deadline") => {
+  const scheduled: Array<{ check: () => void; timer: ReturnType<typeof setTimeout> }> = [];
+  const directories: string[] = [];
+  const results: AgentRunResult[] = [];
+  const realSetTimeout = globalThis.setTimeout;
+  vi.spyOn(globalThis, "setTimeout").mockImplementation((callback, delay, ...args) => {
+    const timer = realSetTimeout(callback, delay, ...args);
+    if (delay === MINUTE && callback.name === "check") {
+      scheduled.push({ check: () => { clearTimeout(timer); callback(...args); }, timer });
+    }
+    return timer;
+  });
+  const originalIdentity = processIdentity.processStartTime;
+  let birth = "1";
+  vi.spyOn(processIdentity, "processStartTime").mockImplementation(pid =>
+    pid === process.ppid ? birth : originalIdentity(pid));
+  // Never signal or launch a real process, even if the recovery fence regresses.
+  const launch = vi.spyOn(ProcessTransport.prototype, "launch").mockRejectedValue(new Error("durable stop must not relaunch"));
+  s.run.mockImplementation(async (...args) => {
+    const request = args[0];
+    expect(request.actorId).toBeDefined();
+    // Ask callers are not persisted across a host restart. Seed only the restored admission
+    // context at this boundary, using the actual host-authored activation ID, not a result.
+    const quotedId = /^  "id": ("(?:[^"\\]|\\.)*")$/m.exec(request.task)?.[1];
+    const activationId = request.activationId ?? (quotedId ? JSON.parse(quotedId) as string : undefined);
+    expect(activationId).toBeDefined();
+    args[0] = { ...request, activationId };
+    birth = "1";
+    const id = (directories.length + 1).toString(16).padStart(32, "0");
+    const directory = path.join(s.root, "runs", id);
+    fs.mkdirSync(directory, { recursive: true });
+    const record = {
+      id, actorId: request.actorId, name: "retained-stop", task: "retained work", status: "running",
+      runner: "pi", transport: "process", sessionId: String(process.ppid), processStartTime: "1",
+      cwd: process.cwd(), startedAt: Date.now(), updatedAt: Date.now(), turns: 0, toolCalls: 0, text: "",
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
+    };
+    fs.writeFileSync(path.join(directory, "task.txt"), JSON.stringify({ actorId: request.actorId, id: activationId }, null, 2));
+    fs.writeFileSync(path.join(directory, "status.json"), JSON.stringify(record));
+    fs.writeFileSync(path.join(directory, "archive-pending.json"), JSON.stringify({
+      format: 1, awaitingResult: true, ownerPid: process.pid,
+      stopIntent: { reason, requestedAt: Date.now(), recoveryRecord: record },
+    }));
+    directories.push(directory);
+    // Seed custody only. The actual result and its origin are produced by the real recovery path.
+    const result = await s.realRun(...args);
+    results.push(result);
+    return result;
+  });
+  return { scheduled, directories, results, launch, gone: () => { birth = "2"; } };
+};
+
+const expectQuietStop = (s: ReturnType<typeof setup>, id: string) => {
+  expect(s.actors.status(id)).toMatchObject({ status: "idle", queued: 0 });
+  expect(s.actors.status(id).activationBlocked).toBeUndefined();
+  const registry = JSON.parse(fs.readFileSync(path.join(s.root, "actors", "actors.json"), "utf8")) as {
+    actors: Array<{ id: string; failureStreak?: unknown; eventsDropped?: unknown }>;
+  };
+  const actor = registry.actors.find(row => row.id === id);
+  expect(actor).toBeDefined();
+  expect(actor!.failureStreak).toBeUndefined();
+  expect(actor!.eventsDropped).toBeUndefined();
+  expect(s.mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, limit: 100 })
+    .filter(event => (event.data as { actorId?: string }).actorId === id)).toHaveLength(0);
+  expect(s.mesh.get(actorAlarmKey(id, "actor-activation-blocked"))).toBeUndefined();
+  expect(s.mesh.get(actorAlarmKey(id, "actor-event-dropped"))).toBeUndefined();
+  expect(s.onDeliver.mock.calls.filter(([request]) => request.delivery === "followUp" && request.triggerTurn)).toHaveLength(0);
+};
+
+const stopCases = (["text", "directive"] as const).flatMap(responseMode =>
+  (["ask", "tell"] as const).flatMap(input => [false, true].map(gone => ({ responseMode, input, gone }))));
+
+describe("recovered durable-stop Main delivery", () => {
+  it.each(stopCases)("settles three deadlines quietly ($responseMode/$input, worker gone: $gone)", async ({ responseMode, input, gone }) => {
+    const s = setup();
+    const recovery = installStopRecovery(s);
+    const actor = await s.actors.create({ name: "recovered-stop", instructions: "Respond.", responseMode, delivery: "mailbox" });
+    for (let index = 0; index < 3; index++) {
+      let answered = false;
+      const answer = input === "ask"
+        ? s.actors.ask(actor.id, "resume retained activation").then(message => {
+          answered = true;
+          return { message };
+        }, error => {
+          answered = true;
+          return { error: String(error) };
+        })
+        : undefined;
+      if (input === "tell") s.actors.tell(actor.id, "resume retained event");
+      await waitFor(() => recovery.scheduled.length === index + 1);
+      const deadline = recovery.scheduled[index]!;
+      expect(deadline.timer.hasRef()).toBe(false);
+      expect(recovery.results).toHaveLength(index);
+      expect(answered).toBe(false);
+      const directory = recovery.directories[index]!;
+      const statusFile = path.join(directory, "status.json");
+      const custodyFile = path.join(directory, "archive-pending.json");
+      const statusBefore = fs.readFileSync(statusFile, "utf8");
+      const custodyBefore = fs.readFileSync(custodyFile, "utf8");
+      if (gone) recovery.gone();
+      // /proc birth is the only changed fact: no directory event wakes the watcher.
+      expect(fs.readFileSync(statusFile, "utf8")).toBe(statusBefore);
+      expect(fs.readFileSync(custodyFile, "utf8")).toBe(custodyBefore);
+      deadline.check(); // Exercise the real one-shot callback without waiting a minute.
+      if (!gone) {
+        // The one-shot cannot discharge a live identity or rearm itself.
+        expect(recovery.results).toHaveLength(index);
+        expect(fs.readFileSync(statusFile, "utf8")).toBe(statusBefore);
+        expect(fs.readFileSync(custodyFile, "utf8")).toBe(custodyBefore);
+        expect(recovery.scheduled).toHaveLength(index + 1);
+        recovery.gone();
+        fs.writeFileSync(path.join(directory, "identity-observed"), "gone"); // A later directory event still joins.
+      }
+      await waitFor(() => recovery.results.length === index + 1 && s.actors.status(actor.id).status === "idle");
+      const result = recovery.results[index]!;
+      expect(result).toMatchObject({ id: path.basename(directory), status: "timed_out" });
+      expect(isRecoveredDurableStop(result)).toBe(true);
+      expect(isRecoveredDurableStop({ ...result })).toBe(false);
+      expect(JSON.parse(fs.readFileSync(statusFile, "utf8"))).toMatchObject({ status: "timed_out" });
+      if (answer) {
+        expect(await answer).toMatchObject(responseMode === "directive"
+          ? { message: { action: "silent", runId: result.id } }
+          : { error: expect.stringContaining(result.error || "Actor run timed_out") });
+      }
+      expectQuietStop(s, actor.id);
+    }
+    await settle();
+    expect(recovery.scheduled).toHaveLength(3); // no minute polling or deadline rearm
+    expect(recovery.launch).not.toHaveBeenCalled();
+    expectQuietStop(s, actor.id);
+  }, 30_000);
+
+  it("does not trust serialized recovery provenance or stopIntent on ordinary timed_out results", async () => {
+    const s = setup();
+    const recovery = installStopRecovery(s, "explicit");
+    const stopped = await s.actors.create({ name: "real-stop", instructions: "Respond.", responseMode: "directive", delivery: "mailbox" });
+    const answer = s.actors.ask(stopped.id, "resume explicit stop");
+    await waitFor(() => recovery.scheduled.length === 1);
+    expect(recovery.scheduled[0]!.timer.hasRef()).toBe(false);
+    recovery.gone();
+    recovery.scheduled[0]!.check();
+    expect(await answer).toMatchObject({ action: "silent" });
+    await waitFor(() => s.actors.status(stopped.id).status === "idle");
+    const genuine = recovery.results[0]!;
+    expect(genuine.status).toBe("stopped");
+    expect(isRecoveredDurableStop(genuine)).toBe(true);
+    expectQuietStop(s, stopped.id);
+    // Worker-writable fields and even a serialized genuine result cannot mint the host's origin marker.
+    const ordinary = { ...JSON.parse(JSON.stringify(genuine)), status: "timed_out", error: "Agent timed out" } as AgentRunResult;
+    expect(ordinary).toMatchObject({ stopIntent: { reason: "explicit" } });
+    expect(isRecoveredDurableStop(ordinary)).toBe(false);
+    s.run.mockResolvedValue(ordinary);
+    const { actor } = await s.fail(3, "provider-transient");
+    await waitFor(() => s.alarms(actor.id).length === 1 && s.onDeliver.mock.calls.length === 1);
+    expect(s.onDeliver.mock.calls[0]![0]).toMatchObject({ delivery: "followUp", triggerTurn: true });
+    expect(s.onDeliver.mock.calls[0]![0].message.text).toContain("failed its last 3 activations");
+    expect(recovery.launch).not.toHaveBeenCalled();
+  }, 30_000);
+
+  it("still alarms Main after three ordinary source failures", async () => {
+    const s = setup(); // Preserve the fixture's original rejection, not a recovery-shaped result.
+    const { actor } = await s.fail(3);
+    await waitFor(() => s.alarms(actor.id).length === 1 && s.onDeliver.mock.calls.length === 1);
+    expect(s.actors.status(actor.id).lastError).toContain(SOURCE_TOKEN);
+    expect(s.onDeliver.mock.calls[0]![0]).toMatchObject({ delivery: "followUp", triggerTurn: true });
+    expect(s.onDeliver.mock.calls[0]![0].message.text).toContain("failed its last 3 activations");
+  }, 30_000);
+});
 
 describe("actor state re-alarm Main delivery (smarty-dev#12512)", () => {
   it("keeps source errors and actual actor paths out of the entire first notice and mesh alarm", async () => {

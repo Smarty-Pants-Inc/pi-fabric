@@ -1,9 +1,11 @@
 // Recorded-call probes only: these check the evidence tools, not a real Fabric canary.
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { createHash } from "node:crypto";
 import { analyzeP95, collectP95, elapsedMs, p95Plan, percentiles } from "./p95.mjs";
 import { analyzeLockAttribution, lockPlan, LOCK_CLASSES } from "./lock-attribution.mjs";
-import { recordedAdapter, rollbackPlan, runRollback } from "./rollback.mjs";
+import { recordedAdapter, rollbackPlan, runRollback,
+  ROLLBACK_DEADLINE_CAP_MS, ROLLBACK_RETRY_HORIZON_MS, ROLLBACK_HOLD_MS } from "./rollback.mjs";
 
 const lockEvidence = () => ({
   schema: "fabric-canary-lock/v1", ownerInventoryComplete: true,
@@ -52,36 +54,66 @@ const completionSamples = () => ["ryzen2", "ryzen4"].map((host, index) => ({
   settlementReceiptId: `recorded:settled:${host}`, deliveredReceiptId: `recorded:delivered:${host}`,
 }));
 
-const rollbackTranscript = ({ host = "ryzen2", unknown = false } = {}) => {
-  const request = { host, runtimeIds: ["session:a", "runtime:b"] }, calls = [];
-  const commands = [
+const recordedStoreDir = (host, hostId) => `/recorded/${host}/control-seen/${createHash("sha256").update(hostId).digest("hex").slice(0, 32)}`;
+const rollbackTranscript = ({ host = "ryzen2", unknown = false, drained = false, uncorrelatedAck = false,
+  flippedAt = "2026-10-16T08:00:00.000Z" } = {}) => {
+  const request = { host, runtimeIds: ["session:a", "runtime:b"],
+    drainReceiptStores: ["session:a", "runtime:b"].map(hostId => ({ hostId, storeDir: recordedStoreDir(host, hostId) })) }, calls = [];
+  const commands = drained ? [] : [
     { commandId: "cmd:queued", replyTo: "reply:q", classification: "queued" },
     { commandId: "cmd:admitted", replyTo: "reply:a", classification: "admitted", storedOutcome: { accepted: true } },
     { commandId: "cmd:terminal", replyTo: "reply:t", classification: "terminal", storedOutcome: { code: "FABRIC_TARGET_TERMINAL" } },
     ...(unknown ? [{ commandId: "cmd:unknown", replyTo: "reply:u", classification: "unknown" }] : []),
   ];
-  const states = [{ runtimeId: "session:a", pending: commands.length, ackPending: 1 },
-    { runtimeId: "runtime:b", pending: 1, ackPending: 0 }];
+  const states = [{ runtimeId: "session:a", stream: `FABRIC_IN_${host}`, pending: commands.length, ackPending: drained ? 0 : 1 },
+    { runtimeId: "runtime:b", stream: `FABRIC_IN_${host}`, pending: drained ? 0 : 1, ackPending: 0 }];
   const messages = commands.map((command, index) => ({ runtimeId: "session:a", sequence: index + 1, kind: "command",
-    commandId: command.commandId, replyTo: command.replyTo,
+    commandId: command.commandId, commandEventId: `event:${command.commandId}`, replyTo: command.replyTo,
     claim: command.classification === "queued" ? "absent" : command.classification === "unknown" ? "pending" : "outcome",
     ...(command.storedOutcome ? { outcome: command.storedOutcome } : {}),
     ...(command.classification === "terminal" ? { terminal: true } : {}),
   }));
-  messages.push({ runtimeId: "session:a", sequence: commands.length + 1, kind: "ack" },
-    { ...messages[0], runtimeId: "runtime:b", sequence: 1 });
-  const add = (kind, payload, result) => calls.push({ action: { kind, ...request, ...payload }, result });
+  if (!drained) messages.push({ runtimeId: "session:a", sequence: commands.length + 1, kind: "ack",
+    ...(uncorrelatedAck ? {} : { commandEventId: "event:cmd:queued" }) },
+    { ...messages[0], runtimeId: "runtime:b", sequence: 1, commandEventId: "event:cmd:queued:second-request" });
+  const add = (kind, payload, result) => calls.push({ action: { kind, host, runtimeIds: request.runtimeIds, ...payload }, result });
   add("pause-admission", {}, { paused: true, spawnsRefused: true, receiversDraining: true,
     code: "FABRIC_TRANSPORT_DRAINING", notRun: true, persisted: false, runtimeIds: request.runtimeIds, hostInventoryComplete: true });
   add("drain", { waitLimitMs: 120000 }, { elapsedMs: 120000, states });
   add("classify-retained", { states }, { complete: true, pausedInventoryStable: true, controlSeenStoreUnchanged: true, messages });
-  commands.forEach((command, index) => add("relay-outcome-unknown", {
-    disposition: { commandId: command.commandId, classification: command.classification, relayId: `relay:${command.commandId}`,
-      code: "FABRIC_RELAY_DESTINATION_UNAVAILABLE", outcome: "outcome-unknown", retry: "same-key-once-after-flip" }, replyTo: command.replyTo,
-  }, { id: `relay:${command.commandId}`, persisted: true, sequence: index + 1 }));
-  add("flip-to-file", { transport: "file", reloadAll: true, retainBridge: true }, {
+  const commandMessages = messages.filter(m => m.kind === "command");
+  commandMessages.forEach((message, index) => {
+    const command = commands.find(c => c.commandId === message.commandId);
+    add("relay-outcome-unknown", {
+      disposition: { commandId: command.commandId, commandEventId: message.commandEventId, runtimeId: message.runtimeId,
+        classification: command.classification, relayId: `relay:${message.commandEventId}`,
+        code: "FABRIC_RELAY_DESTINATION_UNAVAILABLE", outcome: "outcome-unknown", retry: "same-key-once-after-flip" }, replyTo: command.replyTo,
+    }, { id: `relay:${message.commandEventId}`, persisted: true, sequence: index + 1 });
+  });
+  const writes = request.drainReceiptStores.map(({ hostId, storeDir }) => {
+    const state = states.find(s => s.runtimeId === hostId);
+    const eventIds = [...new Set(commandMessages.filter(m => m.runtimeId === hostId).map(m => m.commandEventId))];
+    return { storeDir, receipt: { version: 1, hostId,
+      flippedAt: { from: "actual-flip-boundary", format: "epoch-ms" },
+      completedAt: { from: "drain-completed-at-boundary", format: "epoch-ms" },
+      complete: !(uncorrelatedAck && hostId === "session:a" && !drained),
+      consumer: { stream: state.stream, numPending: state.pending, numAckPending: state.ackPending },
+      dispositions: eventIds.map(commandEventId => ({ commandEventId, disposition: "relay" })) } };
+  });
+  for (const write of writes) add("write-nats-drain-receipt", {
+    module: "dist/topology/nats-drain-receipt.js", api: "writeNatsDrainReceipt", storeDir: write.storeDir,
+    receipt: { ...write.receipt, flippedAt: Date.parse(flippedAt), completedAt: Date.parse(flippedAt) + 1 },
+  }, { apiInvoked: true, persistence: "recorded-unverified" });
+  add("flip-to-file", { transport: "file", reloadAll: true, retainBridge: true,
+    hostConfigWrite: { atomic: true, set: { "mesh.transport": "file",
+      "mesh.nats.rollbackHoldUntil": { from: "flippedAt", plusMs: 172800000, format: "utc-iso" } } },
+    drainReceiptWrite: { module: "dist/topology/nats-drain-receipt.js", api: "writeNatsDrainReceipt",
+      timing: "before-atomic-host-config-write", writes },
+  }, {
     hostTransport: "file", fileRuntimeIds: request.runtimeIds, oldNatsWritersStopped: true, bridgeUp: true,
     filePresenceMirrored: true, eventTopicsUnaffected: true, fileAdmissionReady: true,
+    hostConfigWrite: { atomic: true, persisted: true, flippedAt, set: { "mesh.transport": "file",
+      "mesh.nats.rollbackHoldUntil": new Date(Date.parse(flippedAt) + 172800000).toISOString() } },
   });
   add("reconcile-command-ids", { commands, preserveControlSeen: true, maxSameKeyRetries: 1, retainCompletions: true }, {
     controlSeenStoreUnchanged: true, completionJournalRetained: true, completionJournalUnchanged: true,
@@ -280,9 +312,121 @@ test("T-ROLLBACK dry-run never invokes the injected command adapter and retains 
   assert.ok(result.forbidden.includes("purge"));
 });
 
+// Keep reason: E14.3 evidence trust boundary/data safety; these are NOT live withdraw tests.
+test("E14.3 T-ROLLBACK pins the normal 24h deadline cap plus H=24h to one 48h atomic flip", async () => {
+  assert.equal(ROLLBACK_DEADLINE_CAP_MS, 86400000);
+  assert.equal(ROLLBACK_RETRY_HORIZON_MS, 86400000);
+  assert.equal(ROLLBACK_HOLD_MS, 172800000);
+  assert.equal(ROLLBACK_HOLD_MS, ROLLBACK_DEADLINE_CAP_MS + ROLLBACK_RETRY_HORIZON_MS);
+  const request = { host: "ryzen2", runtimeIds: ["session:a"] };
+  const plan = await runRollback(request, () => { throw new Error("dry-run must not execute"); });
+  assert.deepEqual(plan.withdrawHold, { deadlineCapMs: 86400000, retryHorizonMs: 86400000, durationMs: 172800000 });
+  assert.deepEqual(plan.steps.find(s => s.phase === "flip").hostConfigWrite, { atomic: true, set: {
+    "mesh.transport": "file", "mesh.nats.rollbackHoldUntil": { from: "flippedAt", plusMs: 172800000, format: "utc-iso" },
+  } });
+  assert.ok(plan.forbidden.includes("split transport/hold config writes"));
+});
+
+test("E14.3 T-ROLLBACK exact receipts anchor the hold to the actual flip, across UTC calendar boundaries", async () => {
+  for (const [flippedAt, holdUntil] of [
+    ["2026-10-16T08:00:00.000Z", "2026-10-18T08:00:00.000Z"],
+    ["2026-12-31T23:59:59.999Z", "2027-01-02T23:59:59.999Z"],
+    ["2028-02-28T23:59:59.123Z", "2028-03-01T23:59:59.123Z"],
+  ]) {
+    const report = await replayRollback(rollbackTranscript({ flippedAt }));
+    assert.equal(report.verdict, "reconciled");
+    assert.equal(report.evidenceKind, "recorded-probe-only");
+    assert.equal(report.e2eProven, false);
+    const flips = report.audit.filter(a => a.action.kind === "flip-to-file");
+    assert.equal(flips.length, 1);
+    assert.deepEqual(flips[0].result.hostConfigWrite, { atomic: true, persisted: true, flippedAt,
+      set: { "mesh.transport": "file", "mesh.nats.rollbackHoldUntil": holdUntil } });
+    assert.equal(Date.parse(holdUntil) - Date.parse(flippedAt), 172800000);
+    assert.equal(report.reconciliation.completionJournalUnchanged, true);
+  }
+});
+
+test("E14.3 T-ROLLBACK missing, malformed, stale or split config receipts fail typed/unknown before any retry", async () => {
+  for (const mutation of [
+    r => { delete r.hostConfigWrite; }, // Legacy FILE-only receipt is no longer sufficient.
+    r => { delete r.hostConfigWrite.atomic; },
+    r => { r.hostConfigWrite.atomic = false; },
+    r => { delete r.hostConfigWrite.persisted; },
+    r => { r.hostConfigWrite.persisted = false; },
+    r => { delete r.hostConfigWrite.set["mesh.transport"]; },
+    r => { r.hostConfigWrite.set["mesh.transport"] = "nats"; },
+    r => { delete r.hostConfigWrite.set["mesh.nats.rollbackHoldUntil"]; },
+    r => { r.hostConfigWrite.set["mesh.nats.rollbackHoldUntil"] = "garbage"; },
+    r => { r.hostConfigWrite.set["mesh.nats.rollbackHoldUntil"] = 1792310400000; },
+    r => { r.hostConfigWrite.set["mesh.nats.rollbackHoldUntil"] = "2026-10-18T08:00:00.000+00:00"; },
+    r => { r.hostConfigWrite.set["mesh.nats.rollbackHoldUntil"] = "2026-10-18T08:00:00.000"; },
+    r => { r.hostConfigWrite.set["mesh.nats.rollbackHoldUntil"] = "2026-02-30T08:00:00.000Z"; },
+    r => { r.hostConfigWrite.set["mesh.nats.rollbackHoldUntil"] = "2026-10-15T08:00:00.000Z"; }, // Existing expired hold.
+    r => { r.hostConfigWrite.set["mesh.nats.rollbackHoldUntil"] = "2026-10-17T08:00:00.000Z"; }, // Existing future hold, too short.
+    r => { r.hostConfigWrite.set["mesh.nats.rollbackHoldUntil"] = "2026-10-18T07:59:59.999Z"; },
+    r => { r.hostConfigWrite.set["mesh.nats.rollbackHoldUntil"] = "2026-10-19T08:00:00.000Z"; }, // Not exactly flip+48h.
+    r => { delete r.hostConfigWrite.flippedAt; },
+    r => { r.hostConfigWrite.flippedAt = "2026-02-30T08:00:00.000Z"; },
+    r => { r.hostConfigWrite.flippedAt = "2026-10-16T08:00:00.000+01:00"; },
+    r => { r.hostConfigWrite = { atomic: true, persisted: true, flippedAt: r.hostConfigWrite.flippedAt,
+      transportWrite: { "mesh.transport": "file" },
+      holdWrite: { "mesh.nats.rollbackHoldUntil": "2026-10-18T08:00:00.000Z" } }; },
+    r => { r.code = "CONTROL_NOT_DELIVERED"; r.notDelivered = true; r.notRun = true; },
+  ]) {
+    const transcript = rollbackTranscript(); mutation(transcript.calls.find(c => c.action.kind === "flip-to-file").result);
+    const report = await replayRollback(transcript);
+    assert.equal(report.verdict, "blocked");
+    assert.equal(report.phase, "flip");
+    assert.equal(report.code, "FABRIC_CANARY_ROLLBACK_FLIP_UNVERIFIED");
+    assert.equal(report.outcome, "outcome-unknown");
+    assert.equal(Object.hasOwn(report, "notDelivered"), false);
+    assert.equal(Object.hasOwn(report, "notRun"), false);
+    assert.equal(Object.hasOwn(report, "reconciliation"), false);
+    assert.equal(report.audit.at(-1).action.kind, "flip-to-file");
+    assert.equal(report.e2eProven, false);
+  }
+});
+
+test("E14.3 T-ROLLBACK exact replay rejects a legacy or partial flip action even with a valid hold receipt", async () => {
+  for (const mutation of [
+    a => { delete a.hostConfigWrite; },
+    a => { delete a.hostConfigWrite.set["mesh.transport"]; },
+    a => { delete a.hostConfigWrite.set["mesh.nats.rollbackHoldUntil"]; },
+    a => { a.hostConfigWrite.atomic = false; },
+    a => { a.hostConfigWrite.set["mesh.nats.rollbackHoldUntil"].plusMs = 86400000; },
+  ]) {
+    const transcript = rollbackTranscript(); mutation(transcript.calls.find(c => c.action.kind === "flip-to-file").action);
+    const report = await replayRollback(transcript);
+    assert.equal(report.verdict, "blocked");
+    assert.equal(report.code, "FABRIC_CANARY_ROLLBACK_FLIP_UNVERIFIED");
+    assert.equal(report.outcome, "outcome-unknown");
+    assert.match(report.error, /does not match flip-to-file/);
+    assert.equal(report.audit.at(-1).status, "uncertain");
+    assert.equal(Object.hasOwn(report, "reconciliation"), false);
+  }
+});
+
+test("E14.3 T-ROLLBACK an adapter failure cannot turn an uncertain flip into CONTROL_NOT_DELIVERED", async () => {
+  const transcript = rollbackTranscript(), adapter = recordedAdapter(transcript.calls);
+  const report = await runRollback(transcript.request, async (action, options) => {
+    if (action.kind === "flip-to-file") throw Object.assign(new Error("config write status unknown"),
+      { code: "CONTROL_NOT_DELIVERED", notDelivered: true, notRun: true });
+    return adapter.execute(action, options);
+  }, { dryRun: false, evidenceKind: "recorded-probe-only" });
+  assert.equal(report.verdict, "blocked");
+  assert.equal(report.code, "FABRIC_CANARY_ROLLBACK_FLIP_UNVERIFIED");
+  assert.equal(report.outcome, "outcome-unknown");
+  assert.equal(Object.hasOwn(report, "notDelivered"), false);
+  assert.equal(Object.hasOwn(report, "notRun"), false);
+  assert.equal(report.audit.at(-1).status, "uncertain");
+  assert.equal(report.audit.at(-1).action.kind, "flip-to-file");
+  assert.equal(report.e2eProven, false);
+});
+
 test("T-ROLLBACK an uncertain pause stops before drain, flip or same-key retry", async () => {
   const actions = [];
-  const result = await runRollback({ host: "ryzen4", runtimeIds: ["session:a"] }, async action => {
+  const result = await runRollback({ host: "ryzen4", runtimeIds: ["session:a"],
+    drainReceiptStores: [{ hostId: "session:a", storeDir: recordedStoreDir("ryzen4", "session:a") }] }, async action => {
     actions.push(action.kind); throw new Error("injected uncertain pause");
   }, { dryRun: false, evidenceKind: "recorded-probe-only" });
   assert.deepEqual(actions, ["pause-admission"]);
@@ -300,7 +444,7 @@ test("E4 T-ROLLBACK exact full replay reconciles only control and retains native
     assert.equal(report.e2eProven, false);
     assert.equal(report.fullyDrained, false);
     assert.equal(report.audit.length, transcript.calls.length);
-    assert.deepEqual(report.dispositions.map(d => d.classification), ["queued", "admitted", "terminal"]);
+    assert.deepEqual(report.dispositions.map(d => d.classification), ["queued", "admitted", "terminal", "queued"]);
     assert.equal(report.retainedAcks.length, 1);
     assert.equal(report.reconciliation.completionJournalRetained, true);
     assert.equal(report.reconciliation.completionJournalUnchanged, true);
@@ -360,6 +504,217 @@ test("T-ROLLBACK preserves full drain, inventory, old-writer and same-key safety
     assert.equal(report.audit.at(-1).action.kind, kind);
     assert.equal(report.e2eProven, false);
   }
+});
+
+// Keep reason: E16c/E17 release trust boundary and local custody data safety.
+// These assert the orchestrator's fail-closed decisions, NOT A1's fsync implementation or release predicate.
+test("E17 recorded writer calls follow exhaustive classification and EVERY event relay, before the atomic flip", async () => {
+  for (const host of ["ryzen2", "ryzen4"]) {
+    const transcript = rollbackTranscript({ host, unknown: true });
+    const report = await replayRollback(transcript);
+    assert.equal(report.verdict, "needs-operator"); // A drain disposition is not a native handler outcome.
+    assert.equal(report.releaseProven, false);
+    assert.equal(report.drainReceiptMode, "probe");
+    const kinds = report.audit.map(a => a.action.kind);
+    const firstWrite = kinds.indexOf("write-nats-drain-receipt"), flip = kinds.indexOf("flip-to-file");
+    assert.ok(firstWrite > kinds.indexOf("classify-retained"));
+    assert.ok(firstWrite > kinds.lastIndexOf("relay-outcome-unknown"));
+    assert.ok(firstWrite < flip);
+    assert.equal(report.drainReceiptWrites.length, transcript.request.runtimeIds.length);
+    for (const write of report.drainReceiptWrites) {
+      const configured = transcript.request.drainReceiptStores.find(s => s.hostId === write.receipt.hostId);
+      assert.equal(write.storeDir, configured.storeDir);
+      // Exact numeric argument to A1's actual (storeDir, NatsDrainReceipt) => void API.
+      // A1 validates shape only; exhaustive coverage remains this orchestrator's responsibility.
+      const session = configured.hostId === "session:a";
+      assert.deepEqual(write.receipt, {
+        version: 1, hostId: configured.hostId,
+        flippedAt: Date.parse("2026-10-16T08:00:00.000Z"),
+        completedAt: Date.parse("2026-10-16T08:00:00.000Z") + 1,
+        complete: true,
+        consumer: { stream: `FABRIC_IN_${host}`, numPending: session ? 4 : 1, numAckPending: session ? 1 : 0 },
+        dispositions: (session ? ["event:cmd:queued", "event:cmd:admitted", "event:cmd:terminal", "event:cmd:unknown"] :
+          ["event:cmd:queued:second-request"]).map(commandEventId => ({ commandEventId, disposition: "relay" })),
+      });
+      assert.equal(write.persistence, "recorded-unverified");
+      const call = report.audit.find(a => a.action.kind === "write-nats-drain-receipt" && a.action.storeDir === write.storeDir);
+      assert.deepEqual(call.action, { kind: "write-nats-drain-receipt", host, runtimeIds: transcript.request.runtimeIds,
+        module: "dist/topology/nats-drain-receipt.js", api: "writeNatsDrainReceipt", storeDir: write.storeDir, receipt: write.receipt });
+      assert.deepEqual(call.result, { apiInvoked: true, persistence: "recorded-unverified" });
+    }
+    const ids = report.drainReceiptWrites.flatMap(w => w.receipt.dispositions.map(d => d.commandEventId));
+    assert.ok(ids.includes("event:cmd:queued"));
+    assert.ok(ids.includes("event:cmd:queued:second-request"));
+    assert.ok(ids.includes("event:cmd:unknown"));
+    assert.equal(report.dispositions.filter(d => d.commandId === "cmd:queued").length, 2);
+  }
+});
+
+test("E17 actual 0/0 permits complete receipt with no invented command dispositions", async () => {
+  const report = await replayRollback(rollbackTranscript({ drained: true }));
+  assert.equal(report.verdict, "reconciled");
+  assert.equal(report.fullyDrained, true);
+  assert.equal(report.releaseProven, false);
+  assert.equal(report.audit.some(a => a.action.kind === "relay-outcome-unknown"), false);
+  for (const write of report.drainReceiptWrites) {
+    assert.equal(write.receipt.complete, true);
+    assert.deepEqual(write.receipt.dispositions, []);
+    assert.deepEqual(write.receipt.consumer, { stream: "FABRIC_IN_ryzen2", numPending: 0, numAckPending: 0 });
+    assert.equal(write.persistence, "recorded-unverified");
+  }
+});
+
+test("E17 partial or failed drain/classification/relay never reaches the custody writer", async () => {
+  for (const [kind, mutation] of [
+    ["drain", r => { r.states[0].pending = -1; }],
+    ["drain", r => { delete r.states[0].stream; }],
+    ["drain", r => { r.states[0].stream = "FABRIC_IN_ryzen4"; }],
+    ["classify-retained", r => { r.complete = false; }],
+    ["classify-retained", r => { delete r.messages[0].commandEventId; }],
+    ["relay-outcome-unknown", r => { r.persisted = false; }],
+    ["relay-outcome-unknown", r => { r.id = "relay:cmd:queued"; }],
+  ]) {
+    const transcript = rollbackTranscript({ unknown: true });
+    mutation(transcript.calls.find(c => c.action.kind === kind).result);
+    const report = await replayRollback(transcript);
+    assert.equal(report.verdict, "blocked");
+    assert.equal(report.releaseProven, false);
+    assert.deepEqual(report.drainReceiptWrites, []);
+    assert.equal(report.audit.some(a => a.action.kind === "write-nats-drain-receipt"), false);
+    assert.equal(report.audit.some(a => a.action.kind === "flip-to-file"), false);
+  }
+});
+
+test("E17 queued and unknown claims without their actual event relay cannot authorize a receipt", async () => {
+  for (const commandId of ["cmd:queued", "cmd:unknown"]) {
+    const transcript = rollbackTranscript({ unknown: true });
+    transcript.calls.find(c => c.action.kind === "relay-outcome-unknown" && c.action.disposition.commandId === commandId).result.persisted = false;
+    const report = await replayRollback(transcript);
+    assert.equal(report.verdict, "blocked");
+    assert.equal(report.phase, "disposition");
+    assert.equal(report.releaseProven, false);
+    assert.deepEqual(report.drainReceiptWrites, []);
+    assert.equal(report.audit.some(a => a.action.kind === "write-nats-drain-receipt"), false);
+  }
+});
+
+test("E17 uncertain second writer keeps the first receipt audit but never consumes a config flip or retries", async () => {
+  const transcript = rollbackTranscript(), adapter = recordedAdapter(transcript.calls);
+  const report = await runRollback(transcript.request, async (action, options) => {
+    if (action.kind === "write-nats-drain-receipt" && action.receipt.hostId === "runtime:b") {
+      throw new Error("recorded writer persistence uncertain");
+    }
+    return adapter.execute(action, options);
+  }, { dryRun: false, evidenceKind: "recorded-probe-only" });
+  assert.equal(report.verdict, "blocked");
+  assert.equal(report.phase, "drain-receipt");
+  assert.equal(report.code, "FABRIC_CANARY_ROLLBACK_DRAIN_RECEIPT_UNVERIFIED");
+  assert.equal(report.drainReceiptWrites.length, 1);
+  assert.equal(report.drainReceiptWrites[0].receipt.hostId, "session:a");
+  assert.equal(report.drainReceiptWrites[0].persistence, "recorded-unverified");
+  assert.equal(report.audit.filter(a => a.action.kind === "write-nats-drain-receipt").length, 2);
+  assert.equal(report.audit.at(-1).status, "uncertain");
+  assert.equal(Object.hasOwn(report.audit.at(-1), "result"), false);
+  assert.equal(Object.hasOwn(report, "reconciliation"), false);
+  assert.equal(report.releaseProven, false);
+});
+
+test("E17 retained uncorrelated message writes INCOMPLETE and vetoes the config flip/release claim", async () => {
+  const transcript = rollbackTranscript({ uncorrelatedAck: true });
+  const report = await replayRollback(transcript);
+  assert.equal(report.verdict, "blocked");
+  assert.equal(report.code, "FABRIC_CANARY_ROLLBACK_DRAIN_RECEIPT_UNVERIFIED");
+  assert.equal(report.phase, "drain-receipt");
+  assert.equal(report.releaseProven, false);
+  assert.equal(report.drainReceiptWrites[0].receipt.complete, false);
+  assert.match(report.error, /incomplete per-commandEventId/);
+  assert.equal(report.audit.at(-1).action.kind, "flip-to-file");
+  assert.equal(report.audit.at(-1).status, "uncertain");
+  assert.equal(Object.hasOwn(report.audit.at(-1), "result"), false); // no recorded config write consumed
+  assert.equal(Object.hasOwn(report, "reconciliation"), false);
+});
+
+test("E17 missing, mesh-root, relative, duplicate and foreign-host store bindings fail before pause", async () => {
+  for (const mutation of [
+    r => { delete r.drainReceiptStores; },
+    r => { r.drainReceiptStores.pop(); },
+    r => { r.drainReceiptStores[0].storeDir = "/recorded/ryzen2/mesh"; },
+    r => { r.drainReceiptStores[0].storeDir = "control-seen/relative"; },
+    r => { r.drainReceiptStores[0].storeDir = recordedStoreDir("ryzen2", "foreign:host"); },
+    r => { r.drainReceiptStores[0].hostId = "foreign:host"; },
+    r => { r.drainReceiptStores[1] = r.drainReceiptStores[0]; },
+  ]) {
+    const transcript = rollbackTranscript(); mutation(transcript.request);
+    const report = await replayRollback(transcript);
+    assert.equal(report.verdict, "blocked");
+    assert.equal(report.code, "FABRIC_CANARY_ROLLBACK_DRAIN_RECEIPT_UNVERIFIED");
+    assert.deepEqual(report.audit, []);
+    assert.deepEqual(report.drainReceiptWrites, []);
+  }
+});
+
+test("E17 exact replay rejects foreign, stale-time, incomplete and falsely persisted writer receipts", async () => {
+  for (const mutation of [
+    c => { c.action.storeDir = recordedStoreDir("ryzen2", "foreign:host"); },
+    c => { c.action.receipt.hostId = "foreign:host"; },
+    c => { c.action.receipt.complete = false; },
+    c => { c.action.receipt.consumer.numPending = 0; },
+    c => { c.action.receipt.dispositions.pop(); },
+    c => { c.action.receipt.completedAt = c.action.receipt.flippedAt - 1; },
+    c => { c.action.receipt.flippedAt = -1; },
+    c => { c.result = { apiInvoked: true, persistence: "built-writer-returned" }; },
+    c => { c.result.persisted = true; },
+    c => { c.result.apiInvoked = false; },
+  ]) {
+    const transcript = rollbackTranscript(); mutation(transcript.calls.find(c => c.action.kind === "write-nats-drain-receipt"));
+    const report = await replayRollback(transcript);
+    assert.equal(report.verdict, "blocked");
+    assert.equal(report.releaseProven, false);
+    assert.equal(Object.hasOwn(report, "reconciliation"), false);
+    assert.equal(report.audit.at(-1).status, "uncertain");
+  }
+});
+
+test("E17 receipt timestamp is bound to actual E14.3 config flip, not a planned earlier flip", async () => {
+  const transcript = rollbackTranscript();
+  const config = transcript.calls.find(c => c.action.kind === "flip-to-file").result.hostConfigWrite;
+  config.flippedAt = "2026-10-16T08:00:01.000Z";
+  config.set["mesh.nats.rollbackHoldUntil"] = "2026-10-18T08:00:01.000Z";
+  const report = await replayRollback(transcript);
+  assert.equal(report.verdict, "blocked");
+  assert.equal(report.code, "FABRIC_CANARY_ROLLBACK_FLIP_UNVERIFIED");
+  assert.match(report.error, /drain receipt flippedAt must equal/);
+  assert.equal(report.releaseProven, false);
+});
+
+test("E17 driver cannot skip or duplicate the mandatory beforeFlip hook", async () => {
+  for (const duplicate of [false, true]) {
+    const transcript = rollbackTranscript(), adapter = recordedAdapter(transcript.calls);
+    const flipResult = transcript.calls.find(c => c.action.kind === "flip-to-file").result;
+    const report = await runRollback(transcript.request, async (action, options) => {
+      if (action.kind !== "flip-to-file") return adapter.execute(action, options);
+      if (duplicate) {
+        const stamp = { flippedAt: flipResult.hostConfigWrite.flippedAt, completedAt: Date.parse(flipResult.hostConfigWrite.flippedAt) + 1 };
+        await options.beforeFlip(stamp);
+        await assert.rejects(options.beforeFlip(stamp), /exactly once/);
+      }
+      return structuredClone(flipResult);
+    }, { dryRun: false, evidenceKind: "recorded-probe-only" });
+    assert.equal(report.verdict, "blocked");
+    assert.equal(report.releaseProven, false);
+    assert.equal(Object.hasOwn(report, "reconciliation"), false);
+  }
+});
+
+test("E17 replay cannot opt into the live built writer, even with a misleading evidenceKind", async () => {
+  const transcript = rollbackTranscript(), adapter = recordedAdapter(transcript.calls);
+  const report = await runRollback(transcript.request, adapter.execute,
+    { dryRun: false, evidenceKind: "injected-unverified", drainReceiptMode: "live" });
+  assert.equal(report.verdict, "blocked");
+  assert.match(report.error, /recorded replay cannot opt into live/);
+  assert.equal(report.releaseProven, false);
+  assert.deepEqual(report.audit, []);
+  assert.deepEqual(report.drainReceiptWrites, []);
 });
 
 test("T-ROLLBACK recorded-call replay requires exact calls and refuses unused receipts", async () => {

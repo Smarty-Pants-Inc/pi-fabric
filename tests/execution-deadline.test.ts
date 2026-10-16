@@ -339,6 +339,108 @@ describe("execution deadline under microtask starvation", () => {
     }
   });
 
+  // Data-safety regression: resolved failure values must not authorize a
+  // background writer that was already waiting on the real canonical lock.
+  it.each([
+    { status: "failed", callOutcome: "failed", ending: "timeout", oversized: false },
+    { status: "stopped", callOutcome: "aborted", ending: "abort", oversized: false },
+    { status: "timed_out", callOutcome: "timed_out", ending: "timeout", oversized: false },
+    { status: "failed", callOutcome: "failed", ending: "timeout", oversized: true },
+    { status: "completed", callOutcome: "succeeded", ending: "timeout", oversized: false },
+    { status: "completed", callOutcome: "succeeded", ending: "abort", oversized: false },
+  ] as const)("preserves queued mesh writes only for canonical call success: $status/$ending (oversized=$oversized)", async ({ status, callOutcome, ending, oversized }) => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "execution-mesh-returned-"));
+    const mesh = new MeshStore(base, 65_536, 100, { lockTimeoutMs: 5_000 });
+    const registry = new ActionRegistry();
+    let background: Promise<{ value?: unknown; error?: unknown }> = Promise.resolve({});
+    let received: unknown;
+    let admit = () => {};
+    let admitted = false;
+    const abort = new AbortController();
+    const returned = status === "completed" ? { status, id: "detached-started" } : {
+      status, error: `spawn ${status}`,
+      ...(oversized ? { detail: "oversized failure detail ".repeat(100) } : {}),
+    };
+    const descriptor = {
+      name: "spawn", description: "detached actor start with a returned outcome",
+      inputSchema: { type: "object", additionalProperties: true }, risk: "read" as const,
+    };
+    registry.register({
+      name: "agents", description: "test agents", async list() { return [descriptor]; },
+      async describe() { return descriptor; },
+      async invoke() {
+        // Queue under the inherited invocation BEFORE resolving the spawn call.
+        background = mesh.publish({ topic: "detached", from: meshFrom })
+          .then(value => ({ value }), error => ({ error }));
+        return returned;
+      },
+    });
+    const receiptDescriptor = { ...descriptor, name: "received", description: "guest result receipt" };
+    registry.register({
+      name: "demo", description: "guest receipt", async list() { return [receiptDescriptor]; },
+      async describe() { return receiptDescriptor; },
+      async invoke(_name, args) {
+        // Admission here proves the guest received the resolved value, rather
+        // than catching a newly thrown error. Cold startup costs no CPU budget.
+        received = args.result;
+        admit();
+        return "received";
+      },
+    });
+    const config = structuredClone(DEFAULT_FABRIC_CONFIG);
+    config.executor.timeoutMs = ending === "timeout" ? boundMs : 5_000;
+    config.executor.hostCallTimeouts = {};
+    if (oversized) config.executor.maxNestedResultChars = 256;
+    const context = deadlineContext(`guest-mesh-returned-${status}-${ending}-${oversized}`);
+    const service = new FabricExecutionService(registry, config);
+    await service.prewarm(context);
+    const held = heldMesh(base);
+    await held.ready;
+    try {
+      const result = await executeAfterAdmission((signal, startClock) => {
+        admit = () => { admitted = true; startClock(); };
+        return service.execute({
+          code: `const result = await tools.call({ ref: "agents.spawn", args: {} });
+            await tools.call({ ref: "demo.received", args: { result } });
+            ${ending === "timeout" ? "while (true) {}" : "await new Promise(() => {});"}`,
+          context, signal: AbortSignal.any([signal, abort.signal]),
+          parentToolCallId: "guest-mesh-returned", onPartial() {},
+        });
+      }, () => admitted, () => {
+        if (ending === "abort") abort.abort(new Error("test abort after returned result"));
+      });
+      expect(result.typeErrors).toBeUndefined();
+      expect(result.success).toBe(false);
+      expect(result.trace.outcome).toBe(ending === "timeout" ? "timed_out" : "aborted");
+      if (oversized) {
+        expect(received).toMatchObject({ fabricTruncated: true, originalChars: JSON.stringify(returned).length });
+        expect(received).not.toHaveProperty("status");
+      } else expect(received).toEqual(returned);
+      expect(result.audits.find(audit => audit.ref === "agents.spawn")?.success).toBe(status === "completed");
+      expect(result.trace.operations.find(operation => operation.ref === "agents.spawn")).toMatchObject({
+        outcome: callOutcome,
+        ...(status === "completed" ? {} : { failureStage: "invoke" }),
+        ...(oversized ? { resultTruncated: true } : {}),
+      });
+      expect(mesh.read({ topic: "detached" })).toHaveLength(0);
+      held.release();
+      await held.settled;
+      // Drain the original writer AFTER release, so no-append catches a late
+      // commit. Confirmed successful spawns still commit despite guest teardown.
+      const outcome = await background;
+      if (status === "completed") expect(outcome.value).toMatchObject({ topic: "detached" });
+      else expect(outcome.error).toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
+      expect(mesh.read({ topic: "detached" })).toHaveLength(status === "completed" ? 1 : 0);
+    } finally {
+      held.release();
+      await held.settled;
+      await background;
+      await registry.close();
+      mesh.closeState();
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+
   it.each([true, false])("preserves detached mesh refresh only after successful agents.spawn: %s", async success => {
     const base = fs.mkdtempSync(path.join(os.tmpdir(), "execution-mesh-detached-"));
     const mesh = new MeshStore(base, 65_536, 100, { lockTimeoutMs: 5_000 });

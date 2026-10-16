@@ -50,6 +50,8 @@ const meshInvocationStorage = new AsyncLocalStorage<MeshInvocationContext>();
 export const withMeshInvocationContext = async <T>(
   context: Omit<MeshInvocationContext, "closed" | "detached" | "expired">,
   operation: () => T | Promise<T>,
+  // Dispatchers can require canonical success even when a failed call resolves.
+  confirmSuccess: () => boolean = () => true,
 ): Promise<T> => {
   // A successful detached handle must not keep the caller's eventual runtime
   // abort attached to mesh work that was already waiting when the handle returned.
@@ -71,7 +73,7 @@ export const withMeshInvocationContext = async <T>(
       const value = await operation();
       // Confirmed detached work outlives its caller; only unsuccessful dispatches
       // permanently close the inherited scope. A sibling never shares this object.
-      if (scope.expired) scope.closed = true;
+      if (scope.expired || !confirmSuccess()) scope.closed = true;
       else scope.detached = true;
       return value;
     } catch (error) {

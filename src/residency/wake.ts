@@ -64,6 +64,34 @@ class ResidentWakeAdmissionClosed extends Error {
   constructor() { super("Resident wake maintenance admission closed"); }
 }
 const wakeFailureAt = (root: string): ResidentWakeFailure | undefined => readWakeJson<ResidentWakeFailure>(wakeFailurePath(root));
+const wakeDeliveryCovers = (left: WakeDelivery, right: WakeDelivery): boolean => left.id === right.id ||
+  (left.sequence !== undefined && (right.sequence === undefined || left.sequence >= right.sequence));
+const ownsWakeReceipt = (receipt: ResidentWakeFailure | undefined, claimId: string, delivery: WakeDelivery): boolean =>
+  receipt?.claimId === claimId && receipt.delivery.id === delivery.id && receipt.delivery.sequence === delivery.sequence;
+
+/** A completed monitor prefix, not a successful spawn, settles an abandoned attempt.
+ * Scoped checkpoints supersede the legacy cursor. Every persisted scope must
+ * cover the delivery; a missing/invalid anchor is never completion evidence. */
+const residentWakeDeliveryConsumed = (meshRoot: string, root: string, delivery: WakeDelivery): boolean => {
+  if (!Number.isSafeInteger(delivery.sequence) || delivery.sequence! < 1) return false;
+  const legacy = path.join(root, "actor-mesh-cursor.json");
+  const scoped = ["project", "session"].map(scope => `${legacy}.${scope}`).filter(file => {
+    try { fs.lstatSync(file); return true; }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return false; throw error; }
+  });
+  const consumed = (scoped.length ? scoped : [legacy]).every(file => {
+    const cursor = readWakeJson<{ format?: number; cursor?: number; last?: { sequence?: number; id?: string } }>(file);
+    return cursor?.format === 1 && typeof cursor.cursor === "number" && Number.isFinite(cursor.cursor) && cursor.cursor >= 0 &&
+      typeof cursor.last?.id === "string" && Number.isSafeInteger(cursor.last.sequence) && (cursor.last.sequence! > delivery.sequence! ||
+        (cursor.last!.sequence === delivery.sequence && cursor.last!.id === delivery.id));
+  });
+  if (!consumed) return false;
+  const entry = MeshArchive.fromRoot(meshRoot)?.lookupEntry(delivery.sequence!, RESIDENT_WAKE_RECOVERY_MAX_BYTES);
+  // The actor monitor advances past control and lifecycle events without proving
+  // their separate receiver completed. Unknown archive evidence also stays retryable.
+  return !!entry?.committed && entry.event.id === delivery.id && entry.event.sequence === delivery.sequence &&
+    !entry.event.topic.startsWith("fabric.control.") && entry.event.topic !== "fabric.participant.lifecycle";
+};
 const wakeRetryDelay = (failures: number): number => Math.min(RESIDENT_WAKE_RETRY_MAX_MS,
   RESIDENT_WAKE_RETRY_MIN_MS * 2 ** Math.min(16, Math.max(0, failures - 1)));
 const wakeFailures = (failure: ResidentWakeFailure | undefined): number =>
@@ -76,7 +104,8 @@ const recordResidentWakeFailure = async (mesh: ResidentWakeMesh, root: string, d
   try {
     await mesh.exclusive(() => {
       const prior = wakeFailureAt(root);
-      if (claimId !== undefined && prior?.claimId !== claimId) return;
+      if (claimId !== undefined ? !ownsWakeReceipt(prior, claimId, delivery) :
+        prior && wakeDeliveryCovers(prior.delivery, delivery)) return;
       const failures = wakeFailures(prior) + 1;
       writeJsonAtomic(wakeFailurePath(root), { format: 1, delivery, error: String(error), failedAt: now,
         failures, nextRetryAt: now + wakeRetryDelay(failures) }, { durable: true });
@@ -388,8 +417,12 @@ export async function wakeResidentActors(mesh: Pick<MeshStore, "root" | "listAll
       // Intent alone is not a maintenance retry source. Commit a retry receipt
       // BEFORE removing the pending nudge: admission or failure recording may
       // fail after this ACK. If either this write or custody fails, keep pending.
-      writeJsonAtomic(wakeFailurePath(root), { format: 1, delivery, claimId,
-        nextRetryAt: Date.now() + RESIDENT_WAKE_ATTEMPT_LEASE_MS }, { durable: true });
+      const prior = wakeFailureAt(root);
+      // ACK callbacks can arrive out of order after releasing intent custody.
+      // Never replace a covering receipt (or steal its current claim).
+      if (!prior || !wakeDeliveryCovers(prior.delivery, delivery))
+        writeJsonAtomic(wakeFailurePath(root), { format: 1, delivery, claimId,
+          nextRetryAt: Date.now() + RESIDENT_WAKE_ATTEMPT_LEASE_MS }, { durable: true });
       acknowledgeResidentDelivery(mesh.root, root, delivery);
     });
   let attempted = 0;
@@ -401,14 +434,17 @@ export async function wakeResidentActors(mesh: Pick<MeshStore, "root" | "listAll
     if (!recovery && attempted >= RESIDENT_WAKE_INDEX_MAX_ROOTS) break; // Overflow stays pending for the next drain.
     let delivery: { id: string; sequence?: number } | undefined;
     let acknowledged = false;
+    let intentDelivery: WakeDelivery | undefined;
     const claimId = randomUUID();
     const onIntentWritten = async (written: ResidentWakeRequest): Promise<void> => {
       await acknowledge(root, written, claimId);
+      intentDelivery = written;
       acknowledged = true;
     };
     const clearReceipt = (): Promise<void> => mesh.exclusive(() => {
       // A successful older publication must not erase a newer attempt's nudge.
-      if (wakeFailureAt(root)?.claimId === claimId) fs.rmSync(wakeFailurePath(root), { force: true });
+      if (intentDelivery && ownsWakeReceipt(wakeFailureAt(root), claimId, intentDelivery))
+        fs.rmSync(wakeFailurePath(root), { force: true });
     });
     try {
       // Reject foreign paths before opening their retained config or route files.
@@ -502,6 +538,13 @@ export async function retryResidentWakes(mesh: ResidentWakeMesh,
           if (current && (!delivery || (current.sequence !== undefined &&
               (delivery.sequence === undefined || current.sequence >= delivery.sequence)))) delivery = current;
           if (!delivery) return;
+          if (residentWakeDeliveryConsumed(mesh.root, root, delivery)) {
+            // A publisher may die after ready, before removing its receipt. The
+            // durable receiver cursor still proves that no second wake is owed.
+            acknowledgeResidentDelivery(mesh.root, root, delivery);
+            if (prior) fs.rmSync(wakeFailurePath(root), { force: true });
+            return;
+          }
           writeJsonAtomic(wakeFailurePath(root), { ...prior, format: 1, delivery, claimId,
             nextRetryAt: now + RESIDENT_WAKE_ATTEMPT_LEASE_MS }, { durable: true });
           return delivery;
@@ -515,10 +558,10 @@ export async function retryResidentWakes(mesh: ResidentWakeMesh,
     await Promise.all(attempts.map(async ({ root, delivery, claimId }) => {
       try {
         await requestResidentWake(root, delivery, launch, written => mesh.exclusive(() => {
-          if (wakeFailureAt(root)?.claimId === claimId) acknowledgeResidentDelivery(mesh.root, root, written);
+          if (ownsWakeReceipt(wakeFailureAt(root), claimId, delivery)) acknowledgeResidentDelivery(mesh.root, root, written);
         }), { allowed: canWake, exclusive: mesh.exclusive.bind(mesh) });
         await mesh.exclusive(() => {
-          if (wakeFailureAt(root)?.claimId === claimId) fs.rmSync(wakeFailurePath(root), { force: true });
+          if (ownsWakeReceipt(wakeFailureAt(root), claimId, delivery)) fs.rmSync(wakeFailurePath(root), { force: true });
         });
       } catch (error) {
         if (error instanceof ResidentWakeAdmissionClosed) {
@@ -526,8 +569,8 @@ export async function retryResidentWakes(mesh: ResidentWakeMesh,
           // only our claim, and make it eligible when the owner's gate opens again.
           await mesh.exclusive(() => {
             const current = wakeFailureAt(root);
-            if (current?.claimId !== claimId) return;
-            const { claimId: _claimId, ...retained } = current;
+            if (!ownsWakeReceipt(current, claimId, delivery)) return;
+            const { claimId: _claimId, ...retained } = current!;
             writeJsonAtomic(wakeFailurePath(root), { ...retained, nextRetryAt: now }, { durable: true });
           });
           return;

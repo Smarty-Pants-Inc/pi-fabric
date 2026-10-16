@@ -4,9 +4,10 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { describe, expect, it, vi } from "vitest";
 import * as atomic from "../src/core/atomic-write.js";
-import { MeshArchive } from "../src/mesh/archive.js";
+import { MeshArchive, MESH_ARCHIVE_CONFIG } from "../src/mesh/archive.js";
 import { MeshStore, type MeshEvent } from "../src/mesh/store.js";
 import { residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
+import { processStartTime } from "../src/residency/process-identity.js";
 import { canonicalResidentWakeConfig, residentUnacknowledgedDeliveries } from "../src/residency/wake-index.js";
 import * as wake from "../src/residency/wake.js";
 
@@ -241,6 +242,312 @@ describe("post-intent ACK refusal receipt durability", () => {
       }
     }
   }, 10_000);
+
+  it("a stale warm intent ACK cannot replace or clear a newer cold refusal receipt", async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-wake-stale-warm-"));
+    const quarantine = path.join(directory, "product-removals");
+    fs.mkdirSync(quarantine);
+    let allowed = true;
+    const mesh = new MeshStore(path.join(directory, "mesh"), 65_536, 100, {
+      stateBackend: "file", canWakeResidents: () => allowed,
+    });
+    const rootId = "session:stale-warm";
+    const root = residentRoot(mesh.root, rootId);
+    const config = { rootId, residencyRoot: root, cwd: directory };
+    const receiptPath = path.join(root, "wake-failure.json");
+    const ownerPath = path.join(root, "owner.json");
+    fs.mkdirSync(root, { recursive: true });
+    fs.writeFileSync(path.join(root, "config.json"), JSON.stringify(config));
+    fs.writeFileSync(path.join(root, "wake-routes.json"), JSON.stringify({ format: 1, rootId,
+      hostId: "host:stale-warm", configJson: canonicalResidentWakeConfig(config),
+      actors: [{ id: "actor:listener", name: "listener", topics: [topic] }] }));
+    let removals = 0;
+    const preserve = (file: fs.PathLike): void => {
+      const target = fs.existsSync(file) ? fs.realpathSync(file) : path.resolve(String(file));
+      if (!target.startsWith(`${directory}${path.sep}`)) throw new Error(`non-fixture deletion: ${target}`);
+      if (fs.existsSync(target)) fs.renameSync(target, path.join(quarantine, String(++removals)));
+    };
+    vi.spyOn(fs, "rmSync").mockImplementation(preserve);
+    vi.spyOn(fs, "unlinkSync").mockImplementation(preserve);
+    vi.spyOn(fs, "rmdirSync").mockImplementation(preserve);
+    let entered!: () => void;
+    let release!: () => void;
+    const ackEntered = new Promise<void>(resolve => { entered = resolve; });
+    const hold = new Promise<void>(resolve => { release = resolve; });
+    let olderIntent: Delivery | undefined;
+    let paused = false;
+    let revokeNewer = false;
+    const launches: Delivery[] = [];
+    const launch = vi.fn(async () => {
+      const intent = wake.readWakeJson<wake.ResidentWakeRequest>(wake.residentWakeRequestPath(root))!;
+      launches.push({ id: intent.id, sequence: intent.sequence });
+    });
+    const dispatch = wake.wakeResidentActors;
+    let firstDispatch = true;
+    vi.spyOn(wake, "wakeResidentActors").mockImplementation((store, events, _launch, recovery, ...rest) => {
+      if (firstDispatch) {
+        firstDispatch = false;
+        // Publication committed while cold, retaining a pending index entry.
+        // Become genuinely warm BEFORE the older request samples owner state.
+        fs.writeFileSync(ownerPath, JSON.stringify({ pid: process.pid,
+          processStartTime: processStartTime(process.pid), token: "older-warm" }));
+      }
+      return dispatch(store, events, launch, recovery, ...rest);
+    });
+    const retry = wake.retryResidentWakes;
+    vi.spyOn(wake, "retryResidentWakes").mockImplementation((store, _launch, now, ...rest) => retry(store, launch, now, ...rest));
+    const exclusive = mesh.exclusive.bind(mesh);
+    vi.spyOn(mesh, "exclusive").mockImplementation(async <T>(operation: () => T, timeout?: number): Promise<T> => {
+      const intent = wake.readWakeJson<wake.ResidentWakeRequest>(wake.residentWakeRequestPath(root));
+      if (!paused && intent) {
+        paused = true;
+        olderIntent = { id: intent.id, sequence: intent.sequence };
+        entered();
+        await hold; // Older ACK has not acquired custody or written its receipt.
+        return exclusive(operation, timeout);
+      }
+      const newerAck = revokeNewer && intent && intent.id !== olderIntent?.id;
+      const result = await exclusive(operation, timeout);
+      if (newerAck) { revokeNewer = false; allowed = false; }
+      return result;
+    });
+    let older: Promise<MeshEvent> | undefined;
+    try {
+      older = mesh.publish({ topic, from, text: "older warm owner snapshot, paused ACK" });
+      await Promise.race([ackEntered, older.then(() => { throw new Error("older missed ACK suspension"); })]);
+      expect(wake.residentOwnerLive(root)).toBe(true);
+      expect(launch).not.toHaveBeenCalled();
+      expect(residentUnacknowledgedDeliveries(mesh.root).get(root)).toEqual(olderIntent);
+      fs.renameSync(ownerPath, path.join(quarantine, "departed-warm-owner"));
+      expect(wake.residentOwnerLive(root)).toBe(false);
+      revokeNewer = true;
+      const newer = await mesh.publish({ topic, from, text: "newer cold intent ACK, then admission refusal" });
+      const delivery = { id: newer.id, sequence: newer.sequence };
+      expect(delivery.sequence).toBeGreaterThan(olderIntent!.sequence!);
+      expect(allowed).toBe(false);
+      expect(residentUnacknowledgedDeliveries(mesh.root).size).toBe(0);
+      const retained = fs.readFileSync(receiptPath, "utf8");
+      expect(JSON.parse(retained)).toMatchObject({ delivery, error: expect.stringContaining("admission closed") });
+      allowed = true;
+      release();
+      await older;
+      expect(launch, "older stale warm snapshot must skip launch").not.toHaveBeenCalled();
+      expect.soft(fs.existsSync(receiptPath) ? fs.readFileSync(receiptPath, "utf8") : undefined,
+        "older ACK must neither overwrite the newer sequence/claim nor clear its receipt").toBe(retained);
+      vi.spyOn(Date, "now").mockReturnValue(JSON.parse(retained).nextRetryAt + wake.RESIDENT_WAKE_RETRY_MIN_MS);
+      await mesh.retryResidentWakes();
+      await mesh.retryResidentWakes();
+      await mesh.retryResidentWakes();
+      expect.soft(launches, "due maintenance must retry only the newer delivery once").toEqual([delivery]);
+      expect(fs.existsSync(receiptPath)).toBe(false);
+      expect(mesh.read({ topic })).toHaveLength(2);
+    } finally {
+      release();
+      try { await older; }
+      finally {
+        try { mesh.closeState(); }
+        finally { vi.restoreAllMocks(); fs.rmSync(directory, { recursive: true, force: true }); }
+      }
+    }
+  }, 10_000);
+
+  it.each([
+    { checkpoint: "consumed-native", retry: false },
+    { checkpoint: "consumed-legacy", retry: false },
+    { checkpoint: "unconsumed", retry: true },
+    { checkpoint: "behind", retry: true },
+    { checkpoint: "equal-wrong-id", retry: true },
+    { checkpoint: "missing-anchor-id", retry: true },
+    { checkpoint: "malformed", retry: true },
+    { checkpoint: "invalid-format", retry: true },
+    { checkpoint: "nonfinite-cursor", retry: true },
+    { checkpoint: "no-cursors", retry: true },
+    { checkpoint: "mixed-scopes", retry: true },
+    { checkpoint: "control-receiver", retry: true },
+    { checkpoint: "lifecycle-receiver", retry: true },
+    { checkpoint: "unknown-archive", retry: true },
+  ] as const)("publisher exits after launch completion before cleanup: $checkpoint", async ({ checkpoint, retry: needsRetry }) => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-wake-launch-exit-"));
+    const meshRoot = path.join(directory, "mesh");
+    const rootId = "session:launch-exit";
+    const deliveryTopic = checkpoint === "control-receiver" ? "fabric.control.command" :
+      checkpoint === "lifecycle-receiver" ? "fabric.participant.lifecycle" : topic;
+    const root = residentRoot(meshRoot, rootId);
+    const receiptPath = path.join(root, "wake-failure.json");
+    const cursorPath = path.join(root, "actor-mesh-cursor.json");
+    const quarantine = path.join(directory, "product-removals");
+    const completionPath = path.join(directory, "launch-completed.json");
+    const consumptionPath = path.join(directory, "resident-consumption.json");
+    const config = { rootId, residencyRoot: root, cwd: directory };
+    fs.mkdirSync(root, { recursive: true });
+    fs.mkdirSync(quarantine);
+    fs.writeFileSync(path.join(root, "config.json"), JSON.stringify(config));
+    fs.writeFileSync(path.join(root, "wake-routes.json"), JSON.stringify({ format: 1, rootId,
+      hostId: "host:launch-exit", configJson: canonicalResidentWakeConfig(config),
+      actors: [{ id: "actor:project", name: "project-listener", topics: [deliveryTopic] },
+        { id: "actor:session", name: "session-listener", topics: [deliveryTopic] }] }));
+    // Real monitors resume from an actual pre-publication durable checkpoint.
+    const seed = { format: 1, cursor: 0, last: { sequence: 0, id: "" } };
+    const scopes = checkpoint === "consumed-legacy" ? [""] : [".project", ".session"];
+    for (const scope of scopes) fs.writeFileSync(cursorPath + scope, JSON.stringify(seed));
+    let mesh: MeshStore | undefined;
+    try {
+      const residentProgram = `
+        import fs from "node:fs";
+        import path from "node:path";
+        import { MeshStore } from ${JSON.stringify(path.resolve("src/mesh/store.ts"))};
+        import { ActorMeshMonitor } from ${JSON.stringify(path.resolve("src/actors/mesh-monitor.ts"))};
+        import { processStartTime } from ${JSON.stringify(path.resolve("src/residency/process-identity.ts"))};
+        const directory = ${JSON.stringify(directory)}, root = ${JSON.stringify(root)};
+        let removals = 0;
+        const preserve = file => {
+          const target = fs.existsSync(file) ? fs.realpathSync(file) : path.resolve(String(file));
+          if (!target.startsWith(directory + path.sep)) throw new Error("non-fixture deletion: " + target);
+          if (fs.existsSync(target)) fs.renameSync(target, path.join(directory, "product-removals", "resident-" + ++removals));
+        };
+        fs.rmSync = preserve; fs.unlinkSync = preserve; fs.rmdirSync = preserve;
+        const mesh = new MeshStore(${JSON.stringify(meshRoot)}, 65536, 100, { stateBackend: "file", canWakeResidents: () => false });
+        const owner = { pid: process.pid, processStartTime: processStartTime(process.pid), token: "resident-started" };
+        fs.writeFileSync(path.join(root, "owner.json"), JSON.stringify(owner));
+        const consumed = [];
+        for (const scope of ${JSON.stringify(scopes)}) {
+          const monitor = new ActorMeshMonitor(mesh, { enabled: true, actorPollMs: 60000, maxReadEvents: 100 }, {
+            cursorPath: ${JSON.stringify(cursorPath)} + scope, replayAll: true, beforePoll: () => true,
+            onEvent: event => {
+              if (${JSON.stringify(checkpoint)} === "unconsumed") return "deferred";
+              consumed.push({ scope, id: event.id, sequence: event.sequence });
+              // Real manager monitors skip control events; a checkpoint can
+              // pass them while the separate control receiver is still pending.
+              return event.topic.startsWith("fabric.control.") ? "ignored" : true;
+            },
+          });
+          // Explicit event wake, no polling loop or watcher timing dependency.
+          monitor.schedule();
+          await new Promise(resolve => setImmediate(resolve));
+          monitor.checkpointForRelease();
+          monitor.close();
+        }
+        fs.writeFileSync(${JSON.stringify(consumptionPath)}, JSON.stringify(consumed));
+        // The successfully started resident later sleeps and exits. Its cursor,
+        // not owner liveness or the launch-ready signal, proves consumption.
+        fs.writeFileSync(path.join(root, "sleeping.json"), JSON.stringify({ token: owner.token }));
+        mesh.closeState();
+      `;
+      const child = spawnSync("bun", ["--eval", `
+        import fs from "node:fs";
+        import path from "node:path";
+        import { spawnSync } from "node:child_process";
+        import { MeshStore } from ${JSON.stringify(path.resolve("src/mesh/store.ts"))};
+        import * as wake from ${JSON.stringify(path.resolve("src/residency/wake.ts"))};
+        const directory = ${JSON.stringify(directory)};
+        let removals = 0, completed = false;
+        const preserve = file => {
+          const target = fs.existsSync(file) ? fs.realpathSync(file) : path.resolve(String(file));
+          if (!target.startsWith(directory + path.sep)) throw new Error("non-fixture deletion: " + target);
+          if (target === ${JSON.stringify(receiptPath)}) {
+            if (!completed) throw new Error("receipt cleanup before launch completion");
+            // Crash at the actual product cleanup boundary, BEFORE removing the
+            // receipt. No fabricated receipt and no catch/finally recovery.
+            fs.writeFileSync(${JSON.stringify(completionPath)}, JSON.stringify({ completed, exitBeforeCleanup: true }));
+            process.exit(74);
+          }
+          if (fs.existsSync(target)) fs.renameSync(target, path.join(directory, "product-removals", "publisher-" + ++removals));
+        };
+        fs.rmSync = preserve; fs.unlinkSync = preserve; fs.rmdirSync = preserve;
+        // Inject only the launch boundary; real commit/index/intent/ACK/receipt
+        // and real wake dispatch all run inside this publisher subprocess.
+        const mesh = new MeshStore(${JSON.stringify(meshRoot)}, 65536, 100, { stateBackend: "file", canWakeResidents: () => false });
+        await wake.ensureResidentWakeArchive(mesh);
+        const event = await mesh.publish({ topic: ${JSON.stringify(deliveryTopic)}, from: ${JSON.stringify(from)},
+          ...${JSON.stringify(checkpoint === "control-receiver" ? { to: "host:launch-exit", data: { targetId: "actor:project" } } : {})},
+          text: "publisher exits after successful launch" });
+        await wake.wakeResidentActors(mesh, [event], async () => {
+          const resident = spawnSync("bun", ["--eval", ${JSON.stringify(residentProgram)}], { cwd: process.cwd(), encoding: "utf8", timeout: 8000 });
+          if (resident.error || resident.status !== 0) throw new Error("resident failed: " + resident.stderr + String(resident.error ?? ""));
+          completed = true;
+        });
+        throw new Error("publisher missed launch-complete cleanup boundary");
+      `], { cwd: process.cwd(), encoding: "utf8", timeout: 12_000 });
+      expect(child.error).toBeUndefined();
+      expect(child.status, child.stderr).toBe(74);
+      expect(JSON.parse(fs.readFileSync(completionPath, "utf8"))).toEqual({ completed: true, exitBeforeCleanup: true });
+      mesh = new MeshStore(meshRoot, 65_536, 100, { stateBackend: "file" });
+      const [event] = mesh.read({ topic: deliveryTopic });
+      expect(event).toBeDefined();
+      const delivery = { id: event!.id, sequence: event!.sequence };
+      expect(MeshArchive.fromRoot(meshRoot)?.lookupEntry(delivery.sequence!)).toMatchObject({ committed: true, event: delivery });
+      expect(residentUnacknowledgedDeliveries(meshRoot).size, "real publisher ACK completed before its launch").toBe(0);
+      const receipt = wake.readWakeJson<Receipt>(receiptPath);
+      expect(receipt, "real attempt receipt survives publisher death at cleanup").toMatchObject({ delivery,
+        nextRetryAt: expect.any(Number), claimId: expect.any(String) });
+      expect(receipt?.error).toBeUndefined();
+      const consumed = JSON.parse(fs.readFileSync(consumptionPath, "utf8"));
+      expect(consumed).toHaveLength(checkpoint === "unconsumed" ? 0 : scopes.length);
+      for (const scope of scopes) {
+        const cursor = JSON.parse(fs.readFileSync(cursorPath + scope, "utf8"));
+        expect(cursor).toMatchObject({ format: 1, cursor: expect.any(Number),
+          last: checkpoint === "unconsumed" ? seed.last : delivery });
+      }
+      expect(wake.residentOwnerLive(root), "resident subprocess is cold after successful launch and checkpoint").toBe(false);
+      expect(wake.residentOwnerSleeping(root)).toBe(true);
+      // Cheap negative proofs: use real consumed checkpoints, then corrupt only
+      // the boundary evidence. Native checkpoints must dominate legacy fallback.
+      if (checkpoint === "behind") {
+        const cursor = JSON.parse(fs.readFileSync(cursorPath + ".project", "utf8"));
+        fs.writeFileSync(cursorPath + ".project", JSON.stringify({ ...cursor, last: seed.last }));
+      } else if (checkpoint === "equal-wrong-id") {
+        const cursor = JSON.parse(fs.readFileSync(cursorPath + ".project", "utf8"));
+        fs.writeFileSync(cursorPath + ".project", JSON.stringify({ ...cursor, last: { ...delivery, id: "not-the-delivery" } }));
+      } else if (checkpoint === "missing-anchor-id") {
+        const cursor = JSON.parse(fs.readFileSync(cursorPath + ".project", "utf8"));
+        fs.writeFileSync(cursorPath + ".project", JSON.stringify({ ...cursor, last: { sequence: delivery.sequence! + 1 } }));
+      } else if (checkpoint === "malformed") {
+        fs.writeFileSync(cursorPath + ".project", "{malformed checkpoint");
+      } else if (checkpoint === "invalid-format") {
+        const cursor = JSON.parse(fs.readFileSync(cursorPath + ".project", "utf8"));
+        fs.writeFileSync(cursorPath + ".project", JSON.stringify({ ...cursor, format: 2 }));
+      } else if (checkpoint === "nonfinite-cursor") {
+        // Valid JSON numeric syntax, but JSON.parse yields Infinity.
+        fs.writeFileSync(cursorPath + ".project", `{"format":1,"cursor":1e999,"last":${JSON.stringify(delivery)}}`);
+      } else if (checkpoint === "no-cursors") {
+        for (const scope of scopes) fs.renameSync(cursorPath + scope, path.join(quarantine, `missing-cursor${scope}`));
+      } else if (checkpoint === "mixed-scopes") {
+        fs.writeFileSync(cursorPath + ".session", JSON.stringify(seed));
+        fs.copyFileSync(cursorPath + ".project", cursorPath); // Must not hide held native session work.
+      } else if (checkpoint === "unknown-archive") {
+        fs.renameSync(path.join(meshRoot, MESH_ARCHIVE_CONFIG), path.join(quarantine, "missing-archive-config"));
+      }
+      let removals = 0;
+      const preserve = (file: fs.PathLike): void => {
+        const target = fs.existsSync(file) ? fs.realpathSync(file) : path.resolve(String(file));
+        if (!target.startsWith(`${directory}${path.sep}`)) throw new Error(`non-fixture deletion: ${target}`);
+        if (fs.existsSync(target)) fs.renameSync(target, path.join(quarantine, `recovery-${++removals}`));
+      };
+      vi.spyOn(fs, "rmSync").mockImplementation(preserve);
+      vi.spyOn(fs, "unlinkSync").mockImplementation(preserve);
+      vi.spyOn(fs, "rmdirSync").mockImplementation(preserve);
+      const launches: Delivery[] = [];
+      const launch = vi.fn(async () => {
+        const intent = wake.readWakeJson<wake.ResidentWakeRequest>(wake.residentWakeRequestPath(root))!;
+        launches.push({ id: intent.id, sequence: intent.sequence });
+      });
+      const retry = wake.retryResidentWakes;
+      vi.spyOn(wake, "retryResidentWakes").mockImplementation((store, _launch, now, ...rest) => retry(store, launch, now, ...rest));
+      vi.spyOn(Date, "now").mockReturnValue(receipt!.nextRetryAt! + wake.RESIDENT_WAKE_RETRY_MIN_MS);
+      await mesh.retryResidentWakes();
+      expect.soft(launches, needsRetry ? "unproven consumption needs exactly one retry" : "consumed delivery must settle without restarting a cold resident")
+        .toEqual(needsRetry ? [delivery] : []);
+      expect(fs.existsSync(receiptPath), "maintenance settles or completes the attempt receipt").toBe(false);
+      await mesh.retryResidentWakes();
+      await mesh.retryResidentWakes();
+      expect.soft(launches, "later sweeps must not duplicate a settled/retried delivery").toEqual(needsRetry ? [delivery] : []);
+      expect(mesh.read({ topic: deliveryTopic })).toEqual([event]);
+      expect(residentUnacknowledgedDeliveries(meshRoot).size).toBe(0);
+    } finally {
+      try { mesh?.closeState(); }
+      finally { vi.restoreAllMocks(); fs.rmSync(directory, { recursive: true, force: true }); }
+    }
+  }, 20_000);
 
   it("recovers after the publisher process exits after ACK, before recording the admission refusal", async () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-wake-ack-exit-"));

@@ -64,11 +64,11 @@ const perRecord = async (store: MeshStore, presence: BridgePresence, now: number
   }
   for (const host of presence.hosts) {
     const { record, expiresAt, observedAt } = host;
-    // Mirror leases carry the origin's incarnation (L2b owner review: owner-matched unlease), always
-    // the mirror marker, and a sampled origin's source-clock observation attributed to this link.
+    // Mirror leases carry the origin's incarnation (L2b owner review: owner-matched unlease).
+    // Only sampled origins carry the required-evidence marker and this link's source observation.
     writeHostLease(store.root, { id: record.id, rootId: record.rootId, identityId: record.identity.id, startedAt: record.startedAt,
-      updatedAt: observedAt === undefined ? Math.min(record.updatedAt, now) : record.updatedAt, expiresAt: until(host), mirrorLease: 1,
-      ...(observedAt === undefined ? {} : { mirror: { remoteHost: "forge", observedAt: now, sourceObservedAt: observedAt,
+      updatedAt: observedAt === undefined ? Math.min(record.updatedAt, now) : record.updatedAt, expiresAt: until(host),
+      ...(observedAt === undefined ? {} : { mirrorLease: 1, mirror: { remoteHost: "forge", observedAt: now, sourceObservedAt: observedAt,
         sourceUpdatedAt: record.updatedAt, sourceExpiresAt: expiresAt } }) });
   }
   for (const entry of old) {
@@ -140,7 +140,7 @@ describe("one presence transaction (smarty-dev#3752)", () => {
     expect(probe.counts()).toEqual({ reads: 1, commits: 1, locks: 1 });
     await perRecord(reference, mixed, now);
     compare();
-    expect([...readHostLeases(hub.root).values()].filter(lease => lease.mirrorLease === 1 && !lease.mirror)).toHaveLength(125);
+    expect([...readHostLeases(hub.root).values()].filter(lease => lease.mirrorLease === undefined && !lease.mirror)).toHaveLength(125);
     probe.reset();
     await side.withdraw();
     expect(probe.counts()).toEqual({ reads: 1, commits: 1, locks: 1 });

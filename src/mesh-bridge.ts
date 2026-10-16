@@ -34,7 +34,7 @@ const HANDOFF_USAGE: ReadonlyMap<string, string> = new Map([
 
 const USAGE = `usage:
   mesh-bridge run --mesh ROOT --name LOCAL --remote NAME --cursor FILE [--lock-protocol 1|2] [--max-state-bytes BYTES] [--call-timeout-ms MS] [--log-level info|debug] [--factory-rate PER_MINUTE] [--factory-burst N] [--factory-bytes BYTES_PER_MINUTE] [--factory-byte-burst BYTES] (--ssh HOST [--ssh-key KEY] [--ssh-port N] [--ssh-known-hosts FILE] | -- COMMAND...)
-  mesh-bridge agent --mesh ROOT --peer NAME [--lock-protocol 1|2] [--max-state-bytes BYTES]
+  mesh-bridge agent --mesh ROOT --peer NAME [--lock-protocol 1|2] [--max-state-bytes BYTES] [--log-level info|debug]
 ${[...HANDOFF_USAGE.values()].map((line) => `  ${line}`).join("\n")}`;
 
 /**
@@ -111,8 +111,10 @@ const log = (message: string): void => void process.stderr.write(`mesh-bridge: $
 const runAgent = async (flags: Map<string, string>): Promise<void> => {
   const peer = required(flags, "peer");
   const side = new StoreBridgeSide(openBridgeStore(required(flags, "mesh"), flags), peer, Date.now, true);
+  const logLevel = flags.get("log-level") ?? "info";
+  if (logLevel !== "info" && logLevel !== "debug") throw new Error("--log-level must be info or debug");
   await side.store.prepareLock();
-  await serveBridgeAgent(side, process.stdin, process.stdout);
+  await serveBridgeAgent(side, process.stdin, process.stdout, logLevel === "debug" ? log : undefined);
 };
 
 /** A transport child that ignores SIGTERM is killed this long after it. */

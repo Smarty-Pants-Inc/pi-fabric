@@ -33,6 +33,7 @@ import { PARTICIPANT_NAME_PATTERN as ACTOR_NAME_PATTERN } from "../topology/part
 import { AgentLaunchPreparationTimeoutError, AgentManager } from "../agents/manager.js";
 import type { AgentRunRecord, AgentRunRequest, AgentRunResult } from "../agents/types.js";
 import type { ModelRouteDecision } from "../agents/model-route.js";
+import type { SpawnRouterAdmission } from "../agents/spawn-router.js";
 
 import { readJsonlPage } from "../log-tail.js";
 import { ActorChildCompletionStore, ActorChildCompletionWatch, ChildCompletionClaimLostError } from "./child-completions.js";
@@ -339,10 +340,6 @@ export const meshRetentionSweepArgs = (meshRoot: string, runsOlderThanMs: number
   [meshRoot, "--dry-run", "--runs-older-than", String(runsOlderThanMs), "--report", path.join(meshRoot, ".mesh-retention-report.json")];
 /** Retry delay for presence writes that failed on a contended mesh lock (smarty-dev#448). */
 const PRESENCE_RETRY_MS = 5_000;
-/** Presence carries no lease (owner liveness is the host lease), so a full heartbeat
- * rewrites an unchanged entry only this rarely: far inside the 24 h dead-session
- * presence window, and never once per beat per (often stopped) actor (smarty-dev#6729). */
-export const PRESENCE_REFRESH_MS = 60 * 60 * 1_000;
 /** Recent (actor, event) deliveries, so an event offered again reaches only actors that missed it. */
 const DELIVERED_EVENT_MEMORY = 4_096;
 /** Per durable actor: completed mesh subjects retained in its queue checkpoint. */
@@ -1202,7 +1199,7 @@ export class ActorManager {
     }
   }
 
-  async #recordSpawnRouterStart(request: FabricActorRequest, actor: ManagedActor): Promise<void> {
+  async #recordSpawnRouterStart(request: FabricActorRequest, actor: ManagedActor, admission?: SpawnRouterAdmission): Promise<void> {
     const decisionId = (request as FabricActorRequest & { spawnRouterDecisionId?: unknown }).spawnRouterDecisionId;
     if (typeof decisionId !== "string" || !decisionId) return;
     try {
@@ -1212,19 +1209,19 @@ export class ActorManager {
       if (actor.runner === "pi" || actor.runner === "pi-durable") {
         try { sessionId = readPiSessionHeader(actor.sessionFile)?.id ?? null; } catch { /* No native session yet. */ }
       }
-      await recordSpawnRouterStart({ meshRoot: this.mesh.root, decisionId, agentId: actor.id,
+      await recordSpawnRouterStart({ meshRoot: this.mesh.root, decisionId, admission, spawnKind: "actor", request, cwd: this.agents.cwd, agentId: actor.id,
         sessionId,
         model: binding.model ?? actor.model ?? this.agents.defaultModel(actor.runner) ?? null,
         thinking: binding.thinking ?? actor.thinking ?? this.agents.config.thinking });
     } catch { /* Ledger writes never change actor creation. */ }
   }
 
-  async #recordSpawnRouterStartFailed(request: FabricActorRequest): Promise<void> {
+  async #recordSpawnRouterStartFailed(request: FabricActorRequest, admission?: SpawnRouterAdmission): Promise<void> {
     const decisionId = (request as FabricActorRequest & { spawnRouterDecisionId?: unknown }).spawnRouterDecisionId;
     if (typeof decisionId !== "string" || !decisionId) return;
     try {
       const { recordSpawnRouterStartFailed } = await import("../agents/spawn-router.js");
-      await recordSpawnRouterStartFailed({ meshRoot: this.mesh.root, decisionId });
+      await recordSpawnRouterStartFailed({ meshRoot: this.mesh.root, decisionId, admission, spawnKind: "actor", request, cwd: this.agents.cwd });
     } catch { /* Ledger writes never change actor creation. */ }
   }
 
@@ -1239,8 +1236,10 @@ export class ActorManager {
    */
   async create(
     request: FabricActorRequest,
-    { asRegistryOwner = false, beforeCommit, beforeMaterialize, checkActive, onCommit, supervisorOwner = this.identity }: {
+    { asRegistryOwner = false, beforeCommit, beforeMaterialize, checkActive, onCommit, supervisorOwner = this.identity, routerAdmission }: {
       asRegistryOwner?: boolean;
+      /** Native-only authenticated attribution, independent of supervisor/launch authority. */
+      routerAdmission?: SpawnRouterAdmission;
       /** Host-only: verified resident creator, never request fields. */
       supervisorOwner?: MeshIdentity;
       /** Protected creates require a SYNCHRONOUS final request-acceptance fence.
@@ -1254,6 +1253,8 @@ export class ActorManager {
     } = {},
   ): Promise<FabricActorInfo> {
     ++this.#pendingCreates;
+    routerAdmission = routerAdmission && { ...routerAdmission, targetRootId: this.#rootId,
+      targetHostId: this.agents.runtimeHostId ?? routerAdmission.targetHostId };
     const routerDecisionId = (request as FabricActorRequest & { spawnRouterDecisionId?: unknown }).spawnRouterDecisionId;
     let routerStartSettled = typeof routerDecisionId !== "string" || routerDecisionId.length === 0;
     let reservedName: string | undefined;
@@ -1458,7 +1459,7 @@ export class ActorManager {
       }
       if (!routerStartSettled) {
         routerStartSettled = true;
-        await this.#recordSpawnRouterStart(request, actor);
+        await this.#recordSpawnRouterStart(request, actor, routerAdmission);
       }
     await this.#publishPresence(actor);
     await this.#publishSlotCreated(actor);
@@ -1471,7 +1472,7 @@ export class ActorManager {
     } catch (error) {
       if (!routerStartSettled) {
         routerStartSettled = true;
-        await this.#recordSpawnRouterStartFailed(request);
+        await this.#recordSpawnRouterStartFailed(request, routerAdmission);
       }
       throw error;
     } finally {
@@ -1800,18 +1801,14 @@ export class ActorManager {
       const pending = new Map([...this.#pendingPresence].map(id => [id, this.#presenceRevisions.get(id)]));
       const ids = new Set(pending.keys());
       if (full) for (const actor of this.#actors.values()) ids.add(actor.id);
-      // A full heartbeat renews every live actor's presence (#4383), but only verifies and
-      // repairs a STOPPED actor's: each put is re-versioned and re-encoded in the locked
-      // shared commit, and a host can own hundreds of stopped actors (smarty-dev#6729).
-      // An unchanged stopped entry this instance committed, still in the shared state as
-      // written, is skipped until PRESENCE_REFRESH_MS. The shared read is lazy, so a
-      // host without stopped actors does exactly what it did before.
+      // A full heartbeat publishes only changed actor payloads. Liveness belongs to
+      // the resident host lease, not to an actor envelope's mesh timestamp. The shared
+      // read is lazy, so an unchanged resident does not acquire actor rows for renewal.
       let shared: ReadonlyMap<string, Readonly<MeshStateEntry>> | undefined, sharedRead = false;
       const sharedPresence = () => {
         if (!sharedRead) { sharedRead = true; shared = this.#sharedPresence(); }
         return shared;
       };
-      const now = Date.now();
       const written = new Map<string, string | undefined>();
       const ops: MeshBatchOperation[] = [];
       for (const id of ids) {
@@ -1820,11 +1817,9 @@ export class ActorManager {
           if (this.#ownershipDecision(id) && this.#slotCurrent(actor)) {
             const value = this.#presenceValue(actor);
             if (!value) continue;
-            const serialized = actor.status === "stopped" ? JSON.stringify(value) : undefined;
-            if (full && serialized !== undefined && !pending.has(id) &&
-              this.#presenceUnchanged(id, serialized, sharedPresence(), now)) continue;
+            const serialized = JSON.stringify(value);
+            if (full && !pending.has(id) && this.#presenceUnchanged(id, serialized, sharedPresence())) continue;
             ops.push({ kind: "put", key: this.#presenceKey(id), value, identity: this.identity });
-            // Only stopped presence is remembered; a live put or delete forgets it.
             written.set(id, serialized);
           }
         } else {
@@ -1861,11 +1856,11 @@ export class ActorManager {
   }
 
   #presenceUnchanged(id: string, serialized: string,
-    shared: ReadonlyMap<string, Readonly<MeshStateEntry>> | undefined, now: number): boolean {
+    shared: ReadonlyMap<string, Readonly<MeshStateEntry>> | undefined): boolean {
     if (!shared || this.#publishedPresence.get(id) !== serialized) return false;
     const entry = shared.get(this.#presenceKey(id));
     return entry !== undefined && entry.updatedBy.id === this.identity.id &&
-      now - entry.updatedAt < PRESENCE_REFRESH_MS && JSON.stringify(entry.value) === serialized;
+      JSON.stringify(entry.value) === serialized;
   }
 
   async cede(id: string): Promise<FabricActorInfo> {

@@ -138,7 +138,20 @@ existing events and mirrors root presence. There is no new store or protocol.
   recipient. While a backlog is forwarded, presence and leases are renewed when due. A remote event whose sender, or an ack whose `targetId`, is
   not bound to this link is dropped. Before refusing a lapsed mirror (including expiry while
   waiting for publication), one bounded, single-flight presence pass refreshes and revalidates
-  authority. It never substitutes peer claims for ownership or changes a captured destination.
+  authority. During notification-driven `run()`, traffic with live committed ownership does not
+  join an already-running presence pass merely because a preemptive refresh is due. This also
+  applies after the mirror deadline while an open transport retains that mirror's response slot
+  and has negotiated `independentRpc`: the failed pass may have settled, but live committed
+  traffic still uses the independent lane. Page, batch and relay checks still reread canonical
+  ownership; a missing/new or expired member and a commit-time ownership refusal still take the
+  existing blocking refresh and revalidation path, even while that slot remains pending. If
+  that explicit refresh joins a pass already in flight, it settles that pass and requests or
+  joins one new snapshot before revalidating: an older sample cannot establish
+  fresh absence for a newly observed event. The same bound applies to retained-membership
+  retries: at most the old pass plus one new pass, with no polling or deadline increase.
+  Manual `step()`, startup and shutdown keep their blocking presence behavior. This is
+  scheduling isolation, not permission to forward from an uncommitted presence claim.
+  It never substitutes peer claims for ownership or changes a captured destination.
 - The hub routes to the remote only by canonical ids: host id, identity id, participant id and root
   id. Labels, session ids and names are never addresses across.
 - A mirror never replaces a native record or another bridge's mirror. It writes by
@@ -149,9 +162,14 @@ existing events and mirrors root presence. There is no new store or protocol.
   checkpoints remain bounded to their existing cadence.
 - Each remote call has a deadline (`--call-timeout-ms`, default 30 s). A missed mirror answer
   degrades that link and keeps the bridge open. One mirror response slot stays in flight;
-  the bridge queues no additional RPCs behind it and retries with 1 s to 30 s exponential
-  backoff. A late answer opens the gate for a new presence snapshot; it does not renew the old
-  snapshot's freshness. The agent stamps mirror arrival time before its serial dispatch wait.
+  the bridge queues no additional mirror or presence RPCs behind it and retries with 1 s to
+  30 s exponential backoff. New agents advertise the additive hello capability
+  `independentRpc: true` (with either hello mode/version). Once negotiated, traffic/read RPCs
+  may proceed while a mirror remains pending, including after its deadline. A peer without
+  that capability retains the old global pending-mirror gate for every RPC. Hello/subscription
+  requests are also refused while that slot is occupied, because they share the topology lane.
+  A late answer opens the gate for a new presence snapshot; it does not renew the old snapshot's
+  freshness. The agent stamps mirror arrival time before either lane's dispatch wait.
   Non-mirror timeouts, transport/watch failures and permanent late mirror rejections remain
   fatal. On stop, the bridge fences the loop, gives the remote withdrawal a bounded
   wait, withdraws the local mirrors regardless, and then reaps the transport child
@@ -178,8 +196,18 @@ existing events and mirrors root presence. There is no new store or protocol.
   notifications too. Watchers are installed before snapshots, and changes during a pass are
   latched for the next drain. Notifications are hints: canonical reads and ownership fences
   still decide delivery. A watch failure on a notification-capable link stops it, so it never
-  silently drops events. Remote change frames are negotiated with `hello` and do not occupy the agent's FIFO request
-  queue; there is no hanging wait request in front of a publish.
+  silently drops events. Remote change frames are negotiated with `hello` and do not occupy
+  either agent request lane; there is no hanging wait request in front of a publish.
+- The agent has two independent serial RPC lanes, extending the independent-direction
+  scheduling in smarty-dev#9751: hello/subscription, presence and mirror share the topology
+  lane; all reads, recovery queries and publications share the traffic lane. Hello installs
+  watches before any later topology snapshot. A held topology service cannot by itself hold
+  traffic behind it; publications still retain FIFO order, including for the same target.
+  Both lanes retain the same dispatch validation, mesh locks and ownership fences, so actual
+  store contention can still delay traffic. Input shutdown disposes watches, skips queued
+  work and settles both lanes before returning. Debug RPC timing is opt-in, contains no
+  event bodies, and reports `queueDepth` as the number of earlier requests in that request's
+  lane at admission, including its in-service request, not work in the independent lane.
 
 ## Control deadlines and retention
 

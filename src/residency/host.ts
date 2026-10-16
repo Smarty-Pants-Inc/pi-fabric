@@ -82,6 +82,7 @@ import { ActorSessionResetCancelledError } from "../actors/session-reset-error.j
 import type { FabricActorInfo } from "../actors/types.js";
 import type { StateProjector } from "../mesh/state-projector.js";
 import { AgentManager } from "../agents/manager.js";
+import type { SpawnRouterAdmission } from "../agents/spawn-router.js";
 import { FabricTargetTerminalError, terminalRejectionFields, type AgentTerminalNotice } from "../agents/terminal-target.js";
 import { launchScope } from "../scope.js";
 import { useBudgetLedger } from "../agents/budget-ledger.js";
@@ -477,7 +478,6 @@ export class ResidentHost {
     };
     this.participants = new ParticipantDirectory(this.mesh, {
       enabled: true,
-      renewActorParticipants: true,                            // host fence outlives its Main
       actorRenewalAllowed,
       preparePublicationFence: () => {
         const generations = registries.map(store => store.fingerprint());
@@ -2512,9 +2512,24 @@ export class ResidentHost {
         : Math.max(Date.now(), residentRequestGeneration(command.requestId) ?? 0) };
   }
 
+  async #routerAdmission(command: ResidentCommand): Promise<SpawnRouterAdmission | undefined> {
+    if (command.operation !== "spawnBound" && command.operation !== "createActor") return undefined;
+    const decisionId = (command.request as { spawnRouterDecisionId?: unknown }).spawnRouterDecisionId;
+    if (typeof decisionId !== "string" || !decisionId) return undefined;
+    try {
+      const caller = command.operation === "spawnBound" ? command.caller : command.routerCaller;
+      const participant = caller && this.participants.get(caller.id, Date.now(), { fresh: true });
+      const { authenticatedSpawnRouterAdmission } = await import("../agents/spawn-router.js");
+      return authenticatedSpawnRouterAdmission(this.mesh, caller, participant, this.config.rootId, this.hostId,
+        command.operation === "spawnBound" ? "spawn" : "actor");
+    } catch { return undefined; } // Attribution never supplies launch authority or a new launch veto.
+  }
+
   async #executeRequest(command: ResidentCommand, boundaryAdmitted?: () => void): Promise<ResidentCommandResponse> {
     const requestId = command.requestId;
     let response: ResidentCommandResponse;
+    const routerAdmission = await this.#routerAdmission(command);
+    let routerHandedOff = false;
     try {
       await testResidentRequestDelay("before_commit");
       if (command.operation !== "releaseDrain") this.#businessAdmissions++;
@@ -2544,7 +2559,8 @@ export class ResidentHost {
         const caller = command.caller;
         const returnAddress = assertResidentTaskCaller(caller,
           caller && this.participants.get(caller.id, Date.now(), { fresh: true }), this.config.rootId);
-        const handle = await this.agents.spawn({ ...command.request, residency: "durable" }, undefined, undefined, commit, undefined, undefined, undefined, returnAddress);
+        routerHandedOff = true;
+        const handle = await this.agents.spawn({ ...command.request, residency: "durable" }, undefined, undefined, commit, undefined, undefined, undefined, returnAddress, routerAdmission);
         // spawn already validated the forwarded scope; record what the child received.
         const scope = launchScope(command.request.scope, command.request.inheritedScope);
         const runDirectory = this.agents.runDirectory(handle.id);
@@ -2614,10 +2630,12 @@ export class ResidentHost {
         if (protectedCreate) this.#authorizeResidentSetter(command.caller);
         const { instructionsFile: _file, sha256: _digest, idempotencyKey: _requestKey, ...base } = command.request;
         const instructions = resolveActorInstructions(command.request, this.config.agents.instructionsRoot);
+        routerHandedOff = true;
         const actor = await this.actors.create({ ...base, instructions,
           ...(command.idempotencyKey === undefined ? {} : { idempotencyKey: command.idempotencyKey }),
         }, {
           asRegistryOwner: true,
+          ...(routerAdmission ? { routerAdmission } : {}),
           ...(command.caller ? { supervisorOwner: command.caller.identity } : {}),
           beforeCommit: id => {
             if (protectedCreate || command.caller) this.#authorizeResidentSetter(command.caller);
@@ -2735,6 +2753,16 @@ export class ResidentHost {
         response = await pending;
       }
     } catch (error) {
+      if (!routerHandedOff && (command.operation === "spawnBound" || command.operation === "createActor")) {
+        const decisionId = (command.request as { spawnRouterDecisionId?: unknown }).spawnRouterDecisionId;
+        if (typeof decisionId === "string" && decisionId) {
+          try {
+            const { recordSpawnRouterStartFailed } = await import("../agents/spawn-router.js");
+            await recordSpawnRouterStartFailed({ meshRoot: this.mesh.root, decisionId, admission: routerAdmission,
+              spawnKind: command.operation === "spawnBound" ? "spawn" : "actor", request: command.request, cwd: this.config.cwd });
+          } catch { /* Attribution is advisory, not a replacement for the native error. */ }
+        }
+      }
       const drain = command.operation === "releaseDrain" ? this.#drainRefusal(command, error) : undefined;
       let slotFailure = residentSlotErrorFields(error);
       if (command.operation === "createActor" && (residentCreateMayBeProtected(command) ||

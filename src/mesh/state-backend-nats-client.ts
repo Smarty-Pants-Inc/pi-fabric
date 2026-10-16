@@ -11,6 +11,7 @@ import {
   MeshStateNatsRefusedError, MeshStateNatsUnavailableError, natsConnectOptions, NatsWrongLastSequenceError, redactNatsError,
   type JetStreamPort, type NatsStreamMessage, type NatsTlsFiles,
 } from "./state-backend-nats.js";
+import { selectNatsSyncAlways } from "./nats-monitor-config.js";
 
 /** NATS JetStream API error codes used here. */
 const WRONG_LAST_SEQUENCE = 10071;
@@ -234,12 +235,27 @@ export const connectJetStream = async (servers: string[], options: ConnectJetStr
     server: async () => {
       let syncAlways: boolean | undefined;
       if (options.monitoringUrl) {
-        let varz: { jetstream?: { config?: { sync_always?: unknown } } };
+        const monitoringUrl = options.monitoringUrl;
+        // One unchanged 5s budget for /varz and /jsz, including response bodies (#13112). Both are always read:
+        // an explicit false from either vetoes.
+        const signal = AbortSignal.timeout(5_000);
+        let onAbort!: () => void;
+        const aborted = new Promise<never>((_, reject) => {
+          onAbort = () => reject(signal.reason ?? new Error("NATS monitor request aborted"));
+          if (signal.aborted) onAbort(); else signal.addEventListener("abort", onAbort, { once: true });
+        });
+        const monitor = async (endpoint: string): Promise<unknown> => {
+          const response = await Promise.race([fetch(new URL(endpoint, monitoringUrl), { signal }), aborted]);
+          if (!response.ok) throw new Error(`NATS monitor ${endpoint} returned HTTP ${response.status}`);
+          const body: unknown = await Promise.race([response.json(), aborted]);
+          if (body === null || typeof body !== "object" || Array.isArray(body)) throw new Error(`NATS monitor ${endpoint} did not return a JSON object`);
+          return body;
+        };
         try {
-          const response = await fetch(new URL("/varz", options.monitoringUrl), { signal: AbortSignal.timeout(5_000) });
-          varz = await response.json() as typeof varz;
+          const varz = await monitor("/varz");
+          syncAlways = selectNatsSyncAlways(varz, await monitor("/jsz?raft=true"));
         } catch (error) { throw redactNatsError(error); }
-        syncAlways = typeof varz.jetstream?.config?.sync_always === "boolean" ? varz.jetstream.config.sync_always : undefined;
+        finally { signal.removeEventListener("abort", onAbort); }
       }
       return { version: nc.info?.version ?? "0.0.0", syncAlways,
         ...(typeof nc.info?.max_payload === "number" ? { maxPayload: nc.info.max_payload } : {}),
@@ -353,9 +369,11 @@ export const connectJetStream = async (servers: string[], options: ConnectJetStr
       return message ? { seq: message.seq, data: message.data, ...(msgID ? { msgID } : {}) } : undefined;
     },
     purge: async (stream, beforeSeq) => { await jsm.streams.purge(stream, { seq: beforeSeq }); },
-    publish: async (subject, data, { expectLastSequence, msgID }) => {
+    publish: async (subject, data, { expectLastSequence, msgID, timeoutMs }) => {
       try {
-        const ack = await js.publish(subject, data, { msgID, expect: { lastSequence: expectLastSequence } });
+        // The backend bounds each attempt (smarty-dev#13112); omitted, the SDK's 5s default.
+        const ack = await js.publish(subject, data, { msgID, expect: { lastSequence: expectLastSequence },
+          ...(timeoutMs === undefined ? {} : { timeout: timeoutMs }) });
         return { seq: ack.seq, duplicate: ack.duplicate };
       } catch (error) {
         if (apiCode(error) === WRONG_LAST_SEQUENCE) throw new NatsWrongLastSequenceError(expectLastSequence, (error as Error).message);

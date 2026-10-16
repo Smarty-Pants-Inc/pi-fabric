@@ -116,7 +116,7 @@ describe("effectiveAgentTimeoutMs", () => {
   });
 
   it("respects a configured default below 60 minutes", () => {
-    expect(effectiveAgentTimeoutMs(1_800_000, 900_000)).toBe(1_800_000);
+    expect(effectiveAgentTimeoutMs(1_800_000, 900_000)).toBe(900_000);
     expect(effectiveAgentTimeoutMs(1_800_000, 2_400_000)).toBe(2_400_000);
   });
 });

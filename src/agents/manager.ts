@@ -33,6 +33,7 @@ import {
   DEFAULT_FABRIC_CONFIG,
   MAX_AGENT_TIMEOUT_MS,
   MIN_AGENT_TIMEOUT_MS,
+  MIN_AGENT_SHORTENING_TIMEOUT_MS,
   type FabricAgentRunner,
   type FabricAgentConfig,
   type FabricAgentTransport,
@@ -372,10 +373,20 @@ export const effectiveAgentTimeoutMs = (
   if (requestedTimeoutMs === undefined || !Number.isFinite(requestedTimeoutMs)) {
     return configured;
   }
+  // ponytail: preserve b4408352's protection from model-chosen tiny budgets,
+  // while allowing deliberate lane/audit timeboxes of at least five minutes.
+  if (requestedTimeoutMs < configured && requestedTimeoutMs < MIN_AGENT_SHORTENING_TIMEOUT_MS) return configured;
   return Math.max(
-    configured,
+    MIN_AGENT_TIMEOUT_MS,
     Math.min(Math.floor(requestedTimeoutMs), MAX_AGENT_TIMEOUT_MS),
   );
+};
+
+const ignoredTimeoutNote = (configured: number, requested?: number): AgentRunRecord["timeoutNote"] => {
+  if (requested === undefined || !Number.isFinite(requested) || requested >= MIN_AGENT_SHORTENING_TIMEOUT_MS) return undefined;
+  const effective = effectiveAgentTimeoutMs(configured, requested);
+  return requested < effective ? { code: "AGENT_TIMEOUT_BELOW_SHORTENING_FLOOR", requestedTimeoutMs: requested,
+    effectiveTimeoutMs: effective, minimumTimeoutMs: MIN_AGENT_SHORTENING_TIMEOUT_MS } : undefined;
 };
 
 /** Host-only actor setup budget. Starts after admission and ends before transport launch. */
@@ -518,6 +529,7 @@ interface RecoveryRetry {
 }
 
 interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
+  timeoutNote?: AgentRunRecord["timeoutNote"];
   runRoute: AgentRunRouteMetadata;
   /** smarty-dev#9855: the admission permit a lost-contact process run holds until it is proven gone (once-only). */
   heldPermit?: () => void;
@@ -1878,6 +1890,7 @@ export class AgentManager {
       throw new Error(`Fabric agent depth limit reached (${this.config.maxDepth})`);
     }
     assertAgentTask(request);
+    const timeoutNote = ignoredTimeoutNote(this.config.timeoutMs, request.timeoutMs);
     const needs = normalizeAgentCapabilityTokens(request.needs);
     const requires = normalizeAgentRequires(request.requires);
     // Session transports are disabled until they can retain execution custody.
@@ -2210,6 +2223,7 @@ export class AgentManager {
           this.config.timeoutMs,
           request.timeoutMs,
         );
+        if (timeoutNote) fs.appendFileSync(logFile, JSON.stringify({ type: "run.timeout_ignored", ts: Date.now(), id, timeoutNote }) + "\n", { mode: 0o600 });
         const requestedThinking = routePin?.effort ?? request.thinking ?? this.config.thinking;
         // A route pin's effort is exact and admitted as such; thinking bounds clamp the rest.
         const thinking = requestedThinking && !routePin
@@ -2492,6 +2506,7 @@ export class AgentManager {
           id,
           name,
           task: request.task,
+          ...(timeoutNote ? { timeoutNote } : {}),
           ...prompt,
           // pi-fabric#939: the manager's own pid and birth record, read at launch from the transport handle.
           ...((owned => owned ? { ownProcess: owned } : {})(transport.kind === "process" ? ownedProcess(transport.sessionId) : undefined)),
@@ -2666,6 +2681,7 @@ export class AgentManager {
       ...createRunRouteMetadata({ ...routeFacts, runner, transport: request.transport ?? this.config.transport }),
       id, name, status: "queued", runner, transport: request.transport ?? this.config.transport,
       cwd: selectedCwd, residency, recursive: request.recursive === true,
+      ...(timeoutNote ? { timeoutNote } : {}),
       ...prompt,
       ...(kernel ? { kernel } : {}),
       ...(model ? { model } : {}),
@@ -3018,10 +3034,12 @@ export class AgentManager {
     },
   ): Promise<AgentHandleInfo> {
     const now = Date.now();
+    const timeoutNote = ignoredTimeoutNote(this.config.timeoutMs, launch.request.timeoutMs);
     const record: AgentRunRecord = {
       id: context.id,
       name: context.name,
       task: context.task,
+      ...(timeoutNote ? { timeoutNote } : {}),
       ...launch.prompt,
       status: "running",
       runner: adapter.id,
@@ -3106,6 +3124,7 @@ export class AgentManager {
       id: record.id,
       name: record.name,
       task: record.task,
+      ...(record.timeoutNote ? { timeoutNote: record.timeoutNote } : {}),
       ...(record.promptSha256 ? { promptSha256: record.promptSha256 } : {}),
       ...(record.promptBytes !== undefined ? { promptBytes: record.promptBytes } : {}),
       ...(record.promptPath ? { promptPath: record.promptPath } : {}),
@@ -6414,6 +6433,7 @@ export class AgentManager {
     const thinking = managed.latestRecord?.thinking ?? managed.thinking;
     return {
       ...managed.runRoute,
+      ...(managed.timeoutNote ? { timeoutNote: managed.timeoutNote } : {}),
       id: managed.id,
       name: managed.name,
       ...(managed.promptSha256 ? { promptSha256: managed.promptSha256 } : {}),
@@ -6500,6 +6520,7 @@ export class AgentManager {
     const runnerSessionId = record.runnerSessionId ?? managed.runnerSessionId;
     return {
       ...safeRecord,
+      ...(managed.timeoutNote ? { timeoutNote: managed.timeoutNote } : {}),
       ...(managed.finalAnswer ? { finalAnswerReceipt: { id: managed.finalAnswer.id, recordedAt: managed.finalAnswer.recordedAt } } : {}),
       ...(managed.finalAnswerResult ? {
         status: managed.finalAnswerResult.status, text: managed.finalAnswerResult.text,

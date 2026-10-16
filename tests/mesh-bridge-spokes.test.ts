@@ -647,6 +647,57 @@ describe("spoke-to-spoke roots and addressed control through the hub", () => {
     expect(failure).toBeUndefined();
   });
 
+  // Trust boundary: already-imported non-controls are not new cross-spoke traffic or refusals.
+  // Read/tail must consume their cursor range silently, while the narrow ACK relay still works.
+  it.each([false, true])("silently filters other-link stamped non-relays but preserves ACK relay (negotiated batch=%s)", async negotiatedBatch => {
+    const f = await fixture();
+    const a = f.stores.ryzen3!, b = f.stores.ryzen2!, hub = f.stores.ryzen1!;
+    const source = f.mains.ryzen3!, target = f.mains.ryzen2!, lead = f.mains.ryzen1!;
+    if (negotiatedBatch) await Promise.all(f.links.map(link => link.remote.hello()));
+    const logs: string[] = [];
+    for (const { bridge } of f.links) bridge.options.log = message => { logs.push(message); };
+    const destination = f.links.find(link => link.bridge.options.remoteName === "ryzen2")!.bridge;
+    // Alarm routing accepts only session:<uuid>; register that real native hub recipient.
+    const alarmLead: MeshIdentity = { ...lead.identity, id: "session:00000000-0000-0000-0000-000000000001" };
+    await hub.put({ key: hostKey(alarmLead.id), identity: alarmLead,
+      value: { ...lead.host, id: alarmLead.id, rootId: alarmLead.id, identity: alarmLead } });
+    // A real byte boundary ensures the tail assertion exercises byte filtering, not its read fallback.
+    await hub.publish({ topic: "chatter", kind: "event", from: lead.identity, text: "before imports" });
+    const boundary = await destination.options.local.latestCursor!();
+    expect(boundary.offset).toBeDefined();
+    const nonRelays = [
+      { topic: "fleet.work.smarty-dev.10068", kind: "ask", to: lead.identity.id },
+      { topic: "ops.owner", kind: "pr.wake", to: lead.identity.id },
+      { topic: "fabric.alarm.mesh-outage", kind: "mesh-outage", to: alarmLead.id },
+    ];
+    for (const event of nonRelays) {
+      await a.publish({ ...event, from: source.identity, text: "hub only" });
+    }
+    await f.drain(); await f.drain();
+    for (const { topic } of nonRelays) {
+      expect(events(hub, topic)).toHaveLength(1);
+      expect(events(hub, topic)[0]).toMatchObject({ verification: "bridge", data: { bridge: { from: "ryzen3" } } });
+      expect(events(b, topic)).toEqual([]);
+    }
+    expect(await destination.options.local.read(boundary.through)).toEqual({ events: [], through: hub.latestSequence() });
+    expect(await destination.options.local.tail!(boundary.through, boundary.offset)).toEqual({
+      events: [], through: hub.latestSequence(), offset: hub.latestOffset(),
+    });
+    const cursor = JSON.parse(fs.readFileSync(destination.options.cursorPath, "utf8"));
+    expect(cursor.toRemote.after).toBe(hub.latestSequence());
+    expect(logs).toEqual([]); // in particular, no per-event "not allowed" refusals
+
+    // Counterexample: a native ACK A -> B still crosses the hub with origin authentication.
+    await a.publish({ topic: "fabric.control.ack", kind: "accepted", from: source.identity, to: target.identity.id,
+      data: { version: 1, commandId: "echo-legitimate-relay", targetId: source.identity.id, accepted: true } });
+    await f.drain(); await f.drain();
+    expect(events(b, "fabric.control.ack")).toHaveLength(1);
+    expect(events(b, "fabric.control.ack")[0]).toMatchObject({ verification: "bridge", from: source.identity,
+      to: target.identity.id, data: { commandId: "echo-legitimate-relay", accepted: true,
+        bridge: { from: "ryzen3", via: "ryzen1" } } });
+    expect(logs).toEqual([]);
+  });
+
   it("forwards a control/ACK batch with origin stamps but never relays work topics between spokes", async () => {
     const f = await fixture();
     const a = f.stores.ryzen3!, b = f.stores.ryzen2!;

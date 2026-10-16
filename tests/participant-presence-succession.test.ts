@@ -112,7 +112,7 @@ function fixture() {
       lease: gate, identityId: "observer", rootId: "observer", ownerIncarnation: "observer-activation" });
     opened.push(value); value.start(); return value;
   };
-  return { presence, leases, view, observer, stale, lease, lose: () => { live = false; } };
+  return { presence, leases, view, observer, stale, lease, abort, lose: () => { live = false; } };
 }
 async function ready(view: KvParticipantDirectory) {
   const signal = AbortSignal.timeout(1_000);
@@ -210,6 +210,94 @@ describe("#14115 initial own Main presence succession", () => {
     await expect(f.view().publish(root())).rejects.toBeDefined();
     expect(f.presence.rows.get(pkey())).toEqual(previous);
     expect(f.presence.deletes).toEqual([]);
+  });
+
+  it.each(["replacement", "same-owner new revision"])("undoes the takeover when the post-CAS lease read sees a %s", async change => {
+    const f = fixture(), previous = f.stale(); f.lease();
+    f.presence.beforePut = (_key, expected) => {
+      if (expected === previous.revision) f.lease(change === "replacement" ? "later-owner" : NEXT);
+    };
+    const view = f.view();
+    await expect(view.publish(root())).rejects.toMatchObject({ code: "FABRIC_TRANSPORT_UNAVAILABLE" });
+    const restored = f.presence.rows.get(pkey())!;
+    expect(restored).toMatchObject({ owner: previous.owner, value: previous.value });
+    expect(f.presence.mutations).toEqual([
+      { key: pkey(), expected: previous.revision, revision: restored.revision - 1 },
+      { key: pkey(), expected: restored.revision - 1, revision: restored.revision },
+    ]);
+    await ready(view);
+    expect(view.resolve(ROOT)).toMatchObject({ live: false });
+    await view.close();
+    expect(f.presence.deletes).toEqual([]); // A refused takeover was never remembered as owned.
+    expect(f.presence.rows.get(pkey())).toEqual(restored);
+  });
+
+  it.each(["unavailable", "local cutoff", "local abort"])("undoes and refuses when post-CAS validation encounters %s", async failure => {
+    const f = fixture(), previous = f.stale(); f.lease();
+    let reads = 0;
+    f.leases.afterGet = () => {
+      if (++reads !== 2) return;
+      if (failure === "unavailable") throw new Error("authoritative lease read unavailable");
+      if (failure === "local abort") f.abort.abort(new Error("lease lost after CAS"));
+      else f.lose();
+    };
+    const view = f.view();
+    await expect(view.publish(root())).rejects.toMatchObject({ code: "FABRIC_TRANSPORT_UNAVAILABLE" });
+    expect(f.presence.rows.get(pkey())).toMatchObject({ owner: previous.owner, value: previous.value });
+    expect(f.presence.mutations).toHaveLength(2);
+    expect(f.presence.mutations[1]!.expected).toBe(f.presence.mutations[0]!.revision);
+    await view.close();
+    expect(f.presence.deletes).toEqual([]);
+  });
+
+  it("leaves the rightful new lease holder untouched if the fenced undo loses", async () => {
+    const f = fixture(), previous = f.stale(); f.lease();
+    let competitor: TransportKvEntry<unknown> | undefined;
+    f.presence.beforePut = (_key, expected) => {
+      if (expected === previous.revision) f.lease("rightful-new-owner");
+      else if (expected > previous.revision) competitor = f.presence.seed(pkey(), `${ROOT}#rightful-new-owner`, root("rightful-new-owner"));
+    };
+    const view = f.view(), observer = f.observer();
+    await expect(view.publish(root())).rejects.toMatchObject({ code: "FABRIC_TRANSPORT_UNAVAILABLE" });
+    expect(competitor).toBeDefined();
+    expect(f.presence.rows.get(pkey())).toEqual(competitor);
+    expect(f.presence.mutations).toHaveLength(1); // No retry/adoption after the undo conflict.
+    expect(await liveRoute(observer)).toMatchObject({ live: true, ownerIncarnation: "rightful-new-owner" });
+    await view.close();
+    expect(f.presence.rows.get(pkey())).toEqual(competitor);
+    expect(f.presence.deletes).toEqual([]);
+  });
+
+  it.each([
+    ["host", { id: "another-host" }],
+    ["root", { rootId: "another-root" }],
+    ["identity", { identityId: "another-identity" }],
+    ["incarnation", { incarnation: "another-incarnation" }],
+  ] as const)("readers never treat presence as live with a mismatched lease %s", async (_field, change) => {
+    const f = fixture();
+    f.presence.seed(pkey(), `${ROOT}#${NEXT}`, root());
+    f.lease(NEXT, change);
+    const observer = f.observer(); await ready(observer);
+    expect(observer.resolve(ROOT)).toMatchObject({ live: false });
+    expect(observer.get(ROOT)).toBeUndefined();
+    expect(observer.list()).toEqual([]);
+    expect(observer.list({ includeStale: true })).toMatchObject([{ id: ROOT, stale: true }]);
+    f.lease();
+    expect(await liveRoute(observer)).toMatchObject({ live: true, ownerIncarnation: NEXT });
+    expect(observer.get(ROOT)).toMatchObject({ id: ROOT, stale: false });
+  });
+
+  it.each(["owner", "machine", "absent"])("readers require the exact authenticated lease entry (%s)", async mismatch => {
+    const f = fixture();
+    f.presence.seed(pkey(), `${ROOT}#${NEXT}`, root());
+    if (mismatch !== "absent") f.leases.seed(mismatch === "machine" ? hkey().replace(MACHINE, "machine-c") : hkey(),
+      mismatch === "owner" ? `${ROOT}#another-owner` : `${ROOT}#${NEXT}`, hostLease());
+    const observer = f.observer(); await ready(observer);
+    expect(observer.resolve(ROOT)).toMatchObject({ live: false });
+    expect(observer.get(ROOT)).toBeUndefined();
+    expect(observer.list()).toEqual([]);
+    f.lease();
+    expect(await liveRoute(observer)).toMatchObject({ live: true, ownerIncarnation: NEXT });
   });
 
   it("does not retry/adopt a concurrent replacement after its read revision loses the CAS", async () => {

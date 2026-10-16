@@ -88,6 +88,7 @@ const lazyEntryPoints = [
   // First-use host custody and participant snapshots keep stable lazy paths.
   "src/topology/host-leases.ts",
   "src/topology/participant-view.ts",
+  "src/storage/private-dir.ts",
   "src/topology/nats-drain-receipt.ts",
   "src/mesh/custody-lock.ts",
   // Carrier selection and its first-use NATS module have stable lazy paths.

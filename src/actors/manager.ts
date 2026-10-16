@@ -781,6 +781,8 @@ export class ActorManager {
   readonly #deadLetters = new Map<string, number>();
   /** Active backlog identities, bounded by its cap, independent of the recent-delivery LRU. */
   readonly #deadLetterEventIds = new Map<string, Set<string>>();
+  /** Only replay attempts admitted here may retry stale retirement on monitor progress. */
+  readonly #deadLetterRetirementPending = new Set<string>();
   readonly #deadLettersDropped = new Map<string, number>();
   readonly #deadLetterAlarms = new Map<string, number>();
   // Predecessor queue files taken over, deleted only after this lineage's durable destination receipt.
@@ -1140,8 +1142,9 @@ export class ActorManager {
         for (const actor of this.#actors.values()) {
           if (this.#canManageCached(actor.id)) {
             this.#expireActivationFilter(actor);
-            // Retry stale retirement after the monitor has consumed its previously saved gap.
-            this.#replayDeadLetters(actor);
+            // Retry our admitted retirement after cursor progress, not an arbitrary shared
+            // backlog discovered by a same-root creator's residency fallback (#11107).
+            if (this.#deadLetterRetirementPending.has(actor.id)) this.#replayDeadLetters(actor);
           }
         }
         this.#confirmDeliveryOutcomes();
@@ -3711,6 +3714,7 @@ export class ActorManager {
       }
       this.#revoked.add(actor.id);
       this.#deadLetterEventIds.delete(actor.id);
+      this.#deadLetterRetirementPending.delete(actor.id);
       this.#processedKeys.delete(actor.id);
       this.#clearSettledWindows(actor.id);
       this.#emitChange();
@@ -6471,6 +6475,8 @@ export class ActorManager {
       if (maxAgeMs > 0 && Number.isFinite(entry.at) && entry.at < cutoff) { stale.push(entry); return false; }
       return true;
     });
+    if (stale.length) this.#deadLetterRetirementPending.add(actor.id);
+    else this.#deadLetterRetirementPending.delete(actor.id);
     let archivedStale = 0;
     // Keep stale identities in the active backlog until the monitor durably holds their
     // consumed prefix. Otherwise a crash could offer archived work again as a fresh event.
@@ -6537,6 +6543,7 @@ export class ActorManager {
       try {
         const remaining = [...stale.slice(0, stale.length - archivedStale), ...entries.slice(taken)];
         this.#writeDeadLetters(actor.id, remaining);
+        if (archivedStale === stale.length) this.#deadLetterRetirementPending.delete(actor.id);
         this.#recordMessage(actor, {
           id: randomUUID(), actorId: actor.id, actorName: actor.name, direction: "in",
           source: "actor:dead-letter-replay", createdAt: Date.now(),

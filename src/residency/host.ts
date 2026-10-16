@@ -288,6 +288,7 @@ export class ResidentHost {
   participants!: ParticipantDirectory;
   control!: FabricControlPlane;
   #transport: FabricTransport | undefined;
+  #transportAbort: AbortController | undefined;
   #controlInboxBound = false;
   agents!: AgentManager;
   actors!: ActorDirectory;
@@ -446,9 +447,17 @@ export class ResidentHost {
     }
     const { mkdirPrivate } = await import("../storage/private-dir.js");
     mkdirPrivate(transportStateDir);
+    const transportAbort = new AbortController();
+    this.#transportAbort = transportAbort;
     const { openFabricTransport } = await import("../transport/index.js");
     // NatsTransport.open awaits ensureTransportConsumer before returning (inbox.ts).
-    this.#transport = await openFabricTransport({ config: structuredClone(this.config.mesh), hostId: this.hostId, mesh: this.mesh });
+    const opened = await openFabricTransport({ config: structuredClone(this.config.mesh), hostId: this.hostId, mesh: this.mesh, signal: transportAbort.signal });
+    // A close while open was pending must not publish a late carrier.
+    if (transportAbort.signal.aborted) {
+      await opened.close();
+      transportAbort.signal.throwIfAborted();
+    }
+    this.#transport = opened;
     if (this.#transport.kind !== "nats" || this.#transport.self.hostId !== this.hostId) {
       throw new Error("Fabric NATS transport factory returned a different carrier or owner");
     }
@@ -1169,22 +1178,25 @@ export class ResidentHost {
 
   async #closeWithTransport(): Promise<void> {
     const transport = this.#transport;
+    const transportAbort = this.#transportAbort;
     const control = this.control;
     const participants = this.participants;
-    if (transport) {
+    if (transport || transportAbort) {
       this.#controlInboxBound = false;
       control?.pause();
     }
     try { await this.#close(); }
     finally {
-      if (transport) {
-        // Partial startup and failed teardown retain this order before host custody release.
+      if (transport || transportAbort) {
+        // Partial startup (including rejected open) preserves withdrawal before abort.
         try {
           await control?.close().catch(() => undefined);
           await participants?.close().catch(() => undefined);
         } finally {
-          this.#transport = undefined;
-          try { await transport.close(); }
+          transportAbort?.abort();
+          if (this.#transportAbort === transportAbort) this.#transportAbort = undefined;
+          if (this.#transport === transport) this.#transport = undefined;
+          try { await transport?.close(); }
           finally { try { this.mesh?.closeState(); } finally { this.#releaseLock(); } }
         }
       }
@@ -1245,7 +1257,7 @@ export class ResidentHost {
           // so Windows can remove or migrate state.db once the host is gone (pi-fabric#640).
           try { this.mesh?.closeState(); } catch { /* best effort at teardown */ }
         }
-      } finally { if (!this.#transport) this.#releaseLock(); }
+      } finally { if (!this.#transport && !this.#transportAbort) this.#releaseLock(); }
     }
   }
 

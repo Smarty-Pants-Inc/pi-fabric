@@ -262,6 +262,7 @@ export class FabricRuntimeState {
   #providerParticipants = new ProviderParticipantRegistry();
   #control: FabricControlPlane | undefined;
   #transport: FabricTransport | undefined;
+  #transportAbort: AbortController | undefined;
   #lifecycle: LifecycleBroker | undefined;
   #residency: ResidencyClient | undefined;
   #agentsProvider: AgentsProvider | undefined;
@@ -939,6 +940,8 @@ export class FabricRuntimeState {
     herdrLookup?.start();
     // Carrier configuration belongs to this activation, not reloadConfig's mutable object.
     const meshConfig = this.#config.mesh.transport === "nats" ? structuredClone(this.#config.mesh) : this.#config.mesh;
+    const transportAbort = natsMode ? new AbortController() : undefined;
+    this.#transportAbort = transportAbort;
     try {
     this.#backgroundMesh = new MeshBackgroundQueue("runtime lifecycle/compaction");
     this.#disposableMeshWrites = identity.kind === "actor" || identity.kind === "agent"
@@ -973,7 +976,13 @@ export class FabricRuntimeState {
       mkdirPrivate(transportStateDir);
       const { openFabricTransport } = await import("./transport/index.js");
       // NatsTransport.open awaits ensureTransportConsumer before returning (inbox.ts).
-      this.#transport = await openFabricTransport({ config: structuredClone(meshConfig), hostId, mesh });
+      const opened = await openFabricTransport({ config: structuredClone(meshConfig), hostId, mesh, signal: transportAbort!.signal });
+      // A teardown may have completed while the factory was still opening.
+      if (transportAbort!.signal.aborted) {
+        await opened.close();
+        transportAbort!.signal.throwIfAborted();
+      }
+      this.#transport = opened;
       if (this.#transport.kind !== "nats" || this.#transport.self.hostId !== hostId) {
         throw new Error("Fabric NATS transport factory returned a different carrier or owner");
       }
@@ -2336,9 +2345,10 @@ export class FabricRuntimeState {
     // The session lifecycle retired: stop the background heartbeat before any teardown await.
     this.#participants?.suspend();
     const transport = this.#transport;
-    const control = transport ? this.#control : undefined;
-    const participants = transport ? this.#participants : undefined;
-    if (transport) control?.pause();
+    const transportAbort = this.#transportAbort;
+    const control = transport || transportAbort ? this.#control : undefined;
+    const participants = transport || transportAbort ? this.#participants : undefined;
+    if (transport || transportAbort) control?.pause();
     try {
       await this.#shutdownSteps(reason, targetSessionFile);
     } catch (error) {
@@ -2347,11 +2357,14 @@ export class FabricRuntimeState {
       await (transport ? participants : this.#participants)?.close().catch(() => undefined);
       throw error;
     } finally {
-      if (transport) {
+      if (transport || transportAbort) {
         // Exact instances survive clearing of the live fields by shutdown steps.
         await control?.close().catch(() => undefined);
         await participants?.close().catch(() => undefined);
-        if (this.#transport === transport) {
+        // CAS withdrawal needs a live carrier; retire refresh only after cleanup.
+        transportAbort?.abort();
+        if (this.#transportAbort === transportAbort) this.#transportAbort = undefined;
+        if (transport && this.#transport === transport) {
           await transport.close();
           this.#transport = undefined;
         }
@@ -2360,6 +2373,7 @@ export class FabricRuntimeState {
   }
 
   async #shutdownSteps(reason?: string, targetSessionFile?: string): Promise<void> {
+    const transportAbort = this.#transportAbort;
     this.sessionApprovals.reset();
     // Disposable actor/task results and journals belong to their worker, not
     // to this runtime's advisory presence/heartbeat writes. EOF must not convoy
@@ -2412,12 +2426,13 @@ export class FabricRuntimeState {
       await stageMainSuccessor(this.#mesh, this.#mainAgent.id, this.#mainAgent.sessionId, targetSessionFile);
     }
     const transport = this.#transport;
-    if (transport) {
+    if (transport || transportAbort) {
       // Release NATS ingress, directory lease, then carrier BEFORE native session custody.
       await this.#control?.close();
       if (reason === "exit") await this.#participants?.closeLineage();
       else await this.#participants?.close();
-      await transport.close();
+      transportAbort?.abort();
+      await transport?.close();
       if (this.#transport === transport) this.#transport = undefined;
     }
     try {
@@ -2548,16 +2563,19 @@ export class FabricRuntimeState {
 
   async #closeInternal(): Promise<void> {
     const transport = this.#transport;
-    const control = transport ? this.#control : undefined;
-    const participants = transport ? this.#participants : undefined;
+    const transportAbort = this.#transportAbort;
+    const control = transport || transportAbort ? this.#control : undefined;
+    const participants = transport || transportAbort ? this.#participants : undefined;
     try { await this.#closeInternalSteps(); }
     finally {
-      if (transport) {
-        // Also covers partial initialization and a teardown step rejecting early.
+      if (transport || transportAbort) {
+        // Also covers a rejected pending open, before a transport was assigned.
         control?.pause();
         await control?.close().catch(() => undefined);
         await participants?.close().catch(() => undefined);
-        if (this.#transport === transport) {
+        transportAbort?.abort();
+        if (this.#transportAbort === transportAbort) this.#transportAbort = undefined;
+        if (transport && this.#transport === transport) {
           await transport.close();
           this.#transport = undefined;
         }
@@ -2566,6 +2584,7 @@ export class FabricRuntimeState {
   }
 
   async #closeInternalSteps(): Promise<void> {
+    const transportAbort = this.#transportAbort;
     this.#stopHerdrLookup?.();
     this.#stopHerdrLookup = undefined;
     // /fabric reload and bootstrap replacement rebuild Fabric, not the creating
@@ -2609,11 +2628,12 @@ export class FabricRuntimeState {
     await this.#outputArtifacts.close();
     const externalNames = new Set(this.#externalProviders.keys());
     const transport = this.#transport;
-    if (transport) {
+    if (transport || transportAbort) {
       // Native session custody stays held until carrier teardown has completed.
       await this.#control?.close();
       await this.#participants?.close();
-      await transport.close();
+      transportAbort?.abort();
+      await transport?.close();
       if (this.#transport === transport) this.#transport = undefined;
     }
     try {

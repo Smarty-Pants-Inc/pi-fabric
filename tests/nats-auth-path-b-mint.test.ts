@@ -75,11 +75,15 @@ describe("Path B opt-in mint policy", () => {
       ...common,
       signingSeed: artifact(account, "signing-maintainer.nk"),
       role: "maintainer",
-      machine: "ryzen1",
+      machine: "fabric-ops",
       job: "compaction",
       runId: "test",
     };
-    expect(mintNatsUser(input, clock).metadata.role).toBe("maintainer");
+    const issued = mintNatsUser(input, clock);
+    expect(issued.metadata.role).toBe("maintainer");
+    const jwt = artifact(issued, "user.creds").match(/-{3,}BEGIN NATS USER JWT-{3,}\s*([^\s]+)\s*-{3,}END NATS USER JWT-{3,}/)?.[1];
+    expect(claims(jwt!).nats.tags).toContain("machine:fabric-ops");
+    expect(() => mintNatsUser({ ...input, machine: "ryzen1" }, clock)).toThrow();
     const operator = claims(common.accountJwt).nats.signing_keys.find((entry: any) => entry.role === "maintainer");
     for (const verb of ["CREATE", "UPDATE", "DELETE", "PURGE"]) {
       expect(operator.template.pub.allow.some((subject: string) => subject.startsWith(`$JS.API.STREAM.${verb}.`))).toBe(false);
@@ -87,9 +91,28 @@ describe("Path B opt-in mint policy", () => {
     expect(operator.template.pub.allow).not.toContain("$JS.ACK.FABRIC_IN_ryzen2.>");
     expect(operator.template.pub.allow).toContain("$JS.ACK.FABRIC_ADV.>");
     expect(operator.template.pub.allow).toContain("$JS.API.STREAM.MSG.GET.FABRIC_IN_ryzen2");
+    expect(operator.template.pub.allow).toContain("fabric.in.ryzen2.*.ack.*.{{tag(machine)}}");
+    expect(operator.template.pub.allow).toContain("fabric.in.ryzen4.*.ack.*.{{tag(machine)}}");
+    expect(operator.template.pub.allow).not.toContain("fabric.in.*.*.ack.*.{{tag(machine)}}");
     const { machine: omitted, ...withoutMachine } = input;
     expect(omitted).toBeDefined();
     expect(() => mintNatsUser(withoutMachine, clock)).toThrow();
+  });
+
+  it("T-OPS-MINT: reserves the whole operator namespace and refuses operators outside it", () => {
+    const { account, common } = fixture();
+    const input = { ...common, signingSeed: artifact(account, "signing-agent.nk"), role: "agent", lane: "test", session: "test", release: "test", meshes: ["0".repeat(32)] };
+    for (const host of ["fabric-ops", "fabric-ops-canary", "fabric-ops-2"]) {
+      expect(() => mintNatsUser({ ...input, host }, clock)).toThrow("invalid host");
+      expect(() => mintNatsUser({ ...input, host, pathBMachines: [host] }, clock)).toThrow("invalid pathBMachines");
+    }
+    const operator = { ...common, signingSeed: artifact(account, "signing-maintainer.nk"), role: "maintainer", job: "compaction", runId: "test" };
+    for (const machine of ["ryzen2", "ryzen1", "fabric-ops-", "fabric-ops-two-parts"]) {
+      expect(() => mintNatsUser({ ...operator, machine }, clock)).toThrow("invalid machine");
+    }
+    for (const machine of ["fabric-ops", "fabric-ops-canary"]) {
+      expect(mintNatsUser({ ...operator, machine }, clock).metadata.role).toBe("maintainer");
+    }
   });
 
   it("refuses empty, duplicate or unsafe inventory before generating account artifacts", () => {
@@ -101,7 +124,7 @@ describe("Path B opt-in mint policy", () => {
       jetstream: { memStorage: 0, diskStorage: 1, streams: 1, consumers: 1 },
       ...streams,
     };
-    for (const pathBMachines of [[], ["ryzen2", "ryzen2"], ["ryzen2.*"], ["{{tag(machine)}}"]]) {
+    for (const pathBMachines of [[], ["ryzen2", "ryzen2"], ["ryzen2.*"], ["{{tag(machine)}}"], ["fabric-ops"], ["fabric-ops-canary"]]) {
       expect(() => createNatsAccount({ ...input, pathBMachines }, clock)).toThrow();
     }
   });

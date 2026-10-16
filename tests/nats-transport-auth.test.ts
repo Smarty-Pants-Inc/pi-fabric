@@ -63,7 +63,7 @@ describe.skipIf(!binary)("authenticated Path B transport", () => {
   });
 
   it("accepts the operator's narrower own-source ACK grant", async () => {
-    const connection = await openNatsConnection({ servers: harness.serverUrl, credentials: harness.users.maintainer.credsPath, machine: MACHINE_A });
+    const connection = await openNatsConnection({ servers: harness.serverUrl, credentials: harness.users.maintainer.credsPath, machine: harness.users.maintainer.machine });
     await connection.close();
   });
 

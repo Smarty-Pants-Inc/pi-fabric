@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { pathBRoleTemplate } from "../src/mesh/nats-auth/permissions.js";
+import { PATH_B_OPERATOR_MACHINE, pathBRoleTemplate } from "../src/mesh/nats-auth/permissions.js";
 
 const matches = (pattern: string, subject: string): boolean => {
   const p = pattern.split("."), s = subject.split(".");
@@ -42,21 +42,27 @@ describe("Path B NATS grants", () => {
   });
 
   it("gives the operator read and relay rights without stream lifecycle authority", () => {
-    const template = pathBRoleTemplate("maintainer", "ryzen1", ["ryzen2"]);
+    const template = pathBRoleTemplate("maintainer", PATH_B_OPERATOR_MACHINE, ["ryzen2"]);
     expect(mayPublish(template, "$JS.API.STREAM.CREATE.FABRIC_IN_ryzen2")).toBe(false);
     expect(mayPublish(template, "$JS.API.STREAM.UPDATE.FABRIC_ADV")).toBe(false);
     expect(mayPublish(template, "$JS.API.STREAM.INFO.FABRIC_IN_ryzen2")).toBe(true);
     expect(mayPublish(template, "$JS.ACK.FABRIC_ADV.operator.1.1")).toBe(true);
     expect(mayPublish(template, "$JS.API.STREAM.DELETE.FABRIC_IN_ryzen2")).toBe(false);
     expect(mayPublish(template, "$JS.API.STREAM.PURGE.FABRIC_EV")).toBe(false);
-    expect(mayPublish(template, "fabric.in.ryzen2.owner.ack.target.ryzen1")).toBe(true);
-    expect(mayPublish(template, "fabric.in.ryzen2.owner.cmd.target.ryzen1")).toBe(false);
+    expect(mayPublish(template, "fabric.in.ryzen2.owner.ack.target.fabric-ops")).toBe(true);
+    expect(mayPublish(template, "fabric.in.ryzen4.owner.ack.target.fabric-ops")).toBe(false);
+    expect(mayPublish(template, "fabric.in.ryzen2.owner.ack.target.ryzen1")).toBe(false);
+    expect(mayPublish(template, "fabric.in.ryzen2.owner.cmd.target.fabric-ops")).toBe(false);
     expect(mayPublish(template, "$JS.API.STREAM.MSG.DELETE.FABRIC_IN_ryzen2")).toBe(false);
     expect(mayPublish(template, "$JS.API.DIRECT.GET.FABRIC_IN_ryzen2")).toBe(false);
   });
 
   it("rejects unsafe machine literals and keeps template values fresh", () => {
     expect(() => pathBRoleTemplate("agent", "ryzen.1")).toThrow("invalid machine");
+    expect(() => pathBRoleTemplate("agent", PATH_B_OPERATOR_MACHINE)).toThrow("invalid machine");
+    expect(() => pathBRoleTemplate("agent", "fabric-ops-canary")).toThrow("invalid machine");
+    expect(pathBRoleTemplate("maintainer", "fabric-ops-canary", ["ryzen2"]).pub.allow).toContain("fabric.in.ryzen2.*.ack.*.fabric-ops-canary");
+    expect(() => pathBRoleTemplate("maintainer", "ryzen1", ["ryzen2"])).toThrow("invalid machine");
     const first = pathBRoleTemplate("agent");
     first.pub.allow.push("fabric.in.>");
     expect(pathBRoleTemplate("agent").pub.allow).not.toContain("fabric.in.>");

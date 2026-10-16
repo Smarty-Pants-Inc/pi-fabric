@@ -8,7 +8,7 @@ import {
   encodeUserJwt,
   formatUserCreds,
 } from "./jwt.js";
-import { roleTemplate, roleTemplateWithPathB } from "./permissions.js";
+import { PATH_B_OPERATOR_MACHINE_PATTERN, roleTemplate, roleTemplateWithPathB } from "./permissions.js";
 
 /**
  * smarty-dev#7504 slice 1 (design Amendment B): high-level NATS minter for the `pi-fabric nats` CLI.
@@ -214,7 +214,9 @@ function canonical(value: unknown): string {
  *   /^[a-z0-9][a-z0-9-]{0,31}$/; canary value ["ryzen2", "ryzen4"].
  * - every user input for that account repeats the same pathBMachines to verify the exact scope.
  * - agent input uses its existing `host` field as the machine; it must be in pathBMachines.
- * - maintainer input adds `machine` (credential-bound operator host, e.g. "ryzen1").
+ * - maintainer input adds `machine`, in /^fabric-ops(-[a-z0-9]+)?$/ (default choice "fabric-ops").
+ *   This is a reserved role namespace, not a host; it is forbidden in pathBMachines and agent credentials.
+ *   Operator ACK publication enumerates the destination machines; there is no wildcard destination.
  *   Operator credentials are read/relay only; stream provisioning uses a separate bootstrap authority.
  * Neither input contains secrets in argv/environment: existing CLI stdin JSON and artifact rules apply.
  * A fleet-policy JSON can retain its existing `hosts` map and add pathBMachines, then mint Path B
@@ -223,7 +225,7 @@ function canonical(value: unknown): string {
 function pathBMachines(value: unknown): string[] {
   if (!Array.isArray(value) || value.length === 0 || value.length > 64) fail("pathBMachines");
   const machines = value.map((machine) => matching(machine, /^[a-z0-9][a-z0-9-]{0,31}$/, "pathBMachines"));
-  if (new Set(machines).size !== machines.length) fail("pathBMachines");
+  if (new Set(machines).size !== machines.length || machines.some((machine) => PATH_B_OPERATOR_MACHINE_PATTERN.test(machine))) fail("pathBMachines");
   return machines;
 }
 
@@ -451,7 +453,7 @@ export function mintNatsUser(input: unknown, clock: NatsMintClock = systemClock)
       const [host, lane, session, release] = ["host", "lane", "session", "release"].map(label) as [string, string, string, string];
       const parent = value.parent === undefined ? [] : [`parent:${label("parent")}`];
       const pathMachines = value.pathBMachines === undefined ? undefined : pathBMachines(value.pathBMachines);
-      if (pathMachines && !pathMachines.includes(host)) fail("host");
+      if (pathMachines && (PATH_B_OPERATOR_MACHINE_PATTERN.test(host) || !pathMachines.includes(host))) fail("host");
       const machineTag = pathMachines === undefined ? [] : [`machine:${host}`];
       const tags = [`host:${host}`, `lane:${lane}`, `session:${session}`, `release:${release}`, "role:agent", ...machineTag, ...meshes.map((mesh) => `mesh:${mesh}`), ...parent];
       spec = { role, nameIn: () => `agent/${host}/${lane}/${session}`, tags, lifetime: LIFETIME.agent };
@@ -463,7 +465,7 @@ export function mintNatsUser(input: unknown, clock: NatsMintClock = systemClock)
       const job = value.job === "compaction" || value.job === "migration" ? value.job : fail("job");
       const runId = label("runId");
       const machine = value.machine === undefined ? undefined : matching(value.machine, /^[a-z0-9][a-z0-9-]{0,31}$/, "machine");
-      if (value.pathBMachines !== undefined && machine === undefined) fail("machine");
+      if (value.pathBMachines !== undefined && (machine === undefined || !PATH_B_OPERATOR_MACHINE_PATTERN.test(machine))) fail("machine");
       if (value.pathBMachines === undefined && machine !== undefined) fail("machine");
       const machineTag = machine === undefined ? [] : [`machine:${machine}`];
       spec = { role, nameIn: (org) => `maintainer/${org}/${job}/${runId}`, tags: ["role:maintainer", `job:${job}`, `run:${runId}`, ...machineTag], lifetime: LIFETIME[job] };

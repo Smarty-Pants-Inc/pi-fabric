@@ -28,6 +28,7 @@ export interface NatsConnectionHandle {
 }
 
 const USER_NKEY = /^U[A-Z2-7]{55}$/;
+const OPERATOR_MACHINE = /^fabric-ops(?:-[a-z0-9]+)?$/;
 
 /** Read only the public user identity from a NATS creds file; the full bytes stay in memory for auth. */
 export const readNatsCredentials = (file: string): { readonly bytes: Uint8Array; readonly subject: string; readonly tags: readonly string[] } => {
@@ -51,6 +52,13 @@ export const readNatsCredentials = (file: string): { readonly bytes: Uint8Array;
   return { bytes, subject, tags };
 };
 
+const isOperatorInboxGrant = (subject: string, machine: string): boolean => {
+  const tokens = subject.split(".");
+  return OPERATOR_MACHINE.test(machine) && tokens.length === 7 && tokens[0] === "fabric" && tokens[1] === "in" &&
+    /^[a-z0-9][a-z0-9-]{0,31}$/.test(tokens[2]!) && !OPERATOR_MACHINE.test(tokens[2]!) &&
+    tokens[3] === "*" && tokens[4] === "ack" && tokens[5] === "*" && tokens[6] === machine;
+};
+
 const hasForeignSourceGrant = (subject: string, machine: string, operator: boolean): boolean => {
   const tokens = subject.split(".");
   const tail = tokens.at(-1) === ">";
@@ -59,7 +67,7 @@ const hasForeignSourceGrant = (subject: string, machine: string, operator: boole
   const family = ["fabric", "in"];
   if (family.some((token, index) => fixed[index] !== undefined && fixed[index] !== "*" && fixed[index] !== token)) return false;
   if (fixed[4] !== undefined && fixed[4] !== "*" && fixed[4] !== "cmd" && fixed[4] !== "ack") return false;
-  return tail || fixed[6] !== machine || (operator && fixed[4] !== "ack");
+  return tail || fixed[6] !== machine || (operator && !isOperatorInboxGrant(subject, machine));
 };
 
 const verifyMachineIdentity = async (nc: NatsConnection, machine: string, timeoutMs: number, auth: ReturnType<typeof readNatsCredentials> | undefined): Promise<unknown> => {
@@ -72,9 +80,11 @@ const verifyMachineIdentity = async (nc: NatsConnection, machine: string, timeou
   const data = value && typeof value === "object" ? (value as { data?: { user?: unknown; permissions?: { publish?: { allow?: unknown } } } }).data : undefined;
   const allow = data?.permissions?.publish?.allow;
   const operator = auth?.tags.includes("role:maintainer") ?? false;
-  const expectedGrant = operator ? `fabric.in.*.*.ack.*.${machine}` : `fabric.in.*.*.*.*.${machine}`;
+  const ownSourceGrant = `fabric.in.*.*.*.*.${machine}`;
   if (!auth || auth.tags.filter((tag) => tag.startsWith("machine:")).length !== 1 || !auth.tags.includes(`machine:${machine}`) || data?.user !== auth.subject ||
-    !Array.isArray(allow) || !allow.includes(expectedGrant) ||
+    !Array.isArray(allow) || !(operator
+      ? allow.some((subject) => typeof subject === "string" && isOperatorInboxGrant(subject, machine))
+      : allow.includes(ownSourceGrant)) ||
     allow.some((subject) => typeof subject !== "string" || hasForeignSourceGrant(subject, machine, operator))) throw new Error("NATS USER.INFO machine tag mismatch");
   return value;
 };

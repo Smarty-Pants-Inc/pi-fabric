@@ -1,9 +1,14 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { ActionRegistry } from "../src/core/action-registry.js";
 import { FabricExecutionService } from "../src/execution-service.js";
 import { QuickJsRuntime } from "../src/runtime/quickjs-runtime.js";
+import { MeshLock } from "../src/mesh/mesh-lock.js";
+import { MeshStore } from "../src/mesh/store.js";
 import { executeAfterAdmission } from "./helpers/admission-clock.js";
 
 const memoryLimitBytes = 32 * 1024 * 1024;
@@ -11,6 +16,37 @@ const boundMs = 100;
 const guestDurationMs = 600;
 const busyUntil = (until: number): void => { while (Date.now() < until) { /* Deliberately starve timers. */ } };
 
+const pause = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));
+const meshFrom = { id: "guest", name: "guest", kind: "agent" as const };
+const deadlineContext = (id: string): ExtensionContext => ({
+  cwd: process.cwd(), mode: "print", sessionManager: { getSessionId: () => id },
+} as unknown as ExtensionContext);
+const registerMeshPublish = (registry: ActionRegistry, mesh: MeshStore, onInvoke: () => void): void => {
+  const descriptor = {
+    name: "publish", description: "publish one mesh event",
+    inputSchema: { type: "object", additionalProperties: true }, risk: "read" as const,
+  };
+  registry.register({
+    name: "mesh", description: "test mesh", async list() { return [descriptor]; },
+    async describe() { return descriptor; },
+    async invoke(_name, args) {
+      onInvoke();
+      return mesh.publish({ topic: String(args.topic), from: meshFrom });
+    },
+  });
+};
+const heldMesh = (root: string) => {
+  let release!: () => void;
+  let acquired!: () => void;
+  const ready = new Promise<void>(resolve => { acquired = resolve; });
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const holder = new MeshLock(root, { lockTimeoutMs: 5_000 }, () => {});
+  const settled = holder.withLockAcrossAwait(async () => { acquired(); await gate; });
+  return { ready, release, settled };
+};
+
+// Recorded failure path: use a real held canonical .lock, not an indefinitely
+// pending fake provider. Release is event-driven, independent of cold startup.
 describe("execution deadline under microtask starvation", () => {
   beforeEach(() => {
     vi.stubEnv("PI_FABRIC_PARENT_RUN", "");
@@ -224,5 +260,133 @@ describe("execution deadline under microtask starvation", () => {
     expect(result.terminationReason).toBe("timed_out");
     expect(result.error).toBe("Execution timed out after 100ms");
     expect(calls).toBe(0);
+  });
+
+  it.each(["timeout", "release", "abort", "pause"] as const)("bounds a real guest mesh lock wait: %s", async ending => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "execution-mesh-deadline-"));
+    const mesh = new MeshStore(base, 65_536, 100, { lockTimeoutMs: 5_000 });
+    const registry = new ActionRegistry();
+    const config = structuredClone(DEFAULT_FABRIC_CONFIG);
+    config.executor.timeoutMs = ending === "timeout" ? boundMs : ending === "pause" ? 50 : 500;
+    config.executor.maxTimeoutMs = 5_000;
+    const context = deadlineContext(`guest-mesh-${ending}`);
+    const service = new FabricExecutionService(registry, config);
+    let admit = () => {};
+    let admitted = false;
+    const abort = new AbortController();
+    if (ending === "pause") {
+      config.fullCodeMode = true;
+      config.executor.humanWaitRefs = ["extensions.ask"];
+      const descriptor = {
+        name: "ask", description: "paused extension",
+        inputSchema: { type: "object", additionalProperties: true }, risk: "read" as const,
+      };
+      registry.register({
+        name: "extensions", description: "test extension", async list() { return [descriptor]; },
+        async describe() { return descriptor; },
+        async invoke() {
+          admit();
+          await pause(120);
+          await mesh.publish({ topic: "guest", from: meshFrom });
+          return "published";
+        },
+      });
+    } else registerMeshPublish(registry, mesh, () => admit());
+    await service.prewarm(context);
+    const held = heldMesh(base);
+    await held.ready;
+    // The ordinary caller is outside the guest's async context and must retain
+    // its own budget even while queued ahead of the guest on the same lock.
+    const ordinary = ending === "timeout" ? mesh.publish({ topic: "ordinary", from: meshFrom }) : undefined;
+    void ordinary?.catch(() => undefined);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const result = await executeAfterAdmission((signal, startClock) => {
+        admit = () => {
+          if (admitted) return;
+          admitted = true;
+          startClock();
+          if (ending === "release" || ending === "pause") timer = setTimeout(held.release, ending === "pause" ? 180 : 20);
+          if (ending === "abort") timer = setTimeout(() => abort.abort(new Error("test abort")), 20);
+        };
+        return service.execute({
+          code: ending === "pause" ? 'return await extensions.ask({});' : ending === "timeout"
+            ? 'try { await tools.call({ ref: "mesh.publish", args: { topic: "guest" } }); } catch (error) { if (error?.code !== "FABRIC_MESH_LOCK_TIMEOUT") throw error; } return "continued";'
+            : 'await tools.call({ ref: "mesh.publish", args: { topic: "guest" } }); return "published";',
+          context, signal: AbortSignal.any([signal, abort.signal]), parentToolCallId: `guest-mesh-${ending}`, onPartial() {},
+        });
+      }, () => admitted);
+      expect(result.typeErrors).toBeUndefined();
+      expect(result.success).toBe(ending !== "abort");
+      if (ending === "abort") expect(result.trace.outcome).toBe("aborted");
+      else expect(result.value).toBe(ending === "timeout" ? "continued" : "published");
+      held.release();
+      await held.settled;
+      if (ordinary) expect((await ordinary).topic).toBe("ordinary");
+      // Drain the original aborted provider too: the no-append assertion is
+      // after release, so it catches a late commit rather than only a wait.
+      await registry.close();
+      await pause(30);
+      expect(mesh.read({ topic: "guest" })).toHaveLength(ending === "release" || ending === "pause" ? 1 : 0);
+    } finally {
+      clearTimeout(timer);
+      held.release();
+      await held.settled;
+      await ordinary?.catch(() => undefined);
+      await registry.close();
+      mesh.closeState();
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it.each([true, false])("preserves detached mesh refresh only after successful agents.spawn: %s", async success => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "execution-mesh-detached-"));
+    const mesh = new MeshStore(base, 65_536, 100, { lockTimeoutMs: 5_000 });
+    const registry = new ActionRegistry();
+    let background: Promise<{ value?: unknown; error?: unknown }> = Promise.resolve({});
+    const descriptor = {
+      name: "spawn", description: "detached actor start",
+      inputSchema: { type: "object", additionalProperties: true }, risk: "read" as const,
+    };
+    registry.register({
+      name: "agents", description: "test agents", async list() { return [descriptor]; },
+      async describe() { return descriptor; },
+      async invoke() {
+        // Start waiting BEFORE the host call returns, not from a later timer.
+        background = mesh.publish({ topic: "detached", from: meshFrom })
+          .then(value => ({ value }), error => ({ error }));
+        if (!success) throw new Error("spawn failed");
+        return { id: "detached-started" };
+      },
+    });
+    const config = structuredClone(DEFAULT_FABRIC_CONFIG);
+    config.executor.timeoutMs = 500;
+    const context = deadlineContext("guest-mesh-detached");
+    const service = new FabricExecutionService(registry, config);
+    await service.prewarm(context);
+    const held = heldMesh(base);
+    await held.ready;
+    try {
+      const result = await service.execute({
+        code: 'try { await tools.call({ ref: "agents.spawn", args: {} }); } catch {} return "continued";',
+        context, signal: undefined, parentToolCallId: "guest-mesh-detached", onPartial() {},
+      });
+      expect(result.typeErrors).toBeUndefined();
+      expect(result.success).toBe(true);
+      expect(result.value).toBe("continued");
+      held.release();
+      await held.settled;
+      const outcome = await background;
+      if (success) expect(outcome.value).toMatchObject({ topic: "detached" });
+      else expect(outcome.error).toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
+      expect(mesh.read({ topic: "detached" })).toHaveLength(success ? 1 : 0);
+    } finally {
+      held.release();
+      await held.settled;
+      await background;
+      await registry.close();
+      mesh.closeState();
+      fs.rmSync(base, { recursive: true, force: true });
+    }
   });
 });

@@ -262,6 +262,73 @@ describe("exclusive kernel tool surface", () => {
     expect(result.content).not.toEqual([]);
   });
 
+  it("keeps every failure-progress receipt above a tiny output budget", async () => {
+    const state = {
+      bootstrapped: true,
+      config: normalizeFabricConfig({
+        executor: { kernel: "typescript", maxOutputChars: 32 },
+        ui: { toolDisplay: "full" },
+      }),
+      ensure: vi.fn(async () => {}),
+      outputArtifactWriter: vi.fn(async () => "failure-progress-output.txt"),
+      execution: {
+        execute: vi.fn(async () => ({
+          success: false,
+          value: { answer: "long returned value" },
+          logs: ["guest log ".repeat(20)],
+          audits: [],
+          phases: [],
+          kernel: "typescript" as const,
+          error: "outer failure",
+          trace: {
+            kind: "pi-fabric.execution" as const,
+            version: 1 as const,
+            outcome: "failed" as const,
+            phases: [],
+            operations: [
+              {
+                type: "call" as const,
+                sequence: 0,
+                ref: "agents.followUp",
+                args: {},
+                outcome: "succeeded" as const,
+                result: { messageId: "message-budget", deliveryId: "delivery-budget" },
+              },
+              {
+                type: "call" as const,
+                sequence: 1,
+                ref: "mesh.publish",
+                args: {},
+                outcome: "succeeded" as const,
+                result: { id: "event-budget", sequence: 23 },
+              },
+            ],
+            counts: { droppedValues: 0, truncatedValues: 0, redactedValues: 0, droppedOperations: 0 },
+          },
+        })),
+      },
+      claimHandoff: vi.fn(async () => undefined),
+      prewalk: { planRequired: () => false },
+    } as unknown as FabricState;
+    const tool = createFabricExecTool(state, defaultCodePreviewSettings(), new Map(), value => value);
+    const result = await tool.execute(
+      "tiny-budget",
+      { code: "return 1" } as never,
+      undefined,
+      undefined,
+      { sessionManager: { getSessionId: () => "session" } } as never,
+    );
+    const text = result.content
+      .filter((part): part is { type: "text"; text: string } => part.type === "text")
+      .map(part => part.text)
+      .join("\n");
+    expect(text).toContain("messageId=message-budget");
+    expect(text).toContain("deliveryId=delivery-budget");
+    expect(text).toContain("id=event-budget");
+    expect(text).toContain("sequence=23");
+    expect(result.details).not.toHaveProperty("outputFormat");
+  });
+
   it.each(["typescript", "python"] as const)("tells %s programs that payloads are literal", (kernel) => {
     for (const fullCodeMode of [true, false]) {
       const line = "payloads are literal: read files with native tools first";

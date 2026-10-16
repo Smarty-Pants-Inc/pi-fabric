@@ -294,10 +294,21 @@ export const projectFabricAuditArgs = (
 };
 
 /**
- * Results are omitted except for the exact boolean creation outcome emitted by
- * pi.write and Fabric's own auto-approval and owned-work stop outcomes. No
- * provider details or output text accompany them.
+ * Results are omitted except for exact structural receipts: side-effect ids,
+ * Fabric's auto-approval and owned-work stop outcomes, and pi.write's boolean
+ * creation outcome. No provider details or output text accompany them.
  */
+const resultProjectionRef = (ref: string): string => {
+  const separator = ref.indexOf(".");
+  if (separator <= 0 || separator === ref.length - 1) return ref;
+  const provider = ref.slice(0, separator);
+  const action = ref.slice(separator + 1);
+  if (provider === "agents" && action.toLowerCase().replaceAll(/[^a-z0-9]/g, "") === "followup") {
+    return "agents.followUp";
+  }
+  return ref;
+};
+
 export const projectFabricAuditResult = (
   ref: string,
   result: unknown,
@@ -305,8 +316,9 @@ export const projectFabricAuditResult = (
   if (typeof result !== "object" || result === null || Array.isArray(result)) {
     return undefined;
   }
+  const projectionRef = resultProjectionRef(ref);
   const record = result as Record<string, unknown>;
-  if (ref === "fabric.approval.auto") {
+  if (projectionRef === "fabric.approval.auto") {
     return projected(record, (output) => {
       copyIdentifier(output, record, "action");
       copyIdentifier(output, record, "risk");
@@ -315,13 +327,28 @@ export const projectFabricAuditResult = (
       copyNumber(output, record, "at");
     });
   }
-  if (ref === "fabric.participant.stop") {
+  if (projectionRef === "fabric.participant.stop") {
     return projected(record, (output) => {
       copyIdentifier(output, record, "outcome");
       copyIdentifier(output, record, "detail");
     });
   }
-  if (ref !== "pi.write") return undefined;
+  if (projectionRef === "agents.followUp" || projectionRef === "agents.steer") {
+    return projected(record, (output) => {
+      copyIdentifier(output, record, "messageId");
+      copyIdentifier(output, record, "deliveryId");
+    });
+  }
+  if (projectionRef === "mesh.publish") {
+    return projected(record, (output) => {
+      copyIdentifier(output, record, "id");
+      copyNumber(output, record, "sequence");
+    });
+  }
+  if (projectionRef === "agents.create" || projectionRef === "agents.spawn") {
+    return projected(record, (output) => copyIdentifier(output, record, "id"));
+  }
+  if (projectionRef !== "pi.write") return undefined;
   const details =
     typeof record.details === "object" && record.details !== null && !Array.isArray(record.details)
       ? (record.details as Record<string, unknown>)

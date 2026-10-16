@@ -1,6 +1,7 @@
 import { createMainExecutionCeilingError, isMainExecutionCeilingError, mainExecutionCeilingAbortReason, preserveCancellationOutcome, shareCancellationEffects } from "./async-settlement.js";
 import { ResultConsumption } from "./result-consumption.js";
 import { ExecutionDeadline } from "./runtime/execution-deadline.js";
+import { withMeshInvocationContext } from "./mesh/mesh-lock.js";
 import { NativeCodemodeProvider } from "./native-codemode.js";
 import { nativeMcpIdentity } from "./core/native-mcp-identity.js";
 import { nativeToolRef, nativeToolIdentifier } from "./core/native-tool-names.js";
@@ -694,7 +695,9 @@ export class FabricExecutionService {
       }
       const participants = this.#participants;
       const separator = ref.indexOf(".");
-      return this.registry.invoke(ref, args, {
+      return withMeshInvocationContext(
+        { signal: callContext.signal, deadlineAt: () => runtimeDeadline.at },
+        () => this.registry.invoke(ref, args, {
         ...callContext,
         // The registry resolves `provider.action` by this exact prefix, so the
         // view is bound to the provider that receives it.
@@ -737,7 +740,7 @@ export class FabricExecutionService {
         maxResultChars: ref.startsWith("native.") || callContext.nativeToolResult ? 16_777_216 : this.config.executor.maxNestedResultChars,
         traceOperation,
         observeInvocation,
-      });
+      }));
     };
     const nativeTransaction = this.nativeCodemode.begin(options.parentToolCallId, options.context, !python && codemodeProfile === "native");
     const loadNativeCatalog = async (context: typeof baseContext) => {

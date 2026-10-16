@@ -2,6 +2,7 @@ import type { FabricActorInfo } from "../actors/types.js";
 import type { FabricAgentRunner, FabricAgentTransport } from "../config.js";
 import type { MeshIdentity } from "../mesh/store.js";
 import type { AgentUsage } from "../agents/types.js";
+import type { FabricHostLease } from "./host-leases.js";
 
 /** `provider`: work a Fabric provider registered through `context.participants`. */
 export type FabricParticipantKind = "root" | "agent" | "actor" | "provider";
@@ -107,7 +108,17 @@ export interface FabricParticipantRecord {
   bridgeVia?: string;
 }
 
+/** KV lease payload. Process identity is evidence for the separate local successor gate, not TTL takeover. */
+export interface FabricKvHostLease extends FabricHostLease {
+  incarnation: string;
+  pid: number;
+  pidStartTime: string;
+  bootId: string;
+}
+
 export interface FabricParticipantInfo extends FabricParticipantRecord {
+  /** KV-only projection from the authenticated key, never a presence JSON authority field. */
+  machine?: string;
   local: boolean;
   stale: boolean;
   /** Retained remote routing attribution; transport freshness is unknown, not owner death. */
@@ -122,6 +133,10 @@ export interface FabricHostRecord {
   identity: MeshIdentity;
   /** UUID fence for token-capable host incarnations; start time is metadata. */
   incarnationToken?: string;
+  /** Locally observed tokens superseded by this mirror; bounded and absent on legacy records. */
+  bridgeSupersededTokens?: string[];
+  /** Root-local first-seen ordinals for retained superseded tokens; absent on legacy records. */
+  bridgeSupersededTokenSeen?: Record<string, number>;
   startedAt: number;
   updatedAt: number;
   expiresAt: number;

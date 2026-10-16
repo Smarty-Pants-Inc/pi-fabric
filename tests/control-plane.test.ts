@@ -15,6 +15,7 @@ import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { createMainExecutionCeilingError } from "../src/async-settlement.js";
 import { removeHostLease, writeHostLease } from "../src/topology/host-leases.js";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
+import { FileControlReader, FileTransport } from "../src/transport/file.js";
 
 const roots: string[] = [];
 const planes: FabricControlPlane[] = [];
@@ -128,6 +129,94 @@ describe("saved steer/followUp ACK obligations (#9751)", () => {
     });
     return { release, spy, calls: () => calls, highWater: () => highWater };
   };
+
+  // Keep reason: the recorded #9751 custody regression needs native completion-error
+  // transparency, while E1 deliberately reconciles the generic send path differently.
+  it("9751: FILE native publish and generic send preserve definite pre-append errors and permit a real retry", async () => {
+    const f = setup(), transport = new FileTransport(f.mesh, { machine: "mesh", hostId: ownerId });
+    const publish = f.mesh.publish.bind(f.mesh);
+    const exactError = Object.assign(new Error("definite pre-append refusal"), { code: "FABRIC_MESH_LOCK_TIMEOUT" });
+    const native = { ...f.command("native-definite"), id: "native:definite" };
+    const generic = f.command("generic-definite");
+    const envelope = { id: "logical:definite", kind: "command" as const,
+      to: { machine: "mesh", hostId: ownerId }, targetId: "agent:same", operation: "steer",
+      from: generic.from, body: generic.data };
+    let refuse = true;
+    const spy = vi.spyOn(f.mesh, "publish").mockImplementation(async input => {
+      if (refuse) throw exactError; // No call-through: the native append has not begun.
+      return publish(input);
+    });
+    try {
+      await expect(transport.publish(native)).rejects.toBe(exactError);
+      await expect(transport.send(envelope)).rejects.toBe(exactError);
+      expect(spy).toHaveBeenCalledTimes(2);
+      expect(spy.mock.calls[0]![0].id).toBe(native.id);
+      const failedGenericId = spy.mock.calls[1]![0].id;
+      expect(failedGenericId).toEqual(expect.any(String));
+      expect(failedGenericId).not.toBe(envelope.id);
+      expect(f.mesh.read({ limit: 1_000 })).toEqual([]);
+
+      // Neither rejected operation may be reported as successful custody. Once the
+      // definite refusal clears, explicit retries must reach the real append once each.
+      refuse = false;
+      const nativeReceipt = await transport.publish(native);
+      const genericReceipt = await transport.send(envelope);
+      const events = f.mesh.read({ limit: 1_000 });
+      expect(spy).toHaveBeenCalledTimes(4);
+      expect(events).toHaveLength(2);
+      expect(events[0]).toEqual(nativeReceipt);
+      expect(nativeReceipt).toMatchObject({ id: native.id, data: native.data });
+      expect(events.filter(event => event.id === native.id)).toHaveLength(1);
+      const genericEvent = events[1]!;
+      expect(genericEvent.id).toBe(spy.mock.calls[3]![0].id);
+      expect(genericEvent.id).not.toBe(failedGenericId);
+      expect(genericEvent.id).not.toBe(envelope.id);
+      expect(genericEvent.data).toEqual(envelope.body);
+      expect(genericReceipt).toMatchObject({ id: envelope.id, sequence: genericEvent.sequence, duplicate: false,
+        envelope: { id: envelope.id, body: envelope.body } });
+    } finally { await transport.close(); }
+  });
+
+  it("9751: FILE native publish rejects the exact post-append error while generic send resolves the positive E1 sequence", async () => {
+    const f = setup(), transport = new FileTransport(f.mesh, { machine: "mesh", hostId: ownerId });
+    const publish = f.mesh.publish.bind(f.mesh), exactError = new Error("append completed, publisher completion failed");
+    const command = f.command("native-postappend"), stamp = vi.fn(() => command.data);
+    const native = { ...command, id: "native:postappend", data: stamp };
+    const generic = f.command("generic-postappend");
+    const envelope = { id: "logical:postappend", kind: "command" as const,
+      to: { machine: "mesh", hostId: ownerId }, targetId: "agent:same", operation: "steer",
+      from: generic.from, body: generic.data };
+    const appended: MeshEvent[] = [];
+    const spy = vi.spyOn(f.mesh, "publish").mockImplementation(async input => {
+      const event = await publish(input); // Real native append and positive receipt, not a fabricated event.
+      appended.push(event);
+      throw exactError;
+    });
+    try {
+      let nativeError: unknown;
+      await transport.publish(native).catch(error => { nativeError = error; });
+      // The identical call-through fault is NOT a native error for the generic E1 port.
+      const receipt = await transport.send(envelope);
+      const events = f.mesh.read({ limit: 1_000 });
+      expect(spy).toHaveBeenCalledTimes(2);
+      expect(events).toHaveLength(2);
+      expect(events).toEqual(appended);
+      expect(spy.mock.calls[0]![0].id).toBe(native.id);
+      expect(events[0]).toMatchObject({ id: native.id, data: command.data });
+      expect(events.filter(event => event.id === native.id)).toHaveLength(1);
+      expect(stamp).toHaveBeenCalledOnce();
+      const genericEvent = events[1]!;
+      expect(genericEvent.id).toBe(spy.mock.calls[1]![0].id);
+      expect(genericEvent.id).not.toBe(envelope.id);
+      expect(genericEvent.id).not.toBe(native.id);
+      expect(genericEvent.data).toEqual(envelope.body);
+      expect(genericEvent.sequence).toBeGreaterThan(0);
+      expect(receipt).toMatchObject({ id: envelope.id, sequence: genericEvent.sequence, duplicate: false,
+        envelope: { id: envelope.id, body: envelope.body } });
+      // A positive on-disk native event must not erase the publisher's completion error.
+      expect(nativeError).toBe(exactError);
+    } finally { await transport.close(); }
+  });
 
   it("9751: saved ACK backlog does not block ordered steer/followUp admission", async () => {
     const f = setup(), blocked = holdFirstAck(f), order: string[] = [];
@@ -501,9 +590,9 @@ describe("saved steer/followUp ACK obligations (#9751)", () => {
       } });
       await f.mesh.publish({ ...command, data: { ...command.data, ownerIncarnation: oldEpoch } });
     }
-    await f.mesh.publish(f.command("replay-cap:100", "agent:other"));
-    await f.mesh.publish(f.command("replay-cap:101", "agent:other"));
-    const tail = vi.spyOn(f.mesh, "tail");
+    const hundredth = await f.mesh.publish(f.command("replay-cap:100", "agent:other"));
+    const next = await f.mesh.publish(f.command("replay-cap:101", "agent:other"));
+    const tail = vi.spyOn(f.mesh, "tail"), drain = vi.spyOn(FileControlReader.prototype, "drain");
     vi.spyOn(fs, "watch").mockImplementation(() =>
       Object.assign(new EventEmitter(), { close: vi.fn(), unref: vi.fn() }) as unknown as fs.FSWatcher);
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
@@ -516,6 +605,11 @@ describe("saved steer/followUp ACK obligations (#9751)", () => {
       // 99 saved replays plus this fresh save prove the whole first page reached the SAME cap.
       expect(f.saved("replay-cap:100")).toMatchObject({ acceptance: { accepted: true } });
       expect(receive.mock.calls.map(([command]) => command.commandId)).toEqual(["replay-cap:100"]);
+      // The real call-through reader must commit the command that fills slot 100,
+      // not strand it behind a post-handler capacity check or commit the next input.
+      const reader = drain.mock.contexts[0] as FileControlReader;
+      expect(reader.mesh).toBe(f.mesh);
+      expect(reader.lastSequence).toBe(hundredth.sequence);
       expect(f.mesh.get(seenKey("replay-cap:101"), { fresh: true })).toBeUndefined();
       expect(f.saved("replay-cap:101")).toBeUndefined();
       // Strict pre-tail-page check: neither reading page two nor claiming its command is allowed.
@@ -528,17 +622,92 @@ describe("saved steer/followUp ACK obligations (#9751)", () => {
       expect(timeouts).toHaveBeenCalledTimes(timersAtCapacity); expect(vi.getTimerCount()).toBe(armedAtCapacity);
       expect(blocked.calls()).toBe(1);
       expect(receive.mock.calls.map(([command]) => command.commandId)).toEqual(["replay-cap:100"]);
+      expect(reader.lastSequence).toBe(hundredth.sequence);
       blocked.release.open();
       await vi.advanceTimersByTimeAsync(0);
       expect(f.acks()).toHaveLength(101);
       expect(f.acks().map(event => (event.data as { commandId: string }).commandId)).toEqual(
         Array.from({ length: 101 }, (_, index) => `replay-cap:${index + 1}`));
       expect(receive.mock.calls.map(([command]) => command.commandId)).toEqual(["replay-cap:100", "replay-cap:101"]);
+      expect(reader.lastSequence).toBeGreaterThanOrEqual(next.sequence);
       expect(f.saved("replay-cap:101")).toMatchObject({ acceptance: { accepted: true }, ownerIncarnation: f.owner.incarnation });
       expect(blocked.calls()).toBe(101); expect(blocked.highWater()).toBe(1);
     } finally {
       blocked.release.open();
       // Restore the timeout spy under the fake clock, before returning to real timers.
+      vi.restoreAllMocks(); vi.useRealTimers();
+    }
+  }, 15_000);
+
+  it("9751: full FILE ACK custody consumes same-page ACK, cancel and owned replay but retains the next new command", async () => {
+    const f = setup(), blocked = holdFirstAck(f), asking = gate();
+    let askSignal: AbortSignal | undefined, acknowledged = false;
+    const request = f.owner.request("host:9751-peer", "agent:peer", "steer", {
+      ownerIncarnation: fixtureOwnerIncarnation, message: "capacity ACK barrier",
+    }, "host:9751-peer");
+    void request.then(() => { acknowledged = true; }, () => undefined);
+    await until(() => expect(f.mesh.read({ topic: "fabric.control.command", limit: 1_000 })
+      .some(event => event.from.id === ownerId && (event.data as FabricControlCommand).message === "capacity ACK barrier")).toBe(true));
+    const outbound = f.mesh.read({ topic: "fabric.control.command", limit: 1_000 })
+      .find(event => event.from.id === ownerId && (event.data as FabricControlCommand).message === "capacity ACK barrier")!.data as FabricControlCommand;
+    const ask = f.command("same-page:ask");
+    await f.mesh.publish({ ...ask, kind: "ask", data: { ...ask.data, operation: "ask" } });
+    // Outbound barrier + detached ASK + 98 ACK obligations occupy page one.
+    // Page two enters below capacity, then fills it before the exempt events.
+    for (let index = 1; index <= 100; index++) await f.mesh.publish(f.command(`same-page:${index}`));
+    const ack = await f.mesh.publish({ topic: "fabric.control.ack", kind: "accepted", from: identity("host:9751-peer"), to: ownerId,
+      data: { version: 1, commandId: outbound.commandId, targetId: outbound.targetId, ownerIncarnation: fixtureOwnerIncarnation,
+        accepted: true, messageId: "same-page-ack" } });
+    const cancel = f.command("same-page:cancel");
+    const cancellation = await f.mesh.publish({ ...cancel, kind: "cancel", data: {
+      ...cancel.data, operation: "cancel", cancelCommandId: "same-page:ask",
+    } });
+    const owned = await f.mesh.publish(f.command("same-page:100"));
+    const next = await f.mesh.publish(f.command("same-page:101"));
+    const tail = vi.spyOn(f.mesh, "tail"), drain = vi.spyOn(FileControlReader.prototype, "drain");
+    vi.spyOn(fs, "watch").mockImplementation(() =>
+      Object.assign(new EventEmitter(), { close: vi.fn(), unref: vi.fn() }) as unknown as fs.FSWatcher);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const receive = vi.fn((command: FabricControlCommand, _from: MeshIdentity, signal: AbortSignal) => {
+      if (command.operation === "ask") {
+        askSignal = signal;
+        return asking.promise.then(() => ({ accepted: true, messageId: command.commandId }));
+      }
+      return { accepted: true, messageId: command.commandId };
+    });
+    f.owner.start(receive);
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      expect(f.saved("same-page:100")).toMatchObject({ acceptance: { accepted: true } });
+      expect(blocked.calls()).toBe(1);
+      expect(f.acks()).toEqual([]);
+      // Positive public effects: the actual ACK verifier settled a pending request,
+      // and the actual cancellation path aborted the still-running ASK handler.
+      expect(acknowledged).toBe(true);
+      await expect(request).resolves.toMatchObject({ acknowledged: true, messageId: "same-page-ack" });
+      expect(askSignal).toBeDefined(); expect(askSignal!.aborted).toBe(true);
+      const reader = drain.mock.contexts[0] as FileControlReader;
+      expect(reader.mesh).toBe(f.mesh);
+      expect(reader.lastSequence).toBe(owned.sequence);
+      expect(tail.mock.results.some(result => result.type === "return" &&
+        [ack.id, cancellation.id, owned.id, next.id].every(id => result.value.events.some((event: MeshEvent) => event.id === id)))).toBe(true);
+      expect(receive.mock.calls.map(([command]) => command.commandId)).toEqual([
+        "same-page:ask", ...Array.from({ length: 100 }, (_, index) => `same-page:${index + 1}`),
+      ]);
+      expect(f.mesh.get(seenKey("same-page:101"), { fresh: true })).toBeUndefined();
+      expect(f.saved("same-page:101")).toBeUndefined();
+      blocked.release.open();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(receive.mock.calls.map(([command]) => command.commandId)).toEqual([
+        "same-page:ask", ...Array.from({ length: 101 }, (_, index) => `same-page:${index + 1}`),
+      ]);
+      expect(f.saved("same-page:101")).toMatchObject({ acceptance: { accepted: true } });
+      expect(f.acks()).toHaveLength(101);
+      expect(f.acks("same-page:100")).toHaveLength(1);
+      expect(reader.lastSequence).toBeGreaterThanOrEqual(next.sequence);
+      expect(blocked.calls()).toBe(101); expect(blocked.highWater()).toBe(1);
+    } finally {
+      asking.open(); blocked.release.open();
       vi.restoreAllMocks(); vi.useRealTimers();
     }
   }, 15_000);

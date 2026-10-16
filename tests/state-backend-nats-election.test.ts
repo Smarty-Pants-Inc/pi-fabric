@@ -3,9 +3,10 @@ import path from "node:path";
 import type { Consumer, ConsumerAPI, ConsumerInfo, Consumers } from "@nats-io/jetstream";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { importMeshStateToNats } from "../src/mesh/backend-migration-nats.js";
-import { closeNatsStateBackend, MeshStateNatsUnavailableError, natsStreamName, openNatsStateBackend, type JetStreamPort } from "../src/mesh/state-backend-nats.js";
+import { closeNatsStateBackend, MeshStateNatsOutcomeUnknownError, MeshStateNatsUnavailableError, natsStreamName, openNatsStateBackend, type JetStreamPort } from "../src/mesh/state-backend-nats.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { startNatsElectionCluster, stopNatsElectionCluster, type NatsElectionCluster } from "./helpers/nats-election-cluster.js";
+import { waitForNatsConsumerReady } from "./helpers/nats-consumer-ready.js";
 
 const binary = process.env.NATS_BIN?.trim();
 const identity: MeshIdentity = { id: "election-test", name: "election-test", kind: "agent" };
@@ -17,6 +18,18 @@ afterEach(async () => {
   }
 });
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+const waitForStopped = async (child: { pid?: number | undefined }, deadline: number): Promise<void> => {
+  if (process.platform !== "linux" || child.pid === undefined) return;
+  while (Date.now() < deadline) {
+    try {
+      const stat = fs.readFileSync(`/proc/${child.pid}/stat`, "utf8");
+      const state = stat.slice(stat.lastIndexOf(")") + 2, stat.lastIndexOf(")") + 3);
+      if (state === "T" || state === "t") return;
+    } catch { /* the owned child is still transitioning; the bounded deadline is the safety net */ }
+    await new Promise<void>(resolve => setImmediate(resolve));
+  }
+  throw new Error(`owned NATS child ${child.pid} did not report stopped before first NEXT`);
+};
 const streamInfo = async (seed: string, stream: string) => {
   const [{ connect }, { jetstreamManager }] = await Promise.all([import("@nats-io/transport-node"), import("@nats-io/jetstream")]);
   const nc = await connect({ servers: [seed], ignoreClusterUpdates: true });
@@ -150,6 +163,9 @@ describe("real three-node NATS metadata-leader election", () => {
             pausedAt = performance.now();
             resumeTimer = setTimeout(resume, 6_000); // One finite fault duration; finally also resumes on failed assertions.
             expect(host!.child.kill("SIGSTOP"), "owned R1 receiver SIGSTOP").toBe(true);
+            // SIGSTOP's kill() return only queues the signal. Wait for the owned child to report state T before
+            // allowing the original consume() to issue its first NEXT; this is the event under test, not a sleep.
+            await waitForStopped(host!.child, Date.now() + 1_000);
             faultArmed.resolve();
           }
         }
@@ -164,13 +180,23 @@ describe("real three-node NATS metadata-leader election", () => {
       let gets = 0;
       port.getMessage = (...args: Parameters<JetStreamPort["getMessage"]>) => { gets++; return get(...args); };
       const consume = port.consume.bind(port);
-      port.consume = (stream, after, onMessage, onError) => consume(stream, after, message => {
-        onMessage(message);
-        if (stream === faultStream && message.seq <= 3) {
-          received.push(message.seq);
-          if (received.length === 3) lateHistory.resolve();
+      port.consume = async (stream, after, onMessage, onError) => {
+        const subscription = await consume(stream, after, message => {
+          onMessage(message);
+          if (stream === faultStream && message.seq <= 3) {
+            received.push(message.seq);
+            if (received.length === 3) lateHistory.resolve();
+          }
+        }, onError);
+        // Empty seed opens have no bootstrap history to wait for. Observe their real pending NEXT before the first
+        // setup publish; otherwise a not-yet-routed first pull can consume the entire write budget under load.
+        // The faulting reopen deliberately bypasses this readiness gate: its original receiver is stopped.
+        if (stream !== faultStream) {
+          const created = [...creates].reverse().find(info => info.stream_name === stream)!;
+          await waitForNatsConsumerReady(cluster.seedUrl, stream, created.name);
         }
-      }, onError);
+        return subscription;
+      };
       const close = port.close.bind(port);
       let closing: Promise<void> | undefined;
       port.close = () => closing ??= close();
@@ -242,8 +268,30 @@ describe("real three-node NATS metadata-leader election", () => {
         expect(backend.diagnostics().nats?.failure).toBeUndefined();
         expect((await faultConsumer!.info(false)).name).toBe(faultInfo!.name);
         expect((await manager.consumers.info(faultStream!, faultInfo!.name)).created).toBe(faultInfo!.created);
+        // SIGCONT and late history delivery do not mean the paused R3 replica is current yet. Wait for the
+        // stream's real replica recovery before the post-recovery CAS (the bootstrap budget stays 5s).
+        await expect.poll(async () => {
+          const info = await manager.streams.info(faultStream!);
+          return !!info.cluster?.leader && info.cluster?.replicas?.every(peer => peer.current && !peer.offline) === true;
+        }, { timeout: 15_000, interval: 100 }).toBe(true);
         const entry = expected[0]!;
-        await backend.put({ key: entry.key, ifVersion: entry.version, value: { resumed: true }, identity });
+        for (let attempt = 0; attempt < 2; attempt++) {
+          try {
+            await backend.put({ key: entry.key, ifVersion: entry.version, value: { resumed: true }, identity });
+            break;
+          } catch (error) {
+            if (!(error instanceof MeshStateNatsOutcomeUnknownError) || attempt === 1) throw error;
+            // The publish may have committed before its ACK was lost. Follow the documented contract: wait for the
+            // projector's real applied==known event, re-read, and only write again when the old value is still there.
+            const head = (await manager.streams.info(faultStream!)).state.last_seq;
+            await expect.poll(() => {
+              const nats = backend.diagnostics().nats;
+              return nats !== undefined && nats.appliedSeq >= head && nats.appliedSeq === nats.knownSeq && nats.resyncing === false;
+            }, { timeout: 15_000, interval: 50 }).toBe(true);
+            const reread = backend.get(entry.key);
+            if (reread?.version !== entry.version || JSON.stringify(reread.value) !== JSON.stringify(entry.value)) break;
+          }
+        }
         expect(backend.get(entry.key)).toMatchObject({ value: { resumed: true }, version: entry.version + 1 });
         expect(backend.diagnostics().nats).toMatchObject({ appliedSeq: 4, knownSeq: 4 });
         expect(creates.filter(info => info.stream_name === faultStream)).toHaveLength(2);

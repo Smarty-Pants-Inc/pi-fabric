@@ -87,8 +87,6 @@ const HOST_PREFIX = "topology/hosts/";
 const LINEAGE_CLOSURE_PREFIX = "topology/lineage-closures/";
 const LEGACY_SESSION_PREFIX = "sessions/";
 const LEGACY_ACTOR_PREFIX = "actors/";
-// smarty-dev#7978: the shared namespaces each derived peer answer reads (its participant-scoped change signal).
-const LEGACY_RENEWAL_PREFIXES = [HOST_PREFIX, LEGACY_SESSION_PREFIX, PARTICIPANT_PREFIX] as const;
 // list() (the root-collision report) also reads the legacy actor records.
 const ROOT_COLLISION_PREFIXES = [HOST_PREFIX, PARTICIPANT_PREFIX, LEGACY_SESSION_PREFIX, LEGACY_ACTOR_PREFIX] as const;
 const PARTICIPANT_HEARTBEAT_MS = 5_000;
@@ -796,13 +794,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
   #withdrawalPending = false;
   #withdrawalWarned = false;
   #exitHook: (() => void) | undefined;
-  /**
-   * smarty-dev#7978: an idle heartbeat derived these two answers from an unchanged fleet several times a
-   * pass, each a full read of every host, session and participant entry. Each is reused only while its
-   * change signals (state snapshot, participant files, peer leases) are unchanged, and is recomputed at
-   * least once per lease period (#leaseMs), the safety net of the existing heartbeat timer.
-   */
-  #legacyRenewals: (PeerSignals & { required: boolean; until: number }) | undefined;
+  /** Root-collision observations reuse unchanged peer signals for at most one lease period. */
   #rootCollisionPass: (PeerSignals & { local: string }) | undefined;
 
   constructor(
@@ -967,7 +959,6 @@ export class ParticipantDirectory implements FabricParticipantSource {
     }
     // Restarting this directory is activation too, even if its last local view held a root.
     if (this.#closed) this.#localRecords.delete(this.options.rootId);
-    this.#legacyRenewals = undefined;
     this.#rootCollisionPass = undefined;
     this.#closed = false;
     this.#refreshError = undefined;
@@ -3042,38 +3033,13 @@ export class ParticipantDirectory implements FabricParticipantSource {
     return { token, entries: this.#peerEntries(token, ROOT_COLLISION_PREFIXES), files, leases, local, at: now, checkedAt };
   }
 
-  /**
-   * No operator switch needed: a live older reader makes us dual-renew again.
-   * smarty-dev#7978: one idle heartbeat asks this up to three times, and each answer was a full read of
-   * every host, session and participant entry (JSON copies of the pinned snapshot, or for the unpinned
-   * call a full SQLite scan). The answer is now read from the canonical snapshot without copies and
-   * reused while its change signals are unchanged: a `true` until the live old reader that proved it
-   * lapses (expiry needs no change event), a `false` for any later time (expiry only removes readers),
-   * and either for at most one lease period.
-   */
+  /** A live older reader makes us dual-renew again; lease authority is checked on every call. */
   #legacyRenewalsRequired(now: number, snapshot?: object): boolean {
-    if (typeof this.mesh.stateToken !== "function" || typeof this.mesh.listAllShared !== "function") {
-      const read = snapshot ? { snapshot } : {};
-      return this.#legacyRenewalsScan(now, readHostLeases(this.mesh.root), (prefix) => this.mesh.listAll(prefix, read),
-        this.#participantFiles(read)).required;
-    }
-    // Unpinned: the current canonical snapshot, the same exact read an unpinned listAll made.
-    const token = snapshot ?? this.mesh.stateToken();
-    const read = { snapshot: token };
-    const files = this.#participantFiles(read);
-    const leases = readHostLeases(this.mesh.root);
-    const checkedAt = Date.now();
-    const memo = this.#legacyRenewals;
-    if (memo && memo.files === files && samePeerLeases(memo.leases, leases, this.options.hostId) &&
-      checkedAt >= memo.checkedAt && checkedAt - memo.checkedAt < this.#leaseMs &&
-      (memo.required ? now <= memo.until : now >= memo.at) &&
-      this.#samePeerState(memo, token, LEGACY_RENEWAL_PREFIXES)) return memo.required;
-    // Read-only: hostFromEntry/participantFromEntry/isLiveLegacyRootEntry only inspect the entries, and
-    // #liveHosts and mergeParticipantEntries build new containers, so the shared entries need no copy.
-    const result = this.#legacyRenewalsScan(now, leases, (prefix) => this.mesh.listAllShared(prefix, read), files);
-    this.#legacyRenewals = { token, entries: this.#peerEntries(token, LEGACY_RENEWAL_PREFIXES), files, leases,
-      at: now, checkedAt, ...result };
-    return result.required;
+    const shared = typeof this.mesh.stateToken === "function" && typeof this.mesh.listAllShared === "function";
+    const token = snapshot ?? (shared ? this.mesh.stateToken() : undefined);
+    const read = token ? { snapshot: token } : {};
+    return this.#legacyRenewalsScan(now, (prefix) => shared
+      ? this.mesh.listAllShared(prefix, read) : this.mesh.listAll(prefix, read), this.#participantFiles(read));
   }
 
   /** The shared entries of `prefixes` in the snapshot `token`, uncopied (read-only). */
@@ -3097,29 +3063,34 @@ export class ParticipantDirectory implements FabricParticipantSource {
     return true;
   }
 
-  /** The scan behind #legacyRenewalsRequired; `until` is when the old reader that answered true lapses. */
-  #legacyRenewalsScan(now: number, leases: ReadonlyMap<string, FabricHostLease>,
-    list: (prefix: string) => readonly MeshStateEntry[], files: readonly MeshStateEntry[],
-  ): { required: boolean; until: number } {
-    const hosts = this.#liveHosts(list(HOST_PREFIX), leases);
-    for (const host of hosts.values()) {
-      if (host.id !== this.options.hostId && host.remoteHost === undefined &&
-        host.expiresAt >= now && host.livenessLeaseFiles !== 1) return { required: true, until: host.expiresAt };
-    }
-    for (const entry of list(LEGACY_SESSION_PREFIX)) {
-      if (entry.updatedBy.id !== this.options.identity.id && isLiveLegacyRootEntry(entry, now, this.mesh.root) &&
-        (!isObject(entry.value) || entry.value.livenessLeaseFiles !== 1)) {
-        return { required: true, until: sessionLiveness(entry, this.mesh.root).expiresAt };
-      }
+  /** Select potential legacy owners BEFORE expiry: a renewed file can revive a lapsed shared host. */
+  #legacyRenewalsScan(now: number, list: (prefix: string) => readonly MeshStateEntry[],
+    files: readonly MeshStateEntry[],
+  ): boolean {
+    const hosts = new Map<string, FabricHostRecord>();
+    const owners = new Set<string>();
+    for (const entry of list(HOST_PREFIX)) {
+      const host = hostFromEntry(entry);
+      if (!host) continue;
+      hosts.set(host.id, host);
+      if (host.id !== this.options.hostId && host.remoteHost === undefined && host.livenessLeaseFiles !== 1) owners.add(host.id);
     }
     for (const entry of mergeParticipantEntries(files, list(PARTICIPANT_PREFIX)).entries) {
       const peer = participantFromEntry(entry);
       const owner = peer && hosts.get(peer.ownerHostId);
       if (peer && peer.ownerHostId !== this.options.hostId && peer.remoteHost === undefined &&
-        owner && owner.expiresAt >= now && owner.identity.id === peer.ownerIdentityId &&
-        owner.rootId === peer.rootId && peer.livenessLeaseFiles !== 1) return { required: true, until: owner.expiresAt };
+        owner && owner.identity.id === peer.ownerIdentityId && owner.rootId === peer.rootId &&
+        peer.livenessLeaseFiles !== 1) owners.add(owner.id);
     }
-    return { required: false, until: Number.POSITIVE_INFINITY };
+    for (const id of owners) {
+      const lease = readHostLease(this.mesh.root, id);
+      if (hostLeaseExpiry(lease ? new Map([[id, lease]]) : new Map(), hosts.get(id)!) >= now) return true;
+    }
+    for (const entry of list(LEGACY_SESSION_PREFIX)) {
+      if (entry.updatedBy.id !== this.options.identity.id && isLiveLegacyRootEntry(entry, now, this.mesh.root) &&
+        (!isObject(entry.value) || entry.value.livenessLeaseFiles !== 1)) return true;
+    }
+    return false;
   }
 
   // Whether a participant's owner host is live now, by a fresh read: its shared host record (not

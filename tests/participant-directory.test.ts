@@ -675,6 +675,76 @@ describe("ParticipantDirectory host leases", () => {
   const alphaBatches = (spy: { mock: { calls: unknown[][] } }) =>
     spy.mock.calls.filter((call) => (call[0] as { identity: MeshIdentity }).identity.id === "session:alpha").length;
 
+  // Keep reason: migration must not trust a lease without the exact shared participant owner.
+  it("does not let a missing or mismatched legacy participant owner veto files-only publication", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-legacy-owner-"));
+    roots.push(root);
+    const meshRoot = path.join(root, "mesh");
+    const self = identityOf("observer");
+    const peer = identityOf("legacy-participant");
+    const directory = createDirectory(meshRoot, self, self.id,
+      () => [rootRecord(self.id, self.id, "observer")], steadyLease);
+    const mesh = directory.mesh;
+    await mesh.put({ key: LIVENESS_POLICY_KEY, value: { version: 1, participants: "files" }, identity: self });
+    const hostKey = "topology/hosts/" + createHash("sha256").update(peer.id).digest("hex");
+    const participantKey = "topology/participants/" + createHash("sha256").update(peer.id).digest("hex");
+    const selfKey = "topology/participants/" + createHash("sha256").update(self.id).digest("hex");
+    const now = Date.now();
+    const host = { format: 1, id: peer.id, rootId: peer.id, identity: peer, startedAt: 1,
+      updatedAt: now - 60_000, expiresAt: now - 30_000, livenessLeaseFiles: 1 };
+    const participant = rootRecord(peer.id, peer.id, "legacy-participant");
+    writeHostLease(meshRoot, { id: peer.id, rootId: peer.id, identityId: peer.id,
+      startedAt: 1, updatedAt: now, expiresAt: now + steadyLease.leaseMs });
+    const pass = async () => { await directory.refresh(); return mesh.get(selfKey, { fresh: true }) !== undefined; };
+    await mesh.put({ key: participantKey, value: participant, identity: peer });
+    expect(await pass()).toBe(false);
+    await mesh.put({ key: hostKey, value: host, identity: peer });
+    for (const patch of [{ rootId: "wrong-root" }, { ownerIdentityId: "wrong-identity" }, { ownerHostId: "missing-host" }]) {
+      await mesh.put({ key: participantKey, value: { ...participant, ...patch }, identity: peer });
+      expect(await pass(), JSON.stringify(patch)).toBe(false);
+    }
+    await mesh.put({ key: participantKey, value: participant, identity: peer });
+    writeHostLease(meshRoot, { id: peer.id, rootId: peer.id, identityId: peer.id,
+      startedAt: 2, updatedAt: now, expiresAt: now + steadyLease.leaseMs });
+    expect(await pass()).toBe(false);
+    writeHostLease(meshRoot, { id: peer.id, rootId: peer.id, identityId: peer.id,
+      startedAt: 1, updatedAt: now, expiresAt: now + steadyLease.leaseMs });
+    expect(await pass()).toBe(true);
+  });
+
+  it("keeps legacy-session TTL and attribution checks independent of owner lease selection", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-legacy-session-"));
+    roots.push(root);
+    const meshRoot = path.join(root, "mesh");
+    const self = identityOf("observer");
+    const peer = identityOf("session-only");
+    const directory = createDirectory(meshRoot, self, self.id,
+      () => [{ ...rootRecord(self.id, self.id, "observer"), kind: "agent" }], steadyLease);
+    const mesh = directory.mesh;
+    await mesh.put({ key: LIVENESS_POLICY_KEY, value: { version: 1, participants: "files" }, identity: self });
+    const selfKey = "topology/participants/" + createHash("sha256").update(self.id).digest("hex");
+    let now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+    try {
+      const value = { id: peer.id, sessionId: "session-only", cwd: root, startedAt: 1, status: "idle" };
+      await mesh.put({ key: "sessions/session-only", value, identity: peer });
+      const pass = async () => { await directory.refresh(); return mesh.get(selfKey, { fresh: true }) !== undefined; };
+      expect(await pass()).toBe(true);
+      writeHostLease(meshRoot, { id: peer.id, rootId: peer.id, identityId: peer.id,
+        updatedAt: now, expiresAt: now + 120_000, session: { id: value.sessionId, startedAt: 1,
+          updatedAt: now, expiresAt: now + 120_000 } });
+      now += 15_001;
+      expect(await pass()).toBe(false);
+      await mesh.put({ key: "sessions/session-only", value, identity: self });
+      expect(await pass()).toBe(false);
+      await mesh.put({ key: "sessions/session-only", value: { ...value, livenessLeaseFiles: 1 }, identity: peer });
+      const stats = vi.spyOn(fs, "statSync");
+      expect(await pass()).toBe(false);
+      expect(stats.mock.calls.some(([file]) => String(file) === hostLeasePath(meshRoot, peer.id))).toBe(true);
+      stats.mockRestore();
+    } finally { clock.mockRestore(); }
+  });
+
   it("keeps half-TTL state renewals for an advertising state-only peer", async () => {
     const { meshRoot, store, hostEntry } = await setup(false);
     const identity = identityOf("legacy-reader");

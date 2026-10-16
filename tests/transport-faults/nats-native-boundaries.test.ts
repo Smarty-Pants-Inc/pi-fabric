@@ -16,11 +16,11 @@ import { openNatsKv, type NatsKvStore } from "../../src/transport/nats/kv.js";
 import { transportDurableName, transportInboxFilter, transportInboxStream } from "../../src/transport/nats/subjects.js";
 import { MeshStore } from "../../src/mesh/store.js";
 import { DEFAULT_FABRIC_CONFIG } from "../../src/config.js";
-import { runTreeResourceVeto } from "../../src/storage/retention.js";
+import { runTreeResourceVeto, canRemoveTerminalRun } from "../../src/storage/retention.js";
 import type { CompletionEnvelope } from "../../src/agents/completion-journal.js";
 import { residentHostId } from "../../src/residency/protocol.js";
 
-/** E4 B5 composition check; keep: native custody trust boundary + data safety.
+/** E4 B4/B5 composition check; keep: native custody trust boundary + data safety.
  * Main uses the actual source FabricRuntimeState.initialize with a real native Pi
  * context and host bootstrap. Durable spawn uses its production registry/provider,
  * client, compiled launcher, ResidentHost.start, manager and worker. Only inference
@@ -305,6 +305,218 @@ afterEach(async () => {
   if (failure) { roots.splice(0); throw failure; } // Retain evidence if any child failed to join.
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 }, 90_000);
+
+/** Root-public trace: FabricRuntimeState.initialize constructs the session
+ * AgentManager and real ResidencyClient/CompletionJournal/AgentCompletionInbox;
+ * registry agents.spawn -> AgentsProvider derives native attribution and chooses
+ * that manager for residency:session. Its NATS taskPresence admission remains
+ * real. The fixture observes production save/launch/close, injecting only one
+ * named handle.stop failure; it never supplies exit, status or receipt results.
+ */
+describe.skipIf(!HOSTED_PRODUCT_DELETE)("HOSTED AUTHOR-ONLY E4 native NATS B4 — actual session root result/exit custody", () => {
+  for (const mode of ["i", "ii", "iii"] as const) {
+    it(`B4(${mode}): native result, exact-parent inbox, and independently fenced worker exit`, async ctx => {
+      const transport = await broker(ctx); if (!transport) throw new Error("missing broker fixture");
+      const { h, leases, presence, manager, noCompletionCarrier } = transport;
+      const cli = path.join(REPO, "node_modules/@earendil-works/pi-coding-agent/dist/cli.js");
+      if (!fs.existsSync(cli)) throw new Error("Pinned native Pi CLI is missing; not an optional broker skip");
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-nats-native-b4-")); roots.push(root);
+      fs.mkdirSync(path.join(root, "runs"), { mode: 0o700 });
+      const model = await loopback(root); const log = launchLog(root); logs.push(log);
+      const nats = { replicas: 1, servers: [h.serverUrl], machine: "machine-a", credentials: h.users.machineA.credsPath,
+        operatorMachine: "fabric-ops", inboxLanes: 8 };
+      fs.writeFileSync(path.join(root, "nats-settings.json"), JSON.stringify(nats), { mode: 0o600 });
+      const env: NodeJS.ProcessEnv = { ...process.env, ...log.env, PI_CODING_AGENT_DIR: model.agent,
+        PI_FABRIC_NODE_BINARY: process.execPath, PI_FABRIC_PI_BINARY: cli, PI_FABRIC_MESH_ROOT: path.join(root, "mesh"),
+        PI_FABRIC_PROJECT_ROOT: root, PI_FABRIC_MESH_TRANSPORT: "nats", PI_FABRIC_MESH_HOST_TRANSPORT: "nats",
+        PI_FABRIC_MESH_STATE_BACKEND: "file", PI_FABRIC_MESH_NATS: JSON.stringify(nats),
+        PI_FABRIC_MACHINE: "machine-a", PI_FABRIC_NATS_SERVERS: h.serverUrl, PI_FABRIC_NATS_CREDENTIALS: h.users.machineA.credsPath,
+        VITE_CACHE_DIR: path.join(REPO, ".local/cache/vite"), XDG_CACHE_HOME: path.join(REPO, ".local/cache/xdg"),
+        npm_config_cache: path.join(REPO, ".local/cache/npm"), PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", FABRIC_NATIVE_BOUNDARY_ROOT: root,
+        PI_FABRIC_RUN_ROOT: path.join(root, "runs"), PI_FABRIC_SESSION_ID: "" };
+      const rpc = new NativeRpc(root, env, cli);
+      const ready = await observeJson(path.join(root, "nats-completion-ready.json"), row => row.pid === rpc.child.pid);
+      expect(ready).toMatchObject({ carrier: "nats", hostTransport: "nats", stateBackend: "file", observationHealth: [] });
+      await rpc.request({ type: "prompt", message: "Persist this exact B4 native parent session." }); await rpc.settled();
+      const state = await rpc.request({ type: "get_state" });
+      expect(state.sessionId).toBe(ready.sessionId); expect(typeof state.sessionFile).toBe("string");
+      const parentBirth = identity(log, rpc.child.pid!); const hostId = ready.main.id as string;
+      expect((await leases.get<Record<string, any>>(`machine-a.h.${token(hostId)}`))?.value)
+        .toMatchObject({ id: hostId, pid: parentBirth.pid, pidStartTime: parentBirth.started });
+      const consumer = await manager.consumers.info(transportInboxStream("machine-a"), transportDurableName(hostId));
+      expect(consumer.config.filter_subject).toBe(transportInboxFilter("machine-a", hostId));
+      await noCompletionCarrier();
+      model.holdNext();
+      await rpc.request({ type: "prompt", message: `/native-nats-b4-spawn ${mode}` });
+      const admission = await observeJson(path.join(root, `nats-b4-spawn-${mode}.json`));
+      const id = admission.handle.id as string; const run = admission.run as string;
+      await model.requestAt(1);
+      const workerBirth = assertLocal(run, log);
+      expect(json(path.join(run, "status.json")).processStartTime).toBe(workerBirth.started);
+      const manifest = json(path.join(run, "completion-recipient.json"));
+      expect(manifest).toMatchObject({ meshRoot: path.join(root, "mesh"),
+        recipient: { rootId: hostId, sessionId: state.sessionId, cwd: root, projectRoot: root }, supervisor: { pid: parentBirth.pid } });
+      expect(manifest.recipient.name).toEqual(expect.stringMatching(/\S/));
+      expect(manifest.recipient.startedAt).toBeGreaterThan(0);
+      expect((await presence.get<Record<string, any>>(`machine-a.p.${token(id)}`))?.value)
+        .toMatchObject({ id, ownerHostId: hostId });
+      expect(fs.existsSync(path.join(run, "final-answer.json"))).toBe(false);
+      fs.writeFileSync(path.join(root, "independent-births.json"), JSON.stringify({ parentBirth, workerBirth }));
+      const directory = path.join(manifest.meshRoot, "agent-completions");
+      const name = `${digest(id)}.json`; const envelopeFile = path.join(directory, name);
+      const receiptFile = path.join(directory, "receipts", name); const archiveFile = path.join(directory, "archive", name);
+      const command = (name: string, args = "") => rpc.request({ type: "prompt", message: `/${name}${args ? ` ${args}` : ""}` });
+      const status = async (target: string) => {
+        await command("native-nats-b4-status", target);
+        return json(path.join(root, "nats-b4-status.json"));
+      };
+      let successor: Record<string, any> | undefined;
+      try {
+        if (mode === "i") {
+          // Kill BEFORE finality; explicit stop records operator intent and
+          // forbids startup retry. It does not consume the native inbox result.
+          killRecorded(log, workerBirth.pid);
+          await command("native-nats-b4-stop", id);
+        } else {
+          await command("native-nats-b4-spawn", "successor");
+          successor = await observeJson(path.join(root, "nats-b4-spawn-successor.json"));
+          expect(successor.handle.status).toBe("queued");
+          model.release(1);
+          const held = await observeJson(path.join(root, "nats-b4-worker-exit-gate.json"), row => row.runId === id && row.pid === workerBirth.pid);
+          const answer = json(path.join(run, "final-answer.json"));
+          expect(held.receiptId).toBe(answer.id);
+        }
+        const witnesses = await observe(root, () => {
+          const found = rows(path.join(root, "nats-b4-settlements.jsonl")).filter(row => row.result.id === id);
+          return found.length ? found : undefined;
+        }, "root onSettled production journal save");
+        const witness = witnesses[0]!; const source = witness.source as CompletionEnvelope;
+        expect(witness.envelopes).toEqual([name]);
+        expect(source.recipient).toEqual(manifest.recipient);
+        expect(source.result).toMatchObject({ id, mainAgentId: hostId, fabricSessionId: state.sessionId,
+          spawner: { id: hostId, kind: "main" } });
+        expect(source.result.status).toBe(witness.result.status);
+        expect(source.result.name).toEqual(expect.stringMatching(/\S/));
+        if (mode === "i") {
+          expect(["failed", "timed_out", "stopped"]).toContain(source.result.status);
+          expect(source.result.finalAnswerReceipt).toBeUndefined();
+          expect(fs.existsSync(path.join(run, "final-answer.json"))).toBe(false);
+          expect(witness.veto === null || typeof witness.lostContact === "string" && /\S/.test(witness.lostContact)).toBe(true);
+        } else {
+          const answer = json(path.join(run, "final-answer.json"));
+          expect(source.result).toMatchObject({ status: "completed", text: answer.text, finalAnswerReceipt: { id: answer.id } });
+          expect(answer.id).toEqual(expect.stringMatching(/\S/)); expect(answer.text).toEqual(expect.stringMatching(/\S/));
+          expect(same(workerBirth)).toBe(true);
+          expect(canRemoveTerminalRun(run)).toBe(false);
+          expect(runTreeResourceVeto(run, 0, undefined, true, true)).toBeDefined();
+          expect((await status(successor!.handle.id)).status.status).toBe("queued");
+          expect(rows(path.join(root, "nats-b4-launches.jsonl")).some(row => row.id === successor!.handle.id)).toBe(false);
+          if (mode === "ii") {
+            expect(runTreeResourceVeto(run, 0, undefined, true, true)).toMatch(/root worker may still be running/);
+            const live = await status(id);
+            expect(live).toMatchObject({ primaryClosed: false, retained: true, collectible: false });
+            expect(live.status.lostContact).toBeUndefined();
+            // Keep FILE's narrow kill point inside the native EOF grace; inbox
+            // delivery/order checks below need not delay this real close.
+            killRecorded(log, workerBirth.pid);
+          } else {
+            const failures = await observe(root, () => {
+              const found = rows(path.join(root, "nats-b4-stop-failures.jsonl")).filter(row => row.id === id);
+              return found.length ? found : undefined;
+            }, "named actual transport stop failure");
+            expect(failures[0]).toMatchObject({ seam: "E4_STOP_FAIL_KEEP_WORKER_ALIVE", pid: workerBirth.pid,
+              birth: { pid: workerBirth.pid, started: workerBirth.started }, statusSessionId: String(workerBirth.pid),
+              alive: true, gate: { pid: workerBirth.pid, runId: id, receiptId: source.result.finalAnswerReceipt!.id },
+              placementAbsent: true, unresolved: false });
+            expect(failures[0]!.veto).toMatch(/root worker may still be running/);
+            const marker = await observeJson(path.join(run, "unresolved-worker.json"));
+            expect(marker.reason).toContain("unconfirmed");
+            const lost = await status(id);
+            expect(lost).toMatchObject({ status: { status: "completed" }, primaryClosed: false, collectible: false, retained: true });
+            expect(lost.status.lostContact).toEqual(expect.stringMatching(/\S/));
+            expect(same(workerBirth)).toBe(true);
+          }
+        }
+        // All three cases deliver via the actual root's native inbox. Do not
+        // use agents.wait/status registry actions to manufacture consumption.
+        await observe(directory, () => fs.existsSync(receiptFile) ? json(receiptFile) : undefined, "B4 native inbox receipt");
+        await observe(directory, () => fs.existsSync(archiveFile) && !fs.existsSync(envelopeFile) ? true : undefined, "B4 archive after receipt");
+        await command("native-nats-completion-checkpoint");
+        const receipt = json(receiptFile);
+        expect(receipt).toMatchObject({ id, sessionId: state.sessionId }); expect(receipt.consumedAt).toBeGreaterThan(0);
+        expect(json(archiveFile)).toEqual(source);
+        expect(json(path.join(run, "manager-result.json"))).toMatchObject({ id, status: source.result.status });
+        const delivered = () => rows(path.join(root, "nats-completion-delivered.jsonl")).filter(row => row.id === id);
+        const enqueued = () => rows(path.join(root, "nats-completion-enqueued.jsonl")).filter(row => row.result.id === id);
+        expect(delivered()).toHaveLength(1); expect(enqueued()).toHaveLength(1);
+        expect(enqueued()[0]).toMatchObject({ pid: rpc.child.pid, sessionId: state.sessionId, result: { id, status: source.result.status } });
+        const carriers = () => rows(state.sessionFile).filter(row => row.type === "custom_message" &&
+          row.customType === "pi-fabric-agent-complete" && row.details?.ids?.includes(id));
+        expect(carriers()).toHaveLength(1);
+        const order = rows(path.join(root, "nats-completion-order.jsonl")).filter(row => row.receipt.id === id);
+        expect(order.length).toBeGreaterThan(0);
+        expect(order[0]).toMatchObject({ pid: rpc.child.pid, event: "before-archive", receipt, source,
+          claim: { key: `residency/completion-claims/${digest(id)}`, updatedBy: { id: hostId },
+            value: { rootId: hostId, sessionId: state.sessionId } } });
+        expect(order[0]!.bodySyncSequence).toBeGreaterThan(0);
+        expect(order[0]!.bodySyncSequence).toBeLessThan(order[0]!.receiptRenameSequence);
+        expect(order[0]!.receiptRenameSequence).toBeLessThan(order[0]!.directorySyncSequence);
+        expect(order[0]!.directorySyncSequence).toBeLessThan(order[0]!.archiveAttemptSequence);
+        const mesh = new MeshStore(manifest.meshRoot, DEFAULT_FABRIC_CONFIG.mesh.maxEventBytes, DEFAULT_FABRIC_CONFIG.mesh.maxReadEvents); meshes.push(mesh);
+        await observe(manifest.meshRoot, () => mesh.get(`residency/completion-claims/${digest(id)}`, { fresh: true }) === undefined ? true : undefined, "B4 claim retirement");
+        if (mode === "iii") {
+          // Delivery does NOT discharge this still-live failed-stop custody.
+          expect(same(workerBirth)).toBe(true); expect(fs.existsSync(run)).toBe(true);
+          expect(canRemoveTerminalRun(run)).toBe(false);
+          expect((await status(successor!.handle.id)).status.status).toBe("queued");
+          expect((await status(id)).status.status).toBe("completed");
+          expect((await status(id)).status.lostContact).toEqual(expect.stringMatching(/\S/));
+          await command("native-nats-b4-restore-stop");
+          killRecorded(log, workerBirth.pid);
+        }
+        await command("native-nats-b4-join", id);
+        const joined = json(path.join(root, "nats-b4-joined.json"));
+        expect(joined).toMatchObject({ id, veto: null });
+        expect(joined.status.lostContact).toBeUndefined();
+        expect(same(workerBirth)).toBe(false);
+        expect(rows(path.join(root, "nats-b4-closes.jsonl")).filter(row => row.id === id && row.event === "native-close")).toHaveLength(1);
+        expect(runTreeResourceVeto(run, 0, undefined, true, true)).toBeUndefined();
+        if (successor) {
+          const nextLaunch = await observe(root, () => rows(path.join(root, "nats-b4-launches.jsonl")).find(row => row.id === successor!.handle.id), "permit successor launch");
+          expect(nextLaunch).toMatchObject({ mode: "successor", needs: ["local"], predecessor: { id, primaryClosed: true, veto: null } });
+          // No treeClosed API on an unscoped transport is recorded as null,
+          // never invented as a positive tree receipt. Native stop/join above
+          // still owns its actual execution group.
+          expect([null, true]).toContain(nextLaunch.predecessor.treeClosed);
+          const nextResult = await observeJson(path.join(nextLaunch.run, "manager-result.json"));
+          expect(nextResult).toMatchObject({ id: successor.handle.id, status: "completed" });
+          const nextAnswer = json(path.join(nextLaunch.run, "final-answer.json"));
+          expect(nextResult.finalAnswerReceipt.id).toBe(nextAnswer.id); expect(nextResult.text).toBe(nextAnswer.text);
+          const nextStatus = json(path.join(nextLaunch.run, "status.json"));
+          expect(nextStatus.sessionId).toMatch(/^\d+$/);
+          expect(log.owned().some(row => row.pid === Number(nextStatus.sessionId))).toBe(true);
+          expect(fs.existsSync(path.join(nextLaunch.run, "placement.json"))).toBe(false);
+          expect((await status(id)).status.finalAnswerReceipt.id).toBe(source.result.finalAnswerReceipt!.id);
+        }
+        await command("native-nats-completion-checkpoint");
+        expect(delivered()).toHaveLength(1); expect(enqueued()).toHaveLength(1); expect(carriers()).toHaveLength(1);
+        await noCompletionCarrier();
+        for (const file of [path.join(model.agent, "fabric/control-seen"), path.join(manifest.meshRoot, "control-seen")].flatMap(seenFiles)) {
+          expect(JSON.stringify(json(file))).not.toMatch(/"operation"\s*:\s*"completion"|completion:/);
+        }
+      } finally {
+        // Recover the same handle; no fake exit/status/release. Every test kill
+        // is checked against the independently recorded birth, then close-joined.
+        if (!rpc.closed) {
+          await command("native-nats-b4-restore-stop");
+          if (same(workerBirth)) killRecorded(log, workerBirth.pid);
+          await command("native-nats-b4-join", id);
+        }
+      }
+      await rpc.crash(log);
+    }, 150_000);
+  }
+});
 
 describe.skipIf(!HOSTED_PRODUCT_DELETE)("HOSTED AUTHOR-ONLY E4 native NATS B5 — actual roots, unchanged same-machine FILE journal", () => {
   for (const variant of ["durable-close", "durable-main-kill"] as const) {

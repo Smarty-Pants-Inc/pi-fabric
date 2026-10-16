@@ -41,7 +41,9 @@ import { launchLog, same, stopAllOwned, type LaunchLog } from "../helpers/owned-
  *   File-mode source classes are composed explicitly by the fixture. This is
  *   NOT the full fabric-runtime-state composition, a two-host canary, or NATS
  *   evidence. Actual-root NATS durable-close/Main-kill B5 cases now live in
- *   nats-native-boundaries.test.ts; remaining NATS variants stay explicit gaps.
+ *   nats-native-boundaries.test.ts, which also authors actual-root session B4
+ *   kill/held-final/stop-failure cases (execution coverage must be earned there).
+ *   Remaining NATS B5 variants stay explicit gaps.
  *   No B5 completion ENVELOPE crosses a machine. Remote placement can return
  *   result data to a local manager; these cases pin needs:["local"] instead.
  *   No completion operation, remote ledger, validator or receipt protocol.
@@ -56,7 +58,8 @@ const MAIN_MARKER = "NATIVE_MAIN_JOURNAL_REPLAY_ONCE";
 const TASK_MARKER = "NATIVE_TASK_B3_UNCONSUMED_FOLLOW_UP";
 const NATS_DEPENDENCY = "Remaining E4 NATS variant is not authored here. Actual A2 runtime/resident roots exist; " +
   "nats-native-boundaries.test.ts composes durable-close and durable-main-kill B5 through them with a real JWT broker. " +
-  "NATS B4 kill/stop-failure, durable-host-kill and session-main-kill still need their own actual-root cases. " +
+  "NATS B4 kill/held-final/stop-failure is authored there but not implied to have run; " +
+  "B5 durable-host-kill and session-main-kill still need their own actual-root cases. " +
   "Setting a carrier env on this FILE fixture is not coverage; no passing substitute.";
 const digest = (id: string) => createHash("sha256").update(id).digest("hex");
 const completionFiles = (meshRoot: string, id: string) => {
@@ -909,8 +912,9 @@ describe("E4 T-B5 — file carrier's unchanged same-root completion custody, nat
 });
 
 describe("E4 remaining NATS variants — explicit coverage gaps, NOT a passing substitute", () => {
-  // Durable-close/Main-kill B5 routing: nats-native-boundaries.test.ts.
-  for (const testCase of ["B4(i)", "B4(ii)", "B4(iii)", "B5 durable-host-kill", "B5 session-main-kill"]) {
+  // Actual-root B4 and durable-close/Main-kill B5: nats-native-boundaries.test.ts.
+  // Authorship is not a runtime PASS; both hosted authorization flags still gate it.
+  for (const testCase of ["B5 durable-host-kill", "B5 session-main-kill"]) {
     it(`${testCase} still needs an authored actual-root NATS case`, ctx => unavailable(ctx, NATS_DEPENDENCY));
   }
 });

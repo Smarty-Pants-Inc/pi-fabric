@@ -121,15 +121,24 @@ process.stdin.resume(); process.on('SIGTERM', () => {}); setInterval(() => {}, 1
         fs.writeFileSync(statusFile, JSON.stringify({ ...record, status: "failed", error: "ordinary crash", finishedAt: Date.now() }));
       }
       await vi.waitFor(() => expect(fs.existsSync(path.join(runDirectory, "unresolved-worker.json"))).toBe(true), { timeout: 5000 });
-      const result = await manager.wait(handle.id);
-      expect(result).toMatchObject({ status: "failed", errorCode: "CUSTODY_UNCONFIRMED" });
+      let settled = false;
+      if (mode === "actor-lost-contact") {
+        void manager.wait(handle.id).then(() => { settled = true; });
+        await delay(100);
+        expect(settled, "unknown actor custody must not resume the same-session drain").toBe(false);
+      } else {
+        const result = await manager.wait(handle.id);
+        expect(result).toMatchObject({ status: "failed", errorCode: "CUSTODY_UNCONFIRMED" });
+      }
       const queued = await manager.spawn({ task: "must not overlap", transport: "process" });
       await delay(100);
-      expect(manager.status(handle.id)).toMatchObject({ status: "failed", errorCode: "CUSTODY_UNCONFIRMED" });
+      if (mode === "actor-lost-contact") expect(settled).toBe(false);
+      else expect(manager.status(handle.id)).toMatchObject({ status: "failed", errorCode: "CUSTODY_UNCONFIRMED" });
       expect(launches, "crash must not release the admission permit").toBe(1);
       expect(queued.status).toBe("queued");
       await expect(manager.stop(handle.id)).rejects.toThrow(/execution exit unconfirmed/);
-      await expect(manager.cleanup(handle.id)).rejects.toThrow(/lost track/);
+      if (mode === "actor-lost-contact") await expect(manager.cleanup(handle.id)).rejects.toThrow(/running agent/);
+      else await expect(manager.cleanup(handle.id)).rejects.toThrow(/lost track/);
       await expect(manager.close()).rejects.toThrow(/execution exit unconfirmed/);
       expect(manager.runDirectory(handle.id)).toBe(runDirectory);
       expect(fs.existsSync(runDirectory)).toBe(true);

@@ -3,8 +3,11 @@ import { chmodSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { performance } from "node:perf_hooks";
+import { inspect } from "node:util";
 import { describe, expect, it, vi } from "vitest";
-import { IdleHeartbeatMonitor } from "@nats-io/nats-core/internal";
+import { QueuedIteratorImpl, type NatsConnection, type Status } from "@nats-io/nats-core/internal";
+import { DeliverPolicy, type ConsumerInfo } from "@nats-io/jetstream";
+import { JetStreamClientImpl, type PushConsumerMessagesImpl } from "@nats-io/jetstream/internal";
 import {
   readLocalHostLeaseProcessProof, transportHostLeasePredecessorExited, TransportHostLease,
   TRANSPORT_HOST_LEASE_SAFETY_MS, TRANSPORT_HOST_LEASE_TTL_MS,
@@ -20,7 +23,7 @@ import {
   boundedReceipt, createStubKv, faultGate, openRealAdapterPair, owner,
   type RealAdapterPair,
 } from "../helpers/transport-harness.js";
-import { formatNatsDiagnostic } from "../helpers/nats-diagnostics.js";
+import { formatNatsDiagnostic, sanitizeNatsError } from "../helpers/nats-diagnostics.js";
 
 /**
  * CONTRACT-v2 §§1,4,11,13; E6/E8/E11/E12/E19/E20.
@@ -59,11 +62,35 @@ import { formatNatsDiagnostic } from "../helpers/nats-diagnostics.js";
 const required = process.env.NATS_AUTH_REQUIRED === "1";
 const linux = process.platform === "linux";
 const cutoffMs = TRANSPORT_HOST_LEASE_TTL_MS - TRANSPORT_HOST_LEASE_SAFETY_MS;
-// @nats-io/jetstream 3.4.0: jsmstream_api sets 30s idle_heartbeat;
-// pushconsumer starts IdleHeartbeatMonitor with maxOut=2. The core monitor counts
-// a miss only when age > interval, so data just after creation needs maxOut+1 ticks.
-const ORDERED_PUSH_HEARTBEAT_MS = 30_000;
-const ORDERED_PUSH_MAX_OUT = 2;
+/** Run the same pinned ordered-push factory/consume path as NatsKvStore.watch.
+ * Only the connection and create reply are inert carriers; library code owns ALL
+ * consumer defaults and monitor settings. No broker, reset or delete is invoked. */
+async function pinnedOrderedPushMonitor() {
+  const status = new QueuedIteratorImpl<Status>();
+  const nc = {
+    options: { inboxPrefix: "_INBOX" },
+    features: { get: () => ({ ok: true }) },
+    status: () => status,
+    subscribe: () => ({ closed: new Promise<void>(() => {}), unsubscribe() {} }),
+    request: () => { throw new Error("heartbeat settings probe must not contact a broker"); },
+  } as unknown as NatsConnection;
+  const js = new JetStreamClientImpl(nc);
+  js.consumerAPI.add = async (stream, config) => ({ stream_name: stream, name: config.name, config }) as ConsumerInfo;
+  js.consumerAPI.delete = async () => { throw new Error("heartbeat settings probe must not delete a consumer"); };
+  const consumer = await js.consumers.getPushConsumer("KV_presence", {
+    filter_subjects: "$KV.presence.>", deliver_policy: DeliverPolicy.LastPerSubject,
+  });
+  const messages = await consumer.consume({ callback() {} }) as PushConsumerMessagesImpl;
+  const monitor = messages.monitor;
+  if (!monitor) { await messages.close(); throw new Error("pinned ordered push consumer has no heartbeat monitor"); }
+  return { monitor, close: () => messages.close() };
+}
+// Read actual installed-consumer settings, never copied defaults. The monitor counts
+// a miss only for age > interval, so work just after creation needs maxOut+1 ticks.
+const heartbeatProbe = await pinnedOrderedPushMonitor();
+const ORDERED_PUSH_HEARTBEAT_MS = heartbeatProbe.monitor.interval;
+const ORDERED_PUSH_MAX_OUT = heartbeatProbe.monitor.maxOut;
+await heartbeatProbe.close();
 const RESET_SCHEDULING_MARGIN_MS = 15_000;
 const RESET_OBSERVATION_MS = (ORDERED_PUSH_MAX_OUT + 1) * ORDERED_PUSH_HEARTBEAT_MS + RESET_SCHEDULING_MARGIN_MS;
 const token = (id: string): string => createHash("sha256").update(id).digest("hex").slice(0, 32);
@@ -201,30 +228,68 @@ async function compose(pair: RealAdapterPair, full: boolean) {
   }
 }
 
+/** Shared by the hosted catch and its safe seed-bearing regression. */
+async function failPresenceReset(error: unknown, diagnostics: () => unknown | Promise<unknown>): Promise<never> {
+  // Failure-only observations; no extra watch, retry, readiness or consumer mutation.
+  try { console.error("NATS_PRESENCE_RESET_FAILURE", formatNatsDiagnostic(await diagnostics())); }
+  catch (diagnosticError) { console.error("NATS_PRESENCE_RESET_DIAGNOSTIC_ERROR", formatNatsDiagnostic(diagnosticError)); }
+  throw sanitizeNatsError(error);
+}
+
+describe("presence reset failure output boundary", () => {
+  for (const diagnosticsFail of [false, true]) {
+    it(`scrubs the rethrown error even when diagnostics ${diagnosticsFail ? "fail" : "succeed"}`, async () => {
+      const seed = `SU${"C".repeat(56)}`;
+      const original = new Error(`consumer reset failed ${seed}`, { cause: new Error(`raw cause ${seed}`) });
+      original.stack = `Error: ${original.message}\n    at reset (${seed}:1:1)`;
+      const output = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        const failure = await failPresenceReset(original, () => {
+          if (diagnosticsFail) throw original;
+          return { pid: 123, errors: [original] };
+        }).catch(error => error as Error);
+        expect(failure).toBeInstanceOf(Error);
+        expect(failure.message).toContain("consumer reset failed");
+        for (const value of [failure.message, failure.stack, String(failure), inspect(failure), inspect(output.mock.calls)]) {
+          expect(value).not.toContain(seed);
+        }
+        expect(failure).not.toBe(original);
+        expect(failure.cause).toBeUndefined();
+      } finally { output.mockRestore(); }
+    });
+  }
+});
+
 /** Dependency timing probe only; no broker or product delete/release path is run.
  * Keep: the hosted reset wait expired before the pinned monitor was obliged to report. */
 describe("presence reset observation budget (actual pinned heartbeat monitor)", () => {
   it("allows the 90s timer phase while retaining a finite reset observation deadline", async () => {
     vi.useFakeTimers(); vi.setSystemTime(0);
     const callbacks: number[] = [];
-    let monitor: IdleHeartbeatMonitor | undefined;
+    let probe: Awaited<ReturnType<typeof pinnedOrderedPushMonitor>> | undefined;
     try {
+      probe = await pinnedOrderedPushMonitor();
+      const monitor = probe.monitor;
+      expect(monitor.interval).toBe(ORDERED_PUSH_HEARTBEAT_MS);
+      expect(monitor.maxOut).toBe(ORDERED_PUSH_MAX_OUT);
+      // A dependency settings change must trigger review of the two-reset/230s
+      // hosted test budget, rather than silently leaving an obsolete local wait.
+      expect(RESET_OBSERVATION_MS).toBe(105_000);
       const missed = new Promise<number>(resolve => {
-        // Same 30s/maxOut=2 settings used by the pinned ordered push consumer.
-        monitor = new IdleHeartbeatMonitor(ORDERED_PUSH_HEARTBEAT_MS, count => {
-          callbacks.push(count); resolve(count); return true;
-        }, { maxOut: ORDERED_PUSH_MAX_OUT });
+        // Observe the consumer's REAL monitor; replace only its notification so
+        // this dependency timing probe cannot enter ordered reset/delete logic.
+        monitor.callback = count => { callbacks.push(count); resolve(count); return true; };
       });
       const outcome = boundedReceipt(missed, "actual heartbeat reset observation", RESET_OBSERVATION_MS)
         .then(value => ({ value }), error => ({ error: String(error) }));
-      await vi.advanceTimersByTimeAsync(1); monitor!.work();
+      await vi.advanceTimersByTimeAsync(1); monitor.work();
       // A tick increments misses only for age > interval, not age >= interval.
       await vi.advanceTimersByTimeAsync(74_999);
       expect(callbacks).toEqual([]);
       await vi.advanceTimersByTimeAsync(15_000);
       expect(callbacks).toEqual([2]);
       expect(await outcome).toEqual({ value: 2 });
-    } finally { monitor?.cancel(); vi.useRealTimers(); }
+    } finally { await probe?.close(); vi.useRealTimers(); }
   });
   it("still rejects a missing reset at the finite observation deadline", async () => {
     vi.useFakeTimers();
@@ -321,16 +386,14 @@ describe("A2 real authenticated watch → manually-composed ParticipantView", ()
           ownerIncarnation: record.ownerIncarnation, capabilities: ["stop"] });
         expect(composed.errors).toEqual([]);
       } catch (error) {
-        // Failure-only observations; no extra watch, retry, readiness or consumer mutation.
-        try {
-          console.error("NATS_PRESENCE_RESET_FAILURE", formatNatsDiagnostic({ pid: process.pid,
-            broker: await pair.kvReadiness?.diagnostics?.(), ready: composed?.view.ready,
-            presence: composed?.taps.presence.diagnostics(), leases: composed?.taps.leases.diagnostics(),
-            errors: composed?.errors }));
-        } catch (diagnosticError) { console.error("NATS_PRESENCE_RESET_DIAGNOSTIC_ERROR", formatNatsDiagnostic(diagnosticError)); }
-        throw error;
+        await failPresenceReset(error, async () => ({ pid: process.pid,
+          broker: await pair.kvReadiness?.diagnostics?.(), ready: composed?.view.ready,
+          presence: composed?.taps.presence.diagnostics(), leases: composed?.taps.leases.diagnostics(),
+          errors: composed?.errors }));
       } finally {
-        try { await composed?.close(); } finally { await pair.close(); }
+        try {
+          try { await composed?.close(); } finally { await pair.close(); }
+        } catch (error) { throw sanitizeNatsError(error); }
       }
     }, 230_000);
 });

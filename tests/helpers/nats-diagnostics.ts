@@ -34,15 +34,26 @@ function redact(value: string): string {
     .replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, "");
 }
 
+function scrubString(value: string): string {
+  const safe = redact(value);
+  return safe.length > NATS_DIAGNOSTIC_FIELD_LIMIT
+    ? `${safe.slice(0, NATS_DIAGNOSTIC_FIELD_LIMIT - 12)}[truncated]` : safe;
+}
+
+/** Safe to throw: no original error, cause, prototype or arbitrary properties survive. */
+export function sanitizeNatsError(value: unknown): Error {
+  const safe = new Error(value instanceof Error ? scrubString(value.message) : formatNatsDiagnostic(value));
+  if (value instanceof Error) safe.name = scrubString(value.name);
+  safe.stack = scrubString(value instanceof Error && typeof value.stack === "string"
+    ? value.stack : safe.stack ?? String(safe));
+  return safe;
+}
+
 export function formatNatsDiagnostic(value: unknown): string {
   let remaining = 128;
   const select = (input: unknown, depth: number): unknown => {
     if (--remaining < 0 || depth > 6) return "[bounded]";
-    if (typeof input === "string") {
-      const safe = redact(input);
-      return safe.length > NATS_DIAGNOSTIC_FIELD_LIMIT
-        ? `${safe.slice(0, NATS_DIAGNOSTIC_FIELD_LIMIT - 12)}[truncated]` : safe;
-    }
+    if (typeof input === "string") return scrubString(input);
     if (typeof input === "number") return Number.isFinite(input) ? input : null;
     if (input === null || typeof input === "boolean") return input;
     if (input instanceof Error) return select({ name: input.name, message: input.message, stack: input.stack, cause: input.cause }, depth);

@@ -5,6 +5,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import http from "node:http";
+import { inspect } from "node:util";
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -21,7 +22,7 @@ import { runTreeResourceVeto, canRemoveTerminalRun } from "../../src/storage/ret
 import type { CompletionEnvelope } from "../../src/agents/completion-journal.js";
 import { residentHostId } from "../../src/residency/protocol.js";
 import { readResidentGenerationExit } from "../../src/residency/generation-exit.js";
-import { formatNatsDiagnostic, NATS_DIAGNOSTIC_FIELD_LIMIT } from "../helpers/nats-diagnostics.js";
+import { formatNatsDiagnostic, NATS_DIAGNOSTIC_FIELD_LIMIT, sanitizeNatsError } from "../helpers/nats-diagnostics.js";
 
 /** E4 B4/B5 composition check; keep: native custody trust boundary + data safety.
  * Main uses the actual source FabricRuntimeState.initialize with a real native Pi
@@ -439,7 +440,7 @@ afterEach(async context => {
   // Always release the OWNED broker, including native/setup/assertion failures.
   for (const h of brokers.splice(0)) { try { await bounded(h.stop(), "owned broker stop", 10_000); } catch (error) { failure ??= error; } }
   for (const mesh of meshes.splice(0)) mesh.closeState();
-  if (failure) { roots.splice(0); throw failure; } // Retain evidence if any child failed to join.
+  if (failure) { roots.splice(0); throw sanitizeNatsError(failure); } // Retain evidence if any child failed to join.
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 }, 90_000);
 
@@ -470,6 +471,40 @@ describe("NATS native boundary harness observations", () => {
       errors: Array.from({ length: 100 }, () => "safe error") }));
     expect(long.stderr.length).toBeLessThanOrEqual(NATS_DIAGNOSTIC_FIELD_LIMIT);
     expect(long.errors).toHaveLength(16);
+  });
+  it("scrubs rethrown error message, stack and name without retaining raw causes or properties", () => {
+    // Trust boundary: Vitest prints thrown errors independently of sanitized diagnostics.
+    const seed = `SU${"C".repeat(56)}`;
+    const original = Object.assign(new Error(`cleanup conflict ${seed}`, { cause: new Error(`cause ${seed}`) }), {
+      name: `NatsCleanupFailure ${seed}`, credentials: seed, raw: { seed },
+      [inspect.custom]: () => seed,
+    });
+    original.stack = `${original.name}: ${original.message}\n    at cleanupBroker (${seed}:12:3)`;
+    const safe = sanitizeNatsError(original);
+    expect(safe).toBeInstanceOf(Error);
+    expect(safe).not.toBe(original);
+    expect(Object.getPrototypeOf(safe)).toBe(Error.prototype);
+    expect(safe.name).toContain("NatsCleanupFailure");
+    expect(safe.message).toContain("cleanup conflict");
+    expect(safe.stack).toContain("cleanupBroker");
+    for (const output of [safe.name, safe.message, safe.stack!, String(safe), inspect(safe)]) {
+      expect(output).not.toContain(seed);
+      expect(output).toContain("[REDACTED seed]");
+    }
+    expect(Reflect.ownKeys(safe).sort()).toEqual(["message", "name", "stack"]);
+    expect(safe.cause).toBeUndefined();
+    expect(Object.values(safe)).not.toContain(original);
+    expect(original.message).toContain(seed); // The input is not mutated or retained.
+    const ordinary = sanitizeNatsError(new TypeError("ordinary cleanup failure"));
+    expect(String(ordinary)).toBe("TypeError: ordinary cleanup failure");
+    expect(ordinary.stack).toContain("ordinary cleanup failure");
+    const nonError = sanitizeNatsError(`non-Error failure ${seed}`);
+    expect(nonError.message).not.toContain(seed);
+    expect(nonError.stack).toContain("[REDACTED path]");
+    const withoutStack = new Error(`missing stack ${seed}`);
+    delete withoutStack.stack;
+    expect(sanitizeNatsError(withoutStack).stack).not.toContain(seed);
+    expect(sanitizeNatsError(withoutStack).stack).toContain("[REDACTED path]");
   });
   it("watches the empty attempts namespace before the producer writes its first candidate", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-nats-observer-probe-")); roots.push(root);

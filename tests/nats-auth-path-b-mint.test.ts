@@ -39,6 +39,9 @@ const fixture = () => {
   return { account, common };
 };
 
+// Keep reason (#4280): signing-policy/refusal probes cover the credential trust boundary
+// (especially malformed inventory and reserved identities) without issuing invalid live grants.
+// CLI-to-real-broker coverage separately proves that valid minted files actually enforce it.
 describe("Path B opt-in mint policy", () => {
   it("binds the machine tag and standalone runtime template without changing legacy templates", () => {
     const { account, common } = fixture();
@@ -89,7 +92,8 @@ describe("Path B opt-in mint policy", () => {
       expect(operator.template.pub.allow.some((subject: string) => subject.startsWith(`$JS.API.STREAM.${verb}.`))).toBe(false);
     }
     expect(operator.template.pub.allow).not.toContain("$JS.ACK.FABRIC_IN_ryzen2.>");
-    expect(operator.template.pub.allow).toContain("$JS.ACK.FABRIC_ADV.>");
+    expect(operator.template.pub.allow).toContain("$JS.ACK.FABRIC_ADV.transport_dlq_operator.>");
+    expect(operator.template.pub.allow.some((subject: string) => /^\$JS\.API\.CONSUMER\.(CREATE|DELETE)\./.test(subject))).toBe(false);
     expect(operator.template.pub.allow).toContain("$JS.API.STREAM.MSG.GET.FABRIC_IN_ryzen2");
     expect(operator.template.pub.allow).toContain("fabric.in.ryzen2.*.ack.*.{{tag(machine)}}");
     expect(operator.template.pub.allow).toContain("fabric.in.ryzen4.*.ack.*.{{tag(machine)}}");

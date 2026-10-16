@@ -4,12 +4,11 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
-import { PRESENCE_REFRESH_MS } from "../src/actors/manager.js";
 import { MeshStore, type MeshBatchOperation } from "../src/mesh/store.js";
 import { ResidentHost } from "../src/residency/host.js";
 import { residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
 import { LIVENESS_POLICY_KEY } from "../src/topology/host-leases.js";
-import { ParticipantDirectory, STOPPED_ACTOR_RENEW_MS } from "../src/topology/participant-directory.js";
+import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { readParticipantFile } from "../src/topology/participant-files.js";
 
 // smarty-dev#6729 / #6477: an idle resident heartbeat must not rewrite the presence of
@@ -105,11 +104,65 @@ describe("resident heartbeat with stopped actors (smarty-dev#6729)", () => {
     expect(observer.get(sample, undefined, { fresh: true })).toMatchObject({ kind: "actor", status: "stopped", stale: false, ownerHostId: host.hostId });
     expect(observer.list({ scope: "project", kinds: ["actor"], fresh: true }).filter(actor => actor.status === "stopped")).toHaveLength(STOPPED);
     expect(host.actors.list().filter(actor => actor.status === "stopped")).toHaveLength(STOPPED);
-    // The live actor's envelope (#5128) and legacy presence (#4383) keep their per-heartbeat renewal.
-    expect(batches.flat().filter(key => key === participantKey(actorId(0))).length).toBe(files ? 0 : 4);
-    expect(batches.flat().filter(key => key === presenceKey(actorId(0))).length).toBe(4);
+    // Live and stopped actor rows remain unchanged: the host lease carries liveness.
+    expect(batches.flat().filter(key => key === participantKey(actorId(0)))).toEqual([]);
+    expect(batches.flat().filter(key => key === presenceKey(actorId(0)))).toEqual([]);
     clock.mockRestore();
   }, 120_000);
+
+  it.each([false, true])("expires unchanged actor rows when the host lease stops renewing (files=%s)", async files => {
+    const { config, observer, start } = await fixture(files);
+    const host = await start();
+    const id = actorId(0);
+    const presence = host.mesh.get(presenceKey(id), { fresh: true })!;
+    const participant = host.mesh.get(participantKey(id), { fresh: true });
+    const file = fileVersion(config, id);
+    let now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+    try {
+      host.participants.suspend();
+      now += 16_000;
+      expect(observer.get(id, undefined, { fresh: true })).toBeUndefined();
+      expect(host.mesh.get(presenceKey(id), { fresh: true })!.version).toBe(presence.version);
+      expect(host.mesh.get(participantKey(id), { fresh: true })?.version).toBe(participant?.version);
+      expect(fileVersion(config, id)).toBe(file);
+    } finally { clock.mockRestore(); }
+  });
+
+  it.each([false, true])("publishes one changed actor in the same pass (files=%s)", async files => {
+    const { config, start } = await fixture(files);
+    const host = await start();
+    const id = actorId(0);
+    const beforePresence = host.mesh.get(presenceKey(id), { fresh: true })!;
+    const beforeParticipant = host.mesh.get(participantKey(id), { fresh: true });
+    const beforeFile = fileVersion(config, id);
+    await host.actors.setInstructions(id, "changed in this pass");
+    expect(host.mesh.get(presenceKey(id), { fresh: true })!.version).toBeGreaterThan(beforePresence.version);
+    // Actor presence is flushed by the setter. The participant envelope carries
+    // ownership/status, not private instructions, so it remains unchanged.
+    if (files) {
+      expect(fileVersion(config, id)).toBe(beforeFile);
+      if (beforeParticipant) expect(host.mesh.get(participantKey(id), { fresh: true })!.version).toBe(beforeParticipant.version);
+    } else {
+      expect(host.mesh.get(participantKey(id), { fresh: true })!.version).toBe(beforeParticipant?.version);
+    }
+  });
+
+  it.each([false, true])("publishes a public actor change without rewriting siblings (files=%s)", async files => {
+    const { config, observer, start } = await fixture(files);
+    const host = await start();
+    const id = actorId(0), sibling = actorId(7);
+    const before = host.mesh.get(presenceKey(id), { fresh: true })!;
+    const beforeFile = fileVersion(config, id)!;
+    const siblingPresence = host.mesh.get(presenceKey(sibling), { fresh: true });
+    const siblingFile = readParticipantFile(config.meshRoot, participantKey(sibling));
+    await host.actors.stop(id);
+    expect(host.mesh.get(presenceKey(id), { fresh: true })!.version).toBeGreaterThan(before.version);
+    expect(fileVersion(config, id)).toBeGreaterThan(beforeFile);
+    expect(observer.get(id, undefined, { fresh: true })).toMatchObject({ status: "stopped", stale: false });
+    expect(host.mesh.get(presenceKey(sibling), { fresh: true })).toEqual(siblingPresence);
+    expect(readParticipantFile(config.meshRoot, participantKey(sibling))).toEqual(siblingFile);
+  });
 
   // off Linux #1031 refuses removal (accepted gap smarty-dev#11335); pi-fabric#1079 unskips
   it.skipIf(process.platform !== "linux")("publishes a stop and a removal at once, renews stopped records rarely, and a restart republishes", async () => {
@@ -146,17 +199,13 @@ describe("resident heartbeat with stopped actors (smarty-dev#6729)", () => {
     expect(host.mesh.get(participantKey(removed), { fresh: true })).toBeUndefined();
     expect(observer.get(removed, undefined, { fresh: true })).toBeUndefined();
 
-    // Unchanged stopped records are renewed once the floor elapses, not per beat.
+    // Unchanged stopped records remain stable even after the old envelope-renewal floor.
     const presence = host.mesh.get(presenceKey(sample), { fresh: true })!;
-    const envelope = host.mesh.get(participantKey(sample), { fresh: true })!;
-    now += Math.max(PRESENCE_REFRESH_MS, STOPPED_ACTOR_RENEW_MS);
+    const envelope = host.mesh.get(participantKey(sample), { fresh: true });
+    now += 60 * 60 * 1_000;
     await host.participants.refresh();
-    expect(host.mesh.get(presenceKey(sample), { fresh: true })!.version).toBeGreaterThan(presence.version);
-    expect(host.mesh.get(participantKey(sample), { fresh: true })!.version).toBeGreaterThan(envelope.version);
-    const renewed = host.mesh.get(presenceKey(sample), { fresh: true })!.version;
-    now += PERIOD_MS;
-    await host.participants.refresh();
-    expect(host.mesh.get(presenceKey(sample), { fresh: true })!.version).toBe(renewed);
+    expect(host.mesh.get(presenceKey(sample), { fresh: true })!.version).toBe(presence.version);
+    if (envelope) expect(host.mesh.get(participantKey(sample), { fresh: true })!.version).toBe(envelope.version);
 
     // A restarted host (new instance) republishes its stopped actors' presence once.
     await host.close();

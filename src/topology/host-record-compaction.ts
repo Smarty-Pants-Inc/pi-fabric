@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import type { MeshBatchOperation, MeshBatchView, MeshStateEntry } from "../mesh/store.js";
+import type { MeshBatchOperation, MeshStateEntry } from "../mesh/store.js";
 import { hostEntryLiveness, readHostLease } from "./host-leases.js";
 
 /** Native Mains and resident brokers both advertise topology host records. Never expire their
@@ -23,9 +23,9 @@ const expired = (entry: MeshStateEntry, root: string, ownHostId: string, cutoff:
   return hostEntryLiveness(entry, lease ? new Map([[host.id, lease]]) : new Map()).expiresAt < cutoff;
 };
 
-/** Prepare only from the authoritative view of an ALREADY-needed write. No separate sweep,
- * no timer and no extra state read/lock acquisition. Revalidate file liveness just before delete. */
-export const compactExpiredHostRecords = (view: MeshBatchView, root: string, ownHostId: string,
+/** Select outside custody for an already-needed write. Exact-version CAS rejects changed rows;
+ * the condition revalidates file liveness on the commit's current row, never just this selection. */
+export const compactExpiredHostRecords = (view: { listAll(prefix: string): readonly MeshStateEntry[] }, root: string, ownHostId: string,
   now = Date.now()): MeshBatchOperation[] => {
   const cutoff = now - HOST_RECORD_RETENTION_MS;
   const ops: MeshBatchOperation[] = [];

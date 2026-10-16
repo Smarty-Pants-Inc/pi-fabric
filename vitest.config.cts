@@ -1,12 +1,18 @@
-import { join } from "node:path";
-import type { ViteUserConfig as UserConfig } from "vitest/config";
-import { isolatedTestTemp, isolateTestFleetEnvironment } from "./scripts/test-temp.js";
+type UserConfig = import("vitest/config").ViteUserConfig;
+
+// Vite loads a CommonJS config bundle in memory; ESM configs emit into node_modules/.vite-temp
+// before cacheDir can take effect. Keep this entry .cts so plain `vitest run` is read-only-install safe.
+const { join } = require("node:path") as typeof import("node:path");
+const { isolatedTestTemp, isolateTestFleetEnvironment } = require("./scripts/test-temp.ts") as typeof import("./scripts/test-temp.js");
 
 // Assign the caller-owned run root before Vitest snapshots its environment, forks workers,
 // or allocates fleet state. Every later fixture temp directory stays beneath this root.
 const temp = isolatedTestTemp("pi-fabric-vitest-");
 Object.assign(process.env, temp);
 const fleet = isolateTestFleetEnvironment();
+// Vitest appends vitest/<project hash>/results.json. The pinned run root already falls back to
+// os.tmpdir() when TMPDIR is absent (including Windows); teardown owns the cache's lifetime too.
+const cacheDir = join(temp.TMPDIR, "vite");
 // smarty-dev#7554: fixtures assert 0644/0755 modes; an agent shell's umask 0077 must not decide them.
 // Forked workers inherit it. POSIX-only: Windows has no meaningful umask.
 if (process.platform !== "win32") process.umask(0o022);
@@ -40,7 +46,7 @@ const hostedOnlyDeletionSuites = [
 ];
 
 /** Unguarded or reverted deletion suites stay hosted-only; GitHub Actions always collects every suite. */
-export function productDeletionSuites(): string[] {
+function productDeletionSuites(): string[] {
   return process.env.GITHUB_ACTIONS === "true" ? [] : [...hostedOnlyDeletionSuites];
 }
 
@@ -48,6 +54,19 @@ const localRealDeleteSuites = productDeletionSuites();
 if (localRealDeleteSuites.length > 0) {
   console.warn(`smarty-dev#4664: local run skips ${localRealDeleteSuites.length} native/tool or reverted deletion suites`);
 }
+
+// Generic CI checks do not own a broker. Exclude whole broker-capable suites before
+// affected-test discovery (including their fake cases); dedicated nats-* jobs run them.
+// Fake-only NATS suites stay in the generic cross-platform selection.
+const realBrokerNatsSuites = [
+  "tests/mesh-state-backend.test.ts",
+  "tests/mesh-state-backend-multiprocess.test.ts",
+  "tests/mesh-backend-migration-nats.test.ts",
+  "tests/state-backend-nats-election.test.ts",
+  "tests/nats-auth-server.test.ts",
+];
+const excludedSuites = [...localRealDeleteSuites,
+  ...(process.env.FABRIC_TEST_SKIP_NATS === "1" ? realBrokerNatsSuites : [])];
 
 // Separate policy projects avoid writing a fixture read by unrelated config tests.
 const policyConstants = (name: string) => ({
@@ -59,7 +78,7 @@ const sharedTests = {
   env: { ...temp, ...fleet },
   setupFiles: ["./tests/fleet-isolation-setup.ts"],
   include: ["tests/**/*.test.ts"],
-  ...(localRealDeleteSuites.length > 0 ? { exclude: localRealDeleteSuites } : {}),
+  ...(excludedSuites.length > 0 ? { exclude: excludedSuites } : {}),
   // Real worker processes and cold TypeScript compilers share this suite.
   // Behavioral timeouts and performance budgets remain asserted by tests.
   testTimeout: 15_000,
@@ -70,7 +89,8 @@ const sharedTests = {
   retry: ci ? 2 : 0,
 } satisfies NonNullable<UserConfig["test"]>;
 
-export default {
+module.exports = {
+  cacheDir,
   test: {
     ...sharedTests,
     reporters: ci ? ["default", "./scripts/ci-retry-reporter.ts"] : ["default"],
@@ -82,21 +102,25 @@ export default {
     // Explicit shared options avoid extends merging the broad include into the GC project.
     projects: [
       {
+        cacheDir,
         define: policyConstants("missing"),
-        test: { ...sharedTests, name: "default", exclude: [...localRealDeleteSuites,
+        test: { ...sharedTests, name: "default", exclude: [...excludedSuites,
           "tests/session-entry-retention.test.ts", "tests/host-policy.test.ts",
           "tests/process-slice-scope-e2e.test.ts"] },
       },
       {
+        cacheDir,
         define: policyConstants("host-policy"),
         test: { ...sharedTests, name: "host-policy", include: ["tests/host-policy.test.ts"] },
       },
       {
+        cacheDir,
         // smarty-dev#8953: its own policy file, so the staged processSlice never reaches another file's config.
         define: policyConstants("scope-e2e"),
         test: { ...sharedTests, name: "scope-e2e", include: ["tests/process-slice-scope-e2e.test.ts"] },
       },
       {
+        cacheDir,
         define: policyConstants("missing"),
         test: {
           ...sharedTests,
@@ -107,3 +131,5 @@ export default {
     ],
   },
 } satisfies UserConfig;
+
+module.exports.productDeletionSuites = productDeletionSuites;

@@ -1,4 +1,5 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { diagnostics, notifyDiagnostic } from "./core/diagnostics.js";
 import { RootInbox, type RootInboxBatch, type RootInboxSession, type RootInboxReconcileOptions } from "./topology/root-inbox.js";
 import { RootInboxWatch } from "./topology/root-inbox-wake.js";
 import { MainInboxMaintenance, registerMainInbox, recordMainSuccessor, mainInboxOwns, mainInboxActive, rootPresenceAlarms, stageMainSuccessor, confirmMainSuccessor, providerDeadAlarms, providerDeadAlarmFields, admissionAlarmRecipient } from "./topology/stall-alarms.js";
@@ -219,7 +220,7 @@ const MAIN_ACTOR_MESH_REPLAY_MS = 10 * 60_000;
 // ctx throws, and a throw there is uncaught and exits Pi, so the notice is dropped.
 const notifyDetached = (context: ExtensionContext, message: string): void => {
   try {
-    if (context.hasUI) context.ui.notify(message, "error");
+    if (context.hasUI) notifyDiagnostic(context, "src/fabric-runtime-state.ts", message, "error");
   } catch {
     // Stale ctx: the runtime that owned this callback is closing.
   }
@@ -983,8 +984,8 @@ export class FabricRuntimeState {
       identity,
       onRootCollision: collision => {
         const warning = `Duplicate live Fabric root (${collision.reason}): ${collision.name}; ${collision.ids.join(", ")}. Fixture forks must use PI_FABRIC_FIXTURE=1.`;
-        console.warn(`[pi-fabric] ${warning}`);
-        live.read(ctx => { if (ctx.hasUI) ctx.ui.notify(warning, "warning"); });
+        diagnostics.warn("src/fabric-runtime-state.ts", `[pi-fabric] ${warning}`);
+        live.read(ctx => { if (ctx.hasUI) notifyDiagnostic(ctx, "src/fabric-runtime-state.ts", warning, "warning"); });
       },
       live: live.current,
       // No live ctx to rebind to (smarty-dev#5962/#4313): the lease lapses, so say it on the fleet
@@ -1080,9 +1081,9 @@ export class FabricRuntimeState {
       onUnfencedSenderWarning: message => {
         if (live.read(ctx => {
           if (!ctx.hasUI) return false;
-          ctx.ui.notify(message, "warning");
+          notifyDiagnostic(ctx, "src/fabric-runtime-state.ts", message, "warning");
           return true;
-        }) !== true) console.warn(`[pi-fabric] ${message}`);
+        }) !== true) diagnostics.warn("src/fabric-runtime-state.ts", `[pi-fabric] ${message}`);
       },
       // Both gates: this activation's custody/succession completed (main) AND its
       // directory epoch is committed under a live, renewed lease (#709).
@@ -1271,7 +1272,7 @@ export class FabricRuntimeState {
         // Always addressed (pi-fabric#939 P2-b): the owner identity, else this Main itself; never a broadcast.
         const to = admissionAlarmRecipient(process.env.PI_FABRIC_OWNER_IDENTITY_ID, from);
         if (!to) {
-          console.warn("[pi-fabric] agent-admission alarm not published: no owner session address (the stderr line stands)");
+          diagnostics.warn("src/fabric-runtime-state.ts", "[pi-fabric] agent-admission alarm not published: no owner session address (the stderr line stands)");
           return;
         }
         // A named run's failed recovery save is an ops.owner alarm (pi-fabric#939 round 4); the held count stays a fabric.alarm.
@@ -1535,7 +1536,7 @@ export class FabricRuntimeState {
     try { await this.#actors.recoverProtectedActors(); }
     catch (error) {
       if (!(error instanceof ActorSlotRecoveryParkedError)) throw error;
-      console.warn(`[pi-fabric] ${this.#actors.slotRecoveryStatus().error?.message}`);
+      diagnostics.warn("src/fabric-runtime-state.ts", `[pi-fabric] ${this.#actors.slotRecoveryStatus().error?.message}`);
     }
     this.#participants.registerSource(() =>
       this.#actors!.listOwned(true).map((actor) =>
@@ -1602,11 +1603,12 @@ export class FabricRuntimeState {
       await this.#participants.start();
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
-      console.warn(
+      diagnostics.warn(
+        "src/fabric-runtime-state.ts",
         `[pi-fabric] Initial mesh publish failed (${detail}); the participant heartbeat will keep retrying.`,
       );
       if (context.hasUI) {
-        context.ui.notify(
+        notifyDiagnostic(context, "src/fabric-runtime-state.ts",
           `Pi Fabric could not reach the mesh (${detail}); retrying in the background.`,
           "warning",
         );
@@ -1813,7 +1815,7 @@ export class FabricRuntimeState {
         });
       });
       for (const warning of control.configuration().warnings) {
-        if (context.hasUI) context.ui.notify(warning, "warning");
+        if (context.hasUI) notifyDiagnostic(context, "src/fabric-runtime-state.ts", warning, "warning");
       }
     }
   }
@@ -2335,7 +2337,7 @@ export class FabricRuntimeState {
     const mesh = this.#mesh, identity = this.#identity;
     const owner = process.env.PI_FABRIC_OWNER_IDENTITY_ID?.trim() || undefined;
     void this.#backgroundMesh.enqueue(() => providerDeadAlarms(mesh, identity, rootId, event, owner)).catch((error: unknown) => {
-      console.warn("[pi-fabric] provider-dead ops.owner alarm failed", error);
+      diagnostics.warn("src/fabric-runtime-state.ts", "[pi-fabric] provider-dead ops.owner alarm failed", error);
     });
   }
 

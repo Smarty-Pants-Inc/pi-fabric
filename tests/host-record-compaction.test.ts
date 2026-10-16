@@ -50,11 +50,24 @@ describe("native/resident topology host compaction", () => {
       "topology/participants/keep": { ...dead, key: "topology/participants/keep" },
       "residency/deliveries/keep": { ...dead, key: "residency/deliveries/keep" },
     } }));
-    await store.writeBatch({ identity, ops: [{ kind: "put", key: "field/write/needed", value: 1 }],
-      prepare: current => compactExpiredHostRecords(current, r, identity.id, now) });
+    const selected = compactExpiredHostRecords({ listAll: prefix => store.listAll(prefix, { fresh: true }) }, r, identity.id, now);
+    await store.writeBatch({ identity, ops: [{ kind: "put", key: "field/write/needed", value: 1 }, ...selected] });
     expect(store.get(dead.key, { fresh: true })).toBeUndefined();
     expect(store.get(recent.key, { fresh: true })).toBeDefined();
     expect(store.get("topology/participants/keep")).toBeDefined(); expect(store.get("residency/deliveries/keep")).toBeDefined();
+  });
+  it("keeps a host replaced after off-lock selection, including delete/recreate ABA", async () => {
+    const r = root(), store = new MeshStore(r, 256 * 1024, 1000), now = Date.now();
+    const dead = entry("resident:returning", now);
+    fs.writeFileSync(path.join(r, "state.json"), JSON.stringify({ format: 1, entries: { [dead.key]: dead } }));
+    const selected = compactExpiredHostRecords({ listAll: prefix => store.listAll(prefix, { fresh: true }) }, r, identity.id, now);
+    expect(selected).toHaveLength(1);
+    await store.delete({ key: dead.key, ifVersion: dead.version });
+    await store.put({ key: dead.key, identity, value: { ...dead.value as object, startedAt: 2, expiresAt: now + 15000 } });
+    const successor = store.get(dead.key, { fresh: true });
+    await store.writeBatch({ identity, ops: [{ kind: "put", key: "field/write/needed", value: 1 }, ...selected] });
+    expect(store.get(dead.key, { fresh: true })).toEqual(successor);
+    expect(store.get("field/write/needed")?.value).toBe(1);
   });
 });
 describe("established heartbeat failure is not death", () => {
@@ -67,6 +80,35 @@ describe("established heartbeat failure is not death", () => {
       runner: "pi", transport: "host", capabilities: ["steer", "followUp", "fabric"], cwd: r, sessionId: "observer",
       startedAt: 1, updatedAt: Date.now(), controlProtocol: "v1" }]); return d;
   };
+  it("selects maintenance before a 190-actor main heartbeat transaction", async () => {
+    const r = root(), d = directory(r), now = Date.now();
+    d.registerSource(() => Array.from({ length: 190 }, (_, n): FabricParticipantRecord => ({
+      format: 1, id: `actor:${n}`, kind: "actor", rootId: identity.id, ownerHostId: identity.id,
+      ownerIdentityId: identity.id, name: `actor-${n}`, status: "idle", runner: "pi", transport: "process",
+      capabilities: ["fabric"], controlProtocol: "v1", actorOwnershipToken: `lineage-${n}`, startedAt: 1, updatedAt: now,
+    })));
+    const historical = Array.from({ length: 190 }, (_, n) => entry(`resident:old-${n}`, now));
+    fs.writeFileSync(path.join(r, "state.json"), JSON.stringify({ format: 1,
+      entries: Object.fromEntries(historical.map(row => [row.key, row])) }));
+    const original = d.mesh.writeBatch.bind(d.mesh);
+    const batch = vi.spyOn(d.mesh, "writeBatch").mockImplementation(input => original({ ...input,
+      prepare: (current, files) => input.prepare?.({ ...current, listAll: prefix => {
+        // A whole-family scan under transaction custody is the regression; per-key CAS and
+        // fresh file-lease checks must still execute against the real commit view.
+        expect(prefix).not.toBe("topology/hosts/");
+        return current.listAll(prefix);
+      } }, files) ?? [],
+    }));
+    try {
+      await d.refresh();
+      expect(d.canConsumeMesh()).toBe(true);
+      const remaining = d.mesh.listAll("topology/hosts/", { fresh: true });
+      expect(remaining).toHaveLength(190 - HOST_RECORD_COMPACTION_BATCH + 1);
+      expect(remaining.some(row => row.key === key(identity.id))).toBe(true);
+      expect(d.mesh.listAll("topology/participants/", { fresh: true })).toHaveLength(191);
+    } finally { batch.mockRestore(); }
+  });
+
   it("renews only the established liveness file after a lock timeout; confirmation and admission stay failed", async () => {
     const r = root(), d = directory(r); await d.refresh(); const confirmed = d.confirmedAt();
     const previous = readHostLease(r, identity.id)!;

@@ -5,6 +5,10 @@ import {
   type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { fabricDiagnosticsFile, flushFabricDiagnostics } from "../src/core/diagnostics.js";
 import { Agent } from "@earendil-works/pi-agent-core";
 import { createAssistantMessageEventStream, type AssistantMessage, type Model } from "@earendil-works/pi-ai";
 import type { AgentToolResultMessage } from "../src/agents/types.js";
@@ -594,6 +598,55 @@ describe("persisted in-place Prewalk recovery", () => {
     expect(controller.borrowedReturn()).toBeUndefined();
   });
 
+  it("shows automatic unavailable-return failure as one status and logs privately without notifying an org pane", async () => {
+    vi.stubEnv("SMARTY_ROLE", "org-agent@x");
+    vi.stubEnv("PI_CODING_AGENT_DIR", fs.mkdtempSync(path.join(os.tmpdir(), "fabric-auto-return-")));
+    try {
+      const ctx = context();
+      const controller = new PrewalkController();
+      controller.hydrateBorrowedMain({ returnModel: "anthropic/retired", executorModel: "anthropic/executor" });
+      ctx.value.model = ctx.target as typeof ctx.value.model;
+      const ext = extension();
+
+      expect(await restoreBorrowedInPlaceMain(controller, ext.value, ctx.value)).toBe(false);
+      await flushFabricDiagnostics();
+      expect(ctx.value.ui.notify).not.toHaveBeenCalled();
+      expect(ctx.setStatus.mock.calls).toEqual([["fabric-prewalk",
+        "RETURN FAILURE → anthropic/retired: model unavailable (Main remains on executor)",
+      ]]);
+      expect(ext.setModel).not.toHaveBeenCalled();
+      const lines = fs.readFileSync(fabricDiagnosticsFile("session-1"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+      expect(lines).toContainEqual(expect.objectContaining({
+        level: "error", source: "src/prewalk/return.ts",
+        message: "Prewalk left Main on the executor; could not restore unavailable model anthropic/retired.",
+      }));
+    } finally {
+      await flushFabricDiagnostics();
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it.each(["authentication", "policy"] as const)("keeps explicit restore %s failures visible in an org pane", async (failure) => {
+    vi.stubEnv("SMARTY_ROLE", "org-agent@x");
+    try {
+      const ctx = context();
+      const controller = new PrewalkController();
+      controller.hydrateBorrowedMain({ returnModel: "anthropic/frontier", executorModel: "anthropic/executor" });
+      ctx.value.model = ctx.target as typeof ctx.value.model;
+      const ext = extension();
+      ext.setModel.mockResolvedValue(false);
+      const returning = restoreBorrowedInPlaceMain(controller, ext.value, ctx.value,
+        { deniedModels: failure === "policy" ? ["anthropic/frontier"] : [] }, { principalVisible: true });
+      if (failure === "policy") await expect(returning).rejects.toMatchObject({ code: "FABRIC_MODEL_DENIED" });
+      else expect(await returning).toBe(false);
+      expect(ctx.value.ui.notify).toHaveBeenCalledWith(
+        expect.stringContaining(failure === "policy" ? "#2236" : "Check model authentication"), "error",
+      );
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
   it("retains the adopted record when the return model is unavailable", async () => {
     const ctx = context();
     const session = ctx.value.sessionManager as SessionManager;
@@ -618,6 +671,85 @@ describe("persisted in-place Prewalk recovery", () => {
       "Prewalk left Main on the executor; could not restore unavailable model anthropic/retired.",
       "error",
     );
+  });
+});
+
+describe.each(["restore", "settle"] as const)("automatic %s return status", (entry) => {
+  it.each([
+    { principal: true, failure: "unavailable", reason: "model unavailable" },
+    { principal: true, failure: "authentication", reason: "authentication failed" },
+    { principal: true, failure: "policy", reason: "policy refused" },
+    { principal: false, failure: "unavailable", reason: "model unavailable" },
+    { principal: false, failure: "authentication", reason: "authentication failed" },
+    { principal: false, failure: "policy", reason: "policy refused" },
+  ])("preserves $failure failure and clears on principal retry (principal=$principal)", async ({ principal, failure, reason }) => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-return-status-"));
+    vi.stubEnv("SMARTY_ROLE", principal ? "org-agent@x" : "project-agent@x");
+    vi.stubEnv("PI_CODING_AGENT_DIR", directory);
+    try {
+      const ctx = context();
+      const ext = extension();
+      const controller = new PrewalkController();
+      const session = ctx.value.sessionManager as SessionManager;
+      if (entry === "restore") {
+        // Startup/reload starts from persisted history, before auto-arm.
+        session.appendModelChange("anthropic", "executor");
+        session.appendCustomMessageEntry("pi-fabric-prewalk-continue", "Continue", false, {
+          mode: "in-place", model: "anthropic/executor", returnModel: "anthropic/frontier", continuationId: "status-recovery",
+        });
+      } else {
+        controller.arm({ model: "anthropic/executor", sessionId: "session-1", alwaysRearm: true });
+        const pending = claimHandoff(controller, execution(), "session-1", "json")!;
+        await runFabricHandoffAtBoundary(controller, unusedRunner(), ext.value, pending, outerResult(), ctx.value);
+        const continuation = ext.sendMessage.mock.calls[0]![0] as { details: { continuationId: string } };
+        controller.acceptContinuation("session-1", continuation.details.continuationId);
+        if (principal) expect(ctx.setStatus.mock.calls.every(([, text]) => text === undefined)).toBe(true);
+      }
+      ctx.value.model = ctx.target as typeof ctx.value.model;
+      const find = ctx.value.modelRegistry.find;
+      if (failure === "unavailable") ctx.value.modelRegistry.find = vi.fn().mockReturnValue(undefined);
+      ext.setModel.mockClear();
+      ext.setModel.mockResolvedValue(failure !== "authentication");
+      ctx.setStatus.mockClear();
+      vi.mocked(ctx.value.ui.notify).mockClear();
+      const policy = { deniedModels: failure === "policy" ? ["anthropic/frontier"] : [] };
+      const returning = entry === "restore"
+        ? restoreBorrowedInPlaceMain(controller, ext.value, ctx.value, policy)
+        : settleInPlacePrewalk(controller, ext.value, ctx.value, { policy });
+      if (failure === "policy") await expect(returning).rejects.toMatchObject({ code: "FABRIC_MODEL_DENIED" });
+      else expect(await returning).toBe(false);
+      const expected = principal
+        ? `RETURN FAILURE → anthropic/frontier: ${reason} (Main remains on executor)`
+        : `${failure === "policy" ? "return refused" : "return failed"} → anthropic/frontier`;
+      expect(ctx.setStatus).toHaveBeenLastCalledWith("fabric-prewalk", expected);
+      expect(expected).not.toMatch(/undefined|[\r\n]/);
+      if (principal) {
+        expect(ctx.value.ui.notify).not.toHaveBeenCalled();
+        expect(ctx.setStatus.mock.calls.filter(([, text]) => text !== undefined)).toEqual([["fabric-prewalk", expected]]);
+      } else expect(ctx.value.ui.notify).toHaveBeenCalledWith(expect.any(String), "error");
+      expect(controller.status().state).toBe("idle");
+      expect(controller.borrowedReturn()).toEqual({ returnModel: "anthropic/frontier", executorModel: "anthropic/executor" });
+      // The extension's generic fallback must not erase the owed-return failure.
+      expect(controller.settleTask("session-1")).toBe(false);
+      const statusCalls = ctx.setStatus.mock.calls.length;
+      expect(await settleInPlacePrewalk(controller, ext.value, ctx.value)).toBe(false);
+      expect(ctx.setStatus).toHaveBeenCalledTimes(statusCalls);
+      ctx.value.modelRegistry.find = find;
+      policy.deniedModels = [];
+      ext.setModel.mockResolvedValue(true);
+      expect(await restoreBorrowedInPlaceMain(controller, ext.value, ctx.value, policy)).toBe(true);
+      if (principal) {
+        expect(ctx.setStatus).toHaveBeenLastCalledWith("fabric-prewalk", undefined);
+        expect(ctx.value.ui.notify).not.toHaveBeenCalled();
+      } else {
+        // Nonprincipal recovery historically leaves the status untouched.
+        expect(ctx.setStatus).toHaveBeenCalledTimes(statusCalls);
+        expect(ctx.setStatus).toHaveBeenLastCalledWith("fabric-prewalk", expected);
+      }
+    } finally {
+      await flushFabricDiagnostics();
+      vi.unstubAllEnvs();
+    }
   });
 });
 

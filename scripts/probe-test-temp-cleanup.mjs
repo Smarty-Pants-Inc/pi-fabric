@@ -58,7 +58,7 @@ async function launch(name, mode, caseRoot) {
   const output = join(evidence, name);
   fs.mkdirSync(output);
   const config = join(output, "vitest.config.mts");
-  fs.writeFileSync(config, `import base from ${JSON.stringify(join(repo, "vitest.config.ts"))};\nexport default {...base,root:${JSON.stringify(repo)},test:{...base.test,projects:undefined,include:[${JSON.stringify(join(repo, "tests/fixtures/test-temp-lifecycle.ts"))}]}};\n`);
+  fs.writeFileSync(config, `import base from ${JSON.stringify(join(repo, "vitest.config.cts"))};\nexport default {...base,root:${JSON.stringify(repo)},test:{...base.test,projects:undefined,include:[${JSON.stringify(join(repo, "tests/fixtures/test-temp-lifecycle.ts"))}]}};\n`);
   const result = { name, mode, caseRoot, command: ["bun", "run", "test", "--config", config] };
   const logs = [];
   let readyResolve;

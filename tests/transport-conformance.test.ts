@@ -9,7 +9,7 @@ import type { AgentMessageRouter } from "../src/providers/agents-message-router.
 import {
   adapterKinds, boundedReceipt, commandEnvelope, contractTiming, createStubBus, faultGate, FaultHooks,
   identity, loadControlPlane, loseNextPublishAck, openRealAdapterPair, owner, resolvedRetry, withFaults,
-  type AdapterKind, type CommandBody, type FabricTransport, type RealKvReadiness,
+  type AdapterKind, type CommandBody, type FabricTransport, type RealBrokerOutage, type RealKvReadiness, type RealPairOptions,
   type StubTransport, type TransportBucket, type TransportDelivery, type TransportEnvelope,
   type TransportKvEntry, type TransportKvEvent,
 } from "./helpers/transport-harness.js";
@@ -36,7 +36,10 @@ import type { ParticipantRoute as Route, ParticipantView as View } from "../src/
  * - Real T6 NAK replay is NOT lost-ACK or ackWait/WPI-extension proof.
  * - Stub working/nak/replay are SCRIPTED carrier operations, not a broker timer/delivery engine.
  * - T7 authenticated operator relay/DLQ is DEFERRED-E19: the operator is report-only.
- *   T8/T11/T13/T16/T21/T22 need optional real integration fixtures, below. Missing fixtures
+ *   T8 NATS now owns a real transparent TCP cut + same-store server restart, retaining the
+ *   original factory policy and live iterator. FILE/stub have no broker outage simulation.
+ *   T11/T13/T16/T21/T22 still need optional integrations. T11 is STOPPED at the missing
+ *   production alarm receipt; a caught capacity error is NOT an operator alarm. Missing fixtures
  *   are skipped, never replaced by a synthetic admission/lease/operator/rollback implementation.
  * - T4/T5 use a native-custody test callback invoked by the REAL control plane. This tests its
  *   claim/outcome/ACK machinery, NOT Main/Pi consumption, AgentManager fsync or power-loss safety.
@@ -59,8 +62,9 @@ import type { ParticipantRoute as Route, ParticipantView as View } from "../src/
  *   remain explicit gaps (fail in required mode), never relabelled as pre-consumption coverage.
  * - E6 supersedes draft §4.4's isUpdate/keys() readiness recipe. Only the explicit ready event
  *   completes a snapshot; neither its last put nor a keys()/get() result is a readiness barrier.
- *   Actual A2 resolve() → DirectoryNotReadyError before initial ready and between reset/new ready
- *   remains pending the real A2 watch/view composition API. No test-local directory stands in for it.
+ *   Actual A2 KvParticipantDirectory/TransportHostLease APIs ARE present: manually-composed
+ *   authenticated ready/reset/view coverage is in transport-faults/presence-leases.test.ts.
+ *   Installed application-root composition coverage remains separate and unproven here.
  * - No events port, automatic TTL takeover, file fallback or same-host isolation claim.
  */
 
@@ -73,6 +77,7 @@ interface Pair {
   raw?: { readonly sender: FabricTransport; readonly receiver: FabricTransport };
   reopenReceiver?(): Promise<FabricTransport>;
   kvReadiness?: RealKvReadiness;
+  brokerOutage?: RealBrokerOutage;
   now(): number; advance(ms: number): void;
   close(): Promise<void>;
 }
@@ -83,7 +88,7 @@ interface Pair {
  */
 interface Integration {
   /** Fresh isolated cohort per test, including initially empty presence/leases buckets. */
-  pair(skip: Skip): Promise<Pair>;
+  pair(skip: Skip, options?: RealPairOptions): Promise<Pair>;
   /** B-owned fixture operations on this pair's REAL ordered push watch, never event synthesis.
    * These are test composition hooks, not guessed production exports. Missing hooks are explicit
    * skipped coverage, or failures for mandatory NATS T-READY with FABRIC_TRANSPORT_REQUIRED=1.
@@ -116,8 +121,8 @@ interface Integration {
   flip?: (carrier: "file" | "nats") => Promise<{ sender: FabricControlPlane; receiver: FabricControlPlane }>;
 }
 const integrations: Partial<Record<AdapterKind, Integration>> = {
-  file: { pair: skip => realPair("file", skip) },
-  nats: { pair: skip => realPair("nats", skip) },
+  file: { pair: (skip, options) => realPair("file", skip, options) },
+  nats: { pair: (skip, options) => realPair("nats", skip, options) },
 };
 // Explicit required mode still fails missing capabilities; the real constructor is always probed.
 const transportIntegrated = process.env.PI_FABRIC_TRANSPORT_CONTROL_INTEGRATED === "1";
@@ -183,8 +188,8 @@ function command(pair: Pair, id = nextId("command"), patch: Partial<Parameters<t
     replyTo: pair.sender.self.hostId, message: "bounded conformance input", ...patch });
 }
 
-async function realPair(kind: "file" | "nats", skip: Skip): Promise<Pair> {
-  const result = await openRealAdapterPair(kind, required);
+async function realPair(kind: "file" | "nats", skip: Skip, options?: RealPairOptions): Promise<Pair> {
+  const result = await openRealAdapterPair(kind, required, options);
   if (result.status === "skip") return skip(result.reason);
   const raw = result.pair, hooks = new FaultHooks();
   // Never wrap NATS with synthetic PubAck/connection failures. FILE port-only probes may use
@@ -192,14 +197,15 @@ async function realPair(kind: "file" | "nats", skip: Skip): Promise<Pair> {
   const wrap = (port: FabricTransport) => kind === "file" ? withFaults(port, hooks) : port;
   const pair: Pair = { sender: wrap(raw.sender), receiver: wrap(raw.receiver), raw, hooks,
     ...(raw.kvReadiness ? { kvReadiness: raw.kvReadiness } : {}),
+    ...(raw.brokerOutage ? { brokerOutage: raw.brokerOutage } : {}),
     now: Date.now, advance: () => { throw new Error("real carrier fixture has no virtual clock capability"); },
     reopenReceiver: async () => { pair.receiver = wrap(await raw.reopenReceiver()); return pair.receiver; },
     close: () => raw.close() };
   return pair;
 }
 
-async function openPair(kind: AdapterKind, skip: Skip): Promise<Pair> {
-  if (integrations[kind]) return integrations[kind]!.pair(skip);
+async function openPair(kind: AdapterKind, skip: Skip, options?: RealPairOptions): Promise<Pair> {
+  if (integrations[kind]) return integrations[kind]!.pair(skip, options);
   if (kind === "stub") {
     let time = Date.now();
     const bus = createStubBus(() => time), hooks = new FaultHooks();
@@ -290,11 +296,11 @@ describe.each(adapterKinds)("transport conformance / %s", kind => {
     if (kind === "nats" && required) throw new Error(`mandatory NATS T-READY fixture missing: ${reason}`);
     return skip(reason);
   }
-  function test(name: string, run: (pair: Pair, signal: AbortSignal, skip: Skip) => Promise<void>, timeoutMs = TIMEOUT) {
+  function test(name: string, run: (pair: Pair, signal: AbortSignal, skip: Skip) => Promise<void>, timeoutMs = TIMEOUT, options?: RealPairOptions) {
     it(name, async context => {
       const started = Date.now();
       const skip: Skip = reason => { context.skip(reason); throw new Error("Vitest skip unexpectedly returned"); };
-      const pair = await openPair(kind, skip), abort = new AbortController();
+      const pair = await openPair(kind, skip, options), abort = new AbortController();
       try {
         // Receipts drive progress. Reserve cleanup time BEFORE Vitest's outer deadline; a
         // failing real iterator must never strand this pair's server until the worker is killed.
@@ -467,17 +473,44 @@ describe.each(adapterKinds)("transport conformance / %s", kind => {
   it.skip("T7 DEFERRED-E19: authenticated operator relay/DLQ; report-only permissions covered by B T-OPS-NOREAD", () => {});
 
   test("T8 broker restart/network cut: live iterator resumes from ack floor; outage send never silently succeeds", async (p, signal, skip) => {
-    const broker = integrations[kind]?.broker;
+    const broker = p.brokerOutage ?? integrations[kind]?.broker;
     if (!broker) skip("real broker restart/network-cut dependency absent; stub does not simulate a server");
-    const iterator = stream(p, signal); await p.sender.send(command(p)); await (await next(iterator)).ack();
+    if (kind === "nats" && !p.brokerOutage) throw new Error("T8 requires its pair-owned real TCP/broker receipts, not a missing fixture");
+    const iterator = stream(p, signal), prime = await p.sender.send(command(p));
+    await (await next(iterator)).ack();
     const outstanding = await p.sender.send(command(p)); const held = await next(iterator);
+    expect(held).toMatchObject({ sequence: outstanding.sequence, attempt: 1,
+      sourceMachine: p.sender.self.machine, verification: "bridge" });
+    expect(payloadMinimum(held.payload)).toEqual(payloadMinimum(outstanding.envelope));
+    const before = await p.brokerOutage?.state();
+    if (before) expect(before).toMatchObject({ ackFloor: prime.sequence, delivered: outstanding.sequence, pending: 0, ackPending: 1 });
+    // Cut actual owned sockets/listener and await real runtime disconnect status BEFORE send.
+    // The carrier, its reconnect policy, USER.INFO check and 30s ack_wait remain untouched.
     await broker!.disconnect();
-    await expect(p.sender.send(command(p))).rejects.toMatchObject({ code: expect.stringMatching(/^FABRIC_TRANSPORT_(UNAVAILABLE|UNCERTAIN)$/) });
+    // UNCERTAIN explicitly permits a queued publish to reach the broker after reconnect.
+    // Address this separate outage probe to the sender's OWN inbox, so it cannot overtake
+    // the receiver's held redelivery. Do not assert that an uncertain attempt never persisted.
+    await expect(boundedReceipt(p.sender.send(command(p, nextId("T8-outage"), { to: p.sender.self })), "T8 real outage publish outcome", 10_000))
+      .rejects.toMatchObject({ code: expect.stringMatching(/^FABRIC_TRANSPORT_(UNAVAILABLE|UNCERTAIN)$/) });
     const pending = iterator.next(); void pending.catch(() => undefined);
     await broker!.restart(); await broker!.reconnect();
-    const replay = await next({ next: () => pending });
-    expect(replay.sequence).toBe(outstanding.sequence); expect(payloadMinimum(replay.payload)).toEqual(payloadMinimum(held.payload)); await replay.ack();
-  });
+    if (before) {
+      const after = await p.brokerOutage!.state();
+      expect(after.serverId, "actual nats-server incarnation changed, same persistent store").not.toBe(before.serverId);
+      expect(after).toMatchObject({ durable: before.durable, filter: before.filter,
+        ackFloor: before.ackFloor, pending: 0, ackPending: 1 });
+    }
+    // SAME iterator, no NAK/working/fabricated replay/reopen. The unchanged broker ack_wait
+    // is the event source; allow a production-policy redelivery after the actual restart.
+    const replay = await next({ next: () => pending }, contractTiming.ackWaitMs + 15_000, "T8 same live iterator broker replay");
+    expect(replay.attempt).toBeGreaterThanOrEqual(2);
+    expect(replay).toMatchObject({ sourceMachine: held.sourceMachine, verification: held.verification });
+    expect(replay.sequence).toBe(outstanding.sequence); expect(payloadMinimum(replay.payload)).toEqual(payloadMinimum(held.payload));
+    expect(JSON.stringify(replay.payload), "entire resolved envelope is byte-identical").toBe(JSON.stringify(held.payload));
+    await replay.ack();
+    expect(await p.receiver.drainState()).toEqual({ pending: 0, ackPending: 0 });
+    if (p.brokerOutage) expect(await p.brokerOutage.state()).toMatchObject({ ackFloor: outstanding.sequence, pending: 0, ackPending: 0 });
+  }, TIMEOUT, { brokerOutage: true });
 
   test("T9 real NATS durable reopen: stable hostId replays unacked work, confirmed ACK survives reopen", async (p, signal, skip) => {
     if (kind !== "nats") skip("durable broker cursor is NATS-only; FILE owner restart/control-seen parity is tested separately");
@@ -588,7 +621,7 @@ describe.each(adapterKinds)("transport conformance / %s", kind => {
 
   test("T11 DiscardNew capacity: typed not-persisted refusal and alarm, no eviction", async (p, signal, skip) => {
     const broker = integrations[kind]?.broker;
-    if (!broker) skip("real isolated stream-capacity dependency absent; §1 stub has no fake capacity/alarm engine");
+    if (!broker) skip("STOP T11: inbox.ts send/publishFailure only throws TransportCapacityError; no production alarm receipt is exposed on that traced path. Tiny direct maxBytes is not the fixed 1GiB factory policy; never record caught errors as alarmCodes");
     await broker!.setCapacity(2048);
     const kept = await p.sender.send(command(p));
     await expect(p.sender.send(command(p, nextId("T11"), { message: "x".repeat(4096) })))
@@ -706,8 +739,9 @@ describe.each(adapterKinds)("transport conformance / %s", kind => {
     await snapshotThenReady(iterator, [{ key, machine, owner: writer, value: updated, revision: second }]);
     const final = await kv.put(key, writer, { generation: 4 }, second, signal);
     expect(await next(iterator)).toMatchObject({ type: "put", entry: { key, revision: final, value: { generation: 4 } } });
-    // These are PORT receipts. Actual A2 resolve() must throw FABRIC_DIRECTORY_NOT_READY after
-    // reset until the new marker; testing that awaits the real watch/view composition fixture.
+    // These are PORT receipts. Real A2 reset→not-ready→new ready view composition is covered
+    // separately in transport-faults/presence-leases.test.ts (hosted reset opt-in). That public
+    // class proof is not installed application-root wiring coverage.
     // Each real deletion can take two missed 30s heartbeats. Both have separate 75s receipt
     // deadlines and leave room for setup/cleanup; no consumer-info polling or fake reset.
   }, kind === "nats" ? 210_000 : TIMEOUT);
@@ -848,9 +882,16 @@ describe.each(adapterKinds)("transport conformance / %s", kind => {
     expect(await kv.get(key)).toBeUndefined();
   });
 
+  // T16 is supplied by B's real server suites in the required hosted nats-auth job:
+  // tests/nats-auth-path-b-cli.test.ts:236-263 uses a CLI-minted machine-A JWT against
+  // foreign FABRIC_IN_machine-b CREATE/INFO/MSG.NEXT/DELETE and a LIVE foreign ACK reply,
+  // plus forged source, MSG.GET, foreign KV and private inbox. Companion server suite
+  // T-OPS-NOREAD adds DIRECT.GET, report-only operator and stream lifecycle denials.
+  // PermissionOracle checks real PermissionViolationError.operation/subject, not a local
+  // allow-list. This standalone optional probe is not independently made green by citation.
   test("T16 real permission negatives: source spoof/foreign consumers/ACK/raw reads/KV/inbox/stream lifecycle", async (p, _signal, skip) => {
     const b = integrations[kind]?.broker;
-    if (!b || kind !== "nats") skip("real per-machine runtime credentials required; no stub allow-list proof");
+    if (!b || kind !== "nats") skip("T16 real JWT matrix is owned by tests/nats-auth-path-b-cli.test.ts:236-263 and server T-OPS-NOREAD, both required hosted nats-auth suites; no stub allow-list proof");
     const foreign = `FABRIC_IN_${b!.foreignMachine}`;
     const denied: [string, string][] = [
       ["publish", `fabric.in.${b!.foreignMachine}.owner.cmd.target.${b!.foreignMachine}`],

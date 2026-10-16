@@ -644,6 +644,85 @@ export interface RealKvReadiness {
   reset(bucket: TransportBucket, prefix: string, signal: AbortSignal): Promise<void>;
   holdConsumption(bucket: TransportBucket, prefix: string, signal: AbortSignal): Promise<RealKvConsumptionProbe>;
 }
+/** Read-only receipts from the destination's runtime credential, never bootstrap/body reads. */
+export interface RealBrokerState {
+  readonly serverId: string;
+  readonly durable: string;
+  readonly filter: string | undefined;
+  readonly ackFloor: number;
+  readonly delivered: number;
+  readonly pending: number;
+  readonly ackPending: number;
+}
+export interface RealBrokerOutage {
+  disconnect(): Promise<void>;
+  restart(): Promise<void>;
+  reconnect(): Promise<void>;
+  state(): Promise<RealBrokerState>;
+}
+export interface RealPairOptions { readonly brokerOutage?: boolean }
+
+/** Transparent TCP only: no NATS frame parsing, client-method override, synthetic error or
+ * delivery engine. The listener and BOTH ends of every owned pipe close on cut, including
+ * sockets still connecting. Socket/status events drive progress; timers are finite deadlines.
+ */
+async function openOutageProxy(upstreamUrl: string) {
+  const { createServer, createConnection } = await import("node:net");
+  const upstream = new URL(upstreamUrl);
+  const sockets = new Set<import("node:net").Socket>();
+  let forwarding = true;
+  const server = createServer(client => {
+    if (!forwarding) { client.destroy(); return; }
+    const remote = createConnection({ host: upstream.hostname, port: Number(upstream.port) });
+    for (const socket of [client, remote]) {
+      sockets.add(socket);
+      socket.once("close", () => { sockets.delete(socket); client.destroy(); remote.destroy(); });
+      // Network errors close the actual pipe; they are never mapped into transport errors here.
+      socket.on("error", () => { client.destroy(); remote.destroy(); });
+    }
+    client.pipe(remote); remote.pipe(client);
+  });
+  const listen = async (port: number) => {
+    let onError: ((error: Error) => void) | undefined;
+    let onListening: (() => void) | undefined;
+    try {
+      await boundedReceipt(new Promise<void>((resolve, reject) => {
+        onError = reject; onListening = resolve;
+        server.once("error", onError); server.once("listening", onListening);
+        server.listen(port, "127.0.0.1");
+      }), "listen on owned outage proxy");
+    } finally {
+      if (onError) server.removeListener("error", onError);
+      if (onListening) server.removeListener("listening", onListening);
+    }
+  };
+  const cut = async () => {
+    forwarding = false;
+    const stopped = server.listening ? new Promise<void>((resolve, reject) => {
+      server.close(error => error ? reject(error) : resolve());
+    }) : Promise.resolve();
+    const closed = [...sockets].map(socket => new Promise<void>(resolve => {
+      socket.once("close", () => resolve()); socket.destroy();
+    }));
+    await boundedReceipt(Promise.all([stopped, ...closed]), "close owned proxy listener and TCP pipes");
+  };
+  try { await listen(0); }
+  catch (error) { await cut(); throw error; }
+  const address = server.address();
+  if (!address || typeof address === "string") { await cut(); throw new Error("outage proxy has no loopback address"); }
+  const port = address.port;
+  return {
+    url: `nats://127.0.0.1:${port}`,
+    cut,
+    resume: async () => {
+      if (server.listening) return;
+      forwarding = true;
+      try { await listen(port); } catch (error) { await cut(); throw error; }
+    },
+    close: cut,
+  };
+}
+
 /** Actual factory carriers, retaining concrete FILE identity. Each NATS pair owns a fresh
  * Path B server/keys/store. close() is always the actual port operation, without a
  * pre-close iterator-return workaround for the superseded raw-consumer yield deadlock.
@@ -652,6 +731,7 @@ export interface RealAdapterPair {
   readonly sender: FabricTransport;
   readonly receiver: FabricTransport;
   readonly kvReadiness?: RealKvReadiness;
+  readonly brokerOutage?: RealBrokerOutage;
   reopenReceiver(): Promise<FabricTransport>;
   close(): Promise<void>;
 }
@@ -659,7 +739,7 @@ export type RealAdapterPairResult =
   | { readonly status: "ready"; readonly pair: RealAdapterPair }
   | { readonly status: "skip"; readonly reason: string };
 
-export async function openRealAdapterPair(kind: "file" | "nats", required = false): Promise<RealAdapterPairResult> {
+export async function openRealAdapterPair(kind: "file" | "nats", required = false, options: RealPairOptions = {}): Promise<RealAdapterPairResult> {
   const unavailable = (reason: string): RealAdapterPairResult => {
     if (required) throw new Error(`${kind} transport required: ${reason}`);
     return { status: "skip", reason };
@@ -678,6 +758,8 @@ export async function openRealAdapterPair(kind: "file" | "nats", required = fals
   const mesh = new MeshStore(root, DEFAULT_FABRIC_CONFIG.mesh.maxEventBytes, DEFAULT_FABRIC_CONFIG.mesh.maxReadEvents,
     { stateBackend: "file", canWakeResidents: () => false });
   let server: import("./nats-cluster.js").PathBHarness | undefined;
+  let proxy: Awaited<ReturnType<typeof openOutageProxy>> | undefined;
+  let outageConnection: import("../../src/transport/nats/connection.js").NatsConnectionHandle | undefined;
   const opened = new Set<FabricTransport>();
   const probes = new Set<RealKvConsumptionProbe>();
   let cleaning: Promise<void> | undefined;
@@ -687,14 +769,29 @@ export async function openRealAdapterPair(kind: "file" | "nats", required = fals
       for (const result of await Promise.allSettled(operations)) if (result.status === "rejected") errors.push(result.reason);
     };
     try {
+      // Restore the owned network before draining real clients, including assertion-failure
+      // paths that leave it cut. A failed restore must not skip the remaining cleanup.
+      if (proxy) await settle([proxy.resume()]);
       // B's callback consumer must close independently of public yields. Do not return
       // inboxes here to make close succeed; T-CLOSE-SUSPENDED checks that contract directly.
       await settle([...opened].map(port => boundedReceipt(port.close(), "close actual fixture transport")));
       await settle([...probes].map(probe => boundedReceipt(probe.close(), "close KV scheduling probe")));
     } finally {
       // Even a broken return()/close() cannot strand this fixture's real child at Vitest's deadline.
-      try { await server?.stop(); }
-      finally { mesh.closeState(); rmSync(root, { recursive: true, force: true }); }
+      try {
+        // This public observation handle is not a carrier. Close it even while disconnected,
+        // then join its production status reader; no listener/reconnect task is left behind.
+        if (outageConnection) {
+          await settle([boundedReceipt(outageConnection.nc.close(), "close outage runtime observer")]);
+          await settle([boundedReceipt(outageConnection.close(), "join outage runtime status reader")]);
+        }
+      } finally {
+        try { await server?.stop(); }
+        finally {
+          try { await proxy?.close(); }
+          finally { mesh.closeState(); rmSync(root, { recursive: true, force: true }); }
+        }
+      }
     }
     if (errors.length) throw new AggregateError(errors, "real transport fixture cleanup failed");
   })();
@@ -721,11 +818,12 @@ export async function openRealAdapterPair(kind: "file" | "nats", required = fals
             subjects: [subjects.transportInboxStreamSubject(machine)] });
         }
       } finally { await bootstrap.close(); }
+      if (options.brokerOutage) proxy = await openOutageProxy(server.serverUrl);
     }
     const open = async (side: "sender" | "receiver"): Promise<FabricTransport> => {
       const user = side === "sender" ? server?.users.machineA : server?.users.machineB;
       const config: FabricTransportOptions["config"] = { ...DEFAULT_FABRIC_CONFIG.mesh, transport: kind,
-        ...(server && user ? { nats: { ...DEFAULT_FABRIC_CONFIG.mesh.nats, servers: [server.serverUrl],
+        ...(server && user ? { nats: { ...DEFAULT_FABRIC_CONFIG.mesh.nats, servers: [proxy?.url ?? server.serverUrl],
           machine: user.machine, credentials: user.credsPath, operatorMachine: "fabric-ops" } } : {})
       };
       const result = await openAdapter({ kind, options: { config, mesh, hostId: `session:${side}` },
@@ -821,8 +919,46 @@ export async function openRealAdapterPair(kind: "file" | "nats", required = fals
         } catch (error) { gate.release(); await connection.close(); throw error; }
       },
     } : undefined;
+    let brokerOutage: RealBrokerOutage | undefined;
+    if (server && proxy) {
+      const [{ openNatsConnection }, { transportInboxStream, transportDurableName }] = await Promise.all([
+        import("../../src/transport/nats/connection.js"), import("../../src/transport/nats/subjects.js"),
+      ]);
+      const user = server.users.machineB;
+      // Read-only CONSUMER.INFO/status observer under the receiver's actual runtime JWT.
+      // E12 remains on, just as in both factory carriers. No bootstrap survives setup.
+      const connection = outageConnection = await openNatsConnection({
+        servers: proxy.url, credentials: user.credsPath, machine: user.machine,
+      });
+      const afterStatus = async (type: "disconnect" | "reconnect", operation: () => Promise<void>) => {
+        let observed!: () => void;
+        const event = new Promise<void>(resolve => { observed = resolve; });
+        const remove = connection.onStatus(status => { if (status.type === type) observed(); });
+        try {
+          await operation();
+          await boundedReceipt(event, `real runtime ${type} status after owned network change`, 10_000);
+        } finally { remove(); }
+      };
+      brokerOutage = {
+        disconnect: () => afterStatus("disconnect", () => proxy!.cut()),
+        restart: () => boundedReceipt(server!.restart(), "restart owned Path B server with same persistent root", 30_000),
+        reconnect: async () => {
+          await afterStatus("reconnect", () => proxy!.resume());
+          await boundedReceipt(connection.nc.flush(), "flush reconnected runtime observer");
+        },
+        state: async () => {
+          const info = await boundedReceipt(connection.manager.consumers.info(
+            transportInboxStream(receiver.self.machine), transportDurableName(receiver.self.hostId)), "runtime destination durable INFO");
+          const serverId = connection.nc.info?.server_id;
+          if (!serverId) throw new Error("real broker INFO has no server incarnation");
+          return { serverId, durable: info.name, filter: info.config.filter_subject,
+            ackFloor: info.ack_floor.stream_seq, delivered: info.delivered.stream_seq,
+            pending: info.num_pending, ackPending: info.num_ack_pending };
+        },
+      };
+    }
     return { status: "ready", pair: { sender, get receiver() { return receiver; },
-      ...(kvReadiness ? { kvReadiness } : {}),
+      ...(kvReadiness ? { kvReadiness } : {}), ...(brokerOutage ? { brokerOutage } : {}),
       reopenReceiver: async () => { await boundedReceipt(receiver.close(), "close receiver before durable reopen"); receiver = await open("receiver"); return receiver; },
       close: cleanup } };
   } catch (error) { await cleanup(); throw error; }

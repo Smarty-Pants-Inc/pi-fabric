@@ -315,6 +315,7 @@ export class MeshLock {
     // smarty-dev#9805: only the canonical mesh lock opts into the early free-lock bypass of a stalled head.
     const admission = createMeshLockAdmission(this.root, token, waitMs, { stalledHeadBypassLock: this.#lockPath });
     const { ticket, deadline } = admission;
+    const elapsedDeadline = performance.now() + waitMs;
     // The shared admission helper fixes the relative budget only after setup; expiry cannot grant admission.
     try {
       // Attempts and the largest gap between two of them: a large gap means this waiter stalled
@@ -324,6 +325,17 @@ export class MeshLock {
       let lastAttemptAt = Date.now();
       let retryAttempt = 0;
       let waited = false;
+      let waitSetupExpired = false;
+      const wait = async (ms: number): Promise<void> => {
+        const pending = ticket.queued
+          ? ticket.wait(ms, this.#writeAbortSignal, deadline)
+          : delay(ms, this.#writeAbortSignal);
+        // Invocation includes synchronous watch setup: retain its fixed-deadline refusal.
+        // After yielding, wall-clock lease time can jump independently of the relative timer.
+        waitSetupExpired = Date.now() > deadline;
+        await pending;
+        waited = true;
+      };
       const timeout = (): MeshLockTimeoutError => {
         // Keep a foreign-holder refusal typed even when the deadline is crossed during a wait.
         if (blocked.verdict) {
@@ -339,8 +351,7 @@ export class MeshLock {
         if (!ticket.mayContend()) {
           if (Date.now() < deadline) {
             // Woken when the predecessor's receipt goes; the short poll is only a safety net.
-            await ticket.wait(Math.min(20, Math.max(0, deadline - Date.now())), this.#writeAbortSignal, deadline);
-            waited = true;
+            await wait(Math.min(20, Math.max(0, deadline - Date.now())));
             continue;
           }
           // Expiry never grants FIFO admission: only an eligible head may probe at its deadline. Keep the legacy
@@ -348,9 +359,9 @@ export class MeshLock {
           throw admission.expire(this.#lockPath, this.root, "mesh-lock", lockClass);
         }
         const attemptAt = Date.now();
-        // Both waits can spend the remaining budget in watch setup. Keep the initial/exact-deadline
-        // probes, but never acquire after a wait has crossed the fixed deadline.
-        if (waited && attemptAt > deadline) {
+        // Both waits can spend the budget in setup or resume late, even on a release signal.
+        // Keep initial/exact-deadline probes; asynchronous waits spend monotonic, not wall time.
+        if (waited && (waitSetupExpired || performance.now() > elapsedDeadline)) {
           if (attempts === 0 && ticket.queued) throw admission.expire(this.#lockPath, this.root, "mesh-lock", lockClass);
           throw timeout();
         }
@@ -419,9 +430,8 @@ export class MeshLock {
           if (Date.now() >= deadline) throw timeout();
           // Only the FIFO head probes promptly, woken when .lock is released. After the bounded
           // admission fallback, full jitter spreads plain contenders; the deadline bounds every sleep.
-          if (ticket.queued) await ticket.wait(Math.min(10, Math.max(0, deadline - Date.now())), this.#writeAbortSignal, deadline);
-          else await delay(retryDelayMs(retryAttempt++, 20, 250, deadline - Date.now()), this.#writeAbortSignal);
-          waited = true;
+          await wait(ticket.queued ? Math.min(10, Math.max(0, deadline - Date.now()))
+            : retryDelayMs(retryAttempt++, 20, 250, deadline - Date.now()));
         }
       }
       pin = pinFenceLock(this.#lockPath, ownerRecord);

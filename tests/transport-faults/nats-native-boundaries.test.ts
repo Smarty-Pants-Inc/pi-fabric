@@ -760,7 +760,9 @@ describe.skipIf(!HOSTED_PRODUCT_DELETE)("HOSTED AUTHOR-ONLY E4 native NATS B5 â€
       const cli = path.join(REPO, "node_modules/@earendil-works/pi-coding-agent/dist/cli.js");
       if (!fs.existsSync(cli)) throw new Error("Pinned native Pi CLI is missing; not an optional broker skip");
       const remaining = variant === "durable-host-kill" || variant === "session-main-kill";
-      const root = fs.mkdtempSync(path.join(remaining ? path.join(REPO, ".local") : os.tmpdir(), "fabric-nats-native-e4-")); roots.push(root);
+      const parent = remaining ? path.join(REPO, ".local") : os.tmpdir();
+      fs.mkdirSync(parent, { recursive: true, mode: 0o700 });
+      const root = fs.mkdtempSync(path.join(parent, "fabric-nats-native-e4-")); roots.push(root);
       if (remaining) fs.mkdirSync(path.join(root, "runs"), { mode: 0o700 });
       const model = await loopback(root); const log = launchLog(root); logs.push(log);
       const nats = nativeNatsSettings(h);

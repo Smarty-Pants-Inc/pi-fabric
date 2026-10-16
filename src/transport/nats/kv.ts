@@ -1,0 +1,255 @@
+import { Readable } from "node:stream";
+import {
+  DeliverPolicy,
+  JetStreamApiError,
+  StorageType,
+  type ConsumerMessages,
+  type JetStreamClient,
+  type JsMsg,
+} from "@nats-io/jetstream";
+import { Kvm, type KV, type KvEntry } from "@nats-io/kv";
+import type { SubscribeNatsStatus } from "./connection.js";
+import type { TransportKv, TransportKvEntry, TransportKvEvent } from "../types.js";
+import { KvConflictError, TransportDeniedError, TransportInvalidError, TransportUncertainError } from "../types.js";
+import { publishFailure } from "./errors.js";
+
+export const LEASES_BUCKET = "fabric_leases";
+export const PRESENCE_BUCKET = "fabric_presence";
+export const LEASE_TTL_MS = 15_000;
+export const PRESENCE_TTL_MS = 10 * 60_000;
+export const KV_TTL_MS = LEASE_TTL_MS;
+export const KV_MARKER_TTL_MS = 5 * 60_000;
+export const KV_MAX_VALUE_SIZE = 64 * 1024;
+export { KvConflictError as NatsKvConflictError } from "../types.js";
+export type { TransportKvEntry as NatsKvEntry, TransportKvEvent as NatsKvEvent } from "../types.js";
+
+const MACHINE = /^[a-z0-9][a-z0-9-]{0,31}$/;
+const KEY_TOKEN = /^[A-Za-z0-9_-]{1,128}$/;
+const CONFLICT_CODES = new Set([10071, 10164]);
+
+export interface NatsKvPolicy {
+  readonly bucket: string;
+  readonly ttlMs?: number;
+  readonly markerTtlMs?: number;
+}
+
+const apiCode = (error: unknown): number | undefined => error instanceof JetStreamApiError ? error.apiError().err_code : undefined;
+const abort = (signal?: AbortSignal): void => signal?.throwIfAborted();
+
+const validateMachine = (machine: string): string => {
+  if (!MACHINE.test(machine)) throw new TransportInvalidError("invalid machine token");
+  return machine;
+};
+
+const splitKey = (key: string): readonly [string, string, string] => {
+  const parts = key.split(".");
+  if (parts.length !== 3 || !MACHINE.test(parts[0]!) || !/^(h|p)$/.test(parts[1]!) || !KEY_TOKEN.test(parts[2]!)) {
+    throw new TransportInvalidError("invalid KV key");
+  }
+  return parts as [string, string, string];
+};
+
+const validatePrefix = (prefix: string): void => {
+  const parts = prefix.split(".");
+  if (parts.length > 3 || parts.some((token, index) =>
+    token === ">" ? index !== parts.length - 1 : token !== "*" && !KEY_TOKEN.test(token))) {
+    throw new TransportInvalidError("invalid KV watch prefix");
+  }
+};
+
+const decodeValue = <V>(key: string, value: Uint8Array, revision: number): TransportKvEntry<V> => {
+  const [machine] = splitKey(key);
+  const parsed = JSON.parse(new TextDecoder().decode(value)) as { owner?: unknown; value?: V };
+  if (!parsed || typeof parsed.owner !== "string" || !("value" in parsed)) throw new TransportInvalidError("invalid KV value");
+  return { key, machine, owner: parsed.owner, value: parsed.value as V, revision };
+};
+const decode = <V>(entry: KvEntry): TransportKvEntry<V> => decodeValue(entry.key, entry.value, entry.revision);
+
+const assertPolicy = async (bucket: KV, policy: Required<NatsKvPolicy>): Promise<void> => {
+  const status = await bucket.status();
+  if (status.ttl !== policy.ttlMs || status.history !== 1 || status.markerTTL !== policy.markerTtlMs ||
+    status.storage !== StorageType.File || status.replicas !== 1 || status.maxValueSize !== KV_MAX_VALUE_SIZE ||
+    status.streamInfo.config.allow_direct !== false) {
+    throw new Error(`NATS KV configuration mismatch: ${policy.bucket}`);
+  }
+};
+
+export const openNatsKv = async (js: JetStreamClient, policy: NatsKvPolicy, provision = true, onStatus?: SubscribeNatsStatus): Promise<NatsKvStore> => {
+  const resolved: Required<NatsKvPolicy> = {
+    bucket: policy.bucket,
+    ttlMs: policy.ttlMs ?? (policy.bucket === PRESENCE_BUCKET ? PRESENCE_TTL_MS : LEASE_TTL_MS),
+    markerTtlMs: policy.markerTtlMs ?? KV_MARKER_TTL_MS,
+  };
+  if (![resolved.ttlMs, resolved.markerTtlMs].every((value) => Number.isSafeInteger(value) && value > 0)) {
+    throw new TransportInvalidError("KV TTL values must be positive integers");
+  }
+  const manager = new Kvm(js);
+  const options = {
+    ttl: resolved.ttlMs,
+    markerTTL: resolved.markerTtlMs,
+    history: 1,
+    maxValueSize: KV_MAX_VALUE_SIZE,
+    storage: StorageType.File,
+    replicas: 1,
+    allow_direct: false,
+  };
+  const bucket = provision ? await manager.create(resolved.bucket, options) : await manager.open(resolved.bucket, options);
+  await assertPolicy(bucket, resolved);
+  return new NatsKvStore(bucket, resolved, js, onStatus);
+};
+
+export class NatsKvStore implements TransportKv {
+  readonly ttlMs: number;
+  readonly #bucket: KV;
+  readonly #policy: Required<NatsKvPolicy>;
+  readonly #js: JetStreamClient;
+  readonly #onStatus: SubscribeNatsStatus | undefined;
+  #machine = "";
+
+  constructor(bucket: KV, policy: Required<NatsKvPolicy>, js: JetStreamClient, onStatus?: SubscribeNatsStatus) {
+    this.#bucket = bucket;
+    this.#policy = policy;
+    this.#js = js;
+    this.#onStatus = onStatus;
+    this.ttlMs = policy.ttlMs;
+  }
+
+  async get<V>(key: string, signal?: AbortSignal): Promise<TransportKvEntry<V> | undefined> {
+    abort(signal);
+    splitKey(key);
+    const entry = await this.#bucket.get(key);
+    abort(signal);
+    return entry?.operation === "PUT" ? decode<V>(entry) : undefined;
+  }
+
+  async put<V>(key: string, owner: string, value: V, ifRevision: number, signal?: AbortSignal): Promise<number> {
+    abort(signal);
+    this.#assertWriter(key, ifRevision, true);
+    if (typeof owner !== "string" || owner.length === 0) throw new TransportInvalidError("KV owner must be non-empty");
+    const encoded = JSON.stringify({ owner, value });
+    if (new TextEncoder().encode(encoded).byteLength > KV_MAX_VALUE_SIZE) throw new TransportInvalidError("KV value is too large");
+    let revision: number;
+    try {
+      revision = ifRevision === 0
+        ? await this.#bucket.create(key, encoded)
+        : await this.#bucket.update(key, encoded, ifRevision);
+    } catch (error) {
+      if (CONFLICT_CODES.has(apiCode(error) ?? -1)) throw new KvConflictError(key, ifRevision);
+      throw publishFailure(error, key, { owner, value });
+    }
+    if (signal?.aborted) throw new TransportUncertainError(key, { owner, value }, { cause: signal.reason });
+    return revision;
+  }
+
+  async delete(key: string, ifRevision: number, signal?: AbortSignal): Promise<boolean> {
+    abort(signal);
+    this.#assertWriter(key, ifRevision, false);
+    try {
+      await this.#bucket.delete(key, { previousSeq: ifRevision });
+    } catch (error) {
+      if (CONFLICT_CODES.has(apiCode(error) ?? -1)) return false;
+      throw publishFailure(error, key, undefined);
+    }
+    if (signal?.aborted) throw new TransportUncertainError(key, undefined, { cause: signal.reason });
+    return true;
+  }
+
+  #assertWriter(key: string, revision: number, create: boolean): void {
+    const [machine] = splitKey(key);
+    if (machine !== this.#machine) throw new TransportDeniedError("KV write is outside the credential's machine prefix");
+    if (!Number.isSafeInteger(revision) || revision < (create ? 0 : 1)) throw new TransportInvalidError("invalid KV revision");
+  }
+
+  async *watch<V>(prefix: string, signal: AbortSignal): AsyncIterable<TransportKvEvent<V>> {
+    validatePrefix(prefix);
+    const stream = `KV_${this.#policy.bucket}`;
+    const subjectPrefix = `$KV.${this.#policy.bucket}.`;
+    while (!signal.aborted) {
+      const queue = new Readable({ objectMode: true, read() {} });
+      let messages: ConsumerMessages | undefined;
+      let reset = false;
+      let ready = false;
+      let reconnect: Promise<void> | undefined;
+      let releaseReconnect: (() => void) | undefined;
+      const emit = (event: TransportKvEvent<V>): void => { if (!queue.readableEnded && !queue.destroyed) queue.push(event); };
+      const end = (): void => { messages?.stop(); if (!queue.destroyed) queue.push(null); };
+      const gap = (): void => {
+        if (reset || signal.aborted) return;
+        reset = true;
+        emit({ type: "reset" });
+        end();
+      };
+      const stop = (): void => { releaseReconnect?.(); end(); };
+      signal.addEventListener("abort", stop, { once: true });
+      const unsubscribe = this.#onStatus?.((status) => {
+        if (status.type === "disconnect") {
+          reconnect = new Promise<void>((resolve) => { releaseReconnect = resolve; });
+          gap();
+        }
+        if (status.type === "reconnect" || status.type === "close") releaseReconnect?.();
+      });
+      try {
+        // The official ordered consumer exposes the creation snapshot and status markers
+        // hidden by KV.watch(). No keys() race or private client fields are involved.
+        const consumer = await this.#js.consumers.getPushConsumer(stream, {
+          filter_subjects: `${subjectPrefix}${prefix}`,
+          deliver_policy: DeliverPolicy.LastPerSubject,
+        });
+        const snapshot = await consumer.info(true);
+        const apply = (msg: JsMsg): void => {
+          if (reset || signal.aborted) return;
+          const key = msg.subject.slice(subjectPrefix.length);
+          const operation = msg.headers?.get("KV-Operation");
+          if (operation === "DEL" || operation === "PURGE") {
+            const [machine] = splitKey(key);
+            emit({ type: "gone", key, machine, revision: msg.info.streamSequence,
+              reason: msg.headers?.get("Nats-Marker-Reason") === "MaxAge" ? "expired" : "deleted" });
+          } else {
+            emit({ type: "put", entry: decodeValue<V>(key, msg.data, msg.info.streamSequence) });
+          }
+          if (!ready && msg.info.pending === 0) {
+            ready = true;
+            emit({ type: "ready" });
+          }
+        };
+        if (snapshot.num_pending === 0) {
+          ready = true;
+          emit({ type: "ready" });
+        }
+        messages = await consumer.consume({ callback: apply });
+        const statusTask = (async () => {
+          for await (const status of messages!.status()) {
+            if (["heartbeats_missed", "ordered_consumer_recreated", "consumer_deleted", "stream_not_found"].includes(status.type)) gap();
+            if (status.type === "heartbeat" && !ready && !reset) {
+              ready = true;
+              emit({ type: "ready" });
+            }
+          }
+        })();
+        const closedTask = messages.closed().then(() => { if (!signal.aborted) gap(); else end(); });
+        for await (const event of queue) yield event as TransportKvEvent<V>;
+        await messages.close();
+        await Promise.all([statusTask, closedTask]);
+        if (reconnect && !signal.aborted) await reconnect;
+      } finally {
+        signal.removeEventListener("abort", stop);
+        messages?.stop();
+        unsubscribe?.();
+        queue.destroy();
+      }
+      if (!reset) return;
+    }
+  }
+
+  /** Bind writes to one machine; reads and watches remain fleet-wide. */
+  withMachine(machine: string): NatsKvStore {
+    const copy = new NatsKvStore(this.#bucket, this.#policy, this.#js, this.#onStatus);
+    copy.#machine = validateMachine(machine);
+    return copy;
+  }
+}
+
+export const openNatsKvForMachine = async (js: JetStreamClient, bucket: "leases" | "presence", machine: string, provision = true, onStatus?: SubscribeNatsStatus): Promise<NatsKvStore> => {
+  validateMachine(machine);
+  return (await openNatsKv(js, { bucket: bucket === "leases" ? LEASES_BUCKET : PRESENCE_BUCKET }, provision, onStatus)).withMachine(machine);
+};

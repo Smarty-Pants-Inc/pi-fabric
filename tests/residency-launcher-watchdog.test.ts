@@ -38,7 +38,8 @@ class FakeChild extends EventEmitter {
   renewing = true;
   onSignal?: (signal: string) => void;
   timer: ReturnType<typeof setInterval>;
-  constructor(readonly config: ResidentHostConfig, readonly index: number, alwaysStall: boolean, noLease: boolean) {
+  constructor(readonly config: ResidentHostConfig, readonly index: number, alwaysStall: boolean, noLease: boolean,
+    readonly token = "fixture-owner-token") {
     super();
     this.pid = 900_000 + index;
     mocks.alive.add(this.pid);
@@ -47,7 +48,7 @@ class FakeChild extends EventEmitter {
     setTimeout(() => {
       this.emit("spawn");
       fs.writeFileSync(path.join(config.residencyRoot, "owner.json"), JSON.stringify({
-        hostId: "fixture-host", token: "fixture-owner-token", pid: this.pid, processStartTime: "fixture-birth", startedAt: Date.now(),
+        hostId: "fixture-host", token: this.token, pid: this.pid, processStartTime: "fixture-birth", startedAt: Date.now(),
       }));
       if (!noLease) this.renew();
     }, 0);
@@ -56,7 +57,7 @@ class FakeChild extends EventEmitter {
   exit(code = 1): void {
     clearInterval(this.timer); mocks.alive.delete(this.pid); this.emit("exit", code, null);
   }
-  ready(maintenanceToken = "fixture-owner-token"): void {
+  ready(maintenanceToken = this.token): void {
     const file = path.join(this.config.residencyRoot, "owner.json");
     const owner = JSON.parse(fs.readFileSync(file, "utf8"));
     fs.writeFileSync(file, JSON.stringify({ ...owner, readyAt: Date.now(), maintenanceReady: 1 }));
@@ -95,8 +96,8 @@ const fixture = (settings: ResidentHostConfig["watchdog"] = {}, alwaysStall = fa
   fs.writeFileSync(path.join(root, "config.json"), JSON.stringify(config));
   fs.writeFileSync(path.join(root, "child-stderr.log"), Array.from({ length: 220 }, (_, i) => `line-${i}`).join("\n") + "\n");
   const children: FakeChild[] = [];
-  mocks.spawn.mockImplementation(() => {
-    const child = new FakeChild(config, children.length, alwaysStall, noLease);
+  mocks.spawn.mockImplementation((_command, _args, options) => {
+    const child = new FakeChild(config, children.length, alwaysStall, noLease, options.env.PI_FABRIC_RESIDENT_GENERATION);
     children.push(child); return child as unknown as ChildProcess;
   });
   const controller = new AbortController();
@@ -349,8 +350,9 @@ describe.skipIf(process.platform === "win32")("launcher resident-unhosted alarm"
     } finally { await f.close(); }
   }, 20_000);
 
-  it.each(["child-exit", "custody", "wake-refused"] as const)("awaits immediate %s publication before supervise returns or throws", async reason => {
-    alarmClock(); const f = fixture({ enabled: false }, false, false, 1, ROOT_SESSION, reason === "child-exit");
+  it.each(["child-exit", "exit-0-unreceipted", "custody", "wake-refused"] as const)("awaits immediate %s publication before supervise returns or throws", async reason => {
+    alarmClock(); const childExit = reason === "child-exit" || reason === "exit-0-unreceipted";
+    const f = fixture({ enabled: false }, false, false, 1, ROOT_SESSION, childExit);
     let release!: () => void;
     const held = new Promise<void>(resolve => { release = resolve; });
     const original = MeshStore.prototype.publish;
@@ -360,8 +362,8 @@ describe.skipIf(process.platform === "win32")("launcher resident-unhosted alarm"
     let observed: Promise<unknown> | undefined;
     try {
       let operation: Promise<void>;
-      if (reason === "child-exit") {
-        await vi.advanceTimersByTimeAsync(1); f.children[0]!.exit(); operation = f.done;
+      if (childExit) {
+        await vi.advanceTimersByTimeAsync(1); f.children[0]!.exit(reason === "exit-0-unreceipted" ? 0 : 1); operation = f.done;
       } else if (reason === "custody") {
         fs.writeFileSync(path.join(f.root, "watchdog-custody.json"), "{}");
         operation = supervise(path.join(f.root, "config.json"));
@@ -378,7 +380,7 @@ describe.skipIf(process.platform === "win32")("launcher resident-unhosted alarm"
       else expect(error).toBeUndefined();
       expect(alarms(f)).toEqual([expect.objectContaining({ to: f.config.rootId,
         data: expect.objectContaining({ reason, state: "outage", root: f.config.rootId }) })]);
-      expect(f.children).toHaveLength(reason === "child-exit" ? 1 : 0);
+      expect(f.children).toHaveLength(childExit ? 1 : 0);
     } finally {
       release(); await vi.advanceTimersByTimeAsync(100); await observed; await f.close();
     }
@@ -448,27 +450,61 @@ describe.skipIf(process.platform === "win32")("launcher resident-unhosted alarm"
   }, 20_000);
 });
 
+// Keep: exact receipt attribution must work on both sides of the first 50ms owner sample.
 describe("launcher intentional idle exit", () => {
-  it("makes no late diagnostic write even when the host retires before the first owner sample", async () => {
+  it.each([1, 51])("makes no late diagnostic write for a matching receipt at %sms", async at => {
     alarmClock();
     const f = fixture({ enabled: false });
     try {
-      await vi.advanceTimersByTimeAsync(1);
+      await vi.advanceTimersByTimeAsync(at);
       const child = f.children[0]!;
       fs.writeFileSync(path.join(f.root, "idle-exit.json"), JSON.stringify({ format: 1, reason: "root-dead-idle",
-        rootId: f.config.rootId, pid: child.pid, token: "fixture-owner-token", at: Date.now(), idleMs: 1 }));
-      clearInterval(child.timer);
-      mocks.alive.delete(child.pid);
-      child.emit("exit", 0, null);
+        rootId: f.config.rootId, pid: child.pid, token: child.token, at: Date.now(), idleMs: 1 }));
+      fs.unlinkSync(path.join(f.root, "owner.json")); // Real idle retirement releases the owner before native exit.
+      const sharedSnapshot = () => Object.fromEntries(fs.readdirSync(f.root).filter(name => name !== "generations").map(name => {
+        const stat = fs.statSync(path.join(f.root, name)); return [name, `${stat.size}:${stat.mtimeMs}`];
+      }));
+      const before = sharedSnapshot();
+      child.exit(0);
       await vi.advanceTimersByTimeAsync(100);
       await f.done;
       expect(f.children).toHaveLength(1);
       expect(f.events().filter(row => row.event === "child-exit")).toEqual([]);
+      expect(sharedSnapshot()).toEqual(before);
       expect(fs.existsSync(path.join(f.root, "error.json"))).toBe(false);
       expect(fs.existsSync(path.join(f.root, "resident-unhosted.json"))).toBe(false);
       await vi.advanceTimersByTimeAsync(300_000); await settleAlarms();
+      expect(sharedSnapshot()).toEqual(before);
       expect(fs.existsSync(path.join(f.root, "resident-unhosted.json"))).toBe(false);
       expect(alarms(f)).toEqual([]);
+    } finally { await f.close(); }
+  }, 20_000);
+
+  it.each([
+    { at: 1, receipt: "none" }, { at: 51, receipt: "none" },
+    { at: 1, receipt: "different" }, { at: 51, receipt: "different" },
+  ])("alarms on exit 0 with $receipt receipt at $at ms, preserving the native exit episode", async ({ at, receipt }) => {
+    alarmClock(); const f = fixture({ enabled: false });
+    try {
+      await vi.advanceTimersByTimeAsync(at);
+      const child = f.children[0]!;
+      if (receipt === "different") fs.writeFileSync(path.join(f.root, "idle-exit.json"), JSON.stringify({
+        format: 1, reason: "root-dead-idle", rootId: f.config.rootId, pid: child.pid,
+        token: "different-generation", at: Date.now(), idleMs: 1,
+      }));
+      fs.unlinkSync(path.join(f.root, "owner.json"));
+      const exitedAt = Date.now();
+      child.exit(0);
+      await Promise.resolve(); // Native exit owns episode creation, before the supervisor's next timer.
+      expect(outage(f)).toMatchObject({ reason: "exit-0-unreceipted", since: exitedAt });
+      const id = outage(f).id;
+      await vi.advanceTimersByTimeAsync(100); await f.done;
+      expect(outage(f)).toMatchObject({ id, since: exitedAt, reason: "exit-0-unreceipted", reportedReason: "exit-0-unreceipted" });
+      expect(alarms(f)).toEqual([expect.objectContaining({ to: f.config.rootId,
+        data: expect.objectContaining({ reason: "exit-0-unreceipted", state: "outage", since: exitedAt }) })]);
+      expect(f.children).toHaveLength(1); // Diagnostics never authorize automatic recovery.
+      await vi.advanceTimersByTimeAsync(300_000); await settleAlarms();
+      expect(alarms(f)).toHaveLength(1);
     } finally { await f.close(); }
   }, 20_000);
 });

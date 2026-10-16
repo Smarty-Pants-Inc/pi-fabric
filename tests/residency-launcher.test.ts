@@ -110,7 +110,12 @@ describe.skipIf(!hasLauncher || process.platform === "win32")("resident launcher
 // #10068: fake timers kept the test runner alive after supervise returned and hid the native-process loss.
 // Keep: the real launcher/child lifetime and durable MeshStore boundary are the regression target here.
 describe.skipIf(!hasLauncher || process.platform === "win32")("resident launcher native unhosted alarm", () => {
-  it("commits its own-root outage before native exit, without IPC keepalive or respawning", { timeout: 25_000 }, async () => {
+  it.each([
+    { code: 23, receipt: "none", reason: "child-exit" },
+    { code: 0, receipt: "none", reason: "exit-0-unreceipted" },
+    { code: 0, receipt: "matching", reason: undefined },
+    { code: 0, receipt: "different", reason: "exit-0-unreceipted" },
+  ] as const)("commits its own-root outage before native exit ($code, $receipt), without IPC keepalive or respawning", { timeout: 25_000 }, async ({ code, receipt, reason }) => {
     const base = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-launcher-unhosted-"));
     const root = path.join(base, "resident");
     const meshRoot = path.join(base, "mesh");
@@ -119,13 +124,22 @@ describe.skipIf(!hasLauncher || process.platform === "win32")("resident launcher
     const rootId = `session:${sessionId}`;
     const hostId = `resident:${createHash("sha256").update(rootId).digest("hex").slice(0, 24)}`;
     const childRuns = path.join(base, "child-runs.jsonl");
+    const released = path.join(base, "released.json");
     const hostBinary = path.join(base, "exiting-host.mjs");
     fs.mkdirSync(root); fs.mkdirSync(actorRoot);
     fs.writeFileSync(path.join(actorRoot, "actors.json"), JSON.stringify({ format: 1,
       actors: [{ id: "native-unhosted-actor", rootId, residency: "durable", status: "waiting" }] }));
-    fs.writeFileSync(hostBinary, `import fs from 'node:fs';
+    fs.writeFileSync(hostBinary, `import fs from 'node:fs'; import path from 'node:path';
+const root = ${JSON.stringify(root)};
 fs.appendFileSync(${JSON.stringify(childRuns)}, JSON.stringify({ pid: process.pid }) + '\\n');
-process.exit(23);
+${receipt === "none" ? "" : `fs.writeFileSync(path.join(root, 'idle-exit.json'), JSON.stringify({ format: 1, reason: 'root-dead-idle',
+  rootId: ${JSON.stringify(rootId)}, pid: process.pid, token: ${receipt === "matching" ? "process.env.PI_FABRIC_RESIDENT_GENERATION" : JSON.stringify(randomUUID())},
+  at: Date.now(), idleMs: 1 }));`}
+${receipt !== "matching" ? "" : `fs.writeFileSync(${JSON.stringify(released)}, JSON.stringify(Object.fromEntries(
+  fs.readdirSync(root).filter(name => name !== 'generations').map(name => {
+    const stat = fs.statSync(path.join(root, name)); return [name, stat.size + ':' + stat.mtimeMs];
+  }))));`}
+process.exit(${code});
 `);
     const configPath = path.join(root, "config.json");
     fs.writeFileSync(configPath, JSON.stringify({ cwd: base, piBinary: hostBinary, rootId, sessionId,
@@ -145,18 +159,29 @@ process.exit(23);
       launcher.once("exit", (code, signal) => resolve({ code, signal }));
     });
     try {
-      expect(await exited, stderr).toEqual({ code: 23, signal: null });
+      expect(await exited, stderr).toEqual({ code, signal: null });
       expect(launcher.connected).toBe(false);
       // Read immediately after OS process exit: no sleep, retry, synthetic clock, or in-process supervisor.
       const mesh = new MeshStore(meshRoot, 64 * 1024, 100, { stateBackend: "file", canWakeResidents: () => false });
       try {
         const events = mesh.read({ topic: "fabric.alarm.resident-unhosted" });
-        expect(events, stderr).toEqual([expect.objectContaining({ topic: "fabric.alarm.resident-unhosted",
+        expect(events, stderr).toEqual(reason ? [expect.objectContaining({ topic: "fabric.alarm.resident-unhosted",
           kind: "resident-unhosted-outage", to: rootId, from: expect.objectContaining({ id: hostId }),
-          data: expect.objectContaining({ root: rootId, residency: root, actorCount: 1, reason: "child-exit",
-            since: expect.any(Number), state: "outage", hostId, episodeId: expect.any(String), advisory: true }) })]);
-        expect(events[0]!.from).not.toHaveProperty("verified"); // Correlation only; no sender authentication is claimed.
+          data: expect.objectContaining({ root: rootId, residency: root, actorCount: 1, reason,
+            since: expect.any(Number), state: "outage", hostId, episodeId: expect.any(String), advisory: true }) })] : []);
+        if (reason) expect(events[0]!.from).not.toHaveProperty("verified"); // Correlation only, not sender authentication.
       } finally { mesh.closeState(); }
+      if (reason) {
+        expect(JSON.parse(fs.readFileSync(path.join(root, "resident-unhosted.json"), "utf8")))
+          .toMatchObject({ reason, reportedReason: reason });
+      } else {
+        const before = JSON.parse(fs.readFileSync(released, "utf8"));
+        const after = Object.fromEntries(fs.readdirSync(root).filter(name => name !== "generations").map(name => {
+          const stat = fs.statSync(path.join(root, name)); return [name, `${stat.size}:${stat.mtimeMs}`];
+        }));
+        expect(after).toEqual(before); // Exact idle receipt permits no late shared-root diagnostic writes.
+        expect(fs.existsSync(path.join(root, "resident-unhosted.json"))).toBe(false);
+      }
       expect(fs.readFileSync(childRuns, "utf8").trim().split("\n")).toHaveLength(1);
       const rows = fs.readFileSync(path.join(root, "launcher.log"), "utf8").trim().split("\n")
         .map(line => JSON.parse(line) as { event: string });

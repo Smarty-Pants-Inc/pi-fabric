@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 import type { ChildProcess } from "node:child_process";
 import crossSpawn from "cross-spawn";
 import { observeResidentOwner, captureDescendants, stopObservedDescendants, checkResidentSessionExit, type OwnedProcess } from "./launcher-owner.js";
-import { watchResidentChild, type ResidentChildLifetime } from "./child-lifetime.js";
+import { watchResidentChild, type ResidentChildExit, type ResidentChildLifetime } from "./child-lifetime.js";
 import { processStartTime, residentProcessAlive } from "./process-identity.js";
 import { assertResidentWakeConfig, canonicalResidentWakeConfig, retainedRoutesAt, ResidentWakeConfigMismatch } from "./wake-index.js";
 import { readWakeJson, residentOwnerLive, residentOwnerSleeping, residentSleepingPath, residentWakeRequestPath, residentWakeIntentLockPath, waitResidentChange, ResidentWakePending } from "./wake.js";
@@ -267,7 +267,7 @@ export const pruneResidentChildLogs = (root: string, keep: string, now = Date.no
 
 const RESIDENT_UNHOSTED_TOPIC = "fabric.alarm.resident-unhosted";
 const RESIDENT_UNHOSTED_AFTER_MS = 5 * 60_000;
-type UnhostedReason = "custody" | "wake-refused" | "child-exit";
+type UnhostedReason = "custody" | "wake-refused" | "child-exit" | "exit-0-unreceipted";
 interface UnhostedOutage {
   format: 1; id: string; rootId: string; since: number; reason: UnhostedReason;
   absentSince?: number; reportedReason?: UnhostedReason; recovered?: true;
@@ -308,7 +308,7 @@ const unhostedActors = (root: string, config: ResidentHostConfig): number => {
 const readUnhosted = (root: string, config: ResidentHostConfig): UnhostedOutage | undefined => {
   const value = readWakeJson<UnhostedOutage>(unhostedPath(root));
   return value?.format === 1 && value.rootId === config.rootId && typeof value.id === "string" && Number.isFinite(value.since)
-    && ["custody", "wake-refused", "child-exit"].includes(value.reason) ? value : undefined;
+    && ["custody", "wake-refused", "child-exit", "exit-0-unreceipted"].includes(value.reason) ? value : undefined;
 };
 const unhostedReason = (root: string, fallback: UnhostedReason): UnhostedReason => {
   if (fs.existsSync(watchdogCustodyPath(root)) || handoverActive(readHandoverJson<ResidentHandoverState>(handoverPath(root)))) return "custody";
@@ -508,6 +508,14 @@ async function superviseResident(configPath: string, options: ResidentSuperviseO
   };
   for (const signal of ["SIGINT", "SIGTERM"] as const) process.on(signal, stop);
   options.signal?.addEventListener("abort", stop, { once: true });
+  const childExitReason = (attempt: Attempt, exit: ResidentChildExit): UnhostedReason | undefined => {
+    if (exit.code !== 0 || exit.signal) return "child-exit";
+    const idleExit = readResidentIdleExit(root, (attempt.spec?.config ?? config).rootId);
+    // A short idle window can release before any owner sample. The chosen generation
+    // is already known; a receipt from another generation must never silence an exit.
+    return idleExit?.pid === attempt.child.pid && idleExit?.token === (attempt.ownerToken ?? attempt.generation)
+      ? undefined : "exit-0-unreceipted";
+  };
   const start = (spec?: ResidentLaunchSpec, plan?: ResidentHandoverPlan, kind?: "target" | "fallback", frozenConfigPath?: string): Attempt => {
     const launchConfig = spec?.config ?? config;
     if (options.wakeOnly) assertResidentWakeConfig(root, launchConfig);
@@ -577,8 +585,9 @@ async function superviseResident(configPath: string, options: ResidentSuperviseO
       });
     }
     void attempt.native.exit.then(({ code, signal }) => {
-      // Clean release can already belong to a successor (#2010): never arm a late root writer there.
-      if (!stopping && (code !== 0 || signal)) residentUnhosted(root, "child-exit");
+      // An exact idle receipt is silent; otherwise retain the live-owner/custody guards.
+      const reason = childExitReason(attempt, { code, signal });
+      if (!stopping && reason) residentUnhosted(root, reason);
       // #2010: after an owned release this directory may already belong to the
       // next generation. Do not write its shared files (launcher.log)
       // then. An owned child's exit goes only to its own generation's record
@@ -589,10 +598,7 @@ async function superviseResident(configPath: string, options: ResidentSuperviseO
           reason: "unreported", pid: child.pid ?? 0, at: Date.now(), code, signal });
         return;
       }
-      // A very short configured idle window can release before our first owner sample.
-      const idleExit = readResidentIdleExit(root, launchConfig.rootId);
-      if (code === 0 && !signal && idleExit?.pid === child.pid &&
-          (!attempt.ownerToken || idleExit?.token === attempt.ownerToken)) return;
+      if (!reason) return;
       trace("child-exit", { pid: child.pid, code, signal, kind, seenOwner: attempt.seenOwner });
     });
     child.once("spawn", () => {
@@ -845,9 +851,7 @@ async function superviseResident(configPath: string, options: ResidentSuperviseO
       }
       const exit = await attempt.native.exit;
       if (stopping) { if (custodyFd !== undefined) fs.closeSync(custodyFd); return; }
-      const idleExit = readResidentIdleExit(root, config.rootId);
-      if (!plan && exit.code === 0 && !exit.signal && idleExit && idleExit.pid === attempt.child.pid &&
-          (!attempt.ownerToken || idleExit.token === attempt.ownerToken)) {
+      if (!plan && !childExitReason(attempt, exit)) {
         // The host has released this directory: another generation may already own it.
         // Like every other clean child exit, never make a late diagnostic mutation (#2010).
         process.exitCode = 0;
@@ -940,7 +944,7 @@ async function superviseResident(configPath: string, options: ResidentSuperviseO
       const exit = current?.native.exited ? await current.native.exit : undefined;
       // A live watchdog launcher owns its deferred deadline; a departing failed launcher cannot leave it behind.
       // A clean idle exit must not create a late diagnostic writer.
-      await finishUnhosted(root, exit && (exit.code !== 0 || exit.signal) ? "child-exit" : undefined);
+      await finishUnhosted(root, exit && current ? childExitReason(current, exit) : undefined);
     }
   }
 }

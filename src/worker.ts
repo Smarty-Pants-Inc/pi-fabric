@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { childProcessEnvironment } from "./core/atomic-write.js";
+import { diagnostics } from "./core/diagnostics.js";
 import { detachedPreview } from "./core/preview.js";
 import fs from "node:fs";
 import { followUpFile, followUpState, followUpMessageId, releaseFollowUpPayload } from "./agents/follow-up-delivery.js";
@@ -298,7 +299,7 @@ const executionGroups = new WeakMap<ChildProcess, ReturnType<typeof executionGro
 let executionCleanup: () => Promise<void> = async () => {};
 const terminateChild = (child: ChildProcess, signal: NodeJS.Signals): void => {
   try { executionGroups.get(child)?.signal(signal); }
-  catch (error) { console.error(`Execution cleanup unresolved: ${String(error)}`); }
+  catch (error) { diagnostics.error("src/worker.ts", `Execution cleanup unresolved: ${String(error)}`); }
 };
 
 
@@ -328,7 +329,7 @@ const crash = createCrashFinisher({
   settled: () => executionSettled(),
   report: writeCrashStatus,
   exit: code => process.exit(code),
-  log: text => console.error(text),
+  log: text => diagnostics.error("src/worker.ts", text),
   // Keep the custodian available to its parent even if no native pipes remain.
   retain: () => { setInterval(() => {}, 1000); },
 });

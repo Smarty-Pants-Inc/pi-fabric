@@ -1,4 +1,5 @@
 import { childProcessEnvironment } from "../core/atomic-write.js";
+import { diagnostics } from "../core/diagnostics.js";
 import { detachedPreview } from "../core/preview.js";
 import { copyFabricPrincipal, copyFabricProvenance, type FabricPrincipal, type FabricTurnProvenance } from "../fabric-provenance.js";
 import { createHash, randomUUID } from "node:crypto";
@@ -1687,12 +1688,41 @@ export class AgentManager {
     return runtime;
   }
 
+  async #recordSpawnRouterStart(request: AgentRunRequest, agentId: string, model: string | undefined, thinking: AgentRunRequest["thinking"], sessionFile?: string, managed?: ManagedAgent): Promise<void> {
+    const decisionId = (request as AgentRunRequest & { spawnRouterDecisionId?: unknown }).spawnRouterDecisionId;
+    const meshRoot = request.meshRoot ?? this.#meshRoot;
+    if (typeof decisionId !== "string" || !decisionId || !meshRoot) return;
+    try {
+      const { recordSpawnRouterStart } = await import("./spawn-router.js");
+      const observed = managed && readRecord(managed.statusFile);
+      const record = observed?.id === agentId ? observed : undefined;
+      const pi = ["pi", "pi-durable"].includes(request.runner ?? this.config.runner);
+      await recordSpawnRouterStart({ meshRoot, decisionId, agentId, sessionId: pi ? record?.runnerSessionId ?? null : null,
+        ...(sessionFile && pi ? { sessionFile } : {}),
+        model: model ?? null, thinking: thinking ?? null,
+        launch: { runId: managed?.id ?? null, pid: managed?.ownProcess?.pid ?? null,
+          processStartTime: managed?.ownProcess?.started ?? null },
+        verified: record?.status === "running" && managed?.settled === false && !managed.launchCancelled,
+        evidenceRef: record && managed ? path.relative(meshRoot, managed.statusFile) : null });
+    } catch { /* Ledger writes never change launch behavior. */ }
+  }
+
+  async #recordSpawnRouterStartFailed(request: AgentRunRequest): Promise<void> {
+    const decisionId = (request as AgentRunRequest & { spawnRouterDecisionId?: unknown }).spawnRouterDecisionId;
+    const meshRoot = request.meshRoot ?? this.#meshRoot;
+    if (typeof decisionId !== "string" || !decisionId || !meshRoot) return;
+    try {
+      const { recordSpawnRouterStartFailed } = await import("./spawn-router.js");
+      await recordSpawnRouterStartFailed({ meshRoot, decisionId });
+    } catch { /* Ledger writes never change launch behavior. */ }
+  }
+
   /** authorize is host-only activation authority; unlike a guest deadline it survives queuing.
    * beforeCommit is a separate resident-host mutation fence, checked after model preparation.
    * callerReturnAddress is a validated resident caller snapshot, never a task request field.
    */
   spawn(request: AgentRunRequest, signal?: AbortSignal, authorize?: () => boolean, beforeCommit?: (id: string) => void, onOutputPrincipalDowngrade?: () => void, onLaunched?: (handle: AgentHandleInfo) => void, preparation?: AgentLaunchPreparationOptions, callerReturnAddress?: TaskReturnAddress): Promise<AgentHandleInfo> {
-    if (this.#closing) return Promise.reject(new Error("Fabric agent manager is closing"));
+    if (this.#closing) return this.#recordSpawnRouterStartFailed(request).then(() => { throw new Error("Fabric agent manager is closing"); });
     // smarty-dev#9855: at admission, free the permits of launches now proven gone, before asking for one.
     this.#releaseProvenGone();
     // pi-fabric#939 P2-a: the 6 h re-alarm is also due on every admission attempt, where a stuck state is felt.
@@ -1700,13 +1730,23 @@ export class AgentManager {
     // This is a host-only no-inference worker flag, never a guest admission override.
     const probe = request.residentStartupProbe === true && (request.runner ?? this.config.runner) === "pi" &&
       (request.transport ?? this.config.transport) === "process" && !request.sessionSeed && !request.actorId;
-    if (request.residentStartupProbe && !probe) return Promise.reject(new Error("Invalid resident startup probe"));
+    if (request.residentStartupProbe && !probe) return this.#recordSpawnRouterStartFailed(request).then(() => { throw new Error("Invalid resident startup probe"); });
     request = { ...request };
     const returnAddress = callerReturnAddress && structuredClone(callerReturnAddress);
+    const routerDecisionId = (request as AgentRunRequest & { spawnRouterDecisionId?: unknown }).spawnRouterDecisionId;
+    const routerStart = { settled: typeof routerDecisionId !== "string" || routerDecisionId.length === 0 };
     const pending = (async () => {
-      while (this.#releasePaused && !probe) await this.#waitForRelease(signal);
-      if (this.#closing) throw new Error("Fabric agent manager is closing");
-      return this.#spawn(request, signal, authorize, beforeCommit, onOutputPrincipalDowngrade, onLaunched, preparation, returnAddress);
+      try {
+        while (this.#releasePaused && !probe) await this.#waitForRelease(signal);
+        if (this.#closing) throw new Error("Fabric agent manager is closing");
+        return await this.#spawn(request, signal, authorize, beforeCommit, onOutputPrincipalDowngrade, onLaunched, preparation, returnAddress, routerStart);
+      } catch (error) {
+        if (!routerStart.settled) {
+          routerStart.settled = true;
+          await this.#recordSpawnRouterStartFailed(request);
+        }
+        throw error;
+      }
     })();
     this.#spawns.add(pending);
     void pending.then(() => this.#spawns.delete(pending), () => this.#spawns.delete(pending));
@@ -1798,7 +1838,7 @@ export class AgentManager {
     return true;
   }
 
-  async #spawn(request: AgentRunRequest, signal?: AbortSignal, authorize?: () => boolean, beforeCommit?: (id: string) => void, onOutputPrincipalDowngrade?: () => void, onLaunched?: (handle: AgentHandleInfo) => void, preparation?: AgentLaunchPreparationOptions, callerReturnAddress?: TaskReturnAddress): Promise<AgentHandleInfo> {
+  async #spawn(request: AgentRunRequest, signal?: AbortSignal, authorize?: () => boolean, beforeCommit?: (id: string) => void, onOutputPrincipalDowngrade?: () => void, onLaunched?: (handle: AgentHandleInfo) => void, preparation?: AgentLaunchPreparationOptions, callerReturnAddress?: TaskReturnAddress, routerStart?: { settled: boolean }): Promise<AgentHandleInfo> {
     if (!this.config.enabled) throw new Error("Agents are disabled in Fabric configuration");
     if (this.#currentDepth >= this.config.maxDepth) {
       throw new Error(`Fabric agent depth limit reached (${this.config.maxDepth})`);
@@ -1993,6 +2033,7 @@ export class AgentManager {
         ? { model: request.routeDecision.model, effort: request.routeDecision.effort } : request.routeDecision.pin) });
       model = routePin.model;
     }
+    const routerStartState = routerStart ?? { settled: true };
     const startPrepared = async (release: () => void, signal = admissionSignal): Promise<AgentHandleInfo> => {
       try {
         while (this.#releasePaused && !request.residentStartupProbe) await this.#waitForRelease(signal);
@@ -2191,7 +2232,7 @@ export class AgentManager {
           ...(scope ? { scope } : {}),
         };
         if (hostedAdapter) {
-          return await this.#startHosted(hostedAdapter, launchContext, {
+          const handle = await this.#startHosted(hostedAdapter, launchContext, {
             request,
             release,
             signal,
@@ -2202,6 +2243,11 @@ export class AgentManager {
             ...(branch ? { branch } : {}),
             ...(worktree ? { worktree } : {}),
           });
+          if (!routerStartState.settled) {
+            routerStartState.settled = true;
+            await this.#recordSpawnRouterStart(request, handle.id, launchContext.model, launchContext.thinking, undefined, this.#runs.get(handle.id));
+          }
+          return handle;
         }
         const sessionExportDir = resolveSessionExportDir(this.config);
         const sessionExportFile = sessionExportDir
@@ -2511,6 +2557,10 @@ export class AgentManager {
         } });
         // A queued receipt is not a worker. Notify only after launch and registration.
         try { onLaunched?.(handle); } catch { /* observers must not undo a launched worker */ }
+        if (!routerStartState.settled) {
+          routerStartState.settled = true;
+          await this.#recordSpawnRouterStart(request, id, model, thinking, sessionFile, managed);
+        }
         return handle;
       } catch (error) {
         // An unconfirmed launch may have started a worker that already uses the worktree
@@ -2549,6 +2599,10 @@ export class AgentManager {
           // pi-fabric#939 round 3: event-driven, no polling. The launched process's own close event re-checks the
           // proof; a release wakes the admission waiters through the semaphore.
           void (obligation as { closed?: Promise<unknown> }).closed?.then(() => this.#releaseProvenGone(), () => this.#releaseProvenGone());
+          if (!routerStartState.settled) {
+            routerStartState.settled = true;
+            await this.#recordSpawnRouterStartFailed(request);
+          }
           return this.#queuedInfo(queued);
         }
         release();
@@ -2564,12 +2618,16 @@ export class AgentManager {
     const start = async (release: () => void, signal = admissionSignal): Promise<AgentHandleInfo> => {
       try { return await startPrepared(release, signal); }
       catch (error) {
+        if (!routerStartState.settled) {
+          routerStartState.settled = true;
+          await this.#recordSpawnRouterStartFailed(request);
+        }
         // Cover preparation writes and worktree creation as well as transport failures,
         // without releasing admission while an unconfirmed worker retains custody.
         if ((error as { launchOutcome?: string } | undefined)?.launchOutcome !== "unknown") release();
         if ((error as { launchOutcome?: string } | undefined)?.launchOutcome !== "unknown" && !this.#queued.has(id)) {
           try { routeDispatch?.outcome({ status: signal?.aborted ? "stopped" : "failed" }); }
-          catch (saveError) { console.warn(`[pi-fabric] Pre-worker route outcome save failed; files retained at ${path.join(this.#runRoot, id)}: ${String(saveError)}`); }
+          catch (saveError) { diagnostics.warn("src/agents/manager.ts", `[pi-fabric] Pre-worker route outcome save failed; files retained at ${path.join(this.#runRoot, id)}: ${String(saveError)}`); }
         }
         throw error;
       }
@@ -2600,7 +2658,12 @@ export class AgentManager {
       ...(request.capabilityRequirements ? { capabilityRequirements: [...request.capabilityRequirements] } : {}),
       ...(request.capabilityDigest ? { capabilityDigest: request.capabilityDigest } : {}),
       ...(request.runnerSessionId ? { runnerSessionId: request.runnerSessionId } : {}),
-    }, request.task, start, authorize ? callerSignal : undefined, routeDispatch?.outcome, completionRecipient);
+    }, request.task, start, authorize ? callerSignal : undefined, routeDispatch?.outcome, completionRecipient, routerStartState.settled ? undefined : async () => {
+      if (!routerStartState.settled) {
+        routerStartState.settled = true;
+        await this.#recordSpawnRouterStartFailed(request);
+      }
+    });
   }
 
   #enqueue(
@@ -2610,6 +2673,7 @@ export class AgentManager {
     ownerSignal?: AbortSignal,
     routeOutcome?: (result: AgentRunResult) => void,
     completionRecipient?: CompletionRecipient,
+    onStartFailed?: () => Promise<void>,
   ): AgentHandleInfo {
     const abort = new AbortController();
     // Guest receipts belong to the session, not a program deadline. Host-owned
@@ -2641,6 +2705,7 @@ export class AgentManager {
           return;
         }
         release?.();
+        await onStartFailed?.();
         this.#settleQueued(queued, signal.aborted ? "stopped" : "failed", error);
       }
     })();
@@ -2797,7 +2862,7 @@ export class AgentManager {
         heldPermits: this.heldPermits(), maxConcurrent: this.config.maxConcurrent, at: Date.now(),
         message: `run ${runId}: its recovered answer could not be saved for its spawner; its admission permit stays held ` +
           "while the save is retried (smarty-dev#9855)" };
-      console.warn(`[pi-fabric] ${alarm.message}`);
+      diagnostics.warn("src/agents/manager.ts", `[pi-fabric] ${alarm.message}`);
       try { this.#onAdmissionAlarm?.(structuredClone(alarm)); } catch { /* the stderr line stands */ }
     }
     const tries = managed.recoveryRetries ?? 0;
@@ -2825,7 +2890,7 @@ export class AgentManager {
     const alarm: AgentAdmissionAlarm = { heldPermits: held, maxConcurrent: this.config.maxConcurrent, at: now,
       message: `${held} of ${this.config.maxConcurrent} agent admission permits are held by launches whose exit is ` +
         "unconfirmed; new spawns queue behind them (smarty-dev#9855)" };
-    console.warn(`[pi-fabric] ${alarm.message}`);
+    diagnostics.warn("src/agents/manager.ts", `[pi-fabric] ${alarm.message}`);
     try { this.#onAdmissionAlarm?.(structuredClone(alarm)); } catch { /* the stderr line stands */ }
   }
 
@@ -2889,7 +2954,7 @@ export class AgentManager {
       } catch (error) { failure = error; }
     }
     const warning = `Routing outcome save failed; queued run retained: ${String(failure)}`;
-    if (!queued.routeSaveFailure) console.warn(`[pi-fabric] ${warning}`);
+    if (!queued.routeSaveFailure) diagnostics.warn("src/agents/manager.ts", `[pi-fabric] ${warning}`);
     queued.terminal.warnings = [...(queued.terminal.warnings ?? []).filter(item => item !== queued.routeSaveFailure), warning];
     queued.routeSaveFailure = warning;
     this.#invalidateUiList();
@@ -3881,7 +3946,9 @@ export class AgentManager {
   // otherwise spawn refuses it and the marker is untouched), and it settles nothing: the actor commits after it
   // delivered the answer (commitEnodevRecovery). An uncommitted recovery keeps the marker and the answer.
   #recoverEnodevRun(request: AgentRunRequest, signal?: AbortSignal, authorize?: () => boolean): AgentRunResult | undefined {
-    if (!request.actorId || !request.activationId || process.platform !== "linux") return undefined;
+    if (!request.actorId || !request.activationId) return undefined;
+    // The receipt is Linux ENODEV evidence, but replay needs no Linux APIs:
+    // peekEnodevRun still requires a provably dead worker on every platform.
     if (signal?.aborted || (authorize && !authorize())) return undefined;
     this.#enodevRuns ??= enodevUnresolvedRuns(this.#runRoot);
     for (const directory of this.#enodevRuns) {
@@ -3942,11 +4009,11 @@ export class AgentManager {
       this.#enodevRuns = this.#enodevRuns.filter(other => other !== directory);
       this.#retentionRevision++;
       if (enodevDelivered(directory, path.basename(directory), activationId)) {
-        console.warn(`[pi-fabric] actor ${actorId}: run ${path.basename(directory)} settled as delivered: its activation ` +
+        diagnostics.warn("src/agents/manager.ts", `[pi-fabric] actor ${actorId}: run ${path.basename(directory)} settled as delivered: its activation ` +
           `${activationId} was delivered and acknowledged before a restart (ENODEV, smarty-dev#8935)`);
         continue;
       }
-      console.warn(`[pi-fabric] actor ${actorId}: run ${path.basename(directory)} settled as lost: its activation ${activationId} ` +
+      diagnostics.warn("src/agents/manager.ts", `[pi-fabric] actor ${actorId}: run ${path.basename(directory)} settled as lost: its activation ${activationId} ` +
         "is no longer pending and its worker exit was unconfirmed (ENODEV, smarty-dev#8935)");
     }
     this.#releaseProvenGone(); // smarty-dev#9855: a run this settle proved gone frees its held permit in the same step

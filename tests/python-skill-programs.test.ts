@@ -50,6 +50,7 @@ describe.skipIf(!availablePythonBackends.monty)("Python-native skill behavior in
       if (ref === "agents.peers") return [{ id: "peer" }];
       if (ref === "agents.run") return completed();
       if (ref === "agents.spawn") return { id: "child" };
+      if (ref === "agents.actorStatus") return { id: args.id, topics: ["org.work.v1"] };
       if (ref === "mesh.put") return { key: args.key, version: 1 };
       return "example";
     };

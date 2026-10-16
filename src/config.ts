@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { diagnostics } from "./core/diagnostics.js";
 import { readHostPolicy, warnAgentLandlockDisabled, type HostPolicy } from "./host-policy.js";
 export { readHostPolicy } from "./host-policy.js";
 import type { ModelRoutingConfig } from "./agents/model-route.js";
@@ -337,7 +338,7 @@ export const normalizeDeadRootFilterConfig = (value: unknown): FabricDeadRootFil
   if (!deadRootExemptWarnings.has(shape)) {
     if (deadRootExemptWarnings.size >= 64) deadRootExemptWarnings.clear();
     deadRootExemptWarnings.add(shape);
-    console.warn(`[pi-fabric] agents.deadRootFilter.exempt must be an array of non-empty strings (got ${shape}); the dead-root filter is disabled.`);
+    diagnostics.warn("src/config.ts", `[pi-fabric] agents.deadRootFilter.exempt must be an array of non-empty strings (got ${shape}); the dead-root filter is disabled.`);
   }
   return { mode: "off", exempt: [] };
 };
@@ -430,6 +431,9 @@ export interface FabricRetentionConfig {
   /** Minimum terminal finishedAt age before legacy retirement (default 48 hours). */
   legacyRunArchiveAgeMs?: number;
 }
+
+/** Aggregate serialized event/image budget for an opt-in actor batch; single oversized events run alone. */
+export const DEFAULT_ACTOR_BATCH_MAX_BYTES = 256 * 1024;
 
 export interface FabricActorsConfig {
   /** Reset an actor's Pi session at a run boundary once its file exceeds this many bytes; 0 disables. */

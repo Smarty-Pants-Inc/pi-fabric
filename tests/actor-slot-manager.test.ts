@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ActorDirectory } from "../src/actors/directory.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
+import { ActorSlotClaimRefusedError } from "../src/actors/slot-authority.js";
 import type { AgentManager } from "../src/agents/manager.js";
 import type { FabricActorRequest } from "../src/actors/types.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
@@ -372,5 +373,53 @@ describe("manager protected birth/recovery seam", () => {
     expect(actor.topics).toEqual([protectedTopic]);
     expect(directory.listOwned().map(actor => actor.id)).toEqual([actor.id]);
     expect(intents).toEqual([]);
+    expect((await directory.setTopics(actor.id, [])).topics).toEqual([]);
+  });
+
+  it.each(["project", "session"] as const)("refuses %s protected topic clear before mutation; restart recovers original slot/topics/queue", async scope => {
+    const { directory, actorRoots, root } = open();
+    const actor = await directory.create(request(scope));
+    const queued = directory.tell(actor.id, "accepted before clear");
+    const history = directory.messages(actor.id);
+    const row = () => { const { status: _status, ...rest } = new ActorRegistryStore(actorRoots[scope]).snapshot().actors.find(row => row.id === actor.id)!; return rest; };
+    // tell() persists queue/history asynchronously; settle it before the baseline.
+    await vi.waitFor(() => expect(row()).toMatchObject({ messageHistory: { count: 1 } }));
+    const registryBefore = row();
+    expect(registryBefore).toMatchObject({ topics: [protectedTopic], rootId: identity.id });
+    const updatedAt = directory.status(actor.id).updatedAt;
+    for (const topics of [[], [protectedTopic], ["ordinary.work"], [protectedTopic, "ordinary.work"]]) {
+      const failure = await directory.setTopics(actor.id, topics).catch(error => error);
+      expect(failure).toBeInstanceOf(ActorSlotClaimRefusedError);
+      expect(failure).toMatchObject({ code: "FABRIC_ACTOR_SLOT_CLAIM_REFUSED", reason: "invalid", details: { issue: "smarty-dev#13463" } });
+    }
+    expect(directory.status(actor.id)).toMatchObject({ topics: [protectedTopic], queued: 1, updatedAt });
+    expect(directory.messages(actor.id)).toEqual(history);
+    expect(row()).toEqual(registryBefore);
+    expect(intents).toHaveLength(1);
+    expect(intents[0]).toMatchObject({ actorId: actor.id, state: "admitted", registryRoot: actorRoots[scope] });
+    await directory.close();
+    const restarted = open(root).directory;
+    await restarted.recoverProtectedActors();
+    expect(restarted.status(actor.id)).toMatchObject({ topics: [protectedTopic], queued: 1 });
+    expect((await restarted.create(request(scope))).id).toBe(actor.id);
+    const files = fs.readdirSync(path.join(actorRoots[scope], actor.id)).filter(file => file.startsWith("queue-"));
+    expect(files).toHaveLength(1);
+    expect(fs.readFileSync(path.join(actorRoots[scope], actor.id, files[0]!), "utf8")).toContain(queued.messageId);
+    expect(runner).not.toHaveBeenCalled();
+  });
+
+  it("refuses ordinary-to-protected topic upgrade without mutation; ordinary clear still succeeds", async () => {
+    const { directory, actorRoots } = open();
+    const ordinary = await directory.create({ name: "ordinary-topics", instructions: "unrelated", topics: ["ordinary.work"], scope: "project" });
+    const registryBefore = fs.readFileSync(path.join(actorRoots.project, "actors.json"), "utf8");
+    const updatedAt = directory.status(ordinary.id).updatedAt;
+    const failure = await directory.setTopics(ordinary.id, ["ordinary.work", protectedTopic]).catch(error => error);
+    expect(failure).toBeInstanceOf(ActorSlotClaimRefusedError);
+    expect(failure).toMatchObject({ code: "FABRIC_ACTOR_SLOT_CLAIM_REFUSED", reason: "invalid", details: { issue: "smarty-dev#13463" } });
+    expect(directory.status(ordinary.id)).toMatchObject({ topics: ["ordinary.work"], updatedAt });
+    expect(fs.readFileSync(path.join(actorRoots.project, "actors.json"), "utf8")).toBe(registryBefore);
+    expect(intents).toEqual([]);
+    expect((await directory.setTopics(ordinary.id, [])).topics).toEqual([]);
+    expect(runner).not.toHaveBeenCalled();
   });
 });

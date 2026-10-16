@@ -2,11 +2,12 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import type { CapturedToolCatalog } from "../src/capture/catalog.js";
 import { registerFabricCommand } from "../src/commands/fabric.js";
 import { FABRIC_PREWALK_REQUEST_EVENT } from "../src/protocol.js";
+import { PrewalkController } from "../src/prewalk/controller.js";
 import {
   PREWALK_ARMED_MESSAGE_TYPE,
   prewalkArmedPrompt,
@@ -15,6 +16,37 @@ import type { FabricState } from "../src/fabric-state.js";
 import type { FabricUiController } from "../src/ui/controller.js";
 
 describe("/fabric command", () => {
+  afterEach(() => vi.unstubAllEnvs());
+
+  it.each(["reload", "prewalk --off", "prewalk --cancel"])("keeps unavailable return feedback visible for typed %s in an org pane", async (command) => {
+    vi.stubEnv("SMARTY_ROLE", "org-agent@x");
+    let handler!: (args: string, context: ExtensionContext) => Promise<void>;
+    const pi = { registerCommand: (_name: string, definition: { handler: typeof handler }) => { handler = definition.handler; } } as unknown as ExtensionAPI;
+    const prewalk = new PrewalkController();
+    prewalk.hydrateBorrowedMain({ returnModel: "anthropic/retired", executorModel: "anthropic/executor" });
+    const state = {
+      ensure: vi.fn(async () => {}), initialize: vi.fn(async () => {}), kernelReloadRequired: false,
+      config: { agents: { enabled: true } }, prewalk, prewalkDrift: { drop: vi.fn() },
+    } as unknown as FabricState;
+    const notify = vi.fn();
+    const context = {
+      model: { provider: "anthropic", id: "executor" }, modelRegistry: { find: () => undefined },
+      sessionManager: { getSessionId: () => "session-1", getBranch: () => [] },
+      ui: { notify, setStatus: vi.fn() },
+    } as unknown as ExtensionContext;
+    registerFabricCommand(pi, {
+      state, fabricUi: { stop: vi.fn() } as unknown as FabricUiController,
+      capturedTools: {} as CapturedToolCatalog, applyFabricMode: vi.fn(), suspendToolCapture: vi.fn(),
+    });
+
+    await handler(command, context);
+
+    expect(notify).toHaveBeenCalledWith(
+      "Prewalk left Main on the executor; could not restore unavailable model anthropic/retired.", "error",
+    );
+    expect(notify).toHaveBeenCalledWith(command === "reload" ? "Pi Fabric reloaded" : "Fabric prewalk cancelled", "info");
+  });
+
   it("appends observation-degraded labels to status and adds nothing when health recovers", async () => {
     let handler!: (args: string, context: ExtensionContext) => Promise<void>;
     const pi = { registerCommand: (_name: string, command: { handler: typeof handler }) => { handler = command.handler; } } as unknown as ExtensionAPI;
@@ -39,6 +71,20 @@ describe("/fabric command", () => {
     await handler("status", context);
     expect(notify).toHaveBeenLastCalledWith(healthy, "info");
   });
+  it("preserves thrown activation errors rather than reporting them as import failures", async () => {
+    let handler!: (args: string, context: ExtensionContext) => Promise<void>;
+    const pi = { registerCommand: (_name: string, command: { handler: typeof handler }) => { handler = command.handler; } } as unknown as ExtensionAPI;
+    const failure = new Error("activation failed");
+    const state = { ensure: vi.fn().mockRejectedValue(failure) } as unknown as FabricState;
+    const notify = vi.fn();
+    registerFabricCommand(pi, {
+      state, fabricUi: {} as FabricUiController, capturedTools: {} as CapturedToolCatalog,
+      applyFabricMode: vi.fn(), suspendToolCapture: vi.fn(),
+    });
+    await expect(handler("status", { ui: { notify } } as unknown as ExtensionContext)).rejects.toBe(failure);
+    expect(notify).not.toHaveBeenCalled();
+  });
+
   it("opens the dashboard when invoked without arguments", async () => {
     let handler: ((argumentsText: string, context: ExtensionContext) => Promise<void>) | undefined;
     const pi = {

@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { diagnostics } from "../core/diagnostics.js";
 
 /** setTimeout fires at once for delays above 2^31-1 ms; longer deadlines are reached in chunks. */
 const MAX_TIMER_MS = 2 ** 31 - 1;
@@ -92,7 +93,7 @@ export class RootInboxWatch {
     const message = `root inbox watch failed for ${this.root}: ${error instanceof Error ? error.message : String(error)}; ` +
       "idle wakes wait for turn boundaries and known deadlines";
     // One line per distinct failure; health reports it until a reopen succeeds.
-    if (message !== this.#failure) console.warn(`[pi-fabric] ${message}`);
+    if (message !== this.#failure) diagnostics.warn("src/topology/root-inbox-wake.ts", `[pi-fabric] ${message}`);
     this.#failure = message;
   }
 

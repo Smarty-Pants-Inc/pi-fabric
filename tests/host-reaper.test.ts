@@ -21,10 +21,10 @@ afterEach(async () => {
 
 const HOUR = 60 * 60 * 1000;
 const writer: MeshIdentity = { id: "session:writer", name: "main", kind: "main", sessionId: "writer" };
-const store = () => {
+const store = (stateBackend: "file" | "sqlite" = "file") => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-host-reaper-"));
   roots.push(root);
-  return new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
+  return new MeshStore(path.join(root, "mesh"), 64 * 1024, 100, { stateBackend });
 };
 const hostKey = (id: string) => "topology/hosts/" + createHash("sha256").update(id).digest("hex");
 const host = (mesh: MeshStore, id: string, expiresAt: number) =>
@@ -435,7 +435,7 @@ describe("records of dead hosts", () => {
   });
 
   // smarty-dev#6477 L2b (R11): file leases are read before the state transaction; a lease file
-  // written in between moves the directory stamp, so the transaction reads them again.
+  // written in between moves the directory stamp, so the backend re-reads outside custody.
   it("keeps a host whose file lease renews between the pre-read and the commit", async () => {
     const mesh = store();
     const now = Date.now();
@@ -457,18 +457,58 @@ describe("records of dead hosts", () => {
     writeHostLease(mesh.root, { id: "dead", rootId: "dead", identityId: "dead", updatedAt: now - 8 * HOUR, expiresAt: now - 7 * HOUR });
     const original = mesh.writeBatch.bind(mesh);
     let insideReads = -1;
-    vi.spyOn(mesh, "writeBatch").mockImplementationOnce(async (input) => {
+    vi.spyOn(mesh, "writeBatch").mockImplementationOnce(input => original({ ...input, prepare: (view, files) => {
       const readdir = vi.spyOn(fs, "readdirSync");
       try {
-        return await original({ ...input, prepare: (view) => {
-          const ops = input.prepare?.(view) ?? [];
-          insideReads = readdir.mock.calls.filter(([dir]) => String(dir).endsWith("host-leases")).length;
-          return ops;
-        } });
+        const ops = input.prepare?.(view, files) ?? [];
+        insideReads = readdir.mock.calls.filter(([dir]) => String(dir).endsWith("host-leases")).length;
+        return ops;
       } finally { readdir.mockRestore(); }
-    });
+    } }));
     expect(await reapDeadHostRecords(mesh, writer, { ownHostId: "own", now })).toBe(1);
     expect(insideReads).toBe(0);
+  });
+
+  describe.each(["file", "sqlite"] as const)("%s reaper file-read bracket", stateBackend => {
+    it.each([false, true])("retries one changed lease scan outside custody and defers exhaustion (exhausted=%s)", async exhausted => {
+      const mesh = store(stateBackend), now = Date.now();
+      await host(mesh, "dead", now - 7 * HOUR);
+      await participant(mesh, "dead-root", "dead");
+      writeHostLease(mesh.root, { id: "dead", rootId: "dead", identityId: "dead", updatedAt: now - 8 * HOUR, expiresAt: now - 7 * HOUR });
+      const selected = readHostLeases(mesh.root).get("dead");
+      const original = mesh.writeBatch.bind(mesh);
+      let stamps = 0, reads = 0, prepares = 0, inside = false;
+      vi.spyOn(mesh, "writeBatch").mockImplementationOnce(input => {
+        expect(input.fileRead?.retries).toBe(1);
+        const files = input.fileRead!;
+        return original({ ...input, fileRead: { ...files,
+          read: () => { expect(inside).toBe(false); reads++; return files.read(); },
+          stamp: () => {
+            // The third stamp is checked under state custody. Only an unrelated lease changes;
+            // every selected target gate and its exact-version proof remain held and unchanged.
+            stamps++;
+            if (stamps === 3 || (exhausted && stamps === 6)) writeHostLease(mesh.root, {
+              id: `unrelated-${stamps}`, rootId: "elsewhere", identityId: "elsewhere", updatedAt: now, expiresAt: now + 60_000,
+            });
+            return files.stamp();
+          } }, prepare: (view, value) => {
+          inside = true; prepares++;
+          const readdir = vi.spyOn(fs, "readdirSync");
+          try {
+            const ops = input.prepare?.(view, value) ?? [];
+            expect(readdir.mock.calls.filter(([dir]) => String(dir).endsWith("host-leases"))).toHaveLength(0);
+            return ops;
+          } finally { readdir.mockRestore(); inside = false; }
+        } });
+      });
+      try {
+        expect(await reapDeadHostRecords(mesh, writer, { ownHostId: "own", now })).toBe(exhausted ? 0 : 2);
+        expect(reads).toBe(2); expect(prepares).toBe(exhausted ? 0 : 1);
+        expect(mesh.get(hostKey("dead")) !== undefined).toBe(exhausted);
+        expect(mesh.get("topology/participants/dead-root") !== undefined).toBe(exhausted);
+        expect(readHostLeases(mesh.root).get("dead")).toEqual(exhausted ? selected : undefined);
+      } finally { mesh.closeState(); }
+    });
   });
 
   it("keeps an orphan participant whose host appears before the delete commits", async () => {

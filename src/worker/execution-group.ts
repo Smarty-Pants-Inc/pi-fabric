@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { diagnostics } from "../core/diagnostics.js";
 import type { ChildProcess } from "node:child_process";
 
 /** Only an execution-specific cgroup can become empty while this worker lives.
@@ -44,7 +45,7 @@ const descendantWalkAvailable = (): boolean => {
   if (childrenAvailable !== undefined) return childrenAvailable;
   childrenAvailable = fs.existsSync(`/proc/${process.pid}/task/${process.pid}/children`);
   if (!childrenAvailable) {
-    process.stderr.write("[pi-fabric] /proc/<pid>/task/<tid>/children unavailable; execution-group custody falls back to a full /proc scan\n");
+    diagnostics.stderr("src/worker/execution-group.ts", "[pi-fabric] /proc/<pid>/task/<tid>/children unavailable; execution-group custody falls back to a full /proc scan\n");
   }
   return childrenAvailable;
 };

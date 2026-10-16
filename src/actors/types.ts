@@ -241,6 +241,40 @@ export function normalizeActorActivation(value: unknown): FabricActorActivationP
   return { minIntervalMs };
 }
 
+/** Window batching retains each observation; 0 keeps single-event activation. */
+export interface FabricActorBatching {
+  batchWindowMs?: number;
+  batchMax?: number;
+  /** Aggregate serialized event/image budget; default 256 KiB. One oversized event runs alone. */
+  batchMaxBytes?: number;
+}
+
+export const MAX_ACTOR_BATCH_EVENTS = 1_000;
+
+export class FabricActorBatchPolicyError extends Error {
+  readonly code = "FABRIC_ACTOR_BATCH_POLICY_INVALID";
+  constructor(message: string) {
+    super(message);
+    this.name = "FabricActorBatchPolicyError";
+  }
+}
+
+export function normalizeActorBatching(value: unknown): FabricActorBatching {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) throw new FabricActorBatchPolicyError("Invalid actor batching policy");
+  const input = value as Record<string, unknown>;
+  const result: FabricActorBatching = {};
+  for (const key of ["batchWindowMs", "batchMax", "batchMaxBytes"] as const) {
+    const number = input[key];
+    if (number === undefined) continue;
+    if (typeof number !== "number" || !Number.isSafeInteger(number) || number < (key === "batchWindowMs" ? 0 : 1) ||
+        (key === "batchMax" && number > MAX_ACTOR_BATCH_EVENTS)) {
+      throw new FabricActorBatchPolicyError(`${key} must be a ${key === "batchWindowMs" ? "non-negative" : "positive"} safe integer${key === "batchMax" ? ` <= ${MAX_ACTOR_BATCH_EVENTS}` : ""}`);
+    }
+    result[key] = number;
+  }
+  return result;
+}
+
 /** Exact authoritative claim revision, never a request-supplied caller identity. */
 export interface FabricActorSlotClaim {
   key: string;
@@ -249,8 +283,8 @@ export interface FabricActorSlotClaim {
 
 /** Public creation input; file instructions are resolved only by the actor owner. */
 export type FabricActorCreateRequest = Omit<FabricActorRequest, "instructions"> & import("./instructions-file.js").FabricActorInstructionsSource;
-export interface FabricActorRequest {
-  /** Stable creation retry identity; mandatory for enforced protected slot births. */
+export interface FabricActorRequest extends FabricActorBatching {
+  /** Stable creation retry identity; mandatory for enforced protected slot births. Resident-host retries reuse it. */
   idempotencyKey?: string;
   /** Exact revision won by the authenticated Main on the native slot authority. */
   slotClaim?: FabricActorSlotClaim;
@@ -348,7 +382,7 @@ export interface FabricActorSessionOrphan {
     persisted?: Array<{ by: string; at: number; settledAt?: number; retiredAt?: number; retiredBy?: string }> };
 }
 
-export interface FabricActorInfo {
+export interface FabricActorInfo extends FabricActorBatching {
   id: string;
   scope: FabricActorStorageScope;
   name: string;

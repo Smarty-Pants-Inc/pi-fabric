@@ -1352,6 +1352,14 @@ type RpcOp = "hello" | "latestSequence" | "latestCursor" | "tail" | "read" | "pr
 
 interface RpcRequest { id: number; op: RpcOp; args?: unknown }
 
+/** Diagnostic class only: never used to grant authority or bypass publication fences. */
+const rpcKind = (request: RpcRequest): string => {
+  const events = request.op === "publish" ? [request.args] : request.op === "publishBatch" && Array.isArray(request.args) ? request.args : [];
+  if (events.length && events.every(event => isObject(event) && event.topic === "fabric.control.command")) return "control";
+  if (events.length && events.every(event => isObject(event) && event.topic === "fabric.control.ack")) return "ack";
+  return request.op === "mirror" || request.op === "presence" ? request.op : events.length ? "publish" : "read";
+};
+
 const lines = (input: Readable, onLine: (line: string) => void, onEnd: (error?: Error) => void): void => {
   let buffered = "";
   input.setEncoding("utf8");
@@ -1384,9 +1392,11 @@ const lines = (input: Readable, onLine: (line: string) => void, onEnd: (error?: 
  * only the side operations above against its own mesh, and applies the same allow-list and the
  * pinned peer name to everything it is asked to write. Resolves when the input ends.
  */
-export const serveBridgeAgent = (side: StoreBridgeSide, input: Readable, output: Writable): Promise<void> =>
+export const serveBridgeAgent = (side: StoreBridgeSide, input: Readable, output: Writable,
+  debug?: (message: string) => void): Promise<void> =>
   new Promise((resolve) => {
     let queue = Promise.resolve();
+    let pending = 0; // Debug-only counter; untouched when diagnostics are off.
     let closed = false;
     let unsubscribe: (() => void) | undefined;
     const dispose = (): void => {
@@ -1408,15 +1418,20 @@ export const serveBridgeAgent = (side: StoreBridgeSide, input: Readable, output:
       input,
       (line) => {
         const receivedAt = Date.now(); // Receiver clock BEFORE the serial dispatch/lock wait.
+        const queuedAt = debug ? performance.now() : 0;
+        const queueDepth = debug ? pending++ : 0;
         queue = queue.then(async () => {
           if (closed) return; // stdin may have ended while this request was queued
+          const startedAt = debug ? performance.now() : 0;
           let request: RpcRequest;
           try {
             request = JSON.parse(line) as RpcRequest;
           } catch {
+            if (debug) pending--;
             reply({ id: null, ok: false, error: "Malformed bridge request" });
             return;
           }
+          let result: unknown;
           try {
             // Attach stdin listeners immediately, but prepare before the first hello/snapshot/write.
             // The store refuses rather than waits if a library caller already owns a bounded scope.
@@ -1431,7 +1446,7 @@ export const serveBridgeAgent = (side: StoreBridgeSide, input: Readable, output:
               );
               if (closed) { finish(); return; }
             }
-            const result = await dispatch(side, request, receivedAt);
+            result = await dispatch(side, request, receivedAt);
             if (closed) { finish(); return; }
             reply({ id: request.id, ok: true, result });
           } catch (error) {
@@ -1447,6 +1462,18 @@ export const serveBridgeAgent = (side: StoreBridgeSide, input: Readable, output:
                 : isMeshSnapshotRetriesExhausted(error) ? { code: MESH_SNAPSHOT_RETRIES_EXHAUSTED_CODE }
                   : isMeshRetryableBusy(error) ? { code: MESH_LOCK_TIMEOUT_CODE } : {}),
             });
+          } finally {
+            if (debug) {
+              const endedAt = performance.now();
+              pending--;
+              const presence = request.op === "mirror" ? request.args : request.op === "presence" ? result : undefined;
+              debug(`bridge rpc ${JSON.stringify({ id: request.id, op: request.op, kind: rpcKind(request), queueDepth,
+                queuedAt, startedAt, endedAt, queueMs: startedAt - queuedAt, runMs: endedAt - startedAt,
+                requestBytes: Buffer.byteLength(line, "utf8"),
+                ...(isObject(presence) && Array.isArray(presence.hosts) && Array.isArray(presence.participants)
+                  ? { hosts: presence.hosts.length, participants: presence.participants.length,
+                    presenceBytes: Buffer.byteLength(JSON.stringify(presence), "utf8") } : {}) })}`);
+            }
           }
         });
       },
@@ -2206,7 +2233,15 @@ export class MeshBridge {
 
   /** Mirror each side's live roots into the other; concurrent callers share one pass. */
   syncPresence(): Promise<void> {
-    return this.#presenceSync ??= this.#syncPresence().finally(() => { this.#presenceSync = undefined; });
+    if (this.#presenceSync) {
+      this.options.debug?.("presence sync: joined in-flight pass");
+      return this.#presenceSync;
+    }
+    const startedAt = this.options.debug ? performance.now() : 0;
+    return this.#presenceSync = this.#syncPresence().finally(() => {
+      this.#presenceSync = undefined;
+      this.options.debug?.(`presence sync: settled after ${performance.now() - startedAt} ms`);
+    });
   }
 
   async #syncPresence(): Promise<void> {
@@ -2222,6 +2257,7 @@ export class MeshBridge {
       participants: [...local.participants, ...relays.participants.map(record => ({ ...record, bridgeVia: this.options.localName }))],
     });
     if (outbound.dropped) this.#log(`presence: ${outbound.dropped} hosts pass the frame budget and are not mirrored`);
+    this.options.debug?.(`presence sync: inbound ${remote.hosts.length} hosts/${remote.participants.length} participants; outbound ${outbound.presence.hosts.length} hosts/${outbound.presence.participants.length} participants`);
     // Both settle before a failure is reported, so no local write outlives this pass.
     const results = await Promise.allSettled([this.options.remote.mirror(outbound.presence), this.options.local.mirror(remote, syncedAt)]);
     // A transient failure must not hide a simultaneous permanent/transport failure.

@@ -76,7 +76,7 @@ describe.each(["file", "sqlite"] as const)("%s Round 4 target reaping", backend 
     const s = await fixture(), renewed = { ...s.target, updatedAt: s.now, expiresAt: s.now + 60_000 };
     const writeBatch = s.mesh.writeBatch.bind(s.mesh);
     vi.spyOn(s.mesh, "writeBatch").mockImplementationOnce(input => writeBatch({ ...input,
-      prepare: view => [...(input.prepare?.(view) ?? []), { kind: "put", key: "r4/reaper-race", value: () => {
+      prepare: (view, fileRead) => [...(input.prepare?.(view, fileRead) ?? []), { kind: "put", key: "r4/reaper-race", value: () => {
         writeHostLease(s.root, renewed); return "must not commit";
       } }] }));
     expect(await s.reap()).toBe(0); expect(s.mesh.listAll("", { fresh: true })).toEqual(s.before);

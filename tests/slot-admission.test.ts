@@ -490,6 +490,31 @@ describe.runIf(process.platform === "linux")("same-transaction permanent actor-b
     expect(fs.existsSync(path.join(f.binding.registryRoots[1]!, "actors.json"))).toBe(false); // ledger-only replay
   });
 
+  it("clones large recovery specs after custody and returns detached snapshots", async () => {
+    const f = await fresh(), input = f.input();
+    input.request.instructions = "x".repeat(20_000); input.spec.instructions = input.request.instructions;
+    await f.coordinator.admit(input);
+    let preparing = false, copies = 0;
+    const original = f.mesh.writeBatch.bind(f.mesh), stringify = JSON.stringify;
+    const batch = vi.spyOn(f.mesh, "writeBatch").mockImplementation(input => original({ ...input,
+      prepare: (view, files) => {
+        preparing = true;
+        try { return input.prepare?.(view, files) ?? []; }
+        finally { preparing = false; }
+      } }));
+    const encode = vi.spyOn(JSON, "stringify").mockImplementation((value, replacer, space) => {
+      if (value?.kind === "pair") { expect(preparing).toBe(false); copies++; }
+      return stringify(value, replacer, space);
+    });
+    try {
+      const recovered = await f.coordinator.recoverable(input.registryRoot);
+      expect(copies).toBeGreaterThan(0);
+      expect(recovered[0]?.spec.instructions).toBe(input.request.instructions);
+      recovered[0]!.spec.instructions = "mutated reader copy";
+      expect((await f.coordinator.recoverable(input.registryRoot))[0]?.spec.instructions).toBe(input.request.instructions);
+    } finally { encode.mockRestore(); batch.mockRestore(); }
+  });
+
   it("serializes competing same-role births and keeps one durable incarnation", async () => {
     const f = await fresh(), other = slotAdmissionFor(meshAt(f.mesh.root));
     const rival = f.input("actor:rival"); rival.request.idempotencyKey = "other-request";

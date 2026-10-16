@@ -322,13 +322,13 @@ describe("canonical membership admission while mirrors are deferred", () => {
         const denied = await controls(f.far, sender, f.lead, sender.id);
         await until(() => denied.every(event => f.logs.some(line => line.includes(event.id) && line.endsWith(reason))));
       }
-      // Stamped work from another origin is intentionally rejected, NOT a legitimate control loss.
+      // Stamped work from another origin is silently filtered, NOT a legitimate control loss.
       const echo = await new StoreBridgeSide(f.far, "elsewhere").publish({ topic: "fleet.work.echo.1", kind: "ask",
         from: newcomer, to: f.lead.id, data: { bridge: { from: "elsewhere", id: "intentional-work-echo" } } });
       const echoId = events(f.far).find(event => event.sequence === echo.sequence)!.id;
-      await until(() => f.logs.some(line => line.includes(echoId) && line.endsWith(": not allowed")));
       const barrier = await f.far.publish({ topic: "unrelated", kind: "barrier", from: newcomer });
       await until(() => f.cursor().toLocal.after >= barrier.sequence);
+      expect(f.logs.some(line => line.includes(echoId))).toBe(false);
       expect(events(f.hub).map(stampId)).toEqual(sent.map(event => event.id));
       expect(f.logs.some(line => sent.some(event => line.includes(event.id) && /dropped|refused/.test(line)))).toBe(false);
       expect(f.failure()).toBeUndefined();

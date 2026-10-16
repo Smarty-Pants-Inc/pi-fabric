@@ -78,6 +78,7 @@ import { ActorBindingStore } from "./binding-store.js";
 import { ActorRegistryStore, ActorRegistryUpdateVetoedError } from "./registry-store.js";
 import { ActorSlotCreateUncertainError, slotAdmissionFor } from "./slot-admission.js";
 import { ActorSlotRecovery } from "./slot-recovery.js";
+import { ActorSlotClaimRefusedError } from "./slot-authority.js";
 import { observeActorOwnership, ownershipPointReads } from "../topology/publication-generation.js";
 import { withStateFence } from "../mesh/commit-outbox.js";
 import { deleteRootActorTree } from "../topology/main-publication-fence.js";
@@ -2150,6 +2151,36 @@ export class ActorManager {
     this.#filterQueued(actor);
     this.#replayDeadLetters(actor);
     await this.#publishPresence(actor, true);
+    return this.#publicInfo(actor);
+  }
+
+  /**
+   * Replace an existing actor's exact mesh-topic subscriptions. Removing topics
+   * stops future topic admission without changing already-accepted work, direct
+   * messages or host-event subscriptions. An empty list enables topic drain-only.
+   */
+  async setTopics(id: string, topics: string[]): Promise<FabricActorInfo> {
+    const actor = this.#requireOwnedActor(id);
+    if (!Array.isArray(topics)) throw new Error("topics must be an array of strings");
+    const next = [...new Set(topics)];
+    for (const topic of next) {
+      if (typeof topic !== "string" || !TOPIC_PATTERN.test(topic)) {
+        throw new Error(`Invalid Fabric actor topic: ${String(topic)}`);
+      }
+    }
+    // Native admission binds a protected actor to its original topics. Changing
+    // them (including drain-only []) would bypass slot custody, so refuse before
+    // any mutation. Unenforced/ordinary actors keep the drain-only path.
+    if (this.#slotEnforced(actor.topics) || this.#slotEnforced(next)) {
+      throw new ActorSlotClaimRefusedError("invalid",
+        `Fabric actor ${actor.id} topics are bound to native slot admission and cannot be changed`, "smarty-dev#13463");
+    }
+    this.#assertPresenceValue(this.#presencePreview(actor, { topics: next }));
+    actor.topics = next;
+    actor.updatedAt = Date.now();
+    await this.#publishPresence(actor, true);
+    // Dispatch reads actor.topics live; wake the existing reader, never reset its cursor.
+    this.#meshMonitor.schedule();
     return this.#publicInfo(actor);
   }
 

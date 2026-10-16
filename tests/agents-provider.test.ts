@@ -5253,6 +5253,63 @@ describe("AgentsProvider global actors", () => {
     await expect(provider.invoke("create", { ...createRequest, name: "bad-window", inferenceContext: "invalid" }, context)).rejects.toThrow();
   });
 
+  it.each(["project", "global"] as const)("replaces and clears %s topic subscriptions without changing the other scope", async scope => {
+    const { provider, actors, globalActors, root } = setup();
+    const local = await actors.create({ name: "topics-local", instructions: "Work.", topics: ["topics.local"] });
+    const template = globalActors.create({ name: "topics-global", instructions: "Work.", topics: ["topics.global"] });
+    const id = scope === "global" ? template.id : local.id;
+    const read = () => scope === "global" ? globalActors.resolve(id)! : actors.status(id);
+    expect(await provider.invoke("setTopics", { id, scope, topics: ["topics.new", "topics.new", "topics.other"] }, context))
+      .toMatchObject({ id, topics: ["topics.new", "topics.other"] });
+    expect(read().topics).toEqual(["topics.new", "topics.other"]);
+    expect(scope === "global" ? actors.status(local.id).topics : globalActors.resolve(template.id)!.topics)
+      .toEqual(scope === "global" ? ["topics.local"] : ["topics.global"]);
+    expect(await provider.invoke("setTopics", { id, scope, topics: [] }, context)).toMatchObject({ id, topics: [] });
+    expect(read().topics).toEqual([]);
+    if (scope === "global") {
+      const reopened = new GlobalActorRegistry(root, 64 * 1024);
+      expect(reopened.resolve(id)!.topics).toEqual([]);
+      expect(reopened.toRequest(reopened.resolve(id)!).topics).toEqual([]);
+      const imported = await provider.invoke("import", { id, as: "topics-imported" }, context) as FabricActorInfo;
+      expect(actors.status(imported.id).topics).toEqual([]);
+    }
+  });
+
+  it.each(["project", "global"] as const)("validates %s setTopics before mutating the definition", async scope => {
+    const { provider, actors, globalActors } = setup();
+    const request = { name: "topics-validation", instructions: "Work.", topics: ["topics.original"] };
+    const actor = scope === "global" ? globalActors.create(request) : await actors.create(request);
+    const read = () => scope === "global" ? globalActors.resolve(actor.id)! : actors.status(actor.id);
+    for (const topics of [undefined, null, "topics.string", 7, {}, [null], [7], [""], ["bad topic"], ["x".repeat(129)], ["topics.valid", "bad topic"]]) {
+      await expect(provider.invoke("setTopics", { id: actor.id, scope, ...(topics === undefined ? {} : { topics }) }, context)).rejects.toThrow();
+      expect(read().topics).toEqual(["topics.original"]);
+    }
+  });
+
+  it("validates and persists direct globalActors.update topics, including an empty replacement", () => {
+    const { globalActors, root } = setup();
+    const template = globalActors.create({ name: "topics-update", instructions: "Work.", topics: ["topics.original"] });
+    expect(globalActors.update(template.id, { topics: ["topics.updated", "topics.updated"] }).topics).toEqual(["topics.updated"]);
+    expect(new GlobalActorRegistry(root, 64 * 1024).resolve(template.id)!.topics).toEqual(["topics.updated"]);
+    for (const topics of [["bad topic"], [""], ["topics.valid", "bad topic"]]) {
+      expect(() => globalActors.update(template.id, { topics })).toThrow(/topic/);
+      expect(globalActors.resolve(template.id)!.topics).toEqual(["topics.updated"]);
+      expect(new GlobalActorRegistry(root, 64 * 1024).resolve(template.id)!.topics).toEqual(["topics.updated"]);
+    }
+    expect(globalActors.update(template.id, { topics: [] }).topics).toEqual([]);
+    expect(new GlobalActorRegistry(root, 64 * 1024).resolve(template.id)!.topics).toEqual([]);
+  });
+
+  it("refuses setTopics after canonical actor ownership moves without altering subscriptions or work", async () => {
+    let owned = true;
+    const { provider, actors, agents } = setup([], [], undefined, { canManageActor: () => owned });
+    const actor = await actors.create({ name: "topics-owner", instructions: "Work.", topics: ["topics.original"] });
+    owned = false;
+    await expect(provider.invoke("setTopics", { id: actor.id, topics: [] }, context)).rejects.toThrow("owned by another host");
+    expect(actors.status(actor.id)).toMatchObject({ topics: ["topics.original"], queued: 0 });
+    expect(agents.list()).toEqual([]);
+  });
+
   it("updates tool allowlists for project actors and global templates", async () => {
     const { provider, actors, globalActors } = setup();
     const actor = (await provider.invoke("create", createRequest, context)) as { id: string };

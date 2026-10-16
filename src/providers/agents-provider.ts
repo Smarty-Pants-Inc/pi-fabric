@@ -1661,6 +1661,17 @@ export class AgentsProvider implements FabricProvider {
         if (resident) return this.#setResidentActor(resident, { operation: "setActivationFilter", id: resident.id, activationFilter, ...expiry }, context);
         return this.actorManager.setActivationFilter(String(args.id), activationFilter, checkCommit, expiresAt as number | undefined);
       }
+      case "setTopics": {
+        if (args.scope !== undefined && args.scope !== "project" && args.scope !== "global") {
+          throw new Error(`Invalid Fabric actor topics scope: ${String(args.scope)}`);
+        }
+        if (!Array.isArray(args.topics) || [...args.topics].some((topic) => typeof topic !== "string")) {
+          throw new Error("topics must be an array of strings");
+        }
+        if (args.scope === "global") return this.globalActors.update(String(args.id), { topics: args.topics });
+        // Like setEvents, live subscription changes require this manager's ownership.
+        return this.actorManager.setTopics(String(args.id), args.topics);
+      }
       case "setEvents": {
         const events = Array.isArray(args.events)
           ? args.events.filter(

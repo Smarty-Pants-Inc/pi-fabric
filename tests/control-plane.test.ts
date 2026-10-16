@@ -1556,6 +1556,14 @@ describe("FabricControlPlane", () => {
       const fresh = store.listAll("topology/control-seen/").find((entry) =>
         (entry.value as { hostId?: string }).hostId === "host:receiver");
       expect(fresh?.value).toMatchObject({ explicitDeadline: true });    // new claims carry the flag
+      const bulk = Array.from({ length: 137 }, (_, n) => `command:bulk-${n}`);
+      const retiredValue = (hostId: string, commandId: string) => ({ format: 1, hostId, commandId,
+        targetId: "agent:target", expiresAt: start, explicitDeadline: true, sequence: 0 });
+      await store.writeBatch({ identity: identity("host:other"), ops: bulk.map(commandId => ({ kind: "put" as const,
+        key: seenKey("host:other", commandId), value: retiredValue("host:other", commandId) })) });
+      const own = ownStore(meshRoot, "host:receiver");
+      await own.writeBatch({ identity: identity("host:receiver"), ops: bulk.map(commandId => ({ kind: "put" as const,
+        key: seenKey("host:receiver", commandId), value: retiredValue("host:receiver", commandId) })) });
       const batches = vi.spyOn(MeshStore.prototype, "writeBatch");
       const now = Date.now;
       vi.spyOn(Date, "now").mockImplementation(() => now() - start + later);
@@ -1569,7 +1577,11 @@ describe("FabricControlPlane", () => {
       const sweeps = batches.mock.calls.filter(([input]) => input.ops.every((op) => op.kind === "delete")
         && input.ops.some((op) => op.key.startsWith("topology/control-seen/")));
       expect(sweeps.length).toBeGreaterThanOrEqual(1);
-      expect(sweeps[0]![0].ops.every((op) => op.ifVersion !== undefined)).toBe(true);   // one fenced batch
+      await vi.waitFor(() => {
+        expect(bulk.every(id => !store.get(seenKey("host:other", id), { fresh: true }))).toBe(true);
+        expect(bulk.every(id => !own.get(seenKey("host:receiver", id), { fresh: true }))).toBe(true);
+      }, { timeout: 3_000, interval: 20 });
+      expect(sweeps.every(([input]) => input.ops.length <= 64 && input.ops.every(op => op.ifVersion !== undefined))).toBe(true);
     });
 
     // review/astra on #65: a runtime before phase 1 checks the deadline only at admission and knows

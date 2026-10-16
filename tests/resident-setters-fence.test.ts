@@ -191,6 +191,25 @@ for (const kind of ["Main", "proxy"] as const) {
       } finally { await state.close(); }
     });
 
+    it("configures dead-letter replay age at the real execution owner without weakening the setter fence", async () => {
+      const state = await fixture(kind, 5_000);
+      try {
+        await expect(state.client.setActor({ operation: "setActivationFilter", id: state.actor.id, activationFilter: ["hold"], deadLetterReplayMaxAgeMs: 0 }, undefined, state.caller))
+          .resolves.toMatchObject({ deadLetterReplayMaxAgeMs: 0 });
+        expect(state.host.actors.status(state.actor.id).deadLetterReplayMaxAgeMs).toBe(0);
+        await expect(state.client.setActor({ operation: "setActivationFilter", id: state.actor.id, activationFilter: null }, undefined, state.caller))
+          .resolves.toMatchObject({ deadLetterReplayMaxAgeMs: 0 });
+        const before = fs.readFileSync(path.join(state.config.actorRoot, "actors.json"), "utf8");
+        await expect(state.client.setActor({ operation: "setActivationFilter", id: state.actor.id, activationFilter: ["hold"], deadLetterReplayMaxAgeMs: -1 }, undefined, state.caller))
+          .rejects.toThrow(/deadLetterReplayMaxAgeMs/);
+        expect(fs.readFileSync(path.join(state.config.actorRoot, "actors.json"), "utf8")).toBe(before);
+        const foreign: ResidentActorCaller = { ...state.caller, hostId: "foreign" };
+        await expect(state.client.setActor({ operation: "setActivationFilter", id: state.actor.id, activationFilter: ["hold"], deadLetterReplayMaxAgeMs: 1 }, undefined, foreign))
+          .rejects.toMatchObject({ code: "RESIDENT_ACTOR_FORBIDDEN" });
+        expect(state.host.actors.status(state.actor.id).deadLetterReplayMaxAgeMs).toBe(0);
+      } finally { await state.close(); }
+    });
+
     const mutations: ResidentActorMutation[] = [
       { operation: "resetSession", id: "" },
       { operation: "stop", id: "" },

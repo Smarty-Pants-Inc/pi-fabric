@@ -70,9 +70,10 @@ export interface JetStreamPort {
   /**
    * Publishes with `expect.lastSequence` and `msgID`. A wrong last sequence throws `NatsWrongLastSequenceError`; no
    * answer (a timeout, no responders, a dropped connection: the ack may be lost) throws an error with `transient: true`;
-   * anything else (an oversized payload, a permission) is final.
+   * anything else (an oversized payload, a permission) is final. `timeoutMs`: this one attempt's native request
+   * timeout (the backend's min(remaining write budget, NATS_PUBLISH_ATTEMPT_TIMEOUT_MS)); omitted, the SDK default.
    */
-  publish(subject: string, data: Uint8Array, options: { expectLastSequence: number; msgID: string }): Promise<{ seq: number; duplicate: boolean }>;
+  publish(subject: string, data: Uint8Array, options: { expectLastSequence: number; msgID: string; timeoutMs?: number }): Promise<{ seq: number; duplicate: boolean }>;
   /** Delivers every message after `afterSeq`, in order, then each new one as it is stored; a broken delivery calls `onError`. */
   consume(stream: string, afterSeq: number, onMessage: (message: NatsStreamMessage) => void, onError?: (error: unknown) => void): Promise<{ stop(): Promise<void> }>;
   close(): Promise<void>;
@@ -324,6 +325,13 @@ export class MeshStateNatsBusyError extends MeshLockTimeoutError {
     this.name = "MeshStateNatsBusyError";
   }
 }
+
+/**
+ * The native timeout cap of ONE publish attempt (smarty-dev#13112); the overall write budget (lockTimeoutMs, 5s) is
+ * unchanged. ponytail: hosted healthy ACKs are ~2ms typical and 285ms max after a resume, an R3 stream-leader
+ * switch ~7ms; 1s is >3x the measured ACK tail and >140x the handoff, and leaves 4s of the 5s for same-ID retries.
+ */
+const NATS_PUBLISH_ATTEMPT_TIMEOUT_MS = 1_000;
 
 /** A publish got no answer within the write budget: the batch may or may not have committed. Not retryable as is. */
 export class MeshStateNatsOutcomeUnknownError extends Error {
@@ -961,8 +969,10 @@ export class NatsStateBackend implements StateBackend {
         seq = await this.#publish(data, snapshot.seq, id, deadline);
       } catch (error) {
         if (!(error instanceof NatsWrongLastSequenceError)) throw error;
-        // The server checks the expected sequence before the duplicate window, so a retry of MY stored batch (its ack
-        // was lost) also fails this way. The CAS stored it, if at all, at exactly base + 1: read that one message.
+        // A same-ID retry of MY stored batch inside the duplicate window is answered by a duplicate ACK at its original
+        // sequence (measured on clustered 2.14.7: dedupe answers before the expected-sequence check), handled above.
+        // It fails this way only once the id left the window or a foreign writer moved the stream: the CAS stored
+        // it, if at all, at exactly base + 1: read that one message.
         const committed = error.afterLostAck ? await this.#committedAt(snapshot.seq + 1, id) : undefined;
         const last = await this.#options.port.lastSequence(this.#options.stream);
         this.#knownSeq = Math.max(this.#knownSeq, last);
@@ -986,16 +996,25 @@ export class NatsStateBackend implements StateBackend {
   }
 
   /**
-   * One publish of one batch. A lost ack (a timeout, a dropped connection) is retried with the SAME message id and
-   * expected sequence. If the first copy was stored, the stream moved past `base` and the retry fails the expected
-   * sequence: the caller then finds the batch in the stream by its id (never commits it twice). If it was not stored
-   * and nothing else was, the retry stores it (or the duplicate window returns it). Past the deadline with no answer,
-   * the outcome is unknown: that is not a retryable busy error, the caller must re-read.
+   * One publish of one batch. A lost ack (a timeout, a dropped connection) is retried with the SAME bytes, message id
+   * and expected sequence. If the first copy was stored, the duplicate window answers the retry with a duplicate ACK
+   * at its original sequence (never stored twice); once the id expired, or another writer moved the stream, the retry
+   * fails the expected sequence and the caller finds the batch in the stream by its id. If it was not stored and
+   * nothing else was, the retry stores it. Each attempt's native timeout is min(remaining budget,
+   * NATS_PUBLISH_ATTEMPT_TIMEOUT_MS) so one silent request cannot eat the whole budget; no attempt starts past the
+   * deadline. Past it with no answer, the outcome is unknown: not a retryable busy error, the caller must re-read.
    */
   async #publish(data: Uint8Array, base: number, msgID: string, deadline: number): Promise<number> {
     let lostAck = false;
     for (;;) {
-      try { return (await this.#options.port.publish(this.#options.subject, data, { expectLastSequence: base, msgID })).seq; }
+      const remaining = deadline - performance.now();
+      // nats-core rejects timeouts below 1ms; never round up beyond the remaining write budget.
+      if (remaining < 1) {
+        if (lostAck) throw new MeshStateNatsOutcomeUnknownError(msgID, "the write budget expired without a publish answer");
+        throw new MeshStateNatsBusyError("the write budget expired before the publish");
+      }
+      const timeoutMs = Math.min(remaining, NATS_PUBLISH_ATTEMPT_TIMEOUT_MS);
+      try { return (await this.#options.port.publish(this.#options.subject, data, { expectLastSequence: base, msgID, timeoutMs })).seq; }
       catch (error) {
         if (error instanceof NatsWrongLastSequenceError) { error.afterLostAck = lostAck; throw error; }
         lostAck = true;

@@ -11,6 +11,7 @@ import {
   MeshStateNatsRefusedError, MeshStateNatsUnavailableError, natsConnectOptions, NatsWrongLastSequenceError, redactNatsError,
   type JetStreamPort, type NatsStreamMessage, type NatsTlsFiles,
 } from "./state-backend-nats.js";
+import { selectNatsSyncAlways } from "./nats-monitor-config.js";
 
 /** NATS JetStream API error codes used here. */
 const WRONG_LAST_SEQUENCE = 10071;
@@ -33,6 +34,11 @@ const STREAM_LEADER_TIMEOUT_MS = 10_000;
 const STREAM_LEADER_POLL_MS = 100;
 const CONSUMER_CREATE_ATTEMPT_TIMEOUT_MS = 1_000;
 const CONSUMER_INITIAL_INACTIVE_THRESHOLD_MS = 10_000;
+// ponytail: a first NEXT can be lost while R1 route interest propagates (measured 518ms). The native
+// two-missed-heartbeat monitor rechecks INFO and re-pulls the same consumer; 1s heartbeats normally detect
+// silence in 2–3s, leaving room for a healthy INFO inside the unchanged default 5s projector wait. The
+// native 15s default cannot; actual INFO/transport failures must still fail the unchanged waiter.
+const CONSUMER_IDLE_HEARTBEAT_MS = 1_000;
 const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 type Bounded<T> = { kind: "value"; value: T } | { kind: "error"; error: unknown } | { kind: "deadline" };
 // ponytail: reuse the existing leader-wait request race for placement, not another retry framework.
@@ -234,12 +240,27 @@ export const connectJetStream = async (servers: string[], options: ConnectJetStr
     server: async () => {
       let syncAlways: boolean | undefined;
       if (options.monitoringUrl) {
-        let varz: { jetstream?: { config?: { sync_always?: unknown } } };
+        const monitoringUrl = options.monitoringUrl;
+        // One unchanged 5s budget for /varz and the optional /jsz fallback, including response bodies (#13112).
+        const signal = AbortSignal.timeout(5_000);
+        let onAbort!: () => void;
+        const aborted = new Promise<never>((_, reject) => {
+          onAbort = () => reject(signal.reason ?? new Error("NATS monitor request aborted"));
+          if (signal.aborted) onAbort(); else signal.addEventListener("abort", onAbort, { once: true });
+        });
+        const monitor = async (endpoint: string): Promise<unknown> => {
+          const response = await Promise.race([fetch(new URL(endpoint, monitoringUrl), { signal }), aborted]);
+          if (!response.ok) throw new Error(`NATS monitor ${endpoint} returned HTTP ${response.status}`);
+          const body: unknown = await Promise.race([response.json(), aborted]);
+          if (body === null || typeof body !== "object" || Array.isArray(body)) throw new Error(`NATS monitor ${endpoint} did not return a JSON object`);
+          return body;
+        };
         try {
-          const response = await fetch(new URL("/varz", options.monitoringUrl), { signal: AbortSignal.timeout(5_000) });
-          varz = await response.json() as typeof varz;
+          const varz = await monitor("/varz");
+          syncAlways = selectNatsSyncAlways(varz);
+          if (syncAlways === undefined) syncAlways = selectNatsSyncAlways(varz, await monitor("/jsz?raft=true"));
         } catch (error) { throw redactNatsError(error); }
-        syncAlways = typeof varz.jetstream?.config?.sync_always === "boolean" ? varz.jetstream.config.sync_always : undefined;
+        finally { signal.removeEventListener("abort", onAbort); }
       }
       return { version: nc.info?.version ?? "0.0.0", syncAlways,
         ...(typeof nc.info?.max_payload === "number" ? { maxPayload: nc.info.max_payload } : {}),
@@ -353,9 +374,11 @@ export const connectJetStream = async (servers: string[], options: ConnectJetStr
       return message ? { seq: message.seq, data: message.data, ...(msgID ? { msgID } : {}) } : undefined;
     },
     purge: async (stream, beforeSeq) => { await jsm.streams.purge(stream, { seq: beforeSeq }); },
-    publish: async (subject, data, { expectLastSequence, msgID }) => {
+    publish: async (subject, data, { expectLastSequence, msgID, timeoutMs }) => {
       try {
-        const ack = await js.publish(subject, data, { msgID, expect: { lastSequence: expectLastSequence } });
+        // The backend bounds each attempt (smarty-dev#13112); omitted, the SDK's 5s default.
+        const ack = await js.publish(subject, data, { msgID, expect: { lastSequence: expectLastSequence },
+          ...(timeoutMs === undefined ? {} : { timeout: timeoutMs }) });
         return { seq: ack.seq, duplicate: ack.duplicate };
       } catch (error) {
         if (apiCode(error) === WRONG_LAST_SEQUENCE) throw new NatsWrongLastSequenceError(expectLastSequence, (error as Error).message);
@@ -383,7 +406,7 @@ export const connectJetStream = async (servers: string[], options: ConnectJetStr
       const consumer = readiness === undefined ? await retryTransientRead(request, READ_RETRY_ATTEMPTS)
         : await bootstrapConsumer(stream, request, readiness.deadline, readiness.fresh,
           () => { consumerOptions = { ...consumerOptions, name_prefix: randomUUID() }; });
-      const messages = await consumer.consume();
+      const messages = await consumer.consume({ idle_heartbeat: CONSUMER_IDLE_HEARTBEAT_MS });
       void (async () => { for await (const message of messages) onMessage({ seq: message.seq, data: message.data }); })()
         .catch(error => onError?.(error));
       return { stop: async () => { await messages.close(); } };

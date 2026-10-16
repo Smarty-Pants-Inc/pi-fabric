@@ -6,13 +6,14 @@ import { setTimeout as delay } from "node:timers/promises";
 import { connect, credsAuthenticator, nkeys, type NatsConnection } from "@nats-io/transport-node";
 import { jetstream, jetstreamManager } from "@nats-io/jetstream";
 import { describe, expect, it } from "vitest";
+import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { encodeAccountJwt, encodeOperatorJwt, encodeUserJwt, formatUserCreds } from "../src/mesh/nats-auth/jwt.js";
 import { PATH_B_OPERATOR_MACHINE, roleTemplateWithPathB } from "../src/mesh/nats-auth/permissions.js";
 import * as connectionModule from "../src/transport/nats/connection.js";
 import { openNatsTransport } from "../src/transport/nats/inbox.js";
 import { openNatsKvForMachine } from "../src/transport/nats/kv.js";
 import { ensureTransportConsumer, ensureTransportStream } from "../src/transport/nats/provision.js";
-import { TransportUnavailableError, type FabricTransport, type TransportEnvelope } from "../src/transport/types.js";
+import { TransportUnavailableError, type FabricTransport, type FabricTransportOptions, type TransportEnvelope } from "../src/transport/types.js";
 import { ADVISORY_CAPTURE_STREAM, transportAdvisoryStreamSubject, transportDurableName, transportInboxFilter, transportInboxStream, transportInboxStreamSubject, transportInboxSubject } from "../src/transport/nats/subjects.js";
 import { createPathBHarness, PATH_B_MACHINES, PATH_B_PERMISSION_POLICY, PATH_B_TEST_MESH, resolveNatsBinary, type PathBHarness, type PathBIdentity, type PathBUser } from "./helpers/nats-cluster.js";
 import { ReconnectRelay } from "./helpers/nats-reconnect-server.js";
@@ -79,18 +80,23 @@ function identityFactories() {
   };
 }
 
-async function fixture(withSecond: boolean) {
+async function prepareFixture(withSecond: boolean) {
   const identities = identityFactories();
   const brokers: PathBHarness[] = [];
   const relays: ReconnectRelay[] = [];
   const connections: NatsConnection[] = [];
   const runtimes: FabricTransport[] = [];
+  const openings = new Set<Promise<FabricTransport>>();
+  let closing = false;
   const abort = new AbortController();
   const close = async () => {
+    closing = true;
     abort.abort();
     await Promise.all(connections.map((nc) => nc.close()));
     await Promise.all(runtimes.map((runtime) => runtime.close()));
     for (const relay of relays) relay.disconnect();
+    // Break held verification first, then join opens; seeded RED must not leak late runtimes.
+    await Promise.allSettled([...openings]);
     for (const relay of [...relays].reverse()) await relay.stop();
     for (const broker of [...brokers].reverse()) await broker.stop();
   };
@@ -117,13 +123,40 @@ async function fixture(withSecond: boolean) {
       await ensureTransportConsumer(manager.consumers, { stream: transportInboxStream("machine-a"), durable: transportDurableName(HOST),
         filterSubject: transportInboxFilter("machine-a", HOST), description: JSON.stringify({ fabricHostId: HOST, machine: "machine-a" }), maxAckPending: 128 });
     }
-    const runtime = await openNatsTransport({ ...first.runtimeOptions(first.users.machineA), servers: relays.map((relay) => relay.url),
-      tls: { ca: brokers.map((broker) => fs.readFileSync(broker.tls!.caFile, "utf8")).join("\n") }, hostId: HOST, provision: false, requestTimeoutMs: 2_000 });
-    runtimes.push(runtime);
-    if (brokers[1]) relays[1]!.routeTo(brokers[1]);
-    return { brokers, relays, runtime, raw, abort, close };
+    const trackRuntime = (opening: Promise<FabricTransport>): Promise<FabricTransport> => {
+      const tracked = opening.then(async (runtime) => {
+        if (closing) await runtime.close();
+        else runtimes.push(runtime);
+        return runtime;
+      });
+      openings.add(tracked);
+      void tracked.then(() => openings.delete(tracked), () => openings.delete(tracked));
+      return tracked;
+    };
+    return { brokers, relays, raw, abort, close, trackRuntime };
   } catch (error) { await close(); throw error; }
   finally { identities.clear(); }
+}
+
+async function fixture(withSecond: boolean, ownerSignal?: AbortSignal) {
+  const f = await prepareFixture(withSecond);
+  try {
+    const first = f.brokers[0]!;
+    const options = { ...first.runtimeOptions(first.users.machineA), servers: f.relays.map((relay) => relay.url),
+      tls: { ca: f.brokers.map((broker) => fs.readFileSync(broker.tls!.caFile, "utf8")).join("\n") }, hostId: HOST,
+      provision: false, requestTimeoutMs: 2_000, ...(ownerSignal === undefined ? {} : { signal: ownerSignal }) };
+    const runtime = await f.trackRuntime(openNatsTransport(options));
+    if (f.brokers[1]) f.relays[1]!.routeTo(f.brokers[1]);
+    return { ...f, runtime };
+  } catch (error) { await f.close(); throw error; }
+}
+
+// Exercise the shared factory port: nats is a sibling config property, not mesh.nats.
+// Only the unused MeshStore dependency is substituted; transport/auth/TLS/broker are real.
+function ownerOptions(f: Awaited<ReturnType<typeof prepareFixture>>, signal: AbortSignal, hostId = HOST): FabricTransportOptions {
+  const broker = f.brokers[0]!;
+  const nats = { ...broker.runtimeOptions(broker.users.machineA), servers: f.relays[0]!.url, replicas: 1 };
+  return { config: { ...DEFAULT_FABRIC_CONFIG.mesh, nats }, hostId, mesh: {} as FabricTransportOptions["mesh"], signal };
 }
 
 const command = (id: string, machine = "machine-a"): TransportEnvelope => ({ id, kind: "command", to: { machine, hostId: HOST }, targetId: "reconnect-target", operation: "followUp", from: { id: "sender", name: "sender", kind: "main" }, body: { id } });
@@ -145,6 +178,168 @@ async function sendAfterReopen(runtime: FabricTransport, envelope: TransportEnve
 }
 
 describe.skipIf(!binary || process.platform === "win32")("verified transport reopen against real TLS brokers", () => {
+  it.each(["explicit", "owner"] as const)("suppresses buffered KV and inbox deliveries after %s close", async (kind) => {
+    const owner = new AbortController();
+    const f = await fixture(false, owner.signal);
+    const watchAbort = new AbortController();
+    let watcher: AsyncIterator<unknown> | undefined;
+    let inbox: AsyncIterator<unknown> | undefined;
+    try {
+      const kv = f.runtime.kv("presence");
+      await kv.put("machine-a.h.buffer-a", HOST, { n: 1 }, 0);
+      await kv.put("machine-a.h.buffer-b", HOST, { n: 2 }, 0);
+      watcher = kv.watch("machine-a.h.*", watchAbort.signal)[Symbol.asyncIterator]();
+      expect((await bounded(watcher.next(), "live buffered snapshot")).value).toMatchObject({ type: "put", entry: { value: { n: 1 } } });
+      await f.runtime.send(command("buffered-inbox-a"));
+      await f.runtime.send(command("buffered-inbox-b"));
+      const typedInbox = f.runtime.inbox(f.abort.signal)[Symbol.asyncIterator]();
+      inbox = typedInbox;
+      const first = (await bounded(typedInbox.next(), "live buffered inbox")).value!;
+      expect(first.payload.id).toBe("buffered-inbox-a");
+      await first.ack();
+      if (kind === "owner") owner.abort();
+      else await f.runtime.close();
+      await bounded(f.relays[0]!.whenIdle(), "closed buffered transport socket");
+      expect((await bounded(watcher.next(), "closed buffered KV")).done).toBe(true);
+      expect((await bounded(typedInbox.next(), "closed buffered inbox")).done).toBe(true);
+      expect(watchAbort.signal.aborted).toBe(false);
+      expect(f.abort.signal.aborted).toBe(false);
+      const fresh = kv.watch("machine-a.h.*", watchAbort.signal)[Symbol.asyncIterator]();
+      expect((await bounded(fresh.next(), "fresh watch after close")).done).toBe(true);
+    } finally {
+      watchAbort.abort(); f.abort.abort();
+      await watcher?.return?.(); await inbox?.return?.();
+      await f.close();
+    }
+  }, 30_000);
+
+  it("refuses an already-aborted factory owner before any socket or client protocol, while a live owner works", async () => {
+    const f = await prepareFixture(false);
+    try {
+      const relay = f.relays[0]!;
+      const owner = new AbortController();
+      owner.abort();
+      const before = relay.connectionCount;
+      expect(before).toBe(0);
+      expect(relay.activeConnections).toBe(0);
+      const refused = await bounded(outcome(() => f.trackRuntime(openNatsTransport(ownerOptions(f, owner.signal)))), "pre-aborted owner refusal", 1_500);
+      expect(refused).toBeInstanceOf(Error);
+      expect(relay.connectionCount).toBe(before);
+      expect(relay.activeConnections).toBe(0);
+      expect(relay.subjects).toEqual([]);
+      expect(relay.commands).toEqual([]);
+
+      // A counterexample on the identical real endpoint rules out a dead relay/TLS fixture.
+      const liveOwner = new AbortController();
+      const runtime = await f.trackRuntime(openNatsTransport(ownerOptions(f, liveOwner.signal)));
+      const iterator = runtime.inbox(f.abort.signal)[Symbol.asyncIterator]();
+      const next = iterator.next();
+      await runtime.send(command("live-factory-owner"));
+      const received = (await bounded(next, "live owner delivery")).value!;
+      expect(received.payload.id).toBe("live-factory-owner");
+      await received.ack();
+      expect(await runtime.drainState()).toEqual({ pending: 0, ackPending: 0 });
+      expect(relay.connectionCount).toBe(before + 1);
+      expect(relay.subjects.filter((subject) => subject === "$SYS.REQ.USER.INFO")).toHaveLength(1);
+      await iterator.return?.();
+      await runtime.close();
+      await bounded(relay.whenIdle(), "live owner explicit close", 1_500);
+      expect(relay.errors).toEqual([]);
+    } finally { await f.close(); }
+  }, 90_000);
+
+  it("cancels a factory owner's opening while real USER.INFO is held, promptly closing without provisioning its durable", async () => {
+    const f = await prepareFixture(false);
+    try {
+      const broker = f.brokers[0]!;
+      const relay = f.relays[0]!;
+      const owner = new AbortController();
+      const hostId = `${HOST}-cancelled-opening`;
+      relay.holdVerification = true;
+      const opening = f.trackRuntime(openNatsTransport(ownerOptions(f, owner.signal, hostId)));
+      const settled = outcome(() => opening); // Observe rejection immediately, including before abort.
+      await bounded(relay.verification.promise, "opening real USER.INFO request");
+      expect(relay.activeConnections).toBe(1);
+      expect(relay.subjects).toEqual(["$SYS.REQ.USER.INFO"]);
+      const started = performance.now();
+      owner.abort();
+      const error = await bounded(settled, "owner cancels opening promptly", 1_500);
+      expect(error).toBeInstanceOf(Error);
+      await bounded(relay.verificationClosed.promise, "cancelled opening socket close", 1_500);
+      await bounded(relay.whenIdle(), "cancelled opening has no sockets", 1_500);
+      expect(performance.now() - started).toBeLessThan(2_000);
+      expect(relay.activeConnections).toBe(0);
+      const commandsAtClose = [...relay.commands];
+      relay.releaseVerification(); // A late real response cannot publish a runtime or create a consumer.
+      const observer = await f.raw(broker, broker.users.bootstrap);
+      const manager = await jetstreamManager(observer);
+      const consumers = await manager.consumers.list(transportInboxStream("machine-a")).next();
+      expect(consumers.some((consumer) => consumer.name === transportDurableName(hostId))).toBe(false);
+      expect(relay.connectionCount).toBe(1);
+      expect(relay.subjects).toEqual(["$SYS.REQ.USER.INFO"]);
+      expect(relay.commands).toEqual(commandsAtClose);
+      expect(relay.errors).toEqual([]);
+    } finally { await f.close(); }
+  }, 90_000);
+
+  it.each([false, true])("owner abort closes an established transport (held reopen: %s), ends a waiting inbox, and stays closed after broker restart", async (heldReopen) => {
+    const owner = new AbortController();
+    const f = await fixture(false, owner.signal);
+    try {
+      const broker = f.brokers[0]!;
+      const relay = f.relays[0]!;
+      const iterator = f.runtime.inbox(f.abort.signal)[Symbol.asyncIterator]();
+      const first = iterator.next();
+      await f.runtime.send(command("live-direct-owner"));
+      const initial = (await bounded(first, "live direct owner delivery")).value!;
+      expect(initial.payload.id).toBe("live-direct-owner");
+      await initial.ack();
+      const kv = f.runtime.kv("presence");
+      const pending = iterator.next(); // Its independent inbox signal is deliberately NOT aborted.
+      void pending.catch(() => undefined); // Keep an early failure observed until the bounded assertion below.
+      if (heldReopen) {
+        relay.holdVerification = true;
+        relay.disconnect();
+        relay.enabled = true;
+        await bounded(relay.verification.promise, "owner's held reopen real USER.INFO");
+      }
+      owner.abort();
+      expect((await bounded(pending, "owner abort ends waiting inbox", 1_500)).done).toBe(true);
+      expect(f.abort.signal.aborted).toBe(false);
+      if (heldReopen) await bounded(relay.verificationClosed.promise, "owner cancels held reopen socket", 1_500);
+      await bounded(relay.whenIdle(), "owner abort closes all relay sockets", 1_500);
+      expect(relay.activeConnections).toBe(0);
+      expect(await outcome(() => f.runtime.send(command("aborted-owner-send")))).toBeInstanceOf(TransportUnavailableError);
+      expect(await outcome(() => kv.get("machine-a.h.reconnect"))).toBeInstanceOf(TransportUnavailableError);
+      const connectionsAtClose = relay.connectionCount;
+      const subjectsAtClose = [...relay.subjects];
+      const commandsAtClose = [...relay.commands];
+      relay.releaseVerification();
+      await broker.restart(); // Actual child, same store; the relay remains reachable throughout.
+      const observer = await f.raw(broker, broker.users.bootstrap);
+      const incoming = { ...command("after-owner-abort"), createdAt: Date.now() };
+      await jetstream(observer).publish(transportInboxSubject("machine-a", HOST, "cmd", incoming.targetId, "machine-b"),
+        new TextEncoder().encode(JSON.stringify({ format: 1, sourceMachine: "machine-b", envelope: incoming })));
+      await observer.flush();
+      // Safety-window assertion, not readiness polling: closure above is native-event driven.
+      // 750ms spans the first reopen backoff (100–200ms); any post-close dial/protocol is a failure.
+      await delay(750);
+      expect(relay.connectionCount).toBe(connectionsAtClose);
+      expect(relay.activeConnections).toBe(0);
+      expect(relay.subjects).toEqual(subjectsAtClose);
+      expect(relay.commands).toEqual(commandsAtClose);
+      expect((await bounded(iterator.next(), "closed inbox cannot receive post-abort command", 1_500)).done).toBe(true);
+      expect(await outcome(() => f.runtime.send(command("still-aborted-after-restart")))).toBeInstanceOf(TransportUnavailableError);
+      expect(await outcome(() => kv.get("machine-a.h.reconnect"))).toBeInstanceOf(TransportUnavailableError);
+      const manager = await jetstreamManager(observer);
+      const consumer = await manager.consumers.info(transportInboxStream("machine-a"), transportDurableName(HOST));
+      expect(consumer.delivered.consumer_seq).toBe(1);
+      expect(consumer.ack_floor.consumer_seq).toBe(1);
+      expect((await manager.streams.info(transportInboxStream("machine-a"))).state.messages).toBe(2);
+      expect(relay.errors).toEqual([]);
+    } finally { await f.close(); }
+  }, 90_000);
+
   it("refuses a second configured server's changed account scope with no publication or inbound delivery", async () => {
     const f = await fixture(true);
     try {

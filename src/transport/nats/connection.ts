@@ -32,6 +32,7 @@ interface NatsTransportSecurityOptions {
   readonly tls?: TlsOptions;
   readonly name?: string;
   readonly timeoutMs?: number;
+  readonly signal?: AbortSignal;
 }
 
 export interface NatsConnectionOptions extends NatsPermissionPolicy, NatsTransportSecurityOptions {
@@ -261,6 +262,8 @@ const open = async (
   verify: ((nc: NatsConnection, timeoutMs: number, auth: ReturnType<typeof readNatsCredentials>) => Promise<unknown>) | undefined,
   prepare: (auth: ReturnType<typeof readNatsCredentials>) => void = () => undefined,
 ): Promise<NatsConnectionHandle> => {
+  const signal = options.signal;
+  signal?.throwIfAborted();
   const timeoutMs = options.timeoutMs ?? 5_000;
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) throw new Error("timeoutMs must be positive");
   const security = transportSecurity(options);
@@ -277,15 +280,28 @@ const open = async (
     maxReconnectAttempts: 0,
     authenticator: credsAuthenticator(auth.bytes),
     inboxPrefix: `_INBOX.${auth.subject}`,
-  }).catch((cause: unknown) => { throw connectionFailure(cause, "NATS connection failed"); });
+  }).catch((cause: unknown) => {
+    signal?.throwIfAborted();
+    throw connectionFailure(cause, "NATS connection failed");
+  });
+  // Official connect has no signal option: its timeout bounds dialing. Once a handle exists,
+  // cancellation closes it immediately, including during USER.INFO and provisioning awaits.
+  const onAbort = (): void => { void nc.close().catch(() => undefined); };
+  const removeAbort = (): void => signal?.removeEventListener("abort", onAbort);
+  signal?.addEventListener("abort", onAbort, { once: true });
   try {
+    signal?.throwIfAborted();
     const userInfo = verify ? await verify(nc, timeoutMs, auth) : undefined;
+    signal?.throwIfAborted();
     const manager = await jetstreamManager(nc, { timeout: timeoutMs });
+    signal?.throwIfAborted();
     const js = jetstream(nc, { timeout: timeoutMs });
     const listeners = new Set<NatsStatusListener>();
     let closing = false;
-    const closed = nc.closed().then((cause) => closing ? undefined
-      : new TransportUnavailableError("NATS connection lost; reopen and reverify before use", { cause }));
+    const closed = nc.closed().then((cause) => {
+      removeAbort();
+      return closing ? undefined : new TransportUnavailableError("NATS connection lost; reopen and reverify before use", { cause });
+    });
     const statusTask = (async () => {
       for await (const status of nc.status()) {
         for (const listener of listeners) {
@@ -302,19 +318,23 @@ const open = async (
       onStatus: (listener) => { listeners.add(listener); return () => { listeners.delete(listener); }; },
       close: async () => {
         closing = true;
+        removeAbort();
         await nc.close();
         await statusTask;
         listeners.clear();
       },
     };
   } catch (error) {
-    await nc.close();
+    removeAbort();
+    await nc.close().catch(() => undefined);
+    signal?.throwIfAborted();
     throw error;
   }
 };
 
 /** Verified connection: always checks the signed identity and the exact USER.INFO scope. No bypass exists. */
 export const openNatsConnection = async (options: NatsConnectionOptions): Promise<NatsConnectionHandle> => {
+  options.signal?.throwIfAborted();
   refuseBypass(options);
   const role = options.role ?? "agent";
   if (role !== "agent" && role !== "operator") throw new Error("NATS connection role must be agent or operator");
@@ -331,6 +351,7 @@ export const openNatsConnection = async (options: NatsConnectionOptions): Promis
 
 /** Separate bootstrap authority for `fabric-transport-admin provision` only; never used by the runtime. */
 export const openBootstrapNatsConnection = async (options: NatsBootstrapConnectionOptions): Promise<NatsConnectionHandle> => {
+  options.signal?.throwIfAborted();
   refuseBypass(options);
   return open(options, undefined);
 };

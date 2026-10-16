@@ -296,9 +296,9 @@ describe.skipIf(!binary)("real machine-authenticated inbox faults", () => {
     const rebound = await consumerInfo(reopened);
     expect(rebound.name).toBe(before.name);
     expect(rebound.config).toEqual(before.config);
-    // nats-server 2.11 restores the metadata timestamp at sub-millisecond precision
-    // differently from its initial in-memory timestamp; identity/config/backlog persist.
-    expect(Date.parse(rebound.created)).toBe(Date.parse(before.created));
+    // nats-server 2.11's sub-ms restore rounding can cross a JS millisecond boundary.
+    // Allow only that 1ms precision loss; name/config/backlog/stream sequences still persist.
+    expect(Math.abs(Date.parse(rebound.created) - Date.parse(before.created))).toBeLessThanOrEqual(1);
     await pendingIs(reopened, 0, 2);
     const signal = new AbortController();
     const iterator = reopened.inbox(signal.signal)[Symbol.asyncIterator]();

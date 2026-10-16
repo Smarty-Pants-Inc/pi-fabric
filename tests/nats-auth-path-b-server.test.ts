@@ -17,7 +17,7 @@ const MACHINE_A = "machine-a";
 const MACHINE_B = "machine-b";
 const STREAM_A = "FABRIC_IN_machine-a";
 const STREAM_B = "FABRIC_IN_machine-b";
-const sourceSubject = (machine: string) => `fabric.in.tenant.run.event.message.${machine}`;
+const sourceSubject = (machine: string) => `fabric.in.${machine}.run.cmd.message.${machine}`;
 
 class PermissionOracle {
   private readonly waiters: Array<(error: Error) => void> = [];
@@ -103,7 +103,7 @@ describe("Path B real nats-server authorization", () => {
     const bootstrapNc = await fixture.connect(fixture.users.bootstrap);
     const machineANc = await fixture.connect(fixture.users.machineA);
     const machineBNc = await fixture.connect(fixture.users.machineB);
-    await jetstreamManager(maintainerNc);
+    const operatorManager = await jetstreamManager(maintainerNc);
     const bootstrap = await jetstreamManager(bootstrapNc);
     const machineAManager = await jetstreamManager(machineANc);
     const machineBManager = await jetstreamManager(machineBNc);
@@ -115,8 +115,8 @@ describe("Path B real nats-server authorization", () => {
     expect(fixture.serverVersion).toMatch(/^\d+\.\d+\.\d+/);
 
     // A separate fixture-only bootstrap scope seeds resources. Neither runtime nor maintainer gets lifecycle authority.
-    await bootstrap.streams.add(streamConfig(STREAM_A, `fabric.in.*.*.*.*.${MACHINE_A}`));
-    await bootstrap.streams.add(streamConfig(STREAM_B, `fabric.in.*.*.*.*.${MACHINE_B}`));
+    await bootstrap.streams.add(streamConfig(STREAM_A, `fabric.in.${MACHINE_A}.>`));
+    await bootstrap.streams.add(streamConfig(STREAM_B, `fabric.in.${MACHINE_B}.>`));
     await new Kvm(bootstrapNc).create("fabric_presence", { history: 1, allow_direct: false });
     await new Kvm(bootstrapNc).create("fabric_leases", { history: 1, allow_direct: false });
     for (const subject of [
@@ -150,6 +150,8 @@ describe("Path B real nats-server authorization", () => {
     // The JWT machine tag expands {{tag(machine)}}: own source publish and own consumer pull/ack work.
     const ownPublish = await machineAJs.publish(sourceSubject(MACHINE_A), "machine-a-owned");
     expect(ownPublish.stream).toBe(STREAM_A);
+    // E14: E7 denies stream lifecycle, not the literal operator MSG.GET right.
+    expect((await operatorManager.streams.getMessage(STREAM_A, { seq: ownPublish.seq }))?.string()).toBe("machine-a-owned");
     const ownConsumerClient = await machineAJs.consumers.get(STREAM_A, "machine-a-consumer");
     const ownMessage = await ownConsumerClient.next({ expires: API_TIMEOUT_MS });
     expect(ownMessage?.string()).toBe("machine-a-owned");
@@ -157,7 +159,13 @@ describe("Path B real nats-server authorization", () => {
     expect(await ownMessage.ackAck({ timeout: API_TIMEOUT_MS })).toBe(true);
     expect((await machineAManager.consumers.info(STREAM_A, "machine-a-consumer")).num_ack_pending).toBe(0);
 
-    expect((await machineBJs.publish(sourceSubject(MACHINE_B), "machine-b-owned")).stream).toBe(STREAM_B);
+    const foreignPublish = await machineBJs.publish(sourceSubject(MACHINE_B), "machine-b-owned");
+    expect(foreignPublish.stream).toBe(STREAM_B);
+    expect((await operatorManager.streams.getMessage(STREAM_B, { seq: foreignPublish.seq }))?.string()).toBe("machine-b-owned");
+    const relay = await jetstream(maintainerNc).publish(`fabric.in.${MACHINE_B}.run.ack.message.fabric-ops`, "operator-relay");
+    expect(relay.stream).toBe(STREAM_B);
+    const outsideInventory = "fabric.in.machine-c.run.ack.message.fabric-ops";
+    await expectDenied(maintainerOracle, "publish", outsideInventory, () => maintainerNc.publish(outsideInventory, "outside-inventory"));
     const foreignMessage = await machineBNc.request(`$JS.API.CONSUMER.MSG.NEXT.${STREAM_B}.machine-b-consumer`, JSON.stringify({ batch: 1 }), { timeout: API_TIMEOUT_MS, noMux: true, reply: `_INBOX.${fixture.users.machineB.publicKey}.foreign-pull` });
     expect(foreignMessage.string()).toBe("machine-b-owned");
     expect(foreignMessage.reply?.startsWith(`$JS.ACK.${STREAM_B}.`)).toBe(true);

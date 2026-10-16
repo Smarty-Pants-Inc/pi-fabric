@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { AgentManager, effectiveAgentTimeoutMs } from "../src/agents/manager.js";
 import { normalizeAgentRunRequest } from "../src/agents/request.js";
+import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import type { AgentHandleInfo, AgentRunResult } from "../src/agents/types.js";
 import { ActorManager } from "../src/actors/manager.js";
 import { GlobalActorRegistry } from "../src/actors/global-registry.js";
@@ -31,7 +32,7 @@ const alive = (pid: number) => {
     return process.platform !== "linux" || !/^[ZX]$/.test(fs.readFileSync(`/proc/${pid}/stat`, "utf8").split(") ").at(-1)!.split(" ")[0]!);
   } catch { return false; }
 };
-const setup = () => {
+const setup = (persistent = false) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "spawn-deadline-")); roots.push(root);
   const profile = path.join(root, "profile"); fs.mkdirSync(path.join(profile, "extensions"), { recursive: true });
   fs.copyFileSync(path.resolve("tests/fixtures/spawn-deadline-provider.ts"), path.join(profile, "extensions", "provider.ts"));
@@ -49,13 +50,13 @@ const setup = () => {
   const mesh = new MeshStore(path.join(root, "mesh"), 65536, 100);
   const main = { id: identity.id, matches: (id: string) => id === identity.id || id === "main", info: () => ({ id: identity.id }), local: true } as FabricMainAgentTarget;
   const participants = { list: () => [], get: () => undefined, self: () => undefined, peers: () => [], scheduleRefresh() {}, async refresh() {} } as unknown as FabricParticipantSource;
-  const actor = new ActorManager("deadline-proof", identity, mesh, config.mesh, manager, () => {}, { actorRoot: path.join(root, "actors"), mainAgent: main }); actors.push(actor);
+  const actor = new ActorManager("deadline-proof", identity, mesh, config.mesh, manager, () => {}, { actorRoot: path.join(root, "actors"), mainAgent: main, persistent, reapDeadSessionPresence: false }); actors.push(actor);
   const lifecycle = new LifecycleBroker(mesh, identity, participants, { enabled: false, pollMs: 100, maxReadEvents: 10 }, async () => {});
   const provider = new AgentsProvider(manager, actor, new GlobalActorRegistry(root, 65536), main, participants, undefined, lifecycle);
   const registry = new ActionRegistry(); registry.register(provider);
   const model = { provider: "provider", id: "session" };
   const context = { hasUI: false, modelRegistry: { getAvailable: () => [model], find: (p: string, id: string) => p === model.provider && id === model.id ? model : undefined } } as unknown as ExtensionContext;
-  return { root, manager, delivered, completion, service: new FabricExecutionService(registry, config), context };
+  return { root, manager, actor, mesh, identity, main, config, delivered, completion, service: new FabricExecutionService(registry, config), context };
 };
 
 describe("spawn hard deadlines below the configured default (#12302)", () => {
@@ -71,6 +72,39 @@ describe("spawn hard deadlines below the configured default (#12302)", () => {
     expect(effectiveAgentTimeoutMs(600000, 900000)).toBe(900000);
     expect(effectiveAgentTimeoutMs(600000, 100000000)).toBe(86400000);
     for (const timeoutMs of [30000, 300000]) expect(normalizeAgentRunRequest({ task: "box", timeoutMs }, { runner: "pi", timeoutMs: 600000 }).timeoutMs).toBe(timeoutMs);
+  });
+
+  it("keeps a persisted actor override extension-only after the configured default rises", async () => {
+    const s = setup(true);
+    s.manager.config.timeoutMs = 1_800_000;
+    const created = await s.service.execute({ code: `return await agents.createActor({ name: "persisted-budget", instructions: "Wait for work.", model: "provider/session", extensions: false, timeoutMs: 7200000 });`,
+      signal: undefined, parentToolCallId: "actor-deadline-proof", context: s.context, onPartial() {} });
+    expect(created.success, created.error).toBe(true);
+    const id = (created.value as { id: string }).id;
+    expect(s.actor.definition(id).timeoutMs).toBe(7_200_000);
+    await s.actor.close();
+    s.manager.config.timeoutMs = 86_400_000;
+    const restored = new ActorManager("deadline-proof", s.identity, s.mesh, s.config.mesh, s.manager, () => {}, {
+      actorRoot: path.join(s.root, "actors"), mainAgent: s.main, persistent: true, reapDeadSessionPresence: false,
+    }); actors.push(restored);
+    expect(restored.definition(id).timeoutMs).toBe(7_200_000);
+    const launches: Array<{ actorId: string | undefined; timeoutMs: number }> = [];
+    // Record the real manager's final worker arguments, but launch no native process.
+    vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async request => {
+      const args = new Map<string, string>();
+      for (let i = 0; i < request.workerArguments.length; i += 2) args.set(request.workerArguments[i]!, request.workerArguments[i + 1]!);
+      launches.push({ actorId: args.get("--actor-id"), timeoutMs: Number(args.get("--timeout-ms")) });
+      throw new Error("deadline launch recorded");
+    });
+    await expect(restored.ask(id, "Probe the restored actor's budget.")).rejects.toThrow();
+    expect(launches).toEqual([{ actorId: id, timeoutMs: 86_400_000 }]);
+    const oneShot = await s.service.execute({ code: `return await agents.spawn({ task: "Probe a one-shot budget.", model: "provider/session", extensions: false, timeoutMs: 900000 });`,
+      signal: undefined, parentToolCallId: "one-shot-counterexample", context: s.context, onPartial() {} });
+    expect(oneShot.success).toBe(false); // The recording transport deliberately refuses launch.
+    expect(launches.at(-1)).toEqual({ actorId: undefined, timeoutMs: 900_000 });
+    s.manager.config.timeoutMs = 1_800_000;
+    await expect(s.manager.run({ task: "Probe a longer actor override.", actorId: id, model: "provider/session", extensions: false, timeoutMs: 7_200_000 })).rejects.toThrow("deadline launch recorded");
+    expect(launches.at(-1)).toEqual({ actorId: id, timeoutMs: 7_200_000 });
   });
 
   // The clock changes only in the manager's host, after real native readiness.

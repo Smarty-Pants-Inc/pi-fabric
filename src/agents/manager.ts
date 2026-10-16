@@ -365,6 +365,7 @@ const promptFileMatches = (filePath: string, expectedSha256: string, expectedByt
 export const effectiveAgentTimeoutMs = (
   configuredTimeoutMs: number,
   requestedTimeoutMs?: number,
+  actorBound = false,
 ): number => {
   const configured = Math.max(
     MIN_AGENT_TIMEOUT_MS,
@@ -375,7 +376,8 @@ export const effectiveAgentTimeoutMs = (
   }
   // ponytail: preserve b4408352's protection from model-chosen tiny budgets,
   // while allowing deliberate lane/audit timeboxes of at least five minutes.
-  if (requestedTimeoutMs < configured && requestedTimeoutMs < MIN_AGENT_SHORTENING_TIMEOUT_MS) return configured;
+  // Persisted actor overrides remain extension-only, even if the default rises.
+  if (requestedTimeoutMs < configured && (actorBound || requestedTimeoutMs < MIN_AGENT_SHORTENING_TIMEOUT_MS)) return configured;
   return Math.max(
     MIN_AGENT_TIMEOUT_MS,
     Math.min(Math.floor(requestedTimeoutMs), MAX_AGENT_TIMEOUT_MS),
@@ -1890,7 +1892,7 @@ export class AgentManager {
       throw new Error(`Fabric agent depth limit reached (${this.config.maxDepth})`);
     }
     assertAgentTask(request);
-    const timeoutNote = ignoredTimeoutNote(this.config.timeoutMs, request.timeoutMs);
+    const timeoutNote = request.actorId ? undefined : ignoredTimeoutNote(this.config.timeoutMs, request.timeoutMs);
     const needs = normalizeAgentCapabilityTokens(request.needs);
     const requires = normalizeAgentRequires(request.requires);
     // Session transports are disabled until they can retain execution custody.
@@ -2222,6 +2224,7 @@ export class AgentManager {
         const timeoutMs = effectiveAgentTimeoutMs(
           this.config.timeoutMs,
           request.timeoutMs,
+          Boolean(request.actorId),
         );
         if (timeoutNote) fs.appendFileSync(logFile, JSON.stringify({ type: "run.timeout_ignored", ts: Date.now(), id, timeoutNote }) + "\n", { mode: 0o600 });
         const requestedThinking = routePin?.effort ?? request.thinking ?? this.config.thinking;

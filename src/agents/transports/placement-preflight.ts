@@ -8,9 +8,46 @@ import { agentPlacementProbe } from "../placement-config.js";
 import { AgentInputError, RequiredInputMissingError } from "../input-validation.js";
 import { taskAgentEnvironment } from "../task-environment.js";
 
-/** No guessed shared mounts: host configuration must name a shared root explicitly. */
+const containsPath = (root: string, file: string): boolean => {
+  const relative = path.relative(root, file);
+  return relative === "" || relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
+};
+
+/** Resolve aliases even when the caller names a not-yet-created descendant. */
+const realpathWithMissingTail = (file: string): string => {
+  let ancestor = path.resolve(file);
+  const tail: string[] = [];
+  for (;;) {
+    try { return path.join(fs.realpathSync(ancestor), ...tail); }
+    catch (error) {
+      const parent = path.dirname(ancestor);
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT" || parent === ancestor) throw error;
+      try {
+        const target = fs.readlinkSync(ancestor);
+        return path.join(realpathWithMissingTail(path.resolve(parent, target)), ...tail);
+      } catch (linkError) {
+        if (!["ENOENT", "EINVAL"].includes((linkError as NodeJS.ErrnoException).code ?? "")) throw linkError;
+      }
+      tail.unshift(path.basename(ancestor));
+      ancestor = parent;
+    }
+  }
+};
+
+/** Caller-owned scratch/state wins over even an explicitly declared shared mount. */
 export const placementLocalPathReason = (cwd: string, config: AgentPlacementConfig): string | undefined => {
   if (!path.isAbsolute(cwd)) return undefined;
+  const localReason = `caller-local cwd requires the local worker: ${cwd}`;
+  const localRoots = [process.env.TMPDIR || os.tmpdir(), "/srv/scratch", path.join(os.homedir(), ".local", "state")]
+    .filter(root => path.isAbsolute(root));
+  if (localRoots.some(root => containsPath(root, cwd))) return localReason;
+  try {
+    const resolved = realpathWithMissingTail(cwd);
+    for (const root of localRoots) {
+      try { if (containsPath(realpathWithMissingTail(root), resolved)) return localReason; }
+      catch { /* An unavailable local root still retains its lexical fence. */ }
+    }
+  } catch { return `caller-local cwd cannot be inspected safely: ${cwd}`; }
   let canonical: string;
   try { canonical = fs.realpathSync(cwd); }
   catch (error) {
@@ -22,11 +59,10 @@ export const placementLocalPathReason = (cwd: string, config: AgentPlacementConf
     try {
       const shared = fs.realpathSync(root);
       if (shared === path.parse(shared).root || !fs.statSync(shared).isDirectory()) continue;
-      const relative = path.relative(shared, canonical);
-      if (relative === "" || relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative)) return undefined;
+      if (containsPath(shared, canonical)) return undefined;
     } catch { /* An unavailable shared root proves no portability. */ }
   }
-  return `caller-local cwd requires the local worker: ${cwd}`;
+  return localReason;
 };
 
 const hostName = /^[A-Za-z0-9][A-Za-z0-9._-]*$/u;
@@ -136,7 +172,7 @@ export const preflightFleetPlacement = async (request: AgentTransportLaunch, con
   try {
     const root = fleetRoot(config, request.cwd);
     if (!root && !config.pickerCommand) return undefined;
-    const deadline = Math.min(preflightDeadline ?? Infinity, Date.now() + Math.min(config.commandTimeoutMs, 8_000));
+    const deadline = Math.min(preflightDeadline ?? Infinity, Date.now() + Math.min(config.commandTimeoutMs, 5_000));
     if (!selectedHost) {
       const selection = await selectFleetPlacement({ ...config, command }, request.cwd, request.signal, deadline, environment);
       if (!selection) throw new Error("No fleet placement selection");

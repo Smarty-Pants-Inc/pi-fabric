@@ -7,13 +7,10 @@
 // and queued/unknown/terminal operator classification surface. T-LOCK task custody needs a
 // real pre-admitted AgentManager run, not a synthetic task journal. Native 40 s synchronous
 // write blocking and OS process-death boundaries are not proven by the X3d/B2 slices here.
-import { createHash } from "node:crypto";
-import fs from "node:fs";
 import path from "node:path";
 import { setImmediate as immediate } from "node:timers/promises";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MeshStore } from "../../src/mesh/store.js";
-import { saveCompletion, type CompletionEnvelope } from "../../src/agents/completion-journal.js";
 import { FabricControlPlane, type FabricControlCommand, type FabricControlPlaneOptions } from "../../src/topology/control-plane.js";
 import { MeshConsumptionPausedError } from "../../src/topology/mesh-consumption.js";
 import { TransportUnavailableError, type TransportEnvelope, type TransportSent } from "../../src/transport/types.js";
@@ -506,38 +503,8 @@ describe("real FabricControlPlane / injected carrier faults", () => {
     });
   }
 
-  controlIt("T-LOCK completion: real saveCompletion custody stays off the global mesh lock through confirmed ack", async () => {
-    const f = fixture(), restore = f.locks.instrument(); f.keep(restore);
-    const probe = { finished: false, locks: [] as string[], globalAttempts: [] as string[], localLocks: [] as string[] };
-    await f.locks.storage.run(probe, () => f.receiver.mesh.put({ key: "fault-suite/completion-lock-probe", identity: fromOwner(f), value: 1 }));
-    expect(probe.locks).toEqual([path.join(f.meshRoot, ".lock")]);
-    const at = Date.now();
-    const completion: CompletionEnvelope = { format: 1, recipient: {
-      rootId: f.receiverOwner.hostId, sessionId: "receiver", projectRoot: f.root, cwd: f.root, name: "Main", startedAt: at - 1_000,
-    }, result: {
-      id: "c".repeat(32), name: "completion-lock-input", task: "native completion custody", status: "completed",
-      runner: "pi", transport: "process", cwd: f.root, startedAt: at - 500, updatedAt: at, finishedAt: at,
-      turns: 1, toolCalls: 0, text: "finished", exitCode: 0, finalAnswerReceipt: { id: "final-answer-lock", recordedAt: at },
-      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
-    } };
-    f.start(command => {
-      expect(command.operation).toBe("completion");
-      const body = command.data as CompletionEnvelope;
-      saveCompletion(f.meshRoot, body.recipient, body.result);
-      return { accepted: true, messageId: command.commandId };
-    });
-    const envelope = resolved(f.raw("lock-completion", { operation: "completion" }));
-    await f.publish({ ...envelope, body: { ...objectBody(envelope), data: completion } });
-    await f.settled(envelope.id);
-    const file = path.join(f.meshRoot, "agent-completions", `${createHash("sha256").update(completion.result.id).digest("hex")}.json`);
-    expect(JSON.parse(fs.readFileSync(file, "utf8"))).toEqual(completion);
-    const spans = f.locks.spans.filter(span => span.id === envelope.id);
-    expect(spans).toHaveLength(1); expect(spans[0]?.finished).toBe(true);
-    expect(spans[0]?.localLocks.length).toBeGreaterThan(0);
-    expect(spans[0]?.locks).toEqual([]); expect(spans[0]?.globalAttempts).toEqual([]);
-    expect(f.seen(envelope.id)?.acceptance).toMatchObject({ accepted: true });
-    // This exercises native COMPLETION CUSTODY, not a real child exit/spawn-bound B5 verifier.
-  });
+  // E4 voids the completion control-op/I-LOCK row: completion custody stays on the
+  // unchanged same-host journal. Native B4/B5 belong to native-boundaries.test.ts.
 
   controlIt("T-FILE-POSTCOMMIT (E1): real mesh append followed by wake timeout is uncertain/resolved, and same-key retry admits once", async () => {
     const f = fixture(); // Owns the actual Main custody handler and isolated temporary root.

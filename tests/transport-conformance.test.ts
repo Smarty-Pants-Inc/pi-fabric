@@ -15,7 +15,7 @@ import {
 import type { ParticipantRoute as Route, ParticipantView as View } from "../src/topology/participant-view.js";
 
 /**
- * FROZEN CONTRACT-v2 §§0,1,3,4,5,7,8,10.3,11 + E1–E3; T1–T22: inherited draft §7.
+ * FROZEN CONTRACT-v2 §§0,1,3,4,5,7,8,10.3,11 + errata E1–E10; T1–T22: inherited draft §7.
  * Keep reason: data safety and cross-machine trust boundary. No fake claim/control/admission
  * implementation: the helper's stub models §1 carrier/KV ONLY. Control tests instantiate the
  * actual class returned by loadControlPlane, and skip until A1 integration is explicitly confirmed.
@@ -34,7 +34,7 @@ import type { ParticipantRoute as Route, ParticipantView as View } from "../src/
  *   claim/outcome/ACK machinery, NOT Main/Pi consumption, AgentManager fsync or power-loss safety.
  * - T20 is focused control parity; unchanged control-plane/router suites must ALSO run. It does
  *   not spawn other tests. STATE migration is not control-carrier rollback evidence.
- * - SIGKILL/SIGSTOP, partitions, B3–B5, exact-parent completion, T13b/c/d, T16b, T-HOL, T-LOCK,
+ * - SIGKILL/SIGSTOP, partitions, B3–B5 (same-host completion per E4), T13b/c/d, T16b, T-HOL, T-LOCK,
  *   T-MIX and nonzero-drain classification remain tests/transport-faults/ and canary obligations.
  * - §10.3 N={1,4,16,64}, 1 cmd/s/sender, 10 min/step, per-target/N p50/p95/p99, KV write rate,
  *   PubAck p95 and separate B3 latency belong to T-P95, not CI/stub latency assertions.
@@ -556,7 +556,8 @@ describe.each(adapterKinds)("transport conformance / %s", kind => {
         { ownerIncarnation: "incarnation-1", message: "bounded input" }, nats.receiver.options.hostId,
         { idempotencyKey: nextId("T22-fresh") })).toMatchObject({ acknowledged: true });
       // Nonzero drain queued/admitted/unknown/terminal classification, operator dispositions,
-      // retained completion replay and old-writer stop proof remain T-ROLLBACK/canary, not this 0/0 case.
+      // old-writer stop proof remain T-ROLLBACK/canary, not this 0/0 case. E4 completion
+      // journals remain same-host and never travel on either carrier during rollback.
     } finally { await cp.close(); }
   });
 

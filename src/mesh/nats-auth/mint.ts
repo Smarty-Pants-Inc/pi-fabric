@@ -8,7 +8,7 @@ import {
   encodeUserJwt,
   formatUserCreds,
 } from "./jwt.js";
-import { PATH_B_OPERATOR_MACHINE_PATTERN, roleTemplate, roleTemplateWithPathB } from "./permissions.js";
+import { PATH_B_OPERATOR_MACHINE, PATH_B_OPERATOR_MACHINE_PATTERN, roleTemplate, roleTemplateWithPathB, type NatsRole } from "./permissions.js";
 
 /**
  * smarty-dev#7504 slice 1 (design Amendment B): high-level NATS minter for the `pi-fabric nats` CLI.
@@ -22,7 +22,7 @@ import { PATH_B_OPERATOR_MACHINE_PATTERN, roleTemplate, roleTemplateWithPathB } 
  * approval and the stop-first engine runbook are the caller's duty; the approval reference is audit metadata only.
  */
 
-export type NatsOrgRole = "agent" | "principal" | "maintainer" | "break-glass";
+export type NatsOrgRole = NatsRole | "operator";
 
 export interface NatsMintClock {
   nowSeconds(): number;
@@ -49,7 +49,7 @@ export interface NatsAccountMetadata {
   kind: "account";
   account: { name: string; publicKey: string };
   issuer: string;
-  signingKeys: Record<NatsOrgRole, string>;
+  signingKeys: Record<NatsRole, string> & Partial<Record<"operator", string>>;
 }
 
 export interface NatsUserMetadata {
@@ -88,7 +88,7 @@ const LIFETIME = {
   "break-glass": HOUR,
   sys: HOUR,
 } as const;
-const ORG_ROLES: readonly NatsOrgRole[] = ["agent", "principal", "maintainer", "break-glass"];
+const ORG_ROLES: readonly NatsRole[] = ["agent", "principal", "maintainer", "break-glass"];
 
 // JS regexes without the m flag anchor at the whole input: a final LF/CR/U+2028/U+2029 never matches.
 const ORG_NAME = /^[a-z0-9][a-z0-9-]{0,62}$/;
@@ -212,13 +212,18 @@ function canonical(value: unknown): string {
  * Path B mint schema (opt-in; all original #7504 fields stay unchanged):
  * - account input adds pathBMachines: a nonempty, unique array of 1..64 machine literals
  *   /^[a-z0-9][a-z0-9-]{0,31}$/; canary value ["ryzen2", "ryzen4"].
- * - Path B agent/maintainer user inputs repeat the same pathBMachines to verify the exact scope.
- *   Principal and break-glass keys retain their original templates and need no Path B input.
+ * - Only opted-in accounts add a fifth scoped signing key, role="operator".
+ * - Path B agent/operator user inputs repeat the same pathBMachines to verify the exact scope.
+ *   Principal, normal maintainer and break-glass issuance need no inventory: signed account
+ *   operator-key metadata determines whether the Path B advisory reservation applies.
  * - agent input uses its existing `host` field as the machine; it must be in pathBMachines.
- * - maintainer input adds `machine`, in /^fabric-ops(-[a-z0-9]+)?$/ (default choice "fabric-ops").
+ * - operator input requires job ("compaction" | "migration"), runId and pathBMachines;
+ *   optional machine defaults to "fabric-ops" and must match /^fabric-ops(-[a-z0-9]+)?$/.
  *   This is a reserved role namespace, not a host; it is forbidden in pathBMachines and agent credentials.
- *   The canary operator is metadata/report-only (E19): no inbox reads or relay publication.
+ *   The operator is metadata/report-only (E19): no ACK, inbox bodies, relay or lifecycle rights.
  *   It binds one bootstrap-owned advisory durable; provisioning uses a separate bootstrap authority.
+ * - Normal maintainer remains role="maintainer" with job/runId and NO machine identity.
+ *   All four legacy roles retain their non-opted-in output and break-glass scope is unchanged.
  * Neither input contains secrets in argv/environment: existing CLI stdin JSON and artifact rules apply.
  * A fleet-policy JSON can retain its existing `hosts` map and add pathBMachines, then mint Path B
  * agent users only for those host keys. Other hosts keep their existing #7504 account/credentials.
@@ -234,12 +239,11 @@ function pathBScopeDescription(value: unknown): string {
   return `path-b/${createHash("sha256").update(JSON.stringify(pathBMachines(value).sort())).digest("hex")}`;
 }
 
-function templates(input: Input): Record<NatsOrgRole, ReturnType<typeof roleTemplate>> {
+function mintTemplate(role: NatsOrgRole, input: Input, withPathB: boolean, machines: readonly string[]): ReturnType<typeof roleTemplate> {
   const streams = { custodyStream: input.custodyStream as string, livenessStream: input.livenessStream as string };
-  const machines = input.pathBMachines === undefined ? [] : pathBMachines(input.pathBMachines);
+  if (role === "operator" && !withPathB) fail("role");
   try {
-    const withPathB = input.pathBMachines !== undefined;
-    return Object.fromEntries(ORG_ROLES.map((role) => [role, withPathB ? roleTemplateWithPathB(role, streams, machines) : roleTemplate(role, streams)])) as Record<NatsOrgRole, ReturnType<typeof roleTemplate>>;
+    return withPathB ? roleTemplateWithPathB(role, streams, machines) : roleTemplate(role as NatsRole, streams);
   } catch {
     return fail("custodyStream/livenessStream");
   }
@@ -308,12 +312,15 @@ export function createNatsAccount(input: unknown, clock: NatsMintClock = systemC
       streams: quota(js.streams, "jetstream.streams"),
       consumer: quota(js.consumers, "jetstream.consumers"),
     };
-    const byRole = templates(value);
+    const withPathB = value.pathBMachines !== undefined;
+    const machines = withPathB ? pathBMachines(value.pathBMachines) : [];
+    const roles: readonly NatsOrgRole[] = withPathB ? [...ORG_ROLES, "operator"] : ORG_ROLES;
+    const byRole = Object.fromEntries(roles.map((role) => [role, mintTemplate(role, value, withPathB, machines)])) as Record<NatsOrgRole, ReturnType<typeof roleTemplate>>;
     const at = now(clock);
     const fixed = { nowSeconds: () => at };
     const signer = keyFromSeed(value.operatorSigningSeed, "operatorSigningSeed", "O");
     const account = nkeys.createAccount();
-    const scoped = ORG_ROLES.map(() => nkeys.createAccount());
+    const scoped = roles.map(() => nkeys.createAccount());
     try {
       // The identity key is offline custody: only a listed operator signing key issues accounts here.
       if (!operator.signingKeys.includes(signer.getPublicKey())) fail("operatorSigningSeed");
@@ -321,9 +328,9 @@ export function createNatsAccount(input: unknown, clock: NatsMintClock = systemC
         {
           name,
           subject: account.getPublicKey(),
-          signingKeys: ORG_ROLES.map((role, index) => ({
+          signingKeys: roles.map((role, index) => ({
             key: scoped[index]!.getPublicKey(), role, template: byRole[role],
-            ...(value.pathBMachines === undefined || (role !== "agent" && role !== "maintainer")
+            ...(value.pathBMachines === undefined || (role !== "agent" && role !== "operator")
               ? {} : { description: pathBScopeDescription(value.pathBMachines) }),
           })),
           limits,
@@ -336,12 +343,12 @@ export function createNatsAccount(input: unknown, clock: NatsMintClock = systemC
           kind: "account",
           account: { name, publicKey: account.getPublicKey() },
           issuer: signer.getPublicKey(),
-          signingKeys: Object.fromEntries(ORG_ROLES.map((role, index) => [role, scoped[index]!.getPublicKey()])) as Record<NatsOrgRole, string>,
+          signingKeys: Object.fromEntries(roles.map((role, index) => [role, scoped[index]!.getPublicKey()])) as NatsAccountMetadata["signingKeys"],
         },
         artifacts: [
           jwtArtifact("account.jwt", jwt),
           seedArtifact("account.nk", account),
-          ...ORG_ROLES.map((role, index) => seedArtifact(`signing-${role}.nk`, scoped[index]!)),
+          ...roles.map((role, index) => seedArtifact(`signing-${role}.nk`, scoped[index]!)),
         ],
       };
     } finally {
@@ -369,31 +376,34 @@ function orgSigner(value: Input, role: NatsOrgRole): { signer: KeyPair; account:
   if (account.sub === operator.systemAccount) fail("accountJwt");
   if (value.accountPublicKey !== account.sub) fail("accountPublicKey");
   const org = orgName(account.name, "accountJwt");
-  const expected = templates(value)[role];
   const keys = Array.isArray(account.nats.signing_keys) ? account.nats.signing_keys : [];
+  // The account is signature-verified above. Reservation is an account property, not a
+  // caller inventory toggle: principal/maintainer/break-glass never need that inventory.
+  const operatorScope = keys.find((key) => isRecord(key) && key.kind === "user_scope" && key.role === "operator");
+  const withPathB = isRecord(operatorScope) && typeof operatorScope.description === "string" && /^path-b\/[a-f0-9]{64}$/.test(operatorScope.description);
+  if (operatorScope !== undefined && !withPathB) fail("accountJwt");
   const signer = keyFromSeed(value.signingSeed, "signingSeed", "A");
-  const entry = keys.find((key) => isRecord(key) && key.key === signer.getPublicKey());
-  if (!isRecord(entry) || entry.kind !== "user_scope" || entry.role !== role) {
+  try {
+    const entry = keys.find((key) => isRecord(key) && key.key === signer.getPublicKey());
+    if (!isRecord(entry) || entry.kind !== "user_scope" || entry.role !== role) fail("signingSeed");
+    const inventoryRole = role === "agent" || role === "operator";
+    let machines: string[] = [];
+    if (withPathB && inventoryRole) {
+      machines = pathBMachines(value.pathBMachines);
+      const description = pathBScopeDescription(machines);
+      if (entry.description !== description || operatorScope.description !== description) fail("pathBMachines (scope differs)");
+    } else if (value.pathBMachines !== undefined) {
+      fail("role");
+    }
+    const expected = mintTemplate(role, value, withPathB, machines);
+    if (canonical(entry.template) !== canonical({ ...expected, subs: -1, data: -1, payload: -1 })) {
+      fail("custodyStream/livenessStream (scope template differs)");
+    }
+    return { signer, account: account.sub, org };
+  } catch (error) {
     signer.clear();
-    fail("signingSeed");
+    throw error;
   }
-  if (typeof entry.description === "string" && entry.description.startsWith("path-b/") && value.pathBMachines === undefined) {
-    signer.clear();
-    fail("pathBMachines");
-  }
-  if (value.pathBMachines !== undefined && role !== "agent" && role !== "maintainer") {
-    signer.clear();
-    fail("role");
-  }
-  if (value.pathBMachines !== undefined && entry.description !== pathBScopeDescription(value.pathBMachines)) {
-    signer.clear();
-    fail("pathBMachines (scope differs)");
-  }
-  if (canonical((entry as Input).template) !== canonical({ ...expected, subs: -1, data: -1, payload: -1 })) {
-    signer.clear();
-    fail("custodyStream/livenessStream (scope template differs)");
-  }
-  return { signer, account: account.sub, org };
 }
 
 function issueUser(spec: UserSpec, signer: KeyPair, clock: NatsMintClock): NatsMintOutput<NatsUserMetadata> {
@@ -436,15 +446,16 @@ function issueUser(spec: UserSpec, signer: KeyPair, clock: NatsMintClock): NatsM
   }
 }
 
-/** Ordinary org user (agent, principal, maintainer): one fresh U key per call, fixed role lifetime. */
+/** Ordinary org user (plus opt-in operator): one fresh U key per call, fixed role/job lifetime. */
 export function mintNatsUser(input: unknown, clock: NatsMintClock = systemClock): NatsMintOutput<NatsUserMetadata> {
   return withMint(() => {
     const role = isRecord(input) ? input.role : undefined;
-    if (role !== "agent" && role !== "principal" && role !== "maintainer") return fail("role");
+    if (role !== "agent" && role !== "principal" && role !== "maintainer" && role !== "operator") return fail("role");
     const fields = {
       agent: { required: ["host", "lane", "session", "release", "meshes"], optional: ["parent", "pathBMachines"] },
       principal: { required: ["person", "device"], optional: ["pathBMachines"] },
-      maintainer: { required: ["job", "runId"], optional: ["machine", "pathBMachines"] },
+      maintainer: { required: ["job", "runId"], optional: [] },
+      operator: { required: ["job", "runId", "pathBMachines"], optional: ["machine"] },
     }[role];
     const value = object(input, "input", ["role", ...ORG_COMMON, ...fields.required], fields.optional);
     const label = (key: string) => matching(value[key], LABEL, key);
@@ -466,11 +477,9 @@ export function mintNatsUser(input: unknown, clock: NatsMintClock = systemClock)
     } else {
       const job = value.job === "compaction" || value.job === "migration" ? value.job : fail("job");
       const runId = label("runId");
-      const machine = value.machine === undefined ? undefined : matching(value.machine, /^[a-z0-9][a-z0-9-]{0,31}$/, "machine");
-      if (value.pathBMachines !== undefined && (machine === undefined || !PATH_B_OPERATOR_MACHINE_PATTERN.test(machine))) fail("machine");
-      if (value.pathBMachines === undefined && machine !== undefined) fail("machine");
-      const machineTag = machine === undefined ? [] : [`machine:${machine}`];
-      spec = { role, nameIn: (org) => `maintainer/${org}/${job}/${runId}`, tags: ["role:maintainer", `job:${job}`, `run:${runId}`, ...machineTag], lifetime: LIFETIME[job] };
+      const machineTag = role === "operator"
+        ? [`machine:${matching(value.machine === undefined ? PATH_B_OPERATOR_MACHINE : value.machine, PATH_B_OPERATOR_MACHINE_PATTERN, "machine")}`] : [];
+      spec = { role, nameIn: (org) => `${role}/${org}/${job}/${runId}`, tags: [`role:${role}`, `job:${job}`, `run:${runId}`, ...machineTag], lifetime: LIFETIME[job] };
     }
     const { nameIn, ...issued } = spec;
     const { signer, account, org } = orgSigner(value, role);

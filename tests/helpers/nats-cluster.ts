@@ -29,6 +29,7 @@ export interface PathBUser {
 export interface PathBUsers {
   readonly machineA: PathBUser;
   readonly machineB: PathBUser;
+  /** Historical Module C alias: this is the distinct report-only role=operator credential. */
   readonly maintainer: PathBUser;
   readonly bootstrap: PathBUser;
 }
@@ -247,8 +248,8 @@ export class PathBHarness {
           { key: agentSigning.getPublicKey(), role: "agent", template: { ...agentTemplate, pub: { ...agentTemplate.pub, allow: [...agentTemplate.pub.allow, ...(options.additionalAgentPublish ?? [])] } } },
           {
             key: maintainerSigning.getPublicKey(),
-            role: "maintainer",
-            template: pathBRoleTemplate("maintainer", PATH_B_OPERATOR_MACHINE, PATH_B_MACHINES),
+            role: "operator",
+            template: pathBRoleTemplate("operator", PATH_B_OPERATOR_MACHINE, PATH_B_MACHINES),
           },
           {
             key: bootstrapSigning.getPublicKey(),
@@ -261,7 +262,7 @@ export class PathBHarness {
           signerOf(operatorSigning),
           clock,
         );
-        const user = (pair: KeyPair, machine: PathBUser["machine"], signer: KeyPair, role: "agent" | "maintainer", name: string, fileName: string): PathBUser => {
+        const user = (pair: KeyPair, machine: PathBUser["machine"], signer: KeyPair, role: "agent" | "maintainer" | "operator", name: string, fileName: string): PathBUser => {
           const jwt = encodeUserJwt(
             {
               name,
@@ -280,7 +281,7 @@ export class PathBHarness {
         };
         const machineAUser = user(machineA, "machine-a", agentSigning, "agent", "agent/path-b/machine-a", "machine-a.creds");
         const machineBUser = user(machineB, "machine-b", agentSigning, "agent", "agent/path-b/machine-b", "machine-b.creds");
-        const maintainerUser = user(maintainer, PATH_B_OPERATOR_MACHINE, maintainerSigning, "maintainer", "maintainer/path-b", "maintainer.creds");
+        const maintainerUser = user(maintainer, PATH_B_OPERATOR_MACHINE, maintainerSigning, "operator", "operator/path-b", "maintainer.creds");
         const bootstrapUser = user(bootstrap, PATH_B_OPERATOR_MACHINE, bootstrapSigning, "maintainer", "bootstrap/path-b", "bootstrap.creds");
         return {
           operatorJwt, systemAccount, systemAccountJwt, appAccount, appAccountJwt,
@@ -363,7 +364,7 @@ export class PathBHarness {
     await this.start();
   }
 
-  async connect(user: PathBUser): Promise<NatsConnection> {
+  async connect(user: Pick<PathBUser, "publicKey" | "credsPath">): Promise<NatsConnection> {
     const nc = await connect({
       servers: this.serverUrl,
       authenticator: credsAuthenticator(Uint8Array.from(fs.readFileSync(user.credsPath))),

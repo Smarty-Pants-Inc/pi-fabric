@@ -93,7 +93,31 @@ it.each(["project", "session"] as const)("public actor stop retains its live wri
     nativeSweep.call(this, scanTime ?? now, live, 10_000, stoppedWritersGone);
     if (scanTime !== undefined) scans++;
   });
-  let due: ReturnType<typeof vi.spyOn> | undefined;
+  const realNow = Date.now;
+  let clock: ReturnType<typeof vi.spyOn> | undefined;
+  let deadline: ReturnType<typeof vi.spyOn> | undefined;
+  const retentionNow = () => {
+    // Match the immediate source caller, not an ancestor: nested lease, worker,
+    // and native-exit checks inside maintenance must still observe real time.
+    const origin = (new Error().stack ?? "").split("\n").find(frame => /[\\/]src[\\/]/.test(frame));
+    return scanTime !== undefined && !!origin && /[\\/]residency[\\/]host\.(?:ts|js):/.test(origin) &&
+      /(?:#|\.)maintainRequests\b/.test(origin) ? scanTime : realNow();
+  };
+  const nativeNextDueAt = ResidentRequestRetention.prototype.nextDueAt;
+  const retentionDeadline = function (this: ResidentRequestRetention) {
+    const at = nativeNextDueAt.call(this);
+    // Translate the collector's virtual deadline into a physical timer delay.
+    // Preserve an in-progress scan (0) and an empty collector (undefined).
+    return at === undefined || at === 0 || scanTime === undefined ? at : realNow() + Math.max(0, at - scanTime);
+  };
+  const wakeRetention = () => {
+    // The real root watch is the public wake carrier after each clock advance.
+    // Replace identical config bytes; do not change policy or invoke maintenance.
+    const file = path.join(config.residencyRoot, "config.json");
+    const replacement = `${file}.retention-clock.tmp`;
+    fs.writeFileSync(replacement, fs.readFileSync(file), { mode: 0o600 });
+    fs.renameSync(replacement, file);
+  };
   const remove = vi.spyOn(fs, "rmSync");
   try {
     await participants.start();
@@ -122,9 +146,10 @@ it.each(["project", "session"] as const)("public actor stop retains its live wri
     expect(host.agents.status(writer.id)).toMatchObject({ status: "running", actorId: actor.id, turns: 3 });
 
     scanTime = ack.acknowledgedAt + RESIDENT_REQUEST_RETENTION_MS + 1;
-    due = vi.spyOn(ResidentRequestRetention.prototype, "due").mockReturnValue(true);
+    clock = vi.spyOn(Date, "now").mockImplementation(retentionNow);
+    deadline = vi.spyOn(ResidentRequestRetention.prototype, "nextDueAt").mockImplementation(retentionDeadline);
+    wakeRetention();
     await waitFor(() => scans > 0);
-    due.mockReturnValue(false);
     expect(fs.readFileSync(decisionPath, "utf8")).toBe(committed);
     expect(JSON.parse(fs.readFileSync(ackPath, "utf8"))).toEqual(ack);
     const cancelled = new AbortController();
@@ -163,18 +188,17 @@ it.each(["project", "session"] as const)("public actor stop retains its live wri
     });
     const before = scans;
     scanTime = (scanTime ?? 0) + 60_001;
-    due.mockReturnValue(true);
+    wakeRetention();
     let attempted = before;
     await waitFor(() => {
       if (scans <= before) return false;
       if (!fs.existsSync(decisionPath)) return true;
-      // A conservative first-sample exit/deadline veto is allowed. Forcing due
-      // does not bypass the collector's internal 60-second sample fence: advance
-      // only the retention clock before retrying, never the worker/lease clocks.
-      if (scans > attempted) { attempted = scans; scanTime = (scanTime ?? 0) + 60_001; }
+      // A conservative first-sample exit/deadline veto is allowed. Advance past
+      // the collector's real 60-second sample fence, then wake its real scheduler;
+      // neither due() nor the nested worker/lease clocks are mocked.
+      if (scans > attempted) { attempted = scans; scanTime = (scanTime ?? 0) + 60_001; wakeRetention(); }
       return false;
     });
-    due.mockReturnValue(false);
     // Main has no targeted veto callback on Windows (smarty-dev#5132).
     expect(deferred).toBe(process.platform !== "win32");
     // Native retirement must not remove the tree while the manager still owns
@@ -184,13 +208,12 @@ it.each(["project", "session"] as const)("public actor stop retains its live wri
     expect(remove.mock.calls.filter(([file]) => file === decisionPath)).toHaveLength(1);
     const collected = scans;
     scanTime = (scanTime ?? 0) + 60_001;
-    due.mockReturnValue(true);
+    wakeRetention();
     await waitFor(() => scans > collected);
-    due.mockReturnValue(false);
     expect(remove.mock.calls.filter(([file]) => file === decisionPath)).toHaveLength(1);
     expect(create).toHaveBeenCalledTimes(1);
   } finally {
-    due?.mockRestore(); sweep.mockRestore(); remove.mockRestore();
+    clock?.mockRestore(); deadline?.mockRestore(); sweep.mockRestore(); remove.mockRestore();
     // Every run belongs to this isolated fixture. Join them even if setup failed
     // before the original writer ID was observed; actor close alone can await a detached run.
     for (const run of host.agents?.listForUi() ?? []) await host.agents.stop(run.id);

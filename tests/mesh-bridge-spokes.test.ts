@@ -1,16 +1,16 @@
-import { createHash } from "node:crypto";
+import crypto, { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
 import { setTimeout as sleep } from "node:timers/promises";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { BRIDGE_LEASE_MS, MeshBridge, RemoteBridgeSide, serveBridgeAgent, StoreBridgeSide } from "../src/mesh/bridge.js";
+import { BRIDGE_LEASE_MS, MeshBridge, RemoteBridgeSide, serveBridgeAgent, StoreBridgeSide, type BridgePresence } from "../src/mesh/bridge.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
 import { AgentsProvider } from "../src/providers/agents-provider.js";
-import { readHostLease, writeHostLease } from "../src/topology/host-leases.js";
+import { hostLeasePath, readHostLease, writeHostLease } from "../src/topology/host-leases.js";
 import { writeParticipantFile } from "../src/topology/participant-files.js";
 
 // #11199: exercise lease-removal admission with recorded calls, never delete a lease locally.
@@ -89,6 +89,12 @@ const native = async (store: MeshStore, name: string, ttl = 60_000, incarnationT
     capabilities: ["steer", "followUp"], sessionId: name, startedAt: now, updatedAt: now, controlProtocol: "v1",
   } });
   return { identity, ownerIncarnation, host };
+};
+
+const tinyStores = () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-incarnation-"));
+  scratchRoots.push(dir);
+  return { dir, hub: new MeshStore(path.join(dir, "hub"), 64 * 1024, 100), peer: new MeshStore(path.join(dir, "peer"), 64 * 1024, 100) };
 };
 
 const fixture = async (targetTtl = 60_000, targetToken?: string,
@@ -1100,5 +1106,172 @@ describe("spoke-to-spoke roots and addressed control through the hub", () => {
     await f.drain(); await f.drain();
     expect(events(b, "fabric.control.command")).toHaveLength(0);
     expect(events(hub, "fabric.control.command")).toHaveLength(0);
+  });
+
+  // Incarnation rejection is a trust-boundary fence: a reconnecting spoke's first frame must
+  // not roll back a canonical root (or partially apply removals) using a replayed older snapshot.
+  const incarnationPresence = (id: string, startedAt: number, token: string, name: string, now: number) => {
+    const identity: MeshIdentity = { id, name, kind: "main", sessionId: name };
+    const record = { format: 1 as const, id, rootId: id, identity, startedAt, updatedAt: startedAt,
+      expiresAt: now + 60_000, incarnationToken: token };
+    return { identity, hosts: [{ record, expiresAt: record.expiresAt }], participants: [{
+      format: 1 as const, id, kind: "root" as const, rootId: id, ownerHostId: id, ownerIdentityId: id,
+      ownerIncarnation: `fixture:${token}`, name, label: name.toUpperCase(), status: "idle" as const,
+      runner: "pi", transport: "host" as const, capabilities: ["steer", "followUp"], sessionId: name,
+      startedAt, updatedAt: startedAt, controlProtocol: "v1" as const,
+    }] } satisfies Pick<BridgePresence, "hosts" | "participants"> & { identity: MeshIdentity };
+  };
+
+  it("rejects a superseded first reconnect token even with a later start and preserves authority through cleanup", async () => {
+    const { dir, hub, peer: remoteStore } = tinyStores();
+    const now = Date.now(), rootId = "session:root-R-00000001";
+    const newer = incarnationPresence(rootId, now - 10, `opaque-${crypto.randomUUID()}`, "new-incarnation", now);
+    const authority = new StoreBridgeSide(hub, "ryzen2");
+    const directId = "session:direct-stale-00000001";
+    const directNewer = incarnationPresence(directId, now - 10, `opaque-${crypto.randomUUID()}`, "direct-newer", now);
+    const older = incarnationPresence(rootId, now + 120_000, `opaque-${crypto.randomUUID()}`, "replayed-old", now);
+    const directOlder = incarnationPresence(directId, now + 120_000, `opaque-${crypto.randomUUID()}`, "direct-older", now);
+    // Identity, not clock order: these tokens were genuinely held before being superseded.
+    await authority.mirror({ hosts: [...older.hosts, ...directOlder.hosts],
+      participants: [...older.participants, ...directOlder.participants] });
+    await authority.mirror({ hosts: [...newer.hosts, ...directNewer.hosts],
+      participants: [...newer.participants, ...directNewer.participants] });
+    // Legacy lease bytes cannot prove this rejection: the same-peer mirror must do it.
+    writeHostLease(hub.root, { id: directId, rootId: directId, identityId: directId,
+      updatedAt: now - 10, expiresAt: now + 60_000 });
+    const directLeaseBefore = fs.readFileSync(hostLeasePath(hub.root, directId));
+    const directReconnect = new StoreBridgeSide(hub, "ryzen2");
+    await expect(directReconnect.mirror({ hosts: directOlder.hosts, participants: directOlder.participants }))
+      .rejects.toMatchObject({ code: "FABRIC_BRIDGE_STALE_INCARNATION" });
+    await directReconnect.withdraw();
+    expect(hub.get(hostKey(directId))!.value).toMatchObject({ startedAt: now - 10,
+      incarnationToken: directNewer.hosts[0]!.record.incarnationToken });
+    expect(hub.get(participantKey(directId))!.value).toMatchObject({ name: "direct-newer" });
+    expect(fs.readFileSync(hostLeasePath(hub.root, directId))).toEqual(directLeaseBefore);
+    const newerToken = newer.hosts[0]!.record.incarnationToken;
+    writeHostLease(hub.root, { id: rootId, rootId, identityId: rootId, startedAt: now - 10, incarnationToken: newerToken,
+      bridgeSupersededTokens: [older.hosts[0]!.record.incarnationToken], updatedAt: now - 10, expiresAt: now + 60_000 });
+    const mirrorBefore = hub.get(hostKey(rootId))!.value;
+    const participantBefore = hub.get(participantKey(rootId))!.value;
+    const leasePath = hostLeasePath(hub.root, rootId);
+    const leaseBytesBefore = fs.readFileSync(leasePath);
+    // The remote is a real native store presenting the stale first frame; no mirrored rows are pre-seeded there.
+    await remoteStore.put({ key: hostKey(rootId), identity: older.identity, value: older.hosts[0]!.record });
+    const remoteParticipant = older.participants[0]!;
+    writeParticipantFile(remoteStore.root, { key: participantKey(rootId), version: 1, updatedAt: now,
+      updatedBy: older.identity, value: remoteParticipant });
+    const bridge = new MeshBridge({ localName: "ryzen1", remoteName: "ryzen2", local: authority,
+      remote: new StoreBridgeSide(remoteStore, "ryzen1"), cursorPath: path.join(dir, "cursor.json"), presenceMs: 0 });
+    await expect(bridge.start()).rejects.toMatchObject({ code: "FABRIC_BRIDGE_STALE_INCARNATION" });
+    // runBridge's fatal-start cleanup takes this same stop/withdraw path. It must not turn the
+    // rejected first frame into authority to erase the newer persisted mirror or its lease.
+    await bridge.stop();
+    expect(hub.get(hostKey(rootId))!.value).toEqual(mirrorBefore);
+    expect(hub.get(participantKey(rootId))!.value).toEqual(participantBefore);
+    expect(fs.readFileSync(leasePath)).toEqual(leaseBytesBefore);
+    expect(removals).toEqual([]);
+  });
+
+  it("admits a genuine restart after a 120-second clock rollback in one RPC presence pass, and first-link roots", async () => {
+    const { dir, hub, peer } = tinyStores();
+    const now = Date.now(), rootId = "session:root-newer-00000001";
+    const prior = incarnationPresence(rootId, now - 20, `opaque-${crypto.randomUUID()}`, "prior", now);
+    await new StoreBridgeSide(hub, "ryzen2").mirror({ hosts: prior.hosts, participants: prior.participants });
+    const replacement = incarnationPresence(rootId, prior.hosts[0]!.record.startedAt - 120_000,
+      `opaque-${crypto.randomUUID()}`, "replacement", now);
+    await peer.put({ key: hostKey(rootId), identity: replacement.identity, value: replacement.hosts[0]!.record });
+    writeParticipantFile(peer.root, { key: participantKey(rootId), version: 1, updatedAt: now,
+      updatedBy: replacement.identity, value: replacement.participants[0]! });
+    const input = new PassThrough(), output = new PassThrough();
+    const serving = serveBridgeAgent(new StoreBridgeSide(peer, "ryzen1"), input, output);
+    const remote = new RemoteBridgeSide(output, input);
+    closers.push(async () => { remote.close(); input.end(); await serving; output.end(); });
+    const local = new StoreBridgeSide(hub, "ryzen2");
+    const mirrored = vi.spyOn(local, "mirror");
+    const bridge = new MeshBridge({ localName: "ryzen1", remoteName: "ryzen2", local, remote,
+      cursorPath: path.join(dir, "rollback-cursor.json"), presenceMs: 0 });
+    await expect(bridge.start()).resolves.toBeUndefined();
+    expect(mirrored).toHaveBeenCalledOnce();
+    expect(local.holds(rootId, replacement.identity)).toBe(true);
+    await expect(bridge.syncPresence()).resolves.toBeUndefined(); // same-token retry is not latched
+    expect(hub.get(hostKey(rootId))!.value).toMatchObject({ startedAt: replacement.hosts[0]!.record.startedAt,
+      incarnationToken: replacement.hosts[0]!.record.incarnationToken });
+    expect(readHostLease(hub.root, rootId)).toMatchObject({ startedAt: replacement.hosts[0]!.record.startedAt,
+      incarnationToken: replacement.hosts[0]!.record.incarnationToken });
+    expect(hub.get(participantKey(rootId))!.value).toMatchObject({ name: "replacement" });
+
+    const firstId = "session:first-ever-00000001";
+    const first = incarnationPresence(firstId, now - 1, `opaque-${crypto.randomUUID()}`, "first", now);
+    await new StoreBridgeSide(hub, "ryzen3").mirror({ hosts: first.hosts, participants: first.participants });
+    expect(hub.get(hostKey(firstId))!.value).toMatchObject({ startedAt: now - 1 });
+    expect(hub.get(participantKey(firstId))!.value).toMatchObject({ name: "first" });
+  });
+
+  it("retains X100 through X90 metadata, admits never-seen Y95, and then rejects superseded X", async () => {
+    const { hub } = tinyStores();
+    const now = Date.now(), rootId = "session:same-token-00000001";
+    const prior = incarnationPresence(rootId, now - 30, "same-opaque-token", "same-token-prior", now);
+    await new StoreBridgeSide(hub, "ryzen3").mirror({ hosts: prior.hosts, participants: prior.participants });
+    const metadata = incarnationPresence(rootId, now - 40, "same-opaque-token", "same-token-metadata", now);
+    await expect(new StoreBridgeSide(hub, "ryzen3").mirror({ hosts: metadata.hosts, participants: metadata.participants }))
+      .resolves.toBeUndefined();
+    // Equal tokens admit changed metadata, but neither persisted authority may lose the highwater.
+    expect(hub.get(hostKey(rootId))!.value).toMatchObject({ startedAt: now - 30,
+      incarnationToken: "same-opaque-token", identity: metadata.identity });
+    expect(readHostLease(hub.root, rootId)).toMatchObject({ startedAt: now - 30, incarnationToken: "same-opaque-token" });
+    expect(hub.get(participantKey(rootId))!.value).toMatchObject({ name: "same-token-metadata" });
+    // Y95 has never been held: X100's high-water is metadata for X, not an ordering of Y.
+    const between = incarnationPresence(rootId, now - 35, "distinct-opaque-between", "new-between", now);
+    await expect(new StoreBridgeSide(hub, "ryzen3").mirror(between)).resolves.toBeUndefined();
+    expect(hub.get(hostKey(rootId))!.value).toMatchObject({ startedAt: now - 35,
+      incarnationToken: "distinct-opaque-between" });
+    const hostBefore = hub.get(hostKey(rootId));
+    const participantBefore = hub.get(participantKey(rootId));
+    const leasePath = hostLeasePath(hub.root, rootId);
+    const leaseBefore = fs.readFileSync(leasePath);
+    const reconnect = new StoreBridgeSide(hub, "ryzen3");
+    await expect(reconnect.mirror(metadata)).rejects.toMatchObject({ code: "FABRIC_BRIDGE_STALE_INCARNATION" });
+    await reconnect.withdraw();
+    expect(hub.get(hostKey(rootId))).toEqual(hostBefore);
+    expect(hub.get(participantKey(rootId))).toEqual(participantBefore);
+    expect(fs.readFileSync(leasePath)).toEqual(leaseBefore);
+    expect(removals).toEqual([]);
+
+    const newer = incarnationPresence(rootId, now - 20, "distinct-opaque-newer", "genuinely-newer", now);
+    await new StoreBridgeSide(hub, "ryzen3").mirror({ hosts: newer.hosts, participants: newer.participants });
+    expect(hub.get(hostKey(rootId))!.value).toMatchObject({ startedAt: now - 20,
+      incarnationToken: "distinct-opaque-newer", identity: newer.identity });
+    expect(readHostLease(hub.root, rootId)).toMatchObject({ startedAt: now - 20, incarnationToken: "distinct-opaque-newer" });
+    expect(hub.get(participantKey(rootId))!.value).toMatchObject({ name: "genuinely-newer" });
+  });
+
+  it("uses lease-only superseded-token history as authority without a persisted mirror", async () => {
+    const { hub } = tinyStores();
+    const now = Date.now(), rootId = "session:lease-only-00000001";
+    const old = incarnationPresence(rootId, now - 20, `opaque-${crypto.randomUUID()}`, "replayed-old", now);
+    const newer = incarnationPresence(rootId, now - 10, `opaque-${crypto.randomUUID()}`, "lease-only-newer", now);
+    writeHostLease(hub.root, { id: rootId, rootId, identityId: rootId, startedAt: now - 10,
+      incarnationToken: newer.hosts[0]!.record.incarnationToken, bridgeSupersededTokens: [old.hosts[0]!.record.incarnationToken],
+      updatedAt: now - 10, expiresAt: now + 60_000 });
+    expect(hub.get(hostKey(rootId))).toBeUndefined();
+    const leasePath = hostLeasePath(hub.root, rootId);
+    const leaseBytesBefore = fs.readFileSync(leasePath);
+    await expect(new StoreBridgeSide(hub, "ryzen2").mirror({ hosts: old.hosts, participants: old.participants })).rejects
+      .toMatchObject({ code: "FABRIC_BRIDGE_STALE_INCARNATION" });
+    expect(fs.readFileSync(leasePath)).toEqual(leaseBytesBefore);
+    expect(hub.get(hostKey(rootId))).toBeUndefined();
+    expect(hub.get(participantKey(rootId))).toBeUndefined();
+  });
+
+  it("does not treat a legacy lease-only record as incarnation authority", async () => {
+    const { hub } = tinyStores();
+    const now = Date.now(), rootId = "session:legacy-lease-00000001";
+    const incoming = incarnationPresence(rootId, now - 10, `opaque-${crypto.randomUUID()}`, "admitted", now);
+    // Deliberately seed no mirror: legacy lease bytes without startedAt/token are not proof of an incarnation.
+    writeHostLease(hub.root, { id: rootId, rootId, identityId: rootId, updatedAt: now - 20, expiresAt: now + 60_000 });
+    expect(hub.get(hostKey(rootId))).toBeUndefined();
+    await new StoreBridgeSide(hub, "ryzen2").mirror({ hosts: incoming.hosts, participants: incoming.participants });
+    expect(hub.get(hostKey(rootId))!.value).toMatchObject({ startedAt: now - 10 });
+    expect(hub.get(participantKey(rootId))!.value).toMatchObject({ name: "admitted" });
   });
 });

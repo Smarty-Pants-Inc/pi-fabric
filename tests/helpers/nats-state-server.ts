@@ -13,7 +13,8 @@ import { existsSync, readFileSync, realpathSync, renameSync, writeFileSync } fro
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { it } from "vitest";
-import { openNatsStateBackend, type NatsStateBackend } from "../../src/mesh/state-backend-nats.js";
+import { closeNatsStateBackend, natsStreamName, openNatsStateBackend, type NatsStateBackend } from "../../src/mesh/state-backend-nats.js";
+import { waitForNatsConsumerReady } from "./nats-consumer-ready.js";
 
 const profiles = { single: 1, cluster: 3 } as const;
 const rawProfile = process.env.NATS_STATE_PROFILE;
@@ -78,8 +79,15 @@ export const reportNatsSkip = (): void => { if (!natsConfigured) it.skip(natsSki
 
 /** Prepares the root's NATS backend, so `new MeshStore(root, …, { stateBackend: "nats" })` gets it. Its stream is
  * derived from the root (pi-fabric#937): each test's fresh root has its own, so cases never share state on the server. */
-export const prepareNatsRoot = (root: string, options: { lockTimeoutMs?: number } = {}): Promise<NatsStateBackend> => {
+export const prepareNatsRoot = async (root: string, options: { lockTimeoutMs?: number } = {}): Promise<NatsStateBackend> => {
   if (!natsConfigured) throw new Error(natsSkipReason);
-  return openNatsStateBackend({ root, servers: [natsServerUrl!], monitoringUrl: natsMonitorUrl!,
+  const backend = await openNatsStateBackend({ root, servers: [natsServerUrl!], monitoringUrl: natsMonitorUrl!,
     ...(options.lockTimeoutMs === undefined ? {} : { lockTimeoutMs: options.lockTimeoutMs }) });
+  try {
+    await waitForNatsConsumerReady(natsServerUrl!, natsStreamName(root));
+  } catch (error) {
+    closeNatsStateBackend(root);
+    throw error;
+  }
+  return backend;
 };

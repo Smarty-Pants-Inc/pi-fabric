@@ -163,7 +163,11 @@ function pathBUnique(values: string[]): string[] {
   return [...new Set(values)];
 }
 
+/** Reserved operator principal, deliberately not a host in the runtime inventory (E14). */
+export const PATH_B_OPERATOR_MACHINE = "fabric-ops";
+
 function pathBRuntime(roleMachine: string, machines: readonly string[] = []): PathBRoleTemplate {
+  if (roleMachine === PATH_B_OPERATOR_MACHINE) fail("machine");
   const inbox = `FABRIC_IN_${roleMachine}`;
   const privateInboxes = roleMachine === PATH_B_MACHINE_TAG ? machines.map((machine) => `FABRIC_IN_${pathBMachine(machine)}`) : [inbox];
   const ownInbox = `_INBOX.{{subject()}}.>`;
@@ -200,9 +204,10 @@ function pathBRuntime(roleMachine: string, machines: readonly string[] = []): Pa
 }
 
 function pathBMaintainer(roleMachine: string, machines: readonly string[]): PathBRoleTemplate {
+  if (roleMachine !== PATH_B_MACHINE_TAG && roleMachine !== PATH_B_OPERATOR_MACHINE) fail("machine");
   if (machines.length === 0) fail("machines");
   const inboxes = machines.map((machine) => {
-    if (!PATH_B_MACHINE.test(machine)) fail("machines");
+    if (!PATH_B_MACHINE.test(machine) || machine === PATH_B_OPERATOR_MACHINE) fail("machines");
     return `FABRIC_IN_${machine}`;
   });
   const allow = [
@@ -219,8 +224,8 @@ function pathBMaintainer(roleMachine: string, machines: readonly string[]): Path
     "$JS.API.STREAM.MSG.GET.KV_fabric_leases",
     ...["CREATE", "INFO", "MSG.NEXT", "DELETE"].map((verb) => `$JS.API.CONSUMER.${verb}.FABRIC_ADV.>`),
     ...inboxes.flatMap((stream) => [`$JS.API.CONSUMER.INFO.${stream}.>`]),
-    `fabric.in.*.*.ack.*.${roleMachine}`,
-    `fabric.ev.${roleMachine}.fabric.ops.>`,
+    ...machines.map((machine) => `fabric.in.${machine}.*.ack.*.${PATH_B_OPERATOR_MACHINE}`),
+    `fabric.ev.${PATH_B_OPERATOR_MACHINE}.fabric.ops.>`,
     JS_INFO,
     USER_INFO,
   ];

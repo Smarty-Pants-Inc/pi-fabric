@@ -14,14 +14,14 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { jetstream, jetstreamManager, type JetStreamManager } from "@nats-io/jetstream";
 import { connect, credsAuthenticator, nkeys, type NatsConnection } from "@nats-io/transport-node";
 import { encodeAccountJwt, encodeOperatorJwt, encodeUserJwt, formatUserCreds, type ScopedSigningKey } from "../../src/mesh/nats-auth/jwt.js";
-import { pathBRoleTemplate } from "../../src/mesh/nats-auth/permissions.js";
+import { PATH_B_OPERATOR_MACHINE, pathBRoleTemplate } from "../../src/mesh/nats-auth/permissions.js";
 import { renderNatsServerConfig } from "../../src/mesh/nats-auth/server-config.js";
 
 export const PATH_B_MACHINES = ["machine-a", "machine-b"] as const;
 export type PathBMachine = (typeof PATH_B_MACHINES)[number];
 
 export interface PathBUser {
-  readonly machine: PathBMachine;
+  readonly machine: PathBMachine | typeof PATH_B_OPERATOR_MACHINE;
   readonly publicKey: string;
   readonly credsPath: string;
 }
@@ -231,7 +231,7 @@ export class PathBHarness {
         {
           key: maintainerSigning.getPublicKey(),
           role: "maintainer",
-          template: pathBRoleTemplate("maintainer", "machine-a", PATH_B_MACHINES),
+          template: pathBRoleTemplate("maintainer", PATH_B_OPERATOR_MACHINE, PATH_B_MACHINES),
         },
         {
           key: bootstrapSigning.getPublicKey(),
@@ -244,7 +244,7 @@ export class PathBHarness {
         signerOf(operatorSigning),
         clock,
       );
-      const user = (pair: KeyPair, machine: PathBMachine, signer: KeyPair, role: "agent" | "maintainer", name: string, fileName: string): PathBUser => {
+      const user = (pair: KeyPair, machine: PathBUser["machine"], signer: KeyPair, role: "agent" | "maintainer", name: string, fileName: string): PathBUser => {
         const jwt = encodeUserJwt(
           {
             name,
@@ -263,8 +263,8 @@ export class PathBHarness {
       };
       const machineAUser = user(machineA, "machine-a", agentSigning, "agent", "agent/path-b/machine-a", "machine-a.creds");
       const machineBUser = user(machineB, "machine-b", agentSigning, "agent", "agent/path-b/machine-b", "machine-b.creds");
-      const maintainerUser = user(maintainer, "machine-a", maintainerSigning, "maintainer", "maintainer/path-b", "maintainer.creds");
-      const bootstrapUser = user(bootstrap, "machine-a", bootstrapSigning, "maintainer", "bootstrap/path-b", "bootstrap.creds");
+      const maintainerUser = user(maintainer, PATH_B_OPERATOR_MACHINE, maintainerSigning, "maintainer", "maintainer/path-b", "maintainer.creds");
+      const bootstrapUser = user(bootstrap, PATH_B_OPERATOR_MACHINE, bootstrapSigning, "maintainer", "bootstrap/path-b", "bootstrap.creds");
       const storeDir = path.join(root, "store");
       const resolverDir = path.join(root, "resolver");
       fs.mkdirSync(storeDir, { mode: 0o700 });

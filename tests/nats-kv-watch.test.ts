@@ -268,14 +268,27 @@ describe.skipIf(!binary)("real authenticated NATS KV snapshot/ready/reset", () =
     } })));
   });
 
-  it("fails on malformed broker data instead of hiding it behind reset/retry", async () => {
+  it.each([{ name: "shape", wire: "{}" }, { name: "syntax", wire: "not-json" }])("fails on malformed broker data instead of hiding it behind reset/retry: $name", async ({ name, wire }) => {
     const { store } = await presence(A);
-    const key = `${A}.p.malformed`;
+    const key = `${A}.p.malformed-${name}`;
     const { iterator } = watch(store, key);
     expect(await next(iterator)).toEqual({ type: "ready" });
     const bootstrap = await harness.connect(harness.users.bootstrap);
-    await jetstream(bootstrap).publish(`$KV.fabric_presence.${key}`, "{}");
+    await jetstream(bootstrap).publish(`$KV.fabric_presence.${key}`, wire);
     await expect(bounded(iterator.next(), "malformed entry failure")).rejects.toMatchObject({ code: "FABRIC_TRANSPORT_INVALID" });
+  });
+
+  it("refuses non-serializable values before storing an unreadable record", async () => {
+    const { store } = await presence(A);
+    const key = `${A}.p.invalid-value`;
+    const cycle: Record<string, unknown> = {};
+    cycle.self = cycle;
+    for (const value of [undefined, () => undefined, cycle]) {
+      await expect(store.put(key, OWNER, value, 0)).rejects.toMatchObject({ code: "FABRIC_TRANSPORT_INVALID", persisted: false });
+      expect(await store.get(key)).toBeUndefined();
+    }
+    const revision = await store.put(key, OWNER, null, 0);
+    expect(await store.get(key)).toMatchObject({ revision, value: null });
   });
 
   it("enforces own-machine writes and real create/update/delete CAS conflicts", async () => {

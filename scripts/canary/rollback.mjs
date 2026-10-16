@@ -39,11 +39,12 @@ export function rollbackPlan(request) {
         classes: { queued: "no claim", admitted: "claim with outcome", unknown: "claim without outcome", terminal: "claim with terminal outcome" } },
       { phase: "disposition", action: "relay-outcome-unknown", require: "one durable idempotent relay:<commandId> per remaining command, including admitted and terminal; retain ACK envelopes" },
       { phase: "flip", action: "flip-to-file", require: "host-wide config flip, reload ALL runtimes, confirm old NATS writers stopped before file admission is ready; bridge stays up and resumes file presence mirrors" },
-      { phase: "reconcile", action: "reconcile-command-ids", require: "same commandId/control-seen store; at most one same-key retry; never re-run an unresolved claim; completions retained and re-sent by producer" },
+      { phase: "reconcile", action: "reconcile-command-ids", require: "same commandId/control-seen store; at most one same-key retry; never re-run an unresolved claim; native same-root completion journal retained unchanged; no completion carrier replay" },
       { phase: "retain", action: "retain-audit", require: "keep streams, consumers, FABRIC_ADV, control-seen and ALL native custody/consumption journals" },
     ],
-    forbidden: ["delete", "purge", "ack remaining messages as cleanup", "new-id retry", "automatic TTL takeover", "stop event bridge"],
-    note: "This is a per-host canary rollback, not fleet cutover or file-surface retirement.",
+    forbidden: ["delete", "purge", "ack remaining messages as cleanup", "new-id retry", "automatic TTL takeover", "stop event bridge",
+      "completion carrier replay", "completion control-seen claim"],
+    note: "This is a per-host control/presence rollback, not fleet cutover or file-surface retirement. E4 completions have no transport rollback; native envelopes, attempts, receipts, archives and claims stay unchanged.",
   };
 }
 
@@ -111,6 +112,8 @@ export async function runRollback(request, commandAdapter, { dryRun = true, evid
     for (const message of inventory.messages) {
       requireThat(message && request.runtimeIds.includes(message.runtimeId) && Number.isSafeInteger(message.sequence) && message.sequence > 0 &&
         ["command", "ack"].includes(message.kind), "invalid retained envelope");
+      requireThat(message.operation !== "completion" && !(text(message.commandId) && message.commandId.startsWith("completion:")),
+        "E4 completion has no carrier envelope or control-seen claim; completion:<runId> is reserved, not reconciled");
       const sequenceKey = `${message.runtimeId}:${message.sequence}`;
       requireThat(!sequences.has(sequenceKey), "duplicate retained sequence"); sequences.add(sequenceKey);
       if (message.kind === "ack") {
@@ -149,8 +152,9 @@ export async function runRollback(request, commandAdapter, { dryRun = true, evid
     const reconciliation = await call("reconcile-command-ids", { commands: [...commands.values()],
       preserveControlSeen: true, maxSameKeyRetries: 1, retainCompletions: true }, 120000);
     requireThat(reconciliation?.controlSeenStoreUnchanged === true && reconciliation.completionJournalRetained === true &&
-      reconciliation.completionResendCarrier === "file" && Array.isArray(reconciliation.results) &&
-      sameSet(reconciliation.results.map((r) => r.commandId), [...commands.keys()]), "every retained command needs a reconciliation disposition; completion custody must survive");
+      reconciliation.completionJournalUnchanged === true && !Object.hasOwn(reconciliation, "completionResendCarrier") &&
+      Array.isArray(reconciliation.results) && sameSet(reconciliation.results.map((r) => r.commandId), [...commands.keys()]),
+      "every retained control command needs a reconciliation disposition; native completion journal stays unchanged, with no resend carrier");
     let unresolved = 0;
     for (const result of reconciliation.results) {
       const command = commands.get(result.commandId);

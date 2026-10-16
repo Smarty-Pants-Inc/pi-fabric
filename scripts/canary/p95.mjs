@@ -1,13 +1,13 @@
 #!/usr/bin/env node
 // T-P95: plan by default, or evaluate recorded sender-monotonic receipts. Never connects to NATS.
 import { readFile } from "node:fs/promises";
-import { resolve } from "node:path";
+import { isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { analyzeLockAttribution } from "./lock-attribution.mjs";
 
 export const SUPPORTED_N = Object.freeze([1, 4, 16, 64]);
 const targets = ["main", "task", "actor"];
-const operations = ["followUp", "steer", "stop", "completion"];
+const operations = Object.freeze(["followUp", "steer", "stop"]);
 const requireThat = (test, message) => { if (!test) throw new Error(message); };
 const text = (s) => typeof s === "string" && s.length > 0;
 const count = (n) => Number.isSafeInteger(n) && n >= 0;
@@ -37,14 +37,18 @@ export function p95Plan(n = SUPPORTED_N) {
     hosts: { WA: "ryzen2", WB: "ryzen4" },
     preconditions: ["P-HL: headless RPC Mains on both work hosts", "P-SRV: approved per-host credentials, private CA, dedicated messaging server",
       "P-UP: candidate artifact on both hosts, all runtimes NATS, no other fleet work", "P-ACL: work hosts can reach :4222"],
+    taskPlacement: "Each host's headless Main spawns process tasks on its OWN host; cross-host flows are messaging only.",
+    f3: { hosts: ["ryzen2", "ryzen4"], carriers: ["file", "nats"],
+      requirement: "Parent offline at local child exit; native same-root journal, exact-parent delivered() receipt, unchanged in both modes." },
     steps: selection(n).map((senders) => ({ n: senders, durationMs: 600000, ratePerSenderHz: 1,
-      realAgentsMax: 16, remainingSenders: "model-free Fabric control-plane processes", recipients: "real Main/process-task/actor" })),
+      realAgentsMax: 16, remainingSenders: "model-free Fabric control-plane processes", recipients: "real Main/process-task/actor",
+      claimedOperations: [...operations], completionMeasurement: "report-only local settle -> delivered(); no transport hop" })),
     dispatcher: { inboxLanes: 8, maxInHandPerLane: 16, maxAckPending: 128, ackWaitMs: 30000,
       workingEveryMs: 10000, actorLane: "one serial lane", acksBypassLanes: true },
     measurement: "sender monotonic send -> authenticated owner ACK (B2), NOT command PubAck (B1)",
     reports: ["p50/p95/p99 per N and target class", "per-operation coverage", "KV writes/s", "PubAck p95 <= 250 ms",
-      "B3 sender-observed receipt latency, separately and not claimed"],
-    gate: "healthy cross-host Main/task followUp, steer, stop, completion p95 < 5000 ms (also <= 15000 ms); T-LOCK must pass",
+      "B3 sender-observed receipt latency, separately and not claimed", "Completion settle -> delivered(), separately and not claimed; no transport hop"],
+    gate: "healthy cross-host Main/process-task followUp, steer, stop p95 < 5000 ms (also <= 15000 ms); T-LOCK must pass",
     actor: "report only; never inherits the Main/task claim", bridge: "kept for non-control events",
     note: "No sends, processes, host changes or broker operations are executed by this CLI.",
   };
@@ -63,6 +67,29 @@ function checkContext(input) {
   if (input.server?.host !== "intel1" || input.server?.version !== "2.11.17" ||
       input.server?.syncInterval !== "always" || input.server?.replicas !== 1) blockers.push("server evidence does not match D6 and errata E2");
   return blockers;
+}
+
+/** Local completion timings are native-journal evidence, never command/ACK samples or a latency gate. */
+function completionReport(samples = []) {
+  requireThat(Array.isArray(samples), "completionSamples must be an array");
+  const seen = new Set(), byHost = { ryzen2: [], ryzen4: [] }, latencies = [];
+  for (const sample of samples) {
+    requireThat(sample && text(sample.runId) && ["ryzen2", "ryzen4"].includes(sample.host) &&
+      text(sample.meshRoot) && isAbsolute(sample.meshRoot) && text(sample.recipient?.rootId) && text(sample.recipient?.sessionId) &&
+      processIdentity(sample.recorderProcess) && text(sample.clockId) && sample.settledClockId === sample.clockId &&
+      sample.deliveredClockId === sample.clockId && text(sample.settlementReceiptId) && text(sample.deliveredReceiptId),
+      "completion timing requires a local shared root, spawn-bound recipient, recorder clock and settlement/delivered() receipts");
+    requireThat(!["operation", "commandId", "pubAckMonoNs", "pubAckSequence", "pubAckDurable", "ownerAckMonoNs",
+      "ackAuthenticated", "ackCommandId", "ackSourceMachine", "ackOwnerHostId", "sourceMachine", "controlSeen", "carrier"]
+      .some((key) => Object.hasOwn(sample, key)), "completion timing has no carrier, control-seen claim, command or transport ACK");
+    const key = JSON.stringify([sample.host, sample.meshRoot, sample.runId]);
+    requireThat(!seen.has(key), "duplicate native completion timing for a run"); seen.add(key);
+    const latency = elapsedMs(sample.settledMonoNs, sample.deliveredMonoNs);
+    latencies.push(latency); byHost[sample.host].push(latency);
+  }
+  return { ...percentiles(latencies), byHost: Object.fromEntries(Object.entries(byHost).map(([host, values]) => [host, percentiles(values)])),
+    hostsMissing: Object.keys(byHost).filter((host) => byHost[host].length === 0), claimed: false, transportHop: false,
+    meaning: "local settlement -> exact-parent inbox delivered(); unchanged same-root native journal, not owner ACK or B3" };
 }
 
 export function analyzeP95(input, requestedN = SUPPORTED_N) {
@@ -113,6 +140,7 @@ export function analyzeP95(input, requestedN = SUPPORTED_N) {
     if (step.kvWindowMs !== step.durationMs || step.kvComplete !== true) blockers.push(`N=${step.n}: incomplete KV write-rate window`);
     const groups = Object.fromEntries(targets.map((target) => [target, { ack: [], pubAck: [], b3: [], total: 0,
       outcomes: { accepted: 0, rejected: 0, timeout: 0, uncertain: 0 }, operations: new Map() }]));
+    const completion = completionReport(step.completionSamples);
     const pubAcks = [];
     for (const sample of step.samples) {
       const sender = senders.get(sample.senderId);
@@ -124,7 +152,7 @@ export function analyzeP95(input, requestedN = SUPPORTED_N) {
         targets.includes(sample.targetClass) && sample.ownerHost !== sender.host && sample.realRecipient === true,
         "samples require receipted real cross-host canary recipients");
       requireThat(sample.targetClass === "actor" ? ["tell", "ask", "stop"].includes(sample.operation) : operations.includes(sample.operation),
-        "operation does not match target class");
+        "operation does not match target class; completion has no transport hop and belongs only in completionSamples");
       requireThat(["accepted", "rejected", "timeout", "uncertain"].includes(sample.outcome), "unknown sample outcome");
       const offset = elapsedMs(sender.windowStartMonoNs, sample.sendMonoNs);
       requireThat(offset < step.durationMs, "send lies outside sender window");
@@ -185,14 +213,14 @@ export function analyzeP95(input, requestedN = SUPPORTED_N) {
     const pubAck = percentiles(pubAcks);
     if (pubAck.p95Ms !== null && pubAck.p95Ms > 250) failures.push(`N=${step.n}: PubAck p95 > 250 ms; escalate, do not weaken sync_interval`);
     reports.push({ n: step.n, durationMs: step.durationMs, realAgents, modelFreeSenders: step.n - realAgents,
-      byTargetClass, kv: { writes: step.kvWrites, windowMs: step.kvWindowMs, writesPerSecond: step.kvWrites * 1000 / step.kvWindowMs }, pubAck });
+      byTargetClass, completion, kv: { writes: step.kvWrites, windowMs: step.kvWindowMs, writesPerSecond: step.kvWrites * 1000 / step.kvWindowMs }, pubAck });
   }
   for (const n of requestedN) if (!seenN.has(n)) blockers.push(`missing N=${n} step`);
   const metricVerdict = blockers.length ? "blocked" : failures.length ? "fail" : "pass";
   return { schema: "fabric-canary-p95-report/v1", verdict: metricVerdict === "pass" ? "probe-only" : metricVerdict,
     metricVerdict, evidenceKind: "recorded-probe-only", e2eProven: false, canaryLatencyClaimEligible: false,
     requestedN, fullRisingN: SUPPORTED_N.every((n) => requestedN.includes(n)), availability: "R1 non-HA", lockGate,
-    steps: reports, failures, blockers, dispatcher: input.dispatcher ?? { status: "not-recorded" }, actorClaimed: false, b3Claimed: false,
+    steps: reports, failures, blockers, dispatcher: input.dispatcher ?? { status: "not-recorded" }, actorClaimed: false, b3Claimed: false, completionClaimed: false,
     proofLimit: "Recorded or injected receipts are evidence to review, not real E2E proof. Full headless and B1-B5 acceptance requires independently verified live receipts." };
 }
 

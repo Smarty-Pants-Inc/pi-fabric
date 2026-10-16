@@ -4,7 +4,7 @@ import { readFile } from "node:fs/promises";
 import { isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-export const LOCK_CLASSES = Object.freeze(["main", "task", "stop", "completion"]);
+export const LOCK_CLASSES = Object.freeze(["main", "task", "stop"]);
 const workloads = ["conformance", "faults", "canary"];
 const requireThat = (test, message) => { if (!test) throw new Error(message); };
 const count = (n) => Number.isSafeInteger(n) && n >= 0;
@@ -16,8 +16,9 @@ const checkIdentity = (p) => requireThat(p && text(p.machine) && Number.isSafeIn
 export function lockPlan() {
   return {
     schema: "fabric-canary-lock-report/v1", verdict: "plan", dryRun: true,
-    invariant: "T-LOCK: zero global mesh-root acquisitions from delivery through broker ACK",
+    invariant: "T-LOCK: zero global mesh-root acquisitions from control delivery through broker ACK",
     classes: LOCK_CLASSES, workloads,
+    completion: "E4 voids I-LOCK's completion/writeJsonAtomic control row: same-root native journal, no transport span.",
     collect: [
       "Inventory every participating owner PID, start time and boot id before the window; include replacements.",
       "Capture all-acquisition PID counters on the exact global mesh root, not only held/timeout events.",
@@ -66,7 +67,7 @@ export function analyzeLockAttribution(evidence) {
     for (const span of record.spans) {
       requireThat(span && text(span.commandId) && LOCK_CLASSES.includes(span.targetClass) &&
         workloads.includes(span.workload) && count(span.globalAcquisitions) && count(span.startAt) && count(span.endAt) &&
-        span.startAt >= window.startAt && span.endAt <= window.endAt && span.endAt >= span.startAt, "invalid control span or span outside attribution window");
+        span.startAt >= window.startAt && span.endAt <= window.endAt && span.endAt >= span.startAt, "invalid control span or span outside attribution window; E4 completion is not a control class");
       // One delivery may be replayed: the capture must give every delivery attempt a distinct span id.
       requireThat(text(span.spanId) && !spans.has(`${key}:${span.spanId}`), "missing/duplicate spanId");
       spans.add(`${key}:${span.spanId}`);
@@ -89,7 +90,7 @@ export function analyzeLockAttribution(evidence) {
   return {
     schema: "fabric-canary-lock-report/v1", verdict: failures.length ? "fail" : blockers.length ? "blocked" : "pass",
     evidenceKind: "recorded-attribution", e2eProven: false, window, byClass, attribution, failures, blockers,
-    note: "Other attributed PID activity is reported, not mistaken for handler acquisitions. Actor p95 is not claimed.",
+    note: "Other attributed PID activity is reported, not mistaken for handler acquisitions. Actor p95 is not claimed. E4 completion custody is unchanged and outside the control-span gate.",
   };
 }
 

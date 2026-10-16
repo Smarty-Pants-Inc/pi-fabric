@@ -219,12 +219,15 @@ async function compose(pair: RealAdapterPair, full: boolean) {
         clock.value = cutoffMs; senderLease.live(); // stop only the actual local cutoff alarm
         taps.presence.releaseAll(); taps.leases.releaseAll();
         try { await boundedReceipt(view.close(), "close read-only A2 directory"); }
+        catch (error) { throw sanitizeNatsError(error); }
         finally { rmSync(dir, { recursive: true, force: true }); }
       } };
   } catch (error) {
     clock.value = cutoffMs; senderLease.live();
-    try { await view.close(); } finally { rmSync(dir, { recursive: true, force: true }); }
-    throw error;
+    try { await view.close(); }
+    catch (closeError) { throw sanitizeNatsError(closeError); }
+    finally { rmSync(dir, { recursive: true, force: true }); }
+    throw sanitizeNatsError(error);
   }
 }
 
@@ -258,6 +261,18 @@ describe("presence reset failure output boundary", () => {
       } finally { output.mockRestore(); }
     });
   }
+
+  it("scrubs a seed-bearing NATS setup failure in every thrown representation", () => {
+    const seed = `SU${"P".repeat(56)}`;
+    const original = new Error(`NATS setup failed ${seed}`, { cause: new Error(`raw setup cause ${seed}`) });
+    original.stack = `Error: ${original.message}\n    at setup (${seed}:1:1)`;
+    const failure = sanitizeNatsError(original);
+    for (const value of [failure.message, failure.stack, String(failure)]) {
+      expect(value).not.toContain(seed);
+    }
+    expect(failure).not.toBe(original);
+    expect(failure.cause).toBeUndefined();
+  });
 });
 
 /** Dependency timing probe only; no broker or product delete/release path is run.
@@ -340,8 +355,15 @@ describe("A2 real authenticated watch → manually-composed ParticipantView", ()
           expect(view.list()).toMatchObject([{ id: record.id, machine: pair.sender.self.machine, local: false, stale: false }]);
         } else expect(view.resolve(record.id)).toBeUndefined();
         expect(composed.errors).toEqual([]);
+      } catch (error) {
+        throw sanitizeNatsError(error);
       } finally {
-        try { await composed?.close(); } finally { await pair.close(); }
+        try { await composed?.close(); }
+        catch (error) { throw sanitizeNatsError(error); }
+        finally {
+          try { await pair.close(); }
+          catch (error) { throw sanitizeNatsError(error); }
+        }
       }
     }, 60_000);
   }

@@ -82,7 +82,7 @@ const connections: NatsConnectionHandle[] = [];
 const watches: Array<{ controller: AbortController; iterator: Watch }> = [];
 const connectMachine = async (machine: typeof A | typeof B): Promise<NatsConnectionHandle> => {
   const user = machine === A ? harness.users.machineA : harness.users.machineB;
-  const connection = await openNatsConnection({ servers: harness.serverUrl, credentials: user.credsPath, machine });
+  const connection = await openNatsConnection({ ...harness.runtimeOptions(user), machine });
   connections.push(connection);
   return connection;
 };

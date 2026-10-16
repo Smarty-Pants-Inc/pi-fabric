@@ -28,7 +28,8 @@ import {
 } from "./subjects.js";
 import { ensureTransportConsumer, ensureTransportStream, type TransportStreamPolicy } from "./provision.js";
 import { ADVISORY_CAPTURE_STREAM } from "./subjects.js";
-import { openNatsConnection, type NatsConnectionHandle } from "./connection.js";
+import { openNatsConnection, type NatsConnectionHandle, type NatsPermissionPolicy } from "./connection.js";
+import type { TlsOptions } from "@nats-io/transport-node";
 import { openNatsKvForMachine, type NatsKvStore } from "./kv.js";
 
 const DEFAULT_MAX_BYTES = 1_073_741_824;
@@ -39,25 +40,29 @@ const utf8 = new TextEncoder();
 const validMessageId = (id: string): boolean => id.length > 0 && id === id.trim() && !/[\u0000-\u001f\u007f]/.test(id);
 
 /** Direct options keep the module independently testable; the factory passes FabricTransportOptions. */
-export interface NatsTransportOptions {
+export interface NatsTransportOptions extends NatsPermissionPolicy {
   readonly servers: string | readonly string[];
   readonly machine: string;
   readonly hostId: string;
   readonly name?: string;
-  readonly credentials?: string;
+  /** Scoped runtime agent credentials; verified against the exact USER.INFO scope. */
+  readonly credentials: string;
+  readonly tls?: TlsOptions;
+  /** Test-only plaintext to numeric loopback servers. Never read from config or environment. */
+  readonly allowInsecureLoopback?: boolean;
   readonly maxBytes?: number;
   readonly maxAgeMs?: number;
   readonly maxMessageBytes?: number;
   readonly duplicateWindowMs?: number;
   readonly requestTimeoutMs?: number;
   readonly provision?: boolean;
-  readonly verifyMachine?: boolean;
 }
 
 type OpenOptions = NatsTransportOptions | FabricTransportOptions;
-type ResolvedNatsOptions = Required<Pick<NatsTransportOptions, "servers" | "machine" | "hostId" | "maxBytes" | "maxMessageBytes" | "duplicateWindowMs" | "requestTimeoutMs" | "provision" | "verifyMachine">> & {
+type ResolvedNatsOptions = Required<Pick<NatsTransportOptions, "servers" | "machine" | "hostId" | "credentials" | "custodyStream" | "livenessStream" | "pathBMachines" | "maxBytes" | "maxMessageBytes" | "duplicateWindowMs" | "requestTimeoutMs" | "provision">> & {
   readonly name?: string;
-  readonly credentials?: string;
+  readonly tls?: TlsOptions;
+  readonly allowInsecureLoopback?: boolean;
 };
 
 const isDirectOptions = (options: OpenOptions): options is NatsTransportOptions => "servers" in options;
@@ -69,37 +74,56 @@ const envString = (name: string): string | undefined => {
 
 const normalizeOptions = (options: OpenOptions): ResolvedNatsOptions => {
   if (isDirectOptions(options)) {
+    // The runtime role is fixed to the scoped agent; no caller-selected role or verification bypass.
+    for (const key of ["role", "verifyMachine"]) if (key in options) throw new Error(`NATS transport option ${key} is not supported`);
+    if (!options.credentials) throw new Error("NATS transport requires credentials");
     return {
       servers: options.servers,
       machine: validateMachine(options.machine),
       hostId: options.hostId,
       ...(options.name === undefined ? {} : { name: options.name }),
-      ...(options.credentials === undefined ? {} : { credentials: options.credentials }),
+      credentials: options.credentials,
+      custodyStream: options.custodyStream,
+      livenessStream: options.livenessStream,
+      pathBMachines: options.pathBMachines,
+      ...(options.tls === undefined ? {} : { tls: options.tls }),
+      ...(options.allowInsecureLoopback === undefined ? {} : { allowInsecureLoopback: options.allowInsecureLoopback }),
       maxBytes: options.maxBytes ?? DEFAULT_MAX_BYTES,
       maxMessageBytes: options.maxMessageBytes ?? DEFAULT_MAX_MESSAGE_BYTES,
       duplicateWindowMs: options.duplicateWindowMs ?? DEFAULT_DUPLICATE_WINDOW_MS,
       requestTimeoutMs: options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
-      provision: options.provision ?? options.credentials === undefined,
-      verifyMachine: options.verifyMachine ?? true,
+      provision: options.provision ?? false,
     } as ResolvedNatsOptions;
   }
-  const config = options.config as unknown as { nats?: { servers?: string | readonly string[]; machine?: string; credentials?: string } };
-  const servers = config.nats?.servers ?? envString("PI_FABRIC_NATS_SERVERS");
-  const machine = config.nats?.machine ?? envString("PI_FABRIC_MACHINE");
-  const credentials = config.nats?.credentials ?? envString("PI_FABRIC_NATS_CREDENTIALS");
+  const config = options.config as unknown as { nats?: {
+    servers?: string | readonly string[]; machine?: string; credentials?: string;
+    custodyStream?: string; livenessStream?: string; pathBMachines?: readonly string[]; tls?: TlsOptions;
+  } };
+  const nats = config.nats;
+  // Production config never enables plaintext; the loopback opt-in is a direct test option only.
+  if (nats !== undefined && nats !== null && typeof nats === "object" && "allowInsecureLoopback" in nats) {
+    throw new Error("mesh.nats.allowInsecureLoopback is not supported");
+  }
+  const servers = nats?.servers ?? envString("PI_FABRIC_NATS_SERVERS");
+  const machine = nats?.machine ?? envString("PI_FABRIC_MACHINE");
+  const credentials = nats?.credentials ?? envString("PI_FABRIC_NATS_CREDENTIALS");
   if (!servers || !machine || !credentials) throw new Error("NATS transport requires servers, machine and credentials");
+  // Expected policy is required; openNatsConnection validates it with the mint validators and fails closed.
   return {
     servers,
     machine: validateMachine(machine),
     hostId: options.hostId,
     ...(envString("PI_FABRIC_NATS_NAME") === undefined ? {} : { name: envString("PI_FABRIC_NATS_NAME") }),
     credentials,
+    custodyStream: nats?.custodyStream as string,
+    livenessStream: nats?.livenessStream as string,
+    pathBMachines: nats?.pathBMachines as readonly string[],
+    ...(nats?.tls === undefined ? {} : { tls: nats.tls }),
     maxBytes: DEFAULT_MAX_BYTES,
     maxMessageBytes: DEFAULT_MAX_MESSAGE_BYTES,
     duplicateWindowMs: DEFAULT_DUPLICATE_WINDOW_MS,
     requestTimeoutMs: 5_000,
     provision: false,
-    verifyMachine: true,
   } as ResolvedNatsOptions;
 };
 
@@ -160,10 +184,14 @@ class NatsTransportImpl implements FabricTransport {
     }
     const connection = await openNatsConnection({
       servers: options.servers,
-      ...(options.credentials ? { credentials: options.credentials } : {}),
+      credentials: options.credentials,
       ...(options.name ? { name: options.name } : {}),
       machine: options.machine,
-      verifyMachine: options.verifyMachine,
+      custodyStream: options.custodyStream,
+      livenessStream: options.livenessStream,
+      pathBMachines: options.pathBMachines,
+      ...(options.tls === undefined ? {} : { tls: options.tls }),
+      ...(options.allowInsecureLoopback === undefined ? {} : { allowInsecureLoopback: options.allowInsecureLoopback }),
       timeoutMs: options.requestTimeoutMs,
     });
     try {

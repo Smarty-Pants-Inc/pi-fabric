@@ -944,6 +944,9 @@ describe("AgentManager", () => {
       expect(fs.existsSync(runDirectory)).toBe(true);
       expect(fs.existsSync(worktree!)).toBe(true);
       // A later exact exit discharges transient custody, never a terminal-only receipt.
+      // failed-stop loses the request ACK, not this handle's later exit proof:
+      // retrying that failed hook again after proof must not replace cancellation
+      // with a supervisor failure. The stopped expectation is intentional.
       workerExited = true;
       expect((await manager.stop(queued.id)).status).toBe("stopped");
       expect(fs.existsSync(path.join(runDirectory, "unresolved-worker.json"))).toBe(false);
@@ -1491,19 +1494,25 @@ describe("AgentManager", () => {
         runRoot: root,
       });
       managers.push(manager);
-      const result = await manager.run({ task: "HANG until stopped", transport: "process" });
+      const handle = await manager.spawn({ task: "HANG until stopped", transport: "process" });
+      await vi.waitFor(() => expect(manager.status(handle.id).status).toBe("failed"), { timeout: 10_000 });
+      const candidate = manager.status(handle.id) as AgentRunRecord;
       expect(launches).toBe(1);
-      expect(result.status).toBe("failed");
-      expect(result.error).toContain("Agent transport exited without a result");
-      expect(fs.existsSync(path.join(manager.runDirectory(result.id)!, "relaunches.jsonl"))).toBe(false);
+      expect(candidate.error).toContain("Agent transport exited without a result");
+      await expect(manager.wait(handle.id, { timeoutMs: 50 })).resolves.toMatchObject({ status: "failed", errorCode: "CUSTODY_UNCONFIRMED" });
+      expect(fs.existsSync(path.join(manager.runDirectory(handle.id)!, "relaunches.jsonl"))).toBe(false);
+      expect(await handles[0]!.isAlive()).toBe(true);
+      await handles[0]!.stop();
+      await manager.stop(handle.id);
+      expect(manager.isSettled(handle.id)).toBe(true);
     } finally {
       spy.mockRestore();
       for (const handle of handles) await handle.stop();
     }
   }, 30_000);
 
-  // dev-lead review D1 on #26: lost contact is not an exit. The run fails as lost, once, and
-  // neither cleanup nor shutdown deletes files that the still-running worker may use.
+  // Lost contact is a terminal failed outcome, not an exit receipt: retain
+  // admission and files that the worker may still use.
   it("fails a run whose transport lost contact as lost, and keeps its worker's files", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
     roots.push(root);
@@ -1523,10 +1532,13 @@ describe("AgentManager", () => {
         runRoot: root,
       });
       managers.push(manager);
-      const result = await manager.run({ task: "HANG until stopped", transport: "process" });
+      const handle = await manager.spawn({ task: "HANG until stopped", transport: "process" });
+      await vi.waitFor(() => expect(manager.status(handle.id).status).toBe("failed"), { timeout: 5_000 });
+      const result = manager.status(handle.id) as AgentRunRecord;
       expect(launches).toBe(1);
       expect(result.status).toBe("failed");
-      expect(result.error).toMatch(/^Lost track of the worker: the Herdr server has been unreachable/);
+      await expect(manager.wait(handle.id, { timeoutMs: 50 })).resolves.toMatchObject({ status: "failed", errorCode: "CUSTODY_UNCONFIRMED" });
+      expect(result.error).toContain("Lost track of the worker: the Herdr server has been unreachable");
       expect(result.error).not.toContain("exited without a result");
       const runDirectory = manager.runDirectory(result.id)!;
       await expect(manager.cleanup(result.id)).rejects.toThrow(/lost track of its worker/);
@@ -1540,8 +1552,8 @@ describe("AgentManager", () => {
     }
   }, 30_000);
 
-  // dev-lead review D1 on #26: lost contact is not an exit. The run fails as lost, once, and
-  // neither cleanup nor shutdown deletes files that the still-running worker may use.
+  // Lost contact is a terminal failed outcome, not an exit receipt: retain
+  // admission and files that the worker may still use.
   it("preserves modelReason in the persisted terminal record and settlement callback for a lost worker", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
     roots.push(root);
@@ -1564,13 +1576,17 @@ describe("AgentManager", () => {
         onSettled: settled,
       });
       managers.push(manager);
-      const result = await manager.run({ task: "HANG until stopped", transport: "process", model: "cliproxyapi/gpt-6-astra", modelReason });
+      const handle = await manager.spawn({ task: "HANG until stopped", transport: "process", model: "cliproxyapi/gpt-6-astra", modelReason });
+      await vi.waitFor(() => expect(manager.status(handle.id).status).toBe("failed"), { timeout: 5_000 });
+      const result = manager.status(handle.id) as AgentRunRecord;
       const persisted = JSON.parse(fs.readFileSync(path.join(manager.runDirectory(result.id)!, "status.json"), "utf8"));
       expect.soft(persisted).toMatchObject({ status: "failed", modelReason });
-      expect.soft(settled).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ id: result.id, status: "failed", modelReason }));
+      expect.soft(settled).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ status: "failed", modelReason, errorCode: "CUSTODY_UNCONFIRMED" }));
       expect(launches).toBe(1);
       expect(result.status).toBe("failed");
-      expect(result.error).toMatch(/^Lost track of the worker: the Herdr server has been unreachable/);
+      expect(result.modelReason).toBe(modelReason);
+      await expect(manager.wait(handle.id, { timeoutMs: 50 })).resolves.toMatchObject({ status: "failed", errorCode: "CUSTODY_UNCONFIRMED" });
+      expect(result.error).toContain("Lost track of the worker: the Herdr server has been unreachable");
       expect(result.error).not.toContain("exited without a result");
       const runDirectory = manager.runDirectory(result.id)!;
       await expect(manager.cleanup(result.id)).rejects.toThrow(/lost track of its worker/);
@@ -1618,7 +1634,10 @@ describe("AgentManager", () => {
       managers.push(manager);
       const handle = await manager.spawn({ task: "HANG until stopped", transport: "process" });
       if (path_ === "stop") await expect(manager.stop(handle.id)).rejects.toThrow(/execution exit unconfirmed/);
-      else expect((await manager.wait(handle.id)).status).toBe("timed_out");
+      else {
+        await vi.waitFor(() => expect(manager.status(handle.id).status).toBe("failed"), { timeout: 12_000 });
+        await expect(manager.wait(handle.id, { timeoutMs: 50 })).resolves.toMatchObject({ status: "failed", errorCode: "CUSTODY_UNCONFIRMED" });
+      }
       const runDirectory = manager.runDirectory(handle.id)!;
       expect(JSON.parse(fs.readFileSync(path.join(runDirectory, "unresolved-worker.json"), "utf8")).reason)
         .toMatch(/Herdr server has been unreachable/);
@@ -1746,17 +1765,21 @@ describe("AgentManager", () => {
       });
       managers.push(manager);
       const handle = await manager.spawn({ task: "HANG until stopped", transport: "process" });
-      const result = await manager.wait(handle.id);
+      await vi.waitFor(() => expect(manager.status(handle.id).status).toBe("failed"), { timeout: 25_000 });
+      const candidate = manager.status(handle.id) as AgentRunRecord;
       expect(launches).toBe(1);
-      expect(result.status).toBe("failed");
-      expect(result.error).toContain("did not stop, so it was not relaunched");
+      expect(candidate.error).toContain("did not stop, so it was not relaunched");
+      await expect(manager.wait(handle.id, { timeoutMs: 50 })).resolves.toMatchObject({ status: "failed", errorCode: "CUSTODY_UNCONFIRMED" });
       const relaunches = fs.readFileSync(path.join(manager.runDirectory(handle.id)!, "relaunches.jsonl"), "utf8")
         .trim().split("\n").map((line) => JSON.parse(line));
       expect(relaunches).toEqual([expect.objectContaining({ kind: "relaunch-failed" })]);
-      // review/astra on e170d9e: the worker that did not stop may still use its files.
-      await expect(manager.cleanup(handle.id)).rejects.toThrow(/lost track of its worker/);
+      // The failed stop cannot release or replace a still-live worker.
+      await expect(manager.cleanup(handle.id)).rejects.toThrow(/execution exit unconfirmed/);
       expect(fs.existsSync(manager.runDirectory(handle.id)!)).toBe(true);
-      await expectUnconfirmedClose(manager);
+      expect(await first!.isAlive()).toBe(true);
+      await first!.stop();
+      await manager.stop(handle.id);
+      expect(manager.isSettled(handle.id)).toBe(true);
     } finally {
       spy.mockRestore();
       await first?.stop();
@@ -2074,15 +2097,16 @@ describe("AgentManager", () => {
       expect(workerJoined).toBe(false);
       expect(settled).toBe(false);
       releaseWorker();
-      if (outcome === "uncertain" && platform === "native" && process.platform !== "win32") {
-        // PR 218's POSIX tree custody is stricter than Windows logical stop:
-        // a closed primary alone cannot settle an unconfirmed execution tree.
+      if (outcome === "uncertain") {
+        // A captured primary/helper close is not whole-tree exit on either
+        // platform. Publish custody failure without releasing the execution fence.
         await expect(stopping).rejects.toThrow(/execution exit unconfirmed/);
-        await expect(manager.wait(handle.id, { timeoutMs: 20 })).rejects.toThrow(/still running/);
-        expect(manager.status(handle.id).status).toBe("running");
+        expect(await manager.wait(handle.id)).toMatchObject({ status: "failed", errorCode: "CUSTODY_UNCONFIRMED" });
+        expect(manager.status(handle.id).status).toBe("failed");
         expect(workerJoined).toBe(true);
         expect(fs.existsSync(path.join(manager.runDirectory(handle.id)!, "unresolved-worker.json"))).toBe(true);
-        await expect(manager.cleanup(handle.id)).rejects.toThrow(/running agent/);
+        await expect(manager.cleanup(handle.id)).rejects.toThrow(/lost track/);
+        // This custom handle has no exact bounded native stop-debt receipt.
         await expectUnconfirmedClose(manager);
         return;
       }
@@ -2097,14 +2121,8 @@ describe("AgentManager", () => {
       expect(launch).toHaveBeenCalledOnce();
       expect(JSON.parse(fs.readFileSync(statusFile, "utf8")).sessionId).toBe(sessionId);
       expect(() => process.kill(Number(sessionId), 0)).toThrow(expect.objectContaining({ code: "ESRCH" }));
-      if (outcome === "uncertain") {
-        expect(fs.existsSync(path.join(manager.runDirectory(handle.id)!, "unresolved-worker.json"))).toBe(true);
-        await expect(manager.cleanup(handle.id)).rejects.toThrow(/lost track of its worker/);
-        await expect(manager.checkpointForRelease()).rejects.toThrow(/unresolved/);
-      } else {
-        if (outcome === "failed-result") expect((await manager.wait(handle.id)).error).toBe("real worker failure");
-        expect(await manager.cleanup(handle.id)).toEqual({ cleaned: true });
-      }
+      if (outcome === "failed-result") expect((await manager.wait(handle.id)).error).toBe("real worker failure");
+      expect(await manager.cleanup(handle.id)).toEqual({ cleaned: true });
     } finally {
       releaseHelper(); releaseWorker();
       child.kill("SIGTERM");
@@ -2113,7 +2131,8 @@ describe("AgentManager", () => {
         await closed;
         // Join Windows logical close before restoring the native platform seam.
         if (platform === "win32") {
-          await manager.close();
+          if (outcome === "uncertain") await expect(manager.close()).rejects.toThrow(/execution exit unconfirmed/);
+          else await manager.close();
           const index = managers.indexOf(manager);
           if (index !== -1) managers.splice(index, 1);
         }
@@ -2146,7 +2165,7 @@ describe("AgentManager", () => {
       const record = JSON.parse(fs.readFileSync(statusFile, "utf8"));
       writeJsonAtomic(statusFile, { ...record, status: "completed", text: "finished before native close", finishedAt: Date.now() });
       if (state === "settled result") {
-        // POSIX settlement now includes the execution drain. A terminal file
+        // Settlement on both platforms includes the execution drain. A terminal file
         // alone remains insufficient; release the existing join before wait.
         release();
         await manager.wait(handle.id);

@@ -281,16 +281,25 @@ describe("manager handles, snapshots and receipt custody", () => {
     const onSettled = vi.fn();
     const { manager, directory } = createManager(true, { onSettled });
     const handle = await manager.spawn({ task: "receipt result", transport: "process", extensions: false });
+    const finishing = manager.status(handle.id) as AgentRunRecord;
+    expect(finishing.status).toBe("finishing");
+    expect(manager.isSettled(handle.id)).toBe(false);
+    expect(onSettled).not.toHaveBeenCalled();
+    await expect(manager.wait(handle.id, { timeoutMs: 10 })).rejects.toMatchObject({ name: "AgentWaitBoundError" });
+    await expect(manager.cleanup(handle.id)).rejects.toThrow(/running agent/);
+    expect(finishing.text).toHaveLength(4 * 1024 * 1024);
+    expect((finishing.value as { output: string }).output).toHaveLength(4 * 1024 * 1024);
+    const ui = manager.listForUi()[0] as AgentRunRecord;
+    expect(ui.status).toBe("finishing");
+    expect(ui.text.length).toBeLessThanOrEqual(16_001);
+    expect(ui.value).toMatchObject({ fabricTruncated: true });
+    release();
     const full = await manager.wait(handle.id, { timeoutMs: 2_000 });
     expect(full.text).toHaveLength(4 * 1024 * 1024);
     expect((full.value as { output: string }).output).toHaveLength(4 * 1024 * 1024);
     expect(full.finalAnswerReceipt?.id).toBeTypeOf("string");
     expect(onSettled).toHaveBeenCalledOnce();
     expect(manager.hasRunCustody(handle.id)).toBe(true);
-    await expect(manager.cleanup(handle.id)).rejects.toThrow(/teardown is pending/);
-    const ui = manager.listForUi()[0] as AgentRunRecord;
-    expect(ui.text.length).toBeLessThanOrEqual(16_001);
-    expect(ui.value).toMatchObject({ fabricTruncated: true });
     expect((manager.status(handle.id) as AgentRunRecord).text).toBe(full.text);
     expect((await manager.wait(handle.id)).value).toEqual(full.value);
     expect(JSON.parse(fs.readFileSync(path.join(directory, handle.id, "manager-result.json"), "utf8")).value).toEqual(full.value);
@@ -345,20 +354,23 @@ describe("manager handles, snapshots and receipt custody", () => {
     const { manager, directory } = createManager(true, { onSettled: settled });
     const handle = await manager.spawn({ task: "host validation", transport: "process", extensions: false,
       schema: { type: "object", properties: { output: { type: "boolean" } }, required: ["output"] } });
-    const validated = await manager.wait(handle.id, { timeoutMs: 2_000 });
-    expect(validated.status).toBe("failed");
-    expect(validated.error).toMatch(/Structured agent output was invalid/);
-    expect(settled).toHaveBeenCalledOnce();
-    expect((validated.value as { output: string }).output).toHaveLength(32_000);
+    await vi.waitFor(() => expect(manager.status(handle.id)).toMatchObject({ status: "finishing",
+      error: expect.stringMatching(/Structured agent output was invalid/) }));
+    const finishing = manager.status(handle.id) as AgentRunRecord;
+    expect(manager.isSettled(handle.id)).toBe(false);
+    expect(settled).not.toHaveBeenCalled();
+    expect((finishing.value as { output: string }).output).toHaveLength(32_000);
     const canonical = path.join(directory, handle.id, "manager-result.json");
-    expect(JSON.parse(fs.readFileSync(canonical, "utf8"))).toMatchObject(validated);
+    expect(JSON.parse(fs.readFileSync(canonical, "utf8"))).toMatchObject({ status: "failed", error: finishing.error, value: finishing.value });
     const statusFile = path.join(directory, handle.id, "status.json");
-    const lateWorkerStatus = { ...validated, status: "completed", error: undefined, text: "late success",
+    const lateWorkerStatus = { ...finishing, status: "completed", error: undefined, text: "late success",
       value: { output: true }, exitCode: 0, finishedAt: Date.now() + 1_000, updatedAt: Date.now() + 1_000 };
     writeJsonAtomic(statusFile, lateWorkerStatus);
-    expect(manager.status(handle.id)).toMatchObject(validated);
-    expect(await manager.wait(handle.id)).toMatchObject(validated);
+    expect(manager.status(handle.id)).toMatchObject(finishing);
     release();
+    const validated = await manager.wait(handle.id, { timeoutMs: 2_000 });
+    expect(validated).toMatchObject({ status: "failed", error: finishing.error, value: finishing.value });
+    expect(settled).toHaveBeenCalledOnce();
     await manager.close();
     // Model the worker's final writeRunRecord after its native close too.
     writeJsonAtomic(statusFile, lateWorkerStatus);

@@ -12,11 +12,25 @@ import { readTerminalControl } from "../src/worker/terminal-controls.js";
 import type { AgentTerminalNotice } from "../src/agents/terminal-target.js";
 
 // Same process-transport + built real-worker path as worker-e2e. Only the model
-// child is deterministic; fixtures are retained (no real deletes in this proof).
+// child is deterministic; fixtures are retained. Native child cleanup and product
+// deletion paths are hosted-only; local acceptance uses the recorded race probe.
 const managers: AgentManager[] = [];
+const roots: string[] = [];
 afterEach(async () => {
-  await Promise.all(managers.splice(0).map(manager => manager.close()));
-  vi.unstubAllEnvs();
+  try {
+    // Failed assertions must not strand a held frame/response during teardown.
+    // Release named fixture gates, then join natural completion before close.
+    for (const root of roots) {
+      for (const gate of ["consume-controls", "release-responses", "final", "release"]) fs.writeFileSync(path.join(root, gate), "");
+    }
+    await Promise.all(managers.splice(0).map(async manager => {
+      await Promise.all(manager.listForUi().map(run => manager.wait(run.id).catch(() => undefined)));
+      await manager.close();
+    }));
+  } finally {
+    roots.length = 0;
+    vi.unstubAllEnvs();
+  }
 });
 const rows = (file: string): Array<Record<string, any>> => fs.existsSync(file)
   ? fs.readFileSync(file, "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line)) : [];
@@ -33,6 +47,7 @@ const provenance = { v: 1 as const, channel: "fabric" as const, via: "steer" as 
   sender: { id: "session:steer-ended-sender", name: "Original sender", kind: "main" as const, verified: "mesh" as const } };
 const setup = () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "worker-steer-ended-"));
+  roots.push(root);
   const workspace = path.join(root, "workspace"); fs.mkdirSync(workspace);
   const profile = path.join(root, "profile"); fs.mkdirSync(profile);
   fs.writeFileSync(path.join(profile, "settings.json"), JSON.stringify({ retry: { enabled: false } }));
@@ -135,12 +150,15 @@ describe("E-steer-final: real worker final-answer fence", () => {
     await observed(s.root, () => rows(fake).some(row => row.type === "receipt"));
     const receipt = readFinalAnswerReceipt(directory, handle.id)!;
     fs.writeFileSync(path.join(s.root, "release"), "");
-    const result = await s.manager.wait(handle.id, { timeoutMs: 30_000 });
-    expect(result).toMatchObject({ status: "completed", turns: 1, text: "AUTHORIZED_FINAL_ANSWER", finalAnswerReceipt: { id: receipt.id } });
+    const pending = s.manager.wait(handle.id, { timeoutMs: 30_000 });
+    void pending.catch(() => undefined);
+    await observed(s.root, () => rows(fake).some(row => row.type === "stdin-end") && s.manager.status(handle.id).status === "finishing");
+    expect(s.manager.status(handle.id)).toMatchObject({ status: "finishing", finalAnswerReceipt: { id: receipt.id } });
+    expect(s.manager.isSettled(handle.id)).toBe(false);
     // Host has observed/frozen the final receipt, but the frame is STILL held.
-    // Refusal here would be the bug: forwarding does not certify consumption or
-    // cancellation, even though the final-answer lock ordered the stdin write.
-    expect(readTerminalControl(directory, raced.messageId)?.state).toBe("queued");
+    // Completion now joins native close, so release the held frame BEFORE that
+    // result join. Forwarding still proves neither consumption nor cancellation.
+    expect(readTerminalControl(directory, raced.messageId)).toMatchObject({ state: "queued", provenance });
     expect(s.notices).toEqual([]);
     expect(rows(path.join(directory, "lifecycle.jsonl")).some(row => row.event === "message.refused" && row.data.messageId === raced.messageId)).toBe(false);
     expect(rows(fake).some(row => row.type === "consume" && row.id === raced.messageId)).toBe(false);
@@ -149,7 +167,9 @@ describe("E-steer-final: real worker final-answer fence", () => {
     await observed(s.root, () => rows(fake).some(row => row.type === "ack-observed" && row.id === raced.messageId));
     expect(rows(fake).find(row => row.type === "consume" && row.id === raced.messageId)).toMatchObject({ afterReceipt: true });
     expect(rows(fake).find(row => row.type === "ack-observed" && row.id === raced.messageId)).toMatchObject({ state: "refused", afterReceipt: true });
-    expect(readTerminalControl(directory, raced.messageId)?.state).toBe("refused");
+    expect(readTerminalControl(directory, raced.messageId)).toMatchObject({ state: "refused", provenance });
+    const result = await pending;
+    expect(result).toMatchObject({ status: "completed", turns: 1, text: "AUTHORIZED_FINAL_ANSWER", finalAnswerReceipt: { id: receipt.id } });
     await s.manager.close();
     expect(s.notices).toEqual([{ code: "FABRIC_TARGET_TERMINAL", targetId: handle.id, finalAnswerReceiptId: receipt.id,
       messageId: raced.messageId, delivery: "steer", sender: provenance.sender }]);
@@ -216,14 +236,20 @@ describe("E-steer-final: real worker final-answer fence", () => {
     expect(readTerminalControl(directory, allowed.messageId)?.state).toBe("delivered");
     fs.writeFileSync(path.join(s.root, "final"), "");
     await observed(s.root, () => rows(fake).some(row => row.type === "receipt"));
+    const receipt = readFinalAnswerReceipt(directory, handle.id)!;
     fs.writeFileSync(path.join(s.root, "release"), "");
-    const result = await s.manager.wait(handle.id, { timeoutMs: 30_000 });
-    expect(result).toMatchObject({ status: "completed", turns: 1, text: "AUTHORIZED_FINAL_ANSWER" });
+    const pending = s.manager.wait(handle.id, { timeoutMs: 30_000 });
+    void pending.catch(() => undefined);
+    await observed(s.root, () => rows(fake).some(row => row.type === "stdin-end") && s.manager.status(handle.id).status === "finishing");
+    expect(s.manager.status(handle.id)).toMatchObject({ status: "finishing", finalAnswerReceipt: { id: receipt.id } });
+    expect(s.manager.isSettled(handle.id)).toBe(false);
     expect(rows(fake).some(row => row.type === "response-released" && row.id === allowed.messageId)).toBe(false);
-    expect(readTerminalControl(directory, allowed.messageId)?.state).toBe("delivered");
+    expect(readTerminalControl(directory, allowed.messageId)).toMatchObject({ state: "delivered", provenance });
     expect(s.notices).toEqual([]);
     fs.writeFileSync(path.join(s.root, "release-responses"), "");
     await observed(s.root, () => rows(fake).some(row => row.type === "response-released" && row.id === allowed.messageId));
+    const result = await pending;
+    expect(result).toMatchObject({ status: "completed", turns: 1, text: "AUTHORIZED_FINAL_ANSWER", finalAnswerReceipt: { id: receipt.id } });
     await s.manager.close();
     expect(s.notices).toEqual([]); // NEVER undelivered + child action.
     expect(readTerminalControl(directory, allowed.messageId)?.state).toBe("delivered");

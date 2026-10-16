@@ -325,15 +325,66 @@ describe("authenticated manager terminal results", () => {
     }
   });
 
-  it("refuses worker replacement with same-ID completed during native teardown after host validation failed", async () => {
+  it("publishes monitor-validated schema failure to UI while native close still holds settlement", async () => {
+    let alive = true, release!: () => void;
+    const closed = new Promise<void>(resolve => { release = () => { alive = false; resolve(); }; });
+    releases.push(release);
+    vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async request => {
+      const handle = await fakeManagerHeapWorker(request, 64, false,
+        { closed, alive: () => alive, stop: () => closed });
+      const statusFile = request.workerArguments[request.workerArguments.indexOf("--status-file") + 1]!;
+      const record = JSON.parse(fs.readFileSync(statusFile, "utf8"));
+      writeJsonAtomic(statusFile, { ...record, status: "running", finishedAt: undefined });
+      return handle;
+    });
+    const runRoot = root(), onSettled = vi.fn();
+    const manager = new AgentManager(process.cwd(), {
+      ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, maxConcurrent: 1, retainRuns: true, sessionExport: false,
+    }, { runRoot, workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), fullCodeMode: false, onSettled });
+    managers.push(manager);
+    const handle = await manager.spawn({ task: "monitor-only UI validation", transport: "process", extensions: false,
+      schema: { type: "object", properties: { output: { type: "boolean" } }, required: ["output"] } });
+    expect(manager.listForUi()).toEqual([expect.objectContaining({ id: handle.id, status: "running" })]);
+    let waitReleased = false;
+    const waited = manager.wait(handle.id).then(result => { waitReleased = true; return result; });
+    const directory = path.join(runRoot, handle.id), statusFile = path.join(directory, "status.json");
+    const record = JSON.parse(fs.readFileSync(statusFile, "utf8"));
+    const receipt = saveFinalAnswerReceipt(directory, handle.id, record.text);
+    writeJsonAtomic(statusFile, { ...record, status: "completed", finishedAt: receipt.recordedAt,
+      finalAnswerReceipt: { id: receipt.id, recordedAt: receipt.recordedAt } });
+    // Only the real monitor may observe/validate the receipt: status() would
+    // repair the UI cache itself and hide the regression under test.
+    const resultFile = path.join(directory, "manager-result.json");
+    await vi.waitFor(() => expect(fs.existsSync(resultFile)).toBe(true));
+    const sealed = JSON.parse(fs.readFileSync(resultFile, "utf8"));
+    expect(sealed).toMatchObject({ status: "failed", error: expect.stringMatching(/Structured agent output was invalid/) });
+    expect({ alive, waitReleased }).toEqual({ alive: true, waitReleased: false });
+    expect(onSettled).not.toHaveBeenCalled();
+    expect(manager.listForUi()).toEqual([expect.objectContaining({ id: handle.id, status: "finishing", error: sealed.error })]);
+    release();
+    const result = await waited;
+    expect(result).toMatchObject({ status: "failed", error: sealed.error, finalAnswerReceipt: sealed.finalAnswerReceipt });
+  });
+
+  it("refuses worker replacement with same-ID completed across finishing and native close after host validation failed", async () => {
     let alive = true, release!: () => void;
     const closed = new Promise<void>(resolve => { release = () => { alive = false; resolve(); }; });
     releases.push(release);
     vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(request => fakeManagerHeapWorker(request, 64, true,
       { closed, alive: () => alive, stop: () => closed }));
     const runRoot = root(), manager = createManager(runRoot);
-    const result = await manager.run({ task: "validated failure", transport: "process", extensions: false,
+    const handle = await manager.spawn({ task: "validated failure", transport: "process", extensions: false,
       schema: { type: "object", properties: { output: { type: "boolean" } }, required: ["output"] } });
+    await vi.waitFor(() => expect(manager.status(handle.id)).toMatchObject({ status: "finishing",
+      error: expect.stringMatching(/Structured agent output was invalid/) }));
+    expect(manager.isSettled(handle.id)).toBe(false);
+    const finishing = manager.status(handle.id) as AgentRunRecord;
+    writeJsonAtomic(path.join(runRoot, handle.id, "status.json"), {
+      ...finishing, status: "completed", error: undefined, text: "forged worker success", value: { output: true }, exitCode: 0,
+    });
+    expect(manager.status(handle.id)).toMatchObject(finishing);
+    release();
+    const result = await manager.wait(handle.id, { timeoutMs: 2_000 });
     expect(result.status).toBe("failed");
     expect(result.error).toMatch(/Structured agent output was invalid/);
     expect(manager.status(result.id)).toMatchObject({ status: "failed" });
@@ -342,6 +393,28 @@ describe("authenticated manager terminal results", () => {
     });
     await refuses(manager, result.id);
     release();
+  });
+
+  it("authenticates the disk-backed finishing answer before native close and never settles a replacement as success", async () => {
+    let alive = true, release!: () => void;
+    const closed = new Promise<void>(resolve => { release = () => { alive = false; resolve(); }; });
+    releases.push(release);
+    vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(request => fakeManagerHeapWorker(request, 64, true,
+      { closed, alive: () => alive, stop: () => closed }));
+    const runRoot = root(), manager = createManager(runRoot);
+    const handle = await manager.spawn({ task: "finishing result authentication", transport: "process", extensions: false });
+    expect(manager.status(handle.id).status).toBe("finishing");
+    const file = path.join(runRoot, handle.id, "manager-result.json");
+    const original = JSON.parse(fs.readFileSync(file, "utf8"));
+    writeJsonAtomic(file, { ...original, text: "FORGED finishing answer", value: { forged: true } });
+    expect(() => manager.status(handle.id)).toThrow(expect.objectContaining({ code: "FABRIC_MISSING_RESULT" }));
+    expect(manager.isSettled(handle.id)).toBe(false);
+    release();
+    const result = await manager.wait(handle.id, { timeoutMs: 2_000 });
+    expect(result.status).toBe("failed");
+    expect(result.error).toMatch(/no saved terminal result/);
+    expect(result.text).not.toContain("FORGED");
+    expect(result.value).not.toEqual({ forged: true });
   });
 
   it("refuses an identical-byte replacement inode rather than adopting a foreign publication", async () => {

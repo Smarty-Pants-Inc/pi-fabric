@@ -456,15 +456,16 @@ describe("Windows tree-stop owner custody (#360 security R1)", () => {
           expect(stopped, "closed failed attempt must not add seven seconds to logical stop").toBe(true);
           expect(hasUnresolvedWorker(run)).toBe(true);
           expect(manager.retentionReferences().has(handle.id)).toBe(true);
-          await expect(manager.cleanup(handle.id)).rejects.toThrow(/lost track/);
-          // Later monitoring must preserve the stop/terminal result without transferring custody.
+          await expect(manager.cleanup(handle.id)).rejects.toThrow(/lost track|running/);
+          // Later monitoring must preserve the custody failure without transferring custody.
           await vi.advanceTimersByTimeAsync(10_000);
         }
         // Keep Windows active through the later admission/close probe too;
         // restoring Linux here used to hide that launch's captured-close debt.
         const result = await manager.wait(handle.id);
-        expect(result.status).toBe(outcome === "terminal-before-error" ? "completed" : outcome === "failed-before-error" ? "failed" : "stopped");
-        if (outcome === "failed-before-error") expect(result.error).toBe("real worker failure");
+        const failedCandidate = outcome === "terminal-before-error" || outcome === "failed-before-error";
+        expect(result.status).toBe(failedCandidate ? "failed" : "stopped");
+        if (failedCandidate) expect(result.errorCode).toBe("CUSTODY_UNCONFIRMED");
         if (outcome === "confirmed") {
           expect(hasUnresolvedWorker(run)).toBe(false);
           expect(manager.retentionReferences().has(handle.id)).toBe(false);
@@ -480,7 +481,7 @@ describe("Windows tree-stop owner custody (#360 security R1)", () => {
         }
         expect(stopped, "the bounded stop must return without transferring custody").toBe(true);
         expect(spawn, "uncertain tree exit cannot launch a replacement worker").toHaveBeenCalledTimes(2);
-        if (outcome === "resume-error") expect(result.error).toMatch(/not relaunched/);
+        if (outcome === "resume-error") expect(result.error).toMatch(/unconfirmed|unknown|not relaunched/);
         // A terminal report must not free the uncertain tree's one native permit.
         vi.mocked(spawn).mockReturnValueOnce(worker as unknown as ChildProcess);
         const next = await manager.spawn({ task: "capacity probe", transport: "process" });

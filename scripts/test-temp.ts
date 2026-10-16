@@ -2,6 +2,7 @@ import fs, { lstatSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
+import { rememberFleetHost } from "./hosted-only.mjs";
 
 // Pin immediately after creation or stale-marker validation: path ownership is not ownership of a replacement.
 const ownedRootCleanup = (directory: string, stillOwned: () => boolean = () => true): (() => void) => {
@@ -255,6 +256,7 @@ const testControls = new Set([
 
 /** Run at config evaluation AND before each test file's source imports. */
 export function isolateTestFleetEnvironment(): Record<string, string> {
+  rememberFleetHost(); // Preserve the hosted-only veto BEFORE removing fleet attribution below.
   // Scrub production/future selectors, not the exact test-only controls above.
   // Keep values verbatim: consumers own strict booleans and artifact selection.
   // Unsetting paths alone would fall back to the checkout or the user's Pi profile.

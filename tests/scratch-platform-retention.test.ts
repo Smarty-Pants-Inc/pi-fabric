@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { hostedOnly } from "../scripts/hosted-only.mjs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -256,10 +257,10 @@ describe.skipIf(process.platform !== "linux" || typeof process.getuid !== "funct
   });
 });
 
-// Real deletion, hosted CI only (GitHub Actions sets GITHUB_ACTIONS): never run on a developer or agent host. With
+// Real deletion, verified GitHub-hosted job only: never run on a developer or agent host. With
 // process.platform forced to darwin on a hosted runner, the restored path removes the expired root's actual inode and
 // leaves the active root; it is still not native Darwin evidence (the planned native macOS E2E is separate).
-describe.runIf(process.env.GITHUB_ACTIONS === "true")("hosted CI: actual off-Linux scratch reclamation", () => {
+describe.runIf(hostedOnly("off-Linux scratch reclamation"))("hosted CI: actual off-Linux scratch reclamation", () => {
   it("darwin (forced): the expired closed root is gone, the active root and its identity remain", async () => {
     const tempRoot = sandbox();
     const old = fixture(tempRoot, { closedAt: 1 });

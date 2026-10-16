@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { hostedOnly } from "../scripts/hosted-only.mjs";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -12,6 +13,7 @@ import { processAlive } from "../src/storage/scratch.js";
 import * as agentRemoval from "../src/agents/rm.js";
 import * as retention from "../src/storage/retention.js";
 
+const hostedDelete = hostedOnly("AgentManager close deletion");
 const managers: AgentManager[] = [];
 const roots: string[] = [];
 const setup = (retainRuns = true, extra: ConstructorParameters<typeof AgentManager>[2] = {}) => {
@@ -95,7 +97,7 @@ describe("AgentManager close storage", () => {
     expect(consumed).toHaveBeenCalledExactlyOnceWith(child.id);
   });
 
-  it("removes empty managed roots immediately, without recreating them on repeated close", async () => {
+  it.runIf(hostedDelete)("removes empty managed roots immediately, without recreating them on repeated close", async () => {
     const { manager, root } = setup();
     const first = manager.close();
     expect(manager.close()).toBe(first);
@@ -130,7 +132,7 @@ describe("AgentManager close storage", () => {
     expect(hasUnresolvedWorker(run)).toBe(false);
   });
 
-  it.each(["EBUSY", "EPERM"])("retries transient %s when removing an owned empty root", async (code) => {
+  it.runIf(hostedDelete).each(["EBUSY", "EPERM"])("retries transient %s when removing an owned empty root", async (code) => {
     const { manager, root } = setup(false);
     const rmdir = fs.rmdirSync;
     let attempts = 0;
@@ -201,7 +203,7 @@ describe("AgentManager close storage", () => {
     expect(fs.existsSync(root)).toBe(true);
   });
 
-  it("removes a managed root holding a finished run's pi-durable journal (#229)", async () => {
+  it.runIf(hostedDelete)("removes a managed root holding a finished run's pi-durable journal (#229)", async () => {
     const { manager, root } = setup(false);
     const result = await manager.run({ task: "hello", runner: "pi", extensions: false });
     // The pi-durable runner journals beside status.json in the run directory.
@@ -236,7 +238,7 @@ describe("AgentManager close storage", () => {
     expect(fs.existsSync(tempRoot)).toBe(true);
   });
 
-  it("does not perform retention scans merely by constructing a manager", async () => {
+  it.runIf(hostedDelete)("does not perform retention scans merely by constructing a manager", async () => {
     const { manager, tempRoot } = setup();
     const sentinel = path.join(tempRoot, "pi-fabric-runs-sentinel");
     fs.mkdirSync(sentinel);
@@ -253,7 +255,7 @@ describe("AgentManager close storage", () => {
     await vi.waitFor(() => expect(fs.existsSync(sentinel)).toBe(false), { timeout: 20_000 });
   });
 
-  it("starts the close sweep through a real JS runtime under a Bun-compiled Pi (smarty-dev#2010)", async () => {
+  it.runIf(hostedDelete)("starts the close sweep through a real JS runtime under a Bun-compiled Pi (smarty-dev#2010)", async () => {
     const originalExecPath = process.execPath;
     const originalOverride = process.env.PI_FABRIC_NODE_BINARY;
     const { manager, tempRoot } = setup();
@@ -273,7 +275,7 @@ describe("AgentManager close storage", () => {
     await vi.waitFor(() => expect(fs.existsSync(sentinel)).toBe(false), { timeout: 20_000 });
   });
 
-  it("removes an explicit caller root after stopping a worker with retainRuns:false", async () => {
+  it.runIf(hostedDelete)("removes an explicit caller root after stopping a worker with retainRuns:false", async () => {
     const caller = fs.mkdtempSync(path.join(os.tmpdir(), "caller-stopped-root-"));
     roots.push(caller);
     const { manager, root } = setup(false, { runRoot: caller });
@@ -299,7 +301,7 @@ describe("AgentManager close storage", () => {
     expect(fs.existsSync(path.join(caller, ".fabric-owner.json"))).toBe(false);
   });
 
-  it.each(["live", "unknown", "exited"] as const)("keeps an evicted parent's owned budget until checked descendant exit (%s)", async (state) => {
+  it.runIf(hostedDelete).each(["live", "unknown", "exited"] as const)("keeps an evicted parent's owned budget until checked descendant exit (%s)", async (state) => {
     const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "manager-close-eviction-"));
     roots.push(tempRoot);
     vi.spyOn(os, "tmpdir").mockReturnValue(tempRoot);
@@ -410,7 +412,7 @@ describe("AgentManager close storage", () => {
     } finally { launch.mockRestore(); }
   });
 
-  it("waits for a pending spawn to observe close before deleting the root", async () => {
+  it.runIf(hostedDelete)("waits for a pending spawn to observe close before deleting the root", async () => {
     let resume!: () => void;
     const gate = new Promise<void>((resolve) => { resume = resolve; });
     const { manager, root } = setup(false, { preparePiModel: async () => { await gate; } });

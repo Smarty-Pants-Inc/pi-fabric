@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import { isHostedOnlyAllowed } from "../scripts/hosted-only.mjs";
 import fs, {
   chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, realpathSync, rmSync as namedRmSync, symlinkSync, writeFileSync,
 } from "node:fs";
@@ -12,7 +13,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 // smarty-dev#11145: tests/test-deletion-guard.mjs (imported by tests/fleet-isolation-setup.ts, inherited by
 // children through NODE_OPTIONS --import) refuses deletes outside the run's private TMPDIR locally and only
-// reports them under GITHUB_ACTIONS=true. External fixtures here are NEVER deleted by this file: a sibling
+// reports them only on a verified GitHub-hosted runner. External fixtures here are NEVER deleted by this file: a sibling
 // mkdtemp under dirname(TMPDIR), inside test-env's private parent but outside Vitest's guard root,
 // left for the owner to clean.
 
@@ -21,7 +22,7 @@ const guardUrl = new URL(`./${guardFile}`, import.meta.url).href;
 const refusal = /test deletion outside private temp \(smarty-dev#11145\)/;
 const privateTemp = tmpdir();
 const posix = process.platform !== "win32";
-const hosted = process.env.GITHUB_ACTIONS === "true";
+const hosted = isHostedOnlyAllowed(process.env);
 
 // RED first: every outside attempt is gated on the installed guard, so a missing guard fails without deleting.
 const requireGuard = () =>
@@ -224,6 +225,21 @@ console.log(JSON.stringify({ siblingError, outsideError, status: fs.existsSync(s
   rootExists: fs.existsSync(root) }));
 `;
 
+// Synthetic runner evidence is confined to config-only and recorded-delegate probes below.
+// It never admits/imports a hosted test module or performs a native deletion.
+const hostedRunnerProbe = `
+if (process.env.GITHUB_ACTIONS === "true") {
+  delete process.env.SMARTY_ROLE;
+  delete process.env.PI_TEST_FLEET_HOST;
+  process.env.RUNNER_ENVIRONMENT = "github-hosted";
+  const runner = process.platform === "win32" ? process.env.TMPDIR : "/home/runner/work/_temp";
+  process.env.RUNNER_TEMP = runner;
+  const stat = fs.statSync, realpath = fs.realpathSync;
+  fs.statSync = (p, ...args) => String(p) === runner ? { isDirectory: () => true } : stat(p, ...args);
+  fs.realpathSync = Object.assign((p, ...args) => String(p) === runner ? runner : realpath(p, ...args), realpath);
+}
+`;
+
 // The recorder replaces every deleter BEFORE the explicit guard import, so report mode wraps the
 // recorder: even a report-mode guard that forwards the call cannot delete the external target.
 const reportChild = `
@@ -238,6 +254,7 @@ for (const name of ["rm", "rmdir", "unlink"]) {
 }
 syncBuiltinESMExports();
 const [guard, target] = process.argv.slice(2);
+${hostedRunnerProbe}
 await import(guard);
 function reportCallerMarker() { fs.rmSync(target); }
 reportCallerMarker();
@@ -375,6 +392,7 @@ for (const name of ["rename", "copyFile", "cp", "link", "symlink"]) {
   };
 }
 syncBuiltinESMExports();
+${hostedRunnerProbe}
 await import(guard);
 // Read the static named bindings after synchronization, alongside the live module namespaces.
 const namedSync = { rename: renameSync, copyFile: copyFileSync, cp: cpSync, link: linkSync, symlink: symlinkSync };
@@ -501,7 +519,9 @@ it("keeps native Windows deletion hosted-only without invoking its test callback
     let enabled: unknown;
     const describe = { runIf: (value: unknown) => (_name: string, _callback: unknown) => { enabled = value; } };
     vm.runInNewContext(`describe.runIf(${condition})("Windows verified removal", () => {})`,
-      { describe, process: { platform, env: { GITHUB_ACTIONS: hosted } } });
+      { describe, process: { platform, env: { GITHUB_ACTIONS: hosted } },
+        hostedOnly: () => isHostedOnlyAllowed({ GITHUB_ACTIONS: hosted, RUNNER_ENVIRONMENT: "github-hosted",
+          RUNNER_TEMP: "/home/runner/work/_temp" }, () => "/home/runner/work/_temp") });
     expect(enabled).toBe(expected);
   }
 });
@@ -530,6 +550,7 @@ registerHooks({ resolve(specifier, context, nextResolve) {
   return nextResolve(specifier, context);
 }});
 const [configUrl] = process.argv.slice(2);
+${hostedRunnerProbe}
 const mod = await import(configUrl);
 const config = mod.default;
 const project = config.test.projects.find((entry) => entry.test.name === "default");
@@ -622,7 +643,7 @@ describe("deletion guard in child processes", () => {
     expectExternalIntact();
   });
 
-  it("reports once without throwing under GITHUB_ACTIONS=true and never reaches the real deleter", () => {
+  it("reports once on a simulated GitHub-hosted runner and never reaches the real deleter", () => {
     requireGuard();
     const nodeOptions = withoutGuard(process.env.NODE_OPTIONS);
     expect(nodeOptions).not.toContain(guardFile);

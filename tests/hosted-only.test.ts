@@ -1,0 +1,109 @@
+import { spawnSync } from "node:child_process";
+import fs from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { describe, expect, it, vi } from "vitest";
+import { fleetHostMarker, hostedOnly, isHostedOnlyAllowed, rememberFleetHost } from "../scripts/hosted-only.mjs";
+
+// Data-safety/trust-boundary tests. All positive runner evidence is pure/injected;
+// config probes collect exclusions only, and the guard probe records rather than deletes.
+const runner: NodeJS.ProcessEnv = {
+  CI: "true", GITHUB_ACTIONS: "true", RUNNER_ENVIRONMENT: "github-hosted", RUNNER_TEMP: "/home/runner/work/_temp",
+  FABRIC_TRANSPORT_HOSTED_DELETE: "1", FABRIC_TRANSPORT_HOSTED_KILL: "1", FABRIC_TRANSPORT_HOSTED_NATS_RESET: "1",
+};
+const directory = () => "/home/runner/work/_temp";
+
+describe("hosted-only authorization", () => {
+  it("allows a real-runner environment without a fleet marker, regardless of unrelated opt-ins", () => {
+    expect(isHostedOnlyAllowed(runner, directory)).toBe(true);
+    expect(isHostedOnlyAllowed({ ...runner, FABRIC_TRANSPORT_HOSTED_DELETE: "0" }, directory)).toBe(true);
+    expect(isHostedOnlyAllowed({ ...runner, RUNNER_TEMP: "D:\\a\\_temp" }, () => "D:\\a\\_temp")).toBe(true);
+  });
+
+  it.each(["worktree-agent@fixture", "", "false"])("refuses a present SMARTY_ROLE=%j even with every CI flag/opt-in", role => {
+    const probe = vi.fn(directory);
+    expect(isHostedOnlyAllowed({ ...runner, SMARTY_ROLE: role }, probe)).toBe(false);
+    expect(probe).not.toHaveBeenCalled();
+  });
+
+  it("keeps the veto after attribution scrubbing and in an inherited child environment", () => {
+    const env: NodeJS.ProcessEnv = { ...runner, SMARTY_ROLE: "task-agent@fixture" };
+    rememberFleetHost(env);
+    delete env.SMARTY_ROLE;
+    expect(env[fleetHostMarker]).toBe("1");
+    rememberFleetHost(env);
+    expect(isHostedOnlyAllowed({ ...env }, directory)).toBe(false);
+    expect(isHostedOnlyAllowed({ ...runner, [fleetHostMarker]: "" }, directory)).toBe(false);
+  });
+
+  it.each([
+    { GITHUB_ACTIONS: undefined }, { GITHUB_ACTIONS: "false" }, { GITHUB_ACTIONS: "1" },
+    { RUNNER_ENVIRONMENT: undefined }, { RUNNER_ENVIRONMENT: "self-hosted" },
+    { RUNNER_TEMP: undefined }, { RUNNER_TEMP: "relative" },
+    { RUNNER_TEMP: "/home/paul" }, { RUNNER_TEMP: "/home/paul/fake-runner" }, { RUNNER_TEMP: "/srv/scratch/runner" },
+  ])("refuses incomplete, self-hosted or fleet evidence: %j", override => {
+    expect(isHostedOnlyAllowed({ ...runner, ...override }, directory)).toBe(false);
+  });
+
+  it("refuses missing/non-directory or physically fleet-backed temp; keeps path boundary counterexamples", () => {
+    expect(isHostedOnlyAllowed(runner, () => undefined)).toBe(false);
+    expect(isHostedOnlyAllowed(runner, () => "/srv/scratch/alias-target")).toBe(false);
+    expect(isHostedOnlyAllowed(runner, () => "/home/paul/alias-target")).toBe(false);
+    expect(isHostedOnlyAllowed({ ...runner, RUNNER_TEMP: "/home/pauline/runner" }, () => "/home/pauline/runner")).toBe(true);
+  });
+
+  it("checks the real filesystem by default and refuses a file or missing runner temp", () => {
+    const root = fs.mkdtempSync(join(tmpdir(), "runner-directory-probe-"));
+    const file = join(root, "not-a-directory");
+    fs.writeFileSync(file, "fixture");
+    expect(isHostedOnlyAllowed({ ...runner, RUNNER_TEMP: file })).toBe(false);
+    expect(isHostedOnlyAllowed({ ...runner, RUNNER_TEMP: join(root, "missing") })).toBe(false);
+  });
+
+  it("reports one actionable refusal per case", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      expect(hostedOnly("predicate refusal probe", { ...runner, SMARTY_ROLE: "fleet" })).toBe(false);
+      expect(hostedOnly("predicate refusal probe", { ...runner, SMARTY_ROLE: "fleet" })).toBe(false);
+      expect(warn.mock.calls).toEqual([["hosted-only (predicate refusal probe): push and let CI run it"]]);
+    } finally { warn.mockRestore(); }
+  });
+});
+
+it("config and inherited deletion guard refuse the reported fleet sequence after isolation", () => {
+  const source = `
+    import fs from 'node:fs';
+    import { pathToFileURL } from 'node:url';
+    const calls = [];
+    // Intercept all deleters BEFORE config/guard import. Even a regression only records.
+    for (const name of ['rmSync', 'rmdirSync', 'unlinkSync', 'rm', 'rmdir', 'unlink']) {
+      fs[name] = (...args) => { calls.push(name); if (typeof args.at(-1) === 'function') args.at(-1)(null); };
+    }
+    for (const name of ['rm', 'rmdir', 'unlink']) fs.promises[name] = async () => { calls.push(name); };
+    const config = (await import(pathToFileURL(process.cwd() + '/vitest.config.cts'))).default;
+    const before = calls.length;
+    await import(pathToFileURL(process.cwd() + '/tests/test-deletion-guard.mjs'));
+    let code;
+    try { fs.rmSync(process.cwd() + '/HOSTED-REFUSAL-NOT-A-REAL-TARGET'); } catch (error) { code = error.code; }
+    console.log('FLEET:' + JSON.stringify({ role: process.env.SMARTY_ROLE, veto: process.env.PI_TEST_FLEET_HOST,
+      excludes: config.test.exclude, projects: config.test.projects.map(p => p.test.exclude),
+      code, delegated: calls.length - before }));
+  `;
+  const child = join(fs.mkdtempSync(join(tmpdir(), "hosted-gate-")), "probe.mjs");
+  fs.writeFileSync(child, source);
+  const result = spawnSync(process.execPath, ["--experimental-transform-types", child], {
+    cwd: process.cwd(), encoding: "utf8", timeout: 20_000,
+    env: { ...process.env, ...runner, SMARTY_ROLE: "worktree-agent@fixture", NODE_OPTIONS: "" },
+  });
+  expect(result.status, result.stdout + result.stderr).toBe(0);
+  const line = result.stdout.split(/\r?\n/).find(line => line.startsWith("FLEET:"));
+  expect(line, result.stdout + result.stderr).toBeDefined();
+  const output = JSON.parse(line!.slice(6));
+  expect(output.role).toBeUndefined();
+  expect(output.veto).toBe("1");
+  expect(output.excludes).toHaveLength(15);
+  for (const project of output.projects) expect(project).toEqual(expect.arrayContaining(output.excludes));
+  expect(output.code).toBe("ERR_TEST_DELETION_GUARD");
+  expect(output.delegated).toBe(0);
+  expect(result.stderr).toContain("hosted-only (native/tool or reverted deletion suites): push and let CI run it");
+});

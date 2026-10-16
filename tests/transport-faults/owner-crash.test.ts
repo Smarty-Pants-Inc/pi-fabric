@@ -1,7 +1,7 @@
 // Keep reason: data safety; real process death between control custody/outcome/ACK boundaries.
 // Scope: FILE legacy FabricControlPlane + real MeshStore + real Main native journal, B2 ONLY.
 // expected-skip: win32: requires POSIX SIGKILL and the real file namespace durability barrier.
-// expected-skip: NATS: lane B's real authenticated child-capable transport fixture is not wired.
+// Real authenticated NATS claim/custody/ACK-PubAck OS death lives in nats-owner-crash.test.ts.
 // No A1 transportKind prerequisite: the legacy FILE regression floor MUST run at the port-only base.
 // B2c is a FILE ACK append + explicit MeshStore.sync, NOT JetStream PubAck/double-ack proof.
 // No B3 Pi/model consumption, power-cut, remote-authentication, HA or NATS/I-LOCK claim.
@@ -269,11 +269,4 @@ describe.skipIf(process.platform === "win32")("owner SIGKILL / actual legacy FIL
       expect(restarted.diagnostics()).toBe("");
     } finally { await f.close(); }
   }, 150_000);
-});
-
-it("NATS T-B2a/b/c dependency: real authenticated lane-B fixture, never a fake broker/second dispatcher", context => {
-  const reason = "Missing real NATS hook: lane B must supply an authenticated child-capable FabricTransport/CP composition "
-    + "and an observable real ACK PubAck → delivery.ack boundary. Legacy FILE append/cursor proof is not that hook.";
-  if (process.env.FABRIC_TRANSPORT_REQUIRED === "1") throw new Error(reason);
-  context.skip(reason);
 });

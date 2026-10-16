@@ -1,5 +1,5 @@
 // expected-skip: missing nats-server binary: authenticated real-broker coverage needs NATS_BIN.
-// Required: NATS_AUTH_REQUIRED=1 (or PI_FABRIC_NATS_REQUIRED=1). PI_FABRIC_REQUIRE_CP_B2=1 demands separate native B2 crash coverage.
+// Required: NATS_AUTH_REQUIRED=1 (or PI_FABRIC_NATS_REQUIRED=1). Native B2 is nats-owner-crash.test.ts.
 // Keep reason: data safety/trust boundary; real ack-deadline loss and process/server death.
 // These are CARRIER tests, not T-B2a/b/c or application exactly-once evidence.
 import { spawn, type ChildProcess } from "node:child_process";
@@ -35,12 +35,8 @@ const ACK_WAIT_MS = 2_000;
 const PRODUCTION_ACK_WAIT_MS = 30_000;
 const A_HOST = "runtime:broker-fault-a";
 const B_HOST = "runtime:broker-fault-b";
-// A1 ea3939da is now integrated in the parent. Do NOT gate on its former Unsupported error.
-// This file deliberately owns carrier faults, not a replacement native recipient/engine.
-const CP_B2_DEPENDENCY = "FABRIC_TEST_DEPENDENCY_NATIVE_B2_CRASH_COVERAGE: " +
-  "CP-B2/T-B2a,b,c requires separate actual control-plane/native-recipient crash receipts: " +
-  "control-seen claim, native custody, durable outcome, ACK-envelope PubAck, then broker ACK. " +
-  "A1 NATS dispatch exists; these carrier-only cases are not evidence for those native boundaries.";
+// This file owns carrier faults, not native admission. The separate nats-owner-crash
+// suite runs actual CP/Main OS-death claim/custody/ACK-PubAck boundaries.
 
 type Delivery = TransportDelivery<TransportEnvelope>;
 type Inbox = AsyncIterator<Delivery>;
@@ -296,11 +292,6 @@ function killRecorded(record: Owned): void {
 if (required && !binary) {
   it("required authenticated broker prerequisite: NATS_BIN", () => {
     throw new Error("FABRIC_TEST_PREREQUISITE_NATS_BIN: set NATS_BIN to an absolute nats-server executable");
-  });
-}
-if (process.env.PI_FABRIC_REQUIRE_CP_B2 === "1") {
-  it("CP-B2 required coverage dependency: native claim/custody/ACK-PubAck crash receipts, not carrier substitutes", () => {
-    throw new Error(CP_B2_DEPENDENCY);
   });
 }
 

@@ -234,6 +234,10 @@ export interface FabricHostLease {
   startedAt?: number;
   /** Unique incarnation fence; absent only on historical writers. */
   incarnationToken?: string;
+  /** Locally observed tokens superseded by this bridge authority; absent on legacy leases. */
+  bridgeSupersededTokens?: string[];
+  /** Root-local first-seen ordinals for retained superseded tokens; absent on legacy leases. */
+  bridgeSupersededTokenSeen?: Record<string, number>;
   /** Root Main's bounded reload lease; absent on ordinary heartbeats and older writers. */
   reloadUntil?: number;
   /** Main session has a fixed 15 s TTL, independent of the host TTL. */
@@ -500,6 +504,10 @@ const leaseOf = (text: string, name: string): FabricHostLease | undefined => {
       updatedAt: value.updatedAt, expiresAt: value.expiresAt,
       ...(typeof value.startedAt === "number" && Number.isFinite(value.startedAt) ? { startedAt: value.startedAt } : {}),
       ...(typeof value.incarnationToken === "string" ? { incarnationToken: value.incarnationToken } : {}),
+      ...(Array.isArray(value.bridgeSupersededTokens) ? { bridgeSupersededTokens: value.bridgeSupersededTokens.filter((token): token is string => typeof token === "string" && token.length > 0).slice(-16) } : {}),
+      ...(typeof value.bridgeSupersededTokenSeen === "object" && value.bridgeSupersededTokenSeen !== null && !Array.isArray(value.bridgeSupersededTokenSeen)
+        ? { bridgeSupersededTokenSeen: Object.fromEntries(Object.entries(value.bridgeSupersededTokenSeen)
+          .filter(([token, sequence]) => typeof token === "string" && token.length > 0 && Number.isSafeInteger(sequence) && (sequence as number) >= 0)) } : {}),
       ...(typeof value.reloadUntil === "number" ? { reloadUntil: value.reloadUntil } : {}),
       ...(validSession(value.session) ? { session: value.session } : {}),
       ...(validMirrorLease(value.mirror) ? { mirror: value.mirror } : {}),

@@ -476,7 +476,6 @@ export class ResidentHost {
     };
     this.participants = new ParticipantDirectory(this.mesh, {
       enabled: true,
-      renewActorParticipants: true,                            // host fence outlives its Main
       actorRenewalAllowed,
       preparePublicationFence: () => {
         const generations = registries.map(store => store.fingerprint());

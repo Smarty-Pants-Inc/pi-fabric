@@ -94,12 +94,12 @@ const LEGACY_RENEWAL_PREFIXES = [HOST_PREFIX, LEGACY_SESSION_PREFIX, PARTICIPANT
 const ROOT_COLLISION_PREFIXES = [HOST_PREFIX, PARTICIPANT_PREFIX, LEGACY_SESSION_PREFIX, LEGACY_ACTOR_PREFIX] as const;
 /**
  * smarty-dev#11172 (R-no-polling, chief-of-staff ruling): an idle host renews its lease at most once
- * every 30 s, against a ~90 s TTL (DEFAULT_PARTICIPANT_LEASE_MS). The 1:3 heartbeat:TTL ratio of
+ * every 60 s, against a 180 s TTL (DEFAULT_PARTICIPANT_LEASE_MS). The 1:3 heartbeat:TTL ratio of
  * the old 5 s / 15 s pair is kept, so canConsumeMesh/confirmation (2 heartbeats) stays inside the lease.
  */
-export const PARTICIPANT_HEARTBEAT_MS = 30_000;
+export const PARTICIPANT_HEARTBEAT_MS = 60_000;
 /** Default host lease TTL (and capable Main session TTL in its own host file), smarty-dev#11172. */
-export const DEFAULT_PARTICIPANT_LEASE_MS = 90_000;
+export const DEFAULT_PARTICIPANT_LEASE_MS = 3 * PARTICIPANT_HEARTBEAT_MS;
 /**
  * The old 5 s cadence, used only while a live pre-capability reader needs the fixed 15 s `sessions/`
  * TTL (LEGACY_ROOT_LEASE_MS): a deadline-bounded one-shot timer, never an idle poll (smarty-dev#11172).
@@ -874,8 +874,11 @@ export class ParticipantDirectory implements FabricParticipantSource {
   /** Whether this directory currently owns an armed heartbeat timer (smarty-dev#10004). */
   get heartbeatArmed(): boolean { return this.#timer !== undefined; }
 
-  // The one heartbeat timer. Every tick reads the owner's lifecycle first and skips when it
-  // retired; the background work itself runs through #runBackground (smarty-dev#5962/#10004).
+  // The one heartbeat timer. #1277 lease-only presence renewal is serviced by this same driver:
+  // renewHostLease has no separate renewal event to subscribe to, and refreshPresence is change-only.
+  // A silent idle host still needs bounded liveness renewal; removing this driver would strand it.
+  // Every tick reads the owner's lifecycle first and skips when it retired; the background work
+  // itself runs through #runBackground (smarty-dev#5962/#10004).
   #armHeartbeat(): void {
     if (this.#timer) return;
     this.#timer = setInterval(() => this.#heartbeatTick(), this.#heartbeatMs);
@@ -889,7 +892,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
   }
 
   /**
-   * smarty-dev#11172: an old reader that joins between our 30 s heartbeats needs our fixed-TTL
+   * smarty-dev#11172: an old reader that joins between our 60 s heartbeats needs our fixed-TTL
    * `sessions/` entry within its 15 s. Old releases always commit mesh state (their host record and
    * `sessions/` entry), so a commit notification wakes one check: the root watch on the exact files
    * the backends commit (file: the `state.json` rename; SQLite: `state.db`/`-wal`/`-journal`) plus the
@@ -902,7 +905,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     const wake = (): void => this.#joinCheck();
     let watcher: fs.FSWatcher | undefined;
     let stopped = false;
-    // The watch is the required cross-process carrier (file/SQLite): the default 30 s heartbeat is
+    // The watch is the required cross-process carrier (file/SQLite): the default 60 s heartbeat is
     // only safe beside an old reader's 15 s TTL while it works. No timer and no polling replace it:
     // a failed registration retries once synchronously, a lost watch re-registers once, then fail closed.
     const register = (): fs.FSWatcher => {
@@ -948,7 +951,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
 
   /**
    * The join carrier failed twice: stop serving the long-heartbeat compatibility guarantee rather
-   * than leave a 15 s `sessions/` entry advertised with a 30 s refresh. The heartbeat stops (the
+   * than leave a 15 s `sessions/` entry advertised with a 60 s refresh. The heartbeat stops (the
    * entries lapse with their TTLs), mesh consumption is fenced, and the owner hears it once
    * through the existing lifecycle-lost path. A live rebind (resume/start) arms afresh.
    */

@@ -27,10 +27,10 @@ const waitFor = async (predicate: () => boolean, boundMs: number, label: string,
   }
 };
 
-// smarty-dev#11172 moved the default participant heartbeat to 30 s (TTL 90 s, confirmation 60 s).
+// smarty-dev#11172 default participant heartbeat is 60 s (TTL 180 s, confirmation 120 s).
 // This test proves physical timer/lock interleaving across several real heartbeats, so only the
 // ParticipantDirectory #armHeartbeat interval physically fires every TEST_PHYSICAL_HEARTBEAT_MS.
-// Every directory keeps the production 30 s heartbeat, 90 s lease and 60 s confirmation
+// Every directory keeps the production 60 s heartbeat, 180 s lease and 120 s confirmation
 // arithmetic: no heartbeatMs option (which would also select the legacy 15 s TTL), no fake clock.
 const TEST_PHYSICAL_HEARTBEAT_MS = 5_000;
 const redirectParticipantHeartbeat = () => {

@@ -8,7 +8,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { MeshBackgroundRetry } from "../src/core/atomic-write.js";
-import { confirmWitnessPlatform, ParticipantDirectory, ROUTING_REFRESH_LOCK_BUDGET_MS } from "../src/topology/participant-directory.js";
+import { confirmWitnessPlatform, DEFAULT_PARTICIPANT_LEASE_MS, PARTICIPANT_HEARTBEAT_MS, ParticipantDirectory, ROUTING_REFRESH_LOCK_BUDGET_MS } from "../src/topology/participant-directory.js";
 import { MeshLock } from "../src/mesh/mesh-lock.js";
 import { writeParticipantFile } from "../src/topology/participant-files.js";
 import { actorParticipantRecord } from "../src/topology/records.js";
@@ -2615,7 +2615,7 @@ describe("idle confirmations without the mesh lock (smarty-dev#6477 L6)", () => 
 // smarty-dev#11172 — Decision C: common, unit-level (real MeshStore files, injected clock/timer spies), not E2E.
 // Reason: real incident #11172 (R-no-polling): the idle participant lease heartbeat woke every Main and resident
 // every 5 s; chief-of-staff refused an idle-wake allowlist entry. Failure boundaries: an old reader that joins between
-// 30 s heartbeats (state-commit wake, file + SQLite), and a stale compatibility tick (cancel paths). The E2E proof is the
+// 60 s heartbeats (state-commit wake, file + SQLite), and a stale compatibility tick (cancel paths). The E2E proof is the
 // idle-wake gate (docs/idle-wake-gate.md), main and resident modes, owner fv2-11172wake/event-lead: overall <= 1 wake/s
 // and no non-allowed site > 1/min.
 describe("ParticipantDirectory default lease cadence (smarty-dev#11172)", () => {
@@ -2667,21 +2667,35 @@ describe("ParticipantDirectory default lease cadence (smarty-dev#11172)", () => 
       cwd: "/tmp/project", startedAt: now, status: "idle" } });
   };
 
-  it("heartbeats every 30 s with a ~90 s host and Main session TTL", async () => {
+  it("heartbeats every 60 s with a 180 s host and Main session TTL, fencing consumption after two beats", async () => {
     const { mesh, identity, directory } = fixture("idle");
     const intervals = vi.spyOn(globalThis, "setInterval");
     const timeouts = vi.spyOn(globalThis, "setTimeout");
     try {
       await directory.start();
-      expect(intervals.mock.calls.map(([, ms]) => ms)).toEqual([30_000]);
+      expect(PARTICIPANT_HEARTBEAT_MS).toBe(60_000);
+      expect(DEFAULT_PARTICIPANT_LEASE_MS).toBe(3 * PARTICIPANT_HEARTBEAT_MS);
+      expect(intervals.mock.calls.map(([, ms]) => ms)).toEqual([PARTICIPANT_HEARTBEAT_MS]);
       const lease = readHostLeases(mesh.root).get(identity.id)!;
-      expect(lease.expiresAt - lease.updatedAt).toBe(90_000);
+      expect(lease.expiresAt - lease.updatedAt).toBe(180_000);
       // A capable reader takes the Main session from this file: it must not lapse after 15 s.
       expect(lease.session).toMatchObject({ expiresAt: lease.expiresAt, hostTtl: 1 });
       expect(sessionLiveness(mesh.get("sessions/idle", { fresh: true })!, mesh.root).expiresAt).toBe(lease.session!.expiresAt);
       expect(directory.canConsumeMesh()).toBe(true);
       // Without an old reader no extra cadence timer exists: the idle host wakes only on its heartbeat.
       expect(timeouts.mock.calls.filter(([, ms]) => ms === 5_000)).toHaveLength(0);
+      const confirmationDeadline = directory.confirmedAt() + 2 * PARTICIPANT_HEARTBEAT_MS;
+      expect(confirmationDeadline).toBeLessThan(lease.expiresAt);
+      expect(directory.canConsumeMesh(confirmationDeadline - 1)).toBe(true);
+      // Record the recovery request without actually renewing: elapsed confirmation must fail closed
+      // even while the host and capable Main session leases still have one heartbeat remaining.
+      const refresh = vi.spyOn(directory, "refresh").mockResolvedValue();
+      try {
+        expect(directory.canConsumeMesh(confirmationDeadline)).toBe(false);
+        expect(directory.canConsumeMesh(confirmationDeadline + 1)).toBe(false);
+        await new Promise<void>(resolve => setImmediate(resolve));
+        expect(refresh).toHaveBeenCalledOnce();
+      } finally { refresh.mockRestore(); }
     } finally {
       intervals.mockRestore();
       timeouts.mockRestore();
@@ -2721,7 +2735,7 @@ describe("ParticipantDirectory default lease cadence (smarty-dev#11172)", () => 
   });
 
   // Failure boundary (#11172 review): an old reader joining AFTER a normal lease cached
-  // legacy-needed=false saw our 15 s sessions/ entry lapse for up to one 30 s heartbeat.
+  // legacy-needed=false saw our 15 s sessions/ entry lapse for up to one 60 s heartbeat.
   for (const backend of ["file", "sqlite"] as const) {
     it(`a state-only reader joining between heartbeats wakes one prompt refresh through the ${backend} state commit, without a loop`, async () => {
       const { mesh, directory } = fixture("join", backend);
@@ -2737,7 +2751,7 @@ describe("ParticipantDirectory default lease cadence (smarty-dev#11172)", () => 
         await directory.start();
         expect(legacyTicks()).toBe(0);
         const scheduled = vi.spyOn(directory, "refresh");
-        // 20 s into the 30 s heartbeat: our fixed-TTL sessions/ entry already looks dead to an old reader.
+        // 20 s into the 60 s heartbeat: our fixed-TTL sessions/ entry already looks dead to an old reader.
         now += 20_000;
         const joinedAt = now;
         await addStateOnlyReader(other, joinedAt);
@@ -2779,7 +2793,7 @@ describe("ParticipantDirectory default lease cadence (smarty-dev#11172)", () => 
       expect(tokens).toHaveBeenCalled();
       expect(scheduled).not.toHaveBeenCalled();
       expect(timeouts.mock.calls.filter(([, ms]) => ms === 5_000)).toHaveLength(0);
-      expect(intervals.mock.calls.map(([, ms]) => ms)).toEqual([30_000]);
+      expect(intervals.mock.calls.map(([, ms]) => ms)).toEqual([60_000]);
       expect(mesh.get("sessions/no-old-reader", { fresh: true })).toEqual(before);
     } finally {
       timeouts.mockRestore();
@@ -2952,7 +2966,7 @@ describe("ParticipantDirectory default lease cadence (smarty-dev#11172)", () => 
     }
   });
 
-  // CODE-3/SEC-1 (#11172 audit): the root watch is the required join carrier for the 30 s default; its
+  // CODE-3/SEC-1 (#11172 audit): the root watch is the required join carrier for the 60 s default; its
   // failure must fail closed, never fall back to a timer or poll. Decision C: unit-level, fs.watch stubbed.
   const fakeWatcher = () => {
     const emitter = new EventEmitter() as EventEmitter & { close: () => void };
@@ -3002,8 +3016,8 @@ describe("ParticipantDirectory default lease cadence (smarty-dev#11172)", () => 
       await expect(directory.start()).rejects.toThrow(/join watch .* could not be registered/);
       expect(watch.calls()).toBe(2);                       // exactly one synchronous retry
       expect(directory.heartbeatArmed).toBe(false);
-      expect(clears).toHaveBeenCalledTimes(1);              // the 30 s heartbeat was cancelled
-      expect(timers.created().filter((ms) => ms !== 30_000)).toEqual([]); // no degraded retry timer/poll
+      expect(clears).toHaveBeenCalledTimes(1);              // the 60 s heartbeat was cancelled
+      expect(timers.created().filter((ms) => ms !== 60_000)).toEqual([]); // no degraded retry timer/poll
       expect(mesh.get("sessions/retry-fail", { fresh: true })).toBeUndefined(); // never advertised
       expect(directory.canConsumeMesh()).toBe(false);
     } finally {

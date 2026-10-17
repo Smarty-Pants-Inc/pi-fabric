@@ -1025,7 +1025,11 @@ type FabricMessageTarget =
   | { to: string; id?: string; sessionId?: FabricSessionIdHint };
 /** sessionId is not a field: write id: "session:<sessionId>". */
 type FabricSessionIdHint = "sessionId is not a field: use id: 'session:<sessionId>'";
-/** coalesceKey (1-200 chars): a followUp/tell replaces your unread held one to a busy Main with the same key (like actor coalesceKey). */
+/**
+ * data.coalesceKey is ordinary payload for Main: accepted originals are retained
+ * independently, with one admission per stable message identity. Main does not
+ * merge, replace, or deduplicate by this key. Actor coalesceKey settings are separate.
+ */
 interface FabricMessageData { coalesceKey?: string; [key: string]: unknown }
 type FabricMessageArgs = FabricMessageTarget & {
   message: string;
@@ -1088,8 +1092,9 @@ interface FabricMessageDelivery {
   pendingFollowUps?: number;
   /** For a Main target: the age in seconds of your oldest followUp it still holds (0 when none). */
   oldestAgeS?: number;
-  /** Main: it replaced your held followUp replacedMessageId (same data.coalesceKey). */
+  /** Legacy/remote receiver compatibility; current Main does not report replacement. */
   coalesced?: true;
+  /** Replaced message identity when reported by a legacy/remote receiver. */
   replacedMessageId?: string;
 }
 /** Select the native store to inspect; this read-only preflight never starts a host. */

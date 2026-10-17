@@ -218,7 +218,7 @@ export class MeshLock {
   get ownIncarnation(): Promise<string | undefined> | undefined { return this.#ownIncarnation; }
   get ownIncarnationReady(): boolean { return this.#ownIncarnationReady; }
 
-  /** Bound every mesh acquisition in this async step via the existing try path.
+  /** Bound every mesh acquisition in this async step via the existing FIFO/try path.
    * Registry -> mesh publication retains custody through source selection and copies,
    * but a busy or unprepared mesh throws its typed refusal after a short try so the caller can
    * release registry fences and retry the whole step. This acquires NO lock itself.
@@ -312,11 +312,12 @@ export class MeshLock {
         // Already replaced/removed, unreadable, or cleanup failed: never delete canonical.
       }
     };
-    // Start the relative contention budget only after root, identity and owner-record setup.
-    const deadline = Date.now() + waitMs;
+    // smarty-dev#9805: only the canonical mesh lock opts into the early free-lock bypass of a stalled head.
+    const admission = createMeshLockAdmission(this.root, token, waitMs, { stalledHeadBypassLock: this.#lockPath });
+    const { ticket, deadline } = admission;
     let budgetSpent = false;
     let budgetTimer: ReturnType<typeof setTimeout> | undefined;
-    // Fix the budget once after setup; expiry cannot grant a later acquisition.
+    // The shared admission helper fixes the relative budget only after setup; expiry cannot grant admission.
     try {
       // Attempts and the largest gap between two of them: a large gap means this waiter stalled
       // (no CPU); many attempts with small gaps mean it kept losing the race (smarty-dev#816).
@@ -327,13 +328,15 @@ export class MeshLock {
       let waited = false;
       let waitSetupExpired = false;
       const wait = async (ms: number): Promise<void> => {
-        // Arm once, before delay setup, on the same relative timer clock as the retry wait.
+        // Arm once, before watch setup, on the same relative timer clock as both wait paths.
         // Date is lease time (it may jump); performance may be a separate diagnostic clock.
         // Lazy arming keeps uncontended acquisitions free of another clock read or timer.
         // Spent means strictly past the budget (+1 ms), so an attempt due exactly at the deadline still runs.
         budgetTimer ??= setTimeout(() => { budgetSpent = true; }, Math.max(0, deadline - Date.now()) + 1);
-        const pending = delay(ms, this.#writeAbortSignal);
-        // Invocation includes synchronous timer setup: retain its fixed-deadline refusal.
+        const pending = ticket.queued
+          ? ticket.wait(ms, this.#writeAbortSignal, deadline)
+          : delay(ms, this.#writeAbortSignal);
+        // Invocation includes synchronous watch setup: retain its fixed-deadline refusal.
         // After yielding, wall-clock lease time can jump independently of the relative timer.
         waitSetupExpired = Date.now() > deadline;
         await pending;
@@ -351,10 +354,23 @@ export class MeshLock {
       };
       while (true) {
         this.#writeAbortSignal?.throwIfAborted();
+        if (!ticket.mayContend()) {
+          if (!budgetSpent && Date.now() < deadline) {
+            // Woken when the predecessor's receipt goes; the short poll is only a safety net.
+            await wait(Math.min(20, Math.max(0, deadline - Date.now())));
+            continue;
+          }
+          // Expiry never grants FIFO admission: only an eligible head may probe at its deadline. Keep the legacy
+          // retry code, but report this zero-acquisition refusal separately from real lock contention.
+          throw admission.expire(this.#lockPath, this.root, "mesh-lock", lockClass);
+        }
         const attemptAt = Date.now();
-        // A retry can spend the budget in setup or resume late.
-        // Keep the initial probe; once we have waited, timer expiry is not admission.
-        if (waited && (waitSetupExpired || budgetSpent)) throw timeout();
+        // Both waits can spend the budget in setup or resume late, even on a release signal.
+        // Keep the initial eligible probe; once we have waited, timer expiry is not admission.
+        if (waited && (waitSetupExpired || budgetSpent)) {
+          if (attempts === 0 && ticket.queued) throw admission.expire(this.#lockPath, this.root, "mesh-lock", lockClass);
+          throw timeout();
+        }
         if (attempts > 0) maxGapMs = Math.max(maxGapMs, attemptAt - lastAttemptAt);
         attempts += 1;
         lastAttemptAt = attemptAt;
@@ -418,8 +434,10 @@ export class MeshLock {
             (code !== "ENOTEMPTY" && code !== "EPERM" && code !== "EACCES"))) throw error;
           if (await this.clearStaleLock(ownerPath, deadline, blocked)) continue;
           if (Date.now() >= deadline) throw timeout();
-          // Full jitter spreads native contenders; the deadline bounds every sleep.
-          await wait(retryDelayMs(retryAttempt++, 20, 250, deadline - Date.now()));
+          // Only the FIFO head probes promptly, woken when .lock is released. After the bounded
+          // admission fallback, full jitter spreads plain contenders; the deadline bounds every sleep.
+          await wait(ticket.queued ? Math.min(10, Math.max(0, deadline - Date.now()))
+            : retryDelayMs(retryAttempt++, 20, 250, deadline - Date.now()));
         }
       }
       pin = pinFenceLock(this.#lockPath, ownerRecord);
@@ -455,7 +473,8 @@ export class MeshLock {
       throw error;
     } finally {
       clearTimeout(budgetTimer);
-      // Record bookkeeping after releasing the native lock.
+      ticket.close();
+      // Recorded after the ticket closes, so bookkeeping never delays a FIFO follower.
       if (holdMs >= 0) {
         lockStats?.acquired(this.root, lockClass, lockHeldAt - lockWaitStart, holdMs);
         if (this.#lockHeldEventMs > 0 && holdMs > this.#lockHeldEventMs) lockEvents?.held(this.root, "mesh-lock", lockClass, holdMs);

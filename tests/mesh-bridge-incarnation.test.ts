@@ -59,6 +59,7 @@ const oldLease = {
   id: identity.id, rootId: identity.id, identityId: identity.id, startedAt: host.startedAt,
   incarnationToken: host.incarnationToken!, updatedAt: NOW, expiresAt: host.expiresAt,
 };
+const { incarnationToken: _oldToken, ...tokenlessLease } = oldLease;
 // Tokens identify owners, not order; the newer owner's token sorts before its predecessor's.
 const newerLease = { ...oldLease, startedAt: host.startedAt + 1_000, incarnationToken: "opaque-a-successor",
   bridgeSupersededTokens: [oldLease.incarnationToken] };
@@ -188,12 +189,12 @@ describe("bridge incarnation admission at persisted trust boundaries (smarty-dev
   });
 
   describe.each(["file", "sqlite"] as const)("retained tokenless liveness guards (%s)", backend => {
-    const legacy = (sourceAt: number, remaining = 8_000) => {
+    const legacy = (sourceAt: number, remaining = 8_000): Pick<BridgePresence, "hosts" | "participants"> => {
       const { incarnationToken: _token, ...record } = host;
       return { hosts: [{ record: { ...record, startedAt: NOW + 999_000,
         identity: { ...identity, name: "untrusted-name" }, updatedAt: sourceAt - 1_000 },
         observedAt: sourceAt, expiresAt: sourceAt + remaining }],
-        participants: [{ ...participant, name: "takeover", ownerIncarnation: "takeover", capabilities: ["unsafe"] }] };
+        participants: [{ ...participant, name: "takeover", ownerIncarnation: "takeover", capabilities: ["stop"] }] };
     };
     const unrelated = { ...host, id: "session:unrelated-00000000", rootId: "session:unrelated-00000000",
       identity: { ...identity, id: "session:unrelated-00000000" }, incarnationToken: "U" };
@@ -267,8 +268,8 @@ describe("bridge incarnation admission at persisted trust boundaries (smarty-dev
       if (shape === "owner-mismatch") value = { ...value, identity: { ...identity, id: "session:wrong-owner-00000000" } };
       if (shape !== "missing-host") await hub.put({ key: hostKey(identity.id), identity: updatedBy, value });
       await hub.put({ key: participantKey(identity.id), identity, value: { ...participant, remoteHost: "ryzen2" } });
-      writeHostLease(hub.root, { ...oldLease,
-        ...(shape === "history-only" ? { incarnationToken: undefined, bridgeSupersededTokens: ["retired"] } : {}),
+      writeHostLease(hub.root, {
+        ...(shape === "history-only" ? { ...tokenlessLease, bridgeSupersededTokens: ["retired"] } : oldLease),
         ...(shape === "conflicting-tokens" ? { incarnationToken: "other-current" } : {}) });
       const otherId = `${identity.id}-other`;
       // Two independent real effect rows for the same root; unlease's target has no state row.
@@ -276,8 +277,8 @@ describe("bridge incarnation admission at persisted trust boundaries (smarty-dev
         { kind: "lease", key: `lease:${identity.id}`, payload: { ...oldLease, expiresAt: NOW + 999_000 } },
         { kind: "unlease", key: `lease:${otherId}`, payload: { ...oldLease, id: otherId, key: hostKey(otherId) } },
       ], { durable: true }) });
-      writeHostLease(hub.root, { ...oldLease, id: otherId,
-        ...(shape === "history-only" ? { incarnationToken: undefined, bridgeSupersededTokens: ["retired"] } : {}) });
+      writeHostLease(hub.root, {
+        ...(shape === "history-only" ? { ...tokenlessLease, bridgeSupersededTokens: ["retired"] } : oldLease), id: otherId });
       const before = { host: hub.get(hostKey(identity.id), { fresh: true }),
         participant: hub.get(participantKey(identity.id), { fresh: true }),
         lease: fs.readFileSync(hostLeasePath(hub.root, identity.id)),
@@ -399,7 +400,7 @@ describe("bridge incarnation admission at persisted trust boundaries (smarty-dev
     let interveningHost: unknown, interveningLease: Buffer | undefined;
     const retry = vi.spyOn(hub, "writeBatch").mockImplementationOnce(async input => {
       await write({ identity, ops: [{ kind: "put", key: hostKey(identity.id), value: { ...tokenlessHost, remoteHost: "ryzen2" } }] });
-      writeHostLease(hub.root, { ...oldLease, incarnationToken: undefined });
+      writeHostLease(hub.root, tokenlessLease);
       interveningHost = hub.get(hostKey(identity.id), { fresh: true });
       interveningLease = fs.readFileSync(hostLeasePath(hub.root, identity.id));
       return write(input);

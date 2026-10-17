@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -230,13 +231,43 @@ it.skipIf(process.platform === "win32")("creates usable 0700 directories and 060
 // pi-fabric#875 round 5: macOS has no traversable /dev/fd/N. There (forced here: no fd base, platform darwin) the
 // validated descriptor-free walk is used, never a refusal of every run and never main's unvalidated mkdir.
 describe.skipIf(process.platform === "win32")("without a traversable fd base (darwin)", () => {
-  const darwin = async () => {
+  // The per-user macOS $TMPDIR layout: every ancestor is root's and not sticky-shared (/private/var/folders/xx is
+  // root 0755), then our own 0700 directories. The vitest temp root sits under /tmp, so `perUser` presents a
+  // root-owned sticky ancestor as that layout; the walk mechanics under test are the same (smarty-dev#9527).
+  const asPerUserTmpdir = (_walked: string, stat: fs.Stats): fs.Stats =>
+    stat.uid === 0 && (stat.mode & 0o1000) !== 0 ? Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, { mode: (stat.mode & ~0o7777) | 0o755 }) : stat;
+  const darwin = async (perUser = true) => {
     const module = await import("../src/storage/private-dir.js");
     module.privateDirTestHooks.fdBases = [path.join(tmp("fabric-no-fd-base-"), "none")];
     module.privateDirTestHooks.platform = "darwin";
-    restoreHooks = () => { delete module.privateDirTestHooks.fdBases; delete module.privateDirTestHooks.platform; };
+    if (perUser) module.privateDirTestHooks.stat = asPerUserTmpdir;
+    restoreHooks = () => {
+      delete module.privateDirTestHooks.fdBases; delete module.privateDirTestHooks.platform;
+      delete module.privateDirTestHooks.stat; delete module.privateDirTestHooks.beforeCreate;
+    };
     return module;
   };
+
+  // smarty-dev#9527: without openat, a validated ancestor that another uid can write could be swapped between the
+  // check and the create. On darwin the walk therefore refuses a shared sticky ancestor before creating anything.
+  const stickyTmp = fs.statSync("/tmp", { throwIfNoEntry: false });
+  it.skipIf(!stickyTmp || stickyTmp.uid !== 0 || (stickyTmp.mode & 0o1000) === 0)(
+    "refuses a tree under a shared sticky ancestor (/tmp) before creating anything, so no swap can redirect it", async () => {
+      const { mkdirPrivate, privateDirTestHooks } = await darwin(false);
+      const target = path.join("/tmp", `fabric-darwin-sticky-${randomBytes(8).toString("hex")}`);
+      const swaps: string[] = [];
+      privateDirTestHooks.beforeCreate = (directory) => { swaps.push(directory); }; // where an injected swap would land
+      expect(() => mkdirPrivate(target)).toThrow(/\/tmp is a shared sticky directory .*\$HOME or the per-user \$TMPDIR/);
+      expect(swaps).toEqual([]); // the walk never reached a create
+      expect(fs.existsSync(target)).toBe(false);
+    });
+
+  it("accepts a tree whose ancestors are root's (not shared-sticky) or ours: the per-user $TMPDIR layout", async () => {
+    const { mkdirPrivate } = await darwin(true);
+    const root = tmp("fabric-darwin-per-user-");
+    mkdirPrivate(path.join(root, "T", "run"));
+    expect(mode(path.join(root, "T", "run"))).toBe(0o700);
+  });
   let restoreHooks: (() => void) | undefined;
   afterEach(() => { restoreHooks?.(); restoreHooks = undefined; });
 

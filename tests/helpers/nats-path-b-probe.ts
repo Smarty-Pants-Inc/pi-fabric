@@ -92,8 +92,8 @@ export interface ControlProbeSendResult {
   readonly probeId: string;
   readonly invocationAtNs: string;
   readonly invocationAtEpochNs?: string;
-  readonly acceptedAckObservedAtNs?: string;
-  readonly acceptedAckObservedAtEpochNs?: string;
+  readonly acceptedAckObservedAtNs?: string | null;
+  readonly acceptedAckObservedAtEpochNs?: string | null;
   readonly resolvedAtNs?: string;
   readonly accepted: boolean;
   readonly result?: unknown;
@@ -352,16 +352,21 @@ export function collectControlProbeEvidence(sends: readonly ControlProbeSend[], 
     const result = item.result;
     const records = events.filter(event => event.commandId === item.commandId);
     const ownerCommit = records.find(event => event.role === "owner" && event.type === "main-followup-journal-commit");
-    const commandPubAck = records.find(event => event.role === "sender" && event.type === "transport-puback" && event.kind === "command");
-    const commandPublished = commandPubAck ?? records.find(event => event.role === "sender" && event.type === "file-append" && event.kind === "command");
-    const ownerAck = records.find(event => event.role === "owner" && (event.type === "transport-puback" && event.kind === "ack" ||
-      event.type === "file-append" && event.kind === "ack"));
-    const ackOfAck = records.find(event => event.role === "owner" && event.type === "inbox-ack-confirmed" && event.kind === "command");
-    const senderAckOfAck = records.find(event => event.role === "sender" && event.type === "inbox-ack-confirmed" && event.kind === "ack");
+    // Retained observations can span a carrier restart with the same commandId.
+    // Only the requested carrier can prove its own publication/consumption stages.
+    const carrierRecords = records.filter(event => event.carrier === transport);
+    const publication = transport === "nats" ? "transport-puback" : "file-append";
+    const commandPubAck = carrierRecords.find(event => event.role === "sender" && event.type === "transport-puback" && event.kind === "command");
+    const commandPublished = carrierRecords.find(event => event.role === "sender" && event.type === publication && event.kind === "command");
+    const ownerAck = carrierRecords.find(event => event.role === "owner" && event.type === publication && event.kind === "ack");
+    const ackOfAck = carrierRecords.find(event => event.role === "owner" && event.type === "inbox-ack-confirmed" && event.kind === "command");
+    const senderAckOfAck = carrierRecords.find(event => event.role === "sender" && event.type === "inbox-ack-confirmed" && event.kind === "ack");
     const invocationAtNs = result?.invocationAtNs || null;
     const invocationAtEpochNs = result?.invocationAtEpochNs ?? null;
-    const acceptedAckObservedAtNs = result?.acceptedAckObservedAtNs ?? null;
-    const acceptedAckObservedAtEpochNs = result?.acceptedAckObservedAtEpochNs ?? null;
+    // Legacy workers may timestamp any resolved API result. Only a genuinely
+    // accepted result is an admission-ACK observation, including retained rows.
+    const acceptedAckObservedAtNs = result?.accepted === true ? result.acceptedAckObservedAtNs ?? null : null;
+    const acceptedAckObservedAtEpochNs = result?.accepted === true ? result.acceptedAckObservedAtEpochNs ?? null : null;
     const latencyMs = invocationAtNs && acceptedAckObservedAtNs
       ? Number(BigInt(acceptedAckObservedAtNs) - BigInt(invocationAtNs)) / 1_000_000 : null;
     const sameHostSecondaryMs = invocationAtEpochNs && ownerCommit?.atNs
@@ -383,13 +388,37 @@ export function collectControlProbeEvidence(sends: readonly ControlProbeSend[], 
       senderAckOfAckAtNs: senderAckOfAck?.atNs ?? null,
       ownerJournalCommitAtNs: ownerCommit?.atNs ?? null,
       secondarySameHostJournalCommitMs: sameHostSecondaryMs,
-      redeliveryAttempts: records.filter(event => event.role === "owner" && event.type === "inbox-ack-confirmed" && event.kind === "command")
+      redeliveryAttempts: carrierRecords.filter(event => event.role === "owner" && event.type === "inbox-ack-confirmed" && event.kind === "command")
         .reduce((sum, event) => sum + Math.max(0, (event.attempt ?? 1) - 1), 0),
       allStagesVerified: result?.accepted === true && latencyMs !== null && logicalAdmissionCount === 1 &&
-        !!commandPublished && !!ownerAck && (transport === "file" || !!ackOfAck && !!senderAckOfAck),
+        !!ownerCommit?.atNs && !!commandPublished?.atNs && !!ownerAck?.atNs && !!ackOfAck?.atNs && !!senderAckOfAck?.atNs,
       error: result?.error ?? null,
     };
   });
+}
+
+/** Strict common barrier used by the one-shot controller. The reader must await its native
+ * flush before returning a fresh combined owner/sender snapshot. Never return a partial
+ * accepted cell on expiry; rejected/unknown API outcomes remain separate from stage proof.
+ */
+export async function waitForControlProbeEvidence(
+  sends: readonly ControlProbeSend[],
+  readEvents: () => Promise<readonly ControlProbeEvent[]>,
+  transport: "file" | "nats",
+  timeoutMs = 8_000,
+) {
+  if (!Number.isFinite(timeoutMs) || timeoutMs < 0) throw new Error("control probe stage timeout must be nonnegative and finite");
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const events = await readEvents();
+    const perSend = collectControlProbeEvidence(sends, events, transport);
+    const incomplete = perSend.filter(record => record.accepted && !record.allStagesVerified);
+    if (incomplete.length === 0) return { events, perSend };
+    if (Date.now() >= deadline) throw new Error(`control probe native stage deadline exceeded: ${incomplete.map(record => record.commandId).join(", ")}`);
+    // Worker observations are buffered, not pushed to the controller. Completed sends
+    // trigger the first flush; bounded reflushes cover confirmations arriving afterward.
+    await sleep(Math.min(50, Math.max(0, deadline - Date.now())));
+  }
 }
 
 export interface ControlProbeInstallation {
@@ -543,10 +572,14 @@ export async function installControlProbe(input: ControlProbeInstallation) {
             const acceptedAckObservedAtNs = process.hrtime.bigint().toString();
             const acceptedAckObservedAtEpochNs = epochNow();
             const ack = value as { acknowledged?: boolean; accepted?: boolean } | undefined;
-            result = { probeId: request.probeId, invocationAtNs, invocationAtEpochNs, acceptedAckObservedAtNs,
-              acceptedAckObservedAtEpochNs, accepted: ack?.acknowledged === true && ack?.accepted !== false, result: value };
+            const accepted = ack?.acknowledged === true && ack?.accepted !== false;
+            result = { probeId: request.probeId, invocationAtNs, invocationAtEpochNs,
+              acceptedAckObservedAtNs: accepted ? acceptedAckObservedAtNs : null,
+              acceptedAckObservedAtEpochNs: accepted ? acceptedAckObservedAtEpochNs : null,
+              ...(!accepted ? { resolvedAtNs: acceptedAckObservedAtNs } : {}), accepted, result: value };
           } catch (error) {
             result = { probeId: request.probeId, invocationAtNs, invocationAtEpochNs, resolvedAtNs: process.hrtime.bigint().toString(),
+              acceptedAckObservedAtNs: null, acceptedAckObservedAtEpochNs: null,
               accepted: false, error: error instanceof Error ? error.message : String(error) };
           }
           append({ type: "send", send: { probeId: request.probeId, commandId, result } });
@@ -573,11 +606,13 @@ export async function installControlProbe(input: ControlProbeInstallation) {
               const events = rows.flatMap(row => row.type === "event" ? [row.event] : []);
               const nats = input.runtime.config.mesh.transport === "nats";
               const has = (id: string, type: string, kind?: "command" | "ack") => events.some(event =>
-                event.commandId === id && event.type === type && (kind === undefined || event.kind === kind));
+                event.commandId === id && event.role === input.role && event.type === type &&
+                (type === "main-followup-journal-commit" || event.carrier === input.runtime.config.mesh.transport) &&
+                (kind === undefined || event.kind === kind));
               if (ids.every(id => input.role === "owner"
-                ? has(id, "main-followup-journal-commit") && has(id, nats ? "transport-puback" : "file-append", "ack") && (!nats || has(id, "inbox-ack-confirmed", "command"))
+                ? has(id, "main-followup-journal-commit") && has(id, nats ? "transport-puback" : "file-append", "ack") && has(id, "inbox-ack-confirmed", "command")
                 : rows.some(row => row.type === "send" && row.send.commandId === id && row.send.result?.accepted) &&
-                  has(id, nats ? "transport-puback" : "file-append", "command") && (!nats || has(id, "inbox-ack-confirmed", "ack")))) finish();
+                  has(id, nats ? "transport-puback" : "file-append", "command") && has(id, "inbox-ack-confirmed", "ack"))) finish();
             } catch (error) { finish(error); }
           };
           const timer = setTimeout(() => finish(new Error("control probe native stage deadline exceeded")), timeoutMs);
@@ -623,6 +658,27 @@ function latencyStats(samples: readonly number[]) {
 const isAccepted = (result: unknown): boolean => !!result && typeof result === "object" &&
   (result as Record<string, unknown>).accepted === true;
 const timeoutError = (text: string | undefined): boolean => text !== undefined && /timeout|timed out|acknowledg.{0,12}timeout/i.test(text);
+
+/** The same accepted-only aggregation serves native controller cells and retained-role evidence.
+ * Native journal diagnostics remain on every per-send row; only accepted rows enter latency bars.
+ */
+export function summarizeControlProbeEvidence(sends: readonly ControlProbeSend[], records: ReadonlyArray<ReturnType<typeof collectControlProbeEvidence>[number]>) {
+  const completed = sends.flatMap(send => send.result ? [send.result] : []);
+  const accepted = records.filter(record => record.accepted);
+  return {
+    acceptedCount: completed.filter(isAccepted).length,
+    primary: latencyStats(accepted.flatMap(record => typeof record.primaryLatencyMs === "number" ? [record.primaryLatencyMs] : [])),
+    secondarySameHostJournalCommitMs: latencyStats(accepted.flatMap(record => typeof record.secondarySameHostJournalCommitMs === "number"
+      ? [record.secondarySameHostJournalCommitMs] : [])),
+    counts: {
+      refusals: completed.filter(result => !result.accepted && !result.lost).length,
+      redeliveries: records.reduce((sum, record) => sum + Number(record.redeliveryAttempts), 0),
+      duplicateAdmissions: records.reduce((sum, record) => sum + Math.max(0, Number(record.logicalAdmissionCount) - 1), 0),
+      lostMessages: sends.length - completed.filter(result => !result.lost).length,
+      ackTimeouts: completed.filter(result => result.lost || timeoutError(result.error)).length,
+    },
+  };
+}
 
 async function waitForFile(file: string, timeoutMs: number): Promise<void> {
   const until = Date.now() + timeoutMs;
@@ -817,27 +873,11 @@ export async function runControlProbe(options: ControlProbeOptions) {
     const eventFiles = [ownerEventFile, ...senders.map(sender => sender.eventFile)];
     const readAllEvents = () => eventFiles.flatMap(readJsonLines);
     const flushAll = async () => { await Promise.all(workers.map(client => client.request("flush", {}, 5_000).catch(() => undefined))); };
-    const readyForEvidence = (events: WorkerEvent[]): boolean => {
-      const ownerEvents = events.filter(event => event.role === "owner");
-      if (options.transport === "nats") return completed.filter(result => result.accepted).every(result => {
-        const send = sends.find(item => item.probeId === result.probeId);
-        return !!send && ownerEvents.some(event => event.type === "inbox-ack-confirmed" && event.commandId === send.commandId && event.kind === "command") &&
-          events.some(event => event.role === "sender" && event.type === "inbox-ack-confirmed" && event.commandId === send.commandId && event.kind === "ack");
-      });
-      return completed.filter(result => result.accepted).every(result => {
-        const send = sends.find(item => item.probeId === result.probeId);
-        return !!send && ownerEvents.some(event => event.type === "main-followup-journal-commit" && event.commandId === send.commandId);
-      });
-    };
-    const stageDeadline = Date.now() + 8_000;
-    let events: WorkerEvent[] = [];
-    do {
-      await flushAll();
-      events = readAllEvents();
-      if (readyForEvidence(events)) break;
-      await sleep(50);
-    } while (Date.now() < stageDeadline);
-    events = readAllEvents();
+    const manifest = sends.map(item => ({ probeId: item.probeId, commandId: item.commandId,
+      result: completed.find(candidate => candidate.probeId === item.probeId) }));
+    const { events, perSend: sendRecords } = await waitForControlProbeEvidence(
+      manifest, async () => { await flushAll(); return readAllEvents(); }, options.transport,
+    );
     for (const event of events) {
       if (!event.commandId || !commandIds.has(event.commandId)) continue;
       const list = allEvents.get(event.commandId) ?? [];
@@ -848,17 +888,8 @@ export async function runControlProbe(options: ControlProbeOptions) {
     const afterCursors = readCursorSnapshots(cursorParticipants);
     const fileControlEvents = options.transport === "file" ? fileControlEventEvidence(ownerRoot, commandIds) : null;
     sampleRss();
-    await flushAll();
     const allRecords = [...allEvents.entries()];
-    const acceptedCount = completed.filter(isAccepted).length;
-    const sendRecords = collectControlProbeEvidence(sends.map(item => ({ probeId: item.probeId, commandId: item.commandId,
-      result: completed.find(candidate => candidate.probeId === item.probeId) })), events, options.transport);
-    const acceptedSamples = sendRecords.flatMap(record => typeof record.primaryLatencyMs === "number" ? [record.primaryLatencyMs] : []);
-    const refused = completed.filter(result => !result.accepted && !result.lost).length;
-    const ackTimeouts = completed.filter(result => result.lost || timeoutError(result.error)).length;
-    const redeliveries = sendRecords.reduce((sum, record) => sum + Number(record.redeliveryAttempts), 0);
-    const duplicateAdmissions = sendRecords.reduce((sum, record) => sum + Math.max(0, Number(record.logicalAdmissionCount) - 1), 0);
-    const lostMessages = sends.length - completed.filter(result => !result.lost).length;
+    const summary = summarizeControlProbeEvidence(manifest, sendRecords);
     const eventUnchanged = JSON.stringify(beforeEvents) === JSON.stringify(afterEvents);
     const cursorUnchanged = JSON.stringify(beforeCursors) === JSON.stringify(afterCursors);
     return {
@@ -893,10 +924,9 @@ export async function runControlProbe(options: ControlProbeOptions) {
         presenceProjection: options.presenceProjectionLabel ?? "pre-projection",
         barClaimable: options.presenceProjectionLabel === "enabled",
       },
-      primary: { label: "send -> admission-ACK (sender clock)", ...latencyStats(acceptedSamples) },
-      secondarySameHostJournalCommitMs: latencyStats(sendRecords.flatMap(record => typeof record.secondarySameHostJournalCommitMs === "number"
-        ? [record.secondarySameHostJournalCommitMs] : [])),
-      counts: { refusals: refused, redeliveries, duplicateAdmissions, lostMessages, ackTimeouts },
+      primary: { label: "send -> admission-ACK (sender clock)", ...summary.primary },
+      secondarySameHostJournalCommitMs: summary.secondarySameHostJournalCommitMs,
+      counts: summary.counts,
       perSend: sendRecords,
       evidence: {
         eventsJsonlAndArchiveBefore: beforeEvents,
@@ -926,7 +956,7 @@ export async function runControlProbe(options: ControlProbeOptions) {
           withinHeadroom: estimateBytes !== null && options.headroomLimitBytes !== undefined ? estimateBytes <= options.headroomLimitBytes : null };
       })(),
       checks: {
-        acceptedCount,
+        acceptedCount: summary.acceptedCount,
         allAcceptedHaveMainJournalCommit: sendRecords.filter(record => record.accepted).every(record => record.logicalAdmissionCount === 1 && record.ownerJournalCommitAtNs !== null),
         natsLeavesMeshEventsAndCursorsUnchanged: options.transport === "nats" ? eventUnchanged && cursorUnchanged : null,
       },

@@ -256,6 +256,7 @@ export class PathBHarness {
   readonly tls: PathBTlsFiles | undefined;
   serverVersion = "";
   private child: ChildProcess | undefined;
+  get processId(): number | undefined { return this.child?.pid; }
   private readonly connections = new Set<NatsConnection>();
   private constructor(input: {
     root: string;

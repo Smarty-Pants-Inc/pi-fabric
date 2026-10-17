@@ -302,6 +302,154 @@ describe("real registry preparation and callerless subscription retention", () =
     expect(run).not.toHaveBeenCalled();
   });
 
+  it("P1: a typed veto thrown by binding stays hard until explicit reset", async () => {
+    let unavailable = false;
+    const { actors, agents, mesh, root } = setup({ preparationRetryMs: 5, resolvePiModel: async model => {
+      if (unavailable) throw new ActorRegistryUpdateVetoedError("generation");
+      return model;
+    } });
+    const actor = await create(actors);
+    const run = vi.spyOn(agents, "run");
+    unavailable = true;
+    const done = settled(actors, actor.id, () => actors.messages(actor.id).some(message =>
+      (message.data as { phase?: string })?.phase === "binding"));
+    const event = await publish(mesh, { finding: "P1" });
+    await done;
+    const retained = queue(actor.sessionFile!);
+    const block = actors.status(actor.id).activationBlocked;
+    expect(retained).toEqual([expect.objectContaining({ payload: expect.objectContaining({ id: event.id }),
+      attempts: 0, preparationAttempts: 1 })]);
+    expect(JSON.parse(fs.readFileSync(path.join(root, "cursor.json"), "utf8")).last.sequence)
+      .toBeGreaterThanOrEqual(event.sequence);
+    expect(run).not.toHaveBeenCalled();
+    // Neither a repaired resolver nor a newer callerless observation grants recovery.
+    unavailable = false;
+    const newer = await publish(mesh, { finding: "P1", later: true });
+    await pause(150);
+    expect(run).not.toHaveBeenCalled();
+    expect(block).toMatchObject({ class: "hard", code: "failing-preparation" });
+    expect(actors.status(actor.id).activationBlocked).toEqual(block);
+    expect(queue(actor.sessionFile!).map(item => item.payload.id)).toEqual([event.id, newer.id]);
+    // A restart must not promote the persisted binding wrapper's veto-shaped text
+    // into legacy registry evidence and undo the phase-aware hard classification.
+    await actors.close();
+    await agents.close();
+    const nextAgents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "runs"),
+    });
+    const nextRun = vi.spyOn(nextAgents, "run");
+    const next = new ActorManager("veto-retention", { id: "session:veto-retention", name: "main", kind: "main" }, mesh,
+      { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, nextAgents, () => {}, {
+        actorRoot: path.join(root, "actors"), meshCursorPath: path.join(root, "cursor.json"), persistent: true,
+        meshRetentionSweepPath: false, preparationRetryMs: 5, resolvePiModel: async model => model,
+      });
+    cleanups.push(async () => { await next.close(); await nextAgents.close(); });
+    await pause(150);
+    expect(nextRun).not.toHaveBeenCalled();
+    expect(next.status(actor.id).activationBlocked).toMatchObject({ class: "hard", code: "failing-preparation" });
+    expect(queue(actor.sessionFile!).map(item => item.payload.id)).toEqual([event.id, newer.id]);
+    const recovered = settled(next, actor.id, () => outputs(next, actor.id).length === 2);
+    await next.resetSession(actor.id);
+    await recovered;
+    await pause(50);
+    expect(nextRun).toHaveBeenCalledTimes(2);
+    expect(nextRun.mock.calls.filter(([request]) => request.task.includes(event.id))).toHaveLength(1);
+    expect(nextRun.mock.calls.filter(([request]) => request.task.includes(newer.id))).toHaveLength(1);
+    expect(queue(actor.sessionFile!)).toEqual([]);
+    expect(next.status(actor.id).activationBlocked).toBeUndefined();
+  });
+
+  it("P2: a failed hard-preparation queue checkpoint holds the original zero-attempt item after owner recreation", async () => {
+    let unavailable = false;
+    let failQueueWrites = false;
+    let acceptedBytes = "";
+    let queueFile = "";
+    let sessionFile = "";
+    let durableFailures = 0;
+    const failedWrites: string[] = [];
+    const { actors, agents, mesh, root } = setup({ preparationRetryMs: 5, resolvePiModel: async model => {
+      if (unavailable) {
+        queueFile = path.join(path.dirname(sessionFile), fs.readdirSync(path.dirname(sessionFile))
+          .find(file => file.startsWith("queue-") && file.endsWith(".json"))!);
+        acceptedBytes = fs.readFileSync(queueFile, "utf8");
+        failQueueWrites = true; // Arm only AFTER durable subscription acceptance and before requeue.
+        throw new Error("model no longer available");
+      }
+      return model;
+    } });
+    const actor = await create(actors);
+    sessionFile = actor.sessionFile!;
+    // Fail the real atomic queue write only; registry and cursor writes stay real.
+    const open = fs.openSync;
+    const fault = vi.spyOn(fs, "openSync").mockImplementation((file, flags, mode) => {
+      const name = String(file);
+      if (failQueueWrites && name.startsWith(`${queueFile}.`) && flags === "w") {
+        failedWrites.push(name);
+        durableFailures++;
+        throw Object.assign(new Error("injected queue-directory EACCES at hard-preparation requeue"), { code: "EACCES" });
+      }
+      return open(file, flags, mode);
+    });
+    // Soft finally/monitor checkpoints must see the same unavailable queue directory,
+    // or they could heal the durable requeue failure before owner recreation.
+    const write = fs.writeFileSync;
+    const softFault = vi.spyOn(fs, "writeFileSync").mockImplementation((file, data, options) => {
+      if (failQueueWrites && typeof file === "string" && file.startsWith(`${queueFile}.`)) {
+        failedWrites.push(file);
+        throw Object.assign(new Error("injected queue-directory EACCES during soft checkpoint"), { code: "EACCES" });
+      }
+      return write(file, data, options);
+    });
+    const runBefore = vi.spyOn(agents, "run");
+    unavailable = true;
+    const done = settled(actors, actor.id, () => failedWrites.length > 0);
+    const event = await publish(mesh, { finding: "P2" });
+    await done;
+    expect(durableFailures).toBeGreaterThan(0);
+    expect(failedWrites.length).toBeGreaterThanOrEqual(durableFailures);
+    expect(fs.readFileSync(queueFile, "utf8")).toBe(acceptedBytes);
+    const original = queue(actor.sessionFile!);
+    expect(original).toEqual([expect.objectContaining({ payload: expect.objectContaining({ id: event.id }),
+      attempts: 0, preparationAttempts: 0 })]);
+    expect(runBefore).not.toHaveBeenCalled();
+    const persisted = JSON.parse(fs.readFileSync(path.join(root, "actors", "actors.json"), "utf8"));
+    expect(persisted.actors.find((row: { id: string }) => row.id === actor.id)).toMatchObject({
+      rootId: "session:veto-retention", activationBlocked: { class: "hard", code: "failing-preparation" },
+    });
+    expect(JSON.parse(fs.readFileSync(path.join(root, "cursor.json"), "utf8")).last.sequence)
+      .toBeGreaterThanOrEqual(event.sequence);
+    await actors.close();
+    await agents.close();
+    expect(fs.readFileSync(queueFile, "utf8")).toBe(acceptedBytes);
+    fault.mockRestore();
+    softFault.mockRestore();
+    const nextAgents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "runs"),
+    });
+    const run = vi.spyOn(nextAgents, "run");
+    const next = new ActorManager("veto-retention", { id: "session:veto-retention", name: "main", kind: "main" }, mesh,
+      { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, nextAgents, () => {}, {
+        actorRoot: path.join(root, "actors"), meshCursorPath: path.join(root, "cursor.json"), persistent: true,
+        meshRetentionSweepPath: false, preparationRetryMs: 5, resolvePiModel: async model => model,
+      });
+    cleanups.push(async () => { await next.close(); await nextAgents.close(); });
+    await pause(150);
+    expect(run).not.toHaveBeenCalled();
+    expect(queue(actor.sessionFile!)).toEqual(original);
+    expect(next.status(actor.id)).toMatchObject({ queued: 1,
+      activationBlocked: { class: "hard", code: "failing-preparation" } });
+    const recovered = settled(next, actor.id, () => outputs(next, actor.id).length === 2);
+    await next.ask(actor.id, "healthy explicit P2 recovery probe");
+    await recovered;
+    await pause(50);
+    expect(run).toHaveBeenCalledTimes(2);
+    expect(run.mock.calls[0]![0].task).toContain("healthy explicit P2 recovery probe");
+    expect(run.mock.calls[0]![0].task).not.toContain(event.id);
+    expect(run.mock.calls.filter(([request]) => request.task.includes(event.id))).toHaveLength(1);
+    expect(queue(actor.sessionFile!)).toEqual([]);
+    expect(next.status(actor.id).activationBlocked).toBeUndefined();
+  });
+
   it.each(["text", "directive"] as const)("keeps a real launched %s failure terminal across reset (no event replay)", async responseMode => {
     const { actors, agents, mesh } = setup({ preparationRetryMs: 5 });
     const actor = await create(actors, responseMode);

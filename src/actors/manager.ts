@@ -742,11 +742,11 @@ export class ActorPreparationTimeoutError extends ActorPreparationError {
   }
 }
 
-/** Only known preparation deadlines/deferred mesh writes and registry vetoes may expire.
- * Keep the typed veto distinct: it committed nothing, but is not a timeout. */
+/** Only known preparation deadlines/deferred mesh writes and registry-phase vetoes may expire.
+ * A typed veto from binding or another phase is not registry retry authority. */
 const preparationFailureKind = (error: unknown): true | "timeout" | ActorRegistryUpdateVetoedError => {
   for (let cause: unknown = error, depth = 0; cause instanceof Error && depth < 4; cause = cause.cause, depth++) {
-    if (cause instanceof ActorRegistryUpdateVetoedError) return cause;
+    if (cause instanceof ActorRegistryUpdateVetoedError && error instanceof ActorPreparationError && error.phase === "registry") return cause;
     if (cause instanceof ActorPreparationTimeoutError || cause instanceof AgentLaunchPreparationTimeoutError || Boolean(isMeshWriteDeferred(cause))) return "timeout";
   }
   return true;
@@ -4618,8 +4618,11 @@ export class ActorManager {
 
   #preparationHeadReady(actor: ManagedActor): boolean {
     const head = actor.queue[0];
-    if (!head || head.resolve || head.reject || !((head.preparationAttempts ?? 0) > 0) ||
-        !actor.activationBlocked || activationBlockClass(actor.activationBlocked.code) !== "hard") return true;
+    if (!head || head.resolve || head.reject ||
+        !actor.activationBlocked || activationBlockClass(actor.activationBlocked.code) !== "hard" ||
+        (!((head.preparationAttempts ?? 0) > 0) && actor.activationBlocked.code !== "failing-preparation")) return true;
+    // A failed queue checkpoint can leave zero attempts on disk while the hard
+    // preparation block committed separately. That block still holds callerless work.
     // Confirmed-unlaunched work stays in custody until an explicit reset or a
     // successful caller-owned probe. New callerless input must not clear its block.
     // Asks bypass batching, so a probe cannot absorb the retained observations.

@@ -25,6 +25,18 @@ describe("registry veto activation classification (smarty-dev#11998)", () => {
     }
   });
 
+  it.each(["binding", "presence", "validity", "capabilities", "capability-release", "launch"])(
+    "does not migrate a non-registry preparation wrapper (%s) into registry veto authority", phase => {
+      for (const prefix of ["", "Error: ", "ActorPreparationError: "]) {
+        const lastError = `${prefix}Actor abc-123 preparation (${phase}): ${veto}`;
+        for (const preparation of [false, true]) {
+          const result = classifyActivationFailure({ lastError, preparation, persistedRegistryVeto: "legacy" });
+          expect(result).toMatchObject({ code: preparation ? "failing-preparation" : "unknown", transient: false });
+          expect(activationBlockClass(result.code)).toBe("hard");
+        }
+      }
+    });
+
   it.each([
     ["Actor private-id preparation (registry): " + veto, "caller-validation"],
     ["actor registry validation veto (ownership)", "ownership"],

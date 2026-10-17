@@ -89,7 +89,8 @@ vi.mock("../src/mesh/store.js", async importOriginal => {
       const value = input.value as Record<string, unknown>;
       const local = this.root.includes("control-seen");
       if (local) expect(value).toHaveProperty("acceptance"); // No private pre-handler claim.
-      const stage = local ? "outcome" : value.acceptance ? "expired-claim" : "shared-claim";
+      else expect(value).not.toHaveProperty("acceptance"); // Expiry uses the same bare shared claim.
+      const stage = local ? "outcome" : "shared-claim";
       attempt(stage);
       const prior = this.state.entries.get(input.key);
       if (input.ifVersion !== undefined && input.ifVersion !== (prior?.version ?? 0)) throw new Error("recorded version conflict");
@@ -206,9 +207,13 @@ it.each(errors)("file-copy %s unwinds deferred publication, but keeps single-key
 });
 
 const controlErrors = errors.filter(([name]) => name !== "legacy");
-const controlCases = ["shared-claim", "outcome", "ack", "expired-claim"] as const;
-it.each(controlCases.flatMap(stage => controlErrors.map(([name, makeError]) => ({ stage, name, makeError }))))(
-  "control $stage retains $name work and retries without re-executing a completed handler", async ({ stage, name, makeError }) => {
+const controlStages = ["shared-claim", "outcome", "ack"] as const;
+const controlCases = [false, true].flatMap(expired =>
+  controlStages.flatMap(stage =>
+    controlErrors.map(([name, makeError]) => ({ expired, stage, name, makeError }))));
+it.each(controlCases)(
+  "control $stage expired=$expired retains $name work without re-executing a completed handler",
+  async ({ expired, stage, name, makeError }) => {
     const mesh = new RecordedStore(root, 65_536, 100);
     const plane = new FabricControlPlane(mesh, identity, { enabled: true, hostId: identity.id,
       pollMs: 20, acknowledgementTimeoutMs: 1_000, ownerIncarnation: "recorded:epoch" });
@@ -217,36 +222,38 @@ it.each(controlCases.flatMap(stage => controlErrors.map(([name, makeError]) => (
     const now = Date.now();
     state.events.push({ id: "command", sequence: 1, topic: "fabric.control.command", kind: "steer",
       createdAt: now, verification: "mesh", from: { id: "sender", name: "sender", kind: "main" }, to: identity.id,
-      data: { version: 1, commandId: "command", targetId: "actor:recorded", operation: stage === "outcome" || stage === "ack" ? "ask" : "steer", replyTo: "sender",
-        ownerIncarnation: plane.incarnation, requestedAt: now - (stage === "expired-claim" ? 100 : 0),
-        deadlineAt: now + (stage === "expired-claim" ? -1 : 10_000) } } as MeshEvent);
+      data: { version: 1, commandId: "command", targetId: "actor:recorded",
+        operation: stage === "outcome" || stage === "ack" ? "ask" : "steer", replyTo: "sender",
+        ownerIncarnation: plane.incarnation, requestedAt: now - (expired ? 100 : 0),
+        deadlineAt: now + (expired ? -1 : 10_000) } } as MeshEvent);
     const handler = vi.fn(() => ({ accepted: true, messageId: "delivered-once" }));
     io.failure = { stage, error: makeError() };
-    plane.start(handler); // only recorded store/watch ports, never a process/service start
+    plane.start(handler);
     await vi.advanceTimersByTimeAsync(0);
     const acks = () => state.events.filter(event => event.topic === "fabric.control.ack");
-    if (stage === "outcome") {
-      const seen = [...io.stores.entries()].find(([store]) => store.includes("control-seen"))![1];
-      expect([...seen.entries.values()]).toEqual([]);
-      expect(acks()).toEqual([]); // Completed in memory is not a durable acceptance.
-    }
+    const seen = [...io.stores.entries()].find(([store]) => store.includes("control-seen"))![1];
+    expect(io.failure).toBeUndefined(); // Every injected stage must actually execute.
+    expect(acks()).toEqual([]);
+    expect(handler).toHaveBeenCalledTimes(!expired && stage !== "shared-claim" ? 1 : 0);
+    expect(io.calls.filter(call => call === stage)).toHaveLength(1);
+    if (stage === "outcome") expect([...seen.entries.values()]).toEqual([]);
+    if (stage === "ack") expect([...seen.entries.values()]).toEqual([
+      expect.objectContaining({ value: expect.objectContaining({ acceptance: expect.objectContaining(
+        expired ? { accepted: false, notRun: true } : { accepted: true, messageId: "delivered-once" }) }) }),
+    ]);
     if (name !== "permanent") {
-      expect(acks()).toEqual([]);
-      expect(handler).toHaveBeenCalledTimes(stage === "outcome" || stage === "ack" ? 1 : 0);
-      expect(io.calls.filter(call => call === stage)).toHaveLength(1);
-      // Detached no-write refusals use bounded generic backoff, not timeout-only accounting.
       await vi.advanceTimersByTimeAsync(100);
       expect(io.calls.filter(call => call === stage)).toHaveLength(2);
       expect(acks()).toHaveLength(1);
-      expect(acks()[0]!.data).toMatchObject(stage === "expired-claim"
-        ? { accepted: false, notRun: true } : { accepted: true, messageId: "delivered-once" });
-      expect(handler).toHaveBeenCalledTimes(stage === "expired-claim" ? 0 : 1);
+      expect(acks()[0]!.data).toMatchObject(expired
+        ? { accepted: false, notRun: true, error: "Fabric control command expired" }
+        : { accepted: true, messageId: "delivered-once" });
+      expect(handler).toHaveBeenCalledTimes(expired ? 0 : 1);
     } else {
       await vi.advanceTimersByTimeAsync(20);
       expect(io.calls.filter(call => call === stage)).toHaveLength(1);
-      expect(handler).toHaveBeenCalledTimes(stage === "outcome" || stage === "ack" ? 1 : 0);
-      expect(acks()).toHaveLength(stage === "expired-claim" ? 1 : 0);
-      if (stage === "expired-claim") expect(acks()[0]!.data).toMatchObject({ accepted: false });
+      expect(handler).toHaveBeenCalledTimes(!expired && stage !== "shared-claim" ? 1 : 0);
+      expect(acks()).toEqual([]);
     }
     plane.pause();
   });

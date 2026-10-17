@@ -460,6 +460,62 @@ describe("saved steer/followUp ACK obligations (#9751)", () => {
     } finally { spy.mockRestore(); warn.mockRestore(); }
   });
 
+  // Keep reason: concurrent FILE outcome custody must not turn distinct messages into expiry/resends.
+  it("C4: concurrent followUps retain results and accept every original attempt after one serialization fault", { timeout: 30_000 }, async () => {
+    const storeOptions: MeshStoreOptions = { stateBackend: "sqlite", lockProtocol: 1, lockTimeoutMs: 5_000 };
+    const f = setup({ acknowledgementTimeoutMs: 5_000 }, storeOptions);
+    const sender = plane(f.meshRoot, senderId, storeOptions, { acknowledgementTimeoutMs: 5_000, pollMs: 20 });
+    const keys = Array.from({ length: 20 }, (_, index) => `concurrent:${index}`);
+    const rows = new Map(keys.map(key => [key, { runs: 0, serializations: 0, faults: 0 }]));
+    f.owner.start(command => {
+      const row = rows.get(command.message!)!;
+      row.runs++;
+      let serializations = 0;
+      return { accepted: true, messageId: command.commandId, result: {
+        toJSON() {
+          row.serializations++;
+          if (++serializations === 2) {
+            row.faults++;
+            throw new Error("one transient second-serialization failure");
+          }
+          return { revision: 1 };
+        },
+      } };
+    });
+    sender.start(() => ({ accepted: false }));
+    // Real FILE watchers and subsequent command/ACK publications may wake retained saves.
+    // No synthetic wakes, clock changes, manual resends or enlarged request budgets.
+    const outcomes = await Promise.allSettled(keys.map(message => sender.request(ownerId, "agent:same", "followUp",
+      { message, ownerIncarnation: f.owner.incarnation }, ownerId,
+      { timeoutMs: 5_000, idempotencyKey: message, routedRemoteHost: null })));
+    const commands = f.mesh.read({ topic: "fabric.control.command", limit: 1_000 })
+      .filter(event => event.from.id === senderId && event.to === ownerId)
+      .map(event => event.data as FabricControlCommand);
+    expect(commands).toHaveLength(20); // Counts real CONTROL publications, including any automatic resend.
+    expect(commands.map(command => command.message).sort()).toEqual([...keys].sort());
+    expect(f.own.stateBackend).toBe("file");
+    expect(f.own.listAll("topology/control-seen/", { fresh: true })).toHaveLength(20);
+    for (const [index, message] of keys.entries()) {
+      const command = commands.find(command => command.message === message)!;
+      expect(command.operation).toBe("followUp");
+      expect(f.mesh.get(seenKey(command.commandId), { fresh: true })?.value).toMatchObject({
+        hostId: ownerId, commandId: command.commandId, targetId: "agent:same", ownerIncarnation: f.owner.incarnation,
+      });
+      expect(f.saved(command.commandId)).toMatchObject({ acceptance: {
+        accepted: true, messageId: command.commandId, result: { revision: 1 },
+      } });
+      const acks = f.acks(command.commandId);
+      expect(acks.length).toBeGreaterThan(0); // Replay ACKs are legitimate; they must all carry the same saved success.
+      for (const ack of acks) expect(ack).toMatchObject({ from: { id: ownerId }, to: senderId,
+        data: { commandId: command.commandId, targetId: "agent:same", ownerIncarnation: f.owner.incarnation,
+          accepted: true, messageId: command.commandId, result: { revision: 1 } },
+      });
+      expect(outcomes[index]).toMatchObject({ status: "fulfilled", value: { acknowledged: true, messageId: command.commandId } });
+      expect(rows.get(message)).toMatchObject({ runs: 1, faults: 1 });
+      expect(rows.get(message)!.serializations).toBeGreaterThan(2);
+    }
+  });
+
   it("9751: transient second serialization failure retains completed-result custody without handler replay", async () => {
     const f = setup();
     let serializations = 0;
@@ -2544,6 +2600,46 @@ describe("FabricControlPlane", () => {
       expect(receive.mock.calls.length + olderRuns).toBe(1);
       expect(store.get(seenKey("host:receiver", "command:paused"))).toBeDefined();
     }, 60_000);
+
+    // C3 KEEP: original-sequence reclamation cannot fence an already-admitted legacy runtime.
+    it("keeps the shared legacy admission fence when only a later same-command copy remains replayable", async () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-republished-fence-")); roots.push(root);
+      const meshRoot = path.join(root, "mesh"), id = "command:republished", start = Date.now();
+      const storeOptions = { maxEventLogBytes: 80_000, retainedEventLogBytes: 40_000, maxStateTombstones: 2 };
+      const store = new MeshStore(meshRoot, 64 * 1024, 1_000, storeOptions);
+      const receiver = plane(meshRoot, "host:receiver", storeOptions);
+      const wire = { ...command(id, "host:receiver", receiver.incarnation).data, deadlineAt: start + 16 * 60_000 };
+      const original = await store.publish({ ...command(id, "host:receiver"), data: wire });
+      const older = olderRuntimeAdmits(store, id); // pre-phase-1 admission passed; paused before shared CAS
+      expect(older.checked).toBe(true);
+      const receive = vi.fn(() => ({ accepted: true, messageId: "saved:original" }));
+      receiver.start(receive);
+      await vi.waitFor(() => expect(ackFor(store, id)?.data).toMatchObject({ messageId: "saved:original" }));
+      await receiver.close();
+      for (let index = 0; index < 100; index++) await store.publish({ topic: "compact", from: identity("host:noise"), text: "x".repeat(900) });
+      expect(store.oldestSequence()).toBeGreaterThan(original.sequence);
+      const duplicate = await store.publish({ ...command(id, "host:receiver"), data: wire }); // identical old wire times
+      const restarted = plane(meshRoot, "host:receiver", storeOptions);
+      const now = Date.now;
+      let offset = 16 * 60_000 + 3_000;
+      vi.spyOn(Date, "now").mockImplementation(() => now() + offset);
+      const replayHandler = vi.fn(() => ({ accepted: true }));
+      restarted.start(replayHandler);
+      await vi.waitFor(() => expect(ackFor(store, id)?.data).toMatchObject({ messageId: "saved:original" }));
+      offset += 16 * 60_000; // ACK custody settled; drive an eligible maintenance drain, not an idle timer
+      await store.publish({ topic: "maintenance", from: identity("host:noise") });
+      const key = seenKey("host:receiver", id);
+      await vi.waitFor(() => expect(ownStore(meshRoot, "host:receiver").get(key, { fresh: true })).toBeUndefined());
+      await restarted.close(); // join the whole maintenance drain, not merely its first private delete
+      expect(store.read({ topic: "fabric.control.command", limit: 100 }).map(event => event.sequence)).toContain(duplicate.sequence);
+      expect(store.get(CONTROL_CLAIMS_POLICY_KEY)).toBeUndefined();
+      for (let index = 0; index < 3; index++) await store.writeBatch({ identity: identity("host:noise"), ops: [
+        { kind: "put", key: `noise/${index}`, value: index }, { kind: "delete", key: `noise/${index}` },
+      ] }); // evict the bounded CAS tombstone without touching the retained duplicate event
+      expect(await older.claim()).toBe(false); // old code has no post-CAS deadline fence: a win would run twice
+      expect(receive).toHaveBeenCalledTimes(1);
+      expect(replayHandler).not.toHaveBeenCalled();
+    });
 
     it("are deleted only once expired and their command has left the log", async () => {
       const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-"));

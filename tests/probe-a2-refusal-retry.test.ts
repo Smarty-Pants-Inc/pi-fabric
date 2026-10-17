@@ -121,6 +121,182 @@ const releaseFixture = () => {
   return { release, metadata, writeMetadata, chunk: path.join(release, "dist/chunks/nested/optional.js") };
 };
 const probeModule = () => import(`../scripts/${"probe-a2-refusal-retry"}.mjs`);
+type CleanupFailure = { step: string; error: unknown };
+type CleanupStopper = { stop: () => unknown };
+type CleanupProbeInput = {
+  receiver: CleanupStopper;
+  sender?: CleanupStopper;
+  readResidue: () => { participants: number; named: number };
+  removeScratch: () => unknown;
+  failure: unknown;
+};
+
+const createTraceTestRoots = () => {
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-a2-trace-retention-"));
+  roots.push(parent);
+  const scratch = path.join(parent, "scratch");
+  const stateHome = path.join(parent, "state-home");
+  fs.mkdirSync(scratch);
+  return { parent, scratch, stateHome };
+};
+
+const writeSyntheticRoleSessions = (traceRoot: string) => {
+  const content = '{"type":"synthetic-test-session","id":"not-a-real-agent"}\n';
+  const files = ["receiver", "sender"].map(role => {
+    const roleDirectory = path.join(traceRoot, role);
+    fs.mkdirSync(roleDirectory, { recursive: true, mode: 0o700 });
+    const file = path.join(roleDirectory, "synthetic-session.jsonl");
+    fs.writeFileSync(file, content, { mode: 0o600 });
+    return { file, content };
+  });
+  return files;
+};
+
+describe("A2 probe trace retention", () => {
+  it("uses XDG_STATE_HOME before HOME, creates distinct trace directories, and rejects relative state homes", async () => {
+    const { createTraceDirectory } = await probeModule();
+    const { parent, stateHome } = createTraceTestRoots();
+    const home = path.join(parent, "home");
+    const env = { HOME: home, XDG_STATE_HOME: stateHome };
+    const first = createTraceDirectory(env);
+    const second = createTraceDirectory(env);
+
+    expect(first).toBe(path.join(stateHome, "pi-fabric-a2probe", "sessions", path.basename(first)));
+    expect(path.dirname(first)).toBe(path.dirname(second));
+    expect(path.basename(first)).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+    expect(first).not.toBe(second);
+    expect(fs.statSync(first).isDirectory()).toBe(true);
+    if (process.platform !== "win32") expect(fs.statSync(first).mode & 0o777).toBe(0o700);
+
+    const fallback = createTraceDirectory({ HOME: home });
+    expect(fallback).toBe(path.join(home, ".local", "state", "pi-fabric-a2probe", "sessions", path.basename(fallback)));
+    expect(() => createTraceDirectory({ HOME: home, XDG_STATE_HOME: "relative-state" })).toThrow(/absolute|relative/i);
+  });
+
+  it.each([
+    ["receiver stop rejects", true],
+    ["all cleanup steps succeed", false],
+  ] as const)("keeps synthetic receiver and sender sessions after scratch removal when %s", async (_scenario, rejectReceiver) => {
+    const { createTraceDirectory, cleanupProbe, finalVerdict } = await probeModule();
+    const { scratch, stateHome } = createTraceTestRoots();
+    const traceRoot = createTraceDirectory({ HOME: path.join(path.dirname(stateHome), "home"), XDG_STATE_HOME: stateHome });
+    const sessions = writeSyntheticRoleSessions(traceRoot);
+    fs.writeFileSync(path.join(scratch, "scratch-only-marker"), "must be deleted");
+    const receiverError = new Error("receiver stop failed");
+    const receiver: CleanupStopper = {
+      stop: (): void => { if (rejectReceiver) throw receiverError; },
+    };
+    const sender: CleanupStopper = { stop: (): void => {} };
+    const readResidue: CleanupProbeInput["readResidue"] = () => ({ participants: 0, named: 0 });
+    const removeScratch: CleanupProbeInput["removeScratch"] = () => fs.rmSync(scratch, { recursive: true, force: true });
+    const input: CleanupProbeInput = { receiver, sender, readResidue, removeScratch, failure: undefined };
+    const result = await cleanupProbe(input);
+
+    expect(fs.existsSync(scratch)).toBe(false);
+    expect(fs.existsSync(traceRoot)).toBe(true);
+    for (const { file, content } of sessions) {
+      expect(fs.readFileSync(file, "utf8")).toBe(content);
+    }
+    if (rejectReceiver) {
+      expect(result.failure).toBe(receiverError);
+      expect(result.failures.map(({ step }: CleanupFailure) => step)).toEqual(["receiver stop"]);
+      expect(finalVerdict(result.failure)).toBe("FAIL");
+    } else {
+      expect(result).toEqual({ failure: undefined, residue: 0, failures: [] });
+      expect(finalVerdict(result.failure)).toBe("PASS");
+    }
+  });
+});
+
+describe("A2 probe cleanup", () => {
+  it("attempts every cleanup step in order, keeps the first error, and removes its private scratch root", async () => {
+    const { cleanupProbe, finalVerdict } = await probeModule();
+    const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-a2-cleanup-"));
+    roots.push(scratch);
+    const marker = path.join(scratch, "private-marker");
+    fs.writeFileSync(marker, "owned by this test");
+    const receiverError = new Error("receiver stop failed");
+    const senderError = new Error("sender stop failed");
+    const order: string[] = [];
+    const receiver: CleanupStopper = { stop: async (): Promise<void> => { order.push("receiver stop"); throw receiverError; } };
+    const sender: CleanupStopper = { stop: async (): Promise<void> => { order.push("sender stop"); throw senderError; } };
+    const readResidue: CleanupProbeInput["readResidue"] = () => { order.push("residue check"); return { participants: 1, named: 2 }; };
+    const removeScratch: CleanupProbeInput["removeScratch"] = () => { order.push("scratch removal"); fs.rmSync(scratch, { recursive: true }); };
+    const input: CleanupProbeInput = { receiver, sender, readResidue, removeScratch, failure: undefined };
+    const result = await cleanupProbe(input);
+
+    expect(order).toEqual(["receiver stop", "sender stop", "residue check", "scratch removal"]);
+    expect(fs.existsSync(scratch)).toBe(false);
+    expect(result.failure).toBe(receiverError);
+    expect(result.residue).toBe(3);
+    expect(result.failures.map(({ step }: CleanupFailure) => step)).toEqual(["receiver stop", "sender stop", "residue check"]);
+    expect(result.failures.map(({ error }: CleanupFailure) => error)).toEqual([receiverError, senderError, expect.any(Error)]);
+    expect(result.failures[2]?.error).toMatchObject({ message: expect.stringContaining("probe residue") });
+    expect(finalVerdict(result.failure)).toBe("FAIL");
+  });
+
+  it("passes after successful cleanup, including when no sender exists", async () => {
+    const { cleanupProbe, finalVerdict } = await probeModule();
+    const order: string[] = [];
+    const receiver: CleanupStopper = { stop: (): void => { order.push("receiver stop"); } };
+    const readResidue: CleanupProbeInput["readResidue"] = () => { order.push("residue check"); return { participants: 0, named: 0 }; };
+    const removeScratch: CleanupProbeInput["removeScratch"] = () => { order.push("scratch removal"); };
+    const input: CleanupProbeInput = { receiver, readResidue, removeScratch, failure: undefined };
+    const result = await cleanupProbe(input);
+
+    expect(order).toEqual(["receiver stop", "residue check", "scratch removal"]);
+    expect(result).toEqual({ failure: undefined, residue: 0, failures: [] });
+    expect(finalVerdict(result.failure)).toBe("PASS");
+  });
+
+  it.each(["sender stop", "residue check", "scratch removal"] as const)(
+    "continues later cleanup operations when %s fails",
+    async failedStep => {
+      const { cleanupProbe } = await probeModule();
+      const failure = new Error(`${failedStep} failed`);
+      const order: string[] = [];
+      const receiver: CleanupStopper = { stop: (): void => { order.push("receiver stop"); } };
+      const sender: CleanupStopper = { stop: (): void => { order.push("sender stop"); if (failedStep === "sender stop") throw failure; } };
+      const readResidue: CleanupProbeInput["readResidue"] = () => {
+        order.push("residue check");
+        if (failedStep === "residue check") throw failure;
+        return { participants: 0, named: 0 };
+      };
+      const removeScratch: CleanupProbeInput["removeScratch"] = () => { order.push("scratch removal"); if (failedStep === "scratch removal") throw failure; };
+      const input: CleanupProbeInput = { receiver, sender, readResidue, removeScratch, failure: undefined };
+      const result = await cleanupProbe(input);
+
+      expect(order).toEqual(["receiver stop", "sender stop", "residue check", "scratch removal"]);
+      expect(result.failure).toBe(failure);
+      expect(result.failures.map(({ step }: CleanupFailure) => step)).toEqual([failedStep]);
+    },
+  );
+
+  it("keeps an existing primary failure while reporting every cleanup failure", async () => {
+    const { cleanupProbe, finalVerdict } = await probeModule();
+    const primary = new Error("probe stage failed");
+    const receiverError = new Error("receiver stop failed");
+    const senderError = new Error("sender stop failed");
+    const residueError = new Error("residue read failed");
+    const scratchError = new Error("scratch removal failed");
+    const receiver: CleanupStopper = { stop: (): never => { throw receiverError; } };
+    const sender: CleanupStopper = { stop: (): never => { throw senderError; } };
+    const readResidue: CleanupProbeInput["readResidue"] = (): never => { throw residueError; };
+    const removeScratch: CleanupProbeInput["removeScratch"] = (): never => { throw scratchError; };
+    const input: CleanupProbeInput = { receiver, sender, readResidue, removeScratch, failure: primary };
+    const result = await cleanupProbe(input);
+
+    expect(result.failure).toBe(primary);
+    expect(result.residue).toBe(-1);
+    expect(result.failures.map(({ step, error }: CleanupFailure) => [step, error])).toEqual([
+      ["receiver stop", receiverError],
+      ["sender stop", senderError],
+      ["residue check", residueError],
+      ["scratch removal", scratchError],
+    ]);
+    expect(finalVerdict(result.failure)).toBe("FAIL");
+  });
+});
 
 describe("A2 installed release provenance", () => {
   it("requires an explicit --release before starting Pi and prints only a FAIL receipt", () => {

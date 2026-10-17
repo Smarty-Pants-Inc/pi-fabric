@@ -12,11 +12,11 @@
 // It retries once more with K and checks one accepted receiver message, no duplicate.
 // It reads command/ACK events with mesh.read; it never opens or writes mesh storage.
 // It publishes one a2probe result event for the probe's own topic.
-// Teardown stops only the two probe Pi processes and removes their private scratch root.
+// Teardown stops only the two probe Pi processes and removes scratch, never durable traces.
 // The release is not modified; pass --release to the installed release directory.
 // Identity: prefer RELEASE.json commit+dist hashes; else realpath must be releases/<sha>.
 // Run after install with the same host/user that owns the installed Pi runtime.
-// Output is exactly one operator receipt line with measured elapsed milliseconds.
+// Output is one operator receipt line with measured elapsed milliseconds and durable traces=.
 // A failed stage exits nonzero and prints its diagnostic only on stderr.
 
 import fs from "node:fs";
@@ -30,7 +30,33 @@ const self = fileURLToPath(import.meta.url);
 const repo = path.resolve(path.dirname(self), "..");
 const sleep = ms => new Promise(resolve => setTimeout(resolve, Math.max(0, ms)));
 const hash = value => createHash("sha256").update(value).digest("hex");
+let fatalTrace = "unknown";
 export const finalVerdict = failure => failure ? "FAIL" : "PASS";
+
+export const createTraceDirectory = (env = process.env) => {
+  const stateHome = env.XDG_STATE_HOME || path.join(env.HOME || os.homedir(), ".local", "state");
+  if (!path.isAbsolute(stateHome)) throw new Error("XDG_STATE_HOME/state home must be absolute");
+  const traceRoot = path.join(stateHome, "pi-fabric-a2probe", "sessions", randomUUID());
+  fs.mkdirSync(traceRoot, { recursive: true, mode: 0o700 });
+  return traceRoot;
+};
+
+export const cleanupProbe = async ({ receiver, sender, readResidue, removeScratch, failure }) => {
+  let residue = -1;
+  const failures = [];
+  try { await receiver.stop(); }
+  catch (error) { failures.push({ step: "receiver stop", error }); failure ??= error; }
+  try { await sender?.stop(); }
+  catch (error) { failures.push({ step: "sender stop", error }); failure ??= error; }
+  try {
+    const observedResidue = await readResidue();
+    residue = observedResidue.participants + observedResidue.named;
+    if (residue !== 0) throw new Error(`probe residue remains: participants=${observedResidue.participants} named=${observedResidue.named}`);
+  } catch (error) { failures.push({ step: "residue check", error }); failure ??= error; }
+  try { await removeScratch(); }
+  catch (error) { failures.push({ step: "scratch removal", error }); failure ??= error; }
+  return { failure, residue, failures };
+};
 
 // Prefer commit/files metadata; legacy installs use the installer's /releases/<sha> addressing.
 export const verifyRelease = (release, expectedSha) => {
@@ -113,16 +139,16 @@ export const parse = argv => {
 };
 
 class Rpc {
-  constructor(options, scratch, meshRoot, role, sessionFile, name) {
-    this.options = options; this.scratch = scratch; this.meshRoot = meshRoot; this.role = role; this.sessionFile = sessionFile; this.name = name;
+  constructor(options, scratch, meshRoot, traces, role, sessionFile, name) {
+    this.options = options; this.scratch = scratch; this.meshRoot = meshRoot; this.traces = traces; this.role = role; this.sessionFile = sessionFile; this.name = name;
     this.events = []; this.pending = new Map(); this.serial = 0; this.buffer = ""; this.stderr = ""; this.child = undefined;
   }
   async start() {
-    const profile = path.join(this.scratch, `${this.role}-profile`), cwd = path.join(this.scratch, `${this.role}-cwd`), home = path.join(this.scratch, `${this.role}-home`);
-    for (const directory of [profile, cwd, home, path.join(profile, "sessions")]) fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+    const profile = path.join(this.scratch, `${this.role}-profile`), cwd = path.join(this.scratch, `${this.role}-cwd`), home = path.join(this.scratch, `${this.role}-home`), sessionDir = path.join(this.traces, this.role);
+    for (const directory of [profile, cwd, home, sessionDir]) fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
     fs.writeFileSync(path.join(profile, "fabric.json"), JSON.stringify({ fullCodeMode: true, prewalk: { enabled: false }, agents: { notifyOnComplete: false }, mesh: { enabled: true, announce: true, maxEventBytes: 65536, followUpFlushMs: 1 }, executor: { kernel: "typescript", timeoutMs: 120000 }, approvals: { read: "allow", write: "allow", exec: "allow", agent: "allow" } }));
     fs.writeFileSync(path.join(profile, "settings.json"), JSON.stringify({ compaction: { enabled: false }, retry: { enabled: false } }));
-    const args = ["--mode", "rpc", "--offline", "--name", this.name, "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files", "--approve", "-e", this.options.entry, "-e", path.join(repo, "tests/fixtures/a2-probe-cli-provider.ts"), "--provider", "a2probe", "--model", "offline", "--thinking", "off", "--session-dir", path.join(profile, "sessions")];
+    const args = ["--mode", "rpc", "--offline", "--name", this.name, "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files", "--approve", "-e", this.options.entry, "-e", path.join(repo, "tests/fixtures/a2-probe-cli-provider.ts"), "--provider", "a2probe", "--model", "offline", "--thinking", "off", "--session-dir", sessionDir];
     if (this.sessionFile) args.push("--session", this.sessionFile);
     const env = { PATH: process.env.PATH, HOME: home, TMPDIR: this.scratch, PI_CODING_AGENT_DIR: profile, PI_OFFLINE: "1", PI_FABRIC_MESH_ROOT: this.meshRoot, SMARTY_ROLE_PI_BINARY: process.env.SMARTY_ROLE_PI_BINARY };
     const piArgs = this.options.pi.endsWith(".js") ? [this.options.pi, ...args] : args;
@@ -181,17 +207,18 @@ const main = async () => {
   const started = performance.now();
   const inheritedTmp = process.env.TMPDIR;
   if (!inheritedTmp || !path.isAbsolute(inheritedTmp)) throw new Error("absolute TMPDIR is required");
+  const traces = createTraceDirectory(); fatalTrace = traces;
   const scratch = fs.mkdtempSync(path.join(inheritedTmp, "a2probe-")); fs.chmodSync(scratch, 0o700);
   const meshRoot = path.join(scratch, "mesh");
   const host = options.host, key = `a2probe-${host}-${randomUUID()}`;
   const targetName = `probe-receiver-${randomUUID()}`, message = `A2PROBE ${key}`, topic = `a2probe.${host}.${key}`;
-  const receiver = new Rpc(options, scratch, meshRoot, "receiver", undefined, targetName);
+  const receiver = new Rpc(options, scratch, meshRoot, traces, "receiver", undefined, targetName);
   let sender;
   let refusal = "unknown", before = -1, deliveries = -1, duplicates = -1, residue = -1, failure;
   try {
     const receiverState = await receiver.start();
     const receiverId = `session:${receiverState.sessionId}`;
-    sender = new Rpc(options, scratch, meshRoot, "sender", undefined, "probe-sender");
+    sender = new Rpc(options, scratch, meshRoot, traces, "sender", undefined, "probe-sender");
     await sender.start();
     const discovered = await sender.eval(`const rows = await agents.sessions(); return { rows };`);
     if (!discovered.rows.some(row => row.id === receiverId && row.name === targetName)) throw new Error("receiver did not become publicly discoverable under the probe name");
@@ -216,13 +243,13 @@ const main = async () => {
     if (before !== 0 || deliveries !== 1 || duplicates !== 0) throw new Error(`A2 counts failed: before=${before} deliveries=${deliveries} duplicates=${duplicates}`);
   } catch (error) { failure = error; }
   finally {
-    await receiver.stop(); await sender?.stop();
-    try {
-      const observedResidue = readResidue(meshRoot);
-      residue = observedResidue.participants + observedResidue.named;
-      if (residue !== 0) failure ??= new Error(`probe residue remains: participants=${observedResidue.participants} named=${observedResidue.named}`);
-    } catch (error) { failure ??= error; }
-    try { fs.rmSync(scratch, { recursive: true, force: true }); } catch (error) { failure ??= error; }
+    const cleanup = await cleanupProbe({
+      receiver, sender, failure,
+      readResidue: () => readResidue(meshRoot),
+      removeScratch: () => fs.rmSync(scratch, { recursive: true, force: true }),
+    });
+    ({ failure, residue } = cleanup);
+    for (const { step, error } of cleanup.failures) process.stderr.write(`A2PROBE cleanup ${step}: ${error?.stack ?? error}\n`);
   }
   try {
     const finalRelease = verifyRelease(options.release, options.releaseSha);
@@ -230,9 +257,9 @@ const main = async () => {
   } catch (error) { failure ??= error; }
   const verdict = finalVerdict(failure);
   const elapsed = Math.round(performance.now() - started);
-  const line = `A2PROBE host=${host} release=${options.releaseSha} identity=${options.identity} refusal=${refusal} events_before_retry=${before} deliveries_after_retry=${deliveries} dup_after_second_retry=${duplicates} residue=${residue} ${verdict} ${elapsed}ms`;
+  const line = `A2PROBE host=${host} release=${options.releaseSha} identity=${options.identity} traces=${traces} refusal=${refusal} events_before_retry=${before} deliveries_after_retry=${deliveries} dup_after_second_retry=${duplicates} residue=${residue} ${verdict} ${elapsed}ms`;
   process.stdout.write(line + "\n");
   if (failure) { process.stderr.write(`A2PROBE failure: ${failure.stack ?? failure}\n`); process.exitCode = 1; }
 };
 
-if (process.argv[1] && path.resolve(process.argv[1]) === self) main().catch(error => { process.stdout.write(`A2PROBE host=unknown release=unknown identity=unknown refusal=unknown events_before_retry=-1 deliveries_after_retry=-1 dup_after_second_retry=-1 residue=-1 FAIL 0ms\n`); process.stderr.write(`${error.stack ?? error}\n`); process.exitCode = 1; });
+if (process.argv[1] && path.resolve(process.argv[1]) === self) main().catch(error => { process.stdout.write(`A2PROBE host=unknown release=unknown identity=unknown traces=${fatalTrace} refusal=unknown events_before_retry=-1 deliveries_after_retry=-1 dup_after_second_retry=-1 residue=-1 FAIL 0ms\n`); process.stderr.write(`${error.stack ?? error}\n`); process.exitCode = 1; });

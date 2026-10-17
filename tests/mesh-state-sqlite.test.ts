@@ -597,10 +597,59 @@ describe("SqliteStateStore", () => {
     } finally { clearInterval(timer); }
     expect((await holder.done).code).toBe(0);
     expect(store.stats().busyRetries).toBeGreaterThan(0);
-    expect(store.stats().fifoJoins).toBeGreaterThan(0);
     expect(store.get("w/try")).toBeUndefined();
     expect(store.get("w/abort")).toBeUndefined();
   }, 60_000);
+
+  it("refuses a delayed retry but permits a free zero-budget first attempt", async () => {
+    const root = tempRoot("delayed-retry-deadline");
+    const setup = await open(root);
+    setup.close();
+    let begins = 0;
+    let holder: SqliteConnection | undefined = raw(root);
+    holder.exec("BEGIN IMMEDIATE");
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      holder?.exec("ROLLBACK");
+      holder?.close();
+      holder = undefined;
+    };
+    const store = await open(root, { open: file => {
+      const connection = openNodeSqlite(file);
+      return {
+        exec: (sql: string) => {
+          if (sql === "BEGIN IMMEDIATE") {
+            begins += 1;
+            try { connection.exec(sql); }
+            catch (error) {
+              const until = performance.now() + 80;
+              while (performance.now() < until) { /* delayed event-loop resume */ }
+              release();
+              throw error;
+            }
+            return;
+          }
+          connection.exec(sql);
+        },
+        prepare: (sql: string) => connection.prepare(sql),
+        close: () => connection.close(),
+        get isTransaction() { return connection.isTransaction; },
+      };
+    }});
+    try {
+      await expect(store.withTryLock(() => store.put({ key: "deadline/retry", value: 1, identity }), 20))
+        .rejects.toBeInstanceOf(MeshLockTimeoutError);
+      expect(begins).toBe(1);
+      expect(store.get("deadline/retry")).toBeUndefined();
+      expect(store.stats().writesWaiting).toBe(0);
+    } finally { release(); }
+    // Counterexample: the fixed deadline must not suppress the first native attempt.
+    await store.withTryLock(() => store.put({ key: "deadline/zero", value: 2, identity }), 0);
+    expect(begins).toBe(2);
+    expect(store.get("deadline/zero")?.value).toBe(2);
+  });
 
   it("kill -9 inside a write transaction rolls back and the kernel releases the lock", async () => {
     const root = tempRoot("crash");

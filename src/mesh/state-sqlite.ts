@@ -25,21 +25,10 @@
  * Acquisition (review-opus P1-1; the design's FULL measurement): `DatabaseSync` is synchronous, so
  * SQLite's own busy handler would freeze the caller's event loop and is unfair (sleep-and-poll with
  * growing sleeps). `busy_timeout` is clamped to <= 5 ms (default 2 ms); a busy `BEGIN IMMEDIATE` is
- * retried ASYNCHRONOUSLY with short jittered sleeps capped at 4 ms, and the waiter joins the existing advisory
- * `MeshLockTicket` FIFO (keyed on `state.db`, separate from the `.lock` queue) after `fifoAfterMs` (default 25 ms).
- * The FIFO head waits inside SQLite's busy handler for HEAD_BUSY_MS (5 ms: node:sqlite runs it synchronously, so it
- * is an event-loop stall, kept within the existing busy_timeout clamp) and re-polls after 1 ms. Ineligible non-heads
- * wake on their predecessor's receipt removal, with a 20 ms safety net for missed events and stalled-head checks.
- * Mixed releases (smarty-dev#10516): the default is the contest of the releases before pi-fabric#936 (8d0af4b0),
- * 25 ms without a ticket and then the FIFO, so on a shared store a writer does no worse than they do. Strict FIFO
- * (smarty-dev#9805: with `fifoAfterMs: 0` a newcomer that finds anyone queued takes its ticket before its first
- * attempt) starved next to those barging writers (smarty-dev#10391), so it is opt-in. A waiter passes a head whose
- * heartbeat stalled (its event loop blocked, or it stopped attempting) as soon as the stall bound shows it, not only
- * past 80% of its budget: the ticket closes at BEGIN IMMEDIATE, so a stale head here never holds the lock.
- * The wait honours `writeSignal`, the `withTryLock` budget and `lockTimeoutMs`. Relative budgets start after initial
- * admission setup; a still-ineligible ticket with no BEGIN attempt expires separately as MeshLockQueueExpiredError.
- * Real BEGIN contention keeps the existing MeshLockTimeoutError and timeout counter/event. Later queue joins after
- * a BEGIN attempt do not extend that operation's deadline.
+ * retried ASYNCHRONOUSLY with short jittered sleeps capped at 4 ms. SQLite's writer lock is the only
+ * admission authority; no advisory FIFO ticket is created or consulted.
+ * The wait honours `writeSignal`, the `withTryLock` budget and `lockTimeoutMs`. Every acquisition gets
+ * a real BEGIN attempt, including a zero-budget try; contention expires as MeshLockTimeoutError.
  *
  * Durability (review-luna P1-3, review-opus P3-3): `synchronous=NORMAL`. A commit is atomic and
  * never torn; a process crash loses nothing committed; an OS crash or power loss can drop the most
@@ -120,8 +109,7 @@ import { diagnostics } from "../core/diagnostics.js";
 import { captureStorageDelete, captureStoragePut, storageRevision, type StorageTransition } from "../verified/storage.js";
 import { encodeMeshStateMovedMarker, isMeshStateMovedMarker, isMeshStateNatsMarker, meshStateMovedToNatsError, readMeshStateMovedMarker } from "./backend-fence.js";
 import { holdMeshFence, holdMeshFenceSync } from "./fence-lock.js";
-import { type MeshLockTicket, meshLockQueueBusy, meshLockQueueDirectory } from "./lock-queue.js";
-import { createMeshLockAdmission, lockStats } from "./mesh-lock.js";
+import { lockStats } from "./mesh-lock.js";
 import { processStartTime, residentProcessAlive } from "../residency/process-identity.js";
 import { verifiedRemove } from "../storage/verified-remove.js";
 // From the domain modules, not the store.ts facade: store.ts loads this module through state-backend.ts (L2a).
@@ -409,8 +397,7 @@ export interface SqliteStateStoreOptions {
   lockTimeoutMs?: number;
   /** SQLite's synchronous busy handler, clamped to 0..5 ms. Default 2 ms. */
   busyTimeoutMs?: number;
-  /** A waiter older than this joins the advisory FIFO ticket queue. Default 25 ms, the contest of releases before
-   * pi-fabric#936 (smarty-dev#10516). 0 is strict FIFO (smarty-dev#9805): a newcomer queues before its first attempt. */
+  /** @deprecated Ignored: SQLite writers no longer use advisory FIFO admission. */
   fifoAfterMs?: number;
   /** Host-owned lifetime of writes: abort stops acquisition, never a started transaction. */
   writeSignal?: AbortSignal;
@@ -465,6 +452,7 @@ export interface SqliteStateStats {
   commits: number;
   busyRetries: number;
   transientRetries: number;
+  /** Compatibility counter: always 0; SQLite writers no longer join an advisory FIFO. */
   fifoJoins: number;
   /** Writers of this store waiting for the writer lock now (smarty-dev#9805: returns to 0 after every write). */
   writesWaiting?: number;
@@ -597,12 +585,6 @@ const CHECKPOINT_FLAGS = "state-checkpoint.flags";
 // acquisition, so no checkpointer (stuck in an fsync, crashed, or several raising flags in turn) parks a writer.
 const CHECKPOINT_FLAG_STALE_MS = 250;
 const WRITER_YIELD_BUDGET_MS = 250;
-// The FIFO head's in-SQLite wait per attempt (smarty-dev#9805, pi-fabric#936 round 2): node:sqlite runs the busy
-// handler synchronously, so this blocks the event loop; 5 ms (the busy_timeout clamp) plus a 1 ms re-poll.
-const HEAD_BUSY_MS = 5;
-const HEAD_REPOLL_MS = 1;
-// Non-heads wake when their predecessor leaves at BEGIN; bounded safety net for missed events/stalled heads.
-const NONHEAD_REPOLL_MS = 20;
 // The dead-flag reclaim's claim file (removeDeadFlag) keeps its own, unchanged staleness.
 const CHECKPOINT_FLAG_CLAIM_STALE_MS = 1_000;
 // After a busy maintainer/emergency TRUNCATE this store makes no new attempt for this long (a maintainer: at most
@@ -855,7 +837,6 @@ export class SqliteStateStore {
   readonly #maxTombstones: number;
   readonly #lockTimeoutMs: number;
   readonly #busyTimeoutMs: number;
-  readonly #fifoAfterMs: number;
   readonly #lockHeldEventMs: number;
   readonly #signal: AbortSignal | undefined;
   readonly #checkpointBytes: number;
@@ -908,7 +889,6 @@ export class SqliteStateStore {
     this.#maxTombstones = Math.max(0, Math.floor(options.maxStateTombstones ?? DEFAULT_MAX_STATE_TOMBSTONES));
     this.#lockTimeoutMs = Math.max(0, options.lockTimeoutMs ?? LOCK_TIMEOUT_MS);
     this.#busyTimeoutMs = clampBusy(options.busyTimeoutMs);
-    this.#fifoAfterMs = Math.max(0, options.fifoAfterMs ?? 25);
     this.#lockHeldEventMs = lockHeldEventThreshold(options.lockHeldEventMs);
     this.#signal = options.writeSignal;
     this.#checkpointBytes = Math.max(0, options.checkpointBytes ?? 4 * 1024 * 1024);
@@ -1785,59 +1765,40 @@ export class SqliteStateStore {
     finally { this.#stats.maxAfterCommitMs = Math.max(this.#stats.maxAfterCommitMs, performance.now() - started); }
   }
 
-  // Asynchronous, fair acquisition of the state write lock (see the module comment). Each attempt
+  // Asynchronous acquisition of the state write lock (see the module comment). Each attempt
   // runs BEGIN IMMEDIATE, the synchronous body and COMMIT in ONE synchronous segment, so no other
   // caller in this process can interleave a statement on this connection while the lock is held.
   async #write<T>(lockClass: MeshLockClass, body: (tx: Tx) => T, lockTimeoutMs = this.#lockTimeoutMs,
     walCapExempt = false): Promise<T> {
     const scope = this.#tryLockScope.getStore();
     const budget = scope?.active ? Math.min(scope.timeoutMs, lockTimeoutMs) : lockTimeoutMs;
-    let started = 0;
-    let deadline = 0;
+    const started = performance.now();
+    const deadline = started + Math.max(0, budget);
     let attempts = 0;
     let maxGap = 0;
-    let last = 0;
+    let last = started;
     let transient = 0;
-    let admission: ReturnType<typeof createMeshLockAdmission> | undefined;
-    let ticket: MeshLockTicket | undefined;
     let yieldedMs = 0;
     let waiting = true;
     this.#writesWaiting += 1;
     try {
-      // smarty-dev#9805, strict FIFO only (fifoAfterMs 0, smarty-dev#10516): a newcomer that finds anyone queued
-      // queues behind them, never barging the FIFO head. Inside the try (pi-fabric#936 round 3): the finally always
-      // releases the ticket and #writesWaiting.
-      if (this.#fifoAfterMs === 0 && this.#queueBusy()) {
-        admission = this.#ticket(Math.max(0, budget));
-        ticket = admission?.ticket;
-        if (ticket) this.#stats.fifoJoins += 1;
-      }
-      // No acquisition has been attempted: queue lookup/receipt construction cannot spend this relative budget.
-      started = admission?.startedAt ?? performance.now();
-      deadline = admission?.deadline ?? started + Math.max(0, budget);
-      last = started;
       for (;;) {
         const iteration = performance.now();
         let yielding = false;
-        let headWaitMs = 0;
         this.#signal?.throwIfAborted();
         this.#assertOpen();
         if (this.#inTransaction) throw new Error("Fabric mesh state callbacks must not call store writers");
         if (!walCapExempt) this.#refuseAboveWalCap();
         // smarty-dev#6100: a checkpoint flag pauses this writer for at most WRITER_YIELD_BUDGET_MS in total.
-        const eligible = !ticket || this.#mayContend(ticket);
         if (iteration < deadline && yieldedMs < WRITER_YIELD_BUDGET_MS && this.#checkpointPending()) {
           this.#stats.checkpoints.writerYields += 1; yielding = true;
-        } else if (eligible) {
+        } else if (attempts === 0 || performance.now() < deadline) {
+          // A resumed retry must not BEGIN after its fixed budget; only the first attempt is exempt.
           const now = performance.now();
           if (attempts > 0) maxGap = Math.max(maxGap, now - last);
           last = now;
           attempts += 1;
           let begun = false;
-          // smarty-dev#9805: the FIFO head waits for the release inside SQLite's busy handler (up to HEAD_BUSY_MS of its
-          // budget) instead of a JavaScript sleep, so it takes the lock when the holder lets go.
-          headWaitMs = ticket?.queued ? Math.max(0, Math.min(HEAD_BUSY_MS, Math.floor(deadline - now))) : 0;
-          if (headWaitMs > this.#busyTimeoutMs) this.#db.exec(`PRAGMA busy_timeout = ${headWaitMs}`);
           try {
             this.#db.exec("BEGIN IMMEDIATE");
             begun = true;
@@ -1845,18 +1806,11 @@ export class SqliteStateStore {
             if (isTransient(error) && transient < TRANSIENT_RETRIES) { transient += 1; this.#stats.transientRetries += 1; }
             else if (isBusy(error)) this.#stats.busyRetries += 1;
             else throw error;
-          } finally {
-            if (headWaitMs > this.#busyTimeoutMs) this.#db.exec(`PRAGMA busy_timeout = ${this.#busyTimeoutMs}`);
           }
           if (begun) {
             const waitMs = performance.now() - started;
             this.#stats.maxWaitMs = Math.max(this.#stats.maxWaitMs, waitMs);
             this.#window.maxWaitMs = Math.max(this.#window.maxWaitMs, waitMs);
-            // smarty-dev#6100: the SQLite writer lock is the exclusion; the advisory receipt only orders waiters.
-            // Leave the queue now, so post-COMMIT work (SQLite's autocheckpoint fsync inside COMMIT, the emergency
-            // checkpoint) never keeps the next waiter from contending.
-            ticket?.close();
-            ticket = undefined;
             this.#writesWaiting -= 1;
             waiting = false;
             return this.#run(body, lockClass, waitMs);
@@ -1864,43 +1818,24 @@ export class SqliteStateStore {
         }
         const now = performance.now();
         if (now >= deadline) {
-          if (attempts === 0) {
-            if (!eligible && admission) throw admission.expire(this.file, this.root, "sqlite", lockClass);
-            // A checkpoint yield can consume the last slice, but an eligible waiter still gets a real attempt.
-            continue;
-          }
+          // A checkpoint yield can consume the last slice, but the writer still gets a real attempt.
+          if (attempts === 0) continue;
           this.#stats.lockTimeouts += 1;
           this.#window.lockTimeouts += 1;
           this.#window.maxWaitMs = Math.max(this.#window.maxWaitMs, now - started);
           this.#flushCheckpointWindow();
           // smarty-dev#9290: a full-budget waiter names the writer from the kernel's lock table; a
           // bounded try (a withTryLock scope or a zero budget) fails by design and emits nothing.
-          // Leave the FIFO first: the /proc/locks read and the append must not keep this timed-out
-          // ticket at the head (pi-fabric#905 review round 3).
-          ticket?.close();
-          ticket = undefined;
           const tried = Boolean(scope?.active) || budget <= 0;
           lockStats?.failed(this.root, lockClass, now - started, tried);
           if (!tried) lockEvents?.waitTimeout(this.root, "sqlite", lockClass, now - started, walWriterPid(this.file));
           throw new MeshLockTimeoutError(` (SQLite state ${this.file})`, attempts, Math.round(maxGap));
         }
-        if (!ticket && now - started >= this.#fifoAfterMs) {
-          // This writer already tried BEGIN IMMEDIATE: later queue setup must not reset the operation deadline.
-          admission = this.#ticket(deadline - now);
-          ticket = admission?.ticket;
-          if (ticket) this.#stats.fifoJoins += 1;
-        }
         const cap = Math.min(4, 2 ** Math.min(attempts - 1, 2));
-        // The FIFO head re-polls at once; plain contenders keep their jittered sleep.
-        const head = headWaitMs > 0;
-        // Only non-heads use ticket.wait: its head watcher expects a directory/.lock, not this state.db.
-        // Receipt removal is their normal wake; avoid every queued writer re-statting WAL/flags every 2..4 ms.
-        if (ticket && !eligible) await ticket.wait(Math.min(deadline - now, NONHEAD_REPOLL_MS), this.#signal);
-        else await delay(Math.min(deadline - now, head ? HEAD_REPOLL_MS : cap * (0.5 + Math.random() / 2)), this.#signal);
+        await delay(Math.min(deadline - now, cap * (0.5 + Math.random() / 2)), this.#signal);
         if (yielding) yieldedMs += performance.now() - iteration;
       }
     } finally {
-      ticket?.close();
       if (waiting) this.#writesWaiting -= 1;
     }
   }
@@ -1908,27 +1843,6 @@ export class SqliteStateStore {
   // One stat per attempt: a fresh flag means a TRUNCATE checkpoint wants the writer lock.
   #checkpointPending(): boolean {
     return checkpointFlagRaised(this.root);
-  }
-
-  // The FIFO directory of this database, resolved once (an unusable one: no queue, the plain contest).
-  #queueDirectory: string | null | undefined;
-  #queueBusy(): boolean {
-    if (this.#queueDirectory === undefined) {
-      try { this.#queueDirectory = meshLockQueueDirectory(this.file); } catch { this.#queueDirectory = null; }
-    }
-    return this.#queueDirectory !== null && meshLockQueueBusy(this.#queueDirectory);
-  }
-
-  // Advisory admission fails open (pi-fabric#936 round 3): a queue error (EACCES, EIO) closes the ticket and this
-  // writer joins the plain contest instead of failing the write.
-  #mayContend(ticket: MeshLockTicket): boolean {
-    try { return ticket.mayContend(); }
-    catch { ticket.close(); return true; }
-  }
-
-  #ticket(budgetMs: number): ReturnType<typeof createMeshLockAdmission> | undefined {
-    try { return createMeshLockAdmission(this.file, randomUUID(), budgetMs, { passStalledHead: true }, () => performance.now()); }
-    catch { return undefined; } // Advisory only: an unusable queue leaves the plain jittered contest.
   }
 
   // The synchronous body between BEGIN IMMEDIATE (already taken) and COMMIT.

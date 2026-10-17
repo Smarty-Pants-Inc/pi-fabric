@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -10,7 +11,7 @@ import { main } from "../src/mesh/mesh-backend-cli.js";
 import { ShadowStateBackend } from "../src/mesh/state-backend.js";
 import { StateProjector } from "../src/mesh/state-projector.js";
 import { MeshLock } from "../src/mesh/mesh-lock.js";
-import { MeshStateUnsupportedError, SqliteStateStore } from "../src/mesh/state-sqlite.js";
+import { MeshStateUnsupportedError, openNodeSqlite, SqliteStateStore } from "../src/mesh/state-sqlite.js";
 import { MeshStore, type MeshIdentity, type MeshStoreOptions } from "../src/mesh/store.js";
 
 // smarty-dev#6477 P0: a sqlite-mode open of a root whose state still lives in state.json must refuse,
@@ -141,11 +142,46 @@ describe("sqlite mode on an unimported root (smarty-dev#6477)", () => {
     return [none, emptyJson, zeroLength, touched];
   };
 
-  it("refuses a fresh root with no side effects: no state.db, no fence, a file-mode writer still works (part 2)", async () => {
-    const missing = path.join(tempRoot("parent"), "not-yet");
-    expect(() => SqliteStateStore.openSync(missing, 64 * 1024, 1_000)).toThrow(notImported);
-    expect(fs.existsSync(missing)).toBe(false);
-    for (const root of freshRoots()) {
+  it.each(["sync", "async"] as const)("initialises an absent state.json with a missing or zero-length db via %s open", async (mode) => {
+    const empty = tempRoot(`empty-${mode}`);
+    const missing = path.join(tempRoot(`parent-${mode}`), "not-yet");
+    const zeroDb = tempRoot(`zero-db-${mode}`);
+    fs.writeFileSync(path.join(zeroDb, "state.db"), "", { mode: 0o600 });
+    for (const root of [empty, missing, zeroDb]) {
+      const store = mode === "sync" ? SqliteStateStore.openSync(root, 64 * 1024, 1_000)
+        : await SqliteStateStore.open(root, 64 * 1024, 1_000);
+      sqliteStores.push(store);
+      expect(store.listAll("")).toEqual([]);
+      await store.put({ key: "task/value", value: { saved: true }, identity });
+      expect(store.get("task/value")?.value).toEqual({ saved: true });
+      expect(readMeshStateMovedMarker(root)).toMatchObject({ epoch: 1 });
+      store.close();
+      const reopened = await SqliteStateStore.open(root, 64 * 1024, 1_000);
+      sqliteStores.push(reopened);
+      expect(reopened.get("task/value")?.value).toEqual({ saved: true });
+    }
+  });
+
+  it("opens a task's fresh private root through MeshStore with the sqlite environment override", async () => {
+    const root = path.join(tempRoot("task"), ".pi", "fabric", "mesh");
+    vi.stubEnv("PI_FABRIC_MESH_STATE_BACKEND", "sqlite");
+    const store = open(root);
+    expect(store.stateBackend).toBe("sqlite");
+    expect(store.get("task/value")).toBeUndefined(); // synchronous first use
+    await store.put({ key: "task/value", value: 42, identity });
+    expect(store.get("task/value")?.value).toBe(42);
+    store.closeState();
+    const reopened = open(root);
+    expect(reopened.get("task/value")?.value).toBe(42);
+
+    const writeFirst = open(path.join(tempRoot("task-write"), ".pi", "fabric", "mesh"));
+    await writeFirst.put({ key: "task/value", value: 43, identity }); // asynchronous first use
+    expect(writeFirst.get("task/value")?.value).toBe(43);
+  });
+
+  it("still requires import for even an empty state.json, without side effects", async () => {
+    const [, emptyJson, zeroLength] = freshRoots();
+    for (const root of [emptyJson, zeroLength]) {
       const before = snapshot(root);
       const sqlite = open(root, { stateBackend: "sqlite" });
       expect(() => sqlite.listAll("")).toThrow(notImported);
@@ -156,14 +192,91 @@ describe("sqlite mode on an unimported root (smarty-dev#6477)", () => {
       await expect(StateProjector.open({ root, mode: "sqlite" })).rejects.toThrow(notImported);
       expect(fs.existsSync(path.join(root, "state.db")), root).toBe(false);
       expect(snapshot(root)).toEqual(before);
-      // No fence was created: a file-mode writer that starts later commits. (The file store itself reads a
-      // zero-length state.json as damage on write, before and after this change: that root is skipped.)
-      if (fs.statSync(path.join(root, "state.json"), { throwIfNoEntry: false })?.size === 0) continue;
-      const file = open(root, { stateBackend: "file" });
-      expect((await file.put({ key: "f", value: 1, identity })).version).toBeGreaterThan(0);
-      expect(file.listAll("").map((entry) => entry.key)).toEqual(["f"]);
     }
   });
+
+  it("serialises two first openers of the same empty root and shares their writes", async () => {
+    const root = tempRoot("two-openers");
+    const pending: Promise<SqliteStateStore>[] = [];
+    await new MeshLock(root, { lockProtocol: 1, lockTimeoutMs: 10_000 }, () => undefined).withLockAcrossAwait(async () => {
+      // Both see the absent database before either can initialise it. Each must re-check under the fence.
+      for (let index = 0; index < 2; index += 1) {
+        pending.push(SqliteStateStore.open(root, 64 * 1024, 1_000).then((store) => { sqliteStores.push(store); return store; }));
+      }
+      expect(fs.existsSync(path.join(root, "state.db"))).toBe(false);
+    });
+    const [first, second] = await Promise.all(pending);
+    if (!first || !second) throw new Error("both openers must succeed");
+    await first.put({ key: "first", value: 1, identity });
+    expect(second.get("first")?.value).toBe(1);
+    await second.put({ key: "second", value: 2, identity });
+    expect(first.get("second")?.value).toBe(2);
+    expect(first.stateStamp()).toBe(second.stateStamp());
+  });
+
+  it("waits for another process between schema commit and marker publication, rather than refusing its db", async () => {
+    const root = tempRoot("process-race");
+    // IPC announces the exact vulnerable window; a blocking stdin read holds it until the parent releases it.
+    // No polling or timing sleeps: the second opener must wait on the existing creation fence.
+    const worker = `
+      import fs from "node:fs";
+      import { createJiti } from "jiti";
+      import { pathToFileURL } from "node:url";
+      const jiti = createJiti(pathToFileURL(process.cwd() + "/index.js").href, { fsCache: false });
+      const { SqliteStateStore } = await jiti.import("./src/mesh/state-sqlite.ts");
+      globalThis[Symbol.for("pi-fabric.mesh.sqlite-create.marker-hook")] = (phase) => {
+        if (phase !== "before-marker") return;
+        process.send("before-marker");
+        if (fs.readSync(0, Buffer.alloc(1), 0, 1, null) !== 1) throw new Error("release pipe closed");
+      };
+      const store = await SqliteStateStore.open(process.argv[1], 65536, 1000);
+      await store.put({ key: "child", value: 1, identity: { id: "child", name: "child", kind: "agent" } });
+      process.on("message", () => {
+        process.send({ parentValue: store.get("parent")?.value, token: store.stateStamp() });
+        store.close();
+        process.disconnect();
+      });
+      process.send("opened");
+    `;
+    const child = spawn(process.execPath, ["--input-type=module", "-e", worker, root], {
+      cwd: process.cwd(), stdio: ["pipe", "ignore", "pipe", "ipc"], timeout: 20_000, killSignal: "SIGKILL",
+    });
+    let stderr = "";
+    child.stderr?.on("data", (chunk) => { stderr += chunk; });
+    const done = new Promise<number | null>((resolve, reject) => { child.once("error", reject); child.once("close", resolve); });
+    const message = (): Promise<unknown> => Promise.race([
+      new Promise<unknown>((resolve) => child.once("message", resolve)),
+      done.then((code) => { throw new Error(`child exited ${code} before message: ${stderr}`); }),
+    ]);
+    let pending: Promise<SqliteStateStore> | undefined;
+    try {
+      expect(await message()).toBe("before-marker");
+      expect(fs.statSync(path.join(root, "state.db")).size).toBeGreaterThan(0);
+      expect(readMeshStateMovedMarker(root)).toBeUndefined();
+      const driver = vi.fn(openNodeSqlite);
+      pending = SqliteStateStore.open(root, 64 * 1024, 1_000, { open: driver }).then((store) => {
+        sqliteStores.push(store); return store;
+      });
+      void pending.catch(() => undefined);
+      expect(driver).not.toHaveBeenCalled(); // no opening/validation of the unpublished database
+      expect(() => SqliteStateStore.openSync(root, 64 * 1024, 1_000)).toThrow(MeshLockTimeoutError);
+      const opened = message();
+      child.stdin?.end("x");
+      expect(await opened).toBe("opened");
+      const store = await pending;
+      expect(store.get("child")?.value).toBe(1);
+      await store.put({ key: "parent", value: 2, identity });
+      const observed = message();
+      child.send("verify");
+      expect(await observed).toEqual({ parentValue: 2, token: store.stateStamp() });
+      expect(await done, stderr).toBe(0);
+    } finally {
+      child.stdin?.end();
+      if (child.exitCode === null) child.kill("SIGKILL");
+      await done;
+      await pending?.catch(() => undefined);
+    }
+  }, 30_000);
 
   // ponytail: no cutover or import runs on Windows until reader proofs can be verified there (ACLs: smarty-dev#7548).
   it.skipIf(process.platform === "win32")("imports a fresh root (no state.json, empty, zero-length) to an empty db plus the marker at epoch 1; then sqlite works", async () => {
@@ -198,6 +311,18 @@ describe("sqlite mode on an unimported root (smarty-dev#6477)", () => {
     sqlite.closeState();
     expect(fs.existsSync(path.join(unmarked, "state.json"))).toBe(false);
     expect(fs.readFileSync(path.join(unmarked, "state.db")).equals(dbBytes)).toBe(true);
+
+    // A nonempty database with no meta table is not automatically adopted either (explicit create can seed it).
+    const uninitialised = tempRoot("uninitialised");
+    fs.writeFileSync(path.join(uninitialised, "state.db"), "", { mode: 0o600 });
+    const bare = openNodeSqlite(path.join(uninitialised, "state.db"));
+    bare.exec("PRAGMA user_version = 1");
+    bare.close();
+    expect(fs.statSync(path.join(uninitialised, "state.db")).size).toBeGreaterThan(0);
+    const bareBefore = snapshot(uninitialised);
+    expect(() => SqliteStateStore.openSync(uninitialised, 64 * 1024, 1_000)).toThrow(/state.db is not initialised/);
+    await expect(SqliteStateStore.open(uninitialised, 64 * 1024, 1_000)).rejects.toThrow(/state.db is not initialised/);
+    expect(snapshot(uninitialised)).toEqual(bareBefore);
 
     // The marker with state.db lost.
     const lost = tempRoot("lost");

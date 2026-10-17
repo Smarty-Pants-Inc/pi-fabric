@@ -1501,11 +1501,21 @@ describe("native activation window (offline; opted-in success needs exact native
       expect(system.content).toBe("");
       expect(system.sections).toBeDefined();
       expect(system.toolsAdded?.some(tool => tool.name === "fabric_exec")).toBe(true);
-      const wire = JSON.stringify(s.requests.at(-1));
-      expect(wire).toContain("Configured fabric_exec kernel");
-      expect(JSON.stringify(system)).toContain("Configured fabric_exec kernel");
+      const lastRequest = s.requests.at(-1)!;
+      const wire = JSON.stringify(lastRequest);
+      expect(wire).not.toContain("Configured fabric_exec kernel");
+      expect(JSON.stringify(system)).not.toContain("Configured fabric_exec kernel");
+      const fabricTool = lastRequest.tools.find((tool: { function?: { name?: string } }) =>
+        tool.function?.name === "fabric_exec");
+      expect(fabricTool).toBeDefined();
+      const fabricToolWire = JSON.stringify(fabricTool);
+      expect(fabricToolWire).toContain("payloads are literal: read files with native tools first");
+      expect(fabricToolWire).toContain("Only exact supplied keys exist: payloads.body becomes π.body");
+      expect(fabricToolWire).toContain("QuickJS lacks host globals: process, fetch");
+      expect(fabricToolWire).toContain("Globals: tools, mcp, memory");
+      expect(fabricToolWire).not.toContain("promptGuidelines");
       // Witness every rendered section, not merely the presence of our guidance.
-      const wireSystem = s.requests.at(-1)!.messages.find((message: {role: string}) =>
+      const wireSystem = lastRequest.messages.find((message: {role: string}) =>
         message.role === "system" || message.role === "developer");
       expect(wireSystem.content).toBe(getCurrentSystemPrompt(records as never));
     }

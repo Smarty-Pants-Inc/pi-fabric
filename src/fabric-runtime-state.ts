@@ -1066,6 +1066,9 @@ export class FabricRuntimeState {
       if (!live.current()) throw new Error("Pi Fabric mesh activation lifecycle retired");
       let inboxActivation: string | undefined;
       if (meshConfig.enabled && mainAgent.local) {
+        // SQLite's first open initializes its store under the mesh fence. Open it before file
+        // custody, so resumeLineage's read below never tries to take that fence while custody is held.
+        if (mesh.stateBackend === "sqlite") mesh.stateBackendHandle.stateToken();
         // resumeLineage awaits a mesh write. Hold file custody across that await;
         // mesh.custody callbacks are synchronous and would release it too early.
         const releaseCustody = await acquireMeshCustodyLock(meshRoot);

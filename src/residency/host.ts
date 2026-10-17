@@ -89,7 +89,6 @@ import { launchScope } from "../scope.js";
 import { useBudgetLedger } from "../agents/budget-ledger.js";
 import { LifecycleBroker } from "../lifecycle/broker.js";
 import { lifecycleSourceIdentity, type FabricLifecycleEvent, type FabricLifecycleSubscription } from "../lifecycle/types.js";
-import { meshStateBackendFromMarker } from "../mesh/backend-fence.js";
 import { MeshStore, meshOutageAlarmSink, RUNTIME_MESH_READ_CACHE_MS, type MeshBatchView, type MeshIdentity } from "../mesh/store.js";
 import { CommitOutbox, withStateFence } from "../mesh/commit-outbox.js";
 import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
@@ -423,14 +422,10 @@ export class ResidentHost {
 
   #createMesh(): MeshStore {
     const { config } = this;
-    // Follow moved-marker/meta authority even after a stale backend config re-apply.
-    const stateBackend = meshStateBackendFromMarker(config.meshRoot, config.mesh.stateBackend);
-    if (stateBackend === "sqlite" && stateBackend !== config.mesh.stateBackend) {
-      diagnostics.warn("src/residency/host.ts", `[pi-fabric] resident mesh ${config.meshRoot}: SQLite moved marker overrides mesh.stateBackend=${config.mesh.stateBackend}; opening sqlite`);
-    }
     return new MeshStore(config.meshRoot, config.mesh.maxEventBytes, config.mesh.maxReadEvents,
       { backgroundReadCacheMs: config.mesh.idleReadCoalesceMs ?? RUNTIME_MESH_READ_CACHE_MS, lockProtocol: config.mesh.lockProtocol,
-        stateBackend,
+        // Only configured values are explicit; omission delegates per-root selection to the factory.
+        ...(config.mesh.stateBackend !== undefined ? { stateBackend: config.mesh.stateBackend } : {}),
         canWakeResidents: () => this.#ready && !this.#closed && !this.#staged && !this.#handover && !this.#drain });
   }
 

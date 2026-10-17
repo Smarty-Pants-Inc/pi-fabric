@@ -2,7 +2,7 @@ import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:chil
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { main } from "../src/mesh/mesh-backend-cli.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 
@@ -32,8 +32,16 @@ for await (const line of lines) {
 const identity: MeshIdentity = { id: "operator", name: "operator", kind: "agent" };
 const roots: string[] = [];
 const children: ChildProcessWithoutNullStreams[] = [];
+/** Synthetic owner for accepted-unready switch alarms; never use a real lead identity in tests. */
+const SWITCH_OWNER = "session:0a1b2c3d-0000-4000-8000-00000000c944";
+
+beforeEach(() => {
+  vi.stubEnv("PI_FABRIC_MESH_ALARM_TO", SWITCH_OWNER);
+  vi.stubEnv("SMARTY_LEAD_SESSION", undefined);
+});
 
 afterEach(() => {
+  vi.unstubAllEnvs();
   for (const child of children.splice(0)) if (child.exitCode === null) child.kill("SIGKILL");
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });

@@ -128,13 +128,13 @@ describe("fleet authority snapshot privacy and real backend boundaries", () => {
     await expect(collect(options(f))).rejects.toThrow(/^(UNSAFE_SCHEMA|INVALID_SCALAR|UNSUPPORTED_ID|KEY_ID_MISMATCH)$/);
     const result = run(f); expect(result.status).toBe(1); expect(result.stdout).toBe(""); expect(result.stderr).not.toContain(TOKEN); expect(result.stderr).not.toContain(SECRET); expect(fs.existsSync(path.join(f.out, "snapshot.json"))).toBe(false);
   });
-  it("rejects symlinked input files before following them", async () => {
+  it.skipIf(process.platform === "win32")("rejects symlinked input files before following them (Windows skips: symlink creation may require privileges not guaranteed)", async () => {
     const f = fixture(), target = path.join(f.top, "hidden.json"); fs.renameSync(path.join(f.mesh, "state.json"), target); fs.symlinkSync(target, path.join(f.mesh, "state.json"));
     await expect(collect(options(f))).rejects.toThrow("UNSAFE_INPUT");
   });
   it("writes only a new private output, refuses overwrite and mesh-local outputs", () => {
     const f = fixture(), result = run(f); expect(result.status).toBe(0); const output = path.join(f.out, "snapshot.json");
-    expect(JSON.parse(result.stdout).schemaVersion).toBe(1); expect(fs.readFileSync(output, "utf8")).toBe(result.stdout); expect(fs.statSync(output).mode & 0o777).toBe(0o600);
+    expect(JSON.parse(result.stdout).schemaVersion).toBe(1); expect(fs.readFileSync(output, "utf8")).toBe(result.stdout); if (process.platform !== "win32") expect(fs.statSync(output).mode & 0o777).toBe(0o600);
     expect(run(f).status).toBe(1); expect(run(f, "work", path.join(f.mesh, "output.json")).status).toBe(1);
   });
   it("retains source-generated resident/runtime sibling IDs and common root joins", async () => {

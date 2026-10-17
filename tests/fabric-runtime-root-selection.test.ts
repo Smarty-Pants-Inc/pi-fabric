@@ -110,6 +110,43 @@ describe("FabricRuntimeState selects an unconfigured backend per root", () => {
     }, 60_000);
   }
 
+  it.skipIf(process.platform === "win32")("refuses unconfigured bootstrap and reads when an imported root's moved marker is renamed aside", async () => {
+    const { runtime, context, cwd, agentDir, meshRoot } = fixture();
+    const marker = await seedImported(meshRoot);
+    const before = new MeshStore(meshRoot, 64 * 1024, 1_000);
+    try { expect(before.get("selection/retained", { fresh: true })?.value).toEqual({ preserved: true }); }
+    finally { before.closeState(); }
+    const stateFile = path.join(meshRoot, "state.json");
+    const markerBackup = path.join(meshRoot, "state.json.marker-backup");
+    const database = fs.readFileSync(path.join(meshRoot, "state.db"));
+    fs.renameSync(stateFile, markerBackup);
+    expect(process.env.PI_FABRIC_MESH_STATE_BACKEND).toBeUndefined();
+    const config = loadFabricConfig({ cwd, agentDir, projectTrusted: true });
+    expect(Object.hasOwn(config.mesh, "stateBackend")).toBe(false);
+
+    // Use the real loader/bootstrap: no injected normalized config or replacement store.
+    let refusal: unknown;
+    try { await runtime.initialize(context); } catch (error) { refusal = error; }
+    expect(refusal).toBeInstanceOf(MeshBackendFenceError);
+    expect((refusal as Error).message).toMatch(/state\.json.*state\.db/);
+    await runtime.shutdown();
+    expect(() => {
+      const reader = new MeshStore(meshRoot, 64 * 1024, 1_000);
+      try { reader.get("selection/retained", { fresh: true }); }
+      finally { reader.closeState(); }
+    }).toThrow(MeshBackendFenceError);
+    expect(fs.existsSync(stateFile)).toBe(false);
+    expect(fs.readFileSync(markerBackup, "utf8")).toBe(marker);
+    expect(fs.readFileSync(path.join(meshRoot, "state.db"))).toEqual(database);
+
+    fs.renameSync(markerBackup, stateFile);
+    const restored = new MeshStore(meshRoot, 64 * 1024, 1_000);
+    try {
+      expect(restored.stateBackend).toBe("sqlite");
+      expect(restored.get("selection/retained", { fresh: true })?.value).toEqual({ preserved: true });
+    } finally { restored.closeState(); }
+  }, 60_000);
+
   it.skipIf(process.platform === "win32").each(["config", "environment"] as const)("refuses explicit file from %s and preserves the imported root", async source => {
     const { runtime, context, meshRoot, configFile, settings } = fixture();
     const marker = await seedImported(meshRoot);

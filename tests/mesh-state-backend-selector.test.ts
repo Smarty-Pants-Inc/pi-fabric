@@ -4,7 +4,8 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { normalizeFabricConfig } from "../src/config.js";
 import { MESH_STATE_BACKEND_KINDS } from "../src/mesh/state-backend-kinds.js";
-import { importMeshState } from "../src/mesh/backend-migration.js";
+import { MeshBackendFenceError } from "../src/mesh/backend-fence.js";
+import { importMeshState, rollbackMeshState } from "../src/mesh/backend-migration.js";
 import { createStateBackend, MESH_STATE_BACKEND_NOT_BUILT_CODE, MeshStateBackendNotBuiltError, resolveMeshStateBackend,
   SqliteStateBackend, STATE_BACKEND_FACTORIES, type StateBackendFactory } from "../src/mesh/state-backend.js";
 import { MeshLock } from "../src/mesh/mesh-lock.js";
@@ -132,6 +133,94 @@ describe("root-aware backend selection", () => {
       await backend.put({ key: "after/factory", value: { written: "through factory" }, identity });
       expect(backend.get("after/factory")?.value).toEqual({ written: "through factory" });
     } finally { backend.close(); }
+  });
+
+  it.skipIf(process.platform === "win32")("refuses an implicit file read when an imported root's marker is renamed aside, without changing retained bytes", async () => {
+    const root = await importedRoot();
+    const reader = open(root);
+    expect(reader.get("retained", { fresh: true })?.value).toEqual({ from: "file" });
+    reader.closeState();
+    const stateFile = path.join(root, "state.json");
+    const markerBackup = path.join(root, "state.json.marker-backup");
+    const marker = fs.readFileSync(stateFile);
+    const database = fs.readFileSync(path.join(root, "state.db"));
+    fs.renameSync(stateFile, markerBackup);
+
+    for (const env of [undefined, " \t "]) {
+      vi.stubEnv("PI_FABRIC_MESH_STATE_BACKEND", env);
+      expect(() => resolveMeshStateBackend(undefined, undefined, root)).toThrow(MeshBackendFenceError);
+      expect(() => open(root)).toThrow(/state\.json.*state\.db/);
+      // This is the reported read path: refusal, never an undefined/empty retained result.
+      expect(() => open(root).get("retained", { fresh: true })).toThrow(MeshBackendFenceError);
+    }
+    // A real explicit SQLite choice keeps its production missing-import-marker refusal.
+    const explicit = open(root, { stateBackend: "sqlite" });
+    expect(() => explicit.get("retained", { fresh: true })).toThrow(/marker/i);
+    explicit.closeState();
+    expect(fs.existsSync(stateFile)).toBe(false);
+    expect(fs.readFileSync(markerBackup)).toEqual(marker);
+    expect(fs.readFileSync(path.join(root, "state.db"))).toEqual(database);
+
+    fs.renameSync(markerBackup, stateFile);
+    const restored = open(root);
+    expect(restored.stateBackend).toBe("sqlite");
+    expect(restored.get("retained", { fresh: true })?.value).toEqual({ from: "file" });
+  });
+
+  it("refuses unreadable state.db metadata without presenting an empty file root or changing its bytes", () => {
+    const root = tempRoot();
+    const database = path.join(root, "state.db");
+    const bytes = Buffer.from("unreadable SQLite metadata");
+    fs.writeFileSync(database, bytes, { mode: 0o600 });
+    expect(() => open(root)).toThrow(MeshBackendFenceError);
+    expect(() => open(root).get("retained", { fresh: true })).toThrow(/state\.json.*state\.db/);
+    expect(fs.existsSync(path.join(root, "state.json"))).toBe(false);
+    expect(fs.readFileSync(database)).toEqual(bytes);
+  });
+
+  it("refuses an orphan state.db-wal without creating an empty file root or changing the WAL", () => {
+    const root = tempRoot();
+    const wal = path.join(root, "state.db-wal");
+    const bytes = Buffer.from("retained WAL bytes");
+    fs.writeFileSync(wal, bytes, { mode: 0o600 });
+    for (const env of [undefined, " \t "]) {
+      vi.stubEnv("PI_FABRIC_MESH_STATE_BACKEND", env);
+      expect(() => open(root)).toThrow(MeshBackendFenceError);
+      expect(() => open(root).get("retained", { fresh: true })).toThrow(/state\.json.*state\.db-wal/);
+    }
+    expect(fs.existsSync(path.join(root, "state.json"))).toBe(false);
+    expect(fs.existsSync(path.join(root, "state.db"))).toBe(false);
+    expect(fs.readFileSync(wal)).toEqual(bytes);
+  });
+
+  it.each(["option", "environment"] as const)("allows explicit file from %s on clean and populated file roots", async source => {
+    for (const populated of [false, true]) {
+      const root = tempRoot();
+      if (populated) await seedFileRoot(root);
+      if (source === "environment") vi.stubEnv("PI_FABRIC_MESH_STATE_BACKEND", " FILE ");
+      const store = open(root, source === "option" ? { stateBackend: "file" } : {});
+      expect(store.stateBackend).toBe("file");
+      expect(store.get("retained", { fresh: true })?.value).toEqual(populated ? { from: "file" } : undefined);
+      await store.put({ key: "explicit/file", value: true, identity });
+      expect(store.get("explicit/file", { fresh: true })?.value).toBe(true);
+      expect(fs.existsSync(path.join(root, "state.db"))).toBe(false);
+    }
+  });
+
+  it.skipIf(process.platform === "win32")("allows default and explicit file reads after real rollback with state.db retained", async () => {
+    const root = await importedRoot();
+    expect((await rollbackMeshState(root)).backend).toBe("file");
+    expect(fs.existsSync(path.join(root, "state.db"))).toBe(true);
+    for (const source of ["default", "option", "environment"] as const) {
+      vi.stubEnv("PI_FABRIC_MESH_STATE_BACKEND", source === "environment" ? "file" : undefined);
+      const store = open(root, source === "option" ? { stateBackend: "file" } : {});
+      expect(store.stateBackend).toBe("file");
+      expect(store.get("retained", { fresh: true })?.value).toEqual({ from: "file" });
+      await store.put({ key: `rollback/${source}`, value: true, identity });
+      expect(store.get(`rollback/${source}`, { fresh: true })?.value).toBe(true);
+      store.closeState();
+    }
+    expect(fs.existsSync(path.join(root, "state.db"))).toBe(true);
   });
 
   it("keeps populated and fresh roots on the default file backend", async () => {

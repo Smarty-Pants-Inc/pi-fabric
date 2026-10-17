@@ -243,12 +243,12 @@ export function isolatedTestTemp(prefix: string): Record<"TMPDIR" | "TMP" | "TEM
 const fleetRootsKey = Symbol.for("pi-fabric.test-owned-fleet-roots");
 
 // An exact test-only channel, NOT a prefix exemption or production authority.
-// Jev owns its strict === "1" opt-ins; activation owns exact native/worker paths.
+// Jev and NATS rehearsal own strict === "1" opt-ins; activation owns exact native/worker paths.
 // PostgreSQL reads its binary directory at import; the shell seam reads a delay
 // at first use and accepts only positive integers. Preserve those semantics,
 // including missing/off values, without validating existence or rewriting paths.
 const testControls = new Set([
-  "PI_FABRIC_JEV_LIVE", "PI_FABRIC_JEV_LOCALTERM",
+  "PI_FABRIC_JEV_LIVE", "PI_FABRIC_JEV_LOCALTERM", "PI_FABRIC_NATS_REHEARSAL",
   "PI_FABRIC_ACTIVATION_TEST_PI_BINARY", "PI_FABRIC_ACTIVATION_TEST_WORKER",
   "PI_FABRIC_TEST_PG_BIN", "PI_FABRIC_TEST_PID_DELAY_MS",
 ]);

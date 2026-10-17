@@ -8,6 +8,7 @@ const fs = process.getBuiltinModule("node:fs");
 // isolateTestFleetEnvironment scrubs SMARTY_ROLE for attribution tests. Carry only its veto,
 // not the role/identity, through config reloads, workers and NODE_OPTIONS children.
 export const fleetHostMarker = "PI_TEST_FLEET_HOST";
+export const hostedAdmissionMarker = "PI_TEST_HOSTED_ONLY_PARENT_ADMITTED";
 export function rememberFleetHost(env = process.env) {
   if (env.SMARTY_ROLE !== undefined) env[fleetHostMarker] = "1";
 }
@@ -24,7 +25,10 @@ const fleetPath = path => /^(?:\/home\/paul|\/srv\/scratch)(?:\/|$)/i.test(path.
 /** Pure with a supplied directory probe. Flags/opt-ins alone are never authorization.
  * This is an accidental-execution guard, not attestation against a caller controlling all env/filesystem inputs. */
 export function isHostedOnlyAllowed(env, directory = runnerDirectory) {
-  if (env.SMARTY_ROLE !== undefined || env[fleetHostMarker] !== undefined) return false;
+  // The test setup records original fleet identity before role scrubbing. A worker's new task role
+  // is tolerated only when its parent explicitly passed this already-admitted decision.
+  if (env[fleetHostMarker] !== undefined) return false;
+  if (env.SMARTY_ROLE !== undefined && env[hostedAdmissionMarker] !== "1") return false;
   if (env.GITHUB_ACTIONS !== "true" || env.RUNNER_ENVIRONMENT !== "github-hosted") return false;
   const temp = env.RUNNER_TEMP;
   if (!temp || !absolute(temp) || fleetPath(temp)) return false;

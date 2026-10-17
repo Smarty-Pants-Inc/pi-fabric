@@ -553,9 +553,13 @@ describe.each(["session", "durable"] as const)("%s actor process children", (res
     h.endActivation();
     await vi.waitFor(() => {
       expect(store.received(child.id)).toBe(true);
-      expect(h.owner.status(h.actor.id).status).toBe("idle");
-      expect(h.owner.status(h.actor.id).queued).toBe(0);
+      expect(h.owner.status(h.actor.id).status).toBe(failure === "model-resolution" ? "queued" : "idle");
+      expect(h.owner.status(h.actor.id).queued).toBe(failure === "model-resolution" ? 1 : 0);
       expect(h.owner.status(h.actor.id).inFlightRun).toBeUndefined();
+      if (failure === "model-resolution") {
+        expect(h.owner.status(h.actor.id).activationBlocked).toMatchObject({ class: "hard" });
+        expect(h.owner.status(h.actor.id).activationBlocked?.retryAt).toBeUndefined();
+      }
     }, { timeout: 5000 });
     expect(JSON.parse(fs.readFileSync(store.resultFile(child.id), "utf8"))).toMatchObject({
       text: "x".repeat(100000), value: { output: "x".repeat(100000) },
@@ -573,7 +577,12 @@ describe.each(["session", "durable"] as const)("%s actor process children", (res
     });
     const restarted = h.makeOwner();
     cleanups.push(() => restarted.close());
+    if (failure === "model-resolution") {
+      await vi.waitFor(() => expect(restarted.status(h.actor.id)).toMatchObject({ queued: 1, activationBlocked: { class: "hard" } }));
+      expect(consumed).toBe(0); // Repair/restart alone cannot release a permanent binding refusal.
+    }
     restarted.tell(h.actor.id, "following activation may consume the unread handoff");
+    if (failure === "model-resolution") await restarted.resetSession(h.actor.id);
     await vi.waitFor(() => expect(restarted.status(h.actor.id).status).toBe("idle"), { timeout: 5000 });
     expect(consumed).toBe(1);
     expect(restarted.messages(h.actor.id).filter((m) => m.id === child.id && m.direction === "in")).toHaveLength(1);
@@ -618,7 +627,9 @@ describe.each(["session", "durable"] as const)("%s actor process children", (res
     h.endActivation();
     await vi.waitFor(() => {
       expect(store.received(child.id)).toBe(true);
-      expect(h.owner.status(h.actor.id).status).toBe("idle");
+      expect(h.owner.status(h.actor.id)).toMatchObject({ status: "queued", queued: 1, activationBlocked: { class: "hard" } });
+      expect(h.owner.status(h.actor.id).activationBlocked?.retryAt).toBeUndefined();
+      expect(h.owner.status(h.actor.id).inFlightRun).toBeUndefined();
       expect(h.owner.status(h.actor.id).lastError).toContain("defer before inference");
     }, { timeout: 5000 });
     h.resolveModel.mockImplementation(async (model) => model);
@@ -630,7 +641,8 @@ describe.each(["session", "durable"] as const)("%s actor process children", (res
     });
     const launch = vi.spyOn(ProcessTransport.prototype, "launch");
     const blocker = await h.ownerAgents.spawn({ task: "HANG", transport: "process" });
-    h.owner.tell(h.actor.id, "activation revoked before inference");
+    // Hold the permit before explicitly releasing the hard-blocked child activation.
+    await h.owner.resetSession(h.actor.id);
     await vi.waitFor(() => expect(h.ownerAgents.list().some((r) => r.actorId === h.actor.id && r.status === "queued")).toBe(true));
     const queued = h.ownerAgents.list().find((r) => r.actorId === h.actor.id && r.status === "queued")!;
     expect(tasks).toHaveLength(1);
@@ -672,20 +684,23 @@ describe.each(["session", "durable"] as const)("%s actor process children", (res
     const store = new ActorChildCompletionStore(h.actor.sessionFile!);
     await vi.waitFor(() => expect(store.pending()).toHaveLength(1), { timeout: 5000 });
     await h.runtime.shutdown();
-    h.resolveModel.mockRejectedValue(new Error("transient pre-inference model failure"));
+    h.resolveModel.mockRejectedValue(new Error("permanent pre-inference model failure"));
     h.endActivation();
     await vi.waitFor(() => {
       expect(store.received(child.id)).toBe(true);
-      expect(h.owner.status(h.actor.id).status).toBe("idle");
-      expect(h.owner.status(h.actor.id).lastError).toContain("transient pre-inference");
+      expect(h.owner.status(h.actor.id)).toMatchObject({ status: "queued", queued: 1, activationBlocked: { class: "hard" } });
+      expect(h.owner.status(h.actor.id).activationBlocked?.retryAt).toBeUndefined();
+      expect(h.owner.status(h.actor.id).inFlightRun).toBeUndefined();
+      expect(h.owner.status(h.actor.id).lastError).toContain("permanent pre-inference");
     }, { timeout: 5000 });
     const queueFile = () => path.join(path.dirname(h.actor.sessionFile!),
       fs.readdirSync(path.dirname(h.actor.sessionFile!)).find((file) => file.startsWith("queue-"))!);
-    const deferred = JSON.parse(fs.readFileSync(queueFile(), "utf8")).items;
-    expect(deferred).toHaveLength(1);
-    expect(deferred[0]).toMatchObject({ id: child.id, deferredHandoff: true });
-    const originalActivation = deferred[0].activation;
-    expect(h.owner.status(h.actor.id).queued).toBe(0);
+    const retained = JSON.parse(fs.readFileSync(queueFile(), "utf8")).items;
+    expect(retained).toHaveLength(1);
+    expect(retained[0]).toMatchObject({ id: child.id });
+    expect(retained[0].deferredHandoff).not.toBe(true); // Still an activation until freshness refuses it.
+    const originalActivation = retained[0].activation;
+    expect(h.owner.status(h.actor.id).queued).toBe(1);
     expect(JSON.parse(fs.readFileSync(store.resultFile(child.id), "utf8")).value).toEqual({ output: "x".repeat(100000) });
     let owner = h.owner;
     if (restart) {
@@ -704,8 +719,17 @@ describe.each(["session", "durable"] as const)("%s actor process children", (res
       if (tasks.length === 1) await nextRun;
       return run(...args);
     });
+    await vi.waitFor(() => expect(owner.status(h.actor.id)).toMatchObject({ queued: 1, activationBlocked: { class: "hard" } }));
+    expect(JSON.parse(fs.readFileSync(queueFile(), "utf8")).items[0].activation).toEqual(originalActivation);
     owner.tell(h.actor.id, "newer mailbox event 1");
+    expect(owner.status(h.actor.id)).toMatchObject({ queued: 2, activationBlocked: { class: "hard" } });
+    expect(tasks).toEqual([]); // New callerless work does not bypass the permanent refusal.
+    await owner.resetSession(h.actor.id);
     await vi.waitFor(() => expect(tasks).toHaveLength(1), { timeout: 5000 });
+    const deferred = JSON.parse(fs.readFileSync(queueFile(), "utf8")).items.filter((item: { deferredHandoff?: boolean }) => item.deferredHandoff);
+    expect(deferred).toHaveLength(1);
+    expect(deferred[0]).toMatchObject({ id: child.id, deferredHandoff: true });
+    expect(deferred[0].activation).toEqual(originalActivation);
     expect(tasks[0]).toContain("newer mailbox event 1");
     expect(tasks[0]).toContain("context only, not current activation facts");
     expect(tasks[0]).toContain(JSON.stringify(store.resultFile(child.id)));

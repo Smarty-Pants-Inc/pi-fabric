@@ -127,7 +127,8 @@ const providerTransientIn = (text: string): { why: string; match: string } | und
 const WINDOW_LOST = /^[ \t]*(?:Fabric activation window failed: )?(?:Error: )?(Activation window lost (?:current activation messages|its authorized compaction|its native history boundary|its native system records|its native system prompt|the Google config object))[ \t]*\r?$/m;
 // Persisted legacy records only: exact internal errors, optionally wrapped by #prepare
 // or Error.toString(). Live failures require a typed cause, never a message match.
-const REGISTRY_VETO = /^(?:(?:Error|ActorPreparationError): )?(?:Actor [\w:-]+ preparation \([\w-]+\): )?(?:ActorRegistryUpdateVetoedError: )?Actor registry update was vetoed by its validation and not committed; retry$/;
+// A non-registry preparation wrapper must not gain registry authority on restore.
+const REGISTRY_VETO = /^(?:(?:Error|ActorPreparationError): )?(?:Actor [\w:-]+ preparation \(registry\): )?(?:ActorRegistryUpdateVetoedError: )?Actor registry update was vetoed by its validation and not committed; retry$/;
 const REGISTRY_CHANGED_REPEATEDLY = /^(?:(?:Error|ActorPreparationError): )?(?:Actor [\w:-]+ preparation \([\w-]+\): )?(?:ParticipantPublicationChangedError: )?Actor registry changed (?:repeatedly during preparation|during participant preparation)$/;
 export const classifyActivationFailure = (input: {
   lastError: string; error?: string | undefined; evidence?: readonly string[] | undefined; preparation?: boolean | undefined;

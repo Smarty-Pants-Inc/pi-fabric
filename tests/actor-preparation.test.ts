@@ -410,7 +410,8 @@ describe("actor preparation (#3167)", () => {
     let recover = false;
     const { actors, agents, mesh } = setup({ meshCursorPath: cursorPath, preparationRetryMs: 30,
       acquireCapabilityView: async () => {
-        if (failed < failures) { failed++; throw new Error("temporary preparation unavailable"); }
+        // Cursor recovery models a transient capability deadline, not a hard plain Error.
+        if (failed < failures) { failed++; throw new ActorPreparationTimeoutError(actor.id, "capabilities", 80); }
         if (!recover) throw new Error("hold preparation for cursor inspection");
         return { satisfied: true, missing: [], optionalMissing: [],
           view: { id: "recovered", digest: "recovered", semanticDigest: "recovered", bindings: {} }, release: async () => {} };
@@ -712,7 +713,8 @@ describe("#816 per-actor queue acceptance", () => {
           actorRoot: path.join(root, "actors"), persistent: true, meshCursorPath: cursorPath,
           preparationTimeoutMs: 80, preparationRetryMs: 20,
           acquireCapabilityView: async () => {
-            if (!preparation.ok) { preparation.failures++; throw new Error("temporary preparation unavailable"); }
+            // Page/restart recovery models a transient capability deadline, not a hard plain Error.
+            if (!preparation.ok) { preparation.failures++; throw new ActorPreparationTimeoutError(actors.list().find(actor => actor.name === "failing-prep")!.id, "capabilities", 80); }
             return { satisfied: true, missing: [], optionalMissing: [],
               view: { id: "ok", digest: "ok", semanticDigest: "ok", bindings: {} }, release: async () => {} };
           },

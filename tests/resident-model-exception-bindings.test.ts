@@ -99,14 +99,34 @@ describe("resident protected model exception bindings", () => {
 
       await actors.setThinking(actor.id, "high");
       releaseFirst();
-      await waitFor(() => protectedSpawned.length === 1 && actors.status(actor.id).status === "idle");
+      await waitFor(() => actors.status(actor.id).queued === 2 &&
+        actors.status(actor.id).activationBlocked?.class === "hard" && actors.status(actor.id).status === "queued");
       expect(denials).toEqual([expect.objectContaining({
         code: "FABRIC_MODEL_EXCEPTION_DENIED", denial: "thinking-exceeds", role: "actor:serial", model: protectedModel,
       })]);
-      expect(requests).toHaveLength(2);
-      expect(requests[1]).toMatchObject({ model: protectedModel, modelReason, thinking: "low" });
-      expect(protectedSpawned).toHaveLength(1);
-      expect(protectedSpawned[0]).toMatchObject({ model: protectedModel, modelReason, thinking: "low" });
+      expect(actors.status(actor.id).thinking).toBe("high");
+      expect(requests).toHaveLength(1);
+      expect(protectedSpawned).toHaveLength(0);
+      const deniedQueue = JSON.parse(fs.readFileSync(path.join(actorRoot, actor.id, queueFile), "utf8"));
+      expect(deniedQueue.items.map((item: { id: string }) => item.id)).toEqual([modelOnly.messageId, explicitLow.messageId]);
+      expect(deniedQueue.items[0]?.binding).toEqual({ model: protectedModel, modelReason });
+      expect(deniedQueue.items[1]?.binding).toEqual({ model: protectedModel, modelReason, thinking: "low" });
+
+      await actors.setThinking(actor.id, "medium");
+      expect(actors.status(actor.id).thinking).toBe("medium");
+      await actors.resetSession(actor.id);
+      await waitFor(() => requests.length === 3 && protectedSpawned.length === 2 &&
+        actors.status(actor.id).queued === 0 && actors.status(actor.id).status === "idle");
+      expect(requests).toHaveLength(3);
+      expect(requests[1]).toMatchObject({ model: protectedModel, modelReason, thinking: "medium" });
+      expect(requests[2]).toMatchObject({ model: protectedModel, modelReason, thinking: "low" });
+      expect(protectedSpawned).toHaveLength(2);
+      expect(protectedSpawned[0]).toMatchObject({ model: protectedModel, modelReason, thinking: "medium" });
+      expect(protectedSpawned[1]).toMatchObject({ model: protectedModel, modelReason, thinking: "low" });
+      for (const messageId of [modelOnly.messageId, explicitLow.messageId]) {
+        expect(requests.filter((request) => request.task.includes(messageId))).toHaveLength(1);
+        expect(protectedSpawned.filter((request) => request.task.includes(messageId))).toHaveLength(1);
+      }
     } finally {
       releaseFirst();
     }

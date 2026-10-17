@@ -1,6 +1,6 @@
 import type { ExtensionAPI, ExtensionContext, MessageRenderer, Theme } from "@earendil-works/pi-coding-agent";
 import { CustomMessageComponent, initTheme } from "@earendil-works/pi-coding-agent";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { registerIncomingMessageRenderers } from "../src/ui/incoming-messages.js";
 import { rootInboxMessage } from "../src/topology/root-inbox.js";
 import type { MeshEvent, MeshIdentity } from "../src/mesh/store.js";
@@ -29,17 +29,35 @@ const entry = (value: CustomMessage): unknown => ({ ...value, type: "custom_mess
 const harness = () => {
   let branch: unknown[] = [];
   const renderers = new Map<string, MessageRenderer>();
-  let start: ((event: unknown, context: ExtensionContext) => unknown) | undefined;
-  const on = (_name: string, callback: (event: unknown, context: ExtensionContext) => unknown): void => { start = callback; };
+  const handlers = new Map<string, Array<(event: unknown, context: ExtensionContext) => unknown>>();
+  const on = (name: string, callback: (event: unknown, context: ExtensionContext) => unknown): void => {
+    const registered = handlers.get(name) ?? []; registered.push(callback); handlers.set(name, registered);
+  };
   const registerMessageRenderer = (type: string, render: MessageRenderer): void => { renderers.set(type, render); };
   registerIncomingMessageRenderers({ on, registerMessageRenderer } as unknown as ExtensionAPI, () => "collapsed");
-  start!({}, { sessionManager: { getBranch: () => branch } } as unknown as ExtensionContext);
+  const byId = new Map<string, unknown>();
+  const getBranch = vi.fn(() => branch);
+  const sessionManager = {
+    getLeafEntry: () => branch.at(-1), getEntry: (id: string) => byId.get(id), getEntries: () => [...branch],
+    getSessionId: () => "display-identity-test", getHeader: () => ({ version: 3 }), getBranch,
+  };
+  const context = { sessionManager } as unknown as ExtensionContext;
+  for (const handler of handlers.get("session_start") ?? []) handler({}, context);
   const render = (value: CustomMessage): readonly string[] | undefined =>
     renderers.get(value.customType)!(value, { expanded: false, outputPad: 1 }, theme)?.render(200);
   return {
     render,
     renderer: renderers.get("pi-fabric-inbox")!,
-    setBranch: (entries: unknown[]) => { branch = entries; },
+    setBranch: (entries: unknown[]) => {
+      byId.clear();
+      let parentId: string | null = null;
+      branch = entries.map((raw, index) => {
+        const value = raw && typeof raw === "object" ? raw as Record<string, unknown> : {};
+        const id = typeof value.id === "string" ? value.id : `display-entry-${index}`;
+        const next = { ...value, id, parentId }; byId.set(id, next); parentId = id; return next;
+      });
+      for (const handler of handlers.get("session_tree") ?? []) handler({}, context);
+    },
   };
 };
 

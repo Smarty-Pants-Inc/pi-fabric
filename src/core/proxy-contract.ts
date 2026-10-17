@@ -1,5 +1,6 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { PI_CORE_TOOL_NAME_SET } from "./pi-tools.js";
+import { walkActiveSessionBranch } from "./preview.js";
 
 export const PROXY_CONTRACT_CUSTOM_TYPE = "pi-fabric-proxy";
 
@@ -111,14 +112,7 @@ export class ProxyContractLedger {
   ): void {
     this.#reminded.clear();
     if (!sessionManager || typeof sessionManager.getLeafEntry !== "function" || typeof sessionManager.getEntry !== "function") return;
-    const visited = new Set<string>();
-    let entry = sessionManager.getLeafEntry();
-    while (entry && !visited.has(entry.id)) {
-      visited.add(entry.id);
-      this.#rememberEntry(entry);
-      const parentId = entry.parentId;
-      entry = parentId ? sessionManager.getEntry(parentId) : undefined;
-    }
+    for (const entry of walkActiveSessionBranch(sessionManager)) this.#rememberEntry(entry);
   }
 
   #rememberEntry(entryUnknown: unknown): void {

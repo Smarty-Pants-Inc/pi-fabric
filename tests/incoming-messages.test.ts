@@ -88,6 +88,22 @@ describe("incoming Fabric display projection", () => {
     expect(h.getEntry).toHaveBeenCalledTimes(pointLookups);
   });
 
+  it("keeps prior-inbox rendering constant-time after indexing a large branch", () => {
+    const h = harness();
+    const prior = inbox([event("large-history-event", "prior body")]);
+    const rows = Array.from({ length: 2_000 }, () => ({ type: "message", message: { role: "user", content: "history" } }));
+    h.setBranch([...rows, entry(prior)]);
+    const pointLookups = h.getEntry.mock.calls.length;
+    const leafLookups = h.getLeafEntry.mock.calls.length;
+    expect(plain(h.render(prior)![0]!)).toContain("prior body");
+    const replay = { ...inbox([event("large-history-event", "replayed body")]), timestamp: prior.timestamp + 60_000 };
+    for (let index = 0; index < 8; index++) expect(h.render(replay)).toEqual([]);
+    expect(h.getBranch).not.toHaveBeenCalled();
+    expect(h.getEntries).not.toHaveBeenCalled();
+    expect(h.getEntry).toHaveBeenCalledTimes(pointLookups);
+    expect(h.getLeafEntry).toHaveBeenCalledTimes(leafLookups);
+  });
+
   it("renders exactly one dim decoded whitespace-collapsed body line", () => {
     const lines = harness().render(message())!;
     expect(lines).toHaveLength(1);

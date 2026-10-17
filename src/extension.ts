@@ -16,6 +16,7 @@ import { applyRunBashDefaults } from "./guards/actor-bash-timeout.js";
 import { registerFabricFixture } from "./guards/fixture-mode.js";
 import { registerJevAuth } from "./jev/auth.js";
 import { yieldsToExplicitFabric } from "./core/explicit-fabric.js";
+import { recentSessionEntries } from "./core/preview.js";
 import type {
   ContextEvent,
   ContextEventResult,
@@ -205,8 +206,8 @@ const settledOutcome = (event: unknown, context: ExtensionContext): string => {
   const outcome = (event as { outcome?: unknown }).outcome;
   if (typeof outcome === "string") return outcome;
   if (context.signal?.aborted) return "aborted";
-  const entries = context.sessionManager.getEntries();
-  for (let index = entries.length - 1; index >= Math.max(0, entries.length - 50); index--) {
+  const entries = recentSessionEntries(context.sessionManager, 50);
+  for (let index = entries.length - 1; index >= 0; index--) {
     const entry = entries[index] as { type?: string; message?: { role?: string; stopReason?: string } };
     if (entry.type === "message" && entry.message?.role === "assistant") {
       return entry.message.stopReason === "aborted" || entry.message.stopReason === "error"
@@ -937,7 +938,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
       }
       // Records: the same gate, re-checked after the read (F21).
       if (!idle()) return undefined;
-      const records = await state.nextRecordsInboxMessage(context.sessionManager.getEntries()).catch(() => undefined);
+      const records = await state.nextRecordsInboxMessage(context.sessionManager).catch(() => undefined);
       if (records && idle()) sendFabricMessage(pi, records, { deliverAs: "followUp", triggerTurn: true });
     } catch {
       // A stale context (reload, session replacement) or a mesh error: the next event or turn retries.
@@ -997,6 +998,10 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     state.thinking.invalidate();
     programRunContext = context;
     await state.bootstrap(context);
+    state.resetRecordsInboxCursor(context.sessionManager);
+    // Re-derive the inbox receipt cursor once at session_start; file-backed sessions cache their
+    // confirmed prefix and in-memory sessions use SessionManager's point-lookup active-branch walk.
+    confirmedRootInboxSession(context.sessionManager, verifyIssuedInbox);
     principalView.start(context);
     // Inert until Pi queues a triggered message behind a live prompt preflight (also for records, F21).
     state.setRecordsWake(hostQueuesTriggeredBehindPreflight(pi) ? wakeIdleMain : undefined);
@@ -1057,6 +1062,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
   // Branch changes move the leaf: emitted echoes and spent reminder budget
   // must track it exactly. Rewind removes abandoned-branch residue.
   pi.on("session_tree", async (_event, context) => {
+    state.resetRecordsInboxCursor(context.sessionManager);
     state.thinking.invalidate();
     proxyContract.reset();
     refreshProxyLedger(context);
@@ -1180,7 +1186,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     if (settledCompleted(event, context)) {
       // Records addressed to this root past its processing cursor (smarty-dev#754 C4), same hook.
       // The shadow root inbox reconciles in the outer finally for every settle outcome.
-      const records = await state.nextRecordsInboxMessage(context.sessionManager.getEntries()).catch(() => undefined);
+      const records = await state.nextRecordsInboxMessage(context.sessionManager).catch(() => undefined);
       if (records) sendFabricMessage(pi, records, { deliverAs: "followUp", triggerTurn: true });
     }
   };
@@ -1694,7 +1700,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
   // Records addressed to this root reach it with its next turn (smarty-dev#754 C4).
   pi.on("before_agent_start", async (_event, context) => {
     if (!state.initialized) return;
-    const message = await state.nextRecordsInboxMessage(context.sessionManager.getEntries()).catch(() => undefined);
+    const message = await state.nextRecordsInboxMessage(context.sessionManager).catch(() => undefined);
     if (!message) return;
     // Records have authors, not authenticated admission envelopes. Never claim this Main.
     if (!fabricProvenanceSupported(pi)) return { message };

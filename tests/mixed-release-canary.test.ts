@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -10,6 +11,9 @@ const MIN_HOLD = 60_000;
 const CANDIDATE_SHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const LEGACY_SHA = "41a73f8588e5351d9409736f725fee218810b78c";
 const ROOT = "session:legacy-41a-root";
+const SENTINEL = "session:historied-41a-sentinel";
+const MODERN_OLD = "session:modern-old-root";
+const MODERN_SHA = "c42f7f34125abe2ebbe660758253c9ec4d7765dd";
 const HUB = "session:hub-root";
 const NEW = "session:new-root";
 const HUB_NAME = "hub";
@@ -17,7 +21,8 @@ const NEW_NAME = "new";
 const OLD_NAME = "old-41a";
 const STARTED = 100_000;
 const ENDED = STARTED + MIN_HOLD;
-const TOKEN_HASH = "b".repeat(64);
+const TOKEN = "native-seed-token";
+const TOKEN_HASH = createHash("sha256").update(TOKEN).digest("hex");
 const roots: string[] = [];
 let tempRoot = "";
 
@@ -51,14 +56,16 @@ function makeValidEvidence(): Record<string, any> {
     { id: NEW, name: NEW_NAME, role: "new", sha: CANDIDATE_SHA, ownerIncarnation: "epoch-new", relayCapable: true, capabilityEvidence: structuredClone(capableEvidence) },
     // The historical 41a caller is genuinely tokenless and has no owner epoch.
     { id: ROOT, name: OLD_NAME, role: "old", sha: LEGACY_SHA, relayCapable: false, capabilityEvidence: structuredClone(legacyEvidence) },
+    { id: MODERN_OLD, name: "old-modern", role: "old", sha: MODERN_SHA, ownerIncarnation: "epoch-modern", relayCapable: true, capabilityEvidence: structuredClone(capableEvidence) },
   ];
-  const releases = [{ sha: CANDIDATE_SHA }, { sha: LEGACY_SHA }];
+  const releases = [{ sha: CANDIDATE_SHA }, { sha: LEGACY_SHA }, { sha: MODERN_SHA }];
   const registrations = [
     { id: HUB, native: true, leaseLive: true, participant: true, ownerIncarnation: "epoch-hub", stateBackend: "sqlite", lockProtocol: 3, hostTokenHash: "d".repeat(64), leaseTokenHash: "d".repeat(64) },
     { id: NEW, native: true, leaseLive: true, participant: true, ownerIncarnation: "epoch-new", stateBackend: "sqlite", lockProtocol: 3, hostTokenHash: "e".repeat(64), leaseTokenHash: "e".repeat(64) },
     { id: ROOT, name: OLD_NAME, native: true, leaseLive: true, participant: true, stateBackend: "sqlite", lockProtocol: 2, tokenless: true },
+    { id: MODERN_OLD, native: true, leaseLive: true, participant: true, ownerIncarnation: "epoch-modern", stateBackend: "sqlite", lockProtocol: 3, hostTokenHash: "f".repeat(64), leaseTokenHash: "f".repeat(64) },
   ];
-  const links = [NEW_NAME, OLD_NAME].map(name => ({ name, starts: 1, linkedAt: STARTED - 1, observedUntil: ENDED + 1, closedAt: null, relayAuthenticated: true }));
+  const links = [NEW_NAME, OLD_NAME, "old-modern"].map(name => ({ name, starts: 1, linkedAt: STARTED - 1, observedUntil: ENDED + 1, closedAt: null, relayAuthenticated: true }));
   const allPairs = nodes.flatMap(source => nodes.filter(target => target.id !== source.id).map(target => ({ source, target })));
   const requiredPairs = allPairs.filter(({ source, target }) => source.role === "hub" || target.role === "hub" || source.relayCapable && target.relayCapable);
   const presencePairs = allPairs.filter(({ source, target }) => source.role === "hub" || target.role === "hub" || source.relayCapable);
@@ -98,6 +105,15 @@ function makeValidEvidence(): Record<string, any> {
       data: { commandId: send.commandId, targetId: send.target, accepted: true, messageId: `ack:${send.marker}` },
     })),
   }));
+  const rawOwner = { ownerHostId: SENTINEL, ownerIdentityId: SENTINEL, ownerIncarnation: "epoch-seed", remoteHost: "hub" };
+  const mirror = { id: SENTINEL, hostTokenHash: TOKEN_HASH, leaseTokenHash: TOKEN_HASH, ownerIncarnation: "epoch-seed",
+    remoteHost: "hub", hostHash: "1".repeat(64), leaseHash: "2".repeat(64), rowHash: "3".repeat(64), rawOwner };
+  const marker = "history-only-marker", commandId = "history-only-command";
+  const actualOwner = { remoteHost: "hub", ownerIncarnation: "epoch-seed", expiresAt: STARTED + 15_000 };
+  const command = { from: { id: NEW }, to: SENTINEL, data: { commandId, targetId: SENTINEL, operation: "followUp",
+    data: { marker }, message: marker, destinationRemoteHost: "hub", ownerIncarnation: "epoch-seed" } };
+  const ack = { verification: "bridge", from: { id: SENTINEL }, to: NEW,
+    data: { commandId, targetId: SENTINEL, accepted: true, messageId: `ack:${marker}` } };
   return {
     mode: "release-gate",
     holdMs: MIN_HOLD,
@@ -112,11 +128,21 @@ function makeValidEvidence(): Record<string, any> {
     sends,
     tallies,
     history: {
-      old: { id: ROOT, name: OLD_NAME, native: true, tokenless: true },
-      seeded: { id: ROOT, hostTokenHash: TOKEN_HASH, leaseTokenHash: TOKEN_HASH },
-      preserved: { id: ROOT, hostTokenHash: TOKEN_HASH, leaseTokenHash: TOKEN_HASH },
-      hub: { id: ROOT, remoteHost: OLD_NAME, tokenless: true },
-      warning: { name: "STALE_INCARNATION_HISTORY", source: "canary", rootId: ROOT, tokenHash: TOKEN_HASH },
+      fresh: { id: ROOT, before: { id: ROOT, host: null, lease: null, participant: null, row: null, owner: null } },
+      old: { id: SENTINEL, name: OLD_NAME, sha: LEGACY_SHA, native: true, tokenless: true, leaseLive: true },
+      seeded: clone(mirror), preserved: clone(mirror), after: clone(mirror),
+      hub: { id: SENTINEL, remoteHost: OLD_NAME, tokenless: true },
+      warning: { name: "STALE_INCARNATION_HISTORY", source: "bridge", rootId: SENTINEL, tokenHash: TOKEN_HASH,
+        occurrenceCount: 1, rawLines: [{ link: "measured-new", line: `bridge hub: skipped stale relayed root ${SENTINEL}; preserving its mirror` }] },
+      liveAtAttempt: { id: SENTINEL, native: true, tokenless: true, leaseLive: true, observedAt: STARTED, leaseExpiresAt: STARTED + 15_000 },
+      attempt: { marker, source: NEW, intendedTarget: SENTINEL, actualOwner, publicRequestInvoked: true,
+        observed: { id: SENTINEL, host: { incarnationToken: TOKEN }, owner: clone(actualOwner) },
+        beganAt: STARTED + 1, endedAt: STARTED + 2, elapsedMs: 1, timeoutMs: 20_000, ackGraceMs: 15_000,
+        receipt: { acknowledged: true, routed: "mesh", messageId: `ack:${marker}` }, commandEvents: [command], ackEvents: [ack] },
+      destination: { native: { id: SENTINEL }, expected: [marker], invalid: 0, duplicateCalls: 0,
+        liveAfter: { id: SENTINEL, native: true, tokenless: true, leaseLive: true, observedAt: ENDED },
+        entries: [{ marker, from: NEW, targetId: SENTINEL, commandId, calls: 1, verification: "bridge" }],
+        ackEvents: [{ ...clone(ack), verification: undefined }] },
     },
     restartCount: 0,
     cleanup: { ok: true, failures: [], owned: [] },
@@ -219,6 +245,39 @@ describe("mixed-release canary receipt is fail-closed", () => {
     expect(result.checks.every(check => check.status === "PASS")).toBe(true);
   });
 
+  it("passes an actual named public refusal without pretending the sentinel was delivered", () => {
+    const e = makeValidEvidence();
+    delete e.history.attempt.receipt;
+    e.history.attempt.error = { source: "FabricControlPlane.request", name: "FabricControlStaleIncarnationError",
+      code: "FABRIC_CONTROL_STALE_INCARNATION", message: `Stale Fabric owner incarnation for ${SENTINEL}` };
+    e.history.attempt.ackEvents = [];
+    e.history.destination.entries = [];
+    e.history.destination.ackEvents = [];
+    const result = evaluateReceipt(e);
+    expect(result.ok).toBe(true);
+    expect(result.checks.find(check => check.name === "historied-live-root-public-followup-outcome")?.evidence).toMatchObject({ outcome: "named-public-error" });
+  });
+
+  it("accepts a named public bridge-stale outcome verbatim, independently of normal controls on the same old mesh", () => {
+    const e = makeValidEvidence();
+    delete e.history.attempt.receipt;
+    e.history.attempt.error = { source: "FabricControlPlane.request", name: "FabricBridgeStaleError", code: "FABRIC_BRIDGE_STALE",
+      message: `Fabric bridge-stale for remote host hub, target ${SENTINEL}; no fresh mirror from that host; the remote owner's lease is unconfirmed; the outcome is unknown and it may still be delivered, so a retry can deliver it twice.` };
+    e.history.attempt.ackEvents = [{ verification: "bridge", from: { id: "bridge:hub" }, to: NEW,
+      data: { commandId: "history-only-command", targetId: SENTINEL, accepted: false, error: "Relay destination unavailable" } }];
+    e.history.destination.entries = [];
+    e.history.destination.ackEvents = [{ from: { id: ROOT }, to: HUB,
+      data: { commandId: "normal-primary-command", targetId: ROOT, accepted: true } }];
+    expect(evaluateReceipt(e).ok).toBe(true);
+  });
+
+  it("counts repeated root-specific production warnings without claiming production exact-once", () => {
+    const e = makeValidEvidence();
+    e.history.warning.rawLines.push(clone(e.history.warning.rawLines[0]));
+    e.history.warning.occurrenceCount = 2;
+    expect(evaluateReceipt(e).ok).toBe(true);
+  });
+
   it("passes a complete baseline control only as non-release-gate evidence", () => {
     const baseline = makeValidEvidence();
     baseline.mode = "baseline-control";
@@ -273,6 +332,44 @@ describe("mixed-release canary receipt is fail-closed", () => {
     ["a mismatched authenticated ACK", (e: any) => { e.sends[0].ack.from = "session:wrong-destination"; }],
     ["absent genuine history", (e: any) => { e.history = {}; }],
     ["forged genuine history", (e: any) => { e.history.seeded.hostTokenHash = "f".repeat(64); }],
+    ["the primary root reused as the historied sentinel", (e: any) => { e.history.seeded.id = ROOT; }],
+    ["a primary root with prior history", (e: any) => { e.history.fresh.before.host = { incarnationToken: TOKEN }; }],
+    ["a retained mirror rebound to old-41a", (e: any) => { e.history.after.remoteHost = OLD_NAME; e.history.after.rawOwner.remoteHost = OLD_NAME; }],
+    ["erased retained lease", (e: any) => { e.history.after.leaseHash = null; }],
+    ["changed retained lease", (e: any) => { e.history.after.leaseHash = "changed"; }],
+    ["changed retained owner epoch", (e: any) => { e.history.after.rawOwner.ownerIncarnation = "new"; }],
+    ["an uncorrelated root warning", (e: any) => { e.history.warning.rawLines[0].line = "skipped stale relayed root somebody-else"; }],
+    ["an invented canary warning", (e: any) => { e.history.warning.source = "canary"; }],
+    ["an absent production warning", (e: any) => { e.history.warning.occurrenceCount = 0; e.history.warning.rawLines = []; }],
+    ["an uninvoked public request", (e: any) => { e.history.attempt.publicRequestInvoked = false; }],
+    ["an absent public outcome", (e: any) => { delete e.history.attempt.receipt; }],
+    ["a request to the wrong root", (e: any) => { e.history.attempt.intendedTarget = ROOT; }],
+    ["a forced old-spoke route", (e: any) => { e.history.attempt.actualOwner.remoteHost = OLD_NAME; }],
+    ["a fabricated request precheck rejection", (e: any) => {
+      delete e.history.attempt.receipt;
+      e.history.attempt.error = { source: "canary-precheck", name: "Error", message: `No authentic owner for ${SENTINEL}` };
+      e.history.attempt.ackEvents = []; e.history.destination.entries = []; e.history.destination.ackEvents = [];
+    }],
+    ["a generic harness timeout", (e: any) => {
+      delete e.history.attempt.receipt;
+      e.history.attempt.error = { source: "FabricControlPlane.request", name: "Error", message: `RPC deadline for ${SENTINEL}` };
+      e.history.attempt.ackEvents = []; e.history.destination.entries = []; e.history.destination.ackEvents = [];
+    }],
+    ["an unknown public timeout outcome", (e: any) => {
+      delete e.history.attempt.receipt;
+      e.history.attempt.error = { source: "FabricControlPlane.request", name: "Error", message: `Fabric bridge not responding for ${SENTINEL}; the outcome is unknown` };
+      e.history.attempt.ackEvents = []; e.history.destination.entries = []; e.history.destination.ackEvents = [];
+    }],
+    ["an expired native sentinel at invocation", (e: any) => { e.history.liveAtAttempt.leaseExpiresAt = STARTED - 1; }],
+    ["a dead native sentinel after invocation", (e: any) => { e.history.destination.liveAfter.leaseLive = false; }],
+    ["the wrong native sentinel after invocation", (e: any) => { e.history.destination.liveAfter.id = ROOT; }],
+    ["an outcome outside the 35s public budget", (e: any) => { e.history.attempt.elapsedMs = 35_001; }],
+    ["an artificially short request timeout", (e: any) => { e.history.attempt.timeoutMs = 1; }],
+    ["an acknowledged history send without a handler", (e: any) => { e.history.destination.entries = []; }],
+    ["a duplicate sentinel handler", (e: any) => { e.history.destination.entries[0].calls = 2; }],
+    ["an unauthenticated sentinel handler", (e: any) => { e.history.destination.entries[0].verification = "local"; }],
+    ["an uncorrelated sentinel ACK", (e: any) => { e.history.attempt.ackEvents[0].data.commandId = "wrong"; }],
+    ["a missing sentinel ACK", (e: any) => { e.history.attempt.ackEvents = []; }],
     ["unsupported pair citations without source evidence", (e: any) => {
       for (const unsupported of e.unsupported) {
         for (const release of unsupported.lackingReleases) {

@@ -127,7 +127,9 @@ function validCapabilityEvidence(cites, supported) {
  * routes [{phase,source,target,remoteHost,ownerIncarnation,via}], unsupported [{source,target,reason,lackingReleases}],
  * plans [{marker,source,target,round}],
  * sends [{marker,source,target,commandId,ack}], tallies [{id,entries,invalid,duplicateCalls,ackEvents}],
- * history {seeded,preserved,old,hub,warning}. The CLI retains the underlying raw readbacks too.
+ * history {fresh,seeded,preserved,after,old,hub,warning,attempt,liveAtAttempt,destination}.
+ * The independent fresh primary remains a normal node; the historied sentinel is diagnostic only.
+ * The CLI retains raw host/lease/participant/owner readbacks and public request outcomes.
  */
 export function evaluateReceipt(e = {}) {
   const checks = [];
@@ -208,15 +210,69 @@ export function evaluateReceipt(e = {}) {
         entry.targetId === plan.target && entry.commandId === sends.find(send => send.marker === plan.marker)?.commandId;
     });
   }), tallies.map(({ id, entries, invalid, duplicateCalls }) => ({ id, entries, invalid, duplicateCalls })));
-  const h = e.history ?? {}, seeded = h.seeded ?? {}, preserved = h.preserved ?? {};
-  const historyValid = seeded.id && seeded.id === preserved.id && seeded.id === h.old?.id && seeded.id === h.hub?.id &&
+  const h = e.history ?? {}, seeded = h.seeded ?? {}, preserved = h.preserved ?? {}, after = h.after ?? {};
+  const fresh = nodes.find(node => node.id === h.fresh?.id && node.role === "old" && node.name === h.old?.name);
+  const freshValid = fresh && fresh.id !== seeded.id && fresh.sha === h.old?.sha &&
+    registrations.some(row => row.id === fresh.id && row.tokenless && row.native) &&
+    h.fresh.before?.id === fresh.id && ["host", "lease", "participant", "row", "owner"].every(key => h.fresh.before[key] === null) &&
+    ["before", "after"].every(phase => routes.some(route => route.phase === phase && route.source === nodes.find(node => node.role === "new")?.id &&
+      route.target === fresh.id && route.remoteHost === fresh.name && route.via === "hub"));
+  check("independent-fresh-tokenless-root-reaches-new", baseline || Boolean(freshValid), baseline ? { skipped: "baseline-control" } : h.fresh);
+  const historyValid = seeded.id && !nodes.some(node => node.id === seeded.id) && seeded.id === preserved.id && seeded.id === after.id &&
+    seeded.id === h.old?.id && seeded.id === h.hub?.id && freshValid &&
     seeded.hostTokenHash && seeded.hostTokenHash === seeded.leaseTokenHash && seeded.hostTokenHash === preserved.hostTokenHash &&
-    preserved.hostTokenHash === preserved.leaseTokenHash && h.old.native && h.old.tokenless && h.hub.tokenless &&
-    h.hub.remoteHost === h.old.name && h.warning?.name === "STALE_INCARNATION_HISTORY" &&
-    ["bridge", "canary"].includes(h.warning?.source) && h.warning.rootId === seeded.id &&
-    h.warning.tokenHash === seeded.hostTokenHash && nodes.some(node => node.role === "old" && node.id === seeded.id && node.name === h.old.name);
-  check("stale-incarnation-history-warning-not-fatal", baseline ? true : Boolean(historyValid),
-    baseline ? { skipped: "baseline-control is NOT the mixed-release release gate" } : h);
+    preserved.hostTokenHash === preserved.leaseTokenHash && preserved.remoteHost === "hub" && after.remoteHost === preserved.remoteHost &&
+    preserved.ownerIncarnation === seeded.ownerIncarnation && after.ownerIncarnation === preserved.ownerIncarnation && preserved.rawOwner?.remoteHost === "hub" &&
+    ["hostTokenHash", "leaseTokenHash", "hostHash", "leaseHash", "rowHash", "rawOwner"].every(key =>
+      preserved[key] != null && JSON.stringify(preserved[key]) === JSON.stringify(after[key])) &&
+    h.old.native && h.old.tokenless && h.old.leaseLive && h.hub.tokenless && h.hub.remoteHost === h.old.name &&
+    h.warning?.name === "STALE_INCARNATION_HISTORY" && h.warning.source === "bridge" && h.warning.rootId === seeded.id &&
+    h.warning.tokenHash === seeded.hostTokenHash && h.warning.occurrenceCount > 0 &&
+    h.warning.occurrenceCount === h.warning.rawLines?.length && h.warning.rawLines.every(row =>
+      row.link === "measured-new" && row.line.includes(seeded.id) && /skipped stale relayed root/i.test(row.line));
+  check("stale-incarnation-history-warning-not-fatal", baseline || Boolean(historyValid), baseline ? { skipped: "baseline-control" } : h);
+  const attempt = h.attempt ?? {}, destination = h.destination ?? {}, live = h.liveAtAttempt ?? {};
+  const entries = destination.entries ?? [], commands = attempt.commandEvents ?? [], acks = attempt.ackEvents ?? [];
+  const commandIds = [...new Set(commands.map(event => event.data?.commandId))];
+  const publicAttempt = historyValid && attempt.publicRequestInvoked === true && attempt.source === nodes.find(node => node.role === "new")?.id &&
+    attempt.intendedTarget === seeded.id && typeof attempt.marker === "string" && attempt.marker.length > 0 &&
+    !plans.some(plan => plan.marker === attempt.marker) && attempt.timeoutMs === 20_000 && attempt.ackGraceMs === 15_000 &&
+    Number.isFinite(attempt.beganAt) && Number.isFinite(attempt.endedAt) && Number.isFinite(attempt.elapsedMs) &&
+    attempt.beganAt >= hold.startedAt && attempt.endedAt <= hold.endedAt && attempt.endedAt >= attempt.beganAt &&
+    attempt.elapsedMs >= 0 && attempt.elapsedMs <= 35_000 && attempt.endedAt - attempt.beganAt <= 35_000 &&
+    attempt.observed?.id === seeded.id && attempt.observed.host?.incarnationToken &&
+    hash(attempt.observed.host.incarnationToken) === seeded.hostTokenHash &&
+    JSON.stringify(attempt.actualOwner) === JSON.stringify(attempt.observed.owner) && attempt.actualOwner?.remoteHost === "hub" &&
+    attempt.actualOwner.ownerIncarnation === seeded.ownerIncarnation && live.id === seeded.id && live.native && live.tokenless && live.leaseLive &&
+    live.observedAt <= attempt.beganAt && live.leaseExpiresAt > attempt.beganAt &&
+    destination.native?.id === seeded.id && destination.liveAfter?.id === seeded.id && destination.liveAfter.native && destination.liveAfter.tokenless && destination.liveAfter.leaseLive &&
+    destination.liveAfter.observedAt >= attempt.endedAt && destination.invalid === 0 && destination.duplicateCalls === 0 && entries.length <= 1 &&
+    destination.expected?.length === 1 && destination.expected[0] === attempt.marker &&
+    commands.every(event => event.from?.id === attempt.source && event.to === seeded.id && event.data?.targetId === seeded.id &&
+      event.data?.operation === "followUp" && event.data?.data?.marker === attempt.marker && event.data?.message === attempt.marker &&
+      event.data?.destinationRemoteHost === attempt.actualOwner.remoteHost && event.data?.ownerIncarnation === attempt.actualOwner.ownerIncarnation);
+  const authenticatedAck = event => event.verification === "bridge" && event.from?.id === seeded.id && event.to === attempt.source &&
+    commandIds.includes(event.data?.commandId) && event.data?.targetId === seeded.id && event.data?.accepted === true &&
+    event.data?.messageId === `ack:${attempt.marker}`;
+  const delivered = !attempt.error && attempt.receipt?.acknowledged === true && attempt.receipt.routed === "mesh" &&
+    attempt.receipt.messageId === `ack:${attempt.marker}` && commandIds.length === 1 && entries.length === 1 &&
+    entries[0].marker === attempt.marker && entries[0].from === attempt.source && entries[0].targetId === seeded.id &&
+    entries[0].commandId === commandIds[0] && entries[0].calls === 1 && entries[0].verification === "bridge" &&
+    acks.length === 1 && authenticatedAck(acks[0]) &&
+    (destination.ackEvents ?? []).filter(event => event.from?.id === seeded.id && event.to === attempt.source &&
+      event.data?.commandId === commandIds[0] && event.data?.targetId === seeded.id && event.data?.accepted === true &&
+      event.data?.messageId === `ack:${attempt.marker}`).length === 1;
+  const refusal = !attempt.receipt && entries.length === 0 && !acks.some(event => event.data?.accepted === true) &&
+    !(destination.ackEvents ?? []).some(event => commandIds.includes(event.data?.commandId) && event.data?.accepted === true) &&
+    attempt.error?.source === "FabricControlPlane.request" && typeof attempt.error.name === "string" && attempt.error.name.length > 0 &&
+    typeof attempt.error.message === "string" && attempt.error.message.includes(seeded.id) &&
+    !/RPC deadline|harness/i.test(attempt.error.message) &&
+    // A named public lease/route error is a visible sender outcome even when its
+    // truthful message says delivery is unknown. Do not confuse that with no result
+    // or a generic ACK timeout; preserve its exact words for the release owner.
+    (attempt.error.name !== "Error" || !/outcome is unknown|not responding|Timed out waiting/i.test(attempt.error.message) || attempt.error.notDelivered === true);
+  check("historied-live-root-public-followup-outcome", baseline || Boolean(publicAttempt && (delivered || refusal)),
+    baseline ? { skipped: "baseline-control" } : { outcome: delivered ? "delivered" : refusal ? "named-public-error" : "FAIL", attempt, live, destination });
   // Older pure-evaluator fixtures omit cleanup; explicit native cleanup evidence can
   // never be ignored, including a leader exit that preceded intentional shutdown.
   const cleanup = e.cleanup;
@@ -295,7 +351,8 @@ async function run(options, releases, evidence, scratch, signal) {
     const id = ++rpcId;
     const finish = (error, value) => { clearTimeout(timer); signal.removeEventListener("abort", abort); worker.pending.delete(id); error ? reject(error) : resolve(value); };
     const abort = () => finish(signal.reason);
-    const timer = setTimeout(() => finish(new Error(`${worker.name} ${op} RPC deadline`)), 35_000);
+    // Special request gets transport headroom beyond the unchanged 20s + 15s public budget.
+    const timer = setTimeout(() => finish(new Error(`${worker.name} ${op} RPC deadline`)), op === "historyFollowUp" ? 45_000 : 35_000);
     signal.addEventListener("abort", abort, { once: true });
     worker.pending.set(id, { resolve: value => finish(null, value), reject: error => finish(error) });
     worker.child.stdin.write(`${JSON.stringify({ id, op, ...args })}\n`, error => { if (error) finish(error); });
@@ -348,7 +405,12 @@ async function run(options, releases, evidence, scratch, signal) {
     tokenless: Boolean(row.host && row.lease && row.host.incarnationToken === undefined && row.lease.incarnationToken === undefined),
     hostTokenHash: row.host?.incarnationToken ? hash(row.host.incarnationToken) : null,
     leaseTokenHash: row.lease?.incarnationToken ? hash(row.lease.incarnationToken) : null,
-    remoteHost: row.host?.remoteHost, bridgeVia: row.host?.bridgeVia });
+    remoteHost: row.host?.remoteHost, bridgeVia: row.host?.bridgeVia,
+    observedAt: Date.now(), leaseExpiresAt: row.lease?.expiresAt,
+    hostHash: row.host ? hash(JSON.stringify(row.host)) : null, leaseHash: row.lease ? hash(JSON.stringify(row.lease)) : null,
+    rowHash: row.row ? hash(JSON.stringify(row.row)) : null,
+    rawOwner: row.row ? { ownerHostId: row.row.ownerHostId, ownerIdentityId: row.row.ownerIdentityId,
+      ownerIncarnation: row.row.ownerIncarnation, remoteHost: row.row.remoteHost } : null });
   const save = (name, data) => fs.writeFileSync(path.join(scratch, `${name}.json`), JSON.stringify(data, null, 2), { mode: 0o600 });
   const hubMesh = path.join(scratch, "hub");
   try {
@@ -370,9 +432,18 @@ async function run(options, releases, evidence, scratch, signal) {
           .map(worker => ({ sha: worker.release.sha, evidence: worker.release.relayCapability.evidence })) })));
     const legacy = oldWorkers.find(worker => evidence.registrations.find(row => row.id === worker.native.id)?.tokenless);
     if (!options.baselineControl && !legacy) throw new Error("no OLD release actually wrote a native tokenless host/lease; history case cannot be fabricated");
-    const regressionId = legacy?.native.id;
+    let sentinel, regressionId;
     if (!options.baselineControl) {
-      evidence.history.old = evidence.registrations.find(row => row.id === regressionId);
+      // A second genuine root on the SAME historical spoke. Never replace the fresh
+      // primary topology node or add a fabricated release/unsupported-pair waiver.
+      const started = await startWorker("history-sentinel", legacy.release, legacy.mesh, `session:${randomUUID()}`, "old");
+      sentinel = started.worker; regressionId = sentinel.native.id;
+      evidence.history.old = { ...summarize(started.result.readback, legacy.native.name), sha: legacy.release.sha };
+      const [freshBefore] = await rpc(newer.worker, "presence", { ids: [legacy.native.id] });
+      evidence.history.fresh = { id: legacy.native.id, before: freshBefore };
+      save("fresh-primary-before-new-link", freshBefore);
+      if ([freshBefore.host, freshBefore.lease, freshBefore.participant, freshBefore.row, freshBefore.owner].some(value => value !== null))
+        throw new Error("fresh historical primary already has history on NEW");
       const seed = await startWorker("history-seed", releases.candidate, hubMesh, regressionId, "seed");
       if (!seed.result.readback.host?.incarnationToken) throw new Error("NEW release did not generate a native incarnationToken");
       const seedLink = await bridge("new", newer.worker, "seed");
@@ -390,7 +461,10 @@ async function run(options, releases, evidence, scratch, signal) {
     if (!options.baselineControl) {
       const [oldAtHub] = await rpc(hub.worker, "waitPresence", { ids: [regressionId], conditions: [{ remote: legacy.native.name, tokenless: true }] });
       evidence.history.hub = summarize(oldAtHub, "hub"); save("old-tokenless-at-hub", oldAtHub);
-      const [immediatelyBefore] = await rpc(newer.worker, "presence", { ids: [regressionId] });
+      const [immediatelyBefore, freshBefore] = await rpc(newer.worker, "presence", { ids: [regressionId, legacy.native.id] });
+      evidence.history.fresh.before = freshBefore; save("fresh-primary-before-new-link", freshBefore);
+      if ([freshBefore.host, freshBefore.lease, freshBefore.participant, freshBefore.row, freshBefore.owner].some(value => value !== null))
+        throw new Error("fresh historical primary gained history before measured NEW link");
       evidence.history.preserved = summarize(immediatelyBefore, "new"); save("history-before-regression", immediatelyBefore);
       if (!evidence.history.preserved.hostTokenHash || evidence.history.preserved.hostTokenHash !== evidence.history.seeded.hostTokenHash ||
           evidence.history.preserved.leaseTokenHash !== evidence.history.seeded.leaseTokenHash) throw new Error("persisted token mirror/lease history was erased before regression");
@@ -419,17 +493,15 @@ async function run(options, releases, evidence, scratch, signal) {
       save(`${name}-relay-registration`, registration);
       if (!link.relayAuthenticated) throw new Error(`production relay registration invalid: ${name}`);
     }
-    if (!options.baselineControl) {
-      const productionWarnings = measured.flatMap(link => link.log.split("\n").map(line => ({ link: link.name, line })))
-        .filter(({ line }) => /warn|skip|ignor/i.test(line) && /incarnation/i.test(line));
-      const productionWarning = productionWarnings.find(({ line }) => line.includes(regressionId));
-      evidence.history.warning = { name: "STALE_INCARNATION_HISTORY", source: productionWarning ? "bridge" : "canary",
-        productionWarningObserved: Boolean(productionWarning), rootId: regressionId, tokenHash: evidence.history.seeded.hostTokenHash,
-        message: productionWarning?.line ?? "Canary warning: real persisted NEW token/lease history encountered a native OLD tokenless row via hub; production emitted no correlated named warning.",
-        uncorrelatedProductionWarnings: productionWarnings.filter(value => value !== productionWarning).slice(0, 32),
-        ...(productionWarning ? { link: productionWarning.link } : {}) };
+    const collectWarning = () => {
+      const rawLines = measured.flatMap(link => fs.readFileSync(path.join(scratch, `${link.name}.stderr.log`), "utf8")
+        .split("\n").map(line => ({ link: link.name, line }))).filter(({ link, line }) =>
+          link === "measured-new" && line.includes(regressionId) && /skipped stale relayed root/i.test(line));
+      evidence.history.warning = { name: "STALE_INCARNATION_HISTORY", source: "bridge", rootId: regressionId,
+        tokenHash: evidence.history.seeded.hostTokenHash, occurrenceCount: rawLines.length, rawLines };
       save("stale-incarnation-warning", evidence.history.warning);
-    }
+    };
+    if (!options.baselineControl) collectWarning();
     evidence.plans = endpoints.flatMap(source => endpoints.filter(target => target !== source && (source.role === "hub" || target.role === "hub" ||
       source.release.relayCapability.supported && target.release.relayCapability.supported)).flatMap(target =>
       ["before", "after"].map(round => ({ source: source.native.id, target: target.native.id, round,
@@ -442,18 +514,43 @@ async function run(options, releases, evidence, scratch, signal) {
       const result = await rpc(source, "send", { target: target.native, marker: plan.marker });
       evidence.sends.push({ ...result, source: plan.source, target: plan.target });
     }));
+    let special;
+    if (!options.baselineControl) {
+      const marker = `${randomUUID()}:new->history-sentinel`;
+      await rpc(sentinel, "expect", { messages: [{ marker, from: newer.worker.native.id }] });
+      const [live] = await rpc(sentinel, "presence", { ids: [regressionId] });
+      evidence.history.liveAtAttempt = summarize(live, legacy.native.name); save("sentinel-live-at-attempt", live);
+      special = rpc(newer.worker, "historyFollowUp", { targetId: regressionId, marker }).then(async attempt => {
+        evidence.history.attempt = attempt; save("history-public-followup", attempt);
+        const [liveAfter] = await rpc(sentinel, "presence", { ids: [regressionId] });
+        evidence.history.destination = { ...await rpc(sentinel, "tally"), liveAfter: summarize(liveAfter, legacy.native.name) };
+        save("sentinel-after-attempt", { liveAfter, tally: evidence.history.destination });
+      });
+      // Observe rejection immediately; retain it for the ordered join below.
+      special.catch(() => undefined);
+    }
     await sendRound("before");
     await new Promise((resolve, reject) => {
       const abort = () => finish(signal.reason);
       const finish = error => { clearTimeout(timer); signal.removeEventListener("abort", abort); error ? reject(error) : resolve(); };
       const timer = setTimeout(() => finish(), Math.max(0, options.holdMs - (performance.now() - holdStarted)));
       signal.addEventListener("abort", abort, { once: true });
-      for (const child of [...measured, ...endpoints]) void child.closed.then(() => finish(new Error(`early owned process close: ${child.name}`)));
+      for (const child of [...measured, ...endpoints, ...(sentinel ? [sentinel] : [])])
+        void child.closed.then(() => finish(new Error(`early owned process close: ${child.name}`)));
     });
+    await special;
     await observeRoutes("after");
     await sendRound("after");
     const snapshots = await Promise.all(endpoints.map(async worker => ({ id: worker.native.id, ...await rpc(worker, "tally") })));
     evidence.tallies = snapshots;
+    if (!options.baselineControl) {
+      const [after] = await rpc(newer.worker, "presence", { ids: [regressionId] });
+      evidence.history.after = summarize(after, "new"); save("history-after-hold", after);
+      const [liveAfter] = await rpc(sentinel, "presence", { ids: [regressionId] });
+      evidence.history.destination = { ...await rpc(sentinel, "tally"), liveAfter: summarize(liveAfter, legacy.native.name) };
+      save("sentinel-final-tally", evidence.history.destination);
+      collectWarning();
+    }
     evidence.hold.endedAt = Date.now();
     evidence.hold.elapsedMs = performance.now() - holdStarted;
     save("final-tallies", snapshots);

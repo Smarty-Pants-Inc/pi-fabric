@@ -167,6 +167,32 @@ async function main() {
         sent.push(result);
         return result;
       }
+      case "historyFollowUp": {
+        // No harness admission check: the public compiled API owns route/epoch fencing.
+        const { targetId, marker } = input;
+        const observed = presence([targetId])[0];
+        const actualOwner = directory.mirroredControlOwner(targetId, targetId, targetId) ?? null;
+        const beganAt = Date.now(), began = performance.now();
+        let receipt, error;
+        try {
+          receipt = await control.request(targetId, targetId, "followUp", {
+            message: marker, data: { marker }, ownerIncarnation: actualOwner?.ownerIncarnation,
+          }, targetId, { routedRemoteHost: actualOwner?.remoteHost,
+            idempotencyKey: `mixed-release-history:${marker}`, timeoutMs: 20_000 });
+        } catch (caught) {
+          // Serialize only the actual request rejection, never an RPC/precheck failure.
+          error = { source: "FabricControlPlane.request", name: caught.name, code: caught.code,
+            message: caught.message, stack: caught.stack, notRun: caught.notRun, notDelivered: caught.notDelivered };
+        }
+        const endedAt = Date.now(), elapsedMs = performance.now() - began;
+        const commandEvents = events("fabric.control.command").filter(event => event.from.id === identity.id &&
+          event.to === targetId && event.data?.data?.marker === marker);
+        const ids = new Set(commandEvents.map(event => event.data.commandId));
+        return { marker, source: identity.id, intendedTarget: targetId, actualOwner, observed,
+          publicRequestInvoked: true, beganAt, endedAt, elapsedMs, timeoutMs: 20_000, ackGraceMs: 15_000,
+          ...(error ? { error } : { receipt }), commandEvents,
+          ackEvents: events("fabric.control.ack").filter(event => ids.has(event.data?.commandId)) };
+      }
       case "tally": return { native, expected: [...expected.keys()], entries: [...entries.values()], invalid, duplicateCalls, sent,
         commandEvents: events("fabric.control.command"), ackEvents: events("fabric.control.ack") };
       case "stop": await stop(); return { stopped: true };

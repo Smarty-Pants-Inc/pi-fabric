@@ -23,14 +23,14 @@ const until = (check: () => void) => vi.waitFor(check, { timeout: 5_000, interva
 const planes: FabricControlPlane[] = [];
 const roots: string[] = [];
 const stores: MeshStore[] = [];
-const setup = (backend: "file" | "sqlite", fenced: boolean) => {
+const setup = (backend: "file" | "sqlite", fenced: boolean, readCacheMs = 0) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-one-claim-")); roots.push(root);
   const meshRoot = path.join(root, "mesh");
   const mesh = new MeshStore(meshRoot, 65_536, 1_000, { stateBackend: backend });
   stores.push(mesh);
   expect(mesh.stateBackend).toBe(backend); // Never label a fallback as a SQLite race.
   const makeOwner = (ownerIncarnation = epoch) => {
-    const replica = new MeshStore(meshRoot, 65_536, 1_000, { stateBackend: backend });
+    const replica = new MeshStore(meshRoot, 65_536, 1_000, { stateBackend: backend, readCacheMs });
     stores.push(replica);
     expect(replica.stateBackend).toBe(backend);
     const owner = new FabricControlPlane(replica, identity(ownerId), {
@@ -43,10 +43,9 @@ const setup = (backend: "file" | "sqlite", fenced: boolean) => {
     65_536, 1_000, { stateBackend: "file" });
   stores.push(own);
   expect(own.stateBackend).toBe("file");
-  const publish = (id: string, expired = false) => mesh.publish({ topic: "fabric.control.command", kind: "followUp", from: identity("host:sender"), to: ownerId,
+  const publish = (id: string, requestedAt = Date.now(), deadlineAt = requestedAt + 60_000) => mesh.publish({ topic: "fabric.control.command", kind: "followUp", from: identity("host:sender"), to: ownerId,
     data: { version: 1, commandId: id, targetId: "agent:target", operation: "followUp", replyTo: "host:sender",
-      ownerIncarnation: epoch, message: "PRIVATE-INPUT", requestedAt: Date.now() - (expired ? 100 : 0),
-      deadlineAt: Date.now() + (expired ? -1 : 60_000) } });
+      ownerIncarnation: epoch, message: "PRIVATE-INPUT", requestedAt, deadlineAt } });
   const acks = (id: string) => mesh.read({ topic: "fabric.control.ack", limit: 100 })
     .filter(event => (event.data as { commandId?: string }).commandId === id);
   return { mesh, own, makeOwner, publish, acks };
@@ -248,23 +247,18 @@ describe("one authoritative control claim", () => {
         return publish.call(this, input);
       });
       try {
-        const event = await f.publish(commandId, expired);
+        const now = Date.now();
+        const event = await f.publish(commandId, now - (expired ? 100 : 0), now + (expired ? -1 : 60_000));
         owner.start(receive);
         await until(() => expect(intercepted).toBe(1));
         expect(receive).toHaveBeenCalledTimes(expired ? 0 : 1);
         expect(f.acks(commandId)).toEqual([]);
         const shared = f.mesh.get(key(commandId), { fresh: true });
         expect(shared).toMatchObject({ version: 1, value: { commandId, ownerIncarnation: epoch } });
-        if (expired) {
-          // C1's expiry outcome is terminal in the shared CAS, not the private store.
-          expect(shared?.value).toMatchObject({ acceptance });
-          expect(f.own.get(key(commandId), { fresh: true })).toBeUndefined();
-        } else {
-          expect(shared?.value).not.toHaveProperty("acceptance");
-          expect(f.own.get(key(commandId), { fresh: true })).toMatchObject({ version: 1, value: {
-            sequence: event.sequence, ownerIncarnation: epoch, acceptance,
-          } });
-        }
+        expect(shared?.value).not.toHaveProperty("acceptance");
+        expect(f.own.get(key(commandId), { fresh: true })).toMatchObject({ version: 1, value: {
+          sequence: event.sequence, ownerIncarnation: epoch, acceptance,
+        } });
       } finally {
         // Always release the pending promise before close joins it, including assertion failures.
         owner.pause(); release.open();
@@ -325,6 +319,121 @@ describe("one authoritative control claim", () => {
       expect(effects).toEqual(["handler-entered-with-possible-effect"]);
       expect(f.own.get(key(commandId), { fresh: true })).toBeUndefined();
     });
+  });
+
+  it.each(["late", "future"] as const)("%s commands use the shared claim and private expiry outcome, including restart", async timing => {
+    const f = setup("file", true), owner = f.makeOwner();
+    const now = Date.now(), requestedAt = timing === "late" ? now - 2_000 : now + 120_000;
+    const event = await f.publish(timing, requestedAt, requestedAt + 1_000);
+    if (timing === "future") {
+      const batch = MeshStore.prototype.writeBatch;
+      vi.spyOn(MeshStore.prototype, "writeBatch").mockImplementation(async function (this: MeshStore, input) {
+        const result = await batch.call(this, input);
+        if (this.root === f.mesh.root && input.ops.some(op => op.kind === "put" && op.key === key(timing))) {
+          vi.spyOn(Date, "now").mockReturnValue(requestedAt); // Skew passes while the claim awaits; refusal must stick.
+        }
+        return result;
+      });
+    }
+    const receive = vi.fn(() => ({ accepted: true })); owner.start(receive);
+    await until(() => expect(f.acks(timing)).toHaveLength(1));
+    owner.pause(); await owner.checkpointForRelease(); await owner.close();
+    const expiry = { accepted: false, error: "Fabric control command expired", notRun: true };
+    expect(f.mesh.get(key(timing), { fresh: true })?.value).not.toHaveProperty("acceptance");
+    expect(f.own.get(key(timing), { fresh: true })).toMatchObject({ version: 1, value: {
+      ownerIncarnation: epoch, sequence: event.sequence, acceptance: expiry,
+    } });
+    const restarted = f.makeOwner(); restarted.start(receive);
+    await until(() => expect(f.acks(timing)).toHaveLength(2));
+    expect(f.acks(timing).map(ack => ack.data)).toEqual([
+      expect.objectContaining({ ...expiry, ownerIncarnation: epoch }), expect.objectContaining({ ...expiry, ownerIncarnation: epoch }),
+    ]);
+    expect(receive).not.toHaveBeenCalled();
+  });
+
+  it.each(["shared-result", "private-result", "unknown"] as const)("late cached reader loses the real shared CAS and ACKs %s, never notRun", async outcome => {
+    const f = setup("file", false, 60_000), owner = f.makeOwner(), entered = gate(), resume = gate();
+    await f.mesh.put({ key: "warm", value: 1, identity: identity(ownerId) });
+    await f.publish("cached-late", Date.now() - 2_000, Date.now() - 1_000);
+    const put = MeshStore.prototype.put;
+    let attempts = 0;
+    vi.spyOn(MeshStore.prototype, "put").mockImplementation(async function (this: MeshStore, input) {
+      if (this.root === f.mesh.root && this !== f.mesh && input.key === key("cached-late") && input.ifVersion === 0) {
+        attempts++; entered.open(); await resume.promise;
+      }
+      return put.call(this, input);
+    });
+    const receive = vi.fn(() => ({ accepted: true })); owner.start(receive);
+    try {
+      await entered.promise;
+      const acceptance = { accepted: true, messageId: "earlier-delivery" };
+      const record = { format: 1, hostId: ownerId, commandId: "cached-late", targetId: "agent:target",
+        ownerIncarnation: epoch, expiresAt: Date.now() + 60_000 };
+      const claimed = await f.mesh.put({ key: key("cached-late"), identity: identity(ownerId), ifVersion: 0,
+        value: { ...record, ...(outcome === "shared-result" ? { acceptance } : {}) } });
+      if (outcome === "private-result") await f.own.put({ key: key("cached-late"), identity: identity(ownerId), ifVersion: 0,
+        value: { ...record, acceptance } });
+      expect(owner.mesh.get(key("cached-late"))).toBeUndefined(); // Actual warm cache misses a concurrent claimant.
+      resume.open();
+      await until(() => expect(f.acks("cached-late")).toHaveLength(1));
+      const ack = f.acks("cached-late")[0]!.data;
+      expect(ack).not.toHaveProperty("notRun");
+      if (outcome === "unknown") expect(ack).toMatchObject({ accepted: false, error: expect.stringContaining("indeterminate") });
+      else expect(ack).toMatchObject(acceptance);
+      expect(attempts).toBe(1); expect(receive).not.toHaveBeenCalled();
+      expect(f.mesh.get(key("cached-late"), { fresh: true })?.version).toBe(claimed.version);
+    } finally { resume.open(); }
+  });
+
+  it.each(["save", "ack"] as const)("sender timeout stays unknown while late expiry %s retains custody across timeout/retry", async held => {
+    const f = setup("file", false), owner = f.makeOwner(), entered = gate(), resume = gate();
+    const sender = new FabricControlPlane(f.mesh, identity("host:sender"), {
+      enabled: true, hostId: "host:sender", pollMs: 20, acknowledgementTimeoutMs: 400,
+    });
+    planes.push(sender); sender.start(() => ({ accepted: false }));
+    const outcome = sender.request(ownerId, "agent:target", "followUp", { message: "late", ownerIncarnation: epoch })
+      .then(() => undefined, (error: Error) => error);
+    let command!: { commandId: string; deadlineAt: number };
+    await until(() => {
+      command = f.mesh.read({ topic: "fabric.control.command", limit: 10 })[0]?.data as typeof command;
+      expect(command).toBeDefined();
+    });
+    await until(() => expect(Date.now()).toBeGreaterThan(command.deadlineAt));
+    let failed = false;
+    const failOnce = async () => {
+      failed = true; entered.open(); await resume.promise;
+      throw Object.assign(new Error("expiry lock timeout"), { code: "FABRIC_MESH_LOCK_TIMEOUT" });
+    };
+    const put = MeshStore.prototype.put, publish = MeshStore.prototype.publish;
+    vi.spyOn(MeshStore.prototype, "put").mockImplementation(function (this: MeshStore, input) {
+      if (held === "save" && !failed && this.root === f.own.root && input.key === key(command.commandId)) return failOnce();
+      return put.call(this, input);
+    });
+    vi.spyOn(MeshStore.prototype, "publish").mockImplementation(function (this: MeshStore, input) {
+      if (held === "ack" && !failed && this.root === f.mesh.root && input.topic === "fabric.control.ack") return failOnce();
+      return publish.call(this, input);
+    });
+    const receive = vi.fn(() => ({ accepted: true })); owner.start(receive);
+    try {
+      await entered.promise;
+      const error = await outcome;
+      expect(error?.message).toContain("the outcome is unknown");
+      expect(error?.message).not.toContain("safe");
+      expect(error).not.toHaveProperty("notDelivered"); expect(error).not.toHaveProperty("notRun", true);
+      expect(f.mesh.get(key(command.commandId), { fresh: true })?.value).not.toHaveProperty("acceptance");
+      expect(f.acks(command.commandId)).toHaveLength(0);
+      resume.open();
+      // A reader retry may ACK both retained custody and the still-uncommitted event.
+      await until(() => expect(f.acks(command.commandId).length).toBeGreaterThan(0));
+      owner.pause(); await owner.checkpointForRelease();
+      expect(f.acks(command.commandId).every(ack => (ack.data as { notRun?: boolean }).notRun === true)).toBe(true);
+      expect(f.own.get(key(command.commandId), { fresh: true })).toMatchObject({ version: 1, value: {
+        acceptance: { accepted: false, error: "Fabric control command expired", notRun: true },
+      } });
+      expect(f.mesh.get(key(command.commandId), { fresh: true })?.version).toBe(1);
+      expect(f.mesh.read({ topic: "fabric.control.command", limit: 10 }).filter(event => event.kind === "followUp")).toHaveLength(1);
+      expect(receive).not.toHaveBeenCalled();
+    } finally { resume.open(); }
   });
 
   it("writes only the private outcome, not a second pre-handler claim", async () => {

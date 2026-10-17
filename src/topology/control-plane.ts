@@ -572,6 +572,8 @@ const relayAcknowledgementKey = (commandId: string, idempotencyKey: string): str
 interface ClaimedControlCommand {
   event: MeshEvent;
   claimVersion: number;
+  /** A future-skew refusal must survive the shared claim's lock wait. */
+  futureSkewed?: boolean;
   acceptance?: FabricControlAcceptance;
   saved?: boolean;
   running?: boolean;
@@ -1397,10 +1399,9 @@ export class FabricControlPlane {
 
   /**
    * Win the owner's create-only claim for a timed-out command with a terminal "expired, not run"
-   * record (the same record the owner writes for a command it reads past its deadline). Both the
-   * owner's admission and its duplicate check read this claim before running the handler, so a
-   * win proves the message was never and will never be delivered. A lost race means the owner
-   * holds it, and the outcome stays unknown.
+   * record. The owner's admission uses the same CAS, so a win proves the message was never
+   * and will never be delivered. A lost race means the owner holds it: even an owner expiry
+   * saved privately is unknown to this sender until its ACK arrives.
    */
   async #withdrawUnclaimed(commandId: string, pending: PendingControlRequest): Promise<boolean> {
     // E14-X1: a NATS-era local claim cannot be disproved by winning the shared file claim.
@@ -1429,7 +1430,8 @@ export class FabricControlPlane {
       return true;
     } catch (error) {
       if (isLockTimeout(error)) return false;
-      // The owner may itself have recorded the expiry first.
+      // A previous withdrawal or older owner may have left a shared terminal expiry.
+      // Current owners save expiry privately; their bare shared claim proves no outcome.
       return expired(controlSeenRecord(this.mesh.get(key, { fresh: true })?.value));
     }
   }
@@ -2879,59 +2881,6 @@ export class FabricControlPlane {
       }, this.incarnation, command.ownerIncarnation ?? null);
       return; // no claim, handler, or automatic notRun resend
     }
-    if (now > deadlineAt || command.requestedAt - now > this.#ackTimeoutMs) {
-      // A sender waits at most MAX_CONTROL_ACK_GRACE_MS past the deadline. An older command
-      // is history: a restarting owner replays the retained log from its start, and
-      // answering every past command added one locked publish each, thousands per
-      // relaunch wave (smarty-dev#367). Only a sender that may still wait gets an answer.
-      // An owner restarted past the deadline may have run it before, and a runtime before
-      // smarty-dev#643 claims only the shared key. No read proves it did not run (a read can be
-      // cached, and a claim can land after it): this runtime wins the shared claim first, with
-      // the same create-only put as admission, and records the expiry in it. Then no runtime,
-      // new or old, can claim or run it. Otherwise the claim holder's record answers, never
-      // notRun (review/astra F1 on #121). A runtime that admitted it in time and claims it now
-      // expires it before the handler (see #executeClaimedCommand).
-      const ownRecord = (record: FabricControlSeenRecord | undefined) =>
-        record?.hostId === this.options.hostId && record.commandId === command.commandId &&
-          record.targetId === command.targetId ? record : undefined;
-      const indeterminate = { accepted: false, error: "Fabric control outcome is indeterminate after owner restart" };
-      const local = ownRecord(controlSeenRecord(this.#seen.get(key)?.value));
-      let acceptance: FabricControlAcceptance;
-      let outcomeIncarnation: string | null = this.incarnation;
-      if (local) {
-        acceptance = local.acceptance ?? indeterminate;
-        outcomeIncarnation = local.ownerIncarnation ?? null;
-      }
-      else {
-        const expired = { accepted: false, error: CONTROL_COMMAND_EXPIRED, notRun: true } as const;
-        try {
-          await this.#putFenced(this.mesh, {
-            key,
-            value: {
-              format: 1,
-              hostId: this.options.hostId,
-              commandId: command.commandId,
-              targetId: command.targetId,
-              ownerIncarnation: this.incarnation,
-              expiresAt: Math.max(deadlineAt, now) + this.#ackTimeoutMs,
-              ...(command.deadlineAt !== undefined ? { explicitDeadline: true } : {}),
-              acceptance: expired,
-            } satisfies FabricControlSeenRecord,
-            identity: this.identity,
-            ifVersion: 0,
-          }, true);
-          acceptance = expired;
-        } catch (error) {
-          if (isMeshWriteDeferred(error) || isLockTimeout(error) || error instanceof MeshConsumptionPausedError) throw error;
-          const raced = ownRecord(controlSeenRecord(this.mesh.get(key, { fresh: true })?.value));
-          acceptance = raced?.acceptance ?? indeterminate;
-          outcomeIncarnation = raced?.ownerIncarnation ?? null;
-        }
-      }
-      await this.#publishAcknowledgement(command, acceptance, outcomeIncarnation);
-      return;
-    }
-
     try {
       // One claim authority across drainers, older runtimes and sender withdrawal.
       // The private store is only an outcome store, never a second admission claim.
@@ -2943,7 +2892,7 @@ export class FabricControlPlane {
           commandId: command.commandId,
           targetId: command.targetId,
           ownerIncarnation: this.incarnation,
-          expiresAt: deadlineAt + this.#ackTimeoutMs,
+          expiresAt: Math.max(deadlineAt, now) + this.#ackTimeoutMs,
           ...(command.deadlineAt !== undefined ? { explicitDeadline: true } : {}),
         } satisfies FabricControlSeenRecord,
         identity: this.identity,
@@ -2951,7 +2900,8 @@ export class FabricControlPlane {
       }, true);
     } catch (error) {
       if (isMeshWriteDeferred(error) || isLockTimeout(error) || error instanceof MeshConsumptionPausedError) throw error;
-      const raced = this.#seenRecord(key);
+      // A pre-CAS read may be cached; only fresh outcome/claim readback can answer the loser.
+      const raced = this.#seenRecord(key, true);
       if (
         raced?.hostId === this.options.hostId &&
         raced.commandId === command.commandId &&
@@ -2971,7 +2921,7 @@ export class FabricControlPlane {
 
     // Take custody before any post-CAS admission check: PREPARE/lease loss during
     // the await must retain this command. Its first private outcome save creates it.
-    const admitted = { event, claimVersion: 0 };
+    const admitted = { event, claimVersion: 0, futureSkewed: command.requestedAt - now > this.#ackTimeoutMs };
     this.#ownedCommands.set(key, admitted);
     await this.#runOwnedCommand(key, admitted);
   }
@@ -3116,7 +3066,9 @@ export class FabricControlPlane {
         assertMeshConsumption(this.options.canConsumeMesh);
         if (!owned.acceptance) this.#assertAdmission();
         if (owned.acceptance) acceptance = owned.acceptance;
-        else if (Date.now() > deadlineAt) acceptance = { accepted: false, error: CONTROL_COMMAND_EXPIRED, notRun: true };
+        else if (Date.now() > deadlineAt || owned.futureSkewed || command.requestedAt - Date.now() > this.#ackTimeoutMs) {
+          acceptance = { accepted: false, error: CONTROL_COMMAND_EXPIRED, notRun: true };
+        }
         else if (this.#handler) {
           this.#warnUnfencedSenderDelivery(command, from);
           acceptance = await this.#handler(command, from, controller.signal, verification);
@@ -3230,8 +3182,8 @@ export class FabricControlPlane {
 
   // This host's record for a command: its own store (with the outcome) first, then the shared
   // state, where every claim is also made and where runtimes before smarty-dev#643 keep outcomes.
-  #seenRecord(key: string): FabricControlSeenRecord | undefined {
-    return controlSeenRecord(this.#seen.get(key)?.value) ?? controlSeenRecord(this.mesh.get(key)?.value);
+  #seenRecord(key: string, fresh = false): FabricControlSeenRecord | undefined {
+    return controlSeenRecord(this.#seen.get(key, { fresh })?.value) ?? controlSeenRecord(this.mesh.get(key, { fresh })?.value);
   }
 
   async #cleanupSeen(now: number): Promise<void> {

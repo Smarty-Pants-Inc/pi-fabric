@@ -292,12 +292,26 @@ const mirrorLinkOf = (value: unknown): string | undefined =>
   remoteHostOf(value) !== undefined && isObject(value) && typeof value.bridgeVia === "string"
     ? value.bridgeVia : remoteHostOf(value);
 
-const hostOf = (key: string, value: unknown): FabricHostRecord | undefined => {
+// Identification is not admission. Presence must carry an identifiable malformed direct
+// sample to the receiver's root-wide skip, rather than turn it into omission/withdrawal.
+// Keep the unchecked timestamps intact; neither this reader nor a lease may repair them.
+const identifiableHostOf = (key: string, value: unknown): FabricHostRecord | undefined => {
   if (!isObject(value) || value.format !== 1 || typeof value.id !== "string") return undefined;
   if (key !== keyFor(HOST_PREFIX, value.id) || typeof value.rootId !== "string" || !isIdentity(value.identity)) return undefined;
-  if (typeof value.startedAt !== "number" || typeof value.updatedAt !== "number" || typeof value.expiresAt !== "number") return undefined;
   return value as unknown as FabricHostRecord;
 };
+
+const hostOf = (key: string, value: unknown): FabricHostRecord | undefined => {
+  const host = identifiableHostOf(key, value);
+  return host && typeof host.startedAt === "number" && typeof host.updatedAt === "number" && typeof host.expiresAt === "number"
+    ? host : undefined;
+};
+
+const presenceHostOf = (key: string, value: unknown): FabricHostRecord | undefined =>
+  hostOf(key, value) ?? (remoteHostOf(value) === undefined ? identifiableHostOf(key, value) : undefined);
+
+const finiteHostTimestamps = (record: FabricHostRecord): boolean =>
+  Number.isFinite(record.startedAt) && Number.isFinite(record.updatedAt) && Number.isFinite(record.expiresAt);
 
 const participantOf = (key: string, value: unknown): FabricParticipantRecord | undefined => {
   if (!isObject(value) || value.format !== 1 || typeof value.id !== "string") return undefined;
@@ -824,13 +838,19 @@ export class StoreBridgeSide implements BridgeSide {
     for (const entry of hostEntries) {
       const mark = remoteHostOf(entry.value);
       if (mirrorLinkOf(entry.value) === this.peer) continue;
-      const host = hostOf(entry.key, entry.value);
+      const host = presenceHostOf(entry.key, entry.value);
       if (!host) {
         if (isObject(entry.value) && typeof entry.value.id === "string") reserved.add(entry.value.id);
         continue;
       }
       for (const id of [host.id, host.identity.id, host.rootId]) reserve(entry.value, id);
       if (mark !== undefined || entry.updatedBy.id !== host.identity.id) continue;
+      if (!finiteHostTimestamps(host)) {
+        // Do not let effective file liveness normalize a bad native/bootstrap record into
+        // renewable authority, or silently omit it and erase the peer's retained fence.
+        hosts.push({ record: host, expiresAt: host.expiresAt, observedAt: now });
+        continue;
+      }
       const liveness = hostLiveness(leases, host);
       const expiresAt = liveness.expiresAt;
       // Carry effective renewal time as well as expiry, with the same incarnation fence.
@@ -1205,7 +1225,14 @@ export class StoreBridgeSide implements BridgeSide {
     // Classify whole root groups before any plan or recovery effect. No array order may let
     // a second host bypass tokenless preservation (nor silently choose a conflicting owner).
     const rootCounts = new Map<string, number>();
-    for (const { record } of presence.hosts) rootCounts.set(record.rootId, (rootCounts.get(record.rootId) ?? 0) + 1);
+    for (const { record, expiresAt, observedAt: sourceObservedAt } of presence.hosts) {
+      rootCounts.set(record.rootId, (rootCounts.get(record.rootId) ?? 0) + 1);
+      // Runs before recovery, planning, participant writes and omission deletion in BOTH
+      // directions (remote presence replies are raw JSON, not parsed by presenceArg).
+      // Missing observedAt alone is the legacy unsampled protocol, not a malformed sample.
+      if (remoteHostOf(record) === undefined && (!finiteHostTimestamps(record) || !Number.isFinite(expiresAt) ||
+        (sourceObservedAt !== undefined && !Number.isFinite(sourceObservedAt)))) skippedRoots.add(record.rootId);
+    }
     for (const [rootId, count] of rootCounts) if (count > 1) skippedRoots.add(rootId);
     // Match compute's normalized incarnation evidence without mutating cached lease histories.
     const leaseIncarnationDigest = (leases: ReadonlyMap<string, FabricHostLease>): string => contentDigest(
@@ -1316,7 +1343,7 @@ export class StoreBridgeSide implements BridgeSide {
           const sampled = typeof sourceObservedAt === "number" && Number.isFinite(sourceObservedAt);
           if (!Number.isFinite(expiresAt) || expiresAt <= (sampled ? sourceObservedAt : liveAt) ||
             (retained && (!Number.isFinite(record.updatedAt) || (sourceObservedAt !== undefined && !sampled)))) {
-            if (retained) skippedRoots.add(record.rootId);
+            if (!relayed) skippedRoots.add(record.rootId);
             continue;
           }
           // A sampled origin's remaining life is a SOURCE-clock duration, anchored at liveAt (this
@@ -1328,7 +1355,7 @@ export class StoreBridgeSide implements BridgeSide {
           const until = sampled ? origin
             : Math.min(origin + Math.min(now - liveAt, BRIDGE_LEASE_MS), now + BRIDGE_LEASE_MS);
           if (!sampled && until <= now) {
-            if (retained) skippedRoots.add(record.rootId);
+            if (!relayed) skippedRoots.add(record.rootId);
             continue;
           }
           const renewedAt = sampled ? record.updatedAt : Math.min(record.updatedAt, now);
@@ -1797,7 +1824,7 @@ const presenceArg = (args: unknown, hub: string): Pick<BridgePresence, "hosts" |
   }
   const hosts = args.hosts.flatMap((host): BridgeHost[] => {
     if (!isObject(host) || !isObject(host.record)) return [];
-    const record = hostOf(keyFor(HOST_PREFIX, String(host.record.id)), host.record);
+    const record = presenceHostOf(keyFor(HOST_PREFIX, String(host.record.id)), host.record);
     return record && (remoteHostOf(record) === undefined || (record.bridgeVia === hub && record.remoteHost !== hub))
       ? [{ record, expiresAt: typeof host.expiresAt === "number" ? host.expiresAt : NaN,
         ...(host.observedAt !== undefined ? { observedAt: typeof host.observedAt === "number" ? host.observedAt : NaN } : {}) }] : [];
@@ -2119,8 +2146,13 @@ const remoteAddresses = (presence: Pick<BridgePresence, "hosts" | "participants"
 
 // Where the hub accepts events from the peer: its own natives, by id or unique alias.
 const addresses = (presence: Pick<BridgePresence, "hosts" | "participants">): Set<string> => {
-  const names = remoteAddresses(presence);
-  for (const participant of presence.participants) {
+  // Malformed native samples travel only to preserve a receiver's existing root. They
+  // must not become new hub routing authority merely by remaining in the snapshot.
+  const hosts = presence.hosts.filter(({ record }) => finiteHostTimestamps(record));
+  const owners = new Set(hosts.map(({ record }) => record.id));
+  const participants = presence.participants.filter(participant => owners.has(participant.ownerHostId));
+  const names = remoteAddresses({ hosts, participants });
+  for (const participant of participants) {
     for (const alias of [participant.label, participant.sessionId]) if (alias) names.add(alias);
   }
   return names;

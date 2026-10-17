@@ -6,6 +6,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { BRIDGE_LEASE_MS, BridgeStaleIncarnationError, MeshBridge, RemoteBridgeSide, serveBridgeAgent, StoreBridgeSide } from "../src/mesh/bridge.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
+import { CommitOutbox } from "../src/mesh/commit-outbox.js";
 import { hostLeasePath, readHostLease, writeHostLease } from "../src/topology/host-leases.js";
 import type { FabricHostRecord, FabricParticipantRecord } from "../src/topology/types.js";
 import { writeParticipantFile } from "../src/topology/participant-files.js";
@@ -287,6 +288,33 @@ describe("own-root diagnostic", () => {
 });
 
 describe("direct tokenless presence through MeshBridge RPC", () => {
+  // CODE-F1's independent probe sequence, through JSON framing and presenceArg, not
+  // merely StoreBridgeSide.mirror: malformed presence must not erase the A -> B fence.
+  it.each(["file", "sqlite"] as const)("CODE-F1 preserves B and its A fence when tokenless updatedAt NaN becomes null over RPC (%s)", async backend => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(NOW);
+    const f = ownRootLink(false, backend);
+    const a = fixture("rpc-tokenless-root", "A", NOW - 2_000, NOW + 120_000);
+    const b = fixture("rpc-tokenless-root", "B", NOW - 1_000, NOW + 120_000);
+    await f.agent.mirror(a.presence);
+    await f.agent.mirror(b.presence);
+    const before = { host: f.work.get(hostKey(b.host.id), { fresh: true }),
+      participant: f.work.get(participantKey(b.host.id), { fresh: true }),
+      lease: fs.readFileSync(hostLeasePath(f.work.root, b.host.id)) };
+    expect(before.host?.value).toMatchObject({ incarnationToken: "B", bridgeSupersededTokens: ["A"] });
+    const legacy = fixture("rpc-tokenless-root", undefined, NOW - 1_000, NOW + 120_000);
+    expect(JSON.stringify(Number.NaN)).toBe("null");
+    await f.remote.mirror({ hosts: [{ record: { ...legacy.host, updatedAt: Number.NaN },
+      expiresAt: NOW + 120_000, observedAt: NOW }], participants: [{ ...legacy.participant, name: "untrusted-tokenless" }] });
+    expect(f.work.get(hostKey(b.host.id), { fresh: true })).toEqual(before.host);
+    expect(f.work.get(participantKey(b.host.id), { fresh: true })).toEqual(before.participant);
+    expect(fs.readFileSync(hostLeasePath(f.work.root, b.host.id))).toEqual(before.lease);
+    await expect(f.remote.mirror(a.presence)).rejects.toBeInstanceOf(BridgeStaleIncarnationError);
+    expect(f.work.get(hostKey(b.host.id), { fresh: true })).toEqual(before.host);
+    expect(f.work.get(participantKey(b.host.id), { fresh: true })).toEqual(before.participant);
+    expect(fs.readFileSync(hostLeasePath(f.work.root, b.host.id))).toEqual(before.lease);
+  });
+
   it.each(["file", "sqlite"] as const)("WORKHOST fromHub renews existing B beyond expiry and keeps command/ACK usable (%s)", async backend => {
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(NOW);
@@ -433,6 +461,211 @@ describe("direct tokenless presence through MeshBridge RPC", () => {
     expect(hub.get(participantKey(rootB.participant.id), { fresh: true })?.value).toMatchObject({ name: "participant-B-renewed" });
     expect(hub.get(hostKey(unrelated.host.id), { fresh: true })?.value).toMatchObject({ remoteHost: "spoke" });
     expect(fs.readFileSync(hostLeasePath(hub.root, rootB.host.id))).not.toEqual(before.lease);
+  });
+});
+
+// Keep reason: CODE-F1 is a recorded trust-boundary/data-safety failure. Exercise JSON in
+// both directions, including native state with a valid lease that must NOT repair bad fields.
+const invalidTimestampCases = ["record.startedAt", "record.updatedAt", "record.expiresAt", "expiresAt", "observedAt"].flatMap(field =>
+  [{ label: "NaN", value: NaN }, { label: "null", value: null }, { label: "missing", value: undefined },
+    { label: "string", value: String(NOW) }, { label: "Infinity", value: Infinity }, { label: "-Infinity", value: -Infinity },
+    { label: "object", value: {} }].filter(({ label }) => field !== "observedAt" || label !== "missing")
+    .map(({ label, value }) => ({ field, label, value }))).concat([
+      { field: "expiresAt", label: "expired", value: NOW - 1 },
+      { field: "expiresAt", label: "at-observation", value: NOW + 20_000 },
+      { field: "observedAt", label: "after-expiry", value: NOW + 120_001 },
+    ]);
+
+for (const backend of ["file", "sqlite"] as const) {
+  for (const direction of ["mirror RPC", "native presence RPC"] as const) {
+    describe(`malformed direct timestamps (${backend}, ${direction})`, () => {
+      it.each(invalidTimestampCases.flatMap(sample => [undefined, "B"].map(token => ({ ...sample, token,
+        writer: token ?? "tokenless" }))))("preserves B, participants, lease and A fence for $field=$label ($writer)", async ({ field, value, token }) => {
+        vi.useFakeTimers({ toFake: ["Date"] });
+        vi.setSystemTime(NOW);
+        const f = ownRootLink(false, backend);
+        const receiver = direction === "mirror RPC" ? f.agent : f.local;
+        const store = direction === "mirror RPC" ? f.work : f.hub;
+        const a = fixture("matrix-root", "A", NOW - 2_000, NOW + 5_000);
+        const b = fixture("matrix-root", "B", NOW - 1_000, NOW + 5_000);
+        await receiver.mirror(a.presence);
+        await receiver.mirror(b.presence);
+        const before = { host: store.get(hostKey(b.host.id), { fresh: true }),
+          participant: store.get(participantKey(b.host.id), { fresh: true }),
+          lease: fs.readFileSync(hostLeasePath(store.root, b.host.id)) };
+        vi.setSystemTime(NOW + 20_000); // preservation is not a renewal, even after B expired
+        const legacy = fixture("matrix-root", token, NOW, NOW + 120_000);
+        legacy.participant.name = "untrusted-tokenless";
+        const unrelated = fixture("matrix-unrelated", "U", NOW, NOW + 120_000);
+        const unknown = fixture("matrix-unknown", token, NOW, NOW + 120_000);
+        const mutate = (sample: { record: FabricHostRecord; expiresAt: number; observedAt?: number }) => {
+          const target = (field.startsWith("record.") ? sample.record : sample) as unknown as Record<string, unknown>;
+          const name = field.replace("record.", "");
+          if (value === undefined) delete target[name];
+          else target[name] = value;
+        };
+        if (direction === "mirror RPC") {
+          const samples = [legacy, unknown].map(v => ({ record: { ...v.host }, expiresAt: v.host.expiresAt, observedAt: NOW + 20_000 }));
+          for (const sample of samples) mutate(sample);
+          await f.remote.mirror({ hosts: [...samples, ...unrelated.presence.hosts],
+            participants: [legacy.participant, unknown.participant, unrelated.participant] });
+        } else {
+          for (const v of [legacy, unknown, unrelated]) await installNative(f.work, v);
+          if (field.startsWith("record.")) {
+            for (const v of [legacy, unknown]) {
+              const sample = { record: { ...v.host }, expiresAt: v.host.expiresAt };
+              mutate(sample);
+              await f.work.put({ key: hostKey(v.host.id), identity: v.identity, value: sample.record });
+              // The valid file lease remains: effective liveness must not launder the bad host.
+              expect(readHostLease(f.work.root, v.host.id)!.expiresAt).toBe(NOW + 120_000);
+            }
+          } else {
+            const computed = await f.agent.presence();
+            for (const sample of computed.hosts) if (sample.record.id !== unrelated.host.id) mutate(sample);
+            vi.spyOn(f.agent, "presence").mockResolvedValueOnce(computed); // bad outer sample, real JSON response
+          }
+          await f.bridge.syncPresence();
+        }
+        expect(store.get(hostKey(b.host.id), { fresh: true })).toEqual(before.host);
+        expect(store.get(participantKey(b.host.id), { fresh: true })).toEqual(before.participant);
+        expect(fs.readFileSync(hostLeasePath(store.root, b.host.id))).toEqual(before.lease);
+        expect(store.get(hostKey(unknown.host.id), { fresh: true })).toBeUndefined();
+        expect(store.get(participantKey(unknown.host.id), { fresh: true })).toBeUndefined();
+        expect(readHostLease(store.root, unknown.host.id)).toBeUndefined();
+        expect(store.get(hostKey(unrelated.host.id), { fresh: true })?.value).toMatchObject({ incarnationToken: "U" });
+        expect(store.get(participantKey(unrelated.host.id), { fresh: true })?.value).toMatchObject({ name: unrelated.participant.name });
+        const replay = fixture("matrix-root", "A", NOW + 20_000, NOW + 120_000);
+        if (direction === "mirror RPC") await expect(f.remote.mirror(replay.presence)).rejects.toBeInstanceOf(BridgeStaleIncarnationError);
+        else {
+          await installNative(f.work, replay);
+          await expect(f.bridge.syncPresence()).rejects.toBeInstanceOf(BridgeStaleIncarnationError);
+        }
+        expect(store.get(hostKey(b.host.id), { fresh: true })).toEqual(before.host);
+        expect(store.get(participantKey(b.host.id), { fresh: true })).toEqual(before.participant);
+        expect(fs.readFileSync(hostLeasePath(store.root, b.host.id))).toEqual(before.lease);
+      });
+
+      it("still admits coherent legacy tokenless renewal and same B, but withdraws genuinely omitted roots", async () => {
+        vi.useFakeTimers({ toFake: ["Date"] });
+        vi.setSystemTime(NOW);
+        const f = ownRootLink(false, backend);
+        const receiver = direction === "mirror RPC" ? f.agent : f.local;
+        const store = direction === "mirror RPC" ? f.work : f.hub;
+        const a = fixture("allowed-root", "A", NOW - 2_000, NOW + 5_000);
+        const b = fixture("allowed-root", "B", NOW - 1_000, NOW + 5_000);
+        await receiver.mirror(a.presence);
+        await receiver.mirror(b.presence);
+        const participant = store.get(participantKey(b.host.id), { fresh: true });
+        vi.setSystemTime(NOW + 20_000);
+        const legacy = fixture("allowed-root", undefined, NOW, NOW + 120_000);
+        legacy.participant.name = "untrusted-tokenless";
+        if (direction === "mirror RPC") await f.remote.mirror(legacy.presence); // absent observedAt is valid legacy
+        else {
+          await installNative(f.work, legacy);
+          const computed = await f.agent.presence();
+          for (const host of computed.hosts) delete host.observedAt;
+          vi.spyOn(f.agent, "presence").mockResolvedValueOnce(computed);
+          await f.bridge.syncPresence();
+        }
+        expect(store.get(participantKey(b.host.id), { fresh: true })).toEqual(participant);
+        expect(readHostLease(store.root, b.host.id)).toMatchObject({ incarnationToken: "B", bridgeSupersededTokens: ["A"],
+          expiresAt: NOW + 20_000 + BRIDGE_LEASE_MS });
+        const same = fixture("allowed-root", "B", NOW + 20_000, NOW + 140_000);
+        same.participant.name = "same-B-admitted";
+        if (direction === "mirror RPC") await f.remote.mirror(same.presence);
+        else { await installNative(f.work, same); await f.bridge.syncPresence(); }
+        expect(store.get(participantKey(b.host.id), { fresh: true })?.value).toMatchObject({ name: "same-B-admitted" });
+        if (direction === "mirror RPC") await f.remote.mirror({ hosts: [], participants: [] });
+        else {
+          // Real RPC empty snapshot; do not delete another fixture's files to model omission.
+          vi.spyOn(f.agent, "presence").mockResolvedValueOnce({ hosts: [], participants: [], reserved: [] });
+          await f.bridge.syncPresence();
+        }
+        expect(store.get(hostKey(b.host.id), { fresh: true })).toBeUndefined();
+        expect(store.get(participantKey(b.host.id), { fresh: true })).toBeUndefined();
+        expect(readHostLease(store.root, b.host.id)).toBeUndefined();
+      });
+    });
+  }
+}
+
+describe("preservation-only native samples", () => {
+  it.each(["file", "sqlite"] as const)("do not create native routing authority while unrelated commands continue (%s)", async backend => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(NOW);
+    const f = ownRootLink(false, backend);
+    const bad = fixture("invalid-native-target", undefined, NOW - 1_000, NOW + 120_000);
+    const good = fixture("valid-native-target", "G", NOW - 1_000, NOW + 120_000);
+    const sender = fixture("valid-remote-sender", "S", NOW - 1_000, NOW + 120_000);
+    await installNative(f.hub, bad);
+    await f.hub.put({ key: hostKey(bad.host.id), identity: bad.identity, value: { ...bad.host, startedAt: null } });
+    await installNative(f.hub, good);
+    await installNative(f.work, sender);
+    await f.bridge.start();
+    for (const target of [bad.host.id, bad.participant.label!, bad.participant.sessionId!, good.host.id]) {
+      await f.work.publish({ topic: "fabric.control.command", kind: "followUp", from: sender.identity, to: target,
+        data: { version: 1, commandId: `routing-${target}`, targetId: target, replyTo: sender.host.id,
+          action: "followUp", text: "routing probe" } });
+    }
+    expect((await f.bridge.step()).toLocal).toBe(1);
+    expect(f.hub.read({ after: 0 }).filter(event => event.topic === "fabric.control.command")).toMatchObject([{ to: good.host.id }]);
+    expect(f.work.get(hostKey(bad.host.id), { fresh: true })).toBeUndefined();
+    expect(readHostLease(f.work.root, bad.host.id)).toBeUndefined();
+  });
+});
+
+describe("malformed direct RPC recovery custody", () => {
+  it.each(["file", "sqlite"] as const)("defers lease/unlease effects through recovery, repeated skips and plan retry (%s)", async backend => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(NOW);
+    const f = ownRootLink(false, backend);
+    const a = fixture("recovery-root", "A", NOW - 2_000, NOW + 5_000);
+    const b = fixture("recovery-root", "B", NOW - 1_000, NOW + 5_000);
+    await f.agent.mirror(a.presence);
+    await f.agent.mirror(b.presence);
+    const identity: MeshIdentity = { id: "bridge:hub", name: "hub", kind: "main" };
+    const pending = new CommitOutbox(f.work, "bridge/hub", identity, {});
+    const otherId = `${b.host.id}-other`;
+    const lease = readHostLease(f.work.root, b.host.id)!;
+    writeHostLease(f.work.root, { ...lease, id: otherId });
+    await f.work.writeBatch({ identity, ops: [], prepare: () => pending.plan().stage([], [
+      { kind: "lease", key: `lease:${b.host.id}`, payload: { ...lease, expiresAt: NOW + 999_000 } },
+      { kind: "unlease", key: `lease:${otherId}`, payload: { ...lease, id: otherId, key: hostKey(otherId) } },
+    ], { durable: true }) });
+    const before = { host: f.work.get(hostKey(b.host.id), { fresh: true }),
+      participant: f.work.get(participantKey(b.host.id), { fresh: true }),
+      lease: fs.readFileSync(hostLeasePath(f.work.root, b.host.id)),
+      otherLease: fs.readFileSync(hostLeasePath(f.work.root, otherId)), rows: f.work.listAll(pending.prefix, { fresh: true }) };
+    const input = new PassThrough(), output = new PassThrough();
+    const serving = serveBridgeAgent(new StoreBridgeSide(f.work, "hub", () => Date.now()), input, output);
+    const remote = new RemoteBridgeSide(output, input);
+    closers.push(async () => { remote.close(); input.end(); await serving; output.end(); });
+    vi.setSystemTime(NOW + 20_000);
+    const legacy = fixture("recovery-root", undefined, NOW, NOW + 120_000);
+    const unrelated = fixture("recovery-unrelated", "U", NOW, NOW + 120_000);
+    for (let pass = 0; pass < 3; pass++) {
+      const write = f.work.writeBatch.bind(f.work);
+      const retry = pass === 1 && backend === "sqlite" ? vi.spyOn(f.work, "writeBatch").mockImplementationOnce(async batch => {
+        await write({ identity, ops: [{ kind: "put", key: "topology/hosts/retry-probe", value: {} }] });
+        return write(batch);
+      }) : undefined;
+      await remote.mirror({ hosts: [{ record: { ...legacy.host, updatedAt: NaN }, expiresAt: NOW + 120_000,
+        observedAt: NOW + 20_000 }, ...unrelated.presence.hosts], participants: [legacy.participant, unrelated.participant] });
+      if (retry) { expect(retry).toHaveBeenCalledTimes(2); retry.mockRestore(); }
+      expect(f.work.get(hostKey(b.host.id), { fresh: true })).toEqual(before.host);
+      expect(f.work.get(participantKey(b.host.id), { fresh: true })).toEqual(before.participant);
+      expect(fs.readFileSync(hostLeasePath(f.work.root, b.host.id))).toEqual(before.lease);
+      expect(fs.readFileSync(hostLeasePath(f.work.root, otherId))).toEqual(before.otherLease);
+      for (const row of before.rows) expect(f.work.get(row.key, { fresh: true })).toEqual(row);
+      expect(f.work.get(hostKey(unrelated.host.id), { fresh: true })?.value).toMatchObject({ incarnationToken: "U" });
+    }
+    await remote.mirror({ hosts: [{ record: legacy.host, expiresAt: NOW + 120_000, observedAt: NOW + 20_000 }],
+      participants: [legacy.participant] });
+    expect(readHostLease(f.work.root, b.host.id)).toMatchObject({ incarnationToken: "B", bridgeSupersededTokens: ["A"],
+      expiresAt: NOW + 20_000 + BRIDGE_LEASE_MS });
+    expect(f.work.get(participantKey(b.host.id), { fresh: true })).toEqual(before.participant);
+    const replay = fixture("recovery-root", "A", NOW + 20_000, NOW + 120_000);
+    await expect(remote.mirror(replay.presence)).rejects.toBeInstanceOf(BridgeStaleIncarnationError);
   });
 });
 

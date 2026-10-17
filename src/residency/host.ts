@@ -82,7 +82,7 @@ import { ActorSessionResetCancelledError } from "../actors/session-reset-error.j
 import type { FabricActorInfo } from "../actors/types.js";
 import type { AgentRunRecord } from "../agents/types.js";
 import type { StateProjector } from "../mesh/state-projector.js";
-import { AgentManager } from "../agents/manager.js";
+import { AgentManager, type PendingHostedRecoveryInfo } from "../agents/manager.js";
 import { assertRecoveryAllowed, recoverySlice } from "../agents/enodev-recovery.js";
 import type { SpawnRouterAdmission } from "../agents/spawn-router.js";
 import { FabricTargetTerminalError, terminalRejectionFields, type AgentTerminalNotice } from "../agents/terminal-target.js";
@@ -147,6 +147,9 @@ const REQUEST_POLL_MS = 50;
 // the host's foreground budget explicit, independent of offline callers.
 const RETENTION_REFERENCE_BUDGET_MS = 2;
 const RETENTION_REFERENCE_MAX_ENTRIES = 64;
+// Metadata is a handle, not a retained answer. Bound work before read/parse,
+// including a file that grows after fstat (one extra byte detects the race).
+const HOSTED_RECOVERY_METADATA_MAX_BYTES = 1024 * 1024;
 // ponytail: 30s only amortizes deliveries racing clean close; no worker/session is kept warm.
 const IDLE_EXIT_MS = 30_000;
 // Reuse active-actor observations on the existing request poll, not dormancy checks.
@@ -367,6 +370,7 @@ export class ResidentHost {
   #hostedRecoveryNeeded = true;
   #hostedRecoveryPending: Promise<void> | undefined;
   #hostedRecoveryAbort: AbortController | undefined;
+  #hostedRecoveryOversizeWarned = false;
   // Restored queues and direct launches share the existing release gates until
   // ALL admitted runner modules (not just hosted rows) have been attempted.
   #runnerModulesReady = false;
@@ -689,6 +693,11 @@ export class ResidentHost {
       claudeBinary: config.claudeBinary,
       vedaBinary: config.vedaBinary,
       runRoot: path.join(config.residencyRoot, "runs"),
+      lookupPendingHostedRecovery: id => {
+        const row = this.#hostedRecoveryMetadata(id);
+        return row ? this.#hostedRecoveryProjection(row.metadata) : undefined;
+      },
+      hostedRecoveryPending: () => this.#hostedRecoveryNeeded,
       admissionSnapshotPath: path.join(residentActorRoots(config).session, "admission.json"),
       fullCodeMode: config.fullCodeMode,
       kernel: () => currentConfig().kernel ?? config.kernel ?? "typescript",
@@ -959,7 +968,9 @@ export class ResidentHost {
       const firstSeenAgents = new Map<string, number>();
       this.participants.registerSource(() =>
         agentParticipantRecords(
-          this.agents.listForUi(),
+          // Pending metadata is visible locally, not an adopted participant or
+          // a control-capability claim (even the compatibility finishing state).
+          this.agents.listForUi().filter(agent => !("recovery" in agent && agent.recovery.state === "pending")),
           this.config.rootId,
           this.hostId,
           this.identity.id,
@@ -3030,6 +3041,23 @@ export class ResidentHost {
     else atomicWrite(this.#removalsPath, { format: RESIDENT_HOST_FORMAT, removals });
   }
 
+  #hostedRecoveryProjection(metadata: ResidentAgentMetadata): PendingHostedRecoveryInfo | undefined {
+    const handle = metadata.handle;
+    if (handle.transport !== "hosted" || typeof handle.name !== "string" || typeof handle.runner !== "string" ||
+        typeof handle.cwd !== "string" || !["queued", "running", "finishing", "completed", "failed", "stopped", "timed_out"].includes(handle.status)) return undefined;
+    // Only display facts cross this seam. In particular, metadata never grants
+    // sender attribution, a running target, session attachment or recursive Fabric.
+    return { id: metadata.id, name: handle.name, runner: handle.runner, cwd: handle.cwd,
+      status: "finishing", transport: "hosted", residency: "durable",
+      recovery: { state: "pending", lastKnownStatus: handle.status } };
+  }
+
+  #warnOversizedHostedMetadata(id: string): void {
+    if (this.#hostedRecoveryOversizeWarned) return;
+    this.#hostedRecoveryOversizeWarned = true;
+    diagnostics.warn("src/residency/host.ts", `[pi-fabric] resident hosted metadata ${id} exceeds ${HOSTED_RECOVERY_METADATA_MAX_BYTES} bytes; recovery vetoed, run kept (further oversized-row diagnostics suppressed)`);
+  }
+
   /** undefined vetoes recovery; null alone proves positively absent metadata. */
   #hostedRecoveryMetadata(id: string): { metadata: ResidentAgentMetadata; source: string } | null | undefined {
     if (!/^[0-9a-f]{32}$/.test(id)) return undefined;
@@ -3044,7 +3072,34 @@ export class ResidentHost {
       try { stat = fs.lstatSync(file); }
       catch (error) { return (error as NodeJS.ErrnoException).code === "ENOENT" ? null : undefined; }
       if (!stat.isFile() || stat.isSymbolicLink() || fs.realpathSync(file) !== path.join(realAgents, `${id}.json`)) return undefined;
-      const source = fs.readFileSync(file, "utf8");
+      // Pin the inspected file. NOFOLLOW rejects a swapped leaf symlink where
+      // supported; NONBLOCK prevents a swapped FIFO from blocking before fstat.
+      const fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0));
+      let source: string;
+      try {
+        const before = fs.fstatSync(fd);
+        if (!before.isFile() || before.dev !== stat.dev || before.ino !== stat.ino ||
+            !Number.isSafeInteger(before.size) || before.size < 0) return undefined;
+        if (before.size > HOSTED_RECOVERY_METADATA_MAX_BYTES) {
+          this.#warnOversizedHostedMetadata(id);
+          return undefined;
+        }
+        const buffer = Buffer.alloc(before.size + 1);
+        let bytes = 0;
+        while (bytes < buffer.length) {
+          const read = fs.readSync(fd, buffer, bytes, buffer.length - bytes, bytes);
+          if (!read) break;
+          bytes += read;
+        }
+        const after = fs.fstatSync(fd);
+        if (bytes > HOSTED_RECOVERY_METADATA_MAX_BYTES || after.size > HOSTED_RECOVERY_METADATA_MAX_BYTES) {
+          this.#warnOversizedHostedMetadata(id);
+          return undefined;
+        }
+        if (bytes !== before.size || after.size !== before.size ||
+            after.mtimeMs !== before.mtimeMs || after.ctimeMs !== before.ctimeMs) return undefined;
+        source = buffer.toString("utf8", 0, bytes);
+      } finally { fs.closeSync(fd); }
       const metadata = JSON.parse(source) as ResidentAgentMetadata;
       if (metadata?.format !== RESIDENT_HOST_FORMAT || metadata.rootId !== this.config.rootId ||
           metadata.id !== id || metadata.handle?.id !== id || typeof metadata.runDirectory !== "string" ||
@@ -3072,7 +3127,12 @@ export class ResidentHost {
     this.#admissions++;
     this.#hostedRecoveryPending = this.#recoverHostedRuns(signal, canRecover).then(() => {
       // An interrupted/partial pass must not discharge the discovery obligation.
-      if (canRecover()) this.#hostedRecoveryNeeded = false;
+      if (canRecover()) {
+        this.#hostedRecoveryNeeded = false;
+        // Restored activation replay may only resume after discovery/adoption,
+        // never in the gap between runner imports and the hosted-run scan.
+        this.#resumeAfterRunnerModules();
+      }
     }).catch(error => {
       if (canRecover()) diagnostics.warn("src/residency/host.ts", `[pi-fabric] resident hosted recovery deferred: ${String(error)}`);
     }).finally(() => {
@@ -3084,16 +3144,19 @@ export class ResidentHost {
   }
 
   #resumeAfterRunnerModules(): void {
-    if (!this.#runnerModulesReady) {
+    if (!this.#runnerModulesReady || this.#hostedRecoveryNeeded) {
       if (this.actors.releaseAdmissionHeld) {
         // A completed drain must drop its strict admission/epoch fence even
-        // while bootstrap still owns the activation hold. pause alone cannot
-        // downgrade strictness. Keep AgentManager held, and synchronously put
-        // BOTH actor scopes (and orphan reconciliation) back on the startup
-        // hold before any resumed asynchronous drain can continue to run().
+        // while bootstrap/recovery still owns the activation hold. pause alone
+        // cannot downgrade strictness. Synchronously put BOTH actor scopes (and
+        // orphan reconciliation) back on the startup hold before any resumed
+        // asynchronous drain can continue to run().
         try { this.actors.resumeAfterRelease(); }
         finally { this.actors.pauseForRelease(); }
       }
+      // Direct requests and the manager's recovery scan can proceed once all
+      // runner modules are known; restored actor execution remains held.
+      if (this.#runnerModulesReady) this.agents.resumeAfterRelease();
       return;
     }
     this.agents.resumeAfterRelease();
@@ -3138,6 +3201,7 @@ export class ResidentHost {
         if (!entry.name.endsWith(".json")) continue;
         const id = path.basename(entry.name, ".json");
         const row = this.#hostedRecoveryMetadata(id);
+        this.agents.setPendingHostedRecovery(id, row ? this.#hostedRecoveryProjection(row.metadata) : undefined);
         if (!row) continue;
         if (row.metadata.handle.transport === "hosted") selected.set(id, row.source);
         const module = row.metadata.runnerModule;
@@ -3149,9 +3213,9 @@ export class ResidentHost {
       }
     } finally { await cursor.close(); }
     check();
-    // Preserve the old bootstrap ordering for native/custom restored actors as
-    // well as hosted tasks. Direct receivers may queue while their real manager
-    // launch gate stays held; release/drain resumes cannot bypass this bootstrap.
+    // Direct launches may now use every admitted module. Restored actors retain
+    // the bootstrap hold until the COMPLETE hosted scan succeeds; release/drain
+    // resumes cannot bypass it or replay an activation in the adoption gap.
     this.#runnerModulesReady = true;
     this.#resumeAfterRunnerModules();
     check();

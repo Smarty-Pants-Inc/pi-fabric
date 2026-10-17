@@ -212,26 +212,31 @@ export class ActorLogStore {
     const runsDirectory = path.join(path.dirname(actor.sessionFile), "runs");
     const signature = archiveDirectorySignature(runsDirectory);
     const cached = this.#p95RunCache.get(actor);
-    if (cached?.runsDirectory === runsDirectory && cached.signature === signature) return [...cached.ids];
+    const previous = cached?.runsDirectory === runsDirectory ? cached : undefined;
+    // Two failed stats do not prove that the archive is unchanged.
+    if (signature !== undefined && previous?.signature === signature) return [...previous.ids];
 
     const ids = new Set<string>();
     let directory: fs.Dir | undefined;
-    let opened = false;
+    let complete = false;
     try {
       directory = fs.opendirSync(runsDirectory);
-      opened = true;
       for (let scanned = 0; scanned < boundedLimit; scanned++) {
         const entry = directory.readSync();
         if (entry === null) break;
         if (entry.isDirectory()) ids.add(entry.name);
       }
+      // Both clean EOF and the intended entry cap finish the bounded window.
+      complete = true;
     } catch {
-      // A missing or concurrently removed archive is not a p95 result.
+      // A partial sample can lower the alarm threshold; keep the last complete
+      // window and its signature intact so the next lookup retries the refresh.
     } finally {
       try { directory?.closeSync(); } catch { /* already closed or unavailable */ }
     }
+    if (!complete) return previous ? [...previous.ids] : [];
     const selected = [...ids].sort().slice(-boundedLimit);
-    if (opened) this.#p95RunCache.set(actor, { runsDirectory, signature, ids: selected });
+    this.#p95RunCache.set(actor, { runsDirectory, signature, ids: selected });
     return [...selected];
   }
 

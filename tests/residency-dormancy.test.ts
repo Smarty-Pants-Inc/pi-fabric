@@ -88,9 +88,25 @@ describe("resident dormancy (smarty-dev#6782 / #2264)", () => {
     try {
       await host.start();
       const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      // Readiness precedes full recovery. Join its public completion marker,
+      // then a post-finally request-poll baseline; never count discovery debt as idle.
+      await until(() => host.agents.listForUi().partial === false);
+      const hasOwnedActors = host.actors.hasOwnedActors.bind(host.actors);
+      let sampledIdlePoll = false;
+      vi.spyOn(host.actors, "hasOwnedActors").mockImplementation(() => {
+        const owned = hasOwnedActors(); // actual ownership/liveness path stays intact
+        const stack = new Error().stack ?? "";
+        if (!owned && host.agents.listForUi().partial === false &&
+            stack.includes("checkIdle") && stack.includes("pollRequests")) {
+          // checkIdle(false) sets the empty-host baseline synchronously after
+          // this sample. Observe completion, not an event-driven dormancy check.
+          queueMicrotask(() => { sampledIdlePoll = true; });
+        }
+        return owned;
+      });
+      await until(() => sampledIdlePoll);
       let now = Date.now();
       vi.spyOn(Date, "now").mockImplementation(() => now);
-      await sleep(150); // An empty dead-root host retires after its continuous window (#683).
       now += RESIDENT_IDLE_EXIT_MS + 1_000;
       await until(() => idle.mock.calls.length === 1);
       expect(warn).not.toHaveBeenCalled();

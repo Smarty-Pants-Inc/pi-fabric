@@ -1278,8 +1278,34 @@ const runRootHasExitVeto = (root: string, prelaunchIds: ReadonlySet<string>): bo
   }
 };
 
+type PendingHostedRecoveryInfoCompatibility = {
+  readonly [K in Exclude<keyof AgentHandleInfo,
+    "id" | "name" | "runner" | "cwd" | "status" | "transport" | "residency"
+  >]?: never;
+};
+
+/** Observation only, before the resident host has adopted an existing run.
+ * `finishing` is the shared handle's non-running compatibility envelope, NOT a
+ * terminal verdict or proof of worker liveness. Only recovery.lastKnownStatus
+ * comes from the metadata; no locator, attach command or sender claim is exposed. */
+export type PendingHostedRecoveryInfo =
+  Readonly<Pick<AgentHandleInfo, "id" | "name" | "runner" | "cwd">> &
+  PendingHostedRecoveryInfoCompatibility & {
+    readonly status: "finishing";
+    readonly transport: "hosted";
+    readonly residency: "durable";
+    readonly recovery: Readonly<{ state: "pending"; lastKnownStatus: AgentHandleInfo["status"] }>;
+  };
+
+type AgentStatusProjection = AgentRunRecord | AgentHandleInfo | PendingHostedRecoveryInfo;
+/** Local query metadata; an array's named properties are not a JSON wire envelope. */
+export type AgentUiList = AgentStatusProjection[] & { readonly partial: boolean };
+
 export class AgentManager {
   readonly #runs = new Map<string, ManagedAgent>();
+  readonly #pendingHostedRecovery = new Map<string, PendingHostedRecoveryInfo>();
+  readonly #lookupPendingHostedRecovery: ((id: string) => PendingHostedRecoveryInfo | undefined) | undefined;
+  readonly #hostedRecoveryPending: (() => boolean) | undefined;
   readonly #queued = new Map<string, QueuedAgent>();
   readonly #queuedStarts = new Set<Promise<void>>();
   readonly #semaphore: AgentAdmission;
@@ -1395,7 +1421,7 @@ export class AgentManager {
   #retentionSliceHint: { id: string; actorId: string | undefined } | undefined;
   #uiListRevision = 0;
   #uiListCache:
-    | { revision: number; value: Array<AgentRunRecord | AgentHandleInfo> }
+    | { revision: number; value: AgentUiList }
     | undefined;
   #closing = false;
   #releasePaused = false;
@@ -1453,6 +1479,10 @@ export class AgentManager {
       claudeBinary?: string;
       vedaBinary?: string;
       runRoot?: string;
+      /** Exact read-only metadata lookup, never discovery, import or adoption. */
+      lookupPendingHostedRecovery?: (id: string) => PendingHostedRecoveryInfo | undefined;
+      /** True until the owning host's complete discovery/adoption pass succeeds. */
+      hostedRecoveryPending?: () => boolean;
       /** Host-only, read-only projection of this manager's native admission pool. */
       admissionSnapshotPath?: string;
       fullCodeMode?: boolean;
@@ -1505,6 +1535,8 @@ export class AgentManager {
   ) {
     this.#semaphore = new AgentAdmission(config.maxConcurrent, Infinity, config.maxDepth);
     this.#admissionSnapshotPath = options.admissionSnapshotPath;
+    this.#lookupPendingHostedRecovery = options.lookupPendingHostedRecovery;
+    this.#hostedRecoveryPending = options.hostedRecoveryPending;
     this.#managedTempRoot = options.runRoot === undefined && process.env.PI_FABRIC_RUN_ROOT === undefined;
     this.#runRoot =
       options.runRoot ?? process.env.PI_FABRIC_RUN_ROOT ?? fs.mkdtempSync(path.join(fabricDataRoot(), "pi-fabric-runs-"));
@@ -3392,6 +3424,7 @@ export class AgentManager {
       options.signal.addEventListener("abort", managed.abortHandler, { once: true });
     }
     this.#runs.set(managed.id, managed);
+    this.#pendingHostedRecovery.delete(managed.id);
     this.#invalidateUiList();
     return managed;
   }
@@ -3820,7 +3853,41 @@ export class AgentManager {
     }
   }
 
-  status(id: string): AgentRunRecord | AgentHandleInfo {
+  /** Host metadata discovery pushes only validated, allowlisted observations.
+   * This cache never enters #runs, owns a permit, or supplies a mutation target. */
+  setPendingHostedRecovery(id: string, projection: PendingHostedRecoveryInfo | undefined): void {
+    if (this.#runs.has(id) || this.#queued.has(id) || this.#previousRuns.has(id)) projection = undefined;
+    const previous = this.#pendingHostedRecovery.get(id);
+    if (!projection) {
+      if (this.#pendingHostedRecovery.delete(id)) this.#invalidateUiList();
+      return;
+    }
+    if (projection.id !== id) throw new Error("Hosted recovery projection ID mismatch");
+    if (previous && previous.name === projection.name && previous.runner === projection.runner && previous.cwd === projection.cwd &&
+        previous.recovery.lastKnownStatus === projection.recovery.lastKnownStatus) return;
+    this.#pendingHostedRecovery.set(id, Object.freeze({
+      id, name: projection.name, runner: projection.runner, cwd: projection.cwd,
+      status: "finishing", transport: "hosted", residency: "durable",
+      recovery: Object.freeze({ state: "pending", lastKnownStatus: projection.recovery.lastKnownStatus }),
+    }));
+    this.#invalidateUiList();
+  }
+
+  #pendingHostedRecoveryInfo(id: string): PendingHostedRecoveryInfo | undefined {
+    // Revalidate the exact requested row even before the incremental cursor has
+    // reached it. A removed/foreign/unsafe row must not survive a cached hit.
+    if (this.#lookupPendingHostedRecovery) this.setPendingHostedRecovery(id, this.#lookupPendingHostedRecovery(id));
+    return this.#pendingHostedRecovery.get(id);
+  }
+
+  #pendingHostedRecoveryValues(): PendingHostedRecoveryInfo[] {
+    // UI/list queries use discovered observations only; never a metadata walk or
+    // one filesystem lookup per row. Real records always supersede observations.
+    return [...this.#pendingHostedRecovery.values()].filter(record =>
+      !this.#runs.has(record.id) && !this.#queued.has(record.id) && !this.#previousRuns.has(record.id));
+  }
+
+  status(id: string): AgentStatusProjection {
     const queued = this.#queued.get(id);
     if (queued) return queued.terminal ? structuredClone(queued.terminal) : this.#queuedInfo(queued);
     const previous = this.#previousRun(id);
@@ -3828,7 +3895,12 @@ export class AgentManager {
       this.#terminalNoticeOutbox.recover(path.dirname(this.#previousRuns.get(id)!.resultFile));
       return previous;
     }
-    const managed = this.#requireRun(id);
+    const managed = this.#runs.get(id);
+    if (!managed) {
+      const pending = this.#pendingHostedRecoveryInfo(id);
+      if (pending) return structuredClone(pending);
+      throw new Error(`Unknown Fabric agent: ${id}`);
+    }
     this.#observeFinalAnswer(managed);
     this.#routeTerminalNotices(managed);
     const record = this.#readResult(managed) ?? managed.latestRecord;
@@ -3856,19 +3928,22 @@ export class AgentManager {
     return result;
   }
 
-  list(): Array<AgentRunRecord | AgentHandleInfo> {
-    return [...this.#runs.keys(), ...this.#queued.keys()].map((id) => this.status(id));
+  list(): AgentStatusProjection[] {
+    return [...[...this.#runs.keys(), ...this.#queued.keys()].map((id) => this.status(id)),
+      ...this.#pendingHostedRecoveryValues().map(record => structuredClone(record))];
   }
 
-  listForUi(): Array<AgentRunRecord | AgentHandleInfo> {
-    if (this.#uiListCache?.revision === this.#uiListRevision) {
+  listForUi(): AgentUiList {
+    const partial = this.#hostedRecoveryPending?.() ?? false;
+    if (this.#uiListCache?.revision === this.#uiListRevision && this.#uiListCache.value.partial === partial) {
       return this.#uiListCache.value;
     }
     const runs = [...this.#runs.values()];
     const active = runs.filter((managed) => !managed.settled);
     const settled = runs.filter((managed) => managed.settled);
     const listBudget = MAX_RETAINED_UI_BYTES - MAX_RETAINED_UI_SNAPSHOT_BYTES;
-    const selected = new Map<string, AgentRunRecord | AgentHandleInfo>();
+    const selected = new Map<string, AgentStatusProjection>();
+    const pending = this.#pendingHostedRecoveryValues();
     let bytes = 4;
     const projection = (managed: ManagedAgent): AgentRunRecord | AgentHandleInfo => {
       let record = managed.latestUiRecord;
@@ -3895,8 +3970,8 @@ export class AgentManager {
     }
     const queuedValue = [...this.#queued.values()].map(queued =>
       queued.terminal ? compactUiRecord(queued.terminal) : this.#queuedInfo(queued));
-    for (const record of queuedValue) bytes += uiPayloadBytes(record) + 2;
-    const settledCount = Math.max(0, MAX_RETAINED_UI_RUNS - active.length - queuedValue.length);
+    for (const record of [...queuedValue, ...pending]) bytes += uiPayloadBytes(record) + 2;
+    const settledCount = Math.max(0, MAX_RETAINED_UI_RUNS - active.length - queuedValue.length - pending.length);
     for (const managed of (settledCount > 0 ? settled.slice(-settledCount) : []).reverse()) {
       if (selected.size - active.length >= settledCount) break;
       const record = projection(managed);
@@ -3905,8 +3980,11 @@ export class AgentManager {
       selected.set(managed.id, record);
       bytes += size;
     }
-    const value = runs.flatMap(managed => selected.has(managed.id) ? [selected.get(managed.id)!] : []);
-    value.push(...queuedValue);
+    // Local metadata must not change legacy array equality/enumeration. The
+    // assertion describes only the immutable property just installed here.
+    const value = Object.defineProperty(runs.flatMap(managed => selected.has(managed.id) ? [selected.get(managed.id)!] : []),
+      "partial", { value: partial, enumerable: false, writable: false, configurable: false }) as AgentUiList;
+    value.push(...queuedValue, ...pending);
     this.#pruneRetainedUiRecords();
     // An unusually large live/queued handle set remains queryable, but is not
     // retained as an over-budget UI-list cache.
@@ -7221,6 +7299,12 @@ export class AgentManager {
       const previous = this.#previousRuns.get(id)?.summary;
       if (previous) {
         throw new Error(`Fabric agent ${previous.name} (${id}) is ${previous.status}: ${previous.error ?? "no error"}; it has no running target`);
+      }
+      if (this.#pendingHostedRecoveryInfo(id)) {
+        // Existence observations cannot authorize delivery, stop or attach. This
+        // is deliberately not "Unknown": host routing must not fall through to
+        // another actor/owner while the exact hosted target is recovering.
+        throw new Error(`Fabric agent ${id} is pending hosted recovery; retry after adoption (no running target)`);
       }
       throw new Error(`Unknown Fabric agent: ${id}`);
     }

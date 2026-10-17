@@ -5,6 +5,7 @@ import { pathToFileURL } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { AgentManager } from "../src/agents/manager.js";
+import { persistRunStopIntent } from "../src/agents/archive-custody.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { ActorDirectory } from "../src/actors/directory.js";
@@ -15,6 +16,7 @@ import { readHostLease } from "../src/topology/host-leases.js";
 import { retentionV2Enabled } from "../src/storage/retention-platform.js";
 import { normalizeScope } from "../src/scope.js";
 import { registerAgentRunner, type FabricHostedRunner } from "../src/runners.js";
+import { diagnostics } from "../src/core/diagnostics.js";
 
 const fixture = () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-runsboot-"));
@@ -103,6 +105,53 @@ const observeRuns = (runs: string, ...additionalRoots: string[]) => {
     if (within(args[0])) work.stats++;
     return asyncLstat(...args);
   }) as typeof fs.promises.lstat);
+  return work;
+};
+
+/** Follow the target through pathname and opened-descriptor reads. A
+ * readFileSync(path)-only spy misses a bounded open/fstat/readSync receiver. */
+const observeMetadataReads = (file: string, unreadable = false) => {
+  const open = fs.openSync, close = fs.closeSync, readFile = fs.readFileSync;
+  const read = fs.readSync, readv = fs.readvSync;
+  const descriptors = new Set<number>();
+  const work = { opens: 0, reads: 0, failures: 0 };
+  const matches = (target: unknown): boolean => typeof target === "number"
+    ? descriptors.has(target) : String(target) === file;
+  const fail = (): never => {
+    work.failures++;
+    throw Object.assign(new Error("metadata unreadable"), { code: "EACCES" });
+  };
+  const noteRead = (target: unknown) => {
+    if (!matches(target)) return;
+    work.reads++;
+    if (unreadable) fail();
+  };
+  vi.spyOn(fs, "openSync").mockImplementation(((...args: Parameters<typeof fs.openSync>) => {
+    const target = matches(args[0]);
+    if (target) {
+      work.opens++;
+      if (unreadable) fail();
+    }
+    const fd = open(...args);
+    if (target) descriptors.add(fd);
+    return fd;
+  }) as typeof fs.openSync);
+  vi.spyOn(fs, "closeSync").mockImplementation((...args: Parameters<typeof fs.closeSync>) => {
+    try { return close(...args); }
+    finally { descriptors.delete(args[0]); } // descriptor reuse must not implicate an unrelated file
+  });
+  vi.spyOn(fs, "readFileSync").mockImplementation(((...args: Parameters<typeof fs.readFileSync>) => {
+    noteRead(args[0]);
+    return readFile(...args);
+  }) as typeof fs.readFileSync);
+  vi.spyOn(fs, "readSync").mockImplementation(((...args: Parameters<typeof fs.readSync>) => {
+    noteRead(args[0]);
+    return read(...args);
+  }) as typeof fs.readSync);
+  vi.spyOn(fs, "readvSync").mockImplementation(((...args: Parameters<typeof fs.readvSync>) => {
+    noteRead(args[0]);
+    return readv(...args);
+  }) as typeof fs.readvSync);
   return work;
 };
 
@@ -332,6 +381,7 @@ describe("resident retained-run startup (smarty-dev#4796)", () => {
         }
         callback(...args);
       })) as typeof setImmediate);
+    const nativeLaunches = vi.spyOn(ProcessTransport.prototype, "launch");
     const recovery = observeHostedRecovery((_manager, options) => {
       active = true; lastYieldAt = performance.now();
       const shouldRecover = options!.shouldRecover!;
@@ -356,6 +406,7 @@ describe("resident retained-run startup (smarty-dev#4796)", () => {
       const actor = await client.createActor({ name: "served-during-recovery", instructions: "Respond", residency: "durable",
         topics: ["runsboot.slow-history-wake"], responseMode: "text" });
       const trustedRequestMs = performance.now() - requestAt;
+      expect(trustedRequestMs).toBeLessThan(10_000); // far below the ~100s injected scan
       const pendingAtResponse = !settled;
       const readsAtResponse = statusReadCount;
       expect(pendingAtResponse).toBe(true);
@@ -367,15 +418,30 @@ describe("resident retained-run startup (smarty-dev#4796)", () => {
       // not a direct manager call or a mocked receiver, and require actual output.
       const wakeAt = performance.now();
       await host.mesh.publish({ topic: "runsboot.slow-history-wake", from: host.identity,
-        data: { message: "Wake and respond while historical recovery is still pending" } });
+        data: { message: "Accept this wake while historical recovery is still pending" } });
+      await vi.waitFor(() => expect(host.actors.status(actor.id).queued).toBeGreaterThan(0), { timeout: 10_000 });
+      const wakeAcceptedMs = performance.now() - wakeAt;
+      const pendingAtWakeAccepted = !settled;
+      const readsAtWakeAccepted = statusReadCount;
+      expect(pendingAtWakeAccepted).toBe(true);
+      expect(readsAtWakeAccepted).toBeLessThan(20_000);
+      expect(wakeAcceptedMs).toBeLessThan(10_000);
+      expect(nativeLaunches).not.toHaveBeenCalled();
+      expect(host.actors.messages(actor.id).filter(message => message.direction === "out" && !message.error)).toHaveLength(0);
+      // Authorized fallback A: request/mesh acceptance remains live, but actor
+      // output is held until the hosted scan finishes. Do not hide that cost.
+      await recovery.complete();
+      const scanHeldActorOutputMs = performance.now() - wakeAt;
       await vi.waitFor(() => expect(host.actors.messages(actor.id).filter(message => message.direction === "out" && !message.error)).toHaveLength(1), { timeout: 45_000 });
       const wakeLatencyMs = performance.now() - wakeAt;
       const pendingAtWakeOutput = !settled;
       const readsAtWakeOutput = statusReadCount;
-      expect(pendingAtWakeOutput).toBe(true);
-      expect(readsAtWakeOutput).toBeLessThan(20_000);
+      expect(pendingAtWakeOutput).toBe(false);
+      expect(readsAtWakeOutput).toBe(20_000);
+      expect(nativeLaunches).toHaveBeenCalledTimes(1);
       expect(await client.actorStatus(actor.id)).toMatchObject({ id: actor.id, lastRunId: expect.any(String) });
-      await recovery.complete();
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(host.actors.messages(actor.id).filter(message => message.direction === "out" && !message.error)).toHaveLength(1);
       active = false;
       sampleLease();
       maxSliceReads = Math.max(maxSliceReads, statusReadCount - readsAtYield);
@@ -386,7 +452,8 @@ describe("resident retained-run startup (smarty-dev#4796)", () => {
         persistedLeaseMaxGapMs: maxLeaseGapMs, persistedLeaseMaxAgeMs: maxLeaseAgeMs,
         persistedLeaseMinRemainingTtlMs: minLeaseRemainingMs, trustedRequestMs,
         pendingRecoveryAtResponse: pendingAtResponse, readsAtRequest, readsAtResponse,
-        wakeLatencyMs, pendingRecoveryAtWakeOutput: pendingAtWakeOutput, readsAtWakeOutput, nativeWakeOutputs: 1 }));
+        wakeAcceptedMs, pendingRecoveryAtWakeAccepted: pendingAtWakeAccepted, readsAtWakeAccepted,
+        scanHeldActorOutputMs, wakeLatencyMs, pendingRecoveryAtWakeOutput: pendingAtWakeOutput, readsAtWakeOutput, nativeWakeOutputs: 1 }));
       expect(statusReadCount).toBe(20_000);
       expect(yieldCount).toBeGreaterThanOrEqual(Math.floor(20_000 / 64));
       expect(maxSliceReads).toBeLessThanOrEqual(64);
@@ -490,6 +557,311 @@ describe("resident retained-run startup (smarty-dev#4796)", () => {
     }
   });
 
+  // Keep reason: reproduce a launched native actor's real pre-delivery crash
+  // image, rather than inventing an unsupported hosted-adapter actor. Restored
+  // work must stay held during the hosted scan and reuse its original result.
+  it("holds a restored launched native activation until discovery completes and delivers its original run once", { timeout: 30_000 }, async () => {
+    const { root, config, runs } = fixture();
+    config.workerPath = path.resolve("tests/fixtures/fake-worker.mjs");
+    config.piModels = { available: [{ provider: "test", id: "visible" }], aliases: {}, defaultModel: "test/visible" };
+    const previous = new ResidentHost(config);
+    let host!: ResidentHost;
+    let releaseResult!: () => void, enteredResult!: () => void, enteredManager!: () => void;
+    const resultHeld = new Promise<void>(resolve => { releaseResult = resolve; });
+    const resultEntered = new Promise<void>(resolve => { enteredResult = resolve; });
+    const managerEntered = new Promise<void>(resolve => { enteredManager = resolve; });
+    const launch = ProcessTransport.prototype.launch;
+    const launches = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(function (this: ProcessTransport, request) {
+      return launch.call(this, request);
+    });
+    try {
+      await previous.start();
+      const actor = await previous.actors.create({ name: "launched-before-restart", instructions: "Respond", residency: "durable", responseMode: "text" });
+      const run = previous.agents.run.bind(previous.agents);
+      let original: Awaited<ReturnType<AgentManager["run"]>> | undefined;
+      const runGate = vi.spyOn(previous.agents, "run").mockImplementation(async (...args: Parameters<AgentManager["run"]>) => {
+        const result = await run(...args); // actual launch, worker, disk result, and manager join
+        original = result;
+        enteredResult();
+        await resultHeld; // crash image is captured before actor output/queue acknowledgement
+        return result;
+      });
+      previous.actors.tell(actor.id, "produce the original durable result", undefined);
+      await resultEntered;
+      expect(original).toMatchObject({ status: "completed", text: "fake worker complete" });
+      expect(launches).toHaveBeenCalledTimes(1);
+      const runDirectory = path.join(runs, original!.id);
+      const actorSnapshot = path.join(root, "crash-actors");
+      const runSnapshot = path.join(root, "crash-run");
+      fs.cpSync(config.actorRoot, actorSnapshot, { recursive: true,
+        filter: source => source !== path.join(config.actorRoot, "actors.json.lock") }); // never restore a live writer's transient lock
+      fs.cpSync(runDirectory, runSnapshot, { recursive: true });
+      const actorDirectory = path.join(actorSnapshot, actor.id);
+      const queueFiles = fs.readdirSync(actorDirectory).filter(name => /^queue-.+\.json$/.test(name));
+      const queued = queueFiles.flatMap(name => {
+        const saved = JSON.parse(fs.readFileSync(path.join(actorDirectory, name), "utf8"));
+        return saved.items ?? [];
+      });
+      expect(queued).toContainEqual(expect.objectContaining({ executionStarted: true, resumed: true }));
+      // Use the supported durable-stop/result recovery receipt. The status,
+      // task activation identity, launched queue and result are actual bytes
+      // produced above; only the crash/stop boundary is injected here.
+      const recoveryRecord = JSON.parse(fs.readFileSync(path.join(runSnapshot, "manager-result.json"), "utf8"));
+      expect(recoveryRecord).toMatchObject({ id: original!.id, actorId: actor.id, transport: "process", status: "completed" });
+      persistRunStopIntent(runSnapshot, "explicit", recoveryRecord);
+      const closing = previous.close();
+      releaseResult();
+      await closing;
+      runGate.mockRestore();
+      // Restore only this fixture's captured crash image. No shared roots or
+      // real runroots are opened, replaced, or removed by the test.
+      fs.rmSync(config.actorRoot, { recursive: true, force: true });
+      fs.cpSync(actorSnapshot, config.actorRoot, { recursive: true });
+      fs.rmSync(runDirectory, { recursive: true, force: true });
+      fs.cpSync(runSnapshot, runDirectory, { recursive: true });
+      host = new ResidentHost(config); // all new-generation watchers see the restored image
+      // start() initializes both directories: observe the actual prototypes
+      // before bootstrap, only after the previous generation has fully closed.
+      const actorResumes = vi.spyOn(ActorDirectory.prototype, "resumeAfterRelease"); // passthrough, actual bootstrap transition
+      const replay = vi.spyOn(AgentManager.prototype, "run"); // passthrough: never fake reconciliation
+      const recovery = observeHostedRecovery(manager => {
+        manager.pauseForRelease(true);
+        enteredManager();
+      });
+      await host.start();
+      await managerEntered;
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(recovery.fallbacks).toHaveLength(1);
+      expect(actorResumes).not.toHaveBeenCalled(); // deterministic old-head red, independent of drain microtask timing
+      expect(replay).not.toHaveBeenCalled(); // restored drain cannot enter before this pass completes
+      expect(launches).toHaveBeenCalledTimes(1);
+      expect(host.actors.messages(actor.id).filter(message => message.direction === "out" && !message.error)).toHaveLength(0);
+      host.agents.resumeAfterRelease();
+      await recovery.complete();
+      await vi.waitFor(() => expect(host.actors.messages(actor.id).filter(message => message.direction === "out" && !message.error)).toHaveLength(1), { timeout: 10_000 });
+      const output = host.actors.messages(actor.id).filter(message => message.direction === "out" && !message.error);
+      expect(output[0]).toMatchObject({ runId: original!.id, text: original!.text });
+      expect(host.actors.status(actor.id).lastRunId).toBe(original!.id);
+      expect(actorResumes).toHaveBeenCalled();
+      expect(replay).toHaveBeenCalledTimes(1);
+      expect(launches).toHaveBeenCalledTimes(1); // original worker only; no replay/submission
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(host.actors.messages(actor.id).filter(message => message.direction === "out" && !message.error)).toHaveLength(1);
+    } finally {
+      releaseResult();
+      await previous.close(); await host?.close();
+      vi.restoreAllMocks();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  // Keep reason: P1 is a real host-to-manager visibility gap, not an attach
+  // failure. Hold real discovery before its first row, then hold the real
+  // manager at entry AFTER runner imports; neither status nor UI may adopt.
+  it.each(["before metadata discovery", "after runner imports"] as const)(
+    "projects known hosted runs at %s without early adoption or attachment", { timeout: 15_000 }, async boundary => {
+    const { root, config, runs } = fixture();
+    const runner = hostedRunner();
+    const first = seedManager(config);
+    const host = new ResidentHost(config);
+    let unregisterLate: (() => void) | undefined;
+    const gate = gatedRunnerModule(root, () => { unregisterLate = registerAgentRunner(runner.adapter); });
+    let releaseMetadata!: () => void, enteredMetadata!: () => void, enteredManager!: () => void;
+    const metadataHeld = new Promise<void>(resolve => { releaseMetadata = resolve; });
+    const metadataEntered = new Promise<void>(resolve => { enteredMetadata = resolve; });
+    const managerEntered = new Promise<void>(resolve => { enteredManager = resolve; });
+    try {
+      const kept = await first.spawn({ task: "visible while recovering", runner: runner.adapter.id, residency: "durable" });
+      const foreign = await first.spawn({ task: "foreign metadata is not visibility authority", runner: runner.adapter.id, residency: "durable" });
+      const invalid = await first.spawn({ task: "invalid metadata is not visibility authority", runner: runner.adapter.id, residency: "durable" });
+      const absent = "0".repeat(32); // no metadata AND no retained run; not the legitimate crash window
+      await first.close();
+      expect(kept.status).toBe("running");
+      runner.unregister();
+      const metadata = (handle: typeof kept): ResidentAgentMetadata => ({
+        format: 1, rootId: config.rootId, id: handle.id, handle,
+        runDirectory: path.join(runs, handle.id), createdAt: 1, updatedAt: 1,
+      });
+      saveMetadata(config, { ...metadata(kept), runnerModule: gate.module,
+        handle: { ...kept, attachCommand: "untrusted metadata attach command", sessionId: "untrusted-session",
+          runnerSessionId: "untrusted-runner-session", recursive: true, spawner: { id: "session:forged", kind: "main" },
+          capabilityRequirements: ["untrusted-capability"], capabilityDigest: "untrusted-digest" } });
+      saveMetadata(config, { ...metadata(foreign), rootId: "session:foreign" });
+      saveMetadata(config, { ...metadata(invalid), handle: { ...invalid, id: absent } });
+      const agents = path.join(config.residencyRoot, "agents");
+      const scans = { opens: 0, listings: 0, entries: 0 };
+      let held = false;
+      const opendir = fs.promises.opendir, readdir = fs.readdirSync, asyncReaddir = fs.promises.readdir;
+      vi.spyOn(fs.promises, "opendir").mockImplementation(async (...args: Parameters<typeof fs.promises.opendir>) => {
+        const directory = await opendir(...args);
+        if (String(args[0]) === agents) {
+          scans.opens++;
+          const read = directory.read.bind(directory);
+          vi.spyOn(directory, "read").mockImplementation((async () => {
+            if (!held) { held = true; enteredMetadata(); await metadataHeld; }
+            const entry = await read();
+            if (entry) scans.entries++;
+            return entry;
+          }) as typeof directory.read);
+        }
+        return directory;
+      });
+      vi.spyOn(fs, "readdirSync").mockImplementation(((...args: Parameters<typeof fs.readdirSync>) => {
+        if (String(args[0]) === agents) scans.listings++;
+        return readdir(...args);
+      }) as typeof fs.readdirSync);
+      vi.spyOn(fs.promises, "readdir").mockImplementation(((...args: Parameters<typeof fs.promises.readdir>) => {
+        if (String(args[0]) === agents) scans.listings++;
+        return asyncReaddir(...args);
+      }) as typeof fs.promises.readdir);
+      const recovery = observeHostedRecovery(manager => {
+        manager.pauseForRelease(true); // real pre-adoption release gate; do not replace recovery
+        enteredManager();
+      });
+      await host.start();
+      await metadataEntered;
+      expect(scans.entries).toBe(0);
+      expect(recovery.fallbacks).toHaveLength(0);
+      // Warm the empty UI cache before a direct known-ID lookup populates the
+      // read-only projection. The lookup must not walk or advance the cursor.
+      const beforeQueryUi = host.agents.listForUi();
+      expect(beforeQueryUi).toEqual([]); // partial is readable query metadata, not an enumerable legacy-array entry
+      expect(beforeQueryUi.some(row => row.id === kept.id)).toBe(false);
+      const beforeQuery = { ...scans };
+      const pending = {
+        id: kept.id, transport: "hosted", residency: "durable", status: "finishing",
+        recovery: { state: "pending", lastKnownStatus: "running" },
+      };
+      if (boundary === "before metadata discovery") {
+        const pendingStatus = host.agents.status(kept.id); // red-on-base: Unknown Fabric agent, not just a missing partial marker
+        expect(pendingStatus).toMatchObject(pending);
+        expect(beforeQueryUi.partial).toBe(true);
+        for (const field of ["attachCommand", "sessionId", "runnerSessionId", "sessionFile", "recursive", "spawner", "capabilityRequirements", "capabilityDigest"]) {
+          expect(pendingStatus).not.toHaveProperty(field); // metadata grants observation, never execution/attribution capabilities
+        }
+        expect(host.agents.listForUi().partial).toBe(true);
+        expect(host.agents.listForUi().find(row => row.id === kept.id)).toMatchObject(pending);
+      }
+      for (const id of [absent, foreign.id, invalid.id]) {
+        expect(() => host.agents.status(id)).toThrow(/Unknown Fabric agent/);
+        expect(host.agents.listForUi().some(row => row.id === id)).toBe(false);
+      }
+      expect(scans).toEqual(beforeQuery);
+      expect(scans.entries).toBe(0);
+      expect(runner.calls.attaches).toEqual([]);
+      expect(runner.calls.starts).toEqual([kept.id, foreign.id, invalid.id]);
+      expect(unregisterLate).toBeUndefined(); // direct lookup did not import its runner
+
+      releaseMetadata();
+      await gate.entered;
+      expect(recovery.fallbacks).toHaveLength(0);
+      expect(runner.calls.attaches).toEqual([]);
+      gate.release();
+      await gate.finished;
+      await managerEntered;
+      expect(recovery.fallbacks).toHaveLength(1);
+      expect(unregisterLate).toBeTypeOf("function"); // imports really finished
+      // This is the reported P1 seam: imports are done, the actual manager
+      // pass exists, but its adoption/attach path is held at entry.
+      // Capture UI BEFORE status: the after-imports case never queried kept,
+      // so this also proves incremental discovery populated the list itself.
+      const midRecoveryUi = host.agents.listForUi();
+      expect(host.agents.status(kept.id)).toMatchObject(pending); // independent mid-recovery red-on-base Unknown
+      expect(midRecoveryUi.partial).toBe(true);
+      expect(midRecoveryUi.filter(row => row.id === kept.id)).toEqual([expect.objectContaining(pending)]);
+      for (const id of [absent, foreign.id, invalid.id]) {
+        expect(() => host.agents.status(id)).toThrow(/Unknown Fabric agent/);
+        expect(host.agents.listForUi().some(row => row.id === id)).toBe(false);
+      }
+      expect(runner.calls.attaches).toEqual([]);
+      expect(runner.calls.starts).toEqual([kept.id, foreign.id, invalid.id]);
+      host.agents.resumeAfterRelease();
+      await recovery.complete(); // joins real adoption, attach, and host finally custody
+      const adopted = host.agents.status(kept.id);
+      expect(adopted).toMatchObject({ id: kept.id, transport: "hosted", status: "running" });
+      expect(adopted).not.toHaveProperty("recovery");
+      const completeUi = host.agents.listForUi();
+      expect(completeUi.partial).toBe(false);
+      const adoptedUi = completeUi.filter(row => row.id === kept.id);
+      expect(adoptedUi).toHaveLength(1);
+      expect(adoptedUi[0]).toMatchObject({ id: kept.id, transport: "hosted", status: "running" });
+      expect(adoptedUi[0]).not.toHaveProperty("recovery"); // cached pending row was invalidated
+      expect(runner.calls.attaches).toEqual([kept.id]);
+      expect(runner.calls.starts).toEqual([kept.id, foreign.id, invalid.id]);
+      for (const handle of [foreign, invalid]) {
+        expect(() => host.agents.status(handle.id)).toThrow(/Unknown Fabric agent/);
+        expect(host.agents.listForUi().some(row => row.id === handle.id)).toBe(false);
+        expect(JSON.parse(fs.readFileSync(path.join(runs, handle.id, "status.json"), "utf8"))).toMatchObject({ status: "running" });
+      }
+      expect(runner.calls.stops).toBe(0);
+    } finally {
+      releaseMetadata();
+      await gate.finish();
+      await host.close(); await first.close();
+      vi.restoreAllMocks();
+      unregisterLate?.(); runner.unregister(); gate.dispose();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  // Keep reason: a single oversized metadata row must not bypass the host's
+  // cooperative slice budget or turn skipped metadata into orphan authority.
+  it("rejects oversized metadata before pathname or descriptor payload reads without changing the live run", async () => {
+    const { root, config, runs } = fixture();
+    const runner = hostedRunner();
+    const first = seedManager(config);
+    const host = new ResidentHost(config);
+    try {
+      const handle = await first.spawn({ task: "oversized metadata remains unknown", runner: runner.adapter.id, residency: "durable" });
+      await first.close();
+      const agents = path.join(config.residencyRoot, "agents");
+      fs.mkdirSync(agents, { recursive: true });
+      const file = path.join(agents, `${handle.id}.json`);
+      const source = JSON.stringify({ format: 1, rootId: config.rootId, id: handle.id, handle,
+        runDirectory: path.join(runs, handle.id), createdAt: 1, updatedAt: 1,
+        padding: "x".repeat(1024 * 1024 + 1) });
+      fs.writeFileSync(file, source);
+      expect(fs.statSync(file).size).toBeGreaterThan(1024 * 1024);
+      const statusFile = path.join(runs, handle.id, "status.json");
+      const beforeStatus = fs.readFileSync(statusFile, "utf8");
+      const hostedFile = path.join(runs, handle.id, "hosted.json");
+      const beforeHosted = fs.readFileSync(hostedFile, "utf8");
+      const reads = observeMetadataReads(file);
+      let parses = 0;
+      const parse = JSON.parse;
+      vi.spyOn(JSON, "parse").mockImplementation((text, reviver) => {
+        if (text === source) parses++;
+        return parse(text, reviver);
+      });
+      const warnings = vi.spyOn(diagnostics, "warn").mockImplementation(() => undefined);
+      const recovery = observeHostedRecovery();
+      await host.start();
+      await recovery.complete();
+      expect(reads.reads).toBe(0); // red-on-base: payload was read; includes readFileSync(fd), readSync(fd), and readvSync(fd)
+      expect(reads.opens).toBeGreaterThan(0); // receiver encountered the real oversized file
+      expect(parses).toBe(0);
+      expect(warnings).toHaveBeenCalledTimes(1); // one host-wide diagnostic, not once per revalidation
+      expect(warnings.mock.calls[0]!.map(String).join(" ")).toMatch(/metadata/i);
+      expect(warnings.mock.calls[0]!.map(String).join(" ")).toMatch(/oversiz|too large|exceed|size|byte|limit/i);
+      expect(() => host.agents.status(handle.id)).toThrow(/Unknown Fabric agent/);
+      expect(host.agents.listForUi().some(row => row.id === handle.id)).toBe(false);
+      expect(reads.reads).toBe(0); // direct known-ID query also obeys the byte cap
+      expect(parses).toBe(0);
+      expect(warnings).toHaveBeenCalledTimes(1);
+      expect(fs.readFileSync(statusFile, "utf8")).toBe(beforeStatus);
+      expect(fs.statSync(file).size).toBe(Buffer.byteLength(source));
+      expect(fs.readFileSync(hostedFile, "utf8")).toBe(beforeHosted);
+      expect(runner.calls.attaches).toEqual([]);
+      expect(runner.calls.starts).toEqual([handle.id]);
+      expect(runner.calls.stops).toBe(0);
+    } finally {
+      vi.restoreAllMocks();
+      await host.close(); await first.close();
+      runner.unregister();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("attaches metadata-less crash-window runs and result-deferred metadata only after readiness, once", async () => {
     const { root, config, runs } = fixture();
     const runner = hostedRunner();
@@ -568,17 +940,16 @@ describe("resident retained-run startup (smarty-dev#4796)", () => {
         } else fs.writeFileSync(file, kind === "torn" ? "{torn" : JSON.stringify(metadata));
         if (kind === "unreadable") unreadable = file;
       }
-      const read = fs.readFileSync;
-      vi.spyOn(fs, "readFileSync").mockImplementation(((...args: Parameters<typeof fs.readFileSync>) => {
-        if (String(args[0]) === unreadable) throw Object.assign(new Error("metadata unreadable"), { code: "EACCES" });
-        return read(...args);
-      }) as typeof fs.readFileSync);
+      const unreadableReads = observeMetadataReads(unreadable, true);
       const recovery = observeHostedRecovery();
       await host.start();
       await recovery.complete();
       expect(runner.calls.attaches).toEqual([]);
       expect(runner.calls.starts).toEqual(handles.map(handle => handle.id));
+      expect(unreadableReads.failures).toBeGreaterThan(0); // EACCES reached the actual receiver, including descriptor-based implementations
       for (const handle of handles) {
+        expect(() => host.agents.status(handle.id)).toThrow(/Unknown Fabric agent/);
+        expect(host.agents.listForUi().some(row => row.id === handle.id)).toBe(false);
         expect(JSON.parse(fs.readFileSync(path.join(runs, handle.id, "status.json"), "utf8"))).toMatchObject({ status: "running" });
       }
     } finally {

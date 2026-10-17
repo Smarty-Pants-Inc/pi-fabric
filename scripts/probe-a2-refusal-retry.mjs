@@ -2,7 +2,8 @@
 // A2 post-install acceptance probe (run once per work host).
 // Usage: node scripts/probe-a2-refusal-retry.mjs --release /path/to/pi-fabric --release-sha <40-hex>
 // Optional: --pi /path/to/pi (or PI_FABRIC_PROBE_PI), --host HOST.
-// The probe launches two throwaway Pi roots against one throwaway mesh.
+// It runs the INSTALLED release in a PRIVATE scratch mesh (never live fleet roots).
+// It forces refusal by making that private mesh directory unavailable.
 // All routing and observation inside Pi uses public fabric_exec agents/mesh APIs.
 // It names a unique absent receiver, then forces the late directory read to refuse.
 // The first send must be a typed refusal, never generic/unknown.
@@ -33,6 +34,20 @@ const typedRefusals = new Set([
   "FABRIC_DIRECTORY_UNAVAILABLE", "FABRIC_ROUTE_AUTHORITY_CHANGED", "FABRIC_PARTICIPANT_NOT_YET_MIRRORED",
   "FABRIC_PARTICIPANT_STALE", "FABRIC_PEER_LEASE_STALE",
 ]);
+const residuePrefix = "a2probe-";
+const readResidue = root => {
+  const statePath = path.join(root, "state.json");
+  const state = fs.existsSync(statePath) ? JSON.parse(fs.readFileSync(statePath, "utf8")) : { entries: {} };
+  const entries = Object.entries(state.entries ?? {});
+  const participants = entries.filter(([key, entry]) => key.startsWith("topology/participants/") && entry?.value != null).length;
+  const namedKeys = entries.filter(([key]) => key.startsWith(residuePrefix)).length;
+  const eventPath = path.join(root, "events.jsonl");
+  const namedEvents = fs.existsSync(eventPath)
+    ? fs.readFileSync(eventPath, "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line)).filter(event =>
+      [event.id, event.topic, event.kind, event.name, event.data?.name].some(value => typeof value === "string" && value.startsWith(residuePrefix))).length
+    : 0;
+  return { participants, named: namedKeys + namedEvents };
+};
 
 const parse = argv => {
   const options = { release: repo, releaseSha: undefined, pi: process.env.PI_FABRIC_PROBE_PI ?? "pi", host: os.hostname() };
@@ -149,12 +164,12 @@ const main = async () => {
   const scratch = fs.mkdtempSync(path.join(inheritedTmp, "a2probe-")); fs.chmodSync(scratch, 0o700);
   const meshRoot = path.join(scratch, "mesh");
   const host = options.host, key = `a2probe-${host}-${new Date().toISOString().replace(/[^0-9]/g, "").slice(0, 14)}`;
-  const targetName = `a2probe-receiver-${key}`, message = `A2PROBE ${key}`, topic = `a2probe.${host}.${key}`;
+  const targetName = `probe-receiver-${host}-${key.slice("a2probe-".length)}`, message = `A2PROBE ${key}`, topic = `a2probe.${host}.${key}`;
   const receiver = new Rpc(options, scratch, meshRoot, "receiver", undefined, targetName);
   let sender;
-  let refusal = "unknown", before = -1, deliveries = -1, duplicates = -1, verdict = "FAIL", failure;
+  let refusal = "unknown", before = -1, deliveries = -1, duplicates = -1, residue = -1, verdict = "FAIL", failure;
   try {
-    sender = new Rpc(options, scratch, meshRoot, "sender", undefined, "a2probe-sender");
+    sender = new Rpc(options, scratch, meshRoot, "sender", undefined, "probe-sender");
     await sender.start();
     await sender.eval("return await agents.sessions();");
     fs.chmodSync(meshRoot, 0o000);
@@ -180,11 +195,17 @@ const main = async () => {
   finally {
     try { if (fs.existsSync(meshRoot)) fs.chmodSync(meshRoot, 0o700); } catch { /* teardown is best effort */ }
     await receiver.stop(); await sender?.stop();
+    try {
+      const observedResidue = readResidue(meshRoot);
+      residue = observedResidue.participants + observedResidue.named;
+      if (residue !== 0) failure ??= new Error(`probe residue remains: participants=${observedResidue.participants} named=${observedResidue.named}`);
+    } catch (error) { failure ??= error; }
+    try { fs.rmSync(scratch, { recursive: true, force: true }); } catch (error) { failure ??= error; }
   }
   const elapsed = Math.round(performance.now() - started);
-  const line = `A2PROBE host=${host} release=${options.releaseSha} refusal=${refusal} events_before_retry=${before} deliveries_after_retry=${deliveries} dup_after_second_retry=${duplicates} ${verdict} ${elapsed}ms`;
+  const line = `A2PROBE host=${host} release=${options.releaseSha} refusal=${refusal} events_before_retry=${before} deliveries_after_retry=${deliveries} dup_after_second_retry=${duplicates} residue=${residue} ${verdict} ${elapsed}ms`;
   process.stdout.write(line + "\n");
   if (failure) { process.stderr.write(`A2PROBE failure: ${failure.stack ?? failure}\n`); process.exitCode = 1; }
 };
 
-main().catch(error => { process.stdout.write(`A2PROBE host=unknown release=unknown refusal=unknown events_before_retry=-1 deliveries_after_retry=-1 dup_after_second_retry=-1 FAIL 0ms\n`); process.stderr.write(`${error.stack ?? error}\n`); process.exitCode = 1; });
+main().catch(error => { process.stdout.write(`A2PROBE host=unknown release=unknown refusal=unknown events_before_retry=-1 deliveries_after_retry=-1 dup_after_second_retry=-1 residue=-1 FAIL 0ms\n`); process.stderr.write(`${error.stack ?? error}\n`); process.exitCode = 1; });

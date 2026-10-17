@@ -330,9 +330,11 @@ export interface HeldAgentMessage {
   deliveryId?: string;
   /** Replaced delivery ids: retained with the live carrier even after consumed-id eviction. */
   supersedes?: string[];
-  /** Native admission is durable; retain this journal item only to retry outcome append. */
+  /** Native retirement is complete; retain this item only for outcome bookkeeping. */
   outcomePending?: true;
-  /** Persisted retry reservations; the initial outcome append is not counted here. */
+  /** Host-observed own native receipt, not inferred from chain retirement or consumed ids. */
+  outcomeNativeDelivered?: true;
+  /** Persisted attempt reservations, including the first post-confirmation append. */
   outcomeRetryAttempts?: number;
   /** Handed to Pi's queue; it may still be there after a reload. Unset while Fabric holds it. */
   handed?: true;
@@ -391,7 +393,7 @@ const CONSUMED_DELIVERIES_MAX = 2000;
 /** Outcome bookkeeping is bounded separately from the initial native admission. */
 export const MAIN_DELIVERY_OUTCOME_RETRY_LIMIT = 8;
 const OUTCOME_DEAD_LETTER_REASON =
-  `native carrier delivered; delivery outcome bookkeeping unknown; retry budget of ${MAIN_DELIVERY_OUTCOME_RETRY_LIMIT} exhausted`;
+  `delivery outcome bookkeeping unknown; retry budget of ${MAIN_DELIVERY_OUTCOME_RETRY_LIMIT} exhausted`;
 const deliveryKey = (deliveryId: string): string => `delivery:${deliveryId}`;
 
 type PersistedProviderState = {
@@ -1195,10 +1197,8 @@ export class MainAgentController implements FabricMainAgentTarget {
     const seen = this.#source !== "" && this.#unverified.some((item) => !delivered.has(item.id)) ? this.#inMemory() : new Set<string>();
     for (const item of this.#unverified.splice(0)) {
       if (delivered.has(item.id)) {
-        this.#recordSuperseded(item);
-        const recorded = this.#recordOutcome(item.outcomeSend, "delivered", "consumed by Main as itself");
         this.#consume(item);
-        if (item.supersededSends?.length || !recorded) this.#queueOutcomeRetry(item);
+        this.#queueOutcomeRetry(item, true);
         continue;
       }
       if (queued.has(item.id) || seen.has(item.id)) this.#sent.push(item);
@@ -1217,6 +1217,8 @@ export class MainAgentController implements FabricMainAgentTarget {
       }
     }
     this.#held.sort((a, b) => a.sentAt - b.sentAt);
+    // All confirmed carriers have left the native arrays before the reservation save.
+    this.#retryPendingOutcomes();
     this.#trySave();
   }
 
@@ -1235,10 +1237,12 @@ export class MainAgentController implements FabricMainAgentTarget {
     return pending.length !== before;
   }
 
-  #queueOutcomeRetry(item: HeldAgentMessage): void {
+  #queueOutcomeRetry(item: HeldAgentMessage, nativeDelivered: boolean): void {
+    if (!item.outcomeSend && !item.supersededSends?.length) return;
     item.outcomePending = true;
-    // Legacy journals have no counter. Zero means no retry append has been attempted yet;
-    // the initial post-admission append is deliberately outside this budget.
+    if (nativeDelivered) item.outcomeNativeDelivered = true;
+    else delete item.outcomeNativeDelivered;
+    // Legacy journals start at zero; every post-retirement append needs a durable reservation.
     item.outcomeRetryAttempts ??= 0;
     if (!this.#outcomePending.includes(item)) this.#outcomePending.push(item);
   }
@@ -1259,9 +1263,9 @@ export class MainAgentController implements FabricMainAgentTarget {
     const letter = {
       version: 1,
       kind: "main-delivery-outcome-dead-letter",
-      native: "delivered",
+      native: item.outcomeNativeDelivered === true ? "delivered" : "unknown",
       bookkeeping: "unknown",
-      reason: OUTCOME_DEAD_LETTER_REASON,
+      reason: `${item.outcomeNativeDelivered === true ? "native carrier delivered" : "native carrier receipt unknown"}; ${OUTCOME_DEAD_LETTER_REASON}`,
       carrier: { id: item.id, ...(item.deliveryId === undefined ? {} : { deliveryId: item.deliveryId }) },
       sends,
       attempts: Math.min(item.outcomeRetryAttempts ?? MAIN_DELIVERY_OUTCOME_RETRY_LIMIT, MAIN_DELIVERY_OUTCOME_RETRY_LIMIT),
@@ -1278,6 +1282,7 @@ export class MainAgentController implements FabricMainAgentTarget {
 
   /** Retry outcome-only journal items; they never block native delivery or re-enter Pi. */
   #retryPendingOutcomes(): boolean {
+    if (!this.#journal) return false; // No durable reservation barrier, so no optional append.
     let changed = false;
     const kept: HeldAgentMessage[] = [];
     const retryable: HeldAgentMessage[] = [];
@@ -1324,7 +1329,8 @@ export class MainAgentController implements FabricMainAgentTarget {
     const exhaustedAfterRetry: HeldAgentMessage[] = [];
     for (const item of retryable) {
       const supersededChanged = this.#recordSuperseded(item);
-      const delivered = this.#recordOutcome(item.outcomeSend, "delivered", "consumed by Main as itself");
+      const delivered = item.outcomeNativeDelivered !== true ||
+        this.#recordOutcome(item.outcomeSend, "delivered", "consumed by Main as itself");
       changed ||= supersededChanged;
       if (item.supersededSends?.length || !delivered) {
         if ((item.outcomeRetryAttempts ?? 0) >= MAIN_DELIVERY_OUTCOME_RETRY_LIMIT) exhaustedAfterRetry.push(item);
@@ -1350,7 +1356,7 @@ export class MainAgentController implements FabricMainAgentTarget {
   /** Drop the handed-over followUps the session now holds (the only way one leaves the journal). */
   #confirm(): void {
     this.#retryPendingHalt();
-    let outcomesChanged = this.#retryPendingOutcomes();
+    let outcomesChanged = false;
     for (const item of this.#held) outcomesChanged = this.#recordSuperseded(item) || outcomesChanged;
     const delivered = this.#refreshDelivered();
     const before = this.#sent.length;
@@ -1360,14 +1366,13 @@ export class MainAgentController implements FabricMainAgentTarget {
         kept.push(item);
         continue;
       }
-      // Native session admission is already durable. Outcome logging is best-effort and
-      // cannot hold the delivery queue; a failure becomes an outcome-only journal item.
-      outcomesChanged = this.#recordSuperseded(item) || outcomesChanged;
-      const recorded = this.#recordOutcome(item.outcomeSend, "delivered", "consumed by Main as itself");
+      // Retire native delivery immediately, but persist the outcome obligation and its first
+      // reservation together before any optional append. A rejected save cannot bypass the cap.
       this.#consume(item);
-      if (item.supersededSends?.length || !recorded) this.#queueOutcomeRetry(item);
+      this.#queueOutcomeRetry(item, true);
     }
     this.#sent.splice(0, this.#sent.length, ...kept);
+    outcomesChanged = this.#retryPendingOutcomes() || outcomesChanged;
     if (this.#sent.length !== before || outcomesChanged) this.#trySave();
   }
 
@@ -1424,7 +1429,7 @@ export class MainAgentController implements FabricMainAgentTarget {
           }
           // A policy this runtime cannot read is dropped: the item is then released as a held
           // followUp, as before policies were journalled.
-          const { deliverAs, triggerTurn, supersedes, provenance, source, wakeCause, wakeCauses, outcomeRetryAttempts, ...rest } = item;
+          const { deliverAs, triggerTurn, supersedes, provenance, source, wakeCause, wakeCauses, outcomeRetryAttempts, outcomeNativeDelivered, ...rest } = item;
           const retryAttempts = Number.isSafeInteger(outcomeRetryAttempts)
             ? Math.max(0, Math.min(MAIN_DELIVERY_OUTCOME_RETRY_LIMIT, outcomeRetryAttempts as number))
             : undefined;
@@ -1451,6 +1456,7 @@ export class MainAgentController implements FabricMainAgentTarget {
             } : {}),
             ...(source === "actor-output" || source === "fabric-host" ? { source } : {}),
             ...(retryAttempts === undefined ? {} : { outcomeRetryAttempts: retryAttempts }),
+            ...(item.outcomePending === true && outcomeNativeDelivered === true ? { outcomeNativeDelivered: true as const } : {}),
             ...(Array.isArray(supersedes) ? { supersedes: supersedes.filter((id) => typeof id === "string") } : {}),
             ...(DIRECT_DELIVERIES.has(deliverAs) && typeof triggerTurn === "boolean" ? { deliverAs, triggerTurn } : {}),
           });
@@ -1460,14 +1466,15 @@ export class MainAgentController implements FabricMainAgentTarget {
       this.#retryPendingHalt();                          // owner state survives an empty journal
       return;                                            // no journal
     }
-    // Outcome-only entries are already in the native session. Retry their host-owned logs, but
-    // never send their payload back through Pi.
-    for (const item of items) {
-      if (item.outcomePending === true) this.#outcomePending.push(item);
-    }
     // The owner rule (dev-lead on pi-fabric#102): skip every id the session holds; a handoff
     // may still sit in Pi's queue, so it waits for a boundary to check; the rest is held again.
     const delivered = this.#refreshDelivered();
+    // Outcome-only entries never re-enter Pi. Old journals without own-receipt metadata are
+    // conservative unless the actual native receipt is still observable; consumed ids do not count.
+    for (const item of items) {
+      if (item.outcomePending === true) this.#queueOutcomeRetry(item,
+        item.outcomeNativeDelivered === true || delivered.has(item.id));
+    }
     // One member per replacement chain survives, the latest (a handed one is its chain's last),
     // and none once the session holds one. So no replaced id comes back, however long the burst
     // (review/astra F1 on pi-fabric#114).
@@ -1484,10 +1491,8 @@ export class MainAgentController implements FabricMainAgentTarget {
       if (delivered.has(item.id) || delivered.has(chainOf(item)) || last.get(chainOf(item)) !== item ||
         (item.deliveryId !== undefined && this.#consumed.has(item.deliveryId))) {
         const nativeDelivered = delivered.has(item.id);
-        this.#recordSuperseded(item);
-        const recorded = nativeDelivered ? this.#recordOutcome(item.outcomeSend, "delivered", "consumed by Main as itself") : true;
         this.#consume(item);
-        if (item.supersededSends?.length || !recorded) this.#queueOutcomeRetry(item);
+        if (nativeDelivered || item.supersededSends?.length) this.#queueOutcomeRetry(item, nativeDelivered);
         continue;
       }
       this.#recordSuperseded(item);

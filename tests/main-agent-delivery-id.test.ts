@@ -198,6 +198,142 @@ describe("Main delivery outcome evidence", () => {
     }
   });
 
+  it.each(["confirm", "reconcile"] as const)("requires a durable first reservation at %s and on every handed-carrier reload", confirmation => {
+    const journal = journalPath(); const first = fakePi(); const context = busy([], true);
+    const nativeFile = path.join(path.dirname(journal), "native-session.jsonl");
+    context.sessionManager.getSessionFile = () => nativeFile;
+    const main = new MainAgentController(first.pi, "session:root", true, "/tmp/project", "root");
+    const controllers = [main];
+    main.attachFollowUpDrain(context, 0, journal);
+    const send = { eventId: "first-reservation", to: main.id, from: actor.id, mode: "steer" as const };
+    main.deliverAgent({ from: actor, message: "once", delivery: "steer", deliveryId: "handed-original", outcomeSend: send });
+    // These are the real atomic writer's durable original bytes, not a fabricated return shape.
+    const originalBytes = fs.readFileSync(journal, "utf8");
+    const originalItem = JSON.parse(originalBytes).items[0];
+    expect(originalItem).toMatchObject({ handed: true, deliveryId: "handed-original" });
+    expect(originalItem.outcomePending).toBeUndefined();
+    fs.writeFileSync(nativeFile, `${JSON.stringify(persisted(first.sent[0]!))}\n`);
+    const originalWrite = atomicWrite.writeFileAtomic;
+    let rejectReservation = true;
+    const write = vi.spyOn(atomicWrite, "writeFileAtomic").mockImplementation((file, contents, options) => {
+      if (String(file) === journal && rejectReservation) throw new Error("reservation barrier unavailable");
+      return originalWrite(file, contents, options);
+    });
+    const originalAppend = deliveryOutcomes.appendDeliveryOutcome;
+    const append = vi.spyOn(deliveryOutcomes, "appendDeliveryOutcome").mockImplementation((...args) => {
+      const reserved = JSON.parse(fs.readFileSync(journal, "utf8")).items;
+      expect(reserved).toHaveLength(1);
+      expect(reserved[0]).toMatchObject({ outcomePending: true, outcomeNativeDelivered: true, outcomeRetryAttempts: 1 });
+      return originalAppend(...args);
+    });
+    try {
+      if (confirmation === "confirm") main.confirmInbox();
+      else {
+        main.closeFollowUpDrain();
+        // Reattach before exposing the native receipt so the original handoff is unverified.
+        fs.writeFileSync(nativeFile, "");
+        main.attachFollowUpDrain(context, 0, journal);
+        fs.writeFileSync(nativeFile, `${JSON.stringify(persisted(first.sent[0]!))}\n`);
+        first.emit("agent_before_settle", boundary([]), context);
+      }
+      expect(append).not.toHaveBeenCalled();
+      main.closeFollowUpDrain();
+      for (let reload = 0; reload < MAIN_DELIVERY_OUTCOME_RETRY_LIMIT + 3; reload++) {
+        const h = fakePi();
+        const restarted = new MainAgentController(h.pi, "session:root", true, "/tmp/project", "root");
+        controllers.push(restarted);
+        restarted.attachFollowUpDrain(context, 0, journal);
+        restarted.confirmInbox();
+        expect(h.sent).toHaveLength(0);
+        expect(append).not.toHaveBeenCalled();
+        expect(fs.readFileSync(journal, "utf8")).toBe(originalBytes);
+        if (reload < MAIN_DELIVERY_OUTCOME_RETRY_LIMIT + 2) restarted.closeFollowUpDrain();
+      }
+      rejectReservation = false;
+      controllers.at(-1)!.confirmInbox();
+      expect(append).toHaveBeenCalledTimes(1);
+      expect(outcomes(journal)).toEqual([{ ...send, outcome: "delivered", reason: "consumed by Main as itself", at: expect.any(Number) }]);
+      expect(first.sent).toHaveLength(1);
+      expect(deadLetters(journal)).toHaveLength(0);
+      expect(fs.existsSync(journal)).toBe(false);
+    } finally {
+      write.mockRestore(); append.mockRestore();
+      for (const controller of controllers) controller.closeFollowUpDrain();
+    }
+  });
+
+  it.each(["recover", "exhaust"] as const)("keeps an unreceived legacy chain member unknown through %s and replay", action => {
+    const journal = journalPath(); const first = fakePi(); const entries: unknown[] = [];
+    const context = busy(entries, true);
+    const main = new MainAgentController(first.pi, "session:root", true, "/tmp/project", "root");
+    const controllers = [main];
+    const send = (eventId: string) => ({ eventId, to: main.id, from: actor.id, mode: "followUp" as const });
+    fs.mkdirSync(path.dirname(journal), { recursive: true });
+    fs.writeFileSync(journal, JSON.stringify({ version: 1, items: [
+      { id: "legacy-A", deliveryId: "A", chain: "legacy-chain", generation: 0, from: actor, message: "unreceived A", sentAt: 1,
+        outcomeSend: send("A-own"), supersededSends: [send("A-replaced")] },
+      { id: "legacy-B", deliveryId: "B", chain: "legacy-chain", generation: 1, from: actor, message: "current B", sentAt: 2,
+        outcomeSend: send("B-own") },
+    ] }));
+    const originalAppend = deliveryOutcomes.appendDeliveryOutcome;
+    const append = vi.spyOn(deliveryOutcomes, "appendDeliveryOutcome").mockImplementation(() => { throw new Error("optional sink unavailable"); });
+    try {
+      main.attachFollowUpDrain(context, 0, journal);
+      expect(first.sent).toHaveLength(1);
+      expect(first.sent[0]!.message.details.id).toBe("legacy-B");
+      entries.push(persisted(first.sent[0]!));
+      main.confirmInbox();
+      const pending = JSON.parse(fs.readFileSync(journal, "utf8")).items;
+      expect(pending.find((item: { id: string }) => item.id === "legacy-A").outcomeNativeDelivered).toBeUndefined();
+      expect(pending.find((item: { id: string }) => item.id === "legacy-B").outcomeNativeDelivered).toBe(true);
+      main.closeFollowUpDrain();
+      if (action === "recover") append.mockImplementation(originalAppend);
+      const second = fakePi();
+      const restarted = new MainAgentController(second.pi, "session:root", true, "/tmp/project", "root");
+      controllers.push(restarted);
+      restarted.attachFollowUpDrain(context, 0, journal);
+      for (let attempt = 0; attempt < MAIN_DELIVERY_OUTCOME_RETRY_LIMIT + 2; attempt++) restarted.confirmInbox();
+      expect(second.sent).toHaveLength(0);
+      expect(append.mock.calls.filter(call => call[1].eventId === "A-own")).toEqual([]);
+      if (action === "recover") {
+        expect(outcomes(journal).map(row => [row.eventId, row.outcome])).toEqual([["A-replaced", "superseded"], ["B-own", "delivered"]]);
+        expect(deadLetters(journal)).toHaveLength(0);
+      } else {
+        const letters = deadLetters(journal).map(letter => letter.value);
+        expect(letters).toHaveLength(2);
+        const a = letters.find(letter => letter.carrier.id === "legacy-A");
+        expect(a).toMatchObject({ native: "unknown", attempts: MAIN_DELIVERY_OUTCOME_RETRY_LIMIT, sends: [send("A-own"), send("A-replaced")] });
+        expect(a.reason).toBe("native carrier receipt unknown; delivery outcome bookkeeping unknown; retry budget of 8 exhausted");
+        expect(a.reason).not.toContain("native carrier delivered");
+        expect(letters.find(letter => letter.carrier.id === "legacy-B")).toMatchObject({ native: "delivered", attempts: MAIN_DELIVERY_OUTCOME_RETRY_LIMIT });
+        append.mockImplementation(originalAppend);
+        restarted.confirmInbox();
+        expect(outcomes(journal)).toEqual([]);
+      }
+      expect(fs.existsSync(journal)).toBe(false);
+    } finally {
+      append.mockRestore();
+      for (const controller of controllers) controller.closeFollowUpDrain();
+    }
+  });
+
+  it("does not invent native delivery for an outcome-only legacy journal without receipt metadata", () => {
+    const journal = journalPath(); const h = fakePi();
+    const main = new MainAgentController(h.pi, "session:root", true, "/tmp/project", "root");
+    const send = { eventId: "legacy-unknown", to: main.id, from: actor.id, mode: "steer" as const };
+    fs.mkdirSync(path.dirname(journal), { recursive: true });
+    fs.writeFileSync(journal, JSON.stringify({ version: 1, items: [{ id: "legacy-pending", from: actor, message: "unknown",
+      sentAt: 1, outcomePending: true, outcomeSend: send, supersededSends: [send] }] }));
+    const append = vi.spyOn(deliveryOutcomes, "appendDeliveryOutcome").mockImplementation(() => { throw new Error("sink unavailable"); });
+    try {
+      main.attachFollowUpDrain(busy([], true), 0, journal);
+      for (let attempt = 0; attempt < MAIN_DELIVERY_OUTCOME_RETRY_LIMIT; attempt++) main.confirmInbox();
+      expect(h.sent).toHaveLength(0);
+      expect(append.mock.calls.every(call => call[2] === "superseded")).toBe(true);
+      expect(deadLetters(journal)[0]!.value.native).toBe("unknown");
+    } finally { append.mockRestore(); main.closeFollowUpDrain(); }
+  });
+
   it("exhausts bounded outcome retries into a private truthful dead-letter without appending again", () => {
     const journal = journalPath(); const h = fakePi(); const entries: unknown[] = []; const context = busy(entries, true);
     const main = new MainAgentController(h.pi, "session:root", true, "/tmp/project", "root");
@@ -209,9 +345,9 @@ describe("Main delivery outcome evidence", () => {
     try {
       main.deliverAgent({ from: actor, message: "private payload", delivery: "steer", deliveryId: "legacy/\u0000/arbitrary", outcomeSend: send });
       entries.push(persisted(h.sent[0]!));
-      main.confirmInbox(); // initial append is not part of the retry budget
-      for (let attempt = 0; attempt < MAIN_DELIVERY_OUTCOME_RETRY_LIMIT; attempt++) main.confirmInbox();
-      expect(append).toHaveBeenCalledTimes(1 + MAIN_DELIVERY_OUTCOME_RETRY_LIMIT);
+      main.confirmInbox(); // the first append consumes the first durable reservation
+      for (let attempt = 1; attempt < MAIN_DELIVERY_OUTCOME_RETRY_LIMIT; attempt++) main.confirmInbox();
+      expect(append).toHaveBeenCalledTimes(MAIN_DELIVERY_OUTCOME_RETRY_LIMIT);
       const letters = deadLetters(journal);
       expect(letters).toHaveLength(1);
       expect(letters[0]!.value).toMatchObject({
@@ -224,7 +360,7 @@ describe("Main delivery outcome evidence", () => {
       expect(fs.statSync(letters[0]!.path).mode & 0o777).toBe(0o600);
       expect(fs.existsSync(journal)).toBe(false);
       main.confirmInbox();
-      expect(append).toHaveBeenCalledTimes(1 + MAIN_DELIVERY_OUTCOME_RETRY_LIMIT);
+      expect(append).toHaveBeenCalledTimes(MAIN_DELIVERY_OUTCOME_RETRY_LIMIT);
     } finally { append.mockRestore(); main.closeFollowUpDrain(); }
   });
 
@@ -264,13 +400,13 @@ describe("Main delivery outcome evidence", () => {
       main.confirmInbox();
       main.confirmInbox();
       main.confirmInbox();
-      expect(JSON.parse(fs.readFileSync(journal, "utf8")).items[0].outcomeRetryAttempts).toBe(2);
+      expect(JSON.parse(fs.readFileSync(journal, "utf8")).items[0].outcomeRetryAttempts).toBe(3);
       main.closeFollowUpDrain();
       const second = fakePi();
       const restarted = new MainAgentController(second.pi, "session:root", true, "/tmp/project", "root");
       restarted.attachFollowUpDrain(busy(entries, true), 0, journal);
       expect(second.sent).toHaveLength(0);
-      expect(JSON.parse(fs.readFileSync(journal, "utf8")).items[0].outcomeRetryAttempts).toBe(3);
+      expect(JSON.parse(fs.readFileSync(journal, "utf8")).items[0].outcomeRetryAttempts).toBe(4);
     } finally { append.mockRestore(); main.closeFollowUpDrain(); }
   });
 
@@ -306,6 +442,7 @@ describe("Main delivery outcome evidence", () => {
       fixture.items[0].outcomeRetryAttempts = MAIN_DELIVERY_OUTCOME_RETRY_LIMIT;
       fixture.items[1].outcomeRetryAttempts = 0;
       fs.writeFileSync(journal, JSON.stringify(fixture));
+      reservationSnapshot = undefined; // capture B's replay reservation, not its initial attempt
       append.mockClear();
       const second = fakePi();
       const resumed = new MainAgentController(second.pi, "session:root", true, "/tmp/project", "root");
@@ -359,12 +496,12 @@ describe("Main delivery outcome evidence", () => {
       } });
       entries.push(persisted(h.sent[0]!));
       main.confirmInbox();
-      for (let attempt = 0; attempt < MAIN_DELIVERY_OUTCOME_RETRY_LIMIT; attempt++) main.confirmInbox();
-      expect(append).toHaveBeenCalledTimes(1 + MAIN_DELIVERY_OUTCOME_RETRY_LIMIT);
+      for (let attempt = 1; attempt < MAIN_DELIVERY_OUTCOME_RETRY_LIMIT; attempt++) main.confirmInbox();
+      expect(append).toHaveBeenCalledTimes(MAIN_DELIVERY_OUTCOME_RETRY_LIMIT);
       expect(fs.readFileSync(journal, "utf8")).toContain('"outcomeRetryAttempts":8');
       expect(deadLetters(journal)).toHaveLength(0);
       main.confirmInbox();
-      expect(append).toHaveBeenCalledTimes(1 + MAIN_DELIVERY_OUTCOME_RETRY_LIMIT);
+      expect(append).toHaveBeenCalledTimes(MAIN_DELIVERY_OUTCOME_RETRY_LIMIT);
       expect(deadLetters(journal)).toHaveLength(1);
       expect(fs.existsSync(journal)).toBe(false);
     } finally { write.mockRestore(); append.mockRestore(); main.closeFollowUpDrain(); }

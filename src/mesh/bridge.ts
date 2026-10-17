@@ -65,7 +65,7 @@ const UNICAST_REPLY_TO = /^(?:session|factory-host):[A-Za-z0-9._-]{1,128}$/;
 const RELAYED_ACK_FIELDS = new Set(["version", "commandId", "targetId", "ownerIncarnation", "accepted", "messageId", "error", "errorCode", "notRun"]);
 /** A bridge call the remote has not answered by then closes the transport. */
 export const DEFAULT_CALL_TIMEOUT_MS = 30_000;
-/** stop() waits at most this long for the loop and for each remote step of the withdrawal. */
+/** stop() waits at most this long for the loop and in-flight directions before closing transport. */
 const DEFAULT_STOP_MS = 5_000;
 const LOCK_RETRY_MIN_MS = 100;
 const LOCK_RETRY_MAX_MS = 2_000;
@@ -230,8 +230,7 @@ type BridgeMirrorPresence = Pick<BridgePresence, "hosts" | "participants" | "dro
 
 const validDroppedCount = (value: unknown): number =>
   typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : 0;
-const relevantDroppedCount = (value: unknown): number => Array.isArray(value)
-  ? value.filter(item => !isObject(item) || item.protected !== false).length : 0;
+const relevantDroppedCount = (value: unknown): number => Array.isArray(value) ? value.length : 0;
 const presenceDroppedCount = (presence: BridgeMirrorPresence): number => {
   const raw: unknown = presence;
   if (!isObject(raw)) return 0;
@@ -310,7 +309,9 @@ export interface BridgeSide {
   close?(error?: Error): void;
   /** The peer's records this side holds now (the hub side only): the link's current authority. */
   owned?(): Promise<Pick<BridgePresence, "hosts" | "participants">>;
-  /** Fence every mirror write, wait for one in flight, then delete this link's mirrors. */
+  /** Fence future mirror writes without changing persisted mirrors; stop uses this before leaving. */
+  fence?(): Promise<void>;
+  /** Explicitly fence writes and delete this link's mirrors for operator/decommission use. */
   withdraw?(): Promise<void>;
 }
 
@@ -360,7 +361,7 @@ const droppedPresenceOf = (type: BridgeDroppedPresence["type"], value: unknown, 
     : isObject(value.identity) && typeof value.identity.id === "string" ? value.identity.id : undefined;
   const dropped: BridgeDroppedPresence = {
     type,
-    ...(protect && value.protected !== false ? {} : { protected: false }),
+    ...(protect ? {} : { protected: false }),
     ...(typeof value.id === "string" ? { id: value.id } : {}),
     ...(typeof value.rootId === "string" ? { rootId: value.rootId } : {}),
     ...(identityId !== undefined ? { identityId } : {}),
@@ -370,11 +371,11 @@ const droppedPresenceOf = (type: BridgeDroppedPresence["type"], value: unknown, 
   return Object.keys(dropped).length > 1 ? dropped : undefined;
 };
 
-const uniqueDroppedPresence = (values: readonly unknown[]): BridgeDroppedPresence[] => {
+const uniqueDroppedPresence = (values: readonly unknown[], preserveLocalProtection = false): BridgeDroppedPresence[] => {
   const unique = new Map<string, BridgeDroppedPresence>();
   for (const value of values) {
     if (!isObject(value) || (value.type !== "host" && value.type !== "participant")) continue;
-    const dropped = droppedPresenceOf(value.type, value);
+    const dropped = droppedPresenceOf(value.type, value, !(preserveLocalProtection && value.protected === false));
     if (dropped) unique.set(JSON.stringify(dropped), dropped);
   }
   return [...unique.values()];
@@ -1204,6 +1205,7 @@ export class StoreBridgeSide implements BridgeSide {
   #fenced = false;
   #staleAdmission: BridgeStaleIncarnationError | undefined;
   #inflight: Promise<void> = Promise.resolve();
+  #hasCommittedPass = false;
 
   /**
    * Mirror the peer's presence. Calls run one at a time; after withdraw() no call writes again,
@@ -1227,9 +1229,13 @@ export class StoreBridgeSide implements BridgeSide {
     return run;
   }
 
-  async withdraw(): Promise<void> {
+  async fence(): Promise<void> {
     this.#fenced = true;
     await this.#inflight;
+  }
+
+  async withdraw(): Promise<void> {
+    await this.fence();
     if (this.#staleAdmission) return;
     await this.#mirror({ hosts: [], participants: [] }, true);
   }
@@ -1612,8 +1618,10 @@ export class StoreBridgeSide implements BridgeSide {
       // feed proves no host, participant or handoff row changed since and the participant directory stamp is
       // unchanged, so it still decides on the snapshot it commits on (security review rounds 2/3, F1/F2).
       // A stale plan rolls back and plans again; the last attempt, a backend without a revision view, and
-      // a recovery pass (whose replay must run on the transaction's snapshot) plan inside, as before.
-      const early = this.#recovered && attempt < MIRROR_PLAN_ATTEMPTS - 1 ? this.store.stateView() : undefined;
+      // the first complete pass while recovery is pending (whose replay must run on the transaction's
+      // snapshot) plan inside, as before. A repeated partial pass may use an early plan without replay.
+      const early = (this.#recovered || (partial && this.#hasCommittedPass)) &&
+        attempt < MIRROR_PLAN_ATTEMPTS - 1 ? this.store.stateView() : undefined;
       // Handoffs consult all leases when deciding whether a native identity has reappeared.
       const judgesLeaseLiveness = early !== undefined && early.view.listAll(BRIDGE_HANDOFF_PREFIX).length > 0;
       const planned = early && !halted() ? compute(early.view, files) : undefined;
@@ -1714,8 +1722,11 @@ export class StoreBridgeSide implements BridgeSide {
       }
       break;
     }
-    // Only a committed pass ends recovery; a failed one leaves the rows for the next pass.
-    if (!final) this.#recovered = true;
+    if (!final) {
+      this.#hasCommittedPass = true;
+      // A complete committed pass ends recovery; partial passes cannot certify pending omissions.
+      if (!partial) this.#recovered = true;
+    }
   }
 
   #applyLease(lease: BridgeLease, view: MeshBatchView, replay: boolean): void {
@@ -2455,7 +2466,7 @@ export const admitPresence = (
       }
     } else participants.push(participant);
   }
-  const unique = uniqueDroppedPresence(dropped);
+  const unique = uniqueDroppedPresence(dropped, true);
   const partial = !isObject(rawValue) || raw.partial === true || droppedCount > 0;
   return { hosts, participants, ...(unique.length > 0 ? { dropped: unique } : {}),
     ...(partial ? { partial: true } : {}), ...(droppedCount > 0 ? { droppedCount } : {}) };
@@ -2470,15 +2481,25 @@ export const boundPresence = (
   presence: BridgeMirrorPresence,
   budget = BRIDGE_PAGE_BYTES,
 ): { presence: BridgeMirrorPresence; dropped: number } => {
+  const rawValue: unknown = presence;
+  const raw = isObject(rawValue) ? rawValue : {};
+  const rawHosts = Array.isArray(raw.hosts) ? raw.hosts : [];
+  const rawParticipants = Array.isArray(raw.participants) ? raw.participants : [];
+  const rawDropped = Array.isArray(raw.dropped) ? raw.dropped : [];
   const roots = new Map<string, FabricParticipantRecord[]>();
-  for (const participant of presence.participants) {
-    roots.set(participant.ownerHostId, [...(roots.get(participant.ownerHostId) ?? []), participant]);
+  let malformed = (Array.isArray(raw.hosts) ? 0 : 1) + (Array.isArray(raw.participants) ? 0 : 1);
+  for (const value of rawParticipants) {
+    if (!isObject(value) || typeof value.ownerHostId !== "string") { malformed += 1; continue; }
+    roots.set(value.ownerHostId, [...(roots.get(value.ownerHostId) ?? []), value as unknown as FabricParticipantRecord]);
   }
   const hosts: BridgeHost[] = [];
   const participants: FabricParticipantRecord[] = [];
   let bytes = 0;
   let dropped = 0;
-  for (const host of presence.hosts) {
+  for (const value of rawHosts) {
+    if (!isObject(value) || !isObject(value.record) || typeof value.record.id !== "string" ||
+      typeof value.expiresAt !== "number") { malformed += 1; continue; }
+    const host = value as unknown as BridgeHost;
     const own = roots.get(host.record.id) ?? [];
     const size = Buffer.byteLength(JSON.stringify([host, own]), "utf8");
     if (bytes + size > budget) {
@@ -2489,9 +2510,10 @@ export const boundPresence = (
     hosts.push(host);
     participants.push(...own);
   }
-  const droppedCount = Math.max(validDroppedCount(presence.droppedCount), relevantDroppedCount(presence.dropped)) + dropped;
-  return { presence: { hosts, participants, ...(presence.dropped?.length ? { dropped: presence.dropped } : {}),
-    ...(presence.partial || droppedCount > 0 ? { partial: true } : {}), ...(droppedCount > 0 ? { droppedCount } : {}) }, dropped };
+  const droppedCount = Math.max(validDroppedCount(raw.droppedCount), relevantDroppedCount(rawDropped)) + malformed + dropped;
+  const droppedPresence = uniqueDroppedPresence(rawDropped, true);
+  return { presence: { hosts, participants, ...(droppedPresence.length > 0 ? { dropped: droppedPresence } : {}),
+    ...(raw.partial === true || droppedCount > 0 ? { partial: true } : {}), ...(droppedCount > 0 ? { droppedCount } : {}) }, dropped };
 };
 
 /**
@@ -2883,7 +2905,7 @@ export class MeshBridge {
     const [local, claimed] = await Promise.all([this.options.local.presence(), this.options.remote.presence()]);
     const claimedValue: unknown = claimed;
     const claimedHosts = isObject(claimedValue) && Array.isArray(claimedValue.hosts)
-      ? claimedValue.hosts as BridgePresence["hosts"] : [];
+      ? claimedValue.hosts.filter((host): host is BridgeHost => isObject(host)) : [];
     const remote = admitPresence(claimed, new Set(local.reserved));
     if (this.#stopped) return;
     const relays = await this.options.local.relayPresence?.() ?? { hosts: [], participants: [] };
@@ -3785,10 +3807,9 @@ export class MeshBridge {
   }
 
   /**
-   * Stop the loop and withdraw both mirrors, so peers see the lapse at once. Each wait on the
-   * remote is bounded, and the local withdrawal never depends on it (security review F3): the
-   * loop is fenced first (a silent remote's transport is closed, which fails its pending calls),
-   * so no pass in flight can write a mirror after the withdrawal.
+   * Stop the loop without withdrawing either mirror: authority expires by its lease TTL, so an
+   * error or process teardown cannot turn incomplete presence into withdrawal evidence. Every
+   * wait is bounded; fence the loop before closing the remote transport so no pass can write later.
    */
   async stop(): Promise<void> {
     const bound = this.options.stopMs ?? DEFAULT_STOP_MS;
@@ -3808,17 +3829,10 @@ export class MeshBridge {
     await within(this.#running);
     await within(this.#directions);
     await within(Promise.allSettled([...this.#relayDeliveries]));
-    // A refused reconnect acquired no right to withdraw the predecessor's projection on
-    // either side. Ordinary explicit stop still empties both mirrors exactly as before.
-    if (!this.#staleAdmission) await within(this.options.remote.mirror({ hosts: [], participants: [] }));
     this.options.remote.close?.(new Error("Bridge stopped"));
     await within(this.#running);
     await within(this.#directions);
-    const { local } = this.options;
-    if (this.#staleAdmission) return;
-    await (local.withdraw ? local.withdraw() : local.mirror({ hosts: [], participants: [] })).catch((error: unknown) => {
-      this.#log(`local withdrawal failed: ${error instanceof Error ? error.message : String(error)}`);
-    });
+    await within(this.options.local.fence?.() ?? Promise.resolve());
   }
 }
 

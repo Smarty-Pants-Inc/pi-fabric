@@ -4,7 +4,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { BRIDGE_LEASE_MS, BRIDGE_PROTOCOL_VERSION, BridgeStaleIncarnationError, MeshBridge, RemoteBridgeSide, serveBridgeAgent, StoreBridgeSide } from "../src/mesh/bridge.js";
+import { BRIDGE_LEASE_MS, BRIDGE_PROTOCOL_VERSION, BridgeStaleIncarnationError, MeshBridge, RemoteBridgeSide, serveBridgeAgent, StoreBridgeSide, type BridgePresence } from "../src/mesh/bridge.js";
+import { runBridge } from "../src/mesh-bridge.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { CommitOutbox } from "../src/mesh/commit-outbox.js";
 import { hostLeasePath, readHostLease, writeHostLease } from "../src/topology/host-leases.js";
@@ -306,6 +307,201 @@ describe("direct tokenless presence through MeshBridge RPC", () => {
       .rejects.toThrow("does not support partial presence snapshots");
     expect(mirrors).toBe(1);
     remote.close();
+  });
+
+  it.each(["file", "sqlite"] as const)("does not trust peer protected:false metadata across real presence RPC (%s)", async backend => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(NOW);
+    const f = ownRootLink(false, backend);
+    const victim = fixture("peer-false-protected-victim", "B", NOW - 1_000, NOW + 120_000);
+    const progress = fixture("peer-false-protected-progress", "U", NOW, NOW + 120_000);
+    await installNative(f.work, victim);
+    await f.bridge.syncPresence();
+    const before = { host: f.hub.get(hostKey(victim.host.id), { fresh: true }),
+      participant: f.hub.get(participantKey(victim.participant.id), { fresh: true }),
+      lease: fs.readFileSync(hostLeasePath(f.hub.root, victim.host.id)) };
+    const hostile: BridgePresence = { hosts: progress.presence.hosts, participants: progress.presence.participants,
+      dropped: [{ type: "host", protected: false, id: victim.host.id, rootId: victim.host.rootId,
+        identityId: victim.identity.id }], partial: false, droppedCount: 0, reserved: [] };
+    const response = vi.spyOn(f.agent, "presence").mockResolvedValue(hostile);
+
+    await expect(f.bridge.syncPresence()).resolves.toBeUndefined();
+
+    expect(response).toHaveBeenCalledTimes(1);
+    expect(f.hub.get(hostKey(victim.host.id), { fresh: true })).toEqual(before.host);
+    expect(f.hub.get(participantKey(victim.participant.id), { fresh: true })).toEqual(before.participant);
+    expect(fs.readFileSync(hostLeasePath(f.hub.root, victim.host.id))).toEqual(before.lease);
+    expect(f.hub.get(hostKey(progress.host.id), { fresh: true })?.value).toMatchObject({ incarnationToken: "U" });
+
+    response.mockRestore();
+    await f.work.delete({ key: hostKey(victim.host.id) });
+    await f.work.delete({ key: participantKey(victim.participant.id) });
+    fs.rmSync(hostLeasePath(f.work.root, victim.host.id), { force: true });
+    await expect(f.bridge.syncPresence()).resolves.toBeUndefined();
+    expect(f.hub.get(hostKey(victim.host.id), { fresh: true })).toBeUndefined();
+    expect(f.hub.get(participantKey(victim.participant.id), { fresh: true })).toBeUndefined();
+    expect(readHostLease(f.hub.root, victim.host.id)).toBeUndefined();
+  });
+
+  it.each(["file", "sqlite"] as const)("treats every non-object remote record as a partial drop across RPC (%s)", async backend => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(NOW);
+    const f = ownRootLink(false, backend);
+    const victim = fixture("peer-nonobject-victim", "B", NOW - 1_000, NOW + 120_000);
+    await installNative(f.work, victim);
+    await f.bridge.syncPresence();
+    const before = { host: f.hub.get(hostKey(victim.host.id), { fresh: true }),
+      participant: f.hub.get(participantKey(victim.participant.id), { fresh: true }),
+      lease: fs.readFileSync(hostLeasePath(f.hub.root, victim.host.id)) };
+    const malformed = { hosts: [null, "not-a-host"], participants: [null], partial: false,
+      droppedCount: 0, reserved: [] } as unknown as BridgePresence;
+    const response = vi.spyOn(f.agent, "presence").mockResolvedValue(malformed);
+
+    await expect(f.remote.presence()).resolves.toMatchObject({ hosts: [], participants: [], partial: true, droppedCount: 3 });
+    await expect(f.bridge.syncPresence()).resolves.toBeUndefined();
+
+    expect(response).toHaveBeenCalledTimes(2);
+    expect(f.hub.get(hostKey(victim.host.id), { fresh: true })).toEqual(before.host);
+    expect(f.hub.get(participantKey(victim.participant.id), { fresh: true })).toEqual(before.participant);
+    expect(fs.readFileSync(hostLeasePath(f.hub.root, victim.host.id))).toEqual(before.lease);
+
+    response.mockRestore();
+    await f.work.delete({ key: hostKey(victim.host.id) });
+    await f.work.delete({ key: participantKey(victim.participant.id) });
+    fs.rmSync(hostLeasePath(f.work.root, victim.host.id), { force: true });
+    await expect(f.bridge.syncPresence()).resolves.toBeUndefined();
+    expect(f.hub.get(hostKey(victim.host.id), { fresh: true })).toBeUndefined();
+    expect(readHostLease(f.hub.root, victim.host.id)).toBeUndefined();
+  });
+
+  it.each(["file", "sqlite"] as const)("admits raw hosts:[null] RPC as partial without expiry dereference (%s)", async backend => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(NOW);
+    const hub = openStore(backend);
+    const local = new StoreBridgeSide(hub, "intel1", () => NOW);
+    const victim = fixture("raw-null-host-victim", "B", NOW - 1_000, NOW + 120_000);
+    await local.mirror(victim.presence, NOW);
+    const before = { host: hub.get(hostKey(victim.host.id), { fresh: true }),
+      participant: hub.get(participantKey(victim.participant.id), { fresh: true }),
+      lease: fs.readFileSync(hostLeasePath(hub.root, victim.host.id)) };
+    const fromPeer = new PassThrough();
+    const toPeer = new PassThrough();
+    const remote = new RemoteBridgeSide(fromPeer, toPeer);
+    let buffered = "";
+    toPeer.on("data", chunk => {
+      buffered += String(chunk);
+      for (;;) {
+        const newline = buffered.indexOf("\n");
+        if (newline < 0) break;
+        const request = JSON.parse(buffered.slice(0, newline)) as { id: number; op: string };
+        buffered = buffered.slice(newline + 1);
+        const result = request.op === "presence"
+          ? { hosts: [null], participants: [], partial: false, droppedCount: 0, reserved: [] }
+          : request.op === "hello"
+            ? { version: BRIDGE_PROTOCOL_VERSION, changes: true, partialPresence: true, independentRpc: true }
+            : {};
+        fromPeer.write(`${JSON.stringify({ id: request.id, ok: true, result })}\n`);
+      }
+    });
+    const bridge = new MeshBridge({ localName: "hub", remoteName: "intel1", local, remote,
+      cursorPath: path.join(hub.root, "cursor.json"), presenceMs: 0 });
+    closers.push(async () => { await bridge.stop(); remote.close(); fromPeer.end(); toPeer.end(); });
+
+    const result = await bridge.syncPresence().then(() => "ok", error => error);
+    if (result !== "ok") await bridge.stop(); // mirror the CLI's error teardown
+
+    expect(result).toBe("ok");
+    expect(hub.get(hostKey(victim.host.id), { fresh: true })).toEqual(before.host);
+    expect(hub.get(participantKey(victim.participant.id), { fresh: true })).toEqual(before.participant);
+    expect(fs.readFileSync(hostLeasePath(hub.root, victim.host.id))).toEqual(before.lease);
+  });
+
+  it.each(["file", "sqlite"] as const)("keeps pending unlease recovery pending across a partial pass (%s)", async backend => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(NOW);
+    const hub = openStore(backend);
+    const victim = fixture("partial-recovery-unlease", "B", NOW - 1_000, NOW + 120_000);
+    const lease = leaseFor(victim);
+    writeHostLease(hub.root, lease);
+    const identity: MeshIdentity = { id: "bridge:peer", name: "peer", kind: "main" };
+    const outbox = new CommitOutbox(hub, "bridge/peer", identity, {});
+    const gone = { key: hostKey(victim.host.id), id: victim.host.id, rootId: victim.host.rootId,
+      identityId: victim.identity.id, startedAt: victim.host.startedAt, incarnationToken: victim.host.incarnationToken };
+    const plan = outbox.plan();
+    await hub.writeBatch({ identity, ops: [], prepare: () => plan.stage([], [
+      { kind: "unlease", key: `lease:${victim.host.id}`, payload: gone },
+    ], { durable: true }) });
+    const rowKey = outbox.rowKey(`lease:${victim.host.id}`);
+    const pending = hub.get(rowKey, { fresh: true });
+    const side = new StoreBridgeSide(hub, "peer", () => NOW);
+
+    await side.mirror({ hosts: [], participants: [], partial: true, droppedCount: 1 }, NOW);
+    expect(hub.get(rowKey, { fresh: true })).toEqual(pending);
+    expect(readHostLease(hub.root, victim.host.id)).toEqual(lease);
+
+    await side.mirror({ hosts: [], participants: [] }, NOW);
+    expect(hub.get(rowKey, { fresh: true })).toBeUndefined();
+    expect(readHostLease(hub.root, victim.host.id)).toBeUndefined();
+  });
+
+  it.each(["file", "sqlite"] as const)("stop after legacy-peer refusal leaves both mirrors to expire by TTL (%s)", async backend => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(NOW);
+    const f = ownRootLink(false, backend);
+    const victim = fixture("legacy-peer-outbound", "B", NOW - 2_000, NOW + 120_000);
+    const peerRoot = fixture("legacy-peer-inbound", "P", NOW - 1_000, NOW + 120_000);
+    await installNative(f.hub, victim);
+    await installNative(f.work, peerRoot);
+    await expect(f.bridge.syncPresence()).resolves.toBeUndefined();
+    const partial = fixture("legacy-peer-malformed", undefined, NOW, NOW + 120_000);
+    await f.hub.put({ key: hostKey(victim.host.id), identity: victim.identity,
+      value: { ...victim.host, rootId: partial.host.rootId } });
+    await f.hub.put({ key: participantKey(victim.participant.id), identity: victim.identity,
+      value: { ...victim.participant, rootId: partial.host.rootId } });
+    await installNative(f.hub, fixture("legacy-peer-progress", "U", NOW, NOW + 120_000));
+    expect(await f.local.presence()).toMatchObject({ partial: true, droppedCount: expect.any(Number) });
+    const remoteMirror = vi.spyOn(f.remote, "mirror");
+    vi.spyOn(f.remote, "hello").mockResolvedValue(undefined);
+
+    await expect(f.bridge.syncPresence()).rejects.toThrow("does not support partial presence snapshots");
+    expect(remoteMirror).toHaveBeenCalledTimes(1);
+    const beforeStop = { hubHost: f.hub.get(hostKey(peerRoot.host.id), { fresh: true }),
+      hubParticipant: f.hub.get(participantKey(peerRoot.participant.id), { fresh: true }),
+      hubLease: fs.readFileSync(hostLeasePath(f.hub.root, peerRoot.host.id)),
+      workHost: f.work.get(hostKey(victim.host.id), { fresh: true }),
+      workParticipant: f.work.get(participantKey(victim.participant.id), { fresh: true }),
+      workLease: fs.readFileSync(hostLeasePath(f.work.root, victim.host.id)) };
+
+    await f.bridge.stop();
+
+    expect(remoteMirror).toHaveBeenCalledTimes(1);
+    expect(f.hub.get(hostKey(peerRoot.host.id), { fresh: true })).toEqual(beforeStop.hubHost);
+    expect(f.hub.get(participantKey(peerRoot.participant.id), { fresh: true })).toEqual(beforeStop.hubParticipant);
+    expect(fs.readFileSync(hostLeasePath(f.hub.root, peerRoot.host.id))).toEqual(beforeStop.hubLease);
+    expect(f.work.get(hostKey(victim.host.id), { fresh: true })).toEqual(beforeStop.workHost);
+    expect(f.work.get(participantKey(victim.participant.id), { fresh: true })).toEqual(beforeStop.workParticipant);
+    expect(fs.readFileSync(hostLeasePath(f.work.root, victim.host.id))).toEqual(beforeStop.workLease);
+  });
+
+  it("CLI error before bridge construction leaves an existing mirror for its lease TTL", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(NOW);
+    const store = openStore("file");
+    const side = new StoreBridgeSide(store, "intel1", () => NOW);
+    const peerRoot = fixture("cli-error-fallback", "P", NOW - 1_000, NOW + 120_000);
+    await side.mirror(peerRoot.presence, NOW);
+    const before = { host: store.get(hostKey(peerRoot.host.id), { fresh: true }),
+      participant: store.get(participantKey(peerRoot.participant.id), { fresh: true }),
+      lease: fs.readFileSync(hostLeasePath(store.root, peerRoot.host.id)) };
+    const flags = new Map([["mesh", store.root], ["name", "hub"], ["remote", "intel1"],
+      ["cursor", path.join(store.root, "cursor.json")]]);
+
+    await expect(runBridge(flags, [process.execPath, "-e", "setInterval(() => {}, 1e6)"], new AbortController().signal,
+      () => { throw new Error("injected failure before bridge construction"); })).resolves.toBe(1);
+
+    expect(store.get(hostKey(peerRoot.host.id), { fresh: true })).toEqual(before.host);
+    expect(store.get(participantKey(peerRoot.participant.id), { fresh: true })).toEqual(before.participant);
+    expect(fs.readFileSync(hostLeasePath(store.root, peerRoot.host.id))).toEqual(before.lease);
   });
 
   // CODE-F1's independent probe sequence, through JSON framing and presenceArg, not

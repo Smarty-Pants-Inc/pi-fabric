@@ -75,7 +75,9 @@ export const normalizeAgentRunRequest = (
   }
   const requires = normalizeAgentRequires(args.requires);
   const needs = normalizeAgentCapabilityTokens(args.needs);
-  const timeoutMs = typeof args.timeoutMs === "number" && Number.isFinite(args.timeoutMs) && args.timeoutMs > defaults.timeoutMs ? args.timeoutMs : undefined;
+  // Preserve explicit bounds, including ignored tiny values, for the manager's
+  // deadline policy and typed receipt. Unset still inherits its configured default.
+  const timeoutMs = typeof args.timeoutMs === "number" && Number.isFinite(args.timeoutMs) ? args.timeoutMs : undefined;
   const kernel = checkedKernel(args.kernel);
   const nice = parseAgentNice(args.nice);
   const bashIdleSeconds = args.bashIdleSeconds;

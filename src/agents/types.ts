@@ -200,7 +200,16 @@ export interface AgentCompactionStatus {
   error?: string;
 }
 
+export interface AgentTimeoutIgnoredNote {
+  code: "AGENT_TIMEOUT_BELOW_SHORTENING_FLOOR";
+  requestedTimeoutMs: number;
+  effectiveTimeoutMs: number;
+  minimumTimeoutMs: number;
+}
+
 export interface AgentRunRecord {
+  /** A tiny explicit shortening was ignored to protect real work. */
+  timeoutNote?: AgentTimeoutIgnoredNote;
   /** Manager-owned durable intent distinguishing operator/deadline stops from worker checkpoints. */
   stopIntent?: { reason: "explicit" | "deadline"; requestedAt: number };
   /** Canonical Fabric package root selected for the process worker at spawn time. */
@@ -343,6 +352,8 @@ export interface AgentRunResult extends AgentRunRecord {
 }
 
 export interface AgentHandleInfo {
+  /** A tiny explicit shortening was ignored to protect real work. */
+  timeoutNote?: AgentTimeoutIgnoredNote;
   /** Spawn admission: unavailable discovery never blocks launch, but is explicit in the receipt. */
   modelVerification?: "verified" | "unverified";
   finalAnswerReceipt?: { id: string; recordedAt: number };

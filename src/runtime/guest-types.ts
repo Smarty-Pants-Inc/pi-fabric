@@ -317,6 +317,8 @@ interface FabricTargetTerminalNotice {
   sender?: { id: string; kind: "main" | "actor" | "agent" | "remote"; name?: string; verified: "mesh" | "bridge" };
 }
 interface FabricAgentHandle {
+  /** A model-chosen tiny shortening was ignored; use >=300000ms for lane/audit timeboxes. */
+  timeoutNote?: { code: "AGENT_TIMEOUT_BELOW_SHORTENING_FLOOR"; requestedTimeoutMs: number; effectiveTimeoutMs: number; minimumTimeoutMs: number };
   /** Spawn catalog discovery failed open when unverified. */
   modelVerification?: "verified" | "unverified";
   /** Durable answer boundary; does not confirm native worker/tree exit. */

@@ -28,17 +28,23 @@ const setup = () => {
 };
 
 describe("Astra F2 resident control lease fences", () => {
-  it.each(["shared", "local"] as const)("does not admit/deliver or commit a sequence after the %s claim lock wait loses its lease", async stage => {
+  it.each(["before", "after"] as const)("does not admit/deliver or commit a sequence when the lease lapses %s the sole claim commit", async stage => {
     const f = setup(); const entered = deferred(), release = deferred(); let gated = false;
-    const shouldGate = (store: MeshStore) => stage === "shared" ? store.root === f.mesh.root : store.root === f.seenRoot;
+    const hold = async <T,>(commit: () => Promise<T>): Promise<T> => {
+      gated = true;
+      if (stage === "before") { entered.resolve(); await release.promise; }
+      const result = await commit();
+      if (stage === "after") { entered.resolve(); await release.promise; }
+      return result;
+    };
     const put = MeshStore.prototype.put;
-    vi.spyOn(MeshStore.prototype, "put").mockImplementation(async function (this: MeshStore, input) {
-      if (!gated && shouldGate(this) && input.key.startsWith("topology/control-seen/")) { gated = true; entered.resolve(); await release.promise; }
+    vi.spyOn(MeshStore.prototype, "put").mockImplementation(function (this: MeshStore, input) {
+      if (!gated && this.root === f.mesh.root && input.key.startsWith("topology/control-seen/")) return hold(() => put.call(this, input));
       return put.call(this, input);
     });
     const batch = MeshStore.prototype.writeBatch;
-    vi.spyOn(MeshStore.prototype, "writeBatch").mockImplementation(async function (this: MeshStore, input) {
-      if (!gated && shouldGate(this) && (input.ops.some(op => op.key.startsWith("topology/control-seen/")) || input.prepare)) { gated = true; entered.resolve(); await release.promise; }
+    vi.spyOn(MeshStore.prototype, "writeBatch").mockImplementation(function (this: MeshStore, input) {
+      if (!gated && this.root === f.mesh.root && input.ops.some(op => op.key.startsWith("topology/control-seen/"))) return hold(() => batch.call(this, input));
       return batch.call(this, input);
     });
     const handler = vi.fn(() => ({ accepted: true, messageId: "once" })); f.owner.start(handler);
@@ -47,16 +53,17 @@ describe("Astra F2 resident control lease fences", () => {
       await entered.promise; f.lease(false); release.resolve(); await pause(120);
       expect(handler).not.toHaveBeenCalled();
       expect(f.seen.listAll("topology/control-seen/").every(entry => !(entry.value as { sequence?: number }).sequence)).toBe(true);
-      if (stage === "shared") expect(f.mesh.listAll("topology/control-seen/")).toHaveLength(0);
+      expect(f.mesh.listAll("topology/control-seen/")).toHaveLength(stage === "before" ? 0 : 1);
       f.lease(true); expect(await result).toMatchObject({ acknowledged: true, messageId: "once" }); expect(handler).toHaveBeenCalledOnce();
     } finally { release.resolve(); f.lease(true); await result; await f.close(); }
   });
 
   it.each(["outcome", "ack"] as const)("fences the actual %s commit after its lock waiter loses the lease, retaining the completed handler", async stage => {
-    const f = setup(); const entered = deferred(), release = deferred(); let gated = false, localWrites = 0;
+    const f = setup(); const entered = deferred(), release = deferred(); let gated = false;
     const batch = MeshStore.prototype.writeBatch;
     vi.spyOn(MeshStore.prototype, "writeBatch").mockImplementation(async function (this: MeshStore, input) {
-      if (this.root === f.seenRoot && ++localWrites === 2 && stage === "outcome") { gated = true; entered.resolve(); await release.promise; }
+      if (!gated && this.root === f.seenRoot && stage === "outcome" && input.ops.some(op =>
+        op.kind === "put" && (op.value as { acceptance?: unknown }).acceptance)) { gated = true; entered.resolve(); await release.promise; }
       return batch.call(this, input);
     });
     const publish = MeshStore.prototype.publish;

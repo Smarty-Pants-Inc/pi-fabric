@@ -564,7 +564,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
   };
 
   const refreshProxyLedger = (context: ExtensionContext): void => {
-    proxyContract.restoreFromEntries(context.sessionManager?.getBranch?.() ?? []);
+    proxyContract.restoreFromSessionManager(context.sessionManager);
   };
 
   // alwaysRearm means always armed: every session opens with prewalk armed.

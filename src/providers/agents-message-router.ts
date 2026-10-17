@@ -1,4 +1,3 @@
-import { appendDeliveryOutcome } from "../mesh/delivery-outcomes.js";
 import { interruptErrorCode } from "../interrupt-authority.js";
 import { boundAgentSpawner } from "../agents/spawner.js";
 import { FabricTargetTerminalError, terminalRejectionFields } from "../agents/terminal-target.js";
@@ -107,18 +106,6 @@ export class FabricRouteAuthorityError extends Error {
     this.name = "FabricRouteAuthorityError";
   }
 }
-
-/** Known pre-publication routing refusals: nothing was published, so the attempt failed. */
-const PRE_PUBLICATION_REFUSALS = new Set([
-  "FABRIC_ROUTE_AUTHORITY_CHANGED", "FABRIC_CONTROL_INCARNATION_REQUIRED",
-  "FABRIC_PARTICIPANT_NOT_YET_MIRRORED", "FABRIC_PARTICIPANT_NON_INTERACTIVE",
-  "FABRIC_PEER_LEASE_STALE",
-]);
-const prePublicationRefusal = (error: unknown, reason: string): string | undefined => {
-  const code = error instanceof Error && "code" in error && typeof error.code === "string" ? error.code : undefined;
-  if (code !== undefined && PRE_PUBLICATION_REFUSALS.has(code)) return `${code}: ${reason}`;
-  return reason.includes("this attempt was not published") ? reason : undefined;
-};
 
 /** Distinguishes a pre-publication lease wait from an uncertain published ACK. */
 class LeaseResolutionStale extends FabricParticipantStaleError {}
@@ -606,14 +593,6 @@ export class AgentMessageRouter {
           this.#withDirectory((authority, budget) => this.#route(id, message, data, kind, context, options, false, !recovering, authority, budget), id, !recovering, context?.signal));
     } catch (error) {
       context?.signal?.throwIfAborted();
-      const reason = error instanceof Error ? error.message : String(error);
-      const root = this.actorManager.mesh?.root ?? this.residency?.options.config.meshRoot;
-      // Only pre-publication/local definite refusals. Remote ACK outcomes belong to control.
-      const refusal = prePublicationRefusal(error, reason) ??
-        (/^(Unknown |Main's followUp queue is full|Fabric actor queue limit reached|Fabric participant .* is non-interactive)/.test(reason) ? reason : undefined);
-      if (root && !(error instanceof Error && "rejection" in error && error.rejection === "FABRIC_CONTROL_REJECTED") && refusal !== undefined) {
-        appendDeliveryOutcome(root, { eventId: options.idempotencyKey!, to: id, from: (options.from ?? this.actorManager.identity).id, mode: kind }, "failed", refusal);
-      }
       if (error instanceof FabricParticipantStaleError && !error.idempotencyKey) {
         throw new FabricParticipantStaleError(error.targetId, error.lapsedMs, options.idempotencyKey);
       }

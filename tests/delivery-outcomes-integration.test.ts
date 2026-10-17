@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { afterEach, expect, it, vi } from "vitest";
-import { AgentMessageRouter, FabricParticipantNotYetMirroredError, FabricRouteAuthorityError } from "../src/providers/agents-message-router.js";
+import { AgentMessageRouter, FabricParticipantNonInteractiveError, FabricParticipantNotYetMirroredError, FabricRouteAuthorityError } from "../src/providers/agents-message-router.js";
 import { MainAgentController } from "../src/main-agent.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { FabricControlIncarnationRequiredError, FabricControlPlane } from "../src/topology/control-plane.js";
@@ -23,7 +23,8 @@ const outcomes = (root: string) => {
     fs.readFileSync(path.join(directory, file), "utf8").trim().split("\n").map(line => JSON.parse(line))) : [];
 };
 
-it.each(["Unknown Fabric participant: missing", "Main's followUp queue is full"])("the local sender records a definite refusal (%s)", async reason => {
+// Keep reason: refusal/error honesty and durable receiver admission are data-safety boundaries.
+it.each(["Unknown Fabric participant: missing", "Main's followUp queue is full"])("the local sender preserves a definite refusal without a sender log (%s)", async reason => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-local-refusal-")); roots.push(root);
   const from = identity("session:sender");
   const router = new AgentMessageRouter(
@@ -34,16 +35,22 @@ it.each(["Unknown Fabric participant: missing", "Main's followUp queue is full"]
   );
   const target = reason.startsWith("Unknown") ? "session:missing" : "main";
   await expect(router.routeMessage(target, "hello", undefined, "followUp", undefined, { idempotencyKey: "send" })).rejects.toThrow(reason.startsWith("Unknown") ? "Unknown Fabric participant" : reason);
-  expect(outcomes(root)).toEqual([{ eventId: "send", to: target, from: from.id, mode: "followUp", outcome: "failed", reason: expect.stringContaining(reason.startsWith("Unknown") ? "Unknown Fabric participant" : reason), at: expect.any(Number) }]);
+  expect(outcomes(root)).toEqual([]);
+  expect(fs.existsSync(path.join(root, "delivery-outcomes"))).toBe(false);
 });
 
-it.each([
+it.each(([
   ["FABRIC_ROUTE_AUTHORITY_CHANGED", () => new FabricRouteAuthorityError("main")],
   ["FABRIC_CONTROL_INCARNATION_REQUIRED", () => new FabricControlIncarnationRequiredError("main")],
   ["FABRIC_PARTICIPANT_NOT_YET_MIRRORED", () => new FabricParticipantNotYetMirroredError("main", "host:peer")],
+  ["FABRIC_PARTICIPANT_NON_INTERACTIVE", () => new FabricParticipantNonInteractiveError("main")],
   [undefined, () => new Error("Fabric mesh bridge routing to remote host peer is unavailable for main; the routed owner could not be revalidated; this attempt was not published.")],
-] as const)("the local sender records a known pre-publication routing refusal (%s) as failed with its code", async (code, refusal) => {
+] as const).flatMap(([code, refusal]) => [false, true].map(sinkUnavailable => ({ code, refusal, sinkUnavailable }))))(
+  "the local sender preserves routing refusal $code without a sender log (unavailable outcome sink=$sinkUnavailable)", async ({ code, refusal, sinkUnavailable }) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-prepublication-refusal-")); roots.push(root);
+  const sink = path.join(root, "delivery-outcomes");
+  // A real path collision makes mkdir/append fail; no logger mocks hide the failure mode.
+  if (sinkUnavailable) fs.writeFileSync(sink, "unavailable sink");
   const from = identity("session:sender");
   const error = refusal();
   const router = new AgentMessageRouter(
@@ -53,10 +60,15 @@ it.each([
     { get: () => undefined, lastKnown: () => undefined } as never, undefined, binding => binding,
   );
   await expect(router.routeMessage("main", "hello", undefined, "steer", undefined, { idempotencyKey: "refused" })).rejects.toBe(error);
-  expect(outcomes(root)).toEqual([{ eventId: "refused", to: "main", from: from.id, mode: "steer", outcome: "failed", reason: code ? `${code}: ${error.message}` : error.message, at: expect.any(Number) }]);
+  if (code) expect(error).toMatchObject({ code });
+  if (sinkUnavailable) expect(fs.readFileSync(sink, "utf8")).toBe("unavailable sink");
+  else {
+    expect(outcomes(root)).toEqual([]);
+    expect(fs.existsSync(sink)).toBe(false);
+  }
 });
 
-it("a sender timeout can be followed by receiver-delivered evidence for the same wire event", async () => {
+it.each([false, true])("a real routed Main payload is admitted once and retains receiver evidence (sender timeout=%s)", async timeout => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-late-delivery-")); roots.push(root);
   const entries: unknown[] = []; const sent: Array<{ details: unknown }> = [];
   const pi = { on: () => () => {}, sendMessage: (message: { details: unknown }) => sent.push(message) } as unknown as ExtensionAPI;
@@ -71,24 +83,45 @@ it("a sender timeout can be followed by receiver-delivered evidence for the same
     closers.push(() => value.close()); return value;
   };
   const sender = make("host:sender"), owner = make("host:owner");
+  const participant = { id: main.id, kind: "root", rootId: main.id, local: false,
+    ownerHostId: "host:owner", ownerIdentityId: "host:owner", ownerIncarnation: owner.incarnation,
+    controlProtocol: "v1", capabilities: ["steer"] };
+  const router = (from: MeshIdentity, target: ConstructorParameters<typeof AgentMessageRouter>[2], control?: FabricControlPlane) => new AgentMessageRouter(
+    { status: () => { throw new Error("Unknown Fabric agent"); } } as never,
+    { identity: from, mesh: { root } } as never, target,
+    { get: (id: string) => id === main.id ? participant : undefined, lastKnown: () => undefined } as never,
+    control, binding => binding,
+  );
+  const sending = router(identity("host:sender"), { id: "session:sender", local: true, matches: () => false } as never, sender);
+  const receiving = router(identity("host:owner"), main);
   let acknowledge!: () => void;
   const held = new Promise<void>(resolve => { acknowledge = resolve; });
-  owner.start(async (command, from) => {
-    const result = main.deliverAgent({ from, delivery: "steer", message: command.message!, deliveryId: command.commandId,
-      outcomeSend: { eventId: command.eventId!, to: main.id, from: from.id, mode: "steer" } });
-    await held;
-    return { accepted: true, messageId: result.messageId };
+  // Runtime bootstrap uses this same verified control -> router -> Main admission path.
+  owner.start(async (command, from, signal, verification) => {
+    const result = await receiving.acceptControl(command, from, signal, verification);
+    if (timeout) await held;
+    return result;
   });
   sender.start(() => ({ accepted: false }));
   try {
-    await expect(sender.request("host:owner", main.id, "steer", { message: "late receipt" })).rejects.toThrow("outcome is unknown");
+    const request = sending.routeMessage(main.id, "late receipt", { sender: "forged" }, "steer", undefined, { idempotencyKey: "one-payload" });
+    if (timeout) await expect(request).rejects.toThrow("outcome is unknown");
+    else await expect(request).resolves.toMatchObject({ queued: true, acknowledged: true });
     expect(sent).toHaveLength(1);
-    expect(outcomes(root).map(row => row.outcome)).toEqual(["unknown"]);
+    const journal = JSON.parse(fs.readFileSync(path.join(root, "main-followups", "receiver.json"), "utf8"));
+    expect(journal.items).toHaveLength(1);
+    const admitted = journal.items[0];
+    expect(admitted).toMatchObject({ message: "late receipt", data: { sender: "forged" }, from: { id: "host:sender" },
+      provenance: { sender: { id: "host:sender", verified: "mesh" } },
+      outcomeSend: { to: main.id, from: "host:sender", mode: "steer" } });
+    expect(outcomes(root).map(row => row.outcome)).toEqual(timeout ? ["unknown"] : []);
     entries.push({ type: "custom_message", customType: "pi-fabric-agent-message", details: sent[0]!.details });
     main.confirmInbox();
-    expect(outcomes(root).map(row => row.outcome)).toEqual(["unknown", "delivered"]);
-    expect(outcomes(root)[1].eventId).toBe(outcomes(root)[0].eventId);
-    expect(outcomes(root)[1]).toMatchObject({ to: main.id, from: "host:sender", mode: "steer" });
+    main.confirmInbox();
+    expect(sent).toHaveLength(1);
+    expect(outcomes(root).map(row => row.outcome)).toEqual(timeout ? ["unknown", "delivered"] : ["delivered"]);
+    expect(outcomes(root).every(row => row.eventId === admitted.outcomeSend.eventId)).toBe(true);
+    expect(outcomes(root).at(-1)).toMatchObject({ to: main.id, from: "host:sender", mode: "steer" });
   } finally { acknowledge(); }
 });
 

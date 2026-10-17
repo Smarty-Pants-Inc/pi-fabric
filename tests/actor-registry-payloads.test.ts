@@ -132,7 +132,7 @@ describe("compact actor registry payloads (#3752, #4383)", () => {
     expect(fs.readFileSync(file, "utf8")).toBe(stub);
   });
 
-  it("hydrates prior PR instruction sidecars back inline on the next save", async () => {
+  it("re-addresses a prior PR stub+sidecar row to a stub-free sidecar reference (smarty-dev#8525)", async () => {
     const { store, id, root } = setup();
     const text = "i".repeat(20_000);
     const { createHash } = await import("node:crypto");
@@ -141,8 +141,32 @@ describe("compact actor registry payloads (#3752, #4383)", () => {
     fs.mkdirSync(directory, { recursive: true });
     fs.writeFileSync(path.join(directory, `instructions-${digest}.txt`), text);
     await store.withLock(() => store.write([{ id, instructions: "old stub", instructionsFile: digest, messages: [] }]));
-    expect(store.records()[0]!.instructions).toBe(text);
-    expect(store.records()[0]!.instructionsFile).toBeUndefined();
+    expect(store.records()[0]!.instructions).toBeUndefined();
+    expect(store.records()[0]!.instructionsFile).toBe(digest);
+    expect(store.instructions(store.records()[0]!)).toBe(text);
+  });
+
+  it("counterexample: a live old release's owned save drops instructionsFile; the text survives both ways (smarty-dev#8525)", async () => {
+    const { store, file, id, root } = setup();
+    const text = "Review. ".repeat(2_500), foreign = { id: "b".repeat(32), instructions: "Other. ".repeat(500), messages: [] };
+    await store.update(() => ({ actors: [{ id, instructions: text, messages: [] }, foreign], value: true }));
+    const digest = store.records()[0]!.instructionsFile as string;
+    const sidecar = path.join(root, id, "registry", `instructions-${digest}.txt`), inode = fs.statSync(sidecar).ino;
+    expect("instructions" in store.records()[0]!).toBe(false);
+    // 41a73f85/6c58c333/f4bf329b: the manager reads through instructionsFile and re-inlines its
+    // owned row from known fields only; a foreign row passes through verbatim.
+    const [, foreignRow] = store.records();
+    fs.writeFileSync(file, JSON.stringify({ format: 1, actors: [{ id, instructions: text, messages: [], nice: 7 }, foreignRow] }));
+    const fresh = new ActorRegistryStore(root);
+    expect(fresh.records().map(row => fresh.instructions(row))).toEqual([text, foreign.instructions]);
+    // The new owner re-addresses its row to the same digest; a missing digest is never a deletion.
+    await fresh.update(current => ({ actors: [{ id, instructions: text, messages: [], nice: 8 }, current[1]!], value: true }));
+    const [ownedRow, kept] = fresh.records();
+    expect(ownedRow).toMatchObject({ instructionsFile: digest, nice: 8 });
+    expect("instructions" in ownedRow!).toBe(false);
+    expect(kept).toEqual(foreignRow);
+    expect(fs.statSync(sidecar).ino).toBe(inode);
+    expect(new ActorRegistryStore(root).records().map(row => fresh.instructions(row))).toEqual([text, foreign.instructions]);
   });
 
   it("migrates valid actors beside invalid legacy rows without a null-record regression", async () => {
@@ -153,16 +177,16 @@ describe("compact actor registry payloads (#3752, #4383)", () => {
     expect(store.messages(store.records().find(record => record.id === id)!)).toEqual(actor.messages);
   });
 
-  it("archives ALL embedded legacy messages while keeping long instructions inline", async () => {
+  it("archives ALL embedded legacy messages and moves long instructions to a sidecar", async () => {
     const { store, file, id, log } = setup();
     const legacy = { id, name: "actor", instructions: "i".repeat(20_000), messages: messages(150), extra: { future: true }, status: "idle" };
     fs.writeFileSync(file, JSON.stringify({ format: 1, actors: [legacy] }));
     await store.withLock(() => store.write([{ ...legacy, messages: legacy.messages.slice(-100), status: "running" }]));
     const record = store.records()[0]!;
-    expect(fs.statSync(file).size).toBeLessThan(21_000);
+    expect(fs.statSync(file).size).toBeLessThan(1_000);
     expect(record.messages).toEqual([]);
-    expect(record.instructions).toBe(legacy.instructions);
-    expect(record.instructionsFile).toBeUndefined();
+    expect(record.instructions).toBeUndefined();
+    expect(record.instructionsFile).toMatch(/^[a-f0-9]{64}$/);
     expect(record.extra).toEqual({ future: true });
     expect(store.instructions(record)).toBe(legacy.instructions);
     expect(store.messages(record)).toEqual(legacy.messages.slice(-100));
@@ -188,9 +212,9 @@ describe("compact actor registry payloads (#3752, #4383)", () => {
     await store.withLock(() => store.write([{ ...actor, messages: next, status: "waiting" }]));
     expect(fs.statSync(log).size - bytes).toBeLessThan(1_500);
     expect(fs.statSync(checkpoint).ino).not.toBe(inode);
-    expect(fs.readdirSync(path.dirname(log)).some(name => name.startsWith("instructions-"))).toBe(false);
+    expect(fs.readdirSync(path.dirname(log)).filter(name => name.startsWith("instructions-"))).toHaveLength(1);
     expect(new ActorRegistryStore(root).messages(store.records()[0]!)).toEqual(next);
-    expect(fs.statSync(file).size).toBeLessThan(21_000);
+    expect(fs.statSync(file).size).toBeLessThan(1_000);
   });
 
   it("archives an entire unsaved burst even when only the last 100 remain in memory", async () => {
@@ -297,13 +321,16 @@ describe("compact actor registry payloads (#3752, #4383)", () => {
     await store.withLock(() => store.write([actor]));
     const stub = JSON.parse(fs.readFileSync(file, "utf8"));
     expect(stub.format).toBe(1);
-    expect(stub.actors[0].instructions).toBe(actor.instructions);
-    expect(stub.actors[0].instructionsFile).toBeUndefined();
+    // smarty-dev#8525: no instructions stub; every live reader follows instructionsFile.
+    expect("instructions" in stub.actors[0]).toBe(false);
+    expect(stub.actors[0].instructionsFile).toMatch(/^[a-f0-9]{64}$/);
     expect(Array.isArray(stub.actors[0].messages)).toBe(true);
     expect(stub.actors[0].messages).toEqual([]);
     const archive = fs.readFileSync(log, "utf8");
-    // Simulate the actual old manager save, which drops both new selectors.
-    fs.writeFileSync(file, JSON.stringify({ format: 1, actors: [{ ...stub.actors[0], messageHistory: undefined, instructionsFile: undefined, messages: [] }] }));
+    // Simulate a live (8b22ce04+) manager's owned save: it drops both selectors and
+    // re-inlines the instructions it loaded through instructionsFile.
+    fs.writeFileSync(file, JSON.stringify({ format: 1, actors: [{ ...stub.actors[0], instructions: actor.instructions,
+      messageHistory: undefined, instructionsFile: undefined, messages: [] }] }));
     const oldOwnedReader = new ActorRegistryStore(path.dirname(file));
     expect(oldOwnedReader.messages(oldOwnedReader.records()[0]!)).toEqual(actor.messages.slice(-100));
     expect(await store.restoreInlineForDowngrade()).toBe(1);

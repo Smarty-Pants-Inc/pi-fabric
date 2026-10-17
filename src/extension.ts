@@ -1032,7 +1032,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
       if (residentProbe && (context.mode !== "rpc" || !process.env.PI_FABRIC_PARENT_RUN)) {
         throw new Error("resident startup probe requires a bound RPC worker");
       }
-      if (residentProbe || stoppedUndelivered || selfReloaded || state.shouldEagerlyActivate(context)) await state.ensure(context);
+      if (residentProbe || stoppedUndelivered || selfReloaded || await state.shouldEagerlyActivate(context)) await state.ensure(context);
       if (residentProbe) {
         // Positive native ACK is published only after this generation activated.
         writeSync(1, `${JSON.stringify({ type: "fabric_resident_extension_ready", protocol: 1,

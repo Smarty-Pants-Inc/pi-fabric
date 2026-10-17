@@ -1,8 +1,10 @@
 #!/usr/bin/env bun
-/** Offline mixed-release proof. Build the legacy release normally, then bundle an
- * entry exporting ActorRegistryStore, ActorManager, ActorMeshMonitor, AgentManager,
- * MeshStore and DEFAULT_FABRIC_CONFIG from that release. Pass the bundle's absolute
- * path here. Uses separate processes and private scratch roots; no fleet I/O. */
+/** Offline mixed-release proof for sidecar instructions (smarty-dev#8525).
+ * Pass the absolute path of a git worktree checked out at a live release SHA (with
+ * node_modules): its OWN src/actors/registry-store.ts and ActorManager run in a child.
+ * Proves, for that release: it READS new rows; its owned-row SAVE neither publishes a
+ * stub nor loses the text (and keeps a foreign new row verbatim); a row it rewrote reads
+ * and re-saves correctly in this checkout. Separate processes, private scratch roots. */
 import assert from "node:assert/strict";
 import childProcess from "node:child_process";
 import fs from "node:fs";
@@ -16,95 +18,97 @@ import { AgentManager } from "../src/agents/manager.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 
-const oldBundle = process.argv[2];
-if (!oldBundle || !path.isAbsolute(oldBundle)) throw new Error("Usage: bun scripts/probe-actor-registry-mixed-release.ts /absolute/legacy-bundle.mjs");
-const id = "a".repeat(32), instructions = "i".repeat(20_000);
+const release = process.argv[2];
+if (!release || !path.isAbsolute(release)) throw new Error("Usage: bun scripts/probe-actor-registry-mixed-release.ts /absolute/release-worktree");
+const owned = "a".repeat(32), foreign = "b".repeat(32);
+const instructions = "Review the fleet. ".repeat(1_250), foreignInstructions = "Foreign persona. ".repeat(1_300);
 const identity: MeshIdentity = { id: "session:mixed", name: "main", kind: "main", sessionId: "mixed" };
-const messages = Array.from({ length: 150 }, (_, i) => ({ id: `m-${i}`, source: "direct", direction: "in", createdAt: i, text: "x".repeat(1_100) }));
+const messages = Array.from({ length: 150 }, (_, i) => ({ id: `m-${i}`, source: "direct", direction: "in", createdAt: i, text: "x".repeat(200) }));
+const rows = (file: string) => (JSON.parse(fs.readFileSync(file, "utf8")) as { actors: Record<string, unknown>[] }).actors;
+const byId = (file: string, id: string) => rows(file).find(row => row.id === id)!;
 
-if (process.argv[4] === "--old-worker" || process.argv[4] === "--old-resume") {
-  const mode = process.argv[4]!;
-  const root = process.argv[3]!;
-  const old = await import(pathToFileURL(oldBundle).href);
-  const actorRoot = path.join(root, "actors"), store = new old.ActorRegistryStore(actorRoot);
-  const original = store.records()[0];
-  const expected = mode === "--old-resume" ? messages.slice(-100) : [];
-  assert.deepEqual(original.messages, expected);
-  assert.equal(original.instructions, instructions);
-  if (mode === "--old-worker") {
-    // The store passes unknown fields through without projecting them.
-    await store.withLock(() => store.write(store.records()));
-    assert.deepEqual(store.records()[0].messageHistory, original.messageHistory);
-  }
-  old.ActorMeshMonitor.prototype.start = () => {};
-  old.ActorMeshMonitor.prototype.schedule = () => {};
-  const mesh = new old.MeshStore(path.join(root, "old-mesh"), 256 * 1024, 100);
-  mesh.put = async () => ({ key: "presence", value: {}, version: 1, updatedAt: Date.now(), updatedBy: identity });
-  const agents = new old.AgentManager(process.cwd(), old.DEFAULT_FABRIC_CONFIG.agents, { runRoot: path.join(root, "old-runs") });
-  const manager = new old.ActorManager("mixed", identity, mesh, old.DEFAULT_FABRIC_CONFIG.mesh, agents, () => {}, {
-    actorRoot, persistent: true, rootId: identity.id, claimResidency: "session", reapDeadSessionPresence: false,
+const startManager = async (src: { ActorManager: typeof ActorManager; ActorMeshMonitor: typeof ActorMeshMonitor;
+  AgentManager: typeof AgentManager; MeshStore: typeof MeshStore; DEFAULT_FABRIC_CONFIG: typeof DEFAULT_FABRIC_CONFIG }, root: string, tag: string) => {
+  src.ActorMeshMonitor.prototype.start = () => {};
+  src.ActorMeshMonitor.prototype.schedule = () => {};
+  const mesh = new src.MeshStore(path.join(root, `${tag}-mesh`), 256 * 1024, 100);
+  mesh.put = (async () => ({ key: "presence", value: {}, version: 1, updatedAt: Date.now(), updatedBy: identity })) as typeof mesh.put;
+  const agents = new src.AgentManager(process.cwd(), src.DEFAULT_FABRIC_CONFIG.agents, { runRoot: path.join(root, `${tag}-runs`) });
+  const manager = new src.ActorManager("mixed", identity, mesh, src.DEFAULT_FABRIC_CONFIG.mesh, agents, () => {}, {
+    actorRoot: path.join(root, "actors"), persistent: true, rootId: identity.id, claimResidency: "session", reapDeadSessionPresence: false,
   });
-  try {
-    assert.equal(manager.instructions(id), instructions);
-    assert.deepEqual(manager.messages(id, 100), expected);
-    if (mode === "--old-worker") await manager.setNice(id, 7); // Old owned-row serializer drops unknown fields.
-  } finally { await manager.close(); await agents.close(); }
-  if (mode === "--old-worker") {
-    const rewritten = store.records()[0];
-    assert.equal(rewritten.messageHistory, undefined);
-    assert.equal(rewritten.instructionsFile, undefined);
-    assert.equal(rewritten.instructions, instructions);
-    assert.deepEqual(rewritten.messages, []);
-    console.log("PASS old compiled store preserved raw fields; old compiled manager/store then stripped reference fields and saved empty messages.");
-  } else {
-    console.log("PASS old compiled manager resumed after inline restore with the full active history.");
+  return { manager, close: async () => { await manager.close(); await agents.close(); } };
+};
+
+if (process.argv[4] === "--old") {
+  const root = process.argv[3]!;
+  const load = (file: string) => import(pathToFileURL(path.join(release, "src", file)).href);
+  const [{ ActorRegistryStore: OldStore }, oldManager, monitor, agentsModule, meshModule, config] = await Promise.all([
+    load("actors/registry-store.ts"), load("actors/manager.ts"), load("actors/mesh-monitor.ts"),
+    load("agents/manager.ts"), load("mesh/store.ts"), load("config.ts")]);
+  const file = path.join(root, "actors", "actors.json");
+  const store = new OldStore(path.join(root, "actors"));
+  const foreignBefore = JSON.stringify(byId(file, foreign));
+  // READ: the old store follows instructionsFile for both rows.
+  for (const [id, text] of [[owned, instructions], [foreign, foreignInstructions]] as const) {
+    const row = store.records().find((record: Record<string, unknown>) => record.id === id);
+    assert.equal(row.instructions, undefined);
+    assert.equal(store.instructions(row), text);
   }
+  const old = await startManager({ ActorManager: oldManager.ActorManager, ActorMeshMonitor: monitor.ActorMeshMonitor,
+    AgentManager: agentsModule.AgentManager, MeshStore: meshModule.MeshStore, DEFAULT_FABRIC_CONFIG: config.DEFAULT_FABRIC_CONFIG }, root, "old");
+  try {
+    assert.equal(old.manager.instructions(owned), instructions);
+    assert.deepEqual(old.manager.messages(owned, 100), messages.slice(-100));
+    // SAVE: the old manager's owned-row serializer (known fields only).
+    await old.manager.setNice(owned, 7);
+  } finally { await old.close(); }
+  const saved = byId(file, owned);
+  assert.equal(saved.nice, 7);
+  assert.equal(saved.instructions, instructions, "old owned save must carry the full text, not a stub");
+  assert.equal(saved.instructionsFile, undefined);
+  assert.equal(JSON.stringify(byId(file, foreign)), foreignBefore, "old save must keep a foreign new row verbatim");
+  assert.equal(store.instructions(byId(file, foreign)), foreignInstructions);
+  // The old store's raw write path hydrates every sidecar row inline: still no stub, no loss.
+  await store.withLock(() => store.write(store.records()));
+  assert.equal(byId(file, foreign).instructions, foreignInstructions);
+  assert.equal(byId(file, owned).instructions, instructions);
+  console.log(JSON.stringify({ read: true, ownedSaveFullText: true, foreignRowVerbatim: true, rawStoreWriteFullText: true }));
 } else {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "actor-mixed-release-"));
-  let manager: ActorManager | undefined, agents: AgentManager | undefined;
   try {
-    const actorRoot = path.join(root, "actors"), store = new ActorRegistryStore(actorRoot);
-    await store.withLock(() => store.write([{ id, name: "mixed", rootId: identity.id, instructions, messages, createdAt: 1, status: "idle" }]));
-    const log = path.join(actorRoot, id, "registry", "messages.jsonl"), archive = fs.readFileSync(log, "utf8");
-    assert.equal(JSON.parse(archive.trim()).messages.length, 150);
-    const oldOutput = childProcess.execFileSync("nice", ["-n", "19", process.execPath, import.meta.filename, oldBundle, root, "--old-worker"], {
-      encoding: "utf8", timeout: 60_000, env: process.env,
-    }).trim();
-    const fresh = new ActorRegistryStore(actorRoot), row = fresh.records()[0]!;
-    assert.equal(row.messageHistory, undefined);
-    assert.equal(fresh.instructions(row), instructions);
-    assert.deepEqual(fresh.messages(row), messages.slice(-100));
-    assert.equal(fs.readFileSync(log, "utf8"), archive);
-    // Roll back directly from the old-owned-save shape, then start the actual
-    // compiled 6b15d905 manager and verify that it sees the restored ring.
-    assert.equal(await fresh.restoreInlineForDowngrade(), 1);
-    const restored = fresh.records()[0]!;
-    assert.equal(restored.messageHistory, undefined);
-    assert.deepEqual(restored.messages, messages.slice(-100));
-    assert.equal(fs.readFileSync(log, "utf8"), archive);
-    const oldResumeOutput = childProcess.execFileSync("nice", ["-n", "19", process.execPath, import.meta.filename, oldBundle, root, "--old-resume"], {
-      encoding: "utf8", timeout: 60_000, env: process.env,
-    }).trim();
-    ActorMeshMonitor.prototype.start = () => {};
-    ActorMeshMonitor.prototype.schedule = () => {};
-    const mesh = new MeshStore(path.join(root, "new-mesh"), 256 * 1024, 100);
-    mesh.put = async () => ({ key: "presence", value: {}, version: 1, updatedAt: Date.now(), updatedBy: identity });
-    agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, { runRoot: path.join(root, "new-runs") });
-    manager = new ActorManager("mixed", identity, mesh, DEFAULT_FABRIC_CONFIG.mesh, agents, () => {}, {
-      actorRoot, persistent: true, rootId: identity.id, claimResidency: "session", reapDeadSessionPresence: false,
-    });
-    assert.equal(manager.status(id).messages, 100);
-    assert.equal(manager.instructions(id), instructions);
-    assert.deepEqual(manager.messages(id, 100), messages.slice(-100));
-    await manager.setNice(id, 8);
-    assert.equal(fs.readFileSync(log, "utf8"), archive);
-    await manager.close(); await agents.close();
-    console.log(JSON.stringify({ passed: true, oldBundle, oldOutput, oldResumeOutput, archivedMessagesPreserved: 150,
-      activeMessagesPreserved: 100, instructionsBytesPreserved: Buffer.byteLength(instructions),
-      oldOwnedSaveDroppedUnknownFields: true, downgradeRestoreVerified: true,
-      historyArchiveByteIdentical: true, newManagerReloadAndSave: true }, null, 2));
-  } finally {
-    await manager?.close(); await agents?.close();
-    fs.rmSync(root, { recursive: true, force: true });
-  }
+    const actorRoot = path.join(root, "actors"), file = path.join(actorRoot, "actors.json");
+    const store = new ActorRegistryStore(actorRoot);
+    await store.withLock(() => store.write([
+      { id: owned, name: "mixed", rootId: identity.id, residency: "session", instructions, messages, createdAt: 1, status: "idle" },
+      { id: foreign, name: "foreign", rootId: "session:other", residency: "session", instructions: foreignInstructions, messages: [], createdAt: 1, status: "idle" },
+    ]));
+    for (const id of [owned, foreign]) {
+      const row = byId(file, id);
+      assert.equal("instructions" in row, false);
+      assert.match(String(row.instructionsFile), /^[a-f0-9]{64}$/);
+    }
+    const newBytes = fs.statSync(file).size;
+    const sha = childProcess.execFileSync("git", ["-C", release, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+    const old = JSON.parse(childProcess.execFileSync("nice", ["-n", "19", process.execPath, import.meta.filename, release, root, "--old"], {
+      encoding: "utf8", timeout: 120_000, env: process.env, cwd: release,
+    }).trim().split("\n").at(-1)!);
+    // NEW reads the rows the old release rewrote, then re-addresses them on its own save.
+    const fresh = new ActorRegistryStore(actorRoot);
+    assert.equal(fresh.instructions(byId(file, owned)), instructions);
+    assert.equal(fresh.instructions(byId(file, foreign)), foreignInstructions);
+    assert.deepEqual(fresh.messages(byId(file, owned)), messages.slice(-100));
+    const next = await startManager({ ActorManager, ActorMeshMonitor, AgentManager, MeshStore, DEFAULT_FABRIC_CONFIG }, root, "new");
+    try {
+      assert.equal(next.manager.instructions(owned), instructions);
+      assert.deepEqual(next.manager.messages(owned, 100), messages.slice(-100));
+      await next.manager.setNice(owned, 8);
+    } finally { await next.close(); }
+    const resaved = byId(file, owned);
+    assert.equal("instructions" in resaved, false);
+    assert.equal(resaved.nice, 8);
+    assert.equal(new ActorRegistryStore(actorRoot).instructions(resaved), instructions);
+    console.log(JSON.stringify({ passed: true, release: sha, newRegistryBytes: newBytes, old,
+      newReadsOldRewrite: true, newResaveIsSidecar: true }));
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
 }

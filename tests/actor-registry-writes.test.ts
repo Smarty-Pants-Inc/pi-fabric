@@ -80,8 +80,9 @@ describe("actor registry lazy/status writes (#3752, #4383)", () => {
       await restarted.setNice(actor.id, 7);
       await restarted.close();
       const fresh = new ActorRegistryStore(f.actorRoot), saved = fresh.records()[0]!;
-      expect(saved.instructions).toBe(instructions);
-      expect(saved.instructionsFile).toBeUndefined();
+      expect(saved.instructions).toBeUndefined(); // smarty-dev#8525: a digest, never a stub.
+      expect(saved.instructionsFile).toBe(digest);
+      expect(fresh.instructions(saved)).toBe(instructions);
       expect(saved.nice).toBe(7);
       expect(fresh.messages(saved)).toEqual(messages);
       expect(fs.readFileSync(payload, "utf8")).toBe(instructions);

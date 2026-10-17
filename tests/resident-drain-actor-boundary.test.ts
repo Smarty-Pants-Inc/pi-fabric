@@ -1,5 +1,6 @@
 // Keep reason: data safety and the resident/actor trust boundary (#11962).
 // Real actor queues, registry, completion fences, mesh pages and native fixture workers.
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -94,16 +95,27 @@ describe("strict cooperative resident actor admission boundary", () => {
     });
   }, 25_000);
 
-  it.each(["project", "session"] as const)("checks disk queues/order/attempts, registry and completion obligations before both cursor receipts (default %s)", async defaultScope => {
+  it.each((["project", "session"] as const).flatMap(defaultScope => [
+    { defaultScope, persona: "sidecar", instructions: `Reply: ${"界".repeat(400)}` },
+    { defaultScope, persona: "inline", instructions: "Reply" },
+  ]))("checks $persona personas, disk queues/order/attempts, registry and completion obligations before both cursor receipts (default $defaultScope)", async ({ defaultScope, persona, instructions }) => {
+    // Decision C — keep reason: data safety at the resident/actor trust boundary (#872).
+    // E2E (real entry scenario): durable ActorDirectory create -> accepted tell FIFO ->
+    // pauseForRelease(strict) -> checkpointForRelease -> releaseCheckpointReceipt.
+    // Owner: fabric-store. Pass condition: sidecar/inline personas, accepted queue IDs,
+    // order/attempts, payload bytes/digests and both persisted cursors survive; tampering rejects.
+    if (persona === "sidecar") {
+      expect(instructions.length).toBeLessThan(1024);
+      expect(Buffer.byteLength(instructions, "utf8")).toBeGreaterThan(1024);
+    }
     const { dir, actors } = fixture(true, defaultScope);
-    const values = await Promise.all((["project", "session"] as const).map(scope => actors.create(spec(`queued-${scope}`, scope))));
+    const values = await Promise.all((["project", "session"] as const).map(scope => actors.create({ ...spec(`queued-${scope}`, scope), instructions })));
     const ids = values.map(value => [actors.tell(value.id, "first").messageId, actors.tell(value.id, "second").messageId]);
     const completion = path.join(dir, "project", values[0]!.id, "child-completions");
     fs.mkdirSync(completion, { recursive: true });
     const completionId = "c".repeat(32);
     fs.writeFileSync(path.join(completion, `${completionId}.consumed`), JSON.stringify({ id: completionId, consumedAt: 123 }));
     actors.pauseForRelease({ strict: true });
-    const cursor = vi.spyOn(ActorMeshMonitor.prototype, "checkpointForRelease");
     await actors.checkpointForRelease();
     const receipt = actors.releaseCheckpointReceipt() as any;
     values.forEach((value, index) => {
@@ -113,8 +125,30 @@ describe("strict cooperative resident actor admission boundary", () => {
       expect(queue.cleanHandover).toBe(true);
       expect(json(queue.file).items).toEqual(queue.items);
       expect(receipt[value.scope!].cursor.persisted).toBe(true);
+      const registry = new ActorRegistryStore(path.join(dir, value.scope!));
+      const row = registry.records().find(row => row.id === value.id)!;
+      expect(registry.instructions(row)).toBe(instructions);
+      expect(row.instructions).toBe(persona === "inline" ? instructions : undefined);
+      if (persona === "sidecar") expect(row.instructionsFile).toBeDefined();
+      else expect(row.instructionsFile).toBeUndefined();
+      const payloads = receipt[value.scope!].files.filter((entry: any) =>
+        path.dirname(entry.file) === path.join(dir, value.scope!, value.id, "registry"));
+      if (persona === "sidecar") expect(payloads.length).toBeGreaterThan(0);
+      payloads.forEach((entry: any) => {
+        const bytes = fs.readFileSync(entry.file);
+        expect(entry).toMatchObject({ present: true, bytes: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex") });
+      });
     });
-    expect(cursor).toHaveBeenCalledTimes(2);
+    if (persona === "sidecar") {
+      const payload = receipt.project.files.find((entry: any) =>
+        path.dirname(entry.file) === path.join(dir, "project", values[0]!.id, "registry"));
+      const original = fs.readFileSync(payload.file);
+      try {
+        fs.writeFileSync(payload.file, Buffer.concat([original, Buffer.from("\n")]));
+        expect(() => actors.releaseCheckpointReceipt()).toThrow(/disk readback differs/);
+      } finally { fs.writeFileSync(payload.file, original); }
+      expect(actors.releaseCheckpointReceipt()).toEqual(receipt);
+    }
     expect(receipt.project.files.some((file: any) => file.file.endsWith(`${completionId}.consumed`) && file.present)).toBe(true);
     const file = queueFile(dir, values[0]!.id);
     const original = fs.readFileSync(file, "utf8");

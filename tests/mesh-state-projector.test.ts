@@ -553,7 +553,7 @@ describe("state projector (sqlite, after cutover)", () => {
     const authority = await openStore(root, root);
     for (let step = 0; step < 20; step += 1) await authority.put({ key: `k/${step}`, value: step, identity });
     const before = authority.exportState();
-    const projector = await openProjector(root, { mode: "sqlite", checkpointMs: 10 });
+    const projector = await openProjector(root, { mode: "sqlite", checkpointMs: 10, checkpointMaxAgeMs: 0 });
     expect(await projector.tick()).toMatchObject({ role: "active", checkpoints: 1, fullResyncs: 0, appliedGenerations: 0 });
     await authority.put({ key: "k/after", value: 1, identity });
     await new Promise(resolve => setTimeout(resolve, 15));

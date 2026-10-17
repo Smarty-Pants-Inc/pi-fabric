@@ -181,6 +181,15 @@ export interface StateProjectorOptions {
   changesRetained?: number;
   /** Minimum spacing of WAL-change-driven checkpoints. Default 1 s. */
   checkpointMs?: number;
+  /**
+   * smarty-dev#6100 round 2: a dirty WAL is checkpointed once its first unsynced change is this old, or sooner when the
+   * WAL file grows past `checkpointWalBytes` (it is not restarting). Every complete checkpoint lets the next writer
+   * restart the WAL and fsync its header under the writer lock, so the routine checkpoint no longer runs every
+   * `checkpointMs`. Default 30 s; 0 restores the `checkpointMs` cadence.
+   */
+  checkpointMaxAgeMs?: number;
+  /** A WAL file above this size that grew since the last checkpoint is checkpointed at `checkpointMs`. Default 4 MiB. */
+  checkpointWalBytes?: number;
   /** WAL size above which a growing WAL is TRUNCATEd (R10). Default 64 MiB. */
   checkpointBytes?: number;
   /** WAL size alarm. Default 64 MiB. */
@@ -500,6 +509,8 @@ export class StateProjector {
   readonly #maxStateBytes: number;
   readonly #changesRetained: number;
   readonly #checkpointMs: number;
+  readonly #checkpointMaxAgeMs: number;
+  readonly #checkpointWalBytes: number;
   readonly #walAlarmBytes: number;
   readonly #statusMs: number;
   #role: StateProjectorRole = "starting";
@@ -515,6 +526,9 @@ export class StateProjector {
   #leaseDeadline = Number.POSITIVE_INFINITY;
   #retryAt = Number.POSITIVE_INFINITY;
   #walDirty = true;
+  // When the WAL became dirty (the oldest change the routine checkpoint has not synced). Open: due at once.
+  #dirtySince = Number.NEGATIVE_INFINITY;
+  #walBytesAtCheckpoint = 0;
   #verifyPending = false;
   #databaseVersion = -1;
   #lastVerifyAt = Date.now();
@@ -549,6 +563,8 @@ export class StateProjector {
     this.#maxStateBytes = Math.max(1, options.maxStateBytes ?? DEFAULT_MAX_STATE_BYTES);
     this.#changesRetained = Math.max(1, Math.floor(options.changesRetained ?? 4_096));
     this.#checkpointMs = Math.max(10, options.checkpointMs ?? 1_000);
+    this.#checkpointMaxAgeMs = Math.max(0, options.checkpointMaxAgeMs ?? 30_000);
+    this.#checkpointWalBytes = Math.max(0, options.checkpointWalBytes ?? 4 * 1024 * 1024);
     this.#walAlarmBytes = Math.max(0, options.walAlarmBytes ?? 64 * 1024 * 1024);
     this.#statusMs = Math.max(0, options.statusMs ?? 1_000);
   }
@@ -690,6 +706,7 @@ export class StateProjector {
     const version = Number(this.#db.prepare("PRAGMA data_version").get()?.data_version ?? 0);
     if (version === this.#databaseVersion) return false;
     this.#databaseVersion = version;
+    if (!this.#walDirty) this.#dirtySince = Date.now();
     this.#walDirty = true;
     if (this.#verifyMs > 0) this.#verifyPending = true;
     return true;
@@ -721,7 +738,7 @@ export class StateProjector {
     if (!this.#running || this.#role === "stopped") return;
     let at = Math.min(this.#leaseDeadline, this.#retryAt);
     if (this.#role === "active") {
-      if (this.#walDirty) at = Math.min(at, this.#lastCheckpointAt + this.#checkpointMs);
+      if (this.#walDirty) at = Math.min(at, Math.max(this.#lastCheckpointAt + this.#checkpointMs, this.#dirtySince + this.#checkpointMaxAgeMs));
       if (this.mode === "shadow" && this.#verifyPending) at = Math.min(at, this.#lastVerifyAt + this.#verifyMs);
     }
     if (!Number.isFinite(at)) return;
@@ -827,6 +844,7 @@ export class StateProjector {
         const result = body();
         this.#db.exec("COMMIT");
         committed = true;
+        if (!this.#walDirty) this.#dirtySince = Date.now();
         this.#walDirty = true;
         return result;
       } finally {
@@ -906,7 +924,7 @@ export class StateProjector {
 
   async #maintain(): Promise<void> {
     const now = Date.now();
-    if (this.#walDirty && now - this.#lastCheckpointAt >= this.#checkpointMs) {
+    if (this.#walDirty && now - this.#lastCheckpointAt >= this.#checkpointMs && this.#checkpointDue(now)) {
       // Re-checked here: election may have awaited, and a checkpoint of an exporting database is refused.
       this.#backendFence();
       this.#lastCheckpointAt = now;
@@ -916,6 +934,7 @@ export class StateProjector {
         // settled guarded attempts, so no TRUNCATE copies, syncs or waits under SQLite's writer lock.
         await this.#store.checkpointSettled();
         this.#stats.checkpoints += 1;
+        this.#walBytesAtCheckpoint = this.#store.walBytes();
       } catch (error) {
         this.#stats.errors += 1;
         this.#lastError = errorText(error);
@@ -929,6 +948,14 @@ export class StateProjector {
       this.#emit({ type: "alarm", at: now, alarm: "wal-size", detail: `WAL ${this.#stats.walBytes} bytes > ${this.#walAlarmBytes}` });
     }
     this.#walAlarm = alarm;
+  }
+
+  // smarty-dev#6100 round 2: the routine checkpoint is due by age (bounded sync cadence), or by a WAL file that grew past
+  // checkpointWalBytes since the last one (it is not restarting, so the reuse region is exhausted).
+  #checkpointDue(now: number): boolean {
+    if (now - this.#dirtySince >= this.#checkpointMaxAgeMs) return true;
+    const size = this.#store.walBytes();
+    return size > this.#checkpointWalBytes && size > this.#walBytesAtCheckpoint;
   }
 
   #writeStatus(force: boolean): void {

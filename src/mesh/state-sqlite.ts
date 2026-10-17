@@ -50,7 +50,7 @@
  * through that commit, or throws when it cannot within its budget.
  *
  * Checkpoints (smarty-dev#6477, replacing review-opus P2-1's `wal_autocheckpoint=0`): every connection
- * keeps SQLite's built-in autocheckpoint (`WAL_AUTOCHECKPOINT_PAGES`, ~4 MiB). It is PASSIVE and runs on
+ * keeps SQLite's built-in autocheckpoint (`walAutocheckpointPages`, 4,000 pages, ~16 MiB). It is PASSIVE and runs on
  * the committing connection right after its COMMIT, so it never blocks another writer; with it off and
  * no maintainer in production a hub's WAL reached 48 MB. A store opened with `checkpoint: "maintainer"` (the L3 projector, the
  * maintenance holder, tests) checkpoints on WAL/store notifications (coalesced by a one-shot deadline): PASSIVE first (copies and fsyncs
@@ -59,6 +59,20 @@
  * If no maintainer runs, any writer runs the same checkpoint after its COMMIT once the WAL passes
  * `emergencyCheckpointBytes`, so the WAL stays bounded regardless. `journal_size_limit` caps a reset WAL.
  * `stats()` exports the WAL size and checkpoint progress.
+ *
+ * WAL restarts (smarty-dev#6100 round 2). A checkpoint that backfills EVERY frame lets the NEXT writer restart the WAL
+ * from its start (SQLite's walRestartLog; a reader holding a WAL read mark defers it), and with synchronous=NORMAL that
+ * writer's first frame write fsyncs the WAL header (SQLite ticket ff5be73dee) while it holds the writer lock. So the
+ * restart rate is the rate of complete checkpoints. On a cut-over root no projector runs (residency/host.ts starts it
+ * in shadow mode only), so those are the clients' autocheckpoints: one per ~1,000 frames at the old default, every
+ * ~15 s on a hub writing ~70 frames/s. A checkpoint is also the only fsync of WAL frames under NORMAL, so the sync
+ * cadence and the restart cadence are one number, and it is set by volume AND age: the autocheckpoint at
+ * `walAutocheckpointPages`, plus, after a COMMIT, one PASSIVE when frames were written since the last backfill and that
+ * backfill is older than `walSyncMaxAgeMs` (30 s; by stat only: state.db's mtime is the last backfill, the WAL's the
+ * last frame; a due age sync that finds this store's writers waiting is deferred to the moment the queue drains or to
+ * the commit after three deferrals, never dropped, and never runs inside a transaction). A power loss still drops only commits no checkpoint synced (NORMAL's contract), now at most 4,000
+ * frames AND, while commits continue, at most ~30 s of them (before: 1,000 frames and no time bound; the tail after
+ * the last commit stays unsynced until the next checkpoint, as before: nothing polls). `sync()` is unchanged.
  *
  * Checkpoint timing (smarty-dev#6100). Every checkpoint this store runs is timed (`stats().checkpointTiming`), logged
  * at debug level, and summarised once a minute at info level (`checkpointLog`); the summary also carries COMMIT
@@ -86,7 +100,7 @@
  *
  * Reader starvation (smarty-dev#6477, full-load soak): with many processes reading constantly, some reader
  * always holds a WAL read mark, so PASSIVE autocheckpoints copy frames but the WAL never restarts and grows
- * to the emergency path. After a COMMIT that leaves the WAL above `walResetBytes` (8 MiB), one process at a
+ * to the emergency path. After a COMMIT that leaves the WAL above `walResetBytes` (24 MiB), one process at a
  * time (the `state-wal-reset.lock` try-lock) runs the guarded TRUNCATE above: ONE attempt after the writer's
  * continuation, outside any transaction, and only while this store has no write waiting (its PASSIVE runs on the
  * event loop, smarty-dev#6100), so no client stalls on it. A busy attempt is not
@@ -424,8 +438,16 @@ export interface SqliteStateStoreOptions {
   checkpointIntervalMs?: number;
   /** Ignored since smarty-dev#6100: every TRUNCATE makes one guarded attempt with busy_timeout 0. Kept for callers. */
   checkpointBusyMs?: number;
-  /** WAL size above which a writer resets the WAL with a client-side TRUNCATE after its COMMIT; 0 disables. Default 8 MiB. */
+  /** WAL size above which a writer resets the WAL with a client-side TRUNCATE after its COMMIT; 0 disables. Default 24 MiB. */
   walResetBytes?: number;
+  /** SQLite's `wal_autocheckpoint` (pages) on this store's connection. Default 4,000 (~16 MiB of frames, smarty-dev#6100). */
+  walAutocheckpointPages?: number;
+  /**
+   * After a COMMIT, one PASSIVE checkpoint when WAL frames were written since the last backfill and that backfill is
+   * older than this (the mtimes of state.db and its WAL, stat only); 0 disables. Default 30 s. With the autocheckpoint it bounds the
+   * commits a power loss can drop by age as well as by volume (smarty-dev#6100 round 2).
+   */
+  walSyncMaxAgeMs?: number;
   /**
    * Checkpoint timing log on stderr: "debug" (each checkpoint plus the summary), "info" (one summary line per minute
    * with activity), "off". Default: `PI_FABRIC_MESH_CHECKPOINT_LOG`, else "info" unless stderr is a terminal.
@@ -441,7 +463,7 @@ export interface SqliteStateStoreOptions {
    * greater than 0: 0 (formerly "disabled"), NaN, Infinity and negative values throw a TypeError at open.
    */
   walHardCapBytes?: number;
-  /** `journal_size_limit`. Default 16 MiB. */
+  /** `journal_size_limit`. Default 24 MiB (above the autocheckpoint's ~16 MiB, so a restart keeps the file). */
   journalSizeLimitBytes?: number;
   /** Rows kept in the `changes` feed. Default 4,096. */
   changesRetained?: number;
@@ -482,7 +504,7 @@ export interface SqliteStateStats {
   maxWalBytes: number;
   /**
    * smarty-dev#6100: the checkpoints this store ran, by mode. `onWriterPath`: ran in a writer's path (the WAL-cap
-   * admission before BEGIN, or the emergency or reset checkpoint after its COMMIT). `walRestartsSeen`: a lower
+   * admission before BEGIN, or the emergency, reset or age checkpoint after its COMMIT). `walRestartsSeen`: a lower
    * bound on WAL restarts, from PASSIVE's frame count falling between two of this store's checkpoints.
    */
   checkpointTiming: { passive: CheckpointTiming; truncate: CheckpointTiming; onWriterPath: number; walRestartsSeen: number };
@@ -619,11 +641,18 @@ const WAL_RESET_LOCK = "state-wal-reset.lock";
 const WAL_RESET_LOCK_STALE_MS = 2_000;
 // A busy reset: this process's next attempt waits for a commit at least this much later.
 const WAL_RESET_BACKOFF_MS = 2_000;
-const DEFAULT_WAL_RESET_BYTES = 8 * 1024 * 1024;
+// smarty-dev#6100 round 2: above the autocheckpoint's ~16 MiB, so a WAL that restarts normally never takes this path.
+const DEFAULT_WAL_RESET_BYTES = 24 * 1024 * 1024;
+const DEFAULT_JOURNAL_SIZE_LIMIT_BYTES = 24 * 1024 * 1024;
+const DEFAULT_WAL_SYNC_MAX_AGE_MS = 30_000;
+// The age check (two stats) runs at most this often per store, after a COMMIT.
+const AGE_CHECK_MS = 1_000;
+// A due age sync deferred because this store's writers are waiting runs anyway on the commit after this many deferrals.
+const AGE_SYNC_MAX_SKIPS = 3;
 const SLOW_COMMIT_MS = 50;
 const CHECKPOINT_SUMMARY_MS = 60_000;
-type CheckpointVia = "explicit" | "maintainer" | "emergency" | "reset" | "cap" | "sync";
-const WRITER_PATH_VIAS: ReadonlySet<CheckpointVia> = new Set(["emergency", "reset", "cap"]);
+type CheckpointVia = "explicit" | "maintainer" | "emergency" | "reset" | "cap" | "age" | "sync";
+const WRITER_PATH_VIAS: ReadonlySet<CheckpointVia> = new Set(["emergency", "reset", "cap", "age"]);
 type CheckpointWindow = { startedAt: number; passive: number; passiveMaxMs: number; truncate: number; truncateMaxMs: number;
   busy: number; onWriterPath: number; walRestartsSeen: number; commits: number; slowCommits: number; maxCommitMs: number;
   lockTimeouts: number; maxWaitMs: number; maxWalBytes: number };
@@ -893,6 +922,11 @@ export class SqliteStateStore {
   #walResetting = false;
   #walResetBusyAt = Number.NEGATIVE_INFINITY;
   #lastWalResetCheck = 0;
+  readonly #walSyncMaxAgeMs: number;
+  #lastAgeCheck = 0;
+  #ageSyncing = false;
+  #ageDue = false;
+  #ageSkips = 0;
   #lastPassiveLog = -1;
   readonly #checkpointLog: CheckpointLogLevel;
   #window = newCheckpointWindow(Date.now());
@@ -917,6 +951,7 @@ export class SqliteStateStore {
     this.#changesRetained = Math.max(1, Math.floor(options.changesRetained ?? 4_096));
     this.#walResetBytes = Math.max(0, Math.floor(options.walResetBytes ?? DEFAULT_WAL_RESET_BYTES));
     this.#walHardCapBytes = walHardCapOf(options);
+    this.#walSyncMaxAgeMs = Math.max(0, options.walSyncMaxAgeMs ?? DEFAULT_WAL_SYNC_MAX_AGE_MS);
     this.#checkpointLog = checkpointLogLevel(options.checkpointLog);
     if (options.checkpoint === "maintainer") {
       this.#maintainer = true;
@@ -1653,6 +1688,56 @@ export class SqliteStateStore {
     if (ms >= SLOW_COMMIT_MS) { this.#stats.slowCommits += 1; this.#window.slowCommits += 1; }
   }
 
+  // smarty-dev#6100 round 2: after a COMMIT (at most once per AGE_CHECK_MS), one PASSIVE when frames were written since
+  // the last backfill and that backfill is older than walSyncMaxAgeMs. state.db is only written by a checkpoint's backfill (WAL mode),
+  // right after that checkpoint's WAL fsync, so its mtime is the last sync; the WAL's mtime is the last frame. Stat
+  // only (never an fd on the database files). Scheduled after the writer's continuation, like the emergency path.
+  // A due sync is remembered (#ageDue) until it runs: a persistent writer queue must not starve it (review on adddb81d).
+  #syncByAge(): void {
+    if (this.#walSyncMaxAgeMs <= 0) return;
+    if (!this.#ageDue) {
+      const now = Date.now();
+      if (now - this.#lastAgeCheck < AGE_CHECK_MS) return;
+      this.#lastAgeCheck = now;
+      if (!this.#ageSyncDue(now)) return;
+      this.#ageDue = true;
+      this.#ageSkips = 0;
+    }
+    this.#scheduleAgeSync();
+  }
+
+  #ageSyncDue(now: number): boolean {
+    try {
+      const database = fs.statSync(this.file, { throwIfNoEntry: false });
+      const wal = fs.statSync(`${this.file}-wal`, { throwIfNoEntry: false });
+      return !!database && !!wal && wal.size > 0 && wal.mtimeMs > database.mtimeMs && now - database.mtimeMs >= this.#walSyncMaxAgeMs;
+    } catch { return false; }
+  }
+
+  // Runs the due PASSIVE on the event loop, never inside a transaction (the writer lock; smarty-dev#6100, #869). This
+  // PASSIVE delays the store's waiting writers, so while any wait it is deferred, not dropped: it is retried when the
+  // queue drains (#leaveWriteQueue) and by every commit, and the commit after AGE_SYNC_MAX_SKIPS deferrals runs it anyway.
+  #scheduleAgeSync(): void {
+    if (!this.#ageDue || this.#ageSyncing) return;
+    this.#ageSyncing = true;
+    void new Promise<void>((resolve) => setImmediate(resolve))
+      .then(() => {
+        if (this.#closed || !this.#ageDue || this.#inTransaction || this.#db.isTransaction) return; // the commit retries
+        if (this.#writesWaiting > 0 && this.#ageSkips < AGE_SYNC_MAX_SKIPS) { this.#ageSkips += 1; return; }
+        this.#ageDue = false;
+        this.#ageSkips = 0;
+        if (this.#ageSyncDue(Date.now())) this.#passive("age"); // else a checkpoint (e.g. the autocheckpoint) synced meanwhile
+      })
+      .catch(() => { if (!this.#closed) this.#stats.checkpoints.failed += 1; })
+      .finally(() => { this.#ageSyncing = false; });
+  }
+
+  // A writer leaves the in-process queue (it took the lock, or gave up). An empty queue runs a deferred age sync.
+  #leaveWriteQueue(): void {
+    this.#writesWaiting -= 1;
+    if (this.#writesWaiting === 0) this.#scheduleAgeSync();
+  }
+
   stats(): SqliteStateStats {
     const timing = this.#stats.checkpointTiming;
     return { ...this.#stats, writesWaiting: this.#writesWaiting, checkpoints: { ...this.#stats.checkpoints },
@@ -1857,7 +1942,7 @@ export class SqliteStateStore {
             // checkpoint) never keeps the next waiter from contending.
             ticket?.close();
             ticket = undefined;
-            this.#writesWaiting -= 1;
+            this.#leaveWriteQueue();
             waiting = false;
             return this.#run(body, lockClass, waitMs);
           }
@@ -1901,7 +1986,7 @@ export class SqliteStateStore {
       }
     } finally {
       ticket?.close();
-      if (waiting) this.#writesWaiting -= 1;
+      if (waiting) this.#leaveWriteQueue();
     }
   }
 
@@ -1972,6 +2057,7 @@ export class SqliteStateStore {
         if (this.#maintainer) this.#queueMaintenance();
         this.#emergencyCheckpoint();
         this.#maybeResetWal();
+        this.#syncByAge();
       }
       if (committed) this.#flushCheckpointWindow();
     }
@@ -2281,8 +2367,10 @@ export const removeOwnedFile = (file: string, token: string): void => {
 
 const clampBusy = (value: number | undefined): number => Math.max(0, Math.min(MAX_BUSY_TIMEOUT_MS, Math.floor(value ?? 2)));
 
-// SQLite's default: a PASSIVE checkpoint after the COMMIT that takes the WAL past ~4 MiB (4 KiB pages).
-const WAL_AUTOCHECKPOINT_PAGES = 1000;
+// A PASSIVE checkpoint after the COMMIT that takes the WAL past this many frames (SQLite's default is 1,000, ~4 MiB).
+// smarty-dev#6100 round 2: 4,000 (~16 MiB), so complete checkpoints, and the WAL restarts that follow them, are 4x
+// rarer by volume; walSyncMaxAgeMs adds the age bound (see the module comment).
+const WAL_AUTOCHECKPOINT_PAGES = 4000;
 
 const SEEDED_META = ["schema", "backend", "epoch", "store_id", "high_water", "commit_no", "state_bytes", "tombstone_ord"];
 
@@ -2315,8 +2403,8 @@ const initialise = (db: SqliteConnection, options: SqliteStateStoreOptions): { e
     throw new MeshStateUnsupportedError(`Fabric mesh SQLite state could not enter WAL mode (${String(mode?.journal_mode)})`);
   }
   db.exec("PRAGMA synchronous = NORMAL");
-  db.exec(`PRAGMA wal_autocheckpoint = ${WAL_AUTOCHECKPOINT_PAGES}`);
-  db.exec(`PRAGMA journal_size_limit = ${Math.max(0, Math.floor(options.journalSizeLimitBytes ?? 16 * 1024 * 1024))}`);
+  db.exec(`PRAGMA wal_autocheckpoint = ${Math.max(0, Math.floor(options.walAutocheckpointPages ?? WAL_AUTOCHECKPOINT_PAGES))}`);
+  db.exec(`PRAGMA journal_size_limit = ${Math.max(0, Math.floor(options.journalSizeLimitBytes ?? DEFAULT_JOURNAL_SIZE_LIMIT_BYTES))}`);
   db.exec("PRAGMA trusted_schema = OFF");
   // smarty-dev#6477: an initialised database opens with plain reads; only a missing schema takes the write lock.
   const existing = readIdentity(db);

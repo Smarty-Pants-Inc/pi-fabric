@@ -7,7 +7,8 @@ import { openNodeSqlite, SqliteStateStore } from "../src/mesh/state-sqlite.js";
 import type { MeshIdentity } from "../src/mesh/store.js";
 
 // smarty-dev#6100 round 1: every checkpoint the store runs is timed in stats() and logged (debug: every checkpoint;
-// info: one summary line per minute with commit maxima and lock timeouts). Observability only: no cadence changes.
+// info: one summary line per minute with commit maxima and lock timeouts). Observability only: the cadence defaults
+// asserted at the end are round 2's (tests/mesh-state-sqlite-checkpoint-cadence.test.ts).
 const identity: MeshIdentity = { id: "tester", name: "tester", kind: "agent" };
 const roots: string[] = [];
 const stores: SqliteStateStore[] = [];
@@ -120,7 +121,7 @@ describe("SQLite mesh checkpoint timing (smarty-dev#6100 round 1)", () => {
     }
   });
 
-  it("leaves the durability settings at main's defaults", async () => {
+  it("keeps synchronous NORMAL with round 2's autocheckpoint and journal_size_limit defaults", async () => {
     const root = tempRoot("pragmas");
     const store = await openStore(root, { checkpointLog: "off" });
     await store.put({ key: "k", value: 1, identity });
@@ -130,7 +131,7 @@ describe("SQLite mesh checkpoint timing (smarty-dev#6100 round 1)", () => {
     } finally {
       observer.close();
     }
-    // The store's own connection: synchronous NORMAL (1), autocheckpoint 1,000 pages, journal_size_limit 16 MiB.
+    // The store's own connection: synchronous NORMAL, autocheckpoint 4,000 pages, journal_size_limit 24 MiB (smarty-dev#6100 round 2).
     const recorded: string[] = [];
     const recordingRoot = tempRoot("pragmas-recorded");
     await openStore(recordingRoot, {
@@ -141,7 +142,7 @@ describe("SQLite mesh checkpoint timing (smarty-dev#6100 round 1)", () => {
           close: () => connection.close(), get isTransaction() { return connection.isTransaction; } };
       },
     });
-    expect(recorded).toEqual(expect.arrayContaining(["PRAGMA synchronous = NORMAL", "PRAGMA wal_autocheckpoint = 1000",
-      `PRAGMA journal_size_limit = ${16 * 1024 * 1024}`]));
+    expect(recorded).toEqual(expect.arrayContaining(["PRAGMA synchronous = NORMAL", "PRAGMA wal_autocheckpoint = 4000",
+      `PRAGMA journal_size_limit = ${24 * 1024 * 1024}`]));
   });
 });

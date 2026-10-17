@@ -6,6 +6,7 @@ import crypto, { createHash } from "node:crypto";
 import { syncBuiltinESMExports } from "node:module";
 import { spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
+import { Worker } from "node:worker_threads";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
@@ -320,6 +321,175 @@ describe("fleet authority snapshot privacy and real backend boundaries", () => {
       (crypto as any).createHash = () => ({ update() { return this; }, digest() { return "0".repeat(64); } }); syncBuiltinESMExports();
       await expect(collect(options(f))).rejects.toThrow("HASH_COLLISION");
     } finally { crypto.createHash = original; syncBuiltinESMExports(); }
+  });
+  it.each(["1", "654321", "7654321", "4294967295", ID.slice(8), "actor-outbox-exact-owner", "actor-mailbox-exact-owner"])("retains source-backed participant session handles in FILE, SQLite and participant files (%s)", async sessionId => {
+    for (const backend of ["file", "sqlite"] as const) {
+      const f = fixture(), value = { ...participant(), kind: "agent", transport: "process", status: "completed", residency: "session", finishedAt: 250, sessionId };
+      f.entries[key("participants")] = envelope("participants", value);
+      fs.writeFileSync(path.join(f.mesh, "participants", `${hash(ID)}.json`), JSON.stringify({ format: 1, ...envelope("participants", value) }));
+      let db: DatabaseSync | undefined;
+      if (backend === "sqlite") db = sqlite(f); else fs.writeFileSync(path.join(f.mesh, "state.json"), JSON.stringify({ format: 1, entries: f.entries }));
+      try {
+        const result = run(f, backend === "sqlite" ? "hub" : "work"), snapshot = JSON.parse(result.stdout);
+        expect(result.status, result.stderr).toBe(0); expect(snapshot.attempts).toBe(1);
+        expect(snapshot.stateEntries.find((row: any) => row.key === key("participants")).value.sessionId).toBe(sessionId);
+        expect(snapshot.participantFiles[0].value.sessionId).toBe(sessionId);
+        const census = run(f, backend === "sqlite" ? "hub" : "work", path.join(f.out, "census.json"), true);
+        expect(census.status, census.stderr).toBe(0);
+        expect(JSON.parse(census.stdout)).toMatchObject({ mode: "census", complete: true, attempts: 1, unsupported: [] });
+      } finally { db?.close(); }
+    }
+  });
+  it.each([0, 1, "0", "01", "-1", "+1", "1.0", "1e3", " 1", "1 ", "1\n", "1\u0000", "4294967296", "9999999999", "10000000000", "short-handle"])("rejects noncanonical participant process handles without raw diagnostic values (%j)", async sessionId => {
+    for (const backend of ["file", "sqlite", "participant-file"] as const) {
+      const f = fixture(), value = { ...participant(), sessionId };
+      let db: DatabaseSync | undefined;
+      if (backend === "participant-file") fs.writeFileSync(path.join(f.mesh, "participants", `${hash(ID)}.json`), JSON.stringify({ format: 1, ...envelope("participants", value) }));
+      else {
+        f.entries[key("participants")] = envelope("participants", value);
+        if (backend === "sqlite") db = sqlite(f); else fs.writeFileSync(path.join(f.mesh, "state.json"), JSON.stringify({ format: 1, entries: f.entries }));
+      }
+      try {
+        const shape = typeof sessionId === "string" ? "length:1-32" : "non-string";
+        await expect(collect(options(f, backend === "sqlite" ? { site: "hub", name: "dev1" } : {}))).rejects.toMatchObject({ code: "UNSUPPORTED_ID", field: "entry.value.sessionId", recordKind: "participant", shape });
+        const result = run(f, backend === "sqlite" ? "hub" : "work");
+        expect(result.status).toBe(1); expect(result.stdout).toBe("");
+        expect(result.stderr).toBe(`${JSON.stringify({ error: "UNSUPPORTED_ID", field: "entry.value.sessionId", recordKind: "participant", shape })}\n`);
+        expect(fs.existsSync(path.join(f.out, "snapshot.json"))).toBe(false);
+      } finally { db?.close(); }
+    }
+  });
+  it.each(["identity", "updatedBy-session", "updatedBy-id", "lease", "handoff", "participant-id", "participant-owner", "participant-parent"])("does not admit a process handle into the wrong field (%s)", async target => {
+    for (const backend of ["file", "sqlite"] as const) {
+      const f = fixture(), processSession = "7654321"; let field: string, recordKind: string;
+      if (target === "identity") {
+        const value = host(); value.identity.sessionId = processSession; f.entries[key("hosts")] = envelope("hosts", value);
+        field = "entry.value.identity.sessionId"; recordKind = "host";
+      } else if (target.startsWith("updatedBy")) {
+        const entry = envelope("hosts", host()); entry.updatedBy[target === "updatedBy-id" ? "id" : "sessionId"] = processSession; f.entries[key("hosts")] = entry;
+        field = target === "updatedBy-id" ? "entry.updatedBy.id" : "entry.updatedBy.sessionId"; recordKind = "host";
+      } else if (target === "lease") {
+        const value = lease(); value.session.id = processSession;
+        fs.writeFileSync(path.join(f.mesh, "host-leases", `${hash(ID).slice(0, 32)}.json`), JSON.stringify(value));
+        field = "lease.session.id"; recordKind = "lease";
+      } else if (target === "handoff") {
+        const value = { format: 1, id: ID, sessionId: processSession, link: "dev1", handedOffAt: 100, hub: "dev1" };
+        Object.assign(f.entries, { [key("handoffs")]: envelope("handoffs", value) });
+        field = "entry.value.sessionId"; recordKind = "handoff";
+      } else {
+        const value: any = participant(), name = target === "participant-id" ? "id" : target === "participant-owner" ? "ownerHostId" : "parentId";
+        value[name] = processSession; f.entries[key("participants")] = envelope("participants", value);
+        field = `entry.value.${name}`; recordKind = "participant";
+      }
+      let db: DatabaseSync | undefined;
+      if (backend === "sqlite") db = sqlite(f); else fs.writeFileSync(path.join(f.mesh, "state.json"), JSON.stringify({ format: 1, entries: f.entries }));
+      try {
+        const result = run(f, backend === "sqlite" ? "hub" : "work");
+        expect(result.status).toBe(1); expect(result.stdout).toBe(""); expect(result.stderr).not.toContain(processSession);
+        expect(JSON.parse(result.stderr)).toEqual({ error: "UNSUPPORTED_ID", field, recordKind, shape: "length:1-32" });
+        expect(fs.existsSync(path.join(f.out, "snapshot.json"))).toBe(false);
+      } finally { db?.close(); }
+    }
+  });
+  it.each([false, true])("retries whole captures with fresh counts and findings, census=%s", async census => {
+    for (const target of ["lease", "cursor", "participant", "file-state"] as const) {
+      const f = fixture();
+      if (census) { const value = host(); value.rootId = "unsupported-short-id"; f.entries[key("hosts")] = envelope("hosts", value); }
+      let db: DatabaseSync | undefined;
+      if (target !== "file-state") db = sqlite(f, true); else fs.writeFileSync(path.join(f.mesh, "state.json"), JSON.stringify({ format: 1, entries: f.entries }));
+      const opts = options(f, { census, ...(db ? { site: "hub", name: "dev1" } : {}) });
+      try {
+        const baseline = await collect(opts), read = fs.readFileSync; let passes = 0;
+        const exec = vi.spyOn(DatabaseSync.prototype, "exec");
+        const changing = target === "cursor" ? f.cursor : target === "lease" ? path.join(f.mesh, "host-leases", `${hash(ID).slice(0, 32)}.json`) : target === "participant" ? path.join(f.mesh, "participants", `${hash(ID)}.json`) : path.join(f.mesh, "state.json");
+        const spy = vi.spyOn(fs, "readFileSync").mockImplementation(((...params: any[]) => {
+          const text = (read as any)(...params);
+          if (typeof text === "string" && text.includes('"toRemote"') && ++passes <= 2) fs.appendFileSync(changing, "\n");
+          return text;
+        }) as typeof fs.readFileSync);
+        const snapshot = await collect(opts); spy.mockRestore();
+        expect(passes).toBe(3); expect(snapshot.attempts).toBe(3); expect(baseline.attempts).toBe(1);
+        if (db) {
+          expect(exec.mock.calls.filter(([sql]) => sql === "BEGIN; PRAGMA query_only=ON")).toHaveLength(3);
+          expect(exec.mock.calls.filter(([sql]) => sql === "COMMIT")).toHaveLength(3);
+        }
+        exec.mockRestore(); expect(snapshot.counts).toEqual(baseline.counts);
+        if (census) {
+          expect(snapshot.complete).toBe(false); expect(snapshot.unsupported).toEqual([{ field: "entry.value.rootId", recordKind: "host", shape: "length:1-32", count: 1 }]);
+          expect(snapshot.stateEntries).toBeUndefined();
+        } else {
+          expect(snapshot.stateEntries).toEqual(baseline.stateEntries); expect(snapshot.leaseFiles).toEqual(baseline.leaseFiles); expect(snapshot.cursors).toEqual(baseline.cursors);
+        }
+      } finally { vi.restoreAllMocks(); db?.close(); }
+    }
+  });
+  it.each([false, true])("exhausts exactly three changing-source captures at the CLI without any partial output, census=%s", census => {
+    const f = fixture(), db = sqlite(f, true), preload = path.join(f.top, "changing-source.cjs"), counter = path.join(f.top, "attempts.json");
+    fs.writeFileSync(preload, `const fs = require('node:fs'); const read = fs.readFileSync; let attempts = 0;
+      fs.readFileSync = function(...args) { const text = read.apply(this, args);
+        if (typeof text === 'string' && text.includes('"toRemote"')) { attempts++; fs.appendFileSync(${JSON.stringify(f.cursor)}, '\\n'); fs.writeFileSync(${JSON.stringify(counter)}, JSON.stringify({ attempts })); }
+        return text; };`);
+    try {
+      const result = spawnSync(process.execPath, ["--require", preload, ...args(f, "hub", undefined, census)], { encoding: "utf8", timeout: 5000 });
+      expect(result.error).toBeUndefined(); expect(result.status).toBe(1); expect(result.stdout).toBe("");
+      expect(result.stderr).toBe('{"error":"SOURCE_CHANGED","attempts":3}\n');
+      expect(JSON.parse(fs.readFileSync(counter, "utf8"))).toEqual({ attempts: 3 });
+      expect(fs.existsSync(path.join(f.out, "snapshot.json"))).toBe(false);
+    } finally { db.close(); }
+  });
+  it.each(["schema", "path", "unsupported-id", "key-join", "bounds"])("does not retry a non-source-change failure (%s)", async mode => {
+    const f = fixture();
+    if (mode === "unsupported-id") (f.entries[key("hosts")] as any).value.rootId = "unsupported-short-id";
+    if (mode === "key-join") (f.entries[key("hosts")] as any).value.id = ROOT;
+    if (mode === "bounds") (f.entries[key("hosts")] as any).value.updatedAt = Number.MAX_SAFE_INTEGER + 1;
+    const db = sqlite(f, true);
+    if (mode === "schema") db.exec("ALTER TABLE kv ADD COLUMN unexpected TEXT");
+    if (mode === "path") { fs.unlinkSync(f.cursor); fs.mkdirSync(f.cursor); }
+    const list = fs.readdirSync; let attempts = 0;
+    vi.spyOn(fs, "readdirSync").mockImplementation(((...params: any[]) => {
+      if (params[0] === path.join(f.mesh, "participants")) attempts++;
+      return (list as any)(...params);
+    }) as typeof fs.readdirSync);
+    try {
+      const code = mode === "schema" ? "UNSUPPORTED_SCHEMA" : mode === "path" ? "UNSAFE_INPUT" : mode === "unsupported-id" ? "UNSUPPORTED_ID" : mode === "key-join" ? "KEY_ID_MISMATCH" : "INVALID_SCALAR";
+      await expect(collect(options(f, { site: "hub", name: "dev1" }))).rejects.toMatchObject({ code });
+      expect(attempts).toBe(1);
+    } finally { db.close(); }
+  });
+  it("keeps a single consistent read transaction while an actual concurrent SQLite writer commits", async () => {
+    const f = fixture(), db = sqlite(f, true), signal = new Int32Array(new SharedArrayBuffer(4));
+    db.exec("UPDATE kv SET version=3,updated_at=3");
+    const writer = new Worker(`const { workerData } = require('node:worker_threads'); const { DatabaseSync } = require('node:sqlite');
+      const signal = new Int32Array(workerData.signal); let db;
+      try { db = new DatabaseSync(workerData.file, { timeout: 1000 }); Atomics.store(signal, 0, 1); Atomics.notify(signal, 0);
+        Atomics.wait(signal, 0, 1, 5000); if (Atomics.load(signal, 0) !== 2) throw Error('writer not released');
+        db.exec("BEGIN IMMEDIATE; UPDATE meta SET value=4 WHERE name='commit_no'; UPDATE kv SET version=4,updated_at=4; COMMIT");
+        Atomics.store(signal, 0, 3); Atomics.notify(signal, 0);
+      } catch { Atomics.store(signal, 0, -1); Atomics.notify(signal, 0); } finally { db?.close(); }`,
+      { eval: true, workerData: { file: path.join(f.mesh, "state.db"), signal: signal.buffer } });
+    try {
+      Atomics.wait(signal, 0, 0, 5000); expect(Atomics.load(signal, 0)).toBe(1);
+      const prepare = DatabaseSync.prototype.prepare; let transactions = 0;
+      vi.spyOn(DatabaseSync.prototype, "prepare").mockImplementation(function(this: DatabaseSync, sql: string) {
+        const statement: any = prepare.call(this, sql);
+        if (sql.startsWith("SELECT name,value FROM meta")) {
+          const all = statement.all.bind(statement);
+          statement.all = (...params: any[]) => {
+            const rows = all(...params); transactions++;
+            Atomics.store(signal, 0, 2); Atomics.notify(signal, 0); Atomics.wait(signal, 0, 2, 5000);
+            expect(Atomics.load(signal, 0)).toBe(3); return rows;
+          };
+        }
+        return statement;
+      });
+      const snapshot = await collect(options(f, { site: "hub", name: "dev1" }));
+      expect(transactions).toBe(1); expect(snapshot.attempts).toBe(1); expect(snapshot.stateMetadata.commit).toBe(3);
+      expect(snapshot.stateEntries.every((entry: any) => entry.version === 3 && entry.updatedAt === 3)).toBe(true);
+      expect(snapshot.counts.sqlite.pageCountAfter).toBe(snapshot.counts.sqlite.pageCountBefore);
+      expect(snapshot.counts.sqlite.walFramesAfter).toBeGreaterThan(snapshot.counts.sqlite.walFramesBefore);
+      expect(db.prepare("SELECT value FROM meta WHERE name='commit_no'").get()?.value).toBe(4);
+      expect(db.prepare("SELECT DISTINCT version FROM kv").all()).toEqual([{ version: 4 }]);
+    } finally { vi.restoreAllMocks(); await writer.terminate(); db.close(); }
   });
   it("reads live SQLite WAL on a writable source under accepted reader-index semantics", async () => {
     const f = fixture(), db = sqlite(f, true), before = treeBytes(f.mesh);

@@ -35,6 +35,7 @@ try {
 } catch (error) {
   const code = error instanceof SnapshotError ? error.code : "COLLECTION_FAILED";
   const diagnostic = { error: code };
+  if (error instanceof SnapshotError && code === "SOURCE_CHANGED" && error.attempts !== undefined) diagnostic.attempts = error.attempts;
   if (error instanceof SnapshotError && code === "UNSUPPORTED_ID" && error.field !== undefined) {
     diagnostic.field = error.field; diagnostic.recordKind = error.recordKind; diagnostic.shape = error.shape;
   }

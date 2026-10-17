@@ -6,9 +6,14 @@ import { createHash } from "node:crypto";
 const MAX_SOURCE = 32 * 1024 * 1024;
 const MAX_RECORD = 256 * 1024;
 const MAX_ROWS = 10_000;
+const MAX_CAPTURE_ATTEMPTS = 3;
 const OMIT = Symbol("omit");
 const H = "hash", I = "identity", P = "peer", N = "integer", B = "boolean", SID = "session", A = "alias";
 const UPDATED_BY_ID = Symbol("updatedBy.id");
+// ProcessTransport -> AgentManager -> agentParticipantRecords -> ParticipantDirectory.
+// This transport handle is not a logical session or authority identity.
+const PARTICIPANT_SESSION = Symbol("participant.sessionId");
+const PROCESS_SESSION_PATTERN = /^[1-9][0-9]{0,9}(?![\s\S])/;
 const UUID = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
 // Runtime IDs: fabric-runtime-state.ts; resident IDs: residency/protocol.ts;
 // actor/agent IDs: actors/manager.ts and agents/manager.ts (UUID without dashes).
@@ -63,7 +68,7 @@ const host = obj({ format: one, livenessLeaseFiles: one, id: I, rootId: I, ident
   startedAt: N, updatedAt: N, expiresAt: N, remoteHost: P, bridgeVia: P, mirrorLease: one },
 ["format", "id", "rootId", "identity", "startedAt", "updatedAt", "expiresAt"]);
 const participant = obj({ format: one, id: I, kind: enumOf("root", "agent", "actor", "provider"), rootId: I,
-  ownerHostId: I, ownerIdentityId: I, ownerIncarnation: H, parentId: I, sessionId: SID,
+  ownerHostId: I, ownerIdentityId: I, ownerIncarnation: H, parentId: I, sessionId: PARTICIPANT_SESSION,
   interactive: B, mainBindings: B, livenessLeaseFiles: one,
   status: enumOf("idle", "running", "stopping", "reloading", "queued", "finishing", "completed", "failed", "stopped", "timed_out", "dormant", "preparing", "waiting", "failing-preparation"),
   residency: enumOf("session", "durable"), runner: OMIT,
@@ -98,7 +103,7 @@ const ID_FIELDS = new Map();
 for (const [kind, spec, root] of [["host", host, "entry.value"], ["participant", participant, "entry.value"], ["handoff", handoff, "entry.value"], ["policy", policy, "entry.value"], ["lease", lease, "lease"], ["cursor", cursor, "cursor"]]) {
   const fields = new Set();
   const visit = (node, field) => {
-    if (node === I || node === SID || node === UPDATED_BY_ID) fields.add(field);
+    if (node === I || node === SID || node === PARTICIPANT_SESSION || node === UPDATED_BY_ID) fields.add(field);
     if (node?.fields) for (const [key, child] of Object.entries(node.fields)) visit(child, `${field}.${key}`);
   };
   visit(spec, root); if (root === "entry.value") visit(updatedByIdentity, "entry.updatedBy"); ID_FIELDS.set(kind, fields);
@@ -106,6 +111,7 @@ for (const [kind, spec, root] of [["host", host, "entry.value"], ["participant",
 export class SnapshotError extends Error {
   constructor(code, details) {
     super(code); this.name = "SnapshotError"; this.code = code;
+    if (code === "SOURCE_CHANGED" && Number.isInteger(details?.attempts) && details.attempts >= 1 && details.attempts <= MAX_CAPTURE_ATTEMPTS) this.attempts = details.attempts;
     if (code === "UNSUPPORTED_ID" && ID_FIELDS.get(details?.recordKind)?.has(details?.field) && SAFE_SHAPES.has(details?.shape)) {
       this.field = details.field; this.recordKind = details.recordKind; this.shape = details.shape;
     }
@@ -240,10 +246,12 @@ class Reader {
     }
     let value = this.scalar();
     if (spec === N && !safeInteger(value) || spec === B && typeof value !== "boolean" || spec?.enum && !spec.enum.includes(value)) fail("INVALID_SCALAR");
-    if ([H, I, SID, UPDATED_BY_ID, P, A].includes(spec)) {
+    if ([H, I, SID, PARTICIPANT_SESSION, UPDATED_BY_ID, P, A].includes(spec)) {
       // Diagnose IDs before generic scalar validation, without retaining their raw value.
-      const idSlot = spec === I || spec === SID || spec === UPDATED_BY_ID;
-      const validId = spec === SID ? typeof value === "string" && SESSION_PATTERN.test(value) : supportedId(value, spec);
+      const idSlot = spec === I || spec === SID || spec === PARTICIPANT_SESSION || spec === UPDATED_BY_ID;
+      const validId = spec === SID || spec === PARTICIPANT_SESSION
+        ? typeof value === "string" && (SESSION_PATTERN.test(value) || spec === PARTICIPANT_SESSION && PROCESS_SESSION_PATTERN.test(value) && Number(value) <= 4294967295)
+        : supportedId(value, spec);
       if (idSlot && !validId) {
         const shape = idShape(value);
         if (this.ctx.censusMode) { this.ctx.recordUnsupported(field, this.recordKind, shape); this.ctx.count(field, false); return undefined; }
@@ -421,9 +429,7 @@ function sqliteEntries(root, ctx) {
   } finally { if (db.isTransaction) db.exec("ROLLBACK"); db.close(); observation.walFramesAfter = walFrames(file + "-wal"); }
 }
 
-export async function collectAuthoritySnapshot(options) {
-  try {
-    if (!options || !["hub", "work"].includes(options.site) || !["dev1", "ryzen2"].includes(options.name) || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$/.test(options.peer ?? "") || !Array.isArray(options.cursors ?? []) || (options.cursors ?? []).length > 32) fail("INVALID_OPTIONS");
+function captureAuthoritySnapshot(options, attempts) {
     const root = physical(options.mesh, true), ctx = context(options.census === true);
     const participantPaths = directoryFiles(root, "participants", /^[0-9a-f]{64}\.json$/), leasePaths = directoryFiles(root, "host-leases", /^[0-9a-f]{32}\.json$/);
     const cursors = (options.cursors ?? []).map(file => physical(file));
@@ -461,11 +467,25 @@ export async function collectAuthoritySnapshot(options) {
     ctx.resolveAliases();
     const counts = { ...ctx.census(), ...(state.observation ? { sqlite: state.observation } : {}) };
     if (ctx.censusMode) {
-      const output = { schemaVersion: 1, mode: "census", complete: ctx.unsupportedRows().length === 0, backend, unsupported: ctx.unsupportedRows(), counts };
+      const output = { schemaVersion: 1, mode: "census", complete: ctx.unsupportedRows().length === 0, backend, attempts, unsupported: ctx.unsupportedRows(), counts };
       if (Buffer.byteLength(JSON.stringify(output)) > MAX_SOURCE) fail("LIMIT_EXCEEDED"); return output;
     }
-    const output = { schemaVersion: 1, site: options.site, name: options.name, peer: options.peer, backend,
+    const output = { schemaVersion: 1, site: options.site, name: options.name, peer: options.peer, backend, attempts,
       collectedAt: Date.now(), stateMetadata: state.metadata, stateEntries: state.entries.sort((a, b) => a.key.localeCompare(b.key)), participantFiles, leaseFiles, cursors: projectedCursors, counts };
     if (Buffer.byteLength(JSON.stringify(output)) > MAX_SOURCE) fail("LIMIT_EXCEEDED"); return output;
+}
+
+export async function collectAuthoritySnapshot(options) {
+  try {
+    if (!options || !["hub", "work"].includes(options.site) || !["dev1", "ryzen2"].includes(options.name) || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$/.test(options.peer ?? "") || !Array.isArray(options.cursors ?? []) || (options.cursors ?? []).length > 32) fail("INVALID_OPTIONS");
+    // Retry the entire capture, including a fresh projection context and SQLite
+    // transaction. Never combine rows, counts or census findings across attempts.
+    for (let attempts = 1; attempts <= MAX_CAPTURE_ATTEMPTS; attempts++) {
+      try { return captureAuthoritySnapshot(options, attempts); }
+      catch (error) {
+        if (!(error instanceof SnapshotError) || error.code !== "SOURCE_CHANGED") throw error;
+        if (attempts === MAX_CAPTURE_ATTEMPTS) fail("SOURCE_CHANGED", { attempts });
+      }
+    }
   } catch (error) { if (error instanceof SnapshotError) throw error; fail("COLLECTION_FAILED"); }
 }

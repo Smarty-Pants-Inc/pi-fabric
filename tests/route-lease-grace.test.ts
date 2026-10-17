@@ -417,7 +417,7 @@ describe("A4 public-entry delayed-heartbeat N20", () => {
         rows.push({ input: i, message, acknowledged, refusal: refusal ?? null, settledMs,
           admissions: admitted.length, admissionMs: admitted[0] ? admitted[0].at - started : null });
       }
-      const items = fs.existsSync(journal) ? JSON.parse(fs.readFileSync(journal, "utf8")).items as Array<{ message: string; data: unknown }> : [];
+      const items = fs.existsSync(journal) ? JSON.parse(fs.readFileSync(journal, "utf8")).items as Array<{ message: string; data: unknown; deliveryId: string }> : [];
       const times = rows.flatMap(row => typeof row.admissionMs === "number" ? [row.admissionMs] : []).sort((a, b) => a - b);
       const percentile = (p: number) => times.length ? times[Math.ceil(times.length * p) - 1] : null;
       const summary = { stateBackend, inputs: 20, commands: mesh.read({ topic: "fabric.control.command", limit: 100 }).length,
@@ -441,6 +441,8 @@ describe("A4 public-entry delayed-heartbeat N20", () => {
       expect(summary.refusals).toBe(0);
       expect(summary.commands).toBe(20); expect(summary.admissions).toBe(20); expect(summary.duplicates).toBe(0);
       expect(items.map(item => [item.message, item.data])).toEqual(Array.from({ length: 20 }, (_, i) => [`a4-input-${i}`, { input: i }]));
+      expect(new Set(items.map(item => item.deliveryId)).size).toBe(20);
+      expect(items.map(item => [item.message, item.deliveryId])).toEqual(admissions.map(item => [item.message, item.id]));
     } finally {
       await sender.close(); await owner.close(); main.closeFollowUpDrain();
       await targetDirectory.close(); await readerDirectory.close();

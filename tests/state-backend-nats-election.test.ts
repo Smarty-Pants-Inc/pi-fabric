@@ -327,7 +327,13 @@ describe("real three-node NATS metadata-leader election", () => {
         expect((await manager.consumers.info(faultStream!, faultInfo!.name)).created).toBe(faultInfo!.created);
         // SIGCONT, a leader flip and late delivery do not prove every R3 replica is current or that the
         // original consumer has registered its next pull. Observe both, under the existing recovery bound.
-        await waitForNatsConsumerReady(cluster.seedUrl, faultStream!, faultInfo!.name, { timeoutMs: 15_000 });
+        await waitForNatsConsumerReady(cluster.seedUrl, faultStream!, faultConsumer!, { timeoutMs: 15_000 });
+        // Readiness may follow native recovery, but a successor must NEVER satisfy this original-receiver
+        // fault claim. Recheck the immutable original identity/creation and no-recreate evidence before CAS.
+        expect(await faultConsumer!.info(true)).toMatchObject({ stream_name: faultStream!, name: faultInfo!.name, created: faultInfo!.created });
+        expect((await manager.consumers.info(faultStream!, faultInfo!.name)).created).toBe(faultInfo!.created);
+        expect(faultConsumer).toMatchObject({ stream: faultStream!, name: faultInfo!.name });
+        expect(creates.filter(info => info.stream_name === faultStream)).toHaveLength(2);
         const entry = expected[0]!;
         // Exactly one test-level PUT. Only the product's native same-msgID retries may recover a lost ACK.
         await backend.put({ key: entry.key, ifVersion: entry.version, value: { resumed: true }, identity });

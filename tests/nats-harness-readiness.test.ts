@@ -35,7 +35,7 @@ afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });
 
 const controlledReceiver = (name: string) => {
   const cached = { stream_name: "STATE", name };
-  const receiver = { info: vi.fn(async () => ({ ...cached })), consume: vi.fn(async () => ({})) } as unknown as js.Consumer;
+  const receiver = { name, stream: "STATE", info: vi.fn(async () => ({ ...cached })), consume: vi.fn(async () => ({})) } as unknown as js.Consumer & { name: string; stream: string };
   return { cached, receiver };
 };
 const controlledGets = (receivers: js.Consumer[]) => {
@@ -134,7 +134,7 @@ describe("NATS harness readiness conditions", () => {
     await vi.advanceTimersByTimeAsync(50);
     expect(ready).toBe(false);
     expect(consumer).toHaveBeenCalledWith("STATE", "ordered_1");
-    cached.name = "ordered_2"; // SDK updates cached_info on the SAME consumed receiver, not a new get.
+    receiver.name = cached.name = "ordered_2"; // Atomic settled state; split live/cache transition is tested below.
     state.targetPresent = true;
     await vi.advanceTimersByTimeAsync(50);
     await gate;
@@ -146,7 +146,7 @@ describe("NATS harness readiness conditions", () => {
     const { consumer } = controlledInfo();
     const { cached, receiver } = controlledReceiver("ordered_1");
     consumer.mockImplementationOnce(async (_stream, name) => {
-      cached.name = "ordered_2";
+      receiver.name = cached.name = "ordered_2";
       return { stream_name: _stream, name, num_waiting: 1 };
     }).mockImplementation(async (_stream, name) => ({ stream_name: _stream, name, num_waiting: 0 }));
     let ready = false;
@@ -158,6 +158,93 @@ describe("NATS harness readiness conditions", () => {
     await vi.advanceTimersByTimeAsync(50);
     await gate;
   });
+
+  it.each(["absent", "not waiting"])("keeps live _2/cache _1 closed despite predecessor pending, then rejects current _2 %s", async condition => {
+    const { consumer, list, close } = controlledInfo();
+    const { cached, receiver } = controlledReceiver("ordered_1");
+    let predecessorWaiting = 0;
+    let successorPresent = condition !== "absent";
+    let successorWaiting = 0;
+    consumer.mockImplementation(async (stream, name) => {
+      if (name === "ordered_1") return { stream_name: stream, name, num_waiting: predecessorWaiting };
+      if (!successorPresent) throw new js.JetStreamApiError({ code: 404, err_code: 10014, description: "consumer not found" });
+      return { stream_name: stream, name, num_waiting: successorWaiting };
+    });
+    let ready = false;
+    const gate = waitForNatsConsumerReady("nats://fixture", "STATE", receiver, { timeoutMs: 200 }).then(() => { ready = true; });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ready).toBe(false);
+    expect(consumer.mock.calls.map(args => args[1])).toEqual(["ordered_1"]);
+    receiver.name = "ordered_2"; // Native reset advances LIVE name before the add ACK updates cached INFO.
+    predecessorWaiting = 1;
+    await vi.advanceTimersByTimeAsync(50);
+    expect(ready).toBe(false);
+    expect(consumer.mock.calls.map(args => args[1])).toEqual(["ordered_1"]); // Never certify old pending.
+    cached.name = "ordered_2";
+    await vi.advanceTimersByTimeAsync(50);
+    expect(ready).toBe(false);
+    expect(consumer).toHaveBeenLastCalledWith("STATE", "ordered_2");
+    successorPresent = true;
+    successorWaiting = 1;
+    await vi.advanceTimersByTimeAsync(50);
+    await gate;
+    expect(ready).toBe(true);
+    expect(list).not.toHaveBeenCalled();
+    expect(close).toHaveBeenCalledOnce();
+  });
+
+  it("rejects mid-INFO live advance while cache still names the ready predecessor", async () => {
+    const { consumer } = controlledInfo();
+    const { cached, receiver } = controlledReceiver("ordered_1");
+    consumer.mockImplementationOnce(async (stream, name) => {
+      receiver.name = "ordered_2";
+      return { stream_name: stream, name, num_waiting: 1 };
+    });
+    let ready = false;
+    const gate = waitForNatsConsumerReady("nats://fixture", "STATE", receiver, { timeoutMs: 150 }).then(() => { ready = true; });
+    await vi.advanceTimersByTimeAsync(50);
+    expect(ready).toBe(false);
+    expect(consumer).toHaveBeenCalledTimes(1);
+    cached.name = "ordered_2";
+    await vi.advanceTimersByTimeAsync(50);
+    await gate;
+    expect(consumer).toHaveBeenLastCalledWith("STATE", "ordered_2");
+  });
+
+  it("accepts a healthy live receiver with matching cache and its own pending pull without delay", async () => {
+    const { consumer } = controlledInfo();
+    const { receiver } = controlledReceiver("ordered_2");
+    let ready = false;
+    const gate = waitForNatsConsumerReady("nats://fixture", "STATE", receiver).then(() => { ready = true; });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ready).toBe(true);
+    await gate;
+    expect(consumer).toHaveBeenCalledExactlyOnceWith("STATE", "ordered_2");
+  });
+
+  it("bounds a persistent live/cache transition by the original deadline", async () => {
+    const { consumer, close } = controlledInfo();
+    const { receiver } = controlledReceiver("ordered_1");
+    receiver.name = "ordered_2";
+    const outcome = waitForNatsConsumerReady("nats://fixture", "STATE", receiver, { timeoutMs: 75 }).catch(error => error as Error);
+    await vi.advanceTimersByTimeAsync(75);
+    expect((await outcome)?.message).toContain("readiness deadline");
+    expect(consumer).not.toHaveBeenCalled();
+    expect(close).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each([["stream", "OTHER"], ["stream", undefined], ["name", ""], ["name", undefined], ["name", 7]])(
+    "fails invalid LIVE %s=%s rather than falling back to valid cached identity", async (field, value) => {
+      const { consumer, close } = controlledInfo();
+      const { receiver } = controlledReceiver("ordered_1");
+      Object.assign(receiver, { [field as string]: value });
+      const outcome = waitForNatsConsumerReady("nats://fixture", "STATE", receiver).catch(error => error as Error);
+      await vi.advanceTimersByTimeAsync(0);
+      expect((await outcome)?.message).toContain("identity mismatch");
+      expect(consumer).not.toHaveBeenCalled();
+      expect(close).toHaveBeenCalledOnce();
+    });
 
   it.each(["stream", "name"])("fails invalid cached %s identity without querying another receiver", async field => {
     const { consumer, close } = controlledInfo();

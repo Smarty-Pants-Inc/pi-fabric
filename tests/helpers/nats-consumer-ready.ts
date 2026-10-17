@@ -5,12 +5,28 @@ import { JetStreamApiError, jetstream, jetstreamManager, type Consumer, type Con
 type ReadinessOptions = { timeoutMs?: number };
 type Capture = { stream: string; receivers: Consumer[]; active: boolean; restore: (() => void)[] };
 type ConsumerTarget = string | Pick<Consumer, "info">;
-const identity = async (stream: string, consumer: ConsumerTarget): Promise<string> => {
-  const info = typeof consumer === "string" ? { stream_name: stream, name: consumer } : await consumer.info(true);
-  if (info.stream_name !== stream || typeof info.name !== "string" || !info.name.trim()) {
-    throw new Error(`actual SDK receiver identity mismatch for ${stream}: stream/name required`);
+// The pinned PullConsumerImpl exposes live stream/name even though Consumer's public type omits them.
+// reset()/getConsumerOpts() advances name BEFORE the async add ACK replaces cached _info. Validate the
+// runtime shape, never fall back to the predecessor cache, and treat that split as bounded not-ready.
+const liveIdentity = (stream: string, consumer: Pick<Consumer, "info">): string => {
+  const live = consumer as { stream?: unknown; name?: unknown };
+  if (live.stream !== stream || typeof live.name !== "string" || !live.name.trim()) {
+    throw new Error(`actual SDK receiver identity mismatch for ${stream}: live stream/name required`);
   }
-  return info.name;
+  return live.name;
+};
+const identity = async (stream: string, consumer: ConsumerTarget): Promise<string | undefined> => {
+  if (typeof consumer === "string") {
+    if (!consumer.trim()) throw new Error(`actual SDK receiver identity mismatch for ${stream}: name required`);
+    return consumer;
+  }
+  const name = liveIdentity(stream, consumer);
+  const info = await consumer.info(true);
+  const current = liveIdentity(stream, consumer);
+  if (info.stream_name !== stream || typeof info.name !== "string" || !info.name.trim()) {
+    throw new Error(`actual SDK receiver identity mismatch for ${stream}: cached stream/name required`);
+  }
+  return name === current && info.name === current ? current : undefined;
 };
 const captures = new AsyncLocalStorage<Capture>();
 let captureUsers = 0;
@@ -18,8 +34,8 @@ let restoreGet: (() => void) | undefined;
 
 /** Observe the actual SDK get selected by the product, not LIST or a late ACK from an abandoned get.
  * Record only when that returned object's original consume is invoked. No extra request/await is inserted
- * between get and the product's first NEXT. Retain that SAME object: ordered SDK recovery changes its cached
- * identity in place. Async-local scopes keep simultaneous same-stream opens from borrowing another receiver. */
+ * between get and the product's first NEXT. Retain that SAME object: ordered SDK recovery advances its live
+ * identity before its cached INFO catches up. Async-local scopes keep simultaneous same-stream opens from borrowing another receiver. */
 export const captureNatsConsumer = async <T,>(server: string, stream: string, operation: () => Promise<T>): Promise<{ value: T; consumer: Consumer }> => {
   const nc = await connect({ servers: [server], ignoreClusterUpdates: true, timeout: 1_000 });
   try {
@@ -110,8 +126,8 @@ const waitForReady = async (server: string, stream: string, consumer: ConsumerTa
           && (required === 1 && info.cluster === undefined || typeof leader === "string" && leader.length > 0)
           && new Set(replicas.map(peer => peer.name)).size === replicas.length
           && replicas.every(peer => peer.name !== leader && peer.current === true && peer.offline !== true && (peer.lag ?? 0) === 0);
-        // Resolve only this consumed handle's current cached identity, never LIST or a different receiver.
-        // Native delete/add may leave its predecessor absent until the same object exposes its successor.
+        // Resolve only this consumed handle's LIVE identity, never LIST or a different receiver.
+        // A live/cache split during native delete/add is not-ready, not a fatal error or predecessor success.
         const name = consumer === undefined ? undefined : await bounded(() => identity(stream, consumer));
         const snapshot = name === undefined ? undefined : await bounded(() => manager!.consumers.info(stream, name));
         if (snapshot && (snapshot.stream_name !== stream || snapshot.name !== name)) {
@@ -122,7 +138,7 @@ const waitForReady = async (server: string, stream: string, consumer: ConsumerTa
         last = { configuredReplicas: required, leader, replicas,
           ...(snapshot === undefined ? {} : { consumers: [{ name: snapshot.name, waiting: snapshot.num_waiting }], current }) };
         if (Date.now() < deadline && streamReady
-          && (snapshot === undefined || name === current && snapshot.num_waiting > 0)) return;
+          && (consumer === undefined || snapshot !== undefined && name === current && snapshot.num_waiting > 0)) return;
       } catch (error) {
         lastError = error instanceof Error ? error.message : String(error);
         // Missing exact target is not ready, never evidence from another receiver. Only snapshot reads may

@@ -3,6 +3,7 @@ import path from "node:path";
 import type { Consumer, ConsumerAPI, ConsumerInfo, Consumers } from "@nats-io/jetstream";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { importMeshStateToNats } from "../src/mesh/backend-migration-nats.js";
+import { selectNatsSyncAlways } from "../src/mesh/nats-monitor-config.js";
 import { closeNatsStateBackend, MeshStateNatsOutcomeUnknownError, MeshStateNatsUnavailableError, natsStreamName, openNatsStateBackend, type JetStreamPort } from "../src/mesh/state-backend-nats.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { startNatsElectionCluster, stopNatsElectionCluster, type NatsElectionCluster } from "./helpers/nats-election-cluster.js";
@@ -55,7 +56,7 @@ const observePeerElection = async (cluster: NatsElectionCluster, paused: string,
           getMonitorJson(`${node.monitorUrl}/jsz?raft=true`),
         ]);
         return { node: node.name, id: server.server_id, leader: jsz.meta_cluster?.leader, health: health.status,
-          routes: routeInfo.num_routes ?? 0, syncAlways: server.jetstream?.config?.sync_always === true };
+          routes: routeInfo.num_routes ?? 0, syncAlways: selectNatsSyncAlways(server, jsz) === true };
       }));
       const leaders = new Set(states.map(state => state.leader));
       const leader = states.length === 2 && leaders.size === 1 ? states[0]!.leader : undefined;
@@ -68,6 +69,66 @@ const observePeerElection = async (cluster: NatsElectionCluster, paused: string,
   }
   throw new Error(`healthy peers did not agree on a new metadata leader before SIGCONT: ${JSON.stringify(last)}`);
 };
+describe("peer observer durability", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  const runObserver = async (varzSync: boolean | undefined, jszSync: boolean | undefined) => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    vi.spyOn(AbortSignal, "timeout").mockImplementation(() => new AbortController().signal);
+    const requestUrls: string[] = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async input => {
+      const url = String(input);
+      requestUrls.push(url);
+      const node = url.split("/")[2]?.split(":")[0] ?? "";
+      if (url.includes("/healthz?")) return new Response(null, { status: 200 });
+      if (url.endsWith("/routez")) return new Response(JSON.stringify({ num_routes: 1 }), { status: 200 });
+      if (url.endsWith("/varz")) return new Response(JSON.stringify({ server_id: node, jetstream: varzSync === undefined ? {} : { config: { sync_always: varzSync } } }), { status: 200 });
+      if (url.includes("/jsz?raft=true")) return new Response(JSON.stringify({ meta_cluster: { leader: "peer-a" }, ...(jszSync === undefined ? {} : { config: { sync_always: jszSync } }) }), { status: 200 });
+      return new Response("unexpected monitor endpoint", { status: 404 });
+    });
+    const cluster = { nodes: ["peer-a", "peer-b", "paused"].map(name => ({ name, monitorUrl: `http://${name}` })) } as NatsElectionCluster;
+    const observation = observePeerElection(cluster, "paused", Date.now() + 250).then(
+      states => ({ kind: "resolved" as const, states }),
+      error => ({ kind: "rejected" as const, error }),
+    );
+    const bounded = Promise.race([
+      observation,
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("peer observer fixture exceeded its fake-clock bound")), 1_000)),
+    ]);
+    await vi.advanceTimersByTimeAsync(1_000);
+    return { outcome: await bounded, requestUrls };
+  };
+
+  it("accepts JSZ sync_always when the VARZ JetStream config is omitted", async () => {
+    const { outcome, requestUrls } = await runObserver(undefined, true);
+    expect(outcome.kind).toBe("resolved");
+    expect(requestUrls.some(url => url.endsWith("/routez"))).toBe(true);
+    expect(requestUrls.some(url => url.includes("/healthz?js-enabled-only=true"))).toBe(true);
+    expect(requestUrls.some(url => url.includes("/jsz?raft=true"))).toBe(true);
+    expect(requestUrls.every(url => !url.includes("paused"))).toBe(true);
+  });
+
+  it("keeps an explicit VARZ false as a veto over JSZ true", async () => {
+    const { outcome, requestUrls } = await runObserver(false, true);
+    expect(outcome.kind).toBe("rejected");
+    if (outcome.kind === "rejected") expect(outcome.error).toMatchObject({ message: expect.stringContaining("healthy peers did not agree") });
+    expect(requestUrls.some(url => url.endsWith("/routez"))).toBe(true);
+    expect(requestUrls.some(url => url.includes("/healthz?js-enabled-only=true"))).toBe(true);
+  });
+
+  it("rejects when both VARZ and JSZ omit sync_always", async () => {
+    const { outcome, requestUrls } = await runObserver(undefined, undefined);
+    expect(outcome.kind).toBe("rejected");
+    if (outcome.kind === "rejected") expect(outcome.error).toMatchObject({ message: expect.stringContaining("healthy peers did not agree") });
+    expect(requestUrls.some(url => url.endsWith("/routez"))).toBe(true);
+    expect(requestUrls.some(url => url.includes("/healthz?js-enabled-only=true"))).toBe(true);
+  });
+});
+
 describe("real three-node NATS metadata-leader election", () => {
   // Keep: #11950/#13112's real R3-history / silent R1-receiver split, without changing CREATE or pull budgets.
   // Skip reason off Linux: SIGSTOP stopped-state proof needs Linux /proc.

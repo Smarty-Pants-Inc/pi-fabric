@@ -240,11 +240,10 @@ export const runBridge = async (
     // Join initialization so an abort cannot leave a late-bound socket behind. All startup
     // remote calls are bounded; no receiver is advertised before its presence is ready.
     await starting?.catch(() => undefined);
-    // Fence/close delivery ingress BEFORE withdrawing presence or shutting down the link.
+    // Fence/close delivery ingress before shutting down; mirrors expire by their lease TTL.
     await relay?.close().catch(() => undefined);
     relay = undefined;
-    // The mirrors of the remote on this side go at once; the remote's lapse with their lease.
-    await (bridge ? bridge.stop() : local.withdraw()).catch(() => undefined);
+    if (bridge) await bridge.stop().catch(() => undefined);
     remote?.close();
     if (child.pid !== undefined && child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
     const timer = setTimeout(() => child.kill("SIGKILL"), CHILD_KILL_MS);

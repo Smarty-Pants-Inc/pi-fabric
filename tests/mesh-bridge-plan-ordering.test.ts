@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { StoreBridgeSide, type BridgePresence } from "../src/mesh/bridge.js";
 import { MeshStore } from "../src/mesh/store.js";
+import * as hostLeases from "../src/topology/host-leases.js";
 import { writeHostLease } from "../src/topology/host-leases.js";
 
 // Refs Smarty-Pants-Inc/smarty-dev#7397: real SQLite transactions with the ordering
@@ -17,16 +18,16 @@ afterEach(() => {
 });
 
 describe("bridge mirror plan ordering", () => {
-  it.each((["none", "unrelated", "renewal", "same-root-history"] as const)
+  it.each((["empty", "none", "unrelated", "renewal", "same-root-history"] as const)
     .flatMap(change => Array.from({ length: 5 }, (_, run) => [change, run + 1] as const)))(
-    "lease effects between planning and commit, %s, run %s: no topology scan under the write lock", async (change, run) => {
+    "lease effects between planning and commit, %s, run %s: no topology scan; validate only consulted leases", async (change, run) => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-plan-ordering-"));
     roots.push(root);
     const hub = new MeshStore(root, 65536, 1000, { stateBackend: "sqlite" });
     stores.push(hub);
     const now = Date.now();
     const identity = { id: "session:plan-source", name: "source", kind: "main" as const };
-    const presence: Pick<BridgePresence, "hosts" | "participants"> = {
+    const presence: Pick<BridgePresence, "hosts" | "participants"> = change === "empty" ? { hosts: [], participants: [] } : {
       hosts: [{ record: { format: 1, id: identity.id, rootId: identity.id, identity,
         startedAt: now, updatedAt: now, expiresAt: now + 120000, incarnationToken: "source-A" }, expiresAt: now + 120000 }],
       participants: [],
@@ -45,7 +46,7 @@ describe("bridge mirror plan ordering", () => {
     type All = (this: { sourceSQL: string }, ...args: unknown[]) => unknown[];
     const statementProto = sqlite.StatementSync.prototype as unknown as { all: All };
     const all = statementProto.all;
-    let writes = 0, scans = 0, batches = 0, holdMs = 0;
+    let writes = 0, scans = 0, leaseScans = 0, batches = 0, holdMs = 0, leaseScanMs = 0;
     const open = new WeakMap<object, number>();
     vi.spyOn(sqlite.DatabaseSync.prototype, "exec").mockImplementation(function (this: InstanceType<typeof sqlite.DatabaseSync>, sql: string) {
       const result = exec.call(this, sql);
@@ -63,12 +64,19 @@ describe("bridge mirror plan ordering", () => {
           /^topology\/(hosts|participants|handoffs)\//.test(args[0])) scans += 1;
       return all.apply(this, args);
     });
+    const readLeases = hostLeases.readHostLeases;
+    vi.spyOn(hostLeases, "readHostLeases").mockImplementation((...args) => {
+      const started = performance.now();
+      const result = readLeases(...args);
+      if (writes > 0) { leaseScans += 1; leaseScanMs += performance.now() - started; }
+      return result;
+    });
     const writeBatch = hub.writeBatch.bind(hub);
     vi.spyOn(hub, "writeBatch").mockImplementation(input => {
       batches += 1;
       // Another bridge's post-commit lease effect runs after this plan, before it
       // acquires the shared hub's writer. Two such effects exhaust the old early path.
-      if (change !== "none" && batches <= 2) {
+      if (change !== "none" && change !== "empty" && batches <= 2) {
         const id = change === "renewal" ? identity.id : `session:other-link-${batches}`;
         writeHostLease(root, { id, rootId: change === "same-root-history" || change === "renewal" ? identity.id : id,
           identityId: id, startedAt: now, updatedAt: now + batches, expiresAt: now + 120000 + batches,
@@ -84,10 +92,12 @@ describe("bridge mirror plan ordering", () => {
       expect(hub.listAll("", { fresh: true })).toEqual(before);
     } else {
       await side.mirror(presence);
-      expect(side.holds(identity.id, identity)).toBe(true);
+      expect(side.holds(identity.id, identity)).toBe(change !== "empty");
     }
-    console.log(JSON.stringify({ change, run, batches, inFenceScans: scans, holdMs: +holdMs.toFixed(3) }));
+    console.log(JSON.stringify({ change, run, batches, inFenceTopologyScans: scans, consultedLeaseScans: leaseScans,
+      leaseScanMs: +leaseScanMs.toFixed(3), holdMs: +holdMs.toFixed(3) }));
     expect(scans).toBe(0);
+    expect(leaseScans).toBe(change === "empty" ? 0 : 1);
     expect(batches).toBe(1);
   });
 });

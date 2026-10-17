@@ -1152,8 +1152,12 @@ describe("mesh bridge", () => {
     await bridge.stop();
     expect(logs.filter((line) => line.includes("retrying"))).toHaveLength(1);
   });
-  it("mirrors each side's live roots into the other, marked remoteHost, and withdraws them on stop", async () => {
+  it("mirrors each side's live roots and lets stopped mirrors expire by lease TTL", async () => {
+    let now = Date.now();
+    vi.spyOn(Date, "now").mockImplementation(() => now);
     const { hub, far, bridge } = setup();
+    const hubAuthority = new StoreBridgeSide(hub, "forge", () => now);
+    const farAuthority = new StoreBridgeSide(far, "dev1", () => now);
     const lane = await addRoot(hub, "lane");
     const forgeRoot = await addRoot(far, "forge-main");
     await bridge.start();
@@ -1170,22 +1174,35 @@ describe("mesh bridge", () => {
     // A mirror is never mirrored back (no loops).
     await bridge.step();
     expect(far.get(`topology/hosts/${hash(forgeRoot.hostId)}`)!.value).not.toHaveProperty("remoteHost");
+    const beforeStop = { hubHost: hub.get(`topology/hosts/${hash(forgeRoot.hostId)}`),
+      hubParticipant: hub.get(`topology/participants/${hash(forgeRoot.identity.id)}`),
+      hubLease: readHostLeases(hub.root).get(forgeRoot.hostId),
+      farHost: far.get(`topology/hosts/${hash(lane.identity.id)}`),
+      farParticipant: far.get(`topology/participants/${hash(lane.identity.id)}`),
+      farLease: readHostLeases(far.root).get(lane.identity.id) };
 
     await bridge.stop();
-    expect(hub.get(`topology/hosts/${hash(forgeRoot.hostId)}`)).toBeUndefined();
-    expect(hub.get(`topology/participants/${hash(forgeRoot.identity.id)}`)).toBeUndefined();
-    expect(readHostLeases(hub.root).has(forgeRoot.hostId)).toBe(false);
-    expect(far.get(`topology/participants/${hash(lane.identity.id)}`)).toBeUndefined();
+    expect(hub.get(`topology/hosts/${hash(forgeRoot.hostId)}`)).toEqual(beforeStop.hubHost);
+    expect(hub.get(`topology/participants/${hash(forgeRoot.identity.id)}`)).toEqual(beforeStop.hubParticipant);
+    expect(readHostLeases(hub.root).get(forgeRoot.hostId)).toEqual(beforeStop.hubLease);
+    expect(far.get(`topology/hosts/${hash(lane.identity.id)}`)).toEqual(beforeStop.farHost);
+    expect(far.get(`topology/participants/${hash(lane.identity.id)}`)).toEqual(beforeStop.farParticipant);
+    expect(readHostLeases(far.root).get(lane.identity.id)).toEqual(beforeStop.farLease);
 
-    // A restarted bridge mirrors again over the deleted keys' tombstones.
+    // Restart can renew the retained projection before its lease expires.
     const again = new MeshBridge({
       localName: "dev1", remoteName: "forge", presenceMs: 0, cursorPath: path.join(scratch(), "c.json"),
-      local: new StoreBridgeSide(hub, "forge"), remote: new StoreBridgeSide(far, "dev1"),
+      local: new StoreBridgeSide(hub, "forge", () => now), remote: new StoreBridgeSide(far, "dev1", () => now),
     });
     await again.step();
     expect(hub.get(`topology/hosts/${hash(forgeRoot.hostId)}`)!.value).toMatchObject({ remoteHost: "forge" });
     expect(hub.get(`topology/participants/${hash(forgeRoot.identity.id)}`)!.value).toMatchObject({ remoteHost: "forge" });
     expect(far.get(`topology/participants/${hash(lane.identity.id)}`)!.value).toMatchObject({ remoteHost: "dev1" });
+
+    const expireAt = Math.max(beforeStop.hubLease!.expiresAt, beforeStop.farLease!.expiresAt) + 1;
+    now = expireAt;
+    expect(await hubAuthority.owned()).toEqual({ hosts: [], participants: [] });
+    expect(await farAuthority.owned()).toEqual({ hosts: [], participants: [] });
   });
 
   it("drops a remote root whose lease lapsed, and never replaces a native record", async () => {
@@ -1510,24 +1527,35 @@ describe("mesh bridge", () => {
   });
 
   // Security review F3: a silent remote cannot hold a stop or the loop.
-  it("stops within a bound and withdraws local mirrors when the remote stops answering", async () => {
+  it("stops within a bound without withdrawing mirrors when the remote stops answering", async () => {
+    let now = Date.now();
+    vi.spyOn(Date, "now").mockImplementation(() => now);
     const { hub, far, bridge, gate, remote } = setup(undefined, { callTimeoutMs: 60_000, stopMs: 300 });
+    const local = new StoreBridgeSide(hub, "forge", () => now);
     const forgeRoot = await addRoot(far, "forge-main");
     await bridge.start();
     await bridge.step();
-    expect(hub.get(`topology/participants/${hash(forgeRoot.identity.id)}`)).toBeDefined();
+    const hostKey = `topology/hosts/${hash(forgeRoot.hostId)}`;
+    const participantKey = `topology/participants/${hash(forgeRoot.identity.id)}`;
+    const leaseBefore = readHostLeases(hub.root).get(forgeRoot.hostId);
+    expect(leaseBefore).toBeDefined();
+    expect(hub.get(participantKey)).toBeDefined();
     gate.silent = true;
     const pass = bridge.step().catch((error: Error) => error);
     await new Promise((resolve) => setTimeout(resolve, 50));
     const started = Date.now();
     await bridge.stop();
     expect(Date.now() - started).toBeLessThan(2_000);
-    expect(hub.get(`topology/participants/${hash(forgeRoot.identity.id)}`)).toBeUndefined();
-    expect(hub.get(`topology/hosts/${hash(forgeRoot.hostId)}`)).toBeUndefined();
+    expect(hub.get(participantKey)).toBeDefined();
+    expect(hub.get(hostKey)).toBeDefined();
     await pass;
     await expect(remote.latestSequence()).rejects.toThrow(/stopped|closed/);
-    // The pass in flight did not put the mirror back.
-    expect(hub.get(`topology/participants/${hash(forgeRoot.identity.id)}`)).toBeUndefined();
+    // The pass in flight did not put the mirror back or withdraw it.
+    expect(hub.get(participantKey)).toBeDefined();
+    expect(hub.get(hostKey)).toBeDefined();
+    expect(readHostLeases(hub.root).get(forgeRoot.hostId)).toEqual(leaseBefore);
+    now = leaseBefore!.expiresAt + 1;
+    expect(await local.owned()).toEqual({ hosts: [], participants: [] });
   });
 
   it("closes the transport when a call passes its deadline", async () => {

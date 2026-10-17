@@ -28,5 +28,9 @@ try {
   process.stdout.write(text);
 } catch (error) {
   const code = error instanceof SnapshotError ? error.code : "COLLECTION_FAILED";
-  process.stderr.write(`${JSON.stringify({ error: code })}\n`); process.exitCode = 1;
+  const diagnostic = { error: code };
+  if (error instanceof SnapshotError && code === "UNSUPPORTED_ID" && error.field !== undefined) {
+    diagnostic.field = error.field; diagnostic.recordKind = error.recordKind; diagnostic.shape = error.shape;
+  }
+  process.stderr.write(`${JSON.stringify(diagnostic)}\n`); process.exitCode = 1;
 }

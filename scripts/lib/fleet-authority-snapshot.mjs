@@ -8,8 +8,28 @@ const MAX_RECORD = 256 * 1024;
 const MAX_ROWS = 10_000;
 const OMIT = Symbol("omit");
 const H = "hash", I = "identity", P = "peer", N = "integer", B = "boolean", SID = "session", A = "alias";
-const ID_PATTERN = /^(?:(?:session|host|agent|actor|provider):[A-Za-z0-9-]{8,128}|resident:[0-9a-f]{24}|runtime:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[0-9a-f]{8,64}(?:-[0-9a-f-]{8,64})?)$/;
-const SESSION_PATTERN = /^[A-Za-z0-9-]{8,128}$/;
+const UUID = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
+// Runtime IDs: fabric-runtime-state.ts; resident IDs: residency/protocol.ts;
+// actor/agent IDs: actors/manager.ts and agents/manager.ts (UUID without dashes).
+// These two named CI roots alone come from tests/residency.test.ts rootHarness;
+// do not generalize its arbitrary `name` argument into an authority allowlist.
+const CI_ROOT = "(?:actor-outbox-exact-owner|actor-mailbox-exact-owner)";
+// participant: is a UI entityId only; the release owner's shape-only readback found no persisted authority IDs, so reject it.
+const ID_SHAPES = [
+  ["session:<uuid>", new RegExp(`^session:${UUID}$`, "i")],
+  ["<32hex>", /^[0-9a-f]{32}$/],
+  ["resident:<24hex>", /^resident:[0-9a-f]{24}$/],
+  ["runtime:<uuid>", new RegExp(`^runtime:${UUID}$`, "i")],
+  ["session:<exact-owner-ci>:<hex>", new RegExp(`^session:${CI_ROOT}:[0-9a-f]{1,13}$`)],
+];
+const SESSION_PATTERN = new RegExp(`^(?:${UUID}|${CI_ROOT})$`, "i");
+const SAFE_SHAPES = new Set([...ID_SHAPES.map(([shape]) => shape), "session:other", "resident:other", "runtime:other", "participant:other", "actor:other", "agent:other", "length:0", "length:1-32", "length:33-64", "length:65-128", "length:129-256", "length:over-256", "non-string"]);
+function idShape(value) {
+  if (typeof value !== "string") return "non-string";
+  const known = ID_SHAPES.find(([, pattern]) => pattern.test(value)); if (known) return known[0];
+  for (const prefix of ["session", "resident", "runtime", "participant", "actor", "agent"]) if (value.startsWith(`${prefix}:`)) return `${prefix}:other`;
+  const size = value.length; return size === 0 ? "length:0" : size <= 32 ? "length:1-32" : size <= 64 ? "length:33-64" : size <= 128 ? "length:65-128" : size <= 256 ? "length:129-256" : "length:over-256";
+}
 const PEER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$/;
 const enumOf = (...values) => ({ enum: values });
 const obj = (fields, required = []) => ({ fields, required });
@@ -58,10 +78,25 @@ export const tokenHash = raw => {
   if (typeof raw !== "string" || !raw || Buffer.byteLength(raw) > 256 || /[\u0000-\u001f\u007f-\u009f\ud800-\udfff]/u.test(raw)) fail("INVALID_SCALAR");
   return `h:${digest(raw).slice(0, 32)}`;
 };
-export class SnapshotError extends Error {
-  constructor(code) { super(code); this.name = "SnapshotError"; this.code = code; }
+// Derive diagnostic paths solely from the fixed projection, never an input key.
+const ID_FIELDS = new Map();
+for (const [kind, spec, root] of [["host", host, "entry.value"], ["participant", participant, "entry.value"], ["handoff", handoff, "entry.value"], ["policy", policy, "entry.value"], ["lease", lease, "lease"], ["cursor", cursor, "cursor"]]) {
+  const fields = new Set();
+  const visit = (node, field) => {
+    if (node === I || node === SID) fields.add(field);
+    if (node?.fields) for (const [key, child] of Object.entries(node.fields)) visit(child, `${field}.${key}`);
+  };
+  visit(spec, root); if (root === "entry.value") visit(identity, "entry.updatedBy"); ID_FIELDS.set(kind, fields);
 }
-const fail = code => { throw new SnapshotError(code); };
+export class SnapshotError extends Error {
+  constructor(code, details) {
+    super(code); this.name = "SnapshotError"; this.code = code;
+    if (code === "UNSUPPORTED_ID" && ID_FIELDS.get(details?.recordKind)?.has(details?.field) && SAFE_SHAPES.has(details?.shape)) {
+      this.field = details.field; this.recordKind = details.recordKind; this.shape = details.shape;
+    }
+  }
+}
+const fail = (code, details) => { throw new SnapshotError(code, details); };
 const safeInteger = value => Number.isSafeInteger(value) && value >= 0;
 function context() {
   const hashes = new Map(), rawIdentities = new Map(), fields = new Map(), aliases = new Map(), aliasRefs = [];
@@ -90,7 +125,7 @@ function context() {
 // Structural JSON reader: discarded values are validated lexically but never materialized.
 // In particular FILE entries outside the fixed authority key ranges never reach JSON.parse.
 class Reader {
-  constructor(text, ctx) { this.text = text; this.at = 0; this.ctx = ctx; }
+  constructor(text, ctx, recordKind) { this.text = text; this.at = 0; this.ctx = ctx; this.recordKind = recordKind; }
   ws() { while (/[\x20\t\r\n]/.test(this.text[this.at] ?? "!")) this.at++; }
   char(c) { this.ws(); if (this.text[this.at++] !== c) fail("INVALID_JSON"); }
   string(materialize = true) {
@@ -181,11 +216,14 @@ class Reader {
     let value = this.scalar();
     if (spec === N && !safeInteger(value) || spec === B && typeof value !== "boolean" || spec?.enum && !spec.enum.includes(value)) fail("INVALID_SCALAR");
     if ([H, I, SID, P, A].includes(spec)) {
+      // Diagnose IDs before generic scalar validation, without retaining their raw value.
+      if (spec === I && (typeof value !== "string" || !ID_SHAPES.some(([, pattern]) => pattern.test(value))) || spec === SID && (typeof value !== "string" || !SESSION_PATTERN.test(value))) {
+        fail("UNSUPPORTED_ID", { field, recordKind: this.recordKind, shape: idShape(value) });
+      }
       // Validate every free string before retaining it or deriving a safe alias.
       const hashed = this.ctx.hash(value).slice(2);
       if (spec === H) value = `h:${hashed}`;
-      if (spec === I) { if (!ID_PATTERN.test(value)) fail("UNSUPPORTED_ID"); this.ctx.rawIdentities.set(value, value); }
-      if (spec === SID && !SESSION_PATTERN.test(value)) fail("UNSUPPORTED_ID");
+      if (spec === I) this.ctx.rawIdentities.set(value, value);
       if (spec === P && !PEER_PATTERN.test(value)) fail("INVALID_SCALAR");
       if (spec === A) { const raw = value; value = `n:${hashed}`; this.ctx.aliases.set(value, raw); }
     }
@@ -195,15 +233,16 @@ class Reader {
   done() { this.ws(); if (this.at !== this.text.length) fail("INVALID_JSON"); }
 }
 function classify(key) {
-  if (key === "topology/liveness") return { prefix: key, spec: policy, label: "policy" };
+  if (key === "topology/liveness") return { prefix: key, spec: policy, label: "policy", recordKind: "policy" };
   for (const [prefix, spec] of Object.entries(prefixes)) if (key.startsWith(prefix)) {
     if (!/^[0-9a-f]{64}$/.test(key.slice(prefix.length))) fail("INVALID_KEY");
-    return { prefix, spec, label: prefix.split("/")[1] };
+    return { prefix, spec, label: prefix.split("/")[1], recordKind: spec === host ? "host" : spec === participant ? "participant" : "handoff" };
   }
   return undefined;
 }
 function projectEntry(reader, sourceKey, file = false) {
   const type = classify(sourceKey); if (!type) fail("INVALID_KEY");
+  reader.recordKind = type.recordKind;
   let rawKey;
   const schema = obj({ ...(file ? { format: one } : {}), key: "key", value: type.spec, updatedAt: N, version: N, updatedBy: identity },
     ["key", "value", "updatedAt", "version", "updatedBy", ...(file ? ["format"] : [])]);
@@ -218,8 +257,8 @@ function projectEntry(reader, sourceKey, file = false) {
   if (file) reader.ctx.discardIncluded("entry.format");
   delete entry.format; return entry;
 }
-function projectText(text, spec, label, ctx) {
-  const reader = new Reader(text, ctx), value = reader.project(spec, label); reader.done(); return value;
+function projectText(text, spec, label, ctx, recordKind) {
+  const reader = new Reader(text, ctx, recordKind), value = reader.project(spec, label); reader.done(); return value;
 }
 function fingerprint(stat) { return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`; }
 function regular(file, limit) {
@@ -322,7 +361,7 @@ function sqliteEntries(root, ctx) {
     if (rows.length > MAX_ROWS) fail("LIMIT_EXCEEDED");
     const entries = rows.map(row => {
       if (typeof row.key !== "string" || typeof row.value !== "string" || typeof row.updated_by !== "string" || Buffer.byteLength(row.value) > MAX_RECORD || Buffer.byteLength(row.updated_by) > MAX_RECORD || !safeInteger(row.version) || !safeInteger(row.updated_at)) fail("INVALID_SQLITE_ROW");
-      const type = classify(row.key), value = projectText(row.value, type.spec, "entry.value", ctx), updatedBy = projectText(row.updated_by, identity, "entry.updatedBy", ctx);
+      const type = classify(row.key), value = projectText(row.value, type.spec, "entry.value", ctx, type.recordKind), updatedBy = projectText(row.updated_by, identity, "entry.updatedBy", ctx, type.recordKind);
       let key = row.key;
       if (type.spec !== policy) { const rawId = ctx.rawIdentities.get(value.id); if (!rawId || key !== type.prefix + digest(rawId)) fail("KEY_ID_MISMATCH"); key = type.prefix + digest(value.id); }
       ctx.count("entry.key", true); ctx.count("entry.version", true); ctx.count("entry.updatedAt", true); ctx.count("entry", true);
@@ -355,10 +394,10 @@ export async function collectAuthoritySnapshot(options) {
       const entry = projectEntry(reader, key, true); reader.done(); return entry;
     });
     const leaseFiles = leasePaths.map(file => {
-      const projected = projectText(regular(file, MAX_RECORD), lease, "lease", ctx), rawId = ctx.rawIdentities.get(projected.id);
+      const projected = projectText(regular(file, MAX_RECORD), lease, "lease", ctx, "lease"), rawId = ctx.rawIdentities.get(projected.id);
       if (!rawId || path.basename(file) !== `${digest(rawId).slice(0, 32)}.json`) fail("KEY_ID_MISMATCH"); return projected;
     });
-    const projectedCursors = cursors.map((file, index) => ({ index, ...projectText(regular(file, MAX_RECORD), cursor, "cursor", ctx) }));
+    const projectedCursors = cursors.map((file, index) => ({ index, ...projectText(regular(file, MAX_RECORD), cursor, "cursor", ctx, "cursor") }));
     const afterPaths = [...directoryFiles(root, "participants", /^[0-9a-f]{64}\.json$/), ...directoryFiles(root, "host-leases", /^[0-9a-f]{32}\.json$/), ...cursors];
     if (files.join("\0") !== afterPaths.join("\0") || before !== sourceStamp(afterPaths) || stateBefore !== undefined && stateBefore !== fingerprint(fs.lstatSync(statePath, { bigint: true }))) fail("SOURCE_CHANGED");
     ctx.resolveAliases();

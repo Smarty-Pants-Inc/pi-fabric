@@ -143,6 +143,83 @@ describe("fleet authority snapshot privacy and real backend boundaries", () => {
     fs.writeFileSync(path.join(f.mesh, "state.json"), JSON.stringify({ format: 1, entries }));
     const result = await collect(options(f)); expect(result.stateEntries.map((row: any) => row.value.id).sort()).toEqual(ids.sort()); expect(result.stateEntries.every((row: any) => row.value.rootId === ROOT)).toBe(true);
   });
+  it.each([
+    ID, `session:018f1234-5678-7abc-8def-0123456789ab`, "a".repeat(32),
+    `resident:${"a".repeat(24)}`, `runtime:${ID.slice(8)}`,
+    "session:actor-outbox-exact-owner:abcdef1234567", "session:actor-mailbox-exact-owner:a",
+  ])("retains only the explicit source-traced ID shape (%s)", async id => {
+    const f = fixture(), k = key("hosts", id), value = { ...host(), id };
+    fs.writeFileSync(path.join(f.mesh, "state.json"), JSON.stringify({ format: 1, entries: { [k]: { ...envelope("hosts", value), key: k } } }));
+    const snapshot = await collect(options(f)); expect(snapshot.stateEntries[0].value.id).toBe(id);
+    expect(snapshot.stateEntries[0].key).toBe(k);
+  });
+  it.each(["actor-outbox-exact-owner", "actor-mailbox-exact-owner", "018f1234-5678-7abc-8def-0123456789ab"])("accepts the explicit sessionId shape (%s)", async sessionId => {
+    const f = fixture(), value = host(); value.identity.sessionId = sessionId;
+    fs.writeFileSync(path.join(f.mesh, "state.json"), JSON.stringify({ format: 1, entries: { [key("hosts")]: envelope("hosts", value) } }));
+    expect((await collect(options(f))).stateEntries[0].value.identity.sessionId).toBe(sessionId);
+  });
+  it.each([
+    ["freeform-not-an-id", "length:1-32"], ["/private/path/secret", "length:1-32"],
+    [SECRET, "length:33-64"], [`private-prefix:${TOKEN}`, "length:33-64"],
+    ["session:arbitrary-ci-name:abcdef", "session:other"], ["session:actor-outbox-exact-owner:abcdef12345678", "session:other"],
+    ["session:actor-mailbox-exact-owner:../../private", "session:other"],
+    ["resident:private-body", "resident:other"], ["participant:private-body", "participant:other"],
+    ["runtime:private-body", "runtime:other"], ["actor:private-body", "actor:other"], ["agent:private-body", "agent:other"],
+    ["a".repeat(8), "length:1-32"], ["a".repeat(64), "length:33-64"],
+    ["a".repeat(129), "length:129-256"], ["a".repeat(257), "length:over-256"],
+    ["", "length:0"], [123, "non-string"], [null, "non-string"],
+  ])("rejects unsupported IDs with fixed redacted diagnostics (%s)", async (id, shape) => {
+    const f = fixture(), value: any = host(); value.rootId = id; value[`secret-input-key-${TOKEN}`] = SECRET;
+    fs.writeFileSync(path.join(f.mesh, "state.json"), JSON.stringify({ format: 1, entries: { [key("hosts")]: envelope("hosts", value) } }));
+    await expect(collect(options(f))).rejects.toMatchObject({ code: "UNSUPPORTED_ID", field: "entry.value.rootId", recordKind: "host", shape });
+    const result = run(f); expect(result.status).toBe(1); expect(result.stdout).toBe("");
+    expect(JSON.parse(result.stderr)).toEqual({ error: "UNSUPPORTED_ID", field: "entry.value.rootId", recordKind: "host", shape });
+    expect(result.stderr).toBe(`${JSON.stringify(JSON.parse(result.stderr))}\n`);
+    expect(result.stderr).not.toContain(TOKEN); expect(result.stderr).not.toContain(SECRET);
+    expect(fs.existsSync(path.join(f.out, "snapshot.json"))).toBe(false);
+  });
+  it.each(["file", "sqlite"])("reports full nested fixed schema labels for %s", async backend => {
+    const f = fixture(), value: any = host(); value.identity.sessionId = `unknown-prefix:${TOKEN}`;
+    f.entries[key("hosts")] = envelope("hosts", value);
+    let db: DatabaseSync | undefined;
+    if (backend === "sqlite") db = sqlite(f); else fs.writeFileSync(path.join(f.mesh, "state.json"), JSON.stringify({ format: 1, entries: f.entries }));
+    try {
+      const result = run(f, backend === "sqlite" ? "hub" : "work");
+      expect(result.status).toBe(1); expect(result.stdout).toBe("");
+      expect(JSON.parse(result.stderr)).toEqual({ error: "UNSUPPORTED_ID", field: "entry.value.identity.sessionId", recordKind: "host", shape: "length:33-64" });
+      expect(fs.existsSync(path.join(f.out, "snapshot.json"))).toBe(false);
+    } finally { db?.close(); }
+  });
+  it.each(["participant", "lease", "updatedBy"])("keeps the record kind and fixed field for %s ID failures", async target => {
+    const f = fixture(); let field: string, recordKind: string;
+    if (target === "participant") {
+      const file = path.join(f.mesh, "participants", `${hash(ID)}.json`), value: any = participant(); value.ownerHostId = SECRET;
+      fs.writeFileSync(file, JSON.stringify({ format: 1, ...envelope("participants", value) })); field = "entry.value.ownerHostId"; recordKind = "participant";
+    } else if (target === "lease") {
+      const value: any = lease(); value.session.id = SECRET;
+      fs.writeFileSync(path.join(f.mesh, "host-leases", `${hash(ID).slice(0, 32)}.json`), JSON.stringify(value)); field = "lease.session.id"; recordKind = "lease";
+    } else {
+      const entry = envelope("hosts", host()); entry.updatedBy.id = SECRET;
+      fs.writeFileSync(path.join(f.mesh, "state.json"), JSON.stringify({ format: 1, entries: { [key("hosts")]: entry } })); field = "entry.updatedBy.id"; recordKind = "host";
+    }
+    const result = run(f); expect(result.status).toBe(1); expect(result.stdout).toBe("");
+    expect(JSON.parse(result.stderr)).toEqual({ error: "UNSUPPORTED_ID", field, recordKind, shape: "length:33-64" });
+    expect(fs.existsSync(path.join(f.out, "snapshot.json"))).toBe(false);
+  });
+  it("suppresses native error paths and refuses untrusted diagnostic metadata", async () => {
+    const f = fixture(); fs.unlinkSync(path.join(f.mesh, "state.json"));
+    const result = run(f); expect(result.status).toBe(1); expect(result.stdout).toBe(""); expect(result.stderr).toBe('{"error":"COLLECTION_FAILED"}\n');
+    expect(fs.existsSync(path.join(f.out, "snapshot.json"))).toBe(false);
+    const { SnapshotError } = await import(pathToFileURL(libraryPath).href);
+    for (const details of [
+      { field: SECRET, recordKind: "host", shape: "length:1-32" },
+      { field: "entry.value.id", recordKind: SECRET, shape: "length:1-32" },
+      { field: "entry.value.id", recordKind: "host", shape: SECRET },
+    ]) {
+      const error = new SnapshotError("UNSUPPORTED_ID", details);
+      expect(error.field).toBeUndefined(); expect(error.recordKind).toBeUndefined(); expect(error.shape).toBeUndefined(); expect(JSON.stringify(error)).not.toContain(SECRET);
+    }
+  });
   it("fails closed on a forced truncated digest collision without emitting either raw value", async () => {
     const f = fixture(), original = crypto.createHash;
     try {

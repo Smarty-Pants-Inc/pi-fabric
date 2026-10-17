@@ -88,8 +88,8 @@ vi.mock("../src/mesh/store.js", async importOriginal => {
     put = vi.fn(async (input: Put) => {
       const value = input.value as Record<string, unknown>;
       const local = this.root.includes("control-seen");
-      const stage = local ? (value.acceptance ? "outcome" : "local-claim") :
-        value.acceptance ? "expired-claim" : "shared-claim";
+      if (local) expect(value).toHaveProperty("acceptance"); // No private pre-handler claim.
+      const stage = local ? "outcome" : value.acceptance ? "expired-claim" : "shared-claim";
       attempt(stage);
       const prior = this.state.entries.get(input.key);
       if (input.ifVersion !== undefined && input.ifVersion !== (prior?.version ?? 0)) throw new Error("recorded version conflict");
@@ -206,7 +206,7 @@ it.each(errors)("file-copy %s unwinds deferred publication, but keeps single-key
 });
 
 const controlErrors = errors.filter(([name]) => name !== "legacy");
-const controlCases = ["shared-claim", "local-claim", "outcome", "ack", "expired-claim"] as const;
+const controlCases = ["shared-claim", "outcome", "ack", "expired-claim"] as const;
 it.each(controlCases.flatMap(stage => controlErrors.map(([name, makeError]) => ({ stage, name, makeError }))))(
   "control $stage retains $name work and retries without re-executing a completed handler", async ({ stage, name, makeError }) => {
     const mesh = new RecordedStore(root, 65_536, 100);
@@ -225,6 +225,11 @@ it.each(controlCases.flatMap(stage => controlErrors.map(([name, makeError]) => (
     plane.start(handler); // only recorded store/watch ports, never a process/service start
     await vi.advanceTimersByTimeAsync(0);
     const acks = () => state.events.filter(event => event.topic === "fabric.control.ack");
+    if (stage === "outcome") {
+      const seen = [...io.stores.entries()].find(([store]) => store.includes("control-seen"))![1];
+      expect([...seen.entries.values()]).toEqual([]);
+      expect(acks()).toEqual([]); // Completed in memory is not a durable acceptance.
+    }
     if (name !== "permanent") {
       expect(acks()).toEqual([]);
       expect(handler).toHaveBeenCalledTimes(stage === "outcome" || stage === "ack" ? 1 : 0);
@@ -240,8 +245,8 @@ it.each(controlCases.flatMap(stage => controlErrors.map(([name, makeError]) => (
       await vi.advanceTimersByTimeAsync(20);
       expect(io.calls.filter(call => call === stage)).toHaveLength(1);
       expect(handler).toHaveBeenCalledTimes(stage === "outcome" || stage === "ack" ? 1 : 0);
-      expect(acks()).toHaveLength(stage === "expired-claim" || stage === "local-claim" ? 1 : 0);
-      if (stage === "expired-claim" || stage === "local-claim") expect(acks()[0]!.data).toMatchObject({ accepted: false });
+      expect(acks()).toHaveLength(stage === "expired-claim" ? 1 : 0);
+      if (stage === "expired-claim") expect(acks()[0]!.data).toMatchObject({ accepted: false });
     }
     plane.pause();
   });
@@ -260,6 +265,33 @@ function ackPlane() {
   const acks = () => state.events.filter(event => event.topic === "fabric.control.ack").map(event => event.data);
   return { mesh, plane, send, acks };
 }
+
+it("orders shared claim, completed handler, and durable private acceptance before accepted ACK, without a private preclaim", async () => {
+  const { mesh, plane, send, acks } = ackPlane();
+  const seen = [...io.stores.entries()].find(([store]) => store.includes("control-seen"))![1];
+  const acceptance = { accepted: true, messageId: "ordered-result" };
+  const publish = vi.mocked(mesh.publish).getMockImplementation()!;
+  vi.mocked(mesh.publish).mockImplementation(async input => {
+    if (input.topic === "fabric.control.ack") {
+      expect(io.calls).toEqual(["shared-claim", "handler-completed", "outcome"]);
+      expect([...seen.entries.values()]).toEqual([expect.objectContaining({ version: 1,
+        value: expect.objectContaining({ acceptance }) })]);
+    }
+    return publish(input);
+  });
+  send("ordered");
+  const handler = vi.fn(() => {
+    expect(io.calls).toEqual(["shared-claim"]);
+    expect([...seen.entries.values()]).toEqual([]);
+    io.calls.push("handler-completed");
+    return acceptance;
+  });
+  plane.start(handler); await vi.advanceTimersByTimeAsync(0);
+  plane.pause();
+  expect(handler).toHaveBeenCalledOnce();
+  expect(io.calls).toEqual(["shared-claim", "handler-completed", "outcome", "ack"]);
+  expect(acks()).toEqual([expect.objectContaining({ commandId: "ordered", ...acceptance })]);
+});
 
 // A generic ACK failure is indeterminate: here the recorded event commits and then the call
 // throws, so even the readback would pass. Known no-write refusals are recoverable.

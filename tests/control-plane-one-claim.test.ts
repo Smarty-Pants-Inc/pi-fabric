@@ -1,12 +1,13 @@
-// Keep reason: PR #58 / smarty-dev#643 is an exactly-once and private-outcome boundary.
+// Keep reason: PR #58 / smarty-dev#643 data safety: at-most-once execution and private outcomes.
 // Competing real file readers forward their actual CAS to real file/SQLite state stores.
+// Restart cases model abrupt stops by fencing/closing objects, not by killing an OS process.
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MeshStore, type MeshEvent, type MeshIdentity } from "../src/mesh/store.js";
-import { assertMeshConsumption } from "../src/topology/mesh-consumption.js";
+import { assertMeshConsumption, MeshConsumptionPausedError } from "../src/topology/mesh-consumption.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
 
 const ownerId = "host:one-claim";
@@ -28,12 +29,12 @@ const setup = (backend: "file" | "sqlite", fenced: boolean) => {
   const mesh = new MeshStore(meshRoot, 65_536, 1_000, { stateBackend: backend });
   stores.push(mesh);
   expect(mesh.stateBackend).toBe(backend); // Never label a fallback as a SQLite race.
-  const makeOwner = () => {
+  const makeOwner = (ownerIncarnation = epoch) => {
     const replica = new MeshStore(meshRoot, 65_536, 1_000, { stateBackend: backend });
     stores.push(replica);
     expect(replica.stateBackend).toBe(backend);
     const owner = new FabricControlPlane(replica, identity(ownerId), {
-      enabled: true, hostId: ownerId, ownerIncarnation: epoch, controlIncarnationFence: "enforce",
+      enabled: true, hostId: ownerId, ownerIncarnation, controlIncarnationFence: "enforce",
       pollMs: 20, acknowledgementTimeoutMs: 60_000, ...(fenced ? { canConsumeMesh: () => true } : {}),
     });
     planes.push(owner); return owner;
@@ -41,9 +42,11 @@ const setup = (backend: "file" | "sqlite", fenced: boolean) => {
   const own = new MeshStore(path.join(meshRoot, "control-seen", createHash("sha256").update(ownerId).digest("hex").slice(0, 32)),
     65_536, 1_000, { stateBackend: "file" });
   stores.push(own);
-  const publish = (id: string) => mesh.publish({ topic: "fabric.control.command", kind: "followUp", from: identity("host:sender"), to: ownerId,
+  expect(own.stateBackend).toBe("file");
+  const publish = (id: string, expired = false) => mesh.publish({ topic: "fabric.control.command", kind: "followUp", from: identity("host:sender"), to: ownerId,
     data: { version: 1, commandId: id, targetId: "agent:target", operation: "followUp", replyTo: "host:sender",
-      ownerIncarnation: epoch, message: "PRIVATE-INPUT", requestedAt: Date.now(), deadlineAt: Date.now() + 60_000 } });
+      ownerIncarnation: epoch, message: "PRIVATE-INPUT", requestedAt: Date.now() - (expired ? 100 : 0),
+      deadlineAt: Date.now() + (expired ? -1 : 60_000) } });
   const acks = (id: string) => mesh.read({ topic: "fabric.control.ack", limit: 100 })
     .filter(event => (event.data as { commandId?: string }).commandId === id);
   return { mesh, own, makeOwner, publish, acks };
@@ -222,6 +225,105 @@ describe("one authoritative control claim", () => {
       expect(f.own.get(key("shared-stale"), { fresh: true })).toMatchObject({ version: 1, value: {
         sequence: event.sequence, acceptance: { accepted: true, messageId: "shared-winner" },
       } });
+    });
+  });
+
+  describe.each(["file", "sqlite"] as const)("modeled abrupt-stop/restart (%s shared, file private)", backend => {
+    it.each([false, true])("replays a durable terminal outcome after stopping before ACK (expired=%s)", async expired => {
+      const f = setup(backend, true), owner = f.makeOwner(), release = gate();
+      const commandId = "stopped-before-ack";
+      const completed = { accepted: true, messageId: "completed-once", result: { secret: "PRIVATE-OUTCOME" } };
+      const acceptance = expired ? { accepted: false, error: "Fabric control command expired", notRun: true } : completed;
+      const receive = vi.fn(() => completed);
+      let intercepted = 0;
+      const publish = MeshStore.prototype.publish;
+      // All state writes remain real. Only the old instance's ACK is held before publication.
+      const interception = vi.spyOn(MeshStore.prototype, "publish").mockImplementation(async function (this: MeshStore, input) {
+        if (this.root === f.mesh.root && input.topic === "fabric.control.ack") {
+          intercepted++;
+          owner.pause(); // No retained worker may retry when the interception is released.
+          await release.promise;
+          throw new MeshConsumptionPausedError(); // Known no-write stop, never a committed ACK.
+        }
+        return publish.call(this, input);
+      });
+      try {
+        const event = await f.publish(commandId, expired);
+        owner.start(receive);
+        await until(() => expect(intercepted).toBe(1));
+        expect(receive).toHaveBeenCalledTimes(expired ? 0 : 1);
+        expect(f.acks(commandId)).toEqual([]);
+        const shared = f.mesh.get(key(commandId), { fresh: true });
+        expect(shared).toMatchObject({ version: 1, value: { commandId, ownerIncarnation: epoch } });
+        if (expired) {
+          // C1's expiry outcome is terminal in the shared CAS, not the private store.
+          expect(shared?.value).toMatchObject({ acceptance });
+          expect(f.own.get(key(commandId), { fresh: true })).toBeUndefined();
+        } else {
+          expect(shared?.value).not.toHaveProperty("acceptance");
+          expect(f.own.get(key(commandId), { fresh: true })).toMatchObject({ version: 1, value: {
+            sequence: event.sequence, ownerIncarnation: epoch, acceptance,
+          } });
+        }
+      } finally {
+        // Always release the pending promise before close joins it, including assertion failures.
+        owner.pause(); release.open();
+        await owner.close();
+        interception.mockRestore();
+      }
+      owner.mesh.closeState();
+      expect(intercepted).toBe(1);
+      expect(f.acks(commandId)).toEqual([]); // Old close must not publish the withheld ACK.
+      const restarted = f.makeOwner("epoch:restarted"), freshHandler = vi.fn(() => ({ accepted: true }));
+      restarted.start(freshHandler);
+      await until(() => expect(f.acks(commandId)).toHaveLength(1));
+      restarted.pause(); await restarted.checkpointForRelease();
+      const ack = f.acks(commandId)[0]!;
+      expect(ack.data).toMatchObject({ commandId, targetId: "agent:target", ownerIncarnation: epoch, ...acceptance });
+      if (!expired) expect(ack.data).not.toHaveProperty("notRun");
+      expect(freshHandler).not.toHaveBeenCalled();
+      expect(receive.mock.calls.length + freshHandler.mock.calls.length).toBe(expired ? 0 : 1);
+      expect(f.acks(commandId)).toHaveLength(1);
+    });
+
+    it("replays an incomplete shared-only claim as indeterminate, never accepted/notRun or re-executed", async () => {
+      const f = setup(backend, true), owner = f.makeOwner(), interrupt = gate();
+      const commandId = "incomplete-claim";
+      const effects: string[] = [];
+      const receive = vi.fn(async () => {
+        effects.push("handler-entered-with-possible-effect");
+        await interrupt.promise;
+        // Model loss of an in-flight handler, not a completed refusal or a truthful notRun.
+        throw new MeshConsumptionPausedError();
+      });
+      try {
+        await f.publish(commandId); owner.start(receive);
+        await until(() => expect(receive).toHaveBeenCalledOnce());
+        expect(f.mesh.get(key(commandId), { fresh: true })).toMatchObject({ version: 1, value: {
+          commandId, ownerIncarnation: epoch,
+        } });
+        expect(f.mesh.get(key(commandId), { fresh: true })?.value).not.toHaveProperty("acceptance");
+        expect(f.own.get(key(commandId), { fresh: true })).toBeUndefined();
+        expect(f.acks(commandId)).toEqual([]);
+      } finally {
+        owner.pause(); interrupt.open();
+        await owner.close();
+      }
+      owner.mesh.closeState();
+      expect(f.own.get(key(commandId), { fresh: true })).toBeUndefined();
+      expect(f.acks(commandId)).toEqual([]);
+      const restarted = f.makeOwner("epoch:restarted"), freshHandler = vi.fn(() => ({ accepted: true }));
+      restarted.start(freshHandler);
+      await until(() => expect(f.acks(commandId)).toHaveLength(1));
+      restarted.pause(); await restarted.close();
+      expect(f.acks(commandId)[0]!.data).toMatchObject({ commandId, targetId: "agent:target", ownerIncarnation: epoch,
+        accepted: false, error: "Fabric control outcome is indeterminate after owner restart" });
+      expect(f.acks(commandId)[0]!.data).not.toHaveProperty("notRun");
+      expect(f.acks(commandId)[0]!.data).not.toHaveProperty("messageId");
+      expect(freshHandler).not.toHaveBeenCalled();
+      expect(receive.mock.calls.length + freshHandler.mock.calls.length).toBe(1);
+      expect(effects).toEqual(["handler-entered-with-possible-effect"]);
+      expect(f.own.get(key(commandId), { fresh: true })).toBeUndefined();
     });
   });
 

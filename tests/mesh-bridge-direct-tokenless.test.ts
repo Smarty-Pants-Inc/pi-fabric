@@ -470,17 +470,19 @@ const invalidTimestampCases = ["record.startedAt", "record.updatedAt", "record.e
   [{ label: "NaN", value: NaN }, { label: "null", value: null }, { label: "missing", value: undefined },
     { label: "string", value: String(NOW) }, { label: "Infinity", value: Infinity }, { label: "-Infinity", value: -Infinity },
     { label: "object", value: {} }].filter(({ label }) => field !== "observedAt" || label !== "missing")
-    .map(({ label, value }) => ({ field, label, value }))).concat([
-      { field: "expiresAt", label: "expired", value: NOW - 1 },
-      { field: "expiresAt", label: "at-observation", value: NOW + 20_000 },
-      { field: "observedAt", label: "after-expiry", value: NOW + 120_001 },
-    ]);
+    .map(({ label, value }) => ({ field, label, value })));
+const expiredTimestampCases = [
+  { field: "expiresAt", label: "expired", value: NOW - 1 },
+  { field: "expiresAt", label: "at-observation", value: NOW + 20_000 },
+  { field: "observedAt", label: "after-expiry", value: NOW + 120_001 },
+];
 
 for (const backend of ["file", "sqlite"] as const) {
   for (const direction of ["mirror RPC", "native presence RPC"] as const) {
     describe(`malformed direct timestamps (${backend}, ${direction})`, () => {
-      it.each(invalidTimestampCases.flatMap(sample => [undefined, "B"].map(token => ({ ...sample, token,
-        writer: token ?? "tokenless" }))))("preserves B, participants, lease and A fence for $field=$label ($writer)", async ({ field, value, token }) => {
+      it.each([...invalidTimestampCases.flatMap(sample => [undefined, "B"].map(token => ({ ...sample, token,
+        writer: token ?? "tokenless" }))), ...expiredTimestampCases.map(sample => ({ ...sample, token: undefined,
+        writer: "tokenless" }))])("preserves B, participants, lease and A fence for $field=$label ($writer)", async ({ field, value, token }) => {
         vi.useFakeTimers({ toFake: ["Date"] });
         vi.setSystemTime(NOW);
         const f = ownRootLink(false, backend);
@@ -543,6 +545,49 @@ for (const backend of ["file", "sqlite"] as const) {
         expect(store.get(hostKey(b.host.id), { fresh: true })).toEqual(before.host);
         expect(store.get(participantKey(b.host.id), { fresh: true })).toEqual(before.participant);
         expect(fs.readFileSync(hostLeasePath(store.root, b.host.id))).toEqual(before.lease);
+      });
+
+      it.each(expiredTimestampCases)("same-token real RPC preserves malformed, renews valid, then withdraws $field=$label", async ({ field, value }) => {
+        vi.useFakeTimers({ toFake: ["Date"] });
+        vi.setSystemTime(NOW);
+        const f = ownRootLink(false, backend);
+        const receiver = direction === "mirror RPC" ? f.agent : f.local;
+        const store = direction === "mirror RPC" ? f.work : f.hub;
+        const a = fixture("withdrawal-root", "A", NOW - 2_000, NOW + 5_000);
+        const b = fixture("withdrawal-root", "B", NOW - 1_000, NOW + 5_000);
+        await receiver.mirror(a.presence);
+        await receiver.mirror(b.presence);
+        const before = { host: store.get(hostKey(b.host.id), { fresh: true }),
+          participant: store.get(participantKey(b.host.id), { fresh: true }),
+          lease: fs.readFileSync(hostLeasePath(store.root, b.host.id)) };
+        vi.setSystemTime(NOW + 20_000);
+        const same = fixture("withdrawal-root", "B", b.host.startedAt, NOW + 120_000);
+        same.host.updatedAt = NOW + 20_000;
+        same.participant.name = "valid-same-B";
+        const send = async (outer: { expiresAt: number; observedAt: number }) => {
+          const hosts = [{ record: same.host, ...outer }];
+          if (direction === "mirror RPC") await f.remote.mirror({ hosts, participants: [same.participant] });
+          else {
+            await installNative(f.work, same);
+            vi.spyOn(f.agent, "presence").mockResolvedValueOnce({ hosts, participants: [same.participant], reserved: [] });
+            await f.bridge.syncPresence(); // real native presence reply -> JSON -> hub receiver
+          }
+        };
+        await send({ expiresAt: NaN, observedAt: NOW + 20_000 });
+        expect(store.get(hostKey(b.host.id), { fresh: true })).toEqual(before.host);
+        expect(store.get(participantKey(b.host.id), { fresh: true })).toEqual(before.participant);
+        expect(fs.readFileSync(hostLeasePath(store.root, b.host.id))).toEqual(before.lease);
+        await send({ expiresAt: same.host.expiresAt, observedAt: NOW + 20_000 });
+        expect(store.get(hostKey(b.host.id), { fresh: true })?.value).toMatchObject({ incarnationToken: "B",
+          bridgeSupersededTokens: ["A"], expiresAt: NOW + 20_000 + BRIDGE_LEASE_MS });
+        expect(store.get(participantKey(b.host.id), { fresh: true })?.value).toMatchObject({ name: "valid-same-B" });
+        expect(readHostLease(store.root, b.host.id)).toMatchObject({ incarnationToken: "B", bridgeSupersededTokens: ["A"],
+          expiresAt: NOW + 20_000 + BRIDGE_LEASE_MS });
+        expect(fs.readFileSync(hostLeasePath(store.root, b.host.id))).not.toEqual(before.lease);
+        await send({ expiresAt: same.host.expiresAt, observedAt: NOW + 20_000, [field]: value });
+        expect(store.get(hostKey(b.host.id), { fresh: true })).toBeUndefined();
+        expect(store.get(participantKey(b.host.id), { fresh: true })).toBeUndefined();
+        expect(readHostLease(store.root, b.host.id)).toBeUndefined();
       });
 
       it("still admits coherent legacy tokenless renewal and same B, but withdraws genuinely omitted roots", async () => {

@@ -1343,7 +1343,9 @@ export class StoreBridgeSide implements BridgeSide {
           const sampled = typeof sourceObservedAt === "number" && Number.isFinite(sourceObservedAt);
           if (!Number.isFinite(expiresAt) || expiresAt <= (sampled ? sourceObservedAt : liveAt) ||
             (retained && (!Number.isFinite(record.updatedAt) || (sourceObservedAt !== undefined && !sampled)))) {
-            if (!relayed) skippedRoots.add(record.rootId);
+            // Malformed direct samples were skipped in preflight. A finite expired
+            // explicit owner sample is withdrawal; tokenless liveness cannot withdraw it.
+            if (!relayed && incarnationOf(record).incarnationToken === undefined) skippedRoots.add(record.rootId);
             continue;
           }
           // A sampled origin's remaining life is a SOURCE-clock duration, anchored at liveAt (this
@@ -1355,7 +1357,7 @@ export class StoreBridgeSide implements BridgeSide {
           const until = sampled ? origin
             : Math.min(origin + Math.min(now - liveAt, BRIDGE_LEASE_MS), now + BRIDGE_LEASE_MS);
           if (!sampled && until <= now) {
-            if (!relayed) skippedRoots.add(record.rootId);
+            if (!relayed && incarnationOf(record).incarnationToken === undefined) skippedRoots.add(record.rootId);
             continue;
           }
           const renewedAt = sampled ? record.updatedAt : Math.min(record.updatedAt, now);
@@ -2149,8 +2151,9 @@ const addresses = (presence: Pick<BridgePresence, "hosts" | "participants">): Se
   // Malformed native samples travel only to preserve a receiver's existing root. They
   // must not become new hub routing authority merely by remaining in the snapshot.
   const hosts = presence.hosts.filter(({ record }) => finiteHostTimestamps(record));
-  const owners = new Set(hosts.map(({ record }) => record.id));
-  const participants = presence.participants.filter(participant => owners.has(participant.ownerHostId));
+  const malformedOwners = new Set(presence.hosts.filter(({ record }) => !finiteHostTimestamps(record)).map(({ record }) => record.id));
+  // Trusted adapters can supply participant-only addresses without any host sample.
+  const participants = presence.participants.filter(participant => !malformedOwners.has(participant.ownerHostId));
   const names = remoteAddresses({ hosts, participants });
   for (const participant of participants) {
     for (const alias of [participant.label, participant.sessionId]) if (alias) names.add(alias);

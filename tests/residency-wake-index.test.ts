@@ -67,6 +67,7 @@ describe("append-locked parsed resident routes", () => {
         return Object.assign(Object.create(Object.getPrototypeOf(actual)), actual, stamp(actual));
       }) as never);
     }
+    return routeFds;
   };
 
   // Data safety: the append must retain the latest matching delivery, not a stale route decision.
@@ -150,6 +151,40 @@ describe("append-locked parsed resident routes", () => {
       f.clock.mockReturnValue(now + 60_000);
       f.pending(await f.publish("changed.delivery"));
       expect(f.parses()).toBe(3); // A fresh observation must not seed a later stale cache hit.
+    } finally { f.close(); }
+  });
+
+  it.each(["in-place", "atomic replacement"] as const)("does not seed fresh-at-entry routes after an FD-read %s rewrite ages the clock", async mode => {
+    const f = setup(), now = Date.now(), read = fs.readFileSync;
+    let rewritten = false;
+    const fds = mockRouteMetadata(f.file, stat => typeof stat.ino === "bigint"
+      ? { mtimeNs: BigInt(now) * 1_000_000n, ctimeNs: BigInt(now) * 1_000_000n } : {});
+    vi.spyOn(fs, "readFileSync").mockImplementation((target, ...args) => {
+      const bytes = read(target, ...args);
+      if (typeof target === "number" && fds.has(target) && !rewritten) {
+        expect(bytes).toBe(f.original);
+        expect(fs.existsSync(path.join(f.mesh.root, ".lock"))).toBe(true);
+        expect(Buffer.byteLength(f.changed)).toBe(Buffer.byteLength(f.original));
+        const before = fs.statSync(f.file, { bigint: true });
+        rewritten = true;
+        const next = mode === "in-place" ? f.file : `${f.file}.next`;
+        fs.writeFileSync(next, f.changed);
+        if (mode !== "in-place") fs.renameSync(next, f.file);
+        const after = fs.statSync(f.file, { bigint: true });
+        expect(after.ino === before.ino).toBe(mode === "in-place");
+        expect([after.dev, after.size, after.mtimeNs, after.ctimeNs]).toEqual([before.dev, before.size, before.mtimeNs, before.ctimeNs]);
+        f.clock.mockReturnValue(now + 11);
+      }
+      return bytes;
+    });
+    try {
+      expect((await f.publish("changed.delivery")).sequence).toBe(1);
+      expect(rewritten).toBe(true);
+      expect(fds.size).toBe(0);
+      expect(index.residentUnacknowledgedDeliveries(f.mesh.root).size).toBe(0);
+      const event = await f.publish("changed.delivery");
+      expect(event.sequence).toBe(2); f.pending(event);
+      expect(f.parses()).toBe(2);
     } finally { f.close(); }
   });
 

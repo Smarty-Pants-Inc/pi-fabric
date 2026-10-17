@@ -126,14 +126,15 @@ const wakeRoutesForAppend = (root: string, cache?: Map<string, unknown>): Reside
   if (!cache) return retainedRoutesAt(root);
   const file = path.join(root, "wake-routes.json");
   const stamp = wakeRouteStamp(file);
+  const cacheableBeforeRead = stamp !== undefined && !wakeRouteWasJustWritten(stamp);
   const entry = cache.get(root) as WakeRouteCacheEntry | undefined;
-  if (stamp && entry && entry.cwd === process.cwd() && sameWakeRouteStamp(entry.stamp, stamp) && !wakeRouteWasJustWritten(stamp))
+  if (cacheableBeforeRead && entry && entry.cwd === process.cwd() && sameWakeRouteStamp(entry.stamp, stamp))
     return entry.routes;
   cache.delete(root);
   const routes = retainedRoutesAt(root);
   const postStamp = wakeRouteStamp(file);
   if (stamp && postStamp && routes && sameWakeRouteStamp(stamp, postStamp) &&
-      !wakeRouteWasJustWritten(stamp) && !wakeRouteWasJustWritten(postStamp))
+      cacheableBeforeRead && !wakeRouteWasJustWritten(postStamp))
     cache.set(root, { stamp: postStamp, cwd: process.cwd(), routes });
   return routes;
 };

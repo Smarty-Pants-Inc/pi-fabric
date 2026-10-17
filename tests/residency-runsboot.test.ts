@@ -112,13 +112,13 @@ const observeRuns = (runs: string, ...additionalRoots: string[]) => {
 
 /** Follow the target through pathname and opened-descriptor reads. A
  * readFileSync(path)-only spy misses a bounded open/fstat/readSync receiver. */
-const observeMetadataReads = (file: string, unreadable = false) => {
+const observeMetadataReads = (file: string | ((target: string) => boolean), unreadable = false) => {
   const open = fs.openSync, close = fs.closeSync, readFile = fs.readFileSync;
   const read = fs.readSync, readv = fs.readvSync;
   const descriptors = new Set<number>();
-  const work = { opens: 0, reads: 0, failures: 0 };
+  const work = { opens: 0, reads: 0, pathnameReads: 0, descriptorReads: 0, bytes: 0, failures: 0 };
   const matches = (target: unknown): boolean => typeof target === "number"
-    ? descriptors.has(target) : String(target) === file;
+    ? descriptors.has(target) : typeof file === "string" ? String(target) === file : file(String(target));
   const fail = (): never => {
     work.failures++;
     throw Object.assign(new Error("metadata unreadable"), { code: "EACCES" });
@@ -126,6 +126,8 @@ const observeMetadataReads = (file: string, unreadable = false) => {
   const noteRead = (target: unknown) => {
     if (!matches(target)) return;
     work.reads++;
+    if (typeof target === "number") work.descriptorReads++;
+    else work.pathnameReads++;
     if (unreadable) fail();
   };
   vi.spyOn(fs, "openSync").mockImplementation(((...args: Parameters<typeof fs.openSync>) => {
@@ -144,15 +146,21 @@ const observeMetadataReads = (file: string, unreadable = false) => {
   });
   vi.spyOn(fs, "readFileSync").mockImplementation(((...args: Parameters<typeof fs.readFileSync>) => {
     noteRead(args[0]);
-    return readFile(...args);
+    const value = readFile(...args);
+    if (matches(args[0])) work.bytes += typeof value === "string" ? Buffer.byteLength(value) : value.byteLength;
+    return value;
   }) as typeof fs.readFileSync);
   vi.spyOn(fs, "readSync").mockImplementation(((...args: Parameters<typeof fs.readSync>) => {
     noteRead(args[0]);
-    return read(...args);
+    const bytes = read(...args);
+    if (matches(args[0])) work.bytes += bytes;
+    return bytes;
   }) as typeof fs.readSync);
   vi.spyOn(fs, "readvSync").mockImplementation(((...args: Parameters<typeof fs.readvSync>) => {
     noteRead(args[0]);
-    return readv(...args);
+    const bytes = readv(...args);
+    if (matches(args[0])) work.bytes += bytes;
+    return bytes;
   }) as typeof fs.readvSync);
   return work;
 };
@@ -954,6 +962,61 @@ describe("resident retained-run startup (smarty-dev#4796)", () => {
       host?.agents.resumeAfterRelease();
       await host?.close(); await previous.close();
       vi.restoreAllMocks(); runner.unregister();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  // Keep reason: P1-D crossed the actual host/manager boundary before hosted
+  // filtering. Native archives must not be read merely to reject their transport.
+  it("skips all saved native result payload reads during full recovery of 1,000 metadata-absent runs", { timeout: 20_000 }, async () => {
+    const { root, config, runs } = fixture();
+    const results = path.join(config.residencyRoot, "results");
+    fs.mkdirSync(results, { recursive: true, mode: 0o700 });
+    const now = Date.now();
+    const ids = new Set<string>();
+    for (let index = 1; index <= 1_000; index++) {
+      const id = index.toString(16).padStart(32, "0");
+      ids.add(id);
+      const directory = path.join(runs, id);
+      fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+      const record = { id, name: "retained native task", runner: "pi", transport: "process", status: "completed",
+        cwd: root, task: "private native task", startedAt: now, updatedAt: now, finishedAt: now, turns: 1, toolCalls: 0,
+        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } };
+      fs.writeFileSync(path.join(directory, "status.json"), JSON.stringify({ ...record, text: "native status" }));
+      // Real private files meet the receiver's canonical path, owner, mode and
+      // single-link checks. The old receiver reads them fully before rejecting
+      // transport; an absent/unsafe archive would give a false green control.
+      fs.writeFileSync(residentResultPath(config.residencyRoot, id),
+        JSON.stringify({ ...record, text: "private native answer ".repeat(1_024) }), { mode: 0o600 });
+    }
+    const host = new ResidentHost(config);
+    const scanned = new Set<string>();
+    const recovery = observeHostedRecovery((_manager, options) => {
+      const shouldRecover = options!.shouldRecover!;
+      options!.shouldRecover = id => {
+        const admitted = shouldRecover(id); // preserve the real exact-row/lease fence
+        if (admitted) scanned.add(id);
+        return admitted;
+      };
+    });
+    // Includes readFileSync(path), readFileSync(opened fd), readSync(fd) and
+    // readvSync(fd); close tracking prevents descriptor-reuse false positives.
+    const payload = observeMetadataReads(target => path.dirname(target) === results && target.endsWith(".json"));
+    try {
+      await host.start();
+      await recovery.complete(); // joins the actual full manager scan and host completion
+      expect(recovery.fallbacks).toHaveLength(1);
+      expect(recovery.fallbacks[0]!.manager).toBe(host.agents);
+      expect(scanned).toEqual(ids); // all 1,000 positively absent metadata rows were admitted
+      expect(host.agents.listForUi().partial).toBe(false);
+      expect(readHostLease(config.meshRoot, host.hostId)?.expiresAt).toBeGreaterThan(Date.now());
+      expect(payload.pathnameReads).toBe(0);
+      expect(payload.descriptorReads).toBe(0);
+      expect(payload.reads).toBe(0);
+      expect(payload.bytes).toBe(0);
+    } finally {
+      await host.close();
+      vi.restoreAllMocks();
       fs.rmSync(root, { recursive: true, force: true });
     }
   });

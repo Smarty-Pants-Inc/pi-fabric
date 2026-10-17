@@ -3490,20 +3490,27 @@ export class AgentManager {
       if (options.shouldRecover?.(entry) === false) { this.setPendingHostedRecovery(entry, undefined); continue; }
       if (this.#previousRuns.has(entry)) { this.setPendingHostedRecovery(entry, undefined); continue; }
       const runDirectory = path.join(this.#runRoot, entry);
-      // The owner archive preserves the manager's exact validated outcome even
-      // when a worker overwrote status.json during teardown. It takes precedence
-      // over status, adapter availability and damaged launch state.
-      const saved = options.savedResult?.(entry);
+      const statusFile = path.join(runDirectory, "status.json");
+      const projection = this.#pendingHostedRecovery.get(entry);
+      // Validated metadata admits archive lookup even with missing/damaged
+      // worker files. Otherwise require the existing hosted record/state marker
+      // before asking the owner to read a potentially large saved payload.
+      let record = projection ? undefined : readRecord(statusFile);
+      let state = projection ? undefined : readHostedRunState(path.join(runDirectory, HOSTED_STATE_FILE));
+      const hostedCandidate = projection || (record?.hosted && record.id === entry && state?.context.id === entry);
+      // The owner archive, never worker terminal data, remains authoritative
+      // before terminal-status, adapter and launch-scope checks (including P1-B).
+      const saved = hostedCandidate ? options.savedResult?.(entry) : undefined;
       check();
       if (options.shouldRecover?.(entry) === false) { this.setPendingHostedRecovery(entry, undefined); continue; }
       if (saved && saved.id === entry && terminalStatuses.has(saved.status)) {
         this.restorePreviousRuns([saved], { hostedRecovery: true });
         continue;
       }
-      const statusFile = path.join(runDirectory, "status.json");
-      const record = readRecord(statusFile);
-      const state = readHostedRunState(path.join(runDirectory, HOSTED_STATE_FILE));
-      const projection = this.#pendingHostedRecovery.get(entry);
+      if (projection) {
+        record = readRecord(statusFile);
+        state = readHostedRunState(path.join(runDirectory, HOSTED_STATE_FILE));
+      }
       if (!record?.hosted || !state || record.id !== entry || state.context.id !== entry || terminalStatuses.has(record.status)) {
         const observation = projection ?? (record?.hosted && record.id === entry && state?.context.id === entry ? record : undefined);
         if (observation) this.#refuseHostedRecovery(entry, runDirectory, observation,

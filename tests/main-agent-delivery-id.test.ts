@@ -297,7 +297,10 @@ describe("Main delivery outcome evidence", () => {
       expect(append.mock.calls.filter(call => call[1].eventId === "A-own")).toEqual([]);
       if (action === "recover") {
         expect(outcomes(journal).map(row => [row.eventId, row.outcome])).toEqual([["A-replaced", "superseded"], ["B-own", "delivered"]]);
-        expect(deadLetters(journal)).toHaveLength(0);
+        const letters = deadLetters(journal).map(letter => letter.value);
+        expect(letters).toHaveLength(1);
+        expect(letters[0]).toMatchObject({ native: "unknown", attempts: MAIN_DELIVERY_OUTCOME_RETRY_LIMIT, sends: [send("A-own")] });
+        expect(letters[0].reason).toBe("native carrier receipt unknown; delivery outcome bookkeeping unknown; retry budget of 8 exhausted");
       } else {
         const letters = deadLetters(journal).map(letter => letter.value);
         expect(letters).toHaveLength(2);
@@ -334,6 +337,42 @@ describe("Main delivery outcome evidence", () => {
     } finally { append.mockRestore(); main.closeFollowUpDrain(); }
   });
 
+  it("retains an unknown own outcome from a legacy pending item without superseded sends", () => {
+    const journal = journalPath(); const first = fakePi();
+    const send = { eventId: "legacy-own-only", to: "session:root", from: actor.id, mode: "steer" as const };
+    fs.mkdirSync(path.dirname(journal), { recursive: true });
+    fs.writeFileSync(journal, JSON.stringify({ version: 1, items: [{ id: "legacy-own-only-carrier", from: actor,
+      message: "unknown own outcome", sentAt: 1, outcomePending: true, outcomeSend: send }] }));
+    const append = vi.spyOn(deliveryOutcomes, "appendDeliveryOutcome").mockImplementation(() => { throw new Error("sink unavailable"); });
+    const main = new MainAgentController(first.pi, "session:root", true, "/tmp/project", "root");
+    const controllers = [main];
+    try {
+      main.attachFollowUpDrain(busy([], true), 0, journal);
+      expect(first.sent).toHaveLength(0);
+      expect(JSON.parse(fs.readFileSync(journal, "utf8")).items[0]).toMatchObject({ outcomePending: true, outcomeRetryAttempts: 1 });
+      expect(JSON.parse(fs.readFileSync(journal, "utf8")).items[0].outcomeNativeDelivered).toBeUndefined();
+      main.closeFollowUpDrain();
+
+      const second = fakePi();
+      const restarted = new MainAgentController(second.pi, "session:root", true, "/tmp/project", "root");
+      controllers.push(restarted);
+      restarted.attachFollowUpDrain(busy([], true), 0, journal);
+      for (let attempt = 2; attempt < MAIN_DELIVERY_OUTCOME_RETRY_LIMIT; attempt++) restarted.confirmInbox();
+      expect(second.sent).toHaveLength(0);
+      expect(append).not.toHaveBeenCalled();
+      const letters = deadLetters(journal);
+      expect(letters).toHaveLength(1);
+      expect(letters[0]!.value).toMatchObject({
+        native: "unknown", bookkeeping: "unknown", attempts: MAIN_DELIVERY_OUTCOME_RETRY_LIMIT, sends: [send],
+      });
+      expect(letters[0]!.value.reason).toBe("native carrier receipt unknown; delivery outcome bookkeeping unknown; retry budget of 8 exhausted");
+      expect(fs.existsSync(journal)).toBe(false);
+    } finally {
+      append.mockRestore();
+      for (const controller of controllers) controller.closeFollowUpDrain();
+    }
+  });
+
   it("exhausts bounded outcome retries into a private truthful dead-letter without appending again", () => {
     const journal = journalPath(); const h = fakePi(); const entries: unknown[] = []; const context = busy(entries, true);
     const main = new MainAgentController(h.pi, "session:root", true, "/tmp/project", "root");
@@ -357,7 +396,7 @@ describe("Main delivery outcome evidence", () => {
       });
       expect(letters[0]!.value.reason).toBe("native carrier delivered; delivery outcome bookkeeping unknown; retry budget of 8 exhausted");
       expect(JSON.stringify(letters[0]!.value)).not.toContain("private payload");
-      expect(fs.statSync(letters[0]!.path).mode & 0o777).toBe(0o600);
+      if (process.platform !== "win32") expect(fs.statSync(letters[0]!.path).mode & 0o777).toBe(0o600);
       expect(fs.existsSync(journal)).toBe(false);
       main.confirmInbox();
       expect(append).toHaveBeenCalledTimes(MAIN_DELIVERY_OUTCOME_RETRY_LIMIT);

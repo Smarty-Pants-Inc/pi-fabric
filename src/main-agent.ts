@@ -1329,10 +1329,11 @@ export class MainAgentController implements FabricMainAgentTarget {
     const exhaustedAfterRetry: HeldAgentMessage[] = [];
     for (const item of retryable) {
       const supersededChanged = this.#recordSuperseded(item);
-      const delivered = item.outcomeNativeDelivered !== true ||
-        this.#recordOutcome(item.outcomeSend, "delivered", "consumed by Main as itself");
+      const ownOutcomeHandled = item.outcomeSend === undefined ||
+        (item.outcomeNativeDelivered === true &&
+          this.#recordOutcome(item.outcomeSend, "delivered", "consumed by Main as itself"));
       changed ||= supersededChanged;
-      if (item.supersededSends?.length || !delivered) {
+      if (item.supersededSends?.length || !ownOutcomeHandled) {
         if ((item.outcomeRetryAttempts ?? 0) >= MAIN_DELIVERY_OUTCOME_RETRY_LIMIT) exhaustedAfterRetry.push(item);
         else kept.push(item);
         continue;

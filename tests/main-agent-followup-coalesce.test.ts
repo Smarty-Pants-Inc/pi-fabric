@@ -195,6 +195,37 @@ describe("Main followUp retention (unit)", () => {
     expect(fs.existsSync(journal)).toBe(false);
   });
 
+  it("replays a legacy carrier unchanged except for replacement presentation metadata", () => {
+    const { dir, journal } = journalPath();
+    const carrier = {
+      id: "legacy-latest", deliveryId: "legacy-delivery-latest", from: from("factory"),
+      message: "legacy payload", sentAt: Date.now() - 120_000, deliverAs: "followUp", triggerTurn: false,
+      chain: "legacy-first", generation: 1, supersedes: ["legacy-delivery-first"],
+      replaces: "legacy-first", replacedAt: Date.now(),
+    };
+    fs.mkdirSync(path.dirname(journal), { recursive: true });
+    fs.writeFileSync(journal, JSON.stringify({ version: 1, items: [carrier] }));
+    const next = fakePi();
+    const main = new MainAgentController(next.pi, "session:root", true, dir, "root");
+    main.attachFollowUpDrain(busyContext(), 120_000, journal);
+    next.emit("agent_before_settle", { outcome: "completed" }, busyContext([], { idle: true }));
+    expect(next.sent).toHaveLength(1);
+    const { message, options } = next.sent[0]!;
+    expect(message.details).toMatchObject({
+      id: carrier.id, deliveryId: carrier.deliveryId, from: carrier.from,
+      chain: carrier.chain, generation: carrier.generation, supersedes: carrier.supersedes,
+      sentAt: new Date(carrier.sentAt).toISOString(), delivery: carrier.deliverAs, triggerTurn: false,
+    });
+    expect(options).toEqual({ deliverAs: "followUp", triggerTurn: false });
+    expect(delivered(next.sent)).toEqual([carrier.message]);
+    expect(message.details).not.toHaveProperty("replacedAt");
+    expect(message.details).not.toHaveProperty("replaces");
+    expect(message.content).not.toContain("replaced_at=");
+    // Raw legacy fields may survive durable spreads; this is not a schema migration.
+    expect(JSON.parse(fs.readFileSync(journal, "utf8")).items[0]).toMatchObject(carrier);
+    main.closeFollowUpDrain();
+  });
+
   // A burst must survive restart in every handoff stage; duplicate journal copies never replay.
   for (const stage of ["held", "handed", "in the session"] as const) {
     it(`after a 34-message burst ${stage}, a restart retains every unconsumed original once`, () => {

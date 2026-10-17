@@ -273,12 +273,6 @@ const serializableData = (value: unknown): unknown => {
   }
 };
 
-/** A followUp's `data.coalesceKey`: a non-empty string of at most 200 characters, or none. */
-export const followUpCoalesceKey = (data: unknown): string | undefined => {
-  const key = (data as { coalesceKey?: unknown } | null | undefined)?.coalesceKey;
-  return typeof key === "string" && key.length > 0 && key.length <= 200 ? key : undefined;
-};
-
 const mainWakeCause = (
   sender: MeshIdentity, source: FabricMainAgentDeliveryRequest["source"], delivery: FabricMainAgentDelivery,
   topic?: string, key?: string,
@@ -313,18 +307,14 @@ export interface HeldAgentMessage {
   /** A multi-source or differently classified producer has no reconstructable single envelope. */
   unattributedOnReplay?: true;
   message: string;
-  /** The first send of a coalesced chain: it keeps the queue position and the flush wait. */
+  /** Original arrival time, which keeps the queue position and the flush wait. */
   sentAt: number;
-  /** When the newest replacement arrived (smarty-dev#1495). */
-  replacedAt?: number;
   /**
    * A replacement's chain: the first id, and its place in the chain. Only a held item is
    * replaced, so a handed or delivered member is its chain's last; the others never go.
    */
   chain?: string;
   generation?: number;
-  /** The held id this one replaced. */
-  replaces?: string;
   data?: unknown;
   /** The sender's stable delivery id (FabricMainAgentDeliveryRequest.deliveryId). */
   deliveryId?: string;
@@ -359,7 +349,7 @@ type BoundaryEvent = { context?: { pendingMessages?: readonly unknown[] } };
 
 /** One item's envelope as Main reads it. Throws on an item it cannot render. */
 const agentMessageBlock = (item: HeldAgentMessage, delivery: FabricMainAgentDelivery): string => [
-  `<fabric-agent-message from_name="${escapeXmlAttribute(item.from.name)}" from_id="${escapeXmlAttribute(item.from.id)}" from_kind="${escapeXmlAttribute(item.from.kind)}" delivery="${escapeXmlAttribute(delivery)}" sent_at="${escapeXmlAttribute(new Date(item.sentAt).toISOString())}"${item.replacedAt === undefined ? "" : ` replaced_at="${escapeXmlAttribute(new Date(item.replacedAt).toISOString())}"`}>`,
+  `<fabric-agent-message from_name="${escapeXmlAttribute(item.from.name)}" from_id="${escapeXmlAttribute(item.from.id)}" from_kind="${escapeXmlAttribute(item.from.kind)}" delivery="${escapeXmlAttribute(delivery)}" sent_at="${escapeXmlAttribute(new Date(item.sentAt).toISOString())}">`,
   escapeXmlText(item.message),
   item.data === undefined ? undefined : `<data>${escapeXmlText(JSON.stringify(item.data))}</data>`,
   "</fabric-agent-message>",
@@ -2241,8 +2231,7 @@ export class MainAgentController implements FabricMainAgentTarget {
         from: item.from,
         delivery,
         sentAt: new Date(item.sentAt).toISOString(),
-        ...(item.replacedAt === undefined ? {} : { replacedAt: new Date(item.replacedAt).toISOString() }),
-        ...(item.chain === undefined ? {} : { chain: item.chain, generation: item.generation, replaces: item.replaces }),
+        ...(item.chain === undefined ? {} : { chain: item.chain, generation: item.generation }),
         ...(data === undefined ? {} : { data }),
         ...(item.deliveryId === undefined ? {} : { deliveryId: item.deliveryId }),
         ...(item.inboxEventId === undefined ? {} : { inboxEventId: item.inboxEventId }),

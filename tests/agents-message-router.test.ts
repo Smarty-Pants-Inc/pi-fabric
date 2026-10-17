@@ -271,7 +271,7 @@ describe("sender incarnation fencing (#7514)", () => {
 });
 
 describe("directory availability for live Mains (#2386)", () => {
-  it.each([[false, false], [false, true], [true, false], [true, true]] as const)("reports a retryable lock outage then delivers after recovery (files=%s, fresh lease=%s)", async (files, freshLease) => {
+  it.each([[false, false], [false, true], [true, false], [true, true]] as const)("revalidates live routing without a writer fence but retains stale-lease refusal (files=%s, fresh lease=%s)", async (files, freshLease) => {
     const f = await mainLeaseFixture(files);
     if (freshLease) {
       const host = f.mesh.get(f.key("topology/hosts/"))!.value as Record<string, unknown>;
@@ -293,14 +293,15 @@ describe("directory availability for live Mains (#2386)", () => {
     fs.mkdirSync(lock, { mode: 0o700 });
     fs.writeFileSync(path.join(lock, "owner"), `contended\n${process.pid}\n${Date.now()}\n`);
     try {
-      const failure = await send.value.routeMessage(f.target.id, "live Main reply", { proof: "unchanged" }, "followUp").catch(error => error);
-      expect(failure).toMatchObject(freshLease
-        ? { name: "FabricDirectoryUnavailableError", code: "FABRIC_DIRECTORY_UNAVAILABLE", retryable: true }
-        : { name: "FabricParticipantStaleError", code: "FABRIC_PARTICIPANT_STALE", retryable: true });
-      expect(failure.message).toContain(freshLease ? "Timed out waiting for the Fabric mesh lock" : "lease late by");
-      expect(failure.message).not.toContain("Unknown Fabric actor");
+      const delivery = send.value.routeMessage(f.target.id, "live Main reply", { proof: "unchanged" }, "followUp");
+      if (freshLease) {
+        await expect(delivery).resolves.toMatchObject({ queued: true, messageId: "recovered" });
+        expect(request).toHaveBeenCalledOnce();
+      } else {
+        await expect(delivery).rejects.toMatchObject({ name: "FabricParticipantStaleError", code: "FABRIC_PARTICIPANT_STALE", retryable: true });
+        expect(request).not.toHaveBeenCalled();
+      }
       expect(probe).toHaveBeenCalledTimes(freshLease ? 1 : 0);
-      expect(request).not.toHaveBeenCalled();
       expect(send.actors.status).not.toHaveBeenCalled();
     } finally {
       fs.rmSync(lock, { recursive: true, force: true });
@@ -313,8 +314,8 @@ describe("directory availability for live Mains (#2386)", () => {
     // No sender heartbeat success is needed for the canonical routing read to recover.
     await expect(send.value.routeMessage(f.target.id, "live Main reply", { proof: "unchanged" }, "followUp"))
       .resolves.toMatchObject({ queued: true, messageId: "recovered", acknowledged: true });
-    expect(probe).toHaveBeenCalledTimes(freshLease ? 2 : 1);
-    expect(request).toHaveBeenCalledOnce();
+    expect(probe).toHaveBeenCalledOnce();
+    expect(request).toHaveBeenCalledTimes(freshLease ? 2 : 1);
     expect(request.mock.calls[0]?.slice(0, 4)).toEqual([f.target.id, f.target.id, "followUp", expect.objectContaining({ message: "live Main reply", data: { proof: "unchanged" } })]);
     expect(f.directory.canConsumeMesh()).toBe(false); // Routing did not weaken lease admission.
   });

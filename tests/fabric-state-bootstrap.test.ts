@@ -691,11 +691,8 @@ describe("FabricState lazy bootstrap", () => {
 });
 
 describe("FabricState built-in model guidance", () => {
-  // The Jev block must be part of the first system prompt. Registering it only
-  // when the runtime activates rewrites the prompt suffix mid-session and drops
-  // the provider prefix cache for the whole conversation.
-  it("resolves the Jev guidance before the runtime activates", async () => {
-    const cwd = project();
+  it("keeps Jev-enabled bootstrap free of built-in guidance without activating the runtime", async () => {
+    const cwd = project({ jev: { enabled: true } });
     const harness = runtimeHarness();
     const state = createState(harness.loader);
     try {
@@ -704,8 +701,11 @@ describe("FabricState built-in model guidance", () => {
       const resolved = resolveFabricModelGuidance(state.modelGuidance(), {
         model: "probe/probe", target: "main",
       });
-      expect(resolved.appendText).toContain("Jev supplies typed Choice");
-      expect(resolved.sources.map((source) => source.label)).toEqual(["jev-programs"]);
+      expect(state.config.jev.enabled).toBe(true);
+      expect(state.modelGuidance()).toEqual([]);
+      expect(resolved.appendText).toBe("");
+      expect(resolved.slotText).toBe("");
+      expect(resolved.sources).toEqual([]);
     } finally { await state.shutdown(); fs.rmSync(cwd, { recursive: true, force: true }); }
   });
 
@@ -719,7 +719,10 @@ describe("FabricState built-in model guidance", () => {
         const resolved = resolveFabricModelGuidance(state.modelGuidance(), {
           model: "probe/probe", target: "main",
         });
-        expect(resolved.appendText ?? "").not.toContain("Jev supplies");
+        expect(state.modelGuidance()).toEqual([]);
+        expect(resolved.appendText).toBe("");
+        expect(resolved.slotText).toBe("");
+        expect(resolved.sources).toEqual([]);
       } finally { await state.shutdown(); fs.rmSync(cwd, { recursive: true, force: true }); }
     }
   });

@@ -379,6 +379,19 @@ export async function wakeResidentActors(mesh: Pick<MeshStore, "root" | "listAll
     ? mesh.listAll("topology/subscriptions/", { fresh: true }).map(entry => entry.value as {
       from?: string; to?: string; events?: string[];
     }) : [];
+  // Unrelated publications own no pending/backlog custody. Recovery keeps its
+  // explicit batch path, including startup calls with no events.
+  const publicationRoots = recovery ? [] : residentDirectories(mesh.root).filter(root => {
+    try {
+      const routes = retainedRoutesAt(root);
+      return routes && events.some(event => residentDeliveryMatches(routes, event, lifecycle));
+    } catch (error) {
+      // Preserve per-root isolation when retained actor metadata is malformed.
+      diagnostics.warn("src/residency/wake.ts", `[pi-fabric] resident wake deferred for ${root}: ${String(error)}`);
+      return false;
+    }
+  });
+  if (!recovery && !publicationRoots.length) return;
   const pending = recovery ? recovery.batch.pending : await mesh.exclusive(() => {
     const reader = new ResidentWakeRecoveryReader(mesh.root);
     try { return reader.next().pending; } finally { reader.close(); }
@@ -391,7 +404,7 @@ export async function wakeResidentActors(mesh: Pick<MeshStore, "root" | "listAll
   // A subsequent MATCHING delivery must not let a newly re-filled journal starve old overflow.
   const deferred = [...pending].filter(([, delivery]) => delivery.deferredAt !== undefined &&
     (!events.length || events.some(event => event.sequence > delivery.deferredAt!))).map(([root]) => root);
-  for (const root of new Set([...deferred, ...pending.keys(), ...(recovery ? [] : residentDirectories(mesh.root))])) {
+  for (const root of new Set([...deferred, ...pending.keys(), ...publicationRoots])) {
     if (!canWake()) break;
     if (!recovery && attempted >= RESIDENT_WAKE_INDEX_MAX_ROOTS) break; // Overflow stays pending for the next drain.
     let delivery: { id: string; sequence?: number } | undefined;

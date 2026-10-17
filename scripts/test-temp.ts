@@ -288,13 +288,15 @@ export function isolateTestFleetEnvironment(): Record<string, string> {
     PI_FABRIC_RUN_ROOT: join(root, "runs"),
     PI_FABRIC_AGENT_DIR: join(root, "exports"),
     PI_CODING_AGENT_DIR: join(root, "agent"),
+    // Keep home-directory audit logs and config writes inside this file's owned fleet root.
+    ...(process.platform === "win32" ? { USERPROFILE: join(root, "home") } : { HOME: join(root, "home") }),
     // An explicit private MCP layer prevents fallback to the real home config.
     MCPORTER_CONFIG: join(root, "mcporter.json"),
     // Mesh-lock diagnostics write <mesh>/lock-stats each minute and at exit (smarty-dev#6477 L8);
     // suites that list a mesh root must not race that timer. Lock-stats suites opt in explicitly.
     PI_FABRIC_LOCK_STATS: "0",
   };
-  for (const directory of ["mesh", "project", "runs", "exports", "agent"]) {
+  for (const directory of ["mesh", "project", "runs", "exports", "agent", "home"]) {
     mkdirSync(join(root, directory), { recursive: true });
   }
   writeFileSync(environment.MCPORTER_CONFIG, '{"mcpServers":{},"imports":[]}\n');

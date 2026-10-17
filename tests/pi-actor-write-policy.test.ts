@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
 import type { AgentRunRequest } from "../src/agents/types.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
+import { modelExceptionGrant } from "./helpers/model-exceptions.js";
 import fabricWriteGuard, { writePolicyDenial } from "../src/agents/write-guard.js";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
@@ -128,13 +129,30 @@ describe("Pi actor scratch-only write policy", () => {
 
   it("keeps Claude actor defaults and explicit unrestricted historical behavior", async () => {
     const f = fixture();
-    for (const policy of [{}, { writePolicy: "unrestricted" as const }]) {
-      const { value } = await report(f, { runner: "claude", actorName: "claude", ...policy });
-      expect(value.policy).toBeNull();
-      expect(value.tmpdir).toBeNull();
-    }
-    for (const policy of [{ readOnly: false }, { writableRoots: [] }, { shell: "deny" as const }]) {
-      await expect(f.manager.spawn({ task: "unsupported", runner: "claude", actorId: "claude", ...policy })).rejects.toThrow(/only by the Pi runner/);
+    const model = "claude-haiku-test";
+    const modelReason = "Named Claude actor write-policy exception #11864";
+    const grant = modelExceptionGrant({ model, lane: path.basename(f.cwd), role: "actor:claude" });
+    // Isolate this write-policy test from the host's CLI and grant file. The
+    // model-exception admission and source-trust paths have dedicated tests.
+    vi.spyOn(os, "homedir").mockReturnValue(path.dirname(f.cwd));
+    vi.spyOn(f.manager, "claudeModels").mockResolvedValue([{
+      value: "default", resolvedModel: model, resolvedModelKnown: true,
+      displayName: "Default (test)", description: "Known native default",
+    }]);
+    const admit = vi.spyOn(f.manager, "admitModelException").mockReturnValue(grant);
+    try {
+      for (const policy of [{}, { writePolicy: "unrestricted" as const }]) {
+        const { value } = await report(f, { runner: "claude", actorName: "claude", modelReason, ...policy });
+        expect(value.policy).toBeNull();
+        expect(value.tmpdir).toBeNull();
+      }
+      for (const policy of [{ readOnly: false }, { writableRoots: [] }, { shell: "deny" as const }]) {
+        await expect(f.manager.spawn({ task: "unsupported", runner: "claude", actorId: "claude", modelReason, ...policy })).rejects.toThrow(/only by the Pi runner/);
+      }
+      expect(admit.mock.calls.slice(0, 2).map(([resolvedModel, reason, runner, role]) => [resolvedModel, reason, runner, role]))
+        .toEqual(Array(2).fill([model, modelReason, "claude", "actor:claude"]));
+    } finally {
+      vi.restoreAllMocks();
     }
   });
 

@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { HOST_POLICY_PATH } from "../src/host-policy.js";
 import {
   DEFAULT_FABRIC_CONFIG,
+  MODEL_EXCEPTIONS_PATH,
   MAX_EXECUTOR_MEMORY_LIMIT_BYTES,
   MAX_EXECUTOR_TIMEOUT_MS,
   QUICKJS_MAX_MEMORY_LIMIT_BYTES,
@@ -15,6 +16,7 @@ import {
   normalizeFabricConfig,
   saveFabricConfig,
 } from "../src/config.js";
+import { modelExceptionGrant } from "./helpers/model-exceptions.js";
 
 const temporaryDirectories: string[] = [];
 const originalCompactionEngineEnv = process.env.PI_FABRIC_COMPACTION_ENGINE;
@@ -26,6 +28,7 @@ const temporaryDirectory = (): string => {
 };
 
 afterEach(() => {
+  vi.unstubAllEnvs();
   for (const directory of temporaryDirectories.splice(0)) {
     fs.rmSync(directory, { recursive: true, force: true });
   }
@@ -47,19 +50,46 @@ describe("transient actor activation block cooldown (smarty-dev#6509)", () => {
 });
 
 describe("host-only explicit model exceptions (#3134)", () => {
-  it("defaults to Astra and supports an empty rollback or normalized override", () => {
-    expect(normalizeFabricConfig({}).agents.modelPolicy.requireReason).toEqual(["gpt-6-astra"]);
+  it("defaults to the fleet reason prefixes and supports an empty rollback or normalized override", () => {
+    expect(normalizeFabricConfig({}).agents.modelPolicy).toEqual({
+      requireReason: ["gpt-6-astra", "opus", "claude"],
+      fallbackThinking: "high",
+    });
     expect(normalizeFabricConfig({ agents: { modelPolicy: { requireReason: [] } } }).agents.modelPolicy.requireReason).toEqual([]);
     expect(normalizeFabricConfig({ agents: { modelPolicy: { requireReason: [" CLIPROXYAPI/GPT-6-ASTRA ", "cliproxyapi/gpt-6-astra"] } } }).agents.modelPolicy.requireReason).toEqual(["cliproxyapi/gpt-6-astra"]);
   });
-  it.each([true, false])("project cannot disable the host reason gate (trusted=%s)", projectTrusted => {
+  it("normalizes the indirect fallback model and thinking level", () => {
+    expect(normalizeFabricConfig({ agents: { modelPolicy: {
+      fallbackModel: " cliproxyapi/custom ", fallbackThinking: "medium",
+    } } }).agents.modelPolicy).toMatchObject({
+      fallbackModel: "cliproxyapi/custom",
+      fallbackThinking: "medium",
+    });
+    expect(normalizeFabricConfig({ agents: { modelPolicy: {
+      fallbackModel: " ", fallbackThinking: "invalid",
+    } } }).agents.modelPolicy).toEqual({
+      requireReason: ["gpt-6-astra", "opus", "claude"],
+      fallbackThinking: "high",
+    });
+  });
+  it.each([true, false])("project cannot disable the host reason gate or change fallback (trusted=%s)", projectTrusted => {
     const cwd = temporaryDirectory(); const agentDir = temporaryDirectory();
     fs.mkdirSync(path.join(cwd, ".pi"));
-    fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ agents: { modelPolicy: { requireReason: ["provider/expensive"] } } }));
-    fs.writeFileSync(path.join(cwd, ".pi", "fabric.json"), JSON.stringify({ agents: { modelPolicy: { requireReason: [] } } }));
-    expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.modelPolicy.requireReason).toEqual(["gpt-6-astra", "provider/expensive"]);
+    fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ agents: { modelPolicy: {
+      requireReason: ["provider/expensive"], fallbackModel: "cliproxyapi/host-fallback", fallbackThinking: "low",
+    } } }));
+    fs.writeFileSync(path.join(cwd, ".pi", "fabric.json"), JSON.stringify({ agents: { modelPolicy: {
+      requireReason: [], fallbackModel: "provider/workspace-fallback", fallbackThinking: "off",
+    } } }));
+    const loaded = loadFabricConfig({ cwd, agentDir, projectTrusted });
+    expect(loaded.agents.modelPolicy.requireReason).toEqual(["gpt-6-astra", "opus", "claude", "provider/expensive"]);
+    expect(loaded.agents.modelPolicy.fallbackModel).toBe("cliproxyapi/host-fallback");
+    expect(loaded.agents.modelPolicy.fallbackThinking).toBe("low");
     fs.unlinkSync(path.join(agentDir, "fabric.json"));
-    expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.modelPolicy.requireReason).toEqual(["gpt-6-astra"]);
+    const withoutHostPolicy = loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.modelPolicy;
+    expect(withoutHostPolicy.requireReason).toEqual(["gpt-6-astra", "opus", "claude"]);
+    expect(withoutHostPolicy.fallbackModel).toBeUndefined();
+    expect(withoutHostPolicy.fallbackThinking).toBe("high");
   });
 });
 describe("fleet model policy configuration (#2490)", () => {
@@ -89,6 +119,54 @@ describe("fleet model policy configuration (#2490)", () => {
     const config = loadFabricConfig({ cwd, agentDir, projectTrusted: true });
     expect(config.agents.deniedModels).toEqual([]);
     expect(config.agents.deniedModelReplacement).toBeUndefined();
+  });
+});
+
+describe("host-only model exception file location", () => {
+  it.each(["user", "profile"] as const)("pins the root-owned exception file regardless of %s directory, config, workspace or environment", source => {
+    const cwd = temporaryDirectory();
+    const root = temporaryDirectory();
+    const agentDir = source === "profile" ? path.join(root, "profiles", "work") : root;
+    fs.mkdirSync(agentDir, { recursive: true });
+    const redirected = path.join(temporaryDirectory(), "attacker-grants.json");
+    vi.stubEnv("PI_FABRIC_MODEL_EXCEPTIONS_PATH", redirected);
+    vi.stubEnv("MODEL_EXCEPTIONS_PATH", redirected);
+    fs.mkdirSync(path.join(cwd, ".pi"));
+    const attackerDocument = { version: 1, grants: [modelExceptionGrant({
+      issue: "Smarty-Pants-Inc/smarty-dev#1", model: "cliproxyapi-anthropic/claude-opus-5-5",
+      lane: path.basename(cwd),
+    })] };
+    fs.writeFileSync(path.join(agentDir, "model-exceptions.json"), JSON.stringify(attackerDocument));
+    fs.writeFileSync(redirected, JSON.stringify(attackerDocument));
+    fs.writeFileSync(path.join(cwd, ".pi", "model-exceptions.json"), JSON.stringify(attackerDocument));
+    fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ agents: {
+      modelExceptionsPath: redirected,
+      modelExceptions: attackerDocument.grants,
+      rootSessionCwd: cwd, lane: path.basename(cwd), host: os.hostname().split(".")[0],
+    } }));
+    fs.writeFileSync(path.join(cwd, ".pi", "fabric.json"), JSON.stringify({ agents: {
+      modelExceptionsPath: redirected,
+      modelExceptions: attackerDocument.grants,
+      rootSessionCwd: cwd, lane: path.basename(cwd), host: os.hostname().split(".")[0],
+    } }));
+
+    for (const projectTrusted of [true, false]) {
+      const options = { cwd, agentDir, projectTrusted };
+      const loadedConfigs = [loadFabricConfig(options), loadGlobalFabricConfig(agentDir),
+        loadFabricConfigForScope(options, "global"),
+        ...(projectTrusted ? [loadFabricConfigForScope(options, "project")] : [])];
+      loadedConfigs.map(loaded => {
+        expect(loaded.agents.modelExceptionsPath).toBe("/etc/smarty/model-exceptions.json");
+        expect(loaded.agents).not.toHaveProperty("modelExceptions");
+        expect(loaded.agents).not.toHaveProperty("rootSessionCwd");
+        expect(loaded.agents).not.toHaveProperty("lane");
+        expect(loaded.agents).not.toHaveProperty("host");
+      });
+      expect(normalizeFabricConfig({ agents: { modelExceptionsPath: redirected } }).agents.modelExceptionsPath)
+        .toBe("/etc/smarty/model-exceptions.json");
+    }
+    expect(MODEL_EXCEPTIONS_PATH).toBe("/etc/smarty/model-exceptions.json");
+    expect(DEFAULT_FABRIC_CONFIG.agents.modelExceptionsPath).toBe(MODEL_EXCEPTIONS_PATH);
   });
 });
 

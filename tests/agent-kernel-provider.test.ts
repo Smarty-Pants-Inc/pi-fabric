@@ -7,6 +7,7 @@ import { AgentManager } from "../src/agents/manager.js";
 import type { AgentHandleInfo, AgentRunRequest, AgentRunResult, AgentSessionSeed } from "../src/agents/types.js";
 import type { FabricActorRequest } from "../src/actors/types.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
+import { withRootExceptionMetadata, writeModelExceptions } from "./helpers/model-exceptions.js";
 import type { FabricInvocationContext } from "../src/protocol.js";
 import { AGENTS_ACTION_DESCRIPTORS } from "../src/providers/agents-actions.js";
 import { AgentsProvider } from "../src/providers/agents-provider.js";
@@ -16,9 +17,15 @@ import { typeCheckFabricCode } from "../src/runtime/type-checker.js";
 
 const roots: string[] = [];
 const managers: AgentManager[] = [];
+const trustedExceptionFixturePaths = new Set<string>();
+const realAdmitModelException = AgentManager.prototype.admitModelException;
+let restoreAdmissionFixture: (() => void) | undefined;
 const context = {
   cwd: process.cwd(), signal: undefined, parentToolCallId: "outer", nestedToolCallId: "nested",
-  extensionContext: { modelRegistry: { getAvailable: () => [{ provider: "test", id: "model" }], find: () => undefined } },
+  extensionContext: { modelRegistry: {
+    getAvailable: () => [{ provider: "test", id: "model" }, { provider: "cliproxyapi", id: "gpt-6.1-sol" }],
+    find: (provider: string, id: string) => provider === "cliproxyapi" && id === "gpt-6.1-sol" ? { provider, id } : undefined,
+  } },
   update() {}, activity() {},
 } as unknown as FabricInvocationContext;
 const handle: AgentHandleInfo = {
@@ -32,7 +39,16 @@ type ProviderArgs = ConstructorParameters<typeof AgentsProvider>;
 const setup = () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-agent-kernel-provider-"));
   roots.push(root);
-  const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+  const boundRootRecord = Object.freeze({ cwd: root });
+  const modelExceptionsPath = writeModelExceptions(root, ["claude-haiku-test"], boundRootRecord.cwd);
+  trustedExceptionFixturePaths.add(modelExceptionsPath);
+  const manager = new AgentManager(process.cwd(), {
+    ...DEFAULT_FABRIC_CONFIG.agents,
+    modelExceptionsPath,
+    claude: { ...DEFAULT_FABRIC_CONFIG.agents.claude, model: "claude/haiku" },
+  }, {
+    rootSessionCwd: () => boundRootRecord.cwd,
+    claudeBinary: path.resolve("tests/fixtures/fake-claude.mjs"),
     runRoot: root, kernel: () => "python", pythonRuntime: () => "monty",
   });
   managers.push(manager);
@@ -63,12 +79,20 @@ const setup = () => {
   return { root, manager, provider, spawn, actors, templates, residency };
 };
 beforeEach(() => {
+  trustedExceptionFixturePaths.clear();
+  const admission = vi.spyOn(AgentManager.prototype, "admitModelException").mockImplementation(function (this: AgentManager, ...args) {
+    const file = this.config.modelExceptionsPath;
+    if (!file || !trustedExceptionFixturePaths.has(file)) return realAdmitModelException.apply(this, args);
+    return withRootExceptionMetadata(file, () => realAdmitModelException.apply(this, args));
+  });
+  restoreAdmissionFixture = () => admission.mockRestore();
   vi.stubEnv("PI_FABRIC_DEPTH", undefined);
   vi.stubEnv("PI_FABRIC_BUDGET_FILE", undefined);
   vi.stubEnv("PI_FABRIC_BUDGET", undefined);
 });
 afterEach(async () => {
   await Promise.all(managers.splice(0).map((manager) => manager.close()));
+  restoreAdmissionFixture?.();
   vi.restoreAllMocks();
   vi.unstubAllEnvs();
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
@@ -148,7 +172,7 @@ describe("provider kernel forwarding", () => {
     expect(spawn).not.toHaveBeenCalled();
   });
 
-  it.each([{ runner: "claude" }, { runner: "veda" }, { extensions: false }])("rejects concrete incompatible durable kernel before contacting resident: %j", async (request) => {
+  it.each([{ runner: "veda", model: "cliproxyapi/gpt-6.1-sol" }, { extensions: false, model: "cliproxyapi/gpt-6.1-sol" }])("rejects concrete incompatible durable kernel before contacting resident: %j", async (request) => {
     const { provider, residency } = setup();
     await expect(provider.invoke("spawn", { task: "task", residency: "durable", kernel: "python", ...request }, context)).rejects.toThrow("Fabric extensions");
     expect(residency.spawnAgent).not.toHaveBeenCalled();

@@ -321,7 +321,7 @@ describe("Main reload sender admission (smarty-dev#2160 item 4)", () => {
     fresh.emit("session_before_compact", { reason: "manual", signal: operation.signal });
     if (aborted) operation.abort();
     fresh.emit("session_compact_failed", { reason: "manual", aborted, errorMessage: "failed" });
-    fresh.emit("agent_settled", { outcome: "completed" }); // an unrelated completion cannot lift the owner's stop
+    fresh.emit("agent_settled", { outcome: "completed" }); // replay was already downgraded at its canceled boundary
     expect(f.sent.map((item) => item.options)).toEqual(["steer", "followUp"].map((deliverAs) => ({ deliverAs, triggerTurn: false })));
   });
 
@@ -454,9 +454,10 @@ describe("Main reload sender admission (smarty-dev#2160 item 4)", () => {
     },
   );
 
-  it.each([0, 60_000])("cancel then reload keeps replay passive until user input (flushMs=%s)", async (flushMs) => {
+  it.each([0, 60_000])("explicit owner halt then native cancellation keeps reload replay passive until user input (flushMs=%s)", async (flushMs) => {
     const f = await fixture();
     const old = f.main(false, flushMs);
+    old.controller.halt(); // Explicit authority; an aborted settle alone is transient.
     old.emit("agent_settled", { outcome: "aborted" });
     old.controller.prepareReload();
     const request = { from: sender, message: "after cancel", delivery: "steer" as const, deliveryId: "cancel-gap" };

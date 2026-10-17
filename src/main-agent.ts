@@ -293,6 +293,8 @@ const mainSenderClaimAllowed = (sender: MeshIdentity, deliveryId: unknown, sourc
 
 export interface HeldAgentMessage {
   outcomeSend?: DeliverySend;
+  /** Per-handoff evidence, never inferred from Main's later state at confirmation. */
+  deliveryReason?: "operator-halt";
   supersededSends?: DeliverySend[];
   id: string;
   from: MeshIdentity;
@@ -377,7 +379,10 @@ const itemBytes = (item: HeldAgentMessage): number => {
     (item.inboxKey === undefined ? 0 : Buffer.byteLength(JSON.stringify(item.inboxKey))) +
     (item.deliveryId === undefined ? 0 : Buffer.byteLength(JSON.stringify(item.deliveryId))) +
     (item.supersedes === undefined ? 0 : Buffer.byteLength(JSON.stringify(item.supersedes))) +
-    (item.inboxReceipts === undefined ? 0 : Buffer.byteLength(JSON.stringify(item.inboxReceipts)));
+    (item.inboxReceipts === undefined ? 0 : Buffer.byteLength(JSON.stringify(item.inboxReceipts))) +
+    // Reserve the bounded host-owned handoff evidence even before a later halt
+    // downgrades this item; the native metadata must not evade admission quotas.
+    Buffer.byteLength(JSON.stringify({ deliveryReason: "operator-halt" }));
 };
 
 type SessionEntryLike = { id?: unknown; parentId?: unknown; type?: string; customType?: string; details?: { id?: unknown; items?: unknown } };
@@ -542,9 +547,6 @@ export class MainAgentController implements FabricMainAgentTarget {
   #wake: ReturnType<typeof setInterval> | undefined;
   #preflightWake: ReturnType<typeof setInterval> | undefined;
   #operation: AbortSignal | undefined;
-  #offOperationAbort: (() => void) | undefined;
-  // Keep the veto signal through both settlement notifications, including late owner aborts.
-  #compactionDecline: AbortSignal | undefined;
 
   constructor(
     readonly pi: ExtensionAPI,
@@ -767,7 +769,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     };
     // Retry required owner authority at the next delivery, even without a durable delivery id.
     this.#retryPendingHalt();
-    // Only a project-agent's new peer escalation control envelope gets one run; halt stays latched.
+    // Only a launch-bound project/org Main's new peer control envelope gets one run; halt stays latched.
     // Replays return above; producer/backlog delivery and sender diagnostics grant no wake.
     const peerSteerWake = this.#halted && this.peerSteerResume && !this.#peerSteerInFlight && request.delivery === "steer" && request.triggerTurn !== false &&
       (request.verification === "mesh" || request.verification === "bridge") && sender.kind === "main" && sender.id !== this.id &&
@@ -783,6 +785,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     const restorePeerWakeOnFailure = (): void => { if (peerSteerWake) this.halt(); };
     const triggerTurn = (request.triggerTurn ?? true) && (peerSteerWake || !this.#halted);
     const operatorHalted = this.#halted && !peerSteerWake;
+    if (operatorHalted) item.deliveryReason = "operator-halt";
     const providerHeld = triggerTurn && request.delivery !== "nextTurn" &&
       !this.#context?.signal?.aborted && (this.#providerHeld() || this.#providerAttemptInFlight);
     if (providerHeld && request.delivery === "steer") {
@@ -1174,7 +1177,7 @@ export class MainAgentController implements FabricMainAgentTarget {
    * At a boundary, where Pi shows its pending queue: a replayed handoff the session holds is
    * done, one still in Pi's queue awaits the session, and any other was lost and is held again.
    */
-  #reconcile(event: BoundaryEvent): void {
+  #reconcile(event: BoundaryEvent, triggerTurn = true): void {
     const pending = event.context?.pendingMessages;
     if (!this.#unverified.length || !Array.isArray(pending)) return;
     const queued = agentMessageIds(pending);
@@ -1182,10 +1185,11 @@ export class MainAgentController implements FabricMainAgentTarget {
     // In Pi's memory but not on disk (a failed write, a live reload): Main has read it, so it is
     // not sent again in this process; it stays journalled and a restart replays it.
     const seen = this.#source !== "" && this.#unverified.some((item) => !delivered.has(item.id)) ? this.#inMemory() : new Set<string>();
-    for (const item of this.#unverified.splice(0)) {
+    for (const item of [...this.#unverified]) {
       if (delivered.has(item.id)) {
+        this.#unverified.splice(this.#unverified.indexOf(item), 1);
         this.#recordSuperseded(item);
-        if (!item.supersededSends?.length && this.#recordOutcome(item.outcomeSend, "delivered", "consumed by Main as itself")) this.#consume(item);
+        if (!item.supersededSends?.length && this.#recordOutcome(item.outcomeSend, "delivered", this.#deliveryReason(item))) this.#consume(item);
         else this.#sent.push(item);
         continue;
       }
@@ -1194,18 +1198,25 @@ export class MainAgentController implements FabricMainAgentTarget {
         // A direct delivery goes again alone, with its own mode and triggerTurn; a failed send
         // waits for the next boundary.
         try {
-          this.#send([item], item.deliverAs, item.triggerTurn ?? true, false);
+          this.#send([item], item.deliverAs, triggerTurn && (item.triggerTurn ?? true), false);
           this.#sent.push(item);
         } catch {
-          this.#unverified.push(item);
+          continue; // Still journalled as unverified, including any handoff evidence.
         }
       } else {
         const { handed: _handed, ...held } = item;
         this.#held.push(held);
       }
+      this.#unverified.splice(this.#unverified.indexOf(item), 1);
     }
     this.#held.sort((a, b) => a.sentAt - b.sentAt);
     this.#trySave();
+  }
+
+  #deliveryReason(item: HeldAgentMessage): string {
+    return item.deliveryReason === "operator-halt"
+      ? "delivered, not triggered: recipient is halted by its operator"
+      : "consumed by Main as itself";
   }
 
   #recordOutcome(send: DeliverySend | undefined, outcome: DeliveryOutcome, reason: string): boolean {
@@ -1233,7 +1244,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     const before = this.#sent.length;
     for (const item of this.#sent) outcomesChanged = this.#recordSuperseded(item) || outcomesChanged;
     const kept = this.#sent.filter((item) => {
-      if (!delivered.has(item.id) || item.supersededSends?.length || !this.#recordOutcome(item.outcomeSend, "delivered", "consumed by Main as itself")) return true;
+      if (!delivered.has(item.id) || item.supersededSends?.length || !this.#recordOutcome(item.outcomeSend, "delivered", this.#deliveryReason(item))) return true;
       this.#consume(item);
       return false;
     });
@@ -1344,7 +1355,7 @@ export class MainAgentController implements FabricMainAgentTarget {
       if (delivered.has(item.id) || delivered.has(chainOf(item)) || last.get(chainOf(item)) !== item ||
         (item.deliveryId !== undefined && this.#consumed.has(item.deliveryId))) {
         this.#recordSuperseded(item);
-        if (item.supersededSends?.length || (delivered.has(item.id) && !this.#recordOutcome(item.outcomeSend, "delivered", "consumed by Main as itself"))) {
+        if (item.supersededSends?.length || (delivered.has(item.id) && !this.#recordOutcome(item.outcomeSend, "delivered", this.#deliveryReason(item)))) {
           this.#sent.push(item);
           continue;
         }
@@ -1413,8 +1424,14 @@ export class MainAgentController implements FabricMainAgentTarget {
     // precedes Pi's retry/overflow recovery decision, so never persist it as an owner stop.
     on("turn_end", (event: { message?: { stopReason?: string; errorMessage?: string; diagnostics?: unknown } }, ctx) => {
       const reason = event.message?.stopReason;
-      this.#compactionDecline = undefined;
-      if (ctx.signal?.aborted || reason === "aborted") { if (!this.#interrupts.size) this.halt(); }
+      // A native abort also precedes compact/reload and extension cancellation. Only
+      // explicit halt()/stop() owns durable authority; this boundary is merely passive.
+      if (ctx.signal?.aborted || reason === "aborted") {
+        this.#suspended = true;
+        this.#runUnclassified = false;
+        this.#providerStateDirty = true;
+        this.#trySave(true);
+      }
       else if (reason === "error") {
         // smarty-dev#8742: a request the provider will reject again is not backoff.
         const failure = classifyProviderError(event.message);
@@ -1435,8 +1452,15 @@ export class MainAgentController implements FabricMainAgentTarget {
       }
     });
     const settleGate = (event: { outcome?: string; aborted?: boolean }, ctx: ExtensionContext, finalSettle = false): void => {
-      if (ctx.signal?.aborted || event.aborted === true || isCompactionCancelled(this.#compactionDecline) ||
-        (event.outcome === "aborted" && !this.#compactionDecline)) { if (!this.#interrupts.size) this.halt(); }
+      if (ctx.signal?.aborted || event.aborted === true || event.outcome === "aborted") {
+        this.#suspended = true;
+        // Cancellation is not a failed provider attempt, including legacy settles
+        // without outcome. Do not carry its pending unclassified failure forward.
+        this.#runUnclassified = false;
+        this.#providerStateDirty = true;
+        this.#trySave(true);
+        return;
+      }
       // turn_end already classified a non-retryable failure: recover at idle, never back off.
       else if (event.outcome === "error" && this.#providerDead) { this.#runUnclassified = false; this.#armProviderDeadTimer(); }
       // The third unclassified failure in a row raises provider-dead instead of more silent backoff.
@@ -1462,58 +1486,41 @@ export class MainAgentController implements FabricMainAgentTarget {
         this.#interrupts.delete(id);
       }
     });
-    // Observe the operation in BOTH drain modes. Pi also reports an extension's benign
-    // decline as aborted, but only the operation signal proves an owner cancellation.
-    on("session_before_compact", (event: { reason?: string; signal?: AbortSignal }) => {
+    // Retain operation cancellation in both drain modes to veto this boundary's
+    // wake, not to infer operator intent from a generic native controller.
+    on("session_before_compact", (event: { signal?: AbortSignal }) => {
       this.#stopOperation();
       this.#operation = event.signal;
-      this.#compactionDecline = undefined;
-      // Native manual cancellation is owner intent even when Pi has already emitted
-      // session_compact and is awaiting later handlers (some hosts emit no late failure).
-      // Pi uses the same controller for its deadline, which is NOT owner intent.
-      if (event.reason === "manual" && event.signal) {
-        const signal = event.signal;
-        const cancelled = () => { if (isCompactionCancelled(signal)) this.halt(); };
-        signal.addEventListener("abort", cancelled, { once: true });
-        this.#offOperationAbort = () => signal.removeEventListener("abort", cancelled);
-        if (signal.aborted) cancelled();
-      }
     });
     on("session_compact_failed", (event: { reason?: string; aborted?: boolean; willRetry?: boolean; errorMessage?: string }, ctx) => {
       this.#context = ctx;
-      // The aborted bit alone is ambiguous: an earlier handler may decline and stop
-      // dispatch before we see the signal. Escape/halt is explicit; a seen signal
-      // proves cancellation unless the native deadline expired. Never manufacture
-      // durable owner intent from a decline or recoverable operation timeout.
+      // A seen signal distinguishes cancellation from the recoverable native
+      // deadline, not an operator from an SDK/extension caller. Escape/halt is explicit.
       const decline = takeCompactionDecline(this.pi);
       const operation = decline && decline.reason === event.reason ? decline.signal : this.#operation;
-      const ownerCancelled = ctx.signal?.aborted || (event.aborted && isCompactionCancelled(operation));
+      const cancelled = ctx.signal?.aborted || (event.aborted && isCompactionCancelled(operation));
       // Exact Pi no-op outcomes, with or without the host's error envelope. A provider
       // error merely quoting these phrases is still a recoverable failure, not a no-op.
       const message = event.errorMessage?.replace(/^Compaction failed: /, "");
       const benign = message === "Already compacted" || message === "Nothing to compact (session too small)" ||
         message === "Compaction cancelled";
       const dead = this.#providerDead;
-      if (ownerCancelled) this.halt();
+      if (this.#halted) { /* explicit owner stop suppresses recovery and its alarm */ }
       else if (dead?.phase === "compacting" && event.reason === "manual") {
-        // Fabric's own recovery compaction (ctx.compact is always "manual") ended without an owner
-        // cancel: Pi's native deadline (aborted or not), an error, a veto or a no-op. Recovery failed:
+        // Fabric's recovery compaction (ctx.compact is always "manual") ended without
+        // explicit owner stop: SDK cancellation, deadline, error, veto or no-op. Recovery failed:
         // one alarm and hold, never a silent provider-dead (smarty-dev#8742 item 4). Its error text
         // may echo provider content: it stays out of the alarm.
         this.#raiseProviderDead("compaction-failed");
-      } else if (event.aborted && event.reason !== "manual" && operation && !operation.aborted) {
-        // Pi settles an automatic extension veto as aborted. Retain its provenance
-        // rather than converting the outcome into a durable owner stop.
-        this.#compactionDecline = operation;
-      } else if (!event.aborted && !event.willRetry && dead &&
+      } else if (!cancelled && !event.aborted && !event.willRetry && dead &&
         (dead.phase === "recovering" || dead.phase === "compacting")) {
         // Another compaction failed during the incident, including a benign no-op: alarm, never back off.
         this.#raiseProviderDead("compaction-failed");
-      } else if (!event.aborted && !event.willRetry && !benign) {
+      } else if (!cancelled && !event.aborted && !event.willRetry && !benign) {
         this.#recordProviderFailure(true);
       }
       // A finished (failed) compaction is an idle edge for a recovery step that found Main compacting.
-      this.#armProviderDeadTimer();
+      if (!cancelled) this.#armProviderDeadTimer();
       // Unsuccessful boundaries never wake their queued replay, even for a benign rejection.
       // Later peer deliveries retain permission after a veto; errors await recovery,
       // but only a real owner stop survives reload.
@@ -1526,7 +1533,6 @@ export class MainAgentController implements FabricMainAgentTarget {
       // Retain the failure/in-flight guard so later batches wait for that retry's outcome.
       this.#providerRetryAt = 0;
       this.#stopProviderWake();
-      this.#compactionDecline = undefined;
       // smarty-dev#8742: any completed compaction (Fabric's recovery, a human /compact, Pi's
       // overflow recovery) ends a non-retryable incident's compaction step.
       this.#providerCompacted();
@@ -1539,7 +1545,6 @@ export class MainAgentController implements FabricMainAgentTarget {
       // The HOLD-induced restart belongs to the interrupted turn, not a fresh abort budget.
       if (!this.#interruptResume) this.#interruptUsedThisTurn = false;
       this.#interruptResume = false;
-      this.#compactionDecline = undefined;
       this.#stopOperation();
       this.#providerFailureRecorded = false;
       this.#stopProviderWake();
@@ -1558,13 +1563,14 @@ export class MainAgentController implements FabricMainAgentTarget {
       this.#closed = true;                                 // holds nothing new
       if (typeof this.pi.on !== "function") return;        // the next start confirms from the session
       if (this.#held.length && context.isIdle()) this.#release(true);
-      on("turn_end", (event: BoundaryEvent, ctx) => { this.#context = ctx; this.#reconcile(event); this.#confirm(); });
+      on("turn_end", (event: BoundaryEvent, ctx) => { this.#context = ctx; this.#reconcile(event, !this.#suspended); this.#confirm(); });
       on("agent_before_settle", (event: BoundaryEvent & { outcome?: string }, ctx) => {
         this.#context = ctx;
-        this.#reconcile(event);
-        if (event.outcome === undefined || event.outcome === "completed") this.#release(true);
+        const wake = !this.#suspended && (event.outcome === undefined || event.outcome === "completed");
+        this.#reconcile(event, wake);
+        if (wake) this.#release(true);
       });
-      on("agent_settled", (_event, ctx) => { this.#context = ctx; this.#confirm(); });
+      on("agent_settled", (_event, ctx) => { this.#context = ctx; this.#confirm(); this.#suspended = false; });
       return;
     }
     this.#flushMs = flushMs;
@@ -1585,7 +1591,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     // that continuation when the user cancels (review/astra F1 on pi-fabric#102).
     on("agent_before_settle", (event: BoundaryEvent & { outcome?: string }, ctx) => {
       this.#context = ctx;
-      this.#reconcile(event);
+      this.#reconcile(event, !this.#suspended && (event.outcome === undefined || event.outcome === "completed"));
       if (this.#suspended || (event.outcome !== undefined && event.outcome !== "completed")) return;
       this.#release(true);
     });
@@ -1647,7 +1653,6 @@ export class MainAgentController implements FabricMainAgentTarget {
     this.#stopProviderDeadTimer();
     this.#stopProviderDeadDeadline();
     this.#stopOperation();
-    this.#compactionDecline = undefined;
     takeCompactionDecline(this.pi);
   }
 
@@ -1806,8 +1811,6 @@ export class MainAgentController implements FabricMainAgentTarget {
     // Retiring a compaction signal must not cancel a scheduled provider retry.
     if (this.#wake) clearInterval(this.#wake);
     this.#wake = undefined;
-    this.#offOperationAbort?.();
-    this.#offOperationAbort = undefined;
     this.#operation = undefined;
   }
 
@@ -1858,8 +1861,9 @@ export class MainAgentController implements FabricMainAgentTarget {
     if (this.#providerDead) {
       // A stale compaction callback must not advance the successor binding.
       this.#providerDead = { ...this.#providerDead };
-      if (this.#providerDead.phase === "compacting") {
+      if (this.#providerDead.phase === "compacting" && !this.#halted) {
         // The old binding owns that compaction. Never grant another one on reload.
+        // An explicit owner stop suppresses the recovery alarm across reload too.
         this.#raiseProviderDead("compaction-failed");
       }
     }
@@ -2057,7 +2061,7 @@ export class MainAgentController implements FabricMainAgentTarget {
       return this.#providerDead === dead && this.#bindingsLive && !this.#reloading;
     };
     const failed = (): void => {
-      if (!fresh() || dead.phase !== "compacting") return;
+      if (!fresh() || this.#halted || dead.phase !== "compacting") return;
       this.#raiseProviderDead("compaction-failed");
     };
     try {
@@ -2270,8 +2274,13 @@ export class MainAgentController implements FabricMainAgentTarget {
     if (this.#reloading || !items.length || (this.#inboxFence && !this.#inboxFence.active())) return false;
     const interrupt = this.#context?.isIdle() === true && items.every(item => this.#interrupts.has(item.id));
     triggerTurn &&= (peerSteer || !this.#halted) && !this.#providerHeld() && (!this.#context?.signal?.aborted || interrupt);
+    // Capture the actual handoff decision before native admission, not at delayed
+    // confirmation. A previously triggered handoff must not be relabelled by a later halt.
+    if (this.#halted && !peerSteer) for (const item of items) item.deliveryReason = "operator-halt";
     // Persist a downgraded explicit replay policy, including handoffs retried after a later reload.
     if (!triggerTurn) for (const item of items) if (item.deliverAs !== undefined) item.triggerTurn = false;
+    // Retry this barrier even if an earlier save failed after mutating the item.
+    if (this.#journal && items.some(item => item.deliveryReason === "operator-halt")) this.#save();
     // Each item keeps its own delivery mark: a flushed batch goes in as a steer, but it holds followUps.
     const delivery: FabricMainAgentDelivery = flushed ? "followUp" : deliverAs;
     const blocks = items.map((item) => agentMessageBlock(item, delivery));
@@ -2291,6 +2300,7 @@ export class MainAgentController implements FabricMainAgentTarget {
         ...(item.inboxTopic === undefined ? {} : { inboxTopic: item.inboxTopic }),
         ...(item.inboxKey === undefined ? {} : { inboxKey: item.inboxKey }),
         ...(item.supersedes?.length ? { supersedes: item.supersedes } : {}),
+        ...(item.deliveryReason === "operator-halt" ? { deliveryReason: item.deliveryReason } : {}),
       };
     };
     const first = items[0]!;

@@ -164,19 +164,21 @@ describe("MeshStore lock-timing hook", () => {
     expect(JSON.parse(fs.readFileSync(state, "utf8")).entries["presence/a"].value).toBe(0);
   });
 
-  it("releases the native lock before recording, so bookkeeping never delays a contender", async () => {
+  it("closes the FIFO ticket before recording, so bookkeeping never delays a follower", async () => {
     const root = temp();
     const mesh = new store.MeshStore(root, 64 * 1024, 100);
-    const stats = registry[lockKey]!.stats as { acquired(...args: unknown[]): void };
-    const record = stats.acquired.bind(stats);
-    const acquired = vi.spyOn(stats, "acquired").mockImplementation((...args) => {
-      expect(fs.existsSync(path.join(root, ".lock"))).toBe(false);
-      record(...args);
-    });
+    const { MeshLockTicket } = await import("../src/mesh/lock-queue.js");
+    const close = vi.spyOn(MeshLockTicket.prototype, "close");
+    const acquired = vi.spyOn(registry[lockKey]!.stats as { acquired(): void }, "acquired");
     try {
       await mesh.exclusive(() => undefined);
-      expect(acquired).toHaveBeenCalledOnce();
-    } finally { acquired.mockRestore(); }
+      expect(close).toHaveBeenCalledTimes(1);
+      expect(acquired).toHaveBeenCalledTimes(1);
+      expect(close.mock.invocationCallOrder[0]!).toBeLessThan(acquired.mock.invocationCallOrder[0]!);
+    } finally {
+      close.mockRestore();
+      acquired.mockRestore();
+    }
   });
 
   it("records no failed try or timeout for a cold protocol-2 pending incarnation", async () => {

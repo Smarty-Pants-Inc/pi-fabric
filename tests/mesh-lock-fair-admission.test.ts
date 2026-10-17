@@ -8,7 +8,7 @@ import { promisify } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MeshLockTimeoutError } from "../src/core/atomic-write.js";
 import { MeshLockTicket, meshLockQueueDirectory } from "../src/mesh/lock-queue.js";
-import { createMeshLockAdmission, MeshLock, MeshLockQueueExpiredError } from "../src/mesh/mesh-lock.js";
+import { MeshLock, MeshLockQueueExpiredError } from "../src/mesh/mesh-lock.js";
 
 // Fair mesh lock admission (smarty-dev#6477 L0b): wake-on-handoff, predecessor-only waiting,
 // and no fallback barging while the queue head is alive and making progress.
@@ -195,57 +195,50 @@ describe("fair mesh lock admission", () => {
     vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
     const root = scratch();
     const head = ticket(root, 10_000);
-    const waiter = ticket(root, 10_000);
     expect(head.mayContend()).toBe(true);
-    expect(waiter.mayContend()).toBe(false);
     const canonical = path.join(root, ".lock");
     const owner = `live-holder\n${process.pid}\n${Date.now()}\n`;
     fs.mkdirSync(canonical);
     fs.writeFileSync(path.join(canonical, "owner"), owner);
     const watches = watchNotifications();
+    const eligibility = vi.spyOn(MeshLockTicket.prototype, "mayContend");
+    const mkdir = vi.spyOn(fs, "mkdirSync");
+    const attempts = () => mkdir.mock.calls.filter(([file]) => String(file) === canonical).length;
     const abort = new AbortController();
-    const waits: Promise<unknown>[] = [];
+    const lock = new MeshLock(root, { writeSignal: abort.signal }, () => undefined);
+    const operation = vi.fn(() => "admitted");
+    const pending = lock.withLock(operation).catch((error: unknown) => error);
     try {
-      const pending = waiter.wait(20, abort.signal);
-      waits.push(pending.catch(() => undefined));
+      await vi.advanceTimersByTimeAsync(0);
       expect(watches.handles).toHaveLength(1);
       expect(watches.attempts).toEqual([path.join(meshLockQueueDirectory(root), names(root)[0]!)]);
       watches.failNextOpen();
       watches.handles[0]!.emit("error", new Error("notification lost"));
-      await pending;
-      // Error is a wake, not permission; reopen failure retains the caller's bounded safety-net wait.
-      expect(waiter.mayContend()).toBe(false);
-      let polled = false;
-      const failedReopen = waiter.wait(20, abort.signal).then(() => { polled = true; });
-      waits.push(failedReopen.catch(() => undefined));
+      await vi.advanceTimersByTimeAsync(0);
+      // Error is a wake, not permission: a failed reopen must not strand us on a cached healthy identity.
       expect(watches.attempts).toHaveLength(2);
+      expect(operation).not.toHaveBeenCalled();
+      expect(attempts()).toBe(0);
       expect(names(root)).toHaveLength(2);
       expect(fs.readFileSync(path.join(canonical, "owner"), "utf8")).toBe(owner);
       expect(watches.handles[0]!.close).toHaveBeenCalled();
       await vi.advanceTimersByTimeAsync(19);
-      expect(polled).toBe(false);
+      expect(watches.attempts).toHaveLength(2);
       await vi.advanceTimersByTimeAsync(1);
-      await failedReopen;
-      expect(waiter.mayContend()).toBe(false);
-      let woken = false;
-      const resumed = waiter.wait(20, abort.signal).then(() => { woken = true; });
-      waits.push(resumed.catch(() => undefined));
-      expect(watches.handles).toHaveLength(2);
+      expect(watches.handles).toHaveLength(2); // failed-watch fallback was exactly 20 ms
+      const checks = eligibility.mock.calls.length;
       await vi.advanceTimersByTimeAsync(19);
-      expect(woken).toBe(false);
-      expect(fs.readFileSync(path.join(canonical, "owner"), "utf8")).toBe(owner);
+      expect(eligibility).toHaveBeenCalledTimes(checks); // retain the existing follower safety-net cadence
+      await vi.advanceTimersByTimeAsync(1);
+      expect(eligibility).toHaveBeenCalledTimes(checks + 1); // a dropped event retains the existing 20 ms poll
+      expect(attempts()).toBe(0);
       head.close();
       fs.renameSync(canonical, path.join(root, "released-fixture"));
       watches.handles[1]!.emit("change", "rename", null);
-      await resumed;
-      expect(woken).toBe(true);
-      expect(waiter.mayContend()).toBe(true);
-      waiter.close();
-      // Advisory wakeups never replace the real canonical acquisition.
-      const lock = new MeshLock(root, {}, () => undefined);
-      const operation = vi.fn(() => "admitted");
-      expect(await lock.withLock(operation)).toBe("admitted");
+      await vi.advanceTimersByTimeAsync(0);
+      expect(await pending).toBe("admitted"); // actual canonical acquisition, not a mocked permission decision
       expect(operation).toHaveBeenCalledOnce();
+      expect(attempts()).toBe(1);
       expect(fs.existsSync(canonical)).toBe(false);
       expect(names(root)).toEqual([]);
       expect(watches.handles.every(handle => handle.close.mock.calls.length > 0)).toBe(true);
@@ -253,7 +246,7 @@ describe("fair mesh lock admission", () => {
     } finally {
       abort.abort(new Error("test cleanup"));
       await vi.advanceTimersByTimeAsync(100);
-      await Promise.allSettled(waits);
+      await pending;
     }
   });
 
@@ -313,7 +306,7 @@ describe("fair mesh lock admission", () => {
     }
   });
 
-  it("shared admission: watch setup exhausting the fixed 2 s budget expires immediately with zero canonical attempts", async () => {
+  it("watch setup exhausting the fixed 2 s budget expires immediately with zero canonical attempts", async () => {
     vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
     const root = scratch();
     const head = ticket(root, 10_000);
@@ -325,13 +318,10 @@ describe("fair mesh lock admission", () => {
     });
     const mkdir = vi.spyOn(fs, "mkdirSync");
     const abort = new AbortController();
-    const admission = createMeshLockAdmission(root, randomUUID(), 2_000);
-    tickets.push(admission.ticket);
-    expect(admission.ticket.mayContend()).toBe(false);
+    const lock = new MeshLock(root, { writeSignal: abort.signal }, () => undefined);
+    const operation = vi.fn();
     let settled = false;
-    const pending = admission.ticket.wait(20, abort.signal, admission.deadline)
-      .then(() => admission.expire(path.join(root, ".lock"), root, "mesh-lock", "other"))
-      .catch((error: unknown) => error).finally(() => { settled = true; });
+    const pending = lock.withLock(operation, 2_000).catch((error: unknown) => error).finally(() => { settled = true; });
     try {
       await vi.advanceTimersByTimeAsync(0); // drain continuations without granting another millisecond
       expect(watches.handles).toHaveLength(1);
@@ -339,6 +329,7 @@ describe("fair mesh lock admission", () => {
       expect(await pending).toBeInstanceOf(MeshLockQueueExpiredError);
       expect(await pending).toMatchObject({ kind: "pre-lock", preLockCode: "FABRIC_MESH_LOCK_QUEUE_EXPIRED",
         code: "FABRIC_MESH_LOCK_TIMEOUT", attempts: 0, waitersAhead: 1, waitedMs: 2_000 });
+      expect(operation).not.toHaveBeenCalled();
       expect(mkdir.mock.calls.filter(([file]) => String(file) === path.join(root, ".lock"))).toEqual([]);
       expect(names(root)).toEqual([headName]);
       expect(watches.handles[0]!.close).toHaveBeenCalled();
@@ -350,106 +341,107 @@ describe("fair mesh lock admission", () => {
     }
   });
 
-  it.each([1, 2, 3] as const)("protocol %s: slow plain retry setup cannot acquire past the deadline", async (protocol) => {
-    const root = scratch();
-    const lock = new MeshLock(root, { lockProtocol: protocol }, () => undefined);
-    await lock.ownIncarnation;
+  it.each([1, 2, 3] as const)("protocol %s: slow release-watch setup cannot acquire past the deadline", async (protocol) => {
     vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
-    vi.spyOn(Math, "random").mockReturnValue(0.5);
+    const root = scratch();
     const canonical = path.join(root, ".lock");
     fs.mkdirSync(canonical);
     fs.writeFileSync(path.join(canonical, "owner"), `live-holder\n${process.pid}\n${Date.now()}\n`);
-    const schedule = setTimeout;
-    let setupRan = false;
-    vi.spyOn(globalThis, "setTimeout").mockImplementation(((...args: Parameters<typeof setTimeout>) => {
-      if (!setupRan && Number(args[1]) <= 250) {
-        setupRan = true;
-        vi.setSystemTime(Date.now() + 2_001);
-        fs.renameSync(canonical, path.join(root, "released-fixture"));
-      }
-      return schedule(...args);
-    }) as typeof setTimeout);
+    const lock = new MeshLock(root, { lockProtocol: protocol }, () => undefined);
+    await lock.ownIncarnation;
+    const watches = watchNotifications(() => {
+      vi.setSystemTime(Date.now() + 2_001);
+      fs.renameSync(canonical, path.join(root, "released-fixture"));
+    });
     const operation = vi.fn(() => "acquired after budget");
     const pending = lock.withLock(operation, 2_000).catch((error: unknown) => error);
-    await vi.advanceTimersByTimeAsync(250);
+    await vi.advanceTimersByTimeAsync(0);
     const result = await pending;
-    expect(setupRan).toBe(true);
     expect(result).toBeInstanceOf(MeshLockTimeoutError);
+    expect(result).not.toBeInstanceOf(MeshLockQueueExpiredError);
     expect(result).toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT", attempts: 1 });
     expect(operation).not.toHaveBeenCalled();
+    expect(watches.attempts).toEqual([root]);
+    expect(watches.handles[0]!.close).toHaveBeenCalled();
+    expect(names(root)).toEqual([]);
     expect(fs.existsSync(canonical)).toBe(false);
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it.each([1, 2, 3] as const)("protocol %s: a late native retry cannot acquire a lock released after the deadline", async (protocol) => {
-    const root = scratch();
-    const lock = new MeshLock(root, { lockProtocol: protocol }, () => undefined);
-    await lock.ownIncarnation;
+  it.each([1, 2, 3] as const)("protocol %s: promotion during slow predecessor-watch setup cannot acquire past the deadline", async (protocol) => {
     vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
-    vi.spyOn(Math, "random").mockReturnValue(0.5);
+    const root = scratch();
+    const head = ticket(root, 10_000);
+    expect(head.mayContend()).toBe(true);
+    const predecessor = path.join(meshLockQueueDirectory(root), names(root)[0]!);
     const canonical = path.join(root, ".lock");
     fs.mkdirSync(canonical);
     fs.writeFileSync(path.join(canonical, "owner"), `live-holder\n${process.pid}\n${Date.now()}\n`);
+    const lock = new MeshLock(root, { lockProtocol: protocol }, () => undefined);
+    await lock.ownIncarnation;
+    const watches = watchNotifications(() => {
+      vi.setSystemTime(Date.now() + 2_001);
+      head.close(); // eligible on return, but only after its fixed acquisition budget
+      fs.renameSync(canonical, path.join(root, "released-fixture"));
+    });
     const operation = vi.fn(() => "acquired after budget");
     const pending = lock.withLock(operation, 2_000).catch((error: unknown) => error);
     await vi.advanceTimersByTimeAsync(0);
-    // Fire the fixed budget and retry timers without resuming the stalled continuation.
-    vi.advanceTimersByTime(2_001);
-    fs.renameSync(canonical, path.join(root, "released-fixture"));
-    await vi.advanceTimersByTimeAsync(0);
     const result = await pending;
-    expect(result).toBeInstanceOf(MeshLockTimeoutError);
-    expect(result).toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT", attempts: 1 });
+    expect(result).toBeInstanceOf(MeshLockQueueExpiredError);
+    expect(result).toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT", preLockCode: "FABRIC_MESH_LOCK_QUEUE_EXPIRED",
+      attempts: 0, waitedMs: 2_001, kind: "pre-lock" });
     expect(operation).not.toHaveBeenCalled();
+    expect(watches.attempts).toEqual([predecessor]);
+    expect(watches.handles[0]!.close).toHaveBeenCalled();
+    expect(names(root)).toEqual([]);
     expect(fs.existsSync(canonical)).toBe(false);
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it("abort during synchronous plain retry setup rejects with the exact reason without sleeping or leaking timers", async () => {
+  it("abort during synchronous watch setup rejects with the exact reason without sleeping or leaking admission", async () => {
     vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
     const root = scratch();
-    const canonical = path.join(root, ".lock");
-    const owner = `live-holder\n${process.pid}\n${Date.now()}\n`;
-    fs.mkdirSync(canonical);
-    fs.writeFileSync(path.join(canonical, "owner"), owner);
+    const head = ticket(root, 10_000);
+    expect(head.mayContend()).toBe(true);
+    const headName = names(root)[0]!;
     const abort = new AbortController();
-    const reason = new Error("cancelled while the retry timer was opening");
+    const reason = new Error("cancelled while fs.watch was opening");
     const added = vi.spyOn(abort.signal, "addEventListener");
     const removed = vi.spyOn(abort.signal, "removeEventListener");
-    const schedule = setTimeout;
-    let setupRan = false;
-    vi.spyOn(globalThis, "setTimeout").mockImplementation(((...args: Parameters<typeof setTimeout>) => {
-      if (!setupRan && Number(args[1]) <= 250) { setupRan = true; abort.abort(reason); }
-      return schedule(...args);
-    }) as typeof setTimeout);
+    const watches = watchNotifications(() => abort.abort(reason));
+    const mkdir = vi.spyOn(fs, "mkdirSync");
     const lock = new MeshLock(root, { writeSignal: abort.signal }, () => undefined);
     const operation = vi.fn();
     let settled = false;
     const pending = lock.withLock(operation, 2_000).catch((error: unknown) => error).finally(() => { settled = true; });
     try {
       await vi.advanceTimersByTimeAsync(0);
-      expect(setupRan).toBe(true);
+      expect(watches.handles).toHaveLength(1);
       expect(settled).toBe(true);
       expect(await pending).toBe(reason);
       for (const [type, listener] of added.mock.calls) {
         if (type === "abort") expect(removed).toHaveBeenCalledWith("abort", listener);
       }
       expect(operation).not.toHaveBeenCalled();
-      expect(fs.readFileSync(path.join(canonical, "owner"), "utf8")).toBe(owner);
+      expect(mkdir.mock.calls.filter(([file]) => String(file) === path.join(root, ".lock"))).toEqual([]);
+      expect(names(root)).toEqual([headName]);
+      expect(watches.handles[0]!.close).toHaveBeenCalled();
       expect(vi.getTimerCount()).toBe(0);
     } finally {
       abort.abort(reason);
-      await vi.advanceTimersByTimeAsync(100);
+      await vi.advanceTimersByTimeAsync(100); // also drains the current implementation's missed-abort timer on RED
       await pending;
     }
   });
 
-  it.skipIf(process.platform === "win32")("multi-process: no plain Main starves or times out against legacy contenders", async () => {
+  it.skipIf(process.platform === "win32")("multi-process: no queued Main starves or times out against legacy bargers", async () => {
     const { stdout } = await promisify(execFile)(process.execPath, ["scripts/benchmark-mesh-lock-fairness.mjs",
       "--n=12", "--legacy=2", "--try=2", "--seconds=2", "--budgetMs=10000", "--pLong=0"], { timeout: 85_000 });
     const report = JSON.parse(stdout);
-    // The harness checks real critical-section non-overlap; FIFO source classifications are no longer a contract.
     expect(report.timeouts.queued).toBe(0);
+    expect(report.source.fallback).toBe(0);
+    expect(report.source.queueHead).toBeGreaterThan(report.source.legacyBarge);
     expect(report.queuedWaitMs.max).toBeLessThan(8000);
   }, 90_000);
 });

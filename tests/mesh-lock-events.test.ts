@@ -390,37 +390,45 @@ describe("lock events: rotation across processes", () => {
 });
 
 describe("lock events in one process", () => {
-  it.each([false, true])("native contention (bounded=%s) records real attempts and enforces the timeout gate", async (bounded) => {
+  it.each([false, true])("FIFO expiry (bounded=%s) is counted separately, while real contention still fails the timeout gate", async (bounded) => {
     const { events, MeshLock } = await load();
+    const { meshLockQueueDirectory, MeshLockTicket } = await import("../src/mesh/lock-queue.js");
     const { MeshLockTimeoutError } = await import("../src/core/atomic-write.js");
     const { lockStats } = await import("../src/mesh/mesh-lock.js");
     const { main } = await import("../src/mesh-lock-stats-cli.js");
     const root = temp();
     const lock = new MeshLock(root, { lockTimeoutMs: 2_000 }, () => undefined);
     await lock.withLock(() => undefined); // seed the real stats file; no event for a quick acquisition
-    vi.useFakeTimers({ toFake: ["Date", "performance", "setTimeout", "clearTimeout"] });
-    const canonical = path.join(root, ".lock");
-    const owner = `held\n${process.pid}\n${Date.now()}\n`;
-    fs.mkdirSync(canonical);
-    fs.writeFileSync(path.join(canonical, "owner"), owner);
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    const directory = meshLockQueueDirectory(root);
+    fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+    const head = path.join(directory, `${"0".repeat(24)}-${process.pid}-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa`);
+    fs.writeFileSync(head, "");
     const failed = vi.spyOn(lockStats!, "failed");
     const waitTimeout = vi.spyOn(events, "waitTimeout");
+    const queueExpired = vi.spyOn(events, "queueExpired");
+    const close = vi.spyOn(MeshLockTicket.prototype, "close");
     const operation = vi.fn();
-    const pending = Array.from({ length: 3 }, () => lock.withLock(operation, 100, "publish", bounded).catch((error: unknown) => error));
-    await vi.advanceTimersByTimeAsync(150);
+    const pending = Array.from({ length: 3 }, () => lock.withLock(operation, 2_000, "publish", bounded).catch((error: unknown) => error));
+    for (let elapsed = 0; elapsed < 2_000; elapsed += 50) {
+      const now = Date.now() / 1000;
+      fs.utimesSync(head, now, now); // live admission head, but canonical .lock is free
+      await vi.advanceTimersByTimeAsync(50);
+    }
     for (const error of await Promise.all(pending)) {
-      expect(error).toBeInstanceOf(MeshLockTimeoutError);
-      expect(error).toMatchObject({ name: "MeshLockTimeoutError", code: "FABRIC_MESH_LOCK_TIMEOUT" });
-      expect((error as InstanceType<typeof MeshLockTimeoutError>).attempts).toBeGreaterThan(0);
+      expect(error).toBeInstanceOf(MeshLockTimeoutError); // caller compatibility, not diagnostic attribution
+      expect(error).toMatchObject({ name: "MeshLockQueueExpiredError", code: "FABRIC_MESH_LOCK_TIMEOUT", attempts: 0 });
     }
     expect(operation).not.toHaveBeenCalled();
-    expect(fs.readFileSync(path.join(canonical, "owner"), "utf8")).toBe(owner);
-    expect(failed).toHaveBeenCalledTimes(3);
-    expect(waitTimeout).toHaveBeenCalledTimes(bounded ? 0 : 3);
-    expect(readEvents(eventsFile(root))).toHaveLength(bounded ? 0 : 3);
+    expect(failed).not.toHaveBeenCalled();
+    expect(waitTimeout).not.toHaveBeenCalled();
+    expect(queueExpired).toHaveBeenCalledTimes(3);
+    expect(close.mock.invocationCallOrder[0]!).toBeLessThan(queueExpired.mock.invocationCallOrder[0]!);
+    expect(readEvents(eventsFile(root))).toHaveLength(3);
     for (const event of readEvents(eventsFile(root))) {
-      expect(event).toMatchObject({ v: 1, kind: "wait-timeout", store: "mesh-lock", class: "publish",
-        holder: { pid: process.pid }, waiter: { pid: process.pid, op: "publish" } });
+      expect(event).toMatchObject({ v: 1, kind: "pre-lock", preLockCode: "FABRIC_MESH_LOCK_QUEUE_EXPIRED", store: "mesh-lock", class: "publish",
+        waitedMs: 2_000, holder: { pid: null, process: null, op: null }, waiter: { pid: process.pid, op: "publish" } });
+      expect(event.waitersAhead).toBeGreaterThanOrEqual(1);
     }
     const meter = () => {
       registry[lockKey]!.flush();
@@ -429,23 +437,23 @@ describe("lock events in one process", () => {
         { now: Date.now() + 60_000, stdout: text => { json += text; } });
       return { exit, summary: JSON.parse(json) as { n: number; timeouts: number; tries: number } };
     };
-    expect(meter()).toMatchObject({ exit: bounded ? 0 : 3,
-      summary: { n: 1, timeouts: bounded ? 0 : 3, tries: bounded ? 3 : 0 } });
+    expect(meter()).toMatchObject({ exit: 0, summary: { n: 1, timeouts: 0, tries: 0 } });
 
-    // An ordinary caller always counts as contention, including after bounded tries.
+    // Counterexample: an eligible head really probes a held canonical lock. It must still count as contention.
+    fs.renameSync(head, path.join(root, "fixture-previous-head"));
+    fs.mkdirSync(path.join(root, ".lock"));
+    fs.writeFileSync(path.join(root, ".lock", "owner"), `held\n${process.pid}\n${Date.now()}\n`);
     const contended = lock.withLock(operation, 100, "publish").catch((error: unknown) => error);
     await vi.advanceTimersByTimeAsync(150);
     const timeout = await contended;
     expect(timeout).toBeInstanceOf(MeshLockTimeoutError);
+    expect(timeout).toMatchObject({ name: "MeshLockTimeoutError" });
     expect((timeout as InstanceType<typeof MeshLockTimeoutError>).attempts).toBeGreaterThan(0);
-    expect(failed).toHaveBeenCalledTimes(4);
-    expect(waitTimeout).toHaveBeenCalledTimes(bounded ? 1 : 4);
-    expect(readEvents(eventsFile(root)).filter(event => event.kind === "wait-timeout")).toHaveLength(bounded ? 1 : 4);
-    expect(meter()).toMatchObject({ exit: 3,
-      summary: { n: 1, timeouts: bounded ? 1 : 4, tries: bounded ? 3 : 0 } });
-    expect(fs.readFileSync(path.join(canonical, "owner"), "utf8")).toBe(owner);
-    expect(operation).not.toHaveBeenCalled();
-    expect(vi.getTimerCount()).toBe(0);
+    expect(failed).toHaveBeenCalledTimes(1);
+    expect(waitTimeout).toHaveBeenCalledTimes(1);
+    expect(queueExpired).toHaveBeenCalledTimes(3);
+    expect(readEvents(eventsFile(root)).filter(event => event.kind === "wait-timeout")).toHaveLength(1);
+    expect(meter()).toMatchObject({ exit: 3, summary: { n: 1, timeouts: 1, tries: 0 } });
   });
 
   it("SQLite native BEGIN timeout emits one wait-timeout event", async () => {

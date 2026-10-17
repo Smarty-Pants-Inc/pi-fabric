@@ -533,6 +533,8 @@ export class StoreBridgeSide implements BridgeSide {
   // replays them on its own snapshot (CommitOutboxPlan.replay) before it stages anything.
   readonly #outbox: CommitOutbox;
   #recovered = false;
+  // Active only during one mirror commit attempt, including recovery and afterCommit retries.
+  #skippedRelayedRoots: ReadonlySet<string> | undefined;
   #leaseProcess: Promise<BridgeLeaseProcess | undefined> | undefined;
 
   constructor(
@@ -544,11 +546,17 @@ export class StoreBridgeSide implements BridgeSide {
   ) {
     if (!validBridgeName(peer)) throw new Error(`Invalid bridge peer name: ${peer}`);
     assertBridgeStateBackend(store.root, store.stateBackend);
+    // A skipped root's effects are deferred, not successful no-ops: CommitOutbox catches the
+    // throw and retains the row for a later legitimate renewal/removal (or its superseding effect).
+    const retainSkipped = (rootId?: string): void => {
+      if (rootId && this.#skippedRelayedRoots?.has(rootId)) throw new Error("Skipped relayed root lease effect deferred");
+    };
     this.#outbox = new CommitOutbox(store, `bridge/${peer}`, this.#identity(), {
-      lease: (lease: BridgeLease, view, replay) => this.#applyLease(lease, view, replay),
+      lease: (lease: BridgeLease, view, replay) => { retainSkipped(lease.rootId); this.#applyLease(lease, view, replay); },
       // A removal (live or replayed) unlinks only the removed mirror's own lease: a replacement
       // owner that wrote its file lease before its state record keeps it (L2b owner review, P2).
       unlease: (gone: BridgeUnlease, view) => {
+        retainSkipped(gone.rootId);
         if (view.get(gone.key) || typeof gone.rootId !== "string" || typeof gone.identityId !== "string" ||
           typeof gone.startedAt !== "number") return;
         // A lease without an incarnation is a mirror lease of an earlier release (or a writer from
@@ -1186,6 +1194,10 @@ export class StoreBridgeSide implements BridgeSide {
       ...removed.map((gone) => ({ kind: "unlease", key: `lease:${gone.id}`, payload: gone })),
     ];
     const incomingRootIds = new Set(presence.hosts.map(({ record }) => record.rootId));
+    // A trusted hub can carry a stale projection from another link. That projection is
+    // non-authoritative: keep the destination's newer mirror and let unrelated roots in this
+    // same pass proceed. The set spans plan retries so one root produces one warning per pass.
+    const skippedRelayedRoots = new Set<string>();
     // Match compute's normalized incarnation evidence without mutating cached lease histories.
     const leaseIncarnationDigest = (leases: ReadonlyMap<string, FabricHostLease>): string => contentDigest(
       [...leases.values()].filter(lease => incomingRootIds.has(lease.rootId)).map(lease => ({
@@ -1231,8 +1243,10 @@ export class StoreBridgeSide implements BridgeSide {
         for (const { record, expiresAt, observedAt: sourceObservedAt } of presence.hosts) {
           const relayed = remoteHostOf(record) !== undefined;
           if (relayed && (!fromHub || record.bridgeVia !== this.peer || record.remoteHost === this.peer)) continue;
+          // A preflight skip remains a skip after replay or a plan retry, even if authority moved.
+          if (relayed && skippedRelayedRoots.has(record.rootId)) continue;
           if (own.has(record.id) || own.has(record.identity.id) || own.has(record.rootId)) continue;
-          // Refuse the whole batch, rather than omitting this host from wanted: omission would
+          // Refuse stale native/direct presence rather than omitting it: omission would
           // delete the newer mirror, its participants and its lease in the removal pass below.
           // Check before liveness filtering too: an expired stale frame proves no withdrawal.
           const knownHistory = mergeBridgeSupersededHistory(superseded.get(record.rootId) ?? []);
@@ -1242,6 +1256,18 @@ export class StoreBridgeSide implements BridgeSide {
           if ((incarnationOf(record).incarnationToken === undefined &&
               ((currentTokens.get(record.rootId)?.length ?? 0) > 0 || knownHistory.tokens.length > 0)) ||
               olderBridgeIncarnation(record, knownHistory.tokens)) {
+            // Native and direct-link stale frames remain a hard refusal/fence. Only a
+            // structurally attributable re-export from the trusted hub may be skipped:
+            // omitting it preserves the already-held mirror instead of treating absence as
+            // withdrawal. K05 identity and ownership checks above remain unchanged.
+            if (relayed && fromHub && record.bridgeVia === this.peer && record.remoteHost !== this.peer) {
+              // The Set is intentionally scoped to this mirror pass; compute can run more than
+              // once while the SQLite plan is retried.
+              const firstSkip = !skippedRelayedRoots.has(record.rootId);
+              skippedRelayedRoots.add(record.rootId);
+              if (firstSkip) console.warn(`bridge ${this.peer}: skipped stale relayed root ${record.rootId}; preserving its mirror`);
+              continue;
+            }
             throw new BridgeStaleIncarnationError(record.rootId);
           }
           // Source expiry and age are meaningful on the SOURCE clock only (#10068).
@@ -1318,6 +1344,10 @@ export class StoreBridgeSide implements BridgeSide {
         for (const [key, { value, version }] of mirrored) {
           if (halted()) return undefined;
           if (wanted.has(key) || mirrorLinkOf(value) !== this.peer) continue;
+          // A skipped trusted-hub relay is retained as authority, including its participant
+          // and lease. Do not let the normal omission cleanup reinterpret a stale projection
+          // as a withdrawal.
+          if (isObject(value) && typeof value.rootId === "string" && skippedRelayedRoots.has(value.rootId)) continue;
           if (key.startsWith(HOST_PREFIX) && isObject(value) && typeof value.id === "string") {
             const gone = hostOf(key, value);
             removed.push(gone
@@ -1350,6 +1380,7 @@ export class StoreBridgeSide implements BridgeSide {
       const judgesLeaseLiveness = early !== undefined && early.view.listAll(BRIDGE_HANDOFF_PREFIX).length > 0;
       const planned = early && !halted() ? compute(early.view, files) : undefined;
       const plan = this.#outbox.plan();
+      this.#skippedRelayedRoots = skippedRelayedRoots;
       try {
         await this.store.writeBatch({
           identity: this.#identity(),
@@ -1409,6 +1440,8 @@ export class StoreBridgeSide implements BridgeSide {
       } catch (error) {
         if (error instanceof MirrorPlanStale) continue;
         throw error;
+      } finally {
+        this.#skippedRelayedRoots = undefined;
       }
       break;
     }

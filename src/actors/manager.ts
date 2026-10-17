@@ -742,11 +742,11 @@ export class ActorPreparationTimeoutError extends ActorPreparationError {
   }
 }
 
-/** Only known preparation deadlines/deferred mesh writes and registry vetoes may expire.
- * Keep the typed veto distinct: it committed nothing, but is not a timeout. */
+/** Only known preparation deadlines/deferred mesh writes and registry-phase vetoes may expire.
+ * A typed veto from binding or another phase is not registry retry authority. */
 const preparationFailureKind = (error: unknown): true | "timeout" | ActorRegistryUpdateVetoedError => {
   for (let cause: unknown = error, depth = 0; cause instanceof Error && depth < 4; cause = cause.cause, depth++) {
-    if (cause instanceof ActorRegistryUpdateVetoedError) return cause;
+    if (cause instanceof ActorRegistryUpdateVetoedError && error instanceof ActorPreparationError && error.phase === "registry") return cause;
     if (cause instanceof ActorPreparationTimeoutError || cause instanceof AgentLaunchPreparationTimeoutError || Boolean(isMeshWriteDeferred(cause))) return "timeout";
   }
   return true;
@@ -4616,6 +4616,22 @@ export class ActorManager {
     return { valid: true };
   }
 
+  #preparationHeadReady(actor: ManagedActor): boolean {
+    const head = actor.queue[0];
+    if (!head || head.resolve || head.reject ||
+        !actor.activationBlocked || activationBlockClass(actor.activationBlocked.code) !== "hard" ||
+        (!((head.preparationAttempts ?? 0) > 0) && actor.activationBlocked.code !== "failing-preparation")) return true;
+    // A failed queue checkpoint can leave zero attempts on disk while the hard
+    // preparation block committed separately. That block still holds callerless work.
+    // Confirmed-unlaunched work stays in custody until an explicit reset or a
+    // successful caller-owned probe. New callerless input must not clear its block.
+    // Asks bypass batching, so a probe cannot absorb the retained observations.
+    const probe = actor.queue.findIndex(item => Boolean(item.resolve || item.reject));
+    if (probe < 0) return false;
+    actor.queue.unshift(...actor.queue.splice(probe, 1));
+    return true;
+  }
+
   #ensureDrain(actor: ManagedActor): void {
     if (
       actor.draining ||
@@ -4631,7 +4647,7 @@ export class ActorManager {
     ) {
       return;
     }
-    if (!this.#batchReady(actor)) return;
+    if (!this.#preparationHeadReady(actor) || !this.#batchReady(actor)) return;
     actor.draining = true;
     this.#draining.set(actor.id, actor);
     const drain = this.#slotEnforced(actor.topics)
@@ -4671,7 +4687,10 @@ export class ActorManager {
         }, this.#preparationTimeoutMs);
       })]);
     } catch (error) {
-      throw error instanceof ActorPreparationError ? error : new ActorPreparationError(actor.id, phase, error);
+      // The operation boundary owns phase evidence, not an error supplied by its caller.
+      // Preserve same-phase subclasses (notably timeouts) and their retry budgets.
+      throw error instanceof ActorPreparationError && error.phase === phase
+        ? error : new ActorPreparationError(actor.id, phase, error);
     } finally {
       if (timer) clearTimeout(timer);
     }
@@ -4725,7 +4744,8 @@ export class ActorManager {
     // Cleanup of that pending retry must not double-count a failed activation.
     // Failures outside an item retry still need fail-loud host reporting.
     if (!item && !diagnosticOnly && !actor.queue.some(pending => !pending.resolve && !pending.reject &&
-      (pending.preparationAttempts ?? 0) > 0)) this.#noteFailedActivation(actor, message, undefined, false);
+      (pending.preparationAttempts ?? 0) > 0)) this.#noteFailedActivation(actor, message, undefined, false, 0,
+        preparationFailureKind(error));
   }
 
   async #drain(actor: ManagedActor): Promise<void> {
@@ -4744,7 +4764,7 @@ export class ActorManager {
         if (reset) await reset;
         if (actor.queue.length === 0 || !this.#slotCurrent(actor) || (actor.status as string) === "stopped" || this.#closing ||
             (this.#releasePaused && (this.#releaseStrict || !actor.queue.some(item => item.resolve || item.reject)))) break;
-        if (!this.#batchReady(actor)) break;
+        if (!this.#preparationHeadReady(actor) || !this.#batchReady(actor)) break;
         // A persisted completion cannot run before its handoff receipt commits.
         // If receipt I/O failed, even an unrelated new message must not drain it;
         // the next poll retries the same queued id before opening this gate.
@@ -5218,26 +5238,39 @@ export class ActorManager {
             this.#scheduleRestoreParked();
             continue;
           }
-          // A finite unavailable-model error remains terminal, as before. Only a hung
-          // resolver is retried; infrastructure failures have not consumed the activation.
+          // Only confirmed-unlaunched preparation may retain accepted input. A
+          // binding refusal stays hard, but cannot consume callerless work.
           const launchPreparationTimeout = !workerLaunched && error instanceof AgentLaunchPreparationTimeoutError &&
             error.launchOutcome === "unlaunched";
           const retryPreparation = launchPreparationTimeout || (preLaunch && (error instanceof ActorPreparationTimeoutError ||
             (error instanceof ActorPreparationError && error.phase !== "binding")));
           const callerless = !item.resolve && !item.reject;
-          if (retryPreparation && (callerless || (item.preparationAttempts ?? 0) < ACTOR_PREPARATION_MAX_RETRIES) &&
+          const retainPreparation = retryPreparation || preLaunch;
+          if ((callerless ? retainPreparation : retryPreparation && (item.preparationAttempts ?? 0) < ACTOR_PREPARATION_MAX_RETRIES) &&
             !abortController.signal.aborted && actor.status !== "stopped" && !this.#closing) {
             preparationAbort.abort(error);
             for (const event of this.#batchItems(actor.id, item)) event.preparationAttempts = (event.preparationAttempts ?? 0) + 1;
+            // Report before transferring custody: any publication triggered by the
+            // failure still sees the original in-flight activation in the checkpoint.
+            if (callerless && (!retryPreparation || (item.preparationAttempts ?? 0) > ACTOR_PREPARATION_MAX_RETRIES)) {
+              this.#noteFailedActivation(actor, message, runId, false,
+                retryPreparation ? ACTOR_FAILURE_NOTICE_AFTER : 0, preparationKind);
+            }
+            const hardPreparation = callerless && actor.activationBlocked !== undefined &&
+              activationBlockClass(actor.activationBlocked.code) === "hard";
             // Transfer ownership before cleanup can yield: persistence must never see
             // this activation both in flight and queued (review/astra round 2, #3167).
             this.#inFlight.delete(actor.id);
             const overflow = this.#overflow.get(actor.id);
             const events = this.#batchItems(actor.id, item);
-            // Urgent work depends on older pending observations: an unlaunched batch
-            // must still precede that bypass on retry. Otherwise keep legacy rotation
-            // so an unavailable observation cannot starve ordinary work (#816).
-            if ((item.batchQueued || item.batchIds) && [...actor.queue, ...(overflow ?? [])].some(event => this.#batchBypass(event))) {
+            if (events.length > 1 && !item.batchIds) {
+              const ids = events.map(event => event.id);
+              for (const event of events) { event.activationId = ids[0]!; event.batchIds = ids; }
+            }
+            // Hard preparation work must head the queue so unrelated callerless
+            // work cannot execute and erase its block. Preserve retry rotation otherwise.
+            if (hardPreparation || ((item.batchQueued || item.batchIds) &&
+                [...actor.queue, ...(overflow ?? [])].some(event => this.#batchBypass(event)))) {
               actor.queue.unshift(...events);
             } else if (overflow?.length) overflow.push(...events);
             else actor.queue.push(...events);
@@ -5249,12 +5282,8 @@ export class ActorManager {
             if (callerless) {
               retryDelay = this.#preparationRetryMs * ACTOR_PREPARATION_BACKOFF[
                 Math.min(item.preparationAttempts ?? 0, ACTOR_PREPARATION_BACKOFF.length) - 1]!;
-              if ((item.preparationAttempts ?? 0) > ACTOR_PREPARATION_MAX_RETRIES) {
-                this.#noteFailedActivation(actor, message, runId, false, ACTOR_FAILURE_NOTICE_AFTER,
-                  preparationKind);
-              }
             }
-            retryDrain = true;
+            retryDrain = !hardPreparation;
             break;
           }
           actor.lastError = message;

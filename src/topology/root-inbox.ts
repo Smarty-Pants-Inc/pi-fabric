@@ -114,9 +114,9 @@ interface RootInboxState {
   acked?: Array<[string, number]>;
 }
 
-/** Cursor-only progress must not force a receipt save; failed receipt writes must stay dirty. */
-const receiptSnapshot = (state: Partial<RootInboxState> | undefined): string => JSON.stringify([
-  state?.delivered, state?.deliveredAt, state?.fallbacks, state?.fallbackAt, state?.fallbackThrough,
+/** Only cursor-only progress is gated; receipt/pending changes stay dirty until saved. */
+const immediateSnapshot = (state: Partial<RootInboxState> | undefined): string => JSON.stringify([
+  state?.pending, state?.delivered, state?.deliveredAt, state?.fallbacks, state?.fallbackAt, state?.fallbackThrough,
 ]);
 
 const sequenceOf = (value: unknown): number =>
@@ -129,7 +129,7 @@ const parseAcks = (value: unknown): Array<[string, number]> => Array.isArray(val
 export class RootInbox {
   #state: RootInboxState | undefined;
   #saved: string | undefined;
-  #savedReceipts: string | undefined;
+  #savedImmediate: string | undefined;
   #savedAt = 0;
   #wokeAt = Number.NEGATIVE_INFINITY;
   #dueAt = Number.POSITIVE_INFINITY;
@@ -176,11 +176,11 @@ export class RootInbox {
 
   async #next(session: RootInboxSession, options: RootInboxReconcileOptions, priority: boolean): Promise<RootInboxBatch> {
     const state = this.#load();
-    let receiptsChanged = this.#trimReceipts();
-    receiptsChanged = receiptSnapshot(state) !== this.#savedReceipts || receiptsChanged;
+    let saveImmediately = this.#trimReceipts();
+    saveImmediately = immediateSnapshot(state) !== this.#savedImmediate || saveImmediately;
     // Canonical history without a finite timestamp is exact-replay evidence only; do not
     // renew its ambiguous key/ref claim at read time.
-    receiptsChanged = this.#remember(session.delivered ?? [], session.deliveredAt, true) || receiptsChanged;
+    saveImmediately = this.#remember(session.delivered ?? [], session.deliveredAt, true) || saveImmediately;
     let skippedStale = 0;
     const reservations = new Set<string>();
     if (state.pending && options.turnEnd) await this.#alarmPending(state).catch(error => {
@@ -194,7 +194,7 @@ export class RootInbox {
       const unacked = held.through <= this.#mark() ? [] : held.ids.filter((id) => !this.#acks.has(id));
       const holdsBatch = unacked.length === 0 || session.holdsBatch(held.ids);
       if (options.commitOnly && !holdsBatch) {
-        await this.#save(receiptsChanged);
+        await this.#save(saveImmediately);
         return { events: [], through: state.after };
       }
       const reread = this.#reread(state.after, held);
@@ -237,19 +237,19 @@ export class RootInbox {
       await this.#save(true);
     }
     if (options.commitOnly) {
-      await this.#save(receiptsChanged);
+      await this.#save(saveImmediately);
       return { events: [], through: state.after };
     }
     const batch = this.#scan(state.after, session, true, (event, reservations) => {
-      receiptsChanged = this.#consumeFallback(event, reservations) || receiptsChanged;
-      receiptsChanged = this.#remember(eventReceipts(event)) || receiptsChanged;
+      saveImmediately = this.#consumeFallback(event, reservations) || saveImmediately;
+      saveImmediately = this.#remember(eventReceipts(event)) || saveImmediately;
     }, priority, reservations);
     skippedStale += batch.skippedStale ?? 0;
     if (skippedStale) { batch.skippedStale = skippedStale; batch.horizonMs = this.#horizon(); }
     if (batch.events.length === 0) {
       state.after = batch.through;
       // Expiry and new receipts are durable immediately: a restart must not repeat the summary.
-      await this.#save(receiptsChanged || skippedStale > 0);
+      await this.#save(saveImmediately || skippedStale > 0);
       return batch;
     }
     state.pending = { through: batch.through, ids: batch.events.map((event) => event.id), since: this.#now() };
@@ -749,7 +749,7 @@ export class RootInbox {
       this.#state.fallbackThrough = value.fallbackThrough;
     }
     this.#saved = saved ? JSON.stringify(value) : undefined;
-    this.#savedReceipts = saved ? receiptSnapshot(value) : undefined;
+    this.#savedImmediate = saved ? immediateSnapshot(value) : undefined;
     this.#trimReceipts();
     this.#savedAt = saved ? this.#now() : 0;
     return this.#state;
@@ -761,10 +761,10 @@ export class RootInbox {
     const text = JSON.stringify(this.#state);
     if (text === this.#saved) return;
     if (!now && this.#now() - this.#savedAt < SAVE_INTERVAL_MS) return;
-    const receipts = receiptSnapshot(this.#state);
+    const immediate = immediateSnapshot(this.#state);
     await this.mesh.put({ key: this.key, value: JSON.parse(text) as RootInboxState, identity: this.identity });
     this.#saved = text;
-    this.#savedReceipts = receipts;
+    this.#savedImmediate = immediate;
     this.#savedAt = this.#now();
   }
 

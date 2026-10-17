@@ -104,6 +104,90 @@ describe("root inbox receipt saves versus cursor checkpoints (#14468)", () => {
     expect((await h.box().next(empty)).events).toEqual([]);
   });
 
+  it("promptly commits an ack with already-durable receipts; restart does not replay", async () => {
+    const h = setup(); const inbox = h.box();
+    await inbox.next(empty);
+    const event = await h.publish(me.id, { deliveryId: "already-durable-ack" });
+    const batch = await inbox.next(empty);
+    const receipts = rootInboxMessage(batch.events).details.receipts;
+    // A canonical carrier can provide receipts before the session holds the entire batch.
+    // Commit-only must retain pending while persisting those receipts.
+    await inbox.next({ ...empty, delivered: new Set(receipts),
+      deliveredAt: new Map(receipts.map(id => [id, h.now()])) }, { commitOnly: true });
+    const before = h.saved(inbox);
+    expect(before.pending?.ids).toEqual([event.id]);
+    expect(before.delivered).toEqual(expect.arrayContaining(receipts));
+    h.put.mockClear();
+    inbox.ack([event.id], receipts);
+    await inbox.next(empty, { commitOnly: true });
+    // Soft checks let the restart probe run even on the unchanged production source.
+    expect.soft(h.inboxPuts(inbox)).toHaveLength(1);
+    expect.soft(h.saved(inbox).after).toBe(event.sequence);
+    expect.soft(h.saved(inbox).pending).toBeUndefined();
+    expect(h.saved(inbox).delivered).toEqual(before.delivered);
+    expect(h.saved(inbox).deliveredAt).toEqual(before.deliveredAt);
+    expect((await h.box().next(empty)).events).toEqual([]);
+  });
+
+  it("retries a failed pending-clear save with unchanged durable receipts inside the gate", async () => {
+    const h = setup(); const inbox = h.box();
+    await inbox.next(empty);
+    const event = await h.publish(me.id);
+    const batch = await inbox.next(empty);
+    const receipts = rootInboxMessage(batch.events).details.receipts;
+    await inbox.next({ ...empty, delivered: new Set(receipts),
+      deliveredAt: new Map(receipts.map(id => [id, h.now()])) }, { commitOnly: true });
+    const before = h.saved(inbox);
+    h.put.mockClear();
+    inbox.ack([event.id], receipts);
+    h.put.mockRejectedValueOnce(new Error("injected pending-clear put failure"));
+    await expect(inbox.next(empty, { commitOnly: true })).rejects.toThrow("injected pending-clear put failure");
+    expect(h.saved(inbox)).toEqual(before);
+    await inbox.next(empty, { commitOnly: true });
+    expect(h.inboxPuts(inbox)).toHaveLength(2);
+    expect(h.saved(inbox)).toMatchObject({ after: event.sequence, delivered: before.delivered,
+      deliveredAt: before.deliveredAt });
+    expect(h.saved(inbox).pending).toBeUndefined();
+    expect((await h.box().next(empty)).events).toEqual([]);
+  });
+
+  it("does not mark an ack during an awaited put as part of the saved pending snapshot", async () => {
+    const h = setup(); const inbox = h.box();
+    await inbox.next(empty);
+    const event = await h.publish(me.id);
+    const batch = await inbox.next(empty);
+    const receipts = rootInboxMessage(batch.events).details.receipts;
+    const session = { ...empty, delivered: new Set(receipts),
+      deliveredAt: new Map(receipts.map(id => [id, h.now()])) };
+    await inbox.next(session, { commitOnly: true });
+    let release!: () => void;
+    let wrote!: () => void;
+    const blocked = new Promise<void>(resolve => { release = resolve; });
+    const written = new Promise<void>(resolve => { wrote = resolve; });
+    h.put.mockImplementationOnce(async input => {
+      const result = await MeshStore.prototype.put.call(h.mesh, input);
+      wrote();
+      await blocked;
+      return result;
+    });
+    const extra = native(h.now(), { deliveryId: "concurrent-native" });
+    const saving = inbox.next({ ...session,
+      delivered: new Set([...receipts, ...extra.delivered!]),
+      deliveredAt: new Map([...session.deliveredAt, ...extra.deliveredAt!]),
+    }, { commitOnly: true });
+    try {
+      await written;
+      inbox.ack([event.id], receipts);
+      expect(h.saved(inbox).pending?.ids).toEqual([event.id]);
+    } finally { release(); await saving; }
+    h.put.mockClear();
+    await inbox.next(empty, { commitOnly: true });
+    expect(h.inboxPuts(inbox)).toHaveLength(1);
+    expect(h.saved(inbox).after).toBe(event.sequence);
+    expect(h.saved(inbox).pending).toBeUndefined();
+    expect((await h.box().next(empty)).events).toEqual([]);
+  });
+
   const native = (at: number, data: object) => rootInboxSession([{ type: "custom_message",
     customType: "pi-fabric-agent-message", timestamp: new Date(at).toISOString(),
     details: { from: peer, data: { topic: "fleet.work.checkpoint", ...data } } }]);

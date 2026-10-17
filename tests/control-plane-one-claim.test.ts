@@ -5,7 +5,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
+import { MeshStore, type MeshEvent, type MeshIdentity } from "../src/mesh/store.js";
+import { assertMeshConsumption } from "../src/topology/mesh-consumption.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
 
 const ownerId = "host:one-claim";
@@ -46,6 +47,68 @@ const setup = (backend: "file" | "sqlite", fenced: boolean) => {
   const acks = (id: string) => mesh.read({ topic: "fabric.control.ack", limit: 100 })
     .filter(event => (event.data as { commandId?: string }).commandId === id);
   return { mesh, own, makeOwner, publish, acks };
+};
+
+// Bounded claim-only compatibility fixture, NOT an installed historical Pi/class.
+// Commit/source pins (control-plane.ts; full source retained in compatibility evidence):
+// private-only: 5f7eebcae69e042355aad03f492b13602f1cae56,
+//   sha256 105abca80b427a18cbe8dee747ce82efa7e5049d911651fdd92ad5cc15aa7706,
+//   #acceptCommand:449-544, #seenRecord:632-634 (read both, CAS private only).
+// oldest supplied deployed release by ancestry: 41a73f8588e5351d9409736f725fee218810b78c,
+//   sha256 22c8fa889b484680f1373b9dfed400f672a43d59759d6563e5ccca8e8015fe7d,
+//   #putFenced:342-349, #acceptCommand:1077-1152, #seenRecord:1305-1307.
+// Only valid, in-deadline, ordinary commands and fresh runtime custody are modeled;
+// old timers/ACKs/outcome persistence are not. Modern receivers exercise those below.
+const historicalClaimant = (f: ReturnType<typeof setup>, protocol: "private-only" | "shared-private", fenced: boolean) => {
+  const shared = new MeshStore(f.mesh.root, 65_536, 1_000, { stateBackend: f.mesh.stateBackend });
+  const own = new MeshStore(f.own.root, 65_536, 1_000, { stateBackend: "file" });
+  stores.push(shared, own);
+  expect(shared.stateBackend).toBe(f.mesh.stateBackend);
+  expect(own.stateBackend).toBe("file");
+  const sharedClaims = new Map<string, number>();
+  const trace: string[] = [];
+  const putFenced = async (store: MeshStore, input: Parameters<MeshStore["put"]>[0]) => {
+    if (!fenced) return store.put(input);
+    const results = await store.writeBatch({ identity: identity(ownerId), ops: [], prepare: () => {
+      assertMeshConsumption(() => true);
+      return [{ kind: "put", ...input }];
+    } });
+    return { version: results[0]!.version };
+  };
+  return { trace, async accept(event: MeshEvent, afterRead: () => Promise<void>, handler: () => void) {
+    const command = event.data as { commandId: string; targetId: string; deadlineAt: number };
+    const k = key(command.commandId);
+    const duplicate = sharedClaims.has(k) ? own.get(k)?.value : own.get(k)?.value ?? shared.get(k)?.value;
+    if (duplicate) { trace.push("duplicate"); return "duplicate"; }
+    trace.push("read-empty");
+    await afterRead(); // Forced stale-read / pre-CAS interleaving, never a mocked CAS winner.
+    const value = { format: 1, hostId: ownerId, commandId: command.commandId,
+      targetId: command.targetId, expiresAt: command.deadlineAt + 60_000 };
+    try {
+      if (protocol === "shared-private") {
+        if (!sharedClaims.has(k)) {
+          trace.push("shared-attempt");
+          await putFenced(shared, { key: k, value: { ...value, explicitDeadline: true }, identity: identity(ownerId), ifVersion: 0 });
+          trace.push("shared-won");
+        }
+        sharedClaims.set(k, command.deadlineAt + 60_000);
+      }
+      trace.push("private-attempt");
+      const input = { key: k, value: { ...value, ...(protocol === "private-only" ? { sequence: event.sequence } : {}) },
+        identity: identity(ownerId), ifVersion: 0 };
+      // 5f7 used direct put; 41a used its optional under-lock lease fence.
+      if (protocol === "private-only") await own.put(input); else await putFenced(own, input);
+      trace.push("private-won");
+    } catch (error) {
+      sharedClaims.delete(k);
+      // Distinguish a real create-only CAS conflict from a fixture/IO/lock failure.
+      expect(String(error)).toContain(`Mesh compare-and-swap failed for ${k}: expected version 0, found 1`);
+      trace.push("cas-lost");
+      return "lost";
+    }
+    sharedClaims.delete(k);
+    trace.push("handler"); handler(); return "won";
+  } };
 };
 
 afterEach(async () => {
@@ -101,6 +164,65 @@ describe("one authoritative control claim", () => {
         accepted: true, messageId: "only-handler", result: { secret: "PRIVATE-OUTCOME" },
       } });
     } finally { release.open(); }
+  });
+
+  describe.each(["file", "sqlite"] as const)("historical writer boundary (%s)", backend => {
+    it("UNSUPPORTED 5f7 private-only stale read permits two handlers (F1 counterexample)", async () => {
+      const f = setup(backend, false), owner = f.makeOwner();
+      const old = historicalClaimant(f, "private-only", false);
+      const read = gate(), resume = gate(), entered = gate(), finish = gate();
+      const event = await f.publish("private-stale");
+      const olderHandler = vi.fn();
+      const oldRun = old.accept(event, async () => { read.open(); await resume.promise; }, olderHandler);
+      const currentHandler = vi.fn(async () => { entered.open(); await finish.promise; return { accepted: true }; });
+      try {
+        await read.promise; owner.start(currentHandler); await entered.promise;
+        expect(f.mesh.get(key("private-stale"), { fresh: true })?.version).toBe(1);
+        expect(f.own.get(key("private-stale"), { fresh: true })).toBeUndefined();
+        resume.open(); expect(await oldRun).toBe("won");
+        expect(old.trace).toEqual(["read-empty", "private-attempt", "private-won", "handler"]);
+        expect(currentHandler.mock.calls.length + olderHandler.mock.calls.length).toBe(2);
+        expect(f.own.get(key("private-stale"), { fresh: true })?.version).toBe(1);
+        // Candidate outcome is still unsaved: F1 is real duplication, not ACK counting.
+      } finally { resume.open(); finish.open(); await oldRun; }
+    });
+
+    it.each(["private-only", "shared-private"] as const)("older %s wins first: current handler is refused", async protocol => {
+      const f = setup(backend, true), owner = f.makeOwner();
+      const old = historicalClaimant(f, protocol, true), olderHandler = vi.fn();
+      const event = await f.publish("old-first");
+      expect(await old.accept(event, async () => {}, olderHandler)).toBe("won");
+      const currentHandler = vi.fn(() => ({ accepted: true })); owner.start(currentHandler);
+      await until(() => expect(f.acks("old-first").length).toBeGreaterThan(0));
+      owner.pause(); await owner.close();
+      expect(olderHandler).toHaveBeenCalledOnce();
+      expect(currentHandler).not.toHaveBeenCalled();
+      expect(currentHandler.mock.calls.length + olderHandler.mock.calls.length).toBe(1);
+    });
+
+    it.each([false, true])("oldest deployed 41a stale read loses shared CAS, never private claim/handler (fenced=%s)", async fenced => {
+      const f = setup(backend, fenced), owner = f.makeOwner();
+      const old = historicalClaimant(f, "shared-private", fenced);
+      const read = gate(), resume = gate(), entered = gate(), finish = gate();
+      const event = await f.publish("shared-stale"), olderHandler = vi.fn();
+      const oldRun = old.accept(event, async () => { read.open(); await resume.promise; }, olderHandler);
+      const currentHandler = vi.fn(async () => { entered.open(); await finish.promise; return { accepted: true, messageId: "shared-winner" }; });
+      try {
+        await read.promise; owner.start(currentHandler); await entered.promise;
+        expect(f.mesh.get(key("shared-stale"), { fresh: true })?.version).toBe(1);
+        expect(f.own.get(key("shared-stale"), { fresh: true })).toBeUndefined();
+        resume.open(); expect(await oldRun).toBe("lost");
+        expect(old.trace).toEqual(["read-empty", "shared-attempt", "cas-lost"]);
+        expect(olderHandler).not.toHaveBeenCalled();
+        expect(f.own.get(key("shared-stale"), { fresh: true })).toBeUndefined();
+        expect(currentHandler.mock.calls.length + olderHandler.mock.calls.length).toBe(1);
+      } finally { resume.open(); finish.open(); await oldRun; }
+      await until(() => expect(f.acks("shared-stale").some(event => (event.data as { accepted?: boolean }).accepted)).toBe(true));
+      owner.pause(); await owner.checkpointForRelease();
+      expect(f.own.get(key("shared-stale"), { fresh: true })).toMatchObject({ version: 1, value: {
+        sequence: event.sequence, acceptance: { accepted: true, messageId: "shared-winner" },
+      } });
+    });
   });
 
   it("writes only the private outcome, not a second pre-handler claim", async () => {

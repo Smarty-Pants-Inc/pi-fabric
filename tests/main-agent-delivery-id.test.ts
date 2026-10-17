@@ -15,6 +15,7 @@ import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { FOLLOW_UP_LIMITS, MainAgentController } from "../src/main-agent.js";
 import * as deliveryOutcomes from "../src/mesh/delivery-outcomes.js";
+import * as atomicWrite from "../src/core/atomic-write.js";
 
 // Review round 2 on pi-fabric#160 (finding 1, security S1): Pi's sendMessage returns void and may
 // only queue the message (streaming, prompt preflight, a settle), or fail asynchronously. A
@@ -292,6 +293,70 @@ describe("Main admits a delivery id durably, once", () => {
     expect(restarted.queueDepth()).toMatchObject({ pendingFollowUps: 2 });
     second.emit("agent_before_settle", boundary([]), busy(entries));
     expect(second.sent.flatMap(sent => sent.message.details.items.map((item: { deliveryId: string }) => item.deliveryId))).toEqual(["rec-A", "rec-B"]);
+  });
+
+  it("KEEP: a pre-supersedes coalesced D1 tombstone prevents stale resident retry after native D2", () => {
+    // Data-safety boundary: 45f466fe..872978d86^ replaced same-sender/same-key D1 with D2,
+    // consumed D1 before ACK, then wrote only D2's deliveryId plus internal chain/replaces.
+    // See 872978d86^:src/main-agent.ts (#consume(replaced), #save, #send); its native
+    // details have no supersedes. The old residency/client.ts deletes only AFTER admission:
+    // a failed delete retains D1's source even after D2 is durably consumed in this session.
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-legacy-coalesced-"));
+    roots.push(root);
+    const manager = SessionManager.create(root, path.join(root, "sessions"));
+    const sessionId = manager.getSessionId();
+    const journal = path.join(root, "main-followups", `${sessionId}.json`);
+    const d1 = `resident:${sessionId}:source-D1`;
+    const d2 = `resident:${sessionId}:source-D2`;
+    const internalD1 = "167d261e-d4bc-4c98-829a-cae76d086462";
+    const internalD2 = "543fb841-107a-4de8-bc91-66849acdc520";
+    const sentAt = "2026-01-01T00:00:00.000Z";
+    const replacedAt = "2026-01-01T00:00:01.000Z";
+    const retainedSource = coalesced(d1, "D1 stale state");
+    const current = coalesced(d2, "D2 current state");
+    // Use the SDK's real native entry serializer, in the SAME session/journal namespace.
+    manager.appendMessage({ role: "user", content: "continue", timestamp: Date.parse(sentAt) });
+    manager.appendCustomMessageEntry("pi-fabric-agent-message", [
+      `<fabric-agent-message from_name="${actor.name}" from_id="${actor.id}" from_kind="${actor.kind}" delivery="followUp" sent_at="${sentAt}">`,
+      current.message,
+      `<data>${JSON.stringify(current.data)}</data>`,
+      "</fabric-agent-message>",
+    ].join("\n"), true, {
+      id: internalD2, from: actor, delivery: "followUp", sentAt, replacedAt,
+      chain: internalD1, generation: 1, replaces: internalD1,
+      data: current.data, deliveryId: d2, triggerTurn: true,
+    });
+    // Exact old consumed-index shape, including D1 (retired unsent) and D2 (consumed).
+    // Keep the real atomic writer and its durability barriers, not an fsync mock.
+    atomicWrite.writeFileAtomic(`${journal}.delivered`, JSON.stringify({ version: 1, ids: [d1, d2] }), { durable: true });
+    expect(fs.existsSync(journal)).toBe(false);
+    const nativeFile = manager.getSessionFile()!;
+    const nativeBytes = fs.readFileSync(nativeFile, "utf8");
+    const nativeEntries = manager.getEntries().filter(entry => entry.type === "custom_message" && entry.customType === "pi-fabric-agent-message");
+    expect(nativeEntries).toHaveLength(1);
+    expect(nativeBytes).toContain(`"deliveryId":"${d2}"`);
+    expect(nativeBytes).not.toContain(d1);
+    expect(nativeBytes).not.toContain("supersedes");
+    const h = fakePi();
+    const context = { ...busy(manager.getEntries(), true), sessionManager: manager } as unknown as ExtensionContext;
+    const main = new MainAgentController(h.pi, `session:${sessionId}`, true, root, sessionId);
+    try {
+      main.attachFollowUpDrain(context, 60_000, journal);
+      // Public retry of the retained source: ACK is passive, never a second admission.
+      for (let retry = 0; retry < 2; retry++) {
+        expect.soft(main.deliverAgent(retainedSource)).toMatchObject({ queued: true, duplicate: true, triggered: false });
+      }
+      h.emit("agent_before_settle", boundary([]), context);
+      main.confirmInbox();
+      // Inspect actual send contents too: the rejected J2 source sends stale D1 here.
+      expect.soft(h.sent.map(sent => sent.message.content)).toEqual([]);
+      expect.soft(h.sent.some(sent => sent.message.content.includes(retainedSource.message))).toBe(false);
+      expect.soft(nativeEntries.length + h.sent.length).toBe(1);
+      expect.soft(main.queueDepth().pendingFollowUps).toBe(0);
+      expect(fs.readFileSync(nativeFile, "utf8")).toBe(nativeBytes); // native D2 untouched
+      expect(manager.getEntries().filter(entry => entry.type === "custom_message")).toEqual(nativeEntries);
+      expect(fs.existsSync(journal)).toBe(false);
+    } finally { main.closeFollowUpDrain(); }
   });
 
   // smarty-dev#2339 F2: a failed mesh delete can outlive the bounded consumed-id history.

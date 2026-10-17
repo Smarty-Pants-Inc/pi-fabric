@@ -826,8 +826,6 @@ export class MainAgentController implements FabricMainAgentTarget {
         this.#held.pop();
         throw new Error(`Main could not record the followUp: ${error instanceof Error ? error.message : String(error)}`);
       }
-      this.#recordSuperseded(item);
-      this.#trySave();
       if (providerHeld) {
         this.#scheduleProviderWake();
         this.#armProviderDeadTimer();                   // a new delivery is an edge too; no-op unless pending

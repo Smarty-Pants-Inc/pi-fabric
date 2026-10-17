@@ -195,6 +195,71 @@ describe("Main followUp retention (unit)", () => {
     expect(fs.existsSync(journal)).toBe(false);
   });
 
+  it("public held admission performs one durable journal replacement and retains original metadata", () => {
+    const { journal } = journalPath();
+    const { main } = setup(journal);
+    const request = {
+      from: from("factory"), verification: "mesh" as const, source: "actor-output" as const,
+      message: "head h1", delivery: "followUp" as const, deliveryId: "delivery:factory:1",
+      admissionTopic: "fabric.state", inboxEventId: "event-1", inboxTopic: "fabric.state", inboxKey: "repo#7/state",
+      inboxReceipts: ["receipt-1"], data: { coalesceKey: "repo#7/state", head: "h1" },
+    };
+    const replacements = vi.spyOn(fs, "renameSync");
+    const result = main.deliverAgent(request);
+    const journalReplacements = replacements.mock.calls.filter(([, destination]) => String(destination) === journal);
+    expect(journalReplacements).toHaveLength(1);
+    expect(result).toMatchObject({ queued: true, messageId: expect.any(String), pendingFollowUps: 1 });
+    const [item] = (JSON.parse(fs.readFileSync(journal, "utf8")) as { items: Array<Record<string, unknown>> }).items;
+    expect(item).toBeDefined();
+    expect(item!).toMatchObject({
+      id: result.messageId, from: request.from, message: request.message, deliveryId: request.deliveryId,
+      source: request.source, admissionTopic: request.admissionTopic, inboxEventId: request.inboxEventId,
+      inboxTopic: request.inboxTopic, inboxKey: request.inboxKey, inboxReceipts: request.inboxReceipts,
+      data: request.data,
+    });
+    expect(item!.sentAt).toBe(Date.now());
+  });
+
+  it.skipIf(process.platform === "win32")("public retry rebarriers after a real post-rename fsync failure", () => {
+    const { journal } = journalPath();
+    const { main } = setup(journal);
+    const request = {
+      from: from("factory"), message: "head h1", delivery: "followUp" as const, deliveryId: "delivery:factory:retry",
+      data: { coalesceKey: "repo#7/state", head: "h1" },
+    };
+    const first = main.deliverAgent(request);
+    let replaced = 0;
+    let failed = false;
+    const realRename = fs.renameSync;
+    const realFsync = fs.fsyncSync;
+    vi.spyOn(fs, "renameSync").mockImplementation((source, destination) => {
+      const result = realRename(source, destination);
+      if (String(destination) === journal) replaced++;
+      return result;
+    });
+    vi.spyOn(fs, "fsyncSync").mockImplementation((fd) => {
+      if (replaced === 1 && !failed && fs.fstatSync(fd).isDirectory()) {
+        failed = true;
+        throw new Error("post-rename fsync failure");
+      }
+      return realFsync(fd);
+    });
+
+    expect(() => main.deliverAgent(request)).toThrow("post-rename fsync failure");
+    expect(failed).toBe(true);
+    expect(replaced).toBe(1);
+    expect(JSON.parse(fs.readFileSync(journal, "utf8")).items).toHaveLength(1);
+
+    expect(main.deliverAgent(request)).toMatchObject({
+      queued: true, duplicate: true, messageId: first.messageId, triggered: false,
+    });
+    expect(replaced).toBe(2);
+    expect(JSON.parse(fs.readFileSync(journal, "utf8")).items[0]).toMatchObject({
+      id: first.messageId, from: request.from, message: request.message, deliveryId: request.deliveryId,
+      data: request.data,
+    });
+  });
+
   it("replays a legacy carrier unchanged except for replacement presentation metadata", () => {
     const { dir, journal } = journalPath();
     const carrier = {

@@ -34,6 +34,11 @@ const STREAM_LEADER_TIMEOUT_MS = 10_000;
 const STREAM_LEADER_POLL_MS = 100;
 const CONSUMER_CREATE_ATTEMPT_TIMEOUT_MS = 1_000;
 const CONSUMER_INITIAL_INACTIVE_THRESHOLD_MS = 10_000;
+// ponytail: a first NEXT can be lost while R1 route interest propagates (measured 518ms). The native
+// two-missed-heartbeat monitor rechecks INFO and re-pulls the same consumer; 1s heartbeats normally detect
+// silence in 2–3s, leaving room for a healthy INFO inside the unchanged default 5s projector wait. The
+// native 15s default cannot; actual INFO/transport failures must still fail the unchanged waiter.
+const CONSUMER_IDLE_HEARTBEAT_MS = 1_000;
 const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 type Bounded<T> = { kind: "value"; value: T } | { kind: "error"; error: unknown } | { kind: "deadline" };
 // ponytail: reuse the existing leader-wait request race for placement, not another retry framework.
@@ -401,7 +406,7 @@ export const connectJetStream = async (servers: string[], options: ConnectJetStr
       const consumer = readiness === undefined ? await retryTransientRead(request, READ_RETRY_ATTEMPTS)
         : await bootstrapConsumer(stream, request, readiness.deadline, readiness.fresh,
           () => { consumerOptions = { ...consumerOptions, name_prefix: randomUUID() }; });
-      const messages = await consumer.consume();
+      const messages = await consumer.consume({ idle_heartbeat: CONSUMER_IDLE_HEARTBEAT_MS });
       void (async () => { for await (const message of messages) onMessage({ seq: message.seq, data: message.data }); })()
         .catch(error => onError?.(error));
       return { stop: async () => { await messages.close(); } };

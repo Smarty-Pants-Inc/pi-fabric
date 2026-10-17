@@ -534,7 +534,7 @@ export class StoreBridgeSide implements BridgeSide {
   readonly #outbox: CommitOutbox;
   #recovered = false;
   // Active only during one mirror commit attempt, including recovery and afterCommit retries.
-  #skippedRelayedRoots: ReadonlySet<string> | undefined;
+  #skippedRoots: ReadonlySet<string> | undefined;
   #leaseProcess: Promise<BridgeLeaseProcess | undefined> | undefined;
 
   constructor(
@@ -549,7 +549,7 @@ export class StoreBridgeSide implements BridgeSide {
     // A skipped root's effects are deferred, not successful no-ops: CommitOutbox catches the
     // throw and retains the row for a later legitimate renewal/removal (or its superseding effect).
     const retainSkipped = (rootId?: string): void => {
-      if (rootId && this.#skippedRelayedRoots?.has(rootId)) throw new Error("Skipped relayed root lease effect deferred");
+      if (rootId && this.#skippedRoots?.has(rootId)) throw new Error("Skipped root lease effect deferred");
     };
     this.#outbox = new CommitOutbox(store, `bridge/${peer}`, this.#identity(), {
       lease: (lease: BridgeLease, view, replay) => { retainSkipped(lease.rootId); this.#applyLease(lease, view, replay); },
@@ -859,7 +859,10 @@ export class StoreBridgeSide implements BridgeSide {
       ) participants.set(participant.id, { record: participant, updatedAt: entry.updatedAt });
     }
     return {
-      presence: { hosts, participants: [...participants.values()].map(({ record }) => record), reserved: [...reserved] },
+      // Export the same canonical root hosts we admit inbound, never sibling/task hosts.
+      // Reservations above still cover ALL native and other-link identities, live or not.
+      presence: { ...admitPresence({ hosts, participants: [...participants.values()].map(({ record }) => record) }, new Set()),
+        reserved: [...reserved] },
       voided: handoffs.voided,
       // smarty-dev#10391: what the scan judged by time, for a plan made before its transaction.
       leases, now,
@@ -1197,7 +1200,13 @@ export class StoreBridgeSide implements BridgeSide {
     // A trusted hub can carry a stale projection from another link. That projection is
     // non-authoritative: keep the destination's newer mirror and let unrelated roots in this
     // same pass proceed. The set spans plan retries so one root produces one warning per pass.
-    const skippedRelayedRoots = new Set<string>();
+    const skippedRoots = new Set<string>();
+    const preservedRoots = new Set<string>();
+    // Classify whole root groups before any plan or recovery effect. No array order may let
+    // a second host bypass tokenless preservation (nor silently choose a conflicting owner).
+    const rootCounts = new Map<string, number>();
+    for (const { record } of presence.hosts) rootCounts.set(record.rootId, (rootCounts.get(record.rootId) ?? 0) + 1);
+    for (const [rootId, count] of rootCounts) if (count > 1) skippedRoots.add(rootId);
     // Match compute's normalized incarnation evidence without mutating cached lease histories.
     const leaseIncarnationDigest = (leases: ReadonlyMap<string, FabricHostLease>): string => contentDigest(
       [...leases.values()].filter(lease => incomingRootIds.has(lease.rootId)).map(lease => ({
@@ -1238,43 +1247,78 @@ export class StoreBridgeSide implements BridgeSide {
           if (held && mirrorLinkOf(entry.value) === this.peer) remember(held.rootId, held);
         }
         for (const lease of scan.leases.values()) remember(lease.rootId, lease);
+        // Mark protected direct roots before any host/participant can target their keys under
+        // a different claimed root. Protection cannot depend on presence array order.
+        for (const { record } of presence.hosts) {
+          if (remoteHostOf(record) === undefined && incarnationOf(record).incarnationToken === undefined &&
+            ((currentTokens.get(record.rootId)?.length ?? 0) > 0 ||
+              mergeBridgeSupersededHistory(superseded.get(record.rootId) ?? []).tokens.length > 0)) preservedRoots.add(record.rootId);
+        }
         const wanted = new Map<string, { value: Record<string, unknown>; identity: MeshIdentity }>();
         const hosts = new Map<string, FabricHostRecord>();
         for (const { record, expiresAt, observedAt: sourceObservedAt } of presence.hosts) {
           const relayed = remoteHostOf(record) !== undefined;
           if (relayed && (!fromHub || record.bridgeVia !== this.peer || record.remoteHost === this.peer)) continue;
           // A preflight skip remains a skip after replay or a plan retry, even if authority moved.
-          if (relayed && skippedRelayedRoots.has(record.rootId)) continue;
+          if (skippedRoots.has(record.rootId)) continue;
           if (own.has(record.id) || own.has(record.identity.id) || own.has(record.rootId)) continue;
-          // Refuse stale native/direct presence rather than omitting it: omission would
+          const prior = view.get(keyFor(HOST_PREFIX, record.id))?.value;
+          if (isObject(prior) && typeof prior.rootId === "string" && prior.rootId !== record.rootId &&
+            (preservedRoots.has(prior.rootId) || skippedRoots.has(prior.rootId))) {
+            skippedRoots.add(record.rootId);
+            continue;
+          }
+          // Refuse explicit stale native/direct presence rather than omitting it: omission would
           // delete the newer mirror, its participants and its lease in the removal pass below.
           // Check before liveness filtering too: an expired stale frame proves no withdrawal.
           const knownHistory = mergeBridgeSupersededHistory(superseded.get(record.rootId) ?? []);
-          // Legacy presence remains valid only until this root has local token authority.
-          // Refuse the downgrade before recovery/removal: writing a tokenless mirror would
-          // erase the current token and let its later replay reclaim participant authority.
-          if ((incarnationOf(record).incarnationToken === undefined &&
-              ((currentTokens.get(record.rootId)?.length ?? 0) > 0 || knownHistory.tokens.length > 0)) ||
-              olderBridgeIncarnation(record, knownHistory.tokens)) {
-            // Native and direct-link stale frames remain a hard refusal/fence. Only a
+          const tokenlessAuthority = incarnationOf(record).incarnationToken === undefined &&
+            ((currentTokens.get(record.rootId)?.length ?? 0) > 0 || knownHistory.tokens.length > 0 || preservedRoots.has(record.rootId));
+          let retained: FabricHostRecord | undefined;
+          if (!relayed && tokenlessAuthority) {
+            // Tokenless native presence supplies liveness, NEVER replacement owner evidence.
+            // Preserve first, including expired rows/participants and unusable source samples.
+            // These decisions only strengthen across early plans, replay and recomputation.
+            preservedRoots.add(record.rootId);
+            const entry = view.get(keyFor(HOST_PREFIX, record.id));
+            const held = entry && hostOf(entry.key, entry.value);
+            const token = held && incarnationOf(held).incarnationToken;
+            const tokens = currentTokens.get(record.rootId) ?? [];
+            if (!held || held.remoteHost !== this.peer || held.bridgeVia !== undefined ||
+              held.id !== record.id || held.rootId !== record.rootId || held.identity.id !== record.identity.id ||
+              held.id !== held.rootId || held.id !== held.identity.id || entry!.updatedBy.id !== held.identity.id ||
+              !Number.isFinite(held.startedAt) || !Number.isFinite(held.updatedAt) || !Number.isFinite(held.expiresAt) ||
+              token === undefined || tokens.length !== 1 || tokens[0] !== token ||
+              knownHistory.tokens.includes(token)) {
+              skippedRoots.add(record.rootId);
+              continue;
+            }
+            retained = held;
+          }
+          if ((relayed && tokenlessAuthority) || olderBridgeIncarnation(record, knownHistory.tokens)) {
+            // Explicit stale direct-link tokens remain a hard refusal/fence. Only a
             // structurally attributable re-export from the trusted hub may be skipped:
             // omitting it preserves the already-held mirror instead of treating absence as
             // withdrawal. K05 identity and ownership checks above remain unchanged.
             if (relayed && fromHub && record.bridgeVia === this.peer && record.remoteHost !== this.peer) {
               // The Set is intentionally scoped to this mirror pass; compute can run more than
               // once while the SQLite plan is retried.
-              const firstSkip = !skippedRelayedRoots.has(record.rootId);
-              skippedRelayedRoots.add(record.rootId);
+              const firstSkip = !skippedRoots.has(record.rootId);
+              skippedRoots.add(record.rootId);
               if (firstSkip) console.warn(`bridge ${this.peer}: skipped stale relayed root ${record.rootId}; preserving its mirror`);
               continue;
             }
-            throw new BridgeStaleIncarnationError(record.rootId);
+            throw new BridgeStaleIncarnationError(record.rootId, record.id);
           }
           // Source expiry and age are meaningful on the SOURCE clock only (#10068).
           // Keep legacy projection deadlines for older readers, but give current readers the
           // successful per-host observation. A delayed commit never makes that snapshot fresh.
           const sampled = typeof sourceObservedAt === "number" && Number.isFinite(sourceObservedAt);
-          if (!Number.isFinite(expiresAt) || expiresAt <= (sampled ? sourceObservedAt : liveAt)) continue;
+          if (!Number.isFinite(expiresAt) || expiresAt <= (sampled ? sourceObservedAt : liveAt) ||
+            (retained && (!Number.isFinite(record.updatedAt) || (sourceObservedAt !== undefined && !sampled)))) {
+            if (retained) skippedRoots.add(record.rootId);
+            continue;
+          }
           // A sampled origin's remaining life is a SOURCE-clock duration, anchored at liveAt (this
           // clock, before the source read it), so liveAt + remaining never overstates the origin.
           // Never extend sampled authority for pass latency: retain an expired projection for
@@ -1283,17 +1327,21 @@ export class StoreBridgeSide implements BridgeSide {
           const origin = sampled ? liveAt + Math.min(BRIDGE_LEASE_MS, expiresAt - sourceObservedAt) : expiresAt;
           const until = sampled ? origin
             : Math.min(origin + Math.min(now - liveAt, BRIDGE_LEASE_MS), now + BRIDGE_LEASE_MS);
-          if (!sampled && until <= now) continue;
+          if (!sampled && until <= now) {
+            if (retained) skippedRoots.add(record.rootId);
+            continue;
+          }
           const renewedAt = sampled ? record.updatedAt : Math.min(record.updatedAt, now);
           const mirror: FabricMirrorLease | undefined = sampled ? { remoteHost: relayed ? record.remoteHost! : this.peer, observedAt: liveAt,
             sourceObservedAt, sourceUpdatedAt: record.updatedAt, sourceExpiresAt: expiresAt,
             ...(bridgeProcess ? { bridgeProcess } : {}) } : undefined;
-          const incarnation = bridgeIncarnationWithFloor(record, incarnations.get(record.rootId) ?? []);
+          const authority = retained ?? record;
+          const incarnation = bridgeIncarnationWithFloor(authority, incarnations.get(record.rootId) ?? []);
           const token = incarnation.incarnationToken;
           const priorTokens = token === undefined ? []
             : (currentTokens.get(record.rootId) ?? []).filter(held => held !== token);
           const history = mergeBridgeSupersededHistory(superseded.get(record.rootId) ?? [], priorTokens);
-          const { bridgeSupersededTokens: _tokens, bridgeSupersededTokenSeen: _seen, ...recordFields } = record;
+          const { bridgeSupersededTokens: _tokens, bridgeSupersededTokenSeen: _seen, ...recordFields } = authority;
           const admitted = { ...recordFields, ...incarnation,
             ...(history.tokens.length > 0 ? { bridgeSupersededTokens: history.tokens } : {}),
             ...(Object.keys(history.seen).length > 0 ? { bridgeSupersededTokenSeen: history.seen } : {}) };
@@ -1301,7 +1349,7 @@ export class StoreBridgeSide implements BridgeSide {
           wanted.set(keyFor(HOST_PREFIX, record.id), {
             value: { ...admitted, updatedAt: now, expiresAt: until, remoteHost: relayed ? record.remoteHost : this.peer,
               ...(sampled ? { mirrorLease: 1 } : {}) },
-            identity: record.identity,
+            identity: authority.identity,
           });
           // The lease carries the same age floor as the host, including lease-only authority.
           leases.push({ id: record.id, rootId: record.rootId, identityId: record.identity.id, ...incarnation,
@@ -1313,6 +1361,7 @@ export class StoreBridgeSide implements BridgeSide {
             updatedAt: renewedAt, expiresAt: until, ...(mirror ? { mirrorLease: 1, mirror } : {}) });
         }
         for (const participant of presence.participants) {
+          if (preservedRoots.has(participant.rootId) || skippedRoots.has(participant.rootId)) continue;
           const owner = hosts.get(participant.ownerHostId);
           if (!owner || participant.kind !== "root" || own.has(participant.id)) continue;
           if (remoteHostOf(participant) !== undefined && (!fromHub || participant.bridgeVia !== this.peer ||
@@ -1327,6 +1376,11 @@ export class StoreBridgeSide implements BridgeSide {
         const ops: MeshBatchOperation[] = [];
         for (const [key, { value, identity }] of wanted) {
           const existing = mirrored.get(key);
+          // An unrelated participant may not overwrite a protected row by claiming its key
+          // with a different root/owner. Retained hosts alone may update their own liveness.
+          if (existing && isObject(existing.value) && typeof existing.value.rootId === "string" &&
+            (preservedRoots.has(existing.value.rootId) || skippedRoots.has(existing.value.rootId)) &&
+            (key.startsWith(PARTICIPANT_PREFIX) || existing.value.rootId !== value.rootId)) continue;
           // Never replace a native record, or another bridge's mirror (anti-spoofing); a native may be
           // only in its own file (smarty-dev#2004).
           if (existing && mirrorLinkOf(existing.value) !== this.peer) continue;
@@ -1344,10 +1398,10 @@ export class StoreBridgeSide implements BridgeSide {
         for (const [key, { value, version }] of mirrored) {
           if (halted()) return undefined;
           if (wanted.has(key) || mirrorLinkOf(value) !== this.peer) continue;
-          // A skipped trusted-hub relay is retained as authority, including its participant
-          // and lease. Do not let the normal omission cleanup reinterpret a stale projection
-          // as a withdrawal.
-          if (isObject(value) && typeof value.rootId === "string" && skippedRelayedRoots.has(value.rootId)) continue;
+          // Skipped roots and retained-owner renewals preserve existing participant bytes.
+          // Neither unusable liveness nor ignored tokenless input is withdrawal evidence.
+          if (isObject(value) && typeof value.rootId === "string" &&
+            (skippedRoots.has(value.rootId) || preservedRoots.has(value.rootId))) continue;
           if (key.startsWith(HOST_PREFIX) && isObject(value) && typeof value.id === "string") {
             const gone = hostOf(key, value);
             removed.push(gone
@@ -1380,7 +1434,7 @@ export class StoreBridgeSide implements BridgeSide {
       const judgesLeaseLiveness = early !== undefined && early.view.listAll(BRIDGE_HANDOFF_PREFIX).length > 0;
       const planned = early && !halted() ? compute(early.view, files) : undefined;
       const plan = this.#outbox.plan();
-      this.#skippedRelayedRoots = skippedRelayedRoots;
+      this.#skippedRoots = skippedRoots;
       try {
         await this.store.writeBatch({
           identity: this.#identity(),
@@ -1432,7 +1486,14 @@ export class StoreBridgeSide implements BridgeSide {
             });
             // A changing commit records its lease effects in the same commit; a lease-only renewal
             // commits nothing, records nothing and loses nothing in a crash (the next pass redoes it).
-            return plan.stage(ops, effects());
+            return plan.stage(ops, effects()).filter(op => {
+              // An effect completed on a previous pass may still await retirement. A skipped
+              // root preserves even that pending row; unrelated retirement still proceeds.
+              if (op.kind !== "delete" || !op.key.startsWith(this.#outbox.prefix)) return true;
+              const row = view.get(op.key)?.value;
+              return !isObject(row) || !isObject(row.payload) || typeof row.payload.rootId !== "string" ||
+                !skippedRoots.has(row.payload.rootId);
+            });
           },
           // After the commit, on the committed owner, never a fresh per-record state read.
           afterCommit: (view) => { plan.run(view, halted); },
@@ -1441,7 +1502,7 @@ export class StoreBridgeSide implements BridgeSide {
         if (error instanceof MirrorPlanStale) continue;
         throw error;
       } finally {
-        this.#skippedRelayedRoots = undefined;
+        this.#skippedRoots = undefined;
       }
       break;
     }
@@ -1550,8 +1611,8 @@ export class BridgeStaleIncarnationError extends Error {
   override readonly name = "BridgeStaleIncarnationError";
   readonly code = FABRIC_BRIDGE_STALE_INCARNATION;
   readonly retryable = false;
-  constructor(readonly rootId?: string) {
-    super(`Bridge presence${rootId === undefined ? "" : ` for ${rootId}`} has an older incarnation than persisted authority`);
+  constructor(readonly rootId?: string, readonly hostId?: string) {
+    super(`Bridge presence${rootId === undefined ? "" : ` for ${rootId}`}${hostId === undefined ? "" : ` (host ${hostId})`} has an older incarnation than persisted authority`);
   }
 }
 
@@ -1693,7 +1754,9 @@ export const serveBridgeAgent = (side: StoreBridgeSide, input: Readable, output:
             }
             reply({
               id: request.id, ok: false, error: error instanceof Error ? error.message : String(error),
-              ...(error instanceof BridgeStaleIncarnationError ? { code: error.code }
+              ...(error instanceof BridgeStaleIncarnationError ? { code: error.code,
+                ...(safeDiagnosticId(error.rootId) && isCanonicalRootId(error.rootId) ? { rootId: error.rootId } : {}),
+                ...(safeDiagnosticId(error.hostId) ? { hostId: error.hostId } : {}) }
                 : isMeshIncarnationPending(error) ? { code: MESH_INCARNATION_PENDING_CODE }
                 : isMeshSnapshotRetriesExhausted(error) ? { code: MESH_SNAPSHOT_RETRIES_EXHAUSTED_CODE }
                   : isMeshRetryableBusy(error) ? { code: MESH_LOCK_TIMEOUT_CODE } : {}),
@@ -1717,6 +1780,11 @@ export const serveBridgeAgent = (side: StoreBridgeSide, input: Readable, output:
     );
   });
 
+// Host IDs need not equal root IDs in sibling diagnostics. Bound printable wire metadata;
+// never interpolate an unchecked peer field (or the peer's arbitrary error text).
+const safeDiagnosticId = (value: unknown): value is string =>
+  typeof value === "string" && value.length > 0 && value.length <= 256 && /^[\x20-\x7e]+$/.test(value);
+
 const numberArg = (args: unknown, name: string): number => {
   const value = isObject(args) ? args[name] : undefined;
   if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) throw new Error(`Bridge argument ${name} is invalid`);
@@ -1728,11 +1796,11 @@ const presenceArg = (args: unknown, hub: string): Pick<BridgePresence, "hosts" |
     throw new Error("Bridge presence is invalid");
   }
   const hosts = args.hosts.flatMap((host): BridgeHost[] => {
-    if (!isObject(host) || typeof host.expiresAt !== "number" || !isObject(host.record)) return [];
+    if (!isObject(host) || !isObject(host.record)) return [];
     const record = hostOf(keyFor(HOST_PREFIX, String(host.record.id)), host.record);
     return record && (remoteHostOf(record) === undefined || (record.bridgeVia === hub && record.remoteHost !== hub))
-      ? [{ record, expiresAt: host.expiresAt,
-        ...(typeof host.observedAt === "number" && Number.isFinite(host.observedAt) ? { observedAt: host.observedAt } : {}) }] : [];
+      ? [{ record, expiresAt: typeof host.expiresAt === "number" ? host.expiresAt : NaN,
+        ...(host.observedAt !== undefined ? { observedAt: typeof host.observedAt === "number" ? host.observedAt : NaN } : {}) }] : [];
   });
   const participants = args.participants.flatMap((value): FabricParticipantRecord[] => {
     const record = isObject(value) ? participantOf(keyFor(PARTICIPANT_PREFIX, String(value.id)), value) : undefined;
@@ -1809,7 +1877,8 @@ export class RemoteBridgeSide implements BridgeSide {
     lines(
       input,
       (line) => {
-        let response: { id?: unknown; ok?: unknown; result?: unknown; error?: unknown; code?: unknown; notification?: unknown; kind?: unknown };
+        let response: { id?: unknown; ok?: unknown; result?: unknown; error?: unknown; code?: unknown; notification?: unknown; kind?: unknown;
+          rootId?: unknown; hostId?: unknown };
         try {
           response = JSON.parse(line) as typeof response;
         } catch {
@@ -1830,13 +1899,16 @@ export class RemoteBridgeSide implements BridgeSide {
         const pending = typeof response.id === "number" ? this.#pending.get(response.id) : undefined;
         if (!pending) return;
         this.#pending.delete(response.id as number);
+        const staleError = response.code === FABRIC_BRIDGE_STALE_INCARNATION ? new BridgeStaleIncarnationError(
+          safeDiagnosticId(response.rootId) && isCanonicalRootId(response.rootId) ? response.rootId : undefined,
+          safeDiagnosticId(response.hostId) ? response.hostId : undefined) : undefined;
         const mirrorPending = this.#mirrorPending;
         if (mirrorPending && mirrorPending.id === response.id) {
           const late = mirrorPending.error.timedOut;
           this.#mirrorPending = undefined;
           if (late && response.ok !== true && response.code !== MESH_LOCK_TIMEOUT_CODE &&
             response.code !== MESH_INCARNATION_PENDING_CODE && response.code !== MESH_SNAPSHOT_RETRIES_EXHAUSTED_CODE) {
-            this.close(new Error(`Bridge agent: ${String(response.error)}`));
+            this.close(staleError ?? new Error(`Bridge agent: ${String(response.error)}`));
             return;
           }
           if (late) for (const subscriber of this.#subscribers) subscriber.changed("presence");
@@ -1847,8 +1919,8 @@ export class RemoteBridgeSide implements BridgeSide {
             pending.reject(new FabricIdempotencyKeyReusedError());
             return;
           }
-          if (response.code === FABRIC_BRIDGE_STALE_INCARNATION) {
-            pending.reject(new BridgeStaleIncarnationError());
+          if (staleError) {
+            pending.reject(staleError);
             return;
           }
           const error = new Error(`Bridge agent: ${String(response.error)}`);
@@ -2512,9 +2584,15 @@ export class MeshBridge {
     const remote = admitPresence(claimed, new Set(local.reserved));
     if (this.#stopped) return;
     const relays = await this.options.local.relayPresence?.() ?? { hosts: [], participants: [] };
+    const native = admitPresence(local, new Set());
+    const hosts = [...native.hosts, ...relays.hosts.map(host => ({ ...host, record: { ...host.record, bridgeVia: this.options.localName } }))];
+    const counts = new Map<string, number>();
+    for (const { record } of hosts) counts.set(record.rootId, (counts.get(record.rootId) ?? 0) + 1);
+    // Never silently overwrite conflicting canonical duplicates from an adapter or relay.
     const outbound = boundPresence({
-      hosts: [...local.hosts, ...relays.hosts.map(host => ({ ...host, record: { ...host.record, bridgeVia: this.options.localName } }))],
-      participants: [...local.participants, ...relays.participants.map(record => ({ ...record, bridgeVia: this.options.localName }))],
+      hosts: hosts.filter(({ record }) => counts.get(record.rootId) === 1),
+      participants: [...native.participants, ...relays.participants.map(record => ({ ...record, bridgeVia: this.options.localName }))]
+        .filter(record => counts.get(record.rootId) === 1),
     });
     if (outbound.dropped) this.#log(`presence: ${outbound.dropped} hosts pass the frame budget and are not mirrored`);
     this.options.debug?.(`presence sync: inbound ${remote.hosts.length} hosts/${remote.participants.length} participants; outbound ${outbound.presence.hosts.length} hosts/${outbound.presence.participants.length} participants`);

@@ -23,7 +23,6 @@ import type {
 import { DIRECTORY_RETENTION_MS, reapDeadHostRecords } from "./host-reaper.js";
 import { observeActorOwnership, ownershipPointReads, type ActorOwnershipObservation } from "./publication-generation.js";
 import { compactExpiredHostRecords } from "./host-record-compaction.js";
-import { withStateFence } from "../mesh/commit-outbox.js";
 import { effectiveLiveness } from "./liveness.js";
 import { isLiveLegacyRootEntry, sessionLiveness, LEGACY_ROOT_LEASE_MS as PARTICIPANT_LEASE_MS } from "./legacy-root-liveness.js";
 import {
@@ -96,9 +95,6 @@ const LEGACY_RENEWAL_PREFIXES = [HOST_PREFIX, LEGACY_SESSION_PREFIX, PARTICIPANT
 // list() (the root-collision report) also reads the legacy actor records.
 const ROOT_COLLISION_PREFIXES = [HOST_PREFIX, PARTICIPANT_PREFIX, LEGACY_SESSION_PREFIX, LEGACY_ACTOR_PREFIX] as const;
 const PARTICIPANT_HEARTBEAT_MS = 5_000;
-// ponytail: bounded; it covers a few publish holds at today's ~250 ms (smarty-dev#8305); still far
-// under LOCK_TIMEOUT_MS 10 s. At 250 ms one hold ahead of the refresh failed the send (smarty-dev#6477).
-export const ROUTING_REFRESH_LOCK_BUDGET_MS = 2_000;
 /**
  * Addressable across a live reload, but a failed reload stops accepting after this lease.
  * quiesce("reload") writes it once, at the start of teardown; nothing renews it until the new
@@ -2249,9 +2245,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
       : `participant directory view is overdue (${now - confirmed} ms old)`;
   }
 
-  /** Revalidate once under the state write lock, without waiting for a long heartbeat write.
-   * Never promote this read to confirmedAt/canConsumeMesh: it renews no ownership lease.
-   * A state operation, not exclusive(): the backend picks the lock (smarty-dev#6477 R3). */
+  /** Revalidate the canonical routing view without acquiring a state write lock.
+   * Never promote this read to confirmedAt/canConsumeMesh: it renews no ownership lease. */
   async refreshRoutingView(): Promise<void> {
     if (this.#isNats()) {
       if (this.#closed) throw new Error("participant directory is closed");
@@ -2262,14 +2257,11 @@ export class ParticipantDirectory implements FabricParticipantSource {
     if (!this.options.enabled) return;
     this.#routingReadAt = 0;
     try {
-      await withStateFence(this.mesh, this.options.identity, () => {
-        // MeshStore reads are intentionally tolerant for dashboards. Routing absence is
-        // stronger: a damaged canonical state must never be confirmed as an empty view.
-        assertMeshStateReadable(this.mesh.root);
-        this.list({ scope: "project", includeStale: true, fresh: true });
-        this.#routingReadAt = Date.now();
-        this.#routingError = undefined;
-      }, ROUTING_REFRESH_LOCK_BUDGET_MS);
+      // Dashboard reads tolerate damage; routing must not certify it as absence (#2386).
+      assertMeshStateReadable(this.mesh.root);
+      this.list({ scope: "project", includeStale: true, fresh: true });
+      this.#routingReadAt = Date.now();
+      this.#routingError = undefined;
     } catch (error) {
       this.#routingError = error;
       throw error;

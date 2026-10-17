@@ -22,10 +22,34 @@ registerHooks({ resolve(specifier, context, nextResolve) {
   }
   return nextResolve(specifier, context);
 }});
+const simulatedWindows = process.platform !== "win32";
 Object.defineProperty(process, "platform", { value: "win32" });
+process.env.SystemRoot ??= "C:\\Windows";
+const childProcess = await import("node:child_process");
+const realExecFileSync = childProcess.default.execFileSync.bind(childProcess.default);
+const aclCalls = [];
+if (simulatedWindows) childProcess.default.execFileSync = (file, args, options) => {
+  if (String(file).toLowerCase().endsWith("powershell.exe") && options?.env?.PI_FABRIC_TEST_TEMP_DIRECTORY) {
+    aclCalls.push({
+      marker: process.env.PI_TEST_TEMP_JOB_DIR ?? null,
+      target: options?.env?.PI_FABRIC_TEST_TEMP_DIRECTORY ?? null,
+      modulePath: Object.entries(options?.env ?? {}).find(([key]) => key.toLowerCase() === "psmodulepath")?.[1] ?? null,
+    });
+    return Buffer.alloc(0);
+  }
+  return realExecFileSync(file, args, options);
+};
 const { default: config } = await import(pathToFileURL(path.resolve("vitest.config.cts")).href);
 const { isolatedTestTemp, isolateTestFleetEnvironment } = await import(pathToFileURL(path.resolve("scripts/test-temp.ts")).href);
 const root = config.test.env.TMPDIR;
+if (simulatedWindows) {
+  assert.equal(aclCalls.length, process.env.WINDOWS_TEMP_PROBE_CHILD === "1" ? 0 : 1);
+  if (aclCalls.length) assert.deepEqual(aclCalls[0], {
+    marker: null,
+    target: root,
+    modulePath: "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\Modules",
+  });
+}
 // smarty-dev#11145 r5: a private run child of the job root, never the shared job root itself.
 assert.equal(path.dirname(root), path.join(process.env.RUNNER_TEMP, "pi-fabric-vitest-job"));
 assert.match(path.basename(root), /^pi-fabric-vitest-run-[A-Za-z0-9]{6}$/);
@@ -235,7 +259,15 @@ describe("test temporary-storage isolation", () => {
   const helper = new URL("../scripts/test-temp.ts", import.meta.url).href;
   const windowsTemp = (env: Record<string, string>) => {
     const result = spawnSync("bun", ["-e", `
+      const simulatedWindows = process.platform !== "win32";
       Object.defineProperty(process, "platform", { value: "win32" });
+      process.env.SystemRoot ??= "C:\\\\Windows";
+      const childProcess = await import("node:child_process");
+      const realExecFileSync = childProcess.default.execFileSync.bind(childProcess.default);
+      if (simulatedWindows) childProcess.default.execFileSync = (file, args, options) => {
+        if (String(file).toLowerCase().endsWith("powershell.exe") && options?.env?.PI_FABRIC_TEST_TEMP_DIRECTORY) return Buffer.alloc(0);
+        return realExecFileSync(file, args, options);
+      };
       const { isolatedTestTemp } = await import(${JSON.stringify(helper)});
       const first = isolatedTestTemp("pi-fabric-vitest-");
       Object.assign(process.env, first); // as vitest.config does
@@ -246,6 +278,44 @@ describe("test temporary-storage isolation", () => {
     expect(result.status, result.stderr).toBe(0);
     return JSON.parse(result.stdout) as { first: string; again: string; marker: string };
   };
+
+  it("fails closed before exporting the Windows run marker when ACL protection fails", () => {
+    const fixture = mkdtempSync(join(tmpdir(), "windows-acl-failure-"));
+    try {
+      const result = spawnSync("bun", ["-e", `
+        Object.defineProperty(process, "platform", { value: "win32" });
+        process.env.SystemRoot ??= "C:\\\\Windows";
+        delete process.env.PI_TEST_TEMP_JOB_DIR;
+        const childProcess = await import("node:child_process");
+        const realExecFileSync = childProcess.default.execFileSync.bind(childProcess.default);
+        let setterCalls = 0;
+        childProcess.default.execFileSync = (file, args, options) => {
+          if (String(file).toLowerCase().endsWith("powershell.exe") && options?.env?.PI_FABRIC_TEST_TEMP_DIRECTORY) {
+            setterCalls += 1;
+            throw new Error("simulated ACL setter failure");
+          }
+          return realExecFileSync(file, args, options);
+        };
+        const { isolatedTestTemp } = await import(${JSON.stringify(helper)});
+        try {
+          isolatedTestTemp("pi-fabric-vitest-");
+          process.stdout.write(JSON.stringify({ unexpectedSuccess: true, setterCalls, marker: process.env.PI_TEST_TEMP_JOB_DIR ?? null }));
+          process.exitCode = 1;
+        } catch (error) {
+          process.stdout.write(JSON.stringify({ unexpectedSuccess: false, setterCalls, marker: process.env.PI_TEST_TEMP_JOB_DIR ?? null, message: String(error) }));
+        }
+      `], { env: { ...process.env, RUNNER_TEMP: fixture, TMPDIR: fixture, TMP: fixture, TEMP: fixture }, encoding: "utf8", timeout: 10_000 });
+      expect(result.error).toBeUndefined();
+      expect(result.status, result.stderr).toBe(0);
+      const outcome = JSON.parse(result.stdout) as { unexpectedSuccess: boolean; setterCalls: number; marker: string | null; message: string };
+      expect(outcome.unexpectedSuccess).toBe(false);
+      expect(outcome.setterCalls).toBe(1);
+      expect(outcome.marker).toBeNull();
+      expect(outcome.message).toMatch(/Windows test temp directory ACL protection failed before marker export/);
+    } finally {
+      rmSync(fixture, { recursive: true, force: true });
+    }
+  });
 
   it("never adopts a pre-existing job-named directory named by a forged marker", () => {
     const fixture = mkdtempSync(join(tmpdir(), "forged-job-"));

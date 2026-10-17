@@ -1,7 +1,9 @@
 import fs, { lstatSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
+import childProcess from "node:child_process";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
+import { windowsSecurityPowerShell } from "../src/storage/windows-powershell.js";
 
 // Pin immediately after creation or stale-marker validation: path ownership is not ownership of a replacement.
 const ownedRootCleanup = (directory: string, stillOwned: () => boolean = () => true): (() => void) => {
@@ -35,6 +37,59 @@ const ownedRootCleanup = (directory: string, stillOwned: () => boolean = () => t
 // Not PI_FABRIC_-prefixed: isolateTestFleetEnvironment keeps it, so workers and children inherit it.
 const jobTempMarker = "PI_TEST_TEMP_JOB_DIR";
 const escapeRegExp = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+// A fresh Windows run directory is protected before its marker is exported. Set-Acl is
+// used instead of icacls so no PATH-resolved tool or localized text is involved; the
+// existing builder pins the child to Windows PowerShell 5.1 and its system modules.
+const freshDirectorySecurity = String.raw`
+$directory = $env:PI_FABRIC_TEST_TEMP_DIRECTORY
+$user = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+$acl = [System.Security.AccessControl.DirectorySecurity]::new()
+$acl.SetOwner($user)
+$acl.SetAccessRuleProtection($true, $false)
+foreach ($sid in @($user.Value, 'S-1-5-18')) {
+  $identity = [System.Security.Principal.SecurityIdentifier]::new($sid)
+  $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+    $identity,
+    [System.Security.AccessControl.FileSystemRights]::FullControl,
+    [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit,
+    [System.Security.AccessControl.PropagationFlags]::None,
+    [System.Security.AccessControl.AccessControlType]::Allow)
+  $acl.AddAccessRule($rule)
+}
+Set-Acl -LiteralPath $directory -AclObject $acl
+$read = Get-Acl -LiteralPath $directory
+if (-not $read.AreAccessRulesProtected) { throw 'fresh Windows test temp DACL is inheritable' }
+if ($read.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne $user.Value) { throw 'fresh Windows test temp owner read-back mismatch' }
+$actual = [System.Security.AccessControl.RawSecurityDescriptor]::new($read.GetSecurityDescriptorBinaryForm(), 0)
+$expected = [System.Security.AccessControl.RawSecurityDescriptor]::new($acl.GetSecurityDescriptorBinaryForm(), 0)
+if ($null -eq $actual.DiscretionaryAcl) { throw 'fresh Windows test temp DACL read-back is null' }
+$actualBytes = [byte[]]::new($actual.DiscretionaryAcl.BinaryLength)
+$expectedBytes = [byte[]]::new($expected.DiscretionaryAcl.BinaryLength)
+$actual.DiscretionaryAcl.GetBinaryForm($actualBytes, 0)
+$expected.DiscretionaryAcl.GetBinaryForm($expectedBytes, 0)
+if ([Convert]::ToBase64String($actualBytes) -cne [Convert]::ToBase64String($expectedBytes)) { throw 'fresh Windows test temp DACL read-back mismatch' }
+`;
+
+const protectFreshWindowsRunDirectory = (directory: string): void => {
+  try {
+    const command = windowsSecurityPowerShell(freshDirectorySecurity, {
+      ...process.env,
+      PI_FABRIC_TEST_TEMP_DIRECTORY: directory,
+    });
+    childProcess.execFileSync(command.file, command.args, {
+      env: command.env,
+      encoding: "utf8",
+      windowsHide: true,
+      timeout: 15_000,
+      maxBuffer: 1024 * 1024,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new Error(`Windows test temp directory ACL protection failed before marker export: ${reason}`);
+  }
+};
 
 /** True only for a run directory this helper's mkdtemp could have made: a direct, pattern-named child of a
  * `<prefix>job` root, a real directory (not a link), and on POSIX owned by this uid with mode 0700. Windows has no
@@ -72,6 +127,7 @@ const stableRoot = (prefix: string): string | undefined => {
     throw new Error(`Windows job temp must be a real directory inside RUNNER_TEMP on the runner's checkout volume: ${jobRoot}`);
   }
   const directory = mkdtempSync(join(jobRoot, `${prefix}run-`));
+  protectFreshWindowsRunDirectory(directory);
   process.env[jobTempMarker] = directory;
   return directory;
 };

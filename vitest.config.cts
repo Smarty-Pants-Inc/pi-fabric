@@ -41,6 +41,7 @@ const hostedOnlyDeletionSuites = [
   "tests/stall-alarms.test.ts", // nice/bun crash fixture reaches MeshStore/lock cleanup before its crash.
   "tests/task-write-policy.test.ts", // sentinel run's native proof timed out; unproven slice stays hosted-only (#13018).
   "tests/temp-run-sweep.test.ts", // scriptSpawnArgs selects Bun for the real .ts sweep entry.
+  "tests/mesh-state-windows-acl.test.ts", // native ACL fixtures are created/removed below USERPROFILE, outside TMPDIR.
   "tests/verified-remove-windows.test.ts", // fabric-win-remove.exe deletes by handle, outside Node fs.
   "tests/windows-temp-root-native.test.ts", // diskpart formats a native NTFS VHD mounted outside TMPDIR.
 ];

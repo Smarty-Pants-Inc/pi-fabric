@@ -23,18 +23,6 @@ const HEARTBEAT_MS = 50;
 // absent, before one bypass probe (five missed heartbeats; far below the ordinary 80% fallback).
 const FREE_LOCK_BYPASS_MS = 250;
 
-/** Whether any waiter's receipt is queued in `directory` (one readdir; an absent directory has none). A newcomer that
- * finds one queues behind it instead of barging (smarty-dev#9805). */
-export const meshLockQueueBusy = (directory: string): boolean => {
-  // Fail open (pi-fabric#936 round 3): any stat or listing error (EACCES on a directory another user planted, EIO)
-  // means "nobody queued", the pre-#9805 contest, never a failed write. No throw on the common path either: a root
-  // that never queued has no directory, and an ENOENT exception per write costs more than the stat.
-  try {
-    if (!fs.statSync(directory, { throwIfNoEntry: false })) return false;
-    return fs.readdirSync(directory).some(name => TICKET.test(name));
-  } catch { return false; }
-};
-
 const pidAlive = (name: string): boolean => {
   try { process.kill(Number(name.split("-")[1]), 0); return true; }
   catch (error) { return (error as NodeJS.ErrnoException).code !== "ESRCH"; }

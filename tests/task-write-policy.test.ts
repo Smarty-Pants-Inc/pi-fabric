@@ -41,7 +41,7 @@ const args = new Map(); for (let i=2;i<process.argv.length;i+=2) args.set(proces
 const policy = readWritePolicy(args.get('--write-policy'));
 const cwd = args.get('--cwd'), tmpdir = args.get('--tmpdir');
 const probes = [];
-if (args.get('--runner') === 'pi' && !args.get('--actor-id') && !args.get('--resident-startup-probe')) {
+if (['pi','pi-durable'].includes(args.get('--runner')) && !args.get('--resident-startup-probe')) {
   for (const file of [path.join(cwd,'inside.txt'), ...(tmpdir ? [path.join(tmpdir,'scratch.txt')] : []), ${JSON.stringify(outside)}]) {
     const reason = policy && writePolicyDenial(policy,'write',{path:file,content:'probe'},cwd);
     if (reason) probes.push({file,allowed:false,reason});
@@ -242,14 +242,39 @@ describe("local process task write default", () => {
       .toEqual([expect.objectContaining({ type: "write_policy.unrestricted" })]);
   });
 
-  it("keeps actor and resident startup launches unchanged", async () => {
-    for (const request of [{ actorId: "actor" }, { residentStartupProbe: true }]) {
-      const f = fixture();
-      const { result, value } = await report(f, request);
-      expect(value.policy).toBeNull();
-      expect(value.tmpdir).toBeNull();
-      expect(f.events(result.id).filter(event => event.type.startsWith("write_policy."))).toEqual([]);
+  it.each([
+    { runner: "pi", actorId: "actor" },
+    { runner: "pi", actorName: "actor" },
+    { runner: "pi-durable", actorId: "actor" },
+    { runner: "pi-durable", actorName: "actor" },
+  ])("confines $runner $actorId $actorName activations to private scratch even in a resident layout", async request => {
+    const f = fixture(false, "resident");
+    const { result, value } = await report(f, request);
+    const run = f.manager.runDirectory(result.id)!;
+    expect(value.tmpdir).toBe(path.join(run, "tmp"));
+    expect(value.policy).toEqual({ readOnly: false, writableRoots: [value.tmpdir], shell: "unconfined" });
+    if (process.platform !== "win32") expect(fs.statSync(value.tmpdir).mode & 0o777).toBe(0o700);
+    expect(value.probes.map((probe: { allowed: boolean }) => probe.allowed)).toEqual([false, true, false]);
+    expect(fs.existsSync(path.join(f.cwd, "inside.txt"))).toBe(false);
+    expect(fs.readFileSync(path.join(value.tmpdir, "scratch.txt"), "utf8")).toBe("probe");
+    for (const tool of ["write", "edit"]) {
+      for (const file of [path.join(f.cwd, "state.json"), path.join(run, "status.json"),
+        path.join(run, "events.jsonl"), path.join(run, "nested", "child", "task.txt"),
+        path.join(path.dirname(run), "other-run", "tmp", "scratch.txt")]) {
+        expect(writePolicyDenial(value.policy, tool, { path: file }, f.cwd)).toContain("outside writable roots");
+      }
+      expect(writePolicyDenial(value.policy, tool, { path: path.join(value.tmpdir, "ok.txt") }, f.cwd)).toBeUndefined();
     }
+    expect(f.events(result.id).filter(event => event.type.startsWith("write_policy.")))
+      .toEqual([expect.objectContaining({ type: "write_policy.actor", policy: value.policy })]);
+  });
+
+  it("keeps resident startup launches unchanged", async () => {
+    const f = fixture();
+    const { result, value } = await report(f, { residentStartupProbe: true });
+    expect(value.policy).toBeNull();
+    expect(value.tmpdir).toBeNull();
+    expect(f.events(result.id).filter(event => event.type.startsWith("write_policy."))).toEqual([]);
   });
 
   const assertUnsupportedRunner = async (runner: "claude" | "veda") => {

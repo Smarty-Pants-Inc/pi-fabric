@@ -3,11 +3,12 @@
 // clustered dedupe map answers before the expected-sequence check); a non-duplicate with a wrong expectation still
 // fails the CAS. Owned cluster helper, puts only: no product delete or purge. Runs in the dedicated nats-* CI job.
 import { connect } from "@nats-io/transport-node";
-import { jetstreamManager, StorageType } from "@nats-io/jetstream";
+import { jetstreamManager } from "@nats-io/jetstream";
 import { afterEach, expect, it } from "vitest";
 import { NatsWrongLastSequenceError } from "../src/mesh/state-backend-nats.js";
 import { connectJetStream } from "../src/mesh/state-backend-nats-client.js";
 import { startNatsElectionCluster, stopNatsElectionCluster, type NatsElectionCluster } from "./helpers/nats-election-cluster.js";
+import { waitForNatsStreamReady } from "./helpers/nats-consumer-ready.js";
 
 const binary = process.env.NATS_BIN;
 let cluster: NatsElectionCluster | undefined;
@@ -21,6 +22,7 @@ it.skipIf(!binary)("an identical same-ID retry after a committed R3 publish is a
   const nc = await connect({ servers: [cluster.seedUrl], ignoreClusterUpdates: true });
   try {
     await port.ensureStream(stream, [subject], { maxMsgSize: 1024 * 1024, replicas: 3 });
+    await waitForNatsStreamReady(cluster.seedUrl, stream);
     const manager = await jetstreamManager(nc);
     expect((await manager.streams.info(stream)).config.duplicate_window).toBeGreaterThan(5_000 * 1e6);
     const bytes = new TextEncoder().encode("batch-one");

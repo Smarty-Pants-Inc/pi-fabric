@@ -191,6 +191,22 @@ describe("guest agents surface", () => {
       .toEqual([expect.objectContaining({ message: expect.stringContaining("not assignable to type 'string'") })]);
   });
 
+  // F-001: preserve the served guest/host compatibility boundary, not a text snapshot.
+  it.each([false, true])("types same-key Main payloads and optional legacy replacement receipts (fullCodeMode=%s)", fullCodeMode => {
+    const calls = ["followUp", "tell", "steer"].flatMap(method => [1, 2].map(revision =>
+      `await agents.${method}({ id: "session:main", message: "original ${revision}", data: { ...data, revision: ${revision} } })`));
+    const code = `const data: FabricMessageData = { coalesceKey: "status" };
+      const receipts = [${calls.join(",\n")}];
+      return receipts.map(receipt => {
+        const omitted: Pick<typeof receipt, "coalesced" | "replacedMessageId"> = {};
+        const legacy: Pick<typeof receipt, "coalesced" | "replacedMessageId"> = { coalesced: true, replacedMessageId: "legacy-message" };
+        const coalesced: true | undefined = receipt.coalesced;
+        const replacedMessageId: string | undefined = receipt.replacedMessageId;
+        return { omitted, legacy, coalesced, replacedMessageId };
+      });`;
+    expect(typeCheckFabricCode(code, guestTypeDeclarations(fullCodeMode), true).errors).toEqual([]);
+  });
+
   it.each([false, true])("types literal public message retry keys (fullCodeMode=%s)", fullCodeMode => {
     const code = `if (false) {
       await agents.followUp({ id: "session:peer", message: "unchanged", idempotencyKey: "follow-up-key" });

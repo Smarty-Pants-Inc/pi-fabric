@@ -58,13 +58,17 @@ describe("fabric-exec skill provider contracts", () => {
     expect(extension).not.toContain("FABRIC_TEMPLATE_LITERAL_CAVEAT");
   });
 
-  it("keeps the full execution reference progressive rather than mandatory", () => {
-    const skill = fs.readFileSync("skillsets/typescript/fabric-exec/SKILL.md", "utf8");
+  it.each(["typescript", "python"])("keeps %s execution advice on demand without claiming ambient guidance", kernel => {
+    const skill = fs.readFileSync(`skillsets/${kernel}/fabric-exec/SKILL.md`, "utf8");
     const frontmatter = skill.slice(0, skill.indexOf("---", 4));
 
-    expect(frontmatter).toContain("Routine `pi.*`");
-    expect(frontmatter).toContain("only after");
+    expect(frontmatter).toContain("On-demand");
+    expect(frontmatter).toContain("Load when");
+    expect(frontmatter).not.toContain("ambient guidance");
     expect(frontmatter).not.toContain("before the first Fabric call");
+    for (const advice of ["acceptance ledger", "direct behavioral probes", "public symbols, registrations, and configuration entries", "batch", "display.name", "display.description", "deterministic compaction", "10 min", "60 s", "spawned agents keep running", "2000 lines or 50KB"]) {
+      expect(skill, `${kernel} lost progressive advice: ${advice}`).toContain(advice);
+    }
   });
 
   it("centralizes ambient actor setup outside the profile skills", () => {

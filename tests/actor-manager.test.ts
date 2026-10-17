@@ -4439,11 +4439,12 @@ describe("ActorManager", () => {
           classification: expect.stringContaining("(ownership)"), code: "registry-update-vetoed", class: "transient", backoffMs: 2_000,
           retryAt: blocked.blockedAt! + 2_000 });
         expect(runs).toHaveLength(0); // the registry did not admit a worker
-        time.set(blocked.retryAt! - 1);
+        time.freeze(blocked.retryAt! - 1);
         expect(manager.status(actor.id).activationBlocked).toBeDefined();
         veto = false;
-        time.set(blocked.retryAt! + 1);
+        time.freeze(blocked.retryAt! + 1);
         expect(manager.status(actor.id)).toMatchObject({ status: "idle", activationBlockExpired: { code: "registry-update-vetoed" } });
+        time.set(blocked.retryAt! + 1); // Resume wall-clock progress before asynchronous publish/wait.
         await s.mesh.publish({ topic: "veto.review", from: s.identity, text: "probe after cooldown" });
         await waitFor(() => runs[0]?.finishedAt !== undefined && !manager.status(actor.id).inFlightRun);
         expect(runs).toHaveLength(1);

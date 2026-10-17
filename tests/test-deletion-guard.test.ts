@@ -582,7 +582,8 @@ const hostedOnlySuites = ["tests/actor-child-completion-idle-preflight.test.ts",
   "tests/residency.test.ts", "tests/routed-session-boundaries.test.ts", "tests/stall-alarms.test.ts",
   "tests/task-write-policy.test.ts", "tests/temp-run-sweep.test.ts", "tests/verified-remove-windows.test.ts", "tests/windows-temp-root-native.test.ts"];
 const realBrokerNatsSuites = ["tests/mesh-state-backend.test.ts", "tests/mesh-state-backend-multiprocess.test.ts",
-  "tests/mesh-backend-migration-nats.test.ts", "tests/state-backend-nats-election.test.ts", "tests/nats-auth-server.test.ts"];
+  "tests/mesh-backend-migration-nats.test.ts", "tests/state-backend-nats-election.test.ts",
+  "tests/state-backend-nats-publish-dedupe.test.ts", "tests/state-backend-nats-pull-recovery.test.ts", "tests/nats-auth-server.test.ts"];
 const guardableSuites = ["tests/actor-directory.test.ts",
   "tests/mesh-backend-migration-nats.test.ts",
   "tests/state-backend-nats.test.ts", "tests/residency-operator-actors.test.ts", "tests/mesh-publish-batch-hold.test.ts",

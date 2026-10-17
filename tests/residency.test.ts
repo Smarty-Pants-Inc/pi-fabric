@@ -24,7 +24,7 @@ import { ModelRegistry, ModelRuntime, type ExtensionContext } from "@earendil-wo
 import { InMemoryCredentialStore, InMemoryModelsStore } from "@earendil-works/pi-ai";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { modelExceptionGrant, withRootExceptionMetadata } from "./helpers/model-exceptions.js";
-import type { FabricMainAgentDeliveryRequest, FabricMainAgentTarget } from "../src/main-agent.js";
+import { FOLLOW_UP_LIMITS, type FabricMainAgentDeliveryRequest, type FabricMainAgentTarget } from "../src/main-agent.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { ResidencyClient } from "../src/residency/client.js";
 import { ResidentHost, RESIDENT_RUN_RETENTION_MS } from "../src/residency/host.js";
@@ -1167,7 +1167,7 @@ describe("durable completion receipts", () => {
         const state = await rootHarness("fair-ancestry-drain");
         const main = await realMain(state, [], undefined, false);
         const from = { id: "bounded-actor", name: "actor", kind: "actor" as const };
-        for (let index = 0; index <= 1024; index++) {
+        for (let index = 0; index < FOLLOW_UP_LIMITS.senderItems; index++) {
           main.main.deliverAgent({ from, message: "tiny", delivery: "followUp", triggerTurn: true, data: { coalesceKey: "state" }, deliveryId: `prior-${index}` });
         }
         const prefix = residentDeliveryPrefix(state.identity.id);
@@ -1192,7 +1192,7 @@ describe("durable completion receipts", () => {
           expect(state.mesh.get(`${prefix}b-steer`)).toBeUndefined();
           expect(state.mesh.get(`${prefix}c-other`)).toBeUndefined();
           expect(main.sent.some((item) => item.options?.deliverAs === "steer")).toBe(true);
-          // Release and durably acknowledge the old carrier at a real Main boundary.
+          // Release and durably acknowledge all originals at a real Main boundary.
           main.main.flushHeldAtNextBoundary();
           main.emit("turn_end", { context: { pendingMessages: [] } });
           for (const item of main.sent) main.append(item);
@@ -1204,15 +1204,15 @@ describe("durable completion receipts", () => {
       } finally { synced.mockRestore(); }
     });
 
-    it("#169 round 1 leaves an over-bound replacement source in the resident mesh", { timeout: 15_000 }, async () => {
+    it("#169 round 1 leaves an over-quota same-key source in the resident mesh", { timeout: 15_000 }, async () => {
       // Barrier order and failures are covered by tests/atomic-write-durable.test.ts and the barrier regressions.
       const synced = vi.spyOn(fs, "fsyncSync").mockImplementation(() => {});
       try {
         const state = await rootHarness("ancestry-backpressure");
         const main = await realMain(state, [], undefined, false);
         const from = { id: "bounded-actor", name: "actor", kind: "actor" as const };
-        const maxAncestry = 1024;
-        for (let index = 0; index <= maxAncestry; index++) {
+        const maxItems = FOLLOW_UP_LIMITS.senderItems;
+        for (let index = 0; index < maxItems; index++) {
           main.main.deliverAgent({ from, message: "tiny", delivery: "followUp", triggerTurn: true, data: { coalesceKey: "state" }, deliveryId: `prior-${index}` });
         }
         const key = `${residentDeliveryPrefix(state.identity.id)}refused-source`;
@@ -1228,10 +1228,10 @@ describe("durable completion receipts", () => {
           await new Promise((resolve) => setTimeout(resolve, 100));
           expect(state.mesh.get(key)).toBeDefined();
           expect(deliver.mock.results.every((result) => result.type === "throw" && /queue is full/.test(String(result.value)))).toBe(true);
-          expect(main.main.queueDepth().pendingFollowUps).toBe(1);
+          expect(main.main.queueDepth().pendingFollowUps).toBe(maxItems);
           const saved = JSON.parse(fs.readFileSync(path.join(state.config.meshRoot, "main-followups", "root.json"), "utf8"));
-          expect(saved.items[0].supersedes).toHaveLength(maxAncestry);
-          expect(saved.items[0].deliveryId).toBe(`prior-${maxAncestry}`);
+          expect(saved.items.map((item: { deliveryId: string }) => item.deliveryId))
+            .toEqual(Array.from({ length: maxItems }, (_, index) => `prior-${index}`));
         } finally { await client.close(); await state.participants.close(); }
       } finally { synced.mockRestore(); }
     });

@@ -44,10 +44,12 @@ const authFailure = () => ({ ...pinnedFailure(), errorMessage: "401 Unauthorized
 
 // TRANSIENT_FAILS=<n>#<token> / AUTH_FAILS=<n>#<token>: the first n activations naming the token fail,
 // later ones succeed (smarty-dev#6509). Each activation is a new child, so the count is a file.
+// Optional fixture-owned upstream state survives distinct activation TMPDIRs; without it,
+// preserve the historical per-os.tmpdir() counters. This is not an actor writable root.
 const failsFirst = (task, marker) => {
   const match = new RegExp(`${marker}=(\\d+)#([A-Za-z0-9_-]+)`).exec(task);
   if (!match) return false;
-  const file = path.join(os.tmpdir(), `fake-pi-rpc-${marker}-${match[2]}`);
+  const file = path.join(process.env.FAKE_PI_RPC_STATE_DIR ?? os.tmpdir(), `fake-pi-rpc-${marker}-${match[2]}`);
   let used = 0;
   try { used = Number(fs.readFileSync(file, "utf8")) || 0; } catch { /* first activation */ }
   if (used >= Number(match[1])) return false;

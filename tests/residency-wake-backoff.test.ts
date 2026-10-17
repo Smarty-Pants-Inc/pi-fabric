@@ -312,6 +312,71 @@ describe("publication wake isolation and maintenance backoff", () => {
     } finally { f.close(); }
   });
 
+  it("a nonmatching publication does not wait for pending-index custody", async () => {
+    let allowed = false;
+    const f = fixture(2, () => allowed);
+    let publishing: ReturnType<MeshStore["publish"]> | undefined;
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    let release!: () => void;
+    let markExclusiveStarted!: () => void;
+    const exclusiveStarted = new Promise<void>(resolve => { markExclusiveStarted = resolve; });
+    const exclusiveGate = new Promise<void>(resolve => { release = resolve; });
+    const exclusive = f.mesh.exclusive.bind(f.mesh);
+    vi.spyOn(f.mesh, "exclusive").mockImplementation(async <T>(operation: () => T, timeout?: number): Promise<T> => {
+      markExclusiveStarted();
+      await exclusiveGate;
+      return exclusive(operation, timeout);
+    });
+    try {
+      // Seed real pending work without launching; only the post-append
+      // dispatcher exclusive is gated, never custody needed by the append.
+      const matching = await f.mesh.publish({ topic: "stuck.delivery", from });
+      const pendingBefore = residentUnacknowledgedDeliveries(f.mesh.root);
+      expect(pendingBefore.size).toBe(2);
+      for (const delivery of pendingBefore.values()) expect(delivery).toMatchObject({ id: matching.id, sequence: matching.sequence });
+      const indexBefore = fs.readFileSync(residentWakeIndexPath(f.mesh.root), "utf8");
+      allowed = true;
+      publishing = f.mesh.publish({ topic: "unrelated.control", from });
+      const outcome = await Promise.race([
+        publishing.then(() => "published" as const),
+        exclusiveStarted.then(() => "blocked-on-exclusive" as const),
+        new Promise<"timed-out">(resolve => { deadline = setTimeout(() => resolve("timed-out"), 1_000); }),
+      ]);
+      expect(f.mesh.read().at(-1)).toMatchObject({ topic: "unrelated.control", sequence: matching.sequence + 1 });
+      expect(outcome).toBe("published");
+      const unrelated = await publishing;
+      expect(f.mesh.read().at(-1)?.id).toBe(unrelated.id);
+      expect(fs.readFileSync(residentWakeIndexPath(f.mesh.root), "utf8")).toBe(indexBefore);
+      expect(residentUnacknowledgedDeliveries(f.mesh.root)).toEqual(pendingBefore);
+      release();
+      await maintenance(f.mesh, async () => {});
+      expect(residentUnacknowledgedDeliveries(f.mesh.root).size).toBe(0);
+      for (const config of f.residents) expect(wake.readWakeJson<{ id: string }>(
+        wake.residentWakeRequestPath(config.residencyRoot))?.id).toBe(matching.id);
+    } finally {
+      if (deadline) clearTimeout(deadline);
+      release?.();
+      try { await publishing; } finally { f.close(); }
+    }
+  });
+
+  it("a malformed retained actor route does not suppress another matching resident", async () => {
+    const f = fixture(2, () => false);
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const event = await f.mesh.publish({ topic: "stuck.delivery", from });
+      // Metadata can change after the real append, before its dispatcher runs.
+      const bad = f.residents[0]!.residencyRoot, good = f.residents[1]!.residencyRoot;
+      const file = path.join(bad, "wake-routes.json");
+      fs.writeFileSync(file, JSON.stringify({ ...JSON.parse(fs.readFileSync(file, "utf8")), actors: [null] }));
+      await wake.wakeResidentActors(f.mesh, [event], async () => {});
+      expect(wake.readWakeJson<{ id: string }>(wake.residentWakeRequestPath(good))?.id).toBe(event.id);
+      const pending = residentUnacknowledgedDeliveries(f.mesh.root);
+      expect(pending.get(bad)?.id).toBe(event.id);
+      expect(pending.has(good)).toBe(false);
+    } finally { f.close(); }
+  });
+
   it("a matching publication still waits for its own wake, even during retry backoff", async () => {
     const f = fixture(1);
     let finish!: () => void;

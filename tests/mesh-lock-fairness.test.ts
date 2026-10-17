@@ -86,8 +86,8 @@ describe("bounded FIFO mesh admission", () => {
     const namespace = path.dirname(queue(root));
     const nativeMkdir = fs.mkdirSync.bind(fs);
     const stat = fs.lstatSync.bind(fs);
-    // Inject only this attempt's namespace inspection: other suite roots may share
-    // its parent, so never alter a real shared admission namespace.
+    // The shared ticket class still handles unsafe advisory namespaces for SQLite/legacy callers.
+    // Inject only inspection of this namespace; never alter a real shared namespace.
     if (kind === "file") {
       vi.spyOn(fs, "mkdirSync").mockImplementation((file, options) => {
         if (String(file) === namespace) throw Object.assign(new Error("not a directory"), { code: "EEXIST" });
@@ -99,9 +99,14 @@ describe("bounded FIFO mesh admission", () => {
         return stat(file, options as undefined);
       }) as typeof fs.lstatSync);
     }
-    const store = new MeshStore(root, 65536, 100);
-    await expect(store.exclusive(() => "plain contest")).resolves.toBe("plain contest");
-    expect(fs.readdirSync(root)).toEqual([".writer-census"]);
+    const ticket = new MeshLockTicket(root, randomUUID(), 7000);
+    try {
+      expect(ticket.queued).toBe(false);
+      expect(ticket.mayContend()).toBe(true);
+      const store = new MeshStore(root, 65536, 100);
+      await expect(store.exclusive(() => "plain contest")).resolves.toBe("plain contest");
+      expect(fs.readdirSync(root)).toEqual([".writer-census"]);
+    } finally { ticket.close(); }
   });
 
   it("shares one queue across canonical mesh-root aliases and isolates other roots", () => {
@@ -119,48 +124,50 @@ describe("bounded FIFO mesh admission", () => {
     expect(fs.readdirSync(root)).toEqual([]);
   });
 
-  it("admits 24 enqueued waiters in ticket order, not repeated-winner order", async () => {
-    // Leave the host monotonic clock real: fake hrtime gives all tickets the same age.
+  it("admits all 24 plain contenders exactly once after the native holder releases", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
     const root = scratch();
     const lock = held(root);
     const store = new MeshStore(root, 65536, 100);
     const order: number[] = [];
     const waiting = Array.from({ length: 24 }, (_, index) => store.exclusive(() => order.push(index)));
-    expect(fs.readdirSync(queue(root))).toHaveLength(24);
+    expect(order).toEqual([]);
     fs.rmSync(lock, { recursive: true });
     await vi.advanceTimersByTimeAsync(500);
     await Promise.all(waiting);
-    expect(order).toEqual(Array.from({ length: 24 }, (_, index) => index));
-    expect(fs.readdirSync(queue(root))).toEqual([]);
+    expect([...order].sort((a, b) => a - b)).toEqual(Array.from({ length: 24 }, (_, index) => index));
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it("non-heads inspect only the queue, not the holder or acquisition directory", async () => {
-    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+  it("non-heads inspect only the queue, not the holder or acquisition directory", () => {
     const root = scratch();
+    const canonical = held(root);
+    const owner = fs.readFileSync(path.join(canonical, "owner"), "utf8");
     const head = new MeshLockTicket(root, randomUUID(), 7000);
-    const store = new MeshStore(root, 65536, 100);
+    const waiter = new MeshLockTicket(root, randomUUID(), 7000);
     const read = vi.spyOn(fs, "readFileSync");
     const mkdir = vi.spyOn(fs, "mkdirSync");
-    const operation = vi.fn();
-    const pending = store.exclusive(operation);
-    await vi.advanceTimersByTimeAsync(100);
-    expect(operation).not.toHaveBeenCalled();
-    expect(read.mock.calls.some(([file]) => String(file).endsWith(".lock/owner"))).toBe(false);
-    expect(mkdir.mock.calls.some(([file]) => String(file) === path.join(root, ".lock"))).toBe(false);
-    head.close();
-    await vi.advanceTimersByTimeAsync(20);
-    await pending;
-    expect(operation).toHaveBeenCalledOnce();
+    try {
+      for (let index = 0; index < 10; index++) expect(waiter.mayContend()).toBe(false);
+      expect(read.mock.calls.some(([file]) => String(file) === path.join(canonical, "owner"))).toBe(false);
+      expect(mkdir.mock.calls.some(([file]) => String(file) === canonical)).toBe(false);
+      head.close();
+      expect(waiter.mayContend()).toBe(true);
+      expect(fs.readFileSync(path.join(canonical, "owner"), "utf8")).toBe(owner);
+    } finally { head.close(); waiter.close(); }
   });
 
-  it.each(["dead", "stale"])("removes an oldest %s ticket without removing an actual lock", async (kind) => {
+  it.each(["dead", "stale"])("removes an oldest %s ticket without removing an actual lock", (kind) => {
     const root = scratch();
     const stale = oldTicket(root, kind === "dead" ? 999999999 : process.pid, kind === "stale" ? 31000 : 0);
-    const store = new MeshStore(root, 65536, 100);
-    await expect(store.exclusive(() => "done")).resolves.toBe("done");
-    expect(fs.existsSync(stale)).toBe(false);
+    const canonical = held(root);
+    const owner = fs.readFileSync(path.join(canonical, "owner"), "utf8");
+    const ticket = new MeshLockTicket(root, randomUUID(), 7000);
+    try {
+      expect(ticket.mayContend()).toBe(true);
+      expect(fs.existsSync(stale)).toBe(false);
+      expect(fs.readFileSync(path.join(canonical, "owner"), "utf8")).toBe(owner);
+    } finally { ticket.close(); }
     expect(fs.readdirSync(queue(root))).toEqual([]);
   });
 
@@ -168,15 +175,16 @@ describe("bounded FIFO mesh admission", () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
     const root = scratch();
     const first = oldTicket(root, process.pid);
-    const store = new MeshStore(root, 65536, 100, { lockTimeoutMs: 100 });
-    const operation = vi.fn(() => "fallback");
-    const pending = store.exclusive(operation);
-    await vi.advanceTimersByTimeAsync(79);
-    expect(operation).not.toHaveBeenCalled();
-    await vi.advanceTimersByTimeAsync(1);
-    await expect(pending).resolves.toBe("fallback");
-    expect(operation).toHaveBeenCalledOnce();
-    expect(fs.existsSync(first)).toBe(true); // admission fallback never reaps a live receipt
+    const ticket = new MeshLockTicket(root, randomUUID(), 100);
+    try {
+      expect(ticket.mayContend()).toBe(false);
+      await vi.advanceTimersByTimeAsync(79);
+      expect(ticket.mayContend()).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(ticket.mayContend()).toBe(true);
+      expect(ticket.queued).toBe(false);
+      expect(fs.existsSync(first)).toBe(true); // admission fallback never reaps a live receipt
+    } finally { ticket.close(); }
   });
 
   it("a missing own ticket cannot strand a waiter", async () => {
@@ -187,7 +195,7 @@ describe("bounded FIFO mesh admission", () => {
     ticket.close();
   });
 
-  it("cleans receipts on cancellation, operation exceptions and typed timeouts", async () => {
+  it("preserves the native holder on cancellation and typed timeout, and releases after operation exceptions", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
     const root = scratch();
     const lock = held(root);
@@ -196,16 +204,14 @@ describe("bounded FIFO mesh admission", () => {
     const pending = store.exclusive(() => {}).catch(error => error);
     abort.abort(new Error("cancel"));
     expect(await pending).toMatchObject({ message: "cancel" });
-    expect(fs.readdirSync(queue(root))).toEqual([]);
+    expect(fs.existsSync(lock)).toBe(true);
     const second = new MeshStore(root, 65536, 100, { lockTimeoutMs: 100 });
     const timed = second.exclusive(() => {}).catch(error => error);
     await vi.advanceTimersByTimeAsync(100);
     expect(await timed).toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
-    expect(fs.readdirSync(queue(root))).toEqual([]);
     expect(fs.existsSync(lock)).toBe(true);
     fs.rmSync(lock, { recursive: true });
     await expect(second.exclusive(() => { throw new Error("operation"); })).rejects.toThrow("operation");
-    expect(fs.readdirSync(queue(root))).toEqual([]);
     expect(fs.existsSync(lock)).toBe(false);
   });
 
@@ -217,7 +223,7 @@ describe("bounded FIFO mesh admission", () => {
       `--legacyModule=${path.resolve("tests/fixtures/mesh-legacy-contender.mjs")}`],
       { timeout: 85000, env: { ...process.env, PI_FABRIC_LOCK_STATS: "1" } });
     const report = JSON.parse(stdout);
-    expect(report).toMatchObject({ n: 24, acquisitions: 48, timeouts: 0, mutualExclusion: true, remainingTickets: 0, legacyN });
+    expect(report).toMatchObject({ n: 24, acquisitions: 48, timeouts: 0, mutualExclusion: true, legacyN });
     // Every current contender recorded exactly its own acquisitions (legacy contenders record none).
     expect(report.lockStats).toMatchObject({ files: 24 - legacyN, acquisitions: 48 - 2 * legacyN, timeouts: 0 });
     expect(report.waitMs.p50).toBeGreaterThanOrEqual(0);

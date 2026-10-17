@@ -108,8 +108,8 @@ describe("startup mesh lock selector", () => {
     const pending = mesh.exclusive(() => { throw new Error("must not enter"); }).catch((error: unknown) => error);
     await vi.advanceTimersByTimeAsync(100);
     expect(await pending).toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
-    // One fixed relative budget timer (budget + 1 ms) precedes the unchanged bounded retry cadence.
-    expect(timers.mock.calls.map(([, wait]) => wait)).toEqual([101, ...Array(8).fill(10), 19, 1]);
+    // One fixed relative budget timer precedes native full-jitter retries clamped to the deadline.
+    expect(timers.mock.calls.map(([, wait]) => wait)).toEqual([101, 19, 39, 42]);
     expect(vi.getTimerCount()).toBe(0);
     expect(fs.readFileSync(path.join(lock, "owner"), "utf8")).toBe(live);
   });

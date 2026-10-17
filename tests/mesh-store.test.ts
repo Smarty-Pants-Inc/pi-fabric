@@ -6,7 +6,6 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MESH_ARCHIVE_CONFIG, MeshArchive } from "../src/mesh/archive.js";
-import { meshLockQueueDirectory } from "../src/mesh/lock-queue.js";
 import {
   MeshBatchConflictError,
   MeshStore,
@@ -220,7 +219,7 @@ describe("MeshStore", () => {
     expect(lookup).toHaveBeenCalledExactlyOnceWith(event.sequence);
     expect(scan).not.toHaveBeenCalled();
     expect(reads.mock.calls.some(([file]) => String(file).startsWith(archiveDir) && String(file).endsWith(".jsonl"))).toBe(false);
-    expect(dirs.mock.calls.map(([directory]) => String(directory))).toEqual([meshLockQueueDirectory(store.root)]);
+    expect(dirs).not.toHaveBeenCalled();
     expect(fs.existsSync(base + ".pending.json")).toBe(false);
     expect(await store.publish(packet)).toEqual(event);
     expect(store.latestSequence()).toBe(later.sequence);
@@ -264,7 +263,7 @@ describe("MeshStore", () => {
     const directories = vi.spyOn(fs, "readdirSync");
     const scans = vi.spyOn(MeshArchive.prototype, "readAfter");
     expect(await store.publish(packet)).toEqual(event);
-    expect(directories.mock.calls.map(([directory]) => String(directory))).toEqual([meshLockQueueDirectory(store.root)]);
+    expect(directories).not.toHaveBeenCalled();
     expect(scans).not.toHaveBeenCalled();
     const archive = MeshArchive.fromRoot(store.root)!;
     expect(archive.pending()).toBeUndefined();
@@ -1273,9 +1272,8 @@ describe("MeshStore lock recovery", () => {
     const initializer = start("initializer");
     try {
       await ready("initializer.ready");
-      // Force the original recovery syscall seam despite advisory FIFO admission. A
-      // removed/expired receipt (or an old-release initializer) must not weaken exclusion.
-      for (const name of fs.readdirSync(meshLockQueueDirectory(store.root))) fs.unlinkSync(path.join(meshLockQueueDirectory(store.root), name));
+      // Plain acquisition reaches the native recovery seam directly; the paused
+      // initializer must still preserve exclusion when its publication resumes.
       expect(fs.existsSync(ownerPath)).toBe(phase === "opened");
       if (phase === "opened") expect(fs.readFileSync(ownerPath, "utf8")).toBe("");
       const past = new Date(Date.now() - 60_000);
@@ -1595,7 +1593,7 @@ describe("MeshStore lock recovery", () => {
     await expect(result).resolves.toBe("done");
   });
 
-  it("the FIFO head uses a prompt capped polling cadence", async () => {
+  it("plain acquisition uses capped full-jitter retries and preserves the live holder", async () => {
     vi.useFakeTimers({ now: 1_000_000 });
     const store = createStore({ lockTimeoutMs: 2_000 });
     const lockPath = holdLock(store, `other\n${process.pid}\n${Date.now()}\n`);
@@ -1605,11 +1603,11 @@ describe("MeshStore lock recovery", () => {
     const result = store.exclusive(operation);
     expect(operation).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(1_000);
-    // One fixed relative budget timer (budget + 1 ms) precedes the unchanged polling cadence.
+    // One fixed relative budget timer precedes exponential full jitter, capped at 250 ms.
     const [budget, ...waits] = timers.mock.calls.map(([, wait]) => Number(wait));
     expect(budget).toBe(2_001);
-    expect(waits.slice(0, 6)).toEqual([10, 10, 10, 10, 10, 10]);
-    expect(waits.length).toBeLessThanOrEqual(101); // only the head probes at this cadence
+    expect(waits.slice(0, 6)).toEqual([10, 20, 40, 80, 125, 125]);
+    expect(waits.length).toBeLessThanOrEqual(12);
     expect(waits.every((wait) => wait >= 0 && wait <= 250)).toBe(true);
     expect(fs.readFileSync(path.join(lockPath, "owner"), "utf8")).toContain(`${process.pid}\n`);
     fs.rmSync(lockPath, { recursive: true });
@@ -1619,7 +1617,7 @@ describe("MeshStore lock recovery", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it("FIFO admission falls back to bounded full jitter, preserving diagnostics", async () => {
+  it("plain acquisition uses bounded full jitter, preserving diagnostics", async () => {
     vi.useFakeTimers({ now: 1_000_000 });
     const store = createStore({ lockTimeoutMs: 100 });
     const lockPath = holdLock(store, `other\n${process.pid}\n${Date.now() - 60_000}\n`);
@@ -1630,9 +1628,9 @@ describe("MeshStore lock recovery", () => {
     await vi.advanceTimersByTimeAsync(100);
     const error = await result;
     expect(error).toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
-    expect((error as Error).message).toMatch(/after 11 attempts, largest gap between attempts 19 ms$/);
-    // One fixed relative budget timer (budget + 1 ms) precedes the unchanged bounded retry cadence.
-    expect(timers.mock.calls.map(([, wait]) => Number(wait))).toEqual([101, ...Array(8).fill(10), 19, 1]);
+    expect((error as Error).message).toMatch(/after 4 attempts, largest gap between attempts 42 ms$/);
+    // One fixed relative budget timer precedes jittered retries clamped to the deadline.
+    expect(timers.mock.calls.map(([, wait]) => Number(wait))).toEqual([101, 19, 39, 42]);
     expect(operation).not.toHaveBeenCalled();
     expect(fs.existsSync(lockPath)).toBe(true); // a live holder is never swept, even beyond stale age
     expect(vi.getTimerCount()).toBe(0);
@@ -1645,8 +1643,8 @@ describe("MeshStore lock recovery", () => {
     await vi.advanceTimersByTimeAsync(100);
     await second;
     expect(timers.mock.calls[0]?.[1]).toBe(101);
-    expect(timers.mock.calls.slice(1, 9).every(([, wait]) => wait === 10)).toBe(true);
-    expect(timers.mock.calls.slice(9).every(([, wait]) => wait === 0)).toBe(true);
+    expect(timers.mock.calls.slice(1).length).toBeGreaterThan(0);
+    expect(timers.mock.calls.slice(1).every(([, wait]) => wait === 0)).toBe(true);
     expect(vi.getTimerCount()).toBe(0);
   });
 

@@ -4,12 +4,11 @@ import os from "node:os";
 import path from "node:path";
 import { buildSync } from "esbuild";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { meshLockQueueDirectory } from "../src/mesh/lock-queue.js";
 import { MeshLock } from "../src/mesh/mesh-lock.js";
 
-// smarty-dev#9805 (stalled FIFO head) and data-safety mutual exclusion, through the real MeshLock in real processes.
-// A "stalled" process is a child whose event loop is blocked by a synchronous busy loop: alive (kill -0 succeeds), its
-// receipt present, but it makes no progress. Barriers are stdout lines written synchronously by the child (fs.writeSync,
+// smarty-dev#9805 (stalled contender) and data-safety mutual exclusion, through the real MeshLock in real processes.
+// A "stalled" process is a child whose event loop is blocked by a synchronous busy loop: alive (kill -0 succeeds), but
+// making no progress. Barriers are stdout lines written synchronously by the child (fs.writeSync,
 // so a line is out before the child blocks) and IPC commands from the parent; the parent never sleeps.
 
 const parents: string[] = [];
@@ -35,7 +34,7 @@ process.on("message", async command => {
   try {
     if (command.cmd === "enqueue") {
       pending = lock.withLock(() => say({ acquired: Date.now() }));
-      say({ queued: true }); // protocol 1: the receipt exists once withLock has returned its promise
+      say({ queued: true }); // withLock has begun contending for the native lock
       pending.then(finish, error => { say({ error: String(error?.code ?? error) }); finish(); });
     } else if (command.cmd === "block") {
       say({ blocked: Date.now() });
@@ -45,7 +44,7 @@ process.on("message", async command => {
       await lock.withLock(() => {
         fs.writeFileSync(inside, String(process.pid), { flag: "wx" });
         say({ entered: Date.now() });
-        busy(command.ms); // a live, slow holder that cannot heartbeat its receipt
+        busy(command.ms); // a live, slow native holder
         fs.unlinkSync(inside);
         fs.writeFileSync(root + "/exit", String(Date.now()));
       });
@@ -58,7 +57,7 @@ process.on("message", async command => {
       let acquisitions = 0, violations = 0;
       const errors = [];
       for (let round = 0; round < command.rounds; round += 1) {
-        // Sometimes stall this waiter's whole event loop while it is queued (possibly as the FIFO head).
+        // Sometimes stall this waiter's whole event loop while it is contending.
         if (random() < 0.4) { const ms = Math.floor(random() * command.queuedStallMs); setTimeout(() => busy(ms), Math.floor(random() * 5)); }
         const holdMs = Math.floor(random() * command.holdStallMs);
         try {
@@ -118,18 +117,13 @@ const spawn = (root: string, budgetMs: number): Child => {
 };
 
 const scratch = (): string => {
-  // Own parent per root: the admission namespace (a sibling of the root) stays inside this scratch.
+  // Own parent per root keeps every native child fixture inside this scratch.
   const parent = fs.mkdtempSync(path.join(os.tmpdir(), "mesh-stalled-head-"));
   parents.push(parent);
   const root = path.join(parent, "mesh");
   fs.mkdirSync(root, { mode: 0o700 });
   return root;
 };
-const receipts = (root: string): string[] => {
-  try { return fs.readdirSync(meshLockQueueDirectory(root)).filter(name => /^\d{24}-\d+-/.test(name)).sort(); }
-  catch { return []; }
-};
-const pidOf = (receipt: string): number => Number(receipt.split("-")[1]);
 const ownerPid = (root: string): number => Number(fs.readFileSync(path.join(root, ".lock", "owner"), "utf8").split("\n")[1]);
 const reclaimFences = (root: string): string[] => fs.readdirSync(root).filter(name => name.startsWith(".lock.dead."));
 
@@ -147,8 +141,8 @@ afterEach(() => {
 });
 afterAll(() => { fs.rmSync(bundleDir, { recursive: true, force: true }); });
 
-describe.skipIf(process.platform === "win32")("mesh lock with a stalled live FIFO head (smarty-dev#9805)", () => {
-  it.each([false, true])("passes a live blocked head and preserves its receipt (follower queued before head promotion: %s)", async (queuedBeforePromotion) => {
+describe.skipIf(process.platform === "win32")("mesh lock with a stalled live contender (smarty-dev#9805)", () => {
+  it.each([false, true])("passes a live blocked contender without reclaiming a native holder (follower starts before release: %s)", async (startedBeforeRelease) => {
     const root = scratch();
     // A holds .lock (in this process) so B queues behind it.
     const holderA = new MeshLock(root, { lockTimeoutMs: 2500 }, noop);
@@ -162,46 +156,37 @@ describe.skipIf(process.platform === "win32")("mesh lock with a stalled live FIF
     await b.next("ready");
     b.send({ cmd: "enqueue" });
     await b.next("queued");
-    expect(receipts(root).map(pidOf)).toEqual([process.pid, b.process.pid]);
-    // Block B's event loop (it stays alive), then free .lock: B is now the FIFO head but cannot act on it.
+    // Block B's event loop (it stays alive), then free .lock: B cannot act on it.
     b.send({ cmd: "block", ms: 1800 });
     await b.next("blocked");
-    // Queue C either before B is promoted (A -> B -> C), or once B is already the head. The former catches a
-    // cached index > 1 that never notices its still-present predecessor became head when an older receipt left.
+    // Start C either while A still owns the native lock or just after A releases it.
     const follower = new MeshLock(root, { lockTimeoutMs: 2500 }, noop);
     const started = Date.now();
-    let during: { at: number; receipts: string[]; owner: number } | undefined;
+    let during: { at: number; owner: number } | undefined;
     const acquireFollower = () => follower.withLock(() => {
-      during = { at: Date.now(), receipts: receipts(root), owner: ownerPid(root) };
+      during = { at: Date.now(), owner: ownerPid(root) };
     });
-    const pending = queuedBeforePromotion ? acquireFollower() : undefined;
-    if (queuedBeforePromotion) expect(receipts(root).map(pidOf)).toEqual([process.pid, b.process.pid, process.pid]);
+    const pending = startedBeforeRelease ? acquireFollower() : undefined;
     releaseA();
     await a;
     expect(fs.existsSync(path.join(root, ".lock"))).toBe(false);
-    const [headReceipt] = receipts(root);
-    expect(receipts(root)).toHaveLength(queuedBeforePromotion ? 2 : 1);
-    expect(pidOf(headReceipt!)).toBe(b.process.pid);
-
     await (pending ?? acquireFollower());
     const releasedAt = Date.now();
     const bAcquired = await b.next("acquired");
     await b.next("done");
 
-    // The regression: C must not wait for the stalled head's 80% fallback (~2000 ms) or for B to resume (~1800 ms).
-    console.info(`STALLED_HEAD_PROBE promotion=${queuedBeforePromotion} followerWaitMs=${during!.at - started}`);
+    // C must not wait for the non-holder B to resume (~1800 ms).
+    console.info(`STALLED_CONTENDER_PROBE beforeRelease=${startedBeforeRelease} followerWaitMs=${during!.at - started}`);
     expect(during!.at - started).toBeLessThan(1000);
     expect(b.messages.some(message => "error" in message)).toBe(false);
-    // C passed B; B was neither reaped nor reordered: its receipt was still the queue head during C's hold.
+    // C acquired and released before B resumed; no native holder was reclaimed.
     expect(during!.owner).toBe(process.pid);
-    expect(during!.receipts[0]).toBe(headReceipt);
     expect(Number(bAcquired.acquired)).toBeGreaterThanOrEqual(releasedAt);
     expect(reclaimFences(root)).toEqual([]);
-    expect(receipts(root)).toEqual([]);
     expect(fs.existsSync(path.join(root, ".lock"))).toBe(false);
   }, 20_000);
 
-  it("never bypasses a live slow .lock holder, even when its receipt looks stalled", async () => {
+  it("never bypasses a live slow .lock holder while its event loop is stalled", async () => {
     const root = scratch();
     const h = spawn(root, 10_000);
     await h.next("ready");
@@ -217,8 +202,7 @@ describe.skipIf(process.platform === "win32")("mesh lock with a stalled live FIF
         exitAt: Number(fs.readFileSync(path.join(root, "exit"), "utf8")), owner: ownerPid(root), fences: reclaimFences(root),
       };
     });
-    // F queued behind the holder's receipt (kept through its critical section).
-    expect(receipts(root).map(pidOf)).toEqual([h.process.pid, process.pid]);
+    // Plain contention still cannot enter while H owns the native lock.
     await f;
     await h.next("done");
 
@@ -228,7 +212,6 @@ describe.skipIf(process.platform === "win32")("mesh lock with a stalled live FIF
     expect(during!.owner).toBe(process.pid);
     expect(during!.fences).toEqual([]); // a live holder is never reclaimed
     expect(h.messages.some(message => "error" in message)).toBe(false);
-    expect(receipts(root)).toEqual([]);
   }, 20_000);
 
   it("20 processes with random bounded stalls keep the wx owner-file invariant and all finish without timeout", async () => {
@@ -243,6 +226,5 @@ describe.skipIf(process.platform === "win32")("mesh lock with a stalled live FIF
     expect(fs.existsSync(path.join(root, "holder"))).toBe(false);
     expect(fs.existsSync(path.join(root, ".lock"))).toBe(false);
     expect(reclaimFences(root)).toEqual([]);
-    expect(receipts(root)).toEqual([]);
   }, 60_000);
 });

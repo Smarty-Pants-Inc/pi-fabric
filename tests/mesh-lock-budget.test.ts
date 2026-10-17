@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -6,11 +5,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import * as atomic from "../src/core/atomic-write.js";
 import { MeshIncarnationPendingError, MeshLockTimeoutError } from "../src/core/atomic-write.js";
 import { acquireMeshCustodyLock, MESH_CUSTODY_LOCK_NAME } from "../src/mesh/custody-lock.js";
-import { meshLockQueueDirectory, MeshLockTicket } from "../src/mesh/lock-queue.js";
-import { MeshLock, MeshLockQueueExpiredError } from "../src/mesh/mesh-lock.js";
+import { MeshLock } from "../src/mesh/mesh-lock.js";
 
-// Relative waits start after setup. Only eligible tickets attempt acquisition; FIFO expiry and cold identity
-// are distinct pre-lock refusals, never contention timeouts with fabricated attempts.
+// Relative waits start after setup. Plain contention has real acquisition attempts;
+// cold identity remains a distinct pre-lock refusal, never a fabricated contention timeout.
 const roots: string[] = [];
 const scratch = (): string => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "mesh-lock-budget-"));
@@ -23,33 +21,19 @@ afterEach(() => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
-/** The fake clock jumps by `ms` inside pre-lock setup: the admission receipt's queue lookup (realpath of the root). */
+/** The fake clock jumps by `ms` inside native pre-lock root setup, before the wait budget starts. */
 const slowSetup = (root: string, ms: number): void => {
-  const realpath = fs.realpathSync;
+  const mkdir = fs.mkdirSync;
   let armed = true;
-  vi.spyOn(fs, "realpathSync").mockImplementation(((file: fs.PathLike, options?: unknown) => {
+  vi.spyOn(fs, "mkdirSync").mockImplementation(((file: fs.PathLike, options?: unknown) => {
     if (armed && String(file) === root) { armed = false; vi.setSystemTime(Date.now() + ms); }
-    return realpath(file, options as undefined);
-  }) as typeof fs.realpathSync);
+    return mkdir(file, options as undefined);
+  }) as typeof fs.mkdirSync);
 };
 /** A live holder of `.lock` whose record no reclaimer may recover (live pid, no incarnation). */
 const holdLock = (root: string): void => {
   fs.mkdirSync(path.join(root, ".lock"));
   fs.writeFileSync(path.join(root, ".lock", "owner"), `legacy\n${process.pid}\n${Date.now()}\n`);
-};
-/** A live FIFO predecessor receipt, sorted ahead of every new waiter. */
-const predecessor = (root: string): string => {
-  fs.mkdirSync(meshLockQueueDirectory(root), { recursive: true, mode: 0o700 });
-  const file = path.join(meshLockQueueDirectory(root), `${"0".repeat(24)}-${process.pid}-${randomUUID()}`);
-  fs.writeFileSync(file, "");
-  return file;
-};
-const advanceWithHeartbeat = async (head: string, ms: number): Promise<void> => {
-  for (let elapsed = 0; elapsed < ms; elapsed += 50) {
-    const now = Date.now() / 1000;
-    fs.utimesSync(head, now, now);
-    await vi.advanceTimersByTimeAsync(Math.min(50, ms - elapsed));
-  }
 };
 const ready = async (protocol: 1 | 2 | 3, root: string, options: { lockTimeoutMs?: number } = {}): Promise<MeshLock> => {
   const lock = new MeshLock(root, { lockProtocol: protocol, ...options }, () => undefined);
@@ -71,53 +55,29 @@ describe("mesh lock wait budget starts after pre-lock setup", () => {
     expect(fs.existsSync(path.join(root, ".lock"))).toBe(false);
   });
 
-  it.each([1, 2, 3] as const)("protocol %s: setup leaves the full FIFO wait budget, then reports queue expiry without acquisition", async (protocol) => {
+  it.each([1, 2, 3] as const)("protocol %s: setup leaves the full native contention budget", async (protocol) => {
     const root = scratch();
     const lock = await ready(protocol, root);
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
     holdLock(root);
-    const head = predecessor(root);
+    const owner = fs.readFileSync(path.join(root, ".lock", "owner"), "utf8");
     slowSetup(root, 5_000);
     const operation = vi.fn();
     let settled = false;
     const pending = lock.withLock(operation, 2_000).catch((error: unknown) => error).finally(() => { settled = true; });
-    // Before the fix the deadline had already passed at the first loop: an instant 0-attempt timeout.
-    await advanceWithHeartbeat(head, 1_000);
+    await vi.advanceTimersByTimeAsync(1_000);
     expect(settled).toBe(false);
-    await advanceWithHeartbeat(head, 1_500);
+    await vi.advanceTimersByTimeAsync(1_500);
     const error = await pending;
-    expect(error).toBeInstanceOf(MeshLockQueueExpiredError);
-    expect(error).toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT", preLockCode: "FABRIC_MESH_LOCK_QUEUE_EXPIRED",
-      attempts: 0, waitersAhead: 1, waitedMs: 2_000 });
-    expect(operation).not.toHaveBeenCalled();
-  });
-
-  it("a waiter behind a live, heartbeating head never probes .lock, including at expiry", async () => {
-    const root = scratch();
-    const lock = await ready(1, root);
-    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
-    holdLock(root);
-    const head = predecessor(root);
-    const mkdir = vi.spyOn(fs, "mkdirSync");
-    const lockAttempts = (): number => mkdir.mock.calls.filter(([file]) => String(file) === path.join(root, ".lock")).length;
-    const pending = lock.withLock(() => "never", 2_000).catch((error: unknown) => error);
-    await advanceWithHeartbeat(head, 1_900);
-    expect(lockAttempts()).toBe(0);
-    await advanceWithHeartbeat(head, 300);
-    const error = await pending;
-    expect(error).toBeInstanceOf(MeshLockQueueExpiredError);
-    expect(error).toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT", preLockCode: "FABRIC_MESH_LOCK_QUEUE_EXPIRED",
-      attempts: 0, waitersAhead: 1, waitedMs: 2_000, kind: "pre-lock", retryable: true });
-    expect((error as Error).message).toContain("expired in the FIFO queue before its turn, 1 waiters ahead, waited 2000 ms");
-    expect((error as Error).message.startsWith("FABRIC_MESH_LOCK_QUEUE_EXPIRED (code FABRIC_MESH_LOCK_TIMEOUT): ")).toBe(true);
-    expect((error as Error).message).not.toMatch(/Timed out|0 attempts/);
+    expect(error).toBeInstanceOf(MeshLockTimeoutError);
+    expect((error as MeshLockTimeoutError).attempts).toBeGreaterThan(1);
     expect(atomic.isMeshLockTimeout(error)).toBe(true);
     expect(atomic.isMeshWriteDeferred(error)).toBe(true);
-    expect(lockAttempts()).toBe(0);
-    expect(fs.existsSync(head)).toBe(true);
+    expect(operation).not.toHaveBeenCalled();
+    expect(fs.readFileSync(path.join(root, ".lock", "owner"), "utf8")).toBe(owner);
   });
 
-  it("fresh-budget waiters keep FIFO order", async () => {
+  it("fresh-budget plain contenders all complete once after release", async () => {
     const root = scratch();
     const lock = await ready(1, root);
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
@@ -128,90 +88,38 @@ describe("mesh lock wait budget starts after pre-lock setup", () => {
     await vi.advanceTimersByTimeAsync(3_000);
     expect(order).toEqual([]);
     fs.renameSync(path.join(root, ".lock"), path.join(root, "fixture-held-lock"));
-    await vi.advanceTimersByTimeAsync(200);
+    await vi.advanceTimersByTimeAsync(250); // maximum native jitter delay after release
     await Promise.all([first, second]);
-    expect(order).toEqual(["first", "second"]);
-    expect(fs.readdirSync(meshLockQueueDirectory(root))).toEqual([]);
-  });
-
-  it("a free lock does not let an ineligible expired waiter jump a live head", async () => {
-    const root = scratch();
-    const lock = await ready(1, root);
-    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
-    const head = predecessor(root);
-    const operation = vi.fn();
-    const pending = lock.withLock(operation, 2_000).catch((error: unknown) => error);
-    await advanceWithHeartbeat(head, 2_200);
-    expect(await pending).toMatchObject({ preLockCode: "FABRIC_MESH_LOCK_QUEUE_EXPIRED", attempts: 0, waitersAhead: 1 });
-    expect(operation).not.toHaveBeenCalled();
+    expect([...order].sort()).toEqual(["first", "second"]);
     expect(fs.existsSync(path.join(root, ".lock"))).toBe(false);
   });
 
-  it.each([1, 2, 3] as const)("protocol %s: an eligible head still gets a real acquisition attempt at expiry", async (protocol) => {
+  it.each([1, 2, 3] as const)("protocol %s: a zero budget still gets one real native acquisition attempt", async (protocol) => {
     const root = scratch();
     const lock = await ready(protocol, root);
-    vi.useFakeTimers({ toFake: ["Date"] });
-    const mayContend = MeshLockTicket.prototype.mayContend;
-    vi.spyOn(MeshLockTicket.prototype, "mayContend").mockImplementation(function (this: MeshLockTicket) {
-      const eligible = mayContend.call(this);
-      vi.setSystemTime(Date.now() + 2_000); // admission/setup used the budget, but this ticket really is eligible
-      return eligible;
-    });
-    await expect(lock.withLock(() => "head acquired", 2_000)).resolves.toBe("head acquired");
+    await expect(lock.withLock(() => "acquired", 0)).resolves.toBe("acquired");
     holdLock(root);
-    const error = await lock.withLock(() => "never", 2_000).catch((caught: unknown) => caught);
+    const operation = vi.fn();
+    const error = await lock.withLock(operation, 0).catch((caught: unknown) => caught);
     expect(error).toBeInstanceOf(MeshLockTimeoutError);
-    expect(error).not.toBeInstanceOf(MeshLockQueueExpiredError);
     expect(error).toMatchObject({ attempts: 1 });
     expect((error as Error).message).toContain("Timed out waiting");
+    expect(operation).not.toHaveBeenCalled();
+    expect(fs.existsSync(path.join(root, ".lock"))).toBe(true);
   });
 
-  // The reported interleaving: younger budgets expire between the live head's 10 ms probes. Expiry must
-  // refuse admission instead of turning a free canonical lock into permission to barge.
-  const lockMkdirs = (root: string, onAttempt?: () => void) => {
+  // Record actual native acquisition probes to enforce fixed per-caller deadlines under contention.
+  const lockMkdirs = (root: string) => {
     const mkdir = fs.mkdirSync;
     const at: number[] = [];
     vi.spyOn(fs, "mkdirSync").mockImplementation(((file: fs.PathLike, options?: unknown) => {
-      if (String(file) === path.join(root, ".lock")) { at.push(Date.now()); onAttempt?.(); }
+      if (String(file) === path.join(root, ".lock")) at.push(Date.now());
       return mkdir(file, options as undefined);
     }) as typeof fs.mkdirSync);
     return at;
   };
 
-  it.each([1, 2])("%s ineligible expiry refusal(s) leave the live head ahead of every younger acquisition", async (waiters) => {
-    const root = scratch();
-    const lock = await ready(1, root);
-    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
-    holdLock(root);
-    const t0 = Date.now();
-    let released = false;
-    const attempts = lockMkdirs(root, () => {
-      if (!released && Date.now() >= t0 + 2_005) {
-        released = true;
-        fs.renameSync(path.join(root, ".lock"), path.join(root, "fixture-held-lock"));
-      }
-    });
-    const order: string[] = [];
-    const head = lock.withLock(() => order.push("head"), 10_000);
-    const younger = lock.withLock(() => order.push("younger"), 6_000);
-    const budgets = [2_005, 2_007].slice(0, waiters);
-    const expired = budgets.map((budget, index) =>
-      lock.withLock(() => order.push(`expired${index}`), budget).catch((error: unknown) => error));
-    await vi.advanceTimersByTimeAsync(2_100);
-    await Promise.all([head, younger]);
-    const refusals = await Promise.all(expired);
-    expect(order).toEqual(["head", "younger"]);
-    for (const [index, error] of refusals.entries()) {
-      expect(error).toBeInstanceOf(MeshLockQueueExpiredError);
-      expect(error).toMatchObject({ preLockCode: "FABRIC_MESH_LOCK_QUEUE_EXPIRED", attempts: 0,
-        waitersAhead: 2, waitedMs: budgets[index] });
-      expect((error as Error).message.startsWith("FABRIC_MESH_LOCK_QUEUE_EXPIRED (code FABRIC_MESH_LOCK_TIMEOUT): ")).toBe(true);
-      expect(attempts.filter(time => time === t0 + budgets[index]!)).toEqual([]);
-    }
-    expect(fs.readdirSync(meshLockQueueDirectory(root))).toEqual([]);
-  });
-
-  it("an ineligible queue expiry does not extend the live head's contention deadline", async () => {
+  it("one plain contender timing out does not extend another contender's native deadline", async () => {
     const root = scratch();
     const lock = await ready(1, root);
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
@@ -225,18 +133,17 @@ describe("mesh lock wait budget starts after pre-lock setup", () => {
     const waiter = lock.withLock(() => "never", 2_005).catch((error: unknown) => error)
       .finally(() => { waiterSettledAt = Date.now(); });
     await vi.advanceTimersByTimeAsync(3_100);
-    const [headError, queueError] = await Promise.all([head, waiter]);
-    expect(queueError).toBeInstanceOf(MeshLockQueueExpiredError);
-    expect(queueError).toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT", attempts: 0, waitersAhead: 1, waitedMs: 2_005 });
+    const [headError, waiterError] = await Promise.all([head, waiter]);
+    expect(waiterError).toBeInstanceOf(MeshLockTimeoutError);
+    expect((waiterError as MeshLockTimeoutError).attempts).toBeGreaterThan(1);
     expect(waiterSettledAt).toBe(t0 + 2_005);
-    expect(attempts.filter(time => time === t0 + 2_005)).toEqual([]);
     expect(headError).toBeInstanceOf(MeshLockTimeoutError);
-    expect(headError).not.toBeInstanceOf(MeshLockQueueExpiredError);
-    expect((headError as MeshLockTimeoutError).attempts).toBe(attempts.length);
-    expect((headError as MeshLockTimeoutError).attempts).toBeGreaterThan(100);
-    // H's deadline is fixed: queue expiry neither probes nor delays its settlement at t0 + 3000.
+    expect((headError as MeshLockTimeoutError).attempts).toBeGreaterThan(1);
+    expect((headError as MeshLockTimeoutError).attempts + (waiterError as MeshLockTimeoutError).attempts).toBe(attempts.length);
+    // Both original deadlines stay fixed; neither timeout restarts the other's budget.
     expect(headSettledAt).toBe(t0 + 3_000);
     expect(Math.max(...attempts)).toBeLessThanOrEqual(t0 + 3_000);
+    expect(fs.existsSync(path.join(root, ".lock"))).toBe(true);
   });
 
   it("custody: setup consuming the budget leaves the whole budget for contention", async () => {

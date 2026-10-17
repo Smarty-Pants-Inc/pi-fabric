@@ -2121,11 +2121,19 @@ export class AgentManager {
     // Write confinement is enforced by the child (the Pi tool_call guard, or
     // a runner that declares writePolicy and receives the policy at launch).
     checkWritePolicyRequest(request);
+    const actorRun = request.actorId !== undefined || request.actorName !== undefined;
+    const applyActorWritePolicy = actorRun && (runner === "pi" || runner === "pi-durable");
+    if (applyActorWritePolicy && request.writePolicy === "unrestricted") {
+      throw new Error('Actors cannot use writePolicy: "unrestricted"');
+    }
+    if (applyActorWritePolicy && request.writableRoots?.length) {
+      throw new Error("Pi actors cannot request writableRoots; only private run scratch is writable");
+    }
     if (request.writePolicy === "unrestricted" && this.#parentWritePolicy) {
       throw new Error("A write-confined agent cannot launch an unrestricted child");
     }
     const defaultTaskWritePolicy = !hostedAdapter && (transport === "auto" || transport === "process") &&
-      !request.actorId && !request.actorName && !request.residentStartupProbe &&
+      !actorRun && !request.residentStartupProbe &&
       !requestsWritePolicy(request) && this.#parentWritePolicy === undefined;
     // Existing resident layouts keep main's unscoped behavior until #11705 relocates
     // their host runs outside cwd. Explicit and inherited policies stay unchanged.
@@ -2141,7 +2149,9 @@ export class AgentManager {
     // Runners without write-policy support keep their historical behavior; log the gap below.
     let applyTaskWriteDefault = defaultTaskWritePolicy && capabilities.writePolicy &&
       (Boolean(request.worktree) || defaultWriteScopeFits(selectedCwd));
-    const confined = applyTaskWriteDefault ||
+    const actorShell = request.shell ?? this.#parentWritePolicy?.shell ??
+      (requestsWritePolicy(request) ? "deny" : "unconfined");
+    const confined = applyActorWritePolicy || applyTaskWriteDefault ||
       (requestsWritePolicy(request) && request.writePolicy !== "unrestricted") || this.#parentWritePolicy !== undefined;
     if (confined && !capabilities.writePolicy) {
       throw new Error(
@@ -2152,7 +2162,7 @@ export class AgentManager {
     }
     if (
       confined &&
-      (request.shell ?? this.#parentWritePolicy?.shell ?? (applyTaskWriteDefault ? "unconfined" : "deny")) !== "unconfined" &&
+      (applyActorWritePolicy ? actorShell : request.shell ?? this.#parentWritePolicy?.shell ?? (applyTaskWriteDefault ? "unconfined" : "deny")) !== "unconfined" &&
       ((kernel === "python" && pythonRuntime === "cpython") ||
         (kernel === "typescript" && /^(node|bun)-process$/.test(this.#executorRuntime?.() ?? "")))
     ) {
@@ -2312,12 +2322,21 @@ export class AgentManager {
       try {
         if (worktree && worktreeSetup?.trim()) await this.#worktrees.setup(id, worktreeSetup);
         if (applyTaskWriteDefault && worktree) applyTaskWriteDefault = defaultWriteScopeFits(agentCwd);
-        const tmpdir = applyTaskWriteDefault ? path.join(runDirectory, "tmp") : undefined;
+        const tmpdir = applyActorWritePolicy || applyTaskWriteDefault ? path.join(runDirectory, "tmp") : undefined;
         if (tmpdir) mkdirPrivate(tmpdir, this.#trustRoot());
+        const actorReadOnly = request.readOnly ?? this.#parentWritePolicy?.readOnly ?? false;
         const writePolicy = capabilities.writePolicy
-          ? resolveChildWritePolicy(applyTaskWriteDefault
-              ? { writableRoots: [agentCwd, tmpdir!], shell: "unconfined" }
-              : request, this.#parentWritePolicy, agentCwd)
+          ? resolveChildWritePolicy(applyActorWritePolicy
+              ? {
+                  ...request,
+                  // Actor write access is private scratch only, never the cwd,
+                  // host-owned run records, or all of the parent's roots.
+                  writableRoots: actorReadOnly ? [] : [tmpdir!],
+                  shell: actorShell,
+                }
+              : applyTaskWriteDefault
+                ? { writableRoots: [agentCwd, tmpdir!], shell: "unconfined" }
+                : request, this.#parentWritePolicy, agentCwd)
           : undefined;
         if (applyTaskWriteDefault) assertDefaultTaskWriteRoots(this.#runRoot, writePolicy!.writableRoots);
         const auditWritePolicy = (type: string, warning?: string, policy?: FabricWritePolicy): void => {
@@ -2325,7 +2344,8 @@ export class AgentManager {
             ...(policy ? { policy } : {}), ...(warning ? { warning } : {}),
           }) + "\n", { mode: 0o600 });
         };
-        if (request.writePolicy === "unrestricted") auditWritePolicy("write_policy.unrestricted");
+        if (applyActorWritePolicy) auditWritePolicy("write_policy.actor", undefined, writePolicy);
+        else if (request.writePolicy === "unrestricted") auditWritePolicy("write_policy.unrestricted");
         else if (defaultWriteScopeOverlap) {
           auditWritePolicy("write_policy.default_overlap_unconfined",
             `smarty-dev#11705: cwd ${defaultWriteScopeOverlap.writableRoot} contains host-owned run root ${defaultWriteScopeOverlap.runRoot}; no implicit write scope is imposed on this layout (accepted residual smarty-dev#11308).`);

@@ -428,6 +428,20 @@ export class PathBHarness {
     }
   }
 
+  /** Failure-only caller diagnostics. Never return auth config, JWTs or credential contents. */
+  async diagnostics(): Promise<unknown> {
+    const [health, varz, jsz] = await Promise.all([
+      httpJson(`${this.monitorUrl}/healthz?js-enabled-only=true`),
+      httpJson(`${this.monitorUrl}/varz`), httpJson(`${this.monitorUrl}/jsz?raft=true`),
+    ]);
+    const select = (record: Record<string, unknown> | undefined, keys: string[]) =>
+      Object.fromEntries(keys.filter(key => record?.[key] !== undefined).map(key => [key, record![key]]));
+    return { serverUrl: this.serverUrl, monitorUrl: this.monitorUrl, storeDir: path.join(this.root, "store"),
+      child: { pid: this.child?.pid, exitCode: this.child?.exitCode, signalCode: this.child?.signalCode },
+      health, varz: { status: varz.status, value: select(varz.value, ["server_id", "server_name", "version", "jetstream"]) },
+      jsz: { status: jsz.status, value: select(jsz.value, ["server_id", "config", "meta_cluster", "streams", "consumers", "messages"]) } };
+  }
+
   async start(): Promise<void> {
     if (this.child && this.child.exitCode === null && this.child.signalCode === null) return;
     const configPath = path.join(this.root, "nats.conf");

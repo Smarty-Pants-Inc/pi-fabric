@@ -387,7 +387,7 @@ jobs:
   nats-auth:
     # Hosted smarty-dev#7504 T2 role matrix and configured 1/1 T8 auth slice; this does not claim init --local or adapter coverage.
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
@@ -415,7 +415,14 @@ jobs:
             tar -xzf "$archive"
           )
           echo "NATS_BIN=$stage/nats-server-v${version}-linux-amd64/nats-server" >> "$GITHUB_ENV"
-      - name: Hosted authenticated NATS T2/T8 and Path B grants (source CLI)
+      - name: Fetch the pinned native toolchain
+        run: node scripts/native-toolchain.mjs fetch
+      - name: Build
+        env:
+          FABRIC_NATIVE_CC_PINNED: "1"
+        run: bun run build
+      - name: Hosted authenticated NATS T2/T8, Path B grants and carrier conformance
         env:
           NATS_AUTH_REQUIRED: '1'
-        run: bunx vitest run tests/nats-auth-server.test.ts tests/nats-auth-path-b-*.test.ts tests/nats-messaging.test.ts tests/nats-transport-auth.test.ts tests/nats-inbox-faults.test.ts tests/nats-kv-watch.test.ts tests/nats-dead-letter.test.ts tests/nats-reconnect-auth.test.ts --retry=0
+          FABRIC_NATIVE_PRODUCT_DELETE_HOSTED: '1'
+        run: FABRIC_TRANSPORT_HOSTED_PRESENCE_RESET=1 bunx vitest run tests/nats-auth-server.test.ts tests/nats-auth-path-b-*.test.ts tests/nats-messaging.test.ts tests/nats-transport-auth.test.ts tests/nats-inbox-faults.test.ts tests/nats-kv-watch.test.ts tests/nats-dead-letter.test.ts tests/nats-reconnect-auth.test.ts tests/transport-conformance.test.ts tests/transport-faults/broker-inbox.test.ts tests/transport-faults/nats-owner-crash.test.ts tests/transport-faults/nats-native-boundaries.test.ts tests/transport-faults/e14-control.test.ts tests/transport-faults/presence-leases.test.ts --retry=0 --cache=false

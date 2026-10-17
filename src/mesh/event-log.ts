@@ -11,7 +11,7 @@ import { MeshArchive, MeshArchiveLookupUnavailableError, MeshArchiveRecoveryChan
 import { delay, errorCode, type MeshLock, type MeshStoreContext } from "./mesh-lock.js";
 import { jsonClone } from "./state-file.js";
 import { verifiedRemove } from "../storage/verified-remove.js";
-import { prepareReceiptNamespace, receiptDirectoryBarrier, type ReceiptNamespace } from "./receipt-namespace.js";
+import { prepareKeyedPublishNamespace, receiptDirectoryBarrier, type ReceiptNamespace, type KeyedPublishPrefix, type LiveNamespaceBarrier } from "./receipt-namespace.js";
 
 // Mesh events (smarty-dev#6477 L0): publish, publishBatch, dedupe receipts, the live log, its
 // compaction, archive coupling and recovery, and cursor reads.
@@ -274,12 +274,14 @@ export class EventLog {
   }
 
   /** `durable`: the mesh.sync barrier, whose namespace step fails closed where there is none (win32). */
-  #confirmEventFile(file: string, durable = false): void {
+  #confirmEventFile(file: string, durable = false, syncNamespace?: LiveNamespaceBarrier): void {
     const fd = fs.openSync(file, process.platform === "win32" ? "r+" : "r");
     try {
       fs.fsyncSync(fd);
-      if (durable) syncPathNamespaceDurable(file, fs.fstatSync(fd), meshEventsNotDurable);
-      else syncPathNamespace(file, fs.fstatSync(fd));
+      const receipt = fs.fstatSync(fd);
+      if (durable) syncPathNamespaceDurable(file, receipt, meshEventsNotDurable);
+      else if (syncNamespace) syncNamespace(file, fd, receipt);
+      else syncPathNamespace(file, receipt);
     } finally { fs.closeSync(fd); }
   }
 
@@ -574,7 +576,7 @@ export class EventLog {
     }
   }
 
-  #preparePublish(input: MeshPublishInput, batch?: { appendStarted: boolean; bytes: number }, after?: AfterUnlock): () => MeshEvent {
+  #preparePublish(input: MeshPublishInput, batch?: { appendStarted: boolean; bytes: number }, after?: AfterUnlock, prefixScope?: KeyedPublishPrefix): () => MeshEvent {
     this.#validateTopic(input.topic);
     if (input.to !== undefined && !input.to.trim()) throw new Error("Mesh recipient is empty");
     if (input.dedupeFingerprint !== undefined &&
@@ -600,10 +602,16 @@ export class EventLog {
     let prepared: MeshArchiveRecoveryPlan | undefined;
     let digestRepair: ReturnType<MeshArchive["prepareDigestRepair"]>;
     let liveCatchUp: PreparedLiveCatchUp | undefined;
+    let prefixArchiveDir: string | undefined;
     try {
       prepared = preflight?.prepareRecovery(this.#readLastEventSequence());
       digestRepair = preflight?.prepareDigestRepair();
-      if (preflight) liveCatchUp = this.#prepareLiveCatchUp(preflight);
+      if (preflight) {
+        liveCatchUp = this.#prepareLiveCatchUp(preflight);
+        // Conservative bootstrap control: an archive without an off-lock head keeps ALL old
+        // barriers for this publish. Existence never supplies the borrowed ancestry proof.
+        if (prefixScope && preflight.head()) prefixArchiveDir = preflight.dir;
+      }
     } catch (error) {
       if (!(error instanceof MeshArchiveRecoveryChanged) && input.dedupeKey &&
           fs.existsSync(this.#dedupePath(input.dedupeKey, ".pending.json"))) {
@@ -701,11 +709,16 @@ export class EventLog {
         this.#recoverArchive(archive, false, prepared, liveCatchUp);
         if (archive.dir === preflight?.dir) archive.installDigestRepair(digestRepair);
       }
+      // Only a new single archived keyed append gets this publish's proof. Recovery above,
+      // batch, prior receipts and changed off-lock archive selection retain their defaults.
+      let publishNamespace: ReturnType<KeyedPublishPrefix["forArchive"]>;
       const append = (): { event: MeshEvent; line: string; bytes: number } => {
         input.admit?.();
         const createdAt = Date.now();
         const eventData = stamp ? jsonClone(stamp(createdAt)) : fixedData;
         const sequence = Math.max(this.#readSequence(), this.#readLastEventSequence()) + 1;
+        publishNamespace = input.dedupeKey && !batch && archive?.meshRoot === this.root && archive.dir === prefixArchiveDir
+          ? prefixScope?.forArchive(archive.dir, sequence) : undefined;
         const verification = encoded ? encoded.verification : verificationOf(eventData);
         const event: MeshEvent = {
           id: input.id ?? randomUUID(),
@@ -754,14 +767,14 @@ export class EventLog {
         if (intentPath) {
           // A durable negative lookup exists before the intent. Only begin() can replace it
           // with the synced archive line address, before any live append.
-          archive?.reserveLookup(sequence);
+          archive?.reserveLookup(sequence, publishNamespace?.syncIndexDirectory);
           // This is the crash fence: the intent is durable before the live append begins.
           writeFileAtomic(intentPath, JSON.stringify({
             dedupeKey: input.dedupeKey!, reservedSequence: sequence, eventId: event.id, liveOffset,
             ...(archive ? { archiveDir: archive.dir } : {}),
           } satisfies MeshDedupeIntent), { durable: true, ...(after?.namespace ? { syncDirectory: receiptDirectoryBarrier(after.namespace) } : {}) });
         }
-        const pending = archive?.begin({ event, line });
+        const pending = archive?.begin({ event, line }, publishNamespace?.syncIndexDirectory);
         // Test-only process-death fence: unlike an append exception, no rollback can run.
         if (receiptPath && pending && process.env.PI_FABRIC_TEST_CRASH_AFTER_ARCHIVE_BEGIN === "1") process.kill(process.pid, "SIGKILL");
         try {
@@ -773,7 +786,7 @@ export class EventLog {
         }
         // This distinct fence leaves the live event complete but the sidecar unconfirmed.
         if (receiptPath && pending && process.env.PI_FABRIC_TEST_CRASH_BEFORE_ARCHIVE_COMMIT === "1") process.kill(process.pid, "SIGKILL");
-        if (pending) archive!.commit(pending);
+        if (pending) archive!.commit(pending, true, publishNamespace?.syncIndexDirectory);
         return { event, line, bytes };
       };
       const { event, bytes } = input.fence ? input.fence(append) : append();
@@ -786,7 +799,7 @@ export class EventLog {
         this.#finishLiveReceipt(after, event, intentPath!, receiptPath);
       } else if (receiptPath) {
         // Archive-coupled receipts keep their locked protocol (smarty-dev#6000).
-        this.#confirmEventFile(this.#eventsPath);
+        this.#confirmEventFile(this.#eventsPath, false, publishNamespace?.syncLiveNamespace);
         // publish() only: the checked prepared-namespace leaf barrier (as for its intent);
         // batch/unprepared keep writeFileAtomic's default chain + syncPathNamespace.
         const syncDirectory = after?.namespace && receiptDirectoryBarrier(after.namespace);
@@ -821,10 +834,11 @@ export class EventLog {
     input = this.#capturePublication(input);
     const recoveryDeadline = Date.now() + this.#lock.lockTimeoutMs;
     // Keyed: confirm the complete receipt namespace before `.lock`; a failure appends nothing.
-    const after: AfterUnlock = input.dedupeKey ? { namespace: prepareReceiptNamespace(path.join(this.root, "event-receipts")) } : {};
+    const preparation = input.dedupeKey ? prepareKeyedPublishNamespace(this.root) : undefined;
+    const after: AfterUnlock = { namespace: preparation?.receiptNamespace };
     let event: MeshEvent;
     for (;;) {
-      try { event = await this.#lock.withLock(this.#preparePublish(input, undefined, after), undefined, "publish"); break; }
+      try { event = await this.#lock.withLock(this.#preparePublish(input, undefined, after, preparation?.prefixScope), undefined, "publish"); break; }
       catch (error) {
         if (!(error instanceof MeshArchiveRecoveryChanged) || Date.now() >= recoveryDeadline) throw error;
         await delay(0);

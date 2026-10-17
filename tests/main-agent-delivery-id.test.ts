@@ -13,6 +13,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import * as deliveryOutcomes from "../src/mesh/delivery-outcomes.js";
 import { FOLLOW_UP_LIMITS, MainAgentController } from "../src/main-agent.js";
 
 // Review round 2 on pi-fabric#160 (finding 1, security S1): Pi's sendMessage returns void and may
@@ -99,6 +100,98 @@ describe("Main delivery outcome evidence", () => {
     main.confirmInbox();
     expect(outcomes(journal).map(row => [row.eventId, row.outcome])).toEqual([["old", "superseded"], ["new", "delivered"]]);
     main.closeFollowUpDrain();
+  });
+  it("retires native delivery when outcome append fails, retaining only an outcome journal retry", () => {
+    const journal = journalPath(); const h = fakePi(); const entries: unknown[] = []; const context = busy(entries, true);
+    const main = new MainAgentController(h.pi, "session:root", true, "/tmp/project", "root");
+    main.attachFollowUpDrain(context, 0, journal);
+    const original = deliveryOutcomes.appendDeliveryOutcome;
+    let calls = 0;
+    const append = vi.spyOn(deliveryOutcomes, "appendDeliveryOutcome").mockImplementation((...args) => {
+      calls++;
+      if (calls === 20) throw Object.assign(new Error("outcome sink unavailable"), { code: "EIO" });
+      return original(...args);
+    });
+    try {
+      for (let index = 0; index < 20; index++) {
+        const eventId = `send-${index}`;
+        main.deliverAgent({ from: actor, message: `payload-${index}`, delivery: "steer", deliveryId: `delivery-${index}`,
+          outcomeSend: { eventId, to: main.id, from: actor.id, mode: "steer" } });
+      }
+      expect(h.sent).toHaveLength(20);
+      entries.push(...h.sent.map(persisted));
+      main.confirmInbox();
+      expect(h.sent).toHaveLength(20);                         // outcome failure never replays native payloads
+      expect(entries).toHaveLength(20);                         // every payload was durably admitted once
+      expect(fs.existsSync(journal)).toBe(true);                // only the failed outcome remains journalled
+      expect(outcomes(journal)).toHaveLength(19);
+      main.confirmInbox();                                      // the sink is healthy after N=20
+      expect(h.sent).toHaveLength(20);
+      expect(outcomes(journal)).toHaveLength(20);
+      expect(fs.existsSync(journal)).toBe(false);
+      for (let index = 0; index < 20; index++) {
+        expect(main.deliverAgent({ from: actor, message: `payload-${index}`, delivery: "steer", deliveryId: `delivery-${index}` }))
+          .toMatchObject({ duplicate: true });
+      }
+    } finally { append.mockRestore(); main.closeFollowUpDrain(); }
+  });
+  it("persists partial superseded-outcome progress while the newest carrier retires", () => {
+    const journal = journalPath(); const h = fakePi(); const entries: unknown[] = []; const context = busy(entries);
+    const main = new MainAgentController(h.pi, "session:root", true, "/tmp/project", "root");
+    main.attachFollowUpDrain(context, 60_000, journal);
+    const original = deliveryOutcomes.appendDeliveryOutcome;
+    const failures = new Set([1, 3, 4]);
+    let calls = 0;
+    const append = vi.spyOn(deliveryOutcomes, "appendDeliveryOutcome").mockImplementation((...args) => {
+      calls++;
+      if (failures.has(calls)) throw Object.assign(new Error("outcome sink unavailable"), { code: "EIO" });
+      return original(...args);
+    });
+    try {
+      const send = (eventId: string, message: string) => main.deliverAgent({ from: actor, message, delivery: "followUp",
+        data: { coalesceKey: "same-work" }, outcomeSend: { eventId, to: main.id, from: actor.id, mode: "followUp" } });
+      send("old-1", "old 1");
+      send("old-2", "old 2");
+      send("new", "new");
+      h.emit("agent_before_settle", { outcome: "completed" }, context);
+      entries.push(persisted(h.sent[0]!));
+      main.confirmInbox();
+      expect(JSON.parse(fs.readFileSync(journal, "utf8")).items[0].supersededSends.map((item: { eventId: string }) => item.eventId))
+        .toEqual(["old-2"]);
+      failures.clear();
+      main.confirmInbox();
+      expect(outcomes(journal).map(row => [row.eventId, row.outcome])).toEqual([
+        ["old-1", "superseded"], ["new", "delivered"], ["old-2", "superseded"],
+      ]);
+      expect(fs.existsSync(journal)).toBe(false);
+    } finally { append.mockRestore(); main.closeFollowUpDrain(); }
+  });
+  it("retries an outcome-only journal after reload without resending its native carrier", () => {
+    const journal = journalPath(); const h = fakePi(); const entries: unknown[] = []; const context = busy(entries, true);
+    const main = new MainAgentController(h.pi, "session:root", true, "/tmp/project", "root");
+    main.attachFollowUpDrain(context, 0, journal);
+    const send = { eventId: "reload-outcome", to: main.id, from: actor.id, mode: "steer" as const };
+    const append = vi.spyOn(deliveryOutcomes, "appendDeliveryOutcome").mockImplementation(() => {
+      throw Object.assign(new Error("outcome sink unavailable"), { code: "EIO" });
+    });
+    let restored = false;
+    try {
+      main.deliverAgent({ from: actor, message: "once", delivery: "steer", deliveryId: "reload-delivery", outcomeSend: send });
+      entries.push(persisted(h.sent[0]!));
+      main.confirmInbox();
+      expect(fs.readFileSync(journal, "utf8")).toContain('"outcomePending":true');
+      main.closeFollowUpDrain();
+      append.mockRestore(); restored = true;
+      const restarted = fakePi();
+      new MainAgentController(restarted.pi, "session:root", true, "/tmp/project", "root").attachFollowUpDrain(
+        busy(entries, true), 0, journal,
+      );
+      expect(restarted.sent).toHaveLength(0);
+      expect(outcomes(journal)).toEqual([{ ...send, outcome: "delivered", reason: "consumed by Main as itself", at: expect.any(Number) }]);
+      expect(fs.existsSync(journal)).toBe(false);
+    } finally {
+      if (!restored) append.mockRestore();
+    }
   });
 });
 

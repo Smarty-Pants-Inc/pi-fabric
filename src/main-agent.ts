@@ -330,6 +330,8 @@ export interface HeldAgentMessage {
   deliveryId?: string;
   /** Replaced delivery ids: retained with the live carrier even after consumed-id eviction. */
   supersedes?: string[];
+  /** Native admission is durable; retain this journal item only to retry outcome append. */
+  outcomePending?: true;
   /** Handed to Pi's queue; it may still be there after a reload. Unset while Fabric holds it. */
   handed?: true;
   /**
@@ -473,6 +475,9 @@ export class MainAgentController implements FabricMainAgentTarget {
   readonly #replayed = new Set<string>();
   // Handed to Pi, not yet in the session's entries. Kept in the journal until they are.
   readonly #sent: HeldAgentMessage[] = [];
+  // Native admission is confirmed, but one or more outcome records still need a best-effort retry.
+  // These items never re-enter Pi's queue; the journal is their outcome-only retry obligation.
+  readonly #outcomePending: HeldAgentMessage[] = [];
   // Replayed handoffs of an earlier controller: in Pi's queue after a live reload, lost after a
   // restart. Only a boundary shows Pi's queue, so they wait for one (#reconcile).
   readonly #unverified: HeldAgentMessage[] = [];
@@ -998,7 +1003,7 @@ export class MainAgentController implements FabricMainAgentTarget {
 
   /** The message id under which Main already admitted this delivery id, if it did. */
   #admitted(deliveryId: string): string | undefined {
-    const item = [...this.#unverified, ...this.#sent, ...this.#held].find((item) =>
+    const item = [...this.#unverified, ...this.#sent, ...this.#held, ...this.#outcomePending].find((item) =>
       item.deliveryId === deliveryId || item.supersedes?.includes(deliveryId));
     if (item) {
       // A replayed rename can be visible even though its post-rename barriers failed.
@@ -1063,7 +1068,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     if (!this.#journal) return;
     // Before the journal: an item leaves the journal only once its id is recorded as consumed.
     this.#saveIndex();
-    const items = [...this.#unverified, ...this.#sent, ...this.#held];
+    const items = [...this.#unverified, ...this.#sent, ...this.#held, ...this.#outcomePending];
     if (!items.length) { fs.rmSync(this.#journal, { force: true }); return; }
     writeFileAtomic(this.#journal, JSON.stringify({ version: 1, items }), { durable: true });
   }
@@ -1185,8 +1190,9 @@ export class MainAgentController implements FabricMainAgentTarget {
     for (const item of this.#unverified.splice(0)) {
       if (delivered.has(item.id)) {
         this.#recordSuperseded(item);
-        if (!item.supersededSends?.length && this.#recordOutcome(item.outcomeSend, "delivered", "consumed by Main as itself")) this.#consume(item);
-        else this.#sent.push(item);
+        const recorded = this.#recordOutcome(item.outcomeSend, "delivered", "consumed by Main as itself");
+        this.#consume(item);
+        if (item.supersededSends?.length || !recorded) this.#queueOutcomeRetry(item);
         continue;
       }
       if (queued.has(item.id) || seen.has(item.id)) this.#sent.push(item);
@@ -1223,20 +1229,52 @@ export class MainAgentController implements FabricMainAgentTarget {
     return pending.length !== before;
   }
 
+  #queueOutcomeRetry(item: HeldAgentMessage): void {
+    item.outcomePending = true;
+    if (!this.#outcomePending.includes(item)) this.#outcomePending.push(item);
+  }
+
+  /** Retry outcome-only journal items; they never block native delivery or re-enter Pi. */
+  #retryPendingOutcomes(): boolean {
+    let changed = false;
+    const kept: HeldAgentMessage[] = [];
+    for (const item of this.#outcomePending) {
+      const supersededChanged = this.#recordSuperseded(item);
+      const delivered = this.#recordOutcome(item.outcomeSend, "delivered", "consumed by Main as itself");
+      changed ||= supersededChanged;
+      if (item.supersededSends?.length || !delivered) {
+        kept.push(item);
+        continue;
+      }
+      delete item.outcomePending;
+      this.#consume(item);
+      changed = true;
+    }
+    if (kept.length !== this.#outcomePending.length) changed = true;
+    this.#outcomePending.splice(0, this.#outcomePending.length, ...kept);
+    return changed;
+  }
+
   /** Drop the handed-over followUps the session now holds (the only way one leaves the journal). */
   #confirm(): void {
     this.#retryPendingHalt();
-    let outcomesChanged = false;
+    let outcomesChanged = this.#retryPendingOutcomes();
     for (const item of this.#held) outcomesChanged = this.#recordSuperseded(item) || outcomesChanged;
-    if (!this.#sent.length) { if (outcomesChanged) this.#trySave(); return; }
     const delivered = this.#refreshDelivered();
     const before = this.#sent.length;
-    for (const item of this.#sent) outcomesChanged = this.#recordSuperseded(item) || outcomesChanged;
-    const kept = this.#sent.filter((item) => {
-      if (!delivered.has(item.id) || item.supersededSends?.length || !this.#recordOutcome(item.outcomeSend, "delivered", "consumed by Main as itself")) return true;
+    const kept: HeldAgentMessage[] = [];
+    for (const item of this.#sent) {
+      if (!delivered.has(item.id)) {
+        kept.push(item);
+        continue;
+      }
+      // Native session admission is already durable. Outcome logging is best-effort and
+      // cannot hold the delivery queue; a failure becomes an outcome-only journal item.
+      outcomesChanged = this.#recordSuperseded(item) || outcomesChanged;
+      const recorded = this.#recordOutcome(item.outcomeSend, "delivered", "consumed by Main as itself");
       this.#consume(item);
-      return false;
-    });
+      if (item.supersededSends?.length || !recorded) this.#queueOutcomeRetry(item);
+    }
     this.#sent.splice(0, this.#sent.length, ...kept);
     if (this.#sent.length !== before || outcomesChanged) this.#trySave();
   }
@@ -1326,6 +1364,11 @@ export class MainAgentController implements FabricMainAgentTarget {
       this.#retryPendingHalt();                          // owner state survives an empty journal
       return;                                            // no journal
     }
+    // Outcome-only entries are already in the native session. Retry their host-owned logs, but
+    // never send their payload back through Pi.
+    for (const item of items) {
+      if (item.outcomePending === true) this.#outcomePending.push(item);
+    }
     // The owner rule (dev-lead on pi-fabric#102): skip every id the session holds; a handoff
     // may still sit in Pi's queue, so it waits for a boundary to check; the rest is held again.
     const delivered = this.#refreshDelivered();
@@ -1340,15 +1383,15 @@ export class MainAgentController implements FabricMainAgentTarget {
       if (!other || rank(item) > rank(other)) last.set(chainOf(item), item);
     }
     for (const item of items.sort((a, b) => a.sentAt - b.sentAt)) {
+      if (item.outcomePending === true) continue;
       if (this.#inboxFence && !this.#inboxFence.owns(item.id)) continue;
       if (delivered.has(item.id) || delivered.has(chainOf(item)) || last.get(chainOf(item)) !== item ||
         (item.deliveryId !== undefined && this.#consumed.has(item.deliveryId))) {
+        const nativeDelivered = delivered.has(item.id);
         this.#recordSuperseded(item);
-        if (item.supersededSends?.length || (delivered.has(item.id) && !this.#recordOutcome(item.outcomeSend, "delivered", "consumed by Main as itself"))) {
-          this.#sent.push(item);
-          continue;
-        }
+        const recorded = nativeDelivered ? this.#recordOutcome(item.outcomeSend, "delivered", "consumed by Main as itself") : true;
         this.#consume(item);
+        if (item.supersededSends?.length || !recorded) this.#queueOutcomeRetry(item);
         continue;
       }
       this.#recordSuperseded(item);
@@ -1356,6 +1399,7 @@ export class MainAgentController implements FabricMainAgentTarget {
       this.#replayed.add(item.id);
       (item.handed ? this.#unverified : this.#held).push(item);
     }
+    this.#retryPendingOutcomes();
     this.#trySave();
   }
 
@@ -1641,6 +1685,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     this.#source = undefined;
     this.#scanned = undefined;
     this.#sessionFileIdentity = undefined;
+    this.#outcomePending.splice(0);
     this.#journal = undefined;
     this.#context = undefined;
     this.#providerReleaseUntil = undefined;

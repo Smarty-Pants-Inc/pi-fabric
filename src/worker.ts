@@ -545,6 +545,10 @@ const main = async (): Promise<void> => {
     writeRunRecord(options.statusFile, record);
   }
   if (options.fabricExtensionPath) piArguments.push("-e", options.fabricExtensionPath);
+  // Host-configured hooks are mandatory even with extensions:false. Explicit
+  // -e reaches both native Pi and the task/durable SDK resource loaders; this
+  // is deliberately unrelated to --extensions (Fabric/discovery policy).
+  if (isPi) for (const extension of options.processExtensions ?? []) piArguments.push("-e", extension);
   const deliveryHook = fileURLToPath(new URL(
     import.meta.url.endsWith(".ts") ? "./worker/principal-delivery.ts" : "./worker/principal-delivery.js", import.meta.url));
   piArguments.push("-e", deliveryHook);

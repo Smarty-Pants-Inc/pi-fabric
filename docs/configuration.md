@@ -43,6 +43,30 @@ Only these keys are consumed from root policy; other settings remain in the ordi
 
 **Owner gate:** hosts-lead provisions `/etc/smarty/fabric-policy.json` with each host's **current intended relaxations before install** (for example uid/gid 0, directory mode `0755`, file mode `0644` or `0600`), publishing updates by atomic rename. Per-command escapes are denied by default: set `executor.landlock.allowEscape: true` only with an explicit owner-approved escape grant; an existing escape prefix is not authorization. Fabric-v2 verifies that editing the agent-dir file no longer relaxes authority after install. Revert means restoring the **previous Fabric pin**, not making the root policy writable.
 
+## Process Pi launch hooks
+
+Host configuration in the selected `PI_CODING_AGENT_DIR/fabric.json` may add explicit Pi extensions and environment values to process-transport task and actor launches:
+
+```json
+{
+  "agents": {
+    "process": {
+      "extensions": ["/absolute/path/to/child-lifecycle-hook.ts"],
+      "env": {
+        "CHILD_LABEL": "managed",
+        "CHILD_SCRATCH": "${env:TMPDIR}"
+      }
+    }
+  }
+}
+```
+
+`agents.process` is host-only; workspace `.pi/fabric.json` cannot inject or replace it. Extension entries must be absolute paths and environment values must be strings; invalid host values fail configuration loading with a field-specific error. These are trusted executable extensions, not a sandbox: they run with the child's operating-system permissions. Do not put secrets in committed configuration.
+
+The hook applies to both Pi-backed runners (`pi` and `pi-durable`), not Claude or Veda. Extensions load explicitly even when a task requests `extensions: false`. Configured hooks keep tasks on the local worker because one-shot external placement cannot forward this contract. Omit `agents.process` to retain the existing launch argv and environment unchanged.
+
+Environment values may interpolate `${env:NAME}` from the prepared launch environment after the existing `childEnvironment` hook. `TMPDIR` references account for the worker's `--tmpdir` selection. Interpolation is single-pass, never shell evaluation, and a missing referenced variable refuses launch without logging its value. Ordinary environment values reach Pi; the worker still owns its identity and safety variables. Conflicting `TMPDIR`, `TMP`, or `TEMP` overrides refuse launch rather than silently relocating temporary files outside the prepared directory. This hook does not allocate scratch or manufacture lifecycle identities: a cleanup hook needing a creation-time inode or clock value must receive values captured by the actual child-store creator, not inherited parent identities or a later timestamp.
+
 ## Process task placement
 
 `agents.placement` is **host-only**: put it in the selected `PI_CODING_AGENT_DIR/fabric.json`, never a workspace override. New process spawns check that file for changes and re-read placement when its filesystem identity/timestamps change; no `/reload` is needed. Running tasks keep their original launcher, receipt and cancellation policy. Removing placement (or the file) restores local spawning. Invalid live edits retain the last valid placement with a warning and are not rewritten; other agent settings still require config reload. Managed hosts keep their sealed policy. Absent means unchanged local spawns. When configured, `default` is `"local"` unless explicitly `"remote"`. A remote Main task launches through `command`, not the local worker; `needs?: string[]` on spawn/run routes unmet needs locally. `capabilities` defaults to `[]` and must describe guarantees on every target selected by the launcher. Needs and capabilities share canonical tokens: NFKC-normalize, lowercase, split comma/Unicode White_Space compounds, validate [a-z0-9._-], and deduplicate. Any canonical `local` token always pins execution to Main and is refused in `capabilities` with `AgentInputError` / `FABRIC_AGENT_INPUT_ERROR`. Optional spawn/run `requires` preflights absolute input paths on the selected host; remote commands receive repeated `--require PATH` arguments (the fleet launcher's current repeatable preflight flag, not legacy `--input`) before `--`. See [input preflight](agents.md#opt-in-process-task-placement) for validation bounds and local refusals.

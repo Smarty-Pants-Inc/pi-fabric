@@ -14,6 +14,7 @@ import { WORKER_PROTOCOL_VERSION } from "../worker-protocol.js";
 import { executeFile, findExecutable, spawnDetached } from "./process-utils.js";
 import { taskAgentEnvironment, withoutTaskBoundary } from "../task-environment.js";
 import { applyTaskReturnAddress } from "../task-return-address.js";
+import type { FabricProcessLaunchConfig } from "../../config.js";
 import type { AgentPlacementConfig } from "../placement-config.js";
 import { agentPlacementProbe, liveAgentPlacement } from "../placement-config.js";
 import { normalizeAgentCapabilityTokens } from "../../host-compatibility.js";
@@ -29,7 +30,7 @@ const regularFile = (file: string): boolean => {
  * Pin both child entrypoints to its canonical release root, never a mutable pointer.
  * Explicit source/custom workers remain caller-selected (tests and development).
  */
-const selectWorkerRelease = (workerPath: string): { workerPath: string; fabricRelease?: string; extensionPath?: string } => {
+const selectWorkerRelease = (workerPath: string, requireProcessHooks = false): { workerPath: string; fabricRelease?: string; extensionPath?: string } => {
   let canonicalWorker = path.resolve(workerPath);
   try { canonicalWorker = fs.realpathSync(canonicalWorker); } catch { /* Preserve normal spawn errors for missing custom paths. */ }
   const parent = loadedFabricRoot(pathToFileURL(canonicalWorker).href);
@@ -38,6 +39,10 @@ const selectWorkerRelease = (workerPath: string): { workerPath: string; fabricRe
     return { workerPath, fabricRelease: parent };
   }
   const fallback = { workerPath: canonicalWorker, fabricRelease: parent, extensionPath: path.join(parent, "dist/index.js") };
+  // Protocol-v3 generations predate host launch hooks. Their option parser can
+  // ignore an unknown flag, silently omitting mandatory -e paths. A configured
+  // launch stays on the loaded manager's matching worker until the host reloads.
+  if (requireProcessHooks) return fallback;
   const current = activeFabricRoot(path.join(resolveAgentDir(), "settings.json"));
   if (!current || current === parent) return fallback;
   let version: unknown;
@@ -249,6 +254,42 @@ const prepareTaskTemporaryDirectory = (
   return { workerArguments: childArguments, environment: childEnvironment };
 };
 
+/** Resolve each template once against the post-carrier-hook launch snapshot.
+ * The worker reasserts --tmpdir for its execution child, so that option must
+ * also win in the snapshot. Replacement text is never parsed again or shelled.
+ * Temp relocation is not an env-only operation: it would bypass the task's
+ * prepared write roots or be silently undone by the worker. Ordinary env
+ * additions survive; worker-owned Pi identity/safety fields retain precedence.
+ */
+const processLaunchEnvironment = (
+  configuration: FabricProcessLaunchConfig | undefined,
+  environment: NodeJS.ProcessEnv,
+  workerArguments: readonly string[],
+): NodeJS.ProcessEnv => {
+  if (!configuration?.env || Object.keys(configuration.env).length === 0) return environment;
+  const snapshot = { ...environment };
+  for (let index = 0; index < workerArguments.length; index += 2) {
+    if (workerArguments[index] !== "--tmpdir" || !workerArguments[index + 1]) continue;
+    snapshot.TMPDIR = snapshot.TMP = snapshot.TEMP = workerArguments[index + 1];
+  }
+  const overrides = Object.fromEntries(Object.entries(configuration.env).map(([key, value]) => [
+    key,
+    value.replace(/\$\{env:([^}]+)\}/g, (_template, name: string) => {
+      if (!Object.hasOwn(snapshot, name) || snapshot[name] === undefined) {
+        // Never include a configured value (possibly a secret) in diagnostics.
+        throw new Error(`agents.process.env.${key}: referenced environment variable ${name} is missing`);
+      }
+      return snapshot[name]!;
+    }),
+  ]));
+  for (const name of ["TMPDIR", "TMP", "TEMP"]) {
+    if (Object.hasOwn(overrides, name) && overrides[name] !== snapshot[name]) {
+      throw new Error(`agents.process.env.${name}: cannot override the worker temporary directory`);
+    }
+  }
+  return { ...environment, ...overrides };
+};
+
 export class ProcessTransport implements AgentTransportAdapter {
   readonly kind = "process" as const;
   #scopeWarningLogged = false;
@@ -262,6 +303,7 @@ export class ProcessTransport implements AgentTransportAdapter {
     placement?: AgentPlacementConfig,
     placementConfigPath?: string,
     memoryMaxBytes: number = DEFAULT_TASK_MEMORY_MAX_BYTES,
+    private readonly processLaunch?: FabricProcessLaunchConfig,
   ) {
     this.#placement = placementConfigPath ? liveAgentPlacement(placementConfigPath, placement) : () => placement;
     if (!Number.isSafeInteger(memoryMaxBytes) || memoryMaxBytes <= 0) {
@@ -286,12 +328,25 @@ export class ProcessTransport implements AgentTransportAdapter {
     const requires = normalizeAgentRequires(request.requires);
     const needs = normalizeAgentCapabilityTokens(request.needs);
     request = { ...request, ...(needs !== undefined ? { needs } : {}), ...(requires !== undefined ? { requires } : {}) };
+    const argumentsByName = new Map<string, string>();
+    for (let index = 0; index < request.workerArguments.length; index += 2) {
+      argumentsByName.set(request.workerArguments[index]!, request.workerArguments[index + 1]!);
+    }
+    const runner = argumentsByName.get("--runner");
+    // Host policy only, never a guest request field. Snapshot before placement
+    // awaits so extensions and env are from the same admitted configuration.
+    const processLaunch = (runner === "pi" || runner === "pi-durable") && this.processLaunch
+      ? { ...(this.processLaunch.extensions ? { extensions: [...this.processLaunch.extensions] } : {}),
+          ...(this.processLaunch.env ? { env: { ...this.processLaunch.env } } : {}) }
+      : undefined;
+    const configuredHooks = Boolean(processLaunch?.extensions?.length || Object.keys(processLaunch?.env ?? {}).length);
     const placement = this.#placement();
     if (placement) {
       const preflightDeadline = Date.now() + Math.min(placement.commandTimeoutMs, 5_000);
       const capabilities = normalizeAgentCapabilityTokens(placement.capabilities, "agents.placement.capabilities")!;
       const unmet = (needs ?? []).filter(need => !capabilities.includes(need));
-      let reason = request.needs?.includes("local") ? "reserved need: local pins to the Main host"
+      let reason = configuredHooks ? "agents.process launch hooks require the local Pi worker; one-shot placement cannot forward them"
+        : request.needs?.includes("local") ? "reserved need: local pins to the Main host"
         : placement.default === "local" ? "placement default is local"
         : unmet.length ? `unmet needs: ${unmet.join(", ")}` : request.placementLocalReason;
       if (!reason) reason = agentPlacementProbe(placement, request.cwd).reason;
@@ -362,7 +417,7 @@ export class ProcessTransport implements AgentTransportAdapter {
       executable && slice
         ? { executable, slice, warn: this.#warnScope, ...(capEligible ? { memoryMaxBytes: this.#memoryMaxBytes } : {}) }
         : undefined;
-    const selected = selectWorkerRelease(request.workerPath);
+    const selected = selectWorkerRelease(request.workerPath, configuredHooks);
     const workerArguments = [...request.workerArguments];
     if (selected.extensionPath) {
       let pinned = false;
@@ -384,6 +439,7 @@ export class ProcessTransport implements AgentTransportAdapter {
       }
     }
     if (selected.fabricRelease) workerArguments.push("--fabric-release", selected.fabricRelease);
+    if (processLaunch?.extensions?.length) workerArguments.push("--process-extensions", JSON.stringify(processLaunch.extensions));
     // Worker arguments are flag/value pairs. A flag-shaped value is not an
     // actor identity; explicit actor ids alone retain the parent's role env.
     const baseEnvironment = applyTaskReturnAddress(
@@ -400,7 +456,9 @@ export class ProcessTransport implements AgentTransportAdapter {
       prepared.workerArguments,
       request.cwd,
       request,
-      request.childEnvironment ? request.childEnvironment(prepared.environment) : prepared.environment,
+      processLaunchEnvironment(processLaunch,
+        request.childEnvironment ? request.childEnvironment(prepared.environment) : prepared.environment,
+        prepared.workerArguments),
       scope,
       7_000, // allow the worker's five-second execution-child cleanup
       process.platform !== "win32", // Windows retains its native-close/helper contract

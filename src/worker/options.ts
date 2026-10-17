@@ -1,4 +1,10 @@
+import path from "node:path";
 import type { AgentRunCarryOver, AgentWorkerOptions } from "../agents/types.js";
+
+/** Host-configured explicit Pi hooks, independent of Fabric's extensions boolean. */
+interface ProcessWorkerOptions extends AgentWorkerOptions {
+  processExtensions?: string[];
+}
 
 const argumentMap = (argv: readonly string[]): Map<string, string> => {
   const result = new Map<string, string>();
@@ -60,7 +66,7 @@ const carryOverTotals = (value: unknown): AgentRunCarryOver | undefined => {
 
 export const parseWorkerOptions = (
   argv: readonly string[] = process.argv,
-): AgentWorkerOptions => {
+): ProcessWorkerOptions => {
   const args = argumentMap(argv);
   const model = optional(args, "model");
   const promptSha256 = optional(args, "prompt-sha256");
@@ -209,6 +215,17 @@ export const parseWorkerOptions = (
     throw new Error("Worker persist-session requires the Claude runner");
   }
   const extensions = required(args, "extensions") === "true";
+  const processExtensionsSource = args.get("process-extensions");
+  let processExtensions: string[] | undefined;
+  if (processExtensionsSource !== undefined) {
+    let parsed: unknown;
+    try { parsed = JSON.parse(processExtensionsSource); } catch { /* reject without quoting config contents */ }
+    if (!isPi || !Array.isArray(parsed) || parsed.some(file =>
+      typeof file !== "string" || !path.isAbsolute(file) || file.includes("\0"))) {
+      throw new Error("Invalid worker process extensions: expected absolute Pi extension paths");
+    }
+    processExtensions = [...parsed];
+  }
   const selectedKernel = args.get("kernel");
   const pythonRuntime = args.get("python-runtime") ?? "monty";
   if (pythonRuntime !== "cpython" && pythonRuntime !== "monty") {
@@ -260,6 +277,7 @@ export const parseWorkerOptions = (
     ...(spawnerName ? { spawnerName } : {}),
     ...(fabricSessionId ? { fabricSessionId } : {}),
     extensions,
+    ...(processExtensions ? { processExtensions } : {}),
     tools: JSON.parse(required(args, "tools")) as string[],
     grantedRisks: JSON.parse(required(args, "granted-risks")) as string[],
     transport: required(args, "transport") as AgentWorkerOptions["transport"],

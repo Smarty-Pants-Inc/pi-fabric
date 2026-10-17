@@ -232,6 +232,14 @@ interface FabricPrewalkConfig {
   thinking?: FabricThinking;
 }
 
+/** Host-only additions to process task launches; absent preserves the default launch. */
+export interface FabricProcessLaunchConfig {
+  /** Literal absolute extension entry paths, in launch order. */
+  extensions?: string[];
+  /** Literal strings or ${env:NAME} templates, resolved from the child environment at launch. */
+  env?: Record<string, string>;
+}
+
 export interface FabricAgentConfig {
   /** Optional host-only external spawn/actor model router; off unless enabled. */
   router?: FabricAgentRouterConfig;
@@ -247,6 +255,8 @@ export interface FabricAgentConfig {
   processMemoryMaxBytes?: number;
   /** Host-only opt-in process task placement; workspace files cannot override it. */
   placement?: AgentPlacementConfig;
+  /** Host-only process extensions/environment; workspace files cannot override it. */
+  process?: FabricProcessLaunchConfig;
   /** User/workspace Pi default; package defaults intentionally leave this unset. */
   model?: string;
   /** Root deny baseline unioned with agent-dir additions; workspace lists are ignored. */
@@ -1413,6 +1423,38 @@ const memorySourcesValue = (value: unknown): FabricMemorySourceConfig[] | undefi
   return sources.length > 0 ? sources : undefined;
 };
 
+const processLaunchConfigValue = (value: unknown): FabricProcessLaunchConfig | undefined => {
+  if (value === undefined) return undefined;
+  if (!isJsonObject(value)) throw new Error("agents.process must be an object");
+  const config: FabricProcessLaunchConfig = {};
+  if (value.extensions !== undefined) {
+    if (!Array.isArray(value.extensions)) throw new Error("agents.process.extensions must be an array of absolute paths");
+    config.extensions = value.extensions.map((entry: unknown, index: number) => {
+      if (typeof entry !== "string" || entry.includes("\0") || !path.isAbsolute(entry)) {
+        throw new Error(`agents.process.extensions[${index}] must be an absolute path without NUL characters`);
+      }
+      return entry;
+    });
+  }
+  if (value.env !== undefined) {
+    if (!isJsonObject(value.env)) throw new Error("agents.process.env must be an object of string values");
+    config.env = Object.fromEntries(Object.entries(value.env).map(([name, entry]) => {
+      // Use a portable environment-name grammar, including for template references.
+      if (!/^[A-Za-z_]/.test(name) || /[^A-Za-z0-9_]/.test(name)) {
+        throw new Error("agents.process.env keys must be valid environment variable names (letters, digits and _, not starting with a digit)");
+      }
+      const field = `agents.process.env.${name}`;
+      if (typeof entry !== "string") throw new Error(`${field} must be a string`);
+      if (entry.includes("\0")) throw new Error(`${field} must not contain NUL characters`);
+      // Validation only: never consult the parent environment or expand at config load.
+      const literal = entry.replace(/\$\{env:[A-Za-z_][A-Za-z0-9_]*\}/g, "_");
+      if (literal.includes("${")) throw new Error(`${field} has an invalid template; expected \${env:NAME}`);
+      return [name, entry];
+    }));
+  }
+  return config;
+};
+
 export const normalizeFabricConfig = (input: Record<string, unknown>): FabricConfig => {
   const executor = objectValue(input.executor);
   const cpython = objectValue(executor.cpython);
@@ -1435,6 +1477,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
   const prewalk = objectValue(input.prewalk);
   const agents = objectValue(input.agents);
   const placement = normalizeAgentPlacement(agents.placement);
+  const processLaunch = processLaunchConfigValue(agents.process);
   const claude = objectValue(agents.claude);
   const veda = objectValue(agents.veda);
   const capture = objectValue(input.capture);
@@ -1749,6 +1792,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
         ? { processSlice: agents.processSlice } : {}),
       processMemoryMaxBytes: processMemoryMaxBytesValue(agents.processMemoryMaxBytes),
       ...(placement ? { placement } : {}),
+      ...(processLaunch ? { process: processLaunch } : {}),
       ...(router ? { router } : {}),
       ...(agentModel ? { model: agentModel } : {}),
       ...(typeof agents.modelRouting === "object" && agents.modelRouting !== null && !Array.isArray(agents.modelRouting)
@@ -2464,6 +2508,7 @@ const resolveFabricConfig = (
       delete agents.processSlice;
       delete agents.processMemoryMaxBytes;
       delete agents.placement;
+      delete agents.process; // Host-only extension loading and environment injection.
       delete agents.deadRootFilter; // Host-only: a lane cannot drop the fleet's exemptions.
       delete agents.stuckPreparingMs; // Host-only: a lane cannot silence the stuck-preparing owner notice.
       document.agents = agents;

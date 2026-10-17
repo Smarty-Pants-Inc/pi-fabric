@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
-  MeshStore,
+  MeshStore as RuntimeMeshStore,
   type MeshIdentity,
   type MeshEvent,
   type MeshStoreOptions,
@@ -19,6 +19,16 @@ import { FileControlReader, FileTransport } from "../src/transport/file.js";
 
 const roots: string[] = [];
 const planes: FabricControlPlane[] = [];
+type MeshStore = RuntimeMeshStore;
+const stores: MeshStore[] = [];
+// Own every fixture store, including inline readers, without changing its prototype.
+const MeshStore = new Proxy(RuntimeMeshStore, {
+  construct(target, args, newTarget) {
+    const store = Reflect.construct(target, args, newTarget) as MeshStore;
+    stores.push(store);
+    return store;
+  },
+});
 // Synthetic owner snapshot for tests that inject wire ACKs instead of running an owner.
 const fixtureOwnerIncarnation = "fixture:owner";
 
@@ -52,6 +62,7 @@ const plane = (
 
 afterEach(async () => {
   await Promise.all(planes.splice(0).map((value) => value.close()));
+  for (const store of stores.splice(0)) store.closeState();
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 

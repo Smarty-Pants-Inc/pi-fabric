@@ -1013,8 +1013,25 @@ export const createFabricExecTool = (
       if (failureProgress) sections.push(failureProgress);
       if (repeat.warn) sections.push(fabricRepeatWarnText(repeat.count, FABRIC_REPEAT_BLOCK));
       const rawOutput = sections.join("\n\n");
+      // Failure progress contains side-effect receipts and uncertainty facts;
+      // keep the whole block in the same irreducible priority lane as resident
+      // outcomes so a tiny model budget cannot hide an identifier.
+      const priorityText = [residentPriority, failureProgress]
+        .filter((value): value is string => Boolean(value))
+        .join("\n\n");
+      const priorityOutput = priorityText
+        ? {
+            text: priorityText,
+            sections: [
+              logPrefix ? `Guest logs:\n${logPrefix}` : "",
+              formattedValue.text ?? "",
+              result.error ? `Runtime error: ${result.error}` : "",
+              repeat.warn ? fabricRepeatWarnText(repeat.count, FABRIC_REPEAT_BLOCK) : "",
+            ],
+          }
+        : undefined;
       const outputFormat =
-        !residentPriority &&
+        !priorityOutput &&
         formattedValue.language &&
         formattedValue.text &&
         (result.logs.length === 0 || !outputWillTruncate)
@@ -1070,16 +1087,7 @@ export const createFabricExecTool = (
         outputBudget,
         fullRawOutput || "(no output)",
         outputArtifactWriter,
-        residentPriority ? {
-          text: residentPriority,
-          sections: [
-            logPrefix ? `Guest logs:\n${logPrefix}` : "",
-            formattedValue.text,
-            result.error ? `Runtime error: ${result.error}` : "",
-            failureProgress ?? "",
-            repeat.warn ? fabricRepeatWarnText(repeat.count, FABRIC_REPEAT_BLOCK) : "",
-          ],
-        } : undefined,
+        priorityOutput,
       )).text;
       // In-place prewalk continuation arrives as an in-band context message on
       // this boundary turn, so the loop must keep running: the executor's first

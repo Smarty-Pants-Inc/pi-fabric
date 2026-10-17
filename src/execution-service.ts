@@ -1,6 +1,7 @@
 import { createMainExecutionCeilingError, isMainExecutionCeilingError, mainExecutionCeilingAbortReason, preserveCancellationOutcome, shareCancellationEffects } from "./async-settlement.js";
 import { ResultConsumption } from "./result-consumption.js";
 import { ExecutionDeadline } from "./runtime/execution-deadline.js";
+import { withMeshInvocationContext } from "./mesh/mesh-lock.js";
 import { NativeCodemodeProvider } from "./native-codemode.js";
 import { nativeMcpIdentity } from "./core/native-mcp-identity.js";
 import { nativeToolRef, nativeToolIdentifier } from "./core/native-tool-names.js";
@@ -696,7 +697,10 @@ export class FabricExecutionService {
       }
       const participants = this.#participants;
       const separator = ref.indexOf(".");
-      return this.registry.invoke(ref, args, {
+      let invocationSucceeded = false;
+      return withMeshInvocationContext(
+        { signal: callContext.signal, deadlineAt: () => runtimeDeadline.at },
+        () => this.registry.invoke(ref, args, {
         ...callContext,
         // The registry resolves `provider.action` by this exact prefix, so the
         // view is bound to the provider that receives it.
@@ -738,8 +742,13 @@ export class FabricExecutionService {
         // Native images/state must stay intact; final output has its own bounds.
         maxResultChars: ref.startsWith("native.") || callContext.nativeToolResult ? 16_777_216 : this.config.executor.maxNestedResultChars,
         traceOperation,
-        observeInvocation,
-      });
+        observeInvocation(event) {
+          // The registry classifies the unbounded result; a resolved/bounded
+          // failure value is not permission for escaped mesh writers to detach.
+          if (event.type === "call_end") invocationSucceeded = event.success;
+          observeInvocation(event);
+        },
+      }), () => invocationSucceeded);
     };
     const nativeTransaction = this.nativeCodemode.begin(options.parentToolCallId, options.context, !python && codemodeProfile === "native");
     const loadNativeCatalog = async (context: typeof baseContext) => {

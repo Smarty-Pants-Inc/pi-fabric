@@ -63,6 +63,8 @@ const realBrokerNatsSuites = [
   "tests/mesh-state-backend-multiprocess.test.ts",
   "tests/mesh-backend-migration-nats.test.ts",
   "tests/state-backend-nats-election.test.ts",
+  "tests/state-backend-nats-publish-dedupe.test.ts",
+  "tests/state-backend-nats-pull-recovery.test.ts",
   "tests/nats-auth-server.test.ts",
 ];
 const excludedSuites = [...localRealDeleteSuites,

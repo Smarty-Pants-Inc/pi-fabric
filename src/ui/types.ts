@@ -100,6 +100,7 @@ export const activeStatuses = new Set([
   "ready",
   "claimed",
   "running",
+  "finishing",
   "in_progress",
   "blocked",
   "loading",

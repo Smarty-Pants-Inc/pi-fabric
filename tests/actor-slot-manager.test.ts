@@ -230,6 +230,30 @@ describe("manager protected birth/recovery seam", () => {
     expect(runner).not.toHaveBeenCalled();
   });
 
+  it("replays protected dead letters only after every recovery scope is ready, without another event", async () => {
+    const { directory, actorRoots } = open();
+    const id = "a".repeat(32);
+    intents.push(seed(actorRoots.session, id, "session"));
+    fs.mkdirSync(path.join(actorRoots.session, id), { recursive: true });
+    const deadLetter = path.join(actorRoots.session, id, "dead-letter.jsonl");
+    const backlog = { at: Date.now(), source: `mesh:${protectedTopic}`, event: event() };
+    fs.writeFileSync(deadLetter, `${JSON.stringify(backlog)}\n`);
+    const hold = deferred(), reached = deferred();
+    recover = async registryRoot => {
+      if (registryRoot === actorRoots.project) { reached.resolve(); await hold.promise; }
+    };
+    const recovering = directory.recoverProtectedActors();
+    await reached.promise;
+    await vi.waitFor(() => expect(new ActorRegistryStore(actorRoots.session).snapshot().actors).toHaveLength(1));
+    expect(fs.readFileSync(deadLetter, "utf8")).toContain("input-1");
+    expect(runner).not.toHaveBeenCalled();
+    hold.resolve();
+    await recovering;
+    expect(directory.status(id).queued).toBe(1);
+    expect(fs.existsSync(deadLetter)).toBe(false);
+    expect(runner).not.toHaveBeenCalled();
+  });
+
   it("parks accepted input when authority fails during awaited launch preparation", async () => {
     const { directory, actorRoots } = open();
     const actor = await directory.create({ ...request(), model: "test-model" });

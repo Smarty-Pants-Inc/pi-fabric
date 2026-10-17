@@ -29,6 +29,7 @@ export type FabricRunOutcome = "indeterminate";
 export type AgentRunStatus =
   | "queued"
   | "running"
+  | "finishing"
   | "completed"
   | "failed"
   | "stopped"
@@ -261,6 +262,8 @@ export interface AgentRunRecord {
   startedAt: number;
   updatedAt: number;
   finishedAt?: number;
+  /** Native final settlement; raw worker status stays running until drain/validation. */
+  finishingAt?: number;
   currentTool?: string;
   currentToolStartedAt?: number;
   /** smarty-dev#8758: tool-generated receipt of the paths written and shell commands run (write-receipt.ts). */
@@ -282,13 +285,10 @@ export interface AgentRunRecord {
   replyVia?: "tool";
   value?: unknown;
   error?: string;
-  /** Machine-readable terminal cause for a whitespace-only tool-call runaway. */
-  /**
-   * CONTEXT_OVERFLOW (smarty-dev#3238): set by the worker only from a structured overflow signal
-   * (Pi's own window refusal, pi-ai isContextOverflow on the assistant message, or the activation
-   * window's nonce-bound refusal frame), never from free error text.
-   */
-  errorCode?: "RUNAWAY_TOOL_CALL_STREAM" | "PROCESS_LIVENESS_WATCH_FAILED" | "PROCESS_TREE_CUSTODY_UNCONFIRMED" | "CONTEXT_OVERFLOW";
+  /** Machine-readable terminal cause; failure publication is not an exit receipt.
+   * CONTEXT_OVERFLOW is set only from a structured overflow signal, never free error text. */
+  errorCode?: "RUNAWAY_TOOL_CALL_STREAM" | "PROCESS_LIVENESS_WATCH_FAILED" | "PROCESS_TREE_CUSTODY_UNCONFIRMED" | "CONTEXT_OVERFLOW" | "CUSTODY_UNCONFIRMED";
+  executionCustody?: { state: "unconfirmed"; descendantsMayRemain: number; reason: string };
   /** Run diagnostics, including partial-report retention; warnings never override status. */
   warnings?: string[];
   stderr?: string;
@@ -558,6 +558,12 @@ export interface AgentTransportHandle {
    * Missing/failed admission keeps the legacy checked-query contract. */
   liveness?: "events" | "poll";
   livenessPollIntervalMs?: number;
+  /** Natural-exit grace after a native terminal candidate, before custody cleanup. */
+  finishingGraceMs?: number;
+  /** Birth-checked descendants signalled during custody cleanup, counted once. */
+  forcedCleanupCount?(): number;
+  /** Conservative count of descendants whose exit is not confirmed. */
+  remainingDescendantCount?(): number;
   /**
    * False when a lost worker must never be launched again automatically: the transport
    * cannot prove the previous one is gone (Herdr, smarty-dev#266). Default true.
@@ -574,11 +580,14 @@ export interface AgentTransportHandle {
   /** Optional checked session observation; absence alone is NOT a worker exit receipt. */
   observe?(options?: AgentTransportObservationOptions): Promise<AgentTransportObservation>;
   /** Immutable debt from this captured native stop/close deadline, not a generic
-   * liveness failure. Logical stop may finish while this exact debt retains files
-   * and admission; cancelled launches still require confirmed execution exit. */
+   * liveness failure. Bounded host shutdown may finish with custody retained,
+   * but task settlement and admission still require confirmed execution exit. */
   stopDebt?(): string | undefined;
   /** Bounded join of the captured process worker's native close (not PID absence). */
   waitForClose?(): Promise<void>;
+  /** Captured primary-worker exit notification, NOT native close or tree-exit proof.
+   * Windows uses this only to begin its bounded native-close join after natural exit. */
+  primaryExit?: Promise<void>;
   /** Passive native close notification; wakes monitoring, never itself grants collection. */
   closed?: Promise<void>;
   /** Scoped-only tree-empty receipt: the live PID and admission record agree

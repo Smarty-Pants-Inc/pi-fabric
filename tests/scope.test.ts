@@ -495,7 +495,7 @@ describe("agent scope narrowing", () => {
     } as unknown as AgentManager;
     const residency = { spawnAgent: async (request: unknown) => (resident.push(request), handle) };
     const provider = new AgentsProvider(
-      manager, {} as ActorManager, {} as GlobalActorRegistry, {} as FabricMainAgentTarget,
+      manager, { identity: { id: "session:scope-provider", kind: "main" } } as ActorManager, {} as GlobalActorRegistry, {} as FabricMainAgentTarget,
       { scheduleRefresh() {} } as unknown as FabricParticipantSource, undefined, {} as LifecycleBroker,
       () => true, residency as unknown as ConstructorParameters<typeof AgentsProvider>[8],
     );

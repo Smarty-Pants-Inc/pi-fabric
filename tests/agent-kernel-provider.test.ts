@@ -56,6 +56,7 @@ const setup = () => {
   vi.spyOn(manager, "wait").mockResolvedValue(completed);
   vi.spyOn(manager, "status").mockReturnValue(completed);
   const actors = {
+    identity: { id: "session:kernel-provider", kind: "main" as const },
     create: vi.fn(async (request: FabricActorRequest) => ({ ...request, id: "actor" })),
     cede: vi.fn(async () => {}),
   };

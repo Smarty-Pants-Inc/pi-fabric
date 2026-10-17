@@ -37,7 +37,7 @@ afterEach(async () => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
-const harness = (onTerminalNotice?: (notice: AgentTerminalNotice) => void | Promise<void>) => {
+const harness = (onTerminalNotice?: (notice: AgentTerminalNotice) => void | Promise<void>, sessionId = "99999999") => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "terminal-manager-")); roots.push(root);
   const records = new Map<string, AgentRunRecord>();
   const closures = new Map<string, () => void>();
@@ -47,14 +47,14 @@ const harness = (onTerminalNotice?: (notice: AgentTerminalNotice) => void | Prom
     const now = Date.now();
     const record: AgentRunRecord = { id: request.id, name: request.name, task: "task", status: "running", runner: "pi", transport: "process",
       cwd: request.cwd, startedAt: now, updatedAt: now, turns: 1, toolCalls: 0, text: "intermediate prose",
-      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 }, sessionId: "99999999" };
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 }, sessionId };
     records.set(request.id, record);
     writeJsonAtomic(args.get("--status-file")!, record);
     let alive = true;
     let close!: () => void;
     const closed = new Promise<void>(resolve => { close = () => { alive = false; resolve(); }; });
     closures.set(request.id, close); exits.push(close);
-    return { kind: "process", sessionId: "99999999", closed, stopDebt: () => undefined,
+    return { kind: "process", sessionId, closed, stopDebt: () => undefined,
       waitForClose: () => closed, isAlive: async () => alive, stop: async () => { await closed; } };
   });
   const settled = vi.fn();
@@ -79,42 +79,63 @@ const waitUntil = async (condition: () => boolean) => {
 };
 
 describe("ordinary process-task final answer boundary", () => {
-  it("releases wait and run exactly once on receipt while native admission and custody remain held", async () => {
+  it("keeps wait pending on receipt and settles exactly once after owned execution closes", async () => {
     const { manager, settled, launch, close, finish } = harness();
     const handle = await manager.spawn({ task: "ordinary", transport: "process" });
     const receipt = finish(handle.id, "final answer");
+    expect(manager.status(handle.id)).toMatchObject({ status: "finishing", text: "final answer" });
+    await expect(manager.wait(handle.id, { timeoutMs: 20 })).rejects.toThrow(/still running|timed out/i);
+    expect(settled).not.toHaveBeenCalled();
+    expect(manager.hasRunCustody(handle.id)).toBe(true);
+    const next = await manager.spawn({ task: "next", transport: "process" });
+    expect(next.status).toBe("queued"); expect(launch).toHaveBeenCalledTimes(1);
+    close(handle.id);
     const result = await manager.wait(handle.id, { timeoutMs: 1000 });
     expect(result).toMatchObject({ status: "completed", text: "final answer", finalAnswerReceipt: { id: receipt.id, recordedAt: receipt.recordedAt }, sessionId: "99999999" });
     expect(await manager.wait(handle.id)).toMatchObject({ finalAnswerReceipt: { id: receipt.id } });
     expect(settled).toHaveBeenCalledOnce();
-    expect(manager.hasRunCustody(handle.id)).toBe(true);
-    await expect(manager.cleanup(handle.id)).rejects.toThrow(/teardown is pending/);
-    const next = await manager.spawn({ task: "next", transport: "process" });
-    expect(next.status).toBe("queued"); expect(launch).toHaveBeenCalledTimes(1);
-    close(handle.id);
     await waitUntil(() => launch.mock.calls.length === 2);
     close(next.id);
   });
 
-  it("run returns on receipt, not the owned execution close", async () => {
-    const { manager, launch, settled, finish } = harness();
+  it("retains a terminal answer whose saved PID is still live despite mocked native close", async () => {
+    // Main's persisted live-PID fence is independent of the PR's finishing join.
+    // The transport is mocked; it must never certify collection of this process.
+    const { manager, root, finish, close } = harness(undefined, String(process.pid));
+    const handle = await manager.spawn({ task: "live saved PID", transport: "process" });
+    const directory = path.join(root, handle.id);
+    finish(handle.id, "answer is not an exit receipt");
+    expect(manager.status(handle.id).status).toBe("finishing");
+    expect(canRemoveTerminalRun(directory)).toBe(false);
+    close(handle.id);
+    expect(await manager.wait(handle.id, { timeoutMs: 1000 })).toMatchObject({ status: "completed" });
+    expect(JSON.parse(fs.readFileSync(path.join(directory, "status.json"), "utf8")).sessionId).toBe(String(process.pid));
+    expect(canRemoveTerminalRun(directory)).toBe(false);
+  });
+
+  it("run returns only after the receipt and owned execution close", async () => {
+    const { manager, launch, settled, finish, close } = harness();
     const run = manager.run({ task: "foreground", transport: "process" });
     await waitUntil(() => launch.mock.calls.length === 1);
     const id = launch.mock.calls[0]![0].id;
     finish(id, "foreground result");
+    expect(manager.status(id).status).toBe("finishing");
+    expect(settled).not.toHaveBeenCalled();
+    close(id);
     expect(await run).toMatchObject({ status: "completed", text: "foreground result" });
     expect(settled).toHaveBeenCalledOnce();
-    expect(manager.hasRunCustody(id)).toBe(true);
+    expect(manager.isSettled(id)).toBe(true);
   });
 
   it("does not kill a plain task before its validated receipt frame/status lands", async () => {
-    const { manager, root, finish } = harness();
+    const { manager, root, finish, close } = harness();
     const handle = await manager.spawn({ task: "ordinary", transport: "process" });
     const receipt = saveFinalAnswerReceipt(path.join(root, handle.id), handle.id, "plain final");
     expect(manager.status(handle.id)).toMatchObject({ status: "running", finalAnswerReceipt: { id: receipt.id } });
     expect(manager.isSettled(handle.id)).toBe(false);
     await expect(manager.wait(handle.id, { timeoutMs: 20 })).rejects.toThrow(/still running|timed out/i);
     finish(handle.id, "plain final");
+    close(handle.id);
     expect(await manager.wait(handle.id, { timeoutMs: 1000 })).toMatchObject({ status: "completed", finalAnswerReceipt: { id: receipt.id } });
   });
 
@@ -131,7 +152,7 @@ describe("ordinary process-task final answer boundary", () => {
   });
 
   it("retains schema failures, waits for the associated validated snapshot, and preserves replyVia/value", async () => {
-    const { manager, root, records } = harness();
+    const { manager, root, records, close } = harness();
     const handle = await manager.spawn({ task: "structured", schema: { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"] }, replyTool: true, transport: "process" });
     const receipt = saveFinalAnswerReceipt(path.join(root, handle.id), handle.id, "invalid report");
     manager.status(handle.id);
@@ -139,6 +160,7 @@ describe("ordinary process-task final answer boundary", () => {
     const record = { ...records.get(handle.id)!, status: "failed", error: "Structured agent output was invalid", replyVia: "tool", value: { ok: 42 },
       finalAnswerReceipt: { id: receipt.id, recordedAt: receipt.recordedAt } };
     writeJsonAtomic(path.join(root, handle.id, "status.json"), record);
+    close(handle.id);
     expect(await manager.wait(handle.id, { timeoutMs: 1000 })).toMatchObject({ status: "failed", error: record.error, replyVia: "tool", value: { ok: 42 }, finalAnswerReceipt: { id: receipt.id } });
   });
 
@@ -157,7 +179,7 @@ describe("ordinary process-task final answer boundary", () => {
         code: "FABRIC_TARGET_TERMINAL", targetId: handle.id, messageId, delivery: "steer", finalAnswerReceiptId: receipt.id, sender,
       } }) + "\n");
     }
-    await manager.wait(handle.id, { timeoutMs: 1000 }); close(handle.id);
+    close(handle.id); await manager.wait(handle.id, { timeoutMs: 1000 });
     await waitUntil(() => notices.length === 2);
     expect(notices.map(notice => notice.sender?.id).sort()).toEqual(["sender-local", "sender-remote"]);
     expect(notices.every(notice => notice.finalAnswerReceiptId === receipt.id)).toBe(true);
@@ -193,9 +215,12 @@ describe("ordinary process-task final answer boundary", () => {
       expect(notices).toEqual([]);
       expect(manager.hasRunCustody(handle.id)).toBe(true);
     }
-    await manager.wait(handle.id, { timeoutMs: 1000 });
+    expect(manager.status(handle.id).status).toBe("finishing");
+    await expect(manager.wait(handle.id, { timeoutMs: 20 })).rejects.toThrow(/still running|timed out/i);
     const next = await manager.spawn({ task: "native-close barrier", transport: "process" });
+    expect(next.status).toBe("queued");
     close(handle.id);
+    await manager.wait(handle.id, { timeoutMs: 1000 });
     await waitUntil(() => launch.mock.calls.length === 2);
     close(next.id);
     manager.status(handle.id);
@@ -224,9 +249,12 @@ describe("ordinary process-task final answer boundary", () => {
       id: queued.messageId, delivery: "steer", state: "delivered", provenance,
     });
     finish(handle.id, "done");
-    await manager.wait(handle.id, { timeoutMs: 1000 });
+    expect(manager.status(handle.id).status).toBe("finishing");
+    await expect(manager.wait(handle.id, { timeoutMs: 20 })).rejects.toThrow(/still running|timed out/i);
     const next = await manager.spawn({ task: "native-close barrier", transport: "process" });
+    expect(next.status).toBe("queued");
     close(handle.id);
+    await manager.wait(handle.id, { timeoutMs: 1000 });
     await waitUntil(() => launch.mock.calls.length === 2);
     close(next.id);
     const recovery = new TerminalNoticeOutbox(notice => { notices.push(notice); });
@@ -254,7 +282,7 @@ describe("ordinary process-task final answer boundary", () => {
       code: "FABRIC_TARGET_TERMINAL", targetId: handle.id, messageId: queued.messageId, delivery: "steer", finalAnswerReceiptId: receipt.id,
       sender: { ...admittedSender, id: "session:spoofed-recipient" },
     } }) + "\n");
-    await manager.wait(handle.id, { timeoutMs: 1000 }); close(handle.id);
+    close(handle.id); await manager.wait(handle.id, { timeoutMs: 1000 });
     await waitUntil(() => notices.length === 1);
     expect(notices[0]!.sender).toEqual(admittedSender);
     expect(notices.some(notice => notice.sender?.id === "session:spoofed-recipient")).toBe(false);
@@ -277,15 +305,15 @@ describe("ordinary process-task final answer boundary", () => {
       id: queued.messageId, delivery: "steer", state: "refused", forwarded: true, provenance,
     });
     const receipt = finish(handle.id, "done");
-    await manager.wait(handle.id, { timeoutMs: 1000 });
     const next = await manager.spawn({ task: "native-close barrier", transport: "process" });
     expect(next.status).toBe("queued");
-    close(handle.id);
     const outbox = path.join(root, handle.id, "terminal-notices", `${queued.messageId}.json`);
-    await waitUntil(() => attempts === 1 && fs.existsSync(outbox));
-    expect(canRemoveTerminalRun(path.join(root, handle.id))).toBe(false);
     manager.status(handle.id);
+    await waitUntil(() => attempts === 1 && fs.existsSync(outbox));
+    expect(manager.status(handle.id).status).toBe("finishing");
+    expect(canRemoveTerminalRun(path.join(root, handle.id))).toBe(false);
     await waitUntil(() => fs.existsSync(`${outbox}.delivered`));
+    close(handle.id); await manager.wait(handle.id, { timeoutMs: 1000 });
     expect(acknowledged).toBe(1); expect(attempts).toBe(2);
     const expectedNotice = { code: "FABRIC_TARGET_TERMINAL", targetId: handle.id,
       finalAnswerReceiptId: receipt.id, messageId: queued.messageId, delivery: "steer", sender: provenance.sender };

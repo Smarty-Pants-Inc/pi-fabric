@@ -1128,11 +1128,14 @@ export class ResidentHost {
   }
 
   async #recoverWakeBatch(batch: ResidentWakeRecoveryBatch): Promise<void> {
-    if (this.#drain || this.#staged) throw new Error(HOST_CLOSING_RETRY);
+    const canRecover = (): boolean => !this.#closed && !this.#drain && !this.#staged && !this.#handover;
+    if (!canRecover()) throw new Error(HOST_CLOSING_RETRY);
     this.#admissions++;
     try {
       const recovery = { config: this.config, ownedActors: this.actors.listOwned(true), batch, ignored: 0 };
-      await wakeResidentActors(this.mesh, [], undefined, recovery);
+      // Scoped own-root recovery precedes #ready; ordinary publication's gate
+      // intentionally remains closed, while lifecycle revocation is still live.
+      await wakeResidentActors(this.mesh, [], undefined, recovery, canRecover);
       this.#wakeRecoveryIgnored += recovery.ignored;
     } finally { this.#admissions--; this.#scheduleIdleCheck(); }
   }
@@ -1870,6 +1873,7 @@ export class ResidentHost {
     return this.#wakeRecoveryPending !== undefined || residentProcessWorkPending(this.processWorkSessionId) || this.#admissions > 0 || this.#boundaryRequests.size > 0 ||
       this.#publicationFailed || (includeActorCustody ? this.actors.releaseCustodyCount() > 0 : this.actors.inFlightActorIds().length > 0) ||
       this.agents.listForUi().some(agent => agent.status === "queued" || agent.status === "running") ||
+      this.agents.hasRetainedCustody() ||
       [this.#requestsPath, this.#processingPath].some(directory => {
         try { return fs.readdirSync(directory).some(entry => entry.endsWith(".json")); }
         catch { return false; }
@@ -1926,7 +1930,8 @@ export class ResidentHost {
     const activeActor = this.#hasActiveActor(now);
     const activeAgent = this.agents
       .listForUi()
-      .some((agent) => agent.status === "queued" || agent.status === "running");
+      .some((agent) => agent.status === "queued" || agent.status === "running") ||
+      this.agents.hasRetainedCustody();
     // Host work (admissions, requests, publications, outbox, process custody, wake recovery)
     // is the dormant-wake superset of main's pending-request check.
     const pendingRequest = this.#hasHostWork() || this.#hasPendingRequest();
@@ -2904,7 +2909,7 @@ export class ResidentHost {
           case "setModel": updated = await this.actors.setModel(actor.id, command.model, command.scope, commit, command.modelReason); break;
           case "setThinking": updated = await this.actors.setThinking(actor.id, command.thinking, command.scope, commit); break;
           case "setBatching": updated = await this.actors.setBatching(actor.id, command, commit); break;
-          case "setActivationFilter": updated = await this.actors.setActivationFilter(actor.id, command.activationFilter, commit, command.expiresAt); break;
+          case "setActivationFilter": updated = await this.actors.setActivationFilter(actor.id, command.activationFilter, commit, command.expiresAt, command.deadLetterReplayMaxAgeMs); break;
           case "setTools": updated = await this.actors.setTools(actor.id, command.tools, commit); break;
           default: throw new Error("Unknown resident actor operation");
         }

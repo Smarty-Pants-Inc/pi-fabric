@@ -58,7 +58,17 @@ const withRuntime = async (
   }
 };
 
-it.each(["actor", "agent"] as const)("#2490 inherits the actual %s host binding even when Main is remote and config is denied", async (parentKind) => {
+it("#2490 refuses a task (agent) host binding before inheritance even when Main is remote and config is denied", async () => {
+  await withRuntime([], async (runtime, refresh, context) => {
+    const refused = { name: "AgentSpawnForbiddenError", code: "FABRIC_AGENT_SPAWN_FORBIDDEN", launchOutcome: "unlaunched" };
+    await expect(invoke(runtime, context, "agents.spawn", { task: "HANG" })).rejects.toMatchObject(refused);
+    await expect(invoke(runtime, context, "agents.create", { name: "nested", instructions: "Review." })).rejects.toMatchObject(refused);
+    expect(refresh).not.toHaveBeenCalled();
+    expect(runtime.agents.list()).toEqual([]);
+  }, [], {}, { parentKind: "agent", thinking: "max", agents: { model: "dest/denied", thinking: "low", deniedModels: ["dest/denied"], deniedModelReplacement: "dest/old" } });
+});
+
+it.each(["actor"] as const)("#2490 inherits the actual %s host binding even when Main is remote and config is denied", async (parentKind) => {
   await withRuntime([], async (runtime, refresh, context) => {
     const handle = await invoke(runtime, context, "agents.spawn", { task: "HANG" }) as { id: string; model: string; thinking: string };
     expect(handle).toMatchObject({ model: "dest/old", thinking: "max" });

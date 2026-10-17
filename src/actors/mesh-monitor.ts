@@ -135,6 +135,21 @@ export class ActorMeshMonitor {
     this.releaseCheckpointReceipt();
   }
 
+  /** Retiring accepted backlog must not outlive the cursor receipt that suppresses its replay. */
+  checkpointPast(events: readonly Pick<MeshEvent, "sequence" | "id">[]): boolean {
+    // Without a saved cursor, a new monitor starts at the live end rather than replaying a gap.
+    if (!this.callbacks.cursorPath || events.length === 0) return true;
+    const last = this.#safeCursor.last;
+    if (this.#polling || !last || !Number.isSafeInteger(last.sequence) || events.some(event =>
+      !Number.isSafeInteger(event.sequence) || event.sequence < 0 ||
+      event.sequence > last.sequence || (event.sequence === last.sequence && event.id !== last.id))) return false;
+    try {
+      // Never advance to an arbitrary backlog event: checkpoint only the already consumed prefix.
+      this.checkpointForRelease();
+      return true;
+    } catch { return false; }
+  }
+
   releaseCheckpointReceipt(): unknown {
     if (this.#polling) throw new Error("Actor mesh cursor still polling");
     if (this.callbacks.cursorPath && JSON.stringify(this.#readCursor()) !== JSON.stringify(this.#safeCursor)) {

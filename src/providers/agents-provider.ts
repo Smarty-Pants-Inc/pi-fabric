@@ -12,7 +12,7 @@ import { ActorManager, ActorRegistryOwnershipError, parseBashTimeoutSeconds } fr
 import { slotAdmissionFor } from "../actors/slot-admission.js";
 import { participantProject, recordedProjectLead, repositoryOf, resolveProjectAgent } from "../topology/project-identity.js";
 import { GlobalActorRegistry } from "../actors/global-registry.js";
-import { isFabricActorHostEvent, FabricActorBatchPolicyError, normalizeActorActivation, normalizeActorBatching, validateActorCoalesceKey, validateActorDedupeKey, validateActorInferenceContext } from "../actors/types.js";
+import { isFabricActorHostEvent, FabricActorBatchPolicyError, normalizeDeadLetterReplayMaxAgeMs, normalizeActorActivation, normalizeActorBatching, validateActorCoalesceKey, validateActorDedupeKey, validateActorInferenceContext } from "../actors/types.js";
 import { normalizeActorSlotClaim } from "../actors/slot-claim.js";
 import { normalizeActorActivationFilter } from "../actors/activation-filter.js";
 import { normalizeActorRecords } from "../actors/records.js";
@@ -76,6 +76,7 @@ import {
 import { checkedHandoffCompaction } from "../agents/handoff.js";
 import { checkedSeed, completedBranchPrefix, snippetTask } from "../agents/fork-seed.js";
 import { readAgentLineage } from "../agents/child-env.js";
+import { assertAgentSpawnAllowed, snapshotAgentSpawnEnvironment, type AgentSpawnCaller } from "../agents/spawn-authority.js";
 import { childScope, sessionScope } from "../scope.js";
 import { withInheritedSessionPins } from "../agents/session-pins.js";
 import type {
@@ -125,7 +126,6 @@ import { AgentTranscriptReader } from "../ui/transcript.js";
 import { waitWithProgress, waitWithActorProgress } from "./agents-progress.js";
 import { AgentMessageRouter, unknownParticipant } from "./agents-message-router.js";
 import { terminalAgentStatuses } from "../agents/lifecycle.js";
-import { deliverWithMessageNotice, outgoingMessageNotice } from "./message-id-notice.js";
 
 export { collectAgentToolPreviewNodes, type AgentToolPreviewTreeOptions } from "./agents-progress.js";
 
@@ -339,6 +339,7 @@ const actorRequest = (
   validateActorCoalesceKey(args.coalesceKey);
   validateActorDedupeKey(args.dedupeKey);
   const activation = normalizeActorActivation(args.activation);
+  const deadLetterReplayMaxAgeMs = normalizeDeadLetterReplayMaxAgeMs(args.deadLetterReplayMaxAgeMs);
   const batching = normalizeActorBatching(args);
   const slotClaim = normalizeActorSlotClaim(args.slotClaim);
   const activationFilter = args.activationFilter === undefined ? undefined : normalizeActorActivationFilter(args.activationFilter);
@@ -379,6 +380,7 @@ const actorRequest = (
     ...(activation ? { activation } : {}),
     ...batching,
     ...(activationFilter ? { activationFilter } : {}),
+    ...(deadLetterReplayMaxAgeMs !== undefined ? { deadLetterReplayMaxAgeMs } : {}),
     ...(args.routeClass !== undefined ? { routeClass: args.routeClass as "status-groom" } : {}),
     ...(typeof args.protected === "boolean" ? { protected: args.protected } : {}),
     ...(typeof args.idempotencyKey === "string" ? { idempotencyKey: args.idempotencyKey } : {}),
@@ -450,6 +452,8 @@ export class AgentsProvider implements FabricProvider {
   readonly #router: AgentMessageRouter;
   readonly #projectLeadId: string | undefined;
   readonly #taskReturnAddress = readTaskReturnAddress();
+  readonly #spawnEnvironment: NodeJS.ProcessEnv;
+  readonly #spawnCaller: AgentSpawnCaller;
   readonly #creationAdmissions = new WeakMap<object, SpawnRouterAdmission>();
   readonly name = "agents";
   /** Session registry of `provider:` participants; stop/steer/followUp route there. */
@@ -473,6 +477,16 @@ export class AgentsProvider implements FabricProvider {
     readonly callerThinking: () => string | undefined = () => undefined,
     readonly routeEvaluate: (request: JevRequest, signal: AbortSignal, context: FabricInvocationContext) => Promise<JevResponse> = async () => { throw new Error("Jev routing unavailable"); },
   ) {
+    this.#spawnEnvironment = snapshotAgentSpawnEnvironment();
+    // Bind authority at bootstrap, not to mutable adapter or invocation metadata.
+    const identity = actorManager.identity;
+    // Real actor managers expose create() and must fail closed if bootstrap
+    // identity is absent. A few legacy model-admission fixtures use a minimal
+    // metadata-free adapter; keep their historical Main path without weakening
+    // an actual manager's authority boundary.
+    this.#spawnCaller = identity
+      ? Object.freeze({ kind: identity.kind, id: identity.id })
+      : (typeof (actorManager as { create?: unknown }).create === "function" ? null : undefined);
     this.#projectLeadId = recordedProjectLead(manager.cwd ?? process.cwd());
     this.#router = new AgentMessageRouter(
       manager, actorManager, mainAgent, participants, control,
@@ -794,6 +808,7 @@ export class AgentsProvider implements FabricProvider {
     args: Record<string, unknown>,
     context: FabricInvocationContext,
   ): Promise<Record<string, unknown>> {
+    this.#assertAgentSpawnAllowed();
     context = snapshotFabricInvocation(context);
     const model = typeof args.model === "string" ? args.model.trim() : "";
     if (!model) throw new Error("agents.handoff requires an explicit Pi target model");
@@ -825,6 +840,7 @@ export class AgentsProvider implements FabricProvider {
     context: FabricInvocationContext,
     sessionSeed: AgentSessionSeed,
   ): Promise<Record<string, unknown>> {
+    this.#assertAgentSpawnAllowed();
     context = snapshotFabricInvocation(context);
     const model = typeof args.model === "string" ? args.model.trim() : "";
     if (!model) throw new Error("agents.handoff requires an explicit Pi target model");
@@ -909,6 +925,10 @@ export class AgentsProvider implements FabricProvider {
     }
   }
 
+  #assertAgentSpawnAllowed(): void {
+    assertAgentSpawnAllowed(this.#spawnCaller, this.#spawnEnvironment);
+  }
+
   #mainWaitAtBound(record: object, timeoutMs: number): Record<string, unknown> {
     // The wait ended so Main can see news: held followUps land at this tool boundary.
     this.mainAgent.flushHeldAtNextBoundary?.();
@@ -927,6 +947,9 @@ export class AgentsProvider implements FabricProvider {
   ): Promise<unknown> {
     const checkCommit = (): void => throwIfExecutionExpired(context);
     checkCommit();
+    if (["run", "spawn", "handoff", "create", "createActor", "import", "export"].includes(actionName)) {
+      this.#assertAgentSpawnAllowed();
+    }
     if (args.modelReason === undefined && args.opusReason !== undefined) args = { ...args, modelReason: args.opusReason };
     // Reason admission happens after aliases/defaults are resolved, at the shared
     // AgentManager policy boundary; raw aliases never grant an exemption.
@@ -1719,16 +1742,18 @@ export class AgentsProvider implements FabricProvider {
       case "setActivationFilter": {
         if (args.activationFilter === undefined) throw new Error("activationFilter is required (a list of presets or rules, or null to clear)");
         const activationFilter = args.activationFilter === null ? null : normalizeActorActivationFilter(args.activationFilter);
+        const deadLetterReplayMaxAgeMs = normalizeDeadLetterReplayMaxAgeMs(args.deadLetterReplayMaxAgeMs);
+        const replayAge = deadLetterReplayMaxAgeMs === undefined ? {} : { deadLetterReplayMaxAgeMs };
         const expiresAt = args.expiresAt;
         if (expiresAt !== undefined && (typeof expiresAt !== "number" || !Number.isFinite(expiresAt))) throw new Error("expiresAt must be finite epoch milliseconds");
         if (args.scope === "global") {
           if (expiresAt !== undefined) throw new Error("expiresAt is only supported for live actors");
-          return this.globalActors.update(String(args.id), { activationFilter });
+          return this.globalActors.update(String(args.id), { activationFilter, ...replayAge });
         }
         const expiry = expiresAt === undefined ? {} : { expiresAt };
         const resident = await this.#residentActorOwner(String(args.id), context.signal);
-        if (resident) return this.#setResidentActor(resident, { operation: "setActivationFilter", id: resident.id, activationFilter, ...expiry }, context);
-        return this.actorManager.setActivationFilter(String(args.id), activationFilter, checkCommit, expiresAt as number | undefined);
+        if (resident) return this.#setResidentActor(resident, { operation: "setActivationFilter", id: resident.id, activationFilter, ...expiry, ...replayAge }, context);
+        return this.actorManager.setActivationFilter(String(args.id), activationFilter, checkCommit, expiresAt as number | undefined, deadLetterReplayMaxAgeMs);
       }
       case "setTopics": {
         if (args.scope !== undefined && args.scope !== "project" && args.scope !== "global") {
@@ -1927,14 +1952,7 @@ export class AgentsProvider implements FabricProvider {
         this.providerParticipants, this.participants, this.control, id, kind, message, data,
       ) as Promise<FabricAgentMessageResult>;
     }
-    // Host-authored lifecycle routing has no sender invocation/history. Check
-    // only model sends, before *all* local/actor/remote routing branches.
-    if (!context) return this.#router.routeMessage(id, message, data, kind, context, options);
-    context = snapshotFabricInvocation(context);
-    const checked = await outgoingMessageNotice(message, context, this.actorManager.identity.id);
-    const result = await deliverWithMessageNotice(message, checked,
-      text => this.#router.routeMessage(id, text, data, kind, context, options), `agents.${kind}`);
-    return checked.notice ? { ...result, notice: checked.notice } : result;
+    return this.#router.routeMessage(id, message, data, kind, context, options);
   }
 
   /** Flush pending coalesced lifecycle deliveries; used by tests and shutdown. */
@@ -2024,6 +2042,7 @@ export class AgentsProvider implements FabricProvider {
   }
 
   async #createActor(request: FabricActorCreateRequest, context: FabricInvocationContext): Promise<FabricActorInfo> {
+    this.#assertAgentSpawnAllowed();
     let handedOff = false;
     const routerAdmission = this.#creationAdmissions.get(request);
     const onDispatched = typeof (request as { spawnRouterDecisionId?: unknown }).spawnRouterDecisionId === "string"

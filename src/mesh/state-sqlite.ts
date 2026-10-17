@@ -219,11 +219,11 @@ const importFirst = (root: string, why: string): MeshStateUnsupportedError =>
     + `run \`fabric-mesh-backend import --root ${root}\` first (smarty-dev#6477)`);
 
 /**
- * smarty-dev#6477 part 2: only the import path creates `<root>/state.db` (the file-mode fence). Before any
- * side effect, a default open needs a non-empty state.db (its flag decides, see assertImportedDatabase);
- * without one it refuses: loudly when state.json is the moved marker (state.db lost), else "import first".
- * "create" (fixtures, the import's peers) may initialise a fresh root; "detached" (a shadow copy outside
- * the mesh root, never a fence) is unguarded.
+ * A default open creates `<root>/state.db` only when state.json is absent and state.db is missing or
+ * zero-length, using the fenced "create" path. Otherwise it needs an imported database (its flag decides,
+ * see assertImportedDatabase); a moved marker without its database is still a lost-database refusal.
+ * Explicit "create" (fixtures, the import's peers) also accepts an empty state.json; "detached" (a shadow
+ * copy outside the mesh root, never a fence) is unguarded.
  */
 /**
  * Test fixtures only: tests/fleet-isolation-setup.ts sets this global symbol to "create" so the suite's
@@ -262,8 +262,13 @@ const guardBeforeOpen = (root: string, initialize: SqliteStateStoreOptions["init
     return "create";
   }
   assertSqliteRootImported(root);
+  // Read the marker before the size: a concurrent creator publishes it only after initialising the db.
+  const state = classifyStateFile(path.join(root, "state.json"));
   if (stateDbSize(root) > 0) return initialize;
-  if (readMeshStateMovedMarker(root)) throw lostDatabase(root);
+  if (state === "marker") throw lostDatabase(root);
+  // ponytail: automatic creation is narrower than explicit "create": even an empty state.json still
+  // requires import. Only an absent state file and a missing/zero-length db use the existing create path.
+  if (state === "absent") return "create";
   throw importFirst(root, "this root has no imported state.db");
 };
 
@@ -450,8 +455,8 @@ export interface SqliteStateStoreOptions {
   /** A writer-lock hold longer than this emits a `held` lock event (smarty-dev#9290). Default 1,000 ms; 0 disables. */
   lockHeldEventMs?: number;
   /**
-   * Who may initialise state.db (smarty-dev#6477). Default: nobody; only an imported mesh root opens (an
-   * initialised state.db plus the moved marker), anything else refuses with no side effect. "create":
+   * Who may initialise state.db. Default: an imported root opens, or a fresh root (state.json absent,
+   * state.db missing or zero-length) uses "create". Other roots still require import. Explicit "create":
    * test fixtures and harnesses only: a FRESH root (no state.json or an empty one) is initialised as an
    * import would leave it (state.db at epoch 1 plus the moved marker), under the import's fence
    * (custody.lock, then .lock; fence-lock.ts) from the re-checked guard through the marker. "detached": a database outside the
@@ -957,7 +962,11 @@ export class SqliteStateStore {
     if (refusal) throw new MeshStateUnsupportedError(`Fabric mesh SQLite state needs a local filesystem: ${refusal}`);
     const requested = initializeOf(options);
     const initialize = guardBeforeOpen(root, requested);
-    if (initialize !== "create") return SqliteStateStore.#openAsync(root, maxEventBytes, maxReadEvents, options, initialize, initTimeoutMs);
+    // ponytail: a nonempty db without its marker may be a concurrent creator between schema commit and
+    // marker publication. Wait on its fence, then re-check; never adopt an unmarked db as a fresh one.
+    if (initialize !== "create" && (requested === "detached" || readMeshStateMovedMarker(root))) {
+      return SqliteStateStore.#openAsync(root, maxEventBytes, maxReadEvents, options, initialize, initTimeoutMs);
+    }
     // smarty-dev#6477 review round 2: "create" on a fresh root runs under the import's fence (custody.lock, then
     // .lock) from the re-checked guard through the db init to the marker, so a file-mode writer either commits
     // first (the guard below sees its state.json and refuses) or its fence check sees this state.db and refuses.
@@ -1010,7 +1019,10 @@ export class SqliteStateStore {
     if (refusal) throw new MeshStateUnsupportedError(`Fabric mesh SQLite state needs a local filesystem: ${refusal}`);
     const requested = initializeOf(options);
     const initialize = guardBeforeOpen(root, requested);
-    if (initialize !== "create") return SqliteStateStore.#openSync(root, maxEventBytes, maxReadEvents, options, initialize);
+    // As in open(), an unmarked db must wait for a creator's marker before it can be judged imported.
+    if (initialize !== "create" && (requested === "detached" || readMeshStateMovedMarker(root))) {
+      return SqliteStateStore.#openSync(root, maxEventBytes, maxReadEvents, options, initialize);
+    }
     // The same fence as open(), one synchronous attempt at the same two locks: a busy fence throws an
     // SQLITE_BUSY-coded MeshFenceBusyError, which callers retry like a busy database (see the contract above).
     return holdMeshFenceSync(root, 0, () =>

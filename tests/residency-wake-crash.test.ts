@@ -19,7 +19,7 @@ import * as index from "../src/residency/wake-index.js";
  */
 describe("resident wake recovery after publisher death", () => {
   it.each([
-    ["single", "next publish"], ["batch", "next publish"],
+    ["single", "retention sweep"], ["batch", "retention sweep"],
     ["single", "startup"], ["batch", "startup"],
   ] as const)("recovers a %s commit exactly once on %s with no publisher-local state", async (mode, recovery) => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-wake-crash-"));
@@ -102,8 +102,10 @@ describe("resident wake recovery after publisher death", () => {
         if (recovery === "startup" && events.length) return Promise.resolve();
         return dispatch(mesh, events, launch, recoveryOptions);
       });
-      if (recovery === "next publish") {
+      if (recovery === "retention sweep") {
         await recovered.publish({ topic: "unrelated.recovery", from });
+        expect(launch).not.toHaveBeenCalled();
+        await freshWake.retryResidentWakes(recovered, launch);
         expect(launch).toHaveBeenCalledOnce();
         await recovered.publish({ topic: "unrelated.after-recovery", from });
       } else {

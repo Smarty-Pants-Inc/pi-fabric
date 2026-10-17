@@ -7,6 +7,7 @@ import { BRIDGE_LEASE_MS, BridgeStaleIncarnationError, StoreBridgeSide, type Bri
 import { CommitOutbox, type CommitOutboxPlan } from "../src/mesh/commit-outbox.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { hostLeasePath, hostLiveness, mirroredOwnerRoutingStatus, readHostLease, writeHostLease } from "../src/topology/host-leases.js";
+import * as publicationGeneration from "../src/topology/publication-generation.js";
 import type { FabricHostRecord, FabricParticipantRecord } from "../src/topology/types.js";
 
 // smarty-dev#7397: trust-boundary probes for lease-only authority changes and crash recovery.
@@ -341,6 +342,7 @@ describe("bridge incarnation admission at persisted trust boundaries (smarty-dev
       const side = new StoreBridgeSide(hub, "ryzen2", () => NOW);
       await side.mirror(presence);
       const participantBefore = hub.get(participantKey(identity.id), { fresh: true });
+      const leaseBefore = fs.readFileSync(hostLeasePath(hub.root, identity.id));
       const input = plusUnrelated(legacy(NOW + 600_000));
       const collision = { record: { ...host, rootId: "session:cross-root-00000000", incarnationToken: "CROSS" },
         expiresAt: host.expiresAt };
@@ -351,9 +353,10 @@ describe("bridge incarnation admission at persisted trust boundaries (smarty-dev
       expect(hub.get(participantKey(identity.id), { fresh: true })).toEqual(participantBefore);
       expect(hub.get(hostKey(identity.id), { fresh: true })?.value).toMatchObject({ rootId: identity.id,
         incarnationToken: host.incarnationToken, identity, startedAt: host.startedAt });
-      expect(readHostLease(hub.root, identity.id)).toMatchObject({ rootId: identity.id,
-        incarnationToken: host.incarnationToken, expiresAt: NOW + 8_000 });
-      expect(hub.get(hostKey(unrelated.id), { fresh: true })?.value).toMatchObject({ incarnationToken: "U" });
+      expect(fs.readFileSync(hostLeasePath(hub.root, identity.id))).toEqual(leaseBefore);
+      // The participant's owner root is part of the collision component too; it is preserved,
+      // not created or renewed from the ambiguous frame.
+      expect(hub.get(hostKey(unrelated.id), { fresh: true })).toBeUndefined();
       expect(removals).toEqual([]);
     });
 
@@ -411,6 +414,81 @@ describe("bridge incarnation admission at persisted trust boundaries (smarty-dev
     expect(hub.get(hostKey(identity.id), { fresh: true })).toEqual(interveningHost);
     expect(hub.get(participantKey(identity.id), { fresh: true })).toEqual(participantBefore);
     expect(fs.readFileSync(hostLeasePath(hub.root, identity.id))).toEqual(interveningLease);
+    expect(removals).toEqual([]);
+  });
+
+  it.each(["file", "sqlite"] as const)("%s collision recheck preserves the root retargeted by a lease", async backend => {
+    const hub = store(backend);
+    const side = new StoreBridgeSide(hub, "ryzen2", () => NOW);
+    const ownerIdentity: MeshIdentity = { ...identity, id: "session:lease-retarget-owner-00000001", name: "owner" };
+    const ownerHost: FabricHostRecord = { ...host, id: ownerIdentity.id, rootId: ownerIdentity.id, identity: ownerIdentity,
+      incarnationToken: "W", startedAt: NOW - 1_000 };
+    const ownerParticipant: FabricParticipantRecord = { ...participant, id: ownerIdentity.id, rootId: ownerIdentity.id,
+      ownerHostId: ownerIdentity.id, ownerIdentityId: ownerIdentity.id, name: "owner" };
+    const ownerPresence = { hosts: [{ record: ownerHost, expiresAt: ownerHost.expiresAt }], participants: [ownerParticipant] };
+    await side.mirror(ownerPresence);
+    const collisionId = "session:lease-retarget-collision-00000001";
+    const forgedRoot = "session:lease-retarget-forged-00000001";
+    const collisionIdentity: MeshIdentity = { ...identity, id: collisionId, name: "collision" };
+    const collisionHost: FabricHostRecord = { ...host, id: collisionId, rootId: forgedRoot, identity: collisionIdentity,
+      incarnationToken: "F", startedAt: NOW - 500 };
+    const collisionLease = { id: collisionId, rootId: "session:lease-retarget-old-00000001", identityId: collisionId,
+      startedAt: NOW - 500, incarnationToken: "V", updatedAt: NOW, expiresAt: NOW + 120_000 };
+    writeHostLease(hub.root, collisionLease);
+    const ownerBefore = { host: hub.get(hostKey(ownerHost.id), { fresh: true }),
+      participant: hub.get(participantKey(ownerParticipant.id), { fresh: true }),
+      lease: fs.readFileSync(hostLeasePath(hub.root, ownerHost.id)) };
+    const write = hub.writeBatch.bind(hub);
+    let batches = 0;
+    vi.spyOn(hub, "writeBatch").mockImplementation(async input => {
+      batches += 1;
+      if (batches === 1) writeHostLease(hub.root, { ...collisionLease, rootId: ownerHost.rootId, identityId: ownerIdentity.id });
+      return write(input);
+    });
+
+    const malformed = { hosts: [{ record: collisionHost, expiresAt: collisionHost.expiresAt }], participants: [] };
+    await expect(side.mirror(malformed, NOW)).resolves.toBeUndefined();
+    expect(hub.get(hostKey(ownerHost.id), { fresh: true })).toEqual(ownerBefore.host);
+    expect(hub.get(participantKey(ownerParticipant.id), { fresh: true })).toEqual(ownerBefore.participant);
+    expect(fs.readFileSync(hostLeasePath(hub.root, ownerHost.id))).toEqual(ownerBefore.lease);
+    expect(removals).toEqual([]);
+  });
+
+  it.each(["file", "sqlite"] as const)("%s aborts a plan when a consulted lease changes under an unchanged stamp and root set", async backend => {
+    const hub = store(backend);
+    const side = new StoreBridgeSide(hub, "ryzen2", () => NOW);
+    await side.mirror(presence); // complete recovery and install token A
+    expect(side.holds(identity.id, identity)).toBe(true);
+    const before = hub.listAll("", { fresh: true });
+    const leasePath = hostLeasePath(hub.root, identity.id);
+    const leaseBefore = fs.readFileSync(leasePath);
+    const originalStamp = publicationGeneration.meshDirectoryStamp;
+    const stableLeaseStamp = originalStamp(hub.root, "host-leases");
+    vi.spyOn(publicationGeneration, "meshDirectoryStamp").mockImplementation((root, name) =>
+      name === "host-leases" ? stableLeaseStamp : originalStamp(root, name));
+    const writeBatch = hub.writeBatch.bind(hub);
+    let batches = 0;
+    let changedLease: Buffer | undefined;
+    vi.spyOn(hub, "writeBatch").mockImplementation(input => {
+      batches += 1;
+      if (batches === 1) {
+        // The early plan saw A. B supersedes A but has the SAME root, so the collision-protection
+        // set remains unchanged. Keep the observed directory stamp fixed to exercise the stale
+        // bytes' stamp shortcut on every platform.
+        writeHostLease(hub.root, newerLease);
+        changedLease = fs.readFileSync(leasePath);
+        expect(publicationGeneration.meshDirectoryStamp(hub.root, "host-leases")).toBe(stableLeaseStamp);
+      }
+      return writeBatch(input);
+    });
+
+    await expect(side.mirror(presence)).rejects.toMatchObject({ code: "FABRIC_BRIDGE_STALE_INCARNATION" });
+    expect(batches).toBe(1); // the stale plan rolls back; recomputation refuses A before a second write
+    expect(hub.listAll("", { fresh: true })).toEqual(before);
+    expect(changedLease).toBeDefined();
+    expect(fs.readFileSync(leasePath)).toEqual(changedLease);
+    expect(fs.readFileSync(leasePath)).not.toEqual(leaseBefore);
+    expect(readHostLease(hub.root, identity.id)).toMatchObject(newerLease);
     expect(removals).toEqual([]);
   });
 

@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { BRIDGE_LEASE_MS, BridgeStaleIncarnationError, MeshBridge, RemoteBridgeSide, serveBridgeAgent, StoreBridgeSide } from "../src/mesh/bridge.js";
+import { BRIDGE_LEASE_MS, BRIDGE_PROTOCOL_VERSION, BridgeStaleIncarnationError, MeshBridge, RemoteBridgeSide, serveBridgeAgent, StoreBridgeSide } from "../src/mesh/bridge.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { CommitOutbox } from "../src/mesh/commit-outbox.js";
 import { hostLeasePath, readHostLease, writeHostLease } from "../src/topology/host-leases.js";
@@ -288,6 +288,26 @@ describe("own-root diagnostic", () => {
 });
 
 describe("direct tokenless presence through MeshBridge RPC", () => {
+  it("allows complete snapshots to old peers but refuses partial snapshots they cannot honor", async () => {
+    const toPeer = new PassThrough();
+    const fromPeer = new PassThrough();
+    const remote = new RemoteBridgeSide(fromPeer, toPeer);
+    let mirrors = 0;
+    toPeer.on("data", chunk => {
+      const request = JSON.parse(String(chunk)) as { id: number; op: string };
+      if (request.op === "mirror") mirrors += 1;
+      fromPeer.write(`${JSON.stringify({ id: request.id, ok: true,
+        result: request.op === "hello" ? { version: BRIDGE_PROTOCOL_VERSION, changes: true } : {} })}\n`);
+    });
+
+    await expect(remote.mirror({ hosts: [], participants: [] })).resolves.toBeUndefined();
+    expect(mirrors).toBe(1);
+    await expect(remote.mirror({ hosts: [], participants: [], partial: true, droppedCount: 1 }))
+      .rejects.toThrow("does not support partial presence snapshots");
+    expect(mirrors).toBe(1);
+    remote.close();
+  });
+
   // CODE-F1's independent probe sequence, through JSON framing and presenceArg, not
   // merely StoreBridgeSide.mirror: malformed presence must not erase the A -> B fence.
   it.each(["file", "sqlite"] as const)("CODE-F1 preserves B and its A fence when tokenless updatedAt NaN becomes null over RPC (%s)", async backend => {
@@ -313,6 +333,216 @@ describe("direct tokenless presence through MeshBridge RPC", () => {
     expect(f.work.get(hostKey(b.host.id), { fresh: true })).toEqual(before.host);
     expect(f.work.get(participantKey(b.host.id), { fresh: true })).toEqual(before.participant);
     expect(fs.readFileSync(hostLeasePath(f.work.root, b.host.id))).toEqual(before.lease);
+  });
+
+  it.each(["file", "sqlite"] as const)("partial outbound admission cannot withdraw a previously mirrored root (%s)", async backend => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(NOW);
+    const f = ownRootLink(false, backend);
+    const victim = fixture("partial-outbound-victim", "B", NOW - 1_000, NOW + 120_000);
+    await installNative(f.hub, victim);
+    await expect(f.bridge.syncPresence()).resolves.toBeUndefined();
+    const before = { host: f.work.get(hostKey(victim.host.id), { fresh: true }),
+      participant: f.work.get(participantKey(victim.participant.id), { fresh: true }),
+      lease: fs.readFileSync(hostLeasePath(f.work.root, victim.host.id)) };
+    const malformed = fixture("partial-outbound-forged", undefined, NOW, NOW + 120_000);
+    const progress = fixture("partial-outbound-progress", "U", NOW, NOW + 120_000);
+    await f.hub.put({ key: hostKey(victim.host.id), identity: victim.identity,
+      value: { ...victim.host, rootId: malformed.host.rootId } });
+    await f.hub.put({ key: participantKey(victim.participant.id), identity: victim.identity,
+      value: { ...victim.participant, rootId: malformed.host.rootId } });
+    await installNative(f.hub, progress);
+    const mirrored = vi.spyOn(f.agent, "mirror");
+
+    await expect(f.bridge.syncPresence()).resolves.toBeUndefined();
+
+    expect(mirrored.mock.lastCall?.[0]).toMatchObject({ partial: true, droppedCount: expect.any(Number) });
+    expect((mirrored.mock.lastCall?.[0].droppedCount ?? 0)).toBeGreaterThan(0);
+    expect(f.work.get(hostKey(victim.host.id), { fresh: true })).toEqual(before.host);
+    expect(f.work.get(participantKey(victim.participant.id), { fresh: true })).toEqual(before.participant);
+    expect(fs.readFileSync(hostLeasePath(f.work.root, victim.host.id))).toEqual(before.lease);
+    expect(f.work.get(hostKey(progress.host.id), { fresh: true })?.value).toMatchObject({ incarnationToken: "U" });
+
+    await f.hub.delete({ key: hostKey(victim.host.id) });
+    await f.hub.delete({ key: participantKey(victim.participant.id) });
+    fs.rmSync(hostLeasePath(f.hub.root, victim.host.id), { force: true });
+    await expect(f.bridge.syncPresence()).resolves.toBeUndefined();
+    expect(f.work.get(hostKey(victim.host.id), { fresh: true })).toBeUndefined();
+    expect(f.work.get(participantKey(victim.participant.id), { fresh: true })).toBeUndefined();
+    expect(readHostLease(f.work.root, victim.host.id)).toBeUndefined();
+  });
+
+  it.each(["file", "sqlite"] as const)("partial inbound admission cannot withdraw a previously mirrored root (%s)", async backend => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(NOW);
+    const f = ownRootLink(false, backend);
+    const victim = fixture("partial-inbound-victim", "B", NOW - 1_000, NOW + 120_000);
+    await installNative(f.work, victim);
+    await expect(f.bridge.syncPresence()).resolves.toBeUndefined();
+    const before = { host: f.hub.get(hostKey(victim.host.id), { fresh: true }),
+      participant: f.hub.get(participantKey(victim.participant.id), { fresh: true }),
+      lease: fs.readFileSync(hostLeasePath(f.hub.root, victim.host.id)) };
+    const malformed = fixture("partial-inbound-forged", undefined, NOW, NOW + 120_000);
+    const progress = fixture("partial-inbound-progress", "U", NOW, NOW + 120_000);
+    await f.work.put({ key: hostKey(victim.host.id), identity: victim.identity,
+      value: { ...victim.host, rootId: malformed.host.rootId } });
+    await f.work.put({ key: participantKey(victim.participant.id), identity: victim.identity,
+      value: { ...victim.participant, rootId: malformed.host.rootId } });
+    await installNative(f.work, progress);
+    const mirrored = vi.spyOn(f.local, "mirror");
+
+    await expect(f.bridge.syncPresence()).resolves.toBeUndefined();
+
+    expect(mirrored.mock.lastCall?.[0]).toMatchObject({ partial: true, droppedCount: expect.any(Number) });
+    expect((mirrored.mock.lastCall?.[0].droppedCount ?? 0)).toBeGreaterThan(0);
+    expect(f.hub.get(hostKey(victim.host.id), { fresh: true })).toEqual(before.host);
+    expect(f.hub.get(participantKey(victim.participant.id), { fresh: true })).toEqual(before.participant);
+    expect(fs.readFileSync(hostLeasePath(f.hub.root, victim.host.id))).toEqual(before.lease);
+    expect(f.hub.get(hostKey(progress.host.id), { fresh: true })?.value).toMatchObject({ incarnationToken: "U" });
+
+    await f.work.delete({ key: hostKey(victim.host.id) });
+    await f.work.delete({ key: participantKey(victim.participant.id) });
+    fs.rmSync(hostLeasePath(f.work.root, victim.host.id), { force: true });
+    await expect(f.bridge.syncPresence()).resolves.toBeUndefined();
+    expect(f.hub.get(hostKey(victim.host.id), { fresh: true })).toBeUndefined();
+    expect(f.hub.get(participantKey(victim.participant.id), { fresh: true })).toBeUndefined();
+    expect(readHostLease(f.hub.root, victim.host.id)).toBeUndefined();
+  });
+
+  it.each(["file", "sqlite"] as const)("raw unidentifiable presence is partial and cannot withdraw prior authority (%s)", async backend => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(NOW);
+    const f = ownRootLink(false, backend);
+    const victim = fixture("partial-unidentifiable-victim", "B", NOW - 1_000, NOW + 120_000);
+    await installNative(f.work, victim);
+    await expect(f.bridge.syncPresence()).resolves.toBeUndefined();
+    const before = { host: f.hub.get(hostKey(victim.host.id), { fresh: true }),
+      participant: f.hub.get(participantKey(victim.participant.id), { fresh: true }),
+      lease: fs.readFileSync(hostLeasePath(f.hub.root, victim.host.id)) };
+    const { rootId: _rootId, identity: _identity, ...unidentifiable } = victim.host;
+    await f.work.put({ key: hostKey(victim.host.id), identity: victim.identity, value: unidentifiable });
+    const source = await f.agent.presence();
+    expect(source).toMatchObject({ partial: true, droppedCount: expect.any(Number) });
+    expect((source.droppedCount ?? 0)).toBeGreaterThan(0);
+    const mirrored = vi.spyOn(f.local, "mirror");
+
+    await expect(f.bridge.syncPresence()).resolves.toBeUndefined();
+
+    expect(mirrored.mock.lastCall?.[0]).toMatchObject({ partial: true, droppedCount: expect.any(Number) });
+    expect(f.hub.get(hostKey(victim.host.id), { fresh: true })).toEqual(before.host);
+    expect(f.hub.get(participantKey(victim.participant.id), { fresh: true })).toEqual(before.participant);
+    expect(fs.readFileSync(hostLeasePath(f.hub.root, victim.host.id))).toEqual(before.lease);
+  });
+
+  it.each(["file", "sqlite"] as const)("real sync does not turn a dropped malformed cross-root host into withdrawal (%s)", async backend => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(NOW);
+    const f = ownRootLink(false, backend);
+    const victimA = fixture("sync-cross-root-victim", "A", NOW - 2_000, NOW + 120_000);
+    const victimB = fixture("sync-cross-root-victim", "B", NOW - 1_000, NOW + 120_000);
+    await installNative(f.work, victimA);
+    await expect(f.bridge.syncPresence()).resolves.toBeUndefined();
+    await installNative(f.work, victimB);
+    await expect(f.bridge.syncPresence()).resolves.toBeUndefined();
+    const before = { host: f.hub.get(hostKey(victimB.host.id), { fresh: true }),
+      participant: f.hub.get(participantKey(victimB.participant.id), { fresh: true }),
+      lease: fs.readFileSync(hostLeasePath(f.hub.root, victimB.host.id)) };
+    expect(before.host?.value).toMatchObject({ incarnationToken: "B", bridgeSupersededTokens: ["A"] });
+
+    const forgedRoot = fixture("sync-forged-cross-root", undefined, NOW, NOW + 120_000);
+    const malformedHost: FabricHostRecord = { ...victimB.host, rootId: forgedRoot.host.rootId, updatedAt: Number.NaN };
+    const malformedParticipant: FabricParticipantRecord = { ...victimB.participant, rootId: forgedRoot.host.rootId };
+    await installNative(f.work, { ...victimB, host: malformedHost, participant: malformedParticipant });
+    expect(f.work.get(hostKey(victimB.host.id), { fresh: true })?.value).toMatchObject({ rootId: forgedRoot.host.rootId });
+    await expect(f.bridge.syncPresence()).resolves.toBeUndefined();
+
+    expect(f.hub.get(hostKey(victimB.host.id), { fresh: true })).toEqual(before.host);
+    expect(f.hub.get(participantKey(victimB.participant.id), { fresh: true })).toEqual(before.participant);
+    expect(fs.readFileSync(hostLeasePath(f.hub.root, victimB.host.id))).toEqual(before.lease);
+
+    await installNative(f.work, victimA);
+    await expect(f.bridge.syncPresence()).rejects.toBeInstanceOf(BridgeStaleIncarnationError);
+    expect(f.hub.get(hostKey(victimB.host.id), { fresh: true })).toEqual(before.host);
+    expect(f.hub.get(participantKey(victimB.participant.id), { fresh: true })).toEqual(before.participant);
+    expect(fs.readFileSync(hostLeasePath(f.hub.root, victimB.host.id))).toEqual(before.lease);
+  });
+
+  it.each(["file", "sqlite"] as const)("preserves every root touched by a malformed cross-root RPC claim (%s)", async backend => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(NOW);
+    const f = ownRootLink(false, backend);
+    const victimA = fixture("cross-root-victim", "A", NOW - 2_000, NOW + 120_000);
+    const victimB = fixture("cross-root-victim", "B", NOW - 1_000, NOW + 120_000);
+    await f.agent.mirror(victimA.presence);
+    await f.agent.mirror(victimB.presence);
+    const before = { host: f.work.get(hostKey(victimB.host.id), { fresh: true }),
+      participant: f.work.get(participantKey(victimB.participant.id), { fresh: true }),
+      lease: fs.readFileSync(hostLeasePath(f.work.root, victimB.host.id)) };
+    expect(before.host?.value).toMatchObject({ incarnationToken: "B", bridgeSupersededTokens: ["A"] });
+
+    const forgedRoot = fixture("forged-cross-root", undefined, NOW, NOW + 120_000);
+    const { incarnationToken: _victimToken, ...victimWithoutToken } = victimB.host;
+    const forgedHost: FabricHostRecord = { ...victimWithoutToken, rootId: forgedRoot.host.rootId,
+      updatedAt: Number.NaN };
+    const unrelated = fixture("cross-root-unrelated", "D", NOW, NOW + 120_000);
+    const progress = fixture("cross-root-progress", "U", NOW, NOW + 120_000);
+    const spoofedParticipant: FabricParticipantRecord = { ...unrelated.participant, id: victimB.participant.id,
+      ownerHostId: unrelated.host.id, ownerIdentityId: unrelated.identity.id, rootId: unrelated.host.rootId,
+      name: "spoofed-victim-participant" };
+    expect(JSON.stringify(Number.NaN)).toBe("null");
+    await f.remote.mirror({
+      hosts: [{ record: forgedHost, expiresAt: NOW + 120_000, observedAt: NOW },
+        ...unrelated.presence.hosts, ...progress.presence.hosts],
+      participants: [spoofedParticipant, progress.participant],
+    });
+
+    expect(f.work.get(hostKey(victimB.host.id), { fresh: true })).toEqual(before.host);
+    expect(f.work.get(participantKey(victimB.participant.id), { fresh: true })).toEqual(before.participant);
+    expect(fs.readFileSync(hostLeasePath(f.work.root, victimB.host.id))).toEqual(before.lease);
+    expect(f.work.get(hostKey(unrelated.host.id), { fresh: true })).toBeUndefined();
+    expect(f.work.get(participantKey(unrelated.participant.id), { fresh: true })).toBeUndefined();
+    expect(f.work.get(hostKey(progress.host.id), { fresh: true })?.value).toMatchObject({ incarnationToken: "U" });
+    expect(f.work.get(participantKey(progress.participant.id), { fresh: true })?.value).toMatchObject({ rootId: progress.host.rootId });
+
+    await expect(f.remote.mirror(victimA.presence)).rejects.toBeInstanceOf(BridgeStaleIncarnationError);
+    expect(f.work.get(hostKey(victimB.host.id), { fresh: true })).toEqual(before.host);
+    expect(f.work.get(participantKey(victimB.participant.id), { fresh: true })).toEqual(before.participant);
+    expect(fs.readFileSync(hostLeasePath(f.work.root, victimB.host.id))).toEqual(before.lease);
+  });
+
+  it.each(["file", "sqlite"] as const)("preserves the owner of a claimed root alias before omission (%s)", async backend => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(NOW);
+    const f = ownRootLink(false, backend);
+    const aliasId = "session:claimed-root-alias-00000001";
+    const alias = (value: ReturnType<typeof fixture>) => {
+      const identity: MeshIdentity = { ...value.identity, id: aliasId };
+      const host: FabricHostRecord = { ...value.host, id: aliasId, identity };
+      const participant: FabricParticipantRecord = { ...value.participant, id: aliasId,
+        ownerHostId: aliasId, ownerIdentityId: aliasId, rootId: value.host.rootId };
+      return { identity, host, participant, presence: { hosts: [{ record: host, expiresAt: host.expiresAt }], participants: [participant] } };
+    };
+    const ownerA = alias(fixture("claimed-root-owner", "A", NOW - 2_000, NOW + 120_000));
+    const ownerB = alias(fixture("claimed-root-owner", "B", NOW - 1_000, NOW + 120_000));
+    await f.agent.mirror(ownerA.presence);
+    await f.agent.mirror(ownerB.presence);
+    const before = { host: f.work.get(hostKey(aliasId), { fresh: true }),
+      participant: f.work.get(participantKey(aliasId), { fresh: true }),
+      lease: fs.readFileSync(hostLeasePath(f.work.root, aliasId)) };
+    expect(before.host?.value).toMatchObject({ rootId: ownerB.host.rootId, incarnationToken: "B", bridgeSupersededTokens: ["A"] });
+
+    const malformed = fixture("claimed-root-malformed", undefined, NOW, NOW + 120_000);
+    const claimedRoot = aliasId;
+    const malformedHost: FabricHostRecord = { ...malformed.host, rootId: claimedRoot, updatedAt: Number.NaN };
+    await f.remote.mirror({ hosts: [{ record: malformedHost, expiresAt: NOW + 120_000, observedAt: NOW }], participants: [] });
+    expect(f.work.get(hostKey(aliasId), { fresh: true })).toEqual(before.host);
+    expect(f.work.get(participantKey(aliasId), { fresh: true })).toEqual(before.participant);
+    expect(fs.readFileSync(hostLeasePath(f.work.root, aliasId))).toEqual(before.lease);
+
+    await expect(f.remote.mirror(ownerA.presence)).rejects.toBeInstanceOf(BridgeStaleIncarnationError);
+    expect(f.work.get(hostKey(aliasId), { fresh: true })).toEqual(before.host);
+    expect(f.work.get(participantKey(aliasId), { fresh: true })).toEqual(before.participant);
+    expect(fs.readFileSync(hostLeasePath(f.work.root, aliasId))).toEqual(before.lease);
   });
 
   it.each(["file", "sqlite"] as const)("WORKHOST fromHub renews existing B beyond expiry and keeps command/ACK usable (%s)", async backend => {

@@ -197,16 +197,50 @@ export interface BridgeHost {
   observedAt?: number;
 }
 
+/** Minimal attribution retained when admission drops malformed or conflicting presence. */
+export interface BridgeDroppedPresence {
+  type: "host" | "participant";
+  /** False only when local admission dropped this claim because a native/reserved id wins. */
+  protected?: boolean;
+  id?: string;
+  rootId?: string;
+  identityId?: string;
+  ownerHostId?: string;
+  ownerIdentityId?: string;
+}
+
 export interface BridgePresence {
   hosts: BridgeHost[];
   /** Root participants of those hosts. */
   participants: FabricParticipantRecord[];
+  /** Identifiers for records dropped by admission, when they can be safely attributed. */
+  dropped?: BridgeDroppedPresence[];
+  /** True when this snapshot is incomplete and must not be used as withdrawal evidence. */
+  partial?: boolean;
+  /** Number of malformed, conflicting, or otherwise dropped records observed in the raw scan. */
+  droppedCount?: number;
   /**
    * Every id and identity id of native records, live or not: a peer may never claim them. Only a
    * hub handoff in force to this link waives a dead native's own ids (smarty-dev#9074).
    */
   reserved: string[];
 }
+
+type BridgeMirrorPresence = Pick<BridgePresence, "hosts" | "participants" | "dropped" | "partial" | "droppedCount">;
+
+const validDroppedCount = (value: unknown): number =>
+  typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : 0;
+const relevantDroppedCount = (value: unknown): number => Array.isArray(value)
+  ? value.filter(item => !isObject(item) || item.protected !== false).length : 0;
+const presenceDroppedCount = (presence: BridgeMirrorPresence): number => {
+  const raw: unknown = presence;
+  if (!isObject(raw)) return 0;
+  return Math.max(validDroppedCount(raw.droppedCount), relevantDroppedCount(raw.dropped));
+};
+const presenceIsPartial = (presence: BridgeMirrorPresence): boolean => {
+  const raw: unknown = presence;
+  return !isObject(raw) || raw.partial === true || presenceDroppedCount(presence) > 0;
+};
 
 export interface BridgeSkip { id: string; sequence: number; topic: string; bytes: number }
 
@@ -269,7 +303,7 @@ export interface BridgeSide {
    * Replace this side's mirror of the peer's presence. `observedAt` (this side's clock, never a
    * peer's) is when the snapshot was requested; liveness is judged then, not at commit.
    */
-  mirror(presence: Pick<BridgePresence, "hosts" | "participants">, observedAt?: number): Promise<void>;
+  mirror(presence: BridgeMirrorPresence, observedAt?: number): Promise<void>;
   /** Original ids of events the peer bridged into this side after a sequence, one bounded page. */
   bridgedIds(after: number): Promise<BridgedIds>;
   /** End the transport and fail pending calls (a remote side only). */
@@ -318,6 +352,32 @@ const participantOf = (key: string, value: unknown): FabricParticipantRecord | u
   if (key !== keyFor(PARTICIPANT_PREFIX, value.id) || typeof value.ownerHostId !== "string") return undefined;
   if (typeof value.ownerIdentityId !== "string" || typeof value.rootId !== "string") return undefined;
   return value as unknown as FabricParticipantRecord;
+};
+
+const droppedPresenceOf = (type: BridgeDroppedPresence["type"], value: unknown, protect = true): BridgeDroppedPresence | undefined => {
+  if (!isObject(value)) return undefined;
+  const identityId = typeof value.identityId === "string" ? value.identityId
+    : isObject(value.identity) && typeof value.identity.id === "string" ? value.identity.id : undefined;
+  const dropped: BridgeDroppedPresence = {
+    type,
+    ...(protect && value.protected !== false ? {} : { protected: false }),
+    ...(typeof value.id === "string" ? { id: value.id } : {}),
+    ...(typeof value.rootId === "string" ? { rootId: value.rootId } : {}),
+    ...(identityId !== undefined ? { identityId } : {}),
+    ...(typeof value.ownerHostId === "string" ? { ownerHostId: value.ownerHostId } : {}),
+    ...(typeof value.ownerIdentityId === "string" ? { ownerIdentityId: value.ownerIdentityId } : {}),
+  };
+  return Object.keys(dropped).length > 1 ? dropped : undefined;
+};
+
+const uniqueDroppedPresence = (values: readonly unknown[]): BridgeDroppedPresence[] => {
+  const unique = new Map<string, BridgeDroppedPresence>();
+  for (const value of values) {
+    if (!isObject(value) || (value.type !== "host" && value.type !== "participant")) continue;
+    const dropped = droppedPresenceOf(value.type, value);
+    if (dropped) unique.set(JSON.stringify(dropped), dropped);
+  }
+  return [...unique.values()];
 };
 
 /** A content digest, independent of JSON property order (smarty-dev#5036). */
@@ -833,6 +893,7 @@ export class StoreBridgeSide implements BridgeSide {
     // Only a handoff in force to this link waives a (dead) native's own ids (smarty-dev#9074).
     const reserve = (value: unknown, id: string): void => { if (!handoffs.waived(value, id)) reserved.add(id); };
     const hosts: BridgeHost[] = [];
+    let rawDroppedCount = 0;
     // Every id not mirrored by this link is reserved: natives, live or not, and other links'
     // mirrors (security review F1/F2). Only natives are this side's presence.
     for (const entry of hostEntries) {
@@ -840,12 +901,15 @@ export class StoreBridgeSide implements BridgeSide {
       if (mirrorLinkOf(entry.value) === this.peer) continue;
       const host = presenceHostOf(entry.key, entry.value);
       if (!host) {
+        if (mark === undefined) rawDroppedCount += 1;
         if (isObject(entry.value) && typeof entry.value.id === "string") reserved.add(entry.value.id);
         continue;
       }
       for (const id of [host.id, host.identity.id, host.rootId]) reserve(entry.value, id);
-      if (mark !== undefined || entry.updatedBy.id !== host.identity.id) continue;
+      if (mark !== undefined) continue;
+      if (entry.updatedBy.id !== host.identity.id) { rawDroppedCount += 1; continue; }
       if (!finiteHostTimestamps(host)) {
+        rawDroppedCount += 1;
         // Do not let effective file liveness normalize a bad native/bootstrap record into
         // renewable authority, or silently omit it and erase the peer's retained fence.
         hosts.push({ record: host, expiresAt: host.expiresAt, observedAt: now });
@@ -864,6 +928,7 @@ export class StoreBridgeSide implements BridgeSide {
       if (mirrorLinkOf(entry.value) === this.peer) continue;
       const participant = participantOf(entry.key, entry.value);
       if (!participant) {
+        if (mark === undefined) rawDroppedCount += 1;
         if (isObject(entry.value) && typeof entry.value.id === "string") reserved.add(entry.value.id);
         continue;
       }
@@ -877,12 +942,14 @@ export class StoreBridgeSide implements BridgeSide {
         owner.identity.id === participant.ownerIdentityId && owner.rootId === participant.rootId &&
         (participants.get(participant.id)?.updatedAt ?? -Infinity) < entry.updatedAt
       ) participants.set(participant.id, { record: participant, updatedAt: entry.updatedAt });
+      else if (mark === undefined && participant.kind === "root" && owner !== undefined) rawDroppedCount += 1;
     }
+    const admitted = admitPresence({ hosts, participants: [...participants.values()].map(({ record }) => record),
+      ...(rawDroppedCount > 0 ? { partial: true, droppedCount: rawDroppedCount } : {}) }, new Set());
     return {
       // Export the same canonical root hosts we admit inbound, never sibling/task hosts.
       // Reservations above still cover ALL native and other-link identities, live or not.
-      presence: { ...admitPresence({ hosts, participants: [...participants.values()].map(({ record }) => record) }, new Set()),
-        reserved: [...reserved] },
+      presence: { ...admitted, reserved: [...reserved] },
       voided: handoffs.voided,
       // smarty-dev#10391: what the scan judged by time, for a plan made before its transaction.
       leases, now,
@@ -1143,7 +1210,7 @@ export class StoreBridgeSide implements BridgeSide {
    * and each write checks the fence, so a mirror in flight cannot restore a record or lease after
    * the withdrawal (security review round 2, F3).
    */
-  mirror(presence: Pick<BridgePresence, "hosts" | "participants">, observedAt?: number, fromHub = false): Promise<void> {
+  mirror(presence: BridgeMirrorPresence, observedAt?: number, fromHub = false): Promise<void> {
     if (this.#staleAdmission) return Promise.reject(this.#staleAdmission);
     if (this.#fenced) return Promise.resolve();
     // Only the forced-command agent sets fromHub for its trusted hub's mirror RPC.
@@ -1192,7 +1259,7 @@ export class StoreBridgeSide implements BridgeSide {
     return { hosts, participants };
   }
 
-  async #mirror(presence: Pick<BridgePresence, "hosts" | "participants">, final: boolean, observedAt?: number, fromHub = false): Promise<void> {
+  async #mirror(presence: BridgeMirrorPresence, final: boolean, observedAt?: number, fromHub = false): Promise<void> {
     await this.store.prepareLock();
     const halted = (): boolean => this.#fenced && !final;
     const now = this.now();
@@ -1202,6 +1269,7 @@ export class StoreBridgeSide implements BridgeSide {
     // observedAt counts as now: NaN would admit every lapsed host and -Infinity would resurrect
     // one for a full lease (independent review, P2).
     const liveAt = typeof observedAt === "number" && Number.isFinite(observedAt) ? Math.min(now, observedAt) : now;
+    const partial = presenceIsPartial(presence);
     // Stamp the existing mirror lease with LOCAL writer evidence, outside state custody.
     // A peer's claimed pid/host is never used, including for one-hop re-exports.
     const bridgeProcess = this.monitorLease ? await (this.#leaseProcess ??= (async () => {
@@ -1216,32 +1284,108 @@ export class StoreBridgeSide implements BridgeSide {
       ...leases.map((lease) => ({ kind: "lease", key: `lease:${lease.id}`, payload: lease })),
       ...removed.map((gone) => ({ kind: "unlease", key: `lease:${gone.id}`, payload: gone })),
     ];
-    const incomingRootIds = new Set(presence.hosts.map(({ record }) => record.rootId));
     // A trusted hub can carry a stale projection from another link. That projection is
     // non-authoritative: keep the destination's newer mirror and let unrelated roots in this
     // same pass proceed. The set spans plan retries so one root produces one warning per pass.
     const skippedRoots = new Set<string>();
     const preservedRoots = new Set<string>();
-    // Classify whole root groups before any plan or recovery effect. No array order may let
-    // a second host bypass tokenless preservation (nor silently choose a conflicting owner).
-    const rootCounts = new Map<string, number>();
-    for (const { record, expiresAt, observedAt: sourceObservedAt } of presence.hosts) {
-      rootCounts.set(record.rootId, (rootCounts.get(record.rootId) ?? 0) + 1);
-      // Runs before recovery, planning, participant writes and omission deletion in BOTH
-      // directions (remote presence replies are raw JSON, not parsed by presenceArg).
-      // Missing observedAt alone is the legacy unsampled protocol, not a malformed sample.
-      if (remoteHostOf(record) === undefined && (!finiteHostTimestamps(record) || !Number.isFinite(expiresAt) ||
-        (sourceObservedAt !== undefined && !Number.isFinite(sourceObservedAt)))) skippedRoots.add(record.rootId);
+    // Match every complete lease value consulted by this presence. A collision can resolve an
+    // incoming identifier through a lease to a root that is not incoming, so the consulted set
+    // includes lease ids, identity ids and root ids that touch any raw claim.
+    const consultedLeaseIdentifiers = new Set<string>();
+    const rememberLeaseIdentifier = (value: unknown): void => {
+      if (typeof value === "string") consultedLeaseIdentifiers.add(value);
+    };
+    for (const { record } of presence.hosts) {
+      rememberLeaseIdentifier(record.id);
+      rememberLeaseIdentifier(record.identity.id);
+      rememberLeaseIdentifier(record.rootId);
     }
-    for (const [rootId, count] of rootCounts) if (count > 1) skippedRoots.add(rootId);
-    // Match compute's normalized incarnation evidence without mutating cached lease histories.
-    const leaseIncarnationDigest = (leases: ReadonlyMap<string, FabricHostLease>): string => contentDigest(
-      [...leases.values()].filter(lease => incomingRootIds.has(lease.rootId)).map(lease => ({
-        id: lease.id, rootId: lease.rootId, ...incarnationOf(lease),
-        bridgeSupersededTokens: bridgeSupersededTokensOf(lease.bridgeSupersededTokens),
-        bridgeSupersededTokenSeen: bridgeSupersededSeenOf(lease.bridgeSupersededTokenSeen),
-      })).sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0),
+    for (const participant of presence.participants) {
+      rememberLeaseIdentifier(participant.id);
+      rememberLeaseIdentifier(participant.ownerHostId);
+      rememberLeaseIdentifier(participant.ownerIdentityId);
+      rememberLeaseIdentifier(participant.rootId);
+    }
+    const leaseIncarnationDigest = (leases: ReadonlyMap<string, FabricHostLease>, includeAll = false): string => contentDigest(
+      [...leases.values()].filter(lease => includeAll || consultedLeaseIdentifiers.has(lease.id) ||
+        consultedLeaseIdentifiers.has(lease.identityId) || consultedLeaseIdentifiers.has(lease.rootId))
+        .sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0)
+        .map(lease => includeAll ? lease : ({
+          id: lease.id, rootId: lease.rootId, ...incarnationOf(lease),
+          bridgeSupersededTokens: bridgeSupersededTokensOf(lease.bridgeSupersededTokens),
+          bridgeSupersededTokenSeen: bridgeSupersededSeenOf(lease.bridgeSupersededTokenSeen),
+        })),
     );
+    // Recompute only the collision protection from the raw records and current leases. The
+    // commit-time check uses the entries captured by the early plan, which stateUnchangedSince
+    // proves are still current, so it does not perform a topology scan while holding state.db.
+    const collisionProtection = (
+      hostEntries: readonly MeshStateEntry[], participantEntries: readonly MeshStateEntry[],
+      participantFiles: ReturnType<typeof participantFileSnapshot>, leases: ReadonlyMap<string, FabricHostLease>,
+    ): string[] => {
+      const rootsByIdentifier = new Map<string, Set<string>>();
+      const incomingRootsByIdentifier = new Map<string, Set<string>>();
+      const addRoot = (map: Map<string, Set<string>>, identifier: unknown, rootId: unknown): void => {
+        if (typeof identifier !== "string" || typeof rootId !== "string") return;
+        const roots = map.get(identifier) ?? new Set<string>();
+        roots.add(rootId);
+        map.set(identifier, roots);
+      };
+      const addHostRoots = (map: Map<string, Set<string>>, value: unknown): void => {
+        if (!isObject(value) || typeof value.id !== "string" || typeof value.rootId !== "string" || !isIdentity(value.identity)) return;
+        const identity = value.identity;
+        addRoot(map, value.id, value.rootId);
+        addRoot(map, identity.id, value.rootId);
+        addRoot(map, value.rootId, value.rootId);
+      };
+      for (const entry of hostEntries) addHostRoots(rootsByIdentifier, entry.value);
+      for (const lease of leases.values()) {
+        addRoot(rootsByIdentifier, lease.id, lease.rootId);
+        addRoot(rootsByIdentifier, lease.identityId, lease.rootId);
+        addRoot(rootsByIdentifier, lease.rootId, lease.rootId);
+      }
+      for (const entry of [...participantEntries, ...participantFiles.entries]) {
+        const participant = participantOf(entry.key, entry.value);
+        if (!participant) continue;
+        addRoot(rootsByIdentifier, participant.id, participant.rootId);
+        addRoot(rootsByIdentifier, participant.ownerHostId, participant.rootId);
+        addRoot(rootsByIdentifier, participant.ownerIdentityId, participant.rootId);
+        addRoot(rootsByIdentifier, participant.rootId, participant.rootId);
+      }
+      for (const { record } of presence.hosts) {
+        addRoot(incomingRootsByIdentifier, record.id, record.rootId);
+        addRoot(incomingRootsByIdentifier, record.identity.id, record.rootId);
+        addRoot(incomingRootsByIdentifier, record.rootId, record.rootId);
+      }
+      const rootsTouchedBy = (claimedRoot: unknown, identifiers: readonly unknown[]): Set<string> => {
+        const touched = new Set<string>();
+        const addOwners = (identifier: unknown): void => {
+          if (typeof identifier !== "string") return;
+          for (const root of rootsByIdentifier.get(identifier) ?? []) touched.add(root);
+          for (const root of incomingRootsByIdentifier.get(identifier) ?? []) touched.add(root);
+        };
+        // The claimed root is itself an identifier: a malformed frame may claim F while the
+        // persisted host keyed F belongs to root G. Resolve that owner before any skip or
+        // omission decision, just like the host/identity and participant-owner identifiers.
+        addOwners(claimedRoot);
+        if (typeof claimedRoot === "string") touched.add(claimedRoot);
+        for (const identifier of identifiers) addOwners(identifier);
+        return touched;
+      };
+      const protectionRoots = new Set<string>();
+      const protect = (touched: Set<string>, requireCollision: boolean): void => {
+        if (requireCollision && touched.size <= 1) return;
+        for (const root of touched) protectionRoots.add(root);
+      };
+      for (const { record } of presence.hosts) {
+        protect(rootsTouchedBy(record.rootId, [record.id, record.identity.id]), true);
+      }
+      for (const participant of presence.participants) {
+        protect(rootsTouchedBy(participant.rootId, [participant.id, participant.ownerHostId, participant.ownerIdentityId]), true);
+      }
+      return [...protectionRoots].sort();
+    };
     // The pass's plan on one state view: admission, reservations and the CAS versions. undefined: halted.
     const compute = (view: MeshBatchView, participantFiles: ReturnType<typeof participantFileSnapshot>):
       { ops: MeshBatchOperation[]; leases: BridgeLease[]; removed: BridgeUnlease[];
@@ -1252,6 +1396,20 @@ export class StoreBridgeSide implements BridgeSide {
         const participantEntries = view.listAll(PARTICIPANT_PREFIX);
         const scan = this.#scan(hostEntries, [...participantEntries, ...participantFiles.entries], view.listAll(BRIDGE_HANDOFF_PREFIX));
         const own = new Set(scan.presence.reserved);
+        const protectionRoots = new Set(collisionProtection(hostEntries, participantEntries, participantFiles, scan.leases));
+        for (const root of protectionRoots) skippedRoots.add(root);
+        // Classify whole root groups only after all claimed/current-owner/participant-owner roots
+        // are resolved. No array order may let a second host bypass collision preservation.
+        const rootCounts = new Map<string, number>();
+        for (const { record, expiresAt, observedAt: sourceObservedAt } of presence.hosts) {
+          rootCounts.set(record.rootId, (rootCounts.get(record.rootId) ?? 0) + 1);
+          // Runs before recovery, planning, participant writes and omission deletion in BOTH
+          // directions (remote presence replies are raw JSON, not parsed by presenceArg).
+          // Missing observedAt alone is the legacy unsampled protocol, not a malformed sample.
+          if (remoteHostOf(record) === undefined && (!finiteHostTimestamps(record) || !Number.isFinite(expiresAt) ||
+            (sourceObservedAt !== undefined && !Number.isFinite(sourceObservedAt)))) skippedRoots.add(record.rootId);
+        }
+        for (const [rootId, count] of rootCounts) if (count > 1) skippedRoots.add(rootId);
         // Same-peer mirrors are intentionally absent from reservations, but still prove a root's
         // incarnation across new link objects. Lease authority also survives a missing state row.
         const incarnations = new Map<string, Array<{ startedAt?: number; incarnationToken?: string }>>();
@@ -1395,7 +1553,7 @@ export class StoreBridgeSide implements BridgeSide {
           if (!owner || participant.kind !== "root" || own.has(participant.id)) continue;
           if (remoteHostOf(participant) !== undefined && (!fromHub || participant.bridgeVia !== this.peer ||
               participant.remoteHost !== owner.remoteHost)) continue;
-          if (owner.identity.id !== participant.ownerIdentityId || owner.rootId !== participant.rootId) continue;
+          if (owner.id !== participant.id || owner.identity.id !== participant.ownerIdentityId || owner.rootId !== participant.rootId) continue;
           wanted.set(keyFor(PARTICIPANT_PREFIX, participant.id), {
             value: { ...participant, remoteHost: participant.remoteHost ?? this.peer },
             identity: owner.identity,
@@ -1424,7 +1582,7 @@ export class StoreBridgeSide implements BridgeSide {
           if (halted()) return undefined;
           ops.push({ kind: "put", key, value, identity, ifVersion: view.version(key), onConflict: "skip" });
         }
-        for (const [key, { value, version }] of mirrored) {
+        if (!partial) for (const [key, { value, version }] of mirrored) {
           if (halted()) return undefined;
           if (wanted.has(key) || mirrorLinkOf(value) !== this.peer) continue;
           // Skipped roots and retained-owner renewals preserve existing participant bytes.
@@ -1440,7 +1598,7 @@ export class StoreBridgeSide implements BridgeSide {
           ops.push({ kind: "delete", key, ifVersion: version, onConflict: "skip" });
         }
         // A handoff a native voided goes in this commit: the void lasts if that native leaves again.
-        for (const entry of scan.voided) ops.push({ kind: "delete", key: entry.key, ifVersion: entry.version, onConflict: "skip" });
+        if (!partial) for (const entry of scan.voided) ops.push({ kind: "delete", key: entry.key, ifVersion: entry.version, onConflict: "skip" });
         return { ops, leases, removed, judged: { leases: scan.leases, now: scan.now } };
     };
     for (let attempt = 0; ; attempt += 1) {
@@ -1456,10 +1614,7 @@ export class StoreBridgeSide implements BridgeSide {
       // A stale plan rolls back and plans again; the last attempt, a backend without a revision view, and
       // a recovery pass (whose replay must run on the transaction's snapshot) plan inside, as before.
       const early = this.#recovered && attempt < MIRROR_PLAN_ATTEMPTS - 1 ? this.store.stateView() : undefined;
-      // Stamp incarnation authority before planning. Without handoffs, a moved stamp needs only
-      // incoming roots' evidence rechecked; unrelated leases and renewals do not change admission.
-      // Handoffs still require the full stamp and the scan's native lease liveness judgment.
-      const leaseStamp = early ? meshDirectoryStamp(this.store.root, HOST_LEASE_DIR) : undefined;
+      // Handoffs consult all leases when deciding whether a native identity has reappeared.
       const judgesLeaseLiveness = early !== undefined && early.view.listAll(BRIDGE_HANDOFF_PREFIX).length > 0;
       const planned = early && !halted() ? compute(early.view, files) : undefined;
       const plan = this.#outbox.plan();
@@ -1476,19 +1631,33 @@ export class StoreBridgeSide implements BridgeSide {
             if (halted()) return plan.stage([], []);
             const sameFiles = meshDirectoryStamp(this.store.root, "participants") === filesStamp;
             let result: ReturnType<typeof compute>;
-            if (early && planned && sameFiles && this.store.stateUnchangedSince(early.revision, HELD_STATE_PREFIXES) &&
-              (leaseStamp === undefined || meshDirectoryStamp(this.store.root, HOST_LEASE_DIR) === leaseStamp ||
-                (!judgesLeaseLiveness && leaseIncarnationDigest(planned.judged.leases) ===
-                  leaseIncarnationDigest(readHostLeases(this.store.root)))) &&
-              (!judgesLeaseLiveness || sameLeaseLiveness(planned.judged.leases, planned.judged.now, this.now()))) result = planned;
-            else if (early) throw new MirrorPlanStale();
+            if (early && planned && sameFiles && this.store.stateUnchangedSince(early.revision, HELD_STATE_PREFIXES)) {
+              // Lease files are outside state.db, so the plan's state revision cannot prove them
+              // unchanged. When a lease can affect this plan, read the current lease map under the
+              // fence and ALWAYS compare the complete consulted digest, regardless of directory
+              // stamps. Handoffs consult every lease; otherwise raw presence identifiers select
+              // the digest. With no consulted lease, do no in-fence lease scan.
+              // The topology entries themselves come from the early raw scan: stateUnchangedSince
+              // proves that snapshot is still current, avoiding a full topology scan in the fence.
+              const needsLeaseValidation = judgesLeaseLiveness || consultedLeaseIdentifiers.size > 0;
+              const currentLeases = needsLeaseValidation ? readHostLeases(this.store.root) : planned.judged.leases;
+              const leaseStable = !needsLeaseValidation || leaseIncarnationDigest(planned.judged.leases, judgesLeaseLiveness) ===
+                leaseIncarnationDigest(currentLeases, judgesLeaseLiveness);
+              if (!leaseStable || (judgesLeaseLiveness && !sameLeaseLiveness(planned.judged.leases, planned.judged.now, this.now()))) {
+                throw new MirrorPlanStale();
+              }
+              // State revision and participant-file stamp prove the topology inputs are unchanged;
+              // the digest above proves the only external protection input (consulted leases) is too.
+              // Rewalking the whole topology under SQLite's prepare fence would add O(topology) lock time.
+              result = planned;
+            } else if (early) throw new MirrorPlanStale();
             else {
               const participantFiles = sameFiles ? files : participantFileSnapshot(this.store.root);
               // Refuse stale presence BEFORE recovery can touch any lease file. A successful
               // preflight then replays on this same transaction's snapshot and recomputes, so
               // recovered lease authority participates in admission and handoff judgments too.
               result = compute(view, participantFiles);
-              if (!this.#recovered && result && view.listAll(this.#outbox.prefix).length > 0) {
+              if (!partial && !this.#recovered && result && view.listAll(this.#outbox.prefix).length > 0) {
                 plan.replay(view);
                 result = compute(view, participantFiles);
               }
@@ -1525,7 +1694,17 @@ export class StoreBridgeSide implements BridgeSide {
             });
           },
           // After the commit, on the committed owner, never a fresh per-record state read.
-          afterCommit: (view) => { plan.run(view, halted); },
+          // Partial snapshots may commit admitted lease updates, but must neither replay nor retry
+          // any prior unlease effect until a complete snapshot can authorize withdrawal.
+          afterCommit: (view) => {
+            if (!partial) { plan.run(view, halted); return; }
+            let allowedLeaseEffects = 0;
+            plan.run(view, () => {
+              if (halted()) return true;
+              if (allowedLeaseEffects < leases.length) { allowedLeaseEffects += 1; return false; }
+              return true;
+            });
+          },
         });
       } catch (error) {
         if (error instanceof MirrorPlanStale) continue;
@@ -1820,7 +1999,7 @@ const numberArg = (args: unknown, name: string): number => {
   return value;
 };
 
-const presenceArg = (args: unknown, hub: string): Pick<BridgePresence, "hosts" | "participants"> => {
+const presenceArg = (args: unknown, hub: string): BridgeMirrorPresence => {
   if (!isObject(args) || !Array.isArray(args.hosts) || !Array.isArray(args.participants)) {
     throw new Error("Bridge presence is invalid");
   }
@@ -1835,7 +2014,27 @@ const presenceArg = (args: unknown, hub: string): Pick<BridgePresence, "hosts" |
     const record = isObject(value) ? participantOf(keyFor(PARTICIPANT_PREFIX, String(value.id)), value) : undefined;
     return record && (remoteHostOf(record) === undefined || (record.bridgeVia === hub && record.remoteHost !== hub)) ? [record] : [];
   });
-  return { hosts, participants };
+  const rawDropped = Array.isArray(args.dropped) ? args.dropped : [];
+  const dropped = uniqueDroppedPresence(rawDropped);
+  const owners = new Map(hosts.map(({ record }) => [record.id, record]));
+  const malformedHosts = hosts.filter(({ record, expiresAt, observedAt }) => {
+    const relayed = record.bridgeVia === hub && record.remoteHost !== undefined && record.remoteHost !== hub;
+    return !finiteHostTimestamps(record) || !Number.isFinite(expiresAt) ||
+      (observedAt !== undefined && !Number.isFinite(observedAt)) || record.identity.id !== record.id ||
+      record.rootId !== record.id || (!relayed && record.bridgeVia !== undefined) || !CANONICAL_ID.test(record.id);
+  }).length;
+  const malformedParticipants = participants.filter(record => {
+    const owner = owners.get(record.ownerHostId);
+    const relayed = record.bridgeVia === hub && record.remoteHost !== undefined && record.remoteHost !== hub;
+    return record.kind !== "root" || (!relayed && record.bridgeVia !== undefined) || !owner ||
+      record.id !== owner.id || owner.identity.id !== record.ownerIdentityId || owner.rootId !== record.rootId;
+  }).length;
+  const inheritedCount = Math.max(validDroppedCount(args.droppedCount), relevantDroppedCount(rawDropped));
+  const droppedCount = inheritedCount + malformedHosts + malformedParticipants +
+    (args.hosts.length - hosts.length) + (args.participants.length - participants.length);
+  const partial = args.partial === true || droppedCount > 0;
+  return { hosts, participants, ...(dropped.length > 0 ? { dropped } : {}),
+    ...(partial ? { partial: true } : {}), ...(droppedCount > 0 ? { droppedCount } : {}) };
 };
 
 const dispatch = async (side: StoreBridgeSide, request: RpcRequest, receivedAt: number): Promise<unknown> => {
@@ -1846,6 +2045,7 @@ const dispatch = async (side: StoreBridgeSide, request: RpcRequest, receivedAt: 
       version: isObject(request.args) && request.args.version === BRIDGE_PROTOCOL_VERSION
         ? BRIDGE_PROTOCOL_VERSION : LEGACY_BRIDGE_PROTOCOL_VERSION,
       tail: true, publishBatch: typeof side.publishBatch === "function", changes: true, independentRpc: true,
+      partialPresence: true,
     };
     case "latestSequence": return side.latestSequence();
     case "latestCursor": return side.latestCursor();
@@ -1883,6 +2083,7 @@ const isBridgeRetryable = (error: unknown): boolean => error instanceof BridgeMi
 export class RemoteBridgeSide implements BridgeSide {
   #next = 1;
   #supportsTail = false;
+  #supportsPartialPresence = false;
   #independentRpc = false;
   #protocolVersion: number | undefined;
   #changesReady: Promise<void> | undefined;
@@ -2010,7 +2211,8 @@ export class RemoteBridgeSide implements BridgeSide {
   }
 
   async hello(changes = false): Promise<void> {
-    const reply = await this.#call<{ version?: unknown; tail?: unknown; publishBatch?: unknown; changes?: unknown; independentRpc?: unknown }>("hello", {
+    const reply = await this.#call<{ version?: unknown; tail?: unknown; publishBatch?: unknown; changes?: unknown;
+      independentRpc?: unknown; partialPresence?: unknown }>("hello", {
       version: BRIDGE_PROTOCOL_VERSION, ...(changes ? { changes: true } : {}),
     });
     if (reply?.version !== BRIDGE_PROTOCOL_VERSION && reply?.version !== LEGACY_BRIDGE_PROTOCOL_VERSION) {
@@ -2020,6 +2222,7 @@ export class RemoteBridgeSide implements BridgeSide {
       throw new Error(`Bridge agent changed protocol ${this.#protocolVersion} to ${reply.version}; refusing protocol downgrade`);
     }
     this.#protocolVersion = reply.version;
+    this.#supportsPartialPresence = reply.partialPresence === true;
     // Both ordinary hello and automatic notification setup negotiate dispatch isolation.
     this.#independentRpc = reply.independentRpc === true;
     // Notification setup must not silently switch a caller's chosen read/publication mode.
@@ -2062,7 +2265,15 @@ export class RemoteBridgeSide implements BridgeSide {
   }
   presence(): Promise<BridgePresence> { return this.#call("presence"); }
   publish(event: BridgePublish): Promise<{ sequence: number }> { return this.#call("publish", event); }
-  mirror(presence: Pick<BridgePresence, "hosts" | "participants">): Promise<void> { return this.#call("mirror", presence); }
+  async mirror(presence: BridgeMirrorPresence): Promise<void> {
+    if (presenceIsPartial(presence)) {
+      if (this.#protocolVersion === undefined) await this.hello();
+      if (!this.#supportsPartialPresence) {
+        throw new Error("Bridge peer does not support partial presence snapshots; refusing unsafe withdrawal set");
+      }
+    }
+    await this.#call("mirror", presence);
+  }
   bridgedIds(after: number): Promise<BridgedIds> { return this.#call("bridgedIds", { after }); }
 }
 
@@ -2179,34 +2390,86 @@ export const isCanonicalRootId = (id: string): boolean => CANONICAL_ID.test(id);
  * raw claims (security review F1/F2).
  */
 export const admitPresence = (
-  claimed: Pick<BridgePresence, "hosts" | "participants">,
+  claimed: BridgeMirrorPresence,
   reserved: ReadonlySet<string>,
-): Pick<BridgePresence, "hosts" | "participants"> => {
+): BridgeMirrorPresence => {
+  // Remote presence is raw JSON: a malformed array or item is a dropped record, never evidence
+  // that a previously mirrored root was absent.
+  const rawValue: unknown = claimed;
+  const raw = isObject(rawValue) ? rawValue : {};
+  const rawHosts = Array.isArray(raw.hosts) ? raw.hosts : [];
+  const rawParticipants = Array.isArray(raw.participants) ? raw.participants : [];
   // v1 bridges Main roots only, whose host id, identity id and root id are one id (security
   // review round 4, F2): a host that splits them is refused, so one id names one owner.
-  const hosts = claimed.hosts.filter(({ record }) =>
-    record.identity.id === record.id && record.rootId === record.id && record.bridgeVia === undefined &&
-    CANONICAL_ID.test(record.id) && !reserved.has(record.id));
+  const rawDropped = Array.isArray(raw.dropped) ? raw.dropped : [];
+  const dropped = uniqueDroppedPresence(rawDropped);
+  let droppedCount = Math.max(validDroppedCount(raw.droppedCount), relevantDroppedCount(rawDropped)) +
+    (Array.isArray(raw.hosts) ? 0 : 1) + (Array.isArray(raw.participants) ? 0 : 1);
+  const hosts: BridgeHost[] = [];
+  for (const value of rawHosts) {
+    if (!isObject(value) || !isObject(value.record) || typeof value.record.id !== "string") {
+      droppedCount += 1;
+      continue;
+    }
+    const record = presenceHostOf(keyFor(HOST_PREFIX, value.record.id), value.record);
+    if (!record) {
+      droppedCount += 1;
+      const attribution = droppedPresenceOf("host", value.record);
+      if (attribution) dropped.push(attribution);
+      continue;
+    }
+    const expiresAt = typeof value.expiresAt === "number" ? value.expiresAt : NaN;
+    const hasObservedAt = Object.hasOwn(value, "observedAt");
+    const observedAt = typeof value.observedAt === "number" ? value.observedAt : hasObservedAt ? NaN : undefined;
+    const malformed = !finiteHostTimestamps(record) || !Number.isFinite(expiresAt) ||
+      (observedAt !== undefined && !Number.isFinite(observedAt)) || record.identity.id !== record.id ||
+      record.rootId !== record.id || record.bridgeVia !== undefined || !CANONICAL_ID.test(record.id);
+    const reservedConflict = [record.id, record.identity.id, record.rootId].some(id => reserved.has(id));
+    if (malformed || reservedConflict) {
+      if (malformed) {
+        droppedCount += 1;
+        const attribution = droppedPresenceOf("host", record, !reservedConflict);
+        if (attribution) dropped.push(attribution);
+      }
+    } else hosts.push({ record, expiresAt, ...(observedAt !== undefined ? { observedAt } : {}) });
+  }
   const admitted = new Map(hosts.map(({ record }) => [record.id, record]));
-  const participants = claimed.participants.filter((participant) => {
+  const participants: FabricParticipantRecord[] = [];
+  for (const value of rawParticipants) {
+    if (!isObject(value) || typeof value.id !== "string") { droppedCount += 1; continue; }
+    const participant = participantOf(keyFor(PARTICIPANT_PREFIX, value.id), value);
+    if (!participant) { droppedCount += 1; continue; }
     const owner = admitted.get(participant.ownerHostId);
-    return participant.kind === "root" && participant.bridgeVia === undefined && owner !== undefined && participant.id === owner.id &&
-      owner.identity.id === participant.ownerIdentityId && owner.rootId === participant.rootId &&
-      ![participant.id, participant.rootId, participant.ownerIdentityId, participant.sessionId]
-        .some((id) => typeof id === "string" && reserved.has(id));
-  });
-  return { hosts, participants };
+    const canonicalParticipant = participant.kind === "root" && participant.bridgeVia === undefined &&
+      participant.id === participant.ownerHostId && participant.id === participant.ownerIdentityId && participant.id === participant.rootId;
+    const ownerMatches = owner !== undefined && owner.id === participant.id &&
+      owner.identity.id === participant.ownerIdentityId && owner.rootId === participant.rootId;
+    const reservedConflict = [participant.id, participant.rootId, participant.ownerIdentityId, participant.sessionId]
+      .some((id) => typeof id === "string" && reserved.has(id));
+    if (!canonicalParticipant || !ownerMatches || reservedConflict) {
+      const malformed = !canonicalParticipant || (owner !== undefined && !ownerMatches) || (!reservedConflict && owner === undefined);
+      if (malformed) {
+        droppedCount += 1;
+        const attribution = droppedPresenceOf("participant", participant, !reservedConflict);
+        if (attribution) dropped.push(attribution);
+      }
+    } else participants.push(participant);
+  }
+  const unique = uniqueDroppedPresence(dropped);
+  const partial = !isObject(rawValue) || raw.partial === true || droppedCount > 0;
+  return { hosts, participants, ...(unique.length > 0 ? { dropped: unique } : {}),
+    ...(partial ? { partial: true } : {}), ...(droppedCount > 0 ? { droppedCount } : {}) };
 };
 
 /**
- * A presence snapshot that fits one frame (security review round 2, F4): whole hosts with their
- * roots, in order, until the budget. Hosts past it are left out, so their mirrors lapse and
- * senders get the normal lapsed error; the bridge logs how many.
+ * A presence snapshot that fits one frame: whole hosts with their roots, in order, until the
+ * budget. If any host does not fit, the snapshot is partial and cannot prove omission; the bridge
+ * logs the dropped count.
  */
 export const boundPresence = (
-  presence: Pick<BridgePresence, "hosts" | "participants">,
+  presence: BridgeMirrorPresence,
   budget = BRIDGE_PAGE_BYTES,
-): { presence: Pick<BridgePresence, "hosts" | "participants">; dropped: number } => {
+): { presence: BridgeMirrorPresence; dropped: number } => {
   const roots = new Map<string, FabricParticipantRecord[]>();
   for (const participant of presence.participants) {
     roots.set(participant.ownerHostId, [...(roots.get(participant.ownerHostId) ?? []), participant]);
@@ -2226,7 +2489,9 @@ export const boundPresence = (
     hosts.push(host);
     participants.push(...own);
   }
-  return { presence: { hosts, participants }, dropped };
+  const droppedCount = Math.max(validDroppedCount(presence.droppedCount), relevantDroppedCount(presence.dropped)) + dropped;
+  return { presence: { hosts, participants, ...(presence.dropped?.length ? { dropped: presence.dropped } : {}),
+    ...(presence.partial || droppedCount > 0 ? { partial: true } : {}), ...(droppedCount > 0 ? { droppedCount } : {}) }, dropped };
 };
 
 /**
@@ -2616,6 +2881,9 @@ export class MeshBridge {
     const presenceVersion = this.#presenceVersion;
     const leaseVersion = this.#leaseVersion;
     const [local, claimed] = await Promise.all([this.options.local.presence(), this.options.remote.presence()]);
+    const claimedValue: unknown = claimed;
+    const claimedHosts = isObject(claimedValue) && Array.isArray(claimedValue.hosts)
+      ? claimedValue.hosts as BridgePresence["hosts"] : [];
     const remote = admitPresence(claimed, new Set(local.reserved));
     if (this.#stopped) return;
     const relays = await this.options.local.relayPresence?.() ?? { hosts: [], participants: [] };
@@ -2624,15 +2892,31 @@ export class MeshBridge {
     const counts = new Map<string, number>();
     for (const { record } of hosts) counts.set(record.rootId, (counts.get(record.rootId) ?? 0) + 1);
     // Never silently overwrite conflicting canonical duplicates from an adapter or relay.
+    const outboundHosts = hosts.filter(({ record }) => counts.get(record.rootId) === 1);
+    const outboundParticipants = [...native.participants, ...relays.participants.map(record => ({ ...record, bridgeVia: this.options.localName }))]
+      .filter(record => counts.get(record.rootId) === 1);
+    const outboundAdmissionDrops = hosts.length - outboundHosts.length +
+      native.participants.length + relays.participants.length - outboundParticipants.length;
     const outbound = boundPresence({
-      hosts: hosts.filter(({ record }) => counts.get(record.rootId) === 1),
-      participants: [...native.participants, ...relays.participants.map(record => ({ ...record, bridgeVia: this.options.localName }))]
-        .filter(record => counts.get(record.rootId) === 1),
+      hosts: outboundHosts,
+      participants: outboundParticipants,
+      ...(native.dropped?.length ? { dropped: native.dropped } : {}),
+      ...(native.partial || outboundAdmissionDrops > 0 ? { partial: true } : {}),
+      ...(presenceDroppedCount(native) + outboundAdmissionDrops > 0
+        ? { droppedCount: presenceDroppedCount(native) + outboundAdmissionDrops } : {}),
     });
-    if (outbound.dropped) this.#log(`presence: ${outbound.dropped} hosts pass the frame budget and are not mirrored`);
-    this.options.debug?.(`presence sync: inbound ${remote.hosts.length} hosts/${remote.participants.length} participants; outbound ${outbound.presence.hosts.length} hosts/${outbound.presence.participants.length} participants`);
+    const partial = presenceIsPartial(local) || presenceIsPartial(claimed) || presenceIsPartial(native) ||
+      presenceIsPartial(remote) || presenceIsPartial(outbound.presence);
+    const droppedCount = presenceDroppedCount(remote) + presenceDroppedCount(outbound.presence);
+    const outboundPresence: BridgeMirrorPresence = { ...outbound.presence,
+      ...(partial ? { partial: true } : {}), ...(droppedCount > 0 ? { droppedCount } : {}) };
+    const inboundPresence: BridgeMirrorPresence = { ...remote,
+      ...(partial ? { partial: true } : {}), ...(droppedCount > 0 ? { droppedCount } : {}) };
+    if (partial) this.#log(`presence: ${droppedCount} dropped records; this sync is partial, omissions held${outbound.dropped
+      ? ` (${outbound.dropped} hosts pass the frame budget)` : ""}`);
+    this.options.debug?.(`presence sync: inbound ${remote.hosts.length} hosts/${remote.participants.length} participants; outbound ${outbound.presence.hosts.length} hosts/${outbound.presence.participants.length} participants; partial=${partial} dropped=${droppedCount}`);
     // Both settle before a failure is reported, so no local write outlives this pass.
-    const results = await Promise.allSettled([this.options.remote.mirror(outbound.presence), this.options.local.mirror(remote, syncedAt)]);
+    const results = await Promise.allSettled([this.options.remote.mirror(outboundPresence), this.options.local.mirror(inboundPresence, syncedAt)]);
     // A transient failure must not hide a simultaneous permanent/transport failure.
     const failures = results.filter((result) => result.status === "rejected");
     const stale = failures.find(result => result.reason instanceof BridgeStaleIncarnationError);
@@ -2660,7 +2944,7 @@ export class MeshBridge {
     // still needs its capped, held projection to remain live: one lease deadline, 1 s before
     // the 15 s mirror cap (transport/commit headroom), not an unconditional 5 s presence loop.
     // Source expiry itself is reconciled once. No hosts means no deadline at all.
-    const expiries = [...local.hosts, ...claimed.hosts, ...relays.hosts]
+    const expiries = [...local.hosts, ...claimedHosts, ...relays.hosts]
       .map(host => typeof host.observedAt === "number" && Number.isFinite(host.observedAt)
         ? syncedAt + host.expiresAt - host.observedAt : host.expiresAt)
       .filter(expiry => Number.isFinite(expiry) && expiry > syncedAt);

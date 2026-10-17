@@ -2,7 +2,6 @@ import type { FabricProvider } from "../protocol.js";
 import { fabricHostIdentity } from "../fabric-provenance.js";
 import { AgentService } from "./service.js";
 import { assertAgentSpawnAllowed, snapshotAgentSpawnEnvironment } from "./spawn-authority.js";
-import { deliverWithMessageNotice, outgoingMessageNotice } from "../providers/message-id-notice.js";
 import { agentServiceArgs, agentServiceDescriptors } from "./service-schema.js";
 import type { AgentServiceAction, AgentServiceCapabilities, AgentServiceClient, AgentServiceDispatcher, AgentPublicRecord, AgentServiceRequest, AgentSessionRecord } from "./service-types.js";
 
@@ -81,11 +80,7 @@ export function createAgentsProvider(client: AgentServiceClient): FabricProvider
         assertAgentSpawnAllowed(spawnCaller, spawnEnvironment);
       }
       const validated = validate(action, args);
-      if (action !== "steer" && action !== "followUp") return client.dispatch(action as AgentServiceAction, validated, context.signal);
-      const checked = await outgoingMessageNotice(validated.message as string, context);
-      const result = await deliverWithMessageNotice(validated.message as string, checked,
-        message => client.dispatch(action, { ...validated, message }, context.signal), `agents.${action}`);
-      return checked.notice ? { ...(result as object), notice: checked.notice } : result;
+      return client.dispatch(action as AgentServiceAction, validated, context.signal);
     },
   };
 }

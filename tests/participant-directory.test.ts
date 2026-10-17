@@ -2121,8 +2121,13 @@ describe("ParticipantDirectory reads", () => {
       { heartbeatMs: 60_000, leaseMs: 120_000 });
     await reader.start();
     await peer.start();
+    const stateOnlyId = "session:writer:state-only";
+    await store.put({ key: "topology/participants/" + createHash("sha256").update(stateOnlyId).digest("hex"),
+      value: agentRecord(stateOnlyId, writer.id, writer.id, writer.id), identity: writer });
+    await store.put({ key: "actors/retained/memo-payload", value: { payload: "x".repeat(30_000) }, identity: writer });
     const shared = vi.spyOn(reader.mesh, "listAllShared");
     const first = reader.list({ scope: "project" });
+    const stateCapabilities = first.find((participant) => participant.id === stateOnlyId)!.capabilities;
     const calls = shared.mock.calls.length;
     expect(first.map((participant) => participant.id)).toContain(writer.id);
     for (let i = 0; i < 5; i++) reader.list({ scope: "project" });
@@ -2136,10 +2141,21 @@ describe("ParticipantDirectory reads", () => {
 
     await store.put({ key: "topology/participants/" + createHash("sha256").update("session:writer:agent").digest("hex"),
       value: agentRecord("session:writer:agent", writer.id, writer.id, writer.id), identity: writer });
+    const cloned = vi.spyOn(globalThis, "structuredClone");
     const after = reader.list({ scope: "project", fresh: true });
+    // One new shared entry is copied; unchanged entries, including the large retained actor, are reused.
+    expect(cloned.mock.calls.filter(([entry]) => {
+      const key = typeof entry === "object" && entry !== null && "key" in entry ? entry.key : undefined;
+      return typeof key === "string" &&
+        ["topology/hosts/", "topology/participants/", "sessions/", "actors/"].some(prefix => key.startsWith(prefix));
+    })).toHaveLength(1);
+    cloned.mockRestore();
     expect(after.map((participant) => participant.id)).toContain("session:writer:agent");
-    // The write copied only the new entry: an unchanged record is the same parse.
+    // Both native-file and unchanged shared entries retain their frozen parse across unrelated writes.
     expect(after.find((participant) => participant.id === writer.id)!.capabilities).toBe(capabilities);
+    const afterCapabilities = after.find((participant) => participant.id === stateOnlyId)!.capabilities;
+    expect(afterCapabilities).toBe(stateCapabilities);
+    expect(Object.isFrozen(afterCapabilities)).toBe(true);
     // A changed record is read again.
     const key = "topology/participants/" + createHash("sha256").update(writer.id).digest("hex");
     const current = store.get(key)!;

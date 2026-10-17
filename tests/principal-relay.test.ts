@@ -54,52 +54,50 @@ const router = (h: ReturnType<typeof host>, mesh: MeshStore, targets: ReturnType
 
 describe("round-two invocation and activation fencing (#821)", () => {
   const nextTurn = (h: ReturnType<typeof host>) => h.input(receipt({ v: 1, channel: "voice", principal: { id: "next", binding: "voice-call" } }));
-  it.each([["mesh", false], ["mesh", true], ["agents", false], ["agents", true]] as const)("%s captures principal before blocked preflight (attributed=%s), without borrowing the next turn", async (route, attributed) => {
+  it.each([["mesh", false], ["mesh", true], ["agents", false], ["agents", true]] as const)("%s captures principal before routing yields (attributed=%s), without borrowing the next turn", async (route, attributed) => {
     const h = host("pending"), mesh = new MeshStore(path.join(root(), "mesh"), 64 * 1024, 100);
     h.input(attributed ? receipt({ v: 1, channel: "voice", principal }) : undefined);
     let release!: () => void;
     const gate = new Promise<void>(resolve => { release = resolve; });
-    vi.spyOn(messageNotice, "outgoingMessageNotice").mockImplementation(async text => { await gate; return { text }; });
+    const publish = mesh.publish.bind(mesh);
+    vi.spyOn(mesh, "publish").mockImplementation(async input => { await gate; return publish(input); });
     const provider = new AgentsProvider({} as any, { identity: h.identity } as any, {} as any, h.main, { get: () => undefined } as any, undefined, {} as any);
     const pending = route === "mesh" ? new MeshProvider(mesh, h.identity, {} as any).invoke("publish", { topic: "work", text: "old send" }, invocation(h)) : provider.routeMessage("main", "old send", undefined, "steer", invocation(h));
     nextTurn(h); release(); await pending;
     const p = route === "mesh" ? mesh.read({ topic: "work" })[0]?.principal : h.pi.sendMessage.mock.calls.at(-1)?.[1].provenance.principal;
     expect(p).toEqual(attributed ? principal : undefined);
   });
-  it.each(["mesh", "agents"] as const)("%s fences a cancelled UNKNOWN send after blocked preparation", async route => {
+  it.each(["mesh", "agents"] as const)("%s fences a cancelled UNKNOWN send at admission", async route => {
     const h = host("cancel-unknown"), mesh = new MeshStore(path.join(root(), "mesh"), 64 * 1024, 100);
     h.input(undefined);
     const abort = new AbortController(), ctx = { ...invocation(h), signal: abort.signal };
-    let release!: () => void;
-    const gate = new Promise<void>(resolve => { release = resolve; });
-    vi.spyOn(messageNotice, "outgoingMessageNotice").mockImplementation(async text => { await gate; return { text }; });
     const provider = new AgentsProvider({} as any, { identity: h.identity } as any, {} as any, h.main, { get: () => undefined } as any, undefined, {} as any);
+    abort.abort(new Error("cancelled old invocation"));
     const pending = (route === "mesh" ? new MeshProvider(mesh, h.identity, {} as any).invoke("publish", { topic: "work", text: "old send" }, ctx) : provider.routeMessage("main", "old send", undefined, "steer", ctx)).then(() => "published", () => "cancelled");
-    abort.abort(new Error("cancelled old invocation")); nextTurn(h); release();
+    nextTurn(h);
     expect(await pending).toBe("cancelled");
     expect(mesh.read({ topic: "work" })).toHaveLength(0);
     expect(h.pi.sendMessage).not.toHaveBeenCalled();
   });
-  it.each([false, true])("optional-marker retry retains invocation principal and respects cancellation=%s", async cancel => {
+  it.each([false, true])("mesh refusal never retries or borrows the next principal (cancellation=%s)", async cancel => {
     const h = host("retry"), mesh = new MeshStore(path.join(root(), "mesh"), 64 * 1024, 100);
     h.input(receipt({ v: 1, channel: "voice", principal }));
     const abort = new AbortController(), ctx = { ...invocation(h), signal: abort.signal };
-    vi.spyOn(messageNotice, "outgoingMessageNotice").mockResolvedValue({ text: "old send\nnotice", notice: "unverified ids: test" });
     const publish = mesh.publish.bind(mesh), calls: any[] = [];
     vi.spyOn(mesh, "publish").mockImplementation(async input => {
       calls.push(input.principal);
-      if (calls.length === 1) { nextTurn(h); if (cancel) abort.abort(new Error("cancelled retry")); throw new Error("Mesh event exceeds 100 bytes"); }
+      if (calls.length === 1) { nextTurn(h); if (cancel) abort.abort(new Error("cancelled retry")); input.signal?.throwIfAborted(); throw new Error("Mesh event exceeds 100 bytes"); }
       return publish(input);
     });
     const pending = new MeshProvider(mesh, h.identity, {} as any).invoke("publish", { topic: "work", text: "old send" }, ctx);
-    if (cancel) { await expect(pending).rejects.toThrow("cancelled retry"); expect(calls).toEqual([principal]); }
-    else { await pending; expect(calls).toEqual([principal, principal]); expect(mesh.read({ topic: "work" })[0]?.principal).toEqual(principal); }
+    await expect(pending).rejects.toThrow(cancel ? "cancelled retry" : "Mesh event exceeds 100 bytes");
+    expect(calls).toEqual([principal]);
+    expect(mesh.read({ topic: "work" })).toEqual([]);
   });
-  it.each([false, true])("agents optional-marker retry keeps the snapshot and fences cancellation=%s", async cancel => {
+  it.each([false, true])("agents quota refusal never retries or borrows the next principal (cancellation=%s)", async cancel => {
     const h = host("agents-retry");
     h.input(receipt({ v: 1, channel: "voice", principal }));
     const abort = new AbortController(), ctx = { ...invocation(h), signal: abort.signal };
-    vi.spyOn(messageNotice, "outgoingMessageNotice").mockResolvedValue({ text: "old send\nnotice", notice: "unverified ids: test" });
     const deliver = h.main.deliverAgent.bind(h.main), calls: any[] = [];
     vi.spyOn(h.main, "deliverAgent").mockImplementation(input => {
       calls.push(input.principal);
@@ -111,8 +109,9 @@ describe("round-two invocation and activation fencing (#821)", () => {
     });
     const provider = new AgentsProvider({} as any, { identity: h.identity } as any, {} as any, h.main, { get: () => undefined } as any, undefined, {} as any);
     const pending = provider.routeMessage("main", "old send", undefined, "steer", ctx);
-    if (cancel) { await expect(pending).rejects.toThrow("cancelled retry"); expect(calls).toEqual([principal]); expect(h.pi.sendMessage).not.toHaveBeenCalled(); }
-    else { await pending; expect(calls).toEqual([principal, principal]); expect(h.pi.sendMessage.mock.calls.at(-1)![1].provenance.principal).toEqual(principal); }
+    await expect(pending).rejects.toThrow(cancel ? "cancelled retry" : "Main's followUp queue is full");
+    expect(calls).toEqual([principal]);
+    expect(h.pi.sendMessage).not.toHaveBeenCalled();
   });
   it.each(["foreign", "UNKNOWN"])("%s task steering permanently downgrades automatic actor output and Main delivery", async source => {
     const h = host("actor-main"), dir = root(), mesh = new MeshStore(path.join(dir, "mesh"), 64 * 1024, 100);
@@ -261,7 +260,7 @@ describe("originating principal relay (#821)", () => {
     deliverRootInbox(h.pi as any, [event]);
     expect(h.pi.sendMessage.mock.calls.at(-1)![1].provenance.principal).toEqual(principal);
   });
-  it("a scheduled mesh.publish keeps the turn principal and the outgoing notice through release (#864)", async () => {
+  it("a scheduled mesh.publish keeps the turn principal and original text through release (#864)", async () => {
     const mesh = new MeshStore(path.join(root(), "mesh"), 64 * 1024, 100), h = host("scheduler");
     h.input(receipt({ v: 1, channel: "voice", principal }));
     const notice = vi.spyOn(messageNotice, "outgoingMessageNotice").mockResolvedValue({ text: "hello\nnotice", notice: "unverified ids: test" });
@@ -272,12 +271,13 @@ describe("originating principal relay (#821)", () => {
     const scheduled = await provider.invoke("publish", {
       topic: "fleet.work.task", to: "session:receiver", text: "hello", afterMs, key: "later", principal: forged,
     }, invocation(h)) as any;
-    expect(notice).toHaveBeenCalledOnce();
-    expect(scheduled).toMatchObject({ scheduled: true, key: "later", principal, text: "hello\nnotice", notice: "unverified ids: test" });
+    expect(notice).not.toHaveBeenCalled();
+    expect(scheduled).not.toHaveProperty("notice");
+    expect(scheduled).toMatchObject({ scheduled: true, key: "later", principal, text: "hello" });
     expect(mesh.read({ topic: "fleet.work.task" })).toEqual([]); // still pending
     nextTurnOf(h);
     const [event] = await mesh.releaseDueSchedules(Date.now() + afterMs + 1);
-    expect(event).toMatchObject({ to: "session:receiver", text: "hello\nnotice", principal, scheduled: { key: "later" } });
+    expect(event).toMatchObject({ to: "session:receiver", text: "hello", principal, scheduled: { key: "later" } });
     expect(mesh.read({ topic: "fleet.work.task" })[0]?.principal).toEqual(principal);
   });
   it("an admitted org binding is carried, never inferred from a sender named org", () => {

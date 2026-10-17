@@ -343,6 +343,65 @@ describe("direct tokenless presence through MeshBridge RPC", () => {
     expect(readHostLease(f.hub.root, victim.host.id)).toBeUndefined();
   });
 
+  it.each([
+    ["file", "host", "missing"], ["sqlite", "host", "missing"],
+    ["file", "participant", "missing"], ["sqlite", "participant", "missing"],
+    ["file", "host", "foreign"], ["sqlite", "host", "foreign"],
+    ["file", "participant", "foreign"], ["sqlite", "participant", "foreign"],
+  ] as const)("%s treats peer-shaped %s with %s bridgeVia as partial and preserves the mirror", async (backend, kind, via) => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(NOW);
+    const f = ownRootLink(false, backend);
+    const victim = fixture(`peer-provenance-victim-${kind}-${via}`, "B", NOW - 1_000, NOW + 120_000);
+    const progress = fixture(`peer-provenance-progress-${kind}-${via}`, "U", NOW, NOW + 120_000);
+    await installNative(f.work, victim);
+    await f.bridge.syncPresence();
+    const before = { host: f.hub.get(hostKey(victim.host.id), { fresh: true }),
+      participant: f.hub.get(participantKey(victim.participant.id), { fresh: true }),
+      lease: fs.readFileSync(hostLeasePath(f.hub.root, victim.host.id)) };
+
+    const peerMetadata = { remoteHost: "foreign-origin", ...(via === "foreign" ? { bridgeVia: "other-hub" } : {}) };
+    const hostRecord = kind === "host" ? { ...victim.host, ...peerMetadata } : victim.host;
+    const participantRecord = kind === "participant" ? { ...victim.participant, ...peerMetadata } : undefined;
+    const claimed: BridgePresence = {
+      hosts: kind === "host"
+        ? [{ record: hostRecord, expiresAt: victim.host.expiresAt }, ...progress.presence.hosts]
+        : [...victim.presence.hosts, ...progress.presence.hosts],
+      participants: kind === "participant"
+        ? [participantRecord!, ...progress.presence.participants]
+        : [...progress.presence.participants],
+      partial: false,
+      droppedCount: 0,
+      reserved: [],
+    };
+    const response = vi.spyOn(f.agent, "presence").mockResolvedValue(claimed);
+    const mirrored = vi.spyOn(f.local, "mirror");
+    await f.bridge.syncPresence();
+
+    expect(response).toHaveBeenCalledTimes(1);
+    if (kind === "host") {
+      expect(f.hub.get(hostKey(victim.host.id), { fresh: true })).toEqual(before.host);
+      expect(fs.readFileSync(hostLeasePath(f.hub.root, victim.host.id))).toEqual(before.lease);
+    } else {
+      expect(readHostLease(f.hub.root, victim.host.id)).toMatchObject({ id: victim.host.id,
+        rootId: victim.host.rootId, identityId: victim.identity.id });
+    }
+    expect(f.hub.get(participantKey(victim.participant.id), { fresh: true })).toEqual(before.participant);
+    expect(mirrored.mock.lastCall?.[0]).toMatchObject({ partial: true, droppedCount: expect.any(Number) });
+    expect(f.hub.get(hostKey(progress.host.id), { fresh: true })?.value).toMatchObject({ incarnationToken: "U" });
+    expect(f.hub.get(participantKey(progress.participant.id), { fresh: true })?.value).toMatchObject({ id: progress.participant.id });
+
+    response.mockRestore();
+    mirrored.mockRestore();
+    await f.work.delete({ key: hostKey(victim.host.id) });
+    await f.work.delete({ key: participantKey(victim.participant.id) });
+    fs.rmSync(hostLeasePath(f.work.root, victim.host.id), { force: true });
+    await f.bridge.syncPresence();
+    expect(f.hub.get(hostKey(victim.host.id), { fresh: true })).toBeUndefined();
+    expect(f.hub.get(participantKey(victim.participant.id), { fresh: true })).toBeUndefined();
+    expect(readHostLease(f.hub.root, victim.host.id)).toBeUndefined();
+  });
+
   it.each(["file", "sqlite"] as const)("treats every non-object remote record as a partial drop across RPC (%s)", async backend => {
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(NOW);
@@ -1211,6 +1270,48 @@ describe("malformed direct RPC recovery custody", () => {
     expect(f.work.get(participantKey(b.host.id), { fresh: true })).toEqual(before.participant);
     const replay = fixture("recovery-root", "A", NOW + 20_000, NOW + 120_000);
     await expect(remote.mirror(replay.presence)).rejects.toBeInstanceOf(BridgeStaleIncarnationError);
+  });
+});
+
+describe("commit-time lease identity digest", () => {
+  it.each(["file", "sqlite"] as const)("detects an identity-only lease retarget before applying a colliding plan (%s)", async backend => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(NOW);
+    const store = openStore(backend);
+    const side = new StoreBridgeSide(store, "intel1", () => Date.now());
+    const ownerBefore = fixture("identity-digest-owner", "B0", NOW - 2_000, NOW + 120_000);
+    await side.mirror(ownerBefore.presence, NOW);
+    const ownerNext = fixture("identity-digest-owner", "B1", NOW - 1_000, NOW + 120_000);
+    const claimant = fixture("identity-digest-claimant", "X", NOW - 1_000, NOW + 120_000);
+    const unrelatedIdentityId = "session:identity-digest-before-00000001";
+    const ghostLease = { id: claimant.host.id, rootId: claimant.host.rootId, identityId: unrelatedIdentityId,
+      startedAt: claimant.host.startedAt, updatedAt: claimant.host.updatedAt, expiresAt: claimant.host.expiresAt };
+    writeHostLease(store.root, ghostLease);
+    const retargetedLease = { ...ghostLease, identityId: ownerBefore.host.id };
+    const before = { host: store.get(hostKey(ownerBefore.host.id), { fresh: true }),
+      participant: store.get(participantKey(ownerBefore.participant.id), { fresh: true }),
+      lease: fs.readFileSync(hostLeasePath(store.root, ownerBefore.host.id)) };
+    const candidate: BridgePresence = {
+      hosts: [...claimant.presence.hosts, ...ownerNext.presence.hosts],
+      participants: [...claimant.presence.participants, ...ownerNext.presence.participants],
+      reserved: [],
+    };
+    const write = store.writeBatch.bind(store);
+    let batches = 0;
+    vi.spyOn(store, "writeBatch").mockImplementation(async input => {
+      batches += 1;
+      if (batches === 1) writeHostLease(store.root, retargetedLease);
+      return write(input);
+    });
+
+    await expect(side.mirror(candidate, NOW)).resolves.toBeUndefined();
+
+    expect(store.get(hostKey(ownerBefore.host.id), { fresh: true })).toEqual(before.host);
+    expect(store.get(participantKey(ownerBefore.participant.id), { fresh: true })).toEqual(before.participant);
+    expect(fs.readFileSync(hostLeasePath(store.root, ownerBefore.host.id))).toEqual(before.lease);
+    expect(readHostLease(store.root, claimant.host.id)).toMatchObject(retargetedLease);
+    expect(store.get(hostKey(claimant.host.id), { fresh: true })).toBeUndefined();
+    expect(batches).toBe(backend === "sqlite" ? 2 : 1);
   });
 });
 

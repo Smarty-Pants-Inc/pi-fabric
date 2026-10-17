@@ -336,22 +336,23 @@ const identifiableHostOf = (key: string, value: unknown): FabricHostRecord | und
   return value as unknown as FabricHostRecord;
 };
 
-const hostOf = (key: string, value: unknown): FabricHostRecord | undefined => {
-  const host = identifiableHostOf(key, value);
-  return host && isAdmissibleRecord("host", host) ? host : undefined;
-};
-
-const presenceHostOf = (key: string, value: unknown): FabricHostRecord | undefined =>
-  hostOf(key, value) ?? (remoteHostOf(value) === undefined ? identifiableHostOf(key, value) : undefined);
-
 const finiteHostTimestamps = (record: FabricHostRecord): boolean =>
   Number.isFinite(record.startedAt) && Number.isFinite(record.updatedAt) && Number.isFinite(record.expiresAt);
 
 const PARTICIPANT_KINDS = new Set(["root", "agent", "actor", "provider"]);
 const PARTICIPANT_TRANSPORTS = new Set(["auto", "process", "tmux", "screen", "localterm", "herdr", "host", "hosted"]);
 
-function isAdmissibleRecord(kind: "host" | "participant", value: unknown): boolean {
+const carriesRemoteHost = (value: unknown): value is Record<string, unknown> =>
+  isObject(value) && Object.hasOwn(value, "remoteHost") && value.remoteHost !== undefined;
+
+const trustedRelayOf = (value: unknown, bridgeVia?: string): boolean =>
+  carriesRemoteHost(value) && typeof value.remoteHost === "string" && value.remoteHost.length > 0 &&
+  bridgeVia !== undefined && bridgeVia.length > 0 && value.remoteHost !== bridgeVia && value.bridgeVia === bridgeVia;
+
+function isAdmissibleRecord(kind: "host" | "participant", value: unknown, trustedBridgeVia?: string): boolean {
   if (!isObject(value) || value.format !== 1 || typeof value.id !== "string" || value.id.length === 0) return false;
+  // A relayed origin is admissible only when the receiving link's own hub attests the hop.
+  if (trustedBridgeVia !== undefined && carriesRemoteHost(value) && !trustedRelayOf(value, trustedBridgeVia)) return false;
   if (kind === "host") {
     return typeof value.rootId === "string" && value.rootId.length > 0 && isIdentity(value.identity) &&
       finiteHostTimestamps(value as unknown as FabricHostRecord);
@@ -370,8 +371,16 @@ function isAdmissibleRecord(kind: "host" | "participant", value: unknown): boole
     typeof value.updatedAt === "number" && Number.isFinite(value.updatedAt) && controlProtocolValid;
 }
 
-const participantOf = (key: string, value: unknown): FabricParticipantRecord | undefined => {
-  if (!isAdmissibleRecord("participant", value)) return undefined;
+const hostOf = (key: string, value: unknown, trustedBridgeVia?: string): FabricHostRecord | undefined => {
+  const host = identifiableHostOf(key, value);
+  return host && isAdmissibleRecord("host", host, trustedBridgeVia) ? host : undefined;
+};
+
+const presenceHostOf = (key: string, value: unknown, trustedBridgeVia?: string): FabricHostRecord | undefined =>
+  hostOf(key, value, trustedBridgeVia) ?? (!carriesRemoteHost(value) ? identifiableHostOf(key, value) : undefined);
+
+const participantOf = (key: string, value: unknown, trustedBridgeVia?: string): FabricParticipantRecord | undefined => {
+  if (!isAdmissibleRecord("participant", value, trustedBridgeVia)) return undefined;
   const participant = value as FabricParticipantRecord;
   if (key !== keyFor(PARTICIPANT_PREFIX, participant.id)) return undefined;
   return participant;
@@ -1340,7 +1349,7 @@ export class StoreBridgeSide implements BridgeSide {
         consultedLeaseIdentifiers.has(lease.identityId) || consultedLeaseIdentifiers.has(lease.rootId))
         .sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0)
         .map(lease => includeAll ? lease : ({
-          id: lease.id, rootId: lease.rootId, ...incarnationOf(lease),
+          id: lease.id, rootId: lease.rootId, identityId: lease.identityId, ...incarnationOf(lease),
           bridgeSupersededTokens: bridgeSupersededTokensOf(lease.bridgeSupersededTokens),
           bridgeSupersededTokenSeen: bridgeSupersededSeenOf(lease.bridgeSupersededTokenSeen),
         })),
@@ -2038,13 +2047,13 @@ const presenceArg = (args: unknown, hub: string): BridgeMirrorPresence => {
   }
   const hosts = args.hosts.flatMap((host): BridgeHost[] => {
     if (!isObject(host) || !isObject(host.record)) return [];
-    const record = presenceHostOf(keyFor(HOST_PREFIX, String(host.record.id)), host.record);
+    const record = presenceHostOf(keyFor(HOST_PREFIX, String(host.record.id)), host.record, hub);
     return record && (remoteHostOf(record) === undefined || (record.bridgeVia === hub && record.remoteHost !== hub))
       ? [{ record, expiresAt: typeof host.expiresAt === "number" ? host.expiresAt : NaN,
         ...(host.observedAt !== undefined ? { observedAt: typeof host.observedAt === "number" ? host.observedAt : NaN } : {}) }] : [];
   });
   const participants = args.participants.flatMap((value): FabricParticipantRecord[] => {
-    const record = isObject(value) ? participantOf(keyFor(PARTICIPANT_PREFIX, String(value.id)), value) : undefined;
+    const record = isObject(value) ? participantOf(keyFor(PARTICIPANT_PREFIX, String(value.id)), value, hub) : undefined;
     return record && (remoteHostOf(record) === undefined || (record.bridgeVia === hub && record.remoteHost !== hub)) ? [record] : [];
   });
   const rawDropped = Array.isArray(args.dropped) ? args.dropped : [];
@@ -2052,14 +2061,14 @@ const presenceArg = (args: unknown, hub: string): BridgeMirrorPresence => {
   const owners = new Map(hosts.map(({ record }) => [record.id, record]));
   const malformedHosts = hosts.filter(({ record, expiresAt, observedAt }) => {
     const relayed = record.bridgeVia === hub && record.remoteHost !== undefined && record.remoteHost !== hub;
-    return !isAdmissibleRecord("host", record) || !Number.isFinite(expiresAt) ||
+    return !isAdmissibleRecord("host", record, hub) || !Number.isFinite(expiresAt) ||
       (observedAt !== undefined && !Number.isFinite(observedAt)) || record.identity.id !== record.id ||
       record.rootId !== record.id || (!relayed && record.bridgeVia !== undefined) || !CANONICAL_ID.test(record.id);
   }).length;
   const malformedParticipants = participants.filter(record => {
     const owner = owners.get(record.ownerHostId);
     const relayed = record.bridgeVia === hub && record.remoteHost !== undefined && record.remoteHost !== hub;
-    return record.kind !== "root" || (!relayed && record.bridgeVia !== undefined) || !owner ||
+    return !isAdmissibleRecord("participant", record, hub) || record.kind !== "root" || (!relayed && record.bridgeVia !== undefined) || !owner ||
       record.id !== owner.id || owner.identity.id !== record.ownerIdentityId || owner.rootId !== record.rootId;
   }).length;
   const inheritedCount = Math.max(validDroppedCount(args.droppedCount), relevantDroppedCount(rawDropped));
@@ -2425,6 +2434,7 @@ export const isCanonicalRootId = (id: string): boolean => CANONICAL_ID.test(id);
 export const admitPresence = (
   claimed: BridgeMirrorPresence,
   reserved: ReadonlySet<string>,
+  trustedBridgeVia?: string,
 ): BridgeMirrorPresence => {
   // Remote presence is raw JSON: a malformed array or item is a dropped record, never evidence
   // that a previously mirrored root was absent.
@@ -2444,7 +2454,7 @@ export const admitPresence = (
       droppedCount += 1;
       continue;
     }
-    const record = presenceHostOf(keyFor(HOST_PREFIX, value.record.id), value.record);
+    const record = presenceHostOf(keyFor(HOST_PREFIX, value.record.id), value.record, trustedBridgeVia);
     if (!record) {
       droppedCount += 1;
       const attribution = droppedPresenceOf("host", value.record);
@@ -2454,9 +2464,10 @@ export const admitPresence = (
     const expiresAt = typeof value.expiresAt === "number" ? value.expiresAt : NaN;
     const hasObservedAt = Object.hasOwn(value, "observedAt");
     const observedAt = typeof value.observedAt === "number" ? value.observedAt : hasObservedAt ? NaN : undefined;
-    const malformed = !isAdmissibleRecord("host", record) || !Number.isFinite(expiresAt) ||
+    const relayed = trustedRelayOf(record, trustedBridgeVia);
+    const malformed = !isAdmissibleRecord("host", record, trustedBridgeVia) || !Number.isFinite(expiresAt) ||
       (observedAt !== undefined && !Number.isFinite(observedAt)) || record.identity.id !== record.id ||
-      record.rootId !== record.id || record.bridgeVia !== undefined || !CANONICAL_ID.test(record.id);
+      record.rootId !== record.id || (!relayed && record.bridgeVia !== undefined) || !CANONICAL_ID.test(record.id);
     const reservedConflict = [record.id, record.identity.id, record.rootId].some(id => reserved.has(id));
     if (malformed || reservedConflict) {
       if (malformed) {
@@ -2470,10 +2481,11 @@ export const admitPresence = (
   const participants: FabricParticipantRecord[] = [];
   for (const value of rawParticipants) {
     if (!isObject(value) || typeof value.id !== "string") { droppedCount += 1; continue; }
-    const participant = participantOf(keyFor(PARTICIPANT_PREFIX, value.id), value);
+    const participant = participantOf(keyFor(PARTICIPANT_PREFIX, value.id), value, trustedBridgeVia);
     if (!participant) { droppedCount += 1; continue; }
     const owner = admitted.get(participant.ownerHostId);
-    const canonicalParticipant = participant.kind === "root" && participant.bridgeVia === undefined &&
+    const relayed = trustedRelayOf(participant, trustedBridgeVia);
+    const canonicalParticipant = participant.kind === "root" && (relayed || participant.bridgeVia === undefined) &&
       participant.id === participant.ownerHostId && participant.id === participant.ownerIdentityId && participant.id === participant.rootId;
     const ownerMatches = owner !== undefined && owner.id === participant.id &&
       owner.identity.id === participant.ownerIdentityId && owner.rootId === participant.rootId;
@@ -2928,7 +2940,7 @@ export class MeshBridge {
     const claimedValue: unknown = claimed;
     const claimedHosts = isObject(claimedValue) && Array.isArray(claimedValue.hosts)
       ? claimedValue.hosts.filter((host): host is BridgeHost => isObject(host)) : [];
-    const remote = admitPresence(claimed, new Set(local.reserved));
+    const remote = admitPresence(claimed, new Set(local.reserved), this.options.remoteName);
     if (this.#stopped) return;
     const relays = await this.options.local.relayPresence?.() ?? { hosts: [], participants: [] };
     const native = admitPresence(local, new Set());

@@ -68,7 +68,7 @@ const addRoot = async (store: MeshStore, name: string, expiresIn = 60_000) => {
 };
 
 /** Hub "dev1" (sender) and far "forge" (live origin), joined by a real bridge that then goes silent. */
-const world = async (waitMs?: number) => {
+const world = async (waitMs?: number, heldMain = false) => {
   let offset = 0;
   vi.spyOn(Date, "now").mockImplementation(() => realNow() + offset);
   const hub = new MeshStore(scratch(), 64 * 1024, 100), far = new MeshStore(scratch(), 64 * 1024, 100);
@@ -97,9 +97,11 @@ const world = async (waitMs?: number) => {
   // The true receiving path on the origin: control -> AgentsProvider.acceptControl -> Main controller -> pi.sendMessage.
   const sendMessage = vi.fn();
   const pi = { sendMessage, on: () => undefined } as unknown as ExtensionAPI;
-  const ctx = { isIdle: () => true, sessionManager: { getEntries: () => [] } } as unknown as ExtensionContext;
+  const ctx = { isIdle: () => !heldMain, hasPendingMessages: () => false,
+    sessionManager: { getEntries: () => [] } } as unknown as ExtensionContext;
   const main = new MainAgentController(pi, target.identity.id, true, os.tmpdir(), "remote");
-  main.attachFollowUpDrain(ctx, 120_000, path.join(scratch(), "followups.json"));
+  const journal = path.join(scratch(), "followups.json");
+  main.attachFollowUpDrain(ctx, 120_000, journal);
   cleanups.push(() => main.closeFollowUpDrain());
   const receiving = new AgentsProvider({ cwd: os.tmpdir() } as any, { identity: target.identity } as any, {} as any, main,
     farDirectory, receiver, {} as any, () => false, undefined, false);
@@ -114,7 +116,16 @@ const world = async (waitMs?: number) => {
     hubDirectory, sender, binding => binding);
 
   sender.start(() => ({ accepted: false }));
-  receiver.start((cmd, from, signal, verification) => receiving.acceptControl(cmd, from, signal, verification));
+  const admissions: Array<{ id: string; message: string; at: number; verification: string | undefined }> = [];
+  receiver.start(async (cmd, from, signal, verification) => {
+    const result = await receiving.acceptControl(cmd, from, signal, verification);
+    if (heldMain && result.accepted) {
+      const items = JSON.parse(fs.readFileSync(journal, "utf8")).items as Array<{ deliveryId: string; message: string }>;
+      expect(items.some(item => item.deliveryId === cmd.commandId && item.message === cmd.message)).toBe(true);
+      admissions.push({ id: cmd.commandId, message: cmd.message!, at: performance.now(), verification });
+    }
+    return result;
+  });
   localReceiver.start(localHandler);
   await bridge.start();
   await bridge.syncPresence();
@@ -127,7 +138,7 @@ const world = async (waitMs?: number) => {
   expect(mirror()!.expiresAt).toBeLessThan(Date.now());
   expect(far.get(`topology/hosts/${hash(target.hostId)}`)!.value).toMatchObject({ expiresAt: expect.any(Number) });
   expect((far.get(`topology/hosts/${hash(target.hostId)}`)!.value as { expiresAt: number }).expiresAt).toBeGreaterThan(Date.now());
-  return { hub, far, bridge, lane, local, target, hubDirectory, sending, sender, sendMessage, localHandler, mirror };
+  return { hub, far, bridge, lane, local, target, hubDirectory, sending, sender, sendMessage, localHandler, mirror, journal, admissions };
 };
 
 const settle = <T>(promise: Promise<T>) => {
@@ -218,6 +229,61 @@ const invokingProvider = (w: Awaited<ReturnType<typeof world>>, mainMatch = fals
   return new AgentsProvider(w.sending.manager as Ports[0], w.sending.actorManager as Ports[1], {} as Ports[2],
     main as Ports[3], w.hubDirectory, w.sender, {} as Ports[6], () => false, undefined, false);
 };
+
+// A5 premise: public API -> real FILE/bridge/receiver -> actual busy Main durable journal.
+// Private two-store mirror simulation, constant Date offset; native Pi consumption is inert.
+describe("A5 public-entry mirrored-sample N20", () => {
+  it("admits all 20 once after same-owner sample renewal, with no caller replay", async () => {
+    const w = await world(undefined, true), provider = invokingProvider(w);
+    const rows: Array<Record<string, unknown>> = [];
+    const samples = ["stale", "absent", "source-live expired"] as const;
+    const epoch = w.target.ownerIncarnation;
+    for (let i = 0; i < 20; i++) {
+      const sample = samples[i % samples.length]!;
+      await indeterminate(w, sample);
+      if (i > 0) await w.hubDirectory.refreshRoutingView(); // First input uses bootstrap.
+      const pin = w.hubDirectory.mirroredControlOwner(w.target.hostId, w.target.identity.id, w.target.hostId)!;
+      expect(pin).toMatchObject({ remoteHost: "forge", ownerIncarnation: epoch });
+      const message = `a5-input-${i}`, started = performance.now();
+      const pending = provider.invoke("followUp", { id: w.target.hostId, message, data: { input: i },
+        idempotencyKey: `a5-key-${i}` }, { signal: AbortSignal.timeout(5000), callId: `a5-call-${i}` } as unknown as FabricInvocationContext);
+      let settledAt = started;
+      void pending.then(() => { settledAt = performance.now(); }, () => { settledAt = performance.now(); });
+      const state = settle(pending);
+      // The bridge presence pass is the normal event source; delay only this renewal.
+      await sleep(100);
+      await w.bridge.syncPresence();
+      await waitFor(() => on(w.hub, "fabric.control.command").length > i || state.done !== undefined);
+      await w.bridge.step();
+      if (!state.done) {
+        await waitFor(() => on(w.far, "fabric.control.ack").length > i || state.done !== undefined);
+        await w.bridge.step();
+      }
+      let refusal: string | null = null, acknowledged = false;
+      try { acknowledged = (await pending as { acknowledged?: boolean }).acknowledged === true; }
+      catch (error) { refusal = error instanceof Error ? `${error.name}: ${error.message}` : String(error); }
+      const admitted = w.admissions.filter(item => item.message === message);
+      rows.push({ input: i, sample, message, acknowledged, refusal, settledMs: settledAt - started,
+        admissions: admitted.length, admissionMs: admitted[0] ? admitted[0].at - started : null });
+      expect(w.hubDirectory.mirroredControlOwner(w.target.hostId, w.target.identity.id, w.target.hostId))
+        .toMatchObject({ remoteHost: "forge", ownerIncarnation: epoch });
+    }
+    const items = fs.existsSync(w.journal) ? JSON.parse(fs.readFileSync(w.journal, "utf8")).items as Array<{ deliveryId: string; message: string; data: unknown }> : [];
+    const times = rows.flatMap(row => typeof row.admissionMs === "number" ? [row.admissionMs] : []).sort((a, b) => a - b);
+    const percentile = (p: number) => times.length ? times[Math.ceil(times.length * p) - 1] : null;
+    const summary = { inputs: 20, commands: on(w.hub, "fabric.control.command").length,
+      carried: on(w.far, "fabric.control.command").length, admissions: w.admissions.length, journalItems: items.length,
+      duplicates: w.admissions.length - new Set(w.admissions.map(item => item.id)).size,
+      refusals: rows.filter(row => row.refusal !== null).length, nativeSends: w.sendMessage.mock.calls.length,
+      p50: percentile(.5), p95: percentile(.95), p99: percentile(.99), rows };
+    console.info("A5_PUBLIC_N20", JSON.stringify(summary));
+    expect(summary.refusals).toBe(0); expect(summary.commands).toBe(20); expect(summary.carried).toBe(20);
+    expect(summary.admissions).toBe(20); expect(summary.duplicates).toBe(0); expect(summary.nativeSends).toBe(0);
+    expect(w.admissions.every(item => item.verification === "bridge")).toBe(true);
+    expect(items.map(item => [item.message, item.data])).toEqual(Array.from({ length: 20 }, (_, i) => [`a5-input-${i}`, { input: i }]));
+    expect(items.map(item => item.deliveryId)).toEqual(w.admissions.map(item => item.id));
+  }, 30000);
+});
 
 describe("F-001 provider invocation mirror wait", () => {
   it("observes only lease-wait cleanup when an existing control watch binds a child after renewal", async () => {

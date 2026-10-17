@@ -160,7 +160,12 @@ describe("core override prompt guidance", () => {
           systemPromptOptions: { skills },
         }, modelContext);
         expect(noPromptResult.systemPromptOptions.sections.skills).toContain("Use `pi.read` inside `fabric_exec`");
-        expect(noPromptResult.systemPromptOptions.sections.fabric_execution).toContain("Pi Fabric full code mode");
+        const noPromptGuidance = noPromptResult.systemPromptOptions.sections.fabric_execution;
+        expect(noPromptGuidance).toContain("Custom DeepSeek execution profile");
+        expect(noPromptGuidance).toContain("DeepSeek-specific final instruction");
+        expect(noPromptGuidance).toContain("Prefer symbol IDs when available.");
+        expect(noPromptGuidance).not.toContain("Pi Fabric full code mode");
+        expect(noPromptGuidance).not.toContain("Jev supplies");
 
         const guidedEvent = {
           systemPrompt: "base system",
@@ -173,7 +178,9 @@ describe("core override prompt guidance", () => {
         expect(guidedResult.systemPromptOptions.sections.skills).toContain("Use `pi.read` inside `fabric_exec`");
         expect(guidedResult.systemPromptOptions.sections.skills).toContain("/skills/active/SKILL.md");
         expect((repeatedResult as { systemPrompt: string }).systemPrompt).toBe(guidedPrompt);
-        expect(guidedPrompt).toContain("Pi Fabric full code mode");
+        expect(guidedPrompt).not.toContain("Pi Fabric full code mode");
+        expect(guidedPrompt).not.toContain("Jev supplies");
+        expect(guidedPrompt).toContain("Effective compatible core override guidance:");
         expect(guidedPrompt).toContain("Custom DeepSeek execution profile");
         expect(guidedPrompt).toContain("DeepSeek-specific final instruction");
         expect(guidedPrompt).not.toContain("Examples and returns");

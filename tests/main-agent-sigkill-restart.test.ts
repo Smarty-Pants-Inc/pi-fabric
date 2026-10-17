@@ -91,15 +91,18 @@ if (mode === "admit") {
   await new Promise(() => {});
 }
 
-faux.setResponses([fauxAssistantMessage("resumed")]);
+faux.setResponses([fauxAssistantMessage("resumed"), fauxAssistantMessage("verified"), fauxAssistantMessage("extra turn")]);
 await session.prompt("resume");
+await waitFor(() => session.isIdle);
+const duplicate = main.deliverAgent({ from: actor, message: "duplicate", delivery: "steer", deliveryId });
+await waitFor(() => session.isIdle);
+await session.prompt("verify duplicate refusal at another real turn");
 await waitFor(() => session.isIdle);
 const delivered = session.messages.filter(message => message.role === "custom" && message.customType === "pi-fabric-agent-message");
 const outcomeDir = path.join(path.dirname(path.dirname(journal)), "delivery-outcomes");
 const rows = fs.existsSync(outcomeDir)
   ? fs.readdirSync(outcomeDir).flatMap(file => fs.readFileSync(path.join(outcomeDir, file), "utf8").trim().split("\\n").filter(Boolean).map(line => JSON.parse(line)))
   : [];
-const duplicate = main.deliverAgent({ from: actor, message: "duplicate", delivery: "steer", deliveryId });
 process.stdout.write("DELIVERED_COUNT:" + delivered.length + "\\nDELIVERED_ID:" + (delivered[0]?.details?.deliveryId ?? "") + "\\nDUPLICATE:" + Boolean(duplicate.duplicate) + "\\nOUTCOME_COUNT:" + rows.filter(row => row.eventId === eventId).length + "\\n");
 main.closeFollowUpDrain();
 session.dispose();
@@ -178,6 +181,16 @@ describe("real OS-process Main delivery restart", () => {
       expect(line(restarted.output(), "DELIVERED_ID:")).toBe("sigkill-delivery");
       expect(line(restarted.output(), "DUPLICATE:")).toBe("true");
       expect(line(restarted.output(), "OUTCOME_COUNT:")).toBe("1");
+      // The child is terminal: independently inspect the real persisted carrier, not its memory.
+      const native = fs.readFileSync(sessionFile!, "utf8").trim().split("\n").map(row => JSON.parse(row))
+        .filter(entry => entry.type === "custom_message" && entry.customType === "pi-fabric-agent-message");
+      expect(native).toHaveLength(1);
+      expect(native[0]).toMatchObject({ details: { deliveryId: "sigkill-delivery" }, content: expect.stringContaining("\nexactly once\n") });
+      expect(native[0].content).not.toContain("\nduplicate\n");
+      const outcomeDir = path.join(root, "delivery-outcomes");
+      const outcomes = fs.readdirSync(outcomeDir).flatMap(file => fs.readFileSync(path.join(outcomeDir, file), "utf8")
+        .trim().split("\n").filter(Boolean).map(row => JSON.parse(row)));
+      expect(outcomes).toEqual([expect.objectContaining({ eventId: "sigkill-event", outcome: "delivered", to: "session:root" })]);
       expect(fs.existsSync(journal)).toBe(false);
     } finally {
       await stopChildren(runs);

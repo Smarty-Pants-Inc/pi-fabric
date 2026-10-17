@@ -84,8 +84,27 @@ interface ActorLogTarget {
   lastRunId?: string;
 }
 
+/** p95 only samples a bounded archive window; ordinary log reads retain their full listing semantics. */
+const ACTOR_P95_RUN_SAMPLE_SIZE = 200;
+interface P95RunCache {
+  runsDirectory: string;
+  signature: string | undefined;
+  ids: string[];
+}
+
+const archiveDirectorySignature = (runsDirectory: string): string | undefined => {
+  try {
+    const stat = fs.statSync(runsDirectory);
+    return [stat.dev, stat.ino, stat.mtimeMs, stat.ctimeMs, stat.size].join(":");
+  } catch {
+    return undefined;
+  }
+};
+
 /** Archive I/O and message bounds only; ownership and sweep eligibility stay with the manager. */
 export class ActorLogStore {
+  readonly #p95RunCache = new WeakMap<ActorLogTarget, P95RunCache>();
+
   constructor(
     readonly mesh: Pick<MeshStore, "maxEventBytes">,
     readonly config: Pick<FabricMeshConfig, "eventContextChars">,
@@ -154,6 +173,7 @@ export class ActorLogStore {
       }
     } finally { held.close(); }
     this.pruneRuns(actor);
+    this.#rememberP95Run(actor, runId);
   }
 
   pruneRuns(actor: ActorLogTarget, now = Date.now()): void {
@@ -177,6 +197,62 @@ export class ActorLogStore {
     } catch {
       return [];
     }
+  }
+
+  /**
+   * Return the bounded archive window used only by the stuck-run p95 alarm.
+   * opendir/readSync stops after the sample limit, unlike retainedRunIds(), whose
+   * full sorted listing is part of the actor log API. A directory stat invalidates
+   * the window after an external archive change; retainRun() also records its own
+   * new archive in an already-warm cache so a new random UUID is not missed merely
+   * because the directory iterator returns older entries first.
+   */
+  retainedRunIdsForP95(actor: ActorLogTarget): string[] {
+    const boundedLimit = ACTOR_P95_RUN_SAMPLE_SIZE;
+    const runsDirectory = path.join(path.dirname(actor.sessionFile), "runs");
+    const signature = archiveDirectorySignature(runsDirectory);
+    const cached = this.#p95RunCache.get(actor);
+    const previous = cached?.runsDirectory === runsDirectory ? cached : undefined;
+    // Two failed stats do not prove that the archive is unchanged.
+    if (signature !== undefined && previous?.signature === signature) return [...previous.ids];
+
+    const ids = new Set<string>();
+    let directory: fs.Dir | undefined;
+    let complete = false;
+    try {
+      directory = fs.opendirSync(runsDirectory);
+      for (let scanned = 0; scanned < boundedLimit; scanned++) {
+        const entry = directory.readSync();
+        if (entry === null) break;
+        if (entry.isDirectory()) ids.add(entry.name);
+      }
+      // Both clean EOF and the intended entry cap finish the bounded window.
+      complete = true;
+    } catch {
+      // A partial sample can lower the alarm threshold; keep the last complete
+      // window and its signature intact so the next lookup retries the refresh.
+    } finally {
+      try { directory?.closeSync(); } catch { /* already closed or unavailable */ }
+    }
+    if (!complete) return previous ? [...previous.ids] : [];
+    const selected = [...ids].sort().slice(-boundedLimit);
+    this.#p95RunCache.set(actor, { runsDirectory, signature, ids: selected });
+    return [...selected];
+  }
+
+  #rememberP95Run(actor: ActorLogTarget, runId: string): void {
+    const runsDirectory = path.join(path.dirname(actor.sessionFile), "runs");
+    const cached = this.#p95RunCache.get(actor);
+    if (!cached || cached.runsDirectory !== runsDirectory) return;
+    const ids = new Set(cached.ids);
+    ids.add(runId);
+    const selected = [...ids].sort().slice(-ACTOR_P95_RUN_SAMPLE_SIZE);
+    if (!selected.includes(runId)) selected[0] = runId;
+    this.#p95RunCache.set(actor, {
+      runsDirectory,
+      signature: archiveDirectorySignature(runsDirectory),
+      ids: selected.sort(),
+    });
   }
 
   recordMessage(messages: FabricActorMessage[], message: FabricActorMessage): void {

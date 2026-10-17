@@ -27,7 +27,7 @@ import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
 import { readFileRetrying, renameAtomic, syncDirectoryChain, trackTemporary, writeJsonAtomic } from "../core/atomic-write.js";
 import { discardWorkerCompletion, type CompletionRecipient } from "./completion-journal.js";
 import { processStartTime } from "../residency/process-identity.js";
-import { countUnknownEnodevStarts, enodevDelivered, enodevUnresolvedRuns, noteEnodevDelivered, peekEnodevRun, settleEnodevRun,
+import { assertRecoveryAllowed, recoveryRunDirectories, recoverySlice, countUnknownEnodevStarts, enodevDelivered, enodevUnresolvedRuns, noteEnodevDelivered, peekEnodevRun, settleEnodevRun,
   settleGoneEnodevLaunch, settleLostEnodevRun, ownedProcess, provenGoneEnodevLaunch, goneEnodevOutcome, savedEnodevAnswer, recoverDurableActorStop, type OwnedProcess } from "./enodev-recovery.js";
 import {
   DEFAULT_FABRIC_CONFIG,
@@ -59,7 +59,7 @@ import {
 import {
   HOSTED_STATE_FILE,
   HostedRun,
-  readHostedRunState,
+  type HostedRunState,
   type HostedRunHooks,
 } from "./hosted-run.js";
 import { resolvePiBinary } from "./pi-binary.js";
@@ -398,6 +398,27 @@ class AgentTaskPresenceError extends Error {
   readonly code = "FABRIC_AGENT_TASK_PRESENCE_FAILED";
   constructor(cause: unknown) {
     super(`Task presence admission failed: ${cause instanceof Error ? cause.message : String(cause)}`, { cause });
+  }
+}
+
+/** A recorded resident module failed to provide this runner; no launch was attempted. */
+export class AgentRunnerRecoveryUnavailableError extends Error {
+  readonly code = "FABRIC_RUNNER_RECOVERY_UNAVAILABLE";
+  constructor(readonly runner: string, readonly reason: string) {
+    super(`Fabric runner ${runner} is unavailable: ${reason}`);
+  }
+}
+
+const RECOVERY_RECORD_MAX_BYTES = 1024 * 1024;
+
+/** A per-run recovery refusal, never authority derived from unread worker bytes. */
+export class AgentRunRecoveryRefusal extends Error {
+  readonly code = "FABRIC_RUN_RECOVERY_RECORD_OVERSIZED";
+  readonly reason = "oversized record";
+  readonly maxBytes = RECOVERY_RECORD_MAX_BYTES;
+  constructor(readonly id: string, readonly file: string, readonly observedBytes: number) {
+    super(`Hosted recovery ${id} unrecoverable: oversized record (${file}, ${observedBytes} > ${RECOVERY_RECORD_MAX_BYTES} bytes)`);
+    this.name = "AgentRunRecoveryRefusal";
   }
 }
 
@@ -922,6 +943,69 @@ const readRecord = (filePath: string): AgentRunRecord | undefined => {
   }
 };
 
+/** Recovery discriminators share one bounded, no-follow descriptor reader.
+ * Inspect size before allocating/reading; an oversized file supplies no facts. */
+const readRecoveryJson = (file: string, id: string): unknown => {
+  let fd: number | undefined;
+  try {
+    const leaf = ownedStat(file);
+    if (!leaf?.isFile()) return undefined;
+    fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0));
+    const before = fs.fstatSync(fd);
+    if (!before.isFile() || before.nlink !== 1 || before.dev !== leaf.dev || before.ino !== leaf.ino ||
+        before.uid !== leaf.uid || before.mode !== leaf.mode ||
+        (process.getuid && before.uid !== process.getuid()) ||
+        !Number.isSafeInteger(before.size) || before.size < 0) return undefined;
+    if (before.size > RECOVERY_RECORD_MAX_BYTES) throw new AgentRunRecoveryRefusal(id, file, before.size);
+    // Ordinary 0644 worker records remain supported inside their private run root.
+    const bytes = Buffer.alloc(before.size);
+    for (let offset = 0; offset < bytes.length;) {
+      const read = fs.readSync(fd, bytes, offset, bytes.length - offset, offset);
+      if (read <= 0) return undefined;
+      offset += read;
+    }
+    const after = fs.fstatSync(fd);
+    if (after.size > RECOVERY_RECORD_MAX_BYTES) throw new AgentRunRecoveryRefusal(id, file, after.size);
+    const current = ownedStat(file);
+    if (!current?.isFile() || !after.isFile() || after.nlink !== 1 ||
+        before.dev !== after.dev || before.ino !== after.ino || before.uid !== after.uid ||
+        before.mode !== after.mode || before.nlink !== after.nlink || before.size !== after.size ||
+        before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs ||
+        current.dev !== after.dev || current.ino !== after.ino || current.uid !== after.uid ||
+        current.mode !== after.mode || current.nlink !== after.nlink || current.size !== after.size ||
+        current.mtimeMs !== after.mtimeMs || current.ctimeMs !== after.ctimeMs) return undefined;
+    return JSON.parse(bytes.toString("utf8")) as unknown;
+  } catch (error) {
+    if (error instanceof AgentRunRecoveryRefusal) throw error;
+    return undefined;
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+};
+
+const readRecoveryRecord = (file: string, id: string): AgentRunRecord | undefined => {
+  const parsed = readRecoveryJson(file, id);
+  try {
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
+    const record = parsed as AgentRunRecord;
+    return { ...normalizeRecordTasks(record), runner: isFabricRunnerId(record.runner) ? record.runner : "pi" };
+  } catch { return undefined; }
+};
+
+const recoveryHostedRecordMatches = (record: AgentRunRecord | undefined, id: string): record is AgentRunRecord =>
+  !!record?.hosted && record.id === id && (record.transport === undefined || record.transport === "hosted");
+
+const readRecoveryHostedState = (file: string, id: string): HostedRunState | undefined => {
+  const value = readRecoveryJson(file, id) as Partial<HostedRunState> | undefined;
+  return value?.version === 1 &&
+    typeof value.runner === "string" &&
+    typeof value.context === "object" &&
+    value.context !== null &&
+    typeof value.context.id === "string"
+    ? (value as HostedRunState)
+    : undefined;
+};
+
 /** Read only the exact manager publication proved by its original descriptor. */
 const readPrivateFileBytes = (
   filePath: string,
@@ -1071,6 +1155,8 @@ interface PreviousRun {
   summary: PreviousRunSummary;
   resultFile: string;
   fingerprint: PrivateFileFingerprint;
+  /** Only resolved resident recoveries join the live UI; ordinary archives stay omitted. */
+  recoveryUi?: AgentRunRecord;
   bytes: number;
 }
 
@@ -1278,8 +1364,34 @@ const runRootHasExitVeto = (root: string, prelaunchIds: ReadonlySet<string>): bo
   }
 };
 
+type PendingHostedRecoveryInfoCompatibility = {
+  readonly [K in Exclude<keyof AgentHandleInfo,
+    "id" | "name" | "runner" | "cwd" | "status" | "transport" | "residency"
+  >]?: never;
+};
+
+/** Observation only, before the resident host has adopted an existing run.
+ * `finishing` is the shared handle's non-running compatibility envelope, NOT a
+ * terminal verdict or proof of worker liveness. Only recovery.lastKnownStatus
+ * comes from the metadata; no locator, attach command or sender claim is exposed. */
+export type PendingHostedRecoveryInfo =
+  Readonly<Pick<AgentHandleInfo, "id" | "name" | "runner" | "cwd">> &
+  PendingHostedRecoveryInfoCompatibility & {
+    readonly status: "finishing";
+    readonly transport: "hosted";
+    readonly residency: "durable";
+    readonly recovery: Readonly<{ state: "pending"; lastKnownStatus: AgentHandleInfo["status"] }>;
+  };
+
+type AgentStatusProjection = AgentRunRecord | AgentHandleInfo | PendingHostedRecoveryInfo;
+/** Local query metadata; an array's named properties are not a JSON wire envelope. */
+export type AgentUiList = AgentStatusProjection[] & { readonly partial: boolean };
+
 export class AgentManager {
   readonly #runs = new Map<string, ManagedAgent>();
+  readonly #pendingHostedRecovery = new Map<string, PendingHostedRecoveryInfo>();
+  readonly #lookupPendingHostedRecovery: ((id: string) => PendingHostedRecoveryInfo | undefined) | undefined;
+  readonly #hostedRecoveryPending: (() => boolean) | undefined;
   readonly #queued = new Map<string, QueuedAgent>();
   readonly #queuedStarts = new Set<Promise<void>>();
   readonly #semaphore: AgentAdmission;
@@ -1340,7 +1452,11 @@ export class AgentManager {
   /** Results of runs a previous runtime of this session stopped at reload/shutdown. */
   readonly #previousRuns = new Map<string, PreviousRun>();
   #previousRunBytes = 0;
-  #enodevRuns: string[] | undefined;
+  #enodevRuns: Set<string> | undefined;
+  #enodevPreparation: Promise<void> | undefined;
+  readonly #enodevUnknownStarts = new Map<string, {
+    iterator: Iterator<string>; starts: number; alarm: boolean; unknown: boolean; done: boolean;
+  }>();
   readonly #enodevCommits = new Map<string, { directory: string; actorId: string; activationId: string }>();
   /** pi-fabric#939 round 3: runs THIS manager settled through #912's recovery (it removed their markers itself). */
   readonly #enodevSettledHere = new Set<string>();
@@ -1391,13 +1507,27 @@ export class AgentManager {
   #retentionSliceHint: { id: string; actorId: string | undefined } | undefined;
   #uiListRevision = 0;
   #uiListCache:
-    | { revision: number; value: Array<AgentRunRecord | AgentHandleInfo> }
+    | { revision: number; value: AgentUiList }
     | undefined;
   #closing = false;
   #releasePaused = false;
   #releaseEpoch = 0;
   #releaseCheckpoint: { epoch: number; disk: string; workers: unknown } | undefined;
   readonly #releaseWaiters = new Set<() => void>();
+  readonly #runnerRecoveryUnavailable = new Map<string, string>();
+
+  /** Only failed recovery records this guard; actual registration permits later
+   * explicit launches, never a fresh replacement for the recovered run. */
+  setRunnerRecoveryUnavailable(runner: string, reason: string | undefined): void {
+    if (reason && !getAgentRunner(runner)) this.#runnerRecoveryUnavailable.set(runner, reason);
+    else this.#runnerRecoveryUnavailable.delete(runner);
+  }
+
+  #requireRunner(runner: string): FabricRunnerAdapter {
+    const reason = this.#runnerRecoveryUnavailable.get(runner);
+    if (reason && !getAgentRunner(runner)) throw new AgentRunnerRecoveryUnavailableError(runner, reason);
+    return requireAgentRunner(runner);
+  }
 
   /** Admission hold only: existing workers and their finalizers retain custody. */
   pauseForRelease(_strict = false): void {
@@ -1449,6 +1579,10 @@ export class AgentManager {
       claudeBinary?: string;
       vedaBinary?: string;
       runRoot?: string;
+      /** Exact read-only metadata lookup, never discovery, import or adoption. */
+      lookupPendingHostedRecovery?: (id: string) => PendingHostedRecoveryInfo | undefined;
+      /** True until the owning host's complete discovery/adoption pass succeeds. */
+      hostedRecoveryPending?: () => boolean;
       /** Host-only, read-only projection of this manager's native admission pool. */
       admissionSnapshotPath?: string;
       fullCodeMode?: boolean;
@@ -1501,6 +1635,8 @@ export class AgentManager {
   ) {
     this.#semaphore = new AgentAdmission(config.maxConcurrent, Infinity, config.maxDepth);
     this.#admissionSnapshotPath = options.admissionSnapshotPath;
+    this.#lookupPendingHostedRecovery = options.lookupPendingHostedRecovery;
+    this.#hostedRecoveryPending = options.hostedRecoveryPending;
     this.#managedTempRoot = options.runRoot === undefined && process.env.PI_FABRIC_RUN_ROOT === undefined;
     this.#runRoot =
       options.runRoot ?? process.env.PI_FABRIC_RUN_ROOT ?? fs.mkdtempSync(path.join(fabricDataRoot(), "pi-fabric-runs-"));
@@ -1814,7 +1950,7 @@ export class AgentManager {
     if (choice !== undefined && choice !== "inherit" && choice !== "typescript" && choice !== "python") {
       throw new Error(`Invalid Fabric agent kernel: ${String(choice)}`);
     }
-    const runner = requireAgentRunner(request.runner ?? this.config.runner);
+    const runner = this.#requireRunner(request.runner ?? this.config.runner);
     if (!runner.capabilities.kernels || !(request.extensions ?? this.config.extensions)) {
       if (choice === "typescript" || choice === "python") {
         throw new Error(
@@ -2074,7 +2210,7 @@ export class AgentManager {
       throw new Error(`Invalid Fabric agent residency: ${String(request.residency)}`);
     }
     const runner = request.runner ?? this.config.runner;
-    const runnerAdapter = requireAgentRunner(runner);
+    const runnerAdapter = this.#requireRunner(runner);
     const capabilities = runnerAdapter.capabilities;
     const hostedAdapter = runnerAdapter.kind === "hosted" ? runnerAdapter : undefined;
     if (request.inferenceContext !== undefined && request.inferenceContext !== "full-history" && request.inferenceContext !== "activation") {
@@ -3408,6 +3544,7 @@ export class AgentManager {
       options.signal.addEventListener("abort", managed.abortHandler, { once: true });
     }
     this.#runs.set(managed.id, managed);
+    this.#pendingHostedRecovery.delete(managed.id);
     this.#invalidateUiList();
     return managed;
   }
@@ -3415,36 +3552,99 @@ export class AgentManager {
   /**
    * Re-attach hosted runs persisted under this run root, as after a resident
    * host restart. Recovery calls `attach`, never `start`: a run the adapter
-   * cannot vouch for settles failed with outcome "indeterminate".
+   * cannot vouch for settles failed with outcome "indeterminate". Resident
+   * startup supplies its durable hosted metadata IDs, not the historical run
+   * directory. Omitted candidates preserve explicit standalone recovery.
    */
-  async recoverHostedRuns(): Promise<string[]> {
-    let entries: string[];
-    try {
-      entries = fs.readdirSync(this.#runRoot);
-    } catch {
-      return [];
-    }
+  async recoverHostedRuns(candidates?: readonly string[], options: {
+    signal?: AbortSignal;
+    canRecover?: () => boolean;
+    shouldRecover?: (id: string) => boolean;
+    /** Owner-authenticated archive, never a worker status or an unproved disk result. */
+    savedResult?: (id: string) => AgentRunResult | undefined;
+    refusalReason?: (id: string) => string | undefined;
+    /** Per-run refusal; a consumer failure cannot interrupt the scan. */
+    onRefusal?: (refusal: AgentRunRecoveryRefusal) => void;
+    budgetMs?: number;
+    maxEntries?: number;
+  } = {}): Promise<string[]> {
+    const scan = { ...options, canRecover: () => !this.#closing && options.canRecover?.() !== false };
+    const check = () => assertRecoveryAllowed(scan);
+    check();
+    // Even an explicit list can contain thousands of non-hosted statuses. No synchronous prefix sweep.
+    await new Promise<void>(resolve => setImmediate(resolve));
+    check();
     const recovered: string[] = [];
-    for (const entry of entries) {
-      while (this.#releasePaused) await this.#waitForRelease();
-      if (this.#closing || this.#runs.has(entry) || !/^[0-9a-f]{32}$/.test(entry)) continue;
+    const slice = recoverySlice(options);
+    const reportRefusal = (refusal: AgentRunRecoveryRefusal): void => {
+      diagnostics.warn("src/agents/manager.ts", `[pi-fabric] hosted recovery ${refusal.id} ${refusal.code}: unrecoverable: oversized record; source kept (${refusal.file})`);
+      try { options.onRefusal?.(refusal); }
+      catch {
+        diagnostics.warn("src/agents/manager.ts", `[pi-fabric] hosted recovery ${refusal.id} refusal observer failed; recovery continues`);
+      }
+    };
+    const entries = candidates ?? recoveryRunDirectories(this.#runRoot, scan);
+    for await (const candidate of entries) {
+      const pause = slice();
+      if (pause) await pause;
+      check();
+      while (this.#releasePaused) { await this.#waitForRelease(options.signal); check(); }
+      check();
+      const entry = candidates === undefined ? path.basename(candidate) : candidate;
+      if (this.#runs.has(entry) || !/^[0-9a-f]{32}$/.test(entry)) continue;
+      if (options.shouldRecover?.(entry) === false) { this.setPendingHostedRecovery(entry, undefined); continue; }
+      if (this.#previousRuns.has(entry)) { this.setPendingHostedRecovery(entry, undefined); continue; }
       const runDirectory = path.join(this.#runRoot, entry);
       const statusFile = path.join(runDirectory, "status.json");
-      const record = readRecord(statusFile);
-      const state = readHostedRunState(path.join(runDirectory, HOSTED_STATE_FILE));
-      if (
-        !record?.hosted ||
-        !state ||
-        record.id !== entry ||
-        state.context.id !== entry ||
-        terminalStatuses.has(record.status)
-      ) {
+      const projection = this.#pendingHostedRecovery.get(entry);
+      // Validated metadata admits archive lookup even with missing/damaged
+      // worker files. Otherwise require the existing hosted record/state marker
+      // before asking the owner to read a potentially large saved payload.
+      let record: AgentRunRecord | undefined;
+      let state: HostedRunState | undefined;
+      const readWorkerState = () => {
+        const record = readRecoveryRecord(statusFile, entry);
+        // A native/mismatched status never opens hosted.json, even if it is huge.
+        const state = recoveryHostedRecordMatches(record, entry)
+          ? readRecoveryHostedState(path.join(runDirectory, HOSTED_STATE_FILE), entry)
+          : undefined;
+        return { record, state };
+      };
+      try {
+        if (!projection) ({ record, state } = readWorkerState());
+        const hostedCandidate = projection || (recoveryHostedRecordMatches(record, entry) && state?.context.id === entry);
+        // Owner archives win BEFORE worker reads for a validated projection,
+        // including missing, damaged or oversized worker files (P1-B).
+        const saved = hostedCandidate ? options.savedResult?.(entry) : undefined;
+        check();
+        if (options.shouldRecover?.(entry) === false) { this.setPendingHostedRecovery(entry, undefined); continue; }
+        if (saved && saved.id === entry && terminalStatuses.has(saved.status)) {
+          this.restorePreviousRuns([saved], { hostedRecovery: true });
+          continue;
+        }
+        if (projection) ({ record, state } = readWorkerState());
+      } catch (error) {
+        if (!(error instanceof AgentRunRecoveryRefusal)) throw error;
+        reportRefusal(error);
+        check();
+        const admitted = options.shouldRecover?.(entry) !== false;
+        check(); // Metadata revalidation and the observer may themselves lose the lease.
+        if (!admitted) { this.setPendingHostedRecovery(entry, undefined); continue; }
+        // Only owner-validated metadata can supply a terminal observation. This
+        // publication removes pending custody without overwriting worker bytes.
+        if (projection) this.#refuseHostedRecovery(entry, runDirectory, projection, error.message, true);
+        continue;
+      }
+      if (!recoveryHostedRecordMatches(record, entry) || !state || state.context.id !== entry || terminalStatuses.has(record.status)) {
+        const observation = projection ?? (recoveryHostedRecordMatches(record, entry) && state?.context.id === entry ? record : undefined);
+        if (observation) this.#refuseHostedRecovery(entry, runDirectory, observation,
+          options.refusalReason?.(entry) ?? "Hosted recovery has no authenticated saved terminal result or valid launch state; the run outcome is indeterminate");
         continue;
       }
       const adapter = getAgentRunner(state.runner);
-      let refusal = adapter?.kind !== "hosted"
+      let refusal = options.refusalReason?.(entry) ?? (adapter?.kind !== "hosted"
         ? `Hosted runner ${state.runner} is not registered in this process; the run outcome is indeterminate`
-        : undefined;
+        : undefined);
       // The persisted launch scope is re-validated; a damaged one never re-attaches unscoped.
       if (!refusal && state.context.scope !== undefined) {
         try {
@@ -3454,16 +3654,8 @@ export class AgentManager {
         }
       }
       if (refusal || adapter?.kind !== "hosted") {
-        const now = Date.now();
-        const { currentTool: _tool, blockedOn: _blocked, sleeping: _sleeping, ...rest } = record;
-        writeRecord(statusFile, {
-          ...rest,
-          status: "failed",
-          error: refusal!,
-          outcome: "indeterminate",
-          finishedAt: now,
-          updatedAt: now,
-        });
+        check();
+        this.#refuseHostedRecovery(entry, runDirectory, record, refusal!);
         continue;
       }
       let managed: ManagedAgent | undefined;
@@ -3479,13 +3671,83 @@ export class AgentManager {
         record,
         this.#hostedHooks(() => managed),
       );
+      if (options.shouldRecover?.(entry) === false) { this.setPendingHostedRecovery(entry, undefined); continue; }
+      check();
+      // Another recovery may have adopted while the directory cursor was suspended.
+      if (this.#runs.has(entry)) continue;
       managed = this.#adoptHosted(hosted, { release: () => {}, recovered: true });
-      await hosted.attach();
-      while (this.#releasePaused) await this.#waitForRelease();
-      void this.#monitor(managed, Math.max(0, state.context.deadlineAt - Date.now()));
+      try {
+        check();
+        await hosted.attach();
+        check();
+        while (this.#releasePaused) { await this.#waitForRelease(options.signal); check(); }
+      } finally {
+        // Adoption transfers custody even if attach or a later lifecycle gate fails.
+        void this.#monitor(managed, Math.max(0, state.context.deadlineAt - Date.now()));
+      }
       recovered.push(entry);
     }
+    // Metadata may survive a collected/missing run directory. A complete pass
+    // must resolve those admitted observations too, not leave a phantom pending
+    // target which a subsequent exact lookup can resurrect.
+    for (const [id, projection] of this.#pendingHostedRecovery) {
+      const pause = slice();
+      if (pause) await pause;
+      check();
+      if (options.shouldRecover?.(id) === false) { this.setPendingHostedRecovery(id, undefined); continue; }
+      const saved = options.savedResult?.(id);
+      check();
+      if (options.shouldRecover?.(id) === false) { this.setPendingHostedRecovery(id, undefined); continue; }
+      if (saved && saved.id === id && terminalStatuses.has(saved.status)) this.restorePreviousRuns([saved], { hostedRecovery: true });
+      else {
+        const directory = path.join(this.#runRoot, id);
+        let refusal: AgentRunRecoveryRefusal | undefined;
+        try {
+          const record = readRecoveryRecord(path.join(directory, "status.json"), id);
+          if (recoveryHostedRecordMatches(record, id)) readRecoveryHostedState(path.join(directory, HOSTED_STATE_FILE), id);
+        } catch (error) {
+          if (!(error instanceof AgentRunRecoveryRefusal)) throw error;
+          refusal = error;
+          reportRefusal(error);
+        }
+        check();
+        const admitted = options.shouldRecover?.(id) !== false;
+        check();
+        if (!admitted) { this.setPendingHostedRecovery(id, undefined); continue; }
+        this.#refuseHostedRecovery(id, directory, projection,
+          refusal?.message ?? options.refusalReason?.(id) ?? "Hosted recovery has no valid saved run; the run outcome is indeterminate",
+          refusal !== undefined);
+      }
+    }
+    check();
     return recovered;
+  }
+
+  #refuseHostedRecovery(id: string, directory: string, observation: Pick<AgentRunRecord, "name" | "runner" | "cwd">, reason: string, preserveStatus = false): void {
+    mkdirPrivate(directory, this.#trustRoot());
+    const now = Date.now();
+    // A refusal is a new manager verdict, not authentication of worker output,
+    // attribution, counters or partial text. Keep only the admitted display facts.
+    const result: AgentRunResult = { id, name: observation.name, runner: observation.runner, cwd: observation.cwd,
+      task: "", transport: "hosted", residency: "durable", status: "failed", outcome: "indeterminate", error: reason,
+      startedAt: now, updatedAt: now, finishedAt: now, turns: 0, toolCalls: 0, text: "",
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } };
+    const resultFile = path.join(directory, `manager-restored-result-${randomUUID()}.json`);
+    const fingerprint = writePrivateJsonAtomic(resultFile, result);
+    if (this.#onSettled) this.#stageArchive(directory, result, "settlement");
+    if (!preserveStatus) writeRecord(path.join(directory, "status.json"), result);
+    this.#rememberPreviousRun(result, resultFile, fingerprint, true);
+    if (this.#onSettled) {
+      try {
+        this.#onSettled(result);
+        this.#commitArchive(directory, result);
+      } catch (error) {
+        // Terminal observation is complete; publication is NOT. Keep its full
+        // durable archive and backing custody for the existing archive retry,
+        // without holding discovery/actors or repeatedly walking historical runs.
+        diagnostics.warn("src/agents/manager.ts", `[pi-fabric] hosted recovery ${id} terminal publication deferred; archive retained: ${String(error)}`);
+      }
+    }
   }
 
   /** Park or resume a hosted run whose runner declares `sleep`. */
@@ -3513,13 +3775,33 @@ export class AgentManager {
     onQueued?: (handle: AgentHandleInfo) => void,
     preparation?: AgentLaunchPreparationOptions,
   ): Promise<AgentRunResult> {
-    while (this.#releasePaused && !request.residentStartupProbe) await this.#waitForRelease(signal);
-    if (request.actorId && request.activationId && !signal?.aborted && (!authorize || authorize())) {
-      const stopped = await recoverDurableActorStop(this.#runRoot, request.actorId, request.activationId, this.#closeAbort.signal);
+    const recoveryOptions = {
+      ...(signal ? { signal } : {}),
+      canRecover: () => !this.#closing && (!authorize || authorize()),
+      beforeRecover: (): Promise<void> | undefined => {
+        if (!this.#releasePaused || request.residentStartupProbe) return undefined;
+        return (async () => {
+          while (this.#releasePaused && !request.residentStartupProbe) await this.#waitForRelease(signal);
+          assertRecoveryAllowed(recoveryOptions);
+        })();
+      },
+    };
+    const released = recoveryOptions.beforeRecover();
+    if (released) await released;
+    if (request.actorId && request.activationId && !this.#closing && !signal?.aborted && (!authorize || authorize())) {
+      let savedStopDirectory: string | undefined;
+      const stopped = await recoverDurableActorStop(this.#runRoot, request.actorId, request.activationId, this.#closeAbort.signal,
+        { ...recoveryOptions, onSavedAnswer: directory => { savedStopDirectory = directory; } });
+      const resumed = recoveryOptions.beforeRecover();
+      if (resumed) await resumed;
+      assertRecoveryAllowed(recoveryOptions);
       if (stopped) return stopped;
+      const recovered = await this.#recoverEnodevRun(request, signal, authorize, savedStopDirectory);
+      const releasedAgain = recoveryOptions.beforeRecover();
+      if (releasedAgain) await releasedAgain;
+      assertRecoveryAllowed(recoveryOptions);
+      if (recovered) return recovered;
     }
-    const recovered = this.#recoverEnodevRun(request, signal, authorize);
-    if (recovered) return recovered;
     const handle = await this.spawn(request, signal, authorize, undefined, onOutputPrincipalDowngrade, onSpawned, preparation);
     const queued = this.#queued.get(handle.id);
     if (queued && !queued.terminal && !queued.preparing) onQueued?.(this.#queuedInfo(queued));
@@ -3789,7 +4071,50 @@ export class AgentManager {
     }
   }
 
-  status(id: string): AgentRunRecord | AgentHandleInfo {
+  /** Host metadata discovery pushes only validated, allowlisted observations.
+   * This cache never enters #runs, owns a permit, or supplies a mutation target. */
+  setPendingHostedRecovery(id: string, projection: PendingHostedRecoveryInfo | undefined): void {
+    if (this.#runs.has(id) || this.#queued.has(id) || this.#previousRuns.has(id)) projection = undefined;
+    const previous = this.#pendingHostedRecovery.get(id);
+    if (!projection) {
+      if (this.#pendingHostedRecovery.delete(id)) this.#invalidateUiList();
+      return;
+    }
+    if (projection.id !== id) throw new Error("Hosted recovery projection ID mismatch");
+    if (previous && previous.name === projection.name && previous.runner === projection.runner && previous.cwd === projection.cwd &&
+        previous.recovery.lastKnownStatus === projection.recovery.lastKnownStatus) return;
+    this.#pendingHostedRecovery.set(id, Object.freeze({
+      id, name: projection.name, runner: projection.runner, cwd: projection.cwd,
+      status: "finishing", transport: "hosted", residency: "durable",
+      recovery: Object.freeze({ state: "pending", lastKnownStatus: projection.recovery.lastKnownStatus }),
+    }));
+    this.#invalidateUiList();
+  }
+
+  /** Called only when the owner discharges its complete discovery obligation. */
+  clearPendingHostedRecovery(): void {
+    if (!this.#pendingHostedRecovery.size) return;
+    this.#pendingHostedRecovery.clear();
+    this.#invalidateUiList();
+  }
+
+  #pendingHostedRecoveryInfo(id: string): PendingHostedRecoveryInfo | undefined {
+    // Revalidate the exact requested row even before the incremental cursor has
+    // reached it. A removed/foreign/unsafe row must not survive a cached hit.
+    if (this.#lookupPendingHostedRecovery && this.#hostedRecoveryPending?.() !== false) {
+      this.setPendingHostedRecovery(id, this.#lookupPendingHostedRecovery(id));
+    }
+    return this.#pendingHostedRecovery.get(id);
+  }
+
+  #pendingHostedRecoveryValues(): PendingHostedRecoveryInfo[] {
+    // UI/list queries use discovered observations only; never a metadata walk or
+    // one filesystem lookup per row. Real records always supersede observations.
+    return [...this.#pendingHostedRecovery.values()].filter(record =>
+      !this.#runs.has(record.id) && !this.#queued.has(record.id) && !this.#previousRuns.has(record.id));
+  }
+
+  status(id: string): AgentStatusProjection {
     const queued = this.#queued.get(id);
     if (queued) return queued.terminal ? structuredClone(queued.terminal) : this.#queuedInfo(queued);
     const previous = this.#previousRun(id);
@@ -3797,7 +4122,12 @@ export class AgentManager {
       this.#terminalNoticeOutbox.recover(path.dirname(this.#previousRuns.get(id)!.resultFile));
       return previous;
     }
-    const managed = this.#requireRun(id);
+    const managed = this.#runs.get(id);
+    if (!managed) {
+      const pending = this.#pendingHostedRecoveryInfo(id);
+      if (pending) return structuredClone(pending);
+      throw new Error(`Unknown Fabric agent: ${id}`);
+    }
     this.#observeFinalAnswer(managed);
     this.#routeTerminalNotices(managed);
     const record = this.#readResult(managed) ?? managed.latestRecord;
@@ -3825,19 +4155,23 @@ export class AgentManager {
     return result;
   }
 
-  list(): Array<AgentRunRecord | AgentHandleInfo> {
-    return [...this.#runs.keys(), ...this.#queued.keys()].map((id) => this.status(id));
+  list(): AgentStatusProjection[] {
+    return [...[...this.#runs.keys(), ...this.#queued.keys()].map((id) => this.status(id)),
+      ...[...this.#previousRuns.values()].flatMap(previous => previous.recoveryUi ? [this.status(previous.summary.id)] : []),
+      ...this.#pendingHostedRecoveryValues().map(record => structuredClone(record))];
   }
 
-  listForUi(): Array<AgentRunRecord | AgentHandleInfo> {
-    if (this.#uiListCache?.revision === this.#uiListRevision) {
+  listForUi(): AgentUiList {
+    const partial = this.#hostedRecoveryPending?.() ?? false;
+    if (this.#uiListCache?.revision === this.#uiListRevision && this.#uiListCache.value.partial === partial) {
       return this.#uiListCache.value;
     }
     const runs = [...this.#runs.values()];
     const active = runs.filter((managed) => !managed.settled);
     const settled = runs.filter((managed) => managed.settled);
     const listBudget = MAX_RETAINED_UI_BYTES - MAX_RETAINED_UI_SNAPSHOT_BYTES;
-    const selected = new Map<string, AgentRunRecord | AgentHandleInfo>();
+    const selected = new Map<string, AgentStatusProjection>();
+    const pending = this.#pendingHostedRecoveryValues();
     let bytes = 4;
     const projection = (managed: ManagedAgent): AgentRunRecord | AgentHandleInfo => {
       let record = managed.latestUiRecord;
@@ -3864,8 +4198,8 @@ export class AgentManager {
     }
     const queuedValue = [...this.#queued.values()].map(queued =>
       queued.terminal ? compactUiRecord(queued.terminal) : this.#queuedInfo(queued));
-    for (const record of queuedValue) bytes += uiPayloadBytes(record) + 2;
-    const settledCount = Math.max(0, MAX_RETAINED_UI_RUNS - active.length - queuedValue.length);
+    for (const record of [...queuedValue, ...pending]) bytes += uiPayloadBytes(record) + 2;
+    const settledCount = Math.max(0, MAX_RETAINED_UI_RUNS - active.length - queuedValue.length - pending.length);
     for (const managed of (settledCount > 0 ? settled.slice(-settledCount) : []).reverse()) {
       if (selected.size - active.length >= settledCount) break;
       const record = projection(managed);
@@ -3874,8 +4208,20 @@ export class AgentManager {
       selected.set(managed.id, record);
       bytes += size;
     }
-    const value = runs.flatMap(managed => selected.has(managed.id) ? [selected.get(managed.id)!] : []);
-    value.push(...queuedValue);
+    const resolved: AgentRunRecord[] = [];
+    for (const previous of [...this.#previousRuns.values()].reverse()) {
+      const record = previous.recoveryUi;
+      if (!record || selected.size + resolved.length + queuedValue.length + pending.length >= MAX_RETAINED_UI_RUNS) continue;
+      const size = uiPayloadBytes(record) + 2;
+      if (bytes + size > listBudget) continue;
+      resolved.push(record);
+      bytes += size;
+    }
+    // Local metadata must not change legacy array equality/enumeration. The
+    // assertion describes only the immutable property just installed here.
+    const value = Object.defineProperty(runs.flatMap(managed => selected.has(managed.id) ? [selected.get(managed.id)!] : []),
+      "partial", { value: partial, enumerable: false, writable: false, configurable: false }) as AgentUiList;
+    value.push(...queuedValue, ...pending, ...resolved);
     this.#pruneRetainedUiRecords();
     // An unusually large live/queued handle set remains queryable, but is not
     // retained as an over-budget UI-list cache.
@@ -3902,10 +4248,18 @@ export class AgentManager {
     return refs;
   }
 
+  /** A partial cursor protects via wildcard hints but must not admit resident
+   * collection. A completed wildcard still uses the collector's existing
+   * independent fresh checks; legacy callers retain their previous behavior. */
+  retentionReferencesReady(now = Date.now()): boolean {
+    return !retentionV2Enabled() || this.#referenceScan.current(this.#retentionGeneration(), now);
+  }
+
   // Windows scope cut: verbatim main 9387af87 implementation.
   #mainRetentionReferences(): Set<string> {
     const refs = new Set<string>();
     const protect = (id: string, actorId?: string) => { refs.add(id); if (actorId) refs.add(actorId); };
+    for (const previous of this.#previousRuns.values()) protect(previous.summary.id, previous.summary.actorId);
     for (const queued of this.#queued.values()) {
       if (!queued.terminal || queued.cleanupPending || hasUnresolvedWorker(path.join(this.#runRoot, queued.info.id))) {
         protect(queued.info.id, queued.info.actorId);
@@ -3956,7 +4310,7 @@ export class AgentManager {
 
   /** Archival never discharges a live manager's result/publication custody,
    * even if its saved status is terminal or its handle has settled. */
-  hasRunCustody(id: string): boolean { return this.#runs.has(id) || this.#queued.has(id); }
+  hasRunCustody(id: string): boolean { return this.#runs.has(id) || this.#queued.has(id) || this.#previousRuns.has(id); }
 
   #retentionGeneration(): string {
     return `${this.#runs.size}:${this.#queued.size}:${this.#retentionRevision}:${RetentionReferenceScan.directoryGeneration(this.#runRoot)}`;
@@ -3966,6 +4320,7 @@ export class AgentManager {
    * expiring an exchange, re-evaluate the exact writer/tree under a count/time
    * budget. In-place nested/status changes need no run-set mtime. */
   retentionCustodyVeto(id: string): boolean {
+    if (this.#previousRuns.has(id)) return true;
     if (!retentionV2Enabled()) return this.#mainRetentionReferences().has(id);
     const started = performance.now(), expired = () => performance.now() - started >= 2;
     const check = (runId: string): boolean => {
@@ -3984,6 +4339,9 @@ export class AgentManager {
     if (this.#runs.has(id) || this.#queued.has(id) || ownedStat(path.join(this.#runRoot, id))?.isDirectory()) return check(id);
     if (this.#retentionIndexUnsafe || !this.#referenceScan.current(this.#retentionGeneration())) return true;
     let count = 0;
+    for (const previous of this.#previousRuns.values()) {
+      if (++count > 64 || expired() || previous.summary.actorId === id) return true;
+    }
     // Admission can add an actor-owned handle after its portion of the
     // preparation cursor passed. Check current manager ownership, not only
     // historical actor hints; overflow/time uncertainty remains a veto.
@@ -4033,6 +4391,11 @@ export class AgentManager {
         if (attempt < 2) yield;
       }
       incomplete = true; retry(); return false;
+    }
+    for (const previous of this.#previousRuns.values()) {
+      index(previous.summary.id, previous.summary.actorId);
+      protect(previous.summary.id, previous.summary.actorId);
+      yield;
     }
     for (const queued of this.#queued.values()) {
       incomplete = false;
@@ -4101,7 +4464,9 @@ export class AgentManager {
               // passes; otherwise a delta inflates the actor overflow fence.
             }
           }
-          if (expired()) yield;
+          // Count cached/skipped entries too: a warm watermark must not turn
+          // maxEntries into an unbounded directory walk within one time slice.
+          yield;
         }
       } catch { protect("*"); return; }
       finally { try { directory?.closeSync(); } catch { protect("*"); } }
@@ -4110,7 +4475,7 @@ export class AgentManager {
       for (const [id, prepared] of this.#retentionWatermark) {
         index(id, prepared.actorId);
         if (prepared.held) protect(typeof prepared.actorId === "string" && /^[A-Za-z0-9_-]+$/.test(prepared.actorId) ? id : "*", prepared.actorId);
-        if (expired()) yield;
+        yield;
       }
       // A native cursor may miss additions behind its slot, including changes
       // during the suspended hint phase. Re-open for new identities only.
@@ -4164,7 +4529,7 @@ export class AgentManager {
   }
 
   /** Runs a previous runtime stopped; keep exact outcomes on disk, not in the index. */
-  restorePreviousRuns(results: AgentRunResult[]): void {
+  restorePreviousRuns(results: AgentRunResult[], options: { hostedRecovery?: boolean } = {}): void {
     for (const result of results) {
       if (this.#runs.has(result.id)) continue;
       // Session-carried results may outlive their original temporary run root.
@@ -4175,16 +4540,16 @@ export class AgentManager {
       const statusFile = path.join(directory, "status.json");
       // Publish BEFORE dropping any full in-memory result. A failed save throws,
       // leaving the old index/result intact and the caller's archive unconsumed.
-      writeJsonAtomic(statusFile, result, { space: 2, durable: true });
+      if (!options.hostedRecovery) writeJsonAtomic(statusFile, result, { space: 2, durable: true });
       // A restored archive is a new publication, not a replacement for any
       // original or restored generation still authenticated by another manager.
       const resultFile = path.join(directory, `manager-restored-result-${randomUUID()}.json`);
       const fingerprint = writePrivateJsonAtomic(resultFile, result);
-      this.#rememberPreviousRun(result, resultFile, fingerprint);
+      this.#rememberPreviousRun(result, resultFile, fingerprint, options.hostedRecovery);
     }
   }
 
-  #rememberPreviousRun(result: AgentRunResult, resultFile: string, fingerprint: PrivateFileFingerprint): void {
+  #rememberPreviousRun(result: AgentRunResult, resultFile: string, fingerprint: PrivateFileFingerprint, hostedRecovery = false): void {
     const summary: PreviousRunSummary = {
       id: detachedPreview(result.id, result.id.length),
       name: uiText(result.name, MAX_NAME_LENGTH),
@@ -4200,8 +4565,12 @@ export class AgentManager {
     this.#dropPreviousRun(result.id);
     // The result stays on disk; only this bounded summary, path and fixed proof
     // remain indexed in memory. Do not charge the retained result payload to heap.
-    const bytes = uiPayloadBytes(summary) + resultFile.length * 2 + PRIVATE_FILE_FINGERPRINT_BYTES;
-    this.#previousRuns.set(summary.id, { summary, resultFile, fingerprint, bytes });
+    const recoveryUi = hostedRecovery ? compactUiRecord(result) : undefined;
+    const bytes = uiPayloadBytes(summary) + resultFile.length * 2 + PRIVATE_FILE_FINGERPRINT_BYTES + (recoveryUi ? uiPayloadBytes(recoveryUi) : 0);
+    this.#previousRuns.set(summary.id, { summary, resultFile, fingerprint, bytes, ...(recoveryUi ? { recoveryUi } : {}) });
+    this.#pendingHostedRecovery.delete(result.id);
+    this.#retentionRevision++;
+    this.#invalidateUiList();
     this.#previousRunBytes += bytes;
     while (this.#previousRuns.size > MAX_RETAINED_RUN_HANDLES || this.#previousRunBytes > MAX_PREVIOUS_RUN_BYTES) {
       this.#forgetRunMetadata(this.#previousRuns.keys().next().value!);
@@ -4213,6 +4582,8 @@ export class AgentManager {
     if (!previous) return;
     this.#previousRunBytes -= previous.bytes;
     this.#previousRuns.delete(id);
+    this.#retentionRevision++;
+    this.#invalidateUiList();
   }
 
   #forgetRunMetadata(id: string): void {
@@ -4244,20 +4615,30 @@ export class AgentManager {
   // pi-fabric#912 round 3: the shortcut runs only for an authorized, unaborted request (the same gate spawn applies;
   // otherwise spawn refuses it and the marker is untouched), and it settles nothing: the actor commits after it
   // delivered the answer (commitEnodevRecovery). An uncommitted recovery keeps the marker and the answer.
-  #recoverEnodevRun(request: AgentRunRequest, signal?: AbortSignal, authorize?: () => boolean): AgentRunResult | undefined {
+  async #recoverEnodevRun(request: AgentRunRequest, signal?: AbortSignal, authorize?: () => boolean, freshStopDirectory?: string): Promise<AgentRunResult | undefined> {
     if (!request.actorId || !request.activationId) return undefined;
     // The receipt is Linux ENODEV evidence, but replay needs no Linux APIs:
     // peekEnodevRun still requires a provably dead worker on every platform.
-    if (signal?.aborted || (authorize && !authorize())) return undefined;
-    this.#enodevRuns ??= enodevUnresolvedRuns(this.#runRoot);
-    for (const directory of this.#enodevRuns) {
+    const options = { ...(signal ? { signal } : {}), canRecover: () => !this.#closing && (!authorize || authorize()) };
+    assertRecoveryAllowed(options);
+    await this.prepareEnodevRecovery();
+    assertRecoveryAllowed(options);
+    // A stop written after the once-only negative scan may carry a completed answer too.
+    if (freshStopDirectory) this.#enodevRuns!.add(freshStopDirectory);
+    const slice = recoverySlice();
+    for (const directory of this.#enodevRuns!) {
+      const pause = slice();
+      if (pause) await pause;
+      assertRecoveryAllowed(options);
+      while (this.#releasePaused && !request.residentStartupProbe) { await this.#waitForRelease(signal); assertRecoveryAllowed(options); }
+      assertRecoveryAllowed(options);
       const result = peekEnodevRun(directory, request.actorId, request.activationId);
       if (!result) continue;
       if (result.status === "stopped" || result.status === "timed_out") {
         const settled = settleEnodevRun(directory, request.actorId, request.activationId);
         if (settled) {
           this.#enodevSettledHere.add(result.id);
-          this.#enodevRuns = this.#enodevRuns.filter(other => other !== directory);
+          this.#enodevRuns!.delete(directory);
           const resultFile = path.join(directory, MANAGER_RESULT_FILE);
           const fingerprint = writePrivateJsonAtomic(resultFile, settled);
           this.#rememberPreviousRun(settled, resultFile, fingerprint);
@@ -4299,7 +4680,7 @@ export class AgentManager {
     if (!settleEnodevRun(pending.directory, pending.actorId, pending.activationId)) return false;
     this.#enodevSettledHere.add(runId);
     this.#enodevCommits.delete(runId);
-    this.#enodevRuns = (this.#enodevRuns ?? []).filter(other => other !== pending.directory);
+    this.#enodevRuns?.delete(pending.directory);
     this.#retentionRevision++;
     this.#releaseProvenGone(); // smarty-dev#9855: same step as the settle
     return true;
@@ -4310,15 +4691,30 @@ export class AgentManager {
    * restored queue) will never be claimed by a run request: settle it as lost once its worker is proven gone, so
    * retention can collect it. One log line per run.
    */
-  settleLostEnodevRuns(actorId: string, pending: ReadonlySet<string>): void {
+  async settleLostEnodevRuns(actorId: string, pending: ReadonlySet<string> | (() => ReadonlySet<string>),
+    canRecover?: () => boolean): Promise<void> {
     if (process.platform !== "linux") return;
-    this.#enodevRuns ??= enodevUnresolvedRuns(this.#runRoot);
-    for (const directory of this.#enodevRuns) {
-      const activationId = settleLostEnodevRun(directory, actorId, pending);
+    const options = { canRecover: () => !this.#closing && !this.#releasePaused && canRecover?.() !== false };
+    assertRecoveryAllowed(options);
+    await this.prepareEnodevRecovery();
+    assertRecoveryAllowed(options);
+    const slice = recoverySlice();
+    let protectedIds = typeof pending === "function" ? pending() : pending;
+    for (const directory of this.#enodevRuns!) {
+      const pause = slice();
+      if (pause) {
+        await pause;
+        assertRecoveryAllowed(options);
+        protectedIds = typeof pending === "function" ? pending() : pending;
+      }
+      assertRecoveryAllowed(options);
+      const activationId = settleLostEnodevRun(directory, actorId, protectedIds);
       if (activationId === undefined) continue;
       this.#enodevSettledHere.add(path.basename(directory));
-      this.#enodevRuns = this.#enodevRuns.filter(other => other !== directory);
+      this.#enodevRuns!.delete(directory);
       this.#retentionRevision++;
+      // Keep proof and permit release in the same synchronous step, including interrupted sweeps.
+      this.#releaseProvenGone();
       if (enodevDelivered(directory, path.basename(directory), activationId)) {
         diagnostics.warn("src/agents/manager.ts", `[pi-fabric] actor ${actorId}: run ${path.basename(directory)} settled as delivered: its activation ` +
           `${activationId} was delivered and acknowledged before a restart (ENODEV, smarty-dev#8935)`);
@@ -4327,14 +4723,48 @@ export class AgentManager {
       diagnostics.warn("src/agents/manager.ts", `[pi-fabric] actor ${actorId}: run ${path.basename(directory)} settled as lost: its activation ${activationId} ` +
         "is no longer pending and its worker exit was unconfirmed (ENODEV, smarty-dev#8935)");
     }
-    this.#releaseProvenGone(); // smarty-dev#9855: a run this settle proved gone frees its held permit in the same step
+    assertRecoveryAllowed(options);
+    this.#releaseProvenGone();
   }
 
-  /** pi-fabric#912: counts consecutive starts whose queue state for `actorId` was unknown in its ENODEV markers. */
-  countUnknownEnodevStarts(actorId: string, unknown: boolean): { starts: number; alarm: boolean } {
+  /** Shared first-use discovery; an observer's abort never cancels another actor's preparation. */
+  prepareEnodevRecovery(): Promise<void> {
+    if (!this.#enodevPreparation) {
+      const preparation = enodevUnresolvedRuns(this.#runRoot, { signal: this.#closeAbort.signal,
+        canRecover: () => !this.#closing }).then(directories => { this.#enodevRuns = directories; });
+      this.#enodevPreparation = preparation;
+      void preparation.catch(() => {
+        // An incomplete/error scan is never an empty-root proof; actual first use retries.
+        if (this.#enodevPreparation === preparation) this.#enodevPreparation = undefined;
+      });
+    }
+    return this.#enodevPreparation;
+  }
+
+  /** Once per host/actor, with a resumable cursor so interruption cannot increment a marker twice. */
+  async countUnknownEnodevStarts(actorId: string, unknown: boolean, canRecover?: () => boolean): Promise<{ starts: number; alarm: boolean }> {
     if (process.platform !== "linux") return { starts: 0, alarm: false };
-    this.#enodevRuns ??= enodevUnresolvedRuns(this.#runRoot);
-    return countUnknownEnodevStarts(this.#enodevRuns, actorId, unknown);
+    const options = { canRecover: () => !this.#closing && !this.#releasePaused && canRecover?.() !== false };
+    assertRecoveryAllowed(options);
+    await this.prepareEnodevRecovery();
+    assertRecoveryAllowed(options);
+    let progress = this.#enodevUnknownStarts.get(actorId);
+    if (!progress) {
+      progress = { iterator: this.#enodevRuns!.values(), starts: 0, alarm: false, unknown, done: false };
+      this.#enodevUnknownStarts.set(actorId, progress);
+    }
+    const slice = recoverySlice();
+    while (!progress.done) {
+      const pause = slice();
+      if (pause) await pause;
+      assertRecoveryAllowed(options);
+      const next = progress.iterator.next();
+      if (next.done) { progress.done = true; break; }
+      const count = countUnknownEnodevStarts([next.value], actorId, progress.unknown);
+      progress.starts = Math.max(progress.starts, count.starts);
+      progress.alarm ||= count.alarm;
+    }
+    return { starts: progress.starts, alarm: progress.alarm };
   }
 
   #previousRun(id: string): AgentRunResult | undefined {
@@ -7122,6 +7552,12 @@ export class AgentManager {
       const previous = this.#previousRuns.get(id)?.summary;
       if (previous) {
         throw new Error(`Fabric agent ${previous.name} (${id}) is ${previous.status}: ${previous.error ?? "no error"}; it has no running target`);
+      }
+      if (this.#pendingHostedRecoveryInfo(id)) {
+        // Existence observations cannot authorize delivery, stop or attach. This
+        // is deliberately not "Unknown": host routing must not fall through to
+        // another actor/owner while the exact hosted target is recovering.
+        throw new Error(`Fabric agent ${id} is pending hosted recovery; retry after adoption (no running target)`);
       }
       throw new Error(`Unknown Fabric agent: ${id}`);
     }

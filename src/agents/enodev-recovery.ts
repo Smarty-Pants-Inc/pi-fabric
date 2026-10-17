@@ -52,15 +52,68 @@ export const enodevWorkerGone = (record: Record<string, unknown>): boolean => {
   return birth !== undefined && current !== undefined && current !== birth;
 };
 
-/** Run dirs under `runRoot` marked with the ENODEV observation failure (a one-time scan per host). */
-export const enodevUnresolvedRuns = (runRoot: string): string[] => {
-  let names: string[];
-  try { names = fs.readdirSync(runRoot); } catch { return []; }
-  return names.filter(name => RUN_ID.test(name)).map(name => path.join(runRoot, name)).filter(directory => {
+/** Recovery is exhaustive, but no individual turn may walk the historical run root. */
+export interface RecoveryScanOptions {
+  signal?: AbortSignal;
+  canRecover?: () => boolean;
+  budgetMs?: number;
+  maxEntries?: number;
+  /** Actual actor use may wait for a release hold without cancelling shared discovery. */
+  beforeRecover?: () => Promise<void> | undefined;
+}
+
+export const assertRecoveryAllowed = (options: RecoveryScanOptions): void => {
+  if (options.signal?.aborted || options.canRecover?.() === false) throw new Error("Run recovery interrupted");
+};
+
+/** Count skipped entries too. Callers revalidate their own authority after an actual yield. */
+export const recoverySlice = (options: RecoveryScanOptions = {}): (() => Promise<void> | undefined) => {
+  let started = performance.now();
+  let entries = 0;
+  const budget = Math.max(1, options.budgetMs ?? 2);
+  const maximum = Math.max(1, options.maxEntries ?? 64);
+  return () => {
+    if (++entries < maximum && performance.now() - started < budget) return undefined;
+    return new Promise<void>(resolve => setImmediate(resolve)).then(() => { started = performance.now(); entries = 0; });
+  };
+};
+
+/** Fresh cursor, closed on success, interruption and error. Only a missing root proves an empty root. */
+export async function* recoveryRunDirectories(runRoot: string, options: RecoveryScanOptions = {}): AsyncGenerator<string> {
+  assertRecoveryAllowed(options);
+  let cursor: fs.Dir;
+  try { cursor = await fs.promises.opendir(runRoot); }
+  catch (error) {
+    assertRecoveryAllowed(options);
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  }
+  try {
+    assertRecoveryAllowed(options);
+    const slice = recoverySlice(options);
+    for (;;) {
+      const entry = await cursor.read();
+      assertRecoveryAllowed(options);
+      if (!entry) return;
+      if (RUN_ID.test(entry.name)) yield path.join(runRoot, entry.name);
+      const pause = slice();
+      if (pause) await pause;
+      assertRecoveryAllowed(options);
+    }
+  } finally { await cursor.close(); }
+}
+
+/** Candidate discovery is lazy and shared by the manager, never a durable-stop absence cache. */
+export const enodevUnresolvedRuns = async (runRoot: string, options: RecoveryScanOptions = {}): Promise<Set<string>> => {
+  const directories = new Set<string>();
+  for await (const directory of recoveryRunDirectories(runRoot, options)) {
+    assertRecoveryAllowed(options);
     const marker = readJson(path.join(directory, UNRESOLVED_WORKER_FILE));
-    return (typeof marker?.reason === "string" && marker.reason.startsWith(ENODEV_UNRESOLVED_REASON)) ||
-      readRunStopIntent(directory, readJson(path.join(directory, "status.json"))) !== undefined;
-  });
+    if ((typeof marker?.reason === "string" && marker.reason.startsWith(ENODEV_UNRESOLVED_REASON)) ||
+      readRunStopIntent(directory, readJson(path.join(directory, "status.json"))) !== undefined) directories.add(directory);
+  }
+  assertRecoveryAllowed(options);
+  return directories;
 };
 
 /**
@@ -147,12 +200,19 @@ const waitForStoppedWorker = (directory: string, currentRecord: () => Record<str
 
 /** Recover explicit stops before requiring ENODEV evidence: stop intent is written before transport.stop(). */
 export const recoverDurableActorStop = async (runRoot: string, actorId: string, activationId: string,
-  closeSignal: AbortSignal): Promise<AgentRunResult | undefined> => {
-  let directories: string[];
-  try { directories = fs.readdirSync(runRoot).map(name => path.join(runRoot, name)); } catch { return undefined; }
-  for (const directory of directories) {
+  closeSignal: AbortSignal, options: RecoveryScanOptions & { onSavedAnswer?: (directory: string) => void } = {}): Promise<AgentRunResult | undefined> => {
+  const scan = { ...options, canRecover: () => !closeSignal.aborted && options.canRecover?.() !== false };
+  let candidate: {
+    directory: string; statusFile: string; intent: NonNullable<ReturnType<typeof readRunStopIntent>>;
+    matches: (record: Record<string, unknown> | undefined) => record is Record<string, unknown>;
+    currentRecord: () => Record<string, unknown>;
+  } | undefined;
+  for await (const directory of recoveryRunDirectories(runRoot, scan)) {
+    const released = options.beforeRecover?.();
+    if (released) await released;
+    assertRecoveryAllowed(scan);
     const id = path.basename(directory);
-    if (!RUN_ID.test(id) || activationOf(directory) !== activationId) continue;
+    if (activationOf(directory) !== activationId) continue;
     const statusFile = path.join(directory, "status.json");
     const status = readJson(statusFile);
     const intent = readRunStopIntent(directory, status);
@@ -173,31 +233,44 @@ export const recoverDurableActorStop = async (runRoot: string, actorId: string, 
       // back to a superseded attempt's status/pid to discharge that custody.
       return matches(latestSnapshot) ? latestSnapshot : matches(latestStatus) ? latestStatus : fallback;
     };
-    let record = await waitForStoppedWorker(directory, currentRecord, closeSignal);
-    const latest = readJson(statusFile);
-    if (matches(latest)) record = latest;
-    // Restore the process record needed by the existing completion delivery/ack
-    // path, without consuming or changing its immutable settlement receipt.
-    if (!latest) writeJsonAtomic(statusFile, record, { durable: true });
-    // Completion wins even without ENODEV. Reuse the existing delivery/queue-ack
-    // protocol below rather than overwriting the receipt or settling before delivery.
-    if (savedEnodevAnswer(directory) !== undefined) return undefined;
-    const recoveredIntent = readRunStopIntent(directory, record) ?? intent;
-    if (record.status !== "running" && record.status !== "queued") {
-      if (!["completed", "failed", "stopped", "timed_out"].includes(String(record.status))) continue;
-      const outcome = { ...record, stopIntent: recoveredIntent } as unknown as AgentRunResult;
-      writeJsonAtomic(path.join(directory, "status.json"), outcome, { durable: true });
-      if (outcome.status === "stopped" || outcome.status === "timed_out") recoveredDurableStops.add(outcome);
-      return outcome;
-    }
-    const outcome = { ...record, ...uncleanReceipt(record), status: recoveredIntent.reason === "explicit" ? "stopped" : "timed_out",
-      error: recoveredIntent.reason === "explicit" ? "Agent stopped" : "Agent timed out",
-      stopIntent: recoveredIntent, finishedAt: Date.now() } as unknown as AgentRunResult;
+    candidate = { directory, statusFile, intent, matches, currentRecord };
+    break; // Close the root cursor BEFORE an identity join that may intentionally stay pending at host close.
+  }
+  const released = options.beforeRecover?.();
+  if (released) await released;
+  assertRecoveryAllowed(scan);
+  if (!candidate) return undefined;
+  const { directory, statusFile, intent, matches, currentRecord } = candidate;
+  let record = await waitForStoppedWorker(directory, currentRecord, closeSignal);
+  const resumed = options.beforeRecover?.();
+  if (resumed) await resumed;
+  assertRecoveryAllowed(scan);
+  const latest = readJson(statusFile);
+  if (matches(latest)) record = latest;
+  // Restore the process record needed by the existing completion delivery/ack
+  // path, without consuming or changing its immutable settlement receipt.
+  if (!latest) writeJsonAtomic(statusFile, record, { durable: true });
+  // Completion wins even without ENODEV. Reuse the existing delivery/queue-ack
+  // protocol below rather than overwriting the receipt or settling before delivery.
+  if (savedEnodevAnswer(directory) !== undefined) {
+    options.onSavedAnswer?.(directory);
+    return undefined;
+  }
+  const recoveredIntent = readRunStopIntent(directory, record) ?? intent;
+  if (record.status !== "running" && record.status !== "queued") {
+    // A corrupt terminal status is not permission to run past durable stop custody.
+    if (!["completed", "failed", "stopped", "timed_out"].includes(String(record.status))) throw new Error("Durable stop status is indeterminate");
+    const outcome = { ...record, stopIntent: recoveredIntent } as unknown as AgentRunResult;
     writeJsonAtomic(path.join(directory, "status.json"), outcome, { durable: true });
-    recoveredDurableStops.add(outcome);
+    if (outcome.status === "stopped" || outcome.status === "timed_out") recoveredDurableStops.add(outcome);
     return outcome;
   }
-  return undefined;
+  const outcome = { ...record, ...uncleanReceipt(record), status: recoveredIntent.reason === "explicit" ? "stopped" : "timed_out",
+    error: recoveredIntent.reason === "explicit" ? "Agent stopped" : "Agent timed out",
+    stopIntent: recoveredIntent, finishedAt: Date.now() } as unknown as AgentRunResult;
+  writeJsonAtomic(path.join(directory, "status.json"), outcome, { durable: true });
+  recoveredDurableStops.add(outcome);
+  return outcome;
 };
 
 interface EnodevRun { id: string; statusFile: string; record: Record<string, unknown>; activationId: string; text?: string }

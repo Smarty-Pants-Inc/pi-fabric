@@ -114,6 +114,11 @@ interface RootInboxState {
   acked?: Array<[string, number]>;
 }
 
+/** Cursor-only progress must not force a receipt save; failed receipt writes must stay dirty. */
+const receiptSnapshot = (state: Partial<RootInboxState> | undefined): string => JSON.stringify([
+  state?.delivered, state?.deliveredAt, state?.fallbacks, state?.fallbackAt, state?.fallbackThrough,
+]);
+
 const sequenceOf = (value: unknown): number =>
   typeof value === "number" && Number.isSafeInteger(value) ? value : Number.NEGATIVE_INFINITY;
 const parseAcks = (value: unknown): Array<[string, number]> => Array.isArray(value)
@@ -124,6 +129,7 @@ const parseAcks = (value: unknown): Array<[string, number]> => Array.isArray(val
 export class RootInbox {
   #state: RootInboxState | undefined;
   #saved: string | undefined;
+  #savedReceipts: string | undefined;
   #savedAt = 0;
   #wokeAt = Number.NEGATIVE_INFINITY;
   #dueAt = Number.POSITIVE_INFINITY;
@@ -171,7 +177,7 @@ export class RootInbox {
   async #next(session: RootInboxSession, options: RootInboxReconcileOptions, priority: boolean): Promise<RootInboxBatch> {
     const state = this.#load();
     let receiptsChanged = this.#trimReceipts();
-    receiptsChanged = JSON.stringify(state) !== this.#saved || receiptsChanged;
+    receiptsChanged = receiptSnapshot(state) !== this.#savedReceipts || receiptsChanged;
     // Canonical history without a finite timestamp is exact-replay evidence only; do not
     // renew its ambiguous key/ref claim at read time.
     receiptsChanged = this.#remember(session.delivered ?? [], session.deliveredAt, true) || receiptsChanged;
@@ -743,6 +749,7 @@ export class RootInbox {
       this.#state.fallbackThrough = value.fallbackThrough;
     }
     this.#saved = saved ? JSON.stringify(value) : undefined;
+    this.#savedReceipts = saved ? receiptSnapshot(value) : undefined;
     this.#trimReceipts();
     this.#savedAt = saved ? this.#now() : 0;
     return this.#state;
@@ -754,8 +761,10 @@ export class RootInbox {
     const text = JSON.stringify(this.#state);
     if (text === this.#saved) return;
     if (!now && this.#now() - this.#savedAt < SAVE_INTERVAL_MS) return;
+    const receipts = receiptSnapshot(this.#state);
     await this.mesh.put({ key: this.key, value: JSON.parse(text) as RootInboxState, identity: this.identity });
     this.#saved = text;
+    this.#savedReceipts = receipts;
     this.#savedAt = this.#now();
   }
 

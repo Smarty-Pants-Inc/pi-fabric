@@ -14,7 +14,8 @@ import {
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as deliveryOutcomes from "../src/mesh/delivery-outcomes.js";
-import { FOLLOW_UP_LIMITS, MainAgentController } from "../src/main-agent.js";
+import * as atomicWrite from "../src/core/atomic-write.js";
+import { FOLLOW_UP_LIMITS, MAIN_DELIVERY_OUTCOME_RETRY_LIMIT, MainAgentController } from "../src/main-agent.js";
 
 // Review round 2 on pi-fabric#160 (finding 1, security S1): Pi's sendMessage returns void and may
 // only queue the message (streaming, prompt preflight, a settle), or fail asynchronously. A
@@ -75,6 +76,9 @@ describe("Main delivery outcome evidence", () => {
     return fs.existsSync(directory) ? fs.readdirSync(directory).flatMap(file =>
       fs.readFileSync(path.join(directory, file), "utf8").trim().split("\n").map(line => JSON.parse(line))) : [];
   };
+  const deadLetters = (journal: string) => fs.readdirSync(path.dirname(journal))
+    .filter(file => /^main-delivery-outcome-dead-letter-[0-9a-f]{32}\.json$/.test(file))
+    .map(file => ({ file, path: path.join(path.dirname(journal), file), value: JSON.parse(fs.readFileSync(path.join(path.dirname(journal), file), "utf8")) }));
   it.each(["steer", "followUp"] as const)("records %s only after receiver consumption, never on ACK", delivery => {
     const journal = journalPath(); const h = fakePi(); const entries: unknown[] = []; const context = busy(entries, true);
     const main = new MainAgentController(h.pi, "session:root", true, "/tmp/project", "root");
@@ -192,6 +196,178 @@ describe("Main delivery outcome evidence", () => {
     } finally {
       if (!restored) append.mockRestore();
     }
+  });
+
+  it("exhausts bounded outcome retries into a private truthful dead-letter without appending again", () => {
+    const journal = journalPath(); const h = fakePi(); const entries: unknown[] = []; const context = busy(entries, true);
+    const main = new MainAgentController(h.pi, "session:root", true, "/tmp/project", "root");
+    main.attachFollowUpDrain(context, 0, journal);
+    const send = { eventId: "cap-send", to: main.id, from: actor.id, mode: "steer" as const };
+    const append = vi.spyOn(deliveryOutcomes, "appendDeliveryOutcome").mockImplementation(() => {
+      throw Object.assign(new Error("outcome sink unavailable"), { code: "EIO" });
+    });
+    try {
+      main.deliverAgent({ from: actor, message: "private payload", delivery: "steer", deliveryId: "legacy/\u0000/arbitrary", outcomeSend: send });
+      entries.push(persisted(h.sent[0]!));
+      main.confirmInbox(); // initial append is not part of the retry budget
+      for (let attempt = 0; attempt < MAIN_DELIVERY_OUTCOME_RETRY_LIMIT; attempt++) main.confirmInbox();
+      expect(append).toHaveBeenCalledTimes(1 + MAIN_DELIVERY_OUTCOME_RETRY_LIMIT);
+      const letters = deadLetters(journal);
+      expect(letters).toHaveLength(1);
+      expect(letters[0]!.value).toMatchObject({
+        version: 1, kind: "main-delivery-outcome-dead-letter", native: "delivered", bookkeeping: "unknown",
+        attempts: MAIN_DELIVERY_OUTCOME_RETRY_LIMIT,
+        carrier: { id: expect.any(String), deliveryId: "legacy/\u0000/arbitrary" }, sends: [send],
+      });
+      expect(letters[0]!.value.reason).toBe("native carrier delivered; delivery outcome bookkeeping unknown; retry budget of 8 exhausted");
+      expect(JSON.stringify(letters[0]!.value)).not.toContain("private payload");
+      expect(fs.statSync(letters[0]!.path).mode & 0o777).toBe(0o600);
+      expect(fs.existsSync(journal)).toBe(false);
+      main.confirmInbox();
+      expect(append).toHaveBeenCalledTimes(1 + MAIN_DELIVERY_OUTCOME_RETRY_LIMIT);
+    } finally { append.mockRestore(); main.closeFollowUpDrain(); }
+  });
+
+  it("recovers before the retry cap without writing a dead-letter", () => {
+    const journal = journalPath(); const h = fakePi(); const entries: unknown[] = []; const context = busy(entries, true);
+    const main = new MainAgentController(h.pi, "session:root", true, "/tmp/project", "root");
+    main.attachFollowUpDrain(context, 0, journal);
+    const send = { eventId: "recover-send", to: main.id, from: actor.id, mode: "steer" as const };
+    const original = deliveryOutcomes.appendDeliveryOutcome;
+    let failures = 2;
+    const append = vi.spyOn(deliveryOutcomes, "appendDeliveryOutcome").mockImplementation((...args) => {
+      if (failures-- > 0) throw Object.assign(new Error("EIO"), { code: "EIO" });
+      return original(...args);
+    });
+    try {
+      main.deliverAgent({ from: actor, message: "recover", delivery: "steer", deliveryId: "recover-id", outcomeSend: send });
+      entries.push(persisted(h.sent[0]!));
+      main.confirmInbox();
+      main.confirmInbox();
+      main.confirmInbox();
+      expect(append.mock.calls.length).toBe(3);
+      expect(outcomes(journal)).toEqual([{ ...send, outcome: "delivered", reason: "consumed by Main as itself", at: expect.any(Number) }]);
+      expect(deadLetters(journal)).toHaveLength(0);
+    } finally { append.mockRestore(); main.closeFollowUpDrain(); }
+  });
+
+  it("retains the persisted retry budget across reload without replaying the native carrier", () => {
+    const journal = journalPath(); const entries: unknown[] = []; const first = fakePi();
+    const main = new MainAgentController(first.pi, "session:root", true, "/tmp/project", "root");
+    main.attachFollowUpDrain(busy(entries, true), 0, journal);
+    const append = vi.spyOn(deliveryOutcomes, "appendDeliveryOutcome").mockImplementation(() => { throw new Error("EIO"); });
+    try {
+      main.deliverAgent({ from: actor, message: "once", delivery: "steer", deliveryId: "reload-cap", outcomeSend: {
+        eventId: "reload-cap-send", to: main.id, from: actor.id, mode: "steer",
+      } });
+      entries.push(persisted(first.sent[0]!));
+      main.confirmInbox();
+      main.confirmInbox();
+      main.confirmInbox();
+      expect(JSON.parse(fs.readFileSync(journal, "utf8")).items[0].outcomeRetryAttempts).toBe(2);
+      main.closeFollowUpDrain();
+      const second = fakePi();
+      const restarted = new MainAgentController(second.pi, "session:root", true, "/tmp/project", "root");
+      restarted.attachFollowUpDrain(busy(entries, true), 0, journal);
+      expect(second.sent).toHaveLength(0);
+      expect(JSON.parse(fs.readFileSync(journal, "utf8")).items[0].outcomeRetryAttempts).toBe(3);
+    } finally { append.mockRestore(); main.closeFollowUpDrain(); }
+  });
+
+  it("does not resurrect an exhausted carrier from another item's durable retry reservation after a crash", () => {
+    const journal = journalPath(); const entries: unknown[] = []; const first = fakePi();
+    const main = new MainAgentController(first.pi, "session:root", true, "/tmp/project", "root");
+    const controllers = [main];
+    main.attachFollowUpDrain(busy(entries, true), 0, journal);
+    const originalAppend = deliveryOutcomes.appendDeliveryOutcome;
+    const append = vi.spyOn(deliveryOutcomes, "appendDeliveryOutcome").mockImplementation(() => { throw new Error("EIO"); });
+    const originalWrite = atomicWrite.writeFileAtomic;
+    let reservationSnapshot: string | undefined;
+    const write = vi.spyOn(atomicWrite, "writeFileAtomic").mockImplementation((file, contents, options) => {
+      originalWrite(file, contents, options);
+      if (String(file) === journal && reservationSnapshot === undefined) {
+        // Read the actual bytes only AFTER the real atomic rename and durability barriers.
+        const bytes = fs.readFileSync(journal, "utf8");
+        if (JSON.parse(bytes).items.some((item: { deliveryId?: string; outcomeRetryAttempts?: number }) =>
+          item.deliveryId === "retryable-B" && item.outcomeRetryAttempts === 1)) reservationSnapshot = bytes;
+      }
+    });
+    try {
+      for (const eventId of ["exhausted-A", "retryable-B"]) {
+        main.deliverAgent({ from: actor, message: eventId, delivery: "steer", deliveryId: eventId, outcomeSend: {
+          eventId, to: main.id, from: actor.id, mode: "steer",
+        } });
+      }
+      entries.push(...first.sent.map(persisted));
+      main.confirmInbox();
+      main.closeFollowUpDrain();
+      // Seed only the exact legacy retry counters; retain the real admitted carrier IDs.
+      const fixture = JSON.parse(fs.readFileSync(journal, "utf8"));
+      fixture.items[0].outcomeRetryAttempts = MAIN_DELIVERY_OUTCOME_RETRY_LIMIT;
+      fixture.items[1].outcomeRetryAttempts = 0;
+      fs.writeFileSync(journal, JSON.stringify(fixture));
+      append.mockClear();
+      const second = fakePi();
+      const resumed = new MainAgentController(second.pi, "session:root", true, "/tmp/project", "root");
+      controllers.push(resumed);
+      resumed.attachFollowUpDrain(busy(entries, true), 0, journal);
+      expect(append.mock.calls.map(call => call[1].eventId)).toEqual(["retryable-B"]);
+      expect(deadLetters(journal).map(letter => letter.value.carrier.deliveryId)).toEqual(["exhausted-A"]);
+      expect(reservationSnapshot).toBeDefined();
+      resumed.closeFollowUpDrain();
+      // Discard all later saves: restart from the frozen pre-append reservation crash point.
+      fs.writeFileSync(journal, reservationSnapshot!);
+      append.mockClear();
+      append.mockImplementation(originalAppend);
+      const third = fakePi();
+      const restarted = new MainAgentController(third.pi, "session:root", true, "/tmp/project", "root");
+      controllers.push(restarted);
+      restarted.attachFollowUpDrain(busy(entries, true), 0, journal);
+      restarted.confirmInbox();
+      expect(append.mock.calls.map(call => call[1].eventId)).toEqual(["retryable-B"]);
+      expect(outcomes(journal).map(row => [row.eventId, row.outcome])).toEqual([["retryable-B", "delivered"]]);
+      expect(first.sent).toHaveLength(2);
+      expect(second.sent).toHaveLength(0);
+      expect(third.sent).toHaveLength(0);
+      expect(entries).toHaveLength(2);
+      expect(JSON.parse(reservationSnapshot!).items.map((item: { deliveryId: string; outcomeRetryAttempts: number }) =>
+        [item.deliveryId, item.outcomeRetryAttempts])).toEqual([["retryable-B", 1]]);
+      expect(fs.existsSync(journal)).toBe(false);
+    } finally {
+      write.mockRestore(); append.mockRestore();
+      for (const controller of controllers) controller.closeFollowUpDrain();
+    }
+  });
+
+  it("keeps the journal and forbids extra outcome appends when dead-letter durability fails", () => {
+    const journal = journalPath(); const h = fakePi(); const entries: unknown[] = []; const context = busy(entries, true);
+    const main = new MainAgentController(h.pi, "session:root", true, "/tmp/project", "root");
+    main.attachFollowUpDrain(context, 0, journal);
+    const append = vi.spyOn(deliveryOutcomes, "appendDeliveryOutcome").mockImplementation(() => { throw new Error("EIO"); });
+    const originalWrite = atomicWrite.writeFileAtomic;
+    let failDeadLetter = true;
+    const write = vi.spyOn(atomicWrite, "writeFileAtomic").mockImplementation((file, contents, options) => {
+      if (String(file).includes("main-delivery-outcome-dead-letter-") && failDeadLetter) {
+        failDeadLetter = false;
+        throw new Error("dead-letter barrier unavailable");
+      }
+      return originalWrite(file, contents, options);
+    });
+    try {
+      main.deliverAgent({ from: actor, message: "once", delivery: "steer", deliveryId: "dead-letter-retry", outcomeSend: {
+        eventId: "dead-letter-send", to: main.id, from: actor.id, mode: "steer",
+      } });
+      entries.push(persisted(h.sent[0]!));
+      main.confirmInbox();
+      for (let attempt = 0; attempt < MAIN_DELIVERY_OUTCOME_RETRY_LIMIT; attempt++) main.confirmInbox();
+      expect(append).toHaveBeenCalledTimes(1 + MAIN_DELIVERY_OUTCOME_RETRY_LIMIT);
+      expect(fs.readFileSync(journal, "utf8")).toContain('"outcomeRetryAttempts":8');
+      expect(deadLetters(journal)).toHaveLength(0);
+      main.confirmInbox();
+      expect(append).toHaveBeenCalledTimes(1 + MAIN_DELIVERY_OUTCOME_RETRY_LIMIT);
+      expect(deadLetters(journal)).toHaveLength(1);
+      expect(fs.existsSync(journal)).toBe(false);
+    } finally { write.mockRestore(); append.mockRestore(); main.closeFollowUpDrain(); }
   });
 });
 

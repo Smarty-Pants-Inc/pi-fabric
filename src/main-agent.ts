@@ -1,6 +1,6 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { diagnostics, notifyDiagnostic, notifyPrincipalDiagnosticOnce, resetPrincipalDiagnosticTurn } from "./core/diagnostics.js";
-import { appendDeliveryOutcome, type DeliverySend, type DeliveryOutcome } from "./mesh/delivery-outcomes.js";
+import { appendDeliveryOutcome, deliverySend, type DeliverySend, type DeliveryOutcome } from "./mesh/delivery-outcomes.js";
 import type { AgentFollowUpRunningWarning } from "./agents/types.js";
 import fs from "node:fs";
 import path from "node:path";
@@ -332,6 +332,8 @@ export interface HeldAgentMessage {
   supersedes?: string[];
   /** Native admission is durable; retain this journal item only to retry outcome append. */
   outcomePending?: true;
+  /** Persisted retry reservations; the initial outcome append is not counted here. */
+  outcomeRetryAttempts?: number;
   /** Handed to Pi's queue; it may still be there after a reload. Unset while Fabric holds it. */
   handed?: true;
   /**
@@ -386,6 +388,10 @@ type SessionEntryLike = { id?: unknown; parentId?: unknown; type?: string; custo
 
 /** How many consumed delivery ids Main remembers beside its journal, newest last. */
 const CONSUMED_DELIVERIES_MAX = 2000;
+/** Outcome bookkeeping is bounded separately from the initial native admission. */
+export const MAIN_DELIVERY_OUTCOME_RETRY_LIMIT = 8;
+const OUTCOME_DEAD_LETTER_REASON =
+  `native carrier delivered; delivery outcome bookkeeping unknown; retry budget of ${MAIN_DELIVERY_OUTCOME_RETRY_LIMIT} exhausted`;
 const deliveryKey = (deliveryId: string): string => `delivery:${deliveryId}`;
 
 type PersistedProviderState = {
@@ -1231,24 +1237,110 @@ export class MainAgentController implements FabricMainAgentTarget {
 
   #queueOutcomeRetry(item: HeldAgentMessage): void {
     item.outcomePending = true;
+    // Legacy journals have no counter. Zero means no retry append has been attempted yet;
+    // the initial post-admission append is deliberately outside this budget.
+    item.outcomeRetryAttempts ??= 0;
     if (!this.#outcomePending.includes(item)) this.#outcomePending.push(item);
+  }
+
+  #outcomeDeadLetterPath(item: HeldAgentMessage): string {
+    // Never place an arbitrary legacy item.id in a filename. Include the journal path so two
+    // roots sharing a directory cannot alias one another's private record.
+    const key = createHash("sha256").update(JSON.stringify([this.#journal, item.id, item.deliveryId ?? null])).digest("hex").slice(0, 32);
+    return path.join(path.dirname(this.#journal!), `main-delivery-outcome-dead-letter-${key}.json`);
+  }
+
+  /** Persist a private, allowlisted record after outcome bookkeeping is exhausted. */
+  #writeOutcomeDeadLetter(item: HeldAgentMessage): boolean {
+    if (!this.#journal) return false;
+    const sends = [item.outcomeSend, ...(item.supersededSends ?? [])]
+      .map((send) => deliverySend(send))
+      .filter((send): send is DeliverySend => send !== undefined);
+    const letter = {
+      version: 1,
+      kind: "main-delivery-outcome-dead-letter",
+      native: "delivered",
+      bookkeeping: "unknown",
+      reason: OUTCOME_DEAD_LETTER_REASON,
+      carrier: { id: item.id, ...(item.deliveryId === undefined ? {} : { deliveryId: item.deliveryId }) },
+      sends,
+      attempts: Math.min(item.outcomeRetryAttempts ?? MAIN_DELIVERY_OUTCOME_RETRY_LIMIT, MAIN_DELIVERY_OUTCOME_RETRY_LIMIT),
+      at: Date.now(),
+    };
+    try {
+      writeFileAtomic(this.#outcomeDeadLetterPath(item), JSON.stringify(letter), { durable: true, mode: 0o600, dirMode: 0o700 });
+      return true;
+    } catch (error) {
+      diagnostics.warn("src/main-agent.ts", "[pi-fabric] cannot persist Main delivery outcome dead-letter; retaining journal", error);
+      return false;
+    }
   }
 
   /** Retry outcome-only journal items; they never block native delivery or re-enter Pi. */
   #retryPendingOutcomes(): boolean {
     let changed = false;
     const kept: HeldAgentMessage[] = [];
+    const retryable: HeldAgentMessage[] = [];
+    const exhausted: HeldAgentMessage[] = [];
     for (const item of this.#outcomePending) {
+      if ((item.outcomeRetryAttempts ?? 0) >= MAIN_DELIVERY_OUTCOME_RETRY_LIMIT) exhausted.push(item);
+      else retryable.push(item);
+    }
+    // Once exhausted, this is the only operation permitted: never append another outcome.
+    for (const item of exhausted) {
+      if (this.#writeOutcomeDeadLetter(item)) {
+        delete item.outcomePending;
+        this.#consume(item);
+        changed = true;
+      } else kept.push(item);
+    }
+    // A reservation save must not serialize a completed exhausted item as a native carrier
+    // after its outcomePending flag was cleared. Retain failed letters and all retryable items.
+    this.#outcomePending.splice(0, this.#outcomePending.length, ...kept, ...retryable);
+    // Reserve every retry in the durable journal before attempting any optional append. If the
+    // reservation barrier fails, do not append: the next boundary can retry the same reservation.
+    const reserved: Array<{ item: HeldAgentMessage; previous: number }> = [];
+    for (const item of retryable) {
+      const previous = item.outcomeRetryAttempts ?? 0;
+      item.outcomeRetryAttempts = previous + 1;
+      reserved.push({ item, previous });
+    }
+    if (reserved.length) {
+      try {
+        this.#save();
+        changed = true;
+      } catch {
+        for (const { item, previous } of reserved) {
+          if (item.outcomeRetryAttempts !== previous + 1) continue;
+          if (previous === 0) delete item.outcomeRetryAttempts;
+          else item.outcomeRetryAttempts = previous;
+          kept.push(item);
+        }
+        const before = this.#outcomePending.length;
+        this.#outcomePending.splice(0, this.#outcomePending.length, ...kept);
+        return changed || kept.length !== before;
+      }
+    }
+    const exhaustedAfterRetry: HeldAgentMessage[] = [];
+    for (const item of retryable) {
       const supersededChanged = this.#recordSuperseded(item);
       const delivered = this.#recordOutcome(item.outcomeSend, "delivered", "consumed by Main as itself");
       changed ||= supersededChanged;
       if (item.supersededSends?.length || !delivered) {
-        kept.push(item);
+        if ((item.outcomeRetryAttempts ?? 0) >= MAIN_DELIVERY_OUTCOME_RETRY_LIMIT) exhaustedAfterRetry.push(item);
+        else kept.push(item);
         continue;
       }
       delete item.outcomePending;
       this.#consume(item);
       changed = true;
+    }
+    for (const item of exhaustedAfterRetry) {
+      if (this.#writeOutcomeDeadLetter(item)) {
+        delete item.outcomePending;
+        this.#consume(item);
+        changed = true;
+      } else kept.push(item);
     }
     if (kept.length !== this.#outcomePending.length) changed = true;
     this.#outcomePending.splice(0, this.#outcomePending.length, ...kept);
@@ -1332,7 +1424,10 @@ export class MainAgentController implements FabricMainAgentTarget {
           }
           // A policy this runtime cannot read is dropped: the item is then released as a held
           // followUp, as before policies were journalled.
-          const { deliverAs, triggerTurn, supersedes, provenance, source, wakeCause, wakeCauses, ...rest } = item;
+          const { deliverAs, triggerTurn, supersedes, provenance, source, wakeCause, wakeCauses, outcomeRetryAttempts, ...rest } = item;
+          const retryAttempts = Number.isSafeInteger(outcomeRetryAttempts)
+            ? Math.max(0, Math.min(MAIN_DELIVERY_OUTCOME_RETRY_LIMIT, outcomeRetryAttempts as number))
+            : undefined;
           // Serialized diagnostics are not admission evidence. Reconstruct only when
           // the recorded envelope sender agrees with the displayed/routed sender.
           const admission = copyFabricProvenance(provenance);
@@ -1355,6 +1450,7 @@ export class MainAgentController implements FabricMainAgentTarget {
                 ? via : deliverAs === "steer" ? "steer" : "followUp", verified!, admission?.principal),
             } : {}),
             ...(source === "actor-output" || source === "fabric-host" ? { source } : {}),
+            ...(retryAttempts === undefined ? {} : { outcomeRetryAttempts: retryAttempts }),
             ...(Array.isArray(supersedes) ? { supersedes: supersedes.filter((id) => typeof id === "string") } : {}),
             ...(DIRECT_DELIVERIES.has(deliverAs) && typeof triggerTurn === "boolean" ? { deliverAs, triggerTurn } : {}),
           });

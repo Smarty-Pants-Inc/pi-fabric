@@ -369,7 +369,7 @@ export class AgentMessageRouter {
     });
     const resolveLease = async (target: string): Promise<boolean | undefined> => {
       if (!this.participants.resolveRoutingLease) return undefined;
-      // Bootstrap/late-read recovery must pin before waiting, even while the view is unavailable.
+      // Bootstrap recovery must pin before waiting, even while the view is unavailable.
       // If this raw refusal-fence read fails, skip the wait, but never skip the canonical probe.
       try {
         const known = this.participants.lastKnown?.(target)?.participant ??
@@ -407,13 +407,9 @@ export class AgentMessageRouter {
         throw error.original;
       }
       if (error instanceof LeaseResolutionRequired) throw error.original;
-      // A read can fail after the preflight. Retry resolution once, never delivery after
-      // an ACK/control error: only pre-publication directory failures have this class.
-      if (!(error instanceof FabricDirectoryUnavailableError) || reason || !this.participants.refreshRoutingView) throw error;
-      const resolved = recoverLease && id ? await resolveLease(id) : undefined;
-      await this.#refreshDirectory(error.message);
-      if (resolved === false) throw this.#unknownParticipant(id!);
-      return retry();
+      // Generic directory failures can also escape after publication. Only the private
+      // lookup refusal above may replay resolution; an ordinary retry is the caller's decision.
+      throw error;
     }
   }
 

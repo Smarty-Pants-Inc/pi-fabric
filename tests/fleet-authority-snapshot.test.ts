@@ -20,7 +20,7 @@ const ID = "session:11111111-2222-3333-4444-555555555555", ROOT = "session:66666
 const SECRET = "UNRELATED-PRIVATE-BODY-DO-NOT-PARSE-9fcd";
 const TOKEN = "secret-native-token-aaaaaaaa", OLD = "secret-superseded-token-bbbbbbbb";
 const key = (prefix: string, id = ID) => `topology/${prefix}/${hash(id)}`;
-const by = () => ({ id: ID, name: "Private Human Name", kind: "main", sessionId: ID.slice(8), verified: "bridge" });
+const by = (id = ID) => ({ id, name: "Private Human Name", kind: "main", sessionId: ID.slice(8), verified: "bridge" });
 const host = () => ({ format: 1, id: ID, rootId: ROOT, identity: by(), startedAt: 100, updatedAt: 200, expiresAt: 1000,
   incarnationToken: TOKEN, bridgeSupersededTokens: [OLD, TOKEN], bridgeSupersededTokenSeen: { [OLD]: 0, [TOKEN]: 1 }, remoteHost: "dev1", mirrorLease: 1 });
 const participant = () => ({ format: 1, id: ID, rootId: ROOT, ownerHostId: ID, ownerIdentityId: ID, ownerIncarnation: TOKEN,
@@ -48,10 +48,10 @@ function fixture() {
 }
 function options(f: ReturnType<typeof fixture>, extra = {}) { return { mesh: f.mesh, site: "work", name: "ryzen2", peer: "dev1", cursors: [f.cursor], ...extra }; }
 const cli = path.resolve("scripts/fleet-authority-snapshot.mjs");
-function args(f: ReturnType<typeof fixture>, site = "work", output = path.join(f.out, "snapshot.json")) {
-  return [cli, "--mesh", f.mesh, "--site", site, "--name", site === "hub" ? "dev1" : "ryzen2", "--peer", "dev1", "--cursor", f.cursor, "--output", output];
+function args(f: ReturnType<typeof fixture>, site = "work", output = path.join(f.out, "snapshot.json"), census = false) {
+  return [cli, ...(census ? ["--census"] : []), "--mesh", f.mesh, "--site", site, "--name", site === "hub" ? "dev1" : "ryzen2", "--peer", "dev1", "--cursor", f.cursor, "--output", output];
 }
-function run(f: ReturnType<typeof fixture>, site = "work", output?: string) { return spawnSync(process.execPath, args(f, site, output), { encoding: "utf8", timeout: 5000 }); }
+function run(f: ReturnType<typeof fixture>, site = "work", output?: string, census = false) { return spawnSync(process.execPath, args(f, site, output, census), { encoding: "utf8", timeout: 5000 }); }
 function sqlite(f: ReturnType<typeof fixture>, wal = false) {
   fs.unlinkSync(path.join(f.mesh, "state.json"));
   const db = new DatabaseSync(path.join(f.mesh, "state.db"));
@@ -69,6 +69,26 @@ function treeBytes(root: string): Record<string, string> {
   const output: Record<string, string> = {};
   for (const name of fs.readdirSync(root).sort()) { const file = path.join(root, name), stat = fs.lstatSync(file); if (stat.isDirectory()) for (const [sub, value] of Object.entries(treeBytes(file))) output[`${name}/${sub}`] = value; else if (stat.isFile()) output[name] = hash(fs.readFileSync(file).toString("base64")); }
   return output;
+}
+function censusInputs(f: ReturnType<typeof fixture>) {
+  const badBridge = "bridge:bad-census", badTool = "spawn-router-extra", badPath = "/private/census/path";
+  const first = host(); first.id = badBridge; first.rootId = badBridge;
+  const second = { ...host(), id: ROOT, rootId: badBridge };
+  const stateParticipant: any = participant(); stateParticipant.ownerHostId = badTool; stateParticipant.parentId = badPath;
+  const policy = { key: "topology/liveness", value: { version: 1, participants: "files", hostLeases: "files" }, version: 2, updatedAt: 200, updatedBy: by("/private/policy-owner") };
+  const entries: Record<string, any> = {
+    [key("hosts", badBridge)]: { ...envelope("hosts", first), key: key("hosts", badBridge) },
+    [key("hosts", ROOT)]: { ...envelope("hosts", second), key: key("hosts", ROOT) },
+    [key("participants")]: { ...envelope("participants", stateParticipant), key: key("participants") },
+    "topology/liveness": policy,
+  };
+  for (const name of Object.keys(f.entries)) delete f.entries[name];
+  Object.assign(f.entries, entries);
+  fs.writeFileSync(path.join(f.mesh, "state.json"), JSON.stringify({ format: 1, entries }));
+  const participantFile: any = participant(); participantFile.ownerIdentityId = badTool;
+  fs.writeFileSync(path.join(f.mesh, "participants", `${hash(ID)}.json`), JSON.stringify({ format: 1, ...envelope("participants", participantFile) }));
+  const leaseValue: any = lease(); leaseValue.rootId = badBridge; leaseValue.identityId = badPath;
+  fs.writeFileSync(path.join(f.mesh, "host-leases", `${hash(ID).slice(0, 32)}.json`), JSON.stringify(leaseValue));
 }
 
 describe("fleet authority snapshot privacy and real backend boundaries", () => {
@@ -190,6 +210,51 @@ describe("fleet authority snapshot privacy and real backend boundaries", () => {
       expect(fs.existsSync(path.join(f.out, "snapshot.json"))).toBe(false);
     } finally { db?.close(); }
   });
+  it.each(["bridge:dev1", "spawn-router", "maintenance:nightly-job"])("accepts the pinned updatedBy.id shape in FILE, SQLite, and participant-file writers (%s)", async id => {
+    for (const backend of ["file", "sqlite", "participant-file"] as const) {
+      const f = fixture(); let db: DatabaseSync | undefined;
+      if (backend === "file") {
+        const entry = envelope("hosts", host()); entry.updatedBy = by(id);
+        fs.writeFileSync(path.join(f.mesh, "state.json"), JSON.stringify({ format: 1, entries: { [key("hosts")]: entry } }));
+      } else if (backend === "sqlite") {
+        (f.entries[key("hosts")] as any).updatedBy = by(id); db = sqlite(f);
+      } else {
+        const entry = envelope("participants", participant()); entry.updatedBy = by(id);
+        fs.writeFileSync(path.join(f.mesh, "participants", `${hash(ID)}.json`), JSON.stringify({ format: 1, ...entry }));
+      }
+      try {
+        const snapshot = await collect(options(f, backend === "sqlite" ? { site: "hub", name: "dev1" } : {}));
+        const projected = backend === "participant-file" ? snapshot.participantFiles[0] : snapshot.stateEntries.find((row: any) => row.value.id === ID);
+        expect(projected.updatedBy.id).toBe(id);
+      } finally { db?.close(); }
+    }
+  });
+  it.each(["bridge:dev1", "spawn-router", "maintenance:nightly-job"])("does not accept the pinned updatedBy.id shape in authority identity slots (%s)", async id => {
+    const cases = [
+      ["entry.value.id", "host"], ["entry.value.rootId", "root"], ["entry.value.ownerHostId", "owner"], ["lease.identityId", "lease"],
+    ] as const;
+    for (const [field, target] of cases) {
+      const f = fixture();
+      if (target === "host" || target === "root") {
+        const value: any = host(); value[target === "host" ? "id" : "rootId"] = id;
+        fs.writeFileSync(path.join(f.mesh, "state.json"), JSON.stringify({ format: 1, entries: { [key("hosts")]: { ...envelope("hosts", value), key: key("hosts") } } }));
+      } else if (target === "owner") {
+        const value: any = participant(); value.ownerHostId = id;
+        fs.writeFileSync(path.join(f.mesh, "state.json"), JSON.stringify({ format: 1, entries: { [key("participants")]: { ...envelope("participants", value), key: key("participants") } } }));
+      } else {
+        const value: any = lease(); value.identityId = id;
+        fs.writeFileSync(path.join(f.mesh, "host-leases", `${hash(ID).slice(0, 32)}.json`), JSON.stringify(value));
+      }
+      await expect(collect(options(f))).rejects.toMatchObject({ code: "UNSUPPORTED_ID", field, recordKind: target === "lease" ? "lease" : target === "owner" ? "participant" : "host" });
+    }
+  });
+  it.each(["bridge:UPPER", "bridge:", `maintenance:${"x".repeat(41)}`, "spawn-router-extra", "bridge:\u0001", "/private/census/path"])("rejects non-pinned updatedBy.id shapes with fixed diagnostics (%s)", async id => {
+    const f = fixture(), entry = envelope("hosts", host()); entry.updatedBy = by(id);
+    fs.writeFileSync(path.join(f.mesh, "state.json"), JSON.stringify({ format: 1, entries: { [key("hosts")]: entry } }));
+    const result = run(f); expect(result.status).toBe(1); expect(result.stdout).toBe("");
+    const diagnostic = JSON.parse(result.stderr); expect(diagnostic).toMatchObject({ error: "UNSUPPORTED_ID", field: "entry.updatedBy.id", recordKind: "host" });
+    expect(result.stderr).not.toContain(id);
+  });
   it.each(["participant", "lease", "updatedBy"])("keeps the record kind and fixed field for %s ID failures", async target => {
     const f = fixture(); let field: string, recordKind: string;
     if (target === "participant") {
@@ -205,6 +270,35 @@ describe("fleet authority snapshot privacy and real backend boundaries", () => {
     const result = run(f); expect(result.status).toBe(1); expect(result.stdout).toBe("");
     expect(JSON.parse(result.stderr)).toEqual({ error: "UNSUPPORTED_ID", field, recordKind, shape: "length:33-64" });
     expect(fs.existsSync(path.join(f.out, "snapshot.json"))).toBe(false);
+  });
+  it("emits a complete aggregate-only census without authority payloads", () => {
+    const f = fixture(), result = run(f, "work", undefined, true), report = JSON.parse(result.stdout);
+    expect(result.status).toBe(0); expect(result.stderr).toBe(""); expect(report).toMatchObject({ schemaVersion: 1, mode: "census", complete: true, backend: "file", unsupported: [] });
+    expect(report.stateEntries).toBeUndefined(); expect(report.participantFiles).toBeUndefined(); expect(report.leaseFiles).toBeUndefined(); expect(report.cursors).toBeUndefined();
+    expect(result.stdout).not.toContain(TOKEN); expect(result.stdout).not.toContain(SECRET); expect(fs.readFileSync(path.join(f.out, "snapshot.json"), "utf8")).toBe(result.stdout);
+  });
+  it.each(["file", "sqlite"])("aggregates every unsupported fixed authority ID for %s without partial output", backend => {
+    const normal = fixture(); censusInputs(normal); const normalResult = run(normal);
+    expect(normalResult.status).toBe(1); expect(normalResult.stdout).toBe(""); expect(fs.existsSync(path.join(normal.out, "snapshot.json"))).toBe(false);
+    const f = fixture(); censusInputs(f); let db: DatabaseSync | undefined;
+    if (backend === "sqlite") db = sqlite(f, true);
+    try {
+      const result = run(f, backend === "sqlite" ? "hub" : "work", undefined, true), report = JSON.parse(result.stdout);
+      expect(result.status).toBe(1); expect(result.stderr).toBe(""); expect(report).toMatchObject({ schemaVersion: 1, mode: "census", complete: false, backend });
+      expect(report.stateEntries).toBeUndefined(); expect(report.participantFiles).toBeUndefined(); expect(report.leaseFiles).toBeUndefined(); expect(report.cursors).toBeUndefined();
+      const counts = new Map(report.unsupported.map((row: any) => [`${row.field}|${row.recordKind}|${row.shape}`, row.count]));
+      expect(counts.get("entry.value.id|host|bridge")).toBe(1);
+      expect(counts.get("entry.value.rootId|host|bridge")).toBe(2);
+      expect(counts.get("lease.rootId|lease|bridge")).toBe(1);
+      expect(counts.get("entry.value.ownerHostId|participant|literal-tool")).toBe(1);
+      expect(counts.get("entry.value.ownerIdentityId|participant|literal-tool")).toBe(1);
+      expect(counts.get("entry.value.parentId|participant|length:1-32")).toBe(1);
+      expect(counts.get("lease.identityId|lease|length:1-32")).toBe(1);
+      expect(counts.get("entry.updatedBy.id|policy|length:1-32")).toBe(1);
+      expect(report.counts.included).toBeGreaterThan(0); expect(report.counts.dropped).toBeGreaterThan(0);
+      const text = result.stdout; expect(text).not.toContain("bridge:bad-census"); expect(text).not.toContain("spawn-router-extra"); expect(text).not.toContain("/private/census/path"); expect(text).not.toContain("/private/policy-owner"); expect(text).not.toContain(TOKEN); expect(text).not.toContain(SECRET);
+      expect(fs.readFileSync(path.join(f.out, "snapshot.json"), "utf8")).toBe(result.stdout);
+    } finally { db?.close(); }
   });
   it("suppresses native error paths and refuses untrusted diagnostic metadata", async () => {
     const f = fixture(); fs.unlinkSync(path.join(f.mesh, "state.json"));

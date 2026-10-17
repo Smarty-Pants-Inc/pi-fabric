@@ -5,9 +5,14 @@ import path from "node:path";
 import { collectAuthoritySnapshot, SnapshotError } from "./lib/fleet-authority-snapshot.mjs";
 
 function parseArgs(argv) {
-  const options = { cursors: [] }, seen = new Set();
-  for (let at = 0; at < argv.length; at += 2) {
-    const flag = argv[at], value = argv[at + 1];
+  const options = { cursors: [], census: false }, seen = new Set();
+  for (let at = 0; at < argv.length;) {
+    const flag = argv[at++];
+    if (flag === "--census") {
+      if (seen.has(flag)) throw new SnapshotError("INVALID_OPTIONS");
+      seen.add(flag); options.census = true; continue;
+    }
+    const value = argv[at++];
     if (!["--mesh", "--site", "--name", "--peer", "--cursor", "--output"].includes(flag) || !value || value.startsWith("--") || flag !== "--cursor" && seen.has(flag)) throw new SnapshotError("INVALID_OPTIONS");
     seen.add(flag);
     if (flag === "--cursor") options.cursors.push(value);
@@ -26,6 +31,7 @@ try {
   const fd = fs.openSync(destination, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
   try { fs.writeFileSync(fd, text); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
   process.stdout.write(text);
+  if (options.census && snapshot.mode === "census" && snapshot.complete === false) process.exitCode = 1;
 } catch (error) {
   const code = error instanceof SnapshotError ? error.code : "COLLECTION_FAILED";
   const diagnostic = { error: code };

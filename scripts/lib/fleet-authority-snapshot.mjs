@@ -8,6 +8,7 @@ const MAX_RECORD = 256 * 1024;
 const MAX_ROWS = 10_000;
 const OMIT = Symbol("omit");
 const H = "hash", I = "identity", P = "peer", N = "integer", B = "boolean", SID = "session", A = "alias";
+const UPDATED_BY_ID = Symbol("updatedBy.id");
 const UUID = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
 // Runtime IDs: fabric-runtime-state.ts; resident IDs: residency/protocol.ts;
 // actor/agent IDs: actors/manager.ts and agents/manager.ts (UUID without dashes).
@@ -22,13 +23,26 @@ const ID_SHAPES = [
   ["runtime:<uuid>", new RegExp(`^runtime:${UUID}$`, "i")],
   ["session:<exact-owner-ci>:<hex>", new RegExp(`^session:${CI_ROOT}:[0-9a-f]{1,13}$`)],
 ];
+const UPDATED_BY_ID_PATTERNS = [
+  /^bridge:[a-z0-9-]{1,32}$/,
+  /^spawn-router$/,
+  /^maintenance:[a-z0-9-]{1,40}$/,
+];
 const SESSION_PATTERN = new RegExp(`^(?:${UUID}|${CI_ROOT})$`, "i");
-const SAFE_SHAPES = new Set([...ID_SHAPES.map(([shape]) => shape), "session:other", "resident:other", "runtime:other", "participant:other", "actor:other", "agent:other", "length:0", "length:1-32", "length:33-64", "length:65-128", "length:129-256", "length:over-256", "non-string"]);
+const SAFE_SHAPES = new Set([...ID_SHAPES.map(([shape]) => shape), "bridge", "maintenance", "literal-tool", "session:other", "resident:other", "runtime:other", "participant:other", "actor:other", "agent:other", "length:0", "length:1-32", "length:33-64", "length:65-128", "length:129-256", "length:over-256", "non-string"]);
 function idShape(value) {
   if (typeof value !== "string") return "non-string";
   const known = ID_SHAPES.find(([, pattern]) => pattern.test(value)); if (known) return known[0];
+  if (value.startsWith("bridge:")) return "bridge";
+  if (value === "spawn-router" || value.startsWith("spawn-router")) return "literal-tool";
+  if (value.startsWith("maintenance:")) return "maintenance";
   for (const prefix of ["session", "resident", "runtime", "participant", "actor", "agent"]) if (value.startsWith(`${prefix}:`)) return `${prefix}:other`;
   const size = value.length; return size === 0 ? "length:0" : size <= 32 ? "length:1-32" : size <= 64 ? "length:33-64" : size <= 128 ? "length:65-128" : size <= 256 ? "length:129-256" : "length:over-256";
+}
+function supportedId(value, spec) {
+  if (typeof value !== "string") return false;
+  if (spec === UPDATED_BY_ID && UPDATED_BY_ID_PATTERNS.some(pattern => pattern.test(value))) return true;
+  return ID_SHAPES.some(([, pattern]) => pattern.test(value));
 }
 const PEER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$/;
 const enumOf = (...values) => ({ enum: values });
@@ -36,6 +50,7 @@ const obj = (fields, required = []) => ({ fields, required });
 const array = item => ({ array: item });
 const one = enumOf(1), two = enumOf(2);
 const identity = obj({ id: I, kind: enumOf("main", "agent", "actor"), sessionId: SID, verified: enumOf("bridge"), name: A }, ["id", "kind", "name"]);
+const updatedByIdentity = obj({ id: UPDATED_BY_ID, kind: enumOf("main", "agent", "actor"), sessionId: SID, verified: enumOf("bridge"), name: A }, ["id", "kind", "name"]);
 const processRecord = obj({ pid: N, host: P, startTime: H, incarnation: H, link: P, machineId: H, bootId: H });
 const mirror = obj({ remoteHost: P, observedAt: N, sourceObservedAt: N, sourceUpdatedAt: N, sourceExpiresAt: N,
   bridgeProcess: processRecord }, ["remoteHost", "observedAt", "sourceObservedAt", "sourceUpdatedAt", "sourceExpiresAt"]);
@@ -83,10 +98,10 @@ const ID_FIELDS = new Map();
 for (const [kind, spec, root] of [["host", host, "entry.value"], ["participant", participant, "entry.value"], ["handoff", handoff, "entry.value"], ["policy", policy, "entry.value"], ["lease", lease, "lease"], ["cursor", cursor, "cursor"]]) {
   const fields = new Set();
   const visit = (node, field) => {
-    if (node === I || node === SID) fields.add(field);
+    if (node === I || node === SID || node === UPDATED_BY_ID) fields.add(field);
     if (node?.fields) for (const [key, child] of Object.entries(node.fields)) visit(child, `${field}.${key}`);
   };
-  visit(spec, root); if (root === "entry.value") visit(identity, "entry.updatedBy"); ID_FIELDS.set(kind, fields);
+  visit(spec, root); if (root === "entry.value") visit(updatedByIdentity, "entry.updatedBy"); ID_FIELDS.set(kind, fields);
 }
 export class SnapshotError extends Error {
   constructor(code, details) {
@@ -98,10 +113,11 @@ export class SnapshotError extends Error {
 }
 const fail = (code, details) => { throw new SnapshotError(code, details); };
 const safeInteger = value => Number.isSafeInteger(value) && value >= 0;
-function context() {
+function context(censusMode = false) {
   const hashes = new Map(), rawIdentities = new Map(), fields = new Map(), aliases = new Map(), aliasRefs = [];
+  const unsupported = new Map(), structural = new Set();
   return {
-    rawIdentities, aliases, aliasRefs,
+    censusMode, rawIdentities, aliases, aliasRefs,
     resolveAliases() {
       for (const ref of aliasRefs) { const raw = aliases.get(ref.alias); if (rawIdentities.has(raw)) ref.object[ref.key] = raw; }
     },
@@ -114,6 +130,15 @@ function context() {
       const row = fields.get(field) ?? { field, included: 0, dropped: 0 };
       row[included ? "included" : "dropped"]++; fields.set(field, row);
     },
+    recordUnsupported(field, recordKind, shape) {
+      const key = `${field}\0${recordKind}\0${shape}`, row = unsupported.get(key) ?? { field, recordKind, shape, count: 0 };
+      row.count++; unsupported.set(key, row);
+    },
+    unsupportedRows() {
+      return [...unsupported.values()].sort((a, b) => a.field.localeCompare(b.field) || a.recordKind.localeCompare(b.recordKind) || a.shape.localeCompare(b.shape));
+    },
+    deferStructural(code) { structural.add(code); },
+    firstStructural() { return [...structural].sort()[0]; },
     discardIncluded(field) { const row = fields.get(field); if (!row || row.included < 1) fail("INTERNAL_SCHEMA"); row.included--; row.dropped++; },
     census() {
       const rows = [...fields.values()].sort((a, b) => a.field.localeCompare(b.field));
@@ -215,15 +240,19 @@ class Reader {
     }
     let value = this.scalar();
     if (spec === N && !safeInteger(value) || spec === B && typeof value !== "boolean" || spec?.enum && !spec.enum.includes(value)) fail("INVALID_SCALAR");
-    if ([H, I, SID, P, A].includes(spec)) {
+    if ([H, I, SID, UPDATED_BY_ID, P, A].includes(spec)) {
       // Diagnose IDs before generic scalar validation, without retaining their raw value.
-      if (spec === I && (typeof value !== "string" || !ID_SHAPES.some(([, pattern]) => pattern.test(value))) || spec === SID && (typeof value !== "string" || !SESSION_PATTERN.test(value))) {
-        fail("UNSUPPORTED_ID", { field, recordKind: this.recordKind, shape: idShape(value) });
+      const idSlot = spec === I || spec === SID || spec === UPDATED_BY_ID;
+      const validId = spec === SID ? typeof value === "string" && SESSION_PATTERN.test(value) : supportedId(value, spec);
+      if (idSlot && !validId) {
+        const shape = idShape(value);
+        if (this.ctx.censusMode) { this.ctx.recordUnsupported(field, this.recordKind, shape); this.ctx.count(field, false); return undefined; }
+        fail("UNSUPPORTED_ID", { field, recordKind: this.recordKind, shape });
       }
       // Validate every free string before retaining it or deriving a safe alias.
       const hashed = this.ctx.hash(value).slice(2);
       if (spec === H) value = `h:${hashed}`;
-      if (spec === I) this.ctx.rawIdentities.set(value, value);
+      if (spec === I || spec === UPDATED_BY_ID) this.ctx.rawIdentities.set(value, value);
       if (spec === P && !PEER_PATTERN.test(value)) fail("INVALID_SCALAR");
       if (spec === A) { const raw = value; value = `n:${hashed}`; this.ctx.aliases.set(value, raw); }
     }
@@ -244,14 +273,22 @@ function projectEntry(reader, sourceKey, file = false) {
   const type = classify(sourceKey); if (!type) fail("INVALID_KEY");
   reader.recordKind = type.recordKind;
   let rawKey;
-  const schema = obj({ ...(file ? { format: one } : {}), key: "key", value: type.spec, updatedAt: N, version: N, updatedBy: identity },
+  const schema = obj({ ...(file ? { format: one } : {}), key: "key", value: type.spec, updatedAt: N, version: N, updatedBy: updatedByIdentity },
     ["key", "value", "updatedAt", "version", "updatedBy", ...(file ? ["format"] : [])]);
   // Keys are the one specially validated string scalar, never emitted until their ID join is checked.
   schema.fields.key = enumOf(sourceKey);
   const entry = reader.project(schema, "entry"); rawKey = entry.key;
   if (type.spec !== policy) {
     const rawId = reader.ctx.rawIdentities.get(entry.value.id);
-    if (rawId === undefined || rawKey !== type.prefix + digest(rawId)) fail("KEY_ID_MISMATCH");
+    if (rawId === undefined) {
+      if (!reader.ctx.censusMode || entry.value.id !== undefined) {
+        if (reader.ctx.censusMode) reader.ctx.deferStructural("KEY_ID_MISMATCH");
+        else fail("KEY_ID_MISMATCH");
+      }
+    } else if (rawKey !== type.prefix + digest(rawId)) {
+      if (reader.ctx.censusMode) reader.ctx.deferStructural("KEY_ID_MISMATCH");
+      else fail("KEY_ID_MISMATCH");
+    }
     entry.key = rawKey;
   }
   if (file) reader.ctx.discardIncluded("entry.format");
@@ -361,9 +398,20 @@ function sqliteEntries(root, ctx) {
     if (rows.length > MAX_ROWS) fail("LIMIT_EXCEEDED");
     const entries = rows.map(row => {
       if (typeof row.key !== "string" || typeof row.value !== "string" || typeof row.updated_by !== "string" || Buffer.byteLength(row.value) > MAX_RECORD || Buffer.byteLength(row.updated_by) > MAX_RECORD || !safeInteger(row.version) || !safeInteger(row.updated_at)) fail("INVALID_SQLITE_ROW");
-      const type = classify(row.key), value = projectText(row.value, type.spec, "entry.value", ctx, type.recordKind), updatedBy = projectText(row.updated_by, identity, "entry.updatedBy", ctx, type.recordKind);
+      const type = classify(row.key), value = projectText(row.value, type.spec, "entry.value", ctx, type.recordKind), updatedBy = projectText(row.updated_by, updatedByIdentity, "entry.updatedBy", ctx, type.recordKind);
       let key = row.key;
-      if (type.spec !== policy) { const rawId = ctx.rawIdentities.get(value.id); if (!rawId || key !== type.prefix + digest(rawId)) fail("KEY_ID_MISMATCH"); key = type.prefix + digest(value.id); }
+      if (type.spec !== policy) {
+        const rawId = ctx.rawIdentities.get(value.id), expected = rawId === undefined ? undefined : type.prefix + digest(rawId);
+        if (rawId === undefined) {
+          if (!ctx.censusMode || value.id !== undefined) {
+            if (ctx.censusMode) ctx.deferStructural("KEY_ID_MISMATCH");
+            else fail("KEY_ID_MISMATCH");
+          }
+        } else if (key !== expected) {
+          if (ctx.censusMode) ctx.deferStructural("KEY_ID_MISMATCH");
+          else fail("KEY_ID_MISMATCH");
+        } else key = expected;
+      }
       ctx.count("entry.key", true); ctx.count("entry.version", true); ctx.count("entry.updatedAt", true); ctx.count("entry", true);
       return { key, value, updatedAt: row.updated_at, version: row.version, updatedBy };
     });
@@ -376,7 +424,7 @@ function sqliteEntries(root, ctx) {
 export async function collectAuthoritySnapshot(options) {
   try {
     if (!options || !["hub", "work"].includes(options.site) || !["dev1", "ryzen2"].includes(options.name) || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$/.test(options.peer ?? "") || !Array.isArray(options.cursors ?? []) || (options.cursors ?? []).length > 32) fail("INVALID_OPTIONS");
-    const root = physical(options.mesh, true), ctx = context();
+    const root = physical(options.mesh, true), ctx = context(options.census === true);
     const participantPaths = directoryFiles(root, "participants", /^[0-9a-f]{64}\.json$/), leasePaths = directoryFiles(root, "host-leases", /^[0-9a-f]{32}\.json$/);
     const cursors = (options.cursors ?? []).map(file => physical(file));
     const files = [...participantPaths, ...leasePaths, ...cursors], before = sourceStamp(files);
@@ -395,14 +443,29 @@ export async function collectAuthoritySnapshot(options) {
     });
     const leaseFiles = leasePaths.map(file => {
       const projected = projectText(regular(file, MAX_RECORD), lease, "lease", ctx, "lease"), rawId = ctx.rawIdentities.get(projected.id);
-      if (!rawId || path.basename(file) !== `${digest(rawId).slice(0, 32)}.json`) fail("KEY_ID_MISMATCH"); return projected;
+      if (rawId === undefined) {
+        if (!ctx.censusMode || projected.id !== undefined) {
+          if (ctx.censusMode) ctx.deferStructural("KEY_ID_MISMATCH");
+          else fail("KEY_ID_MISMATCH");
+        }
+      } else if (path.basename(file) !== `${digest(rawId).slice(0, 32)}.json`) {
+        if (ctx.censusMode) ctx.deferStructural("KEY_ID_MISMATCH");
+        else fail("KEY_ID_MISMATCH");
+      }
+      return projected;
     });
     const projectedCursors = cursors.map((file, index) => ({ index, ...projectText(regular(file, MAX_RECORD), cursor, "cursor", ctx, "cursor") }));
     const afterPaths = [...directoryFiles(root, "participants", /^[0-9a-f]{64}\.json$/), ...directoryFiles(root, "host-leases", /^[0-9a-f]{32}\.json$/), ...cursors];
     if (files.join("\0") !== afterPaths.join("\0") || before !== sourceStamp(afterPaths) || stateBefore !== undefined && stateBefore !== fingerprint(fs.lstatSync(statePath, { bigint: true }))) fail("SOURCE_CHANGED");
+    if (ctx.firstStructural()) fail(ctx.firstStructural());
     ctx.resolveAliases();
+    const counts = { ...ctx.census(), ...(state.observation ? { sqlite: state.observation } : {}) };
+    if (ctx.censusMode) {
+      const output = { schemaVersion: 1, mode: "census", complete: ctx.unsupportedRows().length === 0, backend, unsupported: ctx.unsupportedRows(), counts };
+      if (Buffer.byteLength(JSON.stringify(output)) > MAX_SOURCE) fail("LIMIT_EXCEEDED"); return output;
+    }
     const output = { schemaVersion: 1, site: options.site, name: options.name, peer: options.peer, backend,
-      collectedAt: Date.now(), stateMetadata: state.metadata, stateEntries: state.entries.sort((a, b) => a.key.localeCompare(b.key)), participantFiles, leaseFiles, cursors: projectedCursors, counts: { ...ctx.census(), ...(state.observation ? { sqlite: state.observation } : {}) } };
+      collectedAt: Date.now(), stateMetadata: state.metadata, stateEntries: state.entries.sort((a, b) => a.key.localeCompare(b.key)), participantFiles, leaseFiles, cursors: projectedCursors, counts };
     if (Buffer.byteLength(JSON.stringify(output)) > MAX_SOURCE) fail("LIMIT_EXCEEDED"); return output;
   } catch (error) { if (error instanceof SnapshotError) throw error; fail("COLLECTION_FAILED"); }
 }

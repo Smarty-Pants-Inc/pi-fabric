@@ -96,11 +96,11 @@ export const prepareNatsRoot = async (root: string, options: { lockTimeoutMs?: n
   if (!natsConfigured) throw new Error(natsSkipReason);
   await prepareNatsStream(root);
   try {
-    const { value: backend, name } = await captureNatsConsumer(natsServerUrl!, natsStreamName(root), () =>
+    const { value: backend, consumer } = await captureNatsConsumer(natsServerUrl!, natsStreamName(root), () =>
       openNatsStateBackend({ root, servers: [natsServerUrl!], monitoringUrl: natsMonitorUrl!,
         ...(options.lockTimeoutMs === undefined ? {} : { lockTimeoutMs: options.lockTimeoutMs }) }));
     // A prior closed backend's receiver can remain visible; only this opening's actual get is evidence.
-    await waitForNatsConsumerReady(natsServerUrl!, natsStreamName(root), name);
+    await waitForNatsConsumerReady(natsServerUrl!, natsStreamName(root), consumer);
     return backend;
   } catch (error) {
     closeNatsStateBackend(root);

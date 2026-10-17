@@ -211,9 +211,10 @@ describe("real three-node NATS metadata-leader election", () => {
         // setup publish; otherwise a not-yet-routed first pull can consume the entire write budget under load.
         // The faulting reopen deliberately bypasses this readiness gate: its original receiver is stopped.
         if (stream !== faultStream) {
-          const selected = await consumed.get(stream)!.info(true); // Cached real successful get identity, no extra request.
+          const receiver = consumed.get(stream)!;
+          const selected = await receiver.info(true); // Cached real successful get identity, no extra request.
           expect(creates.some(info => info.stream_name === stream && info.name === selected.name)).toBe(true);
-          await waitForNatsConsumerReady(cluster.seedUrl, stream, selected.name);
+          await waitForNatsConsumerReady(cluster.seedUrl, stream, receiver);
         }
         return subscription;
       };
@@ -403,7 +404,7 @@ describe("real three-node NATS metadata-leader election", () => {
       return ack;
     });
     restoreCreateSpy = () => createSpy.mockRestore();
-    const { value: seedBackend, name: seedConsumer } = await captureNatsConsumer(cluster.seedUrl, initial.stream, () =>
+    const { value: seedBackend, consumer: seedConsumer } = await captureNatsConsumer(cluster.seedUrl, initial.stream, () =>
       openNatsStateBackend({ root, ...options, maxEventBytes: 64 * 1024 }));
     qualifiedOpens.push(initial.stream);
     try {

@@ -21,7 +21,7 @@ const controlledInfo = () => {
   const info = vi.fn(async () => state.stream);
   const consumer = vi.fn(async (_stream: string, name: string) => {
     if (!state.targetPresent) throw new js.JetStreamApiError({ code: 404, err_code: 10014, description: "consumer not found" });
-    return { name, num_waiting: state.waiting };
+    return { stream_name: _stream, name, num_waiting: state.waiting };
   });
   // LIST deliberately offers unrelated ready evidence even when the exact target is absent/not waiting.
   const list = vi.fn(() => ({ next: async () => [{ name: "unrelated", num_waiting: 1 }] }));
@@ -32,6 +32,21 @@ const controlledInfo = () => {
   return { state, info, consumer, list, close, manager, getManager };
 };
 afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });
+
+const controlledReceiver = (name: string) => {
+  const cached = { stream_name: "STATE", name };
+  const receiver = { info: vi.fn(async () => ({ ...cached })), consume: vi.fn(async () => ({})) } as unknown as js.Consumer;
+  return { cached, receiver };
+};
+const controlledGets = (receivers: js.Consumer[]) => {
+  class FixtureConsumers {
+    async get(_stream: string) { return receivers.shift()!; }
+  }
+  const consumers = new FixtureConsumers();
+  const originalGet = FixtureConsumers.prototype.get;
+  vi.spyOn(js, "jetstream").mockReturnValue({ consumers } as unknown as ReturnType<typeof js.jetstream>);
+  return { consumers, prototype: FixtureConsumers.prototype, originalGet };
+};
 
 describe("NATS harness readiness conditions", () => {
   it("does not accept pending NEXT or a leader flip while any R3 follower is not current", async () => {
@@ -98,6 +113,121 @@ describe("NATS harness readiness conditions", () => {
     await vi.advanceTimersByTimeAsync(50);
     await gate;
     expect(ready).toBe(true);
+  });
+
+  it("follows the same captured handle from absent _1 to pending SDK successor _2", async () => {
+    const { state, consumer, list } = controlledInfo();
+    const { cached, receiver } = controlledReceiver("ordered_1");
+    const { consumers, prototype, originalGet } = controlledGets([receiver]);
+    const originalConsume = receiver.consume;
+    const captured = await captureNatsConsumer("nats://fixture", "STATE", async () => {
+      const selected = await consumers.get("STATE");
+      await selected.consume();
+      return 7;
+    });
+    expect(captured).toEqual({ value: 7, consumer: receiver });
+    expect(prototype.get).toBe(originalGet);
+    expect(receiver.consume).toBe(originalConsume);
+    state.targetPresent = false;
+    let ready = false;
+    const gate = waitForNatsConsumerReady("nats://fixture", "STATE", captured.consumer, { timeoutMs: 150 }).then(() => { ready = true; });
+    await vi.advanceTimersByTimeAsync(50);
+    expect(ready).toBe(false);
+    expect(consumer).toHaveBeenCalledWith("STATE", "ordered_1");
+    cached.name = "ordered_2"; // SDK updates cached_info on the SAME consumed receiver, not a new get.
+    state.targetPresent = true;
+    await vi.advanceTimersByTimeAsync(50);
+    await gate;
+    expect(consumer).toHaveBeenLastCalledWith("STATE", "ordered_2");
+    expect(list).not.toHaveBeenCalled();
+  });
+
+  it("rejects a predecessor ready ACK when the handle advances during asynchronous INFO", async () => {
+    const { consumer } = controlledInfo();
+    const { cached, receiver } = controlledReceiver("ordered_1");
+    consumer.mockImplementationOnce(async (_stream, name) => {
+      cached.name = "ordered_2";
+      return { stream_name: _stream, name, num_waiting: 1 };
+    }).mockImplementation(async (_stream, name) => ({ stream_name: _stream, name, num_waiting: 0 }));
+    let ready = false;
+    const gate = waitForNatsConsumerReady("nats://fixture", "STATE", receiver).then(() => { ready = true; });
+    await vi.advanceTimersByTimeAsync(50);
+    expect(ready).toBe(false);
+    expect(consumer).toHaveBeenLastCalledWith("STATE", "ordered_2");
+    consumer.mockImplementation(async (_stream, name) => ({ stream_name: _stream, name, num_waiting: 1 }));
+    await vi.advanceTimersByTimeAsync(50);
+    await gate;
+  });
+
+  it.each(["stream", "name"])("fails invalid cached %s identity without querying another receiver", async field => {
+    const { consumer, close } = controlledInfo();
+    const { cached, receiver } = controlledReceiver("ordered_1");
+    if (field === "stream") cached.stream_name = "OTHER";
+    else cached.name = "";
+    const outcome = waitForNatsConsumerReady("nats://fixture", "STATE", receiver).catch(error => error as Error);
+    await vi.advanceTimersByTimeAsync(0);
+    expect((await outcome)?.message).toContain("identity mismatch");
+    expect(consumer).not.toHaveBeenCalled();
+    expect(close).toHaveBeenCalledOnce();
+  });
+
+  it("never treats a missing consumer handle as a stream-only gate", async () => {
+    const { consumer } = controlledInfo();
+    await expect(waitForNatsConsumerReady("nats://fixture", "STATE", undefined as unknown as js.Consumer))
+      .rejects.toThrow("actual consumer identity required");
+    expect(consumer).not.toHaveBeenCalled();
+  });
+
+  it("bounds a stalled cached identity under the same absolute deadline", async () => {
+    const { close } = controlledInfo();
+    const { receiver } = controlledReceiver("ordered_1");
+    vi.mocked(receiver.info).mockImplementation(() => new Promise(() => undefined));
+    const outcome = waitForNatsConsumerReady("nats://fixture", "STATE", receiver, { timeoutMs: 75 }).catch(error => error as Error);
+    await vi.advanceTimersByTimeAsync(75);
+    expect((await outcome)?.message).toContain("readiness deadline");
+    expect(close).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("isolates simultaneous same-stream captures and ignores late abandoned get ACKs", async () => {
+    controlledInfo();
+    const a = controlledReceiver("a").receiver;
+    const b = controlledReceiver("b").receiver;
+    const late = controlledReceiver("late").receiver;
+    const { consumers, prototype, originalGet } = controlledGets([a, b]);
+    let resolveLate!: (receiver: js.Consumer) => void;
+    const get = vi.spyOn(prototype, "get").mockImplementationOnce(() => new Promise(resolve => { resolveLate = resolve; }))
+      .mockImplementation(originalGet);
+    const before = prototype.get;
+    const lateConsume = late.consume;
+    const [first, second] = await Promise.all([captureNatsConsumer("nats://fixture", "STATE", async () => {
+      void consumers.get("STATE"); // Abandoned bootstrap get ACK arrives after this scope closes.
+      const receiver = await consumers.get("STATE");
+      await receiver.consume();
+    }), captureNatsConsumer("nats://fixture", "STATE", async () => {
+      const receiver = await consumers.get("STATE");
+      await receiver.consume();
+    })]);
+    expect(new Set([first.consumer, second.consumer])).toEqual(new Set([a, b]));
+    resolveLate(late);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(late.consume).toBe(lateConsume);
+    expect(prototype.get).toBe(before);
+    get.mockRestore();
+  });
+
+  it("restores get and unconsumed receiver hooks when the operation fails", async () => {
+    controlledInfo();
+    const { receiver } = controlledReceiver("unused");
+    const { consumers, prototype, originalGet } = controlledGets([receiver]);
+    const originalConsume = receiver.consume;
+    const failure = new Error("open failed");
+    await expect(captureNatsConsumer("nats://fixture", "STATE", async () => {
+      await consumers.get("STATE");
+      throw failure;
+    })).rejects.toBe(failure);
+    expect(prototype.get).toBe(originalGet);
+    expect(receiver.consume).toBe(originalConsume);
   });
 
   it("observes temporarily unavailable manager INFO then ready state without a new deadline", async () => {
@@ -190,7 +320,13 @@ describe("NATS harness readiness conditions", () => {
   });
 });
 
+// Opt-in premerge integration/diagnostic probes: NATS_BIN enables these locally. This new file is NOT
+// listed in the dedicated CI job; that job retains the actual product four-child and election paths.
 const binary = process.env.NATS_BIN;
+// Owned raw-SDK gate-isolation fixture ONLY. A short native heartbeat makes a lost initial pull recover
+// without test-level mutation retries, and explicit inactivity keeps the durable fixture alive. These
+// are NOT product consume options and do not claim to fix the product default-pull behavior.
+const isolationPull = { expires: 2_000, idle_heartbeat: 500 };
 let cluster: NatsElectionCluster | undefined;
 afterEach(async () => {
   if (cluster) {
@@ -221,37 +357,92 @@ it.skipIf(!binary)("real two-receiver boundary names each actual SDK get and nev
     // This gate-isolation fixture owns durable receivers, independent of the separately unresolved product
     // consumer[] outcome. Product receiver arguments remain untouched in the four-child flow.
     for (const name of ["unrelated_a", "unrelated_b", "target"]) {
-      await manager.consumers.add(stream, { durable_name: name, ack_policy: js.AckPolicy.None });
+      await manager.consumers.add(stream, { durable_name: name, ack_policy: js.AckPolicy.None,
+        inactive_threshold: 120_000 * 1e6 });
     }
     // Concurrent real SDK gets on the same stream: async-local capture must not cross identities.
     const receivers = await Promise.all(["unrelated_a", "unrelated_b"].map(name => captureNatsConsumer(seed, stream, async () => {
       const receiver = await js.jetstream(nc).consumers.get(stream, name);
-      const messages = await receiver.consume();
+      const messages = await receiver.consume(isolationPull);
       subscriptions.push(messages);
       read(messages);
       return messages;
     })));
-    expect(receivers.map(receiver => receiver.name)).toEqual(["unrelated_a", "unrelated_b"]);
-    await Promise.all(receivers.map(receiver => waitForNatsConsumerReady(seed, stream, receiver.name)));
+    const names = await Promise.all(receivers.map(async receiver => (await receiver.consumer.info(true)).name));
+    expect(names).toEqual(["unrelated_a", "unrelated_b"]);
+    await Promise.all(receivers.map(receiver => waitForNatsConsumerReady(seed, stream, receiver.consumer)));
     const unrelated = await manager.consumers.list(stream).next();
-    expect(unrelated.filter(info => info.num_waiting > 0).map(info => info.name).sort()).toEqual(receivers.map(receiver => receiver.name).sort());
+    expect(unrelated.filter(info => info.num_waiting > 0).map(info => info.name).sort()).toEqual([...names].sort());
     await expect(waitForNatsConsumerReady(seed, stream, "absent_target", { timeoutMs: 500 })).rejects.toThrow(/readiness deadline/);
     const target = await js.jetstream(nc).consumers.get(stream, "target");
     const targetInfo = await target.info(true);
     expect(targetInfo.num_waiting).toBe(0);
-    await expect(waitForNatsConsumerReady(seed, stream, targetInfo.name, { timeoutMs: 500 })).rejects.toThrow(/readiness deadline/);
-    targetMessages = await target.consume(); // Original default SDK pull; no reset/delete or mutation retry.
+    await expect(waitForNatsConsumerReady(seed, stream, target, { timeoutMs: 500 })).rejects.toThrow(/readiness deadline/);
+    targetMessages = await target.consume(isolationPull); // Owned raw fixture options, no reset/delete or mutation retry.
     read(targetMessages);
-    await waitForNatsConsumerReady(seed, stream, targetInfo.name);
+    await waitForNatsConsumerReady(seed, stream, target);
     expect((await manager.consumers.info(stream, targetInfo.name)).num_waiting).toBeGreaterThan(0);
     expect(receiveErrors).toEqual([]);
-    console.log(`NATS_READINESS_RECEIVERS ${JSON.stringify({ unrelated: receivers.map(receiver => receiver.name),
+    console.log(`NATS_READINESS_RECEIVERS ${JSON.stringify({ unrelated: names,
       target: targetInfo.name, absentRejected: true, targetWithoutPullRejected: true, originalTargetPullReady: true })}`);
   } finally {
     await targetMessages?.close();
     await Promise.all(subscriptions.map(subscription => subscription.close()));
     await nc.close();
     await Promise.all(readers);
+  }
+}, 60_000);
+
+// Additional opt-in diagnostic, NOT a stable gate-isolation fixture or a default-product recovery promise.
+// Observed: two native _1 -> _2 recoveries near 30s, but also a 45s expiry with cached _1 unchanged.
+// Keep that failure visible in diagnostics; the controlled tests above deterministically test the gate's
+// successor/racing-INFO contract without requiring the SDK itself to recover in every seeded run.
+it.skipIf(!binary || process.env.NATS_ORDERED_RECOVERY_PROBE !== "1")("real ordered SDK recovery advances the SAME captured handle after a dropped first NEXT", async () => {
+  cluster = await startNatsElectionCluster(binary!);
+  const seed = cluster.seedUrl;
+  const stream = "HARNESS_ORDERED_RECOVERY";
+  const nc = await transport.connect({ servers: [seed], ignoreClusterUpdates: true });
+  let messages: Awaited<ReturnType<js.Consumer["consume"]>> | undefined;
+  let reading: Promise<void> | undefined;
+  const errors: unknown[] = [];
+  const publish = nc.publish;
+  let dropped = 0;
+  const started = performance.now();
+  try {
+    const manager = await js.jetstreamManager(nc, { timeout: 1_000 });
+    await manager.streams.add({ name: stream, subjects: [`${stream}.state`], num_replicas: 3 });
+    await waitForNatsStreamReady(seed, stream);
+    nc.publish = function (...args: Parameters<typeof nc.publish>) {
+      if (dropped === 0 && args[0].includes(`.CONSUMER.MSG.NEXT.${stream}.`)) {
+        dropped++;
+        return; // Explicit owned seed: no handcrafted ACK and no reset/replacement/delete by the test.
+      }
+      return publish.apply(this, args);
+    };
+    let predecessor = "";
+    const captured = await captureNatsConsumer(seed, stream, async () => {
+      // Owned diagnostic's short inactivity lets the broker naturally remove the unused _1.
+      // consume() keeps the SDK default 30s expiry/heartbeat: native recovery must discover and recreate it.
+      const receiver = await js.jetstream(nc).consumers.get(stream, { name_prefix: "native_recovery", inactive_threshold: 1_000 });
+      predecessor = (await receiver.info(true)).name;
+      messages = await receiver.consume();
+      reading = (async () => { try { for await (const message of messages) void message; }
+        catch (error) { errors.push(error); } })();
+    });
+    expect(dropped).toBe(1);
+    await waitForNatsConsumerReady(seed, stream, captured.consumer);
+    const successor = await captured.consumer.info(true);
+    expect(predecessor).toBe("native_recovery_1");
+    expect(successor.name).toBe("native_recovery_2");
+    expect((await manager.consumers.info(stream, successor.name)).num_waiting).toBeGreaterThan(0);
+    expect(errors).toEqual([]);
+    console.log(`NATS_READINESS_NATIVE_RECOVERY ${JSON.stringify({ predecessor, successor: successor.name,
+      sameConsumedHandle: true, droppedFirstNext: dropped, elapsedMs: performance.now() - started })}`);
+  } finally {
+    nc.publish = publish;
+    await messages?.close();
+    await nc.close();
+    await reading;
   }
 }, 60_000);
 

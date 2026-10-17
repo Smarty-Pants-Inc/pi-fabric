@@ -32,9 +32,9 @@ const { MeshStore } = await jiti.import("./src/mesh/store.ts");
 if (kind === "nats") {
   const { openNatsStateBackend, natsStreamName } = await jiti.import("./src/mesh/state-backend-nats.ts");
   const { captureNatsConsumer, waitForNatsConsumerReady } = await jiti.import("./tests/helpers/nats-consumer-ready.ts");
-  const { name } = await captureNatsConsumer(process.env.NATS_SERVER_URL, natsStreamName(root), () =>
+  const { consumer } = await captureNatsConsumer(process.env.NATS_SERVER_URL, natsStreamName(root), () =>
     openNatsStateBackend({ root, servers: [process.env.NATS_SERVER_URL], monitoringUrl: process.env.NATS_MONITOR_URL }));
-  await waitForNatsConsumerReady(process.env.NATS_SERVER_URL, natsStreamName(root), name);
+  await waitForNatsConsumerReady(process.env.NATS_SERVER_URL, natsStreamName(root), consumer);
 }
 const store = new MeshStore(root, 64 * 1024, 1000, { stateBackend: kind });
 if (store.stateBackend !== kind) throw new Error("not " + kind + ": " + JSON.stringify(store.stateDiagnostics()));
@@ -81,7 +81,7 @@ describe.each(["sqlite", "nats"] as const)("%s state backend across processes", 
     roots.push(root);
     // sqlite mode opens only an imported root (smarty-dev#6477): the harness imports the fresh root first.
     // nats: prepare the shared stream before spawning writers, without leaving an idle parent consumer.
-    // Each child names its actual SDK receiver and waits for that receiver's NEXT, never another child's LIST entry.
+    // Each child retains its actual SDK receiver and follows its current identity/NEXT, never another child's LIST entry.
     // No setup publishes or write retries.
     if (kind === "sqlite") await importMeshState(root);
     else await prepareNatsStream(root);

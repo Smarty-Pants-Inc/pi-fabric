@@ -85,8 +85,8 @@ describe.each(["fake", "nats"] as const)("file <-> nats migration on the %s serv
     expect(() => new MeshStore(root, 64 * 1024, 1_000, { stateBackend: "file" }).get("seed/solo")).toThrow(/moved to NATS stream/);
     const open = () => openNatsStateBackend({ root, ...(options.port ? { port: options.port } : { servers: options.servers!, monitoringUrl: options.monitoringUrl! }) });
     if (target === "nats") {
-      const { name } = await captureNatsConsumer(natsServerUrl!, natsStreamName(root), open);
-      await waitForNatsConsumerReady(natsServerUrl!, natsStreamName(root), name);
+      const { consumer } = await captureNatsConsumer(natsServerUrl!, natsStreamName(root), open);
+      await waitForNatsConsumerReady(natsServerUrl!, natsStreamName(root), consumer);
     } else await open();
     const nats = new MeshStore(root, 64 * 1024, 1_000, { stateBackend: "nats" });
     stores.push(nats);
@@ -127,7 +127,7 @@ describe.each(["fake", "nats"] as const)("file <-> nats migration on the %s serv
       ...(options.port ? { port: options.port } : { servers: options.servers!, monitoringUrl: options.monitoringUrl! }) });
     const captured = target === "nats" ? await captureNatsConsumer(natsServerUrl!, imported.stream, open) : undefined;
     const backend = captured ? captured.value : await open();
-    if (captured) await waitForNatsConsumerReady(natsServerUrl!, imported.stream, captured.name);
+    if (captured) await waitForNatsConsumerReady(natsServerUrl!, imported.stream, captured.consumer);
     for (let index = 0; index < 5; index++) await backend.put({ key: `after/${index}`, value: index, identity });
     expect(await backend.compact()).toBe(true);
     await backend.put({ key: "after/last", value: "tail", identity });

@@ -27,7 +27,9 @@ import type { FabricTransport, TransportEnvelope, TransportSent } from "../src/t
 import type { FabricActorInfo, FabricActorMessage } from "../src/actors/types.js";
 import type { AgentRunRecord } from "../src/agents/types.js";
 import { transportDurableName, transportInboxStream } from "../src/transport/nats/subjects.js";
-import { createPathBHarness, openJetStream, PATH_B_MACHINES, resolveNatsBinary, type PathBHarness } from "./helpers/nats-cluster.js";
+import { createPathBHarness, openJetStream, PATH_B_MACHINES, resolveNatsBinary, teardownWithin, type PathBHarness } from "./helpers/nats-cluster.js";
+import { launchLog, stopOwned, type LaunchLog, type Owned } from "./helpers/owned-processes.js";
+import { captureDescendants, observeProcessTree, type ObservedProcessTree } from "../src/residency/launcher-owner.js";
 
 const binary = resolveNatsBinary();
 if (!binary && process.env.NATS_AUTH_REQUIRED === "1") throw new Error("NATS_AUTH_REQUIRED=1: cross-owner actor ask requires NATS_BIN");
@@ -98,7 +100,7 @@ function runtimeFor(root: string, sessionId: string) {
     cwd: root, signal: AbortSignal.timeout(30_000), parentToolCallId: "path-b-actor-ask", nestedToolCallId: ref, extensionContext: context,
     update() {}, approve: async () => {}, audits: [], maxResultChars: 50_000,
   });
-  return { runtime, context, invoke };
+  return { runtime, context, invoke, nativeShutdown: runtime.shutdown.bind(runtime) };
 }
 
 // Generated only in this test's private temp tree. Both the control dispatcher and actor
@@ -125,6 +127,7 @@ import { MeshStore } from ${source("mesh/store.ts")};
 import { openFabricTransport } from ${source("transport/index.ts")};
 const input = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
 const { root, config, sessionId } = input;
+await import(input.ownershipPreload);
 // Supported native model registration and the production worker/launcher. The only
 // deterministic boundary is the keyless scripted model, never control/admission/ACK.
 const modelRuntime = await ModelRuntime.create({ modelsPath: null, refreshOnCreate: false, authPath: path.join(root, "agent/auth.json") });
@@ -132,7 +135,7 @@ const faux = fauxProvider({ provider: "nats-ask-faux", models: [{ id: "one-turn"
 modelRuntime.registerNativeProvider(faux.provider);
 await modelRuntime.getAvailable("nats-ask-faux");
 const providerFile = path.join(root, "faux-provider.ts"), workerFile = path.join(root, "worker.ts");
-fs.writeFileSync(providerFile, ${JSON.stringify(`
+fs.writeFileSync(providerFile, "import " + JSON.stringify(input.ownershipPreload) + ";\\n" + ${JSON.stringify(`
 import fs from "node:fs";
 import { fauxProvider, fauxAssistantMessage } from ${ai};
 export default function(pi) {
@@ -141,11 +144,14 @@ export default function(pi) {
  const birth = pid => fs.readFileSync("/proc/" + pid + "/stat", "utf8").split(")").at(-1).trim().split(/\\s+/)[19];
  faux.setResponses([fauxAssistantMessage(input.reply)]);
  pi.registerProvider(faux.provider);
- pi.on("agent_start", () => fs.appendFileSync(input.root + "/model-events.jsonl", JSON.stringify({ type: "agent_start", pid: process.pid, birth: birth(process.pid), workerPid: process.ppid, workerBirth: birth(process.ppid) }) + "\\n"));
+ pi.on("agent_start", async () => {
+  fs.appendFileSync(input.root + "/model-events.jsonl", JSON.stringify({ type: "agent_start", pid: process.pid, birth: birth(process.pid), workerPid: process.ppid, workerBirth: birth(process.ppid) }) + "\\n");
+  if (input.stallShutdown) await new Promise(() => { setInterval(() => {}, 1000); });
+ });
  pi.on("turn_end", () => fs.appendFileSync(input.root + "/model-events.jsonl", JSON.stringify({ type: "turn_end", pid: process.pid, calls: faux.state.callCount }) + "\\n"));
 }
 `)}.replace('"__INPUT_FILE__"', JSON.stringify(process.argv[2])));
-fs.writeFileSync(workerFile, "import " + JSON.stringify(${source("worker.ts")}) + ";\\n");
+fs.writeFileSync(workerFile, "import " + JSON.stringify(input.ownershipPreload) + ";\\nawait import(" + JSON.stringify(${source("worker.ts")}) + ");\\n");
 fs.mkdirSync(path.join(root, "agent"), { recursive: true });
 fs.writeFileSync(path.join(root, "agent/settings.json"), JSON.stringify({ extensions: [providerFile], compaction: { enabled: false }, retry: { enabled: false } }));
 fs.writeFileSync(path.join(root, "agent/fabric.json"), JSON.stringify(config));
@@ -173,6 +179,10 @@ const runtime = new FabricRuntimeState(pi, new CapturedToolCatalog(), { paths: {
 const invoke = (ref, args) => runtime.registry.invoke(ref, args, { cwd: root, signal: AbortSignal.timeout(30000), parentToolCallId: "path-b-owner", nestedToolCallId: ref, extensionContext: context,
  update() {}, approve: async () => {}, audits: [], maxResultChars: 50000 });
 await runtime.initialize(context, config);
+if (input.stallShutdown) runtime.shutdown = async () => {
+ fs.writeFileSync(path.join(root, "shutdown-entered"), String(process.pid));
+ await new Promise(() => {});
+};
 let actor;
 const unsubscribe = runtime.actors.subscribe(() => { if (actor) {
  const { status, queued, messages, preparing, inFlightRun, lastRunId } = runtime.actors.status(actor.id);
@@ -219,17 +229,26 @@ class OwnerProcess {
   private serial = 0;
   private pending = new Map<number, { resolve(value: unknown): void; reject(error: Error): void; timer: NodeJS.Timeout }>();
   private stderr = "";
-  constructor(file: string, inputFile: string, environment: NodeJS.ProcessEnv) {
+  private readonly tree: ObservedProcessTree;
+  private readonly closed: Promise<void>;
+  private readonly lines: ReturnType<typeof createInterface>;
+  readonly forced: Array<{ pid: number; started: string }> = [];
+  readonly liveAtForce: Array<{ pid: number; started: string }> = [];
+  constructor(file: string, inputFile: string, environment: NodeJS.ProcessEnv, private readonly launches: LaunchLog) {
     this.child = spawn("bun", [file, inputFile], { env: environment, stdio: ["pipe", "pipe", "pipe"] });
+    this.tree = this.child.pid ? observeProcessTree(this.child.pid) : { processes: new Map() };
+    this.closed = new Promise(resolve => this.child.once("close", () => resolve()));
     this.ready = this.response<OwnerReady>(0);
+    void this.ready.catch(() => undefined);
     this.child.stderr!.on("data", chunk => { this.stderr = (this.stderr + String(chunk)).slice(-12_000); });
-    createInterface({ input: this.child.stdout! }).on("line", line => {
+    this.lines = createInterface({ input: this.child.stdout! }).on("line", line => {
       if (!line.startsWith("NATS_ASK_RPC ")) return;
       const message = JSON.parse(line.slice("NATS_ASK_RPC ".length));
       const waiter = this.pending.get(message.id);
       if (waiter) { clearTimeout(waiter.timer); this.pending.delete(message.id); message.error ? waiter.reject(new Error(message.error)) : waiter.resolve(message.value); }
     });
     const failed = (error: Error) => { for (const pending of this.pending.values()) { clearTimeout(pending.timer); pending.reject(error); } this.pending.clear(); };
+    this.child.stdin!.on("error", failed);
     this.child.once("error", failed);
     this.child.once("exit", (code, signal) => failed(new Error(`Owner exited ${code}/${signal}: ${this.stderr}`)));
   }
@@ -241,16 +260,52 @@ class OwnerProcess {
   }
   call<T>(method: string, args?: unknown) {
     const id = ++this.serial, result = this.response<T>(id);
+    void result.catch(() => undefined); // Also covers a synchronous pipe-write failure.
     this.child.stdin!.write(JSON.stringify({ id, method, args }) + "\n");
     return result;
   }
+  private ownedProcesses(): Owned[] {
+    // Sampling supplements launch receipts for early startup failures, but is NOT
+    // the membership proof: explicit Bun wrapper + native profile self-recording
+    // retains the known worker/model births before the owner can orphan them.
+    captureDescendants(this.tree);
+    const sampled = [...this.tree.processes.values()].map(row => ({ pid: row.pid, started: row.processStartTime, at: 0, argv: [] }));
+    return [...new Map([...sampled, ...this.launches.owned()].map(row => [`${row.pid}:${row.started}`, row])).values()];
+  }
   async stop() {
-    if (this.child.exitCode !== null || this.child.signalCode !== null) return;
-    const exited = new Promise<void>(resolve => this.child.once("exit", () => resolve()));
-    const kill = setTimeout(() => this.child.kill("SIGKILL"), 5_000);
-    try { await this.call("shutdown"); this.child.stdin!.end(); }
-    finally { await exited; clearTimeout(kill); }
-    if (this.child.exitCode !== 0) throw new Error(`Owner shutdown was not clean: ${this.child.exitCode}/${this.child.signalCode}`);
+    const failures: unknown[] = [];
+    let owned = this.ownedProcesses(); // Retain detached levels BEFORE requesting shutdown.
+    try {
+      if (this.child.exitCode === null && this.child.signalCode === null) {
+        await teardownWithin("owner shutdown", () => this.call("shutdown"), 3_000);
+        this.child.stdin!.end();
+      }
+      await teardownWithin("owner native close", () => this.closed);
+      owned = this.ownedProcesses();
+      if (owned.some(row => processBirth(row.pid) === row.started)) throw new Error("Owner shutdown left owned descendants alive");
+      if (this.child.exitCode !== 0) throw new Error(`Owner shutdown was not clean: ${this.child.exitCode}/${this.child.signalCode}`);
+    } catch (error) { failures.push(error); }
+    finally {
+      // Even RPC/native-exit failure must reach every retained detached birth.
+      try {
+        owned = this.ownedProcesses();
+        this.liveAtForce.push(...owned.filter(row => processBirth(row.pid) === row.started).map(({ pid, started }) => ({ pid, started })));
+        // Leaf first so the live production worker/owner can reap their children.
+        for (const row of [...owned].reverse()) {
+          try {
+            if (processBirth(row.pid) !== row.started) continue;
+            this.forced.push({ pid: row.pid, started: row.started });
+            const remaining = await stopOwned(row, 300, 1_000);
+            if (remaining !== undefined || processBirth(row.pid) === row.started) failures.push(new Error(`Owned birth did not exit: ${row.pid}:${row.started}`));
+          } catch (error) { failures.push(error); }
+        }
+      } catch (error) { failures.push(error); }
+      try { await teardownWithin("owner forced native close", () => this.closed); } catch (error) { failures.push(error); }
+      for (const waiter of this.pending.values()) { clearTimeout(waiter.timer); waiter.reject(new Error("Owner teardown finished")); }
+      this.pending.clear();
+      this.lines.close(); this.child.stdin?.destroy(); this.child.stdout?.destroy(); this.child.stderr?.destroy();
+    }
+    if (failures.length) throw new AggregateError(failures, failures.map(String).join("; "));
   }
 }
 function processBirth(pid: number): string | undefined {
@@ -259,6 +314,50 @@ function processBirth(pid: number): string | undefined {
     return stat.slice(stat.lastIndexOf(")") + 1).trim().split(/\s+/)[19];
   }
   catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error; }
+}
+async function cleanupPathB(root: string, sender: ReturnType<typeof runtimeFor>, owner?: OwnerProcess, inspector?: FabricTransport, broker?: PathBHarness) {
+  const failures: unknown[] = [];
+  const attempt = async (operation: () => Promise<unknown>) => { try { await operation(); } catch (error) { failures.push(error); } };
+  const brokerChild = broker?.serverProcess;
+  let senderFailed = false;
+  try {
+    // Each participant owns a bounded join; neither failure suppresses the other.
+    await Promise.all([
+      attempt(async () => {
+        try { await teardownWithin("sender shutdown", () => sender.runtime.shutdown("exit")); }
+        catch (error) { senderFailed = true; throw error; }
+      }),
+      attempt(() => owner?.stop() ?? Promise.resolve()),
+    ]);
+  } finally {
+    // The fixture retains the real close capability even when its public shutdown
+    // completion seam is stalled. Close native sender resources BEFORE root removal;
+    // do not merely race away from a live RPC/transport in the Vitest process.
+    if (senderFailed) await attempt(() => teardownWithin("sender native fallback", () => sender.nativeShutdown("exit")));
+    try { await attempt(() => teardownWithin("inspector close", () => inspector?.close() ?? Promise.resolve())); }
+    finally {
+      try { await attempt(() => broker?.stop() ?? Promise.resolve()); }
+      finally {
+        vi.restoreAllMocks(); vi.unstubAllEnvs();
+        try { fs.rmSync(root, { recursive: true, force: true }); } catch (error) { failures.push(error); }
+      }
+    }
+  }
+  console.log("PATH_B_ASK_CLEANUP", JSON.stringify({ ownerPid: owner?.child.pid, ownerExitCode: owner?.child.exitCode,
+    ownerSignal: owner?.child.signalCode, forced: owner?.forced, liveAtForce: owner?.liveAtForce, brokerPid: brokerChild?.pid, brokerExitCode: brokerChild?.exitCode,
+    brokerSignal: brokerChild?.signalCode, privateRootExists: fs.existsSync(root), failures: failures.map(String) }));
+  if (failures.length) throw new AggregateError(failures, failures.map(String).join("; "));
+}
+function watchFile(root: string, check: () => boolean, label: string) {
+  return until(check, listener => {
+    const watcher = fs.watch(root, listener);
+    return () => watcher.close();
+  }, label);
+}
+async function guardedWait<T>(operation: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try { return await Promise.race([operation, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(label)), ms); })]); }
+  finally { clearTimeout(timer); }
 }
 function snapshot(root: string) {
   const bytes: Record<string, string> = {};
@@ -277,6 +376,7 @@ describe.skipIf(!binary || process.platform !== "linux")("Path B cross-process a
   it("runs one genuine actor activation, returns its correlated reply, and confirms both inbox ACKs without sender event-log writes", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "nats-actor-ask-"));
     fs.chmodSync(root, 0o700);
+    const launches = launchLog(root);
     const senderRoot = path.join(root, "sender"), ownerRoot = path.join(root, "owner");
     for (const dir of [senderRoot, ownerRoot]) fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
     for (const name of Object.keys(process.env)) if (name.startsWith("PI_FABRIC_")) vi.stubEnv(name, undefined);
@@ -298,9 +398,9 @@ describe.skipIf(!binary || process.platform !== "linux")("Path B cross-process a
       fs.writeFileSync(path.join(senderMesh, "event-archive.json"), JSON.stringify({ version: 1, dir: path.join(senderMesh, "archive") }));
       const ownerFile = path.join(root, "owner.ts"), inputFile = path.join(root, "owner-input.json");
       fs.writeFileSync(ownerFile, ownerSource());
-      fs.writeFileSync(inputFile, JSON.stringify({ root: ownerRoot, config: ownerConfig, sessionId: ownerSession, reply }));
-      owner = new OwnerProcess(ownerFile, inputFile, { ...process.env, PI_CODING_AGENT_DIR: path.join(ownerRoot, "agent"), PI_FABRIC_PROJECT_ROOT: ownerRoot,
-        PI_FABRIC_PI_BINARY: path.join(repository, "node_modules/@earendil-works/pi-coding-agent/dist/cli.js"), TMPDIR: ownerRoot });
+      fs.writeFileSync(inputFile, JSON.stringify({ root: ownerRoot, config: ownerConfig, sessionId: ownerSession, reply, ownershipPreload: path.join(root, "launch-preload.mjs") }));
+      owner = new OwnerProcess(ownerFile, inputFile, { ...process.env, ...launches.env, PI_CODING_AGENT_DIR: path.join(ownerRoot, "agent"), PI_FABRIC_PROJECT_ROOT: ownerRoot,
+        PI_FABRIC_PI_BINARY: path.join(repository, "node_modules/@earendil-works/pi-coding-agent/dist/cli.js"), TMPDIR: ownerRoot }, launches);
       const ready = await owner.ready;
       expect(ready).toMatchObject({ root: ownerRoot, hostId: ownerId });
       expect(ready.pid).not.toBe(process.pid); expect(ownerRoot).not.toBe(senderRoot);
@@ -405,16 +505,142 @@ describe.skipIf(!binary || process.platform !== "linux")("Path B cross-process a
         ownerAckPending: ownerConsumer.num_ack_pending, senderAckPending: senderConsumer.num_ack_pending,
         senderSnapshotPaths: Object.keys(before).sort(), senderSnapshotUnchanged: true }));
     } finally {
-      const stopped = await Promise.allSettled([sender.runtime.shutdown("exit"), owner?.stop()]);
-      try { await inspector?.close(); }
-      finally {
-        try { await broker?.stop(); }
-        finally { vi.restoreAllMocks(); vi.unstubAllEnvs(); fs.rmSync(root, { recursive: true, force: true }); }
-      }
-      const failure = stopped.find(result => result.status === "rejected");
-      if (failure?.status === "rejected") throw failure.reason;
-      console.log("PATH_B_ASK_CLEANUP", JSON.stringify({ ownerPid: owner?.child.pid, ownerExitCode: owner?.child.exitCode,
-        ownerSignal: owner?.child.signalCode, privateRootExists: fs.existsSync(root) }));
+      await cleanupPathB(root, sender, owner, inspector, broker);
+      expect(owner?.forced ?? []).toEqual([]); // Normal shutdown is still natural code 0, never a force-pass.
     }
   }, 90_000);
+
+  // Keep: #14568 process-ownership/data safety. The native agent_start hook holds
+  // a real model while its production worker is alive; cleanup completions are faulted.
+  it("bounds a stalled runtime shutdown and removes the live detached worker/model tree, broker and private root", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "nats-actor-stall-"));
+    fs.chmodSync(root, 0o700);
+    const launches = launchLog(root);
+    const senderRoot = path.join(root, "sender"), ownerRoot = path.join(root, "owner");
+    for (const dir of [senderRoot, ownerRoot]) fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    for (const name of Object.keys(process.env)) if (name.startsWith("PI_FABRIC_")) vi.stubEnv(name, undefined);
+    vi.stubEnv("SMARTY_AGENT", undefined);
+    vi.stubEnv("PI_CODING_AGENT_DIR", path.join(senderRoot, "agent"));
+    vi.stubEnv("PI_FABRIC_PROJECT_ROOT", senderRoot);
+    vi.stubEnv("TMPDIR", root);
+    const sender = runtimeFor(senderRoot, senderSession);
+    let broker: PathBHarness | undefined, owner: OwnerProcess | undefined, inspector: FabricTransport | undefined;
+    const realSenderShutdown = sender.runtime.shutdown.bind(sender.runtime);
+    let owned: Owned[] = [], brokerChild: ChildProcess | undefined, brokerBirth: string | undefined;
+    let ask: Promise<unknown> | undefined, sibling: ChildProcess | undefined, siblingOwned: Owned | undefined;
+    let nativeInspectorClose: (() => Promise<void>) | undefined;
+    try {
+      const siblingFile = path.join(root, "unrelated-sibling.cjs");
+      fs.writeFileSync(siblingFile, 'process.stdout.write("ready\\n"); setInterval(() => {}, 1000);');
+      sibling = spawn(process.execPath, [siblingFile], { stdio: ["ignore", "pipe", "ignore"] });
+      siblingOwned = { pid: sibling.pid!, started: processBirth(sibling.pid!)!, at: Date.now(), argv: [] };
+      await teardownWithin("unrelated sibling ready", () => new Promise<void>(resolve => sibling!.stdout!.once("data", () => resolve())));
+      expect(siblingOwned.started).toMatch(/^\d+$/);
+      // A deliberately stale birth must not authorize even an otherwise owned PID.
+      await stopOwned({ ...siblingOwned, started: `stale-${siblingOwned.started}` }, 10, 10);
+      expect(processBirth(sibling.pid!)).toBe(siblingOwned.started);
+      broker = await createPathBHarness({ ...(binary ? { binary } : {}), tls: {} });
+      brokerChild = broker.serverProcess; brokerBirth = processBirth(brokerChild!.pid!);
+      for (const [name, value] of Object.entries(broker.adminEnv(broker.users.bootstrap))) vi.stubEnv(name, value);
+      expect(await runTransportAdmin(["provision", "--ca-file", broker.tls!.caFile, "--machines", PATH_B_MACHINES.join(",")])).toBe(0);
+      for (const name of Object.keys(broker.adminEnv(broker.users.bootstrap))) vi.stubEnv(name, undefined);
+      const ownerFile = path.join(root, "owner.ts"), inputFile = path.join(root, "owner-input.json");
+      fs.writeFileSync(ownerFile, ownerSource());
+      fs.writeFileSync(inputFile, JSON.stringify({ root: ownerRoot, config: configFor(broker, ownerRoot, "machine-a"), sessionId: ownerSession,
+        reply, stallShutdown: true, ownershipPreload: path.join(root, "launch-preload.mjs") }));
+      owner = new OwnerProcess(ownerFile, inputFile, { ...process.env, ...launches.env, PI_CODING_AGENT_DIR: path.join(ownerRoot, "agent"),
+        PI_FABRIC_PROJECT_ROOT: ownerRoot, PI_FABRIC_PI_BINARY: path.join(repository, "node_modules/@earendil-works/pi-coding-agent/dist/cli.js"), TMPDIR: ownerRoot }, launches);
+      await owner.ready;
+      await sender.runtime.initialize(sender.context, configFor(broker, senderRoot, "machine-b"));
+      const actor = await owner.call<FabricActorInfo>("create", { name: "stalled-actor", scope: "session", instructions: "Reply once.", responseMode: "text", coalesce: false });
+      // Observe rejection immediately: forced owner exit must not become an unhandled rejection.
+      ask = sender.invoke("agents.ask", { id: actor.id, message: "Hold at the native agent_start barrier." }).then(value => ({ value }), error => ({ error: String(error) }));
+      const eventFile = path.join(ownerRoot, "model-events.jsonl");
+      await watchFile(ownerRoot, () => fs.existsSync(eventFile) && fs.readFileSync(eventFile, "utf8").includes('"agent_start"'), "live native model agent_start");
+      const model = JSON.parse(fs.readFileSync(eventFile, "utf8").trim().split("\n")[0]!);
+      owned = launches.owned();
+      for (const [pid, started] of [[model.pid, model.birth], [model.workerPid, model.workerBirth], [owner.child.pid, processBirth(owner.child.pid!)]]) {
+        expect(started).toMatch(/^\d+$/);
+        expect(owned.some(entry => entry.pid === pid && entry.started === started)).toBe(true);
+        expect(processBirth(pid)).toBe(started);
+      }
+      console.log("PATH_B_STALL_READY", JSON.stringify({ root, ownerPid: owner.child.pid, model, brokerPid: brokerChild!.pid, brokerBirth }));
+      // Keep the genuine ask in flight until the owner force branch. The retained
+      // native sender close capability is joined afterward, before root removal.
+      vi.spyOn(sender.runtime, "shutdown").mockImplementation(() => new Promise(() => {}));
+      inspector = await openFabricTransport({ config: configFor(broker, senderRoot, "machine-b").mesh, hostId: "stall-inspector",
+        mesh: new MeshStore(path.join(senderRoot, "inspector"), 65_536, 1_000) });
+      nativeInspectorClose = inspector.close.bind(inspector);
+      vi.spyOn(inspector, "close").mockImplementation(async () => { await nativeInspectorClose!(); await new Promise(() => {}); });
+      const nc = await broker.connect(broker.users.bootstrap), nativeConnectionClosed = nc.closed();
+      vi.spyOn(nc, "close").mockImplementation(() => new Promise(() => {}));
+      const entered = watchFile(ownerRoot, () => fs.existsSync(path.join(ownerRoot, "shutdown-entered")), "runtime.shutdown entered");
+      void entered.catch(() => undefined);
+      const start = performance.now();
+      let failure: unknown;
+      try { await guardedWait(cleanupPathB(root, sender, owner, inspector, broker), 12_000, "cleanup exceeded outer guard"); }
+      catch (error) { failure = error; }
+      await entered;
+      expect(failure).toBeInstanceOf(Error);
+      for (const phase of ["owner shutdown", "sender shutdown", "inspector close", "NATS connection close"]) expect(String(failure)).toContain(`${phase} timed out`);
+      expect(owner.liveAtForce).toEqual(expect.arrayContaining([{ pid: model.pid, started: model.birth }, { pid: model.workerPid, started: model.workerBirth }]));
+      expect(owner.forced).toContainEqual({ pid: model.pid, started: model.birth });
+      await teardownWithin("broker socket native close", () => nativeConnectionClosed);
+      expect(nc.isClosed()).toBe(true);
+      const askOutcome = await teardownWithin("in-flight ask settled", () => ask!);
+      expect(askOutcome).toHaveProperty("error");
+      expect(performance.now() - start).toBeLessThan(10_000);
+      for (const entry of owned) expect(processBirth(entry.pid), `owned birth survived: ${entry.pid}`).not.toBe(entry.started);
+      expect(processBirth(brokerChild!.pid!)).not.toBe(brokerBirth);
+      expect(brokerChild!.exitCode !== null || brokerChild!.signalCode !== null).toBe(true);
+      expect(fs.existsSync(root)).toBe(false);
+      expect(owned.some(entry => entry.pid === sibling!.pid)).toBe(false);
+      expect(processBirth(sibling.pid!)).toBe(siblingOwned.started);
+      console.log("PATH_B_STALL_CLEANUP", JSON.stringify({ root, elapsedMs: performance.now() - start, failure: String(failure),
+        owned: owned.map(({ pid, started }) => ({ pid, started })), siblingPid: sibling.pid, siblingBirth: siblingOwned.started, siblingPreserved: true, brokerPid: brokerChild!.pid,
+        brokerExitCode: brokerChild!.exitCode, brokerSignal: brokerChild!.signalCode, privateRootExists: fs.existsSync(root) }));
+    } finally {
+      // Independent emergency guard also makes the intentional pre-fix RED safe.
+      // Leaf first: keep the actual worker/owner alive to reap their native children.
+      owned = owned.length ? owned : launches.owned();
+      for (const entry of [...owned].reverse()) await stopOwned(entry, 300, 1_000);
+      if (siblingOwned) await stopOwned(siblingOwned, 300, 1_000);
+      if (brokerChild?.pid && brokerBirth) await stopOwned({ pid: brokerChild.pid, started: brokerBirth, at: Date.now(), argv: [] }, 300, 1_000);
+      await teardownWithin("emergency inspector close", () => nativeInspectorClose?.() ?? Promise.resolve()).catch(() => undefined);
+      await guardedWait(realSenderShutdown("exit"), 1_000, "emergency sender shutdown did not settle").catch(() => undefined);
+      await guardedWait(ask ?? Promise.resolve(), 1_000, "ask did not settle after owned exit").catch(() => undefined);
+      vi.restoreAllMocks(); vi.unstubAllEnvs(); fs.rmSync(root, { recursive: true, force: true });
+      const remaining = [...owned, ...(siblingOwned ? [siblingOwned] : []), ...(brokerChild?.pid && brokerBirth ? [{ pid: brokerChild.pid, started: brokerBirth }] : [])]
+        .filter(entry => processBirth(entry.pid) === entry.started).map(({ pid, started }) => ({ pid, started }));
+      console.log("PATH_B_STALL_GUARD", JSON.stringify({ root, remaining, privateRootExists: fs.existsSync(root) }));
+      expect(remaining).toEqual([]);
+    }
+  }, 45_000);
+
+  it("reaps the private broker with bounded SIGKILL escalation even when connection close rejects", async () => {
+    const broker = await createPathBHarness({ binary: binary! });
+    const child = broker.serverProcess!, pid = child.pid!, birth = processBirth(pid);
+    try {
+      const nc = await broker.connect(broker.users.bootstrap), nativeClosed = nc.closed();
+      vi.spyOn(nc, "close").mockRejectedValue(new Error("seeded connection close rejection"));
+      const nativeKill = child.kill.bind(child);
+      // Owned fault seam: withhold TERM only, requiring the real broker to exit
+      // through the actual SIGKILL branch. No synthetic exit event/receipt.
+      vi.spyOn(child, "kill").mockImplementation(signal => signal === "SIGTERM" ? true : nativeKill(signal));
+      const start = performance.now();
+      const failure = await broker.stop().then(() => undefined, error => error);
+      expect(String(failure)).toContain("seeded connection close rejection");
+      expect(performance.now() - start).toBeLessThan(4_000);
+      expect(child.signalCode).toBe("SIGKILL");
+      expect(processBirth(pid)).not.toBe(birth);
+      await teardownWithin("rejected-connection native close", () => nativeClosed);
+      expect(nc.isClosed()).toBe(true);
+      expect(fs.existsSync(broker.root)).toBe(false);
+      console.log("PATH_B_BROKER_ESCALATION", JSON.stringify({ pid, birth, signal: child.signalCode, elapsedMs: performance.now() - start,
+        nativeConnectionClosed: nc.isClosed(), privateRoot: broker.root, privateRootExists: fs.existsSync(broker.root), failure: String(failure) }));
+    } finally {
+      vi.restoreAllMocks();
+      await teardownWithin("emergency broker stop", () => broker.stop(), 5_000);
+    }
+  }, 15_000);
 });

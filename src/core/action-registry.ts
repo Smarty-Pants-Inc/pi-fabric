@@ -1,5 +1,6 @@
 import type { ProviderOperations, ProviderOperation } from "./provider-operations.js";
 import { snapshotFabricInvocation } from "../fabric-provenance.js";
+import { AgentSpawnForbiddenError } from "../agents/spawn-authority.js";
 import { retainResidentProcessWork } from "../residency/process-work.js";
 import { CapabilityAuthority } from "../verified/authority.js";
 import { randomUUID } from "node:crypto";
@@ -98,6 +99,8 @@ export interface FabricCallAudit {
   endedAt?: number;
   success?: boolean;
   error?: string;
+  /** Host error classification; never recovered from model-visible error text. */
+  errorCode?: string;
   resultChars?: number;
   resultTruncated?: boolean;
   tool?: string;
@@ -1210,6 +1213,7 @@ export class ActionRegistry {
       if (audit) {
         audit.success = false;
         audit.error = message;
+        if (error instanceof AgentSpawnForbiddenError) audit.errorCode = error.code;
         audit.endedAt = Date.now();
         context.observeInvocation?.({
           type: "call_end",

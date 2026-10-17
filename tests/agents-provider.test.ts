@@ -428,13 +428,25 @@ describe("fleet model policy (#2490)", () => {
 
   it("F6 #3115 missing child creation host fails closed before local commitment", async () => {
     const { provider, actors, agents, root } = setup([], [], undefined, {
-      identity: { id: "task:worker", name: "worker", kind: "agent" }, mainAgentId: "session:upstream-main",
+      identity: { id: "session:worker", name: "main", kind: "main" }, mainAgentId: "session:upstream-main",
     });
     vi.spyOn(agents, "runtimeHostId", "get").mockReturnValue(undefined);
     delete (provider.participants as Partial<FabricParticipantSource>).self;
     await expect(provider.invoke("create", { name: "no-owner", instructions: "Review." }, context))
       .rejects.toThrow("Local actor creation requires a runtime owner host ID");
     expect(actors.list()).toEqual([]);
+    expect(fs.existsSync(path.join(root, "actors"))).toBe(false);
+  });
+
+  it("TASK parent actor creation is forbidden before local commitment (#12187)", async () => {
+    const { provider, actors, agents, globalActors, root } = setup([], [], undefined, {
+      identity: { id: "task:worker", name: "worker", kind: "agent" }, mainAgentId: "session:upstream-main",
+    });
+    await expect(provider.invoke("create", { name: "no-child", instructions: "Review." }, context))
+      .rejects.toMatchObject({ name: "AgentSpawnForbiddenError", code: "FABRIC_AGENT_SPAWN_FORBIDDEN", launchOutcome: "unlaunched" });
+    expect(actors.list()).toEqual([]);
+    expect(agents.list()).toEqual([]);
+    expect(globalActors.list()).toEqual([]);
     expect(fs.existsSync(path.join(root, "actors"))).toBe(false);
   });
 
@@ -452,7 +464,8 @@ describe("fleet model policy (#2490)", () => {
     expect(actors.status(previous.id).status).toBe("stopped");
   });
 
-  it.each((["main", "task", "actor"] as const).flatMap(parent =>
+  // TASK parents cannot create actors; their pre-commit refusal is covered above.
+  it.each((["main", "actor"] as const).flatMap(parent =>
     (["create", "import"] as const).flatMap(action =>
       (["registry", "presence"] as const).flatMap(publication =>
         (["Escape", "deadline", "revocation"] as const).map(ending => [parent, action, publication, ending] as const)))))(
@@ -460,7 +473,7 @@ describe("fleet model policy (#2490)", () => {
       const hostId = parent === "main" ? "session:test" : "runtime:child-native-session";
       const { provider, actors, globalActors, root, mesh, identity } = setup([], [], undefined, parent === "main" ? { ownsRuntime: false } : {
         ownsRuntime: false,
-        identity: { id: `${parent}:worker`, name: "worker", kind: parent === "task" ? "agent" : "actor", sessionId: "test" },
+        identity: { id: `${parent}:worker`, name: "worker", kind: "actor", sessionId: "test" },
         hostId, mainAgentId: "session:upstream-main", selfOwnerHostId: "resident:upstream-main",
       });
       const published = new ParticipantDirectory(mesh, { enabled: true, hostId, rootId: provider.mainAgent.id, identity });
@@ -649,9 +662,10 @@ describe("fleet model policy (#2490)", () => {
     expect(actors.list()).toEqual([]);
   });
   const policy = { model: "cliproxyapi/gpt-6-astra", thinking: "low" as const, deniedModels: ["cliproxyapi/gpt-6-astra", "cliproxyapi/gpt-6-sol"], deniedModelReplacement: "cliproxyapi/gpt-6.1-sol" };
-  it.each(["actor", "agent"] as const)("inherits the %s spawning run's admitted model and thinking", async (kind) => {
+  it.each(["actor", "main"] as const)("inherits the %s spawning run's admitted model and thinking", async (kind) => {
     const { provider, agents, actors } = setup([], [], undefined, {
       identity: { id: `${kind}:parent`, name: "parent", kind, sessionId: "test" },
+      ...(kind !== "main" ? { mainAgentId: "session:remote-main" } : {}),
       agentsConfig: { thinking: policy.thinking, deniedModels: policy.deniedModels, deniedModelReplacement: policy.deniedModelReplacement }, callerThinking: "max",
     });
     const parentContext = { ...context, extensionContext: { modelRegistry: visibleModelRegistry, model: { provider: "cliproxyapi", id: "gpt-6.1-sol" } } as unknown as ExtensionContext };
@@ -660,6 +674,18 @@ describe("fleet model policy (#2490)", () => {
     await agents.wait(child.id);
     const actor = await provider.invoke("create", { name: "nested", instructions: "review" }, parentContext) as FabricActorInfo;
     expect(actors.definition(actor.id)).toMatchObject({ model: "cliproxyapi/gpt-6.1-sol", thinking: "max" });
+  });
+  it("refuses a task (agent) spawning run before inheriting its model or creating children", async () => {
+    const { provider, agents, actors } = setup([], [], undefined, {
+      identity: { id: "agent:parent", name: "parent", kind: "agent", sessionId: "test" }, mainAgentId: "session:remote-main",
+      agentsConfig: { thinking: policy.thinking, deniedModels: policy.deniedModels, deniedModelReplacement: policy.deniedModelReplacement }, callerThinking: "max",
+    });
+    const parentContext = { ...context, extensionContext: { modelRegistry: visibleModelRegistry, model: { provider: "cliproxyapi", id: "gpt-6.1-sol" } } as unknown as ExtensionContext };
+    const refused = { name: "AgentSpawnForbiddenError", code: "FABRIC_AGENT_SPAWN_FORBIDDEN", launchOutcome: "unlaunched" };
+    await expect(provider.invoke("spawn", { task: "review", transport: "process" }, parentContext)).rejects.toMatchObject(refused);
+    await expect(provider.invoke("create", { name: "nested", instructions: "review" }, parentContext)).rejects.toMatchObject(refused);
+    expect(agents.list()).toEqual([]);
+    expect(actors.list()).toEqual([]);
   });
   it.each(["spawn", "create"])("%s refuses explicit, alias, inherited and default denied models before creation", async (action) => {
     const { provider, agents, actors, globalActors } = setup([], [], undefined, { agentsConfig: policy, modelsConfig: { aliases: { review: { targets: ["cliproxyapi/gpt-6-astra", "cliproxyapi/gpt-6.1-sol"] } } } });
@@ -895,7 +921,7 @@ const setup = (
 describe("configured task model precedence (#2890, #6062)", () => {
   const sol = "cliproxyapi/gpt-6.1-sol";
   const opus = "cliproxyapi-anthropic/claude-opus-5-5";
-  const callers = (["main", "actor", "agent"] as const)
+  const callers = (["main", "actor"] as const)
     .flatMap(kind => (["run", "spawn"] as const).map(action => [kind, action] as const));
   const parentContext = {
     ...context,
@@ -904,7 +930,7 @@ describe("configured task model precedence (#2890, #6062)", () => {
       model: { provider: "cliproxyapi-anthropic", id: "claude-opus-5-5" },
     } as ExtensionContext,
   };
-  const callerOptions = (kind: "main" | "actor" | "agent", agentsConfig: FabricAgentConfig) => ({
+  const callerOptions = (kind: "main" | "actor", agentsConfig: FabricAgentConfig) => ({
     identity: { id: `${kind}:parent`, name: "parent", kind, sessionId: "test" },
     ...(kind !== "main" ? { mainAgentId: "session:remote-main" } : {}),
     agentsConfig,

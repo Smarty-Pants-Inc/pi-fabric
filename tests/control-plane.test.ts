@@ -3436,7 +3436,7 @@ describe("FabricControlPlane", () => {
       await vi.waitFor(() => expect(store.read({ topic: "fabric.control.ack", limit: 10 })).toHaveLength(1),
         { timeout: 3_000, interval: 20 });
       const ack = store.read({ topic: "fabric.control.ack", limit: 10 })[0]!.data;
-      expect(ack).toMatchObject({ accepted: false, error: "Fabric control outcome is indeterminate after owner restart" });
+      expect(ack).toMatchObject({ accepted: false, error: "Fabric control outcome is indeterminate after concurrent claim" });
       expect(ack).not.toHaveProperty("notRun");
       expect(receive.mock.calls.length + olderDeliveries).toBe(1);
     }, 15_000);
@@ -3476,14 +3476,19 @@ describe("FabricControlPlane", () => {
       const first = commands[0]!.data as { commandId: string };
       const retry = commands[1]!.data as { commandId: string };
       expect(first.commandId).not.toBe(retry.commandId);
-      // The owner won the shared claim for the first command, so nothing ran it: it proves notRun,
-      // and records the expiry in that claim, where every runtime, new or old, finds it.
+      // The owner won the shared claim, so nothing ran it. Expiry is a private outcome;
+      // the shared claim still fences every other claimant, without publishing the outcome.
       expect(acks.find((ack) => ack.commandId === first.commandId))
         .toMatchObject({ accepted: false, error: "Fabric control command expired", notRun: true });
-      expect(store.get(sharedKey(first.commandId))?.value).toMatchObject({
-        hostId: "host:receiver", commandId: first.commandId,
-        acceptance: { accepted: false, error: "Fabric control command expired", notRun: true },
-      });
+      expect(store.get(sharedKey(first.commandId))?.value).not.toHaveProperty("acceptance");
+      const own = new MeshStore(path.join(store.root, "control-seen",
+        createHash("sha256").update("host:receiver").digest("hex").slice(0, 32)), 64 * 1024, 1_000);
+      try {
+        expect(own.get(sharedKey(first.commandId))?.value).toMatchObject({
+          hostId: "host:receiver", commandId: first.commandId,
+          acceptance: { accepted: false, error: "Fabric control command expired", notRun: true },
+        });
+      } finally { own.closeState(); }
       expect(acks.find((ack) => ack.commandId === retry.commandId)).toMatchObject({ accepted: true });
       expect(value).toMatchObject({ acknowledged: true, messageId: "delivered:" + retry.commandId });
       expect(receive).toHaveBeenCalledTimes(1);

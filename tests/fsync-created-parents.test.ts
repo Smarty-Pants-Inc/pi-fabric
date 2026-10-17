@@ -26,6 +26,19 @@ const chain = (directory: string): string[] => {
     if (path.dirname(current) === current) return result;
   }
 };
+// Independent environment qualification, never inferred from observed barrier counts.
+const linuxPrefixCapable = (directory: string): boolean => {
+  if (process.platform !== "linux") return false;
+  const fd = fs.openSync(directory, fs.constants.O_RDONLY);
+  try {
+    const kind = fs.statfsSync(`/proc/self/fd/${fd}`, { bigint: true }).type;
+    return (kind === 0xef53n || kind === 0x58465342n) &&
+      [...fs.readFileSync(`/proc/self/fdinfo/${fd}`, "utf8").matchAll(/^mnt_id:\s*(\d+)\s*$/gm)].length === 1;
+  } catch (error) {
+    if (["ENOENT", "ENOTDIR", "ENOSYS", "ENOTSUP", "EOPNOTSUPP", "EACCES"].includes(String((error as NodeJS.ErrnoException).code))) return false;
+    throw error;
+  } finally { fs.closeSync(fd); }
+};
 interface Barrier { file: string; directory: boolean; kind: "fsync" | "fdatasync"; held: boolean; stack: string }
 const record = (meshRoot?: string, fault?: (file: string) => void) => {
   const descriptors = new Map<number, string>();
@@ -86,6 +99,7 @@ const fixture = async (extraDepth: number) => {
 describe.skipIf(process.platform === "win32")("#14179 created-parent durability acceptance", () => {
   it.each([0, 3])("real held-sender bridge publish removes repeated stable index ancestry (extra depth %s)", async depth => {
     const { root, archive, store, side } = await fixture(depth);
+    const reduced = linuxPrefixCapable(root);
     // Observe the actual driver as well as the real withStateWriteFence boundary.
     const sqlite = process.getBuiltinModule("node:sqlite") as typeof import("node:sqlite");
     const exec = sqlite.DatabaseSync.prototype.exec;
@@ -150,7 +164,7 @@ describe.skipIf(process.platform === "win32")("#14179 created-parent durability 
     expect(heldDirs.filter(b => b.file === path.join(root, "event-receipts"))).toHaveLength(3);
     const segment = dataSyncs[0]!.file;
     for (const directory of chain(path.dirname(segment)).slice(0, 4)) expect(heldDirs.some(b => b.file === directory)).toBe(true);
-    const accounting = { depth, indexDepth, liveDepth, actualHeldDirectories: heldDirs.length,
+    const accounting = { depth, platform: process.platform, reduced, indexDepth, liveDepth, actualHeldDirectories: heldDirs.length,
       oldFormula: 3 * indexDepth + liveDepth + 4 + 3,
       actualIndexDirectories: index.length, maximumIndexAfterOneFullGuard: indexDepth + 2,
       heldFileFsync: fileSyncs.length, heldFdatasync: dataSyncs.length,
@@ -160,9 +174,17 @@ describe.skipIf(process.platform === "win32")("#14179 created-parent durability 
     // Canonical request 1–3: allow FULL first unknown/unproven guard, never existence-as-receipt;
     // but not THREE complete rootward walks for one stable sequence group's three index updates.
     // The bound does not dictate a cache, a new API, or the eventual exact approved total.
-    expect(index.length, "#14179: remove repeated unneeded stable ancestor barriers; first full guard + two fresh leaves allowed")
-      .toBeLessThanOrEqual(indexDepth + 2);
-    expect(heldDirs.length).toBeLessThanOrEqual(indexDepth + 2 + liveDepth + 4 + 3);
+    if (reduced) {
+      expect(index.length, "#14179: remove repeated unneeded stable ancestor barriers; first full guard + two fresh leaves allowed")
+        .toBeLessThanOrEqual(indexDepth + 2);
+      expect(heldDirs.length).toBeLessThanOrEqual(indexDepth + 2 + liveDepth + 4 + 3);
+    }
+    const expectedIndex = reduced ? chain(indexLeaf).slice(0, chain(indexLeaf).indexOf(root) + 1) : chain(indexLeaf);
+    expect(index.map(b => b.file)).toEqual([...expectedIndex, ...expectedIndex, ...expectedIndex]);
+    expect(barriers.filter(b => b.directory && b.stack.includes("confirmEventFile")).map(b => b.file))
+      .toEqual(reduced ? [root] : chain(root));
+    // This fixture creates a fresh topic day (four directory barriers), unlike the warm prefix fixture.
+    expect(heldDirs).toHaveLength(3 * expectedIndex.length + (reduced ? 1 : liveDepth) + 4 + 3);
   });
 
   it("fresh directories: every new link barrier precedes file use and rename; external-parent failure prevents use", () => {

@@ -7,6 +7,7 @@ import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { StoreBridgeSide } from "../src/mesh/bridge.js";
 import { MeshArchive, MESH_ARCHIVE_CONFIG } from "../src/mesh/archive.js";
 import { prepareReceiptNamespace, receiptDirectoryBarrier } from "../src/mesh/receipt-namespace.js";
+import * as receiptNamespace from "../src/mesh/receipt-namespace.js";
 
 // Independent before-code checks, #14179. Keep reason: data safety / real bridge-SQL boundary.
 // No power-loss simulation: real forwarded OS barriers plus deterministic namespace mutations/EIO.
@@ -21,6 +22,20 @@ const chain = (leaf: string, stop = path.parse(path.resolve(leaf)).root): string
 };
 const commonDirectory = (a: string, b: string) => chain(a).find(p => chain(b).includes(p))!;
 const sorted = (values: string[]) => [...values].sort();
+// Qualify the fixture independently of the production fast-path outcome. Unsupported
+// Linux filesystems/proc capability owe full chains too; ext/XFS MUST exercise reuse.
+const linuxPrefixCapable = (directory: string): boolean => {
+  if (process.platform !== "linux") return false;
+  const fd = fs.openSync(directory, fs.constants.O_RDONLY);
+  try {
+    const kind = fs.statfsSync(`/proc/self/fd/${fd}`, { bigint: true }).type;
+    return (kind === 0xef53n || kind === 0x58465342n) &&
+      [...fs.readFileSync(`/proc/self/fdinfo/${fd}`, "utf8").matchAll(/^mnt_id:\s*(\d+)\s*$/gm)].length === 1;
+  } catch (error) {
+    if (["ENOENT", "ENOTDIR", "ENOSYS", "ENOTSUP", "EOPNOTSUPP", "EACCES"].includes(String((error as NodeJS.ErrnoException).code))) return false;
+    throw error;
+  } finally { fs.closeSync(fd); }
+};
 const sender: MeshIdentity = { id: "session:prefix-check", name: "prefix-check", kind: "main" };
 const command = (key: string) => ({ topic: "fabric.control.command", kind: "steer", from: sender,
   to: "session:inert-target", text: "fixture", data: { bridge: { from: "wire", id: key }, version: 1,
@@ -120,8 +135,28 @@ afterEach(() => {
 });
 
 describe.skipIf(process.platform === "win32")("prepared archive prefix: independent acceptance", () => {
-  it.each(["sibling", "inside"] as const)("RED exact warm prefix sets, not a guessed budget (%s)", async layout => {
+  it.each((["sibling", "inside"] as const).flatMap(layout =>
+    (process.platform === "linux" ? ["native", "darwin-simulated"] as const : ["native"] as const)
+      .map(gate => ({ layout, gate }))))("exact warm namespace sets ($layout, $gate)", async ({ layout, gate }) => {
     const f = await fixture(layout);
+    const reduced = gate === "native" && linuxPrefixCapable(f.root);
+    let gateCalls = 0;
+    if (gate === "darwin-simulated") {
+      const prepare = receiptNamespace.prepareKeyedPublishNamespace;
+      const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+      vi.spyOn(receiptNamespace, "prepareKeyedPublishNamespace").mockImplementation(root => {
+        // Only this synchronous source gate sees Darwin. Restore before backend,
+        // bootstrap, host identity or async publication work; no foreign commands.
+        Object.defineProperty(process, "platform", { ...platform, value: "darwin" });
+        try {
+          const prepared = prepare(root);
+          expect(prepared.receiptNamespace).toBeDefined();
+          expect(prepared.prefixScope).toBeUndefined();
+          gateCalls++;
+          return prepared;
+        } finally { Object.defineProperty(process, "platform", platform); }
+      });
+    }
     // Verify real driver transaction, not merely a mocked fence callback.
     const sqlite = process.getBuiltinModule("node:sqlite") as typeof import("node:sqlite");
     const exec = sqlite.DatabaseSync.prototype.exec, transactions = new Set<object>();
@@ -136,8 +171,11 @@ describe.skipIf(process.platform === "win32")("prepared archive prefix: independ
     } });
     const result = await f.side.publish(command("warm"), [sender.id]);
     expect(result.sequence).toBe(2); expect(begins).toBeGreaterThan(0); expect(appendedInSql).toBe(true);
+    if (gate === "darwin-simulated") { expect(gateCalls).toBe(1); expect(process.platform).toBe("linux"); }
     expect(transactions.size).toBe(0); expect(fs.existsSync(path.join(f.root, ".lock"))).toBe(false);
-    const common = commonDirectory(f.leaf, f.root), expected = chain(f.leaf, common);
+    const common = commonDirectory(f.leaf, f.root);
+    const expected = reduced ? chain(f.leaf, common) : chain(f.leaf);
+    const expectedLive = reduced ? [f.root] : chain(f.root);
     const held = measured.barriers.filter(b => b.held), files = held.filter(b => !b.directory && b.kind === "fsync");
     expect(files).toHaveLength(6); expect(held.filter(b => b.kind === "fdatasync")).toHaveLength(1);
     expect(files.filter(b => b.file.startsWith(path.join(f.leaf, "2.json.")))).toHaveLength(3);
@@ -164,15 +202,16 @@ describe.skipIf(process.platform === "win32")("prepared archive prefix: independ
     }
     const offLock = measured.barriers.filter(b => b.directory && !b.held).map(b => b.file);
     expect(offLock).toEqual(chain(path.join(f.root, "event-receipts")));
-    const expectedHeld = 3 * expected.length + 1 + 3; // index phases + live MeshRoot leaf + receipt leaves.
-    console.log("PREFIX_ACCOUNTING " + JSON.stringify({ layout, common, expectedIndex: expected,
+    const expectedHeld = 3 * expected.length + expectedLive.length + 3;
+    console.log("PREFIX_ACCOUNTING " + JSON.stringify({ layout, gate, host: process.platform, reduced, common, expectedIndex: expected,
       fullIndex: chain(f.leaf), expectedHeld, baselineFormula: 3 * chain(f.leaf).length + chain(f.root).length + 3,
       actualHeld: held.filter(b => b.directory).length, actualIndex: [0, 1, 2].map(p => indexDirs(measured, p)),
       live: liveDirs(measured), offLock, offLockCount: offLock.length, files: files.length,
       data: held.filter(b => b.kind === "fdatasync").length }));
-    // Exact sets/counts: skip ONLY proper ancestors above common, fresh common CONTENTS fence owed each time.
+    // Linux eligible: omit ONLY ancestors above common. Darwin/other denial:
+    // every old index chain at all three phases AND the complete live chain.
     for (let phase = 0; phase < 3; phase++) expect(sorted(indexDirs(measured, phase))).toEqual(sorted(expected));
-    expect(liveDirs(measured)).toEqual([f.root]);
+    expect(liveDirs(measured)).toEqual(expectedLive);
     expect(held.filter(b => b.directory)).toHaveLength(expectedHeld);
   });
 

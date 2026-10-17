@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { hostedOnly } from "../scripts/hosted-only.mjs";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -913,9 +914,9 @@ describe.skipIf(process.platform !== "linux")("recorded cleanup", () => {
   });
 });
 
-// #4664: the real product with no recorder. Hosted CI only (CI=true), never in a lane. Nothing is deleted: the root
+// #4664: the real product with no recorder. Verified GitHub-hosted job only, never in a lane. Nothing is deleted: the root
 // names are free and the reported quarantine paths hold the created inodes.
-describe.runIf(process.env.CI === "true" && process.platform === "linux")("hosted cleanup", () => {
+describe.runIf(hostedOnly("mesh backend cleanup") && process.platform === "linux")("hosted cleanup", () => {
   it.each(["import", "cutover"] as const)("%s: a refusal before the importing commit frees every root state.db* name into the reported quarantine", async (command) => {
     const root = await fileRoot();
     await proveSqlite(root);

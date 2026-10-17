@@ -12,6 +12,7 @@ import { takeCompactionDecline } from "./compaction/cancellation.js";
 import { fabricProvenanceOptions, fabricProvenanceSupported, fabricTurnProvenance, fabricWakeCause, copyFabricProvenance, fabricWakeMessage, admittedFabricWakeCauses, sendFabricMessage, sendFabricUserMessage, type FabricWakeCause, type FabricTurnProvenance, type FabricPrincipal } from "./fabric-provenance.js";
 import { classifyProviderError, type ProviderErrorClass } from "./provider-error-class.js";
 import { extensionContextLive } from "./session-liveness.js";
+import { fabricPathBProbeEpochNs, hasFabricPathBProbeObserver, recordFabricPathBProbe } from "./transport/probe-hooks.js";
 
 import { FabricInterruptNotAuthorizedError, FabricInterruptRateLimitedError, type FabricInterruptAuthority } from "./interrupt-authority.js";
 
@@ -787,7 +788,7 @@ export class MainAgentController implements FabricMainAgentTarget {
       item.triggerTurn = triggerTurn;
       this.#admit(item);
       this.#held.push(item);
-      try { this.#save(); } catch (error) { this.#held.pop(); throw error; }
+      try { this.#save(deliveryId !== undefined ? { commandId: deliveryId, messageId: item.id } : undefined); } catch (error) { this.#held.pop(); throw error; }
       return { queued: true, messageId: item.id, routed: "main", triggered: false, ...this.queueDepth(item.from.id) };
     }
     if (request.priority === "interrupt" && triggerTurn && this.#context &&
@@ -798,7 +799,7 @@ export class MainAgentController implements FabricMainAgentTarget {
       this.#admit(item);
       const index = this.#interrupts.size;
       this.#held.splice(index, 0, item);
-      try { this.#save(); } catch (error) { this.#held.splice(index, 1); throw error; }
+      try { this.#save(deliveryId !== undefined ? { commandId: deliveryId, messageId: item.id } : undefined); } catch (error) { this.#held.splice(index, 1); throw error; }
       const abort = !this.#interruptUsedThisTurn;
       this.#interrupts.add(item.id);
       // Same native cancellation path as Escape. Do not queue into Pi's aborted run:
@@ -823,7 +824,7 @@ export class MainAgentController implements FabricMainAgentTarget {
       this.#admit(item);
       this.#held.push(item);
       try {
-        this.#save();                                   // journalled before it is acknowledged
+        this.#save(deliveryId !== undefined ? { commandId: deliveryId, messageId: item.id } : undefined); // journalled before it is acknowledged
       } catch (error) {
         this.#held.pop();
         throw new Error(`Main could not record the followUp: ${error instanceof Error ? error.message : String(error)}`);
@@ -846,7 +847,7 @@ export class MainAgentController implements FabricMainAgentTarget {
       item.triggerTurn = triggerTurn;
       this.#sent.push(item);
       try {
-        this.#save();
+        this.#save(deliveryId !== undefined ? { commandId: deliveryId, messageId: item.id } : undefined);
       } catch (error) {
         this.#sent.pop();
         restorePeerWakeOnFailure();
@@ -1007,13 +1008,15 @@ export class MainAgentController implements FabricMainAgentTarget {
   }
 
   /** Write the held and unconfirmed followUps (0600), or remove the journal when none are left. */
-  #save(): void {
+  #save(probeAdmission?: { commandId: string; messageId: string }): void {
     if (!this.#journal) return;
     // Before the journal: an item leaves the journal only once its id is recorded as consumed.
     this.#saveIndex();
     const items = [...this.#unverified, ...this.#sent, ...this.#held];
     if (!items.length) { fs.rmSync(this.#journal, { force: true }); return; }
     writeFileAtomic(this.#journal, JSON.stringify({ version: 1, items }), { durable: true });
+    if (probeAdmission && hasFabricPathBProbeObserver()) recordFabricPathBProbe({ type: "main-followup-journal-commit",
+      atNs: fabricPathBProbeEpochNs(), ...probeAdmission });
   }
 
   #trySave(indexOnly = false): void {

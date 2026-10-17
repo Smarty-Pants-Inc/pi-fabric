@@ -374,15 +374,14 @@ const nativeItemData = (item: HeldAgentMessage): unknown =>
 
 const itemBytes = (item: HeldAgentMessage): number => {
   const data = nativeItemData(item);
+  // deliveryReason is fixed host-owned bookkeeping, not caller payload. Held-item
+  // count quotas bound it even when a later halt adds the marker after admission.
   return Buffer.byteLength(item.message) + (data === undefined ? 0 : Buffer.byteLength(JSON.stringify(data))) +
     // The retained key and native data are separate serialized representations: charge both.
     (item.inboxKey === undefined ? 0 : Buffer.byteLength(JSON.stringify(item.inboxKey))) +
     (item.deliveryId === undefined ? 0 : Buffer.byteLength(JSON.stringify(item.deliveryId))) +
     (item.supersedes === undefined ? 0 : Buffer.byteLength(JSON.stringify(item.supersedes))) +
-    (item.inboxReceipts === undefined ? 0 : Buffer.byteLength(JSON.stringify(item.inboxReceipts))) +
-    // Reserve the bounded host-owned handoff evidence even before a later halt
-    // downgrades this item; the native metadata must not evade admission quotas.
-    Buffer.byteLength(JSON.stringify({ deliveryReason: "operator-halt" }));
+    (item.inboxReceipts === undefined ? 0 : Buffer.byteLength(JSON.stringify(item.inboxReceipts)));
 };
 
 type SessionEntryLike = { id?: unknown; parentId?: unknown; type?: string; customType?: string; details?: { id?: unknown; items?: unknown } };

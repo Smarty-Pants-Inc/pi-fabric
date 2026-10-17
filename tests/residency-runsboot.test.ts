@@ -1,12 +1,16 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { AgentManager } from "../src/agents/manager.js";
+import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
+import { ActorDirectory } from "../src/actors/directory.js";
 import { ResidentHost } from "../src/residency/host.js";
-import { residentResultPath, type ResidentAgentMetadata, type ResidentHostConfig } from "../src/residency/protocol.js";
+import { residentRoot, residentResultPath, type ResidentAgentMetadata, type ResidentHostConfig } from "../src/residency/protocol.js";
+import { ResidentActorClient } from "../src/residency/actor-client.js";
 import { readHostLease } from "../src/topology/host-leases.js";
 import { retentionV2Enabled } from "../src/storage/retention-platform.js";
 import { normalizeScope } from "../src/scope.js";
@@ -28,9 +32,11 @@ const fixture = () => {
 };
 
 /** Observe the real filesystem calls, not source text or replacement recovery implementations. */
-const observeRuns = (runs: string) => {
+const observeRuns = (runs: string, ...additionalRoots: string[]) => {
+  const roots = [runs, ...additionalRoots];
   const work = { listings: 0, opens: 0, entries: 0, reads: 0, statusReads: 0, stats: 0 };
-  const within = (target: unknown) => String(target) === runs || String(target).startsWith(runs + path.sep);
+  const atRoot = (target: unknown) => roots.includes(String(target));
+  const within = (target: unknown) => roots.some(root => String(target) === root || String(target).startsWith(root + path.sep));
   const readdir = fs.readdirSync, opendir = fs.opendirSync, read = fs.readFileSync;
   const stat = fs.statSync, lstat = fs.lstatSync;
   const asyncReaddir = fs.promises.readdir, asyncOpendir = fs.promises.opendir, asyncRead = fs.promises.readFile;
@@ -56,22 +62,22 @@ const observeRuns = (runs: string) => {
     }
   };
   vi.spyOn(fs, "readdirSync").mockImplementation(((...args: Parameters<typeof fs.readdirSync>) => {
-    if (String(args[0]) === runs) work.listings++;
+    if (atRoot(args[0])) work.listings++;
     return readdir(...args);
   }) as typeof fs.readdirSync);
   vi.spyOn(fs, "opendirSync").mockImplementation((...args: Parameters<typeof fs.opendirSync>) => {
-    if (String(args[0]) === runs) work.opens++;
+    if (atRoot(args[0])) work.opens++;
     const directory = opendir(...args);
-    return String(args[0]) === runs ? observeCursor(directory) : directory;
+    return atRoot(args[0]) ? observeCursor(directory) : directory;
   });
   vi.spyOn(fs.promises, "readdir").mockImplementation(((...args: Parameters<typeof fs.promises.readdir>) => {
-    if (String(args[0]) === runs) work.listings++;
+    if (atRoot(args[0])) work.listings++;
     return asyncReaddir(...args);
   }) as typeof fs.promises.readdir);
   vi.spyOn(fs.promises, "opendir").mockImplementation(async (...args: Parameters<typeof fs.promises.opendir>) => {
-    if (String(args[0]) === runs) work.opens++;
+    if (atRoot(args[0])) work.opens++;
     const directory = await asyncOpendir(...args);
-    return String(args[0]) === runs ? observeCursor(directory) : directory;
+    return atRoot(args[0]) ? observeCursor(directory) : directory;
   });
   vi.spyOn(fs, "readFileSync").mockImplementation(((...args: Parameters<typeof fs.readFileSync>) => {
     noteRead(args[0]);
@@ -101,12 +107,19 @@ const observeRuns = (runs: string) => {
 };
 
 /** Observe and join the real manager operation, including its directory cursor. */
-const observeHostedRecovery = () => {
+const observeHostedRecovery = (onRecover?: (manager: AgentManager, options: Parameters<AgentManager["recoverHostedRuns"]>[1]) => void) => {
   const recover = AgentManager.prototype.recoverHostedRuns;
   const fallbacks: Array<{ manager: AgentManager; options: Parameters<AgentManager["recoverHostedRuns"]>[1]; pending: Promise<string[]> }> = [];
   vi.spyOn(AgentManager.prototype, "recoverHostedRuns").mockImplementation(function (this: AgentManager, candidates, options) {
+    // The unified host operation makes exactly one no-args manager pass AFTER
+    // its metadata/import phase. Do not confuse other native/reference cursors
+    // with this pass merely because they happen to open runs/.
+    if (candidates === undefined) onRecover?.(this, options);
     const pending = recover.call(this, candidates, options);
-    if (candidates === undefined) fallbacks.push({ manager: this, options, pending });
+    if (candidates === undefined) {
+      fallbacks.push({ manager: this, options, pending });
+      void pending.catch(() => undefined); // cancellation is asserted by its owner
+    }
     return pending;
   });
   const complete = async (index = 0) => {
@@ -143,10 +156,36 @@ const seedManager = (config: ResidentHostConfig) => new AgentManager(config.cwd,
   runRoot: path.join(config.residencyRoot, "runs"), fullCodeMode: false,
 });
 
+/** Real dynamic import with top-level await, not a replacement module loader. */
+const gatedRunnerModule = (root: string, register: () => void) => {
+  const key = `runsboot-import:${root}`;
+  let enter!: () => void, release!: () => void, registered!: () => void;
+  const entered = new Promise<void>(resolve => { enter = resolve; });
+  const wait = new Promise<void>(resolve => { release = resolve; });
+  const finished = new Promise<void>(resolve => { registered = resolve; });
+  const globals = globalThis as unknown as Record<string, unknown>;
+  globals[key] = { enter, wait, register: () => { register(); registered(); } };
+  const module = path.join(root, "gated-runner.mjs");
+  fs.writeFileSync(module, `const gate = globalThis[${JSON.stringify(key)}]; gate.enter(); await gate.wait; gate.register();`);
+  return { module, entered, release, finished,
+    finish: async () => { release(); await import(pathToFileURL(module).href); await finished; },
+    dispose: () => { delete globals[key]; } };
+};
+
+const startBeforeImport = async (host: ResidentHost, gate: ReturnType<typeof gatedRunnerModule>) => {
+  const starting = host.start();
+  const winner = await Promise.race([starting.then(() => "ready"), gate.entered.then(() => "pre-ready import")]);
+  // A regressed pre-ready importer must fail WITHOUT stranding its module or
+  // startup fixture. Release and join it before reporting the boundary failure.
+  if (winner !== "ready") gate.release();
+  await starting;
+  expect(winner).toBe("ready");
+};
+
 describe("resident retained-run startup (smarty-dev#4796)", () => {
   // Keep reason: the real 20k-hex-ID state catches the full startup walk that
   // the older archived-N fixture misses; retention work must stay incremental.
-  it("reaches readiness and first idle with a persisted owned actor without walking 20k native runs", { timeout: 30_000 }, async () => {
+  it("reaches readiness and the first event-loop turn with an owned actor without walking 20k runs or retained metadata", { timeout: 30_000 }, async () => {
     const { root, config, runs } = fixture();
     // Use the actual create/registry/close path, not a hand-authored row that
     // misses claimResidency and constructor-time native recovery.
@@ -168,9 +207,14 @@ describe("resident retained-run startup (smarty-dev#4796)", () => {
         sessionId: "2147483647", startedAt: 1, updatedAt: 2, finishedAt: 2, text: "archived answer",
         turns: 1, toolCalls: 0, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: 0 },
       }));
+      saveMetadata(config, { format: 1, rootId: config.rootId, id,
+        handle: { id, name: "retained native task", runner: "pi", status: "completed", transport: "process", cwd: root },
+        runDirectory: directory, createdAt: 1, updatedAt: 2, completionConsumedAt: 2 });
     }
     const host = new ResidentHost(config);
-    const work = observeRuns(runs);
+    // One observer owns each fs spy; stacking spyOn on the same function
+    // rewrites the first implementation rather than making an independent tap.
+    const work = observeRuns(runs, path.join(config.residencyRoot, "agents"));
     try {
       await host.start();
       const ready = { ...work };
@@ -179,11 +223,12 @@ describe("resident retained-run startup (smarty-dev#4796)", () => {
       await new Promise<void>(resolve => setImmediate(resolve));
       expect(ready).toEqual({ listings: 0, opens: 0, entries: 0, reads: 0, statusReads: 0, stats: 0 });
       // An owned actor's first ready-gated maintenance may open its native
-      // recovery cursor by first idle. Count async work too: it must remain a
+      // recovery cursor by the first event-loop turn. Count async work too: it must remain a
       // bounded first slice, never the historical startup sweep.
       expect(work.listings).toBe(0);
-      expect(work.opens).toBeLessThanOrEqual(1);
-      expect(work.entries).toBeLessThanOrEqual(64);
+      expect(work.opens).toBeLessThanOrEqual(2); // metadata + owned actor native cursors
+      expect(work.entries).toBeLessThanOrEqual(128); // at most one bounded slice per cursor
+      expect(work.reads).toBeLessThanOrEqual(128);
       expect(work.statusReads).toBeLessThanOrEqual(64);
       expect(host.actors.status(actorId!).residency).toBe("durable");
       expect(host.actors.status(actorId!).status).not.toBe("dormant"); // scheduled recovery retains custody
@@ -213,6 +258,146 @@ describe("resident retained-run startup (smarty-dev#4796)", () => {
         expect(work.listings).toBe(0); // no unbounded zero-delay fallback after readiness either
       }
     } finally {
+      vi.restoreAllMocks();
+      await host.close();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  // Keep reason: cold-history wedge regression. Fault ONLY the real hosted
+  // recovery's first status read per candidate, not retention's repeated safety
+  // predicates. The owner lease and native request/response path stay real.
+  it("serves a trusted request and renews its persisted lease throughout 20k slow historical status reads", { timeout: 240_000 }, async () => {
+    const { root, config } = fixture();
+    config.residencyRoot = residentRoot(config.meshRoot, config.rootId);
+    config.workerPath = path.resolve("tests/fixtures/fake-worker.mjs");
+    config.piModels = { available: [{ provider: "test", id: "visible" }], aliases: {}, defaultModel: "test/visible" };
+    fs.mkdirSync(config.residencyRoot, { recursive: true });
+    fs.writeFileSync(path.join(config.residencyRoot, "config.json"), JSON.stringify(config));
+    const runs = path.join(config.residencyRoot, "runs");
+    const historical = new Set<string>();
+    for (let index = 1; index <= 20_000; index++) {
+      const id = index.toString(16).padStart(32, "0");
+      historical.add(id);
+      const directory = path.join(runs, id);
+      fs.mkdirSync(directory, { recursive: true });
+      fs.writeFileSync(path.join(directory, "status.json"), JSON.stringify({ id, name: "cold history", runner: "pi",
+        status: "completed", transport: "process", cwd: root, startedAt: 1, updatedAt: 2, finishedAt: 2,
+        text: "saved", turns: 1, toolCalls: 0,
+        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: 0 } }));
+    }
+    const host = new ResidentHost(config);
+    const client = new ResidentActorClient(config.meshRoot, config.rootId, 10_000);
+    const waitCell = new Int32Array(new SharedArrayBuffer(4));
+    let statusReadCount = 0, historicalReads = 0, faultFile: string | undefined;
+    let active = false, settled = false, entered!: () => void;
+    const midRecovery = new Promise<void>(resolve => { entered = resolve; });
+    let yieldCount = 0, readsAtYield = 0, maxSliceReads = 0, maxYieldGapMs = 0, lastYieldAt = 0;
+    let leaseRenewCount = 0, maxLeaseGapMs = 0, minLeaseRemainingMs = Infinity, maxLeaseAgeMs = 0;
+    let previousLease: ReturnType<typeof readHostLease>;
+    const sampleLease = () => {
+      const lease = readHostLease(config.meshRoot, host.hostId);
+      if (!lease) throw new Error("Owner's persisted lease disappeared during recovery");
+      const now = Date.now();
+      minLeaseRemainingMs = Math.min(minLeaseRemainingMs, lease.expiresAt - now);
+      maxLeaseAgeMs = Math.max(maxLeaseAgeMs, now - lease.updatedAt);
+      if (previousLease && previousLease.updatedAt !== lease.updatedAt) {
+        leaseRenewCount++;
+        maxLeaseGapMs = Math.max(maxLeaseGapMs, lease.updatedAt - previousLease.updatedAt);
+      }
+      previousLease = lease;
+    };
+    const read = fs.readFileSync;
+    vi.spyOn(fs, "readFileSync").mockImplementation(((...args: Parameters<typeof fs.readFileSync>) => {
+      const file = String(args[0]);
+      if (file.startsWith(runs + path.sep) && path.basename(file) === "status.json" && historical.has(path.basename(path.dirname(file)))) historicalReads++;
+      if (file === faultFile) {
+        faultFile = undefined;
+        sampleLease();
+        Atomics.wait(waitCell, 0, 0, 5); // deterministic synchronous cold-read fault
+        statusReadCount++;
+        if (statusReadCount === 1_000) entered();
+      }
+      return read(...args);
+    }) as typeof fs.readFileSync);
+    const immediate = globalThis.setImmediate;
+    vi.spyOn(globalThis, "setImmediate").mockImplementation(((callback: (...args: unknown[]) => void, ...args: unknown[]) =>
+      immediate(() => {
+        if (active) {
+          const now = performance.now();
+          yieldCount++;
+          maxYieldGapMs = Math.max(maxYieldGapMs, now - lastYieldAt);
+          maxSliceReads = Math.max(maxSliceReads, statusReadCount - readsAtYield);
+          readsAtYield = statusReadCount; lastYieldAt = now;
+        }
+        callback(...args);
+      })) as typeof setImmediate);
+    const recovery = observeHostedRecovery((_manager, options) => {
+      active = true; lastYieldAt = performance.now();
+      const shouldRecover = options!.shouldRecover!;
+      options!.shouldRecover = id => {
+        const allowed = shouldRecover(id);
+        if (allowed && historical.has(id)) faultFile = path.join(runs, id, "status.json");
+        return allowed;
+      };
+    });
+    try {
+      const startAt = performance.now();
+      await host.start();
+      const readyMs = performance.now() - startAt;
+      expect(historicalReads).toBe(0); // structural readiness check, no flaky wall-clock budget
+      expect(statusReadCount).toBe(0);
+      sampleLease();
+      await midRecovery;
+      expect(recovery.fallbacks).toHaveLength(1);
+      void recovery.fallbacks[0]!.pending.then(() => { settled = true; }, () => { settled = true; });
+      const readsAtRequest = statusReadCount;
+      const requestAt = performance.now();
+      const actor = await client.createActor({ name: "served-during-recovery", instructions: "Respond", residency: "durable",
+        topics: ["runsboot.slow-history-wake"], responseMode: "text" });
+      const trustedRequestMs = performance.now() - requestAt;
+      const pendingAtResponse = !settled;
+      const readsAtResponse = statusReadCount;
+      expect(pendingAtResponse).toBe(true);
+      expect(readsAtRequest).toBeGreaterThanOrEqual(1_000);
+      expect(readsAtResponse).toBeLessThan(20_000);
+      expect(new ActorRegistryStore(config.actorRoot).records().find(row => row.id === actor.id))
+        .toMatchObject({ rootId: config.rootId, residency: "durable" });
+      // The actor client has no tell API. Use the real native mesh wake route,
+      // not a direct manager call or a mocked receiver, and require actual output.
+      const wakeAt = performance.now();
+      await host.mesh.publish({ topic: "runsboot.slow-history-wake", from: host.identity,
+        data: { message: "Wake and respond while historical recovery is still pending" } });
+      await vi.waitFor(() => expect(host.actors.messages(actor.id).filter(message => message.direction === "out" && !message.error)).toHaveLength(1), { timeout: 45_000 });
+      const wakeLatencyMs = performance.now() - wakeAt;
+      const pendingAtWakeOutput = !settled;
+      const readsAtWakeOutput = statusReadCount;
+      expect(pendingAtWakeOutput).toBe(true);
+      expect(readsAtWakeOutput).toBeLessThan(20_000);
+      expect(await client.actorStatus(actor.id)).toMatchObject({ id: actor.id, lastRunId: expect.any(String) });
+      await recovery.complete();
+      active = false;
+      sampleLease();
+      maxSliceReads = Math.max(maxSliceReads, statusReadCount - readsAtYield);
+      const recoveryMs = performance.now() - startAt - readyMs;
+      console.log(JSON.stringify({ metric: "resident-slow-history", logicalRuns: 20_000, delayPerStatusMs: 5,
+        readyMs, recoveryMs, statusReadCount, yieldCount, maxSliceReads, maxYieldGapMs,
+        heartbeatMaxGapMs: maxLeaseGapMs, persistedLeaseRenewCount: leaseRenewCount,
+        persistedLeaseMaxGapMs: maxLeaseGapMs, persistedLeaseMaxAgeMs: maxLeaseAgeMs,
+        persistedLeaseMinRemainingTtlMs: minLeaseRemainingMs, trustedRequestMs,
+        pendingRecoveryAtResponse: pendingAtResponse, readsAtRequest, readsAtResponse,
+        wakeLatencyMs, pendingRecoveryAtWakeOutput: pendingAtWakeOutput, readsAtWakeOutput, nativeWakeOutputs: 1 }));
+      expect(statusReadCount).toBe(20_000);
+      expect(yieldCount).toBeGreaterThanOrEqual(Math.floor(20_000 / 64));
+      expect(maxSliceReads).toBeLessThanOrEqual(64);
+      expect(leaseRenewCount).toBeGreaterThanOrEqual(3);
+      // Production heartbeat is 5s, lease TTL 15s. Require observed renewal
+      // within TWO heartbeats, not merely a lease that happens to remain live.
+      expect(maxLeaseGapMs).toBeLessThanOrEqual(10_000);
+      expect(maxLeaseAgeMs).toBeLessThanOrEqual(10_000);
+      expect(minLeaseRemainingMs).toBeGreaterThan(0);
+    } finally {
+      active = false;
       vi.restoreAllMocks();
       await host.close();
       fs.rmSync(root, { recursive: true, force: true });
@@ -280,12 +465,17 @@ describe("resident retained-run startup (smarty-dev#4796)", () => {
       const work = observeRuns(runs);
       const recovery = observeHostedRecovery();
       await host.start();
+      expect(runner.calls.attaches).toEqual([]);
+      expect(work.statusReads).toBe(0);
+      await recovery.complete();
       expect(runner.calls.attaches).toEqual([kept.id]);
       expect(runner.calls.starts).toEqual([kept.id, foreign.id]);
       expect(host.agents.status(kept.id)).toMatchObject({ status: "running", transport: "hosted" });
       expect(work.listings).toBe(0);
       expect(work.statusReads).toBeGreaterThan(0);
-      expect(vi.mocked(fs.readFileSync).mock.calls.some(([file]) => String(file) === path.join(runs, foreign.id, "status.json"))).toBe(false);
+      // Independent retention safety may inspect this file after readiness;
+      // that read is not admission. Foreign metadata still cannot adopt/attach.
+      expect(JSON.parse(fs.readFileSync(path.join(runs, foreign.id, "status.json"), "utf8"))).toMatchObject({ status: "running" });
       expect(runner.calls.stops).toBe(0);
       await recovery.complete(); // the delayed orphan sweep must not undo the ownership filter
       expect(runner.calls.attaches).toEqual([kept.id]);
@@ -322,11 +512,12 @@ describe("resident retained-run startup (smarty-dev#4796)", () => {
       await host.start();
       expect(runner.calls.attaches).toEqual([]);
       expect(work.statusReads).toBe(0); // retained metadata + result does not eagerly read its archived status
-      expect(fs.readFileSync(imported, "utf8")).toBe("registered"); // deferral must retain admitted module imports
+      expect(fs.existsSync(imported)).toBe(false); // imports too are post-ready
       await new Promise<void>(resolve => setImmediate(resolve));
       expect(work.opens).toBe(0);
       expect(runner.calls.attaches).toEqual([]);
       await recovery.complete();
+      expect(fs.readFileSync(imported, "utf8")).toBe("registered"); // deferral retains admitted module imports
       expect(new Set(runner.calls.attaches)).toEqual(new Set([orphan.id, deferred.id]));
       expect(runner.calls.attaches).toHaveLength(2);
       expect(host.agents.status(orphan.id)).toMatchObject({ status: "running", transport: "hosted" });
@@ -410,9 +601,8 @@ describe("resident retained-run startup (smarty-dev#4796)", () => {
     try {
       const orphan = await first.spawn({ task: "held recovery", runner: runner.adapter.id, residency: "durable" });
       await first.close();
-      const recovery = observeHostedRecovery();
+      const recovery = observeHostedRecovery(manager => manager.pauseForRelease(true));
       await host.start();
-      host.agents.pauseForRelease(true);
       await vi.waitFor(() => expect(recovery.fallbacks).toHaveLength(1), { timeout: 5_000 });
       expect(runner.calls.attaches).toEqual([]);
       const closed = await Promise.race([
@@ -440,6 +630,11 @@ describe("resident retained-run startup (smarty-dev#4796)", () => {
     const first = seedManager(config);
     const host = new ResidentHost(config);
     let releaseRead: (() => void) | undefined;
+    let releaseRefresh: (() => void) | undefined;
+    let restoreRefresh: (() => void) | undefined;
+    const refreshes: Promise<void>[] = [];
+    let now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
     let entered = false;
     try {
       const orphan = await first.spawn({ task: "lease-fenced recovery", runner: runner.adapter.id, residency: "durable" });
@@ -461,18 +656,48 @@ describe("resident retained-run startup (smarty-dev#4796)", () => {
       });
       await host.start();
       await vi.waitFor(() => expect(entered).toBe(true), { timeout: 5_000 });
-      const lease = vi.spyOn(host.participants, "canConsumeMesh").mockReturnValue(false);
+      expect(recovery.fallbacks).toHaveLength(1);
+      expect(host.participants.canConsumeMesh()).toBe(true);
+      // Keep the actual heartbeat renewal behind a gate: canConsumeMesh's
+      // forward-clock recovery must not heal the stale receipt before we assert.
+      const refresh = host.participants.refresh.bind(host.participants);
+      const heldRefresh = new Promise<void>(resolve => { releaseRefresh = resolve; });
+      const refreshing = vi.spyOn(host.participants, "refresh").mockImplementation(() => {
+        const pending = heldRefresh.then(() => refresh());
+        refreshes.push(pending);
+        void pending.catch(() => undefined);
+        return pending;
+      });
+      restoreRefresh = () => refreshing.mockRestore();
+      const samples = vi.spyOn(host.actors, "hasOwnedActors");
+      samples.mockClear();
+      now += 10_001; // real heartbeat freshness is two 5s intervals
+      expect(host.participants.canConsumeMesh()).toBe(false);
       releaseRead!();
       await expect(recovery.fallbacks[0]!.pending).rejects.toThrow(/interrupt/i);
-      await new Promise<void>(resolve => setImmediate(resolve));
+      await new Promise<void>(resolve => setImmediate(resolve)); // host completion/finally custody
       expect(runner.calls.attaches).toEqual([]);
-      lease.mockRestore();
+      // More than two ordinary 100ms maintenance polls with recovery settled:
+      // stale authority keeps discovery debt, so idle must not sample actors.
+      await new Promise<void>(resolve => setTimeout(resolve, 250));
+      expect(host.participants.canConsumeMesh()).toBe(false);
+      expect(samples).not.toHaveBeenCalled();
+      expect(recovery.fallbacks).toHaveLength(1);
+      releaseRefresh!();
+      restoreRefresh();
+      await Promise.all(refreshes);
+      await host.participants.refresh();
+      expect(host.participants.canConsumeMesh()).toBe(true);
       await recovery.complete(1);
       expect(recovery.fallbacks).toHaveLength(2);
       expect(runner.calls.attaches).toEqual([orphan.id]);
       expect(runner.calls.starts).toEqual([orphan.id]);
     } finally {
       releaseRead?.();
+      releaseRefresh?.();
+      restoreRefresh?.();
+      await Promise.allSettled(refreshes);
+      clock.mockRestore();
       vi.restoreAllMocks();
       await host.close();
       await first.close();
@@ -480,6 +705,141 @@ describe("resident retained-run startup (smarty-dev#4796)", () => {
       fs.rmSync(root, { recursive: true, force: true });
     }
   });
+
+  it.each(["startup", "strict release resume"] as const)(
+    "imports completed non-hosted metadata before launching a restored native actor after %s", { timeout: 20_000 }, async boundary => {
+    const { root, config, runs } = fixture();
+    config.workerPath = path.resolve("tests/fixtures/fake-worker.mjs");
+    config.piModels = { available: [{ provider: "test", id: "visible" }], aliases: {}, defaultModel: "test/visible" };
+    const previous = new ResidentHost(config);
+    const host = new ResidentHost(config);
+    let registered = false;
+    const gate = gatedRunnerModule(root, () => { registered = true; });
+    try {
+      await previous.start();
+      const actor = await previous.actors.create({ name: "module-bootstrap", instructions: "Respond", residency: "durable" });
+      previous.actors.pauseForRelease();
+      previous.actors.tell(actor.id, "accepted before restart", undefined);
+      await previous.close();
+      const id = "f".repeat(32);
+      saveMetadata(config, { format: 1, rootId: config.rootId, id, runnerModule: gate.module,
+        handle: { id, name: "consumed native admission", status: "completed", runner: "pi", transport: "process", cwd: root },
+        runDirectory: path.join(runs, id), createdAt: 1, updatedAt: 2, completionConsumedAt: 2 });
+      if (boundary === "strict release resume") {
+        // Inject only the native strict hold, at the last pre-resume seam.
+        // The existing drain-endpoint timeout test exercises the real deadline;
+        // this counterexample keeps a real import and restored actor pending
+        // across the shared host resume helper without exposing private state.
+        const recover = ActorDirectory.prototype.recoverProtectedActors;
+        vi.spyOn(ActorDirectory.prototype, "recoverProtectedActors").mockImplementation(async function (this: ActorDirectory) {
+          await recover.call(this);
+          this.pauseForRelease({ strict: true });
+        });
+      }
+      const launch = ProcessTransport.prototype.launch;
+      const native = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(function (this: ProcessTransport, request) {
+        expect(registered).toBe(true);
+        return launch.call(this, request);
+      });
+      await startBeforeImport(host, gate);
+      await gate.entered;
+      expect(registered).toBe(false);
+      expect(native).not.toHaveBeenCalled();
+      expect(host.actors.messages(actor.id).filter(message => message.direction === "out" && !message.error)).toHaveLength(0);
+      if (boundary === "strict release resume") {
+        expect(host.actors.releaseAdmissionHeld).toBe(false); // strict drain fence, not bootstrap hold
+        const admitted = await host.actors.create({ name: "after-strict-resume", instructions: "Wait", residency: "durable" });
+        expect(admitted.name).toBe("after-strict-resume");
+        await new Promise<void>(resolve => setImmediate(resolve));
+        expect(registered).toBe(false);
+        expect(native).not.toHaveBeenCalled();
+        expect(host.actors.messages(actor.id).filter(message => message.error)).toHaveLength(0);
+        expect(host.actors.status(actor.id).lastError).toBeUndefined();
+      }
+      gate.release();
+      await gate.finished;
+      await vi.waitFor(() => expect(host.actors.messages(actor.id).filter(message => message.direction === "out" && !message.error)).toHaveLength(1), { timeout: 10_000 });
+      expect(native).toHaveBeenCalledOnce();
+    } finally {
+      await gate.finish();
+      vi.restoreAllMocks();
+      await host.close(); await previous.close(); gate.dispose();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  // Keep reason: selection-to-attach crosses a module await and an owner lease.
+  // A still-own-root replacement is NOT the exact row originally admitted.
+  it.each(["live unchanged", "lease lost", "metadata changed", "close"] as const)(
+    "fences a real paused runner import against %s", { timeout: 15_000 }, async outcome => {
+      const { root, config, runs } = fixture();
+      const runner = hostedRunner();
+      const first = seedManager(config);
+      const host = new ResidentHost(config);
+      let unregisterLate: (() => void) | undefined;
+      const gate = gatedRunnerModule(root, () => { unregisterLate = registerAgentRunner(runner.adapter); });
+      let deadline: ReturnType<typeof setTimeout> | undefined;
+      try {
+        const handle = await first.spawn({ task: "import-boundary recovery", runner: runner.adapter.id, residency: "durable" });
+        await first.close();
+        runner.unregister();
+        const metadata: ResidentAgentMetadata = { format: 1, rootId: config.rootId, id: handle.id, handle,
+          runnerModule: gate.module, runDirectory: path.join(runs, handle.id), createdAt: 1, updatedAt: 1 };
+        saveMetadata(config, metadata);
+        const recovery = observeHostedRecovery();
+        const leaseAbort = new AbortController();
+        let metadataCursorClosed = false;
+        const opendir = fs.promises.opendir;
+        vi.spyOn(fs.promises, "opendir").mockImplementation(async (...args: Parameters<typeof fs.promises.opendir>) => {
+          const directory = await opendir(...args);
+          if (String(args[0]) === path.join(config.residencyRoot, "agents")) {
+            const close = directory.close.bind(directory);
+            vi.spyOn(directory, "close").mockImplementation((async () => {
+              await close(); metadataCursorClosed = true;
+            }) as typeof directory.close);
+          }
+          return directory;
+        });
+        await startBeforeImport(host, gate);
+        // Same host signal contract as NATS, with a deterministic lease-loss
+        // event rather than waiting for a maintenance timer or import completion.
+        if (outcome === "lease lost") vi.spyOn(host.participants, "transportLeaseSignal", "get").mockReturnValue(leaseAbort.signal);
+        expect(runner.calls.attaches).toEqual([]);
+        await gate.entered;
+        expect(recovery.fallbacks).toHaveLength(0); // imports precede the SAME manager pass
+        expect(runner.calls.attaches).toEqual([]);
+        if (outcome === "lease lost") {
+          vi.spyOn(host.participants, "canConsumeMesh").mockReturnValue(false);
+          leaseAbort.abort(new Error("Owner lease revoked during module import"));
+          await vi.waitFor(() => expect(metadataCursorClosed).toBe(true)); // import is STILL held
+          expect(recovery.fallbacks).toHaveLength(0);
+        } else if (outcome === "metadata changed") {
+          saveMetadata(config, { ...metadata, updatedAt: 2 }); // remains syntactically own-root
+        } else if (outcome === "close") {
+          const closed = await Promise.race([host.close().then(() => true),
+            new Promise<boolean>(resolve => { deadline = setTimeout(() => resolve(false), 2_000); })]);
+          expect(closed).toBe(true); // must NOT force the module's top-level await first
+        }
+        gate.release();
+        await gate.finished;
+        if (outcome === "live unchanged" || outcome === "metadata changed") await recovery.complete();
+        else await new Promise<void>(resolve => setImmediate(resolve));
+        expect(runner.calls.attaches).toEqual(outcome === "live unchanged" ? [handle.id] : []);
+        expect(runner.calls.starts).toEqual([handle.id]);
+        if (outcome === "live unchanged") {
+          await recovery.complete();
+          expect(recovery.fallbacks).toHaveLength(1);
+          expect(host.agents.status(handle.id)).toMatchObject({ transport: "hosted", status: "running" });
+        }
+      } finally {
+        if (deadline) clearTimeout(deadline);
+        await gate.finish();
+        vi.restoreAllMocks();
+        await host.close(); await first.close();
+        unregisterLate?.(); runner.unregister(); gate.dispose();
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    });
 
   it.each([
     { failure: "missing runner", metadata: true }, { failure: "damaged scope", metadata: true },

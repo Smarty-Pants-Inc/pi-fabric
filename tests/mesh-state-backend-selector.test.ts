@@ -135,11 +135,21 @@ describe("root-aware backend selection", () => {
     } finally { backend.close(); }
   });
 
-  it.skipIf(process.platform === "win32")("refuses an implicit file read when an imported root's marker is renamed aside, without changing retained bytes", async () => {
+  it.skipIf(process.platform === "win32").each(["intact", "removed"] as const)("refuses an implicit file read with meta.schema %s and an imported root's marker renamed aside", async schemaState => {
     const root = await importedRoot();
     const reader = open(root);
     expect(reader.get("retained", { fresh: true })?.value).toEqual({ from: "file" });
     reader.closeState();
+    const sqlite = process.getBuiltinModule("node:sqlite") as typeof import("node:sqlite");
+    let schema: { value: import("node:sqlite").SQLOutputValue } | undefined;
+    if (schemaState === "removed") {
+      const raw = new sqlite.DatabaseSync(path.join(root, "state.db"));
+      try {
+        schema = raw.prepare("SELECT value FROM meta WHERE name = 'schema'").get() as { value: import("node:sqlite").SQLOutputValue } | undefined;
+        expect(schema).toBeDefined();
+        expect(raw.prepare("DELETE FROM meta WHERE name = 'schema'").run().changes).toBe(1);
+      } finally { raw.close(); }
+    }
     const stateFile = path.join(root, "state.json");
     const markerBackup = path.join(root, "state.json.marker-backup");
     const marker = fs.readFileSync(stateFile);
@@ -153,42 +163,75 @@ describe("root-aware backend selection", () => {
       // This is the reported read path: refusal, never an undefined/empty retained result.
       expect(() => open(root).get("retained", { fresh: true })).toThrow(MeshBackendFenceError);
     }
-    // A real explicit SQLite choice keeps its production missing-import-marker refusal.
-    const explicit = open(root, { stateBackend: "sqlite" });
-    expect(() => explicit.get("retained", { fresh: true })).toThrow(/marker/i);
-    explicit.closeState();
+    // Keep the existing explicit-choice check without opening/reinitializing ambiguous metadata.
+    if (schemaState === "intact") {
+      const explicit = open(root, { stateBackend: "sqlite" });
+      expect(() => explicit.get("retained", { fresh: true })).toThrow(/marker/i);
+      explicit.closeState();
+    }
     expect(fs.existsSync(stateFile)).toBe(false);
     expect(fs.readFileSync(markerBackup)).toEqual(marker);
     expect(fs.readFileSync(path.join(root, "state.db"))).toEqual(database);
 
+    if (schema) {
+      const raw = new sqlite.DatabaseSync(path.join(root, "state.db"));
+      try { raw.prepare("INSERT INTO meta(name, value) VALUES ('schema', ?)").run(schema.value); }
+      finally { raw.close(); }
+    }
     fs.renameSync(markerBackup, stateFile);
     const restored = open(root);
     expect(restored.stateBackend).toBe("sqlite");
     expect(restored.get("retained", { fresh: true })?.value).toEqual({ from: "file" });
   });
 
-  it("refuses unreadable state.db metadata without presenting an empty file root or changing its bytes", () => {
+  it.each([false, true])("refuses a zero-byte state.db with no state.json (WAL present: %s), independent of metadata", withWal => {
     const root = tempRoot();
+    const database = path.join(root, "state.db");
+    const wal = path.join(root, "state.db-wal");
+    fs.writeFileSync(database, Buffer.alloc(0), { mode: 0o600 });
+    if (withWal) fs.writeFileSync(wal, "retained WAL bytes", { mode: 0o600 });
+    for (const env of [undefined, " \t "]) {
+      vi.stubEnv("PI_FABRIC_MESH_STATE_BACKEND", env);
+      expect(() => resolveMeshStateBackend(undefined, undefined, root)).toThrow(MeshBackendFenceError);
+      expect(() => open(root).get("retained", { fresh: true })).toThrow(/state\.json.*state\.db/);
+    }
+    expect(fs.existsSync(path.join(root, "state.json"))).toBe(false);
+    expect(fs.readFileSync(database)).toEqual(Buffer.alloc(0));
+    expect(fs.existsSync(wal)).toBe(withWal);
+    if (withWal) expect(fs.readFileSync(wal, "utf8")).toBe("retained WAL bytes");
+  });
+
+  it("keeps the metadata authority fence when state.json exists and state.db is unreadable", async () => {
+    const root = tempRoot();
+    await seedFileRoot(root);
+    const stateFile = path.join(root, "state.json");
+    const envelope = fs.readFileSync(stateFile);
     const database = path.join(root, "state.db");
     const bytes = Buffer.from("unreadable SQLite metadata");
     fs.writeFileSync(database, bytes, { mode: 0o600 });
     expect(() => open(root)).toThrow(MeshBackendFenceError);
+    expect(() => open(root)).toThrow(/backend flag is unreadable/);
     expect(() => open(root).get("retained", { fresh: true })).toThrow(/state\.json.*state\.db/);
-    expect(fs.existsSync(path.join(root, "state.json"))).toBe(false);
+    expect(fs.readFileSync(stateFile)).toEqual(envelope);
     expect(fs.readFileSync(database)).toEqual(bytes);
   });
 
-  it("refuses an orphan state.db-wal without creating an empty file root or changing the WAL", () => {
+  it.each([false, true])("refuses an orphan state.db-wal without changing file state or the WAL (state.json present: %s)", async withFile => {
     const root = tempRoot();
+    if (withFile) await seedFileRoot(root);
+    const stateFile = path.join(root, "state.json");
+    const envelope = withFile ? fs.readFileSync(stateFile) : undefined;
     const wal = path.join(root, "state.db-wal");
     const bytes = Buffer.from("retained WAL bytes");
     fs.writeFileSync(wal, bytes, { mode: 0o600 });
     for (const env of [undefined, " \t "]) {
       vi.stubEnv("PI_FABRIC_MESH_STATE_BACKEND", env);
       expect(() => open(root)).toThrow(MeshBackendFenceError);
+      if (withFile) expect(() => open(root)).toThrow(/state\.db-wal exists without state\.db/);
       expect(() => open(root).get("retained", { fresh: true })).toThrow(/state\.json.*state\.db-wal/);
     }
-    expect(fs.existsSync(path.join(root, "state.json"))).toBe(false);
+    expect(fs.existsSync(stateFile)).toBe(withFile);
+    if (withFile) expect(fs.readFileSync(stateFile)).toEqual(envelope);
     expect(fs.existsSync(path.join(root, "state.db"))).toBe(false);
     expect(fs.readFileSync(wal)).toEqual(bytes);
   });

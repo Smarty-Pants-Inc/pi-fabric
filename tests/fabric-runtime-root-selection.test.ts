@@ -110,12 +110,22 @@ describe("FabricRuntimeState selects an unconfigured backend per root", () => {
     }, 60_000);
   }
 
-  it.skipIf(process.platform === "win32")("refuses unconfigured bootstrap and reads when an imported root's moved marker is renamed aside", async () => {
+  it.skipIf(process.platform === "win32").each(["intact", "removed"] as const)("refuses unconfigured bootstrap and reads with meta.schema %s and an imported root's marker renamed aside", async schemaState => {
     const { runtime, context, cwd, agentDir, meshRoot } = fixture();
     const marker = await seedImported(meshRoot);
     const before = new MeshStore(meshRoot, 64 * 1024, 1_000);
     try { expect(before.get("selection/retained", { fresh: true })?.value).toEqual({ preserved: true }); }
     finally { before.closeState(); }
+    const sqlite = process.getBuiltinModule("node:sqlite") as typeof import("node:sqlite");
+    let schema: { value: import("node:sqlite").SQLOutputValue } | undefined;
+    if (schemaState === "removed") {
+      const raw = new sqlite.DatabaseSync(path.join(meshRoot, "state.db"));
+      try {
+        schema = raw.prepare("SELECT value FROM meta WHERE name = 'schema'").get() as { value: import("node:sqlite").SQLOutputValue } | undefined;
+        expect(schema).toBeDefined();
+        expect(raw.prepare("DELETE FROM meta WHERE name = 'schema'").run().changes).toBe(1);
+      } finally { raw.close(); }
+    }
     const stateFile = path.join(meshRoot, "state.json");
     const markerBackup = path.join(meshRoot, "state.json.marker-backup");
     const database = fs.readFileSync(path.join(meshRoot, "state.db"));
@@ -139,6 +149,11 @@ describe("FabricRuntimeState selects an unconfigured backend per root", () => {
     expect(fs.readFileSync(markerBackup, "utf8")).toBe(marker);
     expect(fs.readFileSync(path.join(meshRoot, "state.db"))).toEqual(database);
 
+    if (schema) {
+      const raw = new sqlite.DatabaseSync(path.join(meshRoot, "state.db"));
+      try { raw.prepare("INSERT INTO meta(name, value) VALUES ('schema', ?)").run(schema.value); }
+      finally { raw.close(); }
+    }
     fs.renameSync(markerBackup, stateFile);
     const restored = new MeshStore(meshRoot, 64 * 1024, 1_000);
     try {

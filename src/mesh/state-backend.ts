@@ -298,8 +298,13 @@ export const resolveMeshStateBackend = (explicit?: MeshStateBackendKind,
     if (root !== undefined) {
       if (readMeshStateMovedMarker(root)) return "sqlite";
       try {
-        // A missing marker must not turn retained SQLite state into an empty state.json read.
-        // The write fence already knows the metadata/rollback rules; keep explicit choices unchanged.
+        // Presence alone blocks an empty file read, even if SQLite metadata is absent or ambiguous.
+        // Keep the metadata fence below for roots where state.json exists (including rollback).
+        if (fs.lstatSync(path.join(root, "state.json"), { throwIfNoEntry: false }) === undefined
+          && (fs.lstatSync(path.join(root, "state.db"), { throwIfNoEntry: false }) !== undefined
+            || fs.lstatSync(path.join(root, "state.db-wal"), { throwIfNoEntry: false }) !== undefined)) {
+          throw new Error("state.json is absent but state.db or state.db-wal exists");
+        }
         if (fs.lstatSync(path.join(root, "state.db-wal"), { throwIfNoEntry: false }) !== undefined
           && fs.statSync(path.join(root, "state.db"), { throwIfNoEntry: false }) === undefined) {
           throw new Error("state.db-wal exists without state.db");

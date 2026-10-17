@@ -9,6 +9,8 @@ merge_queue:
   # blocks the whole line (10-11 23:54Z-02:00Z: one #864 bisect held every PR, P0 pi-fabric#936 included).
   # Revert to 1 if queue-draft resets rise or CI runners can't carry two batches.
   max_parallel_checks: 2
+  # Skip intermediate batch results for anti-flake protection; https://docs.mergify.com/merge-queue/batches/#skip-intermediate-results-anti-flake-protection; Paul 10-17 17:55Z via chief-of-staff (turn on Mergify features), smarty-dev#14537
+  skip_intermediate_results: true
   reset_on_external_merge: always
 
 # smarty-dev's plain rule (smarty-dev#865): the PR, its required checks and this queue are the

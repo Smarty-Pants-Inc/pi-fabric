@@ -6,7 +6,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { fabricWakeCause, withFabricWakeAdmission } from "../src/fabric-provenance.js";
 import { MainAgentController, type FabricMainAgentDeliveryRequest } from "../src/main-agent.js";
 
-// resume models the trusted launch-role capability (project-agent); false is a principal or unknown root.
+// resume models the trusted launch-role capability (project-agent or org-agent); other roots get false.
 const makeHarness = (idle = true, aborted = false, durable = false, resume = true, flushMs = 0) => {
   const handlers = new Map<string, Array<(event: unknown, ctx: ExtensionContext) => unknown>>();
   const sent: Array<{ content: string; deliverAs: string; triggerTurn: boolean }> = [];
@@ -34,7 +34,7 @@ const makeHarness = (idle = true, aborted = false, durable = false, resume = tru
   const emit = (name: string, event: unknown) => {
     for (const handler of handlers.get(name) ?? []) handler(event, ctx);
   };
-  return { main, pi, sent, state, emit, ctx };
+  return { main, pi, sent, state, emit, ctx, journal };
 };
 
 const peer = { id: "session:peer", name: "peer", kind: "main" as const };
@@ -53,7 +53,7 @@ const directSteer = (extra: SteerOverrides = {}): FabricMainAgentDeliveryRequest
 // Keep: incident smarty-dev#12774; native abort parked fresh escalations indefinitely.
 // Recorded Pi calls exercise the receiver's halt/attribution trust boundary without deletion.
 describe("Main operator-halt peer wake admission", () => {
-  it("keeps a principal or unmarked Main halted for a verified peer steer", () => {
+  it("keeps a root without the launch-role capability halted for a verified peer steer", () => {
     const { main, sent } = makeHarness(true, false, false, false);
     main.halt();
     expect(main.deliverAgent(directSteer())).toMatchObject({ triggered: false, halted: true, reason: "operator-halt" });
@@ -198,7 +198,7 @@ describe("Main operator-halt peer wake admission", () => {
     main.closeFollowUpDrain();
   });
 
-  it("rejects a replay before it can clear halt and keeps an aborted turn passive", () => {
+  it("rejects a replay before it can clear halt and keeps an explicitly stopped aborted turn passive", () => {
     const replaying = makeHarness(true, true, true);
     replaying.main.halt();
     const first = directSteer({ deliveryId: "peer-steer-replay" });
@@ -210,10 +210,41 @@ describe("Main operator-halt peer wake admission", () => {
     replaying.main.closeFollowUpDrain();
 
     const settling = makeHarness(false, true);
+    settling.main.halt(); // Explicit owner stop, not the generic abort event, latches this halt.
     settling.emit("turn_end", { message: { stopReason: "aborted" } });
     const blocked = settling.main.deliverAgent(directSteer());
     expect(blocked).toMatchObject({ triggered: false, halted: true, reason: "operator-halt" });
     expect(settling.sent.every(item => !item.triggerTurn)).toBe(true);
     settling.main.closeFollowUpDrain();
+  });
+
+  it("keeps generic abort transient and does not persist an operator halt", () => {
+    const { main, pi, sent, state, emit, ctx, journal } = makeHarness(true, true, true);
+    emit("turn_end", { message: { stopReason: "aborted" } });
+    emit("agent_before_settle", { outcome: "aborted" });
+    emit("agent_settled", { outcome: "aborted" });
+    const followUp = (message: string): FabricMainAgentDeliveryRequest => ({
+      from: peer, verification: "mesh", message, delivery: "followUp",
+    });
+    const cancelled = main.deliverAgent(followUp("during generic cancellation"));
+    expect(cancelled).toMatchObject({ triggered: false });
+    expect(cancelled).not.toHaveProperty("halted");
+    expect(sent.every(item => !item.triggerTurn)).toBe(true);
+    state.aborted = false;
+    const fresh = main.deliverAgent(followUp("fresh after signal clearance"));
+    expect(fresh).toMatchObject({ triggered: true });
+    expect(fresh).not.toHaveProperty("halted");
+    main.closeFollowUpDrain();
+
+    const reopened = new MainAgentController(pi, "session:root", true, "/project", "root", true, undefined, {}, undefined, undefined, true);
+    reopened.attachFollowUpDrain(ctx, 0, journal);
+    try {
+      const restored = reopened.deliverAgent(followUp("fresh after journal reopen"));
+      expect(restored).toMatchObject({ triggered: true });
+      expect(restored).not.toHaveProperty("halted");
+      expect(sent.at(-1)).toMatchObject({ deliverAs: "followUp", triggerTurn: true });
+    } finally {
+      reopened.closeFollowUpDrain();
+    }
   });
 });

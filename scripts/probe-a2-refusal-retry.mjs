@@ -202,6 +202,7 @@ const main = async () => {
     } catch (error) { failure ??= error; }
     try { fs.rmSync(scratch, { recursive: true, force: true }); } catch (error) { failure ??= error; }
   }
+  if (failure) verdict = "FAIL";
   const elapsed = Math.round(performance.now() - started);
   const line = `A2PROBE host=${host} release=${options.releaseSha} refusal=${refusal} events_before_retry=${before} deliveries_after_retry=${deliveries} dup_after_second_retry=${duplicates} residue=${residue} ${verdict} ${elapsed}ms`;
   process.stdout.write(line + "\n");

@@ -30,6 +30,32 @@ A release owner may proceed only after the **full gate** exits zero and its JSON
 
 The scratch topology is disposable; fleet mesh directories are never inputs or destinations. Retain its evidence until the release decision is recorded, then remove only the private directory that invocation created.
 
+## Capture retained authority without fleet content
+
+Fresh registrars are not a substitute for the authority already held by a fleet mesh. The clean-mesh gate above missed the retained-authority failure reported in Refs Smarty-Pants-Inc/smarty-dev#14111. Same-root sibling tokens are one demonstrated fixture trigger, not yet a claim about the cause of a particular fleet stop. Do not infer tokenless input from the installed release: capture the actual authority and inspect the presence computed on each pass.
+
+After independent safety review of the exact collector bytes, the release owner runs the standalone Node 24+ collector locally on each authorized source host. It needs no package installation. From the verified checkout root, on the hub:
+
+```sh
+OUTDIR=$(mktemp -d)
+node scripts/fleet-authority-snapshot.mjs --mesh /home/paul/.local/share/smarty-dev/fabric-mesh/fleet --site hub --name dev1 --peer ryzen2 --cursor /home/paul/.local/state/mesh-bridge/ryzen2/cursor.json --cursor /home/paul/.local/state/mesh-bridge/intel1/cursor.json --output "$OUTDIR/hub.json"
+```
+
+On Ryzen 2, with the same reviewed CLI and library files:
+
+```sh
+OUTDIR=$(mktemp -d)
+node scripts/fleet-authority-snapshot.mjs --mesh /home/paul/.local/share/smarty-dev/fabric-mesh/fleet --site work --name ryzen2 --peer dev1 --output "$OUTDIR/work.json"
+```
+
+Only the generated sanitized JSON files may be sent to the canary host. Never copy a mesh database, canonical state file, WAL/SHM, raw lease/participant files, events, actors, or cursor backups. The `fabric-release` files beside the cursors are not authority inputs. The Intel 1 hub cursor is an observation, not a substitute for Intel 1 work-side authority; these two captures cover the dev1–Ryzen 2 pairing only.
+
+The allowlist projects host records, participant ownership joins, handoffs, liveness policy, separate participant/lease files, mirror observations, and explicitly named cursor fields. All incarnation/owner/process token values and superseded-token keys become stable `h:<32 hex>` SHA-256 prefixes. Canonical IDs and root joins remain exact; arbitrary display names become safe aliases. The field census is in `counts`, including dropped fields under fixed schema labels and SQLite page/WAL-frame counts before and after. No message bodies, event data, actor content, raw tokens, or arbitrary field names are printed. The CLI writes a new mode-0600 file outside the source mesh and prints the same sanitized JSON; it refuses overwrites and reports fixed error codes without source values.
+
+SQLite is opened read-only with `query_only` and one read transaction; no immutable, backup, checkpoint, or write-capable fallback is used. Normal SQLite SHM reader-index maintenance is permitted by the owning lead's scoped ruling, not an authority-data write. FILE collection reads canonical `state.json`, lexically skipping unrelated value subtrees instead of parsing/exporting private bodies. Source file identities/listings are checked for change; a DB transaction plus independent files is not a globally atomic fleet snapshot.
+
+Unsupported schemas/IDs, unknown included-record containers, unsafe paths, changing files, and exceeded bounds fail closed; there is no sampling or truncation. Bounds are 32 MiB canonical source/projected output, 256 KiB per authority value/file, 10,000 authority rows or files per class, 256 array/history items, and 32 explicit cursors. Observed truncated-hash collisions fail; an undetected hypothetical cross-site 128-bit collision remains a limitation. Imported process fields are observations, never proof that a fleet PID is alive on the replay host.
+
 ## Historical regression
 
 Refs Smarty-Pants-Inc/smarty-dev#14111 and Refs Smarty-Pants-Inc/smarty-dev#14279.

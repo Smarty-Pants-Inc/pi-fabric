@@ -126,7 +126,6 @@ import { AgentTranscriptReader } from "../ui/transcript.js";
 import { waitWithProgress, waitWithActorProgress } from "./agents-progress.js";
 import { AgentMessageRouter, unknownParticipant } from "./agents-message-router.js";
 import { terminalAgentStatuses } from "../agents/lifecycle.js";
-import { deliverWithMessageNotice, outgoingMessageNotice } from "./message-id-notice.js";
 
 export { collectAgentToolPreviewNodes, type AgentToolPreviewTreeOptions } from "./agents-progress.js";
 
@@ -1885,14 +1884,7 @@ export class AgentsProvider implements FabricProvider {
         this.providerParticipants, this.participants, this.control, id, kind, message, data,
       ) as Promise<FabricAgentMessageResult>;
     }
-    // Host-authored lifecycle routing has no sender invocation/history. Check
-    // only model sends, before *all* local/actor/remote routing branches.
-    if (!context) return this.#router.routeMessage(id, message, data, kind, context, options);
-    context = snapshotFabricInvocation(context);
-    const checked = await outgoingMessageNotice(message, context, this.actorManager.identity.id);
-    const result = await deliverWithMessageNotice(message, checked,
-      text => this.#router.routeMessage(id, text, data, kind, context, options), `agents.${kind}`);
-    return checked.notice ? { ...result, notice: checked.notice } : result;
+    return this.#router.routeMessage(id, message, data, kind, context, options);
   }
 
   /** Flush pending coalesced lifecycle deliveries; used by tests and shutdown. */

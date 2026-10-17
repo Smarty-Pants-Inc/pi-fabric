@@ -3,19 +3,18 @@
 // Usage: node scripts/probe-a2-refusal-retry.mjs --release /path/to/pi-fabric --release-sha <40-hex>
 // Optional: --pi /path/to/pi (or PI_FABRIC_PROBE_PI), --host HOST.
 // It runs the INSTALLED release in a PRIVATE scratch mesh (never live fleet roots).
-// It forces refusal by making that private mesh directory unavailable.
+// The keyless fixture injects one late stat EIO and restores the real reader before throwing.
 // All routing and observation inside Pi uses public fabric_exec agents/mesh APIs.
-// It names a unique absent receiver, then forces the late directory read to refuse.
-// The first send must be a typed refusal, never generic/unknown.
-// It checks zero control events carrying K before any receiver exists.
-// It then starts the owned receiver under that exact unique probe-only name.
+// It starts a live receiver under a unique probe-only name, warms the sender directory,
+// then forces one late directory read to refuse while refreshRoutingView stays readable.
+// The first send must be a typed refusal, never generic/unknown, with zero command events.
 // It retries with unchanged target, message, and idempotency key K.
 // It retries once more with K and checks one accepted receiver message, no duplicate.
 // It reads command/ACK events with mesh.read; it never opens or writes mesh storage.
 // It publishes one a2probe result event for the probe's own topic.
-// Teardown stops only the two probe Pi processes and restores the throwaway mode.
+// Teardown stops only the two probe Pi processes and removes their private scratch root.
 // The release is not modified; pass --release to the installed release directory.
-// The release SHA is required so the receipt cannot silently identify another build.
+// Identity: prefer RELEASE.json commit+dist hashes; else realpath must be releases/<sha>.
 // Run after install with the same host/user that owns the installed Pi runtime.
 // Output is exactly one operator receipt line with measured elapsed milliseconds.
 // A failed stage exits nonzero and prints its diagnostic only on stderr.
@@ -25,32 +24,75 @@ import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { createHash, randomUUID } from "node:crypto";
 
 const self = fileURLToPath(import.meta.url);
 const repo = path.resolve(path.dirname(self), "..");
 const sleep = ms => new Promise(resolve => setTimeout(resolve, Math.max(0, ms)));
-const errorFields = error => Object.fromEntries(["name", "code", "retryable", "message"].map(key => [key, error?.[key]]).filter(([, value]) => value !== undefined));
-const typedRefusals = new Set([
-  "FABRIC_DIRECTORY_UNAVAILABLE", "FABRIC_ROUTE_AUTHORITY_CHANGED", "FABRIC_PARTICIPANT_NOT_YET_MIRRORED",
-  "FABRIC_PARTICIPANT_STALE", "FABRIC_PEER_LEASE_STALE",
-]);
+const hash = value => createHash("sha256").update(value).digest("hex");
+export const finalVerdict = failure => failure ? "FAIL" : "PASS";
+
+// Prefer commit/files metadata; legacy installs use the installer's /releases/<sha> addressing.
+export const verifyRelease = (release, expectedSha) => {
+  if (!release) throw new Error("--release is required (explicit installed release path)");
+  if (!/^[0-9a-f]{40}$/.test(expectedSha ?? "")) throw new Error("--release-sha must be a full 40-hex release SHA");
+  const root = fs.realpathSync(release);
+  const metadataPath = path.join(root, "RELEASE.json");
+  const metadata = fs.lstatSync(metadataPath, { throwIfNoEntry: false })
+    ? JSON.parse(fs.readFileSync(metadataPath, "utf8")) : undefined;
+  const identity = metadata === undefined ? "release-path" : "release-json";
+  if (identity === "release-json") {
+    if (metadata?.commit !== expectedSha) throw new Error(`release SHA mismatch: metadata=${metadata?.commit}, expected=${expectedSha}`);
+  } else if (path.basename(path.dirname(root)) !== "releases" || path.basename(root) !== expectedSha) {
+    throw new Error("release path mismatch: expected realpath .../releases/<--release-sha>");
+  }
+  if (JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8")).name !== "pi-fabric") throw new Error("not a pi-fabric release");
+  const files = {};
+  const visit = directory => {
+    for (const name of fs.readdirSync(directory).sort()) {
+      const file = path.join(directory, name), stat = fs.lstatSync(file);
+      if (stat.isSymbolicLink()) throw new Error(`release dist must not contain symlinks: ${file}`);
+      if (stat.isDirectory()) visit(file);
+      else if (/\.(?:m?js)$/.test(name)) {
+        const relative = path.relative(root, file).split(path.sep).join("/");
+        const digest = hash(fs.readFileSync(file));
+        if (identity === "release-json" && metadata.files?.[relative] !== digest) throw new Error(`release artifact digest mismatch: ${relative}`);
+        files[relative] = digest;
+      }
+    }
+  };
+  visit(path.join(root, "dist"));
+  if (!files["dist/index.js"]) throw new Error("release entry does not exist: dist/index.js");
+  for (const relative of Object.keys(metadata?.files ?? {})) {
+    if (relative.startsWith("dist/") && /\.(?:m?js)$/.test(relative) && !files[relative]) throw new Error(`release artifact missing: ${relative}`);
+  }
+  return { entry: path.join(root, "dist/index.js"), releaseSha: expectedSha, identity, artifactDigest: hash(JSON.stringify(files)) };
+};
 const residuePrefix = "a2probe-";
 const readResidue = root => {
   const statePath = path.join(root, "state.json");
   const state = fs.existsSync(statePath) ? JSON.parse(fs.readFileSync(statePath, "utf8")) : { entries: {} };
   const entries = Object.entries(state.entries ?? {});
-  const participants = entries.filter(([key, entry]) => key.startsWith("topology/participants/") && entry?.value != null).length;
+  const participantKeys = new Set(entries.filter(([key, entry]) => key.startsWith("topology/participants/") && entry?.value != null).map(([key]) => key));
+  const participantsPath = path.join(root, "participants");
+  if (fs.existsSync(participantsPath)) {
+    for (const name of fs.readdirSync(participantsPath).filter(name => name.endsWith(".json"))) {
+      const entry = JSON.parse(fs.readFileSync(path.join(participantsPath, name), "utf8"));
+      if (typeof entry.key !== "string" || !entry.key.startsWith("topology/participants/")) throw new Error(`invalid participant residue: ${name}`);
+      if (entry.value != null) participantKeys.add(entry.key);
+    }
+  }
   const namedKeys = entries.filter(([key]) => key.startsWith(residuePrefix)).length;
   const eventPath = path.join(root, "events.jsonl");
   const namedEvents = fs.existsSync(eventPath)
     ? fs.readFileSync(eventPath, "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line)).filter(event =>
       [event.id, event.topic, event.kind, event.name, event.data?.name].some(value => typeof value === "string" && value.startsWith(residuePrefix))).length
     : 0;
-  return { participants, named: namedKeys + namedEvents };
+  return { participants: participantKeys.size, named: namedKeys + namedEvents };
 };
 
-const parse = argv => {
-  const options = { release: repo, releaseSha: undefined, pi: process.env.PI_FABRIC_PROBE_PI ?? "pi", host: os.hostname() };
+export const parse = argv => {
+  const options = { release: undefined, releaseSha: undefined, pi: process.env.PI_FABRIC_PROBE_PI ?? "pi", host: os.hostname() };
   for (let index = 0; index < argv.length; index++) {
     const arg = argv[index];
     const value = () => {
@@ -67,30 +109,8 @@ const parse = argv => {
       process.exit(0);
     } else throw new Error(`unknown option ${arg}`);
   }
-  if (!/^[0-9a-f]{40}$/.test(options.releaseSha ?? "")) throw new Error("--release-sha must be a full 40-hex release SHA");
-  const entry = path.resolve(options.release, "dist/index.js");
-  if (!fs.existsSync(entry)) throw new Error(`release entry does not exist: ${entry}`);
-  const packageJson = JSON.parse(fs.readFileSync(path.join(options.release, "package.json"), "utf8"));
-  if (packageJson.name !== "pi-fabric") throw new Error(`not a pi-fabric release: ${packageJson.name}`);
-  return { ...options, entry };
+  return { ...options, ...verifyRelease(options.release, options.releaseSha) };
 };
-
-/* const providerSource = `import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
-const model = { provider: "a2probe", id: "offline", name: "A2 probe", api: "a2probe-api", baseUrl: "http://invalid.local", reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 200000, maxTokens: 4096 };
-const textOf = message => message?.content?.filter(part => part.type === "text").map(part => part.text).join("") ?? "";
-export default function(pi) {
-  const stream = (selected, context) => {
-    const events = createAssistantMessageEventStream();
-    const prompt = textOf(context.messages.at(-1));
-    const spec = JSON.parse(prompt.slice("A2PROBE:".length));
-    const call = { type: "toolCall", id: "a2probe-" + Date.now(), name: "fabric_exec", arguments: { code: spec.code, resultFormat: "json", display: { name: "A2 router probe", description: "Public Fabric A2 post-install acceptance" } } };
-    const message = { role: "assistant", provider: selected.provider, model: selected.id, api: selected.api, timestamp: Date.now(), content: [{ type: "text", text: "" }, { type: "toolCall", ...call }], stopReason: "toolUse", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
-    events.push({ type: "start", partial: message }); events.push({ type: "toolcall_end", contentIndex: 1, toolCall: call, partial: message }); events.push({ type: "done", reason: "toolUse", message }); events.end(); return events;
-  };
-  pi.registerProvider({ id: "a2probe", name: "A2 probe", auth: { apiKey: { name: "Keyless", check: async () => ({ type: "api_key", source: "keyless" }), resolve: async () => ({ auth: {} }) } }, getModels: () => [model], stream, streamSimple: stream });
-}
-`;
-*/
 
 class Rpc {
   constructor(options, scratch, meshRoot, role, sessionFile, name) {
@@ -133,9 +153,9 @@ class Rpc {
       this.child.stdin.write(JSON.stringify({ id, ...data }) + "\n");
     });
   }
-  async eval(code) {
+  async eval(code, lateReadFault = false) {
     const start = this.events.length;
-    await this.request({ type: "prompt", message: "A2PROBE:" + JSON.stringify({ code }) });
+    await this.request({ type: "prompt", message: "A2PROBE:" + JSON.stringify({ code, lateReadFault }) });
     const deadline = Date.now() + 120000;
     while (Date.now() < deadline) {
       const result = this.events.slice(start).find(event => event.type === "tool_execution_end" && event.toolName === "fabric_exec");
@@ -163,37 +183,39 @@ const main = async () => {
   if (!inheritedTmp || !path.isAbsolute(inheritedTmp)) throw new Error("absolute TMPDIR is required");
   const scratch = fs.mkdtempSync(path.join(inheritedTmp, "a2probe-")); fs.chmodSync(scratch, 0o700);
   const meshRoot = path.join(scratch, "mesh");
-  const host = options.host, key = `a2probe-${host}-${new Date().toISOString().replace(/[^0-9]/g, "").slice(0, 14)}`;
-  const targetName = `probe-receiver-${host}-${key.slice("a2probe-".length)}`, message = `A2PROBE ${key}`, topic = `a2probe.${host}.${key}`;
+  const host = options.host, key = `a2probe-${host}-${randomUUID()}`;
+  const targetName = `probe-receiver-${randomUUID()}`, message = `A2PROBE ${key}`, topic = `a2probe.${host}.${key}`;
   const receiver = new Rpc(options, scratch, meshRoot, "receiver", undefined, targetName);
   let sender;
-  let refusal = "unknown", before = -1, deliveries = -1, duplicates = -1, residue = -1, verdict = "FAIL", failure;
+  let refusal = "unknown", before = -1, deliveries = -1, duplicates = -1, residue = -1, failure;
   try {
+    const receiverState = await receiver.start();
+    const receiverId = `session:${receiverState.sessionId}`;
     sender = new Rpc(options, scratch, meshRoot, "sender", undefined, "probe-sender");
     await sender.start();
-    await sender.eval("return await agents.sessions();");
-    fs.chmodSync(meshRoot, 0o000);
-    const first = await sender.eval(`const errorFields = error => Object.fromEntries(["name", "code", "retryable", "message"].map(k => [k, error?.[k]]).filter(([,v]) => v !== undefined)); try { const receipt = await agents.followUp({ id: ${JSON.stringify(targetName)}, message: ${JSON.stringify(message)}, idempotencyKey: ${JSON.stringify(key)} }); return { ok: true, receipt }; } catch (error) { return { ok: false, error: errorFields(error) }; }`);
+    const discovered = await sender.eval(`const rows = await agents.sessions(); return { rows };`);
+    if (!discovered.rows.some(row => row.id === receiverId && row.name === targetName)) throw new Error("receiver did not become publicly discoverable under the probe name");
+    const first = await sender.eval(`const errorFields = error => Object.fromEntries(["name", "code", "retryable", "message"].map(k => [k, error?.[k]]).filter(([,v]) => v !== undefined)); try { const receipt = await agents.followUp({ id: ${JSON.stringify(targetName)}, message: ${JSON.stringify(message)}, idempotencyKey: ${JSON.stringify(key)} }); return { ok: true, receipt }; } catch (error) { return { ok: false, error: errorFields(error) }; }`, true);
+    if (!sender.stderr.includes("A2FAULT one-shot")) throw new Error("one-shot late directory fault was not reached");
     refusal = first.error?.code ?? first.error?.name ?? "none";
     const firstEvents = await sender.eval(`return (await mesh.read({ topic: "fabric.control.command", limit: 1000 })).filter(event => event.data?.message === ${JSON.stringify(message)}).map(event => ({ id: event.id, commandId: event.data.commandId }));`);
     before = new Set(firstEvents.map(event => event.commandId)).size;
-    if (first.ok || !typedRefusals.has(first.error?.code)) throw new Error(`first send was not one typed pre-publication refusal: ${JSON.stringify(first)}`);
-    fs.chmodSync(meshRoot, 0o700);
+    if (first.ok || first.error?.code !== "FABRIC_DIRECTORY_UNAVAILABLE" || first.error?.retryable !== true || !first.error?.message?.includes("A2PROBE one-shot late directory read")) throw new Error(`first send was not the injected typed late-read refusal: ${JSON.stringify(first)}`);
 
-    const receiverState = await receiver.start();
-    const receiverId = `session:${receiverState.sessionId}`;
-    const discovered = await sender.eval(`const rows = await agents.sessions(); return { rows };`);
-    if (!discovered.rows.some(row => row.id === receiverId && row.name === targetName)) throw new Error("receiver did not become publicly discoverable under the probe name");
+    const visible = await sender.eval(`return (await agents.sessions()).some(row => row.id === ${JSON.stringify(receiverId)} && row.name === ${JSON.stringify(targetName)});`);
+    if (!visible) throw new Error("receiver is not publicly visible before explicit retry");
     const retryCode = `const receipt = await agents.followUp({ id: ${JSON.stringify(targetName)}, message: ${JSON.stringify(message)}, idempotencyKey: ${JSON.stringify(key)} }); return { receipt };`;
+    const observeCode = `const commands = (await mesh.read({ topic: "fabric.control.command", limit: 1000 })).filter(event => event.data?.message === ${JSON.stringify(message)}); const ids = new Set(commands.map(event => event.data.commandId)); const acks = (await mesh.read({ topic: "fabric.control.ack", limit: 1000 })).filter(event => ids.has(event.data?.commandId) && event.data?.accepted === true); const messages = new Set(acks.map(event => event.data?.messageId).filter(Boolean));`;
     await sender.eval(retryCode);
+    const afterRetry = await sender.eval(`${observeCode} return { deliveryCount: messages.size };`);
+    deliveries = afterRetry.deliveryCount;
+    if (deliveries !== 1) throw new Error(`first explicit retry did not deliver once: ${deliveries}`);
     await sender.eval(retryCode);
-    const observed = await sender.eval(`const commands = (await mesh.read({ topic: "fabric.control.command", limit: 1000 })).filter(event => event.data?.message === ${JSON.stringify(message)}); const ids = new Set(commands.map(event => event.data.commandId)); const acks = (await mesh.read({ topic: "fabric.control.ack", limit: 1000 })).filter(event => ids.has(event.data?.commandId) && event.data?.accepted === true); const messages = new Set(acks.map(event => event.data?.messageId).filter(Boolean)); await mesh.publish({ topic: ${JSON.stringify(topic)}, kind: "a2probe.result", text: ${JSON.stringify(message)}, data: { key: ${JSON.stringify(key)}, commandIds: [...ids], messageIds: [...messages] } }); return { commandCount: ids.size, deliveryCount: messages.size };`);
-    deliveries = observed.deliveryCount; duplicates = Math.max(0, observed.deliveryCount - 1);
+    const observed = await sender.eval(`${observeCode} await mesh.publish({ topic: ${JSON.stringify(topic)}, kind: "a2probe.result", text: ${JSON.stringify(message)}, data: { key: ${JSON.stringify(key)}, commandIds: [...ids], messageIds: [...messages] } }); return { commandCount: ids.size, deliveryCount: messages.size };`);
+    duplicates = Math.max(0, observed.deliveryCount - deliveries);
     if (before !== 0 || deliveries !== 1 || duplicates !== 0) throw new Error(`A2 counts failed: before=${before} deliveries=${deliveries} duplicates=${duplicates}`);
-    verdict = "PASS";
   } catch (error) { failure = error; }
   finally {
-    try { if (fs.existsSync(meshRoot)) fs.chmodSync(meshRoot, 0o700); } catch { /* teardown is best effort */ }
     await receiver.stop(); await sender?.stop();
     try {
       const observedResidue = readResidue(meshRoot);
@@ -202,11 +224,15 @@ const main = async () => {
     } catch (error) { failure ??= error; }
     try { fs.rmSync(scratch, { recursive: true, force: true }); } catch (error) { failure ??= error; }
   }
-  if (failure) verdict = "FAIL";
+  try {
+    const finalRelease = verifyRelease(options.release, options.releaseSha);
+    if (finalRelease.artifactDigest !== options.artifactDigest || finalRelease.identity !== options.identity) throw new Error("release artifacts or identity changed during probe");
+  } catch (error) { failure ??= error; }
+  const verdict = finalVerdict(failure);
   const elapsed = Math.round(performance.now() - started);
-  const line = `A2PROBE host=${host} release=${options.releaseSha} refusal=${refusal} events_before_retry=${before} deliveries_after_retry=${deliveries} dup_after_second_retry=${duplicates} residue=${residue} ${verdict} ${elapsed}ms`;
+  const line = `A2PROBE host=${host} release=${options.releaseSha} identity=${options.identity} refusal=${refusal} events_before_retry=${before} deliveries_after_retry=${deliveries} dup_after_second_retry=${duplicates} residue=${residue} ${verdict} ${elapsed}ms`;
   process.stdout.write(line + "\n");
   if (failure) { process.stderr.write(`A2PROBE failure: ${failure.stack ?? failure}\n`); process.exitCode = 1; }
 };
 
-main().catch(error => { process.stdout.write(`A2PROBE host=unknown release=unknown refusal=unknown events_before_retry=-1 deliveries_after_retry=-1 dup_after_second_retry=-1 residue=-1 FAIL 0ms\n`); process.stderr.write(`${error.stack ?? error}\n`); process.exitCode = 1; });
+if (process.argv[1] && path.resolve(process.argv[1]) === self) main().catch(error => { process.stdout.write(`A2PROBE host=unknown release=unknown identity=unknown refusal=unknown events_before_retry=-1 deliveries_after_retry=-1 dup_after_second_retry=-1 residue=-1 FAIL 0ms\n`); process.stderr.write(`${error.stack ?? error}\n`); process.exitCode = 1; });

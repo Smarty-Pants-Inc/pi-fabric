@@ -509,4 +509,37 @@ describe("fleet authority snapshot privacy and real backend boundaries", () => {
       const after = treeBytes(f.mesh); delete before["state.db-shm"]; delete after["state.db-shm"]; expect(after).toEqual(before);
     } finally { db.close(); }
   });
+  it("accepts the explicit work/intel1 collector label in snapshots and aggregate census only", () => {
+    const f = fixture();
+    const invoke = (site: string, name: string, output: string, census = false) => {
+      const argv = args(f, site, output, census);
+      argv[argv.indexOf("--name") + 1] = name;
+      return spawnSync(process.execPath, argv, { encoding: "utf8", timeout: 5000 });
+    };
+    const snapshotPath = path.join(f.out, "intel1.json"), snapshotResult = invoke("work", "intel1", snapshotPath);
+    expect(snapshotResult.error, snapshotResult.stderr).toBeUndefined(); expect(snapshotResult.status, snapshotResult.stderr).toBe(0);
+    expect(snapshotResult.stderr).toBe("");
+    const snapshot = JSON.parse(snapshotResult.stdout);
+    expect(snapshot).toMatchObject({ site: "work", name: "intel1", peer: "dev1", backend: "file", attempts: 1 });
+    expect(fs.readFileSync(snapshotPath, "utf8")).toBe(snapshotResult.stdout);
+    for (const secret of [TOKEN, OLD, SECRET, "Private Human Name", "Private Participant Name", "/private"]) expect(snapshotResult.stdout).not.toContain(secret);
+
+    const censusPath = path.join(f.out, "intel1-census.json"), censusResult = invoke("work", "intel1", censusPath, true);
+    expect(censusResult.error, censusResult.stderr).toBeUndefined(); expect(censusResult.status, censusResult.stderr).toBe(0);
+    expect(censusResult.stderr).toBe("");
+    const census = JSON.parse(censusResult.stdout);
+    expect(census).toMatchObject({ schemaVersion: 1, mode: "census", complete: true, backend: "file", attempts: 1, unsupported: [] });
+    expect(census).not.toHaveProperty("site"); expect(census).not.toHaveProperty("name");
+    expect(fs.readFileSync(censusPath, "utf8")).toBe(censusResult.stdout);
+    for (const secret of ["intel1", TOKEN, OLD, SECRET, "Private Human Name", "Private Participant Name", "/private"]) expect(censusResult.stdout).not.toContain(secret);
+
+    const wrongSitePath = path.join(f.out, "hub-intel1.json"), wrongSite = invoke("hub", "intel1", wrongSitePath);
+    expect(wrongSite.status).toBe(1); expect(wrongSite.stdout).toBe(""); expect(wrongSite.stderr).toBe('{"error":"INVALID_OPTIONS"}\n');
+    expect(wrongSite.stderr).not.toContain("intel1"); expect(fs.existsSync(wrongSitePath)).toBe(false);
+
+    const arbitraryName = "private-arbitrary-name-not-allowlisted", arbitraryPath = path.join(f.out, "arbitrary-name.json");
+    const arbitrary = invoke("work", arbitraryName, arbitraryPath);
+    expect(arbitrary.status).toBe(1); expect(arbitrary.stdout).toBe(""); expect(arbitrary.stderr).toBe('{"error":"INVALID_OPTIONS"}\n');
+    expect(arbitrary.stderr).not.toContain(arbitraryName); expect(fs.existsSync(arbitraryPath)).toBe(false);
+  });
 });

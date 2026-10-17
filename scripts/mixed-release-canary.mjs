@@ -6,6 +6,10 @@ import path from "node:path";
 import { spawn, execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { pathToFileURL, fileURLToPath } from "node:url";
+import { seedAuthoritySnapshot, validateAuthoritySnapshot, matchAuthorityRefusal, rebaseAuthoritySnapshot,
+  sanitizeAuthorityEvidence, nativeProcessEvidence } from "./lib/mixed-release-worker.mjs";
+export { sanitizeAuthorityEvidence } from "./lib/mixed-release-worker.mjs";
+export { validateAuthoritySnapshot, rebaseAuthoritySnapshot, authorityPredicates, matchAuthorityRefusal } from "./lib/mixed-release-worker.mjs";
 
 const SHA = /^[a-f0-9]{40}$/;
 const hash = value => createHash("sha256").update(value).digest("hex");
@@ -13,6 +17,7 @@ const WORKER = fileURLToPath(new URL("./lib/mixed-release-worker.mjs", import.me
 const MIN_HOLD = 60_000;
 
 export function parseArgs(argv) {
+  if (argv.includes("--authority-snapshot")) return parseAuthorityArgs(argv);
   const result = { old: [], holdMs: MIN_HOLD, baselineControl: false };
   const seen = new Set();
   for (let i = 0; i < argv.length; i++) {
@@ -264,13 +269,16 @@ export function evaluateReceipt(e = {}) {
       event.data?.messageId === `ack:${attempt.marker}`).length === 1;
   const refusal = !attempt.receipt && entries.length === 0 && !acks.some(event => event.data?.accepted === true) &&
     !(destination.ackEvents ?? []).some(event => commandIds.includes(event.data?.commandId) && event.data?.accepted === true) &&
-    attempt.error?.source === "FabricControlPlane.request" && typeof attempt.error.name === "string" && attempt.error.name.length > 0 &&
-    typeof attempt.error.message === "string" && attempt.error.message.includes(seeded.id) &&
-    !/RPC deadline|harness/i.test(attempt.error.message) &&
-    // A named public lease/route error is a visible sender outcome even when its
-    // truthful message says delivery is unknown. Do not confuse that with no result
-    // or a generic ACK timeout; preserve its exact words for the release owner.
-    (attempt.error.name !== "Error" || !/outcome is unknown|not responding|Timed out waiting/i.test(attempt.error.message) || attempt.error.notDelivered === true);
+    attempt.error?.source === "FabricControlPlane.request" &&
+    // These are the public file-control route/lease/incarnation refusals, not any
+    // named JS exception. In particular TypeError and generic ACK timeouts fail.
+    ({ FabricBridgeStaleError: "FABRIC_BRIDGE_STALE", FabricPeerLeaseStaleError: "FABRIC_PEER_LEASE_STALE",
+      FabricParticipantStaleError: "FABRIC_PARTICIPANT_STALE", FabricControlStaleIncarnationError: "FABRIC_CONTROL_STALE_INCARNATION",
+      FabricControlIncarnationRequiredError: "FABRIC_CONTROL_INCARNATION_REQUIRED",
+      FabricRelayDestinationUnavailableError: "FABRIC_RELAY_DESTINATION_UNAVAILABLE" })[attempt.error.name] === attempt.error.code &&
+    typeof attempt.error.code === "string" && typeof attempt.error.message === "string" &&
+    (attempt.error.targetId === undefined ? attempt.error.message.includes(seeded.id) : attempt.error.targetId === seeded.id) &&
+    !/RPC deadline|harness/i.test(attempt.error.message);
   check("historied-live-root-public-followup-outcome", baseline || Boolean(publicAttempt && (delivered || refusal)),
     baseline ? { skipped: "baseline-control" } : { outcome: delivered ? "delivered" : refusal ? "named-public-error" : "FAIL", attempt, live, destination });
   // Older pure-evaluator fixtures omit cleanup; explicit native cleanup evidence can
@@ -599,6 +607,767 @@ function protectReleaseInputs(argv, destination) {
   }
 }
 
+function parseAuthorityArgs(argv) {
+  const options = { authoritySnapshot: true, passes: 3, timeoutMs: 30_000 };
+  const names = { "--hub-writer": "hubWriter", "--hub-writer-sha": "hubWriterSha", "--work-writer": "workWriter",
+    "--work-writer-sha": "workWriterSha", "--candidate-work": "candidateWork", "--candidate-work-sha": "candidateWorkSha",
+    "--candidate-work-writer": "candidateWorkWriter", "--candidate-work-writer-sha": "candidateWorkWriterSha",
+    "--capture-manifest": "captureManifest", "--capture-manifest-sha256": "captureManifestSha256",
+    "--hub": "hub", "--work": "work", "--candidate": "candidate", "--hub-sha": "hubSha",
+    "--work-sha": "workSha", "--candidate-sha": "candidateSha", "--hub-snapshot": "hubSnapshot",
+    "--work-snapshot": "workSnapshot", "--receipt": "receipt", "--evidence-dir": "evidenceDir", "--passes": "passes", "--timeout-ms": "timeoutMs" };
+  const seen = new Set();
+  for (let i = 0; i < argv.length; i++) {
+    const flag = argv[i];
+    if (seen.has(flag)) throw new Error(`duplicate ${flag}`);
+    seen.add(flag);
+    if (flag === "--authority-snapshot") continue;
+    if (["--live-writers", "--candidate-both-sides", "--synthetic"].includes(flag)) {
+      options[{ "--live-writers": "liveWriters", "--candidate-both-sides": "candidateBothSides", "--synthetic": "synthetic" }[flag]] = true;
+      continue;
+    }
+    const key = names[flag], value = argv[++i];
+    if (!key || !value || value.startsWith("--")) throw new Error("invalid authority CLI argument");
+    options[key] = ["passes", "timeoutMs"].includes(key) ? Number(value) : value;
+  }
+  if (!["hub", "work", "hubSha", "workSha", "hubSnapshot", "workSnapshot"].every(key => options[key]))
+    throw new Error("authority mode requires --hub --hub-sha --work --work-sha --hub-snapshot --work-snapshot");
+  return options;
+}
+
+function authorityRelease(dir, sha) {
+  if (!SHA.test(sha ?? "")) throw new Error("authority release requires full explicitly pinned SHA");
+  dir = fs.realpathSync(dir);
+  const pkg = JSON.parse(fs.readFileSync(path.join(dir, "package.json"), "utf8"));
+  if (pkg.name !== "pi-fabric") throw new Error("authority release is not pi-fabric");
+  const bridge = path.join(dir, "dist/mesh-bridge.js"), bin = path.join(dir, "bin/mesh-bridge");
+  if (!fs.existsSync(bin) || !fs.statSync(path.join(dir, "dist/chunks")).isDirectory()) throw new Error("missing compiled authority release");
+  let identitySource;
+  for (const name of ["dist/build-identity.json", "build-identity.json", ".build-identity.json"]) {
+    const file = path.join(dir, name);
+    if (!fs.existsSync(file)) continue;
+    const identity = JSON.parse(fs.readFileSync(file, "utf8"));
+    if ((identity.sha ?? identity.commit ?? identity.gitSha ?? identity.releaseSha) !== sha) throw new Error("authority release identity mismatch");
+    identitySource ??= name;
+  }
+  if (!identitySource) {
+    try {
+      const top = fs.realpathSync(execFileSync("git", ["-C", dir, "rev-parse", "--show-toplevel"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 5_000 }).trim());
+      if (top === dir) {
+        const head = execFileSync("git", ["-C", dir, "rev-parse", "HEAD"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 5_000 }).trim();
+        if (head !== sha) throw new Error("authority release identity mismatch");
+        identitySource = "git:HEAD";
+      }
+    } catch (error) { if (error.message === "authority release identity mismatch") throw error; }
+  }
+  if (!identitySource && SHA.test(path.basename(dir))) {
+    if (path.basename(dir) !== sha) throw new Error("authority release identity mismatch");
+    identitySource = "canonical-full-sha-artifact-directory";
+  }
+  if (!identitySource) throw new Error("authority release has no verifiable build identity");
+  return { dir, sha, identitySource, bridgeSha256: hash(fs.readFileSync(bridge)),
+    binSha256: hash(fs.readFileSync(bin)), version: pkg.version };
+}
+
+const PRIMARY_HUB_SHA = "9c644fd2ab93f3fed3c0ee51e28e96f70a2a7bf5";
+const PRIMARY_WORK_SHA = "0fc8ca5d706dfb85519719ebfcc12fadfd63696c";
+const C42_SHA = "c42f7f34125abe2ebbe660758253c9ec4d7765dd";
+const PRODUCER_SCOPE = "producer-boundary compatibility; principal session bootstrap and auth policy are not exercised";
+const jsonBytes = input => typeof input === "string" ? fs.readFileSync(input) : Buffer.from(JSON.stringify(input));
+const PARTIAL_LABEL = "partial diagnostic: participant/lease coverage missing; mixed-era (hub 16:30 live, work 12:40 snapshot)";
+
+/** Input-derived, bounded context; never copy arbitrary manifest metadata into evidence. */
+export function classifyAuthorityCoverage(snapshots) {
+  const missingAuthority = [];
+  for (const site of ["hub", "work"]) {
+    const stateHosts = Array.isArray(snapshots[site]?.stateEntries)
+      ? snapshots[site].stateEntries.filter(row => typeof row?.key === "string" && row.key.startsWith("topology/hosts/"))
+      : [];
+    const participantFiles = snapshots[site]?.participantFiles;
+    const leaseFiles = snapshots[site]?.leaseFiles;
+    const hasMatchingLiveLease = stateHosts.some(row => Array.isArray(leaseFiles) && leaseFiles.some(lease =>
+      lease && row.value && lease.id === row.value.id && lease.rootId === row.value.rootId && lease.identityId === row.value.identity?.id &&
+      Math.max(lease.expiresAt, Number.isFinite(lease.reloadUntil) ? lease.reloadUntil : Number.NEGATIVE_INFINITY) > snapshots[site].collectedAt));
+    if (stateHosts.length > 0 && !hasMatchingLiveLease) {
+      if (!Array.isArray(participantFiles) || participantFiles.length === 0) missingAuthority.push(`${site}.participantFiles`);
+      missingAuthority.push(`${site}.leaseFiles`);
+    }
+  }
+  return missingAuthority.length ? { partialDiagnostic: true, label: PARTIAL_LABEL, incidentFaithful: false,
+    acceptanceEligible: false, missingAuthority, material: "mixed-era" } : undefined;
+}
+
+/** A diagnostic can never become acceptance merely because its arms appear RED/PASS. */
+export function evaluateAuthorityAcceptance(result, synthetic = false) {
+  return !synthetic && !result.diagnosticContext?.partialDiagnostic && result.arms.length === 2 &&
+    result.arms[0].outcome === "RED" && result.arms[1].outcome === "PASS";
+}
+
+function readAuthorityInputs(options, result) {
+  const snapshots = {};
+  for (const site of ["hub", "work"]) {
+    snapshots[site] = JSON.parse(jsonBytes(options[`${site}Snapshot`]));
+    result.diagnosticContext = classifyAuthorityCoverage(snapshots);
+  }
+  for (const site of ["hub", "work"]) validateAuthoritySnapshot(snapshots[site], site);
+  const referenceCollectedAt = Math.max(snapshots.hub.collectedAt, snapshots.work.collectedAt);
+  result.captureAge = Object.fromEntries(["hub", "work"].map(site => {
+    const snapshot = snapshots[site], expiries = snapshot.stateEntries.filter(row => row.key.startsWith("topology/hosts/")).map(row => row.value.expiresAt);
+    return [site, { name: snapshot.name, collectedAt: snapshot.collectedAt, referenceCollectedAt,
+      collectionAgeMs: referenceCollectedAt - snapshot.collectedAt, stateHostCount: expiries.length,
+      hostsExpiredAtReference: expiries.filter(at => at <= referenceCollectedAt).length,
+      youngestHostExpiryAgeMs: expiries.length ? referenceCollectedAt - Math.max(...expiries) : null,
+      oldestHostExpiryAgeMs: expiries.length ? referenceCollectedAt - Math.min(...expiries) : null }];
+  }));
+  return snapshots;
+}
+
+/** Pin the original sanitized BYTES and external collector receipts, not reserialized objects.
+ * The pinned operator manifest is the trust input, not an assertion of collector authenticity. */
+export function validateCaptureProvenance(options, snapshots) {
+  const bytes = jsonBytes(options.captureManifest);
+  if (!/^[a-f0-9]{64}$/.test(options.captureManifestSha256 ?? "") || hash(bytes) !== options.captureManifestSha256)
+    throw new Error("capture manifest byte hash missing or mismatched");
+  const manifest = JSON.parse(bytes);
+  if (manifest.schemaVersion !== 1 || !manifest.pairId || manifest.kind !== (options.synthetic ? "synthetic-fixture" : "operator-capture-pair"))
+    throw new Error("capture manifest kind/pair identity mismatch");
+  const diagnosticContext = classifyAuthorityCoverage(snapshots);
+  if (manifest.diagnosticContext !== undefined) {
+    const requested = manifest.diagnosticContext;
+    if (!diagnosticContext || !requested || typeof requested !== "object" || Array.isArray(requested) ||
+      Object.keys(requested).length !== Object.keys(diagnosticContext).length ||
+      Object.entries(diagnosticContext).some(([key, value]) => JSON.stringify(requested[key]) !== JSON.stringify(value)))
+      throw new Error("invalid bounded diagnostic context");
+  }
+  const sites = {};
+  for (const site of ["hub", "work"]) {
+    if (!options.synthetic && (typeof options[`${site}Snapshot`] !== "string" || typeof options.captureManifest !== "string"))
+      throw new Error("REAL capture provenance requires original sanitized byte files and pinned operator manifest");
+    const snapshot = snapshots[site], sha256 = hash(jsonBytes(options[`${site}Snapshot`])), row = manifest.sites?.[site];
+    const binding = { site, name: snapshot.name, backend: snapshot.backend, collectedAt: snapshot.collectedAt, captureSha256: sha256 };
+    if (!row || Object.entries(binding).some(([key, value]) => row[key] !== value))
+      throw new Error(`capture manifest ${site} byte/metadata binding mismatch`);
+    let receipt;
+    if (options.synthetic) receipt = row.fixtureReceipt;
+    else {
+      if (typeof row.collectorReceipt?.path !== "string" || !/^[a-f0-9]{64}$/.test(row.collectorReceipt.sha256 ?? ""))
+        throw new Error("missing immutable collector receipt binding");
+      const receiptPath = path.resolve(path.dirname(options.captureManifest), row.collectorReceipt.path);
+      const receiptBytes = fs.readFileSync(receiptPath);
+      if (hash(receiptBytes) !== row.collectorReceipt.sha256) throw new Error("collector receipt byte hash mismatch");
+      receipt = JSON.parse(receiptBytes);
+    }
+    if (!receipt || receipt.pairId !== manifest.pairId || Object.entries(binding).some(([key, value]) => receipt[key] !== value))
+      throw new Error("collector receipt does not bind capture bytes/name/site/backend/time/pair");
+    sites[site] = { ...binding, collectorReceipt: options.synthetic ? "SYNTHETIC fixture receipt" : row.collectorReceipt };
+  }
+  return { manifestSha256: hash(bytes), pairId: manifest.pairId, kind: manifest.kind, sites, diagnosticContext };
+}
+
+/** Fixed across arms; every address-like reservation in BOTH captures is excluded. */
+export function createAuthorityWriterPlan(snapshots) {
+  const reservations = new Set();
+  const scan = value => {
+    if (!value || typeof value !== "object") return;
+    for (const [key, item] of Object.entries(value)) {
+      if (["id", "rootId", "ownerHostId", "ownerIdentityId", "identityId", "name", "sessionId"].includes(key) && typeof item === "string") reservations.add(item);
+      scan(item);
+    }
+  };
+  scan(snapshots);
+  return [["hub", "sandbox-principal"], ["hub", "sandbox-main"], ["work", "sandbox-main"]].map(([site, role], index) => {
+    let rootId, name;
+    do { rootId = `session:${randomUUID()}`; name = `canary-${index}-${randomUUID()}`; } while (reservations.has(rootId) || reservations.has(name));
+    reservations.add(rootId); reservations.add(name);
+    return { site, role, rootId, name };
+  });
+}
+
+// Match the compiled host-leases identity fence. An unrelated lease is not an
+// extension. Conservatively retain BOTH state and matching file/reload deadlines;
+// a mirrored projection or a later checkpoint may not shorten captured authority.
+function matchingExpiryLease(host, leases) {
+  return leases.find(lease => lease.id === host.id && lease.rootId === host.rootId && lease.identityId === host.identity?.id &&
+    (host.incarnationToken !== undefined ? lease.incarnationToken === host.incarnationToken :
+      lease.startedAt === undefined || host.startedAt === undefined || lease.startedAt === host.startedAt)) ?? null;
+}
+function expiryDeadline(host, lease) {
+  const values = [host?.expiresAt, ...(host?.reloadUntil === undefined ? [] : [host.reloadUntil]),
+    ...(lease === null ? [] : [lease?.expiresAt, ...(lease?.reloadUntil === undefined ? [] : [lease.reloadUntil])])];
+  return values.every(Number.isFinite) ? Math.max(...values) : NaN;
+}
+function provenCapturedExpiry(row) {
+  const proof = row.expiryProof, original = proof?.original, before = row.authorityBefore ?? row.before;
+  const captured = original?.value, host = before?.value;
+  if (!captured || !host || !Number.isFinite(proof.deltaMs) || original.key !== before.key ||
+      original.key !== `topology/hosts/${hash(captured.id ?? "")}` ||
+      !["id", "rootId", "incarnationToken"].every(key => host[key] === captured[key]) || host.identity?.id !== captured.identity?.id ||
+      host.startedAt !== captured.startedAt + proof.deltaMs ||
+      !Object.hasOwn(proof, "originalLease") || !Object.hasOwn(proof, "beforeLease") ||
+      !Object.hasOwn(proof, "afterLease") || !Object.hasOwn(proof, "afterHost")) return false;
+  if (proof.afterHost !== null && (!proof.afterHost ||
+      !["id", "rootId", "incarnationToken", "startedAt"].every(key => proof.afterHost[key] === host[key]) ||
+      proof.afterHost.identity?.id !== host.identity?.id)) return false;
+  const matches = (lease, value) => lease === null || matchingExpiryLease(value, [lease]) === lease;
+  if (!matches(proof.originalLease, captured) || !matches(proof.beforeLease, host) || !matches(proof.afterLease, host)) return false;
+  const deadline = Math.max(expiryDeadline(captured, proof.originalLease) + proof.deltaMs,
+    expiryDeadline(host, proof.beforeLease), expiryDeadline(proof.afterHost ?? host, proof.afterLease));
+  const at = row.kind === "compiled-compaction" ? row.beganAt : row.after?.observedAt;
+  return Number.isFinite(deadline) && Number.isFinite(at) && deadline < at && row.expiresAt === deadline;
+}
+
+/** Pure fail-closed coverage check. A clock-only observation never establishes expiry. */
+export function evaluateAuthorityWriterCoverage({ producers = [], plan = [], expiry = [], passes = [], inFlightAtMeasurementEnd = [], requestedPasses = 3 } = {}) {
+  const renewals = plan.length > 0 && producers.length === plan.length && plan.every(expected => {
+    const producer = producers.find(row => row.rootId === expected.rootId && row.site === expected.site);
+    const leases = producer?.observations ?? [];
+    const initial = leases[0]?.readback;
+    return producer?.identityVerified === true && leases.length >= 3 && leases.every(row => row.readback?.host?.remoteHost === undefined &&
+      row.readback?.host?.id === expected.rootId && row.readback?.lease?.incarnationToken === initial.lease.incarnationToken &&
+      row.readback?.row?.ownerIncarnation === initial.row.ownerIncarnation && row.readback?.lease?.writer?.pid === producer.pid &&
+      row.process?.nativeBirth === producer.process?.nativeBirth) &&
+      leases[1].readback.lease.updatedAt > initial.lease.updatedAt && leases[2].readback.lease.updatedAt > leases[1].readback.lease.updatedAt &&
+      leases.every(row => row.readback.lease.expiresAt > row.at);
+  });
+  const naturalExpiry = expiry.some(row => row.captured === true && row.compiled === true && provenCapturedExpiry(row) &&
+    ((row.kind === "compiled-compaction" && row.applied === true && row.before && row.after === null &&
+      row.expiryProof.afterHost === null && row.operation?.kind === "delete" && row.operation.key === row.before.key &&
+      row.operation.ifVersion === row.before.version && row.at >= row.beganAt) ||
+     (row.kind === "compiled-presence-expiry" && row.before?.present === true && row.after?.present === false &&
+      row.before.observedAt < row.expiresAt && row.preservedExpiry === true)));
+  const window = passes.slice(-requestedPasses), first = window[0]?.pass, last = window.at(-1)?.pass;
+  const continuity = Number.isSafeInteger(requestedPasses) && requestedPasses >= 3 && window.length === requestedPasses &&
+    window.every((pass, index) => Number.isSafeInteger(pass.pass) && pass.pass > 0 && (!index || pass.pass === window[index - 1].pass + 1) &&
+      pass.remoteMirror === "fulfilled" && pass.wireComplete !== false && pass.inboundHosts > 0 && pass.outboundHosts > 0 && pass.allWriterOrigins && pass.bothMirrors) &&
+    passes.filter(pass => pass.pass >= first && pass.pass <= last).length === requestedPasses &&
+    !inFlightAtMeasurementEnd.some(pass => pass >= first && pass <= last);
+  return { renewals, naturalExpiry, continuity, requestedPasses, observedPasses: passes.length,
+    expiryCoverage: naturalExpiry ? "OBSERVED" : "INCOMPLETE/BLOCKED", eventReplay: false };
+}
+
+// Owned children use the same worker/RPC helper and compiled CLI as the original gate.
+// Per-arm deadlines include setup; SIGTERM/SIGINT abort setup too. Each spawn enters
+// ownership before any later await, including importer, producers and compiled readers.
+async function runLiveAuthorityArm(options, arm, snapshots, plan, armRoot, signal) {
+  const owned = [], workers = [], readers = {}, producers = [];
+  const meshes = { hub: path.join(armRoot, "hub"), work: path.join(armRoot, "work") };
+  const save = (name, value) => fs.writeFileSync(path.join(armRoot, name), JSON.stringify(sanitizeAuthorityEvidence(value)) + "\n", { mode: 0o600 });
+  let rpcId = 0, hubProcess, observedBridgeClose = false, measuredWire = [];
+  const active = () => { if (signal.aborted) throw signal.reason; };
+  const members = pgid => fs.readdirSync("/proc").filter(name => /^\d+$/.test(name)).flatMap(name => {
+    try { const value = nativeProcessEvidence(Number(name));
+      const stat = fs.readFileSync(`/proc/${name}/stat`, "utf8");
+      return value.pgid === pgid && !["Z", "X"].includes(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[0]) ? [value] : [];
+    } catch (error) { if (["ENOENT", "ESRCH"].includes(error.code)) return []; throw error; }
+  });
+  const kill = (entry, sig) => { if (!entry.child.pid) return; try { process.kill(-entry.child.pid, sig); } catch (error) { if (error.code !== "ESRCH") throw error; } };
+  const own = (name, args, release, backend, role) => {
+    active();
+    const env = { ...process.env, PI_FABRIC_RELEASE_SHA: release.sha, PI_FABRIC_BUILD_SHA: release.sha,
+      PI_FABRIC_MESH_STATE_BACKEND: backend, XDG_RUNTIME_DIR: armRoot, PI_MIXED_CANARY_DEADLINE_AT: String(options.deadlineAt) };
+    // Never inherit a real actor/parent/project identity into the bounded producer.
+    for (const key of Object.keys(env)) if (/^PI_FABRIC_(?:ACTOR|PARENT|MAIN_AGENT|OWNER|PROJECT|ROLE|SESSION)/.test(key)) delete env[key];
+    const child = spawn(process.execPath, args, { detached: true, stdio: ["pipe", "pipe", "pipe"], env });
+    const entry = { child, name, role, release, pending: new Map(), stdout: "", stderr: "", closing: false, native: null };
+    owned.push(entry);
+    if (child.pid) { try { entry.native = nativeProcessEvidence(child.pid); } catch (error) { entry.birthError = error.message; } }
+    child.stdin.on("error", () => undefined);
+    child.stdout.on("data", chunk => { entry.stdout += chunk; if (entry.stdout.length > 4_000_000) { entry.ioError = "stdout budget"; kill(entry, "SIGKILL"); } });
+    child.stderr.on("data", chunk => { entry.stderr += chunk; if (entry.stderr.length > 2_000_000) { entry.ioError = "stderr budget"; kill(entry, "SIGKILL"); } });
+    entry.closed = new Promise(resolve => {
+      child.once("error", error => { entry.spawnError = error.message; });
+      child.once("close", (code, childSignal) => {
+        entry.exit = { code, signal: childSignal }; entry.closedAt = Date.now(); entry.unexpectedExit = !entry.closing;
+        for (const pending of entry.pending.values()) pending.reject(new Error(`${name} closed`));
+        resolve(entry.exit);
+      });
+    });
+    return entry;
+  };
+  const rpc = (entry, op, args = {}, cleanup = false) => new Promise((resolve, reject) => {
+    if (!cleanup) { try { active(); } catch (error) { reject(error); return; } }
+    const id = ++rpcId;
+    const finish = (error, result) => { clearTimeout(timer); signal.removeEventListener("abort", abort); entry.pending.delete(id); error ? reject(error) : resolve(result); };
+    const abort = () => finish(signal.reason);
+    const timer = setTimeout(() => finish(new Error(`${entry.name} ${op} RPC deadline`)), cleanup ? 2_000 : 15_000);
+    if (!cleanup) signal.addEventListener("abort", abort, { once: true });
+    entry.pending.set(id, { resolve: value => finish(null, value), reject: error => finish(error) });
+    entry.child.stdin.write(JSON.stringify({ id, op, ...args }) + "\n", error => { if (error) finish(error); });
+  });
+  const jsonWorker = entry => {
+    let buffer = "";
+    entry.child.stdout.on("data", chunk => {
+      buffer += chunk;
+      for (;;) {
+        const index = buffer.indexOf("\n"); if (index < 0) break;
+        const line = buffer.slice(0, index); buffer = buffer.slice(index + 1);
+        try { const response = JSON.parse(line), pending = entry.pending.get(response.id);
+          if (pending) response.ok ? pending.resolve(response.result) : pending.reject(new Error(response.error));
+        } catch (error) { for (const pending of entry.pending.values()) pending.reject(error); }
+      }
+    });
+    return entry;
+  };
+  const terminate = async entry => {
+    entry.closing = true;
+    kill(entry, "SIGTERM");
+    const force = setTimeout(() => kill(entry, "SIGKILL"), 2_000);
+    try { await entry.closed; } finally { clearTimeout(force); kill(entry, "SIGKILL"); }
+    // A leader's close is not group teardown. Bounded verification is the safety net
+    // after OS child-close events; zombies cannot heartbeat or hold product custody.
+    const end = Date.now() + 1_000;
+    while (entry.child.pid && members(entry.child.pid).length && Date.now() < end) await new Promise(resolve => setTimeout(resolve, 25));
+    entry.groupEmpty = !entry.child.pid || members(entry.child.pid).length === 0;
+  };
+  const trace = path.join(armRoot, "wire.jsonl");
+  const records = () => fs.readFileSync(trace, "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line));
+  try {
+    const replayAt = Date.now(), referenceCollectedAt = Math.max(snapshots.hub.collectedAt, snapshots.work.collectedAt), deltaMs = replayAt - referenceCollectedAt;
+    arm.clock = { referenceCollectedAt, replayAt, deltaMs, policy: "one global translation; no captured renewal or resurrection" };
+    arm.seed = {};
+    for (const site of ["hub", "work"]) {
+      const importer = jsonWorker(own(`importer-${site}`, [WORKER], arm[site], snapshots[site].backend, "harness-seed-importer"));
+      workers.push(importer);
+      arm.seed[site] = await rpc(importer, "seed", { snapshot: snapshots[site], mesh: meshes[site], release: arm[site].dir,
+        replayAt: snapshots[site].collectedAt + deltaMs });
+      importer.closing = true; await rpc(importer, "stop"); await terminate(importer);
+    }
+    arm.seedVerifiedAt = Date.now();
+    // Start native owners immediately after exact seed validation. No expiry pre-wait.
+    for (const writer of plan) {
+      const release = arm.writers[writer.site], producerTrace = path.join(armRoot, `${writer.name}.jsonl`);
+      const process = jsonWorker(own(writer.name, [WORKER], release, snapshots[writer.site].backend, "product-native-producer"));
+      workers.push(process);
+      const registration = await rpc(process, "start", { producer: true, backend: snapshots[writer.site].backend, release: release.dir,
+        mesh: meshes[writer.site], rootId: writer.rootId, name: writer.name, role: writer.role, evidencePath: producerTrace });
+      const writerMetadata = registration.readback?.lease?.writer;
+      const censusDir = path.join(meshes[writer.site], ".writer-census");
+      const census = fs.existsSync(censusDir) ? fs.readdirSync(censusDir).filter(file => file.endsWith(".json")).map(file => {
+        try { return JSON.parse(fs.readFileSync(path.join(censusDir, file), "utf8")); } catch { return null; }
+      }) : [];
+      const found = census.find(row => row?.pid === process.child.pid && row.host === writerMetadata?.host && row.startedAt === writerMetadata?.startedAt);
+      const identityVerified = registration.process?.pid === process.child.pid && registration.process.nativeBirth === process.native.nativeBirth &&
+        registration.releaseSha === release.sha && registration.buildSha === release.sha && writerMetadata?.releaseSha === release.sha &&
+        writerMetadata.pid === process.child.pid && registration.stateBackend === snapshots[writer.site].backend && registration.lockProtocol === 3 &&
+        writerMetadata.stateBackend === snapshots[writer.site].backend && writerMetadata.lockProtocol === 3 && Boolean(found) &&
+        registration.readback.row?.role === writer.role;
+      producers.push({ ...writer, pid: process.child.pid, process: process.native, release, identityVerified, census: found,
+        registration, trace: producerTrace, observations: [] });
+      if (!identityVerified) throw new Error(`native producer identity/backend/census/role proof incomplete: ${writer.name}`);
+    }
+    arm.producers = producers;
+    fs.writeFileSync(trace, "", { mode: 0o600, flag: "wx" });
+    const config = path.join(armRoot, "proxy.json");
+    save("proxy.json", { hubRelease: arm.hub.dir, hubSha: arm.hub.sha, workRelease: arm.work.dir, workSha: arm.work.sha,
+      hubMesh: meshes.hub, workMesh: meshes.work, hubName: snapshots.hub.name, workName: snapshots.work.name, trace });
+    const cursor = path.join(armRoot, "cursor.json"), cursors = snapshots.hub.cursors.filter(row => row.local === snapshots.hub.name && row.remote === snapshots.work.name);
+    if (cursors.length > 1) throw new Error("ambiguous captured bridge cursor");
+    if (cursors[0]) save("cursor.json", cursors[0]);
+    const args = [path.join(arm.hub.dir, "bin/mesh-bridge"), "run", "--mesh", meshes.hub, "--name", snapshots.hub.name,
+      "--remote", snapshots.work.name, "--cursor", cursor, "--lock-protocol", "3", "--call-timeout-ms", "5000", "--log-level", "debug",
+      "--", process.execPath, WORKER, "authority-proxy", config];
+    arm.command = [process.execPath, ...args];
+    hubProcess = own("hub-run", args, arm.hub, "sqlite", "product-hub-bridge");
+    // Readers are harness-only actual compiled agents, independent of a fatal measured
+    // link. They may observe natural expiry AFTER RED, without a continuity claim.
+    for (const site of ["hub", "work"]) readers[site] = jsonWorker(own(`reader-${site}`,
+      [path.join(arm[site].dir, "bin/mesh-bridge"), "agent", "--mesh", meshes[site], "--peer", snapshots[site].peer, "--lock-protocol", "3"],
+      arm[site], snapshots[site].backend, "harness-compiled-presence-reader"));
+    const capturedPresence = { hub: [], work: [] };
+    const observe = async () => {
+      for (const site of ["hub", "work"]) {
+        const presence = await rpc(readers[site], "presence");
+        const producer = workers.find(row => row.name === plan.find(writer => writer.site === site).name);
+        const observation = await rpc(producer, "observe", { ids: [] });
+        capturedPresence[site].push({ at: Date.now(), presence: sanitizeAuthorityEvidence(presence), authority: observation.authority });
+      }
+    };
+    await observe();
+    // Trace appends and owned lease-renewal files drive progress. A 1000ms safety
+    // net covers coalesced fs events and natural wall expiry (which emits no event).
+    await new Promise((resolve, reject) => {
+      let busy = false, again = false, finished = false;
+      const watchers = [];
+      const finish = error => { if (finished) return; finished = true; clearInterval(safety); signal.removeEventListener("abort", abort);
+        watchers.forEach(watcher => watcher.close()); error ? reject(error) : resolve(); };
+      const abort = () => finish(signal.reason);
+      const check = async () => {
+        if (busy) { again = true; return; } if (finished) return; busy = true;
+        try {
+          await observe();
+          const wire = records();
+          const expiry = collectNaturalExpiry(snapshots, deltaMs, capturedPresence, producers, readers, arm);
+          for (const producer of producers) producer.observations = readProducerTrace(producer.trace).filter(row => row.type === "native-lease-observation");
+          const renewed = producers.every(row => row.observations.length >= 3);
+          if (expiry.length && renewed && (hubProcess.closedAt || wire.filter(row => row.type === "response" && row.frame.ok).length >= (options.passes ?? 3) + 1)) finish();
+        } catch (error) { finish(error); }
+        finally { busy = false; if (again && !finished) { again = false; void check(); } }
+      };
+      const safety = setInterval(() => void check(), 1_000);
+      signal.addEventListener("abort", abort, { once: true });
+      for (const file of [trace, ...producers.map(row => row.trace)]) watchers.push(fs.watch(file, () => void check()));
+      void hubProcess.closed.then(() => { observedBridgeClose = true; void check(); });
+      void check();
+    }).catch(error => { if (!signal.aborted) throw error; arm.deadlineReached = true; });
+    arm.capturedPresence = capturedPresence;
+    arm.expiry = collectNaturalExpiry(snapshots, deltaMs, capturedPresence, producers, readers, arm);
+    arm.expiryObservationScope = hubProcess.closedAt ? "includes post-fatal compiled reader; NOT link continuity" : "live measured link";
+  } catch (error) { arm.blocker = error.message; }
+  finally {
+    // Freeze the measured window BEFORE withdrawing any producer. Shutdown wakeups
+    // remain in the raw trace, but are not fabricated empty measured passes.
+    arm.measurementEndedAt = Date.now();
+    arm.measuredBridgeExited = Boolean(hubProcess?.closedAt);
+    measuredWire = fs.existsSync(trace) ? records() : [];
+    // Keep native fatal/refusal evidence even if expiry or later setup/cleanup blocks acceptance.
+    arm.nativeProcessInventory = owned.flatMap(row => row.child.pid ? members(row.child.pid).map(process => ({ owner: row.name, role: row.role, ...process })) : []);
+    arm.producers = producers;
+    if (hubProcess) { arm.nativeExit = hubProcess.exit ?? null; arm.stderrSha256 = hash(hubProcess.stderr); }
+    for (const producer of producers) producer.observations = readProducerTrace(producer.trace).filter(row => row.type === "native-lease-observation");
+    for (const row of workers) row.closing = true;
+    const stopped = await Promise.allSettled(workers.filter(row => !row.closedAt).map(row => rpc(row, "stop", {}, true)));
+    const terminated = await Promise.allSettled(owned.map(terminate));
+    arm.cleanup = { ok: stopped.every(row => row.status === "fulfilled") && terminated.every(row => row.status === "fulfilled") &&
+      owned.every(row => row.groupEmpty && !row.spawnError && !row.ioError && (row.role === "product-hub-bridge" || !row.unexpectedExit)),
+      owned: owned.map(row => ({ name: row.name, role: row.role, ...row.native, exit: row.exit, groupEmpty: row.groupEmpty,
+        spawnError: row.spawnError, ioError: row.ioError, unexpectedExit: row.unexpectedExit })),
+      failures: [...stopped, ...terminated].filter(row => row.status === "rejected").map(row => String(row.reason)) };
+    if (owned.some(row => row.stderr.includes("authority evidence rejected") || row.stdout.includes('"error":"authority evidence rejected"')))
+      arm.blocker = "authority evidence rejected";
+    for (const row of owned) { save(`${row.name}.stdout.json`, { output: row.role !== "product-hub-bridge" ? row.stdout.split("\n").filter(Boolean).map(line => {
+      try { return JSON.parse(line); } catch { return { malformedOutputSha256: hash(line) }; }
+    }) : { sha256: hash(row.stdout) } });
+      // Opaque native diagnostics may echo authority; retain byte identity, not
+      // unchecked text. Structured refusal attribution below retains the known error.
+      save(`${row.name}.stderr.log`, { sha256: hash(row.stderr) }); }
+  }
+  const wire = measuredWire;
+  arm.trace = trace; arm.wireSha256 = fs.existsSync(trace) ? hash(fs.readFileSync(trace)) : null;
+  const transport = wire.find(row => row.type === "transport");
+  arm.agent = wire.find(row => row.type === "agent-identity") ?? null;
+  arm.transport = transport ?? null;
+  const localFailure = hubProcess?.stderr.match(/stopped: (Bridge presence for [^\n]+ has an older incarnation than persisted authority)/)?.[1];
+  const begun = wire.filter(row => row.type === "pass-start").map(row => row.pass);
+  const numbers = begun.filter(pass => wire.some(row => row.type === "response" && row.pass === pass));
+  arm.inFlightAtMeasurementEnd = begun.filter(pass => !numbers.includes(pass));
+  arm.passes = numbers.map(pass => {
+    const inbound = wire.find(row => row.type === "presence" && row.pass === pass), outbound = wire.find(row => row.type === "request" && row.pass === pass), response = wire.find(row => row.type === "response" && row.pass === pass);
+    const localError = pass === numbers.at(-1) && localFailure && response?.frame.ok ? { source: "hub-cli-stderr", error: localFailure } : null;
+    const has = (presence, ids) => ids.every(id => presence?.hosts.some(row => row.record.id === id) && presence?.participants.some(row => row.id === id));
+    const hubIds = plan.filter(row => row.site === "hub").map(row => row.rootId), workIds = plan.filter(row => row.site === "work").map(row => row.rootId);
+    const mirrorHas = (authority, origin, remote) => producers.filter(row => row.site === origin).every(producer => {
+      const id = producer.rootId, expected = producer.registration.readback;
+      const host = authority?.stateEntries.find(row => row.key.startsWith("topology/hosts/") && row.value.id === id)?.value;
+      const participant = authority?.stateEntries.find(row => row.key.startsWith("topology/participants/") && row.value.id === id)?.value;
+      const lease = authority?.leaseFiles.find(row => row.id === id);
+      return host?.remoteHost === remote && host.rootId === id && host.identity.id === id &&
+        host.incarnationToken === expected.host.incarnationToken && lease?.incarnationToken === expected.lease.incarnationToken &&
+        participant?.ownerIncarnation === expected.row.ownerIncarnation && participant.ownerHostId === id;
+    });
+    return { pass, wireComplete: ["pass-start", "presence", "request", "response"].every(type => wire.filter(row => row.type === type && row.pass === pass).length === 1),
+      inboundHosts: inbound?.presence.hosts.length ?? 0, outboundHosts: outbound?.presence.hosts.length ?? 0,
+      allWriterOrigins: has(inbound?.presence, workIds) && has(outbound?.presence, hubIds),
+      bothMirrors: response?.frame.ok === true &&
+        // Mirror readbacks are authority rows, not native-only compiled presence.
+        mirrorHas(response?.authorityAfter?.work ?? outbound?.authority, "hub", snapshots.hub.name) &&
+        mirrorHas(inbound?.authority, "work", snapshots.work.name),
+      remoteMirror: response?.frame.ok === true ? "fulfilled" : response?.frame.ok === false ? "rejected" : "missing",
+      directions: [{ direction: "work-to-hub", rawError: localError, refusal: localError ? matchAuthorityRefusal(localError, inbound.predicates) : null },
+        { direction: "hub-to-work", rawError: response?.frame.ok === false ? response.frame : null, refusal: response?.refusal ?? null }] };
+  });
+  arm.coverage = evaluateAuthorityWriterCoverage({ producers, plan, expiry: arm.expiry, passes: arm.passes,
+    inFlightAtMeasurementEnd: arm.inFlightAtMeasurementEnd, requestedPasses: options.passes ?? 3 });
+  const refusals = arm.passes.flatMap(pass => pass.directions.filter(row => row.rawError));
+  arm.observedRefusal = refusals.length && refusals.every(row => row.refusal?.rootMatchesFirst) && arm.nativeExit?.code === 1 ? "MATCHED_NATIVE_RED" : null;
+  const identities = producers.length === plan.length && producers.every(row => row.identityVerified) && transport?.workSha === arm.work.sha &&
+    arm.agent?.census.some(row => row.pid === transport.childPid && row.releaseSha === arm.work.sha && row.stateBackend === "file" && row.lockProtocol === 3) &&
+    arm.agent?.bridgeSha256 === arm.work.bridgeSha256 && arm.agent?.process.nativeBirth === transport.childNative.nativeBirth;
+  arm.outcome = "BLOCKED";
+  if (!arm.blocker && identities && arm.cleanup.ok && arm.coverage.renewals && arm.coverage.naturalExpiry) {
+    if (arm.observedRefusal) arm.outcome = "RED";
+    else if (!refusals.length && arm.coverage.continuity && !arm.measuredBridgeExited) arm.outcome = arm.name === "candidate-both-sides" ? "PASS" : "NON_REPRO";
+    else arm.outcome = "NON_REPRO";
+  }
+  if (arm.outcome === "BLOCKED") arm.blocker ??= !arm.coverage.naturalExpiry ? "natural captured expiry coverage incomplete/BLOCKED" : "identity, renewal, native outcome or cleanup incomplete";
+  arm.rolloutPermission = false;
+  arm.maintenanceCoverage = "observed compiled directory batches and sampled authority window; not an exhaustive filesystem mutation journal";
+}
+function readProducerTrace(file) { return fs.existsSync(file) ? fs.readFileSync(file, "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line)) : []; }
+export function collectNaturalExpiry(snapshots, deltaMs, observed, producers, readers, arm) {
+  const evidence = [];
+  for (const site of ["hub", "work"]) for (const entry of snapshots[site].stateEntries.filter(row => row.key.startsWith("topology/hosts/"))) {
+    const originalLease = matchingExpiryLease(entry.value, snapshots[site].leaseFiles);
+    const proof = (before, after) => ({ original: sanitizeAuthorityEvidence(entry), originalLease: sanitizeAuthorityEvidence(originalLease), deltaMs,
+      beforeLease: matchingExpiryLease(before.value, before.authority.leaseFiles),
+      afterLease: matchingExpiryLease(before.value, after.leaseFiles),
+      afterHost: after.stateEntries.find(candidate => candidate.key === entry.key)?.value ?? null });
+    const deadline = (before, expiryProof) => Math.max(expiryDeadline(entry.value, originalLease) + deltaMs,
+      expiryDeadline(before.value, expiryProof.beforeLease), expiryDeadline(expiryProof.afterHost ?? before.value, expiryProof.afterLease));
+    for (const producer of producers.filter(row => row.site === site)) for (const row of readProducerTrace(producer.trace).filter(row => row.type === "compiled-directory-batch")) {
+      const before = row.before.stateEntries.find(candidate => candidate.key === entry.key);
+      const operation = row.operations.find(op => op.kind === "delete" && op.key === entry.key);
+      if (!before || !operation || operation.ifVersion !== before.version || !(row.at >= row.beganAt) ||
+          !row.results.some(result => result.key === entry.key && result.applied) ||
+          row.after.stateEntries.some(candidate => candidate.key === entry.key)) continue;
+      const expiryProof = proof({ ...before, authority: row.before }, row.after);
+      const candidate = { kind: "compiled-compaction", captured: true, compiled: true, site, rootId: entry.value.rootId,
+        before, after: null, operation, applied: true, expiryProof, expiresAt: deadline(before, expiryProof), beganAt: row.beganAt,
+        process: row.process, artifacts: producer.registration.artifacts, at: row.at };
+      if (provenCapturedExpiry(candidate)) evidence.push(candidate);
+    }
+    if (entry.value.remoteHost !== undefined) continue;
+    for (const before of observed[site]) {
+      const host = before.presence.hosts.find(host => host.record.id === entry.value.id);
+      const authorityBefore = before.authority?.stateEntries.find(candidate => candidate.key === entry.key);
+      if (!host || !authorityBefore) continue;
+      for (const after of observed[site].filter(row => row.at > before.at && row.authority && !row.presence.hosts.some(host => host.record.id === entry.value.id))) {
+        const expiryProof = proof({ ...authorityBefore, authority: before.authority }, after.authority);
+        const expiresAt = deadline(authorityBefore, expiryProof);
+        const candidate = { kind: "compiled-presence-expiry", captured: true, compiled: true, site, rootId: entry.value.rootId,
+          expiresAt, expiryProof, authorityBefore, preservedExpiry: host.expiresAt === expiresAt,
+          before: { present: true, observedAt: before.at, host }, after: { present: false, observedAt: after.at },
+          process: readers[site]?.native, observerRole: "harness-compiled-presence-reader", releaseSha: arm[site].sha,
+          bridgeSha256: arm[site].bridgeSha256 };
+        if (candidate.preservedExpiry && before.at < expiresAt && provenCapturedExpiry(candidate)) { evidence.push(candidate); break; }
+      }
+      if (evidence.some(row => row.site === site && row.rootId === entry.value.rootId)) break;
+    }
+  }
+  return evidence;
+}
+
+export async function runLiveAuthorityCanary(options = {}) {
+  const startedAt = Date.now(), controller = new AbortController();
+  const result = { mode: "authority-snapshot", coverageSlice: "LIVE_NATIVE_WRITERS", scope: PRODUCER_SCOPE,
+    releaseGate: false, rolloutPermission: false, acceptance: false, ok: false, outcome: "BLOCKED",
+    evidenceKind: options.synthetic ? "SYNTHETIC" : "CAPTURED_AUTHORITY", arms: [], startedAt };
+  let scratch, timer;
+  const interrupt = () => controller.abort(new Error("authority canary cancelled"));
+  const externalAbort = () => controller.abort(options.signal.reason ?? new Error("authority canary cancelled"));
+  process.once("SIGINT", interrupt); process.once("SIGTERM", interrupt); options.signal?.addEventListener("abort", externalAbort, { once: true });
+  try {
+    if (process.platform !== "linux" || process.release.name !== "node" || Number(process.versions.node.split(".")[0]) < 24) throw new Error("authority replay requires Linux Node >=24");
+    const timeoutMs = options.timeoutMs ?? 30_000, passes = options.passes ?? 3;
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1_000 || timeoutMs > 60_000 || !Number.isSafeInteger(passes) || passes < 3 || passes > 10) throw new Error("invalid bounded writer canary deadline/passes");
+    timer = setTimeout(() => controller.abort(new Error("absolute writer canary job deadline")), timeoutMs * 2 + 30_000);
+    if (options.signal?.aborted) externalAbort();
+    const snapshots = readAuthorityInputs(options, result);
+    if (snapshots.hub.peer !== snapshots.work.name || snapshots.work.peer !== snapshots.hub.name) throw new Error("snapshot orientation mismatch");
+    result.inputs = validateCaptureProvenance(options, snapshots);
+    if (options.hubSha !== PRIMARY_HUB_SHA || options.workSha !== PRIMARY_WORK_SHA || options.hubWriterSha !== C42_SHA || options.workWriterSha !== C42_SHA)
+      throw new Error("wrong primary four-role mix; required 9c hub/0fc work/c42 hub+c42 work writers");
+    const hub = authorityRelease(options.hub, options.hubSha), work = authorityRelease(options.work, options.workSha);
+    const writers = { hub: authorityRelease(options.hubWriter, options.hubWriterSha), work: authorityRelease(options.workWriter, options.workWriterSha) };
+    const arms = [{ name: "primary-live", hub, work, writers }];
+    if (options.candidate || options.candidateBothSides || options.candidateWork || options.candidateWorkWriter) {
+      if (!options.candidateBothSides || !options.candidate || !options.candidateWork || !options.candidateWorkWriter ||
+        !SHA.test(options.candidateSha ?? "") || options.candidateSha !== options.candidateWorkSha || options.candidateSha !== options.candidateWorkWriterSha ||
+        [PRIMARY_HUB_SHA, PRIMARY_WORK_SHA, C42_SHA].includes(options.candidateSha)) throw new Error("candidate BLOCKED: BOTH RC2 bridge sides and RC2 work writer require the same new full SHA; hub-only candidate is not this mix");
+      arms.push({ name: "candidate-both-sides", hub: authorityRelease(options.candidate, options.candidateSha), work: authorityRelease(options.candidateWork, options.candidateWorkSha),
+        writers: { hub: writers.hub, work: authorityRelease(options.candidateWorkWriter, options.candidateWorkWriterSha) } });
+    }
+    const evidenceDir = fs.realpathSync(options.evidenceDir ?? os.tmpdir());
+    for (const release of arms.flatMap(arm => [arm.hub, arm.work, arm.writers.hub, arm.writers.work]))
+      if (evidenceDir === release.dir || evidenceDir.startsWith(release.dir + path.sep)) throw new Error("evidence must not modify release inputs");
+    scratch = fs.mkdtempSync(path.join(evidenceDir, "live-authority-")); fs.chmodSync(scratch, 0o700); result.evidenceRoot = scratch;
+    result.writerPlan = createAuthorityWriterPlan(snapshots);
+    for (const descriptor of arms) {
+      const arm = { ...descriptor, outcome: "BLOCKED", passes: [] }; result.arms.push(arm);
+      const root = path.join(scratch, descriptor.name); fs.mkdirSync(root, { mode: 0o700 });
+      const armSignal = AbortSignal.any([controller.signal, AbortSignal.timeout(timeoutMs)]);
+      await runLiveAuthorityArm({ ...options, deadlineAt: Date.now() + timeoutMs + 5_000 }, arm, snapshots, result.writerPlan, root, armSignal);
+      if (controller.signal.aborted) break;
+    }
+    result.primaryOutcome = result.arms[0]?.outcome;
+    result.candidateOutcome = result.arms[1]?.outcome ?? "BLOCKED";
+    result.candidateBlocker = result.arms.length < 2 ? "RC2 BOTH bridge sides/work-writer artifact input not supplied" : undefined;
+    result.outcome = result.arms.length < 2 || result.arms.length !== arms.length || result.arms.some(arm => arm.outcome === "BLOCKED") ? "BLOCKED" :
+      result.arms.some(arm => arm.outcome === "RED") ? "RED" : result.arms.at(-1)?.outcome ?? "BLOCKED";
+    result.acceptance = evaluateAuthorityAcceptance(result, options.synthetic);
+    result.ok = result.acceptance;
+  } catch (error) { result.failure = { message: error.message }; }
+  finally { clearTimeout(timer); process.off("SIGINT", interrupt); process.off("SIGTERM", interrupt); options.signal?.removeEventListener("abort", externalAbort); }
+  result.finishedAt = Date.now(); result.elapsedMs = result.finishedAt - startedAt;
+  return finishAuthorityEvidence(result, scratch);
+}
+
+function finishAuthorityEvidence(result, scratch) {
+  if (result.diagnosticContext?.partialDiagnostic) { result.acceptance = false; result.ok = false; }
+  let clean;
+  try { clean = sanitizeAuthorityEvidence(result); }
+  catch {
+    // Rejection is an outcome, never a dropped frame followed by PASS. Teardown
+    // already ran; retain only its boolean summary, not the rejected payload.
+    clean = { mode: "authority-snapshot", scope: PRODUCER_SCOPE, releaseGate: false, rolloutPermission: false,
+      acceptance: false, ok: false, outcome: "BLOCKED", evidenceRejected: true,
+      coverageSlice: result.coverageSlice, evidenceKind: result.evidenceKind,
+      diagnosticContext: result.diagnosticContext,
+      startedAt: result.startedAt, finishedAt: result.finishedAt, elapsedMs: result.elapsedMs,
+      failure: { message: "authority evidence rejected" }, arms: result.arms.map(arm => ({ outcome: "BLOCKED", cleanup: { ok: arm.cleanup?.ok === true } })) };
+  }
+  if (scratch) fs.writeFileSync(path.join(scratch, "receipt.json"), JSON.stringify(clean) + "\n", { mode: 0o600 });
+  return clean;
+}
+
+/** Narrow regression reproduction only. Never grants release rollout permission. */
+export async function runAuthorityCanary(options = {}) {
+  if (options.liveWriters) return runLiveAuthorityCanary(options);
+  const startedAt = Date.now();
+  const result = { mode: "authority-snapshot", releaseGate: false, rolloutPermission: false, ok: false,
+    outcome: "BLOCKED", acceptance: false, coverageSlice: "CAPTURED_ONLY_DIAGNOSTIC",
+    scope: "producer-boundary compatibility; principal session bootstrap and auth policy are not exercised",
+    evidenceKind: options.synthetic ? "SYNTHETIC" : "CAPTURED_AUTHORITY", startedAt, arms: [] };
+  let scratch;
+  try {
+    if (process.platform !== "linux" || process.release.name !== "node" || Number(process.versions.node.split(".")[0]) < 24)
+      throw new Error("authority replay requires Linux Node >=24");
+    const passes = options.passes ?? 3, timeoutMs = options.timeoutMs ?? 30_000;
+    if (!Number.isSafeInteger(passes) || passes < 3 || passes > 10 || !Number.isSafeInteger(timeoutMs) || timeoutMs < 1_000 || timeoutMs > 60_000)
+      throw new Error("authority replay needs 3..10 passes and a 1000..60000ms deadline");
+    const { hub: hubSnapshot, work: workSnapshot } = readAuthorityInputs(options, result);
+    if (hubSnapshot.peer !== workSnapshot.name || workSnapshot.peer !== hubSnapshot.name)
+      throw new Error("snapshot peer/name orientation mismatch");
+    const hub = authorityRelease(options.hub, options.hubSha), work = authorityRelease(options.work, options.workSha);
+    const provenance = validateCaptureProvenance(options, { hub: hubSnapshot, work: workSnapshot });
+    result.captureProvenance = provenance;
+    const releases = [{ name: "primary", hub }];
+    if (options.candidate) releases.push({ name: "candidate-control", hub: authorityRelease(options.candidate, options.candidateSha) });
+    const evidenceDir = fs.realpathSync(options.evidenceDir ?? os.tmpdir());
+    for (const release of [hub, work, ...releases.map(arm => arm.hub)])
+      if (evidenceDir === release.dir || evidenceDir.startsWith(release.dir + path.sep)) throw new Error("authority evidence must not modify release inputs");
+    scratch = fs.mkdtempSync(path.join(evidenceDir, "authority-canary-")); fs.chmodSync(scratch, 0o700);
+    result.evidenceRoot = scratch;
+    result.inputs = { hub: { sha256: hash(JSON.stringify(hubSnapshot)), backend: hubSnapshot.backend, collectedAt: hubSnapshot.collectedAt },
+      work: { sha256: hash(JSON.stringify(workSnapshot)), backend: workSnapshot.backend, collectedAt: workSnapshot.collectedAt } };
+    // Each arm starts from exactly the same complete captures, never from another arm's output.
+    for (const release of releases) {
+      const armRoot = path.join(scratch, release.name); fs.mkdirSync(armRoot, { mode: 0o700 });
+      const arm = { name: release.name, hub: release.hub, work, passes: [], outcome: "BLOCKED", cleanup: { ok: false } };
+      result.arms.push(arm);
+      const replayAt = Date.now(), hubMesh = path.join(armRoot, "hub"), workMesh = path.join(armRoot, "work");
+      const referenceCollectedAt = Math.max(hubSnapshot.collectedAt, workSnapshot.collectedAt), deltaMs = replayAt - referenceCollectedAt;
+      arm.clock = { referenceCollectedAt, replayAt, deltaMs, captureGapMs: Math.abs(hubSnapshot.collectedAt - workSnapshot.collectedAt),
+        policy: "one global translation for both captures; no renewal or resurrection" };
+      arm.seed = { hub: await seedAuthoritySnapshot(hubSnapshot, hubMesh, release.hub.dir, hubSnapshot.collectedAt + deltaMs),
+        work: await seedAuthoritySnapshot(workSnapshot, workMesh, work.dir, workSnapshot.collectedAt + deltaMs) };
+      arm.inventory = Object.fromEntries([["hub", hubSnapshot], ["work", workSnapshot]].map(([site, snapshot]) => [site, {
+        stateHostCount: snapshot.stateEntries.filter(entry => entry.key.startsWith("topology/hosts/")).length,
+        nativeHosts: snapshot.stateEntries.filter(entry => entry.key.startsWith("topology/hosts/") && entry.value.remoteHost === undefined)
+          .map(({ value }) => ({ hostId: value.id, rootId: value.rootId, tokenHash: value.incarnationToken ?? null,
+            stateRemainingMs: value.expiresAt - referenceCollectedAt,
+            leaseRemainingMs: snapshot.leaseFiles.find(lease => lease.id === value.id)?.expiresAt - referenceCollectedAt }))
+      }]));
+      const trace = path.join(armRoot, "wire.jsonl"), config = path.join(armRoot, "proxy.json");
+      fs.writeFileSync(trace, "", { mode: 0o600, flag: "wx" });
+      fs.writeFileSync(config, JSON.stringify({ hubRelease: release.hub.dir, hubSha: release.hub.sha, workRelease: work.dir, workSha: work.sha, hubMesh, workMesh,
+        hubName: hubSnapshot.name, workName: workSnapshot.name, trace }), { mode: 0o600, flag: "wx" });
+      // Cursors retain their relative ordering and exact captured values, but no event log is
+      // transplanted: this arm exercises presence only, not sequence/event delivery claims.
+      const cursorPath = path.join(armRoot, "cursor.json");
+      const cursors = hubSnapshot.cursors.filter(cursor => cursor.local === hubSnapshot.name && cursor.remote === workSnapshot.name);
+      if (cursors.length > 1) throw new Error("ambiguous captured bridge cursor");
+      if (cursors[0]) fs.writeFileSync(cursorPath, JSON.stringify(cursors[0]), { mode: 0o600, flag: "wx" });
+      arm.cursor = { captured: cursors.length, eventReplay: false, path: cursorPath };
+      const args = [path.join(release.hub.dir, "bin/mesh-bridge"), "run", "--mesh", hubMesh, "--name", hubSnapshot.name,
+        "--remote", workSnapshot.name, "--cursor", cursorPath, "--lock-protocol", "3", "--call-timeout-ms", "5000",
+        "--log-level", "debug", "--", process.execPath, WORKER, "authority-proxy", config];
+      arm.command = [process.execPath, ...args];
+      const child = spawn(process.execPath, args, { stdio: ["ignore", "pipe", "pipe"],
+        env: { ...process.env, PI_FABRIC_MESH_STATE_BACKEND: "sqlite", XDG_RUNTIME_DIR: armRoot,
+          PI_FABRIC_RELEASE_SHA: release.hub.sha, PI_FABRIC_BUILD_SHA: release.hub.sha } });
+      let stderr = "", stdout = "", stopRequested = false, spawnError;
+      child.stderr.on("data", chunk => { stderr += chunk; if (stderr.length > 2_000_000) child.kill("SIGTERM"); });
+      child.stdout.on("data", chunk => { stdout += chunk; if (stdout.length > 2_000_000) child.kill("SIGTERM"); });
+      child.once("error", error => { spawnError = error.message; });
+      const records = () => fs.readFileSync(trace, "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line));
+      // Wire append is the event source; the one absolute timer bounds an unresponsive arm.
+      const watcher = fs.watch(trace, () => {
+        try {
+          const completed = records().filter(row => row.type === "response" && row.frame.ok);
+          if (completed.length >= passes && !stopRequested) { stopRequested = true; child.kill("SIGTERM"); }
+        } catch { /* An append may not yet contain a complete frame; close-time parse is strict. */ }
+      });
+      const deadline = setTimeout(() => { stopRequested = true; arm.deadlineReached = true; child.kill("SIGTERM"); }, timeoutMs);
+      const force = setTimeout(() => child.kill("SIGKILL"), timeoutMs + 10_000);
+      const exit = await new Promise(resolve => child.once("close", (code, signal) => resolve({ code, signal })));
+      clearTimeout(deadline); clearTimeout(force); watcher.close();
+      fs.writeFileSync(path.join(armRoot, "hub.stderr.log"), JSON.stringify({ sha256: hash(stderr) }) + "\n", { mode: 0o600 });
+      fs.writeFileSync(path.join(armRoot, "hub.stdout.log"), JSON.stringify({ sha256: hash(stdout) }) + "\n", { mode: 0o600 });
+      if (stderr.includes("authority evidence rejected")) arm.blocker = "authority evidence rejected";
+      arm.exit = exit; arm.spawnError = spawnError;
+      const wire = records();
+      const transport = wire.find(row => row.type === "transport");
+      const alive = pid => {
+        if (!Number.isSafeInteger(pid)) return true;
+        try { const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8"); return !["Z", "X"].includes(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[0]); }
+        catch (error) { if (error.code === "ENOENT") return false; throw error; }
+      };
+      arm.cleanup = { ok: Boolean(transport && !alive(transport.pid) && !alive(transport.childPid)),
+        hubPid: child.pid, transportPid: transport?.pid, agentPid: transport?.childPid,
+        transportExit: wire.find(row => row.type === "transport-exit") ?? null };
+      arm.trace = trace;
+      arm.wireSha256 = hash(fs.readFileSync(trace));
+      const localFailure = stderr.match(/stopped: (Bridge presence for [^\n]+ has an older incarnation than persisted authority)/)?.[1];
+      const passNumbers = [...new Set(wire.filter(row => row.type === "presence").map(row => row.pass))];
+      for (const pass of passNumbers) {
+        const inbound = wire.find(row => row.type === "presence" && row.pass === pass);
+        const outbound = wire.find(row => row.type === "request" && row.pass === pass);
+        const response = wire.find(row => row.type === "response" && row.pass === pass);
+        const localError = pass === passNumbers.at(-1) && localFailure && response?.frame.ok ? { source: "hub-cli-stderr", error: localFailure } : null;
+        const localMatch = localError ? matchAuthorityRefusal(localError, inbound.predicates) : null;
+        arm.passes.push({ pass, inboundHosts: inbound.presence.hosts.length, outboundHosts: outbound?.presence.hosts.length ?? null,
+          directions: [{ direction: "work-to-hub", predicates: inbound.predicates, rawError: localError,
+            refusal: localMatch }, { direction: "hub-to-work", predicates: outbound?.predicates ?? [],
+            rawError: response?.frame.ok === false ? response.frame : null, refusal: response?.refusal ?? null }],
+          remoteMirror: response?.frame.ok === true ? "fulfilled" : response?.frame.ok === false ? "rejected" : "missing" });
+      }
+      const refusals = arm.passes.flatMap(pass => pass.directions.filter(direction => direction.rawError));
+      const matched = refusals.length > 0 && refusals.every(direction => direction.refusal?.rootMatchesFirst);
+      const nonemptyExposure = arm.passes.some(pass => pass.inboundHosts > 0 || pass.outboundHosts > 0);
+      arm.coverage = { requestedPasses: passes, observedPasses: arm.passes.length,
+        continuouslyNonemptyBothWays: arm.passes.length >= passes && arm.passes.every(pass => pass.inboundHosts > 0 && pass.outboundHosts > 0),
+        observedNativePopulationOnly: true, renewals: 0, eventReplay: false };
+      if (!arm.blocker && arm.cleanup.ok && !spawnError && nonemptyExposure && matched && exit.code === 1) arm.outcome = "RED";
+      else if (!arm.blocker && arm.cleanup.ok && !spawnError && nonemptyExposure && (arm.passes.length >= passes || arm.deadlineReached) && !refusals.length && stopRequested && exit.code === 0)
+        arm.outcome = "NON_REPRO";
+      else arm.blocker = "setup, population, pass completion, refusal attribution, native exit, or cleanup evidence incomplete";
+      arm.boundedPassingOutcome = arm.outcome === "NON_REPRO" && arm.coverage.continuouslyNonemptyBothWays;
+      arm.rolloutPermission = false;
+    }
+    result.primaryOutcome = result.arms[0].outcome;
+    result.outcome = result.arms.some(arm => arm.outcome === "BLOCKED") ? "BLOCKED" :
+      result.arms.some(arm => arm.outcome === "RED") ? "RED" : "NON_REPRO";
+    result.diagnosticComplete = result.arms.every(arm => arm.boundedPassingOutcome);
+    result.ok = false; // A zero-writer diagnostic can never satisfy four-role acceptance.
+    result.limitedCoverage = result.arms.some(arm => arm.outcome === "NON_REPRO" && !arm.boundedPassingOutcome);
+  } catch (error) { result.failure = { message: error.message }; }
+  result.finishedAt = Date.now(); result.elapsedMs = result.finishedAt - startedAt;
+  return finishAuthorityEvidence(result, scratch);
+}
+
+async function authorityMain() {
+  let result;
+  try {
+    const argv = process.argv.slice(2), index = argv.indexOf("--receipt");
+    const destination = index >= 0 ? argv[index + 1] : null;
+    if (destination) protectAuthorityInputs(argv, destination);
+    const options = parseArgs(argv);
+    result = await runAuthorityCanary(options);
+    if (destination) fs.writeFileSync(destination, JSON.stringify(result) + "\n", { mode: 0o600, flag: "wx" });
+  } catch (error) { result = { ok: false, mode: "authority-snapshot", releaseGate: false, rolloutPermission: false, outcome: "BLOCKED", failure: { message: error.message } }; }
+  process.stdout.write(JSON.stringify(result) + "\n");
+  process.exitCode = result.ok ? 0 : result.outcome === "RED" ? 1 : 2;
+}
+function protectAuthorityInputs(argv, destination) {
+  const canonical = canonicalDestination(destination);
+  for (let index = 0; index < argv.length; index++) {
+    if (!["--hub", "--work", "--candidate", "--candidate-work", "--hub-writer", "--work-writer", "--candidate-work-writer",
+      "--hub-snapshot", "--work-snapshot", "--capture-manifest"].includes(argv[index])) continue;
+    const input = canonicalDestination(argv[index + 1]);
+    if (canonical === input || canonical.startsWith(input + path.sep)) throw new Error("authority receipt must not modify any replay input");
+  }
+}
+
 async function main() {
   const startedAt = Date.now(), controller = new AbortController();
   let options, scratch, timer, receiptPath;
@@ -641,4 +1410,5 @@ async function main() {
   process.stderr.write(`mixed-release-canary: ${result.ok ? "PASS" : "FAIL"} (${result.mode}; releaseGate=${result.releaseGate}); evidence ${scratch ?? "unavailable"}\n`);
   process.exitCode = result.ok ? 0 : 1;
 }
-if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) await main();
+if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href)
+  await (process.argv.includes("--authority-snapshot") ? authorityMain() : main());

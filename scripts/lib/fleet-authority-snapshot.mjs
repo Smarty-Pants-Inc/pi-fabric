@@ -477,7 +477,10 @@ function captureAuthoritySnapshot(options, attempts) {
 
 export async function collectAuthoritySnapshot(options) {
   try {
-    if (!options || !["hub", "work"].includes(options.site) || !["dev1", "ryzen2"].includes(options.name) || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$/.test(options.peer ?? "") || !Array.isArray(options.cursors ?? []) || (options.cursors ?? []).length > 32) fail("INVALID_OPTIONS");
+    const validCollector = options?.site === "hub"
+      ? ["dev1", "ryzen2"].includes(options.name)
+      : options?.site === "work" && ["dev1", "ryzen2", "intel1"].includes(options.name);
+    if (!options || !validCollector || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$/.test(options.peer ?? "") || !Array.isArray(options.cursors ?? []) || (options.cursors ?? []).length > 32) fail("INVALID_OPTIONS");
     // Retry the entire capture, including a fresh projection context and SQLite
     // transaction. Never combine rows, counts or census findings across attempts.
     for (let attempts = 1; attempts <= MAX_CAPTURE_ATTEMPTS; attempts++) {

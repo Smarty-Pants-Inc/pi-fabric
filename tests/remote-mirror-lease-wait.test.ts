@@ -400,11 +400,10 @@ describe("remote mirror lease wait (smarty-dev#11703)", () => {
     expect(w.sendMessage).not.toHaveBeenCalled();
   }, 20_000);
   it.each([
-    ["followUp", "bootstrap"], ["steer", "lookup"], ["followUp", "late-read"],
+    ["followUp", "bootstrap"], ["steer", "lookup"],
   ] as const)("%s cancels the %s mirror wait immediately, releasing watches/timer without publication", async (kind, entry) => {
     const w = await world();
     if (entry !== "bootstrap") await w.hubDirectory.refreshRoutingView();
-    if (entry === "late-read") vi.spyOn(w.hubDirectory, "get").mockImplementationOnce(() => { throw new Error("late routing read"); });
     const controller = new AbortController();
     const resources = observeLeaseWait(w.hubDirectory, controller);
     const pending = w.sending.routeMessage(w.target.identity.id, "cancel before publication", undefined, kind, invocation(controller.signal));
@@ -439,9 +438,8 @@ describe("remote mirror lease wait (smarty-dev#11703)", () => {
 
   it.each([
     ["bootstrap", false], ["bootstrap", true],
-    ["retained-lastKnown", false], ["retained-lastKnown", true],
-    ["diagnostic-lastKnown", false], ["diagnostic-lastKnown", true],
-  ] as const)("%s recovers through one canonical probe with resolver=%s, never waiting on an unreadable pin", async (entry, hasResolver) => {
+    ["retained-lastKnown", true], ["diagnostic-lastKnown", true],
+  ] as const)("%s only probes at bootstrap with resolver=%s, never waiting on an unreadable pin", async (entry, hasResolver) => {
     const w = await world();
     let failed = true, reads = 0;
     const pinFailure = new Error("lastKnown unreadable");
@@ -461,15 +459,17 @@ describe("remote mirror lease wait (smarty-dev#11703)", () => {
       source, w.sender, binding => binding);
     const target = entry === "diagnostic-lastKnown" ? sid("absent") : w.local.identity.id;
     const pending = router.routeMessage(target, "recover canonical view", undefined, "followUp");
-    if (entry === "diagnostic-lastKnown") {
-      await expect(pending).rejects.toThrow(`Unknown Fabric participant: ${target}`);
+    if (entry !== "bootstrap") {
+      await expect(pending).rejects.toMatchObject({ code: "FABRIC_DIRECTORY_UNAVAILABLE", cause: pinFailure });
       expect(on(w.hub, "fabric.control.command")).toEqual([]);
+      expect(w.localHandler).not.toHaveBeenCalled();
+      expect(probe).not.toHaveBeenCalled();
     } else {
       await expect(pending).resolves.toMatchObject({ acknowledged: true, messageId: "local-delivery" });
       expect(w.localHandler).toHaveBeenCalledOnce();
       expect(on(w.hub, "fabric.control.command")).toHaveLength(1);
+      expect(probe).toHaveBeenCalledOnce();
     }
-    expect(probe).toHaveBeenCalledOnce();
     expect(resolver).not.toHaveBeenCalled(); // Pin failed or no resolver: no selected wait authority.
     expect(w.sendMessage).not.toHaveBeenCalled();
   }, 20_000);

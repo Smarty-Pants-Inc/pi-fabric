@@ -43,6 +43,9 @@ const observeRuns = (runs: string, ...additionalRoots: string[]) => {
   const within = (target: unknown) => roots.some(root => String(target) === root || String(target).startsWith(root + path.sep));
   const readdir = fs.readdirSync, opendir = fs.opendirSync, read = fs.readFileSync;
   const stat = fs.statSync, lstat = fs.lstatSync;
+  const openFile = fs.openSync, closeFile = fs.closeSync, readFd = fs.readSync, readv = fs.readvSync, fstat = fs.fstatSync;
+  const descriptors = new Map<number, string>();
+  const statusFiles: string[] = [];
   const asyncReaddir = fs.promises.readdir, asyncOpendir = fs.promises.opendir, asyncRead = fs.promises.readFile;
   const asyncStat = fs.promises.stat, asyncLstat = fs.promises.lstat;
   const observeCursor = (directory: fs.Dir): fs.Dir => {
@@ -59,12 +62,31 @@ const observeRuns = (runs: string, ...additionalRoots: string[]) => {
     }) as typeof directory.read);
     return directory;
   };
-  const noteRead = (file: unknown) => {
-    if (within(file)) {
+  const noteRead = (target: unknown) => {
+    const file = typeof target === "number" ? descriptors.get(target) : String(target);
+    if (file !== undefined && within(file)) {
       work.reads++;
-      if (path.basename(String(file)) === "status.json") work.statusReads++;
+      if (path.basename(file) === "status.json") { work.statusReads++; statusFiles.push(file); }
     }
   };
+  vi.spyOn(fs, "openSync").mockImplementation(((...args: Parameters<typeof fs.openSync>) => {
+    const fd = openFile(...args);
+    if (within(args[0])) descriptors.set(fd, String(args[0]));
+    return fd;
+  }) as typeof fs.openSync);
+  vi.spyOn(fs, "closeSync").mockImplementation((...args: Parameters<typeof fs.closeSync>) => {
+    try { return closeFile(...args); } finally { descriptors.delete(args[0]); }
+  });
+  vi.spyOn(fs, "readSync").mockImplementation(((...args: Parameters<typeof fs.readSync>) => {
+    noteRead(args[0]); return readFd(...args);
+  }) as typeof fs.readSync);
+  vi.spyOn(fs, "readvSync").mockImplementation(((...args: Parameters<typeof fs.readvSync>) => {
+    noteRead(args[0]); return readv(...args);
+  }) as typeof fs.readvSync);
+  vi.spyOn(fs, "fstatSync").mockImplementation(((...args: Parameters<typeof fs.fstatSync>) => {
+    if (descriptors.has(args[0])) work.stats++;
+    return fstat(...args);
+  }) as typeof fs.fstatSync);
   vi.spyOn(fs, "readdirSync").mockImplementation(((...args: Parameters<typeof fs.readdirSync>) => {
     if (atRoot(args[0])) work.listings++;
     return readdir(...args);
@@ -107,59 +129,78 @@ const observeRuns = (runs: string, ...additionalRoots: string[]) => {
     if (within(args[0])) work.stats++;
     return asyncLstat(...args);
   }) as typeof fs.promises.lstat);
-  return work;
+  return Object.defineProperty(work, "statusFiles", { value: statusFiles }) as typeof work & { statusFiles: string[] };
 };
 
 /** Follow the target through pathname and opened-descriptor reads. A
  * readFileSync(path)-only spy misses a bounded open/fstat/readSync receiver. */
-const observeMetadataReads = (file: string | ((target: string) => boolean), unreadable = false) => {
-  const open = fs.openSync, close = fs.closeSync, readFile = fs.readFileSync;
+const observeMetadataReads = (file: string | ((target: string) => boolean), unreadable = false,
+  onRead?: (file: string) => void) => {
+  const open = fs.openSync, close = fs.closeSync, readFile = fs.readFileSync, fstat = fs.fstatSync;
   const read = fs.readSync, readv = fs.readvSync;
-  const descriptors = new Set<number>();
-  const work = { opens: 0, reads: 0, pathnameReads: 0, descriptorReads: 0, bytes: 0, failures: 0 };
-  const matches = (target: unknown): boolean => typeof target === "number"
-    ? descriptors.has(target) : typeof file === "string" ? String(target) === file : file(String(target));
+  const descriptors = new Map<number, string>();
+  const files = new Map<string, { opens: number; fstats: number; reads: number; pathnameReads: number; descriptorReads: number; bytes: number }>();
+  const work = { opens: 0, fstats: 0, reads: 0, pathnameReads: 0, descriptorReads: 0, bytes: 0, failures: 0, files };
+  const fileOf = (target: unknown) => typeof target === "number" ? descriptors.get(target) : String(target);
+  const matches = (target: unknown): boolean => {
+    const name = fileOf(target);
+    return name !== undefined && (typeof file === "string" ? name === file : file(name));
+  };
+  const row = (target: unknown) => {
+    const name = fileOf(target)!;
+    let value = files.get(name);
+    if (!value) files.set(name, value = { opens: 0, fstats: 0, reads: 0, pathnameReads: 0, descriptorReads: 0, bytes: 0 });
+    return value;
+  };
+  const noteBytes = (target: unknown, bytes: number) => {
+    if (matches(target)) { work.bytes += bytes; row(target).bytes += bytes; }
+  };
   const fail = (): never => {
     work.failures++;
     throw Object.assign(new Error("metadata unreadable"), { code: "EACCES" });
   };
   const noteRead = (target: unknown) => {
     if (!matches(target)) return;
-    work.reads++;
-    if (typeof target === "number") work.descriptorReads++;
-    else work.pathnameReads++;
+    work.reads++; row(target).reads++;
+    if (typeof target === "number") { work.descriptorReads++; row(target).descriptorReads++; }
+    else { work.pathnameReads++; row(target).pathnameReads++; }
+    onRead?.(fileOf(target)!);
     if (unreadable) fail();
   };
   vi.spyOn(fs, "openSync").mockImplementation(((...args: Parameters<typeof fs.openSync>) => {
     const target = matches(args[0]);
     if (target) {
-      work.opens++;
+      work.opens++; row(args[0]).opens++;
       if (unreadable) fail();
     }
     const fd = open(...args);
-    if (target) descriptors.add(fd);
+    if (target) descriptors.set(fd, String(args[0]));
     return fd;
   }) as typeof fs.openSync);
   vi.spyOn(fs, "closeSync").mockImplementation((...args: Parameters<typeof fs.closeSync>) => {
     try { return close(...args); }
     finally { descriptors.delete(args[0]); } // descriptor reuse must not implicate an unrelated file
   });
+  vi.spyOn(fs, "fstatSync").mockImplementation(((...args: Parameters<typeof fs.fstatSync>) => {
+    if (matches(args[0])) { work.fstats++; row(args[0]).fstats++; }
+    return fstat(...args);
+  }) as typeof fs.fstatSync);
   vi.spyOn(fs, "readFileSync").mockImplementation(((...args: Parameters<typeof fs.readFileSync>) => {
     noteRead(args[0]);
     const value = readFile(...args);
-    if (matches(args[0])) work.bytes += typeof value === "string" ? Buffer.byteLength(value) : value.byteLength;
+    noteBytes(args[0], typeof value === "string" ? Buffer.byteLength(value) : value.byteLength);
     return value;
   }) as typeof fs.readFileSync);
   vi.spyOn(fs, "readSync").mockImplementation(((...args: Parameters<typeof fs.readSync>) => {
     noteRead(args[0]);
     const bytes = read(...args);
-    if (matches(args[0])) work.bytes += bytes;
+    noteBytes(args[0], bytes);
     return bytes;
   }) as typeof fs.readSync);
   vi.spyOn(fs, "readvSync").mockImplementation(((...args: Parameters<typeof fs.readvSync>) => {
     noteRead(args[0]);
     const bytes = readv(...args);
-    if (matches(args[0])) work.bytes += bytes;
+    noteBytes(args[0], bytes);
     return bytes;
   }) as typeof fs.readvSync);
   return work;
@@ -328,12 +369,11 @@ describe("resident retained-run startup (smarty-dev#4796)", () => {
         const references = host.agents.retentionReferences.bind(host.agents);
         vi.spyOn(host.agents, "retentionReferences").mockImplementation(options => {
           const before = { ...work };
-          const readsBefore = vi.mocked(fs.readFileSync).mock.calls.length;
+          const readsBefore = work.statusFiles.length;
           const refs = references(options);
           // An exit proof can legitimately re-read one status several times.
-          // The count limit bounds visited run units, not raw predicate calls.
-          const statuses = new Set(vi.mocked(fs.readFileSync).mock.calls.slice(readsBefore)
-            .map(([file]) => String(file)).filter(file => file.startsWith(runs + path.sep) && path.basename(file) === "status.json"));
+          // Include descriptor reads; count visited units, not predicate calls.
+          const statuses = new Set(work.statusFiles.slice(readsBefore));
           slices.push({ options, entries: work.entries - before.entries, statusRuns: statuses.size, wildcard: refs.has("*") });
           return refs;
         });
@@ -366,6 +406,7 @@ describe("resident retained-run startup (smarty-dev#4796)", () => {
     fs.writeFileSync(path.join(config.residencyRoot, "config.json"), JSON.stringify(config));
     const runs = path.join(config.residencyRoot, "runs");
     const historical = new Set<string>();
+    const faultedHistorical = new Set<string>();
     for (let index = 1; index <= 20_000; index++) {
       const id = index.toString(16).padStart(32, "0");
       historical.add(id);
@@ -397,19 +438,17 @@ describe("resident retained-run startup (smarty-dev#4796)", () => {
       }
       previousLease = lease;
     };
-    const read = fs.readFileSync;
-    vi.spyOn(fs, "readFileSync").mockImplementation(((...args: Parameters<typeof fs.readFileSync>) => {
-      const file = String(args[0]);
-      if (file.startsWith(runs + path.sep) && path.basename(file) === "status.json" && historical.has(path.basename(path.dirname(file)))) historicalReads++;
+    observeMetadataReads(file => file.startsWith(runs + path.sep) && path.basename(file) === "status.json", false, file => {
+      if (historical.has(path.basename(path.dirname(file)))) historicalReads++;
       if (file === faultFile) {
-        faultFile = undefined;
+        faultFile = undefined; // once per admitted record, even if readFileSync internally reads its fd
+        faultedHistorical.add(path.basename(path.dirname(file)));
         sampleLease();
-        Atomics.wait(waitCell, 0, 0, 5); // deterministic synchronous cold-read fault
+        Atomics.wait(waitCell, 0, 0, 5); // same real fault for pathname and bounded descriptor readers
         statusReadCount++;
         if (statusReadCount === 1_000) entered();
       }
-      return read(...args);
-    }) as typeof fs.readFileSync);
+    });
     const immediate = globalThis.setImmediate;
     vi.spyOn(globalThis, "setImmediate").mockImplementation(((callback: (...args: unknown[]) => void, ...args: unknown[]) =>
       immediate(() => {
@@ -428,7 +467,7 @@ describe("resident retained-run startup (smarty-dev#4796)", () => {
       const shouldRecover = options!.shouldRecover!;
       options!.shouldRecover = id => {
         const allowed = shouldRecover(id);
-        if (allowed && historical.has(id)) faultFile = path.join(runs, id, "status.json");
+        if (allowed && historical.has(id) && !faultedHistorical.has(id)) faultFile = path.join(runs, id, "status.json");
         return allowed;
       };
     });
@@ -983,6 +1022,9 @@ describe("resident retained-run startup (smarty-dev#4796)", () => {
         cwd: root, task: "private native task", startedAt: now, updatedAt: now, finishedAt: now, turns: 1, toolCalls: 0,
         usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } };
       fs.writeFileSync(path.join(directory, "status.json"), JSON.stringify({ ...record, text: "native status" }));
+      // A real file makes accidental hosted-state probing observable, not an
+      // ENOENT shortcut. Native transport alone must short-circuit this path.
+      fs.writeFileSync(path.join(directory, "hosted.json"), JSON.stringify({ context: { id }, runner: "not-a-hosted-native-run" }));
       // Real private files meet the receiver's canonical path, owner, mode and
       // single-link checks. The old receiver reads them fully before rejecting
       // transport; an absent/unsafe archive would give a false green control.
@@ -1001,7 +1043,8 @@ describe("resident retained-run startup (smarty-dev#4796)", () => {
     });
     // Includes readFileSync(path), readFileSync(opened fd), readSync(fd) and
     // readvSync(fd); close tracking prevents descriptor-reuse false positives.
-    const payload = observeMetadataReads(target => path.dirname(target) === results && target.endsWith(".json"));
+    const payload = observeMetadataReads(target => (path.dirname(target) === results && target.endsWith(".json")) ||
+      (path.basename(target) === "hosted.json" && path.dirname(path.dirname(target)) === runs && ids.has(path.basename(path.dirname(target)))));
     try {
       await host.start();
       await recovery.complete(); // joins the actual full manager scan and host completion
@@ -1014,9 +1057,216 @@ describe("resident retained-run startup (smarty-dev#4796)", () => {
       expect(payload.descriptorReads).toBe(0);
       expect(payload.reads).toBe(0);
       expect(payload.bytes).toBe(0);
+      const hostedState = [...payload.files].filter(([file]) => path.basename(file) === "hosted.json");
+      expect(hostedState).toEqual([]); // zero pathname/FD read attempts AND zero open attempts
+      expect(payload.opens).toBe(0); // neither result archives nor native hosted state were opened
     } finally {
       await host.close();
       vi.restoreAllMocks();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  // Keep reason: security/data safety at the real recovery boundary. Share one
+  // >5s pass across all four oversize cases; do not fake a scanner or heartbeat.
+  it("refuses oversized status and hosted state with and without metadata while other rows progress and the real lease renews", { timeout: 30_000 }, async () => {
+    const { root, config, runs } = fixture();
+    const runner = hostedRunner();
+    const first = seedManager(config);
+    const host = new ResidentHost(config);
+    const cap = 1024 * 1024;
+    const cases: Array<{ id: string; file: string; source: string; known: boolean; status: string; state: string }> = [];
+    const nativeIds = new Set<string>(), admitted = new Set<string>(), faulted = new Set<string>();
+    const armed = new Set<string>();
+    const refusals: unknown[] = [];
+    const waitCell = new Int32Array(new SharedArrayBuffer(4));
+    let active = false, renewedWhilePending = 0, previousLease: ReturnType<typeof readHostLease>;
+    let reads: ReturnType<typeof observeMetadataReads> | undefined;
+    const sampleLease = () => {
+      const lease = readHostLease(config.meshRoot, host.hostId);
+      if (!lease) throw new Error("Owner lease disappeared during oversized-record recovery");
+      expect(lease.expiresAt).toBeGreaterThan(Date.now());
+      if (active && previousLease && lease.updatedAt > previousLease.updatedAt) renewedWhilePending++;
+      previousLease = lease;
+    };
+    try {
+      for (const fileName of ["status.json", "hosted.json"] as const) {
+        for (const known of [true, false]) {
+          const handle = await first.spawn({ task: `oversized ${fileName} metadata=${known}`, runner: runner.adapter.id, residency: "durable" });
+          const directory = path.join(runs, handle.id);
+          if (known) saveMetadata(config, { format: 1, rootId: config.rootId, id: handle.id, handle,
+            runDirectory: directory, createdAt: Date.now(), updatedAt: Date.now() });
+          const file = path.join(directory, fileName);
+          const source = JSON.stringify({ ...JSON.parse(fs.readFileSync(file, "utf8")), padding: "x".repeat(cap + 1) });
+          fs.writeFileSync(file, source);
+          cases.push({ id: handle.id, file, source, known,
+            status: fs.readFileSync(path.join(directory, "status.json"), "utf8"),
+            state: fs.readFileSync(path.join(directory, "hosted.json"), "utf8") });
+        }
+      }
+      const ordinary = await first.spawn({ task: "ordinary orphan still attaches", runner: runner.adapter.id, residency: "durable" });
+      await first.close();
+      const originalStarts = [...runner.calls.starts];
+      const now = Date.now(); // fresh timestamps: retention must not prune the proof inputs
+      for (let index = 1; index <= 1_000; index++) {
+        const id = index.toString(16).padStart(32, "0");
+        nativeIds.add(id);
+        const directory = path.join(runs, id);
+        fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+        fs.writeFileSync(path.join(directory, "status.json"), JSON.stringify({ id, name: "recent native row", runner: "pi",
+          status: "completed", transport: "process", cwd: root, startedAt: now, updatedAt: now, finishedAt: now,
+          turns: 1, toolCalls: 0, text: "small", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } }));
+      }
+      const warnings = vi.spyOn(diagnostics, "warn");
+      const recovery = observeHostedRecovery((_manager, options) => {
+        active = true;
+        sampleLease();
+        const shouldRecover = options!.shouldRecover!;
+        options!.shouldRecover = id => {
+          const allowed = shouldRecover(id); // keep actual host exact-row and lease admission
+          if (allowed) {
+            admitted.add(id);
+            if (nativeIds.has(id) && !faulted.has(id)) armed.add(path.join(runs, id, "status.json"));
+          }
+          return allowed;
+        };
+        // Namespace lookup is intentionally AFTER payload assertions below:
+        // old-head negative controls must fail on whole-file reads, not imports.
+        const withCallback = options as NonNullable<typeof options> & { onRefusal?: (refusal: unknown) => void };
+        const previous = withCallback.onRefusal;
+        withCallback.onRefusal = refusal => {
+          refusals.push(refusal); previous?.(refusal);
+          if ((refusal as { id?: string }).id === cases.find(item => !item.known)!.id) {
+            throw new Error("injected refusal observer failure"); // one unknown row cannot abort unrelated scan work
+          }
+        };
+        reads = observeMetadataReads(file => file.startsWith(runs + path.sep) &&
+          (path.basename(file) === "status.json" || path.basename(file) === "hosted.json"), false, file => {
+          if (!active || !armed.delete(file)) return;
+          const id = path.basename(path.dirname(file));
+          if (faulted.has(id)) return;
+          faulted.add(id);
+          sampleLease();
+          Atomics.wait(waitCell, 0, 0, 7); // only an actual admitted row's first payload read
+        });
+      }, () => { sampleLease(); active = false; });
+      await host.start();
+      await recovery.complete(); // actual host manager full scan and host finally custody
+      active = false;
+      // Freeze observations BEFORE fixture comparisons or manager surface reads;
+      // those deliberate verification reads are outside the counted product window.
+      const observed = reads!;
+      const warningText = warnings.mock.calls.map(call => call.map(String).join(" "));
+      vi.restoreAllMocks();
+      expect(recovery.fallbacks).toHaveLength(1);
+      expect(recovery.fallbacks[0]!.manager).toBe(host.agents);
+      expect(faulted).toEqual(nativeIds);
+      expect([...nativeIds].every(id => admitted.has(id))).toBe(true);
+      expect(renewedWhilePending).toBeGreaterThanOrEqual(1); // changed persisted lease, not just fresh TTL
+      // First regression assertions: old readRecord/readHostedRunState read >cap.
+      // fstat rejection must read ZERO bytes, not merely stop after cap+1.
+      for (const item of cases) {
+        const payload = observed.files.get(item.file);
+        expect(payload?.bytes ?? 0, item.file).toBeLessThanOrEqual(cap);
+        expect(payload?.bytes ?? 0, item.file).toBe(0);
+        expect(payload?.reads ?? 0, item.file).toBe(0);
+        expect(payload?.opens ?? 0, item.file).toBeGreaterThan(0);
+        expect(payload?.fstats ?? 0, item.file).toBeGreaterThan(0);
+      }
+      expect(refusals).toHaveLength(4);
+      // Consumer exceptions are untrusted values; warn without rendering them.
+      expect(warningText.some(text => text.includes("refusal observer failed") && text.includes("recovery continues"))).toBe(true);
+      for (const item of cases) {
+        const refusal = refusals.find(value => (value as { id?: string }).id === item.id);
+        expect(refusal).toBeInstanceOf(managerModule.AgentRunRecoveryRefusal);
+        expect(refusal).toMatchObject({ code: "FABRIC_RUN_RECOVERY_RECORD_OVERSIZED", id: item.id,
+          file: item.file, reason: "oversized record" });
+        expect(warningText.some(text => text.includes(item.id) && text.includes("FABRIC_RUN_RECOVERY_RECORD_OVERSIZED") &&
+          text.includes("unrecoverable: oversized record"))).toBe(true);
+        expect(admitted.has(item.id)).toBe(true);
+        expect(fs.readFileSync(item.file, "utf8")).toBe(item.source);
+        expect(fs.readFileSync(path.join(runs, item.id, "status.json"), "utf8")).toBe(item.status);
+        expect(fs.readFileSync(path.join(runs, item.id, "hosted.json"), "utf8")).toBe(item.state);
+        if (item.known) {
+          await expectTerminalHostedSurfaces(host, item.id, { status: "failed", outcome: "indeterminate",
+            error: expect.stringContaining("unrecoverable: oversized record") });
+        } else {
+          expect(host.agents.listForUi().some(row => row.id === item.id && row.transport === "hosted")).toBe(false);
+          expect(host.agents.list().some(row => row.id === item.id && row.transport === "hosted")).toBe(false);
+          expect(() => host.agents.status(item.id)).toThrow(/Unknown Fabric agent/);
+        }
+      }
+      expect(host.agents.listForUi().partial).toBe(false);
+      expect(host.agents.status(ordinary.id)).toMatchObject({ status: "running", transport: "hosted" });
+      expect(runner.calls.attaches).toEqual([ordinary.id]); // no oversized row attached
+      expect(runner.calls.starts).toEqual(originalStarts); // no replacement submission
+      expect(runner.calls.stops).toBe(0);
+      expect(readHostLease(config.meshRoot, host.hostId)?.expiresAt).toBeGreaterThan(Date.now());
+    } finally {
+      active = false;
+      vi.restoreAllMocks();
+      await host.close(); await first.close(); runner.unregister();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  // Keep reason: a refusal observer is an external callback across the exact
+  // metadata fence. Oversize detection itself cannot grant terminal authority.
+  it("rechecks exact metadata after an oversized-record refusal callback before publishing a hosted terminal result", { timeout: 10_000 }, async () => {
+    const { root, config, runs } = fixture();
+    const runner = hostedRunner();
+    const first = seedManager(config);
+    const host = new ResidentHost(config);
+    try {
+      const handle = await first.spawn({ task: "metadata changes inside refusal callback", runner: runner.adapter.id, residency: "durable" });
+      await first.close();
+      const metadata: ResidentAgentMetadata = { format: 1, rootId: config.rootId, id: handle.id, handle,
+        runDirectory: path.join(runs, handle.id), createdAt: Date.now(), updatedAt: Date.now() };
+      saveMetadata(config, metadata);
+      const statusFile = path.join(runs, handle.id, "status.json");
+      const source = JSON.stringify({ ...JSON.parse(fs.readFileSync(statusFile, "utf8")), padding: "x".repeat(1024 * 1024 + 1) });
+      fs.writeFileSync(statusFile, source);
+      const stateFile = path.join(runs, handle.id, "hosted.json");
+      const stateSource = fs.readFileSync(stateFile, "utf8");
+      const changed = { ...metadata, updatedAt: metadata.updatedAt + 1 };
+      let callbacks = 0;
+      let reads: ReturnType<typeof observeMetadataReads> | undefined;
+      const recovery = observeHostedRecovery((_manager, options) => {
+        const withCallback = options as NonNullable<typeof options> & { onRefusal?: (refusal: unknown) => void };
+        const previous = withCallback.onRefusal;
+        withCallback.onRefusal = refusal => {
+          callbacks++;
+          previous?.(refusal);
+          saveMetadata(config, changed); // real exact-row replacement, no mocked admission/lease
+        };
+        reads = observeMetadataReads(statusFile);
+      });
+      await host.start();
+      await recovery.complete();
+      const observed = reads!;
+      vi.restoreAllMocks(); // fixture comparisons are outside counted recovery reads
+      expect(observed.bytes).toBeLessThanOrEqual(1024 * 1024); // old-head failure is payload size, not absent export
+      expect(observed.bytes).toBe(0);
+      expect(callbacks).toBe(1);
+      expect(recovery.fallbacks).toHaveLength(1);
+      expect(host.agents.listForUi().partial).toBe(false);
+      expect(host.agents.listForUi().some(row => row.id === handle.id)).toBe(false);
+      expect(host.agents.list().some(row => row.id === handle.id)).toBe(false);
+      expect(() => host.agents.status(handle.id)).toThrow(/Unknown Fabric agent/);
+      await expect(host.agents.wait(handle.id, { timeoutMs: 1_000 })).rejects.toThrow(/Unknown Fabric agent/);
+      await expect(host.agents.join(handle.id)).rejects.toThrow(/Unknown Fabric agent/);
+      expect(fs.existsSync(residentResultPath(config.residencyRoot, handle.id))).toBe(false);
+      expect(fs.readdirSync(path.join(runs, handle.id)).some(file => /^manager-restored-result-/.test(file))).toBe(false);
+      expect(fs.readFileSync(statusFile, "utf8")).toBe(source);
+      expect(fs.readFileSync(stateFile, "utf8")).toBe(stateSource);
+      expect(fs.readFileSync(path.join(config.residencyRoot, "agents", `${handle.id}.json`), "utf8")).toBe(JSON.stringify(changed));
+      expect(runner.calls.attaches).toEqual([]);
+      expect(runner.calls.starts).toEqual([handle.id]);
+      expect(runner.calls.stops).toBe(0);
+      expect(readHostLease(config.meshRoot, host.hostId)?.expiresAt).toBeGreaterThan(Date.now());
+    } finally {
+      vi.restoreAllMocks();
+      await host.close(); await first.close(); runner.unregister();
       fs.rmSync(root, { recursive: true, force: true });
     }
   });

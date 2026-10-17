@@ -59,7 +59,7 @@ import {
 import {
   HOSTED_STATE_FILE,
   HostedRun,
-  readHostedRunState,
+  type HostedRunState,
   type HostedRunHooks,
 } from "./hosted-run.js";
 import { resolvePiBinary } from "./pi-binary.js";
@@ -406,6 +406,19 @@ export class AgentRunnerRecoveryUnavailableError extends Error {
   readonly code = "FABRIC_RUNNER_RECOVERY_UNAVAILABLE";
   constructor(readonly runner: string, readonly reason: string) {
     super(`Fabric runner ${runner} is unavailable: ${reason}`);
+  }
+}
+
+const RECOVERY_RECORD_MAX_BYTES = 1024 * 1024;
+
+/** A per-run recovery refusal, never authority derived from unread worker bytes. */
+export class AgentRunRecoveryRefusal extends Error {
+  readonly code = "FABRIC_RUN_RECOVERY_RECORD_OVERSIZED";
+  readonly reason = "oversized record";
+  readonly maxBytes = RECOVERY_RECORD_MAX_BYTES;
+  constructor(readonly id: string, readonly file: string, readonly observedBytes: number) {
+    super(`Hosted recovery ${id} unrecoverable: oversized record (${file}, ${observedBytes} > ${RECOVERY_RECORD_MAX_BYTES} bytes)`);
+    this.name = "AgentRunRecoveryRefusal";
   }
 }
 
@@ -928,6 +941,69 @@ const readRecord = (filePath: string): AgentRunRecord | undefined => {
   } catch {
     return undefined;
   }
+};
+
+/** Recovery discriminators share one bounded, no-follow descriptor reader.
+ * Inspect size before allocating/reading; an oversized file supplies no facts. */
+const readRecoveryJson = (file: string, id: string): unknown => {
+  let fd: number | undefined;
+  try {
+    const leaf = ownedStat(file);
+    if (!leaf?.isFile()) return undefined;
+    fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0));
+    const before = fs.fstatSync(fd);
+    if (!before.isFile() || before.nlink !== 1 || before.dev !== leaf.dev || before.ino !== leaf.ino ||
+        before.uid !== leaf.uid || before.mode !== leaf.mode ||
+        (process.getuid && before.uid !== process.getuid()) ||
+        !Number.isSafeInteger(before.size) || before.size < 0) return undefined;
+    if (before.size > RECOVERY_RECORD_MAX_BYTES) throw new AgentRunRecoveryRefusal(id, file, before.size);
+    // Ordinary 0644 worker records remain supported inside their private run root.
+    const bytes = Buffer.alloc(before.size);
+    for (let offset = 0; offset < bytes.length;) {
+      const read = fs.readSync(fd, bytes, offset, bytes.length - offset, offset);
+      if (read <= 0) return undefined;
+      offset += read;
+    }
+    const after = fs.fstatSync(fd);
+    if (after.size > RECOVERY_RECORD_MAX_BYTES) throw new AgentRunRecoveryRefusal(id, file, after.size);
+    const current = ownedStat(file);
+    if (!current?.isFile() || !after.isFile() || after.nlink !== 1 ||
+        before.dev !== after.dev || before.ino !== after.ino || before.uid !== after.uid ||
+        before.mode !== after.mode || before.nlink !== after.nlink || before.size !== after.size ||
+        before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs ||
+        current.dev !== after.dev || current.ino !== after.ino || current.uid !== after.uid ||
+        current.mode !== after.mode || current.nlink !== after.nlink || current.size !== after.size ||
+        current.mtimeMs !== after.mtimeMs || current.ctimeMs !== after.ctimeMs) return undefined;
+    return JSON.parse(bytes.toString("utf8")) as unknown;
+  } catch (error) {
+    if (error instanceof AgentRunRecoveryRefusal) throw error;
+    return undefined;
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+};
+
+const readRecoveryRecord = (file: string, id: string): AgentRunRecord | undefined => {
+  const parsed = readRecoveryJson(file, id);
+  try {
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
+    const record = parsed as AgentRunRecord;
+    return { ...normalizeRecordTasks(record), runner: isFabricRunnerId(record.runner) ? record.runner : "pi" };
+  } catch { return undefined; }
+};
+
+const recoveryHostedRecordMatches = (record: AgentRunRecord | undefined, id: string): record is AgentRunRecord =>
+  !!record?.hosted && record.id === id && (record.transport === undefined || record.transport === "hosted");
+
+const readRecoveryHostedState = (file: string, id: string): HostedRunState | undefined => {
+  const value = readRecoveryJson(file, id) as Partial<HostedRunState> | undefined;
+  return value?.version === 1 &&
+    typeof value.runner === "string" &&
+    typeof value.context === "object" &&
+    value.context !== null &&
+    typeof value.context.id === "string"
+    ? (value as HostedRunState)
+    : undefined;
 };
 
 /** Read only the exact manager publication proved by its original descriptor. */
@@ -3467,6 +3543,8 @@ export class AgentManager {
     /** Owner-authenticated archive, never a worker status or an unproved disk result. */
     savedResult?: (id: string) => AgentRunResult | undefined;
     refusalReason?: (id: string) => string | undefined;
+    /** Per-run refusal; a consumer failure cannot interrupt the scan. */
+    onRefusal?: (refusal: AgentRunRecoveryRefusal) => void;
     budgetMs?: number;
     maxEntries?: number;
   } = {}): Promise<string[]> {
@@ -3478,6 +3556,13 @@ export class AgentManager {
     check();
     const recovered: string[] = [];
     const slice = recoverySlice(options);
+    const reportRefusal = (refusal: AgentRunRecoveryRefusal): void => {
+      diagnostics.warn("src/agents/manager.ts", `[pi-fabric] hosted recovery ${refusal.id} ${refusal.code}: unrecoverable: oversized record; source kept (${refusal.file})`);
+      try { options.onRefusal?.(refusal); }
+      catch {
+        diagnostics.warn("src/agents/manager.ts", `[pi-fabric] hosted recovery ${refusal.id} refusal observer failed; recovery continues`);
+      }
+    };
     const entries = candidates ?? recoveryRunDirectories(this.#runRoot, scan);
     for await (const candidate of entries) {
       const pause = slice();
@@ -3495,24 +3580,43 @@ export class AgentManager {
       // Validated metadata admits archive lookup even with missing/damaged
       // worker files. Otherwise require the existing hosted record/state marker
       // before asking the owner to read a potentially large saved payload.
-      let record = projection ? undefined : readRecord(statusFile);
-      let state = projection ? undefined : readHostedRunState(path.join(runDirectory, HOSTED_STATE_FILE));
-      const hostedCandidate = projection || (record?.hosted && record.id === entry && state?.context.id === entry);
-      // The owner archive, never worker terminal data, remains authoritative
-      // before terminal-status, adapter and launch-scope checks (including P1-B).
-      const saved = hostedCandidate ? options.savedResult?.(entry) : undefined;
-      check();
-      if (options.shouldRecover?.(entry) === false) { this.setPendingHostedRecovery(entry, undefined); continue; }
-      if (saved && saved.id === entry && terminalStatuses.has(saved.status)) {
-        this.restorePreviousRuns([saved], { hostedRecovery: true });
+      let record: AgentRunRecord | undefined;
+      let state: HostedRunState | undefined;
+      const readWorkerState = () => {
+        const record = readRecoveryRecord(statusFile, entry);
+        // A native/mismatched status never opens hosted.json, even if it is huge.
+        const state = recoveryHostedRecordMatches(record, entry)
+          ? readRecoveryHostedState(path.join(runDirectory, HOSTED_STATE_FILE), entry)
+          : undefined;
+        return { record, state };
+      };
+      try {
+        if (!projection) ({ record, state } = readWorkerState());
+        const hostedCandidate = projection || (recoveryHostedRecordMatches(record, entry) && state?.context.id === entry);
+        // Owner archives win BEFORE worker reads for a validated projection,
+        // including missing, damaged or oversized worker files (P1-B).
+        const saved = hostedCandidate ? options.savedResult?.(entry) : undefined;
+        check();
+        if (options.shouldRecover?.(entry) === false) { this.setPendingHostedRecovery(entry, undefined); continue; }
+        if (saved && saved.id === entry && terminalStatuses.has(saved.status)) {
+          this.restorePreviousRuns([saved], { hostedRecovery: true });
+          continue;
+        }
+        if (projection) ({ record, state } = readWorkerState());
+      } catch (error) {
+        if (!(error instanceof AgentRunRecoveryRefusal)) throw error;
+        reportRefusal(error);
+        check();
+        const admitted = options.shouldRecover?.(entry) !== false;
+        check(); // Metadata revalidation and the observer may themselves lose the lease.
+        if (!admitted) { this.setPendingHostedRecovery(entry, undefined); continue; }
+        // Only owner-validated metadata can supply a terminal observation. This
+        // publication removes pending custody without overwriting worker bytes.
+        if (projection) this.#refuseHostedRecovery(entry, runDirectory, projection, error.message, true);
         continue;
       }
-      if (projection) {
-        record = readRecord(statusFile);
-        state = readHostedRunState(path.join(runDirectory, HOSTED_STATE_FILE));
-      }
-      if (!record?.hosted || !state || record.id !== entry || state.context.id !== entry || terminalStatuses.has(record.status)) {
-        const observation = projection ?? (record?.hosted && record.id === entry && state?.context.id === entry ? record : undefined);
+      if (!recoveryHostedRecordMatches(record, entry) || !state || state.context.id !== entry || terminalStatuses.has(record.status)) {
+        const observation = projection ?? (recoveryHostedRecordMatches(record, entry) && state?.context.id === entry ? record : undefined);
         if (observation) this.#refuseHostedRecovery(entry, runDirectory, observation,
           options.refusalReason?.(entry) ?? "Hosted recovery has no authenticated saved terminal result or valid launch state; the run outcome is indeterminate");
         continue;
@@ -3575,14 +3679,31 @@ export class AgentManager {
       check();
       if (options.shouldRecover?.(id) === false) { this.setPendingHostedRecovery(id, undefined); continue; }
       if (saved && saved.id === id && terminalStatuses.has(saved.status)) this.restorePreviousRuns([saved], { hostedRecovery: true });
-      else this.#refuseHostedRecovery(id, path.join(this.#runRoot, id), projection,
-        options.refusalReason?.(id) ?? "Hosted recovery has no valid saved run; the run outcome is indeterminate");
+      else {
+        const directory = path.join(this.#runRoot, id);
+        let refusal: AgentRunRecoveryRefusal | undefined;
+        try {
+          const record = readRecoveryRecord(path.join(directory, "status.json"), id);
+          if (recoveryHostedRecordMatches(record, id)) readRecoveryHostedState(path.join(directory, HOSTED_STATE_FILE), id);
+        } catch (error) {
+          if (!(error instanceof AgentRunRecoveryRefusal)) throw error;
+          refusal = error;
+          reportRefusal(error);
+        }
+        check();
+        const admitted = options.shouldRecover?.(id) !== false;
+        check();
+        if (!admitted) { this.setPendingHostedRecovery(id, undefined); continue; }
+        this.#refuseHostedRecovery(id, directory, projection,
+          refusal?.message ?? options.refusalReason?.(id) ?? "Hosted recovery has no valid saved run; the run outcome is indeterminate",
+          refusal !== undefined);
+      }
     }
     check();
     return recovered;
   }
 
-  #refuseHostedRecovery(id: string, directory: string, observation: Pick<AgentRunRecord, "name" | "runner" | "cwd">, reason: string): void {
+  #refuseHostedRecovery(id: string, directory: string, observation: Pick<AgentRunRecord, "name" | "runner" | "cwd">, reason: string, preserveStatus = false): void {
     mkdirPrivate(directory, this.#trustRoot());
     const now = Date.now();
     // A refusal is a new manager verdict, not authentication of worker output,
@@ -3594,7 +3715,7 @@ export class AgentManager {
     const resultFile = path.join(directory, `manager-restored-result-${randomUUID()}.json`);
     const fingerprint = writePrivateJsonAtomic(resultFile, result);
     if (this.#onSettled) this.#stageArchive(directory, result, "settlement");
-    writeRecord(path.join(directory, "status.json"), result);
+    if (!preserveStatus) writeRecord(path.join(directory, "status.json"), result);
     this.#rememberPreviousRun(result, resultFile, fingerprint, true);
     if (this.#onSettled) {
       try {

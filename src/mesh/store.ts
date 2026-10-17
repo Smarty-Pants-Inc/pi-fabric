@@ -352,7 +352,7 @@ export interface MeshStoreOptions {
   readActive?: () => boolean;
   /** Disable optional delta publication, e.g. for legacy-writer compatibility probes. */
   writeReadJournal?: boolean;
-  /** Keyed-state backend (smarty-dev#6477 L2a). Explicit wins; else PI_FABRIC_MESH_STATE_BACKEND; else "file". */
+  /** Keyed-state backend. Explicit wins, then nonblank PI_FABRIC_MESH_STATE_BACKEND, then the root's moved marker or "file". */
   stateBackend?: MeshStateBackendKind;
   /** A resident startup owns a scoped recovery pass before opening ordinary dispatch. */
   canWakeResidents?: () => boolean;

@@ -1,0 +1,128 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { CapturedToolCatalog } from "../src/capture/catalog.js";
+import { loadFabricConfig } from "../src/config.js";
+import { FabricRuntimeState } from "../src/fabric-runtime-state.js";
+import { MeshBackendFenceError, readMeshStateMovedMarker } from "../src/mesh/backend-fence.js";
+import { importMeshState } from "../src/mesh/backend-migration.js";
+import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
+
+// Data safety and a real runtime boundary: the config loader must not turn an omitted setting
+// into an explicit file selection before MeshStore sees an imported SQLite root.
+const identity: MeshIdentity = { id: "root-selection-probe", name: "probe", kind: "agent" };
+const roots: string[] = [];
+const runtimes: FabricRuntimeState[] = [];
+const FIXTURE_DEFAULT = Symbol.for("pi-fabric.mesh.sqlite-initialize.test-fixtures");
+let fixtureDescriptor: PropertyDescriptor | undefined;
+beforeEach(() => {
+  fixtureDescriptor = Object.getOwnPropertyDescriptor(globalThis, FIXTURE_DEFAULT);
+  Reflect.deleteProperty(globalThis, FIXTURE_DEFAULT);
+  vi.stubEnv("PI_FABRIC_MESH_STATE_BACKEND", undefined);
+});
+afterEach(async () => {
+  try {
+    for (const runtime of runtimes.splice(0)) await runtime.shutdown();
+  } finally {
+    if (fixtureDescriptor) Object.defineProperty(globalThis, FIXTURE_DEFAULT, fixtureDescriptor);
+    else Reflect.deleteProperty(globalThis, FIXTURE_DEFAULT);
+    vi.unstubAllEnvs();
+    for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+const fixture = () => {
+  const cwd = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "fabric-runtime-root-selection-")));
+  roots.push(cwd);
+  const agentDir = path.join(cwd, "agent");
+  const meshRoot = path.join(cwd, ".pi", "fabric", "mesh");
+  fs.mkdirSync(agentDir);
+  const configFile = path.join(agentDir, "fabric.json");
+  const settings = {
+    mesh: { enabled: true }, mcp: { enabled: false, cache: { enabled: false } },
+    agents: { enabled: false }, prewalk: { enabled: false, alwaysRearm: false },
+  };
+  fs.writeFileSync(configFile, JSON.stringify(settings));
+  vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
+  vi.stubEnv("PI_FABRIC_PROJECT_ROOT", cwd);
+  vi.stubEnv("PI_FABRIC_MESH_ROOT", meshRoot);
+  // These are only the host API harness, not replacements for config, backend selection or storage.
+  const pi = { events: { emit: vi.fn() }, getThinkingLevel: () => "off", sendMessage: vi.fn() } as unknown as ExtensionAPI;
+  const context = {
+    cwd, hasUI: false, isProjectTrusted: () => true, isIdle: () => true, hasPendingMessages: () => false,
+    modelRegistry: { find: vi.fn(), getApiKeyAndHeaders: vi.fn() },
+    sessionManager: { getSessionId: () => "root-selection", getSessionFile: () => undefined, getBranch: () => [], getLeafId: () => undefined },
+    ui: { setStatus: vi.fn(), notify: vi.fn() },
+  } as unknown as ExtensionContext;
+  const unused = path.join(cwd, "unused.mjs");
+  fs.writeFileSync(unused, "export default {};");
+  const runtime = new FabricRuntimeState(pi, new CapturedToolCatalog(), {
+    paths: { extension: unused, worker: unused, residentHost: unused, skills: cwd },
+  });
+  runtimes.push(runtime);
+  return { runtime, context, cwd, agentDir, meshRoot, configFile, settings };
+};
+
+const seedFile = async (root: string): Promise<void> => {
+  const seed = new MeshStore(root, 64 * 1024, 1_000, { stateBackend: "file" });
+  try { await seed.put({ key: "selection/retained", value: { preserved: true }, identity }); }
+  finally { seed.closeState(); }
+};
+
+const seedImported = async (root: string): Promise<string> => {
+  await seedFile(root);
+  const imported = await importMeshState(root);
+  expect(imported.backend).toBe("sqlite");
+  expect(readMeshStateMovedMarker(root)).toBeDefined();
+  return fs.readFileSync(path.join(root, "state.json"), "utf8");
+};
+
+describe("FabricRuntimeState selects an unconfigured backend per root", () => {
+  for (const kind of ["sqlite", "file", "fresh"] as const) {
+    // The real importer's reader-proof/ACL support is unavailable on Windows; file/fresh still run.
+    it.skipIf(process.platform === "win32" && kind === "sqlite")(`loads omitted config, reads and writes a ${kind} root, and retains data on reopen`, async () => {
+      const { runtime, context, cwd, agentDir, meshRoot } = fixture();
+      let marker: string | undefined;
+      if (kind === "sqlite") marker = await seedImported(meshRoot);
+      else if (kind === "file") await seedFile(meshRoot);
+      else expect(fs.existsSync(meshRoot)).toBe(false);
+      const config = loadFabricConfig({ cwd, agentDir, projectTrusted: true });
+      expect(Object.hasOwn(config.mesh, "stateBackend")).toBe(false);
+
+      // No bootstrap config: initialize goes through the public loader and production factory itself.
+      await runtime.initialize(context);
+      expect(runtime.mesh.stateBackend).toBe(kind === "sqlite" ? "sqlite" : "file");
+      if (kind !== "fresh") expect(runtime.mesh.get("selection/retained", { fresh: true })?.value).toEqual({ preserved: true });
+      await runtime.mesh.put({ key: "selection/written", value: kind, identity });
+      expect(runtime.mesh.get("selection/written", { fresh: true })?.value).toBe(kind);
+      await runtime.shutdown();
+
+      const reopened = new MeshStore(meshRoot, 64 * 1024, 1_000);
+      try {
+        expect(reopened.stateBackend).toBe(kind === "sqlite" ? "sqlite" : "file");
+        expect(reopened.get("selection/written", { fresh: true })?.value).toBe(kind);
+        if (kind !== "fresh") expect(reopened.get("selection/retained", { fresh: true })?.value).toEqual({ preserved: true });
+      } finally { reopened.closeState(); }
+      if (marker !== undefined) expect(fs.readFileSync(path.join(meshRoot, "state.json"), "utf8")).toBe(marker);
+      else expect(fs.existsSync(path.join(meshRoot, "state.db"))).toBe(false);
+    }, 60_000);
+  }
+
+  it.skipIf(process.platform === "win32").each(["config", "environment"] as const)("refuses explicit file from %s and preserves the imported root", async source => {
+    const { runtime, context, meshRoot, configFile, settings } = fixture();
+    const marker = await seedImported(meshRoot);
+    if (source === "config") fs.writeFileSync(configFile, JSON.stringify({ ...settings, mesh: { ...settings.mesh, stateBackend: "file" } }));
+    else vi.stubEnv("PI_FABRIC_MESH_STATE_BACKEND", " FILE ");
+    await expect(runtime.initialize(context)).rejects.toThrow(MeshBackendFenceError);
+    await runtime.shutdown();
+    vi.stubEnv("PI_FABRIC_MESH_STATE_BACKEND", undefined);
+    expect(fs.readFileSync(path.join(meshRoot, "state.json"), "utf8")).toBe(marker);
+    const reader = new MeshStore(meshRoot, 64 * 1024, 1_000);
+    try {
+      expect(reader.stateBackend).toBe("sqlite");
+      expect(reader.get("selection/retained", { fresh: true })?.value).toEqual({ preserved: true });
+    } finally { reader.closeState(); }
+  }, 60_000);
+});

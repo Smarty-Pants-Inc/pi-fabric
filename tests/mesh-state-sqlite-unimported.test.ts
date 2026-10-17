@@ -19,6 +19,8 @@ import { MeshStore, type MeshIdentity, type MeshStoreOptions } from "../src/mesh
 // fences every file-mode writer at epoch 1.
 
 const identity: MeshIdentity = { id: "tester", name: "tester", kind: "agent" };
+/** Synthetic owner for accepted-unready import alarms; never use a real lead identity in tests. */
+const SWITCH_OWNER = "session:0a1b2c3d-0000-4000-8000-00000000c944";
 const roots: string[] = [];
 const stores: MeshStore[] = [];
 const sqliteStores: SqliteStateStore[] = [];
@@ -39,7 +41,12 @@ const open = (root: string, options: MeshStoreOptions = {}): MeshStore => {
 const FIXTURE_DEFAULT = Symbol.for("pi-fabric.mesh.sqlite-initialize.test-fixtures");
 const globals = globalThis as Record<symbol, unknown>;
 let fixtureDefault: unknown;
-beforeEach(() => { fixtureDefault = globals[FIXTURE_DEFAULT]; delete globals[FIXTURE_DEFAULT]; });
+beforeEach(() => {
+  fixtureDefault = globals[FIXTURE_DEFAULT];
+  delete globals[FIXTURE_DEFAULT];
+  vi.stubEnv("PI_FABRIC_MESH_ALARM_TO", SWITCH_OWNER);
+  vi.stubEnv("SMARTY_LEAD_SESSION", undefined);
+});
 
 const MARKER_HOOK = Symbol.for("pi-fabric.mesh.sqlite-create.marker-hook");
 afterEach(() => {

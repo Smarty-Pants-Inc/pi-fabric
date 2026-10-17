@@ -4,8 +4,10 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { normalizeFabricConfig } from "../src/config.js";
 import { MESH_STATE_BACKEND_KINDS } from "../src/mesh/state-backend-kinds.js";
+import { importMeshState } from "../src/mesh/backend-migration.js";
 import { createStateBackend, MESH_STATE_BACKEND_NOT_BUILT_CODE, MeshStateBackendNotBuiltError, resolveMeshStateBackend,
   SqliteStateBackend, STATE_BACKEND_FACTORIES, type StateBackendFactory } from "../src/mesh/state-backend.js";
+import { MeshLock } from "../src/mesh/mesh-lock.js";
 import { MeshStore, type MeshIdentity, type MeshStoreOptions } from "../src/mesh/store.js";
 import { StateFile } from "../src/mesh/state-file.js";
 
@@ -81,6 +83,128 @@ describe("state backend selector registry", () => {
       expect(backend.diagnostics().fallback).toBe("sqlite: probe refusal");
       backend.close();
     } finally { STATE_BACKEND_FACTORIES.sqlite = original; }
+  });
+});
+
+describe("root-aware backend selection", () => {
+  const fixtureDefaultKey = Symbol.for("pi-fabric.mesh.sqlite-initialize.test-fixtures");
+  const globals = globalThis as Record<symbol, unknown>;
+  let fixtureDefault: unknown;
+
+  // Exercise production selection and initialization, not the suite-wide fresh-SQLite fixture.
+  beforeEach(() => {
+    fixtureDefault = globals[fixtureDefaultKey];
+    delete globals[fixtureDefaultKey];
+    vi.stubEnv("PI_FABRIC_MESH_STATE_BACKEND", undefined);
+  });
+  afterEach(() => { globals[fixtureDefaultKey] = fixtureDefault; });
+
+  const seedFileRoot = async (root: string): Promise<void> => {
+    const file = open(root, { stateBackend: "file" });
+    await file.put({ key: "retained", value: { from: "file" }, identity });
+    file.closeState();
+  };
+  const importedRoot = async (): Promise<string> => {
+    const root = tempRoot();
+    await seedFileRoot(root);
+    await importMeshState(root);
+    return root;
+  };
+
+  it.skipIf(process.platform === "win32")("defaults to an imported SQLite root, preserving reads and writes through MeshStore and the factory", async () => {
+    const root = await importedRoot();
+    expect(process.env.PI_FABRIC_MESH_STATE_BACKEND).toBeUndefined();
+
+    const store = open(root);
+    expect(store.stateBackend).toBe("sqlite");
+    expect(store.stateBackendHandle).toBeInstanceOf(SqliteStateBackend);
+    expect(fs.existsSync(path.join(root, "state.db"))).toBe(true);
+    expect(store.get("retained")?.value).toEqual({ from: "file" });
+    await store.put({ key: "after/import", value: { written: "through MeshStore" }, identity });
+    store.closeState();
+
+    const backend = createStateBackend({ root, maxEventBytes: 64 * 1024, maxReadEvents: 1_000,
+      lock: new MeshLock(root, {}, () => {}) });
+    try {
+      expect(backend.kind).toBe("sqlite");
+      expect(backend.get("retained")?.value).toEqual({ from: "file" });
+      expect(backend.get("after/import")?.value).toEqual({ written: "through MeshStore" });
+      await backend.put({ key: "after/factory", value: { written: "through factory" }, identity });
+      expect(backend.get("after/factory")?.value).toEqual({ written: "through factory" });
+    } finally { backend.close(); }
+  });
+
+  it("keeps populated and fresh roots on the default file backend", async () => {
+    const populated = tempRoot();
+    await seedFileRoot(populated);
+    expect(process.env.PI_FABRIC_MESH_STATE_BACKEND).toBeUndefined();
+    const file = open(populated);
+    expect(file.stateBackend).toBe("file");
+    expect(file.stateBackendHandle).toBeInstanceOf(StateFile);
+    expect(file.get("retained")?.value).toEqual({ from: "file" });
+    await file.put({ key: "still/file", value: true, identity });
+    expect(file.get("still/file")?.value).toBe(true);
+    expect(fs.existsSync(path.join(populated, "state.db"))).toBe(false);
+
+    const fresh = tempRoot();
+    const empty = open(fresh);
+    expect(empty.stateBackend).toBe("file");
+    expect(empty.stateBackendHandle).toBeInstanceOf(StateFile);
+    await empty.put({ key: "fresh/file", value: true, identity });
+    expect(fs.existsSync(path.join(fresh, "state.json"))).toBe(true);
+    expect(fs.existsSync(path.join(fresh, "state.db"))).toBe(false);
+  });
+
+  it("keeps explicit sqlite environment initialization on a fresh root", async () => {
+    const root = tempRoot();
+    vi.stubEnv("PI_FABRIC_MESH_STATE_BACKEND", "sqlite");
+    const store = open(root);
+    expect(store.stateBackend).toBe("sqlite");
+    await store.put({ key: "fresh/sqlite", value: true, identity });
+    expect(store.get("fresh/sqlite")?.value).toBe(true);
+    expect(fs.existsSync(path.join(root, "state.db"))).toBe(true);
+    expect(JSON.parse(fs.readFileSync(path.join(root, "state.json"), "utf8"))).toMatchObject({
+      format: "sqlite", movedTo: "state.db", epoch: 1,
+    });
+  });
+
+  it.skipIf(process.platform === "win32")("keeps explicit file selection on an imported SQLite root fail-closed", async () => {
+    const root = await importedRoot();
+    const explicit = open(root, { stateBackend: "file" });
+    expect(explicit.stateBackend).toBe("file");
+    expect(() => explicit.get("retained")).toThrow(/moved to state\.db/);
+    await expect(explicit.put({ key: "must/not/write", value: 1, identity })).rejects.toThrow(/moved to state\.db/);
+    explicit.closeState();
+
+    // The environment remains authoritative over root detection when it contradicts the marker.
+    vi.stubEnv("PI_FABRIC_MESH_STATE_BACKEND", "file");
+    const fromEnv = open(root);
+    expect(fromEnv.stateBackend).toBe("file");
+    expect(() => fromEnv.get("retained")).toThrow(/moved to state\.db/);
+    await expect(fromEnv.put({ key: "must/not/write/env", value: 1, identity })).rejects.toThrow(/moved to state\.db/);
+  });
+
+  it("refuses explicit sqlite selection on populated file roots without creating state.db", async () => {
+    const root = tempRoot();
+    await seedFileRoot(root);
+    const stateFile = fs.readFileSync(path.join(root, "state.json"), "utf8");
+
+    const explicit = open(root, { stateBackend: "sqlite" });
+    expect(explicit.stateBackend).toBe("sqlite");
+    expect(() => explicit.get("retained")).toThrow(/run `fabric-mesh-backend import --root .+` first/);
+    await expect(explicit.put({ key: "must/not/write", value: 1, identity }))
+      .rejects.toThrow(/run `fabric-mesh-backend import --root .+` first/);
+    explicit.closeState();
+
+    // The environment override must not make populated file state disappear either.
+    vi.stubEnv("PI_FABRIC_MESH_STATE_BACKEND", "sqlite");
+    const fromEnv = open(root);
+    expect(fromEnv.stateBackend).toBe("sqlite");
+    expect(() => fromEnv.get("retained")).toThrow(/run `fabric-mesh-backend import --root .+` first/);
+    await expect(fromEnv.put({ key: "must/not/write/env", value: 1, identity }))
+      .rejects.toThrow(/run `fabric-mesh-backend import --root .+` first/);
+    expect(fs.existsSync(path.join(root, "state.db"))).toBe(false);
+    expect(fs.readFileSync(path.join(root, "state.json"), "utf8")).toBe(stateFile);
   });
 });
 

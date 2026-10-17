@@ -792,7 +792,6 @@ export class FabricControlPlane {
   /** A wake no completed drain has served yet; a wake during a drain makes the loop run again. */
   #dirty = false;
   #draining = false;
-  #wakeScheduled = false;
   #leaseWatchdog: NodeJS.Timeout | undefined;
   #polling: Promise<void> | undefined;
   readonly #backgroundPoll = new MeshBackgroundRetry("control claim/ack poll")
@@ -1803,10 +1802,7 @@ export class FabricControlPlane {
   #wake(): void {
     if (this.#closed || !this.options.enabled || !this.#started) return;
     this.#dirty = true;
-    if (this.#wakeScheduled) return;
-    this.#wakeScheduled = true;
     queueMicrotask(() => {
-      this.#wakeScheduled = false;
       void this.#runDrains();
     });
   }

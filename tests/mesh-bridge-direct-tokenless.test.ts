@@ -630,6 +630,80 @@ describe("direct tokenless presence through MeshBridge RPC", () => {
     expect(fs.readFileSync(hostLeasePath(f.hub.root, victim.host.id))).toEqual(before.lease);
   });
 
+  it.each(["file", "sqlite"] as const)("raw mirror RPC drops a participant with a missing required timestamp without withdrawing prior mirrors (%s)", async backend => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(NOW);
+    const f = ownRootLink(false, backend);
+    const victim = fixture("rpc-participant-victim", "B", NOW - 1_000, NOW + 120_000);
+    await f.agent.mirror(victim.presence);
+    const before = { host: f.work.get(hostKey(victim.host.id), { fresh: true }),
+      participant: f.work.get(participantKey(victim.participant.id), { fresh: true }),
+      lease: fs.readFileSync(hostLeasePath(f.work.root, victim.host.id)) };
+
+    const malformed = fixture("rpc-participant-malformed", "M", NOW, NOW + 120_000);
+    const invalidParticipant = { ...malformed.participant, updatedAt: null } as unknown as FabricParticipantRecord;
+    const progress = fixture("rpc-participant-progress", "U", NOW, NOW + 120_000);
+    await f.remote.mirror({ hosts: [...malformed.presence.hosts, ...progress.presence.hosts],
+      participants: [invalidParticipant, progress.participant] });
+
+    expect(f.work.get(hostKey(victim.host.id), { fresh: true })).toEqual(before.host);
+    expect(f.work.get(participantKey(victim.participant.id), { fresh: true })).toEqual(before.participant);
+    expect(fs.readFileSync(hostLeasePath(f.work.root, victim.host.id))).toEqual(before.lease);
+    expect(f.work.get(participantKey(malformed.participant.id), { fresh: true })).toBeUndefined();
+    expect(f.work.get(hostKey(progress.host.id), { fresh: true })?.value).toMatchObject({ incarnationToken: "U" });
+    expect(f.work.get(participantKey(progress.participant.id), { fresh: true })?.value).toMatchObject({ id: progress.participant.id });
+
+    // A clean, fully valid snapshot still authorizes omission cleanup.
+    await f.remote.mirror(progress.presence);
+    expect(f.work.get(hostKey(victim.host.id), { fresh: true })).toBeUndefined();
+    expect(f.work.get(participantKey(victim.participant.id), { fresh: true })).toBeUndefined();
+    expect(readHostLease(f.work.root, victim.host.id)).toBeUndefined();
+  });
+
+  it.each(["file", "sqlite"] as const)("source scan marks a malformed participant timestamp partial while valid roots progress (%s)", async backend => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(NOW);
+    const f = ownRootLink(false, backend);
+    const victim = fixture("scan-participant-victim", "B", NOW - 1_000, NOW + 120_000);
+    await installNative(f.work, victim);
+    await expect(f.bridge.syncPresence()).resolves.toBeUndefined();
+    const before = { host: f.hub.get(hostKey(victim.host.id), { fresh: true }),
+      participant: f.hub.get(participantKey(victim.participant.id), { fresh: true }),
+      lease: fs.readFileSync(hostLeasePath(f.hub.root, victim.host.id)) };
+
+    await f.work.delete({ key: hostKey(victim.host.id) });
+    await f.work.delete({ key: participantKey(victim.participant.id) });
+    fs.rmSync(hostLeasePath(f.work.root, victim.host.id), { force: true });
+    const malformed = fixture("scan-participant-malformed", "M", NOW, NOW + 120_000);
+    const invalidParticipant = { ...malformed.participant, updatedAt: null } as unknown as FabricParticipantRecord;
+    await f.work.put({ key: hostKey(malformed.host.id), identity: malformed.identity, value: malformed.host });
+    await f.work.put({ key: participantKey(invalidParticipant.id), identity: malformed.identity, value: invalidParticipant });
+    writeHostLease(f.work.root, leaseFor(malformed));
+    const progress = fixture("scan-participant-progress", "U", NOW, NOW + 120_000);
+    await installNative(f.work, progress);
+
+    const source = await f.remote.presence();
+    expect(source).toMatchObject({ partial: true, droppedCount: expect.any(Number) });
+    expect((source.droppedCount ?? 0)).toBeGreaterThan(0);
+    await expect(f.bridge.syncPresence()).resolves.toBeUndefined();
+
+    expect(f.hub.get(hostKey(victim.host.id), { fresh: true })).toEqual(before.host);
+    expect(f.hub.get(participantKey(victim.participant.id), { fresh: true })).toEqual(before.participant);
+    expect(fs.readFileSync(hostLeasePath(f.hub.root, victim.host.id))).toEqual(before.lease);
+    expect(f.hub.get(hostKey(progress.host.id), { fresh: true })?.value).toMatchObject({ incarnationToken: "U" });
+    expect(f.hub.get(participantKey(progress.participant.id), { fresh: true })?.value).toMatchObject({ id: progress.participant.id });
+    expect(f.hub.get(participantKey(malformed.participant.id), { fresh: true })).toBeUndefined();
+
+    // A later complete snapshot still withdraws the genuinely absent victim.
+    await f.work.delete({ key: hostKey(malformed.host.id) });
+    await f.work.delete({ key: participantKey(malformed.participant.id) });
+    fs.rmSync(hostLeasePath(f.work.root, malformed.host.id), { force: true });
+    await expect(f.bridge.syncPresence()).resolves.toBeUndefined();
+    expect(f.hub.get(hostKey(victim.host.id), { fresh: true })).toBeUndefined();
+    expect(f.hub.get(participantKey(victim.participant.id), { fresh: true })).toBeUndefined();
+    expect(readHostLease(f.hub.root, victim.host.id)).toBeUndefined();
+  });
+
   it.each(["file", "sqlite"] as const)("real sync does not turn a dropped malformed cross-root host into withdrawal (%s)", async backend => {
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(NOW);

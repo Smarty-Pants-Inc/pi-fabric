@@ -338,8 +338,7 @@ const identifiableHostOf = (key: string, value: unknown): FabricHostRecord | und
 
 const hostOf = (key: string, value: unknown): FabricHostRecord | undefined => {
   const host = identifiableHostOf(key, value);
-  return host && typeof host.startedAt === "number" && typeof host.updatedAt === "number" && typeof host.expiresAt === "number"
-    ? host : undefined;
+  return host && isAdmissibleRecord("host", host) ? host : undefined;
 };
 
 const presenceHostOf = (key: string, value: unknown): FabricHostRecord | undefined =>
@@ -348,11 +347,34 @@ const presenceHostOf = (key: string, value: unknown): FabricHostRecord | undefin
 const finiteHostTimestamps = (record: FabricHostRecord): boolean =>
   Number.isFinite(record.startedAt) && Number.isFinite(record.updatedAt) && Number.isFinite(record.expiresAt);
 
+const PARTICIPANT_KINDS = new Set(["root", "agent", "actor", "provider"]);
+const PARTICIPANT_TRANSPORTS = new Set(["auto", "process", "tmux", "screen", "localterm", "herdr", "host", "hosted"]);
+
+function isAdmissibleRecord(kind: "host" | "participant", value: unknown): boolean {
+  if (!isObject(value) || value.format !== 1 || typeof value.id !== "string" || value.id.length === 0) return false;
+  if (kind === "host") {
+    return typeof value.rootId === "string" && value.rootId.length > 0 && isIdentity(value.identity) &&
+      finiteHostTimestamps(value as unknown as FabricHostRecord);
+  }
+  // The control protocol governs bridged roots; non-root rows are retained for reservation only.
+  const controlProtocolValid = value.controlProtocol === "v1" || value.controlProtocol === "legacy" ||
+    (value.kind !== "root" && value.controlProtocol === undefined);
+  return typeof value.kind === "string" && PARTICIPANT_KINDS.has(value.kind) &&
+    typeof value.rootId === "string" && value.rootId.length > 0 &&
+    typeof value.ownerHostId === "string" && value.ownerHostId.length > 0 &&
+    typeof value.ownerIdentityId === "string" && value.ownerIdentityId.length > 0 &&
+    typeof value.name === "string" && typeof value.status === "string" &&
+    typeof value.transport === "string" && PARTICIPANT_TRANSPORTS.has(value.transport) &&
+    Array.isArray(value.capabilities) && value.capabilities.every(capability => typeof capability === "string") &&
+    typeof value.startedAt === "number" && Number.isFinite(value.startedAt) &&
+    typeof value.updatedAt === "number" && Number.isFinite(value.updatedAt) && controlProtocolValid;
+}
+
 const participantOf = (key: string, value: unknown): FabricParticipantRecord | undefined => {
-  if (!isObject(value) || value.format !== 1 || typeof value.id !== "string") return undefined;
-  if (key !== keyFor(PARTICIPANT_PREFIX, value.id) || typeof value.ownerHostId !== "string") return undefined;
-  if (typeof value.ownerIdentityId !== "string" || typeof value.rootId !== "string") return undefined;
-  return value as unknown as FabricParticipantRecord;
+  if (!isAdmissibleRecord("participant", value)) return undefined;
+  const participant = value as FabricParticipantRecord;
+  if (key !== keyFor(PARTICIPANT_PREFIX, participant.id)) return undefined;
+  return participant;
 };
 
 const droppedPresenceOf = (type: BridgeDroppedPresence["type"], value: unknown, protect = true): BridgeDroppedPresence | undefined => {
@@ -909,7 +931,7 @@ export class StoreBridgeSide implements BridgeSide {
       for (const id of [host.id, host.identity.id, host.rootId]) reserve(entry.value, id);
       if (mark !== undefined) continue;
       if (entry.updatedBy.id !== host.identity.id) { rawDroppedCount += 1; continue; }
-      if (!finiteHostTimestamps(host)) {
+      if (!isAdmissibleRecord("host", host)) {
         rawDroppedCount += 1;
         // Do not let effective file liveness normalize a bad native/bootstrap record into
         // renewable authority, or silently omit it and erase the peer's retained fence.
@@ -1412,7 +1434,7 @@ export class StoreBridgeSide implements BridgeSide {
           // Runs before recovery, planning, participant writes and omission deletion in BOTH
           // directions (remote presence replies are raw JSON, not parsed by presenceArg).
           // Missing observedAt alone is the legacy unsampled protocol, not a malformed sample.
-          if (remoteHostOf(record) === undefined && (!finiteHostTimestamps(record) || !Number.isFinite(expiresAt) ||
+          if (remoteHostOf(record) === undefined && (!isAdmissibleRecord("host", record) || !Number.isFinite(expiresAt) ||
             (sourceObservedAt !== undefined && !Number.isFinite(sourceObservedAt)))) skippedRoots.add(record.rootId);
         }
         for (const [rootId, count] of rootCounts) if (count > 1) skippedRoots.add(rootId);
@@ -2030,7 +2052,7 @@ const presenceArg = (args: unknown, hub: string): BridgeMirrorPresence => {
   const owners = new Map(hosts.map(({ record }) => [record.id, record]));
   const malformedHosts = hosts.filter(({ record, expiresAt, observedAt }) => {
     const relayed = record.bridgeVia === hub && record.remoteHost !== undefined && record.remoteHost !== hub;
-    return !finiteHostTimestamps(record) || !Number.isFinite(expiresAt) ||
+    return !isAdmissibleRecord("host", record) || !Number.isFinite(expiresAt) ||
       (observedAt !== undefined && !Number.isFinite(observedAt)) || record.identity.id !== record.id ||
       record.rootId !== record.id || (!relayed && record.bridgeVia !== undefined) || !CANONICAL_ID.test(record.id);
   }).length;
@@ -2372,8 +2394,8 @@ const remoteAddresses = (presence: Pick<BridgePresence, "hosts" | "participants"
 const addresses = (presence: Pick<BridgePresence, "hosts" | "participants">): Set<string> => {
   // Malformed native samples travel only to preserve a receiver's existing root. They
   // must not become new hub routing authority merely by remaining in the snapshot.
-  const hosts = presence.hosts.filter(({ record }) => finiteHostTimestamps(record));
-  const malformedOwners = new Set(presence.hosts.filter(({ record }) => !finiteHostTimestamps(record)).map(({ record }) => record.id));
+  const hosts = presence.hosts.filter(({ record }) => isAdmissibleRecord("host", record));
+  const malformedOwners = new Set(presence.hosts.filter(({ record }) => !isAdmissibleRecord("host", record)).map(({ record }) => record.id));
   // Trusted adapters can supply participant-only addresses without any host sample.
   const participants = presence.participants.filter(participant => !malformedOwners.has(participant.ownerHostId));
   const names = remoteAddresses({ hosts, participants });
@@ -2432,7 +2454,7 @@ export const admitPresence = (
     const expiresAt = typeof value.expiresAt === "number" ? value.expiresAt : NaN;
     const hasObservedAt = Object.hasOwn(value, "observedAt");
     const observedAt = typeof value.observedAt === "number" ? value.observedAt : hasObservedAt ? NaN : undefined;
-    const malformed = !finiteHostTimestamps(record) || !Number.isFinite(expiresAt) ||
+    const malformed = !isAdmissibleRecord("host", record) || !Number.isFinite(expiresAt) ||
       (observedAt !== undefined && !Number.isFinite(observedAt)) || record.identity.id !== record.id ||
       record.rootId !== record.id || record.bridgeVia !== undefined || !CANONICAL_ID.test(record.id);
     const reservedConflict = [record.id, record.identity.id, record.rootId].some(id => reserved.has(id));

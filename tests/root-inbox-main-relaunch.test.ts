@@ -245,7 +245,7 @@ describe("RootInbox after a Main session relaunch", () => {
     } finally { reloaded.closeFollowUpDrain(); }
   });
 
-  it("coalesces source receipts through journal reload and suppresses only linked same-sender shadows", async () => {
+  it("retains every source receipt through journal reload and suppresses only linked same-sender shadows", async () => {
     const { root, main, sender, inbox, work } = setup();
     const topic = "fleet.work.pi-fabric.coalesced-receipts";
     const sources = [
@@ -281,7 +281,9 @@ describe("RootInbox after a Main session relaunch", () => {
       reloaded.attachFollowUpDrain(context, 0, journal);
       expect(sent).toHaveLength(1);
       carrier = sent[0]!;
-      expect(carrier.details.inboxEventId).toBe(sources[1]!.id);
+      const items = carrier.details.items as Array<{ inboxEventId: string; from: MeshIdentity }>;
+      expect(items.map(item => item.inboxEventId)).toEqual(sources.map(event => event.id));
+      expect(items.map(item => item.from)).toEqual(sources.map(event => event.from));
     } finally { reloaded.closeFollowUpDrain(); }
 
     const confirmed = confirmedSession(root, main.sessionId!, [asSessionEntry(carrier!)]);
@@ -300,7 +302,7 @@ describe("RootInbox after a Main session relaunch", () => {
     expect(carrier!.details.receipts).toEqual([...new Set(sources.flatMap(eventReceipts))]);
   });
 
-  it("refuses an over-budget coalesced receipt merge without consuming or replacing the survivor", async () => {
+  it("refuses an over-budget same-key receipt append without consuming or replacing the survivor", async () => {
     const { root, main, sender } = setup();
     const pi = { on: () => () => {}, sendMessage: () => {} } as unknown as ExtensionAPI;
     const context = {

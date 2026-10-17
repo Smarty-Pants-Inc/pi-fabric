@@ -254,11 +254,21 @@ describe("Fabric runtime provider components", () => {
         cwd, signal: undefined, parentToolCallId: "jev-reload-test", nestedToolCallId: "jev-reload-test",
         extensionContext: context, update() {}, approve: async () => {}, audits: [], maxResultChars: 32_768,
       };
+      const taskDescriptions: string[] = [];
       for (const ref of ["tasks.wait", "tasks.watch"]) {
-        expect(await runtime.registry.describe(ref, invocation)).toMatchObject({ ref, risk: "read" });
+        const action = await runtime.registry.describe(ref, invocation);
+        expect(action).toMatchObject({ ref, risk: "read" });
+        taskDescriptions.push(action.description);
       }
-      expect(runtime.modelGuidance()).toContainEqual(expect.objectContaining({
-        label: "jev-programs", content: expect.stringContaining("tasks.wait/watch"),
+      expect(taskDescriptions).toEqual([
+        expect.stringContaining("Wait without polling"),
+        expect.stringContaining("Wait without polling"),
+      ]);
+      const jevRun = await runtime.registry.describe("jev.run", invocation);
+      expect(jevRun.description).toContain("tasks.wait/watch");
+      expect(jevRun.description).toContain("maxEvaluations:0 disables program inference");
+      expect(runtime.modelGuidance()).not.toContainEqual(expect.objectContaining({
+        label: "jev-programs",
       }));
       const cacheProbe = await runtime.execution.execute({
         code: `const observation = await cache.status();

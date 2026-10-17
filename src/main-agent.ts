@@ -273,12 +273,6 @@ const serializableData = (value: unknown): unknown => {
   }
 };
 
-/** A followUp's `data.coalesceKey`: a non-empty string of at most 200 characters, or none. */
-export const followUpCoalesceKey = (data: unknown): string | undefined => {
-  const key = (data as { coalesceKey?: unknown } | null | undefined)?.coalesceKey;
-  return typeof key === "string" && key.length > 0 && key.length <= 200 ? key : undefined;
-};
-
 const mainWakeCause = (
   sender: MeshIdentity, source: FabricMainAgentDeliveryRequest["source"], delivery: FabricMainAgentDelivery,
   topic?: string, key?: string,
@@ -315,18 +309,14 @@ export interface HeldAgentMessage {
   /** A multi-source or differently classified producer has no reconstructable single envelope. */
   unattributedOnReplay?: true;
   message: string;
-  /** The first send of a coalesced chain: it keeps the queue position and the flush wait. */
+  /** Original arrival time, which keeps the queue position and the flush wait. */
   sentAt: number;
-  /** When the newest replacement arrived (smarty-dev#1495). */
-  replacedAt?: number;
   /**
    * A replacement's chain: the first id, and its place in the chain. Only a held item is
    * replaced, so a handed or delivered member is its chain's last; the others never go.
    */
   chain?: string;
   generation?: number;
-  /** The held id this one replaced. */
-  replaces?: string;
   data?: unknown;
   /** The sender's stable delivery id (FabricMainAgentDeliveryRequest.deliveryId). */
   deliveryId?: string;
@@ -361,7 +351,7 @@ type BoundaryEvent = { context?: { pendingMessages?: readonly unknown[] } };
 
 /** One item's envelope as Main reads it. Throws on an item it cannot render. */
 const agentMessageBlock = (item: HeldAgentMessage, delivery: FabricMainAgentDelivery): string => [
-  `<fabric-agent-message from_name="${escapeXmlAttribute(item.from.name)}" from_id="${escapeXmlAttribute(item.from.id)}" from_kind="${escapeXmlAttribute(item.from.kind)}" delivery="${escapeXmlAttribute(delivery)}" sent_at="${escapeXmlAttribute(new Date(item.sentAt).toISOString())}"${item.replacedAt === undefined ? "" : ` replaced_at="${escapeXmlAttribute(new Date(item.replacedAt).toISOString())}"`}>`,
+  `<fabric-agent-message from_name="${escapeXmlAttribute(item.from.name)}" from_id="${escapeXmlAttribute(item.from.id)}" from_kind="${escapeXmlAttribute(item.from.kind)}" delivery="${escapeXmlAttribute(delivery)}" sent_at="${escapeXmlAttribute(new Date(item.sentAt).toISOString())}">`,
   escapeXmlText(item.message),
   item.data === undefined ? undefined : `<data>${escapeXmlText(JSON.stringify(item.data))}</data>`,
   "</fabric-agent-message>",
@@ -823,64 +813,21 @@ export class MainAgentController implements FabricMainAgentTarget {
         reason: abort ? "interrupt pending settlement" : "interrupt already used this turn; ordinary steer" };
     }
     let triggered: boolean | undefined = false;
-    let replaced: HeldAgentMessage | undefined;
     // Pi releases its own followUp queue only when Main has no more work, so a Main that
     // chains turns reads it an hour late (smarty-dev#1495). Fabric holds a triggering
     // followUp for a busy Main instead: turn_end flushes the due ones as one steer, and
     // agent_settled releases the rest as a followUp. A non-triggering one never waited.
     const held = providerHeld || (request.delivery === "followUp" && triggerTurn && this.#drainActive());
     if (held) {
-      // smarty-dev#1495: replace a held same-sender/key followUp in place with the newest.
-      // Reload can also hold direct deliveries: never consume one with a different mode or
-      // trigger policy (pi-fabric#184 R1). Ordinary held followUps mean followUp/true.
-      const key = followUpCoalesceKey(item.data);
-      const index = key === undefined ? -1 : this.#held.findIndex((held) =>
-        held.from.id === item.from.id && held.from.kind === item.from.kind && followUpCoalesceKey(held.data) === key &&
-        (held.deliverAs ?? "followUp") === request.delivery && (held.triggerTurn ?? true) === triggerTurn);
-      replaced = index < 0 ? undefined : this.#held[index];
-      if (replaced) {
-        // A compatible journalled replay still goes at its original boundary and policy.
-        if (replaced.deliverAs !== undefined) {
-          item.deliverAs = replaced.deliverAs;
-          item.triggerTurn = replaced.triggerTurn ?? true;
-        }
-        item.sentAt = replaced.sentAt;
-        item.replacedAt = Date.now();
-        item.chain = replaced.chain ?? replaced.id;
-        item.generation = (replaced.generation ?? 0) + 1;
-        item.replaces = replaced.id;
-        // smarty-dev#2339 F2: a failed mesh delete can outlive the last 2000 consumed ids.
-        // The replacement journals every superseded delivery id until the carrier is consumed.
-        item.supersedes = [...(replaced.supersedes ?? []), ...(replaced.deliveryId === undefined ? [] : [replaced.deliveryId])];
-        item.supersededSends = [...(replaced.supersededSends ?? []), ...(replaced.outcomeSend ? [replaced.outcomeSend] : [])];
-        // Preserve every superseded source receipt. Admission charges the merged metadata
-        // before replacing or consuming the held item; refuse over-budget merges, never truncate.
-        if (replaced.inboxReceipts?.length) {
-          item.inboxReceipts = [...new Set([...replaced.inboxReceipts, ...(item.inboxReceipts ?? [])])];
-        }
-      }
-      // Charge the proposed ancestry before mutating or acknowledging either carrier.
-      this.#admit(item, replaced);
-      if (replaced) this.#held[index] = item;
-      else this.#held.push(item);
-      // The replaced id is recorded as consumed in the same save, before the return: its sender's
-      // record, if kept, is then refused after a restart (Astra round 3 finding 4, pi-fabric#160).
-      const consumed = replaced ? new Set(this.#consumed) : this.#consumed;
-      const consumedDirty = this.#consumedDirty;
-      if (replaced) this.#consume(replaced);
+      // Keep every original in arrival order; coalesceKey is ordinary payload data.
+      this.#admit(item);
+      this.#held.push(item);
       try {
         this.#save();                                   // journalled before it is acknowledged
       } catch (error) {
-        if (replaced) this.#held[index] = replaced;
-        else this.#held.pop();
-        this.#consumed = consumed;
-        this.#consumedDirty = consumedDirty;
-        // The consumed file may already hold the replaced chain, which the journal still lists.
-        if (replaced) { this.#consumedDirty = true; this.#trySave(); }
+        this.#held.pop();
         throw new Error(`Main could not record the followUp: ${error instanceof Error ? error.message : String(error)}`);
       }
-      this.#recordSuperseded(item);
-      this.#trySave();
       if (providerHeld) {
         this.#scheduleProviderWake();
         this.#armProviderDeadTimer();                   // a new delivery is an edge too; no-op unless pending
@@ -922,7 +869,6 @@ export class MainAgentController implements FabricMainAgentTarget {
       ...(triggered === undefined ? {} : { triggered }),
       ...(operatorHalted ? { halted: true as const, reason: "operator-halt" } :
         providerHeld ? { reason: this.#providerHoldReason() } : {}),
-      ...(replaced ? { coalesced: true as const, replacedMessageId: replaced.id } : {}),
       // Only a followUp that waits in the held queue can be stalled; a non-triggering one went
       // straight to Pi (#123 review F1).
       ...(held ? this.#depthReport(item.from.id) : this.queueDepth(item.from.id)),
@@ -977,11 +923,11 @@ export class MainAgentController implements FabricMainAgentTarget {
     return stalled ? { ...depth, stalled: true } : depth;
   }
 
-  /** Quotas for a new held item; one that replaces a held item frees that item's share first. */
-  #admit(item: HeldAgentMessage, replacing?: HeldAgentMessage): void {
+  /** Quotas for each original held item, including legacy ancestry on replayed carriers. */
+  #admit(item: HeldAgentMessage): void {
     const limits = FOLLOW_UP_LIMITS;
     const bytes = itemBytes(item);
-    const held = replacing ? this.#held.filter((other) => other !== replacing) : this.#held;
+    const held = this.#held;
     const mine = held.filter((other) => other.from.id === item.from.id);
     const mineBytes = mine.reduce((sum, other) => sum + itemBytes(other), 0);
     const totalBytes = held.reduce((sum, other) => sum + itemBytes(other), 0);
@@ -2291,8 +2237,7 @@ export class MainAgentController implements FabricMainAgentTarget {
         from: item.from,
         delivery,
         sentAt: new Date(item.sentAt).toISOString(),
-        ...(item.replacedAt === undefined ? {} : { replacedAt: new Date(item.replacedAt).toISOString() }),
-        ...(item.chain === undefined ? {} : { chain: item.chain, generation: item.generation, replaces: item.replaces }),
+        ...(item.chain === undefined ? {} : { chain: item.chain, generation: item.generation }),
         ...(data === undefined ? {} : { data }),
         ...(item.deliveryId === undefined ? {} : { deliveryId: item.deliveryId }),
         ...(item.inboxEventId === undefined ? {} : { inboxEventId: item.inboxEventId }),

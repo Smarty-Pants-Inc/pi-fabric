@@ -14,6 +14,8 @@ import {
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { FOLLOW_UP_LIMITS, MainAgentController } from "../src/main-agent.js";
+import * as deliveryOutcomes from "../src/mesh/delivery-outcomes.js";
+import * as atomicWrite from "../src/core/atomic-write.js";
 
 // Review round 2 on pi-fabric#160 (finding 1, security S1): Pi's sendMessage returns void and may
 // only queue the message (streaming, prompt preflight, a settle), or fail asynchronously. A
@@ -165,18 +167,55 @@ describe("Main delivery outcome evidence", () => {
     expect(outcomes(journal)).toEqual([{ ...send, outcome: "delivered", reason: haltedReason, at: expect.any(Number) }]);
     main.closeFollowUpDrain();
   });
-  it("records replaced sends as superseded, not delivered via their carrier", () => {
+  it("records every same-key original as delivered only after its own consumption", () => {
     const journal = journalPath(); const h = fakePi(); const entries: unknown[] = []; const context = busy(entries);
     const main = new MainAgentController(h.pi, "session:root", true, "/tmp/project", "root");
     main.attachFollowUpDrain(context, 60_000, journal);
     for (const eventId of ["old", "new"]) main.deliverAgent({ from: actor, message: eventId, delivery: "followUp", data: { coalesceKey: "work" },
       outcomeSend: { eventId, to: main.id, from: actor.id, mode: "followUp" } });
-    expect(outcomes(journal).map(row => [row.eventId, row.outcome])).toEqual([["old", "superseded"]]);
+    expect(outcomes(journal)).toEqual([]);
     h.emit("agent_before_settle", { outcome: "completed" }, context);
     entries.push(persisted(h.sent[0]!));
     main.confirmInbox();
-    expect(outcomes(journal).map(row => [row.eventId, row.outcome])).toEqual([["old", "superseded"], ["new", "delivered"]]);
+    expect(h.sent[0]!.message.content.match(/\n(?:old|new)\n/g)).toEqual(["\nold\n", "\nnew\n"]);
+    expect(outcomes(journal).map(row => [row.eventId, row.outcome])).toEqual([["old", "delivered"], ["new", "delivered"]]);
     main.closeFollowUpDrain();
+  });
+  it("persists partial legacy superseded-outcome progress and recovers on MAIN without replaying its consumed carrier", () => {
+    const journal = journalPath(); const h = fakePi(); const entries: unknown[] = []; const context = busy(entries);
+    const main = new MainAgentController(h.pi, "session:root", true, "/tmp/project", "root");
+    const send = (eventId: string) => ({ eventId, to: main.id, from: actor.id, mode: "followUp" });
+    fs.mkdirSync(path.dirname(journal), { recursive: true });
+    fs.writeFileSync(journal, JSON.stringify({ version: 1, items: [{ id: "legacy-carrier", from: actor,
+      message: "new", sentAt: Date.now(), outcomeSend: send("new"), supersededSends: [send("old-1"), send("old-2")] }] }));
+    const original = deliveryOutcomes.appendDeliveryOutcome;
+    let fail = true;
+    const append = vi.spyOn(deliveryOutcomes, "appendDeliveryOutcome").mockImplementation((...args) => {
+      if (fail && args[1].eventId === "old-2") throw new Error("outcome unavailable");
+      return original(...args);
+    });
+    try {
+      main.attachFollowUpDrain(context, 60_000, journal);
+      expect(JSON.parse(fs.readFileSync(journal, "utf8")).items[0].supersededSends.map((item: { eventId: string }) => item.eventId)).toEqual(["old-2"]);
+      h.emit("agent_before_settle", { outcome: "completed" }, context);
+      entries.push(persisted(h.sent[0]!));
+      main.confirmInbox();
+      // MAIN retains the consumed payload while an outcome append is pending; no O1 retry engine.
+      expect(JSON.parse(fs.readFileSync(journal, "utf8")).items[0].supersededSends.map((item: { eventId: string }) => item.eventId)).toEqual(["old-2"]);
+      expect(outcomes(journal).map(row => [row.eventId, row.outcome])).toEqual([["old-1", "superseded"]]);
+      main.closeFollowUpDrain();
+      fail = false;
+      const next = fakePi();
+      const restarted = new MainAgentController(next.pi, "session:root", true, "/tmp/project", "root");
+      try {
+        restarted.attachFollowUpDrain(context, 60_000, journal);
+        expect(next.sent).toHaveLength(0);
+        expect(fs.existsSync(journal)).toBe(false);
+        expect(outcomes(journal).map(row => [row.eventId, row.outcome])).toEqual([
+          ["old-1", "superseded"], ["old-2", "superseded"], ["new", "delivered"],
+        ]);
+      } finally { restarted.closeFollowUpDrain(); }
+    } finally { append.mockRestore(); main.closeFollowUpDrain(); }
   });
 });
 
@@ -312,29 +351,94 @@ describe("Main admits a delivery id durably, once", () => {
     });
   }
 
-  // Astra round 3 finding 4 on pi-fabric#160: a replaced id is durably consumed before the return.
+  // A failed mesh delete must not duplicate any separately retained same-key original.
   const coalesced = (deliveryId: string, message: string) =>
     ({ from: actor, message, delivery: "followUp" as const, triggerTurn: true, data: { coalesceKey: "state" }, deliveryId });
-  it("refuses a replaced delivery id after an abrupt restart, and keeps its replacement", () => {
+  it("deduplicates both same-key delivery ids after abrupt restart and keeps both originals", () => {
     const journal = journalPath();
     const entries: unknown[] = [];
     const first = fakePi();
     const main = new MainAgentController(first.pi, "session:root", true, "/tmp/project", "root");
     main.attachFollowUpDrain(busy(entries), 60_000, journal);
     main.deliverAgent(coalesced("rec-A", "old state"));                        // A's mesh delete then fails
-    expect(main.deliverAgent(coalesced("rec-B", "new state"))).toMatchObject({ coalesced: true });
+    expect(main.deliverAgent(coalesced("rec-B", "new state"))).toMatchObject({ pendingFollowUps: 2 });
     // Killed: no boundary, no close. A new controller on the same journal; A's record is drained again.
     const second = fakePi();
     const restarted = new MainAgentController(second.pi, "session:root", true, "/tmp/project", "root");
     restarted.attachFollowUpDrain(busy(entries), 60_000, journal);
     expect(restarted.deliverAgent(coalesced("rec-A", "old state"))).toMatchObject({ duplicate: true });
-    expect(restarted.queueDepth()).toMatchObject({ pendingFollowUps: 1 });
+    expect(restarted.deliverAgent(coalesced("rec-B", "new state"))).toMatchObject({ duplicate: true });
+    expect(restarted.queueDepth()).toMatchObject({ pendingFollowUps: 2 });
     second.emit("agent_before_settle", boundary([]), busy(entries));
-    expect(second.sent.map((sent) => sent.message.details.deliveryId)).toEqual(["rec-B"]);
+    expect(second.sent.flatMap(sent => sent.message.details.items.map((item: { deliveryId: string }) => item.deliveryId))).toEqual(["rec-A", "rec-B"]);
+  });
+
+  it("KEEP: a pre-supersedes coalesced D1 tombstone prevents stale resident retry after native D2", () => {
+    // Data-safety boundary: 45f466fe..872978d86^ replaced same-sender/same-key D1 with D2,
+    // consumed D1 before ACK, then wrote only D2's deliveryId plus internal chain/replaces.
+    // See 872978d86^:src/main-agent.ts (#consume(replaced), #save, #send); its native
+    // details have no supersedes. The old residency/client.ts deletes only AFTER admission:
+    // a failed delete retains D1's source even after D2 is durably consumed in this session.
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-legacy-coalesced-"));
+    roots.push(root);
+    const manager = SessionManager.create(root, path.join(root, "sessions"));
+    const sessionId = manager.getSessionId();
+    const journal = path.join(root, "main-followups", `${sessionId}.json`);
+    const d1 = `resident:${sessionId}:source-D1`;
+    const d2 = `resident:${sessionId}:source-D2`;
+    const internalD1 = "167d261e-d4bc-4c98-829a-cae76d086462";
+    const internalD2 = "543fb841-107a-4de8-bc91-66849acdc520";
+    const sentAt = "2026-01-01T00:00:00.000Z";
+    const replacedAt = "2026-01-01T00:00:01.000Z";
+    const retainedSource = coalesced(d1, "D1 stale state");
+    const current = coalesced(d2, "D2 current state");
+    // Use the SDK's real native entry serializer, in the SAME session/journal namespace.
+    manager.appendMessage({ role: "user", content: "continue", timestamp: Date.parse(sentAt) });
+    manager.appendCustomMessageEntry("pi-fabric-agent-message", [
+      `<fabric-agent-message from_name="${actor.name}" from_id="${actor.id}" from_kind="${actor.kind}" delivery="followUp" sent_at="${sentAt}">`,
+      current.message,
+      `<data>${JSON.stringify(current.data)}</data>`,
+      "</fabric-agent-message>",
+    ].join("\n"), true, {
+      id: internalD2, from: actor, delivery: "followUp", sentAt, replacedAt,
+      chain: internalD1, generation: 1, replaces: internalD1,
+      data: current.data, deliveryId: d2, triggerTurn: true,
+    });
+    // Exact old consumed-index shape, including D1 (retired unsent) and D2 (consumed).
+    // Keep the real atomic writer and its durability barriers, not an fsync mock.
+    atomicWrite.writeFileAtomic(`${journal}.delivered`, JSON.stringify({ version: 1, ids: [d1, d2] }), { durable: true });
+    expect(fs.existsSync(journal)).toBe(false);
+    const nativeFile = manager.getSessionFile()!;
+    const nativeBytes = fs.readFileSync(nativeFile, "utf8");
+    const nativeEntries = manager.getEntries().filter(entry => entry.type === "custom_message" && entry.customType === "pi-fabric-agent-message");
+    expect(nativeEntries).toHaveLength(1);
+    expect(nativeBytes).toContain(`"deliveryId":"${d2}"`);
+    expect(nativeBytes).not.toContain(d1);
+    expect(nativeBytes).not.toContain("supersedes");
+    const h = fakePi();
+    const context = { ...busy(manager.getEntries(), true), sessionManager: manager } as unknown as ExtensionContext;
+    const main = new MainAgentController(h.pi, `session:${sessionId}`, true, root, sessionId);
+    try {
+      main.attachFollowUpDrain(context, 60_000, journal);
+      // Public retry of the retained source: ACK is passive, never a second admission.
+      for (let retry = 0; retry < 2; retry++) {
+        expect.soft(main.deliverAgent(retainedSource)).toMatchObject({ queued: true, duplicate: true, triggered: false });
+      }
+      h.emit("agent_before_settle", boundary([]), context);
+      main.confirmInbox();
+      // Inspect actual send contents too: the rejected J2 source sends stale D1 here.
+      expect.soft(h.sent.map(sent => sent.message.content)).toEqual([]);
+      expect.soft(h.sent.some(sent => sent.message.content.includes(retainedSource.message))).toBe(false);
+      expect.soft(nativeEntries.length + h.sent.length).toBe(1);
+      expect.soft(main.queueDepth().pendingFollowUps).toBe(0);
+      expect(fs.readFileSync(nativeFile, "utf8")).toBe(nativeBytes); // native D2 untouched
+      expect(manager.getEntries().filter(entry => entry.type === "custom_message")).toEqual(nativeEntries);
+      expect(fs.existsSync(journal)).toBe(false);
+    } finally { main.closeFollowUpDrain(); }
   });
 
   // smarty-dev#2339 F2: a failed mesh delete can outlive the bounded consumed-id history.
-  it.each([2, 3])("keeps a %i-member replacement chain across tombstone eviction and restart", (length) => {
+  it.each([2, 3])("keeps a legacy %i-member replacement chain across tombstone eviction and restart", (length) => {
     // Barrier order and failures are covered by tests/atomic-write-durable.test.ts and the barrier regressions.
     const synced = vi.spyOn(fs, "fsyncSync").mockImplementation(() => {});
     try {
@@ -342,9 +446,13 @@ describe("Main admits a delivery id durably, once", () => {
       const entries: unknown[] = [];
       const first = fakePi();
       const main = new MainAgentController(first.pi, "session:root", true, "/tmp/project", "root");
-      main.attachFollowUpDrain(busy(entries), 1_000_000_000, journal);
       const chain = ["rec-A", "rec-B", "rec-C"].slice(0, length);
-      for (const id of chain) main.deliverAgent(coalesced(id, `state ${id}`));
+      fs.mkdirSync(path.dirname(journal), { recursive: true });
+      fs.writeFileSync(journal, JSON.stringify({ version: 1, items: chain.map((deliveryId, generation) => ({
+        id: `legacy-${deliveryId}`, from: actor, message: `state ${deliveryId}`, sentAt: Date.now(),
+        deliveryId, chain: "legacy-rec-A", generation, supersedes: chain.slice(0, generation),
+      })) }));
+      main.attachFollowUpDrain(busy(entries), 1_000_000_000, journal);
       // Retain A's mesh record; confirm enough unrelated messages to evict all replaced ids.
       for (let index = 0; index <= 2000; index++) {
         main.deliverAgent({ from: actor, message: `m${index}`, delivery: "steer", deliveryId: `other-${index}` });
@@ -388,7 +496,7 @@ describe("Main admits a delivery id durably, once", () => {
     } finally { synced.mockRestore(); }
   });
 
-  it("#169 round 1 bounds a 5000-replacement burst without losing F2 tombstones across restart and release reload", { timeout: 30_000 }, async () => {
+  it("#169 bounds a 5000-message same-key burst without losing originals across restart and release reload", { timeout: 30_000 }, async () => {
     // Barrier order and failures are covered by tests/atomic-write-durable.test.ts and the barrier regressions.
     const synced = vi.spyOn(fs, "fsyncSync").mockImplementation(() => {});
     try {
@@ -407,16 +515,18 @@ describe("Main admits a delivery id durably, once", () => {
           refused++;
           const saved = fs.readFileSync(journal, "utf8");
           if (!beforeRefusal) beforeRefusal = saved;
-          expect(saved).toBe(beforeRefusal); // Refusal never truncates or replaces the prior carrier.
+          expect(saved).toBe(beforeRefusal); // Refusal never truncates or replaces prior originals.
         }
       }
       expect(refused).toBeGreaterThan(0);
-      expect(accepted).toBeLessThanOrEqual(FOLLOW_UP_LIMITS.ancestryIds + 1);
+      expect(accepted).toBe(FOLLOW_UP_LIMITS.senderItems);
       const saved = JSON.parse(fs.readFileSync(journal, "utf8"));
-      expect(saved.items).toHaveLength(1);
-      expect(saved.items[0].supersedes).toHaveLength(accepted - 1);
+      expect(saved.items).toHaveLength(accepted);
+      const originalIds = Array.from({ length: accepted }, (_, index) => `burst-${index}`);
+      expect(saved.items.map((item: { deliveryId: string }) => item.deliveryId)).toEqual(originalIds);
+      expect(saved.items.every((item: { supersedes?: string[] }) => item.supersedes === undefined)).toBe(true);
       expect(Buffer.byteLength(JSON.stringify(saved))).toBeLessThan(FOLLOW_UP_LIMITS.senderBytes);
-      // Evict A from the bounded sidecar while its source may still be redrained.
+      // Unrelated consumed ids cannot hide any pending original from duplicate detection.
       for (let index = 0; index <= 2000; index++) {
         main.deliverAgent({ from: actor, message: "unrelated", delivery: "steer", deliveryId: `unrelated-${index}` });
         entries.push(persisted(first.sent.at(-1)!));
@@ -437,8 +547,7 @@ describe("Main admits a delivery id durably, once", () => {
       expect(reloaded.deliverAgent(coalesced("burst-0", "stale"))).toMatchObject({ duplicate: true });
       third.emit("agent_before_settle", boundary([]), busy(entries));
       expect(third.sent).toHaveLength(1);
-      expect(third.sent[0]!.message.details.deliveryId).toBe(`burst-${accepted - 1}`);
-      expect(third.sent[0]!.message.details.supersedes).toHaveLength(accepted - 1);
+      expect(third.sent[0]!.message.details.items.map((item: { deliveryId: string }) => item.deliveryId)).toEqual(originalIds);
       entries.push(persisted(third.sent[0]!));
       third.emit("agent_settled", { outcome: "completed" }, busy(entries, true));
       fs.rmSync(`${journal}.delivered`);
@@ -446,18 +555,18 @@ describe("Main admits a delivery id durably, once", () => {
       const fourth = fakePi();
       const receiptRestart = new Reloaded(fourth.pi, "session:root", true, "/tmp/project", "root");
       receiptRestart.attachFollowUpDrain(busy(entries), 1_000_000_000, journal);
-      expect(receiptRestart.deliverAgent(coalesced("burst-0", "stale"))).toMatchObject({ duplicate: true });
+      for (const id of originalIds) expect(receiptRestart.deliverAgent(coalesced(id, "stale"))).toMatchObject({ duplicate: true });
       expect(fourth.sent).toHaveLength(0);
     } finally { synced.mockRestore(); }
   });
 
-  it.each(["sender", "total"] as const)("#169 round 1 charges ancestry bytes to the %s quota before admission", (quota) => {
+  it.each(["sender", "total"] as const)("#169 charges all original delivery-id bytes to the %s quota before admission", (quota) => {
     const journal = journalPath();
     const first = fakePi();
     const main = new MainAgentController(first.pi, "session:root", true, "/tmp/project", "root");
     main.attachFollowUpDrain(busy([]), 1_000_000_000, journal);
     const request = (sender: string, id: string) => ({ ...coalesced(id, "tiny"), from: { ...actor, id: sender } });
-    // Each carrier holds ~240 KiB of delivery-id ancestry, still fewer than 1024 ids.
+    // Each sender holds ~240 KiB across thirteen original delivery ids.
     for (let sender = 0; sender < (quota === "total" ? 4 : 1); sender++) {
       for (let generation = 0; generation <= 12; generation++) {
         main.deliverAgent(request(`sender-${sender}`, `${sender}:${generation}:` + "x".repeat(18_000)));
@@ -471,7 +580,7 @@ describe("Main admits a delivery id durably, once", () => {
     }
     expect(fs.readFileSync(journal, "utf8")).toBe(before);
   });
-  it("rolls a replacement back when its journal write fails, and the replaced id stays admissible", () => {
+  it("rolls a failed same-key append back without consuming the earlier original", () => {
     const journal = journalPath();
     const first = fakePi();
     const main = new MainAgentController(first.pi, "session:root", true, "/tmp/project", "root");
@@ -487,7 +596,7 @@ describe("Main admits a delivery id durably, once", () => {
     } finally {
       failing.mockRestore();
     }
-    expect(fs.readFileSync(`${journal}.delivered`, "utf8")).not.toContain("rec-A");
+    expect(fs.existsSync(`${journal}.delivered`)).toBe(false);
     const second = fakePi();
     const restarted = new MainAgentController(second.pi, "session:root", true, "/tmp/project", "root");
     restarted.attachFollowUpDrain(busy([]), 60_000, journal);

@@ -2,6 +2,7 @@ import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { hasUnresolvedWorker, markUnresolvedWorker } from "../src/storage/retention.js";
 import { beforeEach } from "vitest";
 import { installInProcessResidentFence } from "./helpers/in-process-resident-fence.js";
+import { failActorTreeRemoval } from "./helpers/actor-tree-removal.js";
 import { retainedProcessStates, retainedProcessWorker } from "./helpers/retained-process-worker.js";
 import fs from "node:fs";
 import { completionConsumed } from "../src/agents/completion-journal.js";
@@ -711,18 +712,14 @@ describe("#169 round 2 public cleanup outcome", () => {
       state.mainAgent, state.participants, undefined, lifecycle, undefined, caller === "main" ? mainClient : undefined);
     const context: FabricInvocationContext = { cwd: repo, signal: undefined, parentToolCallId: "test", nestedToolCallId: "remove",
       extensionContext: {} as FabricInvocationContext["extensionContext"], update() {}, activity() {} };
-    let failing: ReturnType<typeof vi.spyOn> | undefined;
+    let failing: { mockRestore(): void } | undefined;
     try {
       await waitFor(() => fs.existsSync(path.join(state.config.residencyRoot, "owner.json")));
       const client = caller === "main" ? mainClient : nestedClient;
       const actor = await client.createActor({ name: "public cleanup", instructions: "Work.", residency: "durable" });
       const dir = path.join(state.config.actorRoot, actor.id);
       const marker = path.join(state.config.actorRoot, `removal-${actor.id}.json`);
-      const rm = fs.rmSync.bind(fs);
-      failing = vi.spyOn(fs, "rmSync").mockImplementation((target, options) => {
-        if (target === dir) throw new Error("public cleanup unavailable");
-        return rm(target, options);
-      });
+      failing = failActorTreeRemoval(dir, () => { throw new Error("public cleanup unavailable"); });
       await expect(provider.invoke("remove", { id: actor.id }, context)).resolves.toMatchObject({
         removed: true, cleaned: false, pending: expect.stringContaining("cleanup failed"),
       });
@@ -771,7 +768,7 @@ describe("#169 round 1 resident cleanup routing", () => {
       await waitFor(() => fs.existsSync(responsePath));
       return JSON.parse(fs.readFileSync(responsePath, "utf8"));
     };
-    let failing: ReturnType<typeof vi.spyOn> | undefined;
+    let failing: { mockRestore(): void } | undefined;
     try {
       await waitFor(() => fs.existsSync(path.join(state.config.residencyRoot, "requests")));
       const created = await request({ operation: "createActor", request: { scope, name: "resident retry", instructions: "Work.", residency: "durable" } });
@@ -779,11 +776,7 @@ describe("#169 round 1 resident cleanup routing", () => {
       const actor = created.actor;
       const dir = path.join(scope === "project" ? state.config.actorRoot : state.config.sessionActorRoot!, actor.id);
       const marker = path.join(path.dirname(dir), `removal-${actor.id}.json`);
-      const rm = fs.rmSync.bind(fs);
-      failing = vi.spyOn(fs, "rmSync").mockImplementation((target, options) => {
-        if (target === dir) throw new Error("resident cleanup failure");
-        return rm(target, options);
-      });
+      failing = failActorTreeRemoval(dir, () => { throw new Error("resident cleanup failure"); });
       const first = await request({ operation: "removeActor", id: actor.id });
       expect(first).toMatchObject({ ok: true, pending: expect.stringContaining("cleanup failed") });
       expect(fs.existsSync(marker)).toBe(true);

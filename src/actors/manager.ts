@@ -3637,15 +3637,26 @@ export class ActorManager {
         await this.#beforeOperatorCleanup(rootId);
         operatorChecked = true;
       };
+      // smarty-dev#10074: the tree judged at the end of the final check (after its last awaited step) is the inode
+      // removed, through verifiedRemove (#7916): its parent is opened NOFOLLOW and the tree is removed
+      // directory-relative, so an ancestor swapped for a symlink after the check cannot redirect the delete outside
+      // the actor root. A refusal throws: this cleanup stays pending and a later remove or host start retries it.
+      let judged: fs.Stats | undefined;
       await deleteRootActorTree(this.mesh.root, rootId, async () => {
         await operatorCheck();
         await this.#bindings.delete(id);
+        // Lazy (startup graph, assert-build-artifacts): `judged` stays the final check's; a change since then refuses.
+        const { verifiedRemove } = await import("../storage/verified-remove.js");
         await operatorCheck();
-        fs.rmSync(cleanup.sessionDir, { recursive: true, force: true });
+        if (!judged) return; // already gone
+        const result = verifiedRemove(cleanup.sessionDir, judged, { deleter: "actor-tree",
+          fallback: () => { fs.rmSync(cleanup.sessionDir, { recursive: true, force: true }); return true; } });
+        if (!result.removed) throw new Error(`actor tree not removed: ${result.reason}`);
       }, async () => {
         revoked();
         if (this.#ceded.has(id) || this.#removalCleanup.get(id) !== cleanup) throw new Error("cleanup ownership changed");
         await operatorCheck();
+        judged = fs.lstatSync(cleanup.sessionDir, { throwIfNoEntry: false });
       });
       if (cleanup.presenceKey === this.#presenceKey(cleanup.id)) {
         await this.#writePresence(cleanup.id);

@@ -25,6 +25,7 @@ import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { actorParticipantRecord } from "../src/topology/records.js";
 import { writeParticipantFile } from "../src/topology/participant-files.js";
 import { LIVENESS_POLICY_KEY, writeHostLease } from "../src/topology/host-leases.js";
+import { failActorTreeRemoval } from "./helpers/actor-tree-removal.js";
 
 // smarty-dev#1031: Linux, Darwin and Windows support the Main publication fence (smarty-dev#8090;
 // follow-up smarty-dev#11335). Only unsupported platforms resolve pending with this refusal and keep the tree.
@@ -6363,7 +6364,6 @@ describe("ActorManager removal behind an in-flight run", () => {
     const presenceKey = `actors/test/${actor.id}`;
     const registryIds = () => (JSON.parse(fs.readFileSync(path.join(actorRoot, "actors.json"), "utf8")) as
       { actors: Array<{ id: string }> }).actors.map((entry) => entry.id);
-    const rm = fs.rmSync.bind(fs);
     const del = mesh.delete.bind(mesh);
     let failures = 0;
     const fail = () => {
@@ -6372,17 +6372,14 @@ describe("ActorManager removal behind an in-flight run", () => {
       throw new Error(`persistent ${failure} failure`);
     };
     const spy = failure === "directory"
-      ? vi.spyOn(fs, "rmSync").mockImplementation((target, options) => {
-          if (target === sessionDir) fail();
-          return rm(target, options);
-        })
+      ? failActorTreeRemoval(sessionDir, fail)
       : vi.spyOn(mesh, "delete").mockImplementation(async (input) => {
           if (input.key === presenceKey) fail();
           return del(input);
         });
     try {
       release();
-      await expect(waiting).resolves.toMatchObject({ removed: true, cleaned: false, pending: expect.stringContaining(failure === "directory" ? "persistent directory failure" : "presence deletion pending") });
+      await expect(waiting).resolves.toMatchObject({ removed: true, cleaned: false, pending: expect.stringContaining(failure === "directory" ? "actor tree not removed" : "presence deletion pending") });
       expect(failures).toBeGreaterThanOrEqual(6);              // persistent across the bounded retries
       expect(registryIds()).not.toContain(actor.id);
       const marker = path.join(actorRoot, `removal-${actor.id}.json`);
@@ -6627,11 +6624,7 @@ it("#169 round 3 answers owns() for a cleanup-only id on a cold manager", async 
   const { actors, root, agents, mesh, identity, meshConfig } = setup(true);
   const actor = await actors.create({ name: "cold", instructions: "Work." });
   await actors.stop(actor.id);
-  const rm = fs.rmSync.bind(fs);
-  const failing = vi.spyOn(fs, "rmSync").mockImplementation((target, options) => {
-    if (String(target) === path.join(root, "actors", actor.id)) throw new Error("directory busy");
-    return rm(target, options);
-  });
+  const failing = failActorTreeRemoval(path.join(root, "actors", actor.id), () => { throw new Error("directory busy"); });
   let result: { removed: boolean; cleaned?: boolean };
   try { result = await actors.remove(actor.id); } finally { failing.mockRestore(); }
   expect(result).toMatchObject({ removed: true, cleaned: false });
@@ -6866,11 +6859,7 @@ describe("#169 round 1 removal safety", () => {
     const actor = await actors.create({ name: "healthy", instructions: "Work." });
     const actorRoot = path.join(root, "actors");
     const dir = path.join(actorRoot, actor.id);
-    const rm = fs.rmSync.bind(fs);
-    const fail = vi.spyOn(fs, "rmSync").mockImplementation((target, options) => {
-      if (target === dir) throw new Error("cleanup storage unavailable");
-      return rm(target, options);
-    });
+    const fail = failActorTreeRemoval(dir, () => { throw new Error("cleanup storage unavailable"); });
     try { await actors.remove(actor.id); } finally { fail.mockRestore(); }
     await actors.close();
     const badId = "0".repeat(32);

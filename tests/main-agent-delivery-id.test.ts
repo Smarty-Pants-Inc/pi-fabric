@@ -89,6 +89,84 @@ describe("Main delivery outcome evidence", () => {
     expect(outcomes(journal)).toEqual([{ ...send, outcome: "delivered", reason: "consumed by Main as itself", at: expect.any(Number) }]);
     main.closeFollowUpDrain();
   });
+  const haltedReason = "delivered, not triggered: recipient is halted by its operator";
+  it.each(["immediate-halt", "held-then-halt", "triggered-then-halt"] as const)(
+    "retains per-message handoff evidence through delayed confirmation/reload (%s)", scenario => {
+      const journal = journalPath();
+      const h = fakePi(); const entries: unknown[] = [];
+      const context = busy(entries, scenario !== "held-then-halt");
+      const main = new MainAgentController(h.pi, "session:root", true, process.cwd(), "root");
+      main.attachFollowUpDrain(context, 60_000, journal);
+      if (scenario === "immediate-halt") main.halt();
+      const send = { eventId: scenario, to: main.id, from: actor.id, mode: "followUp" as const };
+      const receipt = main.deliverAgent({ from: actor, message: "handoff evidence", delivery: "followUp", outcomeSend: send });
+      if (scenario === "immediate-halt") expect(receipt).toMatchObject({ triggered: false, halted: true, reason: "operator-halt" });
+      if (scenario === "triggered-then-halt") expect(receipt.triggered).toBe(true);
+      main.halt();
+      if (scenario === "held-then-halt") h.emit("agent_settled", { outcome: "aborted" }, context);
+      expect(h.sent).toHaveLength(1);
+      const reason = scenario === "triggered-then-halt" ? "consumed by Main as itself" : haltedReason;
+      expect(h.sent[0]!.message.details.deliveryReason).toBe(scenario === "triggered-then-halt" ? undefined : "operator-halt");
+      // Pi has consumed it but confirmation is delayed until the new controller.
+      // The current owner halt must not relabel the earlier triggering handoff.
+      entries.push(persisted(h.sent[0]!));
+      expect(outcomes(journal)).toEqual([]);
+      main.closeFollowUpDrain();
+      const next = fakePi();
+      const reloaded = new MainAgentController(next.pi, "session:root", true, process.cwd(), "root");
+      reloaded.attachFollowUpDrain(busy(entries, true), 60_000, journal);
+      reloaded.confirmInbox();
+      expect(outcomes(journal)).toEqual([{ ...send, outcome: "delivered", reason, at: expect.any(Number) }]);
+      expect(next.sent).toHaveLength(0);
+      reloaded.closeFollowUpDrain();
+    },
+  );
+  it("persists an owner-halt downgrade when a held message is replayed before native receipt", () => {
+    const journal = journalPath(); const h = fakePi(); const entries: unknown[] = [];
+    const main = new MainAgentController(h.pi, "session:root", true, process.cwd(), "root");
+    const context = busy(entries);
+    main.attachFollowUpDrain(context, 60_000, journal);
+    const send = { eventId: "replayed-halt", to: main.id, from: actor.id, mode: "followUp" as const };
+    main.deliverAgent({ from: actor, message: "held then stopped", delivery: "followUp", outcomeSend: send });
+    main.halt();
+    main.closeFollowUpDrain();
+    const next = fakePi();
+    const replayed = new MainAgentController(next.pi, "session:root", true, process.cwd(), "root");
+    replayed.attachFollowUpDrain(busy(entries, true), 60_000, journal);
+    expect(next.sent[0]!.options.triggerTurn).toBe(false);
+    expect(JSON.parse(fs.readFileSync(journal, "utf8")).items[0].deliveryReason).toBe("operator-halt");
+    entries.push(persisted(next.sent[0]!));
+    replayed.confirmInbox();
+    expect(outcomes(journal)).toEqual([{ ...send, outcome: "delivered", reason: haltedReason, at: expect.any(Number) }]);
+    replayed.closeFollowUpDrain();
+  });
+  it("retries a failed handoff-evidence durability barrier before native send", () => {
+    const journal = journalPath(); const h = fakePi(); const entries: unknown[] = []; const context = busy(entries);
+    const main = new MainAgentController(h.pi, "session:root", true, process.cwd(), "root");
+    main.attachFollowUpDrain(context, 60_000, journal);
+    const send = { eventId: "barrier-retry", to: main.id, from: actor.id, mode: "followUp" as const };
+    main.deliverAgent({ from: actor, message: "do not lose the evidence", delivery: "followUp", outcomeSend: send });
+    main.halt();
+    const rename = fs.renameSync;
+    const fault = vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      if (String(to) === journal) throw new Error("handoff evidence unavailable");
+      return rename(from, to);
+    });
+    try {
+      for (let retry = 0; retry < 2; retry++) {
+        h.emit("agent_settled", { outcome: "aborted" }, context);
+        expect(h.sent).toHaveLength(0);
+        expect(main.queueDepth().pendingFollowUps).toBe(1);
+      }
+    } finally { fault.mockRestore(); }
+    h.emit("agent_settled", { outcome: "aborted" }, context);
+    expect(h.sent).toHaveLength(1);
+    expect(JSON.parse(fs.readFileSync(journal, "utf8")).items[0].deliveryReason).toBe("operator-halt");
+    entries.push(persisted(h.sent[0]!));
+    main.confirmInbox();
+    expect(outcomes(journal)).toEqual([{ ...send, outcome: "delivered", reason: haltedReason, at: expect.any(Number) }]);
+    main.closeFollowUpDrain();
+  });
   it("records every same-key original as delivered only after its own consumption", () => {
     const journal = journalPath(); const h = fakePi(); const entries: unknown[] = []; const context = busy(entries);
     const main = new MainAgentController(h.pi, "session:root", true, "/tmp/project", "root");

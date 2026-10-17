@@ -420,6 +420,8 @@ export class MeshStore {
   #scheduleCache:
     | { inode: number; size: number; modifiedAt: number; file: MeshScheduleFile; error?: string }
     | undefined;
+  /** Parsed wake routes are private to this store and revalidated under the publication lock. */
+  readonly #wakeRouteCache = new Map<string, unknown>();
   /** This store's census registration (directory identity), released once by closeState(). */
   #censusRecord: string | undefined;
 
@@ -438,7 +440,7 @@ export class MeshStore {
       if (!fs.existsSync(path.join(this.root, "residency"))) return;
       const subscriptions = event.topic === "fabric.participant.lifecycle"
         ? this.#state.listAll("topology/subscriptions/", { fresh: true }).map(entry => entry.value as WakeSubscription) : [];
-      indexResidentDeliveries(this.root, event, subscriptions);
+      indexResidentDeliveries(this.root, event, subscriptions, this.#wakeRouteCache);
     });
     this.#schedulesPath = path.join(root, "schedules.json");
     fs.mkdirSync(root, { recursive: true, mode: 0o700 });
@@ -474,6 +476,7 @@ export class MeshStore {
   /** Releases the state database handle (sqlite, shadow); the file backend holds none. */
   closeState(): void {
     closeResidentWakeRetryCursor(this.root);
+    this.#wakeRouteCache.clear();
     this.#state.close();
     // A closed sqlite backend cannot reopen and a closed shadow writes only through .lock: this
     // store no longer needs the record. Another open store of this process keeps it.

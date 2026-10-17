@@ -724,7 +724,7 @@ describe("Main reload sender admission (smarty-dev#2160 item 4)", () => {
     expect(f.sent.flatMap((item) => item.details.items ?? [item.details]).map((item) => item.id)).toEqual(expectedIds);
   });
 
-  it("a matching reload delivery policy coalesces without losing its explicit replay policy", async () => {
+  it("a matching reload delivery policy retains both originals without losing its explicit replay policy", async () => {
     const f = await fixture();
     const old = f.main();
     old.controller.prepareReload();
@@ -734,16 +734,19 @@ describe("Main reload sender admission (smarty-dev#2160 item 4)", () => {
     old.controller.closeFollowUpDrain();
     const fresh = f.main(false);
     const replacement = fresh.controller.deliverAgent({ ...request, message: "replacement", deliveryId: "matching-replacement" });
-    expect(replacement).toMatchObject({ coalesced: true, replacedMessageId: first.messageId });
+    expect(replacement.coalesced).toBeUndefined();
     fresh.emit("turn_end", { context: { pendingMessages: [] } });
     expect(f.sent).toHaveLength(1);
-    expect(f.sent[0]!.details.id).toBe(replacement.messageId);
+    expect(f.sent[0]!.details.id).toBe(first.messageId);
     expect(f.sent[0]!.options).toEqual({ deliverAs: "followUp", triggerTurn: true });
+    fresh.emit("agent_before_settle", { outcome: "completed", context: { pendingMessages: [] } });
+    expect(f.sent.map(item => item.details.id)).toEqual([first.messageId, replacement.messageId]);
+    expect(f.sent[1]!.options).toEqual({ deliverAs: "followUp", triggerTurn: true });
     expect(fresh.controller.deliverAgent(request)).toMatchObject({ duplicate: true });
     fresh.emit("turn_end", { context: { pendingMessages: [] } });
     fresh.controller.closeFollowUpDrain();
     f.main();
-    expect(f.sent).toHaveLength(1);
+    expect(f.sent).toHaveLength(2);
   });
 
   it("keeps a fixed reload expiry through heartbeats and keeps the Main discoverable as a peer", async () => {

@@ -15,8 +15,8 @@ import { Type } from "typebox";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FOLLOW_UP_LIMITS, MainAgentController } from "../src/main-agent.js";
 
-// smarty-dev#1495: a sender that notifies on each state change left ~26 stale wakes for one
-// busy Main. A held followUp with the same (sender id, data.coalesceKey) is replaced in place.
+// Held followUps preserve every original, even with the same sender and data.coalesceKey.
+// Keep FIFO, quota, restart and real-Pi delivery coverage at this data-safety boundary.
 type Handler = (event: unknown, ctx: ExtensionContext) => unknown;
 const fakePi = () => {
   const handlers = new Map<string, Handler[]>();
@@ -53,7 +53,7 @@ const journalPath = () => {
   return { dir, journal: path.join(dir, "main-followups", "root.json") };
 };
 
-describe("Main followUp coalescing (unit)", () => {
+describe("Main followUp retention (unit)", () => {
   beforeEach(() => { vi.useFakeTimers(); vi.setSystemTime(new Date("2026-09-28T06:00:00Z")); });
   afterEach(() => { vi.useRealTimers(); });
 
@@ -67,7 +67,7 @@ describe("Main followUp coalescing (unit)", () => {
   const wake = (head: string, key = "repo#7/state", sender = "factory") =>
     ({ from: from(sender), message: `head ${head}`, delivery: "followUp" as const, data: { coalesceKey: key, head } });
 
-  it("three same-key followUps while busy arrive as ONE, the newest, keeping the first one's place", () => {
+  it("three same-key followUps while busy retain their arrival order and individual flush waits", () => {
     const { main, sent, emit, ctx } = setup();
     main.deliverAgent({ from: from("other"), message: "before", delivery: "followUp" });
     const first = main.deliverAgent(wake("h1"));
@@ -76,19 +76,20 @@ describe("Main followUp coalescing (unit)", () => {
     const second = main.deliverAgent(wake("h2"));
     const third = main.deliverAgent(wake("h3"));
     expect(first.coalesced).toBeUndefined();
-    expect(second).toMatchObject({ queued: true, coalesced: true, replacedMessageId: first.messageId, pendingFollowUps: 1 });
-    expect(third).toMatchObject({ coalesced: true, replacedMessageId: second.messageId, pendingFollowUps: 1, oldestAgeS: 60 });
-    expect(main.queueDepth().pendingFollowUps).toBe(3);
-    vi.advanceTimersByTime(60_000);                      // the chain is due on the first one's wait
-    emit("turn_end", toolTurn, ctx);
-    expect(delivered(sent)).toEqual(["before", "head h3"]);   // "after" has waited 60 s only
+    expect(second).toMatchObject({ queued: true, pendingFollowUps: 2 });
+    expect(third).toMatchObject({ pendingFollowUps: 3, oldestAgeS: 60 });
+    expect([second.coalesced, third.coalesced, third.replacedMessageId]).toEqual([undefined, undefined, undefined]);
+    expect(main.queueDepth().pendingFollowUps).toBe(5);
     vi.advanceTimersByTime(60_000);
     emit("turn_end", toolTurn, ctx);
-    expect(delivered(sent)).toEqual(["before", "head h3", "after"]);
-    const item = sent[0]!.message.details.items[1];
-    expect(item).toMatchObject({ id: third.messageId, data: { head: "h3" }, chain: first.messageId, generation: 2, replaces: second.messageId });
-    expect(item.replacedAt).toBe("2026-09-28T06:01:00.000Z");
-    expect(sent[0]!.message.content).toContain('sent_at="2026-09-28T06:00:00.000Z" replaced_at="2026-09-28T06:01:00.000Z">\nhead h3');
+    expect(delivered(sent)).toEqual(["before", "head h1"]);   // later arrivals have waited 60 s only
+    vi.advanceTimersByTime(60_000);
+    emit("turn_end", toolTurn, ctx);
+    expect(delivered(sent)).toEqual(["before", "head h1", "after", "head h2", "head h3"]);
+    const items = sent.flatMap(entry => entry.message.details.items);
+    expect(items.filter(item => item.from.id === from("factory").id).map(item => item.id))
+      .toEqual([first.messageId, second.messageId, third.messageId]);
+    expect(items.every(item => item.chain === undefined && item.replaces === undefined && item.replacedAt === undefined)).toBe(true);
   });
 
   it("different keys, different senders with the same key, and no key are all delivered", () => {
@@ -116,10 +117,10 @@ describe("Main followUp coalescing (unit)", () => {
     ]);
   });
 
-  it("a 200-character key coalesces", () => {
+  it("a 200-character key also retains both originals", () => {
     const { main } = setup();
     main.deliverAgent(wake("a", "k".repeat(200)));
-    expect(main.deliverAgent(wake("b", "k".repeat(200))).coalesced).toBe(true);
+    expect(main.deliverAgent(wake("b", "k".repeat(200)))).toMatchObject({ pendingFollowUps: 2 });
   });
 
   it("never replaces a followUp already handed to Main: the next one with that key is new", () => {
@@ -134,36 +135,36 @@ describe("Main followUp coalescing (unit)", () => {
     expect(sent.map((entry) => entry.message.details.id)).toEqual([first.messageId, second.messageId]);
   });
 
-  it("a replacement does not count twice against the quotas", () => {
+  it("every same-key original counts against the unchanged item and byte quotas", () => {
     const { main } = setup();
     for (let index = 0; index < FOLLOW_UP_LIMITS.senderItems; index++) main.deliverAgent(wake(`h${index}`, `k${index}`));
-    // Full for new items, but a replacement takes the replaced item's slot.
     expect(() => main.deliverAgent(wake("new", "k-new"))).toThrow(/per sender/);
-    for (let round = 0; round < 3; round++) expect(main.deliverAgent(wake(`again${round}`, "k0")).coalesced).toBe(true);
+    for (let round = 0; round < 3; round++) expect(() => main.deliverAgent(wake(`again${round}`, "k0"))).toThrow(/per sender/);
     const bytes = setup();
     const big = "x".repeat(100 * 1024);
     bytes.main.deliverAgent({ ...wake("a", "big"), message: big });
     bytes.main.deliverAgent({ ...wake("b", "other"), message: big });
-    expect(bytes.main.deliverAgent({ ...wake("c", "big"), message: big }).coalesced).toBe(true);
+    expect(() => bytes.main.deliverAgent({ ...wake("c", "big"), message: big })).toThrow(/per sender/);
+    expect(bytes.main.queueDepth().pendingFollowUps).toBe(2);
   });
 
-  it("rewrites the journal for a replacement; a failed write keeps the replaced item", () => {
+  it("journals every original; a failed append keeps all earlier items", () => {
     const { journal } = journalPath();
     const { main } = setup(journal);
     const first = main.deliverAgent(wake("h1"));
     const second = main.deliverAgent(wake("h2"));
     const items = JSON.parse(fs.readFileSync(journal, "utf8")).items as Array<{ id: string; chain?: string; generation?: number }>;
-    expect(items.map((item) => item.id)).toEqual([second.messageId]);
-    expect(items[0]).toMatchObject({ chain: first.messageId, generation: 1, replaces: first.messageId });
+    expect(items.map((item) => item.id)).toEqual([first.messageId, second.messageId]);
+    expect(items.every(item => item.chain === undefined && item.generation === undefined)).toBe(true);
     fs.rmSync(journal);
     fs.mkdirSync(journal);                               // the next write cannot replace a directory
     expect(() => main.deliverAgent(wake("h3"))).toThrow(/could not record/);
-    expect(main.queueDepth().pendingFollowUps).toBe(1);
+    expect(main.queueDepth().pendingFollowUps).toBe(2);
     fs.rmSync(journal, { recursive: true });
-    expect(main.deliverAgent(wake("h4"))).toMatchObject({ coalesced: true, replacedMessageId: second.messageId });
+    expect(main.deliverAgent(wake("h4"))).toMatchObject({ pendingFollowUps: 3 });
   });
 
-  it("after a restart with a replaced entry in the journal, the newest is delivered exactly once, the superseded never", () => {
+  it("after a restart with a duplicate journal entry, every original is delivered exactly once", () => {
     const { dir, journal } = journalPath();
     const firstPi = fakePi();
     const main = new MainAgentController(firstPi.pi, "session:root", true, dir, "root");
@@ -172,7 +173,7 @@ describe("Main followUp coalescing (unit)", () => {
     const second = main.deliverAgent(wake("h2"));
     main.closeFollowUpDrain();                           // the process stops
     expect(firstPi.sent).toHaveLength(0);
-    // An older writer's journal could still list the superseded item: it must not come back.
+    // A duplicate journal copy must not cause a second delivery of the same original.
     const written = JSON.parse(fs.readFileSync(journal, "utf8"));
     written.items.unshift({ id: first.messageId, from: from("factory"), message: "head h1", sentAt: written.items[0].sentAt, data: { coalesceKey: "repo#7/state" } });
     fs.writeFileSync(journal, JSON.stringify(written));
@@ -184,8 +185,9 @@ describe("Main followUp coalescing (unit)", () => {
       return { next, controller };
     };
     const again = restart();
-    expect(again.next.sent.map((entry) => entry.message.details.id)).toEqual([second.messageId]);
-    expect(delivered(again.next.sent)).toEqual(["head h2"]);
+    expect(again.next.sent.flatMap(entry => entry.message.details.items.map((item: { id: string }) => item.id)))
+      .toEqual([first.messageId, second.messageId]);
+    expect(delivered(again.next.sent)).toEqual(["head h1", "head h2"]);
     entries.push({ type: "custom_message", customType: "pi-fabric-agent-message", details: again.next.sent[0]!.message.details });
     again.controller.closeFollowUpDrain();
     const third = restart();
@@ -193,11 +195,105 @@ describe("Main followUp coalescing (unit)", () => {
     expect(fs.existsSync(journal)).toBe(false);
   });
 
-  // review/astra F1 on pi-fabric#114, rounds 1 and 2: a 34-message burst, then a restart whose
-  // journal still lists stale copies (as this writer wrote them earlier), with the newest still
-  // held, handed to Pi, or already in the session.
+  it("public held admission performs one durable journal replacement and retains original metadata", () => {
+    const { journal } = journalPath();
+    const { main } = setup(journal);
+    const request = {
+      from: from("factory"), verification: "mesh" as const, source: "actor-output" as const,
+      message: "head h1", delivery: "followUp" as const, deliveryId: "delivery:factory:1",
+      admissionTopic: "fabric.state", inboxEventId: "event-1", inboxTopic: "fabric.state", inboxKey: "repo#7/state",
+      inboxReceipts: ["receipt-1"], data: { coalesceKey: "repo#7/state", head: "h1" },
+    };
+    const replacements = vi.spyOn(fs, "renameSync");
+    const result = main.deliverAgent(request);
+    const journalReplacements = replacements.mock.calls.filter(([, destination]) => String(destination) === journal);
+    expect(journalReplacements).toHaveLength(1);
+    expect(result).toMatchObject({ queued: true, messageId: expect.any(String), pendingFollowUps: 1 });
+    const [item] = (JSON.parse(fs.readFileSync(journal, "utf8")) as { items: Array<Record<string, unknown>> }).items;
+    expect(item).toBeDefined();
+    expect(item!).toMatchObject({
+      id: result.messageId, from: request.from, message: request.message, deliveryId: request.deliveryId,
+      source: request.source, admissionTopic: request.admissionTopic, inboxEventId: request.inboxEventId,
+      inboxTopic: request.inboxTopic, inboxKey: request.inboxKey, inboxReceipts: request.inboxReceipts,
+      data: request.data,
+    });
+    expect(item!.sentAt).toBe(Date.now());
+  });
+
+  it.skipIf(process.platform === "win32")("public retry rebarriers after a real post-rename fsync failure", () => {
+    const { journal } = journalPath();
+    const { main } = setup(journal);
+    const request = {
+      from: from("factory"), message: "head h1", delivery: "followUp" as const, deliveryId: "delivery:factory:retry",
+      data: { coalesceKey: "repo#7/state", head: "h1" },
+    };
+    const first = main.deliverAgent(request);
+    let replaced = 0;
+    let failed = false;
+    const realRename = fs.renameSync;
+    const realFsync = fs.fsyncSync;
+    vi.spyOn(fs, "renameSync").mockImplementation((source, destination) => {
+      const result = realRename(source, destination);
+      if (String(destination) === journal) replaced++;
+      return result;
+    });
+    vi.spyOn(fs, "fsyncSync").mockImplementation((fd) => {
+      if (replaced === 1 && !failed && fs.fstatSync(fd).isDirectory()) {
+        failed = true;
+        throw new Error("post-rename fsync failure");
+      }
+      return realFsync(fd);
+    });
+
+    expect(() => main.deliverAgent(request)).toThrow("post-rename fsync failure");
+    expect(failed).toBe(true);
+    expect(replaced).toBe(1);
+    expect(JSON.parse(fs.readFileSync(journal, "utf8")).items).toHaveLength(1);
+
+    expect(main.deliverAgent(request)).toMatchObject({
+      queued: true, duplicate: true, messageId: first.messageId, triggered: false,
+    });
+    expect(replaced).toBe(2);
+    expect(JSON.parse(fs.readFileSync(journal, "utf8")).items[0]).toMatchObject({
+      id: first.messageId, from: request.from, message: request.message, deliveryId: request.deliveryId,
+      data: request.data,
+    });
+  });
+
+  it("replays a legacy carrier unchanged except for replacement presentation metadata", () => {
+    const { dir, journal } = journalPath();
+    const carrier = {
+      id: "legacy-latest", deliveryId: "legacy-delivery-latest", from: from("factory"),
+      message: "legacy payload", sentAt: Date.now() - 120_000, deliverAs: "followUp", triggerTurn: false,
+      chain: "legacy-first", generation: 1, supersedes: ["legacy-delivery-first"],
+      replaces: "legacy-first", replacedAt: Date.now(),
+    };
+    fs.mkdirSync(path.dirname(journal), { recursive: true });
+    fs.writeFileSync(journal, JSON.stringify({ version: 1, items: [carrier] }));
+    const next = fakePi();
+    const main = new MainAgentController(next.pi, "session:root", true, dir, "root");
+    main.attachFollowUpDrain(busyContext(), 120_000, journal);
+    next.emit("agent_before_settle", { outcome: "completed" }, busyContext([], { idle: true }));
+    expect(next.sent).toHaveLength(1);
+    const { message, options } = next.sent[0]!;
+    expect(message.details).toMatchObject({
+      id: carrier.id, deliveryId: carrier.deliveryId, from: carrier.from,
+      chain: carrier.chain, generation: carrier.generation, supersedes: carrier.supersedes,
+      sentAt: new Date(carrier.sentAt).toISOString(), delivery: carrier.deliverAs, triggerTurn: false,
+    });
+    expect(options).toEqual({ deliverAs: "followUp", triggerTurn: false });
+    expect(delivered(next.sent)).toEqual([carrier.message]);
+    expect(message.details).not.toHaveProperty("replacedAt");
+    expect(message.details).not.toHaveProperty("replaces");
+    expect(message.content).not.toContain("replaced_at=");
+    // Raw legacy fields may survive durable spreads; this is not a schema migration.
+    expect(JSON.parse(fs.readFileSync(journal, "utf8")).items[0]).toMatchObject(carrier);
+    main.closeFollowUpDrain();
+  });
+
+  // A burst must survive restart in every handoff stage; duplicate journal copies never replay.
   for (const stage of ["held", "handed", "in the session"] as const) {
-    it(`after a 34-message burst, the newest ${stage}, a restart never brings back an earlier one`, () => {
+    it(`after a 34-message burst ${stage}, a restart retains every unconsumed original once`, () => {
       const { dir, journal } = journalPath();
       const firstPi = fakePi();
       const entries: unknown[] = [];
@@ -222,10 +318,10 @@ describe("Main followUp coalescing (unit)", () => {
       if (stage !== "held") {
         vi.advanceTimersByTime(120_000);
         firstPi.emit("turn_end", toolTurn, busyContext(entries));             // all handed to Pi
-        expect(delivered(firstPi.sent.slice(1))).toEqual(["plain", "head h34", "head x1", "head r1"]);
+        expect(delivered(firstPi.sent.slice(1))).toEqual(["plain", ...burst.map((_, index) => `head h${index + 1}`), "head x1", "head r1"]);
         if (stage === "in the session") {
           entries.push({ type: "custom_message", customType: "pi-fabric-agent-message", details: firstPi.sent[1]!.message.details });
-          firstPi.emit("turn_end", toolTurn, busyContext(entries));           // confirmed: h34 leaves the journal
+          firstPi.emit("turn_end", toolTurn, busyContext(entries));           // confirmed: all originals leave the journal
           expect(fs.existsSync(journal)).toBe(false);
         }
       }
@@ -237,10 +333,10 @@ describe("Main followUp coalescing (unit)", () => {
       const again = new MainAgentController(next.pi, "session:root", true, dir, "root");
       again.attachFollowUpDrain(busyContext(entries, { idle: true }), 120_000, journal);
       next.emit("agent_before_settle", { outcome: "completed", context: { pendingMessages: [] } }, busyContext(entries));
-      const expected = stage === "in the session" ? [] : ["plain", "head h34", "head x1", "head r1"];
+      const expected = stage === "in the session" ? [] : ["plain", ...burst.map((_, index) => `head h${index + 1}`), "head x1", "head r1"];
       expect(delivered(next.sent)).toEqual(expected);
-      expect(next.sent.flatMap((entry) => entry.message.details.items?.map((item: { id: string }) => item.id) ?? [entry.message.details.id]))
-        .not.toContain(burst[0]!.messageId);
+      const deliveredIds = next.sent.flatMap((entry) => entry.message.details.items?.map((item: { id: string }) => item.id) ?? [entry.message.details.id]);
+      expect(deliveredIds.filter(id => id === burst[0]!.messageId)).toHaveLength(stage === "in the session" ? 0 : 1);
     });
   }
 });
@@ -256,8 +352,8 @@ const waitFor = async (predicate: () => boolean, timeoutMs = 5_000): Promise<voi
 };
 
 // The #102 real-Pi harness: Main chains tool calls; wakes arrive mid-tool.
-describe("Main followUp coalescing in a real Pi session", () => {
-  it("three same-key wakes during a tool call reach Main as one message, the newest; another key still arrives", async () => {
+describe("Main followUp retention in a real Pi session", () => {
+  it("every same-key wake during a tool call reaches Main in arrival order with its sender identity", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-coalesce-"));
     roots.push(root);
     const faux = fauxProvider();
@@ -305,8 +401,11 @@ describe("Main followUp coalescing in a real Pi session", () => {
     const ids = ["h1", "h2", "h3"].map((head) => main!.deliverAgent({
       from: factory, message: `PR head ${head}`, delivery: "followUp", data: { coalesceKey: "pi-fabric#7/state", head },
     }));
-    main!.deliverAgent({ from: factory, message: "PR 8 merged", delivery: "followUp", data: { coalesceKey: "pi-fabric#8/state" } });
-    expect(ids[2]).toMatchObject({ coalesced: true, replacedMessageId: ids[1]!.messageId, pendingFollowUps: 1 });
+    const reviewer = { id: "actor:reviewer", name: "reviewer", kind: "actor" as const };
+    ids.push(main!.deliverAgent({ from: reviewer, message: "PR 7 reviewed", delivery: "followUp", data: { coalesceKey: "pi-fabric#7/state" } }));
+    ids.push(main!.deliverAgent({ from: factory, message: "PR 8 merged", delivery: "followUp", data: { coalesceKey: "pi-fabric#8/state" } }));
+    expect(ids.every(result => result.coalesced === undefined && result.replacedMessageId === undefined)).toBe(true);
+    expect(main!.queueDepth().pendingFollowUps).toBe(5);
     await new Promise((resolve) => setTimeout(resolve, 150));       // due, but mid-tool
     gates.shift()!();                                               // the boundary
     while (toolsStarted < 2 || gates.length) {
@@ -315,14 +414,13 @@ describe("Main followUp coalescing in a real Pi session", () => {
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
     await run;
-    const custom = session.messages.filter((message) => message.role === "custom") as Array<{ content: string; details: { id: string; items?: Array<{ id: string }> } }>;
+    type Item = { id: string; from: typeof factory };
+    const custom = session.messages.filter((message) => message.role === "custom") as Array<{ content: string; details: Item & { items?: Item[] } }>;
     const text = custom.map((message) => message.content).join("\n");
-    expect(text.match(/PR head h\d/g)).toEqual(["PR head h3"]);
-    expect(text).toContain("PR 8 merged");
-    const deliveredIds = custom.flatMap((message) => message.details.items?.map((item) => item.id) ?? [message.details.id]);
-    expect(deliveredIds).toContain(ids[2]!.messageId);
-    expect(deliveredIds).not.toContain(ids[0]!.messageId);
-    expect(deliveredIds).not.toContain(ids[1]!.messageId);
+    expect(text.match(/PR head h\d|PR 7 reviewed|PR 8 merged/g)).toEqual(["PR head h1", "PR head h2", "PR head h3", "PR 7 reviewed", "PR 8 merged"]);
+    const originals = custom.flatMap(message => message.details.items ?? [message.details]);
+    expect(originals.map(item => item.id)).toEqual(ids.map(result => result.messageId));
+    expect(originals.map(item => item.from)).toEqual([factory, factory, factory, reviewer, factory]);
     expect(main!.queueDepth().pendingFollowUps).toBe(0);
   });
 });

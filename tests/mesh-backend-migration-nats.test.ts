@@ -10,7 +10,8 @@ import { connectJetStream } from "../src/mesh/state-backend-nats-client.js";
 import { decodeMeshStateFile } from "../src/mesh/state-file.js";
 import { MeshStore, type MeshBatchOperation, type MeshIdentity } from "../src/mesh/store.js";
 import { fakeJetStream } from "./helpers/nats-jetstream-fake.js";
-import { itFor, natsMonitorUrl, natsServerUrl, reportNatsSkip } from "./helpers/nats-state-server.js";
+import { itFor, natsMonitorUrl, natsServerUrl, prepareNatsStream, reportNatsSkip } from "./helpers/nats-state-server.js";
+import { captureNatsConsumer, waitForNatsConsumerReady } from "./helpers/nats-consumer-ready.js";
 
 // smarty-dev#9670: file -> nats -> file, with digests, and a crash at every step (docs/mesh-backends.md, Migration).
 // Each case runs on the in-process fake and, when NATS_SERVER_URL and NATS_MONITOR_URL are set, on a real nats-server.
@@ -28,7 +29,7 @@ const tempRoot = (label: string): string => {
 };
 
 /** A file root with entries, nested values and CAS tombstones. */
-const seedFileRoot = async (root: string): Promise<string> => {
+const seedFileRoot = async (root: string, target?: Target): Promise<string> => {
   const store = new MeshStore(root, 64 * 1024, 1_000, { stateBackend: "file" });
   stores.push(store);
   const ops: MeshBatchOperation[] = Array.from({ length: 30 }, (_, index) => ({
@@ -37,11 +38,17 @@ const seedFileRoot = async (root: string): Promise<string> => {
   await store.writeBatch({ identity, ops });
   await store.put({ key: "seed/solo", value: "plain", identity });
   for (const index of [3, 7, 11]) await store.delete({ key: `seed/ns${index % 3}/${index}` });
+  await prepareMigrationStream(root, target);
   return fileDigest(root);
 };
 const fileDigest = (root: string): string => meshSnapshotDigest(decodeMeshStateFile(path.join(root, "state.json"), 64 * 1024 * 1024, false));
 
 type Target = "fake" | "nats";
+/** Normal migration/crash fixtures need a materialized stream, not merely a CREATE ACK with a leader.
+ * No records are written here; migration still performs its real ensure, fence, publishes and crash steps. */
+const prepareMigrationStream = async (root: string, target?: Target): Promise<void> => {
+  if (target === "nats") await prepareNatsStream(root);
+};
 /** One connection target per test: a fresh fake server, or the real one (each test's fresh root has its own stream,
  * derived from the root: pi-fabric#937). */
 const connection = (target: Target): MeshNatsMigrationOptions => {
@@ -67,7 +74,7 @@ describe.each(["fake", "nats"] as const)("file <-> nats migration on the %s serv
 
   it("round trip: the stream, a nats store and the exported state.json all carry the file digest", async () => {
     const root = tempRoot("roundtrip");
-    const digest = await seedFileRoot(root);
+    const digest = await seedFileRoot(root, target);
     const connect = reconnectable(target);
     const options = connect();
     const imported = await importMeshStateToNats(root, options);
@@ -76,7 +83,11 @@ describe.each(["fake", "nats"] as const)("file <-> nats migration on the %s serv
     expect(meshSnapshotDigest(decodeMeshStateFile(path.join(root, "state.json.nats-cutover-1"), 64 * 1024 * 1024, false))).toBe(digest);
     // A file-mode store refuses the moved root; a nats store on the stream reads the imported state and writes.
     expect(() => new MeshStore(root, 64 * 1024, 1_000, { stateBackend: "file" }).get("seed/solo")).toThrow(/moved to NATS stream/);
-    await openNatsStateBackend({ root, ...(options.port ? { port: options.port } : { servers: options.servers!, monitoringUrl: options.monitoringUrl! }) });
+    const open = () => openNatsStateBackend({ root, ...(options.port ? { port: options.port } : { servers: options.servers!, monitoringUrl: options.monitoringUrl! }) });
+    if (target === "nats") {
+      const { name } = await captureNatsConsumer(natsServerUrl!, natsStreamName(root), open);
+      await waitForNatsConsumerReady(natsServerUrl!, natsStreamName(root), name);
+    } else await open();
     const nats = new MeshStore(root, 64 * 1024, 1_000, { stateBackend: "nats" });
     stores.push(nats);
     expect(nats.get("seed/solo")?.value).toBe("plain");
@@ -108,12 +119,15 @@ describe.each(["fake", "nats"] as const)("file <-> nats migration on the %s serv
 
   it("a compacted stream (a snapshot, then a purge below it, pi-fabric#907) still rolls back with every write", async () => {
     const root = tempRoot("compacted");
-    await seedFileRoot(root);
+    await seedFileRoot(root, target);
     const connect = reconnectable(targetKind);
     const imported = await importMeshStateToNats(root, connect());
     const options = connect();
-    const backend = await openNatsStateBackend({ root, snapshotEvery: 0,
+    const open = () => openNatsStateBackend({ root, snapshotEvery: 0,
       ...(options.port ? { port: options.port } : { servers: options.servers!, monitoringUrl: options.monitoringUrl! }) });
+    const captured = target === "nats" ? await captureNatsConsumer(natsServerUrl!, imported.stream, open) : undefined;
+    const backend = captured ? captured.value : await open();
+    if (captured) await waitForNatsConsumerReady(natsServerUrl!, imported.stream, captured.name);
     for (let index = 0; index < 5; index++) await backend.put({ key: `after/${index}`, value: index, identity });
     expect(await backend.compact()).toBe(true);
     await backend.put({ key: "after/last", value: "tail", identity });
@@ -132,7 +146,7 @@ describe.each(["fake", "nats"] as const)("file <-> nats migration on the %s serv
 
   it("an import and a rollback with no writes in between give back the exact file digest", async () => {
     const root = tempRoot("exact");
-    const digest = await seedFileRoot(root);
+    const digest = await seedFileRoot(root, target);
     const options = connection(target);
     await importMeshStateToNats(root, options);
     expect((await rollbackMeshStateFromNats(root, options)).digest).toBe(digest);
@@ -142,7 +156,7 @@ describe.each(["fake", "nats"] as const)("file <-> nats migration on the %s serv
   it.each(["nats-import-begin", "nats-import-chunk", "nats-import-verify", "nats-copy", "nats-marker", "nats-import-commit"] as const)(
     "a crash at %s: the rerun converges on the same stream and digest", async (step) => {
       const root = tempRoot(`crash-${step}`);
-      const digest = await seedFileRoot(root);
+      const digest = await seedFileRoot(root, target);
       const options = connection(target);
       await expect(importMeshStateToNats(root, { ...options, ...crashAt(step) })).rejects.toThrow(`crash at ${step}`);
       // The marker is the switch: before it, state.json is still the file state; from it on, file mode refuses.
@@ -158,7 +172,7 @@ describe.each(["fake", "nats"] as const)("file <-> nats migration on the %s serv
 
   it.each(["nats-retire", "nats-export-temp", "nats-replace"] as const)("a rollback crash at %s: the rerun converges", async (step) => {
     const root = tempRoot(`rollback-${step}`);
-    const digest = await seedFileRoot(root);
+    const digest = await seedFileRoot(root, target);
     const options = connection(target);
     await importMeshStateToNats(root, options);
     await expect(rollbackMeshStateFromNats(root, { ...options, ...crashAt(step) })).rejects.toThrow(`crash at ${step}`);
@@ -176,6 +190,7 @@ describe.each(["fake", "nats"] as const)("file <-> nats migration on the %s serv
       await store.writeBatch({ identity, ops: Array.from({ length: 100 }, (_, index) => ({ kind: "put" as const, key: `big/${batch}/${index}`, value: { blob } })) });
     }
     const digest = fileDigest(root);
+    await prepareMigrationStream(root, target);
     const options = connection(target);
     let chunks = 0;
     await expect(importMeshStateToNats(root, { ...options, onStep: (step) => { if (step === "nats-import-chunk" && ++chunks === 2) throw new Error("crash at chunk 2"); } }))
@@ -189,7 +204,7 @@ describe.each(["fake", "nats"] as const)("file <-> nats migration on the %s serv
 
   it("a link pre-created at the kept-copy path refuses the import and its target stays unchanged; a link at the old rollback name is never followed", async () => {
     const root = tempRoot("links");
-    const digest = await seedFileRoot(root);
+    const digest = await seedFileRoot(root, target);
     const outside = tempRoot("outside");
     const victim = path.join(outside, "victim.txt");
     fs.writeFileSync(victim, "keep me");
@@ -217,7 +232,7 @@ describe.each(["fake", "nats"] as const)("file <-> nats migration on the %s serv
     expect(readMeshStateNatsMarker(root)).toBeUndefined();
 
     const clean = tempRoot("links-rollback");
-    const cleanDigest = await seedFileRoot(clean);
+    const cleanDigest = await seedFileRoot(clean, target);
     const connect = reconnectable(targetKind);
     await importMeshStateToNats(clean, connect());
     fs.symlinkSync(victim, path.join(clean, "state.json.nats-rollback-2.tmp"));
@@ -228,7 +243,7 @@ describe.each(["fake", "nats"] as const)("file <-> nats migration on the %s serv
 
   it("LIMIT: an over-cap stream refuses the rollback and stays unretired; an over-cap source publishes nothing", async () => {
     const root = tempRoot("limits");
-    const digest = await seedFileRoot(root);
+    const digest = await seedFileRoot(root, target);
     const connect = reconnectable(targetKind);
     await importMeshStateToNats(root, connect());
     await expect(rollbackMeshStateFromNats(root, { ...connect(), maxStateBytes: 1_024 })).rejects.toThrow(/^LIMIT: FABRIC_MESH_NATS_MIGRATION_LIMIT: .*maxStateBytes/);
@@ -244,7 +259,7 @@ describe.each(["fake", "nats"] as const)("file <-> nats migration on the %s serv
     expect((await rollbackMeshStateFromNats(root, connect())).digest).toBe(digest);
 
     const over = tempRoot("limits-source");
-    await seedFileRoot(over); // 3 tombstones
+    await seedFileRoot(over, target); // 3 tombstones
     const sourceOptions = reconnectable(targetKind)();
     await expect(importMeshStateToNats(over, { ...sourceOptions, maxStateTombstones: 2 })).rejects.toThrow(/LIMIT: .*3 tombstones/);
     expect(readMeshStateNatsMarker(over)).toBeUndefined();
@@ -253,7 +268,7 @@ describe.each(["fake", "nats"] as const)("file <-> nats migration on the %s serv
 
   it("maxReplay counts the retire record: head == maxReplay refuses before retiring, head == maxReplay - 1 rolls back", async () => {
     const root = tempRoot("replay-boundary");
-    const digest = await seedFileRoot(root);
+    const digest = await seedFileRoot(root, target);
     const connect = reconnectable(targetKind);
     await importMeshStateToNats(root, connect());
     const options = connect();
@@ -269,7 +284,7 @@ describe.each(["fake", "nats"] as const)("file <-> nats migration on the %s serv
 
   it("a corrupted kept-copy write is caught by its read-back before state.json becomes the marker", async () => {
     const root = tempRoot("torn-copy");
-    const digest = await seedFileRoot(root);
+    const digest = await seedFileRoot(root, target);
     const original = fs.writeSync;
     let corrupted = 0;
     const spy = vi.spyOn(fs, "writeSync").mockImplementation(((descriptor: number, data: Buffer, ...rest: unknown[]) => {
@@ -295,6 +310,7 @@ describe.each(["fake", "nats"] as const)("file <-> nats migration on the %s serv
     await store.put({ key: "big/one", value: "x".repeat(1_100_000), identity });
     store.closeState();
     const digest = fileDigest(root);
+    await prepareMigrationStream(root, target);
     const connect = reconnectable(targetKind);
     const options = connect();
     await expect(importMeshStateToNats(root, options)).rejects.toThrow(/^LIMIT: .*more than the server's max payload 1048576/);
@@ -309,12 +325,12 @@ describe.each(["fake", "nats"] as const)("file <-> nats migration on the %s serv
 
   it("refuses a sqlite root, and a rerun whose state.json changed after a crash before the marker", async () => {
     const sqliteRoot = tempRoot("sqlite");
-    await seedFileRoot(sqliteRoot);
+    await seedFileRoot(sqliteRoot, target);
     await importMeshState(sqliteRoot);
     await expect(importMeshStateToNats(sqliteRoot, connection(target))).rejects.toThrow(/roll it back to file first/);
 
     const root = tempRoot("changed");
-    await seedFileRoot(root);
+    await seedFileRoot(root, target);
     const options = connection(target);
     await expect(importMeshStateToNats(root, { ...options, ...crashAt("nats-import-chunk") })).rejects.toThrow("crash at");
     const file = new MeshStore(root, 64 * 1024, 1_000, { stateBackend: "file" });

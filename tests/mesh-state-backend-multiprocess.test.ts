@@ -8,7 +8,7 @@ import { importMeshState } from "../src/mesh/backend-migration.js";
 import { MeshStateBusyError } from "../src/mesh/state-backend.js";
 import { MeshStore } from "../src/mesh/store.js";
 import { closeNatsStateBackend } from "../src/mesh/state-backend-nats.js";
-import { itFor, natsMonitorUrl, natsServerUrl, prepareNatsRoot, reportNatsSkip } from "./helpers/nats-state-server.js";
+import { itFor, natsMonitorUrl, natsServerUrl, prepareNatsRoot, prepareNatsStream, reportNatsSkip } from "./helpers/nats-state-server.js";
 
 // Four processes write one sqlite-backed (or, on a real nats-server, one NATS-backed: smarty-dev#7504) mesh root
 // concurrently (smarty-dev#6477 L2a). Each child
@@ -30,8 +30,11 @@ for (const name of ["mkdirSync", "mkdtempSync", "renameSync"]) {
 const jiti = createJiti(pathToFileURL(process.cwd() + "/index.js").href);
 const { MeshStore } = await jiti.import("./src/mesh/store.ts");
 if (kind === "nats") {
-  const { openNatsStateBackend } = await jiti.import("./src/mesh/state-backend-nats.ts");
-  await openNatsStateBackend({ root, servers: [process.env.NATS_SERVER_URL], monitoringUrl: process.env.NATS_MONITOR_URL });
+  const { openNatsStateBackend, natsStreamName } = await jiti.import("./src/mesh/state-backend-nats.ts");
+  const { captureNatsConsumer, waitForNatsConsumerReady } = await jiti.import("./tests/helpers/nats-consumer-ready.ts");
+  const { name } = await captureNatsConsumer(process.env.NATS_SERVER_URL, natsStreamName(root), () =>
+    openNatsStateBackend({ root, servers: [process.env.NATS_SERVER_URL], monitoringUrl: process.env.NATS_MONITOR_URL }));
+  await waitForNatsConsumerReady(process.env.NATS_SERVER_URL, natsStreamName(root), name);
 }
 const store = new MeshStore(root, 64 * 1024, 1000, { stateBackend: kind });
 if (store.stateBackend !== kind) throw new Error("not " + kind + ": " + JSON.stringify(store.stateDiagnostics()));
@@ -77,8 +80,11 @@ describe.each(["sqlite", "nats"] as const)("%s state backend across processes", 
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-state-backend-mp-"));
     roots.push(root);
     // sqlite mode opens only an imported root (smarty-dev#6477): the harness imports the fresh root first.
-    // nats: every process prepares the root; its stream is derived from the fresh root (pi-fabric#937).
+    // nats: prepare the shared stream before spawning writers, without leaving an idle parent consumer.
+    // Each child names its actual SDK receiver and waits for that receiver's NEXT, never another child's LIST entry.
+    // No setup publishes or write retries.
     if (kind === "sqlite") await importMeshState(root);
+    else await prepareNatsStream(root);
     const seen: string[] = [];
     const watcher = fs.watch(root, (_event, name) => { if (name) seen.push(String(name)); });
     const count = 40;

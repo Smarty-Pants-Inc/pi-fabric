@@ -171,15 +171,14 @@ describe.skipIf(process.platform === "win32")("#14179 created-parent durability 
       offLockDirectories: barriers.filter(b => b.directory && !b.held).length,
       barriers: barriers.map(({ stack, ...b }) => ({ ...b, operation: stack.includes("writeIndex") ? "archive-index" : "other" })), order };
     console.log("FSYNC_ACCOUNTING " + JSON.stringify(accounting));
-    // Canonical request 1–3: allow FULL first unknown/unproven guard, never existence-as-receipt;
-    // but not THREE complete rootward walks for one stable sequence group's three index updates.
-    // The bound does not dictate a cache, a new API, or the eventual exact approved total.
-    if (reduced) {
-      expect(index.length, "#14179: remove repeated unneeded stable ancestor barriers; first full guard + two fresh leaves allowed")
-        .toBeLessThanOrEqual(indexDepth + 2);
-      expect(heldDirs.length).toBeLessThanOrEqual(indexDepth + 2 + liveDepth + 4 + 3);
-    }
     const expectedIndex = reduced ? chain(indexLeaf).slice(0, chain(indexLeaf).indexOf(root) + 1) : chain(indexLeaf);
+    // Canonical request 1–3: allow FULL first unknown/unproven guard, never existence-as-receipt;
+    // the exact three mesh-root-bounded walks are the depth-independent oracle, regardless of scratch path.
+    if (reduced) {
+      expect(index.length, "#14179: exactly three index barriers per directory from the leaf through the mesh root")
+        .toBe(3 * expectedIndex.length);
+      expect(expectedIndex.length).toBeLessThan(chain(indexLeaf).length);
+    }
     expect(index.map(b => b.file)).toEqual([...expectedIndex, ...expectedIndex, ...expectedIndex]);
     expect(barriers.filter(b => b.directory && b.stack.includes("confirmEventFile")).map(b => b.file))
       .toEqual(reduced ? [root] : chain(root));

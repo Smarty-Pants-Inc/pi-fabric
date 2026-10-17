@@ -401,6 +401,14 @@ class AgentTaskPresenceError extends Error {
   }
 }
 
+/** A recorded resident module failed to provide this runner; no launch was attempted. */
+export class AgentRunnerRecoveryUnavailableError extends Error {
+  readonly code = "FABRIC_RUNNER_RECOVERY_UNAVAILABLE";
+  constructor(readonly runner: string, readonly reason: string) {
+    super(`Fabric runner ${runner} is unavailable: ${reason}`);
+  }
+}
+
 /** Host-only actor setup budget. Starts after admission and ends before transport launch. */
 export interface AgentLaunchPreparationOptions {
   timeoutMs: number;
@@ -1071,6 +1079,8 @@ interface PreviousRun {
   summary: PreviousRunSummary;
   resultFile: string;
   fingerprint: PrivateFileFingerprint;
+  /** Only resolved resident recoveries join the live UI; ordinary archives stay omitted. */
+  recoveryUi?: AgentRunRecord;
   bytes: number;
 }
 
@@ -1428,6 +1438,20 @@ export class AgentManager {
   #releaseEpoch = 0;
   #releaseCheckpoint: { epoch: number; disk: string; workers: unknown } | undefined;
   readonly #releaseWaiters = new Set<() => void>();
+  readonly #runnerRecoveryUnavailable = new Map<string, string>();
+
+  /** Only failed recovery records this guard; actual registration permits later
+   * explicit launches, never a fresh replacement for the recovered run. */
+  setRunnerRecoveryUnavailable(runner: string, reason: string | undefined): void {
+    if (reason && !getAgentRunner(runner)) this.#runnerRecoveryUnavailable.set(runner, reason);
+    else this.#runnerRecoveryUnavailable.delete(runner);
+  }
+
+  #requireRunner(runner: string): FabricRunnerAdapter {
+    const reason = this.#runnerRecoveryUnavailable.get(runner);
+    if (reason && !getAgentRunner(runner)) throw new AgentRunnerRecoveryUnavailableError(runner, reason);
+    return requireAgentRunner(runner);
+  }
 
   /** Admission hold only: existing workers and their finalizers retain custody. */
   pauseForRelease(_strict = false): void {
@@ -1850,7 +1874,7 @@ export class AgentManager {
     if (choice !== undefined && choice !== "inherit" && choice !== "typescript" && choice !== "python") {
       throw new Error(`Invalid Fabric agent kernel: ${String(choice)}`);
     }
-    const runner = requireAgentRunner(request.runner ?? this.config.runner);
+    const runner = this.#requireRunner(request.runner ?? this.config.runner);
     if (!runner.capabilities.kernels || !(request.extensions ?? this.config.extensions)) {
       if (choice === "typescript" || choice === "python") {
         throw new Error(
@@ -2110,7 +2134,7 @@ export class AgentManager {
       throw new Error(`Invalid Fabric agent residency: ${String(request.residency)}`);
     }
     const runner = request.runner ?? this.config.runner;
-    const runnerAdapter = requireAgentRunner(runner);
+    const runnerAdapter = this.#requireRunner(runner);
     const capabilities = runnerAdapter.capabilities;
     const hostedAdapter = runnerAdapter.kind === "hosted" ? runnerAdapter : undefined;
     if (request.inferenceContext !== undefined && request.inferenceContext !== "full-history" && request.inferenceContext !== "activation") {
@@ -3440,6 +3464,9 @@ export class AgentManager {
     signal?: AbortSignal;
     canRecover?: () => boolean;
     shouldRecover?: (id: string) => boolean;
+    /** Owner-authenticated archive, never a worker status or an unproved disk result. */
+    savedResult?: (id: string) => AgentRunResult | undefined;
+    refusalReason?: (id: string) => string | undefined;
     budgetMs?: number;
     maxEntries?: number;
   } = {}): Promise<string[]> {
@@ -3459,24 +3486,34 @@ export class AgentManager {
       while (this.#releasePaused) { await this.#waitForRelease(options.signal); check(); }
       check();
       const entry = candidates === undefined ? path.basename(candidate) : candidate;
-      if (this.#runs.has(entry) || !/^[0-9a-f]{32}$/.test(entry) || options.shouldRecover?.(entry) === false) continue;
+      if (this.#runs.has(entry) || !/^[0-9a-f]{32}$/.test(entry)) continue;
+      if (options.shouldRecover?.(entry) === false) { this.setPendingHostedRecovery(entry, undefined); continue; }
+      if (this.#previousRuns.has(entry)) { this.setPendingHostedRecovery(entry, undefined); continue; }
       const runDirectory = path.join(this.#runRoot, entry);
+      // The owner archive preserves the manager's exact validated outcome even
+      // when a worker overwrote status.json during teardown. It takes precedence
+      // over status, adapter availability and damaged launch state.
+      const saved = options.savedResult?.(entry);
+      check();
+      if (options.shouldRecover?.(entry) === false) { this.setPendingHostedRecovery(entry, undefined); continue; }
+      if (saved && saved.id === entry && terminalStatuses.has(saved.status)) {
+        this.restorePreviousRuns([saved], { hostedRecovery: true });
+        continue;
+      }
       const statusFile = path.join(runDirectory, "status.json");
       const record = readRecord(statusFile);
       const state = readHostedRunState(path.join(runDirectory, HOSTED_STATE_FILE));
-      if (
-        !record?.hosted ||
-        !state ||
-        record.id !== entry ||
-        state.context.id !== entry ||
-        terminalStatuses.has(record.status)
-      ) {
+      const projection = this.#pendingHostedRecovery.get(entry);
+      if (!record?.hosted || !state || record.id !== entry || state.context.id !== entry || terminalStatuses.has(record.status)) {
+        const observation = projection ?? (record?.hosted && record.id === entry && state?.context.id === entry ? record : undefined);
+        if (observation) this.#refuseHostedRecovery(entry, runDirectory, observation,
+          options.refusalReason?.(entry) ?? "Hosted recovery has no authenticated saved terminal result or valid launch state; the run outcome is indeterminate");
         continue;
       }
       const adapter = getAgentRunner(state.runner);
-      let refusal = adapter?.kind !== "hosted"
+      let refusal = options.refusalReason?.(entry) ?? (adapter?.kind !== "hosted"
         ? `Hosted runner ${state.runner} is not registered in this process; the run outcome is indeterminate`
-        : undefined;
+        : undefined);
       // The persisted launch scope is re-validated; a damaged one never re-attaches unscoped.
       if (!refusal && state.context.scope !== undefined) {
         try {
@@ -3487,16 +3524,7 @@ export class AgentManager {
       }
       if (refusal || adapter?.kind !== "hosted") {
         check();
-        const now = Date.now();
-        const { currentTool: _tool, blockedOn: _blocked, sleeping: _sleeping, ...rest } = record;
-        writeRecord(statusFile, {
-          ...rest,
-          status: "failed",
-          error: refusal!,
-          outcome: "indeterminate",
-          finishedAt: now,
-          updatedAt: now,
-        });
+        this.#refuseHostedRecovery(entry, runDirectory, record, refusal!);
         continue;
       }
       let managed: ManagedAgent | undefined;
@@ -3512,7 +3540,7 @@ export class AgentManager {
         record,
         this.#hostedHooks(() => managed),
       );
-      if (options.shouldRecover?.(entry) === false) continue;
+      if (options.shouldRecover?.(entry) === false) { this.setPendingHostedRecovery(entry, undefined); continue; }
       check();
       // Another recovery may have adopted while the directory cursor was suspended.
       if (this.#runs.has(entry)) continue;
@@ -3528,8 +3556,50 @@ export class AgentManager {
       }
       recovered.push(entry);
     }
+    // Metadata may survive a collected/missing run directory. A complete pass
+    // must resolve those admitted observations too, not leave a phantom pending
+    // target which a subsequent exact lookup can resurrect.
+    for (const [id, projection] of this.#pendingHostedRecovery) {
+      const pause = slice();
+      if (pause) await pause;
+      check();
+      if (options.shouldRecover?.(id) === false) { this.setPendingHostedRecovery(id, undefined); continue; }
+      const saved = options.savedResult?.(id);
+      check();
+      if (options.shouldRecover?.(id) === false) { this.setPendingHostedRecovery(id, undefined); continue; }
+      if (saved && saved.id === id && terminalStatuses.has(saved.status)) this.restorePreviousRuns([saved], { hostedRecovery: true });
+      else this.#refuseHostedRecovery(id, path.join(this.#runRoot, id), projection,
+        options.refusalReason?.(id) ?? "Hosted recovery has no valid saved run; the run outcome is indeterminate");
+    }
     check();
     return recovered;
+  }
+
+  #refuseHostedRecovery(id: string, directory: string, observation: Pick<AgentRunRecord, "name" | "runner" | "cwd">, reason: string): void {
+    mkdirPrivate(directory, this.#trustRoot());
+    const now = Date.now();
+    // A refusal is a new manager verdict, not authentication of worker output,
+    // attribution, counters or partial text. Keep only the admitted display facts.
+    const result: AgentRunResult = { id, name: observation.name, runner: observation.runner, cwd: observation.cwd,
+      task: "", transport: "hosted", residency: "durable", status: "failed", outcome: "indeterminate", error: reason,
+      startedAt: now, updatedAt: now, finishedAt: now, turns: 0, toolCalls: 0, text: "",
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } };
+    const resultFile = path.join(directory, `manager-restored-result-${randomUUID()}.json`);
+    const fingerprint = writePrivateJsonAtomic(resultFile, result);
+    if (this.#onSettled) this.#stageArchive(directory, result, "settlement");
+    writeRecord(path.join(directory, "status.json"), result);
+    this.#rememberPreviousRun(result, resultFile, fingerprint, true);
+    if (this.#onSettled) {
+      try {
+        this.#onSettled(result);
+        this.#commitArchive(directory, result);
+      } catch (error) {
+        // Terminal observation is complete; publication is NOT. Keep its full
+        // durable archive and backing custody for the existing archive retry,
+        // without holding discovery/actors or repeatedly walking historical runs.
+        diagnostics.warn("src/agents/manager.ts", `[pi-fabric] hosted recovery ${id} terminal publication deferred; archive retained: ${String(error)}`);
+      }
+    }
   }
 
   /** Park or resume a hosted run whose runner declares `sleep`. */
@@ -3873,10 +3943,19 @@ export class AgentManager {
     this.#invalidateUiList();
   }
 
+  /** Called only when the owner discharges its complete discovery obligation. */
+  clearPendingHostedRecovery(): void {
+    if (!this.#pendingHostedRecovery.size) return;
+    this.#pendingHostedRecovery.clear();
+    this.#invalidateUiList();
+  }
+
   #pendingHostedRecoveryInfo(id: string): PendingHostedRecoveryInfo | undefined {
     // Revalidate the exact requested row even before the incremental cursor has
     // reached it. A removed/foreign/unsafe row must not survive a cached hit.
-    if (this.#lookupPendingHostedRecovery) this.setPendingHostedRecovery(id, this.#lookupPendingHostedRecovery(id));
+    if (this.#lookupPendingHostedRecovery && this.#hostedRecoveryPending?.() !== false) {
+      this.setPendingHostedRecovery(id, this.#lookupPendingHostedRecovery(id));
+    }
     return this.#pendingHostedRecovery.get(id);
   }
 
@@ -3930,6 +4009,7 @@ export class AgentManager {
 
   list(): AgentStatusProjection[] {
     return [...[...this.#runs.keys(), ...this.#queued.keys()].map((id) => this.status(id)),
+      ...[...this.#previousRuns.values()].flatMap(previous => previous.recoveryUi ? [this.status(previous.summary.id)] : []),
       ...this.#pendingHostedRecoveryValues().map(record => structuredClone(record))];
   }
 
@@ -3980,11 +4060,20 @@ export class AgentManager {
       selected.set(managed.id, record);
       bytes += size;
     }
+    const resolved: AgentRunRecord[] = [];
+    for (const previous of [...this.#previousRuns.values()].reverse()) {
+      const record = previous.recoveryUi;
+      if (!record || selected.size + resolved.length + queuedValue.length + pending.length >= MAX_RETAINED_UI_RUNS) continue;
+      const size = uiPayloadBytes(record) + 2;
+      if (bytes + size > listBudget) continue;
+      resolved.push(record);
+      bytes += size;
+    }
     // Local metadata must not change legacy array equality/enumeration. The
     // assertion describes only the immutable property just installed here.
     const value = Object.defineProperty(runs.flatMap(managed => selected.has(managed.id) ? [selected.get(managed.id)!] : []),
       "partial", { value: partial, enumerable: false, writable: false, configurable: false }) as AgentUiList;
-    value.push(...queuedValue, ...pending);
+    value.push(...queuedValue, ...pending, ...resolved);
     this.#pruneRetainedUiRecords();
     // An unusually large live/queued handle set remains queryable, but is not
     // retained as an over-budget UI-list cache.
@@ -4022,6 +4111,7 @@ export class AgentManager {
   #mainRetentionReferences(): Set<string> {
     const refs = new Set<string>();
     const protect = (id: string, actorId?: string) => { refs.add(id); if (actorId) refs.add(actorId); };
+    for (const previous of this.#previousRuns.values()) protect(previous.summary.id, previous.summary.actorId);
     for (const queued of this.#queued.values()) {
       if (!queued.terminal || queued.cleanupPending || hasUnresolvedWorker(path.join(this.#runRoot, queued.info.id))) {
         protect(queued.info.id, queued.info.actorId);
@@ -4072,7 +4162,7 @@ export class AgentManager {
 
   /** Archival never discharges a live manager's result/publication custody,
    * even if its saved status is terminal or its handle has settled. */
-  hasRunCustody(id: string): boolean { return this.#runs.has(id) || this.#queued.has(id); }
+  hasRunCustody(id: string): boolean { return this.#runs.has(id) || this.#queued.has(id) || this.#previousRuns.has(id); }
 
   #retentionGeneration(): string {
     return `${this.#runs.size}:${this.#queued.size}:${this.#retentionRevision}:${RetentionReferenceScan.directoryGeneration(this.#runRoot)}`;
@@ -4082,6 +4172,7 @@ export class AgentManager {
    * expiring an exchange, re-evaluate the exact writer/tree under a count/time
    * budget. In-place nested/status changes need no run-set mtime. */
   retentionCustodyVeto(id: string): boolean {
+    if (this.#previousRuns.has(id)) return true;
     if (!retentionV2Enabled()) return this.#mainRetentionReferences().has(id);
     const started = performance.now(), expired = () => performance.now() - started >= 2;
     const check = (runId: string): boolean => {
@@ -4100,6 +4191,9 @@ export class AgentManager {
     if (this.#runs.has(id) || this.#queued.has(id) || ownedStat(path.join(this.#runRoot, id))?.isDirectory()) return check(id);
     if (this.#retentionIndexUnsafe || !this.#referenceScan.current(this.#retentionGeneration())) return true;
     let count = 0;
+    for (const previous of this.#previousRuns.values()) {
+      if (++count > 64 || expired() || previous.summary.actorId === id) return true;
+    }
     // Admission can add an actor-owned handle after its portion of the
     // preparation cursor passed. Check current manager ownership, not only
     // historical actor hints; overflow/time uncertainty remains a veto.
@@ -4149,6 +4243,11 @@ export class AgentManager {
         if (attempt < 2) yield;
       }
       incomplete = true; retry(); return false;
+    }
+    for (const previous of this.#previousRuns.values()) {
+      index(previous.summary.id, previous.summary.actorId);
+      protect(previous.summary.id, previous.summary.actorId);
+      yield;
     }
     for (const queued of this.#queued.values()) {
       incomplete = false;
@@ -4282,7 +4381,7 @@ export class AgentManager {
   }
 
   /** Runs a previous runtime stopped; keep exact outcomes on disk, not in the index. */
-  restorePreviousRuns(results: AgentRunResult[]): void {
+  restorePreviousRuns(results: AgentRunResult[], options: { hostedRecovery?: boolean } = {}): void {
     for (const result of results) {
       if (this.#runs.has(result.id)) continue;
       // Session-carried results may outlive their original temporary run root.
@@ -4293,16 +4392,16 @@ export class AgentManager {
       const statusFile = path.join(directory, "status.json");
       // Publish BEFORE dropping any full in-memory result. A failed save throws,
       // leaving the old index/result intact and the caller's archive unconsumed.
-      writeJsonAtomic(statusFile, result, { space: 2, durable: true });
+      if (!options.hostedRecovery) writeJsonAtomic(statusFile, result, { space: 2, durable: true });
       // A restored archive is a new publication, not a replacement for any
       // original or restored generation still authenticated by another manager.
       const resultFile = path.join(directory, `manager-restored-result-${randomUUID()}.json`);
       const fingerprint = writePrivateJsonAtomic(resultFile, result);
-      this.#rememberPreviousRun(result, resultFile, fingerprint);
+      this.#rememberPreviousRun(result, resultFile, fingerprint, options.hostedRecovery);
     }
   }
 
-  #rememberPreviousRun(result: AgentRunResult, resultFile: string, fingerprint: PrivateFileFingerprint): void {
+  #rememberPreviousRun(result: AgentRunResult, resultFile: string, fingerprint: PrivateFileFingerprint, hostedRecovery = false): void {
     const summary: PreviousRunSummary = {
       id: detachedPreview(result.id, result.id.length),
       name: uiText(result.name, MAX_NAME_LENGTH),
@@ -4318,8 +4417,12 @@ export class AgentManager {
     this.#dropPreviousRun(result.id);
     // The result stays on disk; only this bounded summary, path and fixed proof
     // remain indexed in memory. Do not charge the retained result payload to heap.
-    const bytes = uiPayloadBytes(summary) + resultFile.length * 2 + PRIVATE_FILE_FINGERPRINT_BYTES;
-    this.#previousRuns.set(summary.id, { summary, resultFile, fingerprint, bytes });
+    const recoveryUi = hostedRecovery ? compactUiRecord(result) : undefined;
+    const bytes = uiPayloadBytes(summary) + resultFile.length * 2 + PRIVATE_FILE_FINGERPRINT_BYTES + (recoveryUi ? uiPayloadBytes(recoveryUi) : 0);
+    this.#previousRuns.set(summary.id, { summary, resultFile, fingerprint, bytes, ...(recoveryUi ? { recoveryUi } : {}) });
+    this.#pendingHostedRecovery.delete(result.id);
+    this.#retentionRevision++;
+    this.#invalidateUiList();
     this.#previousRunBytes += bytes;
     while (this.#previousRuns.size > MAX_RETAINED_RUN_HANDLES || this.#previousRunBytes > MAX_PREVIOUS_RUN_BYTES) {
       this.#forgetRunMetadata(this.#previousRuns.keys().next().value!);
@@ -4331,6 +4434,8 @@ export class AgentManager {
     if (!previous) return;
     this.#previousRunBytes -= previous.bytes;
     this.#previousRuns.delete(id);
+    this.#retentionRevision++;
+    this.#invalidateUiList();
   }
 
   #forgetRunMetadata(id: string): void {

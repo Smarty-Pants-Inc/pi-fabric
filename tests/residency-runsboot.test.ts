@@ -5,6 +5,7 @@ import { pathToFileURL } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { AgentManager } from "../src/agents/manager.js";
+import * as managerModule from "../src/agents/manager.js";
 import { persistRunStopIntent } from "../src/agents/archive-custody.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
@@ -15,7 +16,8 @@ import { ResidentActorClient } from "../src/residency/actor-client.js";
 import { readHostLease } from "../src/topology/host-leases.js";
 import { retentionV2Enabled } from "../src/storage/retention-platform.js";
 import { normalizeScope } from "../src/scope.js";
-import { registerAgentRunner, type FabricHostedRunner } from "../src/runners.js";
+import { registerAgentRunner, type FabricHostedReporter, type FabricHostedRunner } from "../src/runners.js";
+import type { AgentRunResult } from "../src/agents/types.js";
 import { diagnostics } from "../src/core/diagnostics.js";
 
 const fixture = () => {
@@ -156,7 +158,10 @@ const observeMetadataReads = (file: string, unreadable = false) => {
 };
 
 /** Observe and join the real manager operation, including its directory cursor. */
-const observeHostedRecovery = (onRecover?: (manager: AgentManager, options: Parameters<AgentManager["recoverHostedRuns"]>[1]) => void) => {
+const observeHostedRecovery = (
+  onRecover?: (manager: AgentManager, options: Parameters<AgentManager["recoverHostedRuns"]>[1]) => void,
+  onComplete?: (manager: AgentManager) => void,
+) => {
   const recover = AgentManager.prototype.recoverHostedRuns;
   const fallbacks: Array<{ manager: AgentManager; options: Parameters<AgentManager["recoverHostedRuns"]>[1]; pending: Promise<string[]> }> = [];
   vi.spyOn(AgentManager.prototype, "recoverHostedRuns").mockImplementation(function (this: AgentManager, candidates, options) {
@@ -167,6 +172,9 @@ const observeHostedRecovery = (onRecover?: (manager: AgentManager, options: Para
     const pending = recover.call(this, candidates, options);
     if (candidates === undefined) {
       fallbacks.push({ manager: this, options, pending });
+      // Register before the host can await this promise; callers inspect their
+      // observation after real host completion, including any thrown mock result.
+      if (onComplete) void pending.then(() => onComplete(this)).catch(() => undefined);
       void pending.catch(() => undefined); // cancellation is asserted by its owner
     }
     return pending;
@@ -181,18 +189,43 @@ const observeHostedRecovery = (onRecover?: (manager: AgentManager, options: Para
 
 const hostedRunner = () => {
   const calls = { starts: [] as string[], attaches: [] as string[], stops: 0 };
+  const reporters = new Map<string, FabricHostedReporter>();
   const adapter: FabricHostedRunner = {
     id: "runsboot-daemon", label: "Runsboot daemon", kind: "hosted",
     capabilities: { recursiveFabric: false, steer: false, followUp: false, persistentSessions: false,
       kernels: false, handoff: false, modelDiscovery: false, imageInput: false, compaction: false,
       questions: false, sleep: false, writePolicy: false },
     prepare: context => ({ job: context.idempotencyKey }),
-    start: (_locator, context) => { calls.starts.push(context.id); },
+    start: (_locator, context, reporter) => { calls.starts.push(context.id); reporters.set(context.id, reporter); },
     attach: (_locator, context) => { calls.attaches.push(context.id); },
     liveness: () => "running",
     stop: () => { calls.stops++; return { confirmed: true }; },
   };
-  return { adapter, calls, unregister: registerAgentRunner(adapter) };
+  return { adapter, calls, reporters, unregister: registerAgentRunner(adapter) };
+};
+
+/** wait() is the manager's result API; join() only joins settlement. Defer
+ * consumption so one surface cannot collect the fixture before the next read. */
+const expectTerminalHostedSurfaces = async (host: ResidentHost, id: string, expected: Partial<AgentRunResult>) => {
+  const observe = () => {
+    const status = host.agents.status(id);
+    expect(status).toMatchObject({ id, transport: "hosted", ...expected });
+    expect(status).not.toHaveProperty("recovery");
+    const ui = host.agents.listForUi();
+    expect(ui.partial).toBe(false);
+    expect(ui.filter(row => row.id === id)).toEqual([expect.objectContaining({ id, ...expected })]);
+    expect(ui.find(row => row.id === id)).not.toHaveProperty("recovery");
+    expect(host.agents.list().filter(row => row.id === id)).toEqual([expect.objectContaining({ id, ...expected })]);
+  };
+  observe();
+  await expect(host.agents.join(id)).resolves.toBeUndefined();
+  const result = await host.agents.wait(id, { timeoutMs: 1_000, deferConsumption: () => undefined });
+  expect(result).toMatchObject({ id, transport: "hosted", ...expected });
+  expect(result).not.toHaveProperty("recovery");
+  await expect(host.agents.join(id)).resolves.toBeUndefined();
+  expect(await host.agents.wait(id, { timeoutMs: 1_000, deferConsumption: () => undefined })).toEqual(result);
+  observe(); // exact metadata lookup after wait/join must not resurrect pending
+  return result;
 };
 
 const saveMetadata = (config: ResidentHostConfig, metadata: ResidentAgentMetadata) => {
@@ -804,6 +837,235 @@ describe("resident retained-run startup (smarty-dev#4796)", () => {
     }
   });
 
+  // Keep reason: pi-fabric#1324 P1-A crossed the host/manager boundary with
+  // terminal status bytes but an immortal metadata-backed pending projection.
+  it("resolves a refused hosted run on every manager surface without resurrecting stale spawn metadata", { timeout: 15_000 }, async () => {
+    const { root, config, runs } = fixture();
+    const runner = hostedRunner();
+    const previous = new ResidentHost(config);
+    let host!: ResidentHost;
+    let entered!: () => void;
+    const managerEntered = new Promise<void>(resolve => { entered = resolve; });
+    try {
+      await previous.start();
+      const handle = await previous.agents.spawn({ task: "refuse an unavailable adapter after restart", runner: runner.adapter.id, residency: "durable" });
+      await previous.close(); // durable run is detached, never stopped
+      saveMetadata(config, { format: 1, rootId: config.rootId, id: handle.id, handle,
+        runDirectory: path.join(runs, handle.id), createdAt: 1, updatedAt: 1 });
+      const metadataFile = path.join(config.residencyRoot, "agents", `${handle.id}.json`);
+      const staleMetadata = fs.readFileSync(metadataFile, "utf8");
+      runner.unregister();
+      host = new ResidentHost(config);
+      const recovery = observeHostedRecovery(manager => { manager.pauseForRelease(true); entered(); });
+      await host.start();
+      await managerEntered;
+      expect(host.agents.status(handle.id)).toMatchObject({ status: "finishing", recovery: { state: "pending" } });
+      expect(host.agents.listForUi().partial).toBe(true);
+      await expect(host.agents.wait(handle.id)).rejects.toThrow(/pending hosted recovery/);
+      await expect(host.agents.join(handle.id)).rejects.toThrow(/pending hosted recovery/);
+      expect(runner.calls.attaches).toEqual([]);
+      host.agents.resumeAfterRelease();
+      await recovery.complete();
+      const record = JSON.parse(fs.readFileSync(path.join(runs, handle.id, "status.json"), "utf8"));
+      expect(record).toMatchObject({ id: handle.id, status: "failed", outcome: "indeterminate" });
+      expect(record.error).toMatch(/not registered/);
+      const result = await expectTerminalHostedSurfaces(host, handle.id, {
+        status: "failed", outcome: "indeterminate", error: record.error,
+      });
+      expect(result.error).toBe(record.error);
+      expect(fs.readFileSync(metadataFile, "utf8")).toBe(staleMetadata);
+      expect(host.agents.status(handle.id)).toMatchObject({ status: "failed", outcome: "indeterminate", error: record.error });
+      expect(host.agents.status(handle.id)).not.toHaveProperty("recovery");
+      expect(host.agents.listForUi().partial).toBe(false);
+      expect(runner.calls.starts).toEqual([handle.id]);
+      expect(runner.calls.attaches).toEqual([]);
+      expect(runner.calls.stops).toBe(0);
+    } finally {
+      host?.agents.resumeAfterRelease();
+      await host?.close(); await previous.close();
+      vi.restoreAllMocks(); runner.unregister();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  // Keep reason: pi-fabric#1324 P1-B. Complete through the actual hosted
+  // reporter and manager publication BEFORE restart; worker status is progress,
+  // never the authority for the exact saved manager result.
+  it("restores the exact published hosted outcome after restart despite stale spawn metadata and worker status", { timeout: 15_000 }, async () => {
+    const { root, config, runs } = fixture();
+    const runner = hostedRunner();
+    const previous = new ResidentHost(config);
+    let host!: ResidentHost;
+    let entered!: () => void;
+    const managerEntered = new Promise<void>(resolve => { entered = resolve; });
+    try {
+      await previous.start();
+      const handle = await previous.agents.spawn({ task: "complete before the resident cleans up metadata", runner: runner.adapter.id, residency: "durable" });
+      expect(handle.status).toBe("running");
+      saveMetadata(config, { format: 1, rootId: config.rootId, id: handle.id, handle,
+        runDirectory: path.join(runs, handle.id), createdAt: 1, updatedAt: 1 });
+      const metadataFile = path.join(config.residencyRoot, "agents", `${handle.id}.json`);
+      const staleMetadata = fs.readFileSync(metadataFile, "utf8");
+      runner.reporters.get(handle.id)!.progress({ turns: 3 });
+      runner.reporters.get(handle.id)!.usage({ input: 37, output: 19, cacheRead: 5, cacheWrite: 2, cost: 0.004 });
+      runner.reporters.get(handle.id)!.finish({ status: "completed", output: "original exact hosted answer", structured: { saved: ["original", 17] } });
+      await previous.agents.join(handle.id); // actual monitor settlement, not merely reporter terminal progress
+      const original = await previous.agents.wait(handle.id, { deferConsumption: () => undefined });
+      expect(original).toMatchObject({ status: "completed", text: "original exact hosted answer", value: { saved: ["original", 17] }, turns: 3 });
+      const resultFile = path.join(runs, handle.id, "manager-result.json");
+      const publishedBytes = fs.readFileSync(resultFile, "utf8");
+      const published = JSON.parse(publishedBytes);
+      expect(published).toMatchObject({ id: handle.id, status: "completed", text: original.text, value: original.value, usage: original.usage });
+      expect(previous.agents.status(handle.id)).toMatchObject(published); // original owner's authenticated publication/fingerprint path
+      const archivedBytes = fs.readFileSync(residentResultPath(config.residencyRoot, handle.id), "utf8");
+      const archived = JSON.parse(archivedBytes);
+      expect(archived).toEqual(published); // the host, not this test, published restart authority
+      await previous.close();
+      expect(fs.readFileSync(resultFile, "utf8")).toBe(publishedBytes);
+      // A late worker write cannot replace the manager's exact outcome on restart.
+      const statusFile = path.join(runs, handle.id, "status.json");
+      const worker = JSON.parse(fs.readFileSync(statusFile, "utf8"));
+      fs.writeFileSync(statusFile, JSON.stringify({ ...worker, text: "not the authoritative answer", value: { saved: false } }));
+      host = new ResidentHost(config);
+      const recovery = observeHostedRecovery(manager => { manager.pauseForRelease(true); entered(); });
+      await host.start();
+      await managerEntered;
+      expect(host.agents.status(handle.id)).toMatchObject({ status: "finishing", recovery: { state: "pending", lastKnownStatus: "running" } });
+      expect(host.agents.listForUi().partial).toBe(true);
+      await expect(host.agents.wait(handle.id)).rejects.toThrow(/pending hosted recovery/);
+      await expect(host.agents.join(handle.id)).rejects.toThrow(/pending hosted recovery/);
+      host.agents.resumeAfterRelease();
+      await recovery.complete();
+      const result = await expectTerminalHostedSurfaces(host, handle.id, {
+        status: "completed", text: published.text, value: published.value, usage: published.usage,
+        startedAt: published.startedAt, finishedAt: published.finishedAt,
+      });
+      expect(result).toEqual(archived);
+      expect(host.agents.status(handle.id)).toMatchObject(archived);
+      expect(fs.readFileSync(resultFile, "utf8")).toBe(publishedBytes);
+      expect(fs.readFileSync(residentResultPath(config.residencyRoot, handle.id), "utf8")).toBe(archivedBytes);
+      expect(fs.readFileSync(metadataFile, "utf8")).toBe(staleMetadata);
+      expect(host.agents.status(handle.id)).not.toHaveProperty("recovery");
+      expect(host.agents.listForUi().partial).toBe(false);
+      expect(runner.calls.starts).toEqual([handle.id]);
+      expect(runner.calls.attaches).toEqual([]);
+      expect(runner.calls.stops).toBe(0);
+    } finally {
+      host?.agents.resumeAfterRelease();
+      await host?.close(); await previous.close();
+      vi.restoreAllMocks(); runner.unregister();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  // Keep reason: pi-fabric#1324 P1-C crossed a real dynamic-import await, not
+  // a mocked loader. Keep the module unresolved past the production 30s bound;
+  // release it only AFTER timeout, refusal, actor output and latch completion.
+  it("bounds an unresolved real runner import, releases native actors and admits one fresh task after late registration", { timeout: 80_000 }, async () => {
+    const { root, config, runs } = fixture();
+    config.workerPath = path.resolve("tests/fixtures/fake-worker.mjs");
+    config.piModels = { available: [{ provider: "test", id: "visible" }], aliases: {}, defaultModel: "test/visible" };
+    const runner = hostedRunner();
+    const previous = new ResidentHost(config);
+    let host!: ResidentHost;
+    let unregisterLate: (() => void) | undefined;
+    const gate = gatedRunnerModule(root, () => { unregisterLate = registerAgentRunner(runner.adapter); });
+    let entered!: () => void;
+    const managerEntered = new Promise<void>(resolve => { entered = resolve; });
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await previous.start();
+      await vi.waitFor(() => expect(previous.agents.listForUi().partial).toBe(false), { timeout: 5_000 });
+      const actor = await previous.actors.create({ name: "unrelated-to-hung-module", instructions: "Respond", residency: "durable", responseMode: "text" });
+      previous.actors.pauseForRelease();
+      previous.actors.tell(actor.id, "accepted before restart while native activation is held", undefined);
+      const handle = await previous.agents.spawn({ task: "original affected hosted job", runner: runner.adapter.id, residency: "durable" });
+      saveMetadata(config, { format: 1, rootId: config.rootId, id: handle.id, handle, runnerModule: gate.module,
+        runDirectory: path.join(runs, handle.id), createdAt: 1, updatedAt: 1 });
+      await previous.close();
+      runner.unregister();
+      host = new ResidentHost(config);
+      const warnings = vi.spyOn(diagnostics, "warn");
+      const nativeLaunches = vi.spyOn(ProcessTransport.prototype, "launch");
+      const recovery = observeHostedRecovery(manager => { manager.pauseForRelease(true); entered(); });
+      await startBeforeImport(host, gate);
+      await gate.entered;
+      const importAt = performance.now();
+      expect(recovery.fallbacks).toHaveLength(0);
+      expect(host.agents.status(handle.id)).toMatchObject({ status: "finishing", recovery: { state: "pending" } });
+      expect(host.agents.listForUi().partial).toBe(true);
+      await expect(host.agents.wait(handle.id)).rejects.toThrow(/pending hosted recovery/);
+      await expect(host.agents.join(handle.id)).rejects.toThrow(/pending hosted recovery/);
+      expect(nativeLaunches).not.toHaveBeenCalled(); // the accepted full-scan startup hold still applies
+      expect(unregisterLate).toBeUndefined();
+      await Promise.race([managerEntered, new Promise<never>((_resolve, reject) => {
+        deadline = setTimeout(() => reject(new Error("Real unresolved runner import did not relinquish recovery within 45s")), 45_000);
+      })]);
+      clearTimeout(deadline); deadline = undefined;
+      const moduleWaitMs = performance.now() - importAt;
+      expect(moduleWaitMs).toBeGreaterThanOrEqual(29_000); // real clock: do not distort the owner lease with fake timers
+      expect(moduleWaitMs).toBeLessThan(45_000);
+      expect(unregisterLate).toBeUndefined(); // timeout did not settle the actual module import
+      const moduleWarnings = warnings.mock.calls.filter(call => /runner module.*(did not load|timed out|timeout)/i.test(call.map(String).join(" ")));
+      expect(moduleWarnings.length).toBeGreaterThan(0);
+      expect(moduleWarnings.map(call => call.map(String).join(" ")).join("\n")).toContain(gate.module);
+      expect(runner.calls.starts).toEqual([handle.id]);
+      expect(runner.calls.attaches).toEqual([]);
+      host.agents.resumeAfterRelease();
+      await recovery.complete(); // actual pass and host then/finally; no private-latch substitute
+      const record = JSON.parse(fs.readFileSync(path.join(runs, handle.id, "status.json"), "utf8"));
+      expect(record).toMatchObject({ status: "failed", outcome: "indeterminate" });
+      expect(record.error).toMatch(/runner module.*(did not load|timed out|timeout)/i);
+      const originalResult = await expectTerminalHostedSurfaces(host, handle.id, {
+        status: "failed", outcome: "indeterminate", error: record.error,
+      });
+      // Resume a real restored actor through its native worker and delivery path.
+      // ActorManager does not support custom/hosted runner actors; do not forge one.
+      await vi.waitFor(() => expect(host.actors.messages(actor.id).filter(message => message.direction === "out" && !message.error)).toHaveLength(1), { timeout: 10_000 });
+      expect(host.actors.messages(actor.id).find(message => message.direction === "out" && !message.error)?.text).toBe("fake worker complete");
+      expect(nativeLaunches).toHaveBeenCalledTimes(1);
+      expect(unregisterLate).toBeUndefined(); // unrelated actor completed while the import is STILL unresolved
+      const refused = await host.agents.spawn({ task: "cannot launch while the recorded runner is unavailable", runner: runner.adapter.id, residency: "durable" })
+        .then(() => { throw new Error("Unavailable runner unexpectedly launched"); }, error => error);
+      expect(refused).toBeInstanceOf(managerModule.AgentRunnerRecoveryUnavailableError);
+      expect(refused).toMatchObject({ code: "FABRIC_RUNNER_RECOVERY_UNAVAILABLE", runner: runner.adapter.id, reason: expect.stringMatching(/runner module.*(did not load|timed out|timeout)/i) });
+      expect(refused.message).toContain(runner.adapter.id);
+      expect(refused.message).toContain(refused.reason);
+      expect(runner.calls.starts).toEqual([handle.id]);
+      expect(runner.calls.attaches).toEqual([]);
+
+      gate.release();
+      await gate.finished; // actual late module registration, never a manual manager unblock
+      const late = await host.agents.spawn({ task: "independent request may retry after late registration", runner: runner.adapter.id, residency: "durable" });
+      expect(late.id).not.toBe(handle.id);
+      runner.reporters.get(late.id)!.finish({ status: "completed", output: "late registered runner completed once" });
+      await host.agents.join(late.id);
+      expect(await host.agents.wait(late.id, { deferConsumption: () => undefined })).toMatchObject({ status: "completed", text: "late registered runner completed once" });
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(runner.calls.starts).toEqual([handle.id, late.id]);
+      expect(runner.calls.attaches).toEqual([]); // late registration cannot revive/restart the indeterminate original
+      expect(runner.calls.stops).toBe(0);
+      expect(await host.agents.wait(handle.id, { deferConsumption: () => undefined })).toEqual(originalResult);
+      expect(host.agents.status(handle.id)).toMatchObject({ status: "failed", outcome: "indeterminate", error: record.error });
+      expect(host.agents.status(handle.id)).not.toHaveProperty("recovery");
+      expect(host.agents.listForUi().partial).toBe(false);
+      expect(host.actors.messages(actor.id).filter(message => message.direction === "out" && !message.error)).toHaveLength(1);
+      expect(nativeLaunches).toHaveBeenCalledTimes(1);
+      expect(recovery.fallbacks).toHaveLength(1);
+      expect(readHostLease(config.meshRoot, host.hostId)?.expiresAt).toBeGreaterThan(Date.now());
+      console.log(JSON.stringify({ metric: "resident-runner-module-timeout", moduleWaitMs, nativeOutputs: 1,
+        recoveryPasses: recovery.fallbacks.length, hostedStarts: runner.calls.starts.length,
+        originalReattachments: runner.calls.attaches.length, typedRefusal: refused.code }));
+    } finally {
+      if (deadline) clearTimeout(deadline);
+      await gate.finish();
+      host?.agents.resumeAfterRelease();
+      await host?.close(); await previous.close();
+      vi.restoreAllMocks(); unregisterLate?.(); runner.unregister(); gate.dispose();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   // Keep reason: a single oversized metadata row must not bypass the host's
   // cooperative slice budget or turn skipped metadata into orphan authority.
   it("rejects oversized metadata before pathname or descriptor payload reads without changing the live run", async () => {
@@ -1157,7 +1419,9 @@ describe("resident retained-run startup (smarty-dev#4796)", () => {
         const metadata: ResidentAgentMetadata = { format: 1, rootId: config.rootId, id: handle.id, handle,
           runnerModule: gate.module, runDirectory: path.join(runs, handle.id), createdAt: 1, updatedAt: 1 };
         saveMetadata(config, metadata);
-        const recovery = observeHostedRecovery();
+        const originalStatus = fs.readFileSync(path.join(runs, handle.id, "status.json"), "utf8");
+        const completionQuery = vi.fn(() => ({ partial: host.agents.listForUi().partial, status: host.agents.status(handle.id) }));
+        const recovery = observeHostedRecovery(undefined, outcome === "metadata changed" ? completionQuery : undefined);
         const leaseAbort = new AbortController();
         let metadataCursorClosed = false;
         const opendir = fs.promises.opendir;
@@ -1201,6 +1465,29 @@ describe("resident retained-run startup (smarty-dev#4796)", () => {
           await recovery.complete();
           expect(recovery.fallbacks).toHaveLength(1);
           expect(host.agents.status(handle.id)).toMatchObject({ transport: "hosted", status: "running" });
+        } else if (outcome === "metadata changed") {
+          expect(completionQuery).toHaveBeenCalledOnce();
+          expect(completionQuery).toHaveReturnedWith({ partial: true, status: expect.objectContaining({
+            id: handle.id, status: "finishing", recovery: { state: "pending", lastKnownStatus: handle.status },
+          }) }); // exact lookup ran AFTER manager reconciliation, BEFORE host completion
+          // Exact-row veto grants neither a running target nor authority to
+          // terminalize the changed row; a complete pass clears its observation.
+          const ui = host.agents.listForUi(); // read before status can refresh any cache
+          expect(ui.partial).toBe(false);
+          expect(ui.some(row => row.id === handle.id)).toBe(false);
+          expect(host.agents.list().some(row => row.id === handle.id)).toBe(false);
+          expect(() => host.agents.status(handle.id)).toThrow(/Unknown Fabric agent/);
+          await expect(host.agents.wait(handle.id, { timeoutMs: 1_000 })).rejects.toThrow(/Unknown Fabric agent/);
+          await expect(host.agents.join(handle.id)).rejects.toThrow(/Unknown Fabric agent/);
+          expect(JSON.parse(fs.readFileSync(path.join(runs, handle.id, "status.json"), "utf8")))
+            .toMatchObject({ id: handle.id, status: "running" });
+          expect(JSON.parse(fs.readFileSync(path.join(config.residencyRoot, "agents", `${handle.id}.json`), "utf8")))
+            .toEqual({ ...metadata, updatedAt: 2 });
+          expect(fs.readFileSync(path.join(runs, handle.id, "status.json"), "utf8")).toBe(originalStatus);
+          expect(fs.readFileSync(path.join(config.residencyRoot, "agents", `${handle.id}.json`), "utf8"))
+            .toBe(JSON.stringify({ ...metadata, updatedAt: 2 }));
+          expect(runner.calls.attaches).toEqual([]);
+          expect(runner.calls.starts).toEqual([handle.id]);
         }
       } finally {
         if (deadline) clearTimeout(deadline);

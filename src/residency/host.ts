@@ -80,7 +80,8 @@ import { ActorRegistryStore } from "../actors/registry-store.js";
 import { canonicalResidentWakeConfig, residentWakeConfigMatches, residentWakeCapacityAvailable, residentWakeIndexPath, RESIDENT_WAKE_INDEX_MAX_ROOTS, ResidentWakeRecoveryReader, type ResidentWakeRecoveryBatch } from "./wake-index.js";
 import { ActorSessionResetCancelledError } from "../actors/session-reset-error.js";
 import type { FabricActorInfo } from "../actors/types.js";
-import type { AgentRunRecord } from "../agents/types.js";
+import type { AgentRunRecord, AgentRunResult } from "../agents/types.js";
+import { getAgentRunner } from "../agents/runner-registry.js";
 import type { StateProjector } from "../mesh/state-projector.js";
 import { AgentManager, type PendingHostedRecoveryInfo } from "../agents/manager.js";
 import { assertRecoveryAllowed, recoverySlice } from "../agents/enodev-recovery.js";
@@ -150,6 +151,7 @@ const RETENTION_REFERENCE_MAX_ENTRIES = 64;
 // Metadata is a handle, not a retained answer. Bound work before read/parse,
 // including a file that grows after fstat (one extra byte detects the race).
 const HOSTED_RECOVERY_METADATA_MAX_BYTES = 1024 * 1024;
+const RUNNER_MODULE_RECOVERY_TIMEOUT_MS = 30_000;
 // ponytail: 30s only amortizes deliveries racing clean close; no worker/session is kept warm.
 const IDLE_EXIT_MS = 30_000;
 // Reuse active-actor observations on the existing request poll, not dormancy checks.
@@ -371,6 +373,7 @@ export class ResidentHost {
   #hostedRecoveryPending: Promise<void> | undefined;
   #hostedRecoveryAbort: AbortController | undefined;
   #hostedRecoveryOversizeWarned = false;
+  #runnerModuleRetryAt: number | undefined;
   // Restored queues and direct launches share the existing release gates until
   // ALL admitted runner modules (not just hosted rows) have been attempted.
   #runnerModulesReady = false;
@@ -3108,6 +3111,40 @@ export class ResidentHost {
     } catch { return undefined; } // Torn/unreadable/unsafe is never positive absence.
   }
 
+  /** The host's settlement archive is the existing restart authority used by
+   * ResidentClient. Never substitute worker progress or re-fingerprint a claimed
+   * manager-result.json whose original publication proof died with its manager. */
+  #hostedRecoveryResult(id: string): AgentRunResult | undefined {
+    if (!/^[0-9a-f]{32}$/.test(id)) return undefined;
+    const directory = path.join(this.config.residencyRoot, "results");
+    const file = residentResultPath(this.config.residencyRoot, id);
+    let fd: number | undefined;
+    try {
+      const parent = fs.lstatSync(directory);
+      if (!parent.isDirectory() || parent.isSymbolicLink() ||
+          fs.realpathSync(directory) !== path.join(fs.realpathSync(this.config.residencyRoot), "results") ||
+          (process.getuid && (parent.uid !== process.getuid() || (parent.mode & 0o022) !== 0))) return undefined;
+      const leaf = fs.lstatSync(file);
+      if (!leaf.isFile() || leaf.isSymbolicLink() || leaf.nlink !== 1) return undefined;
+      fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0));
+      const before = fs.fstatSync(fd);
+      if (!before.isFile() || before.nlink !== 1 || before.dev !== leaf.dev || before.ino !== leaf.ino ||
+          (process.getuid && (before.uid !== process.getuid() || (before.mode & 0o777) !== 0o600))) return undefined;
+      const source = fs.readFileSync(fd, "utf8");
+      const after = fs.fstatSync(fd), current = fs.lstatSync(file);
+      if (before.size !== Buffer.byteLength(source) || before.size !== after.size || before.mtimeMs !== after.mtimeMs ||
+          before.ctimeMs !== after.ctimeMs || current.dev !== before.dev || current.ino !== before.ino ||
+          current.size !== before.size || current.mtimeMs !== before.mtimeMs || current.ctimeMs !== before.ctimeMs) return undefined;
+      const result = JSON.parse(source) as AgentRunResult;
+      if (result?.id !== id || result.transport !== "hosted" ||
+          !["completed", "failed", "stopped", "timed_out"].includes(result.status) ||
+          typeof result.name !== "string" || typeof result.runner !== "string" || typeof result.cwd !== "string" ||
+          typeof result.text !== "string" || typeof result.task !== "string" || !result.usage) return undefined;
+      return result;
+    } catch { return undefined; }
+    finally { if (fd !== undefined) fs.closeSync(fd); }
+  }
+
   #canRecoverHostedRuns(): boolean {
     return this.#ready && !this.#closed && !this.#idleExitRequested && !this.#sleeping &&
       !this.#staged && !this.#handover && !this.#drain && this.participants.canConsumeMesh();
@@ -3118,17 +3155,26 @@ export class ResidentHost {
   }
 
   #continueHostedRecovery(): void {
-    if (!this.#hostedRecoveryNeeded || this.#hostedRecoveryPending || !this.#canRecoverHostedRuns()) return;
+    if (!this.#canRecoverHostedRuns()) return;
+    // Retry only from the existing authority-fenced poll / maintenance path.
+    // Late import settlement cannot resume or attach anything.
+    if (!this.#hostedRecoveryNeeded && this.#runnerModuleRetryAt !== undefined && Date.now() >= this.#runnerModuleRetryAt) {
+      this.#hostedRecoveryNeeded = true;
+      this.#runnerModuleRetryAt = undefined;
+    }
+    if (!this.#hostedRecoveryNeeded || this.#hostedRecoveryPending) return;
     const abort = new AbortController();
     this.#hostedRecoveryAbort = abort;
     const leaseSignal = this.participants.transportLeaseSignal;
     const signal = leaseSignal ? AbortSignal.any([abort.signal, leaseSignal]) : abort.signal;
     const canRecover = (): boolean => !signal.aborted && this.#canRecoverHostedRuns();
     this.#admissions++;
-    this.#hostedRecoveryPending = this.#recoverHostedRuns(signal, canRecover).then(() => {
+    this.#hostedRecoveryPending = this.#recoverHostedRuns(signal, canRecover).then(modulesLoaded => {
       // An interrupted/partial pass must not discharge the discovery obligation.
       if (canRecover()) {
         this.#hostedRecoveryNeeded = false;
+        this.agents.clearPendingHostedRecovery();
+        this.#runnerModuleRetryAt = modulesLoaded ? undefined : Date.now() + RUNNER_MODULE_RECOVERY_TIMEOUT_MS;
         // Restored activation replay may only resume after discovery/adoption,
         // never in the gap between runner imports and the hosted-run scan.
         this.#resumeAfterRunnerModules();
@@ -3168,26 +3214,36 @@ export class ResidentHost {
   async #waitForRunnerModule(module: string, signal: AbortSignal): Promise<void> {
     signal.throwIfAborted();
     let abort!: () => void;
+    let timer: NodeJS.Timeout | undefined;
     try {
       await Promise.race([loadRunnerModule(module), new Promise<never>((_resolve, reject) => {
         abort = () => reject(new Error("Run recovery interrupted during runner import"));
         signal.addEventListener("abort", abort, { once: true });
         if (signal.aborted) abort();
+      }), new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(`runner module did not load within ${RUNNER_MODULE_RECOVERY_TIMEOUT_MS}ms`)),
+          RUNNER_MODULE_RECOVERY_TIMEOUT_MS);
+        timer.unref?.();
       })]);
-    } finally { signal.removeEventListener("abort", abort); }
+    } finally {
+      signal.removeEventListener("abort", abort);
+      if (timer) clearTimeout(timer);
+    }
   }
 
   /** One maintenance-owned, authority-fenced pass: stream metadata (including
    * skipped entries), restore every admitted module, then inspect hosted runs.
    * Exact selected bytes survive imports/yields; only positive metadata absence
    * can authorize the crash window. Nothing in this pass submits a new job. */
-  async #recoverHostedRuns(signal: AbortSignal, canRecover: () => boolean): Promise<void> {
+  async #recoverHostedRuns(signal: AbortSignal, canRecover: () => boolean): Promise<boolean> {
     const options = { signal, canRecover,
       budgetMs: RETENTION_REFERENCE_BUDGET_MS, maxEntries: RETENTION_REFERENCE_MAX_ENTRIES };
     const check = (): void => assertRecoveryAllowed(options);
     check();
     const selected = new Map<string, string | null>();
     const modules = new Set<string>();
+    const runnerModules = new Map<string, Set<string>>();
+    const runModules = new Map<string, string>();
     const slice = recoverySlice(options);
     const cursor = await fs.promises.opendir(this.#agentsPath);
     try {
@@ -3205,13 +3261,34 @@ export class ResidentHost {
         if (!row) continue;
         if (row.metadata.handle.transport === "hosted") selected.set(id, row.source);
         const module = row.metadata.runnerModule;
-        if (typeof module !== "string" || modules.has(module)) continue;
+        if (typeof module !== "string") continue;
         modules.add(module);
-        check();
-        await this.#waitForRunnerModule(module, signal).catch(() => undefined);
-        check();
+        runModules.set(id, module);
+        let runners = runnerModules.get(module);
+        if (!runners) runnerModules.set(module, runners = new Set());
+        runners.add(row.metadata.handle.runner);
       }
     } finally { await cursor.close(); }
+    check();
+    const failures = new Map<string, string>();
+    // One attempt per module per pass, concurrently: N missing modules consume
+    // one timeout, not a serial N * 30 seconds. Aborts remain independent.
+    await Promise.all([...modules].map(async module => {
+      check();
+      try { await this.#waitForRunnerModule(module, signal); }
+      catch (error) {
+        check();
+        const reason = `runner module did not load: ${module} (${errorMessage(error)})`;
+        failures.set(module, reason);
+        diagnostics.warn("src/residency/host.ts", `[pi-fabric] resident ${reason}`);
+      }
+      check();
+      for (const runner of runnerModules.get(module) ?? []) {
+        const reason = getAgentRunner(runner) ? undefined : failures.get(module) ?? `runner module did not register ${runner}: ${module}`;
+        if (reason) failures.set(module, reason);
+        this.agents.setRunnerRecoveryUnavailable(runner, reason);
+      }
+    }));
     check();
     // Direct launches may now use every admitted module. Restored actors retain
     // the bootstrap hold until the COMPLETE hosted scan succeeds; release/drain
@@ -3220,6 +3297,12 @@ export class ResidentHost {
     this.#resumeAfterRunnerModules();
     check();
     await this.agents.recoverHostedRuns(undefined, { ...options,
+      savedResult: id => this.#hostedRecoveryResult(id),
+      refusalReason: id => {
+        const module = runModules.get(id);
+        const row = this.#hostedRecoveryMetadata(id);
+        return module && row && !getAgentRunner(row.metadata.handle.runner) ? failures.get(module) : undefined;
+      },
       shouldRecover: id => {
         if (!canRecover()) return false;
         const row = this.#hostedRecoveryMetadata(id);
@@ -3234,6 +3317,7 @@ export class ResidentHost {
       },
     });
     check();
+    return failures.size === 0;
   }
 
   #recoverInterruptedRequests(): void {

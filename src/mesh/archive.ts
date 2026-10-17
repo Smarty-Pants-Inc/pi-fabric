@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { writeFileAtomic } from "../core/atomic-write.js";
 import type { MeshEvent } from "./store.js";
+import type { IndexDirectoryBarrier } from "./receipt-namespace.js";
 
 /**
  * The durable fleet log (smarty-dev#754, Paul's decision 2): every event of a mesh root as plain
@@ -262,7 +263,7 @@ export class MeshArchive {
    * Archives a publish's event before it goes live: records where it goes, writes the whole
    * line and syncs it. On any failure it cuts the line back out and throws.
    */
-  begin(entry: MeshArchiveEntry): MeshArchivePending {
+  begin(entry: MeshArchiveEntry, syncIndexDirectory?: IndexDirectoryBarrier): MeshArchivePending {
     this.#requireRoot();
     const relative = this.#fileFor(entry.event, this.#headDay());
     const absolute = path.join(this.dir, relative);
@@ -289,7 +290,7 @@ export class MeshArchive {
       fs.fdatasyncSync(descriptor);
       // A keyed index replaces a durable `absent` reservation: it is an intent-recovery fence
       // and stays durable, after the bytes it names. Nothing resolves an unkeyed index.
-      this.#writeIndex(entry.event.sequence, { sequence: entry.event.sequence, id: entry.event.id, file: relative, offset: pending.size, length: bytes.length, ...(entry.event.dedupeKey ? { committed: false } : {}) }, entry.event.dedupeKey !== undefined);
+      this.#writeIndex(entry.event.sequence, { sequence: entry.event.sequence, id: entry.event.id, file: relative, offset: pending.size, length: bytes.length, ...(entry.event.dedupeKey ? { committed: false } : {}) }, entry.event.dedupeKey !== undefined, syncIndexDirectory);
       // Rare: a new segment's (and day's) name must be durable before its event goes live.
       if (fresh) this.#syncDays(relative);
     } catch (error) {
@@ -304,11 +305,11 @@ export class MeshArchive {
   }
 
   /** The event is live: it is committed. Moves the head and seals any closed day. */
-  commit(pending: MeshArchivePending, sealClosedDays = true): void {
+  commit(pending: MeshArchivePending, sealClosedDays = true, syncIndexDirectory?: IndexDirectoryBarrier): void {
     // Advisory checkpoint of bytes begin() already synced: plain. A lost or stale one is a
     // valid prefix (rebuilt in slices); every truncation path saves its checkpoint durably.
     if (pending.digestAfter) this.#saveDigest(pending.file, pending.digestAfter, fs.statSync(path.join(this.dir, pending.file)), false);
-    if (pending.dedupe) this.confirmLive(pending.sequence, pending.id);
+    if (pending.dedupe) this.confirmLive(pending.sequence, pending.id, syncIndexDirectory);
     // PENDING goes first: a stop before the head moves leaves a head that is behind, and the
     // catch-up skips the event it finds already archived.
     // ponytail (smarty-dev#8907, every PENDING.json/DIGEST-REPAIR.json removal below): these are fixed-name control
@@ -323,12 +324,12 @@ export class MeshArchive {
   }
 
   /** A direct live anchor (or a synced reboot promotion) proves publication, not just append. */
-  confirmLive(sequence: number, id: string): void {
+  confirmLive(sequence: number, id: string, syncIndexDirectory?: IndexDirectoryBarrier): void {
     const indexed = this.#readJson<MeshArchiveIndexEntry | { absent: true }>(path.relative(this.dir, this.#indexPath(sequence)));
     // Old catch-ups had no sidecar; only new reserved entries need this transition.
     if (!indexed || "absent" in indexed) return;
     if (indexed.id !== id) throw new MeshArchiveLookupUnavailableError("Cannot commit a mismatched archive sequence index");
-    if (indexed.committed === false) this.#writeIndex(sequence, { ...indexed, committed: true });
+    if (indexed.committed === false) this.#writeIndex(sequence, { ...indexed, committed: true }, true, syncIndexDirectory);
   }
 
   /**
@@ -818,17 +819,19 @@ export class MeshArchive {
   }
 
   /** Install a durable proof of non-append before creating a publication intent. */
-  reserveLookup(sequence: number): void {
+  reserveLookup(sequence: number, syncIndexDirectory?: IndexDirectoryBarrier): void {
     this.#requireRoot();
-    this.#writeIndex(sequence, { sequence, absent: true });
+    this.#writeIndex(sequence, { sequence, absent: true }, true, syncIndexDirectory);
   }
 
   #indexPath(sequence: number): string {
     return path.join(this.dir, MESH_ARCHIVE_SEQUENCE_INDEX, String(Math.floor(sequence / 1024)), `${sequence}.json`);
   }
 
-  #writeIndex(sequence: number, entry: MeshArchiveIndexEntry | { sequence: number; absent: true }, durable = true): void {
-    writeFileAtomic(this.#indexPath(sequence), JSON.stringify(entry), { durable });
+  #writeIndex(sequence: number, entry: MeshArchiveIndexEntry | { sequence: number; absent: true }, durable = true, syncIndexDirectory?: IndexDirectoryBarrier): void {
+    writeFileAtomic(this.#indexPath(sequence), JSON.stringify(entry), { durable,
+      ...(syncIndexDirectory ? { syncDirectory: (directory: string) => syncIndexDirectory(directory, this.dir, this.meshRoot, sequence) } : {}),
+    });
   }
 
   #readJson<T>(relative: string): T | undefined {

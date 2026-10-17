@@ -285,7 +285,7 @@ const namespaceSnapshot = (target: string, receipt?: Inode) => {
     const identity = typeof receipt?.ino === "bigint" ? fs.lstatSync(current, { bigint: true }) : endpoint;
     if (receipt && !sameInode(receipt, identity)) throw new Error("Session receipt inode changed during namespace confirmation");
     parents.push(endpoint.isDirectory() ? current : path.dirname(current));
-    return { entries, directories, parents };
+    return { entries, directories, parents, hasSymlinks: hops !== 0 };
 };
 
 /**
@@ -320,6 +320,16 @@ export const syncPathNamespaceDurable = (target: string, receipt: Inode | undefi
 
 /** The checked complete-namespace identity syncPathNamespace compares (not a durability receipt). */
 export const namespaceKey = (target: string, receipt?: Inode): string => JSON.stringify(namespaceSnapshot(target, receipt).entries);
+
+/** Read-only identity inspection using the SAME resolver as the full barrier. Not a durability receipt. */
+export const namespaceIdentitySnapshot = (target: string, receipt?: Inode) => {
+  const snapshot = namespaceSnapshot(target, receipt);
+  return Object.freeze({ key: JSON.stringify(snapshot.entries), hasSymlinks: snapshot.hasSymlinks,
+    directories: Object.freeze([...snapshot.directories].map(([directory, stat]) => Object.freeze({
+      directory, dev: stat.dev, ino: stat.ino, mode: stat.mode & fs.constants.S_IFMT,
+    }))),
+  });
+};
 
 export const syncPathNamespace = (target: string, receipt?: Inode): void => {
   const before = namespaceSnapshot(target, receipt);

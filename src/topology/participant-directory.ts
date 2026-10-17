@@ -460,6 +460,11 @@ const hostFromEntry = (entry: MeshStateEntry): FabricHostRecord | undefined => {
 const rootPeerName = (name: string, label: string | undefined, sessionId: string): string =>
   name !== "main" ? name : label ?? `Peer ${sessionId.slice(0, 8)}`;
 
+export interface FabricPeerListOptions extends FabricParticipantListOptions {
+  /** Project display listing from this refresh; never reused by authoritative/fresh reads. */
+  displayParticipants?: readonly FabricParticipantInfo[];
+}
+
 const peerFromParticipant = (participant: FabricParticipantInfo): FabricPeerInfo | undefined => {
   if (
     participant.kind !== "root" ||
@@ -2370,8 +2375,10 @@ export class ParticipantDirectory implements FabricParticipantSource {
     return this.list({ scope: "project", kinds: ["root"] }, now);
   }
 
-  peers(now = Date.now(), options: FabricParticipantListOptions = {}): FabricPeerInfo[] {
-    return this.list({ ...options, scope: "project", kinds: ["root"] }, now)
+  peers(now = Date.now(), options: FabricPeerListOptions = {}): FabricPeerInfo[] {
+    const display = options.background === true && options.fresh !== true
+      ? options.displayParticipants : undefined;
+    return (display ?? this.list({ ...options, scope: "project", kinds: ["root"] }, now))
       .filter((participant) => participant.id !== this.options.rootId)
       .flatMap((participant) => {
         const peer = peerFromParticipant(participant);

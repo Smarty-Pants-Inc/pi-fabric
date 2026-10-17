@@ -97,7 +97,7 @@ import { LifecycleBroker } from "./lifecycle/broker.js";
 import { extensionContextLive } from "./session-liveness.js";
 import type { FabricLifecycleEventType } from "./lifecycle/types.js";
 import { FabricControlPlane } from "./topology/control-plane.js";
-import { ParticipantDirectory } from "./topology/participant-directory.js";
+import { ParticipantDirectory, type FabricPeerListOptions } from "./topology/participant-directory.js";
 import type { FabricTransport } from "./transport/types.js";
 import { rootParticipantName, validName } from "./topology/participant-name.js";
 import { herdrNameLookup, herdrPaneId, readHerdrAgentName } from "./topology/herdr-name.js";
@@ -397,7 +397,7 @@ export class FabricRuntimeState {
     return this.#mainAgent.info(context);
   }
 
-  peerInfos(options: FabricParticipantListOptions = {}): FabricPeerInfo[] {
+  peerInfos(options: FabricPeerListOptions = {}): FabricPeerInfo[] {
     return this.#participants?.peers(undefined, options) ?? [];
   }
 

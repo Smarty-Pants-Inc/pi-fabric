@@ -7,7 +7,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { MainAgentController } from "../src/main-agent.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { openNodeSqlite } from "../src/mesh/state-sqlite.js";
-import { AgentMessageRouter } from "../src/providers/agents-message-router.js";
+import { AgentMessageRouter, FabricDirectoryUnavailableError } from "../src/providers/agents-message-router.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { readHostLease, writeHostLease } from "../src/topology/host-leases.js";
@@ -113,6 +113,23 @@ describe("routing refresh removal on the Main admission boundary", () => {
     expect(f.senderDirectory.canConsumeMesh()).toBe(false);
   });
 
+  it.each(["file", "sqlite"] as const)("a late %s lookup refuses immediately; only an explicit caller retry admits", async backend => {
+    const f = await fixture(backend);
+    expect(f.senderDirectory.routingUnavailable()).toBeUndefined();
+    const probe = vi.spyOn(f.senderDirectory, "refreshRoutingView");
+    const failure = new Error("late canonical lookup unavailable");
+    vi.spyOn(f.senderDirectory, "get").mockImplementationOnce(() => { throw failure; });
+    const options = { idempotencyKey: "caller-retry" };
+    await expect(f.send.routeMessage(f.targetId, "caller retry", { proof: "unchanged" }, "followUp", undefined, options))
+      .rejects.toMatchObject({ code: "FABRIC_DIRECTORY_UNAVAILABLE", retryable: true, cause: failure });
+    expect(f.commands()).toEqual([]); expect(f.items()).toEqual([]); expect(f.accept).not.toHaveBeenCalled();
+    expect(probe).not.toHaveBeenCalled();
+    await expect(f.send.routeMessage(f.targetId, "caller retry", { proof: "unchanged" }, "followUp", undefined, options))
+      .resolves.toMatchObject({ queued: true, acknowledged: true });
+    assertAdmission(f, "caller retry");
+    expect(probe).not.toHaveBeenCalled();
+  });
+
   it("a live validated SQLite target admits through the original 2.5s writer burst (#9805)", async () => {
     const f = await fixture("sqlite", true);
     const holder = openNodeSqlite(path.join(f.meshRoot, "state.db")); holder.exec("BEGIN IMMEDIATE");
@@ -181,6 +198,21 @@ describe("routing refresh removal on the Main admission boundary", () => {
       expect(f.items()).toEqual([]); expect(f.commands()).toEqual([]); expect(f.accept).not.toHaveBeenCalled();
       expect(fs.readFileSync(file, "utf8")).toBe(damaged);
     } finally { fs.writeFileSync(file, healthy); }
+  });
+
+  it("a directory-class failure after durable Main admission never refreshes or republishes", async () => {
+    const f = await fixture("file");
+    const probe = vi.spyOn(f.senderDirectory, "refreshRoutingView");
+    const failure = new FabricDirectoryUnavailableError("ACK observation failed after admission");
+    const request = f.sender.request.bind(f.sender);
+    vi.spyOn(f.sender, "request").mockImplementationOnce(async (...args) => {
+      await request(...args); // Real publication, receiver, journal and owner ACK precede the failure.
+      throw failure;
+    });
+    await expect(f.send.routeMessage(f.targetId, "one committed admission", { proof: "unchanged" }, "followUp"))
+      .rejects.toBe(failure);
+    assertAdmission(f, "one committed admission");
+    expect(probe).not.toHaveBeenCalled();
   });
 
   it("a failed ACK and its cached failure never become a fresh send or second Main side effect", async () => {

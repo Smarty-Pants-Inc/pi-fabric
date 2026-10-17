@@ -23,6 +23,7 @@ import { watchBridgeStore } from "../mesh/change-notifier.js";
 import type { FabricMessageSender } from "../protocol.js";
 import { eventReceipts } from "./root-inbox-shared.js";
 import { FileTransport } from "../transport/file.js";
+import { fabricPathBProbeEpochNs, hasFabricPathBProbeObserver, recordFabricPathBProbe, type FabricPathBProbeEvent } from "../transport/probe-hooks.js";
 import { TransportInvalidError, TransportUncertainError, TransportUnavailableError, TransportUnsupportedError, type FabricTransport, type TransportDelivery, type TransportDrainState, type TransportEnvelope, type TransportSent } from "../transport/types.js";
 import type { ParticipantRoute, ParticipantView } from "./participant-view.js";
 import { assertNatsDrainReceiptForRelease, readNatsDrainReceipt } from "./nats-drain-receipt.js";
@@ -1914,6 +1915,17 @@ export class FabricControlPlane {
     }, () => this.#paused, () => this.options.canConsumeMesh?.() !== false, event => {
       // Release readback needs evidence at the exact cursor commit, not after an await.
       this.#lastSequence = event.sequence;
+      if (hasFabricPathBProbeObserver() && event.to === this.options.hostId && (event.topic === CONTROL_TOPIC || event.topic === ACK_TOPIC)) {
+        const data = ownDataRecord(event.data);
+        // Native FILE reader confirmation is an in-memory cursor commit, NOT a durable/broker ACK.
+        const confirmation = { type: "inbox-ack-confirmed", atNs: fabricPathBProbeEpochNs(), carrier: "file",
+          envelopeId: event.id, ...(typeof data?.commandId === "string" ? { commandId: data.commandId } : {}),
+          kind: event.topic === ACK_TOPIC ? "ack" : "command", operation: event.kind,
+          targetId: typeof data?.targetId === "string" ? data.targetId : event.to, sequence: event.sequence, attempt: 1,
+          confirmationSource: "native-file-reader", cursorPersistence: "in-memory",
+        } satisfies FabricPathBProbeEvent & { readonly confirmationSource: "native-file-reader"; readonly cursorPersistence: "in-memory" };
+        recordFabricPathBProbe(confirmation);
+      }
     }, () => {
       if (this.#acknowledgementsFull()) {
         this.#ackCapacityBlocked = true;

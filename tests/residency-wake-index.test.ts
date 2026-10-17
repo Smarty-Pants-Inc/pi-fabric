@@ -156,35 +156,55 @@ describe("append-locked parsed resident routes", () => {
 
   it.each(["in-place", "atomic replacement"] as const)("does not seed fresh-at-entry routes after an FD-read %s rewrite ages the clock", async mode => {
     const f = setup(), now = Date.now(), read = fs.readFileSync;
-    let rewritten = false;
+    const replacementBlocked = mode === "atomic replacement" && process.platform === "win32";
+    let rewriteAttempted = false, rewriteError: unknown;
     const fds = mockRouteMetadata(f.file, stat => typeof stat.ino === "bigint"
       ? { mtimeNs: BigInt(now) * 1_000_000n, ctimeNs: BigInt(now) * 1_000_000n } : {});
     vi.spyOn(fs, "readFileSync").mockImplementation((target, ...args) => {
       const bytes = read(target, ...args);
-      if (typeof target === "number" && fds.has(target) && !rewritten) {
-        expect(bytes).toBe(f.original);
-        expect(fs.existsSync(path.join(f.mesh.root, ".lock"))).toBe(true);
-        expect(Buffer.byteLength(f.changed)).toBe(Buffer.byteLength(f.original));
-        const before = fs.statSync(f.file, { bigint: true });
-        rewritten = true;
-        const next = mode === "in-place" ? f.file : `${f.file}.next`;
-        fs.writeFileSync(next, f.changed);
-        if (mode !== "in-place") fs.renameSync(next, f.file);
-        const after = fs.statSync(f.file, { bigint: true });
-        expect(after.ino === before.ino).toBe(mode === "in-place");
-        expect([after.dev, after.size, after.mtimeNs, after.ctimeNs]).toEqual([before.dev, before.size, before.mtimeNs, before.ctimeNs]);
-        f.clock.mockReturnValue(now + 11);
+      if (typeof target === "number" && fds.has(target) && !rewriteAttempted) {
+        try {
+          expect(bytes).toBe(f.original);
+          expect(fs.existsSync(path.join(f.mesh.root, ".lock"))).toBe(true);
+          expect(Buffer.byteLength(f.changed)).toBe(Buffer.byteLength(f.original));
+          const before = fs.statSync(f.file, { bigint: true });
+          rewriteAttempted = true;
+          const next = mode === "in-place" ? f.file : `${f.file}.next`;
+          fs.writeFileSync(next, f.changed);
+          // libuv shares DELETE, but legacy MoveFileExW replacement still requires a closed destination.
+          if (replacementBlocked) expect(() => fs.renameSync(next, f.file)).toThrow(expect.objectContaining({ code: "EPERM" }));
+          else if (mode !== "in-place") fs.renameSync(next, f.file);
+          const after = fs.statSync(f.file, { bigint: true });
+          expect(after.ino === before.ino).toBe(mode === "in-place" || replacementBlocked);
+          expect([after.dev, after.size, after.mtimeNs, after.ctimeNs]).toEqual([before.dev, before.size, before.mtimeNs, before.ctimeNs]);
+          f.clock.mockReturnValue(now + 11);
+        } catch (error) { rewriteError = error; throw error; }
       }
       return bytes;
     });
     try {
       expect((await f.publish("changed.delivery")).sequence).toBe(1);
-      expect(rewritten).toBe(true);
+      // readWakeJson catches every error, including a failing assertion or filesystem operation in the spy.
+      expect(rewriteError).toBeUndefined();
+      expect(rewriteAttempted).toBe(true);
       expect(fds.size).toBe(0);
+      expect(read(f.file, "utf8")).toBe(replacementBlocked ? f.original : f.changed);
+      expect(f.parses()).toBe(1);
       expect(index.residentUnacknowledgedDeliveries(f.mesh.root).size).toBe(0);
       const event = await f.publish("changed.delivery");
-      expect(event.sequence).toBe(2); f.pending(event);
-      expect(f.parses()).toBe(2);
+      expect(event.sequence).toBe(2);
+      expect(f.parses()).toBe(2); // Even an unchanged route must reparse: the first observation was fresh.
+      if (replacementBlocked) {
+        expect(index.residentUnacknowledgedDeliveries(f.mesh.root).size).toBe(0);
+        expect(fds.size).toBe(0);
+        const before = fs.statSync(f.file, { bigint: true });
+        fs.renameSync(`${f.file}.next`, f.file); // The same replacement succeeds after readWakeJson closes its fd.
+        expect(fs.statSync(f.file, { bigint: true }).ino).not.toBe(before.ino);
+        expect(read(f.file, "utf8")).toBe(f.changed);
+        const replaced = await f.publish("changed.delivery");
+        expect(replaced.sequence).toBe(3); f.pending(replaced);
+        expect(f.parses()).toBe(3);
+      } else f.pending(event);
     } finally { f.close(); }
   });
 

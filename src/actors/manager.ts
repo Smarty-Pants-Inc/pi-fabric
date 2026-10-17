@@ -4687,7 +4687,10 @@ export class ActorManager {
         }, this.#preparationTimeoutMs);
       })]);
     } catch (error) {
-      throw error instanceof ActorPreparationError ? error : new ActorPreparationError(actor.id, phase, error);
+      // The operation boundary owns phase evidence, not an error supplied by its caller.
+      // Preserve same-phase subclasses (notably timeouts) and their retry budgets.
+      throw error instanceof ActorPreparationError && error.phase === phase
+        ? error : new ActorPreparationError(actor.id, phase, error);
     } finally {
       if (timer) clearTimeout(timer);
     }

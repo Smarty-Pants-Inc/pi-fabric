@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ActorManager } from "../src/actors/manager.js";
+import { ActorManager, ActorPreparationError } from "../src/actors/manager.js";
 import { ActorRegistryStore, ActorRegistryUpdateVetoedError } from "../src/actors/registry-store.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
@@ -302,19 +302,23 @@ describe("real registry preparation and callerless subscription retention", () =
     expect(run).not.toHaveBeenCalled();
   });
 
-  it("P1: a typed veto thrown by binding stays hard until explicit reset", async () => {
+  it.each(["direct typed", "false-registry wrapped typed"] as const)("P1: a %s veto thrown by binding stays hard until explicit reset", async variant => {
     let unavailable = false;
     const { actors, agents, mesh, root } = setup({ preparationRetryMs: 5, resolvePiModel: async model => {
-      if (unavailable) throw new ActorRegistryUpdateVetoedError("generation");
+      if (unavailable) {
+        const veto = new ActorRegistryUpdateVetoedError("generation");
+        throw variant === "direct typed" ? veto : new ActorPreparationError("session:veto-retention", "registry", veto);
+      }
       return model;
     } });
     const actor = await create(actors);
     const run = vi.spyOn(agents, "run");
     unavailable = true;
-    const done = settled(actors, actor.id, () => actors.messages(actor.id).some(message =>
-      (message.data as { phase?: string })?.phase === "binding"));
+    const done = settled(actors, actor.id, () => queue(actor.sessionFile!)[0]?.preparationAttempts === 1);
     const event = await publish(mesh, { finding: "P1" });
     await done;
+    expect(actors.messages(actor.id).find(message => message.error?.includes("Actor registry update was vetoed"))?.data)
+      .toMatchObject({ errorType: "ActorPreparationError", phase: "binding", attempts: 1 });
     const retained = queue(actor.sessionFile!);
     const block = actors.status(actor.id).activationBlocked;
     expect(retained).toEqual([expect.objectContaining({ payload: expect.objectContaining({ id: event.id }),

@@ -164,5 +164,6 @@ describe("resident wake fairness across active meshes", () => {
     expect(closedDirectories).toBe(openedDirectories);
     expect(secondRound, "every one of 33 meshes must reach its 129th pinned delivery in two rounds").toEqual(
       Array(meshCount).fill(rootsPerMesh));
-  }, 30_000);
+  // Minimum fixture crossing both thresholds; Windows filesystem setup takes ~15-30 s on hosted runners, so budget 4x that.
+  }, 120_000);
 });

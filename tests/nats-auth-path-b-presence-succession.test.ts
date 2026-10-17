@@ -17,6 +17,8 @@ import { openFabricTransport } from "../src/transport/index.js";
 import { NatsKvStore } from "../src/transport/nats/kv.js";
 import { runTransportAdmin } from "../src/transport/nats/admin.js";
 import { KvParticipantDirectory } from "../src/topology/participant-view.js";
+import { readHostLease } from "../src/topology/host-leases.js";
+import { readParticipantFile } from "../src/topology/participant-files.js";
 import type { FabricKvHostLease, FabricParticipantRecord } from "../src/topology/types.js";
 import type { FabricTransport, TransportKv, TransportKvEntry } from "../src/transport/types.js";
 import { createPathBHarness, PATH_B_MACHINES, resolveNatsBinary, type PathBHarness } from "./helpers/nats-cluster.js";
@@ -211,6 +213,28 @@ async function successionFixture(label: string, incarnation = `successor-${label
 // AgentCompletionInbox is created by initialize but remote completion followUps enter the
 // Main control dispatcher, not AgentCompletionInbox.enqueue. No fake receiver is substituted.
 describe.skipIf(!binary || process.platform !== "linux")("#14115 real authenticated NATS succession", () => {
+  it("projects this Path B Main's NATS presence and lease into the local store", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "presence-local-projection-"));
+    const sessionId = `projection-${createHash("sha256").update(String(Date.now())).digest("hex").slice(0, 12)}`;
+    const id = `session:${sessionId}`;
+    const config = configFor(root, "machine-a");
+    const owner = main(root, sessionId, "presence-projection");
+    const meshRoot = path.join(root, "mesh");
+    const localKey = `topology/participants/${createHash("sha256").update(id).digest("hex")}`;
+    try {
+      await owner.runtime.initialize(owner.context, config);
+      await vi.waitFor(() => expect(readParticipantFile(meshRoot, localKey)).toMatchObject({
+        key: localKey, updatedBy: { id }, value: { id, rootId: id, kind: "root", ownerIdentityId: id },
+      }), { timeout: 5_000 });
+      await vi.waitFor(() => expect(readHostLease(meshRoot, id)).toMatchObject({
+        id, rootId: id, identityId: id, incarnationToken: expect.any(String),
+      }), { timeout: 5_000 });
+    } finally {
+      try { await owner.runtime.shutdown("exit"); }
+      finally { fs.rmSync(root, { recursive: true, force: true }); }
+    }
+  }, 20_000);
+
   it("stops and resumes the same native Main inside the presence TTL, then receives a real completion followUp within seconds", async () => {
     for (const name of Object.keys(process.env)) if (name.startsWith("PI_FABRIC_")) vi.stubEnv(name, undefined);
     vi.stubEnv("SMARTY_AGENT", undefined);

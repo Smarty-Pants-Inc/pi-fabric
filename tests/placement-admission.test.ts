@@ -13,7 +13,7 @@ import {
   placementRegistrationRequest, placementReleaseRequest, validatePlacementBindings,
   validatePlacementRequest,
 } from "../src/agents/placement-contract.js";
-import { normalizePlacementDeciderConfig, type PlacementDeciderConfig } from "../src/agents/placement-decider-config.js";
+import { nativePlacementEnforceAvailable, nativePlacementPathAvailable, normalizePlacementDeciderConfig, VERIFIED_CALLER_CAPABILITY, type PlacementDeciderConfig } from "../src/agents/placement-decider-config.js";
 import { loadFabricConfig, loadFabricConfigForScope, normalizeFabricConfig } from "../src/config.js";
 
 // Keep reason: a security trust boundary. Exercise a real shell-free child and
@@ -406,6 +406,12 @@ describe("registration/cancel mapping and unpublished receipt gate", () => {
 
 describe("host-only placement decider configuration", () => {
   const config = (): PlacementDeciderConfig => ({ command: [process.execPath, "literal argument; not a shell"], mode: "enforce", wakeSourceMachine: "ryzen1" });
+  const nativeConfig = (output = "caller-verified=1\n", exitCode = 0, delayMs = 0, stderr = ""): PlacementDeciderConfig => {
+    const dir = root(); const context = path.join(dir, "smarty-launch-context"); const recordRoot = path.join(dir, "launches");
+    fs.writeFileSync(context, `#!${process.execPath}\nif (process.argv[2] === ${JSON.stringify(VERIFIED_CALLER_CAPABILITY.probe)}) {\n  setTimeout(() => {\n    if (${JSON.stringify(stderr)}) process.stderr.write(${JSON.stringify(stderr)});\n    process.stdout.write(${JSON.stringify(output)});\n    process.exit(${exitCode});\n  }, ${delayMs});\n} else process.exit(0);\n`, { mode: 0o700 });
+    fs.chmodSync(context, 0o700); fs.mkdirSync(recordRoot, { mode: 0o700 });
+    return { ...config(), contextCommand: [context], recordRoot };
+  };
   it("is absent/off by default and normalizes a configured omitted mode to off", () => {
     expect(normalizeFabricConfig({}).agents.placementDecider).toBeUndefined();
     const value = { command: [process.execPath], wakeSourceMachine: "ryzen1" };
@@ -420,11 +426,55 @@ describe("host-only placement decider configuration", () => {
   it.each(["", "a.b", "*", ">", "a b", "a\n", "user@example", "UpperCase", "under_score", "-leading", "a".repeat(33)])("rejects non-token wake machine %s", wakeSourceMachine => {
     expect(() => normalizePlacementDeciderConfig({ ...config(), wakeSourceMachine })).toThrow();
   });
-  it("rejects unknown modes/keys and blocks enforce config until resident-host support exists", () => {
+  it("accepts Bun's null return for successful fs.accessSync probes", () => {
+    const dir = root(); const context = path.join(dir, "smarty-launch-context"); const recordRoot = path.join(dir, "launches");
+    fs.mkdirSync(recordRoot, { mode: 0o700 }); fs.writeFileSync(context, `#!${process.execPath}\\nprocess.exit(0);\\n`, { mode: 0o700 });
+    fs.chmodSync(context, 0o700);
+    const access = vi.spyOn(fs, "accessSync").mockImplementation(() => null as never);
+    try { expect(nativePlacementPathAvailable([context], undefined, recordRoot)).toBe(true); }
+    finally { access.mockRestore(); }
+  });
+
+  it("requires the exact verified-caller capability at config load and leaves shadow untouched", () => {
+    expect(VERIFIED_CALLER_CAPABILITY).toEqual({ probe: "--capabilities", line: "caller-verified=1" });
+    for (const unavailable of [
+      nativeConfig(""), nativeConfig("systemd=1\ncaller-verified=0\n"), nativeConfig("systemd=1\n"),
+      nativeConfig("systemd=1\nmalformed output\ncaller-verified=1\n"),
+      nativeConfig("caller-verified=1\ncaller-verified=1\n"), nativeConfig("caller-verified=1\n", 1),
+      nativeConfig("caller-verified=1\n", 0, 2_000), nativeConfig("caller-verified=1\n", 0, 0, "unexpected stderr\n"),
+    ]) {
+      expect(() => normalizeFabricConfig({ agents: { placementDecider: unavailable } })).toThrow(/smarty-dev#14903/);
+    }
+    const capable = nativeConfig("systemd=1\ncaller-verified=1\n");
+    expect(nativePlacementEnforceAvailable(capable.contextCommand, undefined, capable.recordRoot)).toBe(true);
+    expect(() => normalizeFabricConfig({ agents: { placementDecider: nativeConfig("systemd=1\ncaller-verified=1\n") } })).not.toThrow();
+    const loadConfigured = (placementDecider: PlacementDeciderConfig): (() => unknown) => {
+      const cwd = root(); const agentDir = root();
+      fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ agents: { placementDecider } }));
+      return () => loadFabricConfig({ cwd, agentDir, projectTrusted: true });
+    };
+    expect(loadConfigured(nativeConfig("systemd=1\ncaller-verified=0\n"))).toThrow(/smarty-dev#14903/);
+    expect(loadConfigured(nativeConfig("systemd=1\ncaller-verified=1\n"))).not.toThrow();
+    expect(() => normalizeFabricConfig({ agents: { placementDecider: { ...nativeConfig("caller-verified=0\n"), mode: "shadow" } } })).not.toThrow();
+  });
+  it("rejects unknown modes/keys and blocks enforce config when native support is absent", () => {
     expect(() => normalizePlacementDeciderConfig({ ...config(), mode: "enforced" })).toThrow();
     expect(() => normalizePlacementDeciderConfig({ ...config(), timeoutMs: 20_000 })).toThrow();
     expect(() => normalizeFabricConfig({ agents: { placementDecider: config() } }))
-      .toThrow(/enforce is unavailable until the resident-host placement follow-up is installed/);
+      .toThrow(/enforce is unavailable.*smarty-dev#14903/);
+    expect(() => normalizeFabricConfig({ agents: { placementDecider: nativeConfig(), }, })).not.toThrow();
+    expect(() => normalizeFabricConfig({ agents: { placementDecider: { ...nativeConfig(), recordRoot: "/dev/null/launches" } } }))
+      .toThrow(/enforce is unavailable/);
+    const available = nativeConfig();
+    expect(nativePlacementPathAvailable(available.contextCommand, "/definitely/missing/systemd-run", available.recordRoot)).toBe(false);
+    const statSync = fs.statSync.bind(fs);
+    vi.spyOn(fs, "statSync").mockImplementation(((file: fs.PathLike, ...args: unknown[]) => {
+      if (String(file) === "/usr/bin/systemd-run") throw new Error("systemd-run unavailable");
+      return (statSync as (...values: unknown[]) => fs.Stats)(file, ...args);
+    }) as typeof fs.statSync);
+    expect(() => normalizeFabricConfig({ agents: { placementDecider: available } })).toThrow(/enforce is unavailable/);
+    vi.restoreAllMocks();
+    expect(() => normalizeFabricConfig({ agents: { placementDecider: { ...nativeConfig(), mode: "shadow", contextCommand: undefined, recordRoot: "/dev/null/launches" } } })).not.toThrow();
     expect(() => normalizePlacementDeciderConfig(null)).toThrow();
     expect(() => normalizePlacementDeciderConfig({ ...config(), wakeSourceMachine: undefined })).toThrow();
   });

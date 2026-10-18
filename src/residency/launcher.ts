@@ -28,6 +28,12 @@ import type { ResidentHostConfig, ResidentHostOwner } from "./protocol.js";
 import { ownedStat } from "../storage/scratch.js";
 import { verifiedRemove } from "../storage/verified-remove.js";
 import type { FabricHostLease } from "../topology/host-leases.js";
+import { LaunchRecordStore, makeLaunchRecord, type LaunchRecord } from "./launch-record.js";
+import { VERIFIED_CALLER_CAPABILITY, VERIFIED_CALLER_ISSUE } from "../agents/placement-config.js";
+import {
+  nativeResidentPlacementAvailable, nativeResidentPlacementEnforceAvailable, systemdRunArguments, systemdRunEnvironment,
+  watchNativeSystemdUnit,
+} from "./native-launch.js";
 
 const NODE_SCRIPT_EXTENSIONS = new Set([".js", ".cjs", ".mjs", ".ts", ".cts", ".mts"]);
 const TOKEN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -68,12 +74,18 @@ interface Attempt {
   watchdogGivenUp?: boolean;
   watchdogDeferred?: { checks: number; nextCheckAt: number };
   native: ResidentChildLifetime;
+  nativeUnit?: boolean;
   stop?: Promise<void>;
   seenOwner: boolean;
   claimedOwner: boolean;
   ownerToken?: string;
   /** The generation (owner token) this launcher chose for the child before spawning it (smarty-dev#7950). */
   generation: string;
+  /** Native launch-record identity for this transient resident unit. */
+  nativeLaunchId: string;
+  recordGeneration: number;
+  record?: LaunchRecord;
+  recordRegistration?: Promise<void>;
   /** Whether this attempt is an attributable startup failure; decided once, at exit. */
   sharedExit?: boolean;
   closingInput: boolean;
@@ -212,6 +224,13 @@ const signalChild = (attempt: Attempt, signal: NodeJS.Signals): void => {
 
 async function terminateWedgedChild(attempt: Attempt, termMs: number, killMs: number, revalidate: (signal: NodeJS.Signals) => boolean): Promise<boolean> {
   if (!revalidate("SIGTERM")) return false;
+  if (attempt.nativeUnit) {
+    // SIGTERM to systemd-run only kills the client; its named unit owns the worker.
+    await attempt.native.stop();
+    if (!attempt.native.exited) throw new Error("Resident systemd unit exit is unproven; restart blocked");
+    await stopObservedDescendants(attempt, attempt.child.pid);
+    return true;
+  }
   signalChild(attempt, "SIGTERM");
   if (!attempt.native.exited) await waitForExit(attempt, termMs);
   if (!attempt.native.exited) {
@@ -230,10 +249,11 @@ async function terminateWedgedChild(attempt: Attempt, termMs: number, killMs: nu
  */
 function stopAttempt(attempt: Attempt): Promise<void> {
   return attempt.stop ??= (async () => {
-    // Sampling is only best-effort descendant cleanup. The direct child must
-    // also be stopped through its native handle, even when its birth could not
-    // be observed. Exclude it from PID-based cleanup and join both operations.
-    const observed = stopObservedDescendants(attempt, attempt.child.pid);
+    // A systemd unit owns its service cgroup. PID sampling must not independently
+    // kill a member while the exact unit is still active; stop the unit and rely
+    // on its matching inactive read-back. Legacy direct children retain the
+    // existing best-effort descendant cleanup alongside native close.
+    const observed = attempt.nativeUnit ? Promise.resolve() : stopObservedDescendants(attempt, attempt.child.pid);
     const results = await Promise.allSettled([attempt.native.stop(), observed]);
     // All cleanup has settled before an error is reported to the supervisor.
     for (const result of results) if (result.status === "rejected") throw result.reason;
@@ -441,9 +461,10 @@ const residentChildReady = (root: string, config: ResidentHostConfig): void => {
   } catch (error) { unhostedDiagnostic(root, error); }
 };
 
-/** Timing injection is only for deterministic launcher tests; production uses fixed signal deadlines. */
-interface ResidentSuperviseOptions {
+/** Timing and native-runner injection are only for deterministic launcher tests; production uses fixed signal deadlines and systemd paths. */
+export interface ResidentSuperviseOptions {
   signal?: AbortSignal; reportWaitMs?: number; termMs?: number; killWaitMs?: number; proofRetryMs?: number; proofChecks?: number; wakeOnly?: boolean;
+  nativeSystemdRun?: string; nativeSystemctl?: string; nativeUnitStopTimeoutMs?: number;
 }
 export async function supervise(configPath: string, options: ResidentSuperviseOptions = {}): Promise<void> {
   const root = path.dirname(configPath);
@@ -480,6 +501,11 @@ async function superviseResident(configPath: string, options: ResidentSuperviseO
   let config: ResidentHostConfig;
   try { config = options.wakeOnly ? assertResidentWakeConfig(root) : readConfig(configPath); }
   catch (error) { await finishUnhosted(root, "wake-refused"); throw error; }
+  const placementMode = config.agents?.placementDecider?.mode ?? "off";
+  if (placementMode === "enforce" && !nativeResidentPlacementEnforceAvailable(config.agents?.placementDecider?.contextCommand, options.nativeSystemdRun, config.agents?.placementDecider?.recordRoot)) {
+    await finishUnhosted(root, "wake-refused");
+    throw new Error(`Resident enforce placement requires systemd-run and private launch records plus smarty-launch-context --capabilities returning exactly ${VERIFIED_CALLER_CAPABILITY.line} (${VERIFIED_CALLER_ISSUE})`);
+  }
   if (readResidentIdleExit(root, config.rootId)) {
     trace("launcher-idle", { reason: "root dead, no actors; waiting for an explicit spawn request" });
     return;
@@ -516,7 +542,7 @@ async function superviseResident(configPath: string, options: ResidentSuperviseO
     return idleExit?.pid === attempt.child.pid && idleExit?.token === (attempt.ownerToken ?? attempt.generation)
       ? undefined : "exit-0-unreceipted";
   };
-  const start = (spec?: ResidentLaunchSpec, plan?: ResidentHandoverPlan, kind?: "target" | "fallback", frozenConfigPath?: string): Attempt => {
+  const start = async (spec?: ResidentLaunchSpec, plan?: ResidentHandoverPlan, kind?: "target" | "fallback", frozenConfigPath?: string): Promise<Attempt> => {
     const launchConfig = spec?.config ?? config;
     if (options.wakeOnly) assertResidentWakeConfig(root, launchConfig);
     const launchEntry = spec?.entry ?? entry;
@@ -530,6 +556,37 @@ async function superviseResident(configPath: string, options: ResidentSuperviseO
     }
     const runtime = spec?.runtime ?? launcher.runtime;
     const attemptInfo = plan && kind ? { id: plan.id, kind } : undefined;
+    const recordEnabled = process.platform === "linux" && placementMode !== "off";
+    const nativeLaunchId = launchConfig.placement?.nativeLaunchId ?? randomUUID();
+    const configuredGeneration = launchConfig.placement?.generation ?? 1;
+    const recordGeneration = Math.max(configuredGeneration, (current?.recordGeneration ?? 0) + (current ? 1 : 0));
+    const placementAvailable = placementMode === "enforce"
+      ? nativeResidentPlacementEnforceAvailable(launchConfig.agents?.placementDecider?.contextCommand, options.nativeSystemdRun, launchConfig.agents?.placementDecider?.recordRoot)
+      : nativeResidentPlacementAvailable(launchConfig.agents?.placementDecider?.contextCommand, options.nativeSystemdRun, launchConfig.agents?.placementDecider?.recordRoot);
+    const useSystemd = process.platform === "linux" && placementMode !== "off" && placementAvailable;
+    if (placementMode === "enforce" && !useSystemd) throw new Error(`Resident enforce placement cannot start without verified native support: expected ${VERIFIED_CALLER_CAPABILITY.line} (${VERIFIED_CALLER_ISSUE})`);
+    const authoritativeRecordStore = new LaunchRecordStore(launchConfig.placement?.recordRoot ?? launchConfig.agents?.placementDecider?.recordRoot);
+    // Shadow records preserve observation evidence without contaminating the authoritative enforce census.
+    const recordStore = new LaunchRecordStore(placementMode === "shadow"
+      ? path.join(authoritativeRecordStore.root, "shadow") : authoritativeRecordStore.root);
+    let record = recordEnabled ? makeLaunchRecord({
+      nativeLaunchId, launchSpecId: launchConfig.placement?.launchSpecId ?? `resident-host:${launchConfig.rootId}`,
+      generation: recordGeneration, fenceToken: launchConfig.placement?.fenceToken ?? recordGeneration,
+      orgId: launchConfig.placement?.orgId ?? launchConfig.rootId, workId: launchConfig.placement?.workId ?? launchConfig.rootId,
+      parentNativeLaunchId: launchConfig.placement?.parentNativeLaunchId ?? null, role: launchConfig.placement?.role ?? "resident-host",
+      profile: launchConfig.placement?.profile ?? "resident-host", sourcePin: launchConfig.placement?.sourcePin ?? launchConfig.fabricExtensionPath,
+      memoryProfile: launchConfig.placement?.memoryProfile ?? "resident-host",
+      origin: launchConfig.placement?.origin ?? { class: "background-agent", originRef: launchConfig.sessionId ?? launchConfig.rootId ?? "resident-host" },
+    }, nativeLaunchId, recordGeneration) : undefined;
+    if (record) {
+      try { record = await recordStore.admit(record, placementMode === "enforce"); }
+      catch (error) {
+        try { record = recordStore.verify(record.native_launch_id, record.generation); } catch { /* preserve whichever durable bytes exist */ }
+        trace("launch-record-error", { stage: "admit", reason: String(error).slice(0, 500) });
+        if (placementMode === "enforce") throw error;
+        record = undefined; // Shadow remains observation-only; baseline startup is never withheld by its evidence sink.
+      }
+    }
     const reportDirectory = path.join(root, "wedges", "reports");
     if (watchdogSupported) {
       try { fs.mkdirSync(reportDirectory, { recursive: true, mode: 0o700 }); }
@@ -544,20 +601,43 @@ async function superviseResident(configPath: string, options: ResidentSuperviseO
     // No shell/string argv. Runtime, entry and binary were resolved in the immutable snapshot.
     const script = NODE_SCRIPT_EXTENSIONS.has(path.extname(launchConfig.piBinary).toLowerCase());
     const generation = current ? randomUUID() : initialGeneration;
-    const child = crossSpawn(script ? runtime : launchConfig.piBinary, script ? [launchConfig.piBinary, ...args] : args, {
-      cwd: launchConfig.cwd, detached: process.platform !== "win32", stdio: ["pipe", "pipe", "pipe", "ipc"],
-      env: childProcessEnvironment({ ...process.env, NODE_OPTIONS: nodeOptions, PI_FABRIC_RESIDENT_CONFIG: snapshot,
-        PI_FABRIC_RESIDENT_LAUNCHER: spec ? JSON.stringify(launcher) : "",
-        PI_FABRIC_RESIDENT_SPEC_DIGEST: spec?.digest ?? "",
-        PI_FABRIC_RESIDENT_ATTEMPT: attemptInfo ? JSON.stringify(attemptInfo) : "",
-        // The owner token the host must publish: the exit handler knows the generation without sampling owner.json.
-        PI_FABRIC_RESIDENT_GENERATION: generation,
-        // Per-attempt argument, never shared config another client may rewrite.
-        PI_FABRIC_RESIDENT_LAUNCH_TOKEN: launchToken }),
-    });
+    const command = script ? [runtime, launchConfig.piBinary, ...args] : [launchConfig.piBinary, ...args];
+    const childEnv = childProcessEnvironment({ ...process.env, NODE_OPTIONS: nodeOptions, PI_FABRIC_RESIDENT_CONFIG: snapshot,
+      PI_FABRIC_RESIDENT_LAUNCHER: spec ? JSON.stringify(launcher) : "",
+      PI_FABRIC_RESIDENT_SPEC_DIGEST: spec?.digest ?? "",
+      PI_FABRIC_RESIDENT_ATTEMPT: attemptInfo ? JSON.stringify(attemptInfo) : "",
+      // The owner token the host must publish: the exit handler knows the generation without sampling owner.json.
+      PI_FABRIC_RESIDENT_GENERATION: generation,
+      // Kept for legacy direct launch; systemdRunEnvironment explicitly drops token-named variables.
+      PI_FABRIC_RESIDENT_LAUNCH_TOKEN: launchToken });
+    let childArgs: string[];
+    let spawnEnvironment: NodeJS.ProcessEnv;
+    try {
+      childArgs = useSystemd ? systemdRunArguments(record!.unit, launchConfig.cwd, command, childEnv) : command.slice(1);
+      spawnEnvironment = useSystemd ? systemdRunEnvironment(childEnv) : childEnv;
+    } catch (error) {
+      if (record) { try { recordStore.closeUnstartedBeforeCreate(record.native_launch_id, record.generation); } catch { /* retain the durable fence */ } }
+      throw error;
+    }
+    let child: ChildProcess;
+    try {
+      child = crossSpawn(useSystemd ? (options.nativeSystemdRun ?? "/usr/bin/systemd-run") : command[0]!, childArgs, {
+        cwd: launchConfig.cwd, detached: process.platform !== "win32", stdio: useSystemd ? ["pipe", "pipe", "pipe"] : ["pipe", "pipe", "pipe", "ipc"],
+        env: spawnEnvironment,
+      });
+    } catch (error) {
+      if (record) { try { recordStore.closeUnstartedBeforeCreate(record.native_launch_id, record.generation); } catch { /* retain the durable fence */ } }
+      throw error;
+    }
     const logFile = path.join(root, plan ? `child-${plan.id}-${kind}.log` : "child-stderr.log");
     pruneResidentChildLogs(root, logFile);
-    const attempt: Attempt = { ...(spec ? { spec } : {}), child, native: watchResidentChild(child), generation,
+    const nativeUnit = useSystemd && !!record;
+    const nativeSystemd = nativeUnit ? watchNativeSystemdUnit(child, recordStore, record!, options.nativeSystemctl,
+      options.nativeUnitStopTimeoutMs === undefined ? {} : { stopTimeoutMs: options.nativeUnitStopTimeoutMs }) : undefined;
+    const native = nativeSystemd ?? watchResidentChild(child);
+    const attempt: Attempt = { ...(spec ? { spec } : {}), child, native, ...(nativeUnit ? { nativeUnit: true } : {}), generation,
+      nativeLaunchId, recordGeneration, ...(record ? { record } : {}),
+      recordRegistration: nativeSystemd?.registered ?? Promise.resolve(),
       startedAt: Date.now(), logFile, seenOwner: false, claimedOwner: false, closingInput: false, processes: new Map(), stderr: "" };
     child.on("message", (value: unknown) => {
       const receipt = value as { event?: string; root?: string; token?: string } | null;
@@ -567,7 +647,13 @@ async function superviseResident(configPath: string, options: ResidentSuperviseO
       if (owner && owner.pid === child.pid && owner.token === receipt.token && owner.readyAt > 0 && residentOwnerLive(root) && !residentOwnerSleeping(root) &&
           owner.maintenanceReady === 1 && maintenance?.token === owner.token) residentChildReady(root, launchConfig);
     });
-    child.once("error", (error) => { trace("child-error", { message: error.message, kind }); writeFailure(root, attempt.generation, error); });
+    child.once("error", (error) => {
+      if (attempt.record && !attempt.nativeUnit) {
+        try { attempt.record = recordStore.transition(attempt.record.native_launch_id, attempt.record.generation, "closed-uncertain"); }
+        catch (recordError) { trace("launch-record-error", { stage: "error", reason: String(recordError).slice(0, 500) }); }
+      }
+      trace("child-error", { message: error.message, kind }); writeFailure(root, attempt.generation, error);
+    });
     if (process.connected && process.send) {
       // Report startup from this exact spawned host. Do not poll owner/readiness files.
       void waitResidentChange(root, () => {
@@ -662,7 +748,7 @@ async function superviseResident(configPath: string, options: ResidentSuperviseO
   // Startup failures from the real host are reported before owner.json may exist. Prepare the
   // generation namespace before its first child so the host can publish without creating shared dirs.
   ensureResidentGenerations(root);
-  let attempt = start(initial);
+  let attempt = await start(initial);
   let nextWatchdogAt = 0;
   const evidenceError = (stage: string, error: unknown): void => {
     trace("watchdog-evidence-error", { stage, reason: String(error).slice(0, 500) });
@@ -853,6 +939,7 @@ async function superviseResident(configPath: string, options: ResidentSuperviseO
         await delay(50);
       }
       const exit = await attempt.native.exit;
+      await attempt.recordRegistration;
       if (stopping) { if (custodyFd !== undefined) fs.closeSync(custodyFd); return; }
       if (!plan && !childExitReason(attempt, exit)) {
         // The host has released this directory: another generation may already own it.
@@ -880,7 +967,7 @@ async function superviseResident(configPath: string, options: ResidentSuperviseO
             validateLaunchSpec(plan.target);
             writeHandoverState(root, plan, "starting");
             targetAttempted = true;
-            attempt = start(plan.target, plan, "target");
+            attempt = await start(plan.target, plan, "target");
             await ready(attempt, plan, plan.target, "target");
             if (!mainGenerationCurrent(root, plan.main)) throw new Error("Main lost at terminal release boundary");
             terminalPublicationAttempted = true;
@@ -914,7 +1001,7 @@ async function superviseResident(configPath: string, options: ResidentSuperviseO
         if (stopping) { if (custodyFd !== undefined) fs.closeSync(custodyFd); return; }
         // Exactly one coherent A fallback. Never read config.json here.
         validateLaunchSpec(plan.previous);
-        attempt = start(plan.previous, plan, "fallback");
+        attempt = await start(plan.previous, plan, "fallback");
         await ready(attempt, plan, plan.previous, "fallback");
         fallbackPublicationAttempted = true;
         writeHandoverState(root, plan, "fallback", failure instanceof Error ? failure.message : String(failure));

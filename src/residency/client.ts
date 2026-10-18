@@ -6,6 +6,7 @@ import { CompletionJournal, completionRecipientFromRun, completionConsumed, cons
 import { newResidentRequestId, ResidentRequestExpiredError, RESIDENT_EXPIRING_COMMAND_FORMAT } from "./request-expiry.js";
 import { FabricModelDeniedError } from "../core/model-policy.js";
 import { ActorSessionResetCancelledError } from "../actors/session-reset-error.js";
+import { prepareResidentHostPlacement } from "./placement.js";
 
 import { throwIfAborted } from "../async-settlement.js";
 import fs from "node:fs";
@@ -420,10 +421,12 @@ export class ResidencyClient {
     // This explicit business startup, not a launcher recovery loop, revokes the idle stop.
     fs.rmSync(residentIdleExitPath(this.options.config.residencyRoot), { force: true });
     const launchToken = randomUUID();
+    const launchConfig = await prepareResidentHostPlacement(this.options.config, launchToken);
+    atomicWrite(this.#configPath, launchConfig);
     const launcher = await spawnDetached(
       this.#hostPath,
       ["--config", this.#configPath, "--launch-token", launchToken],
-      this.options.config.cwd,
+      launchConfig.cwd,
     );
     this.#startupLauncher = launcher;
     // The budget counts from the launcher's first sign of life (its

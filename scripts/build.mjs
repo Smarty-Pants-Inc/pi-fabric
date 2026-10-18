@@ -65,6 +65,8 @@ const lazyEntryPoints = [
   // The resident's first operator cleanup reuses the offline final-check helper (smarty-dev#8090).
   "src/actors/remove-offline.ts",
   "src/residency/launcher-owner.ts",
+  "src/residency/launch-record.ts",
+  "src/residency/native-launch.ts",
   // The actor proxy loads the cooperative drain protocol only at first drain use.
   "src/residency/drain.ts",
   // Native host IPC is loaded only for a launch with trusted containment attestation.
@@ -72,6 +74,7 @@ const lazyEntryPoints = [
   "src/residency/wake.ts",
   "src/residency/process-work.ts",
   "src/agents/transports/process-utils.ts",
+  "src/agents/transports/native-placement.ts",
   "src/core/pid-namespace.ts",
   "src/mesh/state-projector.ts",
   "src/judge/agent.ts",

@@ -538,6 +538,18 @@ export interface AgentRunCarryOver {
 export interface AgentTransportPlacementGrant {
   readonly decision: PlacementGrant;
   readonly revalidate: () => void;
+  /** Host-only launch-record binding derived from trusted caller context. */
+  readonly record?: {
+    orgId: string;
+    workId: string;
+    parentNativeLaunchId: string;
+    role: "resident-host" | "actor-activation" | "task-agent" | "worktree-agent" | "review-agent";
+    profile: string;
+    sourcePin: string;
+    memoryProfile: string;
+    origin: { class: "live-human" | "background-agent"; originRef: string };
+    recordRoot?: string;
+  };
 }
 
 export interface AgentTransportLaunch {

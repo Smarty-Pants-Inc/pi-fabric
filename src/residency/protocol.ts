@@ -413,6 +413,23 @@ export interface ResidentHostConfig {
   vedaBinary: string;
   piModels?: ResidentPiModelState;
   modelGuidance?: FabricOwnedModelGuidance[];
+  /** Native placement binding for this resident host; host-owned and never guest input. */
+  placement?: {
+    nativeLaunchId?: string;
+    launchSpecId?: string;
+    generation?: number;
+    fenceToken?: number;
+    orgId: string;
+    workId: string;
+    parentNativeLaunchId?: string | null;
+    role: "resident-host";
+    profile: string;
+    sourcePin: string;
+    memoryProfile: string;
+    origin: { class: "live-human" | "background-agent"; originRef: string };
+    /** Trusted testing/integration seam; production uses the canonical account path. */
+    recordRoot?: string;
+  };
 }
 
 export interface ResidentHostOwner {

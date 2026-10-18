@@ -2046,7 +2046,7 @@ export class AgentManager {
     const request = { ...facts, placement: facts.placement ? { ...facts.placement } : undefined };
     const config = this.config.placementDecider;
     if (!config || config.mode === "off" || (runner !== "pi" && runner !== "pi-durable")) return;
-    const run = async (): Promise<void> => {
+    const run = async (): Promise<AgentTransportLaunch["placementGrant"]> => {
       const [{ CliPlacementDecider, PlacementAdmissionError, PlacementQueueError }, contextModule, contract] = await Promise.all([
         import("./placement-admission.js"), import("./placement-context.js"), import("./placement-contract.js"),
       ]);
@@ -2079,7 +2079,8 @@ export class AgentManager {
         this.#placementDiagnostic(`shadow-${observation.hypothetical.decision.toLowerCase()}`, id, draft.missingFields);
         return;
       }
-      if (draft.missingFields.length || !draft.roleAllowed) {
+      if (draft.missingFields.length || !draft.roleAllowed ||
+          draft.request.role === "actor-activation" && draft.request.interaction.class !== "background-agent") {
         this.#placementDiagnostic("context-or-role-refused", id, draft.missingFields);
         throw new PlacementAdmissionError("invalid-request");
       }
@@ -2097,10 +2098,27 @@ export class AgentManager {
         this.#placementDiagnostic(`queued-${answer.reason.toLowerCase()}`, id);
         throw new PlacementQueueError(draft.request, answer);
       }
-      // The current schema has typed native identity placeholders but no published
-      // systemd create-fence or registration receipt. A CLI PLACE is not authority.
-      this.#placementDiagnostic("native-create-proof-unavailable", id);
-      throw new PlacementAdmissionError("unavailable");
+      contract.validatePlacementBindings(answer, draft.request);
+      const role = draft.request.role;
+      if (!["resident-host", "actor-activation", "task-agent", "worktree-agent", "review-agent"].includes(role)) {
+        this.#placementDiagnostic("context-or-role-refused", id);
+        throw new PlacementAdmissionError("invalid-request");
+      }
+      return {
+        decision: answer,
+        revalidate: () => {
+          contract.validatePlacementBindings(answer, draft.request);
+          if (this.config.placementDecider?.mode !== "enforce") throw new PlacementAdmissionError("mode-mismatch");
+        },
+        ...(role === "actor-activation" ? { record: {
+          orgId: draft.request.assignment.org_id, workId: draft.request.assignment.work_id,
+          parentNativeLaunchId: draft.parentNativeLaunchId!, role: "actor-activation" as const,
+          profile: draft.request.required_profile, sourcePin: draft.request.requirements.source_pin,
+          memoryProfile: draft.request.requirements.memory_profile_ref,
+          origin: { class: draft.request.interaction.class, originRef: draft.request.interaction.origin_ref },
+          ...(config.recordRoot ? { recordRoot: config.recordRoot } : {}),
+        } } : {}),
+      };
     };
     if (config.mode === "shadow") {
       // Observation includes context resolution and the CLI round-trip; neither may
@@ -2108,7 +2126,7 @@ export class AgentManager {
       void run().catch(() => this.#placementDiagnostic("shadow-observation-unavailable", id));
       return;
     }
-    await run();
+    return await run();
   }
 
   async #placementRestart(id: string, state: ManagerPlacementState, workerGeneration: number,

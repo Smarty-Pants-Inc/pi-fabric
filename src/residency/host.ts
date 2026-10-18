@@ -254,6 +254,25 @@ const validateResidentHostConfig = (value: unknown, configPath: string): Residen
     throw new Error("Fabric resident host config is outside its residency root");
   }
   if (!config.mesh.enabled) throw new Error("Durable residency requires the Fabric mesh");
+  if (config.placement !== undefined) {
+    const placement = config.placement;
+    const safeId = (value: unknown): boolean => typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9_-]{0,95}$/u.test(value);
+    const ref = (value: unknown): boolean => typeof value === "string" && value.length > 0 && value.length <= 200 && !/[\u0000-\u001f\u007f]/u.test(value);
+    if (placement.role !== "resident-host" ||
+        (placement.nativeLaunchId !== undefined && !safeId(placement.nativeLaunchId)) ||
+        (placement.launchSpecId !== undefined && !ref(placement.launchSpecId)) ||
+        (placement.parentNativeLaunchId !== undefined && placement.parentNativeLaunchId !== null && !safeId(placement.parentNativeLaunchId)) ||
+        typeof placement.orgId !== "string" || !ref(placement.orgId) ||
+        typeof placement.workId !== "string" || !ref(placement.workId) || typeof placement.profile !== "string" || !ref(placement.profile) ||
+        typeof placement.sourcePin !== "string" || !ref(placement.sourcePin) || typeof placement.memoryProfile !== "string" || !ref(placement.memoryProfile) ||
+        !placement.origin || (placement.origin.class !== "live-human" && placement.origin.class !== "background-agent") ||
+        typeof placement.origin.originRef !== "string" || !placement.origin.originRef ||
+        (placement.recordRoot !== undefined && (typeof placement.recordRoot !== "string" || !path.isAbsolute(placement.recordRoot))) ||
+        (placement.generation !== undefined && (!Number.isSafeInteger(placement.generation) || placement.generation < 1)) ||
+        (placement.fenceToken !== undefined && (!Number.isSafeInteger(placement.fenceToken) || placement.fenceToken < 1))) {
+      throw new Error("Invalid Fabric resident host placement binding");
+    }
+  }
   return config as ResidentHostConfig;
 };
 
@@ -912,6 +931,15 @@ export class ResidentHost {
         }
         assertNoWatchdogCustody(this.config.residencyRoot);
       } finally { if (admissionFd !== undefined) fs.closeSync(admissionFd); }
+      if (this.config.agents.placementDecider?.mode === "enforce") {
+        // Reconcile crash-window unit records under the admission lock before
+        // AgentManager or actor recovery can admit another resident descendant.
+        const [{ LaunchRecordStore }, { reconcileNativeLaunchRecords }] = await Promise.all([
+          import("./launch-record.js"), import("./native-launch.js"),
+        ]);
+        const recordRoot = this.config.placement?.recordRoot ?? this.config.agents.placementDecider.recordRoot;
+        await reconcileNativeLaunchRecords(new LaunchRecordStore(recordRoot));
+      }
       // Archived runs are read on demand, never walked before the host lease is up.
       // The streaming request collector replays pending full archives before
       // terminal retention after readiness. Failed sinks retain their sources.
@@ -1039,7 +1067,8 @@ export class ResidentHost {
         processStartTime: processStartTime(process.pid),
         fabricExtensionPath: this.config.fabricExtensionPath,
         token: this.#token,
-        ...(process.env.PI_FABRIC_RESIDENT_LAUNCH_TOKEN ? { launchToken: process.env.PI_FABRIC_RESIDENT_LAUNCH_TOKEN } : {}),
+        // In a systemd unit the token-named env is intentionally omitted; the chosen generation is the same launch correlation id.
+        launchToken: process.env.PI_FABRIC_RESIDENT_LAUNCH_TOKEN ?? this.#token,
         startedAt: now,
         readyAt: now,
         maintenanceReady: 1, // client requires the same-token startup receipt before business admission

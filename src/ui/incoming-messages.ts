@@ -69,6 +69,7 @@ const rows = (message: IncomingMessage): Row[] => {
 };
 const receipt = (from: string, kind: string, value: string): string =>
   createHash("sha256").update(JSON.stringify([from, kind, value])).digest("hex");
+const contentDigest = (value: string): string => createHash("sha256").update(value).digest("hex");
 
 type SessionSource = SessionEntryCursorManager & { getHeader?: () => unknown };
 type DisplayMessage = { role?: unknown; customType?: unknown; details?: unknown; content?: unknown; timestamp?: unknown };
@@ -115,20 +116,27 @@ class DeliveredDisplayIndex {
 }
 
 /** Index prior inbox ids once on session_start/tree change and incrementally on message_end. */
-class PriorInboxReceiptIndex {
+export class PriorInboxReceiptIndex {
   #cursor = new SessionEntryCursor();
   #receiptPositions = new Map<string, number>();
   #nextPosition = 0;
   #byDetails = new WeakMap<object, number>();
   #byContent = new WeakMap<object, Map<number, number>>();
+  #byMessageContentHash = new WeakMap<object, string>();
   #byString = new Map<string, Map<number, number>>();
+  #retainedContentKeyChars = 0;
+
+  /** Internal size diagnostic: retained content keys, excluding map/value overhead. */
+  get retainedContentKeyChars(): number { return this.#retainedContentKeyChars; }
 
   reset(session: SessionSource): void {
     this.#receiptPositions.clear();
     this.#nextPosition = 0;
     this.#byDetails = new WeakMap();
     this.#byContent = new WeakMap();
+    this.#byMessageContentHash = new WeakMap();
     this.#byString.clear();
+    this.#retainedContentKeyChars = 0;
     for (const entry of this.#cursor.reset(session).entries) this.#remember(entry);
   }
 
@@ -144,7 +152,13 @@ class PriorInboxReceiptIndex {
     }
     const at = typeof message.timestamp === "number" ? message.timestamp : Number.NaN;
     if (typeof message.content === "string") {
-      const found = this.#byString.get(message.content)?.get(at);
+      const owner = message as object;
+      let key = this.#byMessageContentHash.get(owner);
+      if (!key) {
+        key = contentDigest(message.content);
+        this.#byMessageContentHash.set(owner, key);
+      }
+      const found = this.#byString.get(key)?.get(at);
       if (found !== undefined) return this.#before(found);
     } else if (message.content !== null && typeof message.content === "object") {
       const found = this.#byContent.get(message.content)?.get(at);
@@ -167,8 +181,12 @@ class PriorInboxReceiptIndex {
     const details = entry.details;
     if (details !== null && typeof details === "object" && !this.#byDetails.has(details)) this.#byDetails.set(details, before);
     if (typeof at === "number" && !Number.isNaN(at) && typeof entry.content === "string") {
-      let byTime = this.#byString.get(entry.content);
-      if (!byTime) this.#byString.set(entry.content, byTime = new Map());
+      const key = contentDigest(entry.content);
+      let byTime = this.#byString.get(key);
+      if (!byTime) {
+        this.#byString.set(key, byTime = new Map());
+        this.#retainedContentKeyChars += key.length;
+      }
       if (!byTime.has(at)) byTime.set(at, before);
     } else if (typeof at === "number" && !Number.isNaN(at) && entry.content !== null && typeof entry.content === "object") {
       let byTime = this.#byContent.get(entry.content);

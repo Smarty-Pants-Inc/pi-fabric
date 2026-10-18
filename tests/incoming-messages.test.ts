@@ -3,7 +3,7 @@ import { convertToLlm, CustomMessageComponent, initTheme } from "@earendil-works
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { normalizeFabricConfig, type FabricIncomingMessageMode } from "../src/config.js";
-import { INCOMING_MESSAGE_TYPES, incomingMessagesCollapsed, registerIncomingMessageRenderers } from "../src/ui/incoming-messages.js";
+import { INCOMING_MESSAGE_TYPES, incomingMessagesCollapsed, PriorInboxReceiptIndex, registerIncomingMessageRenderers } from "../src/ui/incoming-messages.js";
 import { rootInboxMessage } from "../src/topology/root-inbox.js";
 import type { MeshEvent } from "../src/mesh/store.js";
 
@@ -102,6 +102,29 @@ describe("incoming Fabric display projection", () => {
     expect(h.getEntries).not.toHaveBeenCalled();
     expect(h.getEntry).toHaveBeenCalledTimes(pointLookups);
     expect(h.getLeafEntry).toHaveBeenCalledTimes(leafLookups);
+  });
+
+  it("matches prior string-content inboxes through compact digests when object identities differ", () => {
+    const h = harness();
+    const earlier = inbox([event("already-seen", "prior row", {})]);
+    const target = { ...inbox([event("already-seen", "prior row", {}), event("new-event", "new row", {})]), timestamp: 456 };
+    h.setBranch([entry(earlier), entry(target)]);
+    const replay = { ...target, details: { ...(target.details as Record<string, unknown>) } };
+    const visible = plain(h.render(replay)![0]!);
+    expect(visible).toContain("new row");
+    expect(visible).not.toContain("prior row");
+  });
+
+  it("retains fixed-size content digests rather than full inbox bodies", () => {
+    const carrier = (content: string) => ({
+      role: "custom" as const, customType: "pi-fabric-inbox", timestamp: 123, content, details: { ids: ["event"] },
+    });
+    const short = new PriorInboxReceiptIndex();
+    const long = new PriorInboxReceiptIndex();
+    short.addMessage(carrier("short body"));
+    long.addMessage(carrier("large body".repeat(100_000)));
+    expect(short.retainedContentKeyChars).toBe(64);
+    expect(long.retainedContentKeyChars).toBe(64);
   });
 
   it("renders exactly one dim decoded whitespace-collapsed body line", () => {

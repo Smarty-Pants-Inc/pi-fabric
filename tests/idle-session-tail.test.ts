@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { SessionEntryCursor } from "../src/core/preview.js";
+import { getSessionBranchFallbackCount, SessionEntryCursor } from "../src/core/preview.js";
 import { confirmedSessionEntries } from "../src/core/session-receipts.js";
 import { RecordsInboxCursor, recordsInboxSession } from "../src/records/inbox.js";
 import type { MeshEvent } from "../src/mesh/store.js";
@@ -22,6 +22,7 @@ const managerFor = (initial: Entry[]) => {
   const getEntries = vi.fn(() => [...entries]);
   const getBranch = vi.fn(() => [...entries]);
   const manager = {
+    getLeafId: () => entries.at(-1)?.id ?? null,
     getLeafEntry, getEntry, getEntries, getBranch,
     getSessionId: () => "synthetic-session",
     getSessionFile: () => undefined,
@@ -100,6 +101,61 @@ describe("bounded active-session readers", () => {
     expect(state.manager.getEntries).not.toHaveBeenCalled();
     expect(state.manager.getBranch).not.toHaveBeenCalled();
   });
+
+  it("recovers missing point ancestors from one full read without redelivering inbox or records receipts", () => {
+    const rows = plainRows(700);
+    rows[320] = { type: "custom_message", ...rootInboxMessage([meshEvent("ancestor-inbox")]) };
+    rows[330] = { type: "custom_message", customType: "pi-fabric-records", details: { ids: ["ancestor-record"] } };
+    const state = managerFor(linked(rows));
+    const missingAncestorId = state.entries[500]!.id;
+    state.manager.getEntry.mockImplementation((id: string) => id === missingAncestorId
+      ? undefined : state.entries.find((entry) => entry.id === id));
+    const before = getSessionBranchFallbackCount();
+
+    const inbox = confirmedRootInboxSession(state.manager);
+    expect(inbox.holdsBatch(["ancestor-inbox"])).toBe(true); // No idle inbox redelivery.
+    expect(state.manager.getEntries).toHaveBeenCalledTimes(1);
+
+    const records = new RecordsInboxCursor();
+    records.reset(state.manager);
+    expect(records.session(state.manager).holdsBatch(["ancestor-record"])).toBe(true); // No record redelivery.
+    expect(state.manager.getEntries).toHaveBeenCalledTimes(2);
+    expect(getSessionBranchFallbackCount()).toBe(before + 2);
+    expect(state.manager.getBranch).not.toHaveBeenCalled();
+  });
+
+  it("detects cyclic ancestry in both branch walks and cursor advances with a bounded lookup guard", () => {
+    let entries = linked(plainRows(3));
+    let byId = new Map(entries.map((entry) => [entry.id, entry]));
+    let lookupCount = 0;
+    const getEntry = vi.fn((id: string) => {
+      lookupCount += 1;
+      if (lookupCount > 12) throw new Error("bounded cycle lookup guard");
+      return byId.get(id);
+    });
+    const getEntries = vi.fn(() => [...entries]);
+    const manager = {
+      getLeafId: () => entries.at(-1)?.id ?? null,
+      getLeafEntry: () => entries.at(-1),
+      getEntry,
+      getEntries,
+      getSessionId: () => "cyclic-session",
+    };
+    const cursor = new SessionEntryCursor();
+    cursor.reset(manager);
+    getEntry.mockClear(); getEntries.mockClear(); lookupCount = 0;
+
+    entries = [
+      { id: "cycle-a", parentId: "cycle-b", type: "message" },
+      { id: "cycle-b", parentId: "cycle-a", type: "message" },
+    ];
+    byId = new Map(entries.map((entry) => [entry.id, entry]));
+    const before = getSessionBranchFallbackCount();
+    expect(() => cursor.read(manager)).toThrow("Full session read contains cyclic or invalid active ancestry");
+    expect(getEntry.mock.calls.length).toBeLessThanOrEqual(4);
+    expect(getEntries).toHaveBeenCalledTimes(1);
+    expect(getSessionBranchFallbackCount()).toBe(before + 1);
+  }, 2_000);
 
   it("retains the full-read compatibility path only for managers without point lookups", () => {
     const legacyEntry = { type: "custom_message", customType: "pi-fabric-records", details: { ids: ["legacy-batch"] } };

@@ -1200,6 +1200,16 @@ interface FabricAgentsApi {
   send(id: string, message: string): Promise<FabricMessageDelivery>;
   steer(args: FabricMessageSteerArgs): Promise<FabricMessageDelivery>;
   steer(id: string, message: string): Promise<FabricMessageDelivery>;
+  /**
+   * After remote control publication or local Main journal admission,
+   * FABRIC_DELIVERY_UNCONFIRMED means delivery may already have been accepted.
+   * QuickJS catches preserve code/name, deliveryId (the remote control command ID
+   * or local journal item ID), and optional targetId/idempotencyKey. Only bounded
+   * own string fields cross QuickJS (1-200 chars). Other guest runtimes currently
+   * expose the code and ID in error message text, not structured catch fields.
+   * Do not treat uncertainty as rejection or resend with changed text/a new key.
+   * Local task/actor manager admission is not yet covered by this contract.
+   */
   followUp(args: FabricMessageArgs & { deadlineMs?: number }): Promise<FabricMessageDelivery>;
   cancelFollowUp(args: { id: string; messageId: string }): Promise<FabricFollowUpDelivery>;
   followUp(id: string, message: string): Promise<FabricMessageDelivery>;

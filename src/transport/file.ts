@@ -90,9 +90,9 @@ export class FileTransport implements FabricTransport {
 
   /** Legacy-envelope entry: preserve native ids, stamps, fences and completion errors.
    * The control plane must observe publication uncertainty even after a positive append. */
-  publish(input: MeshPublishInput): Promise<MeshEvent> {
+  publish(input: MeshPublishInput, onAppend?: () => void): Promise<MeshEvent> {
     if (this.#closed) return Promise.reject(new TransportUnavailableError("File transport closed"));
-    return this.#trackPublish(this.mesh.publish(input));
+    return this.#trackPublish(this.#publish(input, false, onAppend));
   }
 
   #trackPublish(operation: Promise<MeshEvent>): Promise<MeshEvent> {
@@ -103,7 +103,7 @@ export class FileTransport implements FabricTransport {
 
   /** Generic E1 send reconciliation: keep positive append evidence despite completion
    * failures; only an unchanged complete log boundary proves a pre-append failure. */
-  async #publish(input: MeshPublishInput): Promise<MeshEvent> {
+  async #publish(input: MeshPublishInput, reconcileSuccess = true, onAppend?: () => void): Promise<MeshEvent> {
     if (this.#closed) throw new TransportUnavailableError("File transport closed");
     const id = input.id ?? randomUUID();
     let commitEntered = false, preAppendFailure = false, resolvedBody: unknown = input.data;
@@ -138,7 +138,10 @@ export class FileTransport implements FabricTransport {
             // store cannot expose it, the fallback below stays conservative.
             if (typeof result === "object" && result !== null && "event" in result) {
               const event = result.event as MeshEvent | undefined;
-              if (event?.id === id && Number.isSafeInteger(event.sequence)) appended = event;
+              if (event?.id === id && Number.isSafeInteger(event.sequence)) {
+                appended = event;
+                onAppend?.();
+              }
             }
             return result;
           };
@@ -146,7 +149,10 @@ export class FileTransport implements FabricTransport {
         },
       });
     } catch (error) {
-      if (appended) return appended;
+      if (appended) {
+        if (reconcileSuccess) return appended;
+        throw error;
+      }
       // Lock/admission/abort/stamp failures precede append. Preserve their exact typed
       // error (and abort reason), rather than disguising a commit-predicate refusal.
       if (!commitEntered || preAppendFailure) throw error;
@@ -160,7 +166,11 @@ export class FileTransport implements FabricTransport {
         for (;;) {
           const page = this.mesh.read({ after: sequence, limit: this.mesh.maxReadEvents });
           const committed = page.find(event => event.id === id);
-          if (committed) return committed;
+          if (committed) {
+            if (reconcileSuccess) return committed;
+            appended = committed;
+            break;
+          }
           const last = page.at(-1)?.sequence;
           if (page.length < this.mesh.maxReadEvents || last === undefined || last <= sequence || last >= through) break;
           sequence = last;
@@ -175,6 +185,12 @@ export class FileTransport implements FabricTransport {
           sameLast(before, horizon) && sameLast(horizon, confirmed);
       } catch { /* A failed readback cannot prove that nothing appended. */ }
       if (definitelyNotAppended) throw error;
+      if (!reconcileSuccess) {
+        // The router owns outcome classification. Carry evidence, not a fabricated success,
+        // and preserve the original completion failure as its eventual cause.
+        onAppend?.();
+        throw error;
+      }
       throw new TransportUncertainError(id, resolvedBody, { cause: error });
     }
   }

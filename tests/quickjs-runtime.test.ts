@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { QuickJsRuntime } from "../src/runtime/quickjs-runtime.js";
 import { FabricModelDeniedError } from "../src/core/model-policy.js";
+import { FabricDeliveryUnconfirmedError } from "../src/protocol.js";
 import { FabricIdempotencyKeyReusedError } from "../src/mesh/control-idempotency.js";
 import { FabricInterruptNotAuthorizedError, FabricInterruptRateLimitedError } from "../src/interrupt-authority.js";
 import { FabricControlStaleIncarnationError, FabricRelayDestinationUnavailableError, STALE_INCARNATION_ERROR } from "../src/topology/control-plane.js";
@@ -285,6 +286,103 @@ catch (error) { return { name: error.name, code: typeof error.code, extra: typeo
     expect(result.value).toEqual({ stale: { name: "FabricParticipantStaleError", code: "FABRIC_PARTICIPANT_STALE", retryable: true,
       idempotencyKey: "original-key", keys: ["code", "idempotencyKey", "message", "name", "retryable"] }, retry: { queued: true, messageId: "one-delivery" } });
     expect(calls).toEqual(Array(2).fill({ id: "session:test", message: "unchanged", idempotencyKey: "original-key" }));
+  });
+
+  it("delivery unconfirmed preserves only its public contract through guest agents.followUp", async () => {
+    const getter = vi.fn(() => "host-only");
+    const commandId = "control-command-14867";
+    const error = Object.assign(new FabricDeliveryUnconfirmedError(commandId, {
+      targetId: "session:test", idempotencyKey: "original-key", cause: { secret: "nested-host-only" },
+    }), {
+      secret: "host-only", stack: "private-host-stack", retryable: true,
+      guestFields: { secret: "must-not-cross" },
+    });
+    Object.defineProperty(error, "privateGetter", { enumerable: true, get: getter });
+    const hostCall = vi.fn(async (_ref: string, _args: Record<string, unknown>) => { throw error; });
+    const result = await new QuickJsRuntime().execute(
+      `try { await agents.followUp({ id: "session:test", message: "unchanged", idempotencyKey: "original-key" }); }
+       catch (error) { return { name: error.name, code: error.code, message: error.message,
+         deliveryId: error.deliveryId, targetId: error.targetId, idempotencyKey: error.idempotencyKey,
+         isError: error instanceof Error, secret: typeof error.secret, cause: typeof error.cause,
+         privateGetter: typeof error.privateGetter, guestFields: typeof error.guestFields, retryable: typeof error.retryable,
+         hostStack: String(error.stack).includes("private-host-stack"), keys: Object.keys(error).sort() }; }`,
+      hostCall, options,
+    );
+    expect(result.terminationReason, result.error).toBe("completed");
+    expect(result.value).toEqual({ name: "FabricDeliveryUnconfirmedError", code: "FABRIC_DELIVERY_UNCONFIRMED",
+      message: error.message, deliveryId: commandId, targetId: "session:test", idempotencyKey: "original-key",
+      isError: true, secret: "undefined", cause: "undefined", privateGetter: "undefined", guestFields: "undefined", retryable: "undefined",
+      hostStack: false, keys: ["code", "deliveryId", "idempotencyKey", "message", "name", "targetId"] });
+    expect(hostCall.mock.calls.map(([ref, args]) => ({ ref, args }))).toEqual([
+      { ref: "agents.followUp", args: { id: "session:test", message: "unchanged", idempotencyKey: "original-key" } },
+    ]);
+    expect(getter).not.toHaveBeenCalled();
+  });
+
+  it.each(["deliveryId", "targetId", "idempotencyKey"])("delivery unconfirmed bridges only bounded own data for %s", async field => {
+    const getter = vi.fn(() => "must-not-cross");
+    const make = (value: unknown) => Object.assign(new Error("unconfirmed"), {
+      name: "FabricDeliveryUnconfirmedError", code: "FABRIC_DELIVERY_UNCONFIRMED", [field]: value,
+    });
+    const errors = [make(""), make("x".repeat(201)), make(7), make(null), make("x"), make("x".repeat(200)), make("accessor"), make("inherited")];
+    Object.defineProperty(errors[6], field, { get: getter });
+    delete (errors[7] as unknown as Record<string, unknown>)[field];
+    Object.setPrototypeOf(errors[7], Object.assign(Object.create(Error.prototype), { [field]: "inherited" }));
+    let index = 0;
+    const result = await new QuickJsRuntime().execute(
+      `const failures = []; for (let i = 0; i < 8; i++) {
+         try { await agents.followUp({ id: "session:test", message: "unchanged" }); }
+         catch (error) { failures.push({ code: error.code, value: error[${JSON.stringify(field)}] ?? null }); }
+       } return failures;`, async () => { throw errors[index++]; }, options,
+    );
+    expect(result.terminationReason, result.error).toBe("completed");
+    expect(result.value).toEqual([null, null, null, null, "x", "x".repeat(200), null, null].map(value => ({
+      code: "FABRIC_DELIVERY_UNCONFIRMED", value,
+    })));
+    expect(getter).not.toHaveBeenCalled();
+  });
+
+  it("delivery unconfirmed requires own data classification without invoking getters", async () => {
+    const getter = vi.fn(() => "must-not-cross");
+    const make = () => Object.assign(new Error("unconfirmed"), {
+      name: "FabricDeliveryUnconfirmedError", code: "FABRIC_DELIVERY_UNCONFIRMED", deliveryId: "delivery-14867",
+    });
+    const errors = Array.from({ length: 7 }, make);
+    Object.defineProperty(errors[0], "code", { get: getter });
+    Object.defineProperty(errors[1], "name", { get: getter });
+    delete (errors[2] as { code?: string }).code;
+    Object.setPrototypeOf(errors[2], Object.assign(Object.create(Error.prototype), { code: "FABRIC_DELIVERY_UNCONFIRMED" }));
+    delete (errors[3] as { name?: string }).name;
+    Object.setPrototypeOf(errors[3], Object.assign(Object.create(Error.prototype), { name: "FabricDeliveryUnconfirmedError" }));
+    Object.assign(errors[4]!, { name: "RangeError" });
+    Object.assign(errors[5]!, { code: "UNVETTED" });
+    Object.assign(errors[6]!, { name: "FabricDirectoryUnavailableError", code: "FABRIC_DIRECTORY_UNAVAILABLE" });
+    let index = 0;
+    const result = await new QuickJsRuntime().execute(
+      `const failures = []; for (let i = 0; i < 7; i++) {
+         try { await agents.followUp({ id: "session:test", message: "unchanged" }); }
+         catch (error) { failures.push({ code: error.code ?? null, deliveryId: error.deliveryId ?? null }); }
+       } return failures;`, async () => { throw errors[index++]; }, options,
+    );
+    expect(result.terminationReason, result.error).toBe("completed");
+    expect(result.value).toEqual([...Array.from({ length: 6 }, () => ({ code: null, deliveryId: null })),
+      { code: "FABRIC_DIRECTORY_UNAVAILABLE", deliveryId: null }]);
+    expect(getter).not.toHaveBeenCalled();
+  });
+
+  it("delivery unconfirmed leaves an ordinary pre-append followUp failure unchanged", async () => {
+    const error = Object.assign(new RangeError("follow-up rejected before append"), {
+      code: "PRE_APPEND_FAILURE", deliveryId: "must-not-cross", targetId: "session:test", idempotencyKey: "original-key",
+    });
+    const result = await new QuickJsRuntime().execute(
+      `try { await agents.followUp({ id: "session:test", message: "unchanged" }); }
+       catch (error) { return { name: error.name, message: error.message, code: typeof error.code,
+         deliveryId: typeof error.deliveryId, targetId: typeof error.targetId, idempotencyKey: typeof error.idempotencyKey }; }`,
+      async () => { throw error; }, options,
+    );
+    expect(result.terminationReason, result.error).toBe("completed");
+    expect(result.value).toEqual({ name: "RangeError", message: error.message, code: "undefined",
+      deliveryId: "undefined", targetId: "undefined", idempotencyKey: "undefined" });
   });
 
   it("carries only safe relay refusal metadata through public guest followUp calls", async () => {

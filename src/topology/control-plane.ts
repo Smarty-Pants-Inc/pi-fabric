@@ -1,4 +1,5 @@
 import { appendDeliveryOutcome, type DeliverySend } from "../mesh/delivery-outcomes.js";
+import type { FabricDeliveryObserver } from "../protocol.js";
 import { diagnostics } from "../core/diagnostics.js";
 import { controlBodyFingerprint, FABRIC_IDEMPOTENCY_KEY_REUSED, FabricIdempotencyKeyReusedError } from "../mesh/control-idempotency.js";
 import type { MeshControlIncarnationFence } from "../config.js";
@@ -504,6 +505,8 @@ export interface FabricControlRequestOptions {
   /** Reuse unchanged on a stale/outcome-unknown message retry; scoped to sender/owner/target. */
   idempotencyKey?: string | undefined;
   signal?: AbortSignal;
+  /** Host-only evidence for the router's single post-admission error boundary. */
+  deliveryObserver?: FabricDeliveryObserver | undefined;
   /** Host-selected ASK observation policy; only the private branded ceiling qualifies. */
   detachOnMainCeiling?: boolean;
 }
@@ -948,6 +951,9 @@ export class FabricControlPlane {
       sent = await send(delayMs);
     }
     const { commandId, acceptance } = sent;
+    // A verified accepted ACK is admission evidence even when it came from the retained
+    // receipt cache and this attempt skipped publication entirely.
+    options.deliveryObserver?.onAdmission(commandId, targetId);
     return {
       queued: true,
       messageId: acceptance.messageId ?? commandId,
@@ -1074,6 +1080,7 @@ export class FabricControlPlane {
       if (existingPending.ownerIncarnation === ownerIncarnation &&
           existingPending.destinationRemoteHost === destinationRemoteHost &&
           existingPending.bodyFingerprint !== bodyFingerprint) throw new FabricIdempotencyKeyReusedError(idempotencyKey);
+      if (existingPending.commandPublished) options.deliveryObserver?.onAdmission(commandId, targetId);
       throw new Error(`Fabric message with idempotencyKey ${idempotencyKey} is already awaiting acknowledgement`);
     }
     // Only directory-validated remote ownership can authorize an infrastructure refusal.
@@ -1128,6 +1135,9 @@ export class FabricControlPlane {
       ...(destinationRemoteHost !== undefined ? { destinationRemoteHost } : {}),
       ...(mirroredOwner ? { mirroredOwner } : {}),
     });
+    if (cachedAtAdmission && (cachedAtAdmission.data as Record<string, unknown>).accepted === true) {
+      options.deliveryObserver?.onAdmission(commandId, targetId);
+    }
     if (cachedAtAdmission && mirroredOwner && !readMirror()) throw unavailable(mirroredOwner.remoteHost);
     if (mirroredOwner && !cachedAtAdmission) {
       const status = mirroredOwnerRoutingStatus(mirroredOwner, (this.options.now ?? Date.now)());
@@ -1204,6 +1214,7 @@ export class FabricControlPlane {
       }
       if (cached) {
         skipPublication = true;
+        if ((cached.data as Record<string, unknown>).accepted === true) options.deliveryObserver?.onAdmission(commandId, targetId);
         this.#settleAcknowledgement(commandId, pending, cached.data as Record<string, unknown>);
         return;
       }
@@ -1281,6 +1292,11 @@ export class FabricControlPlane {
             deadlineAt: committedAt + timeoutMs,
           };
         },
+      }, () => {
+        // FileTransport reports append evidence before completion work can yield/throw.
+        // Keep the logical commandId, never the transport event's private identity.
+        pendingRequest!.commandPublished = true;
+        options.deliveryObserver?.onAdmission(commandId, targetId);
       });
       const publishing = skipPublication ? Promise.resolve() : publishOnce().catch(async error => {
         if (!(error instanceof MirrorLeaseAdmissionRequired)) throw error;
@@ -1302,10 +1318,12 @@ export class FabricControlPlane {
         this.#startLeaseWatchdog();
         return publishOnce();
       }).then((event) => {
+        if (event) {
+          publishedEvent = event;
+          pendingRequest!.commandPublished = true;
+        }
         this.#wake(); // own publish: never depend on this process's own watcher
-        publishedEvent = event;
         recordFinal();
-        pendingRequest!.commandPublished = true;
         // Other requests retain their commit-time ACK window. Never overwrite a mirrored
         // message's admission timer, or revive a request already settled while publishing.
         if (this.#pending.get(commandId) === pendingRequest! && !pendingRequest!.timer) {
@@ -1338,16 +1356,23 @@ export class FabricControlPlane {
       return { commandId, acceptance: acknowledged };
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
-      // A command withdrawn unclaimed at its deadline (smarty-dev#6729) is definitely not delivered.
-      // An owner rejection proves that only with notRun; otherwise its handler may have run.
+      // Definite owner refusals keep their existing contracts and proven-notRun retries.
+      const definite = (error instanceof FabricControlRejection && error.notRun) ||
+        error instanceof FabricTargetTerminalError || error instanceof FabricControlStaleIncarnationError ||
+        error instanceof FabricIdempotencyKeyReusedError || (isObject(error) && error.notDelivered === true);
+      if (definite) options.deliveryObserver?.onNotRun(commandId);
       if ((error instanceof FabricControlRejection && error.notRun) || (isObject(error) && error.notDelivered === true)) finalOutcome = { outcome: "failed", reason };
-      else if (error instanceof FabricControlRejection || reason.includes("outcome is unknown") || error instanceof FabricParticipantStaleError ||
-        (options.signal?.aborted && isObject(options.signal.reason) && options.signal.reason.name === "TimeoutError")) {
+      else if (!definite && (pendingRequest!.commandPublished || error instanceof FabricControlRejection || reason.includes("outcome is unknown") || error instanceof FabricParticipantStaleError ||
+        (options.signal?.aborted && isObject(options.signal.reason) && options.signal.reason.name === "TimeoutError"))) {
         finalOutcome = { outcome: "unknown", reason };
       }
-      recordFinal();
-      const cancelled = this.#clearPending(commandId);
-      if (cancelled) void this.#publishCancellation(commandId, cancelled);
+      // Reporting and cancellation are secondary debt, never a replacement for the delivery
+      // identity or the original pre-publication refusal (even if their own write/CAS fails).
+      try { recordFinal(); } catch { /* Preserve the primary delivery outcome. */ }
+      try {
+        const cancelled = this.#clearPending(commandId);
+        if (cancelled) void this.#publishCancellation(commandId, cancelled).catch(() => undefined);
+      } catch { /* Preserve the primary delivery outcome. */ }
       throw error;
     }
   }
@@ -2113,6 +2138,7 @@ export class FabricControlPlane {
     const existing = this.#pending.get(commandId);
     if (existing) {
       if (existing.bodyFingerprint !== bodyFingerprint) throw Object.assign(new Error("Fabric control id reused with different input"), { code: "FABRIC_CONTROL_ID_CONFLICT", notRun: true });
+      if (existing.commandPublished) options.deliveryObserver?.onAdmission(commandId, targetId);
       throw new Error(`Fabric message with idempotencyKey ${idempotencyKey} is already awaiting acknowledgement`);
     }
     if (options.timeoutMs !== undefined && !Number.isFinite(options.timeoutMs)) throw new Error("Invalid NATS control timeout");
@@ -2154,16 +2180,21 @@ export class FabricControlPlane {
           if (this.#closed || this.#paused) throw new TransportUnavailableError("NATS control admission is closed or draining");
           // P3's immutable, live ParticipantView snapshot is never re-resolved or retargeted.
           // The receiver's live lease + enforced incarnation close the preflight/PubAck race.
+          // The adapter publishes in this same tick. Until PubAck (or a definite persisted=false
+          // refusal), cancellation cannot prove the command absent from the broker.
+          options.deliveryObserver?.onAdmission(commandId, targetId);
           return { version: 1, commandId, ...commandBody, replyTo: this.options.hostId,
             requestCreatedAt, requestedAt: committedAt, deadlineAt: committedAt + timeoutMs };
         },
       }, operation === "ask" && options.detachOnMainCeiling ? withoutMainExecutionCeiling(options.signal) : options.signal)
         .then(() => {
           pending.commandPublished = true;
+          options.deliveryObserver?.onAdmission(commandId, targetId);
           if (pending.cancellationRequested) void this.#publishCancellation(commandId, pending).catch(() => undefined);
         }, error => {
           if (error instanceof TransportUncertainError || isObject(error) && error.code === "FABRIC_TRANSPORT_UNCERTAIN") {
             pending.commandPublished = true;
+            options.deliveryObserver?.onAdmission(commandId, targetId);
             // Abort/timeout may already have cleared #pending while PubAck was in flight.
             if (pending.cancellationRequested) void this.#publishCancellation(commandId, pending).catch(() => undefined);
           }
@@ -2182,8 +2213,14 @@ export class FabricControlPlane {
       }
       return { commandId, acceptance: acknowledged };
     } catch (error) {
-      const cancelled = this.#clearPending(commandId);
-      if (cancelled) void this.#publishCancellation(commandId, cancelled).catch(() => undefined);
+      const definite = (error instanceof FabricControlRejection && error.notRun) ||
+        error instanceof FabricTargetTerminalError || error instanceof FabricControlStaleIncarnationError ||
+        error instanceof FabricIdempotencyKeyReusedError || (isObject(error) && error.persisted === false);
+      if (definite) options.deliveryObserver?.onNotRun(commandId);
+      try {
+        const cancelled = this.#clearPending(commandId);
+        if (cancelled) void this.#publishCancellation(commandId, cancelled).catch(() => undefined);
+      } catch { /* Preserve the primary delivery outcome. */ }
       throw error;
     }
   }

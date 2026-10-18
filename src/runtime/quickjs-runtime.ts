@@ -54,6 +54,7 @@ const GUEST_FABRIC_ERROR_NAMES: Readonly<Record<string, string>> = Object.freeze
   FABRIC_PARTICIPANT_STALE: "FabricParticipantStaleError",
   FABRIC_RELAY_DESTINATION_UNAVAILABLE: "FabricRelayDestinationUnavailableError",
   FABRIC_IDEMPOTENCY_KEY_REUSED: "FabricIdempotencyKeyReusedError",
+  FABRIC_DELIVERY_UNCONFIRMED: "FabricDeliveryUnconfirmedError",
   FABRIC_PARTICIPANT_NOT_YET_MIRRORED: "FabricParticipantNotYetMirroredError",
   FABRIC_PEER_LEASE_STALE: "FabricPeerLeaseStaleError",
   FABRIC_PARTICIPANT_NON_INTERACTIVE: "FabricParticipantNonInteractiveError",
@@ -81,6 +82,15 @@ const guestFabricErrorMetadata = (error: unknown): Record<string, string | boole
     const launchOutcome = Object.getOwnPropertyDescriptor(error, "launchOutcome")?.value;
     if (launchOutcome === "unlaunched") metadata.launchOutcome = launchOutcome;
   }
+  if (code === "FABRIC_DELIVERY_UNCONFIRMED") {
+    // deliveryId is the control command ID, not proof of receiver rejection.
+    // Bound all public identifiers; accessors and inherited fields stay host-side.
+    for (const key of ["deliveryId", "targetId", "idempotencyKey"] as const) {
+      const value = Object.getOwnPropertyDescriptor(error, key)?.value;
+      if (typeof value === "string" && value.length >= 1 && value.length <= 200) metadata[key] = value;
+    }
+    return metadata;
+  }
   const retryable = Object.getOwnPropertyDescriptor(error, "retryable")?.value;
   if (typeof retryable === "boolean") metadata.retryable = retryable;
   if (code === "FABRIC_PARTICIPANT_STALE" || code === "FABRIC_RELAY_DESTINATION_UNAVAILABLE" || code === "FABRIC_IDEMPOTENCY_KEY_REUSED") {
@@ -90,6 +100,16 @@ const guestFabricErrorMetadata = (error: unknown): Record<string, string | boole
     if (typeof key === "string" && key.length >= 1 && key.length <= 200) metadata.idempotencyKey = key;
   }
   return metadata;
+};
+
+// Preserve ordinary inherited Error classifications without evaluating a host
+// accessor. Fabric's structured contracts above still require own data fields.
+const hostErrorName = (error: Error): unknown => {
+  for (let owner: object | null = error; owner !== null; owner = Object.getPrototypeOf(owner)) {
+    const descriptor = Object.getOwnPropertyDescriptor(owner, "name");
+    if (descriptor) return descriptor.value;
+  }
+  return undefined;
 };
 
 let quickJsModulePromise: Promise<QuickJsModule> | undefined;
@@ -1207,14 +1227,14 @@ export class QuickJsRuntime {
               try {
                 // Known host-issued mesh codes win over legacy or overridden names.
                 // Retryability alone never authorizes exporting arbitrary error codes.
-                const meshCode = error instanceof Error && "code" in error ? error.code : undefined;
+                const meshCode = error instanceof Error ? Object.getOwnPropertyDescriptor(error, "code")?.value : undefined;
                 const safeMetadata = typeof meshCode === "string" && Object.hasOwn(GUEST_MESH_RETRYABLE_ERROR_NAMES, meshCode) && isMeshRetryableBusy(error)
                   ? { name: GUEST_MESH_RETRYABLE_ERROR_NAMES[meshCode]!, code: meshCode }
                   : guestFabricErrorMetadata(error);
                 // Fabric metadata includes its vetted name. Otherwise transfer only
                 // a host Error's string classification, never arbitrary properties
                 // or a caller-selected property key. Each key is assigned once.
-                const name = safeMetadata?.name ?? (error instanceof Error ? error.name : undefined);
+                const name = safeMetadata?.name ?? (error instanceof Error ? hostErrorName(error) : undefined);
                 if (!safeMetadata && typeof name === "string") {
                   const nameHandle = context.newString(name);
                   try {

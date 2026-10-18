@@ -2,8 +2,8 @@
 /** #3039: public Fabric APIs in a native Pi parent + real process task, offline.
  * No source imports, fake Pi, credential lookup, live mesh, or build. All runtime
  * state lives in one private mkdtemp below TMPDIR; only evidence survives.
- * Usage: node scripts/prove-terminal-task.mjs --fabric-root /built/package \
- *   --evidence-dir .local/terminal-proof/baseline --expect-terminal false
+ * Usage: node scripts/prove-terminal-task.mjs --pi-cli /path/to/dist/cli.js \
+ *   --fabric-root /built/package --evidence-dir .local/terminal-proof/baseline --expect-terminal false
  */
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -12,23 +12,33 @@ import http from 'node:http';
 import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
 
-const NATIVE_PI = '/home/paul/.local/share/smarty-dev/pi-runtime/releases/21ab152c7e43af76468d898bc50085fcd01a515b/node/node_modules/@earendil-works/pi-coding-agent/dist/cli.js';
+const usage = 'Usage: node scripts/prove-terminal-task.mjs --pi-cli /path/to/dist/cli.js --fabric-root /built/package --evidence-dir PATH --expect-terminal true|false\nSet TMPDIR to a private host temporary directory (not /var/tmp).';
+if (process.argv.includes('--help') || process.argv.includes('-h')) { console.log(usage); process.exit(0); }
 const GUARD = 180_000;
 const option = name => {
   const i = process.argv.indexOf(name);
-  if (i < 0 || !process.argv[i + 1] || process.argv[i + 1].startsWith('--')) throw new Error(`Required: ${name}`);
-  return process.argv[i + 1];
+  const value = process.argv[i + 1];
+  if (i < 0 || typeof value !== 'string' || !value.trim() || value.startsWith('--') || /[\0\r\n]/.test(value)) throw new Error(`Required nonempty value: ${name}\n${usage}`);
+  return value;
 };
-const fabricRoot = fs.realpathSync(option('--fabric-root'));
-const evidenceDir = path.resolve(option('--evidence-dir'));
+const cliInput = option('--pi-cli');
+const fabricInput = option('--fabric-root');
+const evidenceInput = option('--evidence-dir');
 const expectation = option('--expect-terminal');
-assert(['true', 'false'].includes(expectation), '--expect-terminal must be true|false');
+assert(path.isAbsolute(cliInput), `--pi-cli must be an absolute file path\n${usage}`);
+assert(['true', 'false'].includes(expectation), `--expect-terminal must be true|false\n${usage}`);
+assert(typeof process.env.TMPDIR === 'string' && process.env.TMPDIR.trim() && !/[\0\r\n]/.test(process.env.TMPDIR), `Set TMPDIR to a private host temporary directory\n${usage}`);
+assert(!path.resolve(process.env.TMPDIR).startsWith('/var/tmp'), `Scratch must not use /var/tmp\n${usage}`);
+const NATIVE_PI = path.resolve(cliInput);
+const evidenceDir = path.resolve(evidenceInput);
+assert(fs.existsSync(NATIVE_PI) && fs.statSync(NATIVE_PI).isFile(), `--pi-cli must name an existing file\n${usage}`);
+assert(fs.existsSync(fabricInput) && fs.statSync(fabricInput).isDirectory(), `--fabric-root must name an existing directory\n${usage}`);
+assert(!fs.existsSync(evidenceDir) || fs.statSync(evidenceDir).isDirectory(), `--evidence-dir must name a directory\n${usage}`);
+const fabricRoot = fs.realpathSync(fabricInput);
 const expectTerminal = expectation === 'true';
 const extension = path.join(fabricRoot, 'dist/index.js');
 const worker = path.join(fabricRoot, 'dist/worker.js');
-for (const file of [NATIVE_PI, extension, worker]) assert(fs.statSync(file).isFile(), `Missing built artifact: ${file}`);
-assert(process.env.TMPDIR, 'Set TMPDIR to a private host temporary directory');
-assert(!path.resolve(process.env.TMPDIR).startsWith('/var/tmp'), 'Scratch must not use /var/tmp');
+for (const file of [extension, worker]) assert(fs.existsSync(file) && fs.statSync(file).isFile(), `Missing built artifact: ${file}\n${usage}`);
 assert(!fs.existsSync(evidenceDir) || fs.readdirSync(evidenceDir).length === 0, 'Use a new/empty --evidence-dir; never mix proof generations');
 const scratch = fs.mkdtempSync(path.join(process.env.TMPDIR, 'terminal-native-proof-'));
 fs.mkdirSync(evidenceDir, { recursive: true });

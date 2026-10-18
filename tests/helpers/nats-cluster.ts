@@ -195,7 +195,7 @@ export function resolveNatsBinary(explicit = process.env.NATS_BIN?.trim()): stri
   }
   const candidates = [
     ...(process.env.PATH ?? "").split(path.delimiter).filter(Boolean).map((dir) => path.join(dir, "nats-server")),
-    "/home/paul/.local/bin/nats-server",
+    path.join(os.homedir(), ".local", "bin", "nats-server"),
   ];
   return candidates.find(executable);
 }

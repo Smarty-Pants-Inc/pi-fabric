@@ -2,7 +2,8 @@
 // Run with bun through forge-ssh-bridge.sh. Never creates a mesh, profile, key or sshd.
 // REQUIRED JSON (absolute paths, existing meshes and host-owned agent profiles):
 // { localMesh, remoteMesh, localFabric, remoteFabric, localAgentDir, remoteAgentDir,
-//   localCwd, remoteCwd, evidenceRoot, remoteEvidenceRoot, bridgeKey, bridgeKnownHosts }
+//   localCwd, remoteCwd, evidenceRoot, remoteEvidenceRoot, bridgeKey, bridgeKnownHosts,
+//   bridgeHost: "user@bridge-host.example" }
 // localFabric/remoteFabric are the exact installed B65 dist/index.js paths. The
 // local installation also supplies dist/mesh.js and bin/mesh-bridge. Both evidence
 // roots must contain a .local path component; a unique run subdirectory is created.
@@ -11,7 +12,7 @@
 // OPTIONAL: localName="dev1", remoteName="forge", localPi="pi",
 // remotePi="forge-pi", remoteNode="node", localNode="node",
 // sshHost="forge-agent" (ordinary host-owned SSH profile, NOT the forced key),
-// bridgeHost="paul@100.78.65.112", bridgePort=22,
+// bridgePort=22 (bridgeHost is required; there is no host default),
 // bridgeBin=<local install>/bin/mesh-bridge, model="cliproxyapi/gpt-6.1-sol".
 // Ordinary SSH always uses BatchMode, strict host checking and a connect deadline.
 // The bridge key must ALREADY force the installed remote mesh-bridge agent on
@@ -778,15 +779,24 @@ const cleanup = () => cleanupPromise ??= (async () => {
 process.on("SIGTERM", interrupt);
 process.on("SIGINT", interrupt);
 
+const usage = "Usage: node proof/forge-ssh-bridge.mjs CONFIG.json\nCONFIG.json must be a JSON object with the required absolute paths listed in the driver header and an explicit bridgeHost SSH destination ([user@]host); no bridgeHost default is provided.";
+const configPath = () => {
+  const input = process.argv[2];
+  assert(process.argv.length === 3 && typeof input === "string" && input.trim() && !input.startsWith("-") && !/[\0\r\n]/.test(input), usage);
+  assert(fs.statSync(input).isFile(), `CONFIG.json must be a file\n${usage}`);
+  return input;
+};
 try {
-  cfg = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+  cfg = JSON.parse(fs.readFileSync(configPath(), "utf8"));
+  assert(cfg !== null && typeof cfg === "object" && !Array.isArray(cfg), "CONFIG.json must be a JSON object");
+  assert(typeof cfg.bridgeHost === "string" && cfg.bridgeHost.trim() && !/[\s\0/]/.test(cfg.bridgeHost), "required bridgeHost: explicit SSH destination ([user@]host), not an empty value or path");
   for (const key of ["localMesh", "remoteMesh", "localFabric", "remoteFabric", "localAgentDir", "remoteAgentDir", "localCwd", "remoteCwd", "evidenceRoot", "remoteEvidenceRoot", "bridgeKey", "bridgeKnownHosts"]) {
-    assert(typeof cfg[key] === "string" && path.isAbsolute(cfg[key]) && !cfg[key].includes("\n"), `required absolute path: ${key}`);
+    assert(typeof cfg[key] === "string" && path.isAbsolute(cfg[key]) && !/[\0\r\n]/.test(cfg[key]), `required absolute path: ${key}`);
   }
   for (const key of ["evidenceRoot", "remoteEvidenceRoot"]) assert(cfg[key].split("/").includes(".local") && !cfg[key].startsWith("/tmp/"), `${key} must be under .local, not /tmp`);
   Object.assign(cfg, { localName: cfg.localName ?? "dev1", remoteName: cfg.remoteName ?? "forge",
     localPi: cfg.localPi ?? "pi", remotePi: cfg.remotePi ?? "forge-pi", localNode: cfg.localNode ?? "node", remoteNode: cfg.remoteNode ?? "node",
-    sshHost: cfg.sshHost ?? "forge-agent", bridgeHost: cfg.bridgeHost ?? "paul@100.78.65.112", bridgePort: String(cfg.bridgePort ?? 22),
+    sshHost: cfg.sshHost ?? "forge-agent", bridgePort: String(cfg.bridgePort ?? 22),
     model: cfg.model ?? "cliproxyapi/gpt-6.1-sol", bridgeBin: cfg.bridgeBin ?? path.resolve(path.dirname(cfg.localFabric), "../bin/mesh-bridge") });
   assert(!cfg.sshHost.startsWith("-") && !cfg.bridgeHost.startsWith("-"), "SSH host must not be an option");
   assert(/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(cfg.localName) && /^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(cfg.remoteName) && cfg.localName !== cfg.remoteName, "distinct valid bridge names required");
@@ -998,11 +1008,12 @@ console.log(JSON.stringify(value));`;
   assert(!stopping, "proof interrupted during ledger read");
   results.status = "PASS";
 } catch (error) {
-  // Even invalid configuration gets a failure receipt, without touching auth.
-  if (!evidence) { evidence = path.resolve(".local/forge-bridge-proof", runId); fs.mkdirSync(evidence, { recursive: true, mode: 0o700 }); }
-  results.status = "FAIL"; results.failed = String(error?.stack ?? error); save(); console.error(results.failed);
+  // Invalid input fails before evidence, cleanup helpers or any process launch.
+  results.status = "FAIL"; results.failed = String(error?.stack ?? error);
+  if (!evidence) results.failed += `\n${usage}`;
+  save(); console.error(results.failed);
 } finally {
-  try { await cleanup(); } catch (error) { results.status = "FAIL"; results.cleanupFailure = String(error?.stack ?? error); }
+  try { if (evidence) await cleanup(); } catch (error) { results.status = "FAIL"; results.cleanupFailure = String(error?.stack ?? error); }
   results.status = finalStatus(results.status, results.interrupted, results.cleanup?.errors ?? ["cleanup missing"]);
   results.finishedAt = new Date().toISOString(); save();
   console.log(JSON.stringify({ status: results.status, acceptanceScope: results.acceptanceScope, evidence, checks: Object.keys(results.checks), failure: results.failed ?? results.cleanupFailure }));

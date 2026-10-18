@@ -45,11 +45,11 @@ solution; this change preserves the current deletion guard and caller ownership.
 
 ## Native proof
 
-From the repository root, set `TMPDIR` to a private directory under `/srv/scratch/paul/`, then run:
+From the repository root, prepare an existing absolute `PRIVATE_TEMP_ROOT` directory owned by the caller with mode `0700`. Pass that directory explicitly; it need not be under any fleet-specific prefix:
 
 ```sh
 systemd-run --user --scope -p MemoryMax=24G -p MemorySwapMax=0 -p RuntimeMaxSec=1200 -- \
-  node scripts/probe-test-temp-cleanup.mjs
+  node scripts/probe-test-temp-cleanup.mjs /absolute/private/temp-root
 ```
 
 The probe runs the ordinary `bun run test --config <small-fixture-config>` command, not Vitest

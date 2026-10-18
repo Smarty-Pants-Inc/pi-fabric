@@ -120,7 +120,7 @@ const allowed: Array<[string, string]> = [
   ["a quoted star is literal", `rm -f "/tmp/tmp.*"`],
   ["an escaped star is literal", `rm -f /tmp/tmp.\\*`],
   ["a relative glob outside /tmp", `rm -rf build/*`],
-  ["an absolute glob outside /tmp", `rm -rf /home/paul/w/.local/*.json`],
+  ["an absolute glob outside /tmp", `rm -rf /home/example/w/.local/*.json`],
   ["a listing of /tmp", `ls -la /tmp/tmp.*`],
   ["find /tmp without delete", `find /tmp -maxdepth 1 -name 'tmp.*' -user paul`],
   ["grep for the incident", `grep -rn 'rm -rf /tmp/tmp.*' docs/`],
@@ -214,7 +214,7 @@ describe("expanded-parent recursive deletion (#325 F7)", () => {
     "rm -R `pwd`/..",
     `rm --recursive -- "$TMPDIR/.."`,
     `d=$(mktemp -d) && rm -rf -- "$d/.."`,
-    `TMPDIR=/home/paul/private; rm -rf "$TMPDIR/.."`,
+    `TMPDIR=/home/example/private; rm -rf "$TMPDIR/.."`,
     `find "$TMPDIR/.." -delete`,
   ])("refuses %s", (command) => {
     expect(wipesTmp(command)).toBe(true);

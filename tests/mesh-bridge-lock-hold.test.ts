@@ -154,7 +154,7 @@ const populate = async (mesh: MeshStore) => {
       value: { format: 1, id, kind: "root", rootId: id, ownerHostId: id, ownerIdentityId: id, name: `agent-${n}`,
         label: `lane agent ${n} on host ${n % 9}`, status: "idle", runner: "pi", transport: "host",
         capabilities: ["steer", "followUp", "status"], startedAt: now, updatedAt: now, controlProtocol: "v1",
-        cwd: `/home/paul/lanes/lane-${n}`, model: "opus-5.5", effort: "high" } });
+        cwd: `/home/example/lanes/lane-${n}`, model: "opus-5.5", effort: "high" } });
   }
   for (let at = 0; at < ops.length; at += 200) await mesh.writeBatch({ identity: ops[at]!.identity, ops: ops.slice(at, at + 200) });
   for (let n = 0; n < LEASES; n++) {

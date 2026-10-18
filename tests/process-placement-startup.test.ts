@@ -80,7 +80,7 @@ describe("placement import/registration/idle boundary", () => {
   it("probes startup with a Ryzen 1-style cwd without running the launcher or loading the runtime", async () => {
     const placement = documentedPlacement();
     placement.command[0] = process.execPath; // Only a local executable check, never SSH.
-    const fixture = stateAt(placement, "/home/paul/smarty/smarty-pants/pi-fabric");
+    const fixture = stateAt(placement, "/home/example/smarty/smarty-pants/pi-fabric");
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const loads = calls.loads;
     await fixture.state.bootstrap(fixture.context);

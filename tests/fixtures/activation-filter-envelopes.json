@@ -146,7 +146,7 @@
         "event": "tool_error",
         "session": {
           "id": "01a0d12f-033f-775d-892c-2ad1e8be816f",
-          "cwd": "/home/paul/Projects/playful-dev/playful-chief"
+          "cwd": "/home/example/Projects/playful-dev/playful-chief"
         },
         "digest": {
           "filesTouched": [

@@ -7,7 +7,7 @@ const saved = new Map<string, string | undefined>();
 beforeEach(() => { for (const key of keys) { saved.set(key, process.env[key]); delete process.env[key]; } });
 afterEach(() => { for (const key of keys) { const value = saved.get(key); if (value === undefined) delete process.env[key]; else process.env[key] = value; } saved.clear(); });
 const nats = () => ({ operatorMachine: "fabric-ops", machine: "ryzen2", credentials: "/not-read/user.creds",
-  servers: ["tls://intel1.tail62219a.ts.net:4222"], custodyStream: "FABRIC_CUSTODY", livenessStream: "FABRIC_LIVENESS",
+  servers: ["tls://n1.example.ts.net:4222"], custodyStream: "FABRIC_CUSTODY", livenessStream: "FABRIC_LIVENESS",
   pathBMachines: ["ryzen2", "ryzen4"], tls: { caFile: "/not-read/ca.pem" } });
 const config = (value: Record<string, unknown>) => ({ mesh: { transport: "nats", hostTransport: "nats", stateBackend: "file", nats: value } });
 const refuses = (value: Record<string, unknown>, field?: string) => {

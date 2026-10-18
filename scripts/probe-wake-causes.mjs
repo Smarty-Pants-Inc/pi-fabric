@@ -11,29 +11,35 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createWakeProbeObserver } from './wake-probe-observer.mjs';
 
 const lane = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const defaultCli = '/home/paul/.local/share/smarty-dev/pi-runtime/releases/21ab152c7e43af76468d898bc50085fcd01a515b/node/node_modules/@earendil-works/pi-coding-agent/dist/cli.js';
-const usage = 'node scripts/probe-wake-causes.mjs [dist/index.js] [output-dir] [--duration-ms 600000] [--pi-cli /path/to/dist/cli.js]\nDiagnostic: --duration-ms 90000 (public root-inbox mesh delivery has a real 60s grace).';
-let durationMs = 600000, cli = process.env.PI_FABRIC_PROBE_PI ?? defaultCli;
+const usage = 'Usage: node scripts/probe-wake-causes.mjs [dist/index.js] [output-dir] --pi-cli /path/to/dist/cli.js [--duration-ms 600000]\nAlternatively set PI_FABRIC_PROBE_PI to the explicit absolute CLI file path.\nDiagnostic: --duration-ms 90000 (public root-inbox mesh delivery has a real 60s grace).';
+const requireInput = (value, name) => {
+  assert.ok(typeof value === 'string' && value.trim() && !value.startsWith('--') && !/[\0\r\n]/.test(value), `${name} requires a nonempty path/value\n${usage}`);
+  return value;
+};
+let durationMs = 600000, cli = process.env.PI_FABRIC_PROBE_PI;
 const positional = [];
 for (let index = 2; index < process.argv.length; index++) {
   const arg = process.argv[index];
   if (arg === '--help' || arg === '-h') { console.log(usage); process.exit(0); }
-  if (arg === '--duration-ms') durationMs = Number(process.argv[++index]);
-  else if (arg.startsWith('--duration-ms=')) durationMs = Number(arg.slice(14));
-  else if (arg === '--pi-cli') cli = process.argv[++index];
-  else if (arg.startsWith('--')) throw new Error('Unknown argument: ' + arg);
+  if (arg === '--duration-ms') durationMs = Number(requireInput(process.argv[++index], '--duration-ms'));
+  else if (arg.startsWith('--duration-ms=')) durationMs = Number(requireInput(arg.slice(14), '--duration-ms'));
+  else if (arg === '--pi-cli') cli = requireInput(process.argv[++index], '--pi-cli');
+  else if (arg.startsWith('--pi-cli=')) cli = requireInput(arg.slice(9), '--pi-cli');
+  else if (arg.startsWith('--')) throw new Error(`Unknown argument: ${arg}\n${usage}`);
   else positional.push(arg);
 }
-assert.ok(Number.isSafeInteger(durationMs) && durationMs > 0 && durationMs <= 86400000, '--duration-ms must be an integer in 1..86400000');
+assert.ok(Number.isSafeInteger(durationMs) && durationMs > 0 && durationMs <= 86400000, `--duration-ms must be an integer in 1..86400000\n${usage}`);
 assert.ok(positional.length <= 2, usage);
-const candidate = path.resolve(positional[0] ?? path.join(lane, 'dist/index.js'));
+cli = requireInput(cli, '--pi-cli (or PI_FABRIC_PROBE_PI)');
+assert.ok(path.isAbsolute(cli), `--pi-cli must be an absolute file path\n${usage}`);
+const candidate = path.resolve(requireInput(positional[0] ?? path.join(lane, 'dist/index.js'), 'candidate'));
+const out = path.resolve(requireInput(positional[1] ?? path.join(lane, '.local/wake-causes', new Date().toISOString().replaceAll(':', '-')), 'output-dir'));
 const fixture = path.join(lane, 'tests/fixtures/wake-causes-cli-provider.ts');
 const reader = path.join(lane, 'scripts/read-wake-causes.py');
 cli = path.resolve(cli);
-for (const file of [cli, candidate, fixture, reader]) assert.ok(fs.existsSync(file), 'Missing file (build first): ' + file);
+for (const file of [cli, candidate, fixture, reader]) assert.ok(fs.existsSync(file) && fs.statSync(file).isFile(), `Missing file (build first): ${file}\n${usage}`);
 const cliManifest = JSON.parse(fs.readFileSync(path.join(path.dirname(cli), '../package.json'), 'utf8'));
 assert.equal(cliManifest.version, '0.87.1', 'Replay is pinned to the real Pi 0.87.1 host');
-const out = path.resolve(positional[1] ?? path.join(lane, '.local/wake-causes', new Date().toISOString().replaceAll(':', '-')));
 fs.mkdirSync(out, { recursive: true });
 assert.ok(!fs.existsSync(path.join(out, 'summary.json')) && !fs.existsSync(path.join(out, 'scratch')), 'Use a fresh output directory; evidence must not be overwritten');
 fs.copyFileSync(reader, path.join(out, 'read-wake-causes.py'));

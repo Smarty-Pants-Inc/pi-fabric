@@ -345,8 +345,8 @@ describe("renderNatsServerConfig: bus 3/3 configured route mTLS", () => {
     // Named justified counterexample: an IP-literal route cannot match the DNS SANs that
     // verify_cert_and_check_known_urls checks (Q5, preflight U5), so it is refused rather than rendered.
     for (const route of [
-      "nats-route://100.64.0.3:6222",
-      "nats-route://[fd7a::3]:6222",
+      "nats-route://192.0.2.3:6222",
+      "nats-route://[2001:db8::3]:6222",
       "nats-route://user:pass@n3.example.ts.net:6222",
       "nats-route://*.example.ts.net:6222",
       "nats://n3.example.ts.net:6222",
@@ -590,7 +590,7 @@ describe("config review regressions", () => {
 
   it("C1 refuses an IP cluster.listen (DNS-only routes cannot represent it) and leading-zero route ports", async () => {
     const mod = await load();
-    for (const host of ["100.64.0.2", "10.0.0.2"]) {
+    for (const host of ["192.0.2.2", "10.0.0.2"]) {
       expect(refusal(mod, mutate(triple, (i) => i.cluster && (i.cluster.listen.host = host))).field, host).toBe(
         "cluster.listen.host",
       );

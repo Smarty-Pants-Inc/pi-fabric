@@ -15,8 +15,8 @@ import * as currentMeshLock from "../src/mesh/mesh-lock.js";
 // two parties ever both hold the lock. The precondition (no acquirer recovers a LIVE owner's fence locks) is proven
 // below for this tree and for the 13d1bbef release that can run on the same root during the cutover.
 
-const OLD_TREE = process.env.PI_FABRIC_OLD_RELEASE_TREE ?? "/home/paul/lanes/r13d1";
-const oldTree = fs.existsSync(path.join(OLD_TREE, "src/mesh/mesh-lock.ts")) ? OLD_TREE : undefined;
+const OLD_TREE = process.env.PI_FABRIC_OLD_RELEASE_TREE;
+const oldTree = OLD_TREE && fs.existsSync(path.join(OLD_TREE, "src/mesh/mesh-lock.ts")) ? OLD_TREE : undefined;
 const linux = process.platform === "linux";
 
 const roots: string[] = [];

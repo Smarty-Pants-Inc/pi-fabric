@@ -73,7 +73,7 @@ The explicit-policy old writer's raw fallback was stale in **105** samples while
 native Main remained live in every sample. This directly resolves the old-Mains/zero-
 commits contradiction. All child processes were closed and checked.
 
-Evidence is retained under `/srv/scratch/paul/tasks/direct/fv2-compat3/artifacts/`:
+Evidence is retained at a host-private path (redacted):
 `compat-cadence-bench.ts`, `bench.json`, `compat-live.ts`, `live-default.json`,
 `live-files.json`, writer reports, minute counter JSONL files, and `old-citations.txt`.
 The old checkout is reproducible with `git archive 6b15d905`; only private TMPDIR

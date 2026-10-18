@@ -279,7 +279,7 @@ describe("actor state alarms (smarty-dev#9332)", () => {
   it("alarm data carries fixed failure codes, never raw error text (paths, secrets)", async () => {
     const s = setup(true);
     const actor = await s.actors.create({ name: "leaky", instructions: "Run", residency: "durable", coalesce: false });
-    const leak = "Error: open /home/paul/.config/secret.json failed: Authorization: Bearer sk-abcdefghijklmnop0123";
+    const leak = "Error: open /home/example/.config/secret.json failed: Authorization: Bearer sk-abcdefghijklmnop0123";
     vi.spyOn(s.agents, "run").mockRejectedValue(new Error(leak));
     await s.actors.tell(actor.id, "anything");
     await waitFor(() => s.alarms("actor-event-dropped", actor.id).length === 1);
@@ -352,7 +352,7 @@ describe("actor state alarms (smarty-dev#9332)", () => {
   // smarty-dev#10067 P2-2: the streak alarm and the early unknown-block alarm carry the fixed code, not lastError.
   it("a lastError with a path or a secret never appears in the blocked alarms (streak and early unknown)", async () => {
     const s = setup();
-    const leak = "Error: open /home/paul/.config/secret.json failed: Authorization: Bearer sk-abcdefghijklmnop0123";
+    const leak = "Error: open /home/example/.config/secret.json failed: Authorization: Bearer sk-abcdefghijklmnop0123";
     vi.spyOn(s.agents, "run").mockRejectedValue(new Error(leak));
     const early = await s.actors.create({ name: "early", instructions: "Run", responseMode: "text" });
     const streak = await s.actors.create({ name: "streak", instructions: "Run", responseMode: "text" });
@@ -374,7 +374,7 @@ describe("actor state alarms (smarty-dev#9332)", () => {
     const real = f.s.agents.workerIdentity.bind(f.s.agents);
     vi.spyOn(f.s.agents, "workerIdentity").mockImplementation(id => id === f.runId ? { pid: 2147483647, startTime: "1", open: true } : real(id));
     const status = JSON.parse(fs.readFileSync(path.join(f.directory, "status.json"), "utf8"));
-    fs.writeFileSync(path.join(f.directory, "status.json"), JSON.stringify({ ...status, status: "ok /home/paul/x Bearer y" }));
+    fs.writeFileSync(path.join(f.directory, "status.json"), JSON.stringify({ ...status, status: "ok /home/example/x Bearer y" }));
     try {
       const data = await f.expectAlarm("worker-gone");
       expect(data.workerStatusHint).toEqual({ untrusted: true, status: "unknown" });

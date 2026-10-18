@@ -5,7 +5,7 @@ import { isMeshIncarnationPending, isMeshSnapshotRetriesExhausted, isMeshLockTim
 import fs from "node:fs";
 import path from "node:path";
 import type { Readable, Writable } from "node:stream";
-import { ownProcessIncarnation, readPhysicalHostIdentity, readFileRetrying, writeJsonAtomic } from "../core/atomic-write.js";
+import { MeshLockTimeoutError, ownProcessIncarnation, readPhysicalHostIdentity, readFileRetrying, writeJsonAtomic } from "../core/atomic-write.js";
 import { type BridgeLeaseProcess, type FabricHostLease, type FabricMirrorLease, MIRROR_FRESH_MS, hostLeaseExpiry, hostLeasePath, hostLiveness, readHostLease, readHostLeases, removeHostLeaseIf, STATE_LEASE_RENEW_MS, writeHostLease } from "../topology/host-leases.js";
 import { meshDirectoryStamp } from "../topology/publication-generation.js";
 import type { FabricHostRecord, FabricParticipantRecord } from "../topology/types.js";
@@ -13,7 +13,7 @@ import { ROOT_ID_PREFIX } from "../topology/root-inbox-shared.js";
 import { participantFilePresent, readParticipantFiles } from "../topology/participant-files.js";
 import { FABRIC_MESH_OUTAGE_ALARM_TOPIC, isMeshAlarmTarget, meshCursorGeneration, type MeshBatchOperation, type MeshBatchView, type MeshEvent, type MeshIdentity, type MeshPublishInput, type MeshStateEntry, type MeshStore } from "./store.js";
 import { CommitOutbox, type CommitOutboxEffect } from "./commit-outbox.js";
-import { assertBridgeStateBackend, isMeshRetryableBusy, isMeshStateWalCap } from "./state-backend.js";
+import { assertBridgeStateBackend, isMeshRetryableBusy, isMeshStateBusy, isMeshStateWalCap, MESH_STATE_BUSY_CODE } from "./state-backend.js";
 import { watchBridgeStore, type BridgeChange } from "./change-notifier.js";
 import { BRIDGE_BATCH_MAX_EVENTS } from "./event-log.js";
 import { controlBodyFingerprint, FABRIC_IDEMPOTENCY_KEY_REUSED, FabricIdempotencyKeyReusedError } from "./control-idempotency.js";
@@ -67,6 +67,9 @@ export const DEFAULT_CALL_TIMEOUT_MS = 30_000;
 const DEFAULT_STOP_MS = 5_000;
 const LOCK_RETRY_MIN_MS = 100;
 const LOCK_RETRY_MAX_MS = 2_000;
+const BRIDGE_FENCE_RETRY_MS = 5_000;
+const BRIDGE_FENCE_BACKOFF_MIN_MS = 200;
+const BRIDGE_FENCE_BACKOFF_MAX_MS = 2_000;
 // A WAL-cap refusal (FABRIC_MESH_STATE_WAL_CAP) can last until the operator rolls back: log it at most once a minute.
 const WAL_CAP_LOG_MS = 60_000;
 // A capped WAL stays capped until a reader lets go or the operator rolls back: back off 1 s doubling to 30 s,
@@ -631,7 +634,18 @@ const bridgeIncarnationWithFloor = (
   return next;
 };
 
+class BridgeFenceBusyError extends MeshLockTimeoutError {
+  readonly busyCode = MESH_STATE_BUSY_CODE;
+  constructor(cause: Error) {
+    super(" (bridge SQLite write fence)", 1, 0);
+    this.message = `${MESH_STATE_BUSY_CODE}: ${this.message}; event was not appended`;
+    this.name = "BridgeFenceBusyError";
+    this.cause = cause;
+  }
+}
+
 export class StoreBridgeSide implements BridgeSide {
+  #fenceBusyRetryNotice: ((delayMs: number, error: Error) => void) | undefined;
   // The mirror's host-lease writes and removals run after its state commit, from rows recorded in
   // that commit (smarty-dev#6477 R11): a crash in between leaves them for the next pass, which
   // replays them on its own snapshot (CommitOutboxPlan.replay) before it stages anything.
@@ -640,6 +654,10 @@ export class StoreBridgeSide implements BridgeSide {
   // Active only during one mirror commit attempt, including recovery and afterCommit retries.
   #skippedRoots: ReadonlySet<string> | undefined;
   #leaseProcess: Promise<BridgeLeaseProcess | undefined> | undefined;
+
+  setFenceBusyRetryNotice(notice: (delayMs: number, error: Error) => void): void {
+    this.#fenceBusyRetryNotice = notice;
+  }
 
   constructor(
     readonly store: MeshStore,
@@ -992,11 +1010,11 @@ export class StoreBridgeSide implements BridgeSide {
     return [...this.store.listAll(PARTICIPANT_PREFIX, { fresh: true }), ...readParticipantFiles(this.store.root, { maxAgeMs: 0 })];
   }
 
-  // Do not retry a busy SQLite ownership fence inside bridge publication: failure guarantees no append.
-  // Let the per-direction loop back off with .lock released instead of reacquiring ahead of queued writers.
+  // A busy fence refuses before the append. Retry only after publish has unwound and released .lock,
+  // with jittered bounded backoff so independent hub bridges do not re-collide in lockstep.
   async publish(event: BridgePublish, held: string[] = [], fromHub = false): Promise<{ sequence: number }> {
     await this.store.prepareLock();
-    const published = await this.store.publish(this.#publication(event, held, fromHub));
+    const published = await this.#fenceRetry(() => this.store.publish(this.#publication(event, held, fromHub)));
     return { sequence: published.sequence };
   }
 
@@ -1009,19 +1027,42 @@ export class StoreBridgeSide implements BridgeSide {
     // The dedupe receipt stores this envelope too: NEVER pass the command body to store.publish.
     const key = `${RELAY_RECEIPT_PREFIX}${encodeURIComponent(this.peer)}:${encodeURIComponent(stamp.id)}`;
     await this.store.prepareLock();
-    const published = await this.store.publish({
+    const published = await this.#fenceRetry(() => this.store.publish({
       id: key, dedupeKey: key, topic: checked.topic, kind: checked.kind,
       from: { ...checked.from, verified: "bridge" }, to: checked.to, durable: true,
       ...this.#heldFence([...new Set([checked.from.id, ...held])], checked.from),
       // createdAt is stamped by the host store at commit; no data/text/message/principal.
-    });
+    }));
     return { sequence: published.sequence };
   }
 
   async publishBatch(events: Array<{ event: BridgePublish; held?: string[] }>, fromHub = false): Promise<Array<{ sequence: number }>> {
     await this.store.prepareLock();
-    const published = await this.store.publishBatch(events.map(({ event, held }) => this.#publication(event, held ?? [], fromHub)));
+    const published = await this.#fenceRetry(() => this.store.publishBatch(events.map(({ event, held }) => this.#publication(event, held ?? [], fromHub))));
     return published.map(({ sequence }) => ({ sequence }));
+  }
+
+  async #fenceRetry<T>(publish: () => Promise<T>): Promise<T> {
+    const deadline = Date.now() + Math.min(BRIDGE_FENCE_RETRY_MS, this.store.tryLockBudgetMs ?? BRIDGE_FENCE_RETRY_MS);
+    let backoffCap = BRIDGE_FENCE_BACKOFF_MIN_MS;
+    let reported = false;
+    for (;;) {
+      try { return await publish(); }
+      catch (error) {
+        if (!isMeshStateBusy(error)) throw error;
+        if (Date.now() >= deadline) throw new BridgeFenceBusyError(error instanceof Error ? error : new Error(String(error)));
+        const remaining = deadline - Date.now();
+        const cap = Math.min(backoffCap, BRIDGE_FENCE_BACKOFF_MAX_MS, remaining);
+        // Equal jitter: at least half the cap, with a randomized upper half.
+        const delayMs = Math.max(1, Math.floor(cap / 2 + Math.random() * cap / 2));
+        if (!reported) {
+          this.#fenceBusyRetryNotice?.(delayMs, error instanceof Error ? error : new Error(String(error)));
+          reported = true;
+        }
+        await new Promise(resolve => setTimeout(resolve, delayMs));
+        backoffCap = Math.min(backoffCap * 2, BRIDGE_FENCE_BACKOFF_MAX_MS);
+      }
+    }
   }
 
   #publication(event: BridgePublish, held: string[], fromHub: boolean): Parameters<MeshStore["publish"]>[0] {
@@ -2634,6 +2675,12 @@ export class MeshBridge {
       if (!validBridgeName(name)) throw new Error(`Invalid bridge name: ${name}`);
     }
     if (options.localName === options.remoteName) throw new Error("Bridge side names must differ");
+    for (const side of new Set([options.local, options.remote])) {
+      if (side instanceof StoreBridgeSide) {
+        side.setFenceBusyRetryNotice((delayMs, error) =>
+          this.#log(`${meshBusyLabel(error)} (${side.peer}); retrying in ${delayMs} ms: ${error.message}`));
+      }
+    }
     if (options.membershipRetryMs !== undefined && !(Number.isSafeInteger(options.membershipRetryMs) && options.membershipRetryMs > 0)) {
       throw new Error("membershipRetryMs needs a positive integer");
     }

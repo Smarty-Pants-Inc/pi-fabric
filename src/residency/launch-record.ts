@@ -238,11 +238,18 @@ export class LaunchRecordStore {
     const fd = await lockFile(lockPath, 2, process.platform === "linux");
     try {
       this.prepare(record);
-      if (enforce) {
-        if (!record.parent_native_launch_id) throw new Error("Enforce launch requires a trusted parent record");
-        authorizeLaunchChild(record.parent_native_launch_id, record, this.census());
+      try {
+        if (enforce) {
+          if (!record.parent_native_launch_id) throw new Error("Enforce launch requires a trusted parent record");
+          authorizeLaunchChild(record.parent_native_launch_id, record, this.census());
+        }
+        return this.transition(record.native_launch_id, record.generation, "creating");
+      } catch (error) {
+        // Admission is the last step before native create. A refusal here is
+        // authoritative evidence that this unit was never submitted.
+        try { this.closeUnstartedBeforeCreate(record.native_launch_id, record.generation); } catch { /* preserve the refusal and any fenced bytes */ }
+        throw error;
       }
-      return this.transition(record.native_launch_id, record.generation, "creating");
     } finally { fs.closeSync(fd); }
   }
   verify(nativeLaunchId: string, generation: number, native?: { boot_id: string; invocation_id: string; main_pid_start: string }): LaunchRecord {
@@ -250,15 +257,41 @@ export class LaunchRecordStore {
     if (!current || current.generation !== generation) throw new Error("Unknown launch record generation");
     if (current.fence.state === "closed-started" || current.fence.state === "closed-unstarted") return current;
     if (native) return this.transition(nativeLaunchId, generation, "closed-started", native);
-    if (current.fence.state === "open" || current.fence.state === "creating") return this.transition(nativeLaunchId, generation, "closed-uncertain");
+    if (current.fence.state === "open") return this.closeUnstartedBeforeCreate(nativeLaunchId, generation);
+    if (current.fence.state === "creating") return this.transition(nativeLaunchId, generation, "closed-uncertain");
     return current;
+  }
+  closeUnstartedBeforeCreate(nativeLaunchId: string, generation: number): LaunchRecord {
+    const current = this.get(nativeLaunchId);
+    if (!current || current.generation !== generation || !["open", "creating", "closed-uncertain"].includes(current.fence.state)) {
+      throw new Error("Launch is not fenced before native create");
+    }
+    return this.#writeUnstarted(current);
+  }
+  closeUnstartedFromReadback(nativeLaunchId: string, generation: number, proof: {
+    unit: string; load_state: string; active_state: string; invocation_id: string | null;
+  }): LaunchRecord {
+    const current = this.get(nativeLaunchId);
+    if (!current || current.generation !== generation || !["open", "creating", "closed-uncertain"].includes(current.fence.state) ||
+        proof.unit !== current.unit || proof.load_state !== "loaded" || proof.active_state !== "inactive" || proof.invocation_id !== null) {
+      throw new Error("Native read-back does not prove this launch never started");
+    }
+    return this.#writeUnstarted(current);
+  }
+  #writeUnstarted(current: LaunchRecord): LaunchRecord {
+    const next = structuredClone(current);
+    next.fence.state = "closed-unstarted";
+    if (!next.boot_id) next.boot_id = readBootId();
+    if (!next.boot_id) throw new Error("Cannot close launch without observed boot id");
+    next.invocation_id = null; next.main_pid_start = null; next.terminal = { outcome: "never_started", at: new Date().toISOString() };
+    writeRecord(this.path(current.native_launch_id), next); return next;
   }
   transition(nativeLaunchId: string, generation: number, state: LaunchFenceState, native?: { boot_id: string; invocation_id: string; main_pid_start: string }): LaunchRecord {
     const current = this.get(nativeLaunchId);
     if (!current || current.generation !== generation) throw new Error("Unknown launch record generation");
     if (current.fence.state === state) return current;
     const allowed: Record<LaunchFenceState, LaunchFenceState[]> = {
-      open: ["creating", "closed-unstarted", "closed-uncertain"], creating: ["closed-started", "closed-uncertain"], "closed-unstarted": [], "closed-uncertain": ["closed-started"], "closed-started": [],
+      open: ["creating", "closed-uncertain"], creating: ["closed-started", "closed-uncertain"], "closed-unstarted": [], "closed-uncertain": ["closed-started"], "closed-started": [],
     };
     if (!allowed[current.fence.state].includes(state)) throw new Error(`Invalid launch record transition ${current.fence.state}->${state}`);
     const next = structuredClone(current);
@@ -270,18 +303,27 @@ export class LaunchRecordStore {
     } else if (state === "closed-started") {
       if (!native) throw new Error("Started launch record requires native identity");
       next.boot_id = native.boot_id; next.invocation_id = native.invocation_id; next.main_pid_start = native.main_pid_start; next.terminal = null;
-    } else if (state === "closed-unstarted") {
-      if (!next.boot_id) next.boot_id = readBootId();
-      if (!next.boot_id) throw new Error("Cannot close launch without observed boot id");
-      next.invocation_id = null; next.main_pid_start = null; next.terminal = { outcome: "never_started", at: new Date().toISOString() };
     }
     writeRecord(this.path(nativeLaunchId), next); return next;
   }
-  terminal(nativeLaunchId: string, generation: number): LaunchRecord {
+  terminal(nativeLaunchId: string, generation: number, proof: {
+    unit: string; load_state: string; active_state: string; invocation_id: string | null; boot_id: string | null;
+  }): LaunchRecord {
     const current = this.get(nativeLaunchId);
-    if (!current || current.generation !== generation || current.fence.state !== "closed-started") throw new Error("Launch is not a registered started record");
+    if (!current || current.generation !== generation || current.fence.state !== "closed-started" ||
+        proof.unit !== current.unit || proof.load_state !== "loaded" || proof.active_state !== "inactive" ||
+        proof.invocation_id !== current.invocation_id || proof.boot_id !== current.boot_id) {
+      throw new Error("Native read-back does not prove this launch exited");
+    }
     if (current.terminal) return current;
     const next = structuredClone(current); next.terminal = { outcome: "exited", at: new Date().toISOString() }; writeRecord(this.path(nativeLaunchId), next); return next;
+  }
+  async withAdmissionLock<T>(operation: () => T): Promise<T> {
+    fs.mkdirSync(this.root, { recursive: true, mode: 0o700 });
+    const directory = fs.statSync(this.root);
+    if (!directory.isDirectory() || (directory.mode & 0o077) !== 0 || (process.getuid && directory.uid !== process.getuid())) throw new Error("Launch record directory is not private");
+    const fd = await lockFile(path.join(this.root, ".admission.lock"), 2, process.platform === "linux");
+    try { return operation(); } finally { fs.closeSync(fd); }
   }
   census(): LaunchRecord[] { return this.list(); }
 }
@@ -304,9 +346,13 @@ export const resolveLaunchLineage = (nativeLaunchId: string, records: readonly L
 export const validateLaunchCensus = (records: readonly LaunchRecord[]): Map<string, { rootNativeLaunchId: string; depth: number }> => {
   const byId = new Map<string, LaunchRecord>();
   for (const record of records) { validateLaunchRecord(record); if (byId.has(record.native_launch_id)) throw new Error("Duplicate launch record"); byId.set(record.native_launch_id, record); }
+  // Only durable never_started proof makes a refused/open admission irrelevant
+  // to lineage and resident-cap census. Uncertain records remain fenced.
+  for (const [id, record] of byId) if (record.fence.state === "closed-unstarted" && record.terminal?.outcome === "never_started") byId.delete(id);
   const lineage = new Map<string, { rootNativeLaunchId: string; depth: number }>();
-  for (const record of records) {
-    const value = resolveLaunchLineage(record.native_launch_id, records); lineage.set(record.native_launch_id, value);
+  const censusRecords = [...byId.values()];
+  for (const record of censusRecords) {
+    const value = resolveLaunchLineage(record.native_launch_id, censusRecords); lineage.set(record.native_launch_id, value);
     if (record.parent_native_launch_id === null && !rootRoles.has(record.role)) throw new Error("Non-root role without parent");
     if (record.parent_native_launch_id !== null) {
       const parent = byId.get(record.parent_native_launch_id)!;
@@ -318,7 +364,7 @@ export const validateLaunchCensus = (records: readonly LaunchRecord[]): Map<stri
     }
   }
   const residents = new Set<string>();
-  for (const record of records) if (record.role === "resident-host" && record.terminal?.outcome !== "exited") {
+  for (const record of byId.values()) if (record.role === "resident-host" && record.terminal?.outcome !== "exited") {
     const root = lineage.get(record.native_launch_id)!.rootNativeLaunchId;
     if (residents.has(root)) throw new Error("More than one resident host per root");
     residents.add(root);
@@ -330,7 +376,7 @@ export const authorizeLaunchChild = (callerNativeLaunchId: string, child: Launch
   const census = [...records.filter(record => record.native_launch_id !== child.native_launch_id), child];
   const lineage = validateLaunchCensus(census);
   const caller = census.find(record => record.native_launch_id === callerNativeLaunchId);
-  if (!caller) throw new Error("Unknown launch caller");
+  if (!caller || (caller.fence.state === "closed-unstarted" && caller.terminal?.outcome === "never_started")) throw new Error("Unknown launch caller");
   if (child.parent_native_launch_id !== callerNativeLaunchId) throw new Error("Launch parent is not the trusted caller");
   const callerLineage = lineage.get(callerNativeLaunchId)!; const childLineage = lineage.get(child.native_launch_id)!;
   if (callerLineage.rootNativeLaunchId !== childLineage.rootNativeLaunchId) throw new Error("Cross-root activation");

@@ -32,17 +32,21 @@ export const nativePlacementPathAvailable = (contextCommand: readonly string[] |
     try { const stat = fs.statSync(file); return stat.isFile() && (process.platform === "win32" || (stat.mode & 0o111) !== 0); }
     catch { return false; }
   };
+  const writable = (directory: string): boolean => {
+    try { fs.accessSync(directory, fs.constants.W_OK); return true; }
+    catch { return false; }
+  };
   const recordDirectoryAvailable = (): boolean => {
     let directory = path.resolve(recordRoot ?? path.join(os.homedir(), ".local", "state", "smarty", "launches"));
     try {
       const existing = fs.lstatSync(directory);
-      return existing.isDirectory() && (existing.mode & 0o077) === 0 && fs.accessSync(directory, fs.constants.W_OK) === undefined;
+      return existing.isDirectory() && (existing.mode & 0o077) === 0 && writable(directory);
     } catch { /* The first launch may create the leaf; find a writable existing ancestor. */ }
     while (directory !== path.dirname(directory)) {
       directory = path.dirname(directory);
       try {
         const existing = fs.lstatSync(directory);
-        return existing.isDirectory() && fs.accessSync(directory, fs.constants.W_OK) === undefined;
+        return existing.isDirectory() && writable(directory);
       } catch { /* keep walking toward the root */ }
     }
     return false;

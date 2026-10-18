@@ -426,6 +426,15 @@ describe("host-only placement decider configuration", () => {
   it.each(["", "a.b", "*", ">", "a b", "a\n", "user@example", "UpperCase", "under_score", "-leading", "a".repeat(33)])("rejects non-token wake machine %s", wakeSourceMachine => {
     expect(() => normalizePlacementDeciderConfig({ ...config(), wakeSourceMachine })).toThrow();
   });
+  it("accepts Bun's null return for successful fs.accessSync probes", () => {
+    const dir = root(); const context = path.join(dir, "smarty-launch-context"); const recordRoot = path.join(dir, "launches");
+    fs.mkdirSync(recordRoot, { mode: 0o700 }); fs.writeFileSync(context, `#!${process.execPath}\\nprocess.exit(0);\\n`, { mode: 0o700 });
+    fs.chmodSync(context, 0o700);
+    const access = vi.spyOn(fs, "accessSync").mockImplementation(() => null as never);
+    try { expect(nativePlacementPathAvailable([context], undefined, recordRoot)).toBe(true); }
+    finally { access.mockRestore(); }
+  });
+
   it("requires the exact verified-caller capability at config load and leaves shadow untouched", () => {
     expect(VERIFIED_CALLER_CAPABILITY).toEqual({ probe: "--capabilities", line: "caller-verified=1" });
     for (const unavailable of [

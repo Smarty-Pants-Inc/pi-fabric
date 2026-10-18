@@ -36,7 +36,24 @@ const actor = (parent: string, id: string, org = "org-a", work = "work-a") => ma
     store.transition("resident-a", 1, "creating");
     const started = store.transition("resident-a", 1, "closed-started", { boot_id: "12345678-1234-1234-1234-123456789abc", invocation_id: "1234567890abcdef1234567890abcdef", main_pid_start: "123:456" });
     expect(started.fence.state).toBe("closed-started");
-    expect(store.terminal("resident-a", 1).terminal?.outcome).toBe("exited");
+    expect(store.terminal("resident-a", 1, { unit: started.unit, load_state: "loaded", active_state: "inactive",
+      invocation_id: started.invocation_id, boot_id: started.boot_id }).terminal?.outcome).toBe("exited");
+  });
+
+  it("records a refused duplicate resident as never-started and allows the next admission after exit", async () => {
+    const store = new LaunchRecordStore(temp());
+    const rootRecord = root(); store.prepare(rootRecord); store.transition(rootRecord.native_launch_id, 1, "creating");
+    store.transition(rootRecord.native_launch_id, 1, "closed-started", { boot_id: "12345678-1234-1234-1234-123456789abc",
+      invocation_id: "1234567890abcdef1234567890abcdef", main_pid_start: "123:456" });
+    const first = await store.admit(resident("root-a", "resident-a"), true);
+    store.transition(first.native_launch_id, first.generation, "closed-started", { boot_id: "12345678-1234-1234-1234-123456789abc",
+      invocation_id: "abcdef1234567890abcdef1234567890", main_pid_start: "124:457" });
+    await expect(store.admit(resident("root-a", "resident-b"), true)).rejects.toThrow("More than one resident");
+    expect(store.get("resident-b")).toMatchObject({ fence: { state: "closed-unstarted" }, terminal: { outcome: "never_started" } });
+    expect(validateLaunchCensus(store.census()).has("resident-b")).toBe(false);
+    store.terminal("resident-a", 1, { unit: first.unit, load_state: "loaded", active_state: "inactive",
+      invocation_id: "abcdef1234567890abcdef1234567890", boot_id: "12345678-1234-1234-1234-123456789abc" });
+    expect((await store.admit(resident("root-a", "resident-c"), true)).fence.state).toBe("creating");
   });
 
   it("rejects a second resident, cross-root child, and wrong caller", () => {

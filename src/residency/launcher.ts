@@ -30,7 +30,10 @@ import { verifiedRemove } from "../storage/verified-remove.js";
 import type { FabricHostLease } from "../topology/host-leases.js";
 import { LaunchRecordStore, makeLaunchRecord, type LaunchRecord } from "./launch-record.js";
 import { VERIFIED_CALLER_CAPABILITY, VERIFIED_CALLER_ISSUE } from "../agents/placement-config.js";
-import { nativeResidentPlacementAvailable, nativeResidentPlacementEnforceAvailable, systemdRunArguments, systemdUnitIdentity } from "./native-launch.js";
+import {
+  nativeResidentPlacementAvailable, nativeResidentPlacementEnforceAvailable, systemdRunArguments, systemdRunEnvironment,
+  watchNativeSystemdUnit,
+} from "./native-launch.js";
 
 const NODE_SCRIPT_EXTENSIONS = new Set([".js", ".cjs", ".mjs", ".ts", ".cts", ".mts"]);
 const TOKEN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -71,6 +74,7 @@ interface Attempt {
   watchdogGivenUp?: boolean;
   watchdogDeferred?: { checks: number; nextCheckAt: number };
   native: ResidentChildLifetime;
+  nativeUnit?: boolean;
   stop?: Promise<void>;
   seenOwner: boolean;
   claimedOwner: boolean;
@@ -220,6 +224,13 @@ const signalChild = (attempt: Attempt, signal: NodeJS.Signals): void => {
 
 async function terminateWedgedChild(attempt: Attempt, termMs: number, killMs: number, revalidate: (signal: NodeJS.Signals) => boolean): Promise<boolean> {
   if (!revalidate("SIGTERM")) return false;
+  if (attempt.nativeUnit) {
+    // SIGTERM to systemd-run only kills the client; its named unit owns the worker.
+    await attempt.native.stop();
+    if (!attempt.native.exited) throw new Error("Resident systemd unit exit is unproven; restart blocked");
+    await stopObservedDescendants(attempt, attempt.child.pid);
+    return true;
+  }
   signalChild(attempt, "SIGTERM");
   if (!attempt.native.exited) await waitForExit(attempt, termMs);
   if (!attempt.native.exited) {
@@ -238,10 +249,11 @@ async function terminateWedgedChild(attempt: Attempt, termMs: number, killMs: nu
  */
 function stopAttempt(attempt: Attempt): Promise<void> {
   return attempt.stop ??= (async () => {
-    // Sampling is only best-effort descendant cleanup. The direct child must
-    // also be stopped through its native handle, even when its birth could not
-    // be observed. Exclude it from PID-based cleanup and join both operations.
-    const observed = stopObservedDescendants(attempt, attempt.child.pid);
+    // A systemd unit owns its service cgroup. PID sampling must not independently
+    // kill a member while the exact unit is still active; stop the unit and rely
+    // on its matching inactive read-back. Legacy direct children retain the
+    // existing best-effort descendant cleanup alongside native close.
+    const observed = attempt.nativeUnit ? Promise.resolve() : stopObservedDescendants(attempt, attempt.child.pid);
     const results = await Promise.allSettled([attempt.native.stop(), observed]);
     // All cleanup has settled before an error is reported to the supervisor.
     for (const result of results) if (result.status === "rejected") throw result.reason;
@@ -452,7 +464,7 @@ const residentChildReady = (root: string, config: ResidentHostConfig): void => {
 /** Timing and native-runner injection are only for deterministic launcher tests; production uses fixed signal deadlines and systemd paths. */
 export interface ResidentSuperviseOptions {
   signal?: AbortSignal; reportWaitMs?: number; termMs?: number; killWaitMs?: number; proofRetryMs?: number; proofChecks?: number; wakeOnly?: boolean;
-  nativeSystemdRun?: string; nativeSystemctl?: string;
+  nativeSystemdRun?: string; nativeSystemctl?: string; nativeUnitStopTimeoutMs?: number;
 }
 export async function supervise(configPath: string, options: ResidentSuperviseOptions = {}): Promise<void> {
   const root = path.dirname(configPath);
@@ -593,40 +605,37 @@ async function superviseResident(configPath: string, options: ResidentSuperviseO
       PI_FABRIC_RESIDENT_ATTEMPT: attemptInfo ? JSON.stringify(attemptInfo) : "",
       // The owner token the host must publish: the exit handler knows the generation without sampling owner.json.
       PI_FABRIC_RESIDENT_GENERATION: generation,
-      // Per-attempt argument, never shared config another client may rewrite.
+      // Kept for legacy direct launch; systemdRunEnvironment explicitly drops token-named variables.
       PI_FABRIC_RESIDENT_LAUNCH_TOKEN: launchToken });
-    const child = crossSpawn(useSystemd ? (options.nativeSystemdRun ?? "/usr/bin/systemd-run") : command[0]!, useSystemd
-      ? systemdRunArguments(record!.unit, launchConfig.cwd, command, childEnv)
-      : command.slice(1), {
-      cwd: launchConfig.cwd, detached: process.platform !== "win32", stdio: useSystemd ? ["pipe", "pipe", "pipe"] : ["pipe", "pipe", "pipe", "ipc"],
-      env: childEnv,
-    });
+    let childArgs: string[];
+    let spawnEnvironment: NodeJS.ProcessEnv;
+    try {
+      childArgs = useSystemd ? systemdRunArguments(record!.unit, launchConfig.cwd, command, childEnv) : command.slice(1);
+      spawnEnvironment = useSystemd ? systemdRunEnvironment(childEnv) : childEnv;
+    } catch (error) {
+      if (record) { try { recordStore.closeUnstartedBeforeCreate(record.native_launch_id, record.generation); } catch { /* retain the durable fence */ } }
+      throw error;
+    }
+    let child: ChildProcess;
+    try {
+      child = crossSpawn(useSystemd ? (options.nativeSystemdRun ?? "/usr/bin/systemd-run") : command[0]!, childArgs, {
+        cwd: launchConfig.cwd, detached: process.platform !== "win32", stdio: useSystemd ? ["pipe", "pipe", "pipe"] : ["pipe", "pipe", "pipe", "ipc"],
+        env: spawnEnvironment,
+      });
+    } catch (error) {
+      if (record) { try { recordStore.closeUnstartedBeforeCreate(record.native_launch_id, record.generation); } catch { /* retain the durable fence */ } }
+      throw error;
+    }
     const logFile = path.join(root, plan ? `child-${plan.id}-${kind}.log` : "child-stderr.log");
     pruneResidentChildLogs(root, logFile);
-    const attempt: Attempt = { ...(spec ? { spec } : {}), child, native: watchResidentChild(child), generation,
+    const nativeUnit = useSystemd && !!record;
+    const nativeSystemd = nativeUnit ? watchNativeSystemdUnit(child, recordStore, record!, options.nativeSystemctl,
+      options.nativeUnitStopTimeoutMs === undefined ? {} : { stopTimeoutMs: options.nativeUnitStopTimeoutMs }) : undefined;
+    const native = nativeSystemd ?? watchResidentChild(child);
+    const attempt: Attempt = { ...(spec ? { spec } : {}), child, native, ...(nativeUnit ? { nativeUnit: true } : {}), generation,
       nativeLaunchId, recordGeneration, ...(record ? { record } : {}),
+      recordRegistration: nativeSystemd?.registered ?? Promise.resolve(),
       startedAt: Date.now(), logFile, seenOwner: false, claimedOwner: false, closingInput: false, processes: new Map(), stderr: "" };
-    const registerRecord = async (): Promise<void> => {
-      if (!record) return;
-      if (!useSystemd) {
-        try { attempt.record = recordStore.transition(record.native_launch_id, record.generation, "closed-uncertain"); }
-        catch (error) { trace("launch-record-error", { stage: "legacy-close", reason: String(error).slice(0, 500) }); }
-        return;
-      }
-      const deadline = Date.now() + 2_000;
-      while (!attempt.native.exited && Date.now() < deadline) {
-        const identity = systemdUnitIdentity(record.unit, options.nativeSystemctl);
-        if (identity) {
-          try { attempt.record = recordStore.transition(record.native_launch_id, record.generation, "closed-started", identity); }
-          catch (error) { trace("launch-record-error", { stage: "started", reason: String(error).slice(0, 500) }); }
-          return;
-        }
-        await delay(25);
-      }
-      try { attempt.record = recordStore.transition(record.native_launch_id, record.generation, "closed-uncertain"); }
-      catch (error) { trace("launch-record-error", { stage: "uncertain", reason: String(error).slice(0, 500) }); }
-    };
-    child.once("spawn", () => { attempt.recordRegistration = registerRecord(); });
     child.on("message", (value: unknown) => {
       const receipt = value as { event?: string; root?: string; token?: string } | null;
       if (current !== attempt || attempt.native.exited || stopping || receipt?.event !== "resident-ready" || receipt.root !== root) return;
@@ -636,8 +645,8 @@ async function superviseResident(configPath: string, options: ResidentSuperviseO
           owner.maintenanceReady === 1 && maintenance?.token === owner.token) residentChildReady(root, launchConfig);
     });
     child.once("error", (error) => {
-      if (attempt.record) {
-        try { attempt.record = new LaunchRecordStore(launchConfig.placement?.recordRoot).transition(attempt.record.native_launch_id, attempt.record.generation, "closed-uncertain"); }
+      if (attempt.record && !attempt.nativeUnit) {
+        try { attempt.record = recordStore.transition(attempt.record.native_launch_id, attempt.record.generation, "closed-uncertain"); }
         catch (recordError) { trace("launch-record-error", { stage: "error", reason: String(recordError).slice(0, 500) }); }
       }
       trace("child-error", { message: error.message, kind }); writeFailure(root, attempt.generation, error);
@@ -662,11 +671,6 @@ async function superviseResident(configPath: string, options: ResidentSuperviseO
       // An exact idle receipt is silent; otherwise retain the live-owner/custody guards.
       const reason = childExitReason(attempt, { code, signal });
       if (!stopping && reason) residentUnhosted(root, reason);
-      if (attempt.record) {
-        try {
-          if (attempt.record.fence.state === "closed-started" && !attempt.record.terminal) attempt.record = new LaunchRecordStore(launchConfig.placement?.recordRoot).terminal(attempt.record.native_launch_id, attempt.record.generation);
-        } catch (error) { trace("launch-record-error", { stage: "terminal", reason: String(error).slice(0, 500) }); }
-      }
       // #2010: after an owned release this directory may already belong to the
       // next generation. Do not write its shared files (launcher.log)
       // then. An owned child's exit goes only to its own generation's record

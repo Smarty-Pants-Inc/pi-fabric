@@ -931,6 +931,15 @@ export class ResidentHost {
         }
         assertNoWatchdogCustody(this.config.residencyRoot);
       } finally { if (admissionFd !== undefined) fs.closeSync(admissionFd); }
+      if (this.config.agents.placementDecider?.mode === "enforce") {
+        // Reconcile crash-window unit records under the admission lock before
+        // AgentManager or actor recovery can admit another resident descendant.
+        const [{ LaunchRecordStore }, { reconcileNativeLaunchRecords }] = await Promise.all([
+          import("./launch-record.js"), import("./native-launch.js"),
+        ]);
+        const recordRoot = this.config.placement?.recordRoot ?? this.config.agents.placementDecider.recordRoot;
+        await reconcileNativeLaunchRecords(new LaunchRecordStore(recordRoot));
+      }
       // Archived runs are read on demand, never walked before the host lease is up.
       // The streaming request collector replays pending full archives before
       // terminal retention after readiness. Failed sinks retain their sources.
@@ -1058,7 +1067,8 @@ export class ResidentHost {
         processStartTime: processStartTime(process.pid),
         fabricExtensionPath: this.config.fabricExtensionPath,
         token: this.#token,
-        ...(process.env.PI_FABRIC_RESIDENT_LAUNCH_TOKEN ? { launchToken: process.env.PI_FABRIC_RESIDENT_LAUNCH_TOKEN } : {}),
+        // In a systemd unit the token-named env is intentionally omitted; the chosen generation is the same launch correlation id.
+        launchToken: process.env.PI_FABRIC_RESIDENT_LAUNCH_TOKEN ?? this.#token,
         startedAt: now,
         readyAt: now,
         maintenanceReady: 1, // client requires the same-token startup receipt before business admission

@@ -1478,9 +1478,29 @@ export class StoreBridgeSide implements BridgeSide {
         const participantEntries = view.listAll(PARTICIPANT_PREFIX);
         const scan = this.#scan(hostEntries, [...participantEntries, ...participantFiles.entries], view.listAll(BRIDGE_HANDOFF_PREFIX));
         const own = new Set(scan.presence.reserved);
+        const admittedOwners = canonicalHostOwners(presence.hosts.flatMap(({ record }) =>
+          isAdmissibleRecord("host", record, fromHub ? this.peer : undefined) &&
+            (remoteHostOf(record) === undefined || (fromHub && record.bridgeVia === this.peer && record.remoteHost !== this.peer))
+            ? [record] : []));
+        const droppedIdentifiers = new Set<string>();
+        const unscopedDroppedIdentifiers = new Set<string>();
+        const droppedOwnerExemptions = new Map<string, Set<string>>();
         for (const dropped of presence.dropped ?? []) {
-          for (const id of dropped.identifiers ?? []) if (typeof id === "string" && id.length > 0) own.add(id);
+          const owner = dropped.type === "participant" ? participantOwnerHost(dropped, admittedOwners) : undefined;
+          const ownerIdentifiers = owner ? new Set(presenceIdentifiers(owner)) : undefined;
+          for (const id of dropped.identifiers ?? []) {
+            if (typeof id !== "string" || id.length === 0) continue;
+            droppedIdentifiers.add(id);
+            if (ownerIdentifiers?.has(id)) {
+              const exemptions = droppedOwnerExemptions.get(owner!.id) ?? new Set<string>();
+              exemptions.add(id);
+              droppedOwnerExemptions.set(owner!.id, exemptions);
+            } else unscopedDroppedIdentifiers.add(id);
+          }
         }
+        const hasOwnConflict = (identifiers: readonly string[], ownerId?: string): boolean => identifiers.some(id =>
+          own.has(id) || (droppedIdentifiers.has(id) &&
+            (unscopedDroppedIdentifiers.has(id) || !droppedOwnerExemptions.get(ownerId ?? "")?.has(id))));
         const protectionRoots = new Set(collisionProtection(hostEntries, participantEntries, participantFiles, scan.leases));
         for (const root of protectionRoots) skippedRoots.add(root);
         // Classify whole root groups only after all claimed/current-owner/participant-owner roots
@@ -1531,7 +1551,7 @@ export class StoreBridgeSide implements BridgeSide {
           if (relayed && (!fromHub || record.bridgeVia !== this.peer || record.remoteHost === this.peer)) continue;
           // A preflight skip remains a skip after replay or a plan retry, even if authority moved.
           if (skippedRoots.has(record.rootId)) continue;
-          if (presenceIdentifiers(record).some(id => own.has(id))) continue;
+          if (hasOwnConflict(presenceIdentifiers(record), record.id)) continue;
           const prior = view.get(keyFor(HOST_PREFIX, record.id))?.value;
           if (isObject(prior) && typeof prior.rootId === "string" && prior.rootId !== record.rootId &&
             (preservedRoots.has(prior.rootId) || skippedRoots.has(prior.rootId))) {
@@ -1635,7 +1655,8 @@ export class StoreBridgeSide implements BridgeSide {
         for (const participant of presence.participants) {
           if (preservedRoots.has(participant.rootId) || skippedRoots.has(participant.rootId)) continue;
           const owner = hosts.get(participant.ownerHostId);
-          if (!owner || participant.kind !== "root" || presenceIdentifiers(participant).some(id => own.has(id))) continue;
+          if (!owner || participant.kind !== "root" || hasOwnConflict(presenceIdentifiers(participant),
+            participantOwnerHost(participant, admittedOwners)?.id)) continue;
           if (remoteHostOf(participant) !== undefined && (!fromHub || participant.bridgeVia !== this.peer ||
               participant.remoteHost !== owner.remoteHost)) continue;
           if (owner.id !== participant.id || owner.identity.id !== participant.ownerIdentityId || owner.rootId !== participant.rootId) continue;
@@ -2488,6 +2509,26 @@ const CANONICAL_ID = new RegExp(`^${ROOT_ID_PREFIX}[A-Za-z0-9-]{8,128}$`);
 /** Whether `id` is a root's canonical id, the only form a bridge admits (and a handoff names). */
 export const isCanonicalRootId = (id: string): boolean => CANONICAL_ID.test(id);
 
+const canonicalHostOwners = (hosts: readonly FabricHostRecord[]): Map<string, FabricHostRecord> => {
+  const owners = new Map<string, FabricHostRecord>();
+  const duplicates = new Set<string>();
+  for (const host of hosts) {
+    if (!isAdmissibleRecord("host", host) || host.id !== host.rootId || host.identity.id !== host.id ||
+      !CANONICAL_ID.test(host.id) || duplicates.has(host.id)) continue;
+    if (owners.has(host.id)) { owners.delete(host.id); duplicates.add(host.id); }
+    else owners.set(host.id, host);
+  }
+  return owners;
+};
+
+/** A malformed participant can exempt only its exact canonical owner host's own identifiers. */
+const participantOwnerHost = (value: unknown, owners: ReadonlyMap<string, FabricHostRecord>): FabricHostRecord | undefined => {
+  if (!isObject(value) || typeof value.ownerHostId !== "string") return undefined;
+  const owner = owners.get(value.ownerHostId);
+  return owner && value.id === owner.id && value.rootId === owner.rootId &&
+    value.ownerIdentityId === owner.identity.id ? owner : undefined;
+};
+
 /**
  * The remote's presence as this link admits it: hosts and roots none of whose ids or aliases
  * are reserved on the hub (natives, live or not, and other links' mirrors), and roots under an
@@ -2542,28 +2583,47 @@ export const admitPresence = (
   // Seed every malformed row's identifiers before admitting any sibling claim. Close over
   // conflicting records so array order cannot let a later row claim an alias of a bad row.
   const blockedIdentifiers = new Set<string>();
-  const block = (identifiers: readonly string[]): boolean => {
+  const blockedWithoutOwner = new Set<string>();
+  const ownerExemptions = new Map<string, Set<string>>();
+  const block = (identifiers: readonly string[], owner?: FabricHostRecord): boolean => {
     let changed = false;
-    for (const id of identifiers) if (!blockedIdentifiers.has(id)) { blockedIdentifiers.add(id); changed = true; }
+    const ownerIds = owner ? new Set(presenceIdentifiers(owner)) : undefined;
+    let exemptions = owner ? ownerExemptions.get(owner.id) : undefined;
+    if (owner && !exemptions) { exemptions = new Set<string>(); ownerExemptions.set(owner.id, exemptions); }
+    for (const id of identifiers) {
+      if (!blockedIdentifiers.has(id)) { blockedIdentifiers.add(id); changed = true; }
+      if (ownerIds?.has(id)) {
+        if (!exemptions!.has(id)) { exemptions!.add(id); changed = true; }
+      } else if (!blockedWithoutOwner.has(id)) { blockedWithoutOwner.add(id); changed = true; }
+    }
     return changed;
   };
+  const unmalformedHosts = hostClaims.flatMap(({ record, malformed }) => record && !malformed ? [record] : []);
+  const ownerHosts = canonicalHostOwners(unmalformedHosts);
+  const hostConflicts = (claim: typeof hostClaims[number]): boolean => claim.identifiers.some(id => {
+    if (reserved.has(id)) return true;
+    if (!blockedIdentifiers.has(id)) return false;
+    return blockedWithoutOwner.has(id) || !ownerExemptions.get(claim.record?.id ?? "")?.has(id);
+  });
   for (const value of rawDropped) {
     if (isObject(value) && Array.isArray(value.identifiers)) {
-      block(value.identifiers.filter((id): id is string => typeof id === "string" && id.length > 0));
+      const identifiers = value.identifiers.filter((id): id is string => typeof id === "string" && id.length > 0);
+      const owner = value.type === "participant" ? participantOwnerHost(value, ownerHosts) : undefined;
+      block(identifiers, owner);
     }
   }
   for (const claim of hostClaims) if (claim.tainted) block(claim.identifiers);
-  for (const claim of participantClaims) if (claim.tainted) block(claim.identifiers);
+  for (const claim of participantClaims) if (claim.tainted) {
+    block(claim.identifiers, participantOwnerHost(claim.value, ownerHosts));
+  }
   let changed = true;
   while (changed) {
     changed = false;
     for (const claim of hostClaims) {
-      if (!claim.malformed && claim.identifiers.some(id => reserved.has(id) || blockedIdentifiers.has(id))) {
-        changed = block(claim.identifiers) || changed;
-      }
+      if (!claim.malformed && hostConflicts(claim)) changed = block(claim.identifiers) || changed;
     }
     const available = new Map(hostClaims.flatMap(claim => {
-      if (!claim.record || claim.malformed || claim.identifiers.some(id => reserved.has(id) || blockedIdentifiers.has(id))) return [];
+      if (!claim.record || claim.malformed || hostConflicts(claim)) return [];
       return [[claim.record.id, claim.record] as const];
     }));
     for (const claim of participantClaims) {
@@ -2574,7 +2634,7 @@ export const admitPresence = (
         owner.identity.id === participant.ownerIdentityId && owner.rootId === participant.rootId;
       if (claim.tainted || (owner !== undefined && !ownerMatches) ||
         claim.identifiers.some(id => reserved.has(id) || blockedIdentifiers.has(id))) {
-        changed = block(claim.identifiers) || changed;
+        changed = block(claim.identifiers, participantOwnerHost(claim.value, ownerHosts)) || changed;
       }
     }
   }
@@ -2587,7 +2647,7 @@ export const admitPresence = (
       if (attribution) dropped.push(attribution);
       continue;
     }
-    const reservedConflict = identifiers.some(id => reserved.has(id) || blockedIdentifiers.has(id));
+    const reservedConflict = hostConflicts(claim);
     if (malformed || reservedConflict) {
       if (malformed) {
         droppedCount += 1;

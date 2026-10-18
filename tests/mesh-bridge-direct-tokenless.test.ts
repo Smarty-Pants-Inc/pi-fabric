@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { BRIDGE_LEASE_MS, BRIDGE_PROTOCOL_VERSION, BridgeStaleIncarnationError, MeshBridge, RemoteBridgeSide, serveBridgeAgent, StoreBridgeSide, type BridgePresence } from "../src/mesh/bridge.js";
+import { admitPresence, BRIDGE_LEASE_MS, BRIDGE_PROTOCOL_VERSION, BridgeStaleIncarnationError, MeshBridge, RemoteBridgeSide, serveBridgeAgent, StoreBridgeSide, type BridgePresence } from "../src/mesh/bridge.js";
 import { runBridge } from "../src/mesh-bridge.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { CommitOutbox } from "../src/mesh/commit-outbox.js";
@@ -706,6 +706,24 @@ describe("direct tokenless presence through MeshBridge RPC", () => {
       expect.objectContaining({ type: "host", identifiers: expect.arrayContaining(hostIds) }),
       expect.objectContaining({ type: "participant", identifiers: expect.arrayContaining(participantIds) }),
     ]));
+  });
+
+  it("keeps a malformed participant's valid owner host but blocks its conflicting root alias", async () => {
+    const store = openStore();
+    const owner = fixture("malformed-owner-host", "O", NOW, NOW + 120_000);
+    const conflicting = fixture("malformed-owner-alias", "C", NOW, NOW + 120_000);
+    const unrelated = fixture("malformed-owner-unrelated", "U", NOW, NOW + 120_000);
+    await installNative(store, owner);
+    await installNative(store, conflicting);
+    await installNative(store, unrelated);
+    await store.put({ key: participantKey(owner.participant.id), identity: owner.identity,
+      value: { ...owner.participant, rootIds: [conflicting.host.id], capabilities: null } as unknown as FabricParticipantRecord });
+
+    const presence = await new StoreBridgeSide(store, "peer", () => NOW, false).presence();
+    const admitted = admitPresence(presence, new Set());
+    expect(admitted.hosts.map(({ record }) => record.id).sort()).toEqual([owner.host.id, unrelated.host.id].sort());
+    expect(presence.dropped?.some(drop => drop.type === "participant" &&
+      drop.identifiers?.includes(conflicting.host.id))).toBe(true);
   });
 
   it.each(["file", "sqlite"] as const)("peer malformed host identifiers block conflicting claims while unrelated roots progress (%s)", async backend => {

@@ -1,7 +1,8 @@
 import fs from "node:fs";
 import { spawnSync } from "node:child_process";
 import { childProcessEnvironment } from "../core/atomic-write.js";
-import { processPidStart, readBootId } from "./launch-record.js";
+import { LaunchRecordStore, processPidStart, readBootId } from "./launch-record.js";
+import { nativePlacementPathAvailable } from "../agents/placement-config.js";
 
 export const SYSTEMD_RUN = "/usr/bin/systemd-run";
 export const SYSTEMCTL = "/usr/bin/systemctl";
@@ -39,12 +40,22 @@ export const systemdUnitIdentity = (unit: string, systemctl = SYSTEMCTL): Native
   return { boot_id: boot, invocation_id: invocation, main_pid_start: start };
 };
 
-export const systemdRunArguments = (unit: string, cwd: string, command: readonly string[]): string[] => [
-  "--user", "--unit", unit, "--collect", "--wait", "--pipe", "--quiet", "--working-directory", cwd, "--", ...command,
+export const systemdRunArguments = (unit: string, cwd: string, command: readonly string[], environment?: NodeJS.ProcessEnv): string[] => [
+  "--user", "--unit", unit, "--collect", "--wait", "--pipe", "--quiet", "--working-directory", cwd,
+  ...Object.keys(environment ?? {}).filter(key => /^[A-Za-z_][A-Za-z0-9_]*$/u.test(key) && environment?.[key] !== undefined)
+    .map(key => `--setenv=${key}`),
+  "--", ...command,
 ];
 
+/** Recover a process interruption between the creating fence and systemd read-back.
+ * A live, identity-bound unit closes started; absent or indeterminate evidence closes uncertain. */
+export const verifyNativeLaunchRecord = (store: LaunchRecordStore, nativeLaunchId: string, systemctl = SYSTEMCTL) => {
+  const record = store.get(nativeLaunchId);
+  if (!record) throw new Error("Unknown launch record");
+  const identity = systemdUnitIdentity(record.unit, systemctl);
+  return store.verify(nativeLaunchId, record.generation, identity);
+};
+
 /** A native systemd user unit is mandatory for enforce; this predicate is deliberately filesystem-only. */
-export const nativeResidentPlacementAvailable = (contextCommand: readonly string[] | undefined, run = SYSTEMD_RUN): boolean =>
-  process.platform === "linux" && systemdRunAvailable(run) && !!contextCommand?.length &&
-  contextCommand[0]!.split(/[\\/]/u).at(-1) === "smarty-launch-context" &&
-  (() => { try { return fs.statSync(contextCommand[0]!).isFile() && (fs.statSync(contextCommand[0]!).mode & 0o111) !== 0; } catch { return false; } })();
+export const nativeResidentPlacementAvailable = (contextCommand: readonly string[] | undefined, run = SYSTEMD_RUN, recordRoot?: string): boolean =>
+  nativePlacementPathAvailable(contextCommand, run, recordRoot);

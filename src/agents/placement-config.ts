@@ -1,6 +1,7 @@
 import { diagnostics } from "../core/diagnostics.js";
 import path from "node:path";
 import fs from "node:fs";
+import os from "node:os";
 import { AgentInputError, normalizeAgentCapabilityTokens } from "../host-compatibility.js";
 
 export type PlacementDeciderMode = "off" | "shadow" | "enforce";
@@ -13,20 +14,37 @@ export interface FabricPlacementDeciderConfig {
   mode: PlacementDeciderMode;
   /** One exact NATS subject token for the original owner's wake source, never a request pin. */
   wakeSourceMachine: string;
+  /** Optional host-local launch-record directory; absent uses ~/.local/state/smarty/launches. */
+  recordRoot?: string;
 }
 export type PlacementDeciderConfig = FabricPlacementDeciderConfig;
 export const DEFAULT_PLACEMENT_DECIDER_MODE: PlacementDeciderMode = "off";
 
 /** Filesystem-only native gate for placement enforce. Native user units and the trusted
  * caller resolver must both exist before a config can claim enforce semantics. */
-export const nativePlacementPathAvailable = (contextCommand: readonly string[] | undefined, systemdRun = "/usr/bin/systemd-run"): boolean => {
+export const nativePlacementPathAvailable = (contextCommand: readonly string[] | undefined, systemdRun = "/usr/bin/systemd-run", recordRoot?: string): boolean => {
   const executable = (file: string): boolean => {
     try { const stat = fs.statSync(file); return stat.isFile() && (process.platform === "win32" || (stat.mode & 0o111) !== 0); }
     catch { return false; }
   };
+  const recordDirectoryAvailable = (): boolean => {
+    let directory = path.resolve(recordRoot ?? path.join(os.homedir(), ".local", "state", "smarty", "launches"));
+    try {
+      const existing = fs.lstatSync(directory);
+      return existing.isDirectory() && (existing.mode & 0o077) === 0 && fs.accessSync(directory, fs.constants.W_OK) === undefined;
+    } catch { /* The first launch may create the leaf; find a writable existing ancestor. */ }
+    while (directory !== path.dirname(directory)) {
+      directory = path.dirname(directory);
+      try {
+        const existing = fs.lstatSync(directory);
+        return existing.isDirectory() && fs.accessSync(directory, fs.constants.W_OK) === undefined;
+      } catch { /* keep walking toward the root */ }
+    }
+    return false;
+  };
   const context = contextCommand?.[0];
   return process.platform === "linux" && executable(systemdRun) && !!context &&
-    path.basename(context) === "smarty-launch-context" && executable(context);
+    path.basename(context) === "smarty-launch-context" && executable(context) && recordDirectoryAvailable();
 };
 
 const badPlacementDeciderField = (field: string): never => { throw new Error(`Invalid agents.placementDecider.${field}`); };
@@ -36,7 +54,7 @@ export const normalizePlacementDeciderConfig = (value: unknown): FabricPlacement
   if (value === undefined) return undefined;
   if (!value || typeof value !== "object" || Array.isArray(value)) return badPlacementDeciderField("config");
   const input = value as Record<string, unknown>;
-  for (const key of Object.keys(input)) if (!["command", "contextCommand", "mode", "wakeSourceMachine"].includes(key)) badPlacementDeciderField(key);
+  for (const key of Object.keys(input)) if (!["command", "contextCommand", "mode", "wakeSourceMachine", "recordRoot"].includes(key)) badPlacementDeciderField(key);
   const mode = input.mode === undefined ? DEFAULT_PLACEMENT_DECIDER_MODE : input.mode;
   if (mode !== "off" && mode !== "shadow" && mode !== "enforce") return badPlacementDeciderField("mode");
   const validateArgv = (argv: unknown, field: "command" | "contextCommand", optional: boolean): string[] | undefined => {
@@ -59,7 +77,9 @@ export const normalizePlacementDeciderConfig = (value: unknown): FabricPlacement
   if (typeof input.wakeSourceMachine !== "string" || !/^[a-z0-9][a-z0-9-]{0,31}$(?![\s\S])/u.test(input.wakeSourceMachine)) {
     return badPlacementDeciderField("wakeSourceMachine");
   }
-  return { command, ...(contextCommand ? { contextCommand } : {}), mode, wakeSourceMachine: input.wakeSourceMachine };
+  if (input.recordRoot !== undefined && (typeof input.recordRoot !== "string" || !path.isAbsolute(input.recordRoot))) return badPlacementDeciderField("recordRoot");
+  return { command, ...(contextCommand ? { contextCommand } : {}), mode, wakeSourceMachine: input.wakeSourceMachine,
+    ...(input.recordRoot ? { recordRoot: input.recordRoot } : {}) };
 };
 
 export interface AgentPlacementConfig {

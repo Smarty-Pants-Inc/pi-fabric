@@ -1458,7 +1458,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
   const agents = objectValue(input.agents);
   const placement = normalizeAgentPlacement(agents.placement);
   const placementDecider = normalizePlacementDeciderConfig(agents.placementDecider);
-  if (placementDecider?.mode === "enforce" && !nativePlacementPathAvailable(placementDecider.contextCommand)) {
+  if (placementDecider?.mode === "enforce" && !nativePlacementPathAvailable(placementDecider.contextCommand, undefined, placementDecider.recordRoot)) {
     throw new Error("agents.placementDecider.mode=enforce is unavailable until the resident-host placement follow-up is installed (systemd-run and smarty-launch-context required)");
   }
   const claude = objectValue(agents.claude);

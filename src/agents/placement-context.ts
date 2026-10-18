@@ -229,7 +229,7 @@ export const placementRoleAllowed = (parentRole: string, childRole: string,
   actorActivation?: { actorId: string; rootId: string }): boolean => {
   if (parentRole === "resident-host") return childRole === "actor-activation" && Boolean(actorActivation?.actorId && actorActivation.rootId);
   if (parentRole === "project-agent" || parentRole === "project-lead" || parentRole === "org-agent") {
-    return ["worktree-agent", "task-agent", "review-agent", "supervisor", "resident-host", "actor-activation"].includes(childRole);
+    return ["worktree-agent", "task-agent", "review-agent", "supervisor", "resident-host"].includes(childRole);
   }
   if (parentRole === "worktree-agent") return childRole === "task-agent";
   return false;

@@ -1,23 +1,26 @@
 import type { ResidentHostConfig } from "./protocol.js";
 
-const baseline = (config: ResidentHostConfig, launchId: string): ResidentHostConfig => ({
-  ...config,
-  placement: {
-    nativeLaunchId: launchId,
-    launchSpecId: `resident-host:${config.rootId}`,
-    generation: 1,
-    fenceToken: 1,
-    orgId: config.rootId,
-    workId: config.rootId,
-    parentNativeLaunchId: null,
-    role: "resident-host",
-    profile: config.placement?.profile ?? "resident-host",
-    sourcePin: config.placement?.sourcePin ?? config.fabricExtensionPath,
-    memoryProfile: config.placement?.memoryProfile ?? "resident-host",
-    origin: config.placement?.origin ?? { class: "background-agent", originRef: config.sessionId },
-    ...(config.placement?.recordRoot ? { recordRoot: config.placement.recordRoot } : {}),
-  },
-});
+const baseline = (config: ResidentHostConfig, launchId: string): ResidentHostConfig => {
+  const recordRoot = config.placement?.recordRoot ?? config.agents.placementDecider?.recordRoot;
+  return {
+    ...config,
+    placement: {
+      nativeLaunchId: launchId,
+      launchSpecId: `resident-host:${config.rootId}`,
+      generation: 1,
+      fenceToken: 1,
+      orgId: config.rootId,
+      workId: config.rootId,
+      parentNativeLaunchId: null,
+      role: "resident-host",
+      profile: config.placement?.profile ?? "resident-host",
+      sourcePin: config.placement?.sourcePin ?? config.fabricExtensionPath,
+      memoryProfile: config.placement?.memoryProfile ?? "resident-host",
+      origin: config.placement?.origin ?? { class: "background-agent", originRef: config.sessionId },
+      ...(recordRoot ? { recordRoot } : {}),
+    },
+  };
+};
 
 /** Resolve one resident host placement at the Main launch boundary. Shadow is deliberately
  * fire-and-forget: it observes the exact request but never withholds the baseline host. */
@@ -61,7 +64,7 @@ export const prepareResidentHostPlacement = async (config: ResidentHostConfig, l
       sourcePin: draft.request.requirements.source_pin,
       memoryProfile: draft.request.requirements.memory_profile_ref,
       origin: { class: draft.request.interaction.class, originRef: draft.request.interaction.origin_ref },
-      ...(config.placement?.recordRoot ? { recordRoot: config.placement.recordRoot } : {}),
+      ...(config.placement?.recordRoot ? { recordRoot: config.placement.recordRoot } : placementConfig.recordRoot ? { recordRoot: placementConfig.recordRoot } : {}),
     },
   };
 };

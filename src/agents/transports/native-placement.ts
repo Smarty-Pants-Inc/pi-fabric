@@ -24,16 +24,22 @@ export const launchNativePlacementWorker = async (
     role: "actor-activation", profile: metadata.profile, sourcePin: metadata.sourcePin, memoryProfile: metadata.memoryProfile,
     origin: metadata.origin,
   });
-  const store = new LaunchRecordStore();
+  const store = new LaunchRecordStore(metadata.recordRoot);
   try { await store.admit(record, true); }
   catch (error) {
     try { store.transition(record.native_launch_id, record.generation, "closed-unstarted"); } catch { /* preserve the durable open record */ }
     throw error;
   }
-  const child = spawn("/usr/bin/systemd-run", systemdRunArguments(record.unit, cwd, [workerPath, ...workerArguments]), {
+  const child = spawn("/usr/bin/systemd-run", systemdRunArguments(record.unit, cwd, [workerPath, ...workerArguments], environment), {
     cwd, env: environment, stdio: ["ignore", "pipe", "pipe"], detached: true,
   });
   let stderr = "";
+  let spawnFailure: string | undefined;
+  child.once("error", error => {
+    spawnFailure = error.message;
+    stderr = `${stderr}${error.message}`.slice(-4_000);
+    try { store.verify(record.native_launch_id, record.generation); } catch { /* preserve last durable evidence */ }
+  });
   child.stdout?.on("data", () => undefined);
   child.stderr?.on("data", chunk => { stderr = `${stderr}${String(chunk)}`.slice(-4_000); });
   const closed = new Promise<void>(resolve => child.once("close", () => resolve()));
@@ -58,10 +64,9 @@ export const launchNativePlacementWorker = async (
   });
   return {
     kind: "process", ...(child.pid === undefined ? {} : { sessionId: String(child.pid) }), controls: false, relaunchable: false,
-    isAlive: async () => child.exitCode === null && child.signalCode === null,
+    isAlive: async () => !spawnFailure && child.exitCode === null && child.signalCode === null,
     waitForClose: () => closed,
     closed, primaryExit: closed, stop,
     readStderr: () => stderr,
   };
 };
-

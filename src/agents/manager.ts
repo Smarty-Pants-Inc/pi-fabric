@@ -2116,6 +2116,7 @@ export class AgentManager {
           profile: draft.request.required_profile, sourcePin: draft.request.requirements.source_pin,
           memoryProfile: draft.request.requirements.memory_profile_ref,
           origin: { class: draft.request.interaction.class, originRef: draft.request.interaction.origin_ref },
+          ...(config.recordRoot ? { recordRoot: config.recordRoot } : {}),
         } } : {}),
       };
     };

@@ -13,7 +13,7 @@ import {
   placementRegistrationRequest, placementReleaseRequest, validatePlacementBindings,
   validatePlacementRequest,
 } from "../src/agents/placement-contract.js";
-import { normalizePlacementDeciderConfig, type PlacementDeciderConfig } from "../src/agents/placement-decider-config.js";
+import { nativePlacementPathAvailable, normalizePlacementDeciderConfig, type PlacementDeciderConfig } from "../src/agents/placement-decider-config.js";
 import { loadFabricConfig, loadFabricConfigForScope, normalizeFabricConfig } from "../src/config.js";
 
 // Keep reason: a security trust boundary. Exercise a real shell-free child and
@@ -406,6 +406,11 @@ describe("registration/cancel mapping and unpublished receipt gate", () => {
 
 describe("host-only placement decider configuration", () => {
   const config = (): PlacementDeciderConfig => ({ command: [process.execPath, "literal argument; not a shell"], mode: "enforce", wakeSourceMachine: "ryzen1" });
+  const nativeConfig = (): PlacementDeciderConfig => {
+    const dir = root(); const context = path.join(dir, "smarty-launch-context"); const recordRoot = path.join(dir, "launches");
+    fs.writeFileSync(context, "#!/bin/sh\nexit 0\n", { mode: 0o700 }); fs.chmodSync(context, 0o700); fs.mkdirSync(recordRoot, { mode: 0o700 });
+    return { ...config(), contextCommand: [context], recordRoot };
+  };
   it("is absent/off by default and normalizes a configured omitted mode to off", () => {
     expect(normalizeFabricConfig({}).agents.placementDecider).toBeUndefined();
     const value = { command: [process.execPath], wakeSourceMachine: "ryzen1" };
@@ -425,6 +430,19 @@ describe("host-only placement decider configuration", () => {
     expect(() => normalizePlacementDeciderConfig({ ...config(), timeoutMs: 20_000 })).toThrow();
     expect(() => normalizeFabricConfig({ agents: { placementDecider: config() } }))
       .toThrow(/enforce is unavailable until the resident-host placement follow-up is installed/);
+    expect(() => normalizeFabricConfig({ agents: { placementDecider: nativeConfig(), }, })).not.toThrow();
+    expect(() => normalizeFabricConfig({ agents: { placementDecider: { ...nativeConfig(), recordRoot: "/dev/null/launches" } } }))
+      .toThrow(/enforce is unavailable/);
+    const available = nativeConfig();
+    expect(nativePlacementPathAvailable(available.contextCommand, "/definitely/missing/systemd-run", available.recordRoot)).toBe(false);
+    const statSync = fs.statSync.bind(fs);
+    vi.spyOn(fs, "statSync").mockImplementation(((file: fs.PathLike, ...args: unknown[]) => {
+      if (String(file) === "/usr/bin/systemd-run") throw new Error("systemd-run unavailable");
+      return (statSync as (...values: unknown[]) => fs.Stats)(file, ...args);
+    }) as typeof fs.statSync);
+    expect(() => normalizeFabricConfig({ agents: { placementDecider: available } })).toThrow(/enforce is unavailable/);
+    vi.restoreAllMocks();
+    expect(() => normalizeFabricConfig({ agents: { placementDecider: { ...nativeConfig(), mode: "shadow", contextCommand: undefined, recordRoot: "/dev/null/launches" } } })).not.toThrow();
     expect(() => normalizePlacementDeciderConfig(null)).toThrow();
     expect(() => normalizePlacementDeciderConfig({ ...config(), wakeSourceMachine: undefined })).toThrow();
   });

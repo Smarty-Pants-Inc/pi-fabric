@@ -548,6 +548,7 @@ export interface AgentTransportPlacementGrant {
     sourcePin: string;
     memoryProfile: string;
     origin: { class: "live-human" | "background-agent"; originRef: string };
+    recordRoot?: string;
   };
 }
 

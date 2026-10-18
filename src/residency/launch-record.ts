@@ -245,12 +245,20 @@ export class LaunchRecordStore {
       return this.transition(record.native_launch_id, record.generation, "creating");
     } finally { fs.closeSync(fd); }
   }
+  verify(nativeLaunchId: string, generation: number, native?: { boot_id: string; invocation_id: string; main_pid_start: string }): LaunchRecord {
+    const current = this.get(nativeLaunchId);
+    if (!current || current.generation !== generation) throw new Error("Unknown launch record generation");
+    if (current.fence.state === "closed-started" || current.fence.state === "closed-unstarted") return current;
+    if (native) return this.transition(nativeLaunchId, generation, "closed-started", native);
+    if (current.fence.state === "open" || current.fence.state === "creating") return this.transition(nativeLaunchId, generation, "closed-uncertain");
+    return current;
+  }
   transition(nativeLaunchId: string, generation: number, state: LaunchFenceState, native?: { boot_id: string; invocation_id: string; main_pid_start: string }): LaunchRecord {
     const current = this.get(nativeLaunchId);
     if (!current || current.generation !== generation) throw new Error("Unknown launch record generation");
     if (current.fence.state === state) return current;
     const allowed: Record<LaunchFenceState, LaunchFenceState[]> = {
-      open: ["creating", "closed-unstarted", "closed-uncertain"], creating: ["closed-started", "closed-uncertain"], "closed-unstarted": [], "closed-uncertain": [], "closed-started": [],
+      open: ["creating", "closed-unstarted", "closed-uncertain"], creating: ["closed-started", "closed-uncertain"], "closed-unstarted": [], "closed-uncertain": ["closed-started"], "closed-started": [],
     };
     if (!allowed[current.fence.state].includes(state)) throw new Error(`Invalid launch record transition ${current.fence.state}->${state}`);
     const next = structuredClone(current);

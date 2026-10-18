@@ -270,6 +270,40 @@ const presenceIsPartial = (presence: BridgeMirrorPresence): boolean => {
   return !isObject(raw) || raw.partial === true || presenceDroppedCount(presence) > 0;
 };
 
+const copyMirrorPresence = (presence: BridgeMirrorPresence): BridgeMirrorPresence =>
+  JSON.parse(JSON.stringify({ hosts: presence.hosts, participants: presence.participants })) as BridgeMirrorPresence;
+
+/**
+ * Legacy receivers treat every mirror as withdrawal evidence. On an incomplete cycle, keep every
+ * previously admitted root and its participant, renewing only that held projection until a full
+ * source snapshot can prove withdrawal. A held sample has no fresh source observation, so use the
+ * bounded legacy lease rather than reusing an expired `observedAt`.
+ */
+const completeLegacyPartial = (presence: BridgeMirrorPresence, previous: BridgeMirrorPresence | undefined,
+  now: number): BridgeMirrorPresence => {
+  const hosts = new Map(presence.hosts.map(host => [host.record.id, host]));
+  const held = new Set<string>();
+  const oldHosts = new Map((previous?.hosts ?? []).map(host => [host.record.id, host]));
+  for (const host of previous?.hosts ?? []) {
+    if (hosts.has(host.record.id)) continue;
+    const expiresAt = now + BRIDGE_LEASE_MS;
+    const { observedAt: _observedAt, ...sample } = host;
+    hosts.set(host.record.id, { ...sample, record: { ...host.record, expiresAt }, expiresAt });
+    held.add(host.record.id);
+  }
+  const participants = new Map(presence.participants.map(participant => [participant.id, participant]));
+  for (const participant of previous?.participants ?? []) {
+    if (participants.has(participant.id)) continue;
+    const owner = hosts.get(participant.ownerHostId);
+    const oldOwner = oldHosts.get(participant.ownerHostId);
+    const sameOwner = owner && (held.has(owner.record.id) || (oldOwner !== undefined &&
+      owner.record.startedAt === oldOwner.record.startedAt &&
+      owner.record.incarnationToken === oldOwner.record.incarnationToken));
+    if (sameOwner) participants.set(participant.id, participant);
+  }
+  return { hosts: [...hosts.values()], participants: [...participants.values()] };
+};
+
 export interface BridgeSkip { id: string; sequence: number; topic: string; bytes: number }
 
 export interface BridgeRead {
@@ -958,6 +992,7 @@ export class StoreBridgeSide implements BridgeSide {
     // Only a handoff in force to this link waives a (dead) native's own ids (smarty-dev#9074).
     const reserve = (value: unknown, id: string): void => { if (!handoffs.waived(value, id)) reserved.add(id); };
     const hosts: BridgeHost[] = [];
+    const nonRootHosts: BridgeHost[] = [];
     let rawDroppedCount = 0;
     // Every id not mirrored by this link is reserved: natives, live or not, and other links'
     // mirrors (security review F1/F2). Only natives are this side's presence.
@@ -973,6 +1008,11 @@ export class StoreBridgeSide implements BridgeSide {
       for (const id of [host.id, host.identity.id, host.rootId]) reserve(entry.value, id);
       if (mark !== undefined) continue;
       if (entry.updatedBy.id !== host.identity.id) { rawDroppedCount += 1; continue; }
+      if (isNativeNonRootHost(host)) {
+        const liveness = hostLiveness(leases, host);
+        if (liveness.expiresAt > now) nonRootHosts.push({ record: { ...host, ...liveness }, expiresAt: liveness.expiresAt, observedAt: now });
+        continue;
+      }
       if (!isAdmissibleRecord("host", host)) {
         rawDroppedCount += 1;
         // Do not let effective file liveness normalize a bad native/bootstrap record into
@@ -988,6 +1028,7 @@ export class StoreBridgeSide implements BridgeSide {
     }
     const live = new Map(hosts.map((host) => [host.record.id, host.record]));
     const participants = new Map<string, { record: FabricParticipantRecord; updatedAt: number }>();
+    const participantCopies = new Map<string, { record: FabricParticipantRecord; updatedAt: number }>();
     for (const entry of participantEntries) {
       const mark = remoteHostOf(entry.value);
       if (mirrorLinkOf(entry.value) === this.peer) continue;
@@ -997,24 +1038,32 @@ export class StoreBridgeSide implements BridgeSide {
         if (isObject(entry.value) && typeof entry.value.id === "string") reserved.add(entry.value.id);
         continue;
       }
+      const copy = participantCopies.get(entry.key);
+      if (copy && settled(copy.record as unknown as Record<string, unknown>) !==
+        settled(participant as unknown as Record<string, unknown>)) rawDroppedCount += 1;
+      if (!copy || copy.updatedAt <= entry.updatedAt) participantCopies.set(entry.key, { record: participant, updatedAt: entry.updatedAt });
       for (const id of [participant.id, participant.ownerIdentityId, participant.rootId]) reserve(entry.value, id);
       if (typeof participant.name === "string" && participant.name) reserve(entry.value, participant.name);
       // Labels are minted per mesh and collide by design; they are never addresses across.
       if (typeof participant.sessionId === "string" && participant.sessionId) reserve(entry.value, participant.sessionId);
       const owner = live.get(participant.ownerHostId);
-      if (
-        mark === undefined && participant.kind === "root" && owner && entry.updatedBy.id === participant.ownerIdentityId &&
-        owner.identity.id === participant.ownerIdentityId && owner.rootId === participant.rootId &&
-        (participants.get(participant.id)?.updatedAt ?? -Infinity) < entry.updatedAt
-      ) participants.set(participant.id, { record: participant, updatedAt: entry.updatedAt });
-      else if (mark === undefined && participant.kind === "root" && owner !== undefined) rawDroppedCount += 1;
+      if (mark === undefined && participant.kind === "root" && owner && entry.updatedBy.id === participant.ownerIdentityId &&
+        owner.identity.id === participant.ownerIdentityId && owner.rootId === participant.rootId) {
+        const previous = participants.get(participant.id);
+        // The source directory's rule is later write wins, with the participant file winning ties.
+        // #participantEntries lists shared state first and files second, so replacing on >= preserves it.
+        if (!previous || previous.updatedAt <= entry.updatedAt) {
+          participants.set(participant.id, { record: participant, updatedAt: entry.updatedAt });
+        }
+      } else if (mark === undefined && participant.kind === "root" && owner !== undefined) rawDroppedCount += 1;
     }
     const admitted = admitPresence({ hosts, participants: [...participants.values()].map(({ record }) => record),
       ...(rawDroppedCount > 0 ? { partial: true, droppedCount: rawDroppedCount } : {}) }, new Set());
     return {
-      // Export the same canonical root hosts we admit inbound, never sibling/task hosts.
-      // Reservations above still cover ALL native and other-link identities, live or not.
-      presence: { ...admitted, reserved: [...reserved] },
+      // Root admission exports canonical root hosts; valid resident/runtime rows travel separately
+      // for remote directories and reapers, never as address authority. Reservations above still
+      // cover ALL native and other-link identities, live or not.
+      presence: { ...admitted, hosts: [...admitted.hosts, ...nonRootHosts], reserved: [...reserved] },
       voided: handoffs.voided,
       // smarty-dev#10391: what the scan judged by time, for a plan made before its transaction.
       leases, now,
@@ -1456,11 +1505,12 @@ export class StoreBridgeSide implements BridgeSide {
         // are resolved. No array order may let a second host bypass collision preservation.
         const rootCounts = new Map<string, number>();
         for (const { record, expiresAt, observedAt: sourceObservedAt } of presence.hosts) {
-          rootCounts.set(record.rootId, (rootCounts.get(record.rootId) ?? 0) + 1);
+          const nonRoot = isNativeNonRootHost(record);
+          if (!nonRoot) rootCounts.set(record.rootId, (rootCounts.get(record.rootId) ?? 0) + 1);
           // Runs before recovery, planning, participant writes and omission deletion in BOTH
           // directions (remote presence replies are raw JSON, not parsed by presenceArg).
           // Missing observedAt alone is the legacy unsampled protocol, not a malformed sample.
-          if (remoteHostOf(record) === undefined && (!isAdmissibleRecord("host", record) || !Number.isFinite(expiresAt) ||
+          if (!nonRoot && remoteHostOf(record) === undefined && (!isAdmissibleRecord("host", record) || !Number.isFinite(expiresAt) ||
             (sourceObservedAt !== undefined && !Number.isFinite(sourceObservedAt)))) skippedRoots.add(record.rootId);
         }
         for (const [rootId, count] of rootCounts) if (count > 1) skippedRoots.add(rootId);
@@ -1482,29 +1532,60 @@ export class StoreBridgeSide implements BridgeSide {
         };
         for (const entry of hostEntries) {
           const held = hostOf(entry.key, entry.value);
-          // The remote's history is not evidence. Only this link's own persisted mirror counts.
-          if (held && mirrorLinkOf(entry.value) === this.peer) remember(held.rootId, held);
+          // The remote's history is not evidence. Only this link's own persisted root mirror counts.
+          if (held && !isNonRootHostRecord(held) && mirrorLinkOf(entry.value) === this.peer) remember(held.rootId, held);
         }
-        for (const lease of scan.leases.values()) remember(lease.rootId, lease);
+        for (const lease of scan.leases.values()) {
+          if (!isNonRootHostId(lease.id, lease.rootId)) remember(lease.rootId, lease);
+        }
         // Mark protected direct roots before any host/participant can target their keys under
         // a different claimed root. Protection cannot depend on presence array order.
         for (const { record } of presence.hosts) {
-          if (remoteHostOf(record) === undefined && incarnationOf(record).incarnationToken === undefined &&
-            ((currentTokens.get(record.rootId)?.length ?? 0) > 0 ||
+          if (!isNativeNonRootHost(record) && remoteHostOf(record) === undefined &&
+            incarnationOf(record).incarnationToken === undefined && ((currentTokens.get(record.rootId)?.length ?? 0) > 0 ||
               mergeBridgeSupersededHistory(superseded.get(record.rootId) ?? []).tokens.length > 0)) preservedRoots.add(record.rootId);
         }
         const wanted = new Map<string, { value: Record<string, unknown>; identity: MeshIdentity }>();
         const hosts = new Map<string, FabricHostRecord>();
         for (const { record, expiresAt, observedAt: sourceObservedAt } of presence.hosts) {
           const relayed = remoteHostOf(record) !== undefined;
+          const nonRoot = isNativeNonRootHost(record);
           if (relayed && (!fromHub || record.bridgeVia !== this.peer || record.remoteHost === this.peer)) continue;
           // A preflight skip remains a skip after replay or a plan retry, even if authority moved.
-          if (skippedRoots.has(record.rootId)) continue;
+          if (!nonRoot && skippedRoots.has(record.rootId)) continue;
           if (own.has(record.id) || own.has(record.identity.id) || own.has(record.rootId)) continue;
           const prior = view.get(keyFor(HOST_PREFIX, record.id))?.value;
           if (isObject(prior) && typeof prior.rootId === "string" && prior.rootId !== record.rootId &&
             (preservedRoots.has(prior.rootId) || skippedRoots.has(prior.rootId))) {
-            skippedRoots.add(record.rootId);
+            if (!nonRoot) skippedRoots.add(record.rootId);
+            continue;
+          }
+          if (nonRoot) {
+            if (skippedRoots.has(record.rootId) || preservedRoots.has(record.rootId) || !rootCounts.has(record.rootId)) continue;
+            // Child/resident host rows are useful to the remote directory and reapers, but never
+            // represent a root, participant owner or bridge route. Keep their own identity and
+            // liveness projection without inheriting the main root's incarnation history.
+            const sampled = typeof sourceObservedAt === "number" && Number.isFinite(sourceObservedAt);
+            if (!Number.isFinite(expiresAt) || expiresAt <= (sampled ? sourceObservedAt : liveAt) ||
+              (sourceObservedAt !== undefined && !sampled)) continue;
+            const origin = sampled ? liveAt + Math.min(BRIDGE_LEASE_MS, expiresAt - sourceObservedAt) : expiresAt;
+            const until = sampled ? origin
+              : Math.min(origin + Math.min(now - liveAt, BRIDGE_LEASE_MS), now + BRIDGE_LEASE_MS);
+            if (!sampled && until <= now) continue;
+            const renewedAt = sampled ? record.updatedAt : Math.min(record.updatedAt, now);
+            const incarnation = incarnationOf(record);
+            const { bridgeSupersededTokens: _tokens, bridgeSupersededTokenSeen: _seen, ...fields } = record;
+            const admitted = { ...fields, ...incarnation };
+            const mirror: FabricMirrorLease | undefined = sampled ? { remoteHost: this.peer, observedAt: liveAt,
+              sourceObservedAt, sourceUpdatedAt: record.updatedAt, sourceExpiresAt: expiresAt,
+              ...(bridgeProcess ? { bridgeProcess } : {}) } : undefined;
+            wanted.set(keyFor(HOST_PREFIX, record.id), {
+              value: { ...admitted, updatedAt: now, expiresAt: until, remoteHost: this.peer,
+                ...(sampled ? { mirrorLease: 1 } : {}) },
+              identity: record.identity,
+            });
+            leases.push({ id: record.id, rootId: record.rootId, identityId: record.identity.id, ...incarnation,
+              updatedAt: renewedAt, expiresAt: sampled ? origin : until, ...(mirror ? { mirrorLease: 1, mirror } : {}) });
             continue;
           }
           // Refuse explicit stale native/direct presence rather than omitting it: omission would
@@ -2078,9 +2159,10 @@ const presenceArg = (args: unknown, hub: string): BridgeMirrorPresence => {
   const owners = new Map(hosts.map(({ record }) => [record.id, record]));
   const malformedHosts = hosts.filter(({ record, expiresAt, observedAt }) => {
     const relayed = record.bridgeVia === hub && record.remoteHost !== undefined && record.remoteHost !== hub;
+    const nonRoot = isNativeNonRootHost(record);
     return !isAdmissibleRecord("host", record, hub) || !Number.isFinite(expiresAt) ||
-      (observedAt !== undefined && !Number.isFinite(observedAt)) || record.identity.id !== record.id ||
-      record.rootId !== record.id || (!relayed && record.bridgeVia !== undefined) || !CANONICAL_ID.test(record.id);
+      (observedAt !== undefined && !Number.isFinite(observedAt)) || (!nonRoot && (record.identity.id !== record.id ||
+        record.rootId !== record.id || (!relayed && record.bridgeVia !== undefined) || !CANONICAL_ID.test(record.id)));
   }).length;
   const malformedParticipants = participants.filter(record => {
     const owner = owners.get(record.ownerHostId);
@@ -2143,8 +2225,9 @@ export class RemoteBridgeSide implements BridgeSide {
   #next = 1;
   #supportsTail = false;
   #supportsPartialPresence = false;
-  #legacyPartialSkips = 0;
-  #legacyPartialSkipLogged = false;
+  #legacyCompletedPartials = 0;
+  #legacyMirrorSnapshot: BridgeMirrorPresence | undefined;
+  #lastPresenceRenewalAt = Number.NEGATIVE_INFINITY;
   #independentRpc = false;
   #protocolVersion: number | undefined;
   #changesReady: Promise<void> | undefined;
@@ -2161,8 +2244,7 @@ export class RemoteBridgeSide implements BridgeSide {
    * exactly one mirror remains in flight until its late answer or close(). Other RPC deadlines
    * remain fatal. stop() still bounds its waits and closes the transport (security review F3).
    */
-  constructor(readonly input: Readable, readonly output: Writable, readonly callTimeoutMs = DEFAULT_CALL_TIMEOUT_MS,
-    readonly log?: (message: string) => void) {
+  constructor(readonly input: Readable, readonly output: Writable, readonly callTimeoutMs = DEFAULT_CALL_TIMEOUT_MS) {
     let onClosed!: (error: Error) => void;
     this.closed = new Promise((resolve) => (onClosed = resolve));
     this.#onClosed = onClosed;
@@ -2290,8 +2372,14 @@ export class RemoteBridgeSide implements BridgeSide {
   }
 
   get protocolVersion(): number | undefined { return this.#protocolVersion; }
-  /** Cumulative skipped outbound partial cycles on this link; complete mirrors still run. */
-  get legacyPartialSkips(): number { return this.#legacyPartialSkips; }
+  /** Cumulative partial cycles completed as full snapshots for this legacy peer. */
+  get legacyCompletedPartials(): number { return this.#legacyCompletedPartials; }
+  /** Negotiated peer capability; undefined until hello completes. */
+  get supportsPartialPresence(): boolean | undefined {
+    return this.#protocolVersion === undefined ? undefined : this.#supportsPartialPresence;
+  }
+  /** Local time of the last acknowledged outbound presence mirror. */
+  get lastPresenceRenewalAt(): number { return this.#lastPresenceRenewalAt; }
   get pendingMirrorTraffic(): boolean {
     return this.#independentRpc && this.#mirrorPending !== undefined && this.#closed === undefined;
   }
@@ -2309,7 +2397,6 @@ export class RemoteBridgeSide implements BridgeSide {
     }
     this.#protocolVersion = reply.version;
     const supportsPartialPresence = reply.partialPresence === true;
-    if (this.#supportsPartialPresence !== supportsPartialPresence) this.#legacyPartialSkipLogged = false;
     this.#supportsPartialPresence = supportsPartialPresence;
     // Both ordinary hello and automatic notification setup negotiate dispatch isolation.
     this.#independentRpc = reply.independentRpc === true;
@@ -2358,20 +2445,25 @@ export class RemoteBridgeSide implements BridgeSide {
   publish(event: BridgePublish): Promise<{ sequence: number }> { return this.#call("publish", event); }
   async mirror(presence: BridgeMirrorPresence): Promise<void> {
     if (this.#closed) throw this.#closed;
-    if (presenceIsPartial(presence)) {
-      if (this.#protocolVersion === undefined) await this.hello();
-      if (!this.#supportsPartialPresence) {
-        // Never strip partial metadata or send an omission set to a legacy receiver.
-        // Skip only this direction; local mirroring and unrelated RPCs remain live.
-        this.#legacyPartialSkips += 1;
-        if (!this.#legacyPartialSkipLogged) {
-          this.#legacyPartialSkipLogged = true;
-          this.log?.(`presence: legacy peer lacks partialPresence; skipped remote partial mirror; legacyPartialSkips=${this.#legacyPartialSkips}; link remains active`);
-        }
-        return;
+    const partial = presenceIsPartial(presence);
+    if (partial && this.#protocolVersion === undefined) await this.hello();
+    if (partial && !this.#supportsPartialPresence) {
+      // A legacy mirror treats omissions as withdrawal. Materialize every omission from the last
+      // successful complete snapshot, then send a complete, metadata-free mirror. If new records
+      // make that union exceed one frame, retain and renew the previous complete snapshot instead.
+      let complete = completeLegacyPartial(presence, this.#legacyMirrorSnapshot, Date.now());
+      if (this.#legacyMirrorSnapshot && Buffer.byteLength(JSON.stringify(complete), "utf8") > BRIDGE_PAGE_BYTES) {
+        complete = completeLegacyPartial({ hosts: [], participants: [] }, this.#legacyMirrorSnapshot, Date.now());
       }
+      await this.#call("mirror", complete);
+      this.#legacyCompletedPartials += 1;
+      this.#legacyMirrorSnapshot = copyMirrorPresence(complete);
+      this.#lastPresenceRenewalAt = Date.now();
+      return;
     }
     await this.#call("mirror", presence);
+    this.#lastPresenceRenewalAt = Date.now();
+    if (!partial) this.#legacyMirrorSnapshot = copyMirrorPresence(presence);
   }
   bridgedIds(after: number): Promise<BridgedIds> { return this.#call("bridgedIds", { after }); }
 }
@@ -2460,7 +2552,7 @@ export interface BridgeStepResult {
 // reserve (security review round 2, F1).
 const remoteAddresses = (presence: Pick<BridgePresence, "hosts" | "participants">): Set<string> => {
   const names = new Set<string>();
-  for (const { record } of presence.hosts) names.add(record.id).add(record.identity.id);
+  for (const { record } of presence.hosts) if (!isNativeNonRootHost(record)) names.add(record.id).add(record.identity.id);
   for (const participant of presence.participants) names.add(participant.id).add(participant.rootId);
   return names;
 };
@@ -2469,7 +2561,7 @@ const remoteAddresses = (presence: Pick<BridgePresence, "hosts" | "participants"
 const addresses = (presence: Pick<BridgePresence, "hosts" | "participants">): Set<string> => {
   // Malformed native samples travel only to preserve a receiver's existing root. They
   // must not become new hub routing authority merely by remaining in the snapshot.
-  const hosts = presence.hosts.filter(({ record }) => isAdmissibleRecord("host", record));
+  const hosts = presence.hosts.filter(({ record }) => isAdmissibleRecord("host", record) && !isNativeNonRootHost(record));
   const malformedOwners = new Set(presence.hosts.filter(({ record }) => !isAdmissibleRecord("host", record)).map(({ record }) => record.id));
   // Trusted adapters can supply participant-only addresses without any host sample.
   const participants = presence.participants.filter(participant => !malformedOwners.has(participant.ownerHostId));
@@ -2490,6 +2582,14 @@ const CANONICAL_ID = new RegExp(`^${ROOT_ID_PREFIX}[A-Za-z0-9-]{8,128}$`);
 
 /** Whether `id` is a root's canonical id, the only form a bridge admits (and a handoff names). */
 export const isCanonicalRootId = (id: string): boolean => CANONICAL_ID.test(id);
+
+const NON_ROOT_HOST_ID = /^(?:resident:[0-9a-f]{24}|runtime:[A-Za-z0-9._-]{1,128})$/;
+const isNonRootHostId = (id: string, rootId: string): boolean => NON_ROOT_HOST_ID.test(id) && id !== rootId && CANONICAL_ID.test(rootId);
+const isNonRootHostRecord = (record: FabricHostRecord): boolean => isNonRootHostId(record.id, record.rootId) &&
+  isAdmissibleRecord("host", record);
+/** Valid native runtime/resident host rows are retained for forwarding, not root authority. */
+const isNativeNonRootHost = (record: FabricHostRecord): boolean =>
+  remoteHostOf(record) === undefined && record.bridgeVia === undefined && isNonRootHostRecord(record);
 
 /**
  * The remote's presence as this link admits it: hosts and roots none of whose ids or aliases
@@ -2515,6 +2615,7 @@ export const admitPresence = (
   let droppedCount = Math.max(validDroppedCount(raw.droppedCount), relevantDroppedCount(rawDropped)) +
     (Array.isArray(raw.hosts) ? 0 : 1) + (Array.isArray(raw.participants) ? 0 : 1);
   const hosts: BridgeHost[] = [];
+  const nonRootHosts: BridgeHost[] = [];
   for (const value of rawHosts) {
     if (!isObject(value) || !isObject(value.record) || typeof value.record.id !== "string") {
       droppedCount += 1;
@@ -2531,9 +2632,11 @@ export const admitPresence = (
     const hasObservedAt = Object.hasOwn(value, "observedAt");
     const observedAt = typeof value.observedAt === "number" ? value.observedAt : hasObservedAt ? NaN : undefined;
     const relayed = trustedRelayOf(record, trustedBridgeVia);
+    const nonRoot = isNativeNonRootHost(record);
     const malformed = !isAdmissibleRecord("host", record, trustedBridgeVia) || !Number.isFinite(expiresAt) ||
-      (observedAt !== undefined && !Number.isFinite(observedAt)) || record.identity.id !== record.id ||
-      record.rootId !== record.id || (!relayed && record.bridgeVia !== undefined) || !CANONICAL_ID.test(record.id);
+      (observedAt !== undefined && !Number.isFinite(observedAt)) || (!nonRoot &&
+        (record.identity.id !== record.id || record.rootId !== record.id || (!relayed && record.bridgeVia !== undefined) ||
+          !CANONICAL_ID.test(record.id)));
     const reservedConflict = [record.id, record.identity.id, record.rootId].some(id => reserved.has(id));
     if (malformed || reservedConflict) {
       if (malformed) {
@@ -2541,7 +2644,8 @@ export const admitPresence = (
         const attribution = droppedPresenceOf("host", record, !reservedConflict);
         if (attribution) dropped.push(attribution);
       }
-    } else hosts.push({ record, expiresAt, ...(observedAt !== undefined ? { observedAt } : {}) });
+    } else if (nonRoot) nonRootHosts.push({ record, expiresAt, ...(observedAt !== undefined ? { observedAt } : {}) });
+    else hosts.push({ record, expiresAt, ...(observedAt !== undefined ? { observedAt } : {}) });
   }
   const admitted = new Map(hosts.map(({ record }) => [record.id, record]));
   const participants: FabricParticipantRecord[] = [];
@@ -2568,7 +2672,7 @@ export const admitPresence = (
   }
   const unique = uniqueDroppedPresence(dropped, true);
   const partial = !isObject(rawValue) || raw.partial === true || droppedCount > 0;
-  return { hosts, participants, ...(unique.length > 0 ? { dropped: unique } : {}),
+  return { hosts: [...hosts, ...nonRootHosts], participants, ...(unique.length > 0 ? { dropped: unique } : {}),
     ...(partial ? { partial: true } : {}), ...(droppedCount > 0 ? { droppedCount } : {}) };
 };
 
@@ -2625,6 +2729,7 @@ export const boundPresence = (
 const senderIdentities = (presence: Pick<BridgePresence, "hosts" | "participants">): Map<string, MeshIdentity> => {
   const identities = new Map<string, MeshIdentity>();
   for (const { record } of presence.hosts) {
+    if (isNativeNonRootHost(record)) continue;
     const { id, name, kind, sessionId } = record.identity;
     if (id === record.id) identities.set(id, { id, name, kind, ...(typeof sessionId === "string" ? { sessionId } : {}) });
   }
@@ -2653,7 +2758,7 @@ interface BridgeRules {
 
 const senders = (presence: Pick<BridgePresence, "hosts" | "participants">): Set<string> => {
   const ids = new Set<string>();
-  for (const { record } of presence.hosts) ids.add(record.identity.id);
+  for (const { record } of presence.hosts) if (!isNativeNonRootHost(record)) ids.add(record.identity.id);
   for (const participant of presence.participants) ids.add(participant.id).add(participant.ownerIdentityId);
   return ids;
 };
@@ -2700,6 +2805,7 @@ export class MeshBridge {
   /** Events not addressed across since the last count line (smarty-dev#9352). */
   #unaddressed = { count: 0, toRemote: 0, toLocal: 0, factory: 0, safety: 0, topics: new Set<string>(), more: false };
   #unaddressedLoggedAt = Number.NEGATIVE_INFINITY;
+  #presenceInfoLoggedAt = Number.NEGATIVE_INFINITY;
   /** The factory exception's token buckets (pi-fabric#876 review, P1-2; security pass, (c)). */
   readonly #factoryRate: Required<FactoryRate>;
   #factoryTokens: number;
@@ -2862,6 +2968,17 @@ export class MeshBridge {
 
   #log(message: string): void {
     this.options.log?.(message);
+  }
+
+  /** One per-link INFO line, no more than once a minute, including the last acknowledged renewal age. */
+  #reportPresenceInfo(): void {
+    const now = this.#now();
+    if (now - this.#presenceInfoLoggedAt < UNADDRESSED_LOG_MS) return;
+    this.#presenceInfoLoggedAt = now;
+    const remote = this.options.remote instanceof RemoteBridgeSide ? this.options.remote : undefined;
+    const renewedAt = remote?.lastPresenceRenewalAt ?? this.#presenceAt;
+    const renewalAge = Number.isFinite(renewedAt) ? Math.max(0, now - renewedAt) : "never";
+    this.#log(`presence INFO: peer=${this.options.remoteName} renewalAgeMs=${renewalAge} legacyCompletedPartials=${remote?.legacyCompletedPartials ?? 0}`);
   }
 
   /**
@@ -3164,12 +3281,17 @@ export class MeshBridge {
     const remote = admitPresence(claimed, new Set(local.reserved), this.options.remoteName);
     if (this.#stopped) return;
     const relays = await this.options.local.relayPresence?.() ?? { hosts: [], participants: [] };
-    const native = admitPresence(local, new Set());
-    const hosts = [...native.hosts, ...relays.hosts.map(host => ({ ...host, record: { ...host.record, bridgeVia: this.options.localName } }))];
+    const localRoots = { ...local, hosts: local.hosts.filter(({ record }) => !isNativeNonRootHost(record)) };
+    const native = admitPresence(localRoots, new Set());
+    const nativeNonRootHosts = local.hosts.filter(({ record }) => isNativeNonRootHost(record));
+    const hosts = [...native.hosts, ...nativeNonRootHosts,
+      ...relays.hosts.map(host => ({ ...host, record: { ...host.record, bridgeVia: this.options.localName } }))];
     const counts = new Map<string, number>();
-    for (const { record } of hosts) counts.set(record.rootId, (counts.get(record.rootId) ?? 0) + 1);
+    for (const { record } of hosts) if (!isNativeNonRootHost(record)) {
+      counts.set(record.rootId, (counts.get(record.rootId) ?? 0) + 1);
+    }
     // Never silently overwrite conflicting canonical duplicates from an adapter or relay.
-    const outboundHosts = hosts.filter(({ record }) => counts.get(record.rootId) === 1);
+    const outboundHosts = hosts.filter(({ record }) => isNativeNonRootHost(record) || counts.get(record.rootId) === 1);
     const outboundParticipants = [...native.participants, ...relays.participants.map(record => ({ ...record, bridgeVia: this.options.localName }))]
       .filter(record => counts.get(record.rootId) === 1);
     const outboundAdmissionDrops = hosts.length - outboundHosts.length +
@@ -4045,6 +4167,7 @@ export class MeshBridge {
             reportedTimeout = true;
           }
         }
+        this.#reportPresenceInfo();
         if (this.#stopped) break;
         if (this.#notificationError || (!backingOff && this.#changesPending)) continue;
         await new Promise<void>((resolve) => {

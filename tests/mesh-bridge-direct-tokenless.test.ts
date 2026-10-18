@@ -325,7 +325,7 @@ describe("direct tokenless presence through MeshBridge RPC", () => {
     const logs: string[] = [];
     vi.spyOn(process.stderr, "write").mockImplementation(chunk => {
       logs.push(String(chunk));
-      if (String(chunk).includes("linked hub <-> intel1")) controller.abort();
+      if (String(chunk).includes("presence INFO:")) controller.abort();
       return true;
     });
     const deadline = setTimeout(() => controller.abort(), 3_000);
@@ -334,25 +334,24 @@ describe("direct tokenless presence through MeshBridge RPC", () => {
       expect(code).toBe(0);
       expect(logs.join("")).toContain("linked hub <-> intel1");
       expect(logs.join("")).not.toContain("stopped:");
-      expect(logs.filter(line => line.includes("legacyPartialSkips="))).toEqual([
-        expect.stringContaining("hub -> intel1: presence: legacy peer lacks partialPresence; skipped remote partial mirror; legacyPartialSkips=1"),
-      ]);
+      expect(logs.filter(line => line.includes("presence INFO:")).length).toBe(1);
+      expect(logs.join("")).toContain("peer=intel1 renewalAgeMs=");
+      expect(logs.join("")).toMatch(/legacyCompletedPartials=[1-9]\d*/);
     } finally {
       clearTimeout(deadline);
       controller.abort();
     }
   });
 
-  it("skips only legacy partial mirrors, counts every skip and logs once per capability state", async () => {
+  it("completes legacy partial mirrors and leaves partialPresence-capable payloads unchanged", async () => {
     const toPeer = new PassThrough();
     const fromPeer = new PassThrough();
-    const logs: string[] = [];
-    const remote = new RemoteBridgeSide(fromPeer, toPeer, undefined, message => logs.push(message));
-    let mirrors = 0;
+    const remote = new RemoteBridgeSide(fromPeer, toPeer);
+    const mirrorPayloads: unknown[] = [];
     let supportsPartial = false;
     toPeer.on("data", chunk => {
-      const request = JSON.parse(String(chunk)) as { id: number; op: string };
-      if (request.op === "mirror") mirrors += 1;
+      const request = JSON.parse(String(chunk)) as { id: number; op: string; args?: unknown };
+      if (request.op === "mirror") mirrorPayloads.push(request.args);
       fromPeer.write(`${JSON.stringify({ id: request.id, ok: true,
         result: request.op === "hello" ? { version: BRIDGE_PROTOCOL_VERSION, changes: true,
           ...(supportsPartial ? { partialPresence: true } : {}) } : request.op === "latestSequence" ? 7 : {} })}\n`);
@@ -360,31 +359,30 @@ describe("direct tokenless presence through MeshBridge RPC", () => {
     const partial = { hosts: [], participants: [], partial: true, droppedCount: 1 };
     try {
       await remote.mirror({ hosts: [], participants: [] });
-      expect(mirrors).toBe(1);
       await expect(remote.mirror(partial)).resolves.toBeUndefined();
-      await remote.hello(); // Repeated hello in the same state must not reset the log limit.
+      await remote.hello();
       await remote.mirror(partial);
-      expect(mirrors).toBe(1);
-      expect(remote.legacyPartialSkips).toBe(2);
-      expect(logs).toEqual([expect.stringContaining("legacyPartialSkips=1")]);
+      expect(mirrorPayloads).toEqual([
+        { hosts: [], participants: [] }, { hosts: [], participants: [] }, { hosts: [], participants: [] },
+      ]);
+      expect(remote.legacyCompletedPartials).toBe(2);
+      expect(remote.lastPresenceRenewalAt).toBeTypeOf("number");
       await expect(remote.latestSequence()).resolves.toBe(7);
-      await remote.mirror({ hosts: [], participants: [] });
-      expect(mirrors).toBe(2);
       supportsPartial = true;
       await remote.hello();
       await remote.mirror(partial);
-      expect(mirrors).toBe(3);
-      expect(remote.legacyPartialSkips).toBe(2);
+      expect(mirrorPayloads[3]).toEqual(partial);
+      expect(remote.legacyCompletedPartials).toBe(2);
       supportsPartial = false;
       await remote.hello();
       await remote.mirror(partial);
-      expect(remote.legacyPartialSkips).toBe(3);
-      expect(logs).toEqual([expect.stringContaining("legacyPartialSkips=1"), expect.stringContaining("legacyPartialSkips=3")]);
+      expect(mirrorPayloads[4]).toEqual({ hosts: [], participants: [] });
+      expect(remote.legacyCompletedPartials).toBe(3);
     } finally {
       remote.close();
     }
     await expect(remote.mirror(partial)).rejects.toThrow("Bridge transport closed");
-    expect(remote.legacyPartialSkips).toBe(3);
+    expect(remote.legacyCompletedPartials).toBe(3);
   });
 
   it.each(["file", "sqlite"] as const)("does not trust peer protected:false metadata across real presence RPC (%s)", async backend => {
@@ -581,6 +579,88 @@ describe("direct tokenless presence through MeshBridge RPC", () => {
     expect(readHostLease(hub.root, victim.host.id)).toBeUndefined();
   });
 
+  it.each([false, true] as const)("deduplicates identical participant copies and forwards resident/runtime hosts without partialing (legacy=%s)", async legacy => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(NOW);
+    const f = ownRootLink(false, "sqlite", legacy);
+    const root = fixture("normal-presence-shape", "R", NOW - 1_000, NOW + 120_000);
+    const remoteRoot = fixture("remote-nonroot-parent", "S", NOW - 1_000, NOW + 120_000);
+    root.participant.updatedAt = NOW;
+    await installNative(f.hub, root);
+    installParticipantFile(f.hub, root);
+    await installNative(f.work, remoteRoot);
+    const remoteChildId = "runtime:remote-child-activation";
+    const remoteChildIdentity: MeshIdentity = { id: remoteChildId, name: "remote-child", kind: "agent" };
+    await f.work.put({ key: hostKey(remoteChildId), identity: remoteChildIdentity,
+      value: { format: 1, id: remoteChildId, rootId: remoteRoot.host.id, identity: remoteChildIdentity,
+        startedAt: NOW - 1_000, updatedAt: NOW, expiresAt: NOW + 120_000 } satisfies FabricHostRecord });
+    const nonRootHosts = [
+      { id: `resident:${"a".repeat(24)}`, name: "resident" },
+      { id: "runtime:child-activation", name: "runtime" },
+    ];
+    for (const { id, name } of nonRootHosts) {
+      const identity: MeshIdentity = { id, name, kind: "agent" };
+      const record: FabricHostRecord = { format: 1, id, rootId: root.host.id, identity,
+        startedAt: NOW - 1_000, updatedAt: NOW, expiresAt: NOW + 120_000 };
+      await f.hub.put({ key: hostKey(id), identity, value: record });
+    }
+    await f.remote.hello();
+    const mirrors: BridgePresence[] = [];
+    const mirror = f.remote.mirror.bind(f.remote);
+    vi.spyOn(f.remote, "mirror").mockImplementation(async presence => {
+      mirrors.push(presence as BridgePresence);
+      await mirror(presence);
+    });
+
+    await expect(f.bridge.syncPresence()).resolves.toBeUndefined();
+    const sampled = await f.local.presence();
+    expect(sampled).not.toHaveProperty("partial");
+    expect(sampled).not.toHaveProperty("droppedCount");
+    expect(sampled.hosts.map(host => host.record.id)).toEqual(expect.arrayContaining([
+      root.host.id, ...nonRootHosts.map(host => host.id),
+    ]));
+    expect(sampled.reserved).toEqual(expect.arrayContaining(nonRootHosts.map(host => host.id)));
+    expect(mirrors).toHaveLength(1);
+    expect(mirrors[0]).not.toHaveProperty("partial");
+    expect(mirrors[0]!.hosts.map(host => host.record.id)).toEqual(expect.arrayContaining([
+      root.host.id, ...nonRootHosts.map(host => host.id),
+    ]));
+    expect(mirrors[0]!.participants).toEqual([root.participant]);
+    for (const host of nonRootHosts) {
+      expect(f.work.get(hostKey(host.id), { fresh: true })?.value).toMatchObject({
+        id: host.id, rootId: root.host.id, remoteHost: "hub",
+      });
+      expect(readHostLease(f.work.root, host.id)?.expiresAt).toBeGreaterThan(NOW);
+    }
+    expect(f.hub.get(hostKey(remoteChildId), { fresh: true })?.value).toMatchObject({
+      id: remoteChildId, rootId: remoteRoot.host.id, remoteHost: "intel1",
+    });
+    expect(readHostLease(f.hub.root, remoteChildId)?.expiresAt).toBeGreaterThan(NOW);
+    expect(f.remote.legacyCompletedPartials).toBe(0);
+  });
+
+  it.each(["file-only-invalid", "conflicting-copy"] as const)("keeps genuinely invalid or conflicting participant copies partial (%s)", async shape => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(NOW);
+    const f = ownRootLink(false, "sqlite");
+    const root = fixture(`participant-copy-${shape}`, "R", NOW - 1_000, NOW + 120_000);
+    root.participant.updatedAt = NOW;
+    await installNative(f.hub, root);
+    if (shape === "file-only-invalid") {
+      const invalid = { ...root.participant, id: "session:file-only-invalid-00000001", ownerHostId: undefined };
+      writeParticipantFile(f.hub.root, { key: participantKey(invalid.id), version: 1, updatedAt: NOW,
+        updatedBy: root.identity, value: invalid as unknown as FabricParticipantRecord });
+    } else {
+      const conflicting = { ...root.participant, ownerHostId: "session:other-owner-00000001",
+        ownerIdentityId: "session:other-owner-00000001", updatedAt: NOW + 1 };
+      writeParticipantFile(f.hub.root, { key: participantKey(conflicting.id), version: 1, updatedAt: conflicting.updatedAt,
+        updatedBy: root.identity, value: conflicting });
+    }
+    const presence = await f.local.presence();
+    expect(presence.partial).toBe(true);
+    expect(presence.droppedCount ?? 0).toBeGreaterThan(0);
+  });
+
   it.each(["file", "sqlite"] as const)("legacy partial cycles hold omissions on both sides and later full cycles mirror normally (%s)", async backend => {
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(NOW);
@@ -615,11 +695,22 @@ describe("direct tokenless presence through MeshBridge RPC", () => {
     const remoteMirror = vi.spyOn(f.agent, "mirror");
     for (let cycle = 1; cycle <= 2; cycle += 1) {
       await expect(f.bridge.syncPresence()).resolves.toBeUndefined();
-      expect(snapshot()).toEqual(before);
-      expect(f.remote.legacyPartialSkips).toBe(cycle);
-      expect(remoteMirror).not.toHaveBeenCalled();
+      const after = snapshot();
+      expect(after.hubHost?.value).toMatchObject(before.hubHost?.value as Record<string, unknown>);
+      expect(after.hubParticipant?.value).toMatchObject(before.hubParticipant?.value as Record<string, unknown>);
+      expect(after.workHost?.value).toMatchObject({ id: victim.host.id, rootId: victim.host.id,
+        incarnationToken: "B", remoteHost: "hub" });
+      expect(after.workParticipant?.value).toMatchObject(before.workParticipant?.value as Record<string, unknown>);
+      expect(f.remote.legacyCompletedPartials).toBe(cycle);
+      const outbound = remoteMirror.mock.calls[cycle - 1]![0] as Record<string, unknown> & { hosts: Array<{ record: FabricHostRecord }> };
+      expect(outbound).not.toHaveProperty("partial");
+      expect(outbound).not.toHaveProperty("dropped");
+      expect(outbound).not.toHaveProperty("droppedCount");
+      expect(outbound.hosts.map(host => host.record.id)).toEqual(expect.arrayContaining([victim.host.id, outboundProgress.host.id]));
+      expect(outbound.hosts.map(host => host.record.id)).not.toContain(malformed.host.id);
       expect(f.hub.get(hostKey(inboundProgress.host.id), { fresh: true })?.value).toMatchObject({ incarnationToken: "V" });
-      expect(f.work.get(hostKey(outboundProgress.host.id), { fresh: true })).toBeUndefined();
+      expect(f.work.get(hostKey(outboundProgress.host.id), { fresh: true })?.value).toMatchObject({ incarnationToken: "U" });
+      expect(readHostLease(f.work.root, victim.host.id)?.expiresAt).toBeGreaterThan(Date.now());
       await expect(f.remote.latestSequence()).resolves.toBeTypeOf("number");
     }
 
@@ -628,14 +719,67 @@ describe("direct tokenless presence through MeshBridge RPC", () => {
     await f.hub.delete({ key: participantKey(victim.participant.id) });
     fs.rmSync(hostLeasePath(f.hub.root, victim.host.id), { force: true });
     await expect(f.bridge.syncPresence()).resolves.toBeUndefined();
-    expect(f.remote.legacyPartialSkips).toBe(2);
-    expect(remoteMirror).toHaveBeenCalledTimes(1);
+    expect(f.remote.legacyCompletedPartials).toBe(2);
+    expect(remoteMirror).toHaveBeenCalledTimes(3);
     expect(f.work.get(hostKey(outboundProgress.host.id), { fresh: true })?.value).toMatchObject({ incarnationToken: "U" });
     expect(f.work.get(participantKey(outboundProgress.host.id), { fresh: true })?.value).toMatchObject({ id: outboundProgress.host.id });
     expect(f.work.get(hostKey(victim.host.id), { fresh: true })).toBeUndefined();
     expect(f.work.get(participantKey(victim.host.id), { fresh: true })).toBeUndefined();
     expect(readHostLease(f.work.root, victim.host.id)).toBeUndefined();
     expect(f.hub.get(hostKey(peerRoot.host.id), { fresh: true })).toBeDefined();
+  });
+
+  it.each(["file", "sqlite"] as const)("renews a previously mirrored hub root through 20 persistent frame-budget partials and delivers a later follow-up (%s)", async backend => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(NOW);
+    const f = ownRootLink(false, backend, true);
+    const target = fixture("legacy-budget-target", "H", NOW - 1_000, NOW + 120_000);
+    const peerRoot = fixture("legacy-budget-peer", "P", NOW - 1_000, NOW + 120_000);
+    await installNative(f.hub, target);
+    await installNative(f.work, peerRoot);
+    await f.bridge.start();
+    const mirroredHubIds = () => f.work.listAll("topology/hosts/", { fresh: true })
+      .filter(entry => (entry.value as Record<string, unknown>).remoteHost === "hub")
+      .map(entry => (entry.value as FabricHostRecord).id).sort();
+    const mirroredParticipantIds = () => f.work.listAll("topology/participants/", { fresh: true })
+      .filter(entry => (entry.value as Record<string, unknown>).remoteHost === "hub")
+      .map(entry => (entry.value as FabricParticipantRecord).id).sort();
+    const beforeHosts = mirroredHubIds();
+    const beforeParticipants = mirroredParticipantIds();
+    expect(beforeHosts).toEqual([target.host.id]);
+    expect(beforeParticipants).toEqual([target.participant.id]);
+
+    // Keep the persisted row small, but make its live bridge sample exceed the production 8 MiB
+    // frame. This deterministically reproduces the same persistent boundPresence drop as the hub.
+    const presence = f.local.presence.bind(f.local);
+    const diagnosticPayload = "x".repeat(8 * 1024 * 1024);
+    vi.spyOn(f.local, "presence").mockImplementation(async () => {
+      const sampled = await presence();
+      return { ...sampled, hosts: sampled.hosts.map(host => host.record.id === target.host.id
+        ? { ...host, record: { ...host.record, diagnosticPayload } as FabricHostRecord } : host) };
+    });
+    for (let cycle = 1; cycle <= 20; cycle += 1) {
+      const now = NOW + cycle * 2_500;
+      vi.setSystemTime(now);
+      await expect(f.bridge.syncPresence()).resolves.toBeUndefined();
+      expect(f.remote.legacyCompletedPartials).toBe(cycle);
+      expect(f.work.get(hostKey(target.host.id), { fresh: true })).toBeDefined();
+      expect(f.work.get(participantKey(target.participant.id), { fresh: true })).toBeDefined();
+      expect(readHostLease(f.work.root, target.host.id)?.expiresAt).toBeGreaterThanOrEqual(now + BRIDGE_LEASE_MS);
+      expect(readHostLease(f.hub.root, peerRoot.host.id)?.expiresAt).toBeGreaterThanOrEqual(now + BRIDGE_LEASE_MS);
+      expect(mirroredHubIds()).toEqual(beforeHosts);
+      expect(mirroredParticipantIds()).toEqual(beforeParticipants);
+    }
+
+    const now = NOW + 50_000;
+    vi.setSystemTime(now); // More than three 15 s mirror-lease periods after the initial complete mirror.
+    const sent = await f.work.publish({ topic: "fabric.control.command", kind: "followUp", from: peerRoot.identity,
+      to: target.host.id, data: { version: 1, commandId: "legacy-after-partials", targetId: target.host.id,
+        replyTo: peerRoot.host.id, action: "followUp", text: "still usable after persistent partials" } });
+    expect((await f.bridge.step()).toLocal).toBe(1);
+    expect(f.hub.read({ after: 0 }).filter(event => event.topic === "fabric.control.command")).toMatchObject([
+      { data: { bridge: { id: sent.id } } },
+    ]);
   });
 
   it("CLI error before bridge construction leaves an existing mirror for its lease TTL", async () => {

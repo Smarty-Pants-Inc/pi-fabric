@@ -14,6 +14,32 @@ const runner: NodeJS.ProcessEnv = {
   FABRIC_TRANSPORT_HOSTED_DELETE: "1", FABRIC_TRANSPORT_HOSTED_KILL: "1", FABRIC_TRANSPORT_HOSTED_NATS_RESET: "1",
 };
 const directory = () => "/home/runner/work/_temp";
+const hostedOnlySuites = [
+  "tests/actor-child-completion-idle-preflight.test.ts",
+  "tests/actor-manager.test.ts",
+  "tests/actor-remove-dead-root.test.ts",
+  "tests/agent-manager.test.ts",
+  "tests/agent-release-observation.test.ts",
+  "tests/agents-provider.test.ts",
+  "tests/residency-commit-fence.test.ts",
+  "tests/residency-stopped-writer-retention.test.ts",
+  "tests/residency.test.ts",
+  "tests/routed-session-boundaries.test.ts",
+  "tests/stall-alarms.test.ts",
+  "tests/task-write-policy.test.ts",
+  "tests/temp-run-sweep.test.ts",
+  "tests/verified-remove-windows.test.ts",
+  "tests/windows-temp-root-native.test.ts",
+];
+const natsBrokerSuites = [
+  "tests/mesh-state-backend.test.ts",
+  "tests/mesh-state-backend-multiprocess.test.ts",
+  "tests/mesh-backend-migration-nats.test.ts",
+  "tests/state-backend-nats-election.test.ts",
+  "tests/state-backend-nats-publish-dedupe.test.ts",
+  "tests/state-backend-nats-pull-recovery.test.ts",
+  "tests/nats-auth-server.test.ts",
+];
 
 describe("hosted-only authorization", () => {
   it("allows a real-runner environment without a fleet marker, regardless of unrelated opt-ins", () => {
@@ -152,14 +178,16 @@ it("config and inherited deletion guard refuse the reported fleet sequence after
     }
     for (const name of ['rm', 'rmdir', 'unlink']) fs.promises[name] = async () => { calls.push(name); };
     const config = (await import(pathToFileURL(process.cwd() + '/vitest.config.cts'))).default;
-    const expectedHostedExcludes = config.productDeletionSuites();
+    const expectedHostedExcludes = ${JSON.stringify(hostedOnlySuites)};
+    const expectedNatsExcludes = ${JSON.stringify(natsBrokerSuites)};
+    const skipNats = process.env.FABRIC_TEST_SKIP_NATS === '1';
     const before = calls.length;
     await import(pathToFileURL(process.cwd() + '/tests/test-deletion-guard.mjs'));
     let code;
     try { fs.rmSync(process.cwd() + '/HOSTED-REFUSAL-NOT-A-REAL-TARGET'); } catch (error) { code = error.code; }
     console.log('FLEET:' + JSON.stringify({ role: process.env.SMARTY_ROLE, veto: process.env.PI_TEST_FLEET_HOST,
-      excludes: config.test.exclude, expectedHostedExcludes, projects: config.test.projects.map(p => p.test.exclude),
-      code, delegated: calls.length - before }));
+      excludes: config.test.exclude, expectedHostedExcludes, expectedNatsExcludes, skipNats,
+      projects: config.test.projects.map(p => p.test.exclude), code, delegated: calls.length - before }));
   `;
   const child = join(fs.mkdtempSync(join(tmpdir(), "hosted-gate-")), "probe.mjs");
   fs.writeFileSync(child, source);
@@ -170,10 +198,22 @@ it("config and inherited deletion guard refuse the reported fleet sequence after
   expect(result.status, result.stdout + result.stderr).toBe(0);
   const line = result.stdout.split(/\r?\n/).find(line => line.startsWith("FLEET:"));
   expect(line, result.stdout + result.stderr).toBeDefined();
-  const output = JSON.parse(line!.slice(6));
+  const output = JSON.parse(line!.slice(6)) as {
+    role?: string;
+    veto: string;
+    excludes: string[];
+    expectedHostedExcludes: string[];
+    expectedNatsExcludes: string[];
+    skipNats: boolean;
+    projects: string[][];
+    code?: string;
+    delegated: number;
+  };
   expect(output.role).toBeUndefined();
   expect(output.veto).toBe("1");
   expect(output.excludes).toEqual(expect.arrayContaining(output.expectedHostedExcludes));
+  expect(output.excludes.filter(exclude => !output.expectedHostedExcludes.includes(exclude)))
+    .toEqual(output.skipNats ? output.expectedNatsExcludes : []);
   for (const project of output.projects) expect(project).toEqual(expect.arrayContaining(output.excludes));
   expect(output.code).toBe("ERR_TEST_DELETION_GUARD");
   expect(output.delegated).toBe(0);

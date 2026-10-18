@@ -534,6 +534,10 @@ const hostedOnlySuites = ["tests/actor-child-completion-idle-preflight.test.ts",
   "tests/agents-provider.test.ts", "tests/residency-commit-fence.test.ts", "tests/residency-stopped-writer-retention.test.ts",
   "tests/residency.test.ts", "tests/routed-session-boundaries.test.ts", "tests/stall-alarms.test.ts",
   "tests/task-write-policy.test.ts", "tests/temp-run-sweep.test.ts", "tests/verified-remove-windows.test.ts", "tests/windows-temp-root-native.test.ts"];
+const natsBrokerSuites = ["tests/mesh-state-backend.test.ts", "tests/mesh-state-backend-multiprocess.test.ts",
+  "tests/mesh-backend-migration-nats.test.ts", "tests/state-backend-nats-election.test.ts",
+  "tests/state-backend-nats-publish-dedupe.test.ts", "tests/state-backend-nats-pull-recovery.test.ts",
+  "tests/nats-auth-server.test.ts"];
 const guardableSuites = ["tests/actor-directory.test.ts",
   "tests/mesh-backend-migration-nats.test.ts",
   "tests/state-backend-nats.test.ts", "tests/residency-operator-actors.test.ts", "tests/mesh-publish-batch-hold.test.ts",
@@ -573,11 +577,17 @@ it.each([[undefined, false], ["false", false], ["true", true]] as const)(
       rootExclude: string[]; suites: string[]; projects: Array<{ name: string; exclude: string[] }> };
     expect(output.include).toEqual(["tests/**/*.test.ts"]);
     const required = hosted ? [] : hostedOnlySuites;
+    const skipNats = process.env.FABRIC_TEST_SKIP_NATS === "1";
+    const expectedRootExclude = [...required, ...(skipNats ? natsBrokerSuites : [])];
     expect(output.suites).toEqual(required);
-    expect(output.rootExclude).toEqual(required);
+    expect(output.rootExclude).toEqual(expectedRootExclude);
     for (const project of output.projects) {
       for (const suite of hostedOnlySuites) expect(project.exclude.includes(suite), `${project.name}: ${suite}`).toBe(!hosted);
-      for (const suite of guardableSuites) expect(project.exclude, `${project.name}: guarded Node fs stays local`).not.toContain(suite);
+      for (const suite of natsBrokerSuites) expect(project.exclude.includes(suite), `${project.name}: ${suite}`).toBe(skipNats);
+      for (const suite of guardableSuites) {
+        if (natsBrokerSuites.includes(suite)) continue;
+        expect(project.exclude, `${project.name}: guarded Node fs stays local`).not.toContain(suite);
+      }
     }
     // Native/tool and Bun counterexamples stay excluded; a guarded actor suite and the migration suites
     // no longer disappear just because they import deleting product code (pi-fabric#1151).

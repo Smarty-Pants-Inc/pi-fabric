@@ -135,19 +135,10 @@ const activationOf = (directory: string): string | undefined => activationManife
 export const actorActivationFromRun = (directory: string): ActorActivationManifest | undefined => activationManifestOf(directory);
 
 export interface ProcessScopeReceipt { version: 1; runId: string; scopeUnit: string; cgroupPath: string }
-export interface CloseTimeoutOperatorIdentity { uid: number | null; user: string; pid: number; agent?: string; session?: string }
-export interface DeadRootRecoveryAuthorization {
-  authorizedBy: string;
-  authorityRef: string;
-  rootProof: {
-    version: 1; rootId: string; checkedAt: number; staleBoundMs: number;
-    participantResolution: "not-found"; participantLastSeenAt: number; ownerLeaseExpiresAt?: number;
-    mainLiveness: string; evidence: object;
-  };
-}
+export interface CloseTimeoutOperatorIdentity { uid: number | null; user: string; pid: number; agent?: string }
 interface CloseTimeoutOperatorReceipt {
   version: 1; runId: string; actorId: string; activationId: string; scopeUnit: string; checkedAt: number;
-  operator: CloseTimeoutOperatorIdentity; authorization?: DeadRootRecoveryAuthorization;
+  operator: CloseTimeoutOperatorIdentity;
 }
 
 const validCgroupPath = (value: unknown, scopeUnit: string): value is string => typeof value === "string" && value.startsWith("/") &&
@@ -183,33 +174,6 @@ export const scopeCgroupPathAbsent = (cgroupPath: string, cgroupRoot = "/sys/fs/
   }
   return false;
 };
-const pathEntryExists = (file: string): boolean => {
-  try { fs.lstatSync(file); return true; }
-  catch (error) { return (error as NodeJS.ErrnoException).code !== "ENOENT"; }
-};
-
-/** For old runs with only an operator-supplied unit name, search the whole cgroup tree; incomplete walks veto. */
-export const scopeUnitAbsent = (scopeUnit: string, cgroupRoot = "/sys/fs/cgroup"): boolean => {
-  if (!SCOPE_UNIT.test(scopeUnit) || !path.isAbsolute(cgroupRoot)) return false;
-  const root = path.resolve(cgroupRoot);
-  try { if (!fs.lstatSync(root).isDirectory()) return false; } catch { return false; }
-  const pending = [root];
-  let visited = 0;
-  while (pending.length) {
-    const directory = pending.pop()!;
-    if (++visited > 100_000) return false;
-    let entries: fs.Dirent[];
-    try { entries = fs.readdirSync(directory, { withFileTypes: true }); } catch { return false; }
-    for (const entry of entries) {
-      if (entry.name === scopeUnit) return false;
-      if (entry.isSymbolicLink()) return false;
-      if (!entry.isDirectory()) continue;
-      pending.push(path.join(directory, entry.name));
-    }
-  }
-  return true;
-};
-
 interface CloseTimeoutFacts { id: string; statusFile: string; record: Record<string, unknown>; actorId: string; activationId: string; text: string }
 const closeTimeoutFacts = (directory: string, runId: string): CloseTimeoutFacts | undefined => {
   if (!RUN_ID.test(runId) || path.basename(path.resolve(directory)) !== runId || !ownedStat(directory)?.isDirectory()) return undefined;
@@ -225,30 +189,6 @@ const closeTimeoutFacts = (directory: string, runId: string): CloseTimeoutFacts 
   return { id: runId, statusFile, record, actorId: record.actorId, activationId: task.activationId, text: settlement.text };
 };
 
-const validDeadRootAuthorization = (value: unknown): value is DeadRootRecoveryAuthorization => {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
-  const authorization = value as Record<string, unknown>;
-  const proof = authorization.rootProof;
-  if (typeof authorization.authorizedBy !== "string" || !/^(?:org|[A-Za-z][A-Za-z0-9._-]{0,63})$/.test(authorization.authorizedBy) ||
-      typeof authorization.authorityRef !== "string" || !/^https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/issues\/[1-9][0-9]*(?:#issuecomment-[1-9][0-9]*)?$/.test(authorization.authorityRef) ||
-      typeof proof !== "object" || proof === null || Array.isArray(proof)) return false;
-  const record = proof as Record<string, unknown>;
-  const evidence = record.evidence;
-  if (record.version !== 1 || typeof record.rootId !== "string" || !record.rootId || typeof record.checkedAt !== "number" || !Number.isSafeInteger(record.checkedAt) ||
-      typeof record.staleBoundMs !== "number" || !Number.isSafeInteger(record.staleBoundMs) || record.staleBoundMs <= 0 || record.participantResolution !== "not-found" ||
-      typeof record.participantLastSeenAt !== "number" || !Number.isSafeInteger(record.participantLastSeenAt) || typeof record.mainLiveness !== "string" ||
-      !record.mainLiveness.startsWith("stale:") || typeof evidence !== "object" || evidence === null || Array.isArray(evidence)) return false;
-  const snapshot = evidence as Record<string, unknown>;
-  const participants = snapshot.participants;
-  return Array.isArray(participants) && participants.length > 0 && participants.every(value => {
-    if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
-    const participant = value as Record<string, unknown>;
-    return (participant.source === "file" || participant.source === "state") && typeof participant.identity === "string" &&
-      participant.identity.startsWith("gone:") && typeof participant.lastSeen === "number" && Number.isFinite(participant.lastSeen) &&
-      (participant.ownerLeaseExpiresAt === null || typeof participant.ownerLeaseExpiresAt === "number");
-  });
-};
-
 const validOperatorReceipt = (value: Record<string, unknown> | undefined, facts: CloseTimeoutFacts): value is Record<string, unknown> & CloseTimeoutOperatorReceipt => {
   const operator = value?.operator;
   return value?.version === 1 && value.runId === facts.id && value.actorId === facts.actorId && value.activationId === facts.activationId &&
@@ -257,32 +197,23 @@ const validOperatorReceipt = (value: Record<string, unknown> | undefined, facts:
     ((operator as Record<string, unknown>).uid === null || (typeof (operator as Record<string, unknown>).uid === "number" &&
       Number.isSafeInteger((operator as Record<string, unknown>).uid))) && typeof (operator as Record<string, unknown>).user === "string" &&
     typeof (operator as Record<string, unknown>).pid === "number" && Number.isSafeInteger((operator as Record<string, unknown>).pid) &&
-    ((operator as Record<string, unknown>).agent === undefined || typeof (operator as Record<string, unknown>).agent === "string") &&
-    ((operator as Record<string, unknown>).session === undefined || typeof (operator as Record<string, unknown>).session === "string") &&
-    (value.authorization === undefined || validDeadRootAuthorization(value.authorization));
+    ((operator as Record<string, unknown>).agent === undefined || typeof (operator as Record<string, unknown>).agent === "string");
 };
 
-/** One-shot operator proof for a legacy run lacking the structured launch scope record. */
+/** One-shot owner receipt for a run whose host-recorded scope identity is verified absent. */
 export const writeCloseTimeoutOperatorReceipt = (directory: string, runId: string, scopeUnit: string,
-  operator: CloseTimeoutOperatorIdentity, cgroupRoot = "/sys/fs/cgroup",
-  authorization?: DeadRootRecoveryAuthorization): CloseTimeoutOperatorReceipt | undefined => {
+  operator: CloseTimeoutOperatorIdentity, cgroupRoot = "/sys/fs/cgroup"): CloseTimeoutOperatorReceipt | undefined => {
   if (!SCOPE_UNIT.test(scopeUnit) || !Number.isSafeInteger(operator.pid) || operator.pid !== process.pid || !operator.user ||
-      operator.uid !== (process.getuid?.() ?? null) || (authorization !== undefined && !validDeadRootAuthorization(authorization))) return undefined;
+      operator.uid !== (process.getuid?.() ?? null)) return undefined;
   const facts = closeTimeoutFacts(directory, runId);
   if (!facts) return undefined;
   const scopeFile = path.join(directory, PROCESS_SCOPE_FILE), scope = readJson(scopeFile);
-  if (pathEntryExists(scopeFile) && (!validScopeReceipt(scope, runId) || scope.scopeUnit !== scopeUnit)) return undefined;
-  if (scope && validScopeReceipt(scope, runId) ? !scopeCgroupPathAbsent(scope.cgroupPath, cgroupRoot) : !scopeUnitAbsent(scopeUnit, cgroupRoot)) return undefined;
+  if (!validScopeReceipt(scope, runId) || scope.scopeUnit !== scopeUnit || !scopeCgroupPathAbsent(scope.cgroupPath, cgroupRoot)) return undefined;
   const file = path.join(directory, CLOSE_TIMEOUT_OPERATOR_FILE);
   const existing = readJson(file);
-  const sameAuthorization = (receipt: Record<string, unknown>): boolean => {
-    const current = receipt.authorization as DeadRootRecoveryAuthorization | undefined;
-    return authorization === undefined ? current === undefined : current?.authorizedBy === authorization.authorizedBy &&
-      current.authorityRef === authorization.authorityRef && current.rootProof.rootId === authorization.rootProof.rootId;
-  };
-  if (existing) return validOperatorReceipt(existing, facts) && existing.scopeUnit === scopeUnit && sameAuthorization(existing) ? existing : undefined;
+  if (existing) return validOperatorReceipt(existing, facts) && existing.scopeUnit === scopeUnit ? existing : undefined;
   const receipt: CloseTimeoutOperatorReceipt = { version: 1, runId, actorId: facts.actorId, activationId: facts.activationId,
-    scopeUnit, checkedAt: Date.now(), operator, ...(authorization ? { authorization } : {}) };
+    scopeUnit, checkedAt: Date.now(), operator };
   let fd: number | undefined;
   try {
     fd = fs.openSync(file, "wx", 0o600);
@@ -294,7 +225,7 @@ export const writeCloseTimeoutOperatorReceipt = (directory: string, runId: strin
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "EEXIST") {
       const raced = readJson(file);
-      return validOperatorReceipt(raced, facts) && raced.scopeUnit === scopeUnit && sameAuthorization(raced) ? raced : undefined;
+      return validOperatorReceipt(raced, facts) && raced.scopeUnit === scopeUnit ? raced : undefined;
     }
     return undefined;
   } finally { if (fd !== undefined) fs.closeSync(fd); }
@@ -306,15 +237,9 @@ export const peekCloseTimeoutRun = (directory: string, actorId: string, activati
   const facts = closeTimeoutFacts(directory, path.basename(directory));
   if (!facts || facts.actorId !== actorId || facts.activationId !== activationId) return undefined;
   const task = activationManifestOf(directory);
-  const scopeFile = path.join(directory, PROCESS_SCOPE_FILE), scope = readJson(scopeFile);
-  let operatorReceipt: Record<string, unknown> | undefined;
-  if (pathEntryExists(scopeFile) && !validScopeReceipt(scope, facts.id)) return undefined;
-  if (validScopeReceipt(scope, facts.id)) {
-    if (task?.actorId !== actorId || !scopeCgroupPathAbsent(scope.cgroupPath, cgroupRoot)) return undefined;
-  } else {
-    operatorReceipt = readJson(path.join(directory, CLOSE_TIMEOUT_OPERATOR_FILE));
-    if (!validOperatorReceipt(operatorReceipt, facts) || !scopeUnitAbsent(operatorReceipt.scopeUnit, cgroupRoot)) return undefined;
-  }
+  const scope = readJson(path.join(directory, PROCESS_SCOPE_FILE));
+  if (!validScopeReceipt(scope, facts.id) || (task?.actorId !== undefined && task.actorId !== actorId) ||
+      !scopeCgroupPathAbsent(scope.cgroupPath, cgroupRoot)) return undefined;
   return { ...facts.record, id: facts.id, status: "completed", text: facts.text, finishedAt:
     typeof facts.record.finishedAt === "number" ? facts.record.finishedAt : Date.now() } as unknown as AgentRunResult;
 };

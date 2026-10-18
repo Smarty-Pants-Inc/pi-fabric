@@ -1,18 +1,15 @@
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { MAIN_STOPPED_AUDIT_REQUIRED, MAIN_STOPPED_EVIDENCE_MAX_BYTES, mainStoppedAudit, removeActorOffline } from "./actors/remove-offline.js";
 import { ResidentActorClient } from "./residency/actor-client.js";
 import { residentRoot, residentHostId, type ResidentHostConfig, type ResidentHostOwner } from "./residency/protocol.js";
-import { processStartTime, residentProcessAlive } from "./residency/process-identity.js";
-import { MeshStore } from "./mesh/store.js";
-import { proveDeadResidentRoot, readResidentOperatorEvidence } from "./residency/operator-safety.js";
+import { residentProcessAlive } from "./residency/process-identity.js";
 import { windowsSecurityPowerShell } from "./storage/windows-powershell.js";
 import { ownedStat } from "./storage/scratch.js";
-import { writeCloseTimeoutOperatorReceipt, type DeadRootRecoveryAuthorization } from "./agents/enodev-recovery.js";
+import { writeCloseTimeoutOperatorReceipt } from "./agents/enodev-recovery.js";
 
-const usage = "Usage: fabric-actors stop|remove --resident <directory-or-prefix> --actor <id-or-name> [--mesh-root <dir>] [--dry-run] [--confirm-dead-root <rootId>] [--main-stopped --evidence <text> | --evidence-file <path>]\n       fabric-actors recover-close-timeout --run-root <runs-dir> --run-id <32-hex-id> --scope-unit <fabric-scope-XXXXXX.scope> [--authorized-by <org|lead-name> --authority-ref <issue-or-comment-URL>]";
+const usage = "Usage: fabric-actors stop|remove --resident <directory-or-prefix> --actor <id-or-name> [--mesh-root <dir>] [--dry-run] [--confirm-dead-root <rootId>] [--main-stopped --evidence <text> | --evidence-file <path>]\n       fabric-actors recover-close-timeout --run-root <runs-dir> --run-id <32-hex-id> --scope-unit <fabric-scope-XXXXXX.scope>";
 const help = `${usage}
 
 When the resident host is dead, remove runs offline and needs --main-stopped (the live resident's own remove
@@ -92,56 +89,6 @@ export function windowsOwnerSids(files: string[]): { owners: string[]; user: str
 const defaultOwnerProbe = (): ResidentChannelOwnerProbe => ({ platform: process.platform,
   ...(process.getuid ? { getuid: () => process.getuid!() } : {}), windowsOwnerSids });
 const sidPattern = /^S-1-\d+(-\d+)+$/;
-const AUTHORITY_REF = /^https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/issues\/[1-9][0-9]*(?:#issuecomment-[1-9][0-9]*)?$/;
-
-const readOwnedJson = <T>(file: string, maxBytes = 256 * 1024): T => {
-  const stat = ownedStat(file);
-  if (!stat?.isFile() || stat.size > maxBytes) throw new Error(`Expected an owner-owned regular file: ${file}`);
-  return JSON.parse(fs.readFileSync(file, "utf8")) as T;
-};
-
-const sameResidentRoot = (runRoot: string): { root: string; config: ResidentHostConfig; owner: ResidentHostOwner } => {
-  if (path.basename(runRoot) !== "runs" || fs.realpathSync(runRoot) !== runRoot) throw new Error("--run-root must be the real resident runs directory");
-  const root = path.dirname(runRoot);
-  const config = readOwnedJson<ResidentHostConfig>(path.join(root, "config.json"));
-  const owner = readOwnedJson<ResidentHostOwner>(path.join(root, "owner.json"), 16 * 1024);
-  if (config.format !== 1 || !config.rootId || !config.sessionId || !config.meshRoot || !config.residencyRoot ||
-      !config.mesh || !Number.isSafeInteger(owner.pid) || owner.pid <= 0 || !Number.isFinite(owner.startedAt) ||
-      owner.hostId !== residentHostId(config.rootId) || path.resolve(config.residencyRoot) !== root ||
-      path.resolve(config.residencyRoot) !== residentRoot(config.meshRoot, config.rootId) || fs.realpathSync(config.residencyRoot) !== root ||
-      fs.realpathSync(config.meshRoot) !== path.resolve(config.meshRoot)) throw new Error("Resident directory/config/owner identity mismatch");
-  return { root, config, owner };
-};
-
-const processParent = (pid: number): number | undefined => {
-  if (process.platform !== "linux") return undefined;
-  try {
-    const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
-    const close = stat.lastIndexOf(")");
-    const fields = stat.slice(close + 2).trim().split(/\s+/);
-    const parent = Number(fields[1]);
-    return Number.isSafeInteger(parent) && parent > 0 ? parent : undefined;
-  } catch { return undefined; }
-};
-
-const currentMainOwnerInvocation = (config: ResidentHostConfig, evidence: ReturnType<typeof readResidentOperatorEvidence>): boolean => {
-  if (process.platform !== "linux" || config.rootId !== `session:${config.sessionId}` ||
-      process.env.PI_FABRIC_PARENT_RUN || process.env.PI_FABRIC_ACTOR_ID || process.env.PI_FABRIC_AGENT_NAME ||
-      !evidence.mainLiveness?.startsWith("live:") || !evidence.toolEvidence) return false;
-  const candidates = evidence.toolEvidence.participants.filter(entry => entry.identity.startsWith("live: Main process ") &&
-    entry.host === os.hostname() && Number.isSafeInteger(entry.pid) && entry.pid! > 0 && typeof entry.startTime === "string");
-  return candidates.some(entry => {
-    if (processStartTime(entry.pid!) !== entry.startTime) return false;
-    let current = process.pid;
-    for (let hops = 0; hops < 128 && current > 1; hops++) {
-      if (current === entry.pid) return true;
-      const parent = processParent(current);
-      if (parent === undefined || parent === current) return false;
-      current = parent;
-    }
-    return false;
-  });
-};
 
 /** Fail closed unless every channel path is non-symlink and has an allowed OS owner. */
 export function assertResidentChannelOwned(files: string[], probe: ResidentChannelOwnerProbe = defaultOwnerProbe()): void {
@@ -185,60 +132,33 @@ export async function main(argv: string[], io: { out: (text: string) => void; er
     const [action, ...rest] = argv;
     if (action === "recover-close-timeout") {
       const values: Record<string, string> = {};
-      const allowed = ["--run-root", "--run-id", "--scope-unit", "--authorized-by", "--authority-ref"];
       for (let index = 0; index < rest.length; index++) {
         const option = rest[index]!;
-        if (!allowed.includes(option) || values[option] !== undefined || !rest[index + 1] || rest[index + 1]!.startsWith("--")) throw new Error(usage);
+        if (!["--run-root", "--run-id", "--scope-unit"].includes(option) || values[option] !== undefined ||
+            !rest[index + 1] || rest[index + 1]!.startsWith("--")) throw new Error(usage);
         values[option] = rest[++index]!;
       }
-      const runRootPath = values["--run-root"], runId = values["--run-id"], scopeUnit = values["--scope-unit"];
-      const authorizedBy = values["--authorized-by"], authorityRef = values["--authority-ref"];
-      if (!runRootPath || !runId || !scopeUnit || !/^[a-f0-9]{32}$/.test(runId) ||
-          (authorizedBy === undefined) !== (authorityRef === undefined)) throw new Error(usage);
-      if (authorizedBy !== undefined && (!/^(?:org|[A-Za-z][A-Za-z0-9._-]{0,63})$/.test(authorizedBy) || !AUTHORITY_REF.test(authorityRef!))) {
-        throw new Error("--authorized-by must be org or a lead name, and --authority-ref must be an HTTPS GitHub issue/comment URL");
-      }
+      const runRootPath = values["--run-root"];
+      const runId = values["--run-id"];
+      const scopeUnit = values["--scope-unit"];
+      if (!runRootPath || !runId || !scopeUnit || !/^[a-f0-9]{32}$/.test(runId)) throw new Error(usage);
       const unresolvedRoot = path.resolve(runRootPath);
       const rootStat = ownedStat(unresolvedRoot);
-      if (!rootStat?.isDirectory() || fs.realpathSync(unresolvedRoot) !== unresolvedRoot) {
-        throw new Error("Run root must be the real directory owned by the current OS user");
-      }
+      if (!rootStat?.isDirectory()) throw new Error("Run root must be a real directory owned by the current OS user");
       const runDirectory = path.join(unresolvedRoot, runId);
       const runStat = ownedStat(runDirectory);
-      if (!runStat?.isDirectory() || path.dirname(path.resolve(runDirectory)) !== unresolvedRoot || fs.realpathSync(runDirectory) !== runDirectory) {
+      if (!runStat?.isDirectory() || path.dirname(path.resolve(runDirectory)) !== unresolvedRoot) {
         throw new Error("Run directory must be a direct, owner-owned child of --run-root");
       }
-      const { config, owner } = sameResidentRoot(unresolvedRoot);
-      let authorization: DeadRootRecoveryAuthorization | undefined;
-      const mesh = new MeshStore(config.meshRoot, config.mesh.maxEventBytes, config.mesh.maxReadEvents,
-        { lockProtocol: config.mesh.lockProtocol, stateBackend: config.mesh.stateBackend });
-      try {
-        const resident = { pid: owner.pid, host: os.hostname(), startedAt: owner.startedAt };
-        const deadRootProof = proveDeadResidentRoot(config, mesh, resident);
-        if (authorizedBy !== undefined && authorityRef !== undefined) {
-          if (!deadRootProof) throw new Error("Dead-root authorization refused: the owning Main is live, unresolved, or not beyond the runtime stale bound");
-          authorization = { authorizedBy, authorityRef, rootProof: deadRootProof };
-        } else {
-          if (deadRootProof) throw new Error("The owning root is demonstrably dead; --authorized-by and --authority-ref are required");
-          const evidence = readResidentOperatorEvidence(config, mesh, resident, { mainStopped: true });
-          if (!currentMainOwnerInvocation(config, evidence)) {
-            throw new Error("Live-root recovery is owner-only: run this command from the owning Main; unknown or remote owner state refuses");
-          }
-        }
-        const uid = process.getuid?.() ?? null;
-        const session = process.env.PI_FABRIC_SESSION_ID ?? process.env.PI_SESSION_ID;
-        const operator = {
-          uid, user: process.env.SUDO_USER ?? process.env.USER ?? process.env.LOGNAME ?? `uid:${String(uid)}`,
-          pid: process.pid,
-          ...(process.env.PI_FABRIC_AGENT_NAME ? { agent: process.env.PI_FABRIC_AGENT_NAME } : {}),
-          ...(session ? { session } : {}),
-        };
-        const receipt = writeCloseTimeoutOperatorReceipt(runDirectory, runId, scopeUnit, operator, cgroupRoot, authorization);
-        if (!receipt) throw new Error("Close-timeout recovery proof failed; custody and receipts are unchanged");
-        io.out(JSON.stringify({ runId, scopeUnit, operator: receipt.operator, authorization: receipt.authorization,
-          receipt: "close-timeout-operator.json", custody: "awaiting the restored activation's delivery and queue acknowledgement" }) + "\n");
-        return 0;
-      } finally { mesh.closeState(); }
+      const uid = process.getuid?.() ?? null;
+      const receipt = writeCloseTimeoutOperatorReceipt(runDirectory, runId, scopeUnit, {
+        uid, user: process.env.SUDO_USER ?? process.env.USER ?? process.env.LOGNAME ?? `uid:${String(uid)}`,
+        pid: process.pid, ...(process.env.PI_FABRIC_AGENT_NAME ? { agent: process.env.PI_FABRIC_AGENT_NAME } : {}),
+      }, cgroupRoot);
+      if (!receipt) throw new Error("Close-timeout recovery proof failed; custody and receipts are unchanged");
+      io.out(JSON.stringify({ runId, scopeUnit, operator: receipt.operator, receipt: "close-timeout-operator.json",
+        custody: "awaiting the restored activation's delivery and queue acknowledgement" }) + "\n");
+      return 0;
     }
     if (action !== "stop" && action !== "remove") throw new Error(usage);
     const values: Record<string, string> = {};

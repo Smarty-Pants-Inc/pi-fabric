@@ -638,6 +638,141 @@ describe("direct tokenless presence through MeshBridge RPC", () => {
     expect(f.hub.get(hostKey(peerRoot.host.id), { fresh: true })).toBeDefined();
   });
 
+  it.each(["file", "sqlite"] as const)("legacy partial sync refuses and does not route a claim colliding with a malformed local host (%s)", async backend => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(NOW);
+    const f = ownRootLink(false, backend, true);
+    const target = fixture("malformed-local-target", "T", NOW - 1_000, NOW + 120_000);
+    const claimed = fixture("malformed-local-claim", "C", NOW - 1_000, NOW + 120_000);
+    const unrelated = fixture("malformed-local-unrelated", "U", NOW - 1_000, NOW + 120_000);
+    const malformed = fixture("malformed-local-host", "M", NOW - 1_000, NOW + 120_000);
+    await installNative(f.hub, target);
+    await f.hub.put({ key: hostKey(malformed.host.id), identity: malformed.identity,
+      value: { ...malformed.host, rootId: claimed.host.rootId, hostId: "session:malformed-host-field-00000001",
+        sessionId: "session:malformed-session-field-00000001", rootIds: [claimed.host.rootId],
+        remoteHost: null, updatedAt: Number.NaN } as unknown as FabricHostRecord });
+    await installNative(f.work, claimed);
+    await installNative(f.work, unrelated);
+
+    await f.bridge.start();
+    expect(f.remote.legacyPartialSkips).toBeGreaterThan(0);
+    expect(f.hub.get(hostKey(claimed.host.id), { fresh: true })).toBeUndefined();
+    expect(f.hub.get(hostKey(unrelated.host.id), { fresh: true })).toBeDefined();
+
+    await f.work.publish({ topic: "fleet.work.malformed-local", kind: "ask", from: claimed.identity,
+      to: target.host.id, text: "must remain held" });
+    await f.work.publish({ topic: "fleet.work.unrelated", kind: "ask", from: unrelated.identity,
+      to: target.host.id, text: "unrelated root progresses" });
+    await expect(f.bridge.step()).resolves.toMatchObject({ toLocal: 1 });
+    const delivered = f.hub.read({ after: 0 }).map(event => event.topic);
+    expect(delivered).toContain("fleet.work.unrelated");
+    expect(delivered).not.toContain("fleet.work.malformed-local");
+
+    await f.hub.delete({ key: hostKey(malformed.host.id) });
+    await expect(f.bridge.syncPresence()).resolves.toBeUndefined();
+    expect(f.hub.get(hostKey(claimed.host.id), { fresh: true })).toBeDefined();
+    await f.work.publish({ topic: "fleet.work.recovered", kind: "ask", from: claimed.identity,
+      to: target.host.id, text: "valid claim after the bad row is gone" });
+    await f.bridge.step();
+    expect(f.hub.read({ after: 0 }).map(event => event.topic)).toContain("fleet.work.recovered");
+  });
+
+  it.each(["file", "sqlite"] as const)("reserves every non-empty identifier named by malformed local host and participant rows (%s)", async backend => {
+    const store = openStore(backend);
+    const side = new StoreBridgeSide(store, "peer", () => NOW, false);
+    const hostWriter = fixture("malformed-host-writer", "HW", NOW, NOW + 120_000);
+    const participantWriter = fixture("malformed-participant-writer", "PW", NOW, NOW + 120_000);
+    const hostIds = ["host-row-id", "host-field-id", "host-root-id", "host-session-id", "host-identity-id",
+      "host-list-root-1", "host-list-root-2"];
+    const participantIds = ["participant-row-id", "participant-host-field-id", "participant-root-id",
+      "participant-owner-host-id", "participant-owner-identity-id", "participant-session-id",
+      "participant-identity-id", "participant-list-root"];
+    await store.put({ key: hostKey(hostIds[0]!), identity: hostWriter.identity, value: {
+      format: 1, id: hostIds[0], hostId: hostIds[1], rootId: hostIds[2], sessionId: hostIds[3],
+      identity: { id: hostIds[4] }, rootIds: hostIds.slice(5), remoteHost: null,
+      startedAt: null, updatedAt: null, expiresAt: null,
+    } });
+    await store.put({ key: participantKey(participantIds[0]!), identity: participantWriter.identity, value: {
+      format: 1, id: participantIds[0], kind: "root", hostId: participantIds[1], rootId: participantIds[2],
+      ownerHostId: participantIds[3], ownerIdentityId: participantIds[4], sessionId: participantIds[5],
+      identity: { id: participantIds[6] }, rootIds: [participantIds[7]], name: "malformed", status: "idle",
+      transport: "host", capabilities: [], startedAt: NOW, updatedAt: null, controlProtocol: "v1",
+    } });
+
+    const presence = await side.presence();
+    expect(presence).toMatchObject({ partial: true, droppedCount: expect.any(Number) });
+    expect(presence.reserved).toEqual(expect.arrayContaining([...hostIds, ...participantIds]));
+    expect(presence.dropped).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: "host", identifiers: expect.arrayContaining(hostIds) }),
+      expect.objectContaining({ type: "participant", identifiers: expect.arrayContaining(participantIds) }),
+    ]));
+  });
+
+  it.each(["file", "sqlite"] as const)("peer malformed host identifiers block conflicting claims while unrelated roots progress (%s)", async backend => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(NOW);
+    const f = ownRootLink(false, backend, true);
+    const target = fixture("peer-malformed-target", "T", NOW - 1_000, NOW + 120_000);
+    const claimed = fixture("peer-malformed-claim", "C", NOW - 1_000, NOW + 120_000);
+    const unrelated = fixture("peer-malformed-unrelated", "U", NOW - 1_000, NOW + 120_000);
+    const malformed = fixture("peer-malformed-host", "M", NOW - 1_000, NOW + 120_000);
+    const malformedHost = { ...malformed.host, rootId: claimed.host.rootId,
+      hostId: "session:peer-malformed-host-field-00000001", rootIds: [claimed.host.rootId],
+      remoteHost: null, updatedAt: Number.NaN } as unknown as FabricHostRecord;
+    await installNative(f.hub, target);
+    await installNative(f.work, claimed);
+    await installNative(f.work, unrelated);
+    await f.work.put({ key: hostKey(malformed.host.id), identity: malformed.identity, value: malformedHost });
+    const remotePresence = await f.remote.presence();
+    expect(remotePresence).toMatchObject({ partial: true });
+    expect(remotePresence.dropped?.some(drop => drop.identifiers?.includes(claimed.host.rootId))).toBe(true);
+
+    await f.bridge.start();
+    expect(f.hub.get(hostKey(claimed.host.id), { fresh: true })).toBeUndefined();
+    expect(f.hub.get(hostKey(unrelated.host.id), { fresh: true })).toBeDefined();
+    await f.work.publish({ topic: "fleet.work.peer-malformed", kind: "ask", from: claimed.identity,
+      to: target.host.id, text: "must remain held" });
+    await f.work.publish({ topic: "fleet.work.peer-unrelated", kind: "ask", from: unrelated.identity,
+      to: target.host.id, text: "unrelated root progresses" });
+    await expect(f.bridge.step()).resolves.toMatchObject({ toLocal: 1 });
+    const delivered = f.hub.read({ after: 0 }).map(event => event.topic);
+    expect(delivered).toContain("fleet.work.peer-unrelated");
+    expect(delivered).not.toContain("fleet.work.peer-malformed");
+  });
+
+  it.each(["file", "sqlite"] as const)("peer malformed participant identifiers block conflicting claims over RPC (%s)", async backend => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(NOW);
+    const f = ownRootLink(false, backend, true);
+    const target = fixture("peer-malformed-participant-target", "T", NOW - 1_000, NOW + 120_000);
+    const claimed = fixture("peer-malformed-participant-claim", "C", NOW - 1_000, NOW + 120_000);
+    const unrelated = fixture("peer-malformed-participant-unrelated", "U", NOW - 1_000, NOW + 120_000);
+    const malformed = fixture("peer-malformed-participant", "M", NOW - 1_000, NOW + 120_000);
+    const malformedParticipant = { ...malformed.participant, rootId: claimed.host.rootId,
+      ownerHostId: claimed.host.id, ownerIdentityId: claimed.host.id, sessionId: claimed.host.rootId,
+      rootIds: [claimed.host.rootId], updatedAt: null } as unknown as FabricParticipantRecord;
+    await installNative(f.hub, target);
+    await installNative(f.work, claimed);
+    await installNative(f.work, unrelated);
+    await f.work.put({ key: participantKey(malformed.participant.id), identity: malformed.identity,
+      value: malformedParticipant });
+    const remotePresence = await f.remote.presence();
+    expect(remotePresence).toMatchObject({ partial: true });
+    expect(remotePresence.dropped?.some(drop => drop.identifiers?.includes(claimed.host.rootId))).toBe(true);
+
+    await f.bridge.start();
+    expect(f.hub.get(hostKey(claimed.host.id), { fresh: true })).toBeUndefined();
+    expect(f.hub.get(hostKey(unrelated.host.id), { fresh: true })).toBeDefined();
+    await f.work.publish({ topic: "fleet.work.peer-participant-malformed", kind: "ask", from: claimed.identity,
+      to: target.host.id, text: "must remain held" });
+    await f.work.publish({ topic: "fleet.work.peer-participant-unrelated", kind: "ask", from: unrelated.identity,
+      to: target.host.id, text: "unrelated root progresses" });
+    await expect(f.bridge.step()).resolves.toMatchObject({ toLocal: 1 });
+    const delivered = f.hub.read({ after: 0 }).map(event => event.topic);
+    expect(delivered).toContain("fleet.work.peer-participant-unrelated");
+    expect(delivered).not.toContain("fleet.work.peer-participant-malformed");
+  });
+
   it("CLI error before bridge construction leaves an existing mirror for its lease TTL", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(NOW);

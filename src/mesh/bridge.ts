@@ -207,6 +207,8 @@ export interface BridgeDroppedPresence {
   identityId?: string;
   ownerHostId?: string;
   ownerIdentityId?: string;
+  /** Every identifier named by a malformed row; retained across the presence RPC. */
+  identifiers?: string[];
 }
 
 export interface BridgePresence {
@@ -386,7 +388,26 @@ const participantOf = (key: string, value: unknown, trustedBridgeVia?: string): 
   return participant;
 };
 
-const droppedPresenceOf = (type: BridgeDroppedPresence["type"], value: unknown, protect = true): BridgeDroppedPresence | undefined => {
+const presenceIdentifiers = (value: unknown): string[] => {
+  if (!isObject(value)) return [];
+  const ids = new Set<string>();
+  const add = (candidate: unknown): void => { if (typeof candidate === "string" && candidate.length > 0) ids.add(candidate); };
+  for (const field of ["id", "hostId", "rootId", "identityId", "ownerHostId", "ownerIdentityId", "sessionId"] as const) {
+    add(value[field]);
+  }
+  if (isObject(value.identity)) { add(value.identity.id); add(value.identity.sessionId); }
+  for (const field of ["rootIds", "roots"] as const) {
+    if (!Array.isArray(value[field])) continue;
+    for (const root of value[field]) {
+      if (typeof root === "string") add(root);
+      else if (isObject(root)) { add(root.id); add(root.rootId); }
+    }
+  }
+  return [...ids];
+};
+
+const droppedPresenceOf = (type: BridgeDroppedPresence["type"], value: unknown, protect = true,
+  identifiers = presenceIdentifiers(value)): BridgeDroppedPresence | undefined => {
   if (!isObject(value)) return undefined;
   const identityId = typeof value.identityId === "string" ? value.identityId
     : isObject(value.identity) && typeof value.identity.id === "string" ? value.identity.id : undefined;
@@ -398,6 +419,7 @@ const droppedPresenceOf = (type: BridgeDroppedPresence["type"], value: unknown, 
     ...(identityId !== undefined ? { identityId } : {}),
     ...(typeof value.ownerHostId === "string" ? { ownerHostId: value.ownerHostId } : {}),
     ...(typeof value.ownerIdentityId === "string" ? { ownerIdentityId: value.ownerIdentityId } : {}),
+    ...(identifiers.length > 0 ? { identifiers } : {}),
   };
   return Object.keys(dropped).length > 1 ? dropped : undefined;
 };
@@ -406,7 +428,9 @@ const uniqueDroppedPresence = (values: readonly unknown[], preserveLocalProtecti
   const unique = new Map<string, BridgeDroppedPresence>();
   for (const value of values) {
     if (!isObject(value) || (value.type !== "host" && value.type !== "participant")) continue;
-    const dropped = droppedPresenceOf(value.type, value, !(preserveLocalProtection && value.protected === false));
+    const identifiers = Array.isArray(value.identifiers)
+      ? [...new Set(value.identifiers.filter((id): id is string => typeof id === "string" && id.length > 0))] : [];
+    const dropped = droppedPresenceOf(value.type, value, !(preserveLocalProtection && value.protected === false), identifiers);
     if (dropped) unique.set(JSON.stringify(dropped), dropped);
   }
   return [...unique.values()];
@@ -925,6 +949,7 @@ export class StoreBridgeSide implements BridgeSide {
     // Only a handoff in force to this link waives a (dead) native's own ids (smarty-dev#9074).
     const reserve = (value: unknown, id: string): void => { if (!handoffs.waived(value, id)) reserved.add(id); };
     const hosts: BridgeHost[] = [];
+    const dropped: BridgeDroppedPresence[] = [];
     let rawDroppedCount = 0;
     // Every id not mirrored by this link is reserved: natives, live or not, and other links'
     // mirrors (security review F1/F2). Only natives are this side's presence.
@@ -934,13 +959,23 @@ export class StoreBridgeSide implements BridgeSide {
       const host = presenceHostOf(entry.key, entry.value);
       if (!host) {
         if (mark === undefined) rawDroppedCount += 1;
-        if (isObject(entry.value) && typeof entry.value.id === "string") reserved.add(entry.value.id);
+        for (const id of presenceIdentifiers(entry.value)) reserved.add(id);
+        const attribution = droppedPresenceOf("host", entry.value);
+        if (mark === undefined && attribution) dropped.push(attribution);
         continue;
       }
-      for (const id of [host.id, host.identity.id, host.rootId]) reserve(entry.value, id);
+      const admissible = isAdmissibleRecord("host", host);
+      const attributed = entry.updatedBy.id === host.identity.id;
+      if (!admissible || !attributed) {
+        for (const id of presenceIdentifiers(entry.value)) reserved.add(id);
+        const attribution = droppedPresenceOf("host", entry.value);
+        if (mark === undefined && attribution) dropped.push(attribution);
+      } else {
+        for (const id of presenceIdentifiers(entry.value)) reserve(entry.value, id);
+      }
       if (mark !== undefined) continue;
-      if (entry.updatedBy.id !== host.identity.id) { rawDroppedCount += 1; continue; }
-      if (!isAdmissibleRecord("host", host)) {
+      if (!attributed) { rawDroppedCount += 1; continue; }
+      if (!admissible) {
         rawDroppedCount += 1;
         // Do not let effective file liveness normalize a bad native/bootstrap record into
         // renewable authority, or silently omit it and erase the peer's retained fence.
@@ -961,22 +996,30 @@ export class StoreBridgeSide implements BridgeSide {
       const participant = participantOf(entry.key, entry.value);
       if (!participant) {
         if (mark === undefined) rawDroppedCount += 1;
-        if (isObject(entry.value) && typeof entry.value.id === "string") reserved.add(entry.value.id);
+        for (const id of presenceIdentifiers(entry.value)) reserved.add(id);
+        const attribution = droppedPresenceOf("participant", entry.value);
+        if (mark === undefined && attribution) dropped.push(attribution);
         continue;
       }
-      for (const id of [participant.id, participant.ownerIdentityId, participant.rootId]) reserve(entry.value, id);
+      for (const id of presenceIdentifiers(entry.value)) reserve(entry.value, id);
       if (typeof participant.name === "string" && participant.name) reserve(entry.value, participant.name);
-      // Labels are minted per mesh and collide by design; they are never addresses across.
-      if (typeof participant.sessionId === "string" && participant.sessionId) reserve(entry.value, participant.sessionId);
       const owner = live.get(participant.ownerHostId);
-      if (
-        mark === undefined && participant.kind === "root" && owner && entry.updatedBy.id === participant.ownerIdentityId &&
-        owner.identity.id === participant.ownerIdentityId && owner.rootId === participant.rootId &&
-        (participants.get(participant.id)?.updatedAt ?? -Infinity) < entry.updatedAt
-      ) participants.set(participant.id, { record: participant, updatedAt: entry.updatedAt });
-      else if (mark === undefined && participant.kind === "root" && owner !== undefined) rawDroppedCount += 1;
+      const admissible = mark === undefined && participant.kind === "root" && owner !== undefined &&
+        entry.updatedBy.id === participant.ownerIdentityId && owner.identity.id === participant.ownerIdentityId &&
+        owner.rootId === participant.rootId;
+      if (admissible && (participants.get(participant.id)?.updatedAt ?? -Infinity) < entry.updatedAt) {
+        participants.set(participant.id, { record: participant, updatedAt: entry.updatedAt });
+      } else if (mark === undefined && participant.kind === "root" && owner !== undefined) {
+        rawDroppedCount += 1;
+        if (!admissible) {
+          for (const id of presenceIdentifiers(entry.value)) reserved.add(id);
+          const attribution = droppedPresenceOf("participant", entry.value);
+          if (attribution) dropped.push(attribution);
+        }
+      }
     }
     const admitted = admitPresence({ hosts, participants: [...participants.values()].map(({ record }) => record),
+      ...(dropped.length > 0 ? { dropped } : {}),
       ...(rawDroppedCount > 0 ? { partial: true, droppedCount: rawDroppedCount } : {}) }, new Set());
     return {
       // Export the same canonical root hosts we admit inbound, never sibling/task hosts.
@@ -1224,9 +1267,11 @@ export class StoreBridgeSide implements BridgeSide {
       for (const entry of entries) {
         if (mirrorLinkOf(entry.value) === this.peer || !isObject(entry.value)) continue;
         const value = entry.value;
-        const ids = ["id", "rootId", "ownerHostId", "ownerIdentityId", "sessionId", "name"].map((field) => value[field]);
-        if (isIdentity(value.identity)) ids.push(value.identity.id);
-        for (const id of ids) if (typeof id === "string" && id && !handoffs.waived(value, id)) reserved.add(id);
+        const malformed = entry.key.startsWith(HOST_PREFIX)
+          ? !hostOf(entry.key, value) || (isObject(value) && isObject(value.identity) && entry.updatedBy.id !== value.identity.id)
+          : !participantOf(entry.key, value) || (isObject(value) && typeof value.ownerIdentityId === "string" && entry.updatedBy.id !== value.ownerIdentityId);
+        const ids = [...presenceIdentifiers(value), ...(typeof value.name === "string" && value.name ? [value.name] : [])];
+        for (const id of ids) if (malformed || !handoffs.waived(value, id)) reserved.add(id);
       }
     }
     return reserved;
@@ -1433,6 +1478,9 @@ export class StoreBridgeSide implements BridgeSide {
         const participantEntries = view.listAll(PARTICIPANT_PREFIX);
         const scan = this.#scan(hostEntries, [...participantEntries, ...participantFiles.entries], view.listAll(BRIDGE_HANDOFF_PREFIX));
         const own = new Set(scan.presence.reserved);
+        for (const dropped of presence.dropped ?? []) {
+          for (const id of dropped.identifiers ?? []) if (typeof id === "string" && id.length > 0) own.add(id);
+        }
         const protectionRoots = new Set(collisionProtection(hostEntries, participantEntries, participantFiles, scan.leases));
         for (const root of protectionRoots) skippedRoots.add(root);
         // Classify whole root groups only after all claimed/current-owner/participant-owner roots
@@ -1483,7 +1531,7 @@ export class StoreBridgeSide implements BridgeSide {
           if (relayed && (!fromHub || record.bridgeVia !== this.peer || record.remoteHost === this.peer)) continue;
           // A preflight skip remains a skip after replay or a plan retry, even if authority moved.
           if (skippedRoots.has(record.rootId)) continue;
-          if (own.has(record.id) || own.has(record.identity.id) || own.has(record.rootId)) continue;
+          if (presenceIdentifiers(record).some(id => own.has(id))) continue;
           const prior = view.get(keyFor(HOST_PREFIX, record.id))?.value;
           if (isObject(prior) && typeof prior.rootId === "string" && prior.rootId !== record.rootId &&
             (preservedRoots.has(prior.rootId) || skippedRoots.has(prior.rootId))) {
@@ -1587,7 +1635,7 @@ export class StoreBridgeSide implements BridgeSide {
         for (const participant of presence.participants) {
           if (preservedRoots.has(participant.rootId) || skippedRoots.has(participant.rootId)) continue;
           const owner = hosts.get(participant.ownerHostId);
-          if (!owner || participant.kind !== "root" || own.has(participant.id)) continue;
+          if (!owner || participant.kind !== "root" || presenceIdentifiers(participant).some(id => own.has(id))) continue;
           if (remoteHostOf(participant) !== undefined && (!fromHub || participant.bridgeVia !== this.peer ||
               participant.remoteHost !== owner.remoteHost)) continue;
           if (owner.id !== participant.id || owner.identity.id !== participant.ownerIdentityId || owner.rootId !== participant.rootId) continue;
@@ -2463,54 +2511,113 @@ export const admitPresence = (
   const dropped = uniqueDroppedPresence(rawDropped);
   let droppedCount = Math.max(validDroppedCount(raw.droppedCount), relevantDroppedCount(rawDropped)) +
     (Array.isArray(raw.hosts) ? 0 : 1) + (Array.isArray(raw.participants) ? 0 : 1);
-  const hosts: BridgeHost[] = [];
-  for (const value of rawHosts) {
-    if (!isObject(value) || !isObject(value.record) || typeof value.record.id !== "string") {
-      droppedCount += 1;
-      continue;
+  const hostClaims = rawHosts.map((value) => {
+    const recordValue = isObject(value) && isObject(value.record) ? value.record : undefined;
+    const record = recordValue && typeof recordValue.id === "string"
+      ? presenceHostOf(keyFor(HOST_PREFIX, recordValue.id), recordValue, trustedBridgeVia) : undefined;
+    const expiresAt = isObject(value) && typeof value.expiresAt === "number" ? value.expiresAt : NaN;
+    const hasObservedAt = isObject(value) && Object.hasOwn(value, "observedAt");
+    const observedAt = isObject(value) && typeof value.observedAt === "number" ? value.observedAt : hasObservedAt ? NaN : undefined;
+    const relayed = record !== undefined && trustedRelayOf(record, trustedBridgeVia);
+    const structurallyMalformed = !record || !isAdmissibleRecord("host", record, trustedBridgeVia) || !Number.isFinite(expiresAt) ||
+      (observedAt !== undefined && !Number.isFinite(observedAt)) || (record !== undefined && record.identity.id !== record.id) ||
+      (record !== undefined && !relayed && record.bridgeVia !== undefined);
+    const malformed = structurallyMalformed || (record !== undefined &&
+      (record.rootId !== record.id || !CANONICAL_ID.test(record.id)));
+    const tainted = structurallyMalformed || (trustedBridgeVia !== undefined && record !== undefined &&
+      (record.rootId !== record.id || !CANONICAL_ID.test(record.id)));
+    return { value, recordValue, record, expiresAt, observedAt, malformed, tainted,
+      identifiers: presenceIdentifiers(recordValue ?? value) };
+  });
+  const participantClaims = rawParticipants.map((value) => {
+    const participant = isObject(value) && typeof value.id === "string"
+      ? participantOf(keyFor(PARTICIPANT_PREFIX, value.id), value, trustedBridgeVia) : undefined;
+    const relayed = participant !== undefined && trustedRelayOf(participant, trustedBridgeVia);
+    const canonical = participant !== undefined && participant.kind === "root" &&
+      (relayed || participant.bridgeVia === undefined) && participant.id === participant.ownerHostId &&
+      participant.id === participant.ownerIdentityId && participant.id === participant.rootId;
+    return { value, participant, canonical, tainted: !participant || (trustedBridgeVia !== undefined && !canonical),
+      identifiers: presenceIdentifiers(value) };
+  });
+  // Seed every malformed row's identifiers before admitting any sibling claim. Close over
+  // conflicting records so array order cannot let a later row claim an alias of a bad row.
+  const blockedIdentifiers = new Set<string>();
+  const block = (identifiers: readonly string[]): boolean => {
+    let changed = false;
+    for (const id of identifiers) if (!blockedIdentifiers.has(id)) { blockedIdentifiers.add(id); changed = true; }
+    return changed;
+  };
+  for (const value of rawDropped) {
+    if (isObject(value) && Array.isArray(value.identifiers)) {
+      block(value.identifiers.filter((id): id is string => typeof id === "string" && id.length > 0));
     }
-    const record = presenceHostOf(keyFor(HOST_PREFIX, value.record.id), value.record, trustedBridgeVia);
+  }
+  for (const claim of hostClaims) if (claim.tainted) block(claim.identifiers);
+  for (const claim of participantClaims) if (claim.tainted) block(claim.identifiers);
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const claim of hostClaims) {
+      if (!claim.malformed && claim.identifiers.some(id => reserved.has(id) || blockedIdentifiers.has(id))) {
+        changed = block(claim.identifiers) || changed;
+      }
+    }
+    const available = new Map(hostClaims.flatMap(claim => {
+      if (!claim.record || claim.malformed || claim.identifiers.some(id => reserved.has(id) || blockedIdentifiers.has(id))) return [];
+      return [[claim.record.id, claim.record] as const];
+    }));
+    for (const claim of participantClaims) {
+      const participant = claim.participant;
+      if (!participant) continue;
+      const owner = available.get(participant.ownerHostId);
+      const ownerMatches = owner !== undefined && owner.id === participant.id &&
+        owner.identity.id === participant.ownerIdentityId && owner.rootId === participant.rootId;
+      if (claim.tainted || (owner !== undefined && !ownerMatches) ||
+        claim.identifiers.some(id => reserved.has(id) || blockedIdentifiers.has(id))) {
+        changed = block(claim.identifiers) || changed;
+      }
+    }
+  }
+  const hosts: BridgeHost[] = [];
+  for (const claim of hostClaims) {
+    const { value, recordValue, record, expiresAt, observedAt, malformed, identifiers } = claim;
     if (!record) {
       droppedCount += 1;
-      const attribution = droppedPresenceOf("host", value.record);
+      const attribution = droppedPresenceOf("host", recordValue ?? value);
       if (attribution) dropped.push(attribution);
       continue;
     }
-    const expiresAt = typeof value.expiresAt === "number" ? value.expiresAt : NaN;
-    const hasObservedAt = Object.hasOwn(value, "observedAt");
-    const observedAt = typeof value.observedAt === "number" ? value.observedAt : hasObservedAt ? NaN : undefined;
-    const relayed = trustedRelayOf(record, trustedBridgeVia);
-    const malformed = !isAdmissibleRecord("host", record, trustedBridgeVia) || !Number.isFinite(expiresAt) ||
-      (observedAt !== undefined && !Number.isFinite(observedAt)) || record.identity.id !== record.id ||
-      record.rootId !== record.id || (!relayed && record.bridgeVia !== undefined) || !CANONICAL_ID.test(record.id);
-    const reservedConflict = [record.id, record.identity.id, record.rootId].some(id => reserved.has(id));
+    const reservedConflict = identifiers.some(id => reserved.has(id) || blockedIdentifiers.has(id));
     if (malformed || reservedConflict) {
       if (malformed) {
         droppedCount += 1;
-        const attribution = droppedPresenceOf("host", record, !reservedConflict);
+        const attribution = droppedPresenceOf("host", record, !reservedConflict, claim.tainted ? identifiers : []);
         if (attribution) dropped.push(attribution);
       }
     } else hosts.push({ record, expiresAt, ...(observedAt !== undefined ? { observedAt } : {}) });
   }
   const admitted = new Map(hosts.map(({ record }) => [record.id, record]));
   const participants: FabricParticipantRecord[] = [];
-  for (const value of rawParticipants) {
-    if (!isObject(value) || typeof value.id !== "string") { droppedCount += 1; continue; }
-    const participant = participantOf(keyFor(PARTICIPANT_PREFIX, value.id), value, trustedBridgeVia);
-    if (!participant) { droppedCount += 1; continue; }
+  for (const claim of participantClaims) {
+    const { value, participant, canonical, identifiers } = claim;
+    if (!participant) {
+      droppedCount += 1;
+      const attribution = droppedPresenceOf("participant", value);
+      if (attribution) dropped.push(attribution);
+      continue;
+    }
     const owner = admitted.get(participant.ownerHostId);
-    const relayed = trustedRelayOf(participant, trustedBridgeVia);
-    const canonicalParticipant = participant.kind === "root" && (relayed || participant.bridgeVia === undefined) &&
-      participant.id === participant.ownerHostId && participant.id === participant.ownerIdentityId && participant.id === participant.rootId;
     const ownerMatches = owner !== undefined && owner.id === participant.id &&
       owner.identity.id === participant.ownerIdentityId && owner.rootId === participant.rootId;
-    const reservedConflict = [participant.id, participant.rootId, participant.ownerIdentityId, participant.sessionId]
-      .some((id) => typeof id === "string" && reserved.has(id));
-    if (!canonicalParticipant || !ownerMatches || reservedConflict) {
-      const malformed = !canonicalParticipant || (owner !== undefined && !ownerMatches) || (!reservedConflict && owner === undefined);
+    const localReservedConflict = identifiers.some(id => reserved.has(id));
+    const reservedConflict = localReservedConflict || identifiers.some(id => blockedIdentifiers.has(id));
+    if (!canonical || !ownerMatches || reservedConflict) {
+      const malformed = !canonical || (owner !== undefined && !ownerMatches) || (!localReservedConflict && owner === undefined);
       if (malformed) {
         droppedCount += 1;
-        const attribution = droppedPresenceOf("participant", participant, !reservedConflict);
+        const tainted = claim.tainted || (owner !== undefined && !ownerMatches) ||
+          (canonical && owner === undefined && !localReservedConflict);
+        const attribution = droppedPresenceOf("participant", participant, !reservedConflict, tainted ? identifiers : []);
         if (attribution) dropped.push(attribution);
       }
     } else participants.push(participant);

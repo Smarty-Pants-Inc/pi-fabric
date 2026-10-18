@@ -1,7 +1,8 @@
 // Hosted-only: actual native actor-directory removal. The unmodified product
-// deletion guard excludes this entire suite locally. Never override that guard.
+// hosted-only predicate excludes this entire suite locally. Never override that guard.
 // Keep: #7991 data safety; a stopped status is not native child-settlement proof.
 import fs from "node:fs";
+import { hostedOnly } from "../scripts/hosted-only.mjs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -90,7 +91,7 @@ function fixture() {
   return { root, registryRoot, open, request, transitions, sources, setUnsettled: (value: boolean) => { unsettled = value; }, role: () => role };
 }
 
-describe.runIf(process.platform === "linux")("protected removal native projections (hosted only)", () => {
+describe.runIf(hostedOnly("actor slot native removal") && process.platform === "linux")("protected removal native projections (hosted only)", () => {
   it("retires only after durable registry removal and refuses exact-token rebirth", async () => {
     const f = fixture(), directory = f.open();
     const actor = await directory.create(f.request);

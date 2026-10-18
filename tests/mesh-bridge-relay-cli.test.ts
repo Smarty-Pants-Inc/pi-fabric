@@ -3,6 +3,7 @@
 // Never override this guard or preload deletion mocks into the cross-process CLI canary.
 // Allocate only this test's own short, private mkdtemp child; no provisioned CI path.
 import { spawn, type ChildProcess } from "node:child_process";
+import { hostedOnly } from "../scripts/hosted-only.mjs";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import net from "node:net";
@@ -15,7 +16,7 @@ import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { writeHostLease } from "../src/topology/host-leases.js";
 import { writeParticipantFile } from "../src/topology/participant-files.js";
 
-const HOSTED = process.env.GITHUB_ACTIONS === "true" && process.platform === "linux";
+const HOSTED = hostedOnly("mesh bridge relay CLI") && process.platform === "linux";
 const BIN = path.resolve("bin/mesh-bridge");
 const BUILT_CLI = path.resolve("dist/mesh-bridge.js");
 const PROCESS_DEADLINE_MS = 60_000;

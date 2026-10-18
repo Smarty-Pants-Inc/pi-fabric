@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { hostedOnly } from "../scripts/hosted-only.mjs";
 import { get as httpGet } from "node:http";
 import { createServer, type AddressInfo } from "node:net";
 import fs from "node:fs";
@@ -29,8 +30,9 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 // It is not init --local, the state adapter, a cluster, nor the remaining T1/T4/T5/T6/T14/T15/T16 plan.
 // No NATS server is started by the test unless NATS_BIN is explicitly supplied. CI requires its pinned 2.14.7 binary.
 
+const HOSTED = hostedOnly("NATS auth real server");
 const NATS_BIN = process.env.NATS_BIN?.trim() || undefined;
-if (process.env.NATS_AUTH_REQUIRED === "1" && (!NATS_BIN || !path.isAbsolute(NATS_BIN) || !fs.existsSync(NATS_BIN))) {
+if (HOSTED && process.env.NATS_AUTH_REQUIRED === "1" && (!NATS_BIN || !path.isAbsolute(NATS_BIN) || !fs.existsSync(NATS_BIN))) {
   throw new Error("NATS_AUTH_REQUIRED=1 but NATS_BIN is missing, non-absolute, or does not exist");
 }
 
@@ -618,7 +620,7 @@ async function cleanupFixture(): Promise<void> {
   }
 }
 
-describe("#7504 hosted T2/T8 NATS auth slice (pinned real server only)", () => {
+describe.runIf(HOSTED)("#7504 hosted T2/T8 NATS auth slice (pinned real server only)", () => {
   if (!NATS_BIN) {
     it.skip("nats auth skipped locally: set NATS_BIN to a real nats-server; NATS_AUTH_REQUIRED=1 makes absence fatal", () => undefined);
     return;

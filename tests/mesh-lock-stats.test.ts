@@ -9,6 +9,8 @@ import {
   type LockStatsBucket, type LockStatsFile,
 } from "../src/mesh/commit-stats.js";
 import { main } from "../src/mesh-lock-stats-cli.js";
+import { taskAgentEnvironment } from "../src/agents/task-environment.js";
+import { hostedAdmissionMarker } from "../scripts/hosted-only.mjs";
 
 const lockKey = Symbol.for("pi-fabric.mesh.lock-stats");
 const registry = globalThis as typeof globalThis & {
@@ -578,11 +580,12 @@ describe("mesh lock stats recorder", () => {
 
   it("keeps an exited child writer attributable from its file", () => {
     const root = temp();
-    const env = { ...process.env, PI_FABRIC_AGENT_NAME: "child-writer", PI_FABRIC_ACTOR_ID: "", PI_FABRIC_ACTOR_NAME: "",
-      PI_FABRIC_ROLE: "", SMARTY_ROLE: "task-agent" };
+    const env = taskAgentEnvironment({ ...process.env, PI_FABRIC_AGENT_NAME: "child-writer", PI_FABRIC_ACTOR_ID: "", PI_FABRIC_ACTOR_NAME: "",
+      PI_FABRIC_ROLE: "" });
     const child = spawnSync(process.execPath, [path.resolve("tests/fixtures/lock-stats-writer.mjs"),
       path.resolve("src/mesh/commit-stats.ts"), root], { env, encoding: "utf8", timeout: 30_000 });
-    expect(child.stderr).toBe("");
+    if (env[hostedAdmissionMarker] === "1") expect(child.stderr).toBe("");
+    else expect(child.stderr).toContain("hosted-only (outside-temp deletion reporting): push and let CI run it");
     expect(child.status).toBe(0);
     const file = JSON.parse(fs.readFileSync(path.join(root, "lock-stats", `${lockStatsHost()}-${child.pid}.json`), "utf8")) as LockStatsFile;
     expect(file.writer).toEqual({ argv1: "lock-stats-writer.mjs", agentName: "child-writer", smartyRole: "task-agent", ppid: process.pid });

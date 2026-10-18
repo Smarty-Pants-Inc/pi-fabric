@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { hostedOnly } from "../scripts/hosted-only.mjs";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -170,7 +171,7 @@ describe("actor-tree removal on unsupported platforms refuses (smarty-dev#8090, 
 
 // Linux runs locally; Darwin/Windows need a real CI host. No process.platform override in native tests.
 const nativeFencePlatform = process.platform === "linux" ||
-  (["darwin", "win32"].includes(process.platform) && (process.env.CI === "true" || process.env.GITHUB_ACTIONS === "true"));
+  (["darwin", "win32"].includes(process.platform) && hostedOnly("off-Linux native fence lifecycle"));
 const within = async <T>(result: Promise<T>, milliseconds: number, message: () => string): Promise<T> => {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {

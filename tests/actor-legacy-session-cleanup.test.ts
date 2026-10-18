@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { hostedOnly } from "../scripts/hosted-only.mjs";
 import fs from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -257,7 +258,7 @@ describe.skipIf(process.platform !== "linux")("legacy session actor cleanup mark
 
   // HOSTED ONLY. NEVER RUN LOCALLY (#4664: it performs a real actor-tree deletion). The parent selects only the
   // "recorded:" tests locally; this one runs only in hosted CI as the real-path red/green proof. No interception.
-  it("hosted real deletion: the real bin's exact-id operator remove deletes the legacy session tree and its marker", async () => {
+  it.runIf(hostedOnly("legacy session actor deletion"))("hosted real deletion: the real bin's exact-id operator remove deletes the legacy session tree and its marker", async () => {
     const f = await fixture();
     try {
       const s = seedLegacy(f);

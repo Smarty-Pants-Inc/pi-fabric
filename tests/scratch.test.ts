@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { hostedOnly } from "../scripts/hosted-only.mjs";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
@@ -32,7 +33,7 @@ afterEach(() => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
-describe("managed scratch retention", () => {
+describe.runIf(hostedOnly("managed scratch retention"))("managed scratch retention", () => {
   it.each(["replacement", "reactivation"])("rechecks a candidate after concurrent %s", async change => {
     const tempRoot = sandbox();
     const directory = fixture(tempRoot, "output", { closedAt: 1 });

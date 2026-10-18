@@ -144,6 +144,50 @@ linuxIt("lock queue: an unchanged dead receipt is removed with its judged stat (
   } finally { ticket.close(); }
 });
 
+// PR1412: plain tickets must reclaim through the real off-Linux fallback, while an opted-in canonical holder stays protected.
+it.each([
+  { kind: "dead", canonical: false },
+  { kind: "stale", canonical: false },
+  { kind: "dead", canonical: true },
+  { kind: "stale", canonical: true },
+])("off Linux lock queue: $kind predecessor with canonical guard=$canonical", ({ kind, canonical }) => {
+  dryRun = false;
+  const root = path.join(dir, "mesh-fallback");
+  fs.mkdirSync(root, { mode: 0o700 });
+  const lock = path.join(root, ".lock");
+  if (canonical) fs.mkdirSync(lock, { mode: 0o700 });
+  const queue = meshLockQueueDirectory(root);
+  fs.mkdirSync(queue, { recursive: true, mode: 0o700 });
+  const pid = kind === "dead" ? 999999999 : process.pid;
+  const receipt = path.join(queue, `${"1".padStart(24, "0")}-${pid}-${randomUUID()}`);
+  fs.writeFileSync(receipt, "", { mode: 0o600 });
+  if (kind === "stale") {
+    const stale = (Date.now() - 31_000) / 1000; // Older than the 30s stale bound for a 5s budget, despite a live pid.
+    fs.utimesSync(receipt, stale, stale);
+  }
+  const ino = fs.lstatSync(receipt).ino;
+  const ticket = new MeshLockTicket(root, randomUUID(), 5_000, canonical ? { stalledHeadBypassLock: lock } : {});
+  const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+  Object.defineProperty(process, "platform", { value: "darwin" });
+  try {
+    if (canonical) {
+      expect(ticket.mayContend()).toBe(false);
+      expect(fs.existsSync(receipt)).toBe(true);
+      expect(calls).toEqual([]);
+      expect(primitive.filter(call => call.target === receipt)).toEqual([]);
+      expect(moveAway(lock)).toBe(true);
+    }
+    expect(ticket.mayContend()).toBe(true);
+    expect(ticket.queued).toBe(true); // Promoted to FIFO head, not closed into the plain contest.
+    expect(fs.existsSync(receipt)).toBe(false);
+    expect(primitive.filter(call => call.target === receipt)).toEqual([{ op: "unlink", target: receipt }]);
+    expect(calls).toEqual([{ target: receipt, ino, removed: true }]);
+  } finally {
+    Object.defineProperty(process, "platform", platform);
+    ticket.close();
+  }
+});
+
 linuxIt("lock queue: a stalled canonical head is reaped through judged verifiedRemove", () => {
   vi.useFakeTimers({ toFake: ["Date"] });
   const root = path.join(dir, "mesh-stalled");

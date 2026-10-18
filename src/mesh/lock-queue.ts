@@ -166,7 +166,7 @@ export class MeshLockTicket {
       // waited on, never handed to a recursive removal. verifiedRemove's `.retention-graveyard-*` never matches TICKET.
       if (!stat.isFile()) return true;
       if (!verifiedRemove(file, stat, { deleter: "meshLockQueueReceipt", fallback: () => {
-        if (!this.#canonicalLockAbsent()) return false;
+        if (this.#bypassLock !== undefined && !this.#canonicalLockAbsent()) return false;
         fs.unlinkSync(file);
         return true;
       } }).removed) {
@@ -242,9 +242,10 @@ export class MeshLockTicket {
     return true;
   }
 
-  /** Only ENOENT proves the canonical fence is absent; every other result holds back cleanup. */
+  /** The canonical guard is optional; when configured, only ENOENT proves absence and every other result holds back cleanup. */
   #canonicalLockAbsent(): boolean {
-    try { fs.lstatSync(this.#bypassLock!); return false; }
+    if (this.#bypassLock === undefined) return true;
+    try { fs.lstatSync(this.#bypassLock); return false; }
     catch (error) { return (error as NodeJS.ErrnoException).code === "ENOENT"; }
   }
 

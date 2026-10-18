@@ -308,8 +308,8 @@ export class ProcessTransport implements AgentTransportAdapter {
     if (grant && (request.onPlacementRestart || hasRestartBinding)) {
       throw new Error("Remote placement restart bridge unavailable; refusing grant without restart coverage");
     }
-    if (grant && !placement) throw new Error("Placement grant requires a configured transport");
-    if (placement) {
+    if (grant && !placement && !request.placementGrant?.record) throw new Error("Placement grant requires a configured transport");
+    if (placement && !request.placementGrant?.record) {
       const preflightDeadline = Date.now() + Math.min(placement.commandTimeoutMs, 5_000);
       const capabilities = normalizeAgentCapabilityTokens(placement.capabilities, "agents.placement.capabilities")!;
       const unmet = (needs ?? []).filter(need => !capabilities.includes(need));
@@ -431,6 +431,12 @@ export class ProcessTransport implements AgentTransportAdapter {
     const prepared = isActorLaunch(workerArguments)
       ? { workerArguments, environment: baseEnvironment }
       : prepareTaskTemporaryDirectory(workerArguments, baseEnvironment, request.cwd);
+    if (request.placementGrant?.record) {
+      request.onWritePolicyDisposition?.("local");
+      const { launchNativePlacementWorker } = await import("./native-placement.js");
+      return launchNativePlacementWorker(request, selected.workerPath, prepared.workerArguments, request.cwd,
+        request.childEnvironment ? request.childEnvironment(prepared.environment) : prepared.environment);
+    }
     const processHandle = await spawnDetached(
       selected.workerPath,
       prepared.workerArguments,

@@ -7,7 +7,7 @@ import type { ModelRoutingConfig } from "./agents/model-route.js";
 import { parsePerCallRouting } from "./agents/per-call-config.js";
 import { normalizeAgentRouterConfig, type FabricAgentRouterConfig } from "./agents/router-config.js";
 export type { FabricAgentRouterConfig } from "./agents/router-config.js";
-import { normalizeAgentPlacement, normalizePlacementDeciderConfig, type AgentPlacementConfig, type FabricPlacementDeciderConfig } from "./agents/placement-config.js";
+import { nativePlacementPathAvailable, normalizeAgentPlacement, normalizePlacementDeciderConfig, type AgentPlacementConfig, type FabricPlacementDeciderConfig } from "./agents/placement-config.js";
 export type { FabricPlacementDeciderConfig } from "./agents/placement-config.js";
 import { normalizeWakeTextConfig, type FabricWakeTextConfig } from "./actors/wake-text.js";
 import type { LandlockSettings } from "./core/landlock.js";
@@ -1458,8 +1458,8 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
   const agents = objectValue(input.agents);
   const placement = normalizeAgentPlacement(agents.placement);
   const placementDecider = normalizePlacementDeciderConfig(agents.placementDecider);
-  if (placementDecider?.mode === "enforce") {
-    throw new Error("agents.placementDecider.mode=enforce is unavailable until the resident-host placement follow-up is installed");
+  if (placementDecider?.mode === "enforce" && !nativePlacementPathAvailable(placementDecider.contextCommand)) {
+    throw new Error("agents.placementDecider.mode=enforce is unavailable until the resident-host placement follow-up is installed (systemd-run and smarty-launch-context required)");
   }
   const claude = objectValue(agents.claude);
   const veda = objectValue(agents.veda);

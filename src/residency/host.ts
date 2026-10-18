@@ -254,6 +254,25 @@ const validateResidentHostConfig = (value: unknown, configPath: string): Residen
     throw new Error("Fabric resident host config is outside its residency root");
   }
   if (!config.mesh.enabled) throw new Error("Durable residency requires the Fabric mesh");
+  if (config.placement !== undefined) {
+    const placement = config.placement;
+    const safeId = (value: unknown): boolean => typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9_-]{0,95}$/u.test(value);
+    const ref = (value: unknown): boolean => typeof value === "string" && value.length > 0 && value.length <= 200 && !/[\u0000-\u001f\u007f]/u.test(value);
+    if (placement.role !== "resident-host" ||
+        (placement.nativeLaunchId !== undefined && !safeId(placement.nativeLaunchId)) ||
+        (placement.launchSpecId !== undefined && !ref(placement.launchSpecId)) ||
+        (placement.parentNativeLaunchId !== undefined && placement.parentNativeLaunchId !== null && !safeId(placement.parentNativeLaunchId)) ||
+        typeof placement.orgId !== "string" || !ref(placement.orgId) ||
+        typeof placement.workId !== "string" || !ref(placement.workId) || typeof placement.profile !== "string" || !ref(placement.profile) ||
+        typeof placement.sourcePin !== "string" || !ref(placement.sourcePin) || typeof placement.memoryProfile !== "string" || !ref(placement.memoryProfile) ||
+        !placement.origin || (placement.origin.class !== "live-human" && placement.origin.class !== "background-agent") ||
+        typeof placement.origin.originRef !== "string" || !placement.origin.originRef ||
+        (placement.recordRoot !== undefined && (typeof placement.recordRoot !== "string" || !path.isAbsolute(placement.recordRoot))) ||
+        (placement.generation !== undefined && (!Number.isSafeInteger(placement.generation) || placement.generation < 1)) ||
+        (placement.fenceToken !== undefined && (!Number.isSafeInteger(placement.fenceToken) || placement.fenceToken < 1))) {
+      throw new Error("Invalid Fabric resident host placement binding");
+    }
+  }
   return config as ResidentHostConfig;
 };
 

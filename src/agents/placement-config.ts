@@ -16,6 +16,19 @@ export interface FabricPlacementDeciderConfig {
 }
 export type PlacementDeciderConfig = FabricPlacementDeciderConfig;
 export const DEFAULT_PLACEMENT_DECIDER_MODE: PlacementDeciderMode = "off";
+
+/** Filesystem-only native gate for placement enforce. Native user units and the trusted
+ * caller resolver must both exist before a config can claim enforce semantics. */
+export const nativePlacementPathAvailable = (contextCommand: readonly string[] | undefined, systemdRun = "/usr/bin/systemd-run"): boolean => {
+  const executable = (file: string): boolean => {
+    try { const stat = fs.statSync(file); return stat.isFile() && (process.platform === "win32" || (stat.mode & 0o111) !== 0); }
+    catch { return false; }
+  };
+  const context = contextCommand?.[0];
+  return process.platform === "linux" && executable(systemdRun) && !!context &&
+    path.basename(context) === "smarty-launch-context" && executable(context);
+};
+
 const badPlacementDeciderField = (field: string): never => { throw new Error(`Invalid agents.placementDecider.${field}`); };
 
 /** Host-only argv validation in the already-eager config helper; the adapter itself stays lazy. */

@@ -18,7 +18,7 @@ export interface PlacementCallerRecord {
   native_launch_id: string;
   launch_spec_id: string;
   generation: number;
-  fence: { token: string; state: string };
+  fence: { token: number | string; state: string };
   host: string;
   unit: string;
   boot_id: string;
@@ -26,7 +26,7 @@ export interface PlacementCallerRecord {
   main_pid_start: string;
   org_id: string;
   work_id: string;
-  parent_native_launch_id?: string;
+  parent_native_launch_id?: string | null;
   role: string;
   profile: string;
   source_pin: string;
@@ -64,17 +64,18 @@ const recordFrom = (value: unknown): PlacementCallerRecord | undefined => {
     !/[\u0000-\u001f\u007f]/u.test(field);
   if (!text(row.native_launch_id) || !text(row.launch_spec_id) || !Number.isSafeInteger(row.generation) || (row.generation as number) < 1 ||
       !text(row.host) || !text(row.unit) || !text(row.boot_id) || !text(row.invocation_id) || !text(row.main_pid_start) ||
-      !text(row.org_id) || !text(row.work_id) || (row.parent_native_launch_id !== undefined && !text(row.parent_native_launch_id)) ||
+      !text(row.org_id) || !text(row.work_id) || (row.parent_native_launch_id !== undefined && row.parent_native_launch_id !== null && !text(row.parent_native_launch_id)) ||
       !text(row.role) || !text(row.profile) || !text(row.source_pin) || !text(row.memory_profile)) return undefined;
   if (!row.fence || typeof row.fence !== "object" || Array.isArray(row.fence) || Object.getPrototypeOf(row.fence) !== null) return undefined;
   const fence = row.fence as Record<string, unknown>;
-  if (Object.keys(fence).some(key => key !== "token" && key !== "state") || !text(fence.token) || !text(fence.state)) return undefined;
+  if (Object.keys(fence).some(key => key !== "token" && key !== "state") ||
+      !(typeof fence.token === "number" && Number.isSafeInteger(fence.token) && fence.token >= 1 || text(fence.token)) || !text(fence.state)) return undefined;
   if (!row.origin || typeof row.origin !== "object" || Array.isArray(row.origin) || Object.getPrototypeOf(row.origin) !== null) return undefined;
   const origin = row.origin as Record<string, unknown>;
   if (Object.keys(origin).some(key => key !== "class" && key !== "origin_ref") ||
       (origin.class !== "live-human" && origin.class !== "background-agent") || !text(origin.origin_ref)) return undefined;
   // A process with terminal launch evidence cannot be the live caller for a new child.
-  if (row.terminal !== undefined) return undefined;
+  if (row.terminal !== undefined && row.terminal !== null) return undefined;
   return value as PlacementCallerRecord;
 };
 

@@ -184,7 +184,8 @@ export const runBridge = async (
   let code = 0;
   try {
     onChild?.(child.pid);
-    remote = new RemoteBridgeSide(child.stdout, child.stdin, callTimeoutMs);
+    remote = new RemoteBridgeSide(child.stdout, child.stdin, callTimeoutMs,
+      (message) => log(`${localName} -> ${remoteName}: ${message}`));
     if (spawnError) remote.close(spawnError);
     const linked = remote;
     bridge = new MeshBridge({

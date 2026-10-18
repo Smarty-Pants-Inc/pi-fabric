@@ -57,7 +57,7 @@ export const agentParticipantRecords = (
       capabilities: [
         ...(active && (runner?.steer ?? true) ? (["steer"] as const) : []),
         ...(active && (runner?.followUp ?? true) ? (["followUp"] as const) : []),
-        ...(active ? (["stop"] as const) : []),
+        ...(active || record.status === "finishing" ? (["stop"] as const) : []),
         ...(record.attachCommand ? (["attach"] as const) : []),
         ...(record.recursive ? (["fabric"] as const) : []),
       ],

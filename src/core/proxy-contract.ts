@@ -1,3 +1,4 @@
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { PI_CORE_TOOL_NAME_SET } from "./pi-tools.js";
 
 export const PROXY_CONTRACT_CUSTOM_TYPE = "pi-fabric-proxy";
@@ -29,7 +30,9 @@ export const rewritableHiddenCapturedToolNames = (
 const mentionPattern = (name: string): RegExp =>
   new RegExp(`(?<![\\w.])${escapeRegex(name)}(?![\\w])`);
 
-export const extractSkillRegions = (text: string): string => {
+export const extractSkillRegions = (text: unknown): string => {
+  if (typeof text !== "string") return "";
+
   const regions: string[] = [];
   for (const match of text.matchAll(SKILL_REGION)) {
     const region = match[0];
@@ -44,8 +47,8 @@ export const capturedToolMentions = (
 ): string[] => names.filter((name) => mentionPattern(name).test(text));
 
 export const proxyContractMentionsInSkills = (
-  prompt: string,
-  systemPrompt: string,
+  prompt: unknown,
+  systemPrompt: unknown,
   names: readonly string[],
 ): string[] => {
   const envelope = `${extractSkillRegions(prompt)}\n${extractSkillRegions(systemPrompt)}`;
@@ -92,10 +95,36 @@ export class ProxyContractLedger {
   restoreFromEntries(entries: readonly unknown[]): void {
     this.#reminded.clear();
     for (const entryUnknown of entries) {
-      if (typeof entryUnknown !== "object" || entryUnknown === null) continue;
-      for (const name of namesFromEntry(entryUnknown as Parameters<typeof namesFromEntry>[0])) {
-        this.#reminded.add(name);
-      }
+      this.#rememberEntry(entryUnknown);
+    }
+  }
+
+  /**
+   * Restore from the active branch without materializing a copied branch array. Pi documents
+   * branch-local restore in `docs/extensions.md#persist-state`; the `ReadonlySessionManager` API
+   * referenced by `docs/sdk.md#sessionmanager-api` exposes `getLeafEntry()` and `getEntry()`, so
+   * walk the documented `parentId` chain (`docs/session-format.md#tree-structure`) and retain only
+   * ledger names instead of copying every historical entry with `getBranch()` on each refresh.
+   */
+  restoreFromSessionManager(
+    sessionManager?: Pick<ExtensionContext["sessionManager"], "getLeafEntry" | "getEntry">,
+  ): void {
+    this.#reminded.clear();
+    if (!sessionManager || typeof sessionManager.getLeafEntry !== "function" || typeof sessionManager.getEntry !== "function") return;
+    const visited = new Set<string>();
+    let entry = sessionManager.getLeafEntry();
+    while (entry && !visited.has(entry.id)) {
+      visited.add(entry.id);
+      this.#rememberEntry(entry);
+      const parentId = entry.parentId;
+      entry = parentId ? sessionManager.getEntry(parentId) : undefined;
+    }
+  }
+
+  #rememberEntry(entryUnknown: unknown): void {
+    if (typeof entryUnknown !== "object" || entryUnknown === null) return;
+    for (const name of namesFromEntry(entryUnknown as Parameters<typeof namesFromEntry>[0])) {
+      this.#reminded.add(name);
     }
   }
 

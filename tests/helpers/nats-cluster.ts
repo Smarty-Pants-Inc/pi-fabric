@@ -16,6 +16,7 @@ import { connect, credsAuthenticator, nkeys, type NatsConnection } from "@nats-i
 import { encodeAccountJwt, encodeOperatorJwt, encodeUserJwt, formatUserCreds, type ScopedSigningKey } from "../../src/mesh/nats-auth/jwt.js";
 import { PATH_B_OPERATOR_MACHINE, roleTemplateWithPathB, type RoleTemplate } from "../../src/mesh/nats-auth/permissions.js";
 import { renderNatsServerConfig } from "../../src/mesh/nats-auth/server-config.js";
+import { startTime } from "./owned-processes.js";
 
 export const PATH_B_MACHINES = ["machine-a", "machine-b"] as const;
 export type PathBMachine = (typeof PATH_B_MACHINES)[number];
@@ -220,19 +221,42 @@ function httpJson(url: string): Promise<{ status: number; value?: Record<string,
   });
 }
 
-async function childExited(child: ChildProcess, timeoutMs: number): Promise<boolean> {
-  if (child.exitCode !== null || child.signalCode !== null) return true;
-  return Promise.race([
-    new Promise<boolean>((resolve) => child.once("exit", () => resolve(true))),
-    sleep(timeoutMs).then(() => false),
-  ]);
+/** Deadlines observe rejection immediately and never leave their timer behind.
+ * A timeout is a failure, not cancellation: callers still owe native cleanup in finally.
+ */
+export async function teardownWithin<T>(label: string, operation: () => Promise<T>, timeoutMs = 1_000): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([Promise.resolve().then(operation), new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
+    })]);
+  } finally { clearTimeout(timer); }
 }
 
+async function childExited(child: ChildProcess, timeoutMs: number): Promise<boolean> {
+  if (!child.pid || child.exitCode !== null || child.signalCode !== null) return true;
+  return new Promise(resolve => {
+    const finish = (exited: boolean) => { clearTimeout(timer); child.off("exit", exitedListener); resolve(exited); };
+    const exitedListener = () => finish(true);
+    const timer = setTimeout(() => finish(false), timeoutMs);
+    child.once("exit", exitedListener);
+    if (child.exitCode !== null || child.signalCode !== null) finish(true);
+  });
+}
+
+const childBirths = new WeakMap<ChildProcess, string>();
 async function stopChild(child: ChildProcess): Promise<void> {
-  if (child.exitCode !== null || child.signalCode !== null) return;
-  child.kill("SIGTERM");
+  if (!child.pid || child.exitCode !== null || child.signalCode !== null) return;
+  const signal = (value: NodeJS.Signals) => {
+    if (child.exitCode !== null || child.signalCode !== null) return;
+    if (process.platform === "linux" && (!childBirths.get(child) || startTime(child.pid!) !== childBirths.get(child))) {
+      throw new Error("owned nats-server birth is unconfirmed; refusing signal");
+    }
+    child.kill(value); // Direct captured child only, never a host-wide/group/name kill.
+  };
+  signal("SIGTERM");
   if (await childExited(child, 2_000)) return;
-  child.kill("SIGKILL");
+  signal("SIGKILL");
   if (!(await childExited(child, 2_000))) throw new Error("owned nats-server child did not stop");
 }
 
@@ -436,6 +460,7 @@ export class PathBHarness {
       env: { PATH: process.env.PATH ?? "", HOME: this.root, TMPDIR: this.root, LANG: "C" },
       stdio: ["ignore", "ignore", "ignore"],
     });
+    if (process.platform === "linux" && this.child.pid) childBirths.set(this.child, startTime(this.child.pid));
     let spawnFailed = false;
     this.child.once("error", () => { spawnFailed = true; });
     const deadline = Date.now() + START_TIMEOUT_MS;
@@ -457,10 +482,15 @@ export class PathBHarness {
     throw new Error("nats-server did not become JetStream-ready");
   }
 
+  /** Captured native child handle for teardown exit evidence (not just logical idle). */
+  get serverProcess(): ChildProcess | undefined { return this.child; }
+
   async restart(): Promise<void> {
-    await this.closeConnections();
-    if (this.child) await stopChild(this.child);
-    this.child = undefined;
+    try { await this.closeConnections(); }
+    finally {
+      if (this.child) await stopChild(this.child);
+      this.child = undefined;
+    }
     await this.start();
   }
 
@@ -507,20 +537,30 @@ export class PathBHarness {
       return publicShape(response.json<unknown>());
     } finally {
       this.connections.delete(nc);
-      await nc.close();
+      await teardownWithin("NATS user-info connection close", () => nc.close());
     }
   }
 
   async closeConnections(): Promise<void> {
-    await Promise.allSettled([...this.connections].map((nc) => nc.close()));
+    const connections = [...this.connections];
     this.connections.clear();
+    const results = await Promise.allSettled(connections.map(nc => teardownWithin("NATS connection close", () => nc.close())));
+    const failures = results.flatMap(result => result.status === "rejected" ? [result.reason] : []);
+    if (failures.length) throw new AggregateError(failures, failures.map(String).join("; "));
   }
 
   async stop(): Promise<void> {
-    await this.closeConnections();
-    if (this.child) await stopChild(this.child);
-    this.child = undefined;
-    fs.rmSync(this.root, { recursive: true, force: true });
+    const failures: unknown[] = [];
+    try { await this.closeConnections(); } catch (error) { failures.push(error); }
+    finally {
+      try { if (this.child) await stopChild(this.child); } catch (error) { failures.push(error); }
+      finally {
+        if (!this.child || this.child.exitCode !== null || this.child.signalCode !== null) this.child = undefined;
+        // Even a failed native/connection join cannot bypass private-root cleanup.
+        try { fs.rmSync(this.root, { recursive: true, force: true }); } catch (error) { failures.push(error); }
+      }
+    }
+    if (failures.length) throw new AggregateError(failures, failures.map(String).join("; "));
   }
 
 }

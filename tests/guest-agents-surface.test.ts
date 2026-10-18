@@ -191,6 +191,22 @@ describe("guest agents surface", () => {
       .toEqual([expect.objectContaining({ message: expect.stringContaining("not assignable to type 'string'") })]);
   });
 
+  // F-001: preserve the served guest/host compatibility boundary, not a text snapshot.
+  it.each([false, true])("types same-key Main payloads and optional legacy replacement receipts (fullCodeMode=%s)", fullCodeMode => {
+    const calls = ["followUp", "tell", "steer"].flatMap(method => [1, 2].map(revision =>
+      `await agents.${method}({ id: "session:main", message: "original ${revision}", data: { ...data, revision: ${revision} } })`));
+    const code = `const data: FabricMessageData = { coalesceKey: "status" };
+      const receipts = [${calls.join(",\n")}];
+      return receipts.map(receipt => {
+        const omitted: Pick<typeof receipt, "coalesced" | "replacedMessageId"> = {};
+        const legacy: Pick<typeof receipt, "coalesced" | "replacedMessageId"> = { coalesced: true, replacedMessageId: "legacy-message" };
+        const coalesced: true | undefined = receipt.coalesced;
+        const replacedMessageId: string | undefined = receipt.replacedMessageId;
+        return { omitted, legacy, coalesced, replacedMessageId };
+      });`;
+    expect(typeCheckFabricCode(code, guestTypeDeclarations(fullCodeMode), true).errors).toEqual([]);
+  });
+
   it.each([false, true])("types literal public message retry keys (fullCodeMode=%s)", fullCodeMode => {
     const code = `if (false) {
       await agents.followUp({ id: "session:peer", message: "unchanged", idempotencyKey: "follow-up-key" });
@@ -244,17 +260,20 @@ describe("guest agents surface", () => {
     expect(result.value).toEqual({ batchWindowMs: 300000, batchMax: 50, batchMaxBytes: 262144 });
   });
   it.each([false, true])("types per-filter telemetry and expiry (fullCodeMode=%s)", fullCodeMode => {
-    const code = `await agents.setActivationFilter({ id: "reviewer", activationFilter: ["hold"], expiresAt: Date.now() + 60000 });
+    const code = `await agents.setActivationFilter({ id: "reviewer", activationFilter: ["hold"], expiresAt: Date.now() + 60000, deadLetterReplayMaxAgeMs: 0 });
       const actor = await agents.actorStatus({ id: "reviewer" });
       const count: number = actor.filterSkipped.count;
       const key: string | null = actor.filterSkipped.lastKey;
       const topic: string | null = actor.filterSkipped.lastTopic;
       const at: number | null = actor.filterSkipped.lastAt;
       const expiry: number | undefined = actor.activationFilterExpiresAt;
-      return { count, key, topic, at, expiry };`;
+      const maxAgeMs: number | undefined = actor.deadLetterReplayMaxAgeMs;
+      await agents.create({ name: "backlog", instructions: "Supervise", deadLetterReplayMaxAgeMs: 0 });
+      return { count, key, topic, at, expiry, maxAgeMs };`;
     expect(typeCheckFabricCode(code, guestTypeDeclarations(fullCodeMode), true).errors).toEqual([]);
     const descriptor = AGENTS_ACTION_DESCRIPTORS.find(d => d.name === "setActivationFilter")!;
     expect(descriptor.inputSchema.properties).toHaveProperty("expiresAt");
+    expect(descriptor.inputSchema.properties).toHaveProperty("deadLetterReplayMaxAgeMs");
   });
   it.each(["spawn", "run", "wait", "join"])("types the optional observed Fabric release on agents.%s", method => {
     const args = method === "spawn" || method === "run" ? '{ task: "work" }' : '{ id: "child" }';

@@ -315,8 +315,10 @@ describe.each([120_000, 0])("Main non-retryable provider recovery (flushMs=%s, s
     expect(h.compactions).toHaveLength(1);
     const operation = new AbortController();
     h.emit("session_before_compact", { reason: "manual", signal: operation.signal });
-    operation.abort();                                  // Escape: a plain abort, not the deadline
+    h.main.halt(); // Explicit owner stop, not inferred from the SDK controller.
+    operation.abort();
     h.emit("session_compact_failed", { reason: "manual", aborted: true, willRetry: false });
+    h.compactions[0]!.onError?.(new Error("native cancellation"));
     expect(h.alarms).toHaveLength(0);
     expect(h.main.providerDeadState?.phase).toBe("compacting");
     // Halted: a peer message neither triggers nor gets a provider-dead receipt.
@@ -327,6 +329,43 @@ describe.each([120_000, 0])("Main non-retryable provider recovery (flushMs=%s, s
     expect(h.sent.every(entry => entry.options.triggerTurn === false)).toBe(true);   // passive context only
     expect(h.compactions).toHaveLength(1);
     expect(h.alarms).toHaveLength(0);
+    h.main.closeFollowUpDrain();
+  });
+
+  it("does not count a generic run-signal cancellation as a new provider failure", () => {
+    const h = setup(flushMs, undefined, undefined, { idle: true, aborted: true });
+    h.emit("session_compact_failed", { reason: "manual", aborted: false, willRetry: false, errorMessage: "canceled run" });
+    expect(h.alarms).toHaveLength(0);
+    expect(h.sent).toHaveLength(0);
+    (h.ctx.signal as { aborted: boolean }).aborted = false; // Fresh boundary, no owner input.
+    const peer = h.main.deliverAgent({ from: from("peer"), message: "fresh after transient cancellation", delivery: "followUp" });
+    expect(peer).toMatchObject({ triggered: true });
+    expect(peer.reason).toBeUndefined();
+    h.main.closeFollowUpDrain();
+  });
+
+  it("does not turn a generic recovery-compaction cancellation into durable owner authority", () => {
+    const h = setup(flushMs);
+    h.emit("turn_end", errorTurn(affinity));
+    h.settleError();
+    vi.advanceTimersByTime(0);
+    const operation = new AbortController();
+    h.emit("session_before_compact", { reason: "manual", signal: operation.signal });
+    operation.abort();
+    h.emit("session_compact_failed", { reason: "manual", aborted: true, willRetry: false });
+    h.compactions[0]!.onError?.(new Error("native cancellation"));
+    expect(h.alarms).toEqual([expect.objectContaining({ cause: "compaction-failed" })]);
+    expect(h.main.providerDeadState).toMatchObject({ phase: "alarmed", alarmed: true });
+    const peer = h.main.deliverAgent({ from: from("peer"), message: "defined provider hold, not operator halt", delivery: "followUp" });
+    expect(peer.halted).toBeUndefined();
+    expect(peer.reason).toMatch(/^provider-dead/);
+    // Cancellation itself never wakes Main. A later successful compact can recover
+    // without user input; unlike explicit halt, SDK cancellation grants no authority.
+    expect(h.sent).toHaveLength(0);
+    h.compactOk();
+    vi.advanceTimersByTime(25);
+    expect(h.sent).toHaveLength(1);
+    expect(h.sent[0]!.options.triggerTurn).toBe(true);
     h.main.closeFollowUpDrain();
   });
 

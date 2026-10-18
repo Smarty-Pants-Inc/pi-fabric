@@ -18,9 +18,11 @@ const referencesSkill = (line: string, skillName: string): boolean => {
 };
 
 export const buildSkillReferenceGuidance = (
-  prompt: string,
+  prompt: unknown,
   skills: readonly SkillReference[],
 ): string | undefined => {
+  if (typeof prompt !== "string") return undefined;
+
   const active = skills.find((skill) =>
     prompt.startsWith(`<skill name="${skill.name}" location="${skill.filePath}">`),
   );

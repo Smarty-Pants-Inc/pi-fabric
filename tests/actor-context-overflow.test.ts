@@ -113,6 +113,8 @@ describe("actor context overflow (smarty-dev#3238, offline Pi child)", () => {
     expect(resets(s.actors, actor.id)).toEqual([expect.objectContaining({ trigger: "context", overflow: true })]);
     expect(s.actors.status(actor.id).activationBlocked).toBeUndefined();
     expect(s.overflowEvents()).toEqual([]);
+    expect(s.actors.messages(actor.id, 50).some((message) =>
+      (message.data as { contextOverflow?: { code?: string } } | undefined)?.contextOverflow?.code === "context-overflow-item")).toBe(false);
     expect(s.ownerAlarms()).toEqual([]);
     expect(s.alarms).toEqual([]);
   }, TEST_GUARD_MS);
@@ -122,8 +124,11 @@ describe("actor context overflow (smarty-dev#3238, offline Pi child)", () => {
     const actor = await s.create("preflight-stubborn", { inferenceContext: "activation", responseMode });
     await s.actors.ask(actor.id, "FIRST_REVIEW");
     const outcome = s.actors.ask(actor.id, "PREFLIGHT_ALWAYS", { pr: 10049 });
-    if (responseMode === "text") await expect(outcome).rejects.toThrow(/Fabric activation window failed: Context exceeds window/);
-    else await expect(outcome).resolves.toMatchObject({ action: "silent", error: expect.stringContaining("Context exceeds window") });
+    if (responseMode === "text") {
+      const refusal = await outcome.catch(error => error);
+      expect(refusal).toMatchObject({ code: "CONTEXT_OVERFLOW", message: expect.stringMatching(/Fabric activation window failed: Context exceeds window/),
+        data: { code: "context-overflow-item", errorCode: "CONTEXT_OVERFLOW" } });
+    } else await expect(outcome).resolves.toMatchObject({ action: "silent", error: expect.stringContaining("Context exceeds window") });
     await waitFor(() => s.actors.inFlightCount() === 0);
     expect(s.prompts().map(({ history, marker }) => ({ history, marker }))).toEqual([
       { history: false, marker: "FIRST_REVIEW" }, { history: true, marker: "PREFLIGHT_ALWAYS" },
@@ -136,6 +141,7 @@ describe("actor context overflow (smarty-dev#3238, offline Pi child)", () => {
     expect(s.ownerAlarms()).toHaveLength(1);
     expect(s.overflowEvents()).toHaveLength(1);
     expect(s.alarms).toHaveLength(1);
+    expect(s.alarms[0]).toMatchObject({ message: { data: expect.objectContaining({ code: "context-overflow-item", errorCode: "CONTEXT_OVERFLOW" }) } });
     expect(s.alarms[0]!.message.text).toContain("retried once after resetting its session, but the fresh session still overflowed");
     expect(s.alarms[0]!.message.text).not.toContain("not retried");
   }, TEST_GUARD_MS);
@@ -263,7 +269,7 @@ describe("actor context overflow (smarty-dev#3238, offline Pi child)", () => {
       text: "security: no verdict (context overflow) for PR Smarty-Pants-Inc/smarty-dev#3238.",
       data: {
         actorId: actor.id, actorName: "security", reason: "no verdict (context overflow)",
-        error: "context-overflow",
+        code: "context-overflow-item", error: "context-overflow",
         eventRef: { source: "mesh:github.smarty-dev", topic: "github.smarty-dev", kind: "github.webhook",
           repository: "Smarty-Pants-Inc/smarty-dev", pr: 3238, ref: "https://github.com/Smarty-Pants-Inc/smarty-dev/pull/3238" },
       },
@@ -273,8 +279,9 @@ describe("actor context overflow (smarty-dev#3238, offline Pi child)", () => {
     await waitFor(() => s.actors.status(actor.id).activationBlocked === undefined && resets(s.actors, actor.id).length === 1);
     expect(header(actor.sessionFile!)).not.toBe(s.prompts()[0]!.session);
     // The existing owner alarm, and the failure is recorded on the actor, not as a silent drop.
-    expect(s.ownerAlarms()).toEqual([expect.objectContaining({ data: expect.objectContaining({ actorId: actor.id, reason: "context_window" }) })]);
+    expect(s.ownerAlarms()).toEqual([expect.objectContaining({ data: expect.objectContaining({ actorId: actor.id, reason: "context_window", code: "context-overflow-item" }) })]);
     expect(s.alarms).toHaveLength(1);
+    expect(s.alarms[0]).toMatchObject({ message: { data: expect.objectContaining({ code: "context-overflow-item", errorCode: "CONTEXT_OVERFLOW" }) } });
     const status = s.actors.status(actor.id);
     expect(status.status).not.toBe("stopped");
     expect(status.activationBlocked).toBeUndefined();
@@ -349,7 +356,9 @@ describe("actor context overflow (smarty-dev#3238, offline Pi child)", () => {
     const s = setup();
     const actor = await s.create("stubborn");
     await s.actors.ask(actor.id, "FIRST_REVIEW");
-    await expect(s.actors.ask(actor.id, "OVERFLOW_ALWAYS", { pr: 77 })).rejects.toThrow(/Context exceeds window/);
+    const refusal = await s.actors.ask(actor.id, "OVERFLOW_ALWAYS", { pr: 77 }).catch(error => error);
+    expect(refusal).toMatchObject({ code: "CONTEXT_OVERFLOW", message: expect.stringMatching(/Context exceeds window/),
+      data: { code: "context-overflow-item", errorCode: "CONTEXT_OVERFLOW" } });
     expect(s.prompts().map(({ history, overflow }) => ({ history, overflow }))).toEqual([
       { history: false, overflow: false }, { history: true, overflow: true }, { history: false, overflow: true },
     ]);

@@ -97,7 +97,7 @@ import { LifecycleBroker } from "./lifecycle/broker.js";
 import { extensionContextLive } from "./session-liveness.js";
 import type { FabricLifecycleEventType } from "./lifecycle/types.js";
 import { FabricControlPlane } from "./topology/control-plane.js";
-import { ParticipantDirectory } from "./topology/participant-directory.js";
+import { ParticipantDirectory, type FabricPeerListOptions } from "./topology/participant-directory.js";
 import type { FabricTransport } from "./transport/types.js";
 import { rootParticipantName, validName } from "./topology/participant-name.js";
 import { herdrNameLookup, herdrPaneId, readHerdrAgentName } from "./topology/herdr-name.js";
@@ -397,7 +397,7 @@ export class FabricRuntimeState {
     return this.#mainAgent.info(context);
   }
 
-  peerInfos(options: FabricParticipantListOptions = {}): FabricPeerInfo[] {
+  peerInfos(options: FabricPeerListOptions = {}): FabricPeerInfo[] {
     return this.#participants?.peers(undefined, options) ?? [];
   }
 
@@ -915,7 +915,7 @@ export class FabricRuntimeState {
       },
       (event) => { this.#alarmProviderDead(mainAgentId, event); },
       meshRoot,
-      role === "project-agent",
+      role === "project-agent" || role === "org-agent",
     );
     this.#mainAgent = mainAgent;
     // SMARTY_AGENT is the primary name (smarty-dev#11146). An unnamed interactive Main falls
@@ -1066,6 +1066,9 @@ export class FabricRuntimeState {
       if (!live.current()) throw new Error("Pi Fabric mesh activation lifecycle retired");
       let inboxActivation: string | undefined;
       if (meshConfig.enabled && mainAgent.local) {
+        // SQLite's first open initializes its store under the mesh fence. Open it before file
+        // custody, so resumeLineage's read below never tries to take that fence while custody is held.
+        if (mesh.stateBackend === "sqlite") mesh.stateBackendHandle.stateToken();
         // resumeLineage awaits a mesh write. Hold file custody across that await;
         // mesh.custody callbacks are synchronous and would release it too early.
         const releaseCustody = await acquireMeshCustodyLock(meshRoot);

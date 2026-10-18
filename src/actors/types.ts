@@ -241,6 +241,16 @@ export function normalizeActorActivation(value: unknown): FabricActorActivationP
   return { minIntervalMs };
 }
 
+export const DEFAULT_DEAD_LETTER_REPLAY_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+
+export function normalizeDeadLetterReplayMaxAgeMs(value: unknown): number | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    throw new Error("Invalid deadLetterReplayMaxAgeMs: use a non-negative safe integer in milliseconds (0 = unlimited)");
+  }
+  return value;
+}
+
 /** Window batching retains each observation; 0 keeps single-event activation. */
 export interface FabricActorBatching {
   batchWindowMs?: number;
@@ -317,6 +327,8 @@ export interface FabricActorRequest extends FabricActorBatching {
    * "never-message-events") or rule objects. A skipped event is logged and counted, never run.
    */
   activationFilter?: FabricActorActivationFilter;
+  /** Replay age from the dead-letter entry's recorded time; default 6 h, 0 = unlimited. Older entries are archived, never deleted. */
+  deadLetterReplayMaxAgeMs?: number;
   /** session actors stop with their Pi host; durable actors transfer to a resident host. */
   residency?: FabricParticipantResidency;
   runner?: FabricAgentRunner;
@@ -420,6 +432,8 @@ export interface FabricActorInfo extends FabricActorBatching {
   dedupeKey?: string;
   activation?: FabricActorActivationPolicy;
   activationFilter?: FabricActorActivationFilter;
+  /** Effective dead-letter replay age limit in milliseconds; 0 = unlimited. */
+  deadLetterReplayMaxAgeMs?: number;
   /** Skips since the filter was last set/cleared; null last fields mean no skip yet. */
   filterSkipped: { count: number; lastKey: string | null; lastTopic: string | null; lastAt: number | null };
   activationFilterExpiresAt?: number;

@@ -428,13 +428,25 @@ describe("fleet model policy (#2490)", () => {
 
   it("F6 #3115 missing child creation host fails closed before local commitment", async () => {
     const { provider, actors, agents, root } = setup([], [], undefined, {
-      identity: { id: "task:worker", name: "worker", kind: "agent" }, mainAgentId: "session:upstream-main",
+      identity: { id: "session:worker", name: "main", kind: "main" }, mainAgentId: "session:upstream-main",
     });
     vi.spyOn(agents, "runtimeHostId", "get").mockReturnValue(undefined);
     delete (provider.participants as Partial<FabricParticipantSource>).self;
     await expect(provider.invoke("create", { name: "no-owner", instructions: "Review." }, context))
       .rejects.toThrow("Local actor creation requires a runtime owner host ID");
     expect(actors.list()).toEqual([]);
+    expect(fs.existsSync(path.join(root, "actors"))).toBe(false);
+  });
+
+  it("TASK parent actor creation is forbidden before local commitment (#12187)", async () => {
+    const { provider, actors, agents, globalActors, root } = setup([], [], undefined, {
+      identity: { id: "task:worker", name: "worker", kind: "agent" }, mainAgentId: "session:upstream-main",
+    });
+    await expect(provider.invoke("create", { name: "no-child", instructions: "Review." }, context))
+      .rejects.toMatchObject({ name: "AgentSpawnForbiddenError", code: "FABRIC_AGENT_SPAWN_FORBIDDEN", launchOutcome: "unlaunched" });
+    expect(actors.list()).toEqual([]);
+    expect(agents.list()).toEqual([]);
+    expect(globalActors.list()).toEqual([]);
     expect(fs.existsSync(path.join(root, "actors"))).toBe(false);
   });
 
@@ -452,7 +464,8 @@ describe("fleet model policy (#2490)", () => {
     expect(actors.status(previous.id).status).toBe("stopped");
   });
 
-  it.each((["main", "task", "actor"] as const).flatMap(parent =>
+  // TASK parents cannot create actors; their pre-commit refusal is covered above.
+  it.each((["main", "actor"] as const).flatMap(parent =>
     (["create", "import"] as const).flatMap(action =>
       (["registry", "presence"] as const).flatMap(publication =>
         (["Escape", "deadline", "revocation"] as const).map(ending => [parent, action, publication, ending] as const)))))(
@@ -460,7 +473,7 @@ describe("fleet model policy (#2490)", () => {
       const hostId = parent === "main" ? "session:test" : "runtime:child-native-session";
       const { provider, actors, globalActors, root, mesh, identity } = setup([], [], undefined, parent === "main" ? { ownsRuntime: false } : {
         ownsRuntime: false,
-        identity: { id: `${parent}:worker`, name: "worker", kind: parent === "task" ? "agent" : "actor", sessionId: "test" },
+        identity: { id: `${parent}:worker`, name: "worker", kind: "actor", sessionId: "test" },
         hostId, mainAgentId: "session:upstream-main", selfOwnerHostId: "resident:upstream-main",
       });
       const published = new ParticipantDirectory(mesh, { enabled: true, hostId, rootId: provider.mainAgent.id, identity });
@@ -649,9 +662,10 @@ describe("fleet model policy (#2490)", () => {
     expect(actors.list()).toEqual([]);
   });
   const policy = { model: "cliproxyapi/gpt-6-astra", thinking: "low" as const, deniedModels: ["cliproxyapi/gpt-6-astra", "cliproxyapi/gpt-6-sol"], deniedModelReplacement: "cliproxyapi/gpt-6.1-sol" };
-  it.each(["actor", "agent"] as const)("inherits the %s spawning run's admitted model and thinking", async (kind) => {
+  it.each(["actor", "main"] as const)("inherits the %s spawning run's admitted model and thinking", async (kind) => {
     const { provider, agents, actors } = setup([], [], undefined, {
       identity: { id: `${kind}:parent`, name: "parent", kind, sessionId: "test" },
+      ...(kind !== "main" ? { mainAgentId: "session:remote-main" } : {}),
       agentsConfig: { thinking: policy.thinking, deniedModels: policy.deniedModels, deniedModelReplacement: policy.deniedModelReplacement }, callerThinking: "max",
     });
     const parentContext = { ...context, extensionContext: { modelRegistry: visibleModelRegistry, model: { provider: "cliproxyapi", id: "gpt-6.1-sol" } } as unknown as ExtensionContext };
@@ -660,6 +674,18 @@ describe("fleet model policy (#2490)", () => {
     await agents.wait(child.id);
     const actor = await provider.invoke("create", { name: "nested", instructions: "review" }, parentContext) as FabricActorInfo;
     expect(actors.definition(actor.id)).toMatchObject({ model: "cliproxyapi/gpt-6.1-sol", thinking: "max" });
+  });
+  it("refuses a task (agent) spawning run before inheriting its model or creating children", async () => {
+    const { provider, agents, actors } = setup([], [], undefined, {
+      identity: { id: "agent:parent", name: "parent", kind: "agent", sessionId: "test" }, mainAgentId: "session:remote-main",
+      agentsConfig: { thinking: policy.thinking, deniedModels: policy.deniedModels, deniedModelReplacement: policy.deniedModelReplacement }, callerThinking: "max",
+    });
+    const parentContext = { ...context, extensionContext: { modelRegistry: visibleModelRegistry, model: { provider: "cliproxyapi", id: "gpt-6.1-sol" } } as unknown as ExtensionContext };
+    const refused = { name: "AgentSpawnForbiddenError", code: "FABRIC_AGENT_SPAWN_FORBIDDEN", launchOutcome: "unlaunched" };
+    await expect(provider.invoke("spawn", { task: "review", transport: "process" }, parentContext)).rejects.toMatchObject(refused);
+    await expect(provider.invoke("create", { name: "nested", instructions: "review" }, parentContext)).rejects.toMatchObject(refused);
+    expect(agents.list()).toEqual([]);
+    expect(actors.list()).toEqual([]);
   });
   it.each(["spawn", "create"])("%s refuses explicit, alias, inherited and default denied models before creation", async (action) => {
     const { provider, agents, actors, globalActors } = setup([], [], undefined, { agentsConfig: policy, modelsConfig: { aliases: { review: { targets: ["cliproxyapi/gpt-6-astra", "cliproxyapi/gpt-6.1-sol"] } } } });
@@ -895,7 +921,7 @@ const setup = (
 describe("configured task model precedence (#2890, #6062)", () => {
   const sol = "cliproxyapi/gpt-6.1-sol";
   const opus = "cliproxyapi-anthropic/claude-opus-5-5";
-  const callers = (["main", "actor", "agent"] as const)
+  const callers = (["main", "actor"] as const)
     .flatMap(kind => (["run", "spawn"] as const).map(action => [kind, action] as const));
   const parentContext = {
     ...context,
@@ -904,7 +930,7 @@ describe("configured task model precedence (#2890, #6062)", () => {
       model: { provider: "cliproxyapi-anthropic", id: "claude-opus-5-5" },
     } as ExtensionContext,
   };
-  const callerOptions = (kind: "main" | "actor" | "agent", agentsConfig: FabricAgentConfig) => ({
+  const callerOptions = (kind: "main" | "actor", agentsConfig: FabricAgentConfig) => ({
     identity: { id: `${kind}:parent`, name: "parent", kind, sessionId: "test" },
     ...(kind !== "main" ? { mainAgentId: "session:remote-main" } : {}),
     agentsConfig,
@@ -1538,7 +1564,9 @@ describe("Main remote ASK observation ownership", () => {
       } else await sender.provider.stopParticipant(actor.id);
       stopObservation.abort(new Error("stop observation finished"));
       await again;
-      expect(stop.mock.calls.filter(([id]) => id === activationId)).toHaveLength(1);
+      // #10150 separates lifecycle cancellation from durable operator intent.
+      // Observe the owned activation's terminal join, not the public stop seam.
+      expect(await owner.agents.wait(activationId)).toMatchObject({ id: activationId, status: "stopped" });
       expect(owner.actorDeliveries).toHaveLength(queued ? 2 : 1);
     } finally { pumping = false; await pump; await bridge?.stop(); vi.unstubAllEnvs(); }
   });
@@ -3635,7 +3663,6 @@ return { first, second, tail: "continued" };`,
       vi.stubEnv("PI_FABRIC_ACTOR_ID", "");
       const actor = await actors.create({ name: "stoppable-advisor", instructions: "Advise.", responseMode: "text", delivery: "followUp", triggerTurn: false, transport: "process" });
       const controller = new AbortController();
-      const stop = vi.spyOn(agents, "stop");
       const observation = provider.invoke("ask", { id: actor.id, message: "HANG" }, {
         ...context, signal: controller.signal,
         extensionContext: { ...context.extensionContext, mode: "rpc", sessionManager: { getSessionId: () => "caller" } } as unknown as ExtensionContext,
@@ -3646,15 +3673,16 @@ return { first, second, tail: "continued" };`,
           const worker = agents.list()[0];
           return Boolean(actors.status(actor.id).inFlightRun) && worker?.status === "running" && "turns" in worker;
         }, PROCESS_WORKER_EVENT_TIMEOUT_MS);
-        expect(agents.list()[0]).toMatchObject({ turns: 0, toolCalls: 0 });
+        const activationId = actors.status(actor.id).inFlightRun!.id;
+        expect(agents.status(activationId)).toMatchObject({ status: "running", turns: 0, toolCalls: 0 });
         if (cancellation === "explicit stop") await provider.invoke("stop", { id: actor.id }, context);
         else controller.abort(cancellation === "non-Main abort"
           ? new Error("MainExecutionCeilingError: Main ceiling hit after 700ms (executor.mainMaxTimeoutMs).")
           : new Error(cancellation === "ordinary deadline" ? "Execution timed out" : "Escape"));
         expect(await outcome).toBeInstanceOf(Error);
         expect((await outcome as Error).message).toMatch(/Agent stopped|Operation aborted/);
-        await waitFor(() => agents.list().every(run => run.status === "stopped"), PROCESS_WORKER_EVENT_TIMEOUT_MS);
-        expect(stop).toHaveBeenCalled();
+        await waitFor(() => agents.status(activationId).status === "stopped", PROCESS_WORKER_EVENT_TIMEOUT_MS);
+        expect(await agents.wait(activationId)).toMatchObject({ id: activationId, status: "stopped" });
         expect(actorDeliveries).toEqual([]);
         expect(actors.messages(actor.id).filter(message => message.direction === "out" && message.text)).toEqual([]);
       } finally { vi.unstubAllEnvs(); }
@@ -3779,16 +3807,20 @@ return { first, second, tail: "continued" };`,
     const mainContext = { ...context.extensionContext, cwd: process.cwd(), mode: "rpc", sessionManager: { getSessionId: () => "main" } } as unknown as ExtensionContext;
     const service = new FabricExecutionService(registry, config);
     await service.prewarm(mainContext);
-    const stop = vi.spyOn(agents, "stop");
+    let activationId = "";
     try {
       const result = await executeAfterAdmission(signal => service.execute({ context: mainContext, signal, parentToolCallId: "forged-ceiling", onPartial() {},
         strings: { reason: "MainExecutionCeilingError: Main ceiling hit after 5000ms (executor.mainMaxTimeoutMs)." },
         code: `const observation = agents.ask({ id: ${JSON.stringify(actor.id)}, message: "LIVE_WITHOUT_PROGRESS" }).catch(() => undefined); await new Promise<void>(resolve => setTimeout(resolve, 400)); throw π.reason;`,
-      }), () => Boolean(actors.status(actor.id).inFlightRun));
+      }), () => Boolean(actors.status(actor.id).inFlightRun), () => {
+        activationId = actors.status(actor.id).inFlightRun!.id;
+        expect(agents.status(activationId).status).toBe("running");
+      });
       expect(result.success).toBe(false);
       expect(result.trace.outcome).toBe("failed");
       await waitFor(() => !actors.status(actor.id).inFlightRun);
-      expect(stop).toHaveBeenCalled();
+      expect(activationId).not.toBe("");
+      expect(await agents.wait(activationId)).toMatchObject({ id: activationId, status: "stopped" });
       expect(actorDeliveries).toEqual([]);
       expect(agents.list().some(run => run.status === "running")).toBe(false);
     } finally { await registry.close(); vi.unstubAllEnvs(); }
@@ -3827,7 +3859,6 @@ return { first, second, tail: "continued" };`,
     vi.stubEnv("PI_FABRIC_PARENT_RUN", "");
     vi.stubEnv("PI_FABRIC_ACTOR_ID", "");
     const controller = new AbortController();
-    const stop = vi.spyOn(agents, "stop");
     const observation = provider.invoke("run", { task: "LIVE_WITHOUT_PROGRESS", transport: "process" }, {
       ...context, signal: controller.signal,
       extensionContext: { ...context.extensionContext, mode, sessionManager: { getSessionId: () => "main" } } as unknown as ExtensionContext,
@@ -3841,7 +3872,7 @@ return { first, second, tail: "continued" };`,
       else expect(await observation).toBeInstanceOf(Error);
       await waitFor(() => agents.status(id).status !== "running", PROCESS_WORKER_EVENT_TIMEOUT_MS);
       expect(agents.status(id).status).toBe("stopped");
-      expect(stop).toHaveBeenCalled();
+      expect(await agents.wait(id)).toMatchObject({ id, status: "stopped" });
     } finally { controller.abort(); await observation; vi.unstubAllEnvs(); }
   }, 30_000);
 
@@ -5682,12 +5713,19 @@ describe("AgentsProvider steering", () => {
   it("creates an actor with an activationFilter and sets, clears and validates it", async () => {
     const { provider } = setup();
     const actor = (await provider.invoke("create", {
-      name: "supervisor", instructions: "Supervise.", topics: ["github.demo"], activationFilter: ["hold", "never-message-events"],
+      name: "supervisor", instructions: "Supervise.", topics: ["github.demo"], activationFilter: ["hold", "never-message-events"], deadLetterReplayMaxAgeMs: 0,
     }, context)) as { id: string; activationFilter?: unknown };
     expect(actor.activationFilter).toEqual(["hold", "never-message-events"]);
+    expect(actor).toMatchObject({ deadLetterReplayMaxAgeMs: 0 });
     const expiresAt = Date.now() + 60_000;
     await expect(provider.invoke("setActivationFilter", { id: actor.id, activationFilter: ["hold"], expiresAt }, context))
-      .resolves.toMatchObject({ activationFilterExpiresAt: expiresAt, filterSkipped: { count: 0, lastKey: null, lastTopic: null, lastAt: null } });
+      .resolves.toMatchObject({ deadLetterReplayMaxAgeMs: 0, activationFilterExpiresAt: expiresAt, filterSkipped: { count: 0, lastKey: null, lastTopic: null, lastAt: null } });
+    await expect(provider.invoke("setActivationFilter", { id: actor.id, activationFilter: ["hold"], deadLetterReplayMaxAgeMs: 12_345 }, context))
+      .resolves.toMatchObject({ deadLetterReplayMaxAgeMs: 12_345 });
+    for (const deadLetterReplayMaxAgeMs of [-1, 0.5, Infinity, "0"]) {
+      await expect(provider.invoke("setActivationFilter", { id: actor.id, activationFilter: ["hold"], deadLetterReplayMaxAgeMs }, context)).rejects.toThrow("deadLetterReplayMaxAgeMs");
+      await expect(provider.invoke("create", { name: "bad-age", instructions: "x", deadLetterReplayMaxAgeMs }, context)).rejects.toThrow("deadLetterReplayMaxAgeMs");
+    }
     for (const invalid of [NaN, Infinity, "tomorrow"]) {
       await expect(provider.invoke("setActivationFilter", { id: actor.id, activationFilter: ["hold"], expiresAt: invalid }, context)).rejects.toThrow("expiresAt");
     }
@@ -5698,12 +5736,14 @@ describe("AgentsProvider steering", () => {
     await expect(provider.invoke("setActivationFilter", { id: actor.id }, context)).rejects.toThrow("activationFilter is required");
     await expect(provider.invoke("create", { name: "bad", instructions: "x", activationFilter: [{ id: "all" }] }, context)).rejects.toThrow("name a source, topic, kind or where");
     const template = (await provider.invoke("create", {
-      name: "template", instructions: "Supervise.", scope: "global", activationFilter: ["never-message-events"],
+      name: "template", instructions: "Supervise.", scope: "global", activationFilter: ["never-message-events"], deadLetterReplayMaxAgeMs: 0,
     }, context)) as { id: string; activationFilter?: unknown };
     expect(template.activationFilter).toEqual(["never-message-events"]);
+    expect(template).toMatchObject({ deadLetterReplayMaxAgeMs: 0 });
     await expect(provider.invoke("setActivationFilter", { id: template.id, activationFilter: ["hold"], expiresAt, scope: "global" }, context)).rejects.toThrow("only supported for live actors");
-    await expect(provider.invoke("setActivationFilter", { id: template.id, activationFilter: ["hold"], scope: "global" }, context))
-      .resolves.toMatchObject({ activationFilter: ["hold"] });
+    await expect(provider.invoke("setActivationFilter", { id: template.id, activationFilter: ["hold"], scope: "global", deadLetterReplayMaxAgeMs: 12_345 }, context))
+      .resolves.toMatchObject({ activationFilter: ["hold"], deadLetterReplayMaxAgeMs: 12_345 });
+    await expect(provider.invoke("import", { id: template.id, as: "imported-backlog" }, context)).resolves.toMatchObject({ deadLetterReplayMaxAgeMs: 12_345 });
     await expect(provider.invoke("setActivationFilter", { id: template.id, activationFilter: null, scope: "global" }, context))
       .resolves.not.toHaveProperty("activationFilter");
     await expect(provider.invoke("setActivationFilter", { id: template.id, activationFilter: ["x"], scope: "global" }, context)).rejects.toThrow("Unknown activationFilter preset");
@@ -6558,11 +6598,11 @@ describe("own-root resident setters and authoritative status", () => {
     } finally { vi.unstubAllEnvs(); }
   });
 
-  it("forwards resident expiry to the execution owner", async () => {
+  it("forwards resident expiry and dead-letter replay age to the execution owner", async () => {
     const state = await remoteState();
     const expiresAt = Date.now() + 60000;
-    await state.provider.invoke("setActivationFilter", { id: state.actor.id, activationFilter: ["hold"], expiresAt }, context);
-    expect(state.setActor.mock.calls[0]?.[0]).toEqual({ operation: "setActivationFilter", id: state.actor.id, activationFilter: ["hold"], expiresAt });
+    await state.provider.invoke("setActivationFilter", { id: state.actor.id, activationFilter: ["hold"], expiresAt, deadLetterReplayMaxAgeMs: 0 }, context);
+    expect(state.setActor.mock.calls[0]?.[0]).toEqual({ operation: "setActivationFilter", id: state.actor.id, activationFilter: ["hold"], expiresAt, deadLetterReplayMaxAgeMs: 0 });
   });
 
   it("returns host effective status/list rather than a stale Main overlay", async () => {

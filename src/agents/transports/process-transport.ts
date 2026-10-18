@@ -416,9 +416,13 @@ export class ProcessTransport implements AgentTransportAdapter {
       ...(processHandle.treeClosed ? { liveness: "events" as const } : {}),
       isAlive: processHandle.isAlive,
       lostContact: processHandle.lostContact,
+      finishingGraceMs: 7_000,
+      ...(processHandle.forcedCleanupCount ? { forcedCleanupCount: processHandle.forcedCleanupCount } : {}),
+      ...(processHandle.remainingDescendantCount ? { remainingDescendantCount: processHandle.remainingDescendantCount } : {}),
       ...(processHandle.stopDebt ? { stopDebt: processHandle.stopDebt } : {}),
       waitForClose: processHandle.waitForClose,
       closed: processHandle.closed,
+      ...(processHandle.primaryExit ? { primaryExit: processHandle.primaryExit } : {}),
       ...(processHandle.treeClosed ? { treeClosed: processHandle.treeClosed } : {}),
       stop: processHandle.stop,
     };

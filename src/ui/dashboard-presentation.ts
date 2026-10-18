@@ -20,7 +20,7 @@ export const colorStatus = (theme: Theme, status: string, value: string): string
     return theme.fg("error", value);
   }
   if (status === "blocked" || status === "warning") return theme.fg("warning", value);
-  if (status === "running" || status === "in_progress") return theme.fg("accent", value);
+  if (status === "running" || status === "finishing" || status === "in_progress") return theme.fg("accent", value);
   if (status === "global") return theme.fg("muted", value);
   return theme.fg("dim", value);
 };

@@ -74,7 +74,7 @@ const residentOutcomeReceipts = (error: Error): FabricResidentOutcomeReceipt[] =
  * completes normally. Ordinary successful replies keep their handles and are
  * not uncertainty unless the enclosing execution is interrupted.
  */
-export const preserveCancellationOutcome = <T extends Pick<FabricSandboxResult, "value" | "terminationReason" | "error" | "residentOutcomes">>(
+export const preserveCancellationOutcome = <T extends Pick<FabricSandboxResult, "value" | "terminationReason" | "error" | "residentOutcomes" | "terminalAgentSpawnRefusal">>(
   result: T,
   signal: AbortSignal,
   interrupted = signal.aborted,
@@ -85,6 +85,7 @@ export const preserveCancellationOutcome = <T extends Pick<FabricSandboxResult, 
     if (outcome !== reason) {
       result.value = undefined;
       result.error = outcome.message;
+      delete result.terminalAgentSpawnRefusal;
       for (const receipt of residentOutcomeReceipts(outcome)) recordResidentOutcome(signal, receipt);
       if (result.terminationReason === "completed") result.terminationReason = "runtime_error";
     }

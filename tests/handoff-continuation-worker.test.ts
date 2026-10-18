@@ -19,7 +19,7 @@ describe.skipIf(!fs.existsSync(workerPath))("real trajectory executor continuati
     if (directory) rmTempSync(directory);
   });
 
-  it.each(["pi", "pi-durable"] as const)("%s finishes its original work after a nested depth rejection instead of returning failure text (offline)", async (runner) => {
+  it.each(["pi", "pi-durable"] as const)("%s finishes its original work after a nested task-spawn refusal instead of returning failure text (offline)", async (runner) => {
     directory = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-handoff-continuation-"));
     const agentDir = path.join(directory, "agent");
     fs.mkdirSync(agentDir);
@@ -74,7 +74,11 @@ describe.skipIf(!fs.existsSync(workerPath))("real trajectory executor continuati
     const continuation = events.filter(event => event.type === "message_end" &&
       event.message?.role === "custom" && event.message.customType === "pi-fabric-handoff-continuation");
     expect(continuation).toHaveLength(1);
-    expect(log).toContain("depth limit");
+    expect(log).toContain("Task agents cannot spawn or hand off");
+    expect(log).not.toContain("depth limit");
+    // The forbidden handoff never creates a nested run, even though this
+    // seeded executor continues its original work through the normal tool loop.
+    expect(manager.list().map(run => run.id)).toEqual([result.id]);
     expect(events.filter(event => event.type === "tool_execution_start" && event.toolName === "fabric_exec")).toHaveLength(2);
   }, 45_000);
 });

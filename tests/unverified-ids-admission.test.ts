@@ -13,14 +13,14 @@ import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import type { FabricInvocationContext } from "../src/protocol.js";
 import { AgentsProvider } from "../src/providers/agents-provider.js";
 import { MeshProvider } from "../src/providers/mesh-provider.js";
-import { RootInbox, rootInboxMessage, rootInboxSession } from "../src/topology/root-inbox.js";
+import { RootInbox, rootInboxSession as unsignedRootInboxSession } from "../src/topology/root-inbox.js";
+import { rootInboxMessage, rootInboxSession } from "./root-inbox-issued-fixture.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
 import { eventReceipts } from "../src/topology/root-inbox-shared.js";
 import { AgentMessageRouter } from "../src/providers/agents-message-router.js";
 
 const text = "head fedc9876";
 const notice = "unverified ids: fedc9876";
-const omittedNotice = `${notice} (recipient marker omitted: message at the route size limit)`;
 const identity: MeshIdentity = { id: "session:sender", name: "Sender", kind: "main" };
 const session = (read = false) => {
   const manager = SessionManager.inMemory(process.cwd());
@@ -70,7 +70,8 @@ describe("round-1 admission invariance", () => {
       expect(before).not.toHaveProperty("notice");
       expect(Buffer.byteLength(JSON.stringify(before))).toBe(262_128);
       const after = await provider.invoke("publish", { topic: "team", text: message }, invocation(session()));
-      expect(after).toMatchObject({ text: message, notice: omittedNotice });
+      expect(after).toMatchObject({ text: message });
+      expect(after).not.toHaveProperty("notice");
       expect(store.read()).toHaveLength(3); // Exactly one persisted event per successful publish.
       expect(store.read().at(-1)?.text).toBe(message);
       await expect(provider.invoke("publish", { topic: "team", text: message + "x".repeat(17) }, invocation(session())))
@@ -96,7 +97,7 @@ describe("round-1 admission invariance", () => {
     } as unknown as Ports[1], {} as Ports[2], { matches: () => false } as unknown as Ports[3],
     { get: () => undefined } as unknown as Ports[4], undefined, {} as Ports[6]);
     expect(await provider.invoke(action, { id: "actor", message, data }, invocation(session(true)))).not.toHaveProperty("notice");
-    expect(await provider.invoke(action, { id: "actor", message, data }, invocation(session()))).toHaveProperty("notice", omittedNotice);
+    expect(await provider.invoke(action, { id: "actor", message, data }, invocation(session()))).not.toHaveProperty("notice");
     expect(delivered).toEqual([message, message]);
     await expect(provider.invoke(action, { id: "actor", message: message + "x".repeat(17), data }, invocation(session())))
       .rejects.toThrow("Actor message exceeds");
@@ -127,7 +128,8 @@ describe("round-1 admission invariance", () => {
       const base = mainProvider(before.main, hosted);
       const checked = mainProvider(after.main, hosted);
       expect(await base.invoke("followUp", { id: "main", message }, invocation(session(true)))).not.toHaveProperty("notice");
-      expect(await checked.invoke("followUp", { id: "main", message }, invocation(session()))).toHaveProperty("notice", omittedNotice);
+      const result = await checked.invoke("followUp", { id: "main", message }, invocation(session()));
+      expect(result).not.toHaveProperty("notice");
       expect(before.main.queueDepth().pendingFollowUps).toBe(seeded + 1);
       expect(after.main.queueDepth().pendingFollowUps).toBe(seeded + 1);
       after.main.closeFollowUpDrain(); // Inspect the text actually handed to Pi, not just a receipt.
@@ -139,7 +141,7 @@ describe("round-1 admission invariance", () => {
     } finally { before.main.closeFollowUpDrain(); after.main.closeFollowUpDrain(); }
   });
 
-  it("drops the marker after an explicit remote Main quota rejection, without duplicate delivery", async () => {
+  it("sends original text once to remote Main and preserves its definitive quota rejection", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "id-remote-admission-"));
     const before = busyMain();
     // Remote control commands require durable delivery ids, hence a real Main journal.
@@ -172,34 +174,32 @@ describe("round-1 admission invariance", () => {
       const provider = new AgentsProvider({} as Ports[0], { identity } as Ports[1], {} as Ports[2],
         { matches: () => false } as unknown as Ports[3], { get: () => participant } as unknown as Ports[4], sender, {} as Ports[6]);
       expect(await provider.invoke("followUp", { id: after.main.id, message: text }, invocation(session())))
-        .toMatchObject({ queued: true, acknowledged: true, notice: omittedNotice });
+        .toMatchObject({ queued: true, acknowledged: true });
       expect(after.main.queueDepth().pendingFollowUps).toBe(2); // Seed plus one report, not two reports.
       const commands = senderStore.read({ topic: "fabric.control.command" });
-      expect(commands).toHaveLength(2);
+      expect(commands).toHaveLength(1);
       expect(commands.every(event => /^[a-f0-9]{64}$/.test((event.data as { commandId: string }).commandId))).toBe(true);
-      expect(commands.map(event => (event.data as { message: string }).message)).toEqual([`${text}\n\n${notice}`, text]);
+      expect(commands.map(event => (event.data as { message: string }).message)).toEqual([text]);
       const acknowledgements = () => senderStore.read({ topic: "fabric.control.ack" })
         .map(event => event.data as { commandId: string; accepted: boolean; error?: string; notRun?: boolean });
       expect(acknowledgements()).toMatchObject([
-        { commandId: (commands[0]!.data as { commandId: string }).commandId, accepted: false, error: expect.stringContaining("Main's followUp queue is full") },
-        { commandId: (commands[1]!.data as { commandId: string }).commandId, accepted: true },
+        { commandId: (commands[0]!.data as { commandId: string }).commandId, accepted: true },
       ]);
       const items = JSON.parse(fs.readFileSync(journal, "utf8")).items as Array<{
         message: string; deliveryId?: string; inboxReceipts?: string[];
       }>;
       expect(items).toHaveLength(2);
-      expect(items[1]).toMatchObject({ message: text, inboxReceipts: eventReceipts(commands[1]!) });
+      expect(items[1]).toMatchObject({ message: text, inboxReceipts: eventReceipts(commands[0]!) });
       expect(Buffer.byteLength(JSON.stringify(items[1]!.inboxReceipts))).toBe(inboxReceiptBytes);
       expect(Buffer.byteLength(JSON.stringify(items[1]!.deliveryId))).toBe(deliveryIdBytes);
 
-      // Only 16 bytes remain: another bare report genuinely cannot fit. The marker
-      // fallback must preserve that refusal, not claim it is safe to resend or deliver twice.
+      // Only 16 bytes remain: another report genuinely cannot fit; do not retry it.
       await expect(provider.invoke("followUp", { id: after.main.id, message: text }, invocation(session())))
         .rejects.toThrow(/^Main's followUp queue is full \([^\n]*\); Main is busy and reads followUps only at its next tool boundary\. Wait, or send a short steer\.$/);
       expect(after.main.queueDepth().pendingFollowUps).toBe(2);
       expect(senderStore.read({ topic: "fabric.control.command" })
-        .map(event => (event.data as { message: string }).message)).toEqual([`${text}\n\n${notice}`, text, `${text}\n\n${notice}`, text]);
-      expect(acknowledgements().map(ack => ack.accepted)).toEqual([false, true, false, false]);
+        .map(event => (event.data as { message: string }).message)).toEqual([text, text]);
+      expect(acknowledgements().map(ack => ack.accepted)).toEqual([true, false]);
       expect(acknowledgements().filter(ack => !ack.accepted).every(ack =>
         ack.error?.startsWith("Main's followUp queue is full") && !ack.error.includes("not delivered, safe to resend") && ack.notRun !== true)).toBe(true);
       expect(JSON.parse(fs.readFileSync(journal, "utf8")).items).toEqual(items);
@@ -229,7 +229,7 @@ describe("round-1 admission invariance", () => {
 
 // Round-1 F2: native inbox messages carry authorship in event text, not details.from.
 describe("round-1 native root inbox read provenance", () => {
-  it.each([false, true])("keeps a self-published unread id unverified while retaining peer reads (mixed: %s)", async mixed => {
+  it.each([false, true])("keeps native inbox issuer verification and original self/peer text (mixed: %s)", async mixed => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "id-inbox-self-"));
     try {
       const manager = session();
@@ -241,13 +241,15 @@ describe("round-1 native root inbox read provenance", () => {
       const inbox = new RootInbox(store, own, () => [own.id], { steerGraceMs: 0 });
       inbox.start();
       expect(await provider.invoke("publish", { topic: "fleet.report", to: own.id, text }, invocation(manager)))
-        .toHaveProperty("notice", notice);
+        .not.toHaveProperty("notice");
       if (mixed) await store.publish({ topic: "fleet.report", from: { id: "session:peer", name: "Peer", kind: "main" },
         to: own.id, text: "head abc1234" });
       const batch = await inbox.next(rootInboxSession(manager.getEntries()));
       expect(batch.events).toHaveLength(mixed ? 2 : 1);
+      expect(batch.events.map(event => event.text)).toEqual(mixed ? [text, "head abc1234"] : [text]);
       const message = rootInboxMessage(batch.events);
       expect(message.details).toEqual({
+        nonce: expect.any(String),
         ids: batch.events.map(event => event.id),
         receipts: batch.events.flatMap(event => [
           ["", "event", event.id],
@@ -255,9 +257,12 @@ describe("round-1 native root inbox read provenance", () => {
         ].map(fields => createHash("sha256").update(JSON.stringify(fields)).digest("hex"))),
       });
       manager.appendCustomMessageEntry(message.customType, message.content, message.display, message.details);
+      // The same public carrier cannot settle work without its private issuer verifier.
+      expect((await inbox.next(unsignedRootInboxSession(manager.getEntries()))).events).toEqual(batch.events);
       expect((await inbox.next(rootInboxSession(manager.getEntries()))).events).toEqual([]);
       const result = await provider.invoke("publish", { topic: "team", text: mixed ? `${text}; head abc1234` : text }, invocation(manager));
-      expect(result).toHaveProperty("notice", notice); // The self echo is not a read; the peer event is.
+      expect(result).not.toHaveProperty("notice");
+      expect(store.read({ topic: "team" }).map(event => event.text)).toEqual([mixed ? `${text}; head abc1234` : text]);
     } finally { fs.rmSync(root, { recursive: true, force: true }); }
   });
 });

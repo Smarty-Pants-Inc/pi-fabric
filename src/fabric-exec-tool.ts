@@ -20,12 +20,13 @@ import {
 } from "./ui/code-preview-shell.js";
 import { fabricExecTitleHintCached } from "./ui/fabric-title-hint.js";
 import { Type } from "typebox";
+import { queueHandoffFailureContinuation } from "./agents/handoff-continuation.js";
 import {
   createFabricPersistedExecutionDetails,
   readFabricExecutionRenderDetails,
 } from "./audit/index.js";
 import { DEFAULT_FABRIC_CONFIG } from "./config.js";
-import { PAYLOADS_LITERAL_GUIDANCE, hostGlobalsGuidance } from "./core/system-guidance.js";
+import { hostGlobalsGuidance, MISSING_HOST_GLOBALS, PAYLOADS_LITERAL_GUIDANCE } from "./core/system-guidance.js";
 import type { FabricState } from "./fabric-state.js";
 import { formatFailureProgress } from "./failure-progress.js";
 import {
@@ -94,6 +95,26 @@ import { countNewlines } from "./util.js";
 const RESULT_FORMATS = ["auto", "yaml", "json", "text"] as const;
 const MAX_FABRIC_CODE_TRANSFER_LINES = 12;
 
+// QuickJS dumps guest exceptions as JSON. Match the exception's own name and
+// exact message, not host-global names quoted in arbitrary errors or stacks.
+// The first frame must be guest code: bridged host ReferenceErrors originate
+// in pi-fabric-setup.js and must not be diagnosed as missing guest globals.
+const isMissingQuickJsHostGlobalError = (error: string): boolean => {
+  try {
+    const parsed: unknown = JSON.parse(error);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+    const { name, message, stack } = parsed as Record<string, unknown>;
+    if (name !== "ReferenceError" || typeof message !== "string" || typeof stack !== "string") return false;
+    const missing = /^'([^']+)' is not defined$/.exec(message)?.[1];
+    return missing !== undefined && (MISSING_HOST_GLOBALS as readonly string[]).includes(missing) &&
+      /^\s*at [^\n]*(?:pi-fabric-guest\.js|guest code):\d+(?::\d+)?\)?\s*$/.test(stack.trimStart().split("\n", 1)[0] ?? "");
+  } catch {
+    // Non-JSON errors (including ones already carrying recovery advice) are
+    // not this QuickJS exception shape; never append a second static hint.
+    return false;
+  }
+};
+
 type FabricRendererState = {
   fabricKernel?: "typescript" | "python";
   fabricWriteBindingsCode?: string;
@@ -139,25 +160,6 @@ const compactResultHeader = (
 const countLabel = (count: number, singular: string): string =>
   `${count} ${count === 1 ? singular : `${singular}s`}`;
 
-// Fold the Main limits into an existing guideline, rather than growing every turn's prompt.
-const executionDisplayGuidance =
-  "Use `display.name` and objective `display.description`; Fabric pairs them with verified outcomes in deterministic compaction. " +
-  "In a Main, a fabric_exec program ends after 10 min and agents.run/wait return after 60 s; spawned agents keep running and report back.";
-
-// Orchestration-only programs have no `pi` or `extensions`; files and shell stay native.
-const orchestrationGuidelines = (python: boolean): string[] => [
-  python
-    ? "Batch independent Fabric operations (`agents`, `mesh`, `memory`, `state`, `mcp`, `tools.call`) in one `fabric_exec` Python program with `asyncio.gather`; await dependent steps sequentially. Return only the compact final JSON-compatible value."
-    : "Batch independent Fabric operations (`agents`, `mesh`, `memory`, `state`, `mcp`, `tools.call`) in one `fabric_exec` program (`Promise.all` for parallel, sequential `await` for ordered), not one call per operation; keep dependent steps sequential. Return only the compact final value; intermediate results stay in the sandbox.",
-  "Orchestration-only mode: `pi` and `extensions` do not exist inside `fabric_exec`. Read, search, edit and write files and run shell commands with the native tools directly, not through `fabric_exec`.",
-  "For coding tasks, keep an acceptance ledger: turn the request into concrete checks, trace the relevant execution path before editing, implement end to end, then run targeted tests and direct behavioral probes. Mechanically confirm requested public symbols, registrations, and configuration entries. Use the smallest checks that cover the ledger, escalating only for failures or cross-cutting risk; inspect failures and iterate instead of rerunning unchanged passing checks. A build alone is not completion.",
-  "Amortize round trips without inflating context: batch only independent, bounded work in one program, and keep a step sequential when its output decides the next one. Filter or summarize large results inside the program and return decisions and evidence, not raw data.",
-  python
-    ? "Pass multiline or quote-heavy text through top-level `payloads`; read it as `π.key` or `payloads['key']`, with exactly the keys supplied; " + PAYLOADS_LITERAL_GUIDANCE + "."
-    : "Pass multiline or quote-heavy text through top-level `payloads`; each `π.key` must exactly match a key there; " + PAYLOADS_LITERAL_GUIDANCE + ".",
-  executionDisplayGuidance,
-];
-
 export const createFabricExecTool = (
   state: FabricState,
   codePreviewSettings: CodePreviewSettings,
@@ -174,9 +176,8 @@ export const createFabricExecTool = (
   // applyFabricMode re-creates the tool after bootstrap.
   const modeConfig = state.bootstrapped ? state.config : state.provisionalConfig?.();
   const piTools = !modeConfig || modeConfig.fullCodeMode || modeConfig.schema?.mode === "enforce";
-  // Tool guidelines ride every request, including a peer-delivered turn that skips
-  // before_agent_start, so the QuickJS host-globals line lives here (smarty-dev#459).
-  const quickjs = !python && (modeConfig?.executor?.runtime ?? "quickjs") === "quickjs";
+  const native = !python && modeConfig?.executor?.codemodeProfile === "native";
+  const quickjs = !python && (modeConfig?.schema?.mode === "enforce" || (modeConfig?.executor?.runtime ?? "quickjs") === "quickjs");
   const repeatGuard = new FabricRepeatGuard(FABRIC_REPEAT_WARN, FABRIC_REPEAT_BLOCK);
   return decorateShell(
   defineTool({
@@ -194,33 +195,16 @@ export const createFabricExecTool = (
       );
     },
     label: "Fabric",
-    description: python
+    description: (python
       ? monty
-        ? "Execute Python through Fabric's configured Monty sandbox. Monty runs a Python subset with VM resource limits, no native filesystem/network/environment access, and only host-mediated tools. Each invocation starts fresh. This is the exclusive model tool path in full code mode and Schema enforce mode."
-        : "Execute Python through Fabric’s configured CPython kernel for Pi core tools, MCP, providers, discovery, and extensions. Each call uses a fresh process. Native execution is trusted code; Schema enforce requires OS isolation. This is the exclusive model tool path in full code mode and Schema enforce mode."
-      : "Execute code through Fabric's TypeScript kernel: type-checked TypeScript by default, unmodified JavaScript with executor.codemodeProfile native. Both support nativeTools; native mode places Pi-compatible calls on tools and Fabric discovery on fabric.tools. Compose Pi core tools, MCP, Fabric providers, discovery, and extensions. QuickJS is isolated by default; the optional Node/Bun process is an unsafe trusted-code escape hatch. In full code mode, and always in Schema enforce mode, this is the exclusive model tool path.",
+        ? "Execute Python through Fabric's Monty sandboxed subset; no native imports, filesystem, network or environment."
+        : "Execute Python through Fabric's CPython kernel in a fresh process; native execution is trusted code."
+      : native
+        ? "Execute JavaScript through Fabric's TypeScript kernel (native profile; no type checking or repair)."
+        : "Execute type-checked TypeScript through Fabric's configured kernel.") +
+      (quickjs ? ` QuickJS lacks host globals: ${MISSING_HOST_GLOBALS.join(", ")}.` : ""),
     promptSnippet:
       "Pi core tools, MCP, Fabric providers, discovery, and extensions",
-    // Guidance follows the loaded mode (smarty-dev#459): orchestration-only programs have no
-    // `pi` or `extensions`, so advertising them only produced failed type checks.
-    promptGuidelines: [
-      ...(piTools ? [
-        python
-          ? "Batch independent operations in one `fabric_exec` Python program with `asyncio.gather`; await dependent/conditional steps sequentially. Coalesce independent replacements into one `await pi.edit(path=..., edits=[...])`. Return only the compact final JSON-compatible value."
-          : "Batch independent operations in one `fabric_exec` program (`Promise.all` for parallel); await dependent steps sequentially. Coalesce independent replacements from one file snapshot into one `pi.edit({path, edits:[...]})`; use `all:true` only for intentional repeated exact anchors. Return only the compact final value; intermediate results stay in the sandbox.",
-        python
-          ? "Search before reading with `await pi.grep(pattern=..., path=...)` or `await pi.find(pattern=..., path=...)`, then `await pi.read(path=..., offset=..., limit=...)`. Use Python dict syntax, `True`/`False`/`None`, and bounded searches; unbounded reads cap at 2000 lines or 50KB. Read continuation notices when needed."
-          : "Search before reading: locate lines with `pi.grep`/`pi.find`, then `pi.read({path, offset, limit})` that range. Escape regex metacharacters, or use `literal:true` for exact punctuated text. Keep fan-out search limits small; widen only on misses. Unbounded reads cap at 2000 lines or 50KB; follow `Use offset=…` notices. Reserve whole-file reads for small files you will use in full.",
-        "Keep the acceptance ledger in reasoning or concise progress notes (no tool call): define concrete checks, trace execution before editing, implement end to end, then run targeted tests and direct behavioral probes. Confirm requested public symbols, registrations, and configuration entries. Use the smallest checks that cover the ledger; escalate only for failures or cross-cutting risk. Inspect failures and iterate instead of rerunning unchanged passing checks. A build alone is not completion.",
-        python
-          ? "For test/probe nonzero exits, use `await pi.bash(command=..., settle=True)` and inspect the returned dict: `r['ok']`, `r['output']`, and `r.get('exitCode')`. Set shell `timeout` in seconds once for long suites. Return decisions and evidence rather than raw logs."
-          : "Amortize round trips without inflating context: batch only independent, bounded work. Keep search→read and edit→verify sequential when an output determines the next action. Use `settle:true` for tests or probes whose nonzero result is evidence rather than an exceptional stop; for a known long suite, set `pi.bash` `timeout` in seconds once instead of retrying a timed-out call. Filter or summarize noisy command output inside the program and return decisions, failures, and evidence—not raw logs or unused intermediate results.",
-        "For edits/writes, pass named payloads through top-level `payloads`; each `π.key` must exactly match a key there; prefer `pi.edit`/`pi.write`. `pi.bash`: no stdin.",
-        executionDisplayGuidance,
-      ] : orchestrationGuidelines(python)),
-      ...(quickjs ? [hostGlobalsGuidance(piTools)] : []),
-      ...(monty ? ["Monty requires acyclic JSON host arguments. For underscore-prefixed provider/tool names, use `await tools.call(ref=..., args={...})`, not direct attributes. Use `payloads['key']` for private/non-identifier payload keys."] : []),
-    ],
     // The model-facing schema is intentionally flat: one large `code` string
     // plus scalar/optional params. Do not add nested arrays-of-objects with
     // escaped content here. SOTA models are post-trained on one dominant
@@ -238,16 +222,16 @@ export const createFabricExecTool = (
     // back to Record<string, string> before Pi validates.
     parameters: Type.Object({
       code: Type.String({
-        description: python
-          ? monty
-            ? "Python async function body executed by Monty, a sandboxed Python subset (not CPython). Top-level await/return and asyncio.gather are supported. Use only Monty's supported syntax/modules; native imports, filesystem, network, and environment are unavailable. Host globals: tools, mcp, memory, state, schema, compact, cache, thinking, components, agents, mesh; full-code mode adds pi and extensions. Await dict/keyword calls; use native dict results r['output']. Payloads: π.key or payloads['key']. Return JSON-compatible data; each invocation starts fresh."
-            : "Python async function body executed by CPython. Top-level await and return are supported; standard-library imports are available. Globals: tools, mcp, memory, state, schema, compact, cache, thinking, components, agents, mesh; full-code mode adds pi and extensions. Await host calls using a dict or keyword arguments. Results are native dicts/lists: r['output'], not r.output. Use asyncio.gather for concurrency. Named payloads are π.key or payloads['key']. Return a JSON-compatible value. Each call starts fresh."
-          : "TypeScript function body. Top-level await and return are supported. Globals include `tools`, `mcp`, `memory`, `state`, `schema`, `compact`, `cache`, `thinking`, `agents`, `mesh`, `print`, and `π`; full-code mode adds `pi` and `extensions`. `π` contains only the exact keys supplied by this call's `payloads`. See session guidance / `fabric-exec` skill for exact signatures.",
+        description: (python ? "Python async function body" : native ? "JavaScript async function body" : "TypeScript function body") +
+          "; top-level await/return. Globals: tools, mcp, memory, state, schema, compact, cache, thinking, components, agents, mesh, print, π. " +
+          (piTools ? "pi and extensions are available (full code mode or Schema enforce)." : "Orchestration-only: pi and extensions are unavailable; core/extension tools stay native.") +
+          (native ? " tools/nativeTools use native Pi calls; Fabric discovery is fabric.tools." : "") +
+          (python ? " Host calls accept dict/keyword arguments; results are dicts/lists. Each invocation starts fresh." : ""),
       }),
       payloads: Type.Optional(
         Type.Record(Type.String(), Type.String(), {
           description:
-            "Named payloads exposed under the same exact name as π.key (for example, payloads.contract becomes π.contract). Never reference a π key absent from this map. Useful for content that is awkward to quote inside code. Prefer an object of string values; a JSON-object string is parsed. " + PAYLOADS_LITERAL_GUIDANCE + " (a bare `__TOKEN__`, `@/path` or `file://` value is rejected).",
+            "Named literal strings; " + PAYLOADS_LITERAL_GUIDANCE + ". Only exact supplied keys exist: payloads.body becomes π.body" + (python ? " or payloads['body']" : "") + ". No placeholders or file references.",
         }),
       ),
       resultFormat: Type.Optional(Type.Union(RESULT_FORMATS.map((value) => Type.Literal(value)))),
@@ -653,12 +637,19 @@ export const createFabricExecTool = (
         ];
       };
       const failed = details.success === false;
+      const recoveryOutput = failed && details.error && isMissingQuickJsHostGlobalError(details.error)
+        ? output : "";
 
       if (audits.length === 0) {
         if (failed && details.error) {
           return trackRows(
             new Text(
-              theme.fg("error", `✗ ${safeTerminalText(details.error)}`),
+              // Recovery advice is part of the bounded output, not the raw
+              // error metadata. Render that same text without mutating audits
+              // or the trace, including when the full output is an artifact.
+              theme.fg("error", `✗ ${safeTerminalText(
+                recoveryOutput || details.error,
+              )}`),
               0,
               0,
             ),
@@ -709,6 +700,7 @@ export const createFabricExecTool = (
           if (audit.error) {
             text += nl + theme.fg("error", safeTerminalText(audit.error));
           }
+          if (recoveryOutput) text += nl + theme.fg("error", safeTerminalText(recoveryOutput));
           return trackRows(new Text(text, 0, 0));
         }
         if (previewLines[0]) {
@@ -735,6 +727,7 @@ export const createFabricExecTool = (
         } else if (
           previewLines.length === 0 &&
           output &&
+          !recoveryOutput &&
           !isCoreToolAudit(audit) &&
           (!compact || failed || expanded)
         ) {
@@ -747,6 +740,7 @@ export const createFabricExecTool = (
             if (!expanded) text += theme.fg("dim", " · ") + expandHint(theme);
           }
         }
+        if (recoveryOutput) text += nl + theme.fg("error", safeTerminalText(recoveryOutput));
         const textLines = text.split(nl);
         return trackRows(
           renderBoundedLines(
@@ -960,6 +954,19 @@ export const createFabricExecTool = (
             "warning",
           );
         }
+      } else if (!signal?.aborted && result.success === false && result.trace.outcome === "failed" &&
+        !result.residentOutcomes?.length && result.terminalAgentSpawnRefusal?.ref === "agents.handoff" && result.audits.some(audit =>
+        audit.ref === "agents.handoff" && audit.success === false &&
+        audit.errorCode === "FABRIC_AGENT_SPAWN_FORBIDDEN",
+      ) && queueHandoffFailureContinuation(state.pi, context, { status: "failed" }, "steer")) {
+        // Refusal happens before deferHandoff, so there is no boundary runner
+        // to queue the seeded executor's one direct-work fallback. Keep the
+        // refusal authoritative and never retry or grant spawn authority.
+        // Only the exact host-injected terminal object qualifies. Caught then
+        // replaced/copied refusals and cancelled/timed-out runs cannot continue.
+        // Steer at the next tool-loop turn: unlike a terminating deferred
+        // boundary, this path still owes an ordinary inference after its result.
+        state.prewalk.cancel();
       } else if (state.prewalk.planRequired(boundarySessionId)) {
         // This boundary was withheld because the plan is still owed. Reflect the
         // planning phase instead of leaving the footer reading "armed".
@@ -969,6 +976,20 @@ export const createFabricExecTool = (
           prewalkStatus.state === "armed" ? `plan awaited → ${prewalkStatus.model}` : undefined,
         );
       }
+      // Native codemode skips the type checker, so its missing host globals
+      // need the same on-demand advice as additive type errors. Use the actual
+      // post-ensure runtime selection (Schema enforce also selects QuickJS).
+      // Keep the original error, audits and trace intact; only display output
+      // gains the hint, before either visible or artifact output is budgeted.
+      const runtimeRecoveryHint = !result.success && !result.typeErrors &&
+        result.trace.outcome === "failed" && state.config.executor.kernel === "typescript" &&
+        (state.config.schema.mode === "enforce" || state.config.executor.runtime === "quickjs") &&
+        result.error && isMissingQuickJsHostGlobalError(result.error)
+          ? `Recovery hint: ${hostGlobalsGuidance(state.config.fullCodeMode || state.config.schema.mode === "enforce")}`
+          : undefined;
+      const runtimeErrorDisplay = result.error
+        ? `Runtime error: ${result.error}${runtimeRecoveryHint ? `\n\n${runtimeRecoveryHint}` : ""}`
+        : undefined;
       const fullFormattedValue = formatFabricValue(result.value, selectedResultFormat);
       const failureProgress = formatFailureProgress(result.trace);
       const residentPriority = result.residentOutcomes?.length
@@ -976,7 +997,7 @@ export const createFabricExecTool = (
         : undefined;
       const fullSections = residentPriority ? [residentPriority, ...result.logs] : [...result.logs];
       if (fullFormattedValue.text) fullSections.push(fullFormattedValue.text);
-      if (result.error) fullSections.push(`Runtime error: ${result.error}`);
+      if (runtimeErrorDisplay) fullSections.push(runtimeErrorDisplay);
       if (failureProgress) fullSections.push(failureProgress);
       if (repeat.warn) fullSections.push(fabricRepeatWarnText(repeat.count, FABRIC_REPEAT_BLOCK));
       const fullRawOutput = fullSections.join("\n\n");
@@ -995,7 +1016,7 @@ export const createFabricExecTool = (
       const sections = [...result.logs];
       const logPrefix = result.logs.join("\n\n");
       if (formattedValue.text) sections.push(formattedValue.text);
-      if (result.error) sections.push(`Runtime error: ${result.error}`);
+      if (runtimeErrorDisplay) sections.push(runtimeErrorDisplay);
       if (failureProgress) sections.push(failureProgress);
       if (repeat.warn) sections.push(fabricRepeatWarnText(repeat.count, FABRIC_REPEAT_BLOCK));
       const rawOutput = sections.join("\n\n");
@@ -1061,7 +1082,7 @@ export const createFabricExecTool = (
           sections: [
             logPrefix ? `Guest logs:\n${logPrefix}` : "",
             formattedValue.text,
-            result.error ? `Runtime error: ${result.error}` : "",
+            runtimeErrorDisplay ?? "",
             failureProgress ?? "",
             repeat.warn ? fabricRepeatWarnText(repeat.count, FABRIC_REPEAT_BLOCK) : "",
           ],
@@ -1118,7 +1139,7 @@ export const createFabricExecTool = (
         // text-only model still receives the description while the terminal
         // shows the kitty image.
         const textOutput =
-          singleAudit && mediaNote && !residentPriority
+          singleAudit && mediaNote && !residentPriority && !runtimeRecoveryHint
             ? mediaNote
             : (output === "(no output)" ? "" : output);
         if (textOutput) content.push({ type: "text", text: textOutput });

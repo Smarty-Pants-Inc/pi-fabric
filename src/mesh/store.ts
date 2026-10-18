@@ -12,7 +12,7 @@ import type { MeshReadOptions, MeshStateEntry, MeshBatchResult, MeshBatchView } 
 import { createStateBackend, isMeshStateWalCap, type MeshStateBackendKind, type StateBackend, type StateBackendBatchInput,
   type StateBackendDiagnostics } from "./state-backend.js";
 import { EventLog, type MeshEvent, type MeshIdentity, type MeshPublishInput, type MeshTailResult } from "./event-log.js";
-import { indexResidentDeliveries, type WakeSubscription } from "../residency/wake-index.js";
+import { closeResidentWakeRetryCursor, indexResidentDeliveries, type WakeSubscription } from "../residency/wake-index.js";
 import { writeFileAtomic } from "../core/atomic-write.js";
 import type { FabricMessageSender } from "../protocol.js";
 import { copyFabricPrincipal, type FabricPrincipal } from "../fabric-provenance.js";
@@ -420,6 +420,8 @@ export class MeshStore {
   #scheduleCache:
     | { inode: number; size: number; modifiedAt: number; file: MeshScheduleFile; error?: string }
     | undefined;
+  /** Parsed wake routes are private to this store and revalidated under the publication lock. */
+  readonly #wakeRouteCache = new Map<string, unknown>();
   /** This store's census registration (directory identity), released once by closeState(). */
   #censusRecord: string | undefined;
 
@@ -438,7 +440,7 @@ export class MeshStore {
       if (!fs.existsSync(path.join(this.root, "residency"))) return;
       const subscriptions = event.topic === "fabric.participant.lifecycle"
         ? this.#state.listAll("topology/subscriptions/", { fresh: true }).map(entry => entry.value as WakeSubscription) : [];
-      indexResidentDeliveries(this.root, event, subscriptions);
+      indexResidentDeliveries(this.root, event, subscriptions, this.#wakeRouteCache);
     });
     this.#schedulesPath = path.join(root, "schedules.json");
     fs.mkdirSync(root, { recursive: true, mode: 0o700 });
@@ -473,6 +475,8 @@ export class MeshStore {
 
   /** Releases the state database handle (sqlite, shadow); the file backend holds none. */
   closeState(): void {
+    closeResidentWakeRetryCursor(this.root);
+    this.#wakeRouteCache.clear();
     this.#state.close();
     // A closed sqlite backend cannot reopen and a closed shadow writes only through .lock: this
     // store no longer needs the record. Another open store of this process keeps it.
@@ -519,13 +523,22 @@ export class MeshStore {
     if (!events.length || !this.#canWakeResidents() || !fs.existsSync(path.join(this.root, "residency"))) return;
     try {
       const { wakeResidentActors } = await import("../residency/wake.js");
-      await wakeResidentActors(this, events);
+      await wakeResidentActors(this, events, undefined, undefined, () => this.#canWakeResidents());
     } catch (error) {
       // Already committed: throwing would invite a duplicate publish. The durable pending
-      // index and archived event survive even without a wake request; startup or the next
-      // publish retries the drain. Report failure rather than inventing delivery.
+      // index and archived event survive even without a wake request; scoped startup,
+      // maintenance or the next matching publish retries it. Report failure rather than inventing delivery.
       diagnostics.warn("src/mesh/store.ts", `[pi-fabric] resident wake deferred: ${String(error)}`);
     }
+  }
+
+  /** Existing owner maintenance cadence only; respect publication's resident admission gate. */
+  async retryResidentWakes(): Promise<void> {
+    if (!this.#canWakeResidents() || !fs.existsSync(path.join(this.root, "residency"))) return;
+    const { retryResidentWakes } = await import("../residency/wake.js");
+    // Import preparation may have yielded to staging, drain or handover.
+    if (!this.#canWakeResidents()) return;
+    await retryResidentWakes(this, undefined, undefined, () => this.#canWakeResidents());
   }
 
   #scheduleDue(now = Date.now()): boolean {

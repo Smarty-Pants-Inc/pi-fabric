@@ -7,7 +7,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { MeshBackgroundRetry } from "../src/core/atomic-write.js";
-import { confirmWitnessPlatform, ParticipantDirectory, ROUTING_REFRESH_LOCK_BUDGET_MS } from "../src/topology/participant-directory.js";
+import { confirmWitnessPlatform, ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { MeshLock } from "../src/mesh/mesh-lock.js";
 import { writeParticipantFile } from "../src/topology/participant-files.js";
 import { actorParticipantRecord } from "../src/topology/records.js";
@@ -197,23 +197,12 @@ describe("ParticipantDirectory routing freshness (#2386)", () => {
     const directory = fixture();
     expect(directory.routingUnavailable()).toContain("no confirmed view");
     expect(directory.canConsumeMesh()).toBe(false);
-    // A bounded state operation, not exclusive() on the mesh lock (smarty-dev#6477 L2b).
-    // smarty-dev#7651: withStateFence passes the budget LEFT (deadline - Date.now()), which drops to
-    // 1999 when a millisecond ticks between computing the deadline and the try. Bound it by the clock
-    // time that elapsed around the call instead of demanding the exact constant.
-    const tryLock = directory.mesh.withTryLock.bind(directory.mesh);
-    let triedAt = 0;
-    const read = vi.spyOn(directory.mesh, "withTryLock").mockImplementation((operation, timeout) => {
-      triedAt ||= Date.now(); return tryLock(operation, timeout);
-    });
+    const read = vi.spyOn(directory.mesh, "withTryLock");
     const exclusive = vi.spyOn(directory.mesh, "exclusive");
     const fence = vi.spyOn(directory.mesh, "writeBatch");
-    const calledAt = Date.now();
     await directory.refreshRoutingView();
-    expect(read).toHaveBeenCalledWith(expect.any(Function), expect.any(Number));
-    expect(read.mock.calls[0]![1]).toBeLessThanOrEqual(ROUTING_REFRESH_LOCK_BUDGET_MS);
-    expect(read.mock.calls[0]![1]).toBeGreaterThanOrEqual(ROUTING_REFRESH_LOCK_BUDGET_MS - (triedAt - calledAt));
-    expect(fence).toHaveBeenCalledWith(expect.objectContaining({ ops: [], prepare: expect.any(Function) }));
+    expect(read).not.toHaveBeenCalled();
+    expect(fence).not.toHaveBeenCalled();
     expect(exclusive).not.toHaveBeenCalled();
     expect(directory.routingUnavailable()).toBeUndefined();
     expect(directory.canConsumeMesh()).toBe(false);
@@ -248,26 +237,20 @@ describe("ParticipantDirectory routing freshness (#2386)", () => {
     expect(directory.routingUnavailable()).toBeUndefined();
   });
 
-  // smarty-dev#6477: one fleet publish holds the lock ~250 ms (smarty-dev#8305); a 250 ms budget
-  // failed the send behind one hold. The budget covers a few holds and still bounds a stuck holder.
-  const holdLock = (directory: ParticipantDirectory, ms: number): Promise<void> =>
-    new MeshLock(directory.mesh.root, {}, () => undefined)
-      .withLockAcrossAwait(() => new Promise<void>((resolve) => setTimeout(resolve, ms)));
-
-  it("survives a ~400 ms publish hold and still fails past its lock budget", async () => {
+  it("revalidates canonical reads while the file writer lock is held, without granting lease admission", async () => {
     const directory = fixture();
-    let hold = holdLock(directory, 400);
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    await directory.refreshRoutingView();
-    expect(directory.routingUnavailable()).toBeUndefined();
-    await hold;
-
-    hold = holdLock(directory, ROUTING_REFRESH_LOCK_BUDGET_MS + 300);
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    await expect(directory.refreshRoutingView()).rejects.toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
-    expect(directory.routingUnavailable()).toBeDefined();
-    await hold;
-  }, 10_000);
+    let acquired!: () => void, release!: () => void;
+    const entered = new Promise<void>(resolve => { acquired = resolve; });
+    const hold = new MeshLock(directory.mesh.root, {}, () => undefined).withLockAcrossAwait(() => {
+      acquired(); return new Promise<void>(resolve => { release = resolve; });
+    });
+    await entered;
+    try {
+      await directory.refreshRoutingView();
+      expect(directory.routingUnavailable()).toBeUndefined();
+      expect(directory.canConsumeMesh()).toBe(false);
+    } finally { release(); await hold; }
+  });
 
   it("does not refresh a closed directory", async () => {
     const directory = fixture();
@@ -2121,8 +2104,13 @@ describe("ParticipantDirectory reads", () => {
       { heartbeatMs: 60_000, leaseMs: 120_000 });
     await reader.start();
     await peer.start();
+    const stateOnlyId = "session:writer:state-only";
+    await store.put({ key: "topology/participants/" + createHash("sha256").update(stateOnlyId).digest("hex"),
+      value: agentRecord(stateOnlyId, writer.id, writer.id, writer.id), identity: writer });
+    await store.put({ key: "actors/retained/memo-payload", value: { payload: "x".repeat(30_000) }, identity: writer });
     const shared = vi.spyOn(reader.mesh, "listAllShared");
     const first = reader.list({ scope: "project" });
+    const stateCapabilities = first.find((participant) => participant.id === stateOnlyId)!.capabilities;
     const calls = shared.mock.calls.length;
     expect(first.map((participant) => participant.id)).toContain(writer.id);
     for (let i = 0; i < 5; i++) reader.list({ scope: "project" });
@@ -2136,10 +2124,21 @@ describe("ParticipantDirectory reads", () => {
 
     await store.put({ key: "topology/participants/" + createHash("sha256").update("session:writer:agent").digest("hex"),
       value: agentRecord("session:writer:agent", writer.id, writer.id, writer.id), identity: writer });
+    const cloned = vi.spyOn(globalThis, "structuredClone");
     const after = reader.list({ scope: "project", fresh: true });
+    // One new shared entry is copied; unchanged entries, including the large retained actor, are reused.
+    expect(cloned.mock.calls.filter(([entry]) => {
+      const key = typeof entry === "object" && entry !== null && "key" in entry ? entry.key : undefined;
+      return typeof key === "string" &&
+        ["topology/hosts/", "topology/participants/", "sessions/", "actors/"].some(prefix => key.startsWith(prefix));
+    })).toHaveLength(1);
+    cloned.mockRestore();
     expect(after.map((participant) => participant.id)).toContain("session:writer:agent");
-    // The write copied only the new entry: an unchanged record is the same parse.
+    // Both native-file and unchanged shared entries retain their frozen parse across unrelated writes.
     expect(after.find((participant) => participant.id === writer.id)!.capabilities).toBe(capabilities);
+    const afterCapabilities = after.find((participant) => participant.id === stateOnlyId)!.capabilities;
+    expect(afterCapabilities).toBe(stateCapabilities);
+    expect(Object.isFrozen(afterCapabilities)).toBe(true);
     // A changed record is read again.
     const key = "topology/participants/" + createHash("sha256").update(writer.id).digest("hex");
     const current = store.get(key)!;

@@ -1,7 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { hostGlobalsGuidance } from "../src/core/system-guidance.js";
 import ts from "typescript";
 import { normalizeFabricConfig } from "../src/config.js";
 import { createFabricExecTool } from "../src/fabric-exec-tool.js";
@@ -33,66 +32,19 @@ describe("prewalk prompt isolation", () => {
     expect(handlers.length).toBeGreaterThan(0);
     for (const handler of handlers) expect(handler.toLowerCase()).not.toContain("prewalk");
 
-    const guidelinesStart = toolSource.indexOf("promptGuidelines: [");
-    const guidelinesEnd = toolSource.indexOf("parameters:", guidelinesStart);
-    expect(guidelinesStart).toBeGreaterThanOrEqual(0);
-    expect(guidelinesEnd).toBeGreaterThan(guidelinesStart);
-    const guidelines = toolSource.slice(guidelinesStart, guidelinesEnd).toLowerCase();
-    expect(guidelines).not.toContain("prewalk");
-    expect(guidelines).not.toContain("handoff");
+    expect(toolSource).not.toContain("promptGuidelines:");
   });
 
-  it("keeps coding guidance outcome-oriented and context-bounded", () => {
-    const state = { bootstrapped: true, config: normalizeFabricConfig({}) } as FabricState;
-    const allGuidelines = createFabricExecTool(
-      state, defaultCodePreviewSettings(), new Map(), (tool) => tool,
-    ).promptGuidelines ?? [];
-    // The QuickJS host-globals line moved here from the system section (net zero); it is
-    // not coding guidance, so it stays outside this budget.
-    expect(allGuidelines.at(-1)).toBe(hostGlobalsGuidance(true));
-    const visibleGuidelines = allGuidelines.slice(0, -1);
-    const guidelines = visibleGuidelines.join("\n");
-    const visibleGuidelineChars = visibleGuidelines.reduce((total, line) => total + line.length, 0);
-
-    expect(visibleGuidelines).toHaveLength(6);
-    expect(visibleGuidelineChars).toBeLessThanOrEqual(2_200);
-    expect(guidelines).toContain("acceptance ledger in reasoning or concise progress notes (no tool call)");
-    expect(guidelines).toContain("direct behavioral probes");
-    expect(guidelines).toContain("requested public symbols, registrations, and configuration entries");
-    expect(guidelines).toContain("smallest checks that cover the ledger");
-    expect(guidelines).toContain("instead of rerunning unchanged passing checks");
-    expect(guidelines).toContain("A build alone is not completion");
-    expect(guidelines).toContain("one `pi.edit({path, edits:[...]})`");
-    expect(guidelines).toContain("`all:true` only for intentional repeated exact anchors");
-    expect(guidelines).toContain("`literal:true` for exact punctuated text");
-    expect(guidelines).toContain("fan-out search limits small");
-    expect(guidelines).toContain("`settle:true` for tests or probes");
-    expect(guidelines).toContain("`timeout` in seconds once");
-    expect(guidelines).toContain("batch only independent, bounded work");
-    expect(guidelines).toContain("not raw logs or unused intermediate results");
-    expect(guidelines).toContain("pass named payloads through top-level `payloads`");
-    expect(guidelines).toContain("prefer `pi.edit`/`pi.write`");
-    expect(guidelines).toContain("`pi.bash`: no stdin");
-    expect(guidelines).toContain("`display.name` and objective `display.description`");
-    expect(guidelines).toContain("pairs them with verified outcomes");
-    expect(guidelines).toContain("deterministic compaction");
-  });
-
-  it.each([true, false])("folds Main limits into six bounded guidelines (fullCodeMode=%s)", fullCodeMode => {
+  it.each([true, false])("publishes only a short callable contract, not workflow guidelines (fullCodeMode=%s)", fullCodeMode => {
     const state = { bootstrapped: true, config: normalizeFabricConfig({ fullCodeMode }) } as FabricState;
-    const allGuidelines = createFabricExecTool(
-      state, defaultCodePreviewSettings(), new Map(), (tool) => tool,
-    ).promptGuidelines ?? [];
-    expect(allGuidelines.at(-1)).toBe(hostGlobalsGuidance(fullCodeMode));
-    const visibleGuidelines = allGuidelines.slice(0, -1);
-    expect(visibleGuidelines).toHaveLength(6);
-    expect(visibleGuidelines.reduce((total, line) => total + line.length, 0)).toBeLessThanOrEqual(2_200);
-    const guidance = visibleGuidelines.join("\n");
-    expect(guidance).toContain("Main");
-    expect(guidance).toContain("10 min");
-    expect(guidance).toContain("agents.run/wait");
-    expect(guidance).toContain("60 s");
-    expect(guidance).toContain("spawned agents keep running");
+    const tool = createFabricExecTool(state, defaultCodePreviewSettings(), new Map(), value => value);
+    expect(tool).not.toHaveProperty("promptGuidelines");
+    const contract = [tool.description, tool.parameters.properties.code.description, tool.parameters.properties.payloads.description].join("");
+    expect(contract.length).toBeLessThanOrEqual(1_000);
+    expect(contract).not.toMatch(/acceptance ledger|batch independent|Search before reading|display\.name|10 min|60 s|Jev supplies/);
+    expect(contract).toContain("TypeScript function body");
+    expect(contract).toContain("payloads are literal");
+    expect(contract).toContain("QuickJS lacks host globals");
   });
 
   it("runs handoff from finalized outer message_end without aborting nested calls", () => {

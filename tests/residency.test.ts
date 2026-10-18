@@ -22,7 +22,7 @@ import { ActionRegistry } from "../src/core/action-registry.js";
 import { createMainExecutionCeilingError } from "../src/async-settlement.js";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
-import type { FabricMainAgentDeliveryRequest, FabricMainAgentTarget } from "../src/main-agent.js";
+import { FOLLOW_UP_LIMITS, type FabricMainAgentDeliveryRequest, type FabricMainAgentTarget } from "../src/main-agent.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { ResidencyClient } from "../src/residency/client.js";
 import { ResidentHost, RESIDENT_RUN_RETENTION_MS } from "../src/residency/host.js";
@@ -1152,7 +1152,7 @@ describe("durable completion receipts", () => {
         const state = await rootHarness("fair-ancestry-drain");
         const main = await realMain(state, [], undefined, false);
         const from = { id: "bounded-actor", name: "actor", kind: "actor" as const };
-        for (let index = 0; index <= 1024; index++) {
+        for (let index = 0; index < FOLLOW_UP_LIMITS.senderItems; index++) {
           main.main.deliverAgent({ from, message: "tiny", delivery: "followUp", triggerTurn: true, data: { coalesceKey: "state" }, deliveryId: `prior-${index}` });
         }
         const prefix = residentDeliveryPrefix(state.identity.id);
@@ -1177,7 +1177,7 @@ describe("durable completion receipts", () => {
           expect(state.mesh.get(`${prefix}b-steer`)).toBeUndefined();
           expect(state.mesh.get(`${prefix}c-other`)).toBeUndefined();
           expect(main.sent.some((item) => item.options?.deliverAs === "steer")).toBe(true);
-          // Release and durably acknowledge the old carrier at a real Main boundary.
+          // Release and durably acknowledge all originals at a real Main boundary.
           main.main.flushHeldAtNextBoundary();
           main.emit("turn_end", { context: { pendingMessages: [] } });
           for (const item of main.sent) main.append(item);
@@ -1189,15 +1189,15 @@ describe("durable completion receipts", () => {
       } finally { synced.mockRestore(); }
     });
 
-    it("#169 round 1 leaves an over-bound replacement source in the resident mesh", { timeout: 15_000 }, async () => {
+    it("#169 round 1 leaves an over-quota same-key source in the resident mesh", { timeout: 15_000 }, async () => {
       // Barrier order and failures are covered by tests/atomic-write-durable.test.ts and the barrier regressions.
       const synced = vi.spyOn(fs, "fsyncSync").mockImplementation(() => {});
       try {
         const state = await rootHarness("ancestry-backpressure");
         const main = await realMain(state, [], undefined, false);
         const from = { id: "bounded-actor", name: "actor", kind: "actor" as const };
-        const maxAncestry = 1024;
-        for (let index = 0; index <= maxAncestry; index++) {
+        const maxItems = FOLLOW_UP_LIMITS.senderItems;
+        for (let index = 0; index < maxItems; index++) {
           main.main.deliverAgent({ from, message: "tiny", delivery: "followUp", triggerTurn: true, data: { coalesceKey: "state" }, deliveryId: `prior-${index}` });
         }
         const key = `${residentDeliveryPrefix(state.identity.id)}refused-source`;
@@ -1213,10 +1213,10 @@ describe("durable completion receipts", () => {
           await new Promise((resolve) => setTimeout(resolve, 100));
           expect(state.mesh.get(key)).toBeDefined();
           expect(deliver.mock.results.every((result) => result.type === "throw" && /queue is full/.test(String(result.value)))).toBe(true);
-          expect(main.main.queueDepth().pendingFollowUps).toBe(1);
+          expect(main.main.queueDepth().pendingFollowUps).toBe(maxItems);
           const saved = JSON.parse(fs.readFileSync(path.join(state.config.meshRoot, "main-followups", "root.json"), "utf8"));
-          expect(saved.items[0].supersedes).toHaveLength(maxAncestry);
-          expect(saved.items[0].deliveryId).toBe(`prior-${maxAncestry}`);
+          expect(saved.items.map((item: { deliveryId: string }) => item.deliveryId))
+            .toEqual(Array.from({ length: maxItems }, (_, index) => `prior-${index}`));
         } finally { await client.close(); await state.participants.close(); }
       } finally { synced.mockRestore(); }
     });
@@ -1486,7 +1486,8 @@ describe("durable completion receipts", () => {
     markUnresolvedWorker(seeded.runDirectory, "the Herdr server has been unreachable for 300 s");
     const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent });
     try {
-      await expect(client.cleanupAgent(seeded.id)).rejects.toThrow(/may still be running/);
+      expect(client.statusAgent(seeded.id).status).toBe("finishing");
+      await expect(client.cleanupAgent(seeded.id)).rejects.toThrow(/running durable/);
       expect(fs.existsSync(seeded.runDirectory)).toBe(true);
       expect(fs.existsSync(seeded.metadataPath)).toBe(true);
     } finally {
@@ -1607,7 +1608,8 @@ describe("durable completion receipts", () => {
     markUnresolvedWorker(path.join(seeded.runDirectory, "nested", "child"), "the Herdr server has been unreachable for 300 s");
     const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent });
     try {
-      await expect(client.cleanupAgent(seeded.id)).rejects.toThrow(/may still be running/);
+      expect(client.statusAgent(seeded.id).status).toBe("finishing");
+      await expect(client.cleanupAgent(seeded.id)).rejects.toThrow(/running durable/);
       expect(fs.existsSync(path.join(seeded.runDirectory, "nested", "child"))).toBe(true);
     } finally {
       await client.close();
@@ -1776,6 +1778,9 @@ describe("durable completion receipts", () => {
     const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent });
     try {
       expect(client.settledAgent(seeded.id)).toBeUndefined();
+      expect(client.statusAgent(seeded.id)).toMatchObject({ status: "finishing", text: "authoritative full result" });
+      expect(client.completionSettled(seeded.id)).toBe(false);
+      await expect(client.waitAgent(seeded.id, AbortSignal.timeout(30))).rejects.toThrow(/aborted/);
       const resultPath = residentResultPath(state.config.residencyRoot, seeded.id);
       fs.mkdirSync(path.dirname(resultPath), { recursive: true });
       fs.writeFileSync(resultPath, JSON.stringify({ ...seeded.result, status: "completed" }));
@@ -1783,6 +1788,43 @@ describe("durable completion receipts", () => {
       fs.rmSync(resultPath);
       fs.rmSync(ownerPath);
       expect(client.settledAgent(seeded.id)).toMatchObject({ status: "stopped" });
+    } finally {
+      await client.close();
+      await state.participants.close();
+    }
+  });
+
+  it("exposes a raw running worker's native finishing milestone without settling its result", async () => {
+    const state = await rootHarness("worker-finishing-milestone");
+    const seeded = await seedCompletion(state, "running");
+    const statusFile = path.join(seeded.runDirectory, "status.json");
+    fs.writeFileSync(statusFile, JSON.stringify({ ...seeded.result, finishingAt: Date.now() }));
+    const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent });
+    try {
+      expect(client.statusAgent(seeded.id)).toMatchObject({ status: "finishing", text: "authoritative full result" });
+      expect(client.completionSettled(seeded.id)).toBe(false);
+      await expect(client.waitAgent(seeded.id, AbortSignal.timeout(30))).rejects.toThrow(/aborted/);
+      fs.writeFileSync(statusFile, JSON.stringify({ ...seeded.result, status: "completed" }));
+      expect((await client.waitAgent(seeded.id)).status).toBe("completed");
+    } finally {
+      await client.close();
+      await state.participants.close();
+    }
+  });
+
+  it("masks an orphan terminal process candidate while persisted tree custody still sees a live writer", async () => {
+    const state = await rootHarness("orphan-finishing-tree");
+    const seeded = await seedCompletion(state);
+    const statusFile = path.join(seeded.runDirectory, "status.json");
+    fs.writeFileSync(statusFile, JSON.stringify({ ...seeded.result, sessionId: String(process.pid) }));
+    const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent });
+    try {
+      expect(client.statusAgent(seeded.id)).toMatchObject({ status: "finishing", text: "authoritative full result" });
+      expect(client.completionSettled(seeded.id)).toBe(false);
+      await expect(client.waitAgent(seeded.id, AbortSignal.timeout(30))).rejects.toThrow(/aborted/);
+      fs.writeFileSync(statusFile, JSON.stringify(seeded.result)); // captured persisted writer is now absent
+      expect(client.statusAgent(seeded.id).status).toBe("completed");
+      expect((await client.waitAgent(seeded.id)).status).toBe("completed");
     } finally {
       await client.close();
       await state.participants.close();

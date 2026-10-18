@@ -4,7 +4,8 @@ import { appendDeliveryOutcome } from "../mesh/delivery-outcomes.js";
 import { MeshBackgroundQueue } from "../core/atomic-write.js";
 import type { MeshEvent, MeshIdentity, MeshStore } from "../mesh/store.js";
 import {
-  INBOX_HORIZON_MS, ROOT_ID_PREFIX, crossIdentityReceipts, deliveryIdentity, eventReceipt, eventReceipts, topicWorkReceipt, workKey,
+  INBOX_HORIZON_MS, ROOT_ID_PREFIX, ROOT_INBOX_ACTION_KINDS, compareRootInboxEvents, crossIdentityReceipts, deliveryIdentity,
+  eventReceipt, eventReceipts, rootInboxBudget, topicWorkReceipt, workKey,
   type RootInboxBatch, type RootInboxEvent, type RootInboxReconcileOptions, type RootInboxSession,
 } from "./root-inbox-shared.js";
 
@@ -28,7 +29,11 @@ export {
  * event is skipped when the recipient has a confirmed native/inbox receipt for its sender and
  * work identity, persisted across reloads. Queued messages are not receipts. Addressed shadows
  * older than the configurable horizon are expired on first drain without buying model turns,
- * except answers, blockers, handoffs and completions: those remain actionable work.
+ * except answers, action kinds and completions: those remain actionable work.
+ *
+ * Ordinary durable admission stays bounded. Priority lookahead beyond that prefix is also offered,
+ * without moving its cursor or adding pending ids: the log and the pinned prefix recover it.
+ * Only shown rows are acknowledged; overflow is still work for the following turn.
  *
  * An event whose message entered a turn is acknowledged by id (smarty-dev#8962): it is never
  * injected again, whatever the session file confirms. A fully acknowledged batch moves the cursor
@@ -47,7 +52,7 @@ const STEER_GRACE_MS = 60_000;
  * that lands after the shadow was injected can duplicate it; confirmed receipts still suppress).
  * Name/alias-addressed events keep the grace; unaddressed events never hold the cursor.
  */
-const NEVER_EXPIRE_KINDS = new Set(["answer", "blocker", "handoff", "completion"]);
+const NEVER_EXPIRE_KINDS = new Set(["answer", "blocked", "blocker", "ask", "handoff", "done", "completion"]);
 const LATE_DELIVERY_HOUR_MS = 60 * 60_000;
 const inboxHorizonMs = (): number => {
   const text = process.env.PI_FABRIC_INBOX_HORIZON_MS;
@@ -109,6 +114,11 @@ interface RootInboxState {
   acked?: Array<[string, number]>;
 }
 
+/** Only cursor-only progress is gated; receipt/pending changes stay dirty until saved. */
+const immediateSnapshot = (state: Partial<RootInboxState> | undefined): string => JSON.stringify([
+  state?.pending, state?.delivered, state?.deliveredAt, state?.fallbacks, state?.fallbackAt, state?.fallbackThrough,
+]);
+
 const sequenceOf = (value: unknown): number =>
   typeof value === "number" && Number.isSafeInteger(value) ? value : Number.NEGATIVE_INFINITY;
 const parseAcks = (value: unknown): Array<[string, number]> => Array.isArray(value)
@@ -119,6 +129,7 @@ const parseAcks = (value: unknown): Array<[string, number]> => Array.isArray(val
 export class RootInbox {
   #state: RootInboxState | undefined;
   #saved: string | undefined;
+  #savedImmediate: string | undefined;
   #savedAt = 0;
   #wokeAt = Number.NEGATIVE_INFINITY;
   #dueAt = Number.POSITIVE_INFINITY;
@@ -145,9 +156,9 @@ export class RootInbox {
 
   /**
    * The batch to deliver now. A pending batch the session holds is committed first; one it does
-   * not hold is delivered again. A new batch stops at the first addressed event younger than the
-   * steer grace (priority reads admit through an exact-session event first) and at the batch
-   * bounds, so the cursor never passes an event it has not admitted.
+   * not hold is delivered again. Ordinary admission stops at the steer grace (priority reads
+   * admit through an exact-session event first) and batch bounds, so the cursor never passes
+   * work it has not admitted. Ranked lookahead can offer newer work past that pending prefix.
    */
   async next(session: RootInboxSession, options: RootInboxReconcileOptions = {}): Promise<RootInboxBatch> {
     this.#dueAt = Number.POSITIVE_INFINITY;
@@ -165,12 +176,13 @@ export class RootInbox {
 
   async #next(session: RootInboxSession, options: RootInboxReconcileOptions, priority: boolean): Promise<RootInboxBatch> {
     const state = this.#load();
-    let receiptsChanged = this.#trimReceipts();
-    receiptsChanged = JSON.stringify(state) !== this.#saved || receiptsChanged;
+    let saveImmediately = this.#trimReceipts();
+    saveImmediately = immediateSnapshot(state) !== this.#savedImmediate || saveImmediately;
     // Canonical history without a finite timestamp is exact-replay evidence only; do not
     // renew its ambiguous key/ref claim at read time.
-    receiptsChanged = this.#remember(session.delivered ?? [], session.deliveredAt, true) || receiptsChanged;
+    saveImmediately = this.#remember(session.delivered ?? [], session.deliveredAt, true) || saveImmediately;
     let skippedStale = 0;
+    const reservations = new Set<string>();
     if (state.pending && options.turnEnd) await this.#alarmPending(state).catch(error => {
       // An observational alarm must never keep confirmed work wedged behind publication.
       diagnostics.warn("src/topology/root-inbox.ts", `[pi-fabric] root inbox alarm: ${error instanceof Error ? error.message : String(error)}`);
@@ -182,7 +194,7 @@ export class RootInbox {
       const unacked = held.through <= this.#mark() ? [] : held.ids.filter((id) => !this.#acks.has(id));
       const holdsBatch = unacked.length === 0 || session.holdsBatch(held.ids);
       if (options.commitOnly && !holdsBatch) {
-        await this.#save(receiptsChanged);
+        await this.#save(saveImmediately);
         return { events: [], through: state.after };
       }
       const reread = this.#reread(state.after, held);
@@ -204,7 +216,6 @@ export class RootInbox {
           missing = [];
         }
         // A native delivery can arrive after the pending save. Recheck it on recovery too.
-        const reservations = new Set<string>();
         const events = pending.filter((event) => {
           if (this.#stale(event)) { skippedStale++; return false; }
           if (!this.#steered(event, session, reservations)) return true;
@@ -217,7 +228,8 @@ export class RootInbox {
           // Retry a failed pending-cursor save before delivery: in-memory pending alone
           // is not durable admission, including after a mesh acquisition timeout.
           await this.#save(true);
-          return this.#unacked({ events, through: held.through, ...(skippedStale ? { skippedStale, horizonMs: this.#horizon() } : {}) });
+          return this.#offer({ events, through: held.through, ...(skippedStale ? { skippedStale, horizonMs: this.#horizon() } : {}) },
+            session, priority, reservations);
         }
       }
       state.after = Math.max(state.after, held.through);
@@ -225,24 +237,24 @@ export class RootInbox {
       await this.#save(true);
     }
     if (options.commitOnly) {
-      await this.#save(receiptsChanged);
+      await this.#save(saveImmediately);
       return { events: [], through: state.after };
     }
     const batch = this.#scan(state.after, session, true, (event, reservations) => {
-      receiptsChanged = this.#consumeFallback(event, reservations) || receiptsChanged;
-      receiptsChanged = this.#remember(eventReceipts(event)) || receiptsChanged;
-    }, priority);
+      saveImmediately = this.#consumeFallback(event, reservations) || saveImmediately;
+      saveImmediately = this.#remember(eventReceipts(event)) || saveImmediately;
+    }, priority, reservations);
     skippedStale += batch.skippedStale ?? 0;
     if (skippedStale) { batch.skippedStale = skippedStale; batch.horizonMs = this.#horizon(); }
     if (batch.events.length === 0) {
       state.after = batch.through;
       // Expiry and new receipts are durable immediately: a restart must not repeat the summary.
-      await this.#save(receiptsChanged || skippedStale > 0);
+      await this.#save(saveImmediately || skippedStale > 0);
       return batch;
     }
     state.pending = { through: batch.through, ids: batch.events.map((event) => event.id), since: this.#now() };
     await this.#save(true);
-    return this.#unacked(batch);
+    return this.#offer(batch, session, priority, reservations);
   }
 
   /**
@@ -270,7 +282,7 @@ export class RootInbox {
     if (!idle()) return undefined;
     // A stale-only drain reports once but must not buy a model turn; nor does late actionable work.
     if (batch.events.length === 0) return batch.skippedStale ? batch : undefined;
-    const waking = batch.events.filter((event) => !event.deliveredLate);
+    const waking = rootInboxBudget(batch.events).shown.filter((event) => !(event as RootInboxEvent).deliveredLate);
     if (waking.length === 0) return batch;
     const reason = urgent ? "p0" : exact ? "addressed" : "idle";
     this.#wokeAt = this.#now();
@@ -305,10 +317,14 @@ export class RootInbox {
     // smarty-dev#5518: an ack is the inbox carrier entering a turn, so it is native consumption.
     // Resolve the batch's newly acked events before the cursor moves past them; next() then never
     // sees them, and the journal dedups an id it already holds (exactly once per event id).
-    const consumed = pending ? ids.filter((id) => pending.ids.includes(id) && !this.#acks.has(id)) : [];
-    const delivered = consumed.length ? this.#reread(state.after, { ...pending!, ids: consumed }) : [];
+    // Lookahead can be above the pending prefix. Its ack must retain its actual sequence:
+    // committing the prefix must not erase an out-of-order consumption receipt.
+    const consumed = ids.filter((id) => !this.#acks.has(id));
+    const through = Math.max(pending?.through ?? state.after, this.mesh.latestSequence());
+    const delivered = consumed.length ? this.#reread(state.after, { ids: consumed, through, since: this.#now() }) : [];
+    const sequences = new Map(delivered.map((event) => [event.id, event.sequence]));
     for (const id of ids) {
-      if (!this.#acks.has(id)) this.#acks.set(id, pending?.ids.includes(id) ? pending.through : state.after);
+      if (!this.#acks.has(id)) this.#acks.set(id, sequences.get(id) ?? through);
     }
     if (pending && pending.ids.every((id) => this.#acks.has(id))) {
       state.after = Math.max(state.after, pending.through);
@@ -367,6 +383,57 @@ export class RootInbox {
   }
 
   #acked(event: MeshEvent): boolean { return event.sequence <= this.#mark() || this.#acks.has(event.id); }
+
+  /**
+   * Keep the ordinary 20-event/32-KiB durable prefix, plus a ranked tail window that fits the
+   * remaining persisted ack slots. Reserve every unacked pending id too, including missing ids,
+   * so a full lookahead window leaves enough headroom for the pinned prefix to make progress.
+   * Only the prefix is pending state; no cursor crosses intervening undisplayed work.
+   */
+  #offer(
+    batch: RootInboxBatch, session: RootInboxSession, priority: boolean, reservations: Set<string>,
+  ): RootInboxBatch {
+    const seen = new Set<string>();
+    const actions: RootInboxEvent[] = [], candidates: RootInboxEvent[] = [];
+    const consider = (event: RootInboxEvent): void => {
+      const receipts = eventReceipts(event);
+      if (receipts.some((id) => seen.has(id))) return;
+      for (const id of receipts) seen.add(id);
+      if (ROOT_INBOX_ACTION_KINDS.has(event.kind)) {
+        actions.push(event);
+        actions.sort(compareRootInboxEvents);
+        if (actions.length > MAX_ACKED_IDS) actions.pop();
+      } else {
+        candidates.push(event);
+        candidates.sort(compareRootInboxEvents);
+        if (candidates.length > MAX_BATCH_EVENTS) candidates.pop();
+      }
+    };
+    batch.events.forEach(consider);
+    // Reuse MAIN's scan protocol, including exact-session priority and one-use fallback claims.
+    // This is observational lookahead: suppressed tail events are consumed only on admission.
+    this.#scan(batch.through, session, false, undefined, priority, reservations).events.forEach(consider);
+    const window: RootInboxEvent[] = [];
+    let bytes = 0;
+    for (const event of candidates) {
+      const size = Math.min(Buffer.byteLength(event.text ?? ""), MAX_EVENT_TEXT_BYTES);
+      if (window.length && bytes + size > MAX_BATCH_TEXT_BYTES) break;
+      window.push(event);
+      bytes += size;
+    }
+    const ids = new Set(batch.events.map((event) => event.id));
+    const pendingSlots = this.#state!.pending?.ids.filter((id) => !this.#acks.has(id)).length ?? 0;
+    // Nonaction lookahead uses the same cumulative ack capacity as actions.
+    let remaining = Math.max(0, MAX_ACKED_IDS - this.#acks.size - pendingSlots);
+    const lookahead = [...actions, ...window].filter((event) => {
+      if (ids.has(event.id) || remaining === 0) return false;
+      ids.add(event.id);
+      remaining--;
+      return true;
+    });
+    // Keep the pinned prefix offered even at capacity; without lookahead it gets the next turn.
+    return this.#unacked({ ...batch, events: [...batch.events, ...lookahead] });
+  }
 
   /** Drop what an ack recorded while this read awaited the mesh. */
   #unacked(batch: RootInboxBatch): RootInboxBatch {
@@ -682,6 +749,7 @@ export class RootInbox {
       this.#state.fallbackThrough = value.fallbackThrough;
     }
     this.#saved = saved ? JSON.stringify(value) : undefined;
+    this.#savedImmediate = saved ? immediateSnapshot(value) : undefined;
     this.#trimReceipts();
     this.#savedAt = saved ? this.#now() : 0;
     return this.#state;
@@ -693,8 +761,10 @@ export class RootInbox {
     const text = JSON.stringify(this.#state);
     if (text === this.#saved) return;
     if (!now && this.#now() - this.#savedAt < SAVE_INTERVAL_MS) return;
+    const immediate = immediateSnapshot(this.#state);
     await this.mesh.put({ key: this.key, value: JSON.parse(text) as RootInboxState, identity: this.identity });
     this.#saved = text;
+    this.#savedImmediate = immediate;
     this.#savedAt = this.#now();
   }
 

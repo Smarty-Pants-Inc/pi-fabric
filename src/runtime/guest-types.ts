@@ -820,6 +820,8 @@ interface FabricActorRequestBase extends FabricActorBatching {
   activation?: FabricActorActivationPolicy;
   /** Skip-only rules checked before a queued mesh or host event runs the model. */
   activationFilter?: FabricActorActivationFilter;
+  /** Age from dead-letter recorded time; default 6 h, 0 = unlimited. Stale entries are archived. */
+  deadLetterReplayMaxAgeMs?: number;
   /** Per-activation shadow routing; requires explicit model/thinking. */
   routeClass?: "status-groom";
   /** Required clear trusted state; review/security/audit/needs-security-pass must be true. */
@@ -901,6 +903,8 @@ interface FabricActorInfo extends FabricActorBatching {
   dedupeKey?: string;
   activation?: FabricActorActivationPolicy;
   activationFilter?: FabricActorActivationFilter;
+  /** Effective replay age limit in milliseconds; 0 = unlimited. */
+  deadLetterReplayMaxAgeMs?: number;
   /** Skips since the filter was last set/cleared; null last fields mean no skip yet. */
   filterSkipped: { count: number; lastKey: string | null; lastTopic: string | null; lastAt: number | null };
   activationFilterExpiresAt?: number;
@@ -1021,7 +1025,11 @@ type FabricMessageTarget =
   | { to: string; id?: string; sessionId?: FabricSessionIdHint };
 /** sessionId is not a field: write id: "session:<sessionId>". */
 type FabricSessionIdHint = "sessionId is not a field: use id: 'session:<sessionId>'";
-/** coalesceKey (1-200 chars): a followUp/tell replaces your unread held one to a busy Main with the same key (like actor coalesceKey). */
+/**
+ * data.coalesceKey is ordinary payload for Main: accepted originals are retained
+ * independently, with one admission per stable message identity. Main does not
+ * merge, replace, or deduplicate by this key. Actor coalesceKey settings are separate.
+ */
 interface FabricMessageData { coalesceKey?: string; [key: string]: unknown }
 type FabricMessageArgs = FabricMessageTarget & {
   message: string;
@@ -1084,8 +1092,9 @@ interface FabricMessageDelivery {
   pendingFollowUps?: number;
   /** For a Main target: the age in seconds of your oldest followUp it still holds (0 when none). */
   oldestAgeS?: number;
-  /** Main: it replaced your held followUp replacedMessageId (same data.coalesceKey). */
+  /** Legacy/remote receiver compatibility; current Main does not report replacement. */
   coalesced?: true;
+  /** Replaced message identity when reported by a legacy/remote receiver. */
   replacedMessageId?: string;
 }
 /** Select the native store to inspect; this read-only preflight never starts a host. */
@@ -1160,7 +1169,7 @@ interface FabricAgentsApi {
   setInferenceContext(args: { id: string; inferenceContext: "full-history" | "activation"; scope?: "project" | "global" }): Promise<FabricActorInfo>;
   setCoalesceKey(args: { id: string; coalesceKey: string | null; scope?: "project" | "global" }): Promise<FabricActorInfo>;
   setBatching(args: FabricActorBatching & { id: string; scope?: "project" | "global" }): Promise<FabricActorInfo>;
-  setActivationFilter(args: { id: string; activationFilter: FabricActorActivationFilter | null; expiresAt?: number; scope?: "project" | "global" }): Promise<FabricActorInfo>;
+  setActivationFilter(args: { id: string; activationFilter: FabricActorActivationFilter | null; expiresAt?: number; deadLetterReplayMaxAgeMs?: number; scope?: "project" | "global" }): Promise<FabricActorInfo>;
   /** Replace ordinary actor mesh topics; [] stops topic intake without discarding accepted work. Native slot-bound topics are immutable. Live actors require the local owner; global updates only the template. */
   setTopics(args: { id: string; topics: string[]; scope?: "project" | "global" }): Promise<FabricActorInfo>;
   setEvents(args: { id: string; events: FabricActorHostEvent[] }): Promise<FabricActorInfo>;

@@ -152,12 +152,13 @@ it("config and inherited deletion guard refuse the reported fleet sequence after
     }
     for (const name of ['rm', 'rmdir', 'unlink']) fs.promises[name] = async () => { calls.push(name); };
     const config = (await import(pathToFileURL(process.cwd() + '/vitest.config.cts'))).default;
+    const expectedHostedExcludes = config.productDeletionSuites();
     const before = calls.length;
     await import(pathToFileURL(process.cwd() + '/tests/test-deletion-guard.mjs'));
     let code;
     try { fs.rmSync(process.cwd() + '/HOSTED-REFUSAL-NOT-A-REAL-TARGET'); } catch (error) { code = error.code; }
     console.log('FLEET:' + JSON.stringify({ role: process.env.SMARTY_ROLE, veto: process.env.PI_TEST_FLEET_HOST,
-      excludes: config.test.exclude, projects: config.test.projects.map(p => p.test.exclude),
+      excludes: config.test.exclude, expectedHostedExcludes, projects: config.test.projects.map(p => p.test.exclude),
       code, delegated: calls.length - before }));
   `;
   const child = join(fs.mkdtempSync(join(tmpdir(), "hosted-gate-")), "probe.mjs");
@@ -172,7 +173,7 @@ it("config and inherited deletion guard refuse the reported fleet sequence after
   const output = JSON.parse(line!.slice(6));
   expect(output.role).toBeUndefined();
   expect(output.veto).toBe("1");
-  expect(output.excludes).toHaveLength(15);
+  expect(output.excludes).toEqual(expect.arrayContaining(output.expectedHostedExcludes));
   for (const project of output.projects) expect(project).toEqual(expect.arrayContaining(output.excludes));
   expect(output.code).toBe("ERR_TEST_DELETION_GUARD");
   expect(output.delegated).toBe(0);

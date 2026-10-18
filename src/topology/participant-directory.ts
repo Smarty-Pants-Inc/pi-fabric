@@ -932,7 +932,10 @@ export class ParticipantDirectory implements FabricParticipantSource {
       // An admitted resident stays live during registry/key waits without rewriting
       // its actor files. This does not certify shared admission or advance confirmation.
       if (this.options.enabled && !this.#quiescing &&
-        ((this.#leaseConfirmed && this.options.actorRenewalAllowed) || (this.#refreshing && this.#fileWork > 0))) {
+        ((this.#leaseConfirmed && (this.options.actorRenewalAllowed ||
+          this.options.hostId === this.options.rootId && this.options.identity.id === this.options.rootId &&
+          this.options.identity.kind === "main" && this.#localRecords.get(this.options.rootId)?.kind === "root")) ||
+          (this.#refreshing && this.#fileWork > 0))) {
         void this.#renewFileLease().catch(error => {
           this.#refreshError = this.#superseded ?? error;
           this.#routingReadAt = 0;

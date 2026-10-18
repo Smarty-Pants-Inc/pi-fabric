@@ -36,6 +36,8 @@ import type { AgentRunRecord, AgentRunRequest, AgentRunResult, AgentRunStopCalle
 import { isRecoveredDurableStop } from "../agents/enodev-recovery.js";
 import type { ModelRouteDecision } from "../agents/model-route.js";
 import type { SpawnRouterAdmission } from "../agents/spawn-router.js";
+import type { PlacementQueueReason } from "../agents/placement-contract.js";
+import type { FabricPlacementWake } from "../topology/control-plane.js";
 
 import { readJsonlPage } from "../log-tail.js";
 import { ActorChildCompletionStore, ActorChildCompletionWatch, ChildCompletionClaimLostError } from "./child-completions.js";
@@ -127,7 +129,24 @@ export interface ActorMessageBindingOptions {
   sender?: FabricMessageSender | null;
 }
 
+interface ActorPlacementQueue {
+  launchId: string;
+  generation: number;
+  queueId?: string;
+  reason: PlacementQueueReason;
+  /** Seconds, as returned by the writer; retryAt is its host-clock lower bound. */
+  retryAfter: number;
+  retryAt: number;
+  /** Stable wake identities (one per reason), retained even after a retry consumes them. */
+  wakes: FabricPlacementWake[];
+  wakePending?: true;
+  /** A wake was consumed, but no replacement QUEUE/terminal result has committed yet. */
+  retrying?: true;
+}
+
 interface ActorQueueItem {
+  /** Prompt-free writer queue custody, not launch or inference evidence. */
+  placementQueue?: ActorPlacementQueue;
   outcomeSend?: DeliverySend;
   /** Checkpointed before FAILED escapes: this original is never runnable again. */
   terminalFailed?: true;
@@ -758,6 +777,41 @@ const restoredActivationBlock = (stored: { reason: string; code: string; since: 
     ...(transient ? { retryAt: finitePositive(stored.retryAt) ? stored.retryAt : stored.since + activationBlockBackoffMs(stored.count) } : {}),
     ...(transient && finitePositive(stored.backoffMs) ? { backoffMs: stored.backoffMs } : {}) };
 };
+const PLACEMENT_QUEUE_REASONS: ReadonlySet<string> = new Set([
+  "AGENT_CAPACITY_EXHAUSTED", "FACTS_UNKNOWN", "CI_FACTS_UNKNOWN", "HUMAN_RESERVE_PROTECTED", "ROUTE_UNHEALTHY",
+  "PROVIDER_CAPACITY_UNKNOWN", "QUALITY_PROFILE_UNAVAILABLE", "POLICY_CONFLICT", "BINDING_UNVERIFIED",
+  "DECIDER_UNAVAILABLE", "REQUEST_INVALID", "DEADLINE_EXPIRED", "QUEUE_FULL", "HUMAN_DEMAND_SATURATED",
+]);
+const placementId = (value: unknown): value is string => typeof value === "string" &&
+  [...value].length > 0 && [...value].length <= 200 && !/[\u0000-\u001f\u007f]/u.test(value);
+const placementWakeReceipt = (value: unknown, launchId: string, generation: number): FabricPlacementWake | undefined => {
+  const wake = refRecord(value);
+  if (!wake || wake.version !== 1 || wake.launchId !== launchId || wake.generation !== generation ||
+      !["eligible", "released-never-started", "released-exited"].includes(wake.reason as string) || typeof wake.at !== "string") return;
+  const match = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.\d{1,6})?Z$(?![\s\S])/u.exec(wake.at);
+  const at = match ? Date.parse(`${match[1]}Z`) : NaN;
+  if (!Number.isFinite(at) || new Date(at).toISOString().slice(0, 19) !== match![1]) return;
+  return { version: 1, launchId, generation, reason: wake.reason as FabricPlacementWake["reason"], at: wake.at };
+};
+/** Restore/project only the closed placement metadata, never a request, task or diagnostic blob. */
+const restoredPlacementQueue = (value: unknown): ActorPlacementQueue | undefined => {
+  const row = refRecord(value);
+  if (!row || !placementId(row.launchId) || !Number.isSafeInteger(row.generation) || (row.generation as number) < 1 ||
+      (row.queueId !== undefined && !placementId(row.queueId)) || !PLACEMENT_QUEUE_REASONS.has(row.reason as string) ||
+      typeof row.retryAfter !== "number" || !Number.isFinite(row.retryAfter) || row.retryAfter < 0 || row.retryAfter > 86_400 ||
+      typeof row.retryAt !== "number" || !Number.isSafeInteger(row.retryAt) || row.retryAt < 0 || !Array.isArray(row.wakes) || row.wakes.length > 3) return;
+  const wakes: FabricPlacementWake[] = [];
+  for (const value of row.wakes) {
+    const wake = placementWakeReceipt(value, row.launchId, row.generation as number);
+    if (!wake || wakes.some(prior => prior.reason === wake.reason)) return;
+    wakes.push(wake);
+  }
+  return { launchId: row.launchId, generation: row.generation as number,
+    ...(row.queueId !== undefined ? { queueId: row.queueId as string } : {}),
+    reason: row.reason as PlacementQueueReason, retryAfter: row.retryAfter, retryAt: row.retryAt, wakes,
+    ...(row.wakePending === true && wakes.length ? { wakePending: true } : {}),
+    ...(row.retrying === true && wakes.length ? { retrying: true } : {}) };
+};
 type ActorDeadLetter = { at: number; source: string; event: MeshEvent; batchQueued?: true; supersededSends?: DeliverySend[] };
 
 export class ActorPreparationError extends Error {
@@ -796,6 +850,10 @@ export class ActorManager {
   readonly #inFlightBatches = new Map<string, ActorQueueItem[]>();
   /** At most one unref'd leading-edge batching wake per actor. */
   readonly #batchTimers = new Map<string, { at: number; timer: NodeJS.Timeout }>();
+  /** Only an accepted early wake arms this lower-bound timer; no idle placement polling. */
+  readonly #placementTimers = new Map<string, { at: number; timer: NodeJS.Timeout }>();
+  /** A failed durable queue write still owes a checkpoint, even with no wake yet. */
+  readonly #placementDirty = new Set<string>();
   readonly #deferredHandoffs = new Map<string, ActorQueueItem[]>();
   readonly #pendingHandoffConsumption = new Map<string, Set<string>>();
   readonly #pendingDeliveryOutcomes = new Map<string, DeliveryOutcomeRecord[]>();
@@ -4353,6 +4411,7 @@ export class ActorManager {
     await this.#registrySavePending;
     await this.#registrySaveChain;
     this.#clearBatchTimer();
+    this.#clearPlacementTimer();
     for (const timer of this.#drainRetries.values()) clearTimeout(timer);
     this.#drainRetries.clear();
     this.#drainRearms.clear();
@@ -4692,7 +4751,7 @@ export class ActorManager {
       const existing = [...actor.queue, ...(this.#overflow.get(actor.id) ?? []), ...(this.#parked.get(actor.id) ?? [])]
         // Batches retain every original; a confirmed no-tool overflow owns one replay of
         // this exact activation, not its successor.
-        .find((item) => !item.batchQueued && !item.batchIds && !item.overflowRetried &&
+        .find((item) => !item.placementQueue && !item.batchQueued && !item.batchIds && !item.overflowRetried &&
           item.coalesceKey === options.coalesceKey);
       if (existing) {
         const previous = options.checkpoint || options.natsEventReceiptId !== undefined ? { ...existing } : undefined;
@@ -4869,6 +4928,86 @@ export class ActorManager {
     this.#ensureDrain(actor);
   }
 
+  /**
+   * Host-only callback for an already authenticated placement.wake. Exact local actor
+   * ids only (never names). True is a durable queue receipt, NOT launch authority.
+   * Storage errors throw so the control plane can NAK rather than ACK lost work.
+   */
+  placementWake(targetId: string, wake: FabricPlacementWake): boolean {
+    const actor = this.#actors.get(targetId);
+    if (!actor || !this.#persistent || this.#closing || actor.removal || actor.status === "stopped" ||
+        !this.#ownQueueRead.has(targetId) || !this.#placementActorActivation(actor)) return false;
+    const receipt = placementWakeReceipt(wake, wake.launchId, wake.generation);
+    if (!receipt) return false;
+    const held = [...actor.queue, ...(this.#overflow.get(targetId) ?? []), ...(this.#parked.get(targetId) ?? []),
+      ...this.#inFlightItems(targetId)];
+    const matches = [...new Set(held)].filter(item => !item.executionStarted && item.placementQueue?.launchId === receipt.launchId &&
+      item.placementQueue.generation === receipt.generation);
+    if (!matches.length) return false;
+    const previous = matches.map(item => item.placementQueue!);
+    for (const item of matches) {
+      const queued = item.placementQueue!;
+      if (!queued.wakes.some(prior => prior.reason === receipt.reason)) {
+        item.placementQueue = { ...queued, wakes: [...queued.wakes, receipt], wakePending: true };
+      }
+    }
+    if (!this.#persistQueue(targetId, true)) {
+      matches.forEach((item, index) => { item.placementQueue = previous[index]!; });
+      throw new ActorQueueCheckpointError(actor);
+    }
+    queueMicrotask(() => this.#requestDrain(this.#actors.get(targetId) ?? actor));
+    return true;
+  }
+
+  #clearPlacementTimer(id?: string): void {
+    for (const [actorId, { timer }] of this.#placementTimers) {
+      if (id !== undefined && id !== actorId) continue;
+      clearTimeout(timer);
+      this.#placementTimers.delete(actorId);
+    }
+  }
+
+  #placementRunnable(item: ActorQueueItem, now = Date.now()): boolean {
+    return !item.placementQueue || ((item.placementQueue.wakePending === true || item.placementQueue.retrying === true) &&
+      now >= item.placementQueue.retryAt);
+  }
+
+  #placementHeadReady(actor: ManagedActor): boolean {
+    const now = Date.now();
+    const overflow = this.#overflow.get(actor.id) ?? [];
+    const held = [...actor.queue, ...overflow];
+    if (this.#placementDirty.has(actor.id)) this.#persistQueue(actor.id, true);
+    const at = Math.min(this.#placementDirty.has(actor.id) ? now + this.#preparationRetryMs : Infinity,
+      ...held.flatMap(item => (item.placementQueue?.wakePending || item.placementQueue?.retrying) && item.placementQueue.retryAt > now
+        ? [item.placementQueue.retryAt] : []));
+    if (this.#placementTimers.get(actor.id)?.at !== at) {
+      this.#clearPlacementTimer(actor.id);
+      if (Number.isFinite(at)) {
+        const timer = setTimeout(() => {
+          if (this.#placementTimers.get(actor.id)?.timer !== timer) return;
+          this.#placementTimers.delete(actor.id);
+          const current = this.#actors.get(actor.id);
+          if (current) this.#requestDrain(current);
+        }, Math.min(at - now, 2_147_483_647));
+        timer.unref();
+        this.#placementTimers.set(actor.id, { at, timer });
+      }
+    }
+    let index = actor.queue.findIndex(item => this.#placementRunnable(item, now));
+    if (index < 0) {
+      const fromOverflow = overflow.findIndex(item => this.#placementRunnable(item, now));
+      if (fromOverflow < 0) return false;
+      const [ready] = overflow.splice(fromOverflow, 1);
+      // Keep the configured queue bound while bypassing waiting background work.
+      if (actor.queue.length >= this.meshConfig.actorQueueLimit) overflow.unshift(actor.queue.pop()!);
+      actor.queue.unshift(ready!);
+      if (!overflow.length) this.#overflow.delete(actor.id);
+      index = 0;
+    }
+    if (index > 0) actor.queue.unshift(...actor.queue.splice(index, 1));
+    return actor.queue.length > 0;
+  }
+
   #clearBatchTimer(id?: string): void {
     for (const [actorId, { timer }] of this.#batchTimers) {
       if (id !== undefined && id !== actorId) continue;
@@ -4878,6 +5017,7 @@ export class ActorManager {
   }
 
   #batchBypass(item: ActorQueueItem): boolean {
+    if (item.placementQueue) return true; // Writer-owned activations never absorb unrelated input.
     if (!item.source.startsWith("mesh:") && !item.source.startsWith("host:")) return true;
     if (item.resolve || item.reject || item.source === "host:input" || item.source === "host:user_bash") return true;
     const event = refRecord(item.payload);
@@ -5084,7 +5224,7 @@ export class ActorManager {
     // Confirmed-unlaunched work stays in custody until an explicit reset or a
     // successful caller-owned probe. New callerless input must not clear its block.
     // Asks bypass batching, so a probe cannot absorb the retained observations.
-    const probe = actor.queue.findIndex(item => Boolean(item.resolve || item.reject));
+    const probe = actor.queue.findIndex(item => Boolean(item.resolve || item.reject) && this.#placementRunnable(item));
     if (probe < 0) return false;
     actor.queue.unshift(...actor.queue.splice(probe, 1));
     return true;
@@ -5105,7 +5245,7 @@ export class ActorManager {
     ) {
       return;
     }
-    if (!this.#preparationHeadReady(actor) || !this.#batchReady(actor)) return;
+    if (!this.#placementHeadReady(actor) || !this.#preparationHeadReady(actor) || !this.#batchReady(actor)) return;
     actor.draining = true;
     this.#draining.set(actor.id, actor);
     const drain = this.#slotEnforced(actor.topics)
@@ -5222,7 +5362,7 @@ export class ActorManager {
         if (reset) await reset;
         if (actor.queue.length === 0 || !this.#slotCurrent(actor) || (actor.status as string) === "stopped" || this.#closing ||
             (this.#releasePaused && (this.#releaseStrict || !actor.queue.some(item => item.resolve || item.reject)))) break;
-        if (!this.#preparationHeadReady(actor) || !this.#batchReady(actor)) break;
+        if (!this.#placementHeadReady(actor) || !this.#preparationHeadReady(actor) || !this.#batchReady(actor)) break;
         // A persisted completion cannot run before its handoff receipt commits.
         // If receipt I/O failed, even an unrelated new message must not drain it;
         // the next poll retries the same queued id before opening this gate.
@@ -5418,6 +5558,23 @@ export class ActorManager {
               // A failed fsync is an unlaunched preparation failure, never permission to run.
               if (this.#persistent && !this.#persistQueue(actor.id, true)) throw new Error("Actor activation manifest checkpoint failed");
             });
+          }
+          if (item.placementQueue?.wakePending) {
+            const events = this.#batchItems(actor.id, item);
+            for (const event of events) if (event.placementQueue) {
+              delete event.placementQueue.wakePending;
+              event.placementQueue.retrying = true;
+            }
+            // Consume each stable wake durably before re-deciding. A redelivery
+            // after another QUEUE must not become another decide/launch attempt.
+            // The retrying marker keeps a crash BEFORE decide restart-runnable.
+            if (!this.#persistQueue(actor.id, true)) {
+              for (const event of events) if (event.placementQueue) {
+                event.placementQueue.wakePending = true;
+                delete event.placementQueue.retrying;
+              }
+              throw new ActorPreparationError(actor.id, "placement-checkpoint", new ActorQueueCheckpointError(actor));
+            }
           }
           preLaunch = false; // AgentManager bounds model/auth setup after (not during) permit waiting.
           if (this.#slotEnforced(actor.topics)) this.#slotLaunchUnknown.add(actor.id);
@@ -5698,12 +5855,26 @@ export class ActorManager {
             );
           }
         } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
+          // Load the optional placement boundary only at actual first use. Neither
+          // the thrown request nor CLI diagnostics are logged or checkpointed here.
+          const placementError = error instanceof Error && error.name === "PlacementQueueError";
+          const placementQueue = placementError ? await this.#placementQueueFromError(item, error, workerLaunched) : undefined;
+          const placementRefused = placementError && !placementQueue;
+          if (placementQueue) {
+            this.#slotLaunchUnknown.delete(actor.id); // Confirmed QUEUE is not an uncertain create.
+            for (const event of this.#batchItems(actor.id, item)) {
+              event.placementQueue = placementQueue;
+              event.launchEvidenceVersion = 1;
+              event.executionStarted = false;
+            }
+          }
+          const message = placementError ? "Placement admission refused: queue-not-admissible"
+            : error instanceof Error ? error.message : String(error);
           const preparationKind = preparationFailureKind(error);
           if (error instanceof AgentLaunchPreparationTimeoutError && error.launchOutcome === "unlaunched") {
             this.#slotLaunchUnknown.delete(actor.id);
           }
-          if (!this.#slotCurrent(actor) && !runCompleted) {
+          if (!placementRefused && !this.#slotCurrent(actor) && !runCompleted) {
             // Authority loss during async preparation cannot consume accepted input.
             // Unlike ownership-transfer #park, retain callback asks too: a slot
             // outage is not permission to reject-and-forget an accepted activation.
@@ -5725,7 +5896,7 @@ export class ActorManager {
           }
           const ownershipAborted = actor.ownershipAbort === abortController;
           if (ownershipAborted) delete actor.ownershipAbort;
-          if (!this.#canManage(actor.id) || ownershipAborted) {
+          if (!placementRefused && (!this.#canManage(actor.id) || ownershipAborted)) {
             // An ownership change cut the run off. An event without a caller is kept for
             // the next owner run instead of lost (smarty-dev#442); one whose run already
             // completed is recorded, not rerun, so its side effects do not repeat.
@@ -5742,6 +5913,19 @@ export class ActorManager {
             this.#scheduleRestoreParked();
             continue;
           }
+          if (placementQueue && !abortController.signal.aborted && actor.status !== "stopped" && !this.#closing) {
+            // Transfer the whole original activation before cleanup can yield.
+            // No run id, worker evidence, failure streak or delivery outcome.
+            const events = this.#batchItems(actor.id, item);
+            this.#inFlight.delete(actor.id);
+            const overflow = this.#overflow.get(actor.id) ?? [];
+            overflow.push(...events);
+            this.#overflow.set(actor.id, overflow);
+            this.#refill(actor);
+            this.#placementDirty.add(actor.id);
+            this.#persistQueue(actor.id, true);
+            continue; // Other runnable work (including overflow) must still progress.
+          }
           // Only confirmed-unlaunched preparation may retain accepted input. A
           // binding refusal stays hard, but cannot consume callerless work.
           const launchPreparationTimeout = !workerLaunched && error instanceof AgentLaunchPreparationTimeoutError &&
@@ -5750,7 +5934,7 @@ export class ActorManager {
             (error instanceof ActorPreparationError && error.phase !== "binding")));
           const callerless = !item.resolve && !item.reject;
           const retainPreparation = retryPreparation || preLaunch;
-          if ((callerless ? retainPreparation : retryPreparation && (item.preparationAttempts ?? 0) < ACTOR_PREPARATION_MAX_RETRIES) &&
+          if (!placementRefused && (callerless ? retainPreparation : retryPreparation && (item.preparationAttempts ?? 0) < ACTOR_PREPARATION_MAX_RETRIES) &&
             !abortController.signal.aborted && actor.status !== "stopped" && !this.#closing) {
             preparationAbort.abort(error);
             for (const event of this.#batchItems(actor.id, item)) event.preparationAttempts = (event.preparationAttempts ?? 0) + 1;
@@ -6191,6 +6375,38 @@ export class ActorManager {
     }
   }
 
+  #placementActorActivation(actor: ManagedActor): { actorId: string; rootId: string } | undefined {
+    if (!this.#persistent || actor.rootId !== this.#rootId || !this.#slotCurrent(actor) || !this.#canManage(actor.id)) return;
+    try {
+      const rows = refRecord(this.#registry.read())?.actors;
+      if (!Array.isArray(rows)) return;
+      const matches = rows.filter(row => refRecord(row)?.id === actor.id);
+      if (matches.length === 1 && refRecord(matches[0])?.rootId === this.#rootId) {
+        return { actorId: actor.id, rootId: this.#rootId };
+      }
+    } catch { /* Missing/unreadable registry ownership is never a placement role grant. */ }
+    return;
+  }
+
+  async #placementQueueFromError(item: ActorQueueItem, error: Error, workerLaunched: boolean): Promise<ActorPlacementQueue | undefined> {
+    const { PlacementQueueError } = await import("../agents/placement-admission.js");
+    if (!(error instanceof PlacementQueueError) || workerLaunched || !this.#persistent ||
+        error.request?.interaction?.class !== "background-agent") return;
+    try {
+      const { decodePlacementAnswer } = await import("../agents/placement-contract.js");
+      const queue = decodePlacementAnswer(JSON.stringify(error.queue), 75, error.request);
+      const launchId = item.placementQueue?.launchId ?? item.activationId ?? item.id;
+      const generation = item.placementQueue?.generation ?? 1;
+      if (!("decision" in queue) || queue.decision !== "QUEUE" ||
+          queue.launch_id !== launchId || queue.generation !== generation || error.request.launch_id !== launchId ||
+          error.request.generation !== generation) return;
+      return { launchId, generation, ...(queue.queue_id !== undefined ? { queueId: queue.queue_id } : {}),
+        reason: queue.reason, retryAfter: queue.retry_after,
+        retryAt: Date.now() + Math.ceil(queue.retry_after * 1_000), wakes: item.placementQueue?.wakes ?? [],
+        ...(item.placementQueue?.wakePending ? { wakePending: true } : {}) };
+    } catch { return; } // A malformed or unbound QUEUE is a terminal refusal, not waiting authority.
+  }
+
   #runRequest(
     actor: ManagedActor,
     item: ActorQueueItem,
@@ -6221,8 +6437,12 @@ export class ActorManager {
       ...(roleStamp ? { roleStamp } : {}),
     });
     if (!actorSelf) throw new Error(`Cannot prepare an invalid activation identity for Fabric actor ${actor.id}`);
+    const actorActivation = this.#placementActorActivation(actor);
     return {
       ...(provenance ? { provenance } : {}),
+      placement: { role: "actor-activation", ...(actorActivation ? { actorActivation } : {}),
+        launchId: item.placementQueue?.launchId ?? item.activationId ?? item.id,
+        generation: item.placementQueue?.generation ?? 1 },
       // smarty-dev#8935: a restored activation may already have run to completion before a restart.
       ...(item.resumed || item.activationId ? { activationId: item.activationId ?? item.id } : {}),
       task: this.#activationTask(actor, items, batched, Boolean(item.activationId && item.batchIds)),
@@ -8632,7 +8852,7 @@ export class ActorManager {
       ...(!transfer ? parked : []), ...(this.#deferredHandoffs.get(actorId) ?? []),
     ]
       .filter((item) => {
-        if (item.resolve || item.reject || persistedIds.has(item.id) ||
+        if (((item.resolve || item.reject) && !item.placementQueue) || persistedIds.has(item.id) ||
             (!item.deferredHandoff && this.#cancelledInFlight.get(actorId)?.has(item.id))) return false;
         persistedIds.add(item.id);
         return true;
@@ -8677,6 +8897,7 @@ export class ActorManager {
             ...(item.batchIds?.length ? { batchIds: item.batchIds } : {}),
             launchEvidenceVersion: 1,
             executionStarted: item.executionStarted === true,
+            ...(item.placementQueue ? { placementQueue: restoredPlacementQueue(item.placementQueue) } : {}),
             preparationAttempts: item.preparationAttempts ?? 0,
             ...(item.overflowRetried ? { overflowRetried: true } : {}),
             ...(item.unstartedRedrive ? { unstartedRedrive: item.unstartedRedrive } : {}),
@@ -8730,6 +8951,7 @@ export class ActorManager {
       this.#releaseQueueSnapshots.set(actorId, { file, snapshot });
     }
     if (durable) {
+      this.#placementDirty.delete(actorId);
       for (const { sourceId, window, pending } of savedPendingWindows) {
         if (this.#settledWindows.get(actorId)?.get(sourceId) === window && window.pending === pending) window.pendingCheckpointed = true;
       }
@@ -9240,6 +9462,7 @@ export class ActorManager {
               ? value.activationId : value.batchIds[0] } : {}),
         launchEvidenceVersion: 1,
         executionStarted: false, // this restoration has not launched a new worker
+        ...(restoredPlacementQueue(value.placementQueue) ? { placementQueue: restoredPlacementQueue(value.placementQueue) } : {}),
         preparationAttempts: counter(value.preparationAttempts),
         ...((value as { overflowRetried?: unknown }).overflowRetried === true ? { overflowRetried: true } : {}),
         ...(counter((value as { ownershipRefusals?: unknown }).ownershipRefusals) ? { ownershipRefusals: counter((value as { ownershipRefusals?: unknown }).ownershipRefusals) } : {}),
@@ -9909,7 +10132,7 @@ export class ActorManager {
   // smarty-dev#1065: the key of a queued mesh item under the actor's coalesceKey, from its event. An
   // item queued before the key was set has none yet; a caller's ask never has one.
   #meshItemKey(actor: ManagedActor, item: ActorQueueItem): string | undefined {
-    if (item.batchQueued || item.batchIds) return undefined; // Batching never retroactively replaces an accepted observation.
+    if (item.placementQueue || item.batchQueued || item.batchIds) return undefined; // Accepted writer/batch identities are immutable.
     if (item.coalesceKey) return item.coalesceKey;
     if (!actor.coalesceKey || item.resolve || item.reject || !item.source.startsWith("mesh:")) return undefined;
     const event = item.payload as { topic?: unknown; data?: unknown } | undefined;
@@ -9999,6 +10222,7 @@ export class ActorManager {
   // The queue and its overflow, emptied, in run order.
   #takeQueued(actor: ManagedActor): ActorQueueItem[] {
     this.#clearBatchTimer(actor.id);
+    this.#clearPlacementTimer(actor.id);
     const overflow = this.#overflow.get(actor.id) ?? [];
     this.#overflow.delete(actor.id);
     return [...actor.queue.splice(0), ...overflow];

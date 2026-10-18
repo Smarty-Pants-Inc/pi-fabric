@@ -7,7 +7,8 @@ import type { ModelRoutingConfig } from "./agents/model-route.js";
 import { parsePerCallRouting } from "./agents/per-call-config.js";
 import { normalizeAgentRouterConfig, type FabricAgentRouterConfig } from "./agents/router-config.js";
 export type { FabricAgentRouterConfig } from "./agents/router-config.js";
-import { normalizeAgentPlacement, type AgentPlacementConfig } from "./agents/placement-config.js";
+import { normalizeAgentPlacement, normalizePlacementDeciderConfig, type AgentPlacementConfig, type FabricPlacementDeciderConfig } from "./agents/placement-config.js";
+export type { FabricPlacementDeciderConfig } from "./agents/placement-config.js";
 import { isLoopbackPlacementUrl, normalizePlacementApiConfig, type PlacementApiConfig } from "./placement/config.js";
 export type { PlacementApiConfig } from "./placement/config.js";
 import type { SandboxTransportConfig } from "./transport/sandbox/types.js";
@@ -242,6 +243,8 @@ interface FabricPrewalkConfig {
 export interface FabricAgentConfig {
   /** Optional host-only external spawn/actor model router; off unless enabled. */
   router?: FabricAgentRouterConfig;
+  /** Host-only external placement boundary; absent or unspecified mode defaults off. */
+  placementDecider?: FabricPlacementDeciderConfig;
   /** Opt-in shadow routing pins and finite candidates, never live routing. */
   modelRouting?: ModelRoutingConfig;
   enabled: boolean;
@@ -1552,6 +1555,10 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
     readyTimeoutMs: boundedInteger(sandbox.readyTimeoutMs, DEFAULT_FABRIC_CONFIG.agents.sandbox.readyTimeoutMs, 1_000, 90_000),
   };
   const placementApi = normalizePlacementApiConfig(agents.placementApi);
+  const placementDecider = normalizePlacementDeciderConfig(agents.placementDecider);
+  if (placementDecider?.mode === "enforce") {
+    throw new Error("agents.placementDecider.mode=enforce is unavailable until the resident-host placement follow-up is installed");
+  }
   const claude = objectValue(agents.claude);
   const veda = objectValue(agents.veda);
   const capture = objectValue(input.capture);
@@ -1873,6 +1880,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
       ...(placement ? { placement } : {}),
       sandbox: sandboxConfig,
       ...(placementApi ? { placementApi } : {}),
+      ...(placementDecider ? { placementDecider } : {}),
       ...(router ? { router } : {}),
       ...(agentModel ? { model: agentModel } : {}),
       ...(typeof agents.modelRouting === "object" && agents.modelRouting !== null && !Array.isArray(agents.modelRouting)
@@ -2585,6 +2593,7 @@ const resolveFabricConfig = (
     if (plan === projectPlan) {
       const agents = { ...objectValue(document.agents) };
       delete agents.router; // Host-only argv execution and task disclosure policy.
+      delete agents.placementDecider; // Host-only command/mode/wake binding, never project authority.
       delete agents.modelPolicy;
       delete agents.deniedModels;
       delete agents.deniedModelReplacement;

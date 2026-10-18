@@ -403,6 +403,35 @@ class MirrorLeaseAdmissionRequired extends Error {
   constructor(readonly owner: MirroredControlOwner) { super("Mirror renewal required before publication"); }
 }
 
+/** Authenticated placement hint, not a grant or permission to launch. */
+export interface FabricPlacementWake {
+  readonly version: 1;
+  readonly launchId: string;
+  readonly generation: number;
+  readonly reason: "eligible" | "released-never-started" | "released-exited";
+  /** UTC RFC 3339 text, with at most six fractional digits (placement v1). */
+  readonly at: string;
+}
+
+type PlacementWakeDropReason = "source" | "target" | "malformed" | "unowned";
+const placementWakeId = (value: unknown): value is string =>
+  typeof value === "string" && value.length > 0 && value.length <= 200 && !/[\u0000-\u001f\u007f]/.test(value);
+const placementWakeTimestamp = (value: unknown): value is string => {
+  if (typeof value !== "string") return false;
+  const match = /^(\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d)(?:\.\d{1,6})?Z$(?![\s\S])/u.exec(value);
+  if (!match) return false;
+  const millis = Date.parse(`${match[1]}Z`);
+  // Date.parse repairs impossible calendar dates; require the original UTC second.
+  return Number.isFinite(millis) && new Date(millis).toISOString().slice(0, 19) === match[1];
+};
+const placementWakeFromBody = (body: Record<string, unknown> | undefined): FabricPlacementWake | undefined => {
+  if (!body || Object.keys(body).length !== 5 || body.version !== 1 || !placementWakeId(body.launchId) ||
+      typeof body.generation !== "number" || !Number.isSafeInteger(body.generation) || body.generation <= 0 ||
+      (body.reason !== "eligible" && body.reason !== "released-never-started" && body.reason !== "released-exited") ||
+      !placementWakeTimestamp(body.at)) return undefined;
+  return Object.freeze({ version: 1, launchId: body.launchId, generation: body.generation, reason: body.reason, at: body.at });
+};
+
 export interface FabricControlPlaneOptions {
   /** Injected carrier; caller owns its lifetime. File remains the default. */
   transport?: FabricTransport;
@@ -412,6 +441,12 @@ export interface FabricControlPlaneOptions {
   inboxLanes?: number;
   /** Required in NATS mode: reserved fabric-ops[-suffix] credential machine, injected by composition. */
   relayOperatorMachine?: string;
+  /** Host-only placement writer credential machine; never inferred from envelope.from or workspace input. */
+  placementWakeSourceMachine?: string | undefined;
+  /** Confirm targetId is locally owned and holds this exact queued launchId+generation, then durably
+   * record the wake before returning true. Must be idempotent under redelivery; a wake only re-decides
+   * placement, never authorizes a launch. False/missing drops; a storage exception retries without ACK. */
+  onPlacementWake?: (targetId: string, wake: FabricPlacementWake) => Promise<boolean> | boolean;
   /** Host-only configured inbox stream, also supplied on FILE rollback; never caller/receipt authority. */
   expectedNatsInboxStream?: string;
   /** Rollback withdrawal hold, epoch ms; composition converts mesh.nats.rollbackHoldUntil (E14-X1). */
@@ -786,6 +821,12 @@ export class FabricControlPlane {
   readonly #transport: FabricTransport;
   #stopVerifiedReconnect: (() => void) | undefined;
   readonly #relayOperatorMachine: string | undefined;
+  readonly #placementWakeSourceMachine: string | undefined;
+  // Fixed keys, saturating counts and exponentially spaced warnings: no per-sender/body retention.
+  readonly #placementWakeDrops: Record<PlacementWakeDropReason, { count: number; warnAt: number }> = {
+    source: { count: 0, warnAt: 1 }, target: { count: 0, warnAt: 1 },
+    malformed: { count: 0, warnAt: 1 }, unowned: { count: 0, warnAt: 1 },
+  };
   readonly #expectedNatsInboxStream: string | undefined;
   // File-only access stays behind the legacy branches, including reader/cursor semantics.
   get #fileTransport(): FileTransport {
@@ -895,11 +936,17 @@ export class FabricControlPlane {
           operatorMachine !== operatorMachine.trim() || operatorMachine === transport.self.machine) {
         throw new TransportInvalidError("NATS control requires relayOperatorMachine: a valid reserved fabric-ops operator machine, distinct from this host");
       }
+      if (options.placementWakeSourceMachine !== undefined &&
+          (typeof options.placementWakeSourceMachine !== "string" || !/^[a-z0-9][a-z0-9-]{0,31}$/.test(options.placementWakeSourceMachine) ||
+            options.placementWakeSourceMachine !== options.placementWakeSourceMachine.trim())) {
+        throw new TransportInvalidError("Invalid placement wake source machine");
+      }
     } else if (!(transport instanceof FileTransport)) {
       throw new TransportUnsupportedError("File control requires FileTransport");
     }
     this.#transport = transport;
     this.#relayOperatorMachine = transport.kind === "nats" ? options.relayOperatorMachine : undefined;
+    this.#placementWakeSourceMachine = transport.kind === "nats" ? options.placementWakeSourceMachine : undefined;
     this.#expectedNatsInboxStream = options.expectedNatsInboxStream ??
       (transport.kind === "nats" ? `FABRIC_IN_${transport.self.machine}` : undefined);
     // The file reader replays the retained log from its current generation. Durable claims
@@ -2436,6 +2483,16 @@ export class FabricControlPlane {
     return sender?.live === true && sender.machine === context.sourceMachine;
   }
 
+  #reportPlacementWakeDrop(reason: PlacementWakeDropReason): void {
+    const counter = this.#placementWakeDrops[reason];
+    counter.count = Math.min(Number.MAX_SAFE_INTEGER, counter.count + 1);
+    if (counter.count !== counter.warnAt) return;
+    counter.warnAt *= 2;
+    try {
+      diagnostics.warn("src/topology/control-plane.ts", `[pi-fabric] Dropped NATS placement wake reason=${reason} count=${counter.count}`);
+    } catch { /* Diagnostics never change a broker disposition. */ }
+  }
+
   async #receiveNats(receipt: NatsControlReceipt): Promise<void> {
     const { delivery, session } = receipt;
     const terminate = async (reason: string): Promise<void> => {
@@ -2448,6 +2505,27 @@ export class FabricControlPlane {
       const from = envelope && ownDataRecord(envelope.from);
       const to = envelope && ownDataRecord(envelope.to);
       const body = envelope && ownDataRecord(envelope.body);
+      if (envelope?.operation === "placement.wake") {
+        // Path B authenticates the last subject token, never the JSON from identity. This
+        // command is not a participant control command and emits no control ACK envelope.
+        if (!this.#placementWakeSourceMachine || delivery.sourceMachine !== this.#placementWakeSourceMachine) {
+          this.#reportPlacementWakeDrop("source");
+        } else if (!to || to.machine !== this.#transport.self.machine || to.hostId !== this.options.hostId) {
+          this.#reportPlacementWakeDrop("target");
+        } else {
+          const wake = placementWakeFromBody(body);
+          if (envelope.kind !== "command" || !placementWakeId(envelope.targetId) || !wake ||
+              envelope.id !== `placement-wake:${wake.launchId}:${wake.generation}:${wake.reason}`) {
+            this.#reportPlacementWakeDrop("malformed");
+          } else if (await this.options.onPlacementWake?.(envelope.targetId, wake) !== true) {
+            this.#reportPlacementWakeDrop("unowned");
+          }
+        }
+        // A true callback is the durable owner receipt. Throws reach the existing live-session
+        // NAK path; pause/lease loss during persistence leaves the delivery untouched.
+        this.#assertNatsSession(session);
+        await delivery.ack(); return;
+      }
       // Operator credentials take the relay-only path, regardless of the untrusted from label.
       // Relay-shaped traffic from a runtime credential is dropped by the same strict verifier.
       if (delivery.sourceMachine === this.#relayOperatorMachine ||

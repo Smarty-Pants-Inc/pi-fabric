@@ -2570,6 +2570,57 @@ describe("pi-fabric#876 security pass (round 3)", () => {
     expect(DEFAULT_FACTORY_RATE).toEqual({ perMinute: 30, burst: 60, bytesPerMinute: 512 * 1024, byteBurst: 1024 * 1024 });
   });
 
+  it("falls back from a conflicting control batch, drops only that command and forwards the receipt-backed prefix/suffix", async () => {
+    const cursorPath = path.join(scratch(), "cursor.json");
+    const batchSizes: number[] = [];
+    const { hub, far, remote, bridge, logs } = setup(cursorPath, { presenceMs: 60_000 });
+    const lane = await addRoot(hub, "lane");
+    const spoke = await addRoot(far, "forge-main");
+    await remote.hello();
+    await bridge.start();
+    await bridge.step();
+    const publishBatch = remote.publishBatch;
+    expect(publishBatch).toBeDefined();
+    vi.spyOn(remote, "publishBatch").mockImplementation(async events => {
+      batchSizes.push(events.length);
+      return publishBatch!(events);
+    });
+    const publishCommand = (commandId: string, message: string) => hub.publish({
+      topic: "fabric.control.command", kind: "followUp", from: lane.identity, to: spoke.hostId,
+      data: { ...command(spoke.hostId, lane.hostId), commandId, message, ownerIncarnation: spoke.ownerIncarnation },
+    });
+
+    await publishCommand("reused-command-key", "original private body");
+    expect(await bridge.step()).toMatchObject({ toRemote: 1, dropped: 0 });
+    const prefix = await publishCommand("prefix-command-key", "prefix message");
+    const conflict = await publishCommand("reused-command-key", "edited private body");
+    const next = await publishCommand("next-command-key", "next message");
+    expect(await bridge.step()).toEqual({ toRemote: 2, toLocal: 0, dropped: 1 });
+    expect(batchSizes).toEqual([3]); // The prefix is committed with a receipt before the conflict is observed.
+
+    const deliveredCommands = on(far, "fabric.control.command");
+    expect(deliveredCommands.map(event => (event.data as { message: string }).message))
+      .toEqual(["original private body", "prefix message", "next message"]);
+    const deliveredPrefix = deliveredCommands.filter(event => (event.data as { commandId: string }).commandId === "prefix-command-key");
+    expect(deliveredPrefix).toHaveLength(1); // Single-event fallback reuses the prefix receipt instead of duplicating it.
+    expect((deliveredPrefix[0]!.data as { bridge: { id: string } }).bridge.id).toBe(prefix.id);
+    expect(logs.filter(line => line.includes("dropped idempotency conflict"))).toEqual([
+      `toRemote: dropped idempotency conflict sequence ${conflict.sequence} event ${conflict.id} key reused-command-key`,
+    ]);
+    expect(logs.join(" ")).not.toContain("edited private body");
+    expect(JSON.parse(fs.readFileSync(cursorPath, "utf8")).toRemote.after).toBe(next.sequence);
+    const later = await publishCommand("after-conflict-key", "still live");
+    expect(await bridge.step()).toMatchObject({ toRemote: 1, dropped: 0 });
+    expect((on(far, "fabric.control.command").at(-1)?.data as { bridge: { id: string } }).bridge.id).toBe(later.id);
+
+    await publishCommand("clean-batch-a", "clean a");
+    await publishCommand("clean-batch-b", "clean b");
+    expect(await bridge.step()).toMatchObject({ toRemote: 2, dropped: 0 });
+    expect(batchSizes).toEqual([3, 2]); // A conflict falls back; conflict-free controls remain batched.
+    expect(on(far, "fabric.control.command").map(event => (event.data as { message: string }).message).slice(-2))
+      .toEqual(["clean a", "clean b"]);
+  });
+
   // (b): a live sender id must not carry a forged name, kind or session onto the hub.
   it("takes every inbound sender's name, kind and session from its presence record, never from the event body", async () => {
     const { hub, far, bridge } = setup();

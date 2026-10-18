@@ -202,9 +202,9 @@ class Fixture {
     this.planes.push(plane);
     return { plane, transport };
   }
-  owner(incarnation: string) {
-    const owner = this.runtime(OWNER_HOST, OWNER_ID, "e24-owner", incarnation);
-    const route: ParticipantRoute = { machine: "e24-owner", ownerHostId: OWNER_HOST,
+  owner(incarnation: string, machine = "e24-owner") {
+    const owner = this.runtime(OWNER_HOST, OWNER_ID, machine, incarnation);
+    const route: ParticipantRoute = { machine, ownerHostId: OWNER_HOST,
       ownerIdentityId: OWNER_ID, ownerIncarnation: incarnation, capabilities: ["followUp"], live: true };
     // Explicit successor routing; no lease or directory implementation is mocked as evidence.
     this.routes.set(TARGET, route);
@@ -267,6 +267,41 @@ function expectSameLogicalRequest(first: Publication, retry: Publication) {
 }
 
 describe("E24 NATS retained outcome replay across owner restart (Decision C)", () => {
+  it("binds a caller key to semantic input while retaining identical-retry dedupe", async () => {
+    const f = new Fixture(), owner = f.owner(OLD), caller = f.caller();
+    const exchange = async (message: string, destination: ReturnType<Fixture["owner"]>): Promise<Publication> => {
+      const request = observe(caller.plane.request(OWNER_HOST, TARGET, "followUp", { message }, OWNER_ID, { idempotencyKey: KEY }));
+      const command = await caller.transport.commands.required();
+      const ack = await destination.transport.acknowledgements.required();
+      await delivered(f.carrier, ack, caller.transport);
+      await request.settled;
+      expectAccepted(request);
+      return command;
+    };
+
+    const first = await exchange("original message", owner);
+    const successor = f.owner(CURRENT, "e24-owner-v2");
+    const retry = observe(caller.plane.request(OWNER_HOST, TARGET, "followUp", { message: "original message" }, OWNER_ID,
+      { idempotencyKey: KEY }));
+    const retried = await Promise.race([
+      caller.transport.commands.required().then(command => ({ kind: "published" as const, command })),
+      retry.settled.then(() => ({ kind: "settled" as const, result: retry.result })),
+    ]);
+    expect(retried.kind, retried.kind === "settled" ? JSON.stringify(retried.result) : undefined).toBe("published");
+    if (retried.kind !== "published") return;
+    const currentEpoch = retried.command;
+    expectSameLogicalRequest(first, currentEpoch); // A new owner epoch must not change caller-input identity.
+    const replay = await successor.transport.acknowledgements.required();
+    await delivered(f.carrier, replay, caller.transport);
+    await retry.settled;
+    expectAccepted(retry); // The changed route returns the same original receipt.
+    await expect(caller.plane.request(OWNER_HOST, TARGET, "followUp", { message: "edited message" }, OWNER_ID,
+      { idempotencyKey: KEY })).rejects.toMatchObject({
+        name: "FabricIdempotencyKeyReusedError", code: "FABRIC_IDEMPOTENCY_KEY_REUSED", retryable: false,
+      });
+    expect(caller.transport.commands.values).toHaveLength(0);
+    expect(f.executions).toBe(1);
+  });
   it("settles a recreated stable caller's current-epoch retry from disk, without executing twice", async () => {
     const f = new Fixture(), owner = f.owner(OLD), caller = f.caller();
     const original = f.send(caller);

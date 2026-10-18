@@ -38,11 +38,10 @@ queue_rules:
       - check-success = review/astra
       - -check-failure = review/security  # a failed security verdict refuses admission, label or not
       - check-success = check (ubuntu-latest)
-      - or:
-          - check-success = review/security
-          - and:
-              - -head ~= ^sync/upstream-
-              - -label = needs-security-pass
+      # No security wait before merge (R-no-security-slips, smarty-dev#2264; org 10-18 02:28Z, chief-of-staff 02:41Z):
+      # neither upstream syncs nor needs-security-pass PRs wait for review/security. The pass runs
+      # after merge, within 24 h; the label only marks that it is owed. A failed review/security
+      # (now only a live credential or data exposure) still refuses admission.
     merge_conditions:
       # Label and title opt-outs added after queueing stop the merge.
       # Review statuses here only refuse a FAILED review: an in-place or batch update

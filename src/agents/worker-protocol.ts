@@ -75,6 +75,9 @@ export const attachPlacementRestartHandler = (
   signal?: AbortSignal,
   authorize?: () => boolean,
 ): (() => void) => {
+  // Ordinary workers must not acquire extra lifecycle listeners when there is
+  // no local restart callback (including remote one-shot launches).
+  if (!callback) return () => undefined;
   let active = true;
   const revoke = (): void => { active = false; };
   child.once("exit", revoke);

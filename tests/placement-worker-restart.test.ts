@@ -91,8 +91,10 @@ describe("worker placement restart response boundary", () => {
     expect(await restarting).toBe(false);
   });
 
-  it("refuses missing/legacy IPC and malformed outbound identities", async () => {
+  it("refuses missing remote-parent IPC immediately and malformed outbound identities", async () => {
     const f = fixture();
+    const noIpc = { connected: true, on: f.events.on.bind(f.events), removeListener: f.events.removeListener.bind(f.events) } as unknown as Parameters<typeof requestPlacementRestart>[0];
+    await expect(requestPlacementRestart(noIpc, request)).resolves.toBe(false);
     f.events.connected = false;
     expect(await requestPlacementRestart(f.channel, request)).toBe(false);
     f.events.connected = true;

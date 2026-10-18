@@ -10,7 +10,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import type { MeshIdentity } from "./mesh/store.js";
 import { takeCompactionDecline } from "./compaction/cancellation.js";
 import { fabricProvenanceOptions, fabricProvenanceSupported, fabricTurnProvenance, fabricWakeCause, copyFabricProvenance, fabricWakeMessage, admittedFabricWakeCauses, sendFabricMessage, sendFabricUserMessage, type FabricWakeCause, type FabricTurnProvenance, type FabricPrincipal } from "./fabric-provenance.js";
-import { classifyProviderError, type ProviderErrorClass } from "./provider-error-class.js";
+import { classifyModelRefusal, classifyProviderError, hasRecordedModelRefusal, type ProviderErrorClass } from "./provider-error-class.js";
 import { extensionContextLive } from "./session-liveness.js";
 
 import { FabricInterruptNotAuthorizedError, FabricInterruptRateLimitedError, type FabricInterruptAuthority } from "./interrupt-authority.js";
@@ -152,6 +152,57 @@ const MAX_PERSISTED_UNCLASSIFIED_FAILURES = UNCLASSIFIED_PROVIDER_DEAD_AFTER;
 /** `provider-dead (non-retryable: <allowlisted short>)` or `provider-dead (unclassified)`. */
 const providerDeadLabel = (dead: { kind: "non-retryable" | "unclassified"; error: string }): string =>
   dead.kind === "unclassified" ? "provider-dead (unclassified)" : `provider-dead (non-retryable: ${dead.error})`;
+
+type ModelRefusalTurnMessage = {
+  role?: string;
+  stopReason?: unknown;
+  rawStopReason?: unknown;
+  errorMessage?: unknown;
+  responseId?: unknown;
+  stopDetailsState?: unknown;
+  rawStopDetails?: unknown;
+  stopDetailsBytes?: unknown;
+  stopDetailsSha256?: unknown;
+  diagnostics?: unknown;
+  recovery?: { retryable?: unknown };
+};
+
+/** Add bounded provider refusal metadata to the local assistant-message trace only. */
+const isJson = (value: string): boolean => {
+  try { JSON.parse(value); return true; }
+  catch { return false; }
+};
+
+const appendModelRefusalSessionDiagnostic = (message: ModelRefusalTurnMessage): void => {
+  const existing = Array.isArray(message.diagnostics) ? message.diagnostics : [];
+  if (existing.some(entry => !!entry && typeof entry === "object" &&
+    (entry as { type?: unknown }).type === "fabric_model_refusal")) return;
+  const details: Record<string, string | number> = {};
+  if (typeof message.rawStopReason === "string" && message.rawStopReason.length <= 200) details.rawStopReason = message.rawStopReason;
+  if (typeof message.responseId === "string" && message.responseId.length > 0 && message.responseId.length <= 200) {
+    details.responseId = message.responseId;
+  }
+  const state = message.stopDetailsState;
+  if (state === "absent" && message.rawStopDetails === undefined) {
+    details.stopDetailsState = "absent";
+  } else if (state === "retained" && typeof message.rawStopDetails === "string" &&
+    Buffer.byteLength(message.rawStopDetails, "utf8") <= 4096 && isJson(message.rawStopDetails)) {
+    details.stopDetailsState = "retained";
+    details.rawStopDetails = message.rawStopDetails;
+  } else if (state === "discarded" && message.rawStopDetails === undefined &&
+    Number.isSafeInteger(message.stopDetailsBytes) && (message.stopDetailsBytes as number) >= 0 &&
+    typeof message.stopDetailsSha256 === "string" && /^[0-9a-f]{64}$/i.test(message.stopDetailsSha256)) {
+    details.stopDetailsState = "discarded";
+    details.stopDetailsBytes = message.stopDetailsBytes as number;
+    details.stopDetailsSha256 = message.stopDetailsSha256.toLowerCase();
+  } else if (state === "unavailable" || (state === undefined && message.rawStopDetails === undefined &&
+    message.stopDetailsBytes === undefined && message.stopDetailsSha256 === undefined)) {
+    details.stopDetailsState = "unavailable";
+  } else {
+    details.stopDetailsState = "unavailable";
+  }
+  message.diagnostics = [...existing, { type: "fabric_model_refusal", timestamp: Date.now(), details }];
+};
 
 /**
  * smarty-dev#8742: a provider-dead Main. Every field is allowlisted: the HTTP status, a known error
@@ -526,6 +577,7 @@ export class MainAgentController implements FabricMainAgentTarget {
   #unclassifiedSince: number | undefined;
   #unclassifiedAlarmed = false;
   #runUnclassified = false;
+  #runRecoverySuppressed = false;
   // Preserve an unreadable owner index until explicit user input authorizes replacing it.
   #haltIndexUnknown = false;
   #closed = false;
@@ -1355,10 +1407,15 @@ export class MainAgentController implements FabricMainAgentTarget {
       if (this.#switching) { this.#switching = false; this.#reloading = false; this.#bindingsLive = true; }
       this.#halted = false;
       this.#recoverProvider(false);
+      this.#runRecoverySuppressed = false;
       this.#haltIndexUnknown = false;
       this.#consumedDirty = true;
       this.#suspended = false;
       this.#trySave();
+    });
+    on("message_end", (event: { message?: ModelRefusalTurnMessage }) => {
+      const message = event.message;
+      if (message?.role === "assistant" && classifyModelRefusal(message)) appendModelRefusalSessionDiagnostic(message);
     });
     on("tool_execution_start", (event: { toolCallId: string }, ctx) => {
       this.#context = ctx;
@@ -1367,29 +1424,50 @@ export class MainAgentController implements FabricMainAgentTarget {
     on("tool_execution_end", (event: { toolCallId: string }) => { this.#tools.delete(event.toolCallId); });
     // Set gates before either drain branch can reconcile a lost Pi handoff. A turn error
     // precedes Pi's retry/overflow recovery decision, so never persist it as an owner stop.
-    on("turn_end", (event: { message?: { stopReason?: string; errorMessage?: string; diagnostics?: unknown } }, ctx) => {
+    on("turn_end", (event: { message?: ModelRefusalTurnMessage }, ctx) => {
       const reason = event.message?.stopReason;
       // A native abort also precedes compact/reload and extension cancellation. Only
       // explicit halt()/stop() owns durable authority; this boundary is merely passive.
       if (ctx.signal?.aborted || reason === "aborted") {
         this.#suspended = true;
         this.#runUnclassified = false;
+        this.#runRecoverySuppressed = false;
         this.#providerStateDirty = true;
         this.#trySave(true);
       }
       else if (reason === "error") {
-        // smarty-dev#8742: a request the provider will reject again is not backoff.
-        const failure = classifyProviderError(event.message);
-        // Counted at settle, after Pi's own retries: one failed run is one failure.
-        this.#runUnclassified = failure?.basis === "default";
-        this.#providerStateDirty = true;
-        this.#trySave(true);
-        const dead = this.#providerDead;
-        if (failure && !failure.retryable) this.#recordNonRetryable(failure, ctx);
-        // An unclassified incident's one post-compaction attempt failed the same way: hold again, no second alarm.
-        else if (this.#runUnclassified && dead?.kind === "unclassified" && dead.phase === "probation") this.#raiseProviderDead("unclassified-repeated");
-        else this.#recordProviderFailure(true);
+        const refusal = classifyModelRefusal(event.message) || hasRecordedModelRefusal(event.message);
+        if (refusal && event.message) {
+          // The private refusal diagnostic is appended at message_end; never publish provider details.
+          // Don't send the same refused context through provider backoff or the provider-dead counter.
+          appendModelRefusalSessionDiagnostic(event.message);
+          this.#runUnclassified = false;
+          this.#runRecoverySuppressed = true;
+          this.#providerStateDirty = true;
+          this.#trySave(true);
+          this.#notify("The model declined this request. Resending the same context will likely be declined again.", "warning", ctx, "model-refusal");
+        } else if (event.message?.recovery?.retryable === false) {
+          // Pi's explicit veto applies to Main's compaction and continuation too.
+          this.#runUnclassified = false;
+          this.#runRecoverySuppressed = true;
+          this.#providerStateDirty = true;
+          this.#trySave(true);
+        } else {
+          this.#runRecoverySuppressed = false;
+          // smarty-dev#8742: a request the provider will reject again is not backoff.
+          const failure = classifyProviderError(event.message);
+          // Counted at settle, after Pi's own retries: one failed run is one failure.
+          this.#runUnclassified = failure?.basis === "default";
+          this.#providerStateDirty = true;
+          this.#trySave(true);
+          const dead = this.#providerDead;
+          if (failure && !failure.retryable) this.#recordNonRetryable(failure, ctx);
+          // An unclassified incident's one post-compaction attempt failed the same way: hold again, no second alarm.
+          else if (this.#runUnclassified && dead?.kind === "unclassified" && dead.phase === "probation") this.#raiseProviderDead("unclassified-repeated");
+          else this.#recordProviderFailure(true);
+        }
       } else if (reason !== undefined) {
+        this.#runRecoverySuppressed = false;
         const dead = this.#providerDead;
         if (dead?.phase === "probation") this.#notify(`Main provider recovered after compaction (was ${providerDeadLabel(dead).slice("provider-dead (".length, -1)})`, "info");
         this.#recoverProvider();
@@ -1399,6 +1477,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     const settleGate = (event: { outcome?: string; aborted?: boolean }, ctx: ExtensionContext, finalSettle = false): void => {
       if (ctx.signal?.aborted || event.aborted === true || event.outcome === "aborted") {
         this.#suspended = true;
+        this.#runRecoverySuppressed = false;
         // Cancellation is not a failed provider attempt, including legacy settles
         // without outcome. Do not carry its pending unclassified failure forward.
         this.#runUnclassified = false;
@@ -1406,8 +1485,12 @@ export class MainAgentController implements FabricMainAgentTarget {
         this.#trySave(true);
         return;
       }
+      if (this.#runRecoverySuppressed) {
+        if (finalSettle) this.#runRecoverySuppressed = false;
+        return;
+      }
       // turn_end already classified a non-retryable failure: recover at idle, never back off.
-      else if (event.outcome === "error" && this.#providerDead) { this.#runUnclassified = false; this.#armProviderDeadTimer(); }
+      if (event.outcome === "error" && this.#providerDead) { this.#runUnclassified = false; this.#armProviderDeadTimer(); }
       // The third unclassified failure in a row raises provider-dead instead of more silent backoff.
       else if (event.outcome === "error" && this.#countUnclassified()) { /* alarmed and held */ }
       else if (event.outcome === "error") this.#recordProviderFailure();

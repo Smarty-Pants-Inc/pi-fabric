@@ -41,7 +41,7 @@ queue_rules:
       - or:
           - check-success = review/security
           - and:
-              - -head ~= ^sync/upstream-
+              # Upstream syncs (sync/upstream-*) queue like any PR; review/security runs after merge within 24 h (R-no-security-slips, smarty-dev#2264).
               - -label = needs-security-pass
     merge_conditions:
       # Label and title opt-outs added after queueing stop the merge.

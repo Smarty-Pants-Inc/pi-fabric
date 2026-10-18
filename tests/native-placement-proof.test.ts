@@ -18,6 +18,33 @@ afterEach(() => {
   for (const directory of roots.splice(0)) fs.rmSync(directory, { recursive: true, force: true });
 });
 
+describe("native task root CLI guard (offline)", () => {
+  it("requires NATIVE_TASK_ROOT before fixture reads or side effects", () => {
+    const directory = root();
+    const output = path.join(directory, "must-not-exist");
+    const temp = path.join(directory, "temp");
+    const launcherMarker = path.join(directory, "launcher-called");
+    const launcher = path.join(directory, "fake-launcher.mjs");
+    fs.mkdirSync(temp);
+    fs.writeFileSync(launcher, `#!/usr/bin/env node\nimport fs from "node:fs"; fs.writeFileSync(${JSON.stringify(launcherMarker)}, "called");\n`);
+    fs.chmodSync(launcher, 0o700);
+    const result = spawnSync(process.execPath, [
+      path.resolve("scripts/probe-native-process-placement.mjs"),
+      path.join(directory, "missing-sdk"), output, launcher, "fixture-host",
+      path.join(directory, "missing-work-hosts.json"), "ssh",
+    ], {
+      cwd: directory, encoding: "utf8", timeout: 20_000,
+      env: { ...process.env, TMPDIR: temp, TMP: temp, TEMP: temp },
+    });
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stderr).toBe(1);
+    expect(result.stderr).toContain("NATIVE_TASK_ROOT");
+    expect(fs.existsSync(output)).toBe(false);
+    expect(fs.readdirSync(temp)).toEqual([]);
+    expect(fs.existsSync(launcherMarker)).toBe(false);
+  });
+});
+
 describe("native placement proof caller guard (offline)", () => {
   it.each(["dev1.smartypants.ai", "dev1", "ryzen1", "ryzen1.smartypants.ai"])("accepts approved Main %s", hostname => {
     expect(() => assertMainProofCaller(hostname, aliases)).not.toThrow();
@@ -67,7 +94,13 @@ describe("isolated proof model providers (offline fake metadata only)", () => {
     const hostProfile = path.join(directory, "host-profile");
     const output = path.join(directory, "evidence");
     const temp = path.join(directory, "temp");
-    for (const folder of [path.join(cwd, "dist"), path.join(sdk, "dist/core"), hostProfile, temp]) fs.mkdirSync(folder, { recursive: true });
+    const shellMarker = path.join(directory, "reader-shell-injected");
+    const nativeTaskRoot = path.join(directory, `remote root ' ; touch ${shellMarker} ; #`);
+    const nativeTask = path.join(nativeTaskRoot, "offline-id");
+    for (const folder of [path.join(cwd, "dist"), path.join(sdk, "dist/core"), hostProfile, temp, nativeTask]) fs.mkdirSync(folder, { recursive: true });
+    for (const [name, contents] of Object.entries({ rc: "23\n", "result.md": "offline reader result\n", "stderr.log": "offline reader stderr\n", "pi-rc": "0\n", "completion.json": "{}\n" })) {
+      fs.writeFileSync(path.join(nativeTask, name), contents);
+    }
     fs.writeFileSync(path.join(cwd, "dist/index.js"), "// inert extension fixture\n");
     execFileSync("git", ["init", "--quiet", cwd]);
     execFileSync("git", ["-C", cwd, "-c", "user.name=Offline Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--quiet", "--allow-empty", "-m", "offline fixture"]);
@@ -115,18 +148,43 @@ export async function createAgentSession() {
 }
 `);
     const preload = path.join(directory, "hostname.mjs");
-    fs.writeFileSync(preload, 'import os from "node:os"; os.hostname = () => "dev1.smartypants.ai";\n');
+    fs.writeFileSync(preload, 'import os from "node:os"; os.hostname = () => process.env.FIXTURE_HOSTNAME ?? "dev1.smartypants.ai";\n');
     const map = path.join(directory, "work-hosts.json");
     fs.writeFileSync(map, JSON.stringify(aliases));
     const probe = path.resolve("scripts/probe-native-process-placement.mjs");
-    const result = spawnSync(process.execPath, ["--import", pathToFileURL(preload).href, probe, sdk, output, process.execPath, "ryzen2", map, "ssh"], {
-      cwd, encoding: "utf8", timeout: 20_000,
-      env: { ...process.env, TMPDIR: temp, TMP: temp, TEMP: temp, PI_CODING_AGENT_DIR: hostProfile,
-        PROOF_MODELS_FROM_PROFILE: mode === "default" ? "0" : "1", FIXTURE_HOST_PROFILE: hostProfile,
-        FIXTURE_MODEL_ERROR: mode === "linked-error" ? "1" : "0" },
+    const transport = mode === "default" ? "local" : "ssh";
+    const fixtureEnv: NodeJS.ProcessEnv = { ...process.env, TMPDIR: temp, TMP: temp, TEMP: temp, PI_CODING_AGENT_DIR: hostProfile,
+      PROOF_MODELS_FROM_PROFILE: mode === "default" ? "0" : "1", FIXTURE_HOST_PROFILE: hostProfile,
+      FIXTURE_MODEL_ERROR: mode === "linked-error" ? "1" : "0" };
+    if (transport === "local") fixtureEnv.FIXTURE_HOSTNAME = Object.keys(aliases)[0];
+    else delete fixtureEnv.FIXTURE_HOSTNAME;
+    const result = spawnSync(process.execPath, ["--import", pathToFileURL(preload).href, probe, sdk, output, process.execPath, "ryzen2", map, transport, nativeTaskRoot], {
+      cwd, encoding: "utf8", timeout: 20_000, env: fixtureEnv,
     });
     expect(result.error).toBeUndefined();
     expect(result.status, result.stderr).toBe(mode === "linked-error" ? 1 : 0);
+    const invocation = JSON.parse(fs.readFileSync(path.join(output, "invocation.json"), "utf8"));
+    if (transport === "local") {
+      expect(invocation.placement.resultDirectory).toBe(path.join(nativeTaskRoot, "{id}"));
+      for (const name of ["rc", "pi-rc", "result.md", "stderr.log", "completion.json"]) {
+        expect(fs.readFileSync(path.join(output, `native-${name}`), "utf8")).toBe(fs.readFileSync(path.join(nativeTask, name), "utf8"));
+      }
+    } else {
+      const reader = invocation.placement.resultCommand.at(-1) as string;
+      expect(reader).toContain("pathlib.Path(sys.argv[1])/sys.argv[2]");
+      expect(reader).toContain(`'${nativeTaskRoot.replace(/'/g, "'\\''")}' {id}`);
+      if (mode === "linked") {
+        if (process.platform !== "win32" && spawnSync("sh", ["-c", "command -v python3 >/dev/null 2>&1"], { encoding: "utf8" }).status === 0) {
+          const read = spawnSync("sh", ["-c", reader.replace("{id}", "offline-id")], { encoding: "utf8", timeout: 10_000 });
+          expect(read.error).toBeUndefined();
+          expect(read.status, read.stderr).toBe(0);
+          expect(JSON.parse(read.stdout)).toEqual({ rc: "23", text: "offline reader result\n", stderr: "offline reader stderr\n" });
+          expect(fs.existsSync(shellMarker)).toBe(false);
+        } else {
+          console.warn("SKIP direct remote-reader argv probe: POSIX sh and python3 are required");
+        }
+      }
+    }
     const evidence = JSON.parse(fs.readFileSync(path.join(output, "evidence.json"), "utf8"));
     expect(evidence.passed).toBe(mode !== "linked-error");
     expect(fs.existsSync(evidence.isolatedAgentDir)).toBe(false);

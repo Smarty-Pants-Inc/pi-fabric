@@ -2570,6 +2570,36 @@ describe("pi-fabric#876 security pass (round 3)", () => {
     expect(DEFAULT_FACTORY_RATE).toEqual({ perMinute: 30, burst: 60, bytesPerMinute: 512 * 1024, byteBurst: 1024 * 1024 });
   });
 
+  it("drops a conflicting command replay, logs only its key, advances the cursor and forwards later events", async () => {
+    const cursorPath = path.join(scratch(), "cursor.json");
+    const { hub, far, bridge, logs } = setup(cursorPath, { presenceMs: 60_000 });
+    const lane = await addRoot(hub, "lane");
+    const spoke = await addRoot(far, "forge-main");
+    await bridge.start();
+    await bridge.step();
+    const publishCommand = (commandId: string, message: string) => hub.publish({
+      topic: "fabric.control.command", kind: "followUp", from: lane.identity, to: spoke.hostId,
+      data: { ...command(spoke.hostId, lane.hostId), commandId, message, ownerIncarnation: spoke.ownerIncarnation },
+    });
+
+    await publishCommand("reused-command-key", "original private body");
+    expect(await bridge.step()).toMatchObject({ toRemote: 1, dropped: 0 });
+    const conflict = await publishCommand("reused-command-key", "edited private body");
+    const next = await publishCommand("next-command-key", "next message");
+    expect(await bridge.step()).toEqual({ toRemote: 1, toLocal: 0, dropped: 1 });
+
+    expect(on(far, "fabric.control.command").map(event => (event.data as { message: string }).message))
+      .toEqual(["original private body", "next message"]);
+    expect(logs.filter(line => line.includes("dropped idempotency conflict"))).toEqual([
+      `toRemote: dropped idempotency conflict sequence ${conflict.sequence} event ${conflict.id} key reused-command-key`,
+    ]);
+    expect(logs.join(" ")).not.toContain("edited private body");
+    expect(JSON.parse(fs.readFileSync(cursorPath, "utf8")).toRemote.after).toBe(next.sequence);
+    const later = await publishCommand("after-conflict-key", "still live");
+    expect(await bridge.step()).toMatchObject({ toRemote: 1, dropped: 0 });
+    expect((on(far, "fabric.control.command").at(-1)?.data as { bridge: { id: string } }).bridge.id).toBe(later.id);
+  });
+
   // (b): a live sender id must not carry a forged name, kind or session onto the hub.
   it("takes every inbound sender's name, kind and session from its presence record, never from the event body", async () => {
     const { hub, far, bridge } = setup();

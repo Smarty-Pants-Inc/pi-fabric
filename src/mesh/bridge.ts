@@ -2864,6 +2864,13 @@ export class MeshBridge {
     this.options.log?.(message);
   }
 
+  #logIdempotencyConflict(direction: Direction, event: MeshEvent, error: unknown): void {
+    const data = isObject(event.data) ? event.data : {};
+    const key = typeof data.commandId === "string" ? data.commandId
+      : isObject(error) && typeof error.idempotencyKey === "string" ? error.idempotencyKey : "unknown";
+    this.#log(`${direction}: dropped idempotency conflict sequence ${event.sequence} event ${event.id} key ${key}`);
+  }
+
   /**
    * An event neither addressed to the peer nor admitted to it: one debug line each, and a count
    * for the INFO line (smarty-dev#9352: these drops were silent).
@@ -3504,10 +3511,10 @@ export class MeshBridge {
         const event = page.events[index]!;
         if (event.sequence <= cursor.after) continue;
         if (this.#stopped) return { forwarded, dropped };
-        // Batch only a contiguous, already-admitted prefix. Refusals, lapsed authority and
-        // legacy peers retain the single-event refresh/refusal path below.
+        // Batch only a contiguous, already-admitted prefix. Fingerprinted control commands use
+        // the single-event path so a key conflict cannot follow an unreceipted committed prefix.
         if (target.publishBatch && candidateLimit > 1 && page.events.length - index > 1 && !seen.has(event.id) &&
-          !isRelayReceipt(event) && !this.#isRelayCommand(event, rules, direction)) {
+          !isRelayReceipt(event) && event.topic !== "fabric.control.command" && !this.#isRelayCommand(event, rules, direction)) {
           if (!this.#deferPreemptivePresence() && this.#presenceDue()) {
             await this.syncPresence();
             passRefreshed = true;
@@ -3524,7 +3531,8 @@ export class MeshBridge {
           let bytes = 0;
           for (const candidate of page.events.slice(index, index + candidateLimit)) {
             if (candidate.sequence <= cursor.after || seen.has(candidate.id) || isRelayReceipt(candidate) ||
-              this.#isRelayCommand(candidate, rules, direction) || this.#refusal(candidate, rules, direction)) break;
+              candidate.topic === "fabric.control.command" || this.#isRelayCommand(candidate, rules, direction) ||
+              this.#refusal(candidate, rules, direction)) break;
             if (direction === "toRemote" && this.options.local.holds && !this.options.local.holds(candidate.to!)) break;
             const data = isObject(candidate.data) ? candidate.data : {};
             const item = {
@@ -3548,8 +3556,9 @@ export class MeshBridge {
             let committed: Array<{ sequence: number }> | undefined;
             try { committed = await target.publishBatch(candidates); }
             catch (error) {
-              // No admitted prefix: let the original path refresh/drop this one event.
-              if (isIdempotencyKeyReused(error) || (!(error instanceof BridgeOwnershipError) && !isPermanent(error))) throw error;
+              // Fingerprinted control commands are excluded from batches; retain existing handling
+              // for other commit-time refusals without widening the recoverable error set.
+              if (!isIdempotencyKeyReused(error) && !(error instanceof BridgeOwnershipError) && !isPermanent(error)) throw error;
             }
             if (committed) {
               if (!Array.isArray(committed) || !committed.length || committed.length > candidates.length ||
@@ -3720,10 +3729,16 @@ export class MeshBridge {
                 return { forwarded, dropped };
               }
             }
-            // Structural/permanent refusals still advance; sampled membership uncertainty does not.
-            if (!isPermanent(error)) throw error;
-            dropped += 1;
-            this.#log(`${direction}: refused ${event.topic} ${event.id}: ${(error as Error).message}`);
+            // A key conflict belongs to this event, not the link. It is permanently dropped;
+            // other structural/permanent refusals keep their existing behavior.
+            if (isIdempotencyKeyReused(error)) {
+              dropped += 1;
+              this.#logIdempotencyConflict(direction, event, error);
+            } else {
+              if (!isPermanent(error)) throw error;
+              dropped += 1;
+              this.#log(`${direction}: refused ${event.topic} ${event.id}: ${(error as Error).message}`);
+            }
           }
         }
         cursor.after = event.sequence;
@@ -3832,7 +3847,8 @@ export class MeshBridge {
       }
       // Timeout remains ambiguous. A typed conflict is a fixed, nonretryable source-local
       // refusal; neither case exposes owner assertions, arbitrary errors, body or hash.
-      const refusal = isIdempotencyKeyReused(error)
+      const idempotencyConflict = isIdempotencyKeyReused(error);
+      const refusal = idempotencyConflict
         ? { error: "Fabric idempotency key reused with different input", errorCode: FABRIC_IDEMPOTENCY_KEY_REUSED, retryable: false }
         : { error: "Relay destination unavailable", errorCode: RELAY_UNAVAILABLE_CODE, retryable: true };
       await remote.publish({
@@ -3842,6 +3858,7 @@ export class MeshBridge {
           accepted: false, ...refusal,
           bridge: { from: localName, id: event.id } },
       });
+      if (idempotencyConflict) this.#logIdempotencyConflict("toLocal", event, error);
       return { delivered: false };
     }
     // Only a confirmed destination receipt permits a hub envelope. Its sequence is LOCAL;

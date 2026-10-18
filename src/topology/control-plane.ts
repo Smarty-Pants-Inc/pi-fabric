@@ -53,6 +53,8 @@ type NatsControlErrorCode = "FABRIC_CONTROL_ID_CONFLICT" | "FABRIC_SENDER_UNVERI
 // Keep this constant local: importing the optional UDS runtime would widen startup.
 const RELAY_ACK_RECOVERY_TTL_MS = 8_000;
 const RELAY_ACK_RECOVERY_LIMIT = 256;
+const ORIGIN_IDEMPOTENCY_TTL_MS = NATS_HORIZON_MS;
+const ORIGIN_IDEMPOTENCY_LIMIT = 100_000;
 const UNFENCED_SENDER_WARNING_MS = 60 * 60 * 1_000;
 // A cancellation owns a separate retry deadline, longer than a production mesh lock wait.
 const CANCELLATION_RETENTION_MS = 60_000;
@@ -556,6 +558,10 @@ interface RetainedRelayAcknowledgement {
   readonly authority: ControlAcknowledgementAuthority;
   readonly acknowledgement?: OwnerAcknowledgement;
 }
+interface OriginIdempotencyRecord {
+  readonly bodyFingerprint: string;
+  readonly expiresAt: number;
+}
 
 /** Never invoke a getter while capturing a late ACK; wire records must be plain own data. */
 const ownDataRecord = (value: unknown): Record<string, unknown> | undefined => {
@@ -630,8 +636,30 @@ type OwnedControlCommand = ClaimedControlCommand | SavedControlAcknowledgement;
 export class FabricControlPlane {
   readonly incarnation: string;
   readonly #pending = new Map<string, PendingControlRequest>();
+  // Insertion order bounds sender-local key/fingerprint bindings; retain no request body.
+  readonly #originIdempotency = new Map<string, OriginIdempotencyRecord>();
   // Insertion order is LRU, shared by the authority-only and validated-ACK entries.
   readonly #relayAcknowledgements = new Map<string, RetainedRelayAcknowledgement>();
+
+  #bindOriginIdempotencyKey(commandId: string, idempotencyKey: string, bodyFingerprint: string): void {
+    const now = Date.now();
+    // Entries are inserted with one fixed TTL and never promoted, so expired records form a prefix.
+    for (const [key, entry] of this.#originIdempotency) {
+      if (entry.expiresAt > now) break;
+      this.#originIdempotency.delete(key);
+    }
+    // commandId already hashes the scoped caller key, avoiding retention of the raw key.
+    const key = commandId;
+    const existing = this.#originIdempotency.get(key);
+    if (existing) {
+      if (existing.bodyFingerprint !== bodyFingerprint) throw new FabricIdempotencyKeyReusedError(idempotencyKey);
+      return;
+    }
+    if (this.#originIdempotency.size >= ORIGIN_IDEMPOTENCY_LIMIT) {
+      throw new Error("Fabric origin idempotency window is full; retry after retained keys expire");
+    }
+    this.#originIdempotency.set(key, { bodyFingerprint, expiresAt: now + ORIGIN_IDEMPOTENCY_TTL_MS });
+  }
 
   #pruneRelayAcknowledgements(): void {
     const now = Date.now();
@@ -1030,9 +1058,6 @@ export class FabricControlPlane {
     const ownerIncarnation = input.ownerIncarnation;
     options.signal?.throwIfAborted();
     const idempotencyKey = options.idempotencyKey ?? randomUUID();
-    const commandId = createHash("sha256")
-      .update(JSON.stringify([this.options.hostId, ownerHostId, ownerIdentityId, targetId, operation, idempotencyKey, notRunAttempt]))
-      .digest("hex");
     let mirroredOwner: PendingControlRequest["mirroredOwner"];
     const unavailable = (host: string): Error => new Error(
       `Fabric mesh bridge routing to remote host ${host} is unavailable for ${targetId}; ` +
@@ -1069,6 +1094,11 @@ export class FabricControlPlane {
       ...(input.bindingProvenance !== undefined ? { bindingProvenance: input.bindingProvenance } : {}),
     });
     const bodyFingerprint = controlBodyFingerprint(commandBody, input.principal);
+    const commandId = createHash("sha256")
+      .update(JSON.stringify([this.options.hostId, ownerHostId, ownerIdentityId, targetId, operation, idempotencyKey, notRunAttempt]))
+      .digest("hex");
+    // Bind this caller key to its semantic request before any publication can occur.
+    this.#bindOriginIdempotencyKey(commandId, idempotencyKey, bodyFingerprint);
     const existingPending = this.#pending.get(commandId);
     if (existingPending) {
       if (existingPending.ownerIncarnation === ownerIncarnation &&
@@ -1698,6 +1728,7 @@ export class FabricControlPlane {
     for (const active of this.#activeCommands.values()) active.controller.abort();
     await Promise.allSettled([...this.#activeHandlers]);
     this.#handler = undefined;
+    this.#originIdempotency.clear();
     this.#relayAcknowledgements.clear();
     const pendingAcknowledgements = [...this.#ownedCommands].filter(([, owned]) => owned.acknowledgement);
     if (this.#ackPublicationFailed || pendingAcknowledgements.length) {
@@ -2098,8 +2129,6 @@ export class FabricControlPlane {
     options.signal?.throwIfAborted();
     const owner = captured ?? this.#captureNatsOwner(ownerHostId, ownerIdentityId, targetId, input.ownerIncarnation);
     const idempotencyKey = options.idempotencyKey ?? randomUUID();
-    const commandId = createHash("sha256")
-      .update(JSON.stringify([this.options.hostId, ownerHostId, ownerIdentityId, targetId, operation, idempotencyKey, notRunAttempt])).digest("hex");
     const commandBody = { targetId, operation, ownerIncarnation: owner.ownerIncarnation,
       ...(input.message !== undefined ? { message: input.message } : {}),
       ...(input.data !== undefined ? { data: input.data } : {}),
@@ -2110,6 +2139,10 @@ export class FabricControlPlane {
       ...(input.bindingProvenance !== undefined ? { bindingProvenance: input.bindingProvenance } : {}),
     };
     const bodyFingerprint = controlBodyFingerprint(commandBody, input.principal);
+    const commandId = createHash("sha256")
+      .update(JSON.stringify([this.options.hostId, ownerHostId, ownerIdentityId, targetId, operation, idempotencyKey, notRunAttempt])).digest("hex");
+    // Bind this caller key to its semantic request before any publication can occur.
+    this.#bindOriginIdempotencyKey(commandId, idempotencyKey, bodyFingerprint);
     const existing = this.#pending.get(commandId);
     if (existing) {
       if (existing.bodyFingerprint !== bodyFingerprint) throw Object.assign(new Error("Fabric control id reused with different input"), { code: "FABRIC_CONTROL_ID_CONFLICT", notRun: true });

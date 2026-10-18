@@ -267,6 +267,28 @@ function expectSameLogicalRequest(first: Publication, retry: Publication) {
 }
 
 describe("E24 NATS retained outcome replay across owner restart (Decision C)", () => {
+  it("binds a caller key to semantic input while retaining identical-retry dedupe", async () => {
+    const f = new Fixture(), owner = f.owner(OLD), caller = f.caller();
+    const exchange = async (message: string): Promise<Publication> => {
+      const request = observe(caller.plane.request(OWNER_HOST, TARGET, "followUp", { message }, OWNER_ID, { idempotencyKey: KEY }));
+      const command = await caller.transport.commands.required();
+      const ack = await owner.transport.acknowledgements.required();
+      await delivered(f.carrier, ack, caller.transport);
+      await request.settled;
+      expectAccepted(request);
+      return command;
+    };
+
+    const first = await exchange("original message");
+    const identical = await exchange("original message");
+    expect(identical.envelope.body.commandId).toBe(first.envelope.body.commandId);
+    await expect(caller.plane.request(OWNER_HOST, TARGET, "followUp", { message: "edited message" }, OWNER_ID,
+      { idempotencyKey: KEY })).rejects.toMatchObject({
+        name: "FabricIdempotencyKeyReusedError", code: "FABRIC_IDEMPOTENCY_KEY_REUSED", retryable: false,
+      });
+    expect(caller.transport.commands.values).toHaveLength(0);
+    expect(f.executions).toBe(1);
+  });
   it("settles a recreated stable caller's current-epoch retry from disk, without executing twice", async () => {
     const f = new Fixture(), owner = f.owner(OLD), caller = f.caller();
     const original = f.send(caller);

@@ -10,7 +10,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import type { MeshIdentity } from "./mesh/store.js";
 import { takeCompactionDecline } from "./compaction/cancellation.js";
 import { fabricProvenanceOptions, fabricProvenanceSupported, fabricTurnProvenance, fabricWakeCause, copyFabricProvenance, fabricWakeMessage, admittedFabricWakeCauses, sendFabricMessage, sendFabricUserMessage, type FabricWakeCause, type FabricTurnProvenance, type FabricPrincipal } from "./fabric-provenance.js";
-import { classifyModelRefusal, classifyProviderError, type ProviderErrorClass } from "./provider-error-class.js";
+import { classifyModelRefusal, classifyProviderError, hasRecordedModelRefusal, type ProviderErrorClass } from "./provider-error-class.js";
 import { extensionContextLive } from "./session-liveness.js";
 
 import { FabricInterruptNotAuthorizedError, FabricInterruptRateLimitedError, type FabricInterruptAuthority } from "./interrupt-authority.js";
@@ -164,6 +164,7 @@ type ModelRefusalTurnMessage = {
   stopDetailsBytes?: unknown;
   stopDetailsSha256?: unknown;
   diagnostics?: unknown;
+  recovery?: { retryable?: unknown };
 };
 
 /** Add bounded provider refusal metadata to the local assistant-message trace only. */
@@ -576,7 +577,7 @@ export class MainAgentController implements FabricMainAgentTarget {
   #unclassifiedSince: number | undefined;
   #unclassifiedAlarmed = false;
   #runUnclassified = false;
-  #runModelRefusal = false;
+  #runRecoverySuppressed = false;
   // Preserve an unreadable owner index until explicit user input authorizes replacing it.
   #haltIndexUnknown = false;
   #closed = false;
@@ -1406,47 +1407,53 @@ export class MainAgentController implements FabricMainAgentTarget {
       if (this.#switching) { this.#switching = false; this.#reloading = false; this.#bindingsLive = true; }
       this.#halted = false;
       this.#recoverProvider(false);
-      this.#runModelRefusal = false;
+      this.#runRecoverySuppressed = false;
       this.#haltIndexUnknown = false;
       this.#consumedDirty = true;
       this.#suspended = false;
       this.#trySave();
+    });
+    on("message_end", (event: { message?: ModelRefusalTurnMessage }) => {
+      const message = event.message;
+      if (message?.role === "assistant" && classifyModelRefusal(message)) appendModelRefusalSessionDiagnostic(message);
     });
     on("tool_execution_start", (event: { toolCallId: string }, ctx) => {
       this.#context = ctx;
       this.#tools.add(event.toolCallId);
     });
     on("tool_execution_end", (event: { toolCallId: string }) => { this.#tools.delete(event.toolCallId); });
-    on("message_end", (event: { message?: ModelRefusalTurnMessage }) => {
-      const message = event.message;
-      if (message?.role === "assistant" && classifyModelRefusal(message)) appendModelRefusalSessionDiagnostic(message);
-    });
     // Set gates before either drain branch can reconcile a lost Pi handoff. A turn error
     // precedes Pi's retry/overflow recovery decision, so never persist it as an owner stop.
-    on("turn_end", (event: { message?: { stopReason?: string; rawStopReason?: string; errorMessage?: string; diagnostics?: unknown } }, ctx) => {
+    on("turn_end", (event: { message?: ModelRefusalTurnMessage }, ctx) => {
       const reason = event.message?.stopReason;
       // A native abort also precedes compact/reload and extension cancellation. Only
       // explicit halt()/stop() owns durable authority; this boundary is merely passive.
       if (ctx.signal?.aborted || reason === "aborted") {
         this.#suspended = true;
         this.#runUnclassified = false;
-        this.#runModelRefusal = false;
+        this.#runRecoverySuppressed = false;
         this.#providerStateDirty = true;
         this.#trySave(true);
       }
       else if (reason === "error") {
-        const refusal = classifyModelRefusal(event.message);
+        const refusal = classifyModelRefusal(event.message) || hasRecordedModelRefusal(event.message);
         if (refusal && event.message) {
           // The private refusal diagnostic is appended at message_end; never publish provider details.
           // Don't send the same refused context through provider backoff or the provider-dead counter.
           appendModelRefusalSessionDiagnostic(event.message);
           this.#runUnclassified = false;
-          this.#runModelRefusal = true;
+          this.#runRecoverySuppressed = true;
           this.#providerStateDirty = true;
           this.#trySave(true);
           this.#notify("The model declined this request. Resending the same context will likely be declined again.", "warning", ctx, "model-refusal");
+        } else if (event.message?.recovery?.retryable === false) {
+          // Pi's explicit veto applies to Main's compaction and continuation too.
+          this.#runUnclassified = false;
+          this.#runRecoverySuppressed = true;
+          this.#providerStateDirty = true;
+          this.#trySave(true);
         } else {
-          this.#runModelRefusal = false;
+          this.#runRecoverySuppressed = false;
           // smarty-dev#8742: a request the provider will reject again is not backoff.
           const failure = classifyProviderError(event.message);
           // Counted at settle, after Pi's own retries: one failed run is one failure.
@@ -1460,7 +1467,7 @@ export class MainAgentController implements FabricMainAgentTarget {
           else this.#recordProviderFailure(true);
         }
       } else if (reason !== undefined) {
-        this.#runModelRefusal = false;
+        this.#runRecoverySuppressed = false;
         const dead = this.#providerDead;
         if (dead?.phase === "probation") this.#notify(`Main provider recovered after compaction (was ${providerDeadLabel(dead).slice("provider-dead (".length, -1)})`, "info");
         this.#recoverProvider();
@@ -1470,7 +1477,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     const settleGate = (event: { outcome?: string; aborted?: boolean }, ctx: ExtensionContext, finalSettle = false): void => {
       if (ctx.signal?.aborted || event.aborted === true || event.outcome === "aborted") {
         this.#suspended = true;
-        this.#runModelRefusal = false;
+        this.#runRecoverySuppressed = false;
         // Cancellation is not a failed provider attempt, including legacy settles
         // without outcome. Do not carry its pending unclassified failure forward.
         this.#runUnclassified = false;
@@ -1478,8 +1485,8 @@ export class MainAgentController implements FabricMainAgentTarget {
         this.#trySave(true);
         return;
       }
-      if (this.#runModelRefusal) {
-        if (finalSettle) this.#runModelRefusal = false;
+      if (this.#runRecoverySuppressed) {
+        if (finalSettle) this.#runRecoverySuppressed = false;
         return;
       }
       // turn_end already classified a non-retryable failure: recover at idle, never back off.

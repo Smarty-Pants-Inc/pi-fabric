@@ -165,6 +165,21 @@ describe.each([120_000, 0])("Main non-retryable provider recovery (flushMs=%s, s
     } finally { h.main.closeFollowUpDrain(); }
   });
 
+  it("honors Pi's retryable=false for a non-refusal error without compacting or continuing", () => {
+    const h = setup(flushMs);
+    try {
+      h.emit("turn_end", { message: { role: "assistant", stopReason: "error", errorMessage: "503 upstream transient",
+        recovery: { retryable: false } } });
+      h.settleError();
+      vi.advanceTimersByTime(60 * 60_000);
+      expect(h.compactions).toEqual([]);
+      expect(h.sent).toEqual([]);
+      expect(h.alarms).toEqual([]);
+      expect(h.main.providerDeadState).toBeUndefined();
+      expect(h.notify.mock.calls).toEqual([]);
+    } finally { h.main.closeFollowUpDrain(); }
+  });
+
   it("does not reset an existing unclassified streak when refusals occur", () => {
     const h = setup(flushMs);
     const fail = () => {

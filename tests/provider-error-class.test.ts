@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { classifyModelRefusal, classifyProviderError } from "../src/provider-error-class.js";
+import { classifyModelRefusal, classifyProviderError, hasRecordedModelRefusal } from "../src/provider-error-class.js";
 
 // smarty-dev#8742: 26 Mains sat 13.5 h in provider-backoff on a gateway 409 that no retry could fix.
 const affinity = "compaction_affinity_missing: the signed compaction block belongs to another upstream account";
@@ -8,13 +8,47 @@ const anthropic = (status: number, type: string, message: string) =>
 const failed = (errorMessage: string, extra: Record<string, unknown> = {}) => ({ stopReason: "error", errorMessage, ...extra });
 
 describe("classifyModelRefusal (smarty-dev#14952)", () => {
-  it("recognizes the exact owned error text or Pi's structured raw stop reason, only on errors", () => {
-    expect(classifyModelRefusal({ stopReason: "error", errorMessage: "The model refused to complete the request" }))
-      .toEqual({ kind: "model-refusal" });
+  it("recognizes only Pi's structured raw stop reason, and only on errors", () => {
     expect(classifyModelRefusal({ stopReason: "error", rawStopReason: "refusal", errorMessage: "private stop detail" }))
       .toEqual({ kind: "model-refusal" });
-    expect(classifyModelRefusal({ stopReason: "error", errorMessage: "The model refused to complete the request: more" })).toBeUndefined();
+    expect(classifyModelRefusal({ stopReason: "error", errorMessage: "The model refused to complete the request" })).toBeUndefined();
     expect(classifyModelRefusal({ stopReason: "stop", rawStopReason: "refusal" })).toBeUndefined();
+  });
+
+  it("keeps status, body, diagnostic, and fallback-text errors on the provider path", () => {
+    const rawReasonWith5xx = failed(anthropic(503, "api_error", "The model refused to complete the request"), { rawStopReason: "refusal" });
+    expect(classifyModelRefusal(rawReasonWith5xx)).toBeUndefined();
+    expect(classifyProviderError(rawReasonWith5xx)).toMatchObject({ retryable: true, status: 503 });
+
+    const rawReasonWithBody = failed(JSON.stringify({ type: "error", error: { type: "api_error", message: "refusal" } }), { rawStopReason: "refusal" });
+    expect(classifyModelRefusal(rawReasonWithBody)).toBeUndefined();
+    expect(classifyProviderError(rawReasonWithBody)).toMatchObject({ retryable: true });
+
+    const fallbackOnly = failed("The model refused to complete the request");
+    expect(classifyModelRefusal(fallbackOnly)).toBeUndefined();
+    expect(classifyProviderError(fallbackOnly)).toMatchObject({ retryable: true, basis: "default" });
+
+    const statusBearingFallback = failed("503 The model refused to complete the request");
+    expect(classifyModelRefusal(statusBearingFallback)).toBeUndefined();
+    expect(classifyProviderError(statusBearingFallback)).toMatchObject({ retryable: true, status: 503 });
+
+    expect(classifyModelRefusal(failed("private stop detail", { rawStopReason: "refusal", diagnostics: [{ type: "provider_limit" }] })))
+      .toBeUndefined();
+
+    const recorded = failed("private stop detail", { rawStopReason: "refusal",
+      diagnostics: [{ type: "fabric_model_refusal", details: { rawStopReason: "refusal" } }] });
+    expect(classifyModelRefusal(recorded)).toBeUndefined();
+    expect(hasRecordedModelRefusal(recorded)).toBe(true);
+    const marker = { type: "fabric_model_refusal", details: { rawStopReason: "refusal" } };
+    expect(hasRecordedModelRefusal(failed("private stop detail", { rawStopReason: "refusal", diagnostics: [marker] }))).toBe(true);
+    expect(hasRecordedModelRefusal(failed(anthropic(503, "api_error", "temporary"), { rawStopReason: "refusal", diagnostics: [marker] })))
+      .toBe(false);
+    expect(hasRecordedModelRefusal(failed(JSON.stringify({ type: "error", error: { type: "api_error", message: "temporary" } }),
+      { rawStopReason: "refusal", diagnostics: [marker] }))).toBe(false);
+    expect(hasRecordedModelRefusal(failed("private stop detail", { rawStopReason: "refusal", diagnostics: [
+      marker, { type: "provider_limit" },
+    ] }))).toBe(false);
+    expect(hasRecordedModelRefusal(failed("private stop detail", { diagnostics: [{ type: "provider_limit" }] }))).toBe(false);
   });
 });
 

@@ -57,19 +57,19 @@ export const registerMainProviderRecovery = (pi: ExtensionAPI, options: {
     const live = (): boolean => generation === current && extensionContextLive(context);
     // The classifier loads at the first failed settle: it is shared with the lazy Main drain and
     // would otherwise split into its own eager startup chunk.
-    const { classifyModelRefusal, classifyProviderError } = await import("./provider-error-class.js");
+    const { classifyModelRefusal, classifyProviderError, hasRecordedModelRefusal } = await import("./provider-error-class.js");
     if (!live()) return;
-    if (classifyModelRefusal(last)) { reset(); return; }
+    // Pi's refusal and explicit retry veto both suppress Fabric's automatic recovery.
+    if (classifyModelRefusal(last) || hasRecordedModelRefusal(last) ||
+      (last as AssistantMessage & { recovery?: { retryable?: unknown } }).recovery?.retryable === false) {
+      reset();
+      return;
+    }
     // A blind retry of a request the provider rejects as non-retryable fails the same way.
     const classified = classifyProviderError(last);
     if (classified?.retryable === false && options.ownsNonRetryable?.() === true) {
       const message = `Provider rejected Main's request as non-retryable (${classified.short}); compacting once to recover`;
       if (context.hasUI) notifyPrincipalDiagnosticOnce(pi, context, "provider-non-retryable", message, "warning");
-      reset();
-      return;
-    }
-    // Pi's per-turn recovery decision wins even when Fabric cannot classify the failure text.
-    if ((last as AssistantMessage & { recovery?: { retryable?: unknown } }).recovery?.retryable === false) {
       reset();
       return;
     }

@@ -16,11 +16,12 @@ type RpcEvent = Record<string, any>;
 const repo = fileURLToPath(new URL("../", import.meta.url));
 const entry = path.join(repo, "dist/index.js");
 const cli = process.env.FABRIC_8742_PI_CLI ?? path.join(repo, "node_modules/@earendil-works/pi-coding-agent/dist/cli.js");
+const noRetryFixture = path.join(repo, "tests/fixtures/main-provider-no-retry-14952.ts");
 // A provider that echoes prompt or secret content in its error body (security review P1).
 const SECRET = "SECRET-sk-ant-8742 echoed prompt hunter2";
 const POISON = "SIGNED-BLOCK";
 
-type Mode = "non-retryable" | "unclassified" | "retryable" | "refusal";
+type Mode = "non-retryable" | "unclassified" | "retryable" | "refusal" | "pi-no-retry";
 
 const run = async (mode: Mode) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), `fabric-8742-${mode}-`));
@@ -34,8 +35,9 @@ const run = async (mode: Mode) => {
     req.on("end", () => {
       const summarizer = body.includes("context summarization assistant");
       const poisoned = !summarizer && body.includes(POISON);
-      requests.push({ who: summarizer ? "summarizer" : "main", poisoned,
-        status: poisoned ? (mode === "unclassified" ? 0 : mode === "retryable" ? 503 : mode === "refusal" ? 200 : 409) : 200 });
+      const status = !poisoned ? 200 : mode === "unclassified" ? 0
+        : mode === "retryable" || mode === "pi-no-retry" ? 503 : mode === "refusal" ? 200 : 409;
+      requests.push({ who: summarizer ? "summarizer" : "main", poisoned, status });
       if (poisoned && mode === "unclassified") { req.socket.destroy(); return; }       // no status, no body
       if (poisoned && mode === "refusal") {
         const responseId = `refusal-${randomUUID()}`;
@@ -51,10 +53,11 @@ const run = async (mode: Mode) => {
         res.end();
         return;
       }
-      if (poisoned && mode === "retryable") {
-        // A retryable 5xx whose body echoes the secret: #4012's one retry, then its BLOCKED report.
+      if (poisoned && (mode === "retryable" || mode === "pi-no-retry")) {
+        // Both paths get a transient 503; the test hook adds Pi's explicit veto only in pi-no-retry mode.
+        const marker = mode === "pi-no-retry" ? " PI_NO_RETRY_14952" : "";
         res.writeHead(503, { "content-type": "application/json", "x-should-retry": "false" });
-        res.end(JSON.stringify({ type: "error", error: { type: "api_error", message: `upstream echoed: ${SECRET}` } }));
+        res.end(JSON.stringify({ type: "error", error: { type: "api_error", message: `upstream echoed: ${SECRET}${marker}` } }));
         return;
       }
       if (poisoned) {
@@ -91,7 +94,8 @@ const run = async (mode: Mode) => {
     env: { PI_CODING_AGENT_DIR: agentDir, PI_FABRIC_AGENT_DIR: path.join(root, "exports"), PI_FABRIC_MESH_ROOT: meshRoot,
       PI_FABRIC_PROJECT_ROOT: project, PI_FABRIC_RUN_ROOT: path.join(root, "runs"), HERDR_PANE_ID: "", HERDR_SOCKET_PATH: "", PI_OFFLINE: "1" },
     args: ["--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files", "--approve",
-      "--no-builtin-tools", "--thinking", "off", "--session-dir", path.join(root, "sessions"), "-e", entry] });
+      "--no-builtin-tools", "--thinking", "off", "--session-dir", path.join(root, "sessions"),
+      ...(mode === "pi-no-retry" ? ["-e", noRetryFixture] : []), "-e", entry] });
   const events: RpcEvent[] = [];
   client.onEvent(event => { events.push(event as RpcEvent); });
   const notices = () => events.filter(e => e.type === "extension_ui_request" && e.method === "notify").map(e => String(e.message));
@@ -113,7 +117,9 @@ const run = async (mode: Mode) => {
     for (const seed of ["seed one", "seed two"]) await prompt(seed);
     // The retryable path never alarms provider-dead; it ends in #4012's one BLOCKED report.
     const dead = mode === "retryable" ? /^BLOCKED: provider error/ : /^provider-dead/;
-    if (mode === "refusal") {
+    if (mode === "pi-no-retry") {
+      await prompt(`${POISON}: transient provider error with Pi's no-retry decision`);
+    } else if (mode === "refusal") {
       for (let attempt = 0; attempt < 3; attempt++) {
         await prompt(`${POISON}: partial output followed by refusal (attempt ${attempt + 1})`);
         await wait(() => notices().filter(n => n === "The model declined this request. Resending the same context will likely be declined again.").length >= attempt + 1,
@@ -134,7 +140,7 @@ const run = async (mode: Mode) => {
     const mesh = new MeshStore(meshRoot, 256 * 1024, 1000);
     const read = (topic: string) => mesh.read({ topic, after: 0, limit: 200 });
     // Mesh delivery is best-effort background work; give it a moment.
-    if (mode !== "retryable" && mode !== "refusal") await wait(() => read("ops.owner").some(e => e.kind === "fabric.main.provider-dead"), "the ops.owner alarm", 15_000);
+    if (mode !== "retryable" && mode !== "refusal" && mode !== "pi-no-retry") await wait(() => read("ops.owner").some(e => e.kind === "fabric.main.provider-dead"), "the ops.owner alarm", 15_000);
     const meshFiles = (dir: string): string[] => fs.readdirSync(dir, { withFileTypes: true })
       .flatMap(d => d.isDirectory() ? meshFiles(path.join(dir, d.name)) : [path.join(dir, d.name)]);
     const sessionFile = (state as { sessionFile?: string }).sessionFile;
@@ -208,6 +214,16 @@ describe.runIf(process.env.FABRIC_8742_REAL_PI === "1")("real Pi + stub provider
     expect(result.opsOwner.find(e => e.kind === "fabric.main.provider-dead")!.data)
       .toMatchObject({ kind: "unclassified", cause: "unclassified-repeated", error: "unclassified", failures: 3 });
     expect(result.meshLeaks).toEqual([]);
+  }, 150_000);
+
+  it("Pi retryable=false on a transient 503: Main does not compact or continue", async () => {
+    const result = await run("pi-no-retry");
+    expect(result.requests.filter(r => r.who === "main" && r.poisoned)).toHaveLength(1);
+    expect(result.mainRequestsAfter).toBe(result.mainRequests);
+    expect(result.requests.filter(r => r.who === "summarizer")).toHaveLength(0);
+    expect(result.notices.some(n => n.startsWith("provider-dead") || n.startsWith("BLOCKED:") || n.startsWith("Provider rejected"))).toBe(false);
+    expect(result.opsOwner.some(e => e.kind === "fabric.main.provider-dead")).toBe(false);
+    expect(result.mainWake.some(e => e.kind === "fabric.main.provider-dead")).toBe(false);
   }, 150_000);
 
   it("retryable 503 echoing a secret: one retry, then a BLOCKED report with only the status and error type", async () => {

@@ -16,16 +16,17 @@ vi.mock("../src/fabric-provenance.js", () => ({
 vi.mock("@earendil-works/pi-ai/compat", () => ({ isContextOverflow: () => false }));
 
 type Handler = (event: unknown, context: ExtensionContext) => unknown;
-const harness = (options: { errorMessage?: string; rawStopReason?: string; recoveryRetryable?: boolean; owns?: boolean } = {}) => {
+const harness = (options: { errorMessage?: string; rawStopReason?: string; recoveryRetryable?: boolean; diagnostics?: unknown; owns?: boolean } = {}) => {
   const handlers = new Map<string, Handler[]>();
   let idle = false;
   let settling = false;
   let halted = false;
   let owner = new AbortController();
-  const turn: { role: string; stopReason: string; errorMessage: string; rawStopReason?: string; recovery?: { retryable: boolean } } = {
+  const turn: { role: string; stopReason: string; errorMessage: string; rawStopReason?: string; recovery?: { retryable: boolean }; diagnostics?: unknown } = {
     role: "assistant", stopReason: "error", errorMessage: options.errorMessage ?? "disconnect\nprivate diagnostic",
     ...(options.rawStopReason === undefined ? {} : { rawStopReason: options.rawStopReason }),
     ...(options.recoveryRetryable === undefined ? {} : { recovery: { retryable: options.recoveryRetryable } }),
+    ...(options.diagnostics === undefined ? {} : { diagnostics: options.diagnostics }),
   };
   const context = {
     get signal() { return owner.signal; },
@@ -64,6 +65,18 @@ afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); });
 describe("Main provider recovery waiting for settlement compaction", () => {
   it("does not retry or latch a structured model refusal", async () => {
     const h = harness({ errorMessage: "private refusal detail", rawStopReason: "refusal" });
+    h.idle();
+    await h.emit("agent_settled");
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(sendFabricMessage).not.toHaveBeenCalled();
+    expect(h.report).not.toHaveBeenCalled();
+    expect(h.context.ui.notify).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("does not retry a refusal after Main records its private session diagnostic", async () => {
+    const h = harness({ errorMessage: "private refusal detail", rawStopReason: "refusal",
+      diagnostics: [{ type: "fabric_model_refusal", details: { rawStopReason: "refusal" } }] });
     h.idle();
     await h.emit("agent_settled");
     await vi.advanceTimersByTimeAsync(5_000);

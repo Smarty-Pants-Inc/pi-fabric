@@ -4,7 +4,8 @@ import { RootInbox, type RootInboxBatch, type RootInboxSession, type RootInboxRe
 import { RootInboxWatch } from "./topology/root-inbox-wake.js";
 import { MainInboxMaintenance, registerMainInbox, recordMainSuccessor, mainInboxOwns, mainInboxActive, rootPresenceAlarms, stageMainSuccessor, confirmMainSuccessor, providerDeadAlarms, providerDeadAlarmFields, admissionAlarmRecipient } from "./topology/stall-alarms.js";
 import type { RecordsService } from "./records/service.js";
-import { recordsInboxMessage, recordsInboxSession, type RecordsInboxBatch, type RecordsInboxSession } from "./records/inbox.js";
+import { recordsInboxMessage, RecordsInboxCursor, type RecordsInboxBatch, type RecordsInboxSession } from "./records/inbox.js";
+import type { SessionEntryCursorManager } from "./core/preview.js";
 import { RECORDS_DISABLED_HINT } from "./records/config.js";
 import { RecordsProvider } from "./providers/records-provider.js";
 import { closeWithActors } from "./actors/close-order.js";
@@ -249,6 +250,7 @@ export class FabricRuntimeState {
   #meshActivationReady: () => boolean = () => false;
   #records: Promise<RecordsService> | undefined;
   #openRecords: (() => Promise<RecordsService>) | undefined;
+  readonly #recordsInboxCursor = new RecordsInboxCursor();
   #mesh: MeshStore | undefined;
   #disposableMeshWrites: AbortController | undefined;
   #backgroundMesh = new MeshBackgroundQueue("runtime lifecycle/compaction");
@@ -490,9 +492,14 @@ export class FabricRuntimeState {
     return service.inbox?.next(session);
   }
 
+  /** Re-derive the branch-local records cursor at each session_start/tree replacement. */
+  resetRecordsInboxCursor(session: SessionEntryCursorManager): void {
+    this.#recordsInboxCursor.reset(session);
+  }
+
   /** The same, as the one message that brings the batch into the session; undefined when empty. */
-  async nextRecordsInboxMessage(entries: readonly unknown[]): Promise<ReturnType<typeof recordsInboxMessage> | undefined> {
-    const batch = await this.nextRecordsInbox(recordsInboxSession(entries));
+  async nextRecordsInboxMessage(session: SessionEntryCursorManager): Promise<ReturnType<typeof recordsInboxMessage> | undefined> {
+    const batch = await this.nextRecordsInbox(this.#recordsInboxCursor.session(session));
     return batch?.records.length ? recordsInboxMessage(batch.records) : undefined;
   }
 
@@ -1265,6 +1272,12 @@ export class FabricRuntimeState {
       kernel: () => this.#config?.executor.kernel ?? "typescript",
       pythonRuntime: () => this.#config?.executor.pythonRuntime ?? "monty",
       mainAgentId,
+      rootSessionCwd: () => {
+        const root = this.#participants?.get(mainAgentId, undefined, { fresh: true });
+        return root?.kind === "root" && root.id === mainAgentId && typeof root.cwd === "string" && root.cwd.trim().length > 0
+          ? root.cwd
+          : undefined;
+      },
       fabricSessionId,
       meshRoot,
       projectRoot,

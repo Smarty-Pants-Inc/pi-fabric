@@ -86,7 +86,7 @@ describe.runIf(process.platform !== "win32")("root-owned host policy (#7591)", (
       expect(loaded.executor.landlock).toEqual({ mode: "off", disabled: false });
       expect(loaded.agents.processSlice).toBeUndefined();
       expect(loaded.agents.deniedModels).toEqual([]);
-      expect(loaded.agents.modelPolicy.requireReason).toEqual(["gpt-6-astra"]);
+      expect(loaded.agents.modelPolicy.requireReason).toEqual(["gpt-6-astra", "opus", "claude"]);
       expect(config.readHostLandlockDisabled(agentDir)).toBe(false);
       expect(config.liveLandlockSettings({ mode: "off", disabled: true }, agentDir)).toEqual({ mode: "off", disabled: false });
     }
@@ -161,7 +161,7 @@ describe.runIf(process.platform !== "win32")("root-owned host policy (#7591)", (
       config.loadFabricConfigForScope({ cwd, agentDir, projectTrusted: true }, "project")]) {
       expect(loaded.executor.landlock).toEqual({ mode: "enforce", disabled: false });
       expect(config.liveLandlockSettings(loaded.executor.landlock, agentDir)).toEqual({ mode: "enforce", disabled: false });
-      expect(loaded.agents.modelPolicy.requireReason).toEqual(["gpt-6-astra"]);
+      expect(loaded.agents.modelPolicy.requireReason).toEqual(["gpt-6-astra", "opus", "claude"]);
     }
     expect(warn.mock.calls.filter(call => String(call[0]).includes("ignoring untrusted"))).toHaveLength(1);
     expect(String(warn.mock.calls[0]?.[0])).toContain(HOST_POLICY_PATH);
@@ -196,13 +196,15 @@ describe.runIf(process.platform !== "win32")("root-owned host policy (#7591)", (
     const loaded = load();
     expect(loaded.executor.landlock).toEqual({ mode: "enforce", disabled: false });
     expect(loaded.agents.deniedModels).toEqual(["agent-deny"]);
-    expect(loaded.agents.modelPolicy.requireReason).toEqual(["gpt-6-astra", "agent-reason"]);
+    expect(loaded.agents.modelPolicy.requireReason).toEqual(["gpt-6-astra", "opus", "claude", "agent-reason"]);
   });
 
   it("applies root relaxations and unions only agent restrictions across all loaders", () => {
     simulateRootOwnership();
     writePolicy({ executor: { landlock: { disabled: true, mode: "enforce" } }, fullCodeMode: false,
-      agents: { processSlice: "root.slice", deniedModels: [" ROOT-DENY "], modelPolicy: { requireReason: [] } } });
+      agents: { processSlice: "root.slice", deniedModels: [" ROOT-DENY "], modelPolicy: {
+        requireReason: [], fallbackModel: "provider/root-only", fallbackThinking: "low",
+      } } });
     writeAgent({ executor: { landlock: { disabled: false } }, agents: {
       processSlice: "agent.slice", deniedModels: ["agent-deny", "root-deny"], modelPolicy: { requireReason: [" AGENT-REASON "] },
     } });
@@ -217,6 +219,8 @@ describe.runIf(process.platform !== "win32")("root-owned host policy (#7591)", (
       expect(loaded.agents.processSlice).toBe("root.slice");
       expect(loaded.agents.deniedModels).toEqual(["root-deny", "agent-deny"]);
       expect(loaded.agents.modelPolicy.requireReason).toEqual(["agent-reason"]);
+      expect(loaded.agents.modelPolicy.fallbackModel).toBeUndefined();
+      expect(loaded.agents.modelPolicy.fallbackThinking).toBe("high");
     }
     writeAgent({ agents: { deniedModels: [], modelPolicy: { requireReason: [] } } });
     writePolicy({ agents: { deniedModels: ["root-deny"], modelPolicy: { requireReason: ["root-reason"] } } });
@@ -233,10 +237,10 @@ describe.runIf(process.platform !== "win32")("root-owned host policy (#7591)", (
       deniedModels: ["agent-deny"], modelPolicy: { requireReason: ["extra-reason"] },
     } });
     expect(load().executor.landlock).toEqual({ mode: "enforce", disabled: false });
-    expect(load().agents.modelPolicy.requireReason).toEqual(["gpt-6-astra", "extra-reason"]);
+    expect(load().agents.modelPolicy.requireReason).toEqual(["gpt-6-astra", "opus", "claude", "extra-reason"]);
     writeAgent({ agents: { deniedModels: ["agent-deny"], modelPolicy: { requireReason: [] } } });
     expect(load().agents.deniedModels).toEqual(["agent-deny"]);
-    expect(load().agents.modelPolicy.requireReason).toEqual(["gpt-6-astra"]);
+    expect(load().agents.modelPolicy.requireReason).toEqual(["gpt-6-astra", "opus", "claude"]);
   });
 
   it.each(["non-root", "group-writable", "world-writable", "directory", "malformed", "array", "symlink"])("rejects %s policy without fallback", kind => {
@@ -260,7 +264,7 @@ describe.runIf(process.platform !== "win32")("root-owned host policy (#7591)", (
       expect(loaded.executor.landlock.disabled).toBe(false);
       expect(loaded.agents.processSlice).toBeUndefined();
       expect(loaded.agents.deniedModels).toEqual(["agent-deny"]);
-      expect(loaded.agents.modelPolicy.requireReason).toEqual(["gpt-6-astra"]);
+      expect(loaded.agents.modelPolicy.requireReason).toEqual(["gpt-6-astra", "opus", "claude"]);
       expect(config.liveLandlockSettings({ mode: "enforce", disabled: true }, agentDir).disabled).toBe(false);
     }
     fs.unlinkSync(path.join(agentDir, "fabric.json"));
@@ -558,6 +562,6 @@ describe.runIf(process.platform !== "win32")("root-owned host policy (#7591)", (
     vi.stubEnv("PI_FABRIC_HOST_POLICY_PATH", other); vi.stubEnv("FABRIC_HOST_POLICY_PATH", other);
     writeAgent({ hostPolicyPath: other, agents: { modelPolicy: { requireReason: [] } } });
     expect(policy.readHostPolicy().status).toBe("missing");
-    expect(load().agents.modelPolicy.requireReason).toEqual(["gpt-6-astra"]);
+    expect(load().agents.modelPolicy.requireReason).toEqual(["gpt-6-astra", "opus", "claude"]);
   });
 });

@@ -8,7 +8,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ActorDirectory } from "../src/actors/directory.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
-import type { AgentManager } from "../src/agents/manager.js";
+import type { AgentManager, AgentModelAdmission } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore } from "../src/mesh/store.js";
 
@@ -22,6 +22,18 @@ afterEach(async () => {
   await Promise.all(directories.splice(0).map(directory => directory.close()));
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
+// Nonprotected fixture contract only; protected slot topics do not grant model exceptions.
+const assertModelAllowed: AgentManager["assertModelAllowed"] = (model, runner = DEFAULT_FABRIC_CONFIG.agents.runner) => {
+  if ((model !== undefined && model !== "test-model") || (runner !== "pi" && runner !== "pi-durable")) {
+    throw new Error(`Unexpected slot fixture model/runner: ${model}/${runner}`);
+  }
+};
+const resolveModelReasonPolicy = (
+  ...[model, _reason, runner, options = {}]: Parameters<AgentManager["resolveModelReasonPolicy"]>
+): AgentModelAdmission => {
+  assertModelAllowed(model, runner);
+  return { model, thinking: options.thinking, fallback: false };
+};
 function fixture() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "actor-slot-removal-"));
   roots.push(root);
@@ -64,7 +76,7 @@ function fixture() {
   const sources = new Map<string, string>();
   let unsettled = false;
   const agents = { config: DEFAULT_FABRIC_CONFIG.agents, resolveKernel: () => undefined, defaultModel: () => undefined,
-    actorArchiveSources: () => sources, retentionCustodyVeto: () => unsettled,
+    assertModelAllowed, resolveModelReasonPolicy, actorArchiveSources: () => sources, retentionCustodyVeto: () => unsettled,
     run: () => { throw new Error("No worker in this fixture"); }, close: async () => {} } as unknown as AgentManager;
   const open = () => {
     const directory = new ActorDirectory(["alpha", identity, mesh, DEFAULT_FABRIC_CONFIG.mesh, agents, () => {}, {

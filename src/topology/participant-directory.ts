@@ -59,6 +59,7 @@ import {
 import { HostLeaseLockBusyError, withHostLeaseLock } from "./host-lease-lock.js";
 import type { TransportHostLease } from "./host-leases.js";
 import type { KvParticipantDirectory, ParticipantView } from "./participant-view.js";
+import type { NatsLocalProjection, NatsLocalProjectionMetrics } from "./nats-local-projection.js";
 import { peerLabelPrefix } from "./peer-settle.js";
 import { rootParticipantName } from "./participant-name.js";
 import { ownProcessIncarnation } from "../core/atomic-write.js";
@@ -713,6 +714,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
   readonly ownerIncarnation = randomUUID();
   #transportLease: TransportHostLease | undefined;
   #participantView: KvParticipantDirectory | undefined;
+  #localProjection: NatsLocalProjection | undefined;
   readonly #natsPrelaunch = new Map<string, FabricParticipantRecord>();
   readonly #natsPending = new Map<string, Promise<void>>();
   readonly #natsPublished = new Map<string, FabricParticipantRecord>();
@@ -864,6 +866,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
 
   /** Composition aborts transport consumers when this local host lease is lost. */
   get transportLeaseSignal(): AbortSignal | undefined { return this.#transportLease?.signal; }
+
+  /** Write/read rates for the host-local NATS projection; undefined for FILE transport. */
+  get natsProjectionMetrics(): NatsLocalProjectionMetrics | undefined { return this.#localProjection?.metrics(); }
 
   #isNats(): boolean { return this.options.transport?.kind === "nats"; }
 
@@ -1127,8 +1132,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
   async #startNats(): Promise<void> {
     if (this.#timer) return;
     if (!this.#transportLease || !this.#participantView) {
-      const [{ TransportHostLease }, { KvParticipantDirectory }] = await Promise.all([
-        import("./host-leases.js"), import("./participant-view.js"),
+      const [{ TransportHostLease }, { KvParticipantDirectory }, { NatsLocalProjection }] = await Promise.all([
+        import("./host-leases.js"), import("./participant-view.js"), import("./nats-local-projection.js"),
       ]);
       const transport = this.options.transport;
       if (!transport || !this.options.transportStateDir) throw new Error("NATS participant carrier is incomplete");
@@ -1143,6 +1148,10 @@ export class ParticipantDirectory implements FabricParticipantSource {
         ownerIncarnation: this.ownerIncarnation, rootId: this.options.rootId,
         onError: error => { this.#refreshError = error; this.#routingError = error; },
       });
+      this.#localProjection = new NatsLocalProjection({
+        mesh: this.mesh, transport, leaseLive: () => lease.live(),
+        onError: error => { this.#refreshError = error; this.#routingError = error; },
+      });
     }
     const lease = this.#transportLease, view = this.#participantView;
     if (!lease || !view) throw new Error("NATS participant carrier is incomplete");
@@ -1151,8 +1160,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
       await lease.acquire(AbortSignal.timeout(5_000));
       if (this.#closed) throw new TransportUnavailableError("Participant directory closed during acquisition");
       view.start();
+      this.#localProjection?.start();
       this.#armHeartbeat();
-      await this.#waitNatsReady();
+      await Promise.all([this.#waitNatsReady(), this.#localProjection?.whenReady()]);
       await this.refresh();
     } catch (error) {
       await this.#closeNats();
@@ -2479,6 +2489,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     await this.#transportRenewing?.catch(() => undefined);
     if (this.#participantView) await this.#participantView.close().catch(error => { this.#refreshError = error; });
     if (this.#transportLease) await this.#transportLease.release(AbortSignal.timeout(5_000)).catch(error => { this.#refreshError = error; });
+    if (this.#localProjection) await this.#localProjection.close().catch(error => { this.#refreshError = error; });
     this.#natsPrelaunch.clear();
     this.#natsPending.clear();
     this.#natsPublished.clear();

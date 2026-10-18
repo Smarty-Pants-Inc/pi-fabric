@@ -3,7 +3,7 @@ import { convertToLlm, CustomMessageComponent, initTheme } from "@earendil-works
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { normalizeFabricConfig, type FabricIncomingMessageMode } from "../src/config.js";
-import { INCOMING_MESSAGE_TYPES, incomingMessagesCollapsed, registerIncomingMessageRenderers } from "../src/ui/incoming-messages.js";
+import { INCOMING_MESSAGE_TYPES, incomingMessagesCollapsed, PriorInboxReceiptIndex, registerIncomingMessageRenderers } from "../src/ui/incoming-messages.js";
 import { rootInboxMessage } from "../src/topology/root-inbox.js";
 import type { MeshEvent } from "../src/mesh/store.js";
 
@@ -25,15 +25,47 @@ const entry = (value: CustomMessage) => ({ ...value, type: "custom_message" });
 const harness = (initial: FabricIncomingMessageMode = "collapsed") => {
   let mode = initial; let branch: unknown[] = [];
   const renderers = new Map<string, MessageRenderer>();
-  let start: ((event: unknown, ctx: ExtensionContext) => unknown) | undefined;
-  const on = vi.fn((name: string, fn: any) => { expect(name).toBe("session_start"); start = fn; });
+  const handlers = new Map<string, Array<(event: any, context: ExtensionContext) => unknown>>();
+  const on = vi.fn((name: string, fn: (event: any, context: ExtensionContext) => unknown) => {
+    const list = handlers.get(name) ?? []; list.push(fn); handlers.set(name, list);
+  });
   const registerMessageRenderer = vi.fn((type: string, render: MessageRenderer) => renderers.set(type, render));
   registerIncomingMessageRenderers({ on, registerMessageRenderer } as unknown as ExtensionAPI, () => mode);
-  start!({}, { sessionManager: { getBranch: () => branch } } as unknown as ExtensionContext);
+  const getBranch = vi.fn(() => branch);
+  const getEntries = vi.fn(() => [...branch]);
+  const getLeafEntry = vi.fn(() => branch.at(-1));
+  const byId = new Map<string, unknown>();
+  const getEntry = vi.fn((id: string) => byId.get(id));
+  const sessionManager = {
+    getLeafEntry,
+    getEntry,
+    getSessionId: () => "renderer-test-session",
+    getHeader: () => ({ version: 3 }),
+    getEntries,
+    getBranch,
+  };
+  const context = { sessionManager } as unknown as ExtensionContext;
+  for (const handler of handlers.get("session_start") ?? []) handler({}, context);
   const render = (value: CustomMessage, expanded = false, width = 200) =>
     renderers.get(value.customType)!(value, { expanded, outputPad: 1 }, theme)?.render(width);
-  return { render, renderers, on, setMode: (value: FabricIncomingMessageMode) => { mode = value; },
-    setBranch: (entries: unknown[]) => { branch = entries; } };
+  const setBranch = (entries: unknown[]) => {
+    byId.clear();
+    let parentId: string | null = null;
+    branch = entries.map((raw, index) => {
+      const value = raw && typeof raw === "object" ? raw as Record<string, unknown> : {};
+      const id = typeof value.id === "string" ? value.id : `renderer-entry-${index}`;
+      const next = { ...value, id, parentId };
+      byId.set(id, next); parentId = id;
+      return next;
+    });
+    for (const handler of handlers.get("session_tree") ?? []) handler({}, context);
+  };
+  const messageEnd = (value: CustomMessage) => {
+    for (const handler of handlers.get("message_end") ?? []) handler({ message: value }, context);
+  };
+  return { render, renderers, on, getBranch, getEntries, getLeafEntry, getEntry,
+    setMode: (value: FabricIncomingMessageMode) => { mode = value; },
+    setBranch, messageEnd };
 };
 afterEach(() => vi.unstubAllEnvs());
 
@@ -41,7 +73,58 @@ describe("incoming Fabric display projection", () => {
   it("registers only incoming types, no context transformation or reply renderer", () => {
     const h = harness();
     expect([...h.renderers.keys()]).toEqual([...INCOMING_MESSAGE_TYPES]);
-    expect(h.on.mock.calls.map(call => call[0])).toEqual(["session_start"]);
+    expect(h.on.mock.calls.map(call => call[0])).toEqual(["session_start", "session_tree", "message_end"]);
+  });
+
+  it("does not read the session branch on each inbox render", () => {
+    const h = harness();
+    const carrier = inbox([event("rendered", "visible")]);
+    const leafLookups = h.getLeafEntry.mock.calls.length;
+    const pointLookups = h.getEntry.mock.calls.length;
+    for (let index = 0; index < 8; index++) h.render(carrier);
+    expect(h.getBranch).not.toHaveBeenCalled();
+    expect(h.getEntries).not.toHaveBeenCalled();
+    expect(h.getLeafEntry).toHaveBeenCalledTimes(leafLookups);
+    expect(h.getEntry).toHaveBeenCalledTimes(pointLookups);
+  });
+
+  it("keeps prior-inbox rendering constant-time after indexing a large branch", () => {
+    const h = harness();
+    const prior = inbox([event("large-history-event", "prior body")]);
+    const rows = Array.from({ length: 2_000 }, () => ({ type: "message", message: { role: "user", content: "history" } }));
+    h.setBranch([...rows, entry(prior)]);
+    const pointLookups = h.getEntry.mock.calls.length;
+    const leafLookups = h.getLeafEntry.mock.calls.length;
+    expect(plain(h.render(prior)![0]!)).toContain("prior body");
+    const replay = { ...inbox([event("large-history-event", "replayed body")]), timestamp: prior.timestamp + 60_000 };
+    for (let index = 0; index < 8; index++) expect(h.render(replay)).toEqual([]);
+    expect(h.getBranch).not.toHaveBeenCalled();
+    expect(h.getEntries).not.toHaveBeenCalled();
+    expect(h.getEntry).toHaveBeenCalledTimes(pointLookups);
+    expect(h.getLeafEntry).toHaveBeenCalledTimes(leafLookups);
+  });
+
+  it("matches prior string-content inboxes through compact digests when object identities differ", () => {
+    const h = harness();
+    const earlier = inbox([event("already-seen", "prior row", {})]);
+    const target = { ...inbox([event("already-seen", "prior row", {}), event("new-event", "new row", {})]), timestamp: 456 };
+    h.setBranch([entry(earlier), entry(target)]);
+    const replay = { ...target, details: { ...(target.details as Record<string, unknown>) } };
+    const visible = plain(h.render(replay)![0]!);
+    expect(visible).toContain("new row");
+    expect(visible).not.toContain("prior row");
+  });
+
+  it("retains fixed-size content digests rather than full inbox bodies", () => {
+    const carrier = (content: string) => ({
+      role: "custom" as const, customType: "pi-fabric-inbox", timestamp: 123, content, details: { ids: ["event"] },
+    });
+    const short = new PriorInboxReceiptIndex();
+    const long = new PriorInboxReceiptIndex();
+    short.addMessage(carrier("short body"));
+    long.addMessage(carrier("large body".repeat(100_000)));
+    expect(short.retainedContentKeyChars).toBe(64);
+    expect(long.retainedContentKeyChars).toBe(64);
   });
 
   it("renders exactly one dim decoded whitespace-collapsed body line", () => {
@@ -345,6 +428,18 @@ describe("incoming Fabric display projection", () => {
     expect(plain(h.render(value)![0]!)).toContain("same old work");
   });
 
+  it("updates delivery and prior-inbox indexes as messages arrive without a branch read", () => {
+    const h = harness();
+    const delivered = message(); h.messageEnd(delivered);
+    const shadow = inbox([event("shadow", "native duplicate", { key: "same-work", messageId: "native-1" })]);
+    expect(h.render(shadow)).toEqual([]);
+    const firstInbox = inbox([event("event-once", "first copy", {})]);
+    h.messageEnd(firstInbox);
+    expect(h.render(firstInbox)![0]).toContain("first copy"); // The carrier does not hide itself.
+    expect(h.render({ ...inbox([event("event-once", "replay", {})]), timestamp: firstInbox.timestamp + 60_000 })).toEqual([]);
+    expect(h.getBranch).not.toHaveBeenCalled();
+  });
+
   it("keeps message and LLM-facing content byte-identical through render and toggles", () => {
     const h = harness(); const all = [message(), inbox([event("shadow", "unchanged & body")]),
       { ...message(), customType: "pi-fabric-actor" }];
@@ -411,12 +506,14 @@ describe("incoming full-carrier markdown theme (cold import, first use)", () => 
   it("imports and idles without the SDK or highlighter, then colors code with the host Theme on first use", async () => {
     const { registerIncomingMessageRenderers: register } = await load();
     const renderers = new Map<string, MessageRenderer>();
-    let start: ((event: unknown, ctx: ExtensionContext) => unknown) | undefined;
-    register({ on: (_name: string, fn: any) => { start = fn; },
+    const handlers = new Map<string, (event: any, ctx: ExtensionContext) => unknown>();
+    register({ on: (name: string, fn: any) => { handlers.set(name, fn); },
       registerMessageRenderer: (type: string, fn: MessageRenderer) => renderers.set(type, fn) } as unknown as ExtensionAPI,
     () => "collapsed");
     let branch: unknown[] = [];
-    start!({}, { sessionManager: { getBranch: () => branch } } as unknown as ExtensionContext);
+    const byId = new Map<string, unknown>();
+    const sessionManager = { getLeafEntry: () => branch.at(-1), getEntry: (id: string) => byId.get(id), getSessionId: () => "cold-test" };
+    const context = { sessionManager } as unknown as ExtensionContext;
     const used = new Set<string>();
     const mark = (name: string) => (text: string) => { used.add(name); return text; };
     const hostTheme = { fg: (name: string, text: string) => mark(name)(text), bg: (name: string, text: string) => mark(name)(text),
@@ -426,7 +523,9 @@ describe("incoming full-carrier markdown theme (cold import, first use)", () => 
     const code = "Intro\n\n# Incoming Heading\n\n**Bold** and `inline`\n\n```ts\nconst x = 1;\n```\nOutro";
     // Native inbox construction dedupes within a carrier. A prior carrier is
     // the real path that makes fullCarrier remove a repeat while retaining code.
-    branch = [entry(inbox([event("repeated", "already delivered", {})]))];
+    const prior = { ...entry(inbox([event("repeated", "already delivered", {})])), id: "prior", parentId: null };
+    branch = [prior]; byId.set("prior", prior);
+    handlers.get("session_start")!({}, context);
     const value = inbox([event("repeated", "REPEATED_COPY", {}), event("work", code, {})]);
     // Idle: collapsed previews and native fallbacks never touch the highlighter.
     expect(render(value, false)!.render(120)).toHaveLength(1);

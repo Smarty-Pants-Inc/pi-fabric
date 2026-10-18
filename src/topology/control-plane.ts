@@ -470,6 +470,17 @@ const snapshotControlInput = (input: FabricControlInput): FabricControlInput => 
   binding: input.binding,
   bindingProvenance: input.bindingProvenance,
 })) as FabricControlInput;
+const controlRequestFingerprint = (operation: FabricControlOperation, input: FabricControlInput): string =>
+  controlBodyFingerprint({
+    operation,
+    ...(input.message !== undefined ? { message: input.message } : {}),
+    ...(input.data !== undefined ? { data: input.data } : {}),
+    ...(input.priority !== undefined ? { priority: input.priority } : {}),
+    ...(input.triggerTurn !== undefined ? { triggerTurn: input.triggerTurn } : {}),
+    ...(input.wakeCause !== undefined ? { wakeCause: input.wakeCause } : {}),
+    ...(input.binding !== undefined ? { binding: input.binding } : {}),
+    ...(input.bindingProvenance !== undefined ? { bindingProvenance: input.bindingProvenance } : {}),
+  }, input.principal);
 
 /** Trust owner-default provenance only from a validated member of that actor's root. */
 export const controlActorBindingOptions = (
@@ -1094,11 +1105,12 @@ export class FabricControlPlane {
       ...(input.bindingProvenance !== undefined ? { bindingProvenance: input.bindingProvenance } : {}),
     });
     const bodyFingerprint = controlBodyFingerprint(commandBody, input.principal);
+    const originFingerprint = controlRequestFingerprint(operation, input);
     const commandId = createHash("sha256")
       .update(JSON.stringify([this.options.hostId, ownerHostId, ownerIdentityId, targetId, operation, idempotencyKey, notRunAttempt]))
       .digest("hex");
     // Bind this caller key to its semantic request before any publication can occur.
-    this.#bindOriginIdempotencyKey(commandId, idempotencyKey, bodyFingerprint);
+    this.#bindOriginIdempotencyKey(commandId, idempotencyKey, originFingerprint);
     const existingPending = this.#pending.get(commandId);
     if (existingPending) {
       if (existingPending.ownerIncarnation === ownerIncarnation &&
@@ -2139,10 +2151,11 @@ export class FabricControlPlane {
       ...(input.bindingProvenance !== undefined ? { bindingProvenance: input.bindingProvenance } : {}),
     };
     const bodyFingerprint = controlBodyFingerprint(commandBody, input.principal);
+    const originFingerprint = controlRequestFingerprint(operation, input);
     const commandId = createHash("sha256")
       .update(JSON.stringify([this.options.hostId, ownerHostId, ownerIdentityId, targetId, operation, idempotencyKey, notRunAttempt])).digest("hex");
     // Bind this caller key to its semantic request before any publication can occur.
-    this.#bindOriginIdempotencyKey(commandId, idempotencyKey, bodyFingerprint);
+    this.#bindOriginIdempotencyKey(commandId, idempotencyKey, originFingerprint);
     const existing = this.#pending.get(commandId);
     if (existing) {
       if (existing.bodyFingerprint !== bodyFingerprint) throw Object.assign(new Error("Fabric control id reused with different input"), { code: "FABRIC_CONTROL_ID_CONFLICT", notRun: true });

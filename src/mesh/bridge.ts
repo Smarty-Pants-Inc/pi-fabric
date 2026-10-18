@@ -3507,14 +3507,17 @@ export class MeshBridge {
         dropped += 1;
         this.#log(`${direction}: skipped ${skip.topic} ${skip.id} (sequence ${skip.sequence}): ${skip.bytes} bytes pass the ${BRIDGE_PAGE_BYTES}-byte frame budget`);
       }
+      let fallbackBatchThrough = cursor.after;
       for (let index = 0; index < page.events.length; index++) {
         const event = page.events[index]!;
         if (event.sequence <= cursor.after) continue;
         if (this.#stopped) return { forwarded, dropped };
-        // Batch only a contiguous, already-admitted prefix. Fingerprinted control commands use
-        // the single-event path so a key conflict cannot follow an unreceipted committed prefix.
-        if (target.publishBatch && candidateLimit > 1 && page.events.length - index > 1 && !seen.has(event.id) &&
-          !isRelayReceipt(event) && event.topic !== "fabric.control.command" && !this.#isRelayCommand(event, rules, direction)) {
+        // Keep receipt-backed controls in their own batches: a command conflict can leave a
+        // committed prefix only when every prefix event has its own destination receipt.
+        const batchUsesReceipt = event.topic === "fabric.control.command" || event.topic === "fabric.control.ack";
+        if (target.publishBatch && candidateLimit > 1 && event.sequence > fallbackBatchThrough &&
+          page.events.length - index > 1 && !seen.has(event.id) &&
+          !isRelayReceipt(event) && !this.#isRelayCommand(event, rules, direction)) {
           if (!this.#deferPreemptivePresence() && this.#presenceDue()) {
             await this.syncPresence();
             passRefreshed = true;
@@ -3530,8 +3533,9 @@ export class MeshBridge {
           let spendingBytes = 0;
           let bytes = 0;
           for (const candidate of page.events.slice(index, index + candidateLimit)) {
+            const candidateUsesReceipt = candidate.topic === "fabric.control.command" || candidate.topic === "fabric.control.ack";
             if (candidate.sequence <= cursor.after || seen.has(candidate.id) || isRelayReceipt(candidate) ||
-              candidate.topic === "fabric.control.command" || this.#isRelayCommand(candidate, rules, direction) ||
+              candidateUsesReceipt !== batchUsesReceipt || this.#isRelayCommand(candidate, rules, direction) ||
               this.#refusal(candidate, rules, direction)) break;
             if (direction === "toRemote" && this.options.local.holds && !this.options.local.holds(candidate.to!)) break;
             const data = isObject(candidate.data) ? candidate.data : {};
@@ -3556,9 +3560,10 @@ export class MeshBridge {
             let committed: Array<{ sequence: number }> | undefined;
             try { committed = await target.publishBatch(candidates); }
             catch (error) {
-              // Fingerprinted control commands are excluded from batches; retain existing handling
-              // for other commit-time refusals without widening the recoverable error set.
-              if (!isIdempotencyKeyReused(error) && !(error instanceof BridgeOwnershipError) && !isPermanent(error)) throw error;
+              // A key conflict falls through to per-event handling for this whole batch. Its
+              // receipt-backed control prefix is safe to replay; do not retry overlapping suffix batches.
+              if (isIdempotencyKeyReused(error)) fallbackBatchThrough = page.events[index + candidates.length - 1]!.sequence;
+              else if (!(error instanceof BridgeOwnershipError) && !isPermanent(error)) throw error;
             }
             if (committed) {
               if (!Array.isArray(committed) || !committed.length || committed.length > candidates.length ||

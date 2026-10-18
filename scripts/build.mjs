@@ -92,6 +92,8 @@ const lazyEntryPoints = [
   // First-use host custody and participant snapshots keep stable lazy paths.
   "src/topology/host-leases.ts",
   "src/topology/participant-view.ts",
+  // NATS-only local projection is loaded when a NATS directory starts, not for FILE sessions.
+  "src/topology/nats-local-projection.ts",
   "src/storage/private-dir.ts",
   "src/topology/nats-drain-receipt.ts",
   "src/mesh/custody-lock.ts",

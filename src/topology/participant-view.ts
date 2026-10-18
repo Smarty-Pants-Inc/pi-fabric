@@ -83,7 +83,7 @@ function machineFromKey(key: string, kind: "p" | "h"): string | undefined {
     ? parts[0] : undefined;
 }
 
-function presenceValue(entry: TransportKvEntry<unknown>): FabricParticipantRecord | undefined {
+export function presenceValue(entry: TransportKvEntry<unknown>): FabricParticipantRecord | undefined {
   const value = entry.value;
   if (!machineFromKey(entry.key, "p") || !Number.isSafeInteger(entry.revision) || entry.revision <= 0 ||
     !objectValue(value) || value.format !== 1 || !textValue(value.id) ||
@@ -106,7 +106,7 @@ function presenceValue(entry: TransportKvEntry<unknown>): FabricParticipantRecor
   return value as unknown as FabricParticipantRecord;
 }
 
-function leaseValue(entry: TransportKvEntry<unknown>): FabricKvHostLease | undefined {
+export function leaseValue(entry: TransportKvEntry<unknown>): FabricKvHostLease | undefined {
   const value = entry.value;
   if (!machineFromKey(entry.key, "h") || !Number.isSafeInteger(entry.revision) || entry.revision <= 0 ||
     !objectValue(value) || !textValue(value.id) || entry.key.split(".")[2] !== tokenFor(value.id) ||

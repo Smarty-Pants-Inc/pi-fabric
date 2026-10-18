@@ -11,10 +11,11 @@ const now = 10 * HOUR;
 const log = Array.from({ length: 401 }, (_, sequence) => JSON.stringify({ sequence }) + "\n").join("");
 const make = (record: Record<string, unknown> = {}) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-tail-")); roots.push(root);
-  const run = path.join(root, "runs", "old"); fs.mkdirSync(run, { recursive: true });
-  fs.writeFileSync(path.join(run, "status.json"), JSON.stringify({ status: "completed", finishedAt: 4 * HOUR, transport: "process", sessionId: "2147483647", ...record }));
-  fs.writeFileSync(path.join(run, "events.jsonl"), log);
-  fs.writeFileSync(path.join(run, "reply.json"), '{"text":"retained result"}');
+  fs.chmodSync(root, 0o700);
+  const run = path.join(root, "runs", "old"); fs.mkdirSync(run, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(run, "status.json"), JSON.stringify({ status: "completed", finishedAt: 4 * HOUR, transport: "process", sessionId: "2147483647", ...record }), { mode: 0o600 });
+  fs.writeFileSync(path.join(run, "events.jsonl"), log, { mode: 0o600 });
+  fs.writeFileSync(path.join(run, "reply.json"), '{"text":"retained result"}', { mode: 0o600 });
   return { root, run };
 };
 const snapshot = (run: string) => fs.readdirSync(run).sort().map(name => {
@@ -82,6 +83,36 @@ describe("six-hour terminal run compaction", () => {
     const after = snapshot(run);
     expect(compactTerminalRunEvents(run, { now })).toBe(false);
     expect(snapshot(run)).toEqual(after);
+  });
+
+  it("counts the marker within the byte cap and retains an exactly aligned final event", () => {
+    const { run } = make();
+    const file = path.join(run, "events.jsonl");
+    const marker = '{"fabricTruncated":true,"reason":"terminal run event retention"}\n';
+    const event = JSON.stringify({ text: "α😀".repeat(100) }) + "\n";
+    fs.writeFileSync(file, event.repeat(201));
+    const maxBytes = Buffer.byteLength(marker + event);
+    expect(compactTerminalRunEvents(run, { now, terminalRunEventsMaxBytes: maxBytes })).toBe(true);
+    expect(fs.readFileSync(file, "utf8")).toBe(marker + event);
+    expect(fs.statSync(file).size).toBe(maxBytes);
+    expect(compactTerminalRunEvents(run, { now, terminalRunEventsMaxBytes: maxBytes })).toBe(false);
+  });
+
+  it("keeps only the marker when the final event cannot fit, without a JSON fragment", () => {
+    const { run } = make();
+    const file = path.join(run, "events.jsonl");
+    const marker = '{"fabricTruncated":true,"reason":"terminal run event retention"}\n';
+    fs.writeFileSync(file, JSON.stringify({ text: "x".repeat(1024) }) + "\n");
+    expect(compactTerminalRunEvents(run, { now, terminalRunEventsMaxBytes: 256 })).toBe(true);
+    expect(fs.readFileSync(file, "utf8")).toBe(marker);
+  });
+
+  it("uses the final-answer receipt age instead of a later status rewrite", () => {
+    const { run } = make({ finishedAt: now, updatedAt: now, finalAnswerReceipt: { id: "receipt", recordedAt: 4 * HOUR } });
+    // This fixture exercises age selection only; an unpaired receipt is not archive/deletion authority.
+    const before = snapshot(run);
+    expect(compactTerminalRunEvents(run, { now })).toBe(true);
+    expect(fs.readFileSync(path.join(run, "status.json"), "utf8")).toBe(before.find(row => row[0] === "status.json")![1]);
   });
 
   it("also compacts a closed managed one-shot root before its unchanged deletion age", () => {

@@ -1,5 +1,7 @@
 import fs from "node:fs";
 import { retentionV2Enabled } from "./retention-platform.js";
+import { decodeRunLogFrame } from "../run-log-source.js";
+import { RUN_LOG_BYTE_CAP } from "./run-log-compression.js";
 import path from "node:path";
 import { writeFileAtomic, writeJsonAtomic } from "../core/atomic-write.js";
 import { ownedStat, processAlive } from "./scratch.js";
@@ -857,11 +859,63 @@ export interface TerminalRunEventsRetention {
 const TERMINAL_EVENT_TAIL_LINES = 200;
 const EVENT_TAIL_MARKER = Buffer.from('{"fabricTruncated":true,"reason":"terminal run event retention"}\n');
 
-/** Compact only an owned, safely terminal run. Read a bounded suffix, keep complete JSONL
- * lines (at most the last 200), and atomically replace only events.jsonl; status/reply/result remain byte-for-byte.
- * The marker counts against the byte cap. A single oversized final event may leave only
- * the marker rather than a corrupt JSON fragment. Already bounded logs are never rewritten.
- * Callers retain their ownership/latest-run vetoes before entering this shared predicate. */
+const sameEventFile = (before: fs.Stats, after: fs.Stats | undefined, moved = false): boolean => !!after && after.isFile() &&
+  before.dev === after.dev && before.ino === after.ino && before.size === after.size && before.uid === after.uid &&
+  before.mode === after.mode && before.nlink === after.nlink && before.mtimeMs === after.mtimeMs && (moved || before.ctimeMs === after.ctimeMs);
+
+/** One tail algorithm for plain and decoded events. Undefined means a byte-for-byte no-op. */
+const terminalEventTail = (tail: Buffer, size: number, maxBytes: number): Buffer | undefined => {
+  let retained = tail;
+  if (tail.length < size) {
+    const newline = tail.indexOf(0x0a);
+    retained = newline < 0 ? Buffer.alloc(0) : tail.subarray(newline + 1);
+  } else if (tail.subarray(0, EVENT_TAIL_MARKER.length).equals(EVENT_TAIL_MARKER)) {
+    retained = tail.subarray(EVENT_TAIL_MARKER.length);
+  }
+  let lines = 0;
+  for (let index = retained.length - 1; index >= 0; index--) {
+    if (retained[index] === 0x0a && index !== retained.length - 1 && ++lines === TERMINAL_EVENT_TAIL_LINES) {
+      retained = retained.subarray(index + 1);
+      break;
+    }
+  }
+  // Check BOTH limits before reserving marker space: near-limit unmarked logs stay unchanged.
+  if (size <= maxBytes && (retained.length === size ||
+      (tail.length === size && size === EVENT_TAIL_MARKER.length + retained.length &&
+       tail.subarray(0, EVENT_TAIL_MARKER.length).equals(EVENT_TAIL_MARKER)))) return;
+  const eventBytes = maxBytes - EVENT_TAIL_MARKER.length;
+  if (retained.length > eventBytes) {
+    const newline = retained.indexOf(0x0a, retained.length - eventBytes - 1);
+    retained = newline < 0 ? Buffer.alloc(0) : retained.subarray(newline + 1);
+  }
+  return Buffer.concat([EVENT_TAIL_MARKER, retained]);
+};
+
+const readTerminalEventTail = (file: string, stat: fs.Stats, maxBytes: number, expired: Deadline, compressed = false): { tail: Buffer; size: number } => {
+  if (compressed && stat.size > RUN_LOG_BYTE_CAP) throw new Error("Encoded run log exceeds codec cap");
+  const fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0));
+  try {
+    if (!sameEventFile(stat, fs.fstatSync(fd))) throw new Error("Run log changed while opening");
+    const length = compressed ? stat.size : Math.min(stat.size, maxBytes);
+    const bytes = Buffer.alloc(length);
+    let read = 0;
+    while (read < length) {
+      if (expired()) throw new Error("Run log retention deadline");
+      const count = fs.readSync(fd, bytes, read, length - read, stat.size - length + read);
+      if (count === 0) throw new Error("Run log short read");
+      read += count;
+    }
+    // Shared checksummed single-frame parser and 128-MiB decoded-output bound; no second codec/parser.
+    const decoded = compressed ? decodeRunLogFrame(bytes, file) : bytes;
+    if (expired() || !sameEventFile(stat, fs.fstatSync(fd)) || !sameEventFile(stat, ownedStat(file))) throw new Error("Run log changed while reading");
+    return { tail: compressed ? decoded.subarray(Math.max(0, decoded.length - maxBytes)) : decoded, size: compressed ? decoded.length : stat.size };
+  } finally { fs.closeSync(fd); }
+};
+
+/** Compact only an owned, safely terminal run. Keep complete JSONL lines (at most the last 200)
+ * under the byte cap, including the marker. Decode compressed sources under the existing codec cap.
+ * Publish a plain tail BEFORE retiring a compressed generation; a held old descriptor stays complete.
+ * Status/reply/result and the directory's TTL timestamp remain unchanged. */
 export const compactTerminalRunEvents = (
   directory: string,
   options: TerminalRunEventsRetention & { now?: number; expired?: Deadline; isRetained?: () => boolean; dryRun?: boolean;
@@ -877,81 +931,100 @@ export const compactTerminalRunEvents = (
   const record = readJson<RunRecordSummary>(path.join(directory, "status.json"));
   if (!record?.status || !TERMINAL_STATUSES.has(record.status) ||
       now - recordAgeReference(record, ownedStat(directory)?.mtimeMs ?? now) < ageMs) return false;
-  const file = path.join(directory, "events.jsonl");
-  const stat = ownedStat(file);
-  if (!stat?.isFile() || stat.size === 0 || (!retentionV2Enabled() &&
-      (runTreeExitVeto(directory, 0, expired, true) || !canRemoveTerminalRun(directory, expired)))) return false;
+  const file = path.join(directory, "events.jsonl"), compressedFile = `${file}.zst`;
+  const plainStat = ownedStat(file);
+  // ENOENT-only fallback, just like the shared reader: an unsafe/denied plain name is never bypassed.
+  if (!plainStat) {
+    try { fs.lstatSync(file); return false; }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") return false; }
+  }
+  const compressed = plainStat === undefined;
+  const sourceFile = compressed ? compressedFile : file;
+  const stat = plainStat ?? ownedStat(compressedFile);
+  if (!stat?.isFile() || stat.size === 0 || (compressed && process.platform !== "win32" && (stat.mode & 0o022) !== 0) ||
+      (!retentionV2Enabled() && (runTreeExitVeto(directory, 0, expired, true) || !canRemoveTerminalRun(directory, expired)))) return false;
   try {
-    const fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
-    let tail: Buffer;
-    try {
-      const opened = fs.fstatSync(fd);
-      if (opened.dev !== stat.dev || opened.ino !== stat.ino || opened.size !== stat.size ||
-          opened.mtimeMs !== stat.mtimeMs) return false;
-      // Establish whether the original satisfies both limits before reserving
-      // marker bytes. Reading at most the cap preserves near-limit unmarked logs
-      // and still includes the look-behind needed for the smaller marked tail.
-      const length = Math.min(stat.size, maxBytes);
-      tail = Buffer.alloc(length);
-      let read = 0;
-      while (read < length) {
-        if (expired()) return false;
-        const count = fs.readSync(fd, tail, read, length - read, stat.size - length + read);
-        if (count === 0) return false;
-        read += count;
-      }
-    } finally { fs.closeSync(fd); }
-    // Skip a partial first line only when we did not read from the start.
-    let retained = tail;
-    if (tail.length < stat.size) {
-      const newline = tail.indexOf(0x0a);
-      retained = newline < 0 ? Buffer.alloc(0) : tail.subarray(newline + 1);
-    } else if (tail.subarray(0, EVENT_TAIL_MARKER.length).equals(EVENT_TAIL_MARKER)) {
-      retained = tail.subarray(EVENT_TAIL_MARKER.length);
+    const { tail, size } = readTerminalEventTail(sourceFile, stat, maxBytes, expired, compressed);
+    let next = terminalEventTail(tail, size, maxBytes);
+    const compressedStat = compressed ? stat : ownedStat(compressedFile);
+    let compressedNext = compressed ? next : undefined;
+    if (!compressed && compressedStat?.isFile()) {
+      try {
+        const decoded = readTerminalEventTail(compressedFile, compressedStat, maxBytes, expired, true);
+        compressedNext = terminalEventTail(decoded.tail, decoded.size, maxBytes);
+      } catch { /* A bad/conflicting compressed artifact never grants cleanup authority. */ }
     }
-    let lines = 0;
-    for (let index = retained.length - 1; index >= 0; index--) {
-      if (retained[index] === 0x0a && index !== retained.length - 1 && ++lines === TERMINAL_EVENT_TAIL_LINES) {
-        retained = retained.subarray(index + 1);
-        break;
-      }
-    }
-    // A full unmarked log of <=200 events, or our already bounded tail, is a no-op.
-    if (stat.size <= maxBytes && (retained.length === stat.size ||
-        (tail.length === stat.size && stat.size === EVENT_TAIL_MARKER.length + retained.length &&
-         tail.subarray(0, EVENT_TAIL_MARKER.length).equals(EVENT_TAIL_MARKER)))) return false;
-    // Reading an unchanged bounded suffix grants no mutation authority. Avoid
-    // four redundant status reads for that no-op (native directory order can
-    // put the historical prefix inside the resident run phase).
-    // A real replacement still requires both independent fresh safety walks.
+    // A restore or interrupted cleanup can leave both names. Only the exact computed tail authorizes
+    // retiring the old compressed log; unrelated plain bytes are never replaced on its authority.
+    const cleanupOnly = !next && !!compressedNext && size === tail.length && tail.equals(compressedNext);
+    if (cleanupOnly) next = compressedNext;
+    if (!next) return false;
+    const privateDirectory = (): boolean => {
+      const current = ownedStat(directory);
+      return !!current?.isDirectory() && current.dev === directoryStat.dev && current.ino === directoryStat.ino &&
+        (process.platform === "win32" || (current.mode & 0o077) === 0);
+    };
+    if (compressed && !privateDirectory()) return false;
     if (retentionV2Enabled() && (runTreeExitVeto(directory, 0, expired, true) || !canRemoveTerminalRun(directory, expired))) return false;
-    // Truncation is now known to be necessary. Reserve the marker's space and
-    // drop only complete prefix lines; look behind by one byte so an exactly
-    // aligned final event is kept. An oversized final event leaves only a marker.
-    const eventBytes = maxBytes - EVENT_TAIL_MARKER.length;
-    if (retained.length > eventBytes) {
-      const newline = retained.indexOf(0x0a, retained.length - eventBytes - 1);
-      retained = newline < 0 ? Buffer.alloc(0) : retained.subarray(newline + 1);
-    }
-    const checked = ownedStat(file);
-    if (!checked || checked.dev !== stat.dev || checked.ino !== stat.ino ||
-        checked.size !== stat.size || checked.mtimeMs !== stat.mtimeMs ||
-        runTreeExitVeto(directory, 0, expired, true) || !canRemoveTerminalRun(directory, expired) ||
-        expired() || options.isRetained?.()) return false;
-    const next = Buffer.concat([EVENT_TAIL_MARKER, retained]);
-    let replaced = false;
+    const safe = (): boolean => !runTreeExitVeto(directory, 0, expired, true) && canRemoveTerminalRun(directory, expired) &&
+      !expired() && !options.isRetained?.();
+    if (!sameEventFile(stat, ownedStat(sourceFile)) || !safe()) return false;
+    let replaced = false, retired = false;
     try {
-      // The judged events.jsonl goes through the one verified removal (smarty-dev#7916): verified, moved into the
-      // graveyard and verified again; the new tail then takes the free name (link fails on EEXIST), and only then
-      // is the judged inode removed. A failed publish moves it back.
-      replaced = verifiedRemove(file, stat, { deleter: "compactTerminalRunEvents", freed: stat.size - next.length,
-        ...(options.dryRun ? { dryRun: true } : {}),
-        proceed: () => publishExclusive(file, next),
-        fallback: () => { writeFileAtomic(file, next); return true; } }).removed;
-    } finally {
+      if (compressed) {
+        // Do NOT publish in verifiedRemove.proceed: that would first hide the ONLY discoverable generation.
+        replaced = options.dryRun ? verifiedRemove(compressedFile, stat, {
+          deleter: "compactTerminalRunEvents", dryRun: true, freed: stat.size - next.length,
+          fallback: () => false,
+        }).removed : publishExclusive(file, next);
+      } else if (!cleanupOnly) {
+        // Main's plain path: verify/move the judged inode, exclusively publish the tail, then remove the old inode.
+        replaced = verifiedRemove(file, stat, { deleter: "compactTerminalRunEvents", freed: stat.size - next.length,
+          ...(options.dryRun ? { dryRun: true } : {}),
+          proceed: () => publishExclusive(file, next!),
+          fallback: () => { writeFileAtomic(file, next!); return true; } }).removed;
+      }
+      if (!replaced && !cleanupOnly) return false;
+      if (compressedStat && compressedNext?.equals(next) && privateDirectory()) {
+        const published = options.dryRun && replaced ? undefined : ownedStat(file);
+        const matchesPublished = (): boolean => !!published && sameEventFile(published, ownedStat(file));
+        // Compare the actual reopened bytes, not just the existence of a name or marker. EEXIST above never gets here.
+        if ((options.dryRun && replaced) || (published?.isFile() && published.size === next.length && matchesPublished() &&
+            readTerminalEventTail(file, published, maxBytes, expired).tail.equals(next))) {
+          if (!options.dryRun && process.platform !== "win32") {
+            const fd = fs.openSync(directory, fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY ?? 0) | (fs.constants.O_NOFOLLOW ?? 0));
+            try {
+              const held = fs.fstatSync(fd);
+              if (held.dev !== directoryStat.dev || held.ino !== directoryStat.ino) return replaced;
+              fs.fsyncSync(fd); // The plain name is durable before the compressed name can move/unlink.
+            } finally { fs.closeSync(fd); }
+          }
+          if (sameEventFile(compressedStat, ownedStat(compressedFile)) && safe() &&
+              (options.dryRun || matchesPublished())) {
+            // Pin the judged physical source through unlink. Its rename changes ctime, not content/version;
+            // the held descriptor still checks size, mode, owner and single-link custody in proceed.
+            if (options.dryRun && replaced && compressed) retired = true;
+            else {
+              const fd = fs.openSync(compressedFile, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0));
+              try {
+                if (sameEventFile(compressedStat, fs.fstatSync(fd))) retired = verifiedRemove(compressedFile, compressedStat, {
+                  deleter: "compactTerminalRunEvents", ...(options.dryRun ? { dryRun: true } : {}),
+                  proceed: () => matchesPublished() && sameEventFile(compressedStat, fs.fstatSync(fd), true) &&
+                    !expired() && !options.isRetained?.(),
+                  fallback: () => {
+                    if (!matchesPublished() || !sameEventFile(compressedStat, fs.fstatSync(fd)) ||
+                        !sameEventFile(compressedStat, ownedStat(compressedFile)) || !safe()) return false;
+                    fs.unlinkSync(compressedFile); return true;
+                  },
+                }).removed;
+              } finally { fs.closeSync(fd); }
+            }
+          }
+        }
+      }
+    } catch { /* A completed plain publication stays valid; failed compressed cleanup retries next sweep. */ }
+    finally {
       if (!options.dryRun) {
-        // Residency expiry (and legacy timestamp fallback) uses directory mtime.
-        // Creating/renaming the atomic tail must not restart that retention clock.
         const current = ownedStat(directory);
         if (current?.dev === directoryStat.dev && current.ino === directoryStat.ino) {
           try { fs.utimesSync(directory, directoryStat.atimeMs / 1000, directoryStat.mtimeMs / 1000); }
@@ -959,8 +1032,10 @@ export const compactTerminalRunEvents = (
         }
       }
     }
-    if (!replaced) return false;
-    options.onCompact?.({ path: file, beforeBytes: stat.size, afterBytes: EVENT_TAIL_MARKER.length + retained.length });
+    if (!replaced && !retired) return false;
+    // Physical accounting includes both representations when cleanup accompanies a plain compaction.
+    options.onCompact?.({ path: file, beforeBytes: stat.size + (!compressed && retired ? compressedStat!.size : 0),
+      afterBytes: next.length + (compressed && !retired ? stat.size : 0) });
     return true;
   } catch { return false; }
 };
@@ -971,7 +1046,15 @@ const publishExclusive = (file: string, data: Buffer): boolean => {
   const temp = `${file}.${process.pid}.${Date.now()}.tmp`;
   try {
     const fd = fs.openSync(temp, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW ?? 0), 0o600);
-    try { fs.writeSync(fd, data); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+    try {
+      let offset = 0;
+      while (offset < data.length) {
+        const count = fs.writeSync(fd, data, offset, data.length - offset, offset);
+        if (count <= 0) throw new Error("Short terminal tail write");
+        offset += count;
+      }
+      fs.fsyncSync(fd);
+    } finally { fs.closeSync(fd); }
     fs.linkSync(temp, file);
     return true;
   } catch { return false; }

@@ -243,7 +243,7 @@ export class ActorLogStore {
       files.push(status);
       if (fs.fstatSync(status.fd).size > 1024 * 1024) throw new Error(`Unsafe actor run ${runId} archived status`);
       const record = JSON.parse(fs.readFileSync(status.fd, "utf8"));
-      if (!record || record.id !== runId || !["completed", "failed", "stopped"].includes(record.status) ||
+      if (!record || record.id !== runId || !["completed", "failed", "stopped", "timed_out"].includes(record.status) ||
           (record.actorId !== undefined && record.actorId !== actor.id)) {
         throw new Error(`Actor run ${runId} archived status does not prove ownership/terminal state`);
       }

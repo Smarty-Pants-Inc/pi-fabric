@@ -24,6 +24,7 @@ import {
   type FabricSchemaMode,
 } from "./config.js";
 import { FabricSessionApprovals } from "./core/approval-controller.js";
+import type { SessionEntryCursorManager } from "./core/preview.js";
 import { readChildToolAllowlist } from "./core/child-tool-allowlist.js";
 import { NO_FOREGROUND, resolveForegroundTools, type FabricForegroundResolution } from "./core/foreground-tools.js";
 import { PrewalkController } from "./prewalk/controller.js";
@@ -394,8 +395,11 @@ export class FabricState {
     return this.#runtime?.requestRootInboxWake() ?? false;
   }
 
-  async nextRecordsInboxMessage(entries: readonly unknown[]): Promise<{ customType: string; content: string; display: boolean; details: { ids: string[] } } | undefined> {
-    return this.#current()?.nextRecordsInboxMessage(entries);
+  resetRecordsInboxCursor(session: SessionEntryCursorManager): void {
+    this.#current()?.resetRecordsInboxCursor?.(session);
+  }
+  async nextRecordsInboxMessage(session: SessionEntryCursorManager): Promise<{ customType: string; content: string; display: boolean; details: { ids: string[] } } | undefined> {
+    return this.#current()?.nextRecordsInboxMessage?.(session);
   }
   observationHealth(): string[] { return this.#current()?.observationHealth() ?? []; }
   writeStalled(): Error | undefined { return this.#current()?.writeStalled(); }

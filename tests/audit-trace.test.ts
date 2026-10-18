@@ -19,6 +19,7 @@ import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { ActionRegistry } from "../src/core/action-registry.js";
 import { FabricExecutionService } from "../src/execution-service.js";
 import type { FabricProvider } from "../src/protocol.js";
+import { executeAfterAdmission } from "./helpers/admission-clock.js";
 
 describe("agent message audit parity", () => {
   it.each(["agents.send", "agents.steer"])("retains only the target for %s", ref => {
@@ -522,27 +523,45 @@ return true;
   });
 
   it("seals unclosed workflow spans on timeout and abort", async () => {
-    const waitingProvider = demoProvider({
+    let timedAdmitted = false;
+    const timed = serviceFor(demoProvider({
       async invoke() {
+        timedAdmitted = true;
         return new Promise(() => undefined);
       },
-    });
-    const timed = serviceFor(waitingProvider);
+    }));
     timed.service.config.executor.timeoutMs = 40;
     timed.service.config.agents.timeoutMs = 40;
     const code = `return workflow.parallel([
       () => tools.call({ ref: "demo.echo", args: { value: "wait-secret" } }),
     ]);`;
-    const timedResult = await execute(timed.service, timed.context, code);
+    const timedResult = await executeAfterAdmission(
+      (signal) => execute(timed.service, timed.context, code, signal),
+      () => timedAdmitted,
+    );
     expect(timedResult.trace.operations.map(({ ref, outcome }) => ({ ref, outcome }))).toEqual([
       { ref: "fabric.workflow.parallel", outcome: "timed_out" },
       { ref: "demo.echo", outcome: "timed_out" },
     ]);
 
-    const aborted = serviceFor(waitingProvider);
+    let abortedAdmitted = false;
     const controller = new AbortController();
-    setTimeout(() => controller.abort(new Error("abort-secret")), 30);
-    const abortedResult = await execute(aborted.service, aborted.context, code, controller.signal);
+    const aborted = serviceFor(demoProvider({
+      async invoke() {
+        abortedAdmitted = true;
+        queueMicrotask(() => controller.abort(new Error("abort-secret")));
+        return new Promise(() => undefined);
+      },
+    }));
+    const abortedResult = await executeAfterAdmission(
+      (safetySignal) => execute(
+        aborted.service,
+        aborted.context,
+        code,
+        AbortSignal.any([controller.signal, safetySignal]),
+      ),
+      () => abortedAdmitted,
+    );
     expect(abortedResult.trace.operations.map(({ ref, outcome }) => ({ ref, outcome }))).toEqual([
       { ref: "fabric.workflow.parallel", outcome: "aborted" },
       { ref: "demo.echo", outcome: "aborted" },
@@ -746,30 +765,43 @@ return true;
   });
 
   it("seals unfinished calls as timed out and cancelled", async () => {
-    const waitingProvider = demoProvider({
+    let timedAdmitted = false;
+    const timed = serviceFor(demoProvider({
       async invoke() {
+        timedAdmitted = true;
         return new Promise(() => undefined);
       },
-    });
-
-    const timed = serviceFor(waitingProvider);
+    }));
     timed.service.config.executor.timeoutMs = 50;
-    const timedResult = await execute(
-      timed.service,
-      timed.context,
-      'return tools.call({ ref: "demo.echo", args: { value: "slow" } });',
+    const timedResult = await executeAfterAdmission(
+      (signal) => execute(
+        timed.service,
+        timed.context,
+        'return tools.call({ ref: "demo.echo", args: { value: "slow" } });',
+        signal,
+      ),
+      () => timedAdmitted,
     );
     expect(timedResult.trace.outcome).toBe("timed_out");
     expect(timedResult.trace.operations[0]).toMatchObject({ outcome: "timed_out" });
 
-    const cancelled = serviceFor(waitingProvider);
+    let cancelledAdmitted = false;
     const controller = new AbortController();
-    setTimeout(() => controller.abort(new Error("stop requested")), 30);
-    const cancelledResult = await execute(
-      cancelled.service,
-      cancelled.context,
-      'return tools.call({ ref: "demo.echo", args: { value: "slow" } });',
-      controller.signal,
+    const cancelled = serviceFor(demoProvider({
+      async invoke() {
+        cancelledAdmitted = true;
+        queueMicrotask(() => controller.abort(new Error("stop requested")));
+        return new Promise(() => undefined);
+      },
+    }));
+    const cancelledResult = await executeAfterAdmission(
+      (safetySignal) => execute(
+        cancelled.service,
+        cancelled.context,
+        'return tools.call({ ref: "demo.echo", args: { value: "slow" } });',
+        AbortSignal.any([controller.signal, safetySignal]),
+      ),
+      () => cancelledAdmitted,
     );
     expect(cancelledResult.trace.outcome).toBe("aborted");
     expect(cancelledResult.trace.operations[0]).toMatchObject({ outcome: "aborted" });

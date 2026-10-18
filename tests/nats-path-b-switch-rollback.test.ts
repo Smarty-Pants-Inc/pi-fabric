@@ -2,13 +2,12 @@
 // Opted-in FILE close cases remain known RED until smarty-dev#14612 is fixed; assertions stay active.
 // expected-skip: no NATS_BIN/PATH executable: private authenticated TLS broker required.
 // expected-skip: no NATS_SWITCH_PROBE_MODULE: full R1 waits for shared admission probe.
+// expected-skip: no NATS_SWITCH_SEED_MODULE for R2: not capture-backed; no fixture is started.
 // Keep reason: rollback data safety across real registry/control/receiver and OS boundaries.
 // Source integration, NOT installed-TUI or live-fleet proof. No shared broker/root is used.
 import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
-import { spawnSync } from "node:child_process";
-import { pathToFileURL } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import { normalizeFabricConfig } from "../src/config.js";
 import { importMeshState } from "../src/mesh/backend-migration.js";
@@ -17,9 +16,17 @@ import { runTransportAdmin } from "../src/transport/nats/admin.js";
 import { transportDurableName, transportInboxFilter, transportInboxStream } from "../src/transport/nats/subjects.js";
 import { createPathBHarness, openJetStream, PATH_B_MACHINES, resolveNatsBinary, type PathBHarness } from "./helpers/nats-cluster.js";
 import { collectControlProbeEvidence, waitForControlProbeEvidence } from "./helpers/nats-path-b-probe.js";
+import { loadSwitchSeedHooks, requireSwitchSeedResult, verifySwitchCapture, preserveSwitchArchive,
+  type SwitchSeedHooks } from "./helpers/nats-switch-evidence.js";
 import { createSwitchRoot, requireSwitchMirrors, runSwitchRollback, startSwitchBridge, startSwitchRuntime, switchError,
   type SwitchMirrorStatus, type SwitchProcess, type SwitchRuntimeOptions, type SwitchConsumerSnapshot, type SwitchProbeSnapshot,
 } from "./helpers/nats-switch-runtime.js";
+
+declare module "@vitest/runner" {
+  interface TaskMeta {
+    captureAdmission?: string;
+  }
+}
 
 const rehearsalEnabled = process.env.PI_FABRIC_NATS_REHEARSAL === "1";
 const binary = rehearsalEnabled ? resolveNatsBinary() : undefined;
@@ -28,28 +35,9 @@ const probeModule = process.env.NATS_SWITCH_PROBE_MODULE?.trim();
 const hubSession = "00000000-0000-4000-8000-000000000001";
 const workSession = "00000000-0000-4000-8000-000000000002";
 const hubId = `session:${hubSession}`, workId = `session:${workSession}`;
-type SwitchSeedInput = {
-  root: string;
-  hubMesh: string;
-  workMesh: string;
-  ownerOptions: SwitchRuntimeOptions;
-  senderOptions: SwitchRuntimeOptions;
-  carrier: "nats" | "file";
-};
-type SwitchPopulationInput = {
-  seedResult: unknown;
-  ownerRoutes: unknown;
-  senderRoutes: unknown;
-  ownerId: string;
-  senderId: string;
-  carrier: "nats" | "file";
-};
-type SwitchSeedHooks = {
-  seedSwitchFixture(input: SwitchSeedInput): unknown | Promise<unknown>;
-  verifySwitchPopulation?(input: SwitchPopulationInput): unknown | Promise<unknown>;
-};
-
-async function fixture(carrier: "nats" | "file" = "nats") {
+async function fixture(carrier: "nats" | "file" = "nats", captureHooks?: SwitchSeedHooks) {
+  // Validate explicit hooks before allocating roots or starting any private process.
+  const seedHooks = carrier === "nats" ? captureHooks ?? await loadSwitchSeedHooks(process.env.NATS_SWITCH_SEED_MODULE) : undefined;
   if (!binary) throw new Error("switch fixture requires a private NATS executable");
   const root = createSwitchRoot();
   let broker: PathBHarness | undefined;
@@ -64,24 +52,11 @@ async function fixture(carrier: "nats" | "file" = "nats") {
   };
   const preserve = () => {
     if (!artifact) return;
-    // Never copy/rename out of the private test ceiling. The canonical stdout
-    // receipt retains the archive bytes; a separate audit-only decoder owns extraction.
+    // Never copy/rename out of the private test ceiling or send archive/state bytes to stdout.
     const pids = processes.flatMap(process => {
       if (!process.terminal) throw new Error("cannot archive without terminal native process inventory");
       return [process.terminal.pid, ...process.terminal.preStopDescendants].filter((pid): pid is number => pid !== undefined);
     });
-    if (pids.some(pid => fs.existsSync(`/proc/${pid}`))) throw new Error("cannot archive while an actual native PID remains");
-    let fileCount = 0, bytes = 0;
-    const inspect = (directory: string) => {
-      for (const item of fs.readdirSync(directory, { withFileTypes: true })) {
-        const file = path.join(directory, item.name), stat = fs.lstatSync(file);
-        if (stat.isDirectory()) inspect(file);
-        else if (stat.isFile() && stat.nlink === 1) { fileCount++; bytes += stat.size; }
-        else throw new Error("archive refuses symlink/hardlink/special entry");
-        if (fileCount > 20_000 || bytes > 128 * 1024 * 1024) throw new Error("archive source exceeds size bound");
-      }
-    };
-    inspect(root);
     const readJson = (file: string): any => fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, "utf8")) : null;
     const senderEvidence = path.join(root, "work", "control-probe-evidence.jsonl");
     const sends = fs.existsSync(senderEvidence) ? fs.readFileSync(senderEvidence, "utf8").trim().split("\n").filter(Boolean)
@@ -106,21 +81,8 @@ async function fixture(carrier: "nats" | "file" = "nats") {
       sqliteFiles: fs.readdirSync(path.join(root, "hub", "mesh")).filter(name => /^state\.db(?:-wal|-shm)?$/.test(name)).map(name => {
         const data = fs.readFileSync(path.join(root, "hub", "mesh", name)); return { name, bytes: data.length, sha256: createHash("sha256").update(data).digest("hex") };
       }) };
-    console.info(JSON.stringify(forensic));
-    const archive = path.join(fs.realpathSync(process.env.TMPDIR!), `${path.basename(root)}.tar.gz`);
-    const result = spawnSync("tar", ["--format=ustar", "-czf", archive, "-C", path.dirname(root), path.basename(root)], { encoding: "utf8", timeout: 20_000 });
-    if (result.error || result.status !== 0) throw result.error ?? new Error(`archive failed: ${result.stderr}`);
-    fs.chmodSync(archive, 0o600);
-    const data = fs.readFileSync(archive);
-    if (data.length > 64 * 1024 * 1024) throw new Error("compressed archive exceeds bound");
-    const sha256 = createHash("sha256").update(data).digest("hex"), id = path.basename(root);
-    const encoded = data.toString("base64"), chunkSize = 48_000, chunks = Math.ceil(encoded.length / chunkSize);
-    for (let index = 0; index < chunks; index++) console.info(JSON.stringify({ type: "switch-archive-chunk", label: "pre-projection",
-      schema: 1, id, index, total: chunks, sha256, fileCount, bytes: data.length, data: encoded.slice(index * chunkSize, (index + 1) * chunkSize) }));
-    const receipt = { type: "switch-archive-complete", label: "pre-projection", schema: 1, id, sha256, chunks,
-      fileCount, bytes: data.length, sourceBytes: bytes, originalRoot: root, privateArchive: archive, at: Date.now(), stoppedPids: pids };
-    console.info(JSON.stringify(receipt));
-    save("preservation.json", receipt);
+    save("forensic.json", forensic);
+    save("preservation.json", preserveSwitchArchive(root, pids));
   };
   try {
     broker = await createPathBHarness({ binary, tls: {} });
@@ -158,14 +120,11 @@ async function fixture(carrier: "nats" | "file" = "nats") {
       };
     };
     const ownerOptions = runtimeOptions("hub"), senderOptions = runtimeOptions("work");
-    let populationEvidence: unknown;
-    let seedHooks: SwitchSeedHooks | undefined;
+    let populationEvidence: Awaited<ReturnType<typeof verifySwitchCapture>> | undefined;
     let seedResult: unknown;
-    const seedModule = carrier === "nats" ? process.env.NATS_SWITCH_SEED_MODULE?.trim() : undefined;
-    if (seedModule) {
-      seedHooks = await import(pathToFileURL(path.resolve(seedModule)).href) as SwitchSeedHooks;
-      if (typeof seedHooks.seedSwitchFixture !== "function") throw new Error("NATS_SWITCH_SEED_MODULE must export seedSwitchFixture");
+    if (seedHooks) {
       seedResult = await seedHooks.seedSwitchFixture({ root, hubMesh, workMesh, ownerOptions, senderOptions, carrier });
+      requireSwitchSeedResult(seedResult);
     }
     // Use the real public import/cutover path, not the test-only fresh-sqlite
     // initialization symbol. Child processes must open an actually imported hub.
@@ -182,7 +141,7 @@ async function fixture(carrier: "nats" | "file" = "nats") {
     owner = startSwitchRuntime(ownerOptions); sender = startSwitchRuntime(senderOptions); processes.push(owner, sender);
     const [a, b] = await Promise.all([owner.request<{ pid: number; stateBackend: string }>("ready"), sender.request<{ pid: number; stateBackend: string }>("ready")]);
     expect(a.pid).not.toBe(b.pid); expect(a.stateBackend).toBe("sqlite"); expect(b.stateBackend).toBe("file");
-    if (seedHooks?.verifySwitchPopulation) {
+    if (seedHooks) {
       // Each process is ready after its own native publication. The peer's KV
       // watch may still be catching up; observe both real routes before handing
       // one immutable pair of snapshots to the private population verifier.
@@ -195,11 +154,8 @@ async function fixture(carrier: "nats" | "file" = "nats") {
         expect(senderRoutes.find(row => row.id === hubId)).toMatchObject({ stale: false });
       }, { timeout: 5_000, interval: 25 });
       const [ownerRoutes, senderRoutes] = await Promise.all([owner.request("routes"), sender.request("routes")]);
-      const evidence = await seedHooks.verifySwitchPopulation({ seedResult, ownerRoutes, senderRoutes,
+      populationEvidence = await verifySwitchCapture(seedHooks, { seedResult, ownerRoutes, senderRoutes,
         ownerId: hubId, senderId: workId, carrier });
-      const serialized = JSON.stringify(evidence);
-      if (serialized === undefined) throw new Error("verifySwitchPopulation must return serializable safe evidence");
-      populationEvidence = JSON.parse(serialized);
     }
     // Route publication is driven by actual broker KV watches. These bounded
     // inspector RPCs are only the safety-net observation of that native state.
@@ -248,14 +204,15 @@ async function fixture(carrier: "nats" | "file" = "nats") {
         save("terminal.json", { terminal, stops: stops.map(row => row.status === "fulfilled" ? { status: row.status } :
           { status: row.status, reason: switchError(row.reason) }), otherStops: otherStops.map(row => row.status === "fulfilled" ? { status: row.status } :
           { status: row.status, reason: switchError(row.reason) }), completedAt: Date.now() });
-        console.info(JSON.stringify({ type: "switch-native-terminal", label: "pre-projection", terminal, artifact,
-          stops: stops.map(row => row.status === "fulfilled" ? { status: row.status } : { status: row.status, reason: String(row.reason) }) }));
+        console.info(JSON.stringify({ type: "switch-native-terminal", processCount: terminal.length,
+          normalExitCount: terminal.filter(row => row?.exitCode === 0 && row.signalCode === null).length,
+          stopFailureCount: [...stops, ...otherStops].filter(row => row.status === "rejected").length }));
         const failures: unknown[] = [...stops, ...otherStops].flatMap(row => row.status === "rejected" ? [row.reason] : []);
         if (terminal.some(row => !row || row.exitCode !== 0 || row.signalCode !== null)) failures.push(new Error("fixture owned native process cleanup incomplete"));
         try { preserve(); } catch (error) { failures.push(error); }
         if (failures.length) throw new AggregateError(failures, "fixture cleanup and/or preservation failed");
-        // The private test environment owns temp-root retirement. Evidence was
-        // exported above before it can remove this command's private TMPDIR.
+        // The private test environment owns retirement; local artifacts may vanish with TMPDIR.
+        // No public log transport or alternate export API bypasses that boundary.
       },
     };
   } catch (error) {
@@ -299,7 +256,7 @@ describe.skipIf(!binary || process.platform !== "linux")("native Path B separate
         expect(visibleCount).toBe(1);
         // UI-boundary count is NOT advertised as an admission-journal count or
         // ACK-of-ACK proof. The shared probe supplies those independently.
-        console.info(JSON.stringify({ type: "switch-send-smoke", id: send.id, startedAt, completedAt: Date.now(), result, visibleCount,
+        console.info(JSON.stringify({ type: "switch-send-smoke", id: send.id, startedAt, completedAt: Date.now(), acknowledged: result.acknowledged === true, visibleCount,
           coverage: "real registry/control/receiver; Pi sendMessage boundary fixture; broker PubAck/ACK-of-ACK not instrumented" }));
       }
       const [ownerRoutes, senderRoutes] = await Promise.all([f.owner.request<Array<{ id: string; stale?: boolean }>>("routes"),
@@ -336,7 +293,7 @@ describe.skipIf(!binary || process.platform !== "linux")("native Path B separate
         const messages = await f.owner.request<Array<{ message: unknown }>>("messages");
         const visibleCount = messages.filter(row => JSON.stringify(row.message).includes(marker)).length;
         expect(visibleCount).toBe(1);
-        console.info(JSON.stringify({ type: "switch-file-counterexample-send", ref, startedAt, completedAt: Date.now(), result, visibleCount }));
+        console.info(JSON.stringify({ type: "switch-file-counterexample-send", ref, startedAt, completedAt: Date.now(), acknowledged: true, visibleCount }));
       }
     } finally { await f.close(); }
   }, 60_000);
@@ -369,14 +326,22 @@ describe.skipIf(!binary || process.platform !== "linux")("native Path B separate
           originalHistoryPresent: before.length !== 0, archivesUnchanged: true };
       });
       f.save("r1-report.json", { populationEvidence: f.populationEvidence, history, ...report });
-      console.info(JSON.stringify({ type: "switch-rollback-report", populationEvidence: f.populationEvidence, history, ...report }));
+      console.info(JSON.stringify({ type: "switch-rollback-report", phase: report.phase,
+        captureBacked: f.populationEvidence !== undefined, populationEvidence: f.populationEvidence, history }));
       expect(report.phase).toBe("file-verified");
     } finally { await f.close(); }
   }, 90_000);
 
-  it.skipIf(!probeModule)("R2 full capture-backed native followUp and steer both-role all-stage evidence and byte invariance", async () => {
-    const f = await fixture();
+  it.skipIf(!probeModule)("R2 full capture-backed native followUp and steer both-role all-stage evidence and byte invariance", async context => {
+    const captureHooks = await loadSwitchSeedHooks(process.env.NATS_SWITCH_SEED_MODULE);
+    if (!captureHooks) {
+      const reason = "not capture-backed: NATS_SWITCH_SEED_MODULE with seed and population verifier required";
+      context.task.meta.captureAdmission = reason;
+      context.skip(reason); return;
+    }
+    const f = await fixture("nats", captureHooks);
     try {
+      if (!f.populationEvidence) throw new Error("not capture-backed: verified native population evidence required");
       const before = await Promise.all([f.owner.request<SwitchProbeSnapshot>("probeSnapshot"), f.sender.request<SwitchProbeSnapshot>("probeSnapshot")]);
       await f.owner.request("probeHold");
       const pending = ["followUp", "steer"].map(operation => f.sender.request("probeSend", {
@@ -413,7 +378,10 @@ describe.skipIf(!binary || process.platform !== "linux")("native Path B separate
         limits: ["shared v2 owner ACK publication stage does not inspect acceptance; native accepted API and journal reconciliation separately required",
           "original absent history proves absence invariance only", "actors not exercised"] };
       f.save("r2-report.json", report);
-      console.info(JSON.stringify(report));
+      console.info(JSON.stringify({ type: "switch-r2-report", captureBacked: true, populationEvidence: f.populationEvidence,
+        operations: ["followUp", "steer"], acceptedCount: complete.perSend.filter(row => row.accepted).length,
+        allStagesVerified: complete.perSend.every(row => row.allStagesVerified), eventBytesUnchanged: true,
+        holdBeforeJournal: true, roleLocalProofRejected: true }));
     } finally { await f.close(); }
   }, 90_000);
 });

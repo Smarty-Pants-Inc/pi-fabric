@@ -14,6 +14,7 @@ import type { FabricConfig } from "../../src/config.js";
 import type { FabricRuntimeState } from "../../src/fabric-runtime-state.js";
 import { waitForControlProbeEvidence } from "./nats-path-b-probe.js";
 import type { SwitchRoleSnapshot } from "./nats-switch-probe.js";
+import { logSwitchCheckpointEntry, logSwitchPhase } from "./nats-switch-evidence.js";
 
 export interface SwitchRuntimeOptions {
   root: string;
@@ -134,7 +135,7 @@ export class SwitchProcess {
       if (reply.event) {
         this.events.push(reply);
         if (reply.event === "checkpoint-trace" && (reply.result as { stage?: string })?.stage === "entry")
-          console.info(JSON.stringify({ type: "switch-checkpoint-entry", ...reply.result as object }));
+          logSwitchCheckpointEntry(reply.result);
       }
       if (reply.id === undefined) return;
       const pending = this.#pending.get(reply.id);
@@ -269,7 +270,7 @@ export async function runSwitchRollback(input: SwitchRollbackInput) {
     const event = { type: "switch-phase", label: "pre-projection", phase, at, elapsedMs: at - rollbackStartedAt,
       phaseMs: at - (timeline.at(-1)?.at ?? rollbackStartedAt), ...(evidence === undefined ? {} : { evidence }) };
     timeline.push(event);
-    console.info(JSON.stringify(event));
+    logSwitchPhase(event);
     input.onPhase?.(event);
     return at;
   };

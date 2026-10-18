@@ -66,9 +66,14 @@ Capture native command exit, stdout, stderr and descendant terminal evidence sec
 `NATS_SWITCH_PROBE_MODULE` must resolve to the existing thin adapter shown below; otherwise R1/R2
 can skip. A skip is not PASS. Verify the selected case actually executed.
 
-For real-copy evidence, supply an authorized `NATS_SWITCH_SEED_MODULE` exporting
-`seedSwitchFixture` and preferably `verifySwitchPopulation`; it may seed only the fixture-owned
-copies passed to it. Omission produces a fresh synthetic fixture, NOT capture-backed evidence.
+For real-copy evidence, supply an authorized `NATS_SWITCH_SEED_MODULE` exporting BOTH
+`seedSwitchFixture` AND `verifySwitchPopulation`; it may seed only the fixture-owned copies passed
+to it. The seed must return a nonempty serializable object. The verifier receives that same object
+and BOTH actual native route snapshots. Its positive matching captured counts, zero historical live
+routes, exactly two fresh native routes per role and total counts must agree with those snapshots.
+Invalid exports, seed results or population evidence fail closed; hook claims alone are insufficient.
+Without a seed module, ordinary non-R2 cases may use fresh synthetic fixtures, NOT capture-backed
+evidence. R2 skips BEFORE creating a fixture or starting a broker, with reason `not capture-backed`.
 The public fixture's `residency.enabled:false` input is not a supported product disable guard;
 prove actual resident inventory/state instead of relying on that field.
 
@@ -83,10 +88,12 @@ bunx vitest run tests/nats-path-b-switch-rollback.test.ts -t 'R1 exact STOPALL'
 
 `NATS_BIN` is a caller-supplied absolute executable path; `REHEARSAL_ARTIFACTS` is a new, private,
 caller-owned output directory, not a live native root. If using the seed hook, export its absolute
-module path as `NATS_SWITCH_SEED_MODULE` before R1 and R2. No private path or credentials belong here.
+module path as `NATS_SWITCH_SEED_MODULE` before R1 and R2; it is REQUIRED for capture-backed R2.
+No private path or credentials belong here.
 Inspect R1's actual result and normal shutdown, retain failures and complete its independent
 acceptance barrier before authorizing R2. Do not infer a green exit from a business JSON record.
-R2 is a separate capture-backed native evidence case, not a substitute for R1 rollback:
+R2 is a separate capture-backed native evidence case, not a substitute for R1 rollback.
+Its seed module and population verifier are mandatory; a missing seed is a skip, never a capture PASS:
 
 ```sh
 PI_FABRIC_NATS_REHEARSAL=1 NATS_BIN="$NATS_BIN" NATS_EXPECTED_SERVER_VERSION=2.14.7 NATS_AUTH_REQUIRED=1 \
@@ -211,12 +218,18 @@ outage from quiet through business release and verification through final manife
 Keep actual measurements in the private qualified evidence handoff: these are **PRE-PROJECTION**
 copied-fixture observations, not fleet capacity, cross-host latency or a presence-projection bar.
 
-Retain stopped native roots/journals/seen state only through the approved private artifact path.
-The fixture archives inside its owned private temporary area and emits encoded chunks/hash through
-the canonical stdout receipt. Keep that receipt PRIVATE: archives can contain keys and captures.
-Before audit-only extraction, verify hash, ordered complete chunks, paths, links/devices and size
-bounds; extract ONLY into a new owned private temporary audit copy, NEVER into a live native root.
-Do not copy to a refused destination, relax guards or paste opaque archives into model/public text.
+Stopped native roots/journals/seen state and full reports are PRIVATE. The fixture creates its
+archive only inside the current owned private TMPDIR; stdout emits ONLY its SHA-256 and local private
+archive path, never base64/archive chunks, forensic state, arbitrary hook evidence or full IPC reports.
+Forensic projections, full terminal metadata and complete R1/R2 reports stay in private artifact JSON.
+The archive is real and locally readable at preservation time, but the test environment may retire
+TMPDIR on exit: a printed path is NOT a promise of persistent retention. If audit requires retention
+beyond that lifetime, obtain separate authorized custody before running; do not invent an export.
+Existing retained private baselines remain immutable and do not use a new stdout decoder.
+Before authorized audit-only extraction, verify the archive hash, paths, links/devices and size bounds;
+extract ONLY into a new owned private temporary audit copy, NEVER into a live native root.
+Do not copy/rename/symlink out to a refused destination, use alternate export APIs, clear deletion guards,
+relax guards or paste opaque archives into model/public text. There is no opt-in to print archive bytes.
 Keep artifact and cleanup errors separate; neither may mask the other or turn command RED green.
 
 Source bindings: [switch controller](../tests/helpers/nats-switch-runtime.ts),

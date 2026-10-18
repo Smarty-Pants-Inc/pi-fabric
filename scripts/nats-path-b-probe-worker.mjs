@@ -3,15 +3,17 @@ import path from "node:path";
 import readline from "node:readline";
 import { setTimeout as sleep } from "node:timers/promises";
 import { randomUUID } from "node:crypto";
-import { CapturedToolCatalog } from "../src/capture/catalog.ts";
-import { normalizeFabricConfig } from "../src/config.ts";
-import { FabricRuntimeState } from "../src/fabric-runtime-state.ts";
-import { AgentMessageRouter } from "../src/providers/agents-message-router.ts";
-import { observeFabricPathBProbe } from "../src/transport/probe-hooks.ts";
-
 const configFile = process.argv[2];
 if (!configFile) throw new Error("worker config path is required");
 const options = JSON.parse(fs.readFileSync(configFile, "utf8"));
+// Bun does not reliably honor Node's NODE_OPTIONS --import. As in #1390, the
+// private config explicitly records this birth BEFORE runtime imports/startup.
+if (options.ownershipPreload) await import(options.ownershipPreload);
+const [{ CapturedToolCatalog }, { normalizeFabricConfig }, { FabricRuntimeState },
+  { AgentMessageRouter }, { observeFabricPathBProbe }] = await Promise.all([
+  import("../src/capture/catalog.ts"), import("../src/config.ts"), import("../src/fabric-runtime-state.ts"),
+  import("../src/providers/agents-message-router.ts"), import("../src/transport/probe-hooks.ts"),
+]);
 const role = options.role;
 const projectRoot = options.projectRoot;
 const agentDir = options.agentDir;

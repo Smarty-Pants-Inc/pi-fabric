@@ -4,11 +4,14 @@ import { createInterface } from "node:readline";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { setTimeout as sleep } from "node:timers/promises";
 import { MeshStore } from "../../src/mesh/store.js";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { FabricRuntimeState } from "../../src/fabric-runtime-state.js";
+import { captureDescendants, observeProcessTree, type ObservedProcessTree } from "../../src/residency/launcher-owner.js";
+import { launchLog, same, startTime, stopOwned, type LaunchLog, type Owned } from "./owned-processes.js";
+import { teardownWithin } from "./nats-cluster.js";
 
 export type ControlProbeOperation = "followUp" | "steer";
 
@@ -115,7 +118,8 @@ const workerPath = path.join(repoRoot, "scripts/nats-path-b-probe-worker.mjs");
 const ROOT_INBOX_PREFIX = "topology/inbox/";
 const DEFAULT_DEADLINE_MS = 30_000;
 
-class WorkerClient {
+/** Private probe subprocess boundary, exported only for native cleanup fault regressions. */
+export class WorkerClient {
   readonly child: ChildProcessWithoutNullStreams;
   readonly ready: Promise<WorkerReady>;
   readonly #pending = new Map<string, { resolve(value: unknown): void; reject(error: Error): void; timer: NodeJS.Timeout }>();
@@ -126,13 +130,35 @@ class WorkerClient {
   #stderr = "";
   #stdoutLine = "";
   #peakRssBytes: number | undefined;
+  readonly #tree: ObservedProcessTree;
+  readonly #launches: LaunchLog;
+  readonly #retained = new Map<string, Owned>();
+  #closedResult: { code: number | null; signal: NodeJS.Signals | null } | undefined;
+  #spawnFailed = false;
+  #stop: Promise<void> | undefined;
+  #cleanupProven = false;
+  readonly forced: Array<{ pid: number; started: string }> = [];
 
   constructor(configPath: string, env: NodeJS.ProcessEnv) {
+    const ownershipRoot = `${configPath}.ownership`;
+    fs.mkdirSync(ownershipRoot, { mode: 0o700 });
+    this.#launches = launchLog(ownershipRoot);
+    const config = JSON.parse(fs.readFileSync(configPath, "utf8")) as Record<string, unknown>;
+    fs.writeFileSync(configPath, `${JSON.stringify({ ...config,
+      ownershipPreload: pathToFileURL(path.join(ownershipRoot, "launch-preload.mjs")).href })}\n`, { mode: 0o600 });
     this.child = spawn(process.env.PI_FABRIC_PROBE_RUNTIME ?? "bun", [workerPath, configPath], {
-      cwd: repoRoot, env, stdio: ["pipe", "pipe", "pipe"],
+      cwd: repoRoot, env: { ...env, ...this.#launches.env }, stdio: ["pipe", "pipe", "pipe"],
     });
-    this.ready = new Promise((resolve, reject) => { this.#readyResolve = resolve; this.#readyReject = reject; });
-    this.#closed = new Promise(resolve => this.child.once("close", (code, signal) => resolve({ code, signal })));
+    this.#tree = this.child.pid ? observeProcessTree(this.child.pid) : { processes: new Map() };
+    for (const row of this.#tree.processes.values()) this.#retained.set(`${row.pid}:${row.processStartTime}`,
+      { pid: row.pid, started: row.processStartTime, at: 0, argv: [] });
+    // The #1390 pattern observes rejection immediately, including failed spawn/startup.
+    const ready = new Promise<WorkerReady>((resolve, reject) => { this.#readyResolve = resolve; this.#readyReject = reject; });
+    this.ready = teardownWithin("probe worker ready", () => ready, 45_000);
+    void this.ready.catch(() => undefined);
+    this.#closed = new Promise(resolve => this.child.once("close", (code, signal) => {
+      this.#closedResult = { code, signal }; resolve(this.#closedResult);
+    }));
     this.child.stdout.setEncoding("utf8");
     this.child.stdout.on("data", (chunk: string) => {
       this.#stdoutLine += chunk;
@@ -148,7 +174,8 @@ class WorkerClient {
     this.child.stderr.on("data", (chunk: string) => {
       this.#stderr = (this.#stderr + chunk).slice(-8_000);
     });
-    this.child.once("error", error => this.#fail(error));
+    this.child.stdin.on("error", error => this.#fail(error));
+    this.child.once("error", error => { this.#spawnFailed = !this.child.pid; this.#fail(error); });
     this.child.once("close", (code, signal) => this.#fail(new Error(
       `probe worker closed (code=${code}, signal=${signal})${this.#stderr ? `: ${this.#stderr}` : ""}`)));
   }
@@ -193,6 +220,7 @@ class WorkerClient {
   get peakRssBytes(): number | undefined { return this.#peakRssBytes; }
 
   request<T>(type: string, body: Record<string, unknown> = {}, timeoutMs = 45_000): Promise<T> {
+    if (this.#closedResult || this.#spawnFailed || this.child.stdin.destroyed) return Promise.reject(new Error("probe worker is closed"));
     const requestId = randomUUID();
     return new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -212,13 +240,88 @@ class WorkerClient {
     });
   }
 
-  async stop(): Promise<void> {
-    if (this.child.exitCode !== null || this.child.signalCode !== null) return;
-    try { await this.request("shutdown", {}, 60_000); } catch { /* close below reports ownership evidence */ }
-    this.child.stdin.end();
-    const closed = await Promise.race([this.#closed, sleep(10_000).then(() => undefined)]);
-    if (!closed) throw new Error("owned probe worker did not exit after graceful shutdown");
-    if (closed.code !== 0) throw new Error(`probe worker exit status ${closed.code} (${closed.signal})`);
+  get cleanupProven(): boolean { return this.#cleanupProven; }
+
+  #ownedProcesses(): Owned[] {
+    // Reuse #1390: retain descendants BEFORE shutdown, supplemented by explicit Bun
+    // boot + inherited Node launch receipts, so parent exit cannot erase known orphans.
+    try { captureDescendants(this.#tree); }
+    finally {
+      // A failed ancestry scan cannot erase independent launch receipts. Keep
+      // those confirmed births available for force cleanup, but still fail closed.
+      const sampled = [...this.#tree.processes.values()].map(row => ({ pid: row.pid, started: row.processStartTime, at: 0, argv: [] }));
+      for (const row of [...sampled, ...this.#launches.owned()]) this.#retained.set(`${row.pid}:${row.started}`, row);
+    }
+    return [...this.#retained.values()];
+  }
+
+  #assertGone(owned: readonly Owned[]): void {
+    if (process.platform === "linux" && /\bhidepid=(?!0\b)\w+/.test(fs.readFileSync("/proc/mounts", "utf8")))
+      throw new Error("probe worker ownership is unprovable with restricted proc visibility");
+    if (this.child.pid && !owned.some(row => row.pid === this.child.pid && row.started))
+      throw new Error("probe worker launch birth is unconfirmed");
+    for (const row of owned) {
+      if (process.platform === "linux") {
+        // Unlike startTime's portability fallback, permission/read errors are NOT absence.
+        let stat: string;
+        try { stat = fs.readFileSync(`/proc/${row.pid}/stat`, "utf8"); }
+        catch (error) { if (["ENOENT", "ESRCH"].includes((error as NodeJS.ErrnoException).code ?? "")) continue; throw error; }
+        const close = stat.lastIndexOf(")");
+        const birth = stat.slice(close + 2).trim().split(/\s+/)[19];
+        if (close < 0 || !birth || !/^\d+$/.test(birth)) throw new Error(`Owned probe birth is unreadable: ${row.pid}:${row.started}`);
+        if (birth === row.started) throw new Error(`Owned probe birth did not exit: ${row.pid}:${row.started}`);
+      } else if (same(row) || !startTime(row.pid) && (() => {
+        try { process.kill(row.pid, 0); return true; }
+        catch (error) { if ((error as NodeJS.ErrnoException).code === "ESRCH") return false; throw error; }
+      })()) throw new Error(`Owned probe exit is unproven: ${row.pid}:${row.started}`);
+    }
+  }
+
+  stop(): Promise<void> { return this.#stop ??= this.#stopOwnedTree(); }
+
+  async #stopOwnedTree(): Promise<void> {
+    const failures: unknown[] = [];
+    let observationFailed = false;
+    const capture = () => {
+      try { return this.#ownedProcesses(); }
+      catch (error) { observationFailed = true; failures.push(error); return [...this.#retained.values()]; }
+    };
+    let owned = capture();
+    try {
+      if (!this.#closedResult && !this.#spawnFailed && this.child.exitCode === null && this.child.signalCode === null) {
+        await this.request("shutdown", {}, 60_000);
+        this.child.stdin.end();
+      }
+      const closed = await teardownWithin("probe worker native close", () => this.#closed, 10_000);
+      owned = capture();
+      this.#assertGone(owned);
+      if (closed.code !== 0) throw new Error(`probe worker exit status ${closed.code} (${closed.signal})`);
+    } catch (error) { failures.push(error); }
+    finally {
+      owned = capture();
+      // Exact #1390 leaf-first birth-qualified stop; no group/name/PID-only kill.
+      for (const row of [...owned].reverse()) {
+        try {
+          if (!same(row)) continue;
+          this.forced.push({ pid: row.pid, started: row.started });
+          const remaining = await stopOwned(row, 300, 1_000);
+          if (remaining !== undefined || same(row)) throw new Error(`Owned probe birth did not exit: ${row.pid}:${row.started}`);
+        } catch (error) { failures.push(error); }
+      }
+      let nativeClosed = false;
+      try { await teardownWithin("probe worker forced native close", () => this.#closed); nativeClosed = true; }
+      catch (error) { failures.push(error); }
+      try {
+        // Even a failed close join must report identity/permission uncertainty;
+        // it must not short-circuit the retained-birth absence check.
+        this.#assertGone(capture());
+        if (observationFailed) throw new Error("probe worker tree observation failed; preserving private run directory");
+        this.#cleanupProven = nativeClosed;
+      } catch (error) { failures.push(error); }
+      this.#fail(new Error("probe worker teardown finished"));
+      this.child.stdin.destroy(); this.child.stdout.destroy(); this.child.stderr.destroy();
+    }
+    if (failures.length) throw new AggregateError(failures, failures.map(String).join("; "));
   }
 }
 
@@ -710,15 +813,17 @@ export async function runControlProbe(options: ControlProbeOptions) {
   if (options.transport === "nats" && !options.nats && !(options.natsOwner && options.natsSender)) {
     throw new Error("NATS transport options are required for both owner and sender roles");
   }
-  const runDir = privateRunDir();
-  const runId = randomUUID();
   const loadShape = options.loadShape ?? "steady-14-ops-per-second";
   if (options.holdAdmission && loadShape !== "synchronized-burst") throw new Error("owner admission hold is supported only with synchronized-burst load");
+  const runDir = privateRunDir();
+  const runId = randomUUID();
   const deadlineMs = options.deadlineMs ?? DEFAULT_DEADLINE_MS;
   const holdWaitMs = options.holdWaitMs ?? 5_000;
   const createdRoots: string[] = [];
   const workers: WorkerClient[] = [];
   const allEvents = new Map<string, WorkerEvent[]>();
+  let probeFailure: unknown;
+  let probeFailed = false;
   let holdProof: Record<string, unknown> | undefined;
   let rssTimer: NodeJS.Timeout | undefined;
   let peakControllerRssBytes: number | undefined;
@@ -961,14 +1066,24 @@ export async function runControlProbe(options: ControlProbeOptions) {
         natsLeavesMeshEventsAndCursorsUnchanged: options.transport === "nats" ? eventUnchanged && cursorUnchanged : null,
       },
     };
-  } finally {
+  } catch (error) { probeFailed = true; probeFailure = error; throw error; }
+  finally {
     if (rssTimer) clearInterval(rssTimer);
-    sampleRss();
-    await Promise.allSettled(workers.reverse().map(worker => worker.stop()));
-    for (const root of [...new Set(createdRoots)].reverse()) {
-      if (root.startsWith(runDir + path.sep)) fs.rmSync(root, { recursive: true, force: true });
-    }
-    fs.rmSync(runDir, { recursive: true, force: true });
+    const failures: unknown[] = [];
+    try { sampleRss(); } catch (error) { failures.push(error); }
+    const stopped = await Promise.allSettled([...workers].reverse().map(worker => worker.stop()));
+    failures.push(...stopped.flatMap(result => result.status === "rejected" ? [result.reason] : []));
+    if (workers.every(worker => worker.cleanupProven)) {
+      // Supplied mesh roots outside this private runDir are never cleanup targets.
+      for (const root of [...new Set(createdRoots)].reverse()) {
+        if (root.startsWith(runDir + path.sep)) {
+          try { fs.rmSync(root, { recursive: true, force: true }); } catch (error) { failures.push(error); }
+        }
+      }
+      try { fs.rmSync(runDir, { recursive: true, force: true }); } catch (error) { failures.push(error); }
+    } else failures.push(new Error(`probe native cleanup unproven; private run directory preserved: ${runDir}`));
+    if (failures.length) throw new AggregateError([...(probeFailed ? [probeFailure] : []), ...failures],
+      [...(probeFailed ? [probeFailure] : []), ...failures].map(String).join("; "));
   }
 }
 

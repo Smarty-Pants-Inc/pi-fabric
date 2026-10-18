@@ -3063,9 +3063,8 @@ export class MeshBridge {
       else this.#directionPendingSince.toRemote ??= now;
       if (!pendingToLocal) this.#noteDirectionSuccess("toLocal", now);
       else this.#directionPendingSince.toLocal ??= now;
-      if (pendingToRemote) this.#wakeDirectionForProbe("toRemote");
-      if (pendingToLocal) this.#wakeDirectionForProbe("toLocal");
-
+      // Probes observe heads only. Direction loops own forwarding wakes through notifications
+      // and their bounded missed-notification safety timers; a probe must not trigger membership.
       const directionalAfter = this.options.directionStallAfterMs ?? BRIDGE_DIRECTION_STALL_AFTER_MS;
       if (pendingToRemote && !pendingToLocal && now - this.#directionPendingSince.toRemote! >= directionalAfter) {
         direction = "toRemote";
@@ -3105,12 +3104,6 @@ export class MeshBridge {
       const stallAfter = this.options.watchdogStallAfterMs ?? BRIDGE_WATCHDOG_STALL_AFTER_MS;
       if (stalledFor >= stallAfter) await this.#raiseStall(direction, `no successful round trip for ${stalledFor} ms`, false);
     }
-  }
-
-  #wakeDirectionForProbe(direction: Direction): void {
-    this.#directionPending[direction] = true;
-    this.#directionWakeReason[direction] = "other";
-    if (!this.#directionBackoff[direction]) this.#directionWake[direction]?.("other");
   }
 
   async #watchdogLoop(running: () => boolean): Promise<void> {
@@ -4012,7 +4005,7 @@ export class MeshBridge {
             started = true;
             this.#directions = Promise.all([this.#directionLoop("toRemote", running), this.#directionLoop("toLocal", running)])
               .then(() => undefined, () => undefined);
-            this.#watchdogTask = this.#watchdogLoop(running);
+            if (this.options.notifyWatchdog || this.options.publishStallAlarm) this.#watchdogTask = this.#watchdogLoop(running);
           }
           const deadline = Math.min(this.#expiryAt,
             this.#leaseVersion !== this.#syncedLeaseVersion ? this.#leaseRenewAt : Infinity);

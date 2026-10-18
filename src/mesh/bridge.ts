@@ -14,7 +14,7 @@ import { ROOT_ID_PREFIX } from "../topology/root-inbox-shared.js";
 import { participantFilePresent, readParticipantFiles } from "../topology/participant-files.js";
 import { FABRIC_MESH_OUTAGE_ALARM_TOPIC, isMeshAlarmTarget, meshCursorGeneration, type MeshBatchOperation, type MeshBatchView, type MeshEvent, type MeshIdentity, type MeshPublishInput, type MeshStateEntry, type MeshStore } from "./store.js";
 import { CommitOutbox, type CommitOutboxEffect } from "./commit-outbox.js";
-import { assertBridgeStateBackend, isMeshRetryableBusy, isMeshStateBusy, isMeshStateWalCap } from "./state-backend.js";
+import { assertBridgeStateBackend, isMeshRetryableBusy, isMeshStateWalCap } from "./state-backend.js";
 import { watchBridgeStore, type BridgeChange } from "./change-notifier.js";
 import { BRIDGE_BATCH_MAX_EVENTS } from "./event-log.js";
 import { controlBodyFingerprint, FABRIC_IDEMPOTENCY_KEY_REUSED, FabricIdempotencyKeyReusedError } from "./control-idempotency.js";
@@ -45,8 +45,6 @@ const HOST_PREFIX = "topology/hosts/";
 const PARTICIPANT_PREFIX = "topology/participants/";
 /** Freshness bound for an observation from one physical bridge peer. */
 export const BRIDGE_LEASE_MS = MIRROR_FRESH_MS;
-/** How long a held publish retries a busy SQLite state write fence before the loop backs off. */
-const BRIDGE_FENCE_RETRY_MS = 5_000;
 const DEFAULT_PRESENCE_MS = 5_000;
 /** A retained source event revalidates after this delay; this is NOT an event/authority TTL. */
 const DEFAULT_MEMBERSHIP_RETRY_MS = 1_000;
@@ -1029,9 +1027,11 @@ export class StoreBridgeSide implements BridgeSide {
     return [...this.store.listAll(PARTICIPANT_PREFIX, { fresh: true }), ...readParticipantFiles(this.store.root, { maxAgeMs: 0 })];
   }
 
+  // Do not retry a busy SQLite ownership fence inside bridge publication: failure guarantees no append.
+  // Let the per-direction loop back off with .lock released instead of reacquiring ahead of queued writers.
   async publish(event: BridgePublish, held: string[] = [], fromHub = false): Promise<{ sequence: number }> {
     await this.store.prepareLock();
-    const published = await this.#fenceRetry(() => this.store.publish(this.#publication(event, held, fromHub)));
+    const published = await this.store.publish(this.#publication(event, held, fromHub));
     return { sequence: published.sequence };
   }
 
@@ -1044,37 +1044,19 @@ export class StoreBridgeSide implements BridgeSide {
     // The dedupe receipt stores this envelope too: NEVER pass the command body to store.publish.
     const key = `${RELAY_RECEIPT_PREFIX}${encodeURIComponent(this.peer)}:${encodeURIComponent(stamp.id)}`;
     await this.store.prepareLock();
-    const published = await this.#fenceRetry(() => this.store.publish({
+    const published = await this.store.publish({
       id: key, dedupeKey: key, topic: checked.topic, kind: checked.kind,
       from: { ...checked.from, verified: "bridge" }, to: checked.to, durable: true,
       ...this.#heldFence([...new Set([checked.from.id, ...held])], checked.from),
       // createdAt is stamped by the host store at commit; no data/text/message/principal.
-    }));
+    });
     return { sequence: published.sequence };
   }
 
   async publishBatch(events: Array<{ event: BridgePublish; held?: string[] }>, fromHub = false): Promise<Array<{ sequence: number }>> {
     await this.store.prepareLock();
-    const published = await this.#fenceRetry(() => this.store.publishBatch(events.map(({ event, held }) => this.#publication(event, held ?? [], fromHub))));
+    const published = await this.store.publishBatch(events.map(({ event, held }) => this.#publication(event, held ?? [], fromHub)));
     return published.map(({ sequence }) => ({ sequence }));
-  }
-
-  // A busy state write fence (SQLite) refused the event before its stamp: nothing was appended,
-  // so it is retried with .lock released in between, for a bounded time; then the busy error
-  // (a lock timeout) goes to the bridge loop's own backoff. A batch whose later event met a busy
-  // fence returns its committed prefix instead, like any other suffix failure. Inside a bounded mesh
-  // try (withTryLock) the retries never outlast that try's budget (pi-fabric#640 review round 1).
-  async #fenceRetry<T>(publish: () => Promise<T>): Promise<T> {
-    const deadline = Date.now() + Math.min(BRIDGE_FENCE_RETRY_MS, this.store.tryLockBudgetMs ?? BRIDGE_FENCE_RETRY_MS);
-    for (let attempt = 0; ; attempt += 1) {
-      try {
-        return await publish();
-      } catch (error) {
-        if (isIdempotencyKeyReused(error) || !isMeshStateBusy(error) || Date.now() >= deadline) throw error;
-        const cap = Math.min(25, 2 ** Math.min(attempt, 5));
-        await new Promise((resolve) => setTimeout(resolve, cap * (0.5 + Math.random() / 2)));
-      }
-    }
   }
 
   #publication(event: BridgePublish, held: string[], fromHub: boolean): Parameters<MeshStore["publish"]>[0] {
@@ -3422,7 +3404,12 @@ export class MeshBridge {
         this.#directionBackoff[direction] = !(this.#directionMirrorBackoff[direction] && this.#presenceVersion !== presenceVersion);
         if (error instanceof BridgeMirrorDeferredError || isMeshStateWalCap(error))
           delay = walCapDelay = walCapRetryDelay(walCapDelay, this.options.walCapRetryMinMs);
-        else delay = retryMs;
+        else {
+          // Equal jitter over the upper half of a capped exponential delay spreads independent bridges
+          // without retrying sooner than the original deterministic backoff.
+          const cap = Math.min(retryMs * 4, LOCK_RETRY_MAX_MS);
+          delay = Math.floor(cap / 2 + Math.random() * cap / 2);
+        }
         retryMs = Math.min(retryMs * 2, LOCK_RETRY_MAX_MS);
         if (!reported) {
           this.#log(`${error instanceof BridgeMirrorDeferredError ? "bridge mirror degraded" : meshBusyLabel(error)} (${direction}); retrying in ${delay} ms: ${(error as Error).message}`);

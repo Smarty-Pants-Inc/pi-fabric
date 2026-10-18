@@ -565,7 +565,10 @@ async function superviseResident(configPath: string, options: ResidentSuperviseO
       : nativeResidentPlacementAvailable(launchConfig.agents?.placementDecider?.contextCommand, options.nativeSystemdRun, launchConfig.agents?.placementDecider?.recordRoot);
     const useSystemd = process.platform === "linux" && placementMode !== "off" && placementAvailable;
     if (placementMode === "enforce" && !useSystemd) throw new Error(`Resident enforce placement cannot start without verified native support: expected ${VERIFIED_CALLER_CAPABILITY.line} (${VERIFIED_CALLER_ISSUE})`);
-    const recordStore = new LaunchRecordStore(launchConfig.placement?.recordRoot);
+    const authoritativeRecordStore = new LaunchRecordStore(launchConfig.placement?.recordRoot ?? launchConfig.agents?.placementDecider?.recordRoot);
+    // Shadow records preserve observation evidence without contaminating the authoritative enforce census.
+    const recordStore = new LaunchRecordStore(placementMode === "shadow"
+      ? path.join(authoritativeRecordStore.root, "shadow") : authoritativeRecordStore.root);
     let record = recordEnabled ? makeLaunchRecord({
       nativeLaunchId, launchSpecId: launchConfig.placement?.launchSpecId ?? `resident-host:${launchConfig.rootId}`,
       generation: recordGeneration, fenceToken: launchConfig.placement?.fenceToken ?? recordGeneration,

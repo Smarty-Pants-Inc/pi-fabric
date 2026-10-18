@@ -123,6 +123,13 @@ const parseUnitStatus = (unit: string, stdout: string): NativeUnitStatus | undef
   return { unit, load_state: loadState, active_state: activeState, invocation_id: invocation || null, main_pid: Number(mainPid) };
 };
 
+/** Require an inactive exact-unit read-back, with neither a live PID nor an invocation identity. */
+const provesInactiveWithoutInvocation = (status: NativeUnitStatus): boolean =>
+  (status.load_state === "loaded" || status.load_state === "not-found") && status.active_state === "inactive" &&
+  status.invocation_id === null && status.main_pid === 0;
+const provesExactUnitAbsent = (status: NativeUnitStatus): boolean =>
+  status.load_state === "not-found" && status.active_state === "inactive" && status.invocation_id === null && status.main_pid === 0;
+
 export const systemdUnitStatus = (unit: string, systemctl = SYSTEMCTL): NativeUnitStatus | undefined => {
   if (process.platform !== "linux") return undefined;
   let result;
@@ -245,18 +252,20 @@ export const watchNativeSystemdUnit = (
       } else if (identity && current.fence.state === "open") {
         try { current = store.transition(record.native_launch_id, record.generation, "closed-uncertain"); } catch { /* retain open fence */ }
       }
-      if (status.load_state === "loaded" && status.active_state === "inactive" && status.invocation_id === null &&
-          current && current.fence.state !== "closed-started" && !current.terminal) {
+      // A not-found sample can race the systemd-run submission; wait for its client to exit before proving never-started.
+      if (provesInactiveWithoutInvocation(status) && clientExit && current && current.fence.state !== "closed-started" && !current.terminal) {
         try {
           store.closeUnstartedFromReadback(record.native_launch_id, record.generation, status);
           unitProved = true;
         } catch { /* mismatched/uncertain evidence never releases custody */ }
-      } else if ((!stopRequested || stopCommandComplete) && status.load_state === "loaded" && status.active_state === "inactive" &&
-          current?.fence.state === "closed-started" && current.invocation_id === status.invocation_id && current.boot_id === readBootId()) {
+      } else if ((!stopRequested || stopCommandComplete) && current?.fence.state === "closed-started" &&
+          (provesExactUnitAbsent(status) || (status.load_state === "loaded" && status.active_state === "inactive" && status.main_pid === 0 &&
+            current.invocation_id === status.invocation_id && current.boot_id === readBootId()))) {
+        // Once start identity is durable, exact-unit not-found with no InvocationID is the post-GC exit proof.
         try {
           store.terminal(record.native_launch_id, record.generation, { ...status, boot_id: readBootId() });
           unitProved = true;
-        } catch { /* exact invocation read-back is required to terminalize */ }
+        } catch { /* exact unit/invocation read-back is required to terminalize */ }
       }
     }
     if (clientExit && !unitProved && Date.now() >= registerDeadline) {
@@ -318,7 +327,7 @@ export const reconcileNativeLaunchRecords = async (store: LaunchRecordStore, sys
       if (!record || record.terminal || record.fence.state === "closed-unstarted") continue;
       const status = systemdUnitStatus(record.unit, systemctl);
       if (record.fence.state === "open") {
-        if (!status || status.load_state === "not-found" || (status.load_state === "loaded" && status.active_state === "inactive" && status.invocation_id === null)) {
+        if (!status || provesInactiveWithoutInvocation(status)) {
           record = store.closeUnstartedBeforeCreate(record.native_launch_id, record.generation);
         } else if (status) {
           record = store.transition(record.native_launch_id, record.generation, "closed-uncertain");
@@ -327,11 +336,12 @@ export const reconcileNativeLaunchRecords = async (store: LaunchRecordStore, sys
         const identity = identityFromStatus(status);
         if (identity && (record.fence.state === "creating" || record.fence.state === "closed-uncertain")) {
           record = store.transition(record.native_launch_id, record.generation, "closed-started", identity);
-        } else if (status.load_state === "loaded" && status.active_state === "inactive" && status.invocation_id === null &&
+        } else if (provesInactiveWithoutInvocation(status) &&
             (record.fence.state === "creating" || record.fence.state === "closed-uncertain")) {
           record = store.closeUnstartedFromReadback(record.native_launch_id, record.generation, status);
-        } else if (status.load_state === "loaded" && status.active_state === "inactive" && record.fence.state === "closed-started" &&
-            record.invocation_id === status.invocation_id && record.boot_id === readBootId()) {
+        } else if (record.fence.state === "closed-started" &&
+            (provesExactUnitAbsent(status) || (status.load_state === "loaded" && status.active_state === "inactive" && status.main_pid === 0 &&
+              record.invocation_id === status.invocation_id && record.boot_id === readBootId()))) {
           record = store.terminal(record.native_launch_id, record.generation, { ...status, boot_id: readBootId() });
         } else if (record.fence.state === "creating") {
           record = store.transition(record.native_launch_id, record.generation, "closed-uncertain");

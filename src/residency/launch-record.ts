@@ -269,11 +269,12 @@ export class LaunchRecordStore {
     return this.#writeUnstarted(current);
   }
   closeUnstartedFromReadback(nativeLaunchId: string, generation: number, proof: {
-    unit: string; load_state: string; active_state: string; invocation_id: string | null;
+    unit: string; load_state: string; active_state: string; invocation_id: string | null; main_pid: number;
   }): LaunchRecord {
     const current = this.get(nativeLaunchId);
     if (!current || current.generation !== generation || !["open", "creating", "closed-uncertain"].includes(current.fence.state) ||
-        proof.unit !== current.unit || proof.load_state !== "loaded" || proof.active_state !== "inactive" || proof.invocation_id !== null) {
+        proof.unit !== current.unit || !["loaded", "not-found"].includes(proof.load_state) || proof.active_state !== "inactive" ||
+        proof.invocation_id !== null || proof.main_pid !== 0) {
       throw new Error("Native read-back does not prove this launch never started");
     }
     return this.#writeUnstarted(current);
@@ -307,12 +308,14 @@ export class LaunchRecordStore {
     writeRecord(this.path(nativeLaunchId), next); return next;
   }
   terminal(nativeLaunchId: string, generation: number, proof: {
-    unit: string; load_state: string; active_state: string; invocation_id: string | null; boot_id: string | null;
+    unit: string; load_state: string; active_state: string; invocation_id: string | null; main_pid: number; boot_id: string | null;
   }): LaunchRecord {
     const current = this.get(nativeLaunchId);
-    if (!current || current.generation !== generation || current.fence.state !== "closed-started" ||
-        proof.unit !== current.unit || proof.load_state !== "loaded" || proof.active_state !== "inactive" ||
-        proof.invocation_id !== current.invocation_id || proof.boot_id !== current.boot_id) {
+    const absent = proof.load_state === "not-found" && proof.active_state === "inactive" && proof.invocation_id === null && proof.main_pid === 0;
+    const inactiveInvocation = proof.load_state === "loaded" && proof.active_state === "inactive" && proof.main_pid === 0 &&
+      proof.invocation_id === current?.invocation_id && proof.boot_id === current?.boot_id;
+    if (!current || current.generation !== generation || current.fence.state !== "closed-started" || proof.unit !== current.unit ||
+        (!absent && !inactiveInvocation)) {
       throw new Error("Native read-back does not prove this launch exited");
     }
     if (current.terminal) return current;

@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -8,8 +9,9 @@ import { RESIDENT_HOST_FORMAT, residentRoot, type ResidentHostConfig } from "../
 import { supervise } from "../src/residency/launcher.js";
 import { launchNativePlacementWorker } from "../src/agents/transports/native-placement.js";
 import type { AgentTransportLaunch } from "../src/agents/types.js";
-import { LaunchRecordStore, makeLaunchRecord } from "../src/residency/launch-record.js";
-import { reconcileNativeLaunchRecords, systemdRunArguments, systemdRunEnvironment, verifyNativeLaunchRecord } from "../src/residency/native-launch.js";
+import { LaunchRecordStore, makeLaunchRecord, validateLaunchCensus } from "../src/residency/launch-record.js";
+import { prepareResidentHostPlacement } from "../src/residency/placement.js";
+import { reconcileNativeLaunchRecords, systemdRunArguments, systemdRunEnvironment, verifyNativeLaunchRecord, watchNativeSystemdUnit } from "../src/residency/native-launch.js";
 
 const roots: string[] = [];
 const root = (): string => { const value = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-native-launcher-")); roots.push(value); return value; };
@@ -115,9 +117,13 @@ const fixture = (directory: string, options: { failCreate?: boolean; holdHost?: 
   const nativeSystemdRun = path.join(directory, "systemd-run");
   fs.writeFileSync(nativeSystemdRun, `#!${process.execPath}
 const fs = require('node:fs'); const { spawn } = require('node:child_process');
-const args = process.argv.slice(2); const unitAt = args.indexOf('--unit'); const unit = args[unitAt + 1]; const separator = args.indexOf('--');
-const record = JSON.parse(fs.readFileSync(${JSON.stringify(recordPath)}, 'utf8'));
-fs.writeFileSync(${JSON.stringify(stateLog)}, JSON.stringify({ unit, state: record.fence.state, mode: fs.statSync(${JSON.stringify(recordPath)}).mode & 0o777, args }));
+const path = require('node:path'); const args = process.argv.slice(2); const unitAt = args.indexOf('--unit'); const unit = args[unitAt + 1]; const separator = args.indexOf('--');
+const nativeLaunchId = unit.slice('smarty-launch-'.length).replace(/-g[0-9]+\\.service$/, '');
+const primaryRecordPath = path.join(${JSON.stringify(recordRoot)}, nativeLaunchId + '.json');
+const shadowRecordPath = path.join(${JSON.stringify(recordRoot)}, 'shadow', nativeLaunchId + '.json');
+const recordPath = fs.existsSync(primaryRecordPath) ? primaryRecordPath : shadowRecordPath;
+const record = JSON.parse(fs.readFileSync(recordPath, 'utf8'));
+fs.writeFileSync(${JSON.stringify(stateLog)}, JSON.stringify({ unit, state: record.fence.state, mode: fs.statSync(recordPath).mode & 0o777, args }));
 ${options.holdHost ? "" : `fs.writeFileSync(${JSON.stringify(residencyRoot + "/idle-exit.json")}, JSON.stringify({ format: 1, reason: 'root-dead-idle', rootId: 'root-a', pid: process.pid, token: process.env.PI_FABRIC_RESIDENT_GENERATION, at: Date.now(), idleMs: 1 }));`}
 ${options.failCreate ? `fs.writeFileSync(${JSON.stringify(unitCreated)}, '1'); process.exit(44);` : `if (separator < 0 || unitAt < 0) process.exit(45);
 const command = args.slice(separator + 1); const main = spawn(command[0], command.slice(1), { stdio: 'ignore', env: process.env, detached: true });
@@ -315,6 +321,36 @@ process.stdout.write('LoadState=' + (loaded ? 'loaded' : 'not-found') + '\\nActi
     expect(fs.existsSync(f.stateLog)).toBe(false);
   }, 10_000);
 
+  it("keeps shadow resident records outside the enforce census on the same host", async () => {
+    const directory = root(); const f = fixture(directory, { nativeLaunchId: "resident-shadow" });
+    const config = JSON.parse(fs.readFileSync(f.configPath, "utf8")) as ResidentHostConfig;
+    config.agents.placementDecider!.mode = "shadow";
+    const shadowConfig = await prepareResidentHostPlacement(config, "resident-shadow");
+    expect(shadowConfig.placement).toMatchObject({ nativeLaunchId: "resident-shadow", parentNativeLaunchId: null, role: "resident-host" });
+    fs.writeFileSync(f.configPath, JSON.stringify(shadowConfig));
+    await supervise(f.configPath, { nativeSystemdRun: path.join(directory, "missing-systemd-run"), nativeSystemctl: f.nativeSystemctl });
+
+    const shadowStore = new LaunchRecordStore(path.join(f.store.root, "shadow"));
+    expect(shadowStore.get("resident-shadow")).toMatchObject({ role: "resident-host", parent_native_launch_id: null, fence: { state: "creating" } });
+    expect(f.store.get("resident-shadow")).toBeUndefined();
+    expect(() => validateLaunchCensus(f.store.census())).not.toThrow();
+
+    fs.rmSync(path.join(f.residencyRoot, "idle-exit.json"), { force: true });
+    const enforceConfig = JSON.parse(JSON.stringify(shadowConfig)) as ResidentHostConfig;
+    enforceConfig.agents.placementDecider!.mode = "enforce";
+    enforceConfig.placement!.nativeLaunchId = "resident-enforce";
+    enforceConfig.placement!.generation = 8;
+    enforceConfig.placement!.fenceToken = 12;
+    enforceConfig.placement!.orgId = "org-a";
+    enforceConfig.placement!.workId = "work-a";
+    enforceConfig.placement!.parentNativeLaunchId = "root-a";
+    enforceConfig.placement!.origin.originRef = "resident-enforce";
+    fs.writeFileSync(f.configPath, JSON.stringify(enforceConfig));
+    await supervise(f.configPath, { nativeSystemdRun: f.nativeSystemdRun, nativeSystemctl: f.nativeSystemctl });
+    expect(f.store.get("resident-enforce")).toMatchObject({ fence: { state: "closed-started" }, terminal: { outcome: "exited" } });
+    expect(() => validateLaunchCensus(f.store.census())).not.toThrow();
+  }, 15_000);
+
   it("runs launch-record reconciliation during enforce-mode host startup", async () => {
     const directory = root(); const rootId = "session:native-launch-reconcile";
     const meshRoot = path.join(directory, "mesh"); const residencyRoot = residentRoot(meshRoot, rootId);
@@ -361,6 +397,75 @@ process.stdout.write('LoadState=loaded\\nActiveState=active\\nInvocationID=abcde
       invocation_id: "abcdef1234567890abcdef1234567890", main_pid_start: expect.stringMatching(new RegExp(`^${process.pid}:[1-9][0-9]*$`)) });
     expect(store.get("open-root")).toMatchObject({ fence: { state: "closed-unstarted" }, terminal: { outcome: "never_started" } });
   });
+
+  it("releases exact not-found resident records and keeps mismatched invocation evidence fenced", async () => {
+    const directory = root(); const store = new LaunchRecordStore(path.join(directory, "records")); startParent(store);
+    const residentRecord = (id: string) => makeLaunchRecord({ launchSpecId: `${id}-spec`, orgId: "org-a", workId: "work-a",
+      parentNativeLaunchId: "root-a", role: "resident-host", profile: "resident", sourcePin: "pin", memoryProfile: "resident",
+      origin: { class: "background-agent", originRef: id } }, id, 1);
+    const neverStarted = residentRecord("resident-never-started");
+    store.prepare(neverStarted); store.transition(neverStarted.native_launch_id, neverStarted.generation, "creating");
+    const uncertain = residentRecord("resident-uncertain");
+    const rootUnit = store.get("root-a")!.unit;
+    const nativeSystemctl = path.join(directory, "systemctl");
+    fs.writeFileSync(nativeSystemctl, `#!${process.execPath}
+const unit = process.argv.slice(2).find(value => value.endsWith('.service'));
+if (unit === ${JSON.stringify(rootUnit)}) process.stdout.write('LoadState=loaded\\nActiveState=active\\nInvocationID=1234567890abcdef1234567890abcdef\\nMainPID=${process.pid}\\n');
+else process.stdout.write('LoadState=not-found\\nActiveState=inactive\\nInvocationID=' + (unit === ${JSON.stringify(uncertain.unit)} ? 'abcdef1234567890abcdef1234567890' : '') + '\\nMainPID=0\\n');
+`, { mode: 0o700 }); fs.chmodSync(nativeSystemctl, 0o700);
+
+    await reconcileNativeLaunchRecords(store, nativeSystemctl);
+    expect(store.get(neverStarted.native_launch_id)).toMatchObject({ fence: { state: "closed-unstarted" }, terminal: { outcome: "never_started" } });
+    const started = await store.admit(residentRecord("resident-started"), true);
+    store.transition(started.native_launch_id, started.generation, "closed-started", {
+      boot_id: "12345678-1234-1234-1234-123456789abc", invocation_id: "fedcba0987654321fedcba0987654321", main_pid_start: "124:457",
+    });
+    await reconcileNativeLaunchRecords(store, nativeSystemctl);
+    expect(store.get(started.native_launch_id)).toMatchObject({ fence: { state: "closed-started" }, terminal: { outcome: "exited" } });
+
+    const replacement = await store.admit(residentRecord("resident-replacement"), true);
+    expect(replacement.fence.state).toBe("creating");
+    store.closeUnstartedBeforeCreate(replacement.native_launch_id, replacement.generation);
+    store.prepare(uncertain); store.transition(uncertain.native_launch_id, uncertain.generation, "creating");
+    await reconcileNativeLaunchRecords(store, nativeSystemctl);
+    expect(store.get(uncertain.native_launch_id)).toMatchObject({ fence: { state: "closed-uncertain" }, terminal: null });
+    await expect(store.admit(residentRecord("resident-blocked"), true)).rejects.toThrow("More than one resident host per root");
+  });
+
+  it("does not release an unstarted not-found unit until its launch client exits", async () => {
+    const directory = root(); const store = new LaunchRecordStore(path.join(directory, "records"));
+    const record = makeLaunchRecord({ launchSpecId: "resident-spec", orgId: "org-a", workId: "work-a", parentNativeLaunchId: "root-a",
+      role: "resident-host", profile: "resident", sourcePin: "pin", memoryProfile: "resident",
+      origin: { class: "background-agent", originRef: "resident-wait" } }, "resident-wait", 1);
+    store.prepare(record); store.transition(record.native_launch_id, record.generation, "creating");
+    const nativeSystemctl = path.join(directory, "systemctl");
+    fs.writeFileSync(nativeSystemctl, `#!${process.execPath}\nprocess.stdout.write('LoadState=not-found\\nActiveState=inactive\\nInvocationID=\\nMainPID=0\\n');\n`, { mode: 0o700 });
+    fs.chmodSync(nativeSystemctl, 0o700);
+    const client = spawn(process.execPath, ["-e", "setTimeout(() => {}, 100)"], { stdio: "ignore" });
+    const lifetime = watchNativeSystemdUnit(client, store, record, nativeSystemctl, { pollMs: 5 });
+    await sleep(20);
+    expect(store.get(record.native_launch_id)?.fence.state).toBe("creating");
+    await lifetime.closed;
+    expect(store.get(record.native_launch_id)).toMatchObject({ fence: { state: "closed-unstarted" }, terminal: { outcome: "never_started" } });
+  }, 10_000);
+
+  it("terminalizes a started watcher after exact unit read-back reports not-found", async () => {
+    const directory = root(); const store = new LaunchRecordStore(path.join(directory, "records"));
+    const record = makeLaunchRecord({ launchSpecId: "resident-spec", orgId: "org-a", workId: "work-a", parentNativeLaunchId: "root-a",
+      role: "resident-host", profile: "resident", sourcePin: "pin", memoryProfile: "resident",
+      origin: { class: "background-agent", originRef: "resident-not-found" } }, "resident-not-found", 1);
+    store.prepare(record); store.transition(record.native_launch_id, record.generation, "creating");
+    store.transition(record.native_launch_id, record.generation, "closed-started", {
+      boot_id: "12345678-1234-1234-1234-123456789abc", invocation_id: "fedcba0987654321fedcba0987654321", main_pid_start: "124:457",
+    });
+    const nativeSystemctl = path.join(directory, "systemctl");
+    fs.writeFileSync(nativeSystemctl, `#!${process.execPath}\nprocess.stdout.write('LoadState=not-found\\nActiveState=inactive\\nInvocationID=\\nMainPID=0\\n');\n`, { mode: 0o700 });
+    fs.chmodSync(nativeSystemctl, 0o700);
+    const client = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30)"], { stdio: "ignore" });
+    const lifetime = watchNativeSystemdUnit(client, store, record, nativeSystemctl, { pollMs: 5 });
+    await lifetime.closed;
+    expect(store.get(record.native_launch_id)).toMatchObject({ fence: { state: "closed-started" }, terminal: { outcome: "exited" } });
+  }, 10_000);
 
   it("verifies and closes a crash-window record left at creating before read-back", async () => {
     const directory = root(); const store = new LaunchRecordStore(path.join(directory, "records"));

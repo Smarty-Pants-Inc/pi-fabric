@@ -2963,7 +2963,9 @@ export class AgentManager {
           : timeoutMs > 240 * 60_000 ? "launcher supports at most 240 minutes" : undefined;
         const placementApiLocalReason = placementApiConfig && request.needs?.includes("local")
           ? "reserved need: local pins to the Main host"
-          : legacyPlacementLocalReason;
+          : writePolicy !== undefined
+            ? "write-policy-not-transportable"
+            : legacyPlacementLocalReason;
         let deadlineAt = Date.now() + timeoutMs;
         if (placementApiConfig) {
           if (hostedAdapter || adapter.kind !== "process") {

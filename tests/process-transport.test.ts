@@ -899,6 +899,87 @@ console.log('RYZEN2_TASK_ACCEPTED '+at('--id')+' on '+host);\n`);
   });
 });
 
+describe("AgentManager write-policy placement boundary", () => {
+  const setup = () => {
+    const directory = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "fabric-write-policy-placement-")));
+    roots.push(directory);
+    const cwd = path.join(directory, "cwd"); fs.mkdirSync(cwd);
+    const tmp = path.join(directory, "tmp"); fs.mkdirSync(tmp); vi.stubEnv("TMPDIR", tmp);
+    const launcher = path.join(directory, "launcher.mjs");
+    const launcherCalls = path.join(directory, "launcher-calls.json");
+    fs.writeFileSync(launcher, `import fs from 'node:fs';
+const args=process.argv.slice(2);fs.writeFileSync(${JSON.stringify(launcherCalls)},JSON.stringify(args));
+const at=flag=>args[args.indexOf(flag)+1];const id=at('--id');
+fs.writeFileSync(${JSON.stringify(path.join(directory, "rc"))},'0');
+fs.writeFileSync(${JSON.stringify(path.join(directory, "result.md"))},'remote placement completed');
+console.log('RYZEN2_TASK_ACCEPTED '+id+' on remote-host');\n`);
+    const placement = normalizeFabricConfig({ agents: { placement: {
+      default: "remote", sharedMounts: [directory], capabilities: [], command: [process.execPath, launcher,
+        "--id", "{id}", "--host", "auto", "--model", "{model}", "--thinking", "{thinking}", "--", "{task}"],
+      resultDirectory: directory, cancelCommand: [process.execPath, launcher], pollIntervalMs: 10, commandTimeoutMs: 5_000,
+    } } }).agents.placement!;
+    const manager = new AgentManager(cwd, { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, deniedModels: [],
+      timeoutMs: 5_000, placement }, { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(directory, "runs") });
+    managers.push(manager);
+    return { directory, cwd, launcherCalls, manager };
+  };
+
+  it.each([["default", {}], ["explicit read-only", { readOnly: true }]] as const)(
+    "keeps an active %s write policy local despite remote placement",
+    async (_kind, policy) => {
+      const f = setup();
+      const selector = vi.spyOn(placementModule, "selectFleetPlacement").mockResolvedValue(undefined);
+      const remote = vi.spyOn(placementModule, "launchPlacedTask");
+      const requests: AgentTransportLaunch[] = [];
+      const nativeLaunch = ProcessTransport.prototype.launch;
+      vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(function(this: ProcessTransport, request) {
+        requests.push(request);
+        return nativeLaunch.call(this, request);
+      });
+
+      const result = await f.manager.run({ task: "policy route probe", transport: "process", ...policy });
+      expect(result.status, result.error).toBe("completed");
+      expect(requests).toHaveLength(1);
+      expect(requests[0]).toMatchObject({ placementLocalReason: "write-policy-not-transportable" });
+      const workerArguments = requests[0]!.workerArguments;
+      const policyIndex = workerArguments.indexOf("--write-policy");
+      expect(policyIndex).toBeGreaterThanOrEqual(0);
+      const activePolicy = JSON.parse(workerArguments[policyIndex + 1]!);
+      if ("readOnly" in policy) {
+        expect(activePolicy).toMatchObject({ readOnly: true, writableRoots: [] });
+      } else {
+        expect(activePolicy.writableRoots).toContain(f.cwd);
+        expect(activePolicy.writableRoots.some((root: string) => root.startsWith(path.join(f.directory, "runs")))).toBe(true);
+        expect(workerArguments).toContain("--tmpdir");
+      }
+      expect(selector).not.toHaveBeenCalled();
+      expect(remote).not.toHaveBeenCalled();
+      expect(fs.existsSync(f.launcherCalls)).toBe(false);
+    },
+  );
+
+  it("keeps the no-active-policy counterexample eligible for remote placement", async () => {
+    const f = setup();
+    const selector = vi.spyOn(placementModule, "selectFleetPlacement").mockResolvedValue(undefined);
+    const remote = vi.spyOn(placementModule, "launchPlacedTask");
+    const requests: AgentTransportLaunch[] = [];
+    const nativeLaunch = ProcessTransport.prototype.launch;
+    vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(function(this: ProcessTransport, request) {
+      requests.push(request);
+      return nativeLaunch.call(this, request);
+    });
+
+    const result = await f.manager.run({ task: "unrestricted route probe", transport: "process", writePolicy: "unrestricted" });
+    expect(result.status, result.error).toBe("completed");
+    expect(requests).toHaveLength(1);
+    expect(requests[0]!.placementLocalReason).toBeUndefined();
+    expect(requests[0]!.workerArguments).not.toContain("--write-policy");
+    expect(selector).toHaveBeenCalledOnce();
+    expect(remote).toHaveBeenCalledOnce();
+    expect(fs.existsSync(f.launcherCalls)).toBe(true);
+  });
+});
+
 // smarty-dev#8257 MECHANISM (mock transport handle via ProcessTransport.launch, no OS process): the
 // public agents.stop path after a latched watcher failure. Excludes the real kernel/EPERM branch
 // (tests/task-cgroup.test.ts) and native Pi (named proof .local/out/prove-task-stop.mjs).

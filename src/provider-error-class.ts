@@ -38,7 +38,21 @@ export interface ProviderErrorClass {
   basis: "diagnostic" | "status" | "body" | "text" | "default";
 }
 
-type FailedTurn = { stopReason?: unknown; errorMessage?: unknown; diagnostics?: unknown };
+type FailedTurn = { stopReason?: unknown; rawStopReason?: unknown; errorMessage?: unknown; diagnostics?: unknown; recovery?: unknown };
+
+export interface ModelRefusalClassification {
+  kind: "model-refusal";
+}
+
+const MODEL_REFUSAL_ERROR_MESSAGE = "The model refused to complete the request";
+
+/** Pi preserves Anthropic's refusal finish reason, while its fallback error text is stable too. */
+export const classifyModelRefusal = (turn: FailedTurn | undefined): ModelRefusalClassification | undefined => {
+  if (turn?.stopReason !== "error") return undefined;
+  return turn.rawStopReason === "refusal" || turn.errorMessage === MODEL_REFUSAL_ERROR_MESSAGE
+    ? { kind: "model-refusal" }
+    : undefined;
+};
 
 // Anthropic/OpenAI error types that describe the request or the credentials, not load.
 const NON_RETRYABLE_TYPES = new Set([
@@ -113,6 +127,9 @@ const routingMiss = (status: number, body: ErrorBody | undefined, message: strin
  */
 export const classifyProviderError = (turn: FailedTurn | undefined): ProviderErrorClass | undefined => {
   if (turn?.stopReason !== "error") return undefined;
+  if (classifyModelRefusal(turn)) return { retryable: false, short: "model refusal", basis: "diagnostic" };
+  const recovery = turn.recovery as { retryable?: unknown } | undefined;
+  if (recovery?.retryable === false) return { retryable: false, short: "non-retryable", basis: "diagnostic" };
   const message = typeof turn.errorMessage === "string" ? turn.errorMessage : "";
   const diagnostics = Array.isArray(turn.diagnostics) ? turn.diagnostics as Array<{ type?: unknown }> : [];
   // A provider plan/usage limit (Pi's provider_limit, e.g. smarty_limit) is a 429 window: backoff fits.

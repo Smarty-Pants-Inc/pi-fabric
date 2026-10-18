@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { classifyProviderError } from "../src/provider-error-class.js";
+import { classifyModelRefusal, classifyProviderError } from "../src/provider-error-class.js";
 
 // smarty-dev#8742: 26 Mains sat 13.5 h in provider-backoff on a gateway 409 that no retry could fix.
 const affinity = "compaction_affinity_missing: the signed compaction block belongs to another upstream account";
@@ -7,7 +7,25 @@ const anthropic = (status: number, type: string, message: string) =>
   `${status} ${JSON.stringify({ type: "error", error: { type, message } })}`;
 const failed = (errorMessage: string, extra: Record<string, unknown> = {}) => ({ stopReason: "error", errorMessage, ...extra });
 
+describe("classifyModelRefusal (smarty-dev#14952)", () => {
+  it("recognizes the exact owned error text or Pi's structured raw stop reason, only on errors", () => {
+    expect(classifyModelRefusal({ stopReason: "error", errorMessage: "The model refused to complete the request" }))
+      .toEqual({ kind: "model-refusal" });
+    expect(classifyModelRefusal({ stopReason: "error", rawStopReason: "refusal", errorMessage: "private stop detail" }))
+      .toEqual({ kind: "model-refusal" });
+    expect(classifyModelRefusal({ stopReason: "error", errorMessage: "The model refused to complete the request: more" })).toBeUndefined();
+    expect(classifyModelRefusal({ stopReason: "stop", rawStopReason: "refusal" })).toBeUndefined();
+  });
+});
+
 describe("classifyProviderError (smarty-dev#8742)", () => {
+  it("classifies refusals and Pi's explicit non-retryable recovery without provider text", () => {
+    expect(classifyProviderError(failed("private refusal detail", { rawStopReason: "refusal" })))
+      .toMatchObject({ retryable: false, short: "model refusal", basis: "diagnostic" });
+    expect(classifyProviderError(failed("private network diagnostic", { recovery: { retryable: false } })))
+      .toMatchObject({ retryable: false, short: "non-retryable", basis: "diagnostic" });
+  });
+
   it("ignores turns that did not fail", () => {
     expect(classifyProviderError(undefined)).toBeUndefined();
     expect(classifyProviderError({ stopReason: "stop" })).toBeUndefined();

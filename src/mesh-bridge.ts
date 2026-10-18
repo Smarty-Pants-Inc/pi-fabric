@@ -16,10 +16,12 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { readMeshStateMovedMarker } from "./mesh/backend-fence.js";
-import { DEFAULT_CALL_TIMEOUT_MS, DEFAULT_FACTORY_RATE, MeshBridge, RemoteBridgeSide, serveBridgeAgent, StoreBridgeSide, validBridgeName } from "./mesh/bridge.js";
+import { BRIDGE_STALL_ALARM_TOPIC, DEFAULT_CALL_TIMEOUT_MS, DEFAULT_FACTORY_RATE, MeshBridge, RemoteBridgeSide,
+  serveBridgeAgent, StoreBridgeSide, validBridgeName, type BridgeStallAlarm } from "./mesh/bridge.js";
 import { BridgeRelayUnavailableError, startBridgeRelay } from "./mesh/bridge-relay.js";
 import { BridgeHandoffRefusedError, BridgeHandoffUsageError, handOffNativeIdentity, handoffRootId, listHandoffs, revokeHandoff } from "./mesh/bridge-handoff.js";
-import { MeshStore, type MeshStoreOptions } from "./mesh/store.js";
+import { MeshStore, meshAlarmRecipient, type MeshStoreOptions } from "./mesh/store.js";
+import { systemdWatchdogNotify } from "./mesh/systemd-watchdog.js";
 
 // Fabric's defaults for mesh.maxEventBytes and mesh.maxReadEvents (src/config.ts).
 const MAX_EVENT_BYTES = 256 * 1024;
@@ -195,6 +197,17 @@ export const runBridge = async (
       },
       stopMs: Math.min(callTimeoutMs, 5_000),
       log,
+      notifyWatchdog: systemdWatchdogNotify,
+      publishStallAlarm: async (alarm: BridgeStallAlarm) => {
+        const to = meshAlarmRecipient();
+        if (!to) {
+          log("stall alarm has no configured mesh alarm session recipient");
+          return;
+        }
+        await local.store.publish({ topic: BRIDGE_STALL_ALARM_TOPIC, kind: "bridge-stall",
+          from: { id: `bridge:${localName}`, name: "mesh-bridge", kind: "main" }, to,
+          text: alarm.reason, data: alarm, dedupeKey: `bridge-stall:${localName}:${remoteName}:${alarm.stallId}` });
+      },
       factoryRate,
       ...(logLevel === "debug" ? { debug: (message: string) => log(`debug: ${message}`) } : {}),
     });

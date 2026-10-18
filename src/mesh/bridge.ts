@@ -5,7 +5,7 @@ import { isMeshIncarnationPending, isMeshSnapshotRetriesExhausted, isMeshLockTim
 import fs from "node:fs";
 import path from "node:path";
 import type { Readable, Writable } from "node:stream";
-import { ownProcessIncarnation, readPhysicalHostIdentity, readFileRetrying, writeJsonAtomic } from "../core/atomic-write.js";
+import { ownProcessIncarnation, readPhysicalHostIdentity, readFileRetrying, writeFileAtomic, writeJsonAtomic } from "../core/atomic-write.js";
 import { type BridgeLeaseProcess, type FabricHostLease, type FabricMirrorLease, MIRROR_FRESH_MS, hostLeaseExpiry, hostLeasePath, hostLiveness, readHostLease, readHostLeases, removeHostLeaseIf, STATE_LEASE_RENEW_MS, writeHostLease } from "../topology/host-leases.js";
 import { meshDirectoryStamp } from "../topology/publication-generation.js";
 import type { FabricHostRecord, FabricParticipantRecord } from "../topology/types.js";
@@ -57,6 +57,33 @@ const LEGACY_POLL_MS = 250;
 const MAX_AWAITING_ACKS = 4_096;
 type Direction = "toRemote" | "toLocal";
 type DirectionWakeReason = "real" | "safety" | "grace" | "sync" | "other";
+export const BRIDGE_WATCHDOG_INTERVAL_MS = 15_000;
+export const BRIDGE_WATCHDOG_PROBE_TIMEOUT_MS = 5_000;
+export const BRIDGE_WATCHDOG_STALL_AFTER_MS = 30_000;
+export const BRIDGE_DIRECTION_STALL_AFTER_MS = 180_000;
+export const BRIDGE_STALL_ALARM_TOPIC = "fabric.alarm.bridge-stall";
+
+export interface BridgeStallAlarm {
+  v: 1;
+  host: string;
+  peer: string;
+  direction: Direction | "both";
+  lastOkToRemote: string | null;
+  lastOkToLocal: string | null;
+  stallId: string;
+  reason: string;
+  at: string;
+}
+
+let lastBridgeStallId = 0n;
+const nextBridgeStallId = (): string => {
+  const now = process.hrtime.bigint();
+  lastBridgeStallId = now > lastBridgeStallId ? now : lastBridgeStallId + 1n;
+  return lastBridgeStallId.toString();
+};
+
+/** Stable operator handoff alongside the link cursor, normalized to an absolute per-peer path. */
+export const bridgeStallReasonPath = (cursorPath: string): string => `${path.resolve(cursorPath)}.last-stall-reason`;
 /** How long a carried command's ACK may still be relayed back (smarty-dev#9751). */
 const AWAITING_ACK_MS = 15 * 60_000;
 /** A relayed ACK goes back only to one session or factory host: never an org, topic or broadcast name. */
@@ -124,8 +151,7 @@ const isIdentity = (value: unknown): value is MeshIdentity =>
 
 export const validBridgeName = (name: string): boolean => NAME_PATTERN.test(name);
 
-/** v1 allow-list: control commands and acks, well-formed work events (isWorkTopic), owner wakes, and a work host's
- * mesh-outage alarm and its recovery, only when addressed to one `session:<uuid>` (pi-fabric#893 rounds 4-5). */
+/** v1 allow-list: control commands and acks, work events, owner wakes, and session-addressed bridge/outage alarms. */
 export const isBridgedTopic = (event: Pick<MeshEvent, "topic" | "kind"> & { to?: unknown }): boolean =>
   event.topic === "fabric.control.command" ||
   event.topic === "fabric.control.ack" ||
@@ -133,6 +159,7 @@ export const isBridgedTopic = (event: Pick<MeshEvent, "topic" | "kind"> & { to?:
   (event.topic === "ops.owner" && (event.kind === "pr.wake" || event.kind === "inbox.age.alarm")) ||
   (event.topic === "ops.owner" && (event.kind === "bridge.lease.alarm" || event.kind === "bridge.lease.recovered") &&
     isMeshAlarmTarget(event.to)) ||
+  (event.topic === BRIDGE_STALL_ALARM_TOPIC && event.kind === "bridge-stall" && isMeshAlarmTarget(event.to)) ||
   (event.topic === FABRIC_MESH_OUTAGE_ALARM_TOPIC && (event.kind === "mesh-outage" || event.kind === "mesh-recovered") &&
     isMeshAlarmTarget(event.to));
 
@@ -269,6 +296,8 @@ export interface BridgePublish {
 /** One side of the bridge: the local mesh directly, or the remote one through the agent. */
 export interface BridgeSide {
   latestSequence(): Promise<number>;
+  /** Remote heartbeat read with a non-fatal deadline; a missed probe suspends watchdog notifications only. */
+  watchdogHead?(timeoutMs: number): Promise<number>;
   read(after: number): Promise<BridgeRead>;
   /** Install before the first snapshot. Changes are latched during in-flight work.
    * Watch failure is fatal. undefined selects transitional legacy-remote polling only with
@@ -2220,7 +2249,7 @@ export class RemoteBridgeSide implements BridgeSide {
     this.input.destroy();
   }
 
-  #call<T>(op: RpcOp, args?: unknown): Promise<T> {
+  #call<T>(op: RpcOp, args?: unknown, options: { timeoutMs?: number; fatalTimeout?: boolean } = {}): Promise<T> {
     if (this.#closed) return Promise.reject(this.#closed);
     // Legacy agents have one global FIFO. Negotiated agents can serve traffic while
     // mirroring, but never enqueue more topology work behind the one pending mirror.
@@ -2228,16 +2257,29 @@ export class RemoteBridgeSide implements BridgeSide {
       return Promise.reject(this.#mirrorPending.error);
     }
     const id = this.#next++;
+    const timeoutMs = options.timeoutMs ?? this.callTimeoutMs;
     return new Promise<T>((resolve, reject) => {
-      if (op === "mirror") this.#mirrorPending = { id, error: new BridgeMirrorDeferredError(false, this.callTimeoutMs) };
+      if (op === "mirror") this.#mirrorPending = { id, error: new BridgeMirrorDeferredError(false, timeoutMs) };
       const timer = setTimeout(() => {
-        if (op !== "mirror") { this.close(new Error(`Bridge agent did not answer ${op} within ${this.callTimeoutMs} ms`)); return; }
-        const error = new BridgeMirrorDeferredError(true, this.callTimeoutMs);
-        this.#mirrorPending = { id, error };
-        // Keep this one response slot: its late ACK releases the gate, but never renews a
-        // hub observation. The loop retries a NEW presence snapshot after backoff.
-        reject(error);
-      }, this.callTimeoutMs);
+        if (op === "mirror") {
+          const error = new BridgeMirrorDeferredError(true, timeoutMs);
+          this.#mirrorPending = { id, error };
+          // Keep this one response slot: its late ACK releases the gate, but never renews a
+          // hub observation. The loop retries a NEW presence snapshot after backoff.
+          reject(error);
+          return;
+        }
+        const error = new Error(`Bridge agent did not answer ${op} within ${timeoutMs} ms`);
+        if (options.fatalTimeout === false) {
+          const pending = this.#pending.get(id);
+          if (pending) {
+            this.#pending.delete(id);
+            pending.reject(error);
+          }
+          return;
+        }
+        this.close(error);
+      }, timeoutMs);
       const settle = <V>(done: (value: V) => void) => (value: V): void => {
         clearTimeout(timer);
         done(value);
@@ -2298,6 +2340,9 @@ export class RemoteBridgeSide implements BridgeSide {
   }
 
   latestSequence(): Promise<number> { return this.#call("latestSequence"); }
+  watchdogHead(timeoutMs: number): Promise<number> {
+    return this.#call("latestSequence", undefined, { timeoutMs, fatalTimeout: false });
+  }
   read(after: number): Promise<BridgeRead> { return this.#call("read", { after }); }
   latestCursor(): Promise<BridgeHead> {
     return this.#supportsTail ? this.#call("latestCursor") : this.latestSequence().then(through => ({ through }));
@@ -2381,6 +2426,15 @@ export interface MeshBridgeOptions {
   factoryRate?: FactoryRate;
   /** The clock of the once-a-minute log lines and the factory rate bound (Date.now by default; tests inject it). */
   clock?: () => number;
+  /** Bounded peer round-trip cadence; tests scale these values without adding runtime configuration. */
+  watchdogIntervalMs?: number;
+  watchdogProbeTimeoutMs?: number;
+  watchdogStallAfterMs?: number;
+  directionStallAfterMs?: number;
+  /** The one systemd notification call site, invoked after a responsive probe and at least one healthy direction. */
+  notifyWatchdog?: () => void;
+  /** The fabric.alarm bridge-stall envelope; without a publisher the durable stderr/reason-file signal remains. */
+  publishStallAlarm?: (alarm: BridgeStallAlarm) => Promise<void>;
 }
 
 export interface BridgeStepResult {
@@ -2646,6 +2700,14 @@ export class MeshBridge {
   #factoryRetryAt = Number.NEGATIVE_INFINITY;
   #factoryDeferrals = 0;
   #factoryLoggedAt = Number.NEGATIVE_INFINITY;
+  #lastCursorAfter: Partial<Record<Direction, number>> = {};
+  #directionPendingSince: Partial<Record<Direction, number>> = {};
+  #lastOkToRemote: number | undefined;
+  #lastOkToLocal: number | undefined;
+  #lastRoundTripAt: number | undefined;
+  #stallActive = false;
+  #watchdogTask: Promise<void> | undefined;
+  #watchdogWake: (() => void) | undefined;
 
   constructor(readonly options: MeshBridgeOptions) {
     for (const name of [options.localName, options.remoteName]) {
@@ -2654,6 +2716,11 @@ export class MeshBridge {
     if (options.localName === options.remoteName) throw new Error("Bridge side names must differ");
     if (options.membershipRetryMs !== undefined && !(Number.isSafeInteger(options.membershipRetryMs) && options.membershipRetryMs > 0)) {
       throw new Error("membershipRetryMs needs a positive integer");
+    }
+    for (const [name, value] of Object.entries({ watchdogIntervalMs: options.watchdogIntervalMs,
+      watchdogProbeTimeoutMs: options.watchdogProbeTimeoutMs, watchdogStallAfterMs: options.watchdogStallAfterMs,
+      directionStallAfterMs: options.directionStallAfterMs })) {
+      if (value !== undefined && !(Number.isSafeInteger(value) && value > 0)) throw new Error(`${name} needs a positive integer`);
     }
     const given = options.factoryRate ?? DEFAULT_FACTORY_RATE;
     const rate: Required<FactoryRate> = {
@@ -2844,6 +2911,7 @@ export class MeshBridge {
     }
     if (saved) {
       this.#cursor = saved;
+      this.#lastCursorAfter = { toRemote: saved.toRemote.after, toLocal: saved.toLocal.after };
     } else {
       const [localHead, remoteHead]: [BridgeHead, BridgeHead] = await Promise.all([
         local.latestCursor?.() ?? local.latestSequence().then(through => ({ through })),
@@ -2861,7 +2929,11 @@ export class MeshBridge {
     // Reconcile against the destination under its lock: unchanged digests skip state writes,
     // but lost records must be recreated and missing sources must not have their lease renewed.
     await this.syncPresence();
-    if (!this.#stopped) this.#ready = true;
+    if (!this.#stopped) {
+      this.#ready = true;
+      this.#lastRoundTripAt = Date.now();
+      this.#clearStallReason();
+    }
   }
 
   /**
@@ -2907,6 +2979,134 @@ export class MeshBridge {
   #save(): void {
     fs.mkdirSync(path.dirname(this.options.cursorPath), { recursive: true, mode: 0o700 });
     writeJsonAtomic(this.options.cursorPath, this.#cursor, { mode: 0o600, durable: true });
+    if (!this.#cursor) return;
+    const now = Date.now();
+    for (const direction of ["toRemote", "toLocal"] as const) {
+      const after = this.#cursor[direction].after;
+      const previous = this.#lastCursorAfter[direction];
+      this.#lastCursorAfter[direction] = after;
+      if (previous === undefined || after > previous) this.#noteDirectionSuccess(direction, now);
+    }
+  }
+
+  #noteDirectionSuccess(direction: Direction, at: number): void {
+    if (direction === "toRemote") this.#lastOkToRemote = at;
+    else this.#lastOkToLocal = at;
+    delete this.#directionPendingSince[direction];
+  }
+
+  #clearStallReason(): void {
+    try { writeFileAtomic(bridgeStallReasonPath(this.options.cursorPath), "", { mode: 0o600, durable: true }); }
+    catch { this.#log("could not clear the previous bridge stall reason file"); }
+  }
+
+  #recordStallReason(line: string): void {
+    this.#log(line.slice("mesh-bridge: ".length));
+    try { writeFileAtomic(bridgeStallReasonPath(this.options.cursorPath), `${line}\n`, { mode: 0o600, durable: true }); }
+    catch { this.#log("could not atomically write the bridge stall reason file"); }
+  }
+
+  async #raiseStall(direction: Direction | "both", reason: string, fatal: boolean): Promise<void> {
+    if (!this.#stallActive) {
+      this.#stallActive = true;
+      const atMs = Date.now();
+      const at = new Date(atMs).toISOString();
+      const safeReason = reason.replace(/[\r\n]/g, " ");
+      const alarm: BridgeStallAlarm = {
+        v: 1, host: this.options.localName, peer: this.options.remoteName, direction,
+        lastOkToRemote: this.#lastOkToRemote === undefined ? null : new Date(this.#lastOkToRemote).toISOString(),
+        lastOkToLocal: this.#lastOkToLocal === undefined ? null : new Date(this.#lastOkToLocal).toISOString(),
+        stallId: nextBridgeStallId(), reason: safeReason, at,
+      };
+      this.#recordStallReason(`mesh-bridge: stall v1 host=${alarm.host} peer=${alarm.peer} direction=${alarm.direction} at=${alarm.at} ` +
+        `lastOkToRemote=${alarm.lastOkToRemote ?? "never"} lastOkToLocal=${alarm.lastOkToLocal ?? "never"} ` +
+        `stallId=${alarm.stallId} reason=${alarm.reason} restartCount=unknown`);
+      try { await this.options.publishStallAlarm?.(alarm); }
+      catch { this.#log("could not publish fabric.alarm bridge-stall"); }
+    }
+    if (fatal) this.options.remote.close?.(new Error(`Bridge ${direction} stalled`));
+  }
+
+  async #watchdogProbe(): Promise<void> {
+    const cursor = this.#cursor;
+    if (!cursor || this.#stopped) return;
+    const timeoutMs = this.options.watchdogProbeTimeoutMs ?? BRIDGE_WATCHDOG_PROBE_TIMEOUT_MS;
+    let direction: Direction | "both" = "both";
+    try {
+      const remoteHead = await (this.options.remote.watchdogHead?.(timeoutMs) ?? this.options.remote.latestSequence());
+      const localHead = await this.options.local.latestSequence();
+      if (!Number.isSafeInteger(remoteHead) || remoteHead < 0 || !Number.isSafeInteger(localHead) || localHead < 0) {
+        throw new Error("invalid mesh sequence from watchdog probe");
+      }
+      const now = Date.now();
+      const pendingToRemote = cursor.toRemote.after < localHead;
+      const pendingToLocal = cursor.toLocal.after < remoteHead;
+      if (!pendingToRemote) this.#noteDirectionSuccess("toRemote", now);
+      else this.#directionPendingSince.toRemote ??= now;
+      if (!pendingToLocal) this.#noteDirectionSuccess("toLocal", now);
+      else this.#directionPendingSince.toLocal ??= now;
+      if (pendingToRemote) this.#wakeDirectionForProbe("toRemote");
+      if (pendingToLocal) this.#wakeDirectionForProbe("toLocal");
+
+      const directionalAfter = this.options.directionStallAfterMs ?? BRIDGE_DIRECTION_STALL_AFTER_MS;
+      if (pendingToRemote && !pendingToLocal && now - this.#directionPendingSince.toRemote! >= directionalAfter) {
+        direction = "toRemote";
+        await this.#raiseStall(direction, `no toRemote acknowledgement for ${now - this.#directionPendingSince.toRemote!} ms while toLocal remains current`, true);
+        return;
+      }
+      if (pendingToLocal && !pendingToRemote && now - this.#directionPendingSince.toLocal! >= directionalAfter) {
+        direction = "toLocal";
+        await this.#raiseStall(direction, `no toLocal event receipt for ${now - this.#directionPendingSince.toLocal!} ms while toRemote remains current`, true);
+        return;
+      }
+
+      const progressFreshMs = Math.max((this.options.watchdogIntervalMs ?? BRIDGE_WATCHDOG_INTERVAL_MS) * 2, timeoutMs * 2);
+      const toRemoteWorking = !pendingToRemote || now - (this.#lastOkToRemote ?? Number.NEGATIVE_INFINITY) <= progressFreshMs;
+      const toLocalWorking = !pendingToLocal || now - (this.#lastOkToLocal ?? Number.NEGATIVE_INFINITY) <= progressFreshMs;
+      // One live direction is enough to keep the service watchdog satisfied while the opposite
+      // direction earns its longer independent stall deadline.
+      if (toRemoteWorking || toLocalWorking) {
+        this.#lastRoundTripAt = now;
+        if (this.#stallActive) {
+          this.#stallActive = false;
+          this.#clearStallReason();
+        }
+        this.options.notifyWatchdog?.();
+        return;
+      }
+      const stalledFor = this.#lastRoundTripAt === undefined ? Infinity : now - this.#lastRoundTripAt;
+      const stallAfter = this.options.watchdogStallAfterMs ?? BRIDGE_WATCHDOG_STALL_AFTER_MS;
+      if (stalledFor >= stallAfter) {
+        direction = pendingToRemote && pendingToLocal ? "both" : pendingToRemote ? "toRemote" : "toLocal";
+        await this.#raiseStall(direction, `no successful round trip for ${stalledFor} ms`, false);
+      }
+    } catch {
+      const now = Date.now();
+      const stalledFor = this.#lastRoundTripAt === undefined ? Infinity : now - this.#lastRoundTripAt;
+      const stallAfter = this.options.watchdogStallAfterMs ?? BRIDGE_WATCHDOG_STALL_AFTER_MS;
+      if (stalledFor >= stallAfter) await this.#raiseStall(direction, `no successful round trip for ${stalledFor} ms`, false);
+    }
+  }
+
+  #wakeDirectionForProbe(direction: Direction): void {
+    this.#directionPending[direction] = true;
+    this.#directionWakeReason[direction] = "other";
+    if (!this.#directionBackoff[direction]) this.#directionWake[direction]?.("other");
+  }
+
+  async #watchdogLoop(running: () => boolean): Promise<void> {
+    while (running()) {
+      await new Promise<void>(resolve => {
+        const timer = setTimeout(() => {
+          if (this.#watchdogWake === wake) this.#watchdogWake = undefined;
+          resolve();
+        }, this.options.watchdogIntervalMs ?? BRIDGE_WATCHDOG_INTERVAL_MS);
+        timer.unref?.();
+        const wake = (): void => { clearTimeout(timer); resolve(); };
+        this.#watchdogWake = wake;
+      });
+      if (running()) await this.#watchdogProbe();
+    }
   }
 
   /** Mirror each side's live roots into the other; concurrent callers share one pass. */
@@ -3793,6 +3993,7 @@ export class MeshBridge {
             started = true;
             this.#directions = Promise.all([this.#directionLoop("toRemote", running), this.#directionLoop("toLocal", running)])
               .then(() => undefined, () => undefined);
+            this.#watchdogTask = this.#watchdogLoop(running);
           }
           const deadline = Math.min(this.#expiryAt,
             this.#leaseVersion !== this.#syncedLeaseVersion ? this.#leaseRenewAt : Infinity);
@@ -3834,9 +4035,11 @@ export class MeshBridge {
     } finally {
       ended = true;
       this.#ready = false;
+      this.#watchdogWake?.();
       for (const direction of ["toRemote", "toLocal"] as const) this.#directionWake[direction]?.();
       for (const unsubscribe of unsubscribers) unsubscribe();
       this.#notificationMode = false;
+      await this.#watchdogTask?.catch(() => undefined);
     }
   }
 
@@ -3859,8 +4062,10 @@ export class MeshBridge {
     this.#stopped = true;
     this.#ready = false;
     this.#wake?.();
+    this.#watchdogWake?.();
     for (const direction of ["toRemote", "toLocal"] as const) this.#directionWake[direction]?.();
     await within(this.#running);
+    if (this.#watchdogTask) await within(this.#watchdogTask);
     await within(this.#directions);
     await within(Promise.allSettled([...this.#relayDeliveries]));
     this.options.remote.close?.(new Error("Bridge stopped"));

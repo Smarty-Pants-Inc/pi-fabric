@@ -2,6 +2,7 @@ import { copyFabricPrincipal, type FabricPrincipal } from "../fabric-provenance.
 import { createHash } from "node:crypto";
 import { isMeshIncarnationPending, isMeshSnapshotRetriesExhausted, isMeshLockTimeout,
   MESH_INCARNATION_PENDING_CODE, MESH_SNAPSHOT_RETRIES_EXHAUSTED_CODE, MESH_LOCK_TIMEOUT_CODE, meshDeferredSummary } from "../core/atomic-write.js";
+import { performance as monotonicClock } from "node:perf_hooks";
 import fs from "node:fs";
 import path from "node:path";
 import type { Readable, Writable } from "node:stream";
@@ -53,6 +54,9 @@ const DEFAULT_MEMBERSHIP_RETRY_MS = 1_000;
 const MEMBERSHIP_RETRY_MAX_MS = 30_000;
 /** Transitional mixed-version exception only: remove after all fleet agents support changes. */
 const LEGACY_POLL_MS = 250;
+// Keep health sampling independent of caller fake timers and wall-clock adjustments.
+const setWatchdogTimeout = setTimeout;
+const clearWatchdogTimeout = clearTimeout;
 /** Commands whose ACK this link relays back to a non-participant hub sender (smarty-dev#9751). */
 const MAX_AWAITING_ACKS = 4_096;
 type Direction = "toRemote" | "toLocal";
@@ -2716,6 +2720,8 @@ export class MeshBridge {
   #directionPendingSince: Partial<Record<Direction, number>> = {};
   #lastOkToRemote: number | undefined;
   #lastOkToLocal: number | undefined;
+  #lastOkToRemoteMono: number | undefined;
+  #lastOkToLocalMono: number | undefined;
   #lastRoundTripAt: number | undefined;
   #stallActive = false;
   #watchdogTask: Promise<void> | undefined;
@@ -2943,7 +2949,7 @@ export class MeshBridge {
     await this.syncPresence();
     if (!this.#stopped) {
       this.#ready = true;
-      this.#lastRoundTripAt = Date.now();
+      this.#lastRoundTripAt = monotonicClock.now();
       this.#clearStallReason();
     }
   }
@@ -2997,13 +3003,18 @@ export class MeshBridge {
       const after = this.#cursor[direction].after;
       const previous = this.#lastCursorAfter[direction];
       this.#lastCursorAfter[direction] = after;
-      if (previous === undefined || after > previous) this.#noteDirectionSuccess(direction, now);
+      if (previous === undefined || after > previous) this.#noteDirectionSuccess(direction, now, monotonicClock.now());
     }
   }
 
-  #noteDirectionSuccess(direction: Direction, at: number): void {
-    if (direction === "toRemote") this.#lastOkToRemote = at;
-    else this.#lastOkToLocal = at;
+  #noteDirectionSuccess(direction: Direction, at: number, monotonicAt: number): void {
+    if (direction === "toRemote") {
+      this.#lastOkToRemote = at;
+      this.#lastOkToRemoteMono = monotonicAt;
+    } else {
+      this.#lastOkToLocal = at;
+      this.#lastOkToLocalMono = monotonicAt;
+    }
     delete this.#directionPendingSince[direction];
   }
 
@@ -3056,30 +3067,31 @@ export class MeshBridge {
       if (!Number.isSafeInteger(remoteHead) || remoteHead < 0 || !Number.isSafeInteger(localHead) || localHead < 0) {
         throw new Error("invalid mesh sequence from watchdog probe");
       }
-      const now = Date.now();
+      const wallNow = Date.now();
+      const now = monotonicClock.now();
       const pendingToRemote = cursor.toRemote.after < localHead;
       const pendingToLocal = cursor.toLocal.after < remoteHead;
-      if (!pendingToRemote) this.#noteDirectionSuccess("toRemote", now);
+      if (!pendingToRemote) this.#noteDirectionSuccess("toRemote", wallNow, now);
       else this.#directionPendingSince.toRemote ??= now;
-      if (!pendingToLocal) this.#noteDirectionSuccess("toLocal", now);
+      if (!pendingToLocal) this.#noteDirectionSuccess("toLocal", wallNow, now);
       else this.#directionPendingSince.toLocal ??= now;
       // Probes observe heads only. Direction loops own forwarding wakes through notifications
       // and their bounded missed-notification safety timers; a probe must not trigger membership.
       const directionalAfter = this.options.directionStallAfterMs ?? BRIDGE_DIRECTION_STALL_AFTER_MS;
       if (pendingToRemote && !pendingToLocal && now - this.#directionPendingSince.toRemote! >= directionalAfter) {
         direction = "toRemote";
-        await this.#raiseStall(direction, `no toRemote acknowledgement for ${now - this.#directionPendingSince.toRemote!} ms while toLocal remains current`, true);
+        await this.#raiseStall(direction, `no toRemote acknowledgement for ${Math.floor(now - this.#directionPendingSince.toRemote!)} ms while toLocal remains current`, true);
         return;
       }
       if (pendingToLocal && !pendingToRemote && now - this.#directionPendingSince.toLocal! >= directionalAfter) {
         direction = "toLocal";
-        await this.#raiseStall(direction, `no toLocal event receipt for ${now - this.#directionPendingSince.toLocal!} ms while toRemote remains current`, true);
+        await this.#raiseStall(direction, `no toLocal event receipt for ${Math.floor(now - this.#directionPendingSince.toLocal!)} ms while toRemote remains current`, true);
         return;
       }
 
       const progressFreshMs = Math.max((this.options.watchdogIntervalMs ?? BRIDGE_WATCHDOG_INTERVAL_MS) * 2, timeoutMs * 2);
-      const toRemoteWorking = !pendingToRemote || now - (this.#lastOkToRemote ?? Number.NEGATIVE_INFINITY) <= progressFreshMs;
-      const toLocalWorking = !pendingToLocal || now - (this.#lastOkToLocal ?? Number.NEGATIVE_INFINITY) <= progressFreshMs;
+      const toRemoteWorking = !pendingToRemote || now - (this.#lastOkToRemoteMono ?? Number.NEGATIVE_INFINITY) <= progressFreshMs;
+      const toLocalWorking = !pendingToLocal || now - (this.#lastOkToLocalMono ?? Number.NEGATIVE_INFINITY) <= progressFreshMs;
       // One live direction is enough to keep the service watchdog satisfied while the opposite
       // direction earns its longer independent stall deadline.
       if (toRemoteWorking || toLocalWorking) {
@@ -3091,7 +3103,7 @@ export class MeshBridge {
         this.options.notifyWatchdog?.();
         return;
       }
-      const stalledFor = this.#lastRoundTripAt === undefined ? Infinity : now - this.#lastRoundTripAt;
+      const stalledFor = this.#lastRoundTripAt === undefined ? Infinity : Math.floor(now - this.#lastRoundTripAt);
       const stallAfter = this.options.watchdogStallAfterMs ?? BRIDGE_WATCHDOG_STALL_AFTER_MS;
       if (stalledFor >= stallAfter) {
         direction = pendingToRemote && pendingToLocal ? "both" : pendingToRemote ? "toRemote" : "toLocal";
@@ -3099,8 +3111,8 @@ export class MeshBridge {
       }
     } catch {
       if (this.#stopped) return;
-      const now = Date.now();
-      const stalledFor = this.#lastRoundTripAt === undefined ? Infinity : now - this.#lastRoundTripAt;
+      const now = monotonicClock.now();
+      const stalledFor = this.#lastRoundTripAt === undefined ? Infinity : Math.floor(now - this.#lastRoundTripAt);
       const stallAfter = this.options.watchdogStallAfterMs ?? BRIDGE_WATCHDOG_STALL_AFTER_MS;
       if (stalledFor >= stallAfter) await this.#raiseStall(direction, `no successful round trip for ${stalledFor} ms`, false);
     }
@@ -3109,12 +3121,12 @@ export class MeshBridge {
   async #watchdogLoop(running: () => boolean): Promise<void> {
     while (running()) {
       await new Promise<void>(resolve => {
-        const timer = setTimeout(() => {
+        const timer = setWatchdogTimeout(() => {
           if (this.#watchdogWake === wake) this.#watchdogWake = undefined;
           resolve();
         }, this.options.watchdogIntervalMs ?? BRIDGE_WATCHDOG_INTERVAL_MS);
         timer.unref?.();
-        const wake = (): void => { clearTimeout(timer); resolve(); };
+        const wake = (): void => { clearWatchdogTimeout(timer); resolve(); };
         this.#watchdogWake = wake;
       });
       if (running()) await this.#watchdogProbe();
@@ -4005,7 +4017,7 @@ export class MeshBridge {
             started = true;
             this.#directions = Promise.all([this.#directionLoop("toRemote", running), this.#directionLoop("toLocal", running)])
               .then(() => undefined, () => undefined);
-            if (this.options.notifyWatchdog || this.options.publishStallAlarm) this.#watchdogTask = this.#watchdogLoop(running);
+            this.#watchdogTask = this.#watchdogLoop(running);
           }
           const deadline = Math.min(this.#expiryAt,
             this.#leaseVersion !== this.#syncedLeaseVersion ? this.#leaseRenewAt : Infinity);

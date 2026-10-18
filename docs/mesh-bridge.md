@@ -66,7 +66,7 @@ existing events and mirrors root presence. There is no new store or protocol.
   observation). Without a fresh bridge sample, roots remain discoverable with `bridgeStale: true`
   for a precise routing error, but do not authorize bridged traffic. Traffic retains its stricter
   translated TTL and reobserves short-lease origins before forwarding. Clean stop or transport
-  failure leaves persisted projections to expire by their lease TTL; a later fresh snapshot
+  failure leaves persisted projections in place to expire by their lease TTL. A later fresh snapshot
   reconciles origins that no longer report a live native lease.
 - Nothing else crosses beyond the routes above. This excludes `github.*`, actor output, state and
   cache keys, and agent and actor participants.
@@ -228,8 +228,8 @@ existing events and mirrors root presence. There is no new store or protocol.
   A late answer opens the gate for a new presence snapshot; it does not renew the old snapshot's
   freshness. The agent stamps mirror arrival time before either lane's dispatch wait.
   Non-mirror timeouts, transport/watch failures and permanent late mirror rejections remain
-  fatal. On stop, the bridge fences future local mirror writes and ends remote stdin cleanly;
-  persisted mirrors expire by lease TTL rather than being withdrawn. The hub reaps a transport
+  fatal. On stop, the bridge fences future local mirror writes and ends remote stdin cleanly.
+  Persisted mirrors expire by lease TTL. The hub reaps a transport
   child after clean EOF grace (SIGTERM after 2 s, then SIGKILL 500 ms later if needed).
 - An allow-listed event that is not addressed across (its recipient is not on the other side) is
   not forwarded. Each one is a debug line (`--log-level debug`), and the bridge logs at most one

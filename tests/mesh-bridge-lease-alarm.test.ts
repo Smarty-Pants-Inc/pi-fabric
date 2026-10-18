@@ -71,12 +71,18 @@ async function fixture(populated: boolean, watchdog: Record<string, unknown> = {
     import { writeHostLease } from ${JSON.stringify(path.resolve("src/topology/host-leases.ts"))};
     const [role, root, cursor, populated, watchdogWire = "{}"] = process.argv.slice(2);
     const watchdog = JSON.parse(watchdogWire);
+    let wallClockOffsetMs = 0;
+    if (role === "bridge") {
+      const realDateNow = Date.now.bind(Date);
+      Date.now = () => realDateNow() + wallClockOffsetMs;
+    }
     const store = new MeshStore(root, 64 * 1024, 100);
     const send = value => process.send?.(value);
     process.on("uncaughtException", error => { send({ kind: "failure", error: String(error.stack) }); process.exit(1); });
     process.on("unhandledRejection", error => { send({ kind: "failure", error: String(error?.stack || error) }); process.exit(1); });
     let gates = [];
     process.on("message", message => {
+      if (message.op === "wall-clock-offset") wallClockOffsetMs = message.offsetMs;
       if (message.op === "pause") { gates.forEach(gate => gate.paused = true); send({ kind: "paused" }); }
       if (message.op === "resume" || message.op === "shutdown") {
         gates.forEach(gate => { gate.paused = false; for (const bytes of gate.queued.splice(0)) gate.push(bytes); gate.bytes = 0; });
@@ -124,12 +130,14 @@ async function fixture(populated: boolean, watchdog: Record<string, unknown> = {
       const bridge = new MeshBridge({ localName: "hub", remoteName: "far", local, remote, cursorPath: cursor,
         watchdogIntervalMs: watchdog.intervalMs, watchdogProbeTimeoutMs: watchdog.probeTimeoutMs,
         watchdogStallAfterMs: watchdog.stallAfterMs, directionStallAfterMs: watchdog.directionStallAfterMs,
-        notifyWatchdog: () => send({ kind: "watchdog" }),
-        publishStallAlarm: async alarm => {
-          const event = await store.publish({ topic: BRIDGE_STALL_ALARM_TOPIC, kind: "bridge-stall",
-            from: { id: "bridge:hub", name: "mesh-bridge", kind: "main" }, to: ${JSON.stringify(owner.id)}, text: alarm.reason, data: alarm });
-          send({ kind: "stall-alarm", alarm, sequence: event.sequence });
-        },
+        ...(watchdog.callbacks === false ? {} : {
+          notifyWatchdog: () => send({ kind: "watchdog" }),
+          publishStallAlarm: async alarm => {
+            const event = await store.publish({ topic: BRIDGE_STALL_ALARM_TOPIC, kind: "bridge-stall",
+              from: { id: "bridge:hub", name: "mesh-bridge", kind: "main" }, to: ${JSON.stringify(owner.id)}, text: alarm.reason, data: alarm });
+            send({ kind: "stall-alarm", alarm, sequence: event.sequence });
+          },
+        }),
       });
       await remote.hello();
       send({ kind: "ready", pid: process.pid });
@@ -331,6 +339,33 @@ describe.skipIf(process.platform !== "linux")("mirrored lease bridge alarms via 
     expect(reason).toMatch(/^mesh-bridge: stall v1 host=.* peer=far direction=toLocal at=.* lastOkToRemote=.* lastOkToLocal=.* stallId=\d+ reason=no toLocal event receipt .* while toRemote remains current restartCount=unknown\n$/);
     expect(f.stallAlarms()).toHaveLength(1);
   }, 30_000);
+
+  it("detects a directional stall without reporting callbacks and ignores wall-clock jumps", async () => {
+    const f = await fixture(true, { callbacks: false, intervalMs: 20, probeTimeoutMs: 100,
+      stallAfterMs: 1_500, directionStallAfterMs: 500, inboundTailStall: true });
+    await changed(f.hubRoot, () => f.sample());
+    const publishedAfter = f.agentMessages.receipts.length;
+    f.agent.send({ op: "publish", event: { topic: "ops.owner", kind: "pr.wake",
+      from: { id: remoteId, name: "remote", kind: "main" }, to: owner.id, data: { path: "inbound-no-callbacks" } } });
+    await f.agentMessages.wait("published", publishedAfter);
+    await f.mesh.publish({ topic: "ops.owner", kind: "pr.wake", from: owner, to: remoteId, data: { path: "outbound-no-callbacks" } });
+    await waitFor(() => f.farMesh.read({ topic: "ops.owner", after: 0 }).some(event =>
+      (event.data as { path?: string } | undefined)?.path === "outbound-no-callbacks"));
+
+    // A forward wall-clock jump cannot make the direction appear stalled early.
+    f.bridge.send({ op: "wall-clock-offset", offsetMs: 600_000 });
+    await sleep(120);
+    expect(f.bridge.exitCode).toBeNull();
+    // A backward jump cannot mask the elapsed monotonic stall deadline.
+    f.bridge.send({ op: "wall-clock-offset", offsetMs: -600_000 });
+    await waitFor(() => f.bridge.exitCode !== null, 3_000);
+    expect(f.bridge.exitCode).toBe(1);
+    expect(f.bridge.signalCode).toBeNull();
+    expect(f.bridgeMessages.receipts.filter(item => item.kind === "watchdog" || item.kind === "stall-alarm")).toEqual([]);
+    await waitFor(() => f.agent.exitCode !== null, 3_000);
+    expect(f.agent.exitCode).toBe(0);
+    expect(f.diagnostics()).not.toMatch(/EPIPE/);
+  }, 10_000);
 
   it("does not treat a quiet but healthy direction as a stall while outbound events are acknowledged", async () => {
     const f = await fixture(true, { intervalMs: 20, probeTimeoutMs: 60, stallAfterMs: 150, directionStallAfterMs: 150 });

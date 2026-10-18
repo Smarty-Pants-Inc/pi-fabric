@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import { diagnostics } from "../core/diagnostics.js";
 import path from "node:path";
-import { writeJsonAtomic } from "../core/atomic-write.js";
+import { syncDirectoryChain, writeJsonAtomic } from "../core/atomic-write.js";
 import { processStartTime } from "../residency/process-identity.js";
 import { ownedStat, processAlive } from "../storage/scratch.js";
 import { UNRESOLVED_WORKER_FILE } from "../storage/retention.js";
@@ -23,10 +23,22 @@ import type { AgentRunResult } from "./types.js";
  *   the run's task carries this activation's id and actor.
  * Then the status record becomes the completed result, the custody files are discharged, and normal retention
  * collects the directory. Anything else keeps the veto.
+ *
+ * The close-timeout path below does not treat stderr/event logs as scope proof. New runs record a host-verified scope
+ * unit and cgroup path; older runs require an operator receipt after an explicit unit's cgroup absence is checked.
+ * Both use the same actor delivery/queue-ack boundary before removing unresolved custody.
  */
 export const ENODEV_UNRESOLVED_REASON = "Owned scope observation failed: Error: ENODEV";
 const RUN_ID = /^[a-f0-9]{32}$/;
 const MAX_FILE = 4 * 1024 * 1024;
+export const PROCESS_SCOPE_FILE = "scope.json";
+export const CLOSE_TIMEOUT_OPERATOR_FILE = "close-timeout-operator.json";
+const CLOSE_TIMEOUT_DETAIL = "Owned process worker did not confirm tree/native close within 7000ms";
+const CLOSE_TIMEOUT_SUFFIX = `execution exit unconfirmed; custody retained: ${CLOSE_TIMEOUT_DETAIL}`;
+const CLOSE_TIMEOUT_OPERATOR_REASON = (id: string): string => `Error: Agent ${id} ${CLOSE_TIMEOUT_SUFFIX}`;
+const isCloseTimeoutReason = (reason: unknown, id: string): boolean =>
+  reason === CLOSE_TIMEOUT_OPERATOR_REASON(id) || reason === CLOSE_TIMEOUT_DETAIL;
+const SCOPE_UNIT = /^(?:fabric-scope-[A-Za-z0-9]{6}|fabric-task-[1-9][0-9]*-[a-f0-9]{16})\.scope$/;
 
 // Host-only provenance: neither worker fields nor serialized checkpoints can mark a result.
 const recoveredDurableStops = new WeakSet<AgentRunResult>();
@@ -98,22 +110,199 @@ export const countUnknownEnodevStarts = (directories: readonly string[], actorId
 /** Host-authored first line of task.txt; input data cannot impersonate this manifest. */
 export const ACTOR_ACTIVATION_HEADER = "Fabric activation: ";
 
-/** The immutable activation ID, independent of whether the input is an object or array. */
-const activationOf = (directory: string): string | undefined => {
+interface ActorActivationManifest { activationId: string; actorId?: string }
+/** The immutable activation and (for new tasks) actor identity, independent of payload shape. */
+const activationManifestOf = (directory: string): ActorActivationManifest | undefined => {
   try {
     const task = fs.readFileSync(path.join(directory, "task.txt"), "utf8");
     if (task.startsWith(ACTOR_ACTIVATION_HEADER)) {
       const manifest: unknown = JSON.parse(task.split("\n", 1)[0]!.slice(ACTOR_ACTIVATION_HEADER.length));
       if (typeof manifest !== "object" || manifest === null || Array.isArray(manifest)) return undefined;
-      const { activationId, batchIds } = manifest as Record<string, unknown>;
-      return typeof activationId === "string" && activationId.length > 0 && Array.isArray(batchIds) &&
-        batchIds.length > 0 && batchIds[0] === activationId && batchIds.every(id => typeof id === "string" && id.length > 0) &&
-        new Set(batchIds).size === batchIds.length ? activationId : undefined;
+      const { activationId, actorId, batchIds } = manifest as Record<string, unknown>;
+      if (typeof activationId !== "string" || activationId.length === 0 || !Array.isArray(batchIds) ||
+          batchIds.length === 0 || batchIds[0] !== activationId || !batchIds.every(id => typeof id === "string" && id.length > 0) ||
+          new Set(batchIds).size !== batchIds.length || (actorId !== undefined && (typeof actorId !== "string" || !actorId))) return undefined;
+      return { activationId, ...(typeof actorId === "string" ? { actorId } : {}) };
     }
     // Legacy single-event tasks remain recoverable. Never fall back from a malformed manifest.
     const quoted = /^  "id": ("(?:[^"\\]|\\.)*")$/m.exec(task)?.[1];
-    return quoted === undefined ? undefined : JSON.parse(quoted) as string;
+    if (quoted === undefined) return undefined;
+    const activationId: unknown = JSON.parse(quoted);
+    return typeof activationId === "string" && activationId ? { activationId } : undefined;
   } catch { return undefined; }
+};
+const activationOf = (directory: string): string | undefined => activationManifestOf(directory)?.activationId;
+export const actorActivationFromRun = (directory: string): ActorActivationManifest | undefined => activationManifestOf(directory);
+
+export interface ProcessScopeReceipt { version: 1; runId: string; scopeUnit: string; cgroupPath: string }
+export interface CloseTimeoutOperatorIdentity { uid: number | null; user: string; pid: number; agent?: string }
+interface CloseTimeoutOperatorReceipt {
+  version: 1; runId: string; actorId: string; activationId: string; scopeUnit: string; checkedAt: number;
+  operator: CloseTimeoutOperatorIdentity;
+}
+
+const validCgroupPath = (value: unknown, scopeUnit: string): value is string => typeof value === "string" && value.startsWith("/") &&
+  !value.startsWith("//") && !/[\0\r\n]/.test(value) && path.posix.normalize(value) === value &&
+  !value.split("/").some(part => part === "." || part === "..") && path.posix.basename(value) === scopeUnit;
+const validScopeReceipt = (value: Record<string, unknown> | undefined, runId: string): value is Record<string, unknown> & ProcessScopeReceipt =>
+  value?.version === 1 && value.runId === runId && typeof value.scopeUnit === "string" && SCOPE_UNIT.test(value.scopeUnit) &&
+  validCgroupPath(value.cgroupPath, value.scopeUnit);
+
+/** The host persists the verified systemd scope identity separately from worker-writable status.json. */
+export const recordProcessScope = (directory: string, runId: string, scopeUnit: string, cgroupPath: string): void => {
+  if (!RUN_ID.test(runId) || path.basename(path.resolve(directory)) !== runId || !ownedStat(directory)?.isDirectory() ||
+      !SCOPE_UNIT.test(scopeUnit) || !validCgroupPath(cgroupPath, scopeUnit)) throw new Error("Invalid process scope receipt");
+  writeJsonAtomic(path.join(directory, PROCESS_SCOPE_FILE), { version: 1, runId, scopeUnit, cgroupPath } satisfies ProcessScopeReceipt, { durable: true });
+};
+
+/** Positive absence check for a recorded cgroup-v2 path; any unreadable/invalid state vetoes recovery. */
+export const scopeCgroupPathAbsent = (cgroupPath: string, cgroupRoot = "/sys/fs/cgroup"): boolean => {
+  if (!path.isAbsolute(cgroupRoot) || !cgroupPath.startsWith("/") || cgroupPath.startsWith("//") || /[\0\r\n]/.test(cgroupPath) ||
+      path.posix.normalize(cgroupPath) !== cgroupPath || cgroupPath.split("/").some(part => part === "." || part === "..")) return false;
+  const root = path.resolve(cgroupRoot), parts = cgroupPath.split("/").filter(Boolean);
+  if (parts.length === 0) return false;
+  try { const stat = fs.lstatSync(root); if (!stat.isDirectory() || stat.isSymbolicLink()) return false; } catch { return false; }
+  let current = root;
+  for (let index = 0; index < parts.length; index++) {
+    current = path.join(current, parts[index]!);
+    let stat: fs.Stats;
+    try { stat = fs.lstatSync(current); }
+    catch (error) { return (error as NodeJS.ErrnoException).code === "ENOENT"; }
+    if (stat.isSymbolicLink()) return false;
+    if (index === parts.length - 1) return false;
+    if (!stat.isDirectory()) return false;
+  }
+  return false;
+};
+const pathEntryExists = (file: string): boolean => {
+  try { fs.lstatSync(file); return true; }
+  catch (error) { return (error as NodeJS.ErrnoException).code !== "ENOENT"; }
+};
+
+/** For old runs with only an operator-supplied unit name, search the whole cgroup tree; incomplete walks veto. */
+export const scopeUnitAbsent = (scopeUnit: string, cgroupRoot = "/sys/fs/cgroup"): boolean => {
+  if (!SCOPE_UNIT.test(scopeUnit) || !path.isAbsolute(cgroupRoot)) return false;
+  const root = path.resolve(cgroupRoot);
+  try { if (!fs.lstatSync(root).isDirectory()) return false; } catch { return false; }
+  const pending = [root];
+  let visited = 0;
+  while (pending.length) {
+    const directory = pending.pop()!;
+    if (++visited > 100_000) return false;
+    let entries: fs.Dirent[];
+    try { entries = fs.readdirSync(directory, { withFileTypes: true }); } catch { return false; }
+    for (const entry of entries) {
+      if (entry.name === scopeUnit) return false;
+      if (entry.isSymbolicLink()) return false;
+      if (!entry.isDirectory()) continue;
+      pending.push(path.join(directory, entry.name));
+    }
+  }
+  return true;
+};
+
+interface CloseTimeoutFacts { id: string; statusFile: string; record: Record<string, unknown>; actorId: string; activationId: string; text: string }
+const closeTimeoutFacts = (directory: string, runId: string): CloseTimeoutFacts | undefined => {
+  if (!RUN_ID.test(runId) || path.basename(path.resolve(directory)) !== runId || !ownedStat(directory)?.isDirectory()) return undefined;
+  const marker = readJson(path.join(directory, UNRESOLVED_WORKER_FILE));
+  if (marker?.runId !== runId || !isCloseTimeoutReason(marker.reason, runId)) return undefined;
+  const statusFile = path.join(directory, "status.json"), record = readJson(statusFile);
+  if (!record || record.id !== runId || record.transport !== "process" || record.status !== "completed" ||
+      typeof record.actorId !== "string" || !record.actorId || !enodevWorkerGone(record)) return undefined;
+  const task = activationManifestOf(directory);
+  if (!task || (task.actorId !== undefined && task.actorId !== record.actorId)) return undefined;
+  const settlement = readJson(path.join(directory, "settlement.json"));
+  if (settlement?.version !== 1 || settlement.runId !== runId || settlement.outcome !== "completed" || typeof settlement.text !== "string") return undefined;
+  return { id: runId, statusFile, record, actorId: record.actorId, activationId: task.activationId, text: settlement.text };
+};
+
+const validOperatorReceipt = (value: Record<string, unknown> | undefined, facts: CloseTimeoutFacts): value is Record<string, unknown> & CloseTimeoutOperatorReceipt => {
+  const operator = value?.operator;
+  return value?.version === 1 && value.runId === facts.id && value.actorId === facts.actorId && value.activationId === facts.activationId &&
+    typeof value.scopeUnit === "string" && SCOPE_UNIT.test(value.scopeUnit) && typeof value.checkedAt === "number" && Number.isSafeInteger(value.checkedAt) &&
+    typeof operator === "object" && operator !== null && !Array.isArray(operator) &&
+    ((operator as Record<string, unknown>).uid === null || (typeof (operator as Record<string, unknown>).uid === "number" &&
+      Number.isSafeInteger((operator as Record<string, unknown>).uid))) && typeof (operator as Record<string, unknown>).user === "string" &&
+    typeof (operator as Record<string, unknown>).pid === "number" && Number.isSafeInteger((operator as Record<string, unknown>).pid) &&
+    ((operator as Record<string, unknown>).agent === undefined || typeof (operator as Record<string, unknown>).agent === "string");
+};
+
+/** One-shot operator proof for a legacy run lacking the structured launch scope record. */
+export const writeCloseTimeoutOperatorReceipt = (directory: string, runId: string, scopeUnit: string,
+  operator: CloseTimeoutOperatorIdentity, cgroupRoot = "/sys/fs/cgroup"): CloseTimeoutOperatorReceipt | undefined => {
+  if (!SCOPE_UNIT.test(scopeUnit) || !Number.isSafeInteger(operator.pid) || operator.pid !== process.pid || !operator.user ||
+      operator.uid !== (process.getuid?.() ?? null)) return undefined;
+  const facts = closeTimeoutFacts(directory, runId);
+  if (!facts) return undefined;
+  const scopeFile = path.join(directory, PROCESS_SCOPE_FILE), scope = readJson(scopeFile);
+  if (pathEntryExists(scopeFile) && (!validScopeReceipt(scope, runId) || scope.scopeUnit !== scopeUnit)) return undefined;
+  if (scope && validScopeReceipt(scope, runId) ? !scopeCgroupPathAbsent(scope.cgroupPath, cgroupRoot) : !scopeUnitAbsent(scopeUnit, cgroupRoot)) return undefined;
+  const file = path.join(directory, CLOSE_TIMEOUT_OPERATOR_FILE);
+  const existing = readJson(file);
+  if (existing) return validOperatorReceipt(existing, facts) && existing.scopeUnit === scopeUnit ? existing : undefined;
+  const receipt: CloseTimeoutOperatorReceipt = { version: 1, runId, actorId: facts.actorId, activationId: facts.activationId,
+    scopeUnit, checkedAt: Date.now(), operator };
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(file, "wx", 0o600);
+    fs.writeFileSync(fd, JSON.stringify(receipt));
+    fs.fsyncSync(fd);
+    fs.closeSync(fd); fd = undefined;
+    syncDirectoryChain(directory);
+    return receipt;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+      const raced = readJson(file);
+      return validOperatorReceipt(raced, facts) && raced.scopeUnit === scopeUnit ? raced : undefined;
+    }
+    return undefined;
+  } finally { if (fd !== undefined) fs.closeSync(fd); }
+};
+
+/** Actor recovery gate: structured launch scope for new runs, or a validated operator receipt for legacy runs. */
+export const peekCloseTimeoutRun = (directory: string, actorId: string, activationId: string,
+  cgroupRoot = "/sys/fs/cgroup"): AgentRunResult | undefined => {
+  const facts = closeTimeoutFacts(directory, path.basename(directory));
+  if (!facts || facts.actorId !== actorId || facts.activationId !== activationId) return undefined;
+  const task = activationManifestOf(directory);
+  const scopeFile = path.join(directory, PROCESS_SCOPE_FILE), scope = readJson(scopeFile);
+  let operatorReceipt: Record<string, unknown> | undefined;
+  if (pathEntryExists(scopeFile) && !validScopeReceipt(scope, facts.id)) return undefined;
+  if (validScopeReceipt(scope, facts.id)) {
+    if (task?.actorId !== actorId || !scopeCgroupPathAbsent(scope.cgroupPath, cgroupRoot)) return undefined;
+  } else {
+    operatorReceipt = readJson(path.join(directory, CLOSE_TIMEOUT_OPERATOR_FILE));
+    if (!validOperatorReceipt(operatorReceipt, facts) || !scopeUnitAbsent(operatorReceipt.scopeUnit, cgroupRoot)) return undefined;
+  }
+  return { ...facts.record, id: facts.id, status: "completed", text: facts.text, finishedAt:
+    typeof facts.record.finishedAt === "number" ? facts.record.finishedAt : Date.now() } as unknown as AgentRunResult;
+};
+
+/** Delivery receipt and commit are deliberately separate: marker removal follows the actor's queue acknowledgement. */
+export const noteCloseTimeoutDelivered = (directory: string, runId: string, activationId: string): void =>
+  writeJsonAtomic(path.join(directory, "close-timeout-delivered.json"), { version: 1, runId, activationId, deliveredAt: Date.now() }, { durable: true });
+export const closeTimeoutDelivered = (directory: string, runId: string, activationId: string): boolean => {
+  const receipt = readJson(path.join(directory, "close-timeout-delivered.json"));
+  return receipt?.version === 1 && receipt.runId === runId && receipt.activationId === activationId;
+};
+export const settleCloseTimeoutRun = (directory: string, actorId: string, activationId: string,
+  cgroupRoot = "/sys/fs/cgroup"): AgentRunResult | undefined => {
+  const run = peekCloseTimeoutRun(directory, actorId, activationId, cgroupRoot);
+  if (!run || !closeTimeoutDelivered(directory, run.id, activationId)) return undefined;
+  const facts = closeTimeoutFacts(directory, run.id);
+  if (!facts) return undefined;
+  return settle(directory, { ...facts, ...(run.text !== undefined ? { text: run.text } : {}) },
+    { status: "completed", text: facts.text, closeTimeoutRecovered: true });
+};
+
+/** Close-timeout debts of actor runs; old runs remain held until an operator receipt exists. */
+export const closeTimeoutUnresolvedRuns = (runRoot: string): string[] => {
+  let names: string[];
+  try { names = fs.readdirSync(runRoot); } catch { return []; }
+  return names.filter(name => RUN_ID.test(name)).map(name => path.join(runRoot, name)).filter(directory => {
+    const marker = readJson(path.join(directory, UNRESOLVED_WORKER_FILE));
+    return marker?.runId === path.basename(directory) && isCloseTimeoutReason(marker.reason, path.basename(directory));
+  });
 };
 
 /** Keep the restored activation in flight until the old process identity is proven gone.
@@ -153,6 +342,8 @@ export const recoverDurableActorStop = async (runRoot: string, actorId: string, 
   for (const directory of directories) {
     const id = path.basename(directory);
     if (!RUN_ID.test(id) || activationOf(directory) !== activationId) continue;
+    const unresolved = readJson(path.join(directory, UNRESOLVED_WORKER_FILE));
+    if (isCloseTimeoutReason(unresolved?.reason, id)) continue; // no stop-intent fallback may discharge this custody
     const statusFile = path.join(directory, "status.json");
     const status = readJson(statusFile);
     const intent = readRunStopIntent(directory, status);
@@ -208,6 +399,7 @@ const inspect = (directory: string, actorId: string): EnodevRun | undefined => {
   const statusFile = path.join(directory, "status.json");
   const record = readJson(statusFile);
   if (!record || record.id !== id || record.actorId !== actorId || record.transport !== "process") return undefined;
+  if (isCloseTimeoutReason(marker?.reason, id)) return undefined; // close-timeout custody requires the scope proof below
   if (!(typeof marker?.reason === "string" && marker.reason.startsWith(ENODEV_UNRESOLVED_REASON)) &&
       !readRunStopIntent(directory, record)) return undefined;
   const activationId = activationOf(directory);

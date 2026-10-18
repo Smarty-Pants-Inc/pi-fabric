@@ -30,8 +30,10 @@ import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
 import { readFileRetrying, renameAtomic, syncDirectoryChain, trackTemporary, writeJsonAtomic } from "../core/atomic-write.js";
 import { discardWorkerCompletion, type CompletionRecipient } from "./completion-journal.js";
 import { processStartTime } from "../residency/process-identity.js";
-import { countUnknownEnodevStarts, enodevDelivered, enodevUnresolvedRuns, noteEnodevDelivered, peekEnodevRun, settleEnodevRun,
-  settleGoneEnodevLaunch, settleLostEnodevRun, ownedProcess, provenGoneEnodevLaunch, goneEnodevOutcome, savedEnodevAnswer, recoverDurableActorStop, type OwnedProcess } from "./enodev-recovery.js";
+import { actorActivationFromRun, closeTimeoutDelivered, closeTimeoutUnresolvedRuns, countUnknownEnodevStarts, enodevDelivered,
+  enodevUnresolvedRuns, noteCloseTimeoutDelivered, noteEnodevDelivered, peekCloseTimeoutRun, peekEnodevRun, recordProcessScope,
+  settleCloseTimeoutRun, settleEnodevRun, settleGoneEnodevLaunch, settleLostEnodevRun, ownedProcess, provenGoneEnodevLaunch,
+  goneEnodevOutcome, savedEnodevAnswer, recoverDurableActorStop, type OwnedProcess } from "./enodev-recovery.js";
 import {
   DEFAULT_FABRIC_CONFIG,
   MAX_AGENT_TIMEOUT_MS,
@@ -760,6 +762,9 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   executionDrain?: Promise<void>;
   /** Set when the run failed because its transport lost contact: its worker may still run. */
   lostContact?: string;
+  /** Exact actor recovery is awaiting queue acknowledgement before its retained permit is released. */
+  closeTimeoutRecoveryPending?: boolean;
+  closeTimeoutWatcher?: fs.FSWatcher;
   model?: string;
   modelReason?: string;
   modelPolicyWarnings?: string[];
@@ -809,7 +814,7 @@ const createAdmissionRelease = (managed: ManagedAgent, release: () => void): (()
 
 const executionFencedRelease = (managed: ManagedAgent, release: () => void): (() => void) =>
   () => {
-    if (managed.executionExited) release();
+    if (managed.executionExited && !managed.closeTimeoutRecoveryPending) release();
     else managed.executionRelease = release;
   };
 
@@ -1360,7 +1365,8 @@ export class AgentManager {
   readonly #previousRuns = new Map<string, PreviousRun>();
   #previousRunBytes = 0;
   #enodevRuns: string[] | undefined;
-  readonly #enodevCommits = new Map<string, { directory: string; actorId: string; activationId: string }>();
+  #closeTimeoutRuns: string[] | undefined;
+  readonly #enodevCommits = new Map<string, { directory: string; actorId: string; activationId: string; kind: "enodev" | "close-timeout" }>();
   /** pi-fabric#939 round 3: runs THIS manager settled through #912's recovery (it removed their markers itself). */
   readonly #enodevSettledHere = new Set<string>();
   readonly #foregroundPrepared = new Set<string>();
@@ -3019,6 +3025,10 @@ export class AgentManager {
         while (this.#releasePaused && !request.residentStartupProbe) await this.#waitForRelease(signal);
         assertAuthorized();
         const transport = await this.#launchTransport(adapter, launch, request.residentStartupProbe === true);
+        if (transport.kind === "process" && transport.scopeUnit && transport.scopeCgroup) {
+          try { recordProcessScope(runDirectory, id, transport.scopeUnit, transport.scopeCgroup); }
+          catch (error) { diagnostics.warn("src/agents/manager.ts", `[pi-fabric] run ${id}: could not persist verified process scope receipt: ${String(error)}`); }
+        }
         const queued = this.#queued.get(id);
         const lifecycle = createAgentLifecycle<AgentRunResult>(release);
         if (queued) {
@@ -3131,6 +3141,9 @@ export class AgentManager {
               ...failedRecord(managed, "failed", String(error)),
               ...(candidate ?? {}), status: "failed",
             });
+            if (!managed.settled && managed.actorId && closeTimeoutUnresolvedRuns(this.#runRoot).includes(managed.runDirectory)) {
+              this.#watchCloseTimeoutRecovery(managed);
+            }
           });
         }
         const handle = this.#handleInfo(managed, "running");
@@ -3343,7 +3356,7 @@ export class AgentManager {
       [...this.#queued.values()].some(queued => queued.cleanupPending !== undefined) ||
       [...this.#runs.values()].some(managed => managed.transport.kind === "process" && (
         // Normal finishing still owns its tree until exact exit and settlement.
-        !managed.settled || managed.processStopPending || managed.lostContact !== undefined ||
+        !managed.settled || managed.processStopPending || managed.lostContact !== undefined || managed.closeTimeoutRecoveryPending === true ||
         (managed.settled && managed.executionExited !== true)
       ));
   }
@@ -3378,7 +3391,7 @@ export class AgentManager {
       // A normal Windows settlement owns release until its captured close/stop
       // joins. Rejection or the existing close bound permits reconciliation, not
       // release: every later scan must re-establish fresh host-owned death proof.
-      if (!managed.actorId || managed.relaunchPending || !managed.admissionRelease) continue;
+      if (!managed.actorId || managed.relaunchPending || managed.closeTimeoutRecoveryPending || !managed.admissionRelease) continue;
       const nativeFenced = managed.nativeAdmissionFenced;
       if (nativeFenced && managed.nativeAdmissionReconcile !== managed.transport) continue;
       // Every proof-triggered scan (close, admission, or native debt) can beat
@@ -4581,6 +4594,48 @@ export class AgentManager {
       [...this.#queued.values()].filter((queued) => !queued.terminal).length;
   }
 
+  /** Watch only this actor run's owner-created receipt; successful recovery still uses the normal actor queue ack. */
+  #watchCloseTimeoutRecovery(managed: ManagedAgent): void {
+    const cleanup = (): void => {
+      managed.closeTimeoutWatcher?.close();
+      delete managed.closeTimeoutWatcher;
+    };
+    const check = (): void => {
+      if (managed.settled || this.#runs.get(managed.id) !== managed) { cleanup(); return; }
+      if (this.#recoverLiveCloseTimeout(managed)) cleanup();
+    };
+    try {
+      const watcher = fs.watch(managed.runDirectory, (_event, filename) => {
+        if (filename && filename.toString() !== "close-timeout-operator.json" && filename.toString() !== "scope.json") return;
+        check();
+      });
+      managed.closeTimeoutWatcher = watcher;
+      watcher.unref();
+      watcher.on("error", cleanup);
+      check(); // close a receipt that raced watcher registration
+    } catch { /* a restart remains the safe fallback when the owner cannot watch this run directory */ }
+  }
+
+  /** Live owner pickup for the same activation: the operator receipt or structured scope proof arrived after launch. */
+  #recoverLiveCloseTimeout(managed: ManagedAgent): boolean {
+    if (!managed.actorId || managed.transport.kind !== "process" || managed.closeTimeoutRecoveryPending) return false;
+    const activation = actorActivationFromRun(managed.runDirectory);
+    if (!activation) return false;
+    const recovered = peekCloseTimeoutRun(managed.runDirectory, managed.actorId, activation.activationId);
+    if (!recovered) return false;
+    const replay = closeTimeoutDelivered(managed.runDirectory, recovered.id, activation.activationId);
+    managed.closeTimeoutRecoveryPending = true;
+    managed.executionExited = true; // the dead worker plus absent owned scope is the recovered close proof
+    delete managed.lostContact;
+    if (!managed.heldPermit && managed.admissionRelease) managed.heldPermit = managed.admissionRelease;
+    this.#enodevCommits.set(recovered.id, { directory: managed.runDirectory, actorId: managed.actorId,
+      activationId: activation.activationId, kind: "close-timeout" });
+    this.#retentionRevision++;
+    this.#settle(managed, { ...recovered, enodevRecovered: true, closeTimeoutRecovered: true,
+      ...(replay ? { enodevReplay: true, closeTimeoutReplay: true } : {}) });
+    return true;
+  }
+
   /**
    * smarty-dev#8935: a restored actor activation whose earlier run completed, but was left "execution exit
    * unconfirmed" by the pre-pi-fabric#849 ENODEV scope observation, gets that run's saved answer instead of a rerun.
@@ -4610,10 +4665,19 @@ export class AgentManager {
         }
         return settled ?? result;
       }
-      this.#enodevCommits.set(result.id, { directory, actorId: request.actorId, activationId: request.activationId });
+      this.#enodevCommits.set(result.id, { directory, actorId: request.actorId, activationId: request.activationId, kind: "enodev" });
       // A receipt means a delivery may already have happened (a crash before the queue ack): replay it idempotently.
       const replay = enodevDelivered(directory, result.id, request.activationId);
       return { ...result, enodevRecovered: true, ...(replay ? { enodevReplay: true } : {}) };
+    }
+    this.#closeTimeoutRuns ??= closeTimeoutUnresolvedRuns(this.#runRoot);
+    for (const directory of this.#closeTimeoutRuns) {
+      const result = peekCloseTimeoutRun(directory, request.actorId, request.activationId);
+      if (!result) continue;
+      this.#enodevCommits.set(result.id, { directory, actorId: request.actorId, activationId: request.activationId, kind: "close-timeout" });
+      const replay = closeTimeoutDelivered(directory, result.id, request.activationId);
+      return { ...result, enodevRecovered: true, closeTimeoutRecovered: true,
+        ...(replay ? { enodevReplay: true, closeTimeoutReplay: true } : {}) };
     }
     return undefined;
   }
@@ -4622,7 +4686,8 @@ export class AgentManager {
   noteEnodevDelivered(runId: string): boolean {
     const pending = this.#enodevCommits.get(runId);
     if (!pending) return false;
-    noteEnodevDelivered(pending.directory, runId, pending.activationId);
+    if (pending.kind === "close-timeout") noteCloseTimeoutDelivered(pending.directory, runId, pending.activationId);
+    else noteEnodevDelivered(pending.directory, runId, pending.activationId);
     return true;
   }
 
@@ -4630,21 +4695,35 @@ export class AgentManager {
   commitEnodevRecovery(runId: string): boolean {
     const pending = this.#enodevCommits.get(runId);
     if (!pending) return false;
-    const recovered = peekEnodevRun(pending.directory, pending.actorId, pending.activationId);
+    const recovered = pending.kind === "close-timeout"
+      ? peekCloseTimeoutRun(pending.directory, pending.actorId, pending.activationId)
+      : peekEnodevRun(pending.directory, pending.actorId, pending.activationId);
     if (!recovered) return false;
     // Keep the original recovery authority and obligation until both publication
     // and its bounded authenticated index exist. Disk-only results are never adopted.
-    const result = { ...recovered, enodevDelivered: true };
+    const result = { ...recovered, enodevDelivered: true,
+      ...(pending.kind === "close-timeout" ? { closeTimeoutRecovered: true } : {}) };
     const resultFile = path.join(pending.directory, MANAGER_RESULT_FILE);
     const fingerprint = writePrivateJsonAtomic(resultFile, result);
     this.#rememberPreviousRun(result, resultFile, fingerprint);
     // Pin peek's finishedAt and truncated receipt in the secondary status record
     // so settle's later observation cannot select a different terminal timestamp.
     writeJsonAtomic(path.join(pending.directory, "status.json"), result, { durable: true });
-    if (!settleEnodevRun(pending.directory, pending.actorId, pending.activationId)) return false;
+    const settled = pending.kind === "close-timeout"
+      ? settleCloseTimeoutRun(pending.directory, pending.actorId, pending.activationId)
+      : settleEnodevRun(pending.directory, pending.actorId, pending.activationId);
+    if (!settled) return false;
     this.#enodevSettledHere.add(runId);
     this.#enodevCommits.delete(runId);
     this.#enodevRuns = (this.#enodevRuns ?? []).filter(other => other !== pending.directory);
+    this.#closeTimeoutRuns = (this.#closeTimeoutRuns ?? []).filter(other => other !== pending.directory);
+    const live = this.#runs.get(runId);
+    if (live?.closeTimeoutRecoveryPending) {
+      delete live.closeTimeoutRecoveryPending;
+      this.#releaseHeldPermit(live);
+      live.executionRelease?.();
+      delete live.executionRelease;
+    }
     this.#retentionRevision++;
     this.#releaseProvenGone(); // smarty-dev#9855: same step as the settle
     return true;
@@ -6499,6 +6578,7 @@ export class AgentManager {
         continue;
       }
       if (managed.recursive) this.#nestedAgents(managed);
+      if (this.#recoverLiveCloseTimeout(managed)) return;
       this.#pruneRetainedUiRecords();
       if (record?.runnerSessionId) {
         managed.runnerSessionId = record.runnerSessionId;
@@ -6736,6 +6816,8 @@ export class AgentManager {
 
   #settle(managed: ManagedAgent, result: AgentRunResult): void {
     if (managed.settled) return;
+    managed.closeTimeoutWatcher?.close();
+    delete managed.closeTimeoutWatcher;
     this.#fenceNativeTerminalAdmission(managed, result);
     if (managed.worktreeResult) result.worktreeResult = managed.worktreeResult;
     // Every terminal path (including explicit stop and lost transport) gets a
@@ -6775,7 +6857,7 @@ export class AgentManager {
       }
     }
     this.#drainLifecycle(managed);
-    const lost = managed.transport.lostContact?.();
+    const lost = managed.closeTimeoutRecoveryPending ? undefined : managed.transport.lostContact?.();
     if (lost) this.#markLost(managed, lost);
     const forcedCleanup = managed.actorId ? 0 : managed.transport.forcedCleanupCount?.() ?? 0;
     if (!managed.actorId && forcedCleanup > 0) {

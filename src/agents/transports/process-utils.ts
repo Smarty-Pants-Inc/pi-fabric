@@ -310,7 +310,7 @@ export const spawnDetached = async (
   /** Ordinary workers need time to run their five-second execution-child cleanup. */
   termGraceMs = STOP_TERM_MS,
   executionCustodian = false,
-): Promise<{ pid: number; closed: Promise<void>; primaryExit?: Promise<void>; treeClosed?: Promise<void>; cgroup?: string; stop(): Promise<void>; isAlive(): Promise<boolean>; lostContact(): string | undefined; stopDebt?(): string | undefined; forcedCleanupCount?(): number; remainingDescendantCount?(): number; waitForClose(): Promise<void> }> => {
+): Promise<{ pid: number; closed: Promise<void>; primaryExit?: Promise<void>; treeClosed?: Promise<void>; cgroup?: string; scopeUnit?: string; scopeCgroup?: string; stop(): Promise<void>; isAlive(): Promise<boolean>; lostContact(): string | undefined; stopDebt?(): string | undefined; forcedCleanupCount?(): number; remainingDescendantCount?(): number; waitForClose(): Promise<void> }> => {
   // No PR observer or timer is created on the unscoped/unsupported path.
   const scopedLinux = Boolean(scope && process.platform === "linux");
   if (!scopedLinux) {
@@ -631,6 +631,7 @@ export const spawnDetached = async (
   let resolveTree!: () => void;
   let rejectTree!: (error: unknown) => void;
   let treeClosed: Promise<void> | undefined;
+  let scopeCgroup: string | undefined;
   const finishTree = (error?: unknown): void => {
     if (treeFinished) return;
     treeFinished = true;
@@ -712,6 +713,7 @@ export const spawnDetached = async (
         return stat.isDirectory() && stat.uid === process.getuid?.();
       };
       if (!ownedDirectory() || fs.statfsSync(directory).type !== 0x63677270) throw new Error("Scope is not our UID-owned cgroup-v2 directory");
+      scopeCgroup = cgroup;
       if (capped) {
         // Retain the admitted leaf by descriptor: later limit reads, kills and
         // membership walks never re-authorize a same-UID pathname.
@@ -920,7 +922,7 @@ export const spawnDetached = async (
   if (scope && marker) {
     // Only a verified arm may publish event custody. Validation failure keeps
     // this same worker on checked legacy monitoring, without replay or receipt.
-    const admittedHandle = async () => await armTreeObservation() ? { ...handle, treeClosed: treeClosed! } : handle;
+    const admittedHandle = async () => await armTreeObservation() ? { ...handle, treeClosed: treeClosed!, ...(scopeUnit ? { scopeUnit } : {}), ...(scopeCgroup ? { scopeCgroup } : {}) } : handle;
     try {
       const admitted = await (async (): Promise<boolean> => {
         let watcher: fs.FSWatcher | undefined;
@@ -981,7 +983,7 @@ export const spawnDetached = async (
           scratchRetained = true;
           // A receipt may already have proven the leaf empty (shim died after release).
           if (treeConfirmed) releaseScratch();
-          return { ...handle, treeClosed: treeClosed!, cgroup: boundary.relative };
+          return { ...handle, treeClosed: treeClosed!, cgroup: boundary.relative, ...(scopeUnit ? { scopeUnit } : {}), ...(scopeCgroup ? { scopeCgroup } : {}) };
         }
       }
       // Unproven capped admission: EOF makes the shim exit 125 before the worker runs.

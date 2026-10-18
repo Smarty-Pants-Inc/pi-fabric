@@ -71,6 +71,7 @@ process.stdout.write('InvocationID=${invocation}\\nMainPID=' + fs.readFileSync($
  describe("resident native systemd launch", () => {
   it("uses the literal unit and publishes creating durably before native create, then closes started with read-back identity", async () => {
     const directory = root(); const f = fixture(directory);
+    writeContext(f.context, f.capabilityCalls, "systemd=1\ncaller-verified=1\n");
     expect(systemdRunArguments("smarty-launch-resident-a-g7.service", directory, ["/bin/true"])).toContain("smarty-launch-resident-a-g7.service");
     await supervise(f.configPath, { nativeSystemdRun: f.nativeSystemdRun, nativeSystemctl: f.nativeSystemctl });
     expect(JSON.parse(fs.readFileSync(f.stateLog, "utf8"))).toMatchObject({

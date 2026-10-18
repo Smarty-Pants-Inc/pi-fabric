@@ -429,22 +429,23 @@ describe("host-only placement decider configuration", () => {
   it("requires the exact verified-caller capability at config load and leaves shadow untouched", () => {
     expect(VERIFIED_CALLER_CAPABILITY).toEqual({ probe: "--capabilities", line: "caller-verified=1" });
     for (const unavailable of [
-      nativeConfig(""), nativeConfig("caller-verified=0\n"), nativeConfig("caller-verified=1\nextra=unknown\n"),
-      nativeConfig("caller-verified=1\n", 1), nativeConfig("caller-verified=1\n", 0, 2_000),
-      nativeConfig("caller-verified=1\n", 0, 0, "unexpected stderr\n"),
+      nativeConfig(""), nativeConfig("systemd=1\ncaller-verified=0\n"), nativeConfig("systemd=1\n"),
+      nativeConfig("systemd=1\nmalformed output\ncaller-verified=1\n"),
+      nativeConfig("caller-verified=1\ncaller-verified=1\n"), nativeConfig("caller-verified=1\n", 1),
+      nativeConfig("caller-verified=1\n", 0, 2_000), nativeConfig("caller-verified=1\n", 0, 0, "unexpected stderr\n"),
     ]) {
       expect(() => normalizeFabricConfig({ agents: { placementDecider: unavailable } })).toThrow(/smarty-dev#14903/);
     }
-    const capable = nativeConfig();
+    const capable = nativeConfig("systemd=1\ncaller-verified=1\n");
     expect(nativePlacementEnforceAvailable(capable.contextCommand, undefined, capable.recordRoot)).toBe(true);
-    expect(() => normalizeFabricConfig({ agents: { placementDecider: nativeConfig() } })).not.toThrow();
+    expect(() => normalizeFabricConfig({ agents: { placementDecider: nativeConfig("systemd=1\ncaller-verified=1\n") } })).not.toThrow();
     const loadConfigured = (placementDecider: PlacementDeciderConfig): (() => unknown) => {
       const cwd = root(); const agentDir = root();
       fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ agents: { placementDecider } }));
       return () => loadFabricConfig({ cwd, agentDir, projectTrusted: true });
     };
-    expect(loadConfigured(nativeConfig("caller-verified=0\n"))).toThrow(/smarty-dev#14903/);
-    expect(loadConfigured(nativeConfig())).not.toThrow();
+    expect(loadConfigured(nativeConfig("systemd=1\ncaller-verified=0\n"))).toThrow(/smarty-dev#14903/);
+    expect(loadConfigured(nativeConfig("systemd=1\ncaller-verified=1\n"))).not.toThrow();
     expect(() => normalizeFabricConfig({ agents: { placementDecider: { ...nativeConfig("caller-verified=0\n"), mode: "shadow" } } })).not.toThrow();
   });
   it("rejects unknown modes/keys and blocks enforce config when native support is absent", () => {

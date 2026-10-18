@@ -52,8 +52,8 @@ export const nativePlacementPathAvailable = (contextCommand: readonly string[] |
     path.basename(context) === "smarty-launch-context" && executable(context) && recordDirectoryAvailable();
 };
 
-/** Probe in a bounded, shell-free, minimal environment. Any output beyond the exact
- * capability line, stderr, nonzero exit, signal, or timeout is a refusal. */
+/** Probe in a bounded, shell-free, minimal environment. Each nonempty stdout line must
+ * be key=value syntax; stderr, nonzero exit, signal, or timeout is a refusal. */
 export const nativePlacementEnforceAvailable = (contextCommand: readonly string[] | undefined, systemdRun = "/usr/bin/systemd-run", recordRoot?: string): boolean => {
   if (!nativePlacementPathAvailable(contextCommand, systemdRun, recordRoot)) return false;
   const executable = contextCommand![0]!;
@@ -64,8 +64,18 @@ export const nativePlacementEnforceAvailable = (contextCommand: readonly string[
       windowsHide: true, stdio: ["ignore", "pipe", "pipe"],
     });
     const stdout = result.stdout;
-    const exactLine = stdout === VERIFIED_CALLER_CAPABILITY.line || stdout === `${VERIFIED_CALLER_CAPABILITY.line}\n` || stdout === `${VERIFIED_CALLER_CAPABILITY.line}\r\n`;
-    return !result.error && result.status === 0 && result.signal === null && exactLine && result.stderr === "";
+    if (result.error || result.status !== 0 || result.signal !== null || typeof stdout !== "string" || result.stderr !== "") return false;
+    let verifiedCallerLines = 0;
+    for (const line of stdout.split(/\r?\n/u)) {
+      if (!line) continue;
+      const match = /^([a-z0-9-]+)=([^\s]*)$/u.exec(line);
+      if (!match) return false;
+      if (match[1] === VERIFIED_CALLER_CAPABILITY.line.split("=", 1)[0]) {
+        verifiedCallerLines++;
+        if (match[2] !== "1") return false;
+      }
+    }
+    return verifiedCallerLines === 1;
   } catch { return false; }
 };
 

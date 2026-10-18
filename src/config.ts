@@ -82,6 +82,9 @@ type FabricActorScope = "project" | "session";
 
 export type FabricPythonRuntime = "cpython" | "monty";
 
+/** Fixed root-owned grant source; no config, environment, workspace, or agent directory may redirect it. */
+export const MODEL_EXCEPTIONS_PATH = "/etc/smarty/model-exceptions.json";
+
 /** Whether pi.powershell and extension powershell overrides may run (smarty-dev#9826). */
 export type FabricPowerShellPolicy = "refuse" | "allow";
 
@@ -252,8 +255,20 @@ export interface FabricAgentConfig {
   /** Root deny baseline unioned with agent-dir additions; workspace lists are ignored. */
   deniedModels: string[];
   /** Root/default reason baseline unioned with agent-dir additions; only root may relax. */
-  modelPolicy: { requireReason: string[] };
+  modelPolicy: {
+    requireReason: string[];
+    /** Model used for indirect/default resolution when the configured model is unavailable or denied. */
+    fallbackModel?: string;
+    /** Thinking level paired with the indirect fallback model. */
+    fallbackThinking?: FabricThinking;
+  };
   deniedModelReplacement?: string;
+  /**
+   * Internal trusted host path of `model-exceptions.json` (root-owned host source).
+   * Never read from any config file: normalization always uses MODEL_EXCEPTIONS_PATH.
+   * Direct embedders may set it, but every read validates the trusted source.
+   */
+  modelExceptionsPath?: string;
   /** Host-only file instructions root. Unset = ~/.local/share/smarty-dev/factory/current/. */
   instructionsRoot?: string;
   claude: FabricClaudeRunnerConfig;
@@ -981,7 +996,11 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     transport: "process",
     processMemoryMaxBytes: DEFAULT_PROCESS_MEMORY_MAX_BYTES,
     deniedModels: [],
-    modelPolicy: { requireReason: ["gpt-6-astra"] },
+    modelExceptionsPath: MODEL_EXCEPTIONS_PATH,
+    modelPolicy: {
+      requireReason: ["gpt-6-astra", "opus", "claude"],
+      fallbackThinking: "high",
+    },
     claude: { binary: "claude" },
     veda: { binary: "veda", backend: "agy", persona: "navigator-chat" },
     thinking: DEFAULT_FABRIC_THINKING,
@@ -1503,6 +1522,11 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
   const prewalkModel = stringValue(prewalk.model);
   const prewalkThinking = isFabricThinking(prewalk.thinking) ? prewalk.thinking : undefined;
   const agentModel = stringValue(agents.model);
+  const modelPolicy = objectValue(agents.modelPolicy);
+  const fallbackModel = stringValue(modelPolicy.fallbackModel)?.trim();
+  const fallbackThinking = isFabricThinking(modelPolicy.fallbackThinking)
+    ? modelPolicy.fallbackThinking
+    : undefined;
   const wakeText = normalizeWakeTextConfig(agents.wakeText);
   const router = normalizeAgentRouterConfig(agents.router);
   const deniedModelReplacement = stringValue(agents.deniedModelReplacement)?.trim();
@@ -1787,12 +1811,15 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
             };
           })() }
         : {}),
+      modelExceptionsPath: MODEL_EXCEPTIONS_PATH,
       modelPolicy: {
-        requireReason: [...new Set((Array.isArray(objectValue(agents.modelPolicy).requireReason)
-          ? objectValue(agents.modelPolicy).requireReason as unknown[]
+        requireReason: [...new Set((Array.isArray(modelPolicy.requireReason)
+          ? modelPolicy.requireReason as unknown[]
           : DEFAULT_FABRIC_CONFIG.agents.modelPolicy.requireReason)
           .filter((model): model is string => typeof model === "string" && !!model.trim())
           .map(model => model.trim().toLowerCase()))],
+        ...(fallbackModel ? { fallbackModel } : {}),
+        fallbackThinking: fallbackThinking ?? "high",
       },
       deniedModels: [...new Set((Array.isArray(agents.deniedModels) ? agents.deniedModels : [])
         .filter((model): model is string => typeof model === "string" && !!model.trim())
@@ -2512,6 +2539,8 @@ const resolveFabricConfig = (
     merged.fullCodeMode = inheritedFullCodeMode === "true";
   }
   const normalized = normalizeFabricConfig(merged);
+  // Host-owned exceptions: no host/project config layer can supply or redirect them.
+  normalized.agents.modelExceptionsPath = MODEL_EXCEPTIONS_PATH;
   if (applyEnvironmentOverrides && process.env[FABRIC_THINKING_BOUNDS_ENV] !== undefined) {
     // A child only narrows its own bounds by the parent's; never widens them.
     const inherited = inheritedThinkingBounds();

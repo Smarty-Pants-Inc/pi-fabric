@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
 import type { ActorManager } from "../src/actors/manager.js";
 import type { GlobalActorRegistry } from "../src/actors/global-registry.js";
@@ -14,6 +14,7 @@ import { AgentsProvider } from "../src/providers/agents-provider.js";
 import { GUEST_TYPE_DECLARATIONS } from "../src/runtime/guest-types.js";
 import { typeCheckFabricCode } from "../src/runtime/type-checker.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
+import { withRootExceptionMetadata, writeModelExceptions } from "./helpers/model-exceptions.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { checkedSeed, completedBranchPrefix, snippetTask } from "../src/agents/fork-seed.js";
 import { writeForkSession } from "../src/agents/handoff.js";
@@ -27,9 +28,22 @@ const roots: string[] = [];
 const managers: AgentManager[] = [];
 const savedPolicy = process.env.PI_FABRIC_WRITE_POLICY;
 const savedLineage = process.env.PI_FABRIC_LINEAGE;
+const trustedExceptionFixturePaths = new Set<string>();
+const realAdmitModelException = AgentManager.prototype.admitModelException;
+let restoreAdmissionFixture: (() => void) | undefined;
+beforeEach(() => {
+  trustedExceptionFixturePaths.clear();
+  const admission = vi.spyOn(AgentManager.prototype, "admitModelException").mockImplementation(function (this: AgentManager, ...args) {
+    const file = this.config.modelExceptionsPath;
+    if (!file || !trustedExceptionFixturePaths.has(file)) return realAdmitModelException.apply(this, args);
+    return withRootExceptionMetadata(file, () => realAdmitModelException.apply(this, args));
+  });
+  restoreAdmissionFixture = () => admission.mockRestore();
+});
 
 afterEach(async () => {
   await Promise.all(managers.splice(0).map((manager) => manager.close()));
+  restoreAdmissionFixture?.();
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
   if (savedPolicy === undefined) delete process.env.PI_FABRIC_WRITE_POLICY;
   else process.env.PI_FABRIC_WRITE_POLICY = savedPolicy;
@@ -308,7 +322,13 @@ const createManager = (
   const root = tempRoot("pi-fabric-wp7-runs-");
   const workerPath = path.join(root, "worker.mjs");
   fs.writeFileSync(workerPath, workerSource);
-  const manager = new AgentManager(cwd, { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: 10_000, ...config }, {
+  const boundRootRecord = Object.freeze({ cwd });
+  const modelExceptionsPath = writeModelExceptions(root, ["claude-haiku-test"], boundRootRecord.cwd);
+  trustedExceptionFixturePaths.add(modelExceptionsPath);
+  const manager = new AgentManager(cwd, { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: 10_000,
+    modelExceptionsPath, claude: { ...DEFAULT_FABRIC_CONFIG.agents.claude, model: "claude/haiku" }, ...config }, {
+    rootSessionCwd: () => boundRootRecord.cwd,
+    claudeBinary: path.resolve("tests/fixtures/fake-claude.mjs"),
     workerPath,
     runRoot: path.join(root, "runs"),
     fullCodeMode: false,
@@ -483,21 +503,13 @@ describe("worker child environment contract", () => {
 describe("agents provider seeds and confinement", () => {
   const createProvider = () => {
     const requests: AgentRunRequest[] = [];
-    const manager = {
-      config: DEFAULT_FABRIC_CONFIG.agents,
-      resolveKernel: () => undefined,
-      resolvePythonRuntime: () => "monty",
-      resolveCwd: (cwd: string) => cwd,
-      childThinkingBounds: () => ({}),
-      // Fork model-policy hooks the provider consults before admission.
-      assertModelAllowed() {},
-      defaultModel: () => undefined,
-      detachSignal() {},
-      spawn: async (request: AgentRunRequest) => {
-        requests.push(request);
-        return { id: "child", name: "child", status: "running", runner: "pi", transport: "process", cwd: "/" };
-      },
-    } as unknown as AgentManager;
+    const { manager } = createManager(process.cwd());
+    vi.spyOn(manager, "spawn").mockImplementation(async (request: AgentRunRequest) => {
+      requests.push(request);
+      return { id: "child", name: "child", status: "running", runner: "pi", transport: "process", cwd: "/" };
+    });
+    // The spawn spy returns a fixture handle, not a manager-owned execution.
+    vi.spyOn(manager, "detachSignal").mockImplementation(() => {});
     const participants = {
       scheduleRefresh() {},
       self: () => ({ id: "self-participant" }),
@@ -550,7 +562,7 @@ describe("agents provider seeds and confinement", () => {
 
   it("refuses seeds without Pi, without a session, or with durable branch forks", async () => {
     const { provider, requests } = createProvider();
-    await expect(provider.invoke("spawn", { task: "x", seed: "branch", runner: "claude" }, context(callerBranch())))
+    await expect(provider.invoke("spawn", { task: "x", seed: "branch", runner: "veda", model: "cliproxyapi/gpt-6.1-sol" }, context(callerBranch())))
       .rejects.toThrow(/requires the Pi runner/);
     await expect(provider.invoke("run", { task: "x", seed: "snippet" }, context(undefined)))
       .rejects.toThrow(/requires a Pi session/);

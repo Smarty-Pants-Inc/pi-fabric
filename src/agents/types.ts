@@ -104,8 +104,14 @@ export interface AgentRunRequest {
   pythonRuntime?: FabricPythonRuntime;
   transport?: FabricAgentTransport;
   model?: string;
-  /** Caller-supplied justification for an explicit model selection. */
+  /** Host-only selection provenance; never normalized from public arguments. */
+  modelSource?: "explicit" | "default" | "inherited" | "route";
+  /** Host-only original target retained across pre-admission fallback/forwarding. */
+  modelPolicyOriginalModel?: string;
+  /** Caller-supplied justification for a protected model selection. */
   modelReason?: string;
+  /** Compatibility alias; modelReason wins when both are supplied. */
+  opusReason?: string;
   /** Veda persona name; only used when runner is "veda". */
   persona?: string;
   thinking?: FabricThinking;
@@ -343,6 +349,8 @@ export interface AgentRunResult extends AgentRunRecord {
 }
 
 export interface AgentHandleInfo {
+  /** Policy switch/audit diagnostics are present on receipts and final results. */
+  warnings?: string[];
   /** Spawn admission: unavailable discovery never blocks launch, but is explicit in the receipt. */
   modelVerification?: "verified" | "unverified";
   finalAnswerReceipt?: { id: string; recordedAt: number };
@@ -397,6 +405,8 @@ export interface AgentHandleInfo {
 }
 
 export interface AgentWorkerOptions {
+  /** Host-issued policy notices retained in every worker status record. */
+  modelPolicyWarnings?: string[];
   /** Spawn-selected Fabric package root, retained in the durable run record. */
   fabricRelease?: string;
   /** Host-created record metadata, independent of the route header/decision. */

@@ -21,9 +21,11 @@ import { rmTempSync } from "./fixtures/temp-cleanup.js";
 
 const roots: string[] = [];
 const servers: http.Server[] = [];
+const policyManagers: AgentManager[] = [];
 afterEach(async () => {
   vi.useRealTimers();
   vi.unstubAllEnvs();
+  await Promise.all(policyManagers.splice(0).map(manager => manager.close()));
   await Promise.all(servers.splice(0).map(server => new Promise<void>(resolve => server.close(() => resolve()))));
   for (const root of roots.splice(0)) rmTempSync(root);
 });
@@ -52,7 +54,14 @@ const harness = (baseUrl?: string, ids = ["a", "b", "c"]) => {
     requests.push(request);
     return { id: "child", name: "child", status: "running", runner: "pi", transport: "process", cwd: "." };
   });
-  const manager = { config: { ...DEFAULT_FABRIC_CONFIG.agents, transport: "process", deniedModels: [], model: undefined },
+  const config: AgentManager["config"] = { ...DEFAULT_FABRIC_CONFIG.agents, transport: "process", deniedModels: [] };
+  delete config.model;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-model-policy-")); roots.push(root);
+  // Keep private-brand policy methods on a real instance; only the double spawns.
+  const policyManager = new AgentManager(".", config, { runRoot: root, fullCodeMode: false });
+  policyManagers.push(policyManager);
+  const manager = { config,
+    resolveModelReasonPolicy: policyManager.resolveModelReasonPolicy.bind(policyManager),
     assertModelAllowed() {}, defaultModel: () => undefined, resolveKernel: () => undefined,
     resolvePythonRuntime: () => "monty", detachSignal() {}, spawn,
   } as unknown as AgentManager;

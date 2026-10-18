@@ -91,8 +91,16 @@ async function fixture(options: { replayAge?: number; archive?: boolean } = {}) 
   const anchor = await mesh.publish({ topic: "ordinary.anchor", from });
   fs.writeFileSync(cursorPath, JSON.stringify({ format: 1, ...mesh.latestCursor() }));
   const run = vi.fn(() => { throw new Error("Worker execution forbidden in this suite"); });
+  // Only ordinary, unbound Pi actors are created through this double. Keep the
+  // real model-policy boundary explicit rather than accepting protected targets.
+  const resolveModelReasonPolicy: AgentManager["resolveModelReasonPolicy"] = (model, reason, runner = "pi", options = {}) => {
+    if (model !== undefined || reason !== undefined || runner !== "pi") {
+      throw new Error(`Unexpected monitor fixture model/reason/runner: ${model}/${reason}/${runner}`);
+    }
+    return { model, thinking: options.thinking, fallback: false };
+  };
   const agents = { config: DEFAULT_FABRIC_CONFIG.agents, resolveKernel: () => undefined, defaultModel: () => undefined,
-    assertModelAllowed: () => {}, run, actorArchiveSources: () => new Map(), close: async () => {} } as unknown as AgentManager;
+    assertModelAllowed: () => {}, resolveModelReasonPolicy, run, actorArchiveSources: () => new Map(), close: async () => {} } as unknown as AgentManager;
   const directory = new ActorDirectory(["alpha", identity, mesh, { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 60_000 }, agents, () => {}, {
     persistent: true, rootId: identity.id, claimResidency: "session", releasePaused: true,
     meshCursorPath: cursorPath, ...(options.replayAge === undefined ? {} : { meshReplayAgeMs: options.replayAge }),

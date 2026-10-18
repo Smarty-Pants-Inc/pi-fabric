@@ -126,8 +126,8 @@ afterEach(async () => {
   finally { diagnostics.warn = originalWarn; }
 });
 
-async function ackWithoutControl(f: Fixture, payload: TransportEnvelope, source = SOURCE): Promise<void> {
-  const receipt = f.transport.deliver(payload, source);
+async function ackWithoutControl(f: Fixture, payload: TransportEnvelope, source = SOURCE, attempt = 5): Promise<void> {
+  const receipt = f.transport.deliver(payload, source, undefined, attempt);
   assert.equal(await bounded(receipt.outcome), "ack");
   assert.equal(receipt.acks, 1);
   assert.deepEqual(receipt.naks, []);
@@ -223,6 +223,54 @@ describe("Path B placement.wake receiver", () => {
     assert.equal(calls, 3);
     assert.equal(f.diskWake(), undefined);
     assert.match(warnings[0]!, /reason=unowned count=1$/);
+  });
+
+  it("NAKs a pre-checkpoint wake, then accepts the same identity after the durable queue commit", async () => {
+    let committed = false, calls = 0;
+    const f: Fixture = new Fixture({ onPlacementWake: (targetId, received): boolean | Promise<boolean> => {
+      calls++;
+      return committed ? f.persist(targetId, received) : false;
+    } });
+    const payload = envelope();
+    const early = f.transport.deliver(payload, SOURCE, undefined, 1);
+    assert.equal(await bounded(early.outcome), "nak");
+    assert.equal(early.acks, 0);
+    assert.deepEqual(early.naks, [250]);
+    assert.deepEqual(early.terms, []);
+    assert.equal(f.diskWake(), undefined);
+
+    committed = true;
+    const retry = f.transport.deliver(payload, SOURCE, () => {
+      assert.deepEqual(f.diskWake(), { targetId: TARGET, wake: wake() });
+    }, 2);
+    assert.equal(await bounded(retry.outcome), "ack");
+    assert.equal(retry.acks, 1);
+    assert.deepEqual(retry.naks, []);
+    assert.equal(calls, 2);
+    assert.equal(f.ordinaryCalls, 0);
+    assert.deepEqual(f.transport.sent, []);
+    assert.deepEqual(warnings, []);
+  });
+
+  it("counts and drops an unknown launch after bounded NAK redeliveries", async () => {
+    let calls = 0;
+    const f = new Fixture({ onPlacementWake: () => { calls++; return false; } });
+    const payload = envelope({ ...wake(), launchId: "never-checkpointed" });
+    for (let attempt = 1; attempt < 5; attempt++) {
+      const retry = f.transport.deliver(payload, SOURCE, undefined, attempt);
+      assert.equal(await bounded(retry.outcome), "nak");
+      assert.equal(retry.acks, 0);
+      assert.deepEqual(retry.naks, [250]);
+      assert.deepEqual(retry.terms, []);
+    }
+    const final = f.transport.deliver(payload, SOURCE, undefined, 5);
+    assert.equal(await bounded(final.outcome), "ack");
+    assert.equal(final.acks, 1);
+    assert.deepEqual(final.naks, []);
+    assert.equal(calls, 5);
+    assert.deepEqual(warnings, ["[pi-fabric] Dropped NATS placement wake reason=unowned count=1"]);
+    assert.ok(warnings.every(message => !message.includes("never-checkpointed") && !message.includes(TARGET)));
+    assert.equal(f.diskWake(), undefined);
   });
 
   it("NAKs a persistence exception without ACK, then retries the same identity successfully", async () => {

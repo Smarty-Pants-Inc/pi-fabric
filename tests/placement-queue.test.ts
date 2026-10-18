@@ -170,6 +170,48 @@ describe("durable actor placement QUEUE", () => {
       actorActivation: { actorId: actor.id, rootId: "session:placement-fixture" }, launchId: accepted.messageId, generation: 1 });
   });
 
+  it("retries a wake arriving after QUEUE but before checkpoint, then launches once after durable acceptance", async () => {
+    const f = new Fixture();
+    const actor = await f.actor();
+    let earlyWake: FabricPlacementWake | undefined;
+    let earlyAccepted: boolean | undefined;
+    f.decide = async request => {
+      const response = queued(request);
+      const launchId = request.placement?.launchId;
+      const generation = request.placement?.generation;
+      assert.ok(launchId);
+      assert.ok(generation);
+      earlyWake = wakeFor(launchId, generation);
+      // The authenticated receiver's first attempt lands after QUEUE exists but before
+      // ActorManager has installed or durably checkpointed its queue identity.
+      earlyAccepted = f.actors.placementWake(actor.id, earlyWake);
+      throw response;
+    };
+
+    const accepted = f.actors.tell(actor.id, SECRET_TASK);
+    await f.idle();
+    assert.equal(earlyAccepted, false);
+    assert.equal(earlyWake?.launchId, accepted.messageId);
+    assert.equal(f.requests.length, 1);
+    assert.deepEqual(f.launches, []);
+    const beforeRetry = f.checkpoint(actor.sessionFile!).items[0]!;
+    assert.equal(beforeRetry.executionStarted, false);
+    assert.equal(beforeRetry.placementQueue?.launchId, accepted.messageId);
+    assert.equal(beforeRetry.placementQueue?.generation, 1);
+    assert.deepEqual(beforeRetry.placementQueue?.wakes, []);
+
+    f.decide = f.success;
+    assert.equal(f.actors.placementWake(actor.id, earlyWake!), true);
+    const afterWake = f.checkpoint(actor.sessionFile!).items[0]!;
+    assert.deepEqual(afterWake.placementQueue?.wakes, [earlyWake]);
+    assert.equal(afterWake.placementQueue?.wakePending, true);
+    await f.until(f.actors, () => f.launches.length === 1 && f.actors.inFlightCount() === 0);
+    assert.equal(f.requests.length, 2);
+    assert.equal(f.launches.length, 1, "the redelivered wake launches the activation exactly once");
+    assert.equal(f.requests[1]!.placement?.launchId, accepted.messageId);
+    assert.equal(f.requests[1]!.placement?.generation, 1);
+  });
+
   it("requires exact local actor id, launch and generation, with durable idempotent matching receipts", async () => {
     const f = new Fixture(); const actor = await f.actor();
     const accepted = f.actors.tell(actor.id, SECRET_TASK); await f.idle();

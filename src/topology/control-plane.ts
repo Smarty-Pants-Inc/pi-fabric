@@ -414,6 +414,9 @@ export interface FabricPlacementWake {
 }
 
 type PlacementWakeDropReason = "source" | "target" | "malformed" | "unowned";
+const PLACEMENT_WAKE_RETRY_DELAY_MS = 250;
+// Match transport/nats/provision.ts so an unknown wake is counted and ACK-dropped before max_deliver.
+const PLACEMENT_WAKE_MAX_DELIVERIES = 5;
 const placementWakeId = (value: unknown): value is string =>
   typeof value === "string" && value.length > 0 && value.length <= 200 && !/[\u0000-\u001f\u007f]/.test(value);
 const placementWakeTimestamp = (value: unknown): value is string => {
@@ -445,7 +448,8 @@ export interface FabricControlPlaneOptions {
   placementWakeSourceMachine?: string | undefined;
   /** Confirm targetId is locally owned and holds this exact queued launchId+generation, then durably
    * record the wake before returning true. Must be idempotent under redelivery; a wake only re-decides
-   * placement, never authorizes a launch. False/missing drops; a storage exception retries without ACK. */
+   * placement, never authorizes a launch. False/missing is retried with bounded redelivery, then counted
+   * and dropped; a storage exception retries without ACK. */
   onPlacementWake?: (targetId: string, wake: FabricPlacementWake) => Promise<boolean> | boolean;
   /** Host-only configured inbox stream, also supplied on FILE rollback; never caller/receipt authority. */
   expectedNatsInboxStream?: string;
@@ -2518,6 +2522,16 @@ export class FabricControlPlane {
               envelope.id !== `placement-wake:${wake.launchId}:${wake.generation}:${wake.reason}`) {
             this.#reportPlacementWakeDrop("malformed");
           } else if (await this.options.onPlacementWake?.(envelope.targetId, wake) !== true) {
+            // The queue's QUEUE response can reach this owner before its matching local checkpoint.
+            // NAK false/missing receipts so that exact launch+generation is checked again after commit.
+            // JetStream attempt is durable across owner restarts; final unknown wakes are counted below.
+            const attempt = Number.isSafeInteger(delivery.attempt) && delivery.attempt > 0
+              ? delivery.attempt : PLACEMENT_WAKE_MAX_DELIVERIES;
+            if (attempt < PLACEMENT_WAKE_MAX_DELIVERIES) {
+              this.#assertNatsSession(session);
+              delivery.nak(PLACEMENT_WAKE_RETRY_DELAY_MS);
+              return;
+            }
             this.#reportPlacementWakeDrop("unowned");
           }
         }

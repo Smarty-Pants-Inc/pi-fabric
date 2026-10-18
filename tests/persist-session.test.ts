@@ -1,13 +1,14 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ExtensionContext, SessionManager } from "@earendil-works/pi-coding-agent";
 import { buildClaudeArguments } from "../src/agents/claude-cli.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { ActorManager } from "../src/actors/manager.js";
 import { GlobalActorRegistry } from "../src/actors/global-registry.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
+import { withRootExceptionMetadata, writeModelExceptions } from "./helpers/model-exceptions.js";
 import { AgentsProvider } from "../src/providers/agents-provider.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
 import { GUEST_TYPE_DECLARATIONS } from "../src/runtime/guest-types.js";
@@ -25,11 +26,25 @@ const roots: string[] = [];
 const managers: AgentManager[] = [];
 const actorManagers: ActorManager[] = [];
 const controlPlanes: FabricControlPlane[] = [];
+const hasPosixTrustMetadata = process.platform !== "win32" && typeof process.getuid === "function";
+const trustedExceptionFixturePaths = new Set<string>();
+const realAdmitModelException = AgentManager.prototype.admitModelException;
+let restoreAdmissionFixture: (() => void) | undefined;
+beforeEach(() => {
+  trustedExceptionFixturePaths.clear();
+  const admission = vi.spyOn(AgentManager.prototype, "admitModelException").mockImplementation(function (this: AgentManager, ...args) {
+    const file = this.config.modelExceptionsPath;
+    if (!file || !trustedExceptionFixturePaths.has(file)) return realAdmitModelException.apply(this, args);
+    return withRootExceptionMetadata(file, () => realAdmitModelException.apply(this, args));
+  });
+  restoreAdmissionFixture = () => admission.mockRestore();
+});
 
 afterEach(async () => {
   await Promise.all(controlPlanes.splice(0).map((c) => c.close()));
   await Promise.all(actorManagers.splice(0).map((m) => m.close()));
   await Promise.all(managers.splice(0).map((m) => m.close()));
+  restoreAdmissionFixture?.();
   for (const r of roots.splice(0)) fs.rmSync(r, { recursive: true, force: true });
 });
 
@@ -66,9 +81,17 @@ const createProvider = () => {
   const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-persist-"));
   roots.push(rootDir);
   const mesh = new MeshStore(path.join(rootDir, "mesh"), 64 * 1024, 100);
+  const boundRootRecord = Object.freeze({ cwd: rootDir });
+  const modelExceptionsPath = writeModelExceptions(rootDir, ["claude-haiku-test"], boundRootRecord.cwd);
+  trustedExceptionFixturePaths.add(modelExceptionsPath);
   const agents = new AgentManager(
-    process.cwd(), DEFAULT_FABRIC_CONFIG.agents,
+    process.cwd(), {
+      ...DEFAULT_FABRIC_CONFIG.agents,
+      modelExceptionsPath,
+      claude: { ...DEFAULT_FABRIC_CONFIG.agents.claude, model: "claude/haiku" },
+    },
     {
+      rootSessionCwd: () => boundRootRecord.cwd,
       workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
       claudeBinary: path.resolve("tests/fixtures/fake-claude.mjs"),
       vedaBinary: path.resolve("tests/fixtures/fake-veda.mjs"),
@@ -84,7 +107,7 @@ const createProvider = () => {
     matches: (id: string) => id === "main" || id === identity.id,
     info: () => ({
       id: identity.id, name: "Main" as const, kind: "main" as const, status: "idle" as const,
-      runner: "pi" as const, transport: "host" as const, cwd: process.cwd(), sessionId: "test",
+      runner: "pi" as const, transport: "host" as const, cwd: boundRootRecord.cwd, sessionId: "test",
       startedAt: 1, updatedAt: 1, pendingMessages: false, local: true,
     }),
     deliverAgent: (req: FabricMainAgentDeliveryRequest) => {
@@ -103,7 +126,7 @@ const createProvider = () => {
       format: 1, id: identity.id, kind: "root", rootId: identity.id,
       ownerHostId: identity.id, ownerIdentityId: identity.id, name: "main",
       status: "idle", runner: "pi", transport: "host", capabilities: [],
-      cwd: process.cwd(), sessionId: "test", startedAt: 1, updatedAt: 1,
+      cwd: boundRootRecord.cwd, sessionId: "test", startedAt: 1, updatedAt: 1,
       pendingMessages: false, controlProtocol: "v1", local: true, stale: false,
     }),
     peers: () => [], async refresh() {}, scheduleRefresh() {},
@@ -169,10 +192,18 @@ describe("persistSession: AgentManager runner guard", () => {
     ).rejects.toThrow("persistSession is only supported by the Claude runner");
   });
 
-  it("allows persistSession:true for the Claude runner", async () => {
+  it.runIf(hasPosixTrustMetadata)("allows persistSession:true for the Claude runner", async () => {
     const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-persist-"));
     roots.push(rootDir);
-    const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+    const boundRootRecord = Object.freeze({ cwd: rootDir });
+    const modelExceptionsPath = writeModelExceptions(rootDir, ["claude-haiku-test"], boundRootRecord.cwd);
+    trustedExceptionFixturePaths.add(modelExceptionsPath);
+    const manager = new AgentManager(process.cwd(), {
+      ...DEFAULT_FABRIC_CONFIG.agents,
+      modelExceptionsPath,
+      claude: { ...DEFAULT_FABRIC_CONFIG.agents.claude, model: "claude/haiku" },
+    }, {
+      rootSessionCwd: () => boundRootRecord.cwd,
       workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
       claudeBinary: path.resolve("tests/fixtures/fake-claude.mjs"),
       runRoot: rootDir,
@@ -181,6 +212,7 @@ describe("persistSession: AgentManager runner guard", () => {
     const result = await manager.run({
       task: "test",
       runner: "claude",
+      modelReason: "Test exception for #11864",
       persistSession: true,
       transport: "process",
     });
@@ -238,7 +270,7 @@ describe("persistSession: worker option parsing", () => {
 });
 
 describe("persistSession: provider invoke integration", () => {
-  it("agents.run preserves persistSession:true through invoke into the launch request", async () => {
+  it.runIf(hasPosixTrustMetadata)("agents.run preserves persistSession:true through invoke into the launch request", async () => {
     const { provider, agents } = createProvider();
     // Spy on manager.spawn to inspect the normalized request
     const origSpawn = agents.spawn.bind(agents);
@@ -251,13 +283,14 @@ describe("persistSession: provider invoke integration", () => {
     const result = (await provider.invoke("run", {
       task: "test",
       runner: "claude",
+      modelReason: "Test exception for #11864",
       persistSession: true,
     }, ctx)) as { status: string };
     expect(capturedRequest.persistSession).toBe(true);
     expect(result.status).toBe("completed");
   });
 
-  it("agents.spawn preserves persistSession:true through invoke into the launch request", async () => {
+  it.runIf(hasPosixTrustMetadata)("agents.spawn preserves persistSession:true through invoke into the launch request", async () => {
     const { provider, agents } = createProvider();
     const origSpawn = agents.spawn.bind(agents);
     let capturedRequest: any;
@@ -269,13 +302,14 @@ describe("persistSession: provider invoke integration", () => {
     const handle = (await provider.invoke("spawn", {
       task: "test",
       runner: "claude",
+      modelReason: "Test exception for #11864",
       persistSession: true,
     }, ctx)) as { id: string };
     expect(capturedRequest.persistSession).toBe(true);
     expect(handle.id).toBeDefined();
   });
 
-  it("agents.run does not set persistSession when omitted", async () => {
+  it.runIf(hasPosixTrustMetadata)("agents.run does not set persistSession when omitted", async () => {
     const { provider, agents } = createProvider();
     const origSpawn = agents.spawn.bind(agents);
     let capturedRequest: any;
@@ -287,6 +321,7 @@ describe("persistSession: provider invoke integration", () => {
     await provider.invoke("run", {
       task: "test",
       runner: "claude",
+      modelReason: "Test exception for #11864",
     }, ctx);
     expect(capturedRequest.persistSession).toBeUndefined();
   });

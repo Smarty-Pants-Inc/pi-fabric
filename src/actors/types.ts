@@ -145,9 +145,13 @@ export type FabricActorBindingScope = "session" | "project";
 export type FabricActorStorageScope = "session" | "project";
 
 export interface FabricActorRunBinding {
-  model?: string;
-  modelReason?: string;
-  thinking?: FabricThinking;
+  /** Host-only provenance/notices; public binding extraction must not copy these. */
+  modelSource?: "explicit" | "default" | "inherited" | "route";
+  modelPolicyOriginalModel?: string | undefined;
+  model?: string | undefined;
+  modelReason?: string | undefined;
+  opusReason?: string | undefined;
+  thinking?: FabricThinking | undefined;
 }
 
 /** Raw per-call fields from the actor's own root; omitted fields stay owner-defaulted. */
@@ -337,8 +341,13 @@ export interface FabricActorRequest extends FabricActorBatching {
   /** Host-only backend snapshot for persistent/resident sessions; not a provider argument. */
   pythonRuntime?: FabricPythonRuntime;
   model?: string;
+  /** Host-only selection provenance, not a public provider field. */
+  modelSource?: "explicit" | "default" | "inherited" | "route";
+  modelPolicyOriginalModel?: string;
   /** Named model exception (non-blank, ≤200 chars), retained on activation runs. */
   modelReason?: string;
+  /** Compatibility alias; modelReason wins when both are supplied. */
+  opusReason?: string;
   thinking?: FabricThinking;
   /** Opt-in per-activation shadow Choice; requires explicit model/effort pins. */
   routeClass?: "status-groom";

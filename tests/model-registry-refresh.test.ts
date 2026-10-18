@@ -181,34 +181,34 @@ it("fails an activation whose model is still missing with the same error", async
   });
 });
 
-// review/astra round 2 on #138: a similar stale model on the same provider must not win the fuzzy
-// fallback before the refresh runs (claude-opus-5-6 requested, only claude-opus-5-5 listed).
-const similar = ["claude-opus-5-5"];
+// Keep registry refresh coverage on ordinary GPT-6 models: these cases exercise selection and
+// refresh semantics, not Claude/Opus exception admission.
+const similar = ["gpt-6.1-sol"];
 
 it("resolves an exact model added next to a similar one after one refresh, on every path", async () => {
-  await withRuntime(["claude-opus-5-6"], async (runtime, refresh) => {
-    const handle = await runtime.agents.spawn({ task: "HANG", model: "dest/claude-opus-5-6" });
+  await withRuntime(["gpt-6.1-pro"], async (runtime, refresh) => {
+    const handle = await runtime.agents.spawn({ task: "HANG", model: "dest/gpt-6.1-pro" });
     expect(refresh).toHaveBeenCalledTimes(1);
-    expect(runtime.agents.status(handle.id)).toMatchObject({ model: "dest/claude-opus-5-6" });
+    expect(runtime.agents.status(handle.id)).toMatchObject({ model: "dest/gpt-6.1-pro" });
     await runtime.agents.stop(handle.id);
   }, similar);
-  await withRuntime(["claude-opus-5-6"], async (runtime, refresh, context) => {
-    const handle = await invoke(runtime, context, "agents.spawn", { task: "HANG", model: "dest/claude-opus-5-6" }) as { id: string };
+  await withRuntime(["gpt-6.1-pro"], async (runtime, refresh, context) => {
+    const handle = await invoke(runtime, context, "agents.spawn", { task: "HANG", model: "dest/gpt-6.1-pro" }) as { id: string };
     expect(refresh).toHaveBeenCalledTimes(1);
-    expect(runtime.agents.status(handle.id)).toMatchObject({ model: "dest/claude-opus-5-6" });
+    expect(runtime.agents.status(handle.id)).toMatchObject({ model: "dest/gpt-6.1-pro" });
     await runtime.agents.stop(handle.id);
   }, similar);
-  await withRuntime(["claude-opus-5-6"], async (runtime, refresh, context) => {
+  await withRuntime(["gpt-6.1-pro"], async (runtime, refresh, context) => {
     const actor = await invoke(runtime, context, "agents.create", {
-      name: "similar-actor", instructions: "Reply.", runner: "pi", model: "dest/claude-opus-5-6",
+      name: "similar-actor", instructions: "Reply.", runner: "pi", model: "dest/gpt-6.1-pro",
     }) as { model?: string };
     expect(refresh).toHaveBeenCalledTimes(1);
-    expect(actor.model).toBe("dest/claude-opus-5-6");
+    expect(actor.model).toBe("dest/gpt-6.1-pro");
   }, similar);
-  await withRuntime(["claude-opus-5-6"], async (runtime, refresh) => {
-    const actor = await runtime.actors.create({ name: "bare-actor", instructions: "Reply.", runner: "pi", model: "claude-opus-5-6" });
+  await withRuntime(["gpt-6.1-pro"], async (runtime, refresh) => {
+    const actor = await runtime.actors.create({ name: "bare-actor", instructions: "Reply.", runner: "pi", model: "gpt-6.1-pro" });
     expect(refresh).toHaveBeenCalledTimes(1);
-    expect(actor.model).toBe("dest/claude-opus-5-6");
+    expect(actor.model).toBe("dest/gpt-6.1-pro");
   }, similar);
 });
 
@@ -221,12 +221,12 @@ it("keeps the same error for a truly unknown exact id next to similar models aft
 });
 
 it("resolves an alias or a fuzzy query that matches today without a refresh", async () => {
-  await withRuntime(["claude-opus-5-6"], async (runtime, refresh, context) => {
+  await withRuntime(["gpt-6.1-pro"], async (runtime, refresh, context) => {
     const aliased = await invoke(runtime, context, "agents.spawn", { task: "HANG", model: "big" }) as { id: string };
-    const fuzzy = await runtime.agents.spawn({ task: "HANG", model: "opus" });
+    const fuzzy = await runtime.agents.spawn({ task: "HANG", model: "gpt" });
     expect(refresh).not.toHaveBeenCalled();
-    expect(runtime.agents.status(aliased.id)).toMatchObject({ model: "dest/claude-opus-5-5" });
-    expect(runtime.agents.status(fuzzy.id)).toMatchObject({ model: "dest/claude-opus-5-5" });
+    expect(runtime.agents.status(aliased.id)).toMatchObject({ model: "dest/gpt-6.1-sol" });
+    expect(runtime.agents.status(fuzzy.id)).toMatchObject({ model: "dest/gpt-6.1-sol" });
     for (const handle of [aliased, fuzzy]) await runtime.agents.stop(handle.id);
-  }, similar, { big: "dest/claude-opus-5-5" });
+  }, similar, { big: "dest/gpt-6.1-sol" });
 });

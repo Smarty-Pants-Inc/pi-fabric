@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { resolveActorInstructions, MAX_ACTOR_INSTRUCTIONS_FILE_BYTES } from "../src/actors/instructions-file.js";
 import { ActorManager } from "../src/actors/manager.js";
@@ -22,6 +22,22 @@ import { FabricExecutionService } from "../src/execution-service.js";
 import type { FabricMainAgentTarget } from "../src/main-agent.js";
 import type { FabricActorInfo } from "../src/actors/types.js";
 import type { FabricInvocationContext } from "../src/protocol.js";
+import { modelExceptionGrant, withRootExceptionMetadata } from "./helpers/model-exceptions.js";
+
+const hasPosixTrustMetadata = process.platform !== "win32" && typeof process.getuid === "function";
+const trustedExceptionFixturePaths = new Set<string>();
+const realAdmitModelException = AgentManager.prototype.admitModelException;
+let restoreAdmissionFixture: (() => void) | undefined;
+beforeEach(() => {
+  trustedExceptionFixturePaths.clear();
+  const admission = vi.spyOn(AgentManager.prototype, "admitModelException").mockImplementation(function (this: AgentManager, ...args) {
+    const file = this.config.modelExceptionsPath;
+    if (!file || !trustedExceptionFixturePaths.has(file)) return realAdmitModelException.apply(this, args);
+    return withRootExceptionMetadata(file, () => realAdmitModelException.apply(this, args));
+  });
+  restoreAdmissionFixture = () => admission.mockRestore();
+});
+afterEach(() => restoreAdmissionFixture?.());
 
 const digest = (bytes: string | Buffer) => createHash("sha256").update(bytes).digest("hex");
 const text = "\ufeffOwn this role — café 🚀.\r\nKeep the final newline.\n";
@@ -35,15 +51,22 @@ const fixture = async (durable = false) => {
   const identity = { id: "session:instructions", name: "Main", kind: "main" as const, sessionId: "instructions" };
   const meshRoot = path.join(root, "mesh");
   const meshConfig = { ...DEFAULT_FABRIC_CONFIG.mesh, maxEventBytes: 1024 * 1024, actorPollMs: 20 };
+  const boundRootRecord = Object.freeze({ cwd: root });
+  const modelExceptionsPath = path.join(root, "model-exceptions.json");
+  fs.writeFileSync(modelExceptionsPath, JSON.stringify({ version: 1, grants: [
+    modelExceptionGrant({ model: "cliproxyapi-anthropic/claude-opus-5-5", lane: path.basename(boundRootRecord.cwd), role: "actor:role" }),
+  ] }));
+  trustedExceptionFixturePaths.add(modelExceptionsPath);
   const mesh = new MeshStore(meshRoot, meshConfig.maxEventBytes, 100);
   const participants = new ParticipantDirectory(mesh, { enabled: true, hostId: identity.id, rootId: identity.id, identity });
   participants.registerSource(() => [{
     format: 1, id: identity.id, kind: "root", rootId: identity.id, ownerHostId: identity.id, ownerIdentityId: identity.id,
     name: "Main", status: "idle", residency: "session", runner: "pi", transport: "host", capabilities: ["fabric"],
-    cwd: root, sessionId: identity.sessionId, startedAt: 1, updatedAt: Date.now(), controlProtocol: "v1",
+    cwd: boundRootRecord.cwd, sessionId: identity.sessionId, startedAt: 1, updatedAt: Date.now(), controlProtocol: "v1",
   }]);
   await participants.start();
-  const agents = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, instructionsRoot: localRoot }, {
+  const agents = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, instructionsRoot: localRoot, modelExceptionsPath }, {
+    rootSessionCwd: () => boundRootRecord.cwd,
     runRoot: path.join(root, "runs"), workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
   });
   const localActorRoot = path.join(root, "main-actors");
@@ -51,10 +74,15 @@ const fixture = async (durable = false) => {
   const config: ResidentHostConfig = {
     format: 1, rootId: identity.id, sessionId: identity.sessionId, cwd: root, projectRoot: root, meshRoot,
     actorRoot: path.join(root, "resident-actors"), residencyRoot: residentRoot(meshRoot, identity.id), fullCodeMode: true,
-    agents: { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, instructionsRoot: factory }, mesh: meshConfig,
+    agents: { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, instructionsRoot: factory, modelExceptionsPath }, mesh: meshConfig,
     retention: DEFAULT_FABRIC_CONFIG.retention, workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
     fabricExtensionPath: path.resolve("dist/index.js"), piBinary: "pi", claudeBinary: "claude", vedaBinary: "veda",
-    piModels: { available: [{ provider: "fixture", id: "visible" }, { provider: "cliproxyapi", id: "gpt-6-astra" }], aliases: {}, defaultModel: "fixture/visible" },
+    piModels: { available: [
+      { provider: "fixture", id: "visible" },
+      { provider: "cliproxyapi", id: "gpt-6-astra" },
+      { provider: "cliproxyapi", id: "gpt-6-luna" },
+      { provider: "cliproxyapi-anthropic", id: "claude-opus-5-5" },
+    ], aliases: {}, defaultModel: "fixture/visible" },
   };
   const mainAgent = { id: identity.id, local: true, matches: (id: string) => id === identity.id } as FabricMainAgentTarget;
   const host = durable ? new ResidentHost(config, () => {}) : undefined;
@@ -98,7 +126,7 @@ for (const durable of [false, true]) describe(`${durable ? "resident" : "Main"} 
         const service = new FabricExecutionService(registry, config);
         // #436 unifies #389's createActor guard with run/spawn/setModel policy.
         // Keep the complete instructions/scope/route matrix on the shared refusal.
-        const refusal = "model cliproxyapi/gpt-6-astra requires modelReason (named exception); omit model to use the role default pi default (inherited session model), see smarty-dev#3134";
+        const refusal = /model cliproxyapi\/gpt-6-astra requires modelReason.*#2264/;
         for (const modelReason of [undefined, "", " \t\n "]) {
           const args = {
             name: "refused-astra", scope, residency: durable ? "durable" : "session",
@@ -106,14 +134,14 @@ for (const durable of [false, true]) describe(`${durable ? "resident" : "Main"} 
             ...(source === "file" ? fileSource(file) : { instructions: text }),
           };
           if (route === "direct") {
-            await expect(state.provider.invoke("createActor", args, state.context)).rejects.toMatchObject({ message: refusal });
+            await expect(state.provider.invoke("createActor", args, state.context)).rejects.toMatchObject({ message: expect.stringMatching(refusal) });
           } else {
             const result = await service.execute({
               code: `try { await agents.createActor(${JSON.stringify(args)}); return "unexpected admission"; } catch (error) { return error.message; }`,
               signal: undefined, parentToolCallId: "guest-astra-file-guard", context: state.context.extensionContext, onPartial() {},
             });
             expect(result.success, result.error).toBe(true);
-            expect(result.value).toBe(refusal);
+            expect(result.value).toEqual(expect.stringMatching(refusal));
           }
           expect(state.actors.listOwned()).toEqual([]);
           expect(state.owner.listOwned()).toEqual([]);
@@ -133,6 +161,23 @@ for (const durable of [false, true]) describe(`${durable ? "resident" : "Main"} 
         ...(source === "file" ? fileSource(file) : { instructions: text }) });
       expect(state.owner.definition(actor.id)).toMatchObject({ model: "cliproxyapi/gpt-6-astra", modelReason });
       expect(state.owner.instructions(actor.id)).toBe(text);
+    } finally { await state.close(); }
+  });
+});
+
+for (const durable of [false, true]) describe(`${durable ? "resident" : "Main"} actor file boundary (#11864)`, () => {
+  it("refuses a direct Opus actor without a reason, then accepts and records an issue-bearing opusReason", async () => {
+    const state = await fixture(durable);
+    try {
+      await expect(state.create({ model: "cliproxyapi-anthropic/claude-opus-5-5", instructions: text }))
+        .rejects.toThrow(/#2264|named exception/);
+      if (hasPosixTrustMetadata) {
+        const reason = "#11864 actor instructions exception";
+        const actor = await state.create({ model: "cliproxyapi-anthropic/claude-opus-5-5", opusReason: reason, instructions: text });
+        expect(state.owner.definition(actor.id)).toMatchObject({
+          model: "cliproxyapi-anthropic/claude-opus-5-5", modelReason: reason,
+        });
+      }
     } finally { await state.close(); }
   });
 });

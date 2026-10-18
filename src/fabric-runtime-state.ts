@@ -1265,6 +1265,12 @@ export class FabricRuntimeState {
       kernel: () => this.#config?.executor.kernel ?? "typescript",
       pythonRuntime: () => this.#config?.executor.pythonRuntime ?? "monty",
       mainAgentId,
+      rootSessionCwd: () => {
+        const root = this.#participants?.get(mainAgentId, undefined, { fresh: true });
+        return root?.kind === "root" && root.id === mainAgentId && typeof root.cwd === "string" && root.cwd.trim().length > 0
+          ? root.cwd
+          : undefined;
+      },
       fabricSessionId,
       meshRoot,
       projectRoot,

@@ -163,7 +163,7 @@ export class AgentMessageRouter {
       readonly transportKind?: "file" | "nats";
       readonly participantView?: ParticipantView | undefined;
     }) | undefined,
-    readonly resolvePiRunBinding: (binding: FabricActorRunBinding, runner: FabricAgentRunner, context: FabricInvocationContext, requiredPin?: boolean) => FabricActorRunBinding | Promise<FabricActorRunBinding>,
+    readonly resolvePiRunBinding: (binding: FabricActorRunBinding, runner: FabricAgentRunner, context: FabricInvocationContext, requiredPin?: boolean, role?: string) => FabricActorRunBinding | Promise<FabricActorRunBinding>,
     readonly residency?: Pick<ResidencyClient, "ensureActor" | "hostId"> & { options: { config: { rootId: string; meshRoot: string } } },
     readonly spawner = boundAgentSpawner(),
   ) {}
@@ -901,7 +901,7 @@ export class AgentMessageRouter {
     const { actor, participant } = target;
     const localActor = Boolean(actor && (this.actorManager.owns?.(actor.id) ?? (!participant || participant.local)));
     const binding = options.binding && context && localActor
-      ? await this.resolvePiRunBinding(options.binding, actor!.runner, context, actor!.routeClass !== undefined)
+      ? await this.resolvePiRunBinding(options.binding, actor!.runner, context, actor!.routeClass !== undefined, `actor:${actor!.name}`)
       : options.binding;
     context?.signal?.throwIfAborted();
     if (actor && localActor) {

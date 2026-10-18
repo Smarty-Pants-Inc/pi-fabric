@@ -226,6 +226,7 @@ interface ManagedActor extends FabricActorBatching {
   resolvedBinding?: FabricActorRunBinding;
   model?: string;
   modelReason?: string;
+  modelPolicyOriginalModel?: string;
   thinking?: FabricThinking;
   routeClass?: "status-groom";
   protected?: boolean;
@@ -1368,10 +1369,22 @@ export class ActorManager {
       if (!this.#prepareModelRoute) throw new Error("Actor shadow routing host unavailable");
     }
     const requestedModel = typeof request.model === "string" ? request.model.trim() : "";
-    const effectiveModel = requestedModel || this.agents.defaultModel(runner);
-    const admittedModel = effectiveModel ? await this.#resolvedModel(runner, effectiveModel, request.routeClass !== undefined) : undefined;
-    // No binding keeps actor defaults dynamic, but must still admit the current default.
-    const model = requestedModel ? admittedModel : undefined;
+    const requestedReason = request.modelReason ?? request.opusReason;
+    request = { ...request, ...(requestedReason !== undefined ? { modelReason: requestedReason } : {}) };
+    delete request.opusReason;
+    const admittedBinding = await this.#resolvedRunBindingFor(runner, {
+      model: requestedModel || this.agents.defaultModel(runner), modelReason: request.modelReason,
+      thinking: request.thinking, modelPolicyOriginalModel: request.modelPolicyOriginalModel,
+      modelSource: request.modelSource ?? (request.routeClass !== undefined ? "route" : requestedModel ? "explicit" : "default"),
+    }, request.routeClass !== undefined, false, `actor:${name}`);
+    const admittedModel = admittedBinding.model;
+    // Unchanged defaults stay dynamic; a substituted target/thinking must travel together.
+    const model = requestedModel || admittedBinding.modelPolicyOriginalModel ? admittedModel : undefined;
+    request = { ...request,
+      ...(admittedBinding.thinking ? { thinking: admittedBinding.thinking } : {}),
+      ...(admittedBinding.modelPolicyOriginalModel ? { modelPolicyOriginalModel: admittedBinding.modelPolicyOriginalModel } : {}) };
+    if (admittedBinding.modelReason !== undefined) request.modelReason = admittedBinding.modelReason;
+    else delete request.modelReason;
     const requirements = normalizeCapabilityRequirements(request.requires);
     if (requirements.length > 0 && !this.#acquireCapabilityView) {
       throw new Error("This Fabric host cannot commit actor capability requirements");
@@ -1407,6 +1420,7 @@ export class ActorManager {
       ...(pythonRuntime ? { pythonRuntime } : {}),
       ...(model ? { model } : {}),
       ...(request.modelReason !== undefined ? { modelReason: request.modelReason } : {}),
+      ...(request.modelPolicyOriginalModel ? { modelPolicyOriginalModel: request.modelPolicyOriginalModel } : {}),
       ...(request.thinking ? { thinking: request.thinking } : {}),
       ...(request.routeClass ? { routeClass: request.routeClass } : {}),
       ...(typeof request.protected === "boolean" ? { protected: request.protected } : {}),
@@ -1947,7 +1961,8 @@ export class ActorManager {
     overrides: FabricActorRunBinding = {},
   ): FabricActorRunBinding {
     this.#syncActorsFromRegistry();
-    return this.#runBinding(this.#requireActor(id), overrides);
+    const { modelSource: _source, ...binding } = this.#runBinding(this.#requireActor(id), overrides);
+    return binding;
   }
 
   /**
@@ -1980,6 +1995,7 @@ export class ActorManager {
     scope: FabricActorBindingScope = "session",
     beforeCommit?: (id: string) => void,
     modelReason?: string,
+    resolvedOpaqueModel = false,
   ): Promise<FabricActorInfo> {
     if (scope !== "session" && scope !== "project") {
       throw new Error(`Invalid Fabric actor binding scope: ${String(scope)}`);
@@ -1987,17 +2003,31 @@ export class ActorManager {
     const next = typeof model === "string" ? model.trim() : "";
     if (scope === "session") this.#syncActorsFromRegistry();
     const actor = scope === "session" ? this.#requireActor(id) : this.#requireOwnedActor(id);
+    // A passive session may bind an opaque owner key without authenticating the
+    // owner's unrelated registry. Aliases and protected selectors still resolve.
+    // Only the provider, which owns the alias table, may certify a key is not an
+    // alias. Direct setters still resolve even provider-qualified alias names.
+    const policyOnly = resolvedOpaqueModel && scope === "session" && !this.#canManage(actor.id) &&
+      this.agents.config.deniedModels.length === 0 && actor.routeClass === undefined &&
+      (actor.runner === "pi" || actor.runner === "pi-durable") && next.includes("/") &&
+      !this.agents.modelReasonRequired(next, actor.runner);
+    const thinking = scope === "session" ? this.#runBinding(actor).thinking : actor.thinking;
     const resolved = next
-      ? scope === "project" || this.#canManage(actor.id) || this.agents.config.deniedModels.length > 0
-        ? await this.#resolvedModel(actor.runner, next, actor.routeClass !== undefined)
-        : next
+      ? (await this.#resolvedRunBindingFor(actor.runner, { model: next, modelReason, thinking, modelSource: "explicit" }, actor.routeClass !== undefined, policyOnly,
+        `actor:${actor.name}`)).model
       : undefined;
     this.agents.assertModelAllowed(resolved);
     if (!resolved) {
-      const fallback = scope === "session" ? actor.model ?? this.agents.defaultModel(actor.runner)
-        : this.#bindings.get(actor.id)?.model ?? this.agents.defaultModel(actor.runner);
-      if (fallback) await this.#resolvedModel(actor.runner, fallback, actor.routeClass !== undefined);
-      else await this.agents.prepareModelForAdmission(undefined, actor.runner);
+      const inherited = scope === "session" ? actor.model : this.#bindings.get(actor.id)?.model;
+      const reason = scope === "session" ? actor.modelReason : this.#bindings.get(actor.id)?.modelReason;
+      const fallback = inherited ?? this.agents.defaultModel(actor.runner);
+      if (fallback) await this.#resolvedRunBindingFor(actor.runner, {
+        model: fallback, modelReason: reason, thinking,
+        modelSource: inherited ? "explicit" : "default",
+      }, actor.routeClass !== undefined, false, `actor:${actor.name}`);
+      else await this.agents.prepareModelWithReason(undefined, reason, actor.runner, {
+        modelSource: "default", thinking, requiredPin: actor.routeClass !== undefined, role: `actor:${actor.name}`,
+      });
     }
     // Validate both the effective view and duplicated binding/default metadata before commit.
     const preview = scope === "project"
@@ -2026,6 +2056,7 @@ export class ActorManager {
     else delete actor.model;
     if (resolved && modelReason !== undefined) actor.modelReason = modelReason;
     else delete actor.modelReason;
+    delete actor.modelPolicyOriginalModel;
     actor.updatedAt = Date.now();
     await this.#publishPresence(actor, true);
     return this.#publicInfo(actor);
@@ -4251,7 +4282,12 @@ export class ActorManager {
     // A synchronous resolver (the resident owner) rejects a hidden model here, so the caller
     // learns at once. A resolver that may refresh the registry is async: #drain resolves the
     // model again when the activation runs, and enqueue stays synchronous (smarty-dev#1830).
-    const resolving = this.#resolvedRunBinding(actor, unresolved);
+    // Check against current owner effort without making it a queued override.
+    // Foreign resolved bindings must not borrow the owner's private defaults.
+    const ownerThinking = options.binding === undefined ? this.#runBinding(actor).thinking : undefined;
+    const resolving = unresolved.model ? this.#resolvedRunBindingFor(
+      actor.runner, unresolved, actor.routeClass !== undefined, false, `actor:${actor.name}`, ownerThinking,
+    ) : unresolved;
     const binding = resolving instanceof Promise ? (resolving.catch(() => undefined), unresolved) : resolving;
     const sender = options.sender === null ? undefined : options.sender ?? processSender();
     const createdAt = Date.now();
@@ -5738,6 +5774,8 @@ export class ActorManager {
       ...(actor.runnerSessionId ? { runnerSessionId: actor.runnerSessionId } : {}),
       ...(binding.model ? { model: binding.model } : {}),
       ...(binding.modelReason !== undefined ? { modelReason: binding.modelReason } : {}),
+      ...(binding.modelSource ? { modelSource: binding.modelSource } : {}),
+      ...(binding.modelPolicyOriginalModel ? { modelPolicyOriginalModel: binding.modelPolicyOriginalModel } : {}),
       ...(binding.thinking ? { thinking: binding.thinking } : {}),
       ...(actor.tools ? { tools: actor.tools } : {}),
       ...(actor.transport ? { transport: actor.transport } : {}),
@@ -7271,6 +7309,7 @@ export class ActorManager {
       // known fields and may discard the optional last-run binding.
       ...(actor.model ? { model: actor.model } : {}),
       ...(actor.modelReason !== undefined ? { modelReason: actor.modelReason } : {}),
+      ...(actor.modelPolicyOriginalModel ? { modelPolicyOriginalModel: actor.modelPolicyOriginalModel } : {}),
       ...(actor.thinking ? { thinking: actor.thinking } : {}),
       ...(actor.resolvedBinding ? { resolvedBinding: { ...actor.resolvedBinding } } : {}),
       ...(actor.routeClass ? { routeClass: actor.routeClass } : {}),
@@ -7819,6 +7858,7 @@ export class ActorManager {
           : {}),
         ...(typeof record.model === "string" ? { model: record.model } : {}),
         ...(typeof record.modelReason === "string" ? { modelReason: record.modelReason } : {}),
+        ...(typeof record.modelPolicyOriginalModel === "string" ? { modelPolicyOriginalModel: record.modelPolicyOriginalModel } : {}),
         ...(isFabricThinking(record.thinking) ? { thinking: record.thinking } : {}),
         ...(binding ? { resolvedBinding: {
           ...(typeof binding.model === "string" ? { model: binding.model } : {}),
@@ -8678,20 +8718,65 @@ export class ActorManager {
 
   #resolvedModel(runner: FabricAgentRunner, model: string, requiredPin = false): string | Promise<string> {
     this.agents.assertModelAllowed(model, runner);
-    const resolved = (runner === "pi" || runner === "pi-durable") && this.#resolvePiModel ? this.#resolvePiModel(model, requiredPin) : model;
+    const resolved = runner !== "pi" && runner !== "pi-durable"
+      ? this.agents.prepareModelForAdmission(model, runner).then(key => {
+        if (!key) throw new ModelRoutePinError(model);
+        return key;
+      })
+      : this.#resolvePiModel ? this.#resolvePiModel(model, requiredPin) : model;
     const admit = (key: string): string => { this.agents.assertModelAllowed(key, runner); return key; };
     return resolved instanceof Promise ? resolved.then(admit) : admit(resolved);
+  }
+
+  #resolvedRunBindingFor(
+    runner: FabricAgentRunner,
+    binding: FabricActorRunBinding,
+    requiredPin = false,
+    policyOnly = false,
+    role?: string,
+    ownerThinking?: FabricThinking,
+  ): FabricActorRunBinding | Promise<FabricActorRunBinding> {
+    const reason = binding.modelReason ?? binding.opusReason;
+    const source = binding.modelSource ?? (requiredPin ? "route" : binding.model ? "explicit" : "default");
+    const selector = binding.model ?? this.agents.defaultModel(runner);
+    const resolve = (key: string): string | Promise<string> => this.#resolvedModel(runner, key, requiredPin);
+    const admit = (model: string | undefined): FabricActorRunBinding | Promise<FabricActorRunBinding> => {
+      const admission = this.agents.resolveModelReasonPolicy(model, reason, runner, {
+        modelSource: source, thinking: binding.thinking ?? ownerThinking, requiredPin,
+        resolveFallback: key => this.#resolvedModel(runner, key, true),
+        ...(role !== undefined ? { role } : {}),
+      });
+      const finish = (admitted: { model?: string | undefined; thinking?: FabricThinking | undefined; fallback: boolean }): FabricActorRunBinding => {
+        const result: FabricActorRunBinding = { ...binding,
+          // Validate dynamic defaults without turning an unbound mailbox item
+          // into a model override. Only a policy substitution must freeze it.
+          ...(admitted.model && (binding.model || admitted.fallback) ? { model: admitted.model } : {}),
+          ...(reason !== undefined ? { modelReason: reason } : {}),
+          ...(admitted.thinking && (binding.thinking !== undefined || admitted.fallback) ? { thinking: admitted.thinking } : {}) };
+        delete result.opusReason;
+        if (admitted.fallback) {
+          delete result.modelReason;
+          result.modelSource = "default";
+          result.modelPolicyOriginalModel = binding.modelPolicyOriginalModel ?? model;
+        }
+        return result;
+      };
+      // Keep synchronous resolution synchronous: tell refusal and legacy binding
+      // restoration must settle before queue/publication effects, not a microtask.
+      return admission instanceof Promise ? admission.then(finish) : finish(admission);
+    };
+    // Unbound actors remain dynamic. The actual launch resolves inherited Pi auth
+    // post-permit; creating a definition must not authenticate a backend default.
+    if (!selector) return admit(undefined);
+    const model = policyOnly ? selector : resolve(selector);
+    return model instanceof Promise ? model.then(admit) : admit(model);
   }
 
   #resolvedRunBinding(
     actor: ManagedActor,
     binding: FabricActorRunBinding,
   ): FabricActorRunBinding | Promise<FabricActorRunBinding> {
-    if (!binding.model) return binding;
-    const model = this.#resolvedModel(actor.runner, binding.model, actor.routeClass !== undefined);
-    return model instanceof Promise
-      ? model.then((resolved) => ({ ...binding, model: resolved }))
-      : { ...binding, model };
+    return this.#resolvedRunBindingFor(actor.runner, binding, actor.routeClass !== undefined, false, `actor:${actor.name}`);
   }
 
   #validatedRunBinding(binding: FabricActorRunBinding): FabricActorRunBinding {
@@ -8701,7 +8786,9 @@ export class ActorManager {
     }
     return {
       ...(model ? { model } : {}),
-      ...(model && binding.modelReason !== undefined ? { modelReason: binding.modelReason } : {}),
+      ...(model && (binding.modelReason ?? binding.opusReason) !== undefined ? { modelReason: binding.modelReason ?? binding.opusReason } : {}),
+      ...(binding.modelSource ? { modelSource: binding.modelSource } : {}),
+      ...(binding.modelPolicyOriginalModel ? { modelPolicyOriginalModel: binding.modelPolicyOriginalModel } : {}),
       ...(isFabricThinking(binding.thinking) ? { thinking: binding.thinking } : {}),
     };
   }
@@ -8715,7 +8802,11 @@ export class ActorManager {
     const model = call.model ?? session?.model ?? actor.model;
     const modelReason = call.model ? call.modelReason : session?.model ? session.modelReason : actor.modelReason;
     const thinking = call.thinking ?? session?.thinking ?? actor.thinking;
+    const modelSource = call.model ? call.modelSource ?? "explicit" : model ? "explicit" : "default";
+    const original = call.model ? call.modelPolicyOriginalModel : session?.model ? undefined : actor.modelPolicyOriginalModel;
     return {
+      modelSource,
+      ...(original ? { modelPolicyOriginalModel: original } : {}),
       ...(model ? { model } : {}),
       ...(modelReason !== undefined ? { modelReason } : {}),
       ...(thinking ? { thinking } : {}),

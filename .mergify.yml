@@ -38,8 +38,10 @@ queue_rules:
       - check-success = review/astra
       - -check-failure = review/security  # a failed security verdict refuses admission, label or not
       - check-success = check (ubuntu-latest)
+      # fork-sync labels every upstream sync needs-security-pass, so sync/upstream-* heads are exempt here (R-no-security-slips).
       - or:
           - check-success = review/security
+          - head ~= ^sync/upstream-
           - and:
               # Upstream syncs (sync/upstream-*) queue like any PR; review/security runs after merge within 24 h (R-no-security-slips, smarty-dev#2264).
               - -label = needs-security-pass

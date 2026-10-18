@@ -3135,8 +3135,8 @@ export class AgentManager {
           ...(applyTaskWriteDefault ? { onWritePolicyDisposition } : {}),
           placementLocalReason: this.#meshTransport?.transport === "nats"
             ? "NATS task custody and host credentials require the owning host's native worker"
-            : writePolicy && !applyTaskWriteDefault
-            ? "explicit or inherited write policy requires the local worker; one-shot placement cannot forward confinement"
+            : writePolicy !== undefined
+            ? "write-policy-not-transportable"
             : isClaudeModel(model, runner, this.config.veda.backend) && request.modelReason
               ? "Claude exception reason requires the local worker"
             : this.#spawner?.kind === "actor" || this.#spawner?.kind === "agent" || this.#currentDepth > 0

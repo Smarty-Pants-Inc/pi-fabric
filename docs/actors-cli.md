@@ -101,3 +101,61 @@ This requires a resident binary advertising `operatorActor`. Older binaries
 are refused before a request is dispatched; no unsafe legacy command fallback
 is used. Existing dead-root resident binaries need an explicit deployment of a
 compatible host before this operator path is available.
+
+## Recover a close-timeout actor run
+
+A close-timeout recovery receipt is not permission to delete custody. The restored activation must match the saved run and answer; its normal actor delivery and queue acknowledgement are still the only point that settles custody. New runs use the host-recorded process-scope path. A legacy run without that receipt requires a machine-proven absent cgroup scope and this operator command:
+
+```sh
+fabric-actors recover-close-timeout --run-root <resident-root>/runs --run-id <32-hex-run-id> \
+  --scope-unit <fabric-scope-XXXXXX.scope> --authorized-by <org-or-lead-name> \
+  --authority-ref "<approved-issue-or-comment-URL>"
+```
+
+Use `--authorized-by` and `--authority-ref` only after the owning Main no longer resolves in the resident's participant directory, every recorded Main process is proven gone, and its participant heartbeat is older than the runtime's normal stale bound. The receipt stores the operator, authority reference and the tool's participant/lease/process snapshot. Missing, unreadable, remote-only or fresh owner state refuses. If the Main is live, the CLI is owner-only: invoke it from that owning Main; operator authority cannot override a live or unknown root. Do not infer death from stderr, event logs or a hand-written PID check. The receipt is one-shot and does not itself remove `unresolved-worker.json`.
+
+When the old resident is still running code that cannot read the receipt, create the receipt first, then restart that exact resident under the installed release. There is no host-level `fabric-actors stop` operation. The following bounded sequence signals only the launcher incarnation recorded by the resident, waits for both launcher and child owner to exit, then starts the installed package's new launcher in wake mode. It deliberately refuses if the old owner lacks the launcher birth identity; do not substitute a PID-only `kill`.
+
+```sh
+set -euo pipefail
+ROOT=$(dirname "$(realpath -- "<resident-root>/runs")")
+OWNER="$ROOT/owner.json"
+node --input-type=module - "$OWNER" <<'NODE'
+import fs from 'node:fs';
+const ownerFile = process.argv[2];
+const owner = JSON.parse(fs.readFileSync(ownerFile, 'utf8'));
+const launcher = owner.handover?.launcher;
+if (!Number.isSafeInteger(launcher?.pid) || typeof launcher?.processStartTime !== 'string' ||
+    !/^[0-9]+$/.test(launcher.processStartTime) || !Number.isSafeInteger(owner.pid) ||
+    typeof owner.processStartTime !== 'string' || !/^[0-9]+$/.test(owner.processStartTime)) {
+  throw new Error('No exact launcher and owner birth identities; safe restart is unavailable');
+}
+function birth(pid) {
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+    const fields = stat.slice(stat.lastIndexOf(')') + 2).trim().split(/\s+/);
+    return fields[19];
+  } catch (error) {
+    if (error.code === 'ENOENT') return undefined;
+    throw error;
+  }
+}
+if (birth(launcher.pid) !== launcher.processStartTime || birth(owner.pid) !== owner.processStartTime) {
+  throw new Error('Resident process identity changed; no signal sent');
+}
+process.kill(launcher.pid, 'SIGTERM');
+const deadline = Date.now() + 30_000;
+while (Date.now() < deadline &&
+    (birth(launcher.pid) === launcher.processStartTime || birth(owner.pid) === owner.processStartTime)) {
+  await new Promise(resolve => setTimeout(resolve, 100));
+}
+if (birth(launcher.pid) === launcher.processStartTime || birth(owner.pid) === owner.processStartTime) {
+  throw new Error('Resident did not provide a bounded native exit; do not start a second host');
+}
+NODE
+ACTORS=$(realpath -- "$(command -v fabric-actors)")
+RELEASE=$(dirname "$(dirname "$ACTORS")")
+node "$RELEASE/dist/residency/launcher.js" --config "$ROOT/config.json" --wake
+```
+
+Run the restart on the resident machine as the same OS user. Confirm the installed `fabric-actors` resolves to the intended new release before starting. If owner.json has no exact launcher identity, the process does not exit within 30 seconds, or the launcher rejects the existing config, stop and escalate instead of signaling another PID or starting a second host. A resident host on the new release reads the durable receipt during restore; queued activations continue only after the saved answer is delivered and acknowledged. Refs Smarty-Pants-Inc/smarty-dev#4313.

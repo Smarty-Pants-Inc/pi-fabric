@@ -5,7 +5,7 @@ import { processStartTime } from "./process-identity.js";
 import { ResidentActorAuthorizationError, type ResidentHostConfig } from "./protocol.js";
 import type { MeshStateEntry, MeshStore } from "../mesh/store.js";
 import { participantFilePresent, readParticipantFile } from "../topology/participant-files.js";
-import { hostEntryLiveness, hostLeasePath, readHostLeaseCurrent, STATE_LEASE_RENEW_MS, type FabricHostLease } from "../topology/host-leases.js";
+import { hostEntryLiveness, hostLeasePath, readHostLeaseCurrent, participantLeaseGraceMs, STATE_LEASE_RENEW_MS, type FabricHostLease } from "../topology/host-leases.js";
 
 export interface ResidentOperatorEvidence {
   rootId: string;
@@ -99,6 +99,46 @@ export const ROOT_PARTICIPANT_FRESH_MS = 2 * STATE_LEASE_RENEW_MS;
 export interface MainStoppedOptions {
   /** The operator asserts the root's Main process is gone (--main-stopped). */
   mainStopped?: boolean;
+}
+
+/** Machine evidence for an explicitly authorized recovery against an ended owning Main. */
+export interface DeadRootAuthorizationProof {
+  version: 1;
+  rootId: string;
+  checkedAt: number;
+  staleBoundMs: number;
+  participantResolution: "not-found";
+  participantLastSeenAt: number;
+  ownerLeaseExpiresAt?: number;
+  mainLiveness: string;
+  evidence: MainToolEvidence;
+}
+
+/**
+ * Prove the owning Main no longer resolves from this runtime's own participant/lease directory.
+ * Unlike --main-stopped, this never accepts operator prose: all recorded Main identities must be
+ * locally proven gone, every participant must be beyond its normal heartbeat freshness bound, and
+ * the owner lease cannot still be live. Unknown, remote-only and missing-identity cases veto.
+ */
+export function proveDeadResidentRoot(config: ResidentHostConfig, mesh: Pick<MeshStore, "get">,
+  resident: ResidentLeaseWriter, now = Date.now()): DeadRootAuthorizationProof | undefined {
+  const observed = readResidentOperatorEvidence(config, mesh, resident, { mainStopped: true });
+  if (!observed.mainLiveness?.startsWith("stale:") || observed.liveLease || !observed.toolEvidence ||
+      observed.toolEvidence.participants.length === 0) return undefined;
+  const entries = observed.toolEvidence.participants;
+  const participantLastSeenAt = Math.max(...entries.map(entry => entry.lastSeen ?? Number.POSITIVE_INFINITY));
+  if (!Number.isFinite(participantLastSeenAt) || now - participantLastSeenAt <= ROOT_PARTICIPANT_FRESH_MS) return undefined;
+  const ownerLeaseExpiresAt = Math.max(...entries.map(entry => entry.ownerLeaseExpiresAt ?? Number.NEGATIVE_INFINITY),
+    observed.toolEvidence.rootLease.sessionExpiresAt ?? Number.NEGATIVE_INFINITY,
+    observed.toolEvidence.rootLease.expiresAt ?? Number.NEGATIVE_INFINITY);
+  const grace = participantLeaseGraceMs();
+  const leaseExpiredPastBound = Number.isFinite(ownerLeaseExpiresAt) && now - ownerLeaseExpiresAt > grace;
+  const heartbeatExpiredPastBound = now - participantLastSeenAt > ROOT_PARTICIPANT_FRESH_MS;
+  if (!leaseExpiredPastBound && !heartbeatExpiredPastBound) return undefined;
+  return { version: 1, rootId: config.rootId, checkedAt: now, staleBoundMs: ROOT_PARTICIPANT_FRESH_MS,
+    participantResolution: "not-found", participantLastSeenAt,
+    ...(Number.isFinite(ownerLeaseExpiresAt) ? { ownerLeaseExpiresAt } : {}),
+    mainLiveness: observed.mainLiveness, evidence: observed.toolEvidence };
 }
 
 /** A pid on this host, checked by the tool: /proc/<pid> exists, and its start time against the record. */

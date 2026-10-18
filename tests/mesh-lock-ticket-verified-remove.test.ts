@@ -144,6 +144,47 @@ linuxIt("lock queue: an unchanged dead receipt is removed with its judged stat (
   } finally { ticket.close(); }
 });
 
+linuxIt("lock queue: a stalled canonical head is reaped through judged verifiedRemove", () => {
+  vi.useFakeTimers({ toFake: ["Date"] });
+  const root = path.join(dir, "mesh-stalled");
+  fs.mkdirSync(root, { mode: 0o700 });
+  const canonical = path.join(root, ".lock");
+  const head = new MeshLockTicket(root, randomUUID(), 5_000);
+  const follower = new MeshLockTicket(root, randomUUID(), 5_000, { stalledHeadBypassLock: canonical });
+  const headReceipt = path.join(meshLockQueueDirectory(root), fs.readdirSync(meshLockQueueDirectory(root)).sort()[0]!);
+  const ino = fs.lstatSync(headReceipt).ino;
+  try {
+    expect(head.mayContend()).toBe(true);
+    expect(follower.mayContend()).toBe(false); // first observation starts the stall lease
+    vi.advanceTimersByTime(501); // #stallMs is 500 ms for this budget
+    expect(follower.mayContend()).toBe(true);
+    expect(calls).toEqual([{ target: headReceipt, ino, removed: true }]);
+    expect(fs.existsSync(headReceipt)).toBe(false);
+    expect(follower.queued).toBe(true); // reaping promoted it; it did not close into a plain contest
+  } finally {
+    head.close();
+    follower.close();
+  }
+});
+
+linuxIt("lock queue: an existing canonical holder keeps even a dead head receipt", () => {
+  const root = path.join(dir, "mesh-holder");
+  fs.mkdirSync(root, { mode: 0o700 });
+  const canonical = path.join(root, ".lock");
+  fs.mkdirSync(canonical, { mode: 0o700 });
+  fs.writeFileSync(path.join(canonical, "owner"), `${randomUUID()}\n${process.pid}\n${Date.now()}\n`);
+  const queue = meshLockQueueDirectory(root);
+  fs.mkdirSync(queue, { recursive: true, mode: 0o700 });
+  const headReceipt = path.join(queue, `${"0".repeat(24)}-999999999-${randomUUID()}`);
+  fs.writeFileSync(headReceipt, "", { mode: 0o600 });
+  const follower = new MeshLockTicket(root, randomUUID(), 5_000, { stalledHeadBypassLock: canonical });
+  try {
+    expect(follower.mayContend()).toBe(false);
+    expect(calls).toEqual([]);
+    expect(fs.existsSync(headReceipt)).toBe(true);
+  } finally { follower.close(); }
+});
+
 it("lock queue: a dead receipt name holding a directory is waited on, never removed (file-only, as main's unlink)", () => {
   const { ticket, receipt } = deadReceipt();
   real.renameSync(receipt, path.join(trash, "file"));

@@ -3,6 +3,7 @@ import { notifyDiagnostic, notifyPrincipalDiagnosticOnce, resetPrincipalDiagnost
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { resolveFabricIdentity, sendFabricMessage } from "./fabric-provenance.js";
 import { extensionContextLive } from "./session-liveness.js";
+import { recentSessionEntries } from "./core/preview.js";
 
 /** Final settlement is after Pi's own retry/overflow recovery, unlike agent_end (#4012). */
 export const registerMainProviderRecovery = (pi: ExtensionAPI, options: {
@@ -33,11 +34,11 @@ export const registerMainProviderRecovery = (pi: ExtensionAPI, options: {
     if (identity.kind !== "main" || identity.id !== mainAgentId) return;
     if (context.signal?.aborted || options.halted() ||
       (event as { outcome?: string }).outcome === "aborted") return;
-    const entries = context.sessionManager.getEntries();
+    const entries = recentSessionEntries(context.sessionManager, 50);
     let last: AssistantMessage | undefined;
-    for (let i = entries.length - 1; i >= Math.max(0, entries.length - 50); i--) {
-      const entry = entries[i]!;
-      if (entry.type === "message" && entry.message.role === "assistant") {
+    for (let i = entries.length - 1; i >= 0; i--) {
+      const entry = entries[i] as { type?: string; message?: AssistantMessage };
+      if (entry.type === "message" && entry.message?.role === "assistant") {
         last = entry.message;
         break;
       }

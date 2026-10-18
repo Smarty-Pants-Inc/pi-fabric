@@ -193,12 +193,21 @@ export const projectRootInboxReceipt = (value: unknown): unknown => {
 
 const matchesInboxReceipt = (line: string): boolean =>
   line.includes(ROOT_INBOX_CUSTOM_TYPE) || line.includes(AGENT_MESSAGE_CUSTOM_TYPE);
+const matchesInboxReceiptEntry = (value: unknown): boolean => {
+  const entry = value && typeof value === "object" ? value as { type?: unknown; customType?: unknown } : undefined;
+  return entry?.type === "custom_message" &&
+    (entry.customType === ROOT_INBOX_CUSTOM_TYPE || entry.customType === AGENT_MESSAGE_CUSTOM_TYPE);
+};
 
 const matchesMainReceipt = (line: string): boolean => line.includes(AGENT_MESSAGE_CUSTOM_TYPE) || line.includes('\"session\"');
+const matchesMainReceiptEntry = (value: unknown): boolean => {
+  const entry = value && typeof value === "object" ? value as { type?: unknown; customType?: unknown } : undefined;
+  return entry?.type === "session" || (entry?.type === "custom_message" && entry.customType === AGENT_MESSAGE_CUSTOM_TYPE);
+};
 /** Original native carrier IDs, for a retired/dead Main's inbox rotation. This uses
  * the same cached canonical receipt/barrier path as the root shadow inbox. */
 export const confirmedMainInboxIds = (manager: SessionReceiptManager, sessionId: string): Set<string> => {
-  const snapshot = confirmedSessionReceiptSnapshot(manager, matchesMainReceipt, projectRootInboxReceipt);
+  const snapshot = confirmedSessionReceiptSnapshot(manager, matchesMainReceipt, projectRootInboxReceipt, matchesMainReceiptEntry);
   const ids = new Set<string>();
   if (!snapshot.count) return ids;
   type Entry = { type?: string; id?: string; customType?: string; details?: { id?: string; chain?: string; items?: Array<{ id?: string; chain?: string }> } };
@@ -235,7 +244,7 @@ export const confirmedRootInboxSession = (
   manager: SessionReceiptManager, verifier?: RootInboxReceiptVerifier,
 ): RootInboxSession => {
   try {
-    const snapshot = confirmedSessionReceiptSnapshot(manager, matchesInboxReceipt, projectRootInboxReceipt);
+    const snapshot = confirmedSessionReceiptSnapshot(manager, matchesInboxReceipt, projectRootInboxReceipt, matchesInboxReceiptEntry);
     return inboxReceiptSession(snapshot.entries, snapshot.count, 500, verifier);
   } catch {
     return rootInboxSession([]);

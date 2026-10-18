@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import { syncPathNamespace } from "./atomic-write.js";
+import { SessionEntryCursor, type SessionEntryCursorManager } from "./preview.js";
 
 /** A missing (including deferred-first-write) file is no receipt. All other uncertainty throws.
  * Reconfirm every barrier even when callers already cached this inode's entries. */
@@ -27,7 +28,7 @@ export const withConfirmedSessionFile = (
   }
 };
 
-export interface SessionReceiptManager {
+export interface SessionReceiptManager extends SessionEntryCursorManager {
   getEntries(): readonly unknown[];
   getSessionFile?(): string | undefined;
   isPersisted?(): boolean;
@@ -35,6 +36,7 @@ export interface SessionReceiptManager {
 
 type ReceiptMatcher = (line: string) => boolean;
 type ReceiptProjector = (entry: unknown) => unknown;
+type ReceiptEntryMatcher = (entry: unknown) => boolean;
 const identityReceipt: ReceiptProjector = (entry) => entry;
 export interface SessionReceiptSnapshot {
   count: number;
@@ -43,6 +45,7 @@ export interface SessionReceiptSnapshot {
 interface ReceiptCache extends SessionReceiptSnapshot {
   file: string;
   matches: ReceiptMatcher;
+  matchesEntry?: ReceiptEntryMatcher;
   project: ReceiptProjector;
   stat: fs.Stats;
   /** Confirmed complete-line offset; stat.size also includes the unconfirmed carry. */
@@ -54,6 +57,12 @@ interface ReceiptCache extends SessionReceiptSnapshot {
 // One current file/filter per manager, released with the host session manager. Filters must
 // have stable identity; a different predicate must never inherit another filter's receipts.
 const receiptCaches = new WeakMap<SessionReceiptManager, ReceiptCache>();
+interface MemoryReceiptCache {
+  cursor: SessionEntryCursor;
+  count: number;
+  entries: Map<number, unknown>;
+}
+const memoryReceiptCaches = new WeakMap<SessionReceiptManager, Map<ReceiptMatcher, Map<ReceiptProjector, Map<ReceiptEntryMatcher | undefined, MemoryReceiptCache>>>>();
 const TAIL_BYTES = 64;
 
 const readAt = (fd: number, buffer: Buffer, position: number): void => {
@@ -78,8 +87,35 @@ export const confirmedSessionReceiptSnapshot = (
   manager: SessionReceiptManager,
   matches: ReceiptMatcher,
   project: ReceiptProjector = identityReceipt,
+  matchesEntry?: ReceiptEntryMatcher,
 ): SessionReceiptSnapshot => {
   const memory = (): SessionReceiptSnapshot => {
+    // Current Pi exposes point lookups for the active branch. Re-derive once, then follow only
+    // entries appended since the previous leaf; retain projected receipt data, not transcript bodies.
+    if (typeof manager.getLeafEntry === "function" && typeof manager.getEntry === "function") {
+      let byFilter = memoryReceiptCaches.get(manager);
+      if (!byFilter) memoryReceiptCaches.set(manager, byFilter = new Map());
+      let byProjector = byFilter.get(matches);
+      if (!byProjector) byFilter.set(matches, byProjector = new Map());
+      let byEntryMatcher = byProjector.get(project);
+      if (!byEntryMatcher) byProjector.set(project, byEntryMatcher = new Map());
+      let cache = byEntryMatcher.get(matchesEntry);
+      if (!cache) {
+        cache = { cursor: new SessionEntryCursor(), count: 0, entries: new Map() };
+        byEntryMatcher.set(matchesEntry, cache);
+      }
+      const read = cache.cursor.read(manager);
+      if (read.reset) { cache.count = 0; cache.entries.clear(); }
+      for (const entry of read.entries) {
+        const index = cache.count++;
+        const line = matchesEntry ? undefined : JSON.stringify(entry);
+        if (matchesEntry ? matchesEntry(entry) : typeof line === "string" && matches(line)) {
+          cache.entries.set(index, project(entry));
+        }
+      }
+      return { count: cache.count, entries: cache.entries };
+    }
+    // Older hosts without point lookup methods retain their compatibility behavior.
     const entries = manager.getEntries();
     return { count: entries.length, entries: new Map(entries.map((entry, index) => [index, project(entry)])) };
   };
@@ -91,7 +127,7 @@ export const confirmedSessionReceiptSnapshot = (
   try {
     const found = withConfirmedSessionFile(file, (fd, stat) => {
       let previous = receiptCaches.get(manager);
-      if (previous?.file !== file || previous.matches !== matches || previous.project !== project ||
+      if (previous?.file !== file || previous.matches !== matches || previous.matchesEntry !== matchesEntry || previous.project !== project ||
           previous.stat.dev !== stat.dev || previous.stat.ino !== stat.ino || stat.size < previous.stat.size) {
         previous = undefined;
       }
@@ -132,7 +168,7 @@ export const confirmedSessionReceiptSnapshot = (
             try { entry = JSON.parse(line); parsed = true; } catch { /* Malformed entries are not receipts. */ }
             // Keep only the consumer's receipt fields, not another complete
             // copy of every delivered body. Projection errors fail confirmation.
-            if (parsed) entries.set(index, project(entry));
+            if (parsed && (!matchesEntry || matchesEntry(entry))) entries.set(index, project(entry));
           }
           offset = position + start;
         }
@@ -143,7 +179,7 @@ export const confirmedSessionReceiptSnapshot = (
         if (start < length) carry.push(Buffer.from(view.subarray(start)));
       }
       snapshot = { count, entries };
-      receiptCaches.set(manager, { file, matches, project, stat, offset, count, entries, carry, tail,
+      receiptCaches.set(manager, { file, matches, ...(matchesEntry ? { matchesEntry } : {}), project, stat, offset, count, entries, carry, tail,
         partialTail: endTail });
     });
     if (!found) receiptCaches.delete(manager);
@@ -157,8 +193,10 @@ export const confirmedSessionReceiptSnapshot = (
 
 /** Compatibility array view; root-inbox consumes the indexed Map directly to avoid holes. */
 export const confirmedSessionEntries = (manager: SessionReceiptManager, matches: ReceiptMatcher): readonly unknown[] => {
-  if (manager.isPersisted?.() === false) return manager.getEntries();
-  if (!manager.getSessionFile?.() && manager.isPersisted?.() !== true) return manager.getEntries();
+  const hasPointLookups = typeof manager.getLeafEntry === "function" && typeof manager.getEntry === "function";
+  if (manager.isPersisted?.() === false && !hasPointLookups) return manager.getEntries();
+  if (!manager.getSessionFile?.() && manager.isPersisted?.() !== true && !hasPointLookups) return manager.getEntries();
+  if (!manager.getSessionFile?.() && manager.isPersisted?.() === true) return [];
   const snapshot = confirmedSessionReceiptSnapshot(manager, matches);
   const entries: unknown[] = [];
   for (const [index, entry] of snapshot.entries) entries[index] = entry;

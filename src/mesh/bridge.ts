@@ -2161,6 +2161,8 @@ export class RemoteBridgeSide implements BridgeSide {
   #next = 1;
   #supportsTail = false;
   #supportsPartialPresence = false;
+  #legacyPartialSkips = 0;
+  #legacyPartialSkipLogged = false;
   #independentRpc = false;
   #protocolVersion: number | undefined;
   #changesReady: Promise<void> | undefined;
@@ -2177,7 +2179,8 @@ export class RemoteBridgeSide implements BridgeSide {
    * exactly one mirror remains in flight until its late answer or close(). Other RPC deadlines
    * remain fatal. stop() still bounds its waits and closes the transport (security review F3).
    */
-  constructor(readonly input: Readable, readonly output: Writable, readonly callTimeoutMs = DEFAULT_CALL_TIMEOUT_MS) {
+  constructor(readonly input: Readable, readonly output: Writable, readonly callTimeoutMs = DEFAULT_CALL_TIMEOUT_MS,
+    readonly log?: (message: string) => void) {
     let onClosed!: (error: Error) => void;
     this.closed = new Promise((resolve) => (onClosed = resolve));
     this.#onClosed = onClosed;
@@ -2305,6 +2308,8 @@ export class RemoteBridgeSide implements BridgeSide {
   }
 
   get protocolVersion(): number | undefined { return this.#protocolVersion; }
+  /** Cumulative skipped outbound partial cycles on this link; complete mirrors still run. */
+  get legacyPartialSkips(): number { return this.#legacyPartialSkips; }
   get pendingMirrorTraffic(): boolean {
     return this.#independentRpc && this.#mirrorPending !== undefined && this.#closed === undefined;
   }
@@ -2321,7 +2326,9 @@ export class RemoteBridgeSide implements BridgeSide {
       throw new Error(`Bridge agent changed protocol ${this.#protocolVersion} to ${reply.version}; refusing protocol downgrade`);
     }
     this.#protocolVersion = reply.version;
-    this.#supportsPartialPresence = reply.partialPresence === true;
+    const supportsPartialPresence = reply.partialPresence === true;
+    if (this.#supportsPartialPresence !== supportsPartialPresence) this.#legacyPartialSkipLogged = false;
+    this.#supportsPartialPresence = supportsPartialPresence;
     // Both ordinary hello and automatic notification setup negotiate dispatch isolation.
     this.#independentRpc = reply.independentRpc === true;
     // Notification setup must not silently switch a caller's chosen read/publication mode.
@@ -2368,10 +2375,18 @@ export class RemoteBridgeSide implements BridgeSide {
   presence(): Promise<BridgePresence> { return this.#call("presence"); }
   publish(event: BridgePublish): Promise<{ sequence: number }> { return this.#call("publish", event); }
   async mirror(presence: BridgeMirrorPresence): Promise<void> {
+    if (this.#closed) throw this.#closed;
     if (presenceIsPartial(presence)) {
       if (this.#protocolVersion === undefined) await this.hello();
       if (!this.#supportsPartialPresence) {
-        throw new Error("Bridge peer does not support partial presence snapshots; refusing unsafe withdrawal set");
+        // Never strip partial metadata or send an omission set to a legacy receiver.
+        // Skip only this direction; local mirroring and unrelated RPCs remain live.
+        this.#legacyPartialSkips += 1;
+        if (!this.#legacyPartialSkipLogged) {
+          this.#legacyPartialSkipLogged = true;
+          this.log?.(`presence: legacy peer lacks partialPresence; skipped remote partial mirror; legacyPartialSkips=${this.#legacyPartialSkips}; link remains active`);
+        }
+        return;
       }
     }
     await this.#call("mirror", presence);

@@ -17,6 +17,7 @@ import { FileTransport } from "../src/transport/file.js";
 const UNCONFIRMED = "FABRIC_DELIVERY_UNCONFIRMED";
 type Ports = ConstructorParameters<typeof AgentMessageRouter>;
 type Handler = (event: unknown, context: ExtensionContext) => unknown;
+type NativeMessage = { customType: string; content: string; details: { id: string; items?: Array<{ id: string }> } };
 const sender: MeshIdentity = { id: "actor:local-proof", name: "Local proof", kind: "actor" };
 const roots: string[] = [];
 const mains: MainAgentController[] = [];
@@ -31,7 +32,7 @@ const tempRoot = () => {
 };
 const fakePi = () => {
   const handlers = new Map<string, Handler[]>();
-  const sendMessage = vi.fn();
+  const sendMessage = vi.fn<(message: NativeMessage, options: { deliverAs: string; triggerTurn: boolean }) => void>();
   const pi = {
     on: (name: string, handler: Handler) => {
       handlers.set(name, [...(handlers.get(name) ?? []), handler]);
@@ -41,13 +42,16 @@ const fakePi = () => {
     sendUserMessage: vi.fn(),
     getThinkingLevel: () => "off",
   } as unknown as ExtensionAPI;
-  return { pi, sendMessage };
+  const emit = (name: string, event: unknown, context: ExtensionContext) => {
+    for (const handler of handlers.get(name) ?? []) handler(event, context);
+  };
+  return { pi, sendMessage, emit };
 };
-const busy = (idle = false) => ({
+const busy = (idle = false, entries: unknown[] = []) => ({
   isIdle: () => idle,
   hasPendingMessages: () => false,
   signal: { aborted: false },
-  sessionManager: { getEntries: () => [] },
+  sessionManager: { getEntries: () => entries },
 }) as unknown as ExtensionContext;
 const router = (main: Ports[2], control?: Ports[4], entries: FabricParticipantInfo[] = []) => {
   const manager = {
@@ -67,15 +71,17 @@ const router = (main: Ports[2], control?: Ports[4], entries: FabricParticipantIn
   } as unknown as Ports[3];
   return new AgentMessageRouter(manager, actors, main, participants, control, binding => binding);
 };
-const localMain = () => {
+const localMain = (idle = true) => {
   const root = tempRoot();
   const journal = path.join(root, "main-followups", "root.json");
   const h = fakePi();
   const main = new MainAgentController(h.pi, "session:local-proof", true, root, "local-proof");
   mains.push(main);
   // Idle Main takes the immediate send path, but still durably journals first.
-  main.attachFollowUpDrain(busy(true), 60_000, journal);
-  return { journal, h, main, value: router(main) };
+  const entries: unknown[] = [];
+  const context = busy(idle, entries);
+  main.attachFollowUpDrain(context, 60_000, journal);
+  return { journal, h, main, context, entries, value: router(main) };
 };
 const fileRoute = () => {
   const mesh = new MeshStore(path.join(tempRoot(), "mesh"), 65_536, 1_000, { stateBackend: "file" });
@@ -157,32 +163,122 @@ describe("followUp local outcome at the router boundary (#14867)", () => {
     expect(fs.existsSync(f.journal)).toBe(false);
   });
 
-  it("keeps the journal item id and raw cause when rename commits before completion throws", async () => {
-    const f = localMain();
-    const completionFailure = new Error("journal rename committed before completion failed");
-    const rename = fs.renameSync.bind(fs);
-    let committed: { items: Array<{ id: string; message: string }> } | undefined;
-    vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
-      const result = rename(from, to); // The actual journal replacement commits first.
-      if (String(to) === f.journal) {
-        committed = JSON.parse(fs.readFileSync(f.journal, "utf8"));
-        throw completionFailure;
-      }
-      return result;
-    });
+  it.each(["held-busy", "sent-idle"] as const)(
+    "preserves a committed item across a later save and hands it to Pi exactly once (%s)", async state => {
+      const f = localMain(state === "sent-idle");
+      const completionFailure = new Error("journal rename committed before completion failed");
+      const rename = fs.renameSync.bind(fs);
+      let committed: { items: Array<{ id: string; message: string }> } | undefined;
+      const fault = vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+        const result = rename(from, to); // The actual journal replacement commits first.
+        if (String(to) === f.journal) {
+          committed = JSON.parse(fs.readFileSync(f.journal, "utf8"));
+          throw completionFailure;
+        }
+        return result;
+      });
 
-    const failure = await rejection(f.value.routeMessage(f.main.id, "journal survives completion failure", undefined, "followUp",
-      undefined, { idempotencyKey: "local-postrename" }));
+      const failure = await rejection(f.value.routeMessage(f.main.id, "journal survives completion failure", undefined, "followUp",
+        undefined, { idempotencyKey: `local-postrename-${state}` }));
+      fault.mockRestore();
 
-    expect(committed?.items).toHaveLength(1);
-    const item = committed!.items[0]!;
-    expect(item).toMatchObject({ id: expect.any(String), message: "journal survives completion failure" });
-    expect(failure).toBeInstanceOf(Error);
-    expect(failure).toMatchObject({ code: UNCONFIRMED, deliveryId: item.id });
-    expect((failure as Error).cause).toBe(completionFailure);
-    expect(f.h.sendMessage).not.toHaveBeenCalled();
-    expect(JSON.parse(fs.readFileSync(f.journal, "utf8"))).toEqual(committed);
-  });
+      expect(committed?.items).toHaveLength(1);
+      const item = committed!.items[0]!;
+      expect(item).toMatchObject({ id: expect.any(String), message: "journal survives completion failure" });
+      expect(failure).toMatchObject({ code: UNCONFIRMED, deliveryId: item.id });
+      expect((failure as Error).cause).toBe(completionFailure);
+      expect(f.h.sendMessage).not.toHaveBeenCalled();
+      // Real lifecycle save, BEFORE any handoff: the old unconditional pop erases the item here.
+      f.h.emit("input", { source: "terminal" }, f.context);
+      const preserved = JSON.parse(fs.readFileSync(f.journal, "utf8")) as { items: Array<{ id: string; message: string; handed?: true }> };
+      expect(preserved.items).toEqual([expect.objectContaining({ id: item.id, message: item.message })]);
+      expect(preserved.items[0]!.handed).toBeUndefined();
+
+      const idle = busy(true, f.entries);
+      const boundary = { outcome: "completed", context: { pendingMessages: [] } };
+      f.h.emit("agent_before_settle", boundary, idle);
+      expect(f.h.sendMessage).toHaveBeenCalledOnce();
+      const [message, options] = f.h.sendMessage.mock.calls[0]!;
+      expect(message.details.id).toBe(item.id);
+      expect(message.content).toContain(item.message);
+      expect(options).toEqual({ deliverAs: "followUp", triggerTurn: true });
+      // Native queue presence is not consumption, and does not cause another handoff.
+      f.h.emit("agent_before_settle", { ...boundary, context: { pendingMessages: [message] } }, idle);
+      expect(fs.readFileSync(f.journal, "utf8")).toContain(item.id);
+      f.entries.push({ type: "custom_message", customType: message.customType, details: message.details });
+      f.main.confirmInbox();
+      expect(fs.existsSync(f.journal)).toBe(false);
+      f.h.emit("agent_before_settle", boundary, idle);
+      f.h.emit("agent_settled", { outcome: "completed" }, idle);
+      expect(f.h.sendMessage).toHaveBeenCalledOnce();
+    },
+  );
+
+  for (const state of ["held-busy", "sent-idle"] as const) {
+    it.each(["absent", "valid-existing"] as const)(
+      `rolls back proven pre-rename nonadmission without stranding memory (${state}, %s)`, async prior => {
+        const f = localMain(state === "sent-idle");
+        let originalId: string | undefined;
+        if (prior === "valid-existing") {
+          originalId = f.main.deliverAgent({ from: sender, message: "existing original", delivery: "nextTurn", triggerTurn: false }).messageId;
+          f.h.sendMessage.mockClear();
+        }
+        const saveFailure = new Error("known pre-rename refusal");
+        const rename = fs.renameSync.bind(fs);
+        const fault = vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+          if (String(to) === f.journal) throw saveFailure;
+          return rename(from, to);
+        });
+        const failure = await rejection(f.value.routeMessage(f.main.id, "never admitted", undefined, "followUp",
+          undefined, { idempotencyKey: `local-prewrite-${state}-${prior}` }));
+        fault.mockRestore();
+        expect(failure).not.toHaveProperty("code", UNCONFIRMED);
+        expect(failure).toHaveProperty("message", `Main could not record the ${state === "held-busy" ? "followUp" : "message"}: ${saveFailure.message}`);
+        expect((failure as Error).cause).toBe(saveFailure);
+        expect(f.h.sendMessage).not.toHaveBeenCalled();
+        expect(f.main.queueDepth().pendingFollowUps).toBe(0);
+        f.h.emit("input", { source: "terminal" }, f.context);
+        if (originalId) {
+          const saved = JSON.parse(fs.readFileSync(f.journal, "utf8")) as { items: Array<{ id: string; message: string }> };
+          expect(saved.items.map(item => item.id)).toEqual([originalId]);
+          expect(saved.items.map(item => item.message)).toEqual(["existing original"]);
+        } else expect(fs.existsSync(f.journal)).toBe(false);
+        f.h.emit("agent_before_settle", { outcome: "completed", context: { pendingMessages: [] } }, busy(true, f.entries));
+        expect(f.h.sendMessage).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each(["unreadable", "malformed-json", "unknown-version", "malformed-items"] as const)(
+      `retains an item when failed-save readback cannot prove absence (${state}, %s)`, async readback => {
+        const f = localMain(state === "sent-idle");
+        const saveFailure = new Error("save completion is unobservable");
+        const rename = fs.renameSync.bind(fs);
+        const fault = vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+          if (String(to) !== f.journal) return rename(from, to);
+          if (readback === "unreadable") fs.mkdirSync(f.journal);
+          else fs.writeFileSync(f.journal, readback === "malformed-json" ? "{" : JSON.stringify({
+            version: readback === "unknown-version" ? 2 : 1,
+            items: readback === "malformed-items" ? [{ id: "not-a-valid-item" }] : [],
+          }));
+          throw saveFailure;
+        });
+        const failure = await rejection(f.value.routeMessage(f.main.id, "retain on unknown readback", undefined, "followUp",
+          undefined, { idempotencyKey: `local-unknown-${state}-${readback}` }));
+        fault.mockRestore();
+        expect(failure).toMatchObject({ code: UNCONFIRMED, deliveryId: expect.any(String) });
+        expect((failure as Error).cause).toBe(saveFailure);
+        expect(f.h.sendMessage).not.toHaveBeenCalled();
+        if (readback === "unreadable") fs.rmdirSync(f.journal);
+        f.h.emit("input", { source: "terminal" }, f.context);
+        const saved = JSON.parse(fs.readFileSync(f.journal, "utf8")) as { items: Array<{ id: string; message: string }> };
+        expect(saved.items).toEqual([expect.objectContaining({ id: (failure as { deliveryId: string }).deliveryId,
+          message: "retain on unknown readback" })]);
+        f.h.emit("agent_before_settle", { outcome: "completed", context: { pendingMessages: [] } }, busy(true, f.entries));
+        expect(f.h.sendMessage).toHaveBeenCalledOnce();
+        expect(f.h.sendMessage.mock.calls[0]![0].details.id).toBe(saved.items[0]!.id);
+      },
+    );
+  }
 
   it("classifies an accepted-but-stalled Main result without losing its accepted message id", async () => {
     const accepted = { queued: true as const, messageId: "accepted-main-item", routed: "main" as const,

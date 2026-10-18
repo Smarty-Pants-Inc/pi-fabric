@@ -790,7 +790,7 @@ export class MainAgentController implements FabricMainAgentTarget {
       item.triggerTurn = triggerTurn;
       this.#admit(item);
       this.#held.push(item);
-      try { this.#saveDelivery(item, request.deliveryObserver); } catch (error) { this.#held.pop(); throw error; }
+      this.#saveDelivery(item, request.deliveryObserver, undefined, true);
       return { queued: true, messageId: item.id, routed: "main", triggered: false, ...this.queueDepth(item.from.id) };
     }
     if (request.priority === "interrupt" && triggerTurn && this.#context &&
@@ -801,7 +801,7 @@ export class MainAgentController implements FabricMainAgentTarget {
       this.#admit(item);
       const index = this.#interrupts.size;
       this.#held.splice(index, 0, item);
-      try { this.#saveDelivery(item, request.deliveryObserver); } catch (error) { this.#held.splice(index, 1); throw error; }
+      this.#saveDelivery(item, request.deliveryObserver, undefined, true);
       const abort = !this.#interruptUsedThisTurn;
       this.#interrupts.add(item.id);
       // Same native cancellation path as Escape. Do not queue into Pi's aborted run:
@@ -825,12 +825,7 @@ export class MainAgentController implements FabricMainAgentTarget {
       // Keep every original in arrival order; coalesceKey is ordinary payload data.
       this.#admit(item);
       this.#held.push(item);
-      try {
-        this.#saveDelivery(item, request.deliveryObserver, "followUp"); // journalled before acknowledgement
-      } catch (error) {
-        this.#held.pop();
-        throw error;
-      }
+      this.#saveDelivery(item, request.deliveryObserver, "followUp", true); // journalled before acknowledgement
       if (providerHeld) {
         this.#scheduleProviderWake();
         this.#armProviderDeadTimer();                   // a new delivery is an edge too; no-op unless pending
@@ -847,14 +842,17 @@ export class MainAgentController implements FabricMainAgentTarget {
       item.handed = true;
       item.deliverAs = request.delivery;
       item.triggerTurn = triggerTurn;
-      this.#sent.push(item);
+      // Stage in the retryable queue until the save returns. The persisted handed marker
+      // fences live-reload reconciliation, but a failed save has not attempted Pi yet.
+      this.#held.push(item);
       try {
-        this.#saveDelivery(item, request.deliveryObserver, "message");
+        this.#saveDelivery(item, request.deliveryObserver, "message", true);
       } catch (error) {
-        this.#sent.pop();
         try { restorePeerWakeOnFailure(); } catch { /* Preserve the admission failure. */ }
         throw error;
       }
+      this.#held.splice(this.#held.indexOf(item), 1);
+      this.#sent.push(item);
       try {
         triggered = this.#send([item], request.delivery, triggerTurn, false, peerSteerWake);
       } catch (error) {
@@ -892,7 +890,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     const retained = { ...item, deliveryId };
     this.#admit(retained);
     this.#held.push(retained);
-    try { this.#save(); } catch (error) { this.#held.pop(); throw error; }
+    this.#saveDelivery(retained, undefined, undefined, true);
     if (this.#context?.isIdle()) this.#release(true);
   }
 
@@ -1010,25 +1008,51 @@ export class MainAgentController implements FabricMainAgentTarget {
     pendingHalts().delete(file); // Only the completed durability barriers commit authority.
   }
 
-  /** Report admission evidence only; the router, not Main, classifies any later failure. */
-  #saveDelivery(item: HeldAgentMessage, observer?: FabricDeliveryObserver, recordContext?: "followUp" | "message"): void {
+  /** Own admission-aware rollback; only the router classifies the original failure. */
+  #saveDelivery(item: HeldAgentMessage, observer?: FabricDeliveryObserver, recordContext?: "followUp" | "message", newAdmission = false): void {
     let admitted = false;
     const onAdmission = (): void => {
       admitted = true;
       observer?.onAdmission(item.deliveryId ?? item.id, this.id);
     };
+    // A duplicate is already in our custody. A failed re-barrier cannot revoke it.
+    if (!newAdmission) onAdmission();
     try { this.#save(onAdmission); }
     catch (error) {
-      // Atomic rename can succeed before a namespace barrier/cleanup fails. Positive
-      // readback is uncertainty evidence, never a substitute for the failed barrier.
+      // Every new item is still staged in #held: no native handoff was attempted.
+      // Clear the direct-delivery replay sentinel so later saves/release keep that fact.
+      if (newAdmission) delete item.handed;
       if (!admitted && this.#journal) {
+        let absent = false;
         try {
-          const saved = JSON.parse(fs.readFileSync(this.#journal, "utf8")) as { items?: HeldAgentMessage[] };
-          if (Array.isArray(saved.items) && saved.items.some(savedItem => savedItem.id === item.id)) onAdmission();
-        } catch { /* No positive evidence: retain the original pre-admission contract. */ }
+          const saved = JSON.parse(fs.readFileSync(this.#journal, "utf8")) as { version?: unknown; items?: unknown } | null;
+          const validItem = (value: unknown): value is HeldAgentMessage => {
+            if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+            const candidate = value as Partial<HeldAgentMessage>;
+            return typeof candidate.id === "string" && candidate.id.length > 0 &&
+              typeof candidate.message === "string" && typeof candidate.sentAt === "number" && Number.isFinite(candidate.sentAt) &&
+              senderIdentity(candidate.from) !== undefined &&
+              (candidate.handed === undefined || candidate.handed === true) &&
+              (candidate.deliverAs === undefined || DIRECT_DELIVERIES.has(candidate.deliverAs)) &&
+              (candidate.triggerTurn === undefined || typeof candidate.triggerTurn === "boolean") &&
+              (candidate.deliveryId === undefined || typeof candidate.deliveryId === "string") &&
+              (candidate.supersedes === undefined || (Array.isArray(candidate.supersedes) && candidate.supersedes.every(id => typeof id === "string")));
+          };
+          // Only a supported, readable journal with valid items can prove absence.
+          // Malformed/unknown readback is uncertainty, not permission to resend.
+          absent = saved?.version === 1 && Array.isArray(saved.items) && saved.items.every(validItem) &&
+            !saved.items.some(savedItem => savedItem.id === item.id);
+        } catch (readError) {
+          absent = (readError as { code?: unknown } | null)?.code === "ENOENT";
+        }
+        if (!absent) onAdmission();
       }
-      if (!admitted && recordContext) {
-        throw new Error(`Main could not record the ${recordContext}: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+      if (!admitted) {
+        if (newAdmission) {
+          const index = this.#held.indexOf(item);
+          if (index !== -1) this.#held.splice(index, 1);
+        }
+        if (recordContext) throw new Error(`Main could not record the ${recordContext}: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
       }
       throw error;
     }

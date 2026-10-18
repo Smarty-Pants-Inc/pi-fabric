@@ -632,17 +632,22 @@ export class AgentMessageRouter {
         );
       }
     } catch (error) {
-      // Control clears verified notRun/withdrawal/conflict evidence at its source. Do not
-      // trust an arbitrary caller error's notRun property as permission to discard an id.
-      if (error instanceof FabricTargetTerminalError || error instanceof FabricControlStaleIncarnationError) admission = undefined;
-      const failure = unconfirmed(error);
-      if (failure) throw failure;
       const reason = error instanceof Error ? error.message : String(error);
-      const root = this.actorManager.mesh?.root ?? this.residency?.options.config.meshRoot;
-      // Only pre-publication/local definite refusals. Remote ACK outcomes belong to control.
       const refusal = prePublicationRefusal(error, reason) ??
         (/^(Unknown |Main's followUp queue is full|Fabric actor queue limit reached|Fabric participant .* is non-interactive)/.test(reason) ? reason : undefined);
-      if (root && !(error instanceof Error && "rejection" in error && error.rejection === "FABRIC_CONTROL_REJECTED") && refusal !== undefined) {
+      const remoteRejection = error instanceof Error && "rejection" in error && error.rejection === "FABRIC_CONTROL_REJECTED";
+      const typedPrePublicationRefusal = error instanceof Error && "code" in error &&
+        typeof error.code === "string" && PRE_PUBLICATION_REFUSALS.has(error.code);
+      // Control clears verified notRun/withdrawal/conflict evidence at its source. Preserve
+      // known admission refusals in an authenticated owner rejection too, without changing
+      // control's ledger or trusting arbitrary post-append error text/notRun properties.
+      if (error instanceof FabricTargetTerminalError || error instanceof FabricControlStaleIncarnationError ||
+          typedPrePublicationRefusal || (remoteRejection && refusal !== undefined)) admission = undefined;
+      const failure = unconfirmed(error);
+      if (failure) throw failure;
+      const root = this.actorManager.mesh?.root ?? this.residency?.options.config.meshRoot;
+      // Remote ACK outcomes still belong to control, including its conservative unknown ledger.
+      if (root && !remoteRejection && refusal !== undefined) {
         try { appendDeliveryOutcome(root, { eventId: options.idempotencyKey!, to: id, from: (options.from ?? this.actorManager.identity).id, mode: kind }, "failed", refusal); }
         catch { /* Reporting must not replace the original pre-publication refusal. */ }
       }

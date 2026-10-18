@@ -115,10 +115,14 @@ describe("followUp durable publication outcome (#14867)", () => {
     expect(hasDeliveryOutcome(f.root, { eventId: event.id, to: f.targetId, from: f.from.id, mode: "followUp" }, "unknown")).toBe(false);
   });
 
-  it.each(["queue expiry", "CAS loss"] as const)("reports delivery unconfirmed after append then %s, without replay", async fault => {
+  it.each(["queue expiry", "CAS loss", "misleading quota text"] as const)("reports delivery unconfirmed after append then %s, without replay", async fault => {
     const f = fixture();
     const original = f.mesh.publish.bind(f.mesh);
-    const failure = new MeshLockQueueExpiredError(path.join(f.root, ".lock"), 3, 10000);
+    // The same text is definitive only in a real rejected owner ACK, not an arbitrary
+    // post-append failure. Keep reason: data safety after an already committed command.
+    const failure = fault === "misleading quota text"
+      ? new Error("Main's followUp queue is full (50 of yours); Main is busy and reads followUps only at its next tool boundary. Wait, or send a short steer.")
+      : new MeshLockQueueExpiredError(path.join(f.root, ".lock"), 3, 10000);
     if (fault === "CAS loss") await f.mesh.put({ key: "test/delivery-cas", value: "winner", identity: f.from, ifVersion: 0 });
     const publish = vi.spyOn(f.mesh, "publish").mockImplementationOnce(async input => {
       await original({ ...input, durable: true }); // Actual durable native command, not a mocked receipt.
@@ -133,7 +137,7 @@ describe("followUp durable publication outcome (#14867)", () => {
     expect(error.message).toMatch(/do not resend/i);
     expect(error.message).toContain((event.data as FabricControlCommand).commandId);
     expect(error).not.toBe(failure);
-    if (fault === "queue expiry") expect(error.cause).toBe(failure);
+    if (fault !== "CAS loss") expect(error.cause).toBe(failure);
     else expect(error.cause).toBeInstanceOf(Error);
     expect(publish.mock.calls.filter(([input]) => input.topic === "fabric.control.command" && input.kind === "followUp")).toHaveLength(1);
     const delivered = vi.fn((command: FabricControlCommand) => ({ accepted: true, messageId: command.commandId }));
@@ -141,6 +145,22 @@ describe("followUp durable publication outcome (#14867)", () => {
     await vi.waitFor(() => expect(delivered).toHaveBeenCalledOnce(), { timeout: 3000 });
     expect(delivered.mock.calls[0]![0]).toMatchObject({ message: "same immutable message", data: { token: "unchanged" } });
     expect(f.commands()).toHaveLength(1);
+  });
+
+  it("keeps an arbitrary rejected owner ACK unconfirmed after admission", async () => {
+    const f = fixture();
+    const reason = "owner handoff failed after admission";
+    const delivered = vi.fn(() => ({ accepted: false, error: reason }));
+    f.receiver.start(delivered);
+
+    const error = await f.send().catch(error => error);
+    expect(delivered).toHaveBeenCalledOnce();
+    expect(f.commands()).toHaveLength(1);
+    const event = f.commands()[0]!;
+    expect(error).toMatchObject({ name: "FabricDeliveryUnconfirmedError", code: "FABRIC_DELIVERY_UNCONFIRMED",
+      deliveryId: (event.data as FabricControlCommand).commandId, targetId: f.to.id, idempotencyKey: "same-logical-delivery" });
+    expect(error.cause).toMatchObject({ message: reason, rejection: "FABRIC_CONTROL_REJECTED", notRun: false });
+    expect(hasDeliveryOutcome(f.root, { eventId: event.id, to: f.targetId, from: f.from.id, mode: "followUp" }, "unknown")).toBe(true);
   });
 
   it("reports delivery unconfirmed when the owner accepts but its ACK cannot return", async () => {

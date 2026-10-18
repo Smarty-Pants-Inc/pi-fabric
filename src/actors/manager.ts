@@ -5036,7 +5036,10 @@ export class ActorManager {
     let index = actor.queue.findIndex(item => this.#placementRunnable(item, now));
     if (index < 0) {
       const fromOverflow = overflow.findIndex(item => this.#placementRunnable(item, now));
-      if (fromOverflow < 0) return false;
+      // An empty queue may still need the drain's settled-boundary cleanup (for
+      // example, restoring a verified legacy overflow block). Do not treat the
+      // absence of runnable launch work as a reason to skip that cleanup.
+      if (fromOverflow < 0) return held.length === 0;
       const [ready] = overflow.splice(fromOverflow, 1);
       // Keep the configured queue bound while bypassing waiting background work.
       if (actor.queue.length >= this.meshConfig.actorQueueLimit) overflow.unshift(actor.queue.pop()!);

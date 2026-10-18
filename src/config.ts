@@ -7,7 +7,8 @@ import type { ModelRoutingConfig } from "./agents/model-route.js";
 import { parsePerCallRouting } from "./agents/per-call-config.js";
 import { normalizeAgentRouterConfig, type FabricAgentRouterConfig } from "./agents/router-config.js";
 export type { FabricAgentRouterConfig } from "./agents/router-config.js";
-import { normalizeAgentPlacement, type AgentPlacementConfig } from "./agents/placement-config.js";
+import { normalizeAgentPlacement, normalizePlacementDeciderConfig, type AgentPlacementConfig, type FabricPlacementDeciderConfig } from "./agents/placement-config.js";
+export type { FabricPlacementDeciderConfig } from "./agents/placement-config.js";
 import { normalizeWakeTextConfig, type FabricWakeTextConfig } from "./actors/wake-text.js";
 import type { LandlockSettings } from "./core/landlock.js";
 import { DEFAULT_JEV_CONFIG, normalizeJevConfig, type FabricJevConfig } from "./jev/config.js";
@@ -238,6 +239,8 @@ interface FabricPrewalkConfig {
 export interface FabricAgentConfig {
   /** Optional host-only external spawn/actor model router; off unless enabled. */
   router?: FabricAgentRouterConfig;
+  /** Host-only external placement boundary; absent or unspecified mode defaults off. */
+  placementDecider?: FabricPlacementDeciderConfig;
   /** Opt-in shadow routing pins and finite candidates, never live routing. */
   modelRouting?: ModelRoutingConfig;
   enabled: boolean;
@@ -1454,6 +1457,10 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
   const prewalk = objectValue(input.prewalk);
   const agents = objectValue(input.agents);
   const placement = normalizeAgentPlacement(agents.placement);
+  const placementDecider = normalizePlacementDeciderConfig(agents.placementDecider);
+  if (placementDecider?.mode === "enforce") {
+    throw new Error("agents.placementDecider.mode=enforce is unavailable until the resident-host placement follow-up is installed");
+  }
   const claude = objectValue(agents.claude);
   const veda = objectValue(agents.veda);
   const capture = objectValue(input.capture);
@@ -1773,6 +1780,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
         ? { processSlice: agents.processSlice } : {}),
       processMemoryMaxBytes: processMemoryMaxBytesValue(agents.processMemoryMaxBytes),
       ...(placement ? { placement } : {}),
+      ...(placementDecider ? { placementDecider } : {}),
       ...(router ? { router } : {}),
       ...(agentModel ? { model: agentModel } : {}),
       ...(typeof agents.modelRouting === "object" && agents.modelRouting !== null && !Array.isArray(agents.modelRouting)
@@ -2483,6 +2491,7 @@ const resolveFabricConfig = (
     if (plan === projectPlan) {
       const agents = { ...objectValue(document.agents) };
       delete agents.router; // Host-only argv execution and task disclosure policy.
+      delete agents.placementDecider; // Host-only command/mode/wake binding, never project authority.
       delete agents.modelPolicy;
       delete agents.deniedModels;
       delete agents.deniedModelReplacement;

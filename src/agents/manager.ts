@@ -1393,6 +1393,7 @@ export class AgentManager {
   readonly #parentLineage: FabricAgentLineage | undefined = readAgentLineage();
   #childIndex = 0;
   readonly #piModelPreparations = new Map<string, Promise<string | undefined>>();
+  readonly #placementDiagnosticCounts = new Map<string, number>();
   readonly #budget: BudgetLedgerState | undefined;
   readonly #budgetOwned: boolean;
   readonly #uiListeners = new Set<() => void>();
@@ -2001,6 +2002,84 @@ export class AgentManager {
     return awaitAgentCwd(this.cwd, requestedCwd, signal);
   }
 
+  #placementDiagnostic(kind: string, id: string, missingFields: string[] = []): void {
+    const count = (this.#placementDiagnosticCounts.get(kind) ?? 0) + 1;
+    this.#placementDiagnosticCounts.set(kind, count);
+    if (count === 1 || (count & (count - 1)) === 0) {
+      const missing = missingFields.length ? `; missing=${[...new Set(missingFields)].slice(0, 16).join(",")}` : "";
+      diagnostics.warn("src/agents/manager.ts", `[pi-fabric] placement ${kind}; run=${id}; count=${count}${missing}`);
+    }
+  }
+
+  async #placementPreflight(id: string, request: AgentRunRequest, runner: FabricAgentRunner, model: string | undefined,
+    thinking: FabricThinking | undefined): Promise<void> {
+    const config = this.config.placementDecider;
+    if (!config || config.mode === "off" || (runner !== "pi" && runner !== "pi-durable")) return;
+    const run = async (): Promise<void> => {
+      const [{ CliPlacementDecider, PlacementAdmissionError, PlacementQueueError }, contextModule, contract] = await Promise.all([
+        import("./placement-admission.js"), import("./placement-context.js"), import("./placement-contract.js"),
+      ]);
+      const deadline = performance.now() + contract.PLACEMENT_DEADLINE_MS;
+      const binding = request.placement;
+      const actorActivation = binding?.actorActivation;
+      if ((actorActivation && (binding?.role !== "actor-activation" || actorActivation.actorId !== request.actorId ||
+          actorActivation.rootId !== this.#mainAgentId)) ||
+          (binding?.role === "actor-activation" && (!actorActivation || !request.actorId || !this.#mainAgentId))) {
+        this.#placementDiagnostic("actor-root-ownership-refused", id);
+        throw new PlacementAdmissionError("invalid-request");
+      }
+      const launchId = binding?.launchId ?? request.activationId ?? id;
+      const generation = binding?.generation ?? 1;
+      if (!Number.isSafeInteger(generation) || generation < 1) throw new PlacementAdmissionError("invalid-request");
+      const context = await contextModule.resolvePlacementCallerContext(config, deadline);
+      const draft = contextModule.buildPlacementRequestDraft(context, {
+        launchId, generation, agentName: `fabric-child:${launchId}`,
+        ...(binding ? { child: {
+          ...(binding.role ? { role: binding.role } : {}), ...(binding.complexity ? { complexity: binding.complexity } : {}),
+          ...(binding.profile ? { profile: binding.profile } : {}), ...(binding.memoryProfileRef ? { memoryProfileRef: binding.memoryProfileRef } : {}),
+          ...(binding.actorActivation ? { actorActivation: binding.actorActivation } : {}),
+        } } : {}),
+        ...(model ? { model } : {}), ...(thinking ? { thinking } : {}),
+        capabilities: request.capabilityRequirements ?? [],
+      });
+      const decider = new CliPlacementDecider(config);
+      if (config.mode === "shadow") {
+        const observation = await decider.observe(draft.request, { deadline });
+        this.#placementDiagnostic(`shadow-${observation.hypothetical.decision.toLowerCase()}`, id, draft.missingFields);
+        return;
+      }
+      if (draft.missingFields.length || !draft.roleAllowed) {
+        this.#placementDiagnostic("context-or-role-refused", id, draft.missingFields);
+        throw new PlacementAdmissionError("invalid-request");
+      }
+      const answer = await decider.decide(draft.request, { deadline });
+      if (answer.decision === "QUEUE") {
+        if (draft.request.interaction.class === "live-human") {
+          this.#placementDiagnostic("live-human-queue-refused", id);
+          throw new PlacementAdmissionError("invalid-response");
+        }
+        const anonymousUnavailable = answer.reason === "DECIDER_UNAVAILABLE" && answer.launch_id === undefined && answer.generation === undefined;
+        if (!anonymousUnavailable && (answer.launch_id !== draft.request.launch_id || answer.generation !== draft.request.generation)) {
+          this.#placementDiagnostic("queue-identity-missing", id);
+          throw new PlacementAdmissionError("invalid-response");
+        }
+        this.#placementDiagnostic(`queued-${answer.reason.toLowerCase()}`, id);
+        throw new PlacementQueueError(draft.request, answer);
+      }
+      // The current schema has typed native identity placeholders but no published
+      // systemd create-fence or registration receipt. A CLI PLACE is not authority.
+      this.#placementDiagnostic("native-create-proof-unavailable", id);
+      throw new PlacementAdmissionError("unavailable");
+    };
+    if (config.mode === "shadow") {
+      // Observation includes context resolution and the CLI round-trip; neither may
+      // delay or authorize a live launch.
+      void run().catch(() => this.#placementDiagnostic("shadow-observation-unavailable", id));
+      return;
+    }
+    await run();
+  }
+
   #inheritedSessionPins(request: AgentRunRequest): InheritedSessionPin[] | undefined {
     const explicit = request.inheritedSessionPins;
     if (explicit && explicit.length > 0) return explicit;
@@ -2575,11 +2654,14 @@ export class AgentManager {
         if (this.#closing) throw new Error("Fabric agent manager is closing");
         if (signal?.aborted) throw new Error("Agent launch aborted");
         assertAuthorized();
+        await this.#placementPreflight(id, request, runner, model, effectiveThinking());
         // Internal resident-host fence: preparation may outlive the caller's deadline.
         // Activation authority and durable request commit are independent obligations.
         beforeCommit?.(id);
       } catch (error) {
-        try { routeDispatch?.outcome({ status: signal?.aborted ? "stopped" : "failed" }); } catch { /* pinned work is never blocked by routing storage */ }
+        if ((error as { name?: unknown } | undefined)?.name !== "PlacementQueueError") {
+          try { routeDispatch?.outcome({ status: signal?.aborted ? "stopped" : "failed" }); } catch { /* pinned work is never blocked by routing storage */ }
+        }
         release();
         throw error;
       }
@@ -3201,7 +3283,7 @@ export class AgentManager {
     const start = async (release: () => void, signal = admissionSignal): Promise<AgentHandleInfo> => {
       try { return await startPrepared(release, signal); }
       catch (error) {
-        if (!routerStartState.settled) {
+        if ((error as { name?: unknown } | undefined)?.name !== "PlacementQueueError" && !routerStartState.settled) {
           routerStartState.settled = true;
           await this.#recordSpawnRouterStartFailed(request, routerStartState.admission);
         }
@@ -3216,7 +3298,8 @@ export class AgentManager {
             await this.#withdrawTaskPresence(id);
           }
         }
-        if ((error as { launchOutcome?: string } | undefined)?.launchOutcome !== "unknown" && !this.#queued.has(id)) {
+        if ((error as { launchOutcome?: string } | undefined)?.launchOutcome !== "unknown" &&
+            (error as { name?: unknown } | undefined)?.name !== "PlacementQueueError" && !this.#queued.has(id)) {
           try { routeDispatch?.outcome({ status: signal?.aborted ? "stopped" : "failed" }); }
           catch (saveError) { diagnostics.warn("src/agents/manager.ts", `[pi-fabric] Pre-worker route outcome save failed; files retained at ${path.join(this.#runRoot, id)}: ${String(saveError)}`); }
         }

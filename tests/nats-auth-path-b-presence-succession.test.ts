@@ -219,10 +219,12 @@ describe.skipIf(!binary || process.platform !== "linux")("#14115 real authentica
     const id = `session:${sessionId}`;
     const config = configFor(root, "machine-a");
     const owner = main(root, sessionId, "presence-projection");
-    const meshRoot = path.join(root, "mesh");
     const localKey = `topology/participants/${createHash("sha256").update(id).digest("hex")}`;
     try {
       await owner.runtime.initialize(owner.context, config);
+      const projectRoot = process.env.PI_FABRIC_PROJECT_ROOT ?? owner.context.cwd;
+      const meshRoot = process.env.PI_FABRIC_MESH_ROOT ?? path.resolve(projectRoot,
+        owner.runtime.config.mesh.root ?? path.join(".pi", "fabric", "mesh"));
       await vi.waitFor(() => expect(readParticipantFile(meshRoot, localKey)).toMatchObject({
         key: localKey, updatedBy: { id }, value: { id, rootId: id, kind: "root", ownerIdentityId: id },
       }), { timeout: 5_000 });

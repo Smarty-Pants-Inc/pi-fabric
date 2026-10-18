@@ -33,7 +33,10 @@ class MemoryKv implements TransportKv {
   readonly values = new Map<string, TransportKvEntry<unknown>>();
   readonly watchers: Watcher[] = [];
   #revision = 0;
+  #watchGenerations = 0;
   constructor(ttlMs: number, readonly machine: string) { this.ttlMs = ttlMs; }
+  get revision(): number { return this.#revision; }
+  get watchGeneration(): number { return this.#watchGenerations; }
   seed(key: string, owner: string, value: unknown): TransportKvEntry<unknown> {
     const entry = { key, machine: this.machine, owner, value, revision: ++this.#revision };
     this.values.set(key, entry);
@@ -58,6 +61,7 @@ class MemoryKv implements TransportKv {
     return true;
   }
   async *watch<V>(prefix: string, signal: AbortSignal): AsyncIterable<TransportKvEvent<V>> {
+    this.#watchGenerations++;
     const watcher: Watcher = { prefix: prefix.slice(0, -1), queue: [], paused: false };
     this.watchers.push(watcher);
     const snapshot = function* (self: MemoryKv): Generator<Event> {
@@ -154,6 +158,18 @@ async function start(f: ReturnType<typeof fixture>): Promise<void> {
   await f.projection.whenReady();
 }
 async function waitUntil(check: () => void): Promise<void> { await vi.waitFor(check, { timeout: 2_000, interval: 5 }); }
+function projectedParticipantRevision(meshRoot: string, id: string): number | undefined {
+  const projected = readParticipantFile(meshRoot, localParticipantKey(id)) as
+    { natsProjection?: { revision?: unknown } } | undefined;
+  return typeof projected?.natsProjection?.revision === "number" ? projected.natsProjection.revision : undefined;
+}
+function projectedHostLeaseRevision(meshRoot: string, id: string): number | undefined {
+  try {
+    const projected = JSON.parse(fs.readFileSync(hostLeasePath(meshRoot, id), "utf8")) as
+      { natsProjection?: { revision?: unknown } };
+    return typeof projected.natsProjection?.revision === "number" ? projected.natsProjection.revision : undefined;
+  } catch { return undefined; }
+}
 
 afterEach(async () => {
   await Promise.all(projections.splice(0).map(projection => projection.close()));
@@ -189,6 +205,59 @@ describe("NATS local presence projection", () => {
     });
   });
 
+  it("resnapshots and continues after a participant file-writer failure", async () => {
+    const f = fixture();
+    await start(f);
+    const initialGeneration = f.presence.watchGeneration;
+    const write = participantFiles.writeParticipantFileIf;
+    let failed = false;
+    vi.spyOn(participantFiles, "writeParticipantFileIf").mockImplementation(async (...args) => {
+      if (!failed) { failed = true; throw new Error("injected participant writer failure"); }
+      return write(...args);
+    });
+
+    const first = participant(f.id, INCARNATION, "Recovered participant", f.record.updatedAt + 1);
+    let revision = await f.presence.put(participantKvKey(f.id), owner, first, f.presenceEntry!.revision);
+    await waitUntil(() => expect(f.presence.watchGeneration).toBeGreaterThan(initialGeneration));
+    await waitUntil(() => expect(projectedParticipantRevision(f.mesh.root, f.id)).toBe(revision));
+    expect(failed).toBe(true);
+
+    const later = participant(f.id, INCARNATION, "Later participant renewal", first.updatedAt + 1);
+    revision = await f.presence.put(participantKvKey(f.id), owner, later, revision);
+    await waitUntil(() => expect(projectedParticipantRevision(f.mesh.root, f.id)).toBe(revision));
+    expect(await f.presence.delete(participantKvKey(f.id), revision)).toBe(true);
+    await waitUntil(() => expect(readParticipantFile(f.mesh.root, localParticipantKey(f.id))).toBeUndefined());
+  });
+
+  it("resnapshots and continues after a host lease lock failure", async () => {
+    const f = fixture();
+    await start(f);
+    const initialGeneration = f.leases.watchGeneration;
+    const lock = hostLeaseLock.withHostLeaseLock;
+    let failed = false;
+    vi.spyOn(hostLeaseLock, "withHostLeaseLock").mockImplementation(async (...args) => {
+      if (!failed) { failed = true; throw new Error("injected host lease lock failure"); }
+      return lock(...args);
+    });
+    // A missing local lease bypasses the stat-only fast path and reaches the injected lock.
+    fs.rmSync(hostLeasePath(f.mesh.root, f.id), { force: true });
+
+    const first = lease(f.id, INCARNATION, f.hostLease.updatedAt + 1);
+    let revision = await f.leases.put(leaseKvKey(f.id), `${f.id}#${INCARNATION}`, first, f.leaseEntry!.revision);
+    await waitUntil(() => expect(f.leases.watchGeneration).toBeGreaterThan(initialGeneration));
+    await waitUntil(() => expect(projectedHostLeaseRevision(f.mesh.root, f.id)).toBe(revision));
+    await waitUntil(() => expect(f.projection.metrics().hostLeaseWrites).toBe(2));
+    expect(failed).toBe(true);
+
+    // Force the later renewal through the locked writer instead of the stat-only cache path.
+    fs.rmSync(hostLeasePath(f.mesh.root, f.id), { force: true });
+    const later = lease(f.id, INCARNATION, first.updatedAt + 1);
+    revision = await f.leases.put(leaseKvKey(f.id), `${f.id}#${INCARNATION}`, later, revision);
+    await waitUntil(() => expect(projectedHostLeaseRevision(f.mesh.root, f.id)).toBe(revision));
+    expect(await f.leases.delete(leaseKvKey(f.id), revision)).toBe(true);
+    await waitUntil(() => expect(readHostLease(f.mesh.root, f.id)).toBeUndefined());
+  });
+
   it("reports steady lease-refresh writes and local reconciliation reads per minute", async () => {
     let clock = 1_000_000;
     const f = fixture({ record: participant(ROOT, INCARNATION, "Main", clock),
@@ -203,13 +272,13 @@ describe("NATS local presence projection", () => {
       if (step === 3) pRevision = await f.presence.put(participantKvKey(f.id), owner, f.record, pRevision);
       if (step === 6) pRevision = await f.presence.put(participantKvKey(f.id), owner, changed, pRevision);
       if (step === 12) pRevision = await f.presence.put(participantKvKey(f.id), owner, changed, pRevision);
-      if (step % 2 === 0) await waitUntil(() => expect(f.projection.metrics().hostLeaseWrites).toBe(1 + step / 2));
+      if (step % 2 === 0) await waitUntil(() => expect(f.projection.metrics().hostLeaseWrites).toBe(1 + step));
     }
     await waitUntil(() => expect(f.projection.metrics().participantReconcileReads).toBe(5));
     expect(f.projection.metrics()).toMatchObject({
-      elapsedMs: 60_000, participantWrites: 2, hostLeaseWrites: 7,
+      elapsedMs: 60_000, participantWrites: 4, hostLeaseWrites: 13,
       participantReconcileReads: 5, hostLeaseReconcileReads: 14, kvReconcileReads: 0,
-      participantWritesPerMinute: 2, hostLeaseWritesPerMinute: 7,
+      participantWritesPerMinute: 4, hostLeaseWritesPerMinute: 13,
       participantReconcileReadsPerMinute: 5, hostLeaseReconcileReadsPerMinute: 14,
       kvReconcileReadsPerMinute: 0,
     });
@@ -238,7 +307,7 @@ describe("NATS local presence projection", () => {
     expect(f.projection.metrics()).toMatchObject({
       elapsedMs: 60_000, participantWritesPerMinute: 5, hostLeaseWritesPerMinute: 5,
       participantReconcileReadsPerMinute: 6, hostLeaseReconcileReadsPerMinute: 7,
-      kvReconcileReadsPerMinute: 0,
+      kvReconcileReadsPerMinute: 2,
     });
   });
 
@@ -264,6 +333,141 @@ describe("NATS local presence projection", () => {
     await waitUntil(() => expect(readParticipantFile(again.mesh.root, localParticipantKey(again.id))).toBeUndefined());
   });
 
+  it("retains recreated participant and lease rows when the other projection receives an older tombstone", async () => {
+    const initialLease = { ...lease(ROOT, INCARNATION), expiresAt: Date.now() + 120_000 };
+    const f = fixture({ lease: initialLease });
+    await start(f);
+    const other = new NatsLocalProjection({ mesh: f.mesh, transport: f.transport, leaseLive: () => true });
+    projections.push(other);
+    other.start();
+    await other.whenReady();
+    expect(f.presence.watchers).toHaveLength(2);
+    expect(f.leases.watchers).toHaveLength(2);
+    for (const index of [0, 1]) { f.presence.pause(index); f.leases.pause(index); }
+
+    const pKey = participantKvKey(f.id), hKey = leaseKvKey(f.id);
+    expect(await f.presence.delete(pKey, f.presenceEntry!.revision)).toBe(true);
+    const oldParticipantTombstone: Event = {
+      type: "gone", key: pKey, machine: MACHINE, revision: f.presence.revision, reason: "deleted",
+    };
+    expect(await f.leases.delete(hKey, f.leaseEntry!.revision)).toBe(true);
+    const oldLeaseTombstone: Event = {
+      type: "gone", key: hKey, machine: MACHINE, revision: f.leases.revision, reason: "deleted",
+    };
+
+    const participantRevision = await f.presence.put(pKey, owner, f.record, 0);
+    const currentParticipant = await f.presence.get(pKey);
+    if (!currentParticipant) throw new Error("recreated participant row missing from MemoryKv");
+    expect(currentParticipant.value).toEqual(f.record);
+    const leaseRevision = await f.leases.put(hKey, `${f.id}#${INCARNATION}`, f.hostLease, 0);
+    const currentLease = await f.leases.get(hKey);
+    if (!currentLease) throw new Error("recreated lease row missing from MemoryKv");
+    expect(currentLease.value).toEqual(f.hostLease);
+
+    const projected = f.projection.metrics();
+    f.presence.deliverTo(0, { type: "put", entry: currentParticipant });
+    f.leases.deliverTo(0, { type: "put", entry: currentLease });
+    await waitUntil(() => {
+      const metrics = f.projection.metrics();
+      expect(metrics.participantReconcileReads).toBeGreaterThan(projected.participantReconcileReads);
+      expect(metrics.hostLeaseReconcileReads).toBeGreaterThan(projected.hostLeaseReconcileReads);
+      expect(projectedParticipantRevision(f.mesh.root, f.id)).toBe(participantRevision);
+      expect(projectedHostLeaseRevision(f.mesh.root, f.id)).toBe(leaseRevision);
+    });
+
+    const checked = other.metrics().kvReconcileReads;
+    f.presence.deliverTo(1, oldParticipantTombstone);
+    f.leases.deliverTo(1, oldLeaseTombstone);
+    await waitUntil(() => expect(other.metrics().kvReconcileReads).toBeGreaterThanOrEqual(checked + 2));
+    expect(readParticipantFile(f.mesh.root, localParticipantKey(f.id))).toMatchObject({ value: f.record });
+    expect(readHostLease(f.mesh.root, f.id)).toMatchObject({
+      id: f.id, rootId: f.id, identityId: f.id, incarnationToken: INCARNATION,
+    });
+
+    expect(await f.presence.delete(pKey, participantRevision)).toBe(true);
+    const currentParticipantTombstone: Event = {
+      type: "gone", key: pKey, machine: MACHINE, revision: f.presence.revision, reason: "deleted",
+    };
+    expect(await f.leases.delete(hKey, leaseRevision)).toBe(true);
+    const currentLeaseTombstone: Event = {
+      type: "gone", key: hKey, machine: MACHINE, revision: f.leases.revision, reason: "deleted",
+    };
+    f.presence.deliverTo(0, currentParticipantTombstone);
+    f.leases.deliverTo(0, currentLeaseTombstone);
+    await waitUntil(() => {
+      expect(readParticipantFile(f.mesh.root, localParticipantKey(f.id))).toBeUndefined();
+      expect(readHostLease(f.mesh.root, f.id)).toBeUndefined();
+    });
+  });
+
+  it("fences delayed removals when a recreated row is reprojected after the KV absence read", async () => {
+    const f = fixture();
+    await start(f);
+    const pKey = participantKvKey(f.id), hKey = leaseKvKey(f.id);
+    const localKey = localParticipantKey(f.id), hostFile = hostLeasePath(f.mesh.root, f.id);
+    const gated = new Set<string>();
+    const release = deferred<void>();
+    const markGated = (kind: string): void => { gated.add(kind); };
+
+    const removeParticipant = participantFiles.removeParticipantFileIf;
+    vi.spyOn(participantFiles, "removeParticipantFileIf").mockImplementation(async (...args) => {
+      if (args[1] === localKey && !gated.has("participant")) {
+        markGated("participant");
+        await release.promise;
+      }
+      return removeParticipant(...args);
+    });
+    const withLeaseLock = hostLeaseLock.withHostLeaseLock;
+    vi.spyOn(hostLeaseLock, "withHostLeaseLock").mockImplementation(async (mesh, file, operation, options) => {
+      if (file === hostFile && !gated.has("lease")) {
+        markGated("lease");
+        await release.promise;
+      }
+      return withLeaseLock(mesh, file, operation, options);
+    });
+
+    try {
+      expect(await f.presence.delete(pKey, f.presenceEntry!.revision)).toBe(true);
+      expect(await f.leases.delete(hKey, f.leaseEntry!.revision)).toBe(true);
+      await waitUntil(() => expect(gated.size).toBe(2));
+      expect(f.projection.metrics().kvReconcileReads).toBe(2);
+
+      // Each old tombstone has already read the key as absent, but its local removal
+      // is paused. A separate watch snapshot now sees the recreated KV rows and
+      // advances their persisted markers before those stale removals resume.
+      const participantRevision = await f.presence.put(pKey, owner, f.record, 0);
+      const leaseRevision = await f.leases.put(hKey, owner, f.hostLease, 0);
+      const successor = new NatsLocalProjection({ mesh: f.mesh, transport: f.transport, leaseLive: () => true });
+      projections.push(successor);
+      successor.start();
+      await successor.whenReady();
+      await waitUntil(() => {
+        expect(projectedParticipantRevision(f.mesh.root, f.id)).toBe(participantRevision);
+        expect(projectedHostLeaseRevision(f.mesh.root, f.id)).toBe(leaseRevision);
+      });
+
+      release.resolve();
+      await waitUntil(() => {
+        expect(readParticipantFile(f.mesh.root, localKey)).toMatchObject({
+          value: { id: f.id }, natsProjection: { revision: participantRevision },
+        });
+        expect(readHostLease(f.mesh.root, f.id)).toMatchObject({ id: f.id });
+        expect(projectedHostLeaseRevision(f.mesh.root, f.id)).toBe(leaseRevision);
+      });
+
+      // A true current tombstone still removes both projections.
+      vi.restoreAllMocks();
+      expect(await f.presence.delete(pKey, participantRevision)).toBe(true);
+      expect(await f.leases.delete(hKey, leaseRevision)).toBe(true);
+      await waitUntil(() => {
+        expect(readParticipantFile(f.mesh.root, localKey)).toBeUndefined();
+        expect(readHostLease(f.mesh.root, f.id)).toBeUndefined();
+      });
+    } finally {
+      release.resolve();
+    }
+  });
+
   it("refuses a stale-incarnation writer that resumes after a newer projection", async () => {
     const f = fixture();
     const delayed = deferred<void>();
@@ -278,7 +482,8 @@ describe("NATS local presence projection", () => {
     await entered.promise;
 
     const nextIncarnation = "projection-incarnation-b";
-    const nextRecord = participant(f.id, nextIncarnation, "Successor", Date.now() + 10);
+    const nextRecord = participant(f.id, nextIncarnation, "Successor", f.record.updatedAt - 1);
+    expect(nextRecord.updatedAt).toBeLessThan(f.record.updatedAt);
     const nextLease = lease(f.id, nextIncarnation, nextRecord.updatedAt);
     const nextPresenceRevision = await f.presence.put(participantKvKey(f.id), `${f.id}#${nextIncarnation}`, nextRecord, f.presenceEntry!.revision);
     await f.leases.put(leaseKvKey(f.id), `${f.id}#${nextIncarnation}`, nextLease, f.leaseEntry!.revision);
@@ -301,6 +506,33 @@ describe("NATS local presence projection", () => {
     });
   });
 
+  it("settles every removal in bounded unique-key participant and lease churn", async () => {
+    const f = fixture();
+    await start(f);
+    const rows: Array<{ id: string; participantRevision: number; leaseRevision: number }> = [];
+    for (let index = 0; index < 8; index++) {
+      const id = `session:projection-churn-${index}`;
+      const record = participant(id, `churn-incarnation-${index}`, `Churn ${index}`, f.record.updatedAt + index + 1);
+      const hostLease = lease(id, record.ownerIncarnation!, record.updatedAt);
+      const participantRevision = await f.presence.put(participantKvKey(id), `${id}#${record.ownerIncarnation}`, record, 0);
+      const leaseRevision = await f.leases.put(leaseKvKey(id), `${id}#${record.ownerIncarnation}`, hostLease, 0);
+      rows.push({ id, participantRevision, leaseRevision });
+    }
+    await waitUntil(() => expect(f.projection.metrics()).toMatchObject({
+      participantWrites: rows.length + 1, hostLeaseWrites: rows.length + 1,
+    }));
+    for (const row of rows) {
+      expect(await f.presence.delete(participantKvKey(row.id), row.participantRevision)).toBe(true);
+      expect(await f.leases.delete(leaseKvKey(row.id), row.leaseRevision)).toBe(true);
+    }
+    await waitUntil(() => {
+      for (const row of rows) {
+        expect(readParticipantFile(f.mesh.root, localParticipantKey(row.id))).toBeUndefined();
+        expect(readHostLease(f.mesh.root, row.id)).toBeUndefined();
+      }
+    });
+  });
+
   it("fences a delayed stale-incarnation host-lease writer while allowing the successor", async () => {
     const f = fixture();
     const delayed = deferred<void>();
@@ -315,7 +547,8 @@ describe("NATS local presence projection", () => {
     await entered.promise;
 
     const nextIncarnation = "projection-incarnation-b";
-    const nextLease = lease(f.id, nextIncarnation, Date.now() + 10);
+    const nextLease = lease(f.id, nextIncarnation, f.hostLease.updatedAt - 1);
+    expect(nextLease.updatedAt).toBeLessThan(f.hostLease.updatedAt);
     const nextRevision = await f.leases.put(leaseKvKey(f.id), `${f.id}#${nextIncarnation}`, nextLease, f.leaseEntry!.revision);
     const successor = new NatsLocalProjection({ mesh: f.mesh, transport: f.transport, leaseLive: () => true });
     projections.push(successor);

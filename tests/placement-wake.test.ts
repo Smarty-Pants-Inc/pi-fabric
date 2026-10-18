@@ -137,6 +137,31 @@ async function ackWithoutControl(f: Fixture, payload: TransportEnvelope, source 
 }
 
 describe("Path B placement.wake receiver", () => {
+  it("keeps an attempt-five wake pending while its known local checkpoint is delayed", async () => {
+    const entered = deferred<void>(), commit = deferred<void>();
+    const f: Fixture = new Fixture({ onPlacementWake: async (targetId, received) => {
+      entered.resolve();
+      await commit.promise;
+      return f.persist(targetId, received);
+    } });
+    const receipt = f.transport.deliver(envelope(), SOURCE, () => {
+      assert.deepEqual(f.diskWake(), { targetId: TARGET, wake: wake() });
+    }, 5);
+    try {
+      await bounded(entered.promise);
+      await new Promise(resolve => setTimeout(resolve, 1_300));
+      assert.equal(receipt.acks, 0);
+      assert.deepEqual(receipt.naks, []);
+      assert.deepEqual(receipt.terms, []);
+      assert.equal(f.diskWake(), undefined);
+      commit.resolve();
+      assert.equal(await bounded(receipt.outcome), "ack");
+      assert.equal(receipt.acks, 1);
+      assert.deepEqual(receipt.naks, []);
+      assert.deepEqual(warnings, []);
+    } finally { commit.resolve(); }
+  });
+
   it("delivers an authenticated wake directly and persists the exact owner record before ACK", async () => {
     const entered = deferred<void>(), commit = deferred<void>(), events: string[] = [];
     const f: Fixture = new Fixture({ onPlacementWake: async (targetId, received) => {

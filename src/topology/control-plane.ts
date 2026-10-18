@@ -2522,9 +2522,9 @@ export class FabricControlPlane {
               envelope.id !== `placement-wake:${wake.launchId}:${wake.generation}:${wake.reason}`) {
             this.#reportPlacementWakeDrop("malformed");
           } else if (await this.options.onPlacementWake?.(envelope.targetId, wake) !== true) {
-            // The queue's QUEUE response can reach this owner before its matching local checkpoint.
-            // NAK false/missing receipts so that exact launch+generation is checked again after commit.
-            // JetStream attempt is durable across owner restarts; final unknown wakes are counted below.
+            // A known local QUEUE keeps this await pending until its durable checkpoint commits;
+            // false/missing means no matching pending queue or checkpoint. NAK then rechecks the
+            // exact launch+generation; JetStream attempt survives restarts and unknown wakes are bounded below.
             const attempt = Number.isSafeInteger(delivery.attempt) && delivery.attempt > 0
               ? delivery.attempt : PLACEMENT_WAKE_MAX_DELIVERIES;
             if (attempt < PLACEMENT_WAKE_MAX_DELIVERIES) {

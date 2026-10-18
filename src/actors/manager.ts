@@ -129,19 +129,32 @@ export interface ActorMessageBindingOptions {
   sender?: FabricMessageSender | null;
 }
 
+const PLACEMENT_RETRY_BASE_DELAY_MS = 250;
+const PLACEMENT_RETRY_MAX_BACKOFF_MS = 60_000;
+const PLACEMENT_RETRY_MAX_COUNT = 9;
+const PLACEMENT_RETRY_MAX_DELAY_MS = 86_400_000;
+
 interface ActorPlacementQueue {
   launchId: string;
   generation: number;
   queueId?: string;
   reason: PlacementQueueReason;
-  /** Seconds, as returned by the writer; retryAt is its host-clock lower bound. */
+  /** Seconds, as returned by the writer; retryAt also includes bounded local backoff. */
   retryAfter: number;
   retryAt: number;
+  /** Repeated QUEUE responses increase local backoff; absent in legacy checkpoints. */
+  retryCount?: number;
   /** Stable wake identities (one per reason), retained even after a retry consumes them. */
   wakes: FabricPlacementWake[];
   wakePending?: true;
   /** A wake was consumed, but no replacement QUEUE/terminal result has committed yet. */
   retrying?: true;
+}
+
+interface PendingPlacementQueueWake {
+  actorId: string;
+  wakes: FabricPlacementWake[];
+  waiters: Map<FabricPlacementWake["reason"], { promise: Promise<boolean>; resolve: (accepted: boolean) => void }>;
 }
 
 interface ActorQueueItem {
@@ -784,6 +797,7 @@ const PLACEMENT_QUEUE_REASONS: ReadonlySet<string> = new Set([
 ]);
 const placementId = (value: unknown): value is string => typeof value === "string" &&
   [...value].length > 0 && [...value].length <= 200 && !/[\u0000-\u001f\u007f]/u.test(value);
+const placementWakeKey = (launchId: string, generation: number): string => `${launchId.length}:${launchId}:${generation}`;
 const placementWakeReceipt = (value: unknown, launchId: string, generation: number): FabricPlacementWake | undefined => {
   const wake = refRecord(value);
   if (!wake || wake.version !== 1 || wake.launchId !== launchId || wake.generation !== generation ||
@@ -806,9 +820,12 @@ const restoredPlacementQueue = (value: unknown): ActorPlacementQueue | undefined
     if (!wake || wakes.some(prior => prior.reason === wake.reason)) return;
     wakes.push(wake);
   }
+  const retryCount = Number.isSafeInteger(row.retryCount) && (row.retryCount as number) >= 0
+    ? Math.min(row.retryCount as number, PLACEMENT_RETRY_MAX_COUNT) : 0;
   return { launchId: row.launchId, generation: row.generation as number,
     ...(row.queueId !== undefined ? { queueId: row.queueId as string } : {}),
     reason: row.reason as PlacementQueueReason, retryAfter: row.retryAfter, retryAt: row.retryAt, wakes,
+    ...(retryCount > 0 ? { retryCount } : {}),
     ...(row.wakePending === true && wakes.length ? { wakePending: true } : {}),
     ...(row.retrying === true && wakes.length ? { retrying: true } : {}) };
 };
@@ -850,8 +867,10 @@ export class ActorManager {
   readonly #inFlightBatches = new Map<string, ActorQueueItem[]>();
   /** At most one unref'd leading-edge batching wake per actor. */
   readonly #batchTimers = new Map<string, { at: number; timer: NodeJS.Timeout }>();
-  /** Only an accepted early wake arms this lower-bound timer; no idle placement polling. */
+  /** One-shot local QUEUE retries; retryAt is checkpointed and re-armed after restore. */
   readonly #placementTimers = new Map<string, { at: number; timer: NodeJS.Timeout }>();
+  /** Wakes received after QUEUE but before its durable checkpoint wait for that exact receipt. */
+  readonly #pendingPlacementWakes = new Map<string, PendingPlacementQueueWake>();
   /** A failed durable queue write still owes a checkpoint, even with no wake yet. */
   readonly #placementDirty = new Set<string>();
   readonly #deferredHandoffs = new Map<string, ActorQueueItem[]>();
@@ -4366,6 +4385,7 @@ export class ActorManager {
         return Promise.reject(new Error(`Fabric actor close not durably checkpointed; custody retained: ${failures.map(actor =>
           actor.lastError ?? `${actor.name} (${actor.id}) pending checkpoint failed`).join("; ")}`));
       }
+      for (const key of this.#pendingPlacementWakes.keys()) this.#finishPendingPlacementWake(key, false);
       this.#closing = true;
       this.#closePromise = this.#close().finally(() => this.#registry.releaseReadCache());
       // Retention/presence joins may yield before #close reaches its owned rows.
@@ -4931,26 +4951,38 @@ export class ActorManager {
   /**
    * Host-only callback for an already authenticated placement.wake. Exact local actor
    * ids only (never names). True is a durable queue receipt, NOT launch authority.
-   * A false pre-checkpoint match is not acceptance; the authenticated NATS receiver NAKs
-   * and rechecks the same launch+generation with a bounded delivery count. Storage errors
-   * throw so the control plane can NAK rather than ACK lost work.
+   * A matching in-memory QUEUE waits for that exact checkpoint before returning true;
+   * an unknown wake returns false so the authenticated receiver can bound NAK retries.
+   * Storage errors throw so the control plane can NAK rather than ACK lost work.
    */
-  placementWake(targetId: string, wake: FabricPlacementWake): boolean {
+  placementWake(targetId: string, wake: FabricPlacementWake): boolean | Promise<boolean> {
     const actor = this.#actors.get(targetId);
     if (!actor || !this.#persistent || this.#closing || actor.removal || actor.status === "stopped" ||
-        !this.#ownQueueRead.has(targetId) || !this.#placementActorActivation(actor)) return false;
+        !this.#ownQueueRead.has(targetId)) return false;
     const receipt = placementWakeReceipt(wake, wake.launchId, wake.generation);
     if (!receipt) return false;
     const held = [...actor.queue, ...(this.#overflow.get(targetId) ?? []), ...(this.#parked.get(targetId) ?? []),
       ...this.#inFlightItems(targetId)];
     const matches = [...new Set(held)].filter(item => !item.executionStarted && item.placementQueue?.launchId === receipt.launchId &&
       item.placementQueue.generation === receipt.generation);
-    if (!matches.length) return false;
+    if (!matches.length) {
+      const pending = this.#pendingPlacementWakes.get(placementWakeKey(receipt.launchId, receipt.generation));
+      if (!pending || pending.actorId !== targetId) return false;
+      if (!pending.wakes.some(prior => prior.reason === receipt.reason)) pending.wakes.push(receipt);
+      const existing = pending.waiters.get(receipt.reason);
+      if (existing) return existing.promise;
+      let resolve!: (accepted: boolean) => void;
+      const promise = new Promise<boolean>(done => { resolve = done; });
+      pending.waiters.set(receipt.reason, { promise, resolve });
+      return promise;
+    }
+    if (!this.#placementActorActivation(actor)) return false;
     const previous = matches.map(item => item.placementQueue!);
     for (const item of matches) {
       const queued = item.placementQueue!;
       if (!queued.wakes.some(prior => prior.reason === receipt.reason)) {
-        item.placementQueue = { ...queued, wakes: [...queued.wakes, receipt], wakePending: true };
+        item.placementQueue = { ...queued, wakes: [...queued.wakes, receipt], wakePending: true,
+          retryAt: Math.min(queued.retryAt, Date.now()) };
       }
     }
     if (!this.#persistQueue(targetId, true)) {
@@ -4970,8 +5002,8 @@ export class ActorManager {
   }
 
   #placementRunnable(item: ActorQueueItem, now = Date.now()): boolean {
-    return !item.placementQueue || ((item.placementQueue.wakePending === true || item.placementQueue.retrying === true) &&
-      now >= item.placementQueue.retryAt);
+    return !item.placementQueue || item.placementQueue.wakePending === true || item.placementQueue.retrying === true ||
+      now >= item.placementQueue.retryAt;
   }
 
   #placementHeadReady(actor: ManagedActor): boolean {
@@ -4979,9 +5011,14 @@ export class ActorManager {
     const overflow = this.#overflow.get(actor.id) ?? [];
     const held = [...actor.queue, ...overflow];
     if (this.#placementDirty.has(actor.id)) this.#persistQueue(actor.id, true);
-    const at = Math.min(this.#placementDirty.has(actor.id) ? now + this.#preparationRetryMs : Infinity,
-      ...held.flatMap(item => (item.placementQueue?.wakePending || item.placementQueue?.retrying) && item.placementQueue.retryAt > now
-        ? [item.placementQueue.retryAt] : []));
+    const checkpointPending = this.#placementDirty.has(actor.id);
+    const at = Math.min(checkpointPending ? now + this.#preparationRetryMs : Infinity,
+      ...(checkpointPending ? [] : held.flatMap(item => {
+        const queue = item.placementQueue;
+        if (!queue) return [];
+        if (queue.wakePending || queue.retrying) return [now];
+        return queue.retryAt > now ? [queue.retryAt] : [];
+      })));
     if (this.#placementTimers.get(actor.id)?.at !== at) {
       this.#clearPlacementTimer(actor.id);
       if (Number.isFinite(at)) {
@@ -4995,6 +5032,7 @@ export class ActorManager {
         this.#placementTimers.set(actor.id, { at, timer });
       }
     }
+    if (checkpointPending) return false;
     let index = actor.queue.findIndex(item => this.#placementRunnable(item, now));
     if (index < 0) {
       const fromOverflow = overflow.findIndex(item => this.#placementRunnable(item, now));
@@ -5470,6 +5508,8 @@ export class ActorManager {
         let preLaunch = true;
         let workerLaunched = false;
         let runEvidence: readonly string[] | undefined;
+        let pendingPlacementWakeKey: string | undefined;
+        let pendingPlacementQueueRetained = false;
         const preparationAbort = new AbortController();
         try {
           await this.#publishDrainPresence(actor);
@@ -5860,7 +5900,11 @@ export class ActorManager {
           // Load the optional placement boundary only at actual first use. Neither
           // the thrown request nor CLI diagnostics are logged or checkpointed here.
           const placementError = error instanceof Error && error.name === "PlacementQueueError";
+          pendingPlacementWakeKey = placementError
+            ? this.#beginPendingPlacementWake(actor.id, item, error, workerLaunched) : undefined;
           const placementQueue = placementError ? await this.#placementQueueFromError(item, error, workerLaunched) : undefined;
+          pendingPlacementQueueRetained = Boolean(placementQueue);
+          if (placementQueue) this.#attachPendingPlacementWakes(actor.id, placementQueue);
           const placementRefused = placementError && !placementQueue;
           if (placementQueue) {
             this.#slotLaunchUnknown.delete(actor.id); // Confirmed QUEUE is not an uncertain create.
@@ -5892,6 +5936,7 @@ export class ActorManager {
           if (actor.cancelAbort === abortController) {
             delete actor.cancelAbort;
             if (!runCompleted && !item.resolve && !item.reject) {
+              pendingPlacementQueueRetained = false;
               this.#drop(actor, [item], `Fabric actor ${actor.name} (${actor.id}) halted by user interrupt`);
               continue;
             }
@@ -5903,8 +5948,10 @@ export class ActorManager {
             // the next owner run instead of lost (smarty-dev#442); one whose run already
             // completed is recorded, not rerun, so its side effects do not repeat.
             // A recovered ENODEV answer was never run here: park it, and the next owner recovers it (marker kept).
-            if (runCompleted && !enodevRecovered) this.#drop(actor, [item], message);
-            else {
+            if (runCompleted && !enodevRecovered) {
+              pendingPlacementQueueRetained = false;
+              this.#drop(actor, [item], message);
+            } else {
               // #912 round 4: a resumed item refused before any launch spends no restart attempt, so count the
               // refusals: from the cap on it loses its parked-queue exemption, and its owner hears it once.
               if (!workerLaunched) for (const event of this.#batchItems(actor.id, item)) {
@@ -5976,6 +6023,7 @@ export class ActorManager {
             retryDrain = !hardPreparation;
             break;
           }
+          pendingPlacementQueueRetained = false;
           actor.lastError = message;
           const failed: FabricActorMessage = {
             id: randomUUID(),
@@ -5998,6 +6046,9 @@ export class ActorManager {
             for (const event of this.#batchItems(actor.id, item)) this.#noteDroppedEvent(actor, event, message, runId);
           }
         } finally {
+          if (pendingPlacementWakeKey && !pendingPlacementQueueRetained) {
+            this.#finishPendingPlacementWake(pendingPlacementWakeKey, false);
+          }
           if (capabilityLease) {
             if (!workerLaunched) await this.#prepare(actor, "capability-release", () => capabilityLease!.release())
               .catch((error: unknown) => this.#recordPreparationFailure(actor, error));
@@ -6390,6 +6441,57 @@ export class ActorManager {
     return;
   }
 
+  #beginPendingPlacementWake(actorId: string, item: ActorQueueItem, error: Error, workerLaunched: boolean): string | undefined {
+    if (!this.#persistent || workerLaunched || error.name !== "PlacementQueueError") return;
+    try {
+      const request = refRecord((error as Error & { request?: unknown }).request);
+      const interaction = refRecord(request?.interaction);
+      const launchId = item.placementQueue?.launchId ?? item.activationId ?? item.id;
+      const generation = item.placementQueue?.generation ?? 1;
+      if (interaction?.class !== "background-agent" || request?.launch_id !== launchId || request.generation !== generation) return;
+      const key = placementWakeKey(launchId, generation);
+      const existing = this.#pendingPlacementWakes.get(key);
+      if (existing && existing.actorId !== actorId) return;
+      if (!existing) this.#pendingPlacementWakes.set(key, { actorId, wakes: [], waiters: new Map() });
+      return key;
+    } catch { return; }
+  }
+
+  #attachPendingPlacementWakes(actorId: string, queue: ActorPlacementQueue): void {
+    const pending = this.#pendingPlacementWakes.get(placementWakeKey(queue.launchId, queue.generation));
+    if (!pending || pending.actorId !== actorId) return;
+    let added = false;
+    for (const wake of pending.wakes) {
+      if (!queue.wakes.some(prior => prior.reason === wake.reason)) {
+        queue.wakes.push(wake);
+        added = true;
+      }
+    }
+    if (added) {
+      queue.wakePending = true;
+      queue.retryAt = Math.min(queue.retryAt, Date.now());
+    }
+  }
+
+  #finishPendingPlacementWake(key: string, accepted: boolean): void {
+    const pending = this.#pendingPlacementWakes.get(key);
+    if (!pending) return;
+    this.#pendingPlacementWakes.delete(key);
+    for (const waiter of pending.waiters.values()) waiter.resolve(accepted);
+  }
+
+  #commitPendingPlacementWakes(actorId: string, items: readonly ActorQueueItem[]): void {
+    for (const item of items) {
+      const queue = item.placementQueue;
+      if (!queue) continue;
+      const key = placementWakeKey(queue.launchId, queue.generation);
+      const pending = this.#pendingPlacementWakes.get(key);
+      if (!pending || pending.actorId !== actorId ||
+          !pending.wakes.every(wake => queue.wakes.some(prior => prior.reason === wake.reason))) continue;
+      this.#finishPendingPlacementWake(key, true);
+    }
+  }
+
   async #placementQueueFromError(item: ActorQueueItem, error: Error, workerLaunched: boolean): Promise<ActorPlacementQueue | undefined> {
     const { PlacementQueueError } = await import("../agents/placement-admission.js");
     if (!(error instanceof PlacementQueueError) || workerLaunched || !this.#persistent ||
@@ -6402,9 +6504,14 @@ export class ActorManager {
       if (!("decision" in queue) || queue.decision !== "QUEUE" ||
           queue.launch_id !== launchId || queue.generation !== generation || error.request.launch_id !== launchId ||
           error.request.generation !== generation) return;
+      const retryCount = Math.min(PLACEMENT_RETRY_MAX_COUNT, item.placementQueue ? (item.placementQueue.retryCount ?? 0) + 1 : 0);
+      const backoffMs = Math.min(PLACEMENT_RETRY_MAX_BACKOFF_MS,
+        PLACEMENT_RETRY_BASE_DELAY_MS * 2 ** retryCount);
+      const delayMs = Math.min(PLACEMENT_RETRY_MAX_DELAY_MS,
+        Math.max(Math.ceil(queue.retry_after * 1_000), backoffMs));
       return { launchId, generation, ...(queue.queue_id !== undefined ? { queueId: queue.queue_id } : {}),
-        reason: queue.reason, retryAfter: queue.retry_after,
-        retryAt: Date.now() + Math.ceil(queue.retry_after * 1_000), wakes: item.placementQueue?.wakes ?? [],
+        reason: queue.reason, retryAfter: queue.retry_after, retryAt: Date.now() + delayMs,
+        ...(retryCount > 0 ? { retryCount } : {}), wakes: item.placementQueue?.wakes ?? [],
         ...(item.placementQueue?.wakePending ? { wakePending: true } : {}) };
     } catch { return; } // A malformed or unbound QUEUE is a terminal refusal, not waiting authority.
   }
@@ -8954,6 +9061,7 @@ export class ActorManager {
     }
     if (durable) {
       this.#placementDirty.delete(actorId);
+      this.#commitPendingPlacementWakes(actorId, items);
       for (const { sourceId, window, pending } of savedPendingWindows) {
         if (this.#settledWindows.get(actorId)?.get(sourceId) === window && window.pending === pending) window.pendingCheckpointed = true;
       }

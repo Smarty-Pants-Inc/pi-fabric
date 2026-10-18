@@ -20,6 +20,18 @@ import type { FabricPlacementWake } from "../src/topology/control-plane.js";
 const SECRET_TASK = "private-task-body-never-placement-metadata";
 const SECRET_PROMPT = "private-system-prompt-never-placement-metadata";
 const turn = () => new Promise<void>(resolve => setImmediate(resolve));
+function deferred<T = void>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>(done => { resolve = done; });
+  return { promise, resolve };
+}
+async function bounded<T>(promise: Promise<T>, event = "Actor placement event"): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try { return await Promise.race([promise, new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${event} did not arrive`)), 3_000);
+  })]); }
+  finally { clearTimeout(timer); }
+}
 const fixtures: Fixture[] = [];
 const wakeFor = (launchId: string, generation = 1, reason: FabricPlacementWake["reason"] = "eligible"): FabricPlacementWake => ({
   version: 1, launchId, generation, reason, at: "2030-01-02T03:04:05.123456Z",
@@ -41,7 +53,7 @@ function queued(request: AgentRunRequest, retryAfter = 0, interaction: Placement
 type Run = AgentManager["run"];
 type QueueRecord = { id: string; payload: unknown; attempts: number; preparationAttempts: number; executionStarted: boolean;
   placementQueue?: { launchId: string; generation: number; queueId?: string; reason: string; retryAfter: number; retryAt: number;
-    wakes: FabricPlacementWake[]; wakePending?: true; retrying?: true }; };
+    wakes: FabricPlacementWake[]; wakePending?: true; retrying?: true; retryCount?: number }; };
 class Fixture {
   readonly root = fs.mkdtempSync(path.join(process.env.TMPDIR ?? os.tmpdir(), "actor-placement-queue-"));
   readonly mesh = new MeshStore(path.join(this.root, "mesh"), 64 * 1024, 100, { stateBackend: "file" });
@@ -61,7 +73,7 @@ class Fixture {
     return this.decide(...args);
   });
   readonly warn = testMock.method(diagnostics, "warn", (_source: string, ...args: unknown[]) => { this.warnings.push(args.join(" ")); });
-  decide: Run = async request => { throw queued(request); };
+  decide: Run = async request => { throw queued(request, 60); };
   actors: ActorManager;
   owned = true;
   constructor(readonly queueLimit = DEFAULT_FABRIC_CONFIG.mesh.actorQueueLimit) {
@@ -128,7 +140,7 @@ afterEach(async () => { for (const fixture of fixtures.splice(0).reverse()) awai
 
 describe("durable actor placement QUEUE", () => {
   it("checkpoints a prompt-free queue identity without worker/run/outcome evidence and restores it on restart", async () => {
-    const f = new Fixture();
+    const f = new Fixture(); f.decide = async request => { throw queued(request, 60); };
     const actor = await f.actor();
     const outcomeSend = { eventId: "queued-send", to: actor.id, from: "session:sender", mode: "followUp" as const };
     const accepted = f.actors.tell(actor.id, SECRET_TASK, undefined, { outcomeSend });
@@ -141,8 +153,8 @@ describe("durable actor placement QUEUE", () => {
     assert.equal(item.attempts, 0);
     assert.equal(item.preparationAttempts, 0);
     assert.deepEqual(item.placementQueue, { launchId: accepted.messageId, generation: 1, queueId: "protected-writer-queue",
-      reason: "AGENT_CAPACITY_EXHAUSTED", retryAfter: 0, retryAt: item.placementQueue!.retryAt, wakes: [] });
-    assert.ok(item.placementQueue!.retryAt <= Date.now());
+      reason: "AGENT_CAPACITY_EXHAUSTED", retryAfter: 60, retryAt: item.placementQueue!.retryAt, wakes: [] });
+    assert.ok(item.placementQueue!.retryAt > Date.now());
     assert.equal(JSON.stringify(item.placementQueue).includes(SECRET_TASK), false);
     assert.equal(JSON.stringify(item.placementQueue).includes(SECRET_PROMPT), false);
     assert.equal(f.actors.status(actor.id).lastRunId, undefined);
@@ -170,11 +182,179 @@ describe("durable actor placement QUEUE", () => {
       actorActivation: { actorId: actor.id, rootId: "session:placement-fixture" }, launchId: accepted.messageId, generation: 1 });
   });
 
+  it("re-asks after retry_after with no wake and launches the accepted activation exactly once", async () => {
+    const f = new Fixture();
+    const decisionsAt: number[] = [];
+    f.decide = async (...args) => {
+      decisionsAt.push(Date.now());
+      if (decisionsAt.length === 1) throw queued(args[0], 0.05);
+      return f.success(...args);
+    };
+    const actor = await f.actor();
+    const accepted = f.actors.tell(actor.id, SECRET_TASK);
+    await f.idle();
+    const queue = f.checkpoint(actor.sessionFile!).items[0]!.placementQueue!;
+    const retryAt = queue.retryAt;
+    assert.deepEqual(queue.wakes, []);
+    assert.ok(retryAt > Date.now(), "QUEUE persisted a future retry before any wake");
+    assert.deepEqual(f.launches, []);
+    await f.until(f.actors, () => f.launches.length === 1 && f.actors.inFlightCount() === 0);
+    assert.equal(f.requests.length, 2);
+    assert.ok(decisionsAt[1]! >= retryAt, "the local retry does not precede the persisted retry_at");
+    assert.equal(f.requests[1]!.placement!.launchId, accepted.messageId);
+    assert.equal(f.launches.length, 1);
+  });
+
+  it("backs off repeated QUEUE responses and caps the local retry delay", async () => {
+    const f = new Fixture();
+    const queueTimes: number[] = [];
+    f.decide = async request => { queueTimes.push(Date.now()); throw queued(request); };
+    const actor = await f.actor();
+    const accepted = f.actors.tell(actor.id, SECRET_TASK);
+    await f.idle();
+    const first = f.checkpoint(actor.sessionFile!).items[0]!.placementQueue!;
+    assert.equal(first.retryCount, undefined);
+    assert.ok(first.retryAt - queueTimes[0]! >= 250);
+
+    await f.until(f.actors, () => f.requests.length === 2 && f.actors.inFlightCount() === 0);
+    const second = f.checkpoint(actor.sessionFile!).items[0]!.placementQueue!;
+    assert.equal(second.retryCount, 1);
+    assert.ok(second.retryAt - queueTimes[1]! >= 500, "the second QUEUE uses a longer persisted backoff");
+
+    f.actors.pauseForRelease();
+    assert.equal(f.actors.placementWake(actor.id, wakeFor(accepted.messageId, 1, "released-never-started")), true);
+    f.actors.resumeAfterRelease();
+    await f.until(f.actors, () => f.requests.length === 3 && f.actors.inFlightCount() === 0);
+    const third = f.checkpoint(actor.sessionFile!).items[0]!.placementQueue!;
+    assert.equal(third.retryCount, 2);
+    assert.ok(third.retryAt - queueTimes[2]! >= 1_000, "backoff continues to grow after a wake-driven re-decision");
+    assert.deepEqual(f.launches, []);
+
+    await f.actors.close();
+    const seeded = f.checkpoint(actor.sessionFile!);
+    seeded.items[0]!.placementQueue!.retryCount = 99;
+    seeded.items[0]!.placementQueue!.retryAt = Date.now();
+    fs.writeFileSync(seeded.file, JSON.stringify(seeded.snapshot));
+    const beforeRestore = f.requests.length;
+    f.decide = async request => { throw queued(request); };
+    f.actors = f.manager();
+    await f.until(f.actors, () => f.requests.length === beforeRestore + 1 && f.actors.inFlightCount() === 0);
+    const capped = f.checkpoint(actor.sessionFile!).items[0]!.placementQueue!;
+    assert.equal(capped.retryCount, 9, "restored retry counters are bounded");
+    assert.ok(capped.retryAt - Date.now() <= 60_000, "local backoff never exceeds its cap");
+    assert.ok(capped.retryAt - Date.now() > 55_000, "the capped backoff is still honored");
+    assert.deepEqual(f.launches, []);
+  });
+
+  it("re-arms the checkpointed retry timer after manager restore", async () => {
+    const f = new Fixture();
+    f.decide = async request => { throw queued(request, 0.05); };
+    const actor = await f.actor();
+    f.actors.tell(actor.id, SECRET_TASK);
+    await f.idle();
+    await f.actors.close();
+    const retryAt = f.checkpoint(actor.sessionFile!).items[0]!.placementQueue!.retryAt;
+    const beforeRestore = f.requests.length;
+    let decidedAt = 0;
+    f.decide = async (...args) => { decidedAt = Date.now(); return f.success(...args); };
+    f.actors = f.manager();
+    await f.until(f.actors, () => f.launches.length === 1 && f.actors.inFlightCount() === 0);
+    assert.ok(decidedAt >= retryAt, `restored retry ${decidedAt} must be at/after checkpoint time ${retryAt}`);
+    assert.equal(f.requests.length, beforeRestore + 1);
+    assert.equal(f.launches.length, 1);
+  });
+
+  it("holds a wake until a QUEUE checkpoint delayed beyond five NAK intervals commits", async () => {
+    const f = new Fixture();
+    const actor = await f.actor();
+    const wakeCaptured = deferred<void>();
+    const checkpointFailed = deferred<void>();
+    const secondEntered = deferred<void>();
+    const releaseSecond = deferred<void>();
+    let heldWake: Promise<boolean> | undefined;
+    let wakeSettled = false;
+    let allowCheckpoint = false;
+    let failQueueCheckpoints = false;
+    let fsyncFailures = 0;
+    let delayNextFsync = false;
+    let checkpointDelay = 0;
+    const fsync = fs.fsyncSync;
+    const sync = testMock.method(fs, "fsyncSync", (fd: number) => {
+      if (delayNextFsync) {
+        delayNextFsync = false;
+        const startedAt = Date.now();
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1_350);
+        checkpointDelay = Date.now() - startedAt;
+        failQueueCheckpoints = true;
+        assert.ok(checkpointDelay >= 1_250, "checkpoint delay must exceed five 250ms NAK intervals");
+        assert.equal(f.requests.length, 1, "no retry can run before the delayed checkpoint commits");
+      }
+      if (failQueueCheckpoints && !allowCheckpoint) {
+        fsyncFailures++;
+        if (fsyncFailures === 2) checkpointFailed.resolve();
+        throw new Error("synthetic transient queue checkpoint failure");
+      }
+      return fsync(fd);
+    });
+    f.decide = async (...args) => {
+      if (f.requests.length > 1) {
+        secondEntered.resolve();
+        await releaseSecond.promise;
+        return f.success(...args);
+      }
+      const request = args[0];
+      const error = queued(request, 60);
+      const queuedJson = structuredClone(error.queue);
+      Object.defineProperty(error.queue, "toJSON", { enumerable: false, value: () => {
+        delayNextFsync = true;
+        const launchId = request.placement?.launchId;
+        const generation = request.placement?.generation ?? 1;
+        assert.ok(launchId);
+        const receipt = wakeFor(launchId, generation);
+        queueMicrotask(() => {
+          const result = f.actors.placementWake(actor.id, receipt);
+          assert.ok(result instanceof Promise, "a locally pending QUEUE holds the wake instead of NAKing it");
+          heldWake = result;
+          void result.then(() => { wakeSettled = true; });
+          wakeCaptured.resolve();
+        });
+        return queuedJson;
+      } });
+      throw error;
+    };
+    try {
+      f.actors.tell(actor.id, SECRET_TASK);
+      await bounded(wakeCaptured.promise, "Pending wake capture");
+      await bounded(checkpointFailed.promise, "Checkpoint failure");
+      assert.equal(wakeSettled, false, "a failed checkpoint cannot ACK the retained wake");
+      assert.equal(f.requests.length, 1, "a failed checkpoint cannot re-run placement");
+      assert.deepEqual(f.launches, []);
+      allowCheckpoint = true;
+      await bounded(secondEntered.promise, "Second placement decision");
+      assert.equal(f.actors.inFlightCount(), 1);
+      assert.ok(heldWake);
+      assert.equal(await heldWake, true, "the wake callback resolves only after the durable queue write");
+      assert.ok(checkpointDelay >= 1_250);
+      const persisted = f.checkpoint(actor.sessionFile!).items[0]!.placementQueue!;
+      assert.equal(persisted.wakePending, undefined);
+      assert.equal(persisted.retrying, true);
+      assert.deepEqual(persisted.wakes, [wakeFor(f.requests[0]!.placement!.launchId!, 1)]);
+      assert.deepEqual(f.launches, [], "wake only advances placement re-decision");
+      releaseSecond.resolve();
+      await f.until(f.actors, () => f.launches.length === 1 && f.actors.inFlightCount() === 0);
+      assert.equal(f.requests.length, 2);
+      assert.equal(f.launches.length, 1);
+    } finally {
+      releaseSecond.resolve();
+      sync.mock.restore();
+    }
+  });
+
   it("retries a wake arriving after QUEUE but before checkpoint, then launches once after durable acceptance", async () => {
     const f = new Fixture();
     const actor = await f.actor();
     let earlyWake: FabricPlacementWake | undefined;
-    let earlyAccepted: boolean | undefined;
+    let earlyAccepted: boolean | Promise<boolean> | undefined;
     f.decide = async request => {
       const response = queued(request);
       const launchId = request.placement?.launchId;
@@ -258,25 +438,25 @@ describe("durable actor placement QUEUE", () => {
     assert.deepEqual(f.launches, []);
   });
 
-  it("persists an early wake across restart and lets its timer re-decide only at retry_after", async () => {
-    const f = new Fixture(); f.decide = async request => { throw queued(request, 0.2); };
+  it("persists an early wake across restart and brings the retry forward", async () => {
+    const f = new Fixture(); f.decide = async request => { throw queued(request, 60); };
     const actor = await f.actor(); const accepted = f.actors.tell(actor.id, SECRET_TASK); await f.idle();
     const retryAt = f.checkpoint(actor.sessionFile!).items[0]!.placementQueue!.retryAt;
     const receipt = wakeFor(accepted.messageId);
     f.actors.pauseForRelease();
     assert.equal(f.actors.placementWake(actor.id, receipt), true);
-    assert.equal(f.checkpoint(actor.sessionFile!).items[0]!.placementQueue!.wakePending, true);
+    const checkpoint = f.checkpoint(actor.sessionFile!).items[0]!.placementQueue!;
+    assert.equal(checkpoint.wakePending, true);
+    assert.ok(checkpoint.retryAt < retryAt, "a wake advances, but does not authorize, the retry timer");
     await f.actors.close();
     let decidedAt = 0;
     f.decide = async (...args) => { decidedAt = Date.now(); return f.success(...args); };
     f.actors = f.manager();
     assert.deepEqual(f.checkpoint(actor.sessionFile!).items[0]!.placementQueue!.wakes, [receipt]);
-    assert.ok(Date.now() < retryAt, "fixture restart must finish inside the early-wake window");
-    await turn();
-    assert.equal(f.requests.length, 1, "the received wake cannot bypass the retry lower bound");
     await f.until(f.actors, () => f.launches.length === 1 && f.actors.inFlightCount() === 0);
-    assert.ok(decidedAt >= retryAt, `decide ${decidedAt} must be at/after ${retryAt}`);
+    assert.ok(decidedAt < retryAt, `wake retry ${decidedAt} must precede local timer ${retryAt}`);
     assert.equal(f.requests.length, 2);
+    assert.equal(f.launches.length, 1);
     assert.equal(f.requests[1]!.placement!.launchId, accepted.messageId);
     assert.equal(f.requests[1]!.placement!.generation, 1);
   });

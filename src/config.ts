@@ -7,7 +7,7 @@ import type { ModelRoutingConfig } from "./agents/model-route.js";
 import { parsePerCallRouting } from "./agents/per-call-config.js";
 import { normalizeAgentRouterConfig, type FabricAgentRouterConfig } from "./agents/router-config.js";
 export type { FabricAgentRouterConfig } from "./agents/router-config.js";
-import { nativePlacementPathAvailable, normalizeAgentPlacement, normalizePlacementDeciderConfig, type AgentPlacementConfig, type FabricPlacementDeciderConfig } from "./agents/placement-config.js";
+import { nativePlacementEnforceAvailable, VERIFIED_CALLER_CAPABILITY, VERIFIED_CALLER_ISSUE, normalizeAgentPlacement, normalizePlacementDeciderConfig, type AgentPlacementConfig, type FabricPlacementDeciderConfig } from "./agents/placement-config.js";
 export type { FabricPlacementDeciderConfig } from "./agents/placement-config.js";
 import { normalizeWakeTextConfig, type FabricWakeTextConfig } from "./actors/wake-text.js";
 import type { LandlockSettings } from "./core/landlock.js";
@@ -1458,8 +1458,8 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
   const agents = objectValue(input.agents);
   const placement = normalizeAgentPlacement(agents.placement);
   const placementDecider = normalizePlacementDeciderConfig(agents.placementDecider);
-  if (placementDecider?.mode === "enforce" && !nativePlacementPathAvailable(placementDecider.contextCommand, undefined, placementDecider.recordRoot)) {
-    throw new Error("agents.placementDecider.mode=enforce is unavailable until the resident-host placement follow-up is installed (systemd-run and smarty-launch-context required)");
+  if (placementDecider?.mode === "enforce" && !nativePlacementEnforceAvailable(placementDecider.contextCommand, undefined, placementDecider.recordRoot)) {
+    throw new Error(`agents.placementDecider.mode=enforce is unavailable: systemd-run and private launch records plus smarty-launch-context --capabilities returning exactly ${VERIFIED_CALLER_CAPABILITY.line} are required (${VERIFIED_CALLER_ISSUE})`);
   }
   const claude = objectValue(agents.claude);
   const veda = objectValue(agents.veda);

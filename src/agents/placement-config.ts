@@ -2,6 +2,7 @@ import { diagnostics } from "../core/diagnostics.js";
 import path from "node:path";
 import fs from "node:fs";
 import os from "node:os";
+import { spawnSync } from "node:child_process";
 import { AgentInputError, normalizeAgentCapabilityTokens } from "../host-compatibility.js";
 
 export type PlacementDeciderMode = "off" | "shadow" | "enforce";
@@ -20,8 +21,12 @@ export interface FabricPlacementDeciderConfig {
 export type PlacementDeciderConfig = FabricPlacementDeciderConfig;
 export const DEFAULT_PLACEMENT_DECIDER_MODE: PlacementDeciderMode = "off";
 
-/** Filesystem-only native gate for placement enforce. Native user units and the trusted
- * caller resolver must both exist before a config can claim enforce semantics. */
+/** The exact native context-helper probe and authority token required by enforce. */
+export const VERIFIED_CALLER_CAPABILITY = { probe: "--capabilities", line: "caller-verified=1" } as const;
+export const VERIFIED_CALLER_ISSUE = "smarty-dev#14903";
+const VERIFIED_CALLER_PROBE_TIMEOUT_MS = 1_000;
+
+/** Filesystem-only readiness for the legacy shadow path. */
 export const nativePlacementPathAvailable = (contextCommand: readonly string[] | undefined, systemdRun = "/usr/bin/systemd-run", recordRoot?: string): boolean => {
   const executable = (file: string): boolean => {
     try { const stat = fs.statSync(file); return stat.isFile() && (process.platform === "win32" || (stat.mode & 0o111) !== 0); }
@@ -45,6 +50,23 @@ export const nativePlacementPathAvailable = (contextCommand: readonly string[] |
   const context = contextCommand?.[0];
   return process.platform === "linux" && executable(systemdRun) && !!context &&
     path.basename(context) === "smarty-launch-context" && executable(context) && recordDirectoryAvailable();
+};
+
+/** Probe in a bounded, shell-free, minimal environment. Any output beyond the exact
+ * capability line, stderr, nonzero exit, signal, or timeout is a refusal. */
+export const nativePlacementEnforceAvailable = (contextCommand: readonly string[] | undefined, systemdRun = "/usr/bin/systemd-run", recordRoot?: string): boolean => {
+  if (!nativePlacementPathAvailable(contextCommand, systemdRun, recordRoot)) return false;
+  const executable = contextCommand![0]!;
+  try {
+    const result = spawnSync(executable, [...contextCommand!.slice(1), VERIFIED_CALLER_CAPABILITY.probe], {
+      cwd: "/", env: { PATH: "/usr/bin:/bin", LANG: "C", LC_ALL: "C" }, shell: false,
+      encoding: "utf8", timeout: VERIFIED_CALLER_PROBE_TIMEOUT_MS, maxBuffer: 4_096,
+      windowsHide: true, stdio: ["ignore", "pipe", "pipe"],
+    });
+    const stdout = result.stdout;
+    const exactLine = stdout === VERIFIED_CALLER_CAPABILITY.line || stdout === `${VERIFIED_CALLER_CAPABILITY.line}\n` || stdout === `${VERIFIED_CALLER_CAPABILITY.line}\r\n`;
+    return !result.error && result.status === 0 && result.signal === null && exactLine && result.stderr === "";
+  } catch { return false; }
 };
 
 const badPlacementDeciderField = (field: string): never => { throw new Error(`Invalid agents.placementDecider.${field}`); };

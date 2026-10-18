@@ -2,7 +2,7 @@ import fs from "node:fs";
 import { spawnSync } from "node:child_process";
 import { childProcessEnvironment } from "../core/atomic-write.js";
 import { LaunchRecordStore, processPidStart, readBootId } from "./launch-record.js";
-import { nativePlacementPathAvailable } from "../agents/placement-config.js";
+import { nativePlacementEnforceAvailable, nativePlacementPathAvailable } from "../agents/placement-config.js";
 
 export const SYSTEMD_RUN = "/usr/bin/systemd-run";
 export const SYSTEMCTL = "/usr/bin/systemctl";
@@ -56,6 +56,10 @@ export const verifyNativeLaunchRecord = (store: LaunchRecordStore, nativeLaunchI
   return store.verify(nativeLaunchId, record.generation, identity);
 };
 
-/** A native systemd user unit is mandatory for enforce; this predicate is deliberately filesystem-only. */
+/** Native systemd paths are available for the existing shadow path; no capability is required. */
 export const nativeResidentPlacementAvailable = (contextCommand: readonly string[] | undefined, run = SYSTEMD_RUN, recordRoot?: string): boolean =>
   nativePlacementPathAvailable(contextCommand, run, recordRoot);
+
+/** Enforce additionally requires the context helper's verified-caller capability. */
+export const nativeResidentPlacementEnforceAvailable = (contextCommand: readonly string[] | undefined, run = SYSTEMD_RUN, recordRoot?: string): boolean =>
+  nativePlacementEnforceAvailable(contextCommand, run, recordRoot);

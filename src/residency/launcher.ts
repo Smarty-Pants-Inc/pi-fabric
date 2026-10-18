@@ -29,7 +29,8 @@ import { ownedStat } from "../storage/scratch.js";
 import { verifiedRemove } from "../storage/verified-remove.js";
 import type { FabricHostLease } from "../topology/host-leases.js";
 import { LaunchRecordStore, makeLaunchRecord, type LaunchRecord } from "./launch-record.js";
-import { nativeResidentPlacementAvailable, systemdRunArguments, systemdUnitIdentity } from "./native-launch.js";
+import { VERIFIED_CALLER_CAPABILITY, VERIFIED_CALLER_ISSUE } from "../agents/placement-config.js";
+import { nativeResidentPlacementAvailable, nativeResidentPlacementEnforceAvailable, systemdRunArguments, systemdUnitIdentity } from "./native-launch.js";
 
 const NODE_SCRIPT_EXTENSIONS = new Set([".js", ".cjs", ".mjs", ".ts", ".cts", ".mts"]);
 const TOKEN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -489,9 +490,9 @@ async function superviseResident(configPath: string, options: ResidentSuperviseO
   try { config = options.wakeOnly ? assertResidentWakeConfig(root) : readConfig(configPath); }
   catch (error) { await finishUnhosted(root, "wake-refused"); throw error; }
   const placementMode = config.agents?.placementDecider?.mode ?? "off";
-  if (placementMode === "enforce" && !nativeResidentPlacementAvailable(config.agents?.placementDecider?.contextCommand, options.nativeSystemdRun, config.agents?.placementDecider?.recordRoot)) {
+  if (placementMode === "enforce" && !nativeResidentPlacementEnforceAvailable(config.agents?.placementDecider?.contextCommand, options.nativeSystemdRun, config.agents?.placementDecider?.recordRoot)) {
     await finishUnhosted(root, "wake-refused");
-    throw new Error("Resident enforce placement requires systemd-run and smarty-launch-context");
+    throw new Error(`Resident enforce placement requires systemd-run and private launch records plus smarty-launch-context --capabilities returning exactly ${VERIFIED_CALLER_CAPABILITY.line} (${VERIFIED_CALLER_ISSUE})`);
   }
   if (readResidentIdleExit(root, config.rootId)) {
     trace("launcher-idle", { reason: "root dead, no actors; waiting for an explicit spawn request" });
@@ -547,9 +548,11 @@ async function superviseResident(configPath: string, options: ResidentSuperviseO
     const nativeLaunchId = launchConfig.placement?.nativeLaunchId ?? randomUUID();
     const configuredGeneration = launchConfig.placement?.generation ?? 1;
     const recordGeneration = Math.max(configuredGeneration, (current?.recordGeneration ?? 0) + (current ? 1 : 0));
-    const useSystemd = process.platform === "linux" && placementMode !== "off" &&
-      nativeResidentPlacementAvailable(launchConfig.agents?.placementDecider?.contextCommand, options.nativeSystemdRun, launchConfig.agents?.placementDecider?.recordRoot);
-    if (placementMode === "enforce" && !useSystemd) throw new Error("Resident enforce placement cannot start without systemd-run");
+    const placementAvailable = placementMode === "enforce"
+      ? nativeResidentPlacementEnforceAvailable(launchConfig.agents?.placementDecider?.contextCommand, options.nativeSystemdRun, launchConfig.agents?.placementDecider?.recordRoot)
+      : nativeResidentPlacementAvailable(launchConfig.agents?.placementDecider?.contextCommand, options.nativeSystemdRun, launchConfig.agents?.placementDecider?.recordRoot);
+    const useSystemd = process.platform === "linux" && placementMode !== "off" && placementAvailable;
+    if (placementMode === "enforce" && !useSystemd) throw new Error(`Resident enforce placement cannot start without verified native support: expected ${VERIFIED_CALLER_CAPABILITY.line} (${VERIFIED_CALLER_ISSUE})`);
     const recordStore = new LaunchRecordStore(launchConfig.placement?.recordRoot);
     let record = recordEnabled ? makeLaunchRecord({
       nativeLaunchId, launchSpecId: launchConfig.placement?.launchSpecId ?? `resident-host:${launchConfig.rootId}`,

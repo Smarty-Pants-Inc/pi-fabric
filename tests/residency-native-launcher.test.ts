@@ -19,6 +19,11 @@ const startParent = (store: LaunchRecordStore): void => {
   });
 };
 
+const writeContext = (context: string, calls: string, output = "caller-verified=1\n", exitCode = 0, delayMs = 0, stderr = ""): void => {
+  fs.writeFileSync(context, `#!${process.execPath}\nconst fs = require('node:fs');\nif (process.argv[2] === '--capabilities') {\n  fs.appendFileSync(${JSON.stringify(calls)}, 'probe\\n');\n  setTimeout(() => {\n    if (${JSON.stringify(stderr)}) process.stderr.write(${JSON.stringify(stderr)});\n    process.stdout.write(${JSON.stringify(output)});\n    process.exit(${exitCode});\n  }, ${delayMs});\n} else process.stdout.write('{}');\n`, { mode: 0o700 });
+  fs.chmodSync(context, 0o700);
+};
+
 const fixture = (directory: string, options: { failCreate?: boolean; failReadback?: boolean } = {}) => {
   const residencyRoot = path.join(directory, "resident"); fs.mkdirSync(residencyRoot, { mode: 0o700 });
   const recordRoot = path.join(directory, "records"); fs.mkdirSync(recordRoot, { mode: 0o700 });
@@ -30,7 +35,8 @@ const fixture = (directory: string, options: { failCreate?: boolean; failReadbac
   const failReadback = path.join(directory, "fail-readback");
   if (options.failReadback) fs.writeFileSync(failReadback, "1");
   const context = path.join(directory, "smarty-launch-context");
-  fs.writeFileSync(context, `#!${process.execPath}\nprocess.stdout.write('{}');\n`, { mode: 0o700 }); fs.chmodSync(context, 0o700);
+  const capabilityCalls = path.join(directory, "capability-calls");
+  writeContext(context, capabilityCalls);
   const nativeSystemdRun = path.join(directory, "systemd-run");
   fs.writeFileSync(nativeSystemdRun, `#!${process.execPath}
 const fs = require('node:fs'); const { spawn } = require('node:child_process');
@@ -59,7 +65,7 @@ process.stdout.write('InvocationID=${invocation}\\nMainPID=' + fs.readFileSync($
       orgId: "org-a", workId: "work-a", parentNativeLaunchId: "root-a", role: "resident-host", profile: "resident",
       sourcePin: "pin", memoryProfile: "resident", origin: { class: "background-agent", originRef: "resident-a" }, recordRoot },
   }));
-  return { configPath, store, recordPath, stateLog, hostStarted, hostEnvironment, residencyRoot, nativeSystemdRun, nativeSystemctl };
+  return { configPath, store, recordPath, stateLog, hostStarted, hostEnvironment, residencyRoot, nativeSystemdRun, nativeSystemctl, context, capabilityCalls };
 };
 
  describe("resident native systemd launch", () => {
@@ -88,19 +94,32 @@ process.stdout.write('InvocationID=${invocation}\\nMainPID=' + fs.readFileSync($
     expect(f.store.get("resident-a")?.fence.state).toBe("closed-uncertain");
   }, 10_000);
 
+  it("refuses enforce startup when caller verification is absent", async () => {
+    const directory = root(); const f = fixture(directory);
+    writeContext(f.context, f.capabilityCalls, "caller-verified=0\n");
+    await expect(supervise(f.configPath, { nativeSystemdRun: f.nativeSystemdRun, nativeSystemctl: f.nativeSystemctl }))
+      .rejects.toThrow(/smarty-dev#14903/);
+    expect(fs.existsSync(f.hostStarted)).toBe(false);
+    expect(fs.readFileSync(f.capabilityCalls, "utf8")).toContain("probe");
+    expect(f.store.get("resident-a")).toBeUndefined();
+  }, 10_000);
+
   it("keeps mode-off baseline on the legacy direct launch path", async () => {
     const directory = root(); const f = fixture(directory);
+    writeContext(f.context, f.capabilityCalls, "caller-verified=0\n");
     const config = JSON.parse(fs.readFileSync(f.configPath, "utf8")) as { agents: { placementDecider: { mode: string } } };
     config.agents.placementDecider.mode = "off";
     fs.writeFileSync(f.configPath, JSON.stringify(config));
     await supervise(f.configPath);
     expect(fs.existsSync(f.hostStarted)).toBe(true);
+    expect(fs.existsSync(f.capabilityCalls)).toBe(false);
     expect(fs.existsSync(f.stateLog)).toBe(false);
     expect(fs.existsSync(f.recordPath)).toBe(false);
   }, 10_000);
 
   it("does not let shadow record-path failure withhold the baseline host", async () => {
     const directory = root(); const f = fixture(directory);
+    writeContext(f.context, f.capabilityCalls, "caller-verified=0\n");
     const blocker = path.join(directory, "record-blocker"); fs.writeFileSync(blocker, "not-a-directory");
     const unavailableRoot = path.join(blocker, "launches");
     const config = JSON.parse(fs.readFileSync(f.configPath, "utf8")) as {
@@ -113,6 +132,7 @@ process.stdout.write('InvocationID=${invocation}\\nMainPID=' + fs.readFileSync($
     fs.writeFileSync(f.configPath, JSON.stringify(config));
     await supervise(f.configPath);
     expect(fs.existsSync(f.hostStarted)).toBe(true);
+    expect(fs.existsSync(f.capabilityCalls)).toBe(false);
     expect(fs.existsSync(f.stateLog)).toBe(false);
   }, 10_000);
 

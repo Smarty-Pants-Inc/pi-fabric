@@ -58,6 +58,6 @@ const actor = (parent: string, id: string, org = "org-a", work = "work-a") => ma
     expect(nativePlacementPathAvailable(["/definitely/missing/smarty-launch-context"])).toBe(false);
     expect(() => normalizeFabricConfig({ agents: { placementDecider: {
       command: ["/bin/true"], mode: "enforce", wakeSourceMachine: "host",
-    } } })).toThrow("resident-host placement follow-up");
+    } } })).toThrow("smarty-dev#14903");
   });
 });

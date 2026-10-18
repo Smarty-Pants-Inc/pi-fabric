@@ -13,7 +13,7 @@ import {
   placementRegistrationRequest, placementReleaseRequest, validatePlacementBindings,
   validatePlacementRequest,
 } from "../src/agents/placement-contract.js";
-import { nativePlacementPathAvailable, normalizePlacementDeciderConfig, type PlacementDeciderConfig } from "../src/agents/placement-decider-config.js";
+import { nativePlacementEnforceAvailable, nativePlacementPathAvailable, normalizePlacementDeciderConfig, VERIFIED_CALLER_CAPABILITY, type PlacementDeciderConfig } from "../src/agents/placement-decider-config.js";
 import { loadFabricConfig, loadFabricConfigForScope, normalizeFabricConfig } from "../src/config.js";
 
 // Keep reason: a security trust boundary. Exercise a real shell-free child and
@@ -406,9 +406,10 @@ describe("registration/cancel mapping and unpublished receipt gate", () => {
 
 describe("host-only placement decider configuration", () => {
   const config = (): PlacementDeciderConfig => ({ command: [process.execPath, "literal argument; not a shell"], mode: "enforce", wakeSourceMachine: "ryzen1" });
-  const nativeConfig = (): PlacementDeciderConfig => {
+  const nativeConfig = (output = "caller-verified=1\n", exitCode = 0, delayMs = 0, stderr = ""): PlacementDeciderConfig => {
     const dir = root(); const context = path.join(dir, "smarty-launch-context"); const recordRoot = path.join(dir, "launches");
-    fs.writeFileSync(context, "#!/bin/sh\nexit 0\n", { mode: 0o700 }); fs.chmodSync(context, 0o700); fs.mkdirSync(recordRoot, { mode: 0o700 });
+    fs.writeFileSync(context, `#!${process.execPath}\nif (process.argv[2] === ${JSON.stringify(VERIFIED_CALLER_CAPABILITY.probe)}) {\n  setTimeout(() => {\n    if (${JSON.stringify(stderr)}) process.stderr.write(${JSON.stringify(stderr)});\n    process.stdout.write(${JSON.stringify(output)});\n    process.exit(${exitCode});\n  }, ${delayMs});\n} else process.exit(0);\n`, { mode: 0o700 });
+    fs.chmodSync(context, 0o700); fs.mkdirSync(recordRoot, { mode: 0o700 });
     return { ...config(), contextCommand: [context], recordRoot };
   };
   it("is absent/off by default and normalizes a configured omitted mode to off", () => {
@@ -425,11 +426,32 @@ describe("host-only placement decider configuration", () => {
   it.each(["", "a.b", "*", ">", "a b", "a\n", "user@example", "UpperCase", "under_score", "-leading", "a".repeat(33)])("rejects non-token wake machine %s", wakeSourceMachine => {
     expect(() => normalizePlacementDeciderConfig({ ...config(), wakeSourceMachine })).toThrow();
   });
-  it("rejects unknown modes/keys and blocks enforce config until resident-host support exists", () => {
+  it("requires the exact verified-caller capability at config load and leaves shadow untouched", () => {
+    expect(VERIFIED_CALLER_CAPABILITY).toEqual({ probe: "--capabilities", line: "caller-verified=1" });
+    for (const unavailable of [
+      nativeConfig(""), nativeConfig("caller-verified=0\n"), nativeConfig("caller-verified=1\nextra=unknown\n"),
+      nativeConfig("caller-verified=1\n", 1), nativeConfig("caller-verified=1\n", 0, 2_000),
+      nativeConfig("caller-verified=1\n", 0, 0, "unexpected stderr\n"),
+    ]) {
+      expect(() => normalizeFabricConfig({ agents: { placementDecider: unavailable } })).toThrow(/smarty-dev#14903/);
+    }
+    const capable = nativeConfig();
+    expect(nativePlacementEnforceAvailable(capable.contextCommand, undefined, capable.recordRoot)).toBe(true);
+    expect(() => normalizeFabricConfig({ agents: { placementDecider: nativeConfig() } })).not.toThrow();
+    const loadConfigured = (placementDecider: PlacementDeciderConfig): (() => unknown) => {
+      const cwd = root(); const agentDir = root();
+      fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ agents: { placementDecider } }));
+      return () => loadFabricConfig({ cwd, agentDir, projectTrusted: true });
+    };
+    expect(loadConfigured(nativeConfig("caller-verified=0\n"))).toThrow(/smarty-dev#14903/);
+    expect(loadConfigured(nativeConfig())).not.toThrow();
+    expect(() => normalizeFabricConfig({ agents: { placementDecider: { ...nativeConfig("caller-verified=0\n"), mode: "shadow" } } })).not.toThrow();
+  });
+  it("rejects unknown modes/keys and blocks enforce config when native support is absent", () => {
     expect(() => normalizePlacementDeciderConfig({ ...config(), mode: "enforced" })).toThrow();
     expect(() => normalizePlacementDeciderConfig({ ...config(), timeoutMs: 20_000 })).toThrow();
     expect(() => normalizeFabricConfig({ agents: { placementDecider: config() } }))
-      .toThrow(/enforce is unavailable until the resident-host placement follow-up is installed/);
+      .toThrow(/enforce is unavailable.*smarty-dev#14903/);
     expect(() => normalizeFabricConfig({ agents: { placementDecider: nativeConfig(), }, })).not.toThrow();
     expect(() => normalizeFabricConfig({ agents: { placementDecider: { ...nativeConfig(), recordRoot: "/dev/null/launches" } } }))
       .toThrow(/enforce is unavailable/);

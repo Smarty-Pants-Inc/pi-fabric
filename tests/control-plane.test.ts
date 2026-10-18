@@ -66,6 +66,33 @@ afterEach(async () => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
+describe("origin control idempotency keys", () => {
+  it("keeps identical retries on one command id and refuses an edited body before publication", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-origin-idempotency-")); roots.push(root);
+    const meshRoot = path.join(root, "mesh");
+    const sender = plane(meshRoot, "sender");
+    const owner = plane(meshRoot, "owner");
+    const receive = vi.fn((command: FabricControlCommand) => ({ accepted: true, messageId: command.message ?? "missing-message" }));
+    owner.start(receive);
+    sender.start(() => ({ accepted: false }));
+    const send = (message: string) => sender.request("owner", "session:target", "followUp",
+      { message, ownerIncarnation: owner.incarnation }, "owner", { idempotencyKey: "caller-supplied-followup" });
+
+    await expect(send("original message")).resolves.toMatchObject({ acknowledged: true, messageId: "original message" });
+    await expect(send("original message")).resolves.toMatchObject({ acknowledged: true, messageId: "original message" });
+    await expect(send("edited message")).rejects.toMatchObject({
+      name: "FabricIdempotencyKeyReusedError", code: "FABRIC_IDEMPOTENCY_KEY_REUSED", retryable: false,
+    });
+
+    const commands = sender.mesh.read({ topic: "fabric.control.command", limit: 100 })
+      .filter(event => event.from.id === "sender" && event.to === "owner" && event.kind === "followUp");
+    const ids = commands.map(event => (event.data as FabricControlCommand).commandId);
+    expect(ids).toHaveLength(2); // The edited retry is refused before the source event is published.
+    expect(ids[0]).toBe(ids[1]); // Identical retry still reuses the original command id and receipt.
+    expect(receive).toHaveBeenCalledTimes(1);
+  });
+});
+
 // Keep reason: #9751 is a recorded receipt-HOL failure and an outcome/ACK custody boundary.
 // Exercise the real reader, local outcome store and ACK verifier, not an implementation queue.
 describe("saved steer/followUp ACK obligations (#9751)", () => {

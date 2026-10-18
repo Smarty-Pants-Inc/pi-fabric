@@ -341,6 +341,18 @@ describe("local singleton relay data safety", () => {
     const conflict = retrySender.request(target.identity.id, target.identity.id, "followUp",
       { ...input, data: { nested: { marker: changedMarker, count: 2 } } }, target.identity.id, options);
     void conflict.catch(() => undefined);
+    if (recovery === "expired") {
+      await expect(conflict).rejects.toBeInstanceOf(FabricIdempotencyKeyReusedError);
+      await expect(conflict).rejects.toMatchObject({ name: "FabricIdempotencyKeyReusedError", code: FABRIC_IDEMPOTENCY_KEY_REUSED,
+        retryable: false, idempotencyKey: options.idempotencyKey, message: "Fabric idempotency key reused with different input" });
+      expect(events(a, "fabric.control.command")).toHaveLength(1); // Origin refused before publication.
+      expect(calls).toBe(1);
+      expect(events(b, "fabric.control.command")).toHaveLength(1);
+      expect(events(b, "fabric.control.command")[0]!.data).toMatchObject({ message: marker, data: input.data });
+      expect(markerFiles(b.root, changedMarker)).toEqual([]);
+      bodyFreeReceipts(hub);
+      return;
+    }
     await vi.waitFor(() => expect(events(a, "fabric.control.command")).toHaveLength(2));
     await f.drain();
     await expect(conflict).rejects.toBeInstanceOf(FabricIdempotencyKeyReusedError);

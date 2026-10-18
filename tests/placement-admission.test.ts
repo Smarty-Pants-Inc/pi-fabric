@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   CliPlacementDecider, PlacementAdmissionError, createPlacementDecider,
   type PlacementDecider, type PlacementGrant, type PlacementNativeIdentity,
@@ -19,12 +19,61 @@ import { loadFabricConfig, loadFabricConfigForScope, normalizeFabricConfig } fro
 // Keep reason: a security trust boundary. Exercise a real shell-free child and
 // actual stdin/stdout/exits; these are not native writer-authentication proofs.
 const roots: string[] = [];
+const helperPidFiles: string[] = [];
 const root = (): string => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "placement-admission-"));
   roots.push(dir);
   return dir;
 };
-afterEach(() => { for (const dir of roots.splice(0)) fs.rmSync(dir, { recursive: true, force: true }); });
+const waitForProcessExit = async (pid: number): Promise<void> => {
+  const deadline = performance.now() + 2_000;
+  while (performance.now() < deadline) {
+    try { process.kill(pid, 0); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === "ESRCH") return; }
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+  throw new Error(`placement test helper process survived cleanup: ${pid}`);
+};
+const killTrackedHelpers = async (): Promise<void> => {
+  let failure: unknown;
+  for (const file of helperPidFiles.splice(0)) {
+    if (!fs.existsSync(file)) continue;
+    const pid = Number(fs.readFileSync(file, "utf8"));
+    if (!Number.isSafeInteger(pid) || pid < 1) continue;
+    try { process.kill(pid, "SIGKILL"); } catch { /* Already exited. */ }
+    try { await waitForProcessExit(pid); } catch (error) { failure ??= error; }
+  }
+  if (failure) throw failure;
+};
+afterEach(async () => {
+  try { await killTrackedHelpers(); }
+  finally {
+    vi.restoreAllMocks();
+    for (const dir of roots.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+const sleepingHelper = (dir: string, detached: boolean, inheritedPipes: boolean) => {
+  const script = path.join(dir, "sleeping-helper.cjs");
+  const helperPidFile = path.join(dir, "helper.pid");
+  const grandchildPidFile = path.join(dir, "grandchild.pid");
+  helperPidFiles.push(helperPidFile, grandchildPidFile);
+  const stdio = inheritedPipes ? `["ignore", "inherit", "inherit"]` : `"ignore"`;
+  fs.writeFileSync(script, `const fs = require('node:fs');
+const { spawn } = require('node:child_process');
+fs.writeFileSync(${JSON.stringify(helperPidFile)}, String(process.pid));
+const grandchild = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { detached: ${detached}, stdio: ${stdio} });
+fs.writeFileSync(${JSON.stringify(grandchildPidFile)}, String(grandchild.pid));
+setInterval(() => {}, 1000);
+`);
+  return { script, helperPidFile, grandchildPidFile };
+};
+const expectPidGone = (file: string): void => {
+  const pid = Number(fs.readFileSync(file, "utf8"));
+  let alive = false;
+  try { process.kill(pid, 0); alive = true; }
+  catch (error) { alive = (error as NodeJS.ErrnoException).code !== "ESRCH"; }
+  expect(alive, `helper PID ${pid} should be gone`).toBe(false);
+};
 const digest = `sha256:${"a".repeat(64)}`;
 const request = (): PlacementRequest => ({
   schema: "smarty.placement.v1", operation: "decide", launch_id: "semantic-launch", agent_name: "task-agent-1", generation: 4,
@@ -168,6 +217,37 @@ describe("placement CLI admission", () => {
     await rejects(cli(root(), { reply: place(), delay: 10_000, split: true }).decide(request()), "timeout");
     expect(performance.now() - start).toBeLessThan(3_000);
   }, 5_000);
+  it.skipIf(process.platform === "win32")("waits for the whole POSIX process group before resolving timeout refusal", async () => {
+    const dir = root();
+    const helper = sleepingHelper(dir, false, false);
+    const decider = new CliPlacementDecider({ command: [process.execPath, helper.script], mode: "enforce", wakeSourceMachine: "ryzen1" });
+    const nativeKill = process.kill.bind(process);
+    let groupKillDelivered = false;
+    let groupProbeCalled = false;
+    vi.spyOn(process, "kill").mockImplementation((pid, signal) => {
+      if (typeof pid === "number" && pid < 0 && signal === 0) groupProbeCalled = true;
+      if (typeof pid === "number" && pid < 0 && signal === "SIGKILL") {
+        setTimeout(() => { try { nativeKill(pid, signal); groupKillDelivered = true; } catch { /* Assertion reports failure. */ } }, 100);
+        return true;
+      }
+      return nativeKill(pid, signal);
+    });
+    await rejects(decider.decide(request(), { deadline: performance.now() + 1_000 }), "timeout");
+    expect(groupKillDelivered).toBe(true);
+    expect(groupProbeCalled).toBe(true);
+    expectPidGone(helper.grandchildPidFile);
+  }, 8_000);
+  it("reports an unconfirmed helper teardown instead of a clean timeout", async () => {
+    const dir = root();
+    const helper = sleepingHelper(dir, process.platform !== "win32", true);
+    const decider = new CliPlacementDecider({ command: [process.execPath, helper.script], mode: "enforce", wakeSourceMachine: "ryzen1" });
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    await rejects(decider.decide(request(), { deadline: performance.now() + 1_000 }), "helper-teardown-unconfirmed");
+    const helperPid = Number(fs.readFileSync(helper.helperPidFile, "utf8"));
+    expect(warning).toHaveBeenCalledOnce();
+    expect(warning.mock.calls[0]?.[0]).toContain(`pid=${helperPid}`);
+    expect(warning.mock.calls[0]?.[0]).toContain(process.platform === "win32" ? "pgid=unavailable" : `pgid=${helperPid}`);
+  }, 8_000);
   it("snapshots request bindings before asynchronous CLI IO", async () => {
     const dir = root(); const intended = request(); const pending = cli(dir, { reply: place(), delay: 20 }).decide(intended);
     intended.launch_id = "mutation-after-invocation";

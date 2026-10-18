@@ -27,7 +27,7 @@ export type {
   PlacementGrant, PlacementNativeIdentity, PlacementReleaseProof,
 } from "./placement-contract.js";
 export type { FabricPlacementDeciderConfig, PlacementDeciderConfig } from "./placement-decider-config.js";
-export type PlacementRefusalReason = "disabled" | "invalid-request" | "unavailable" | "timeout" | "invalid-response" | "mode-mismatch";
+export type PlacementRefusalReason = "disabled" | "invalid-request" | "unavailable" | "timeout" | "invalid-response" | "mode-mismatch" | "helper-teardown-unconfirmed";
 export type PlacementDecisionResult = PlacementPlace | PlacementQueue;
 export class PlacementAdmissionError extends Error {
   constructor(readonly reason: PlacementRefusalReason) {
@@ -65,9 +65,38 @@ interface CliResult {
   /** Kept separate, bounded, never parsed as protocol or echoed into error reasons. */
   stderr: string;
   exitCode: number | null;
-  failure?: "unavailable" | "timeout" | "invalid-response";
+  failure?: "unavailable" | "timeout" | "invalid-response" | "helper-teardown-unconfirmed";
 }
 const MAX_DIAGNOSTICS_BYTES = 64 * 1024;
+const HELPER_TEARDOWN_TIMEOUT_MS = 2_000;
+const confirmHelperTeardown = async (pid: number | undefined, close: Promise<void>, isClosed: () => boolean): Promise<boolean> => {
+  const deadline = performance.now() + HELPER_TEARDOWN_TIMEOUT_MS;
+  if (!isClosed()) {
+    const remaining = deadline - performance.now();
+    if (remaining <= 0) return false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const closed = await Promise.race([
+      close.then(() => true),
+      new Promise<boolean>(resolve => { timer = setTimeout(() => resolve(false), remaining); }),
+    ]);
+    if (timer) clearTimeout(timer);
+    if (!closed) return false;
+  }
+  if (process.platform === "win32" || pid === undefined) return true;
+  while (performance.now() < deadline) {
+    try { process.kill(-pid, 0); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === "ESRCH") return true; }
+    const remaining = deadline - performance.now();
+    if (remaining <= 0) break;
+    await new Promise(resolve => setTimeout(resolve, Math.min(25, remaining)));
+  }
+  try { process.kill(-pid, 0); return false; }
+  catch (error) { return (error as NodeJS.ErrnoException).code === "ESRCH"; }
+};
+const warnUnconfirmedHelperTeardown = (pid: number | undefined): void => {
+  const pgid = process.platform === "win32" ? "unavailable" : pid ?? "unknown";
+  console.warn(`[pi-fabric] placement helper teardown unconfirmed pid=${pid ?? "unknown"} pgid=${pgid}`);
+};
 const cliEnvironment = (): NodeJS.ProcessEnv => {
   // No inherited NODE_OPTIONS, PYTHONPATH, workspace env or prompt content.
   const env: NodeJS.ProcessEnv = { PATH: process.platform === "win32" ? "" : "/usr/bin:/bin" };
@@ -88,6 +117,10 @@ const runPlacementCli = (
     cwd: os.homedir(), env: cliEnvironment(), detached: process.platform !== "win32",
   });
   let settled = false;
+  let aborting = false;
+  let childClosed = false;
+  let resolveChildClose: () => void = () => {};
+  const childClose = new Promise<void>(resolve => { resolveChildClose = resolve; });
   let bytes = 0;
   let diagnosticBytes = 0;
   const stdout: Buffer[] = [];
@@ -101,13 +134,20 @@ const runPlacementCli = (
     resolve(result);
   };
   const abort = (failure: NonNullable<CliResult["failure"]>): void => {
-    if (settled) return;
+    if (settled || aborting) return;
+    aborting = true;
+    const pid = child.pid;
     // Only this invocation's process group, including any inherited pipe owners.
     try {
-      if (process.platform !== "win32" && child.pid !== undefined) process.kill(-child.pid, "SIGKILL");
+      if (process.platform !== "win32" && pid !== undefined) process.kill(-pid, "SIGKILL");
       else child.kill("SIGKILL");
-    } catch { /* Already exited or unprovable: still no admission. */ }
-    finish({ stdout: "", stderr: diagnostics(), exitCode: null, failure });
+    } catch { /* The close and process-group checks below decide whether teardown is proven. */ }
+    void confirmHelperTeardown(pid, childClose, () => childClosed).then(confirmed => {
+      if (!confirmed) {
+        warnUnconfirmedHelperTeardown(pid);
+        finish({ stdout: "", stderr: diagnostics(), exitCode: null, failure: "helper-teardown-unconfirmed" });
+      } else finish({ stdout: "", stderr: diagnostics(), exitCode: null, failure });
+    });
   };
   // Exactly the remaining aggregate budget, not a new timeout for each step.
   const timer = setTimeout(() => abort("timeout"), Math.max(0, deadline - performance.now()));
@@ -127,7 +167,9 @@ const runPlacementCli = (
     if (kept.length) stderr.push(kept);
   });
   child.on("close", (exitCode, signal) => {
-    if (settled) return;
+    childClosed = true;
+    resolveChildClose();
+    if (settled || aborting) return;
     if (performance.now() >= deadline) { abort("timeout"); return; }
     if (signal !== null) { finish({ stdout: "", stderr: diagnostics(), exitCode, failure: "unavailable" }); return; }
     try {

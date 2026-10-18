@@ -336,6 +336,8 @@ export interface BridgeSide {
   bridgedIds(after: number): Promise<BridgedIds>;
   /** End the transport and fail pending calls (a remote side only). */
   close?(error?: Error): void;
+  /** End remote stdin cleanly while keeping stdout readable until the peer exits. */
+  closeGracefully?(error?: Error): void;
   /** The peer's records this side holds now (the hub side only): the link's current authority. */
   owned?(): Promise<Pick<BridgePresence, "hosts" | "participants">>;
   /** Fence future mirror writes without changing persisted mirrors; stop uses this before leaving. */
@@ -2235,8 +2237,17 @@ export class RemoteBridgeSide implements BridgeSide {
     );
   }
 
-  /** Fail every pending and later call, and end the transport's streams. */
+  /** Fail pending calls, end remote stdin, and keep stdout readable until the child exits. */
+  closeGracefully(error: Error = new Error("Bridge stopped")): void {
+    this.#close(error, false);
+  }
+
+  /** Fail every pending and later call, and end both transport streams. */
   close(error: Error = new Error("Bridge transport closed")): void {
+    this.#close(error, true);
+  }
+
+  #close(error: Error, destroyInput: boolean): void {
     if (this.#closed) return;
     this.#closed = error;
     for (const pending of this.#pending.values()) pending.reject(error);
@@ -2246,7 +2257,7 @@ export class RemoteBridgeSide implements BridgeSide {
     for (const subscriber of this.#subscribers) subscriber.failed(error);
     this.#subscribers.clear();
     this.output.end();
-    this.input.destroy();
+    if (destroyInput) this.input.destroy();
   }
 
   #call<T>(op: RpcOp, args?: unknown, options: { timeoutMs?: number; fatalTimeout?: boolean } = {}): Promise<T> {
@@ -2653,6 +2664,7 @@ export class MeshBridge {
   #presenceSync: Promise<void> | undefined;
   #staleAdmission: BridgeStaleIncarnationError | undefined;
   #stopped = false;
+  #stopTask: Promise<void> | undefined;
   #ready = false;
   readonly #relayDeliveries = new Set<Promise<void>>();
   #wake: (() => void) | undefined;
@@ -3007,6 +3019,7 @@ export class MeshBridge {
   }
 
   async #raiseStall(direction: Direction | "both", reason: string, fatal: boolean): Promise<void> {
+    if (this.#stopped) return;
     if (!this.#stallActive) {
       this.#stallActive = true;
       const atMs = Date.now();
@@ -3024,7 +3037,11 @@ export class MeshBridge {
       try { await this.options.publishStallAlarm?.(alarm); }
       catch { this.#log("could not publish fabric.alarm bridge-stall"); }
     }
-    if (fatal) this.options.remote.close?.(new Error(`Bridge ${direction} stalled`));
+    if (fatal && !this.#stopped) {
+      const error = new Error(`Bridge ${direction} stalled`);
+      if (this.options.remote.closeGracefully) this.options.remote.closeGracefully(error);
+      else this.options.remote.close?.(error);
+    }
   }
 
   async #watchdogProbe(): Promise<void> {
@@ -3035,6 +3052,7 @@ export class MeshBridge {
     try {
       const remoteHead = await (this.options.remote.watchdogHead?.(timeoutMs) ?? this.options.remote.latestSequence());
       const localHead = await this.options.local.latestSequence();
+      if (this.#stopped) return;
       if (!Number.isSafeInteger(remoteHead) || remoteHead < 0 || !Number.isSafeInteger(localHead) || localHead < 0) {
         throw new Error("invalid mesh sequence from watchdog probe");
       }
@@ -3081,6 +3099,7 @@ export class MeshBridge {
         await this.#raiseStall(direction, `no successful round trip for ${stalledFor} ms`, false);
       }
     } catch {
+      if (this.#stopped) return;
       const now = Date.now();
       const stalledFor = this.#lastRoundTripAt === undefined ? Infinity : now - this.#lastRoundTripAt;
       const stallAfter = this.options.watchdogStallAfterMs ?? BRIDGE_WATCHDOG_STALL_AFTER_MS;
@@ -4045,16 +4064,27 @@ export class MeshBridge {
 
   /**
    * Stop the loop without withdrawing either mirror: authority expires by its lease TTL, so an
-   * error or process teardown cannot turn incomplete presence into withdrawal evidence. Every
-   * wait is bounded; fence the loop before closing the remote transport so no pass can write later.
+   * error or process teardown cannot turn incomplete presence into withdrawal evidence. Fence
+   * local mirror writes before ending remote stdin, then bound all cleanup by one total deadline.
    */
-  async stop(): Promise<void> {
-    const bound = this.options.stopMs ?? DEFAULT_STOP_MS;
+  stop(): Promise<void> {
+    if (this.#stopTask) return this.#stopTask;
+    this.#stopTask = this.#stop();
+    return this.#stopTask;
+  }
+
+  async #stop(): Promise<void> {
+    const deadline = Date.now() + (this.options.stopMs ?? DEFAULT_STOP_MS);
     const within = async (work: Promise<unknown>): Promise<void> => {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        void work.catch(() => undefined);
+        return;
+      }
       let timer: ReturnType<typeof setTimeout> | undefined;
       try {
         await Promise.race([work.catch(() => undefined), new Promise<void>((resolve) => {
-          timer = setTimeout(resolve, bound);
+          timer = setTimeout(resolve, remaining);
           timer.unref?.();
         })]);
       } finally { if (timer !== undefined) clearTimeout(timer); }
@@ -4064,14 +4094,15 @@ export class MeshBridge {
     this.#wake?.();
     this.#watchdogWake?.();
     for (const direction of ["toRemote", "toLocal"] as const) this.#directionWake[direction]?.();
+    const localFence = this.options.local.fence?.() ?? Promise.resolve();
+    const stopError = new Error("Bridge stopped");
+    if (this.options.remote.closeGracefully) this.options.remote.closeGracefully(stopError);
+    else this.options.remote.close?.(stopError);
     await within(this.#running);
     if (this.#watchdogTask) await within(this.#watchdogTask);
     await within(this.#directions);
     await within(Promise.allSettled([...this.#relayDeliveries]));
-    this.options.remote.close?.(new Error("Bridge stopped"));
-    await within(this.#running);
-    await within(this.#directions);
-    await within(this.options.local.fence?.() ?? Promise.resolve());
+    await within(localFence);
   }
 }
 

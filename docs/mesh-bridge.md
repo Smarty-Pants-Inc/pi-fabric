@@ -66,8 +66,8 @@ existing events and mirrors root presence. There is no new store or protocol.
   observation). Without a fresh bridge sample, roots remain discoverable with `bridgeStale: true`
   for a precise routing error, but do not authorize bridged traffic. Traffic retains its stricter
   translated TTL and reobserves short-lease origins before forwarding. Clean stop or transport
-  failure withdraws the projections. A fresh snapshot withdraws origins that no longer report
-  a live native lease.
+  failure leaves persisted projections to expire by their lease TTL; a later fresh snapshot
+  reconciles origins that no longer report a live native lease.
 - Nothing else crosses beyond the routes above. This excludes `github.*`, actor output, state and
   cache keys, and agent and actor participants.
 
@@ -137,8 +137,8 @@ existing events and mirrors root presence. There is no new store or protocol.
 
   Before notifications stop or a directional exit, the bridge writes one reason line to stderr
   and atomically overwrites the per-peer reason file. Its absolute path is the absolute cursor
-  path plus `.last-stall-reason`: for `--cursor /home/fabric/.local/state/mesh-bridge/forge.json`,
-  use `/home/fabric/.local/state/mesh-bridge/forge.json.last-stall-reason`. The single-line format
+  path plus `.last-stall-reason`: for a cursor at `/absolute/state/<peer>.cursor.json`, use
+  `/absolute/state/<peer>.cursor.json.last-stall-reason`. The single-line format
   is `mesh-bridge: stall v1 host=<host> peer=<peer> direction=<toRemote|toLocal|both>
   at=<RFC3339-UTC> lastOkToRemote=<RFC3339-UTC|never>
   lastOkToLocal=<RFC3339-UTC|never> stallId=<monotonic-decimal> reason=<one-line-reason>
@@ -152,11 +152,16 @@ existing events and mirrors root presence. There is no new store or protocol.
   [Service]
   NotifyAccess=all
   WatchdogSec=90
+  TimeoutStopSec=10
   ```
 
-  `NotifyAccess=all` is required because the notifier is a child process. After installing the
-  drop-in and the operator-owned `ExecStopPost` hook, run `systemctl daemon-reload`, restart that
-  peer's bridge unit, and verify effective `NotifyAccess` and `WatchdogUSec` with `systemctl show`.
+  `NotifyAccess=all` is required because the notifier is a child process. A requested SIGTERM or
+  SIGINT stops sync and forwarding, fences local mirror writes, ends remote stdin cleanly, and exits
+  with status 0 within five seconds. If the SSH transport has not exited two seconds after stdin
+  closes, the bridge terminates it; a second signal forces an immediate status-0 exit. Keep the
+  service type unchanged. After installing the drop-in and the operator-owned `ExecStopPost` hook,
+  run `systemctl daemon-reload`, restart that peer's bridge unit, and verify effective
+  `NotifyAccess`, `WatchdogUSec`, and `TimeoutStopUSec` with `systemctl show`.
   The service cgroup must contain both the bridge and its SSH transport. The hook pages based on
   `$SERVICE_RESULT` (`watchdog` or `exit-code`) and reads the reason file. If no alarm session is
   configured, the bridge cannot safely address a mesh event; the stderr/reason-file signal remains
@@ -223,9 +228,9 @@ existing events and mirrors root presence. There is no new store or protocol.
   A late answer opens the gate for a new presence snapshot; it does not renew the old snapshot's
   freshness. The agent stamps mirror arrival time before either lane's dispatch wait.
   Non-mirror timeouts, transport/watch failures and permanent late mirror rejections remain
-  fatal. On stop, the bridge fences the loop, gives the remote withdrawal a bounded
-  wait, withdraws the local mirrors regardless, and then reaps the transport child
-  (SIGTERM, then SIGKILL after 2 s).
+  fatal. On stop, the bridge fences future local mirror writes and ends remote stdin cleanly;
+  persisted mirrors expire by lease TTL rather than being withdrawn. The hub reaps a transport
+  child after clean EOF grace (SIGTERM after 2 s, then SIGKILL 500 ms later if needed).
 - An allow-listed event that is not addressed across (its recipient is not on the other side) is
   not forwarded. Each one is a debug line (`--log-level debug`), and the bridge logs at most one
   count line a minute, `bridge: N events not addressed across (topics: ...; toRemote N, toLocal N (to
@@ -236,11 +241,12 @@ existing events and mirrors root presence. There is no new store or protocol.
   Presence snapshots (both the replies and the mirror requests) hold whole hosts with their roots
   up to the same budget. Hosts past the budget are not mirrored, so they lapse, and the bridge logs
   the count. A `bridgedIds` reply holds at most 50,000 ids per page.
-- Local mirror writes run one at a time behind a fence. On withdrawal, the bridge fences first,
-  waits for a write in flight, then deletes, so no record or lease comes back after stop.
+- Local mirror writes run one at a time behind a fence. On explicit withdrawal, the bridge fences
+  first, waits for a write in flight, then deletes, so no record or lease comes back after withdrawal.
 - The bridge checks its arguments and opens the local mesh before it starts the transport. From the
-  spawn on, one `finally` withdraws the mirrors and reaps the child. A transport that cannot start
-  (a missing or non-executable ssh) fails the bridge with a named error and exit status 1.
+  spawn on, one `finally` fences local mirror writes and reaps the child; it leaves persisted mirrors
+  to expire by lease TTL. A transport that cannot start (a missing or non-executable ssh) fails the
+  bridge with a named error and exit status 1.
 - The agent (the remote end) serves only the bridge operations. It applies the allow-list and
   stamps its pinned `--peer` name on everything it writes, whatever the hub sends.
 - The hub and agent watch the mesh directory and bind watches for `participants/` and
@@ -295,12 +301,12 @@ link requires explicit retirement, not silent cursor invalidation.
 
 On the remote, pin the agent to the bridge's dedicated key in `~/.ssh/authorized_keys`:
 
-    command="node /path/to/pi-fabric/bin/mesh-bridge agent --mesh /path/to/project/.pi/fabric/mesh --peer dev1",restrict ssh-ed25519 AAAA... mesh-bridge@dev1
+    command="node /path/to/pi-fabric/bin/mesh-bridge agent --mesh /path/to/project/.pi/fabric/mesh --peer hub-a",restrict ssh-ed25519 AAAA... mesh-bridge@hub-a
 
 On the hub, run one bridge per remote host as the fleet user, under the service manager:
 
-    mesh-bridge run --mesh ~/proj/.pi/fabric/mesh --name dev1 --remote forge \
-      --cursor ~/.local/state/mesh-bridge/forge.json --ssh forge --ssh-key ~/.ssh/mesh-bridge
+    mesh-bridge run --mesh ~/proj/.pi/fabric/mesh --name hub-a --remote peer-b \
+      --cursor ~/.local/state/mesh-bridge/peer-b.cursor.json --ssh peer-b --ssh-key ~/.ssh/mesh-bridge
 
 Both modes accept `--max-state-bytes BYTES` for meshes larger than the default 32 MiB
 shared-state read ceiling. Set it explicitly on each side that needs the larger capacity;

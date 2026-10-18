@@ -116,6 +116,8 @@ async function fixture(populated: boolean, watchdog: Record<string, unknown> = {
       if (watchdog.inboundTailStall) side.tail = async (after, offset) => ({ events: [], through: after, ...(offset !== undefined ? { offset } : {}) });
       send({ kind: "ready", pid: process.pid });
       await serveBridgeAgent(side, input, output);
+      store.closeState();
+      process.exit(0);
     } else {
       const local = new StoreBridgeSide(store, "far", Date.now, true);
       const remote = new RemoteBridgeSide(process.stdin, process.stdout, 120000);
@@ -164,7 +166,7 @@ async function fixture(populated: boolean, watchdog: Record<string, unknown> = {
     expect([...bridgeMessages.receipts, ...agentMessages.receipts].filter(item => item.kind === "failure" || item.kind === "ended")).toEqual([]);
   };
   return { root, hubRoot, farRoot, mesh, farMesh, bridge, agent, bridgeMessages, agentMessages, lease, sample, sweep,
-    alarms, stallAlarms, healthy };
+    alarms, stallAlarms, diagnostics: () => stderr, healthy };
 }
 // Keep reason: real process liveness/cross-host provenance; unit mocks cannot establish idle renewal.
 describe.skipIf(process.platform !== "linux")("mirrored lease bridge alarms via the committed owner sweep", () => {
@@ -317,6 +319,9 @@ describe.skipIf(process.platform !== "linux")("mirrored lease bridge alarms via 
     await waitFor(() => f.bridge.exitCode !== null, 3_000);
     expect(f.bridge.exitCode).toBe(1);
     expect(f.bridge.signalCode).toBeNull();
+    await waitFor(() => f.agent.exitCode !== null, 3_000);
+    expect(f.agent.exitCode).toBe(0);
+    expect(f.diagnostics()).not.toMatch(/EPIPE/);
     expect(f.stallAlarms()).toHaveLength(1);
     const alarm = f.stallAlarms()[0]!;
     expect(alarm).toMatchObject({ kind: "bridge-stall", to: owner.id,

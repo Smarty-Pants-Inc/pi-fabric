@@ -273,35 +273,60 @@ const presenceIsPartial = (presence: BridgeMirrorPresence): boolean => {
 const copyMirrorPresence = (presence: BridgeMirrorPresence): BridgeMirrorPresence =>
   JSON.parse(JSON.stringify({ hosts: presence.hosts, participants: presence.participants })) as BridgeMirrorPresence;
 
+const LEGACY_PARTIAL_HOLD_PERIODS = 3;
+const LEGACY_PARTIAL_HOLD_MS = BRIDGE_LEASE_MS * LEGACY_PARTIAL_HOLD_PERIODS;
+interface LegacyMirrorSnapshot {
+  /** The exact complete projection acknowledged by this legacy peer. */
+  presence: BridgeMirrorPresence;
+  /** First partial omission time per root; kept with the baseline so renewals cannot reset it. */
+  firstHeldAtByRoot: Map<string, number>;
+}
+const copyLegacySnapshot = (presence: BridgeMirrorPresence, firstHeldAtByRoot = new Map<string, number>()): LegacyMirrorSnapshot =>
+  ({ presence: copyMirrorPresence(presence), firstHeldAtByRoot: new Map(firstHeldAtByRoot) });
+
 /**
- * Legacy receivers treat every mirror as withdrawal evidence. On an incomplete cycle, keep every
- * previously admitted root and its participant, renewing only that held projection until a full
- * source snapshot can prove withdrawal. A held sample has no fresh source observation, so use the
- * bounded legacy lease rather than reusing an expired `observedAt`.
+ * Legacy receivers treat every mirror as withdrawal evidence. Hold omitted roots for at most three
+ * lease periods from their first partial omission, regardless of later renewals. Three periods
+ * (45 s) tolerates short incomplete scans while placing a hard bound on stale authority. A fresh
+ * complete scan resets the per-root clock by replacing this snapshot without hold metadata.
  */
-const completeLegacyPartial = (presence: BridgeMirrorPresence, previous: BridgeMirrorPresence | undefined,
-  now: number): BridgeMirrorPresence => {
-  const hosts = new Map(presence.hosts.map(host => [host.record.id, host]));
-  const held = new Set<string>();
-  const oldHosts = new Map((previous?.hosts ?? []).map(host => [host.record.id, host]));
-  for (const host of previous?.hosts ?? []) {
-    if (hosts.has(host.record.id)) continue;
-    const expiresAt = now + BRIDGE_LEASE_MS;
-    const { observedAt: _observedAt, ...sample } = host;
-    hosts.set(host.record.id, { ...sample, record: { ...host.record, expiresAt }, expiresAt });
-    held.add(host.record.id);
+const completeLegacyPartial = (presence: BridgeMirrorPresence, previous: LegacyMirrorSnapshot | undefined,
+  now: number): LegacyMirrorSnapshot => {
+  const hosts = new Map(presence.hosts.filter(({ record }) => isRootAuthorityHost(record) || isNativeNonRootHost(record))
+    .map(host => [host.record.id, host]));
+  const participants = new Map(presence.participants.filter(isRootAuthorityParticipant).map(participant => [participant.id, participant]));
+  const oldHosts = new Map((previous?.presence.hosts ?? []).map(host => [host.record.id, host]));
+  const oldParticipants = new Map((previous?.presence.participants ?? []).map(participant => [participant.id, participant]));
+  const roots = new Set([...oldHosts.values()].filter(host => isRootAuthorityHost(host.record)).map(host => host.record.id));
+  const firstHeldAtByRoot = new Map<string, number>();
+  for (const rootId of roots) {
+    const oldRootHosts = [...oldHosts.values()].filter(host => host.record.rootId === rootId);
+    const oldRootParticipants = [...oldParticipants.values()].filter(participant => participant.rootId === rootId);
+    const omittedHosts = oldRootHosts.filter(host => !hosts.has(host.record.id));
+    const omittedParticipants = oldRootParticipants.filter(participant => !participants.has(participant.id));
+    if (omittedHosts.length === 0 && omittedParticipants.length === 0) continue;
+    const firstHeldAt = previous?.firstHeldAtByRoot.get(rootId) ?? now;
+    if (now - firstHeldAt >= LEGACY_PARTIAL_HOLD_MS) continue;
+    firstHeldAtByRoot.set(rootId, firstHeldAt);
+    for (const host of omittedHosts) {
+      const expiresAt = now + BRIDGE_LEASE_MS;
+      const { observedAt: _observedAt, ...sample } = host;
+      hosts.set(host.record.id, { ...sample, record: { ...host.record, expiresAt }, expiresAt });
+    }
+    for (const participant of omittedParticipants) {
+      const owner = hosts.get(participant.ownerHostId);
+      const oldOwner = oldHosts.get(participant.ownerHostId);
+      const sameOwner = owner && oldOwner && owner.record.startedAt === oldOwner.record.startedAt &&
+        owner.record.incarnationToken === oldOwner.record.incarnationToken;
+      if (sameOwner) participants.set(participant.id, participant);
+    }
   }
-  const participants = new Map(presence.participants.map(participant => [participant.id, participant]));
-  for (const participant of previous?.participants ?? []) {
-    if (participants.has(participant.id)) continue;
-    const owner = hosts.get(participant.ownerHostId);
-    const oldOwner = oldHosts.get(participant.ownerHostId);
-    const sameOwner = owner && (held.has(owner.record.id) || (oldOwner !== undefined &&
-      owner.record.startedAt === oldOwner.record.startedAt &&
-      owner.record.incarnationToken === oldOwner.record.incarnationToken));
-    if (sameOwner) participants.set(participant.id, participant);
-  }
-  return { hosts: [...hosts.values()], participants: [...participants.values()] };
+  const rootIds = new Set([...hosts.values()].filter(({ record }) => isRootAuthorityHost(record)).map(({ record }) => record.id));
+  return { presence: {
+    hosts: [...hosts.values()].filter(({ record }) => isRootAuthorityHost(record) ||
+      (isNativeNonRootHost(record) && rootIds.has(record.rootId))),
+    participants: [...participants.values()].filter(participant => isRootAuthorityParticipant(participant) && rootIds.has(participant.rootId)),
+  }, firstHeldAtByRoot };
 };
 
 export interface BridgeSkip { id: string; sequence: number; topic: string; bytes: number }
@@ -2186,7 +2211,7 @@ const dispatch = async (side: StoreBridgeSide, request: RpcRequest, receivedAt: 
       version: isObject(request.args) && request.args.version === BRIDGE_PROTOCOL_VERSION
         ? BRIDGE_PROTOCOL_VERSION : LEGACY_BRIDGE_PROTOCOL_VERSION,
       tail: true, publishBatch: typeof side.publishBatch === "function", changes: true, independentRpc: true,
-      partialPresence: true,
+      partialPresence: true, nonRootHosts: true,
     };
     case "latestSequence": return side.latestSequence();
     case "latestCursor": return side.latestCursor();
@@ -2225,8 +2250,11 @@ export class RemoteBridgeSide implements BridgeSide {
   #next = 1;
   #supportsTail = false;
   #supportsPartialPresence = false;
+  #supportsNonRootHosts = false;
   #legacyCompletedPartials = 0;
-  #legacyMirrorSnapshot: BridgeMirrorPresence | undefined;
+  #legacyNoBaselineCycles = 0;
+  #legacyNoBaselineSince: number | undefined;
+  #legacyMirrorSnapshot: LegacyMirrorSnapshot | undefined;
   #lastPresenceRenewalAt = Number.NEGATIVE_INFINITY;
   #independentRpc = false;
   #protocolVersion: number | undefined;
@@ -2374,9 +2402,15 @@ export class RemoteBridgeSide implements BridgeSide {
   get protocolVersion(): number | undefined { return this.#protocolVersion; }
   /** Cumulative partial cycles completed as full snapshots for this legacy peer. */
   get legacyCompletedPartials(): number { return this.#legacyCompletedPartials; }
-  /** Negotiated peer capability; undefined until hello completes. */
+  /** Consecutive partial cycles skipped because no legacy complete baseline exists. */
+  get legacyNoBaselineCycles(): number { return this.#legacyNoBaselineCycles; }
+  get legacyNoBaselineSince(): number | undefined { return this.#legacyNoBaselineSince; }
+  /** Negotiated peer capabilities; undefined until hello completes. */
   get supportsPartialPresence(): boolean | undefined {
     return this.#protocolVersion === undefined ? undefined : this.#supportsPartialPresence;
+  }
+  get supportsNonRootHosts(): boolean | undefined {
+    return this.#protocolVersion === undefined ? undefined : this.#supportsNonRootHosts;
   }
   /** Local time of the last acknowledged outbound presence mirror. */
   get lastPresenceRenewalAt(): number { return this.#lastPresenceRenewalAt; }
@@ -2384,9 +2418,9 @@ export class RemoteBridgeSide implements BridgeSide {
     return this.#independentRpc && this.#mirrorPending !== undefined && this.#closed === undefined;
   }
 
-  async hello(changes = false): Promise<void> {
+  async hello(changes = false, presenceOnly = false): Promise<void> {
     const reply = await this.#call<{ version?: unknown; tail?: unknown; publishBatch?: unknown; changes?: unknown;
-      independentRpc?: unknown; partialPresence?: unknown }>("hello", {
+      independentRpc?: unknown; partialPresence?: unknown; nonRootHosts?: unknown }>("hello", {
       version: BRIDGE_PROTOCOL_VERSION, ...(changes ? { changes: true } : {}),
     });
     if (reply?.version !== BRIDGE_PROTOCOL_VERSION && reply?.version !== LEGACY_BRIDGE_PROTOCOL_VERSION) {
@@ -2398,11 +2432,12 @@ export class RemoteBridgeSide implements BridgeSide {
     this.#protocolVersion = reply.version;
     const supportsPartialPresence = reply.partialPresence === true;
     this.#supportsPartialPresence = supportsPartialPresence;
+    this.#supportsNonRootHosts = reply.nonRootHosts === true;
     // Both ordinary hello and automatic notification setup negotiate dispatch isolation.
     this.#independentRpc = reply.independentRpc === true;
     // Notification setup must not silently switch a caller's chosen read/publication mode.
     // The CLI explicitly negotiates tail/batch; manual legacy users may have disabled them.
-    if (!changes) {
+    if (!changes && !presenceOnly) {
       this.#supportsTail = reply.tail === true;
       if (reply.publishBatch === true) this.publishBatch = events => this.#call("publishBatch", events.map(({ event }) => event));
     }
@@ -2446,24 +2481,36 @@ export class RemoteBridgeSide implements BridgeSide {
   async mirror(presence: BridgeMirrorPresence): Promise<void> {
     if (this.#closed) throw this.#closed;
     const partial = presenceIsPartial(presence);
-    if (partial && this.#protocolVersion === undefined) await this.hello();
+    if (this.#protocolVersion === undefined) await this.hello(false, true);
+    // Older receivers merge every same-root host token into one supersession history. Until a
+    // peer explicitly advertises the isolated child-host admission path, send its canonical-root
+    // projection only; never infer this capability from the protocol version alone.
+    const outbound = this.#supportsNonRootHosts ? presence : legacyRootProjection(presence);
     if (partial && !this.#supportsPartialPresence) {
-      // A legacy mirror treats omissions as withdrawal. Materialize every omission from the last
-      // successful complete snapshot, then send a complete, metadata-free mirror. If new records
-      // make that union exceed one frame, retain and renew the previous complete snapshot instead.
-      let complete = completeLegacyPartial(presence, this.#legacyMirrorSnapshot, Date.now());
-      if (this.#legacyMirrorSnapshot && Buffer.byteLength(JSON.stringify(complete), "utf8") > BRIDGE_PAGE_BYTES) {
+      // A legacy mirror treats every omission as withdrawal. Without an acknowledged complete
+      // baseline, fail closed; otherwise hold each omitted root for at most three lease periods.
+      if (!this.#legacyMirrorSnapshot) {
+        this.#legacyNoBaselineCycles += 1;
+        this.#legacyNoBaselineSince ??= Date.now();
+        return;
+      }
+      let complete = completeLegacyPartial(outbound, this.#legacyMirrorSnapshot, Date.now());
+      if (Buffer.byteLength(JSON.stringify(complete.presence), "utf8") > BRIDGE_PAGE_BYTES) {
         complete = completeLegacyPartial({ hosts: [], participants: [] }, this.#legacyMirrorSnapshot, Date.now());
       }
-      await this.#call("mirror", complete);
+      await this.#call("mirror", complete.presence);
       this.#legacyCompletedPartials += 1;
-      this.#legacyMirrorSnapshot = copyMirrorPresence(complete);
+      this.#legacyMirrorSnapshot = complete;
       this.#lastPresenceRenewalAt = Date.now();
       return;
     }
-    await this.#call("mirror", presence);
+    await this.#call("mirror", outbound);
     this.#lastPresenceRenewalAt = Date.now();
-    if (!partial) this.#legacyMirrorSnapshot = copyMirrorPresence(presence);
+    if (!partial) {
+      this.#legacyMirrorSnapshot = copyLegacySnapshot(outbound);
+      this.#legacyNoBaselineCycles = 0;
+      this.#legacyNoBaselineSince = undefined;
+    }
   }
   bridgedIds(after: number): Promise<BridgedIds> { return this.#call("bridgedIds", { after }); }
 }
@@ -2552,19 +2599,24 @@ export interface BridgeStepResult {
 // reserve (security review round 2, F1).
 const remoteAddresses = (presence: Pick<BridgePresence, "hosts" | "participants">): Set<string> => {
   const names = new Set<string>();
-  for (const { record } of presence.hosts) if (!isNativeNonRootHost(record)) names.add(record.id).add(record.identity.id);
-  for (const participant of presence.participants) names.add(participant.id).add(participant.rootId);
+  const hosts = presence.hosts.filter(({ record }) => isRootAuthorityHost(record));
+  const rejectedHostIds = new Set(presence.hosts.filter(({ record }) => !isRootAuthorityHost(record)).map(({ record }) => record.id));
+  for (const { record } of hosts) names.add(record.id).add(record.identity.id);
+  for (const participant of presence.participants) {
+    if (!isRootAuthorityParticipant(participant) || rejectedHostIds.has(participant.ownerHostId)) continue;
+    names.add(participant.id).add(participant.rootId);
+  }
   return names;
 };
 
-// Where the hub accepts events from the peer: its own natives, by id or unique alias.
+// Where the hub accepts events from the peer: its own canonical roots, by id or unique alias.
 const addresses = (presence: Pick<BridgePresence, "hosts" | "participants">): Set<string> => {
-  // Malformed native samples travel only to preserve a receiver's existing root. They
-  // must not become new hub routing authority merely by remaining in the snapshot.
-  const hosts = presence.hosts.filter(({ record }) => isAdmissibleRecord("host", record) && !isNativeNonRootHost(record));
-  const malformedOwners = new Set(presence.hosts.filter(({ record }) => !isAdmissibleRecord("host", record)).map(({ record }) => record.id));
-  // Trusted adapters can supply participant-only addresses without any host sample.
-  const participants = presence.participants.filter(participant => !malformedOwners.has(participant.ownerHostId));
+  // Malformed, non-root and noncanonical native samples may remain for preservation but never
+  // become routing authority. Trusted adapters may still supply a valid root participant alone.
+  const hosts = presence.hosts.filter(({ record }) => isRootAuthorityHost(record));
+  const rejectedHostIds = new Set(presence.hosts.filter(({ record }) => !isRootAuthorityHost(record)).map(({ record }) => record.id));
+  const participants = presence.participants.filter(participant => isRootAuthorityParticipant(participant) &&
+    !rejectedHostIds.has(participant.ownerHostId));
   const names = remoteAddresses({ hosts, participants });
   for (const participant of participants) {
     for (const alias of [participant.label, participant.sessionId]) if (alias) names.add(alias);
@@ -2590,6 +2642,23 @@ const isNonRootHostRecord = (record: FabricHostRecord): boolean => isNonRootHost
 /** Valid native runtime/resident host rows are retained for forwarding, not root authority. */
 const isNativeNonRootHost = (record: FabricHostRecord): boolean =>
   remoteHostOf(record) === undefined && record.bridgeVia === undefined && isNonRootHostRecord(record);
+const NON_ROOT_HOST_PREFIX_LIKE = /^(?:resident|runtime):/i;
+/** Fail closed for recipient/sender authority: only an exact canonical root host may route. */
+const isRootAuthorityHost = (record: FabricHostRecord): boolean => {
+  if (NON_ROOT_HOST_PREFIX_LIKE.test(record.id) || !isCanonicalRootId(record.id)) return false;
+  return isAdmissibleRecord("host", record) && record.rootId === record.id && record.identity.id === record.id;
+};
+const isRootAuthorityParticipant = (participant: FabricParticipantRecord): boolean =>
+  isAdmissibleRecord("participant", participant) && participant.kind === "root" &&
+  isCanonicalRootId(participant.id) && participant.id === participant.rootId &&
+  participant.ownerHostId === participant.id && participant.ownerIdentityId === participant.id;
+const legacyRootProjection = (presence: BridgeMirrorPresence): BridgeMirrorPresence => ({
+  ...presence,
+  // Preserve malformed canonical rows so the receiver can mark its own snapshot partial and
+  // protect existing owners; only omit non-root/noncanonical host ids old receivers cannot safely merge.
+  hosts: presence.hosts.filter(({ record }) => isCanonicalRootId(record.id) && !NON_ROOT_HOST_PREFIX_LIKE.test(record.id)),
+  participants: presence.participants,
+});
 
 /**
  * The remote's presence as this link admits it: hosts and roots none of whose ids or aliases
@@ -2729,9 +2798,9 @@ export const boundPresence = (
 const senderIdentities = (presence: Pick<BridgePresence, "hosts" | "participants">): Map<string, MeshIdentity> => {
   const identities = new Map<string, MeshIdentity>();
   for (const { record } of presence.hosts) {
-    if (isNativeNonRootHost(record)) continue;
+    if (!isRootAuthorityHost(record)) continue;
     const { id, name, kind, sessionId } = record.identity;
-    if (id === record.id) identities.set(id, { id, name, kind, ...(typeof sessionId === "string" ? { sessionId } : {}) });
+    identities.set(id, { id, name, kind, ...(typeof sessionId === "string" ? { sessionId } : {}) });
   }
   return identities;
 };
@@ -2758,8 +2827,10 @@ interface BridgeRules {
 
 const senders = (presence: Pick<BridgePresence, "hosts" | "participants">): Set<string> => {
   const ids = new Set<string>();
-  for (const { record } of presence.hosts) if (!isNativeNonRootHost(record)) ids.add(record.identity.id);
-  for (const participant of presence.participants) ids.add(participant.id).add(participant.ownerIdentityId);
+  for (const { record } of presence.hosts) if (isRootAuthorityHost(record)) ids.add(record.identity.id);
+  const rejectedHostIds = new Set(presence.hosts.filter(({ record }) => !isRootAuthorityHost(record)).map(({ record }) => record.id));
+  for (const participant of presence.participants) if (isRootAuthorityParticipant(participant) &&
+    !rejectedHostIds.has(participant.ownerHostId)) ids.add(participant.id).add(participant.ownerIdentityId);
   return ids;
 };
 
@@ -2806,6 +2877,8 @@ export class MeshBridge {
   #unaddressed = { count: 0, toRemote: 0, toLocal: 0, factory: 0, safety: 0, topics: new Set<string>(), more: false };
   #unaddressedLoggedAt = Number.NEGATIVE_INFINITY;
   #presenceInfoLoggedAt = Number.NEGATIVE_INFINITY;
+  #legacyNoBaselineWarned = false;
+  #legacyNoBaselineOverdueReported = false;
   /** The factory exception's token buckets (pi-fabric#876 review, P1-2; security pass, (c)). */
   readonly #factoryRate: Required<FactoryRate>;
   #factoryTokens: number;
@@ -2970,15 +3043,31 @@ export class MeshBridge {
     this.options.log?.(message);
   }
 
-  /** One per-link INFO line, no more than once a minute, including the last acknowledged renewal age. */
+  /** One per-link INFO line, no more than once a minute except the first baseline-outage alarm. */
   #reportPresenceInfo(): void {
     const now = this.#now();
-    if (now - this.#presenceInfoLoggedAt < UNADDRESSED_LOG_MS) return;
-    this.#presenceInfoLoggedAt = now;
     const remote = this.options.remote instanceof RemoteBridgeSide ? this.options.remote : undefined;
+    const noBaselineCycles = remote?.legacyNoBaselineCycles ?? 0;
+    const noBaselineSince = remote?.legacyNoBaselineSince;
+    if (noBaselineCycles === 0) {
+      this.#legacyNoBaselineWarned = false;
+      this.#legacyNoBaselineOverdueReported = false;
+    } else if (!this.#legacyNoBaselineWarned) {
+      this.#log(`presence WARN: peer=${this.options.remoteName} partial cycles cannot be mirrored without a complete baseline; ` +
+        `legacyNoBaselineCycles=${noBaselineCycles}; existing peer mirror is left untouched`);
+      this.#legacyNoBaselineWarned = true;
+    }
+    const noBaselineOverdue = noBaselineCycles > 0 && noBaselineSince !== undefined &&
+      now - noBaselineSince > LEGACY_PARTIAL_HOLD_MS;
+    const overdueInfoDue = noBaselineOverdue && !this.#legacyNoBaselineOverdueReported;
+    if (now - this.#presenceInfoLoggedAt < UNADDRESSED_LOG_MS && !overdueInfoDue) return;
+    this.#presenceInfoLoggedAt = now;
     const renewedAt = remote?.lastPresenceRenewalAt ?? this.#presenceAt;
     const renewalAge = Number.isFinite(renewedAt) ? Math.max(0, now - renewedAt) : "never";
-    this.#log(`presence INFO: peer=${this.options.remoteName} renewalAgeMs=${renewalAge} legacyCompletedPartials=${remote?.legacyCompletedPartials ?? 0}`);
+    this.#log(`presence INFO: peer=${this.options.remoteName} renewalAgeMs=${renewalAge} ` +
+      `legacyCompletedPartials=${remote?.legacyCompletedPartials ?? 0} legacyNoBaselineCycles=${noBaselineCycles}` +
+      (noBaselineOverdue ? " legacy presence not renewed (no complete baseline)" : ""));
+    if (noBaselineOverdue) this.#legacyNoBaselineOverdueReported = true;
   }
 
   /**
@@ -3358,6 +3447,11 @@ export class MeshBridge {
       this.#directionPending[direction] = true;
       if (this.#directionWakeReason[direction] !== "real") this.#directionWakeReason[direction] = "sync";
       if (!this.#directionBackoff[direction]) this.#directionWake[direction]?.("sync");
+    }
+    // A skipped first legacy partial is an outage state, not a successful renewal; expose it
+    // immediately even for callers that use syncPresence() without the long-running loop.
+    if (this.options.remote instanceof RemoteBridgeSide && this.options.remote.legacyNoBaselineCycles > 0) {
+      this.#reportPresenceInfo();
     }
   }
 
@@ -4143,8 +4237,12 @@ export class MeshBridge {
               .then(() => undefined, () => undefined);
             this.#watchdogTask = this.#watchdogLoop(running);
           }
+          const remote = this.options.remote instanceof RemoteBridgeSide ? this.options.remote : undefined;
+          const noBaselineAlarmAt = remote && remote.legacyNoBaselineCycles > 0 && !this.#legacyNoBaselineOverdueReported &&
+            remote.legacyNoBaselineSince !== undefined
+            ? remote.legacyNoBaselineSince + LEGACY_PARTIAL_HOLD_MS + 1 : Infinity;
           const deadline = Math.min(this.#expiryAt,
-            this.#leaseVersion !== this.#syncedLeaseVersion ? this.#leaseRenewAt : Infinity);
+            this.#leaseVersion !== this.#syncedLeaseVersion ? this.#leaseRenewAt : Infinity, noBaselineAlarmAt);
           if (Number.isFinite(deadline)) delay = Math.max(0, deadline - Date.now());
           if (this.#legacyPolling) delay = Math.min(delay ?? Infinity, this.options.pollMs ?? LEGACY_POLL_MS);
         } catch (error) {

@@ -287,6 +287,11 @@ export class ProcessTransport implements AgentTransportAdapter {
     const needs = normalizeAgentCapabilityTokens(request.needs);
     request = { ...request, ...(needs !== undefined ? { needs } : {}), ...(requires !== undefined ? { requires } : {}) };
     const placement = this.#placement();
+    // A present full grant is a host decision, never a hint for the old picker.
+    // Any incompatibility refuses it rather than falling back to another host.
+    const grant = request.placementGrant !== undefined
+      ? await (await import("./placement.js")).validatedTransportPlacementGrant(request) : undefined;
+    if (grant && !placement) throw new Error("Placement grant requires a configured transport");
     if (placement) {
       const preflightDeadline = Date.now() + Math.min(placement.commandTimeoutMs, 5_000);
       const capabilities = normalizeAgentCapabilityTokens(placement.capabilities, "agents.placement.capabilities")!;
@@ -327,10 +332,12 @@ export class ProcessTransport implements AgentTransportAdapter {
       }
       if (!reason) {
         const { launchPlacedTask, selectFleetPlacement } = await import("./placement.js");
+        if (grant) return launchPlacedTask(request, placement, preflightDeadline, grant.host);
         const selection = await selectFleetPlacement(placement, request.cwd, request.signal, preflightDeadline);
         if (selection && "localReason" in selection) reason = selection.localReason;
         else return launchPlacedTask(request, placement, preflightDeadline, selection?.host);
       }
+      if (grant) throw new Error(`Placement grant transport incompatible: ${reason}`);
       const args = new Map<string, string>();
       for (let i = 0; i < request.workerArguments.length; i += 2) args.set(request.workerArguments[i]!, request.workerArguments[i + 1]!);
       const log = args.get("--log-file");
@@ -399,7 +406,11 @@ export class ProcessTransport implements AgentTransportAdapter {
       selected.workerPath,
       prepared.workerArguments,
       request.cwd,
-      request,
+      // Do not retain a whole launch request in the IPC placement closure.
+      { signal: request.signal,
+        ...(request.authorize ? { authorize: request.authorize } : {}),
+        ...(request.onUnconfirmedExit ? { onUnconfirmedExit: request.onUnconfirmedExit } : {}),
+        ...(request.onPlacementRestart ? { onPlacementRestart: request.onPlacementRestart } : {}) },
       request.childEnvironment ? request.childEnvironment(prepared.environment) : prepared.environment,
       scope,
       7_000, // allow the worker's five-second execution-child cleanup

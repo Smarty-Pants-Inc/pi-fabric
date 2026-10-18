@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import type { AgentTransportLaunch } from "../types.js";
 import { assertTransportLaunchAllowed } from "./launch-authority.js";
+import { attachPlacementRestartHandler } from "../worker-protocol.js";
 import { terminateWindowsTree } from "../../child-process-tree.js";
 import { spawnDetached as spawnDetachedLegacy } from "./process-utils-legacy.js";
 import { randomBytes } from "node:crypto";
@@ -303,7 +304,7 @@ export const spawnDetached = async (
   workerPath: string,
   workerArguments: string[],
   cwd: string,
-  authority?: Pick<AgentTransportLaunch, "signal" | "authorize" | "onUnconfirmedExit">,
+  authority?: Pick<AgentTransportLaunch, "signal" | "authorize" | "onUnconfirmedExit" | "onPlacementRestart">,
   environment?: NodeJS.ProcessEnv,
   /** memoryMaxBytes present: capped `fabric-task-*.scope` with an owned cgroup kill boundary (#8257). */
   scope?: { executable: string; slice: string; warn: (reason: string) => void; memoryMaxBytes?: number },
@@ -337,7 +338,8 @@ export const spawnDetached = async (
     ? capped ? `${TASK_SCOPE_PREFIX}${process.pid}-${randomBytes(8).toString("hex")}.scope` : `${path.basename(scopeRoot)}.scope`
     : undefined;
   // The capped shim blocks on this inherited pipe until the parent verified the boundary.
-  const gateFd = tracksExecution ? 4 : 3;
+  const ipc = tracksExecution || Boolean(authority?.onPlacementRestart);
+  const gateFd = ipc ? 4 : 3;
   const childEnvironment = childProcessEnvironment(environment);
   if (capped) {
     // Only the released shim exports these, and only for a proven admission.
@@ -378,9 +380,10 @@ export const spawnDetached = async (
     env: childEnvironment,
     detached: process.platform !== "win32",
     stdio: capped
-      ? ["ignore", "ignore", "ignore", ...(tracksExecution ? ["ipc" as const] : []), "pipe"]
-      : tracksExecution ? ["ignore", "ignore", "ignore", "ipc"] : "ignore",
+      ? ["ignore", "ignore", "ignore", ...(ipc ? ["ipc" as const] : []), "pipe"]
+      : ipc ? ["ignore", "ignore", "ignore", "ipc"] : "ignore",
   });
+  const revokePlacement = attachPlacementRestartHandler(child, authority?.onPlacementRestart, authority?.signal, authority?.authorize);
   let spawnError: Error | undefined;
   child.once("error", error => { spawnError = error; });
   const gate = capped ? child.stdio[gateFd] as import("node:stream").Writable | null : null;
@@ -791,6 +794,7 @@ export const spawnDetached = async (
       } finally { clearTimeout(deadline); }
     },
     stop() {
+      revokePlacement();
       if (stopping) return stopping;
       stopFailed = false;
       const pending = (async () => {

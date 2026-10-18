@@ -10,6 +10,21 @@ import { normalizeAgentRequires, RequiredInputMissingError } from "../input-vali
 import { preflightFleetPlacement } from "./placement-preflight.js";
 export { placementLocalPathReason, selectFleetPlacement } from "./placement-preflight.js";
 
+/** Structural checks supplement, never replace, the manager's native authority
+ * recheck. A bare CLI PLACE has no revalidate callback and is refused. */
+export const validatedTransportPlacementGrant = async (request: AgentTransportLaunch) => {
+  const carrier = request.placementGrant;
+  if (carrier === undefined) return undefined;
+  if (!carrier || typeof carrier.revalidate !== "function") throw new Error("Placement grant lacks manager validation");
+  const contract: typeof import("../placement-contract.js") = await import("../placement-contract.js");
+  contract.validatePlacementPlace(carrier.decision);
+  if (Date.parse(carrier.decision.create_before) <= Date.now() || Date.parse(carrier.decision.grant.expiresAt) <= Date.now()) {
+    throw new Error("Placement grant expired");
+  }
+  carrier.revalidate();
+  return carrier.decision;
+};
+
 interface Receipt { rc: number | string; text: string; stderr?: string }
 
 /** The fleet launcher returns rc=3 and a concrete PREFLIGHT_REFUSED receipt when a --require path is absent on target. */
@@ -41,6 +56,9 @@ const receipt = (input: unknown): Receipt | undefined => {
  */
 export const launchPlacedTask = async (request: AgentTransportLaunch, config: AgentPlacementConfig, preflightDeadline?: number, selectedHost?: string): Promise<AgentTransportHandle> => {
   const requires = normalizeAgentRequires(request.requires);
+  const grant = request.placementGrant !== undefined ? await validatedTransportPlacementGrant(request) : undefined;
+  if (grant && selectedHost !== undefined && selectedHost !== grant.host) throw new Error("Placement grant host mismatch");
+  if (grant) selectedHost = grant.host;
   const args = new Map<string, string>();
   for (let i = 0; i < request.workerArguments.length; i += 2) args.set(request.workerArguments[i]!, request.workerArguments[i + 1]!);
   const required = (flag: string): string => {
@@ -56,15 +74,28 @@ export const launchPlacedTask = async (request: AgentTransportLaunch, config: Ag
   const deadline = startedAt + timeoutMs;
   const values: Record<string, string> = {
     id: request.id, cwd: request.cwd, task, minutes: String(Math.max(1, Math.ceil(timeoutMs / 60_000))),
-    model: args.get("--model") ?? "", thinking: args.get("--thinking") ?? "high",
+    model: grant?.model ?? args.get("--model") ?? "", thinking: grant?.thinking ?? args.get("--thinking") ?? "high",
+    ...(grant ? { host: grant.host } : {}),
   };
   let environment = taskAgentEnvironment();
   // The launcher binds its inbox notification to the Pi caller, not this child.
   environment.PI_SESSION_ID = args.get("--fabric-session-id") ?? environment.PI_SESSION_ID;
-  const prepared = await preflightFleetPlacement(request, config, config.command.map(entry => render(entry, values)), task, environment, preflightDeadline, selectedHost);
+  const launchCommand = config.command.map(entry => render(entry, values));
+  if (grant) {
+    // The existing one-shot argv protocol selects all three, even if an older
+    // host template still contains literal baseline values rather than tokens.
+    for (const [flag, value] of [["--host", grant.host], ["--model", grant.model], ["--thinking", grant.thinking]]) {
+      const end = launchCommand.indexOf("--") < 0 ? launchCommand.length : launchCommand.indexOf("--");
+      const slots = launchCommand.slice(0, end).flatMap((entry, index) => entry === flag ? [index] : []);
+      if (slots.length > 1 || slots[0] === end - 1) throw new Error("Malformed placement triplet options");
+      if (slots[0] !== undefined) launchCommand[slots[0] + 1] = value!;
+      else launchCommand.splice(end, 0, flag!, value!);
+    }
+  }
+  const prepared = await preflightFleetPlacement(request, config, launchCommand, task, environment, preflightDeadline, selectedHost);
   if (prepared) environment = prepared.environment;
   const command = async (template: string[], limit = config.commandTimeoutMs, signal?: AbortSignal, extraArguments: string[] = []) => {
-    const argv = template === config.command && prepared ? [...prepared.command] : template.map(entry => render(entry, values));
+    const argv = template === config.command ? [...(prepared?.command ?? launchCommand)] : template.map(entry => render(entry, values));
     // The fleet launcher's current repeatable preflight flag is --require.
     // Keep paths literal and before the prompt separator, never as task text.
     const separator = argv.indexOf("--");
@@ -160,6 +191,12 @@ export const launchPlacedTask = async (request: AgentTransportLaunch, config: Ag
   };
   // Rendering/read errors above are prelaunch. After exec starts, failure cannot
   // prove that nothing ran remotely: retain custody and never spawn locally.
+  if (grant) {
+    const current = await validatedTransportPlacementGrant(request);
+    if (!current || current.host !== values.host || current.model !== values.model || current.thinking !== values.thinking) {
+      throw new Error("Placement grant changed during preparation");
+    }
+  }
   assertTransportLaunchAllowed(request);
   request.onWritePolicyDisposition?.("remote");
   try {
@@ -179,7 +216,7 @@ export const launchPlacedTask = async (request: AgentTransportLaunch, config: Ag
       return handle;
     }
     const accepted = output.match(/^RYZEN2_TASK_ACCEPTED ([A-Za-z0-9._-]+) on ([A-Za-z0-9][A-Za-z0-9._-]*)\b/m);
-    if (!accepted || accepted[1] !== request.id || prepared && accepted[2] !== prepared.host) {
+    if (!accepted || accepted[1] !== request.id || prepared && accepted[2] !== prepared.host || grant && accepted[2] !== grant.host) {
       debt = "Placement launch outcome unknown: missing or mismatched RYZEN2_TASK_ACCEPTED receipt";
       request.onUnconfirmedExit?.(debt);
       save("failed", "", debt);

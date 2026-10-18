@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { BridgeMirrorDeferredError, MeshBridge, RemoteBridgeSide, serveBridgeAgent, StoreBridgeSide, type BridgePresence } from "../src/mesh/bridge.js";
+import { BRIDGE_PROTOCOL_VERSION, BridgeMirrorDeferredError, MeshBridge, RemoteBridgeSide, serveBridgeAgent, StoreBridgeSide, type BridgePresence } from "../src/mesh/bridge.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { CommitOutbox } from "../src/mesh/commit-outbox.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
@@ -467,7 +467,17 @@ const transport = (timeout = 30) => {
   const output = new PassThrough();
   const remote = new RemoteBridgeSide(input, output, timeout);
   const sent: Array<{ id: number; op: string }> = [];
-  output.on("data", buffer => { sent.push(JSON.parse(buffer.toString())); });
+  output.on("data", buffer => {
+    const request = JSON.parse(buffer.toString()) as { id: number; op: string };
+    if (request.op === "hello") {
+      // This direct transport peer supports protocol v2 but predates nonRootHosts. Reply to
+      // capability negotiation while intentionally leaving the optional capability absent.
+      input.write(JSON.stringify({ id: request.id, ok: true,
+        result: { version: BRIDGE_PROTOCOL_VERSION, changes: true } }) + "\n");
+      return;
+    }
+    sent.push(request);
+  });
   const reply = (id: number, result: unknown = undefined, error?: string, code?: string) => input.write(JSON.stringify({ id,
     ok: error === undefined, ...(error === undefined ? { result } : { error, ...(code ? { code } : {}) }) }) + "\n");
   close.push(() => remote.close());

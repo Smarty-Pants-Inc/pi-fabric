@@ -4523,7 +4523,9 @@ export class ActorManager {
   /**
    * Host-only callback for an already authenticated placement.wake. Exact local actor
    * ids only (never names). True is a durable queue receipt, NOT launch authority.
-   * Storage errors throw so the control plane can NAK rather than ACK lost work.
+   * A false pre-checkpoint match is not acceptance; the authenticated NATS receiver NAKs
+   * and rechecks the same launch+generation with a bounded delivery count. Storage errors
+   * throw so the control plane can NAK rather than ACK lost work.
    */
   placementWake(targetId: string, wake: FabricPlacementWake): boolean {
     const actor = this.#actors.get(targetId);

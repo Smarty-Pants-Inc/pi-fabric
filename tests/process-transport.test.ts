@@ -799,6 +799,38 @@ console.log('RYZEN2_TASK_ACCEPTED '+at('--id')+' on '+host);\n`);
     expect(JSON.parse(fs.readFileSync(f.statusFile, "utf8"))).toMatchObject({ status: "completed", model: "granted/model", text: "fake task on granted-host" });
   });
 
+  it("keeps remote shadow restarts baseline-only and strips the local manager IPC binding", async () => {
+    const f = setup();
+    vi.spyOn(placementModule, "selectFleetPlacement").mockResolvedValue(undefined);
+    const callback = vi.fn(async () => "BASELINE" as const);
+    const remoteLaunch = vi.spyOn(placementModule, "launchPlacedTask");
+    const workerArguments = [...f.request.workerArguments, "--placement-launch-id", "semantic-launch",
+      "--placement-generation", "7", "--placement-enforcing", "false"];
+    const handle = await new ProcessTransport(undefined, f.config).launch({ ...f.request, workerArguments,
+      onPlacementRestart: callback });
+    const remoteRequest = remoteLaunch.mock.calls[0]?.[0];
+    expect(remoteLaunch).toHaveBeenCalledOnce();
+    expect(remoteRequest).toBeDefined();
+    expect(remoteRequest).not.toHaveProperty("onPlacementRestart");
+    expect(remoteRequest!.workerArguments).not.toContain("--placement-launch-id");
+    expect(remoteRequest!.workerArguments).not.toContain("--placement-generation");
+    expect(remoteRequest!.workerArguments).not.toContain("--placement-enforcing");
+    expect(callback).not.toHaveBeenCalled();
+    expect(await handle.isAlive()).toBe(false);
+  });
+
+  it("refuses an enforced remote restart without a bridge before starting the remote task", async () => {
+    const f = setup();
+    vi.spyOn(placementModule, "selectFleetPlacement").mockResolvedValue(undefined);
+    const remoteLaunch = vi.spyOn(placementModule, "launchPlacedTask");
+    const workerArguments = [...f.request.workerArguments, "--placement-launch-id", "semantic-launch",
+      "--placement-generation", "7", "--placement-enforcing", "true"];
+    await expect(new ProcessTransport(undefined, f.config).launch({ ...f.request, workerArguments,
+      onPlacementRestart: async () => "BASELINE" })).rejects.toThrow(/restart bridge unavailable/u);
+    expect(remoteLaunch).not.toHaveBeenCalled();
+    expect(fs.existsSync(f.argvFile)).toBe(false);
+  });
+
   it("with no grant uses today's selector and baseline triplet, never an attached shadow hypothetical", async () => {
     const f = setup();
     const picker = vi.spyOn(placementModule, "selectFleetPlacement").mockResolvedValue(undefined);

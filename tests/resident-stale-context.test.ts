@@ -147,7 +147,7 @@ it("reloads a real resident Pi host while a process-backed browser call is in fl
     expect(calls).toBe(2); // No replay of the already-dispatched child call.
     expect(errors).toEqual([]);
   } finally {
-    for (const child of children) { if (child.process.connected) child.process.send("release"); }
+    for (const child of children) { if (child.process.connected) child.process.send("release", () => {}); }
     await Promise.all(children.map(child => child.closed));
     await pending;
     if (session) { await session.extensionRunner!.emit({ type: "session_shutdown", reason: "quit" }); session.dispose(); }

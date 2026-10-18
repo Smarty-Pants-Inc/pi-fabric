@@ -460,7 +460,7 @@ describe.skipIf(process.platform === "win32")("fabric-mesh-backend readiness gat
       if (child.exitCode !== null || !child.connected) { child.kill("SIGKILL"); resolve(); return; }
       const deadline = setTimeout(() => { child.kill("SIGKILL"); resolve(); }, 5_000);
       child.once("exit", () => { clearTimeout(deadline); resolve(); });
-      child.send("exit");
+      child.send("exit", () => {});
     });
     return { child, open, close };
   };

@@ -1,4 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
+import { hostedOnly } from "../scripts/hosted-only.mjs";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -91,7 +92,7 @@ const setOwner = (file: string, sid: string): { changed: boolean; trace: string[
   return { changed: now.sid === sid, trace };
 };
 
-describe.runIf(process.env.GITHUB_ACTIONS === "true" && process.platform === "win32")("Windows verified removal (smarty-dev#7858)", () => {
+describe.runIf(hostedOnly("Windows verified removal") && process.platform === "win32")("Windows verified removal (smarty-dev#7858)", () => {
   it("has the digest-verified helper in this build", () => {
     expect(windowsRemoveHelper()).toMatch(/fabric-win-remove\.exe$/);
   });

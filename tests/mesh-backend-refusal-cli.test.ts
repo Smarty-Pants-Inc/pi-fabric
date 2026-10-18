@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import { hostedOnly } from "../scripts/hosted-only.mjs";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -15,7 +16,7 @@ import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 // moves this run's state.db* into a `.import-quarantine-*` slot and RETAINS them (no unlink/rmdir ever), reporting
 // each entry path with warnings. Linux GitHub-hosted runners only. Locally this file is collected and skipped.
 
-const HOSTED = process.env.GITHUB_ACTIONS === "true" && process.platform === "linux";
+const HOSTED = hostedOnly("mesh backend refusal CLI") && process.platform === "linux";
 const BIN = path.resolve("bin/fabric-mesh-backend");
 const BUILT_CLI = path.resolve("dist/mesh/mesh-backend-cli.js");
 const CHILD_TIMEOUT = 60_000;

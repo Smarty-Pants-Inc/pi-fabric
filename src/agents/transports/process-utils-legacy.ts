@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import type { AgentTransportLaunch } from "../types.js";
 import { assertTransportLaunchAllowed } from "./launch-authority.js";
+import { attachPlacementRestartHandler } from "../worker-protocol.js";
 import { terminateWindowsTree } from "../../child-process-tree.js";
 
 export interface ExecFileResult {
@@ -281,7 +282,7 @@ export const spawnDetached = async (
   workerPath: string,
   workerArguments: string[],
   cwd: string,
-  authority?: Pick<AgentTransportLaunch, "signal" | "authorize" | "onUnconfirmedExit">,
+  authority?: Pick<AgentTransportLaunch, "signal" | "authorize" | "onUnconfirmedExit" | "onPlacementRestart">,
   environment?: NodeJS.ProcessEnv,
   scope?: { executable: string; slice: string; warn: (reason: string) => void },
   /** Ordinary workers need time to run their five-second execution-child cleanup. */
@@ -305,8 +306,9 @@ export const spawnDetached = async (
     cwd,
     env: childProcessEnvironment(environment),
     detached: process.platform !== "win32",
-    stdio: tracksExecution ? ["ignore", "ignore", "ignore", "ipc"] : "ignore",
+    stdio: tracksExecution || authority?.onPlacementRestart ? ["ignore", "ignore", "ignore", "ipc"] : "ignore",
   });
+  const revokePlacement = attachPlacementRestartHandler(child, authority?.onPlacementRestart, authority?.signal, authority?.authorize);
   let spawnError: Error | undefined;
   child.once("error", error => { spawnError = error; });
   if (!child.pid) {
@@ -533,6 +535,7 @@ export const spawnDetached = async (
       }
     },
     stop() {
+      revokePlacement();
       if (stopping) return stopping;
       stopFailed = false;
       const pending = (async () => {

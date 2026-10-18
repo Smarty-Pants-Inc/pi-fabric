@@ -211,6 +211,50 @@ describe.skipIf(process.platform !== "linux")("owned execution snapshot", () => 
 });
 
 describe("spawnDetached", () => {
+  it.each(["linux", "win32"] as const)("dispatches restart IPC through the host callback independently of execution custody on %s", async platform => {
+    vi.spyOn(process, "platform", "get").mockReturnValue(platform);
+    const child = Object.assign(new EventEmitter(), {
+      pid: process.pid, unref: vi.fn(), channel: {}, connected: true,
+      send: vi.fn((_message: unknown, callback: () => void) => callback()),
+    });
+    vi.mocked(spawn).mockReturnValueOnce(child as unknown as ChildProcess);
+    const callback = vi.fn(async () => "BASELINE" as const);
+    await spawnDetached("worker.mjs", [], process.cwd(), { onPlacementRestart: callback });
+    expect(vi.mocked(spawn).mock.calls.at(-1)?.[2]?.stdio).toEqual(["ignore", "ignore", "ignore", "ipc"]);
+    child.emit("message", { type: "placement.restart", launchId: "launch", generation: 8, task: "refuse extra input" });
+    await Promise.resolve();
+    expect(callback).not.toHaveBeenCalled();
+    expect(child.send).toHaveBeenLastCalledWith({ type: "placement.restart.decision", launchId: "launch", generation: 8, decision: "REFUSE" }, expect.any(Function));
+    child.emit("message", { type: "placement.restart", launchId: "launch", generation: 8 });
+    await vi.waitFor(() => expect(child.send).toHaveBeenLastCalledWith({ type: "placement.restart.decision", launchId: "launch", generation: 8, decision: "BASELINE" }, expect.any(Function)));
+    expect(callback).toHaveBeenCalledExactlyOnceWith({ type: "placement.restart", launchId: "launch", generation: 8 });
+    child.emit("exit", 0); child.emit("close", 0);
+    child.emit("message", { type: "placement.restart", launchId: "launch", generation: 9 });
+    await Promise.resolve();
+    expect(callback).toHaveBeenCalledOnce();
+  });
+
+  it.each(["abort", "disconnect", "exit"])("does not send a delayed baseline after %s", async race => {
+    const child = Object.assign(new EventEmitter(), {
+      pid: process.pid, unref: vi.fn(), connected: true,
+      send: vi.fn((_message: unknown, callback: () => void) => callback()),
+    });
+    vi.mocked(spawn).mockReturnValueOnce(child as unknown as ChildProcess);
+    let release!: (value: "BASELINE") => void;
+    const answer = new Promise<"BASELINE">(resolve => { release = resolve; });
+    const callback = vi.fn(() => answer);
+    const abort = new AbortController();
+    await spawnDetached("worker.mjs", [], process.cwd(), { onPlacementRestart: callback, signal: abort.signal });
+    child.emit("message", { type: "placement.restart", launchId: "launch", generation: 8 });
+    expect(callback).toHaveBeenCalledOnce();
+    if (race === "abort") abort.abort();
+    else { if (race === "disconnect") child.connected = false; child.emit(race, 0); }
+    release("BASELINE");
+    await Promise.resolve(); await Promise.resolve();
+    expect(child.send).not.toHaveBeenCalled();
+    child.emit("exit", 0); child.emit("close", 0);
+  });
+
   it("accepts a Bun-shaped IPC channel without unref while retaining custody messages", async () => {
     const child = Object.assign(new EventEmitter(), {
       pid: process.pid, unref: vi.fn(), channel: {}, connected: true,

@@ -5,6 +5,7 @@ import { copyFabricPrincipal, copyFabricProvenance, type FabricPrincipal, type F
 import { createHash, randomUUID } from "node:crypto";
 import { taskReturnAddressArguments, type TaskReturnAddress } from "./task-return-address.js";
 import type { SpawnRouterAdmission } from "./spawn-router.js";
+import { isPlacementRestartRequest, type PlacementRestartRequest, type PlacementRestartDecision } from "./worker-protocol.js";
 import { AgentWaitBoundError, describeWaitBound } from "./wait-bound.js";
 import { admitModelException, appendOpusPolicyLog, FabricModelExceptionDeniedError, isClaudeModel, type ModelExceptionEntry } from "./model-policy-log.js";
 import { normalizeAgentRequires } from "./input-validation.js";
@@ -678,7 +679,34 @@ interface RecoveryRetry {
   recoveryAlarmed?: boolean;
 }
 
+type PlacementFacts = Pick<AgentRunRequest, "placement" | "actorId" | "capabilityRequirements">;
+interface ManagerPlacementState {
+  facts: PlacementFacts;
+  launchId: string;
+  generation: number;
+  workerGeneration: number;
+}
+/** Whitelist before any async closure is made: never retain the task request,
+ * caller provenance, route decisions, or arbitrary public fields. */
+const placementState = (id: string, request: AgentRunRequest): ManagerPlacementState => {
+  const binding = request.placement;
+  const launchId = binding?.launchId ?? request.activationId ?? id;
+  const generation = binding?.generation ?? 1;
+  return { launchId, generation, workerGeneration: generation, facts: {
+    placement: { launchId, generation,
+      ...(binding?.role ? { role: binding.role } : {}),
+      ...(binding?.complexity ? { complexity: binding.complexity } : {}),
+      ...(binding?.profile ? { profile: binding.profile } : {}),
+      ...(binding?.memoryProfileRef ? { memoryProfileRef: binding.memoryProfileRef } : {}),
+      ...(binding?.actorActivation ? { actorActivation: { actorId: binding.actorActivation.actorId, rootId: binding.actorActivation.rootId } } : {}),
+    },
+    ...(request.actorId ? { actorId: request.actorId } : {}),
+    ...(request.capabilityRequirements ? { capabilityRequirements: [...request.capabilityRequirements] } : {}),
+  } };
+};
+
 interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
+  placement?: ManagerPlacementState;
   runRoute: AgentRunRouteMetadata;
   /** smarty-dev#9855: the admission permit a lost-contact process run holds until it is proven gone (once-only). */
   heldPermit?: () => void;
@@ -2072,8 +2100,11 @@ export class AgentManager {
     }
   }
 
-  async #placementPreflight(id: string, request: AgentRunRequest, runner: FabricAgentRunner, model: string | undefined,
-    thinking: FabricThinking | undefined): Promise<void> {
+  async #placementPreflight(id: string, facts: PlacementFacts, runner: FabricAgentRunner, model: string | undefined,
+    thinking: FabricThinking | undefined): Promise<AgentTransportLaunch["placementGrant"]> {
+    // This private method accepts compact host facts only. Each observation
+    // snapshots its generation before awaiting context or the decider.
+    const request = { ...facts, placement: facts.placement ? { ...facts.placement } : undefined };
     const config = this.config.placementDecider;
     if (!config || config.mode === "off" || (runner !== "pi" && runner !== "pi-durable")) return;
     const { runPlacementPreflight } = await import("./placement-preflight-admission.js");
@@ -2084,6 +2115,30 @@ export class AgentManager {
       return;
     }
     await run();
+  }
+
+  async #placementRestart(id: string, state: ManagerPlacementState, workerGeneration: number,
+    request: PlacementRestartRequest): Promise<PlacementRestartDecision> {
+    const current = (): ManagedAgent | undefined => {
+      const managed = this.#runs.get(id);
+      if (!managed || managed.placement !== state || state.workerGeneration !== workerGeneration || managed.settled ||
+          managed.stopRequested || managed.abandoned || managed.relaunchPending || managed.finalAnswer || managed.lostContact ||
+          managed.transport.lostContact?.() !== undefined || this.#releasePaused || this.#closing || managed.abortSignal?.aborted) return undefined;
+      try { if (managed.launch.authorize?.() === false) return undefined; } catch { return undefined; }
+      return managed;
+    };
+    const managed = current();
+    if (!managed || !isPlacementRestartRequest(request) || request.launchId !== state.launchId ||
+        !Number.isSafeInteger(state.generation + 1) || request.generation !== state.generation + 1) return "REFUSE";
+    // Consume before awaiting: replay/concurrent requests cannot share a generation.
+    state.generation = request.generation;
+    state.facts.placement!.generation = state.generation;
+    try {
+      await this.#placementPreflight(id, state.facts, managed.runner, managed.model, managed.thinking);
+      // No native-create proof exists. BASELINE is valid only for off/shadow;
+      // neither a CLI PLACE nor a hypothetical may authorize an enforcing restart.
+      return current() && state.generation === request.generation && this.config.placementDecider?.mode !== "enforce" ? "BASELINE" : "REFUSE";
+    } catch { return "REFUSE"; }
   }
 
   #inheritedSessionPins(request: AgentRunRequest): InheritedSessionPin[] | undefined {
@@ -2679,6 +2734,8 @@ export class AgentManager {
       }
     }
     const routerStartState = routerStart ?? { settled: true, admission: undefined };
+    const placement = placementState(id, request);
+    let placementGrant: AgentTransportLaunch["placementGrant"];
     let presenceAttempted = false;
     let presenceWithdrawn = false;
     let placementRunId: string | undefined;
@@ -2713,7 +2770,7 @@ export class AgentManager {
         if (this.#closing) throw new Error("Fabric agent manager is closing");
         if (signal?.aborted) throw new Error("Agent launch aborted");
         assertAuthorized();
-        await this.#placementPreflight(id, request, runner, model, effectiveThinking());
+        placementGrant = await this.#placementPreflight(id, placement.facts, runner, model, effectiveThinking());
         // Internal resident-host fence: preparation may outlive the caller's deadline.
         // Activation authority and durable request commit are independent obligations.
         beforeCommit?.(id);
@@ -3203,6 +3260,10 @@ export class AgentManager {
           cwd: agentCwd,
           workerPath: runnerLaunch.workerPath,
           workerArguments: [...runnerLaunch.workerArguments],
+          ...(placementGrant ? { placementGrant } : {}),
+          ...((runner === "pi" || runner === "pi-durable") && adapter.kind === "process" ? {
+            onPlacementRestart: this.#placementRestart.bind(this, id, placement, placement.workerGeneration),
+          } : {}),
           // Apply mesh credentials first, then replace inherited actor identity with
           // this exact activation tuple (or clear it for non-actor children).
           childEnvironment,
@@ -3217,6 +3278,11 @@ export class AgentManager {
           onUnconfirmedExit: this.#handleUnconfirmedExit.bind(this, id, runDirectory, adapter.kind),
           ...(authorize ? { authorize: assertAuthorized } : {}),
         };
+        if (runner === "pi" || runner === "pi-durable") {
+          setWorkerArgument(launch.workerArguments, "placement-launch-id", placement.launchId);
+          setWorkerArgument(launch.workerArguments, "placement-generation", String(placement.generation));
+          setWorkerArgument(launch.workerArguments, "placement-enforcing", String(this.config.placementDecider?.mode === "enforce"));
+        }
         if (this.#closing) throw new Error("Fabric agent manager is closing");
         if (signal?.aborted) throw new Error("Agent launch aborted");
         // Preparation/transport resolution may have yielded since admission. Check the
@@ -3242,6 +3308,7 @@ export class AgentManager {
         }
         if (launchCancelled) queued?.abort.abort();
         const managed: ManagedAgent = {
+          placement,
           runRoute,
           id,
           name,
@@ -6360,6 +6427,22 @@ export class AgentManager {
           ref: admission.approvedGrant.issue, reason: managed.modelReason, grant: admission.approvedGrant,
           thinking: admission.thinking, runId: managed.id });
         if (warning) (managed.modelPolicyWarnings ??= []).push(warning);
+      }
+      const placement = managed.placement;
+      if (!placement) throw new Error("Replacement placement identity unavailable");
+      if (!Number.isSafeInteger(placement.generation + 1)) throw new Error("Placement generation exhausted");
+      placement.workerGeneration = ++placement.generation;
+      placement.facts.placement!.generation = placement.generation;
+      const grant = await this.#placementPreflight(managed.id, placement.facts, managed.runner,
+        managed.model, managed.routePin?.effort ?? record.thinking ?? managed.thinking);
+      if (grant) managed.launch.placementGrant = grant;
+      else delete managed.launch.placementGrant;
+      if (cancelled() || managed.abortSignal?.aborted) return false;
+      if (managed.runner === "pi" || managed.runner === "pi-durable") {
+        setWorkerArgument(managed.launch.workerArguments, "placement-generation", String(placement.generation));
+        if (managed.adapter.kind === "process") {
+          managed.launch.onPlacementRestart = this.#placementRestart.bind(this, managed.id, placement, placement.workerGeneration);
+        }
       }
       const transport = await this.#launchTransport(managed.adapter, managed.launch);
       nativeLaunchReturned = true;

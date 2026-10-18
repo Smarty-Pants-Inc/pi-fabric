@@ -26,6 +26,7 @@ import { processStartTime } from "./residency/process-identity.js";
 import { executionGroup, observeExecutionGroup } from "./worker/execution-group.js";
 import { waitForExecutionExit } from "./worker/execution-exit.js";
 import { createCrashFinisher } from "./worker/crash-finish.js";
+import { requestPlacementRestart } from "./agents/worker-protocol.js";
 
 // ProcessTransport's native channel transfers the execution cleanup obligation
 // before spawning. Other transports have no channel and retain normal signals.
@@ -365,6 +366,8 @@ const main = async (): Promise<void> => {
     writeRunRecord,
   } = loadedRunRecordHelpers;
   const options = optionHelpers.parseWorkerOptions();
+  const restartAbort = new AbortController();
+  let placementGeneration = options.placementRestart?.generation ?? 1;
   const isPi = PI_BACKED_RUNNERS.has(options.runner);
   const sessionExporter = options.sessionExportFile
     ? new sessionExportHelpers.SessionExporter({
@@ -2530,7 +2533,21 @@ const main = async (): Promise<void> => {
     child.stderr?.on("data", (chunk: Buffer) => recordStderr(stderrDecoder.write(chunk)));
     child.stderr?.on("error", () => {});
   };
-  const restartPiChild = (): void => {
+  const restartPiChild = async (): Promise<boolean> => {
+    if (terminalStatus || externalStopRequested || restartAbort.signal.aborted) return false;
+    const binding = options.placementRestart;
+    // Non-process legacy transports have no parent IPC and keep baseline
+    // behavior only. An enforcing path can never use that compatibility exit.
+    const allowed = !binding ? !process.send : !process.send
+      ? options.transport !== "process" && !binding.enforcing
+      : await requestPlacementRestart(process, { type: "placement.restart", launchId: binding.launchId,
+        generation: ++placementGeneration }, restartAbort.signal, binding.enforcing);
+    if (terminalStatus || externalStopRequested || restartAbort.signal.aborted) return false;
+    if (!allowed) {
+      terminalStatus = "failed";
+      terminalError = "Pi restart refused: no current manager placement decision";
+      return false;
+    }
     finishingStartedAt = undefined;
     delete record.finishingAt;
     record.status = "running";
@@ -2559,6 +2576,7 @@ const main = async (): Promise<void> => {
     childExited = false;
     attachChildStreams();
     startChildInput();
+    return true;
   };
   attachChildStreams();
   startChildInput();
@@ -2566,6 +2584,7 @@ const main = async (): Promise<void> => {
   const timeout = setTimeout(() => {
     if (terminalStatus || finishingStartedAt !== undefined) return;
     terminalStatus = "timed_out";
+    restartAbort.abort();
     terminalError = `Agent timed out after ${options.timeoutMs}ms`;
     if (isPi && !modelControl.ready) {
       terminalError += "; Pi model admission did not complete; task was not sent";
@@ -2577,6 +2596,7 @@ const main = async (): Promise<void> => {
   const stop = (): void => {
     if (terminalStatus) return;
     terminalStatus = "stopped";
+    restartAbort.abort();
     terminalError = "Agent stopped";
     killChild();
   };
@@ -2637,7 +2657,7 @@ const main = async (): Promise<void> => {
       // The activation hasn't been dispatched. Keep its original envelope and
       // persona, and re-pin model/effort before any business inference.
       providerAborted = false;
-      restartPiChild();
+      if (!await restartPiChild()) break;
       continue;
     }
     if (terminalStatus) break;
@@ -2715,7 +2735,7 @@ const main = async (): Promise<void> => {
     retainedPiQueues = record.pendingMessages ? {
       steering: [...record.pendingMessages.steering], followUp: [...record.pendingMessages.followUp],
     } : undefined;
-    restartPiChild();
+    if (!await restartPiChild()) break;
   }
   await executionSettled();
 

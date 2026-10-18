@@ -62,6 +62,14 @@ export const parseWorkerOptions = (
   argv: readonly string[] = process.argv,
 ): AgentWorkerOptions => {
   const args = argumentMap(argv);
+  const placementLaunchId = optional(args, "placement-launch-id");
+  const placementGenerationSource = optional(args, "placement-generation");
+  const placementEnforcing = optional(args, "placement-enforcing");
+  const hasPlacementRestart = placementLaunchId !== undefined || placementGenerationSource !== undefined || placementEnforcing !== undefined;
+  const placementGeneration = Number(placementGenerationSource);
+  if (hasPlacementRestart && (!placementLaunchId || placementLaunchId.length > 200 || /[\u0000-\u001f\u007f]/u.test(placementLaunchId) ||
+      !Number.isSafeInteger(placementGeneration) || placementGeneration < 1 ||
+      (placementEnforcing !== "true" && placementEnforcing !== "false"))) throw new Error("Invalid worker placement restart binding");
   const model = optional(args, "model");
   const modelReason = args.get("model-reason") ?? args.get("opus-reason");
   const policyWarningsSource = optional(args, "model-policy-warnings");
@@ -236,6 +244,7 @@ export const parseWorkerOptions = (
     throw new Error("Resident startup probe must be an isolated Pi worker");
   }
   return {
+    ...(hasPlacementRestart ? { placementRestart: { launchId: placementLaunchId!, generation: placementGeneration, enforcing: placementEnforcing === "true" } } : {}),
     ...(residentStartupProbe ? { residentStartupProbe: true } : {}),
     id: required(args, "id"),
     ...(fabricRelease ? { fabricRelease } : {}),

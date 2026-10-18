@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { PassThrough } from "node:stream";
+import { PassThrough, Transform } from "node:stream";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -62,14 +62,29 @@ const installNative = async (store: MeshStore, value: ReturnType<typeof fixture>
 
 // Keep reason: own-root reservation and incarnation admission cross the real trusted-hub RPC
 // boundary, including the work-host receiver's fromHub path.
-const ownRootLink = (monitorLease = true, backend: "file" | "sqlite" = "sqlite") => {
+const ownRootLink = (monitorLease = true, backend: "file" | "sqlite" = "sqlite", legacy = false) => {
   const hub = openStore(backend);
   const work = openStore(backend);
   const input = new PassThrough();
   const output = new PassThrough();
   const local = new StoreBridgeSide(hub, "intel1", () => Date.now());
   const agent = new StoreBridgeSide(work, "hub", () => Date.now(), monitorLease);
-  const serving = serveBridgeAgent(agent, input, output);
+  // Emulate the legacy hello on the actual RPC wire, preserving every other agent operation.
+  let buffered = "";
+  const legacyReplies = legacy ? new Transform({ transform(chunk, _encoding, done) {
+    buffered += String(chunk);
+    for (;;) {
+      const newline = buffered.indexOf("\n");
+      if (newline < 0) break;
+      const response = JSON.parse(buffered.slice(0, newline));
+      buffered = buffered.slice(newline + 1);
+      if (response.result?.partialPresence === true) delete response.result.partialPresence;
+      this.push(`${JSON.stringify(response)}\n`);
+    }
+    done();
+  } }) : undefined;
+  legacyReplies?.pipe(output);
+  const serving = serveBridgeAgent(agent, input, legacyReplies ?? output);
   const remote = new RemoteBridgeSide(output, input);
   const bridge = new MeshBridge({ localName: "hub", remoteName: "intel1", local, remote,
     cursorPath: path.join(hub.root, "intel1.cursor.json"), presenceMs: 0 });
@@ -78,6 +93,7 @@ const ownRootLink = (monitorLease = true, backend: "file" | "sqlite" = "sqlite")
     remote.close();
     input.end();
     await serving;
+    legacyReplies?.destroy();
     output.end();
   });
   return { hub, work, local, agent, remote, bridge };
@@ -289,24 +305,86 @@ describe("own-root diagnostic", () => {
 });
 
 describe("direct tokenless presence through MeshBridge RPC", () => {
-  it("allows complete snapshots to old peers but refuses partial snapshots they cannot honor", async () => {
+  it("CLI keeps a legacy link alive after a partial presence cycle", async () => {
+    const store = openStore("file");
+    const flags = new Map([["mesh", store.root], ["name", "hub"], ["remote", "intel1"],
+      ["cursor", path.join(store.root, "cursor.json")], ["call-timeout-ms", "1000"]]);
+    // A real transport peer advertises notifications but predates partialPresence.
+    const peer = `
+      require("node:readline").createInterface({ input: process.stdin }).on("line", line => {
+        const request = JSON.parse(line);
+        const result = request.op === "hello" ? { version: ${BRIDGE_PROTOCOL_VERSION}, changes: true }
+          : request.op === "presence" ? { hosts: [null], participants: [] }
+          : request.op === "latestSequence" ? 0
+          : request.op === "bridgedIds" ? { ids: [], through: 0, done: true }
+          : request.op === "read" ? { events: [], through: 0, done: true } : {};
+        process.stdout.write(JSON.stringify({ id: request.id, ok: true, result }) + "\\n");
+      });
+    `;
+    const controller = new AbortController();
+    const logs: string[] = [];
+    vi.spyOn(process.stderr, "write").mockImplementation(chunk => {
+      logs.push(String(chunk));
+      if (String(chunk).includes("linked hub <-> intel1")) controller.abort();
+      return true;
+    });
+    const deadline = setTimeout(() => controller.abort(), 3_000);
+    try {
+      const code = await runBridge(flags, [process.execPath, "-e", peer], controller.signal);
+      expect(code).toBe(0);
+      expect(logs.join("")).toContain("linked hub <-> intel1");
+      expect(logs.join("")).not.toContain("stopped:");
+      expect(logs.filter(line => line.includes("legacyPartialSkips="))).toEqual([
+        expect.stringContaining("hub -> intel1: presence: legacy peer lacks partialPresence; skipped remote partial mirror; legacyPartialSkips=1"),
+      ]);
+    } finally {
+      clearTimeout(deadline);
+      controller.abort();
+    }
+  });
+
+  it("skips only legacy partial mirrors, counts every skip and logs once per capability state", async () => {
     const toPeer = new PassThrough();
     const fromPeer = new PassThrough();
-    const remote = new RemoteBridgeSide(fromPeer, toPeer);
+    const logs: string[] = [];
+    const remote = new RemoteBridgeSide(fromPeer, toPeer, undefined, message => logs.push(message));
     let mirrors = 0;
+    let supportsPartial = false;
     toPeer.on("data", chunk => {
       const request = JSON.parse(String(chunk)) as { id: number; op: string };
       if (request.op === "mirror") mirrors += 1;
       fromPeer.write(`${JSON.stringify({ id: request.id, ok: true,
-        result: request.op === "hello" ? { version: BRIDGE_PROTOCOL_VERSION, changes: true } : {} })}\n`);
+        result: request.op === "hello" ? { version: BRIDGE_PROTOCOL_VERSION, changes: true,
+          ...(supportsPartial ? { partialPresence: true } : {}) } : request.op === "latestSequence" ? 7 : {} })}\n`);
     });
-
-    await expect(remote.mirror({ hosts: [], participants: [] })).resolves.toBeUndefined();
-    expect(mirrors).toBe(1);
-    await expect(remote.mirror({ hosts: [], participants: [], partial: true, droppedCount: 1 }))
-      .rejects.toThrow("does not support partial presence snapshots");
-    expect(mirrors).toBe(1);
-    remote.close();
+    const partial = { hosts: [], participants: [], partial: true, droppedCount: 1 };
+    try {
+      await remote.mirror({ hosts: [], participants: [] });
+      expect(mirrors).toBe(1);
+      await expect(remote.mirror(partial)).resolves.toBeUndefined();
+      await remote.hello(); // Repeated hello in the same state must not reset the log limit.
+      await remote.mirror(partial);
+      expect(mirrors).toBe(1);
+      expect(remote.legacyPartialSkips).toBe(2);
+      expect(logs).toEqual([expect.stringContaining("legacyPartialSkips=1")]);
+      await expect(remote.latestSequence()).resolves.toBe(7);
+      await remote.mirror({ hosts: [], participants: [] });
+      expect(mirrors).toBe(2);
+      supportsPartial = true;
+      await remote.hello();
+      await remote.mirror(partial);
+      expect(mirrors).toBe(3);
+      expect(remote.legacyPartialSkips).toBe(2);
+      supportsPartial = false;
+      await remote.hello();
+      await remote.mirror(partial);
+      expect(remote.legacyPartialSkips).toBe(3);
+      expect(logs).toEqual([expect.stringContaining("legacyPartialSkips=1"), expect.stringContaining("legacyPartialSkips=3")]);
+    } finally {
+      remote.close();
+    }
+    await expect(remote.mirror(partial)).rejects.toThrow("Bridge transport closed");
+    expect(remote.legacyPartialSkips).toBe(3);
   });
 
   it.each(["file", "sqlite"] as const)("does not trust peer protected:false metadata across real presence RPC (%s)", async backend => {
@@ -503,43 +581,61 @@ describe("direct tokenless presence through MeshBridge RPC", () => {
     expect(readHostLease(hub.root, victim.host.id)).toBeUndefined();
   });
 
-  it.each(["file", "sqlite"] as const)("stop after legacy-peer refusal leaves both mirrors to expire by TTL (%s)", async backend => {
+  it.each(["file", "sqlite"] as const)("legacy partial cycles hold omissions on both sides and later full cycles mirror normally (%s)", async backend => {
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(NOW);
-    const f = ownRootLink(false, backend);
+    const f = ownRootLink(false, backend, true);
     const victim = fixture("legacy-peer-outbound", "B", NOW - 2_000, NOW + 120_000);
     const peerRoot = fixture("legacy-peer-inbound", "P", NOW - 1_000, NOW + 120_000);
     await installNative(f.hub, victim);
     await installNative(f.work, peerRoot);
+    await f.remote.hello();
     await expect(f.bridge.syncPresence()).resolves.toBeUndefined();
-    const partial = fixture("legacy-peer-malformed", undefined, NOW, NOW + 120_000);
-    await f.hub.put({ key: hostKey(victim.host.id), identity: victim.identity,
-      value: { ...victim.host, rootId: partial.host.rootId } });
-    await f.hub.put({ key: participantKey(victim.participant.id), identity: victim.identity,
-      value: { ...victim.participant, rootId: partial.host.rootId } });
-    await installNative(f.hub, fixture("legacy-peer-progress", "U", NOW, NOW + 120_000));
-    expect(await f.local.presence()).toMatchObject({ partial: true, droppedCount: expect.any(Number) });
-    const remoteMirror = vi.spyOn(f.remote, "mirror");
-    vi.spyOn(f.remote, "hello").mockResolvedValue(undefined);
-
-    await expect(f.bridge.syncPresence()).rejects.toThrow("does not support partial presence snapshots");
-    expect(remoteMirror).toHaveBeenCalledTimes(1);
-    const beforeStop = { hubHost: f.hub.get(hostKey(peerRoot.host.id), { fresh: true }),
+    const snapshot = () => ({ hubHost: f.hub.get(hostKey(peerRoot.host.id), { fresh: true }),
       hubParticipant: f.hub.get(participantKey(peerRoot.participant.id), { fresh: true }),
       hubLease: fs.readFileSync(hostLeasePath(f.hub.root, peerRoot.host.id)),
       workHost: f.work.get(hostKey(victim.host.id), { fresh: true }),
       workParticipant: f.work.get(participantKey(victim.participant.id), { fresh: true }),
-      workLease: fs.readFileSync(hostLeasePath(f.work.root, victim.host.id)) };
+      workLease: fs.readFileSync(hostLeasePath(f.work.root, victim.host.id)) });
+    const before = snapshot();
+    expect(before.hubHost).toBeDefined();
+    expect(before.workHost).toBeDefined();
+    const malformed = fixture("legacy-peer-malformed", undefined, NOW, NOW + 120_000);
+    await f.hub.put({ key: hostKey(victim.host.id), identity: victim.identity,
+      value: { ...victim.host, rootId: malformed.host.rootId } });
+    await f.hub.put({ key: participantKey(victim.participant.id), identity: victim.identity,
+      value: { ...victim.participant, rootId: malformed.host.rootId } });
+    const outboundProgress = fixture("legacy-peer-outbound-progress", "U", NOW, NOW + 120_000);
+    const inboundProgress = fixture("legacy-peer-inbound-progress", "V", NOW, NOW + 120_000);
+    await installNative(f.hub, outboundProgress);
+    await installNative(f.work, inboundProgress);
+    expect(await f.local.presence()).toMatchObject({ partial: true, droppedCount: expect.any(Number) });
+    // Omit the old peer root too: partial from either direction must hold BOTH omission sets.
+    const peerPresence = vi.spyOn(f.agent, "presence").mockResolvedValue({ ...inboundProgress.presence, reserved: [] });
+    const remoteMirror = vi.spyOn(f.agent, "mirror");
+    for (let cycle = 1; cycle <= 2; cycle += 1) {
+      await expect(f.bridge.syncPresence()).resolves.toBeUndefined();
+      expect(snapshot()).toEqual(before);
+      expect(f.remote.legacyPartialSkips).toBe(cycle);
+      expect(remoteMirror).not.toHaveBeenCalled();
+      expect(f.hub.get(hostKey(inboundProgress.host.id), { fresh: true })?.value).toMatchObject({ incarnationToken: "V" });
+      expect(f.work.get(hostKey(outboundProgress.host.id), { fresh: true })).toBeUndefined();
+      await expect(f.remote.latestSequence()).resolves.toBeTypeOf("number");
+    }
 
-    await f.bridge.stop();
-
+    peerPresence.mockRestore();
+    await f.hub.delete({ key: hostKey(victim.host.id) });
+    await f.hub.delete({ key: participantKey(victim.participant.id) });
+    fs.rmSync(hostLeasePath(f.hub.root, victim.host.id), { force: true });
+    await expect(f.bridge.syncPresence()).resolves.toBeUndefined();
+    expect(f.remote.legacyPartialSkips).toBe(2);
     expect(remoteMirror).toHaveBeenCalledTimes(1);
-    expect(f.hub.get(hostKey(peerRoot.host.id), { fresh: true })).toEqual(beforeStop.hubHost);
-    expect(f.hub.get(participantKey(peerRoot.participant.id), { fresh: true })).toEqual(beforeStop.hubParticipant);
-    expect(fs.readFileSync(hostLeasePath(f.hub.root, peerRoot.host.id))).toEqual(beforeStop.hubLease);
-    expect(f.work.get(hostKey(victim.host.id), { fresh: true })).toEqual(beforeStop.workHost);
-    expect(f.work.get(participantKey(victim.participant.id), { fresh: true })).toEqual(beforeStop.workParticipant);
-    expect(fs.readFileSync(hostLeasePath(f.work.root, victim.host.id))).toEqual(beforeStop.workLease);
+    expect(f.work.get(hostKey(outboundProgress.host.id), { fresh: true })?.value).toMatchObject({ incarnationToken: "U" });
+    expect(f.work.get(participantKey(outboundProgress.host.id), { fresh: true })?.value).toMatchObject({ id: outboundProgress.host.id });
+    expect(f.work.get(hostKey(victim.host.id), { fresh: true })).toBeUndefined();
+    expect(f.work.get(participantKey(victim.host.id), { fresh: true })).toBeUndefined();
+    expect(readHostLease(f.work.root, victim.host.id)).toBeUndefined();
+    expect(f.hub.get(hostKey(peerRoot.host.id), { fresh: true })).toBeDefined();
   });
 
   it("CLI error before bridge construction leaves an existing mirror for its lease TTL", async () => {

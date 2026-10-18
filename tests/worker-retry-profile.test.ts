@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { readRunLogText } from "../src/run-log-source.js";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -135,7 +136,7 @@ describe("native task retry profile", () => {
       const result = await manager.run({ task: "Use the selected custom launcher", cwd: s.cwd, transport: "process", extensions: false });
       expect(result.status).toBe("completed");
       expect(result.warnings ?? []).toEqual([]);
-      const events = fs.readFileSync(result.logFile!, "utf8").trim().split("\n").map(line => JSON.parse(line));
+      const events = readRunLogText(result.logFile!).trim().split("\n").map(line => JSON.parse(line));
       expect(events.filter(event => event.type === "fabric_retry_profile")).toEqual([{
         type: "fabric_retry_profile", mode: "launcher", reason: "sdk_unavailable",
         message: "Selected Pi launcher has no discoverable native SDK; preserving its retry settings and canonical auth path (Fabric same-session recovery remains enabled)",

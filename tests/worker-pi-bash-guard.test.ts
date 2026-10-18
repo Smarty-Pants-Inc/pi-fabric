@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { readRunLogText } from "../src/run-log-source.js";
 import os from "node:os";
 import path from "node:path";
 import http from "node:http";
@@ -123,7 +124,7 @@ describe.skipIf(process.platform === "win32")("fabric_exec pi.bash in a real pro
     });
     cleanups.push(() => manager.close());
     const result = await manager.run({ task: "probe8606: run git stash list through fabric_exec pi.bash", model: "proof/offline", transport: "process", extensions: true, tools: ["fabric_exec", "bash"] });
-    const log = result.logFile && fs.existsSync(result.logFile) ? fs.readFileSync(result.logFile, "utf8").slice(-6000) : "";
+    const log = result.logFile && (fs.existsSync(result.logFile) || fs.existsSync(`${result.logFile}.zst`)) ? readRunLogText(result.logFile).slice(-6000) : "";
     const evidence = { launch, sessionCwd: path.basename(sessionCwd), status: result.status, error: result.error, text: result.text, requests, toolMessages,
       stashExecuted: fs.existsSync(executed), allowedExecuted: fs.existsSync(allowed), guardRefusals: fs.existsSync(refusals) ? fs.readFileSync(refusals, "utf8").trim().split("\n").map((line) => JSON.parse(line)) : [] };
     if (process.env.TASK_OUT) fs.writeFileSync(path.join(process.env.TASK_OUT, "probe8606-" + launch + ".json"), JSON.stringify(evidence, null, 2).replaceAll(root, "<tmp>") + "\n");

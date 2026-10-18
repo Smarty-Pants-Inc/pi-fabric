@@ -7,6 +7,7 @@ import { createHash } from "node:crypto";
 import { performance } from "node:perf_hooks";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { readJsonlPage } from "../src/log-tail.js";
+import { readRunLogBuffer } from "../src/run-log-source.js";
 import { NativeConversationReader } from "../src/ui/conversation-native-reader.js";
 import { AgentTranscriptReader } from "../src/ui/transcript-reader.js";
 import { compactTerminalRunLog, createRunLogWriter, MIN_ELIDED_TOOL_RESULT_BYTES, MAX_EVENT_LINE_CHARS, MAX_TERMINAL_LOG_BYTES, MAX_TERMINAL_LOG_RECORDS, MAX_TERMINAL_LOG_WORK_MS } from "../src/worker/run-log.js";
@@ -184,6 +185,11 @@ describe.skipIf(!fs.existsSync(path.resolve("dist/worker.js")))("actual worker t
       workerPath = path.join(directory, "worker-with-frozen-work-clock.mjs");
       fs.writeFileSync(workerPath, `import { importWorkerWithFrozenTerminalClock } from ${JSON.stringify(fixtureUrl)};\nawait importWorkerWithFrozenTerminalClock(${JSON.stringify(workerUrl)}, ${JSON.stringify(workClockReceipt)});\n`);
     }
+    // Capture worker compaction before the manager can retire the plain log.
+    const workerExitReceipt = path.join(directory, "worker-exit.json");
+    const workerEntry = workerPath;
+    workerPath = path.join(directory, "worker-with-exit-receipt.mjs");
+    fs.writeFileSync(workerPath, `import fs from "node:fs";\nprocess.once("exit", () => {\n  const logFile = process.argv[process.argv.indexOf("--log-file") + 1];\n  fs.writeFileSync(${JSON.stringify(workerExitReceipt)}, JSON.stringify({ ino: fs.statSync(logFile).ino }));\n});\nawait import(${JSON.stringify(pathToFileURL(workerEntry).href)});\n`);
     const binary = path.join(directory, "offline-rpc.mjs");
     const clockFile = path.join(directory, "clock.json");
     const receiptFile = path.join(directory, "before-terminal.json");
@@ -261,18 +267,22 @@ process.stdin.on("end", () => {
         expect(clockReceipt.calls).toBeGreaterThan(0);
         expect(clockReceipt.restored).toBe(true);
       }
+      // Logical completion can precede native close on Windows; join before
+      // reading the worker's physical-generation receipt and terminal artifact.
+      await manager.finalizeRunLog(result.id);
       const file = path.join(runRoot, result.id, "events.jsonl");
       const receipt = JSON.parse(fs.readFileSync(receiptFile, "utf8")) as { ino: number; bytes: number; sha256: string };
-      const bytes = fs.readFileSync(file);
+      const workerExit = JSON.parse(fs.readFileSync(workerExitReceipt, "utf8")) as { ino: number };
+      const bytes = readRunLogBuffer(file);
       if (scenario === "pathological") {
         expect(result.compactionSkipped).toContain("MAX_TERMINAL_LOG_BYTES");
         expect(manager.listForUi()[0]?.compactionSkipped).toBe(result.compactionSkipped);
-        expect(fs.statSync(file).ino).toBe(receipt.ino);
+        expect(workerExit.ino).toBe(receipt.ino);
         expect(bytes.length).toBe(receipt.bytes);
         expect(createHash("sha256").update(bytes).digest("hex")).toBe(receipt.sha256);
       } else {
         expect(result.compactionSkipped).toBeUndefined();
-        expect(fs.statSync(file).ino).not.toBe(receipt.ino);
+        expect(workerExit.ino).not.toBe(receipt.ino);
         expect(bytes.length).toBeLessThan(receipt.bytes);
         const ends = bytes.toString("utf8").trimEnd().split("\n").map((line) => JSON.parse(line)).filter((event) => event.type === "tool_execution_end");
         expect(ends).toHaveLength(scenario === "near-deadline" ? 400 : 1);
@@ -800,7 +810,7 @@ describe("worker run log", () => {
       });
 
       it.each([false, true])("retains loaded older native pages after large terminal replacement (follow=%s)", (follow) => {
-        const directory = fs.mkdtempSync(path.resolve(".native-replacement-"));
+        const directory = fs.mkdtempSync(path.join(os.tmpdir(), "native-replacement-"));
         directories.push(directory);
         const file = path.join(directory, "events.jsonl");
         const events = Array.from({ length: 160 }, (_, index) => {

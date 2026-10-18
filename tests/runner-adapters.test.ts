@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { readRunLogText } from "../src/run-log-source.js";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -210,7 +211,7 @@ describe("custom worker runners", () => {
     expect(context?.files.steerFile).toMatch(/steer\.jsonl$/);
     expect(context?.fabricWorker.workerArguments).toContain("--runner");
     expect(context?.writePolicy).toBeUndefined();
-    expect(fs.readFileSync(path.join(manager.runDirectory(result.id)!, "events.jsonl"), "utf8")).toContain("acme says hi");
+    expect(readRunLogText(path.join(manager.runDirectory(result.id)!, "events.jsonl"))).toContain("acme says hi");
   });
 
   it("refuses requests needing undeclared capabilities before launch", async () => {
@@ -271,7 +272,7 @@ describe("hosted runners", () => {
     });
     expect(result.usage).toMatchObject({ input: 150, output: 30, cost: 0.75 });
     expect(questions[0]?.question).toMatchObject({ method: "select", title: "Ship?", options: ["yes", "no"] });
-    expect(fs.readFileSync(path.join(manager.runDirectory(result.id)!, "events.jsonl"), "utf8")).toContain("thinking");
+    expect(readRunLogText(path.join(manager.runDirectory(result.id)!, "events.jsonl"))).toContain("thinking");
   });
 
   it("hands hosted runners the narrowed host scope", async () => {

@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { readRunLogText } from "../src/run-log-source.js";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -120,10 +121,11 @@ describe("native pending queues across provider recovery", () => {
     if (evidenceDirectory) {
       fs.mkdirSync(evidenceDirectory, { recursive: true });
       for (const file of ["queue-inputs.jsonl", "events.jsonl", "status.json"]) {
-        fs.copyFileSync(path.join(runDirectory, file), path.join(evidenceDirectory, "native-pending-" + file));
+        if (file === "events.jsonl") fs.writeFileSync(path.join(evidenceDirectory, "native-pending-" + file), readRunLogText(path.join(runDirectory, file)));
+        else fs.copyFileSync(path.join(runDirectory, file), path.join(evidenceDirectory, "native-pending-" + file));
       }
     }
-    expect(result, JSON.stringify(result) + "\n" + fs.readFileSync(result.logFile!, "utf8")).toMatchObject({ status: "completed", text: "queues retained", runnerSessionIds: ["queue-session"] });
+    expect(result, JSON.stringify(result) + "\n" + readRunLogText(result.logFile!)).toMatchObject({ status: "completed", text: "queues retained", runnerSessionIds: ["queue-session"] });
     const inputs = fs.readFileSync(path.join(runDirectory, "queue-inputs.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
     for (const [type, message] of [["steer", "NATIVE_PENDING_STEER"], ["follow_up", "NATIVE_PENDING_FOLLOW_UP"]]) {
       expect(inputs.filter(frame => frame.attempt === 1 && frame.type === type && frame.message === message)).toHaveLength(1);
@@ -295,7 +297,7 @@ describe("native Pi runner session attribution", () => {
     expect(events.find(event => event.event === "run.completed")).toMatchObject({
       source: { rootId: "session:" + parent }, data: { runnerSessionId: latest, fabricSessionId: parent },
     });
-    const frames = fs.readFileSync(path.join(runDirectory, "events.jsonl"), "utf8").trim().split("\n");
+    const frames = readRunLogText(path.join(runDirectory, "events.jsonl")).trim().split("\n");
     const argv = JSON.parse(frames.find(line => line.includes("fake_session_argv"))!).argv as string[];
     expect(argv).not.toContain("--no-session");
     expect(argv[argv.indexOf("--session") + 1]).toBe(path.join(runDirectory, "session.jsonl"));
@@ -325,7 +327,7 @@ describe("native Pi runner session attribution", () => {
     expect(events.find(event => event.event === "run.completed")).toMatchObject({
       source: { id: actor.id, name: "metered-actor", rootId: "session:" + parent }, data: { runnerSessionId: first },
     });
-    const frames = fs.readFileSync(path.join(path.dirname(file), "events.jsonl"), "utf8").trim().split("\n");
+    const frames = readRunLogText(path.join(path.dirname(file), "events.jsonl")).trim().split("\n");
     expect(JSON.parse(frames.find(line => line.includes("fake_session_argv"))!).argv).toContain("--session");
   }, 15_000);
 

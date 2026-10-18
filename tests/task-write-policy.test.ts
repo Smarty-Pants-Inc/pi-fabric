@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { readRunLogText } from "../src/run-log-source.js";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -75,7 +76,7 @@ const [mode,id]=process.argv.slice(2); if(mode==='launch'){const dir=path.join($
     ...(remote ? { placement: remote } : {}),
   }, { workerPath: worker, ...(overlap === "environment" ? {} : { runRoot }), fullCodeMode: false, meshRoot, completionRecipient: recipient });
   managers.push(manager);
-  const events = (id: string) => fs.readFileSync(path.join(manager.runDirectory(id)!, "events.jsonl"), "utf8")
+  const events = (id: string) => readRunLogText(path.join(manager.runDirectory(id)!, "events.jsonl"))
     .trim().split("\n").filter(Boolean).map(line => JSON.parse(line));
   return { root, cwd, outside, manager, events, meshRoot, recipient, runRoot };
 };
@@ -200,10 +201,10 @@ describe("local process task write default", () => {
       expect(fs.existsSync(f.outside)).toBe(false);
       for (const name of ["completion-recipient.json", "status.json", "events.jsonl"]) {
         const file = path.join(run, name);
-        const before = fs.readFileSync(file, "utf8");
+        const before = name === "events.jsonl" ? readRunLogText(file) : fs.readFileSync(file, "utf8");
         await expect(provider.invoke("write", { path: file, content: "redirected" }, context)).rejects.toThrow(/outside writable roots/);
         await expect(provider.invoke("edit", { path: file, edits: [{ oldText: before, newText: "redirected" }] }, context)).rejects.toThrow(/outside writable roots/);
-        expect(fs.readFileSync(file, "utf8")).toBe(before);
+        expect(name === "events.jsonl" ? readRunLogText(file) : fs.readFileSync(file, "utf8")).toBe(before);
       }
       expect(completionRecipientFromRun(f.meshRoot, run)).toEqual(f.recipient);
       await provider.invoke("write", { path: path.join(value.tmpdir, "nested.txt"), content: "scratch-one" }, context);

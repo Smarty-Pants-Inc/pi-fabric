@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { readRunLogText } from "../src/run-log-source.js";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import os from "node:os";
@@ -102,7 +103,7 @@ describe("built durable Fabric host", () => {
     expect(result.text).toContain("FABRIC_AGENT_SPAWN_FORBIDDEN");
     expect(result.text).toContain("unlaunched");
     expect(manager.list().map(run => run.id)).toEqual([result.id]);
-    const events = fs.readFileSync(result.logFile!, "utf8");
+    const events = readRunLogText(result.logFile!);
     expect(events).toContain('"toolName":"fabric_exec"');
   }, 60000);
 });

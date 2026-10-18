@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { readRunLogText } from "../src/run-log-source.js";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -34,6 +35,12 @@ const HANG_GUARD_MS = 120_000;
 const TEST_GUARD_MS = HANG_GUARD_MS + 30_000;
 
 interface Prompt { history: boolean; overflow: boolean; session?: string; marker: string }
+
+const terminalLogText = (result: AgentRunResult, sessionFile: string): string => {
+  const retained = path.join(path.dirname(sessionFile), "runs", result.id, "events.jsonl");
+  const file = [retained, result.logFile].find(candidate => candidate && (fs.existsSync(candidate) || fs.existsSync(`${candidate}.zst`)));
+  return file ? readRunLogText(file) : "";
+};
 
 const waitFor = async (predicate: () => boolean, timeoutMs = 60_000): Promise<void> => {
   const deadline = Date.now() + timeoutMs;
@@ -684,9 +691,8 @@ describe("actor context overflow (smarty-dev#3238, offline Pi child)", () => {
       results: s.results.map(({ status, errorCode, error, toolCalls }) => ({ status, errorCode, error, toolCalls })),
       blocked: s.actors.status(actor.id).activationBlocked, resets: resets(s.actors, actor.id),
       overflowNotices: s.overflowEvents().length, ownerAlarms: s.ownerAlarms().length,
-      terminalFrames: s.results.flatMap(result => result.logFile && fs.existsSync(result.logFile)
-        ? fs.readFileSync(result.logFile, "utf8").split("\n").filter(line => /fabric_activation_window|auto_retry|worker_stderr/.test(line))
-          .map(line => line.slice(0, 1500)) : []) }));
+      terminalFrames: s.results.flatMap(result => terminalLogText(result, actor.sessionFile!).split("\n")
+        .filter(line => /fabric_activation_window|auto_retry|worker_stderr/.test(line)).map(line => line.slice(0, 1500))) }));
     expect(trace[0]).toMatchObject({ type: "tool_turn", stopReason: "toolUse", totalTokens: 201_471, toolResultBytes: 6144 });
     // The oversized encoded payload MUST have been admitted once with covered ciphertext,
     // before the overload. Otherwise this would test only an ordinary genuinely large prompt.
@@ -734,8 +740,8 @@ describe("actor context overflow (smarty-dev#3238, offline Pi child)", () => {
       s.actors.status(actor.id).activationBlocked?.code !== "context-overflow");
     const trace = fs.readFileSync(path.join(s.dir, "prompts.jsonl.native"), "utf8").split("\n").filter(Boolean)
       .map(line => JSON.parse(line) as Record<string, any>);
-    const terminalFrames = s.results.flatMap(result => result.logFile && fs.existsSync(result.logFile)
-      ? fs.readFileSync(result.logFile, "utf8").split("\n").filter(line => /fabric_activation_window|auto_retry|worker_stderr/.test(line)) : []);
+    const terminalFrames = s.results.flatMap(result => terminalLogText(result, actor.sessionFile!).split("\n")
+      .filter(line => /fabric_activation_window|auto_retry|worker_stderr/.test(line)));
     console.info("14075 bound retry refusal evidence", JSON.stringify({ trace,
       results: s.results.map(({ status, errorCode, error, toolCalls }) => ({ status, errorCode, error, toolCalls })),
       blocked: s.actors.status(actor.id).activationBlocked, resets: resets(s.actors, actor.id),

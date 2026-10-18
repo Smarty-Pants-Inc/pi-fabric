@@ -90,6 +90,8 @@ describe("ActorLogStore", () => {
     const { root, actor, store } = setup();
     const source = path.join(root, "source");
     fs.mkdirSync(source, { mode: 0o700 });
+    fs.writeFileSync(path.join(source, "events.jsonl"), "{\"type\":\"message_end\"}\n");
+    fs.writeFileSync(path.join(source, "status.json"), JSON.stringify({ id: "latest", status: "completed", finishedAt: 1 }));
     const receipt = { runId: "latest", ledger: path.join(root, "ledger.jsonl"),
       decision: { decisionId: "decision", routeClass: "bounded-lookup", mode: "live" } };
     const file = path.join(source, "route-dispatch-receipt.json");
@@ -103,7 +105,7 @@ describe("ActorLogStore", () => {
 
   it("copies the archive protocol and nested runs, tolerating missing sources and nested-copy failure", async () => {
     const { root, actor, store } = setup();
-    await store.retainRun(actor, "missing", undefined);
+    await expect(store.retainRun(actor, "missing", undefined)).rejects.toThrow(/archive source is missing/);
     expect(store.retainedRunIds(actor)).toEqual([]);
     const source = path.join(root, "source");
     fs.mkdirSync(path.join(source, "nested"), { recursive: true });

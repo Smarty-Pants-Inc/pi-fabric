@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs";
+import { readRunLogText } from "../src/run-log-source.js";
 import os from "node:os";
 import path from "node:path";
 import { build } from "esbuild";
@@ -130,7 +131,7 @@ async function restart(directory: string, first: Pick<AgentRunRecord, "id" | "na
   return JSON.parse(fs.readFileSync(values["status-file"]!, "utf8")) as AgentRunRecord;
 }
 
-const events = (file: string) => fs.readFileSync(file, "utf8").trim().split("\n").map(line => JSON.parse(line));
+const events = (file: string) => (path.basename(file) === "events.jsonl" ? readRunLogText(file) : fs.readFileSync(file, "utf8")).trim().split("\n").map(line => JSON.parse(line));
 
 describe("AgentManager real durable parent worker", () => {
   it("recovers a completed journal after the parent dies before saving completion", async () => {

@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { readRunLogText } from "../src/run-log-source.js";
 import os from "node:os";
 import path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -193,7 +194,7 @@ describe.skipIf(!fs.existsSync(workerPath))("sender headers in real built worker
       ...(spawnerName ? { spawnerName } : {}),
     }); managers.push(manager);
     const result = await manager.run({ task: "harmless", model: "openai-codex/gpt-5.6-sol", transport: "process", extensions: false, ...facts });
-    const events = fs.readFileSync(path.join(root, "runs", result.id, "events.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    const events = readRunLogText(path.join(root, "runs", result.id, "events.jsonl")).trim().split("\n").map(line => JSON.parse(line));
     return { result, launch: events.find(event => event.type === "fake_sender_headers") };
   };
 

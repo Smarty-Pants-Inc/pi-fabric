@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { readRunLogText } from "../src/run-log-source.js";
 import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -239,7 +240,7 @@ await import(${JSON.stringify(new URL("./fixtures/fake-pi-overflow.mjs", import.
     const result = JSON.parse(fs.readFileSync(statusFile, "utf8"));
     expect(result).toMatchObject({ status: "failed", errorCode: "CONTEXT_OVERFLOW", toolCalls: 0 });
     expect(result.error).toContain("Fabric activation window failed: Context exceeds window");
-    const frames = fs.readFileSync(result.logFile, "utf8");
+    const frames = readRunLogText(path.join(path.dirname(statusFile), "events.jsonl"));
     expect(frames).toContain('"type":"fabric_activation_window_refusal"');
     expect(frames).toContain('"code":"context-overflow"');
     expect(refusals()[0]).toMatchObject({ from: { id: actor.id }, data: { actorId: actor.id, code: "context-overflow-item", error: "context-overflow",
@@ -336,7 +337,7 @@ await import(${JSON.stringify(new URL("./fixtures/fake-pi-overflow.mjs", import.
     const failedRun = host.actors.status(actor.id).lastRunId!;
     const actorScratch = (runId: string): string => {
       const runRoot = path.join(path.dirname(actor.sessionFile!), "runs", runId);
-      const frames = fs.readFileSync(path.join(runRoot, "events.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+      const frames = readRunLogText(path.join(runRoot, "events.jsonl")).trim().split("\n").map(line => JSON.parse(line));
       const policy = frames.find(frame => frame.type === "write_policy.actor")?.policy;
       expect(policy?.writableRoots).toEqual([path.join(s.config.residencyRoot, "runs", runId, "tmp")]);
       expect(policy.writableRoots).not.toContain(s.providerStateDir);

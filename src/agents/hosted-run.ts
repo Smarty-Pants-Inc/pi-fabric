@@ -131,6 +131,9 @@ export class HostedRun {
   #detached = false;
   #shutdown = false;
   #pendingQuestions = 0;
+  #reporterPending = 0;
+  #reporterDrain?: Promise<void>;
+  #resolveReporterDrain: (() => void) | undefined;
   #deliveries: Promise<void> = Promise.resolve();
   lastLiveness: FabricHostedLiveness = "running";
   readonly reporter: FabricHostedReporter;
@@ -151,12 +154,31 @@ export class HostedRun {
       stop: () => this.stop(),
     };
     this.reporter = {
-      progress: (update) => this.#progress(update),
-      usage: (total) => this.#usage(total),
-      transcript: (event) => this.#transcript(event),
-      question: (question) => this.#question(question),
-      finish: (result) => this.#finish(result),
-      fail: (failure) => this.#fail(failure),
+      progress: (update) => {
+        this.#reporterPending++;
+        try { this.#progress(update); } finally { this.#reporterReturned(); }
+      },
+      usage: (total) => {
+        this.#reporterPending++;
+        try { this.#usage(total); } finally { this.#reporterReturned(); }
+      },
+      transcript: (event) => {
+        this.#reporterPending++;
+        try { this.#transcript(event); } finally { this.#reporterReturned(); }
+      },
+      question: (question) => {
+        if (this.#closed) return Promise.resolve({ cancelled: true });
+        this.#reporterPending++;
+        return this.#question(question).finally(() => { this.#reporterReturned(); });
+      },
+      finish: (result) => {
+        this.#reporterPending++;
+        try { this.#finish(result); } finally { this.#reporterReturned(); }
+      },
+      fail: (failure) => {
+        this.#reporterPending++;
+        try { this.#fail(failure); } finally { this.#reporterReturned(); }
+      },
     };
   }
 
@@ -282,8 +304,24 @@ export class HostedRun {
     return this.#detached;
   }
 
-  close(): void {
+  /** True only after the owner closes and all in-flight reporter calls returned. */
+  get reporterClosed(): boolean {
+    return this.#closed && this.#reporterPending === 0;
+  }
+
+  /** Fence late callbacks immediately; join all reporter calls accepted before close. */
+  close(): Promise<void> {
     this.#closed = true;
+    return this.#reporterDrain ??= this.#reporterPending === 0
+      ? Promise.resolve()
+      : new Promise<void>(resolve => { this.#resolveReporterDrain = resolve; });
+  }
+
+  #reporterReturned(): void {
+    this.#reporterPending--;
+    if (!this.reporterClosed) return;
+    this.#resolveReporterDrain?.();
+    this.#resolveReporterDrain = undefined;
   }
 
   deliver(kind: "steer" | "followUp", text: string, data?: unknown): string {
@@ -478,6 +516,8 @@ export class HostedRun {
   }
 
   #appendLog(event: unknown): void {
+    // In-flight adapter control failures can arrive after the reporter drain.
+    if (this.#closed) return;
     try {
       const line = JSON.stringify(event);
       if (line === undefined || Buffer.byteLength(line) > MAX_TRANSCRIPT_EVENT_BYTES) return;

@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { readRunLogText } from "../src/run-log-source.js";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -36,8 +37,8 @@ afterEach(async () => {
 });
 const events = () => {
   const runs = path.join(root, "runs");
-  const id = fs.readdirSync(runs).find(id => fs.existsSync(path.join(runs, id, "events.jsonl")))!;
-  return fs.readFileSync(path.join(runs, id, "events.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+  const id = fs.readdirSync(runs).find(id => fs.existsSync(path.join(runs, id, "events.jsonl")) || fs.existsSync(path.join(runs, id, "events.jsonl.zst")))!;
+  return readRunLogText(path.join(runs, id, "events.jsonl")).trim().split("\n").map(line => JSON.parse(line));
 };
 describe.skipIf(!fs.existsSync("dist/worker.js"))("built judgment worker isolation", () => {
   it("has only host delivery/session/reply/route/sender hooks, no ambient authority, no full-code and no schema-free text result", async () => {

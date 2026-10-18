@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { readRunLogText } from "../src/run-log-source.js";
 import os from "node:os";
 import path from "node:path";
 import http from "node:http";
@@ -79,7 +80,7 @@ describe("native compiled actor activation-end result custody", () => {
             expect(archives).toHaveLength(1);
             childId = archives[0]!.replace(/\.result\.json$/, "");
             const saved = JSON.parse(fs.readFileSync(store.resultFile(childId), "utf8")) as AgentRunResult;
-            expect(saved.status, `${saved.error ?? ""} ${saved.logFile ? fs.readFileSync(saved.logFile, "utf8").slice(-4000) : ""}`).toBe("completed");
+            expect(saved.status, `${saved.error ?? ""} ${saved.logFile ? readRunLogText(saved.logFile).slice(-4000) : ""}`).toBe("completed");
             expect(saved.value).toEqual(full);
           }, { timeout: 30000 });
           if (notify) {
@@ -140,7 +141,7 @@ describe("native compiled actor activation-end result custody", () => {
       sessionFile: actor.sessionFile!, inferenceContext: "full-history", meshRoot, model: "f10-offline/activation", transport: "process",
       recursive: true, tools: [], extensions: true });
     expect(errors).toEqual([]);
-    expect(activation, activation.logFile ? fs.readFileSync(activation.logFile, "utf8").slice(-10000) : JSON.stringify(activation))
+    expect(activation, activation.logFile ? readRunLogText(activation.logFile).slice(-10000) : JSON.stringify(activation))
       .toMatchObject({ status: notify ? "failed" : "completed" });
     expect(activationRequests).toBe(2);
     expect(childRequests).toBe(1);

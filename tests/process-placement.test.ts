@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { readRunLogText } from "../src/run-log-source.js";
 import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
@@ -103,7 +104,7 @@ describe("host process task placement", () => {
     const request = { task: "must stay here", transport: "process" as const, needs: ["compute", need] };
     const result = method === "run" ? await f.manager.run(request) : await f.manager.wait((await f.manager.spawn(request)).id);
     expect(result).toMatchObject({ text: "LOCAL", transport: "process" });
-    const events = fs.readFileSync(path.join(f.manager.runDirectory(result.id)!, "events.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    const events = readRunLogText(path.join(f.manager.runDirectory(result.id)!, "events.jsonl")).trim().split("\n").map(line => JSON.parse(line));
     expect(events.filter(event => event.type.startsWith("placement."))).toEqual([expect.objectContaining({ type: "placement.local", reason: "reserved need: local pins to the Main host", needs: ["compute", "local"] })]);
     expect(fs.existsSync(f.results)).toBe(false);
   });
@@ -202,7 +203,7 @@ describe("host process task placement", () => {
     const handle = await f.manager.spawn({ task: "local scratch", cwd, transport: "process" });
     const result = await f.manager.wait(handle.id);
     expect(result).toMatchObject({ status: "completed", text: "LOCAL", cwd: fs.realpathSync(cwd) });
-    const events = fs.readFileSync(path.join(f.manager.runDirectory(result.id)!, "events.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    const events = readRunLogText(path.join(f.manager.runDirectory(result.id)!, "events.jsonl")).trim().split("\n").map(line => JSON.parse(line));
     expect(events.filter(line => line.type.startsWith("placement."))).toEqual([expect.objectContaining({ type: "placement.local" })]);
     expect(fs.existsSync(f.results)).toBe(false);
   });
@@ -211,7 +212,7 @@ describe("host process task placement", () => {
     const localRoot = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-placement-local-write-")); roots.push(localRoot);
     const result = await f.manager.run({ task: "local writable root", writableRoots: [localRoot], transport: "process" });
     expect(result).toMatchObject({ status: "completed", text: "LOCAL" });
-    const events = fs.readFileSync(path.join(f.manager.runDirectory(result.id)!, "events.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    const events = readRunLogText(path.join(f.manager.runDirectory(result.id)!, "events.jsonl")).trim().split("\n").map(line => JSON.parse(line));
     expect(events.filter(line => line.type.startsWith("placement."))).toEqual([expect.objectContaining({ type: "placement.local" })]);
     expect(fs.existsSync(f.results)).toBe(false);
   });
@@ -288,7 +289,7 @@ describe("host process task placement", () => {
   it.each(["github-write","corpus","mac","ryzen1-service","unknown"])("keeps unmet %s local with exactly one audit line", async need => {
     const f=fixture(); const h=await f.manager.spawn({task:"x",transport:"process",needs:[need]});
     expect((await f.manager.wait(h.id)).text).toBe("LOCAL");
-    const lines=fs.readFileSync(path.join(f.manager.runDirectory(h.id)!,"events.jsonl"),"utf8").trim().split("\n").map(line=>JSON.parse(line)).filter(line=>line.type==="placement.local");
+    const lines=readRunLogText(path.join(f.manager.runDirectory(h.id)!,"events.jsonl")).trim().split("\n").map(line=>JSON.parse(line)).filter(line=>line.type==="placement.local");
     expect(lines).toEqual([expect.objectContaining({reason:`unmet needs: ${need}`,needs:[need]})]);
     expect(fs.existsSync(f.results)).toBe(false);
   });
@@ -357,7 +358,7 @@ describe("host process task placement", () => {
     const h=await f.manager.spawn({task:"pending",transport:"process"});
     expect(await f.manager.wait(h.id)).toMatchObject({status:"timed_out",exitCode:124});
     expect(fs.existsSync(path.join(f.results,h.id,"cancelled"))).toBe(true);
-    const events=fs.readFileSync(path.join(f.manager.runDirectory(h.id)!,"events.jsonl"),"utf8").trim().split("\n").map(line=>JSON.parse(line));
+    const events=readRunLogText(path.join(f.manager.runDirectory(h.id)!,"events.jsonl")).trim().split("\n").map(line=>JSON.parse(line));
     // Transport-owned timeout would report timed_out here, not stopped.
     expect(events).toContainEqual(expect.objectContaining({type:"placement.result",status:"stopped",rc:"124"}));
   });
@@ -366,7 +367,7 @@ describe("host process task placement", () => {
     expect(await f.manager.stop(h.id)).toMatchObject({status:"stopped",exitCode:124});
     expect(await f.manager.wait(h.id)).toMatchObject({status:"stopped",exitCode:124});
     expect(fs.existsSync(path.join(f.results,h.id,"cancelled"))).toBe(true);
-    const events=fs.readFileSync(path.join(f.manager.runDirectory(h.id)!,"events.jsonl"),"utf8").trim().split("\n").map(line=>JSON.parse(line));
+    const events=readRunLogText(path.join(f.manager.runDirectory(h.id)!,"events.jsonl")).trim().split("\n").map(line=>JSON.parse(line));
     expect(events).toContainEqual(expect.objectContaining({type:"placement.result",status:"stopped",rc:"124"}));
   });
   it("bounds broken polling and reports timeout debt without claiming remote exit", async () => {
@@ -388,7 +389,7 @@ describe("host process task placement", () => {
     const f=fixture(); f.config.placement.command=[path.join(f.root,"missing"),"{id}"];
     const h=await f.manager.spawn({task:"x",transport:"process"});
     expect((await f.manager.wait(h.id)).text).toBe("LOCAL");
-    const events=fs.readFileSync(path.join(f.manager.runDirectory(h.id)!,"events.jsonl"),"utf8").trim().split("\n").map(line=>JSON.parse(line));
+    const events=readRunLogText(path.join(f.manager.runDirectory(h.id)!,"events.jsonl")).trim().split("\n").map(line=>JSON.parse(line));
     expect(events.filter(line=>line.type==="placement.local")).toEqual([expect.objectContaining({reason:expect.stringContaining("placement-probe-failed:")})]);
     expect(fs.existsSync(f.results)).toBe(false);
   });
@@ -404,7 +405,7 @@ describe("host process task placement", () => {
     if(kind==="home") vi.stubEnv("HOME",f.root);
     const h=await f.manager.spawn({task:"x",transport:"process"});
     expect((await f.manager.wait(h.id)).text).toBe("LOCAL");
-    expect(fs.readFileSync(path.join(f.manager.runDirectory(h.id)!,"events.jsonl"),"utf8")).toContain('"reason":"cwd-not-shippable"');
+    expect(readRunLogText(path.join(f.manager.runDirectory(h.id)!,"events.jsonl"))).toContain('"reason":"cwd-not-shippable"');
     expect(fs.existsSync(f.results)).toBe(false);
   });
   it.each([".local", "huge-cache"])("never invokes the launcher or ships an ignored %s source root", async directory => {
@@ -417,7 +418,7 @@ describe("host process task placement", () => {
     f.config.placement.command = f.config.placement.command.map(entry => entry === "--cwd" ? "--src" : entry);
     const result = await f.manager.run({ task: "must remain local", cwd, transport: "process" });
     expect(result).toMatchObject({ status: "completed", text: "LOCAL", cwd });
-    const events = fs.readFileSync(path.join(f.manager.runDirectory(result.id)!, "events.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    const events = readRunLogText(path.join(f.manager.runDirectory(result.id)!, "events.jsonl")).trim().split("\n").map(line => JSON.parse(line));
     expect(events.filter(line => line.type.startsWith("placement."))).toEqual([expect.objectContaining({ type: "placement.local", reason: "cwd-not-shippable" })]);
     expect(fs.existsSync(f.results)).toBe(false); // The fake launcher creates this on any invocation.
     expect(fs.readFileSync(privateFile, "utf8")).toBe("NONSECRET PRIVATE FIXTURE");
@@ -436,7 +437,7 @@ describe("host process task placement", () => {
     const result = await f.manager.run({ task: "must remain local", transport: "process" });
     expect(result.text).toBe("LOCAL");
     expect(query).toHaveBeenNthCalledWith(2, "git", ["-C", fs.realpathSync(f.root), "check-ignore", "-q", "--", fs.realpathSync(f.root)], expect.objectContaining({ killSignal: "SIGKILL" }));
-    const events = fs.readFileSync(path.join(f.manager.runDirectory(result.id)!, "events.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    const events = readRunLogText(path.join(f.manager.runDirectory(result.id)!, "events.jsonl")).trim().split("\n").map(line => JSON.parse(line));
     expect(events.filter(line => line.type.startsWith("placement."))).toEqual([expect.objectContaining({ type: "placement.local", reason: "cwd-not-shippable" })]);
     expect(fs.existsSync(f.results)).toBe(false);
   });
@@ -451,7 +452,7 @@ describe("host process task placement", () => {
     const argv = JSON.parse(fs.readFileSync(path.join(f.root, "worker-argv.json"), "utf8"));
     expect(JSON.parse(argv["--inherited-session-pins"])).toEqual(pins);
     expect(resolver).toHaveBeenCalledTimes(source === "parent" ? 1 : 0);
-    const lines = fs.readFileSync(path.join(f.manager.runDirectory(h.id)!, "events.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line)).filter(line => line.type === "placement.local");
+    const lines = readRunLogText(path.join(f.manager.runDirectory(h.id)!, "events.jsonl")).trim().split("\n").map(line => JSON.parse(line)).filter(line => line.type === "placement.local");
     expect(lines).toEqual([expect.objectContaining({ reason: "inherited account pins require the local worker" })]);
     expect(fs.existsSync(f.results)).toBe(false);
   });
@@ -463,7 +464,7 @@ describe("host process task placement", () => {
     const result = await f.manager.run({ task: "disabled extensions", transport: "process", ...(source === "requested" ? { extensions: false } : {}) });
     expect(result.text).toBe("LOCAL");
     expect(JSON.parse(fs.readFileSync(path.join(f.root, "worker-argv.json"), "utf8"))["--extensions"]).toBe("false");
-    const lines = fs.readFileSync(path.join(f.manager.runDirectory(result.id)!, "events.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line)).filter(line => line.type === "placement.local");
+    const lines = readRunLogText(path.join(f.manager.runDirectory(result.id)!, "events.jsonl")).trim().split("\n").map(line => JSON.parse(line)).filter(line => line.type === "placement.local");
     expect(lines).toEqual([expect.objectContaining({ reason: "extensions disabled require the local worker" })]);
     expect(fs.existsSync(f.results)).toBe(false);
   });
@@ -475,7 +476,7 @@ describe("host process task placement", () => {
     const f=fixture();
     for(const request of [{task:"actor",actorId:"actor-probe"},{task:"durable",residency:"durable" as const}]) {
       const result=await f.manager.run(request); expect(result.text).toBe("LOCAL");
-      expect(fs.readFileSync(path.join(f.manager.runDirectory(result.id)!,"events.jsonl"),"utf8")).toContain("placement.local");
+      expect(readRunLogText(path.join(f.manager.runDirectory(result.id)!,"events.jsonl"))).toContain("placement.local");
     }
     expect(fs.existsSync(f.results)).toBe(false);
   });
@@ -510,7 +511,7 @@ describe("host process task placement", () => {
     for (const request of [{task:"tools",tools:["read"]},{task:"effort",thinking:"off" as const},{task:"default"}]) {
       if(request.task==="default") f.config.placement.default="local";
       const result=await f.manager.run(request); expect(result.text).toBe("LOCAL");
-      expect(fs.readFileSync(path.join(f.manager.runDirectory(result.id)!,"events.jsonl"),"utf8")).toContain(request.task!=="default" ? "worker features" : "default is local");
+      expect(readRunLogText(path.join(f.manager.runDirectory(result.id)!,"events.jsonl"))).toContain(request.task!=="default" ? "worker features" : "default is local");
     }
   });
 });

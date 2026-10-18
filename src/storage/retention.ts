@@ -244,7 +244,7 @@ const recordAgeReference = (record: RunRecordSummary, fallback: number): number 
 // Every file the worker and manager write into a run directory. A missing name made the run
 // unremovable forever: 54k expired actor runs with reply.json piled up in /tmp (smarty-dev#2010).
 const runFiles = new Set([
-  "task.txt", "task.txt.provenance.json", "status.json", "events.jsonl", "lifecycle.jsonl", "steer.jsonl", "schema.json", "images.json",
+  "task.txt", "task.txt.provenance.json", "status.json", "events.jsonl", "events.jsonl.zst", "lifecycle.jsonl", "steer.jsonl", "schema.json", "images.json",
   // Manager-owned exact settlement and byte-evicted legacy nested history.
   // Neither artifact substitutes for the worker status/receipt/exit proof.
   "manager-result.json", "manager-nested.json",
@@ -257,7 +257,8 @@ const runFiles = new Set([
 ]);
 const runFile = (name: string): boolean => runFiles.has(name) ||
   /^manager-restored-result-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.json$/.test(name) ||
-  /^oversized-event-prefix(-\d+)?\.txt$/.test(name);
+  /^oversized-event-prefix(-\d+)?\.txt$/.test(name) ||
+  /^\.events\.jsonl\.(?:compress|restore)-[1-9][0-9]*-[0-9a-f]{32}\.tmp$/.test(name);
 const followUpName = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.json$/;
 /** Only paired, owned admission/final-receipt artifacts authorize collection.
  * A passed alarm deadline is not expiry of the payload: the sender may wait.

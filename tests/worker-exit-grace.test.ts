@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { readRunLogText } from "../src/run-log-source.js";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -26,7 +27,7 @@ const run = async (behavior: string, schema?: Record<string, unknown>, replyTool
   const result = await manager.run({ task: behavior, cwd: root, transport: "process", ...(schema ? { schema } : {}), ...(replyTool ? { replyTool } : {}) });
   return { manager, result, root };
 };
-const readEvents = (logFile: string) => fs.readFileSync(logFile, "utf8").trim().split("\n").map(line => JSON.parse(line));
+const readEvents = (logFile: string) => readRunLogText(logFile).trim().split("\n").map(line => JSON.parse(line));
 const isRunning = (pid: number): boolean => {
   try {
     process.kill(pid, 0);

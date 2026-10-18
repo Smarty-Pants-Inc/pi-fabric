@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { openRunLogSource, RunLogReadError, type RunLogSource } from "./run-log-source.js";
 import type { FabricLogLine } from "./agents/types.js";
 
 const READ_CHUNK_BYTES = 64 * 1024;
@@ -51,7 +52,7 @@ const completeLines = (buffer: Buffer, bufferStart: number, fileEnd: number): Bu
 
 /** Read a bounded JSONL page backwards from an already validated descriptor. */
 export const readJsonlPageFromDescriptor = (
-  descriptor: number,
+  descriptor: number | RunLogSource,
   limit: number,
   before?: number,
   knownSize?: number,
@@ -59,7 +60,7 @@ export const readJsonlPageFromDescriptor = (
   beforeGeneration?: string,
 ): JsonlPage => {
   try {
-    const stat = fs.fstatSync(descriptor, { bigint: true });
+    const stat = typeof descriptor === "number" ? fs.fstatSync(descriptor, { bigint: true }) : descriptor.stat;
     const generation = `${stat.dev}:${stat.ino}`;
     if (beforeGeneration !== undefined && beforeGeneration !== generation) {
       const error = new Error("cursor-stale: Log generation changed; re-read from start without before or beforeGeneration");
@@ -67,7 +68,7 @@ export const readJsonlPageFromDescriptor = (
       throw error;
     }
     // Sample identity and read bytes from the same FD, including across rename.
-    const size = knownSize ?? Number(stat.size);
+    const size = knownSize ?? (typeof descriptor === "number" ? Number(stat.size) : descriptor.size);
     const fileEnd = typeof before === "number" && Number.isSafeInteger(before)
       ? Math.max(0, Math.min(before, size))
       : size;
@@ -89,7 +90,8 @@ export const readJsonlPageFromDescriptor = (
       const length = Math.min(READ_CHUNK_BYTES, bufferStart, boundedBytes - bufferedBytes);
       const chunkStart = bufferStart - length;
       const chunk = Buffer.allocUnsafe(length);
-      const bytesRead = fs.readSync(descriptor, chunk, 0, length, chunkStart);
+      const bytesRead = typeof descriptor === "number" ? fs.readSync(descriptor, chunk, 0, length, chunkStart)
+        : descriptor.read(chunk, 0, length, chunkStart);
       if (bytesRead <= 0) break;
       const captured = chunk.subarray(0, bytesRead);
       chunks.push(captured);
@@ -112,29 +114,40 @@ export const readJsonlPageFromDescriptor = (
       ...(hasMore ? { before: selected[0]!.offset } : {}),
     };
   } catch (error) {
-    if (error instanceof Error && error.name === "cursor-stale") throw error;
+    if ((typeof descriptor !== "number" && error instanceof RunLogReadError) ||
+      (error instanceof Error && error.name === "cursor-stale")) throw error;
     return { lines: [], hasMore: false };
   }
 };
 
-/** Read a bounded JSONL page backwards. Bare legacy before offsets remain unbound. */
-export const readJsonlPage = (
+const readPage = (
   filePath: string,
   limit: number,
   before?: number,
   maxBytes?: number,
   beforeGeneration?: string,
+  runLog = false,
 ): JsonlPage => {
-  let descriptor: number | undefined;
+  let descriptor: number | RunLogSource | undefined;
   try {
-    descriptor = fs.openSync(filePath, "r");
+    descriptor = runLog ? openRunLogSource(filePath) : fs.openSync(filePath, "r");
     return readJsonlPageFromDescriptor(descriptor, limit, before, undefined, maxBytes, beforeGeneration);
   } catch (error) {
-    if (error instanceof Error && error.name === "cursor-stale") throw error;
+    if ((runLog && error instanceof RunLogReadError) || (error instanceof Error && error.name === "cursor-stale")) throw error;
     return { lines: [], hasMore: false };
   } finally {
     if (descriptor !== undefined) {
-      try { fs.closeSync(descriptor); } catch {}
+      try { if (typeof descriptor === "number") fs.closeSync(descriptor); else descriptor.close(); } catch {}
     }
   }
 };
+
+/** Plain JSONL paging; legacy bare before offsets remain unbound. */
+export const readJsonlPage = (
+  filePath: string, limit: number, before?: number, maxBytes?: number, beforeGeneration?: string,
+): JsonlPage => readPage(filePath, limit, before, maxBytes, beforeGeneration);
+
+/** Run events use decoded byte offsets and the selected artifact's physical generation. */
+export const readRunLogPage = (
+  filePath: string, limit: number, before?: number, maxBytes?: number, beforeGeneration?: string,
+): JsonlPage => readPage(filePath, limit, before, maxBytes, beforeGeneration, true);

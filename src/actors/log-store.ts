@@ -1,10 +1,12 @@
 import { diagnostics } from "../core/diagnostics.js";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { syncDirectoryChain } from "../core/atomic-write.js";
 import { detachedPreview } from "../core/preview.js";
 import type { FabricMeshConfig, FabricRetentionConfig } from "../config.js";
 import type { MeshStore } from "../mesh/store.js";
+import { readRunLogPage } from "../log-tail.js";
 import { pruneActorRunArchives, pruneActorSessionBackups } from "../storage/retention.js";
 import { closeDirectory, openPrivateDir, writeArchiveFile, type PrivateDirectory } from "../storage/private-dir.js";
 import type { FabricActorMessage } from "./types.js";
@@ -80,9 +82,43 @@ const boundedActorData = (data: unknown, maxBytes: number): unknown => {
 };
 
 interface ActorLogTarget {
+  id?: string;
   sessionFile: string;
   lastRunId?: string;
 }
+
+const archiveReadFlags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0);
+const sameFile = (a: fs.BigIntStats, b: fs.BigIntStats): boolean =>
+  a.dev === b.dev && a.ino === b.ino && a.size === b.size && a.mtimeNs === b.mtimeNs && a.ctimeNs === b.ctimeNs;
+const ownedFile = (stat: fs.BigIntStats): boolean => stat.isFile() && stat.nlink === 1n &&
+  (!process.getuid || stat.uid === BigInt(process.getuid()));
+const hashDescriptor = (fd: number): string => {
+  const hash = createHash("sha256"), chunk = Buffer.allocUnsafe(64 * 1024);
+  let position = 0, read: number;
+  while ((read = fs.readSync(fd, chunk, 0, chunk.length, position)) > 0) {
+    hash.update(chunk.subarray(0, read));
+    position += read;
+  }
+  return hash.digest("hex");
+};
+
+/** Hold each mandatory source/destination descriptor and verify bytes before source custody can be discharged. */
+const holdArchiveFile = (file: string, durable = false) => {
+  const flags = durable && process.platform === "win32" ? archiveReadFlags | fs.constants.O_RDWR : archiveReadFlags;
+  const fd = fs.openSync(file, flags);
+  try {
+    const stat = fs.fstatSync(fd, { bigint: true });
+    if (!ownedFile(stat)) throw new Error(`Unsafe actor archive file ${file}`);
+    const verify = (): void => {
+      const opened = fs.fstatSync(fd, { bigint: true }), named = fs.lstatSync(file, { bigint: true });
+      if (!ownedFile(opened) || !ownedFile(named) || !sameFile(stat, opened) || !sameFile(stat, named)) {
+        throw new Error(`Actor archive file changed: ${file}`);
+      }
+    };
+    verify();
+    return { fd, verify, close: () => fs.closeSync(fd) };
+  } catch (error) { fs.closeSync(fd); throw error; }
+};
 
 /** Archive I/O and message bounds only; ownership and sweep eligibility stay with the manager. */
 export class ActorLogStore {
@@ -94,42 +130,64 @@ export class ActorLogStore {
   ) {}
 
   async retainRun(actor: ActorLogTarget, runId: string, runDirectory: string | undefined): Promise<void> {
-    if (!runDirectory || !fs.existsSync(runDirectory)) return;
     const dest = path.join(path.dirname(actor.sessionFile), "runs", runId);
-    // pi-fabric#875 round 2 P1-b: the archive destination is created or validated BEFORE anything is copied, by the
-    // trusted descriptor walk (private-dir.ts), and every copy goes through the held descriptor's path. A symlinked,
-    // foreign or group/other-writable step anywhere in the chain refuses the archive: the run stays unarchived (its
-    // source is untouched) and one line says why.
-    let held: PrivateDirectory;
-    // The anchor is the mesh root (the parent of the `actors` directory the session file lies in), else the actor's own
-    // directory: our own group-writable containers below it are tightened on first use (pi-fabric#875 round 3).
     const sessionDirectory = path.dirname(path.resolve(actor.sessionFile));
     const actorsAt = sessionDirectory.lastIndexOf(`${path.sep}actors${path.sep}`);
     const anchor = actorsAt > 0 ? sessionDirectory.slice(0, actorsAt) : sessionDirectory;
+    // A missing live source is not success: validate the already-copied archive before custody is discharged.
+    if (!runDirectory) return this.#verifyArchivedRun(actor, runId, dest, anchor);
+    let sourceStat: fs.Stats;
+    try { sourceStat = fs.lstatSync(runDirectory); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      return this.#verifyArchivedRun(actor, runId, dest, anchor);
+    }
+    if (!sourceStat.isDirectory()) throw new Error(`Unsafe actor run archive source ${runDirectory}`);
+    let held: PrivateDirectory;
     try { held = openPrivateDir(dest, anchor); }
     catch (error) {
       diagnostics.warn("src/actors/log-store.ts", `[pi-fabric] actor run ${runId} not archived: ${(error as Error).message}`);
-      return;
+      throw error;
     }
+    let source: PrivateDirectory | undefined;
+    const files: ReturnType<typeof holdArchiveFile>[] = [];
     try {
+      source = openPrivateDir(runDirectory, runDirectory);
+      const sourceOpened = fs.statSync(source.path);
+      if (sourceOpened.dev !== sourceStat.dev || sourceOpened.ino !== sourceStat.ino) throw new Error(`Archive source ${runDirectory} changed`);
+      const plain = fs.lstatSync(path.join(source.path, "events.jsonl"), { throwIfNoEntry: false });
+      const compressed = fs.lstatSync(path.join(source.path, "events.jsonl.zst"), { throwIfNoEntry: false });
+      if (!plain && !compressed) throw new Error(`Actor run ${runId} event artifact is missing`);
+      const mandatory = [...(plain ? ["events.jsonl"] : []), ...(compressed ? ["events.jsonl.zst"] : []), "status.json"];
+      const sources = mandatory.map(name => {
+        const file = holdArchiveFile(path.join(source!.path, name));
+        files.push(file);
+        return { name, file, hash: hashDescriptor(file.fd) };
+      });
+      for (const { name, file, hash } of sources) {
+        file.verify();
+        if (!writeArchiveFile(held, name, { source: path.join(source.path, name) }, true)) {
+          throw new Error(`Unsafe actor run ${runId} archive entry ${name}`);
+        }
+        const copied = holdArchiveFile(path.join(held.path, name));
+        files.push(copied);
+        if (hashDescriptor(copied.fd) !== hash) throw new Error(`Actor run ${runId} archive hash mismatch: ${name}`);
+        file.verify();
+        copied.verify();
+      }
       const receipt = path.join(runDirectory, "route-dispatch-receipt.json");
       if (fs.existsSync(receipt)) {
         const { readRouteDispatchReceipt } = await import("../agents/model-route.js");
-        const source = readRouteDispatchReceipt(receipt);
-        if (!source || source.runId !== runId) throw new Error("Mismatched route dispatch receipt");
-        // Durable archive confirmation precedes source cleanup (F2 custody): the file and the held directory are
-        // fsynced through their fds, then the chain above by path, which must still name the held directory.
-        if (!writeArchiveFile(held, "route-dispatch-receipt.json", { bytes: Buffer.from(JSON.stringify(source)) }, true)) {
+        const receiptRecord = readRouteDispatchReceipt(receipt);
+        if (!receiptRecord || receiptRecord.runId !== runId) throw new Error("Mismatched route dispatch receipt");
+        if (!writeArchiveFile(held, "route-dispatch-receipt.json", { bytes: Buffer.from(JSON.stringify(receiptRecord)) }, true)) {
           throw new Error(`Archive entry ${path.join(dest, "route-dispatch-receipt.json")} exists and is not our regular file`);
         }
         const named = fs.statSync(dest), opened = fs.statSync(held.path);
         if (named.dev !== opened.dev || named.ino !== opened.ino) throw new Error(`Archive directory ${dest} changed while it was held`);
         syncDirectoryChain(dest);
       }
-      // pi-fabric#875 round 4 SEC P1: no path write into the archive. Each entry is created O_EXCL|O_NOFOLLOW through
-      // the held fd, or replaced by rename only when it is our own regular file; anything else (a symlink planted while
-      // a healed directory was writable) refuses that entry, with one line, and the source is untouched.
-      for (const file of ["events.jsonl", "status.json", "reply.json", "task.txt", "relaunches.jsonl"]) {
+      for (const file of ["reply.json", "task.txt", "relaunches.jsonl"]) {
         const src = path.join(runDirectory, file);
         if (!fs.existsSync(src)) continue;
         try {
@@ -139,28 +197,83 @@ export class ActorLogStore {
       const nested = path.join(runDirectory, "nested");
       if (fs.existsSync(nested)) {
         try {
-          // Copied only into a nested/ directory this archive creates now (fresh, 0700): never into existing entries.
           fs.mkdirSync(path.join(held.path, "nested"), { mode: 0o700 });
-          fs.chmodSync(path.join(held.path, "nested"), 0o700); // our fresh directory; a umask 0400 left 0300 (unopenable)
+          fs.chmodSync(path.join(held.path, "nested"), 0o700);
           if (!closeDirectory(path.join(held.path, "nested"))) throw new Error("the new nested directory is not ours");
           fs.cpSync(nested, path.join(held.path, "nested"), { recursive: true });
-          // cpSync keeps the source's modes; a run made under umask 002 is 0775. Archived directories are 0700, like
-          // the archive itself (smarty-dev#9016), each through its own O_NOFOLLOW fd. Files keep their modes.
           if (process.platform !== "win32") closeDirectories(path.join(held.path, "nested"));
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code === "EEXIST") diagnostics.warn("src/actors/log-store.ts", `[pi-fabric] actor run ${runId}: archive nested/ exists; not copied again`);
-          /* otherwise best-effort recursive run retention */
         }
       }
-    } finally { held.close(); }
-    this.pruneRuns(actor);
+      for (const file of files) file.verify();
+      const verifyDirectories = (): void => {
+        const namedSource = fs.lstatSync(runDirectory), namedDest = fs.lstatSync(dest), openedDest = fs.statSync(held.path);
+        if (!namedSource.isDirectory() || namedSource.dev !== sourceStat.dev || namedSource.ino !== sourceStat.ino ||
+            !namedDest.isDirectory() || namedDest.dev !== openedDest.dev || namedDest.ino !== openedDest.ino) {
+          throw new Error(`Actor run ${runId} archive directory changed`);
+        }
+      };
+      verifyDirectories();
+      syncDirectoryChain(dest);
+      verifyDirectories();
+      for (const file of files) file.verify();
+    } finally {
+      for (const file of files) file.close();
+      source?.close();
+      held.close();
+    }
+    this.pruneRuns(actor, Date.now(), runId);
   }
 
-  pruneRuns(actor: ActorLogTarget, now = Date.now()): void {
+  /** A source-less rejoin proves archived ownership, terminal status, event readability and durable identity. */
+  #verifyArchivedRun(actor: ActorLogTarget, runId: string, dest: string, anchor: string): void {
+    if (!fs.lstatSync(dest, { throwIfNoEntry: false })?.isDirectory()) {
+      throw new Error(`Actor run ${runId} archive source is missing and no verified archive exists`);
+    }
+    const held = openPrivateDir(dest, anchor), files: ReturnType<typeof holdArchiveFile>[] = [];
+    try {
+      const plain = fs.lstatSync(path.join(held.path, "events.jsonl"), { throwIfNoEntry: false });
+      const compressed = fs.lstatSync(path.join(held.path, "events.jsonl.zst"), { throwIfNoEntry: false });
+      if (!plain && !compressed) throw new Error(`Actor run ${runId} archived event artifact is missing`);
+      const event = holdArchiveFile(path.join(held.path, plain ? "events.jsonl" : "events.jsonl.zst"), true);
+      files.push(event);
+      if (plain && compressed) files.push(holdArchiveFile(path.join(held.path, "events.jsonl.zst"), true));
+      const status = holdArchiveFile(path.join(held.path, "status.json"), true);
+      files.push(status);
+      if (fs.fstatSync(status.fd).size > 1024 * 1024) throw new Error(`Unsafe actor run ${runId} archived status`);
+      const record = JSON.parse(fs.readFileSync(status.fd, "utf8"));
+      if (!record || record.id !== runId || !["completed", "failed", "stopped"].includes(record.status) ||
+          (record.actorId !== undefined && record.actorId !== actor.id)) {
+        throw new Error(`Actor run ${runId} archived status does not prove ownership/terminal state`);
+      }
+      const hashes = files.map(file => hashDescriptor(file.fd));
+      const page = readRunLogPage(path.join(held.path, "events.jsonl"), 1);
+      const stat = fs.fstatSync(event.fd, { bigint: true });
+      if (page.generation !== `${stat.dev}:${stat.ino}`) throw new Error(`Actor run ${runId} archive event artifact is not securely readable`);
+      for (const [index, file] of files.entries()) {
+        file.verify();
+        if (hashDescriptor(file.fd) !== hashes[index]) throw new Error(`Actor run ${runId} archive changed during verification`);
+        fs.fsyncSync(file.fd);
+      }
+      const verifyDirectory = (): void => {
+        const named = fs.lstatSync(dest), opened = fs.statSync(held.path);
+        if (!named.isDirectory() || named.dev !== opened.dev || named.ino !== opened.ino) throw new Error(`Actor run ${runId} archive directory changed`);
+      };
+      verifyDirectory();
+      if (held.fd !== undefined) fs.fsyncSync(held.fd);
+      syncDirectoryChain(dest);
+      verifyDirectory();
+      for (const file of files) file.verify();
+    } finally { for (const file of files) file.close(); held.close(); }
+  }
+
+  pruneRuns(actor: ActorLogTarget, now = Date.now(), archivingRunId?: string): void {
     pruneActorSessionBackups(actor.sessionFile);
     pruneActorRunArchives({
       runsDirectory: path.join(path.dirname(actor.sessionFile), "runs"),
       ...(actor.lastRunId ? { latestRunId: actor.lastRunId } : {}),
+      ...(archivingRunId ? { isRetained: (id: string) => id === archivingRunId } : {}),
       retentionMs: this.retention.actorRunArchiveMs,
       ...(this.retention.terminalRunEventsAgeMs !== undefined
         ? { terminalRunEventsAgeMs: this.retention.terminalRunEventsAgeMs } : {}),

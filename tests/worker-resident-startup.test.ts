@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { readRunLogText } from "../src/run-log-source.js";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -25,7 +26,7 @@ describe.skipIf(!fs.existsSync("dist/worker.js"))("resident startup worker loade
     expect(result.status, result.error).toBe(mode === "ok" ? "completed" : "failed");
     if (mode === "ok") expect(result.text).toBe("resident worker startup verified");
     else expect(result.error).toMatch(/readiness|acknowledge/);
-    const events = fs.readFileSync(path.join(root, "runs", result.id, "events.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    const events = readRunLogText(path.join(root, "runs", result.id, "events.jsonl")).trim().split("\n").map(line => JSON.parse(line));
     const argv = events.find(e => e.type === "probe_argv")?.args;
     expect(argv).toEqual(expect.arrayContaining(["--no-extensions", "--no-context-files"]));
     expect(events.filter(e => e.type === "probe_received").some(e => e.frame.type === "prompt")).toBe(false);
@@ -51,7 +52,7 @@ describe.skipIf(!fs.existsSync("dist/worker.js"))("resident startup worker loade
       return;
     }
     expect(result.status, result.error).toBe("completed");
-    const events = fs.readFileSync(path.join(root, "runs", result.id, "events.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    const events = readRunLogText(path.join(root, "runs", result.id, "events.jsonl")).trim().split("\n").map(line => JSON.parse(line));
     const argv = events.find(event => event.type === "probe_argv")?.args as string[];
     expect(argv).toContain("--no-extensions");
     expect(argv.some(arg => arg.includes("provider-bridge"))).toBe(false);
@@ -70,7 +71,7 @@ describe.skipIf(!fs.existsSync("dist/worker.js"))("resident startup worker loade
     const result = await manager.run({ task: "never infer", transport: "process", extensions: true, recursive: true, tools: [], residentStartupProbe: true });
     expect(result.status).toBe("failed");
     expect(result.error).toContain("did not acknowledge");
-    const log = fs.readFileSync(path.join(root, "runs", result.id, "events.jsonl"), "utf8");
+    const log = readRunLogText(path.join(root, "runs", result.id, "events.jsonl"));
     expect(log).not.toContain('"type":"prompt"');
     expect(result.toolCalls).toBe(0);
   }, 30_000);

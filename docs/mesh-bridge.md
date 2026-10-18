@@ -6,9 +6,9 @@ existing events and mirrors root presence. There is no new store or protocol.
 
 ## What crosses
 
-- `fabric.control.command` and `fabric.control.ack`, well-formed `fleet.work.<name>` topics, and
-  `ops.owner` with kind `pr.wake`, when the recipient (`to`) is a live root or host native to the
-  other side. A well-formed work topic is at most 128 characters of dot-separated, non-empty ASCII
+- `fabric.control.command` and `fabric.control.ack`, well-formed `fleet.work.<name>` topics,
+  `ops.owner` with kind `pr.wake`, and the versioned `fabric.alarm.bridge-stall` alarm when
+  addressed to a canonical live session on the other side. A well-formed work topic is at most 128 characters of dot-separated, non-empty ASCII
   segments of `[A-Za-z0-9_-]` (a dot-led repo such as `.github` is the one exception), so every
   work topic that crosses also passes the mesh's and `mesh_answers`' topic pattern. `fleet.work.`,
   `fleet.work..1`, `fleet.work.a..b.1`, a trailing dot, NUL, space, lookalike or other non-ASCII
@@ -66,10 +66,10 @@ existing events and mirrors root presence. There is no new store or protocol.
   observation). Without a fresh bridge sample, roots remain discoverable with `bridgeStale: true`
   for a precise routing error, but do not authorize bridged traffic. Traffic retains its stricter
   translated TTL and reobserves short-lease origins before forwarding. Clean stop or transport
-  failure withdraws the projections. A fresh snapshot withdraws origins that no longer report
-  a live native lease.
-- Nothing else. This excludes `github.*`, actor output, state and cache keys, and agent and actor
-  participants.
+  failure leaves persisted projections in place to expire by their lease TTL. A later fresh snapshot
+  reconciles origins that no longer report a live native lease.
+- Nothing else crosses beyond the routes above. This excludes `github.*`, actor output, state and
+  cache keys, and agent and actor participants.
 
 ## Rules
 
@@ -98,26 +98,83 @@ existing events and mirrors root presence. There is no new store or protocol.
   https://github.com/Smarty-Pants-Inc/smarty-dev/issues/7886.
   A rewritten log invalidates the offset generation and reconciles by sequence (from the archive
   when available) before returning to byte tails.
-- Link stall alarms reuse the existing `host-leases/<host-hash>.json` mirror observation
-  (`mirror.observedAt`), not a cursor heartbeat or a new bridge timer. With mirrored roots,
-  existing source/lease deadlines renew that observation even without event traffic. The
-  owner's committed presence-maintenance pass checks for more than three missed 15 s
-  freshness intervals while the locally recorded bridge process is still the same live
-  incarnation on this machine and boot. It publishes one `ops.owner` `bridge.lease.alarm`
-  naming the physical link and lease-lapse age; a fresh lease clears/re-arms that episode
-  and emits `bridge.lease.recovered`. Both use the existing mesh-health session recipient
-  (`PI_FABRIC_MESH_ALARM_TO`, otherwise `SMARTY_LEAD_SESSION`); without one the existing
-  structured mesh-outage journal sink carries the alarm. The sweep never refreshes a lease,
-  sends a probe or restarts a unit. A link with no mirrored roots has no lease to lose and
-  keeps the empty-idle contract. Historical leases without local bridge-process evidence
-  are not monitored until that link completes a new mirror pass.
+- The mirrored-lease alarm still reuses the existing `host-leases/<host-hash>.json` observation
+  (`mirror.observedAt`). With mirrored roots, existing source/lease deadlines can renew that
+  observation without event traffic. The owner's committed presence-maintenance pass checks
+  for more than three missed 15 s freshness intervals while the locally recorded bridge process
+  is still the same live incarnation on this machine and boot. It publishes one `ops.owner`
+  `bridge.lease.alarm` naming the physical link and lease-lapse age; a fresh lease clears/re-arms
+  that episode and emits `bridge.lease.recovered`. Both use the existing mesh-health session
+  recipient (`PI_FABRIC_MESH_ALARM_TO`, otherwise `SMARTY_LEAD_SESSION`); without one the
+  existing structured mesh-outage journal sink carries the alarm. This owner sweep never
+  refreshes a lease, probes a link or restarts a unit. A link with no mirrored roots has no
+  lease to lose and keeps the empty-idle contract. Historical leases without local
+  bridge-process evidence are not monitored until that link completes a new mirror pass.
+  **This lease alarm does not prove the event path is healthy:** a one-way event-stream stall
+  can leave presence/mirror RPCs working, renewing `mirror.observedAt` and keeping the lease
+  alarm quiet. If the whole peer stops answering presence/mirror calls, the observation stops
+  renewing and the existing lease alarm can fire after its freshness deadline.
+- The bridge process independently probes both mesh heads every 15 s (remote probe deadline
+  5 s). It invokes `/usr/bin/systemd-notify WATCHDOG=1` only after a responsive probe and when
+  at least one direction is current or has recent cursor progress; a one-way pending direction
+  does not starve watchdog notifications while the other direction works. If neither direction
+  is current/progressing or the peer probe stops answering for 30 s, the bridge emits one
+  `fabric.alarm.bridge-stall` event and stops notifying systemd. A direction with no acknowledged
+  (`toRemote`) or received/handled (`toLocal`) cursor progress for 180 s while the other direction
+  remains current/progressing emits the same alarm once and exits with status 1. The event is
+  addressed only to the configured mesh-alarm session recipient.
+
+  The versioned alarm contract is `topic: "fabric.alarm.bridge-stall"`, `kind: "bridge-stall"`,
+  with typed `data` exactly `{ v: 1, host: string, peer: string,
+  direction: "toRemote" | "toLocal" | "both", lastOkToRemote: string | null,
+  lastOkToLocal: string | null, stallId: string, reason: string, at: string }`. The last-ok
+  `host` is the local `--name`; `peer` is the configured remote name. The last-ok values and
+  `at` are RFC3339 UTC; last-ok is `null` before that direction has a successful observation.
+  `stallId` is a decimal `process.hrtime.bigint()` monotonic-clock value, guarded
+  strictly increasing within the running process (monotonic across service restarts on the same
+  host boot). `direction` names the stalled direction, or `both` when a complete probe/path has
+  stalled.
+
+  Before notifications stop or a directional exit, the bridge writes one reason line to stderr
+  and atomically overwrites the per-peer reason file. Its absolute path is the absolute cursor
+  path plus `.last-stall-reason`: for a cursor at `/absolute/state/<peer>.cursor.json`, use
+  `/absolute/state/<peer>.cursor.json.last-stall-reason`. The single-line format
+  is `mesh-bridge: stall v1 host=<host> peer=<peer> direction=<toRemote|toLocal|both>
+  at=<RFC3339-UTC> lastOkToRemote=<RFC3339-UTC|never>
+  lastOkToLocal=<RFC3339-UTC|never> stallId=<monotonic-decimal> reason=<one-line-reason>
+  restartCount=unknown`. Each overwrite writes the complete line to a unique same-directory
+  temporary file, fsyncs it, atomically replaces the reason file and syncs the containing directory
+  where supported; recovery/start replaces the old reason with an empty file. The bridge cannot know systemd's
+  restart count; `ExecStopPost` can read `$SERVICE_RESULT` (`watchdog` or `exit-code`) and this file to page. The operator must keep the
+  service type unchanged and use this drop-in:
+
+  ```ini
+  [Service]
+  NotifyAccess=all
+  WatchdogSec=90
+  TimeoutStopSec=10
+  ```
+
+  `NotifyAccess=all` is required because the notifier is a child process. A requested SIGTERM or
+  SIGINT stops sync and forwarding, fences local mirror writes, ends remote stdin cleanly, and exits
+  with status 0 within five seconds. If the SSH transport has not exited two seconds after stdin
+  closes, the bridge terminates it; a second signal forces an immediate status-0 exit. Keep the
+  service type unchanged. After installing the drop-in and the operator-owned `ExecStopPost` hook,
+  run `systemctl daemon-reload`, restart that peer's bridge unit, and verify effective
+  `NotifyAccess`, `WatchdogUSec`, and `TimeoutStopUSec` with `systemctl show`.
+  The service cgroup must contain both the bridge and its SSH transport. The hook pages based on
+  `$SERVICE_RESULT` (`watchdog` or `exit-code`) and reads the reason file. If no alarm session is
+  configured, the bridge cannot safely address a mesh event; the stderr/reason-file signal remains
+  available to the hook. The P0 rule for two exits within 30 minutes belongs in the alarm router,
+  not this bridge.
 - The remote is not trusted. An event from it crosses only when all of these are true:
   - its sender is a live native participant or host identity of the remote;
   - no hub record, live or not, uses that id;
   - its recipient is native to the hub, or it is a `fleet.work.*` or allow-listed `ops.owner`
     event addressed exactly to `factory`, or an unaddressed `wait`/`eta` issue record on a parsed
-    `fleet.work.<repo>.<n>` topic (the sender checks above, the per-link factory rate bound,
-    the commit-time ownership fence and the frame budget still apply to it).
+    `fleet.work.<repo>.<n>` topic. The session-addressed `fabric.alarm.bridge-stall` event can
+    also cross to its native hub recipient; the sender checks, commit-time ownership fence and
+    frame budget still apply.
 - A remote identity is bound to the one link that mirrored it first (the `remoteHost` on its record).
   Each link reserves every id it did not mirror: native records (live or not) and other links'
   mirrors. It reserves host ids, identity ids, root ids, participant ids and session ids, but not
@@ -171,9 +228,9 @@ existing events and mirrors root presence. There is no new store or protocol.
   A late answer opens the gate for a new presence snapshot; it does not renew the old snapshot's
   freshness. The agent stamps mirror arrival time before either lane's dispatch wait.
   Non-mirror timeouts, transport/watch failures and permanent late mirror rejections remain
-  fatal. On stop, the bridge fences the loop, gives the remote withdrawal a bounded
-  wait, withdraws the local mirrors regardless, and then reaps the transport child
-  (SIGTERM, then SIGKILL after 2 s).
+  fatal. On stop, the bridge fences future local mirror writes and ends remote stdin cleanly.
+  Persisted mirrors expire by lease TTL. The hub reaps a transport
+  child after clean EOF grace (SIGTERM after 2 s, then SIGKILL 500 ms later if needed).
 - An allow-listed event that is not addressed across (its recipient is not on the other side) is
   not forwarded. Each one is a debug line (`--log-level debug`), and the bridge logs at most one
   count line a minute, `bridge: N events not addressed across (topics: ...; toRemote N, toLocal N (to
@@ -184,11 +241,12 @@ existing events and mirrors root presence. There is no new store or protocol.
   Presence snapshots (both the replies and the mirror requests) hold whole hosts with their roots
   up to the same budget. Hosts past the budget are not mirrored, so they lapse, and the bridge logs
   the count. A `bridgedIds` reply holds at most 50,000 ids per page.
-- Local mirror writes run one at a time behind a fence. On withdrawal, the bridge fences first,
-  waits for a write in flight, then deletes, so no record or lease comes back after stop.
+- Local mirror writes run one at a time behind a fence. On explicit withdrawal, the bridge fences
+  first, waits for a write in flight, then deletes, so no record or lease comes back after withdrawal.
 - The bridge checks its arguments and opens the local mesh before it starts the transport. From the
-  spawn on, one `finally` withdraws the mirrors and reaps the child. A transport that cannot start
-  (a missing or non-executable ssh) fails the bridge with a named error and exit status 1.
+  spawn on, one `finally` fences local mirror writes and reaps the child; it leaves persisted mirrors
+  to expire by lease TTL. A transport that cannot start (a missing or non-executable ssh) fails the
+  bridge with a named error and exit status 1.
 - The agent (the remote end) serves only the bridge operations. It applies the allow-list and
   stamps its pinned `--peer` name on everything it writes, whatever the hub sends.
 - The hub and agent watch the mesh directory and bind watches for `participants/` and
@@ -243,12 +301,12 @@ link requires explicit retirement, not silent cursor invalidation.
 
 On the remote, pin the agent to the bridge's dedicated key in `~/.ssh/authorized_keys`:
 
-    command="node /path/to/pi-fabric/bin/mesh-bridge agent --mesh /path/to/project/.pi/fabric/mesh --peer dev1",restrict ssh-ed25519 AAAA... mesh-bridge@dev1
+    command="node /path/to/pi-fabric/bin/mesh-bridge agent --mesh /path/to/project/.pi/fabric/mesh --peer hub-a",restrict ssh-ed25519 AAAA... mesh-bridge@hub-a
 
 On the hub, run one bridge per remote host as the fleet user, under the service manager:
 
-    mesh-bridge run --mesh ~/proj/.pi/fabric/mesh --name dev1 --remote forge \
-      --cursor ~/.local/state/mesh-bridge/forge.json --ssh forge --ssh-key ~/.ssh/mesh-bridge
+    mesh-bridge run --mesh ~/proj/.pi/fabric/mesh --name hub-a --remote peer-b \
+      --cursor ~/.local/state/mesh-bridge/peer-b.cursor.json --ssh peer-b --ssh-key ~/.ssh/mesh-bridge
 
 Both modes accept `--max-state-bytes BYTES` for meshes larger than the default 32 MiB
 shared-state read ceiling. Set it explicitly on each side that needs the larger capacity;

@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
+import { buildSync } from "esbuild";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai";
 import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager,
@@ -57,6 +58,29 @@ const scratch = (): string => {
 };
 
 const hash = (id: string): string => createHash("sha256").update(id).digest("hex");
+
+const isProcessAlive = (pid: number): boolean => {
+  try { process.kill(pid, 0); return true; } catch { return false; }
+};
+
+const waitForCondition = async (predicate: () => boolean, timeoutMs: number, what: string): Promise<void> => {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error(`Timed out waiting for ${what}`);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+};
+
+const waitForExit = async (child: ReturnType<typeof spawn>, timeoutMs: number): Promise<{ code: number | null; signal: NodeJS.Signals | null }> => {
+  if (child.exitCode !== null || child.signalCode !== null) return { code: child.exitCode, signal: child.signalCode };
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`Child did not exit within ${timeoutMs} ms`)), timeoutMs);
+    child.once("close", (code, signal) => {
+      clearTimeout(timer);
+      resolve({ code, signal });
+    });
+  });
+};
 
 /** A live root session on a mesh, as the participant directory writes it. */
 /** A root's canonical id, as Fabric mints it (`session:<session id>`); its host id is the same. */
@@ -1592,6 +1616,140 @@ describe("mesh bridge", () => {
       expect(alive(pid!)).toBe(false);
     }
   }, 20_000);
+
+  describe.skipIf(process.platform === "win32")("system bridge signal shutdown", () => {
+    type StopMode = "normal" | "hold" | "stuck";
+    const launch = async (mode: StopMode) => {
+      const root = scratch();
+      fs.symlinkSync(path.resolve("node_modules"), path.join(root, "node_modules"), "dir");
+      const cli = path.join(root, "mesh-bridge-cli.mjs");
+      const agent = path.join(root, "bridge-agent.mjs");
+      const cliSource = `
+        import { main } from ${JSON.stringify(path.resolve("src/mesh-bridge.ts"))};
+        main(process.argv.slice(2)).then(code => { process.exitCode = code; }, error => {
+          process.stderr.write(String(error) + "\\n"); process.exitCode = 2;
+        });
+      `;
+      const agentSource = `
+        import fs from "node:fs";
+        import { MeshStore } from ${JSON.stringify(path.resolve("src/mesh/store.ts"))};
+        import { StoreBridgeSide, serveBridgeAgent } from ${JSON.stringify(path.resolve("src/mesh/bridge.ts"))};
+        const [meshRoot, tracePath, mode] = process.argv.slice(2);
+        const trace = line => fs.appendFileSync(tracePath, line + "\\n");
+        const store = new MeshStore(meshRoot, 256 * 1024, 100);
+        const side = new StoreBridgeSide(store, "hub-a", Date.now, true);
+        process.stdin.on("end", () => trace("stdin-end"));
+        process.stdin.on("error", error => trace("stdin-error:" + error.code));
+        process.stdout.on("error", error => trace("stdout-error:" + error.code));
+        if (mode === "stuck") setInterval(() => {}, 1_000);
+        if (mode === "hold" || mode === "stuck") {
+          side.publish = async () => {
+            trace("publish-started");
+            if (mode === "stuck") await new Promise(() => {});
+            else await new Promise(resolve => process.stdin.once("end", resolve));
+            return { sequence: 1 };
+          };
+        }
+        trace("agent-ready:" + process.pid);
+        try { await serveBridgeAgent(side, process.stdin, process.stdout); }
+        finally { store.closeState(); trace("agent-exit"); }
+      `;
+      buildSync({ stdin: { contents: cliSource, resolveDir: process.cwd() }, outfile: cli,
+        bundle: true, platform: "node", format: "esm", packages: "external" });
+      buildSync({ stdin: { contents: agentSource, resolveDir: process.cwd() }, outfile: agent,
+        bundle: true, platform: "node", format: "esm", packages: "external" });
+      const hubRoot = path.join(root, "hub-mesh");
+      const peerRoot = path.join(root, "peer-mesh");
+      const hubStore = new MeshStore(hubRoot, 256 * 1024, 100);
+      const peerStore = new MeshStore(peerRoot, 256 * 1024, 100);
+      const hubMain = await addRoot(hubStore, "hub-main");
+      const peerMain = await addRoot(peerStore, "peer-main");
+      const tracePath = path.join(root, "transport.log");
+      let stderr = "";
+      const bridgeProcess = spawn(process.execPath, [cli, "run", "--mesh", hubRoot, "--name", "hub-a", "--remote", "peer-b",
+        "--cursor", path.join(root, "peer-b.cursor.json"), "--call-timeout-ms", "1000", "--",
+        process.execPath, agent, peerRoot, tracePath, mode], { stdio: ["ignore", "ignore", "pipe"] });
+      bridgeProcess.stderr.setEncoding("utf8");
+      bridgeProcess.stderr.on("data", chunk => { stderr += chunk; });
+      let transportPid: number | undefined;
+      const trace = (): string => fs.existsSync(tracePath) ? fs.readFileSync(tracePath, "utf8") : "";
+      const linked = async (): Promise<void> => {
+        await waitForCondition(() => {
+          if (bridgeProcess.exitCode !== null || bridgeProcess.signalCode !== null) {
+            throw new Error(`Bridge exited before linking: ${stderr}`);
+          }
+          return stderr.includes("linked hub-a <-> peer-b");
+        }, 5_000, "bridge link");
+        const ready = trace().match(/agent-ready:(\d+)/);
+        if (!ready) throw new Error(`Agent did not record its pid: ${trace()}`);
+        transportPid = Number(ready[1]);
+      };
+      const publishForward = async (): Promise<void> => {
+        await hubStore.publish({ topic: "fleet.work.stop-test.1", kind: "ask", from: hubMain.identity,
+          to: peerMain.identity.id, text: "stop while this forward is in flight" });
+      };
+      cleanups.push(async () => {
+        if (transportPid !== undefined && isProcessAlive(transportPid)) {
+          try { process.kill(transportPid, "SIGKILL"); } catch { /* Already exited. */ }
+        }
+        if (bridgeProcess.exitCode === null && bridgeProcess.signalCode === null) {
+          bridgeProcess.kill("SIGKILL");
+          await waitForExit(bridgeProcess, 2_000).catch(() => undefined);
+        }
+        hubStore.closeState();
+        peerStore.closeState();
+      });
+      return { bridgeProcess, linked, publishForward, trace, stderr: () => stderr,
+        transportPid: () => transportPid };
+    };
+
+    it.each(["SIGTERM", "SIGINT"] as const)("exits 0 on %s within five seconds and lets the remote agent consume clean stdin EOF", async (signal) => {
+      const fixture = await launch("normal");
+      await fixture.linked();
+      const started = Date.now();
+      fixture.bridgeProcess.kill(signal);
+      const exit = await waitForExit(fixture.bridgeProcess, 5_000);
+      expect(exit).toEqual({ code: 0, signal: null });
+      expect(Date.now() - started).toBeLessThan(5_000);
+      await waitForCondition(() => fixture.trace().includes("agent-exit"), 1_000, "remote agent exit");
+      expect(fixture.trace()).toContain("stdin-end");
+      expect(fixture.trace()).not.toMatch(/EPIPE|stdin-error|stdout-error/);
+      expect(isProcessAlive(fixture.transportPid()!)).toBe(false);
+      expect(fixture.stderr()).not.toMatch(/EPIPE/);
+    }, 12_000);
+
+    it("finishes an in-flight forward on SIGTERM without an orphan transport", async () => {
+      const fixture = await launch("hold");
+      await fixture.linked();
+      await fixture.publishForward();
+      await waitForCondition(() => fixture.trace().includes("publish-started"), 3_000, "in-flight remote publish");
+      const started = Date.now();
+      fixture.bridgeProcess.kill("SIGTERM");
+      const exit = await waitForExit(fixture.bridgeProcess, 5_000);
+      expect(exit).toEqual({ code: 0, signal: null });
+      expect(Date.now() - started).toBeLessThan(5_000);
+      await waitForCondition(() => fixture.trace().includes("agent-exit"), 1_000, "held agent exit after EOF");
+      expect(fixture.trace()).toContain("stdin-end");
+      expect(fixture.trace()).not.toMatch(/EPIPE|stdin-error|stdout-error/);
+      expect(isProcessAlive(fixture.transportPid()!)).toBe(false);
+      expect(fixture.stderr()).not.toMatch(/EPIPE/);
+    }, 12_000);
+
+    it("forces an immediate status-0 exit on a second signal and kills the transport child", async () => {
+      const fixture = await launch("stuck");
+      await fixture.linked();
+      await fixture.publishForward();
+      await waitForCondition(() => fixture.trace().includes("publish-started"), 3_000, "stuck in-flight remote publish");
+      fixture.bridgeProcess.kill("SIGTERM");
+      await waitForCondition(() => fixture.trace().includes("stdin-end"), 1_000, "first-signal stdin EOF");
+      const started = Date.now();
+      fixture.bridgeProcess.kill("SIGTERM");
+      const exit = await waitForExit(fixture.bridgeProcess, 1_000);
+      expect(exit).toEqual({ code: 0, signal: null });
+      expect(Date.now() - started).toBeLessThan(1_000);
+      await waitForCondition(() => !isProcessAlive(fixture.transportPid()!), 1_000, "transport child termination");
+    }, 12_000);
+  });
 
   // Review F4: a page never passes one transport frame, over a real pipe.
   it("delivers, in order, a backlog larger than one transport frame over a real pipe", async () => {

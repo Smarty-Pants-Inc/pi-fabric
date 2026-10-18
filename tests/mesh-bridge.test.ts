@@ -185,6 +185,9 @@ const on = (store: MeshStore, topic: string): MeshEvent[] => store.read({ after:
 const notAddressedDebugs = (debugs: string[]): string[] => debugs.filter(line => line.includes(": not addressed across:"));
 
 const lockTimeout = (): Error => Object.assign(new Error("mesh busy"), { code: "FABRIC_MESH_LOCK_TIMEOUT" });
+const sqliteFenceBusy = (): Error => Object.assign(new Error("SQLite state fence busy"), {
+  code: "FABRIC_MESH_LOCK_TIMEOUT", busyCode: "FABRIC_MESH_STATE_BUSY",
+});
 
 const waitFor = async (check: () => boolean): Promise<void> => {
   const until = Date.now() + 3_000;
@@ -994,6 +997,56 @@ describe("mesh bridge", () => {
         await bridge.stop();
         await running;
       }
+    }
+  });
+
+  it("backs off after the first SQLite ownership-fence refusal without losing or duplicating the event", async () => {
+    const hub = new MeshStore(scratch(), 64 * 1024, 100, { stateBackend: "sqlite" });
+    const { far, bridge, logs } = setup(undefined, { hub, presenceMs: 0, stopMs: 100 });
+    const lane = await addRoot(hub, "lane");
+    const forge = await addRoot(far, "forge-main");
+    let running: Promise<void> | undefined;
+    try {
+      await bridge.start();
+      const sent = await far.publish({ topic: "fleet.work.fence.1", kind: "ask", from: forge.identity,
+        to: lane.identity.id, text: "delivered once" });
+      let inTargetPublish = false;
+      let failFence = true;
+      const publishTimes: number[] = [];
+      const originalPublish = hub.publish.bind(hub);
+      const originalFence = hub.withStateWriteFence.bind(hub);
+      vi.spyOn(hub, "publish").mockImplementation(async (...args) => {
+        const targeted = args[0].topic === "fleet.work.fence.1";
+        if (targeted) publishTimes.push(Date.now());
+        const previous = inTargetPublish;
+        inTargetPublish = previous || targeted;
+        try { return await originalPublish(...args); }
+        finally { inTargetPublish = previous; }
+      });
+      vi.spyOn(hub, "withStateWriteFence").mockImplementation((operation) => {
+        if (inTargetPublish && failFence) {
+          failFence = false;
+          throw sqliteFenceBusy();
+        }
+        return originalFence(operation);
+      });
+      let failure: unknown;
+      running = bridge.run().catch((error: unknown) => { failure = error; });
+      await waitFor(() => on(hub, "fleet.work.fence.1").length === 1);
+      await waitFor(() => logs.some((line) => line.includes("retrying")));
+      const received = on(hub, "fleet.work.fence.1");
+      expect(failFence).toBe(false);
+      expect(publishTimes).toHaveLength(2);
+      expect(publishTimes[1]! - publishTimes[0]!).toBeGreaterThanOrEqual(80);
+      expect(received).toHaveLength(1);
+      expect(received.map((event) => (event.data as { bridge: { id: string } }).bridge.id)).toEqual([sent.id]);
+      expect(logs.filter((line) => line.includes("retrying"))).toHaveLength(1);
+      expect(logs.some((line) => /dropped|refused/.test(line))).toBe(false);
+      expect(failure).toBeUndefined();
+    } finally {
+      await bridge.stop();
+      await running;
+      hub.closeState();
     }
   });
 

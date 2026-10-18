@@ -1343,22 +1343,29 @@ export class SqliteStateStore {
   }
 
   /**
-   * The R20 write fence (smarty-dev#6477 L2b): ONE synchronous `BEGIN IMMEDIATE` attempt (bounded by
-   * `busy_timeout`, <= 5 ms), `operation` on that transaction's snapshot, then ROLLBACK. No other
+   * The R20 write fence (smarty-dev#6477 L2b): ONE synchronous `BEGIN IMMEDIATE` attempt with
+   * `busy_timeout = 0`, `operation` on that transaction's snapshot, then ROLLBACK. No other
    * connection commits while it runs, and it writes nothing. It never waits asynchronously, so a
-   * caller that holds `.lock` (lock order: `.lock`, then this) never holds `.lock` through a SQLite
-   * wait: a busy write lock throws `MeshLockTimeoutError` before `operation` runs, and the caller
-   * retries after releasing `.lock`. `operation` must be synchronous and must not call writers.
+   * caller that holds `.lock` (lock order: `.lock`, then this) never waits for a SQLite writer while
+   * holding `.lock`: a busy write lock throws `MeshLockTimeoutError` before `operation` runs, and
+   * the caller retries with `.lock` released. `operation` must be synchronous and must not call writers.
    */
   fenceSync<T>(operation: () => T): T {
     this.#assertOpen();
     if (this.#inTransaction) throw new Error("Fabric mesh state callbacks must not call store writers");
+    // A caller may hold the fair mesh .lock while fencing an append. Never wait for a competing
+    // SQLite writer in that critical section: fail this BEGIN once, then let the caller release
+    // .lock and retry with backoff. Restore the connection's ordinary read/write busy policy before
+    // running the fenced callback or returning to its caller.
+    this.#db.exec("PRAGMA busy_timeout = 0");
     try {
       this.#db.exec("BEGIN IMMEDIATE");
     } catch (error) {
       if (!isBusy(error) && !isTransient(error)) throw error;
       this.#stats.busyRetries += 1;
       throw new MeshLockTimeoutError(` (SQLite state ${this.file}, write fence)`, 1, 0);
+    } finally {
+      this.#db.exec(`PRAGMA busy_timeout = ${this.#busyTimeoutMs}`);
     }
     this.#inTransaction = true;
     const began = performance.now();

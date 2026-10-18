@@ -30,6 +30,8 @@ const diagnosedFallbackManagers = new WeakSet<object>();
 /** Diagnostic count of anomalous active-branch reads recovered through a full session snapshot. */
 export const getSessionBranchFallbackCount = (): number => sessionBranchFallbackCount;
 
+class SessionEntryBranchRefusalError extends Error {}
+
 const fullActiveBranchRead = (
   manager: SessionEntryCursorManager,
   leaf: unknown,
@@ -42,36 +44,36 @@ const fullActiveBranchRead = (
     try { diagnostics.warn("src/core/preview.ts", `[pi-fabric] active session ancestry required a full-read fallback #${sessionBranchFallbackCount}: ${reason}`); } catch {}
   }
   if (typeof manager.getEntries !== "function") {
-    throw new Error("Active session ancestry is incomplete and no full session read is available");
+    throw new SessionEntryBranchRefusalError("Active session ancestry is incomplete and no full session read is available");
   }
   const entries = manager.getEntries();
   if (maxEntries === 0) return [];
   const byId = new Map<string, unknown>();
   for (const entry of entries) {
     const id = sessionEntryId(entry);
-    if (!id || byId.has(id)) throw new Error("Full session read has missing or duplicate entry ids");
+    if (!id || byId.has(id)) throw new SessionEntryBranchRefusalError("Full session read has missing or duplicate entry ids");
     byId.set(id, entry);
   }
   const leafId = sessionEntryId(leaf) ?? manager.getLeafId?.() ?? null;
   if (leafId === null) {
     if (entries.length === 0) return [];
-    throw new Error("Full session read cannot identify the active leaf");
+    throw new SessionEntryBranchRefusalError("Full session read cannot identify the active leaf");
   }
   let current = byId.get(leafId);
-  if (!current) throw new Error("Full session read is missing the active leaf");
+  if (!current) throw new SessionEntryBranchRefusalError("Full session read is missing the active leaf");
   const reverse: unknown[] = [];
   const visited = new Set<string>();
   while (current) {
     const id = sessionEntryId(current);
-    if (!id || visited.has(id)) throw new Error("Full session read contains cyclic or invalid active ancestry");
+    if (!id || visited.has(id)) throw new SessionEntryBranchRefusalError("Full session read contains cyclic or invalid active ancestry");
     visited.add(id);
     reverse.push(current);
     if (maxEntries !== undefined && reverse.length >= maxEntries) break;
     const parent = sessionParentId(current);
     if (parent === null) break;
-    if (parent === undefined) throw new Error("Full session read contains incomplete active ancestry");
+    if (parent === undefined) throw new SessionEntryBranchRefusalError("Full session read contains incomplete active ancestry");
     current = byId.get(parent);
-    if (!current) throw new Error("Full session read is missing an active ancestor");
+    if (!current) throw new SessionEntryBranchRefusalError("Full session read is missing an active ancestor");
   }
   return reverse.reverse();
 };
@@ -123,7 +125,26 @@ export interface SessionEntryRead {
   leafId: string | null;
 }
 
-/** Incremental active-branch cursor; no history-size cap unless requested by existing semantics. */
+interface SessionEntryCursorFailure {
+  sessionId: string | undefined;
+  leafId: string | null;
+  maxEntries: number | undefined;
+  error: unknown;
+}
+
+const CURSOR_KNOWN_ID_LIMIT = 500;
+const cursorKnownIdLimit = (maxEntries: number | undefined): number =>
+  Math.max(0, Math.min(maxEntries ?? CURSOR_KNOWN_ID_LIMIT, CURSOR_KNOWN_ID_LIMIT));
+const currentLeafId = (manager: SessionEntryCursorManager): string | null => {
+  try {
+    const declared = manager.getLeafId?.();
+    return declared !== undefined ? declared : sessionEntryId(manager.getLeafEntry?.()) ?? null;
+  } catch {
+    return null;
+  }
+};
+
+/** Incremental active-branch cursor; returned history is uncapped, cursor metadata keeps 500 ids. */
 export class SessionEntryCursor {
   #initialized = false;
   #sessionId: string | undefined;
@@ -131,22 +152,48 @@ export class SessionEntryCursor {
   #pathIds: string[] = [];
   #known = new Set<string>();
   #maxEntries: number | undefined;
+  #failure: SessionEntryCursorFailure | undefined;
 
   reset(manager: SessionEntryCursorManager, maxEntries?: number): SessionEntryRead {
+    const sessionId = manager.getSessionId?.();
+    const leafId = currentLeafId(manager);
+    if (this.#failure) {
+      const failure = this.#failure;
+      if (failure.sessionId === sessionId && failure.leafId === leafId && failure.maxEntries === maxEntries) {
+        throw failure.error;
+      }
+      this.#failure = undefined;
+    }
     this.#initialized = false;
-    this.#sessionId = manager.getSessionId?.();
+    this.#sessionId = sessionId;
     this.#leafId = null;
     this.#pathIds = [];
     this.#known.clear();
     this.#maxEntries = maxEntries;
-    const entries = walkActiveSessionBranch(manager, maxEntries);
-    this.#setPath(entries);
-    this.#initialized = true;
-    return { entries, reset: true, leafId: this.#leafId };
+    try {
+      const entries = walkActiveSessionBranch(manager, maxEntries);
+      this.#setPath(entries);
+      this.#initialized = true;
+      return { entries, reset: true, leafId: this.#leafId };
+    } catch (error) {
+      // Cache an explicit ancestry refusal before propagating it. Transient reader exceptions must
+      // remain retryable on the next read at the same session/tip.
+      if (error instanceof SessionEntryBranchRefusalError) {
+        this.#failure = { sessionId, leafId, maxEntries, error };
+      }
+      throw error;
+    }
   }
 
   read(manager: SessionEntryCursorManager): SessionEntryRead {
-    if (!this.#initialized || this.#sessionId !== manager.getSessionId?.()) return this.reset(manager, this.#maxEntries);
+    const sessionId = manager.getSessionId?.();
+    if (this.#failure) {
+      const failure = this.#failure;
+      if (failure.sessionId === sessionId && failure.leafId === currentLeafId(manager) &&
+          failure.maxEntries === this.#maxEntries) throw failure.error;
+      this.#failure = undefined;
+    }
+    if (!this.#initialized || this.#sessionId !== sessionId) return this.reset(manager, this.#maxEntries);
     if (typeof manager.getLeafEntry !== "function" || typeof manager.getEntry !== "function") return this.reset(manager, this.#maxEntries);
     const leaf = manager.getLeafEntry();
     const leafId = sessionEntryId(leaf) ?? null;
@@ -172,7 +219,11 @@ export class SessionEntryCursor {
         const entries = reverse.reverse(); this.#appendPath(entries); this.#leafId = leafId;
         return { entries, reset: false, leafId: this.#leafId };
       }
-      current = manager.getEntry(parent);
+      try {
+        current = manager.getEntry(parent);
+      } catch {
+        return this.reset(manager, this.#maxEntries);
+      }
     }
     return this.reset(manager, this.#maxEntries);
   }
@@ -180,25 +231,28 @@ export class SessionEntryCursor {
   #setPath(entries: readonly unknown[]): void {
     const ids = entries.flatMap((entry) => { const id = sessionEntryId(entry); return id ? [id] : []; });
     this.#leafId = ids.at(-1) ?? null;
-    if (this.#maxEntries === undefined) { this.#pathIds = []; this.#known = new Set(ids); return; }
-    this.#pathIds = this.#maxEntries === 0 ? [] : ids.slice(-this.#maxEntries);
+    const limit = cursorKnownIdLimit(this.#maxEntries);
+    this.#pathIds = limit === 0 ? [] : ids.slice(-limit);
     this.#known = new Set(this.#pathIds);
   }
 
   #appendPath(entries: readonly unknown[]): void {
+    const limit = cursorKnownIdLimit(this.#maxEntries);
     for (const entry of entries) {
       const id = sessionEntryId(entry);
       if (!id) continue;
-      if (this.#maxEntries !== undefined && this.#maxEntries > 0) this.#pathIds.push(id);
-      if (this.#maxEntries !== 0) this.#known.add(id);
+      if (limit > 0) this.#pathIds.push(id);
+      if (limit > 0) this.#known.add(id);
       this.#leafId = id;
     }
     this.#trimPath();
   }
 
   #trimPath(): void {
-    if (this.#maxEntries === undefined || this.#pathIds.length <= this.#maxEntries) return;
-    this.#pathIds = this.#maxEntries === 0 ? [] : this.#pathIds.slice(-this.#maxEntries);
+    const limit = cursorKnownIdLimit(this.#maxEntries);
+    if (limit === 0) { this.#pathIds = []; this.#known.clear(); return; }
+    if (this.#pathIds.length <= limit) return;
+    this.#pathIds = this.#pathIds.slice(-limit);
     this.#known = new Set(this.#pathIds);
   }
 }

@@ -151,11 +151,92 @@ describe("bounded active-session readers", () => {
     ];
     byId = new Map(entries.map((entry) => [entry.id, entry]));
     const before = getSessionBranchFallbackCount();
-    expect(() => cursor.read(manager)).toThrow("Full session read contains cyclic or invalid active ancestry");
+    for (let read = 0; read < 2; read++) {
+      expect(() => cursor.read(manager)).toThrow("Full session read contains cyclic or invalid active ancestry");
+    }
     expect(getEntry.mock.calls.length).toBeLessThanOrEqual(4);
     expect(getEntries).toHaveBeenCalledTimes(1);
     expect(getSessionBranchFallbackCount()).toBe(before + 1);
   }, 2_000);
+
+  it("caches an incomplete full-read refusal until the active tip changes", () => {
+    const state = managerFor(linked(plainRows(3)));
+    const cursor = new SessionEntryCursor();
+    state.replace(plainRows(2));
+    const activeEntry = state.entries[1]!;
+    const missingAncestorId = state.entries[0]!.id;
+    state.manager.getEntry.mockImplementation((id: string) => id === missingAncestorId
+      ? undefined : state.entries.find((entry) => entry.id === id));
+    state.manager.getEntries.mockReturnValue([activeEntry]);
+    state.manager.getEntry.mockClear(); state.manager.getEntries.mockClear();
+    const before = getSessionBranchFallbackCount();
+
+    for (let reset = 0; reset < 2; reset++) {
+      expect(() => cursor.reset(state.manager)).toThrow("Full session read is missing an active ancestor");
+    }
+    expect(state.manager.getEntries).toHaveBeenCalledTimes(1);
+    expect(getSessionBranchFallbackCount()).toBe(before + 1);
+  });
+
+  it("catches a throwing incremental point lookup and recovers through one full snapshot", () => {
+    const state = managerFor(linked(plainRows(2)));
+    const cursor = new SessionEntryCursor();
+    cursor.reset(state.manager);
+    state.manager.getEntry.mockClear(); state.manager.getEntries.mockClear();
+    state.append(plainRows(3));
+    const throwingAncestorId = "entry-2";
+    state.manager.getEntry.mockImplementation((id: string) => {
+      if (id === throwingAncestorId) throw new Error("synthetic point lookup failure");
+      return state.entries.find((entry) => entry.id === id);
+    });
+    const before = getSessionBranchFallbackCount();
+
+    const read = cursor.read(state.manager);
+    expect(read.reset).toBe(true);
+    expect(read.entries).toHaveLength(5);
+    expect(state.manager.getEntries).toHaveBeenCalledTimes(1);
+    expect(getSessionBranchFallbackCount()).toBe(before + 1);
+    expect(cursor.read(state.manager)).toMatchObject({ entries: [], reset: false, leafId: "entry-4" });
+    expect(state.manager.getEntries).toHaveBeenCalledTimes(1);
+  });
+
+  it("retries a transient full-snapshot exception at the unchanged active tip", () => {
+    const state = managerFor(linked(plainRows(3)));
+    const cursor = new SessionEntryCursor();
+    const missingAncestorId = state.entries[0]!.id;
+    state.manager.getEntry.mockImplementation((id: string) => id === missingAncestorId
+      ? undefined : state.entries.find((entry) => entry.id === id));
+    state.manager.getEntries.mockImplementationOnce(() => { throw new Error("transient full snapshot failure"); });
+    const before = getSessionBranchFallbackCount();
+
+    expect(() => cursor.read(state.manager)).toThrow("transient full snapshot failure");
+    const recovered = cursor.read(state.manager);
+    expect(recovered).toMatchObject({ reset: true, leafId: "entry-2" });
+    expect(recovered.entries).toHaveLength(3);
+    expect(state.manager.getEntries).toHaveBeenCalledTimes(2);
+    expect(getSessionBranchFallbackCount()).toBe(before + 2);
+  });
+
+  it("evicts cursor ids FIFO at 500 and rederives a rewound branch exactly", () => {
+    const original = plainRows(800);
+    original[50] = { type: "custom_message", customType: "pi-fabric-records", details: { ids: ["rewound-batch"] } };
+    const state = managerFor(linked(original));
+    const cursor = new SessionEntryCursor();
+    cursor.reset(state.manager);
+    state.manager.getEntry.mockClear(); state.manager.getEntries.mockClear();
+
+    const rewound = plainRows(100);
+    rewound[50] = { type: "custom_message", customType: "pi-fabric-records", details: { ids: ["rewound-batch"] } };
+    state.replace(rewound);
+    const read = cursor.read(state.manager);
+    expect(read.reset).toBe(true);
+    expect(read.entries).toHaveLength(100);
+    expect(recordsInboxSession(read.entries).holdsBatch(["rewound-batch"])).toBe(true);
+    // The old tip is outside the retained 500-ID window, so the cursor walks to the root
+    // and then rederives the branch rather than accepting a partial suffix.
+    expect(state.manager.getEntry.mock.calls.length).toBeGreaterThan(150);
+    expect(state.manager.getEntries).not.toHaveBeenCalled();
+  });
 
   it("retains the full-read compatibility path only for managers without point lookups", () => {
     const legacyEntry = { type: "custom_message", customType: "pi-fabric-records", details: { ids: ["legacy-batch"] } };

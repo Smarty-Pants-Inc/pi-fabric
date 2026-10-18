@@ -85,7 +85,7 @@ describe("isolated proof model providers (offline fake metadata only)", () => {
     expect(fs.existsSync(source)).toBe(true);
   });
 
-  it.each(["linked", "linked-error", "default"])("keeps model filename/contents out of actual proof evidence and argv (%s)", mode => {
+  const runModelPrivacyProof = (mode: "linked" | "linked-error" | "default", adversarialRoot = false) => {
     // Execute the real proof script against an inert SDK fixture. No launcher,
     // inference, credential store, SSH or real host models file is accessed.
     const directory = root();
@@ -95,7 +95,7 @@ describe("isolated proof model providers (offline fake metadata only)", () => {
     const output = path.join(directory, "evidence");
     const temp = path.join(directory, "temp");
     const shellMarker = path.join(directory, "reader-shell-injected");
-    const nativeTaskRoot = path.join(directory, `remote root ' ; touch ${shellMarker} ; #`);
+    const nativeTaskRoot = path.join(directory, adversarialRoot ? `remote root ' ; touch ${shellMarker} ; #` : "remote root ' legal");
     const nativeTask = path.join(nativeTaskRoot, "offline-id");
     for (const folder of [path.join(cwd, "dist"), path.join(sdk, "dist/core"), hostProfile, temp, nativeTask]) fs.mkdirSync(folder, { recursive: true });
     for (const [name, contents] of Object.entries({ rc: "23\n", "result.md": "offline reader result\n", "stderr.log": "offline reader stderr\n", "pi-rc": "0\n", "completion.json": "{}\n" })) {
@@ -164,26 +164,16 @@ export async function createAgentSession() {
     expect(result.error).toBeUndefined();
     expect(result.status, result.stderr).toBe(mode === "linked-error" ? 1 : 0);
     const invocation = JSON.parse(fs.readFileSync(path.join(output, "invocation.json"), "utf8"));
+    let reader: string | undefined;
     if (transport === "local") {
       expect(invocation.placement.resultDirectory).toBe(path.join(nativeTaskRoot, "{id}"));
       for (const name of ["rc", "pi-rc", "result.md", "stderr.log", "completion.json"]) {
         expect(fs.readFileSync(path.join(output, `native-${name}`), "utf8")).toBe(fs.readFileSync(path.join(nativeTask, name), "utf8"));
       }
     } else {
-      const reader = invocation.placement.resultCommand.at(-1) as string;
+      reader = invocation.placement.resultCommand.at(-1) as string;
       expect(reader).toContain("pathlib.Path(sys.argv[1])/sys.argv[2]");
       expect(reader).toContain(`'${nativeTaskRoot.replace(/'/g, "'\\''")}' {id}`);
-      if (mode === "linked") {
-        if (process.platform !== "win32" && spawnSync("sh", ["-c", "command -v python3 >/dev/null 2>&1"], { encoding: "utf8" }).status === 0) {
-          const read = spawnSync("sh", ["-c", reader.replace("{id}", "offline-id")], { encoding: "utf8", timeout: 10_000 });
-          expect(read.error).toBeUndefined();
-          expect(read.status, read.stderr).toBe(0);
-          expect(JSON.parse(read.stdout)).toEqual({ rc: "23", text: "offline reader result\n", stderr: "offline reader stderr\n" });
-          expect(fs.existsSync(shellMarker)).toBe(false);
-        } else {
-          console.warn("SKIP direct remote-reader argv probe: POSIX sh and python3 are required");
-        }
-      }
     }
     const evidence = JSON.parse(fs.readFileSync(path.join(output, "evidence.json"), "utf8"));
     expect(evidence.passed).toBe(mode !== "linked-error");
@@ -201,5 +191,24 @@ export async function createAgentSession() {
     }
     expect(fs.readFileSync(hostModels, "utf8")).toBe(modelContents);
     expect(fs.readdirSync(temp)).toEqual([]);
+    return { reader, shellMarker };
+  };
+
+  it.each(["linked", "linked-error", "default"] as const)("keeps model filename/contents out of actual proof evidence and argv (%s)", mode => {
+    runModelPrivacyProof(mode);
   });
+
+  const hasPosixReaderPrerequisites = process.platform !== "win32" && spawnSync("sh", ["-c", "command -v python3 >/dev/null 2>&1"], { encoding: "utf8" }).status === 0;
+  it.skipIf(process.platform === "win32" || !hasPosixReaderPrerequisites)(
+    "preserves the POSIX shell-metacharacter injection defense in the argv reader (Windows forbids these path characters; requires POSIX sh and python3)",
+    () => {
+      const { reader, shellMarker } = runModelPrivacyProof("linked", true);
+      expect(reader).toBeDefined();
+      const read = spawnSync("sh", ["-c", reader!.replace("{id}", "offline-id")], { encoding: "utf8", timeout: 10_000 });
+      expect(read.error).toBeUndefined();
+      expect(read.status, read.stderr).toBe(0);
+      expect(JSON.parse(read.stdout)).toEqual({ rc: "23", text: "offline reader result\n", stderr: "offline reader stderr\n" });
+      expect(fs.existsSync(shellMarker)).toBe(false);
+    },
+  );
 });

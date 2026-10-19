@@ -132,7 +132,7 @@ describe.skipIf(process.platform === "win32")("installed fleet placement affinit
     const started = Date.now();
     const preflight = preflightFleetPlacement(f.request(), f.config, f.config.command, "task", f.env);
     await expect(preflight).rejects.toThrow(`host=ryzen3: missing path ${f.request().requires![0]}`);
-    await expect(preflight).rejects.toThrow("needs:['corpus']");
+    await expect(preflight).rejects.toThrow("needs:['local']");
     expect(Date.now() - started).toBeLessThan(10_000);
     expect(fs.readFileSync(f.sshCalls, "utf8")).toBe("called\n");
   });

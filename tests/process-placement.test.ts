@@ -285,7 +285,25 @@ describe("host process task placement", () => {
     for(const needs of ["corpus",[1],[""]]) expect(()=>normalizeAgentRunRequest({task:"x",needs},defaults)).toThrow("needs");
     for (const name of ["run","spawn"]) expect((AGENTS_ACTION_DESCRIPTORS.find(d=>d.name===name)!.inputSchema as {properties:Record<string,unknown>}).properties.needs).toBeDefined();
   });
-  it.each(["github-write","corpus","mac","ryzen1-service","unknown"])("keeps unmet %s local with exactly one audit line", async need => {
+  it("treats corpus as audit metadata while preserving local and unmet github placement", async () => {
+    const f=fixture();
+    const task="same process task";
+    const corpus=await f.manager.run({task,transport:"process",needs:["corpus"]});
+    const local=await f.manager.run({task,transport:"process",needs:["local"]});
+    const github=await f.manager.run({task,transport:"process",needs:["github"]});
+    const placementEvents = (id: string) => fs.readFileSync(path.join(f.manager.runDirectory(id)!,"events.jsonl"),"utf8").trim().split("\n").map(line=>JSON.parse(line)).filter(line=>line.type.startsWith("placement."));
+
+    expect(corpus).toMatchObject({status:"completed",text:`REMOTE: ${task}`});
+    expect(placementEvents(corpus.id)).toEqual([
+      expect.objectContaining({type:"placement.remote",needs:["corpus"]}),
+      expect.objectContaining({type:"placement.result"}),
+    ]);
+    expect(local).toMatchObject({status:"completed",text:"LOCAL"});
+    expect(placementEvents(local.id)).toEqual([expect.objectContaining({type:"placement.local",reason:"reserved need: local pins to the Main host",needs:["local"]})]);
+    expect(github).toMatchObject({status:"completed",text:"LOCAL"});
+    expect(placementEvents(github.id)).toEqual([expect.objectContaining({type:"placement.local",reason:"unmet needs: github",needs:["github"]})]);
+  });
+  it.each(["github-write","mac","ryzen1-service","unknown"])("keeps unmet %s local with exactly one audit line", async need => {
     const f=fixture(); const h=await f.manager.spawn({task:"x",transport:"process",needs:[need]});
     expect((await f.manager.wait(h.id)).text).toBe("LOCAL");
     const lines=fs.readFileSync(path.join(f.manager.runDirectory(h.id)!,"events.jsonl"),"utf8").trim().split("\n").map(line=>JSON.parse(line)).filter(line=>line.type==="placement.local");

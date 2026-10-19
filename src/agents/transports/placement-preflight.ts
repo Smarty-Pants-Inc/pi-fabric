@@ -68,7 +68,7 @@ export const placementLocalPathReason = (cwd: string, config: AgentPlacementConf
 const hostName = /^[A-Za-z0-9][A-Za-z0-9._-]*$/u;
 const quote = (value: string): string => `'${value.replaceAll("'", `'"'"'`)}'`;
 const failure = (host: string, reason: string): AgentInputError => new AgentInputError("placement",
-  `Placement refused host=${host}: ${reason}; use needs:['corpus'] for caller-only corpus inputs or run locally with needs:['local']; no task started`);
+  `Placement refused host=${host}: ${reason}; use needs:['local'] for caller-only inputs; no task started`);
 
 /** Native close is the normal event; a one-shot deadline bounds stuck read-only
  * queries. Their own group includes the picker's SSH children, never a launcher.

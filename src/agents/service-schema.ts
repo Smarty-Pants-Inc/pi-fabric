@@ -14,7 +14,7 @@ const native = (name: string): FabricActionDescriptor => {
 };
 const run = native("run");
 const properties = { ...(run.inputSchema as {properties: Record<string, unknown>}).properties };
-for (const key of ["transport", "persona"]) delete properties[key];
+for (const key of ["transport", "persona", "extensionPaths"]) delete properties[key];
 Object.assign(properties, {
   runner: {type: "string", enum: ["pi"]},
   kernel: {type: "string", enum: ["typescript", "inherit"]},

@@ -379,7 +379,7 @@ export class ProcessTransport implements AgentTransportAdapter {
       }
       const args = new Map<string, string>();
       for (let index = 0; index < workerArguments.length; index += 2) args.set(workerArguments[index]!, workerArguments[index + 1]!);
-      if (!pinned && args.get("--runner") === "pi" && args.get("--extensions") === "true") {
+      if (!pinned && !args.has("--extension-paths") && args.get("--runner") === "pi" && args.get("--extensions") === "true") {
         workerArguments.push("--fabric-extension", selected.extensionPath);
       }
     }

@@ -86,6 +86,12 @@ const runProperties = {
       "Optional longer wall-clock limit in milliseconds. Omit to use agents.timeoutMs (60 minutes by default); values below the configured default are ignored.",
   },
   extensions: { type: "boolean" },
+  extensionPaths: {
+    type: "array",
+    maxItems: 4,
+    items: { type: "string", minLength: 1, maxLength: 4096 },
+    description: "Host-authorized Pi extension paths. Loads only these explicit paths, disables default extension discovery, and requires tools to name every admitted tool. Each path must be owned by the current UID and inside agents.extensionRoots in host fabric.json.",
+  },
   recursive: { type: "boolean" },
   cwd: {
     type: "string",

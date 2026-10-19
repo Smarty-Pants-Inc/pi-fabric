@@ -271,6 +271,8 @@ export interface FabricAgentConfig {
   modelExceptionsPath?: string;
   /** Host-only file instructions root. Unset = ~/.local/share/smarty-dev/factory/current/. */
   instructionsRoot?: string;
+  /** Host-only roots from which process-child extensions may be explicitly admitted. */
+  extensionRoots?: string[];
   claude: FabricClaudeRunnerConfig;
   veda: FabricVedaRunnerConfig;
   thinking: FabricThinking;
@@ -1896,6 +1898,8 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
       deadRootFilter: normalizeDeadRootFilterConfig(agents.deadRootFilter),
       stuckPreparingMs: boundedInteger(agents.stuckPreparingMs, DEFAULT_FABRIC_CONFIG.agents.stuckPreparingMs, 1_000, 7 * 24 * 60 * 60_000),
       ...(stringValue(agents.instructionsRoot)?.trim() ? { instructionsRoot: stringValue(agents.instructionsRoot)!.trim() } : {}),
+      ...(Array.isArray(agents.extensionRoots) && agents.extensionRoots.every(root => typeof root === "string" && root.trim())
+        ? { extensionRoots: agents.extensionRoots.map(root => (root as string).trim()) } : {}),
       ...(wakeText ? { wakeText } : {}),
       modelAdmission: modelAdmissionValue(
         agents.modelAdmission,
@@ -2487,6 +2491,7 @@ const resolveFabricConfig = (
       delete agents.deniedModels;
       delete agents.deniedModelReplacement;
       delete agents.instructionsRoot;
+      delete agents.extensionRoots;
       delete agents.wakeText;
       delete agents.processSlice;
       delete agents.processMemoryMaxBytes;

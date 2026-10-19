@@ -170,20 +170,24 @@ describe("host-only model exception file location", () => {
   });
 });
 
-describe("host-only actor instruction root (#3819)", () => {
-  it("leaves the default implicit and normalizes the configured root", () => {
+describe("host-only actor instruction and extension roots", () => {
+  it("leaves the defaults implicit and normalizes configured roots", () => {
     expect(normalizeFabricConfig({}).agents.instructionsRoot).toBeUndefined();
     expect(normalizeFabricConfig({ agents: { instructionsRoot: " /factory/current " } }).agents.instructionsRoot).toBe("/factory/current");
     expect(normalizeFabricConfig({ agents: { instructionsRoot: " " } }).agents.instructionsRoot).toBeUndefined();
+    expect(normalizeFabricConfig({}).agents.extensionRoots).toBeUndefined();
+    expect(normalizeFabricConfig({ agents: { extensionRoots: [" /host/extensions "] } }).agents.extensionRoots).toEqual(["/host/extensions"]);
   });
   it.each([true, false])("cannot be widened by workspace config (trusted: %s)", projectTrusted => {
     const cwd = temporaryDirectory(); const agentDir = temporaryDirectory();
     fs.mkdirSync(path.join(cwd, ".pi"));
-    fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ agents: { instructionsRoot: "/host/factory" } }));
-    fs.writeFileSync(path.join(cwd, ".pi", "fabric.json"), JSON.stringify({ agents: { instructionsRoot: "/" } }));
+    fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ agents: { instructionsRoot: "/host/factory", extensionRoots: ["/host/extensions"] } }));
+    fs.writeFileSync(path.join(cwd, ".pi", "fabric.json"), JSON.stringify({ agents: { instructionsRoot: "/", extensionRoots: ["/"] } }));
     expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.instructionsRoot).toBe("/host/factory");
+    expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.extensionRoots).toEqual(["/host/extensions"]);
     fs.unlinkSync(path.join(agentDir, "fabric.json"));
     expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.instructionsRoot).toBeUndefined();
+    expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.extensionRoots).toBeUndefined();
   });
 });
 describe("host-only processSlice (#4383)", () => {

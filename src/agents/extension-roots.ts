@@ -4,19 +4,29 @@ import path from "node:path";
 const WRITE_BY_OTHERS = 0o022;
 const STICKY = 0o1000;
 
+export const agentExtensionPathStatsIssue = (
+  stats: fs.Stats,
+  label: string,
+  allowRootStickyDirectory = false,
+): string | undefined => {
+  if (stats.isSymbolicLink()) return `${label} is a symlink`;
+  const uid = process.getuid?.();
+  if (uid === undefined) return "the host cannot verify file ownership";
+  if (stats.uid !== 0 && stats.uid !== uid) return `${label} is not owned by root or the current UID`;
+  const safeStickyDirectory = allowRootStickyDirectory && stats.isDirectory() && stats.uid === 0 && (stats.mode & STICKY) !== 0;
+  if ((stats.mode & WRITE_BY_OTHERS) !== 0 && !safeStickyDirectory) {
+    return `${label} is group- or world-writable`;
+  }
+  return undefined;
+};
+
 const reasonForPathComponent = (candidate: string, directoryOnly: boolean): string | undefined => {
   let stats: fs.Stats;
   try { stats = fs.lstatSync(candidate); }
   catch (error) { return `path component ${candidate} cannot be inspected (${error instanceof Error ? error.message : String(error)})`; }
-  if (stats.isSymbolicLink()) return `path component ${candidate} is a symlink`;
+  const issue = agentExtensionPathStatsIssue(stats, `path component ${candidate}`, true);
+  if (issue) return issue;
   if (directoryOnly && !stats.isDirectory()) return `path component ${candidate} is not a directory`;
-  const uid = process.getuid?.();
-  if (uid === undefined) return "the host cannot verify file ownership";
-  if (stats.uid !== 0 && stats.uid !== uid) return `path component ${candidate} is not owned by root or the current UID`;
-  const safeStickyDirectory = stats.isDirectory() && stats.uid === 0 && (stats.mode & STICKY) !== 0;
-  if ((stats.mode & WRITE_BY_OTHERS) !== 0 && !safeStickyDirectory) {
-    return `path component ${candidate} is group- or world-writable`;
-  }
   return undefined;
 };
 
@@ -90,17 +100,24 @@ export const resolveAgentExtensionPins = <TPin extends { id: string; path: strin
     const reason = inspectPathChain(canonical, false);
     if (reason) throw new Error(`Invalid agents.extensionPins[${index}].path: ${reason}`);
     let stats: fs.Stats;
-    try { stats = fs.statSync(canonical); }
+    try { stats = fs.lstatSync(canonical); }
     catch (error) {
       throw new Error(`Invalid agents.extensionPins[${index}].path: cannot inspect (${error instanceof Error ? error.message : String(error)})`);
     }
+    const statsIssue = agentExtensionPathStatsIssue(stats, `agents.extensionPins[${index}].path`);
+    if (statsIssue) throw new Error(`Invalid agents.extensionPins[${index}].path: ${statsIssue}`);
     if (!stats.isFile() && !stats.isDirectory()) {
       throw new Error(`Invalid agents.extensionPins[${index}].path: must be a regular file or package directory`);
     }
     if (stats.isDirectory()) {
+      const packagePath = path.join(canonical, "package.json");
+      const packageIssue = inspectPathChain(packagePath, false);
+      if (packageIssue) throw new Error(`Invalid agents.extensionPins[${index}].path: ${packageIssue}`);
       let packageStats: fs.Stats;
-      try { packageStats = fs.statSync(path.join(canonical, "package.json")); }
+      try { packageStats = fs.lstatSync(packagePath); }
       catch { throw new Error(`Invalid agents.extensionPins[${index}].path: package.json is missing`); }
+      const packageStatsIssue = agentExtensionPathStatsIssue(packageStats, `agents.extensionPins[${index}].package.json`);
+      if (packageStatsIssue) throw new Error(`Invalid agents.extensionPins[${index}].path: ${packageStatsIssue}`);
       if (!packageStats.isFile()) throw new Error(`Invalid agents.extensionPins[${index}].path: package.json is not a regular file`);
     }
     return { ...pin };

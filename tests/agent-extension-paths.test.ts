@@ -11,7 +11,7 @@ import { ProcessTransport } from "../src/agents/transports/process-transport.js"
 import { applyTaskReturnAddress } from "../src/agents/task-return-address.js";
 import { taskAgentEnvironment } from "../src/agents/task-environment.js";
 import { childProcessEnvironment } from "../src/core/atomic-write.js";
-import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
+import { DEFAULT_FABRIC_CONFIG, loadFabricConfig } from "../src/config.js";
 import { AGENTS_ACTION_DESCRIPTORS } from "../src/providers/agents-actions.js";
 
 const roots: string[] = [];
@@ -28,9 +28,18 @@ const manifestSha256 = (entries: Array<[string, string, string?]>): string => {
   entries.sort((left, right) => compare(left[0], right[0]) || compare(left[1], right[1]) || compare(left[2] ?? "", right[2] ?? ""));
   return sha256(JSON.stringify(entries));
 };
-const managerFor = (cwd: string, extensionRoots?: string[], piBinary?: string, extensionPins?: Array<{ id: string; path: string; sha256: string }>): AgentManager => {
+const fakePathOwner = (file: string, uid: number) => {
+  const original = fs.lstatSync;
+  return vi.spyOn(fs, "lstatSync").mockImplementation(((candidate: fs.PathLike, ...args: unknown[]) => {
+    const stats = (original as (...values: unknown[]) => fs.Stats)(candidate, ...args);
+    return path.resolve(String(candidate)) === file
+      ? Object.assign(Object.create(Object.getPrototypeOf(stats)) as fs.Stats, stats, { uid })
+      : stats;
+  }) as typeof fs.lstatSync);
+};
+const managerFor = (cwd: string, extensionRoots?: string[], piBinary?: string, extensionPins?: Array<{ id: string; path: string; sha256: string }>, baseConfig: typeof DEFAULT_FABRIC_CONFIG.agents = DEFAULT_FABRIC_CONFIG.agents): AgentManager => {
   const manager = new AgentManager(cwd, {
-    ...DEFAULT_FABRIC_CONFIG.agents,
+    ...baseConfig,
     runner: "pi",
     transport: "process",
     timeoutMs: 30_000,
@@ -79,7 +88,7 @@ describe("host-authorized process extension paths", () => {
     expect((hostedRun.inputSchema as { properties: Record<string, unknown> }).properties.extensionPaths).toBeUndefined();
   });
 
-  it.skipIf(!supportsUidOwnership)("loads only the named extension, calls its allow-listed tool, and records its digest", async () => {
+  it.skipIf(!supportsUidOwnership)("loads a root-owned pinned extension, calls its allow-listed tool, and records its digest", async () => {
     const root = temporary("fabric-extension-real-");
     const extensionRoot = path.join(root, "approved");
     const extensionPath = path.join(extensionRoot, "spawn-extension-probe.mjs");
@@ -111,13 +120,22 @@ describe("host-authorized process extension paths", () => {
       path: fs.realpathSync(extensionPath),
       sha256: sha256(fs.readFileSync(extensionPath)),
     };
-    const manager = managerFor(root, undefined, undefined, [extensionPin]);
+    fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ agents: { extensionPins: [extensionPin] } }));
 
-    const result = await manager.run({
-      ...spawnRequest([extensionPin.id], ["probe_echo"]),
-      model: "spawn-extension-probe/offline",
-      thinking: "off",
-    });
+    const rootOwnedPin = fakePathOwner(extensionPin.path, 0);
+    let result: Awaited<ReturnType<AgentManager["run"]>>;
+    let activeManager: AgentManager | undefined;
+    try {
+      const hostConfig = loadFabricConfig({ cwd: root, agentDir, projectTrusted: false });
+      activeManager = managerFor(root, undefined, undefined, undefined, hostConfig.agents);
+      result = await activeManager.run({
+        ...spawnRequest([extensionPin.id], ["probe_echo"]),
+        model: "spawn-extension-probe/offline",
+        thinking: "off",
+      });
+    } finally {
+      rootOwnedPin.mockRestore();
+    }
 
     expect(result.status, result.error).toBe("completed");
     expect(result.text).toContain("extension-result:probe-echo:from-child");
@@ -132,6 +150,7 @@ describe("host-authorized process extension paths", () => {
       sha256: sha256(fs.readFileSync(extensionPath)),
     }]);
 
+    const manager = activeManager!;
     const defaultResult = await manager.run({
       task: "Verify the legacy extension-discovery path remains available.",
       runner: "pi",
@@ -202,6 +221,10 @@ describe("host-authorized process extension paths", () => {
     const second = validateAgentExtensionPaths([packagePin.path], [packagePin], [root], root)[0];
     expect(first).toEqual({ path: fs.realpathSync(packageDirectory), sha256: expected });
     expect(second).toEqual(first);
+    const foreignPackageEntry = fakePathOwner(path.join(packageDirectory, "index.mjs"), process.getuid!() + 1);
+    expect(() => validateAgentExtensionPaths([packagePin.id], [packagePin], [root], root))
+      .toThrow(/package entry index\.mjs is not owned by root or the current UID/);
+    foreignPackageEntry.mockRestore();
     fs.appendFileSync(path.join(packageDirectory, "index.mjs"), "// changed\n");
     expect(() => validateAgentExtensionPaths([packagePin.id], [packagePin], [root], root))
       .toThrow(/does not match its host-pinned SHA-256/);
@@ -209,19 +232,13 @@ describe("host-authorized process extension paths", () => {
     const sharedModule = path.join(root, "shared.mjs");
     const symlinkPackage = path.join(root, "symlink-package");
     const symlinkPackageJson = '{"name":"symlink-package"}\n';
-    const sharedText = "export default 1;\n";
-    fs.writeFileSync(sharedModule, sharedText);
+    fs.writeFileSync(sharedModule, "export default 1;\n");
     fs.mkdirSync(symlinkPackage);
     fs.writeFileSync(path.join(symlinkPackage, "package.json"), symlinkPackageJson);
     fs.symlinkSync(sharedModule, path.join(symlinkPackage, "alias.mjs"));
-    const symlinkExpected = manifestSha256([
-      ["", "directory"],
-      ["alias.mjs", "symlink", "../shared.mjs"],
-      ["alias.mjs", "file", sha256(sharedText)],
-      ["package.json", "file", sha256(symlinkPackageJson)],
-    ]);
-    const symlinkPin = { id: "symlink-package", path: fs.realpathSync(symlinkPackage), sha256: symlinkExpected };
-    expect(validateAgentExtensionPaths([symlinkPin.id], [symlinkPin], [root], root)[0]?.sha256).toBe(symlinkExpected);
+    const symlinkPin = { id: "symlink-package", path: fs.realpathSync(symlinkPackage), sha256: "0".repeat(64) };
+    expect(() => validateAgentExtensionPaths([symlinkPin.id], [symlinkPin], [root], root))
+      .toThrow(/package entry alias\.mjs is a symlink/);
   });
 
   it.skipIf(!supportsUidOwnership)("requires a host pin, enforces optional roots, and refuses before launch", () => {
@@ -256,13 +273,11 @@ describe("host-authorized process extension paths", () => {
     expect(() => manager.spawn(spawnRequest([unlistedPath], ["probe_echo"]))).toThrow(/not an ID or exact path in the host agents\.extensionPins/);
     expect(() => manager.spawn(spawnRequest(["outside"], ["probe_echo"]))).toThrow(/outside the optional agents\.extensionRoots constraint/);
     expect(() => manager.spawn(spawnRequest(["symlink"], ["probe_echo"]))).toThrow(/must equal its realpath/);
-    expect(() => manager.spawn(spawnRequest(["package-escape"], ["probe_echo"]))).toThrow(/package symlink escape\.mjs escapes the allowed roots/);
+    expect(() => manager.spawn(spawnRequest(["package-escape"], ["probe_echo"]))).toThrow(/package entry escape\.mjs is a symlink/);
     expect(() => manager.spawn(spawnRequest(["writable"], ["probe_echo"]))).toThrow(/group- or world-writable/);
     expect(() => manager.spawn(spawnRequest([`${extensionRoot}${path.sep}..${path.sep}outside${path.sep}outside.mjs`], ["probe_echo"]))).toThrow(/'\.\.' path segments/);
     if (process.getuid) {
-      const uid = process.getuid();
-      let calls = 0;
-      const owner = vi.spyOn(process, "getuid").mockImplementation(() => ++calls === 1 ? uid : uid + 1);
+      const owner = fakePathOwner(fs.realpathSync(validPath), process.getuid!() + 1);
       expect(() => manager.spawn(spawnRequest(["valid"], ["probe_echo"]))).toThrow(/not owned by root or the current UID/);
       owner.mockRestore();
     }

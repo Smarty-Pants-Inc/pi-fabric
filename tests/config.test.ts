@@ -28,6 +28,17 @@ const temporaryDirectory = (): string => {
   return directory;
 };
 
+const fakePathOwner = <T>(file: string, uid: number, run: () => T): T => {
+  const original = fs.lstatSync;
+  const owner = vi.spyOn(fs, "lstatSync").mockImplementation(((candidate: fs.PathLike, ...args: unknown[]) => {
+    const stats = (original as (...values: unknown[]) => fs.Stats)(candidate, ...args);
+    return path.resolve(String(candidate)) === file
+      ? Object.assign(Object.create(Object.getPrototypeOf(stats)) as fs.Stats, stats, { uid })
+      : stats;
+  }) as typeof fs.lstatSync);
+  try { return run(); } finally { owner.mockRestore(); }
+};
+
 afterEach(() => {
   vi.unstubAllEnvs();
   for (const directory of temporaryDirectories.splice(0)) {
@@ -202,6 +213,19 @@ describe("host-only actor instruction and extension pins", () => {
     expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.instructionsRoot).toBeUndefined();
     expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.extensionRoots).toBeUndefined();
     expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.extensionPins).toBeUndefined();
+  });
+  it.skipIf(!supportsUidOwnership)("accepts root-owned pins and rejects another non-root owner at config load", () => {
+    const cwd = temporaryDirectory(); const agentDir = temporaryDirectory();
+    const artifact = path.join(agentDir, "root-extension.mjs");
+    const pin = { id: "root-extension", path: artifact, sha256: "e".repeat(64) };
+    fs.writeFileSync(artifact, "export default () => {};\n");
+    fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ agents: { extensionPins: [pin] } }));
+
+    expect(fakePathOwner(artifact, 0, () => loadFabricConfig({ cwd, agentDir, projectTrusted: false }).agents.extensionPins))
+      .toEqual([pin]);
+    expect(() => fakePathOwner(artifact, process.getuid!() + 1,
+      () => loadFabricConfig({ cwd, agentDir, projectTrusted: false })))
+      .toThrow(/not owned by root or the current UID/);
   });
   it.skipIf(!supportsUidOwnership)("rejects a pinned artifact path that is not its exact realpath", () => {
     const cwd = temporaryDirectory(); const agentDir = temporaryDirectory();

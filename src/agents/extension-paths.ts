@@ -4,13 +4,11 @@ import path from "node:path";
 import { AgentInputError } from "../host-compatibility.js";
 import type { FabricAgentExtensionPin } from "../config.js";
 import type { AgentExtensionPathReceipt } from "./types.js";
-import { assertSafeAgentExtensionPathChain, resolveAgentExtensionPins, resolveAgentExtensionRoots } from "./extension-roots.js";
+import { agentExtensionPathStatsIssue, assertSafeAgentExtensionPathChain, resolveAgentExtensionPins, resolveAgentExtensionRoots } from "./extension-roots.js";
 
 const MAX_AGENT_EXTENSION_PATHS = 4;
 const MAX_MANIFEST_ENTRIES = 10_000;
 const MAX_MANIFEST_BYTES = 256 * 1024 * 1024;
-const WRITE_BY_OTHERS = 0o022;
-
 const fail = (index: number | undefined, reason: string): never => {
   const slot = index === undefined ? "extensionPaths" : `extensionPaths[${index}]`;
   throw new AgentInputError("extensionPaths", `Invalid agents.spawn ${slot}: ${reason}; no worker started`);
@@ -23,15 +21,9 @@ const strictInside = (root: string, candidate: string): boolean => {
   return relative !== "" && relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
 };
 
-const safeOwner = (stats: fs.Stats, label: string, index: number | undefined): void => {
-  const uid = process.getuid?.();
-  if (uid === undefined) fail(index, "the host cannot verify file ownership");
-  if (stats.uid !== uid) fail(index, `${label} is not owned by the current UID`);
-};
-
 const safeStats = (stats: fs.Stats, label: string, index: number | undefined): void => {
-  safeOwner(stats, label, index);
-  if ((stats.mode & WRITE_BY_OTHERS) !== 0) fail(index, `${label} is group- or world-writable`);
+  const issue = agentExtensionPathStatsIssue(stats, label);
+  if (issue) fail(index, issue);
 };
 
 const digest = (bytes: Buffer | string): string => createHash("sha256").update(bytes).digest("hex");
@@ -42,7 +34,7 @@ const realpath = (candidate: string, index: number | undefined, label: string): 
 };
 
 const statPath = (candidate: string, index: number | undefined, label: string): fs.Stats => {
-  try { return fs.statSync(candidate); }
+  try { return fs.lstatSync(candidate); }
   catch (error) { return fail(index, `${label} cannot be inspected (${error instanceof Error ? error.message : String(error)})`); }
 };
 
@@ -56,19 +48,7 @@ const manifestHash = (directory: string, roots: readonly string[] | undefined, i
     try { linkStats = fs.lstatSync(candidate); }
     catch (error) { return fail(index, `package changed while hashing (${error instanceof Error ? error.message : String(error)})`); }
 
-    if (linkStats.isSymbolicLink()) {
-      // Symlink mode bits are always 0777 on POSIX and do not grant write access;
-      // its protected parent directory and the real target carry the policy.
-      safeOwner(linkStats, `package symlink ${relative}`, index);
-      const target = realpath(candidate, index, `package symlink ${relative}`);
-      if (roots && !roots.some(root => strictInside(root, target))) fail(index, `package symlink ${relative} escapes the allowed roots`);
-      try { assertSafeAgentExtensionPathChain(target, `package symlink ${relative} target`); }
-      catch (error) { fail(index, error instanceof Error ? error.message : String(error)); }
-      entries.push([relative, "symlink", path.relative(directory, target).split(path.sep).join("/")]);
-      visit(target, relative);
-      return;
-    }
-
+    safeStats(linkStats, `package entry ${relative || "."}`, index);
     const canonical = realpath(candidate, index, `package entry ${relative || "."}`);
     if (roots && !roots.some(root => canonical === root || strictInside(root, canonical))) {
       fail(index, `package entry ${relative || "."} escapes the allowed roots`);
@@ -113,8 +93,9 @@ const hashExtensionPath = (canonical: string, roots: readonly string[] | undefin
   if (stats.isDirectory()) {
     const packageFile = path.join(canonical, "package.json");
     let packageStats: fs.Stats;
-    try { packageStats = fs.statSync(packageFile); }
+    try { packageStats = fs.lstatSync(packageFile); }
     catch { return fail(index, "directory is not a package (package.json is missing)"); }
+    safeStats(packageStats, "package.json", index);
     if (!packageStats.isFile()) fail(index, "directory is not a package (package.json is not a regular file)");
     return manifestHash(canonical, roots, index);
   }

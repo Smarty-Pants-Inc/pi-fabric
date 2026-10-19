@@ -56,8 +56,9 @@ const fixture = () => {
   const home = path.join(directory, "home"); fs.mkdirSync(home);
   const callsFile = path.join(directory, "read-token-calls");
   const writeFile = path.join(directory, "write-helper-calls");
-  const wrapper = path.join(directory, "fake token wrapper");
-  fs.writeFileSync(wrapper, `#!/bin/sh\nprintf '%s\\n' "$*" >> "$FAKE_TOKEN_CALLS"\n[ "\${FAKE_TOKEN_FAIL:-0}" = 1 ] && exit 1\nprintf '%s\\n' 'ghs_read_fixture_token_01234567890123456789'\n`, { mode: 0o700 });
+  const wrapper = process.execPath;
+  const fakeTokenScript = `const fs = require("node:fs");\nfs.appendFileSync(process.env.FAKE_TOKEN_CALLS, "token " + process.argv[2] + "\\n");\nif (process.env.FAKE_TOKEN_FAIL === "1") process.exit(1);\nprocess.stdout.write("ghs_read_fixture_token_01234567890123456789\\n");\n`;
+  fs.writeFileSync(path.join(directory, "token"), fakeTokenScript);
   const writeHelper = path.join(directory, "inherited-write-helper");
   fs.writeFileSync(writeHelper, `#!/bin/sh\nprintf '%s\\n' "$*" >> "$FAKE_WRITE_CALLS"\nprintf '%s\\n' 'username=write-helper' 'password=ghs_write_fixture_token_01234567890123456789'\n`, { mode: 0o700 });
   const globalConfig = path.join(home, ".gitconfig");
@@ -212,6 +213,7 @@ describe("task-agent read-only Git credential path", () => {
     const { proxy, requests, proxyEvents } = await localGitHub(f.directory, path.join(f.directory, "repos"), token);
     expect(f.env.GIT_CONFIG_PARAMETERS).toBeUndefined();
     const target = path.join(f.directory, "target"); fs.mkdirSync(target);
+    fs.writeFileSync(path.join(target, "token"), fs.readFileSync(path.join(f.directory, "token")));
     requireGit(["init", target], f.directory, f.env);
     const remote = "https://github.com/Smarty-Pants-Inc/fetch.git";
     const transport = ["-c", `http.proxy=${proxy}`, "-c", "http.sslVerify=false"];

@@ -16,6 +16,7 @@ import { AGENTS_ACTION_DESCRIPTORS } from "../src/providers/agents-actions.js";
 
 const roots: string[] = [];
 const managers: AgentManager[] = [];
+const supportsUidOwnership = typeof process.getuid === "function";
 const temporary = (prefix: string): string => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
   roots.push(root);
@@ -77,7 +78,7 @@ describe("host-authorized process extension paths", () => {
     expect((hostedRun.inputSchema as { properties: Record<string, unknown> }).properties.extensionPaths).toBeUndefined();
   });
 
-  it("loads only the named extension, calls its allow-listed tool, and records its digest", async () => {
+  it.skipIf(!supportsUidOwnership)("loads only the named extension, calls its allow-listed tool, and records its digest", async () => {
     const root = temporary("fabric-extension-real-");
     const extensionRoot = path.join(root, "approved");
     const extensionPath = path.join(extensionRoot, "spawn-extension-probe.mjs");
@@ -138,7 +139,45 @@ describe("host-authorized process extension paths", () => {
     expect(fs.readFileSync(defaultMarker, "utf8")).toBe("loaded");
   });
 
-  it("hashes package directories from a stable sorted manifest", () => {
+  it.skipIf(!supportsUidOwnership)("refuses a post-admission extension swap before Pi or extension code starts", async () => {
+    const root = temporary("fabric-extension-tamper-");
+    const extensionRoot = path.join(root, "approved");
+    const extensionPath = path.join(extensionRoot, "spawn-extension-probe.mjs");
+    const agentDir = path.join(root, "pi-agent");
+    const executed = path.join(root, "extension-executed.log");
+    const toolsLog = path.join(root, "extension-tools.log");
+    fs.mkdirSync(extensionRoot, { recursive: true });
+    fs.mkdirSync(agentDir, { recursive: true });
+    fs.copyFileSync(path.resolve("tests/fixtures/spawn-extension-probe.mjs"), extensionPath);
+    const admittedSha = sha256(fs.readFileSync(extensionPath));
+    for (const name of Object.keys(process.env)) if (name.startsWith("PI_FABRIC_")) vi.stubEnv(name, undefined);
+    vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
+    vi.stubEnv("PI_FABRIC_AGENT_DIR", agentDir);
+    vi.stubEnv("PI_OFFLINE", "1");
+    vi.stubEnv("HOME", root);
+    vi.stubEnv("FABRIC_EXTENSION_PROBE_EXECUTED", executed);
+    vi.stubEnv("FABRIC_EXTENSION_PROBE_TOOLS", toolsLog);
+    const manager = managerFor(root, [extensionRoot]);
+    const originalLaunch = ProcessTransport.prototype.launch;
+    vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async function (this: ProcessTransport, request) {
+      fs.appendFileSync(extensionPath, "\n// changed after host admission\n");
+      return originalLaunch.call(this, request);
+    });
+
+    const result = await manager.run({
+      ...spawnRequest([extensionPath], ["probe_echo"]),
+      model: "spawn-extension-probe/offline",
+      thinking: "off",
+    });
+
+    expect(result.status, result.error).toBe("failed");
+    expect(result.error).toMatch(/changed after admission before Pi load.*expected SHA-256/);
+    expect(result.extensionPaths).toEqual([{ path: fs.realpathSync(extensionPath), sha256: admittedSha }]);
+    expect(fs.existsSync(executed)).toBe(false);
+    expect(fs.existsSync(toolsLog)).toBe(false);
+  });
+
+  it.skipIf(!supportsUidOwnership)("hashes package directories from a stable sorted manifest", () => {
     const root = temporary("fabric-extension-manifest-");
     const packageDirectory = path.join(root, "fixture");
     fs.mkdirSync(packageDirectory);
@@ -167,7 +206,7 @@ describe("host-authorized process extension paths", () => {
     expect(validateAgentExtensionPaths([symlinkPackage], [root], root)[0]?.sha256).toMatch(/^[a-f0-9]{64}$/);
   });
 
-  it("refuses the whole spawn for invalid paths, missing tools, or absent host roots", () => {
+  it.skipIf(!supportsUidOwnership)("refuses the whole spawn for invalid paths, missing tools, or absent host roots", () => {
     const root = temporary("fabric-extension-refusal-");
     const extensionRoot = path.join(root, "approved");
     const outsideRoot = path.join(root, "outside");
@@ -198,7 +237,7 @@ describe("host-authorized process extension paths", () => {
       const uid = process.getuid();
       let calls = 0;
       const owner = vi.spyOn(process, "getuid").mockImplementation(() => ++calls === 1 ? uid : uid + 1);
-      expect(() => manager.spawn(spawnRequest([validPath], ["probe_echo"]))).toThrow(/path component .* is not owned by the current UID/);
+      expect(() => manager.spawn(spawnRequest([validPath], ["probe_echo"]))).toThrow(/not owned by root or the current UID/);
       owner.mockRestore();
     }
     expect(() => manager.spawn({ ...spawnRequest([validPath], ["probe_echo"]), runner: "claude" })).toThrow(/requires the Pi runner/);

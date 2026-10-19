@@ -4,6 +4,7 @@ import { diagnostics } from "./core/diagnostics.js";
 import { readHostPolicy, warnAgentLandlockDisabled, type HostPolicy } from "./host-policy.js";
 export { readHostPolicy } from "./host-policy.js";
 import type { ModelRoutingConfig } from "./agents/model-route.js";
+import { resolveAgentExtensionRoots } from "./agents/extension-roots.js";
 import { parsePerCallRouting } from "./agents/per-call-config.js";
 import { normalizeAgentRouterConfig, type FabricAgentRouterConfig } from "./agents/router-config.js";
 export type { FabricAgentRouterConfig } from "./agents/router-config.js";
@@ -2544,6 +2545,9 @@ const resolveFabricConfig = (
     merged.fullCodeMode = inheritedFullCodeMode === "true";
   }
   const normalized = normalizeFabricConfig(merged);
+  if (normalized.agents.extensionRoots?.length) {
+    normalized.agents.extensionRoots = resolveAgentExtensionRoots(normalized.agents.extensionRoots, options.agentDir);
+  }
   // Host-owned exceptions: no host/project config layer can supply or redirect them.
   normalized.agents.modelExceptionsPath = MODEL_EXCEPTIONS_PATH;
   if (applyEnvironmentOverrides && process.env[FABRIC_THINKING_BOUNDS_ENV] !== undefined) {

@@ -482,6 +482,11 @@ const main = async (): Promise<void> => {
   // Keep the CLI lifecycle for activation/actors and SDK task retry semantics.
   let piReleaseSdk: string | undefined;
   const explicitExtensionPaths = options.extensionPaths !== undefined;
+  let verifyExplicitExtensions: (() => void) | undefined;
+  if (explicitExtensionPaths) {
+    const verifier = await import("./agents/extension-paths.js");
+    verifyExplicitExtensions = () => verifier.verifyAgentExtensionPathReceipts(options.extensionPaths!);
+  }
   const pinnedFabricExtension = options.fabricRelease
     ? path.join(options.fabricRelease, "dist/index.js") : options.fabricExtensionPath;
   if (options.runner === "pi" && !explicitExtensionPaths && options.fabricExtensionPath && pinnedFabricExtension) {
@@ -723,7 +728,11 @@ const main = async (): Promise<void> => {
     return { PI_SESSION_ID: header.id, PI_SESSION_FILE: nativeFile };
   };
   let taskResuming = false;
-  const spawnChild = (): ChildProcess => spawnCli(piRetrySdk ? taskEntryPath : piReleaseSdk ? releaseEntryPath : childBinary,
+  const spawnChild = (): ChildProcess => {
+    // Re-hash immediately before Pi loads any extension code. The module is
+    // loaded only for explicit paths, keeping ordinary worker startup unchanged.
+    verifyExplicitExtensions?.();
+    return spawnCli(piRetrySdk ? taskEntryPath : piReleaseSdk ? releaseEntryPath : childBinary,
     piRetrySdk ? [piRetrySdk, String(recoveryScale), ...childArguments]
       : piReleaseSdk ? [piReleaseSdk, pinnedFabricExtension!, ...childArguments] : childArguments, {
     cwd: options.cwd,
@@ -801,7 +810,8 @@ const main = async (): Promise<void> => {
       PI_FABRIC_EXTENSION_MODEL: undefined,
     },
     stdio: piRetrySdk ? ["pipe", "pipe", "pipe", "ipc"] : ["pipe", "pipe", "pipe"],
-  });
+    });
+  };
   // Every provider resume is a new execution obligation. Drain each attempt
   // before replacement, but retain the worker's custody until the whole run ends.
   let finishingStartedAt: number | undefined;

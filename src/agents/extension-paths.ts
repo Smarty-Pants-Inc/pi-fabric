@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { AgentInputError } from "../host-compatibility.js";
 import type { AgentExtensionPathReceipt } from "./types.js";
+import { assertSafeAgentExtensionPathChain, resolveAgentExtensionRoots } from "./extension-roots.js";
 
 const MAX_AGENT_EXTENSION_PATHS = 4;
 const MAX_MANIFEST_ENTRIES = 10_000;
@@ -25,25 +26,12 @@ const safeOwner = (stats: fs.Stats, label: string, index: number | undefined): v
   const uid = process.getuid?.();
   if (uid === undefined) fail(index, "the host cannot verify file ownership");
   if (stats.uid !== uid) fail(index, `${label} is not owned by the current UID`);
-}
+};
 
 const safeStats = (stats: fs.Stats, label: string, index: number | undefined): void => {
   safeOwner(stats, label, index);
   if ((stats.mode & WRITE_BY_OTHERS) !== 0) fail(index, `${label} is group- or world-writable`);
-}
-
-const safePathChain = (root: string, target: string, index: number | undefined): void => {
-  let current = target;
-  for (;;) {
-    safeStats(statPath(current, index, `path component ${current}`), `path component ${current}`, index);
-    if (current === root) return;
-    const parent = path.dirname(current);
-    if (parent === current || (!strictInside(root, parent) && parent !== root)) {
-      fail(index, "path escaped its configured root while checking ownership");
-    }
-    current = parent;
-  }
-}
+};
 
 const digest = (bytes: Buffer | string): string => createHash("sha256").update(bytes).digest("hex");
 
@@ -57,7 +45,7 @@ const statPath = (candidate: string, index: number | undefined, label: string): 
   catch (error) { return fail(index, `${label} cannot be inspected (${error instanceof Error ? error.message : String(error)})`); }
 };
 
-const manifestHash = (directory: string, roots: readonly string[], index: number): string => {
+const manifestHash = (directory: string, roots: readonly string[] | undefined, index: number): string => {
   const entries: Array<[string, string, string?]> = [];
   let byteCount = 0;
   const activeDirectories = new Set<string>();
@@ -72,14 +60,16 @@ const manifestHash = (directory: string, roots: readonly string[], index: number
       // its protected parent directory and the real target carry the policy.
       safeOwner(linkStats, `package symlink ${relative}`, index);
       const target = realpath(candidate, index, `package symlink ${relative}`);
-      if (!roots.some(root => strictInside(root, target))) fail(index, `package symlink ${relative} escapes the allowed roots`);
+      if (roots && !roots.some(root => strictInside(root, target))) fail(index, `package symlink ${relative} escapes the allowed roots`);
+      try { assertSafeAgentExtensionPathChain(target, `package symlink ${relative} target`); }
+      catch (error) { fail(index, error instanceof Error ? error.message : String(error)); }
       entries.push([relative, "symlink", path.relative(directory, target).split(path.sep).join("/")]);
       visit(target, relative);
       return;
     }
 
     const canonical = realpath(candidate, index, `package entry ${relative || "."}`);
-    if (!roots.some(root => canonical === root || strictInside(root, canonical))) {
+    if (roots && !roots.some(root => canonical === root || strictInside(root, canonical))) {
       fail(index, `package entry ${relative || "."} escapes the allowed roots`);
     }
     const stats = statPath(canonical, index, `package entry ${relative || "."}`);
@@ -109,6 +99,27 @@ const manifestHash = (directory: string, roots: readonly string[], index: number
   return digest(JSON.stringify(entries));
 };
 
+const hashExtensionPath = (canonical: string, roots: readonly string[] | undefined, index: number): string => {
+  const stats = statPath(canonical, index, "path");
+  safeStats(stats, "path", index);
+  if (stats.isFile()) {
+    if (stats.size > MAX_MANIFEST_BYTES) fail(index, `extension file exceeds ${MAX_MANIFEST_BYTES} bytes`);
+    let bytes: Buffer;
+    try { bytes = fs.readFileSync(canonical); }
+    catch (error) { return fail(index, `file cannot be read (${error instanceof Error ? error.message : String(error)})`); }
+    return digest(bytes);
+  }
+  if (stats.isDirectory()) {
+    const packageFile = path.join(canonical, "package.json");
+    let packageStats: fs.Stats;
+    try { packageStats = fs.statSync(packageFile); }
+    catch { return fail(index, "directory is not a package (package.json is missing)"); }
+    if (!packageStats.isFile()) fail(index, "directory is not a package (package.json is not a regular file)");
+    return manifestHash(canonical, roots, index);
+  }
+  return fail(index, "path must resolve to a regular file or package directory");
+};
+
 /** Resolve, authorize, and hash extension paths on the owning host before admission. */
 export const validateAgentExtensionPaths = (
   value: unknown,
@@ -119,57 +130,43 @@ export const validateAgentExtensionPaths = (
   if (value.length > MAX_AGENT_EXTENSION_PATHS || value.some(entry => typeof entry !== "string" || !entry.trim() || entry.length > 4096 || /[\u0000-\u001f\u007f]/u.test(entry))) {
     return fail(undefined, `expected at most ${MAX_AGENT_EXTENSION_PATHS} non-empty paths`);
   }
-  const requestedPaths = value as string[];
   if (!configuredRoots?.length) return fail(undefined, "agents.extensionRoots is empty or unset");
-  const roots = configuredRoots.map((configured, index) => {
-    if (typeof configured !== "string" || !configured.trim() || hasParentSegment(configured)) {
-      return fail(undefined, `agents.extensionRoots[${index}] must be a path without '..'`);
-    }
-    const lexical = path.resolve(cwd, configured);
-    const canonical = realpath(lexical, undefined, `agents.extensionRoots[${index}]`);
-    const stats = statPath(canonical, undefined, `agents.extensionRoots[${index}]`);
-    if (!stats.isDirectory()) fail(undefined, `agents.extensionRoots[${index}] is not a directory`);
-    safeStats(stats, `agents.extensionRoots[${index}]`, undefined);
-    return { lexical, canonical };
-  });
-  const realRoots = [...new Set(roots.map(root => root.canonical))];
+  let realRoots: string[];
+  try { realRoots = resolveAgentExtensionRoots(configuredRoots, cwd); }
+  catch (error) { return fail(undefined, error instanceof Error ? error.message : String(error)); }
+  if (realRoots.length === 0) fail(undefined, "agents.extensionRoots is empty or unset");
+
   const receipts: AgentExtensionPathReceipt[] = [];
   const seen = new Set<string>();
-
-  for (const [index, requested] of requestedPaths.entries()) {
+  for (const [index, requested] of (value as string[]).entries()) {
     if (hasParentSegment(requested)) fail(index, "'..' path segments are not allowed");
     const lexical = path.resolve(cwd, requested);
-    const configuredRoot = roots.find(root => strictInside(root.lexical, lexical));
-    if (!configuredRoot) fail(index, "path is not strictly inside a configured extension root");
+    if (!realRoots.some(root => strictInside(root, lexical))) fail(index, "path is not strictly inside a configured extension root");
     const canonical = realpath(lexical, index, "path");
     if (!realRoots.some(root => strictInside(root, canonical))) {
       fail(index, "path is not strictly inside a realpath'd extension root (symlink escape refused)");
     }
     if (seen.has(canonical)) fail(index, "duplicate extension path");
     seen.add(canonical);
-    const stats = statPath(canonical, index, "path");
-    const containingRoot = realRoots.find(root => strictInside(root, canonical));
-    if (!containingRoot) return fail(index, "path is not inside a realpath'd extension root");
-    safePathChain(containingRoot, canonical, index);
-    safeStats(stats, "path", index);
-    let sha256: string;
-    if (stats.isFile()) {
-      if (stats.size > MAX_MANIFEST_BYTES) fail(index, `extension file exceeds ${MAX_MANIFEST_BYTES} bytes`);
-      let bytes: Buffer;
-      try { bytes = fs.readFileSync(canonical); }
-      catch (error) { return fail(index, `file cannot be read (${error instanceof Error ? error.message : String(error)})`); }
-      sha256 = digest(bytes);
-    } else if (stats.isDirectory()) {
-      const packageFile = path.join(canonical, "package.json");
-      let packageStats: fs.Stats;
-      try { packageStats = fs.statSync(packageFile); }
-      catch { return fail(index, "directory is not a package (package.json is missing)"); }
-      if (!packageStats.isFile()) fail(index, "directory is not a package (package.json is not a regular file)");
-      sha256 = manifestHash(canonical, realRoots, index);
-    } else {
-      return fail(index, "path must resolve to a regular file or package directory");
-    }
-    receipts.push({ path: canonical, sha256 });
+    try {
+      assertSafeAgentExtensionPathChain(lexical, `path component ${lexical}`);
+      assertSafeAgentExtensionPathChain(canonical, `path component ${canonical}`);
+    } catch (error) { fail(index, error instanceof Error ? error.message : String(error)); }
+    receipts.push({ path: canonical, sha256: hashExtensionPath(canonical, realRoots, index) });
   }
   return receipts;
+};
+
+/** Re-hash the admitted bytes in the worker immediately before starting Pi. */
+export const verifyAgentExtensionPathReceipts = (receipts: readonly AgentExtensionPathReceipt[]): void => {
+  for (const [index, receipt] of receipts.entries()) {
+    const canonical = realpath(receipt.path, index, "admitted extension path");
+    if (canonical !== receipt.path) fail(index, "path no longer resolves to its admitted canonical path");
+    try { assertSafeAgentExtensionPathChain(canonical, `admitted path component ${canonical}`); }
+    catch (error) { fail(index, error instanceof Error ? error.message : String(error)); }
+    const actual = hashExtensionPath(canonical, undefined, index);
+    if (actual !== receipt.sha256) {
+      throw new Error(`Explicit extension changed after admission before Pi load: ${canonical} (expected SHA-256 ${receipt.sha256}, got ${actual}); refusing to start Pi`);
+    }
+  }
 };

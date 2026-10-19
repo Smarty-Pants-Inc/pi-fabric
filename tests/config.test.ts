@@ -20,6 +20,7 @@ import { modelExceptionGrant } from "./helpers/model-exceptions.js";
 
 const temporaryDirectories: string[] = [];
 const originalCompactionEngineEnv = process.env.PI_FABRIC_COMPACTION_ENGINE;
+const supportsUidOwnership = typeof process.getuid === "function";
 
 const temporaryDirectory = (): string => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-config-"));
@@ -178,16 +179,40 @@ describe("host-only actor instruction and extension roots", () => {
     expect(normalizeFabricConfig({}).agents.extensionRoots).toBeUndefined();
     expect(normalizeFabricConfig({ agents: { extensionRoots: [" /host/extensions "] } }).agents.extensionRoots).toEqual(["/host/extensions"]);
   });
-  it.each([true, false])("cannot be widened by workspace config (trusted: %s)", projectTrusted => {
+  it.skipIf(!supportsUidOwnership).each([true, false])("cannot be widened by workspace config (trusted: %s)", projectTrusted => {
     const cwd = temporaryDirectory(); const agentDir = temporaryDirectory();
+    const hostExtensions = path.join(agentDir, "approved-extensions");
+    fs.mkdirSync(hostExtensions);
     fs.mkdirSync(path.join(cwd, ".pi"));
-    fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ agents: { instructionsRoot: "/host/factory", extensionRoots: ["/host/extensions"] } }));
+    fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ agents: { instructionsRoot: "/host/factory", extensionRoots: [hostExtensions] } }));
     fs.writeFileSync(path.join(cwd, ".pi", "fabric.json"), JSON.stringify({ agents: { instructionsRoot: "/", extensionRoots: ["/"] } }));
     expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.instructionsRoot).toBe("/host/factory");
-    expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.extensionRoots).toEqual(["/host/extensions"]);
+    expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.extensionRoots).toEqual([fs.realpathSync(hostExtensions)]);
     fs.unlinkSync(path.join(agentDir, "fabric.json"));
     expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.instructionsRoot).toBeUndefined();
     expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.extensionRoots).toBeUndefined();
+  });
+  it.skipIf(!supportsUidOwnership)("rejects an extension root beneath a group-writable parent at config load", () => {
+    const cwd = temporaryDirectory(); const agentDir = temporaryDirectory();
+    const unsafeParent = path.join(cwd, "group-writable-parent");
+    const extensionRoot = path.join(unsafeParent, "extensions");
+    fs.mkdirSync(extensionRoot, { recursive: true, mode: 0o700 });
+    fs.chmodSync(unsafeParent, 0o777);
+    fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ agents: { extensionRoots: [extensionRoot] } }));
+    expect(() => loadFabricConfig({ cwd, agentDir, projectTrusted: false }))
+      .toThrow(/Invalid agents\.extensionRoots\[0\].*group-writable-parent.*group- or world-writable/);
+  });
+  it.skipIf(!supportsUidOwnership)("rejects an extension root reached through a symlinked parent at config load", () => {
+    const cwd = temporaryDirectory(); const agentDir = temporaryDirectory();
+    const realParent = path.join(cwd, "real-parent");
+    const extensionRoot = path.join(realParent, "extensions");
+    const symlinkParent = path.join(cwd, "symlink-parent");
+    fs.mkdirSync(extensionRoot, { recursive: true });
+    fs.symlinkSync(realParent, symlinkParent, "dir");
+    const configuredRoot = path.join(symlinkParent, "extensions");
+    fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ agents: { extensionRoots: [configuredRoot] } }));
+    expect(() => loadFabricConfig({ cwd, agentDir, projectTrusted: false }))
+      .toThrow(/Invalid agents\.extensionRoots\[0\].*symlink/);
   });
 });
 describe("host-only processSlice (#4383)", () => {

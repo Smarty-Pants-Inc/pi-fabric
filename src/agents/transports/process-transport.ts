@@ -290,7 +290,11 @@ export class ProcessTransport implements AgentTransportAdapter {
     if (placement) {
       const preflightDeadline = Date.now() + Math.min(placement.commandTimeoutMs, 5_000);
       const capabilities = normalizeAgentCapabilityTokens(placement.capabilities, "agents.placement.capabilities")!;
-      const unmet = (needs ?? []).filter(need => !(need === "corpus" && placement.corpusRemote) && !capabilities.includes(need));
+      const corpusRemoteEligible = placement.corpusRemote && (needs ?? []).includes("corpus")
+        ? (await import("./placement.js")).corpusRemotePreflightEligible(placement, request.cwd)
+        : false;
+      const unmet = (needs ?? []).filter(need => need === "corpus" && placement.corpusRemote
+        ? !corpusRemoteEligible : !capabilities.includes(need));
       let reason = request.needs?.includes("local") ? "reserved need: local pins to the Main host"
         : placement.default === "local" ? "placement default is local"
         : unmet.length ? `unmet needs: ${unmet.join(", ")}` : request.placementLocalReason;

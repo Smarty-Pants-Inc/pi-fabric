@@ -297,7 +297,7 @@ describe("host process task placement", () => {
     expect(events).toContain('"needs":["corpus"]');
     expect(fs.existsSync(f.results)).toBe(false);
   });
-  it("treats corpus as audit metadata while preserving local and unmet github placement when host opt-in is enabled", async () => {
+  it("keeps corpus local for a custom launcher even when corpusRemote is enabled", async () => {
     const f=fixture();
     f.config.placement.corpusRemote=true;
     const task="same process task";
@@ -306,15 +306,28 @@ describe("host process task placement", () => {
     const github=await f.manager.run({task,transport:"process",needs:["github"]});
     const placementEvents = (id: string) => fs.readFileSync(path.join(f.manager.runDirectory(id)!,"events.jsonl"),"utf8").trim().split("\n").map(line=>JSON.parse(line)).filter(line=>line.type.startsWith("placement."));
 
-    expect(corpus).toMatchObject({status:"completed",text:`REMOTE: ${task}`});
-    expect(placementEvents(corpus.id)).toEqual([
-      expect.objectContaining({type:"placement.remote",needs:["corpus"]}),
-      expect.objectContaining({type:"placement.result"}),
-    ]);
+    expect(corpus).toMatchObject({status:"completed",text:"LOCAL"});
+    expect(placementEvents(corpus.id)).toEqual([expect.objectContaining({type:"placement.local",reason:"unmet needs: corpus",needs:["corpus"]})]);
     expect(local).toMatchObject({status:"completed",text:"LOCAL"});
     expect(placementEvents(local.id)).toEqual([expect.objectContaining({type:"placement.local",reason:"reserved need: local pins to the Main host",needs:["local"]})]);
     expect(github).toMatchObject({status:"completed",text:"LOCAL"});
     expect(placementEvents(github.id)).toEqual([expect.objectContaining({type:"placement.local",reason:"unmet needs: github",needs:["github"]})]);
+    expect(fs.existsSync(f.results)).toBe(false);
+  });
+  it.each(["prompt", "requires"] as const)("keeps a corpus path in %s local for a custom launcher with corpusRemote enabled", async location => {
+    const f=fixture();
+    f.config.placement.corpusRemote=true;
+    const corpusPath=path.join(f.root,"private-corpus","secret.txt");
+    fs.mkdirSync(path.dirname(corpusPath),{recursive:true});
+    fs.writeFileSync(corpusPath,"private corpus fixture");
+    const task=location === "prompt" ? `Inspect ${corpusPath}` : "Inspect supplied input";
+    const result=await f.manager.run({task,transport:"process",needs:["corpus"],...(location === "requires" ? {requires:[corpusPath]} : {})});
+    const events=fs.readFileSync(path.join(f.manager.runDirectory(result.id)!,"events.jsonl"),"utf8");
+
+    expect(result).toMatchObject({status:"completed",text:"LOCAL"});
+    expect(events).toContain('"type":"placement.local"');
+    expect(events).toContain('"reason":"unmet needs: corpus"');
+    expect(fs.existsSync(f.results)).toBe(false);
   });
   it.each(["github-write","mac","ryzen1-service","unknown"])("keeps unmet %s local with exactly one audit line", async need => {
     const f=fixture(); const h=await f.manager.spawn({task:"x",transport:"process",needs:[need]});

@@ -127,6 +127,13 @@ const fleetRoot = (config: AgentPlacementConfig, cwd: string): string | undefine
     ? path.join(os.homedir(), ".local", "share", "smarty-dev", "factory", "current") : path.dirname(bin);
 };
 
+/** Corpus is placement-neutral only when this request can use the trusted fleet admission helper. */
+export const corpusRemotePreflightEligible = (config: AgentPlacementConfig, cwd: string): boolean => {
+  if (!config.corpusRemote) return false;
+  try { return fleetRoot(config, cwd) !== undefined; }
+  catch { return false; }
+};
+
 const hostSlot = (command: readonly string[]): number | undefined => {
   const end = command.indexOf("--") < 0 ? command.length : command.indexOf("--");
   const slots = command.slice(1, end).flatMap((entry, index) => entry === "--host" ? [index + 1] : []);
@@ -171,6 +178,7 @@ export const preflightFleetPlacement = async (request: AgentTransportLaunch, con
   let host = selectedHost ?? "auto";
   try {
     const root = fleetRoot(config, request.cwd);
+    const corpusRemoteEligible = corpusRemotePreflightEligible(config, request.cwd);
     if (!root && !config.pickerCommand) return undefined;
     const deadline = Math.min(preflightDeadline ?? Infinity, Date.now() + Math.min(config.commandTimeoutMs, 5_000));
     if (!selectedHost) {
@@ -197,7 +205,7 @@ export const preflightFleetPlacement = async (request: AgentTransportLaunch, con
       const source = path.join(root, "setup/factory/task-preflight.py");
       // Only the host opt-in makes corpus placement-neutral. The helper still derives
       // corpus isolation from task and required paths in either mode.
-      const admitted = await query("python3", ["-I", source, "--admit", "--root", project, String(requires.length), ...requires, "0", ...(request.needs ?? []).filter(need => need === "github" || (need === "corpus" && !config.corpusRemote))], deadline, environment, request.signal, task);
+      const admitted = await query("python3", ["-I", source, "--admit", "--root", project, String(requires.length), ...requires, "0", ...(request.needs ?? []).filter(need => need === "github" || (need === "corpus" && !corpusRemoteEligible))], deadline, environment, request.signal, task);
       const fields = admitted.stdout.split("\0");
       if (fields.at(-1) === "") fields.pop();
       const guards = Number(fields[3]);

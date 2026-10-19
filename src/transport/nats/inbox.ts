@@ -39,6 +39,7 @@ const DEFAULT_MAX_BYTES = 1_073_741_824;
 const DEFAULT_MAX_MESSAGE_BYTES = 1_048_576;
 const DEFAULT_DUPLICATE_WINDOW_MS = 10 * 60 * 1_000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 5_000;
+const DEFAULT_EPHEMERAL_INACTIVE_SECONDS = 3_600;
 const utf8 = new TextEncoder();
 const validMessageId = (id: string): boolean => id.length > 0 && id === id.trim() && !/[\u0000-\u001f\u007f]/.test(id);
 
@@ -57,11 +58,15 @@ export interface NatsTransportOptions extends NatsPermissionPolicy {
   readonly duplicateWindowMs?: number;
   readonly requestTimeoutMs?: number;
   readonly provision?: boolean;
+  /** Host-only opt-in to expiring this host's own inbox durable. */
+  readonly ephemeralHost?: boolean;
+  /** Idle expiration in seconds when ephemeralHost is enabled (300..86400). */
+  readonly ephemeralInactiveSeconds?: number;
   readonly signal?: AbortSignal;
 }
 
 type OpenOptions = NatsTransportOptions | FabricTransportOptions;
-type ResolvedNatsOptions = Required<Pick<NatsTransportOptions, "servers" | "machine" | "hostId" | "credentials" | "custodyStream" | "livenessStream" | "pathBMachines" | "maxBytes" | "maxMessageBytes" | "duplicateWindowMs" | "requestTimeoutMs" | "provision">> & {
+type ResolvedNatsOptions = Required<Pick<NatsTransportOptions, "servers" | "machine" | "hostId" | "credentials" | "custodyStream" | "livenessStream" | "pathBMachines" | "maxBytes" | "maxMessageBytes" | "duplicateWindowMs" | "requestTimeoutMs" | "provision" | "ephemeralHost" | "ephemeralInactiveSeconds">> & {
   readonly name?: string;
   readonly tls?: TlsOptions;
   readonly signal?: AbortSignal;
@@ -94,12 +99,15 @@ const normalizeOptions = (options: OpenOptions): ResolvedNatsOptions => {
       duplicateWindowMs: options.duplicateWindowMs ?? DEFAULT_DUPLICATE_WINDOW_MS,
       requestTimeoutMs: options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
       provision: options.provision ?? false,
+      ephemeralHost: options.ephemeralHost ?? false,
+      ephemeralInactiveSeconds: options.ephemeralInactiveSeconds ?? DEFAULT_EPHEMERAL_INACTIVE_SECONDS,
       ...(options.signal === undefined ? {} : { signal: options.signal }),
     } as ResolvedNatsOptions;
   }
   const config = options.config as unknown as { nats?: {
     servers?: string | readonly string[]; machine?: string; credentials?: string;
     custodyStream?: string; livenessStream?: string; pathBMachines?: readonly string[]; tls?: TlsOptions;
+    ephemeralHost?: boolean; ephemeralInactiveSeconds?: number;
   } };
   const nats = config.nats;
   // Production config never enables plaintext; the loopback opt-in is a direct test option only.
@@ -126,6 +134,8 @@ const normalizeOptions = (options: OpenOptions): ResolvedNatsOptions => {
     duplicateWindowMs: DEFAULT_DUPLICATE_WINDOW_MS,
     requestTimeoutMs: 5_000,
     provision: false,
+    ephemeralHost: nats?.ephemeralHost ?? false,
+    ephemeralInactiveSeconds: nats?.ephemeralInactiveSeconds ?? DEFAULT_EPHEMERAL_INACTIVE_SECONDS,
     ...(options.signal === undefined ? {} : { signal: options.signal }),
   } as ResolvedNatsOptions;
 };
@@ -210,6 +220,7 @@ const openNatsSession = async (options: ResolvedNatsOptions, signal?: AbortSigna
       filterSubject: transportInboxFilter(options.machine, options.hostId),
       description,
       maxAckPending: 128,
+      ...(options.ephemeralHost ? { inactiveThresholdNs: options.ephemeralInactiveSeconds * 1_000_000_000 } : {}),
     });
     assertAlive();
     if (consumer.config.description !== description) throw new TransportInvalidError("transport inbox owner description mismatch");
@@ -356,8 +367,12 @@ class NatsTransportImpl implements FabricTransport {
     const options = normalizeOptions(rawOptions);
     if (!options.hostId) throw new Error("hostId is required");
     for (const [key, value] of Object.entries(options)) {
-      if (["servers", "machine", "hostId", "name", "credentials"].includes(key)) continue;
+      if (["servers", "machine", "hostId", "name", "credentials", "ephemeralHost"].includes(key)) continue;
       if (typeof value === "number" && (!Number.isSafeInteger(value) || value <= 0)) throw new Error(`${key} must be positive`);
+    }
+    if (typeof options.ephemeralHost !== "boolean") throw new Error("ephemeralHost must be a boolean");
+    if (!Number.isSafeInteger(options.ephemeralInactiveSeconds) || options.ephemeralInactiveSeconds < 300 || options.ephemeralInactiveSeconds > 86_400) {
+      throw new Error("ephemeralInactiveSeconds must be an integer from 300 through 86400");
     }
     const transport = new NatsTransportImpl(await openNatsSession(options, options.signal), options);
     // Cover an abort between acquisition and owner-listener registration.
@@ -642,8 +657,16 @@ class NatsTransportImpl implements FabricTransport {
     session?.unsubscribe?.();
     const reconnect = this.#reconnectTask;
     this.#closeTask = (async () => {
-      try { if (session) await session.connection.close(); }
-      finally { if (reconnect) await reconnect; }
+      try {
+        if (session) {
+          if (this.#options.ephemeralHost) {
+            try {
+              void session.manager.consumers.delete(this.#stream, transportDurableName(this.self.hostId)).catch(() => undefined);
+            } catch { /* best-effort cleanup must not block shutdown */ }
+          }
+          await session.connection.close();
+        }
+      } finally { if (reconnect) await reconnect; }
     })();
     return this.#closeTask;
   }

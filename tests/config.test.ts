@@ -196,6 +196,25 @@ describe("host-only actor instruction and extension pins", () => {
     expect(() => normalizeFabricConfig({ agents: { extensionPins: [{ ...pin, sha256: "invalid" }] } })).toThrow(/extensionPins\[0\]\.sha256/);
     expect(() => normalizeFabricConfig({ agents: { extensionPins: [pin, pin] } })).toThrow(/duplicate id/);
   });
+  it("fails config loading rather than dropping malformed roots or pins", () => {
+    const cwd = temporaryDirectory(); const agentDir = temporaryDirectory();
+    const configPath = path.join(agentDir, "fabric.json");
+    for (const extensionRoots of [["/opt/pi/extensions", " "], ["/opt/pi/extensions", 42], "/opt/pi/extensions"] as unknown[]) {
+      fs.writeFileSync(configPath, JSON.stringify({ agents: { extensionRoots } }));
+      expect(() => loadFabricConfig({ cwd, agentDir, projectTrusted: false }))
+        .toThrow(/Invalid agents\.extensionRoots: expected an array of non-empty path strings/);
+    }
+    for (const extensionPins of [[null], [{ id: "probe", path: "/host/probe.mjs", sha256: "invalid" }], "not-an-array"] as unknown[]) {
+      fs.writeFileSync(configPath, JSON.stringify({ agents: { extensionPins } }));
+      expect(() => loadFabricConfig({ cwd, agentDir, projectTrusted: false })).toThrow(/Invalid agents\.extensionPins/);
+    }
+    const validRoot = path.join(agentDir, "valid-root");
+    fs.mkdirSync(validRoot);
+    fs.writeFileSync(configPath, JSON.stringify({ agents: { extensionRoots: [` ${validRoot} `] } }));
+    expect(loadFabricConfig({ cwd, agentDir, projectTrusted: false }).agents.extensionRoots).toEqual([fs.realpathSync(validRoot)]);
+    fs.writeFileSync(configPath, JSON.stringify({ agents: {} }));
+    expect(loadFabricConfig({ cwd, agentDir, projectTrusted: false }).agents.extensionRoots).toBeUndefined();
+  });
   it.skipIf(!supportsUidOwnership).each([true, false])("cannot be widened by workspace config (trusted: %s)", projectTrusted => {
     const cwd = temporaryDirectory(); const agentDir = temporaryDirectory();
     const hostExtensions = path.join(agentDir, "approved-extensions");

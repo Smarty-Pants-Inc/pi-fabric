@@ -1282,6 +1282,14 @@ const boundedFloat = (value: unknown, fallback: number, min: number, max: number
 const stringValue = (value: unknown): string | undefined =>
   typeof value === "string" && value.trim() ? value : undefined;
 
+const extensionRootsValue = (value: unknown): string[] | undefined => {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.some(root => typeof root !== "string" || !root.trim())) {
+    throw new Error("Invalid agents.extensionRoots: expected an array of non-empty path strings");
+  }
+  return value.map(root => (root as string).trim());
+};
+
 const extensionPinsValue = (value: unknown): FabricAgentExtensionPin[] | undefined => {
   if (value === undefined) return undefined;
   if (!Array.isArray(value) || value.length > 128) throw new Error("Invalid agents.extensionPins: expected at most 128 pin entries");
@@ -1494,6 +1502,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
   const mcpJev = objectValue(mcp.jev);
   const prewalk = objectValue(input.prewalk);
   const agents = objectValue(input.agents);
+  const extensionRoots = extensionRootsValue(agents.extensionRoots);
   const extensionPins = extensionPinsValue(agents.extensionPins);
   const placement = normalizeAgentPlacement(agents.placement);
   const claude = objectValue(agents.claude);
@@ -1938,8 +1947,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
       deadRootFilter: normalizeDeadRootFilterConfig(agents.deadRootFilter),
       stuckPreparingMs: boundedInteger(agents.stuckPreparingMs, DEFAULT_FABRIC_CONFIG.agents.stuckPreparingMs, 1_000, 7 * 24 * 60 * 60_000),
       ...(stringValue(agents.instructionsRoot)?.trim() ? { instructionsRoot: stringValue(agents.instructionsRoot)!.trim() } : {}),
-      ...(Array.isArray(agents.extensionRoots) && agents.extensionRoots.every(root => typeof root === "string" && root.trim())
-        ? { extensionRoots: agents.extensionRoots.map(root => (root as string).trim()) } : {}),
+      ...(extensionRoots !== undefined ? { extensionRoots } : {}),
       ...(extensionPins !== undefined ? { extensionPins } : {}),
       ...(wakeText ? { wakeText } : {}),
       modelAdmission: modelAdmissionValue(

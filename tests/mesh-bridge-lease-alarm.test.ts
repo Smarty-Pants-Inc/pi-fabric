@@ -1,7 +1,6 @@
 // Linux process/boot trust boundary; existing hosted-only guards remain untouched.
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
-import { once } from "node:events";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -52,13 +51,33 @@ function messages(child: ChildProcess) {
     });
   }};
 }
+const childAlive = (child: ChildProcess): boolean => child.exitCode === null && child.signalCode === null;
+async function sendChildMessage(child: ChildProcess, message: Record<string, unknown>): Promise<void> {
+  if (!childAlive(child) || !child.connected) return;
+  await new Promise<void>((resolve, reject) => {
+    child.send(message, error => {
+      if (!error || ((error as NodeJS.ErrnoException).code === "EPIPE" && !childAlive(child))) resolve();
+      else reject(error);
+    });
+  });
+}
+function waitForExit(child: ChildProcess): Promise<void> {
+  if (!childAlive(child)) return Promise.resolve();
+  return new Promise(resolve => {
+    const onExit = () => { child.off("exit", onExit); resolve(); };
+    child.once("exit", onExit);
+    if (!childAlive(child)) onExit();
+  });
+}
 async function terminate(child: ChildProcess) {
-  if (child.exitCode !== null || child.signalCode !== null) return;
+  if (!childAlive(child)) return;
   if (process.platform === "linux") child.kill("SIGCONT");
-  const exited = once(child, "exit");
-  if (child.connected) child.send({ op: "shutdown" });
+  const exited = waitForExit(child);
+  let sendError: unknown;
+  try { await sendChildMessage(child, { op: "shutdown" }); } catch (error) { sendError = error; }
   const timer = setTimeout(() => child.kill("SIGKILL"), 2_000);
   try { await exited; } finally { clearTimeout(timer); }
+  if (sendError) throw sendError;
 }
 async function fixture(populated: boolean, watchdog: Record<string, unknown> = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-lease-process-"));
@@ -176,16 +195,32 @@ async function fixture(populated: boolean, watchdog: Record<string, unknown> = {
   const agent = launch("agent", farRoot), agentMessages = messages(agent);
   const bridge = launch("bridge", hubRoot), bridgeMessages = messages(bridge);
   let stderr = "";
-  for (const child of [bridge, agent]) child.stderr!.on("data", bytes => { stderr += String(bytes); });
+  const transportErrors: string[] = [];
+  for (const [name, child] of [["bridge", bridge], ["agent", agent]] as const) {
+    child.stderr!.on("data", bytes => {
+      // The local deletion guard announces its hosted-only report mode in every child; it is not product stderr.
+      stderr += String(bytes).replace(/^hosted-only \(outside-temp deletion reporting\): push and let CI run it\r?\n/gm, "");
+    });
+    child.stdin!.on("error", error => { transportErrors.push(`${name}.stdin: ${error.message}`); });
+    child.stdout!.on("error", error => { transportErrors.push(`${name}.stdout: ${error.message}`); });
+  }
   bridge.stdout!.pipe(agent.stdin!); agent.stdout!.pipe(bridge.stdin!);
-  bridge.stdin!.on("error", () => {}); agent.stdin!.on("error", () => {});
   const mesh = new MeshStore(hubRoot, 64 * 1024, 100);
   const farMesh = new MeshStore(farRoot, 64 * 1024, 100);
   cleanup.push(async () => {
-    if (process.platform === "linux") agent.kill("SIGCONT");
-    if (agent.connected) agent.send({ op: "resume" });
-    await terminate(bridge); await terminate(agent); mesh.closeState(); farMesh.closeState();
-    fs.rmSync(root, { recursive: true, force: true }); // only this fixture's temp, after owned handles join
+    const failures: unknown[] = [];
+    try {
+      if (childAlive(agent)) {
+        if (process.platform === "linux") agent.kill("SIGCONT");
+        await sendChildMessage(agent, { op: "resume" });
+      }
+    } catch (error) { failures.push(error); }
+    try { await terminate(bridge); } catch (error) { failures.push(error); }
+    try { await terminate(agent); } catch (error) { failures.push(error); }
+    if (transportErrors.length) failures.push(new Error(`bridge fixture transport errors: ${transportErrors.join("; ")}`));
+    mesh.closeState(); farMesh.closeState();
+    fs.rmSync(root, { recursive: true, force: true }); // only this fixture's temp, after both child exits
+    if (failures.length) throw new AggregateError(failures, "bridge fixture cleanup failed");
   });
   await Promise.all([agentMessages.wait("ready"), bridgeMessages.wait("ready")]);
   const lease = () => readHostLease(hubRoot, remoteId);
@@ -194,7 +229,7 @@ async function fixture(populated: boolean, watchdog: Record<string, unknown> = {
   const alarms = () => mesh.read({ topic: "ops.owner", after: 0, limit: 100 }).filter(event => event.kind.startsWith("bridge.lease."));
   const stallAlarms = () => mesh.read({ topic: BRIDGE_STALL_ALARM_TOPIC, after: 0, limit: 100 });
   const healthy = () => {
-    expect(stderr).toBe(""); expect(bridge.exitCode).toBeNull(); expect(agent.exitCode).toBeNull();
+    expect(stderr).toBe(""); expect(transportErrors).toEqual([]); expect(bridge.exitCode).toBeNull(); expect(agent.exitCode).toBeNull();
     expect([...bridgeMessages.receipts, ...agentMessages.receipts].filter(item => item.kind === "failure" || item.kind === "ended")).toEqual([]);
   };
   return { root, hubRoot, farRoot, mesh, farMesh, bridge, agent, bridgeMessages, agentMessages, lease, sample, sweep,

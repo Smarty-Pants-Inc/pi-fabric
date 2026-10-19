@@ -194,8 +194,16 @@ describe("round-1 admission invariance", () => {
       expect(Buffer.byteLength(JSON.stringify(items[1]!.deliveryId))).toBe(deliveryIdBytes);
 
       // Only 16 bytes remain: another report genuinely cannot fit; do not retry it.
-      await expect(provider.invoke("followUp", { id: after.main.id, message: text }, invocation(session())))
-        .rejects.toThrow(/^Main's followUp queue is full \([^\n]*\); Main is busy and reads followUps only at its next tool boundary\. Wait, or send a short steer\.$/);
+      const request = vi.spyOn(sender, "request");
+      const failure = await provider.invoke("followUp", { id: after.main.id, message: text }, invocation(session()))
+        .catch(error => error);
+      expect(failure).toBeInstanceOf(Error);
+      expect(failure).toMatchObject({ rejection: "FABRIC_CONTROL_REJECTED", notRun: false });
+      expect(failure).not.toHaveProperty("code", "FABRIC_DELIVERY_UNCONFIRMED");
+      expect((failure as Error).message).toMatch(/^Main's followUp queue is full \([^\n]*\); Main is busy and reads followUps only at its next tool boundary\. Wait, or send a short steer\.$/);
+      expect(request).toHaveBeenCalledOnce();
+      expect(failure).toBe(await request.mock.results[0]!.value.catch((error: unknown) => error));
+      request.mockRestore();
       expect(after.main.queueDepth().pendingFollowUps).toBe(2);
       expect(senderStore.read({ topic: "fabric.control.command" })
         .map(event => (event.data as { message: string }).message)).toEqual([text, text]);

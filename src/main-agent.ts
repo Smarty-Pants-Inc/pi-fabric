@@ -1,10 +1,11 @@
 import { randomUUID } from "node:crypto";
+import type { FabricDeliveryObserver } from "./protocol.js";
 import { diagnostics, notifyDiagnostic, notifyPrincipalDiagnosticOnce, resetPrincipalDiagnosticTurn } from "./core/diagnostics.js";
 import { appendDeliveryOutcome, type DeliverySend, type DeliveryOutcome } from "./mesh/delivery-outcomes.js";
 import type { AgentFollowUpRunningWarning } from "./agents/types.js";
 import fs from "node:fs";
 import path from "node:path";
-import { readFileRetrying, writeFileAtomic } from "./core/atomic-write.js";
+import { readFileRetrying, writeFileAtomic, syncDirectoryChain } from "./core/atomic-write.js";
 import { withConfirmedSessionFile } from "./core/session-receipts.js";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { MeshIdentity } from "./mesh/store.js";
@@ -56,6 +57,8 @@ export interface FabricMainAgentInfo {
 }
 
 export interface FabricMainAgentDeliveryRequest {
+  /** Host-only evidence for the router's single post-admission outcome boundary. */
+  deliveryObserver?: FabricDeliveryObserver | undefined;
   from: MeshIdentity;
   /** Recorded admission only; absence (including old bridges) makes no sender claim. */
   verification?: "mesh" | "bridge";
@@ -765,7 +768,7 @@ export class MainAgentController implements FabricMainAgentTarget {
       // A durable id needs the journal: without one (closed at shutdown or reload, or never
       // opened) the sender keeps its record for a later drain (Astra round 3 finding 2, pi-fabric#160).
       if (!this.#journal) throw new Error("Main has no follow-up journal open; retry the durable delivery later");
-      const admitted = this.#admitted(deliveryId);
+      const admitted = this.#admitted(deliveryId, request.deliveryObserver);
       if (admitted) return { queued: true, messageId: admitted, routed: "main", duplicate: true, triggered: false };
     }
     if (request.priority === "interrupt") {
@@ -839,7 +842,7 @@ export class MainAgentController implements FabricMainAgentTarget {
       item.triggerTurn = triggerTurn;
       this.#admit(item);
       this.#held.push(item);
-      try { this.#save(); } catch (error) { this.#held.pop(); throw error; }
+      this.#saveDelivery(item, request.deliveryObserver, undefined, true);
       return { queued: true, messageId: item.id, routed: "main", triggered: false, ...this.queueDepth(item.from.id) };
     }
     if (request.priority === "interrupt" && triggerTurn && this.#context &&
@@ -850,7 +853,7 @@ export class MainAgentController implements FabricMainAgentTarget {
       this.#admit(item);
       const index = this.#interrupts.size;
       this.#held.splice(index, 0, item);
-      try { this.#save(); } catch (error) { this.#held.splice(index, 1); throw error; }
+      this.#saveDelivery(item, request.deliveryObserver, undefined, true);
       const abort = !this.#interruptUsedThisTurn;
       this.#interrupts.add(item.id);
       // Same native cancellation path as Escape. Do not queue into Pi's aborted run:
@@ -874,12 +877,7 @@ export class MainAgentController implements FabricMainAgentTarget {
       // Keep every original in arrival order; coalesceKey is ordinary payload data.
       this.#admit(item);
       this.#held.push(item);
-      try {
-        this.#save();                                   // journalled before it is acknowledged
-      } catch (error) {
-        this.#held.pop();
-        throw new Error(`Main could not record the followUp: ${error instanceof Error ? error.message : String(error)}`);
-      }
+      this.#saveDelivery(item, request.deliveryObserver, "followUp", true); // journalled before acknowledgement
       if (providerHeld) {
         this.#scheduleProviderWake();
         this.#armProviderDeadTimer();                   // a new delivery is an edge too; no-op unless pending
@@ -896,20 +894,23 @@ export class MainAgentController implements FabricMainAgentTarget {
       item.handed = true;
       item.deliverAs = request.delivery;
       item.triggerTurn = triggerTurn;
-      this.#sent.push(item);
+      // Stage in the retryable queue until the save returns. The persisted handed marker
+      // fences live-reload reconciliation, but a failed save has not attempted Pi yet.
+      this.#held.push(item);
       try {
-        this.#save();
+        this.#saveDelivery(item, request.deliveryObserver, "message", true);
       } catch (error) {
-        this.#sent.pop();
-        restorePeerWakeOnFailure();
-        throw new Error(`Main could not record the message: ${error instanceof Error ? error.message : String(error)}`);
+        try { restorePeerWakeOnFailure(); } catch { /* Preserve the admission failure. */ }
+        throw error;
       }
+      this.#held.splice(this.#held.indexOf(item), 1);
+      this.#sent.push(item);
       try {
         triggered = this.#send([item], request.delivery, triggerTurn, false, peerSteerWake);
       } catch (error) {
-        this.#sent.splice(this.#sent.indexOf(item), 1);
-        this.#trySave();
-        restorePeerWakeOnFailure();
+        // The journal already owns this item and Pi may have accepted it before throwing.
+        // Retain it for native receipt/replay reconciliation; do not roll back admission.
+        try { restorePeerWakeOnFailure(); } catch { /* Preserve the handoff error. */ }
         throw error;
       }
     } else {
@@ -941,7 +942,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     const retained = { ...item, deliveryId };
     this.#admit(retained);
     this.#held.push(retained);
-    try { this.#save(); } catch (error) { this.#held.pop(); throw error; }
+    this.#saveDelivery(retained, undefined, undefined, true);
     if (this.#context?.isIdle()) this.#release(true);
   }
 
@@ -997,7 +998,7 @@ export class MainAgentController implements FabricMainAgentTarget {
   }
 
   /** The message id under which Main already admitted this delivery id, if it did. */
-  #admitted(deliveryId: string): string | undefined {
+  #admitted(deliveryId: string, observer?: FabricDeliveryObserver): string | undefined {
     const item = [...this.#unverified, ...this.#sent, ...this.#held].find((item) =>
       item.deliveryId === deliveryId || item.supersedes?.includes(deliveryId));
     if (item) {
@@ -1005,12 +1006,13 @@ export class MainAgentController implements FabricMainAgentTarget {
       // Reading it (or a failed best-effort replay save) is not a durability receipt.
       // Re-establish the complete journal barrier chain before duplicate acceptance
       // lets the resident client delete its source; propagate failure for a later drain.
-      this.#save();
+      this.#saveDelivery(item, observer);
       return item.id;
     }
     if (this.#consumed.has(deliveryId)) {
       // The same uncertainty applies to a recovered consumed-ID replacement, even
       // with no payload journal left. Force its own barriers, not just the journal's.
+      observer?.onAdmission(deliveryId, this.id); // Already consumed; a failed re-barrier is not non-delivery.
       this.#consumedDirty = true;
       this.#save();
       return deliveryId;
@@ -1058,14 +1060,72 @@ export class MainAgentController implements FabricMainAgentTarget {
     pendingHalts().delete(file); // Only the completed durability barriers commit authority.
   }
 
+  /** Own admission-aware rollback; only the router classifies the original failure. */
+  #saveDelivery(item: HeldAgentMessage, observer?: FabricDeliveryObserver, recordContext?: "followUp" | "message", newAdmission = false): void {
+    let admitted = false;
+    const onAdmission = (): void => {
+      admitted = true;
+      observer?.onAdmission(item.deliveryId ?? item.id, this.id);
+    };
+    // A duplicate is already in our custody. A failed re-barrier cannot revoke it.
+    if (!newAdmission) onAdmission();
+    try { this.#save(onAdmission); }
+    catch (error) {
+      // Every new item is still staged in #held: no native handoff was attempted.
+      // Clear the direct-delivery replay sentinel so later saves/release keep that fact.
+      if (newAdmission) delete item.handed;
+      if (!admitted && this.#journal) {
+        let absent = false;
+        try {
+          const saved = JSON.parse(fs.readFileSync(this.#journal, "utf8")) as { version?: unknown; items?: unknown } | null;
+          const validItem = (value: unknown): value is HeldAgentMessage => {
+            if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+            const candidate = value as Partial<HeldAgentMessage>;
+            return typeof candidate.id === "string" && candidate.id.length > 0 &&
+              typeof candidate.message === "string" && typeof candidate.sentAt === "number" && Number.isFinite(candidate.sentAt) &&
+              senderIdentity(candidate.from) !== undefined &&
+              (candidate.handed === undefined || candidate.handed === true) &&
+              (candidate.deliverAs === undefined || DIRECT_DELIVERIES.has(candidate.deliverAs)) &&
+              (candidate.triggerTurn === undefined || typeof candidate.triggerTurn === "boolean") &&
+              (candidate.deliveryId === undefined || typeof candidate.deliveryId === "string") &&
+              (candidate.supersedes === undefined || (Array.isArray(candidate.supersedes) && candidate.supersedes.every(id => typeof id === "string")));
+          };
+          // Only a supported, readable journal with valid items can prove absence.
+          // Malformed/unknown readback is uncertainty, not permission to resend.
+          absent = saved?.version === 1 && Array.isArray(saved.items) && saved.items.every(validItem) &&
+            !saved.items.some(savedItem => savedItem.id === item.id);
+        } catch (readError) {
+          absent = (readError as { code?: unknown } | null)?.code === "ENOENT";
+        }
+        if (!absent) onAdmission();
+      }
+      if (!admitted) {
+        if (newAdmission) {
+          const index = this.#held.indexOf(item);
+          if (index !== -1) this.#held.splice(index, 1);
+        }
+        if (recordContext) throw new Error(`Main could not record the ${recordContext}: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+      }
+      throw error;
+    }
+    if (this.#journal) onAdmission();
+  }
+
   /** Write the held and unconfirmed followUps (0600), or remove the journal when none are left. */
-  #save(): void {
+  #save(onJournaled?: () => void): void {
     if (!this.#journal) return;
     // Before the journal: an item leaves the journal only once its id is recorded as consumed.
     this.#saveIndex();
     const items = [...this.#unverified, ...this.#sent, ...this.#held];
     if (!items.length) { fs.rmSync(this.#journal, { force: true }); return; }
-    writeFileAtomic(this.#journal, JSON.stringify({ version: 1, items }), { durable: true });
+    writeFileAtomic(this.#journal, JSON.stringify({ version: 1, items }), { durable: true,
+      ...(onJournaled ? { syncDirectory: (directory: string) => {
+        // Rename already installed the payload. A subsequent barrier failure is uncertain,
+        // not a pre-admission refusal, and cancellation must see that evidence immediately.
+        onJournaled();
+        syncDirectoryChain(directory);
+      } } : {}),
+    });
   }
 
   #trySave(indexOnly = false): void {

@@ -1,4 +1,6 @@
 import { appendDeliveryOutcome } from "../mesh/delivery-outcomes.js";
+import { deliveryUnconfirmedError, type FabricDeliveryObserver } from "../protocol.js";
+import { registerCancellationEffect } from "../async-settlement.js";
 import { interruptErrorCode } from "../interrupt-authority.js";
 import { boundAgentSpawner } from "../agents/spawner.js";
 import { FabricTargetTerminalError, terminalRejectionFields } from "../agents/terminal-target.js";
@@ -264,7 +266,6 @@ export class AgentMessageRouter {
     };
     try { return await attempt(); }
     catch (error) {
-      signal?.throwIfAborted();
       // Only our private lookup refusal may replay resolution, never control.request's ACK failure.
       if (!(error instanceof PresenceResolutionRequired)) throw error;
       if (!recoverLease) throw error.original;
@@ -393,7 +394,6 @@ export class AgentMessageRouter {
     try {
       return await operation(authority, budget);
     } catch (error) {
-      signal?.throwIfAborted();
       // Lease recovery is pre-publication only. A failed ACK is never replayed here.
       if (recoverLease && error instanceof LeaseResolutionRequired && this.participants.resolveRoutingLease) {
         // The canonical unknown classification already captured the pre-wait authority.
@@ -598,42 +598,70 @@ export class AgentMessageRouter {
     // Task-local `main` remains its immutable immediate return address.
     if (id.trim() === "main" && this.#taskReturnAddress?.spawnerId) id = this.#taskReturnAddress.spawnerId;
     const provenLocal = this.isProcessOwnedTarget(id);
+    let admission: { deliveryId: string; targetId: string } | undefined;
+    const unconfirmed = (cause: unknown) => admission
+      ? deliveryUnconfirmedError(cause, admission.deliveryId, { targetId: admission.targetId, idempotencyKey: options.idempotencyKey })
+      : undefined;
+    let cancellationRegistered = false;
+    const deliveryObserver: FabricDeliveryObserver = {
+      onAdmission: (deliveryId, targetId) => {
+        admission = { deliveryId, targetId };
+        if (!cancellationRegistered) {
+          cancellationRegistered = true;
+          // The outer runAbortable race can settle before this async catch. Share the SAME
+          // boundary with its synchronous cancellation path, including after a successful ACK.
+          registerCancellationEffect(context?.signal, reason => unconfirmed(reason));
+        }
+      },
+      onNotRun: deliveryId => { if (admission?.deliveryId === deliveryId) admission = undefined; },
+    };
+    const deliveryOptions = { ...options, deliveryObserver };
     let result: FabricAgentMessageResult;
     try {
       result = provenLocal
-        ? await this.#route(id, message, data, kind, context, options, true)
+        ? await this.#route(id, message, data, kind, context, deliveryOptions, true)
         : await this.#withDurableRecovery(id, recovering =>
-          this.#withDirectory((authority, budget) => this.#route(id, message, data, kind, context, options, false, !recovering, authority, budget), id, !recovering, context?.signal));
+          this.#withDirectory((authority, budget) => this.#route(id, message, data, kind, context, deliveryOptions, false, !recovering, authority, budget), id, !recovering, context?.signal), () => admission !== undefined);
+      // Older owners omit stalled. An accepted-but-held refusal belongs inside the same
+      // post-admission boundary, never a suggestion to send replacement text under a new key.
+      if (kind === "followUp" && result?.stalled) {
+        if (!admission) deliveryObserver.onAdmission(result.messageId, id);
+        throw new Error(
+          `Fabric followUp to ${id} was accepted but is not being delivered: target idle and its held queue stalled ` +
+          `(yours: ${result.pendingFollowUps ?? 0} held, oldest ${result.oldestAgeS ?? 0} s). The message is still held, not withdrawn.`,
+        );
+      }
     } catch (error) {
-      context?.signal?.throwIfAborted();
       const reason = error instanceof Error ? error.message : String(error);
-      const root = this.actorManager.mesh?.root ?? this.residency?.options.config.meshRoot;
-      // Only pre-publication/local definite refusals. Remote ACK outcomes belong to control.
       const refusal = prePublicationRefusal(error, reason) ??
         (/^(Unknown |Main's followUp queue is full|Fabric actor queue limit reached|Fabric participant .* is non-interactive)/.test(reason) ? reason : undefined);
-      if (root && !(error instanceof Error && "rejection" in error && error.rejection === "FABRIC_CONTROL_REJECTED") && refusal !== undefined) {
-        appendDeliveryOutcome(root, { eventId: options.idempotencyKey!, to: id, from: (options.from ?? this.actorManager.identity).id, mode: kind }, "failed", refusal);
+      const remoteRejection = error instanceof Error && "rejection" in error && error.rejection === "FABRIC_CONTROL_REJECTED";
+      const typedPrePublicationRefusal = error instanceof Error && "code" in error &&
+        typeof error.code === "string" && PRE_PUBLICATION_REFUSALS.has(error.code);
+      // Control clears verified notRun/withdrawal/conflict evidence at its source. Preserve
+      // known admission refusals in an authenticated owner rejection too, without changing
+      // control's ledger or trusting arbitrary post-append error text/notRun properties.
+      if (error instanceof FabricTargetTerminalError || error instanceof FabricControlStaleIncarnationError ||
+          typedPrePublicationRefusal || (remoteRejection && refusal !== undefined)) admission = undefined;
+      const failure = unconfirmed(error);
+      if (failure) throw failure;
+      const root = this.actorManager.mesh?.root ?? this.residency?.options.config.meshRoot;
+      // Remote ACK outcomes still belong to control, including its conservative unknown ledger.
+      if (root && !remoteRejection && refusal !== undefined) {
+        try { appendDeliveryOutcome(root, { eventId: options.idempotencyKey!, to: id, from: (options.from ?? this.actorManager.identity).id, mode: kind }, "failed", refusal); }
+        catch { /* Reporting must not replace the original pre-publication refusal. */ }
       }
       if (error instanceof FabricParticipantStaleError && !error.idempotencyKey) {
         throw new FabricParticipantStaleError(error.targetId, error.lapsedMs, options.idempotencyKey);
       }
       throw error;
     }
-    // smarty-dev#1826: an ack alone hid a Main whose held followUps no boundary would release.
-    // Older owners never report `stalled`, so their results pass unchanged.
-    if (kind === "followUp" && result?.stalled) {
-      throw new Error(
-        `Fabric followUp to ${id} was accepted but is not being delivered: target idle and its held queue stalled ` +
-          `(yours: ${result.pendingFollowUps ?? 0} held, oldest ${result.oldestAgeS ?? 0} s). The message is still held, not withdrawn. ` +
-          "Use agents.steer meanwhile (smarty-dev#1826).",
-      );
-    }
     return result;
   }
 
   /** Only this root's non-owned durable actors can wait out a dead or ownerless local lock.
    * Live/corrupt holders and unrelated routing errors retain the ordinary failure path. */
-  async #withDurableRecovery<T>(id: string, operation: (recovering?: boolean) => Promise<T>): Promise<T> {
+  async #withDurableRecovery<T>(id: string, operation: (recovering?: boolean) => Promise<T>, admitted?: () => boolean): Promise<T> {
     if (this.#nats) return operation();
     // Ownerless recovery needs the first integer millisecond strictly after the
     // stale boundary, plus the full final mesh write-timeout budget.
@@ -642,6 +670,7 @@ export class AgentMessageRouter {
     for (;;) {
       try { return await operation(recovering); }
       catch (error) {
+        if (admitted?.()) throw error; // A post-append lock failure is never recovery/replay permission.
         const lockError = error instanceof FabricDirectoryUnavailableError ? error.cause : error;
         const recoveryEvidence = (lockError instanceof Error && "code" in lockError && lockError.code === "FABRIC_MESH_LOCK_TIMEOUT") ||
           error instanceof LeaseResolutionStale;
@@ -715,6 +744,7 @@ export class AgentMessageRouter {
       binding?: FabricActorRunBinding;
       deadlineMs?: number;
       idempotencyKey?: string;
+      deliveryObserver?: FabricDeliveryObserver;
     } = {},
     provenLocal = false,
     recoverLease = true,
@@ -759,6 +789,7 @@ export class AgentMessageRouter {
           ...(options.wakeCause ? { wakeCause: options.wakeCause } : {}),
           message,
           delivery: kind,
+          deliveryObserver: options.deliveryObserver,
           outcomeSend: { eventId: options.idempotencyKey!, to: this.mainAgent.id, from: (options.from ?? this.actorManager.identity).id, mode: kind },
           ...(options.priority ? { priority: options.priority } : {}),
           ...(typeof options.triggerTurn === "boolean"
@@ -816,6 +847,7 @@ export class AgentMessageRouter {
           ...(!this.#nats ? { routedRemoteHost: participant.remoteHost ?? null } : {}),
           ...(budget?.waited ? { mirrorLeaseWaitBudget: budget } : {}),
           ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
+          deliveryObserver: options.deliveryObserver,
           ...(participant.status === "reloading" && typeof participant.reloadUntil === "number"
             ? { timeoutMs: Math.max(1, participant.reloadUntil - Date.now()) } : {}),
         },
@@ -884,7 +916,7 @@ export class AgentMessageRouter {
         kind,
         { message, data, principal: options.principal, ownerIncarnation },
         remoteAgent.ownerIdentityId,
-        { idempotencyKey: options.idempotencyKey, ...(!this.#nats ? { routedRemoteHost: remoteAgent.remoteHost ?? null } : {}), ...(context?.signal ? { signal: context.signal } : {}) },
+        { idempotencyKey: options.idempotencyKey, deliveryObserver: options.deliveryObserver, ...(!this.#nats ? { routedRemoteHost: remoteAgent.remoteHost ?? null } : {}), ...(context?.signal ? { signal: context.signal } : {}) },
       );
     }
     // Persistent actors consume both delivery modes through their serial mailbox.
@@ -963,7 +995,7 @@ export class AgentMessageRouter {
         },
         owner.ownerIdentityId,
         {
-          idempotencyKey: options.idempotencyKey, ...(!this.#nats ? { routedRemoteHost: owner.remoteHost ?? null } : {}),
+          idempotencyKey: options.idempotencyKey, deliveryObserver: options.deliveryObserver, ...(!this.#nats ? { routedRemoteHost: owner.remoteHost ?? null } : {}),
           // Retained dormant authority has no live-owner ACK window yet. Its committed
           // command must include bounded cold startup, formerly waited out in preflight.
           ...(owner.stale ? { timeoutMs: 90_000 } : {}),

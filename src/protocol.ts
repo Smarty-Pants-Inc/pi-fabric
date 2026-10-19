@@ -1,5 +1,62 @@
 import type { BashOperations, BashToolOptions, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
+/** Publication or admission may have completed, but its final delivery receipt is unavailable. */
+export const FABRIC_DELIVERY_UNCONFIRMED = "FABRIC_DELIVERY_UNCONFIRMED";
+
+/** Host-only admission evidence. Never persisted or hydrated from message/data. */
+export interface FabricDeliveryObserver {
+  /** A durable admission, complete append, or publication whose absence cannot be proved. */
+  onAdmission(deliveryId: string, targetId: string): void;
+  /** A verified owner refusal/withdrawal proves this admitted attempt cannot deliver. */
+  onNotRun(deliveryId: string): void;
+}
+
+export interface DeliveryUnconfirmedOptions {
+  targetId?: string | undefined;
+  idempotencyKey?: string | undefined;
+  cause?: unknown;
+}
+
+export class FabricDeliveryUnconfirmedError extends Error {
+  override readonly name = "FabricDeliveryUnconfirmedError";
+  readonly code = FABRIC_DELIVERY_UNCONFIRMED;
+  readonly targetId?: string | undefined;
+  readonly idempotencyKey?: string | undefined;
+
+  constructor(readonly deliveryId: string, options: DeliveryUnconfirmedOptions = {}) {
+    super(`${FABRIC_DELIVERY_UNCONFIRMED}: Fabric delivery ${deliveryId}${options.targetId ? ` to ${options.targetId}` : ""} is unconfirmed: ` +
+      "the message may already be delivered or may still deliver. Do not resend with new text or a new key; " +
+      "reconcile this delivery using the same idempotencyKey and unchanged input.", { cause: options.cause });
+    this.targetId = options.targetId;
+    this.idempotencyKey = options.idempotencyKey;
+  }
+}
+
+/** Structural recognition also works across compiled generations and runtime error carriers. */
+export const isDeliveryUnconfirmedError = (error: unknown): error is FabricDeliveryUnconfirmedError => {
+  if (typeof error !== "object" || error === null) return false;
+  try {
+    return Object.getOwnPropertyDescriptor(error, "code")?.value === FABRIC_DELIVERY_UNCONFIRMED &&
+      typeof Object.getOwnPropertyDescriptor(error, "deliveryId")?.value === "string";
+  } catch { return false; }
+};
+
+/** The caller chooses its layer's stable identity (control commandId, not the carrier event id). */
+export const deliveryUnconfirmedError = (
+  error: unknown,
+  deliveryId: string,
+  options: Omit<DeliveryUnconfirmedOptions, "cause"> = {},
+): FabricDeliveryUnconfirmedError => {
+  if (isDeliveryUnconfirmedError(error)) {
+    try {
+      if (Object.getOwnPropertyDescriptor(error, "deliveryId")?.value === deliveryId &&
+          (options.targetId === undefined || Object.getOwnPropertyDescriptor(error, "targetId")?.value === options.targetId) &&
+          (options.idempotencyKey === undefined || Object.getOwnPropertyDescriptor(error, "idempotencyKey")?.value === options.idempotencyKey)) return error;
+    } catch { /* A hostile descriptor must not replace the actual delivery failure. */ }
+  }
+  return new FabricDeliveryUnconfirmedError(deliveryId, { ...options, cause: error });
+};
+
 /** Host-local opt-in on a bash ToolDefinition; never serialized into guest schemas. */
 export const FABRIC_BASH_MIDDLEWARE = Symbol.for("pi-fabric:bash-middleware:v1");
 

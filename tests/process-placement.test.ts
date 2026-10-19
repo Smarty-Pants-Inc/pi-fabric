@@ -83,8 +83,10 @@ describe("host process task placement", () => {
     expect(normalizeFabricConfig({}).agents.placement).toBeUndefined();
     const f = fixture();
     expect(normalizeFabricConfig({agents:{placement:{...f.raw,default:undefined}}}).agents.placement?.default).toBe("local");
-    expect(f.config.placement).toMatchObject({default:"remote",capabilities:[],pollIntervalMs:10});
-    for (const change of [{command:"shell string"},{default:"auto"},{command:["{typo}"]},{cancelCommand:[]},{resultDirectory:undefined},{resultDirectory:"relative/{id}"},{pollIntervalMs:0},{capabilities:[1]},{sshAliases:[]},{sshAliases:{ryzen3:"-oProxyCommand=bad"}},{command:["fake","{sshAlias}"]},{resultCommand:["fake","{sshAlias}"],resultDirectory:undefined}]) {
+    expect(f.config.placement).toMatchObject({default:"remote",capabilities:[],corpusRemoteHosts:[],pollIntervalMs:10});
+    const corpusHosts = normalizeFabricConfig({agents:{placement:{...f.raw,sshAliases:{ryzen2:"r2-agent"},corpusRemoteHosts:["ryzen2"]}}}).agents.placement?.corpusRemoteHosts;
+    expect(corpusHosts).toEqual(["ryzen2"]);
+    for (const change of [{command:"shell string"},{default:"auto"},{command:["{typo}"]},{cancelCommand:[]},{resultDirectory:undefined},{resultDirectory:"relative/{id}"},{pollIntervalMs:0},{capabilities:[1]},{corpusRemote:true},{corpusRemoteHosts:"ryzen2"},{corpusRemoteHosts:["-unsafe"]},{corpusRemoteHosts:new Array(1)},{corpusRemoteHosts:["ryzen2"]},{sshAliases:[]},{sshAliases:{ryzen3:"-oProxyCommand=bad"}},{command:["fake","{sshAlias}"]},{resultCommand:["fake","{sshAlias}"],resultDirectory:undefined}]) {
       expect(() => normalizeFabricConfig({agents:{placement:{...f.raw,...change}}})).toThrow();
     }
   });
@@ -119,9 +121,9 @@ describe("host process task placement", () => {
   });
   it("matches NFKC and Unicode-White_Space canonicalized compound capabilities and needs", async () => {
     const f = fixture();
-    f.config.placement.capabilities = ["ＣＯＭＰＵＴＥ\u0085ＣＯＲＰＵＳ"];
-    expect(await f.manager.run({ task: "canonical", needs: ["ｃｏｍｐｕｔｅ\u0085ｃｏｒｐｕｓ", "COMPUTE"] })).toMatchObject({ status: "completed", text: "REMOTE: canonical" });
-    expect(normalizeFabricConfig({ agents: { placement: { ...f.raw, capabilities: ["ＣＯＭＰＵＴＥ\u0085ＣＯＲＰＵＳ", "compute"] } } }).agents.placement?.capabilities).toEqual(["compute", "corpus"]);
+    f.config.placement.capabilities = ["ＣＯＭＰＵＴＥ\u0085ＦＡＳＴ"];
+    expect(await f.manager.run({ task: "canonical", needs: ["ｃｏｍｐｕｔｅ\u0085ｆａｓｔ", "COMPUTE"] })).toMatchObject({ status: "completed", text: "REMOTE: canonical" });
+    expect(normalizeFabricConfig({ agents: { placement: { ...f.raw, capabilities: ["ＣＯＭＰＵＴＥ\u0085ＦＡＳＴ", "compute"] } } }).agents.placement?.capabilities).toEqual(["compute", "fast"]);
   });
   it.each(["compute/slash", "ＣＯＭＰＵＴＥ／ＦＡＳＴ"])("rejects capability token %s outside the ASCII grammar", token => {
     const f = fixture();
@@ -191,7 +193,7 @@ describe("host process task placement", () => {
   it("does not allow a workspace to override host placement", () => {
     const f=fixture(); fs.mkdirSync(path.join(f.root,".pi"));
     fs.writeFileSync(path.join(f.profile,"fabric.json"), JSON.stringify({agents:{placement:f.raw}}));
-    fs.writeFileSync(path.join(f.root,".pi/fabric.json"), JSON.stringify({agents:{placement:{...f.raw,default:"local",capabilities:["github-write"]}}}));
+    fs.writeFileSync(path.join(f.root,".pi/fabric.json"), JSON.stringify({agents:{placement:{...f.raw,default:"local",capabilities:["github-write"],corpusRemoteHosts:["ryzen2"]}}}));
     expect(loadFabricConfig({cwd:f.root,agentDir:f.profile,projectTrusted:true}).agents.placement).toEqual(f.config.placement);
   });
   it("keeps an existing local-only cwd on the Main host before considering remote placement", async () => {
@@ -285,7 +287,51 @@ describe("host process task placement", () => {
     for(const needs of ["corpus",[1],[""]]) expect(()=>normalizeAgentRunRequest({task:"x",needs},defaults)).toThrow("needs");
     for (const name of ["run","spawn"]) expect((AGENTS_ACTION_DESCRIPTORS.find(d=>d.name===name)!.inputSchema as {properties:Record<string,unknown>}).properties.needs).toBeDefined();
   });
-  it.each(["github-write","corpus","mac","ryzen1-service","unknown"])("keeps unmet %s local with exactly one audit line", async need => {
+  it("keeps corpus needs local by default even if a generic capability is claimed", async () => {
+    const f=fixture();
+    f.config.placement.capabilities = ["corpus"];
+    expect(f.config.placement.corpusRemoteHosts).toEqual([]);
+    const result=await f.manager.run({task:"same process task",transport:"process",needs:["corpus"]});
+    expect(result).toMatchObject({status:"completed",text:"LOCAL"});
+    const events=fs.readFileSync(path.join(f.manager.runDirectory(result.id)! ,"events.jsonl"),"utf8");
+    expect(events).toContain('"type":"placement.local"');
+    expect(events).toContain('"reason":"unmet needs: corpus"');
+    expect(events).toContain('"needs":["corpus"]');
+    expect(fs.existsSync(f.results)).toBe(false);
+  });
+  it("keeps corpus local for a custom launcher even when a corpus host is allow-listed", async () => {
+    const f=fixture();
+    f.config.placement.corpusRemoteHosts=["ryzen2"];
+    const task="same process task";
+    const corpus=await f.manager.run({task,transport:"process",needs:["corpus"]});
+    const local=await f.manager.run({task,transport:"process",needs:["local"]});
+    const github=await f.manager.run({task,transport:"process",needs:["github"]});
+    const placementEvents = (id: string) => fs.readFileSync(path.join(f.manager.runDirectory(id)!,"events.jsonl"),"utf8").trim().split("\n").map(line=>JSON.parse(line)).filter(line=>line.type.startsWith("placement."));
+
+    expect(corpus).toMatchObject({status:"completed",text:"LOCAL"});
+    expect(placementEvents(corpus.id)).toEqual([expect.objectContaining({type:"placement.local",reason:"unmet needs: corpus",needs:["corpus"]})]);
+    expect(local).toMatchObject({status:"completed",text:"LOCAL"});
+    expect(placementEvents(local.id)).toEqual([expect.objectContaining({type:"placement.local",reason:"reserved need: local pins to the Main host",needs:["local"]})]);
+    expect(github).toMatchObject({status:"completed",text:"LOCAL"});
+    expect(placementEvents(github.id)).toEqual([expect.objectContaining({type:"placement.local",reason:"unmet needs: github",needs:["github"]})]);
+    expect(fs.existsSync(f.results)).toBe(false);
+  });
+  it.each(["prompt", "requires"] as const)("keeps a corpus path in %s local for a custom launcher with corpus hosts allow-listed", async location => {
+    const f=fixture();
+    f.config.placement.corpusRemoteHosts=["ryzen2"];
+    const corpusPath=path.join(f.root,"private-corpus","secret.txt");
+    fs.mkdirSync(path.dirname(corpusPath),{recursive:true});
+    fs.writeFileSync(corpusPath,"private corpus fixture");
+    const task=location === "prompt" ? `Inspect ${corpusPath}` : "Inspect supplied input";
+    const result=await f.manager.run({task,transport:"process",needs:["corpus"],...(location === "requires" ? {requires:[corpusPath]} : {})});
+    const events=fs.readFileSync(path.join(f.manager.runDirectory(result.id)!,"events.jsonl"),"utf8");
+
+    expect(result).toMatchObject({status:"completed",text:"LOCAL"});
+    expect(events).toContain('"type":"placement.local"');
+    expect(events).toContain('"reason":"unmet needs: corpus"');
+    expect(fs.existsSync(f.results)).toBe(false);
+  });
+  it.each(["github-write","mac","ryzen1-service","unknown"])("keeps unmet %s local with exactly one audit line", async need => {
     const f=fixture(); const h=await f.manager.spawn({task:"x",transport:"process",needs:[need]});
     expect((await f.manager.wait(h.id)).text).toBe("LOCAL");
     const lines=fs.readFileSync(path.join(f.manager.runDirectory(h.id)!,"events.jsonl"),"utf8").trim().split("\n").map(line=>JSON.parse(line)).filter(line=>line.type==="placement.local");

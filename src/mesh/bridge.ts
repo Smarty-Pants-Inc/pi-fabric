@@ -2104,15 +2104,30 @@ export const serveBridgeAgent = (side: StoreBridgeSide, input: Readable, output:
       unsubscribe = undefined;
       close?.();
     };
-    const reply = (value: unknown): void => {
-      if (!closed) output.write(`${JSON.stringify(value)}\n`);
-    };
     const finish = (): void => {
       const wasClosed = closed;
       closed = true;
       dispose(); // also dispose a subscription returned after a reentrant finish()
       if (wasClosed) return;
       void Promise.allSettled([queues.topology, queues.traffic]).then(() => { dispose(); resolve(); });
+    };
+    const outputClosed = (error?: unknown): void => {
+      if (error !== undefined) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code !== "EPIPE" && code !== "ERR_STREAM_DESTROYED") throw error;
+      }
+      if (closed) return;
+      finish();
+      input.destroy();
+    };
+    output.on("error", outputClosed);
+    output.on("close", () => outputClosed());
+    output.on("finish", () => outputClosed());
+    if (output.writableEnded || output.destroyed) outputClosed(output.errored ?? undefined);
+    const reply = (value: unknown): void => {
+      if (closed || output.writableEnded || output.destroyed) return;
+      try { output.write(`${JSON.stringify(value)}\n`); }
+      catch (error) { outputClosed(error); }
     };
     lines(
       input,

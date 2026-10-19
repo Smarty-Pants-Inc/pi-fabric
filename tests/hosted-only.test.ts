@@ -14,6 +14,7 @@ const runner: NodeJS.ProcessEnv = {
   FABRIC_TRANSPORT_HOSTED_DELETE: "1", FABRIC_TRANSPORT_HOSTED_KILL: "1", FABRIC_TRANSPORT_HOSTED_NATS_RESET: "1",
 };
 const directory = () => "/home/runner/work/_temp";
+const missingRunnerRecipe = join(tmpdir(), `hosted-only-missing-recipe-${process.pid}`);
 const hostedOnlySuites = [
   "tests/actor-child-completion-idle-preflight.test.ts",
   "tests/actor-manager.test.ts",
@@ -43,9 +44,61 @@ const natsBrokerSuites = [
 
 describe("hosted-only authorization", () => {
   it("allows a real-runner environment without a fleet marker, regardless of unrelated opt-ins", () => {
-    expect(isHostedOnlyAllowed(runner, directory)).toBe(true);
-    expect(isHostedOnlyAllowed({ ...runner, FABRIC_TRANSPORT_HOSTED_DELETE: "0" }, directory)).toBe(true);
-    expect(isHostedOnlyAllowed({ ...runner, RUNNER_TEMP: "D:\\a\\_temp" }, () => "D:\\a\\_temp")).toBe(true);
+    expect(isHostedOnlyAllowed(runner, directory, missingRunnerRecipe)).toBe(true);
+    expect(isHostedOnlyAllowed({ ...runner, FABRIC_TRANSPORT_HOSTED_DELETE: "0" }, directory, missingRunnerRecipe)).toBe(true);
+    expect(isHostedOnlyAllowed({ ...runner, RUNNER_TEMP: "D:\\a\\_temp" }, () => "D:\\a\\_temp", missingRunnerRecipe)).toBe(true);
+  });
+
+  it("admits the self-hosted pool only for a root-owned, protected image recipe", () => {
+    const root = fs.mkdtempSync(join(tmpdir(), "runner-recipe-probe-"));
+    const markerPath = join(root, "smarty-runner-recipe");
+    const symlinkPath = join(root, "recipe-symlink");
+    const missingPath = join(root, "missing-recipe");
+    const digest = `${"a".repeat(64)}\n`;
+    fs.writeFileSync(markerPath, digest, { mode: 0o644 });
+    const pool = { CI: "true", RUNNER_ENVIRONMENT: "self-hosted" };
+    const files = (override: { uid?: number; mode?: number; isFile?: boolean } = {}) => ({
+      lstatSync: (path: string) => {
+        if (override.isFile === false) return { isFile: () => false, uid: override.uid ?? 0, mode: override.mode ?? 0o100644 };
+        const stat = fs.lstatSync(path);
+        return {
+          isFile: () => stat.isFile(),
+          uid: override.uid ?? stat.uid,
+          mode: override.mode ?? stat.mode,
+        };
+      },
+      readFileSync: (path: string, _encoding: BufferEncoding) => fs.readFileSync(path, "utf8"),
+    });
+
+    try {
+      expect(isHostedOnlyAllowed(runner, directory, missingPath)).toBe(true);
+      expect(isHostedOnlyAllowed(pool, undefined, markerPath, files({ uid: 0, mode: 0o100644 }))).toBe(true);
+      expect(isHostedOnlyAllowed({ ...pool, CI: undefined, GITHUB_ACTIONS: "true" }, undefined, markerPath,
+        files({ uid: 0, mode: 0o100644 }))).toBe(true);
+      expect(isHostedOnlyAllowed(pool, undefined, missingPath, files({ uid: 0 }))).toBe(false);
+
+      let symlinkCreated = false;
+      try {
+        fs.symlinkSync(markerPath, symlinkPath);
+        symlinkCreated = true;
+      } catch (error) {
+        if (process.platform !== "win32") throw error;
+      }
+      const symlinkFiles = symlinkCreated ? files({ uid: 0 }) : files({ uid: 0, mode: 0o100644, isFile: false });
+      expect(isHostedOnlyAllowed(pool, undefined, symlinkPath, symlinkFiles)).toBe(false);
+
+      expect(isHostedOnlyAllowed(pool, undefined, markerPath, files({ uid: 1, mode: 0o100644 }))).toBe(false);
+      expect(isHostedOnlyAllowed(pool, undefined, markerPath,
+        files({ uid: 0, mode: 0o100644 | 0o020 }))).toBe(false);
+      fs.writeFileSync(markerPath, "not-an-image-digest\n");
+      expect(isHostedOnlyAllowed(pool, undefined, markerPath, files({ uid: 0, mode: 0o100644 }))).toBe(false);
+      expect(isHostedOnlyAllowed({ ...pool, CI: undefined }, undefined, markerPath,
+        files({ uid: 0, mode: 0o100644 }))).toBe(false);
+      expect(isHostedOnlyAllowed({ ...pool, CI: undefined, GITHUB_ACTIONS: undefined }, undefined, markerPath,
+        files({ uid: 0, mode: 0o100644 }))).toBe(false);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it.each(["worktree-agent@fixture", "task-agent@fixture"])("refuses SMARTY_ROLE=%j without a parent's admission marker", role => {
@@ -76,22 +129,22 @@ describe("hosted-only authorization", () => {
     { RUNNER_TEMP: undefined }, { RUNNER_TEMP: "relative" },
     { RUNNER_TEMP: "/home/paul" }, { RUNNER_TEMP: "/home/paul/fake-runner" }, { RUNNER_TEMP: "/srv/scratch/runner" },
   ])("refuses incomplete, self-hosted or fleet evidence: %j", override => {
-    expect(isHostedOnlyAllowed({ ...runner, ...override }, directory)).toBe(false);
+    expect(isHostedOnlyAllowed({ ...runner, ...override }, directory, missingRunnerRecipe)).toBe(false);
   });
 
   it("refuses missing/non-directory or physically fleet-backed temp; keeps path boundary counterexamples", () => {
-    expect(isHostedOnlyAllowed(runner, () => undefined)).toBe(false);
-    expect(isHostedOnlyAllowed(runner, () => "/srv/scratch/alias-target")).toBe(false);
-    expect(isHostedOnlyAllowed(runner, () => "/home/paul/alias-target")).toBe(false);
-    expect(isHostedOnlyAllowed({ ...runner, RUNNER_TEMP: "/home/pauline/runner" }, () => "/home/pauline/runner")).toBe(true);
+    expect(isHostedOnlyAllowed(runner, () => undefined, missingRunnerRecipe)).toBe(false);
+    expect(isHostedOnlyAllowed(runner, () => "/srv/scratch/alias-target", missingRunnerRecipe)).toBe(false);
+    expect(isHostedOnlyAllowed(runner, () => "/home/paul/alias-target", missingRunnerRecipe)).toBe(false);
+    expect(isHostedOnlyAllowed({ ...runner, RUNNER_TEMP: "/home/pauline/runner" }, () => "/home/pauline/runner", missingRunnerRecipe)).toBe(true);
   });
 
   it("checks the real filesystem by default and refuses a file or missing runner temp", () => {
     const root = fs.mkdtempSync(join(tmpdir(), "runner-directory-probe-"));
     const file = join(root, "not-a-directory");
     fs.writeFileSync(file, "fixture");
-    expect(isHostedOnlyAllowed({ ...runner, RUNNER_TEMP: file })).toBe(false);
-    expect(isHostedOnlyAllowed({ ...runner, RUNNER_TEMP: join(root, "missing") })).toBe(false);
+    expect(isHostedOnlyAllowed({ ...runner, RUNNER_TEMP: file }, undefined, missingRunnerRecipe)).toBe(false);
+    expect(isHostedOnlyAllowed({ ...runner, RUNNER_TEMP: join(root, "missing") }, undefined, missingRunnerRecipe)).toBe(false);
   });
 
   it("passes admitted runner markers to a worker child but never admits a non-hosted parent", () => {
@@ -145,7 +198,7 @@ describe("hosted-only authorization", () => {
     });
     expect(hostedResult.stderr).toContain("TEST_DELETION_REPORT:");
 
-    const localChild = taskAgentEnvironment({ ...hostedParent, GITHUB_ACTIONS: "false" });
+    const localChild = taskAgentEnvironment({ ...hostedParent, CI: undefined, GITHUB_ACTIONS: "false" });
     const localResult = probe(localChild);
     expect(localResult.status, localResult.stderr).toBe(0);
     expect(JSON.parse(localResult.stdout)).toMatchObject({ allowed: false, error: "ERR_TEST_DELETION_GUARD", delegated: [] });

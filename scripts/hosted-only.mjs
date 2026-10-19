@@ -21,19 +21,36 @@ function runnerDirectory(directory) {
 
 const absolute = path => posix.isAbsolute(path) || win32.isAbsolute(path);
 const fleetPath = path => /^(?:\/home\/paul|\/srv\/scratch)(?:\/|$)/i.test(path.replaceAll("\\", "/"));
+const runnerRecipePath = "/etc/smarty-runner-recipe";
 
-/** Pure with a supplied directory probe. Flags/opt-ins alone are never authorization.
- * This is an accidental-execution guard, not attestation against a caller controlling all env/filesystem inputs. */
-export function isHostedOnlyAllowed(env, directory = runnerDirectory) {
+function isRunnerImageAdmitted(env, markerPath, files) {
+  if (env.CI !== "true" && env.GITHUB_ACTIONS !== "true") return false;
+  try {
+    const marker = files.lstatSync(markerPath);
+    if (!marker.isFile() || marker.uid !== 0 || (marker.mode & 0o022) !== 0) return false;
+    return /^[0-9a-f]{64}\n?$/.test(files.readFileSync(markerPath, "utf8"));
+  } catch { return false; }
+}
+
+/** Pure with supplied runner probes. Flags/opt-ins alone are never authorization.
+ * This is an accidental-execution guard, not attestation against a caller controlling all env/filesystem inputs.
+ * markerPath/files are injectable for tests; production callers use the fixed image marker and real filesystem. */
+export function isHostedOnlyAllowed(env, directory = runnerDirectory, markerPath = runnerRecipePath, files = fs) {
   // The test setup records original fleet identity before role scrubbing. A worker's new task role
   // is tolerated only when its parent explicitly passed this already-admitted decision.
   if (env[fleetHostMarker] !== undefined) return false;
   if (env.SMARTY_ROLE !== undefined && env[hostedAdmissionMarker] !== "1") return false;
-  if (env.GITHUB_ACTIONS !== "true" || env.RUNNER_ENVIRONMENT !== "github-hosted") return false;
-  const temp = env.RUNNER_TEMP;
-  if (!temp || !absolute(temp) || fleetPath(temp)) return false;
-  const physical = directory(temp);
-  return typeof physical === "string" && absolute(physical) && !fleetPath(physical);
+
+  // Keep the existing GitHub-hosted runner checks unchanged; the image marker is an additional
+  // admission path for the pool's disposable self-hosted VMs.
+  if (env.GITHUB_ACTIONS === "true" && env.RUNNER_ENVIRONMENT === "github-hosted") {
+    const temp = env.RUNNER_TEMP;
+    if (temp && absolute(temp) && !fleetPath(temp)) {
+      const physical = directory(temp);
+      if (typeof physical === "string" && absolute(physical) && !fleetPath(physical)) return true;
+    }
+  }
+  return isRunnerImageAdmitted(env, markerPath, files);
 }
 
 const refused = new Set();

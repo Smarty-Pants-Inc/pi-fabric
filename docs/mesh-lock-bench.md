@@ -86,7 +86,10 @@ branch on ryzen5 (32 CPUs, shared and loaded, `nice -n 19`) with the default loa
 ## CI
 
 The self-hosted `smarty-linux-x64` pool serves our own pushes and the merge queue; fork pull requests
-use GitHub-hosted `ubuntu-latest` runners. The Linux `check` job's typecheck and entropy
+use GitHub-hosted `ubuntu-latest` runners. For its ephemeral VMs, hosted-only tests also admit the pool
+only when either `CI` or `GITHUB_ACTIONS` equals `true` and `/etc/smarty-runner-recipe` is a root-owned,
+non-group/other-writable regular file containing a 64-character lowercase image digest. The Linux
+`check` job's typecheck and entropy
 certification's build (which runs `tsc`) both use `NODE_OPTIONS=--max-old-space-size=4096`
 to avoid Node's default heap limit on that pool.
 The `mesh-lock-bench` job of

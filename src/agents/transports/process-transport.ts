@@ -392,9 +392,8 @@ export class ProcessTransport implements AgentTransportAdapter {
       workerArguments,
     );
     assertTransportLaunchAllowed(request);
-    const prepared = isActorLaunch(workerArguments)
-      ? { workerArguments, environment: baseEnvironment }
-      : prepareTaskTemporaryDirectory(workerArguments, baseEnvironment, request.cwd);
+    // Actors preserve their role identity, not Main's temp environment.
+    const prepared = prepareTaskTemporaryDirectory(workerArguments, baseEnvironment, request.cwd);
     const processHandle = await spawnDetached(
       selected.workerPath,
       prepared.workerArguments,

@@ -9,6 +9,8 @@ export interface AgentPlacementConfig {
   default: "remote" | "local";
   /** Needs the selected target guarantees (empty is conservative); local is reserved. */
   capabilities: string[];
+  /** Host-only opt-in: treat explicit corpus needs as placement metadata, not a location requirement. */
+  corpusRemote: boolean;
   /** Host-owned shared-root overrides; absent means no caller-local paths are portable. */
   sharedMounts?: string[];
   /** Host-only literal picker argv; fleet defaults to the installed sibling picker. */
@@ -48,6 +50,7 @@ export const normalizeAgentPlacement = (value: unknown): AgentPlacementConfig | 
   const input = value as Record<string, unknown>;
   if (input.default !== undefined && input.default !== "local" && input.default !== "remote") throw new Error("Invalid agents.placement.default");
   const capabilities = normalizeAgentCapabilityTokens(input.capabilities ?? [], "agents.placement.capabilities")!;
+  if (input.corpusRemote !== undefined && typeof input.corpusRemote !== "boolean") throw new Error("Invalid agents.placement.corpusRemote");
   if (capabilities.includes("local")) throw new AgentInputError("agents.placement.capabilities", 'Invalid agents.placement.capabilities: "local" is a reserved need, never a launcher capability');
   if ((input.resultDirectory === undefined) === (input.resultCommand === undefined)) throw new Error("agents.placement requires exactly one of resultDirectory or resultCommand");
   if (input.resultDirectory !== undefined && (typeof input.resultDirectory !== "string" || !path.isAbsolute(input.resultDirectory))) throw new Error("agents.placement.resultDirectory must be absolute");
@@ -80,7 +83,7 @@ export const normalizeAgentPlacement = (value: unknown): AgentPlacementConfig | 
     .some(entry => typeof entry === "string" && entry.includes("{sshAlias}"));
   if (usesAlias && !Object.keys(sshAliases ?? {}).length) throw new Error("agents.placement {sshAlias} requires sshAliases mapping");
   return {
-    command, default: input.default ?? "local", capabilities,
+    command, default: input.default ?? "local", capabilities, corpusRemote: input.corpusRemote ?? false,
     ...(sharedMounts ? { sharedMounts } : {}),
     ...(pickerCommand ? { pickerCommand } : {}),
     ...(sshAliases ? { sshAliases } : {}),

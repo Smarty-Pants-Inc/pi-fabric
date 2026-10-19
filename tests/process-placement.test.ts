@@ -83,8 +83,9 @@ describe("host process task placement", () => {
     expect(normalizeFabricConfig({}).agents.placement).toBeUndefined();
     const f = fixture();
     expect(normalizeFabricConfig({agents:{placement:{...f.raw,default:undefined}}}).agents.placement?.default).toBe("local");
-    expect(f.config.placement).toMatchObject({default:"remote",capabilities:[],pollIntervalMs:10});
-    for (const change of [{command:"shell string"},{default:"auto"},{command:["{typo}"]},{cancelCommand:[]},{resultDirectory:undefined},{resultDirectory:"relative/{id}"},{pollIntervalMs:0},{capabilities:[1]},{sshAliases:[]},{sshAliases:{ryzen3:"-oProxyCommand=bad"}},{command:["fake","{sshAlias}"]},{resultCommand:["fake","{sshAlias}"],resultDirectory:undefined}]) {
+    expect(f.config.placement).toMatchObject({default:"remote",capabilities:[],corpusRemote:false,pollIntervalMs:10});
+    expect(normalizeFabricConfig({agents:{placement:{...f.raw,corpusRemote:true}}}).agents.placement?.corpusRemote).toBe(true);
+    for (const change of [{command:"shell string"},{default:"auto"},{command:["{typo}"]},{cancelCommand:[]},{resultDirectory:undefined},{resultDirectory:"relative/{id}"},{pollIntervalMs:0},{capabilities:[1]},{corpusRemote:"true"},{sshAliases:[]},{sshAliases:{ryzen3:"-oProxyCommand=bad"}},{command:["fake","{sshAlias}"]},{resultCommand:["fake","{sshAlias}"],resultDirectory:undefined}]) {
       expect(() => normalizeFabricConfig({agents:{placement:{...f.raw,...change}}})).toThrow();
     }
   });
@@ -191,7 +192,7 @@ describe("host process task placement", () => {
   it("does not allow a workspace to override host placement", () => {
     const f=fixture(); fs.mkdirSync(path.join(f.root,".pi"));
     fs.writeFileSync(path.join(f.profile,"fabric.json"), JSON.stringify({agents:{placement:f.raw}}));
-    fs.writeFileSync(path.join(f.root,".pi/fabric.json"), JSON.stringify({agents:{placement:{...f.raw,default:"local",capabilities:["github-write"]}}}));
+    fs.writeFileSync(path.join(f.root,".pi/fabric.json"), JSON.stringify({agents:{placement:{...f.raw,default:"local",capabilities:["github-write"],corpusRemote:true}}}));
     expect(loadFabricConfig({cwd:f.root,agentDir:f.profile,projectTrusted:true}).agents.placement).toEqual(f.config.placement);
   });
   it("keeps an existing local-only cwd on the Main host before considering remote placement", async () => {
@@ -285,8 +286,20 @@ describe("host process task placement", () => {
     for(const needs of ["corpus",[1],[""]]) expect(()=>normalizeAgentRunRequest({task:"x",needs},defaults)).toThrow("needs");
     for (const name of ["run","spawn"]) expect((AGENTS_ACTION_DESCRIPTORS.find(d=>d.name===name)!.inputSchema as {properties:Record<string,unknown>}).properties.needs).toBeDefined();
   });
-  it("treats corpus as audit metadata while preserving local and unmet github placement", async () => {
+  it("keeps corpus needs local by default", async () => {
     const f=fixture();
+    expect(f.config.placement.corpusRemote).toBe(false);
+    const result=await f.manager.run({task:"same process task",transport:"process",needs:["corpus"]});
+    expect(result).toMatchObject({status:"completed",text:"LOCAL"});
+    const events=fs.readFileSync(path.join(f.manager.runDirectory(result.id)! ,"events.jsonl"),"utf8");
+    expect(events).toContain('"type":"placement.local"');
+    expect(events).toContain('"reason":"unmet needs: corpus"');
+    expect(events).toContain('"needs":["corpus"]');
+    expect(fs.existsSync(f.results)).toBe(false);
+  });
+  it("treats corpus as audit metadata while preserving local and unmet github placement when host opt-in is enabled", async () => {
+    const f=fixture();
+    f.config.placement.corpusRemote=true;
     const task="same process task";
     const corpus=await f.manager.run({task,transport:"process",needs:["corpus"]});
     const local=await f.manager.run({task,transport:"process",needs:["local"]});

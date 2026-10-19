@@ -100,6 +100,7 @@ describe.skipIf(process.platform === "win32")("installed fleet placement affinit
 
   it("admits an explicit corpus need through the fleet preflight and keeps it in the placement audit", async () => {
     const f = fixture({ executeRemote: true });
+    f.config.corpusRemote = true;
     const local = localWorkerRequest(f);
     local.request.needs = ["corpus"];
     const resultDirectory = path.join(f.base, "results", "affinity");
@@ -117,6 +118,14 @@ describe.skipIf(process.platform === "win32")("installed fleet placement affinit
     expect(fs.readFileSync(f.launchCalls, "utf8")).toBe("called\n");
   });
 
+  it("passes corpus to the helper by default, preserving the explicit location check", async () => {
+    const f = fixture();
+    expect(f.config.corpusRemote).toBe(false);
+    await expect(preflightFleetPlacement(f.request(f.cwd, ["corpus"], false), f.config, f.config.command, "portable task", f.env))
+      .rejects.toThrow("needs corpus: explicit corpus need");
+    expect(fs.existsSync(f.sshCalls)).toBe(false);
+  });
+
   it("preserves the explicit github need in fleet preflight", async () => {
     const f = fixture();
     await expect(preflightFleetPlacement(f.request(f.cwd, ["github"], false), f.config, f.config.command, "portable task", f.env))
@@ -126,6 +135,7 @@ describe.skipIf(process.platform === "win32")("installed fleet placement affinit
 
   it.each(["prompt", "requires"] as const)("still refuses a path-derived corpus input in %s during fleet preflight", async location => {
     const f = fixture();
+    f.config.corpusRemote = true;
     const corpusPath = path.join(f.base, "private-corpus", "secret.txt");
     const request = {
       ...f.request(f.cwd, ["corpus"], false),

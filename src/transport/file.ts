@@ -8,6 +8,7 @@ import {
   type TransportDelivery, type TransportDrainState, type TransportEnvelope,
   type TransportKv, type TransportOwner, type TransportSent,
 } from "./types.js";
+import { fabricPathBProbeEpochNs, hasFabricPathBProbeObserver, recordFabricPathBProbe } from "./probe-hooks.js";
 
 const CONTROL_TOPIC = "fabric.control.command";
 const ACK_TOPIC = "fabric.control.ack";
@@ -92,7 +93,18 @@ export class FileTransport implements FabricTransport {
    * The control plane must observe publication uncertainty even after a positive append. */
   publish(input: MeshPublishInput): Promise<MeshEvent> {
     if (this.#closed) return Promise.reject(new TransportUnavailableError("File transport closed"));
-    return this.#trackPublish(this.mesh.publish(input));
+    const operation = this.mesh.publish(input).then(event => {
+      if (hasFabricPathBProbeObserver() && (input.topic === CONTROL_TOPIC || input.topic === ACK_TOPIC)) {
+        const body = event.data;
+        const record = body && typeof body === "object" && !Array.isArray(body) ? body as Record<string, unknown> : undefined;
+        recordFabricPathBProbe({ type: "file-append", atNs: fabricPathBProbeEpochNs(), carrier: "file",
+          envelopeId: event.id, ...(typeof record?.commandId === "string" ? { commandId: record.commandId } : {}),
+          kind: input.topic === CONTROL_TOPIC ? "command" : "ack", operation: event.kind,
+          targetId: typeof record?.targetId === "string" ? record.targetId : event.to ?? "", sequence: event.sequence, duplicate: false });
+      }
+      return event;
+    });
+    return this.#trackPublish(operation);
   }
 
   #trackPublish(operation: Promise<MeshEvent>): Promise<MeshEvent> {
@@ -201,10 +213,16 @@ export class FileTransport implements FabricTransport {
       }
       throw error;
     }
-    return { id: captured.id, sequence: event.sequence, duplicate: false,
-      envelope: { ...captured, from: event.from, principal: event.principal,
-        body: event.data as T, createdAt: event.createdAt,
-        ...(event.sender ? { sender: event.sender } : {}) } };
+    const resolved = { ...captured, from: event.from, principal: event.principal,
+      body: event.data as T, createdAt: event.createdAt,
+      ...(event.sender ? { sender: event.sender } : {}) };
+    const resolvedBody = resolved.body;
+    const commandId = resolvedBody && typeof resolvedBody === "object" && !Array.isArray(resolvedBody) && typeof (resolvedBody as Record<string, unknown>).commandId === "string"
+      ? (resolvedBody as Record<string, unknown>).commandId as string : undefined;
+    if (hasFabricPathBProbeObserver()) recordFabricPathBProbe({ type: "file-append", atNs: fabricPathBProbeEpochNs(), carrier: "file",
+      envelopeId: captured.id, ...(commandId ? { commandId } : {}), kind: captured.kind, operation: captured.operation,
+      targetId: captured.targetId, sequence: event.sequence, duplicate: false });
+    return { id: captured.id, sequence: event.sequence, duplicate: false, envelope: resolved };
   }
 
   async *inbox(signal: AbortSignal): AsyncIterable<TransportDelivery<TransportEnvelope>> {
@@ -263,12 +281,16 @@ export class FileTransport implements FabricTransport {
               receipt = finish;
               const confirmed = new Promise<void>((resolve, reject) => { confirmation = { sequence: event.sequence, resolve, reject }; });
               void confirmed.catch(() => undefined);
+              const commandId = body && typeof body === "object" && "commandId" in body && typeof body.commandId === "string" ? body.commandId : undefined;
               const acknowledge = async () => {
                 if (stopped()) throw new TransportUnavailableError("File inbox stopped");
                 finish();
                 await confirmed;
+                if (hasFabricPathBProbeObserver()) recordFabricPathBProbe({ type: "inbox-ack-confirmed", atNs: fabricPathBProbeEpochNs(), carrier: "file",
+                  envelopeId: event.id, ...(commandId ? { commandId } : {}),
+                  kind: event.topic === ACK_TOPIC ? "ack" : "command", operation: event.kind,
+                  targetId, sequence: event.sequence, attempt: 1 });
               };
-              const commandId = body && typeof body === "object" && "commandId" in body && typeof body.commandId === "string" ? body.commandId : undefined;
               const logicalId = commandId === undefined ? event.id : event.topic === ACK_TOPIC ? `ack:${commandId}` : commandId;
               offer = {
                 payload: { id: logicalId, kind: event.topic === ACK_TOPIC ? "ack" : "command",

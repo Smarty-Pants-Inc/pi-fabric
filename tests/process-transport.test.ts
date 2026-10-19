@@ -554,12 +554,13 @@ describe.skipIf(process.platform !== "linux" || !isV2)("ProcessTransport task me
     expect(properties(args)).toEqual(expect.arrayContaining([`MemoryMax=${GIB}`, "MemorySwapMax=0"]));
   });
 
-  it("does not cap actors: an actor launch keeps the uncapped processSlice scope, or none", async () => {
+  it("keeps actor Git env unchanged and gives process tasks the read-only token", async () => {
     const f = await fixture("live");
     vi.stubEnv("FABRIC_TASK_MEMORY_MAX", "25769803776");
     vi.stubEnv("FABRIC_TASK_CGROUP", "/a/fabric-task-parent.scope");
     vi.stubEnv("FABRIC_TASK_SYSTEMD_RUN_WRAPPER", "/parent/bin/systemd-run");
     vi.stubEnv("PI_FABRIC_ROLE", "actor");
+    vi.stubEnv("SMARTY_GIT_READ_ONLY", "caller-value");
     fs.appendFileSync(f.worker, '\nfs.writeFileSync("actor-env.json", JSON.stringify(process.env));');
     const actor = { ...f.request, workerArguments: ["--actor-id", "actor:a"] };
     await launch(new ProcessTransport(undefined, undefined, undefined, 24 * GIB), actor, f.root);
@@ -574,8 +575,35 @@ describe.skipIf(process.platform !== "linux" || !isV2)("ProcessTransport task me
       expect(environment[key], `uncapped actor inherited ${key}`).toBeUndefined();
     }
     expect(environment.PI_FABRIC_ROLE).toBe("actor");
+    expect(environment.SMARTY_GIT_READ_ONLY).toBe("caller-value");
     const { cappedTaskBashBlockReason } = await import("../src/guards/actor-bash-hook.js");
     expect(cappedTaskBashBlockReason(environment, "/usr/bin/systemd-run --user --scope -- true")).toBeUndefined();
+
+    // A normal task launch must override the caller's value. Disable the fixture bus so this
+    // test exercises the real child environment without requiring a host cgroup scope.
+    vi.stubEnv("XDG_RUNTIME_DIR", path.join(f.root, "no-bus"));
+    vi.stubEnv("DBUS_SESSION_BUS_ADDRESS", undefined);
+    fs.unlinkSync(path.join(f.root, "started"));
+    const taskRequest = {
+      ...f.request,
+      childEnvironment: (environment: NodeJS.ProcessEnv) => ({ ...environment, SMARTY_GIT_READ_ONLY: "0",
+        GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "credential.helper", GIT_CONFIG_VALUE_0: "inherited-write-helper",
+        GIT_CONFIG_PARAMETERS: "'credential.helper=inherited-write-helper'" }),
+    };
+    await launch(new ProcessTransport(), taskRequest, f.root);
+    const taskEnvironment = JSON.parse(fs.readFileSync(path.join(f.root, "actor-env.json"), "utf8"));
+    expect(taskEnvironment.SMARTY_GIT_READ_ONLY).toBe("1");
+    expect(taskEnvironment.GIT_CONFIG_COUNT).toBe("4");
+    expect(taskEnvironment.GIT_CONFIG_PARAMETERS).toBeUndefined();
+    expect(taskEnvironment.GIT_CONFIG_KEY_1).toBe("credential.helper");
+    expect(taskEnvironment.GIT_CONFIG_VALUE_1).toBe("");
+    expect(taskEnvironment.GIT_CONFIG_KEY_2).toBe("credential.helper");
+    expect(taskEnvironment.GIT_CONFIG_VALUE_2).toContain("token");
+    expect(taskEnvironment.GIT_CONFIG_VALUE_2).not.toContain("--write");
+    expect(taskEnvironment.GIT_CONFIG_VALUE_2).not.toContain("--git");
+    expect(taskEnvironment.GIT_CONFIG_KEY_3).toBe("credential.useHttpPath");
+    expect(taskEnvironment.GIT_CONFIG_VALUE_3).toBe("true");
+    expect(process.env.SMARTY_GIT_READ_ONLY).toBe("caller-value");
   });
 
   it("without a user bus the cap is ineligible: direct launch, no systemd-run, no cgroup claim", async () => {
@@ -717,14 +745,14 @@ describe("process transport startup diagnostics", () => {
 // while the worker's own same-run native child keeps it (opt-in preserveTaskBoundary).
 describe("taskAgentEnvironment capped-boundary evidence (smarty-dev#8257)", () => {
   const parent = { PATH: "/task/bin:/usr/bin", FABRIC_TASK_MEMORY_MAX: "25769803776", FABRIC_TASK_CGROUP: "/a/fabric-task-x.scope",
-    FABRIC_TASK_SYSTEMD_RUN_WRAPPER: "/task/bin/systemd-run", OTHER: "kept" };
+    FABRIC_TASK_SYSTEMD_RUN_WRAPPER: "/task/bin/systemd-run", SMARTY_GIT_READ_ONLY: "0", OTHER: "kept" };
   it("scrubs memory/cgroup/wrapper by default (new task launch), leaving PATH and others untouched", async () => {
     const { taskAgentEnvironment } = await import("../src/agents/task-environment.js");
     const child = taskAgentEnvironment({ ...parent });
     expect(child.FABRIC_TASK_MEMORY_MAX).toBeUndefined();
     expect(child.FABRIC_TASK_CGROUP).toBeUndefined();
     expect(child.FABRIC_TASK_SYSTEMD_RUN_WRAPPER).toBeUndefined();
-    expect(child).toMatchObject({ PATH: parent.PATH, OTHER: "kept" });
+    expect(child).toMatchObject({ PATH: parent.PATH, SMARTY_GIT_READ_ONLY: "1", OTHER: "kept" });
     expect(taskAgentEnvironment({ ...parent }, false).FABRIC_TASK_CGROUP).toBeUndefined();
   });
   it("new actor scrub keeps roles while dropping only the caller's boundary", async () => {
@@ -738,7 +766,8 @@ describe("taskAgentEnvironment capped-boundary evidence (smarty-dev#8257)", () =
   it("preserves all three for the same run when preserveTaskBoundary is true", async () => {
     const { taskAgentEnvironment } = await import("../src/agents/task-environment.js");
     expect(taskAgentEnvironment({ ...parent }, true)).toMatchObject({ FABRIC_TASK_MEMORY_MAX: parent.FABRIC_TASK_MEMORY_MAX,
-      FABRIC_TASK_CGROUP: parent.FABRIC_TASK_CGROUP, FABRIC_TASK_SYSTEMD_RUN_WRAPPER: parent.FABRIC_TASK_SYSTEMD_RUN_WRAPPER });
+      FABRIC_TASK_CGROUP: parent.FABRIC_TASK_CGROUP, FABRIC_TASK_SYSTEMD_RUN_WRAPPER: parent.FABRIC_TASK_SYSTEMD_RUN_WRAPPER,
+      SMARTY_GIT_READ_ONLY: "1" });
   });
 });
 

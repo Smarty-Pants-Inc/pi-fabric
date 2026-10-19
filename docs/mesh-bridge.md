@@ -7,12 +7,18 @@ existing events and mirrors root presence. The additive publish-receipt hello ca
 ## What crosses
 
 - `fabric.control.command` and `fabric.control.ack`, well-formed `fleet.work.<name>` topics,
-  `ops.owner` with kind `pr.wake`, the session-addressed delivery-age owner alarm/recovery, and the versioned `fabric.alarm.bridge-stall` alarm when
-  addressed to a canonical live session on the other side. A well-formed work topic is at most 128 characters of dot-separated, non-empty ASCII
-  segments of `[A-Za-z0-9_-]` (a dot-led repo such as `.github` is the one exception), so every
-  work topic that crosses also passes the mesh's and `mesh_answers`' topic pattern. `fleet.work.`,
-  `fleet.work..1`, `fleet.work.a..b.1`, a trailing dot, NUL, space, lookalike or other non-ASCII
-  character does not cross to anyone.
+  `ops.owner` with kind `pr.wake`, the session-addressed delivery-age and legacy-baseline
+  alarm/recovery events, and the versioned `fabric.alarm.bridge-stall` alarm when addressed to a
+  canonical live session on the other side. A legacy peer without an acknowledged complete
+  presence baseline is paged after more than two minutes using monotonic elapsed time; a transient
+  publish failure is retried after one second, alarm/recovery publishes are bounded to 15 seconds,
+  and an acknowledged complete baseline emits recovery. Partial-presence-capable
+  peers are not paged; without a configured mesh-alarm recipient the structured mesh-outage journal
+  records the episode. A well-formed work topic is at most 128 characters of dot-separated,
+  non-empty ASCII segments of `[A-Za-z0-9_-]` (a dot-led repo such as `.github` is the one
+  exception), so every work topic that crosses also passes the mesh's and `mesh_answers`' topic
+  pattern. `fleet.work.`, `fleet.work..1`, `fleet.work.a..b.1`, a trailing dot, NUL, space,
+  lookalike or other non-ASCII character does not cross to anyone.
 - For bridged `fabric.control.command` and `fabric.control.ack` events, each direction samples
   origin `createdAt` through the destination's durable append timestamp, plus the destination RPC
   receipt latency. It logs one event-driven line per nonempty minute:

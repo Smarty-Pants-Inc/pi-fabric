@@ -10,8 +10,9 @@ existing events and mirrors root presence. The additive publish-receipt hello ca
   `ops.owner` with kind `pr.wake`, the session-addressed delivery-age and legacy-baseline
   alarm/recovery events, and the versioned `fabric.alarm.bridge-stall` alarm when addressed to a
   canonical live session on the other side. A legacy peer without an acknowledged complete
-  presence baseline is paged after more than two minutes; a transient publish failure is retried
-  after one second, and an acknowledged complete baseline emits recovery. Partial-presence-capable
+  presence baseline is paged after more than two minutes using monotonic elapsed time; a transient
+  publish failure is retried after one second, alarm/recovery publishes are bounded to 15 seconds,
+  and an acknowledged complete baseline emits recovery. Partial-presence-capable
   peers are not paged; without a configured mesh-alarm recipient the structured mesh-outage journal
   records the episode. A well-formed work topic is at most 128 characters of dot-separated,
   non-empty ASCII segments of `[A-Za-z0-9_-]` (a dot-led repo such as `.github` is the one

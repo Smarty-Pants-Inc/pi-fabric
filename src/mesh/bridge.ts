@@ -18,7 +18,7 @@ import { assertBridgeStateBackend, isMeshRetryableBusy, isMeshStateWalCap } from
 import { BridgeDeliveryAgeMonitor, type BridgeDeliveryAgeAlarm } from "./bridge-delivery-age.js";
 import { watchBridgeStore, type BridgeChange } from "./change-notifier.js";
 import { BRIDGE_BATCH_MAX_EVENTS } from "./event-log.js";
-import { BridgeLegacyBaselineAlarmEpisode, isLegacyBaselineAlarmEligible, type BridgeLegacyBaselineAlarm } from "./bridge-baseline-alarms.js";
+import { BridgeLegacyBaselineAlarmEpisode, supportsLegacyBaselineAlarm, type BridgeLegacyBaselineAlarm } from "./bridge-baseline-alarms.js";
 import { controlBodyFingerprint, FABRIC_IDEMPOTENCY_KEY_REUSED, FabricIdempotencyKeyReusedError } from "./control-idempotency.js";
 import { HUB_FACTORY_RECIPIENT, isAddressedHubFactoryEvent, isWorkTopic, parseWorkTopic } from "./bridge-topics.js";
 export { HUB_FACTORY_RECIPIENT, isWorkTopic, parseWorkTopic } from "./bridge-topics.js";
@@ -2292,6 +2292,7 @@ export class RemoteBridgeSide implements BridgeSide {
   #legacyCompletedPartials = 0;
   #legacyNoBaselineCycles = 0;
   #legacyNoBaselineSince: number | undefined;
+  #legacyNoBaselineSinceMonotonic: number | undefined;
   #legacyMirrorSnapshot: LegacyMirrorSnapshot | undefined;
   #lastPresenceRenewalAt = Number.NEGATIVE_INFINITY;
   #independentRpc = false;
@@ -2445,6 +2446,7 @@ export class RemoteBridgeSide implements BridgeSide {
   /** Consecutive partial cycles skipped because no legacy complete baseline exists. */
   get legacyNoBaselineCycles(): number { return this.#legacyNoBaselineCycles; }
   get legacyNoBaselineSince(): number | undefined { return this.#legacyNoBaselineSince; }
+  get legacyNoBaselineSinceMonotonic(): number | undefined { return this.#legacyNoBaselineSinceMonotonic; }
   /** Negotiated peer capabilities; undefined until hello completes. */
   get supportsPartialPresence(): boolean | undefined {
     return this.#protocolVersion === undefined ? undefined : this.#supportsPartialPresence;
@@ -2540,7 +2542,10 @@ export class RemoteBridgeSide implements BridgeSide {
       // baseline, fail closed; otherwise hold each omitted root for at most three lease periods.
       if (!this.#legacyMirrorSnapshot) {
         this.#legacyNoBaselineCycles += 1;
-        this.#legacyNoBaselineSince ??= Date.now();
+        if (this.#legacyNoBaselineSince === undefined) {
+          this.#legacyNoBaselineSince = Date.now();
+          this.#legacyNoBaselineSinceMonotonic = monotonicClock.now();
+        }
         return;
       }
       let complete = completeLegacyPartial(outbound, this.#legacyMirrorSnapshot, Date.now());
@@ -2559,6 +2564,7 @@ export class RemoteBridgeSide implements BridgeSide {
       this.#legacyMirrorSnapshot = copyLegacySnapshot(outbound);
       this.#legacyNoBaselineCycles = 0;
       this.#legacyNoBaselineSince = undefined;
+      this.#legacyNoBaselineSinceMonotonic = undefined;
     }
   }
   bridgedIds(after: number): Promise<BridgedIds> { return this.#call("bridgedIds", { after }); }
@@ -3116,9 +3122,11 @@ export class MeshBridge {
         `legacyNoBaselineCycles=${noBaselineCycles}; existing peer mirror is left untouched`);
       this.#legacyNoBaselineWarned = true;
     }
-    if (isLegacyBaselineAlarmEligible(remote?.supportsPartialPresence, noBaselineCycles) && this.options.publishLegacyBaselineAlarm) {
+    if (remote && supportsLegacyBaselineAlarm(remote.supportsPartialPresence) && this.options.publishLegacyBaselineAlarm) {
       this.#legacyBaselineAlarm.observe({ peer: this.options.remoteName,
-        sinceMs: noBaselineCycles > 0 ? noBaselineSince : undefined, at: now }, this.options.publishLegacyBaselineAlarm,
+        sinceMs: noBaselineCycles > 0 ? noBaselineSince : undefined,
+        sinceMonotonicMs: noBaselineCycles > 0 ? remote.legacyNoBaselineSinceMonotonic : undefined,
+        at: now, monotonicAt: monotonicClock.now() }, this.options.publishLegacyBaselineAlarm,
       (error: unknown) => {
         this.#log(`presence alarm publish failed: peer=${this.options.remoteName}; ${error instanceof Error ? error.message : String(error)}`);
         this.#wake?.();
@@ -4338,12 +4346,15 @@ export class MeshBridge {
           const legacyInfoAt = remote && remote.legacyNoBaselineCycles > 0 && !this.#legacyNoBaselineOverdueReported &&
             noBaselineSince !== undefined
             ? noBaselineSince + LEGACY_PARTIAL_HOLD_MS + 1 : Infinity;
-          const noBaselineAlarmAt = remote && isLegacyBaselineAlarmEligible(remote.supportsPartialPresence,
-            remote.legacyNoBaselineCycles) && noBaselineSince !== undefined && this.options.publishLegacyBaselineAlarm
-            ? this.#legacyBaselineAlarm.nextAttemptAt(noBaselineSince) ?? Infinity : Infinity;
+          const noBaselineAlarmAt = remote && supportsLegacyBaselineAlarm(remote.supportsPartialPresence) &&
+            remote.legacyNoBaselineCycles > 0 && remote.legacyNoBaselineSinceMonotonic !== undefined && this.options.publishLegacyBaselineAlarm
+            ? this.#legacyBaselineAlarm.nextAttemptAt(remote.legacyNoBaselineSinceMonotonic) ?? Infinity : Infinity;
           const deadline = Math.min(this.#expiryAt,
-            this.#leaseVersion !== this.#syncedLeaseVersion ? this.#leaseRenewAt : Infinity, legacyInfoAt, noBaselineAlarmAt);
+            this.#leaseVersion !== this.#syncedLeaseVersion ? this.#leaseRenewAt : Infinity, legacyInfoAt);
           if (Number.isFinite(deadline)) delay = Math.max(0, deadline - Date.now());
+          if (Number.isFinite(noBaselineAlarmAt)) {
+            delay = Math.min(delay ?? Infinity, Math.max(0, noBaselineAlarmAt - monotonicClock.now()));
+          }
           if (this.#legacyPolling) delay = Math.min(delay ?? Infinity, this.options.pollMs ?? LEGACY_POLL_MS);
         } catch (error) {
           if (this.#stopped) return;

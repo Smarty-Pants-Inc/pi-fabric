@@ -19,6 +19,7 @@ import { readMeshStateMovedMarker } from "./mesh/backend-fence.js";
 import { BRIDGE_STALL_ALARM_TOPIC, DEFAULT_CALL_TIMEOUT_MS, DEFAULT_FACTORY_RATE, MeshBridge, RemoteBridgeSide,
   serveBridgeAgent, StoreBridgeSide, validBridgeName, type BridgeStallAlarm } from "./mesh/bridge.js";
 import { BridgeRelayUnavailableError, startBridgeRelay } from "./mesh/bridge-relay.js";
+import { BRIDGE_DELIVERY_AGE_ALERT_MS, type BridgeDeliveryAgeAlarm } from "./mesh/bridge-delivery-age.js";
 import { BridgeHandoffRefusedError, BridgeHandoffUsageError, handOffNativeIdentity, handoffRootId, listHandoffs, revokeHandoff } from "./mesh/bridge-handoff.js";
 import { MeshStore, meshAlarmRecipient, type MeshStoreOptions } from "./mesh/store.js";
 import { systemdWatchdogNotify } from "./mesh/systemd-watchdog.js";
@@ -260,6 +261,21 @@ export const runBridge = async (
         await local.store.publish({ topic: BRIDGE_STALL_ALARM_TOPIC, kind: "bridge-stall",
           from: { id: `bridge:${localName}`, name: "mesh-bridge", kind: "main" }, to,
           text: alarm.reason, data: alarm, dedupeKey: `bridge-stall:${localName}:${remoteName}:${alarm.stallId}` });
+      },
+      publishDeliveryAgeAlarm: async (alarm: BridgeDeliveryAgeAlarm) => {
+        const to = meshAlarmRecipient();
+        if (!to) {
+          log("delivery-age alarm has no configured mesh alarm session recipient");
+          return;
+        }
+        await local.store.publish({ topic: "ops.owner",
+          kind: alarm.state === "outage" ? "bridge.delivery-age.alarm" : "bridge.delivery-age.recovered",
+          from: { id: `bridge:${localName}`, name: "mesh-bridge", kind: "main" }, to,
+          text: alarm.state === "outage"
+            ? `Bridge ${remoteName} ${alarm.direction} delivery or receipt age exceeded ${BRIDGE_DELIVERY_AGE_ALERT_MS} ms (${alarm.reason}, delivery ${alarm.maxDeliveryAgeMs} ms, receipt ${alarm.maxAckLatencyMs} ms)`
+            : `Bridge ${remoteName} ${alarm.direction} delivery recovered after ${alarm.durationMs ?? 0} ms (max delivery ${alarm.maxDeliveryAgeMs} ms, receipt ${alarm.maxAckLatencyMs} ms)`,
+          data: alarm,
+          dedupeKey: `bridge-delivery-age:${localName}:${remoteName}:${alarm.direction}:${alarm.episodeId}:${alarm.state}` });
       },
       factoryRate,
       ...(logLevel === "debug" ? { debug: (message: string) => log(`debug: ${message}`) } : {}),

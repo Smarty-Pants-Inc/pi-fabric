@@ -4567,14 +4567,15 @@ export class ActorManager {
   }
 
   #unstartedReplayId(item: ActorQueueItem): string | undefined {
+    // Require an explicit replay/delivery key. Every mesh envelope has an id, but treating that
+    // generic id as a replay key would bypass existing failure backoff for ordinary messages.
     const event = refRecord(item.payload);
     const data = refRecord(event?.data);
     const payload = refRecord(event?.payload);
     const activationData = refRecord("data" in item.activation ? item.activation.data : undefined);
     const replayId = [data?.replayId, payload?.replayId, event?.replayId, activationData?.replayId,
       data?.deliveryId, payload?.deliveryId, event?.deliveryId, activationData?.deliveryId,
-      item.coalesceKey, item.settledDeliveryId, item.outcomeSend?.eventId,
-      item.source.startsWith("mesh:") ? event?.id : undefined]
+      item.coalesceKey, item.settledDeliveryId, item.outcomeSend?.eventId]
       .find(value => typeof value === "string" && value.trim().length > 0);
     return typeof replayId === "string" ? replayId : undefined;
   }

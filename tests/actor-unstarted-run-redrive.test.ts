@@ -97,6 +97,23 @@ describe("actor runs that end before inference (#15195)", () => {
     expect(alarms(h.mesh)).toHaveLength(1);
   });
 
+  it("does not re-drive an ordinary mesh item without an explicit replay or delivery identity", async () => {
+    const h = fixture();
+    const actor = await actorRequest(h.actors, "ordinary-reviewer");
+    const requests: AgentRunRequest[] = [];
+    vi.spyOn(h.agents, "run").mockImplementation(async (request, _signal, onSpawned) => {
+      requests.push(request);
+      const id = randomUUID().replace(/-/g, "");
+      onSpawned?.(handleFor(request, id));
+      return resultFor(request, id, "stopped", false);
+    });
+    await h.mesh.publish({ topic: "review.requests", from: identity, kind: "notification", text: "ordinary delivery" });
+    await waitFor(() => requests.length === 1 && h.actors.status(actor.id).status === "idle" && h.actors.status(actor.id).queued === 0);
+    await new Promise(resolve => setTimeout(resolve, 60));
+    expect(requests).toHaveLength(1);
+    expect(alarms(h.mesh)).toHaveLength(0);
+  });
+
   it("does not re-drive a run that started inference", async () => {
     const h = fixture(false);
     const actor = await actorRequest(h.actors);

@@ -5,7 +5,7 @@ import { execFileSync } from "node:child_process";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { loadFabricConfig, normalizeFabricConfig } from "../src/config.js";
-import { preflightFleetPlacement, placementLocalPathReason } from "../src/agents/transports/placement-preflight.js";
+import { corpusRemotePreflightEligible, preflightFleetPlacement, placementLocalPathReason } from "../src/agents/transports/placement-preflight.js";
 import type { AgentTransportLaunch } from "../src/agents/types.js";
 import { AgentInputError } from "../src/agents/input-validation.js";
 
@@ -17,10 +17,16 @@ afterEach(() => {
 
 function fixture(options: { candidates?: string[]; pickerExit?: number; sshExit?: number; executeRemote?: boolean } = {}) {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-placement-affinity-")); roots.push(base);
+  const home = path.join(base, "home"); fs.mkdirSync(home);
+  vi.spyOn(os, "homedir").mockReturnValue(home);
   // The test runner allocates outside /srv/scratch; caller TMPDIR is private, not the portable workspace.
   const callerTmp = path.join(base, "caller-tmp"); fs.mkdirSync(callerTmp);
   vi.stubEnv("TMPDIR", callerTmp);
-  const root = path.join(base, "install");
+  const factory = path.join(home, ".local", "share", "smarty-dev", "factory");
+  const releaseId = "a".repeat(40);
+  const root = path.join(factory, "releases", releaseId);
+  fs.mkdirSync(path.dirname(path.join(root, "bin", "placeholder")), { recursive: true });
+  fs.symlinkSync(path.join("releases", releaseId), path.join(factory, "current"), "dir");
   const mkdir = (file: string) => fs.mkdirSync(path.dirname(file), { recursive: true });
   const write = (file: string, text: string) => { mkdir(file); fs.writeFileSync(file, text); };
   write(path.join(root, "setup/factory/task-preflight.py"), [
@@ -59,7 +65,7 @@ function fixture(options: { candidates?: string[]; pickerExit?: number; sshExit?
     : `${options.sshExit === 3 ? "printf 'PREFLIGHT_MISSING 1\\n'" : ":"}\nexit "${options.sshExit ?? 0}"`}\n`); fs.chmodSync(ssh, 0o700);
   const cwd = path.join(base, "workspace"); fs.mkdirSync(cwd);
   const config = normalizeFabricConfig({ agents: { placement: {
-    default: "remote", command: [fleet, "--host", "auto", "--cwd", cwd, "--", "task"],
+    default: "remote", command: [path.join(factory, "current", "bin", "smarty-task-ryzen2"), "--host", "auto", "--cwd", cwd, "--", "task"],
     resultDirectory: path.join(base, "results", "{id}"), cancelCommand: ["true"], commandTimeoutMs: 1_000,
     sshAliases: { intel1: "intel1-agent", ryzen2: "r2-agent", ryzen3: "r3-agent", qs32729: "qs32729-agent" }, sharedMounts: [cwd], pickerCommand: [picker],
   } } }).agents.placement!;
@@ -72,7 +78,28 @@ function fixture(options: { candidates?: string[]; pickerExit?: number; sshExit?
     id: "affinity", name: "affinity", cwd: cwdPath, workerPath: "unused", workerArguments: [], needs,
     ...(withRequires ? { requires: [path.join(base, "target-only", "corpus.dat")] } : {}),
   });
-  return { base, root, cwd, callerTmp, config, env, request, picker, sshCalls: env.SSH_CALLS, pickerCalls: env.PICKER_CALLS, launchCalls: env.LAUNCH_CALLS };
+  return { base, home, factory, root, cwd, callerTmp, config, env, request, picker, sshCalls: env.SSH_CALLS, pickerCalls: env.PICKER_CALLS, launchCalls: env.LAUNCH_CALLS };
+}
+
+/** Model a secure mounted parent for the fixture while keeping its files inside the test's private TMPDIR. */
+function trustTemporaryFixtureAncestors(base: string) {
+  const ancestors = new Set<string>();
+  for (let directory = path.dirname(fs.realpathSync(base)); ; directory = path.dirname(directory)) {
+    ancestors.add(directory);
+    if (directory === path.parse(directory).root) break;
+  }
+  const uid = typeof process.getuid === "function" ? process.getuid() : 0;
+  const original = fs.lstatSync.bind(fs);
+  vi.spyOn(fs, "lstatSync").mockImplementation(((file: { toString(): string }) => {
+    const info = original(file.toString());
+    if (!ancestors.has(path.resolve(file.toString()))) return info;
+    return new Proxy(info, { get(target, property) {
+      if (property === "uid") return target.uid === 0 ? 0 : uid;
+      if (property === "mode") return target.mode & ~0o022;
+      const value = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    } }) as fs.Stats;
+  }) as unknown as typeof fs.lstatSync);
 }
 
 function localWorkerRequest(f: ReturnType<typeof fixture>, cwd = f.cwd) {
@@ -98,26 +125,62 @@ describe.skipIf(process.platform === "win32")("installed fleet placement affinit
     expect(result?.command.slice(result.command.indexOf("--host"), result.command.indexOf("--host") + 2)).toEqual(["--host", "intel1"]);
   });
 
-  it("admits corpus only on an allow-listed host and keeps it in the placement audit", async () => {
-    const f = fixture({ candidates: ["ryzen3", "ryzen2"], executeRemote: true });
+  it("preflights corpus only on an allow-listed host selected by the trusted release", async () => {
+    const f = fixture({ candidates: ["ryzen3", "ryzen2"] });
     f.config.corpusRemoteHosts = ["ryzen2"];
+    expect(corpusRemotePreflightEligible(f.config, f.cwd)).toBe(false);
+    trustTemporaryFixtureAncestors(f.base);
+    const releaseBin = path.join(f.root, "bin");
+    fs.chmodSync(releaseBin, 0o770);
+    expect(corpusRemotePreflightEligible(f.config, f.cwd)).toBe(false);
+    fs.chmodSync(releaseBin, 0o700);
+    expect(corpusRemotePreflightEligible(f.config, f.cwd)).toBe(true);
+    const current = path.join(f.factory, "current");
+    fs.unlinkSync(current);
+    fs.symlinkSync(path.join("..", "outside-release"), current, "dir");
+    expect(corpusRemotePreflightEligible(f.config, f.cwd)).toBe(false);
+    fs.unlinkSync(current);
+    fs.symlinkSync(path.join("releases", path.basename(f.root)), current, "dir");
+    expect(corpusRemotePreflightEligible(f.config, f.cwd)).toBe(true);
+    expect(corpusRemotePreflightEligible(f.config, f.cwd, "ryzen2")).toBe(true);
+    expect(corpusRemotePreflightEligible(f.config, f.cwd, "ryzen3")).toBe(false);
+    const request = f.request(f.cwd, ["corpus"], false);
+
+    const result = await preflightFleetPlacement(request, f.config, f.config.command, "portable task", f.env);
+
+    expect(result?.host).toBe("ryzen2");
+    expect(result?.command.slice(result.command.indexOf("--host"), result.command.indexOf("--host") + 2)).toEqual(["--host", "ryzen2"]);
+    expect(request.needs).toEqual(["corpus"]);
+    expect(fs.readFileSync(f.sshCalls, "utf8")).toBe("called\n");
+    expect(fs.existsSync(f.launchCalls)).toBe(false);
+  });
+
+  it.each(["local-bin", "temporary"] as const)("keeps corpus local for a %s launcher lookalike and never starts it", async location => {
+    const f = fixture();
+    f.config.corpusRemoteHosts = ["ryzen2"];
+    const launcher = location === "local-bin"
+      ? path.join(f.home, ".local", "bin", "smarty-task-ryzen2")
+      : path.join(f.base, "custom-bin", "smarty-task-ryzen2");
+    fs.mkdirSync(path.dirname(launcher), { recursive: true });
+    fs.writeFileSync(launcher, [
+      "#!/bin/sh",
+      "printf 'called\\n' >> \"$LAUNCH_CALLS\"",
+      "printf 'RYZEN2_TASK_ACCEPTED lookalike on ryzen2\\n'",
+      "",
+    ].join("\n"));
+    fs.chmodSync(launcher, 0o700);
+    const config = { ...f.config, command: [launcher, ...f.config.command.slice(1)] };
+    expect(corpusRemotePreflightEligible(config, f.cwd)).toBe(false);
     const local = localWorkerRequest(f);
     local.request.needs = ["corpus"];
-    const resultDirectory = path.join(f.base, "results", "affinity");
-    fs.mkdirSync(resultDirectory, { recursive: true });
-    fs.writeFileSync(path.join(resultDirectory, "rc"), "0");
-    fs.writeFileSync(path.join(resultDirectory, "result.md"), "REMOTE");
 
-    const handle = await new ProcessTransport(undefined, f.config).launch(local.request);
+    const handle = await new ProcessTransport(undefined, config).launch(local.request);
+    await handle.waitForClose?.();
 
-    expect(handle.sessionId).toBe("placement:affinity");
-    expect(await handle.isAlive()).toBe(false);
-    expect(fs.readFileSync(local.events, "utf8")).toContain('"type":"placement.remote"');
-    expect(fs.readFileSync(local.events, "utf8")).toContain('"needs":["corpus"]');
-    expect(fs.readFileSync(f.sshCalls, "utf8")).toBe("called\n");
-    expect(fs.readFileSync(f.launchCalls, "utf8")).toBe("called\n");
-    const argv = fs.readFileSync(f.env.LAUNCH_ARGS, "utf8").trim().split("\n");
-    expect(argv.slice(argv.indexOf("--host"), argv.indexOf("--host") + 2)).toEqual(["--host", "ryzen2"]);
+    expect(fs.readFileSync(local.marker, "utf8")).toBe("LOCAL");
+    expect(fs.readFileSync(local.events, "utf8")).toContain('"reason":"unmet needs: corpus"');
+    expect(fs.existsSync(f.launchCalls)).toBe(false);
+    expect(fs.existsSync(f.sshCalls)).toBe(false);
   });
 
   it("keeps corpus local when the qualified-host allow-list is empty", async () => {
@@ -135,6 +198,7 @@ describe.skipIf(process.platform === "win32")("installed fleet placement affinit
   it("keeps an explicit corpus target local when it is outside the qualified-host allow-list", async () => {
     const f = fixture({ candidates: ["ryzen2", "ryzen3"] });
     f.config.corpusRemoteHosts = ["ryzen2"];
+    trustTemporaryFixtureAncestors(f.base);
     const command = [...f.config.command]; command[command.indexOf("--host") + 1] = "ryzen3";
     const config = { ...f.config, command };
     const local = localWorkerRequest(f);
@@ -167,6 +231,7 @@ describe.skipIf(process.platform === "win32")("installed fleet placement affinit
   it.each(["prompt", "requires"] as const)("still refuses a path-derived corpus input in %s during fleet preflight", async location => {
     const f = fixture();
     f.config.corpusRemoteHosts = ["ryzen2"];
+    trustTemporaryFixtureAncestors(f.base);
     const corpusPath = path.join(f.base, "private-corpus", "secret.txt");
     const request = {
       ...f.request(f.cwd, ["corpus"], false),
@@ -300,8 +365,7 @@ describe.skipIf(process.platform === "win32")("installed fleet placement affinit
 
   it("fences lexical and canonical local-root descendants, but not prefix siblings", () => {
     const f = fixture();
-    const home = path.join(f.base, "home"); fs.mkdirSync(home);
-    vi.spyOn(os, "homedir").mockReturnValue(home);
+    const home = f.home;
     const state = path.join(home, ".local", "state"); fs.mkdirSync(state, { recursive: true });
     const config = { ...f.config, sharedMounts: [f.base] };
     for (const root of [f.callerTmp, state]) {

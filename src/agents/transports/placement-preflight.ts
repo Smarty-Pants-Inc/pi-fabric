@@ -127,11 +127,47 @@ const fleetRoot = (config: AgentPlacementConfig, cwd: string): string | undefine
     ? path.join(os.homedir(), ".local", "share", "smarty-dev", "factory", "current") : path.dirname(bin);
 };
 
-/** Corpus can bypass local placement only with a trusted fleet helper and a configured host allow-list. */
+const trustedDirectoryOwner = (info: fs.Stats, uid: number): boolean =>
+  (info.uid === 0 || info.uid === uid) && (info.mode & 0o022) === 0;
+
+/** The corpus exception trusts only the pinned launcher in the active factory release. */
+const trustedFactoryLauncherRoot = (config: AgentPlacementConfig, cwd: string): string | undefined => {
+  if (process.platform === "win32" || !path.isAbsolute(config.command[0]!)) return undefined;
+  const home = path.resolve(os.homedir());
+  const factory = path.join(home, ".local", "share", "smarty-dev", "factory");
+  const current = path.join(factory, "current");
+  const configuredLauncher = path.join(current, "bin", "smarty-task-ryzen2");
+  if (config.command[0] !== configuredLauncher) return undefined;
+  try {
+    if (fs.realpathSync(home) !== home || fs.realpathSync(factory) !== factory) return undefined;
+    const uid = typeof process.getuid === "function" ? process.getuid() : -1;
+    const currentInfo = fs.lstatSync(current);
+    if (!currentInfo.isSymbolicLink() || (currentInfo.uid !== 0 && currentInfo.uid !== uid)) return undefined;
+    const target = fs.readlinkSync(current);
+    const releaseMatch = /^releases\/([0-9a-f]{40})$/u.exec(target);
+    if (!releaseMatch) return undefined;
+    const release = path.join(factory, target);
+    if (fs.realpathSync(current) !== release) return undefined;
+    const executable = agentPlacementProbe(config, cwd).executable;
+    const launcher = path.join(release, "bin", "smarty-task-ryzen2");
+    if (executable !== configuredLauncher || fs.realpathSync(executable) !== launcher) return undefined;
+    for (let directory = path.dirname(launcher); ; directory = path.dirname(directory)) {
+      const info = fs.lstatSync(directory);
+      if (!info.isDirectory() || info.isSymbolicLink() || !trustedDirectoryOwner(info, uid)) return undefined;
+      if (directory === path.parse(directory).root) break;
+    }
+    const info = fs.lstatSync(launcher);
+    if (!info.isFile() || info.isSymbolicLink() || !trustedDirectoryOwner(info, uid) || (info.mode & 0o111) === 0) return undefined;
+    fs.accessSync(launcher, fs.constants.X_OK);
+    return release;
+  } catch { return undefined; }
+};
+
+/** Corpus can bypass local placement only with the active factory launcher and a configured host allow-list. */
 export const corpusRemotePreflightEligible = (config: AgentPlacementConfig, cwd: string, host?: string): boolean => {
   if (!config.corpusRemoteHosts.length) return false;
   try {
-    if (fleetRoot(config, cwd) === undefined) return false;
+    if (trustedFactoryLauncherRoot(config, cwd) === undefined) return false;
     return host === undefined || config.corpusRemoteHosts.includes(host);
   } catch { return false; }
 };

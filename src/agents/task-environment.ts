@@ -25,6 +25,9 @@ export const taskAgentEnvironment = (
   // an unstamped/non-fleet parent must not invent a revision.
   const revision = environment.SMARTY_ROLE?.match(/@([0-9a-f]{12,40})$/)?.[1];
   child.SMARTY_ROLE = `task-agent${revision ? `@${revision}` : ""}`;
+  // Process task agents always use the read-only Git credential token; never inherit
+  // a caller-selected value for this privilege-reducing boundary.
+  child.SMARTY_GIT_READ_ONLY = "1";
   // Preserve the parent's actual hosted-only admission across this role change; a
   // non-hosted parent cannot mint the marker merely by passing runner-looking env.
   if (isHostedOnlyAllowed(environment)) child[hostedAdmissionMarker] = "1";

@@ -394,12 +394,15 @@ export class ProcessTransport implements AgentTransportAdapter {
     assertTransportLaunchAllowed(request);
     // Actors preserve their role identity, not Main's temp environment.
     const prepared = prepareTaskTemporaryDirectory(workerArguments, baseEnvironment, request.cwd);
+    const childEnvironment = request.childEnvironment ? request.childEnvironment(prepared.environment) : prepared.environment;
+    // Keep the privilege boundary final even if a host-side launch callback tries to modify it.
+    if (!isActorLaunch(workerArguments)) childEnvironment.SMARTY_GIT_READ_ONLY = "1";
     const processHandle = await spawnDetached(
       selected.workerPath,
       prepared.workerArguments,
       request.cwd,
       request,
-      request.childEnvironment ? request.childEnvironment(prepared.environment) : prepared.environment,
+      childEnvironment,
       scope,
       7_000, // allow the worker's five-second execution-child cleanup
       process.platform !== "win32", // Windows retains its native-close/helper contract

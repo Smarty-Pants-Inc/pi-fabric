@@ -16,6 +16,7 @@ jobs:
     # so the dedicated jobs keep their broker-required gates and explicit lists.
     env:
       FABRIC_TEST_SKIP_NATS: '1'
+      NODE_OPTIONS: ${{ matrix.os == 'ubuntu-latest' && '--max-old-space-size=4096' || '' }}
     strategy:
       fail-fast: false
       matrix:

@@ -86,7 +86,10 @@ branch on ryzen5 (32 CPUs, shared and loaded, `nice -n 19`) with the default loa
 ## CI
 
 The self-hosted `smarty-linux-x64` pool serves our own pushes and the merge queue; fork pull requests
-use GitHub-hosted `ubuntu-latest` runners. The `mesh-lock-bench` job of
+use GitHub-hosted `ubuntu-latest` runners. The Linux `check` job's typecheck and entropy
+certification's build (which runs `tsc`) both use `NODE_OPTIONS=--max-old-space-size=4096`
+to avoid Node's default heap limit on that pool.
+The `mesh-lock-bench` job of
 `.github/workflows/test.yml` (Node 24; on pushes to `main` and pull requests whose base matches the
 workflow's `pull_request.branches`: `main` and the `refactor/sd-6477-**` / `feat/sd-6477-**` stack
 branches) builds and runs the default load against the committed baseline:

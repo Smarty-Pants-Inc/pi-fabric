@@ -31,11 +31,17 @@ type Activation = {
   responses: Map<string, string>;
   advertisedTools?: string[];
   discoveryResponse?: string;
+  temporary?: { id: string; sent: boolean; workerEnvironment: string[]; response?: string };
+};
+const temporaryArgs = {
+  command: String.raw`d=$(mktemp -d); printf x > "$d/claim.json"; printf 'claim=%s\n' "$d"; printf 'TMPDIR=%s\nTMP=%s\nTEMP=%s\n' "$TMPDIR" "$TMP" "$TEMP"`,
+  timeout: 10,
 };
 const textOf = (content: unknown): string => typeof content === "string" ? content :
   Array.isArray(content) ? content.map((part) => part?.text ?? "").join("\n") : JSON.stringify(content) ?? "";
 
-// Keep reason: actor state-file overwrite incident (smarty-dev#14404).
+// Keep reason: actor state-file overwrite incident (smarty-dev#14404), and the
+// host-to-actor temp environment trust boundary (smarty-dev#4605, Linux bash).
 // ActorManager -> AgentManager -> freshly built dist/worker.js -> native Pi CLI.
 // Only inference is substituted. Extensions=false uses advertised native tools;
 // extensions=true keeps fullCodeMode and calls the real pi.* tools via fabric_exec.
@@ -90,6 +96,9 @@ describe("native actor write/edit confinement", () => {
           for (const message of payload.messages) {
             if (message.role !== "tool") continue;
             if (message.tool_call_id === discoveryId) current.discoveryResponse = textOf(message.content);
+            if (current.temporary && message.tool_call_id === current.temporary.id) {
+              current.temporary.response = textOf(message.content);
+            }
             if (current.probes.some((probe) => probe.id === message.tool_call_id)) {
               current.responses.set(message.tool_call_id, textOf(message.content));
             }
@@ -114,6 +123,15 @@ describe("native actor write/edit confinement", () => {
             expect(runDirectory).toBeTruthy();
             const scratch = path.join(runDirectory, "tmp");
             current.scratch = scratch;
+            if (process.platform === "linux") {
+              // Observe the live worker's exec environment as well as bash's:
+              // worker.ts can mask a transport leak when it exports --tmpdir to Pi.
+              const workerPid = agents.status(runId!).sessionId;
+              expect(workerPid, "native process worker PID required").toMatch(/^\d+$/);
+              current.temporary = { id: `activation-${current.number}-temporary`, sent: false,
+                workerEnvironment: fs.readFileSync(`/proc/${workerPid}/environ`, "utf8").split("\0")
+                  .filter((entry) => /^(TMPDIR|TMP|TEMP)=/.test(entry)).sort() };
+            }
             let editSchema;
             if (extensions) {
               expect(current.advertisedTools, "full-code actor must expose its real execution tool").toContain("fabric_exec");
@@ -172,6 +190,12 @@ describe("native actor write/edit confinement", () => {
               code: `return await tools.call({ref:"pi.${probe.tool}",args:JSON.parse(π.args)});`,
               payloads: { args: JSON.stringify(probe.args) }, resultFormat: "json",
             } : probe.args);
+          } else if (current.temporary && !current.temporary.sent) {
+            current.temporary.sent = true;
+            reply(current.temporary.id, extensions ? "fabric_exec" : "bash", extensions ? {
+              code: 'return await tools.call({ref:"pi.bash",args:JSON.parse(π.args)});',
+              payloads: { args: JSON.stringify(temporaryArgs) }, resultFormat: "json",
+            } : temporaryArgs);
           } else {
             response.writeHead(200, { "Content-Type": "text/event-stream" });
             response.end(`data: ${JSON.stringify({
@@ -225,7 +249,8 @@ describe("native actor write/edit confinement", () => {
     cleanups.push(() => owner.close());
     const actor = await owner.create({ name: "native-write-policy", instructions: "Perform the supplied native write/edit probes.",
       delivery: "mailbox", responseMode: "text", runner: "pi", transport: "process", residency: "session",
-      model: "actor-write-offline/actor", tools: ["write", "edit"], extensions, nice: 19, timeoutMs: 45000 });
+      model: "actor-write-offline/actor", tools: ["write", "edit", ...(process.platform === "linux" ? ["bash"] : [])],
+      extensions, nice: 19, timeoutMs: 45000 });
     actorId = actor.id;
     sessionFile = actor.sessionFile!;
 
@@ -247,7 +272,7 @@ describe("native actor write/edit confinement", () => {
         throw new Error(`Native actor activation ${number} (extensions=${extensions}) failed: ${String(error)}\n` +
           `Fixture errors:\n${errors.map((entry) => entry instanceof Error ? entry.stack : String(entry)).join("\n")}\n` +
           `Tool surface: ${JSON.stringify(current.advertisedTools)}\nDiscovery: ${current.discoveryResponse}\n` +
-          `Last tool result: ${JSON.stringify([...current.responses].at(-1))}`, { cause: error });
+          `Last tool result: ${JSON.stringify([...current.responses].at(-1))}\nTemporary tool result: ${current.temporary?.response}`, { cause: error });
       }
       expect(errors).toEqual([]);
       expect(message.error).toBeUndefined();
@@ -292,6 +317,45 @@ describe("native actor write/edit confinement", () => {
           else expect(fs.readFileSync(actual, "utf8"), `${probe.id}: outside bytes must be unchanged`).toBe(before);
         } else expect(returned).not.toContain("Fabric write policy refuses");
       }
+      if (process.platform === "linux") {
+        // Linux /proc proves the worker's launch environment without replacing
+        // transport/worker/CLI; mktemp and claim creation run in the real bash tool.
+        const temporary = current.temporary!;
+        expect(temporary?.sent, "native bash temporary-directory probe must run").toBe(true);
+        const result = entries.find((entry) => entry.type === "message" && entry.message?.role === "toolResult" &&
+          entry.message.toolCallId === temporary.id)?.message;
+        expect(result, "native session must retain the real bash result").toBeTruthy();
+        expect(result.toolName).toBe(extensions ? "fabric_exec" : "bash");
+        expect(result.isError === true, textOf(result.content)).toBe(false);
+        expect(temporary.response, "inference must receive the actual bash result").toBe(textOf(result.content));
+        let output = temporary.response!;
+        if (extensions) {
+          expect(result.details?.success).toBe(true);
+          expect(result.details?.audits?.find((entry: any) => entry.ref === "pi.bash"))
+            .toMatchObject({ ref: "pi.bash", success: true });
+          const value = JSON.parse(output);
+          expect(value).toMatchObject({ ok: true, output: expect.any(String) });
+          output = value.output;
+        }
+        const lines = output.trimEnd().split("\n");
+        const directory = lines.find((line) => line.startsWith("claim="))?.slice("claim=".length);
+        const scratch = current.scratch!;
+        const environment = ["TMPDIR", "TMP", "TEMP"].map((key) =>
+          lines.find((line) => line.startsWith(`${key}=`))?.slice(key.length + 1));
+        expect(directory, `mktemp output: ${output}`).toBeTruthy();
+        expect(environment, "TMPDIR/TMP/TEMP must all name this run's scratch").toEqual([scratch, scratch, scratch]);
+        expect(temporary.workerEnvironment, "worker must not inherit Main's temp environment")
+          .toEqual([`TMPDIR=${scratch}`, `TMP=${scratch}`, `TEMP=${scratch}`].sort());
+        expect(path.dirname(directory!)).toBe(scratch);
+        expect(path.dirname(fs.realpathSync(directory!))).toBe(fs.realpathSync(scratch));
+        expect(fs.statSync(scratch).mode & 0o777).toBe(0o700);
+        expect(fs.statSync(directory!).isDirectory()).toBe(true);
+        expect(fs.statSync(directory!).mode & 0o777).toBe(0o700);
+        const claim = path.join(directory!, "claim.json");
+        expect(fs.realpathSync(claim)).toBe(path.join(fs.realpathSync(directory!), "claim.json"));
+        expect(fs.statSync(claim).isFile()).toBe(true);
+        expect(fs.readFileSync(claim, "utf8")).toBe("x");
+      }
       expect(fs.readFileSync(path.join(current.scratch!, "inside.txt"), "utf8")).toBe(edited);
       expect(fs.existsSync(path.join(cwd, `${number}-symlink-write.txt`))).toBe(false);
       expect(fs.readFileSync(path.join(cwd, `${number}-symlink-edit.txt`), "utf8")).toBe(before);
@@ -299,11 +363,12 @@ describe("native actor write/edit confinement", () => {
     expect(activations[0]!.runId).not.toBe(activations[1]!.runId);
     expect(activations[0]!.scratch).not.toBe(activations[1]!.scratch);
     console.info("offline native actor write-policy proof", JSON.stringify({ piBinary: fs.realpathSync(piBinary!), worker,
-      extension, actorId, extensions, route: extensions ? "fabric_exec -> tools.call(pi.write/pi.edit) -> real tool lifecycle" : "direct native write/edit",
-      sessionFile, activations: activations.map(({ runId, scratch, probes, advertisedTools, discoveryResponse }) => ({
+      extension, actorId, extensions, route: extensions ? "fabric_exec -> tools.call(pi.*) -> real tool lifecycle" : "direct native tools",
+      sessionFile, activations: activations.map(({ runId, scratch, probes, advertisedTools, discoveryResponse, temporary }) => ({
         runId, scratch, advertisedTools, discoveredTools: discoveryResponse === undefined ? undefined :
           JSON.parse(discoveryResponse).map(({ ref, provider, namespace }: any) => ({ ref, provider, namespace })),
-        toolResults: probes.length, denied: probes.filter((probe) => probe.denied).length,
+        toolResults: probes.length + (temporary?.response === undefined ? 0 : 1), denied: probes.filter((probe) => probe.denied).length,
+        temporary,
       })) }));
   }, 120000);
 });

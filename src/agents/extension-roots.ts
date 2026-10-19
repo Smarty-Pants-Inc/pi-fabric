@@ -67,3 +67,42 @@ export const resolveAgentExtensionRoots = (
     return canonical;
   }))];
 };
+
+/** Require host pin paths to be exact canonical, safe files or package directories. */
+export const resolveAgentExtensionPins = <TPin extends { id: string; path: string; sha256: string }>(
+  pins: readonly TPin[] | undefined,
+): TPin[] => {
+  if (!pins?.length) return [];
+  return pins.map((pin, index) => {
+    if (!/^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$/.test(pin.id) || pin.id.length > 64) {
+      throw new Error(`Invalid agents.extensionPins[${index}].id`);
+    }
+    if (!path.isAbsolute(pin.path) || pin.path.length > 4096 || /[\u0000-\u001f\u007f]/u.test(pin.path)) {
+      throw new Error(`Invalid agents.extensionPins[${index}].path: expected an absolute path`);
+    }
+    if (!/^[a-f0-9]{64}$/.test(pin.sha256)) throw new Error(`Invalid agents.extensionPins[${index}].sha256`);
+    let canonical: string;
+    try { canonical = fs.realpathSync.native(pin.path); }
+    catch (error) {
+      throw new Error(`Invalid agents.extensionPins[${index}].path: cannot resolve (${error instanceof Error ? error.message : String(error)})`);
+    }
+    if (canonical !== pin.path) throw new Error(`Invalid agents.extensionPins[${index}].path: must equal its realpath ${canonical}`);
+    const reason = inspectPathChain(canonical, false);
+    if (reason) throw new Error(`Invalid agents.extensionPins[${index}].path: ${reason}`);
+    let stats: fs.Stats;
+    try { stats = fs.statSync(canonical); }
+    catch (error) {
+      throw new Error(`Invalid agents.extensionPins[${index}].path: cannot inspect (${error instanceof Error ? error.message : String(error)})`);
+    }
+    if (!stats.isFile() && !stats.isDirectory()) {
+      throw new Error(`Invalid agents.extensionPins[${index}].path: must be a regular file or package directory`);
+    }
+    if (stats.isDirectory()) {
+      let packageStats: fs.Stats;
+      try { packageStats = fs.statSync(path.join(canonical, "package.json")); }
+      catch { throw new Error(`Invalid agents.extensionPins[${index}].path: package.json is missing`); }
+      if (!packageStats.isFile()) throw new Error(`Invalid agents.extensionPins[${index}].path: package.json is not a regular file`);
+    }
+    return { ...pin };
+  });
+};

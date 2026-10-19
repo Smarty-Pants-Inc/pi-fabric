@@ -28,7 +28,7 @@ const manifestSha256 = (entries: Array<[string, string, string?]>): string => {
   entries.sort((left, right) => compare(left[0], right[0]) || compare(left[1], right[1]) || compare(left[2] ?? "", right[2] ?? ""));
   return sha256(JSON.stringify(entries));
 };
-const managerFor = (cwd: string, extensionRoots?: string[], piBinary?: string): AgentManager => {
+const managerFor = (cwd: string, extensionRoots?: string[], piBinary?: string, extensionPins?: Array<{ id: string; path: string; sha256: string }>): AgentManager => {
   const manager = new AgentManager(cwd, {
     ...DEFAULT_FABRIC_CONFIG.agents,
     runner: "pi",
@@ -36,6 +36,7 @@ const managerFor = (cwd: string, extensionRoots?: string[], piBinary?: string): 
     timeoutMs: 30_000,
     sessionExport: false,
     ...(extensionRoots ? { extensionRoots } : {}),
+    ...(extensionPins ? { extensionPins } : {}),
   }, {
     workerPath: path.resolve("dist/worker.js"),
     piBinary: piBinary ?? path.resolve("node_modules/@earendil-works/pi-coding-agent/dist/cli.js"),
@@ -105,10 +106,15 @@ describe("host-authorized process extension paths", () => {
     vi.stubEnv("FABRIC_DEFAULT_EXTENSION_MARKER", defaultMarker);
     vi.stubEnv("FABRIC_EXTENSION_PROBE_EXECUTED", executed);
     vi.stubEnv("FABRIC_EXTENSION_PROBE_TOOLS", toolsLog);
-    const manager = managerFor(root, [extensionRoot]);
+    const extensionPin = {
+      id: "offline-probe",
+      path: fs.realpathSync(extensionPath),
+      sha256: sha256(fs.readFileSync(extensionPath)),
+    };
+    const manager = managerFor(root, undefined, undefined, [extensionPin]);
 
     const result = await manager.run({
-      ...spawnRequest([extensionPath], ["probe_echo"]),
+      ...spawnRequest([extensionPin.id], ["probe_echo"]),
       model: "spawn-extension-probe/offline",
       thinking: "off",
     });
@@ -157,7 +163,8 @@ describe("host-authorized process extension paths", () => {
     vi.stubEnv("HOME", root);
     vi.stubEnv("FABRIC_EXTENSION_PROBE_EXECUTED", executed);
     vi.stubEnv("FABRIC_EXTENSION_PROBE_TOOLS", toolsLog);
-    const manager = managerFor(root, [extensionRoot]);
+    const extensionPin = { id: "tamper-probe", path: fs.realpathSync(extensionPath), sha256: admittedSha };
+    const manager = managerFor(root, undefined, undefined, [extensionPin]);
     const originalLaunch = ProcessTransport.prototype.launch;
     vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async function (this: ProcessTransport, request) {
       fs.appendFileSync(extensionPath, "\n// changed after host admission\n");
@@ -190,34 +197,44 @@ describe("host-authorized process extension paths", () => {
       ["index.mjs", "file", sha256(moduleText)],
       ["package.json", "file", sha256(packageJson)],
     ]);
-    const first = validateAgentExtensionPaths([packageDirectory], [root], root)[0];
-    const second = validateAgentExtensionPaths([packageDirectory], [root], root)[0];
+    const packagePin = { id: "fixture-package", path: fs.realpathSync(packageDirectory), sha256: expected };
+    const first = validateAgentExtensionPaths([packagePin.id], [packagePin], [root], root)[0];
+    const second = validateAgentExtensionPaths([packagePin.path], [packagePin], [root], root)[0];
     expect(first).toEqual({ path: fs.realpathSync(packageDirectory), sha256: expected });
     expect(second).toEqual(first);
     fs.appendFileSync(path.join(packageDirectory, "index.mjs"), "// changed\n");
-    expect(validateAgentExtensionPaths([packageDirectory], [root], root)[0]?.sha256).not.toBe(expected);
+    expect(() => validateAgentExtensionPaths([packagePin.id], [packagePin], [root], root))
+      .toThrow(/does not match its host-pinned SHA-256/);
 
     const sharedModule = path.join(root, "shared.mjs");
     const symlinkPackage = path.join(root, "symlink-package");
-    fs.writeFileSync(sharedModule, "export default 1;\n");
+    const symlinkPackageJson = '{"name":"symlink-package"}\n';
+    const sharedText = "export default 1;\n";
+    fs.writeFileSync(sharedModule, sharedText);
     fs.mkdirSync(symlinkPackage);
-    fs.writeFileSync(path.join(symlinkPackage, "package.json"), '{"name":"symlink-package"}\n');
+    fs.writeFileSync(path.join(symlinkPackage, "package.json"), symlinkPackageJson);
     fs.symlinkSync(sharedModule, path.join(symlinkPackage, "alias.mjs"));
-    expect(validateAgentExtensionPaths([symlinkPackage], [root], root)[0]?.sha256).toMatch(/^[a-f0-9]{64}$/);
+    const symlinkExpected = manifestSha256([
+      ["", "directory"],
+      ["alias.mjs", "symlink", "../shared.mjs"],
+      ["alias.mjs", "file", sha256(sharedText)],
+      ["package.json", "file", sha256(symlinkPackageJson)],
+    ]);
+    const symlinkPin = { id: "symlink-package", path: fs.realpathSync(symlinkPackage), sha256: symlinkExpected };
+    expect(validateAgentExtensionPaths([symlinkPin.id], [symlinkPin], [root], root)[0]?.sha256).toBe(symlinkExpected);
   });
 
-  it.skipIf(!supportsUidOwnership)("refuses the whole spawn for invalid paths, missing tools, or absent host roots", () => {
+  it.skipIf(!supportsUidOwnership)("requires a host pin, enforces optional roots, and refuses before launch", () => {
     const root = temporary("fabric-extension-refusal-");
     const extensionRoot = path.join(root, "approved");
     const outsideRoot = path.join(root, "outside");
     fs.mkdirSync(extensionRoot);
     fs.mkdirSync(outsideRoot);
     const validPath = path.join(extensionRoot, "valid.mjs");
+    const unlistedPath = path.join(extensionRoot, "unlisted.mjs");
     const outsidePath = path.join(outsideRoot, "outside.mjs");
     const writablePath = path.join(extensionRoot, "world-writable.mjs");
-    fs.writeFileSync(validPath, "export default () => {};\n");
-    fs.writeFileSync(outsidePath, "export default () => {};\n");
-    fs.writeFileSync(writablePath, "export default () => {};\n", { mode: 0o666 });
+    for (const file of [validPath, unlistedPath, outsidePath, writablePath]) fs.writeFileSync(file, "export default () => {};\n");
     fs.chmodSync(writablePath, 0o666);
     const escapePath = path.join(extensionRoot, "escape.mjs");
     fs.symlinkSync(outsidePath, escapePath);
@@ -225,32 +242,46 @@ describe("host-authorized process extension paths", () => {
     fs.mkdirSync(packageDirectory);
     fs.writeFileSync(path.join(packageDirectory, "package.json"), '{"name":"symlink-package"}\n');
     fs.symlinkSync(outsidePath, path.join(packageDirectory, "escape.mjs"));
+    const fileSha = (file: string) => sha256(fs.readFileSync(file));
+    const pins = [
+      { id: "valid", path: fs.realpathSync(validPath), sha256: fileSha(validPath) },
+      { id: "outside", path: fs.realpathSync(outsidePath), sha256: fileSha(outsidePath) },
+      { id: "writable", path: fs.realpathSync(writablePath), sha256: fileSha(writablePath) },
+      { id: "symlink", path: escapePath, sha256: fileSha(outsidePath) },
+      { id: "package-escape", path: fs.realpathSync(packageDirectory), sha256: "0".repeat(64) },
+    ];
     const launch = vi.spyOn(ProcessTransport.prototype, "launch");
-    const manager = managerFor(root, [extensionRoot]);
+    const manager = managerFor(root, [extensionRoot], undefined, pins);
 
-    expect(() => manager.spawn(spawnRequest([outsidePath], ["probe_echo"]))).toThrow(/strictly inside a configured extension root/);
+    expect(() => manager.spawn(spawnRequest([unlistedPath], ["probe_echo"]))).toThrow(/not an ID or exact path in the host agents\.extensionPins/);
+    expect(() => manager.spawn(spawnRequest(["outside"], ["probe_echo"]))).toThrow(/outside the optional agents\.extensionRoots constraint/);
+    expect(() => manager.spawn(spawnRequest(["symlink"], ["probe_echo"]))).toThrow(/must equal its realpath/);
+    expect(() => manager.spawn(spawnRequest(["package-escape"], ["probe_echo"]))).toThrow(/package symlink escape\.mjs escapes the allowed roots/);
+    expect(() => manager.spawn(spawnRequest(["writable"], ["probe_echo"]))).toThrow(/group- or world-writable/);
     expect(() => manager.spawn(spawnRequest([`${extensionRoot}${path.sep}..${path.sep}outside${path.sep}outside.mjs`], ["probe_echo"]))).toThrow(/'\.\.' path segments/);
-    expect(() => manager.spawn(spawnRequest([escapePath], ["probe_echo"]))).toThrow(/symlink escape refused/);
-    expect(() => manager.spawn(spawnRequest([packageDirectory], ["probe_echo"]))).toThrow(/package symlink escape\.mjs escapes the allowed roots/);
-    expect(() => manager.spawn(spawnRequest([writablePath], ["probe_echo"]))).toThrow(/group- or world-writable/);
     if (process.getuid) {
       const uid = process.getuid();
       let calls = 0;
       const owner = vi.spyOn(process, "getuid").mockImplementation(() => ++calls === 1 ? uid : uid + 1);
-      expect(() => manager.spawn(spawnRequest([validPath], ["probe_echo"]))).toThrow(/not owned by root or the current UID/);
+      expect(() => manager.spawn(spawnRequest(["valid"], ["probe_echo"]))).toThrow(/not owned by root or the current UID/);
       owner.mockRestore();
     }
-    expect(() => manager.spawn({ ...spawnRequest([validPath], ["probe_echo"]), runner: "claude" })).toThrow(/requires the Pi runner/);
-    expect(() => manager.spawn({ ...spawnRequest([validPath], ["probe_echo"]), transport: "tmux" })).toThrow(/requires process transport/);
-    expect(() => manager.spawn({ ...spawnRequest([validPath], ["probe_echo"]), recursive: true })).toThrow(/cannot be combined with recursive/);
-    expect(() => manager.spawn(spawnRequest([validPath]))).toThrow(/explicit tools allow-list/);
-    expect(() => manager.spawn(spawnRequest([validPath, validPath, validPath, validPath, validPath], ["probe_echo"]))).toThrow(/at most 4/);
-    expect(launch).not.toHaveBeenCalled();
+    expect(() => manager.spawn({ ...spawnRequest(["valid"], ["probe_echo"]), runner: "claude" })).toThrow(/requires the Pi runner/);
+    expect(() => manager.spawn({ ...spawnRequest(["valid"], ["probe_echo"]), transport: "tmux" })).toThrow(/requires process transport/);
+    expect(() => manager.spawn({ ...spawnRequest(["valid"], ["probe_echo"]), recursive: true })).toThrow(/cannot be combined with recursive/);
+    expect(() => manager.spawn(spawnRequest(["valid"]))).toThrow(/explicit tools allow-list/);
+    expect(() => manager.spawn(spawnRequest(["valid", "valid", "valid", "valid", "valid"], ["probe_echo"]))).toThrow(/at most 4/);
 
-    const unconfigured = managerFor(root);
-    expect(() => unconfigured.spawn(spawnRequest([validPath], ["probe_echo"]))).toThrow(/extensionRoots is empty or unset/);
-    const empty = managerFor(root, []);
-    expect(() => empty.spawn(spawnRequest([validPath], ["probe_echo"]))).toThrow(/extensionRoots is empty or unset/);
+    const unpinned = managerFor(root, [extensionRoot]);
+    expect(() => unpinned.spawn(spawnRequest([validPath], ["probe_echo"]))).toThrow(/extensionPins is empty or unset/);
+    const empty = managerFor(root, [], undefined, []);
+    expect(() => empty.spawn(spawnRequest([validPath], ["probe_echo"]))).toThrow(/extensionPins is empty or unset/);
+
+    const changedPinManager = managerFor(root, undefined, undefined, [pins[0]!]);
+    fs.appendFileSync(validPath, "// changed after host pin\n");
+    expect(() => changedPinManager.spawn(spawnRequest(["valid"], ["probe_echo"])))
+      .toThrow(/does not match its host-pinned SHA-256/);
+    expect(launch).not.toHaveBeenCalled();
   });
 
   it("keeps the legacy process launch argv and environment unchanged when extensionPaths is absent", async () => {

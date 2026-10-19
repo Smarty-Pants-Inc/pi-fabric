@@ -85,7 +85,7 @@ interface FabricAgentRequest {
   /** Unix niceness 0-19 for the child and its tools; only raises agents.nice. */
   nice?: number;
   extensions?: boolean;
-  /** Up to four host-authorized Pi extension paths; disables default discovery and requires explicit tools. */
+  /** Up to four host-pinned Pi extension IDs or exact paths; disables default discovery and requires explicit tools. */
   extensionPaths?: string[];
   recursive?: boolean;
   /** Filesystem execution directory; relative paths resolve from the parent agent cwd. */

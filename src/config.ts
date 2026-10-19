@@ -4,7 +4,7 @@ import { diagnostics } from "./core/diagnostics.js";
 import { readHostPolicy, warnAgentLandlockDisabled, type HostPolicy } from "./host-policy.js";
 export { readHostPolicy } from "./host-policy.js";
 import type { ModelRoutingConfig } from "./agents/model-route.js";
-import { resolveAgentExtensionRoots } from "./agents/extension-roots.js";
+import { resolveAgentExtensionPins, resolveAgentExtensionRoots } from "./agents/extension-roots.js";
 import { parsePerCallRouting } from "./agents/per-call-config.js";
 import { normalizeAgentRouterConfig, type FabricAgentRouterConfig } from "./agents/router-config.js";
 export type { FabricAgentRouterConfig } from "./agents/router-config.js";
@@ -236,6 +236,12 @@ interface FabricPrewalkConfig {
   thinking?: FabricThinking;
 }
 
+export interface FabricAgentExtensionPin {
+  id: string;
+  path: string;
+  sha256: string;
+}
+
 export interface FabricAgentConfig {
   /** Optional host-only external spawn/actor model router; off unless enabled. */
   router?: FabricAgentRouterConfig;
@@ -272,8 +278,10 @@ export interface FabricAgentConfig {
   modelExceptionsPath?: string;
   /** Host-only file instructions root. Unset = ~/.local/share/smarty-dev/factory/current/. */
   instructionsRoot?: string;
-  /** Host-only roots from which process-child extensions may be explicitly admitted. */
+  /** Host-only optional path constraint for explicitly pinned process-child extensions. */
   extensionRoots?: string[];
+  /** Host-reviewed process-child extension artifacts, pinned by canonical path and SHA-256. */
+  extensionPins?: FabricAgentExtensionPin[];
   claude: FabricClaudeRunnerConfig;
   veda: FabricVedaRunnerConfig;
   thinking: FabricThinking;
@@ -1274,6 +1282,36 @@ const boundedFloat = (value: unknown, fallback: number, min: number, max: number
 const stringValue = (value: unknown): string | undefined =>
   typeof value === "string" && value.trim() ? value : undefined;
 
+const extensionPinsValue = (value: unknown): FabricAgentExtensionPin[] | undefined => {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.length > 128) throw new Error("Invalid agents.extensionPins: expected at most 128 pin entries");
+  const ids = new Set<string>();
+  const paths = new Set<string>();
+  return value.map((entry, index) => {
+    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
+      throw new Error(`Invalid agents.extensionPins[${index}]: expected { id, path, sha256 }`);
+    }
+    const pin = entry as Record<string, unknown>;
+    const id = pin.id;
+    const extensionPath = pin.path;
+    const sha256 = pin.sha256;
+    if (typeof id !== "string" || !/^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$/.test(id) || id.length > 64) {
+      throw new Error(`Invalid agents.extensionPins[${index}].id: expected a lowercase extension id`);
+    }
+    if (typeof extensionPath !== "string" || !path.isAbsolute(extensionPath) || extensionPath.length > 4096 || /[\u0000-\u001f\u007f]/u.test(extensionPath)) {
+      throw new Error(`Invalid agents.extensionPins[${index}].path: expected an absolute realpath`);
+    }
+    if (typeof sha256 !== "string" || !/^[a-f0-9]{64}$/.test(sha256)) {
+      throw new Error(`Invalid agents.extensionPins[${index}].sha256: expected 64 lowercase hex characters`);
+    }
+    if (ids.has(id)) throw new Error(`Invalid agents.extensionPins[${index}].id: duplicate id ${id}`);
+    if (paths.has(extensionPath)) throw new Error(`Invalid agents.extensionPins[${index}].path: duplicate path ${extensionPath}`);
+    ids.add(id);
+    paths.add(extensionPath);
+    return { id, path: extensionPath, sha256 };
+  });
+};
+
 // Inlined copy of RUNNER_ID_PATTERN (src/agents/runner-registry.ts) so config
 // never loads the runner registry; tests/runner-registry-graph.test.ts keeps it in sync.
 const RUNNER_ID_PATTERN = /^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$/;
@@ -1456,6 +1494,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
   const mcpJev = objectValue(mcp.jev);
   const prewalk = objectValue(input.prewalk);
   const agents = objectValue(input.agents);
+  const extensionPins = extensionPinsValue(agents.extensionPins);
   const placement = normalizeAgentPlacement(agents.placement);
   const claude = objectValue(agents.claude);
   const veda = objectValue(agents.veda);
@@ -1901,6 +1940,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
       ...(stringValue(agents.instructionsRoot)?.trim() ? { instructionsRoot: stringValue(agents.instructionsRoot)!.trim() } : {}),
       ...(Array.isArray(agents.extensionRoots) && agents.extensionRoots.every(root => typeof root === "string" && root.trim())
         ? { extensionRoots: agents.extensionRoots.map(root => (root as string).trim()) } : {}),
+      ...(extensionPins !== undefined ? { extensionPins } : {}),
       ...(wakeText ? { wakeText } : {}),
       modelAdmission: modelAdmissionValue(
         agents.modelAdmission,
@@ -2493,6 +2533,7 @@ const resolveFabricConfig = (
       delete agents.deniedModelReplacement;
       delete agents.instructionsRoot;
       delete agents.extensionRoots;
+      delete agents.extensionPins;
       delete agents.wakeText;
       delete agents.processSlice;
       delete agents.processMemoryMaxBytes;
@@ -2547,6 +2588,9 @@ const resolveFabricConfig = (
   const normalized = normalizeFabricConfig(merged);
   if (normalized.agents.extensionRoots?.length) {
     normalized.agents.extensionRoots = resolveAgentExtensionRoots(normalized.agents.extensionRoots, options.agentDir);
+  }
+  if (normalized.agents.extensionPins?.length) {
+    normalized.agents.extensionPins = resolveAgentExtensionPins(normalized.agents.extensionPins);
   }
   // Host-owned exceptions: no host/project config layer can supply or redirect them.
   normalized.agents.modelExceptionsPath = MODEL_EXCEPTIONS_PATH;

@@ -2,8 +2,9 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { AgentInputError } from "../host-compatibility.js";
+import type { FabricAgentExtensionPin } from "../config.js";
 import type { AgentExtensionPathReceipt } from "./types.js";
-import { assertSafeAgentExtensionPathChain, resolveAgentExtensionRoots } from "./extension-roots.js";
+import { assertSafeAgentExtensionPathChain, resolveAgentExtensionPins, resolveAgentExtensionRoots } from "./extension-roots.js";
 
 const MAX_AGENT_EXTENSION_PATHS = 4;
 const MAX_MANIFEST_ENTRIES = 10_000;
@@ -120,39 +121,45 @@ const hashExtensionPath = (canonical: string, roots: readonly string[] | undefin
   return fail(index, "path must resolve to a regular file or package directory");
 };
 
-/** Resolve, authorize, and hash extension paths on the owning host before admission. */
+/** Resolve an ID or exact host-pinned path, then verify its pin before admission. */
 export const validateAgentExtensionPaths = (
   value: unknown,
+  configuredPins: readonly FabricAgentExtensionPin[] | undefined,
   configuredRoots: readonly string[] | undefined,
   cwd: string,
 ): AgentExtensionPathReceipt[] => {
-  if (!Array.isArray(value)) return fail(undefined, `expected at most ${MAX_AGENT_EXTENSION_PATHS} non-empty paths`);
+  if (!Array.isArray(value)) return fail(undefined, `expected at most ${MAX_AGENT_EXTENSION_PATHS} extension IDs or exact paths`);
   if (value.length > MAX_AGENT_EXTENSION_PATHS || value.some(entry => typeof entry !== "string" || !entry.trim() || entry.length > 4096 || /[\u0000-\u001f\u007f]/u.test(entry))) {
-    return fail(undefined, `expected at most ${MAX_AGENT_EXTENSION_PATHS} non-empty paths`);
+    return fail(undefined, `expected at most ${MAX_AGENT_EXTENSION_PATHS} extension IDs or exact paths`);
   }
-  if (!configuredRoots?.length) return fail(undefined, "agents.extensionRoots is empty or unset");
+  if (!configuredPins?.length) return fail(undefined, "host agents.extensionPins is empty or unset; roots alone do not authorize extensions");
   let realRoots: string[];
-  try { realRoots = resolveAgentExtensionRoots(configuredRoots, cwd); }
+  try { realRoots = configuredRoots?.length ? resolveAgentExtensionRoots(configuredRoots, cwd) : []; }
   catch (error) { return fail(undefined, error instanceof Error ? error.message : String(error)); }
-  if (realRoots.length === 0) fail(undefined, "agents.extensionRoots is empty or unset");
-
   const receipts: AgentExtensionPathReceipt[] = [];
   const seen = new Set<string>();
   for (const [index, requested] of (value as string[]).entries()) {
     if (hasParentSegment(requested)) fail(index, "'..' path segments are not allowed");
-    const lexical = path.resolve(cwd, requested);
-    if (!realRoots.some(root => strictInside(root, lexical))) fail(index, "path is not strictly inside a configured extension root");
-    const canonical = realpath(lexical, index, "path");
-    if (!realRoots.some(root => strictInside(root, canonical))) {
-      fail(index, "path is not strictly inside a realpath'd extension root (symlink escape refused)");
+    const pin = configuredPins.find(candidate => candidate.id === requested || candidate.path === requested);
+    if (!pin) return fail(index, "value is not an ID or exact path in the host agents.extensionPins allow-list");
+    let resolvedPin: FabricAgentExtensionPin | undefined;
+    try { [resolvedPin] = resolveAgentExtensionPins([pin]); }
+    catch (error) { return fail(index, error instanceof Error ? error.message : String(error)); }
+    if (!resolvedPin) return fail(index, "host pin could not be resolved");
+    const canonical = realpath(resolvedPin.path, index, "pinned extension path");
+    if (canonical !== resolvedPin.path) fail(index, "pinned path no longer equals its realpath");
+    if (realRoots.length > 0 && !realRoots.some(root => strictInside(root, canonical))) {
+      fail(index, "pinned path is outside the optional agents.extensionRoots constraint");
     }
-    if (seen.has(canonical)) fail(index, "duplicate extension path");
+    if (seen.has(canonical)) fail(index, "duplicate extension pin");
     seen.add(canonical);
-    try {
-      assertSafeAgentExtensionPathChain(lexical, `path component ${lexical}`);
-      assertSafeAgentExtensionPathChain(canonical, `path component ${canonical}`);
-    } catch (error) { fail(index, error instanceof Error ? error.message : String(error)); }
-    receipts.push({ path: canonical, sha256: hashExtensionPath(canonical, realRoots, index) });
+    try { assertSafeAgentExtensionPathChain(canonical, `pinned path component ${canonical}`); }
+    catch (error) { fail(index, error instanceof Error ? error.message : String(error)); }
+    const actual = hashExtensionPath(canonical, realRoots.length > 0 ? realRoots : undefined, index);
+    if (actual !== resolvedPin.sha256) {
+      fail(index, `extension ${resolvedPin.id} does not match its host-pinned SHA-256 (expected ${resolvedPin.sha256}, got ${actual})`);
+    }
+    receipts.push({ path: canonical, sha256: resolvedPin.sha256 });
   }
   return receipts;
 };

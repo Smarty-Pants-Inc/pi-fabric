@@ -2107,7 +2107,7 @@ export class AgentManager {
       if (!Array.isArray(request.tools) || request.tools.some(tool => typeof tool !== "string" || !tool.trim())) {
         throw new AgentInputError("extensionPaths", "agents.spawn extensionPaths requires an explicit tools allow-list; no worker started");
       }
-      const receipts = validateAgentExtensionPaths(request.extensionPaths, this.config.extensionRoots, this.cwd);
+      const receipts = validateAgentExtensionPaths(request.extensionPaths, this.config.extensionPins, this.config.extensionRoots, this.cwd);
       request.extensionPaths = receipts.map(receipt => receipt.path);
       request.extensionPathReceipts = receipts;
       const needs = normalizeAgentCapabilityTokens(request.needs) ?? [];

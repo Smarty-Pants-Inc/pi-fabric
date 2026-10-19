@@ -268,7 +268,7 @@ export interface AgentRunRecord {
   capabilityRequirements?: string[];
   capabilityDigest?: string;
   recursive?: boolean;
-  /** Host receipt of each explicitly admitted extension path and its content digest. */
+  /** Host receipt of each explicitly admitted extension path and its host-pinned digest. */
   extensionPaths?: AgentExtensionPathReceipt[];
   residency?: FabricParticipantResidency;
   startedAt: number;

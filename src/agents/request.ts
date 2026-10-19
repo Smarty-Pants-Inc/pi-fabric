@@ -15,7 +15,7 @@ const checkedKernel = (value: unknown): AgentRunRequest["kernel"] => {
 const extensionPathsValue = (value: unknown): string[] | undefined => {
   if (value === undefined) return undefined;
   if (!Array.isArray(value) || value.length > 4 || value.some(entry => typeof entry !== "string" || !entry.trim() || entry.length > 4096)) {
-    throw new Error("Invalid Fabric agent extensionPaths: expected at most four non-empty path strings");
+    throw new Error("Invalid Fabric agent extensionPaths: expected at most four non-empty extension IDs or exact paths");
   }
   return [...value] as string[];
 };

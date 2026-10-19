@@ -18,6 +18,7 @@ import { assertBridgeStateBackend, isMeshRetryableBusy, isMeshStateWalCap } from
 import { BridgeDeliveryAgeMonitor, type BridgeDeliveryAgeAlarm } from "./bridge-delivery-age.js";
 import { watchBridgeStore, type BridgeChange } from "./change-notifier.js";
 import { BRIDGE_BATCH_MAX_EVENTS } from "./event-log.js";
+import { BridgeLegacyBaselineAlarmEpisode, isLegacyBaselineAlarmEligible, type BridgeLegacyBaselineAlarm } from "./bridge-baseline-alarms.js";
 import { controlBodyFingerprint, FABRIC_IDEMPOTENCY_KEY_REUSED, FabricIdempotencyKeyReusedError } from "./control-idempotency.js";
 import { HUB_FACTORY_RECIPIENT, isAddressedHubFactoryEvent, isWorkTopic, parseWorkTopic } from "./bridge-topics.js";
 export { HUB_FACTORY_RECIPIENT, isWorkTopic, parseWorkTopic } from "./bridge-topics.js";
@@ -161,7 +162,8 @@ export const isBridgedTopic = (event: Pick<MeshEvent, "topic" | "kind"> & { to?:
   isWorkTopic(event.topic) ||
   (event.topic === "ops.owner" && (event.kind === "pr.wake" || event.kind === "inbox.age.alarm")) ||
   (event.topic === "ops.owner" && (event.kind === "bridge.lease.alarm" || event.kind === "bridge.lease.recovered" ||
-    event.kind === "bridge.delivery-age.alarm" || event.kind === "bridge.delivery-age.recovered") && isMeshAlarmTarget(event.to)) ||
+    event.kind === "bridge.delivery-age.alarm" || event.kind === "bridge.delivery-age.recovered" ||
+    event.kind === "bridge.legacy-baseline.alarm" || event.kind === "bridge.legacy-baseline.recovered") && isMeshAlarmTarget(event.to)) ||
   (event.topic === BRIDGE_STALL_ALARM_TOPIC && event.kind === "bridge-stall" && isMeshAlarmTarget(event.to)) ||
   (event.topic === FABRIC_MESH_OUTAGE_ALARM_TOPIC && (event.kind === "mesh-outage" || event.kind === "mesh-recovered") &&
     isMeshAlarmTarget(event.to));
@@ -2635,6 +2637,8 @@ export interface MeshBridgeOptions {
   publishStallAlarm?: (alarm: BridgeStallAlarm) => Promise<void>;
   /** Per-direction delivery-age owner alarm/recovery; never changes watchdog or transport state. */
   publishDeliveryAgeAlarm?: (alarm: BridgeDeliveryAgeAlarm) => Promise<void>;
+  /** Addressed owner alarm for a legacy link that lacks an acknowledged complete baseline. */
+  publishLegacyBaselineAlarm?: (alarm: BridgeLegacyBaselineAlarm) => Promise<void>;
 }
 
 export interface BridgeStepResult {
@@ -2928,6 +2932,8 @@ export class MeshBridge {
   #presenceInfoLoggedAt = Number.NEGATIVE_INFINITY;
   #legacyNoBaselineWarned = false;
   #legacyNoBaselineOverdueReported = false;
+  // Owner-page episode and retry state is separate from the informational hold deadline.
+  readonly #legacyBaselineAlarm = new BridgeLegacyBaselineAlarmEpisode();
   /** The factory exception's token buckets (pi-fabric#876 review, P1-2; security pass, (c)). */
   readonly #factoryRate: Required<FactoryRate>;
   #factoryTokens: number;
@@ -3109,6 +3115,14 @@ export class MeshBridge {
       this.#log(`presence WARN: peer=${this.options.remoteName} partial cycles cannot be mirrored without a complete baseline; ` +
         `legacyNoBaselineCycles=${noBaselineCycles}; existing peer mirror is left untouched`);
       this.#legacyNoBaselineWarned = true;
+    }
+    if (isLegacyBaselineAlarmEligible(remote?.supportsPartialPresence, noBaselineCycles) && this.options.publishLegacyBaselineAlarm) {
+      this.#legacyBaselineAlarm.observe({ peer: this.options.remoteName,
+        sinceMs: noBaselineCycles > 0 ? noBaselineSince : undefined, at: now }, this.options.publishLegacyBaselineAlarm,
+      (error: unknown) => {
+        this.#log(`presence alarm publish failed: peer=${this.options.remoteName}; ${error instanceof Error ? error.message : String(error)}`);
+        this.#wake?.();
+      });
     }
     const noBaselineOverdue = noBaselineCycles > 0 && noBaselineSince !== undefined &&
       now - noBaselineSince > LEGACY_PARTIAL_HOLD_MS;
@@ -3420,6 +3434,8 @@ export class MeshBridge {
   }
 
   async #syncPresence(): Promise<void> {
+    const legacyRemote = this.options.remote instanceof RemoteBridgeSide ? this.options.remote : undefined;
+    const hadLegacyNoBaseline = (legacyRemote?.legacyNoBaselineCycles ?? 0) > 0;
     const syncedAt = Date.now();
     const presenceVersion = this.#presenceVersion;
     const leaseVersion = this.#leaseVersion;
@@ -3508,11 +3524,9 @@ export class MeshBridge {
       if (this.#directionWakeReason[direction] !== "real") this.#directionWakeReason[direction] = "sync";
       if (!this.#directionBackoff[direction]) this.#directionWake[direction]?.("sync");
     }
-    // A skipped first legacy partial is an outage state, not a successful renewal; expose it
+    // Report after the mirror ACK as well as a skipped first legacy partial: this exposes recovery
     // immediately even for callers that use syncPresence() without the long-running loop.
-    if (this.options.remote instanceof RemoteBridgeSide && this.options.remote.legacyNoBaselineCycles > 0) {
-      this.#reportPresenceInfo();
-    }
+    if (legacyRemote && (hadLegacyNoBaseline || legacyRemote.legacyNoBaselineCycles > 0)) this.#reportPresenceInfo();
   }
 
   /** Only an expired sampled projection makes these membership failures inconclusive. */
@@ -4320,11 +4334,15 @@ export class MeshBridge {
             this.#watchdogTask = this.#watchdogLoop(running);
           }
           const remote = this.options.remote instanceof RemoteBridgeSide ? this.options.remote : undefined;
-          const noBaselineAlarmAt = remote && remote.legacyNoBaselineCycles > 0 && !this.#legacyNoBaselineOverdueReported &&
-            remote.legacyNoBaselineSince !== undefined
-            ? remote.legacyNoBaselineSince + LEGACY_PARTIAL_HOLD_MS + 1 : Infinity;
+          const noBaselineSince = remote?.legacyNoBaselineSince;
+          const legacyInfoAt = remote && remote.legacyNoBaselineCycles > 0 && !this.#legacyNoBaselineOverdueReported &&
+            noBaselineSince !== undefined
+            ? noBaselineSince + LEGACY_PARTIAL_HOLD_MS + 1 : Infinity;
+          const noBaselineAlarmAt = remote && isLegacyBaselineAlarmEligible(remote.supportsPartialPresence,
+            remote.legacyNoBaselineCycles) && noBaselineSince !== undefined && this.options.publishLegacyBaselineAlarm
+            ? this.#legacyBaselineAlarm.nextAttemptAt(noBaselineSince) ?? Infinity : Infinity;
           const deadline = Math.min(this.#expiryAt,
-            this.#leaseVersion !== this.#syncedLeaseVersion ? this.#leaseRenewAt : Infinity, noBaselineAlarmAt);
+            this.#leaseVersion !== this.#syncedLeaseVersion ? this.#leaseRenewAt : Infinity, legacyInfoAt, noBaselineAlarmAt);
           if (Number.isFinite(deadline)) delay = Math.max(0, deadline - Date.now());
           if (this.#legacyPolling) delay = Math.min(delay ?? Infinity, this.options.pollMs ?? LEGACY_POLL_MS);
         } catch (error) {

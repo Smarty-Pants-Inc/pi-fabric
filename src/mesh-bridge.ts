@@ -20,6 +20,7 @@ import { BRIDGE_STALL_ALARM_TOPIC, DEFAULT_CALL_TIMEOUT_MS, DEFAULT_FACTORY_RATE
   serveBridgeAgent, StoreBridgeSide, validBridgeName, type BridgeStallAlarm } from "./mesh/bridge.js";
 import { BridgeRelayUnavailableError, startBridgeRelay } from "./mesh/bridge-relay.js";
 import { BRIDGE_DELIVERY_AGE_ALERT_MS, type BridgeDeliveryAgeAlarm } from "./mesh/bridge-delivery-age.js";
+import { publishBridgeLegacyBaselineAlarm, type BridgeLegacyBaselineAlarm } from "./mesh/bridge-baseline-alarms.js";
 import { BridgeHandoffRefusedError, BridgeHandoffUsageError, handOffNativeIdentity, handoffRootId, listHandoffs, revokeHandoff } from "./mesh/bridge-handoff.js";
 import { MeshStore, meshAlarmRecipient, type MeshStoreOptions } from "./mesh/store.js";
 import { systemdWatchdogNotify } from "./mesh/systemd-watchdog.js";
@@ -245,6 +246,8 @@ export const runBridge = async (
     const linked = remote;
     bridge = new MeshBridge({
       localName, remoteName, local, remote: linked, cursorPath,
+      publishLegacyBaselineAlarm: (alarm: BridgeLegacyBaselineAlarm) => publishBridgeLegacyBaselineAlarm(local.store,
+        { id: `bridge:${localName}`, name: "mesh-bridge", kind: "main" }, alarm),
       relay: async (destinationRemote, event) => {
         if (!relay || signal.aborted) throw new BridgeRelayUnavailableError();
         await relay.send(destinationRemote, event);

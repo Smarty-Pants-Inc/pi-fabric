@@ -18,6 +18,7 @@ import type {
   TransportSent,
 } from "../types.js";
 import { TransportInvalidError, TransportUncertainError, TransportUnavailableError } from "../types.js";
+import { fabricPathBProbeEpochNs, hasFabricPathBProbeObserver, recordFabricPathBProbe, transportProbeCommandId } from "../probe-hooks.js";
 import { publishFailure } from "./errors.js";
 import {
   transportAdvisoryStreamSubject,
@@ -503,6 +504,10 @@ class NatsTransportImpl implements FabricTransport {
       throw publishFailure(error, prepared.resolved.id, prepared.resolved.body);
     }
     if (signal?.aborted) throw new TransportUncertainError(prepared.resolved.id, prepared.resolved.body, { cause: signal.reason });
+    if (hasFabricPathBProbeObserver()) recordFabricPathBProbe({ type: "transport-puback", atNs: fabricPathBProbeEpochNs(), carrier: "nats",
+      envelopeId: prepared.resolved.id, ...(transportProbeCommandId(prepared.resolved) ? { commandId: transportProbeCommandId(prepared.resolved)! } : {}),
+      kind: prepared.resolved.kind, operation: prepared.resolved.operation, targetId: prepared.resolved.targetId,
+      sequence: ack.seq, duplicate: ack.duplicate });
     return { id: prepared.resolved.id, sequence: ack.seq, duplicate: ack.duplicate, envelope: prepared.resolved };
   }
 
@@ -585,6 +590,10 @@ class NatsTransportImpl implements FabricTransport {
                   if (finished) return;
                   const confirmed = await msg.ackAck();
                   if (!confirmed) throw new Error("transport broker ACK was not confirmed");
+                  if (hasFabricPathBProbeObserver()) recordFabricPathBProbe({ type: "inbox-ack-confirmed", atNs: fabricPathBProbeEpochNs(), carrier: "nats",
+                    envelopeId: payload.id, ...(transportProbeCommandId(payload) ? { commandId: transportProbeCommandId(payload)! } : {}),
+                    kind: payload.kind, operation: payload.operation, targetId: payload.targetId,
+                    sequence: msg.info.streamSequence, attempt: msg.info.deliveryCount });
                   finished = true;
                 },
                 nak: (delayMs?: number) => { if (!finished) msg.nak(delayMs); },

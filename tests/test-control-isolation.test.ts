@@ -24,6 +24,8 @@ const input = JSON.parse(process.env.CONTROL_INPUT);
 const entry = await import(pathToFileURL(path.resolve(process.env.CONTROL_ENTRY)).href);
 const check = boundary => {
 for (const [key, value] of Object.entries(input)) assert.equal(process.env[key], value, key + " lost at " + boundary);
+assert.equal(process.env.PI_FABRIC_NATS_REHEARSAL, input.PI_FABRIC_NATS_REHEARSAL);
+for (const key of ["PI_FABRIC_NATS_REHEARSAL_EXTRA", "pi_fabric_nats_rehearsal_foreign"]) assert.equal(process.env[key], undefined);
 const source = file => ts.createSourceFile(file, fs.readFileSync(file, "utf8"), ts.ScriptTarget.Latest, true);
 const js = text => ts.transpileModule(text, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None } }).outputText;
 const fail = () => { throw new Error("a test/hook callback or dependency was invoked"); };
@@ -84,6 +86,8 @@ const initializer = (file, name) => {
   vm.runInContext(js("globalThis.audit = (" + value + ");"), context);
   return context.audit;
 };
+const rehearsal = initializer("tests/nats-path-b-switch-rollback.test.ts", "rehearsalEnabled");
+assert.equal(rehearsal, input.PI_FABRIC_NATS_REHEARSAL === "1", "actual rehearsal selector must remain strict");
 // Evaluate the manual native case's actual sibling-hook selector, not realpath
 // existence: qualification owns artifact validity, not the isolation boundary.
 context.fs = { realpathSync: value => value };
@@ -107,9 +111,9 @@ if (entry.default) {
 `;
 
 const controls = ["PI_FABRIC_JEV_LIVE", "PI_FABRIC_JEV_LOCALTERM", "PI_FABRIC_ACTIVATION_TEST_PI_BINARY",
-  "PI_FABRIC_ACTIVATION_TEST_WORKER", "PI_FABRIC_TEST_PG_BIN", "PI_FABRIC_TEST_PID_DELAY_MS"];
+  "PI_FABRIC_ACTIVATION_TEST_WORKER", "PI_FABRIC_TEST_PG_BIN", "PI_FABRIC_TEST_PID_DELAY_MS", "PI_FABRIC_NATS_REHEARSAL"];
 const optedIn = {
-  PI_FABRIC_JEV_LIVE: "1", PI_FABRIC_JEV_LOCALTERM: "1",
+  PI_FABRIC_JEV_LIVE: "1", PI_FABRIC_JEV_LOCALTERM: "1", PI_FABRIC_NATS_REHEARSAL: "1",
   PI_FABRIC_ACTIVATION_TEST_PI_BINARY: "C:\\exact artifact\\[native].exe",
   PI_FABRIC_ACTIVATION_TEST_WORKER: "./exact artifact/[worker].js",
   PI_FABRIC_TEST_PG_BIN: "./exact artifact/postgres bin", PI_FABRIC_TEST_PID_DELAY_MS: "600",
@@ -119,13 +123,14 @@ for (const entry of ["vitest.config.cts", "tests/fleet-isolation-setup.ts"]) {
     ["live opt-in", { PI_FABRIC_JEV_LIVE: "1", PI_FABRIC_JEV_LOCALTERM: "1" }],
     ["exact artifacts", { PI_FABRIC_ACTIVATION_TEST_PI_BINARY: optedIn.PI_FABRIC_ACTIVATION_TEST_PI_BINARY, PI_FABRIC_ACTIVATION_TEST_WORKER: optedIn.PI_FABRIC_ACTIVATION_TEST_WORKER }],
     ["opt-in and exact artifacts", optedIn],
-    ["off", { PI_FABRIC_JEV_LIVE: "0", PI_FABRIC_JEV_LOCALTERM: "0", PI_FABRIC_TEST_PID_DELAY_MS: "0" }],
-    ["strict non-boolean strings", { PI_FABRIC_JEV_LIVE: "true", PI_FABRIC_JEV_LOCALTERM: "01", PI_FABRIC_TEST_PID_DELAY_MS: "-1" }],
+    ["off", { PI_FABRIC_JEV_LIVE: "0", PI_FABRIC_JEV_LOCALTERM: "0", PI_FABRIC_TEST_PID_DELAY_MS: "0", PI_FABRIC_NATS_REHEARSAL: "0" }],
+    ["strict non-boolean strings", { PI_FABRIC_JEV_LIVE: "true", PI_FABRIC_JEV_LOCALTERM: "01", PI_FABRIC_TEST_PID_DELAY_MS: "-1", PI_FABRIC_NATS_REHEARSAL: "true" }],
     ["missing", {}],
   ])(`${entry}: %s reaches real selectors without invoking tests`, (_name, input) => {
     const env = { ...process.env };
     for (const key of controls) delete env[key];
-    Object.assign(env, input, { CONTROL_INPUT: JSON.stringify(input), CONTROL_ENTRY: entry });
+    Object.assign(env, input, { CONTROL_INPUT: JSON.stringify(input), CONTROL_ENTRY: entry,
+      PI_FABRIC_NATS_REHEARSAL_EXTRA: "production-main-sentinel", pi_fabric_nats_rehearsal_foreign: "1" });
     const child = spawnSync(process.execPath, ["--experimental-transform-types", "--input-type=module", "-e", probe], {
       cwd: fileURLToPath(new URL("../", import.meta.url)), env, encoding: "utf8", timeout: 10_000,
     });

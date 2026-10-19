@@ -586,11 +586,23 @@ describe.skipIf(process.platform !== "linux" || !isV2)("ProcessTransport task me
     fs.unlinkSync(path.join(f.root, "started"));
     const taskRequest = {
       ...f.request,
-      childEnvironment: (environment: NodeJS.ProcessEnv) => ({ ...environment, SMARTY_GIT_READ_ONLY: "0" }),
+      childEnvironment: (environment: NodeJS.ProcessEnv) => ({ ...environment, SMARTY_GIT_READ_ONLY: "0",
+        GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "credential.helper", GIT_CONFIG_VALUE_0: "inherited-write-helper",
+        GIT_CONFIG_PARAMETERS: "'credential.helper=inherited-write-helper'" }),
     };
     await launch(new ProcessTransport(), taskRequest, f.root);
     const taskEnvironment = JSON.parse(fs.readFileSync(path.join(f.root, "actor-env.json"), "utf8"));
     expect(taskEnvironment.SMARTY_GIT_READ_ONLY).toBe("1");
+    expect(taskEnvironment.GIT_CONFIG_COUNT).toBe("4");
+    expect(taskEnvironment.GIT_CONFIG_PARAMETERS).toBeUndefined();
+    expect(taskEnvironment.GIT_CONFIG_KEY_1).toBe("credential.helper");
+    expect(taskEnvironment.GIT_CONFIG_VALUE_1).toBe("");
+    expect(taskEnvironment.GIT_CONFIG_KEY_2).toBe("credential.helper");
+    expect(taskEnvironment.GIT_CONFIG_VALUE_2).toContain("token");
+    expect(taskEnvironment.GIT_CONFIG_VALUE_2).not.toContain("--write");
+    expect(taskEnvironment.GIT_CONFIG_VALUE_2).not.toContain("--git");
+    expect(taskEnvironment.GIT_CONFIG_KEY_3).toBe("credential.useHttpPath");
+    expect(taskEnvironment.GIT_CONFIG_VALUE_3).toBe("true");
     expect(process.env.SMARTY_GIT_READ_ONLY).toBe("caller-value");
   });
 

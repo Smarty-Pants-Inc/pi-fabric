@@ -13,6 +13,7 @@ import { fabricResourceRoot } from "../../core/fabric-resource.js";
 import { WORKER_PROTOCOL_VERSION } from "../worker-protocol.js";
 import { executeFile, findExecutable, spawnDetached } from "./process-utils.js";
 import { taskAgentEnvironment, withoutTaskBoundary } from "../task-environment.js";
+import { configureTaskGitReadOnlyEnvironment } from "../task-git-credential.js";
 import { applyTaskReturnAddress } from "../task-return-address.js";
 import type { AgentPlacementConfig } from "../placement-config.js";
 import { agentPlacementProbe, liveAgentPlacement } from "../placement-config.js";
@@ -395,8 +396,11 @@ export class ProcessTransport implements AgentTransportAdapter {
     // Actors preserve their role identity, not Main's temp environment.
     const prepared = prepareTaskTemporaryDirectory(workerArguments, baseEnvironment, request.cwd);
     const childEnvironment = request.childEnvironment ? request.childEnvironment(prepared.environment) : prepared.environment;
-    // Keep the privilege boundary final even if a host-side launch callback tries to modify it.
-    if (!isActorLaunch(workerArguments)) childEnvironment.SMARTY_GIT_READ_ONLY = "1";
+    // Keep task Git credentials read-only even if a host-side launch callback alters the environment.
+    if (!isActorLaunch(workerArguments)) {
+      childEnvironment.SMARTY_GIT_READ_ONLY = "1";
+      configureTaskGitReadOnlyEnvironment(childEnvironment);
+    }
     const processHandle = await spawnDetached(
       selected.workerPath,
       prepared.workerArguments,

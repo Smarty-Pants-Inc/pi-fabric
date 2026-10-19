@@ -15,6 +15,7 @@ import { participantFilePresent, readParticipantFiles } from "../topology/partic
 import { FABRIC_MESH_OUTAGE_ALARM_TOPIC, isMeshAlarmTarget, meshCursorGeneration, type MeshBatchOperation, type MeshBatchView, type MeshEvent, type MeshIdentity, type MeshPublishInput, type MeshStateEntry, type MeshStore } from "./store.js";
 import { CommitOutbox, type CommitOutboxEffect } from "./commit-outbox.js";
 import { assertBridgeStateBackend, isMeshRetryableBusy, isMeshStateWalCap } from "./state-backend.js";
+import { BridgeDeliveryAgeMonitor, type BridgeDeliveryAgeAlarm } from "./bridge-delivery-age.js";
 import { watchBridgeStore, type BridgeChange } from "./change-notifier.js";
 import { BRIDGE_BATCH_MAX_EVENTS } from "./event-log.js";
 import { controlBodyFingerprint, FABRIC_IDEMPOTENCY_KEY_REUSED, FabricIdempotencyKeyReusedError } from "./control-idempotency.js";
@@ -159,8 +160,8 @@ export const isBridgedTopic = (event: Pick<MeshEvent, "topic" | "kind"> & { to?:
   event.topic === "fabric.control.ack" ||
   isWorkTopic(event.topic) ||
   (event.topic === "ops.owner" && (event.kind === "pr.wake" || event.kind === "inbox.age.alarm")) ||
-  (event.topic === "ops.owner" && (event.kind === "bridge.lease.alarm" || event.kind === "bridge.lease.recovered") &&
-    isMeshAlarmTarget(event.to)) ||
+  (event.topic === "ops.owner" && (event.kind === "bridge.lease.alarm" || event.kind === "bridge.lease.recovered" ||
+    event.kind === "bridge.delivery-age.alarm" || event.kind === "bridge.delivery-age.recovered") && isMeshAlarmTarget(event.to)) ||
   (event.topic === BRIDGE_STALL_ALARM_TOPIC && event.kind === "bridge-stall" && isMeshAlarmTarget(event.to)) ||
   (event.topic === FABRIC_MESH_OUTAGE_ALARM_TOPIC && (event.kind === "mesh-outage" || event.kind === "mesh-recovered") &&
     isMeshAlarmTarget(event.to));
@@ -344,6 +345,8 @@ export interface BridgeRead {
 
 export interface BridgeHead { through: number; offset?: number }
 
+export interface BridgePublishReceipt { sequence: number; createdAt?: number }
+
 export interface BridgePublish {
   principal?: FabricPrincipal | undefined;
   topic: string;
@@ -380,10 +383,14 @@ export interface BridgeSide {
   relayStaleOrigin?(id: string): string | undefined;
   /** Publish a bridged event; with `held`, only if this link holds each of those ids at commit. */
   publish(event: BridgePublish, held?: string[]): Promise<{ sequence: number }>;
+  /** Internal append receipt with the destination timestamp; older BridgeSide implementations may omit it. */
+  publishWithReceipt?(event: BridgePublish, held?: string[]): Promise<BridgePublishReceipt>;
   /** Hub-local only: persist a payload-free successful relay receipt under the sender fence. */
   recordRelay?(event: BridgePublish, held?: string[]): Promise<{ sequence: number }>;
   /** Optional capability: returns a durably committed, ordered prefix (1..256 events). */
   publishBatch?(events: Array<{ event: BridgePublish; held?: string[] }>): Promise<Array<{ sequence: number }>>;
+  /** Internal append receipts with destination timestamps; absent on older BridgeSide implementations. */
+  publishBatchWithReceipt?(events: Array<{ event: BridgePublish; held?: string[] }>): Promise<BridgePublishReceipt[]>;
   /** Whether this link holds a live mirror answering to the id (the hub side only). */
   holds?(id: string, identity?: MeshIdentity): boolean;
   /** Whether this link has a mirror record for the id, even if its lease lapsed (hub only). */
@@ -1109,6 +1116,12 @@ export class StoreBridgeSide implements BridgeSide {
     return { sequence: published.sequence };
   }
 
+  async publishWithReceipt(event: BridgePublish, held: string[] = [], fromHub = false): Promise<BridgePublishReceipt> {
+    const { sequence } = await this.publish(event, held, fromHub);
+    const appended = this.store.read({ after: sequence - 1, limit: 1 })[0];
+    return { sequence, ...(appended?.sequence === sequence ? { createdAt: appended.createdAt } : {}) };
+  }
+
   async recordRelay(event: BridgePublish, held: string[] = [event.from.id]): Promise<{ sequence: number }> {
     const checked = checkBridgePublish(event);
     const stamp = checked.data.bridge;
@@ -1131,6 +1144,22 @@ export class StoreBridgeSide implements BridgeSide {
     await this.store.prepareLock();
     const published = await this.store.publishBatch(events.map(({ event, held }) => this.#publication(event, held ?? [], fromHub)));
     return published.map(({ sequence }) => ({ sequence }));
+  }
+
+  async publishBatchWithReceipt(events: Array<{ event: BridgePublish; held?: string[] }>, fromHub = false): Promise<BridgePublishReceipt[]> {
+    const published = await this.publishBatch(events, fromHub);
+    return this.publishReceipts(published.map(({ sequence }) => sequence));
+  }
+
+  publishReceipts(sequences: readonly number[]): BridgePublishReceipt[] {
+    if (!sequences.length || sequences.length > 256 || sequences.some(sequence => !Number.isSafeInteger(sequence) || sequence <= 0)) {
+      throw new Error("Invalid bridge publish receipt sequences");
+    }
+    const first = Math.min(...sequences);
+    const last = Math.max(...sequences);
+    if (last - first >= 256) throw new Error("Bridge publish receipt range is too large");
+    const bySequence = new Map(this.store.read({ after: first - 1, limit: last - first + 1 }).map(event => [event.sequence, event.createdAt]));
+    return sequences.map(sequence => ({ sequence, ...(bySequence.has(sequence) ? { createdAt: bySequence.get(sequence)! } : {}) }));
   }
 
   #publication(event: BridgePublish, held: string[], fromHub: boolean): Parameters<MeshStore["publish"]>[0] {
@@ -2013,13 +2042,15 @@ export const checkBridgePublish = (input: unknown): BridgePublish => {
 // ---------------------------------------------------------------------------------------------
 // Stdio transport: one JSON request or response per line.
 
-type RpcOp = "hello" | "latestSequence" | "latestCursor" | "tail" | "read" | "presence" | "publish" | "publishBatch" | "mirror" | "bridgedIds";
+type RpcOp = "hello" | "latestSequence" | "latestCursor" | "tail" | "read" | "presence" | "publish" | "publishReceipt" | "publishBatch" | "publishReceiptTimes" | "mirror" | "bridgedIds";
 
 interface RpcRequest { id: number; op: RpcOp; args?: unknown }
 
 /** Diagnostic class only: never used to grant authority or bypass publication fences. */
 const rpcKind = (request: RpcRequest): string => {
-  const events = request.op === "publish" ? [request.args] : request.op === "publishBatch" && Array.isArray(request.args) ? request.args : [];
+  const singleton = request.op === "publish" || request.op === "publishReceipt";
+  const batch = request.op === "publishBatch";
+  const events = singleton ? [request.args] : batch && Array.isArray(request.args) ? request.args : [];
   if (events.length && events.every(event => isObject(event) && event.topic === "fabric.control.command")) return "control";
   if (events.length && events.every(event => isObject(event) && event.topic === "fabric.control.ack")) return "ack";
   return request.op === "mirror" || request.op === "presence" ? request.op : events.length ? "publish" : "read";
@@ -2210,7 +2241,7 @@ const dispatch = async (side: StoreBridgeSide, request: RpcRequest, receivedAt: 
     case "hello": return {
       version: isObject(request.args) && request.args.version === BRIDGE_PROTOCOL_VERSION
         ? BRIDGE_PROTOCOL_VERSION : LEGACY_BRIDGE_PROTOCOL_VERSION,
-      tail: true, publishBatch: typeof side.publishBatch === "function", changes: true, independentRpc: true,
+      tail: true, publishBatch: typeof side.publishBatch === "function", publishReceipts: true, changes: true, independentRpc: true,
       partialPresence: true, nonRootHosts: true,
     };
     case "latestSequence": return side.latestSequence();
@@ -2220,10 +2251,15 @@ const dispatch = async (side: StoreBridgeSide, request: RpcRequest, receivedAt: 
     case "read": return side.read(numberArg(request.args, "after"));
     case "presence": return { ...boundPresence(await side.presence()).presence, reserved: [] };
     case "publish": return side.publish(checkBridgePublish(request.args), [], true);
+    case "publishReceipt": return side.publishWithReceipt(checkBridgePublish(request.args), [], true);
     case "publishBatch": {
       if (!Array.isArray(request.args) || !request.args.length || request.args.length > 256) throw new Error("Invalid bridge publish batch");
       // Remote wire never accepts held IDs: those are hub-local ownership fences.
       return side.publishBatch(request.args.map(event => ({ event: checkBridgePublish(event) })), true);
+    }
+    case "publishReceiptTimes": {
+      if (!Array.isArray(request.args)) throw new Error("Invalid bridge publish receipt sequences");
+      return side.publishReceipts(request.args as number[]);
     }
     case "mirror": return side.mirror(presenceArg(request.args, side.peer), receivedAt, true);
     case "bridgedIds": return side.bridgedIds(numberArg(request.args, "after"));
@@ -2261,6 +2297,8 @@ export class RemoteBridgeSide implements BridgeSide {
   #changesReady: Promise<void> | undefined;
   readonly #subscribers = new Set<{ changed: (kind: BridgeChange) => void; failed: (error: Error) => void }>();
   publishBatch?: NonNullable<BridgeSide["publishBatch"]>;
+  publishWithReceipt?: NonNullable<BridgeSide["publishWithReceipt"]>;
+  publishBatchWithReceipt?: NonNullable<BridgeSide["publishBatchWithReceipt"]>;
   #closed: Error | undefined;
   #mirrorPending: { id: number; error: BridgeMirrorDeferredError } | undefined;
   readonly #pending = new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void }>();
@@ -2419,7 +2457,7 @@ export class RemoteBridgeSide implements BridgeSide {
   }
 
   async hello(changes = false, presenceOnly = false): Promise<void> {
-    const reply = await this.#call<{ version?: unknown; tail?: unknown; publishBatch?: unknown; changes?: unknown;
+    const reply = await this.#call<{ version?: unknown; tail?: unknown; publishBatch?: unknown; publishReceipts?: unknown; changes?: unknown;
       independentRpc?: unknown; partialPresence?: unknown; nonRootHosts?: unknown }>("hello", {
       version: BRIDGE_PROTOCOL_VERSION, ...(changes ? { changes: true } : {}),
     });
@@ -2439,7 +2477,16 @@ export class RemoteBridgeSide implements BridgeSide {
     // The CLI explicitly negotiates tail/batch; manual legacy users may have disabled them.
     if (!changes && !presenceOnly) {
       this.#supportsTail = reply.tail === true;
-      if (reply.publishBatch === true) this.publishBatch = events => this.#call("publishBatch", events.map(({ event }) => event));
+      if (reply.publishReceipts === true) {
+        this.publishWithReceipt = event => this.#call<BridgePublishReceipt>("publishReceipt", event);
+        if (reply.publishBatch === true) {
+          this.publishBatchWithReceipt = async events => {
+            const published = await this.publishBatch!(events);
+            return published.length ? this.#call<BridgePublishReceipt[]>("publishReceiptTimes", published.map(({ sequence }) => sequence)) : [];
+          };
+        }
+      }
+      if (reply.publishBatch === true) this.publishBatch = events => this.#call<Array<{ sequence: number }>>("publishBatch", events.map(({ event }) => event));
     }
     if (reply.changes !== true) {
       if (reply.version === BRIDGE_PROTOCOL_VERSION) {
@@ -2586,6 +2633,8 @@ export interface MeshBridgeOptions {
   notifyWatchdog?: () => void;
   /** The fabric.alarm bridge-stall envelope; without a publisher the durable stderr/reason-file signal remains. */
   publishStallAlarm?: (alarm: BridgeStallAlarm) => Promise<void>;
+  /** Per-direction delivery-age owner alarm/recovery; never changes watchdog or transport state. */
+  publishDeliveryAgeAlarm?: (alarm: BridgeDeliveryAgeAlarm) => Promise<void>;
 }
 
 export interface BridgeStepResult {
@@ -2902,8 +2951,12 @@ export class MeshBridge {
   #stallActive = false;
   #watchdogTask: Promise<void> | undefined;
   #watchdogWake: (() => void) | undefined;
+  readonly #deliveryAge: BridgeDeliveryAgeMonitor;
 
   constructor(readonly options: MeshBridgeOptions) {
+    this.#deliveryAge = new BridgeDeliveryAgeMonitor({ host: options.localName, peer: options.remoteName,
+      ...(options.clock ? { clock: options.clock } : {}),
+      log: line => this.#log(line), ...(options.publishDeliveryAgeAlarm ? { alarm: options.publishDeliveryAgeAlarm } : {}) });
     for (const name of [options.localName, options.remoteName]) {
       if (!validBridgeName(name)) throw new Error(`Invalid bridge name: ${name}`);
     }
@@ -3708,6 +3761,8 @@ export class MeshBridge {
       const start = cursor.after;
       const startOffset = cursor.offset;
       const page = await (source.tail?.(start, startOffset) ?? source.read(start));
+      const hasControlEvents = page.events.some(event => event.topic === "fabric.control.command" || event.topic === "fabric.control.ack");
+      const sourceHead = hasControlEvents ? await source.latestSequence() : page.through;
       // Even filtered/skip-only reads can carry this drain past the mirrors' lease.
       // Reconcile latched origin changes/expiry even on a filtered page.
       const retainedRefresh = passRefreshed && retainedBoundary !== undefined && cursor.after < retainedBoundary &&
@@ -3773,8 +3828,12 @@ export class MeshBridge {
             }
           }
           if (candidates.length > 1) {
-            let committed: Array<{ sequence: number }> | undefined;
-            try { committed = await target.publishBatch(candidates); }
+            let committed: readonly BridgePublishReceipt[] | undefined;
+            try {
+              committed = await this.#deliveryAge.trackBatch(direction, page.events.slice(index, index + candidates.length),
+                () => target.publishBatchWithReceipt ? target.publishBatchWithReceipt(candidates) : target.publishBatch!(candidates),
+                Math.max(0, sourceHead - cursor.after));
+            }
             catch (error) {
               // A key conflict falls through to per-event handling for this whole batch. Its
               // receipt-backed control prefix is safe to replay; do not retry overlapping suffix batches.
@@ -3899,7 +3958,7 @@ export class MeshBridge {
             const held = direction === "toLocal"
               ? [event.from.id, ...(event.topic === "fabric.control.ack" && isObject(event.data) && typeof event.data.targetId === "string" ? [event.data.targetId] : [])]
               : [];
-            const publish = async (): Promise<{ sequence: number }> => {
+            const publish = async (): Promise<BridgePublishReceipt> => {
               if (direction === "toRemote" && this.options.local.holds && !this.options.local.holds(event.to!)) {
                 throw new BridgeOwnershipError(`${event.to} is no longer bound to bridge link ${this.options.remoteName}`);
               }
@@ -3907,11 +3966,12 @@ export class MeshBridge {
               const destinationRefusal = this.#destinationRefusal(event, direction);
               if (destinationRefusal) throw new BridgeOwnershipError(destinationRefusal);
               // Built from the current rules, so a sender identity refreshed below is the one sent.
-              return target.publish(this.#outbound(event, rules, direction), held);
+              const outbound = this.#outbound(event, rules, direction);
+              return target.publishWithReceipt ? target.publishWithReceipt(outbound, held) : target.publish(outbound, held);
             };
-            let published: { sequence: number };
+            let published: BridgePublishReceipt;
             try {
-              published = await publish();
+              published = await this.#deliveryAge.track(direction, event, publish, Math.max(0, sourceHead - cursor.after));
             } catch (error) {
               // Ownership errors happen before append, under the publish lock. A mirror can
               // lapse during that wait: refresh once, reread authority, then retry once.
@@ -3921,7 +3981,7 @@ export class MeshBridge {
               await refresh();
               if (this.#stopped) return { forwarded, dropped };
               if (this.#refusal(event, rules, direction)) throw error;
-              published = await publish();
+              published = await this.#deliveryAge.track(direction, event, publish, Math.max(0, sourceHead - cursor.after));
             }
             if (factorySpend > 0) {
               this.#factoryTokens -= 1;
@@ -4353,6 +4413,7 @@ export class MeshBridge {
     await within(this.#directions);
     await within(Promise.allSettled([...this.#relayDeliveries]));
     await within(localFence);
+    this.#deliveryAge.close();
   }
 }
 

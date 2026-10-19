@@ -2,17 +2,28 @@
 
 `bin/mesh-bridge` links the Fabric mesh of this host (the hub, Dev1) to the mesh of one remote host
 over an ssh stdio transport (smarty-dev#2004). Each host keeps its own mesh; the bridge republishes
-existing events and mirrors root presence. There is no new store or protocol.
+existing events and mirrors root presence. The additive publish-receipt hello capability reports destination append timestamps; older peers keep the existing publication RPC.
 
 ## What crosses
 
 - `fabric.control.command` and `fabric.control.ack`, well-formed `fleet.work.<name>` topics,
-  `ops.owner` with kind `pr.wake`, and the versioned `fabric.alarm.bridge-stall` alarm when
+  `ops.owner` with kind `pr.wake`, the session-addressed delivery-age owner alarm/recovery, and the versioned `fabric.alarm.bridge-stall` alarm when
   addressed to a canonical live session on the other side. A well-formed work topic is at most 128 characters of dot-separated, non-empty ASCII
   segments of `[A-Za-z0-9_-]` (a dot-led repo such as `.github` is the one exception), so every
   work topic that crosses also passes the mesh's and `mesh_answers`' topic pattern. `fleet.work.`,
   `fleet.work..1`, `fleet.work.a..b.1`, a trailing dot, NUL, space, lookalike or other non-ASCII
   character does not cross to anyone.
+- For bridged `fabric.control.command` and `fabric.control.ack` events, each direction samples
+  origin `createdAt` through the destination's durable append timestamp, plus the destination RPC
+  receipt latency. It logs one event-driven line per nonempty minute:
+  `bridge delivery-age v1 peer=<peer> minute=<RFC3339-UTC> toRemote count=<n> deliveryP50Ms=<ms|none> deliveryMaxMs=<ms|none> ackP50Ms=<ms|none> ackMaxMs=<ms|none> cursorLagSequences=<n> cursorLagSeconds=<s> toLocal ...`.
+  Cursor lag is sampled from the source head minus that direction's persisted cursor, with age in
+  seconds from the oldest sampled event. A delivery age over 30 seconds, an RPC receipt latency
+  over 30 seconds, or a command appended after its `deadlineAt` emits one `ops.owner` alarm per
+  directional episode and one recovery event after timely traffic resumes. This signal does not
+  set bridge stall state, withhold `WATCHDOG=1`, close the link, or exit. Peers that advertise the
+  additive `publishReceipts` hello capability provide exact append timestamps; older peers retain
+  their original publish response shape and the bridge uses receipt time as the append-time fallback.
 - From the remote to the hub only: a work topic of the exact form `fleet.work.<repo>.<n>` (a
   non-empty repo of `[A-Za-z0-9._-]`, not `.` or `..`, and a decimal number with no sign or leading
   zero) and the allow-listed `ops.owner` kinds, addressed to the hub factory's role, the exact
@@ -165,8 +176,9 @@ existing events and mirrors root presence. There is no new store or protocol.
   The service cgroup must contain both the bridge and its SSH transport. The hook pages based on
   `$SERVICE_RESULT` (`watchdog` or `exit-code`) and reads the reason file. If no alarm session is
   configured, the bridge cannot safely address a mesh event; the stderr/reason-file signal remains
-  available to the hook. The P0 rule for two exits within 30 minutes belongs in the alarm router,
-  not this bridge.
+  available to the hook. Directional-stall exits rely on the installed systemd `Restart=` policy;
+  unit restart configuration belongs to ops-lead under smarty-dev#13620, and the two-exits-in-30-minutes
+  alarm belongs in the alarm router, not this bridge.
 - The remote is not trusted. An event from it crosses only when all of these are true:
   - its sender is a live native participant or host identity of the remote;
   - no hub record, live or not, uses that id;

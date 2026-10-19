@@ -3911,9 +3911,19 @@ export class MeshBridge {
           rules = await authority(false);
         };
         let reason = this.#refusal(event, rules, direction);
+        // The shared outbound log includes native and other-link recipients. Their trusted,
+        // handoff-aware reservations already prove absence from this link. A well-formed
+        // command destination can also prove exclusion, but never admits a recipient. Leave
+        // unknown/malformed destinations and business fields on work/ACKs on the refresh path.
+        const excludedRecipient = reason === "not addressed across" && direction === "toRemote" &&
+          ((typeof event.to === "string" && rules.reservedRecipients?.has(event.to)) ||
+            (event.topic === "fabric.control.command" && isObject(event.data) &&
+              (event.data.destinationRemoteHost === null ||
+                (typeof event.data.destinationRemoteHost === "string" && validBridgeName(event.data.destinationRemoteHost) &&
+                  event.data.destinationRemoteHost !== this.options.remoteName))));
         const lapsedId = reason === "sender is not a live participant of the remote" ? event.from.id
           : reason === "ack target is not bound to this link" && isObject(event.data) && typeof event.data.targetId === "string" ? event.data.targetId
-          : reason === "not addressed across" && direction === "toRemote" ? event.to : undefined;
+          : reason === "not addressed across" && direction === "toRemote" && !excludedRecipient ? event.to : undefined;
         // A file notification may still be queued when a later event append is already
         // readable. Refresh a newly observed canonical address once before dropping it;
         // admission/holds still use the committed projection, never the sender's claim.

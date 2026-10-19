@@ -38,7 +38,11 @@ export interface ProviderErrorClass {
   basis: "diagnostic" | "status" | "body" | "text" | "default";
 }
 
-type FailedTurn = { stopReason?: unknown; errorMessage?: unknown; diagnostics?: unknown };
+type FailedTurn = { stopReason?: unknown; rawStopReason?: unknown; errorMessage?: unknown; diagnostics?: unknown; recovery?: unknown };
+
+export interface ModelRefusalClassification {
+  kind: "model-refusal";
+}
 
 // Anthropic/OpenAI error types that describe the request or the credentials, not load.
 const NON_RETRYABLE_TYPES = new Set([
@@ -82,6 +86,28 @@ const bodyOf = (message: string): ErrorBody | undefined => {
   }
 };
 
+/** Structured refusal is authoritative only when no HTTP, body, or diagnostic evidence contradicts it. */
+export const classifyModelRefusal = (turn: FailedTurn | undefined): ModelRefusalClassification | undefined => {
+  if (turn?.stopReason !== "error" || turn.rawStopReason !== "refusal") return undefined;
+  const message = typeof turn.errorMessage === "string" ? turn.errorMessage : "";
+  if (statusOf(message) !== undefined || bodyOf(message) !== undefined) return undefined;
+  if (Array.isArray(turn.diagnostics) && turn.diagnostics.length > 0) return undefined;
+  return { kind: "model-refusal" };
+};
+
+const isRecordedModelRefusalDiagnostic = (diagnostic: unknown): boolean => {
+  if (!diagnostic || typeof diagnostic !== "object") return false;
+  const recorded = diagnostic as { type?: unknown; details?: unknown };
+  return recorded.type === "fabric_model_refusal" && !!recorded.details && typeof recorded.details === "object" &&
+    (recorded.details as { rawStopReason?: unknown }).rawStopReason === "refusal";
+};
+
+/** Fabric appends this marker only after classification, so later lifecycle hooks can retain that decision. */
+export const hasRecordedModelRefusal = (turn: FailedTurn | undefined): boolean => {
+  if (!turn || !Array.isArray(turn.diagnostics) || !turn.diagnostics.some(isRecordedModelRefusalDiagnostic)) return false;
+  return classifyModelRefusal({ ...turn, diagnostics: turn.diagnostics.filter(entry => !isRecordedModelRefusalDiagnostic(entry)) }) !== undefined;
+};
+
 // CLIProxyAPI's routing miss while it reloads after a restart (smarty-dev#1856): the whole reason is
 // `unknown provider for model <model>` (Go: fmt.Errorf("unknown provider for model %s", model)).
 const ROUTING_MISS = /^unknown provider for model(?: \S+)?$/i;
@@ -113,6 +139,9 @@ const routingMiss = (status: number, body: ErrorBody | undefined, message: strin
  */
 export const classifyProviderError = (turn: FailedTurn | undefined): ProviderErrorClass | undefined => {
   if (turn?.stopReason !== "error") return undefined;
+  if (classifyModelRefusal(turn)) return { retryable: false, short: "model refusal", basis: "diagnostic" };
+  const recovery = turn.recovery as { retryable?: unknown } | undefined;
+  if (recovery?.retryable === false) return { retryable: false, short: "non-retryable", basis: "diagnostic" };
   const message = typeof turn.errorMessage === "string" ? turn.errorMessage : "";
   const diagnostics = Array.isArray(turn.diagnostics) ? turn.diagnostics as Array<{ type?: unknown }> : [];
   // A provider plan/usage limit (Pi's provider_limit, e.g. smarty_limit) is a 429 window: backoff fits.

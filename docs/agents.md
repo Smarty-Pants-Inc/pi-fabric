@@ -257,6 +257,8 @@ Ordinary tasks drop the spawner's `PI_FABRIC_ROLE` override, `PI_FABRIC_ROLE_SES
 so participant discovery cannot still report the parent's role or critical-read class.
 Explicit actor runs retain both. Parent environment and bound session/mesh routing are unchanged.
 
+Process task agents set `SMARTY_GIT_READ_ONLY=1` and replace inherited Git credential helpers with a task-only helper that requests the existing read App token for the GitHub owner in the remote path; it answers credential `get` only and refuses other hosts. The token is used in memory and grants only the read App's existing `contents:read` access, so fetches can work without exposing the global write helper and pushes remain denied. Actors and Main do not receive this configuration, and no standing access is added.
+
 Task agents return status to their parent; they must not call `smarty-status` to update the
 parent's status comment. That helper keys ordinary comments by role/worktree, so a task
 agent's call would create a separate `task-agent/<worktree>` comment and leave the

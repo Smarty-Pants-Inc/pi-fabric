@@ -23,7 +23,11 @@ export const registerMainProviderRecovery = (pi: ExtensionAPI, options: {
   };
   const reset = (): void => { cancel(); retried = false; reported = false; };
   pi.on("agent_start", (_event, context) => { resetPrincipalDiagnosticTurn(pi, context); cancel(); });
-  pi.on("input", (_event, context) => { resetPrincipalDiagnosticTurn(pi, context); cancel(); });
+  pi.on("input", (event: { source?: string }, context) => {
+    resetPrincipalDiagnosticTurn(pi, context);
+    if (event.source === "extension") { cancel(); return; }
+    reset();
+  });
   pi.on("session_start", (_event, context) => { resetPrincipalDiagnosticTurn(pi, context); reset(); });
   pi.on("session_shutdown", reset);
   pi.on("session_before_switch", (_event, context) => { resetPrincipalDiagnosticTurn(pi, context); reset(); });
@@ -53,8 +57,14 @@ export const registerMainProviderRecovery = (pi: ExtensionAPI, options: {
     const live = (): boolean => generation === current && extensionContextLive(context);
     // The classifier loads at the first failed settle: it is shared with the lazy Main drain and
     // would otherwise split into its own eager startup chunk.
-    const { classifyProviderError } = await import("./provider-error-class.js");
+    const { classifyModelRefusal, classifyProviderError, hasRecordedModelRefusal } = await import("./provider-error-class.js");
     if (!live()) return;
+    // Pi's refusal and explicit retry veto both suppress Fabric's automatic recovery.
+    if (classifyModelRefusal(last) || hasRecordedModelRefusal(last) ||
+      (last as AssistantMessage & { recovery?: { retryable?: unknown } }).recovery?.retryable === false) {
+      reset();
+      return;
+    }
     // A blind retry of a request the provider rejects as non-retryable fails the same way.
     const classified = classifyProviderError(last);
     if (classified?.retryable === false && options.ownsNonRetryable?.() === true) {

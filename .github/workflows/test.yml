@@ -20,7 +20,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
-    runs-on: ${{ matrix.os == 'ubuntu-latest' && ((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && 'ubuntu-latest' || (vars.SMARTY_LINUX_RUNNER && fromJSON(vars.SMARTY_LINUX_RUNNER)) || 'ubuntu-latest') || matrix.os }}
+    runs-on: ${{ matrix.os == 'ubuntu-latest' && ((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && 'ubuntu-latest' || 'smarty-linux-x64' || 'ubuntu-latest') || matrix.os }}
     steps:
       - run: git config --global core.autocrlf false
       - uses: actions/checkout@v4
@@ -204,7 +204,7 @@ jobs:
     # smarty-dev#11373: the same three suites run against both NATS_STATE_PROFILE values. `single` is one server;
     # `cluster` is three routed loopback nodes (replicas 3). NATS_SERVER_URL/NATS_MONITOR_URL stay the single seed
     # inputs; the profile only selects the replica count the test helper writes into the private fixture config.
-    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && 'ubuntu-latest' || (vars.SMARTY_LINUX_RUNNER && fromJSON(vars.SMARTY_LINUX_RUNNER)) || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && 'ubuntu-latest' || 'smarty-linux-x64' || 'ubuntu-latest' }}
     timeout-minutes: 10
     strategy:
       fail-fast: false
@@ -307,7 +307,7 @@ jobs:
     # regression of the deterministic per-op lock metrics against bench/mesh-lock-baseline.json.
     # Timing metrics are reported only: on a shared runner they swing by tens of percent.
     # Not a required check (.mergify.yml requires `check (ubuntu-latest)` only).
-    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && 'ubuntu-latest' || (vars.SMARTY_LINUX_RUNNER && fromJSON(vars.SMARTY_LINUX_RUNNER)) || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && 'ubuntu-latest' || 'smarty-linux-x64' || 'ubuntu-latest' }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -341,7 +341,7 @@ jobs:
     # idle Fabric resident host, 300 s each in parallel after a 30 s warm-up. Breach: > 1.0 timer wakes/s in total,
     # or one callsite firing more than once a minute. Report-only while IDLE_WAKE_ENFORCE is 0: set it to 1 to block.
     # Not a required check. Wall time ~8 min: install + build ~2 min, self-test ~70 s, both modes ~6 min.
-    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && 'ubuntu-latest' || (vars.SMARTY_LINUX_RUNNER && fromJSON(vars.SMARTY_LINUX_RUNNER)) || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && 'ubuntu-latest' || 'smarty-linux-x64' || 'ubuntu-latest' }}
     timeout-minutes: 20
     env:
       IDLE_WAKE_ENFORCE: '0'
@@ -386,7 +386,7 @@ jobs:
 
   nats-auth:
     # Hosted smarty-dev#7504 T2 role matrix and configured 1/1 T8 auth slice; this does not claim init --local or adapter coverage.
-    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && 'ubuntu-latest' || (vars.SMARTY_LINUX_RUNNER && fromJSON(vars.SMARTY_LINUX_RUNNER)) || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && 'ubuntu-latest' || 'smarty-linux-x64' || 'ubuntu-latest' }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4

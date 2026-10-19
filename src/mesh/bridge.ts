@@ -1148,10 +1148,18 @@ export class StoreBridgeSide implements BridgeSide {
 
   async publishBatchWithReceipt(events: Array<{ event: BridgePublish; held?: string[] }>, fromHub = false): Promise<BridgePublishReceipt[]> {
     const published = await this.publishBatch(events, fromHub);
-    const first = published[0]?.sequence;
-    if (first === undefined) return [];
-    const bySequence = new Map(this.store.read({ after: first - 1, limit: published.length }).map(event => [event.sequence, event.createdAt]));
-    return published.map(({ sequence }) => ({ sequence, ...(bySequence.has(sequence) ? { createdAt: bySequence.get(sequence)! } : {}) }));
+    return this.publishReceipts(published.map(({ sequence }) => sequence));
+  }
+
+  publishReceipts(sequences: readonly number[]): BridgePublishReceipt[] {
+    if (!sequences.length || sequences.length > 256 || sequences.some(sequence => !Number.isSafeInteger(sequence) || sequence <= 0)) {
+      throw new Error("Invalid bridge publish receipt sequences");
+    }
+    const first = Math.min(...sequences);
+    const last = Math.max(...sequences);
+    if (last - first >= 256) throw new Error("Bridge publish receipt range is too large");
+    const bySequence = new Map(this.store.read({ after: first - 1, limit: last - first + 1 }).map(event => [event.sequence, event.createdAt]));
+    return sequences.map(sequence => ({ sequence, ...(bySequence.has(sequence) ? { createdAt: bySequence.get(sequence)! } : {}) }));
   }
 
   #publication(event: BridgePublish, held: string[], fromHub: boolean): Parameters<MeshStore["publish"]>[0] {
@@ -2034,14 +2042,14 @@ export const checkBridgePublish = (input: unknown): BridgePublish => {
 // ---------------------------------------------------------------------------------------------
 // Stdio transport: one JSON request or response per line.
 
-type RpcOp = "hello" | "latestSequence" | "latestCursor" | "tail" | "read" | "presence" | "publish" | "publishReceipt" | "publishBatch" | "publishBatchReceipt" | "mirror" | "bridgedIds";
+type RpcOp = "hello" | "latestSequence" | "latestCursor" | "tail" | "read" | "presence" | "publish" | "publishReceipt" | "publishBatch" | "publishReceiptTimes" | "mirror" | "bridgedIds";
 
 interface RpcRequest { id: number; op: RpcOp; args?: unknown }
 
 /** Diagnostic class only: never used to grant authority or bypass publication fences. */
 const rpcKind = (request: RpcRequest): string => {
   const singleton = request.op === "publish" || request.op === "publishReceipt";
-  const batch = request.op === "publishBatch" || request.op === "publishBatchReceipt";
+  const batch = request.op === "publishBatch";
   const events = singleton ? [request.args] : batch && Array.isArray(request.args) ? request.args : [];
   if (events.length && events.every(event => isObject(event) && event.topic === "fabric.control.command")) return "control";
   if (events.length && events.every(event => isObject(event) && event.topic === "fabric.control.ack")) return "ack";
@@ -2249,9 +2257,9 @@ const dispatch = async (side: StoreBridgeSide, request: RpcRequest, receivedAt: 
       // Remote wire never accepts held IDs: those are hub-local ownership fences.
       return side.publishBatch(request.args.map(event => ({ event: checkBridgePublish(event) })), true);
     }
-    case "publishBatchReceipt": {
-      if (!Array.isArray(request.args) || !request.args.length || request.args.length > 256) throw new Error("Invalid bridge publish batch");
-      return side.publishBatchWithReceipt(request.args.map(event => ({ event: checkBridgePublish(event) })), true);
+    case "publishReceiptTimes": {
+      if (!Array.isArray(request.args)) throw new Error("Invalid bridge publish receipt sequences");
+      return side.publishReceipts(request.args as number[]);
     }
     case "mirror": return side.mirror(presenceArg(request.args, side.peer), receivedAt, true);
     case "bridgedIds": return side.bridgedIds(numberArg(request.args, "after"));
@@ -2472,7 +2480,10 @@ export class RemoteBridgeSide implements BridgeSide {
       if (reply.publishReceipts === true) {
         this.publishWithReceipt = event => this.#call<BridgePublishReceipt>("publishReceipt", event);
         if (reply.publishBatch === true) {
-          this.publishBatchWithReceipt = events => this.#call<BridgePublishReceipt[]>("publishBatchReceipt", events.map(({ event }) => event));
+          this.publishBatchWithReceipt = async events => {
+            const published = await this.publishBatch!(events);
+            return published.length ? this.#call<BridgePublishReceipt[]>("publishReceiptTimes", published.map(({ sequence }) => sequence)) : [];
+          };
         }
       }
       if (reply.publishBatch === true) this.publishBatch = events => this.#call<Array<{ sequence: number }>>("publishBatch", events.map(({ event }) => event));

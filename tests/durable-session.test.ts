@@ -162,6 +162,9 @@ describe("durable public SDK host", () => {
     await entered; expect(acknowledged).toBe(false);
     release(); await control; await host.agent.awaitControls();
     expect(host.agent.hasQueuedMessages()).toBe(true);
+    // Pi 1.2 refuses disposal with pending native input; this test's assertion is complete.
+    host.session.clearQueue();
+    await host.agent.awaitControls();
   });
 
   it("keeps SDK ownership, scoped tool guards/results, source metadata, and session history", async () => {
@@ -237,7 +240,8 @@ describe("durable public SDK host", () => {
       expect(options?.headers).toMatchObject({ "x-model-header": "configured", "x-extension": "present" });
       // Faux has no HTTP payload/raw event parser; exercise the supplied provider callbacks.
       expect(await options?.onPayload?.({ original: true }, model)).toEqual({ changed: true });
-      await options?.onProviderStreamEvent?.({ type: "offline" }, model);
+      await options?.onProviderStreamEvent?.({ type: "provider_stream_event" });
+      await options?.onResponse?.({});
       return fauxAssistantMessage("instrumented");
     }]);
     const settingsManager = SettingsManager.inMemory({ compaction: { enabled: false },
@@ -247,7 +251,9 @@ describe("durable public SDK host", () => {
     await host.session.bindExtensions({});
     await host.session.prompt("hello");
     expect(host.session.getLastAssistantText(), JSON.stringify(host.session.messages)).toBe("instrumented");
-    expect(response).toHaveBeenCalled(); expect(streamEvent).toHaveBeenCalledOnce();
+    expect(response).toHaveBeenNthCalledWith(1, { type: "after_provider_response", status: 200 }, expect.anything());
+    expect(response).toHaveBeenNthCalledWith(2, { type: "after_provider_response" }, expect.anything());
+    expect(streamEvent).toHaveBeenCalledWith({ type: "provider_stream_event" }, expect.anything());
     expect(JSON.stringify(f.sessionManager.buildSessionContext().messages)).not.toContain("request-local context");
   });
 

@@ -111,13 +111,16 @@ export async function createDurableAgentSession(
     onResponse: async response => {
       const runner = extensionRunnerRef.current;
       if (runner?.hasHandlers("after_provider_response")) {
-        await runner.emit({ type: "after_provider_response", status: response.status, headers: response.headers });
+        const event = response.status === undefined
+          ? { type: "after_provider_response" } as const
+          : { type: "after_provider_response", status: response.status } as const;
+        await runner.emit(event);
       }
     },
-    onProviderStreamEvent: async (data, requestModel) => {
+    onProviderStreamEvent: async () => {
       const runner = extensionRunnerRef.current;
       if (runner?.hasHandlers("provider_stream_event")) {
-        await runner.emit({ type: "provider_stream_event", data, provider: requestModel.provider, api: requestModel.api, model: requestModel.id });
+        await runner.emit({ type: "provider_stream_event" });
       }
     },
     sessionId: sessionManager.getSessionId(),

@@ -1470,7 +1470,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     if (epoch !== extractiveEpoch || !extractiveConfig()?.enabled || context.signal?.aborted ||
       context.sessionManager.getSessionId() !== sessionId || context.sessionManager.getLeafId() !== leaf) return;
     extractiveHistory ??= new ExtractiveHistory(extractiveConfig);
-    await extractiveHistory.prepare(context, typeof event.prompt === "string" ? event.prompt : "");
+    await extractiveHistory.prepare(context, event.messageType === "user" ? event.prompt : "");
   });
 
   // The root inbox context filter (smarty-dev#8962) loads at the first request whose context holds
@@ -1576,7 +1576,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     // mode preserves Pi's progressive skill loading without exposing read.
     // Turn-derived: delivered via the message channel (below), never the
     // system prompt, so the cached system prefix stays byte-stable.
-    const skillReferenceGuidance = effectiveFullCodeMode && typeof event.prompt === "string"
+    const skillReferenceGuidance = effectiveFullCodeMode && event.messageType === "user"
       ? buildSkillReferenceGuidance(event.prompt, skills)
       : undefined;
     const currentModel = context.model
@@ -1648,7 +1648,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     );
     if (names.length === 0) return;
     const mentioned = proxyContractMentionsInSkills(
-      typeof event.prompt === "string" ? event.prompt : "",
+      event.messageType === "user" ? event.prompt : "",
       event.systemPrompt,
       names,
     );

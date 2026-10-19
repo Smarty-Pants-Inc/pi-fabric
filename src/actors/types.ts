@@ -30,10 +30,12 @@ import type { FabricScope } from "../protocol.js";
 //     messages and its result is sent verbatim. Exposing it to actors would let
 //     them rewrite the system prompt per request, which Fabric deliberately
 //     avoids to keep the cached system prefix byte-stable.
-// Pi 0.99's mcp_servers_change is infrastructure reconciliation, and
-// provider_stream_event carries raw provider data on the request hot path.
-// Neither is an actor observation: forwarding would expose raw payloads and
-// enqueue actors once per stream frame. Keep the exhaustive allowlist below.
+// Pi 0.99's mcp_servers_change is infrastructure reconciliation. Pi 1.2's
+// provider_stream_event is a data-free notification, but it could enqueue actors
+// once per parsed stream frame; tool_partial_result is a per-update snapshot.
+// bash_spawn carries the resolved command and an environment that may contain
+// secrets. session_ready is replacement-session readiness, not a host work event
+// for actor triggers. Keep all four out of this allowlist.
 // To observe these as actor events, add them to
 // FABRIC_ACTOR_PI_HOST_EVENTS below and give it a FABRIC_LIFECYCLE_EVENTS topic.
 export type FabricActorPiHostEvent = Exclude<
@@ -42,8 +44,11 @@ export type FabricActorPiHostEvent = Exclude<
   | "cache_warming_decision"
   | "agent_before_settle"
   | "context_with_system"
+  | "session_ready"
   | "mcp_servers_change"
   | "provider_stream_event"
+  | "tool_partial_result"
+  | "bash_spawn"
 >;
 
 const defineFabricActorPiHostEvents = <

@@ -5,7 +5,7 @@ import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
 // The published artifact: pack the checkout (dist is built by CI before tests),
-// unpack it, and load it in the real Pi 1.1.0 host offline, as Pi installs it.
+// unpack it, and load it in the real Pi 1.2.0 host offline, as Pi installs it.
 const repo = path.resolve(import.meta.dirname, "..");
 const manifest = JSON.parse(fs.readFileSync(path.join(repo, "package.json"), "utf8")) as {
   dependencies: Record<string, string>;
@@ -74,7 +74,7 @@ describe("bundled Coral Bricks provider package", () => {
     vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
     vi.stubEnv("CORALBRICKS_API_KEY", "");
     const sdk = await import("@earendil-works/pi-coding-agent");
-    expect(sdk.VERSION).toBe("1.1.0");
+    expect(sdk.VERSION).toBe("1.2.0");
     const settingsManager = sdk.SettingsManager.inMemory({ packages, compaction: { enabled: false }, retry: { enabled: false } } as never);
     const loader = new sdk.DefaultResourceLoader({
       cwd: agentDir, agentDir, settingsManager,
@@ -84,7 +84,7 @@ describe("bundled Coral Bricks provider package", () => {
     return { sdk, agentDir, loaded: loader.getExtensions() };
   }
 
-  it("loads the packed provider offline in a real Pi 1.1.0 host, beside Fabric", async () => {
+  it("loads the packed provider offline in a real Pi 1.2.0 host, beside Fabric", async () => {
     const requests: string[] = [];
     vi.stubGlobal("fetch", async (url: unknown) => { requests.push(String(url)); return new Response("", { status: 503 }); });
     const { sdk, agentDir, loaded } = await loadPacked([packed]);

@@ -127,5 +127,5 @@ export default function (pi: ExtensionAPI) {
   pi.on("before_agent_start", (event, context) => receipt({ type: "native_activation", actorId: process.env.PI_FABRIC_ACTOR_ID ?? null,
     runId: process.env.PI_FABRIC_PARENT_RUN ?? "main", pid: process.pid, sessionId: context.sessionManager.getSessionId(),
     sessionFile: context.sessionManager.getSessionFile(), model: context.model ? `${context.model.provider}/${context.model.id}` : null,
-    thinking: pi.getThinkingLevel(), prompt: event.prompt }));
+    thinking: pi.getThinkingLevel(), prompt: event.messageType === "user" ? event.prompt : "" }));
 }

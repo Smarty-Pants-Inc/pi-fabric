@@ -27,11 +27,23 @@ function fixture(options: { candidates?: string[]; pickerExit?: number; sshExit?
     "import sys",
     "args = sys.argv",
     "if '--probe' in args: sys.exit(0)",
-    "sys.stdin.read()",
+    "task = sys.stdin.read()",
     "count_at = args.index('--admit') + 3",
     "requires = int(args[count_at])",
     "paths = args[count_at + 1:count_at + 1 + requires]",
-    "sys.stdout.write('\\0'.join(['', '', '', '0'] + [p for file in paths for p in [file, file]]) + '\\0')",
+    "needs_at = count_at + 1 + requires",
+    "pin_count = int(args[needs_at])",
+    "needs = args[needs_at + 1 + pin_count:]",
+    "corpus_path = '/private-corpus/'",
+    "if 'corpus' in needs:",
+    "    result = ['', 'corpus', 'explicit corpus need', '0']",
+    "elif 'github' in needs:",
+    "    result = ['', 'github', 'explicit github need', '0']",
+    "elif corpus_path in task or any(corpus_path in file for file in paths):",
+    "    result = ['', 'corpus', 'path-derived corpus input', '0']",
+    "else:",
+    "    result = ['', '', '', '0'] + [p for file in paths for p in [file, file]]",
+    "sys.stdout.write('\\0'.join(result) + '\\0')",
   ].join("\n"));
   const bin = path.join(root, "bin"); fs.mkdirSync(bin, { recursive: true });
   const fleet = path.join(bin, "smarty-task-ryzen2");
@@ -84,6 +96,62 @@ describe.skipIf(process.platform === "win32")("installed fleet placement affinit
     const result = await preflightFleetPlacement(f.request(), f.config, f.config.command, "task", f.env);
     expect(result?.host).toBe("intel1");
     expect(result?.command.slice(result.command.indexOf("--host"), result.command.indexOf("--host") + 2)).toEqual(["--host", "intel1"]);
+  });
+
+  it("admits an explicit corpus need through the fleet preflight and keeps it in the placement audit", async () => {
+    const f = fixture({ executeRemote: true });
+    const local = localWorkerRequest(f);
+    local.request.needs = ["corpus"];
+    const resultDirectory = path.join(f.base, "results", "affinity");
+    fs.mkdirSync(resultDirectory, { recursive: true });
+    fs.writeFileSync(path.join(resultDirectory, "rc"), "0");
+    fs.writeFileSync(path.join(resultDirectory, "result.md"), "REMOTE");
+
+    const handle = await new ProcessTransport(undefined, f.config).launch(local.request);
+
+    expect(handle.sessionId).toBe("placement:affinity");
+    expect(await handle.isAlive()).toBe(false);
+    expect(fs.readFileSync(local.events, "utf8")).toContain('"type":"placement.remote"');
+    expect(fs.readFileSync(local.events, "utf8")).toContain('"needs":["corpus"]');
+    expect(fs.readFileSync(f.sshCalls, "utf8")).toBe("called\n");
+    expect(fs.readFileSync(f.launchCalls, "utf8")).toBe("called\n");
+  });
+
+  it("preserves the explicit github need in fleet preflight", async () => {
+    const f = fixture();
+    await expect(preflightFleetPlacement(f.request(f.cwd, ["github"], false), f.config, f.config.command, "portable task", f.env))
+      .rejects.toThrow("needs github: explicit github need");
+    expect(fs.existsSync(f.sshCalls)).toBe(false);
+  });
+
+  it.each(["prompt", "requires"] as const)("still refuses a path-derived corpus input in %s during fleet preflight", async location => {
+    const f = fixture();
+    const corpusPath = path.join(f.base, "private-corpus", "secret.txt");
+    const request = {
+      ...f.request(f.cwd, ["corpus"], false),
+      ...(location === "requires" ? { requires: [corpusPath] } : {}),
+    };
+    const task = location === "prompt" ? `Inspect ${corpusPath}` : "Inspect the supplied input";
+
+    await expect(preflightFleetPlacement(request, f.config, f.config.command, task, f.env))
+      .rejects.toThrow("needs corpus: path-derived corpus input");
+    expect(fs.existsSync(f.sshCalls)).toBe(false);
+    expect(fs.existsSync(f.launchCalls)).toBe(false);
+  });
+
+  it.each(["local", "github"] as const)("keeps needs %s on the existing local path before fleet preflight", async need => {
+    const f = fixture();
+    const local = localWorkerRequest(f);
+    local.request.needs = [need];
+
+    const handle = await new ProcessTransport(undefined, f.config).launch(local.request);
+    await handle.waitForClose?.();
+
+    expect(fs.readFileSync(local.marker, "utf8")).toBe("LOCAL");
+    expect(fs.readFileSync(local.events, "utf8")).toContain('"type":"placement.local"');
+    expect(fs.existsSync(f.pickerCalls)).toBe(false);
+    expect(fs.existsSync(f.sshCalls)).toBe(false);
+    expect(fs.existsSync(f.launchCalls)).toBe(false);
   });
 
   it.each(["ineligible", "missing", "nonzero", "empty", "timeout"] as const)("runs a real local worker when picker admission is %s", async kind => {

@@ -195,7 +195,9 @@ export const preflightFleetPlacement = async (request: AgentTransportLaunch, con
     if (root) {
       // Reuse installed literal-path/corpus inference, not another prompt scanner.
       const source = path.join(root, "setup/factory/task-preflight.py");
-      const admitted = await query("python3", ["-I", source, "--admit", "--root", project, String(requires.length), ...requires, "0", ...(request.needs ?? []).filter(need => need === "github" || need === "corpus")], deadline, environment, request.signal, task);
+      // Corpus is placement metadata, not an explicit host requirement. The helper still
+      // derives corpus isolation from task and required paths.
+      const admitted = await query("python3", ["-I", source, "--admit", "--root", project, String(requires.length), ...requires, "0", ...(request.needs ?? []).filter(need => need === "github")], deadline, environment, request.signal, task);
       const fields = admitted.stdout.split("\0");
       if (fields.at(-1) === "") fields.pop();
       const guards = Number(fields[3]);

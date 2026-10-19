@@ -1,4 +1,4 @@
-# NATS Path B switch and FILE rollback — operator DRAFT
+# NATS Path B switch and FILE rollback: operator DRAFT
 
 **GATED DRAFT, not rollout approval. No live-fleet cutover has been made by this work.**
 Do not use this page to authorize a fleet restart, install, broker change or cutover.
@@ -34,7 +34,7 @@ A separate FILE-from-start fixture is a useful contrast, not a rollback of those
 
 These are `mesh.*` fields. `mesh.hostTransport` is the host stamp in `<agentDir>/fabric.json`;
 a project cannot set it. Inventory trusted project overrides of `mesh.transport`/`mesh.stateBackend`.
-Read back effective settings, not only the edited file: `PI_FABRIC_MESH_TRANSPORT`,
+Read back effective settings, not just the edited file: `PI_FABRIC_MESH_TRANSPORT`,
 `PI_FABRIC_MESH_HOST_TRANSPORT` and `PI_FABRIC_MESH_STATE_BACKEND` must be unset or match.
 Configuration is activation-captured: editing it does not switch a running process.
 
@@ -56,7 +56,7 @@ Do not purge, delete or recreate streams/consumers, remove seen rows, synthesize
 change host IDs, or retry UNKNOWN work with fresh keys to manufacture a passing result.
 Missing inventory, missing Consumer Info or an RPC error is **UNKNOWN, not zero**.
 
-## Source rehearsal commands — R1 FIRST, R2 only after its acceptance barrier
+## Source rehearsal commands: R1 FIRST, R2 only after its acceptance barrier
 
 These commands select existing source-integration cases; they are not fleet-management tools.
 Prerequisites: Linux, dependencies, Node/Pi host environment and a caller-owned isolated test
@@ -64,7 +64,7 @@ environment/deletion guard; test-root retirement belongs only to that environmen
 Set `PI_FABRIC_NATS_REHEARSAL=1` explicitly; NATS_BIN/PATH discovery alone must not admit the suite.
 Capture native command exit, stdout, stderr and descendant terminal evidence securely.
 `NATS_SWITCH_PROBE_MODULE` must resolve to the existing thin adapter shown below; otherwise R1/R2
-can skip. A skip is not PASS. Verify the selected case actually executed.
+can skip. A skip is not PASS. Verify the selected case executed.
 
 For real-copy evidence, supply an authorized `NATS_SWITCH_SEED_MODULE` exporting BOTH
 `seedSwitchFixture` AND `verifySwitchPopulation`; it may seed only the fixture-owned copies passed
@@ -75,7 +75,7 @@ Invalid exports, seed results or population evidence fail closed; hook claims al
 Without a seed module, ordinary non-R2 cases may use fresh synthetic fixtures, NOT capture-backed
 evidence. R2 skips BEFORE creating a fixture or starting a broker, with reason `not capture-backed`.
 The public fixture's `residency.enabled:false` input is not a supported product disable guard;
-prove actual resident inventory/state instead of relying on that field.
+prove actual resident inventory/state; do not rely on that field.
 
 R1 selection (template; do not run until the gates above and evidence collector are ready):
 
@@ -106,7 +106,7 @@ The local `producerFence`/`stopProducers`/`resumeProducers` IPC gate controls te
 it is **not a product feature or an atomic fleet fence**. The real receiver, journal and ACK paths run.
 The fixture fails closed if residual 4a recovery is needed; it does not implement that branch.
 
-## Targeted FILE close diagnostics — known RED, separate from R1/R2
+## Targeted FILE close diagnostics: known RED, separate from R1/R2
 
 Both no-business close and FILE followUp/steer close are expected RED (`smarty-dev#14612`) until fixed.
 With opt-in, do not suppress EPIPE or skip assertions; the fix must make both GREEN before the gate may default-on.
@@ -146,7 +146,7 @@ Required links run normally before STOP-ALL; a publishing bridge is never exempt
 4. **Frozen ALL-consumer recheck while ALL publishers remain stopped.** Query ALL retained
    owner/sender inboxes again; require unchanged retained identity/filter and exact 0/0 everywhere.
    Reject missing, replaced, malformed or errored consumer information. No config flip yet.
-   **4a — residual only:** start ONLY the runtime owning that residual consumer on NATS,
+   **4a: residual only:** start ONLY the runtime owning that residual consumer on NATS,
    attempt its native drain, complete its normal STOP, then repeat the ALL-stopped ALL-consumer
    check. Include new ACKs in other stopped sender inboxes; repeat this exact barrier per attempt.
    Do not silently start peers or bridges. If owner-only startup requires extra publishers,
@@ -175,7 +175,7 @@ Required links run normally before STOP-ALL; a publishing bridge is never exempt
    and `agents.steer`; require accepted results, one admission each and both-role stage evidence.
    Mirror readiness alone proves neither old-result recovery nor successful custody release.
 
-## Conditional paused custody checkpoint — not ordinary FILE startup/send/stop
+## Conditional paused custody checkpoint: not ordinary FILE startup/send/stop
 
 Ordinary FILE startup, send, Main admission, graceful shutdown and operator business release
 are NOT drain-receipt-gated. Separate native paused custody/dormancy/cooperative-release paths
@@ -197,7 +197,7 @@ but validates declarations and writes: it does NOT query the broker. There is no
 safe issuer/CLI here. Admin `drain` reports one consumer only; it does not fence, consume, ACK,
 settle business work, mint a receipt or certify the global inventory. Do not hand-author an envelope,
 invent timestamps or use fixture IPC declarations as authenticated issuance.
-If a required native checkpoint actually hits, stop/escalate to a separately authorized issuer lane.
+If a required native checkpoint hits, stop/escalate to a separately authorized issuer lane.
 That lane must bind actual host/configured stream, final retained writes (including stop/4a),
 authenticated existing-consumer checks immediately before durable write/readback and the maintained
 barrier. No receipt bypass or universal mint prerequisite is implied by ordinary FILE success.

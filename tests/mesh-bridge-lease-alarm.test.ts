@@ -55,10 +55,47 @@ async function terminate(child: ChildProcess) {
   if (child.exitCode !== null || child.signalCode !== null) return;
   if (process.platform === "linux") child.kill("SIGCONT");
   const exited = once(child, "exit");
-  if (child.connected) child.send({ op: "shutdown" });
+  if (child.connected) child.send({ op: "shutdown" }, () => {});
   const timer = setTimeout(() => child.kill("SIGKILL"), 2_000);
   try { await exited; } finally { clearTimeout(timer); }
 }
+describe.skipIf(process.platform !== "linux")("terminate IPC teardown", () => {
+  it.each([
+    { name: "ordinary shutdown exits code 0", disconnectBeforeSend: false, exitCode: 0, signalCode: null },
+    { name: "disconnect-before-send falls back to SIGKILL", disconnectBeforeSend: true, exitCode: null, signalCode: "SIGKILL" as const },
+  ])("$name", async ({ disconnectBeforeSend, exitCode, signalCode }) => {
+    const child = spawn(process.execPath, ["-e", `
+      process.on("message", message => { if (message?.op === "shutdown") process.exit(0); });
+      process.send({ kind: "ready" });
+      setInterval(() => {}, 60_000);
+    `], { stdio: ["ignore", "ignore", "ignore", "ipc"] });
+    const errors: Error[] = [];
+    child.on("error", error => errors.push(error));
+    const ready = once(child, "message");
+    try {
+      await ready;
+      if (disconnectBeforeSend) {
+        const originalSend = child.send;
+        child.send = ((...args: Parameters<ChildProcess["send"]>) => {
+          expect(child.connected).toBe(true);
+          child.disconnect();
+          expect(child.connected).toBe(false);
+          return Reflect.apply(originalSend, child, args);
+        }) as ChildProcess["send"];
+      }
+      await terminate(child);
+      expect(child.exitCode).toBe(exitCode);
+      expect(child.signalCode).toBe(signalCode);
+      expect(errors).toEqual([]);
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) {
+        const exited = new Promise<void>(resolve => child.once("exit", () => resolve()));
+        child.kill("SIGKILL");
+        await exited;
+      }
+    }
+  }, 10_000);
+});
 async function fixture(populated: boolean, watchdog: Record<string, unknown> = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-lease-process-"));
   const hubRoot = path.join(root, "hub"), farRoot = path.join(root, "far");
@@ -159,7 +196,7 @@ async function fixture(populated: boolean, watchdog: Record<string, unknown> = {
   const farMesh = new MeshStore(farRoot, 64 * 1024, 100);
   cleanup.push(async () => {
     if (process.platform === "linux") agent.kill("SIGCONT");
-    if (agent.connected) agent.send({ op: "resume" });
+    if (agent.connected) agent.send({ op: "resume" }, () => {});
     await terminate(bridge); await terminate(agent); mesh.closeState(); farMesh.closeState();
     fs.rmSync(root, { recursive: true, force: true }); // only this fixture's temp, after owned handles join
   });
@@ -205,7 +242,8 @@ describe.skipIf(process.platform !== "linux")("mirrored lease bridge alarms via 
     // The process stays alive and genuinely unresponsive for three freshness intervals.
     // Explicit now above/below the boundary checks equality without a timing race; this
     // wait also proves the stalled sequence on real elapsed time, not just clock injection.
-    await sleep(Math.max(0, last + 45_001 - Date.now()));
+    const alarmAt = last + 45_001;
+    while (Date.now() < alarmAt) await sleep(Math.max(1, alarmAt - Date.now()));
     expect(Date.now() - last).toBeGreaterThanOrEqual(45_001);
     await f.sweep(last + 45_001);
     expect(f.alarms()).toHaveLength(1);

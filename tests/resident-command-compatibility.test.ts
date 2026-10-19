@@ -45,7 +45,7 @@ const stop = async (child: ChildProcess, output: () => string) => {
   const exit = once(child, "exit");
   const timer = setTimeout(() => child.kill("SIGKILL"), 10_000);
   try {
-    if (child.connected) child.send("close"); else child.kill("SIGTERM");
+    if (child.connected) child.send("close", () => {}); else child.kill("SIGTERM");
     const [code, signal] = await exit;
     expect({ code, signal }, `Legacy host and its worker must close cleanly: ${output()}`).toEqual({ code: 0, signal: null });
   }

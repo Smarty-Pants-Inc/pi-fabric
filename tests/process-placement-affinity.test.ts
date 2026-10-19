@@ -47,7 +47,7 @@ function fixture(options: { candidates?: string[]; pickerExit?: number; sshExit?
   ].join("\n"));
   const bin = path.join(root, "bin"); fs.mkdirSync(bin, { recursive: true });
   const fleet = path.join(bin, "smarty-task-ryzen2");
-  write(fleet, "#!/bin/sh\nprintf 'called\\n' >> \"$LAUNCH_CALLS\"\nprintf 'RYZEN2_TASK_ACCEPTED affinity on ryzen2\\n'\n"); fs.chmodSync(fleet, 0o700);
+  write(fleet, "#!/bin/sh\nprintf 'called\\n' >> \"$LAUNCH_CALLS\"\nprintf '%s\\n' \"$@\" > \"$LAUNCH_ARGS\"\nprintf 'RYZEN2_TASK_ACCEPTED affinity on ryzen2\\n'\n"); fs.chmodSync(fleet, 0o700);
   const picker = path.join(base, "smarty-pick-host-fixture");
   write(picker, `#!/bin/sh\nprintf 'called\\n' >> "$PICKER_CALLS"\nprintf '%s\\n' "$CANDIDATES"\nprintf 'eligible0=1 eligible1=1\\n' >&2\nexit "${options.pickerExit ?? 0}"\n`); fs.chmodSync(picker, 0o700);
   const pathBin = path.join(base, "path"); fs.mkdirSync(pathBin);
@@ -66,7 +66,7 @@ function fixture(options: { candidates?: string[]; pickerExit?: number; sshExit?
   const env = {
     ...process.env, PATH: `${pathBin}:${process.env.PATH}`,
     CANDIDATES: (options.candidates ?? ["ryzen2", "ryzen3"]).join("\n"),
-    SSH_CALLS: path.join(base, "ssh-calls"), PICKER_CALLS: path.join(base, "picker-calls"), LAUNCH_CALLS: path.join(base, "launch-calls"),
+    SSH_CALLS: path.join(base, "ssh-calls"), PICKER_CALLS: path.join(base, "picker-calls"), LAUNCH_CALLS: path.join(base, "launch-calls"), LAUNCH_ARGS: path.join(base, "launch-args"),
   };
   const request = (cwdPath = cwd, needs: string[] = [], withRequires = true): AgentTransportLaunch => ({
     id: "affinity", name: "affinity", cwd: cwdPath, workerPath: "unused", workerArguments: [], needs,
@@ -76,7 +76,7 @@ function fixture(options: { candidates?: string[]; pickerExit?: number; sshExit?
 }
 
 function localWorkerRequest(f: ReturnType<typeof fixture>, cwd = f.cwd) {
-  for (const key of ["PATH", "CANDIDATES", "SSH_CALLS", "PICKER_CALLS", "LAUNCH_CALLS"] as const) vi.stubEnv(key, f.env[key]);
+  for (const key of ["PATH", "CANDIDATES", "SSH_CALLS", "PICKER_CALLS", "LAUNCH_CALLS", "LAUNCH_ARGS"] as const) vi.stubEnv(key, f.env[key]);
   const runDir = path.join(f.base, "run"); fs.mkdirSync(runDir);
   const taskFile = path.join(runDir, "task.txt"); fs.writeFileSync(taskFile, "portable task");
   const marker = path.join(runDir, "local-worker.txt");
@@ -98,9 +98,9 @@ describe.skipIf(process.platform === "win32")("installed fleet placement affinit
     expect(result?.command.slice(result.command.indexOf("--host"), result.command.indexOf("--host") + 2)).toEqual(["--host", "intel1"]);
   });
 
-  it("admits an explicit corpus need through the fleet preflight and keeps it in the placement audit", async () => {
-    const f = fixture({ executeRemote: true });
-    f.config.corpusRemote = true;
+  it("admits corpus only on an allow-listed host and keeps it in the placement audit", async () => {
+    const f = fixture({ candidates: ["ryzen3", "ryzen2"], executeRemote: true });
+    f.config.corpusRemoteHosts = ["ryzen2"];
     const local = localWorkerRequest(f);
     local.request.needs = ["corpus"];
     const resultDirectory = path.join(f.base, "results", "affinity");
@@ -116,11 +116,42 @@ describe.skipIf(process.platform === "win32")("installed fleet placement affinit
     expect(fs.readFileSync(local.events, "utf8")).toContain('"needs":["corpus"]');
     expect(fs.readFileSync(f.sshCalls, "utf8")).toBe("called\n");
     expect(fs.readFileSync(f.launchCalls, "utf8")).toBe("called\n");
+    const argv = fs.readFileSync(f.env.LAUNCH_ARGS, "utf8").trim().split("\n");
+    expect(argv.slice(argv.indexOf("--host"), argv.indexOf("--host") + 2)).toEqual(["--host", "ryzen2"]);
+  });
+
+  it("keeps corpus local when the qualified-host allow-list is empty", async () => {
+    const f = fixture();
+    const local = localWorkerRequest(f);
+    local.request.needs = ["corpus"];
+    const handle = await new ProcessTransport(undefined, f.config).launch(local.request);
+    await handle.waitForClose?.();
+
+    expect(fs.readFileSync(local.marker, "utf8")).toBe("LOCAL");
+    expect(fs.readFileSync(local.events, "utf8")).toContain('"reason":"unmet needs: corpus"');
+    for (const file of [f.pickerCalls, f.sshCalls, f.launchCalls]) expect(fs.existsSync(file)).toBe(false);
+  });
+
+  it("keeps an explicit corpus target local when it is outside the qualified-host allow-list", async () => {
+    const f = fixture({ candidates: ["ryzen2", "ryzen3"] });
+    f.config.corpusRemoteHosts = ["ryzen2"];
+    const command = [...f.config.command]; command[command.indexOf("--host") + 1] = "ryzen3";
+    const config = { ...f.config, command };
+    const local = localWorkerRequest(f);
+    local.request.needs = ["corpus"];
+    const handle = await new ProcessTransport(undefined, config).launch(local.request);
+    await handle.waitForClose?.();
+
+    expect(fs.readFileSync(local.marker, "utf8")).toBe("LOCAL");
+    expect(fs.readFileSync(local.events, "utf8")).toContain("host ryzen3 is not in corpusRemoteHosts");
+    expect(fs.readFileSync(f.pickerCalls, "utf8")).toBe("called\n");
+    expect(fs.existsSync(f.sshCalls)).toBe(false);
+    expect(fs.existsSync(f.launchCalls)).toBe(false);
   });
 
   it("passes corpus to the helper by default, preserving the explicit location check", async () => {
     const f = fixture();
-    expect(f.config.corpusRemote).toBe(false);
+    expect(f.config.corpusRemoteHosts).toEqual([]);
     await expect(preflightFleetPlacement(f.request(f.cwd, ["corpus"], false), f.config, f.config.command, "portable task", f.env))
       .rejects.toThrow("needs corpus: explicit corpus need");
     expect(fs.existsSync(f.sshCalls)).toBe(false);
@@ -135,7 +166,7 @@ describe.skipIf(process.platform === "win32")("installed fleet placement affinit
 
   it.each(["prompt", "requires"] as const)("still refuses a path-derived corpus input in %s during fleet preflight", async location => {
     const f = fixture();
-    f.config.corpusRemote = true;
+    f.config.corpusRemoteHosts = ["ryzen2"];
     const corpusPath = path.join(f.base, "private-corpus", "secret.txt");
     const request = {
       ...f.request(f.cwd, ["corpus"], false),

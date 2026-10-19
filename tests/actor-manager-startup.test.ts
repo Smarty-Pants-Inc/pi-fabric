@@ -20,7 +20,7 @@ afterEach(async () => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
-function fixture(count: number) {
+function fixture(count: number, withArchives = true) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-actor-startup-")); roots.push(root);
   const actorRoot = path.join(root, "actors"); fs.mkdirSync(actorRoot);
   const mesh = new MeshStore(path.join(root, "mesh"), 256 * 1024, 100);
@@ -33,7 +33,7 @@ function fixture(count: number) {
   const old = Date.now() - 10 * 24 * 60 * 60 * 1_000;
   const records = Array.from({ length: count }, (_, i) => {
     const id = i.toString(16).padStart(32, "0"), directory = path.join(actorRoot, id);
-    for (let run = 0; run < 10; run++) {
+    for (let run = 0; withArchives && run < 10; run++) {
       const dir = path.join(directory, "runs", `run-${i}-${run}`); fs.mkdirSync(dir, { recursive: true });
       fs.writeFileSync(path.join(dir, "status.json"), JSON.stringify({ status: "completed", transport: "process", sessionId: "2147483646", finishedAt: old }));
       fs.writeFileSync(path.join(dir, "events.jsonl"), '{"type":"complete"}\n');
@@ -52,7 +52,7 @@ function fixture(count: number) {
     }); managers.push(value); return value;
   };
   const runDir = (actor: number, run: number) => path.join(actorRoot, records[actor]!.id, "runs", `run-${actor}-${run}`);
-  return { actorRoot, records, make, runDir, agents: manager };
+  return { actorRoot, records, make, runDir, agents: manager, mesh, identity };
 }
 
 const turn = () => new Promise<void>((resolve) => setImmediate(resolve));
@@ -63,6 +63,54 @@ async function eventually(predicate: () => boolean, timeoutMs = 10_000) {
 }
 
 describe("ActorManager bounded startup (#4250 item 4)", () => {
+  it("drains 200 initial presence rows promptly in bounded event-loop batches", async () => {
+    const f = fixture(200, false);
+    const prefix = "actors/startup/";
+    const writtenIds: string[] = [];
+    let firstWriteAt: number | undefined;
+    let writesThisTurn = 0;
+    const writesPerTurn: number[] = [];
+    vi.spyOn(f.mesh, "put").mockImplementation(async input => {
+      if (input.key.startsWith(prefix)) {
+        firstWriteAt ??= performance.now();
+        writtenIds.push(input.key.slice(prefix.length));
+        writesThisTurn++;
+        // Deterministic synchronous work makes a batch exceed the loop-delay budget if too large.
+        const until = performance.now() + 6;
+        while (performance.now() < until) { /* controlled mesh-write latency */ }
+      }
+      return { key: input.key, value: input.value, version: 1, updatedAt: Date.now(), updatedBy: f.identity };
+    });
+    const started = performance.now();
+    f.make({ canConsumeMesh: () => false }); // No presencePublisher: exercise the Main ActorDirectory path.
+    const construction = performance.now() - started;
+    expect(construction).toBeLessThan(2_000);
+    expect(writtenIds).toHaveLength(0); // Construction schedules work; it never waits for the drain.
+
+    let previous = performance.now(), longest = 0, active = true;
+    let heartbeat: NodeJS.Immediate;
+    const beat = () => {
+      const now = performance.now(); longest = Math.max(longest, now - previous); previous = now;
+      if (writesThisTurn) writesPerTurn.push(writesThisTurn);
+      writesThisTurn = 0;
+      if (active) heartbeat = setImmediate(beat);
+    };
+    heartbeat = setImmediate(beat);
+    try {
+      await eventually(() => writtenIds.length > 0, 500); // Must start now, not at the default 5 s retry.
+      await eventually(() => writtenIds.length === f.records.length);
+      await turn();
+      const expectedIds = f.records.map(record => record.id).sort();
+      expect(firstWriteAt! - started).toBeLessThan(500); // Initial publication starts promptly, not at retry backoff.
+      expect(writtenIds).toHaveLength(200);
+      expect(new Set(writtenIds).size).toBe(200);
+      expect([...writtenIds].sort()).toEqual(expectedIds); // Exactly one write per loaded row: none lost or duplicated.
+      expect(writesPerTurn.length).toBeGreaterThanOrEqual(Math.ceil(f.records.length / 2));
+      expect(Math.max(...writesPerTurn)).toBeLessThanOrEqual(2);
+      expect(longest).toBeLessThan(50);
+    } finally { active = false; clearImmediate(heartbeat!); }
+  }, 15_000);
+
   it("loads 200 real-shaped actors in one linear read and eventually sweeps 2,000 runs in bounded event-loop slices", async () => {
     const f = fixture(200);
     const rawOwnership = vi.fn(() => true);

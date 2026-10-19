@@ -343,6 +343,8 @@ export const meshRetentionSweepArgs = (meshRoot: string, runsOlderThanMs: number
   [meshRoot, "--dry-run", "--runs-older-than", String(runsOlderThanMs), "--report", path.join(meshRoot, ".mesh-retention-report.json")];
 /** Retry delay for presence writes that failed on a contended mesh lock (smarty-dev#448). */
 const PRESENCE_RETRY_MS = 5_000;
+/** Bound startup/retry writes per event-loop turn; yields do not add mesh operations. */
+const PRESENCE_RETRY_BATCH_SIZE = 2;
 /** Recent (actor, event) deliveries, so an event offered again reaches only actors that missed it. */
 const DELIVERED_EVENT_MEMORY = 4_096;
 /** Per durable actor: completed mesh subjects retained in its queue checkpoint. */
@@ -7233,7 +7235,7 @@ export class ActorManager {
     this.#presenceAlarmTimer.unref();
   }
 
-  #schedulePresenceRetry(): void {
+  #schedulePresenceRetry(immediate = false): void {
     if (this.#presencePublisher) {
       if (!this.#closing && this.#pendingPresence.size > 0) this.#presencePublisher.schedule();
       return;
@@ -7242,16 +7244,20 @@ export class ActorManager {
     this.#presenceTimer = setTimeout(() => {
       this.#presenceTimer = undefined;
       void (async () => {
-        for (const id of [...this.#pendingPresence]) {
+        const ids = [...this.#pendingPresence];
+        for (let index = 0; index < ids.length; index++) {
           if (this.#closing) return;
-          await this.#writePresence(id);
+          await this.#writePresence(ids[index]!);
+          if ((index + 1) % PRESENCE_RETRY_BATCH_SIZE === 0 && index + 1 < ids.length) {
+            await new Promise<void>(resolve => setImmediate(resolve));
+          }
         }
       })().catch(error => {
         // Keep the owned timer contained even if a non-mesh presence precondition fails.
         diagnostics.warn("src/actors/manager.ts", `[pi-fabric] actor presence retry failed: ${error instanceof Error ? error.message : String(error)}`);
         this.#schedulePresenceRetry();
       });
-    }, Math.max(1, [...this.#pendingPresence].reduce((wait, id) =>
+    }, immediate ? 0 : Math.max(1, [...this.#pendingPresence].reduce((wait, id) =>
       Math.min(wait, this.#presenceRetries.get(id)?.waitMs || this.#presenceRetryMs), 5_000)));
     this.#presenceTimer.unref();
   }
@@ -7996,7 +8002,7 @@ export class ActorManager {
       this.#restoreLoadedBinding(actor);
       if (this.#ownershipDecision(actor.id) && this.#slotCurrent(actor)) this.#pendingPresence.add(actor.id);
     }
-    this.#schedulePresenceRetry();
+    this.#schedulePresenceRetry(true);
     // Persist each restart (running, no orphan marker) so peers and the next load agree. It keeps
     // the actor's id, definition, filters, topics, mailbox and the session's mesh cursor.
     if (restartedIds.length) this.#scheduleRegistrySave(true, 1);

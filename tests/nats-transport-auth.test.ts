@@ -98,6 +98,13 @@ describe.skipIf(!binary)("authenticated Path B transport", () => {
     } finally { await fixture.stop(); }
   });
 
+  it("refuses a report-only operator with a response grant", async () => {
+    const fixture = await createPathBHarness({ binary: binary!, tls: {}, additionalOperatorResponses: { max: 16 } });
+    try {
+      await expect(openNatsConnection(fixture.operatorOptions())).rejects.toThrow(NatsAuthorizationError);
+    } finally { await fixture.stop(); }
+  });
+
   it("refuses bootstrap authority as the report-only operator despite a matching signed machine tag", async () => {
     await expect(openNatsConnection(harness.operatorOptions(harness.users.bootstrap))).rejects.toThrow();
   });

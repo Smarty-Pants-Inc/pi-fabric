@@ -79,6 +79,8 @@ export interface PathBHarnessOptions {
   readonly additionalAgentSubscribe?: readonly string[];
   /** Deliberately widened operator subscriptions; production operator remains metadata-only. */
   readonly additionalOperatorSubscribe?: readonly string[];
+  /** Deliberately add response permission; production operator has no response grant. */
+  readonly additionalOperatorResponses?: { readonly max: number };
   /** Deliberately removed agent publish denies for fail-closed identity-check tests. */
   readonly removeAgentDeny?: readonly string[];
   /** Serve client TLS from an owned ephemeral test CA (openssl subprocess). Server cert SANs default to localhost/127.0.0.1. */
@@ -361,7 +363,11 @@ export class PathBHarness {
           {
             key: maintainerSigning.getPublicKey(),
             role: "operator",
-            template: { ...operatorTemplate, sub: { allow: [...operatorTemplate.sub.allow, ...(options.additionalOperatorSubscribe ?? [])] } },
+            template: {
+              ...operatorTemplate,
+              ...(options.additionalOperatorResponses === undefined ? {} : { allow_responses: options.additionalOperatorResponses }),
+              sub: { allow: [...operatorTemplate.sub.allow, ...(options.additionalOperatorSubscribe ?? [])] },
+            },
           },
           { key: principalSigning.getPublicKey(), role: "principal", template: roleTemplateWithPathB("principal", streams, PATH_B_MACHINES) },
           {

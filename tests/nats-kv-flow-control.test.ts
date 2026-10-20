@@ -4,7 +4,7 @@ import { PermissionViolationError, nkeys, type Status } from "@nats-io/transport
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { encodeAccountJwt, encodeOperatorJwt, encodeUserJwt, formatUserCreds, type ScopedSigningKey } from "../src/mesh/nats-auth/jwt.js";
 import { legacyRoleTemplateWithPathB } from "../src/mesh/nats-auth/permissions.js";
-import { openNatsConnection, type NatsConnectionHandle } from "../src/transport/nats/connection.js";
+import { NatsAuthorizationError, openNatsConnection, type NatsConnectionHandle } from "../src/transport/nats/connection.js";
 import { NatsKvStore, openNatsKvForMachine } from "../src/transport/nats/kv.js";
 import type { KV } from "@nats-io/kv";
 import type { TransportKvEvent } from "../src/transport/types.js";
@@ -38,7 +38,7 @@ const bounded = async <T>(promise: Promise<T>, label: string, ms = 8_000): Promi
 
 const signerOf = (pair: KeyPair) => ({ publicKey: pair.getPublicKey(), sign: (bytes: Uint8Array) => pair.sign(bytes) });
 
-const legacyIdentityFactory = (root: string): PathBIdentity => {
+const legacyIdentityFactory = (root: string, additionalAgentPublish: readonly string[] = []): PathBIdentity => {
   const operatorIdentity = nkeys.createOperator() as unknown as KeyPair;
   const operatorSigning = nkeys.createOperator() as unknown as KeyPair;
   const systemAccountPair = nkeys.createAccount() as unknown as KeyPair;
@@ -67,8 +67,16 @@ const legacyIdentityFactory = (root: string): PathBIdentity => {
     signerOf(operatorSigning),
     clock,
   );
+  const legacyAgentTemplate = legacyRoleTemplateWithPathB("agent", streams, PATH_B_MACHINES);
   const scopedKeys: ScopedSigningKey[] = [
-    { key: agentSigning.getPublicKey(), role: "agent", template: legacyRoleTemplateWithPathB("agent", streams, PATH_B_MACHINES) },
+    {
+      key: agentSigning.getPublicKey(),
+      role: "agent",
+      template: additionalAgentPublish.length === 0 ? legacyAgentTemplate : {
+        ...legacyAgentTemplate,
+        pub: { ...legacyAgentTemplate.pub, allow: [...legacyAgentTemplate.pub.allow, ...additionalAgentPublish] },
+      },
+    },
     { key: bootstrapSigning.getPublicKey(), role: "maintainer", template: { pub: { allow: [">"], deny: [] }, sub: { allow: ["_INBOX.{{subject()}}.>"] } } },
   ];
   const appAccountJwt = encodeAccountJwt(
@@ -159,6 +167,14 @@ describe.skipIf(!binary)("real NATS KV flow-control rollout", () => {
       warning.mockRestore();
       await legacy.stop();
     }
+  }, 30_000);
+
+  it("rejects an extra grant on the frozen d231bd15 scope", async () => {
+    const legacy = await createPathBHarness({ binary: binary!, tls: {}, identityFactory: (root) => legacyIdentityFactory(root, ["fabric.>"]) });
+    try {
+      await expect(openNatsConnection({ ...legacy.runtimeOptions(legacy.users.machineA), machine: MACHINE }))
+        .rejects.toThrow(NatsAuthorizationError);
+    } finally { await legacy.stop(); }
   }, 30_000);
 });
 

@@ -8,3 +8,11 @@ export * from "./entropy/index.js";
 export * from "./protocol.js";
 export { FabricModelDeniedError } from "./core/model-policy.js";
 export { FabricModelNotServedError } from "./core/model-served-error.js";
+export type {
+  CallerIdentity,
+  SessionChannel,
+  SessionChannelEvent,
+  SessionChannelOpenOptions,
+  SessionChannelReply,
+  SessionChannelRequest,
+} from "./transport/nats/session-channel.js";

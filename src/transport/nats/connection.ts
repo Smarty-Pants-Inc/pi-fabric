@@ -5,7 +5,7 @@ import { credsAuthenticator, type NatsConnection } from "@nats-io/nats-core";
 import { jetstream, jetstreamManager, type JetStreamClient, type JetStreamManager } from "@nats-io/jetstream";
 import { AuthorizationError, PermissionViolationError, connect, type NodeConnectionOptions, type Status, type TlsOptions } from "@nats-io/transport-node";
 import { pathBMachines } from "../../mesh/nats-auth/mint.js";
-import { PATH_B_OPERATOR_MACHINE_PATTERN, roleTemplateWithPathB } from "../../mesh/nats-auth/permissions.js";
+import { PATH_B_OPERATOR_MACHINE_PATTERN, gatewayRoleTemplate, roleTemplateWithPathB } from "../../mesh/nats-auth/permissions.js";
 import { validateMachine } from "./subjects.js";
 import { TransportUnavailableError } from "../types.js";
 
@@ -24,6 +24,7 @@ export interface NatsPermissionPolicy {
   readonly custodyStream: string;
   readonly livenessStream: string;
   readonly pathBMachines: readonly string[];
+  readonly org?: string;
 }
 
 interface NatsTransportSecurityOptions {
@@ -35,13 +36,22 @@ interface NatsTransportSecurityOptions {
   readonly signal?: AbortSignal;
 }
 
-export interface NatsConnectionOptions extends NatsPermissionPolicy, NatsTransportSecurityOptions {
+interface NatsConnectionCredentials extends NatsTransportSecurityOptions {
   readonly credentials: string;
-  /** The server-verified machine identity; must equal the single signed `machine:` tag. */
-  readonly machine: string;
-  /** Defaults to the scoped runtime agent. `operator` is for explicit admin report connections only. */
-  readonly role?: "agent" | "operator";
 }
+
+export type NatsConnectionOptions =
+  | (NatsConnectionCredentials & NatsPermissionPolicy & {
+      /** The server-verified machine identity; must equal the single signed `machine:` tag. */
+      readonly machine: string;
+      /** Defaults to the scoped runtime agent. `operator` is for explicit admin report connections only. */
+      readonly role?: "agent" | "operator";
+    })
+  | (NatsConnectionCredentials & {
+      readonly role: "gateway";
+      /** Organization bound into the signed gateway permission template. */
+      readonly org: string;
+    });
 
 /** Bootstrap authority for admin provisioning only. Deliberately not exported from the package entry. */
 export interface NatsBootstrapConnectionOptions extends NatsTransportSecurityOptions {
@@ -191,9 +201,10 @@ interface ExpectedPermissions {
   readonly pubDeny: ReadonlySet<string>;
   readonly subAllow: ReadonlySet<string>;
   readonly subDeny: ReadonlySet<string>;
+  readonly allowResponses?: { readonly max: number };
 }
 
-/** Server-expanded #1276 scope for this signed user, built by the same roleTemplateWithPathB and validators as mint. */
+/** Server-expanded scope for this signed user, built by the same templates and validators as mint. */
 const expectedPermissions = (role: "agent" | "operator", machine: string, policy: NatsPermissionPolicy, auth: ReturnType<typeof readNatsCredentials>): ExpectedPermissions => {
   const machines = pathBMachines(policy.pathBMachines);
   const roles = tagValues(auth.tags, "role");
@@ -208,14 +219,30 @@ const expectedPermissions = (role: "agent" | "operator", machine: string, policy
   } else if (!PATH_B_OPERATOR_MACHINE_PATTERN.test(machine) || meshes.length !== 0) {
     throw new Error(MISMATCH);
   }
-  const template = roleTemplateWithPathB(role, { custodyStream: policy.custodyStream, livenessStream: policy.livenessStream }, machines);
+  const template = roleTemplateWithPathB(role, { custodyStream: policy.custodyStream, livenessStream: policy.livenessStream }, machines, policy.org);
   const expand = (subjects: readonly string[]): Set<string> => new Set(subjects.flatMap((subject) => {
     const fixed = subject.replaceAll("{{subject()}}", auth.subject).replaceAll("{{tag(machine)}}", machine);
     const out = fixed.includes("{{tag(mesh)}}") ? meshes.map((mesh) => fixed.replaceAll("{{tag(mesh)}}", mesh)) : [fixed];
     if (out.some((value) => value.includes("{{"))) throw new Error("unexpected NATS permission template");
     return out;
   }));
-  return { pubAllow: expand(template.pub.allow), pubDeny: expand(template.pub.deny), subAllow: expand(template.sub.allow), subDeny: new Set() };
+  return {
+    pubAllow: expand(template.pub.allow), pubDeny: expand(template.pub.deny),
+    subAllow: expand(template.sub.allow), subDeny: new Set(),
+    ...(template.allow_responses ? { allowResponses: template.allow_responses } : {}),
+  };
+};
+
+const expectedGatewayPermissions = (org: string, auth: ReturnType<typeof readNatsCredentials>): ExpectedPermissions => {
+  const roles = tagValues(auth.tags, "role");
+  if (roles.length !== 1 || roles[0] !== "gateway") throw new Error(MISMATCH);
+  const template = gatewayRoleTemplate(org);
+  const expand = (subjects: readonly string[]): Set<string> => new Set(subjects.map((subject) =>
+    subject.replaceAll("{{subject()}}", auth.subject)));
+  return {
+    pubAllow: expand(template.pub.allow), pubDeny: expand(template.pub.deny),
+    subAllow: expand(template.sub.allow), subDeny: new Set(),
+  };
 };
 
 /** Absent list = empty; present list must be strings. Unknown keys refuse. */
@@ -245,11 +272,15 @@ const verifyIdentity = async (nc: NatsConnection, timeoutMs: number, auth: Retur
   const data = isPlainObject(value) && isPlainObject(value.data) ? value.data : undefined;
   const permissions = data?.permissions;
   if (!data || data.user !== auth.subject || !isPlainObject(permissions) ||
-    Object.keys(permissions).some((key) => key !== "publish" && key !== "subscribe")) throw new NatsAuthorizationError(MISMATCH);
+    Object.keys(permissions).some((key) => key !== "publish" && key !== "subscribe" && key !== "allow_responses")) throw new NatsAuthorizationError(MISMATCH);
   const publish = permissionLists(permissions.publish);
   const subscribe = permissionLists(permissions.subscribe);
+  const allowResponses = permissions.allow_responses;
+  const responsesMatch = expected.allowResponses
+    ? isPlainObject(allowResponses) && Object.keys(allowResponses).length === 1 && allowResponses.max === expected.allowResponses.max
+    : allowResponses === undefined || allowResponses === null;
   if (!publish || !subscribe || !sameSet(publish.allow, expected.pubAllow) || !sameSet(publish.deny, expected.pubDeny) ||
-    !sameSet(subscribe.allow, expected.subAllow) || !sameSet(subscribe.deny, expected.subDeny)) throw new NatsAuthorizationError(MISMATCH);
+    !sameSet(subscribe.allow, expected.subAllow) || !sameSet(subscribe.deny, expected.subDeny) || !responsesMatch) throw new NatsAuthorizationError(MISMATCH);
   return value;
 };
 
@@ -336,12 +367,20 @@ const open = async (
 export const openNatsConnection = async (options: NatsConnectionOptions): Promise<NatsConnectionHandle> => {
   options.signal?.throwIfAborted();
   refuseBypass(options);
+  let expected: ExpectedPermissions | undefined;
+  if (options.role === "gateway") {
+    return open(options, (nc, timeoutMs, auth) => verifyIdentity(nc, timeoutMs, auth, expected!), (auth) => {
+      try { expected = expectedGatewayPermissions(options.org, auth); }
+      catch (cause) { throw new NatsAuthorizationError("NATS signed identity / permission policy mismatch", { cause }); }
+    });
+  }
   const role = options.role ?? "agent";
-  if (role !== "agent" && role !== "operator") throw new Error("NATS connection role must be agent or operator");
   if (typeof options.machine !== "string") throw new Error("NATS machine is required");
   const machine = validateMachine(options.machine);
-  const policy: NatsPermissionPolicy = { custodyStream: options.custodyStream, livenessStream: options.livenessStream, pathBMachines: options.pathBMachines };
-  let expected: ExpectedPermissions | undefined;
+  const policy: NatsPermissionPolicy = {
+    custodyStream: options.custodyStream, livenessStream: options.livenessStream,
+    pathBMachines: options.pathBMachines, ...(options.org === undefined ? {} : { org: options.org }),
+  };
   return open(options, (nc, timeoutMs, auth) => verifyIdentity(nc, timeoutMs, auth, expected!), (auth) => {
     // Fail closed before dialing: missing/invalid policy or a signed identity that cannot match.
     try { expected = expectedPermissions(role, machine, policy, auth); }

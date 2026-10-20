@@ -76,6 +76,8 @@ export interface FabricParticipantRecord {
   capabilities: FabricParticipantCapability[];
   cwd?: string;
   sessionId?: string;
+  /** Services that this Main session accepts over Fabric's NATS session channel. */
+  services?: Array<{ name: string; version: number }>;
   model?: string;
   thinking?: string;
   startedAt: number;

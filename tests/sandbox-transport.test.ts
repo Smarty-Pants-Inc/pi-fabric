@@ -10,7 +10,7 @@ import { AgentManager } from "../src/agents/manager.js";
 import { placementRunIdForParticipant } from "../src/topology/placement-run-id.js";
 import { captureSandboxFinalAnswer, waitForSandboxFinalAnswer } from "../src/agents/completion-inbox.js";
 import { createSandboxFabricMesh } from "../src/transport/sandbox/fabric-mesh.js";
-import { buildSandboxIntent, DEFAULT_SANDBOX_PLACEMENT_URL, SandboxPlacementHttp, SandboxReadyTimeoutError, SandboxSpawnTimeoutError, SandboxTransport, SandboxUnsupportedError, type SandboxBinding, type SandboxMesh, type SandboxPlacement, type SandboxSpawnIntent, type SandboxSpawnResult, type SandboxTaskResult, type SandboxTerminalRecord, type SandboxTransportConfig } from "../src/transport/sandbox/index.js";
+import { buildSandboxIntent, DEFAULT_SANDBOX_PLACEMENT_URL, SandboxPlacementHttp, SandboxPodPendingTimeoutError, SandboxReadyTimeoutError, SandboxSpawnTimeoutError, SandboxTransport, SandboxUnsupportedError, type SandboxBinding, type SandboxMesh, type SandboxPlacement, type SandboxSpawnIntent, type SandboxSpawnResult, type SandboxTaskResult, type SandboxTerminalRecord, type SandboxTransportConfig } from "../src/transport/sandbox/index.js";
 
 const BASE_NOW = Date.parse("2026-02-01T00:00:00Z");
 const RUN_ID = "sandbox-run-1";
@@ -81,6 +81,7 @@ const bindingFor = (intent: SandboxSpawnIntent): SandboxBinding => {
 interface FakePlacementOptions {
   post: (intent: SandboxSpawnIntent, index: number) => SandboxSpawnResult;
   watch: (runId: string, index: number) => SandboxSpawnResult[];
+  binding?: (intent: SandboxSpawnIntent, index: number) => SandboxBinding;
   rejectProfile?: boolean;
   profileErrorDetail?: string;
   allowAnyRunId?: boolean;
@@ -91,12 +92,12 @@ const intentKeys = ["v", "runId", "kind", "org", "parentSession", "role", "profi
 const spawnResultKeys = ["runId", "status", "code", "detail", "retryAfterSeconds", "host", "claimRef", "claimUID", "podUID"];
 const bindingKeys = ["runId", "status", "claimRef", "claimUID", "podUID", "podName", "host", "org", "role", "model", "provider", "thinking", "expectedSeconds", "deadline", "executionDeadline", "admittedAt"];
 
-const fakePlacementServer = async (options: FakePlacementOptions): Promise<{ placement: SandboxPlacement; intents: SandboxSpawnIntent[]; requestBodies: Record<string, unknown>[]; watches: string[]; posts: number; gets: number; base: string }> => {
+const fakePlacementServer = async (options: FakePlacementOptions): Promise<{ placement: SandboxPlacement; intents: SandboxSpawnIntent[]; requestBodies: Record<string, unknown>[]; watches: string[]; posts: number; gets: number; bindingReads: number; base: string }> => {
   const intents: SandboxSpawnIntent[] = [];
   const requestBodies: Record<string, unknown>[] = [];
   const watches: string[] = [];
   const current = new Map<string, SandboxSpawnResult>();
-  let posts = 0, gets = 0;
+  let posts = 0, gets = 0, bindingReads = 0;
   const respond = (res: import("node:http").ServerResponse, status: number, body: unknown, contentType = "application/json") => {
     res.writeHead(status, { "content-type": contentType });
     res.end(typeof body === "string" ? body : JSON.stringify(body));
@@ -151,7 +152,8 @@ const fakePlacementServer = async (options: FakePlacementOptions): Promise<{ pla
     if (req.method === "GET" && bindingMatch) {
       const intent = [...intents].reverse().find(value => value.runId === decodeURIComponent(bindingMatch[1]!));
       if (!intent) { respond(res, 404, { code: "NOT_FOUND", detail: "unknown run" }); return; }
-      const binding = bindingFor(intent);
+      const binding = options.binding?.(intent, bindingReads) ?? bindingFor(intent);
+      bindingReads += 1;
       if (Object.keys(binding).length !== bindingKeys.length) throw new Error("fake binding is not the exact sixteen-field projection");
       respond(res, 200, binding);
       return;
@@ -165,7 +167,7 @@ const fakePlacementServer = async (options: FakePlacementOptions): Promise<{ pla
   });
   const address = server.address() as AddressInfo;
   const base = `http://127.0.0.1:${address.port}`;
-  return { placement: new SandboxPlacementHttp(base), intents, requestBodies, watches, get posts() { return posts; }, get gets() { return gets; }, base };
+  return { placement: new SandboxPlacementHttp(base), intents, requestBodies, watches, get posts() { return posts; }, get gets() { return gets; }, get bindingReads() { return bindingReads; }, base };
 };
 
 class FakeTerminal {
@@ -245,6 +247,100 @@ describe("sandbox agent transport", () => {
     expect(handle.sessionId).toBe(CHILD);
     expect(JSON.parse(fs.readFileSync(path.join(directory, "status.json"), "utf8"))).toMatchObject({ status: "completed", text: "exact sandbox-result", exitCode: 0, transport: "sandbox" });
     expect(terminal.records.get(RUN_ID)).toMatchObject({ placementRunId: RUN_ID, state: "finished", exitCode: 0, at: "2026-02-01T00:00:00Z" });
+  });
+
+  it("waits for the admitted Pod UID to appear before spawning and delivering", async () => {
+    const directory = scratch();
+    const api = await fakePlacementServer({
+      post: intent => result(intent.runId, "admitted", { podUID: null }),
+      watch: () => [],
+      binding: (intent, index) => index === 0 ? { ...bindingFor(intent), podUID: null, podName: null } : bindingFor(intent),
+    });
+    let now = BASE_NOW;
+    const mesh = meshFor(taskResult("completed", "spawned after Pod binding"));
+    const terminal = new FakeTerminal();
+    const transport = new SandboxTransport(config(), {
+      placement: api.placement, mesh, terminal, meshTransport: "nats", org: "smarty-dev", now: () => now,
+      sleep: async milliseconds => { now += milliseconds; },
+      resolveRepository: () => ({ repository: "https://github.com/Smarty-Pants-Inc/smarty-dev", cwd: "." }),
+    });
+
+    const handle = await transport.launch(launchRequest(directory));
+    await handle.closed;
+    expect(api.bindingReads).toBe(2);
+    expect(now).toBe(BASE_NOW + 250);
+    expect(mesh.delivered).toHaveLength(1);
+    expect(JSON.parse(fs.readFileSync(path.join(directory, "status.json"), "utf8")))
+      .toMatchObject({ status: "completed", text: "spawned after Pod binding" });
+    expect(terminal.records.get(RUN_ID)?.state).toBe("finished");
+  });
+
+  it("allows a replacement Pod UID for the same admitted run and Claim", async () => {
+    const directory = scratch();
+    const api = await fakePlacementServer({
+      post: intent => result(intent.runId, "admitted", { podUID: "pod-uid-before-replacement" }),
+      watch: () => [],
+      binding: intent => ({ ...bindingFor(intent), podUID: "pod-uid-after-replacement" }),
+    });
+    const mesh = meshFor(taskResult("completed", "replacement Pod result"));
+    const terminal = new FakeTerminal();
+    const transport = new SandboxTransport(config(), {
+      placement: api.placement, mesh, terminal, meshTransport: "nats", org: "smarty-dev", now: () => BASE_NOW,
+      resolveRepository: () => ({ repository: "https://github.com/Smarty-Pants-Inc/smarty-dev", cwd: "." }),
+    });
+
+    const handle = await transport.launch(launchRequest(directory));
+    await handle.closed;
+    expect(api.bindingReads).toBe(1);
+    expect(mesh.delivered).toHaveLength(1);
+    expect(JSON.parse(fs.readFileSync(path.join(directory, "status.json"), "utf8")))
+      .toMatchObject({ status: "completed", text: "replacement Pod result" });
+  });
+
+  it("times out an unlinked Claim with the sandbox Pod-pending error code", async () => {
+    const directory = scratch();
+    const api = await fakePlacementServer({
+      post: intent => result(intent.runId, "admitted"),
+      watch: () => [],
+      binding: intent => ({ ...bindingFor(intent), claimRef: null, claimUID: null, podUID: null, podName: null }),
+    });
+    let now = BASE_NOW;
+    const mesh = meshFor();
+    const terminal = new FakeTerminal();
+    const transport = new SandboxTransport(config(true, 500), {
+      placement: api.placement, mesh, terminal, meshTransport: "nats", org: "smarty-dev", now: () => now,
+      sleep: async milliseconds => { now += milliseconds; },
+      resolveRepository: () => ({ repository: "https://github.com/Smarty-Pants-Inc/smarty-dev", cwd: "." }),
+    });
+
+    await expect(transport.launch(launchRequest(directory))).rejects.toMatchObject({
+      name: "SandboxPodPendingTimeoutError", code: "FABRIC_SANDBOX_POD_PENDING_TIMEOUT", field: "claimRef",
+    });
+    expect(api.bindingReads).toBe(2);
+    expect(mesh.delivered).toHaveLength(0);
+    expect(terminal.records.get(RUN_ID)).toMatchObject({ state: "never-started", reason: "sandbox Pod or Claim binding remained pending" });
+  });
+
+  it("fails a hard binding mismatch and names the mismatched field", async () => {
+    const directory = scratch();
+    const api = await fakePlacementServer({
+      post: intent => result(intent.runId, "admitted"),
+      watch: () => [],
+      binding: intent => ({ ...bindingFor(intent), role: "wrong-role" }),
+    });
+    const mesh = meshFor();
+    const terminal = new FakeTerminal();
+    const transport = new SandboxTransport(config(), {
+      placement: api.placement, mesh, terminal, meshTransport: "nats", org: "smarty-dev", now: () => BASE_NOW,
+      resolveRepository: () => ({ repository: "https://github.com/Smarty-Pants-Inc/smarty-dev", cwd: "." }),
+    });
+
+    await expect(transport.launch(launchRequest(directory))).rejects.toMatchObject({
+      name: "SandboxProtocolError", code: "sandbox.protocol.invalid", message: expect.stringContaining("binding field role"),
+    });
+    expect(api.bindingReads).toBe(1);
+    expect(mesh.delivered).toHaveLength(0);
+    expect(terminal.records.get(RUN_ID)?.state).toBe("never-started");
   });
 
   it("keeps the captured final answer when the terminal KV write fails", async () => {

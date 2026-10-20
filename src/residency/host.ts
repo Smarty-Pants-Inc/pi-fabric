@@ -689,6 +689,18 @@ export class ResidentHost {
       fabricSessionId: config.sessionId,
       meshRoot: config.meshRoot,
       projectRoot: config.projectRoot,
+      placementTerminalWriter: async (record) => {
+        if (transport) {
+          if (!transport.writePlacementTerminal) {
+            const { PlacementTerminalWriteError } = await import("../placement/terminal.js");
+            throw new PlacementTerminalWriteError();
+          }
+          await transport.writePlacementTerminal(record);
+          return;
+        }
+        const { writePlacementTerminalFile } = await import("../placement/terminal.js");
+        writePlacementTerminalFile(config.meshRoot, this.hostId, record);
+      },
       completionRecipient: () => ({ rootId: config.rootId, sessionId: config.sessionId, cwd: config.cwd,
         projectRoot: config.projectRoot, name: currentConfig().mainName ?? config.mainName ?? "main", role: config.role,
         startedAt: config.mainStartedAt ?? this.participants.lastKnown?.(config.rootId)?.participant.startedAt ?? 0 }),

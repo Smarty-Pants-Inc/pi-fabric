@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { openAndSend, type NatsSendOptions, type NatsSendReply } from "./send-cli.js";
@@ -156,7 +156,7 @@ function appendRecord(file: string, record: DispatchRecord): void {
 function answerFields(reply: NatsSendReply | null | undefined, runId: string): Pick<DispatchRecord, "answer_ok" | "answer_text_sha256"> {
   if (!reply) return { answer_ok: false, answer_text_sha256: null };
   return {
-    answer_ok: reply.text.startsWith(`FABRIC-RESULT ${runId}`),
+    answer_ok: reply.text.startsWith(`FABRIC-RESULT ${runId}\n`),
     answer_text_sha256: createHash("sha256").update(reply.text, "utf8").digest("hex"),
   };
 }
@@ -195,7 +195,8 @@ export async function runNatsDispatchCli(argv: string[]): Promise<number> {
       servers: options.servers,
       machine: options.machine,
       name: `dispatch-${options.runId}`,
-      idempotencyKey: randomUUID(),
+      // FabricControlPlane additionally scopes this key to sender, owner, target, and operation.
+      idempotencyKey: `pi-fabric:nats:dispatch:v1:${options.runId}`,
       timeoutMs: options.findTimeoutSeconds * 1_000 + 30_000,
       awaitReplySeconds: options.awaitReplySeconds,
       org: options.org,

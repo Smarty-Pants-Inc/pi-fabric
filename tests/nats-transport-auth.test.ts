@@ -2,7 +2,7 @@ import * as realFs from "node:fs";
 import path from "node:path";
 import { jetstream, jetstreamManager } from "@nats-io/jetstream";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { openNatsConnection } from "../src/transport/nats/connection.js";
+import { NatsAuthorizationError, openNatsConnection } from "../src/transport/nats/connection.js";
 import { runTransportAdmin } from "../src/transport/nats/admin.js";
 import { openNatsTransport } from "../src/transport/nats/inbox.js";
 import { openNatsKvForMachine } from "../src/transport/nats/kv.js";
@@ -76,7 +76,7 @@ describe.skipIf(!binary)("authenticated Path B transport", () => {
     }
   }, 30_000);
 
-  it("verifies USER.INFO against the signed user and exact own-source grant", async () => {
+  it("verifies USER.INFO against the signed user and required grants", async () => {
     const connection = await openNatsConnection(harness.runtimeOptions(harness.users.machineA));
     expect(connection.userInfo).toBeDefined();
     await connection.close();
@@ -123,32 +123,51 @@ describe.skipIf(!binary)("authenticated Path B transport", () => {
     });
   });
 
-  it("fails closed when any expected policy field is missing", async () => {
+  it("fails closed when expected policy fields are missing, while accepting extra machine grants", async () => {
     for (const field of ["custodyStream", "livenessStream", "pathBMachines"] as const) {
       const options: Record<string, unknown> = { ...harness.runtimeOptions(harness.users.machineA) };
       delete options[field];
       await expect(openNatsConnection(options as unknown as ConnectionOptions)).rejects.toThrow();
     }
-    await expect(openNatsConnection({ ...harness.runtimeOptions(harness.users.machineA), pathBMachines: [MACHINE_A] })).rejects.toThrow();
+    const narrowedInventory = await openNatsConnection({ ...harness.runtimeOptions(harness.users.machineA), pathBMachines: [MACHINE_A] });
+    await narrowedInventory.close();
     await expect(openNatsConnection({ ...harness.runtimeOptions(harness.users.machineA), custodyStream: "OTHER_CUSTODY" })).rejects.toThrow();
   });
 
-  it.each([">", "fabric.>", "fabric.in.*.*.*.*.machine-b", "$JS.API.STREAM.NAMES", "fabric.in.*.*.*.*.machine-a.>"])("refuses a server-expanded extra publish grant: %s", async (grant) => {
+  it.each([">", "fabric.>", "fabric.in.*.*.*.*.machine-b", "$JS.API.STREAM.NAMES", "fabric.in.*.*.*.*.machine-a.>"])("accepts a server-expanded extra publish grant: %s", async (grant) => {
     const fixture = await createPathBHarness({ binary: binary!, tls: {}, additionalAgentPublish: [grant] });
     try {
-      await expect(openNatsConnection(fixture.runtimeOptions(fixture.users.machineA))).rejects.toThrow();
+      const connection = await openNatsConnection(fixture.runtimeOptions(fixture.users.machineA));
+      try {
+        expect(connection.userInfo).toMatchObject({
+          data: { permissions: { publish: { allow: expect.arrayContaining([grant]) } } },
+        });
+      } finally { await connection.close(); }
     } finally {
       await fixture.stop();
     }
   });
 
-  it.each([">", "fabric.>", "_INBOX.>"])("refuses an extra subscribe grant: %s", async (grant) => {
+  it.each([">", "fabric.>", "_INBOX.>"])("accepts an extra subscribe grant: %s", async (grant) => {
     const fixture = await createPathBHarness({ binary: binary!, tls: {}, additionalAgentSubscribe: [grant] });
     try {
-      await expect(openNatsConnection(fixture.runtimeOptions(fixture.users.machineA))).rejects.toThrow();
+      const connection = await openNatsConnection(fixture.runtimeOptions(fixture.users.machineA));
+      try {
+        expect(connection.userInfo).toMatchObject({
+          data: { permissions: { subscribe: { allow: expect.arrayContaining([grant]) } } },
+        });
+      } finally { await connection.close(); }
     } finally {
       await fixture.stop();
     }
+  });
+
+  it("refuses an agent when an expected publish allow is missing", async () => {
+    const expected = "$JS.FC.KV_fabric_presence.>";
+    const fixture = await createPathBHarness({ binary: binary!, tls: {}, removeAgentPublish: [expected] });
+    try {
+      await expect(openNatsConnection(fixture.runtimeOptions(fixture.users.machineA))).rejects.toThrow(NatsAuthorizationError);
+    } finally { await fixture.stop(); }
   });
 
   it.each(["$JS.API.DIRECT.GET.>", "$JS.API.STREAM.DELETE.>", "$JS.API.STREAM.CREATE.FABRIC_CUSTODY"])("refuses a removed publish deny: %s", async (subject) => {

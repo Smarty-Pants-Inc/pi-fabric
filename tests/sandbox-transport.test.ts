@@ -240,7 +240,9 @@ describe("sandbox agent transport", () => {
     expect(mesh.presenceRunIds).toEqual([RUN_ID]);
     expect(mesh.delivered).toHaveLength(1);
     expect(mesh.delivered[0]).toMatchObject({ childSession: CHILD });
+    expect(mesh.delivered[0]!.text).toContain(`FABRIC-SANDBOX-TASK ${RUN_ID}\n`);
     expect(mesh.delivered[0]!.text).toContain("Return the exact marker sandbox-result.");
+    expect(mesh.delivered[0]!.text).toContain("automatically returns your final assistant text");
     expect(mesh.delivered[0]!.text).toContain(`agents.followUp({ id: ${JSON.stringify(PARENT)}`);
     expect(mesh.delivered[0]!.text).toContain(`FABRIC-RESULT ${RUN_ID}\\n`);
     expect(mesh.awaited).toEqual([{ childSession: CHILD, deadline: Date.parse("2026-02-01T00:01:00Z") }]);
@@ -341,6 +343,25 @@ describe("sandbox agent transport", () => {
     expect(api.bindingReads).toBe(1);
     expect(mesh.delivered).toHaveLength(0);
     expect(terminal.records.get(RUN_ID)?.state).toBe("never-started");
+  });
+
+  it("publishes failed terminal status when the child's result return fails", async () => {
+    const directory = scratch();
+    const api = await fakePlacementServer({ post: intent => result(intent.runId, "admitted"), watch: () => [] });
+    const mesh = meshFor();
+    mesh.awaitResult = async () => { throw new Error("child result followUp was rejected"); };
+    const terminal = new FakeTerminal();
+    const transport = new SandboxTransport(config(), {
+      placement: api.placement, mesh, terminal, meshTransport: "nats", org: "smarty-dev", now: () => BASE_NOW,
+      resolveRepository: () => ({ repository: "https://github.com/Smarty-Pants-Inc/smarty-dev", cwd: "." }),
+    });
+
+    const handle = await transport.launch(launchRequest(directory));
+    await handle.closed;
+
+    expect(JSON.parse(fs.readFileSync(path.join(directory, "status.json"), "utf8")))
+      .toMatchObject({ status: "failed", error: "Sandbox result could not be retrieved" });
+    expect(terminal.records.get(RUN_ID)).toMatchObject({ state: "failed", reason: "sandbox result path failed" });
   });
 
   it("keeps the captured final answer when the terminal KV write fails", async () => {

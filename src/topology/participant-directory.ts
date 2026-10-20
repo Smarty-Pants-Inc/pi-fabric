@@ -6,6 +6,7 @@ import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { MeshBackgroundQueue, MeshBackgroundRetry, isMeshWriteDeferred } from "../core/atomic-write.js";
 import { participantProject, ParticipantRoleGrant, repositoryOf } from "./project-identity.js";
+import { isPlacementRunId, placementRunIdForParticipant } from "./placement-run-id.js";
 import { mainPublicationFenced, MainPublicationFencedError } from "./main-publication-fence.js";
 import type { FabricMainAgentInfo } from "../main-agent.js";
 import { DirectoryNotReadyError, TransportUnavailableError, type FabricTransport } from "../transport/types.js";
@@ -323,6 +324,7 @@ const transports = new Set([
   "hosted",
   "auto",
   "process",
+  "sandbox",
   "tmux",
   "screen",
   "localterm",
@@ -397,7 +399,8 @@ const participantFromEntry = (entry: MeshStateEntry): FabricParticipantRecord | 
     (value.bridgeVia !== undefined && (value.remoteHost === undefined || value.bridgeVia === value.remoteHost)) ||
     // Optional fields that consumers read as strings (peer cards, labels, leader selection):
     // a malformed one drops this record alone, never the listing (smarty-dev#2045).
-    !optionalStrings(value, ["sessionId", "herdrPane", "cwd", "label", "role", "project", "projectRoot", "repository", "model", "thinking", "parentId", "actorOwnershipToken", "finalAnswerReceiptId"]) ||
+    !optionalStrings(value, ["sessionId", "herdrPane", "cwd", "label", "role", "project", "projectRoot", "repository", "model", "thinking", "parentId", "actorOwnershipToken", "finalAnswerReceiptId", "placementRunId"]) ||
+    value.placementRunId !== undefined && !isPlacementRunId(value.placementRunId) ||
     // v1 of the bridge mirrors root presence only; remote agents and actors come in v2.
     (value.remoteHost !== undefined && kind !== "root") ||
     typeof value.id !== "string" ||
@@ -2673,8 +2676,12 @@ export class ParticipantDirectory implements FabricParticipantSource {
       text: _text,
       error: _error,
       ownerIncarnation: _incarnation,
+      placementRunId: _placementRunId,
       ...operational
     } = candidate as FabricParticipantRecord & { task?: unknown; text?: unknown; error?: unknown };
+    const placementRunId = candidate.kind === "root" && candidate.id === this.options.rootId && candidate.rootId === this.options.rootId
+      ? placementRunIdForParticipant(candidate.kind)
+      : undefined;
     return {
       ...operational,
       format: 1,
@@ -2686,6 +2693,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
           ? { status: "reloading", reloadUntil: this.#reloadUntil }
           : { capabilities: [], status: "stopping" }
         : {}),
+      ...(placementRunId ? { placementRunId } : {}),
       controlProtocol: "v1",
       livenessLeaseFiles: 1,
     };

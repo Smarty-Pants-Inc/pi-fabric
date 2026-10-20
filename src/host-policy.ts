@@ -42,6 +42,10 @@ const validatePolicy = (document: Record<string, unknown>): void => {
     }
   }
   const agents = object(document.agents, "agents");
+  const sandbox = object(agents.sandbox, "agents.sandbox");
+  if (sandbox.enabled !== undefined && typeof sandbox.enabled !== "boolean") throw new Error("agents.sandbox.enabled must be a boolean");
+  if (sandbox.template !== undefined && (typeof sandbox.template !== "string" || !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/u.test(sandbox.template))) throw new Error("agents.sandbox.template must be a DNS label");
+  if (sandbox.readyTimeoutMs !== undefined && (!Number.isSafeInteger(sandbox.readyTimeoutMs) || (sandbox.readyTimeoutMs as number) < 1_000 || (sandbox.readyTimeoutMs as number) > 90_000)) throw new Error("agents.sandbox.readyTimeoutMs must be between 1000 and 90000");
   if (agents.processSlice !== undefined && (typeof agents.processSlice !== "string"
     || !/^[a-zA-Z0-9_.-]+\.slice$/.test(agents.processSlice))) throw new Error("agents.processSlice must be a slice name");
   // smarty-dev#8257: match config and the launcher; an unusably small cap fails

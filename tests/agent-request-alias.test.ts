@@ -27,6 +27,9 @@ describe("parent run inheritance (#2490)", () => {
     expect(request.model).toBeUndefined();
     expect(request.thinking).toBeUndefined();
   });
+  it("accepts explicit sandbox transport", () => {
+    expect(normalizeAgentRunRequest({ task: "review", transport: "sandbox" }, parent).transport).toBe("sandbox");
+  });
 });
 
 describe("configured task defaults (#2890, #6062)", () => {

@@ -37,6 +37,8 @@ export interface FabricParticipantRecord {
    * participant via the mesh peer sequence. Never reused after a peer leaves.
    */
   label?: string;
+  /** Pod-injected run id used only to bind a sandbox placement to this root's NATS presence. */
+  placementRunId?: string;
   /** The root's fleet role, for example "project-agent" (smarty-dev#784). */
   role?: string;
   /** The Herdr pane a root Main runs in (smarty-dev#6758); display only, never authority. */

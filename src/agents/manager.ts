@@ -83,6 +83,7 @@ import { ProcessTransport } from "./transports/process-transport.js";
 import { scriptSpawnArgs } from "./transports/process-utils.js";
 import { ScreenTransport } from "./transports/screen-transport.js";
 import { TmuxTransport } from "./transports/tmux-transport.js";
+import type { SandboxTransportDependencies } from "../transport/sandbox/types.js";
 import { resolveAgentSpawner } from "./spawner.js";
 import { senderAgent, senderHeaderValue } from "../guards/sender-headers.js";
 import type {
@@ -1349,6 +1350,7 @@ export class AgentManager {
   readonly #hostId: string | undefined;
   readonly #identityId: string | undefined;
   readonly #taskReturnAddressArguments: string[];
+  readonly #spawnerSessionId: string | undefined;
   readonly #transports: Map<FabricAgentTransport, AgentTransportAdapter>;
   readonly #onBackgroundComplete: ((result: AgentRunResult, admittedRecipient?: CompletionRecipient) => void) | undefined;
   readonly #onResultConsumed: ((id: string) => void) | undefined;
@@ -1481,6 +1483,8 @@ export class AgentManager {
       meshTransport?: Pick<FabricMeshConfig, "transport" | "hostTransport" | "nats">;
       /** Required for NATS spawn. The owning runtime must bind its inbox first. */
       taskPresence?: AgentTaskPresence;
+      /** Island placement, presence, child-return, and terminal-KV seams. */
+      sandbox?: SandboxTransportDependencies;
       projectRoot?: string;
       /** Root-owned return address; never inferred from a child request or inherited by nested agents. */
       completionRecipient?: CompletionRecipient | (() => CompletionRecipient);
@@ -1583,9 +1587,10 @@ export class AgentManager {
     // Nested work returns to its immediate caller. This launch-only binding does
     // not change the owning Main that an actor discovers or steers during its turn.
     this.#spawner = resolveAgentSpawner(this.#identityId, this.#mainAgentId);
+    this.#spawnerSessionId = options.spawnerSessionId ?? process.env.PI_SESSION_ID;
     this.#taskReturnAddressArguments = taskReturnAddressArguments(
       this.#spawner?.id,
-      options.spawnerSessionId ?? process.env.PI_SESSION_ID ?? this.#fabricSessionId,
+      this.#spawnerSessionId ?? this.#fabricSessionId,
       this.#mainAgentId,
     );
     this.#spawnerName = options.spawnerName ?? (() => senderAgent());
@@ -1599,6 +1604,17 @@ export class AgentManager {
       !inheritedBudget && this.#currentDepth === 0 && config.budgetUsd > 0;
     const adapters: AgentTransportAdapter[] = [
       new ProcessTransport(config.processSlice, config.placement, options.placementConfigPath, config.processMemoryMaxBytes),
+      {
+        kind: "sandbox",
+        available: async () => true,
+        launch: async (launch) => {
+          const { SandboxTransport } = await import("../transport/sandbox/transport.js");
+          return new SandboxTransport(config.sandbox, {
+            ...options.sandbox,
+            ...(this.#meshTransport?.transport ? { meshTransport: this.#meshTransport.transport } : {}),
+          }).launch(launch);
+        },
+      },
       new TmuxTransport(),
       new ScreenTransport(),
       new LocaltermTransport(),
@@ -2878,7 +2894,7 @@ export class AgentManager {
             ...(this.#spawner.runId ? ["--spawner-run", this.#spawner.runId] : [])] : []),
           ...((name?: string) => name ? ["--spawner-name", name] : [])(senderHeaderValue(this.#spawnerName())),
           ...(this.#fabricSessionId ? ["--fabric-session-id", this.#fabricSessionId] : []),
-          ...(adapter.kind === "process" && !request.actorId
+          ...((adapter.kind === "process" || adapter.kind === "sandbox") && !request.actorId
             ? callerReturnAddress ? ["--task-return-address", JSON.stringify(callerReturnAddress)] : this.#taskReturnAddressArguments
             : []),
           "--extensions",
@@ -2989,6 +3005,8 @@ export class AgentManager {
           ...(this.#childMeshEnvironment ? { childEnvironment: this.#childMeshEnvironment } : {}),
           ...(request.needs ? { needs: [...request.needs] } : {}),
           ...(request.requires ? { requires: [...request.requires] } : {}),
+          ...(this.#spawnerSessionId ? { parentSession: this.#spawnerSessionId } : {}),
+          ...(request.complexity ? { complexity: request.complexity } : {}),
           ...(applyTaskWriteDefault ? { onWritePolicyDisposition } : {}),
           placementLocalReason: this.#meshTransport?.transport === "nats"
             ? "NATS task custody and host credentials require the owning host's native worker"
@@ -7400,7 +7418,7 @@ export class AgentManager {
     // detached group. Until those adapters retain birth-safe outer custody,
     // fail closed rather than reintroducing a forced-session cleanup bypass.
     // Follow-up: smarty-dev#2566 (execution custody for session transports).
-    if (requested !== "auto" && requested !== "process") {
+    if (requested !== "auto" && requested !== "process" && requested !== "sandbox") {
       throw new Error(`Fabric agent transport ${requested} is disabled: detached execution custody is not confirmed; use process`);
     }
     if (requested !== "auto") {

@@ -32,8 +32,8 @@ const waitFor = async (predicate: () => boolean): Promise<void> => {
     await new Promise(resolve => setTimeout(resolve, 10));
   }
 };
-const queueSnapshot = (actorId: string): { items: Array<{ payload: MeshEvent }>; natsEventReceipts?: string[] } => {
-  const directory = path.join(actorRoot, actorId);
+const queueSnapshot = (actorId: string, rootPath = actorRoot): { items: Array<{ payload: MeshEvent }>; natsEventReceipts?: string[] } => {
+  const directory = path.join(rootPath, actorId);
   const file = fs.readdirSync(directory).find(name => /^queue-.+\.json$/.test(name));
   if (!file) throw new Error("durable actor queue snapshot was not written");
   return JSON.parse(fs.readFileSync(path.join(directory, file), "utf8")) as { items: Array<{ payload: MeshEvent }>; natsEventReceipts?: string[] };
@@ -47,6 +47,50 @@ afterEach(async () => {
 });
 
 describe("NATS actor event queue admission", () => {
+  it("returns retry during an ownership blip, then accepts and receipts the redelivery once", async () => {
+    const testRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-nats-event-ownership-"));
+    const mesh = new MeshStore(path.join(testRoot, "mesh"), 64 * 1024, 100);
+    const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(testRoot, "runs"),
+    });
+    let ownership = true;
+    const actors = new ActorManager("nats-events-ownership-test", identity, mesh, {
+      ...DEFAULT_FABRIC_CONFIG.mesh, transport: "nats" as const,
+      nats: { ...DEFAULT_FABRIC_CONFIG.mesh.nats, events: true, org: "test-org", servers: ["tls://localhost:4222"],
+        credentials: "/unused/user.creds", machine: "ryzen2", custodyStream: "FABRIC_CUSTODY",
+        livenessStream: "FABRIC_LIVENESS", pathBMachines: ["ryzen2"] },
+    }, agents, () => {}, { actorRoot: path.join(testRoot, "actors"), persistent: true,
+      canManageActor: () => ownership });
+    close.push(async () => { await actors.close(); await agents.close(); fs.rmSync(testRoot, { recursive: true, force: true }); });
+    const actor = await actors.create({ name: "owner-fenced", instructions: "Wait for events.", topics: ["mail.inbound"],
+      coalesce: false, residency: "durable", extensions: false });
+    await waitFor(() => typeof mocks.onMessage === "function");
+    const onMessage = mocks.onMessage as (event: MeshEvent, messageId: string, ack: () => Promise<void>) => Promise<boolean>;
+    const event: MeshEvent = { id: "owner-blip-event", sequence: 12, topic: "mail.inbound", kind: "message",
+      from: { id: "mail-service", name: "mail-service", kind: "agent" }, data: { message: "retry me" }, createdAt: Date.now() };
+    let acknowledgements = 0;
+    const ack = async () => { acknowledgements++; };
+
+    ownership = false;
+    await expect(onMessage(event, "nats-msg-owner-blip", ack)).resolves.toBe(false);
+    expect(acknowledgements).toBe(0);
+    let beforeRetry: ReturnType<typeof queueSnapshot> | undefined;
+    try { beforeRetry = queueSnapshot(actor.id, path.join(testRoot, "actors")); } catch { /* No queue file means the message was not persisted. */ }
+    expect(beforeRetry?.natsEventReceipts ?? []).not.toContain("nats-msg-owner-blip");
+
+    ownership = true;
+    await expect(onMessage(event, "nats-msg-owner-blip", ack)).resolves.toBe(true);
+    expect(acknowledgements).toBe(1);
+    const accepted = queueSnapshot(actor.id, path.join(testRoot, "actors"));
+    expect(accepted.natsEventReceipts).toContain("nats-msg-owner-blip");
+    expect(accepted.items).toHaveLength(1);
+    expect(accepted.items[0]?.payload.data).toMatchObject({ message: "retry me", deliveryId: "nats-msg-owner-blip" });
+
+    await expect(onMessage(event, "nats-msg-owner-blip", ack)).resolves.toBe(true);
+    expect(acknowledgements).toBe(2); // Duplicate redelivery ACKs but never re-enqueues.
+    expect(queueSnapshot(actor.id, path.join(testRoot, "actors")).items).toHaveLength(1);
+  });
+
   it("persists the Nats-Msg-Id as data.deliveryId with the queue receipt before ACK", async () => {
     const mesh = new MeshStore(meshRoot, 64 * 1024, 100);
     const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {

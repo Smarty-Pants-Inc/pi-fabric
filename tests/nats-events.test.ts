@@ -8,7 +8,7 @@ import type { MeshEvent } from "../src/mesh/event-log.js";
 import { ensureNatsEventsStream, ensureTransportStream, natsEventsStreamName, natsGithubStreamName, transportStreamConfig } from "../src/transport/nats/provision.js";
 import { hashToken } from "../src/transport/nats/subjects.js";
 import { createPathBHarness, resolveNatsBinary, type PathBHarness } from "./helpers/nats-cluster.js";
-import { DeliverPolicy, DiscardPolicy, RetentionPolicy, StorageType, type StreamConfig, type StreamInfo } from "@nats-io/jetstream";
+import { AckPolicy, DeliverPolicy, DiscardPolicy, ReplayPolicy, RetentionPolicy, StorageType, type StreamConfig, type StreamInfo } from "@nats-io/jetstream";
 
 const binary = resolveNatsBinary() ?? "";
 if (!binary && process.env.NATS_AUTH_REQUIRED === "1") throw new Error("NATS_AUTH_REQUIRED=1 but no nats-server executable was found");
@@ -165,6 +165,8 @@ describe.skipIf(!binary)("NATS Mesh events on a real JetStream server", () => {
       expect(deliveredB).toEqual([{ id: "stable-mail-event:stable-mail-event", seq: 1 }]);
       const eventConsumerInfo = await connection.manager.consumers.info(publisher.stream, `ev_${hashToken(`${org}:actor-a`)}`);
       expect(eventConsumerInfo.config.filter_subjects).toEqual([`fabric.ev.${org}.mail.inbound`, `fabric.ev.${org}.wake.${org}:actor-a`].sort());
+      expect(eventConsumerInfo.config.max_deliver).toBe(5);
+      expect(eventConsumerInfo.config.backoff).toEqual([1, 5, 15, 30, 30].map(seconds => seconds * 1_000_000_000));
       await publisher.publish(event("wake-for-actor-a", `wake.${org}:actor-a`));
       await waitFor(() => deliveredA.length === 2);
       expect(deliveredA[1]).toEqual({ id: "wake-for-actor-a:wake-for-actor-a", seq: 2 });
@@ -226,6 +228,8 @@ describe.skipIf(!binary)("NATS Mesh events on a real JetStream server", () => {
       const ghInfo = await connection.manager.consumers.info(githubStream, `gh_${hashToken(actorId)}`);
       expect(evInfo.config.filter_subjects).toEqual([`fabric.ev.${org}.mail.inbound`, `fabric.ev.${org}.wake.${actorId}`].sort());
       expect(ghInfo.config.filter_subjects).toEqual([`github.${org}.repo.pulls.shard1of1`]);
+      expect(evInfo.config.backoff).toEqual([1, 5, 15, 30, 30].map(seconds => seconds * 1_000_000_000));
+      expect(ghInfo.config.backoff).toEqual([1, 5, 15, 30, 30].map(seconds => seconds * 1_000_000_000));
 
       await publisher.publish(event("fabric-copy", "mail.inbound"));
       const subject = `github.${org}.repo.pulls.shard1of1`;
@@ -260,6 +264,116 @@ describe.skipIf(!binary)("NATS Mesh events on a real JetStream server", () => {
       await publisher.publish(event("new-filter", "mail.after"));
       await waitFor(() => seen.length === 2);
       expect(seen).toEqual(["mail.before", "mail.after"]);
+    } finally {
+      await consumer?.close(false);
+      await connection.close();
+    }
+  }, 30_000);
+
+  it("delays a transient NAK, then accepts the same event once ownership returns", async () => {
+    const server = await fixture();
+    const org = `events-${randomUUID().slice(0, 8)}`;
+    const { connection, publisher } = await open(server, org);
+    const actorId = `${org}:ownership-retry`;
+    let owned = false;
+    const attempts: string[] = [], accepted: string[] = [];
+    let consumer: { close(remove?: boolean): Promise<void> } | undefined;
+    try {
+      consumer = await startNatsActorEventsConsumer(connection, {
+        org, actorId, topics: ["mail.retry"],
+        onMessage: async (received, _messageId, ack) => {
+          attempts.push(received.id);
+          if (!owned) return false;
+          accepted.push(received.id);
+          await ack();
+          return true;
+        },
+      });
+      await publisher.publish(event("ownership-blip", "mail.retry"));
+      await waitFor(() => attempts.length === 1);
+      owned = true;
+      await waitFor(() => accepted.length === 1, 7_000);
+      expect(attempts).toEqual(["ownership-blip", "ownership-blip"]);
+      expect(accepted).toEqual(["ownership-blip"]);
+    } finally {
+      await consumer?.close(false);
+      await connection.close();
+    }
+  }, 15_000);
+
+  it("immediately exhausts malformed poison events at max_deliver without invoking the handler", async () => {
+    const server = await fixture();
+    const org = `events-${randomUUID().slice(0, 8)}`;
+    const { connection } = await open(server, org);
+    const actorId = `${org}:poison-event`;
+    let handlerCalls = 0;
+    let consumer: { close(remove?: boolean): Promise<void> } | undefined;
+    try {
+      consumer = await startNatsActorEventsConsumer(connection, {
+        org, actorId, topics: ["mail.poison"],
+        onMessage: async (_received, _messageId, ack) => { handlerCalls++; await ack(); },
+      });
+      const stream = natsEventsStreamName(org);
+      const durable = `ev_${hashToken(actorId)}`;
+      const initial = await connection.manager.consumers.info(stream, durable);
+      expect(initial.config.max_deliver).toBe(5);
+      expect(initial.config.backoff).toEqual([1, 5, 15, 30, 30].map(seconds => seconds * 1_000_000_000));
+      await connection.js.publish(`fabric.ev.${org}.mail.poison`, Buffer.from("{"), { msgID: "malformed-poison" });
+      const deadline = Date.now() + 7_000;
+      let exhausted = initial;
+      while ((exhausted.delivered?.consumer_seq ?? 0) < 5) {
+        if (Date.now() >= deadline) throw new Error("malformed poison event did not exhaust max_deliver=5");
+        await new Promise(resolve => setTimeout(resolve, 25));
+        exhausted = await connection.manager.consumers.info(stream, durable);
+      }
+      expect(exhausted.delivered?.consumer_seq).toBe(5);
+      expect(exhausted.num_ack_pending).toBe(0);
+      expect(exhausted.num_pending).toBe(0);
+      expect(handlerCalls).toBe(0);
+    } finally {
+      await consumer?.close(false);
+      await connection.close();
+    }
+  }, 15_000);
+
+  it("updates existing empty-backoff actor durables without resetting their cursors", async () => {
+    const server = await fixture();
+    const org = `events-${randomUUID().slice(0, 8)}`;
+    const { connection, publisher } = await open(server, org);
+    const actorId = `${org}:backoff-upgrade`;
+    const eventTopic = `fabric.ev.${org}.mail.upgrade`;
+    const githubTopic = `github.${org}.repo.upgrade`;
+    let consumer: { close(remove?: boolean): Promise<void> } | undefined;
+    const seen: string[] = [];
+    try {
+      const githubStream = natsGithubStreamName(org);
+      await connection.manager.streams.add({ name: githubStream, subjects: [`github.${org}.>`], storage: StorageType.File,
+        retention: RetentionPolicy.Limits, discard: DiscardPolicy.New, max_bytes: 1_048_576, max_age: 0,
+        max_msg_size: 1_048_576, max_msgs: -1, max_msgs_per_subject: -1,
+        duplicate_window: 120_000_000_000, num_replicas: 1, no_ack: false, allow_direct: false } as StreamConfig);
+      const subjects = [eventTopic, `fabric.ev.${org}.wake.${actorId}`].sort();
+      const addLegacyDurable = (stream: string, durable: string, filterSubjects: string[]) => connection.manager.consumers.add(stream, {
+        durable_name: durable, filter_subject: "", filter_subjects: filterSubjects, ack_policy: AckPolicy.Explicit,
+        deliver_policy: DeliverPolicy.All, replay_policy: ReplayPolicy.Instant, ack_wait: 60_000_000_000,
+        max_deliver: 5, max_ack_pending: 128, backoff: [], inactive_threshold: 0,
+      });
+      const oldEv = await addLegacyDurable(natsEventsStreamName(org), `ev_${hashToken(actorId)}`, subjects);
+      const oldGh = await addLegacyDurable(githubStream, `gh_${hashToken(actorId)}`, [githubTopic]);
+      await publisher.publish(event("legacy-ev", "mail.upgrade"));
+      await connection.js.publish(githubTopic, Buffer.from(JSON.stringify(event("legacy-gh", githubTopic))));
+      consumer = await startNatsActorEventsConsumer(connection, {
+        org, actorId, topics: ["mail.upgrade", githubTopic],
+        onMessage: async (received, _messageId, ack) => { seen.push(received.id); await ack(); },
+      });
+      const newEv = await connection.manager.consumers.info(natsEventsStreamName(org), `ev_${hashToken(actorId)}`);
+      const newGh = await connection.manager.consumers.info(githubStream, `gh_${hashToken(actorId)}`);
+      const expectedBackoff = [1, 5, 15, 30, 30].map(seconds => seconds * 1_000_000_000);
+      expect(newEv.config.backoff).toEqual(expectedBackoff);
+      expect(newGh.config.backoff).toEqual(expectedBackoff);
+      expect(newEv.created).toEqual(oldEv.created);
+      expect(newGh.created).toEqual(oldGh.created);
+      await waitFor(() => seen.length === 2);
+      expect(seen.sort()).toEqual(["legacy-ev", "legacy-gh"]);
     } finally {
       await consumer?.close(false);
       await connection.close();

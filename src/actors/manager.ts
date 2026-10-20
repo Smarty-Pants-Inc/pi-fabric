@@ -31,7 +31,7 @@ import type { FabricMainAgentTarget } from "../main-agent.js";
 import type { FabricParticipantRecord, FabricParticipantResidency } from "../topology/types.js";
 import { PARTICIPANT_NAME_PATTERN as ACTOR_NAME_PATTERN } from "../topology/participant-name.js";
 import { AgentLaunchPreparationTimeoutError, AgentManager } from "../agents/manager.js";
-import type { AgentRunRecord, AgentRunRequest, AgentRunResult } from "../agents/types.js";
+import type { AgentRunRecord, AgentRunRequest, AgentRunResult, AgentRunStopCaller, AgentRunStopPath } from "../agents/types.js";
 import { isRecoveredDurableStop } from "../agents/enodev-recovery.js";
 import type { ModelRouteDecision } from "../agents/model-route.js";
 import type { SpawnRouterAdmission } from "../agents/spawn-router.js";
@@ -131,6 +131,8 @@ interface ActorQueueItem {
   settledDeliveryId?: string;
   /** Superseded receipts still owed while absorbed predecessor files remain on disk. */
   settledDeliveryIds?: string[];
+  /** One bounded retry for a stable delivery that ended before inference. */
+  unstartedRedrive?: { replayId: string; firstRunId: string; secondRunId?: string };
   activation: FabricActorActivation;
   /** Supplied fields, interpreted according to bindingMode (including absent fields). */
   binding: FabricActorRunBinding;
@@ -3148,7 +3150,7 @@ export class ActorManager {
     return this.#draining.get(id) ?? this.#actors.get(id);
   }
 
-  #stopRun(actor: ManagedActor): void {
+  #stopRun(actor: ManagedActor, path: AgentRunStopPath = "actors.stop"): void {
     this.#clearSettledWindows(actor.id);
     actor.status = "stopped";
     // agents.stop/remove: an explicit stop is terminal, never restarted at a session start (smarty-dev#9241).
@@ -3158,22 +3160,28 @@ export class ActorManager {
     // Explicit stop wins over an ownership abort: do not park/retry the abandoned activation.
     if (actor.abortController) actor.cancelAbort = actor.abortController;
     delete actor.ownershipAbort;
-    // Mark abandonment before abort, so a dead worker cannot be recovered for this owner.
-    if (actor.inFlightRun) this.agents.abandon(actor.inFlightRun.id);
+    // Persist the actor-side caller before its abort can settle the AgentManager run.
+    if (actor.inFlightRun) {
+      this.agents.recordStopIntent(actor.inFlightRun.id, { by: { kind: this.identity.kind, id: this.identity.id }, path });
+      // Mark abandonment before abort, so a dead worker cannot be recovered for this owner.
+      this.agents.abandon(actor.inFlightRun.id);
+    }
     actor.abortController?.abort();
   }
 
-  async #joinStoppedRun(id: string): Promise<void> {
+  async #joinStoppedRun(id: string, path: AgentRunStopPath = "actors.stop"): Promise<void> {
     const running = this.#runningActor(id);
     if (!running) return;
-    this.#stopRun(running);
+    this.#stopRun(running, path);
     // A caller abort detaches a worker that made progress. Public terminal stop
     // must explicitly end that owned worker before joining its activation.
-    if (running.inFlightRun) await this.agents.stop(running.inFlightRun.id);
+    if (running.inFlightRun) await this.agents.stop(running.inFlightRun.id, { caller: {
+      by: { kind: this.identity.kind, id: this.identity.id }, path,
+    } });
     await running.drain?.catch(() => undefined);
   }
 
-  async stop(id: string, beforeCommit?: (id: string) => void, wait = false): Promise<FabricActorInfo> {
+  async stop(id: string, beforeCommit?: (id: string) => void, wait = false, path: AgentRunStopPath = "actors.stop"): Promise<FabricActorInfo> {
     const actor = this.#requireOwnedActor(id);
     const running = this.#runningActor(actor.id)!;
     const stopped = actor.status === "stopped";
@@ -3182,11 +3190,11 @@ export class ActorManager {
     const resets = this.#pendingResets.get(actor.id);
     this.#pendingResets.delete(actor.id);
     resets?.forEach(waiter => waiter.reject(new ActorSessionResetCancelledError(actor.id)));
-    this.#stopRun(running);
-    if (running !== actor) this.#stopRun(actor);
+    this.#stopRun(running, path);
+    if (running !== actor) this.#stopRun(actor, path);
     await this.#releaseChildCompletionStore(actor);
     if (stopped && running === actor) {
-      if (wait) await this.#joinStoppedRun(actor.id);
+      if (wait) await this.#joinStoppedRun(actor.id, path);
       return this.#publicInfo(actor);
     }
     this.#drop(actor, [...this.#takeQueued(actor), ...(running !== actor ? this.#takeQueued(running) : []), ...this.#takeParked(actor.id)],
@@ -3201,7 +3209,7 @@ export class ActorManager {
         data: this.#publicInfo(actor),
       })
       .catch(() => undefined);
-    if (wait) await this.#joinStoppedRun(actor.id);
+    if (wait) await this.#joinStoppedRun(actor.id, path);
     return this.#publicInfo(actor);
   }
 
@@ -3416,7 +3424,7 @@ export class ActorManager {
       }
       const running = this.#runningActor(id);
       if (!this.#removals.has(id) && running?.drain) {
-        this.#stopRun(running);
+        this.#stopRun(running, "actors.remove");
         this.#removals.set(id, this.#finishBehind(running, running.drain));
       }
       if (!this.#removals.has(id)) return this.#finishCleanup(this.#removalCleanup.get(id)!);
@@ -3436,7 +3444,7 @@ export class ActorManager {
       }, undefined, "slot-revoke");
     }
     if (actor.removal) {
-      await this.stop(actor.id);
+      await this.stop(actor.id, undefined, false, "actors.remove");
       // A missing drain on reloaded metadata is not proof that the old run settled.
       const drain = this.#runningActor(actor.id)?.drain;
       if (!this.#removals.has(actor.id) && drain) {
@@ -3445,7 +3453,7 @@ export class ActorManager {
       if (this.#removals.has(actor.id)) return { removed: true, pending: this.#removalState(actor) };
       return this.#finishRemove(actor);
     }
-    await this.stop(actor.id);
+    await this.stop(actor.id, undefined, false, "actors.remove");
     const running = this.#runningActor(actor.id);
     const drain = running?.drain;
     if (drain) {
@@ -3960,7 +3968,24 @@ export class ActorManager {
       // Cancel current preparations now; a released model resolver must not launch
       // a worker while shutdown waits for a deferred maintenance slice. Cache the
       // close promise first so an abort listener can safely join close reentrantly.
-      for (const actor of this.#draining.values()) actor.abortController?.abort();
+      for (const actor of this.#draining.values()) {
+        if (actor.inFlightRun) {
+          let run: ReturnType<AgentManager["status"]> | undefined;
+          try { run = this.agents.status(actor.inFlightRun.id); } catch { /* The manager may have already retired this handle. */ }
+          // A persistent Main close suspends a run that has made progress. Only the no-work
+          // path is stopped by the ensuing abort; attributing that abort must not fence an
+          // independently continuing run from its existing recovery behavior.
+          const turns = run && "turns" in run ? run.turns : 0;
+          const toolCalls = run && "toolCalls" in run ? run.toolCalls : 0;
+          if (run?.status === "running" && turns === 0 && toolCalls === 0) {
+            this.agents.recordStopIntent(actor.inFlightRun.id, {
+              by: { kind: this.identity.kind, id: this.identity.id },
+              path: actor.residency === "durable" ? "residency-teardown" : "session-reset",
+            });
+          }
+        }
+        actor.abortController?.abort();
+      }
     }
     return this.#closePromise;
   }
@@ -4038,7 +4063,7 @@ export class ActorManager {
       if (owned.length > 0) await this.#saveActorsAtClose();
       return;
     }
-    await Promise.allSettled([...this.#actors.keys()].map((id) => this.stop(id)));
+    await Promise.allSettled([...this.#actors.keys()].map((id) => this.stop(id, undefined, false, "session-reset")));
     await Promise.allSettled(
       [...this.#actors.values()].map((actor) => actor.drain ?? Promise.resolve()),
     );
@@ -4554,6 +4579,20 @@ export class ActorManager {
     return batch?.[0] === item ? batch : [item];
   }
 
+  #unstartedReplayId(item: ActorQueueItem): string | undefined {
+    // Require an explicit replay/delivery key. Every mesh envelope has an id, but treating that
+    // generic id as a replay key would bypass existing failure backoff for ordinary messages.
+    const event = refRecord(item.payload);
+    const data = refRecord(event?.data);
+    const payload = refRecord(event?.payload);
+    const activationData = refRecord("data" in item.activation ? item.activation.data : undefined);
+    const replayId = [data?.replayId, payload?.replayId, event?.replayId, activationData?.replayId,
+      data?.deliveryId, payload?.deliveryId, event?.deliveryId, activationData?.deliveryId,
+      item.coalesceKey, item.settledDeliveryId, item.outcomeSend?.eventId]
+      .find(value => typeof value === "string" && value.trim().length > 0);
+    return typeof replayId === "string" ? replayId : undefined;
+  }
+
   #inFlightItems(actorId: string): ActorQueueItem[] {
     const item = this.#inFlight.get(actorId);
     return item ? this.#batchItems(actorId, item) : [];
@@ -4815,6 +4854,37 @@ export class ActorManager {
         // A freed slot lets a catch-up that a full queue deferred continue at once.
         this.#meshMonitor.schedule();
         if (!item) break;
+        if (item.unstartedRedrive?.secondRunId) {
+          const retry = item.unstartedRedrive;
+          const data = { actorId: actor.id, actorName: actor.name, replayId: retry.replayId,
+            runIds: [retry.firstRunId, retry.secondRunId] };
+          const fingerprint = createHash("sha256").update(JSON.stringify({ topic: "ops.owner", kind: "actor.run.unstarted",
+            to: actor.rootId, data })).digest("hex");
+          const dedupeKey = `actor-run-unstarted:${actor.id}:${createHash("sha256")
+            .update(`${item.id}\0${retry.replayId}`).digest("hex").slice(0, 32)}`;
+          try {
+            await this.mesh.publish({ topic: "ops.owner", to: actor.rootId, from: this.identity,
+              kind: "actor.run.unstarted", data, dedupeKey, dedupeFingerprint: fingerprint });
+          } catch {
+            actor.queue.unshift(item);
+            this.#persistQueue(actor.id, true);
+            retryDrain = true;
+            break;
+          }
+          const batchIds = new Set(item.batchIds ?? [item.id]);
+          const members = new Map(actor.queue.filter(event => batchIds.has(event.id)).map(event => [event.id, event]));
+          const batch = (item.batchIds ?? [item.id]).flatMap(id => id === item.id ? [item] : members.has(id) ? [members.get(id)!] : []);
+          actor.queue = actor.queue.filter(event => !batchIds.has(event.id));
+          for (const event of batch) delete event.unstartedRedrive;
+          this.#inFlight.set(actor.id, item);
+          this.#inFlightBatches.set(actor.id, batch);
+          this.#finishInFlight(actor.id, item, false, false);
+          this.#persistQueue(actor.id, true);
+          actor.status = actor.queue.length > 0 ? "queued" : "idle";
+          actor.updatedAt = Date.now();
+          await this.#publishDrainPresence(actor);
+          continue;
+        }
         // A retry may have queued while its first activation was in flight, or arrived
         // through a predecessor's queue. Recheck at execution, not only at ingress.
         if (this.#hasProcessedKey(actor, item.source, item.payload)) {
@@ -4866,6 +4936,7 @@ export class ActorManager {
         let enodevRecovered = false; // a saved answer handed back, not a run: nothing to protect from a repeat
         let enodevDelivered = false; // its durable delivery receipt is written; commit after the queue ack
         let handoffConsumed = false;
+        let unstartedRedrive = false;
         // Stops and recovered durable terminal stops are interrupted, not failing.
         // Ordinary deadlines still fail; recovery provenance is host-only object identity.
         let runStopped = false;
@@ -5023,11 +5094,24 @@ export class ActorManager {
           runEvidence = result.warnings;
           // Error-only turns and a spawned handle do not prove inference consumed context.
           handoffConsumed = result.inferenceStarted ?? (result.status === "completed" || result.toolCalls > 0);
+          if (handoffConsumed && item.unstartedRedrive) delete item.unstartedRedrive;
           // Captured before any check that can throw: a completed run is never parked and
           // rerun, whatever happens to ownership afterwards.
           runCompleted = result.status === "completed";
           enodevRecovered = result.enodevRecovered === true;
           runStopped = result.status === "stopped" || isRecoveredDurableStop(result);
+          const retryIdentity = this.#unstartedReplayId(item);
+          const explicitlyCancelled = this.#batchItems(actor.id, item).some(event =>
+            this.#cancelledInFlight.get(actor.id)?.has(event.id));
+          const mayRedrive = !handoffConsumed && retryIdentity !== undefined && !actor.removal &&
+            (actor.status as string) !== "stopped" && actor.stopReason === undefined && actor.ownershipAbort !== abortController &&
+            !explicitlyCancelled && this.#canManage(actor.id) && !result.launchPreparationTimeoutMs &&
+            result.errorCode !== "CONTEXT_OVERFLOW";
+          if (mayRedrive) {
+            if (!item.unstartedRedrive) item.unstartedRedrive = { replayId: retryIdentity!, firstRunId: result.id };
+            else if (!item.unstartedRedrive.secondRunId) item.unstartedRedrive.secondRunId = result.id;
+            unstartedRedrive = true;
+          }
           const cancelled = actor.cancelAbort === abortController;
           if (cancelled) delete actor.cancelAbort;
           // A caller hears the run's own outcome; an event without one is recorded dropped.
@@ -5051,6 +5135,7 @@ export class ActorManager {
             throw new AgentLaunchPreparationTimeoutError(result.launchPreparationTimeoutMs);
           }
           actor.lastRunId = result.id;
+          if (unstartedRedrive) continue;
           if (result.contextUsage) {
             const live = this.#liveActor(actor);
             let sessionId: string | undefined;
@@ -5387,7 +5472,7 @@ export class ActorManager {
           actor.updatedAt = Date.now();
           if (actor.status !== "stopped") actor.status = actor.queue.length > 0 ? "queued" : "idle";
           // Failed handoffs wait as context; never obstruct the next runnable item.
-          this.#finishInFlight(actor.id, item, handoffConsumed, runCompleted);
+          this.#finishInFlight(actor.id, item, handoffConsumed, runCompleted, unstartedRedrive);
           if (enodevDelivered && (!this.#persistent || this.#persistQueue(actor.id, true))) {
             try { this.agents.commitEnodevRecovery?.(runId!); } catch { /* the receipt settles it at the next start */ }
           }
@@ -8088,8 +8173,8 @@ export class ActorManager {
   // files it took over deleted (review/astra F5 on #79): a failed write keeps them for the next load.
   #persistQueue(actorId: string, durable = false, release = false, transfer?: {
     sourceId: string; window: SettledWindow; pending: NonNullable<SettledWindow["pending"]>; item: ActorQueueItem;
-  }, cancellationFallback = false): boolean {
-    if (!this.#persistent || this.#closing || !this.#ownQueueRead.has(actorId)) return false;
+  }, cancellationFallback = false, allowClosing = false): boolean {
+    if (!this.#persistent || (this.#closing && !allowClosing) || !this.#ownQueueRead.has(actorId)) return false;
     if (!release) this.#releaseCheckpoint = undefined;
     const actor = this.#actors.get(actorId);
     if (!actor) return false;
@@ -8154,6 +8239,7 @@ export class ActorManager {
             executionStarted: item.executionStarted === true,
             preparationAttempts: item.preparationAttempts ?? 0,
             ...(item.overflowRetried ? { overflowRetried: true } : {}),
+            ...(item.unstartedRedrive ? { unstartedRedrive: item.unstartedRedrive } : {}),
             ...(item.ownershipRefusals ? { ownershipRefusals: item.ownershipRefusals } : {}),
             ...(this.#inFlightItems(actorId).includes(item) || item.resumed ? { resumed: true } : {}),
             ...(item.deferredHandoff ? { deferredHandoff: true } : {}),
@@ -8319,9 +8405,18 @@ export class ActorManager {
     delete item.supersededSends;
   }
 
-  #finishInFlight(actorId: string, item: ActorQueueItem, consumed: boolean, completed: boolean): void {
+  #finishInFlight(actorId: string, item: ActorQueueItem, consumed: boolean, completed: boolean, requeueUnstarted = false): void {
     const items = this.#batchItems(actorId, item);
     const actor = this.#actors.get(actorId);
+    const retryUnstarted = actor && requeueUnstarted && item.unstartedRedrive && !actor.removal &&
+      actor.status !== "stopped" && actor.stopReason === undefined;
+    if (retryUnstarted) {
+      const queued = new Set(actor.queue.map(event => event.id));
+      actor.queue.unshift(...items.filter(event => !queued.has(event.id)));
+      for (const event of items) event.executionStarted = false;
+      actor.status = "queued";
+      actor.updatedAt = Date.now();
+    }
     const pendingIds = new Set(actor ? [...actor.queue, ...(this.#overflow.get(actorId) ?? []),
       ...(this.#parked.get(actorId) ?? [])].map(event => event.id) : []);
     for (const event of items) {
@@ -8367,6 +8462,9 @@ export class ActorManager {
       for (const id of consumedIds) pending.add(id);
       this.#pendingHandoffConsumption.set(actorId, pending);
       this.#flushHandoffConsumption(actor);
+    } else if (retryUnstarted && pendingIds.has(item.id)) {
+      // Unlike ordinary queue updates, the one-time retry fence must survive a session/resident teardown.
+      this.#persistQueue(actorId, true, false, undefined, false, true);
     } else this.#persistQueue(actorId, processed || item.source === "child-completion" || context.length > 0);
   }
 
@@ -8676,6 +8774,14 @@ export class ActorManager {
         ...(typeof value.coalesceKey === "string" ? { coalesceKey: value.coalesceKey } : {}),
         ...(typeof value.settledDeliveryId === "string" && value.settledDeliveryId ? { settledDeliveryId: value.settledDeliveryId } : {}),
         ...(Array.isArray(value.settledDeliveryIds) ? { settledDeliveryIds: this.#settledDeliveryReceipts({ settledDeliveryIds: value.settledDeliveryIds }) } : {}),
+        ...(() => {
+          const retry = refRecord(value.unstartedRedrive);
+          if (typeof retry?.replayId !== "string" || !retry.replayId.trim() || retry.replayId.length > 2048 ||
+              typeof retry.firstRunId !== "string" || !retry.firstRunId.trim() || retry.firstRunId.length > 128) return {};
+          return { unstartedRedrive: { replayId: retry.replayId, firstRunId: retry.firstRunId,
+            ...(typeof retry.secondRunId === "string" && retry.secondRunId.trim() && retry.secondRunId.length <= 128
+              ? { secondRunId: retry.secondRunId } : {}) } };
+        })(),
         ...((value as { resumed?: unknown }).resumed === true ? { resumed: true } : {}),
         attempts,
         ...(value.batchQueued === true ? { batchQueued: true } : {}),

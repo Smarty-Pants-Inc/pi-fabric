@@ -203,6 +203,7 @@ interface ManagedActor extends FabricActorBatching {
   instructions: string;
   status: FabricActorStatus;
   events: FabricActorHostEvent[];
+  eventsStartAt?: number;
   topics: string[];
   delivery: FabricActorDelivery;
   responseMode: FabricActorResponseMode;
@@ -324,6 +325,11 @@ const isRetryableRegistrySave = (error: unknown): boolean => error instanceof Ac
 const errorText = (error: unknown): string => error instanceof Error ? error.message : String(error);
 
 const TOPIC_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,127}$/;
+const parseEventsStartAt = (value: unknown): number => {
+  const at = typeof value === "number" ? value : typeof value === "string" ? Date.parse(value) : Number.NaN;
+  if (!Number.isSafeInteger(at) || at < 0) throw new Error("eventsStartAt must be a nonnegative epoch millisecond or ISO timestamp");
+  return at;
+};
 const HOST_EVENTS: ReadonlySet<FabricActorHostEvent> = new Set(FABRIC_ACTOR_HOST_EVENTS);
 const MAIN_REVISION_EVENTS: ReadonlySet<FabricActorHostEvent> = new Set([
   "input",
@@ -888,6 +894,12 @@ export class ActorManager {
   readonly #pendingPresence = new Set<string>();
   /** Residents publish both scopes through their one registry-fenced host heartbeat. */
   readonly #presencePublisher: { refresh: () => Promise<void>; schedule: () => void } | undefined;
+  readonly #waitForActorClaimChange: ((id: string, signal: AbortSignal) => Promise<void>) | undefined;
+  readonly #ownershipWatchers = new Map<string, AbortController>();
+  readonly #handoffOwner: { hostId: string; incarnation: string } | undefined;
+  readonly #handoffReleases = new Map<string, {
+    format: 1; actorId: string; ownerHostId: string; ownerIdentityId: string; ownerIncarnation: string; stoppedAt: number;
+  }>();
   readonly #presenceRevisions = new Map<string, object>();
   /** Serialized presence this instance committed through the host heartbeat. A new
    * instance (restart) starts empty, so its first full heartbeat republishes all once. */
@@ -914,6 +926,20 @@ export class ActorManager {
   #meshOutageAlarmMs: number | undefined;
   #removalRetryMs = REMOVAL_RETRY_MS;
   readonly #delivered = new Set<string>();
+  // Stable NATS message-ID receipts are stored in the same durable queue snapshot before ACK.
+  readonly #natsEventReceipts = new Map<string, Set<string>>();
+  readonly #natsEventConsumers = new Map<string, import("../transport/nats/events-consume.js").NatsActorEventsConsumer>();
+  readonly #natsEventConsumerTopics = new Map<string, string[]>();
+  readonly #natsEventConsumerActive = new Set<string>();
+  #natsEventsSession: {
+    connection: import("../transport/nats/connection.js").NatsConnectionHandle;
+    startConsumer: typeof import("../transport/nats/events-consume.js").startNatsActorEventsConsumer;
+  } | undefined;
+  #natsEventsOpening: Promise<{
+    connection: import("../transport/nats/connection.js").NatsConnectionHandle;
+    startConsumer: typeof import("../transport/nats/events-consume.js").startNatsActorEventsConsumer;
+  }> | undefined;
+  #natsEventsSyncPending: Promise<void> | undefined;
   // Independent of registry objects: ownership/reload may replace them during a drain.
   readonly #processedKeys = new Map<string, Set<string>>();
   // Admission times belong to the manager, not replaceable registry objects.
@@ -1022,6 +1048,10 @@ export class ActorManager {
       canConsumeMesh?: () => boolean;
       /** Delegate resident presence to the host heartbeat; never start per-actor retries. */
       presencePublisher?: { refresh: () => Promise<void>; schedule: () => void };
+      /** Wait for a participant/lease KV update so a visible successor claim aborts active work. */
+      waitForActorClaimChange?: (id: string, signal: AbortSignal) => Promise<void>;
+      /** NATS host identity used to attest actor release after every owned turn drains. */
+      handoffOwner?: { hostId: string; incarnation: string };
       /** Retry delay for failed presence writes (tests use a short one). */
       presenceRetryMs?: number;
       /** Outage-alarm bound of this manager's background paths (tests shorten it); default MESH_OUTAGE_ALARM_AFTER_MS. */
@@ -1098,6 +1128,8 @@ export class ActorManager {
     this.#deadSessionReap = options.reapDeadSessionPresence ?? true;
     this.#canConsumeMesh = options.canConsumeMesh;
     this.#presencePublisher = options.presencePublisher;
+    this.#waitForActorClaimChange = options.waitForActorClaimChange;
+    this.#handoffOwner = options.handoffOwner;
     this.#logs = new ActorLogStore(
       mesh,
       meshConfig,
@@ -1122,7 +1154,8 @@ export class ActorManager {
       if (this.#persistent && meshConfig.enabled) this.#loadActors();
       this.#registryFingerprint = this.#registry.fingerprint();
       for (const actor of this.#actors.values()) {
-        this.#ownership.set(actor.id, this.#ownershipDecision(actor.id));
+        const owned = this.#ownershipDecision(actor.id);
+        this.#ownership.set(actor.id, owned);
       }
     });
     this.#acquireCapabilityView = options.acquireCapabilityView;
@@ -1140,6 +1173,7 @@ export class ActorManager {
       replayAll: options.claimResidency === "durable",
       isDurableWork: (event) => this.#slotEventDurable(event),
       beforePoll: () => {
+        this.#scheduleNatsEventsSync();
         if (this.#releaseStrict || options.canConsumeMesh?.() === false) return false;
         // Initial publication may have outlived the first deferred slice (or
         // failed and later recovered). Retry once ready, never on the constructor.
@@ -1174,11 +1208,17 @@ export class ActorManager {
         }
         if (this.#releaseStrict) return false;
         if (event.topic === "fabric.steer") this.#relaySteer(event);
-        else if (!event.topic.startsWith("fabric.control.")) return this.#dispatchMeshEvent(event);
+        else if (!event.topic.startsWith("fabric.control.")) {
+          // NATS is the sole actor-topic delivery path when alpha events are enabled; the local event log
+          // remains for control/state bookkeeping but must not dispatch a second copy to actors.
+          if (this.#natsEventsEnabled() && this.#persistent) return "ignored";
+          return this.#dispatchMeshEvent(event);
+        }
         return event.topic === "fabric.steer" ? true : "ignored";
       },
     });
     this.#meshMonitor.start();
+    this.#scheduleNatsEventsSync();
     this.#presenceRetryMs = options.presenceRetryMs ?? PRESENCE_RETRY_MS;
     this.#meshOutageAlarmMs = options.meshOutageAlarmMs;
     this.#preparationTimeoutMs = Math.max(1, options.preparationTimeoutMs ?? ACTOR_PREPARATION_TIMEOUT_MS);
@@ -1202,6 +1242,184 @@ export class ActorManager {
   subscribeMesh(listener: () => void): () => void {
     this.#meshListeners.add(listener);
     return () => this.#meshListeners.delete(listener);
+  }
+
+  #natsEventsEnabled(): boolean {
+    return this.meshConfig.transport === "nats" && this.meshConfig.nats.events === true;
+  }
+
+  #scheduleNatsEventsSync(): void {
+    if (!this.#natsEventsEnabled() || !this.#persistent || this.#closing) return;
+    void this.#syncNatsEventConsumers().catch(error => {
+      diagnostics.warn("src/actors/manager.ts", `[pi-fabric] NATS actor event setup deferred: ${errorText(error)}`);
+    });
+  }
+
+  async #natsEventsRuntime(): Promise<{
+    connection: import("../transport/nats/connection.js").NatsConnectionHandle;
+    startConsumer: typeof import("../transport/nats/events-consume.js").startNatsActorEventsConsumer;
+  }> {
+    if (this.#natsEventsSession) return this.#natsEventsSession;
+    if (this.#natsEventsOpening) return this.#natsEventsOpening;
+    const nats = this.meshConfig.nats;
+    if (!nats.org || !nats.servers || !nats.credentials || !nats.machine || !nats.custodyStream ||
+        !nats.livenessStream || !nats.pathBMachines) throw new Error("NATS actor events require complete mesh.nats connection settings");
+    const opening = (async () => {
+      const { openNatsConnection, startNatsActorEventsConsumer } = await import("../transport/nats/index.js");
+      const connection = await openNatsConnection({
+        servers: nats.servers!, credentials: nats.credentials!, machine: nats.machine!,
+        custodyStream: nats.custodyStream!, livenessStream: nats.livenessStream!, pathBMachines: nats.pathBMachines!,
+        events: true, org: nats.org!,
+        ...(nats.tls ? { tls: nats.tls } : {}),
+        name: `fabric-events-${this.identity.id}`,
+      });
+      return { connection, startConsumer: startNatsActorEventsConsumer };
+    })();
+    this.#natsEventsOpening = opening;
+    try {
+      const session = await opening;
+      this.#natsEventsSession = session;
+      void session.connection.closed().then(error => {
+        if (!error || this.#closing || this.#natsEventsSession !== session) return;
+        this.#natsEventsSession = undefined;
+        const consumers = [...this.#natsEventConsumers.values()];
+        this.#natsEventConsumers.clear();
+        this.#natsEventConsumerTopics.clear();
+        this.#natsEventConsumerActive.clear();
+        void Promise.all(consumers.map(consumer => consumer.close(false).catch(() => undefined))).finally(() => {
+          this.#scheduleNatsEventsSync();
+        });
+      });
+      return session;
+    } finally {
+      if (this.#natsEventsOpening === opening) this.#natsEventsOpening = undefined;
+    }
+  }
+
+  async #syncNatsEventConsumers(): Promise<void> {
+    if (!this.#natsEventsEnabled() || !this.#persistent || this.#closing) return;
+    if (this.#natsEventsSyncPending) return this.#natsEventsSyncPending;
+    const syncing = (async () => {
+      this.#syncActorsFromRegistry();
+      this.#refreshOwnership();
+      for (const [actorId, consumer] of [...this.#natsEventConsumers]) {
+        const actor = this.#actors.get(actorId);
+        if (!actor) {
+          await this.#removeNatsActorConsumer(actorId, true);
+          continue;
+        }
+        if (!this.#canManageCached(actorId) || !this.#slotCurrent(actor)) {
+          await consumer.close(false);
+          this.#natsEventConsumers.delete(actorId);
+          this.#natsEventConsumerTopics.delete(actorId);
+          this.#natsEventConsumerActive.delete(actorId);
+          continue;
+        }
+        const active = actor.status !== "stopped" && !actor.removal;
+        const topics = active ? actor.topics : [];
+        if (JSON.stringify(this.#natsEventConsumerTopics.get(actorId) ?? []) !== JSON.stringify(topics) ||
+            this.#natsEventConsumerActive.has(actorId) !== active) {
+          await consumer.updateTopics(topics, active);
+          this.#natsEventConsumerTopics.set(actorId, [...topics]);
+          if (active) this.#natsEventConsumerActive.add(actorId);
+          else this.#natsEventConsumerActive.delete(actorId);
+        }
+      }
+      const candidates = [...this.#actors.values()].filter(actor => actor.status !== "stopped" &&
+        !actor.removal && this.#canManageCached(actor.id) && this.#slotCurrent(actor) && !this.#natsEventConsumers.has(actor.id));
+      if (!candidates.length) return;
+      const { connection, startConsumer } = await this.#natsEventsRuntime();
+      for (const actor of candidates) {
+        // Ownership or topics may have changed while connection setup yielded.
+        const current = this.#actors.get(actor.id);
+        if (!current || current.status === "stopped" || current.removal ||
+            !this.#canManageCached(current.id) || !this.#slotCurrent(current)) continue;
+        const consumer = await startConsumer(connection, {
+          org: this.meshConfig.nats.org!, actorId: current.id, topics: [...current.topics],
+          ...(current.eventsStartAt !== undefined ? { eventsStartAt: current.eventsStartAt } : {}),
+          provision: false,
+          onMessage: (event, messageId, ack) => this.#acceptNatsActorEvent(current.id, event, messageId, ack),
+        });
+        this.#natsEventConsumers.set(current.id, consumer);
+        this.#natsEventConsumerTopics.set(current.id, [...current.topics]);
+        this.#natsEventConsumerActive.add(current.id);
+      }
+    })();
+    const pending = syncing.finally(() => {
+      if (this.#natsEventsSyncPending === pending) this.#natsEventsSyncPending = undefined;
+    });
+    this.#natsEventsSyncPending = pending;
+    return pending;
+  }
+
+  async #removeNatsActorConsumer(actorId: string, remove: boolean): Promise<void> {
+    const consumer = this.#natsEventConsumers.get(actorId);
+    if (!consumer) return;
+    await consumer.close(remove);
+    this.#natsEventConsumers.delete(actorId);
+    this.#natsEventConsumerTopics.delete(actorId);
+    this.#natsEventConsumerActive.delete(actorId);
+  }
+
+  async #closeNatsEvents(): Promise<void> {
+    await this.#natsEventsSyncPending?.catch(() => undefined);
+    const session = this.#natsEventsSession ?? await this.#natsEventsOpening?.catch(() => undefined);
+    await Promise.all([...this.#natsEventConsumers.values()].map(consumer => consumer.close(false).catch(error => {
+      diagnostics.warn("src/actors/manager.ts", `[pi-fabric] NATS actor event consumer close deferred: ${errorText(error)}`);
+    })));
+    this.#natsEventConsumers.clear();
+    this.#natsEventConsumerTopics.clear();
+    this.#natsEventConsumerActive.clear();
+    this.#natsEventsSession = undefined;
+    await session?.connection.close().catch(error => {
+      diagnostics.warn("src/actors/manager.ts", `[pi-fabric] NATS actor event connection close failed: ${errorText(error)}`);
+    });
+  }
+
+  #persistNatsEventReceipt(actorId: string, messageId: string): boolean {
+    const receipts = this.#natsEventReceipts.get(actorId) ?? new Set<string>();
+    if (receipts.has(messageId)) return true;
+    receipts.add(messageId);
+    this.#natsEventReceipts.set(actorId, receipts);
+    if (this.#persistQueue(actorId, true)) return true;
+    receipts.delete(messageId);
+    if (receipts.size === 0) this.#natsEventReceipts.delete(actorId);
+    return false;
+  }
+
+  async #acceptNatsActorEvent(actorId: string, event: MeshEvent, messageId: string, ack: () => Promise<void>): Promise<void> {
+    this.#refreshOwnership(actorId);
+    const actor = this.#actors.get(actorId);
+    const org = this.meshConfig.nats.org;
+    const isWake = event.topic === `wake.${actorId}` || event.topic === `fabric.ev.${org}.wake.${actorId}`;
+    const subscribed = actor?.topics.includes(event.topic) || actor?.topics.includes(`fabric.ev.${org}.${event.topic}`);
+    if (!actor || actor.status === "stopped" || actor.removal || (!isWake && !subscribed) ||
+        !this.#canManageCached(actorId) || !this.#slotCurrent(actor)) return;
+    if (this.#natsEventReceipts.get(actorId)?.has(messageId)) {
+      await ack();
+      setImmediate(() => { const current = this.#actors.get(actorId); if (current) this.#ensureDrain(current); });
+      return;
+    }
+    const source = `mesh:${event.topic}`;
+    const deliveryId = messageId || String(event.sequence);
+    const eventData = refRecord(event.data);
+    const queuedEvent: MeshEvent = {
+      ...event,
+      data: { ...(eventData ?? (event.data === undefined ? {} : { value: event.data })), deliveryId },
+    };
+    if (this.#skipOnArrival(actor, source, event) || this.#hasProcessedKey(actor, source, event)) {
+      if (!this.#persistNatsEventReceipt(actorId, deliveryId)) throw new ActorQueueCheckpointError(actor);
+    } else {
+      this.#enqueue(actor, source, queuedEvent, {
+        ...this.#meshEnqueueOptions(actor, queuedEvent),
+        natsEventReceiptId: deliveryId,
+        deferDrain: true,
+        deadLetter: false,
+        holdWhenFull: true,
+      });
+    }
+    await ack();
+    setImmediate(() => { const current = this.#actors.get(actorId); if (current) this.#ensureDrain(current); });
   }
 
   retryCapabilityWaiters(): void {
@@ -1405,6 +1623,7 @@ export class ActorManager {
       instructions: request.instructions,
       status: "idle",
       events,
+      ...(request.eventsStartAt !== undefined ? { eventsStartAt: parseEventsStartAt(request.eventsStartAt) } : {}),
       topics,
       delivery: deliveryPolicy.delivery,
       responseMode: request.responseMode ?? "text",
@@ -1506,6 +1725,7 @@ export class ActorManager {
       }
     await this.#publishPresence(actor);
     await this.#publishSlotCreated(actor);
+    this.#scheduleNatsEventsSync();
     return this.#publicInfo(actor);
     } catch (error) {
       if (!admitted) throw error;
@@ -2230,9 +2450,17 @@ export class ActorManager {
         `Fabric actor ${actor.id} topics are bound to native slot admission and cannot be changed`, "smarty-dev#13463");
     }
     this.#assertPresenceValue(this.#presencePreview(actor, { topics: next }));
+    const previous = actor.topics;
     actor.topics = next;
     actor.updatedAt = Date.now();
-    await this.#publishPresence(actor, true);
+    try {
+      if (this.#natsEventsEnabled()) await this.#syncNatsEventConsumers();
+      await this.#publishPresence(actor, true);
+    } catch (error) {
+      actor.topics = previous;
+      actor.updatedAt = Date.now();
+      throw error;
+    }
     // Dispatch reads actor.topics live; wake the existing reader, never reset its cursor.
     this.#meshMonitor.schedule();
     return this.#publicInfo(actor);
@@ -2701,6 +2929,7 @@ export class ActorManager {
       name: actor.name,
       instructions: actor.instructions,
       events: [...actor.events],
+      ...(actor.eventsStartAt !== undefined ? { eventsStartAt: actor.eventsStartAt } : {}),
       topics: [...actor.topics],
       delivery: actor.delivery,
       responseMode: actor.responseMode,
@@ -3756,9 +3985,11 @@ export class ActorManager {
         throw error;
       }
       this.#revoked.add(actor.id);
+      await this.#removeNatsActorConsumer(actor.id, true);
       this.#deadLetterEventIds.delete(actor.id);
       this.#deadLetterRetirementPending.delete(actor.id);
       this.#processedKeys.delete(actor.id);
+      this.#natsEventReceipts.delete(actor.id);
       this.#clearSettledWindows(actor.id);
       this.#emitChange();
     }
@@ -3994,6 +4225,9 @@ export class ActorManager {
   }
 
   async #close(): Promise<void> {
+    for (const watcher of this.#ownershipWatchers.values()) watcher.abort();
+    this.#ownershipWatchers.clear();
+    await this.#closeNatsEvents();
     this.#meshMonitor.close();
     // Join native watch closes before any owned file can be released.
     const watches = [...this.#childCompletionWatches.values()];
@@ -4048,9 +4282,10 @@ export class ActorManager {
       const drains = Promise.allSettled(owned.map((actor) => actor.drain ?? Promise.resolve()));
       // A losing race deadline is still a live old-generation timer. The shared
       // bounded-settlement helper clears it when drains finish first (#4383).
-      if (!await settleWithin([drains], this.#closeGraceMs)) {
+      let drained = await settleWithin([drains], this.#closeGraceMs);
+      if (!drained) {
         await this.agents.close({ persistentSessionReload: this.identity.kind === "main" });
-        await settleWithin([drains], this.#closeGraceMs);
+        drained = await settleWithin([drains], this.#closeGraceMs);
       }
       // Retry every durable join before AgentManager.close. Failed sinks keep
       // their source veto on disk for the next execution owner.
@@ -4064,6 +4299,17 @@ export class ActorManager {
         actor.updatedAt = Date.now();
       }
       if (owned.length > 0) await this.#saveActorsAtClose();
+      if (drained && this.#handoffOwner && this.#presencePublisher && owned.length > 0) {
+        const stoppedAt = Date.now();
+        for (const actor of owned) this.#handoffReleases.set(actor.id, {
+          format: 1, actorId: actor.id, ownerHostId: this.#handoffOwner.hostId,
+          ownerIdentityId: this.identity.id, ownerIncarnation: this.#handoffOwner.incarnation, stoppedAt,
+        });
+        // The participant publisher writes this receipt through the same live host lease
+        // as ordinary presence. Failure is safe: successor admission then waits for expiry.
+        try { await this.#presencePublisher.refresh(); }
+        catch { /* The host lease expiry path remains the fallback. */ }
+      }
       return;
     }
     await Promise.allSettled([...this.#actors.keys()].map((id) => this.stop(id, undefined, false, "session-reset")));
@@ -4277,6 +4523,8 @@ export class ActorManager {
       deferDrain?: boolean;
       /** Routed mesh work: acceptance requires the persisted queue to hold it (#816). */
       requirePersisted?: boolean;
+      /** NATS message ID included in the same durable queue snapshot before broker ACK. */
+      natsEventReceiptId?: string;
       /** Durable routed work: past the queue and overflow it waits in the actor's dead-letter file. */
       deadLetter?: boolean;
       /** A dead-lettered event returning to the queue; it never goes back to the file. */
@@ -4320,6 +4568,24 @@ export class ActorManager {
     const sender = options.sender === null ? undefined : options.sender ?? processSender();
     const createdAt = Date.now();
     const sequence = ++actor.latestActivationSequence;
+    let addedNatsReceipt = false;
+    const rememberNatsReceipt = (): void => {
+      const id = options.natsEventReceiptId;
+      if (id === undefined) return;
+      const receipts = this.#natsEventReceipts.get(actor.id) ?? new Set<string>();
+      if (!receipts.has(id)) {
+        receipts.add(id);
+        this.#natsEventReceipts.set(actor.id, receipts);
+        addedNatsReceipt = true;
+      }
+    };
+    const forgetNatsReceipt = (): void => {
+      if (!addedNatsReceipt || options.natsEventReceiptId === undefined) return;
+      const receipts = this.#natsEventReceipts.get(actor.id);
+      receipts?.delete(options.natsEventReceiptId);
+      if (receipts?.size === 0) this.#natsEventReceipts.delete(actor.id);
+      addedNatsReceipt = false;
+    };
     if (options.coalesceKey && !options.batchQueued && !(actor.batchWindowMs! > 0)) {
       // Parked work (waiting for ownership, or restored after a restart) coalesces too (smarty-dev#1065).
       const existing = [...actor.queue, ...(this.#overflow.get(actor.id) ?? []), ...(this.#parked.get(actor.id) ?? [])]
@@ -4328,7 +4594,7 @@ export class ActorManager {
         .find((item) => !item.batchQueued && !item.batchIds && !item.overflowRetried &&
           item.coalesceKey === options.coalesceKey);
       if (existing) {
-        const previous = options.checkpoint ? { ...existing } : undefined;
+        const previous = options.checkpoint || options.natsEventReceiptId !== undefined ? { ...existing } : undefined;
         const incomingNewer = !options.replaying || this.#newerEvent({
           source, payload, activation: this.#activation(existing.id, source, payload, sequence, createdAt),
         } as ActorQueueItem, existing);
@@ -4364,14 +4630,24 @@ export class ActorManager {
           }
           throw error;
         }
-        // The merged item, with its superseded sends, is durable before their outcomes are recorded.
-        let persisted = options.checkpoint ? true : this.#persistQueue(actor.id);
+        // The merged item and any NATS message-ID receipt are durable before ACK/outcome recording.
+        rememberNatsReceipt();
+        let persisted = options.checkpoint ? true : this.#persistQueue(actor.id, options.natsEventReceiptId !== undefined);
+        if (options.natsEventReceiptId !== undefined && !persisted) {
+          if (previous) {
+            for (const key of Object.keys(existing)) if (!Object.hasOwn(previous, key)) Reflect.deleteProperty(existing, key);
+            Object.assign(existing, previous);
+            actor.latestActivationSequence = sequence - 1;
+          }
+          forgetNatsReceipt();
+          throw new ActorQueueCheckpointError(actor);
+        }
         options.onAccepted?.();
         if (existing.supersededSends?.length) {
           this.#recordSuperseded(actor.id, existing);
           persisted = this.#persistQueue(actor.id) || persisted;
         }
-        this.#ensureDrain(actor);
+        if (!options.deferDrain) this.#ensureDrain(actor);
         // Memory already runs the merged item; an unacknowledged replay coalesces again.
         if (options.requirePersisted && this.#persistent && !persisted) throw new ActorQueueCheckpointError(actor);
         return existing;
@@ -4446,7 +4722,9 @@ export class ActorManager {
       actor.latestActivationSequence = sequence - 1;
       throw error;
     }
-    if (!options.checkpoint && !this.#persistQueue(actor.id) && options.requirePersisted && this.#persistent) {
+    rememberNatsReceipt();
+    const persisted = options.checkpoint ? true : this.#persistQueue(actor.id, options.natsEventReceiptId !== undefined);
+    if (!persisted && options.requirePersisted && (this.#persistent || options.natsEventReceiptId !== undefined)) {
       // Not durable in the receiver's queue: do not accept it, so the host cursor
       // keeps the event and offers it again rather than losing it on a restart.
       for (const held of [actor.queue, this.#overflow.get(actor.id) ?? []]) {
@@ -4454,6 +4732,7 @@ export class ActorManager {
         if (at >= 0) held.splice(at, 1);
       }
       if (this.#overflow.get(actor.id)?.length === 0) this.#overflow.delete(actor.id);
+      forgetNatsReceipt();
       throw new ActorQueueCheckpointError(actor);
     }
     options.onAccepted?.();
@@ -4827,6 +5106,7 @@ export class ActorManager {
   }
 
   async #drain(actor: ManagedActor): Promise<void> {
+    if (actor.queue.length > 0) this.#ensureOwnershipWatch(actor.id);
     let retryDrain = false;
     let retryDelay = this.#preparationRetryMs;
     try {
@@ -5039,6 +5319,10 @@ export class ActorManager {
               if (this.#persistent && !this.#persistQueue(actor.id, true)) throw new Error("Actor activation manifest checkpoint failed");
             });
           }
+          // Re-read the latest participant view immediately before the turn is handed
+          // to AgentManager; a successor claim visible since preparation aborts and parks it.
+          this.#refreshOwnership(actor.id);
+          if (!this.#canManage(actor.id)) throw new Error(`Fabric actor ownership moved before run: ${actor.id}`);
           preLaunch = false; // AgentManager bounds model/auth setup after (not during) permit waiting.
           if (this.#slotEnforced(actor.topics)) this.#slotLaunchUnknown.add(actor.id);
           const result = await this.agents.run(
@@ -5069,11 +5353,16 @@ export class ActorManager {
             },
             // The controller identity is this activation's generation token. A
             // permit may arrive after stop/remove/halt or after a newer drain.
-            () => !this.#closing && !abortController.signal.aborted &&
-              this.#runningActor(actor.id)?.abortController === abortController &&
-              actor.status !== "stopped" && this.#actors.has(actor.id) &&
-              this.#actors.get(actor.id)?.status !== "stopped" && this.#ownershipDecision(actor.id) &&
-              this.#slotLaunchAllowed(actor),
+            () => {
+              // AgentManager can wait for a permit after preparation. Refresh the
+              // participant decision again at that native launch boundary as well.
+              this.#refreshOwnership(actor.id);
+              return !this.#closing && !abortController.signal.aborted &&
+                this.#runningActor(actor.id)?.abortController === abortController &&
+                actor.status !== "stopped" && this.#actors.has(actor.id) &&
+                this.#actors.get(actor.id)?.status !== "stopped" && this.#ownershipDecision(actor.id) &&
+                this.#slotLaunchAllowed(actor);
+            },
             () => this.#downgradeOutputPrincipal(actor, item),
             (handle) => {
               this.#noteSlotRun(actor, handle.id);
@@ -5516,6 +5805,7 @@ export class ActorManager {
       }
       actor.draining = false;
       if (this.#draining.get(actor.id) === actor) this.#draining.delete(actor.id);
+      this.#stopOwnershipWatch(actor.id);
       this.#emitChange(); // Final settlement changes dormancy eligibility, not just public status.
       // A reload may have moved this actor's queue to a new object while this drain ran.
       const live = this.#actors.get(actor.id);
@@ -7383,6 +7673,7 @@ export class ActorManager {
       ...(actor.status === "stopped" && actor.stopReason ? { stopReason: actor.stopReason } : {}),
       ...(actor.status === "stopped" && actor.stoppedAt !== undefined ? { stoppedAt: actor.stoppedAt } : {}),
       events: actor.events,
+      ...(actor.eventsStartAt !== undefined ? { eventsStartAt: actor.eventsStartAt } : {}),
       topics: actor.topics,
       delivery: actor.delivery,
       responseMode: actor.responseMode,
@@ -7922,6 +8213,8 @@ export class ActorManager {
         events: Array.isArray(record.events)
           ? record.events.filter((event): event is FabricActorHostEvent => HOST_EVENTS.has(event))
           : [],
+        ...(Number.isSafeInteger(record.eventsStartAt) && (record.eventsStartAt as number) >= 0
+          ? { eventsStartAt: record.eventsStartAt as number } : {}),
         topics: Array.isArray(record.topics)
           ? record.topics.filter(
               (topic): topic is string => typeof topic === "string" && TOPIC_PATTERN.test(topic),
@@ -8204,6 +8497,7 @@ export class ActorManager {
     const file = this.#ownQueueFile(actor);
     const cleanHandover = release || this.#releasePaused;
     const processedKeys = [...(this.#processedKeys.get(actorId) ?? [])];
+    const natsEventReceipts = [...(this.#natsEventReceipts.get(actorId) ?? [])];
     const pendingWindows = [...(this.#settledWindows.get(actorId) ?? [])]
       .flatMap(([sourceId, window]) => window.pending ? [{ sourceId, window, pending: window.pending }] : []);
     // Projection is serialization-only: pending stays in memory until the atomic write commits.
@@ -8259,6 +8553,7 @@ export class ActorManager {
         format: 1, items: records, latestActivationSequence: actor.latestActivationSequence,
         ...(pendingDeliveryOutcomes.length ? { pendingDeliveryOutcomes } : {}),
         ...(processedKeys.length ? { processedKeys } : {}),
+        ...(natsEventReceipts.length ? { natsEventReceipts } : {}),
         mainRevision: this.#mainRevision, taskRevision: this.#taskRevision,
         ...(settledWindows.length ? { settledWindows } : {}),
         ...(cleanHandover ? { cleanHandover: true } : {}),
@@ -8266,7 +8561,7 @@ export class ActorManager {
       };
       // Keep the obligation-free soft empty fast path. Durable empty state and
       // cancellation/predecessor fences require a file + namespace receipt.
-      if (items.length === 0 && processedKeys.length === 0 && settledWindows.length === 0 && !cleanHandover && !durable && !cancelledPredecessors.length &&
+      if (items.length === 0 && processedKeys.length === 0 && natsEventReceipts.length === 0 && settledWindows.length === 0 && !cleanHandover && !durable && !cancelledPredecessors.length &&
           !pendingDeliveryOutcomes.length) {
         fs.rmSync(file, { force: true });
       } else writeJsonAtomic(file, snapshot, { durable });
@@ -8617,11 +8912,16 @@ export class ActorManager {
     if (!this.#persistent || typeof parsed !== "object" || parsed === null) return;
     const saved = parsed as {
       format?: unknown; items?: unknown; pendingDeliveryOutcomes?: unknown; latestActivationSequence?: unknown; mainRevision?: unknown; taskRevision?: unknown; cleanHandover?: unknown;
-      processedKeys?: unknown;
+      processedKeys?: unknown; natsEventReceipts?: unknown;
       settledWindows?: unknown; cancelled?: unknown; cancelledPredecessors?: unknown;
     };
     const records = saved.format === 1 ? saved.items : undefined;
     if (!Array.isArray(records)) return;
+    if (Array.isArray(saved.natsEventReceipts)) {
+      const receipts = this.#natsEventReceipts.get(actor.id) ?? new Set<string>();
+      for (const id of saved.natsEventReceipts) if (typeof id === "string" && id.length > 0) receipts.add(id);
+      if (receipts.size) this.#natsEventReceipts.set(actor.id, receipts);
+    }
     if (actor.residency === "durable" && actor.dedupeKey && Array.isArray(saved.processedKeys)) {
       // Predecessor history precedes locally completed work; never let an old
       // handoff evict a newer local completion. Legacy snapshots have no history.
@@ -9012,6 +9312,8 @@ export class ActorManager {
       ownershipToken: this.#lineage(actor),
       // binding.sessionId is the reader's overlay; this names the owner (lucky-asc-router report).
       ownerSessionId: actor.rootId.startsWith("session:") ? actor.rootId.slice(8) : this.sessionId,
+      ...(registryView && this.#handoffReleases.has(actor.id)
+        ? { actorHandoffRelease: { ...this.#handoffReleases.get(actor.id)! } } : {}),
       ...(actor.project ? { project: actor.project } : {}),
       ...(actor.sessionOrphan ? { sessionOrphan: { ...actor.sessionOrphan } } : {}),
       // The instruction text stays private; its digest lets a caller verify setInstructions
@@ -9030,6 +9332,7 @@ export class ActorManager {
       ...(actor.kernel ? { kernel: actor.kernel } : {}),
       ...(actor.pythonRuntime ? { pythonRuntime: actor.pythonRuntime } : {}),
       events: [...actor.events],
+      ...(actor.eventsStartAt !== undefined ? { eventsStartAt: actor.eventsStartAt } : {}),
       topics: [...actor.topics],
       delivery: actor.delivery,
       responseMode: actor.responseMode,
@@ -9326,6 +9629,29 @@ export class ActorManager {
     // to fence, adopt or restore, so do not build a fleet-wide ownership snapshot (#2039).
     if (this.#actors.size === 0 || !this.#canManageActor || this.#reloadingOwnership) return;
     this.#withOwnershipRead(() => this.#refreshOwnershipNow(id, fresh), fresh);
+  }
+
+  #ensureOwnershipWatch(id: string): void {
+    if (!this.#waitForActorClaimChange || this.#closing || !this.#actors.has(id) || this.#ownershipWatchers.has(id)) return;
+    const controller = new AbortController();
+    this.#ownershipWatchers.set(id, controller);
+    void (async () => {
+      while (!controller.signal.aborted && !this.#closing) {
+        try { await this.#waitForActorClaimChange!(id, controller.signal); }
+        catch { return; } // The regular actor poll retries after a watch reset/failure.
+        if (controller.signal.aborted || this.#closing || !this.#actors.has(id)) return;
+        this.#refreshOwnership(id);
+      }
+    })().finally(() => {
+      if (this.#ownershipWatchers.get(id) === controller) this.#ownershipWatchers.delete(id);
+    }).catch(() => undefined);
+  }
+
+  #stopOwnershipWatch(id: string): void {
+    const controller = this.#ownershipWatchers.get(id);
+    if (!controller) return;
+    this.#ownershipWatchers.delete(id);
+    controller.abort();
   }
 
   #refreshOwnershipNow(id?: string, fresh = true): void {

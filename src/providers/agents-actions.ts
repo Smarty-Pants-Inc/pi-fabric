@@ -31,7 +31,7 @@ const runProperties = {
   },
   transport: {
     type: "string",
-    enum: ["auto", "process", "tmux", "screen", "localterm", "herdr"],
+    enum: ["auto", "process", "sandbox", "tmux", "screen", "localterm", "herdr"],
   },
   model: {
     type: "string",
@@ -537,6 +537,13 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
           },
         },
         topics: { type: "array", items: { type: "string" } },
+        eventsStartAt: {
+          oneOf: [
+            { type: "integer", minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+            { type: "string", minLength: 1, pattern: "^\\d{4}-\\d{2}-\\d{2}T" },
+          ],
+          description: "Epoch milliseconds or an ISO-8601 timestamp for the first NATS durable; omitted replays all retained events.",
+        },
         delivery: {
           type: "string",
           enum: ["mailbox", "steer", "followUp", "nextTurn"],

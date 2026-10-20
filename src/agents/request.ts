@@ -42,6 +42,7 @@ export const normalizeAgentRunRequest = (
   const transport =
     args.transport === "auto" ||
     args.transport === "process" ||
+    args.transport === "sandbox" ||
     args.transport === "tmux" ||
     args.transport === "screen" ||
     args.transport === "localterm" ||

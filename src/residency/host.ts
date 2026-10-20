@@ -97,6 +97,7 @@ import { isMeshWriteDeferred } from "../core/atomic-write.js";
 import { FabricControlPlane, controlOwnerIncarnation, controlActorBindingOptions, type FabricControlAcceptance, type FabricControlCommand } from "../topology/control-plane.js";
 import { MeshConsumptionPausedError, assertMeshConsumption } from "../topology/mesh-consumption.js";
 import { ParticipantDirectory } from "../topology/participant-directory.js";
+import type { ActorHandoffRelease } from "../topology/participant-view.js";
 import type { FabricTransport } from "../transport/types.js";
 import { hostLeasePath, readHostLeaseCurrent } from "../topology/host-leases.js";
 import { RESIDENT_IDLE_EXIT_MS, FabricMeshTransportConfigError, normalizeFabricConfig, validateFabricNatsOperatorMachine } from "../config.js";
@@ -551,6 +552,8 @@ export class ResidentHost {
       identity: this.identity,
       reapDeadHosts: false,                                    // its session's runtime sweeps
       presencePass: async () => {
+        // Reuse host maintenance without delaying lease renewal on a backlog; no extra polling lifetime.
+        if (transport && config.mesh.nats.events === true) void this.mesh.retryEventPublications();
         await rootPresenceAlarms(this.mesh, this.identity, this.hostId,
           this.participants.list({ scope: "project", includeStale: true, fresh: true }), config.mesh.rootPresenceAlarmMs);
         await this.actors?.reconcileSessionOrphans();
@@ -821,6 +824,8 @@ export class ResidentHost {
         // Restoration must not launch queued work until owner and readiness publication commit.
         releasePaused: true,
         canConsumeMesh: () => this.#ready && (transport ? participants : this.participants).canConsumeMesh(),
+        ...(participantView ? { waitForActorClaimChange: (id: string, signal: AbortSignal) => participantView.whenChanged(id, signal) } : {}),
+        ...(transport?.kind === "nats" ? { handoffOwner: { hostId: this.hostId, incarnation: participants.ownerIncarnation } } : {}),
         presencePublisher: { refresh: async () => {
           try {
             await (transport ? participants : this.participants).refreshPresence();
@@ -974,15 +979,17 @@ export class ResidentHost {
         ),
       );
       this.participants.registerSource(() =>
-        this.actors.listOwned(true).map((actor) =>
-          actorParticipantRecord(
+        this.actors.listOwned(true).map((actor) => {
+          const record = actorParticipantRecord(
             actor,
             this.config.rootId,
             this.hostId,
             this.identity.id,
             this.config.rootId,
-          ),
-        ),
+          );
+          const handoffRelease = (actor as FabricActorInfo & { actorHandoffRelease?: ActorHandoffRelease }).actorHandoffRelease;
+          return this.#transport?.kind === "nats" && handoffRelease ? { ...record, actorHandoffRelease: handoffRelease } : record;
+        }),
       );
       this.agents.subscribeUi(() => { this.participants.scheduleRefresh(); this.#scheduleIdleCheck(); });
       this.actors.subscribe(() => this.participants.scheduleRefresh());

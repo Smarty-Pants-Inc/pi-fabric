@@ -1091,6 +1091,91 @@ Shared state keeps a persistent revision clock (`highWater` in the mesh `state.j
 
 If `state.json` is empty or unparseable, reads return an empty table and every write fails with `invalid state format`. This barrier keeps Fabric from issuing a revision that an earlier caller still holds. To repair a root, stop every Fabric process that uses it, inspect the file, fix it or move it aside, and then start the processes again. Moving the file aside restarts revisions. That is safe only while no process runs, because each process reads fresh revisions after it starts.
 
+### NATS events: alpha
+
+`mesh.nats.events` **defaults to false**. With `mesh.transport: "nats"`, opt in
+with the keys below, added to the existing complete NATS configuration (TLS,
+credentials, machine inventory and custody/liveness policy remain required):
+
+```json
+{ "mesh": { "nats": { "events": true, "org": "smarty-pants-inc", "provision": false } } }
+```
+
+`mesh.nats.org` is a GitHub login slug, required when events are enabled. The
+active values are `smarty-pants-inc` and `versehq` (Playful's login is `versehq`,
+not `playful`). Values are 1–63 lowercase letters, digits or hyphens, starting
+with a letter or digit; `sys` is reserved. Stream names uppercase the slug and
+replace hyphens with `_`. `mesh.nats.provision` **defaults to false**;
+both flags must be booleans. FILE transport keeps them off. In NATS mode the
+existing `PI_FABRIC_MESH_NATS` replacement snapshot supplies these keys when
+present.
+
+**Two streams, no overlap:** `FABRIC_EV_SMARTY_PANTS_INC` owns only
+`fabric.ev.smarty-pants-inc.>`; `GITHUB_SMARTY_PANTS_INC` is the existing
+fabric-store stream for `github.smarty-pants-inc.>`. The equivalent names for
+`versehq` are `FABRIC_EV_VERSEHQ` and `GITHUB_VERSEHQ`. Fabric-store creates the
+event stream with admin credentials: Limits retention, DiscardNew, 2 GiB max,
+File storage, one replica, no age expiry, and a two-minute duplicate window.
+Runtime provisioning verifies this exact existing policy; runtime credentials do
+not need stream-create authority. `mesh.nats.provision` only opts an explicit
+provisioning path in; it grants no NATS authority. Missing/incompatible streams
+or permission failures surface and never fall back to FILE.
+
+**Subjects and actor durables:** plain Fabric topic `T` publishes unchanged as
+`fabric.ev.<org>.<T>`, with no machine prefix or topic hash. A topic beginning
+`github.<org>.` is consumed from the existing `GITHUB_<ORG>` stream; other Fabric
+topics use `FABRIC_EV_<ORG>`. Each actor has a pull durable per stream it uses:
+`ev_<hash(actorId)>` and, when it subscribes to GitHub topics, `gh_<hash(actorId)>`.
+A Fabric durable also includes its exact wake subject
+`fabric.ev.<org>.wake.<actorId>`, so factory stall-wakes arrive as ordinary
+NATS events. `agents.create({ eventsStartAt })` accepts epoch milliseconds or an
+ISO-8601 timestamp and sets `DeliverPolicy.StartTime` only when each durable is
+first created. If omitted, `DeliverPolicy.All` replays all retained events;
+reopening or changing topics does not reset the cursor.
+
+| Purpose | Subject |
+|---|---|
+| Fabric topic `fleet.work` in org `smarty-pants-inc` | `fabric.ev.smarty-pants-inc.fleet.work` |
+| Actor wake for `<actorId>` | `fabric.ev.smarty-pants-inc.wake.<actorId>` |
+| Raw GitHub ingress fact (separate factory authority) | `github.<org>.<repo>.<event>.<action>.<n>` |
+| GitHub review projection | `github.<org>.<repo>.pulls.shard<K>of<N>` |
+
+Both Path B template APIs take optional fourth argument `{ events: true, org }`.
+The runtime agent may publish only `fabric.ev.<org>.>`; it may use consumer
+CREATE/INFO/MSG.NEXT/DELETE and ACK subjects on both
+`FABRIC_EV_<ORG>` and `GITHUB_<ORG>`. It receives no `github.>` publish or stream
+administration grant. The publisher's stream-wide sequence CAS and lost-ACK
+read-back also require `STREAM.INFO` and `STREAM.MSG.GET` on `FABRIC_EV_<ORG>`;
+changing topic filters requires `CONSUMER.UPDATE` on the actor's event and GitHub
+durables. These exact additions are pending product-owner approval; event-mode
+runtime publishing and filter changes remain blocked until approved and minted.
+Absent/false preserves existing grants, and the operator gains no event rights.
+Minting and exact `USER.INFO` verification use the same options.
+
+Mail services can publish through the plain-Node CLI:
+
+```sh
+pi-fabric events publish --topic mail.inbound --id <message-id> --data-file ./event.json \
+  --creds /run/fabric/nats/user.creds --ca /etc/fabric/nats/ca.pem \
+  --servers tls://nats.example:4222 --org smarty-pants-inc
+```
+
+Provide exactly one of `--data` or `--data-file`; JSON input is limited to 1 MiB.
+The CLI requires an already-provisioned stream and publishes an external,
+untrusted `mail-service` event. Its output is only `{stream, seq, duplicate}`.
+With `--id`, retry using the same topic and JSON data: the original stored event
+is returned even if the CLI's generated `createdAt` differs. Reusing an ID with
+different event content fails; it does not silently suppress the new content.
+Without `--id`, the CLI generates a new ID, so callers cannot safely retry the
+same logical event.
+
+**Accepted alpha security gap:** one shared NATS user per org has broad consumer
+rights: a holder can read either stream and create/delete another actor's
+consumer, and can forge events on `fabric.ev.<org>.>`. Filters and actor names
+are conventions, not authorization boundaries; `mesh.nats.org` is not signed
+identity. [smarty-dev#15355](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/15355)
+tracks this gap. Per-actor signed tags and authorization hardening are deferred.
+
 ## Records
 
 `records` (off by default) connects Fabric to the org's records service for `records.*`: `enabled`, `socket` (the

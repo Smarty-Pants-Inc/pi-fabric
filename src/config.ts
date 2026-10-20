@@ -10,6 +10,7 @@ export type { FabricAgentRouterConfig } from "./agents/router-config.js";
 import { normalizeAgentPlacement, type AgentPlacementConfig } from "./agents/placement-config.js";
 import { normalizePlacementApiConfig, type PlacementApiConfig } from "./placement/config.js";
 export type { PlacementApiConfig } from "./placement/config.js";
+import type { SandboxTransportConfig } from "./transport/sandbox/types.js";
 import { normalizeWakeTextConfig, type FabricWakeTextConfig } from "./actors/wake-text.js";
 import type { LandlockSettings } from "./core/landlock.js";
 import { DEFAULT_JEV_CONFIG, normalizeJevConfig, type FabricJevConfig } from "./jev/config.js";
@@ -53,6 +54,7 @@ type FabricApprovalMode = "allow" | "ask" | "auto" | "deny";
 export type FabricAgentTransport =
   | "auto"
   | "process"
+  | "sandbox"
   | "tmux"
   | "screen"
   | "localterm"
@@ -252,6 +254,7 @@ export interface FabricAgentConfig {
   processMemoryMaxBytes?: number;
   /** Host-only opt-in process task placement; workspace files cannot override it. */
   placement?: AgentPlacementConfig;
+  sandbox: SandboxTransportConfig;
   /** Host-only Placement API client; absent means the legacy path is unchanged. */
   placementApi?: PlacementApiConfig;
   /** User/workspace Pi default; package defaults intentionally leave this unset. */
@@ -565,7 +568,7 @@ const meshNatsEphemeralInactiveSeconds = (value: unknown): number => {
 /** Messaging/rollback settings fail visibly in the same typed config-error family as E9. */
 export class FabricMeshNatsConfigError extends Error {
   readonly code = "FABRIC_MESH_TRANSPORT_CONFIG";
-  constructor(readonly field: "operatorMachine" | "rollbackHoldUntil" | "servers" | "custodyStream" | "livenessStream" | "pathBMachines" | "tls" | "org" | "allowInsecureLoopback" | "verifyMachine" | "ephemeralHost" | "ephemeralInactiveSeconds", requirement: string) {
+  constructor(readonly field: "operatorMachine" | "rollbackHoldUntil" | "servers" | "custodyStream" | "livenessStream" | "pathBMachines" | "tls" | "org" | "allowInsecureLoopback" | "verifyMachine" | "ephemeralHost" | "ephemeralInactiveSeconds" | "events" | "provision", requirement: string) {
     super(`mesh.nats.${field} ${requirement}`);
     this.name = "FabricMeshNatsConfigError";
   }
@@ -574,6 +577,12 @@ export class FabricMeshNatsConfigError extends Error {
 export interface FabricMeshNatsConfig {
   /** Stream num_replicas on create; an existing stream with a different count is refused (default 1). */
   replicas: number;
+  /** Opt-in NATS event log; normalized configs supply false. */
+  events?: boolean;
+  /** Org slug for event and service subjects; required when events is true or a session channel is opened. */
+  org?: string;
+  /** Explicit event-stream provisioning gate; normalized configs supply false. Does not grant admin rights. */
+  provision?: boolean;
   /** Messaging connection settings. No credential is read while loading config. */
   servers?: string | string[];
   /** Required literal policy mapping in NATS mode; full permission verification stays in the lazy adapter. */
@@ -583,8 +592,6 @@ export interface FabricMeshNatsConfig {
   pathBMachines?: string[];
   /** Required trust anchor in NATS mode. Config never reads the CA or permits verification overrides. */
   tls?: { ca?: string; caFile?: string };
-  /** Organization token used by the Fabric session-channel subjects. Required only when opening a channel. */
-  org?: string;
   /** Host credential file path, consumed only by the NATS adapter. */
   credentials?: string;
   /** Literal machine id; the adapter must also verify it against the credential. */
@@ -600,6 +607,18 @@ export interface FabricMeshNatsConfig {
   /** Server-side durable idle expiration in seconds when ephemeralHost is enabled (300..86400, default 3600). */
   ephemeralInactiveSeconds?: number;
 }
+
+const meshNatsFlag = (value: unknown, field: "events" | "provision"): boolean => {
+  if (value === undefined) return false;
+  if (typeof value === "boolean") return value;
+  throw new FabricMeshNatsConfigError(field, "must be a boolean");
+};
+
+const meshNatsOrg = (value: unknown, events = false): string | undefined => {
+  if (value === undefined && !events) return undefined;
+  if (typeof value === "string" && /^[a-z0-9][a-z0-9-]{0,62}$/.exec(value)?.[0] === value && value !== "sys") return value;
+  throw new FabricMeshNatsConfigError("org", "must be a non-sys org slug (1..63 lowercase letters, digits or hyphens, starting with a letter or digit); required when events is true");
+};
 
 const meshNatsString = (value: unknown, field: "credentials" | "machine"): string | undefined => {
   if (value === undefined) return undefined;
@@ -655,14 +674,6 @@ const meshNatsPathBMachines = (value: unknown): string[] => {
   return [...value] as string[];
 };
 
-const meshNatsOrg = (value: unknown): string | undefined => {
-  if (value === undefined) return undefined;
-  if (typeof value !== "string" || /^[a-z0-9][a-z0-9-]{0,62}$/.exec(value)?.[0] !== value) {
-    throw new FabricMeshNatsConfigError("org", "must match /^[a-z0-9][a-z0-9-]{0,62}$/");
-  }
-  return value;
-};
-
 const meshNatsTls = (value: unknown): NonNullable<FabricMeshNatsConfig["tls"]> => {
   if (!isJsonObject(value) || ![Object.prototype, null].includes(Object.getPrototypeOf(value)) ||
     Reflect.ownKeys(value).some(key => key !== "ca" && key !== "caFile")) {
@@ -716,7 +727,7 @@ const meshNatsConfig = (value: unknown, transport: FabricMeshTransport): FabricM
     const machine = meshNatsString(nats.machine, "machine");
     const rollbackHoldUntil = meshNatsRollbackHoldUntil(nats.rollbackHoldUntil);
     return {
-      replicas: meshNatsReplicas(nats.replicas), inboxLanes: 8,
+      replicas: meshNatsReplicas(nats.replicas), inboxLanes: 8, events: false, provision: false,
       ephemeralHost: meshNatsEphemeralHost(nats.ephemeralHost),
       ephemeralInactiveSeconds: meshNatsEphemeralInactiveSeconds(nats.ephemeralInactiveSeconds),
       ...(machine !== undefined ? { machine } : {}),
@@ -736,6 +747,9 @@ const meshNatsConfig = (value: unknown, transport: FabricMeshTransport): FabricM
   for (const field of ["allowInsecureLoopback", "verifyMachine"] as const) {
     if (field in nats || field in messaging) throw new FabricMeshNatsConfigError(field, "is not supported in NATS config");
   }
+  const events = meshNatsFlag(messaging.events, "events");
+  const org = meshNatsOrg(messaging.org, events);
+  const provision = meshNatsFlag(messaging.provision, "provision");
   const servers = meshNatsServers(messaging.servers);
   const custodyStream = meshNatsStream(messaging.custodyStream, "custodyStream");
   const livenessStream = meshNatsStream(messaging.livenessStream, "livenessStream");
@@ -746,7 +760,6 @@ const meshNatsConfig = (value: unknown, transport: FabricMeshTransport): FabricM
   const tls = meshNatsTls(messaging.tls);
   const ephemeralHost = meshNatsEphemeralHost(messaging.ephemeralHost);
   const ephemeralInactiveSeconds = meshNatsEphemeralInactiveSeconds(messaging.ephemeralInactiveSeconds);
-  const org = meshNatsOrg(messaging.org);
   const credentials = meshNatsString(messaging.credentials, "credentials");
   const machine = meshNatsString(messaging.machine, "machine");
   const operatorMachine = validateFabricNatsOperatorMachine(messaging.operatorMachine, machine);
@@ -754,6 +767,7 @@ const meshNatsConfig = (value: unknown, transport: FabricMeshTransport): FabricM
   return {
     replicas: meshNatsReplicas(nats.replicas),
     servers, custodyStream, livenessStream, pathBMachines, tls,
+    events, provision,
     ...(org !== undefined ? { org } : {}),
     ...(credentials !== undefined ? { credentials } : {}),
     ...(machine !== undefined ? { machine } : {}),
@@ -1033,6 +1047,7 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     runner: "pi",
     transport: "process",
     processMemoryMaxBytes: DEFAULT_PROCESS_MEMORY_MAX_BYTES,
+    sandbox: { enabled: false, template: "smarty-proof-agent", readyTimeoutMs: 90_000 },
     deniedModels: [],
     modelExceptionsPath: MODEL_EXCEPTIONS_PATH,
     modelPolicy: {
@@ -1122,7 +1137,7 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     lockProtocol: 1,
     stateBackend: "file",
     transport: "file",
-    nats: { replicas: 1, inboxLanes: 8, ephemeralHost: false, ephemeralInactiveSeconds: 3_600 },
+    nats: { replicas: 1, inboxLanes: 8, events: false, provision: false, ephemeralHost: false, ephemeralInactiveSeconds: 3_600 },
     enabled: true,
     announce: false,
     actorScope: "project",
@@ -1329,12 +1344,27 @@ const prewalkModeValue = (
 ): FabricPrewalkMode =>
   value === "in-place" || value === "trajectory" ? value : fallback;
 
+const sandboxPlacementUrlValue = (value: unknown): string => {
+  const candidate = value === undefined ? "http://smarty-placement.smarty-island.svc:8080" : value;
+  if (typeof candidate !== "string" || candidate.length > 512) throw new Error("Invalid agents.sandbox.placementUrl");
+  let url: URL;
+  try { url = new URL(candidate); } catch { throw new Error("Invalid agents.sandbox.placementUrl"); }
+  const octets = url.hostname.split(".");
+  const tailnetIp = octets.length === 4 && octets.every(part => /^\d{1,3}$/u.test(part) && Number(part) <= 255) &&
+    Number(octets[0]) === 100 && Number(octets[1]) >= 64 && Number(octets[1]) <= 127;
+  const service = url.hostname === "smarty-placement.smarty-island.svc" && url.port === "8080";
+  if (url.protocol !== "http:" || url.username || url.password || url.pathname !== "/" || url.search || url.hash ||
+    !(service || tailnetIp && url.port === "30880")) throw new Error("agents.sandbox.placementUrl must use the in-cluster HTTP endpoint or a tailnet IPv4 NodePort");
+  return url.origin;
+};
+
 const transportValue = (
   value: unknown,
   fallback: FabricAgentTransport,
 ): FabricAgentTransport =>
   value === "auto" ||
   value === "process" ||
+  value === "sandbox" ||
   value === "tmux" ||
   value === "screen" ||
   value === "localterm" ||
@@ -1492,6 +1522,16 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
   const prewalk = objectValue(input.prewalk);
   const agents = objectValue(input.agents);
   const placement = normalizeAgentPlacement(agents.placement);
+  const sandbox = objectValue(agents.sandbox);
+  const sandboxTemplate = sandbox.template === undefined ? DEFAULT_FABRIC_CONFIG.agents.sandbox.template
+    : typeof sandbox.template === "string" && /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/u.test(sandbox.template)
+      ? sandbox.template : (() => { throw new Error("Invalid agents.sandbox.template"); })();
+  const sandboxConfig: SandboxTransportConfig = {
+    enabled: booleanValue(sandbox.enabled, DEFAULT_FABRIC_CONFIG.agents.sandbox.enabled),
+    template: sandboxTemplate,
+    ...(sandbox.placementUrl !== undefined ? { placementUrl: sandboxPlacementUrlValue(sandbox.placementUrl) } : {}),
+    readyTimeoutMs: boundedInteger(sandbox.readyTimeoutMs, DEFAULT_FABRIC_CONFIG.agents.sandbox.readyTimeoutMs, 1_000, 90_000),
+  };
   const placementApi = normalizePlacementApiConfig(agents.placementApi);
   const claude = objectValue(agents.claude);
   const veda = objectValue(agents.veda);
@@ -1812,6 +1852,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
         ? { processSlice: agents.processSlice } : {}),
       processMemoryMaxBytes: processMemoryMaxBytesValue(agents.processMemoryMaxBytes),
       ...(placement ? { placement } : {}),
+      sandbox: sandboxConfig,
       ...(placementApi ? { placementApi } : {}),
       ...(router ? { router } : {}),
       ...(agentModel ? { model: agentModel } : {}),
@@ -2476,6 +2517,7 @@ const resolveFabricConfig = (
       agents: {
         ...(Object.hasOwn(agents, "processSlice") ? { processSlice: agents.processSlice } : {}),
         ...(Object.hasOwn(agents, "processMemoryMaxBytes") ? { processMemoryMaxBytes: agents.processMemoryMaxBytes } : {}),
+        ...(Object.hasOwn(agents, "sandbox") ? { sandbox: agents.sandbox } : {}),
         ...(Array.isArray(agents.deniedModels) ? { deniedModels: agents.deniedModels } : {}),
         ...(Array.isArray(requireReason) ? { modelPolicy: { requireReason } } : {}),
       },
@@ -2507,6 +2549,7 @@ const resolveFabricConfig = (
       const agents = { ...objectValue(document.agents) };
       delete agents.processSlice;
       delete agents.processMemoryMaxBytes; // Root-policy-only, like processSlice.
+      delete agents.sandbox; // Root-policy-only: only the host policy can enable island execution.
       const inheritedAgents = objectValue(merged.agents);
       // Agent-writable lists can add restrictions, never remove a root/default gate.
       const union = (base: unknown, extra: unknown): unknown[] => [
@@ -2531,6 +2574,7 @@ const resolveFabricConfig = (
       delete agents.processSlice;
       delete agents.processMemoryMaxBytes;
       delete agents.placement;
+      delete agents.sandbox; // Host-only: a lane cannot enable island execution.
       delete agents.placementApi; // Host-only Placement endpoint and timeouts.
       delete agents.deadRootFilter; // Host-only: a lane cannot drop the fleet's exemptions.
       delete agents.stuckPreparingMs; // Host-only: a lane cannot silence the stuck-preparing owner notice.

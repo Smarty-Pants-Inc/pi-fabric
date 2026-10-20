@@ -296,6 +296,13 @@ jobs:
         if: matrix.profile == 'cluster'
         # The fixture owns another three-node cluster on unique ports, so only its own leader is paused.
         run: bunx vitest run --retry=0 tests/state-backend-nats-election.test.ts
+      - name: Transport replicas and real R3 inbox delivery
+        if: matrix.profile == 'cluster'
+        # The test owns a separate three-node cluster and private scratch, not the shared conformance streams.
+        env:
+          NATS_EXPECTED_SERVER_VERSION: '2.14.7'
+          NATS_SERVER_REQUIRED: '1'
+        run: bunx vitest run --retry=0 tests/nats-transport-replicas.test.ts
       - name: Publish retry deduplication on R3
         if: matrix.profile == 'cluster'
         run: bunx vitest run --retry=0 tests/state-backend-nats-publish-dedupe.test.ts

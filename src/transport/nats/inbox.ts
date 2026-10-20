@@ -64,6 +64,8 @@ export interface NatsTransportOptions extends NatsPermissionPolicy {
   readonly credentials: string;
   readonly tls?: TlsOptions;
   readonly maxBytes?: number;
+  /** Leases, presence and inbox replicas; omitted preserves the single-replica policy. */
+  readonly replicas?: number;
   /** Inbox stream max_age in milliseconds. Existing maxAgeMs is a legacy direct-options alias. */
   readonly inboxMaxAgeMs?: number;
   readonly maxAgeMs?: number;
@@ -81,7 +83,7 @@ export interface NatsTransportOptions extends NatsPermissionPolicy {
 }
 
 type OpenOptions = NatsTransportOptions | FabricTransportOptions;
-type ResolvedNatsOptions = Required<Pick<NatsTransportOptions, "servers" | "machine" | "hostId" | "credentials" | "custodyStream" | "livenessStream" | "pathBMachines" | "maxBytes" | "maxMessageBytes" | "duplicateWindowMs" | "requestTimeoutMs" | "provision" | "ephemeralHost" | "ephemeralInactiveSeconds" | "inboxMaxAgeMs">> & {
+type ResolvedNatsOptions = Required<Pick<NatsTransportOptions, "servers" | "machine" | "hostId" | "credentials" | "custodyStream" | "livenessStream" | "pathBMachines" | "maxBytes" | "maxMessageBytes" | "duplicateWindowMs" | "requestTimeoutMs" | "provision" | "ephemeralHost" | "ephemeralInactiveSeconds" | "inboxMaxAgeMs" | "replicas">> & {
   readonly org?: string;
   readonly name?: string;
   readonly tls?: TlsOptions;
@@ -114,6 +116,7 @@ const normalizeOptions = (options: OpenOptions): ResolvedNatsOptions => {
       ...(options.org === undefined ? {} : { org: options.org }),
       ...(options.tls === undefined ? {} : { tls: options.tls }),
       maxBytes: options.maxBytes ?? DEFAULT_MAX_BYTES,
+      replicas: options.replicas === undefined ? 1 : options.replicas,
       maxMessageBytes: options.maxMessageBytes ?? DEFAULT_MAX_MESSAGE_BYTES,
       duplicateWindowMs: options.duplicateWindowMs ?? DEFAULT_DUPLICATE_WINDOW_MS,
       requestTimeoutMs: options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
@@ -130,7 +133,7 @@ const normalizeOptions = (options: OpenOptions): ResolvedNatsOptions => {
   const config = options.config as unknown as { nats?: {
     servers?: string | readonly string[]; machine?: string; credentials?: string;
     custodyStream?: string; livenessStream?: string; pathBMachines?: readonly string[]; org?: string; tls?: TlsOptions;
-    ephemeralHost?: boolean; ephemeralInactiveSeconds?: number; inboxMaxAgeMs?: number; events?: boolean; provision?: boolean;
+    ephemeralHost?: boolean; ephemeralInactiveSeconds?: number; inboxMaxAgeMs?: number; events?: boolean; provision?: boolean; replicas?: number;
   } };
   const nats = config.nats;
   // Production config never enables plaintext; the loopback opt-in is a direct test option only.
@@ -154,6 +157,7 @@ const normalizeOptions = (options: OpenOptions): ResolvedNatsOptions => {
     ...(nats?.org === undefined ? {} : { org: nats.org }),
     ...(nats?.tls === undefined ? {} : { tls: nats.tls }),
     maxBytes: DEFAULT_MAX_BYTES,
+    replicas: nats?.replicas === undefined ? 1 : nats.replicas,
     maxMessageBytes: DEFAULT_MAX_MESSAGE_BYTES,
     duplicateWindowMs: DEFAULT_DUPLICATE_WINDOW_MS,
     requestTimeoutMs: 5_000,
@@ -174,7 +178,7 @@ const streamPolicy = (name: string, subjects: readonly string[], options: Resolv
   maxAgeMs: overrides.maxAgeMs ?? options.inboxMaxAgeMs,
   maxMessageBytes: overrides.maxMessageBytes ?? options.maxMessageBytes,
   duplicateWindowMs: overrides.duplicateWindowMs ?? options.duplicateWindowMs,
-  replicas: 1,
+  replicas: overrides.replicas ?? options.replicas,
 });
 
 const transportConsumerPolicy = (options: ResolvedNatsOptions): TransportConsumerPolicy => ({
@@ -241,12 +245,13 @@ const openNatsSession = async (options: ResolvedNatsOptions, signal?: AbortSigna
         maxAgeMs: 30 * 24 * 60 * 60 * 1_000,
         maxBytes: Math.max(options.maxBytes, 64 * 1024 * 1024),
         maxMessageBytes: 64 * 1024,
+        replicas: 1,
       }), true);
       assertAlive();
     }
-    const leases = await openNatsKvForMachine(connection.js, "leases", options.machine, options.provision, connection.onStatus);
+    const leases = await openNatsKvForMachine(connection.js, "leases", options.machine, options.provision, connection.onStatus, options.replicas);
     assertAlive();
-    const presence = await openNatsKvForMachine(connection.js, "presence", options.machine, options.provision, connection.onStatus);
+    const presence = await openNatsKvForMachine(connection.js, "presence", options.machine, options.provision, connection.onStatus, options.replicas);
     assertAlive();
     await ensureTransportStream(manager, {
       ...streamPolicy(transportInboxStream(options.machine), [transportInboxStreamSubject(options.machine)], options),
@@ -272,6 +277,10 @@ const openNatsSession = async (options: ResolvedNatsOptions, signal?: AbortSigna
   } catch (error) {
     await connection.close().catch(() => undefined);
     signal?.throwIfAborted();
+    // provision.ts owns the exact checks; type only this inbox's refusal, not advisory/event failures.
+    if (error instanceof Error && error.message === `NATS stream configuration mismatch: ${transportInboxStream(options.machine)}`) {
+      throw new TransportInvalidError(error.message, { cause: error });
+    }
     throw error;
   }
 };
@@ -417,6 +426,9 @@ class NatsTransportImpl implements FabricTransport {
     if (!options.hostId) throw new Error("hostId is required");
     if (typeof options.events !== "boolean") throw new Error("NATS transport events must be a boolean");
     if (options.events && (!options.org || !options.mesh)) throw new Error("NATS transport events require org and mesh");
+    if (!Number.isSafeInteger(options.replicas) || options.replicas <= 0) {
+      throw new TransportInvalidError("NATS transport replicas must be a positive safe integer");
+    }
     for (const [key, value] of Object.entries(options)) {
       if (["servers", "machine", "hostId", "name", "credentials", "ephemeralHost"].includes(key)) continue;
       if (typeof value === "number" && (!Number.isSafeInteger(value) || value <= 0)) throw new Error(`${key} must be positive`);

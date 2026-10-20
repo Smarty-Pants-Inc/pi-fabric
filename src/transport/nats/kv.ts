@@ -35,6 +35,7 @@ export interface NatsKvPolicy {
   readonly bucket: string;
   readonly ttlMs?: number;
   readonly markerTtlMs?: number;
+  readonly replicas?: number;
 }
 
 const apiCode = (error: unknown): number | undefined => error instanceof JetStreamApiError ? error.apiError().err_code : undefined;
@@ -110,9 +111,9 @@ const decode = <V>(entry: KvEntry): TransportKvEntry<V> => decodeValue(entry.key
 const assertPolicy = async (bucket: KV, policy: Required<NatsKvPolicy>): Promise<void> => {
   const status = await bucket.status();
   if (status.ttl !== policy.ttlMs || status.history !== 1 || status.markerTTL !== policy.markerTtlMs ||
-    status.storage !== StorageType.File || status.replicas !== 1 || status.maxValueSize !== KV_MAX_VALUE_SIZE ||
+    status.storage !== StorageType.File || status.replicas !== policy.replicas || status.maxValueSize !== KV_MAX_VALUE_SIZE ||
     status.streamInfo.config.allow_direct !== false) {
-    throw new Error(`NATS KV configuration mismatch: ${policy.bucket}`);
+    throw new TransportInvalidError(`NATS KV configuration mismatch: ${policy.bucket}`);
   }
 };
 
@@ -121,9 +122,13 @@ export const openNatsKv = async (js: JetStreamClient, policy: NatsKvPolicy, prov
     bucket: policy.bucket,
     ttlMs: policy.ttlMs ?? (policy.bucket === PRESENCE_BUCKET ? PRESENCE_TTL_MS : LEASE_TTL_MS),
     markerTtlMs: policy.markerTtlMs ?? KV_MARKER_TTL_MS,
+    replicas: policy.replicas === undefined ? 1 : policy.replicas,
   };
   if (![resolved.ttlMs, resolved.markerTtlMs].every((value) => Number.isSafeInteger(value) && value > 0)) {
     throw new TransportInvalidError("KV TTL values must be positive integers");
+  }
+  if (!Number.isSafeInteger(resolved.replicas) || resolved.replicas <= 0) {
+    throw new TransportInvalidError("KV replicas must be a positive safe integer");
   }
   const manager = new Kvm(js);
   const options = {
@@ -132,7 +137,7 @@ export const openNatsKv = async (js: JetStreamClient, policy: NatsKvPolicy, prov
     history: 1,
     maxValueSize: KV_MAX_VALUE_SIZE,
     storage: StorageType.File,
-    replicas: 1,
+    replicas: resolved.replicas,
     allow_direct: false,
   };
   const bucket = provision ? await manager.create(resolved.bucket, options) : await manager.open(resolved.bucket, options);
@@ -148,9 +153,9 @@ export class NatsKvStore implements TransportKv {
   readonly #onStatus: SubscribeNatsStatus | undefined;
   #machine = "";
 
-  constructor(bucket: KV, policy: Required<NatsKvPolicy>, js: JetStreamClient, onStatus?: SubscribeNatsStatus) {
+  constructor(bucket: KV, policy: Required<Omit<NatsKvPolicy, "replicas">> & Pick<NatsKvPolicy, "replicas">, js: JetStreamClient, onStatus?: SubscribeNatsStatus) {
     this.#bucket = bucket;
-    this.#policy = policy;
+    this.#policy = { ...policy, replicas: policy.replicas === undefined ? 1 : policy.replicas };
     this.#js = js;
     this.#onStatus = onStatus;
     this.ttlMs = policy.ttlMs;
@@ -455,7 +460,7 @@ export class NatsKvStore implements TransportKv {
   }
 }
 
-export const openNatsKvForMachine = async (js: JetStreamClient, bucket: "leases" | "presence", machine: string, provision = true, onStatus?: SubscribeNatsStatus): Promise<NatsKvStore> => {
+export const openNatsKvForMachine = async (js: JetStreamClient, bucket: "leases" | "presence", machine: string, provision = true, onStatus?: SubscribeNatsStatus, replicas = 1): Promise<NatsKvStore> => {
   validateMachine(machine);
-  return (await openNatsKv(js, { bucket: bucket === "leases" ? LEASES_BUCKET : PRESENCE_BUCKET }, provision, onStatus)).withMachine(machine);
+  return (await openNatsKv(js, { bucket: bucket === "leases" ? LEASES_BUCKET : PRESENCE_BUCKET, replicas }, provision, onStatus)).withMachine(machine);
 };

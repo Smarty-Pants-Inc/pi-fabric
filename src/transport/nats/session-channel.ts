@@ -186,12 +186,21 @@ export class NatsSessionChannelManager {
     if (typeof identity.sessionGeneration !== "string" || identity.sessionGeneration.length === 0) throw new Error("session channel sessionGeneration is required");
   }
 
+  #isVerified(connection = this.#connection): boolean {
+    if (!connection || this.#connection !== connection) return false;
+    const check = (connection as NatsConnection & { isVerified?: () => boolean }).isVerified;
+    return typeof check !== "function" || check.call(connection);
+  }
+
   #bind(record: ChannelRecord): void {
     const connection = this.#connection;
     if (!connection || this.#closed || record.closed) return;
     const subject = sessionChannelRequestSubject({ ...record.identity, service: record.service }, "*");
     const subscription = connection.subscribe(subject, {
-      callback: (_error, message) => { void this.#receive(record, message).catch(() => undefined); },
+      callback: (_error, message) => {
+        if (this.#connection !== connection || !this.#isVerified()) return;
+        void this.#receive(record, message).catch(() => undefined);
+      },
     });
     record.subscription = subscription;
   }
@@ -226,19 +235,20 @@ export class NatsSessionChannelManager {
   }
 
   async #receive(record: ChannelRecord, message: Msg): Promise<void> {
-    if (record.closed || !message.reply) return;
+    const connection = this.#connection;
+    if (!connection || record.closed || !message.reply || !this.#isVerified(connection)) return;
     const caller = this.#readCaller(message);
     if (!caller) {
-      this.#respond(message, 400, { error: "invalid request" });
+      this.#respond(message, 400, { error: "invalid request" }, connection);
       return;
     }
     const requestId = message.headers?.get("Fabric-Request-Id") ?? "";
     if (!matches(REQUEST_ID, requestId)) {
-      this.#respond(message, 400, { error: "missing request id" });
+      this.#respond(message, 400, { error: "missing request id" }, connection);
       return;
     }
     if (message.data.byteLength > SESSION_CHANNEL_REQUEST_LIMIT) {
-      this.#respond(message, 413, { error: "request too large" });
+      this.#respond(message, 413, { error: "request too large" }, connection);
       return;
     }
 
@@ -249,7 +259,7 @@ export class NatsSessionChannelManager {
     if (prior) {
       this.#touchDedupe(dedupeKey, prior);
       const bytes = prior.response ?? await prior.pending;
-      if (bytes) message.respond(bytes);
+      if (bytes) this.#respondMessage(message, bytes, connection);
       return;
     }
     if (!this.#makeDedupeRoom()) return; // Bounded in-flight custody: no reply means caller outcome is unknown.
@@ -269,7 +279,7 @@ export class NatsSessionChannelManager {
     });
     this.#touchDedupe(dedupeKey, entry);
     const bytes = await entry.pending;
-    if (bytes) message.respond(bytes);
+    if (bytes) this.#respondMessage(message, bytes, connection);
   }
 
   #readCaller(message: Msg): CallerIdentity | undefined {
@@ -306,7 +316,12 @@ export class NatsSessionChannelManager {
     }
   }
 
-  #respond(message: Msg, status: number, body: unknown): void {
-    try { message.respond(replyBytes(status, body)); } catch { /* No raw handler or serialization error reaches the wire. */ }
+  #respond(message: Msg, status: number, body: unknown, connection: NatsConnection): void {
+    this.#respondMessage(message, replyBytes(status, body), connection);
+  }
+
+  #respondMessage(message: Msg, bytes: Uint8Array, connection: NatsConnection): void {
+    if (!this.#isVerified(connection)) return;
+    try { message.respond(bytes); } catch { /* No raw handler or serialization error reaches the wire. */ }
   }
 }

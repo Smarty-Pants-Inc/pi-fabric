@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
   DeliverPolicy,
   jetstream,
@@ -9,8 +10,10 @@ import {
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { openNatsConnection, type NatsConnectionHandle } from "../src/transport/nats/connection.js";
 import { openNatsTransport } from "../src/transport/nats/inbox.js";
+import { KvParticipantDirectory } from "../src/topology/participant-view.js";
+import type { FabricKvHostLease, FabricParticipantRecord } from "../src/topology/types.js";
 import { openNatsKv, openNatsKvForMachine, type NatsKvStore } from "../src/transport/nats/kv.js";
-import type { TransportKvEvent } from "../src/transport/types.js";
+import { TransportUnavailableError, type TransportKvEvent } from "../src/transport/types.js";
 import { ensureTransportStream } from "../src/transport/nats/provision.js";
 import { transportInboxStream, transportInboxStreamSubject } from "../src/transport/nats/subjects.js";
 import { createPathBHarness, resolveNatsBinary, type PathBHarness } from "./helpers/nats-cluster.js";
@@ -23,6 +26,7 @@ const A = "machine-a";
 const B = "machine-b";
 const OWNER = "runtime-watch#one";
 const STREAM = "KV_fabric_presence";
+const wait = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 const deferred = <T>() => {
   let resolve!: (value: T) => void;
   const promise = new Promise<T>((done) => { resolve = done; });
@@ -110,6 +114,8 @@ describe.skipIf(!binary)("real authenticated NATS KV snapshot/ready/reset", () =
     await openNatsKvForMachine(js, "leases", A);
     await openNatsKvForMachine(js, "presence", A);
     await ensureTransportStream(manager, { name: transportInboxStream(A), subjects: [transportInboxStreamSubject(A)],
+      maxBytes: 1_073_741_824, maxAgeMs: 0, maxMessageBytes: 1_048_576, duplicateWindowMs: 600_000, replicas: 1 });
+    await ensureTransportStream(manager, { name: transportInboxStream(B), subjects: [transportInboxStreamSubject(B)],
       maxBytes: 1_073_741_824, maxAgeMs: 0, maxMessageBytes: 1_048_576, duplicateWindowMs: 600_000, replicas: 1 });
   }, 30_000);
 
@@ -249,6 +255,92 @@ describe.skipIf(!binary)("real authenticated NATS KV snapshot/ready/reset", () =
       } finally { await restart; }
     } finally { await transport.close(); }
   }, 40_000);
+
+  it("recovers both participant directories, KV watches and routed sends after a real same-store server restart", async () => {
+    const mainId = "session:directory-restart-main", callerId = "session:directory-restart-caller";
+    const mainIncarnation = "restart-main-1", callerIncarnation = "restart-caller-1";
+    const mainTransport = await openNatsTransport({ ...harness.runtimeOptions(harness.users.machineA), hostId: mainId });
+    const callerTransport = await openNatsTransport({ ...harness.runtimeOptions(harness.users.machineB), hostId: callerId });
+    const mainLeaseAbort = new AbortController(), callerLeaseAbort = new AbortController();
+    const mainGate = { live: () => true, signal: mainLeaseAbort.signal };
+    const callerGate = { live: () => true, signal: callerLeaseAbort.signal };
+    const mainDirectory = new KvParticipantDirectory({ transport: mainTransport, lease: mainGate,
+      identityId: mainId, rootId: mainId, ownerIncarnation: mainIncarnation });
+    const callerDirectory = new KvParticipantDirectory({ transport: callerTransport, lease: callerGate,
+      identityId: callerId, rootId: callerId, ownerIncarnation: callerIncarnation });
+    const inboxAbort = new AbortController();
+    let inbox: AsyncIterator<import("../src/transport/types.js").TransportDelivery<import("../src/transport/types.js").TransportEnvelope>> | undefined;
+    const token = (id: string) => createHash("sha256").update(id).digest("hex").slice(0, 32);
+    const now = Date.now();
+    const record = (id: string, incarnation: string): FabricParticipantRecord => ({ format: 1, id, rootId: id,
+      kind: "root", ownerHostId: id, ownerIdentityId: id, ownerIncarnation: incarnation,
+      sessionId: id.slice("session:".length), name: id, status: "idle", runner: "pi", transport: "host",
+      capabilities: ["followUp"], controlProtocol: "v1", startedAt: now, updatedAt: now });
+    const lease = (id: string, incarnation: string): FabricKvHostLease => ({ id, identityId: id, rootId: id,
+      incarnation, pid: process.pid, pidStartTime: "12345", bootId: "directory-restart", updatedAt: now, expiresAt: now + 15_000 });
+    const publishParticipant = async (transport: typeof mainTransport, machine: string, id: string, incarnation: string) => {
+      const owner = `${id}#${incarnation}`;
+      await transport.kv("leases").put(`${machine}.h.${token(id)}`, owner, lease(id, incarnation), 0);
+      await transport.kv("presence").put(`${machine}.p.${token(id)}`, owner, record(id, incarnation), 0);
+    };
+    const waitFor = async (predicate: () => boolean, label: string, ms = 8_000): Promise<void> => {
+      const deadline = Date.now() + ms;
+      while (Date.now() < deadline) { if (predicate()) return; await wait(20); }
+      throw new Error(`timed out: ${label}`);
+    };
+    const makeEnvelope = (id: string) => ({ id, kind: "command" as const, to: { machine: A, hostId: mainId },
+      targetId: mainId, operation: "followUp", from: { id: callerId, name: "restart-caller", kind: "main" as const }, body: { id } });
+    const sendToMain = async (id: string) => {
+      const route = callerDirectory.resolve(mainId);
+      expect(route).toMatchObject({ machine: A, ownerHostId: mainId, live: true });
+      return callerTransport.send({ ...makeEnvelope(id), to: { machine: route!.machine, hostId: route!.ownerHostId } });
+    };
+    try {
+      mainDirectory.start(); callerDirectory.start();
+      await waitFor(() => mainDirectory.ready && callerDirectory.ready, "initial participant directory snapshots");
+      await publishParticipant(mainTransport, A, mainId, mainIncarnation);
+      await publishParticipant(callerTransport, B, callerId, callerIncarnation);
+      await waitFor(() => mainDirectory.resolve(callerId)?.live === true && callerDirectory.resolve(mainId)?.live === true,
+        "both participants become routable");
+      inbox = mainTransport.inbox(inboxAbort.signal)[Symbol.asyncIterator]();
+      const first = await sendToMain("directory-before-restart");
+      expect(first.duplicate).toBe(false);
+      const firstDelivery = (await bounded(inbox.next(), "pre-restart routed delivery")).value!;
+      expect(firstDelivery.payload.id).toBe("directory-before-restart");
+      await firstDelivery.ack();
+
+      const started = performance.now();
+      const restart = harness.restart();
+      try {
+        await bounded(waitFor(() => !mainDirectory.ready && !callerDirectory.ready, "both directories invalidate on disconnect", 8_000),
+          "directory invalidation", 9_000);
+        await expect(callerTransport.send(makeEnvelope("directory-during-restart")))
+          .rejects.toBeInstanceOf(TransportUnavailableError);
+        await bounded(restart, "owned nats-server restart with retained JetStream store", 25_000);
+        await bounded(waitFor(() => mainDirectory.ready && callerDirectory.ready, "both participant directories resnapshot", 10_000),
+          "directory recovery after broker restart", 10_500);
+        expect(performance.now() - started).toBeLessThan(10_000);
+        await waitFor(() => callerDirectory.resolve(mainId)?.live === true, "recovered route is live", 2_000);
+        const retry = await sendToMain("directory-after-restart");
+        const duplicate = await sendToMain("directory-after-restart");
+        expect(retry.duplicate).toBe(false);
+        expect(duplicate.duplicate).toBe(true);
+        const secondDelivery = (await bounded(inbox.next(), "post-restart routed delivery")).value!;
+        expect(secondDelivery.payload.id).toBe("directory-after-restart");
+        await secondDelivery.ack();
+        await expect(bounded(inbox.next(), "duplicate delivery counterexample", 250)).rejects.toThrow("timed out");
+        const inspector = await harness.connect(harness.users.bootstrap);
+        try {
+          const manager = await jetstreamManager(inspector);
+          expect((await manager.streams.info(transportInboxStream(A))).state.messages).toBe(2);
+        } finally { await inspector.close(); }
+      } finally { await restart; }
+    } finally {
+      inboxAbort.abort(); mainLeaseAbort.abort(); callerLeaseAbort.abort();
+      await inbox?.return?.();
+      await Promise.all([mainDirectory.close(), callerDirectory.close(), mainTransport.close(), callerTransport.close()]);
+    }
+  }, 50_000);
 
   it("keeps broker revision order for concurrent updates from both authenticated machines", async () => {
     const { store: a } = await presence(A);

@@ -111,20 +111,20 @@ if (entry.default) {
 `;
 
 const controls = ["PI_FABRIC_JEV_LIVE", "PI_FABRIC_JEV_LOCALTERM", "PI_FABRIC_ACTIVATION_TEST_PI_BINARY",
-  "PI_FABRIC_ACTIVATION_TEST_WORKER", "PI_FABRIC_TEST_PG_BIN", "PI_FABRIC_TEST_PID_DELAY_MS", "PI_FABRIC_NATS_REHEARSAL"];
+  "PI_FABRIC_ACTIVATION_TEST_WORKER", "PI_FABRIC_TEST_PG_BIN", "PI_FABRIC_TEST_PID_DELAY_MS", "PI_FABRIC_NATS_REHEARSAL", "PI_FABRIC_REQUIRE_NATS"];
 const optedIn = {
   PI_FABRIC_JEV_LIVE: "1", PI_FABRIC_JEV_LOCALTERM: "1", PI_FABRIC_NATS_REHEARSAL: "1",
   PI_FABRIC_ACTIVATION_TEST_PI_BINARY: "C:\\exact artifact\\[native].exe",
   PI_FABRIC_ACTIVATION_TEST_WORKER: "./exact artifact/[worker].js",
-  PI_FABRIC_TEST_PG_BIN: "./exact artifact/postgres bin", PI_FABRIC_TEST_PID_DELAY_MS: "600",
+  PI_FABRIC_TEST_PG_BIN: "./exact artifact/postgres bin", PI_FABRIC_TEST_PID_DELAY_MS: "600", PI_FABRIC_REQUIRE_NATS: "1",
 };
 for (const entry of ["vitest.config.cts", "tests/fleet-isolation-setup.ts"]) {
   test.each([
     ["live opt-in", { PI_FABRIC_JEV_LIVE: "1", PI_FABRIC_JEV_LOCALTERM: "1" }],
     ["exact artifacts", { PI_FABRIC_ACTIVATION_TEST_PI_BINARY: optedIn.PI_FABRIC_ACTIVATION_TEST_PI_BINARY, PI_FABRIC_ACTIVATION_TEST_WORKER: optedIn.PI_FABRIC_ACTIVATION_TEST_WORKER }],
     ["opt-in and exact artifacts", optedIn],
-    ["off", { PI_FABRIC_JEV_LIVE: "0", PI_FABRIC_JEV_LOCALTERM: "0", PI_FABRIC_TEST_PID_DELAY_MS: "0", PI_FABRIC_NATS_REHEARSAL: "0" }],
-    ["strict non-boolean strings", { PI_FABRIC_JEV_LIVE: "true", PI_FABRIC_JEV_LOCALTERM: "01", PI_FABRIC_TEST_PID_DELAY_MS: "-1", PI_FABRIC_NATS_REHEARSAL: "true" }],
+    ["off", { PI_FABRIC_JEV_LIVE: "0", PI_FABRIC_JEV_LOCALTERM: "0", PI_FABRIC_TEST_PID_DELAY_MS: "0", PI_FABRIC_NATS_REHEARSAL: "0", PI_FABRIC_REQUIRE_NATS: "0" }],
+    ["strict non-boolean strings", { PI_FABRIC_JEV_LIVE: "true", PI_FABRIC_JEV_LOCALTERM: "01", PI_FABRIC_TEST_PID_DELAY_MS: "-1", PI_FABRIC_NATS_REHEARSAL: "true", PI_FABRIC_REQUIRE_NATS: "true" }],
     ["missing", {}],
   ])(`${entry}: %s reaches real selectors without invoking tests`, (_name, input) => {
     const env = { ...process.env };

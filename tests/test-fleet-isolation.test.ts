@@ -159,7 +159,7 @@ test.each(["vitest.config.cts", "tests/fleet-isolation-setup.ts"])(
         PI_FABRIC_JEV_LIVE: "1", PI_FABRIC_JEV_LOCALTERM: "1", PI_FABRIC_NATS_REHEARSAL: "1",
         PI_FABRIC_ACTIVATION_TEST_PI_BINARY: "./exact artifact/native.exe",
         PI_FABRIC_ACTIVATION_TEST_WORKER: "./exact artifact/worker.js",
-        PI_FABRIC_TEST_PG_BIN: "./exact artifact/pg bin", PI_FABRIC_TEST_PID_DELAY_MS: "600",
+        PI_FABRIC_TEST_PG_BIN: "./exact artifact/pg bin", PI_FABRIC_TEST_PID_DELAY_MS: "600", PI_FABRIC_REQUIRE_NATS: "1",
       };
       const env: NodeJS.ProcessEnv = { ...process.env, ...testControls, FLEET_ISOLATION_SENTINEL: sentinel,
         FLEET_ISOLATION_ENTRY: path.join(repo, entry), FLEET_ISOLATION_TEST_CONTROLS: JSON.stringify(testControls) };

@@ -52,6 +52,10 @@ jobs:
           fi
       - name: Install dependencies
         run: bun install --frozen-lockfile
+      - name: Install pinned nats-server for session-channel acceptance
+        # Match the official 2.14.7 release and qualified archive hash used by nats-state-conformance/nats-auth.
+        if: runner.os == 'Linux'
+        run: bash scripts/install-pinned-nats-server.sh
       - name: Install pinned Bend proof compiler
         if: runner.os == 'Linux'
         shell: bash
@@ -88,6 +92,13 @@ jobs:
         env:
           FABRIC_NATIVE_CC_PINNED: ${{ runner.os == 'Linux' && '1' || '' }}
         run: bun run build
+      - name: Session-channel real-broker acceptance
+        # This real trust-boundary suite runs on Ubuntu; the Windows affected-test run reports its explicit broker-unavailable skip.
+        if: runner.os == 'Linux'
+        env:
+          PI_FABRIC_REQUIRE_NATS: '1'
+          NATS_EXPECTED_SERVER_VERSION: '2.14.7'
+        run: bunx vitest run --retry=0 tests/nats-session-channel.test.ts
       # Pi installs packages without peer or dev dependencies; the agent and memory
       # workers run outside Pi's module aliases, so their imports must resolve there.
       - name: Package install smoke (no peers, as pi install)

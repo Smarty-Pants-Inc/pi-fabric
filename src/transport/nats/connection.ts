@@ -24,6 +24,7 @@ export interface NatsPermissionPolicy {
   readonly custodyStream: string;
   readonly livenessStream: string;
   readonly pathBMachines: readonly string[];
+  readonly org?: string;
 }
 
 interface NatsTransportSecurityOptions {
@@ -35,13 +36,16 @@ interface NatsTransportSecurityOptions {
   readonly signal?: AbortSignal;
 }
 
-export interface NatsConnectionOptions extends NatsPermissionPolicy, NatsTransportSecurityOptions {
+interface NatsConnectionCredentials extends NatsTransportSecurityOptions {
   readonly credentials: string;
+}
+
+export type NatsConnectionOptions = NatsConnectionCredentials & NatsPermissionPolicy & {
   /** The server-verified machine identity; must equal the single signed `machine:` tag. */
   readonly machine: string;
   /** Defaults to the scoped runtime agent. `operator` is for explicit admin report connections only. */
   readonly role?: "agent" | "operator";
-}
+};
 
 /** Bootstrap authority for admin provisioning only. Deliberately not exported from the package entry. */
 export interface NatsBootstrapConnectionOptions extends NatsTransportSecurityOptions {
@@ -78,6 +82,7 @@ const MAX_CREDENTIALS_BYTES = 64 * 1024;
 const MISMATCH = "NATS USER.INFO machine tag mismatch";
 export const NATS_KV_FLOW_CONTROL_WARNING = "NATS user lacks KV flow-control grants; KV watches will stall; re-issue credentials";
 let warnedLegacyPermissions = false;
+const NATS_RESPONSE_PERMISSION_TTL_NS = 120_000_000_000;
 
 /**
  * Read a creds file through one descriptor: open (no symlink follow, nonblocking for FIFOs), fstat the same fd,
@@ -193,6 +198,7 @@ interface PermissionSet {
   readonly pubDeny: ReadonlySet<string>;
   readonly subAllow: ReadonlySet<string>;
   readonly subDeny: ReadonlySet<string>;
+  readonly responses?: { readonly max: number; readonly ttl: number };
 }
 
 interface ExpectedPermissions extends PermissionSet {
@@ -207,7 +213,11 @@ const expandPermissions = (template: ReturnType<typeof roleTemplateWithPathB>, m
     if (out.some((value) => value.includes("{{"))) throw new Error("unexpected NATS permission template");
     return out;
   }));
-  return { pubAllow: expand(template.pub.allow), pubDeny: expand(template.pub.deny), subAllow: expand(template.sub.allow), subDeny: new Set() };
+  return {
+    pubAllow: expand(template.pub.allow), pubDeny: expand(template.pub.deny),
+    subAllow: expand(template.sub.allow), subDeny: new Set(),
+    ...(template.allow_responses ? { responses: { ...template.allow_responses, ttl: NATS_RESPONSE_PERMISSION_TTL_NS } } : {}),
+  };
 };
 
 /** Server-expanded #1276 scope for this signed user, built by the same roleTemplateWithPathB and validators as mint. */
@@ -226,10 +236,12 @@ const expectedPermissions = (role: "agent" | "operator", machine: string, policy
     throw new Error(MISMATCH);
   }
   const input = { custodyStream: policy.custodyStream, livenessStream: policy.livenessStream };
-  const template = roleTemplateWithPathB(role, input, machines);
-  // The installed d231bd15 account is a deliberate rollout exception. It is a separate frozen template, not a
-  // subtraction from the current one, because other runtime lanes add grants to the current template as well.
-  const legacy = role === "agent" ? legacyRoleTemplateWithPathB("agent", input, machines) : template;
+  const template = roleTemplateWithPathB(role, input, machines, policy.org);
+  // Keep the installed no-org account as a separate frozen rollout exception. New org-scoped
+  // session-channel credentials must match the current template, including its response limit.
+  const legacy = role === "agent" && policy.org === undefined
+    ? legacyRoleTemplateWithPathB("agent", input, machines)
+    : template;
   return { ...expandPermissions(template, machine, meshes, auth), legacy: expandPermissions(legacy, machine, meshes, auth) };
 };
 
@@ -265,12 +277,19 @@ const verifyIdentity = async (nc: NatsConnection, timeoutMs: number, auth: Retur
   const data = isPlainObject(value) && isPlainObject(value.data) ? value.data : undefined;
   const permissions = data?.permissions;
   if (!data || data.user !== auth.subject || !isPlainObject(permissions) ||
-    Object.keys(permissions).some((key) => key !== "publish" && key !== "subscribe")) throw new NatsAuthorizationError(MISMATCH);
+    Object.keys(permissions).some((key) => key !== "publish" && key !== "subscribe" && key !== "responses")) throw new NatsAuthorizationError(MISMATCH);
   const publish = permissionLists(permissions.publish);
   const subscribe = permissionLists(permissions.subscribe);
   if (!publish || !subscribe) throw new NatsAuthorizationError(MISMATCH);
-  const current = matchesPermissions(publish, expected, false) && matchesPermissions(subscribe, expected, true);
-  const legacy = matchesPermissions(publish, expected.legacy, false) && matchesPermissions(subscribe, expected.legacy, true);
+  const responsesMatch = (permission: PermissionSet): boolean => {
+    const responses = permissions.responses;
+    return permission.responses
+      ? isPlainObject(responses) && Object.keys(responses).length === 2 &&
+        responses.max === permission.responses.max && responses.ttl === permission.responses.ttl
+      : responses === undefined || responses === null;
+  };
+  const current = matchesPermissions(publish, expected, false) && matchesPermissions(subscribe, expected, true) && responsesMatch(expected);
+  const legacy = matchesPermissions(publish, expected.legacy, false) && matchesPermissions(subscribe, expected.legacy, true) && responsesMatch(expected.legacy);
   if (!current && !legacy) throw new NatsAuthorizationError(MISMATCH);
   if (!current && !warnedLegacyPermissions) {
     warnedLegacyPermissions = true;
@@ -362,12 +381,14 @@ const open = async (
 export const openNatsConnection = async (options: NatsConnectionOptions): Promise<NatsConnectionHandle> => {
   options.signal?.throwIfAborted();
   refuseBypass(options);
+  let expected: ExpectedPermissions | undefined;
   const role = options.role ?? "agent";
-  if (role !== "agent" && role !== "operator") throw new Error("NATS connection role must be agent or operator");
   if (typeof options.machine !== "string") throw new Error("NATS machine is required");
   const machine = validateMachine(options.machine);
-  const policy: NatsPermissionPolicy = { custodyStream: options.custodyStream, livenessStream: options.livenessStream, pathBMachines: options.pathBMachines };
-  let expected: ExpectedPermissions | undefined;
+  const policy: NatsPermissionPolicy = {
+    custodyStream: options.custodyStream, livenessStream: options.livenessStream,
+    pathBMachines: options.pathBMachines, ...(options.org === undefined ? {} : { org: options.org }),
+  };
   return open(options, (nc, timeoutMs, auth) => verifyIdentity(nc, timeoutMs, auth, expected!), (auth) => {
     // Fail closed before dialing: missing/invalid policy or a signed identity that cannot match.
     try { expected = expectedPermissions(role, machine, policy, auth); }

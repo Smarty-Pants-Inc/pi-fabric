@@ -90,6 +90,8 @@ export interface TransportConsumerPolicy {
   readonly filterSubject: string;
   readonly description: string;
   readonly maxAckPending: number;
+  /** JetStream nanoseconds; omitted preserves the normal-host inactive_threshold: 0 policy. */
+  readonly inactiveThresholdNs?: number;
 }
 
 export const ensureTransportConsumer = async (api: ConsumerAPI, policy: TransportConsumerPolicy): Promise<ConsumerInfo> => {
@@ -111,7 +113,7 @@ export const ensureTransportConsumer = async (api: ConsumerAPI, policy: Transpor
         backoff,
         max_ack_pending: policy.maxAckPending,
         max_waiting: 1,
-        inactive_threshold: 0,
+        inactive_threshold: policy.inactiveThresholdNs ?? 0,
       });
     } catch (createError) {
       // A concurrent opener may have won the create. Read it back only if the winner exists;
@@ -121,10 +123,13 @@ export const ensureTransportConsumer = async (api: ConsumerAPI, policy: Transpor
     }
   }
   const actual = info.config;
+  const inactiveThresholdMismatch = policy.inactiveThresholdNs === undefined
+    ? actual.inactive_threshold !== 0 && actual.inactive_threshold !== undefined
+    : actual.inactive_threshold !== policy.inactiveThresholdNs;
   if (actual.durable_name !== policy.durable || actual.filter_subject !== policy.filterSubject || actual.filter_subjects?.length ||
     actual.deliver_subject || actual.headers_only || actual.ack_policy !== AckPolicy.Explicit || actual.replay_policy !== ReplayPolicy.Instant ||
     actual.max_waiting !== 1 || actual.deliver_policy !== DeliverPolicy.All || actual.ack_wait !== nanos(30_000) || actual.max_deliver !== 5 ||
-    actual.max_ack_pending !== policy.maxAckPending || (actual.inactive_threshold !== 0 && actual.inactive_threshold !== undefined) ||
+    actual.max_ack_pending !== policy.maxAckPending || inactiveThresholdMismatch ||
     JSON.stringify(actual.backoff) !== JSON.stringify(backoff)) {
     throw new Error(`NATS consumer configuration mismatch: ${policy.durable}`);
   }

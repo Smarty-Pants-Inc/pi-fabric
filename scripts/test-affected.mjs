@@ -12,13 +12,34 @@
 // (bun run test:smoke) so a Linux or Windows break still surfaces quickly.
 import fs from "node:fs";
 import { execFileSync } from "node:child_process";
+import path from "node:path";
 
 const argv = process.argv.slice(2);
+// CI shards both selections, not just the direct run. Keep local selection unchanged.
+const shard = argv.find((arg) => arg.startsWith("--shard="))?.slice("--shard=".length);
+if (shard !== undefined) {
+  const match = /^(\d+)\/(\d+)$/.exec(shard);
+  if (!match || Number(match[1]) < 1 || Number(match[1]) > Number(match[2])) {
+    throw new Error(`Invalid --shard=${shard}; expected i/N with 1 <= i <= N`);
+  }
+}
+const reportDir = process.env.PI_TEST_REPORT_DIR;
+const recordSelection = (selection) => {
+  if (!reportDir) return;
+  fs.mkdirSync(reportDir, { recursive: true });
+  fs.writeFileSync(path.join(reportDir, "selection.json"), JSON.stringify({
+    shard, platform: process.platform, ...selection,
+  }, null, 2) + "\n");
+};
+const emptySelection = (reason) => recordSelection({ reason, direct: [], related: [], phases: [] });
 const baseIndex = argv.indexOf("--base");
 // Either source selects range mode: the CI script passes --base, and an
 // operator can export PI_TEST_BASE when running the file directly.
 const baseFromFlag = baseIndex >= 0;
-const base = baseFromFlag ? (argv[baseIndex + 1] ?? "") : (process.env.PI_TEST_BASE ?? "");
+const baseArgument = argv[baseIndex + 1];
+const base = baseFromFlag
+  ? (baseArgument && !baseArgument.startsWith("--") ? baseArgument : "")
+  : (process.env.PI_TEST_BASE ?? "");
 const rangeMode = baseFromFlag || process.env.PI_TEST_BASE !== undefined;
 
 const git = (args) => execFileSync("git", args, { encoding: "utf8" });
@@ -33,10 +54,12 @@ const changedPaths = (spec) =>
 let changed;
 if (rangeMode) {
   if (!base) {
+    emptySelection("no base provided");
     console.log("no base provided (PI_TEST_BASE is empty); nothing to select");
     process.exit(0);
   }
   if (/^0+$/.test(base)) {
+    emptySelection("new branch push");
     console.log(`base ${base} is not a commit (new branch push); nothing to select`);
     process.exit(0);
   }
@@ -47,6 +70,7 @@ if (rangeMode) {
       .split("\n")
       .filter(Boolean);
   } catch {
+    emptySelection(`cannot resolve base ${base}`);
     console.error(`cannot resolve base ${base}; nothing to select`);
     process.exit(0);
   }
@@ -96,6 +120,11 @@ const related = files.filter(
   (file) => (file.startsWith("src/") || file.startsWith("tests/")) && !isTestFile(file),
 );
 
+recordSelection({ base, direct, related, phases: [
+  ...(related.length > 0 ? ["related"] : []),
+  ...(direct.length > 0 ? ["direct"] : []),
+] });
+
 if (direct.length === 0 && related.length === 0) {
   console.log(`${base ? `vs ${base}` : "dirty tree"}: no changed src/tests files; nothing to run`);
   process.exit(0);
@@ -103,22 +132,31 @@ if (direct.length === 0 && related.length === 0) {
 
 // vitest 4: `related` is a subcommand, not a `run` flag.
 const runs = [];
-if (related.length > 0) runs.push(["vitest", "related", ...related]);
+if (related.length > 0) runs.push(["related", ["vitest", "related", ...related]]);
 // ponytail: vitest.config.cts computes exclusions with temp/env side effects, not a
 // reusable export. Let Vitest own discovery for suites covered by dedicated CI jobs.
 // Trade-off: any empty direct selection passes; actual test failures still fail.
 // Keep this off the related run so its existing no-tests behavior is unchanged.
-if (direct.length > 0) runs.push(["vitest", "run", "--passWithNoTests", ...direct]);
+if (direct.length > 0) runs.push(["direct", ["vitest", "run", "--passWithNoTests", ...direct]]);
+for (const [phase, args] of runs) {
+  // A shard can legitimately have no files in an otherwise non-empty selection.
+  if (shard) {
+    args.push(`--shard=${shard}`);
+    if (!args.includes("--passWithNoTests")) args.push("--passWithNoTests");
+  }
+  if (reportDir) args.push("--reporter=default", "--reporter=./scripts/ci-retry-reporter.ts",
+    "--reporter=json", `--outputFile.json=${path.resolve(reportDir, `${phase}.json`)}`);
+}
 console.log(
   `${base ? `vs ${base}` : "dirty tree"}: ${related.length} changed source file(s), ${direct.length} changed test file(s)`,
 );
-console.log(runs.map((args) => "vitest " + args.slice(2).join(" ")).join(" && "));
+console.log(runs.map(([, args]) => "vitest " + args.slice(2).join(" ")).join(" && "));
 if (argv.includes("--dry-run")) {
   console.log("dry run: selection printed, nothing executed");
   process.exit(0);
 }
 try {
-  for (const args of runs) execFileSync("bunx", args, { stdio: "inherit" });
+  for (const [, args] of runs) execFileSync("bunx", args, { stdio: "inherit" });
 } catch {
   process.exit(1);
 }

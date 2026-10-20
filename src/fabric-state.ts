@@ -55,6 +55,7 @@ import type {
   FabricProvider,
 } from "./protocol.js";
 import type { FabricRuntimeState } from "./fabric-runtime-state.js";
+import type { SessionChannel, SessionChannelOpenOptions } from "./transport/nats/session-channel.js";
 import type { FabricRuntimePaths } from "./runtime-paths.js";
 import type { FabricLoadedFileIdentity } from "./build-identity.js";
 
@@ -147,6 +148,10 @@ export class FabricState {
 
   get initialized(): boolean {
     return this.#current()?.initialized === true;
+  }
+
+  openSessionChannel(options: SessionChannelOpenOptions): Promise<SessionChannel> {
+    return this.#required().openSessionChannel(options);
   }
 
   // Lightweight bootstrap seam: true once configuration is loaded, with no

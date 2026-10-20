@@ -100,6 +100,7 @@ import type { FabricLifecycleEventType } from "./lifecycle/types.js";
 import { FabricControlPlane } from "./topology/control-plane.js";
 import { ParticipantDirectory, type FabricPeerListOptions } from "./topology/participant-directory.js";
 import type { FabricTransport } from "./transport/types.js";
+import type { SessionChannel, SessionChannelIdentity, SessionChannelOpenOptions } from "./transport/nats/session-channel.js";
 import { rootParticipantName, validName } from "./topology/participant-name.js";
 import { herdrNameLookup, herdrPaneId, readHerdrAgentName } from "./topology/herdr-name.js";
 import type {
@@ -265,6 +266,7 @@ export class FabricRuntimeState {
   #control: FabricControlPlane | undefined;
   #transport: FabricTransport | undefined;
   #transportAbort: AbortController | undefined;
+  readonly #sessionChannels = new Map<string, { readonly version: number; readonly channel: SessionChannel }>();
   #lifecycle: LifecycleBroker | undefined;
   #residency: ResidencyClient | undefined;
   #agentsProvider: AgentsProvider | undefined;
@@ -330,6 +332,43 @@ export class FabricRuntimeState {
 
   get initialized(): boolean {
     return Boolean(this.#execution);
+  }
+
+  async openSessionChannel(options: SessionChannelOpenOptions): Promise<SessionChannel> {
+    const org = this.#config?.mesh.nats.org;
+    if (!org) throw new Error("mesh.nats.org is required to open a Fabric session channel");
+    const transport = this.#transport;
+    if (!transport || transport.kind !== "nats") throw new Error("Fabric session channels require the NATS transport");
+    if (this.#identity?.kind !== "main" || !this.#participants) throw new Error("Fabric session channels require a local Main session");
+    const root = this.#participants.self();
+    if (!root?.sessionId) throw new Error("Fabric Main session identity is unavailable");
+    const natsTransport = transport as FabricTransport & {
+      openSessionChannel(identity: SessionChannelIdentity, channel: SessionChannelOpenOptions): SessionChannel;
+    };
+    if (typeof natsTransport.openSessionChannel !== "function") throw new Error("NATS session channels are unavailable");
+    const channel = natsTransport.openSessionChannel({
+      org,
+      hostId: transport.self.hostId,
+      sessionId: root.sessionId,
+      sessionGeneration: this.#participants.ownerIncarnation,
+    }, options);
+    const registration = { version: options.version, channel };
+    this.#sessionChannels.set(options.service, registration);
+    this.#participants.scheduleRefresh();
+    let closed = false;
+    return {
+      handle: (op, handler) => channel.handle(op, handler),
+      publish: (event) => channel.publish(event),
+      close: () => {
+        if (closed) return;
+        closed = true;
+        channel.close();
+        if (this.#sessionChannels.get(options.service) === registration) {
+          this.#sessionChannels.delete(options.service);
+          this.#participants?.scheduleRefresh();
+        }
+      },
+    };
   }
 
   get widgetDismissedAt(): number {
@@ -1639,7 +1678,8 @@ export class FabricRuntimeState {
       participants.registerSource(() => {
         const current = live.read(ctx => mainAgent.info(ctx));
         rootInfo = current ?? { ...rootInfo, updatedAt: Date.now() };
-        return [participants.root(rootInfo, mainAgent.interactive, mainName(), { role }, herdr.pane)];
+        const services = [...this.#sessionChannels].map(([name, service]) => ({ name, version: service.version }));
+        return [participants.root(rootInfo, mainAgent.interactive, mainName(), { role }, herdr.pane, services)];
       });
     };
     const registerAgentSource = (): void => {
@@ -2365,6 +2405,8 @@ export class FabricRuntimeState {
   }
 
   async shutdown(reason?: string, targetSessionFile?: string): Promise<void> {
+    for (const { channel } of this.#sessionChannels.values()) channel.close();
+    this.#sessionChannels.clear();
     this.#stopHerdrLookup?.();
     this.#stopHerdrLookup = undefined;
     this.#meshActivationReady = () => false;

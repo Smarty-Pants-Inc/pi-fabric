@@ -8,7 +8,7 @@ import {
   encodeUserJwt,
   formatUserCreds,
 } from "./jwt.js";
-import { PATH_B_OPERATOR_MACHINE, PATH_B_OPERATOR_MACHINE_PATTERN, roleTemplate, roleTemplateWithPathB, type NatsRole } from "./permissions.js";
+import { PATH_B_OPERATOR_MACHINE, PATH_B_OPERATOR_MACHINE_PATTERN, gatewayRoleTemplate, roleTemplate, roleTemplateWithPathB, type NatsRole } from "./permissions.js";
 
 /**
  * smarty-dev#7504 slice 1 (design Amendment B): high-level NATS minter for the `pi-fabric nats` CLI.
@@ -22,7 +22,7 @@ import { PATH_B_OPERATOR_MACHINE, PATH_B_OPERATOR_MACHINE_PATTERN, roleTemplate,
  * approval and the stop-first engine runbook are the caller's duty; the approval reference is audit metadata only.
  */
 
-export type NatsOrgRole = NatsRole | "operator";
+export type NatsOrgRole = NatsRole | "operator" | "gateway";
 
 export interface NatsMintClock {
   nowSeconds(): number;
@@ -49,7 +49,7 @@ export interface NatsAccountMetadata {
   kind: "account";
   account: { name: string; publicKey: string };
   issuer: string;
-  signingKeys: Record<NatsRole, string> & Partial<Record<"operator", string>>;
+  signingKeys: Record<NatsRole, string> & Partial<Record<"operator" | "gateway", string>>;
 }
 
 export interface NatsUserMetadata {
@@ -86,6 +86,7 @@ const LIFETIME = {
   compaction: HOUR,
   migration: 2 * HOUR,
   "break-glass": HOUR,
+  gateway: 7 * DAY,
   sys: HOUR,
 } as const;
 const ORG_ROLES: readonly NatsRole[] = ["agent", "principal", "maintainer", "break-glass"];
@@ -242,8 +243,14 @@ function pathBScopeDescription(value: unknown): string {
 function mintTemplate(role: NatsOrgRole, input: Input, withPathB: boolean, machines: readonly string[]): ReturnType<typeof roleTemplate> {
   const streams = { custodyStream: input.custodyStream as string, livenessStream: input.livenessStream as string };
   if (role === "operator" && !withPathB) fail("role");
+  if (role === "gateway") {
+    if (!withPathB) fail("role");
+    try { return gatewayRoleTemplate(orgName(input.org, "org")); }
+    catch { return fail("org"); }
+  }
   try {
-    return withPathB ? roleTemplateWithPathB(role, streams, machines) : roleTemplate(role as NatsRole, streams);
+    const org = input.org === undefined ? undefined : orgName(input.org, "org");
+    return withPathB ? roleTemplateWithPathB(role, streams, machines, org) : roleTemplate(role as NatsRole, streams);
   } catch {
     return fail("custodyStream/livenessStream");
   }
@@ -302,7 +309,7 @@ export function createNatsOperator(input: unknown, clock: NatsMintClock = system
 
 export function createNatsAccount(input: unknown, clock: NatsMintClock = systemClock): NatsMintOutput<NatsAccountMetadata> {
   return withMint(() => {
-    const value = object(input, "input", ["name", "operatorJwt", "operatorSigningSeed", "jetstream", "custodyStream", "livenessStream"], ["pathBMachines"]);
+    const value = object(input, "input", ["name", "operatorJwt", "operatorSigningSeed", "jetstream", "custodyStream", "livenessStream"], ["pathBMachines", "org"]);
     const name = orgName(value.name, "name");
     const operator = verifyOperator(value.operatorJwt);
     const js = object(value.jetstream, "jetstream", ["memStorage", "diskStorage", "streams", "consumers"]);
@@ -314,7 +321,11 @@ export function createNatsAccount(input: unknown, clock: NatsMintClock = systemC
     };
     const withPathB = value.pathBMachines !== undefined;
     const machines = withPathB ? pathBMachines(value.pathBMachines) : [];
-    const roles: readonly NatsOrgRole[] = withPathB ? [...ORG_ROLES, "operator"] : ORG_ROLES;
+    const serviceOrg = value.org === undefined ? undefined : orgName(value.org, "org");
+    if (serviceOrg !== undefined && !withPathB) fail("pathBMachines");
+    const roles: readonly NatsOrgRole[] = withPathB
+      ? [...ORG_ROLES, "operator", ...(serviceOrg ? ["gateway" as const] : [])]
+      : ORG_ROLES;
     const byRole = Object.fromEntries(roles.map((role) => [role, mintTemplate(role, value, withPathB, machines)])) as Record<NatsOrgRole, ReturnType<typeof roleTemplate>>;
     const at = now(clock);
     const fixed = { nowSeconds: () => at };
@@ -358,6 +369,7 @@ export function createNatsAccount(input: unknown, clock: NatsMintClock = systemC
 }
 
 const ORG_COMMON = ["operatorJwt", "accountPublicKey", "accountJwt", "signingSeed", "custodyStream", "livenessStream"] as const;
+const ORG_OPTIONAL = ["org"] as const;
 
 interface UserSpec {
   role: NatsOrgRole | "sys";
@@ -450,14 +462,15 @@ function issueUser(spec: UserSpec, signer: KeyPair, clock: NatsMintClock): NatsM
 export function mintNatsUser(input: unknown, clock: NatsMintClock = systemClock): NatsMintOutput<NatsUserMetadata> {
   return withMint(() => {
     const role = isRecord(input) ? input.role : undefined;
-    if (role !== "agent" && role !== "principal" && role !== "maintainer" && role !== "operator") return fail("role");
+    if (role !== "agent" && role !== "principal" && role !== "maintainer" && role !== "operator" && role !== "gateway") return fail("role");
     const fields = {
       agent: { required: ["host", "lane", "session", "release", "meshes"], optional: ["parent", "pathBMachines"] },
       principal: { required: ["person", "device"], optional: ["pathBMachines"] },
       maintainer: { required: ["job", "runId"], optional: [] },
       operator: { required: ["job", "runId", "pathBMachines"], optional: ["machine"] },
+      gateway: { required: ["runId"], optional: [] },
     }[role];
-    const value = object(input, "input", ["role", ...ORG_COMMON, ...fields.required], fields.optional);
+    const value = object(input, "input", ["role", ...ORG_COMMON, ...fields.required], [...fields.optional, ...ORG_OPTIONAL]);
     const label = (key: string) => matching(value[key], LABEL, key);
     let spec: Omit<UserSpec, "name" | "account" | "org"> & { nameIn(org: string): string };
     if (role === "agent") {
@@ -474,6 +487,9 @@ export function mintNatsUser(input: unknown, clock: NatsMintClock = systemClock)
       // Deliberately unbound: a principal reads the whole org (design 1.4), so it carries no mesh tag.
       const [person, device] = [label("person"), label("device")];
       spec = { role, nameIn: () => `principal/${person}/${device}`, tags: ["role:principal", `person:${person}`, `device:${device}`], lifetime: LIFETIME.principal };
+    } else if (role === "gateway") {
+      const runId = label("runId");
+      spec = { role, nameIn: (org) => `gateway/${org}/${runId}`, tags: ["role:gateway"], lifetime: LIFETIME.gateway };
     } else {
       const job = value.job === "compaction" || value.job === "migration" ? value.job : fail("job");
       const runId = label("runId");
@@ -490,7 +506,7 @@ export function mintNatsUser(input: unknown, clock: NatsMintClock = systemClock)
 /** Break-glass user: only through this explicit call (`mint user --break-glass`), 1 h, audit metadata only. */
 export function mintNatsBreakGlassUser(input: unknown, clock: NatsMintClock = systemClock): NatsMintOutput<NatsUserMetadata> {
   return withMint(() => {
-    const value = object(input, "input", [...ORG_COMMON, "person", "runId", "approvalRef"]);
+    const value = object(input, "input", [...ORG_COMMON, "person", "runId", "approvalRef"], ORG_OPTIONAL);
     const person = matching(value.person, LABEL, "person");
     const runId = matching(value.runId, LABEL, "runId");
     const approvalRef = matching(value.approvalRef, APPROVAL_REF, "approvalRef");

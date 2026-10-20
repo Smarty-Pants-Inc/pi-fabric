@@ -394,12 +394,26 @@ const ownMainProcess = (): { pid: number; host: string; startTime?: string } => 
   return ownProcessIdentity;
 };
 
+const sessionServicesValid = (value: unknown, kind: FabricParticipantKind): boolean => {
+  if (value === undefined) return true;
+  if (kind !== "root" || !Array.isArray(value)) return false;
+  const names = new Set<string>();
+  return value.every((service) => {
+    if (!isObject(service) || typeof service.name !== "string" ||
+      /^[a-z0-9][a-z0-9-]{0,47}$/.exec(service.name)?.[0] !== service.name ||
+      !Number.isSafeInteger(service.version) || Number(service.version) < 1 || names.has(service.name)) return false;
+    names.add(service.name);
+    return true;
+  });
+};
+
 const participantFromEntry = (entry: MeshStateEntry): FabricParticipantRecord | undefined => {
   if (!isObject(entry.value) || entry.value.format !== 1 || entry.value.stopReason === "owner-root-gone") return undefined;
   const value = entry.value as Partial<FabricParticipantRecord> & Record<string, unknown>;
   const kind = participantKind(value.kind);
   if (
     !kind ||
+    !sessionServicesValid(value.services, kind) ||
     (value.interactive !== undefined && typeof value.interactive !== "boolean") ||
     !remoteHostValid(value.remoteHost) ||
     !remoteHostValid(value.bridgeVia) ||
@@ -2406,7 +2420,14 @@ export class ParticipantDirectory implements FabricParticipantSource {
       });
   }
 
-  root(main: FabricMainAgentInfo, interactive = true, sessionName?: string, boundGrant?: { role: string | undefined }, herdrPane?: string): FabricParticipantRecord {
+  root(
+    main: FabricMainAgentInfo,
+    interactive = true,
+    sessionName?: string,
+    boundGrant?: { role: string | undefined },
+    herdrPane?: string,
+    services?: readonly { name: string; version: number }[],
+  ): FabricParticipantRecord {
     // Runtime supplies its session_start-bound snapshot. Standalone directories bind once too.
     const role = boundGrant ? boundGrant.role : this.#roleGrant.roleFor(main.sessionId ?? "", main.cwd ?? "");
     const project = main.cwd ? participantProject(main.cwd) : undefined;
@@ -2433,6 +2454,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       ...(repository ? { repository } : {}),
       ...(role ? { role } : {}),
       ...(herdrPane ? { herdrPane } : {}),
+      ...(services?.length ? { services: services.map(({ name, version }) => ({ name, version })) } : {}),
       ...(main.sessionId ? { sessionId: main.sessionId } : {}),
       ...(main.model ? { model: main.model } : {}),
       ...(main.thinking ? { thinking: main.thinking } : {}),

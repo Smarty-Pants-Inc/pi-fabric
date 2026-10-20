@@ -232,6 +232,8 @@ describe("durable public SDK host", () => {
     f.extension.handlers.set("after_provider_response", [response]);
     f.extension.handlers.set("provider_stream_event", [streamEvent]);
     f.extension.handlers.set("context", [async event => ({ messages: [...(event as ContextEvent).messages, { role: "user", content: "request-local context", timestamp: 1 }] })]);
+    const providerEvent = { type: "content_block_delta", delta: { type: "text_delta", text: "instrumented" } };
+    const providerResponse = { status: 206, headers: { "x-request-id": "durable-provider-request" } };
     f.faux.setResponses([async (context, options, _state, model) => {
       expect(JSON.stringify(context.messages)).toContain("request-local context");
       expect(options?.apiKey).toBe("offline-key");
@@ -240,8 +242,8 @@ describe("durable public SDK host", () => {
       expect(options?.headers).toMatchObject({ "x-model-header": "configured", "x-extension": "present" });
       // Faux has no HTTP payload/raw event parser; exercise the supplied provider callbacks.
       expect(await options?.onPayload?.({ original: true }, model)).toEqual({ changed: true });
-      await options?.onProviderStreamEvent?.({ type: "provider_stream_event" });
-      await options?.onResponse?.({});
+      await options?.onProviderStreamEvent?.(providerEvent, model);
+      await options?.onResponse?.(providerResponse, model);
       return fauxAssistantMessage("instrumented");
     }]);
     const settingsManager = SettingsManager.inMemory({ compaction: { enabled: false },
@@ -251,9 +253,11 @@ describe("durable public SDK host", () => {
     await host.session.bindExtensions({});
     await host.session.prompt("hello");
     expect(host.session.getLastAssistantText(), JSON.stringify(host.session.messages)).toBe("instrumented");
-    expect(response).toHaveBeenNthCalledWith(1, { type: "after_provider_response", status: 200 }, expect.anything());
-    expect(response).toHaveBeenNthCalledWith(2, { type: "after_provider_response" }, expect.anything());
-    expect(streamEvent).toHaveBeenCalledWith({ type: "provider_stream_event" }, expect.anything());
+    expect(response).toHaveBeenCalledTimes(2);
+    expect(response).toHaveBeenNthCalledWith(1, { type: "after_provider_response", status: 200, headers: {} }, expect.anything());
+    expect(response).toHaveBeenNthCalledWith(2, { type: "after_provider_response", ...providerResponse }, expect.anything());
+    expect(streamEvent).toHaveBeenCalledExactlyOnceWith({ type: "provider_stream_event", data: providerEvent,
+      provider: f.faux.getModel().provider, api: f.faux.getModel().api, model: f.faux.getModel().id }, expect.anything());
     expect(JSON.stringify(f.sessionManager.buildSessionContext().messages)).not.toContain("request-local context");
   });
 

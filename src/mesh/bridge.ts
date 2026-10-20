@@ -16,6 +16,8 @@ import { FABRIC_MESH_OUTAGE_ALARM_TOPIC, isMeshAlarmTarget, meshCursorGeneration
 import { CommitOutbox, type CommitOutboxEffect } from "./commit-outbox.js";
 import { assertBridgeStateBackend, isMeshRetryableBusy, isMeshStateWalCap } from "./state-backend.js";
 import { BridgeDeliveryAgeMonitor, type BridgeDeliveryAgeAlarm } from "./bridge-delivery-age.js";
+import { BridgeFenceObservationBuffer, BridgeFenceStats, measureBridgeFence, measureBridgeScan,
+  type BridgeFenceObservation, type BridgeFenceObservationCallback } from "./bridge-fence-stats.js";
 import { watchBridgeStore, type BridgeChange } from "./change-notifier.js";
 import { BRIDGE_BATCH_MAX_EVENTS } from "./event-log.js";
 import { BridgeLegacyBaselineAlarmEpisode, supportsLegacyBaselineAlarm, type BridgeLegacyBaselineAlarm } from "./bridge-baseline-alarms.js";
@@ -369,6 +371,10 @@ export interface BridgeSide {
    * Watch failure is fatal. undefined selects transitional legacy-remote polling only with
    * reported protocolVersion 1; local stores always require watches. Manual step() needs no subscription. */
   subscribeChanges?(changed: (kind: BridgeChange) => void, failed: (error: Error) => void): (() => void) | undefined | Promise<(() => void) | undefined>;
+  /** Optional local-only raw writer-fence observation subscription. */
+  subscribeWriteFence?(observer: BridgeFenceObservationCallback): () => void;
+  /** Optional local-only bounded raw writer-fence samples for reproduction. */
+  drainWriteFenceObservations?(): BridgeFenceObservation[];
   /** Reported hello version, required before a remote may use the pre-capability polling path. */
   readonly protocolVersion?: number | undefined;
   /** An open, negotiated traffic lane remains usable despite a retained pending mirror. */
@@ -734,6 +740,11 @@ const bridgeIncarnationWithFloor = (
   return next;
 };
 
+export interface StoreBridgeSideOptions {
+  /** Optional raw callback for local reproduction; observer failures are ignored. */
+  observeWriteFence?: BridgeFenceObservationCallback;
+}
+
 export class StoreBridgeSide implements BridgeSide {
   // The mirror's host-lease writes and removals run after its state commit, from rows recorded in
   // that commit (smarty-dev#6477 R11): a crash in between leaves them for the next pass, which
@@ -743,6 +754,8 @@ export class StoreBridgeSide implements BridgeSide {
   // Active only during one mirror commit attempt, including recovery and afterCommit retries.
   #skippedRoots: ReadonlySet<string> | undefined;
   #leaseProcess: Promise<BridgeLeaseProcess | undefined> | undefined;
+  readonly #fenceObservations = new BridgeFenceObservationBuffer();
+  readonly #fenceObservers = new Set<BridgeFenceObservationCallback>();
 
   constructor(
     readonly store: MeshStore,
@@ -750,7 +763,9 @@ export class StoreBridgeSide implements BridgeSide {
     readonly now: () => number = Date.now,
     /** CLI link/agent processes opt in; reference/manual adapters keep their existing lease shape. */
     readonly monitorLease = false,
+    options: StoreBridgeSideOptions = {},
   ) {
+    if (options.observeWriteFence) this.#fenceObservers.add(options.observeWriteFence);
     if (!validBridgeName(peer)) throw new Error(`Invalid bridge peer name: ${peer}`);
     assertBridgeStateBackend(store.root, store.stateBackend);
     // A skipped root's effects are deferred, not successful no-ops: CommitOutbox catches the
@@ -778,6 +793,37 @@ export class StoreBridgeSide implements BridgeSide {
   // Each mirror put supplies its checked owner identity; this default is unused for deletes.
   #identity(): MeshIdentity {
     return { id: `bridge:${this.peer}`, name: this.peer, kind: "main" };
+  }
+
+  subscribeWriteFence(observer: BridgeFenceObservationCallback): () => void {
+    this.#fenceObservers.add(observer);
+    return () => this.#fenceObservers.delete(observer);
+  }
+
+  drainWriteFenceObservations(): BridgeFenceObservation[] {
+    return this.#fenceObservations.drain();
+  }
+
+  #observeFence(observation: BridgeFenceObservation): void {
+    try { this.#fenceObservations.push(observation); } catch { /* bounded telemetry must not affect the bridge */ }
+    for (const observer of this.#fenceObservers) {
+      try { observer(observation); } catch { /* raw telemetry is advisory */ }
+    }
+  }
+
+  #withWriteFence<T>(
+    site: "subscribeChanges.capture" | "heldFence", attempt: number, optimized: boolean, fallback: boolean,
+    operation: () => T,
+  ): T {
+    return measureBridgeFence(this.store.withStateWriteFence.bind(this.store), operation, {
+      peer: this.peer, site, scope: "state-write-fence", attempt, optimized, fallback, retry: attempt > 0,
+    }, observation => this.#observeFence(observation));
+  }
+
+  #scanInWriteBatch<T>(attempt: number, optimized: boolean, fallback: boolean, operation: () => T): T {
+    return measureBridgeScan(operation, {
+      peer: this.peer, site: "mirror.prepare", scope: "writeBatch.prepare", attempt, optimized, fallback, retry: attempt > 0,
+    }, observation => this.#observeFence(observation));
   }
 
   async latestSequence(): Promise<number> {
@@ -955,10 +1001,10 @@ export class StoreBridgeSide implements BridgeSide {
         const revision = this.store.stateRevision();
         const stamps = files();
         const value = snapshot();
-        if (revision !== undefined && this.store.withStateWriteFence(() =>
+        if (revision !== undefined && this.#withWriteFence("subscribeChanges.capture", attempt, true, false, () =>
           this.store.stateUnchangedSince(revision, HELD_STATE_PREFIXES) && files() === stamps)) return value;
       }
-      return this.store.withStateWriteFence(snapshot);
+      return this.#withWriteFence("subscribeChanges.capture", HELD_FENCE_ATTEMPTS - 1, false, true, snapshot);
     };
     const flush = (): void => {
       queued = false;
@@ -1247,7 +1293,7 @@ export class StoreBridgeSide implements BridgeSide {
       fence: <R>(commit: () => R): R => {
         for (let attempt = 0; ; attempt += 1) {
           const observed = attempt < HELD_FENCE_ATTEMPTS - 1 ? this.#heldObservation(held, from) : undefined;
-          const outcome = this.store.withStateWriteFence(() => {
+          const outcome = this.#withWriteFence("heldFence", attempt, observed !== undefined, observed === undefined, () => {
             if (observed !== undefined) {
               if (!(observed.until > this.now() && this.store.stateUnchangedSince(observed.revision, HELD_STATE_PREFIXES) &&
                 this.#heldFiles(held, observed.leasesAll) === observed.files)) return HELD_FENCE_STALE;
@@ -1820,7 +1866,7 @@ export class StoreBridgeSide implements BridgeSide {
           // Admission, reservations and CAS all observe ONE authoritative snapshot under the
           // write lock. No native takeover can fit between that observation and this commit
           // (security review rounds 2/3, F1/F2), including recreation over retained tombstones.
-          prepare: (view) => {
+          prepare: (view) => this.#scanInWriteBatch(attempt, early !== undefined, early === undefined, () => {
             if (halted()) return plan.stage([], []);
             const sameFiles = meshDirectoryStamp(this.store.root, "participants") === filesStamp;
             let result: ReturnType<typeof compute>;
@@ -1885,7 +1931,7 @@ export class StoreBridgeSide implements BridgeSide {
               return !isObject(row) || !isObject(row.payload) || typeof row.payload.rootId !== "string" ||
                 !skippedRoots.has(row.payload.rootId);
             });
-          },
+          }),
           // After the commit, on the committed owner, never a fresh per-record state read.
           // Partial snapshots may commit admitted lease updates, but must neither replay nor retry
           // any prior unlease effect until a complete snapshot can authorize withdrawal.
@@ -2637,6 +2683,8 @@ export interface MeshBridgeOptions {
   /** First wait after a WAL-cap refusal (then doubling to 30 s). Default 1 s; tests lower it. */
   walCapRetryMinMs?: number;
   log?: (message: string) => void;
+  /** Optional raw writer-fence observation callback for local reproduction. */
+  observeWriteFence?: BridgeFenceObservationCallback;
   /** Debug lines (each event not addressed across); off when absent. */
   debug?: (message: string) => void;
   /**
@@ -2979,11 +3027,21 @@ export class MeshBridge {
   #watchdogTask: Promise<void> | undefined;
   #watchdogWake: (() => void) | undefined;
   readonly #deliveryAge: BridgeDeliveryAgeMonitor;
+  readonly #fenceStats: BridgeFenceStats;
+  readonly #fenceObserverUnsubscribers: Array<() => void> = [];
 
   constructor(readonly options: MeshBridgeOptions) {
     this.#deliveryAge = new BridgeDeliveryAgeMonitor({ host: options.localName, peer: options.remoteName,
       ...(options.clock ? { clock: options.clock } : {}),
       log: line => this.#log(line), ...(options.publishDeliveryAgeAlarm ? { alarm: options.publishDeliveryAgeAlarm } : {}) });
+    this.#fenceStats = new BridgeFenceStats({
+      ...(options.clock ? { clock: options.clock } : {}),
+      log: line => this.#log(line), ...(options.observeWriteFence ? { observe: options.observeWriteFence } : {}),
+    });
+    for (const side of [options.local, options.remote]) {
+      const unsubscribe = side.subscribeWriteFence?.(observation => this.#fenceStats.record(observation));
+      if (unsubscribe) this.#fenceObserverUnsubscribers.push(unsubscribe);
+    }
     for (const name of [options.localName, options.remoteName]) {
       if (!validBridgeName(name)) throw new Error(`Invalid bridge name: ${name}`);
     }
@@ -3011,6 +3069,11 @@ export class MeshBridge {
     this.#factoryRate = rate;
     this.#factoryTokens = rate.burst;
     this.#factoryBytes = rate.byteBurst;
+  }
+
+  /** Drain bounded raw samples from local StoreBridgeSide instances for reproduction. */
+  drainWriteFenceObservations(): BridgeFenceObservation[] {
+    return [this.options.local, this.options.remote].flatMap(side => side.drainWriteFenceObservations?.() ?? []);
   }
 
   #now(): number {
@@ -3125,6 +3188,7 @@ export class MeshBridge {
 
   /** One per-link INFO line, no more than once a minute except the first baseline-outage alarm. */
   #reportPresenceInfo(): void {
+    this.#fenceStats.flushIfDue();
     const now = this.#now();
     const remote = this.options.remote instanceof RemoteBridgeSide ? this.options.remote : undefined;
     const noBaselineCycles = remote?.legacyNoBaselineCycles ?? 0;
@@ -3429,7 +3493,10 @@ export class MeshBridge {
         const wake = (): void => { clearWatchdogTimeout(timer); resolve(); };
         this.#watchdogWake = wake;
       });
-      if (running()) await this.#watchdogProbe();
+      if (running()) {
+        this.#fenceStats.flushIfDue();
+        await this.#watchdogProbe();
+      }
     }
   }
 
@@ -3631,6 +3698,7 @@ export class MeshBridge {
     if (this.#stopped) return { toRemote: 0, toLocal: 0, dropped: 0 };
     const toRemote = await this.#direction("toRemote");
     const toLocal = await this.#direction("toLocal");
+    this.#fenceStats.flushIfDue();
     return { toRemote: toRemote.forwarded, toLocal: toLocal.forwarded, dropped: toRemote.dropped + toLocal.dropped };
   }
 
@@ -4468,6 +4536,9 @@ export class MeshBridge {
     await within(Promise.allSettled([...this.#relayDeliveries]));
     await within(localFence);
     this.#deliveryAge.close();
+    for (const unsubscribe of this.#fenceObserverUnsubscribers) unsubscribe();
+    this.#fenceObserverUnsubscribers.length = 0;
+    this.#fenceStats.close();
   }
 }
 

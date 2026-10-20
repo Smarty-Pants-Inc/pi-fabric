@@ -413,11 +413,13 @@ export class ProcessTransport implements AgentTransportAdapter {
     );
     // Core sets cgroup only after admitting a capped receipt; structural read keeps
     // this compatible with handles that never carry one.
-    const { cgroup } = processHandle as typeof processHandle & { cgroup?: string };
+    const { cgroup, scopeUnit, scopeCgroup } = processHandle;
     return {
       kind: this.kind,
       ...(selected.fabricRelease ? { fabricRelease: selected.fabricRelease } : {}),
       ...(cgroup ? { cgroup } : {}),
+      ...(scopeUnit ? { scopeUnit } : {}),
+      ...(scopeCgroup ? { scopeCgroup } : {}),
       sessionId: String(processHandle.pid),
       ...(processHandle.treeClosed ? { liveness: "events" as const } : {}),
       isAlive: processHandle.isAlive,

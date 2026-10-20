@@ -340,6 +340,10 @@ export interface AgentRunResult extends AgentRunRecord {
   enodevRecovered?: boolean;
   /** Its delivery receipt already exists: a crash came after a delivery attempt; the actor replays idempotently. */
   enodevReplay?: boolean;
+  /** This result was recovered from a positively verified scope-close-timeout receipt. */
+  closeTimeoutRecovered?: boolean;
+  /** A replay after a crash following close-timeout delivery but before queue acknowledgement. */
+  closeTimeoutReplay?: boolean;
   /** Canonical launch selection when via is present; may differ from the observed model. */
   selectedModel?: string;
   /** Failed admission only: model/auth timed out before any transport launch was attempted.
@@ -599,6 +603,10 @@ export interface AgentTransportHandle {
   /** Admitted, memory-capped task cgroup path (smarty-dev#8257). Present only after the
    * launcher verified the capped scope receipt; uncapped/fallback launches omit it. */
   cgroup?: string;
+  /** Host-captured systemd scope identity for positive close-timeout recovery. */
+  scopeUnit?: string;
+  /** Unified cgroup-v2 path for `scopeUnit`, when the launch scope was verified. */
+  scopeCgroup?: string;
   /** Bounded diagnostic tail for workers that fail before writing a status record. */
   readStderr?(): string;
   isAlive(options?: AgentTransportObservationOptions): Promise<boolean>;

@@ -101,3 +101,9 @@ This requires a resident binary advertising `operatorActor`. Older binaries
 are refused before a request is dispatched; no unsafe legacy command fallback
 is used. Existing dead-root resident binaries need an explicit deployment of a
 compatible host before this operator path is available.
+
+## Recover a close-timeout actor run
+
+A close-timeout recovery receipt is not permission to delete custody. The restored activation must match the saved run and answer; its normal actor delivery and queue acknowledgement are still the only point that settles custody. Recovery accepts only a trusted, run-specific `scope.json` written by the host and the exact cgroup path it records, positively verified absent. The operator CLI cannot supply a substitute scope identity. Runs without that structured record remain unresolved; this is intentionally fail-closed. Dead-root authorization is deferred to a follow-up with a verifiable, one-use authorization bound to the root and run.
+
+If an old resident binary cannot consume a newly written receipt, do not signal a PID or start a second host manually. Restart the resident through its supervised systemd unit or the authorized staging procedure (Light). Where no supervisor is available, use a reviewed pidfd-bound helper that validates the exact launcher incarnation. Wait for the supervised restart to report the new release ready; then verify that restore delivers the saved matching activation once, acknowledges its queue item, and only afterward runs queued work. A dead resident root waits for the follow-up authorization design. Refs Smarty-Pants-Inc/smarty-dev#4313.

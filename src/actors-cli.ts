@@ -6,8 +6,10 @@ import { ResidentActorClient } from "./residency/actor-client.js";
 import { residentRoot, residentHostId, type ResidentHostConfig, type ResidentHostOwner } from "./residency/protocol.js";
 import { residentProcessAlive } from "./residency/process-identity.js";
 import { windowsSecurityPowerShell } from "./storage/windows-powershell.js";
+import { ownedStat } from "./storage/scratch.js";
+import { writeCloseTimeoutOperatorReceipt } from "./agents/enodev-recovery.js";
 
-const usage = "Usage: fabric-actors stop|remove --resident <directory-or-prefix> --actor <id-or-name> [--mesh-root <dir>] [--dry-run] [--confirm-dead-root <rootId>] [--main-stopped --evidence <text> | --evidence-file <path>]";
+const usage = "Usage: fabric-actors stop|remove --resident <directory-or-prefix> --actor <id-or-name> [--mesh-root <dir>] [--dry-run] [--confirm-dead-root <rootId>] [--main-stopped --evidence <text> | --evidence-file <path>]\n       fabric-actors recover-close-timeout --run-root <runs-dir> --run-id <32-hex-id> --scope-unit <fabric-scope-XXXXXX.scope>";
 const help = `${usage}
 
 When the resident host is dead, remove runs offline and needs --main-stopped (the live resident's own remove
@@ -123,10 +125,41 @@ export function assertResidentChannelOwned(files: string[], probe: ResidentChann
 }
 
 export async function main(argv: string[], io: { out: (text: string) => void; err: (text: string) => void } = { out: (text: string) => process.stdout.write(text),
-  err: (text: string) => process.stderr.write(text) }, ownerProbe: ResidentChannelOwnerProbe = defaultOwnerProbe()): Promise<number> {
+  err: (text: string) => process.stderr.write(text) }, ownerProbe: ResidentChannelOwnerProbe = defaultOwnerProbe(),
+  cgroupRoot = "/sys/fs/cgroup"): Promise<number> {
   try {
     if (argv.length === 1 && (argv[0] === "--help" || argv[0] === "-h")) { io.out(help + "\n"); return 0; }
     const [action, ...rest] = argv;
+    if (action === "recover-close-timeout") {
+      const values: Record<string, string> = {};
+      for (let index = 0; index < rest.length; index++) {
+        const option = rest[index]!;
+        if (!["--run-root", "--run-id", "--scope-unit"].includes(option) || values[option] !== undefined ||
+            !rest[index + 1] || rest[index + 1]!.startsWith("--")) throw new Error(usage);
+        values[option] = rest[++index]!;
+      }
+      const runRootPath = values["--run-root"];
+      const runId = values["--run-id"];
+      const scopeUnit = values["--scope-unit"];
+      if (!runRootPath || !runId || !scopeUnit || !/^[a-f0-9]{32}$/.test(runId)) throw new Error(usage);
+      const unresolvedRoot = path.resolve(runRootPath);
+      const rootStat = ownedStat(unresolvedRoot);
+      if (!rootStat?.isDirectory()) throw new Error("Run root must be a real directory owned by the current OS user");
+      const runDirectory = path.join(unresolvedRoot, runId);
+      const runStat = ownedStat(runDirectory);
+      if (!runStat?.isDirectory() || path.dirname(path.resolve(runDirectory)) !== unresolvedRoot) {
+        throw new Error("Run directory must be a direct, owner-owned child of --run-root");
+      }
+      const uid = process.getuid?.() ?? null;
+      const receipt = writeCloseTimeoutOperatorReceipt(runDirectory, runId, scopeUnit, {
+        uid, user: process.env.SUDO_USER ?? process.env.USER ?? process.env.LOGNAME ?? `uid:${String(uid)}`,
+        pid: process.pid, ...(process.env.PI_FABRIC_AGENT_NAME ? { agent: process.env.PI_FABRIC_AGENT_NAME } : {}),
+      }, cgroupRoot);
+      if (!receipt) throw new Error("Close-timeout recovery proof failed; custody and receipts are unchanged");
+      io.out(JSON.stringify({ runId, scopeUnit, operator: receipt.operator, receipt: "close-timeout-operator.json",
+        custody: "awaiting the restored activation's delivery and queue acknowledgement" }) + "\n");
+      return 0;
+    }
     if (action !== "stop" && action !== "remove") throw new Error(usage);
     const values: Record<string, string> = {};
     let dryRun = false;

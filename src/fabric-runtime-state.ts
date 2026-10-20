@@ -1283,6 +1283,18 @@ export class FabricRuntimeState {
       projectRoot,
       hostId,
       identityId: identity.id,
+      placementTerminalWriter: async (record) => {
+        if (transport) {
+          if (!transport.writePlacementTerminal) {
+            const { PlacementTerminalWriteError } = await import("./placement/terminal.js");
+            throw new PlacementTerminalWriteError();
+          }
+          await transport.writePlacementTerminal(record);
+          return;
+        }
+        const { writePlacementTerminalFile } = await import("./placement/terminal.js");
+        writePlacementTerminalFile(meshRoot, hostId, record);
+      },
       ...(transport ? {
         meshTransport: structuredClone({ transport: meshConfig.transport,
           ...(meshConfig.hostTransport ? { hostTransport: meshConfig.hostTransport } : {}), nats: meshConfig.nats }),

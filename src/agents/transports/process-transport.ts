@@ -250,6 +250,17 @@ const prepareTaskTemporaryDirectory = (
   return { workerArguments: childArguments, environment: childEnvironment };
 };
 
+const assertPlacementDeadline = (request: AgentTransportLaunch): number | undefined => {
+  if (!request.placementAdmission) return undefined;
+  const deadline = Date.parse(request.placementAdmission.executionDeadline);
+  if (!Number.isSafeInteger(deadline) || deadline <= Date.now()) {
+    throw Object.assign(new Error("Placement execution deadline expired before worker launch"), {
+      launchOutcome: "unlaunched", code: "LOCAL_BINDING_NOT_ADMITTED",
+    });
+  }
+  return deadline;
+};
+
 export class ProcessTransport implements AgentTransportAdapter {
   readonly kind = "process" as const;
   #scopeWarningLogged = false;
@@ -287,6 +298,37 @@ export class ProcessTransport implements AgentTransportAdapter {
     const requires = normalizeAgentRequires(request.requires);
     const needs = normalizeAgentCapabilityTokens(request.needs);
     request = { ...request, ...(needs !== undefined ? { needs } : {}), ...(requires !== undefined ? { requires } : {}) };
+    const placementDeadline = assertPlacementDeadline(request);
+    if (request.placementAdmission) {
+      if (request.placementLocalReason) {
+        throw Object.assign(new Error("The admitted Placement transport cannot preserve this worker's host-side requirements"),
+          { launchOutcome: "unlaunched", code: "LOCAL_TRANSPORT_UNSUPPORTED" });
+      }
+      if (request.placementAdmission.placementKind === "remote") {
+        const remoteConfig = this.#placement();
+        if (!remoteConfig) {
+          throw Object.assign(new Error("Remote Placement admission has no host-owned launcher configuration"),
+            { launchOutcome: "unlaunched", code: "LOCAL_TRANSPORT_UNSUPPORTED" });
+        }
+        const preflightDeadline = Math.min(Date.now() + Math.min(remoteConfig.commandTimeoutMs, 5_000), placementDeadline!);
+        const { launchPlacedTask } = await import("./placement.js");
+        try {
+          return await launchPlacedTask(request, remoteConfig, preflightDeadline, request.placementAdmission.placementHost);
+        } catch (error) {
+          if ((error as { launchOutcome?: string } | undefined)?.launchOutcome === "unknown") throw error;
+          const code = error && typeof error === "object" && "code" in error && typeof error.code === "string" && error.code.startsWith("LOCAL_")
+            ? error.code : "LOCAL_TRANSPORT_UNSUPPORTED";
+          throw Object.assign(error instanceof Error ? error : new Error("Remote Placement preflight failed"),
+            { launchOutcome: "unlaunched", code });
+        }
+      }
+      const localHostname = os.hostname().toLowerCase().replace(/\.$/u, "");
+      const localNames = new Set([localHostname, localHostname.split(".", 1)[0]!]);
+      if (!localNames.has(request.placementAdmission.placementHost)) {
+        throw Object.assign(new Error("Placement admitted this local process run to a different host"),
+          { launchOutcome: "unlaunched", code: "LOCAL_BINDING_MISMATCH" });
+      }
+    } else {
     const placement = this.#placement();
     if (placement) {
       const preflightDeadline = Date.now() + Math.min(placement.commandTimeoutMs, 5_000);
@@ -337,6 +379,7 @@ export class ProcessTransport implements AgentTransportAdapter {
       const log = args.get("--log-file");
       if (!log) throw new Error("Placement audit requires a run event log");
       fs.appendFileSync(log, JSON.stringify({ type: "placement.local", ts: Date.now(), id: request.id, reason, needs: request.needs ?? [] }) + "\n", { mode: 0o600 });
+    }
     }
     // Check on Main only after the remote decision; required paths may exist solely on the target.
     assertAgentRequiredInputsExist(requires, file => fs.existsSync(file));
@@ -401,6 +444,7 @@ export class ProcessTransport implements AgentTransportAdapter {
       childEnvironment.SMARTY_GIT_READ_ONLY = "1";
       configureTaskGitReadOnlyEnvironment(childEnvironment);
     }
+    assertPlacementDeadline(request);
     const processHandle = await spawnDetached(
       selected.workerPath,
       prepared.workerArguments,

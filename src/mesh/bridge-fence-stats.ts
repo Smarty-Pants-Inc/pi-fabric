@@ -1,10 +1,10 @@
 import { performance } from "node:perf_hooks";
 
-/** The bridge code paths that can execute a state scan while a writer fence is held. */
-export type BridgeFenceSite = "subscribeChanges.capture" | "heldFence" | "mirror.prepare";
+/** Bridge callbacks measured while state writer custody is held, including mirror batch effects. */
+export type BridgeFenceSite = "subscribeChanges.capture" | "heldFence" | "mirror.prepare" | "mirror.afterCommit";
 
-/** Whether the measured callback is the SQLite write fence or a writeBatch prepare callback. */
-export type BridgeFenceScope = "state-write-fence" | "writeBatch.prepare";
+/** State-fence callback through rollback, or only the named synchronous writeBatch callback. */
+export type BridgeFenceScope = "state-write-fence" | "writeBatch.prepare" | "writeBatch.afterCommit";
 
 /** One bounded, opt-in raw observation of a bridge fence/scan callback. */
 export interface BridgeFenceObservation {
@@ -12,13 +12,14 @@ export interface BridgeFenceObservation {
   peer: string;
   site: BridgeFenceSite;
   scope: BridgeFenceScope;
-  /** Monotonic callback-through-rollback time; mirror.prepare is callback-only, in milliseconds. */
+  /** Monotonic milliseconds: state-write-fence includes rollback, not acquisition; mirror.prepare
+   * and mirror.afterCommit measure only their complete callbacks, not the enclosing transaction. */
   holdMs: number;
-  /** The attempt number within the current optimized/fallback retry loop. */
+  /** The attempt number within the current bridge retry loop. */
   attempt: number;
-  /** True when the callback used the revision/stamp proof rather than the full scan. */
+  /** True for a revision/stamp proof rather than a full scan; false (not applicable) for afterCommit. */
   optimized: boolean;
-  /** True when this callback performed the full-scan fallback. */
+  /** True for a full-scan fallback; false (not applicable) for afterCommit. */
   fallback: boolean;
   /** True when this was a retry after an earlier attempt in the same loop. */
   retry: boolean;
@@ -114,7 +115,7 @@ export class BridgeFenceStats {
     const now = this.#clock();
     const bucketStart = Math.floor(now / this.#windowMs) * this.#windowMs;
     // Rotation is deliberately observed by flushIfDue(), outside measured callbacks. In particular,
-    // record() must never synchronously log from a mirror.prepare callback under a write transaction.
+    // record() must never synchronously log from mirror.prepare/afterCommit under a write transaction.
     if (this.#bucketStart === undefined) this.#bucketStart = bucketStart;
     const key = bucketKey(observation.peer, observation.site);
     let entry = this.#buckets.get(key);
@@ -205,7 +206,7 @@ export const measureBridgeFence = <T>(
   }
 };
 
-/** Measure a scan callback that runs in writeBatch.prepare (not a state-fence transaction). */
+/** Measure a complete synchronous writeBatch.prepare/afterCommit callback, not its transaction. */
 export const measureBridgeScan = <T>(
   operation: () => T,
   context: TimedFenceContext,

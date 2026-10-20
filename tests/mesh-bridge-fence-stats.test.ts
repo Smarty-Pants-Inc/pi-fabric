@@ -7,7 +7,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { BRIDGE_FENCE_RAW_BUFFER_MAX, BridgeFenceObservationBuffer, BridgeFenceStats,
   measureBridgeFence, measureBridgeScan, type BridgeFenceObservation } from "../src/mesh/bridge-fence-stats.js";
 import { MeshBridge, StoreBridgeSide } from "../src/mesh/bridge.js";
+import { CommitOutbox } from "../src/mesh/commit-outbox.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
+import { readHostLease } from "../src/topology/host-leases.js";
 
 // Keep reason: instrumentation must never change the bridge's admission/append failure path.
 const context = { peer: "far", site: "heldFence", scope: "state-write-fence", attempt: 0,
@@ -72,6 +74,30 @@ describe("bridge fence timing and passive aggregation", () => {
     expect(observe).toHaveBeenCalledWith(expect.objectContaining({ site: "mirror.prepare", scope: "writeBatch.prepare", holdMs: expect.any(Number) }));
   });
 
+  it("measures complete afterCommit callbacks and preserves exact returns and throws despite observer failures", () => {
+    let now = 0;
+    vi.spyOn(performance, "now").mockImplementation(() => now);
+    const samples: BridgeFenceObservation[] = [];
+    const afterCommit = { ...context, site: "mirror.afterCommit", scope: "writeBatch.afterCommit",
+      attempt: 2, optimized: false, fallback: false, retry: true } as const;
+    const observe = (observation: BridgeFenceObservation): void => {
+      samples.push(observation);
+      throw new Error("observer failed");
+    };
+    const result = { committed: true };
+    expect(measureBridgeScan(() => { now += 13; return result; }, afterCommit, observe)).toBe(result);
+    const failure = new Error("original afterCommit failure");
+    let caught: unknown;
+    try {
+      measureBridgeScan(() => { now += 7; throw failure; }, afterCommit, observe);
+    } catch (error) { caught = error; }
+    expect(caught).toBe(failure);
+    expect(samples).toEqual([
+      { v: 1, ...afterCommit, holdMs: 13 },
+      { v: 1, ...afterCommit, holdMs: 7 },
+    ]);
+  });
+
   it("aggregates sites and fallback/retry counts without logging in the measured callback", () => {
     let now = 0;
     const lines: string[] = [];
@@ -81,16 +107,18 @@ describe("bridge fence timing and passive aggregation", () => {
     stats.record(sample(2, { retry: true, attempt: 1 }));
     stats.record(sample(10, { optimized: false, fallback: true, retry: true, attempt: 2 }));
     stats.record(sample(4, { site: "subscribeChanges.capture" }));
+    stats.record(sample(13, { site: "mirror.afterCommit", scope: "writeBatch.afterCommit", optimized: false }));
     now = 60_001;
     stats.record(sample(3)); // No synchronous rollover log in mirror.prepare/any callback.
     expect(lines).toEqual([]);
     stats.flushIfDue();
-    expect(lines).toHaveLength(2);
+    expect(lines).toHaveLength(3);
     expect(lines[0]).toBe("bridge write-fence v1 peer=far site=heldFence count=4 holdP50Ms=2 holdP99Ms=10 holdMaxMs=10 fallbackCount=1 optimizedCount=3 retryCount=2");
     expect(lines[1]).toContain("site=subscribeChanges.capture count=1");
+    expect(lines[2]).toBe("bridge write-fence v1 peer=far site=mirror.afterCommit count=1 holdP50Ms=13 holdP99Ms=13 holdMaxMs=13 fallbackCount=0 optimizedCount=0 retryCount=0");
     stats.close();
     stats.close();
-    expect(lines).toHaveLength(2);
+    expect(lines).toHaveLength(3);
   });
 
   it("keeps only a rolling 512 percentile samples but exact count and maximum", () => {
@@ -126,11 +154,64 @@ describe("StoreBridgeSide instrumented real SQLite paths", () => {
       observeWriteFence: () => { throw new Error("observer failure"); } });
     await local.mirror({ hosts: [], participants: [] });
     expect(lines).toEqual([]);
-    expect(bridge.drainWriteFenceObservations()).toEqual([expect.objectContaining({ site: "mirror.prepare", fallback: true })]);
+    expect(bridge.drainWriteFenceObservations()).toEqual([
+      expect.objectContaining({ site: "mirror.prepare", fallback: true }),
+      expect.objectContaining({ site: "mirror.afterCommit", scope: "writeBatch.afterCommit", optimized: false, fallback: false }),
+    ]);
     expect(bridge.drainWriteFenceObservations()).toEqual([]);
     await bridge.stop();
-    expect(lines).toHaveLength(1);
+    expect(lines).toHaveLength(2);
     expect(lines[0]).toContain("bridge write-fence v1 peer=far site=mirror.prepare count=1");
+    expect(lines[1]).toContain("bridge write-fence v1 peer=far site=mirror.afterCommit count=1");
+  });
+
+  it.each([false, true])("observes complete mirror afterCommit effects on changing and write-free SQLite passes (partial=%s)", async partial => {
+    const mesh = store();
+    const observations: BridgeFenceObservation[] = [];
+    const now = Date.now();
+    const side = new StoreBridgeSide(mesh, "far", () => now, false, { observeWriteFence: observation => {
+      observations.push(observation);
+      throw new Error("passive observer failure");
+    } });
+    let elapsed = 0, completed = 0;
+    vi.spyOn(performance, "now").mockImplementation(() => elapsed);
+    const planFor = CommitOutbox.prototype.plan;
+    vi.spyOn(CommitOutbox.prototype, "plan").mockImplementation(function (this: CommitOutbox) {
+      const plan = planFor.call(this);
+      return { ...plan, run: (view, halted) => {
+        expect(observations.filter(observation => observation.site === "mirror.afterCommit")).toHaveLength(completed);
+        const result = plan.run(view, halted); // Keep real lease effects and partial-branch admission.
+        elapsed += 13;
+        completed += 1;
+        return result;
+      } };
+    });
+    const changing: boolean[] = [];
+    const writeBatch = mesh.writeBatch.bind(mesh);
+    vi.spyOn(mesh, "writeBatch").mockImplementation(async input => {
+      elapsed += 100; // Outside the callback: not part of the sample.
+      const results = await writeBatch(input);
+      changing.push(results.some(result => result.applied));
+      elapsed += 200;
+      return results;
+    });
+    const identity: MeshIdentity = { id: "session:after-commit", name: "source", kind: "main" };
+    const record = { format: 1 as const, id: identity.id, rootId: identity.id, identity,
+      startedAt: now, updatedAt: now, expiresAt: now + 60_000 };
+    const presence = { hosts: [{ record, expiresAt: record.expiresAt }], participants: [], partial };
+    await expect(side.mirror(presence)).resolves.toBeUndefined();
+    const lease = readHostLease(mesh.root, identity.id);
+    expect(lease).toMatchObject({ id: identity.id, identityId: identity.id, startedAt: now });
+    await expect(side.mirror(presence)).resolves.toBeUndefined();
+    expect(readHostLease(mesh.root, identity.id)).toEqual(lease);
+    expect(changing).toEqual([true, false]);
+    expect(completed).toBe(2);
+    expect(observations.filter(observation => observation.site === "mirror.afterCommit")).toEqual([
+      expect.objectContaining({ scope: "writeBatch.afterCommit", holdMs: 13, attempt: 0,
+        optimized: false, fallback: false, retry: false }),
+      expect.objectContaining({ scope: "writeBatch.afterCommit", holdMs: 13, attempt: 0,
+        optimized: false, fallback: false, retry: false }),
+    ]);
   });
 
   it("attributes optimized and fallback notification capture without changing subscription behavior", async () => {

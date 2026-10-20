@@ -826,6 +826,13 @@ export class StoreBridgeSide implements BridgeSide {
     }, observation => this.#observeFence(observation));
   }
 
+  #afterCommitInWriteBatch<T>(attempt: number, operation: () => T): T {
+    return measureBridgeScan(operation, {
+      peer: this.peer, site: "mirror.afterCommit", scope: "writeBatch.afterCommit", attempt,
+      optimized: false, fallback: false, retry: attempt > 0,
+    }, observation => this.#observeFence(observation));
+  }
+
   async latestSequence(): Promise<number> {
     return this.store.latestSequence();
   }
@@ -1935,7 +1942,7 @@ export class StoreBridgeSide implements BridgeSide {
           // After the commit, on the committed owner, never a fresh per-record state read.
           // Partial snapshots may commit admitted lease updates, but must neither replay nor retry
           // any prior unlease effect until a complete snapshot can authorize withdrawal.
-          afterCommit: (view) => {
+          afterCommit: (view) => this.#afterCommitInWriteBatch(attempt, () => {
             if (!partial) { plan.run(view, halted); return; }
             let allowedLeaseEffects = 0;
             plan.run(view, () => {
@@ -1943,7 +1950,7 @@ export class StoreBridgeSide implements BridgeSide {
               if (allowedLeaseEffects < leases.length) { allowedLeaseEffects += 1; return false; }
               return true;
             });
-          },
+          }),
         });
       } catch (error) {
         if (error instanceof MirrorPlanStale) continue;

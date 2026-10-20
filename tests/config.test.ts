@@ -291,7 +291,7 @@ describe("host-only control incarnation rollout fence (#7514)", () => {
     }
   });
 });
-describe("host-only ephemeral NATS inbox settings (smarty-dev#15310)", () => {
+describe("host-only NATS inbox retention settings (smarty-dev#15310)", () => {
   const nats = {
     servers: ["tls://nats.example.test:4222"],
     credentials: "/run/fabric/runtime.creds",
@@ -311,12 +311,15 @@ describe("host-only ephemeral NATS inbox settings (smarty-dev#15310)", () => {
   };
 
   it("defaults to a persistent host and a one-hour idle threshold, and accepts configured bounds", () => {
-    expect(DEFAULT_FABRIC_CONFIG.mesh.nats).toMatchObject({ ephemeralHost: false, ephemeralInactiveSeconds: 3_600 });
-    expect(normalizeNats()).toMatchObject({ ephemeralHost: false, ephemeralInactiveSeconds: 3_600 });
+    expect(DEFAULT_FABRIC_CONFIG.mesh.nats).toMatchObject({ ephemeralHost: false, ephemeralInactiveSeconds: 3_600, inboxMaxAgeMs: 7 * 24 * 60 * 60_000 });
+    expect(normalizeNats()).toMatchObject({ ephemeralHost: false, ephemeralInactiveSeconds: 3_600, inboxMaxAgeMs: 7 * 24 * 60 * 60_000 });
     expect(normalizeNats({ ephemeralHost: true, ephemeralInactiveSeconds: 300 }))
       .toMatchObject({ ephemeralHost: true, ephemeralInactiveSeconds: 300 });
     expect(normalizeNats({ ephemeralHost: true, ephemeralInactiveSeconds: 86_400 }))
       .toMatchObject({ ephemeralHost: true, ephemeralInactiveSeconds: 86_400 });
+    expect(normalizeNats({ inboxMaxAgeMs: 60_000 })).toMatchObject({ inboxMaxAgeMs: 60_000 });
+    expect(normalizeNats({ inboxMaxAgeMs: 90 * 24 * 60 * 60_000 }))
+      .toMatchObject({ inboxMaxAgeMs: 90 * 24 * 60 * 60_000 });
   });
 
   it("rejects invalid opt-in values and thresholds", () => {
@@ -326,6 +329,10 @@ describe("host-only ephemeral NATS inbox settings (smarty-dev#15310)", () => {
     for (const value of [299, 86_401, 300.5, "300", null]) {
       expect(() => normalizeNats({ ephemeralInactiveSeconds: value }))
         .toThrow("mesh.nats.ephemeralInactiveSeconds must be an integer from 300 through 86400");
+    }
+    for (const value of [0, 59_999, 90 * 24 * 60 * 60_000 + 1, 60_000.5, "604800000", null]) {
+      expect(() => normalizeNats({ inboxMaxAgeMs: value }))
+        .toThrow("mesh.nats.inboxMaxAgeMs must be an integer from 60000 through 7776000000 milliseconds");
     }
   });
 
@@ -342,10 +349,10 @@ describe("host-only ephemeral NATS inbox settings (smarty-dev#15310)", () => {
         transport: "nats", hostTransport: "nats", nats: { ...nats, ephemeralHost: false, ephemeralInactiveSeconds: 600 },
       } }));
       fs.writeFileSync(path.join(cwd, ".pi", "fabric.json"), JSON.stringify({ mesh: {
-        nats: { ephemeralHost: true, ephemeralInactiveSeconds: 900 },
+        nats: { ephemeralHost: true, ephemeralInactiveSeconds: 900, inboxMaxAgeMs: 60_000 },
       } }));
       const config = loadFabricConfigForScope({ cwd, agentDir, projectTrusted: true }, "project");
-      expect(config.mesh.nats).toMatchObject({ ephemeralHost: false, ephemeralInactiveSeconds: 600 });
+      expect(config.mesh.nats).toMatchObject({ ephemeralHost: false, ephemeralInactiveSeconds: 600, inboxMaxAgeMs: 7 * 24 * 60 * 60_000 });
     } finally {
       if (originalNatsEnv === undefined) delete process.env.PI_FABRIC_MESH_NATS;
       else process.env.PI_FABRIC_MESH_NATS = originalNatsEnv;

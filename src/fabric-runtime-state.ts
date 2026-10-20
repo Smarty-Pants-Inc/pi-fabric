@@ -102,6 +102,7 @@ import { ParticipantDirectory, type FabricPeerListOptions } from "./topology/par
 import type { FabricTransport } from "./transport/types.js";
 import type { SessionChannel, SessionChannelIdentity, SessionChannelOpenOptions } from "./transport/nats/session-channel.js";
 import { rootParticipantName, validName } from "./topology/participant-name.js";
+import { createSandboxFabricMesh } from "./transport/sandbox/fabric-mesh.js";
 import { herdrNameLookup, herdrPaneId, readHerdrAgentName } from "./topology/herdr-name.js";
 import type {
   FabricParticipantInfo,
@@ -1067,6 +1068,8 @@ export class FabricRuntimeState {
       presencePassMs: 25_000,
       terminalActor: entry => (transport ? directoryActors : this.#actors)?.validateSessionActorTombstone(entry),
       presencePass: async () => {
+        // Commit notifications are primary; reuse maintenance without delaying lease renewal on a backlog.
+        if (transport && meshConfig.nats.events === true) void mesh.retryEventPublications();
         await rootPresenceAlarms(transport ? mesh : this.#mesh!, identity, hostId,
           (transport ? participants : this.#participants!).list({ scope: "project", includeStale: true, fresh: true }),
           transport ? meshConfig.rootPresenceAlarmMs : this.#config!.mesh.rootPresenceAlarmMs);
@@ -1303,6 +1306,25 @@ export class FabricRuntimeState {
       actorChildStore ? (ids) => actorChildStore.consumeLiveBatch(ids) : undefined);
     this.#completionInbox = completionInbox;
     const firstSeenAgents = new Map<string, number>();
+    const sandboxDependencies = transport?.kind === "nats" && agentConfig.sandbox.enabled
+      ? await (async () => {
+          const { createSandboxFabricMesh } = await import("./transport/sandbox/fabric-mesh.js");
+          const participantView = participants.participantView;
+          if (!participantView) throw new Error("Sandbox requires the live NATS participant view");
+          return {
+            meshTransport: "nats" as const,
+            org: process.env.SMARTY_ORG?.trim() || "smarty-pants",
+            mesh: createSandboxFabricMesh({
+              transport,
+              participants,
+              participantView,
+              control: this.#control!,
+              canSend: () => controlInboxBound && meshActivationReady && natsPublicationReady &&
+                this.#bindingFresh() && live.current() && participants.canConsumeMesh(),
+            }),
+          };
+        })()
+      : undefined;
     let markStoppedDelivered = (_id: string): void => {};
     recordMainRelease(sessionId, loadedFabricRoot(import.meta.url));
     this.#agents = new AgentManager(context.cwd, agentConfig, {
@@ -1322,6 +1344,7 @@ export class FabricRuntimeState {
       projectRoot,
       hostId,
       identityId: identity.id,
+      ...(sandboxDependencies ? { sandbox: sandboxDependencies } : {}),
       placementTerminalWriter: async (record) => {
         if (transport) {
           if (!transport.writePlacementTerminal) {

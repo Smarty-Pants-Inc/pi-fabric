@@ -31,6 +31,10 @@ export interface TransportStreamPolicy {
   readonly duplicateWindowMs: number;
   readonly replicas?: number;
   readonly discard?: DiscardPolicy;
+  /** Existing Fabric event streams may be server-unbounded; publishers still enforce the application cap. */
+  readonly allowUnboundedMaxMessageBytes?: boolean;
+  /** Explicit legacy compatibility for an existing stream with max_age: 0; never updates it. */
+  readonly allowUnboundedMaxAge?: boolean;
 }
 
 export const transportStreamConfig = (policy: TransportStreamPolicy): Partial<StreamConfig> => ({
@@ -50,13 +54,18 @@ export const transportStreamConfig = (policy: TransportStreamPolicy): Partial<St
   allow_direct: false,
 });
 
-export const assertTransportStream = (info: StreamInfo, wanted: Partial<StreamConfig>): void => {
+export const assertTransportStream = (info: StreamInfo, wanted: Partial<StreamConfig>, allowUnboundedMaxMessageBytes = false,
+  allowUnboundedMaxAge = false): void => {
+  const maxMessageBytesMatch = info.config.max_msg_size === wanted.max_msg_size ||
+    (allowUnboundedMaxMessageBytes && info.config.max_msg_size === -1);
+  const maxAgeMatch = info.config.max_age === wanted.max_age ||
+    (allowUnboundedMaxAge && info.config.max_age === 0);
   const same = info.config.storage === wanted.storage &&
     info.config.retention === wanted.retention &&
     info.config.discard === wanted.discard &&
     info.config.max_bytes === wanted.max_bytes &&
-    info.config.max_age === wanted.max_age &&
-    info.config.max_msg_size === wanted.max_msg_size &&
+    maxAgeMatch &&
+    maxMessageBytesMatch &&
     info.config.max_msgs === wanted.max_msgs &&
     info.config.max_msgs_per_subject === wanted.max_msgs_per_subject &&
     info.config.duplicate_window === wanted.duplicate_window &&
@@ -80,9 +89,61 @@ export const ensureTransportStream = async (manager: JetStreamManager, policy: T
       info = await manager.streams.info(policy.name);
     }
   }
-  assertTransportStream(info, wanted);
+  assertTransportStream(info, wanted, policy.allowUnboundedMaxMessageBytes, policy.allowUnboundedMaxAge);
   return info;
 };
+
+/** Org-wide Fabric event history. Fabric-store provisions this; runtime opens only verify it. */
+export interface NatsEventsStreamOptions {
+  readonly org: string;
+  /** Pass mesh.nats.provision. Only literal true permits creation; existing streams are never updated. */
+  readonly provision?: boolean;
+  readonly maxBytes?: number;
+  readonly maxMessageBytes?: number;
+  readonly duplicateWindowMs?: number;
+  readonly replicas?: number;
+}
+
+const normalizedNatsOrg = (org: string): string => {
+  if (typeof org !== "string" || /^[a-z0-9][a-z0-9-]{0,62}$/.exec(org)?.[0] !== org || org === "sys") {
+    throw new Error("NATS events org must be a GitHub-login slug");
+  }
+  return org.toUpperCase().replaceAll("-", "_");
+};
+
+export const natsEventsStreamName = (org: string): string => `FABRIC_EV_${normalizedNatsOrg(org)}`;
+export const natsGithubStreamName = (org: string): string => `GITHUB_${normalizedNatsOrg(org)}`;
+
+export const ensureNatsEventsStream = async (manager: JetStreamManager, options: NatsEventsStreamOptions): Promise<StreamInfo> => {
+  const name = natsEventsStreamName(options.org);
+  const maxBytes = options.maxBytes ?? 2_147_483_648;
+  const maxMessageBytes = options.maxMessageBytes ?? 1_048_576;
+  const duplicateWindowMs = options.duplicateWindowMs ?? 2 * 60 * 1_000;
+  const replicas = options.replicas ?? 1;
+  if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) throw new Error("NATS events maxBytes must be a positive finite safe integer");
+  if (!Number.isSafeInteger(maxMessageBytes) || maxMessageBytes <= 0 || maxMessageBytes > maxBytes) {
+    throw new Error("NATS events maxMessageBytes must be a positive safe integer no greater than maxBytes");
+  }
+  if (!Number.isSafeInteger(duplicateWindowMs) || duplicateWindowMs <= 0 || !Number.isSafeInteger(nanos(duplicateWindowMs))) {
+    throw new Error("NATS events duplicateWindowMs must be positive and representable in nanoseconds");
+  }
+  if (!Number.isSafeInteger(replicas) || replicas <= 0) throw new Error("NATS events replicas must be a positive safe integer");
+  return ensureTransportStream(manager, {
+    name,
+    subjects: [`fabric.ev.${options.org}.>`],
+    maxBytes,
+    maxAgeMs: 0,
+    maxMessageBytes,
+    duplicateWindowMs,
+    replicas,
+    discard: DiscardPolicy.New,
+    allowUnboundedMaxMessageBytes: true,
+  }, options.provision === true);
+};
+
+/** BUILD NOW provisioning entry: existing compatible streams are accepted; only an explicit admin path may create. */
+export const ensureFabricEventsStream = (manager: JetStreamManager, org: string, provision: boolean): Promise<StreamInfo> =>
+  ensureNatsEventsStream(manager, { org, provision });
 
 export interface TransportConsumerPolicy {
   readonly stream: string;

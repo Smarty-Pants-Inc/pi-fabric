@@ -89,6 +89,8 @@ const lazyEntryPoints = [
   "src/cli/mesh.ts",
   "src/cli/decisions.ts",
   "src/mesh/nats-auth/cli.ts",
+  "src/mesh/nats-auth/send-cli.ts",
+  "src/mesh/nats-auth/dispatch-cli.ts",
   // First-use host custody and participant snapshots keep stable lazy paths.
   "src/topology/host-leases.ts",
   "src/topology/participant-view.ts",
@@ -100,6 +102,8 @@ const lazyEntryPoints = [
   // Carrier selection and its first-use NATS module have stable lazy paths.
   "src/transport/index.ts",
   "src/transport/nats/index.ts",
+  "src/transport/sandbox/transport.ts",
+  "src/transport/sandbox/fabric-mesh.ts",
   "src/thinking-control.ts",
   "src/compaction/owner.ts",
   "src/compaction/orphan-repair.ts",

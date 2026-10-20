@@ -37,6 +37,8 @@ export interface FabricParticipantRecord {
    * participant via the mesh peer sequence. Never reused after a peer leaves.
    */
   label?: string;
+  /** Pod-injected sandbox correlation or Placement API binding for process/remote runs. */
+  placementRunId?: string;
   /** The root's fleet role, for example "project-agent" (smarty-dev#784). */
   role?: string;
   /** The Herdr pane a root Main runs in (smarty-dev#6758); display only, never authority. */
@@ -76,8 +78,7 @@ export interface FabricParticipantRecord {
   capabilities: FabricParticipantCapability[];
   cwd?: string;
   sessionId?: string;
-  /** Placement API binding, present only for enabled process/remote runs. */
-  placementRunId?: string;
+  /** Placement API execution metadata, present only for enabled process/remote runs. */
   placementKind?: AgentPlacementKind;
   placementHost?: string;
   expectedSeconds?: number;

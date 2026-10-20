@@ -3,6 +3,7 @@ import { isAbsolute } from "node:path";
 import { openBootstrapNatsConnection, openNatsConnection, type NatsPermissionPolicy } from "./connection.js";
 import { consumeDeadLetters, ensureDeadLetterConsumer, type DeadLetterEnvelope, type DeadLetterSink } from "./dead-letter.js";
 import { openNatsKv } from "./kv.js";
+import { DEFAULT_INBOX_MAX_AGE_MS, isValidInboxMaxAgeMs } from "./inbox-policy.js";
 import { ensureTransportStream, type TransportStreamPolicy } from "./provision.js";
 import {
   ADVISORY_CAPTURE_STREAM,
@@ -31,6 +32,17 @@ const streamPolicy = (name: string, subjects: readonly string[], maxAgeMs: numbe
   duplicateWindowMs: DUPLICATE_WINDOW_MS,
   replicas: 1,
 });
+
+const inboxMaxAgeMsArg = (args: readonly string[]): number => {
+  const indexes = args.flatMap((arg, index) => arg === "--inbox-max-age-ms" ? [index] : []);
+  if (indexes.length > 1) throw new Error("--inbox-max-age-ms must not be specified more than once");
+  if (indexes.length === 0) return DEFAULT_INBOX_MAX_AGE_MS;
+  const raw = args[indexes[0]! + 1];
+  if (!raw || !/^[1-9][0-9]*$/.test(raw)) throw new Error("--inbox-max-age-ms must be an integer from 60000 through 7776000000");
+  const value = Number(raw);
+  if (!isValidInboxMaxAgeMs(value)) throw new Error("--inbox-max-age-ms must be an integer from 60000 through 7776000000");
+  return value;
+};
 
 const machinesArg = (args: readonly string[]): string[] => {
   const index = args.indexOf("--machines");
@@ -100,6 +112,7 @@ const jsonLineSink = (file: string): DeadLetterSink => {
 
 async function provision(args: readonly string[]): Promise<void> {
   const machines = machinesArg(args);
+  const inboxMaxAgeMs = inboxMaxAgeMsArg(args);
   // Separate bootstrap authority is intentionally broader than machine runtime credentials.
   const connection = await openBootstrapNatsConnection({
     servers: requiredEnv("PI_FABRIC_NATS_SERVERS"),
@@ -114,9 +127,12 @@ async function provision(args: readonly string[]): Promise<void> {
     await openNatsKv(connection.js, { bucket: "fabric_leases", ttlMs: 15_000, markerTtlMs: 5 * 60_000 });
     await openNatsKv(connection.js, { bucket: "fabric_presence", ttlMs: 10 * 60_000, markerTtlMs: 5 * 60_000 });
     for (const target of machines) {
-      await ensureTransportStream(connection.manager, streamPolicy(transportInboxStream(target), [transportInboxStreamSubject(target),], 0));
+      await ensureTransportStream(connection.manager, {
+        ...streamPolicy(transportInboxStream(target), [transportInboxStreamSubject(target)], inboxMaxAgeMs),
+        allowUnboundedMaxAge: true,
+      });
     }
-    process.stdout.write(`${JSON.stringify({ ok: true, advisory: ADVISORY_CAPTURE_STREAM, machines })}\n`);
+    process.stdout.write(`${JSON.stringify({ ok: true, advisory: ADVISORY_CAPTURE_STREAM, machines, inboxMaxAgeMs })}\n`);
   } finally {
     await connection.close();
   }
@@ -223,6 +239,6 @@ export async function runTransportAdmin(args: readonly string[]): Promise<number
   else if (command === "drain") await drain(args);
   else if (command === "orphan") await orphan(args);
   else if (command === "dlq") await dlq(args);
-  else throw new Error("usage: fabric-transport-admin provision|dlq|drain|orphan [--ca-file <absolute path>]");
+  else throw new Error("usage: fabric-transport-admin provision [--inbox-max-age-ms <ms>] [--ca-file <absolute path>]|dlq|drain|orphan [--ca-file <absolute path>]");
   return 0;
 }

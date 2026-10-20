@@ -125,7 +125,7 @@ function lease(id = ROOT, incarnation = INCARNATION, updatedAt = Date.now()): Fa
   return { id, rootId: id, identityId: id, incarnation, pid: process.pid, pidStartTime: "1",
     bootId: "12345678-1234-4234-8234-123456789abc", updatedAt, expiresAt: updatedAt + 15_000 };
 }
-function fixture(options: { id?: string; record?: FabricParticipantRecord; lease?: FabricKvHostLease; seed?: boolean; now?: () => number; transportHostId?: string } = {}) {
+function fixture(options: { id?: string; record?: FabricParticipantRecord; lease?: FabricKvHostLease; seed?: boolean; now?: () => number; transportHostId?: string; leaseLive?: () => boolean } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "nats-local-projection-"));
   roots.push(root);
   const mesh = new MeshStore(path.join(root, "mesh"), 65_536, 1_000);
@@ -147,7 +147,7 @@ function fixture(options: { id?: string; record?: FabricParticipantRecord; lease
     kv(bucket: TransportBucket) { return bucket === "presence" ? presence : leases; },
     async drainState() { return { pending: 0, ackPending: 0 }; }, async close() {},
   };
-  const projection = new NatsLocalProjection({ mesh, transport, leaseLive: () => true,
+  const projection = new NatsLocalProjection({ mesh, transport, leaseLive: options.leaseLive ?? (() => true),
     ...(options.now ? { now: options.now, monotonic: options.now } : {}) });
   projections.push(projection);
   return { root, mesh, id, record, hostLease, presence, leases, transport, projection, presenceEntry, leaseEntry };
@@ -158,6 +158,55 @@ async function start(f: ReturnType<typeof fixture>): Promise<void> {
   await f.projection.whenReady();
 }
 async function waitUntil(check: () => void): Promise<void> { await vi.waitFor(check, { timeout: 2_000, interval: 5 }); }
+async function verifyDelayedReplayTombstone(bucket: "presence" | "leases"): Promise<void> {
+  let leaseLive = false;
+  const f = fixture({ seed: false, leaseLive: () => leaseLive });
+  const key = bucket === "presence" ? participantKvKey(f.id) : leaseKvKey(f.id);
+  const store = bucket === "presence" ? f.presence : f.leases;
+  const entry = bucket === "presence"
+    ? store.seed(key, `${f.record.ownerHostId}#${f.record.ownerIncarnation}`, f.record)
+    : store.seed(key, `${f.id}#${f.hostLease.incarnation}`, f.hostLease);
+  const entered = deferred<void>(), release = deferred<void>();
+  const abort = new AbortController();
+  const observer = store.watch<unknown>(">", abort.signal)[Symbol.asyncIterator]();
+  let held = false;
+  let replay: Promise<void> | undefined;
+  try {
+    await start(f);
+    expect((await observer.next()).value).toMatchObject({ type: "put", entry: { key, revision: entry.revision } });
+    expect((await observer.next()).value).toEqual({ type: "ready" });
+    if (bucket === "presence") {
+      const write = participantFiles.writeParticipantFileIf;
+      const localKey = localParticipantKey(f.id);
+      vi.spyOn(participantFiles, "writeParticipantFileIf").mockImplementation(async (...args) => {
+        if (args[1] === localKey && !held) { held = true; entered.resolve(); await release.promise; }
+        return write(...args);
+      });
+    } else {
+      const write = hostLeaseLock.withHostLeaseLock;
+      const file = hostLeasePath(f.mesh.root, f.id);
+      vi.spyOn(hostLeaseLock, "withHostLeaseLock").mockImplementation(async (mesh, target, operation, options) => {
+        if (target === file && !held) { held = true; entered.resolve(); await release.promise; }
+        return write(mesh, target, operation, options);
+      });
+    }
+
+    leaseLive = true;
+    replay = f.projection.resumeAfterLeaseRecovery();
+    await entered.promise; // Re-read finished; the local writer is deliberately delayed.
+    expect(await store.delete(key, entry.revision)).toBe(true);
+    expect((await observer.next()).value).toMatchObject({ type: "gone", key });
+    release.resolve();
+    await replay;
+    if (bucket === "presence") await waitUntil(() => expect(readParticipantFile(f.mesh.root, localParticipantKey(f.id))).toBeUndefined());
+    else await waitUntil(() => expect(readHostLease(f.mesh.root, f.id)).toBeUndefined());
+  } finally {
+    release.resolve();
+    abort.abort();
+    await observer.return?.();
+    await replay?.catch(() => undefined);
+  }
+}
 function projectedParticipantRevision(meshRoot: string, id: string): number | undefined {
   const projected = readParticipantFile(meshRoot, localParticipantKey(id)) as
     { natsProjection?: { revision?: unknown } } | undefined;
@@ -331,6 +380,102 @@ describe("NATS local presence projection", () => {
     again.presence.pause(0, false);
     again.presence.deliverTo(0, { type: "reset" });
     await waitUntil(() => expect(readParticipantFile(again.mesh.root, localParticipantKey(again.id))).toBeUndefined());
+  });
+
+  it("serializes a delayed participant replay with its later tombstone", async () => {
+    await verifyDelayedReplayTombstone("presence");
+  });
+
+  it("serializes a delayed host-lease replay with its later tombstone", async () => {
+    await verifyDelayedReplayTombstone("leases");
+  });
+
+  it("does not replay a cached participant after an outage tombstone in the watch stream", async () => {
+    let leaseLive = false;
+    const f = fixture({ leaseLive: () => leaseLive });
+    const key = participantKvKey(f.id);
+    const writer = vi.spyOn(participantFiles, "writeParticipantFileIf");
+    const observerAbort = new AbortController();
+    const observer = f.presence.watch<unknown>(">", observerAbort.signal)[Symbol.asyncIterator]();
+    try {
+      await start(f); // The snapshot is cached while the owner lease is suspended.
+      expect(readParticipantFile(f.mesh.root, localParticipantKey(f.id))).toBeUndefined();
+      expect((await observer.next()).value).toMatchObject({ type: "put", entry: { key, revision: f.presenceEntry!.revision } });
+      expect((await observer.next()).value).toEqual({ type: "ready" });
+
+      f.presence.pause(0); // The projection misses the tombstone as its watch is disconnected.
+      expect(await f.presence.delete(key, f.presenceEntry!.revision)).toBe(true);
+      expect((await observer.next()).value).toMatchObject({ type: "gone", key });
+      leaseLive = true; // Reconnect/reacquire starts the deferred projection replay.
+      await f.projection.resumeAfterLeaseRecovery();
+      expect(writer).not.toHaveBeenCalled();
+      expect(readParticipantFile(f.mesh.root, localParticipantKey(f.id))).toBeUndefined();
+
+      // The source watch has no follow-up PUT, and the local projection never materializes the stale row.
+      expect(f.presence.watchers[1]?.queue).toEqual([]);
+      expect(writer).not.toHaveBeenCalled();
+      expect(readParticipantFile(f.mesh.root, localParticipantKey(f.id))).toBeUndefined();
+    } finally {
+      observerAbort.abort();
+      await observer.return?.();
+    }
+  });
+
+  it("replays the current participant revision after an outage update", async () => {
+    let leaseLive = false;
+    const f = fixture({ leaseLive: () => leaseLive });
+    const key = participantKvKey(f.id);
+    const observerAbort = new AbortController();
+    const observer = f.presence.watch<unknown>(">", observerAbort.signal)[Symbol.asyncIterator]();
+    try {
+      await start(f);
+      expect((await observer.next()).value).toMatchObject({ type: "put", entry: { key, revision: f.presenceEntry!.revision } });
+      expect((await observer.next()).value).toEqual({ type: "ready" });
+      f.presence.pause(0);
+      const changed = participant(f.id, INCARNATION, "Recovered Main", f.record.updatedAt + 1);
+      const revision = await f.presence.put(key, owner, changed, f.presenceEntry!.revision);
+      expect((await observer.next()).value).toMatchObject({ type: "put", entry: { key, revision, value: changed } });
+
+      leaseLive = true;
+      await f.projection.resumeAfterLeaseRecovery();
+      expect(readParticipantFile(f.mesh.root, localParticipantKey(f.id))).toMatchObject({
+        value: changed, natsProjection: { revision },
+      });
+      expect(f.projection.metrics().participantWrites).toBe(1);
+    } finally {
+      observerAbort.abort();
+      await observer.return?.();
+    }
+  });
+
+  it("retries failed pending-key reads when a later watch update arrives", async () => {
+    let leaseLive = false;
+    const f = fixture({ leaseLive: () => leaseLive });
+    await start(f);
+    const pKey = participantKvKey(f.id), hKey = leaseKvKey(f.id);
+    const presenceGet = f.presence.get.bind(f.presence), leaseGet = f.leases.get.bind(f.leases);
+    let failPresence = true, failLease = true;
+    vi.spyOn(f.presence, "get").mockImplementation(async <T>(key: string) => {
+      if (key === pKey && failPresence) { failPresence = false; throw new Error("injected participant re-read failure"); }
+      return presenceGet<T>(key);
+    });
+    vi.spyOn(f.leases, "get").mockImplementation(async <T>(key: string) => {
+      if (key === hKey && failLease) { failLease = false; throw new Error("injected lease re-read failure"); }
+      return leaseGet<T>(key);
+    });
+
+    leaseLive = true;
+    await expect(f.projection.resumeAfterLeaseRecovery()).rejects.toThrow("NATS local projection lease recovery failed");
+    expect(failPresence).toBe(false);
+    expect(failLease).toBe(false);
+    expect(readParticipantFile(f.mesh.root, localParticipantKey(f.id))).toBeUndefined();
+    expect(readHostLease(f.mesh.root, f.id)).toBeUndefined();
+
+    const triggerId = "session:projection-retry-trigger", triggerIncarnation = "projection-retry-trigger";
+    const trigger = participant(triggerId, triggerIncarnation, "Retry trigger", f.record.updatedAt + 1);
+    await f.presence.put(participantKvKey(triggerId), `${triggerId}#${triggerIncarnation}`, trigger, 0);
+    await waitUntil(() => expect(readParticipantFile(f.mesh.root, localParticipantKey(f.id))).toMatchObject({ value: f.record }));
+    await waitUntil(() => expect(readHostLease(f.mesh.root, f.id)).toMatchObject({ incarnationToken: INCARNATION }));
   });
 
   it("retains recreated participant and lease rows when the other projection receives an older tombstone", async () => {

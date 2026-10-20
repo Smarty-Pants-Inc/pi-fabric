@@ -1,9 +1,10 @@
 import { createHash } from "node:crypto";
+import { performance } from "node:perf_hooks";
 import fs from "node:fs";
 import type { MeshIdentity, MeshStateEntry, MeshStore } from "../mesh/store.js";
 import { hostLeasePath, readHostLeaseCurrent, readHostLeases, removeHostLeaseIf, sameHostLeaseVersion, writeHostLease,
   TRANSPORT_HOST_LEASE_TTL_MS, type FabricHostLease } from "./host-leases.js";
-import { withHostLeaseLock, type HostLeaseMesh } from "./host-lease-lock.js";
+import { HostLeaseLockBusyError, withHostLeaseLock, type HostLeaseLockOptions, type HostLeaseMesh } from "./host-lease-lock.js";
 import { readParticipantFiles, removeParticipantFileIf, writeParticipantFileIf } from "./participant-files.js";
 import { leaseValue, presenceValue } from "./participant-view.js";
 import type { FabricKvHostLease, FabricParticipantRecord } from "./types.js";
@@ -11,6 +12,9 @@ import type { FabricTransport, TransportBucket, TransportKvEntry } from "../tran
 
 const PARTICIPANT_PREFIX = "topology/participants/";
 const MARKER = "natsProjection";
+const INITIAL_HOST_LEASE_LOCK_RETRY_MS = 10_000;
+const HOST_LEASE_LOCK_RETRY_BASE_MS = 10;
+const HOST_LEASE_LOCK_RETRY_MAX_MS = 250;
 const markerFor = (entry: TransportKvEntry<unknown>): NatsProjectionMarker => {
   const record = entry.value as Record<string, unknown>;
   const incarnation = typeof record.ownerIncarnation === "string" ? record.ownerIncarnation :
@@ -118,6 +122,12 @@ export class NatsLocalProjection {
   #started = false;
   #closed = false;
   #initialReadyResolved = false;
+  #initialLockRetryDeadline: number | undefined;
+  #recoveryLockRetryDeadline: number | undefined;
+  #resumingAfterLeaseRecovery: Promise<void> | undefined;
+  readonly #pendingEntries = new Map<string, { bucket: BucketKind; entry: TransportKvEntry<unknown> }>();
+  readonly #projectionQueues = new Map<string, Promise<void>>();
+  #replayAfterUpdateRequested = false;
 
   constructor(readonly options: NatsLocalProjectionOptions) {
     if (options.transport.kind !== "nats") throw new TypeError("NATS local projection requires mesh.transport=nats");
@@ -164,6 +174,28 @@ export class NatsLocalProjection {
     };
   }
 
+  #serializeProjectionKey<T>(key: string, operation: () => Promise<T>): Promise<T> {
+    const previous = this.#projectionQueues.get(key) ?? Promise.resolve();
+    const current = previous.then(operation, operation);
+    const settled = current.then(() => undefined, () => undefined);
+    this.#projectionQueues.set(key, settled);
+    void settled.then(() => {
+      if (this.#projectionQueues.get(key) === settled) this.#projectionQueues.delete(key);
+    });
+    return current;
+  }
+
+  #retryPendingAfterWatchEvent(): void {
+    if (this.#closed || !this.options.leaseLive() || this.#pendingEntries.size === 0) return;
+    if (this.#resumingAfterLeaseRecovery) {
+      this.#replayAfterUpdateRequested = true;
+      return;
+    }
+    void this.resumeAfterLeaseRecovery().catch(error => {
+      try { this.options.onError?.(error); } catch { /* diagnostic only */ }
+    });
+  }
+
   async #watch(bucket: BucketKind): Promise<void> {
     const kv = bucket === "presence" ? this.#presence : this.#leases;
     const kind = bucket === "presence" ? "p" : "h";
@@ -178,11 +210,18 @@ export class NatsLocalProjection {
           if (event.type === "reset") {
             observed = new Set();
             this.#ready.delete(bucket);
+            const staleKeys = [...this.#pendingEntries].filter(([, pending]) => pending.bucket === bucket).map(([key]) => key);
+            for (const key of staleKeys) {
+              await this.#serializeProjectionKey(key, async () => {
+                if (this.#pendingEntries.get(key)?.bucket === bucket) this.#pendingEntries.delete(key);
+              });
+            }
             continue;
           }
           if (event.type === "ready") {
             await this.#reconcile(bucket, observed);
             this.#ready.add(bucket);
+            this.#retryPendingAfterWatchEvent();
             if (this.#ready.size === 2 && !this.#initialReadyResolved) {
               this.#initialReadyResolved = true;
               this.#resolveInitial();
@@ -191,11 +230,12 @@ export class NatsLocalProjection {
           }
           if (event.type === "put") {
             observed.add(event.entry.key);
-            await this.#put(bucket, event.entry);
+            await this.#serializeProjectionKey(`${bucket}:${event.entry.key}`, () => this.#put(bucket, event.entry));
           } else {
             observed.delete(event.key);
-            await this.#gone(bucket, event.key, event.revision);
+            await this.#serializeProjectionKey(`${bucket}:${event.key}`, () => this.#gone(bucket, event.key, event.revision));
           }
+          this.#retryPendingAfterWatchEvent();
         }
         if (this.#closed) return;
         throw new Error(`NATS ${bucket} projection watch ended`);
@@ -232,21 +272,90 @@ export class NatsLocalProjection {
     });
   }
 
+  async #withHostLeaseLock<T>(file: string, operation: () => T, options: HostLeaseLockOptions = {}): Promise<T> {
+    let attempt = 0;
+    for (;;) {
+      if (!this.#closed) this.#abort.signal.throwIfAborted();
+      try {
+        return await withHostLeaseLock(this.options.mesh as unknown as HostLeaseMesh, file, operation,
+          { ...options, ...(this.#closed ? {} : { signal: this.#abort.signal }) });
+      } catch (error) {
+        if (this.#closed || this.#initialReadyResolved && this.#recoveryLockRetryDeadline === undefined ||
+          !(error instanceof HostLeaseLockBusyError)) throw error;
+        const retryDeadline = this.#initialReadyResolved ? this.#recoveryLockRetryDeadline! :
+          this.#initialLockRetryDeadline ??= performance.now() + INITIAL_HOST_LEASE_LOCK_RETRY_MS;
+        const remaining = retryDeadline - performance.now();
+        if (remaining <= 0) throw error;
+        const backoff = Math.min(HOST_LEASE_LOCK_RETRY_MAX_MS,
+          HOST_LEASE_LOCK_RETRY_BASE_MS * 2 ** Math.min(attempt, 5));
+        const delay = Math.min(remaining, Math.floor(backoff * (0.5 + Math.random())));
+        attempt += 1;
+        await this.#waitBeforeRetry(delay);
+      }
+    }
+  }
+
   async #put(bucket: BucketKind, entry: TransportKvEntry<unknown>): Promise<void> {
     if (entry.machine !== this.options.transport.self.machine) return;
     const value = bucket === "presence" ? presenceValue(entry) : leaseValue(entry);
+    const pendingKey = `${bucket}:${entry.key}`;
     if (!value) {
+      this.#pendingEntries.delete(pendingKey);
       await this.#remove(bucket, entry.key, entry.revision);
       return;
     }
+    const pending = { bucket, entry };
+    this.#pendingEntries.set(pendingKey, pending);
     if (!this.options.leaseLive()) return;
     if (bucket === "presence") await this.#writeParticipant(entry, value as FabricParticipantRecord);
     else await this.#writeHostLease(entry, value as FabricKvHostLease);
+    if (this.options.leaseLive() && this.#pendingEntries.get(pendingKey) === pending) this.#pendingEntries.delete(pendingKey);
   }
 
   async #gone(bucket: BucketKind, key: string, revision: number): Promise<void> {
     if (!key.startsWith(`${this.options.transport.self.machine}.${bucket === "presence" ? "p" : "h"}.`)) return;
+    this.#pendingEntries.delete(`${bucket}:${key}`);
     await this.#remove(bucket, key, revision);
+  }
+
+  /** Replay snapshot rows deferred while this process's own NATS lease was suspended. */
+  resumeAfterLeaseRecovery(): Promise<void> {
+    if (this.#closed || !this.options.leaseLive()) return Promise.resolve();
+    if (this.#resumingAfterLeaseRecovery) {
+      this.#replayAfterUpdateRequested = true;
+      return this.#resumingAfterLeaseRecovery;
+    }
+    this.#recoveryLockRetryDeadline = performance.now() + INITIAL_HOST_LEASE_LOCK_RETRY_MS;
+    const work = (async () => {
+      const failures: unknown[] = [];
+      for (const [key, pending] of [...this.#pendingEntries]) {
+        if (this.#closed || !this.options.leaseLive()) break;
+        try {
+          await this.#serializeProjectionKey(key, async () => {
+            if (this.#closed || !this.options.leaseLive() || this.#pendingEntries.get(key) !== pending) return;
+            const kv = pending.bucket === "presence" ? this.#presence : this.#leases;
+            const current = await kv.get<unknown>(pending.entry.key, AbortSignal.timeout(5_000));
+            if (this.#closed || !this.options.leaseLive() || this.#pendingEntries.get(key) !== pending) return;
+            if (!current) {
+              await this.#remove(pending.bucket, pending.entry.key, pending.entry.revision, markerFor(pending.entry));
+              if (this.#pendingEntries.get(key) === pending) this.#pendingEntries.delete(key);
+              return;
+            }
+            await this.#put(pending.bucket, current);
+          });
+        } catch (error) { failures.push(error); }
+      }
+      if (failures.length) throw new AggregateError(failures, "NATS local projection lease recovery failed");
+    })().finally(() => {
+      if (this.#resumingAfterLeaseRecovery === work) this.#resumingAfterLeaseRecovery = undefined;
+      this.#recoveryLockRetryDeadline = undefined;
+      if (this.#replayAfterUpdateRequested) {
+        this.#replayAfterUpdateRequested = false;
+        this.#retryPendingAfterWatchEvent();
+      }
+    });
+    this.#resumingAfterLeaseRecovery = work;
+    return work;
   }
 
   async #writeParticipant(entry: TransportKvEntry<unknown>, record: FabricParticipantRecord): Promise<void> {
@@ -319,7 +428,7 @@ export class NatsLocalProjection {
       } catch { this.#leaseCache.delete(lease.id); }
     };
     let wrote = false;
-    await withHostLeaseLock(this.options.mesh as unknown as HostLeaseMesh, file, () => {
+    await this.#withHostLeaseLock(file, () => {
       this.#hostLeaseReconcileReads++;
       if (!this.options.leaseLive()) return;
       const current = readHostLeaseCurrent(this.options.mesh.root, lease.id);
@@ -418,7 +527,7 @@ export class NatsLocalProjection {
     if (!lease) { this.#hostLeaseIdsByKv.delete(key); return; }
     const file = hostLeasePath(this.options.mesh.root, hostId);
     let removed = false;
-    await withHostLeaseLock(this.options.mesh as unknown as HostLeaseMesh, file, () => {
+    await this.#withHostLeaseLock(file, () => {
       this.#hostLeaseReconcileReads++;
       const current = readHostLeaseCurrent(this.options.mesh.root, lease.id);
       const marker = this.#readHostMarker(lease.id);
@@ -443,15 +552,16 @@ export class NatsLocalProjection {
         if (!marker || marker.machine !== this.options.transport.self.machine) continue;
         this.#participantKeysByKv.set(marker.kvKey, local.key);
         if (observed.has(marker.kvKey)) continue;
-        this.#participantReconcileReads++;
-        this.#kvReconcileReads++;
-        let current: TransportKvEntry<unknown> | undefined;
-        current = await this.#presence.get<unknown>(marker.kvKey, AbortSignal.timeout(5_000));
-        if (current) {
-          const value = presenceValue(current);
-          if (value) { if (!this.#closed) await this.#put("presence", current); continue; }
-          await this.#remove("presence", marker.kvKey, current.revision);
-        } else await this.#remove("presence", marker.kvKey, 0, marker);
+        await this.#serializeProjectionKey(`presence:${marker.kvKey}`, async () => {
+          this.#participantReconcileReads++;
+          this.#kvReconcileReads++;
+          const current = await this.#presence.get<unknown>(marker.kvKey, AbortSignal.timeout(5_000));
+          if (current) {
+            const value = presenceValue(current);
+            if (value) { if (!this.#closed) await this.#put("presence", current); return; }
+            await this.#remove("presence", marker.kvKey, current.revision);
+          } else await this.#remove("presence", marker.kvKey, 0, marker);
+        });
       }
       return;
     }
@@ -465,15 +575,16 @@ export class NatsLocalProjection {
       if (!marker || marker.machine !== this.options.transport.self.machine) continue;
       this.#hostLeaseIdsByKv.set(marker.kvKey, local.id);
       if (observed.has(marker.kvKey)) continue;
-      this.#hostLeaseReconcileReads++;
-      this.#kvReconcileReads++;
-      let current: TransportKvEntry<unknown> | undefined;
-      current = await this.#leases.get<unknown>(marker.kvKey, AbortSignal.timeout(5_000));
-      if (current) {
-        const value = leaseValue(current);
-        if (value) { if (!this.#closed) await this.#put("leases", current); continue; }
-        await this.#remove("leases", marker.kvKey, current.revision);
-      } else await this.#remove("leases", marker.kvKey, 0, marker);
+      await this.#serializeProjectionKey(`leases:${marker.kvKey}`, async () => {
+        this.#hostLeaseReconcileReads++;
+        this.#kvReconcileReads++;
+        const current = await this.#leases.get<unknown>(marker.kvKey, AbortSignal.timeout(5_000));
+        if (current) {
+          const value = leaseValue(current);
+          if (value) { if (!this.#closed) await this.#put("leases", current); return; }
+          await this.#remove("leases", marker.kvKey, current.revision);
+        } else await this.#remove("leases", marker.kvKey, 0, marker);
+      });
     }
   }
 
@@ -482,8 +593,10 @@ export class NatsLocalProjection {
     this.#closed = true;
     this.#abort.abort();
     await Promise.allSettled(this.#watchTasks);
+    await this.#resumingAfterLeaseRecovery?.catch(() => undefined);
     // Shutdown follows KV withdrawal. Re-read before cleanup because an abort can overtake
     // queued tombstones; a failed get retains the local file rather than guessing absence.
     await Promise.all([this.#reconcile("presence", new Set()), this.#reconcile("leases", new Set())]);
+    this.#pendingEntries.clear();
   }
 }

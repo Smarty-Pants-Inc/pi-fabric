@@ -67,16 +67,22 @@ export interface PathBHarnessOptions {
   readonly binary?: string;
   /** Opt into the shared runtime user's org-scoped session-channel grants. */
   readonly org?: string;
+  /** Mint the runtime agent with the opt-in shared-org event grants. Requires org. */
+  readonly events?: boolean;
   /** Issue real CLI artifacts without changing the default hand-built fault-injection fixture. */
   readonly identityFactory?: (root: string) => PathBIdentity | Promise<PathBIdentity>;
-  /** Deliberately misissued grants for fail-closed identity-check tests. */
+  /** Additional publish allows for agent superset-verification tests. */
   readonly additionalAgentPublish?: readonly string[];
+  /** Remove expected publish allows for fail-closed identity-check tests. */
+  readonly removeAgentPublish?: readonly string[];
   /** Additional signed mesh bindings for multi-tag template expansion tests. */
   readonly additionalAgentMeshes?: readonly string[];
-  /** Deliberately misissued extra subscribe allows for fail-closed identity-check tests. */
+  /** Additional subscribe allows for agent superset-verification tests. */
   readonly additionalAgentSubscribe?: readonly string[];
   /** Deliberately widened operator subscriptions; production operator remains metadata-only. */
   readonly additionalOperatorSubscribe?: readonly string[];
+  /** Deliberately add response permission; production operator has no response grant. */
+  readonly additionalOperatorResponses?: { readonly max: number };
   /** Deliberately removed agent publish denies for fail-closed identity-check tests. */
   readonly removeAgentDeny?: readonly string[];
   /** Serve client TLS from an owned ephemeral test CA (openssl subprocess). Server cert SANs default to localhost/127.0.0.1. */
@@ -116,10 +122,17 @@ function createTestTls(root: string, dnsNames: readonly string[], ipAddresses: r
 }
 
 function faultedAgentTemplate(options: PathBHarnessOptions): RoleTemplate {
-  const base = roleTemplateWithPathB("agent", { custodyStream: PATH_B_PERMISSION_POLICY.custodyStream, livenessStream: PATH_B_PERMISSION_POLICY.livenessStream }, PATH_B_MACHINES, options.org);
-  const removed = new Set(options.removeAgentDeny ?? []);
+  const policy = options.events === true
+    ? { events: true, ...(options.org === undefined ? {} : { org: options.org }) }
+    : options.org;
+  const base = roleTemplateWithPathB("agent", { custodyStream: PATH_B_PERMISSION_POLICY.custodyStream, livenessStream: PATH_B_PERMISSION_POLICY.livenessStream }, PATH_B_MACHINES, policy);
+  const removedPublish = new Set(options.removeAgentPublish ?? []);
+  const removedDeny = new Set(options.removeAgentDeny ?? []);
   return {
-    pub: { allow: [...base.pub.allow, ...(options.additionalAgentPublish ?? [])], deny: base.pub.deny.filter((subject) => !removed.has(subject)) },
+    pub: {
+      allow: [...base.pub.allow.filter((subject) => !removedPublish.has(subject)), ...(options.additionalAgentPublish ?? [])],
+      deny: base.pub.deny.filter((subject) => !removedDeny.has(subject)),
+    },
     sub: { allow: [...base.sub.allow, ...(options.additionalAgentSubscribe ?? [])] },
     ...(base.allow_responses ? { allow_responses: base.allow_responses } : {}),
   };
@@ -355,7 +368,11 @@ export class PathBHarness {
           {
             key: maintainerSigning.getPublicKey(),
             role: "operator",
-            template: { ...operatorTemplate, sub: { allow: [...operatorTemplate.sub.allow, ...(options.additionalOperatorSubscribe ?? [])] } },
+            template: {
+              ...operatorTemplate,
+              ...(options.additionalOperatorResponses === undefined ? {} : { allow_responses: options.additionalOperatorResponses }),
+              sub: { allow: [...operatorTemplate.sub.allow, ...(options.additionalOperatorSubscribe ?? [])] },
+            },
           },
           { key: principalSigning.getPublicKey(), role: "principal", template: roleTemplateWithPathB("principal", streams, PATH_B_MACHINES) },
           {

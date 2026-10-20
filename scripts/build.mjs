@@ -88,6 +88,8 @@ const lazyEntryPoints = [
   "src/memory/extractive-history.ts",
   "src/cli/mesh.ts",
   "src/cli/decisions.ts",
+  // NATS event CLI is loaded only when its subcommand runs; keep that package-local path stable.
+  "src/cli/events.ts",
   "src/mesh/nats-auth/cli.ts",
   "src/mesh/nats-auth/send-cli.ts",
   // First-use host custody and participant snapshots keep stable lazy paths.

@@ -152,6 +152,31 @@ export function roleTemplate(role: NatsRole, input: RoleStreams): RoleTemplate {
 export type PathBRole = "agent" | "operator";
 export interface PathBRoleTemplate extends RoleTemplate {}
 
+/** Alpha shared-org event grants; absent/false keeps the existing Path B scope unchanged. */
+export interface PathBEventsOptions {
+  events?: boolean;
+  org?: string;
+}
+
+function pathBEventAllows({ events, org }: PathBEventsOptions): string[] {
+  if (events !== undefined && typeof events !== "boolean") fail("events");
+  if (events !== true) return [];
+  if (typeof org !== "string" || /^[a-z0-9][a-z0-9-]{0,62}$/.exec(org)?.[0] !== org || org === "sys") fail("org");
+  // Shared org authority, NOT actor isolation: smarty-dev#15355. No github.> publish grant.
+  const streamOrg = org.toUpperCase().replaceAll("-", "_");
+  const eventStream = `FABRIC_EV_${streamOrg}`;
+  const streams = [eventStream, `GITHUB_${streamOrg}`];
+  return [
+    `fabric.ev.${org}.>`,
+    `$JS.API.STREAM.INFO.${eventStream}`,
+    ...streams.flatMap(stream => [
+      ...["CREATE", "INFO", "MSG.NEXT", "DELETE"].map((verb) => `$JS.API.CONSUMER.${verb}.${stream}.>`),
+      `$JS.API.CONSUMER.DURABLE.CREATE.${stream}.>`,
+      `$JS.ACK.${stream}.>`
+    ]),
+  ];
+}
+
 const PATH_B_MACHINE = /^[a-z0-9][a-z0-9-]{0,31}$/;
 const PATH_B_MACHINE_TAG = "{{tag(machine)}}";
 const SERVICE_ORG = /^[a-z0-9][a-z0-9-]{0,62}$/;
@@ -212,11 +237,21 @@ const PATH_B_RESERVED_MUTATIONS = [
   "$JS.API.ACCOUNT.STREAM.CANCEL_MOVE.*.FABRIC_ADV",
 ];
 
-function pathBRuntime(roleMachine: string, machines: readonly string[] = [], org?: string): PathBRoleTemplate {
+function pathBOptions(value: string | PathBEventsOptions | undefined): PathBEventsOptions {
+  const options: PathBEventsOptions = typeof value === "string" ? { org: value } : value ?? {};
+  if (options.events !== undefined && typeof options.events !== "boolean") fail("events");
+  if (options.org !== undefined) serviceOrg(options.org);
+  if (options.events === true) pathBEventAllows(options);
+  return options;
+}
+
+function pathBRuntime(roleMachine: string, machines: readonly string[] = [], options: PathBEventsOptions = {}): PathBRoleTemplate {
+  const { org } = options;
   if (PATH_B_OPERATOR_MACHINE_PATTERN.test(roleMachine)) fail("machine");
   const inbox = `FABRIC_IN_${roleMachine}`;
   const privateInboxes = roleMachine === PATH_B_MACHINE_TAG ? machines.map((machine) => `FABRIC_IN_${pathBMachine(machine)}`) : [inbox];
   const allow = [
+    ...pathBEventAllows(options),
     `fabric.in.*.*.*.*.${roleMachine}`,
     `$JS.API.STREAM.INFO.${inbox}`,
     ...["CREATE", "INFO", "MSG.NEXT", "DELETE"].map((verb) => `$JS.API.CONSUMER.${verb}.${inbox}.>`),
@@ -302,9 +337,9 @@ function pathBOperator(roleMachine: string, machines: readonly string[]): PathBR
 }
 
 /** Compose Path B with the existing role only when the mint input explicitly opts in. */
-export function roleTemplateWithPathB(role: NatsRole | "operator", input: RoleStreams, machines: readonly string[] = [], org?: string): RoleTemplate {
-  // Supplying an org never bypasses validation, even for roles that receive no service grants.
-  if (org !== undefined) serviceOrg(org);
+export function roleTemplateWithPathB(role: NatsRole | "operator", input: RoleStreams, machines: readonly string[] = [], orgOrEvents?: string | PathBEventsOptions): RoleTemplate {
+  // Preserve the existing org-string API while adding opt-in event scope options.
+  const events = pathBOptions(orgOrEvents);
   if (role === "operator") {
     const path = pathBOperator(PATH_B_MACHINE_TAG, machines);
     const base = roleTemplate("maintainer", input);
@@ -315,7 +350,7 @@ export function roleTemplateWithPathB(role: NatsRole | "operator", input: RoleSt
   }
   const base = roleTemplate(role, input);
   if (role === "agent") {
-    const path = pathBRuntime(PATH_B_MACHINE_TAG, machines, org);
+    const path = pathBRuntime(PATH_B_MACHINE_TAG, machines, events);
     return {
       pub: { allow: pathBUnique([...base.pub.allow, ...path.pub.allow]), deny: pathBUnique([...base.pub.deny, ...path.pub.deny]) },
       sub: { allow: path.sub.allow },
@@ -331,9 +366,9 @@ export function roleTemplateWithPathB(role: NatsRole | "operator", input: RoleSt
   };
 }
 
-export function pathBRoleTemplate(role: PathBRole, machine = PATH_B_MACHINE_TAG, machines: readonly string[] = [], org?: string): PathBRoleTemplate {
-  if (org !== undefined) serviceOrg(org);
-  if (role === "agent") return pathBRuntime(pathBMachine(machine), machines, org);
+export function pathBRoleTemplate(role: PathBRole, machine = PATH_B_MACHINE_TAG, machines: readonly string[] = [], orgOrEvents?: string | PathBEventsOptions): PathBRoleTemplate {
+  const events = pathBOptions(orgOrEvents);
+  if (role === "agent") return pathBRuntime(pathBMachine(machine), machines, events);
   if (role === "operator") return pathBOperator(pathBMachine(machine), machines);
   throw new Error("invalid Path B role");
 }

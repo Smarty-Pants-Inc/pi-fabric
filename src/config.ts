@@ -568,7 +568,7 @@ const meshNatsEphemeralInactiveSeconds = (value: unknown): number => {
 /** Messaging/rollback settings fail visibly in the same typed config-error family as E9. */
 export class FabricMeshNatsConfigError extends Error {
   readonly code = "FABRIC_MESH_TRANSPORT_CONFIG";
-  constructor(readonly field: "operatorMachine" | "rollbackHoldUntil" | "servers" | "custodyStream" | "livenessStream" | "pathBMachines" | "org" | "tls" | "allowInsecureLoopback" | "verifyMachine" | "ephemeralHost" | "ephemeralInactiveSeconds", requirement: string) {
+  constructor(readonly field: "operatorMachine" | "rollbackHoldUntil" | "servers" | "custodyStream" | "livenessStream" | "pathBMachines" | "org" | "tls" | "allowInsecureLoopback" | "verifyMachine" | "events" | "provision" | "ephemeralHost" | "ephemeralInactiveSeconds", requirement: string) {
     super(`mesh.nats.${field} ${requirement}`);
     this.name = "FabricMeshNatsConfigError";
   }
@@ -577,6 +577,12 @@ export class FabricMeshNatsConfigError extends Error {
 export interface FabricMeshNatsConfig {
   /** Stream num_replicas on create; an existing stream with a different count is refused (default 1). */
   replicas: number;
+  /** Opt-in NATS event log; normalized configs supply false. */
+  events?: boolean;
+  /** Org slug for event and session-channel subjects; required when events is true. */
+  org?: string;
+  /** Explicit event-stream provisioning gate; normalized configs supply false. Does not grant admin rights. */
+  provision?: boolean;
   /** Messaging connection settings. No credential is read while loading config. */
   servers?: string | string[];
   /** Required literal policy mapping in NATS mode; full permission verification stays in the lazy adapter. */
@@ -584,8 +590,6 @@ export interface FabricMeshNatsConfig {
   livenessStream?: string;
   /** Explicit runtime inventory (1..64 unique, non-operator machine literals). */
   pathBMachines?: string[];
-  /** Organization used by service-facing NATS clients and session-channel subjects. */
-  org?: string;
   /** Required trust anchor in NATS mode. Config never reads the CA or permits verification overrides. */
   tls?: { ca?: string; caFile?: string };
   /** Host credential file path, consumed only by the NATS adapter. */
@@ -604,19 +608,23 @@ export interface FabricMeshNatsConfig {
   ephemeralInactiveSeconds?: number;
 }
 
+const meshNatsFlag = (value: unknown, field: "events" | "provision"): boolean => {
+  if (value === undefined) return false;
+  if (typeof value === "boolean") return value;
+  throw new FabricMeshNatsConfigError(field, "must be a boolean");
+};
+
+const meshNatsOrg = (value: unknown, events: boolean): string | undefined => {
+  if (value === undefined && !events) return undefined;
+  if (typeof value === "string" && /^[a-z0-9][a-z0-9-]{0,62}$/.exec(value)?.[0] === value && value !== "sys") return value;
+  throw new FabricMeshNatsConfigError("org", "must be a non-sys org slug (1..63 lowercase letters, digits or hyphens, starting with a letter or digit); required when events is true");
+};
+
 const meshNatsString = (value: unknown, field: "credentials" | "machine"): string | undefined => {
   if (value === undefined) return undefined;
   if (typeof value !== "string") throw new Error(`mesh.nats.${field} must be a string`);
   if (field === "machine" && /^[a-z0-9][a-z0-9-]{0,31}$/.exec(value)?.[0] !== value) {
     throw new Error("mesh.nats.machine must match /^[a-z0-9][a-z0-9-]{0,31}$/");
-  }
-  return value;
-};
-
-const meshNatsOrg = (value: unknown): string | undefined => {
-  if (value === undefined) return undefined;
-  if (typeof value !== "string" || !/^[a-z0-9][a-z0-9-]{0,62}$/.test(value) || value === "sys") {
-    throw new FabricMeshNatsConfigError("org", "must be a non-system org name");
   }
   return value;
 };
@@ -719,7 +727,7 @@ const meshNatsConfig = (value: unknown, transport: FabricMeshTransport): FabricM
     const machine = meshNatsString(nats.machine, "machine");
     const rollbackHoldUntil = meshNatsRollbackHoldUntil(nats.rollbackHoldUntil);
     return {
-      replicas: meshNatsReplicas(nats.replicas), inboxLanes: 8,
+      replicas: meshNatsReplicas(nats.replicas), inboxLanes: 8, events: false, provision: false,
       ephemeralHost: meshNatsEphemeralHost(nats.ephemeralHost),
       ephemeralInactiveSeconds: meshNatsEphemeralInactiveSeconds(nats.ephemeralInactiveSeconds),
       ...(machine !== undefined ? { machine } : {}),
@@ -739,6 +747,9 @@ const meshNatsConfig = (value: unknown, transport: FabricMeshTransport): FabricM
   for (const field of ["allowInsecureLoopback", "verifyMachine"] as const) {
     if (field in nats || field in messaging) throw new FabricMeshNatsConfigError(field, "is not supported in NATS config");
   }
+  const events = meshNatsFlag(messaging.events, "events");
+  const org = meshNatsOrg(messaging.org, events);
+  const provision = meshNatsFlag(messaging.provision, "provision");
   const servers = meshNatsServers(messaging.servers);
   const custodyStream = meshNatsStream(messaging.custodyStream, "custodyStream");
   const livenessStream = meshNatsStream(messaging.livenessStream, "livenessStream");
@@ -747,7 +758,6 @@ const meshNatsConfig = (value: unknown, transport: FabricMeshTransport): FabricM
   }
   const pathBMachines = meshNatsPathBMachines(messaging.pathBMachines);
   const tls = meshNatsTls(messaging.tls);
-  const org = meshNatsOrg(messaging.org);
   const ephemeralHost = meshNatsEphemeralHost(messaging.ephemeralHost);
   const ephemeralInactiveSeconds = meshNatsEphemeralInactiveSeconds(messaging.ephemeralInactiveSeconds);
   const credentials = meshNatsString(messaging.credentials, "credentials");
@@ -756,7 +766,7 @@ const meshNatsConfig = (value: unknown, transport: FabricMeshTransport): FabricM
   const rollbackHoldUntil = meshNatsRollbackHoldUntil(messaging.rollbackHoldUntil);
   return {
     replicas: meshNatsReplicas(nats.replicas),
-    servers, custodyStream, livenessStream, pathBMachines, tls,
+    servers, custodyStream, livenessStream, pathBMachines, tls, events, provision,
     ...(org !== undefined ? { org } : {}),
     ...(credentials !== undefined ? { credentials } : {}),
     ...(machine !== undefined ? { machine } : {}),
@@ -1126,7 +1136,7 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     lockProtocol: 1,
     stateBackend: "file",
     transport: "file",
-    nats: { replicas: 1, inboxLanes: 8, ephemeralHost: false, ephemeralInactiveSeconds: 3_600 },
+    nats: { replicas: 1, inboxLanes: 8, events: false, provision: false, ephemeralHost: false, ephemeralInactiveSeconds: 3_600 },
     enabled: true,
     announce: false,
     actorScope: "project",

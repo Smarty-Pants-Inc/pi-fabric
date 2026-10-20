@@ -5,7 +5,8 @@ import { fileURLToPath } from "node:url";
 
 /**
  * `pi-fabric` out-of-process CLI. A standalone entry: it never imports the
- * extension graph, and each subcommand module loads only when invoked.
+ * extension graph. Mesh, decisions and NATS subcommands load on invocation; the small
+ * events command is linked here to keep the standalone CLI's package path stable.
  * Subcommands take their remaining argv and return a process exit code.
  */
 type FabricCliCommand = (argv: string[]) => Promise<number>;
@@ -14,6 +15,7 @@ const commands: Record<string, () => Promise<FabricCliCommand>> = {
   mesh: async () => (await import("./mesh.js")).runMeshCli,
   decisions: async () => (await import("./decisions.js")).runDecisionsCli,
   nats: async () => (await import("../mesh/nats-auth/cli.js")).runNatsCli,
+  events: async () => (await import("./events.js")).runEventsCli,
 };
 
 const usage = (): string => [

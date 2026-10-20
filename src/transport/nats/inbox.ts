@@ -39,6 +39,8 @@ import {
   LEASE_TTL_MS, PRESENCE_TTL_MS, PLACEMENT_TERMINAL_BUCKET, PLACEMENT_TERMINAL_TTL_MS,
   openNatsKv, openNatsKvForMachine, type NatsKvStore,
 } from "./kv.js";
+import type { MeshEventPublisherBinding, MeshStore } from "../../mesh/store.js";
+import type { NatsEventsPublisher } from "./events-publish.js";
 
 const DEFAULT_MAX_BYTES = 1_073_741_824;
 const DEFAULT_MAX_MESSAGE_BYTES = 1_048_576;
@@ -68,14 +70,18 @@ export interface NatsTransportOptions extends NatsPermissionPolicy {
   readonly ephemeralHost?: boolean;
   /** Idle expiration in seconds when ephemeralHost is enabled (300..86400). */
   readonly ephemeralInactiveSeconds?: number;
+  /** Opt-in actor-topic publishing, using this transport's verified connection. */
+  readonly events?: boolean;
+  readonly mesh?: MeshStore;
   readonly signal?: AbortSignal;
 }
 
 type OpenOptions = NatsTransportOptions | FabricTransportOptions;
-type ResolvedNatsOptions = Required<Pick<NatsTransportOptions, "servers" | "machine" | "hostId" | "credentials" | "custodyStream" | "livenessStream" | "pathBMachines" | "maxBytes" | "maxMessageBytes" | "duplicateWindowMs" | "requestTimeoutMs" | "provision" | "ephemeralHost" | "ephemeralInactiveSeconds">> & {
+type ResolvedNatsOptions = Required<Pick<NatsTransportOptions, "servers" | "machine" | "hostId" | "credentials" | "custodyStream" | "livenessStream" | "pathBMachines" | "maxBytes" | "maxMessageBytes" | "duplicateWindowMs" | "requestTimeoutMs" | "provision" | "ephemeralHost" | "ephemeralInactiveSeconds" | "events">> & {
   readonly org?: string;
   readonly name?: string;
   readonly tls?: TlsOptions;
+  readonly mesh?: MeshStore;
   readonly signal?: AbortSignal;
 };
 
@@ -106,16 +112,19 @@ const normalizeOptions = (options: OpenOptions): ResolvedNatsOptions => {
       maxMessageBytes: options.maxMessageBytes ?? DEFAULT_MAX_MESSAGE_BYTES,
       duplicateWindowMs: options.duplicateWindowMs ?? DEFAULT_DUPLICATE_WINDOW_MS,
       requestTimeoutMs: options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
-      provision: options.provision ?? false,
+      // Event-mode runtimes never provision streams, including through the direct-options port.
+      provision: options.events === true ? false : options.provision ?? false,
       ephemeralHost: options.ephemeralHost ?? false,
       ephemeralInactiveSeconds: options.ephemeralInactiveSeconds ?? DEFAULT_EPHEMERAL_INACTIVE_SECONDS,
+      events: options.events ?? false,
+      ...(options.mesh === undefined ? {} : { mesh: options.mesh }),
       ...(options.signal === undefined ? {} : { signal: options.signal }),
     } as ResolvedNatsOptions;
   }
   const config = options.config as unknown as { nats?: {
     servers?: string | readonly string[]; machine?: string; credentials?: string;
     custodyStream?: string; livenessStream?: string; pathBMachines?: readonly string[]; org?: string; tls?: TlsOptions;
-    ephemeralHost?: boolean; ephemeralInactiveSeconds?: number;
+    ephemeralHost?: boolean; ephemeralInactiveSeconds?: number; events?: boolean;
   } };
   const nats = config.nats;
   // Production config never enables plaintext; the loopback opt-in is a direct test option only.
@@ -145,6 +154,8 @@ const normalizeOptions = (options: OpenOptions): ResolvedNatsOptions => {
     provision: false,
     ephemeralHost: nats?.ephemeralHost ?? false,
     ephemeralInactiveSeconds: nats?.ephemeralInactiveSeconds ?? DEFAULT_EPHEMERAL_INACTIVE_SECONDS,
+    events: nats?.events ?? false,
+    mesh: options.mesh,
     ...(options.signal === undefined ? {} : { signal: options.signal }),
   } as ResolvedNatsOptions;
 };
@@ -187,6 +198,7 @@ interface NatsSession {
   readonly js: JetStreamClient;
   readonly manager: JetStreamManager;
   readonly kvStores: Readonly<Record<"leases" | "presence", NatsKvStore>>;
+  readonly eventsPublisher?: NatsEventsPublisher;
   unsubscribe?: () => void;
 }
 
@@ -207,7 +219,7 @@ const openNatsSession = async (options: ResolvedNatsOptions, signal?: AbortSigna
     custodyStream: options.custodyStream,
     livenessStream: options.livenessStream,
     pathBMachines: options.pathBMachines,
-    ...(options.org === undefined ? {} : { org: options.org }),
+    ...(options.events ? { events: true, org: options.org! } : options.org === undefined ? {} : { org: options.org }),
     ...(options.tls === undefined ? {} : { tls: options.tls }),
     timeoutMs: options.requestTimeoutMs,
     ...(signal === undefined ? {} : { signal }),
@@ -236,7 +248,18 @@ const openNatsSession = async (options: ResolvedNatsOptions, signal?: AbortSigna
     const consumer = await ensureTransportConsumer(manager.consumers, consumerPolicy);
     assertAlive();
     if (consumer.config.description !== consumerPolicy.description) throw new TransportInvalidError("transport inbox owner description mismatch");
-    return { connection, js: connection.js, manager, kvStores: { leases, presence } };
+    let eventsPublisher: NatsEventsPublisher | undefined;
+    if (options.events) {
+      const { openNatsEventsPublisher } = await import("./index.js");
+      assertAlive();
+      // Fabric-store owns stream creation with admin credentials. Even mesh.nats.provision=true
+      // cannot grant runtime creation: require the existing FABRIC_EV_<NORMALIZED_ORG> stream.
+      // Its canonical layout/policy belongs to provision.ts; GitHub uses its separate GITHUB stream.
+      eventsPublisher = await openNatsEventsPublisher(connection, { org: options.org!, provision: false });
+      assertAlive();
+    }
+    return { connection, js: connection.js, manager, kvStores: { leases, presence },
+      ...(eventsPublisher ? { eventsPublisher } : {}) };
   } catch (error) {
     await connection.close().catch(() => undefined);
     signal?.throwIfAborted();
@@ -362,6 +385,7 @@ class NatsTransportImpl implements FabricTransport {
   #placementTerminalStore: { readonly epoch: number; readonly store: NatsKvStore } | undefined;
   readonly #waiters = new Set<ReadyWaiter>();
   readonly #sessionChannels = new NatsSessionChannelManager();
+  #eventPublisher: MeshEventPublisherBinding | undefined;
 
   private constructor(session: NatsSession, options: ResolvedNatsOptions) {
     this.#session = session;
@@ -380,6 +404,8 @@ class NatsTransportImpl implements FabricTransport {
     rawOptions.signal?.throwIfAborted();
     const options = normalizeOptions(rawOptions);
     if (!options.hostId) throw new Error("hostId is required");
+    if (typeof options.events !== "boolean") throw new Error("NATS transport events must be a boolean");
+    if (options.events && (!options.org || !options.mesh)) throw new Error("NATS transport events require org and mesh");
     for (const [key, value] of Object.entries(options)) {
       if (["servers", "machine", "hostId", "name", "credentials", "ephemeralHost"].includes(key)) continue;
       if (typeof value === "number" && (!Number.isSafeInteger(value) || value <= 0)) throw new Error(`${key} must be positive`);
@@ -389,6 +415,21 @@ class NatsTransportImpl implements FabricTransport {
       throw new Error("ephemeralInactiveSeconds must be an integer from 300 through 86400");
     }
     const transport = new NatsTransportImpl(await openNatsSession(options, options.signal), options);
+    try {
+      if (options.events) {
+        transport.#eventPublisher = options.mesh!.bindEventPublisher(`nats:${options.org!}`, event => {
+          const publisher = transport.#assertOpen().eventsPublisher;
+          if (!publisher) throw new TransportUnavailableError("NATS event publisher is unavailable");
+          return publisher.publish(event);
+        }, event => {
+          if (typeof event.id !== "string" || !validMessageId(event.id)) throw new TransportInvalidError("invalid NATS event id");
+          if (event.topic.split(".").some(token => token.length === 0)) throw new TransportInvalidError("invalid NATS event topic");
+        });
+      }
+    } catch (error) {
+      await transport.close().catch(() => undefined);
+      throw error;
+    }
     // Cover an abort between acquisition and owner-listener registration.
     if (options.signal?.aborted) {
       await transport.close().catch(() => undefined);
@@ -438,6 +479,8 @@ class NatsTransportImpl implements FabricTransport {
     });
     void (session.connection as NatsConnectionHandle & { closed(): Promise<void | Error> }).closed().then(() => this.#loseSession(session));
     this.#resolveWaiters(session);
+    // A retained outbox row retries against the NEW verified publisher, with its original event id.
+    void this.#eventPublisher?.retry();
   }
 
   #loseSession(session: NatsSession): void {
@@ -693,8 +736,12 @@ class NatsTransportImpl implements FabricTransport {
     this.#session = undefined;
     session?.unsubscribe?.();
     const reconnect = this.#reconnectTask;
+    const eventsClosed = this.#eventPublisher?.close();
     this.#closeTask = (async () => {
+      // Join the bounded in-flight attempt before closing its connection. Unsent/uncertain rows
+      // remain durable for reload; close never republishes under a new local event id.
       try {
+        await eventsClosed;
         if (session) {
           if (this.#options.ephemeralHost) {
             let timer: ReturnType<typeof setTimeout> | undefined;

@@ -24,6 +24,8 @@ export interface NatsPermissionPolicy {
   readonly custodyStream: string;
   readonly livenessStream: string;
   readonly pathBMachines: readonly string[];
+  /** Optional shared-org event grants; absent/false preserves the existing Path B scope. */
+  readonly events?: boolean;
   readonly org?: string;
 }
 
@@ -237,7 +239,11 @@ const expectedPermissions = (role: "agent" | "operator", machine: string, policy
     throw new Error(MISMATCH);
   }
   const input = { custodyStream: policy.custodyStream, livenessStream: policy.livenessStream };
-  const template = roleTemplateWithPathB(role, input, machines, policy.org);
+  const scope = {
+    ...(policy.events === undefined ? {} : { events: policy.events }),
+    ...(policy.org === undefined ? {} : { org: policy.org }),
+  };
+  const template = roleTemplateWithPathB(role, input, machines, scope);
   // The installed d231bd15 account is a deliberate rollout exception. It is a separate frozen template, not a
   // subtraction from the current one, because other runtime lanes add grants to the current template as well.
   const legacy = role === "agent" ? legacyRoleTemplateWithPathB("agent", input, machines) : template;
@@ -411,8 +417,11 @@ export const openNatsConnection = async (options: NatsConnectionOptions): Promis
   if (typeof options.machine !== "string") throw new Error("NATS machine is required");
   const machine = validateMachine(options.machine);
   const policy: NatsPermissionPolicy = {
-    custodyStream: options.custodyStream, livenessStream: options.livenessStream,
-    pathBMachines: options.pathBMachines, ...(options.org === undefined ? {} : { org: options.org }),
+    custodyStream: options.custodyStream,
+    livenessStream: options.livenessStream,
+    pathBMachines: options.pathBMachines,
+    ...(options.events === undefined ? {} : { events: options.events }),
+    ...(options.org === undefined ? {} : { org: options.org }),
   };
   return open(options, (nc, timeoutMs, auth) => verifyIdentity(nc, timeoutMs, auth, expected!), (auth) => {
     // Fail closed before dialing: missing/invalid policy or a signed identity that cannot match.

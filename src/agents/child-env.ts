@@ -31,6 +31,7 @@ export const childMeshTransportEnvironment = (
       custodyStream, livenessStream,
       pathBMachines: pathBMachines === undefined ? undefined : [...pathBMachines],
       org,
+      events: mesh.nats.events === true ? true : undefined,
       tls: tls === undefined ? undefined : { ca: tls.ca, caFile: tls.caFile },
     });
   }

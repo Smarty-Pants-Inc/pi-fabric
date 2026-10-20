@@ -1068,6 +1068,8 @@ export class FabricRuntimeState {
       presencePassMs: 25_000,
       terminalActor: entry => (transport ? directoryActors : this.#actors)?.validateSessionActorTombstone(entry),
       presencePass: async () => {
+        // Commit notifications are primary; reuse maintenance without delaying lease renewal on a backlog.
+        if (transport && meshConfig.nats.events === true) void mesh.retryEventPublications();
         await rootPresenceAlarms(transport ? mesh : this.#mesh!, identity, hostId,
           (transport ? participants : this.#participants!).list({ scope: "project", includeStale: true, fresh: true }),
           transport ? meshConfig.rootPresenceAlarmMs : this.#config!.mesh.rootPresenceAlarmMs);

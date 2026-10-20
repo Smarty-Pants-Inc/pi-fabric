@@ -15,6 +15,8 @@ import { publishFailure } from "./errors.js";
 
 export const LEASES_BUCKET = "fabric_leases";
 export const PRESENCE_BUCKET = "fabric_presence";
+export const PLACEMENT_TERMINAL_BUCKET = "fabric_placement_terminal";
+export const PLACEMENT_TERMINAL_TTL_MS = 900_000;
 export const LEASE_TTL_MS = 15_000;
 export const PRESENCE_TTL_MS = 10 * 60_000;
 export const KV_TTL_MS = LEASE_TTL_MS;
@@ -158,6 +160,38 @@ export class NatsKvStore implements TransportKv {
     }
     if (signal?.aborted) throw new TransportUncertainError(key, undefined, { cause: signal.reason });
     return true;
+  }
+
+  /** Raw runId-keyed Placement receipt. This is separate from machine-scoped Fabric KV. */
+  async writePlacementTerminal(record: import("../../placement/terminal.js").PlacementTerminalRecord): Promise<void> {
+    const terminalModule: typeof import("../../placement/terminal.js") = await import("../../placement/terminal.js");
+    const { PlacementTerminalWriteError } = terminalModule;
+    try {
+      if (this.#policy.bucket !== PLACEMENT_TERMINAL_BUCKET) throw new PlacementTerminalWriteError();
+      terminalModule.assertPlacementTerminalRecord(record);
+      const key = record.placementRunId;
+      const encoded = JSON.stringify(record);
+      if (new TextEncoder().encode(encoded).byteLength > KV_MAX_VALUE_SIZE) throw new PlacementTerminalWriteError();
+      const same = (entry: KvEntry | null | undefined): boolean => {
+        if (!entry || entry.operation !== "PUT") return false;
+        try { return new TextDecoder("utf-8", { fatal: true }).decode(entry.value) === encoded; }
+        catch { return false; }
+      };
+      const existing = await this.#bucket.get(key);
+      if (existing) {
+        if (same(existing)) return;
+        throw new PlacementTerminalWriteError();
+      }
+      try { await this.#bucket.create(key, encoded); }
+      catch (error) {
+        if (same(await this.#bucket.get(key).catch(() => undefined))) return;
+        throw new PlacementTerminalWriteError(error);
+      }
+      if (!same(await this.#bucket.get(key))) throw new PlacementTerminalWriteError();
+    } catch (error) {
+      if (error instanceof PlacementTerminalWriteError) throw error;
+      throw new PlacementTerminalWriteError(error);
+    }
   }
 
   #assertWriter(key: string, revision: number, create: boolean): void {

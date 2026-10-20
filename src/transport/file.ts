@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { MeshEvent, MeshPublishInput } from "../mesh/event-log.js";
 import type { MeshStore } from "../mesh/store.js";
+import type { PlacementTerminalRecord } from "../placement/terminal.js";
 import { watchBridgeStore } from "../mesh/change-notifier.js";
 import {
   TransportUncertainError, TransportUnavailableError, TransportUnsupportedError,
@@ -339,6 +340,10 @@ export class FileTransport implements FabricTransport {
   }
 
   kv(_bucket: TransportBucket): TransportKv { throw new TransportUnsupportedError("File transport has no KV"); }
+  async writePlacementTerminal(record: PlacementTerminalRecord): Promise<void> {
+    const { writePlacementTerminalFile } = await import("../placement/terminal.js");
+    writePlacementTerminalFile(this.mesh.root, this.self.hostId, record);
+  }
   async drainState(signal?: AbortSignal): Promise<TransportDrainState> { signal?.throwIfAborted(); return this.reader.drainState(); }
   async close(): Promise<void> {
     if (this.#closed) return;

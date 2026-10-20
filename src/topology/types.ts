@@ -1,7 +1,7 @@
 import type { FabricActorInfo } from "../actors/types.js";
 import type { FabricAgentRunner, FabricAgentTransport } from "../config.js";
 import type { MeshIdentity } from "../mesh/store.js";
-import type { AgentUsage } from "../agents/types.js";
+import type { AgentPlacementKind, AgentUsage } from "../agents/types.js";
 import type { FabricHostLease } from "./host-leases.js";
 
 /** `provider`: work a Fabric provider registered through `context.participants`. */
@@ -76,6 +76,11 @@ export interface FabricParticipantRecord {
   capabilities: FabricParticipantCapability[];
   cwd?: string;
   sessionId?: string;
+  /** Placement API binding, present only for enabled process/remote runs. */
+  placementRunId?: string;
+  placementKind?: AgentPlacementKind;
+  placementHost?: string;
+  expectedSeconds?: number;
   model?: string;
   thinking?: string;
   startedAt: number;

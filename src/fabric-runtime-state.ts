@@ -343,10 +343,10 @@ export class FabricRuntimeState {
     const root = this.#participants.self();
     if (!root?.sessionId) throw new Error("Fabric Main session identity is unavailable");
     const natsTransport = transport as FabricTransport & {
-      openSessionChannel(identity: SessionChannelIdentity, channel: SessionChannelOpenOptions): SessionChannel;
+      openSessionChannel(identity: SessionChannelIdentity, channel: SessionChannelOpenOptions): Promise<SessionChannel>;
     };
     if (typeof natsTransport.openSessionChannel !== "function") throw new Error("NATS session channels are unavailable");
-    const channel = natsTransport.openSessionChannel({
+    const channel = await natsTransport.openSessionChannel({
       org,
       hostId: transport.self.hostId,
       sessionId: root.sessionId,

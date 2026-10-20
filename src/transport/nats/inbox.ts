@@ -677,7 +677,7 @@ class NatsTransportImpl implements FabricTransport {
     }
   }
 
-  openSessionChannel(identity: SessionChannelIdentity, options: SessionChannelOpenOptions): SessionChannel {
+  openSessionChannel(identity: SessionChannelIdentity, options: SessionChannelOpenOptions): Promise<SessionChannel> {
     if (!this.#options.org) throw new Error("mesh.nats.org is required to open a Fabric session channel");
     if (!this.#session) throw this.#unavailable();
     return this.#sessionChannels.open({ ...identity, org: this.#options.org, hostId: this.self.hostId }, options);

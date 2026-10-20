@@ -34,7 +34,7 @@ export type Clock = EncodeClock;
 
 export interface ScopedSigningKey {
   key: string;
-  role: NatsRole | "operator" | "gateway";
+  role: NatsRole | "operator";
   template: RoleTemplate;
   description?: string;
 }
@@ -124,7 +124,7 @@ const TAG = /^[a-z][a-z0-9_-]{0,31}:[a-z0-9][a-z0-9._-]{0,127}$/;
 const MESH_TAG_VALUE = /^[0-9a-f]{32}$/;
 // One NATS subject, optionally with `{{subject()}}` / `{{tag(x)}}` / `{{name()}}` templates; no whitespace.
 const SUBJECT = /^[A-Za-z0-9_$*>{}().:-]+$/;
-const ROLES: readonly string[] = ["agent", "principal", "maintainer", "break-glass", "operator", "gateway"];
+const ROLES: readonly string[] = ["agent", "principal", "maintainer", "break-glass", "operator"];
 
 const utf8 = new TextEncoder();
 const strictUtf8 = new TextDecoder("utf-8", { fatal: true });
@@ -362,13 +362,15 @@ function template(value: unknown): Record<string, unknown> {
   let allowResponses: { max: number } | undefined;
   if (input.allow_responses !== undefined) {
     const response = record(input.allow_responses, "signingKeys.template.allow_responses", ["max"]);
-    if (typeof response.max !== "number" || !Number.isSafeInteger(response.max) || response.max !== 1) fail("signingKeys.template.allow_responses");
+    if (typeof response.max !== "number" || !Number.isSafeInteger(response.max) || response.max !== 16) {
+      fail("signingKeys.template.allow_responses");
+    }
     allowResponses = { max: response.max };
   }
   return {
     pub: { allow: subjects(pub.allow, "signingKeys.template", false), deny: subjects(pub.deny, "signingKeys.template", true) },
     sub: subOut,
-    ...(allowResponses ? { allow_responses: allowResponses } : {}),
+    ...(allowResponses ? { resp: allowResponses } : {}),
     subs: NO_LIMIT,
     data: NO_LIMIT,
     payload: NO_LIMIT,

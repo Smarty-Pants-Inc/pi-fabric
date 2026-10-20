@@ -16,7 +16,7 @@ import type { EncodeClock } from "./jwt.js";
  * Decision C: the hosted proof is T15 (owner fabric-store); a server cannot check the caller's inventory.
  */
 
-export type IssuedCredentialRole = "agent" | "principal" | "maintainer" | "break-glass" | "operator" | "gateway";
+export type IssuedCredentialRole = "agent" | "principal" | "maintainer" | "break-glass" | "operator";
 
 /** Public metadata recorded for every issued org user (the minter's user metadata carries these fields). */
 export interface IssuedCredential {
@@ -38,7 +38,7 @@ export class NatsRetirementError extends Error {
   }
 }
 
-const ROLES: readonly string[] = ["agent", "principal", "maintainer", "break-glass", "operator", "gateway"];
+const ROLES: readonly string[] = ["agent", "principal", "maintainer", "break-glass", "operator"];
 const PUBLIC_KEY = /^[AU][A-Z2-7]{55}$/;
 
 function fail(field: string): never {

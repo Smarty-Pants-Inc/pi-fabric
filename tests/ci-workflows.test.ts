@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import { parse } from "yaml";
 
 type Step = {
+  name?: string;
   uses?: string;
   run?: string;
   if?: string;
@@ -50,6 +51,21 @@ describe("CI Node runtime prerequisites", () => {
     expect(realPi).toBeGreaterThan(build);
     expect(steps[realPi]!.if).toBe("runner.os == 'Linux'");
     expect(steps[realPi]!.env).toEqual({ FABRIC_6207_REAL_PI: "1" });
+  });
+
+  it("requires the pinned NATS broker for session-channel acceptance on Linux", () => {
+    const { steps } = parse(fs.readFileSync(new URL(".github/workflows/test.yml", root), "utf8")).jobs.check as { steps: Step[] };
+    const install = steps.find((step) => step.name === "Install pinned nats-server for session-channel acceptance");
+    const acceptance = steps.find((step) => step.name === "Session-channel real-broker acceptance");
+    expect(install?.if).toBe("runner.os == 'Linux'");
+    expect(install?.run).toBe("bash scripts/install-pinned-nats-server.sh");
+    const installer = fs.readFileSync(new URL("scripts/install-pinned-nats-server.sh", root), "utf8");
+    expect(installer).toContain("version=2.14.7");
+    expect(installer).toContain("e5c20b1cb2c0566b54c544312e91e011f9e130c5c80f16a14f4cf28ef30b8be2");
+    expect(installer).toContain("https://github.com/nats-io/nats-server/releases/download/v${version}");
+    expect(acceptance?.if).toBe("runner.os == 'Linux'");
+    expect(acceptance?.env).toEqual({ PI_FABRIC_REQUIRE_NATS: "1", NATS_EXPECTED_SERVER_VERSION: "2.14.7" });
+    expect(acceptance?.run).toBe("bunx vitest run --retry=0 tests/nats-session-channel.test.ts");
   });
 
   // Our deliberately pinned jobs keep their own Node version (fork CI policy: our jobs stay as

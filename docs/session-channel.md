@@ -6,7 +6,7 @@ The session channel lets an in-process Pi extension expose request/reply operati
 
 Pi gives every extension factory its own `ExtensionAPI` object. The `pi.events` bus is shared across those objects, so consumers use the order-independent handoff; `pi.fabric` on their own object will not expose Fabric's API. `pi.fabric.sessionChannel` is also exposed on Fabric's own `pi` object.
 
-```ts
+```ts host
 import { requestSessionChannelApi } from "pi-fabric";
 
 export default (pi) => {

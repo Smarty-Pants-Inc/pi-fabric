@@ -13,7 +13,9 @@ import { openNatsConnection } from "../src/transport/nats/connection.js";
 import { createPathBHarness, resolveNatsBinary, teardownWithin, type PathBHarness } from "./helpers/nats-cluster.js";
 
 const binary = resolveNatsBinary() ?? "";
-if (!binary && process.env.NATS_AUTH_REQUIRED === "1") throw new Error("NATS_AUTH_REQUIRED=1 but no nats-server executable was found");
+if (!binary && process.env.PI_FABRIC_REQUIRE_NATS === "1") {
+  throw new Error("PI_FABRIC_REQUIRE_NATS=1 but no nats-server executable was found");
+}
 
 // Keep reason: the real broker is the trust boundary for scoped request/reply and event permissions.
 // Literal subject vector: SHA-256 UTF-8 host/session IDs, truncated to the first 32 hex characters.
@@ -73,7 +75,7 @@ async function request(
 }
 
 beforeAll(async () => {
-  // Real-broker checks are explicit skips on runners without nats-server; NATS_AUTH_REQUIRED can make absence fatal.
+  // Linux hosted CI sets PI_FABRIC_REQUIRE_NATS=1 and pins the real broker; Windows intentionally skips this broker-only suite.
   if (!binary) return;
   fixture = await createPathBHarness({ binary, org: identity.org, tls: {} });
   if (process.env.NATS_BIN || process.env.NATS_EXPECTED_SERVER_VERSION) expect(fixture.serverVersion).toBe("2.14.7");
@@ -100,7 +102,9 @@ afterEach(async () => {
 afterAll(async () => { await fixture?.stop(); });
 
 describe.skipIf(!binary)("session channels over real org-scoped NATS", () => {
-  if (!binary) it.skip("set NATS_BIN or put nats-server on PATH to run real-broker session-channel tests", () => undefined);
+  if (!binary) it.skip(process.platform === "win32"
+    ? "Windows check does not install nats-server; the pinned real-broker acceptance runs on Ubuntu"
+    : "set NATS_BIN or put nats-server on PATH to run real-broker session-channel tests", () => undefined);
   it("verifies the shared org role's exact grants through the real broker USER.INFO", async () => {
     const verified = await openNatsConnection({ ...fixture!.runtimeOptions(fixture!.users.machineA), org: identity.org });
     try {

@@ -25,6 +25,8 @@ import path from "node:path";
 import { kernelFenceAvailable } from "../residency/file-lock.js";
 import { processAlive } from "../storage/scratch.js";
 import { assertTaskMainTarget, readTaskReturnAddress } from "../agents/task-return-address.js";
+import { placementRunIdForParticipant, isPlacementRunId } from "../topology/placement-run-id.js";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 // MeshStore's default stale window; recovery waits, never weakens mesh locking.
 export const RESIDENT_MESH_STALE_WINDOW_MS = 30_000;
@@ -146,6 +148,36 @@ const samePresenceOwner = (left: ParticipantRoute, right: ParticipantRoute): boo
   left.machine === right.machine && left.ownerHostId === right.ownerHostId &&
   left.ownerIdentityId === right.ownerIdentityId && left.ownerIncarnation === right.ownerIncarnation;
 
+const SANDBOX_CONTROL_PROTOCOL = "pi-fabric-sandbox-stop-v1";
+const SANDBOX_STOP_CONFIRMATION_MS = 30_000;
+const SANDBOX_STOP_OBSERVATION_MS = 50;
+const objectRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+const sandboxControlRunId = (value: unknown): string | undefined => {
+  if (!objectRecord(value) || Object.keys(value).length !== 1 || !objectRecord(value.sandboxControl)) return undefined;
+  const binding = value.sandboxControl;
+  if (Object.keys(binding).length !== 2 || binding.protocol !== SANDBOX_CONTROL_PROTOCOL || !isPlacementRunId(binding.runId)) return undefined;
+  return binding.runId;
+};
+const hasSandboxControl = (value: unknown): boolean => objectRecord(value) && Object.hasOwn(value, "sandboxControl");
+const verifiedSandboxMainCaller = (from: MeshIdentity, verification: "mesh" | "bridge" | undefined): boolean =>
+  (verification === "mesh" || verification === "bridge") && from.kind === "main" && from.id.startsWith("session:");
+
+const sandboxMainSettledAfterStop = async (context: ExtensionContext, signal?: AbortSignal): Promise<boolean> => {
+  const deadline = Date.now() + SANDBOX_STOP_CONFIRMATION_MS;
+  for (;;) {
+    if (signal?.aborted) return false;
+    try {
+      if (context.signal?.aborted === true && context.isIdle() &&
+        (context as ExtensionContext & { isSettling?: () => boolean }).isSettling?.() !== true) return true;
+    } catch { return false; }
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return false;
+    // Pi's agent_settled boundary drives isIdle; the bounded read is only this router's observation fallback.
+    await new Promise<void>(resolve => setTimeout(resolve, Math.min(SANDBOX_STOP_OBSERVATION_MS, remaining)));
+  }
+};
+
 export class AgentMessageRouter {
   readonly #taskReturnAddress = readTaskReturnAddress();
   /** Preserve authenticated machine/owner/epoch across asynchronous actor resolution. */
@@ -153,10 +185,11 @@ export class AgentMessageRouter {
   #legacyDeliveryCount = 0;
   /** Retained dormant wake routes this router resolved; only they may take the one wake resend. */
   readonly #dormantRoutes = new WeakSet<FabricParticipantInfo>();
+  #sandboxRunOwner: { runId: string; sessionId: string } | undefined;
   constructor(
     readonly manager: Pick<AgentManager, "status" | "steer" | "followUp" | "stop">,
     readonly actorManager: Pick<ActorManager, "identity" | "status" | "validateDirectMessage" | "tell" | "ask" | "stop" | "steerRemote" | "resolveBinding" | "resolveActivationBinding"> & { owns?: (id: string) => boolean; mesh?: { root: string } },
-    readonly mainAgent: Pick<FabricMainAgentTarget, "matches" | "local" | "id" | "deliverAgent" | "interactive">,
+    readonly mainAgent: Pick<FabricMainAgentTarget, "matches" | "local" | "id" | "deliverAgent" | "interactive" | "stop" | "bindingContext">,
     readonly participants: Pick<FabricParticipantSource, "get" | "scheduleRefresh" | "writeStalled" | "lastKnown"> & Partial<Pick<FabricParticipantSource, "peers" | "list" | "lineageAlive" | "routingUnavailable" | "refreshRoutingView" | "retainedRouteAllowed">> & {
       resolveRoutingLease?: (id: string, signal?: AbortSignal, budget?: MirrorLeaseWaitBudget) => Promise<boolean>;
     },
@@ -1031,6 +1064,27 @@ export class AgentMessageRouter {
     if (command.operation === "cancel") {
       return { accepted: false, error: "Cancel commands are handled by the control plane" };
     }
+    const sandboxRunId = placementRunIdForParticipant("root");
+    if (command.operation === "stop" && sandboxRunId && this.mainAgent.local && command.targetId === this.mainAgent.id) {
+      return this.#stopSandboxMain(command, from, signal, verification, sandboxRunId);
+    }
+    let sandboxOwnerToBind: { runId: string; sessionId: string } | undefined;
+    if (command.operation === "followUp" && sandboxRunId && this.mainAgent.local && command.targetId === this.mainAgent.id &&
+      hasSandboxControl(command.data)) {
+      const requestedRunId = sandboxControlRunId(command.data);
+      if (!requestedRunId || requestedRunId !== sandboxRunId) {
+        return { accepted: false, error: "Sandbox task delivery run binding does not match this Main session" };
+      }
+      if (!verifiedSandboxMainCaller(from, verification)) {
+        return { accepted: false, error: "Sandbox task delivery requires an authenticated Main caller" };
+      }
+      const routeError = this.#sandboxRouteRefusal(command, sandboxRunId, "followUp");
+      if (routeError) return { accepted: false, error: routeError };
+      if (this.#sandboxRunOwner && (this.#sandboxRunOwner.runId !== sandboxRunId || this.#sandboxRunOwner.sessionId !== from.id)) {
+        return { accepted: false, error: "Sandbox task is already bound to a different authenticated owner" };
+      }
+      sandboxOwnerToBind = { runId: sandboxRunId, sessionId: from.id };
+    }
     if (command.operation === "followUp" && this.mainAgent.local && this.mainAgent.matches(command.targetId) &&
       captureSandboxFinalAnswer(from, verification, command.message ?? "")) {
       return { accepted: true, messageId: command.commandId };
@@ -1121,6 +1175,7 @@ export class AgentMessageRouter {
         return { accepted: false, error: error instanceof Error ? error.message : String(error),
           ...(errorCode ? { errorCode, notRun: true } : {}) };
       }
+      if (sandboxOwnerToBind) this.#sandboxRunOwner = sandboxOwnerToBind;
       return {
         accepted: true,
         messageId: result.messageId,
@@ -1170,6 +1225,59 @@ export class AgentMessageRouter {
       }
     }
     return { accepted: false, error: `Owner does not control Fabric participant ${command.targetId}` };
+  }
+
+  #sandboxRouteRefusal(command: FabricControlCommand, runId: string, capability: "followUp" | "stop"): string | undefined {
+    if (!this.#nats || !command.ownerIncarnation) return "Sandbox control requires a fenced NATS owner route";
+    try {
+      const participant = this.#get(command.targetId, true);
+      const route = this.#presenceRoute(command.targetId);
+      if (!participant || participant.id !== this.mainAgent.id || participant.kind !== "root" || participant.local !== true ||
+        participant.interactive === false || participant.placementRunId !== runId ||
+        participant.ownerIncarnation !== command.ownerIncarnation || !participant.capabilities.includes(capability) ||
+        !route?.live || route.ownerHostId !== participant.ownerHostId || route.ownerIdentityId !== participant.ownerIdentityId ||
+        route.ownerIncarnation !== participant.ownerIncarnation || !route.capabilities.includes(capability)) {
+        return "Sandbox control refused: current child route, run binding, or capability does not match";
+      }
+      return undefined;
+    } catch {
+      return "Sandbox control refused: current child route could not be authenticated";
+    }
+  }
+
+  async #stopSandboxMain(
+    command: FabricControlCommand,
+    from: MeshIdentity,
+    signal: AbortSignal | undefined,
+    verification: "mesh" | "bridge" | undefined,
+    runId: string,
+  ): Promise<FabricControlAcceptance> {
+    if (sandboxControlRunId(command.data) !== runId) {
+      return { accepted: false, error: "Sandbox stop refused: requested run id does not match this Main session" };
+    }
+    if (!verifiedSandboxMainCaller(from, verification) || this.#sandboxRunOwner?.runId !== runId ||
+      this.#sandboxRunOwner.sessionId !== from.id) {
+      return { accepted: false, error: "Sandbox stop refused: caller is not the authenticated owner of this run" };
+    }
+    const routeError = this.#sandboxRouteRefusal(command, runId, "followUp");
+    if (routeError) return { accepted: false, error: routeError };
+    const context = this.mainAgent.bindingContext?.();
+    if (!context || !this.mainAgent.stop) {
+      return { accepted: false, error: "Sandbox stop refused: this Main has no local stop controller" };
+    }
+    try {
+      const stopped = this.mainAgent.stop();
+      if (stopped.id !== this.mainAgent.id || stopped.status !== "stopped" || context.signal?.aborted !== true) {
+        return { accepted: false, error: "Sandbox Main stop was not confirmed" };
+      }
+      if (!(await sandboxMainSettledAfterStop(context, signal))) {
+        return { accepted: false, error: "Sandbox Main stop was requested but its run did not reach a terminal idle state within 30 seconds" };
+      }
+      this.participants.scheduleRefresh();
+      return { accepted: true, messageId: command.commandId };
+    } catch (error) {
+      return { accepted: false, error: error instanceof Error ? error.message : "Sandbox Main stop failed" };
+    }
   }
 
   /** A lease can still look fresh after SIGKILL. For this root's non-owned durable

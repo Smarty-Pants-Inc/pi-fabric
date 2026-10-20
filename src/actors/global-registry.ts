@@ -218,6 +218,9 @@ export class GlobalActorRegistry {
       name: patch.name ?? existing.name,
       instructions: patch.instructions ?? existing.instructions,
       events: patch.events ?? existing.events,
+      ...(patch.eventsStartAt !== undefined
+        ? { eventsStartAt: patch.eventsStartAt }
+        : existing.eventsStartAt !== undefined ? { eventsStartAt: existing.eventsStartAt } : {}),
       topics: patch.topics ?? existing.topics,
       delivery: patch.delivery ?? existing.delivery,
       responseMode: patch.responseMode ?? existing.responseMode,

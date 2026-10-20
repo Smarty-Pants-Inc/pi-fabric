@@ -753,7 +753,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
   #natsStarting: Promise<void> | undefined;
   #natsClosing: Promise<void> | undefined;
   #transportRenewing: Promise<void> | undefined;
+  #transportReconnectUnsubscribe: (() => void) | undefined;
   #natsConfirmedAt = 0;
+  #transportRecovering = false;
   #transportLost = false;
   readonly #backgroundRefresh = new MeshBackgroundRetry("participant heartbeat/change refresh")
     .alarmsTo(meshOutageAlarmSink(() => ({ mesh: this.mesh, from: this.options.identity })));
@@ -908,9 +910,19 @@ export class ParticipantDirectory implements FabricParticipantSource {
     return view;
   }
 
+  #transportSuspendedNow(error: unknown): void {
+    if (this.#closed || this.#transportLost || this.#transportRecovering) return;
+    this.#transportRecovering = true;
+    this.#leaseConfirmed = false;
+    this.#natsConfirmedAt = 0;
+    this.#refreshError = error;
+    this.#routingError = error;
+  }
+
   #transportLostNow(error: unknown): void {
     if (this.#transportLost) return;
     this.#transportLost = true;
+    this.#transportRecovering = false;
     this.#leaseConfirmed = false;
     this.#refreshError = error;
     this.#routingError = error;
@@ -928,8 +940,23 @@ export class ParticipantDirectory implements FabricParticipantSource {
     const lease = this.#transportLease;
     if (!lease || this.#closed || this.#transportLost) return Promise.resolve();
     if (this.#transportRenewing) return this.#transportRenewing;
-    const work = Promise.resolve().then(() => lease.renew(AbortSignal.timeout(5_000))).then(() => undefined).catch(error => {
-      if (!lease.live()) this.#transportLostNow(error);
+    const work = Promise.resolve().then(() => lease.renew(AbortSignal.timeout(5_000))).then(() => {
+      if (this.#transportRecovering && lease.live()) {
+        this.#transportRecovering = false;
+        this.#refreshError = undefined;
+        this.#routingError = undefined;
+        this.#natsConfirmedAt = 0;
+        void this.#localProjection?.resumeAfterLeaseRecovery().catch(error => {
+          this.#refreshError = error;
+          this.#routingError = error;
+        });
+        this.scheduleRefresh();
+      }
+    }).catch(error => {
+      if (!lease.live()) {
+        if (lease.recovering()) this.#transportSuspendedNow(error);
+        else this.#transportLostNow(error);
+      }
       this.#refreshError = error;
       throw error;
     });
@@ -951,7 +978,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
         this.#lifecycleTick(live);
         if (live) {
           void this.#renewTransportLease().catch(() => undefined);
-          if (!this.#quiescing) void this.#refreshNats(true).catch(error => { this.#refreshError = error; });
+          if (!this.#quiescing && !this.#transportRecovering) void this.#refreshNats(true).catch(error => { this.#refreshError = error; });
         }
         return;
       }
@@ -1170,9 +1197,14 @@ export class ParticipantDirectory implements FabricParticipantSource {
       const lease = new TransportHostLease({
         kv: transport.kv("leases"), self: transport.self, rootId: this.options.rootId,
         identityId: this.options.identity.id, incarnation: this.ownerIncarnation,
-        localStateDir: this.options.transportStateDir, onLost: error => this.#transportLostNow(error),
+        localStateDir: this.options.transportStateDir,
+        onLost: error => this.#transportLostNow(error),
+        onSuspended: error => this.#transportSuspendedNow(error),
       });
       this.#transportLease = lease;
+      this.#transportReconnectUnsubscribe = transport.onVerifiedReconnect?.(() => {
+        if (!this.#closed && !this.#transportLost) void this.#renewTransportLease().catch(() => undefined);
+      });
       this.#participantView = new KvParticipantDirectory({
         transport, lease, identityId: this.options.identity.id,
         ownerIncarnation: this.ownerIncarnation, rootId: this.options.rootId,
@@ -2316,7 +2348,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
   /** Resident consumers fail closed on failed/overdue renewal, not just peer visibility.
    * A file-only liveness write is not confirmation that the mesh is writable. */
   canConsumeMesh(now = Date.now()): boolean {
-    if (this.#isNats()) return !this.#closed && !this.#suspended && !this.#quiescing && !this.#transportLost &&
+    if (this.#isNats()) return !this.#closed && !this.#suspended && !this.#quiescing && !this.#transportRecovering && !this.#transportLost &&
       !!this.#transportLease?.live() && !!this.#participantView?.ready;
     const confirmed = !this.options.enabled || (!this.#closed && !this.#quiescing && this.#leaseConfirmed &&
       this.#refreshError === undefined && now - this.#refreshedAt < this.#heartbeatMs * 2);
@@ -2525,6 +2557,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
     await this.#refreshing?.catch(() => undefined);
     await Promise.allSettled([...this.#natsPending.values()]);
     await this.#transportRenewing?.catch(() => undefined);
+    this.#transportReconnectUnsubscribe?.();
+    this.#transportReconnectUnsubscribe = undefined;
     if (this.#participantView) await this.#participantView.close().catch(error => { this.#refreshError = error; });
     if (this.#transportLease) await this.#transportLease.release(AbortSignal.timeout(5_000)).catch(error => { this.#refreshError = error; });
     if (this.#localProjection) await this.#localProjection.close().catch(error => { this.#refreshError = error; });
@@ -2586,15 +2620,31 @@ export class ParticipantDirectory implements FabricParticipantSource {
 
   async #closeNatsLineage(): Promise<void> {
     if (this.#closed) return;
+    const lease = this.#transportLease;
     try {
-      await this.#quiesceNats();
-      if (this.options.hostId === this.options.rootId && this.options.identity.id === this.options.rootId &&
+      // A lost/suspended NATS lease cannot fence a closure receipt. Shutdown is still
+      // idempotent: let the lease TTL expire rather than failing the runtime close path.
+      if (lease?.live()) {
+        try { await this.#quiesceNats(); }
+        catch (error) {
+          const code = typeof error === "object" && error !== null && "code" in error ? error.code : undefined;
+          const unavailable = code === "FABRIC_TRANSPORT_UNAVAILABLE" || code === "FABRIC_TRANSPORT_UNCERTAIN" ||
+            code === "FABRIC_DIRECTORY_NOT_READY";
+          if (lease.live() && !lease.recovering() && !this.#transportLost && !unavailable) throw error;
+        }
+      }
+      if (lease?.live() && !lease.recovering() && !this.#transportLost &&
+        this.options.hostId === this.options.rootId && this.options.identity.id === this.options.rootId &&
         this.options.identity.kind === "main" && this.#localRecords.get(this.options.rootId)?.kind === "root") {
-        await this.#withLeaseFence(() => this.mesh.put({
-          key: keyFor(LINEAGE_CLOSURE_PREFIX, this.options.rootId), identity: this.options.identity,
-          value: { format: 1, rootId: this.options.rootId, ownerHostId: this.options.hostId,
-            ownerIdentityId: this.options.identity.id, closedAt: Date.now() },
-        }));
+        try {
+          await this.#withLeaseFence(() => this.mesh.put({
+            key: keyFor(LINEAGE_CLOSURE_PREFIX, this.options.rootId), identity: this.options.identity,
+            value: { format: 1, rootId: this.options.rootId, ownerHostId: this.options.hostId,
+              ownerIdentityId: this.options.identity.id, closedAt: Date.now() },
+          }));
+        } catch (error) {
+          if (lease.live() && !lease.recovering() && !this.#transportLost) throw error;
+        }
       }
     } finally { await this.#closeNats(); }
   }

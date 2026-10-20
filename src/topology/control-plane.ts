@@ -783,6 +783,7 @@ export class FabricControlPlane {
   readonly #bridgeTimeoutMs: number;
   readonly #inboxLanes: number;
   readonly #transport: FabricTransport;
+  #stopVerifiedReconnect: (() => void) | undefined;
   readonly #relayOperatorMachine: string | undefined;
   readonly #expectedNatsInboxStream: string | undefined;
   // File-only access stays behind the legacy branches, including reader/cursor semantics.
@@ -2259,7 +2260,13 @@ export class FabricControlPlane {
     if (session.signal.aborted || this.#natsSession !== session || this.#closed || this.#paused || !this.options.enabled) return false;
     try {
       if (!this.options.participants!.leaseLive()) {
-        // E11: actual lease loss is latched, never a retry or auto-resume.
+        if (this.options.participants!.leaseRecovering?.()) {
+          // A timed-out lease is admission-held until the directory re-acquires it by CAS.
+          this.#stopNatsInbox(session);
+          this.#bindNatsInbox(true);
+          return false;
+        }
+        // A conflicting owner or aborted lease is terminal, never a retry or auto-resume.
         this.pause(new MeshConsumptionPausedError());
         return false;
       }
@@ -2289,6 +2296,16 @@ export class FabricControlPlane {
   #startNats(): void {
     // E11: A2 owns the lease-loss notification and E8 reacquisition. No lease
     // polling, whenChanged(self), or automatic reacquisition lives in this plane.
+    if (!this.#stopVerifiedReconnect && this.#transport.onVerifiedReconnect) {
+      this.#stopVerifiedReconnect = this.#transport.onVerifiedReconnect(() => {
+        this.#natsInboxRetryDelayMs = 1_000;
+        if (this.#natsInboxRetryTimer) {
+          clearTimeout(this.#natsInboxRetryTimer);
+          this.#natsInboxRetryTimer = undefined;
+        }
+        this.#bindNatsInbox();
+      });
+    }
     if (!this.#natsWorkingTimer) {
       this.#natsWorkingTimer = setInterval(() => {
         const now = Date.now();
@@ -2321,6 +2338,7 @@ export class FabricControlPlane {
     if (this.#natsOutcomes.size) { this.#scheduleNatsOutcomeRetry(); return; }
     try {
       if (!this.options.participants!.leaseLive()) {
+        if (this.options.participants!.leaseRecovering?.()) { this.#bindNatsInbox(true); return; }
         this.pause(new MeshConsumptionPausedError()); return;
       }
       if (this.options.canConsumeMesh?.() === false) { this.#bindNatsInbox(true); return; }
@@ -2835,6 +2853,8 @@ export class FabricControlPlane {
 
   async #closeNats(): Promise<void> {
     this.#closed = true; this.#started = false;
+    this.#stopVerifiedReconnect?.();
+    this.#stopVerifiedReconnect = undefined;
     clearTimeout(this.#natsInboxRetryTimer); this.#natsInboxRetryTimer = undefined;
     for (const cancel of this.#resendWaits) cancel();
     clearInterval(this.#natsWorkingTimer); this.#natsWorkingTimer = undefined;

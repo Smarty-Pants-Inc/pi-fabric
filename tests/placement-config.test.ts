@@ -1,8 +1,11 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { createServer } from "node:http";
+import type { IncomingMessage, Server, ServerResponse } from "node:http";
 import { afterEach, describe, expect, it } from "vitest";
-import { loadFabricConfigForScope } from "../src/config.js";
+import { loadFabricConfigForScope, normalizeFabricConfig } from "../src/config.js";
+import { PlacementClient, type PlacementIntent } from "../src/placement/client.js";
 import { normalizePlacementApiConfig } from "../src/placement/config.js";
 
 const temporaryRoots: string[] = [];
@@ -21,8 +24,58 @@ describe("Placement API configuration URL policy", () => {
     "http://smarty-placement.smarty-island.svc:8080",
     "http://100.64.0.1:30880",
     "http://100.127.255.255:30880",
+    "http://127.0.0.1:1024",
+    "http://127.0.0.1:18080",
+    "http://127.0.0.1:65535",
   ])("accepts the approved endpoint %s", url => {
     expect(normalizePlacementApiConfig(validConfig({ url }))?.url).toBe(url);
+  });
+
+  it("sends a configured loopback URL through the real PlacementClient", async () => {
+    let receivedPath: string | undefined;
+    let receivedIntent: PlacementIntent | undefined;
+    const server: Server = createServer((request: IncomingMessage, response: ServerResponse) => {
+      void (async () => {
+        receivedPath = request.url;
+        const chunks: Buffer[] = [];
+        for await (const chunk of request) chunks.push(Buffer.from(chunk));
+        const submitted = JSON.parse(Buffer.concat(chunks).toString("utf8")) as PlacementIntent;
+        receivedIntent = submitted;
+        response.writeHead(200, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({
+          runId: submitted.runId, status: "admitted", code: "ADMITTED", detail: "Admitted",
+          retryAfterSeconds: null, host: "placement-node", claimRef: null, claimUID: null, podUID: null,
+        }));
+      })().catch(() => { if (!response.headersSent) response.writeHead(500).end(); });
+    });
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    try {
+      const address = server.address();
+      if (!address || typeof address === "string" || address.port < 1024) throw new Error("Loopback HTTP stub did not bind an allowed port");
+      const config = normalizeFabricConfig({ agents: { placementApi: {
+        enabled: true, url: `http://127.0.0.1:${address.port}`, requestTimeoutMs: 1_000, watchTimeoutMs: 1_000,
+      } } });
+      const api = config.agents.placementApi;
+      if (!api) throw new Error("Placement API config unexpectedly disabled");
+      const client = new PlacementClient(api);
+      const intent: PlacementIntent = {
+        v: 1, runId: "loopback-config-check", kind: "process", org: "smarty-pants", parentSession: "parent-session",
+        role: "task-agent", complexity: "normal", model: "openai/gpt-6.1-sol", thinking: "high", needs: [],
+        repository: "https://github.com/Smarty-Pants-Inc/pi-fabric", cwd: ".", expectedSeconds: 60,
+        timeoutSeconds: 60, deadline: null,
+      };
+
+      expect(await client.requestSpawn(intent)).toEqual({
+        status: "admitted", host: "placement-node", claimRef: null, claimUID: null, podUID: null,
+      });
+      expect(receivedPath).toBe("/v1/spawns");
+      expect(receivedIntent).toEqual(intent);
+    } finally {
+      await new Promise<void>(resolve => {
+        server.close(() => resolve());
+        server.closeAllConnections();
+      });
+    }
   });
 
   it.each([
@@ -35,6 +88,20 @@ describe("Placement API configuration URL policy", () => {
     "http://user@smarty-placement.smarty-island.svc:8080",
     "http://smarty-placement.smarty-island.svc:8080/path",
     "http://smarty-placement.smarty-island.svc:8080/?query=1",
+    "http://localhost:18080",
+    "http://127.0.0.2:18080",
+    "http://127.1:18080",
+    "http://2130706433:18080",
+    "http://0x7f000001:18080",
+    "http://0.0.0.0:18080",
+    "http://[::1]:18080",
+    "http://127.0.0.1",
+    "http://127.0.0.1:80",
+    "http://127.0.0.1:1023",
+    "http://127.0.0.1:65536",
+    "https://127.0.0.1:18080",
+    "http://u:p@127.0.0.1:18080",
+    "http://127.0.0.1:18080/x",
   ])("rejects an endpoint outside the allowlist: %s", url => {
     expect(() => normalizePlacementApiConfig(validConfig({ url }))).toThrow("Invalid agents.placementApi configuration");
   });

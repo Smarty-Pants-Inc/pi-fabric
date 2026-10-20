@@ -1,5 +1,6 @@
 import { existsSync, openSync, closeSync, fsyncSync, readFileSync, writeSync } from "node:fs";
 import { isAbsolute } from "node:path";
+import { TransportInvalidError } from "../types.js";
 import { openBootstrapNatsConnection, openNatsConnection, type NatsPermissionPolicy } from "./connection.js";
 import { consumeDeadLetters, ensureDeadLetterConsumer, type DeadLetterEnvelope, type DeadLetterSink } from "./dead-letter.js";
 import { openNatsKv } from "./kv.js";
@@ -113,6 +114,11 @@ const jsonLineSink = (file: string): DeadLetterSink => {
 async function provision(args: readonly string[]): Promise<void> {
   const machines = machinesArg(args);
   const inboxMaxAgeMs = inboxMaxAgeMsArg(args);
+  // Read the same agent-only source as the NATS state client, before contacting NATS.
+  const [{ loadAgentNatsReplicas }, { resolveAgentDir }] = await Promise.all([
+    import("../../config.js"), import("../../core/agent-dir.js"),
+  ]);
+  const replicas = loadAgentNatsReplicas(resolveAgentDir());
   // Separate bootstrap authority is intentionally broader than machine runtime credentials.
   const connection = await openBootstrapNatsConnection({
     servers: requiredEnv("PI_FABRIC_NATS_SERVERS"),
@@ -124,15 +130,22 @@ async function provision(args: readonly string[]): Promise<void> {
     // This is deliberately first: advisories are otherwise lost before the operator consumer exists.
     await ensureTransportStream(connection.manager, streamPolicy(ADVISORY_CAPTURE_STREAM, [transportAdvisoryStreamSubject], 30 * 24 * 60 * 60_000, 64 * 1024));
     await ensureDeadLetterConsumer(connection.manager);
-    await openNatsKv(connection.js, { bucket: "fabric_leases", ttlMs: 15_000, markerTtlMs: 5 * 60_000 });
-    await openNatsKv(connection.js, { bucket: "fabric_presence", ttlMs: 10 * 60_000, markerTtlMs: 5 * 60_000 });
+    await openNatsKv(connection.js, { bucket: "fabric_leases", ttlMs: 15_000, markerTtlMs: 5 * 60_000, replicas });
+    await openNatsKv(connection.js, { bucket: "fabric_presence", ttlMs: 10 * 60_000, markerTtlMs: 5 * 60_000, replicas });
     for (const target of machines) {
       await ensureTransportStream(connection.manager, {
         ...streamPolicy(transportInboxStream(target), [transportInboxStreamSubject(target)], inboxMaxAgeMs),
+        replicas,
         allowUnboundedMaxAge: true,
       });
     }
     process.stdout.write(`${JSON.stringify({ ok: true, advisory: ADVISORY_CAPTURE_STREAM, machines, inboxMaxAgeMs })}\n`);
+  } catch (error) {
+    // Preserve advisory failures; type only inbox refusals without changing provision.ts's checks.
+    if (error instanceof Error && machines.some((machine) => error.message === `NATS stream configuration mismatch: ${transportInboxStream(machine)}`)) {
+      throw new TransportInvalidError(error.message, { cause: error });
+    }
+    throw error;
   } finally {
     await connection.close();
   }

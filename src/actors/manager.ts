@@ -1374,18 +1374,20 @@ export class ActorManager {
     return false;
   }
 
-  async #acceptNatsActorEvent(actorId: string, event: MeshEvent, messageId: string, ack: () => Promise<void>): Promise<void> {
+  async #acceptNatsActorEvent(actorId: string, event: MeshEvent, messageId: string, ack: () => Promise<void>): Promise<boolean> {
     this.#refreshOwnership(actorId);
     const actor = this.#actors.get(actorId);
     const org = this.meshConfig.nats.org;
     const isWake = event.topic === `wake.${actorId}` || event.topic === `fabric.ev.${org}.wake.${actorId}`;
     const subscribed = actor?.topics.includes(event.topic) || actor?.topics.includes(`fabric.ev.${org}.${event.topic}`);
-    if (!actor || actor.status === "stopped" || actor.removal || (!isWake && !subscribed) ||
-        !this.#canManageCached(actorId) || !this.#slotCurrent(actor)) return;
+    if (!actor || actor.status === "stopped" || actor.removal || (!isWake && !subscribed)) return true;
+    // The durable has not accepted this delivery while either custody fence is
+    // down. Tell the consumer to delayed-NAK so it can retry after recovery.
+    if (!this.#canManageCached(actorId) || !this.#slotCurrent(actor)) return false;
     if (this.#natsEventReceipts.get(actorId)?.has(messageId)) {
       await ack();
       setImmediate(() => { const current = this.#actors.get(actorId); if (current) this.#ensureDrain(current); });
-      return;
+      return true;
     }
     const source = `mesh:${event.topic}`;
     const deliveryId = messageId || String(event.sequence);
@@ -1407,6 +1409,7 @@ export class ActorManager {
     }
     await ack();
     setImmediate(() => { const current = this.#actors.get(actorId); if (current) this.#ensureDrain(current); });
+    return true;
   }
 
   retryCapabilityWaiters(): void {

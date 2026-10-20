@@ -3,7 +3,7 @@ import { Buffer } from "node:buffer";
 import { afterEach, describe, expect, it } from "vitest";
 import { openBootstrapNatsConnection, openNatsConnection } from "../src/transport/nats/connection.js";
 import { NatsEventsIdConflictError, openNatsEventsPublisher } from "../src/transport/nats/events-publish.js";
-import { startNatsActorEventsConsumer } from "../src/transport/nats/events-consume.js";
+import { NATS_EVENT_RETRY_DELAY_SCHEDULE_MS, startNatsActorEventsConsumer } from "../src/transport/nats/events-consume.js";
 import type { MeshEvent } from "../src/mesh/event-log.js";
 import { ensureNatsEventsStream, ensureTransportStream, natsEventsStreamName, natsGithubStreamName, transportStreamConfig } from "../src/transport/nats/provision.js";
 import { hashToken } from "../src/transport/nats/subjects.js";
@@ -43,6 +43,10 @@ const event = (id: string, topic: string, createdAt = Date.now()): Omit<MeshEven
 });
 
 describe("NATS event stream names", () => {
+  it("uses the default transient NAK retry schedule", () => {
+    expect(NATS_EVENT_RETRY_DELAY_SCHEDULE_MS).toEqual([1_000, 5_000, 15_000, 30_000]);
+  });
+
   it("normalizes GitHub login slugs with uppercase and underscores", () => {
     expect(natsEventsStreamName("smarty-pants-inc")).toBe("FABRIC_EV_SMARTY_PANTS_INC");
     expect(natsEventsStreamName("versehq")).toBe("FABRIC_EV_VERSEHQ");
@@ -165,7 +169,7 @@ describe.skipIf(!binary)("NATS Mesh events on a real JetStream server", () => {
       expect(deliveredB).toEqual([{ id: "stable-mail-event:stable-mail-event", seq: 1 }]);
       const eventConsumerInfo = await connection.manager.consumers.info(publisher.stream, `ev_${hashToken(`${org}:actor-a`)}`);
       expect(eventConsumerInfo.config.filter_subjects).toEqual([`fabric.ev.${org}.mail.inbound`, `fabric.ev.${org}.wake.${org}:actor-a`].sort());
-      expect(eventConsumerInfo.config.max_deliver).toBe(5);
+      expect(eventConsumerInfo.config.max_deliver).toBe(-1);
       expect(eventConsumerInfo.config.backoff).toEqual([1, 5, 15, 30, 30].map(seconds => seconds * 1_000_000_000));
       await publisher.publish(event("wake-for-actor-a", `wake.${org}:actor-a`));
       await waitFor(() => deliveredA.length === 2);
@@ -270,38 +274,64 @@ describe.skipIf(!binary)("NATS Mesh events on a real JetStream server", () => {
     }
   }, 30_000);
 
-  it("delays a transient NAK, then accepts the same event once ownership returns", async () => {
+  it("keeps transient NAKs retrying beyond the old delivery budget, then accepts once ownership returns", async () => {
     const server = await fixture();
     const org = `events-${randomUUID().slice(0, 8)}`;
     const { connection, publisher } = await open(server, org);
     const actorId = `${org}:ownership-retry`;
+    const stream = natsEventsStreamName(org);
+    const durable = `ev_${hashToken(actorId)}`;
     let owned = false;
-    const attempts: string[] = [], accepted: string[] = [];
+    const attempts: Array<{ id: string; at: number; owned: boolean }> = [];
+    const accepted: string[] = [];
     let consumer: { close(remove?: boolean): Promise<void> } | undefined;
     try {
       consumer = await startNatsActorEventsConsumer(connection, {
-        org, actorId, topics: ["mail.retry"],
+        org, actorId, topics: ["mail.retry"], retryDelayScheduleMs: [100, 200, 400, 800],
         onMessage: async (received, _messageId, ack) => {
-          attempts.push(received.id);
-          if (!owned) return false;
+          const wasOwned = owned;
+          attempts.push({ id: received.id, at: Date.now(), owned: wasOwned });
+          if (!wasOwned) return false;
           accepted.push(received.id);
           await ack();
           return true;
         },
       });
+      const initial = await connection.manager.consumers.info(stream, durable);
+      expect(initial.config.max_deliver).toBe(-1);
+      expect(initial.config.backoff).toEqual([100, 200, 400, 800, 800].map(milliseconds => milliseconds * 1_000_000));
       await publisher.publish(event("ownership-blip", "mail.retry"));
-      await waitFor(() => attempts.length === 1);
+      await waitFor(() => attempts.filter(attempt => !attempt.owned).length >= 1);
+      await new Promise(resolve => setTimeout(resolve, 9_000));
+      const refusedAttempts = attempts.filter(attempt => !attempt.owned);
+      expect(accepted).toEqual([]);
+      expect(Date.now() - refusedAttempts[0]!.at).toBeGreaterThanOrEqual(8_000);
+      expect(refusedAttempts.length).toBeGreaterThanOrEqual(6);
+      const beforeRelease = await connection.manager.consumers.info(stream, durable);
+      expect(beforeRelease.delivered?.consumer_seq).toBe(attempts.length);
+
       owned = true;
-      await waitFor(() => accepted.length === 1, 7_000);
-      expect(attempts).toEqual(["ownership-blip", "ownership-blip"]);
+      await waitFor(() => accepted.length === 1, 5_000);
+      await new Promise(resolve => setTimeout(resolve, 250));
+      const afterAcceptance = await connection.manager.consumers.info(stream, durable);
+      expect(afterAcceptance.delivered?.consumer_seq).toBe(attempts.length);
       expect(accepted).toEqual(["ownership-blip"]);
+      expect(attempts.at(-1)?.owned).toBe(true);
+      expect(attempts.every(attempt => attempt.id === "ownership-blip")).toBe(true);
+      const expectedGaps = [100, 200, 400, 800, 800];
+      const tolerances = [500, 500, 500, 750, 750];
+      for (const [index, expectedGap] of expectedGaps.entries()) {
+        const actualGap = attempts[index + 1]!.at - attempts[index]!.at;
+        expect(actualGap).toBeGreaterThanOrEqual(expectedGap);
+        expect(actualGap).toBeLessThanOrEqual(expectedGap + tolerances[index]!);
+      }
     } finally {
       await consumer?.close(false);
       await connection.close();
     }
-  }, 15_000);
+  }, 30_000);
 
-  it("immediately exhausts malformed poison events at max_deliver without invoking the handler", async () => {
+  it("terminates malformed poison envelopes without invoking the handler", async () => {
     const server = await fixture();
     const org = `events-${randomUUID().slice(0, 8)}`;
     const { connection } = await open(server, org);
@@ -316,19 +346,21 @@ describe.skipIf(!binary)("NATS Mesh events on a real JetStream server", () => {
       const stream = natsEventsStreamName(org);
       const durable = `ev_${hashToken(actorId)}`;
       const initial = await connection.manager.consumers.info(stream, durable);
-      expect(initial.config.max_deliver).toBe(5);
+      expect(initial.config.max_deliver).toBe(-1);
       expect(initial.config.backoff).toEqual([1, 5, 15, 30, 30].map(seconds => seconds * 1_000_000_000));
       await connection.js.publish(`fabric.ev.${org}.mail.poison`, Buffer.from("{"), { msgID: "malformed-poison" });
-      const deadline = Date.now() + 7_000;
-      let exhausted = initial;
-      while ((exhausted.delivered?.consumer_seq ?? 0) < 5) {
-        if (Date.now() >= deadline) throw new Error("malformed poison event did not exhaust max_deliver=5");
+      const deadline = Date.now() + 5_000;
+      let terminated = initial;
+      while ((terminated.delivered?.consumer_seq ?? 0) < 1 || terminated.num_ack_pending !== 0 || terminated.num_pending !== 0) {
+        if (Date.now() >= deadline) throw new Error("malformed poison event was not terminated");
         await new Promise(resolve => setTimeout(resolve, 25));
-        exhausted = await connection.manager.consumers.info(stream, durable);
+        terminated = await connection.manager.consumers.info(stream, durable);
       }
-      expect(exhausted.delivered?.consumer_seq).toBe(5);
-      expect(exhausted.num_ack_pending).toBe(0);
-      expect(exhausted.num_pending).toBe(0);
+      await new Promise(resolve => setTimeout(resolve, 1_250));
+      terminated = await connection.manager.consumers.info(stream, durable);
+      expect(terminated.delivered?.consumer_seq).toBe(1);
+      expect(terminated.num_ack_pending).toBe(0);
+      expect(terminated.num_pending).toBe(0);
       expect(handlerCalls).toBe(0);
     } finally {
       await consumer?.close(false);
@@ -368,6 +400,10 @@ describe.skipIf(!binary)("NATS Mesh events on a real JetStream server", () => {
       const newEv = await connection.manager.consumers.info(natsEventsStreamName(org), `ev_${hashToken(actorId)}`);
       const newGh = await connection.manager.consumers.info(githubStream, `gh_${hashToken(actorId)}`);
       const expectedBackoff = [1, 5, 15, 30, 30].map(seconds => seconds * 1_000_000_000);
+      expect(oldEv.config.max_deliver).toBe(5);
+      expect(oldGh.config.max_deliver).toBe(5);
+      expect(newEv.config.max_deliver).toBe(-1);
+      expect(newGh.config.max_deliver).toBe(-1);
       expect(newEv.config.backoff).toEqual(expectedBackoff);
       expect(newGh.config.backoff).toEqual(expectedBackoff);
       expect(newEv.created).toEqual(oldEv.created);

@@ -15,7 +15,7 @@ import { openNatsTransport, type NatsTransportOptions } from "../src/transport/n
 import { runTransportAdmin } from "../src/transport/nats/admin.js";
 import { openNatsKv, KV_MARKER_TTL_MS, KV_MAX_VALUE_SIZE, LEASE_TTL_MS, PRESENCE_TTL_MS } from "../src/transport/nats/kv.js";
 import { transportStreamConfig } from "../src/transport/nats/provision.js";
-import { transportDurableName, transportInboxStream, transportInboxStreamSubject } from "../src/transport/nats/subjects.js";
+import { ADVISORY_CAPTURE_STREAM, transportAdvisoryStreamSubject, transportDurableName, transportInboxStream, transportInboxStreamSubject } from "../src/transport/nats/subjects.js";
 import { TransportInvalidError, type FabricTransport, type FabricTransportOptions } from "../src/transport/types.js";
 import { loadAgentNatsReplicas, loadGlobalFabricConfig } from "../src/config.js";
 import { startNatsElectionCluster, type NatsElectionCluster } from "./helpers/nats-election-cluster.js";
@@ -46,6 +46,14 @@ const base: NatsTransportOptions = {
 const inboxPolicy = {
   name: INBOX, subjects: [transportInboxStreamSubject(MACHINE)], maxBytes: 1_073_741_824,
   maxAgeMs: 7 * 24 * 60 * 60_000, maxMessageBytes: 1_048_576, duplicateWindowMs: 600_000,
+};
+const advisoryPolicy = {
+  name: ADVISORY_CAPTURE_STREAM,
+  subjects: [transportAdvisoryStreamSubject],
+  maxBytes: 1_073_741_824,
+  maxAgeMs: 30 * 24 * 60 * 60_000,
+  maxMessageBytes: 64 * 1024,
+  duplicateWindowMs: 600_000,
 };
 const bucketPolicies = [
   { bucket: "fabric_leases", ttlMs: LEASE_TTL_MS },
@@ -273,7 +281,7 @@ describe("transport replica policy (unit data-safety boundaries)", () => {
     expect(kv.open).not.toHaveBeenCalled();
   });
 
-  it.each([undefined, 3])("admin reads the agent-only replica count once (configured=%s), keeping the advisory at R1", async replicas => {
+  it.each([undefined, 3])("admin reads the agent-only replica count once (configured=%s), including the advisory stream", async replicas => {
     const root = privateScratch();
     const source = JSON.stringify({ mesh: { nats: replicas === undefined ? {} : { replicas } } });
     fs.writeFileSync(path.join(root, "fabric.json"), source);
@@ -293,13 +301,13 @@ describe("transport replica policy (unit data-safety boundaries)", () => {
       ["fabric_leases", replicas ?? 1], ["fabric_presence", replicas ?? 1],
     ]);
     expect(broker.streams.get(INBOX)?.config.num_replicas).toBe(replicas ?? 1);
-    expect(broker.streams.get("FABRIC_ADV")?.config.num_replicas).toBe(1);
+    expect(broker.streams.get(ADVISORY_CAPTURE_STREAM)?.config.num_replicas).toBe(replicas ?? 1);
     expect(broker.streamApi.update).not.toHaveBeenCalled();
     expect(broker.handle.close).toHaveBeenCalledTimes(1);
     expect(fs.readFileSync(path.join(root, "fabric.json"), "utf8")).toBe(source);
   });
 
-  it.each(["fabric_leases", "fabric_presence", INBOX])("admin refuses existing R1 %s under agent R3 policy without updating it", async resource => {
+  it.each(["fabric_leases", "fabric_presence", INBOX, ADVISORY_CAPTURE_STREAM])("admin refuses existing R1 %s under agent R3 policy without updating it", async resource => {
     const root = privateScratch();
     fs.writeFileSync(path.join(root, "fabric.json"), JSON.stringify({ mesh: { nats: { replicas: 3 } } }));
     vi.stubEnv("PI_CODING_AGENT_DIR", root);
@@ -308,8 +316,9 @@ describe("transport replica policy (unit data-safety boundaries)", () => {
     const broker = fakeBroker();
     const kv = fakeKv();
     kv.setObserved(3);
-    const existing = { config: transportStreamConfig({ ...inboxPolicy, replicas: 1 }) } as StreamInfo;
-    if (resource === INBOX) broker.streams.set(INBOX, structuredClone(existing));
+    const policy = resource === ADVISORY_CAPTURE_STREAM ? advisoryPolicy : inboxPolicy;
+    const existing = { config: transportStreamConfig({ ...policy, replicas: 1 }) } as StreamInfo;
+    if (resource === INBOX || resource === ADVISORY_CAPTURE_STREAM) broker.streams.set(resource, structuredClone(existing));
     else kv.setObserved(1, resource);
     await expect(runTransportAdmin(["provision", "--machines", MACHINE])).rejects.toBeInstanceOf(TransportInvalidError);
     expect(loadAgentNatsReplicas).toHaveBeenCalledExactlyOnceWith(root);
@@ -317,7 +326,7 @@ describe("transport replica policy (unit data-safety boundaries)", () => {
     expect(broker.streamApi.update).not.toHaveBeenCalled();
     expect(kv.update).not.toHaveBeenCalled();
     expect(broker.handle.close).toHaveBeenCalledTimes(1);
-    if (resource === INBOX) expect(broker.streams.get(INBOX)).toEqual(existing);
+    if (resource === INBOX || resource === ADVISORY_CAPTURE_STREAM) expect(broker.streams.get(resource)).toEqual(existing);
     else expect((await kv.status(resource)).replicas).toBe(1);
   });
 
@@ -357,6 +366,27 @@ it.skipIf(skipCluster)("real NATS 2.14.7 R3 leases, presence and actual transpor
     expect(response.ok).toBe(true);
     expect(await response.json()).toMatchObject({ version: expectedVersion, server_name: node.name });
   }
+  const agentDir = path.join(root, "agent");
+  fs.mkdirSync(agentDir, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ mesh: { nats: { replicas: 3 } } }));
+  vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
+  vi.stubEnv("PI_FABRIC_NATS_SERVERS", cluster.seedUrl);
+  vi.stubEnv("PI_FABRIC_NATS_CREDENTIALS", "fixture-bootstrap-only");
+  vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+
+  const adminNc = await connect({ servers: [cluster.seedUrl], ignoreClusterUpdates: true, timeout: 2_000 });
+  rawConnections.push(adminNc);
+  const adminManager = await jetstreamManager(adminNc);
+  const adminHandle: NatsConnectionHandle = {
+    nc: adminNc, js: jetstream(adminNc), manager: adminManager, isVerified: () => !adminNc.isClosed(), onStatus: () => () => undefined,
+    closed: () => adminNc.closed(), close: () => adminNc.close(),
+  };
+  connections.bootstrap.mockResolvedValue(adminHandle);
+  // Exercise the exact provisioning path that consumes the agent-only config, including FABRIC_ADV.
+  expect(await runTransportAdmin(["provision", "--machines", MACHINE])).toBe(0);
+  expect(loadAgentNatsReplicas).toHaveBeenCalledExactlyOnceWith(agentDir);
+  expect(loadGlobalFabricConfig).not.toHaveBeenCalled();
+
   const nc = await connect({ servers: [cluster.seedUrl], ignoreClusterUpdates: true, timeout: 2_000 });
   rawConnections.push(nc);
   const manager = await jetstreamManager(nc);
@@ -366,10 +396,10 @@ it.skipIf(skipCluster)("real NATS 2.14.7 R3 leases, presence and actual transpor
     closed: () => nc.closed(), close: () => nc.close(),
   };
   connections.runtime.mockResolvedValue(handle);
-  // The product session provisions the actual resources; no hand-written stand-in inbox stream.
-  const transport = await openNatsTransport({ ...base, servers: cluster.seedUrl, replicas: 3, provision: true });
+  // Runtime opens the admin-provisioned R3 resources and exercises the real inbox path.
+  const transport = await openNatsTransport({ ...base, servers: cluster.seedUrl, replicas: 3, provision: false });
   transports.push(transport);
-  for (const name of ["KV_fabric_leases", "KV_fabric_presence", INBOX]) {
+  for (const name of ["KV_fabric_leases", "KV_fabric_presence", ADVISORY_CAPTURE_STREAM, INBOX]) {
     await waitForNatsStreamReady(cluster.seedUrl, name);
     const info = await manager.streams.info(name);
     expect(info.config).toMatchObject({ name, storage: "file", num_replicas: 3, allow_direct: false });
@@ -383,7 +413,7 @@ it.skipIf(skipCluster)("real NATS 2.14.7 R3 leases, presence and actual transpor
     expect(status.replicas).toBe(3);
     expect(status.streamInfo.config.num_replicas).toBe(3);
   }
-  expect((await manager.streams.info("FABRIC_ADV")).config.num_replicas).toBe(1);
+  expect((await manager.streams.info(ADVISORY_CAPTURE_STREAM)).config.num_replicas).toBe(3);
   const durable = transportDurableName(HOST);
   const before = await manager.consumers.info(INBOX, durable);
   expect(await transport.drainState()).toEqual({ pending: 0, ackPending: 0 });

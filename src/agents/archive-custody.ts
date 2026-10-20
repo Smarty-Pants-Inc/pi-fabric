@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { syncDirectoryChain, writeJsonAtomic } from "../core/atomic-write.js";
-import type { AgentRunResult, AgentRunStopCaller, AgentRunStopIntent } from "./types.js";
+import type { AgentRunResult } from "./types.js";
 import type { CompletionRecipient } from "./completion-journal.js";
 
 export const ARCHIVE_PENDING_FILE = "archive-pending.json";
@@ -16,23 +16,16 @@ export interface PendingRunArchive {
   actorOnly?: boolean;
   routePending?: boolean;
 }
-type ArchiveCustodyRecord = { format: number; awaitingResult?: boolean; ownerPid?: number; stopIntent?: AgentRunStopIntent; pending?: Partial<Record<PendingRunArchive["kind"], PendingRunArchive>> } & Partial<PendingRunArchive>;
+type ArchiveCustodyRecord = { format: number; awaitingResult?: boolean; ownerPid?: number; stopIntent?: { reason: "explicit" | "deadline"; requestedAt: number; recoveryRecord?: Record<string, unknown> }; pending?: Partial<Record<PendingRunArchive["kind"], PendingRunArchive>> } & Partial<PendingRunArchive>;
 const read = (directory: string): ArchiveCustodyRecord => {
   try { return JSON.parse(fs.readFileSync(path.join(directory, ARCHIVE_PENDING_FILE), "utf8")); }
   catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return { format: 1 }; throw error; }
 };
 /** Persist manager stop intent in the existing durable archive-custody receipt. */
-export const persistRunStopIntent = (directory: string, reason: "explicit" | "deadline", recoveryRecord?: Record<string, unknown>, caller?: AgentRunStopCaller): void => {
+export const persistRunStopIntent = (directory: string, reason: "explicit" | "deadline", recoveryRecord?: Record<string, unknown>): void => {
   const record = read(directory);
-  const by = record.stopIntent?.by ?? caller?.by;
-  const stopPath = record.stopIntent?.path ?? caller?.path;
-  const recovery = recoveryRecord ?? record.stopIntent?.recoveryRecord;
   writeJsonAtomic(path.join(directory, ARCHIVE_PENDING_FILE), { ...record, stopIntent: {
-    reason: record.stopIntent?.reason ?? reason,
-    requestedAt: record.stopIntent?.requestedAt ?? Date.now(),
-    ...(by ? { by } : {}),
-    ...(stopPath ? { path: stopPath } : {}),
-    ...(recovery ? { recoveryRecord: recovery } : {}),
+    reason, requestedAt: record.stopIntent?.requestedAt ?? Date.now(), ...(recoveryRecord ? { recoveryRecord } : {}),
   } }, { durable: true });
 };
 
@@ -46,19 +39,11 @@ export const readRunStopIntent = (directory: string, statusRecord?: Record<strin
   const intent = record?.stopIntent;
   if (!intent || typeof intent !== "object" || Array.isArray(intent)) return undefined;
   const value = intent as Record<string, unknown>;
-  if ((value.reason !== "explicit" && value.reason !== "deadline") || typeof value.requestedAt !== "number") return undefined;
-  const by = value.by && typeof value.by === "object" && !Array.isArray(value.by)
-    ? value.by as Record<string, unknown> : undefined;
-  const caller = by && typeof by.id === "string" && by.id.length > 0 &&
-    (by.kind === "main" || by.kind === "agent" || by.kind === "actor")
-    ? { kind: by.kind, id: by.id } as AgentRunStopIntent["by"] : undefined;
-  const stopPath = typeof value.path === "string" && ["agents.stop", "actors.stop", "actors.remove", "session-reset", "residency-teardown", "deadline"].includes(value.path)
-    ? value.path as NonNullable<AgentRunStopIntent["path"]> : undefined;
-  return { reason: value.reason, requestedAt: value.requestedAt,
-    ...(caller ? { by: caller } : {}), ...(stopPath ? { path: stopPath } : {}),
-    ...(value.recoveryRecord && typeof value.recoveryRecord === "object" && !Array.isArray(value.recoveryRecord)
-      ? { recoveryRecord: value.recoveryRecord as Record<string, unknown> } : {}),
-  };
+  return (value.reason === "explicit" || value.reason === "deadline") && typeof value.requestedAt === "number"
+    ? { reason: value.reason, requestedAt: value.requestedAt,
+      ...(value.recoveryRecord && typeof value.recoveryRecord === "object" && !Array.isArray(value.recoveryRecord)
+        ? { recoveryRecord: value.recoveryRecord as Record<string, unknown> } : {}),
+    } : undefined;
 };
 
 /** Clear only after a terminal status has been durably published. */

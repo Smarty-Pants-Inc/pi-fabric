@@ -68,18 +68,6 @@ export interface AgentSessionSeed {
   outerToolResult: AgentToolResultMessage;
 }
 
-export type AgentRunStopPath = "agents.stop" | "actors.stop" | "actors.remove" | "session-reset" | "residency-teardown" | "deadline";
-export type AgentRunStopCaller = { by: Pick<AgentSpawner, "kind" | "id">; path: AgentRunStopPath };
-export interface AgentRunStopIntent {
-  reason: "explicit" | "deadline";
-  requestedAt: number;
-  /** Optional only for legacy records written before stop-caller provenance was added. */
-  by?: Pick<AgentSpawner, "kind" | "id">;
-  /** Optional only for legacy records written before stop-caller provenance was added. */
-  path?: AgentRunStopPath;
-  recoveryRecord?: Record<string, unknown>;
-}
-
 /** Record-only host classification; it never grants permission to route. */
 export interface AgentRunRouteMetadata {
   routeClass: string;
@@ -230,9 +218,8 @@ export interface AgentCompactionStatus {
 }
 
 export interface AgentRunRecord {
-  /** Manager-owned durable intent distinguishing operator/deadline stops from worker checkpoints.
-   * by/path are absent only on legacy records written before stop-caller provenance was added. */
-  stopIntent?: AgentRunStopIntent;
+  /** Manager-owned durable intent distinguishing operator/deadline stops from worker checkpoints. */
+  stopIntent?: { reason: "explicit" | "deadline"; requestedAt: number };
   /** Canonical Fabric package root selected for the process worker at spawn time. */
   fabricRelease?: string;
   /** Admitted memory-capped task cgroup (smarty-dev#8257); absent when uncapped. */

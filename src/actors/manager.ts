@@ -3972,12 +3972,15 @@ export class ActorManager {
         if (actor.inFlightRun) {
           let run: ReturnType<AgentManager["status"]> | undefined;
           try { run = this.agents.status(actor.inFlightRun.id); } catch { /* The manager may have already retired this handle. */ }
-          // A persistent Main close suspends a run that has made progress. Only the no-work
-          // path is stopped by the ensuing abort; attributing that abort must not fence an
-          // independently continuing run from its existing recovery behavior.
+          // A persistent session actor close is a reload handoff, not an explicit stop:
+          // marking an unstarted run intentional suppresses its AgentManager recovery. A
+          // cursor replay cannot replace that recovery for ordinary mesh events, which have
+          // no explicit redrive identity. Durable teardown and non-persistent close are
+          // terminal, so preserve provenance there before the abort.
           const turns = run && "turns" in run ? run.turns : 0;
           const toolCalls = run && "toolCalls" in run ? run.toolCalls : 0;
-          if (run?.status === "running" && turns === 0 && toolCalls === 0) {
+          if (run?.status === "running" && turns === 0 && toolCalls === 0 &&
+              (actor.residency === "durable" || !this.#persistent)) {
             this.agents.recordStopIntent(actor.inFlightRun.id, {
               by: { kind: this.identity.kind, id: this.identity.id },
               path: actor.residency === "durable" ? "residency-teardown" : "session-reset",

@@ -24,7 +24,7 @@ const waitFor = async (predicate: () => boolean, timeoutMs = 10_000): Promise<vo
   }
 };
 
-const fixture = (persistent = true) => {
+const fixture = (persistent = true, closeGraceMs = 0) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "actor-unstarted-redrive-"));
   roots.push(root);
   const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
@@ -35,7 +35,7 @@ const fixture = (persistent = true) => {
   closers.push(() => agents.close());
   const actors = new ActorManager("redrive-test", identity, mesh,
     { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20, actorQueueLimit: 16 }, agents, () => {}, {
-      actorRoot: path.join(root, "actors"), persistent, closeGraceMs: 0, meshRetentionSweepPath: false,
+      actorRoot: path.join(root, "actors"), persistent, closeGraceMs, meshRetentionSweepPath: false,
     });
   closers.push(() => actors.close());
   return { root, mesh, agents, actors };
@@ -129,6 +129,22 @@ describe("actor runs that end before inference (#15195)", () => {
     expect(requests).toHaveLength(1);
     expect(alarms(h.mesh)).toHaveLength(0);
   });
+
+  it("does not fence a persistent session run when close suspends it for reload", async () => {
+    const h = fixture(true, 5_000);
+    const actor = await actorRequest(h.actors, "reload-reviewer");
+    await h.mesh.publish({ topic: "review.requests", from: identity, kind: "notification", text: "HANG during session reload" });
+    await waitFor(() => h.actors.status(actor.id).inFlightRun !== undefined);
+    const runId = h.actors.status(actor.id).inFlightRun!.id;
+    await waitFor(() => {
+      const run = h.agents.status(runId);
+      return run.status === "running" && "turns" in run && run.turns === 0;
+    });
+    await h.actors.close();
+    const result = await h.agents.wait(runId);
+    expect(result.status).toBe("stopped");
+    expect(result).not.toHaveProperty("stopIntent");
+  }, 15_000);
 
   it("does not re-drive an activation being removed and records removal provenance in run status", async () => {
     const h = fixture();

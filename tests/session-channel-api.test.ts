@@ -1,10 +1,8 @@
+import { describe, expect, it } from "vitest";
 import type { ExtensionAPI, ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import { createEventBus } from "../node_modules/@earendil-works/pi-coding-agent/dist/core/event-bus.js";
 import { createExtensionRuntime, loadExtensionFromFactory } from "../node_modules/@earendil-works/pi-coding-agent/dist/core/extensions/loader.js";
 import { requestSessionChannelApi, registerSessionChannelApi, type FabricSessionChannelApi } from "../src/transport/nats/session-channel-api.js";
-
-const testModule = process.versions.bun ? "bun:test" : "vitest";
-const { describe, expect, it } = await import(/* @vite-ignore */ testModule) as typeof import("vitest");
 
 const sessionChannelApi = Object.freeze({ open: async () => { throw new Error("not opened in API handoff test"); } });
 

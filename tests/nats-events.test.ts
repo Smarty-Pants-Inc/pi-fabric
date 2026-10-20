@@ -5,10 +5,10 @@ import { openBootstrapNatsConnection, openNatsConnection } from "../src/transpor
 import { NatsEventsIdConflictError, openNatsEventsPublisher } from "../src/transport/nats/events-publish.js";
 import { NATS_EVENT_RETRY_DELAY_SCHEDULE_MS, startNatsActorEventsConsumer } from "../src/transport/nats/events-consume.js";
 import type { MeshEvent } from "../src/mesh/event-log.js";
-import { ensureNatsEventsStream, natsEventsStreamName, natsGithubStreamName } from "../src/transport/nats/provision.js";
+import { ensureNatsEventsStream, ensureTransportStream, natsEventsStreamName, natsGithubStreamName, transportStreamConfig } from "../src/transport/nats/provision.js";
 import { hashToken } from "../src/transport/nats/subjects.js";
 import { createPathBHarness, PATH_B_PERMISSION_POLICY, resolveNatsBinary, type PathBHarness } from "./helpers/nats-cluster.js";
-import { DeliverPolicy, DiscardPolicy, RetentionPolicy, StorageType, type StreamConfig } from "@nats-io/jetstream";
+import { DeliverPolicy, DiscardPolicy, RetentionPolicy, StorageType, type StreamConfig, type StreamInfo } from "@nats-io/jetstream";
 
 const binary = resolveNatsBinary() ?? "";
 if (!binary && process.env.NATS_AUTH_REQUIRED === "1") throw new Error("NATS_AUTH_REQUIRED=1 but no nats-server executable was found");
@@ -53,6 +53,31 @@ describe("NATS event stream names", () => {
     expect(natsGithubStreamName("smarty-pants-inc")).toBe("GITHUB_SMARTY_PANTS_INC");
     expect(natsGithubStreamName("versehq")).toBe("GITHUB_VERSEHQ");
     expect(() => natsEventsStreamName("sys")).toThrow();
+  });
+
+  it("accepts an unbounded event stream but retains the 1 MiB application publish cap", async () => {
+    const org = "smarty-pants-inc";
+    const stream = natsEventsStreamName(org);
+    const policy = {
+      name: stream, subjects: [`fabric.ev.${org}.>`], maxBytes: 2_147_483_648, maxAgeMs: 0,
+      maxMessageBytes: 1_048_576, duplicateWindowMs: 120_000, replicas: 1,
+      discard: DiscardPolicy.New, allowUnboundedMaxMessageBytes: true,
+    } as const;
+    const config = { ...transportStreamConfig(policy), max_msg_size: -1 };
+    let publishes = 0;
+    const info = { config, state: { last_seq: 0 } } as StreamInfo;
+    const manager = { streams: { info: async () => info } };
+    const js = { publish: async () => { publishes += 1; return { stream, seq: 1, duplicate: false }; } };
+    const connection = { js, manager } as unknown as Parameters<typeof openNatsEventsPublisher>[0];
+    const publisher = await openNatsEventsPublisher(connection, { org, provision: false });
+    await expect(publisher.publish({ ...event("oversized", "mail.large"), data: { value: "x".repeat(1_048_600) } }))
+      .rejects.toThrow("exceeds 1048576 bytes");
+    expect(publishes).toBe(0);
+
+    const ordinary = { ...policy, name: "FABRIC_IN_sandbox1", subjects: ["fabric.in.sandbox1.>"], allowUnboundedMaxMessageBytes: false };
+    const ordinaryInfo = { config: { ...config, name: ordinary.name, subjects: [...ordinary.subjects] }, state: { last_seq: 0 } } as StreamInfo;
+    const ordinaryManager = { streams: { info: async () => ordinaryInfo } } as unknown as Parameters<typeof ensureTransportStream>[0];
+    await expect(ensureTransportStream(ordinaryManager, ordinary, false)).rejects.toThrow("configuration mismatch");
   });
 });
 

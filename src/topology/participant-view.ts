@@ -8,6 +8,8 @@ export interface ParticipantView {
   whenChanged(participantId: string, signal: AbortSignal): Promise<void>;
   /** The host lease is live by the local monotonic window (§4.2). */
   leaseLive(): boolean;
+  /** False admission during a recoverable local expiry; terminal loss aborts the lease signal. */
+  leaseRecovering?(): boolean;
 }
 
 import { createHash } from "node:crypto";
@@ -27,6 +29,8 @@ import { isPlacementRunId } from "./placement-run-id.js";
 /** The lease task owns acquisition, monotonic expiry, successor evidence and release. */
 export interface ParticipantLeaseGate {
   live(): boolean;
+  /** True only after a local TTL lapse that may be recovered by a fenced KV CAS. */
+  recovering?(): boolean;
   readonly signal: AbortSignal;
 }
 
@@ -147,7 +151,9 @@ export class KvParticipantDirectory implements ParticipantView {
   #started = false;
   #closed = false;
   #watchFailed = false;
-  #watchTasks: Promise<void>[] = [];
+  readonly #failedWatches = new Set<TransportBucket>();
+  readonly #watchTasks = new Set<Promise<void>>();
+  #stopVerifiedReconnect: (() => void) | undefined;
   #timer: ReturnType<typeof setTimeout> | undefined;
   #refreshPass: Promise<void> | undefined;
   #closing: Promise<void> | undefined;
@@ -179,7 +185,9 @@ export class KvParticipantDirectory implements ParticipantView {
     this.options.lease.signal.throwIfAborted();
     this.#started = true;
     this.options.lease.signal.addEventListener("abort", this.#leaseLost, { once: true });
-    this.#watchTasks = [this.#watch("presence"), this.#watch("leases")];
+    this.#stopVerifiedReconnect = this.options.transport.onVerifiedReconnect?.(() => this.#restartFailedWatches());
+    this.#launchWatch("presence");
+    this.#launchWatch("leases");
   }
 
   get ready(): boolean {
@@ -189,6 +197,33 @@ export class KvParticipantDirectory implements ParticipantView {
   leaseLive(): boolean {
     try { return !this.#closed && !this.options.lease.signal.aborted && this.options.lease.live(); }
     catch { return false; }
+  }
+
+  leaseRecovering(): boolean {
+    try { return !this.#closed && !this.options.lease.signal.aborted && this.options.lease.recovering?.() === true; }
+    catch { return false; }
+  }
+
+  #launchWatch(bucket: TransportBucket): void {
+    const task = this.#watch(bucket).finally(() => this.#watchTasks.delete(task));
+    this.#watchTasks.add(task);
+  }
+
+  #restartFailedWatches(): void {
+    if (this.#closed || !this.#started) return;
+    for (const bucket of [...this.#failedWatches]) {
+      this.#failedWatches.delete(bucket);
+      if (bucket === "presence") {
+        this.#presenceReady = false;
+        this.#records.clear();
+        this.#presenceRevisions.clear();
+      } else {
+        this.#leasesReady = false;
+        this.#hosts.clear();
+        this.#leaseRevisions.clear();
+      }
+      this.#launchWatch(bucket);
+    }
   }
 
   #assertReady(): void { if (!this.ready) throw new DirectoryNotReadyError(); }
@@ -209,6 +244,8 @@ export class KvParticipantDirectory implements ParticipantView {
     if (this.#timer) clearTimeout(this.#timer);
     this.#timer = undefined;
     this.options.lease.signal.removeEventListener("abort", this.#leaseLost);
+    this.#stopVerifiedReconnect?.();
+    this.#stopVerifiedReconnect = undefined;
     this.#abort.abort(reason);
     for (const waiter of [...this.#waiters]) waiter.fail(reason);
   }
@@ -229,6 +266,8 @@ export class KvParticipantDirectory implements ParticipantView {
           if (event.type === "ready") {
             const wasReady = this.ready;
             if (presence) this.#presenceReady = true; else this.#leasesReady = true;
+            this.#failedWatches.delete(bucket);
+            if (this.#presenceReady && this.#leasesReady) this.#watchFailed = false;
             if (!wasReady && this.ready) for (const waiter of [...this.#waiters]) waiter.changed();
             if (presence) this.#requestCleanup();
             continue;
@@ -270,6 +309,7 @@ export class KvParticipantDirectory implements ParticipantView {
       if (this.#closed || this.#abort.signal.aborted) return;
       if (retryAfterReconnect) continue;
       this.#watchFailed = true;
+      this.#failedWatches.add(bucket);
       for (const waiter of [...this.#waiters]) waiter.fail(new DirectoryNotReadyError());
       return;
     }
@@ -617,7 +657,7 @@ export class KvParticipantDirectory implements ParticipantView {
     if (this.#closing) return this.#closing;
     this.#stop(new DirectoryNotReadyError());
     this.#closing = (async () => {
-      await Promise.allSettled(this.#watchTasks);
+      await Promise.allSettled([...this.#watchTasks]);
       await this.#flushing?.catch(error => this.#report(error));
       await Promise.allSettled([...this.#writes.values()]);
       await Promise.all([...this.#owned].map(([key, owned]) => this.#serial(key, async () => {

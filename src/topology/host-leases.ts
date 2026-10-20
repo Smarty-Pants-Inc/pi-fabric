@@ -7,7 +7,7 @@ import { effectiveLiveness, type Liveness } from "./liveness.js";
 import { watchBridgeStore } from "../mesh/change-notifier.js";
 import { FabricPeerLeaseStaleError, PEER_LEASE_WAIT_MS } from "../agents/peer-lease-stale.js";
 import type { MeshStateEntry } from "../mesh/store.js";
-import type { TransportKv, TransportOwner } from "../transport/types.js";
+import { TransportUnavailableError, type TransportKv, type TransportKvEntry, type TransportOwner } from "../transport/types.js";
 import { HostLeaseLockBusyError, HostLeaseLockLostError, withHostLeaseLock, type HostLeaseLockOptions, type HostLeaseMesh } from "./host-lease-lock.js";
 
 // Host lease renewals outside the shared state (smarty-dev#816). Every heartbeat rewrote the
@@ -807,9 +807,10 @@ export type TransportHostLeaseLossReason = "conflict" | "timeout" | "clock" | "i
 export class TransportHostLeaseLostError extends Error {
   override readonly name = "TransportHostLeaseLostError";
   readonly code = "FABRIC_HOST_LEASE_LOST";
-  readonly retryable = false;
+  readonly retryable: boolean;
   constructor(readonly hostId: string, readonly owner: string, readonly reason: TransportHostLeaseLossReason, options?: ErrorOptions) {
     super(`Fabric transport host ${hostId}: lease ${owner} lost (${reason})`, options);
+    this.retryable = reason === "timeout";
   }
 }
 
@@ -835,8 +836,10 @@ export interface TransportHostLeaseOptions {
    * Every incarnation/parallel successor of this hostId MUST use the same stable directory.
    * Composition owns this placement; deleting/moving the receipt loses successor evidence. */
   readonly localStateDir: string;
-  /** Synchronous notification; called at most once. Throwing cannot restore the lease. */
+  /** Synchronous notification; called at most once for a terminal ownership loss. */
   readonly onLost?: (error: TransportHostLeaseLostError) => void;
+  /** Synchronous notification; called once per recoverable local TTL lapse. */
+  readonly onSuspended?: (error: TransportHostLeaseLostError) => void;
   readonly monotonic?: () => number;
 }
 
@@ -898,11 +901,12 @@ export const transportHostLeasePredecessorExited = (proof: TransportHostLeasePro
 const transportLeaseConflict = (error: unknown): boolean =>
   typeof error === "object" && error !== null && "code" in error && error.code === "FABRIC_KV_CONFLICT";
 
-/** Single-use incarnation. The directory drives renew() every RENEW_MS; there is no heartbeat
- * loop here. One unreferenced local cutoff alarm aborts signal even if nobody calls live().
- * Every custody/claim fence must still call live(): a paused event loop can delay that alarm.
- * Successful writes are dated conservatively at request START, not delayed PubAck receipt;
- * neither a late renew nor a previously lost incarnation can ever revive this object. */
+/** One activation incarnation. The directory drives renew() every RENEW_MS; there is no heartbeat
+ * loop here. The unreferenced cutoff alarm suspends admission even if nobody calls live(). Every
+ * custody/claim fence must still call live(): a paused event loop can delay that alarm. Successful
+ * writes are dated conservatively at request START, not delayed PubAck receipt. A suspended lease
+ * may recover only by verifying the same local receipt and CASing the broker's current revision;
+ * a conflicting owner or invalid local fence permanently loses this object. */
 export class TransportHostLease {
   readonly key: string;
   readonly owner: string;
@@ -915,9 +919,11 @@ export class TransportHostLease {
   readonly #receiptFile: string;
   readonly #monotonic: () => number;
   readonly #onLost: TransportHostLeaseOptions["onLost"];
+  readonly #onSuspended: TransportHostLeaseOptions["onSuspended"];
   readonly #abort = new AbortController();
-  #state: "idle" | "acquiring" | "held" | "lost" | "released" = "idle";
+  #state: "idle" | "acquiring" | "held" | "suspended" | "lost" | "released" = "idle";
   #loss: TransportHostLeaseLostError | undefined;
+  #suspension: TransportHostLeaseLostError | undefined;
   #revision = 0;
   #deadline: number | undefined;
   #lastClock: number | undefined;
@@ -946,14 +952,18 @@ export class TransportHostLease {
     this.#receiptFile = path.join(options.localStateDir, `transport-host-lease-${fileName(this.self.hostId)}`);
     this.#monotonic = options.monotonic ?? (() => performance.now());
     this.#onLost = options.onLost;
+    this.#onSuspended = options.onSuspended;
   }
 
   get signal(): AbortSignal { return this.#abort.signal; }
 
   live(): boolean {
     if (this.#state !== "held") return false;
-    try { this.#checkCutoff(); return true; } catch { return false; }
+    try { this.#checkCutoff(); return this.#state === "held"; } catch { return false; }
   }
+
+  /** A TTL lapse stops admission but does not prove a different owner took the lease. */
+  recovering(): boolean { return this.#state === "suspended"; }
 
   acquire(signal?: AbortSignal): Promise<TransportHostLeaseValue> {
     if (this.#state !== "idle") throw this.#loss ?? new Error("Transport host lease acquisition is single-use");
@@ -963,12 +973,12 @@ export class TransportHostLease {
     return pending;
   }
 
-  /** Concurrent renew calls join one CAS; a failed/uncertain write never extends the cutoff. */
+  /** Concurrent renew calls join one operation; stale revisions are re-read before recovery. */
   renew(signal?: AbortSignal): Promise<TransportHostLeaseValue> {
-    this.#requireLive();
     signal?.throwIfAborted();
     if (this.#renewing) return this.#renewing;
-    const pending = this.#renew(signal);
+    if (this.#state !== "suspended") this.#requireLive();
+    const pending = this.#state === "suspended" ? this.#reacquire(signal) : this.#renew(signal);
     this.#pending = this.#renewing = pending;
     const clear = (): void => { if (this.#renewing === pending) this.#renewing = undefined; };
     void pending.then(clear, clear);
@@ -983,7 +993,7 @@ export class TransportHostLease {
     if (this.#releasing) return this.#releasing;
     this.#state = "released";
     this.#clearTimer();
-    this.#abort.abort(this.#loss ?? new TransportHostLeaseLostError(this.self.hostId, this.owner, "released"));
+    this.#abort.abort(this.#loss ?? this.#suspension ?? new TransportHostLeaseLostError(this.self.hostId, this.owner, "released"));
     const pending = this.#pending;
     this.#releasing = (async () => {
       try { await pending; } catch { /* Cleanup still uses any confirmed revision from that write. */ }
@@ -1045,7 +1055,16 @@ export class TransportHostLease {
       operationSignal.throwIfAborted();
       const started = this.#checkCutoff();
       const value = this.#value();
-      const revision = await this.#kv.put(this.key, this.owner, value, this.#revision, operationSignal);
+      let revision: number;
+      try {
+        revision = await this.#kv.put(this.key, this.owner, value, this.#revision, operationSignal);
+      } catch (cause) {
+        if (!transportLeaseConflict(cause)) throw cause;
+        const current = await this.#kv.get<unknown>(this.key, operationSignal);
+        if (current && !this.#isOwnLeaseEntry(current)) throw this.#lose("conflict", cause);
+        this.#suspend(cause);
+        return await this.#reacquire(signal);
+      }
       this.#confirmRevision(revision);
       // Check the OLD deadline first, even if the deadline alarm has not had an event-loop turn.
       this.#requireLive();
@@ -1054,10 +1073,69 @@ export class TransportHostLease {
       this.#armCutoff();
       return value;
     } catch (cause) {
-      if (transportLeaseConflict(cause)) throw this.#lose("conflict", cause);
-      this.live(); // Latch a cutoff that elapsed while the failed request was in flight.
-      throw this.#loss ?? cause;
+      if (this.#state !== "suspended") this.live(); // Latch a cutoff that elapsed while the request was in flight.
+      if (this.#state === "suspended" && cause === this.#suspension) return await this.#reacquire(signal);
+      throw this.#loss ?? this.#suspension ?? cause;
     }
+  }
+
+  async #reacquire(signal?: AbortSignal): Promise<TransportHostLeaseValue> {
+    const operationSignal = signal ? AbortSignal.any([signal, this.signal]) : this.signal;
+    try {
+      operationSignal.throwIfAborted();
+      const processProof = this.#processProof;
+      const receipt = this.#receipt;
+      if (!processProof || !receipt) throw this.#lose("acquire-failed", new TransportHostLeaseProofError("missing"));
+      return await this.#withReceiptCustody(async () => {
+        operationSignal.throwIfAborted();
+        const currentReceipt = this.#readReceipt();
+        if (!currentReceipt || currentReceipt.releasedCleanly || !this.#sameReceiptOwner(currentReceipt, receipt) ||
+          currentReceipt.pid !== processProof.pid || currentReceipt.processStartTime !== processProof.pidStartTime ||
+          currentReceipt.bootId !== processProof.bootId) {
+          throw this.#lose("acquire-failed", new TransportHostLeaseProofError("invalid"));
+        }
+        for (let attempt = 0; attempt < 3; attempt++) {
+          operationSignal.throwIfAborted();
+          const started = this.#clock();
+          const deadline = started + TRANSPORT_HOST_LEASE_TTL_MS - TRANSPORT_HOST_LEASE_SAFETY_MS;
+          const current = await this.#kv.get<unknown>(this.key, operationSignal);
+          if (current && !this.#isOwnLeaseEntry(current)) throw this.#lose("conflict");
+          const value = this.#value();
+          try {
+            const revision = await this.#kv.put(this.key, this.owner, value, current?.revision ?? 0, operationSignal);
+            this.#confirmRevision(revision);
+            if (this.#clock() >= deadline) throw this.#suspend();
+            operationSignal.throwIfAborted();
+            this.#deadline = deadline;
+            this.#suspension = undefined;
+            this.#state = "held";
+            this.#armCutoff();
+            return value;
+          } catch (cause) {
+            if (this.#loss) throw this.#loss;
+            if (!transportLeaseConflict(cause)) throw cause;
+            const latest = await this.#kv.get<unknown>(this.key, operationSignal);
+            if (latest && !this.#isOwnLeaseEntry(latest)) throw this.#lose("conflict", cause);
+          }
+        }
+        throw new TransportUnavailableError("Transport host lease recovery is contended");
+      });
+    } catch (cause) {
+      if (this.#loss) throw this.#loss;
+      if (this.#state === "released") throw this.signal.reason ?? cause;
+      throw this.#suspension ?? cause;
+    }
+  }
+
+  #isOwnLeaseEntry(entry: TransportKvEntry<unknown>): boolean {
+    const value = entry.value;
+    const proof = this.#processProof;
+    if (!proof || typeof value !== "object" || value === null || Array.isArray(value)) return false;
+    const lease = value as Record<string, unknown>;
+    return entry.key === this.key && entry.machine === this.self.machine && entry.owner === this.owner &&
+      lease.id === this.self.hostId && lease.rootId === this.#rootId && lease.identityId === this.#identityId &&
+      lease.incarnation === this.#incarnation && lease.incarnationToken === this.#incarnation &&
+      lease.pid === proof.pid && lease.pidStartTime === proof.pidStartTime && lease.bootId === proof.bootId;
   }
 
   #value(): TransportHostLeaseValue {
@@ -1089,7 +1167,7 @@ export class TransportHostLease {
   #checkCutoff(): number {
     this.signal.throwIfAborted();
     const now = this.#clock();
-    if (this.#deadline !== undefined && now >= this.#deadline) throw this.#lose("timeout");
+    if (this.#deadline !== undefined && now >= this.#deadline) throw this.#suspend();
     return now;
   }
 
@@ -1104,9 +1182,18 @@ export class TransportHostLease {
     this.#timer = setTimeout(() => {
       this.#timer = undefined;
       if (this.#state !== "held" && this.#state !== "acquiring") return;
-      try { this.#armCutoff(); } catch { /* checkCutoff has already latched loss and aborted. */ }
+      try { this.#armCutoff(); } catch { /* checkCutoff has already suspended admission. */ }
     }, Math.ceil(remaining));
     this.#timer.unref?.();
+  }
+
+  #suspend(cause?: unknown): TransportHostLeaseLostError {
+    if (this.#suspension) return this.#suspension;
+    this.#suspension = new TransportHostLeaseLostError(this.self.hostId, this.owner, "timeout", { cause });
+    this.#state = "suspended";
+    this.#clearTimer();
+    try { this.#onSuspended?.(this.#suspension); } catch { /* A callback cannot grant authority or mask suspension. */ }
+    return this.#suspension;
   }
 
   #lose(reason: TransportHostLeaseLossReason, cause?: unknown): TransportHostLeaseLostError {

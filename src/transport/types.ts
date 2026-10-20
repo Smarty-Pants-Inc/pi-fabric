@@ -99,6 +99,8 @@ export interface TransportDrainState {
 export interface FabricTransport {
   readonly kind: "file" | "nats";
   readonly self: TransportOwner;
+  /** NATS only; fires after a reconnect session has passed USER.INFO verification. */
+  onVerifiedReconnect?(listener: () => void): () => void;
   /** Persist one envelope into envelope.to's inbox. Resolves on persistence only (§1.1). */
   send<T>(envelope: TransportEnvelope<T>, signal?: AbortSignal): Promise<TransportSent<T>>;
   /** This runtime's durable inbox. At most one iterator per process. Across processes the host lease (§4)

@@ -6422,8 +6422,10 @@ export class AgentManager {
 
   /** A leader's death forbids replay, but never substitutes for the whole native/tree join. */
   async #settleGoneActorWorker(managed: ManagedAgent, record: AgentRunRecord | undefined): Promise<boolean> {
-    // An intentional stop owns its verdict even when host identity also proves death.
-    if (readRunStopIntent(managed.runDirectory) !== undefined) return false;
+    // An intentional stop owns its verdict even when host identity also proves death,
+    // except an actor that abandoned this run: its live descendant may finish after actor.stop,
+    // but a later primary/whole-tree exit must still settle the unresumable run as lost.
+    if (readRunStopIntent(managed.runDirectory) !== undefined && !managed.abandoned) return false;
     // Lifecycle close/abort has no durable operator intent, but its own teardown
     // still cannot manufacture a pre-existing actor-loss verdict.
     if ((managed.stopRequested && managed.workerGoneBeforeStop !== managed.transport) || !this.#actorWorkerGone(managed)) return false;
@@ -6446,8 +6448,9 @@ export class AgentManager {
     await this.#captureWorktree(managed);
     if (managed.settled) return true;
     // Operator/deadline intent may arrive while the loss observer joins the tree.
-    // Recheck after the last await, before publishing a synthetic loss verdict.
-    if (readRunStopIntent(managed.runDirectory) !== undefined) return false;
+    // Recheck after the last await, before publishing a synthetic loss verdict. An actor's
+    // abandoned run remains eligible for this loss settlement: it cannot be resumed.
+    if (readRunStopIntent(managed.runDirectory) !== undefined && !managed.abandoned) return false;
     // Final publication may race the join. Do not replace a committed success (or
     // genuine worker failure) with the earlier running/missing snapshot's loss.
     const joined = readRecord(managed.statusFile);

@@ -3968,7 +3968,24 @@ export class ActorManager {
       // Cancel current preparations now; a released model resolver must not launch
       // a worker while shutdown waits for a deferred maintenance slice. Cache the
       // close promise first so an abort listener can safely join close reentrantly.
-      for (const actor of this.#draining.values()) actor.abortController?.abort();
+      for (const actor of this.#draining.values()) {
+        if (actor.inFlightRun) {
+          let run: ReturnType<AgentManager["status"]> | undefined;
+          try { run = this.agents.status(actor.inFlightRun.id); } catch { /* The manager may have already retired this handle. */ }
+          // A persistent Main close suspends a run that has made progress. Only the no-work
+          // path is stopped by the ensuing abort; attributing that abort must not fence an
+          // independently continuing run from its existing recovery behavior.
+          const turns = run && "turns" in run ? run.turns : 0;
+          const toolCalls = run && "toolCalls" in run ? run.toolCalls : 0;
+          if (run?.status === "running" && turns === 0 && toolCalls === 0) {
+            this.agents.recordStopIntent(actor.inFlightRun.id, {
+              by: { kind: this.identity.kind, id: this.identity.id },
+              path: actor.residency === "durable" ? "residency-teardown" : "session-reset",
+            });
+          }
+        }
+        actor.abortController?.abort();
+      }
     }
     return this.#closePromise;
   }
@@ -4013,10 +4030,6 @@ export class ActorManager {
       this.#refreshOwnership();
       const owned = [...this.#actors.values()].filter((actor) => this.#canManageCached(actor.id));
       for (const actor of owned) {
-        if (actor.inFlightRun) this.agents.recordStopIntent(actor.inFlightRun.id, {
-          by: { kind: this.identity.kind, id: this.identity.id },
-          path: actor.residency === "durable" ? "residency-teardown" : "session-reset",
-        });
         actor.abortController?.abort();
         for (const item of actor.queue.splice(0)) {
           item.reject?.(

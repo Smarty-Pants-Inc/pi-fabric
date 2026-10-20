@@ -355,6 +355,24 @@ const PRESENCE_RETRY_MS = 5_000;
 const DELIVERED_EVENT_MEMORY = 4_096;
 /** Per durable actor: completed mesh subjects retained in its queue checkpoint. */
 const PROCESSED_KEY_MEMORY = 256;
+/** Actor queue snapshots retain recent broker receipts, never an unbounded history. */
+export const NATS_EVENT_RECEIPT_MEMORY = 4_096;
+export function rememberNatsEventReceipt(receipts: Set<string>, messageId: string): string[] {
+  if (receipts.has(messageId)) {
+    receipts.delete(messageId);
+    receipts.add(messageId);
+    return [];
+  }
+  receipts.add(messageId);
+  const evicted: string[] = [];
+  while (receipts.size > NATS_EVENT_RECEIPT_MEMORY) {
+    const oldest = receipts.values().next().value;
+    if (oldest === undefined) break;
+    receipts.delete(oldest);
+    evicted.push(oldest);
+  }
+  return evicted;
+}
 const warnedActivationFilters = new Set<string>();
 // smarty-dev#1579: an unreadable stored filter never drops or rewrites its actor. It is kept as
 // stored (and written back unchanged) but not applied, so every event is delivered.
@@ -1363,29 +1381,44 @@ export class ActorManager {
     });
   }
 
+  #trimNatsEventReceipts(receipts: Set<string>): void {
+    while (receipts.size > NATS_EVENT_RECEIPT_MEMORY) {
+      const oldest = receipts.values().next().value;
+      if (oldest === undefined) break;
+      receipts.delete(oldest);
+    }
+  }
+
   #persistNatsEventReceipt(actorId: string, messageId: string): boolean {
     const receipts = this.#natsEventReceipts.get(actorId) ?? new Set<string>();
-    if (receipts.has(messageId)) return true;
-    receipts.add(messageId);
+    if (receipts.has(messageId)) {
+      rememberNatsEventReceipt(receipts, messageId);
+      this.#natsEventReceipts.set(actorId, receipts);
+      return true;
+    }
+    const evicted = rememberNatsEventReceipt(receipts, messageId);
     this.#natsEventReceipts.set(actorId, receipts);
     if (this.#persistQueue(actorId, true)) return true;
     receipts.delete(messageId);
+    for (const id of evicted) receipts.add(id);
+    this.#trimNatsEventReceipts(receipts);
     if (receipts.size === 0) this.#natsEventReceipts.delete(actorId);
     return false;
   }
 
-  async #acceptNatsActorEvent(actorId: string, event: MeshEvent, messageId: string, ack: () => Promise<void>): Promise<void> {
+  async #acceptNatsActorEvent(actorId: string, event: MeshEvent, messageId: string, ack: () => Promise<void>): Promise<"accepted" | "retry"> {
     this.#refreshOwnership(actorId);
     const actor = this.#actors.get(actorId);
     const org = this.meshConfig.nats.org;
     const isWake = event.topic === `wake.${actorId}` || event.topic === `fabric.ev.${org}.wake.${actorId}`;
     const subscribed = actor?.topics.includes(event.topic) || actor?.topics.includes(`fabric.ev.${org}.${event.topic}`);
     if (!actor || actor.status === "stopped" || actor.removal || (!isWake && !subscribed) ||
-        !this.#canManageCached(actorId) || !this.#slotCurrent(actor)) return;
+        !this.#canManageCached(actorId) || !this.#slotCurrent(actor)) return "retry";
     if (this.#natsEventReceipts.get(actorId)?.has(messageId)) {
+      this.#persistNatsEventReceipt(actorId, messageId);
       await ack();
       setImmediate(() => { const current = this.#actors.get(actorId); if (current) this.#ensureDrain(current); });
-      return;
+      return "accepted";
     }
     const source = `mesh:${event.topic}`;
     const deliveryId = messageId || String(event.sequence);
@@ -1407,6 +1440,7 @@ export class ActorManager {
     }
     await ack();
     setImmediate(() => { const current = this.#actors.get(actorId); if (current) this.#ensureDrain(current); });
+    return "accepted";
   }
 
   retryCapabilityWaiters(): void {
@@ -8881,7 +8915,10 @@ export class ActorManager {
     if (!Array.isArray(records)) return;
     if (Array.isArray(saved.natsEventReceipts)) {
       const receipts = this.#natsEventReceipts.get(actor.id) ?? new Set<string>();
-      for (const id of saved.natsEventReceipts) if (typeof id === "string" && id.length > 0) receipts.add(id);
+      for (const id of saved.natsEventReceipts) {
+        if (typeof id !== "string" || id.length === 0) continue;
+        rememberNatsEventReceipt(receipts, id);
+      }
       if (receipts.size) this.#natsEventReceipts.set(actor.id, receipts);
     }
     if (actor.residency === "durable" && actor.dedupeKey && Array.isArray(saved.processedKeys)) {

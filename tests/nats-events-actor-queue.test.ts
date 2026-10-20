@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
-import { ActorManager } from "../src/actors/manager.js";
+import { ActorManager, NATS_EVENT_RECEIPT_MEMORY, rememberNatsEventReceipt } from "../src/actors/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore, type MeshEvent, type MeshIdentity } from "../src/mesh/store.js";
 
@@ -47,11 +47,25 @@ afterEach(async () => {
 });
 
 describe("NATS actor event queue admission", () => {
+  it("bounds the durable receipt history with LRU ordering", () => {
+    const receipts = new Set(["oldest", "recent"]);
+    for (let index = 0; index < NATS_EVENT_RECEIPT_MEMORY - 2; index++) {
+      rememberNatsEventReceipt(receipts, `receipt-${index}`);
+    }
+    rememberNatsEventReceipt(receipts, "recent");
+    const evicted = rememberNatsEventReceipt(receipts, "newest");
+    expect(receipts.size).toBe(NATS_EVENT_RECEIPT_MEMORY);
+    expect(receipts.has("oldest")).toBe(false);
+    expect(receipts.has("recent")).toBe(true);
+    expect(evicted).toEqual(["oldest"]);
+  });
+
   it("persists the Nats-Msg-Id as data.deliveryId with the queue receipt before ACK", async () => {
     const mesh = new MeshStore(meshRoot, 64 * 1024, 100);
     const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
       workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "runs"),
     });
+    const ownership = { owned: true };
     const meshConfig = {
       ...DEFAULT_FABRIC_CONFIG.mesh,
       transport: "nats" as const,
@@ -68,7 +82,7 @@ describe("NATS actor event queue admission", () => {
       },
     };
     const actors = new ActorManager("nats-events-test", identity, mesh, meshConfig, agents, () => {}, {
-      actorRoot, persistent: true,
+      actorRoot, persistent: true, canManageActor: () => ownership.owned,
     });
     close.push(async () => { await actors.close(); await agents.close(); });
     const actor = await actors.create({ name: "mail-reviewer", instructions: "Review mail events.", topics: ["mail.inbound"],
@@ -81,7 +95,7 @@ describe("NATS actor event queue admission", () => {
     };
     let resolveAck!: () => void;
     const ackPending = new Promise<void>(resolve => { resolveAck = resolve; });
-    const onMessage = mocks.onMessage as (event: MeshEvent, messageId: string, ack: () => Promise<void>) => Promise<void>;
+    const onMessage = mocks.onMessage as (event: MeshEvent, messageId: string, ack: () => Promise<void>) => Promise<"accepted" | "retry">;
     const accepting = onMessage(event, "nats-msg-mail-1", () => ackPending);
     await waitFor(() => {
       try { return queueSnapshot(actor.id).items.length === 1; }
@@ -115,5 +129,20 @@ describe("NATS actor event queue admission", () => {
     expect(queueSnapshot(idleActor.id).items[0]?.payload.data).toMatchObject({ wake: true, deliveryId: "nats-msg-idle-wake" });
     resolveIdleAck();
     await acceptingIdleWake;
+
+    let staleAcked = false;
+    const staleOutcome = await onIdleMessage({ ...idleWake, id: "stale-topic", topic: "mail.not-subscribed" }, "nats-stale-topic", async () => {
+      staleAcked = true;
+    });
+    expect(staleOutcome).toBe("retry");
+    expect(staleAcked).toBe(false);
+
+    ownership.owned = false;
+    let lostOwnerAcked = false;
+    const lostOwnerOutcome = await onIdleMessage(idleWake, "nats-lost-owner", async () => {
+      lostOwnerAcked = true;
+    });
+    expect(lostOwnerOutcome).toBe("retry");
+    expect(lostOwnerAcked).toBe(false);
   });
 });

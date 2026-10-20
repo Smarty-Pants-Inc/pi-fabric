@@ -67,6 +67,8 @@ export interface PathBHarnessOptions {
   readonly binary?: string;
   /** Opt into the shared runtime user's org-scoped session-channel grants. */
   readonly org?: string;
+  /** Mint the runtime agent with the opt-in shared-org event grants. Requires org. */
+  readonly events?: boolean;
   /** Issue real CLI artifacts without changing the default hand-built fault-injection fixture. */
   readonly identityFactory?: (root: string) => PathBIdentity | Promise<PathBIdentity>;
   /** Additional publish allows for agent superset-verification tests. */
@@ -120,7 +122,10 @@ function createTestTls(root: string, dnsNames: readonly string[], ipAddresses: r
 }
 
 function faultedAgentTemplate(options: PathBHarnessOptions): RoleTemplate {
-  const base = roleTemplateWithPathB("agent", { custodyStream: PATH_B_PERMISSION_POLICY.custodyStream, livenessStream: PATH_B_PERMISSION_POLICY.livenessStream }, PATH_B_MACHINES, options.org);
+  const policy = options.events === true
+    ? { events: true, ...(options.org === undefined ? {} : { org: options.org }) }
+    : options.org;
+  const base = roleTemplateWithPathB("agent", { custodyStream: PATH_B_PERMISSION_POLICY.custodyStream, livenessStream: PATH_B_PERMISSION_POLICY.livenessStream }, PATH_B_MACHINES, policy);
   const removedPublish = new Set(options.removeAgentPublish ?? []);
   const removedDeny = new Set(options.removeAgentDeny ?? []);
   return {

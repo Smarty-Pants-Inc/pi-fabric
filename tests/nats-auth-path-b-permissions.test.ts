@@ -51,10 +51,14 @@ describe("Path B NATS grants", () => {
     const grants = [
       "fabric.ev.smarty-dev.>",
       ...["FABRIC_EV_SMARTY_DEV", "GITHUB_SMARTY_DEV"].flatMap(stream => [
+        `$JS.API.STREAM.INFO.${stream}`,
+        `$JS.API.STREAM.MSG.GET.${stream}`,
+        `$JS.API.CONSUMER.DURABLE.CREATE.${stream}.>`,
         `$JS.API.CONSUMER.CREATE.${stream}.>`,
         `$JS.API.CONSUMER.INFO.${stream}.>`,
         `$JS.API.CONSUMER.MSG.NEXT.${stream}.>`,
         `$JS.API.CONSUMER.DELETE.${stream}.>`,
+        `$JS.API.CONSUMER.UPDATE.${stream}.>`,
         `$JS.ACK.${stream}.>`,
       ]),
     ];

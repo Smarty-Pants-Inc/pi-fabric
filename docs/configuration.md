@@ -1114,8 +1114,8 @@ server-side inactivity expiry cleans up after unclean exits.
 The admin provisioning command defaults new inbox streams to seven days and
 accepts an explicit `--inbox-max-age-ms` value when provisioning a different
 configured age. It verifies existing streams only and never updates them.
-Bounded age removes old and acknowledged traffic but also means an unacked
-message older than the configured age can expire. The stream's byte limit still
+Bounded age removes old and acknowledged traffic. An unacked message older
+than the configured age can also expire. The stream's byte limit still
 applies sooner at high throughput.
 
 Longer term, `WorkQueue` retention is likely a closer fit than `Interest`: each

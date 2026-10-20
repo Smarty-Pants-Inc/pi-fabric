@@ -1,6 +1,14 @@
 // src/topology/participant-view.ts (A2 owns; A1 imports only this)
 export interface ParticipantRoute { machine: string; ownerHostId: string; ownerIdentityId: string; ownerIncarnation: string;
   capabilities: readonly string[]; live: boolean }
+export interface ActorHandoffRelease {
+  format: 1;
+  actorId: string;
+  ownerHostId: string;
+  ownerIdentityId: string;
+  ownerIncarnation: string;
+  stoppedAt: number;
+}
 export interface ParticipantView {
   /** Throws DirectoryNotReadyError before the presence watch is ready. undefined = known absent. */
   resolve(participantId: string): ParticipantRoute | undefined;
@@ -76,6 +84,14 @@ const canonicalJson = (value: unknown): string => JSON.stringify(value, (_key, c
   if (!objectValue(child)) return child;
   return Object.fromEntries(Object.keys(child).sort().map(key => [key, child[key]]));
 }) ?? "";
+const leaseOwnerKey = (id: string, incarnation: string): string => `${id}\0${incarnation}`;
+const validActorHandoffRelease = (value: unknown, record: Record<string, unknown>): boolean => {
+  if (value === undefined) return true;
+  if (!objectValue(value)) return false;
+  return record.kind === "actor" && value.format === 1 && value.actorId === record.id &&
+    value.ownerHostId === record.ownerHostId && value.ownerIdentityId === record.ownerIdentityId &&
+    value.ownerIncarnation === record.ownerIncarnation && finiteValue(value.stoppedAt);
+};
 
 /** Key tokens, not entry.machine or JSON fields, establish the authenticated machine. */
 function machineFromKey(key: string, kind: "p" | "h"): string | undefined {
@@ -104,6 +120,7 @@ export function presenceValue(entry: TransportKvEntry<unknown>): FabricParticipa
     !["sessionId", "cwd", "label", "role", "project", "projectRoot", "repository", "model", "thinking", "parentId", "finalAnswerReceiptId", "placementRunId"]
       .every(key => value[key] === undefined || typeof value[key] === "string") ||
     value.placementRunId !== undefined && !isPlacementRunId(value.placementRunId) ||
+    !validActorHandoffRelease(value.actorHandoffRelease, value) ||
     value.remoteHost !== undefined || value.bridgeVia !== undefined || value.stopReason !== undefined) return undefined;
   return value as unknown as FabricParticipantRecord;
 }
@@ -135,6 +152,8 @@ export class KvParticipantDirectory implements ParticipantView {
   readonly #abort = new AbortController();
   readonly #records = new Map<string, TransportKvEntry<FabricParticipantRecord>>();
   readonly #hosts = new Map<string, TransportKvEntry<FabricKvHostLease>>();
+  /** Exact lease values whose KV TTL tombstone was observed; a replacement lease alone is not expiry proof. */
+  readonly #expiredLeases = new Map<string, FabricKvHostLease>();
   readonly #presenceRevisions = new Map<string, number>();
   readonly #leaseRevisions = new Map<string, number>();
   readonly #owned = new Map<string, OwnedPresence>();
@@ -206,6 +225,7 @@ export class KvParticipantDirectory implements ParticipantView {
     this.#presenceReady = this.#leasesReady = false;
     this.#records.clear();
     this.#hosts.clear();
+    this.#expiredLeases.clear();
     if (this.#timer) clearTimeout(this.#timer);
     this.#timer = undefined;
     this.options.lease.signal.removeEventListener("abort", this.#leaseLost);
@@ -221,7 +241,7 @@ export class KvParticipantDirectory implements ParticipantView {
         if (this.#closed) break;
         if (event.type === "reset") {
           if (presence) { this.#presenceReady = false; this.#records.clear(); this.#presenceRevisions.clear(); }
-          else { this.#leasesReady = false; this.#hosts.clear(); this.#leaseRevisions.clear(); }
+          else { this.#leasesReady = false; this.#hosts.clear(); this.#expiredLeases.clear(); this.#leaseRevisions.clear(); }
           continue;
         }
         if (event.type === "ready") {
@@ -244,10 +264,17 @@ export class KvParticipantDirectory implements ParticipantView {
             if (record) this.#records.set(key, { ...event.entry, value: freezeJson(cloneJson(record)) });
           }
         } else {
+          const previous = this.#hosts.get(key)?.value;
           this.#hosts.delete(key);
+          if (event.type === "gone" && event.reason === "expired" && previous) {
+            this.#expiredLeases.set(leaseOwnerKey(previous.id, previous.incarnation), previous);
+          }
           if (event.type === "put") {
             const lease = leaseValue(event.entry);
-            if (lease) this.#hosts.set(key, { ...event.entry, value: freezeJson(cloneJson(lease)) });
+            if (lease) {
+              this.#expiredLeases.delete(leaseOwnerKey(lease.id, lease.incarnation));
+              this.#hosts.set(key, { ...event.entry, value: freezeJson(cloneJson(lease)) });
+            }
           }
         }
         for (const waiter of [...this.#waiters]) {
@@ -407,7 +434,7 @@ export class KvParticipantDirectory implements ParticipantView {
     return this.#remember(key, record, revision);
   }
 
-  /** On-change publication; only an initial own-root create may succeed a fenced predecessor. */
+  /** On-change publication; only roots, same-lineage participants, or participants with a dead owner may replace a predecessor. */
   publish(record: FabricParticipantRecord): Promise<KvPresencePublication> {
     const copy = this.#ownRecord(record), key = this.#key(copy.id);
     return this.#serial(key, async () => {
@@ -421,38 +448,98 @@ export class KvParticipantDirectory implements ParticipantView {
       let revision: number;
       try { revision = await this.#update(key, copy, owned?.revision ?? 0); }
       catch (error) {
-        // Only the initial own-root create may replace a predecessor. Children,
-        // owned revisions and same-incarnation conflicts never acquire a read revision.
-        if (owned || errorCode(error) !== "FABRIC_KV_CONFLICT" || copy.kind !== "root" ||
-          copy.id !== this.options.rootId || copy.id !== this.options.identityId) throw error;
+        // Initial root creation keeps its fenced predecessor rule. Actor/agent rows
+        // may also move to a live successor in their root lineage, or out of a dead
+        // owner's lease. Existing local revisions never acquire read authority.
+        if (owned || errorCode(error) !== "FABRIC_KV_CONFLICT") throw error;
+        const rootCreate = copy.kind === "root" && copy.id === this.options.rootId && copy.id === this.options.identityId;
         const current = await this.#presence.get<unknown>(key, this.#signal());
         const predecessor = current && presenceValue(current);
-        if (!current || current.key !== key || !predecessor || predecessor.kind !== "root" ||
-          predecessor.id !== copy.id || predecessor.rootId !== copy.rootId ||
-          predecessor.ownerHostId !== copy.ownerHostId || predecessor.ownerIdentityId !== copy.ownerIdentityId ||
-          predecessor.sessionId !== copy.sessionId || predecessor.ownerIncarnation === copy.ownerIncarnation) {
-          throw new TransportInvalidError("Presence create conflict is not an owned predecessor root");
+        if (!current || current.key !== key || !predecessor || predecessor.id !== copy.id ||
+          predecessor.ownerIncarnation === copy.ownerIncarnation) {
+          if (rootCreate) throw new TransportInvalidError("Presence create conflict is not an owned predecessor root");
+          throw error;
         }
-        // Custody's clean/native-exit proof plus exclusive lease create establishes
-        // succession, not UUID ordering or a possibly stale lease watch snapshot.
-        const leaseKey = `${this.options.transport.self.machine}.h.${tokenFor(copy.ownerHostId)}`;
+        const rootSuccessor = rootCreate && predecessor.kind === "root" && predecessor.rootId === copy.rootId &&
+          predecessor.ownerHostId === copy.ownerHostId && predecessor.ownerIdentityId === copy.ownerIdentityId &&
+          predecessor.sessionId === copy.sessionId;
+        const participantRow = (copy.kind === "actor" || copy.kind === "agent") && predecessor.kind === copy.kind;
+        const participantSuccessor = participantRow && predecessor.rootId === copy.rootId;
+        if (rootCreate && !rootSuccessor) throw new TransportInvalidError("Presence create conflict is not an owned predecessor root");
+        if (!rootSuccessor && !participantRow) throw error;
+
+        const actorIncarnationHandoff = participantRow && copy.kind === "actor" && predecessor.rootId === copy.rootId;
+        const ownLineageSuccessor = rootSuccessor || participantSuccessor;
+        const leaseKey = `${this.options.transport.self.machine}.h.${tokenFor(
+          ownLineageSuccessor ? copy.ownerHostId : predecessor.ownerHostId)}`;
         const currentLease = await this.#leases.get<unknown>(leaseKey, this.#signal());
         const lease = currentLease && leaseValue(currentLease);
-        if (!currentLease || currentLease.key !== leaseKey || currentLease.owner !== this.#owner() || !lease ||
-          lease.id !== copy.ownerHostId || lease.rootId !== copy.rootId ||
-          lease.identityId !== copy.ownerIdentityId || lease.incarnation !== copy.ownerIncarnation) {
-          throw new TransportUnavailableError("Current owner lease does not authorize root succession");
+        const successorLease = !!currentLease && currentLease.key === leaseKey && currentLease.owner === this.#owner() && !!lease &&
+          lease.id === copy.ownerHostId && lease.rootId === copy.rootId &&
+          lease.identityId === copy.ownerIdentityId && lease.incarnation === copy.ownerIncarnation && lease.expiresAt > Date.now();
+        const predecessorLease = !!lease && lease.id === predecessor.ownerHostId && lease.rootId === predecessor.rootId &&
+          lease.identityId === predecessor.ownerIdentityId && lease.incarnation === predecessor.ownerIncarnation;
+        const release = (predecessor as FabricParticipantRecord & { actorHandoffRelease?: ActorHandoffRelease }).actorHandoffRelease;
+        const matchingRelease = actorIncarnationHandoff && release?.actorId === predecessor.id &&
+          release.ownerHostId === predecessor.ownerHostId && release.ownerIdentityId === predecessor.ownerIdentityId &&
+          release.ownerIncarnation === predecessor.ownerIncarnation;
+        let predecessorLeaseEntry = currentLease;
+        const predecessorLeaseKey = `${this.options.transport.self.machine}.h.${tokenFor(predecessor.ownerHostId)}`;
+        if (actorIncarnationHandoff && predecessorLeaseKey !== leaseKey) {
+          predecessorLeaseEntry = await this.#leases.get<unknown>(predecessorLeaseKey, this.#signal());
+        }
+        const predecessorExpired = actorIncarnationHandoff && this.#predecessorLeaseExpired(predecessor, predecessorLeaseEntry);
+        // Same-root actors require the exact predecessor's committed drain receipt
+        // or an observed expiry of that predecessor's lease. A successor lease by
+        // itself only proves that the successor may publish, not that it may run.
+        const deadPredecessor = participantRow && !ownLineageSuccessor && (!currentLease ||
+          (!!currentLease && currentLease.key === leaseKey && !!lease &&
+            (!predecessorLease || lease.expiresAt <= Date.now())));
+        if (ownLineageSuccessor && !successorLease) {
+          throw new TransportUnavailableError("Current owner lease does not authorize presence succession");
+        }
+        if (actorIncarnationHandoff && !successorLease) {
+          throw new TransportUnavailableError("Current owner lease does not authorize presence succession");
+        }
+        if (actorIncarnationHandoff && !matchingRelease && !predecessorExpired) {
+          const observedPredecessor = predecessorLeaseEntry?.key === predecessorLeaseKey
+            ? leaseValue(predecessorLeaseEntry) : undefined;
+          if (observedPredecessor && observedPredecessor.id === predecessor.ownerHostId &&
+              observedPredecessor.rootId === predecessor.rootId && observedPredecessor.identityId === predecessor.ownerIdentityId &&
+              observedPredecessor.incarnation === predecessor.ownerIncarnation && observedPredecessor.expiresAt > Date.now()) throw error;
+          throw new TransportUnavailableError("Predecessor actor lease has not expired and no handoff receipt is present");
+        }
+        if (!ownLineageSuccessor && !actorIncarnationHandoff && !deadPredecessor) {
+          if (currentLease && currentLease.key === leaseKey && lease && predecessorLease && lease.expiresAt > Date.now()) throw error;
+          throw new TransportUnavailableError("Current owner lease does not authorize presence succession");
         }
         this.#assertWritable(); // Reads may outlive the monotonic lease window.
         revision = await this.#update(key, copy, current.revision); // One CAS; never retry/adopt a lost revision.
         try {
-          // KV has no cross-bucket transaction. Validate the exact lease revision
-          // again after the CAS, before remembering or admitting this publication.
+          // KV has no cross-bucket transaction. Revalidate the exact successor
+          // lease, or prove the displaced participant owner is still not live.
           const confirmed = await this.#leases.get<unknown>(leaseKey, this.#signal());
           const confirmedLease = confirmed && leaseValue(confirmed);
-          if (!confirmed || confirmed.key !== currentLease.key || confirmed.revision !== currentLease.revision ||
-            confirmed.owner !== currentLease.owner || !confirmedLease || canonicalJson(confirmedLease) !== canonicalJson(lease)) {
-            throw new TransportUnavailableError("Owner lease changed during root succession");
+          const sameOwnerLease = (value: FabricKvHostLease): boolean =>
+            value.id === predecessor.ownerHostId && value.rootId === predecessor.rootId &&
+            value.identityId === predecessor.ownerIdentityId && value.incarnation === predecessor.ownerIncarnation;
+          const stillDead = !confirmed || (!!confirmed && confirmed.key === leaseKey && !!confirmedLease &&
+            (!sameOwnerLease(confirmedLease) || confirmedLease.expiresAt <= Date.now()));
+          if (ownLineageSuccessor) {
+            if (!confirmed || confirmed.key !== currentLease!.key || confirmed.revision !== currentLease!.revision ||
+              confirmed.owner !== currentLease!.owner || !confirmedLease || canonicalJson(confirmedLease) !== canonicalJson(lease) ||
+              confirmedLease.expiresAt <= Date.now()) {
+              throw new TransportUnavailableError("Owner lease changed during presence succession");
+            }
+          } else if (!stillDead) {
+            throw new TransportUnavailableError("Predecessor host lease became live during presence succession");
+          }
+          if (actorIncarnationHandoff && !matchingRelease) {
+            const confirmedPredecessor = predecessorLeaseKey === leaseKey ? confirmed :
+              await this.#leases.get<unknown>(predecessorLeaseKey, this.#signal());
+            if (!this.#predecessorLeaseExpired(predecessor, confirmedPredecessor)) {
+              throw new TransportUnavailableError("Predecessor host lease did not expire during presence succession");
+            }
           }
           this.#assertWritable();
         } catch (error) {
@@ -460,11 +547,26 @@ export class KvParticipantDirectory implements ParticipantView {
           // now aborted. A newer presence writer wins; never retry or delete it.
           try { await this.#presence.put(key, current.owner, predecessor, revision, this.#signal(true)); }
           catch (undoError) { this.#report(undoError); }
-          throw new TransportUnavailableError("Owner lease no longer authorizes root succession", { cause: error });
+          throw new TransportUnavailableError("Owner lease no longer authorizes presence succession", { cause: error });
         }
       }
       return this.#admitted(key, copy, revision);
     });
+  }
+
+  #predecessorLeaseExpired(predecessor: FabricParticipantRecord, current: TransportKvEntry<unknown> | undefined): boolean {
+    const incarnation = predecessor.ownerIncarnation;
+    if (!incarnation) return false;
+    const expectedKey = `${this.options.transport.self.machine}.h.${tokenFor(predecessor.ownerHostId)}`;
+    const lease = current?.key === expectedKey ? leaseValue(current) : undefined;
+    // A key that merely advertises a past expiresAt is not proof the broker's TTL
+    // removed it. Nor may a re-created exact lease reuse an older expiry receipt.
+    if (lease && lease.id === predecessor.ownerHostId && lease.rootId === predecessor.rootId &&
+      lease.identityId === predecessor.ownerIdentityId && lease.incarnation === predecessor.ownerIncarnation) return false;
+    const expired = this.#expiredLeases.get(leaseOwnerKey(predecessor.ownerHostId, incarnation));
+    return !!expired && expired.id === predecessor.ownerHostId && expired.rootId === predecessor.rootId &&
+      expired.identityId === predecessor.ownerIdentityId && expired.incarnation === incarnation &&
+      expired.expiresAt <= Date.now();
   }
 
   async #update(key: string, record: FabricParticipantRecord, revision: number): Promise<number> {

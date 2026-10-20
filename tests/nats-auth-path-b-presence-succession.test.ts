@@ -19,6 +19,8 @@ import { runTransportAdmin } from "../src/transport/nats/admin.js";
 import { KvParticipantDirectory } from "../src/topology/participant-view.js";
 import { readHostLease } from "../src/topology/host-leases.js";
 import { readParticipantFile } from "../src/topology/participant-files.js";
+import { isOwnResidentActor } from "../src/residency/actor-ownership.js";
+import { residentHostId } from "../src/residency/protocol.js";
 import type { FabricKvHostLease, FabricParticipantRecord } from "../src/topology/types.js";
 import type { FabricTransport, TransportKv, TransportKvEntry } from "../src/transport/types.js";
 import { createPathBHarness, PATH_B_MACHINES, resolveNatsBinary, type PathBHarness } from "./helpers/nats-cluster.js";
@@ -308,6 +310,48 @@ describe.skipIf(!binary || process.platform !== "linux")("#14115 real authentica
       await inspector?.close(); vi.unstubAllEnvs();
     }
   }, 60_000);
+
+  it("moves a live same-lineage durable actor row to the resident owner by broker CAS", async () => {
+    const f = await successionFixture("resident-actor");
+    const actorId = createHash("sha256").update(f.id).digest("hex").slice(0, 32);
+    const resident = residentHostId(f.id), residentIncarnation = `resident-${f.id.slice(-12)}`;
+    const actor: FabricParticipantRecord = { ...f.predecessor, id: actorId, kind: "actor", rootId: f.id, residency: "durable",
+      ownerHostId: f.id, ownerIdentityId: f.id, ownerIncarnation: f.initialLease.incarnation, parentId: f.id };
+    const actorKey = key("machine-a", "p", actorId);
+    const oldRevision = await f.presence.put(actorKey, `${f.id}#${actor.ownerIncarnation}`, actor, 0);
+    const residentOwner = `${resident}#${residentIncarnation}`;
+    const residentLease: FabricKvHostLease = { id: resident, identityId: resident, rootId: f.id, incarnation: residentIncarnation,
+      pid: process.pid, pidStartTime: "12345", bootId: "resident-actor-fixture", updatedAt: Date.now(), expiresAt: Date.now() + 15_000 };
+    await f.leases.put(key("machine-a", "h", resident), residentOwner, residentLease, 0);
+    const residentTransport: FabricTransport = { kind: f.transport.kind,
+      self: { machine: f.transport.self.machine, hostId: resident },
+      kv: f.transport.kv.bind(f.transport), send: f.transport.send.bind(f.transport), inbox: f.transport.inbox.bind(f.transport),
+      drainState: f.transport.drainState.bind(f.transport), close: f.transport.close.bind(f.transport) };
+    const residentView = new KvParticipantDirectory({ transport: residentTransport,
+      lease: { live: () => true, signal: new AbortController().signal }, identityId: resident, rootId: f.id,
+      ownerIncarnation: residentIncarnation, operationTimeoutMs: 30_000 });
+    residentView.start();
+    try {
+      await directoryReady(residentView, actorId);
+      const successor = { ...actor, ownerHostId: resident, ownerIdentityId: resident, ownerIncarnation: residentIncarnation,
+        name: "dev-supervisor", updatedAt: Date.now() };
+      const publication = await residentView.publish(successor);
+      expect(publication.revision).toBeGreaterThan(oldRevision);
+      expect(await f.presence.get<FabricParticipantRecord>(actorKey)).toMatchObject({
+        key: actorKey, owner: residentOwner, revision: publication.revision, value: successor,
+      });
+      await routeEventually(f.view, actorId, route => route.live && route.ownerHostId === resident);
+      // Main's existing actor source is listOwned(), whose owner check sees the
+      // resident host after this directory watch update; the resident-specific view agrees.
+      expect(isOwnResidentActor(f.view, actorId, f.id)).toBe(true);
+      expect(deletes.filter(item => item.key === actorKey)).toEqual([]);
+    } finally {
+      await residentView.close();
+      f.leaseAbort.abort();
+      await Promise.allSettled([f.view.close(), f.observer.close()]);
+      await f.transport.close();
+    }
+  }, 25_000);
 
   it("real broker CAS admits exactly one concurrent own-root resumer and leaves the winner live", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "presence-broker-cas-"));

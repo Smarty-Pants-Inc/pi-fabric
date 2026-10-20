@@ -74,6 +74,11 @@ describe("Main session creation alongside its resident host (#2483)", () => {
     const state = await fixture(undefined, scope);
     try {
       expect(state.actors.owns(state.durable.id)).toBe(false);
+      // Main's participant source is listOwned(); after the resident row wins,
+      // Main must not publish that durable actor back under its own host lease.
+      await state.participants.refresh();
+      expect(state.actors.listOwned().some(actor => actor.id === state.durable.id)).toBe(false);
+      expect(state.participants.get(state.durable.id)?.ownerHostId).toBe(state.host.hostId);
       const original = state.registry().actors.find(actor => actor.id === state.durable.id);
       const session = await state.actors.create({ name: "session", instructions: "Reply", residency: "session", scope, model: "fixture/visible", delivery: "steer", triggerTurn: false });
       expect(state.actors.owns(session.id)).toBe(true);

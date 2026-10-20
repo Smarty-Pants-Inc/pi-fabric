@@ -216,6 +216,8 @@ function pathBRuntime(roleMachine: string, machines: readonly string[] = []): Pa
     `$JS.ACK.${inbox}.>`,
     `$KV.fabric_presence.${roleMachine}.>`,
     `$KV.fabric_leases.${roleMachine}.>`,
+    "$JS.FC.KV_fabric_presence.>",
+    "$JS.FC.KV_fabric_leases.>",
     "$JS.API.STREAM.INFO.KV_fabric_presence",
     "$JS.API.STREAM.INFO.KV_fabric_leases",
     "$JS.API.STREAM.MSG.GET.KV_fabric_presence",
@@ -311,4 +313,56 @@ export function pathBRoleTemplate(role: PathBRole, machine = PATH_B_MACHINE_TAG,
   if (role === "agent") return pathBRuntime(pathBMachine(machine), machines);
   if (role === "operator") return pathBOperator(pathBMachine(machine), machines);
   throw new Error("invalid Path B role");
+}
+
+/**
+ * Frozen d231bd15 runtime scope for rollout verification. Do not derive this by removing the current flow-control
+ * grants: later runtime lanes may add session/event subjects to the current template, and the installed account's
+ * old scope must remain accepted only when it matches this exact pre-change set.
+ */
+const legacyPathBRuntime = (roleMachine: string, machines: readonly string[] = []): PathBRoleTemplate => {
+  if (PATH_B_OPERATOR_MACHINE_PATTERN.test(roleMachine)) fail("machine");
+  const inbox = `FABRIC_IN_${roleMachine}`;
+  const privateInboxes = roleMachine === PATH_B_MACHINE_TAG ? machines.map((machine) => `FABRIC_IN_${pathBMachine(machine)}`) : [inbox];
+  const allow = [
+    `fabric.in.*.*.*.*.${roleMachine}`,
+    `$JS.API.STREAM.INFO.${inbox}`,
+    ...["CREATE", "INFO", "MSG.NEXT", "DELETE"].map((verb) => `$JS.API.CONSUMER.${verb}.${inbox}.>`),
+    `$JS.ACK.${inbox}.>`,
+    `$KV.fabric_presence.${roleMachine}.>`,
+    `$KV.fabric_leases.${roleMachine}.>`,
+    "$JS.API.STREAM.INFO.KV_fabric_presence",
+    "$JS.API.STREAM.INFO.KV_fabric_leases",
+    "$JS.API.STREAM.MSG.GET.KV_fabric_presence",
+    "$JS.API.STREAM.MSG.GET.KV_fabric_leases",
+    ...["CREATE", "INFO", "DELETE"].flatMap((verb) => [
+      `$JS.API.CONSUMER.${verb}.KV_fabric_presence.>`,
+      `$JS.API.CONSUMER.${verb}.KV_fabric_leases.>`,
+    ]),
+    JS_INFO,
+    USER_INFO,
+  ];
+  const deny = [
+    "$JS.API.STREAM.CREATE.>",
+    "$JS.API.STREAM.UPDATE.>",
+    "$JS.API.STREAM.DELETE.>",
+    "$JS.API.STREAM.PURGE.>",
+    ...privateInboxes.map((stream) => `$JS.API.STREAM.MSG.GET.${stream}`),
+    "$JS.API.STREAM.MSG.DELETE.>",
+    "$JS.API.DIRECT.GET.>",
+    "$JS.API.CONSUMER.*.FABRIC_ADV.>",
+    "$JS.API.CONSUMER.MSG.NEXT.FABRIC_ADV.>",
+    ...PATH_B_RESERVED_MUTATIONS,
+  ];
+  return { pub: { allow: pathBUnique(allow), deny }, sub: { allow: [OWN_INBOX] } };
+};
+
+/** Frozen d231bd15 agent scope, including its old role grants and no later runtime additions. */
+export function legacyRoleTemplateWithPathB(role: "agent", input: RoleStreams, machines: readonly string[] = []): RoleTemplate {
+  const base = roleTemplate(role, input);
+  const path = legacyPathBRuntime(PATH_B_MACHINE_TAG, machines);
+  return {
+    pub: { allow: pathBUnique([...base.pub.allow, ...path.pub.allow]), deny: pathBUnique([...base.pub.deny, ...path.pub.deny]) },
+    sub: { allow: path.sub.allow },
+  };
 }

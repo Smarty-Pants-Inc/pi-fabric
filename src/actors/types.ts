@@ -255,6 +255,12 @@ export function normalizeDeadLetterReplayMaxAgeMs(value: unknown): number | unde
   return value;
 }
 
+export const parseEventsStartAt = (value: unknown): number => {
+  const at = typeof value === "number" ? value : typeof value === "string" ? Date.parse(value) : Number.NaN;
+  if (!Number.isSafeInteger(at) || at < 0) throw new Error("eventsStartAt must be a nonnegative epoch millisecond or ISO timestamp");
+  return at;
+};
+
 /** Window batching retains each observation; 0 keeps single-event activation. */
 export interface FabricActorBatching {
   batchWindowMs?: number;

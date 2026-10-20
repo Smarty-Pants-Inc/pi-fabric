@@ -45,7 +45,7 @@ import { fileURLToPath } from "node:url";
 import { processIsAlive, scriptSpawnArgs } from "../agents/transports/process-utils.js";
 import { processStartTime } from "../residency/process-identity.js";
 import { ActorLogStore, ACTOR_MESSAGE_ENVELOPE_BYTES, ACTOR_MESSAGE_HISTORY_LIMIT as MESSAGE_HISTORY_LIMIT } from "./log-store.js";
-import { FABRIC_ACTOR_HOST_EVENTS, FabricActorBatchPolicyError, MAX_ACTOR_BATCH_EVENTS, DEFAULT_DEAD_LETTER_REPLAY_MAX_AGE_MS, normalizeDeadLetterReplayMaxAgeMs, normalizeActorActivation, normalizeActorBatching, validateActorCoalesceKey, validateActorDedupeKey, validateActorInferenceContext, type FabricActorInferenceContext } from "./types.js";
+import { FABRIC_ACTOR_HOST_EVENTS, FabricActorBatchPolicyError, MAX_ACTOR_BATCH_EVENTS, DEFAULT_DEAD_LETTER_REPLAY_MAX_AGE_MS, normalizeDeadLetterReplayMaxAgeMs, normalizeActorActivation, normalizeActorBatching, parseEventsStartAt, validateActorCoalesceKey, validateActorDedupeKey, validateActorInferenceContext, type FabricActorInferenceContext } from "./types.js";
 import { ACTOR_ACTIVATION_HEADER } from "../agents/enodev-recovery.js";
 import { activationFilterSkip, normalizeActorActivationFilter, type FabricActorActivationFilter } from "./activation-filter.js";
 import { hydrateWakeText, normalizeWakeTextConfig, renderWakeTextBlock, type ActorWakeText, type FabricWakeTextConfig } from "./wake-text.js";
@@ -325,11 +325,6 @@ const isRetryableRegistrySave = (error: unknown): boolean => error instanceof Ac
 const errorText = (error: unknown): string => error instanceof Error ? error.message : String(error);
 
 const TOPIC_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,127}$/;
-const parseEventsStartAt = (value: unknown): number => {
-  const at = typeof value === "number" ? value : typeof value === "string" ? Date.parse(value) : Number.NaN;
-  if (!Number.isSafeInteger(at) || at < 0) throw new Error("eventsStartAt must be a nonnegative epoch millisecond or ISO timestamp");
-  return at;
-};
 const HOST_EVENTS: ReadonlySet<FabricActorHostEvent> = new Set(FABRIC_ACTOR_HOST_EVENTS);
 const MAIN_REVISION_EVENTS: ReadonlySet<FabricActorHostEvent> = new Set([
   "input",

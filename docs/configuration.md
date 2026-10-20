@@ -1128,8 +1128,10 @@ topics use `FABRIC_EV_<ORG>`. Each actor has a pull durable per stream it uses:
 `ev_<hash(actorId)>` and, when it subscribes to GitHub topics, `gh_<hash(actorId)>`.
 A Fabric durable also includes its exact wake subject
 `fabric.ev.<org>.wake.<actorId>`, so factory stall-wakes arrive as ordinary
-NATS events. `eventsStartAt` is an ISO-8601 timestamp applied only when each
-durable is first created; it does not reset an existing cursor.
+NATS events. `agents.create({ eventsStartAt })` accepts epoch milliseconds or an
+ISO-8601 timestamp and sets `DeliverPolicy.StartTime` only when each durable is
+first created. If omitted, `DeliverPolicy.All` replays all retained events;
+reopening or changing topics does not reset the cursor.
 
 | Purpose | Subject |
 |---|---|

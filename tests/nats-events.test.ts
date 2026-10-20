@@ -8,7 +8,7 @@ import type { MeshEvent } from "../src/mesh/event-log.js";
 import { ensureNatsEventsStream, natsEventsStreamName, natsGithubStreamName } from "../src/transport/nats/provision.js";
 import { hashToken } from "../src/transport/nats/subjects.js";
 import { createPathBHarness, PATH_B_PERMISSION_POLICY, resolveNatsBinary, type PathBHarness } from "./helpers/nats-cluster.js";
-import { DiscardPolicy, RetentionPolicy, StorageType, type StreamConfig } from "@nats-io/jetstream";
+import { DeliverPolicy, DiscardPolicy, RetentionPolicy, StorageType, type StreamConfig } from "@nats-io/jetstream";
 
 const binary = resolveNatsBinary() ?? "";
 if (!binary && process.env.NATS_AUTH_REQUIRED === "1") throw new Error("NATS_AUTH_REQUIRED=1 but no nats-server executable was found");
@@ -202,13 +202,14 @@ describe.skipIf(!binary)("NATS Mesh events on a real JetStream server", () => {
     const server = await fixture();
     const org = `events-${randomUUID().slice(0, 8)}`;
     const { connection, publisher } = await open(server, org);
+    const actorId = `${org}:start-floor`;
     let consumer: { close(remove?: boolean): Promise<void> } | undefined;
     try {
       await publisher.publish(event("before-start", "mail.paul"));
       const startAt = new Date(Date.now() + 100).toISOString();
       const seen: string[] = [];
       consumer = await startNatsActorEventsConsumer(connection, {
-        org, actorId: `${org}:start-floor`, topics: ["mail.paul"], eventsStartAt: startAt,
+        org, actorId, topics: ["mail.paul"], eventsStartAt: startAt,
         onMessage: async (received, _messageId, ack) => {
           seen.push(received.id);
           if (received.id === "after-start" && seen.filter(id => id === "after-start").length === 1) {
@@ -218,6 +219,9 @@ describe.skipIf(!binary)("NATS Mesh events on a real JetStream server", () => {
           return "accepted";
         },
       });
+      const firstDurable = await connection.manager.consumers.info(natsEventsStreamName(org), `ev_${hashToken(actorId)}`);
+      expect(firstDurable.config.deliver_policy).toBe(DeliverPolicy.StartTime);
+      expect(firstDurable.config.opt_start_time).toBe(startAt);
       await new Promise(resolve => setTimeout(resolve, 150));
       await publisher.publish(event("after-start", "mail.paul"));
       await waitFor(() => seen.filter(id => id === "after-start").length >= 2);
@@ -225,9 +229,12 @@ describe.skipIf(!binary)("NATS Mesh events on a real JetStream server", () => {
 
       await consumer.close(false);
       consumer = await startNatsActorEventsConsumer(connection, {
-        org, actorId: `${org}:start-floor`, topics: ["mail.paul"], eventsStartAt: new Date(0).toISOString(),
+        org, actorId, topics: ["mail.paul"], eventsStartAt: new Date(0).toISOString(),
         onMessage: async (received, _messageId, ack) => { seen.push(received.id); await ack(); return "accepted"; },
       });
+      const reopenedDurable = await connection.manager.consumers.info(natsEventsStreamName(org), `ev_${hashToken(actorId)}`);
+      expect(reopenedDurable.config.deliver_policy).toBe(DeliverPolicy.StartTime);
+      expect(reopenedDurable.config.opt_start_time).toBe(startAt);
       await new Promise(resolve => setTimeout(resolve, 100));
       expect(seen).toEqual(["after-start", "after-start"]);
     } finally {

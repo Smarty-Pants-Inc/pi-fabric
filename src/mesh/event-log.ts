@@ -143,6 +143,22 @@ const atomicWrite = (filePath: string, value: unknown, maxBytes = Number.POSITIV
   writeFileAtomic(filePath, serialized);
 };
 
+/** A transport-owned outbox, staged durably before append and settled before compaction.
+ * Ready rows own their event bytes independently of the retained live log. */
+interface MeshEventOutboxRow {
+  format: 1;
+  scope: string;
+  event: MeshEvent;
+  liveOffset?: number;
+  generation?: number;
+  archiveDir?: string;
+}
+
+const outboxDirectory = (root: string, scope: string): string =>
+  path.join(root, "event-outbox", createHash("sha256").update(scope).digest("hex"));
+const outboxName = (event: MeshEvent): string => `${String(event.sequence).padStart(24, "0")}.json`;
+const OUTBOX_NAME = /^\d{24}\.json$/;
+
 interface MeshDedupeIntent {
   dedupeKey: string;
   reservedSequence: number;
@@ -237,6 +253,140 @@ export class EventLog {
   } | undefined;
   #oldestLive: { identity: string; sequence: number | undefined } | undefined;
   #preparedLiveCatchUp: PreparedLiveCatchUp | undefined;
+  #outbox: { scope: string; committed: () => void; validate?: (event: MeshEvent) => void } | undefined;
+
+  /** Host-only. Configure before opening any producers; detaching the transport never discards rows. */
+  enableOutbox(scope: string, committed: () => void, validate?: (event: MeshEvent) => void): void {
+    if (!scope || this.#outbox) throw new Error("Mesh event outbox is already configured or has no scope");
+    this.#outbox = { scope, committed, ...(validate ? { validate } : {}) };
+  }
+
+  eventOutboxDirectory(scope: string): string { return outboxDirectory(this.root, scope); }
+
+  #readOutbox(file: string, scope: string): MeshEventOutboxRow | undefined {
+    let row: MeshEventOutboxRow;
+    try { row = JSON.parse(fs.readFileSync(file, "utf8")) as MeshEventOutboxRow; }
+    catch (error) { if (errorCode(error) === "ENOENT") return undefined; throw error; }
+    if (row?.format !== 1 || row.scope !== scope || !row.event || typeof row.event.id !== "string" ||
+      !Number.isSafeInteger(row.event.sequence) || row.event.sequence < 1 ||
+      (row.liveOffset !== undefined && (!Number.isSafeInteger(row.liveOffset) || row.liveOffset < 0 ||
+        !Number.isSafeInteger(row.generation) || row.generation! < 0)) ||
+      (row.archiveDir !== undefined && (typeof row.archiveDir !== "string" || !path.isAbsolute(row.archiveDir))) ||
+      file !== path.join(outboxDirectory(this.root, scope), outboxName(row.event))) {
+      throw new Error("Invalid mesh event outbox row; retained for reconciliation");
+    }
+    return row;
+  }
+
+  #settleOutbox(file: string, row: MeshEventOutboxRow, archive?: MeshArchive): MeshEventOutboxRow | undefined {
+    if (row.liveOffset === undefined) return row;
+    const event = row.event;
+    let live = false;
+    const sameGeneration = row.generation === this.#readGeneration();
+    let fd: number | undefined;
+    try {
+      if (!sameGeneration) throw new MeshDedupeRecoveryError("Mesh event outbox live anchor was rewritten; reconciliation required");
+      fd = fs.openSync(this.#eventsPath, "r");
+      // Another store (or a reload) may have a smaller maxEventBytes. The staged event, not
+      // today's configured bound, determines its exact read window; never discard an older large event.
+      const bytes = Buffer.allocUnsafe(Buffer.byteLength(JSON.stringify(event), "utf8") + 1);
+      const count = fs.readSync(fd, bytes, 0, bytes.length, row.liveOffset);
+      const end = bytes.subarray(0, count).indexOf(0x0a);
+      if (end >= 0) {
+        const found = JSON.parse(bytes.subarray(0, end).toString("utf8")) as MeshEvent;
+        live = found.id === event.id && found.sequence === event.sequence;
+        if (live && JSON.stringify(found) !== JSON.stringify(event)) {
+          throw new MeshDedupeRecoveryError("Mesh event outbox envelope conflicts with its local commit");
+        }
+      }
+    } catch (error) { if (errorCode(error) !== "ENOENT" && !(error instanceof SyntaxError)) throw error; }
+    finally { if (fd !== undefined) fs.closeSync(fd); }
+    if (live) this.#confirmEventFile(this.#eventsPath);
+    else if (row.archiveDir !== undefined) {
+      if (archive?.dir !== row.archiveDir) throw new MeshDedupeRecoveryError("Mesh event outbox archive is unavailable");
+      const entry = archive.lookupEntry(event.sequence);
+      if (entry?.event.id === event.id) {
+        // A pending archive append is not proof of local publication. Ordinary reboot recovery
+        // runs before this check; an overtaken/ambiguous append stays fenced, never sent speculatively.
+        if (!entry.committed) throw new MeshDedupeRecoveryError(`Mesh event outbox ${event.id} requires archive reconciliation`);
+        live = true;
+      }
+    }
+    if (!live) {
+      // Under .lock: the exact staged reservation has no complete live or committed archive event.
+      // It never committed (or was not durable across a power loss); do not send a phantom event.
+      fs.rmSync(file, { force: true });
+      syncPathNamespace(path.dirname(file));
+      return undefined;
+    }
+    const ready: MeshEventOutboxRow = { format: 1, scope: row.scope, event };
+    writeFileAtomic(file, JSON.stringify(ready), { durable: true });
+    return ready;
+  }
+
+  /** Before a live-log rewrite, settle EVERY scope, including rows left by another/closed store. */
+  #settleOutboxes(archive?: MeshArchive): void {
+    const directory = path.join(this.root, "event-outbox");
+    let scopes: string[];
+    try { scopes = fs.readdirSync(directory).filter(name => /^[a-f0-9]{64}$/.test(name)); }
+    catch (error) { if (errorCode(error) === "ENOENT") return; throw error; }
+    for (const name of scopes) {
+      for (const entry of fs.readdirSync(path.join(directory, name)).filter(file => OUTBOX_NAME.test(file)).sort()) {
+        const file = path.join(directory, name, entry);
+        let scope: string;
+        try { scope = (JSON.parse(fs.readFileSync(file, "utf8")) as MeshEventOutboxRow).scope; }
+        catch (error) { if (errorCode(error) === "ENOENT") continue; throw error; }
+        const row = this.#readOutbox(file, scope);
+        if (row) this.#settleOutbox(file, row, archive);
+      }
+    }
+  }
+
+  /** One committed row in local sequence order. Network publication must run AFTER this releases .lock. */
+  async nextOutboxEvent(scope: string): Promise<MeshEvent | undefined> {
+    const directory = outboxDirectory(this.root, scope);
+    const deadline = Date.now() + this.#lock.lockTimeoutMs;
+    for (;;) {
+      let names: string[];
+      try { names = fs.readdirSync(directory).filter(name => OUTBOX_NAME.test(name)).sort(); }
+      catch (error) { if (errorCode(error) === "ENOENT") return undefined; throw error; }
+      if (!names.length) return undefined;
+      const file = path.join(directory, names[0]!);
+      const row = this.#readOutbox(file, scope);
+      if (!row) continue;
+      if (row.liveOffset === undefined) return jsonClone(row.event);
+      // Prepare archive recovery off-lock, exactly as a normal append does. A reboot can promote
+      // synced archive bytes whose live append was lost; never mistake them for an absent reservation.
+      const archive = MeshArchive.fromRoot(this.root);
+      const prepared = archive?.prepareRecovery(this.#readLastEventSequence());
+      const catchUp = archive && this.#prepareLiveCatchUp(archive);
+      try {
+        const ready = await this.#lock.withLock(() => {
+          if (archive && (archive.head()?.sequence ?? 0) < this.#readLastEventSequence() &&
+            (!catchUp || catchUp.identity !== this.#liveLogIdentity())) throw new MeshArchiveRecoveryChanged();
+          this.#repairEventLog();
+          if (archive) this.#recoverArchive(archive, false, prepared, catchUp);
+          const current = this.#readOutbox(file, scope);
+          return current && this.#settleOutbox(file, current, archive);
+        }, undefined, "publish");
+        if (ready) return jsonClone(ready.event);
+      } catch (error) {
+        if (!(error instanceof MeshArchiveRecoveryChanged) || Date.now() >= deadline) throw error;
+        await delay(0);
+      }
+    }
+  }
+
+  /** The scope's delivery-custody holder retires only an acknowledged immutable ready row. */
+  ackOutboxEvent(scope: string, event: MeshEvent): void {
+    const file = path.join(outboxDirectory(this.root, scope), outboxName(event));
+    const row = this.#readOutbox(file, scope);
+    if (!row) return;
+    if (row.liveOffset !== undefined || row.event.id !== event.id) throw new Error("Mesh event outbox acknowledgement mismatch");
+    // A confirmed transport publication, not an age/liveness judgment; .delivery custody owns retirement.
+    fs.rmSync(file, { force: true });
+    syncPathNamespace(path.dirname(file));
+  }
 
   constructor(context: MeshStoreContext, options: EventLogOptions,
     readonly indexDeliveryBeforeAppend?: (event: MeshEvent) => void) {
@@ -744,6 +894,7 @@ export class EventLog {
         if (bytes > maxEventBytes) {
           throw new Error(`Mesh event exceeds ${maxEventBytes} bytes`);
         }
+        this.#outbox?.validate?.(event);
         // One slot per key, including unresolved intents. Admission must fail closed BEFORE
         // reserving a sequence or appending (failed compaction cannot grow pending files).
         if (intentPath && this.#pruneDedupeReceipts(1) >= this.#maxDedupeReceipts) {
@@ -774,6 +925,13 @@ export class EventLog {
             ...(archive ? { archiveDir: archive.dir } : {}),
           } satisfies MeshDedupeIntent), { durable: true, ...(after?.namespace ? { syncDirectory: receiptDirectoryBarrier(after.namespace) } : {}) });
         }
+        const outbox = this.#outbox;
+        if (outbox) {
+          writeFileAtomic(path.join(outboxDirectory(this.root, outbox.scope), outboxName(event)), JSON.stringify({
+            format: 1, scope: outbox.scope, event, liveOffset, generation: this.#readGeneration(),
+            ...(archive ? { archiveDir: archive.dir } : {}),
+          } satisfies MeshEventOutboxRow), { durable: true });
+        }
         const pending = archive?.begin({ event, line }, publishNamespace?.syncIndexDirectory);
         // Test-only process-death fence: unlike an append exception, no rollback can run.
         if (receiptPath && pending && process.env.PI_FABRIC_TEST_CRASH_AFTER_ARCHIVE_BEGIN === "1") process.kill(process.pid, "SIGKILL");
@@ -784,6 +942,10 @@ export class EventLog {
           if (pending) archive!.rollback(pending);
           throw error;
         }
+        // Notify at the actual append boundary, not publish()'s return: a later archive/receipt
+        // failure, a partial batch or a throwing transact callback must not strand committed rows.
+        // The host callback only schedules off-lock work and must never change commit's outcome.
+        try { outbox?.committed(); } catch { /* durable row is retried by owner maintenance */ }
         // This distinct fence leaves the live event complete but the sidecar unconfirmed.
         if (receiptPath && pending && process.env.PI_FABRIC_TEST_CRASH_BEFORE_ARCHIVE_COMMIT === "1") process.kill(process.pid, "SIGKILL");
         if (pending) archive!.commit(pending, true, publishNamespace?.syncIndexDirectory);
@@ -1476,7 +1638,9 @@ export class EventLog {
       descriptor = fs.openSync(this.#eventsPath, "r");
       const size = fs.fstatSync(descriptor).size;
       if (size <= this.#maxEventLogBytes) return;
-      this.#settleDedupeIntents(MeshArchive.fromRoot(this.root));
+      const archive = MeshArchive.fromRoot(this.root);
+      this.#settleDedupeIntents(archive);
+      this.#settleOutboxes(archive);
       this.#pruneDedupeReceipts();
       const readBytes = Math.min(
         size,

@@ -2,14 +2,24 @@
 // Ordinary `bun run test` lifecycle proof. No mocks or caller cleanup before assertions.
 import { spawn } from "node:child_process";
 import fs from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const caller = fs.realpathSync(process.env.TMPDIR ?? "");
-const stat = fs.statSync(caller);
-if (!caller.startsWith("/srv/scratch/paul/") || stat.uid !== process.getuid() || (stat.mode & 0o077) !== 0) {
-  throw new Error("Set TMPDIR to a private caller-owned directory under /srv/scratch/paul/");
+const usage = "Usage: node scripts/probe-test-temp-cleanup.mjs PRIVATE_TEMP_ROOT\nPRIVATE_TEMP_ROOT must be an existing absolute caller-owned directory with mode 0700.";
+const input = process.argv[2];
+if (process.argv.length !== 3 || typeof input !== "string" || !input.trim() || !isAbsolute(input) || /[\0\r\n]/.test(input)) {
+  throw new Error(usage);
+}
+let caller;
+try {
+  caller = fs.realpathSync(input);
+  const stat = fs.statSync(caller);
+  if (!isAbsolute(caller) || !stat.isDirectory() || stat.uid !== process.getuid() || (stat.mode & 0o7777) !== 0o700) {
+    throw new Error("PRIVATE_TEMP_ROOT must be a caller-owned directory with mode 0700");
+  }
+} catch (error) {
+  throw new Error(`${usage}\n${error.message}`);
 }
 process.umask(0o022);
 const evidence = fs.mkdtempSync(join(caller, "temp-proof-"));

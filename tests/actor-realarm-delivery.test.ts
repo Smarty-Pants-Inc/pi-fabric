@@ -33,7 +33,7 @@ const waitFor = async (predicate: () => boolean, timeoutMs = 15_000): Promise<vo
 };
 const settle = () => new Promise(resolve => setTimeout(resolve, 250)); // several retention sweeps
 const SOURCE_TOKEN = "r2-12512-source-token-a71c9";
-const SOURCE_PATH = "/home/paul/.config/r2-12512-source-path.json";
+const SOURCE_PATH = "/home/example/.config/r2-12512-source-path.json";
 const SOURCE_ERROR = `Error: open ${SOURCE_PATH} failed: Authorization: Bearer ${SOURCE_TOKEN}`;
 const LEGACY_LAST_ERROR = "r2-12512-legacy-last-error-token-b82da";
 const LEGACY_REASON = "r2-12512-legacy-reason-token-c93eb /private/r2-12512-reason.json";

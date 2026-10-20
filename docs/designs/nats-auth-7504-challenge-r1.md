@@ -102,7 +102,7 @@ consumer-create-unnamed=transport-or-permission-error:RequestError
 
 ## Probe cleanup handoff
 
-The local server probe was started as PID `3626203`. I accidentally omitted a loopback-only `host` setting, so NATS logged a bind on `0.0.0.0:43934` (monitor `0.0.0.0:42050`). I only connected to `127.0.0.1`; I did not contact another host. The fleet shell guard refused my exact `kill 3626203` attempt because this process has no Herdr-pane ancestry, and also refused the server's `--signal` control form. (Resolved: fabric-store stopped it at 05:04Z; tracked on smarty-dev#8266.) Its config and data are under `/srv/scratch/paul/smarty-pi-tmp/pi-d8dbb921aab6/p.L71mmv/` and use only fake probe credentials.
+The local server probe was started as PID `3626203`. I accidentally omitted a loopback-only `host` setting, so NATS logged a bind on `0.0.0.0:43934` (monitor `0.0.0.0:42050`). I only connected to `127.0.0.1`; I did not contact another host. The fleet shell guard refused my exact `kill 3626203` attempt because this process has no Herdr-pane ancestry, and also refused the server's `--signal` control form. (Resolved: fabric-store stopped it at 05:04Z; tracked on smarty-dev#8266.) Its config and data are under a host-private path (redacted) and use only fake probe credentials.
 
 ## Constraints added after round 1 (10-13, #958)
 

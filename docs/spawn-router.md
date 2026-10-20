@@ -70,7 +70,7 @@ to stdout, then exit 0 within the deadline. Example input:
   "taskLength": 1842,
   "parentId": "session:<id>",
   "requestedComplexity": "normal",
-  "host": "ryzen5.smartypants.ai",
+  "host": "work-host.example",
   "defaults": { "model": "provider/model", "thinking": "medium" }
 }
 ```
@@ -133,7 +133,7 @@ attributed start outcome. Only the start line's
 preparation and clamping for a task, or the admitted binding for an idle actor:
 
 ```json
-{"ts":"2026-10-15T21:00:00.100Z","kind":"start","decisionId":"1465ef6c-0b75-4ddc-a685-44eb6d9c9a02","agentId":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","sessionId":"8f3c78d2-ec8b-4567-b416-c13689740710","launch":{"runId":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","pid":12345,"processStartTime":"56801737"},"host":"ryzen1.smartypants.ai","model":"provider/model","thinking":"medium","verified":true,"evidenceRef":"residency/example/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/status.json"}
+{"ts":"2026-10-15T21:00:00.100Z","kind":"start","decisionId":"1465ef6c-0b75-4ddc-a685-44eb6d9c9a02","agentId":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","sessionId":"8f3c78d2-ec8b-4567-b416-c13689740710","launch":{"runId":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","pid":12345,"processStartTime":"56801737"},"host":"main-host.example","model":"provider/model","thinking":"medium","verified":true,"evidenceRef":"residency/example/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/status.json"}
 ```
 
 `verified: true` requires the admitting manager's own observation of its

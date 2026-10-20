@@ -4,7 +4,7 @@
   "schema": 1,
   "store": "file",
   "host": {
-    "name": "ryzen5.smartypants.ai",
+    "name": "redacted-host",
     "cpus": 32,
     "load1": 17.37,
     "node": "v24.19.0",

@@ -62,12 +62,12 @@ Positive host-side proof requires a Pi build advertising `hostCapabilities.turnP
 
 ## Trust boundary
 
-Pi accepts a Fabric claim only from an extension listed in the host's **global** `settings.json` under `turnProvenance.fabricExtensions`. The profile uses `PI_CODING_AGENT_DIR`; trust is never configured through project settings. For the fleet's release layout, the global entry is:
+Pi accepts a Fabric claim only from an extension listed in the host's **global** `settings.json` under `turnProvenance.fabricExtensions`. The profile uses `PI_CODING_AGENT_DIR`; trust is never configured through project settings. For example, a release layout under `/home/example` could use:
 
 ```json
 {
   "turnProvenance": {
-    "fabricExtensions": ["/home/paul/.local/share/smarty-dev/fabric/releases/"]
+    "fabricExtensions": ["/home/example/.local/share/smarty-dev/fabric/releases/"]
   }
 }
 ```

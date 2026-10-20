@@ -811,7 +811,7 @@ describe("SqliteStateStore", () => {
       "43 40 0:43 / /mnt/nfs/local rw,relatime shared:5 - ext4 /dev/sdb1 rw",
     ].join("\n");
     const linux = (root: string) => filesystemRefusal(root, { platform: "linux", mountinfo });
-    expect(linux("/home/paul/mesh")).toBeUndefined();
+    expect(linux("/home/example/mesh")).toBeUndefined();
     expect(linux("/mnt/nfs/mesh")).toMatch(/nfs4/);
     expect(linux("/mnt/nfs/local/mesh")).toBeUndefined();
     expect(linux("/mnt/ssh dir/mesh")).toMatch(/fuse\.sshfs/);
@@ -822,7 +822,7 @@ describe("SqliteStateStore", () => {
     expect(win("//server/share/mesh")).toMatch(/network path/);
     expect(win("\\\\?\\UNC\\server\\share\\mesh")).toMatch(/network path/);
     expect(win("\\\\?\\C:\\mesh")).toBeUndefined();
-    expect(win("C:\\Users\\paul\\mesh")).toBeUndefined();
+    expect(win("C:\\Users\\example\\mesh")).toBeUndefined();
     expect(filesystemRefusal(os.tmpdir())).toBeUndefined();
   });
 });

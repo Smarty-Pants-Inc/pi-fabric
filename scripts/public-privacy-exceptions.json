@@ -1,0 +1,895 @@
+{
+  "version": 1,
+  "followup": "smarty-dev#14658: shrink exceptions to zero",
+  "literalPins": "SHA-256 of exact matched UTF-8 token; identifies original literals without duplicating private values.",
+  "exceptions": [
+    {
+      "file": "bench/mesh-lock-baseline.json",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "historical-doc",
+      "reason": "Historical documentation, benchmark, media, or implementation commentary; baseline only, shrink under followup."
+    },
+    {
+      "file": "bench/registry-dashboard.md",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "historical-doc",
+      "reason": "Historical documentation, benchmark, media, or implementation commentary; baseline only, shrink under followup."
+    },
+    {
+      "file": "docs/agents.md",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "historical-doc",
+      "reason": "Historical documentation, benchmark, media, or implementation commentary; baseline only, shrink under followup."
+    },
+    {
+      "file": "docs/configuration.md",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "historical-doc",
+      "reason": "Historical documentation, benchmark, media, or implementation commentary; baseline only, shrink under followup."
+    },
+    {
+      "file": "docs/designs/nats-auth-7504.md",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "historical-doc",
+      "reason": "Historical documentation, benchmark, media, or implementation commentary; baseline only, shrink under followup."
+    },
+    {
+      "file": "docs/mesh-bridge.md",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "historical-doc",
+      "reason": "Historical documentation, benchmark, media, or implementation commentary; baseline only, shrink under followup."
+    },
+    {
+      "file": "docs/mesh-lock-bench.md",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "historical-doc",
+      "reason": "Historical documentation, benchmark, media, or implementation commentary; baseline only, shrink under followup."
+    },
+    {
+      "file": "docs/mesh-lock-plan.md",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "historical-doc",
+      "reason": "Historical documentation, benchmark, media, or implementation commentary; baseline only, shrink under followup."
+    },
+    {
+      "file": "docs/mesh-state-reads.md",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "historical-doc",
+      "reason": "Historical documentation, benchmark, media, or implementation commentary; baseline only, shrink under followup."
+    },
+    {
+      "file": "docs/pr-434-windows-triage.md",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "historical-doc",
+      "reason": "Historical documentation, benchmark, media, or implementation commentary; baseline only, shrink under followup."
+    },
+    {
+      "file": "docs/principal-view.md",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "historical-doc",
+      "reason": "Historical documentation, benchmark, media, or implementation commentary; baseline only, shrink under followup."
+    },
+    {
+      "file": "docs/records.md",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "historical-doc",
+      "reason": "Historical documentation, benchmark, media, or implementation commentary; baseline only, shrink under followup."
+    },
+    {
+      "file": "docs/records/paul-steps-dry-run.md",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "historical-doc",
+      "reason": "Historical documentation, benchmark, media, or implementation commentary; baseline only, shrink under followup."
+    },
+    {
+      "file": "docs/spawn-router.md",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "historical-doc",
+      "reason": "Historical documentation, benchmark, media, or implementation commentary; baseline only, shrink under followup."
+    },
+    {
+      "file": "docs/task-result-interruption-plan.md",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "historical-doc",
+      "reason": "Historical documentation, benchmark, media, or implementation commentary; baseline only, shrink under followup."
+    },
+    {
+      "file": "docs/upstream-sync/0.110.1/resolutions.md",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "historical-doc",
+      "reason": "Historical documentation, benchmark, media, or implementation commentary; baseline only, shrink under followup."
+    },
+    {
+      "file": "media/opencollective/fabric-runtime/fa-avatar.png",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "historical-doc",
+      "reason": "Historical documentation, benchmark, media, or implementation commentary; baseline only, shrink under followup."
+    },
+    {
+      "file": "media/opencollective/fabric-runtime/particle-cover.png",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "historical-doc",
+      "reason": "Historical documentation, benchmark, media, or implementation commentary; baseline only, shrink under followup."
+    },
+    {
+      "file": "proof/README.md",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "historical-doc",
+      "reason": "Historical documentation, benchmark, media, or implementation commentary; baseline only, shrink under followup."
+    },
+    {
+      "file": "proof/forge-ssh-bridge.mjs",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "identity-boundary",
+      "reason": "Existing bridge default local-peer identity; exact named-file baseline preserves the peer identity contract."
+    },
+    {
+      "file": "proof/forge-ssh-bridge.sh",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "historical-doc",
+      "reason": "Historical documentation, benchmark, media, or implementation commentary; baseline only, shrink under followup."
+    },
+    {
+      "file": "proof/loopback-ssh-bridge.mjs",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "synthetic-fixture",
+      "reason": "Two isolated fake peers in the loopback bridge proof; synthetic peer labels, not real fleet destinations."
+    },
+    {
+      "file": "proof/loopback-ssh-bridge.sh",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "synthetic-fixture",
+      "reason": "Shell wrapper names two isolated fake peers for the loopback bridge proof; synthetic fixture identities only."
+    },
+    {
+      "file": "scripts/lib/native-placement-proof.mjs",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "identity-boundary",
+      "reason": "Lead-approved exact-file host/launcher identity recognition contract; keep runtime recognition intact."
+    },
+    {
+      "file": "scripts/mesh-load.ts",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "historical-doc",
+      "reason": "Historical documentation, benchmark, media, or implementation commentary; baseline only, shrink under followup."
+    },
+    {
+      "file": "scripts/probe-native-process-placement.mjs",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "identity-boundary",
+      "reason": "Real launcher acceptance receipt protocol; preserve the existing wire token and identity-verification contract."
+    },
+    {
+      "file": "scripts/probe-process-placement.mjs",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "synthetic-fixture",
+      "reason": "Offline adapter proof uses a fake launcher and fake acceptance receipt; synthetic fixture identities only."
+    },
+    {
+      "file": "scripts/probe-provider-backoff-cli.mjs",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "historical-doc",
+      "reason": "Historical documentation, benchmark, media, or implementation commentary; baseline only, shrink under followup."
+    },
+    {
+      "file": "scripts/records-paul-steps.sh",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "historical-doc",
+      "reason": "Historical documentation, benchmark, media, or implementation commentary; baseline only, shrink under followup."
+    },
+    {
+      "file": "src/agents/manager.ts",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "historical-doc",
+      "reason": "Historical documentation, benchmark, media, or implementation commentary; baseline only, shrink under followup."
+    },
+    {
+      "file": "src/agents/transports/herdr-transport.ts",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "historical-doc",
+      "reason": "Historical documentation, benchmark, media, or implementation commentary; baseline only, shrink under followup."
+    },
+    {
+      "file": "src/agents/transports/placement-preflight.ts",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "identity-boundary",
+      "reason": "Lead-approved exact-file host/launcher identity recognition contract; keep runtime recognition intact."
+    },
+    {
+      "file": "src/agents/transports/placement.ts",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "identity-boundary",
+      "reason": "Existing launcher acceptance receipt token is a wire identity-boundary contract; do not rename it as documentation."
+    },
+    {
+      "file": "src/core/pattern-kill.ts",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "historical-doc",
+      "reason": "Historical documentation, benchmark, media, or implementation commentary; baseline only, shrink under followup."
+    },
+    {
+      "file": "src/mesh-bridge.ts",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "historical-doc",
+      "reason": "Historical documentation, benchmark, media, or implementation commentary; baseline only, shrink under followup."
+    },
+    {
+      "file": "src/mesh/bridge.ts",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "historical-doc",
+      "reason": "Historical documentation, benchmark, media, or implementation commentary; baseline only, shrink under followup."
+    },
+    {
+      "file": "src/mesh/event-log.ts",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "historical-doc",
+      "reason": "Historical documentation, benchmark, media, or implementation commentary; baseline only, shrink under followup."
+    },
+    {
+      "file": "src/mesh/nats-auth/mint.ts",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "historical-doc",
+      "reason": "Historical documentation, benchmark, media, or implementation commentary; baseline only, shrink under followup."
+    },
+    {
+      "file": "src/mesh/state-file.ts",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "historical-doc",
+      "reason": "Historical documentation, benchmark, media, or implementation commentary; baseline only, shrink under followup."
+    },
+    {
+      "file": "src/topology/records.ts",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "historical-doc",
+      "reason": "Historical documentation, benchmark, media, or implementation commentary; baseline only, shrink under followup."
+    },
+    {
+      "file": "tests/actor-dead-root-filter.test.ts",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "synthetic-fixture",
+      "reason": "Existing synthetic fixture host identities; baseline only, new files are not exempt."
+    },
+    {
+      "file": "tests/actor-remove-finishing-answer.test.ts",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "synthetic-fixture",
+      "reason": "Existing synthetic fixture host identities; baseline only, new files are not exempt."
+    },
+    {
+      "file": "tests/bridge-destination-binding.test.ts",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "synthetic-fixture",
+      "reason": "Existing synthetic fixture host identities; baseline only, new files are not exempt."
+    },
+    {
+      "file": "tests/config-nats-transport.test.ts",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "synthetic-fixture",
+      "reason": "Existing synthetic fixture host identities; baseline only, new files are not exempt."
+    },
+    {
+      "file": "tests/control-plane-incarnation.test.ts",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "synthetic-fixture",
+      "reason": "Existing synthetic fixture host identities; baseline only, new files are not exempt."
+    },
+    {
+      "file": "tests/control-plane.test.ts",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "synthetic-fixture",
+      "reason": "Existing synthetic fixture host identities; baseline only, new files are not exempt."
+    },
+    {
+      "file": "tests/conversation-native-reader.test.ts",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "synthetic-fixture",
+      "reason": "Existing synthetic fixture host identities; baseline only, new files are not exempt."
+    },
+    {
+      "file": "tests/fixtures/images/sample.jpg",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "synthetic-fixture",
+      "reason": "Existing synthetic fixture host identities; baseline only, new files are not exempt."
+    },
+    {
+      "file": "tests/herdr-transport.test.ts",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "synthetic-fixture",
+      "reason": "Existing synthetic fixture host identities; baseline only, new files are not exempt."
+    },
+    {
+      "file": "tests/mesh-archive.test.ts",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "synthetic-fixture",
+      "reason": "Existing synthetic fixture host identities; baseline only, new files are not exempt."
+    },
+    {
+      "file": "tests/mesh-bridge-commit-outbox.test.ts",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "synthetic-fixture",
+      "reason": "Existing synthetic fixture host identities; baseline only, new files are not exempt."
+    },
+    {
+      "file": "tests/mesh-bridge-direct-tokenless.test.ts",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "synthetic-fixture",
+      "reason": "Existing synthetic fixture host identities; baseline only, new files are not exempt."
+    },
+    {
+      "file": "tests/mesh-bridge-durable-records.test.ts",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "synthetic-fixture",
+      "reason": "Existing synthetic fixture host identities; baseline only, new files are not exempt."
+    },
+    {
+      "file": "tests/mesh-bridge-events-batch.test.ts",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "synthetic-fixture",
+      "reason": "Existing synthetic fixture host identities; baseline only, new files are not exempt."
+    },
+    {
+      "file": "tests/mesh-bridge-handoff.test.ts",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "synthetic-fixture",
+      "reason": "Existing synthetic fixture host identities; baseline only, new files are not exempt."
+    },
+    {
+      "file": "tests/mesh-bridge-idle-cost.test.ts",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "synthetic-fixture",
+      "reason": "Existing synthetic fixture host identities; baseline only, new files are not exempt."
+    },
+    {
+      "file": "tests/mesh-bridge-incarnation.test.ts",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "synthetic-fixture",
+      "reason": "Existing synthetic fixture host identities; baseline only, new files are not exempt."
+    },
+    {
+      "file": "tests/mesh-bridge-latency.test.ts",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "synthetic-fixture",
+      "reason": "Existing synthetic fixture host identities; baseline only, new files are not exempt."
+    },
+    {
+      "file": "tests/mesh-bridge-lease-loop.test.ts",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "synthetic-fixture",
+      "reason": "Existing synthetic fixture host identities; baseline only, new files are not exempt."
+    },
+    {
+      "file": "tests/mesh-bridge-lock-hold.test.ts",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "synthetic-fixture",
+      "reason": "Existing synthetic fixture host identities; baseline only, new files are not exempt."
+    },
+    {
+      "file": "tests/mesh-bridge-notifications.test.ts",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "synthetic-fixture",
+      "reason": "Existing synthetic fixture host identities; baseline only, new files are not exempt."
+    },
+    {
+      "file": "tests/mesh-bridge-participants.test.ts",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "synthetic-fixture",
+      "reason": "Existing synthetic fixture host identities; baseline only, new files are not exempt."
+    },
+    {
+      "file": "tests/mesh-bridge-relay-cli.test.ts",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "synthetic-fixture",
+      "reason": "Existing synthetic fixture host identities; baseline only, new files are not exempt."
+    },
+    {
+      "file": "tests/mesh-bridge-relay-safety.test.ts",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "synthetic-fixture",
+      "reason": "Existing synthetic fixture host identities; baseline only, new files are not exempt."
+    },
+    {
+      "file": "tests/mesh-bridge-spokes.test.ts",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "synthetic-fixture",
+      "reason": "Existing synthetic fixture host identities; baseline only, new files are not exempt."
+    },
+    {
+      "file": "tests/mesh-bridge-tail.test.ts",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "synthetic-fixture",
+      "reason": "Existing synthetic fixture host identities; baseline only, new files are not exempt."
+    },
+    {
+      "file": "tests/mesh-bridge.test.ts",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "synthetic-fixture",
+      "reason": "Existing synthetic fixture host identities; baseline only, new files are not exempt."
+    },
+    {
+      "file": "tests/mesh-lock-namespace.test.ts",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "synthetic-fixture",
+      "reason": "Existing synthetic fixture host identities; baseline only, new files are not exempt."
+    },
+    {
+      "file": "tests/mesh-lock-stats.test.ts",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "synthetic-fixture",
+      "reason": "Existing synthetic fixture host identities; baseline only, new files are not exempt."
+    },
+    {
+      "file": "tests/mesh-provider-factory.test.ts",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "synthetic-fixture",
+      "reason": "Existing synthetic fixture host identities; baseline only, new files are not exempt."
+    },
+    {
+      "file": "tests/mesh-receipt-namespace.test.ts",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "synthetic-fixture",
+      "reason": "Existing synthetic fixture host identities; baseline only, new files are not exempt."
+    },
+    {
+      "file": "tests/mesh-store.test.ts",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "synthetic-fixture",
+      "reason": "Existing synthetic fixture host identities; baseline only, new files are not exempt."
+    },
+    {
+      "file": "tests/mirrored-root-liveness.test.ts",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "synthetic-fixture",
+      "reason": "Existing synthetic fixture host identities; baseline only, new files are not exempt."
+    },
+    {
+      "file": "tests/native-placement-proof.test.ts",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "synthetic-fixture",
+      "reason": "Existing synthetic fixture host identities; baseline only, new files are not exempt."
+    },
+    {
+      "file": "tests/nats-auth-cli.test.ts",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "synthetic-fixture",
+      "reason": "Existing synthetic fixture host identities; baseline only, new files are not exempt."
+    },
+    {
+      "file": "tests/nats-auth-path-b-mint.test.ts",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "synthetic-fixture",
+      "reason": "Existing synthetic fixture host identities; baseline only, new files are not exempt."
+    },
+    {
+      "file": "tests/nats-auth-path-b-permissions.test.ts",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "synthetic-fixture",
+      "reason": "Existing synthetic fixture host identities; baseline only, new files are not exempt."
+    },
+    {
+      "file": "tests/pattern-kill.test.ts",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "synthetic-fixture",
+      "reason": "Existing synthetic fixture host identities; baseline only, new files are not exempt."
+    },
+    {
+      "file": "tests/process-placement-affinity.test.ts",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "synthetic-fixture",
+      "reason": "Existing synthetic fixture host identities; baseline only, new files are not exempt."
+    },
+    {
+      "file": "tests/process-placement-startup.test.ts",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "synthetic-fixture",
+      "reason": "Existing synthetic fixture host identities; baseline only, new files are not exempt."
+    },
+    {
+      "file": "tests/process-placement.test.ts",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "synthetic-fixture",
+      "reason": "Existing synthetic fixture host identities; baseline only, new files are not exempt."
+    },
+    {
+      "file": "tests/records-admission.test.ts",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "synthetic-fixture",
+      "reason": "Existing synthetic fixture host identities; baseline only, new files are not exempt."
+    },
+    {
+      "file": "tests/records-chain.test.ts",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "synthetic-fixture",
+      "reason": "Existing synthetic fixture host identities; baseline only, new files are not exempt."
+    },
+    {
+      "file": "tests/records-paul-steps.test.ts",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "synthetic-fixture",
+      "reason": "Existing synthetic fixture host identities; baseline only, new files are not exempt."
+    },
+    {
+      "file": "tests/records-service.test.ts",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "synthetic-fixture",
+      "reason": "Existing synthetic fixture host identities; baseline only, new files are not exempt."
+    },
+    {
+      "file": "tests/records-store.test.ts",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "synthetic-fixture",
+      "reason": "Existing synthetic fixture host identities; baseline only, new files are not exempt."
+    },
+    {
+      "file": "tests/remote-mirror-lease-wait.test.ts",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "synthetic-fixture",
+      "reason": "Existing synthetic fixture host identities; baseline only, new files are not exempt."
+    },
+    {
+      "file": "tests/remote-presence.test.ts",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "synthetic-fixture",
+      "reason": "Existing synthetic fixture host identities; baseline only, new files are not exempt."
+    },
+    {
+      "file": "tests/root-inbox-dedup.test.ts",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "synthetic-fixture",
+      "reason": "Existing synthetic fixture host identities; baseline only, new files are not exempt."
+    },
+    {
+      "file": "tests/root-inbox-distinct-events.test.ts",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "synthetic-fixture",
+      "reason": "Existing synthetic fixture host identities; baseline only, new files are not exempt."
+    },
+    {
+      "file": "tests/task-write-policy.test.ts",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "synthetic-fixture",
+      "reason": "Existing synthetic fixture host identities; baseline only, new files are not exempt."
+    },
+    {
+      "file": "tests/tmp-wipe.test.ts",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "synthetic-fixture",
+      "reason": "Existing synthetic fixture host identities; baseline only, new files are not exempt."
+    },
+    {
+      "file": "tests/worker-activation-window.test.ts",
+      "rules": [
+        "fleet-alias"
+      ],
+      "kind": "synthetic-fixture",
+      "reason": "Existing synthetic fixture host identities; baseline only, new files are not exempt."
+    },
+    {
+      "file": "scripts/lib/native-placement-proof.mjs",
+      "rules": [
+        "org-fqdn"
+      ],
+      "kind": "identity-boundary",
+      "reason": "Lead-approved exact identity-recognition literal; separate security-pass migration tracked by #14658.",
+      "literalSha256": "d4f0571cc4687711617f927575420caf84a1bab2579d965cd0d126986ec140fa"
+    },
+    {
+      "file": "scripts/lib/native-placement-proof.mjs",
+      "rules": [
+        "org-fqdn"
+      ],
+      "kind": "identity-boundary",
+      "reason": "Lead-approved exact identity-recognition literal; separate security-pass migration tracked by #14658.",
+      "literalSha256": "25c3ee7ccd1bf18e9e8d1c4a47a87edb2d2a72cc148ed26b72f4f7231ff2ae78"
+    },
+    {
+      "file": "tests/native-placement-proof.test.ts",
+      "rules": [
+        "org-fqdn"
+      ],
+      "kind": "identity-boundary",
+      "reason": "Lead-approved exact identity-recognition literal; separate security-pass migration tracked by #14658.",
+      "literalSha256": "d4f0571cc4687711617f927575420caf84a1bab2579d965cd0d126986ec140fa"
+    },
+    {
+      "file": "tests/native-placement-proof.test.ts",
+      "rules": [
+        "org-fqdn"
+      ],
+      "kind": "identity-boundary",
+      "reason": "Lead-approved exact identity-recognition literal; separate security-pass migration tracked by #14658.",
+      "literalSha256": "25c3ee7ccd1bf18e9e8d1c4a47a87edb2d2a72cc148ed26b72f4f7231ff2ae78"
+    },
+    {
+      "file": "tests/native-placement-proof.test.ts",
+      "rules": [
+        "org-fqdn"
+      ],
+      "kind": "identity-boundary",
+      "reason": "Lead-approved exact identity-recognition literal; separate security-pass migration tracked by #14658.",
+      "literalSha256": "9bd60f4ad81daa19f912b68af7f75d5f193a51a9e52de0c6bc7d3b12a69132d8"
+    },
+    {
+      "file": "tests/native-placement-proof.test.ts",
+      "rules": [
+        "org-fqdn"
+      ],
+      "kind": "identity-boundary",
+      "reason": "Lead-approved exact identity-recognition literal; separate security-pass migration tracked by #14658.",
+      "literalSha256": "9d8d67beac5a52623554db8e236e985ea9fa37e514fa17b43e145cfbd6e4ae4a"
+    },
+    {
+      "file": "media/opencollective/fabric-runtime/fa-avatar.png",
+      "rules": [
+        "ip-address"
+      ],
+      "kind": "historical-doc",
+      "reason": "Existing compressed PNG media bytes accidentally form this exact short address token; #14658.",
+      "literalSha256": "1e14fbbc6a3ae5fdd678faa82cd522692eea8661ab78863a01d8c6fc5fa77806"
+    },
+    {
+      "file": "media/opencollective/fabric-runtime/particle-cover.png",
+      "rules": [
+        "ip-address"
+      ],
+      "kind": "historical-doc",
+      "reason": "Existing compressed PNG media bytes accidentally form this exact short address token; #14658.",
+      "literalSha256": "646566908ec0181cf74be2660654c1139fd75df6f1daed1fb9fc97a368fcd6b0"
+    },
+    {
+      "file": "media/opencollective/fabric-runtime/particle-cover.png",
+      "rules": [
+        "ip-address"
+      ],
+      "kind": "historical-doc",
+      "reason": "Existing compressed PNG media bytes accidentally form this exact short address token; #14658.",
+      "literalSha256": "1d99dae930918faa18083ee3ca7e64adcb90a9bd1afd337a05c1c399a8bc3077"
+    },
+    {
+      "file": "media/opencollective/fabric-runtime/particle-cover.png",
+      "rules": [
+        "ip-address"
+      ],
+      "kind": "historical-doc",
+      "reason": "Existing compressed PNG media bytes accidentally form this exact short address token; #14658.",
+      "literalSha256": "449535f8597d04749ad205e8e7d611ea3184f47dea3eefbed0f3169cb5d4d4dc"
+    },
+    {
+      "file": "media/opencollective/fabric-runtime/particle-cover.png",
+      "rules": [
+        "ip-address"
+      ],
+      "kind": "historical-doc",
+      "reason": "Existing compressed PNG media bytes accidentally form this exact short address token; #14658.",
+      "literalSha256": "5e3e39f15d6d03268451749de1f054143faf2d7388785f911aa0a370967a8bc5"
+    },
+    {
+      "file": "media/opencollective/fabric-runtime/particle-cover.png",
+      "rules": [
+        "ip-address"
+      ],
+      "kind": "historical-doc",
+      "reason": "Existing compressed PNG media bytes accidentally form this exact short address token; #14658.",
+      "literalSha256": "9a7c1e2404fa5b46600558136d9d00f998291c40b393b4b52ceeecb0b028001a"
+    },
+    {
+      "file": "media/opencollective/fabric-runtime/particle-cover.png",
+      "rules": [
+        "ip-address"
+      ],
+      "kind": "historical-doc",
+      "reason": "Existing compressed PNG media bytes accidentally form this exact short address token; #14658.",
+      "literalSha256": "d4508a8ed646ba8c73555a8b924a081b148d2d426177879a75b810db33e4ad86"
+    },
+    {
+      "file": "tests/spawn-router.test.ts",
+      "rules": [
+        "ip-address"
+      ],
+      "kind": "synthetic-fixture",
+      "reason": "Existing deliberately invalid software-version construct, not a network endpoint; #14658.",
+      "literalSha256": "6694f83c9f476da31f5df6bcc520034e7e57d421d247b9d34f49edbfc84a764c"
+    },
+    {
+      "file": "tests/state-backend-nats.test.ts",
+      "rules": [
+        "ip-address"
+      ],
+      "kind": "synthetic-fixture",
+      "reason": "Existing deliberately invalid software-version construct, not a network endpoint; #14658.",
+      "literalSha256": "e2bcbcf15f6c9774b5579488c86ff997ae19be578c2ffb0e4c7d81e9393a8003"
+    },
+    {
+      "file": "src/mesh/state-backend-nats.ts",
+      "rules": [
+        "ip-address"
+      ],
+      "kind": "synthetic-fixture",
+      "reason": "Technical false positive: existing loopback-recognition regexp prefix is not an endpoint; exact-token scope only.",
+      "literalSha256": "cfbbaf044127682fe063bb1b3547ab061aa8a23d264eb257a850de816e8e5be6"
+    }
+  ]
+}

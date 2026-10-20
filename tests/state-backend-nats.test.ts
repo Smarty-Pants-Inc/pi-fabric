@@ -1286,7 +1286,7 @@ describe("JetStream backend: round 4 (pi-fabric#937)", () => {
       await expect(openNatsStateBackend({ root: root(), port: fakeJetStream().port(), servers: [`tls://[${host}]:4222`], lookup: resolver }), host)
         .resolves.toBeInstanceOf(NatsStateBackend);
     }
-    for (const host of ["::ffff:a00:1", "::ffff:8000:1", "::ffff:10.0.0.1", "::2"]) {
+    for (const host of ["::ffff:a00:1", "::ffff:c000:201", "::ffff:10.0.0.1", "2001:db8::2"]) {
       await expect(assertNatsTransportSecure(`nats://[${host}]:4222`, "tls:", resolver), host).rejects.toBeInstanceOf(MeshStateNatsInsecureError);
     }
   });

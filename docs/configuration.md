@@ -57,7 +57,7 @@ Ryzen 1 example (the existing fleet launcher, **not executed by the offline test
     "placement": {
       "default": "remote",
       "command": [
-        "/home/paul/.local/bin/smarty-task-ryzen2",
+        "/absolute/launcher/smarty-task-ryzen2",
         "{id}",
         "--host",
         "auto",
@@ -86,10 +86,10 @@ Ryzen 1 example (the existing fleet launcher, **not executed by the offline test
         "-o",
         "ConnectTimeout=10",
         "{sshAlias}",
-        "python3 -c 'import json, pathlib, sys; p=pathlib.Path(\"/srv/scratch/paul/tasks/direct\")/sys.argv[1]; rc=p/\"rc\"; print(json.dumps({\"rc\":rc.read_text().strip(),\"text\":(p/\"result.md\").read_text(),\"stderr\":(p/\"stderr.log\").read_text() if (p/\"stderr.log\").exists() else \"\"} if rc.exists() else {\"rc\":None}))' {id}"
+        "python3 -c 'import json, pathlib, sys; p=pathlib.Path(\"/absolute/native/task-root\")/sys.argv[1]; rc=p/\"rc\"; print(json.dumps({\"rc\":rc.read_text().strip(),\"text\":(p/\"result.md\").read_text(),\"stderr\":(p/\"stderr.log\").read_text() if (p/\"stderr.log\").exists() else \"\"} if rc.exists() else {\"rc\":None}))' {id}"
       ],
       "cancelCommand": [
-        "/home/paul/.local/bin/smarty-task-ryzen2",
+        "/absolute/launcher/smarty-task-ryzen2",
         "--host",
         "{host}",
         "--cancel",
@@ -102,7 +102,7 @@ Ryzen 1 example (the existing fleet launcher, **not executed by the offline test
 }
 ```
 
-The Ryzen 1 Main's cwd (for example `/home/paul/smarty/smarty-pants/pi-fabric`) is a **source** workspace, not a target-local lane: `--src {cwd}` makes the launcher ship tracked and unignored files to the selected task's `OUT/src` and run there. Do not substitute `--cwd`, which the launcher permits only for existing target-local lanes under `/home/paul/lanes`, `/home/paul/repos`, or `/srv/scratch/paul/tasks`. With `--src {cwd}`, home/root, non-Git or ignored source directories stay local with audit reason `cwd-not-shippable`. A failed, timed-out or indeterminate Git ignore check also stays local. Fabric requires the launcher's tracked/unignored manifest branch; it never knowingly selects the recursive-copy fallback for ignored (potentially huge or private) source roots.
+The Ryzen 1 Main's cwd (for example `/home/example/project/pi-fabric`) is a **source** workspace, not a target-local lane: `--src {cwd}` makes the launcher ship tracked and unignored files to the selected task's `OUT/src` and run there. Do not substitute `--cwd`, which the launcher permits only for existing target-local lanes beneath host-owner-configured allowlisted roots; `/home/example/lanes`, `/home/example/repos`, and `/absolute/native/task-root` here are placeholders, not literal authorized roots. With `--src {cwd}`, home/root, non-Git or ignored source directories stay local with audit reason `cwd-not-shippable`. A failed, timed-out or indeterminate Git ignore check also stays local. Fabric requires the launcher's tracked/unignored manifest branch; it never knowingly selects the recursive-copy fallback for ignored (potentially huge or private) source roots.
 
 `sshAliases` copies smarty-dev's `setup/factory/work-hosts.json` mapping: `ryzen2 → ryzen2-agent`, **`ryzen3 → forge-agent`**, `ryzen4 → ryzen4-agent`, `ryzen5 → ryzen5-agent`. Keep this host-owned map synchronized with that file; Fabric does not read smarty-dev files or invent `{host}-agent`. `{sshAlias}` is looked up using the accepted host, and requires a nonempty map of safe host/alias tokens. An unmapped accepted host retains launch custody; it does not guess an alias or start a local duplicate. This example uses normal SSH host-key verification, with only read-only result polling added. Verify the aliases and shippable source workspace before enabling it. For a target without `python3`, use an equivalent host-owned reader that implements the JSON contract below. The hook itself does not call SSH implicitly or retrieve a remote file as if it were local. The launcher selects the host; its `RYZEN2_TASK_ACCEPTED <id> on <host> ...` line must match the Fabric run ID. `{host}` in polling/cancellation comes from that receipt, not from `auto`.
 
@@ -123,7 +123,7 @@ One-shot placement supports ordinary Main Pi tasks (up to 240 minutes, launcher-
 
 ### Native fleet proof and rollout gate
 
-`scripts/probe-process-placement.mjs` is an **offline adapter proof** with a fake launcher and fake receipt; it is not evidence of a real Main-to-work-host model call. The separate opt-in `scripts/probe-native-process-placement.mjs` loads the installed Pi SDK and the freshly built extension into an isolated agent directory, invokes `agents.spawn` → `agents.wait` through the **real** fleet launcher, and retains its acceptance line, native terminal rc, full result, manager audit, exact candidate SHA and command. Its caller makes no inference calls and reads no host authentication files; only the real launcher uses the work host's existing native Pi profile. SSH proof is restricted to the approved Main hostnames `dev1.smartypants.ai` (also `dev1`) and `ryzen1` (also `ryzen1.smartypants.ai`); work hosts are rejected, and neither Main name may appear as a work-host key or SSH alias route. It ships a tiny public Git source packet, not the repository/private corpus or credential-bearing inputs.
+`scripts/probe-process-placement.mjs` is an **offline adapter proof** with a fake launcher and fake receipt; it is not evidence of a real Main-to-work-host model call. The separate opt-in `scripts/probe-native-process-placement.mjs` loads the installed Pi SDK and the freshly built extension into an isolated agent directory, invokes `agents.spawn` → `agents.wait` through the **real** fleet launcher, and retains its acceptance line, native terminal rc, full result, manager audit, exact candidate SHA and command. Its caller makes no inference calls and reads no host authentication files; only the real launcher uses the work host's existing native Pi profile. SSH proof is restricted to the approved Main hostnames (including the existing bare aliases `dev1` and `ryzen1`; private FQDNs are omitted); work hosts are rejected, and neither Main name may appear as a work-host key or SSH alias route. It ships a tiny public Git source packet, not the repository/private corpus or credential-bearing inputs.
 
 From a **Ryzen 1 Main owner**, after a fresh build on the clean candidate:
 
@@ -131,8 +131,9 @@ From a **Ryzen 1 Main owner**, after a fresh build on the clean candidate:
 PROOF_MODELS_FROM_PROFILE=1 nice -n 19 node scripts/probe-native-process-placement.mjs \
   /absolute/installed/pi-coding-agent/package \
   /absolute/kept/evidence-directory \
-  /home/paul/.local/bin/smarty-task-ryzen2 ryzen2 \
-  /home/paul/.local/share/smarty-dev/factory/current/setup/factory/work-hosts.json ssh
+  /absolute/real-launcher work-host \
+  /absolute/work-hosts.json ssh \
+  /absolute/native/task-root
 ```
 
 `PROOF_MODELS_FROM_PROFILE=1` opts into the selected host profile's model providers: before replacing `PI_CODING_AGENT_DIR`, the probe resolves that directory (default `~/.pi/agent`) and symlinks its `models.json` into the private isolated profile. The installed SDK consumes the symlink with network/model refresh disabled and in-memory authentication; the probe never copies or prints the models file, passes it on argv, or includes it or its contents in the evidence directory. No authentication store is linked. The scratch profile and symlink are removed on completion without modifying the host file. A missing models file fails closed; private failure diagnostics are omitted from evidence/stdout/stderr when this option is enabled. Leave the option unset for the inert offline provider metadata instead. Only the real work task makes an inference call through the target profile.

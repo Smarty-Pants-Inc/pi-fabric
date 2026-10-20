@@ -85,7 +85,7 @@ describe("restored guard fail-closed provenance (#325 S4-S6)", () => {
     ["S4 shared listing read loop", `find /tmp -maxdepth 1 > .local/targets; while read d; do rm -rf "$d"; done < .local/targets`, wipesTmp],
     ["S4 shared listing cat pipeline", `ls -d /tmp/tmp.* > .local/targets; cat .local/targets | xargs rm -rf`, wipesTmp],
     ["S4 shared listing cat capture", `ls -d /tmp/tmp.* > .local/targets; rm -rf "$(cat .local/targets)"`, wipesTmp],
-    ["S4 shared cwd listing output", `cd /tmp; ls > /home/paul/list; xargs -a /home/paul/list rm -rf`, wipesTmp],
+    ["S4 shared cwd listing output", `cd /tmp; ls > /home/example/list; xargs -a /home/example/list rm -rf`, wipesTmp],
     ["S4 numeric output filename", `pgrep -f worker > 1; xargs -a 1 kill`, killsByPattern],
     ["S4 file descriptor combined write", `pgrep -f worker >& .local/targets; xargs -a .local/targets kill`, killsByPattern],
     ["S4 spelling aliases", `pgrep -f worker > ./.local//targets; xargs -a .local/targets kill`, killsByPattern],

@@ -1338,7 +1338,7 @@ For a code-owned typed alternative to a reasoning actor, use [Jev Main-turn obse
 ```ts
 return agents.createActor({
   name: "reviewer",
-  instructionsFile: "/home/paul/.local/share/smarty-dev/factory/current/roles/reviewer.md",
+  instructionsFile: "/home/example/.local/share/smarty-dev/factory/current/roles/reviewer.md",
   sha256: "<lowercase 64-hex SHA256 of the file bytes>",
 });
 // The same pair works on agents.setInstructions({ id, instructionsFile, sha256 }).

@@ -1,10 +1,11 @@
 import fs from "node:fs";
 import { retentionV2Enabled } from "./retention-platform.js";
 import path from "node:path";
-import { writeFileAtomic, writeJsonAtomic } from "../core/atomic-write.js";
+import { syncDirectoryChain, writeFileAtomic, writeJsonAtomic } from "../core/atomic-write.js";
 import { ownedStat, processAlive } from "./scratch.js";
 import { boundedRunTree } from "./reference-scan.js";
 import { countRefusal, removalTallyOn, verifiedRemove } from "./verified-remove.js";
+import { mkdirPrivate } from "./private-dir.js";
 import { processStartTime } from "../residency/process-identity.js";
 import { FileLockBusy, lockFile } from "../residency/file-lock.js";
 import { recoverActorRunArchives } from "../actors/child-completions.js";
@@ -258,6 +259,133 @@ const runFiles = new Set([
 const runFile = (name: string): boolean => runFiles.has(name) ||
   /^manager-restored-result-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.json$/.test(name) ||
   /^oversized-event-prefix(-\d+)?\.txt$/.test(name);
+
+export const RUN_SESSION_TRACE_ARCHIVE_DIRECTORY = ".pi-fabric-session-traces";
+const RUN_SESSION_TRACE_ARCHIVE_MANIFEST = ".manifest.json";
+interface RunSessionTraceArchiveEntry { path: string; dev: number; ino: number; size: number; mtimeMs: number }
+interface RunSessionTraceArchiveManifest { format: 1; files: RunSessionTraceArchiveEntry[] }
+const sessionTranscriptName = /^(?:.*[-_.])?session(?:[-_.][^/]*)?\.jsonl(?:\.[^/]*)?$/i;
+const rawSessionTrace = (name: string, inHandoffSession: boolean): boolean =>
+  name === "events.jsonl" || sessionTranscriptName.test(name) ||
+  (inHandoffSession && /\.jsonl(?:\.[^/]*)?$/i.test(name));
+const traceIdentity = (stat: fs.Stats): Omit<RunSessionTraceArchiveEntry, "path"> =>
+  ({ dev: stat.dev, ino: stat.ino, size: stat.size, mtimeMs: stat.mtimeMs });
+const validTraceArchiveEntry = (value: unknown): value is RunSessionTraceArchiveEntry => {
+  if (!value || typeof value !== "object") return false;
+  const entry = value as Partial<RunSessionTraceArchiveEntry>;
+  const normalized = typeof entry.path === "string" ? entry.path.split("/").join(path.sep) : "";
+  return typeof entry.path === "string" && !!entry.path && !path.isAbsolute(normalized) && normalized !== ".." && !normalized.startsWith(`..${path.sep}`) &&
+    [entry.dev, entry.ino, entry.size, entry.mtimeMs].every(item => typeof item === "number" && Number.isFinite(item) && item >= 0);
+};
+const sameTraceIdentity = (stat: fs.Stats, entry: RunSessionTraceArchiveEntry): boolean =>
+  stat.isFile() && !stat.isSymbolicLink() && stat.nlink === 1 && stat.dev === entry.dev && stat.ino === entry.ino &&
+  stat.size === entry.size && stat.mtimeMs === entry.mtimeMs;
+const lstatIfPresent = (file: string): fs.Stats | undefined => {
+  try { return fs.lstatSync(file); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error; }
+};
+const traceManifest = (file: string): RunSessionTraceArchiveManifest | undefined => {
+  const stat = ownedStat(file);
+  if (!stat?.isFile() || stat.size > 16 * 1024 * 1024) return;
+  try {
+    const value = JSON.parse(fs.readFileSync(file, "utf8")) as RunSessionTraceArchiveManifest;
+    if (value?.format !== 1 || !Array.isArray(value.files) || value.files.length > 100_000 ||
+        !value.files.every(validTraceArchiveEntry) || new Set(value.files.map(entry => entry.path)).size !== value.files.length) return;
+    return value;
+  } catch { return; }
+};
+/**
+ * Move every raw Pi transcript/event log out of a run before retention can remove the run tree.
+ * The durable manifest records each original inode before the first rename, so a partial archive
+ * can be retried and a missing or replaced trace fails closed. Archive paths preserve each trace's
+ * relative name and same-filesystem rename preserves its mtime.
+ */
+export const archiveRunSessionTraces = (directory: string): boolean => {
+  const root = path.resolve(directory);
+  if (!ownedStat(root)?.isDirectory()) return false;
+  const files: RunSessionTraceArchiveEntry[] = [];
+  const collect = (current: string, relative: string, depth: number, inHandoffSession: boolean): boolean => {
+    if (depth > 64) return false;
+    let entries: fs.Dirent[];
+    try { entries = fs.readdirSync(current, { withFileTypes: true }); } catch { return false; }
+    for (const entry of entries) {
+      const source = path.join(current, entry.name);
+      const rel = relative ? path.join(relative, entry.name) : entry.name;
+      let stat: fs.Stats;
+      try { stat = fs.lstatSync(source); } catch { return false; }
+      if (stat.isSymbolicLink()) return false;
+      if (stat.isDirectory()) {
+        if (!ownedStat(source)?.isDirectory() || !collect(source, rel, depth + 1, inHandoffSession || entry.name === "handoff-session")) return false;
+      } else if (stat.isFile()) {
+        if (rawSessionTrace(entry.name, inHandoffSession)) {
+          const owned = ownedStat(source);
+          if (!owned?.isFile()) return false;
+          files.push({ path: rel.split(path.sep).join("/"), ...traceIdentity(owned) });
+        }
+      } else if (rawSessionTrace(entry.name, inHandoffSession)) return false;
+    }
+    return true;
+  };
+  if (!collect(root, "", 0, false)) return false;
+  files.sort((left, right) => left.path.localeCompare(right.path));
+
+  const parent = path.dirname(root);
+  const archiveRoot = path.join(parent, RUN_SESSION_TRACE_ARCHIVE_DIRECTORY);
+  const archive = path.join(archiveRoot, `run-${path.basename(root)}`);
+  const manifestPath = path.join(archive, RUN_SESSION_TRACE_ARCHIVE_MANIFEST);
+  try {
+    const archiveStat = lstatIfPresent(archive);
+    if (!archiveStat && files.length === 0) return true;
+    if (archiveStat && (!archiveStat.isDirectory() || archiveStat.isSymbolicLink() || !ownedStat(archive)?.isDirectory())) return false;
+    mkdirPrivate(archiveRoot, parent);
+    mkdirPrivate(archive, archiveRoot);
+    const manifestStat = lstatIfPresent(manifestPath);
+    let prior: RunSessionTraceArchiveManifest | undefined;
+    if (manifestStat) {
+      prior = traceManifest(manifestPath);
+      if (!prior) return false;
+    } else if (fs.readdirSync(archive).length > 0) return false;
+    const entries = new Map((prior?.files ?? []).map(entry => [entry.path, entry]));
+    for (const file of files) {
+      const existing = entries.get(file.path);
+      if (existing && (existing.dev !== file.dev || existing.ino !== file.ino || existing.size !== file.size || existing.mtimeMs !== file.mtimeMs)) return false;
+      if (!existing) entries.set(file.path, file);
+    }
+    const manifest: RunSessionTraceArchiveManifest = {
+      format: 1,
+      files: [...entries.values()].sort((left, right) => left.path.localeCompare(right.path)),
+    };
+    if (!prior || manifest.files.length !== prior.files.length) writeJsonAtomic(manifestPath, manifest, { durable: true });
+
+    const syncDirectories = new Set([parent, archiveRoot, archive]);
+    for (const entry of manifest.files) {
+      const parts = entry.path.split("/");
+      if (!entry.path || parts.some(part => !part || part === "." || part === "..")) return false;
+      const source = path.join(root, ...parts);
+      const target = path.join(archive, ...parts);
+      if (path.dirname(target) !== archive) mkdirPrivate(path.dirname(target), archive);
+      const sourceStat = lstatIfPresent(source), targetStat = lstatIfPresent(target);
+      if (sourceStat && (!ownedStat(source)?.isFile() || !sameTraceIdentity(sourceStat, entry))) return false;
+      if (targetStat && (!ownedStat(target)?.isFile() || !sameTraceIdentity(targetStat, entry))) return false;
+      if (sourceStat && targetStat || !sourceStat && !targetStat) return false;
+      if (sourceStat) {
+        const fd = fs.openSync(source, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+        try {
+          if (!sameTraceIdentity(fs.fstatSync(fd), entry)) return false;
+          fs.fsyncSync(fd);
+        } finally { fs.closeSync(fd); }
+        if (!sameTraceIdentity(ownedStat(source)!, entry)) return false;
+        fs.renameSync(source, target);
+        const archived = ownedStat(target);
+        if (!archived || !sameTraceIdentity(archived, entry)) return false;
+        syncDirectories.add(path.dirname(source));
+        syncDirectories.add(path.dirname(target));
+      }
+    }
+    for (const syncDirectory of syncDirectories) syncDirectoryChain(syncDirectory);
+    return true;
+  } catch { return false; }
+};
 const followUpName = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.json$/;
 /** Only paired, owned admission/final-receipt artifacts authorize collection.
  * A passed alarm deadline is not expiry of the payload: the sender may wait.
@@ -537,30 +665,30 @@ export const removeEmptyRunRoot = (root: string): boolean => {
 };
 const pruneClosedRunRoot = (
   root: string, owner: RunRootOwner, orphanMs: number, oneShotMs: number, now: number, expired: () => boolean,
-  eventsRetention: TerminalRunEventsRetention,
 ): string[] => {
   const removed: string[] = [];
   // Every run started after its root, so no run of a root younger than the shortest retention is due.
-  if (now - owner.startedAt < Math.min(orphanMs, oneShotMs, eventsRetention.terminalRunEventsAgeMs ?? 6 * 60 * 60 * 1_000)) return removed;
+  if (now - owner.startedAt < Math.min(orphanMs, oneShotMs)) return removed;
   let entries: fs.Dirent[];
   try { entries = fs.readdirSync(root, { withFileTypes: true }); } catch { return removed; }
   for (const entry of entries) {
     if (expired()) break;
-    if (!entry.isDirectory()) continue;
+    if (!entry.isDirectory() || entry.name === RUN_SESSION_TRACE_ARCHIVE_DIRECTORY) continue;
     const directory = path.join(root, entry.name);
     // Age first: a young run is kept either way, so it needs no full tree walk (smarty-dev#2010).
     const record = readJson<RunRecordSummary>(path.join(directory, "status.json"));
     const terminal = !!record?.status && TERMINAL_STATUSES.has(record.status);
     const reference = terminal ? recordAgeReference(record!, ownedStat(directory)?.mtimeMs ?? now) : owner.closedAt!;
     const retention = terminal && !record?.actorId ? oneShotMs : orphanMs;
-    if (now - reference < retention) {
-      compactTerminalRunEvents(directory, { ...eventsRetention, now, expired });
-      continue;
-    }
+    if (now - reference < retention) continue;
     if (!processAlive(owner.pid)) { recoverActorRunArchives(directory, expired); recoverEnodevTask(directory); }
-    // The judged stat: taken after recovery, before the safety walk; the removal requires it unchanged.
-    const judged = ownedStat(directory);
     if (!safeRunTree(directory, owner.childrenStopped === true, 0, expired)) { countRefusal("pruneClosedRunRoot", "run tree is not proven safe", directory); continue; }
+    if (!archiveRunSessionTraces(directory)) { countRefusal("pruneClosedRunRoot", "raw session trace archive failed", directory); continue; }
+    // Archive moves change the run directory's mtime; judge the post-archive tree and walk it again.
+    const judged = ownedStat(directory);
+    if (!judged?.isDirectory() || !safeRunTree(directory, owner.childrenStopped === true, 0, expired)) {
+      countRefusal("pruneClosedRunRoot", "run tree changed during trace archival", directory); continue;
+    }
     if (verifiedRemove(directory, judged, { deleter: "pruneClosedRunRoot", fallback: rmTree(directory) }).removed) removed.push(directory);
   }
   return removed;
@@ -710,7 +838,7 @@ export const sweepTempRunRoots = (options: TempRunSweepRequest & {
     if (!validOwner(owner)) continue;
     if (owner.closedAt !== undefined) {
       result.removedRuns.push(...pruneClosedRunRoot(
-        root, owner, options.orphanedTempRunRetentionMs, options.oneShotRunRetentionMs, now, expired, options,
+        root, owner, options.orphanedTempRunRetentionMs, options.oneShotRunRetentionMs, now, expired,
       ));
       if (removeEmptyRunRoot(root)) result.removedRoots.push(root);
       continue;
@@ -727,12 +855,16 @@ export const sweepTempRunRoots = (options: TempRunSweepRequest & {
     try { runs = fs.readdirSync(root, { withFileTypes: true }); } catch { continue; }
     for (const run of runs) {
       if (expired()) break;
-      if (run.name === RUN_ROOT_OWNER_FILE || !run.isDirectory()) continue;
+      if (run.name === RUN_ROOT_OWNER_FILE || run.name === RUN_SESSION_TRACE_ARCHIVE_DIRECTORY || !run.isDirectory()) continue;
       const directory = path.join(root, run.name);
       recoverActorRunArchives(directory, expired);
       recoverEnodevTask(directory);
-      const judged = ownedStat(directory);
       if (!safeRunTree(directory, false, 0, expired)) { countRefusal("sweepTempRunRoots", "run tree is not proven safe", directory); continue; }
+      if (!archiveRunSessionTraces(directory)) { countRefusal("sweepTempRunRoots", "raw session trace archive failed", directory); continue; }
+      const judged = ownedStat(directory);
+      if (!judged?.isDirectory() || !safeRunTree(directory, false, 0, expired)) {
+        countRefusal("sweepTempRunRoots", "run tree changed during trace archival", directory); continue;
+      }
       // Reported as the root's removal once it is empty, as before.
       verifiedRemove(directory, judged, { deleter: "sweepTempRunRoots", fallback: rmTree(directory) });
     }

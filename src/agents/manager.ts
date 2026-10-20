@@ -148,6 +148,7 @@ import type { BudgetLedgerState } from "./budget-ledger.js";
 import { readJsonlPage } from "../log-tail.js";
 import { ownedStat, processAlive } from "../storage/scratch.js";
 import {
+  archiveRunSessionTraces,
   canRemoveManagedRunRoot,
   canRemoveTerminalRun,
   hasUnresolvedWorker,
@@ -5715,6 +5716,9 @@ export class AgentManager {
     for (const managed of expired) {
       if (!this.#canCollect(managed)) continue;
       // Retry settlement saves first; pending deliveries and unsafe contents still veto expiry.
+      if (!canRemoveTerminalRun(managed.runDirectory)) continue;
+      if (!archiveRunSessionTraces(managed.runDirectory)) continue;
+      // Trace moves alter the directory contents; re-prove the terminal tree before recursive removal.
       if (!canRemoveTerminalRun(managed.runDirectory)) continue;
       await removeTree(managed.runDirectory).catch(() => undefined);
       if (!fs.existsSync(managed.runDirectory)) {

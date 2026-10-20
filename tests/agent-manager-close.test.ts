@@ -97,6 +97,64 @@ describe("AgentManager close storage", () => {
     expect(consumed).toHaveBeenCalledExactlyOnceWith(child.id);
   });
 
+  it.each([false, true] as const)("active one-shot expiry archives every raw trace before removal (archive failure=%s)", async failArchive => {
+    let sweep: (() => void) | undefined;
+    const interval = globalThis.setInterval;
+    const timer = vi.spyOn(globalThis, "setInterval").mockImplementation(((callback: () => void, ms?: number, ...args: unknown[]) => {
+      if (ms === 15 * 60 * 1_000) sweep = callback;
+      return interval(callback, ms, ...args);
+    }) as typeof setInterval);
+    const detachedSweep = vi.spyOn(retention, "claimTempRunSweep").mockReturnValue(false);
+    const { manager, root } = setup(false, {
+      retention: { ...DEFAULT_FABRIC_CONFIG.retention, oneShotRunMs: 1_000 },
+    });
+    let clock: ReturnType<typeof vi.spyOn> | undefined;
+    let renameFault: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      const result = await manager.run({ task: "raw trace expiry", transport: "process", extensions: false });
+      const run = manager.runDirectory(result.id)!;
+      const contents = new Map([["session.jsonl", "raw session\n"], ["route-session.jsonl", "raw route session\n"], ["events.jsonl", "raw events\n"]]);
+      const mtimes = new Map<string, number>();
+      for (const [name, content] of contents) {
+        const file = path.join(run, name);
+        fs.writeFileSync(file, content);
+        fs.utimesSync(file, new Date(1_000), new Date(1_000));
+        mtimes.set(name, fs.statSync(file).mtimeMs);
+      }
+      expect(sweep).toBeTypeOf("function");
+      const routeTrace = path.join(run, "route-session.jsonl");
+      if (failArchive) {
+        const realRename = fs.renameSync;
+        renameFault = vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+          if (String(from) === routeTrace) throw Object.assign(new Error("injected archive failure"), { code: "EIO" });
+          return realRename(from, to);
+        });
+      }
+      clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 2_000);
+      sweep!();
+      const archive = path.join(root, retention.RUN_SESSION_TRACE_ARCHIVE_DIRECTORY, `run-${result.id}`);
+      if (failArchive) {
+        await vi.waitFor(() => expect(fs.existsSync(path.join(archive, "events.jsonl"))).toBe(true), { timeout: 2_000 });
+        expect(fs.existsSync(run)).toBe(true);
+        expect(fs.readFileSync(routeTrace, "utf8")).toBe("raw route session\n");
+        renameFault!.mockRestore();
+        sweep!();
+      }
+      await vi.waitFor(() => expect(fs.existsSync(run)).toBe(false), { timeout: 2_000 });
+      for (const [name, content] of contents) {
+        const archived = path.join(archive, name);
+        expect(fs.readFileSync(archived, "utf8")).toBe(content);
+        expect(fs.statSync(archived).mtimeMs).toBe(mtimes.get(name));
+      }
+    } finally {
+      clock?.mockRestore();
+      await manager.close();
+      timer.mockRestore();
+      detachedSweep.mockRestore();
+      renameFault?.mockRestore();
+    }
+  }, 15_000);
+
   it.runIf(hostedDelete)("removes empty managed roots immediately, without recreating them on repeated close", async () => {
     const { manager, root } = setup();
     const first = manager.close();

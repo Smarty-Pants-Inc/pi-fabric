@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { compactTerminalRunEvents, pruneActorRunArchives, markRunRootActive, markRunRootClosed, sweepTempRunRoots, FABRIC_RUN_ROOT_PREFIX, runTreeExitVeto } from "../src/storage/retention.js";
+import { compactTerminalRunEvents, pruneActorRunArchives, markRunRootActive, markRunRootClosed, sweepTempRunRoots, FABRIC_RUN_ROOT_PREFIX, RUN_SESSION_TRACE_ARCHIVE_DIRECTORY, runTreeExitVeto } from "../src/storage/retention.js";
 import { ActorLogStore } from "../src/actors/log-store.js";
 
 const roots: string[] = [];
@@ -84,16 +84,24 @@ describe("six-hour terminal run compaction", () => {
     expect(snapshot(run)).toEqual(after);
   });
 
-  it("also compacts a closed managed one-shot root before its unchanged deletion age", () => {
+  it("keeps closed one-shot events byte-for-byte until expiry, then archives the full log before removal", () => {
     const { root, run } = make();
     const managed = path.join(root, FABRIC_RUN_ROOT_PREFIX + "closed");
     fs.mkdirSync(managed);
-    fs.renameSync(run, path.join(managed, "old"));
+    const moved = path.join(managed, "old");
+    fs.renameSync(run, moved);
+    const eventFile = path.join(moved, "events.jsonl");
+    const original = fs.readFileSync(eventFile, "utf8");
+    const originalMtime = fs.statSync(eventFile).mtimeMs;
     markRunRootActive(managed, 4 * HOUR); markRunRootClosed(managed, 4 * HOUR, true);
     const sweep = (at: number) => sweepTempRunRoots({ tempRoot: root, now: at, orphanedTempRunRetentionMs: 24 * HOUR, oneShotRunRetentionMs: 24 * HOUR });
     expect(sweep(now).removedRuns).toEqual([]);
-    expect(fs.readFileSync(path.join(managed, "old", "events.jsonl"), "utf8").trim().split("\n")).toHaveLength(201);
-    expect(sweep(28 * HOUR).removedRuns).toEqual([path.join(managed, "old")]);
+    expect(fs.readFileSync(eventFile, "utf8")).toBe(original);
+    expect(sweep(28 * HOUR).removedRuns).toEqual([moved]);
+    const archived = path.join(managed, RUN_SESSION_TRACE_ARCHIVE_DIRECTORY, "run-old", "events.jsonl");
+    expect(fs.existsSync(moved)).toBe(false);
+    expect(fs.readFileSync(archived, "utf8")).toBe(original);
+    expect(fs.statSync(archived).mtimeMs).toBe(originalMtime);
   });
 
   it.each([{ status: "running" }, { status: "queued" }, { status: "unknown" }, { sessionId: undefined }, { sessionId: String(process.pid) }, { cleanupPending: true }])("leaves nonterminal/unknown/uncertain custody untouched: %j", record => {

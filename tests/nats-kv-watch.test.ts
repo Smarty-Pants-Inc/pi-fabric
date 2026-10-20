@@ -1,4 +1,7 @@
 import { createHash } from "node:crypto";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import {
   DeliverPolicy,
   jetstream,
@@ -10,6 +13,9 @@ import {
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { openNatsConnection, type NatsConnectionHandle } from "../src/transport/nats/connection.js";
 import { openNatsTransport } from "../src/transport/nats/inbox.js";
+import { MeshStore } from "../src/mesh/store.js";
+import { ParticipantDirectory } from "../src/topology/participant-directory.js";
+import { readParticipantFiles } from "../src/topology/participant-files.js";
 import { KvParticipantDirectory } from "../src/topology/participant-view.js";
 import type { FabricKvHostLease, FabricParticipantRecord } from "../src/topology/types.js";
 import { openNatsKv, openNatsKvForMachine, type NatsKvStore } from "../src/transport/nats/kv.js";
@@ -87,6 +93,10 @@ const gateConsumer = (js: JetStreamClient) => {
 let harness: PathBHarness;
 const connections: NatsConnectionHandle[] = [];
 const watches: Array<{ controller: AbortController; iterator: Watch }> = [];
+const recoveryDirectories: ParticipantDirectory[] = [];
+const recoveryTransports: Array<{ close(): Promise<void> }> = [];
+const recoveryMeshes: MeshStore[] = [];
+const recoveryRoots: string[] = [];
 const connectMachine = async (machine: typeof A | typeof B): Promise<NatsConnectionHandle> => {
   const user = machine === A ? harness.users.machineA : harness.users.machineB;
   const connection = await openNatsConnection({ ...harness.runtimeOptions(user), machine });
@@ -120,6 +130,10 @@ describe.skipIf(!binary)("real authenticated NATS KV snapshot/ready/reset", () =
   }, 30_000);
 
   afterEach(async () => {
+    await Promise.allSettled(recoveryDirectories.splice(0).map(directory => directory.close()));
+    await Promise.allSettled(recoveryTransports.splice(0).map(transport => transport.close()));
+    for (const mesh of recoveryMeshes.splice(0)) mesh.closeState();
+    for (const root of recoveryRoots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
     watches.forEach(({ controller }) => controller.abort());
     await Promise.all(watches.splice(0).map(async ({ iterator }) => {
       if (iterator.return) await bounded(iterator.return(), "watch cleanup");
@@ -342,6 +356,74 @@ describe.skipIf(!binary)("real authenticated NATS KV snapshot/ready/reset", () =
     }
   }, 50_000);
 
+  it("reacquires 20+ participant leases after an outage beyond TTL and closes lost lineage idempotently", async () => {
+    const participantCount = 21;
+    const directories: ParticipantDirectory[] = [];
+    for (let index = 0; index < participantCount; index++) {
+      const id = `session:lease-recovery-${String(index).padStart(2, "0")}`;
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-nats-lease-recovery-"));
+      fs.chmodSync(root, 0o700);
+      recoveryRoots.push(root);
+      const mesh = new MeshStore(path.join(root, "mesh"), 65_536, 1_000);
+      recoveryMeshes.push(mesh);
+      const transportStateDir = path.join(root, "transport-state");
+      fs.mkdirSync(transportStateDir, { mode: 0o700 });
+      const transport = await openNatsTransport({ ...harness.runtimeOptions(harness.users.machineA), hostId: id });
+      recoveryTransports.push(transport);
+      const directory = new ParticipantDirectory(mesh, {
+        enabled: true, hostId: id, rootId: id, identity: { id, name: id, kind: "main" },
+        transport, transportStateDir,
+      });
+      directory.registerSource((): FabricParticipantRecord[] => {
+        const now = Date.now();
+        return [{ format: 1, id, rootId: id, kind: "root", ownerHostId: id, ownerIdentityId: id,
+          ownerIncarnation: directory.ownerIncarnation, name: id, status: "idle", runner: "pi", transport: "host",
+          capabilities: ["followUp"], controlProtocol: "v1", startedAt: now, updatedAt: now }];
+      });
+      directories.push(directory);
+      recoveryDirectories.push(directory);
+    }
+    await Promise.all(directories.map(directory => directory.start()));
+    const waitFor = async (predicate: () => boolean, label: string, ms: number): Promise<void> => {
+      const deadline = Date.now() + ms;
+      while (Date.now() < deadline) { if (predicate()) return; await wait(25); }
+      throw new Error(`timed out: ${label}`);
+    };
+    const allVisible = (active: readonly ParticipantDirectory[]): boolean => active.every(directory => {
+      if (!directory.canConsumeMesh()) return false;
+      const peers = directory.list({ scope: "project" });
+      return peers.length === active.length && peers.every(peer => !peer.stale && directory.participantView?.resolve(peer.id)?.live === true);
+    });
+    await waitFor(() => allVisible(directories), "initial 21-participant directory", 30_000);
+
+    const server = harness.serverProcess;
+    if (!server) throw new Error("Path B NATS server process is unavailable");
+    if (server.exitCode === null && server.signalCode === null) {
+      const stopped = new Promise<void>(resolve => server.once("exit", () => resolve()));
+      server.kill("SIGTERM");
+      await bounded(stopped, "NATS outage begins", 5_000);
+    }
+    const outageStarted = performance.now();
+    await wait(17_000);
+    expect(performance.now() - outageStarted).toBeGreaterThanOrEqual(15_000);
+    expect(directories.every(directory => !directory.canConsumeMesh())).toBe(true);
+
+    await expect(directories[0]!.closeLineage()).resolves.toBeUndefined();
+    await expect(directories[0]!.closeLineage()).resolves.toBeUndefined();
+    await expect(directories[0]!.close()).resolves.toBeUndefined();
+
+    await bounded(harness.start(), "NATS restart after expired lease TTL", 25_000);
+    const survivors = directories.slice(1);
+    await waitFor(() => allVisible(survivors), "20 participant lease reacquisition and replay", 35_000);
+    for (const directory of survivors) {
+      expect(directory.list({ scope: "project" })).toHaveLength(survivors.length);
+    }
+    const peerId = survivors[0]!.options.hostId;
+    const projectedKey = `topology/participants/${createHash("sha256").update(peerId).digest("hex")}`;
+    const projected = readParticipantFiles(survivors[1]!.mesh.root, { maxAgeMs: 0 }).find(entry => entry.key === projectedKey);
+    expect(projected?.value).toMatchObject({ id: peerId });
+  }, 120_000);
+
   it("keeps broker revision order for concurrent updates from both authenticated machines", async () => {
     const { store: a } = await presence(A);
     const { store: b } = await presence(B);
@@ -377,9 +459,48 @@ describe.skipIf(!binary)("real authenticated NATS KV snapshot/ready/reset", () =
     const { iterator } = watch(store, key);
     expect(await next(iterator)).toEqual({ type: "ready" });
     const bootstrap = await harness.connect(harness.users.bootstrap);
-    await jetstream(bootstrap).publish(`$KV.fabric_presence.${key}`, wire);
-    await expect(bounded(iterator.next(), "malformed entry failure")).rejects.toMatchObject({ code: "FABRIC_TRANSPORT_INVALID" });
+    let revision = 0;
+    try {
+      revision = (await jetstream(bootstrap).publish(`$KV.fabric_presence.${key}`, wire)).seq;
+      await expect(bounded(iterator.next(), "malformed entry failure")).rejects.toMatchObject({ code: "FABRIC_TRANSPORT_INVALID" });
+    } finally {
+      try { if (revision) await store.delete(key, revision); }
+      finally { await bootstrap.close(); }
+    }
   });
+
+  it("restarts a failed participant watch after verified reconnect and clears failure after replay", async () => {
+    const id = "session:watch-failed-recovery";
+    const transport = await openNatsTransport({ ...harness.runtimeOptions(harness.users.machineA), hostId: id });
+    const leaseAbort = new AbortController();
+    const directory = new KvParticipantDirectory({ transport, lease: { live: () => true, signal: leaseAbort.signal },
+      identityId: id, rootId: id, ownerIncarnation: "watch-failed-recovery" });
+    const waitFor = async (predicate: () => boolean, label: string, ms = 8_000): Promise<void> => {
+      const deadline = Date.now() + ms;
+      while (Date.now() < deadline) { if (predicate()) return; await wait(20); }
+      throw new Error(`timed out: ${label}`);
+    };
+    try {
+      directory.start();
+      await waitFor(() => directory.ready, "initial empty snapshots");
+      const token = createHash("sha256").update("malformed-watch-recovery").digest("hex").slice(0, 32);
+      const key = `${A}.p.${token}`;
+      const admin = await harness.connect(harness.users.bootstrap);
+      let revision: number;
+      try { revision = (await jetstream(admin).publish(`$KV.fabric_presence.${key}`, "{}")).seq; }
+      finally { await admin.close(); }
+      await waitFor(() => !directory.ready, "malformed row stops participant readiness");
+      expect(directory.ready).toBe(false);
+      expect(await transport.kv("presence").delete(key, revision)).toBe(true);
+      await bounded(harness.restart(), "verified NATS reconnect after malformed row", 25_000);
+      await waitFor(() => directory.ready, "watch snapshot replay clears the prior failure", 15_000);
+      expect(directory.ready).toBe(true);
+    } finally {
+      leaseAbort.abort();
+      await directory.close();
+      await transport.close();
+    }
+  }, 50_000);
 
   it("refuses non-serializable values before storing an unreadable record", async () => {
     const { store } = await presence(A);

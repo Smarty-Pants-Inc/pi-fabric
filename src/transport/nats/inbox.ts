@@ -387,8 +387,10 @@ class NatsTransportImpl implements FabricTransport {
   readonly #kvStores: Readonly<Record<"leases" | "presence", TransportKv>>;
   #placementTerminalStore: { readonly epoch: number; readonly store: NatsKvStore } | undefined;
   readonly #waiters = new Set<ReadyWaiter>();
+  readonly #verifiedReconnectListeners = new Set<() => void>();
   readonly #sessionChannels = new NatsSessionChannelManager();
   #eventPublisher: MeshEventPublisherBinding | undefined;
+  #hasInstalledSession = false;
 
   private constructor(session: NatsSession, options: ResolvedNatsOptions) {
     this.#session = session;
@@ -477,6 +479,8 @@ class NatsTransportImpl implements FabricTransport {
   }
 
   #installSession(session: NatsSession): void {
+    const reinstalled = this.#hasInstalledSession;
+    this.#hasInstalledSession = true;
     this.#session = session;
     this.#sessionChannels.setConnection(session.connection.nc);
     session.unsubscribe = session.connection.onStatus((status) => {
@@ -491,6 +495,7 @@ class NatsTransportImpl implements FabricTransport {
       } else if (status.type === "reconnect") {
         this.#sessionChannels.setConnection(session.connection.nc);
         this.#resolveWaiters(session);
+        this.#notifyVerifiedReconnect();
         // A retained outbox row retries only after the native session was re-verified.
         void this.#eventPublisher?.retry();
       }
@@ -504,6 +509,20 @@ class NatsTransportImpl implements FabricTransport {
       this.#loseSession(session);
     });
     this.#resolveWaiters(session);
+    // A hard close uses the bounded full-reopen path; the new session is already verified.
+    if (reinstalled) this.#notifyVerifiedReconnect();
+  }
+
+  #notifyVerifiedReconnect(): void {
+    for (const listener of [...this.#verifiedReconnectListeners]) {
+      try { listener(); } catch { /* One observer cannot block a verified transport session. */ }
+    }
+  }
+
+  onVerifiedReconnect(listener: () => void): () => void {
+    if (this.#closed) return () => undefined;
+    this.#verifiedReconnectListeners.add(listener);
+    return () => { this.#verifiedReconnectListeners.delete(listener); };
   }
 
   #loseSession(session: NatsSession): void {
@@ -772,6 +791,7 @@ class NatsTransportImpl implements FabricTransport {
   close(): Promise<void> {
     if (this.#closed) return this.#closeTask ?? Promise.resolve();
     this.#closed = true;
+    this.#verifiedReconnectListeners.clear();
     this.#options.signal?.removeEventListener("abort", this.#onOwnerAbort);
     this.#closeController.abort(this.#options.signal?.reason);
     this.#sessionChannels.close();

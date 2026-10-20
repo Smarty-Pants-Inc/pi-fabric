@@ -1,10 +1,11 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { DEFAULT_FABRIC_CONFIG, normalizeFabricConfig } from "../src/config.js";
+import { diagnostics } from "../src/core/diagnostics.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { placementRunIdForParticipant } from "../src/topology/placement-run-id.js";
 import { captureSandboxFinalAnswer, waitForSandboxFinalAnswer } from "../src/agents/completion-inbox.js";
@@ -21,6 +22,7 @@ const servers: Server[] = [];
 const managers: AgentManager[] = [];
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   await Promise.all(managers.splice(0).map(manager => manager.close()));
   for (const server of servers.splice(0)) {
     server.closeAllConnections();
@@ -243,6 +245,26 @@ describe("sandbox agent transport", () => {
     expect(handle.sessionId).toBe(CHILD);
     expect(JSON.parse(fs.readFileSync(path.join(directory, "status.json"), "utf8"))).toMatchObject({ status: "completed", text: "exact sandbox-result", exitCode: 0, transport: "sandbox" });
     expect(terminal.records.get(RUN_ID)).toMatchObject({ placementRunId: RUN_ID, state: "finished", exitCode: 0, at: "2026-02-01T00:00:00Z" });
+  });
+
+  it("keeps the captured final answer when the terminal KV write fails", async () => {
+    const directory = scratch();
+    const api = await fakePlacementServer({ post: intent => result(intent.runId, "admitted"), watch: () => [] });
+    const warning = vi.spyOn(diagnostics, "warn").mockImplementation(() => {});
+    const terminal = { put: async () => { throw Object.assign(new Error("KV write denied"), { code: "FABRIC_PLACEMENT_TERMINAL_WRITE_FAILED" }); } };
+    const transport = new SandboxTransport(config(), {
+      placement: api.placement, mesh: meshFor(taskResult("completed", "captured answer")), terminal,
+      meshTransport: "nats", org: "smarty-dev", now: () => BASE_NOW,
+      resolveRepository: () => ({ repository: "https://github.com/Smarty-Pants-Inc/smarty-dev", cwd: "." }),
+    });
+
+    const handle = await transport.launch(launchRequest(directory));
+    await handle.closed;
+    expect(JSON.parse(fs.readFileSync(path.join(directory, "status.json"), "utf8")))
+      .toMatchObject({ status: "completed", text: "captured answer", exitCode: 0, transport: "sandbox" });
+    expect(handle.lostContact?.()).toBeUndefined();
+    expect(warning).toHaveBeenCalledWith("src/transport/sandbox/transport.ts",
+      expect.stringContaining("FABRIC_PLACEMENT_TERMINAL_WRITE_FAILED"));
   });
 
   it("returns a typed refusal and records never-started", async () => {

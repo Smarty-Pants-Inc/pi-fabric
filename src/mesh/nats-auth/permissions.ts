@@ -168,7 +168,10 @@ function pathBEventAllows({ events, org }: PathBEventsOptions): string[] {
   return [
     `fabric.ev.${org}.>`,
     ...streams.flatMap(stream => [
-      ...["CREATE", "INFO", "MSG.NEXT", "DELETE"].map((verb) => `$JS.API.CONSUMER.${verb}.${stream}.>`),
+      `$JS.API.STREAM.INFO.${stream}`,
+      `$JS.API.STREAM.MSG.GET.${stream}`,
+      `$JS.API.CONSUMER.DURABLE.CREATE.${stream}.>`,
+      ...["CREATE", "INFO", "MSG.NEXT", "DELETE", "UPDATE"].map((verb) => `$JS.API.CONSUMER.${verb}.${stream}.>`),
       `$JS.ACK.${stream}.>`,
     ]),
   ];

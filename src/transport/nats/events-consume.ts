@@ -15,8 +15,30 @@ import { hashToken } from "./subjects.js";
 
 const CONSUMER_NOT_FOUND = 10014;
 const ACK_WAIT_NS = 60_000 * 1_000_000;
+const MAX_RETRY_DELAY_MS = 30_000;
+export const NATS_EVENT_RETRY_DELAY_SCHEDULE_MS = [1_000, 5_000, 15_000, MAX_RETRY_DELAY_MS] as const;
 const MAX_ACK_PENDING = 128;
 type StreamKind = "ev" | "gh";
+
+export type NatsActorEventDisposition = "accepted" | "retry";
+
+const normalizeRetryDelaySchedule = (schedule?: readonly number[]): number[] => {
+  const values = schedule ?? NATS_EVENT_RETRY_DELAY_SCHEDULE_MS;
+  if (!Array.isArray(values) || values.length === 0 || !values.every(value => Number.isSafeInteger(value) && value > 0)) {
+    throw new Error("NATS event retry delay schedule must contain positive integer milliseconds");
+  }
+  return values.map(value => Math.min(value, MAX_RETRY_DELAY_MS));
+};
+const consumerBackoffNs = (schedule: readonly number[]): number[] =>
+  [...schedule, schedule[schedule.length - 1]!].map(ms => ms * 1_000_000);
+const transientNakDelay = (deliveryCount: number, schedule: readonly number[]): number => {
+  const count = Number.isSafeInteger(deliveryCount) && deliveryCount > 0 ? deliveryCount : 1;
+  return schedule[Math.min(count - 1, schedule.length - 1)]!;
+};
+const nakTransiently = (message: JsMsg, schedule: readonly number[]): void => {
+  // Consumer backoff paces AckWait expiry, not NAK; schedule transient retries explicitly.
+  message.nak(transientNakDelay(message.info.deliveryCount, schedule));
+};
 
 export interface NatsActorEventsConsumerOptions {
   readonly org: string;
@@ -27,8 +49,10 @@ export interface NatsActorEventsConsumerOptions {
   readonly eventsStartAt?: number | string | Date;
   /** Explicit admin-only stream creation; runtime event mode always passes false. */
   readonly provision?: boolean;
-  /** Persist the actor queue and message-ID receipt, then confirm ACK before starting the actor drain. */
-  readonly onMessage: (event: MeshEvent, messageId: string, ack: () => Promise<void>) => Promise<void>;
+  /** Transient NAK delays in milliseconds; defaults to 1s, 5s, 15s, then 30s (capped and repeated). */
+  readonly retryDelayScheduleMs?: readonly number[];
+  /** Persist the actor queue and message-ID receipt before ACK; non-accepted outcomes are retried. */
+  readonly onMessage: (event: MeshEvent, messageId: string, ack: () => Promise<void>) => Promise<NatsActorEventDisposition>;
 }
 
 export interface NatsActorEventsConsumer {
@@ -105,6 +129,7 @@ const startGroup = async (
   options: NatsActorEventsConsumerOptions,
   kind: StreamKind,
   subjects: string[],
+  retryDelayScheduleMs: readonly number[],
 ): Promise<ManagedGroup | undefined> => {
   const stream = kind === "ev" ? natsEventsStreamName(options.org) : natsGithubStreamName(options.org);
   const durable = `${kind}_${hashToken(options.actorId)}`;
@@ -113,9 +138,9 @@ const startGroup = async (
     filter_subject: "",
     filter_subjects: filters,
     ack_wait: ACK_WAIT_NS,
-    max_deliver: 5,
+    max_deliver: -1,
     max_ack_pending: MAX_ACK_PENDING,
-    backoff: [],
+    backoff: consumerBackoffNs(retryDelayScheduleMs),
     inactive_threshold: 0,
   });
   const assertCompatible = (info: ConsumerInfo): void => {
@@ -176,7 +201,7 @@ const startGroup = async (
       try {
         for await (const message of messages) {
           if (run.stopping || closing || !allowed.has(message.subject)) {
-            message.nak();
+            nakTransiently(message, retryDelayScheduleMs);
             if (run.stopping || closing) break;
             continue;
           }
@@ -187,12 +212,18 @@ const startGroup = async (
             if (!confirmed) throw new Error("NATS actor event ACK was not confirmed");
             acknowledged = true;
           };
+          let decoded: ReturnType<typeof decodeEvent>;
+          try { decoded = decodeEvent(message, options.org); }
+          catch {
+            message.term("invalid NATS MeshEvent envelope");
+            continue;
+          }
           try {
-            const { event, messageId } = decodeEvent(message, options.org);
-            await options.onMessage(event, messageId, ack);
-            await ack();
+            const disposition = await options.onMessage(decoded.event, decoded.messageId, ack);
+            if (disposition === "accepted") await ack();
+            else if (!acknowledged) nakTransiently(message, retryDelayScheduleMs);
           } catch {
-            if (!acknowledged) message.nak();
+            if (!acknowledged) nakTransiently(message, retryDelayScheduleMs);
             continue;
           }
         }
@@ -258,14 +289,15 @@ export const startNatsActorEventsConsumer = async (
   if (typeof options.org !== "string" || options.org.length === 0) throw new Error("NATS events org is required");
   if (typeof options.actorId !== "string" || options.actorId.length === 0) throw new Error("NATS event actorId is required");
   if (typeof options.onMessage !== "function") throw new Error("NATS event onMessage callback is required");
+  const retryDelayScheduleMs = normalizeRetryDelaySchedule(options.retryDelayScheduleMs);
   if (options.provision === true) await ensureFabricEventsStream(connection.manager, options.org, true);
   const planned = topicPlans(options.org, options.actorId, options.topics);
   const groups = new Map<StreamKind, ManagedGroup>();
   try {
-    const eventGroup = await startGroup(connection, options, "ev", planned.ev);
+    const eventGroup = await startGroup(connection, options, "ev", planned.ev, retryDelayScheduleMs);
     if (!eventGroup) throw new Error("NATS Fabric events durable could not be opened");
     groups.set("ev", eventGroup);
-    const githubGroup = await startGroup(connection, options, "gh", planned.gh);
+    const githubGroup = await startGroup(connection, options, "gh", planned.gh, retryDelayScheduleMs);
     if (githubGroup) groups.set("gh", githubGroup);
   } catch (error) {
     await Promise.all([...groups.values()].map(group => group.close(false).catch(() => undefined)));
@@ -291,7 +323,7 @@ export const startNatsActorEventsConsumer = async (
         await groups.get("ev")!.update(next.ev);
         let github = groups.get("gh");
         if (next.gh.length > 0 && !github) {
-          github = await startGroup(connection, options, "gh", next.gh);
+          github = await startGroup(connection, options, "gh", next.gh, retryDelayScheduleMs);
           if (github) groups.set("gh", github);
         } else if (github) {
           await github.update(next.gh);

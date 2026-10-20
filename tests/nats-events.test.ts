@@ -1,13 +1,13 @@
 import { randomUUID } from "node:crypto";
 import { Buffer } from "node:buffer";
 import { afterEach, describe, expect, it } from "vitest";
-import { openBootstrapNatsConnection } from "../src/transport/nats/connection.js";
+import { openBootstrapNatsConnection, openNatsConnection } from "../src/transport/nats/connection.js";
 import { NatsEventsIdConflictError, openNatsEventsPublisher } from "../src/transport/nats/events-publish.js";
-import { startNatsActorEventsConsumer } from "../src/transport/nats/events-consume.js";
+import { NATS_EVENT_RETRY_DELAY_SCHEDULE_MS, startNatsActorEventsConsumer } from "../src/transport/nats/events-consume.js";
 import type { MeshEvent } from "../src/mesh/event-log.js";
 import { ensureNatsEventsStream, natsEventsStreamName, natsGithubStreamName } from "../src/transport/nats/provision.js";
 import { hashToken } from "../src/transport/nats/subjects.js";
-import { createPathBHarness, resolveNatsBinary, type PathBHarness } from "./helpers/nats-cluster.js";
+import { createPathBHarness, PATH_B_PERMISSION_POLICY, resolveNatsBinary, type PathBHarness } from "./helpers/nats-cluster.js";
 import { DiscardPolicy, RetentionPolicy, StorageType, type StreamConfig } from "@nats-io/jetstream";
 
 const binary = resolveNatsBinary() ?? "";
@@ -43,6 +43,10 @@ const event = (id: string, topic: string, createdAt = Date.now()): Omit<MeshEven
 });
 
 describe("NATS event stream names", () => {
+  it("uses a bounded default transient retry schedule", () => {
+    expect(NATS_EVENT_RETRY_DELAY_SCHEDULE_MS).toEqual([1_000, 5_000, 15_000, 30_000]);
+  });
+
   it("normalizes GitHub login slugs with uppercase and underscores", () => {
     expect(natsEventsStreamName("smarty-pants-inc")).toBe("FABRIC_EV_SMARTY_PANTS_INC");
     expect(natsEventsStreamName("versehq")).toBe("FABRIC_EV_VERSEHQ");
@@ -82,11 +86,11 @@ describe.skipIf(!binary)("NATS Mesh events on a real JetStream server", () => {
       const deliveredB: Array<{ id: string; seq: number }> = [];
       consumers.push(await startNatsActorEventsConsumer(connection, {
         org, actorId: `${org}:actor-a`, topics: ["mail.inbound"],
-        onMessage: async (received, messageId, ack) => { deliveredA.push({ id: `${received.id}:${messageId}`, seq: received.sequence }); await ack(); },
+        onMessage: async (received, messageId, ack) => { deliveredA.push({ id: `${received.id}:${messageId}`, seq: received.sequence }); await ack(); return "accepted"; },
       }));
       consumers.push(await startNatsActorEventsConsumer(connection, {
         org, actorId: `${org}:actor-b`, topics: ["mail.inbound"],
-        onMessage: async (received, messageId, ack) => { deliveredB.push({ id: `${received.id}:${messageId}`, seq: received.sequence }); await ack(); },
+        onMessage: async (received, messageId, ack) => { deliveredB.push({ id: `${received.id}:${messageId}`, seq: received.sequence }); await ack(); return "accepted"; },
       }));
       await waitFor(() => deliveredA.length === 1 && deliveredB.length === 1);
       expect(deliveredA).toEqual([{ id: "stable-mail-event:stable-mail-event", seq: 1 }]);
@@ -101,7 +105,7 @@ describe.skipIf(!binary)("NATS Mesh events on a real JetStream server", () => {
       const noIdReceived: string[] = [];
       consumers.push(await startNatsActorEventsConsumer(connection, {
         org, actorId: `${org}:actor-no-header-id`, topics: ["mail.paul"],
-        onMessage: async (received, messageId, ack) => { noIdReceived.push(`${received.id}:${messageId}`); await ack(); },
+        onMessage: async (received, messageId, ack) => { noIdReceived.push(`${received.id}:${messageId}`); await ack(); return "accepted"; },
       }));
       const raw = event("event-without-msg-id", "mail.paul");
       const rawAck = await connection.js.publish(`fabric.ev.${org}.mail.paul`, Buffer.from(JSON.stringify(raw)));
@@ -148,7 +152,7 @@ describe.skipIf(!binary)("NATS Mesh events on a real JetStream server", () => {
       const received: string[] = [];
       consumer = await startNatsActorEventsConsumer(connection, {
         org, actorId, topics: ["mail.inbound", `github.${org}.repo.pulls.shard1of1`],
-        onMessage: async (receivedEvent, messageId, ack) => { received.push(`${receivedEvent.topic}:${messageId}`); await ack(); },
+        onMessage: async (receivedEvent, messageId, ack) => { received.push(`${receivedEvent.topic}:${messageId}`); await ack(); return "accepted"; },
       });
       const evInfo = await connection.manager.consumers.info(natsEventsStreamName(org), `ev_${hashToken(actorId)}`);
       const ghInfo = await connection.manager.consumers.info(githubStream, `gh_${hashToken(actorId)}`);
@@ -177,7 +181,7 @@ describe.skipIf(!binary)("NATS Mesh events on a real JetStream server", () => {
     try {
       consumer = await startNatsActorEventsConsumer(connection, {
         org, actorId, topics: ["mail.before"],
-        onMessage: async (received, _messageId, ack) => { seen.push(received.topic); await ack(); },
+        onMessage: async (received, _messageId, ack) => { seen.push(received.topic); await ack(); return "accepted"; },
       });
       await publisher.publish(event("before-update", "mail.before"));
       await waitFor(() => seen.length === 1);
@@ -211,6 +215,7 @@ describe.skipIf(!binary)("NATS Mesh events on a real JetStream server", () => {
             throw new Error("simulate failure before durable queue acceptance");
           }
           await ack();
+          return "accepted";
         },
       });
       await new Promise(resolve => setTimeout(resolve, 150));
@@ -221,13 +226,210 @@ describe.skipIf(!binary)("NATS Mesh events on a real JetStream server", () => {
       await consumer.close(false);
       consumer = await startNatsActorEventsConsumer(connection, {
         org, actorId: `${org}:start-floor`, topics: ["mail.paul"], eventsStartAt: new Date(0).toISOString(),
-        onMessage: async (received, _messageId, ack) => { seen.push(received.id); await ack(); },
+        onMessage: async (received, _messageId, ack) => { seen.push(received.id); await ack(); return "accepted"; },
       });
       await new Promise(resolve => setTimeout(resolve, 100));
       expect(seen).toEqual(["after-start", "after-start"]);
     } finally {
       await consumer?.close(false);
       await connection.close();
+    }
+  }, 30_000);
+
+  it("keeps transient ownership refusals retrying beyond five deliveries", async () => {
+    const server = await fixture();
+    const org = `events-${randomUUID().slice(0, 8)}`;
+    const { connection, publisher } = await open(server, org);
+    const actorId = `${org}:ownership-retry`;
+    const stream = natsEventsStreamName(org);
+    const durable = `ev_${hashToken(actorId)}`;
+    let owned = false;
+    const attempts: string[] = [];
+    const accepted: string[] = [];
+    let consumer: Awaited<ReturnType<typeof startNatsActorEventsConsumer>> | undefined;
+    try {
+      consumer = await startNatsActorEventsConsumer(connection, {
+        org, actorId, topics: ["mail.retry"], retryDelayScheduleMs: [50],
+        onMessage: async (received, _messageId, ack) => {
+          attempts.push(received.id);
+          if (!owned) return "retry";
+          accepted.push(received.id);
+          await ack();
+          return "accepted";
+        },
+      });
+      const initial = await connection.manager.consumers.info(stream, durable);
+      expect(initial.config.max_deliver).toBe(-1);
+      expect(initial.config.backoff).toEqual([50, 50].map(ms => ms * 1_000_000));
+      await publisher.publish(event("ownership-blip", "mail.retry"));
+      await waitFor(() => attempts.length >= 6, 8_000);
+      expect(accepted).toEqual([]);
+      const refused = await connection.manager.consumers.info(stream, durable);
+      expect(refused.delivered?.consumer_seq).toBe(attempts.length);
+
+      owned = true;
+      await waitFor(() => accepted.length === 1, 5_000);
+      await new Promise(resolve => setTimeout(resolve, 100));
+      const settled = await connection.manager.consumers.info(stream, durable);
+      expect(settled.delivered?.consumer_seq).toBe(attempts.length);
+      expect(accepted).toEqual(["ownership-blip"]);
+      expect(attempts.every(id => id === "ownership-blip")).toBe(true);
+    } finally {
+      await consumer?.close(false);
+      await connection.close();
+    }
+  }, 15_000);
+
+  it("terminates malformed poison envelopes without invoking the handler", async () => {
+    const server = await fixture();
+    const org = `events-${randomUUID().slice(0, 8)}`;
+    const { connection } = await open(server, org);
+    const actorId = `${org}:poison-event`;
+    let handlerCalls = 0;
+    let consumer: Awaited<ReturnType<typeof startNatsActorEventsConsumer>> | undefined;
+    try {
+      consumer = await startNatsActorEventsConsumer(connection, {
+        org, actorId, topics: ["mail.poison"],
+        onMessage: async (_received, _messageId, ack) => { handlerCalls++; await ack(); return "accepted"; },
+      });
+      const stream = natsEventsStreamName(org);
+      const durable = `ev_${hashToken(actorId)}`;
+      const initial = await connection.manager.consumers.info(stream, durable);
+      expect(initial.config.max_deliver).toBe(-1);
+      await connection.js.publish(`fabric.ev.${org}.mail.poison`, Buffer.from("{"), { msgID: "malformed-poison" });
+      const deadline = Date.now() + 5_000;
+      let terminated = initial;
+      while ((terminated.delivered?.consumer_seq ?? 0) < 1 || terminated.num_ack_pending !== 0 || terminated.num_pending !== 0) {
+        if (Date.now() >= deadline) throw new Error("malformed poison event was not terminated");
+        await new Promise(resolve => setTimeout(resolve, 25));
+        terminated = await connection.manager.consumers.info(stream, durable);
+      }
+      await new Promise(resolve => setTimeout(resolve, 1_100));
+      terminated = await connection.manager.consumers.info(stream, durable);
+      expect(terminated.delivered?.consumer_seq).toBe(1);
+      expect(terminated.num_ack_pending).toBe(0);
+      expect(terminated.num_pending).toBe(0);
+      expect(handlerCalls).toBe(0);
+    } finally {
+      await consumer?.close(false);
+      await connection.close();
+    }
+  }, 15_000);
+
+  it("redelivers an event after ownership is lost mid-delivery, while ACKing the still-owned case", async () => {
+    const server = await fixture();
+    const org = `events-${randomUUID().slice(0, 8)}`;
+    const { connection, publisher } = await open(server, org);
+    const actorId = `${org}:ownership-handoff`;
+    let oldOwner = true;
+    let resolveOldEntered!: () => void;
+    let resolveOldDecision!: () => void;
+    let resolveOldRetry!: () => void;
+    const oldEntered = new Promise<void>(resolve => { resolveOldEntered = resolve; });
+    const oldDecision = new Promise<void>(resolve => { resolveOldDecision = resolve; });
+    const oldRetry = new Promise<void>(resolve => { resolveOldRetry = resolve; });
+    const oldSeen: string[] = [];
+    const newSeen: string[] = [];
+    let oldConsumer: Awaited<ReturnType<typeof startNatsActorEventsConsumer>> | undefined;
+    let newConsumer: Awaited<ReturnType<typeof startNatsActorEventsConsumer>> | undefined;
+    try {
+      oldConsumer = await startNatsActorEventsConsumer(connection, {
+        org, actorId, topics: ["mail.owner"], retryDelayScheduleMs: [50, 100],
+        onMessage: async (received, _messageId, ack) => {
+          oldSeen.push(received.id);
+          if (received.id === "ownership-lost") {
+            resolveOldEntered();
+            await oldDecision;
+            if (!oldOwner) {
+              resolveOldRetry();
+              // A normal return without an accepted outcome must be NAKed, never ACKed.
+              return undefined as never;
+            }
+          }
+          await ack();
+          return "accepted";
+        },
+      });
+      await publisher.publish(event("still-owned", "mail.owner"));
+      await waitFor(() => oldSeen.filter(id => id === "still-owned").length === 1);
+
+      await publisher.publish(event("ownership-lost", "mail.owner"));
+      await oldEntered;
+      newConsumer = await startNatsActorEventsConsumer(connection, {
+        org, actorId, topics: ["mail.owner"], retryDelayScheduleMs: [50, 100],
+        onMessage: async (received, _messageId, ack) => {
+          newSeen.push(received.id);
+          await ack();
+          return "accepted";
+        },
+      });
+      oldOwner = false;
+      resolveOldDecision();
+      await oldRetry;
+      await oldConsumer.close(false);
+      oldConsumer = undefined;
+      await waitFor(() => newSeen.includes("ownership-lost"));
+      await new Promise(resolve => setTimeout(resolve, 150));
+      expect(oldSeen.filter(id => id === "still-owned")).toHaveLength(1);
+      expect(oldSeen.filter(id => id === "ownership-lost")).toHaveLength(1);
+      expect(newSeen).toEqual(["ownership-lost"]);
+    } finally {
+      await Promise.all([oldConsumer?.close(false), newConsumer?.close(false)]);
+      await connection.close();
+    }
+  }, 30_000);
+
+  it("starts Fabric and GitHub event paths with a minted Path B runtime credential", async () => {
+    const org = `events-${randomUUID().slice(0, 8)}`;
+    const server = await createPathBHarness({ binary, tls: {}, org, events: true });
+    fixtures.push(server);
+    const bootstrap = await openBootstrapNatsConnection({
+      servers: `tls://localhost:${new URL(server.serverUrl).port}`,
+      credentials: server.users.bootstrap.credsPath,
+      tls: { caFile: server.tls!.caFile },
+      name: `nats-events-bootstrap-${org}`,
+    });
+    let runtime: Awaited<ReturnType<typeof openNatsConnection>> | undefined;
+    let consumer: Awaited<ReturnType<typeof startNatsActorEventsConsumer>> | undefined;
+    try {
+      await ensureNatsEventsStream(bootstrap.manager, { org, provision: true });
+      const githubStream = natsGithubStreamName(org);
+      await bootstrap.manager.streams.add({
+        name: githubStream, subjects: [`github.${org}.>`], storage: StorageType.File,
+        retention: RetentionPolicy.Limits, discard: DiscardPolicy.New, max_bytes: 1_048_576,
+        max_age: 0, max_msg_size: 1_048_576, max_msgs: -1, max_msgs_per_subject: -1,
+        duplicate_window: 120_000_000_000, num_replicas: 1, no_ack: false, allow_direct: false,
+      } as StreamConfig);
+      runtime = await openNatsConnection({
+        servers: `tls://localhost:${new URL(server.serverUrl).port}`,
+        credentials: server.users.machineA.credsPath,
+        tls: { caFile: server.tls!.caFile },
+        name: `nats-events-minted-${org}`,
+        machine: "machine-a",
+        ...PATH_B_PERMISSION_POLICY,
+        events: true,
+        org,
+      });
+      const publisher = await openNatsEventsPublisher(runtime, { org, provision: false });
+      const githubTopic = `github.${org}.repo.pulls.shard1of1`;
+      const seen: string[] = [];
+      consumer = await startNatsActorEventsConsumer(runtime, {
+        org, actorId: `${org}:minted-runtime`, topics: ["mail.before", githubTopic],
+        onMessage: async (received, _messageId, ack) => {
+          seen.push(received.topic);
+          await ack();
+          return "accepted";
+        },
+      });
+      await consumer.updateTopics(["mail.after", githubTopic]);
+      await publisher.publishWithAck(event("minted-fabric-event", "mail.after"));
+      await bootstrap.js.publish(githubTopic, Buffer.from(JSON.stringify(event("minted-github-event", githubTopic))));
+      await waitFor(() => seen.length === 2);
+      expect(seen).toEqual(expect.arrayContaining(["mail.after", githubTopic]));
+    } finally {
+      await consumer?.close(false);
+      await runtime?.close();
+      await bootstrap.close();
     }
   }, 30_000);
 });

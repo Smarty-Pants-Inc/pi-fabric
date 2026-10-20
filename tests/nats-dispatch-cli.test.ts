@@ -93,7 +93,7 @@ brokerSuite("pi-fabric nats dispatch by real placement-run presence", () => {
   ])("$name", async ({ runIds, replyRunId, expectedCode }) => {
     if (!broker) throw new Error("NATS fixture unavailable");
     const fixture = broker;
-    const received: Array<{ runId: string; targetId: string; senderId: string; message: string; senderLive: boolean }> = [];
+    const received: Array<{ runId: string; targetId: string; senderId: string; message: string; senderLive: boolean; replyCorrelationId: string }> = [];
     const replyDeliveries: Promise<unknown>[] = [];
     const owners: Array<{
       runId: string;
@@ -158,11 +158,14 @@ brokerSuite("pi-fabric nats dispatch by real placement-run presence", () => {
           if (command.operation !== "followUp" || command.targetId !== id) return { accepted: false, error: "unexpected dispatch target" };
           const senderRoute = view.resolve(from.id);
           if (!senderRoute?.live) return { accepted: false, error: "dispatch sender is not live" };
-          received.push({ runId, targetId: command.targetId, senderId: from.id, message: command.message ?? "", senderLive: true });
+          expect(command.data).toMatchObject({ replyCorrelationId: expect.any(String) });
+          const replyCorrelationId = (command.data as { replyCorrelationId: string }).replyCorrelationId;
+          received.push({ runId, targetId: command.targetId, senderId: from.id, message: command.message ?? "", senderLive: true, replyCorrelationId });
           const resultRunId = replyRunId(runId);
           if (resultRunId !== null) {
             replyDeliveries.push(plane.request(senderRoute.ownerHostId, from.id, "followUp", {
-              message: `FABRIC-RESULT ${resultRunId}\nanswer-${runId}`, ownerIncarnation: senderRoute.ownerIncarnation,
+              message: `FABRIC-RESULT ${resultRunId}\nanswer-${runId}`,
+              data: { inReplyTo: replyCorrelationId }, ownerIncarnation: senderRoute.ownerIncarnation,
             }, senderRoute.ownerIdentityId, { idempotencyKey: `result-${runId}`, timeoutMs: 10_000 }));
           }
           return { accepted: true, messageId: command.commandId };
@@ -225,8 +228,9 @@ brokerSuite("pi-fabric nats dispatch by real placement-run presence", () => {
       }
       expect(received).toHaveLength(owners.length);
       expect(new Set(received.map((item) => item.senderId)).size).toBe(owners.length);
-      expect(received.every((item) => item.senderLive && item.message.includes(`agents.followUp(\"${item.senderId}\"`) &&
-        item.message.includes(`FABRIC-RESULT ${item.runId}\\n<answer>`))).toBe(true);
+      expect(received.every((item) => item.senderLive && item.message.includes(`id: \"${item.senderId}\"`) &&
+        item.message.includes(`FABRIC-RESULT ${item.runId}\\n<answer>`) &&
+        item.message.includes(`inReplyTo: \"${item.replyCorrelationId}\"`))).toBe(true);
       await Promise.all(replyDeliveries);
 
       if (expectedCode === 2) {

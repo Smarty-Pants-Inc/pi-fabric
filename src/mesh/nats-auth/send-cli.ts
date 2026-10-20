@@ -58,7 +58,7 @@ export type NatsSendOptions = {
   findTimeoutMs?: number;
   onTaskDispatched?: () => void;
   onReply?: (reply: NatsSendReply) => void;
-  messageForSender?: (senderId: string, targetId: string) => string;
+  messageForSender?: (senderId: string, targetId: string, replyCorrelationId: string | undefined) => string;
 };
 
 export type NatsSendReply = {
@@ -570,7 +570,7 @@ export async function openAndSend(options: NatsSendOptions, onAcknowledged: Ackn
     const settled = await waitForSettledPresence(view, directory, identity.id, signal);
     if (!settled.live || !directory.canConsumeMesh()) throw new SendCliError("sender presence is not live");
     signal.throwIfAborted();
-    const message = options.messageForSender?.(identity.id, targetId) ?? options.text;
+    const message = options.messageForSender?.(identity.id, targetId, replyCorrelationId) ?? options.text;
     if (!message || Buffer.byteLength(message, "utf8") > MAX_TEXT_BYTES) throw new SendCliError("message text must be nonempty and at most 512 KiB");
     if (options.awaitReplySeconds !== undefined) awaitingReply = true;
     options.onTaskDispatched?.();

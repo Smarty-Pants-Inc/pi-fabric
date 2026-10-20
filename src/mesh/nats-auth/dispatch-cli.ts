@@ -259,9 +259,11 @@ export async function runNatsDispatchCli(argv: string[]): Promise<number> {
       ...(options.pathBMachines === undefined ? {} : { pathBMachines: options.pathBMachines }),
       placementRunId: options.runId,
       findTimeoutMs: options.findTimeoutSeconds * 1_000,
-      messageForSender: (senderId, targetId) => {
+      messageForSender: (senderId, targetId, replyCorrelationId) => {
+        if (!replyCorrelationId) throw new DispatchCliError("dispatch reply correlation is unavailable");
         bindRunContent(options.runId, task, targetId);
-        return `${task}\n\nWhen done, reply with agents.followUp("${senderId}", "FABRIC-RESULT ${options.runId}\\n<answer>").`;
+        const answer = `FABRIC-RESULT ${options.runId}\n<answer>`;
+        return `${task}\n\nWhen done, call agents.followUp({ id: ${JSON.stringify(senderId)}, message: ${JSON.stringify(answer)}, data: { inReplyTo: ${JSON.stringify(replyCorrelationId)} } }).`;
       },
       onTaskDispatched: () => { record.t_task_dispatched = isoNs(); },
       onReply: () => { record.t_answer_received = isoNs(); },

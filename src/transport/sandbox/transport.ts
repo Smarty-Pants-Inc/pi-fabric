@@ -10,6 +10,7 @@ const EMPTY_USAGE = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 
 const NAME = /^[A-Za-z0-9][A-Za-z0-9_.:/@+-]{0,255}$/u;
 const HOST = /^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/u;
 const TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/u;
+const SANDBOX_POD_PENDING_POLL_MS = 250;
 const isTimestamp = (value: unknown): value is string => typeof value === "string" && TIMESTAMP.test(value) && Number.isFinite(Date.parse(value)) && new Date(Date.parse(value)).toISOString().replace(".000Z", "Z") === value;
 
 export class SandboxUnsupportedError extends Error {
@@ -32,6 +33,13 @@ export class SandboxReadyTimeoutError extends Error {
   readonly code = "sandbox.ready.timeout";
   constructor(readonly runId: string, readonly timeoutMs: number) { super(`Sandbox child presence for ${runId} was not observed within ${timeoutMs} ms`); this.name = "SandboxReadyTimeoutError"; }
 }
+export class SandboxPodPendingTimeoutError extends Error {
+  readonly code = "FABRIC_SANDBOX_POD_PENDING_TIMEOUT";
+  constructor(readonly runId: string, readonly timeoutMs: number, readonly field: string) {
+    super(`Sandbox Placement field ${field} remained pending for run ${runId} beyond ${timeoutMs} ms`);
+    this.name = "SandboxPodPendingTimeoutError";
+  }
+}
 export class SandboxProtocolError extends Error {
   readonly code = "sandbox.protocol.invalid";
   constructor(detail: string) { super(detail); this.name = "SandboxProtocolError"; }
@@ -49,57 +57,113 @@ const timeoutSleep = (milliseconds: number, signal?: AbortSignal): Promise<void>
   signal?.addEventListener("abort", abort, { once: true });
 });
 
+const protocolField = (field: string, detail = "is invalid"): SandboxProtocolError =>
+  new SandboxProtocolError(`Placement ${field} ${detail}`);
+
+type BindingCheck = { ready: true; binding: SandboxBinding } | { ready: false; field: string; binding: SandboxBinding };
+
 const validateSpawnResult = (value: unknown, runId: string): SandboxSpawnResult => {
   const keys = ["runId", "status", "code", "detail", "retryAfterSeconds", "host", "claimRef", "claimUID", "podUID"];
-  if (!isObject(value) || Object.keys(value).length !== keys.length || keys.some(key => !Object.hasOwn(value, key)) ||
-    value.runId !== runId || !["refused", "delayed", "admitted"].includes(String(value.status)) ||
-    typeof value.code !== "string" || typeof value.detail !== "string" || !value.detail || value.detail.length > 1024 ||
-    !(value.retryAfterSeconds === null || Number.isSafeInteger(value.retryAfterSeconds)) ||
-    !(value.host === null || typeof value.host === "string") ||
-    !(value.claimRef === null || isObject(value.claimRef)) ||
-    !(value.claimUID === null || typeof value.claimUID === "string") ||
-    !(value.podUID === null || typeof value.podUID === "string")) throw new SandboxProtocolError("Invalid placement spawn result");
-  if (value.status === "refused" && value.retryAfterSeconds !== null ||
-    value.status === "delayed" && (typeof value.retryAfterSeconds !== "number" || value.retryAfterSeconds < 1 || value.retryAfterSeconds > 3_600) ||
-    value.status === "admitted" && (typeof value.host !== "string" || !HOST.test(value.host))) {
-    throw new SandboxProtocolError("Placement spawn result violates the v1 status invariants");
+  if (!isObject(value)) throw protocolField("spawn result response");
+  const missing = keys.find(key => !Object.hasOwn(value, key));
+  if (missing) throw protocolField(`spawn result field ${missing}`, "is missing");
+  const extra = Object.keys(value).find(key => !keys.includes(key));
+  if (extra) throw protocolField(`spawn result field ${extra}`, "is unexpected");
+  if (value.runId !== runId) throw protocolField("spawn result field runId", "does not match the requested run");
+  if (!["refused", "delayed", "admitted"].includes(String(value.status))) throw protocolField("spawn result field status");
+  if (typeof value.code !== "string") throw protocolField("spawn result field code");
+  if (typeof value.detail !== "string" || !value.detail || value.detail.length > 1024) throw protocolField("spawn result field detail");
+  if (!(value.retryAfterSeconds === null || Number.isSafeInteger(value.retryAfterSeconds))) throw protocolField("spawn result field retryAfterSeconds");
+  if (!(value.host === null || typeof value.host === "string")) throw protocolField("spawn result field host");
+  if (!(value.claimRef === null || isObject(value.claimRef))) throw protocolField("spawn result field claimRef");
+  if (!(value.claimUID === null || typeof value.claimUID === "string")) throw protocolField("spawn result field claimUID");
+  if (!(value.podUID === null || typeof value.podUID === "string")) throw protocolField("spawn result field podUID");
+  if (value.status === "refused" && value.retryAfterSeconds !== null) throw protocolField("spawn result field retryAfterSeconds", "must be null for refused status");
+  if (value.status === "delayed" && (typeof value.retryAfterSeconds !== "number" || value.retryAfterSeconds < 1 || value.retryAfterSeconds > 3_600)) {
+    throw protocolField("spawn result field retryAfterSeconds", "violates the delayed status invariant");
   }
+  if (value.status === "admitted" && (typeof value.host !== "string" || !HOST.test(value.host))) throw protocolField("spawn result field host");
   if (value.claimRef !== null) {
     const ref = value.claimRef as Record<string, unknown>;
-    if (Object.keys(ref).length !== 3 || !["namespace", "name", "uid"].every(key => Object.hasOwn(ref, key)) ||
-      ref.namespace !== "smarty-island" || ref.name !== `spawn-${runId}` || typeof ref.uid !== "string" || !NAME.test(ref.uid) ||
-      value.claimUID !== ref.uid) throw new SandboxProtocolError("Placement Claim reference does not match the run");
-  } else if (value.claimUID !== null || value.podUID !== null) {
-    throw new SandboxProtocolError("Placement returned UIDs without a Claim reference");
+    const refMissing = ["namespace", "name", "uid"].find(key => !Object.hasOwn(ref, key));
+    if (refMissing) throw protocolField(`spawn result field claimRef.${refMissing}`, "is missing");
+    const refExtra = Object.keys(ref).find(key => !["namespace", "name", "uid"].includes(key));
+    if (refExtra) throw protocolField(`spawn result field claimRef.${refExtra}`, "is unexpected");
+    if (ref.namespace !== "smarty-island") throw protocolField("spawn result field claimRef.namespace");
+    if (ref.name !== `spawn-${runId}`) throw protocolField("spawn result field claimRef.name", "does not match runId");
+    if (typeof ref.uid !== "string" || !NAME.test(ref.uid)) throw protocolField("spawn result field claimRef.uid");
+    if (value.claimUID !== ref.uid) throw protocolField("spawn result field claimUID", "does not match claimRef.uid");
+    if (value.podUID !== null && (value.status !== "admitted" || !NAME.test(value.podUID))) throw protocolField("spawn result field podUID");
+  } else if (value.claimUID !== null) {
+    throw protocolField("spawn result field claimRef", "is null while claimUID is present");
+  } else if (value.podUID !== null) {
+    throw protocolField("spawn result field claimRef", "is null while podUID is present");
   }
-  if (value.status === "admitted" && (value.claimRef === null || typeof value.claimUID !== "string" || !NAME.test(value.claimUID) || typeof value.podUID !== "string" || !NAME.test(value.podUID))) {
-    throw new SandboxProtocolError("Admitted sandbox result has no UID-linked Claim and Pod");
-  }
+  if (value.status !== "admitted" && value.podUID !== null) throw protocolField("spawn result field podUID", "must be null before admission");
   return value as unknown as SandboxSpawnResult;
 };
 
-const validateBinding = (value: unknown, intent: SandboxSpawnIntent, admitted: SandboxSpawnResult): SandboxBinding => {
+const validateBinding = (value: unknown, intent: SandboxSpawnIntent, admitted: SandboxSpawnResult): BindingCheck => {
   const fields = ["runId", "status", "claimRef", "claimUID", "podUID", "podName", "host", "org", "role", "model", "provider", "thinking", "expectedSeconds", "deadline", "executionDeadline", "admittedAt"];
-  if (!isObject(value) || Object.keys(value).length !== 16 || fields.some(field => !Object.hasOwn(value, field)) ||
-    value.runId !== intent.runId || value.status !== "admitted" ||
-    !isObject(value.claimRef) || value.claimRef.namespace !== "smarty-island" || value.claimRef.name !== `spawn-${intent.runId}` ||
-    Object.keys(value.claimRef).length !== 3 || !["namespace", "name", "uid"].every(key => Object.hasOwn(value.claimRef as Record<string, unknown>, key)) ||
-    typeof value.claimRef.uid !== "string" || !NAME.test(value.claimRef.uid) || value.claimUID !== value.claimRef.uid ||
-    typeof value.claimUID !== "string" || !NAME.test(value.claimUID) || typeof value.podUID !== "string" || !NAME.test(value.podUID) ||
-    typeof value.podName !== "string" || !HOST.test(value.podName) || typeof value.host !== "string" || !HOST.test(value.host) ||
-    value.org !== intent.org || value.role !== intent.role || value.model !== intent.model || value.thinking !== intent.thinking ||
-    !(value.provider === null || typeof value.provider === "string" && NAME.test(value.provider)) ||
-    typeof value.expectedSeconds !== "number" || !Number.isSafeInteger(value.expectedSeconds) || value.expectedSeconds < 1 || value.expectedSeconds > 604_800 ||
-    !(value.deadline === null || isTimestamp(value.deadline)) || !isTimestamp(value.executionDeadline) || !isTimestamp(value.admittedAt) ||
-    value.expectedSeconds !== intent.expectedSeconds || value.deadline !== intent.deadline ||
-    value.claimUID !== admitted.claimUID || value.podUID !== admitted.podUID || value.host !== admitted.host) {
-    throw new SandboxProtocolError("Placement binding is not an admitted, UID-linked sandbox binding for this run");
+  if (!isObject(value)) throw protocolField("binding response");
+  const missing = fields.find(field => !Object.hasOwn(value, field));
+  if (missing) throw protocolField(`binding field ${missing}`, "is missing");
+  const extra = Object.keys(value).find(field => !fields.includes(field));
+  if (extra) throw protocolField(`binding field ${extra}`, "is unexpected");
+  if (value.runId !== intent.runId) throw protocolField("binding field runId", "does not match the requested run");
+  if (value.status !== "admitted") throw protocolField("binding field status", "is not admitted");
+  if (!isTimestamp(value.admittedAt)) throw protocolField("binding field admittedAt");
+  if (!isTimestamp(value.executionDeadline)) throw protocolField("binding field executionDeadline");
+  if (typeof value.host !== "string" || !HOST.test(value.host)) throw protocolField("binding field host");
+  if (value.host !== admitted.host) throw protocolField("binding field host", "does not match the admitted result");
+  if (value.org !== intent.org) throw protocolField("binding field org", "does not match the intent");
+  if (value.role !== intent.role) throw protocolField("binding field role", "does not match the intent");
+  if (value.model !== intent.model) throw protocolField("binding field model", "does not match the intent");
+  if (value.thinking !== intent.thinking) throw protocolField("binding field thinking", "does not match the intent");
+  if (!(value.provider === null || typeof value.provider === "string" && NAME.test(value.provider))) throw protocolField("binding field provider");
+  if (typeof value.expectedSeconds !== "number" || !Number.isSafeInteger(value.expectedSeconds) || value.expectedSeconds < 1 || value.expectedSeconds > 604_800) {
+    throw protocolField("binding field expectedSeconds");
   }
-  const binding = value as unknown as SandboxBinding;
-  const expectedExecutionDeadline = Date.parse(binding.admittedAt!) + binding.expectedSeconds! * 1_000;
-  const frozenDeadline = binding.deadline ? Math.min(expectedExecutionDeadline, Date.parse(binding.deadline)) : expectedExecutionDeadline;
-  if (Date.parse(binding.executionDeadline!) !== frozenDeadline) throw new SandboxProtocolError("Placement execution deadline does not match its admitted binding");
-  return binding;
+  if (value.expectedSeconds !== intent.expectedSeconds) throw protocolField("binding field expectedSeconds", "does not match the intent");
+  if (!(value.deadline === null || isTimestamp(value.deadline))) throw protocolField("binding field deadline");
+  if (value.deadline !== intent.deadline) throw protocolField("binding field deadline", "does not match the intent");
+  const expectedExecutionDeadline = Date.parse(value.admittedAt) + value.expectedSeconds * 1_000;
+  const frozenDeadline = value.deadline ? Math.min(expectedExecutionDeadline, Date.parse(value.deadline)) : expectedExecutionDeadline;
+  if (Date.parse(value.executionDeadline) !== frozenDeadline) throw protocolField("binding field executionDeadline", "does not match admittedAt/expectedSeconds/deadline");
+
+  let claim: Record<string, unknown> | null;
+  if (value.claimRef === null) claim = null;
+  else if (!isObject(value.claimRef)) throw protocolField("binding field claimRef");
+  else {
+    claim = value.claimRef;
+    const claimFields = ["namespace", "name", "uid"];
+    const claimMissing = claimFields.find(field => !Object.hasOwn(claim!, field));
+    if (claimMissing) throw protocolField(`binding field claimRef.${claimMissing}`, "is missing");
+    const claimExtra = Object.keys(claim).find(field => !claimFields.includes(field));
+    if (claimExtra) throw protocolField(`binding field claimRef.${claimExtra}`, "is unexpected");
+    if (claim.namespace !== "smarty-island") throw protocolField("binding field claimRef.namespace");
+    if (claim.name !== `spawn-${intent.runId}`) throw protocolField("binding field claimRef.name", "does not match runId");
+    if (typeof claim.uid !== "string" || !NAME.test(claim.uid)) throw protocolField("binding field claimRef.uid");
+    if (value.claimUID !== claim.uid) throw protocolField("binding field claimUID", "does not match claimRef.uid");
+    if (admitted.claimRef !== null && (claim.namespace !== admitted.claimRef.namespace || claim.name !== admitted.claimRef.name || claim.uid !== admitted.claimRef.uid)) {
+      throw protocolField("binding field claimRef", "does not match the admitted result");
+    }
+    if (admitted.claimUID !== null && value.claimUID !== admitted.claimUID) throw protocolField("binding field claimUID", "does not match the admitted result");
+  }
+  if (claim === null) {
+    if (value.claimUID !== null) throw protocolField("binding field claimUID", "is present without claimRef");
+    if (value.podUID !== null) throw protocolField("binding field podUID", "is present without claimRef");
+    if (value.podName !== null) throw protocolField("binding field podName", "is present without claimRef");
+    return { ready: false, field: "claimRef", binding: value as unknown as SandboxBinding };
+  }
+  if (value.podUID === null) {
+    if (value.podName !== null && (typeof value.podName !== "string" || !HOST.test(value.podName))) throw protocolField("binding field podName");
+    return { ready: false, field: "podUID", binding: value as unknown as SandboxBinding };
+  }
+  if (typeof value.podUID !== "string" || !NAME.test(value.podUID)) throw protocolField("binding field podUID");
+  if (typeof value.podName !== "string" || !HOST.test(value.podName)) throw protocolField("binding field podName");
+  // Pod UIDs may change when Placement recreates a Pod for the same run; runId and Claim UID are the stable binding.
+  return { ready: true, binding: value as unknown as SandboxBinding };
 };
 
 const responseErrorIsRetryable = (error: unknown): boolean => {
@@ -217,9 +281,10 @@ export class SandboxTransport implements AgentTransportAdapter {
     }
 
     let binding: SandboxBinding;
-    try { binding = validateBinding(await placement.getBinding(runId, request.signal), intent, admitted); }
-    catch {
-      return failBeforeStart(new SandboxProtocolError("Placement did not provide a valid admitted binding"), "admitted binding was unavailable or invalid");
+    try { binding = await this.#waitForBinding(placement, intent, admitted, request.signal); }
+    catch (error) {
+      const typed = error instanceof Error ? error : new SandboxProtocolError("Placement binding field response failed");
+      return failBeforeStart(typed, typed instanceof SandboxPodPendingTimeoutError ? "sandbox Pod or Claim binding remained pending" : "admitted binding was invalid");
     }
     const deadlineAt = Date.parse(binding.executionDeadline!);
     const deadlineRemaining = deadlineAt - this.#now();
@@ -413,6 +478,38 @@ export class SandboxTransport implements AgentTransportAdapter {
       await this.#sleep(Math.min(retryMs, deadline - this.#now()), signal);
     }
     throw new SandboxSpawnTimeoutError();
+  }
+
+  async #waitForBinding(placement: SandboxPlacement, intent: SandboxSpawnIntent, admitted: SandboxSpawnResult, signal?: AbortSignal): Promise<SandboxBinding> {
+    const timeoutMs = Math.min(this.config.readyTimeoutMs, SANDBOX_READY_TIMEOUT_MS);
+    let deadline = this.#now() + timeoutMs;
+    let pendingField = "claimRef";
+    while (true) {
+      abortIfNeeded(signal);
+      const remaining = Math.ceil(deadline - this.#now());
+      if (remaining <= 0) throw new SandboxPodPendingTimeoutError(intent.runId, timeoutMs, pendingField);
+      const timeoutSignal = AbortSignal.timeout(remaining);
+      const operationSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
+      let response: unknown;
+      try { response = await placement.getBinding(intent.runId, operationSignal); }
+      catch (error) {
+        if (signal?.aborted) throw signal.reason ?? error;
+        if (timeoutSignal.aborted || this.#now() >= deadline) throw new SandboxPodPendingTimeoutError(intent.runId, timeoutMs, pendingField);
+        throw protocolField("binding field response", "could not be read");
+      }
+      const checked = validateBinding(response, intent, admitted);
+      deadline = Math.min(deadline, Date.parse(checked.binding.executionDeadline!));
+      if (checked.ready) return checked.binding;
+      pendingField = checked.field;
+      const sleepMs = Math.min(SANDBOX_POD_PENDING_POLL_MS, Math.ceil(deadline - this.#now()));
+      if (sleepMs <= 0) throw new SandboxPodPendingTimeoutError(intent.runId, timeoutMs, pendingField);
+      try { await this.#sleep(sleepMs, operationSignal); }
+      catch (error) {
+        if (signal?.aborted) throw signal.reason ?? error;
+        if (timeoutSignal.aborted || this.#now() >= deadline) throw new SandboxPodPendingTimeoutError(intent.runId, timeoutMs, pendingField);
+        throw error;
+      }
+    }
   }
 
   async #awaitResult(resultWait: Promise<SandboxTaskResult>, deadlineAt: number): Promise<SandboxTaskResult> {

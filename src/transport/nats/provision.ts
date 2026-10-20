@@ -31,6 +31,8 @@ export interface TransportStreamPolicy {
   readonly duplicateWindowMs: number;
   readonly replicas?: number;
   readonly discard?: DiscardPolicy;
+  /** Existing Fabric event streams may be server-unbounded; publishers still enforce the application cap. */
+  readonly allowUnboundedMaxMessageBytes?: boolean;
 }
 
 export const transportStreamConfig = (policy: TransportStreamPolicy): Partial<StreamConfig> => ({
@@ -50,13 +52,15 @@ export const transportStreamConfig = (policy: TransportStreamPolicy): Partial<St
   allow_direct: false,
 });
 
-export const assertTransportStream = (info: StreamInfo, wanted: Partial<StreamConfig>): void => {
+export const assertTransportStream = (info: StreamInfo, wanted: Partial<StreamConfig>, allowUnboundedMaxMessageBytes = false): void => {
+  const maxMessageBytesMatch = info.config.max_msg_size === wanted.max_msg_size ||
+    (allowUnboundedMaxMessageBytes && info.config.max_msg_size === -1);
   const same = info.config.storage === wanted.storage &&
     info.config.retention === wanted.retention &&
     info.config.discard === wanted.discard &&
     info.config.max_bytes === wanted.max_bytes &&
     info.config.max_age === wanted.max_age &&
-    info.config.max_msg_size === wanted.max_msg_size &&
+    maxMessageBytesMatch &&
     info.config.max_msgs === wanted.max_msgs &&
     info.config.max_msgs_per_subject === wanted.max_msgs_per_subject &&
     info.config.duplicate_window === wanted.duplicate_window &&
@@ -80,7 +84,7 @@ export const ensureTransportStream = async (manager: JetStreamManager, policy: T
       info = await manager.streams.info(policy.name);
     }
   }
-  assertTransportStream(info, wanted);
+  assertTransportStream(info, wanted, policy.allowUnboundedMaxMessageBytes);
   return info;
 };
 
@@ -128,6 +132,7 @@ export const ensureNatsEventsStream = async (manager: JetStreamManager, options:
     duplicateWindowMs,
     replicas,
     discard: DiscardPolicy.New,
+    allowUnboundedMaxMessageBytes: true,
   }, options.provision === true);
 };
 

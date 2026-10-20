@@ -321,6 +321,21 @@ const registrySaveRetryMs = (failures: number): number => {
 const isRetryableRegistrySave = (error: unknown): boolean => error instanceof ActorRegistryUpdateVetoedError ||
   (typeof error === "object" && error !== null && (error as { retryable?: unknown }).retryable === true);
 const errorText = (error: unknown): string => error instanceof Error ? error.message : String(error);
+const errorChain = (error: unknown): string => {
+  const chain: string[] = [];
+  let current: unknown = error;
+  for (let depth = 0; depth < 4 && current !== undefined; depth += 1) {
+    if (current instanceof Error) {
+      const fields = current as Error & { code?: unknown };
+      chain.push(`${current.name}: ${current.message} code=${String(fields.code ?? "")}`);
+      current = current.cause;
+    } else {
+      chain.push(`${typeof current}: ${String(current)} code=`);
+      break;
+    }
+  }
+  return chain.join(" <- ");
+};
 
 const TOPIC_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,127}$/;
 const parseEventsStartAt = (value: unknown): number => {
@@ -1236,7 +1251,14 @@ export class ActorManager {
   #scheduleNatsEventsSync(): void {
     if (!this.#natsEventsEnabled() || !this.#persistent || this.#closing) return;
     void this.#syncNatsEventConsumers().catch(error => {
-      diagnostics.warn("src/actors/manager.ts", `[pi-fabric] NATS actor event setup deferred: ${errorText(error)}`);
+      const connection = this.#natsEventsSession?.connection;
+      let stats = "unavailable";
+      try {
+        const value = connection?.nc.stats() as { inMsgs?: number; outMsgs?: number; inBytes?: number; outBytes?: number } | undefined;
+        if (value) stats = `inMsgs=${value.inMsgs ?? "?"} outMsgs=${value.outMsgs ?? "?"} inBytes=${value.inBytes ?? "?"} outBytes=${value.outBytes ?? "?"}`;
+      } catch { stats = "unavailable"; }
+      const snapshot = `verified=${connection?.isVerified() ?? "unknown"} closed=${connection?.nc.isClosed() ?? "unknown"} draining=${connection?.nc.isDraining() ?? "unknown"} stats={${stats}} requestTimeoutMs=5000 pendingSetup=${[...this.#actors.values()].filter(actor => actor.status !== "stopped" && !actor.removal && !this.#natsEventConsumers.has(actor.id)).length}`;
+      diagnostics.warn("src/actors/manager.ts", `[pi-fabric] NATS actor event setup deferred: ${errorChain(error)}; ${snapshot}`);
     });
   }
 

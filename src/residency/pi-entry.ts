@@ -18,7 +18,11 @@ export default function (pi: ExtensionAPI): void {
     controller = new AbortController();
     // The headless Pi session is not the originating Main session in config.json.
     host = runResidentHostFromConfigPath(configPath, controller.signal, ctx.modelRegistry, ctx.sessionManager.getSessionId())
-      .catch(() => undefined)
+      .catch(error => {
+        const detail = error instanceof Error ? error.stack ?? error.message : String(error);
+        try { process.stderr.write(`[pi-fabric] resident host failed to start: ${detail}\n`); } catch { /* best effort */ }
+        if (process.exitCode === undefined || process.exitCode === 0) process.exitCode = 1;
+      })
       .finally(() => {
         // Natural idle completion shuts down the live session. Teardown already
         // owns shutdown during reload/replacement; never call its captured ctx.

@@ -909,17 +909,17 @@ export class ParticipantDirectory implements FabricParticipantSource {
     return view;
   }
 
-  #transportSuspendedNow(error: unknown): void {
-    if (this.#closed || this.#transportLost || this.#transportRecovering) return;
-    this.#transportRecovering = true;
-    this.#leaseConfirmed = false;
-    this.#natsConfirmedAt = 0;
-    this.#refreshError = error;
-    this.#routingError = error;
-  }
-
   #transportLostNow(error: unknown): void {
-    if (this.#transportLost) return;
+    if (this.#closed || this.#transportLost) return;
+    if (this.#transportLease?.recovering()) {
+      if (this.#transportRecovering) return;
+      this.#transportRecovering = true;
+      this.#leaseConfirmed = false;
+      this.#natsConfirmedAt = 0;
+      this.#refreshError = error;
+      this.#routingError = error;
+      return;
+    }
     this.#transportLost = true;
     this.#transportRecovering = false;
     this.#leaseConfirmed = false;
@@ -952,10 +952,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
         this.scheduleRefresh();
       }
     }).catch(error => {
-      if (!lease.live()) {
-        if (lease.recovering()) this.#transportSuspendedNow(error);
-        else this.#transportLostNow(error);
-      }
+      if (!lease.live()) this.#transportLostNow(error);
       this.#refreshError = error;
       throw error;
     });
@@ -1198,7 +1195,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
         identityId: this.options.identity.id, incarnation: this.ownerIncarnation,
         localStateDir: this.options.transportStateDir,
         onLost: error => this.#transportLostNow(error),
-        onSuspended: error => this.#transportSuspendedNow(error),
+        onSuspended: error => this.#transportLostNow(error),
       });
       this.#transportLease = lease;
       this.#transportReconnectUnsubscribe = transport.onVerifiedReconnect?.(() => {

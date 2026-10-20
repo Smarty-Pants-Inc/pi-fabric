@@ -441,7 +441,7 @@ const finiteHostTimestamps = (record: FabricHostRecord): boolean =>
   Number.isFinite(record.startedAt) && Number.isFinite(record.updatedAt) && Number.isFinite(record.expiresAt);
 
 const PARTICIPANT_KINDS = new Set(["root", "agent", "actor", "provider"]);
-const PARTICIPANT_TRANSPORTS = new Set(["auto", "process", "tmux", "screen", "localterm", "herdr", "host", "hosted"]);
+const PARTICIPANT_TRANSPORTS = new Set(["auto", "process", "sandbox", "tmux", "screen", "localterm", "herdr", "host", "hosted"]);
 
 const carriesRemoteHost = (value: unknown): value is Record<string, unknown> =>
   isObject(value) && Object.hasOwn(value, "remoteHost") && value.remoteHost !== undefined;

@@ -8,6 +8,7 @@ import { parsePerCallRouting } from "./agents/per-call-config.js";
 import { normalizeAgentRouterConfig, type FabricAgentRouterConfig } from "./agents/router-config.js";
 export type { FabricAgentRouterConfig } from "./agents/router-config.js";
 import { normalizeAgentPlacement, type AgentPlacementConfig } from "./agents/placement-config.js";
+import type { SandboxTransportConfig } from "./transport/sandbox/types.js";
 import { normalizePlacementApiConfig, type PlacementApiConfig } from "./placement/config.js";
 export type { PlacementApiConfig } from "./placement/config.js";
 import { normalizeWakeTextConfig, type FabricWakeTextConfig } from "./actors/wake-text.js";
@@ -53,6 +54,7 @@ type FabricApprovalMode = "allow" | "ask" | "auto" | "deny";
 export type FabricAgentTransport =
   | "auto"
   | "process"
+  | "sandbox"
   | "tmux"
   | "screen"
   | "localterm"
@@ -252,6 +254,7 @@ export interface FabricAgentConfig {
   processMemoryMaxBytes?: number;
   /** Host-only opt-in process task placement; workspace files cannot override it. */
   placement?: AgentPlacementConfig;
+  sandbox: SandboxTransportConfig;
   /** Host-only Placement API client; absent means the legacy path is unchanged. */
   placementApi?: PlacementApiConfig;
   /** User/workspace Pi default; package defaults intentionally leave this unset. */
@@ -1033,6 +1036,7 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     runner: "pi",
     transport: "process",
     processMemoryMaxBytes: DEFAULT_PROCESS_MEMORY_MAX_BYTES,
+    sandbox: { enabled: false, template: "smarty-proof-agent", readyTimeoutMs: 90_000 },
     deniedModels: [],
     modelExceptionsPath: MODEL_EXCEPTIONS_PATH,
     modelPolicy: {
@@ -1329,12 +1333,27 @@ const prewalkModeValue = (
 ): FabricPrewalkMode =>
   value === "in-place" || value === "trajectory" ? value : fallback;
 
+const sandboxPlacementUrlValue = (value: unknown): string => {
+  const candidate = value === undefined ? "http://smarty-placement.smarty-island.svc:8080" : value;
+  if (typeof candidate !== "string" || candidate.length > 512) throw new Error("Invalid agents.sandbox.placementUrl");
+  let url: URL;
+  try { url = new URL(candidate); } catch { throw new Error("Invalid agents.sandbox.placementUrl"); }
+  const octets = url.hostname.split(".");
+  const tailnetIp = octets.length === 4 && octets.every(part => /^\d{1,3}$/u.test(part) && Number(part) <= 255) &&
+    Number(octets[0]) === 100 && Number(octets[1]) >= 64 && Number(octets[1]) <= 127;
+  const service = url.hostname === "smarty-placement.smarty-island.svc" && url.port === "8080";
+  if (url.protocol !== "http:" || url.username || url.password || url.pathname !== "/" || url.search || url.hash ||
+    !(service || tailnetIp && url.port === "30880")) throw new Error("agents.sandbox.placementUrl must use the in-cluster HTTP endpoint or a tailnet IPv4 NodePort");
+  return url.origin;
+};
+
 const transportValue = (
   value: unknown,
   fallback: FabricAgentTransport,
 ): FabricAgentTransport =>
   value === "auto" ||
   value === "process" ||
+  value === "sandbox" ||
   value === "tmux" ||
   value === "screen" ||
   value === "localterm" ||
@@ -1492,6 +1511,16 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
   const prewalk = objectValue(input.prewalk);
   const agents = objectValue(input.agents);
   const placement = normalizeAgentPlacement(agents.placement);
+  const sandbox = objectValue(agents.sandbox);
+  const sandboxTemplate = sandbox.template === undefined ? DEFAULT_FABRIC_CONFIG.agents.sandbox.template
+    : typeof sandbox.template === "string" && /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/u.test(sandbox.template)
+      ? sandbox.template : (() => { throw new Error("Invalid agents.sandbox.template"); })();
+  const sandboxConfig: SandboxTransportConfig = {
+    enabled: booleanValue(sandbox.enabled, DEFAULT_FABRIC_CONFIG.agents.sandbox.enabled),
+    template: sandboxTemplate,
+    ...(sandbox.placementUrl !== undefined ? { placementUrl: sandboxPlacementUrlValue(sandbox.placementUrl) } : {}),
+    readyTimeoutMs: boundedInteger(sandbox.readyTimeoutMs, DEFAULT_FABRIC_CONFIG.agents.sandbox.readyTimeoutMs, 1_000, 90_000),
+  };
   const placementApi = normalizePlacementApiConfig(agents.placementApi);
   const claude = objectValue(agents.claude);
   const veda = objectValue(agents.veda);
@@ -1812,6 +1841,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
         ? { processSlice: agents.processSlice } : {}),
       processMemoryMaxBytes: processMemoryMaxBytesValue(agents.processMemoryMaxBytes),
       ...(placement ? { placement } : {}),
+      sandbox: sandboxConfig,
       ...(placementApi ? { placementApi } : {}),
       ...(router ? { router } : {}),
       ...(agentModel ? { model: agentModel } : {}),
@@ -2476,6 +2506,7 @@ const resolveFabricConfig = (
       agents: {
         ...(Object.hasOwn(agents, "processSlice") ? { processSlice: agents.processSlice } : {}),
         ...(Object.hasOwn(agents, "processMemoryMaxBytes") ? { processMemoryMaxBytes: agents.processMemoryMaxBytes } : {}),
+        ...(Object.hasOwn(agents, "sandbox") ? { sandbox: agents.sandbox } : {}),
         ...(Array.isArray(agents.deniedModels) ? { deniedModels: agents.deniedModels } : {}),
         ...(Array.isArray(requireReason) ? { modelPolicy: { requireReason } } : {}),
       },
@@ -2507,6 +2538,7 @@ const resolveFabricConfig = (
       const agents = { ...objectValue(document.agents) };
       delete agents.processSlice;
       delete agents.processMemoryMaxBytes; // Root-policy-only, like processSlice.
+      delete agents.sandbox; // Root-policy-only: only the host policy can enable island execution.
       const inheritedAgents = objectValue(merged.agents);
       // Agent-writable lists can add restrictions, never remove a root/default gate.
       const union = (base: unknown, extra: unknown): unknown[] => [
@@ -2531,6 +2563,7 @@ const resolveFabricConfig = (
       delete agents.processSlice;
       delete agents.processMemoryMaxBytes;
       delete agents.placement;
+      delete agents.sandbox; // Host-only: a lane cannot enable island execution.
       delete agents.placementApi; // Host-only Placement endpoint and timeouts.
       delete agents.deadRootFilter; // Host-only: a lane cannot drop the fleet's exemptions.
       delete agents.stuckPreparingMs; // Host-only: a lane cannot silence the stuck-preparing owner notice.

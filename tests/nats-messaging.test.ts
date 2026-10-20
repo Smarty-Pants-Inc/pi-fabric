@@ -23,6 +23,15 @@ const binary = resolveNatsBinary() ?? "";
 if (!binary && process.env.NATS_AUTH_REQUIRED === "1") throw new Error("NATS_AUTH_REQUIRED=1 but no nats-server executable was found");
 const wait = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
+const bounded = async <T>(promise: Promise<T>, label: string, timeoutMs = 5_000): Promise<T> => {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([promise, new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
+    })]);
+  } finally { if (timer) clearTimeout(timer); }
+};
+
 const consumerInfo = (inactiveThreshold?: number): ConsumerInfo => ({
   config: {
     durable_name: "policy-test",
@@ -166,6 +175,30 @@ describe.skipIf(!binary)("real nats-server Path B module", () => {
       const admin = await openJetStream(inspector);
       const info = await admin.manager.consumers.info(transportInboxStream("machine-a"), durable);
       expect(info.config.inactive_threshold).toBe(300 * 1_000_000_000);
+
+      const inboxAbort = new AbortController();
+      const inboxIterator = transport.inbox(inboxAbort.signal)[Symbol.asyncIterator]();
+      try {
+        const received = bounded(inboxIterator.next(), "ephemeral NATS inbox delivery");
+        const envelope = {
+          id: "ephemeral-inbox-reensure",
+          kind: "command" as const,
+          to: transport.self,
+          targetId: "ephemeral-inbox-target",
+          operation: "followUp",
+          from: { id: hostId, name: "ephemeral-test", kind: "main" as const },
+          body: { text: "re-ensure the existing ephemeral durable" },
+        };
+        await transport.send(envelope);
+        const result = await received;
+        expect(result.done).toBe(false);
+        if (result.done || !result.value) throw new Error("ephemeral inbox ended before delivery");
+        expect(result.value.payload).toMatchObject({ id: envelope.id, to: transport.self });
+        await result.value.ack();
+      } finally {
+        inboxAbort.abort();
+        await inboxIterator.return?.();
+      }
 
       await transport.close();
       let deleted = false;

@@ -29,7 +29,7 @@ import {
   validateMachine,
   hashToken,
 } from "./subjects.js";
-import { ensureTransportConsumer, ensureTransportStream, type TransportStreamPolicy } from "./provision.js";
+import { ensureTransportConsumer, ensureTransportStream, type TransportConsumerPolicy, type TransportStreamPolicy } from "./provision.js";
 import { ADVISORY_CAPTURE_STREAM } from "./subjects.js";
 import { openNatsConnection, type NatsConnectionHandle, type NatsPermissionPolicy } from "./connection.js";
 import type { TlsOptions } from "@nats-io/transport-node";
@@ -40,6 +40,7 @@ const DEFAULT_MAX_MESSAGE_BYTES = 1_048_576;
 const DEFAULT_DUPLICATE_WINDOW_MS = 10 * 60 * 1_000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 5_000;
 const DEFAULT_EPHEMERAL_INACTIVE_SECONDS = 3_600;
+const EPHEMERAL_DELETE_TIMEOUT_MS = 1_000;
 const utf8 = new TextEncoder();
 const validMessageId = (id: string): boolean => id.length > 0 && id === id.trim() && !/[\u0000-\u001f\u007f]/.test(id);
 
@@ -150,6 +151,15 @@ const streamPolicy = (name: string, subjects: readonly string[], options: Resolv
   replicas: 1,
 });
 
+const transportConsumerPolicy = (options: ResolvedNatsOptions): TransportConsumerPolicy => ({
+  stream: transportInboxStream(options.machine),
+  durable: transportDurableName(options.hostId),
+  filterSubject: transportInboxFilter(options.machine, options.hostId),
+  description: JSON.stringify({ fabricHostId: options.hostId, machine: options.machine }),
+  maxAckPending: 128,
+  ...(options.ephemeralHost ? { inactiveThresholdNs: options.ephemeralInactiveSeconds * 1_000_000_000 } : {}),
+});
+
 const isTransportEnvelope = (value: unknown): value is TransportEnvelope => {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
   const candidate = value as Record<string, unknown>;
@@ -213,17 +223,10 @@ const openNatsSession = async (options: ResolvedNatsOptions, signal?: AbortSigna
       maxAgeMs: 0,
     }), options.provision);
     assertAlive();
-    const description = JSON.stringify({ fabricHostId: options.hostId, machine: options.machine });
-    const consumer = await ensureTransportConsumer(manager.consumers, {
-      stream: transportInboxStream(options.machine),
-      durable: transportDurableName(options.hostId),
-      filterSubject: transportInboxFilter(options.machine, options.hostId),
-      description,
-      maxAckPending: 128,
-      ...(options.ephemeralHost ? { inactiveThresholdNs: options.ephemeralInactiveSeconds * 1_000_000_000 } : {}),
-    });
+    const consumerPolicy = transportConsumerPolicy(options);
+    const consumer = await ensureTransportConsumer(manager.consumers, consumerPolicy);
     assertAlive();
-    if (consumer.config.description !== description) throw new TransportInvalidError("transport inbox owner description mismatch");
+    if (consumer.config.description !== consumerPolicy.description) throw new TransportInvalidError("transport inbox owner description mismatch");
     return { connection, js: connection.js, manager, kvStores: { leases, presence } };
   } catch (error) {
     await connection.close().catch(() => undefined);
@@ -545,9 +548,7 @@ class NatsTransportImpl implements FabricTransport {
     signal.throwIfAborted();
     if (this.#inboxActive) throw new TransportInvalidError("only one inbox iterator is allowed per transport");
     this.#inboxActive = true;
-    const durable = transportDurableName(this.self.hostId);
-    const filter = transportInboxFilter(this.self.machine, this.self.hostId);
-    const description = JSON.stringify({ fabricHostId: this.self.hostId, machine: this.self.machine });
+    const consumerPolicy = transportConsumerPolicy(this.#options);
     try {
       while (!signal.aborted && !this.#closed) {
         let session: NatsSession;
@@ -565,17 +566,11 @@ class NatsTransportImpl implements FabricTransport {
         controller.signal.addEventListener("abort", stop, { once: true });
         try {
           try {
-          const info = await ensureTransportConsumer(session.manager.consumers, {
-            stream: this.#stream,
-            durable,
-            filterSubject: filter,
-            description,
-            maxAckPending: 128,
-          });
-          if (info.config.filter_subject !== filter || info.config.description !== description) {
+          const info = await ensureTransportConsumer(session.manager.consumers, consumerPolicy);
+          if (info.config.filter_subject !== consumerPolicy.filterSubject || info.config.description !== consumerPolicy.description) {
             throw new TransportInvalidError("transport inbox owner/filter mismatch");
           }
-          const consumer = await session.js.consumers.get(this.#stream, durable);
+          const consumer = await session.js.consumers.get(this.#stream, consumerPolicy.durable);
           messages = await consumer.consume({ max_messages: 16, callback: (msg) => {
             if (!signal.aborted && !controller.signal.aborted && !this.#closed && this.#session === session && !queue.destroyed) queue.push(msg);
           } });
@@ -660,9 +655,14 @@ class NatsTransportImpl implements FabricTransport {
       try {
         if (session) {
           if (this.#options.ephemeralHost) {
+            let timer: ReturnType<typeof setTimeout> | undefined;
             try {
-              void session.manager.consumers.delete(this.#stream, transportDurableName(this.self.hostId)).catch(() => undefined);
+              await Promise.race([
+                session.manager.consumers.delete(this.#stream, transportDurableName(this.self.hostId)).then(() => undefined),
+                new Promise<void>((resolve) => { timer = setTimeout(resolve, EPHEMERAL_DELETE_TIMEOUT_MS); }),
+              ]);
             } catch { /* best-effort cleanup must not block shutdown */ }
+            finally { if (timer) clearTimeout(timer); }
           }
           await session.connection.close();
         }

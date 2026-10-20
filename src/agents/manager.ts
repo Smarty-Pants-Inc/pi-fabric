@@ -7,7 +7,7 @@ import { taskReturnAddressArguments, type TaskReturnAddress } from "./task-retur
 import type { SpawnRouterAdmission } from "./spawn-router.js";
 import { AgentWaitBoundError, describeWaitBound } from "./wait-bound.js";
 import { admitModelException, appendOpusPolicyLog, FabricModelExceptionDeniedError, isClaudeModel, type ModelExceptionEntry } from "./model-policy-log.js";
-import { normalizeAgentRequires } from "./input-validation.js";
+import { assertAgentRequiredInputsExist, normalizeAgentRequires } from "./input-validation.js";
 import { AgentInputError, normalizeAgentCapabilityTokens } from "../host-compatibility.js";
 import {
   childThinkingBounds,
@@ -2690,6 +2690,11 @@ export class AgentManager {
         if (this.#closing) throw new Error("Fabric agent manager is closing");
         if (signal?.aborted) throw new Error("Agent launch aborted");
         assertAuthorized();
+        // Durable spawns must reject missing inputs on this owning host before the
+        // resident request commits. The process transport repeats its own check
+        // for session launches and selected local execution; remote placement has
+        // a separate target-side preflight.
+        if (residency === "durable") assertAgentRequiredInputsExist(requires, file => fs.existsSync(file));
         // Internal resident-host fence: preparation may outlive the caller's deadline.
         // Activation authority and durable request commit are independent obligations.
         beforeCommit?.(id);

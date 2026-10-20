@@ -387,6 +387,70 @@ describe("durable cwd validation", () => {
   });
 });
 
+describe("resident required-input refusal", () => {
+  it("refuses before the durable commit and cannot launch on replay", { timeout: 15_000 }, async () => {
+    const state = await rootHarness("resident-required-input-refusal");
+    const launches = launchLog(state.root);
+    for (const [key, value] of Object.entries(launches.env)) vi.stubEnv(key, value);
+    // Hold the request before manager preparation so the test can retain its exact
+    // envelope and replay it after the caller has recorded abandonment.
+    vi.stubEnv("PI_FABRIC_TEST_RESIDENT_DELAY_STAGE", "before_commit");
+    vi.stubEnv("PI_FABRIC_TEST_RESIDENT_DELAY_MS", "1000");
+    const host = new ResidentHost(state.config);
+    const client = new ResidencyClient({ config: state.config, mesh: state.mesh,
+      participants: state.participants, mainAgent: state.mainAgent, hostPath });
+    const missing = path.join(state.root, "not-present-required-input");
+    const requestsPath = path.join(state.config.residencyRoot, "requests");
+    const processingPath = path.join(state.config.residencyRoot, "processing");
+    try {
+      await host.start();
+      const spawn = client.spawnAgent({ task: "must not start", requires: [missing], runner: "pi",
+        transport: "process", residency: "durable" });
+      const spawnOutcome = spawn.then(() => undefined, (error: unknown) => error);
+      await waitFor(() => fs.readdirSync(processingPath).some(file => file.endsWith(".json")));
+      const processingFile = path.join(processingPath, fs.readdirSync(processingPath).find(file => file.endsWith(".json"))!);
+      const command = JSON.parse(fs.readFileSync(processingFile, "utf8")) as { requestId: string; [key: string]: unknown };
+
+      const refusal = await spawnOutcome;
+      expect(refusal).toBeInstanceOf(Error);
+      expect(refusal).toMatchObject({ name: "Error" });
+      expect(refusal).not.toHaveProperty("residentOutcome");
+      expect((refusal as Error).message).toBe(
+        `Missing required agent input requires[0]: ${missing}; path must exist on the selected host; no worker started`,
+      );
+      const decisionPath = path.join(state.config.residencyRoot, "decisions", `${command.requestId}.json`);
+      await waitFor(() => fs.existsSync(decisionPath));
+      expect(JSON.parse(fs.readFileSync(decisionPath, "utf8"))).toMatchObject({ requestId: command.requestId, state: "abandoned" });
+      const committed = fs.readdirSync(path.join(state.config.residencyRoot, "decisions"))
+        .map(file => JSON.parse(fs.readFileSync(path.join(state.config.residencyRoot, "decisions", file), "utf8")))
+        .filter(decision => decision.state === "committed");
+      expect(committed).toEqual([]);
+      expect(fs.readdirSync(path.join(state.config.residencyRoot, "agents"))).toEqual([]);
+      expect(host.agents.listForUi()).toEqual([]);
+
+      // Re-publishing the exact abandoned request must not pass the durable fence.
+      const replay = path.join(requestsPath, `${command.requestId}.json`);
+      fs.writeFileSync(replay, JSON.stringify(command), { mode: 0o600, flag: "wx" });
+      await waitFor(() => !fs.existsSync(replay));
+      await delay(100);
+      expect(host.agents.listForUi()).toEqual([]);
+      expect(launches.owned().filter(entry => entry.argv.includes(fakeWorker))).toEqual([]);
+
+      // Counterexample: the same durable path accepts and runs when its input exists.
+      const present = path.join(state.root, "present-required-input");
+      fs.writeFileSync(present, "available");
+      const allowed = await client.spawnAgent({ task: "valid required input", requires: [present], runner: "pi",
+        transport: "process", residency: "durable" });
+      await expect(client.waitAgent(allowed.id)).resolves.toMatchObject({ status: "completed" });
+      expect(launches.owned().some(entry => entry.argv.includes(fakeWorker))).toBe(true);
+    } finally {
+      await client.close();
+      await host.close();
+      await state.participants.close();
+    }
+  });
+});
+
 // smarty-dev#883: a timed-out start left its launcher (and Pi child) running
 // with no owner. The client must end the launcher it spawned.
 describe.skipIf(process.platform === "win32")("resident host start timeout", () => {

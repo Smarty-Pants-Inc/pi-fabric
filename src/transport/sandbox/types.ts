@@ -90,7 +90,7 @@ export interface SandboxTaskResult {
 /** The owning runtime matches PI_FABRIC_RUN_ID presence to runId, then uses followUp and the child's run-prefixed result return path. */
 export interface SandboxMesh {
   waitForPresence(runId: string, options: { timeoutMs: number; signal?: AbortSignal }): Promise<SandboxParticipant>;
-  deliverTask(childSession: string, text: string): Promise<void>;
+  deliverTask(childSession: string, text: string, signal?: AbortSignal): Promise<void>;
   awaitResult(childSession: string, runId: string, deadline: number, signal?: AbortSignal): Promise<SandboxTaskResult>;
   stop?(childSession: string, runId: string): Promise<{ confirmed: boolean; reason?: string }>;
 }

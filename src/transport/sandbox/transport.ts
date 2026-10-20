@@ -257,7 +257,7 @@ export class SandboxTransport implements AgentTransportAdapter {
     const resultPrefix = `FABRIC-RESULT ${runId}\n`;
     const returnInstructions = `When complete, send exactly one follow-up to the spawner with the final answer. Call agents.followUp({ id: ${JSON.stringify(parentSession)}, message: ${JSON.stringify(resultPrefix)} + answer }). The message must begin with the exact prefix ${JSON.stringify(resultPrefix)}; append your final answer after it.`;
     const deliveredTask = `${task}\n\n${returnInstructions}`;
-    try { await mesh.deliverTask(child.id, deliveredTask); }
+    try { await mesh.deliverTask(child.id, deliveredTask, request.signal); }
     catch {
       base = { ...base, warnings: [...(base.warnings ?? []), "Task delivery acknowledgement was not received; awaiting the single result without retry."] };
       try { writeJsonAtomic(statusFile, base, { space: 2, durable: true }); } catch { /* the running status was persisted before the single delivery attempt */ }

@@ -86,7 +86,7 @@ export const createSandboxFabricMesh = (options: SandboxFabricMeshOptions): Sand
       throw new Error("NATS presence watch ended before the sandbox child joined");
     },
 
-    async deliverTask(childSession, text) {
+    async deliverTask(childSession, text, signal) {
       if (!canSend()) throw new Error("Fabric NATS control plane is not ready for sandbox task delivery");
       const bound = routes.get(childSession);
       const participant = participants.get(childSession, Date.now(), { fresh: true });
@@ -100,7 +100,7 @@ export const createSandboxFabricMesh = (options: SandboxFabricMeshOptions): Sand
         ownerIncarnation: route.ownerIncarnation,
         message: text,
         triggerTurn: true,
-      }, route.ownerIdentityId);
+      }, route.ownerIdentityId, { ...(signal ? { signal } : {}) });
     },
 
     awaitResult(childSession, runId, deadline, signal): Promise<SandboxTaskResult> {

@@ -8,8 +8,9 @@ export type SandboxPlacementStatus = "refused" | "delayed" | "admitted";
 export type SandboxTerminalState = "finished" | "failed" | "never-started";
 export type SandboxRunStatus = "completed" | "failed" | "stopped" | "timed_out";
 export type SandboxComplexity = "simple" | "normal" | "complex" | "delicate";
+export type SandboxProfile = "lead" | "lane" | "task" | "org" | "actor";
 
-/** Exact v1 intent fields. Prompt text is never part of this value. */
+/** Placement v1 intent fields plus the capacity-lead profile selector. Prompt text is never part of this value. */
 export interface SandboxSpawnIntent {
   v: 1;
   runId: string;
@@ -17,6 +18,7 @@ export interface SandboxSpawnIntent {
   org: string;
   parentSession: string;
   role: string;
+  profile: SandboxProfile;
   complexity: SandboxComplexity;
   model: string;
   thinking: string;
@@ -60,9 +62,10 @@ export interface SandboxBinding {
   admittedAt: string | null;
 }
 
-/** The PlacementClient implementation is injected by the integration owner. */
+/** HTTP adapter for the Placement v1 broker contract. */
 export interface SandboxPlacement {
   requestSpawn(intent: SandboxSpawnIntent, signal?: AbortSignal): Promise<SandboxSpawnResult>;
+  getSpawn(runId: string, signal?: AbortSignal): Promise<SandboxSpawnResult>;
   watchSpawn(runId: string, signal?: AbortSignal): AsyncIterable<SandboxSpawnResult>;
   getBinding(runId: string, signal?: AbortSignal): Promise<SandboxBinding>;
 }
@@ -84,7 +87,7 @@ export interface SandboxTaskResult {
   toolCalls?: number;
 }
 
-/** The owning runtime matches the child's PI_FABRIC_RUN_ID presence to the runId, never Pod/Claim names, then uses followUp and the child's return path. */
+/** The owning runtime matches PI_FABRIC_RUN_ID presence to runId, then uses followUp and the child's run-prefixed result return path. */
 export interface SandboxMesh {
   waitForPresence(runId: string, options: { timeoutMs: number; signal?: AbortSignal }): Promise<SandboxParticipant>;
   deliverTask(childSession: string, text: string): Promise<void>;
@@ -107,8 +110,9 @@ export interface SandboxTerminalKv {
 
 export interface SandboxTransportConfig {
   enabled: boolean;
-  /** Retained as deployment selection metadata; v1 SpawnIntent currently has no template field. */
+  /** Legacy deployment metadata; placement chooses the SandboxTemplate from profile. */
   template: string;
+  placementUrl?: string;
   readyTimeoutMs: number;
 }
 

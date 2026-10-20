@@ -2,12 +2,13 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import type { AgentTransportLaunch } from "../../agents/types.js";
-import type { SandboxComplexity, SandboxSpawnIntent } from "./types.js";
+import type { SandboxComplexity, SandboxProfile, SandboxSpawnIntent } from "./types.js";
 
 const RUN_ID = /^[a-z0-9](?:[a-z0-9-]{0,55}[a-z0-9])?$/;
 const NAME = /^[A-Za-z0-9][A-Za-z0-9_.:/@+-]{0,255}$/;
 const THINKING = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 const COMPLEXITIES = new Set<SandboxComplexity>(["simple", "normal", "complex", "delicate"]);
+const PROFILES = new Set<SandboxProfile>(["lead", "lane", "task", "org", "actor"]);
 
 export interface SandboxRepositoryContext {
   repository: string;
@@ -19,6 +20,7 @@ export interface SandboxIntentInput {
   cwd: string;
   needs: readonly string[];
   complexity?: SandboxComplexity;
+  profile?: SandboxProfile;
   parentSession: string;
   org: string;
   timeoutMs: number;
@@ -85,6 +87,8 @@ export const buildSandboxIntent = (input: SandboxIntentInput): SandboxSpawnInten
   if (!THINKING.has(thinking)) throw new Error("Invalid sandbox intent thinking");
   const complexity = input.complexity ?? "normal";
   if (!COMPLEXITIES.has(complexity)) throw new Error("Invalid sandbox intent complexity");
+  const profile = input.profile ?? "task";
+  if (!PROFILES.has(profile)) throw new Error("Invalid sandbox intent profile");
   if (!Number.isSafeInteger(input.timeoutMs) || input.timeoutMs < 1 || input.timeoutMs > 604_800_000 ||
     !Number.isSafeInteger(input.now) || !Number.isSafeInteger(input.now + input.timeoutMs)) {
     throw new Error("Invalid sandbox intent timeout");
@@ -102,6 +106,7 @@ export const buildSandboxIntent = (input: SandboxIntentInput): SandboxSpawnInten
     org,
     parentSession,
     role: "task-agent",
+    profile,
     complexity,
     model,
     thinking,

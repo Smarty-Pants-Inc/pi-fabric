@@ -101,6 +101,7 @@ import { buildSkillReferenceGuidance } from "./core/skill-references.js";
 import { createFabricExecTool } from "./fabric-exec-tool.js";
 import { FabricState } from "./fabric-state.js";
 import type { SessionChannel, SessionChannelOpenOptions } from "./transport/nats/session-channel.js";
+import { registerSessionChannelApi } from "./transport/nats/session-channel-api.js";
 import { FABRIC_THINKING_BOUNDS_ENV } from "./thinking.js";
 import { classifyToolResult } from "./repairs/classify.js";
 import { getActiveRepairCompiler } from "./repairs/active.js";
@@ -243,13 +244,11 @@ const reportInboxExpiry = async (pi: ExtensionAPI, inbox: RootInboxBatch | undef
 // symbol below, since their Pi predates it.
 type HostCapabilities = { triggeredMessageQueuesBehindPreflight?: unknown; promptPendingVisible?: unknown };
 const TEST_HOST_CAPABILITIES = Symbol.for("pi-fabric.test.hostCapabilities");
-const publishSessionChannelApi = (state: FabricState): void => {
-  const host = globalThis as unknown as { fabric?: Record<string, unknown> };
-  const previous = host.fabric && typeof host.fabric === "object" ? host.fabric : {};
+const publishSessionChannelApi = (pi: ExtensionAPI, state: FabricState): void => {
   const sessionChannel = Object.freeze({
     open: (options: SessionChannelOpenOptions): Promise<SessionChannel> => state.openSessionChannel(options),
   });
-  host.fabric = Object.freeze({ ...previous, sessionChannel });
+  registerSessionChannelApi(pi, sessionChannel, pi);
 };
 const hostQueuesTriggeredBehindPreflight = (pi: ExtensionAPI): boolean => {
   const injected = (globalThis as Record<symbol, HostCapabilities | undefined>)[TEST_HOST_CAPABILITIES];
@@ -307,7 +306,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     ...(FABRIC_ENTRY_IDENTITY ? { entryIdentity: FABRIC_ENTRY_IDENTITY } : {}),
     ...(options.managedHost ? {managedHost: options.managedHost} : {}),
   });
-  publishSessionChannelApi(state);
+  publishSessionChannelApi(pi, state);
   const directToolApproval = new FabricDirectToolApproval(
     pi,
     () => state.config,

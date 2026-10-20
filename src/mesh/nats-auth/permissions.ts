@@ -18,7 +18,7 @@ export type NatsRole = "agent" | "principal" | "maintainer" | "break-glass";
 export interface RoleTemplate {
   pub: { allow: string[]; deny: string[] };
   sub: { allow: string[] };
-  allow_responses?: { max: number };
+  allow_responses?: { readonly max: number };
 }
 
 export interface RoleStreams {
@@ -29,7 +29,7 @@ export interface RoleStreams {
 export class NatsPermissionsError extends Error {
   readonly field: string;
   constructor(field: string) {
-    // Never carries the offending value: stream names and roles come from caller configuration.
+    // Never carries the offending value: stream names, roles and orgs come from caller configuration.
     super(`invalid ${field}`);
     this.name = "NatsPermissionsError";
     this.field = field;
@@ -216,7 +216,6 @@ function pathBRuntime(roleMachine: string, machines: readonly string[] = [], org
   if (PATH_B_OPERATOR_MACHINE_PATTERN.test(roleMachine)) fail("machine");
   const inbox = `FABRIC_IN_${roleMachine}`;
   const privateInboxes = roleMachine === PATH_B_MACHINE_TAG ? machines.map((machine) => `FABRIC_IN_${pathBMachine(machine)}`) : [inbox];
-  const ownInbox = `_INBOX.{{subject()}}.>`;
   const allow = [
     `fabric.in.*.*.*.*.${roleMachine}`,
     `$JS.API.STREAM.INFO.${inbox}`,
@@ -249,30 +248,18 @@ function pathBRuntime(roleMachine: string, machines: readonly string[] = [], org
   ];
   if (org !== undefined) {
     const scopedOrg = serviceOrg(org);
-    allow.push(`fabric.svc.${scopedOrg}.*.*.*.events`);
+    // Alpha deliberately shares one org runtime user across agents and callers. That user can read
+    // service requests and race replies; its subject wildcard is the accepted same-org trust boundary.
+    const serviceSubject = `fabric.svc.${scopedOrg}.>`;
+    allow.push(serviceSubject);
     return {
       pub: { allow: pathBUnique(allow), deny },
-      sub: { allow: [ownInbox, `fabric.svc.${scopedOrg}.*.*.*.*`] },
-      allow_responses: { max: 1 },
+      sub: { allow: [OWN_INBOX, serviceSubject] },
+      allow_responses: { max: 16 },
     };
   }
-  return { pub: { allow: pathBUnique(allow), deny }, sub: { allow: [ownInbox] } };
+  return { pub: { allow: pathBUnique(allow), deny }, sub: { allow: [OWN_INBOX] } };
 }
-
-export function gatewayRoleTemplate(org: string): RoleTemplate {
-  const scopedOrg = serviceOrg(org);
-  return {
-    pub: {
-      allow: [...SESSION_CHANNEL_OPERATIONS.map((operation) => `fabric.svc.${scopedOrg}.*.*.*.${operation}`), USER_INFO],
-      deny: [],
-    },
-    sub: {
-      allow: [_INBOX_TEMPLATE, `fabric.svc.${scopedOrg}.*.*.*.events`],
-    },
-  };
-}
-
-const _INBOX_TEMPLATE = "_INBOX.{{subject()}}.>";
 
 function pathBOperator(roleMachine: string, machines: readonly string[]): PathBRoleTemplate {
   if (roleMachine !== PATH_B_MACHINE_TAG && !PATH_B_OPERATOR_MACHINE_PATTERN.test(roleMachine)) fail("machine");
@@ -309,11 +296,13 @@ function pathBOperator(roleMachine: string, machines: readonly string[]): PathBR
       `$JS.API.DIRECT.GET.${stream}.>`,
     ]),
   ];
-  return { pub: { allow: pathBUnique(allow), deny }, sub: { allow: [`_INBOX.{{subject()}}.>`] } };
+  return { pub: { allow: pathBUnique(allow), deny }, sub: { allow: [OWN_INBOX] } };
 }
 
 /** Compose Path B with the existing role only when the mint input explicitly opts in. */
 export function roleTemplateWithPathB(role: NatsRole | "operator", input: RoleStreams, machines: readonly string[] = [], org?: string): RoleTemplate {
+  // Supplying an org never bypasses validation, even for roles that receive no service grants.
+  if (org !== undefined) serviceOrg(org);
   if (role === "operator") {
     const path = pathBOperator(PATH_B_MACHINE_TAG, machines);
     const base = roleTemplate("maintainer", input);
@@ -341,6 +330,7 @@ export function roleTemplateWithPathB(role: NatsRole | "operator", input: RoleSt
 }
 
 export function pathBRoleTemplate(role: PathBRole, machine = PATH_B_MACHINE_TAG, machines: readonly string[] = [], org?: string): PathBRoleTemplate {
+  if (org !== undefined) serviceOrg(org);
   if (role === "agent") return pathBRuntime(pathBMachine(machine), machines, org);
   if (role === "operator") return pathBOperator(pathBMachine(machine), machines);
   throw new Error("invalid Path B role");

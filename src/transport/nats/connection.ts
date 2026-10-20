@@ -5,7 +5,7 @@ import { credsAuthenticator, type NatsConnection } from "@nats-io/nats-core";
 import { jetstream, jetstreamManager, type JetStreamClient, type JetStreamManager } from "@nats-io/jetstream";
 import { AuthorizationError, PermissionViolationError, connect, type NodeConnectionOptions, type Status, type TlsOptions } from "@nats-io/transport-node";
 import { pathBMachines } from "../../mesh/nats-auth/mint.js";
-import { PATH_B_OPERATOR_MACHINE_PATTERN, gatewayRoleTemplate, roleTemplateWithPathB } from "../../mesh/nats-auth/permissions.js";
+import { PATH_B_OPERATOR_MACHINE_PATTERN, roleTemplateWithPathB } from "../../mesh/nats-auth/permissions.js";
 import { validateMachine } from "./subjects.js";
 import { TransportUnavailableError } from "../types.js";
 
@@ -40,18 +40,12 @@ interface NatsConnectionCredentials extends NatsTransportSecurityOptions {
   readonly credentials: string;
 }
 
-export type NatsConnectionOptions =
-  | (NatsConnectionCredentials & NatsPermissionPolicy & {
-      /** The server-verified machine identity; must equal the single signed `machine:` tag. */
-      readonly machine: string;
-      /** Defaults to the scoped runtime agent. `operator` is for explicit admin report connections only. */
-      readonly role?: "agent" | "operator";
-    })
-  | (NatsConnectionCredentials & {
-      readonly role: "gateway";
-      /** Organization bound into the signed gateway permission template. */
-      readonly org: string;
-    });
+export type NatsConnectionOptions = NatsConnectionCredentials & NatsPermissionPolicy & {
+  /** The server-verified machine identity; must equal the single signed `machine:` tag. */
+  readonly machine: string;
+  /** Defaults to the scoped runtime agent. `operator` is for explicit admin report connections only. */
+  readonly role?: "agent" | "operator";
+};
 
 /** Bootstrap authority for admin provisioning only. Deliberately not exported from the package entry. */
 export interface NatsBootstrapConnectionOptions extends NatsTransportSecurityOptions {
@@ -86,6 +80,7 @@ const MESH = /^[0-9a-f]{32}$/;
 const MAX_MESHES = 64;
 const MAX_CREDENTIALS_BYTES = 64 * 1024;
 const MISMATCH = "NATS USER.INFO machine tag mismatch";
+const NATS_RESPONSE_PERMISSION_TTL_NS = 120_000_000_000;
 
 /**
  * Read a creds file through one descriptor: open (no symlink follow, nonblocking for FIFOs), fstat the same fd,
@@ -201,7 +196,7 @@ interface ExpectedPermissions {
   readonly pubDeny: ReadonlySet<string>;
   readonly subAllow: ReadonlySet<string>;
   readonly subDeny: ReadonlySet<string>;
-  readonly allowResponses?: { readonly max: number };
+  readonly responses?: { readonly max: number; readonly ttl: number };
 }
 
 /** Server-expanded scope for this signed user, built by the same templates and validators as mint. */
@@ -229,19 +224,7 @@ const expectedPermissions = (role: "agent" | "operator", machine: string, policy
   return {
     pubAllow: expand(template.pub.allow), pubDeny: expand(template.pub.deny),
     subAllow: expand(template.sub.allow), subDeny: new Set(),
-    ...(template.allow_responses ? { allowResponses: template.allow_responses } : {}),
-  };
-};
-
-const expectedGatewayPermissions = (org: string, auth: ReturnType<typeof readNatsCredentials>): ExpectedPermissions => {
-  const roles = tagValues(auth.tags, "role");
-  if (roles.length !== 1 || roles[0] !== "gateway") throw new Error(MISMATCH);
-  const template = gatewayRoleTemplate(org);
-  const expand = (subjects: readonly string[]): Set<string> => new Set(subjects.map((subject) =>
-    subject.replaceAll("{{subject()}}", auth.subject)));
-  return {
-    pubAllow: expand(template.pub.allow), pubDeny: expand(template.pub.deny),
-    subAllow: expand(template.sub.allow), subDeny: new Set(),
+    ...(template.allow_responses ? { responses: { ...template.allow_responses, ttl: NATS_RESPONSE_PERMISSION_TTL_NS } } : {}),
   };
 };
 
@@ -272,13 +255,14 @@ const verifyIdentity = async (nc: NatsConnection, timeoutMs: number, auth: Retur
   const data = isPlainObject(value) && isPlainObject(value.data) ? value.data : undefined;
   const permissions = data?.permissions;
   if (!data || data.user !== auth.subject || !isPlainObject(permissions) ||
-    Object.keys(permissions).some((key) => key !== "publish" && key !== "subscribe" && key !== "allow_responses")) throw new NatsAuthorizationError(MISMATCH);
+    Object.keys(permissions).some((key) => key !== "publish" && key !== "subscribe" && key !== "responses")) throw new NatsAuthorizationError(MISMATCH);
   const publish = permissionLists(permissions.publish);
   const subscribe = permissionLists(permissions.subscribe);
-  const allowResponses = permissions.allow_responses;
-  const responsesMatch = expected.allowResponses
-    ? isPlainObject(allowResponses) && Object.keys(allowResponses).length === 1 && allowResponses.max === expected.allowResponses.max
-    : allowResponses === undefined || allowResponses === null;
+  const responses = permissions.responses;
+  const responsesMatch = expected.responses
+    ? isPlainObject(responses) && Object.keys(responses).length === 2 &&
+      responses.max === expected.responses.max && responses.ttl === expected.responses.ttl
+    : responses === undefined || responses === null;
   if (!publish || !subscribe || !sameSet(publish.allow, expected.pubAllow) || !sameSet(publish.deny, expected.pubDeny) ||
     !sameSet(subscribe.allow, expected.subAllow) || !sameSet(subscribe.deny, expected.subDeny) || !responsesMatch) throw new NatsAuthorizationError(MISMATCH);
   return value;
@@ -368,12 +352,6 @@ export const openNatsConnection = async (options: NatsConnectionOptions): Promis
   options.signal?.throwIfAborted();
   refuseBypass(options);
   let expected: ExpectedPermissions | undefined;
-  if (options.role === "gateway") {
-    return open(options, (nc, timeoutMs, auth) => verifyIdentity(nc, timeoutMs, auth, expected!), (auth) => {
-      try { expected = expectedGatewayPermissions(options.org, auth); }
-      catch (cause) { throw new NatsAuthorizationError("NATS signed identity / permission policy mismatch", { cause }); }
-    });
-  }
   const role = options.role ?? "agent";
   if (typeof options.machine !== "string") throw new Error("NATS machine is required");
   const machine = validateMachine(options.machine);

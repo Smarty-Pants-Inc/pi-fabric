@@ -551,6 +551,8 @@ export class ResidentHost {
       identity: this.identity,
       reapDeadHosts: false,                                    // its session's runtime sweeps
       presencePass: async () => {
+        // Reuse host maintenance without delaying lease renewal on a backlog; no extra polling lifetime.
+        if (transport && config.mesh.nats.events === true) void this.mesh.retryEventPublications();
         await rootPresenceAlarms(this.mesh, this.identity, this.hostId,
           this.participants.list({ scope: "project", includeStale: true, fresh: true }), config.mesh.rootPresenceAlarmMs);
         await this.actors?.reconcileSessionOrphans();

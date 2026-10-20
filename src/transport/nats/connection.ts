@@ -24,6 +24,9 @@ export interface NatsPermissionPolicy {
   readonly custodyStream: string;
   readonly livenessStream: string;
   readonly pathBMachines: readonly string[];
+  /** Optional shared-org event grants; absent/false preserves the existing Path B scope. */
+  readonly events?: boolean;
+  readonly org?: string;
 }
 
 interface NatsTransportSecurityOptions {
@@ -208,7 +211,7 @@ const expectedPermissions = (role: "agent" | "operator", machine: string, policy
   } else if (!PATH_B_OPERATOR_MACHINE_PATTERN.test(machine) || meshes.length !== 0) {
     throw new Error(MISMATCH);
   }
-  const template = roleTemplateWithPathB(role, { custodyStream: policy.custodyStream, livenessStream: policy.livenessStream }, machines);
+  const template = roleTemplateWithPathB(role, { custodyStream: policy.custodyStream, livenessStream: policy.livenessStream }, machines, policy);
   const expand = (subjects: readonly string[]): Set<string> => new Set(subjects.flatMap((subject) => {
     const fixed = subject.replaceAll("{{subject()}}", auth.subject).replaceAll("{{tag(machine)}}", machine);
     const out = fixed.includes("{{tag(mesh)}}") ? meshes.map((mesh) => fixed.replaceAll("{{tag(mesh)}}", mesh)) : [fixed];
@@ -340,7 +343,13 @@ export const openNatsConnection = async (options: NatsConnectionOptions): Promis
   if (role !== "agent" && role !== "operator") throw new Error("NATS connection role must be agent or operator");
   if (typeof options.machine !== "string") throw new Error("NATS machine is required");
   const machine = validateMachine(options.machine);
-  const policy: NatsPermissionPolicy = { custodyStream: options.custodyStream, livenessStream: options.livenessStream, pathBMachines: options.pathBMachines };
+  const policy: NatsPermissionPolicy = {
+    custodyStream: options.custodyStream,
+    livenessStream: options.livenessStream,
+    pathBMachines: options.pathBMachines,
+    ...(options.events === undefined ? {} : { events: options.events }),
+    ...(options.org === undefined ? {} : { org: options.org }),
+  };
   let expected: ExpectedPermissions | undefined;
   return open(options, (nc, timeoutMs, auth) => verifyIdentity(nc, timeoutMs, auth, expected!), (auth) => {
     // Fail closed before dialing: missing/invalid policy or a signed identity that cannot match.

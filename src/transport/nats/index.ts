@@ -1,5 +1,7 @@
 export { openNatsTransport } from "./inbox.js";
 export { NatsAuthorizationError, openNatsConnection, readNatsCredentials } from "./connection.js";
+export { openNatsEventsPublisher } from "./events-publish.js";
+export { startNatsActorEventsConsumer } from "./events-consume.js";
 export type { NatsConnectionHandle, NatsConnectionOptions } from "./connection.js";
 export {
   KV_MARKER_TTL_MS,

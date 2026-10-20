@@ -151,6 +151,28 @@ export function roleTemplate(role: NatsRole, input: RoleStreams): RoleTemplate {
 export type PathBRole = "agent" | "operator";
 export interface PathBRoleTemplate extends RoleTemplate {}
 
+/** Alpha shared-org event grants; absent/false keeps the existing Path B scope unchanged. */
+export interface PathBEventsOptions {
+  events?: boolean;
+  org?: string;
+}
+
+function pathBEventAllows({ events, org }: PathBEventsOptions): string[] {
+  if (events !== undefined && typeof events !== "boolean") fail("events");
+  if (events !== true) return [];
+  if (typeof org !== "string" || /^[a-z0-9][a-z0-9-]{0,62}$/.exec(org)?.[0] !== org || org === "sys") fail("org");
+  // Shared org authority, NOT actor isolation: smarty-dev#15355. No github.> publish grant.
+  const streamOrg = org.toUpperCase().replaceAll("-", "_");
+  const streams = [`FABRIC_EV_${streamOrg}`, `GITHUB_${streamOrg}`];
+  return [
+    `fabric.ev.${org}.>`,
+    ...streams.flatMap(stream => [
+      ...["CREATE", "INFO", "MSG.NEXT", "DELETE"].map((verb) => `$JS.API.CONSUMER.${verb}.${stream}.>`),
+      `$JS.ACK.${stream}.>`,
+    ]),
+  ];
+}
+
 const PATH_B_MACHINE = /^[a-z0-9][a-z0-9-]{0,31}$/;
 const PATH_B_MACHINE_TAG = "{{tag(machine)}}";
 
@@ -204,12 +226,13 @@ const PATH_B_RESERVED_MUTATIONS = [
   "$JS.API.ACCOUNT.STREAM.CANCEL_MOVE.*.FABRIC_ADV",
 ];
 
-function pathBRuntime(roleMachine: string, machines: readonly string[] = []): PathBRoleTemplate {
+function pathBRuntime(roleMachine: string, machines: readonly string[] = [], events: PathBEventsOptions = {}): PathBRoleTemplate {
   if (PATH_B_OPERATOR_MACHINE_PATTERN.test(roleMachine)) fail("machine");
   const inbox = `FABRIC_IN_${roleMachine}`;
   const privateInboxes = roleMachine === PATH_B_MACHINE_TAG ? machines.map((machine) => `FABRIC_IN_${pathBMachine(machine)}`) : [inbox];
   const ownInbox = `_INBOX.{{subject()}}.>`;
   const allow = [
+    ...pathBEventAllows(events),
     `fabric.in.*.*.*.*.${roleMachine}`,
     `$JS.API.STREAM.INFO.${inbox}`,
     ...["CREATE", "INFO", "MSG.NEXT", "DELETE"].map((verb) => `$JS.API.CONSUMER.${verb}.${inbox}.>`),
@@ -281,7 +304,7 @@ function pathBOperator(roleMachine: string, machines: readonly string[]): PathBR
 }
 
 /** Compose Path B with the existing role only when the mint input explicitly opts in. */
-export function roleTemplateWithPathB(role: NatsRole | "operator", input: RoleStreams, machines: readonly string[] = []): RoleTemplate {
+export function roleTemplateWithPathB(role: NatsRole | "operator", input: RoleStreams, machines: readonly string[] = [], events: PathBEventsOptions = {}): RoleTemplate {
   if (role === "operator") {
     const path = pathBOperator(PATH_B_MACHINE_TAG, machines);
     const base = roleTemplate("maintainer", input);
@@ -292,7 +315,7 @@ export function roleTemplateWithPathB(role: NatsRole | "operator", input: RoleSt
   }
   const base = roleTemplate(role, input);
   if (role === "agent") {
-    const path = pathBRuntime(PATH_B_MACHINE_TAG, machines);
+    const path = pathBRuntime(PATH_B_MACHINE_TAG, machines, events);
     return {
       pub: { allow: pathBUnique([...base.pub.allow, ...path.pub.allow]), deny: pathBUnique([...base.pub.deny, ...path.pub.deny]) },
       sub: { allow: path.sub.allow },
@@ -307,8 +330,8 @@ export function roleTemplateWithPathB(role: NatsRole | "operator", input: RoleSt
   };
 }
 
-export function pathBRoleTemplate(role: PathBRole, machine = PATH_B_MACHINE_TAG, machines: readonly string[] = []): PathBRoleTemplate {
-  if (role === "agent") return pathBRuntime(pathBMachine(machine), machines);
+export function pathBRoleTemplate(role: PathBRole, machine = PATH_B_MACHINE_TAG, machines: readonly string[] = [], events: PathBEventsOptions = {}): PathBRoleTemplate {
+  if (role === "agent") return pathBRuntime(pathBMachine(machine), machines, events);
   if (role === "operator") return pathBOperator(pathBMachine(machine), machines);
   throw new Error("invalid Path B role");
 }

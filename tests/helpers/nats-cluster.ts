@@ -65,6 +65,8 @@ export interface PathBIdentity {
 
 export interface PathBHarnessOptions {
   readonly binary?: string;
+  /** Opt into the shared runtime user's org-scoped session-channel grants. */
+  readonly org?: string;
   /** Issue real CLI artifacts without changing the default hand-built fault-injection fixture. */
   readonly identityFactory?: (root: string) => PathBIdentity | Promise<PathBIdentity>;
   /** Deliberately misissued grants for fail-closed identity-check tests. */
@@ -114,11 +116,12 @@ function createTestTls(root: string, dnsNames: readonly string[], ipAddresses: r
 }
 
 function faultedAgentTemplate(options: PathBHarnessOptions): RoleTemplate {
-  const base = roleTemplateWithPathB("agent", { custodyStream: PATH_B_PERMISSION_POLICY.custodyStream, livenessStream: PATH_B_PERMISSION_POLICY.livenessStream }, PATH_B_MACHINES);
+  const base = roleTemplateWithPathB("agent", { custodyStream: PATH_B_PERMISSION_POLICY.custodyStream, livenessStream: PATH_B_PERMISSION_POLICY.livenessStream }, PATH_B_MACHINES, options.org);
   const removed = new Set(options.removeAgentDeny ?? []);
   return {
     pub: { allow: [...base.pub.allow, ...(options.additionalAgentPublish ?? [])], deny: base.pub.deny.filter((subject) => !removed.has(subject)) },
     sub: { allow: [...base.sub.allow, ...(options.additionalAgentSubscribe ?? [])] },
+    ...(base.allow_responses ? { allow_responses: base.allow_responses } : {}),
   };
 }
 
@@ -369,6 +372,7 @@ export class PathBHarness {
           const tags = role === "agent"
             ? [`role:${role}`, `machine:${machine}`, ...[PATH_B_TEST_MESH, ...(options.additionalAgentMeshes ?? [])].map((mesh) => `mesh:${mesh}`)]
             : [`role:${role}`, `machine:${machine}`];
+          if (options.org !== undefined && role === "agent") tags.push(`org:${options.org}`);
           const jwt = encodeUserJwt(
             {
               name,

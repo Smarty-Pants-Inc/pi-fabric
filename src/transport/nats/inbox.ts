@@ -33,6 +33,7 @@ import {
 import { ensureTransportConsumer, ensureTransportStream, type TransportConsumerPolicy, type TransportStreamPolicy } from "./provision.js";
 import { ADVISORY_CAPTURE_STREAM } from "./subjects.js";
 import { openNatsConnection, type NatsConnectionHandle, type NatsPermissionPolicy } from "./connection.js";
+import { NatsSessionChannelManager, type SessionChannel, type SessionChannelIdentity, type SessionChannelOpenOptions } from "./session-channel.js";
 import type { TlsOptions } from "@nats-io/transport-node";
 import {
   LEASE_TTL_MS, PRESENCE_TTL_MS, PLACEMENT_TERMINAL_BUCKET, PLACEMENT_TERMINAL_TTL_MS,
@@ -72,6 +73,7 @@ export interface NatsTransportOptions extends NatsPermissionPolicy {
 
 type OpenOptions = NatsTransportOptions | FabricTransportOptions;
 type ResolvedNatsOptions = Required<Pick<NatsTransportOptions, "servers" | "machine" | "hostId" | "credentials" | "custodyStream" | "livenessStream" | "pathBMachines" | "maxBytes" | "maxMessageBytes" | "duplicateWindowMs" | "requestTimeoutMs" | "provision" | "ephemeralHost" | "ephemeralInactiveSeconds">> & {
+  readonly org?: string;
   readonly name?: string;
   readonly tls?: TlsOptions;
   readonly signal?: AbortSignal;
@@ -98,6 +100,7 @@ const normalizeOptions = (options: OpenOptions): ResolvedNatsOptions => {
       custodyStream: options.custodyStream,
       livenessStream: options.livenessStream,
       pathBMachines: options.pathBMachines,
+      ...(options.org === undefined ? {} : { org: options.org }),
       ...(options.tls === undefined ? {} : { tls: options.tls }),
       maxBytes: options.maxBytes ?? DEFAULT_MAX_BYTES,
       maxMessageBytes: options.maxMessageBytes ?? DEFAULT_MAX_MESSAGE_BYTES,
@@ -111,7 +114,7 @@ const normalizeOptions = (options: OpenOptions): ResolvedNatsOptions => {
   }
   const config = options.config as unknown as { nats?: {
     servers?: string | readonly string[]; machine?: string; credentials?: string;
-    custodyStream?: string; livenessStream?: string; pathBMachines?: readonly string[]; tls?: TlsOptions;
+    custodyStream?: string; livenessStream?: string; pathBMachines?: readonly string[]; org?: string; tls?: TlsOptions;
     ephemeralHost?: boolean; ephemeralInactiveSeconds?: number;
   } };
   const nats = config.nats;
@@ -133,6 +136,7 @@ const normalizeOptions = (options: OpenOptions): ResolvedNatsOptions => {
     custodyStream: nats?.custodyStream as string,
     livenessStream: nats?.livenessStream as string,
     pathBMachines: nats?.pathBMachines as readonly string[],
+    ...(nats?.org === undefined ? {} : { org: nats.org }),
     ...(nats?.tls === undefined ? {} : { tls: nats.tls }),
     maxBytes: DEFAULT_MAX_BYTES,
     maxMessageBytes: DEFAULT_MAX_MESSAGE_BYTES,
@@ -203,6 +207,7 @@ const openNatsSession = async (options: ResolvedNatsOptions, signal?: AbortSigna
     custodyStream: options.custodyStream,
     livenessStream: options.livenessStream,
     pathBMachines: options.pathBMachines,
+    ...(options.org === undefined ? {} : { org: options.org }),
     ...(options.tls === undefined ? {} : { tls: options.tls }),
     timeoutMs: options.requestTimeoutMs,
     ...(signal === undefined ? {} : { signal }),
@@ -356,6 +361,7 @@ class NatsTransportImpl implements FabricTransport {
   readonly #kvStores: Readonly<Record<"leases" | "presence", TransportKv>>;
   #placementTerminalStore: { readonly epoch: number; readonly store: NatsKvStore } | undefined;
   readonly #waiters = new Set<ReadyWaiter>();
+  readonly #sessionChannels = new NatsSessionChannelManager();
 
   private constructor(session: NatsSession, options: ResolvedNatsOptions) {
     this.#session = session;
@@ -426,6 +432,7 @@ class NatsTransportImpl implements FabricTransport {
 
   #installSession(session: NatsSession): void {
     this.#session = session;
+    this.#sessionChannels.setConnection(session.connection.nc);
     session.unsubscribe = session.connection.onStatus((status) => {
       if (status.type === "disconnect" || status.type === "close") this.#loseSession(session);
     });
@@ -436,6 +443,7 @@ class NatsTransportImpl implements FabricTransport {
   #loseSession(session: NatsSession): void {
     if (this.#closed || this.#session !== session) return;
     this.#session = undefined;
+    this.#sessionChannels.setConnection(undefined);
     this.#epoch += 1;
     this.#activeInbox?.controller.abort();
     session.unsubscribe?.();
@@ -659,6 +667,12 @@ class NatsTransportImpl implements FabricTransport {
     }
   }
 
+  openSessionChannel(identity: SessionChannelIdentity, options: SessionChannelOpenOptions): Promise<SessionChannel> {
+    if (!this.#options.org) throw new Error("mesh.nats.org is required to open a Fabric session channel");
+    if (!this.#session) throw this.#unavailable();
+    return this.#sessionChannels.open({ ...identity, org: this.#options.org, hostId: this.self.hostId }, options);
+  }
+
   async drainState(signal?: AbortSignal): Promise<{ pending: number; ackPending: number }> {
     const session = this.#assertOpen();
     signal?.throwIfAborted();
@@ -672,6 +686,7 @@ class NatsTransportImpl implements FabricTransport {
     this.#closed = true;
     this.#options.signal?.removeEventListener("abort", this.#onOwnerAbort);
     this.#closeController.abort(this.#options.signal?.reason);
+    this.#sessionChannels.close();
     this.#activeInbox?.controller.abort();
     this.#rejectWaiters(new TransportUnavailableError("NATS transport is closed"));
     const session = this.#session;

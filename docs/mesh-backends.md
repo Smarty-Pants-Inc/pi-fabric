@@ -301,3 +301,7 @@ this reason. An R3 cluster needs these TCP ports opened on `tailscale0` only:
 
 That ACL change needs the product owner's yes (smarty-dev#7504 c6095415747). Until then, tests run
 on one host, or across hosts through `ssh -L` tunnels.
+
+### NATS session channels
+
+See the [NATS session-channel guide](session-channel.md) for the in-process Pi API, request/reply and event wire format, replay-cache behavior, presence discovery, and alpha trust boundary.

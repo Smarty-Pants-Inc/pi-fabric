@@ -6,7 +6,7 @@ const keys = ["PI_FABRIC_MESH_TRANSPORT", "PI_FABRIC_MESH_HOST_TRANSPORT", "PI_F
 const saved = new Map<string, string | undefined>();
 beforeEach(() => { for (const key of keys) { saved.set(key, process.env[key]); delete process.env[key]; } });
 afterEach(() => { for (const key of keys) { const value = saved.get(key); if (value === undefined) delete process.env[key]; else process.env[key] = value; } saved.clear(); });
-const nats = () => ({ operatorMachine: "fabric-ops", machine: "ryzen2", credentials: "/not-read/user.creds",
+const nats = () => ({ org: "smarty-pants-inc", operatorMachine: "fabric-ops", machine: "ryzen2", credentials: "/not-read/user.creds",
   servers: ["tls://intel1.tail62219a.ts.net:4222"], custodyStream: "FABRIC_CUSTODY", livenessStream: "FABRIC_LIVENESS",
   pathBMachines: ["ryzen2", "ryzen4"], tls: { caFile: "/not-read/ca.pem" } });
 const config = (value: Record<string, unknown>) => ({ mesh: { transport: "nats", hostTransport: "nats", stateBackend: "file", nats: value } });
@@ -18,7 +18,7 @@ const refuses = (value: Record<string, unknown>, field?: string) => {
 describe.sequential("NATS transport policy and TLS configuration", () => {
   it("normalizes the complete policy without reading credentials or CA and copies mutable inputs", () => {
     const input = nats(), before = structuredClone(input), actual = normalizeFabricConfig(config(input)).mesh.nats;
-    expect(actual).toEqual({ replicas: 1, inboxLanes: 8, ...input });
+    expect(actual).toEqual({ replicas: 1, inboxLanes: 8, ephemeralHost: false, ephemeralInactiveSeconds: 3_600, ...input });
     expect(actual).not.toBe(input); expect(actual.servers).not.toBe(input.servers);
     expect(actual.pathBMachines).not.toBe(input.pathBMachines); expect(actual.tls).not.toBe(input.tls);
     expect(input).toEqual(before);
@@ -68,7 +68,8 @@ describe.sequential("NATS transport policy and TLS configuration", () => {
   });
   it.each([
     { custodyStream: "" }, { custodyStream: "FABRIC_MESH_private" }, { livenessStream: "fabric_custody" },
-    { livenessStream: "WITH SPACE" }, { pathBMachines: [] }, { pathBMachines: ["ryzen2", "ryzen2"] },
+    { livenessStream: "WITH SPACE" }, { org: "Smarty-Pants-Inc" }, { org: "two.parts" }, { org: "x*" },
+    { pathBMachines: [] }, { pathBMachines: ["ryzen2", "ryzen2"] },
     { pathBMachines: ["fabric-ops"] }, { pathBMachines: ["ryzen2\n"] }, { pathBMachines: new Array(1) },
   ])("refuses malformed or reserved policy %j", change => refuses({ ...nats(), ...change }));
   it("preserves exact ordinary FILE defaults and ignores NATS-only policy", () => {
@@ -78,7 +79,7 @@ describe.sequential("NATS transport policy and TLS configuration", () => {
   it("retains only approved FILE rollback machine and hold authority", () => {
     const rollbackHoldUntil = "2030-01-02T03:04:05Z";
     expect(normalizeFabricConfig({ mesh: { transport: "file", nats: { ...nats(), rollbackHoldUntil } } }).mesh.nats)
-      .toEqual({ replicas: 1, inboxLanes: 8, machine: "ryzen2", rollbackHoldUntil });
+      .toEqual({ replicas: 1, inboxLanes: 8, ephemeralHost: false, ephemeralInactiveSeconds: 3_600, machine: "ryzen2", rollbackHoldUntil });
   });
   it("inherits a whitelisted independent policy snapshot across different child workspace settings", () => {
     const parent = normalizeFabricConfig(config(nats())).mesh, before = structuredClone(parent);

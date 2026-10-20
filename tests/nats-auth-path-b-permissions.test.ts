@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { PATH_B_ADVISORY_DURABLE, PATH_B_OPERATOR_MACHINE, pathBRoleTemplate, roleTemplate, roleTemplateWithPathB } from "../src/mesh/nats-auth/permissions.js";
+import { NatsPermissionsError, PATH_B_ADVISORY_DURABLE, PATH_B_OPERATOR_MACHINE, pathBRoleTemplate, roleTemplate, roleTemplateWithPathB, type RoleTemplate } from "../src/mesh/nats-auth/permissions.js";
 
 const matches = (pattern: string, subject: string): boolean => {
   const p = pattern.split("."), s = subject.split(".");
@@ -9,8 +9,10 @@ const matches = (pattern: string, subject: string): boolean => {
   }
   return p.length === s.length;
 };
-const mayPublish = (template: ReturnType<typeof pathBRoleTemplate>, subject: string): boolean =>
+const mayPublish = (template: RoleTemplate, subject: string): boolean =>
   template.pub.allow.some(pattern => matches(pattern, subject)) && !template.pub.deny.some(pattern => matches(pattern, subject));
+const maySubscribe = (template: RoleTemplate, subject: string): boolean =>
+  template.sub.allow.some(pattern => matches(pattern.replaceAll("{{subject()}}", "fixture-user"), subject));
 
 // Keep reason (#4280): pure grant-shape checks catch trust-boundary wildcard regressions before
 // account signing. The CLI-to-real-broker test is the real-path proof; these do not replace it.
@@ -41,6 +43,36 @@ describe("Path B NATS grants", () => {
     expect(template.pub.deny).not.toContain("$JS.API.STREAM.MSG.GET.FABRIC_IN_*");
     expect(template.pub.deny).not.toContain("$JS.API.DIRECT.GET.FABRIC_IN_*.>");
     expect(template.sub.allow).toEqual(["_INBOX.{{subject()}}.>"]);
+  });
+
+  it("grants the shared runtime role org-scoped service access and reply permissions", () => {
+    const org = "smarty-pants-inc";
+    const streams = { custodyStream: "TEST_CUSTODY", livenessStream: "TEST_LIVENESS" };
+    const runtime = roleTemplateWithPathB("agent", streams, ["ryzen1", "ryzen2"], org);
+    const serviceScope = `fabric.svc.${org}.>`;
+    expect(runtime.pub.allow).toContain(serviceScope);
+    expect(runtime.sub.allow).toContain(serviceScope);
+    expect(runtime.allow_responses).toEqual({ max: 16 });
+    expect(runtime.pub.allow).toContain("$JS.FC.KV_fabric_presence.>");
+    expect(runtime.pub.allow).toContain("$JS.FC.KV_fabric_leases.>");
+    for (const host of ["ryzen1", "ryzen2"]) {
+      for (const operation of ["snapshot", "history", "input", "model", "abort"]) {
+        const subject = `fabric.svc.${org}.${host}.session.service.${operation}`;
+        expect(mayPublish(runtime, subject), subject).toBe(true);
+        expect(maySubscribe(runtime, subject), subject).toBe(true);
+      }
+      const events = `fabric.svc.${org}.${host}.session.service.events`;
+      expect(mayPublish(runtime, events), events).toBe(true);
+      expect(maySubscribe(runtime, events), events).toBe(true);
+    }
+    expect(mayPublish(runtime, "fabric.svc.other.ryzen1.session.service.input")).toBe(false);
+    expect(maySubscribe(runtime, "fabric.svc.other.ryzen1.session.service.input")).toBe(false);
+    for (const valid of ["s", "0", "smarty-pants", "a".repeat(63)]) {
+      expect(pathBRoleTemplate("agent", "ryzen1", [], valid).pub.allow).toContain(`fabric.svc.${valid}.>`);
+    }
+    for (const invalid of ["", ".", "smarty.other", "smarty.*", "smarty.>", "*", ">", "Smarty", "smarty_org", "a".repeat(64)]) {
+      expect(() => roleTemplateWithPathB("agent", streams, ["ryzen1"], invalid)).toThrow(NatsPermissionsError);
+    }
   });
 
   it("gives the operator metadata and fixed advisory rights without reads, relays or lifecycle authority", () => {

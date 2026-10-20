@@ -626,6 +626,8 @@ Extension-enabled Pi children inherit the parent’s full-code mode, including o
 
 A session actor is suspended, not stopped, when its Main reloads or exits. If the Main stays gone past the restart grace (120 s, with proof that its process died), a peer Main or its resident host retires the actor in its registry: it is `stopped` with `stopReason: "host-exit"` and a `sessionOrphan` marker. When the same session starts again (`pi --session <id>`, a herdr relaunch, or a resume), Fabric restarts every such actor in that session. Each keeps its id, instructions, filters, topics and mailbox. It resumes from the session's saved mesh cursor, so a long downtime replays only the last few minutes. Fabric never restarts a stopped actor whose `stopReason` is `explicit` (`agents.stop` or `agents.remove`) or `directive` (the actor stopped itself). It also never restarts an older stopped row that has no reason or root-gone marker. The owning Main removes a stopped actor of its own with `agents.remove({ id })` (smarty-dev#9241).
 
+A callerless delivery with an explicit stable replay ID, delivery ID or coalesce key that ends before inference is re-queued for that same actor once. If the retry also ends before inference, Fabric emits one addressed `ops.owner` event of kind `actor.run.unstarted` naming the actor, delivery ID and both run IDs, then consumes the item; a run that started inference is not re-driven. Removal never re-drives. Terminal run status records `stopIntent` with the reason, request time, caller `{ kind, id }` and path (including `agents.stop`, `actors.stop`, `actors.remove`, `session-reset` and `residency-teardown`); legacy status without caller provenance remains readable.
+
 ```ts
 const audit = await agents.spawn({
   name: "integration-audit",

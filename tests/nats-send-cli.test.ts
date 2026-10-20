@@ -23,6 +23,7 @@ const cliEntry = fileURLToPath(new URL(builtNodeCli ? "../dist/cli/index.js" : "
 const cliRuntime = builtNodeCli ? "node" : process.versions.bun ? process.execPath : "bun";
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 const tokenFor = (id: string) => createHash("sha256").update(id).digest("hex").slice(0, 32);
+const UUID_PATTERN_FOR_TEST = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const brokerSuite = describe.skipIf(!binary || process.platform !== "linux");
 
 let broker: PathBHarness | undefined;
@@ -41,12 +42,20 @@ async function provision(fixture: PathBHarness): Promise<void> {
   }
 }
 
-function runCli(args: string[], env: NodeJS.ProcessEnv, stdin = ""): Promise<{ code: number | null; signal: NodeJS.Signals | null; stdout: string; stderr: string }> {
+function runCli(
+  args: string[], env: NodeJS.ProcessEnv, stdin = "", onFirstLine?: (line: string) => void,
+): Promise<{ code: number | null; signal: NodeJS.Signals | null; stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
     const child = spawn(cliRuntime, [cliEntry, "nats", "send", ...args], { cwd: repoRoot, env, stdio: ["pipe", "pipe", "pipe"] });
     child.stdin.end(stdin);
-    let stdout = "", stderr = "";
-    child.stdout.setEncoding("utf8").on("data", (chunk: string) => { stdout += chunk; });
+    let stdout = "", stderr = "", firstLineDelivered = false;
+    child.stdout.setEncoding("utf8").on("data", (chunk: string) => {
+      stdout += chunk;
+      if (onFirstLine && !firstLineDelivered) {
+        const newline = stdout.indexOf("\n");
+        if (newline >= 0) { firstLineDelivered = true; onFirstLine(stdout.slice(0, newline)); }
+      }
+    });
     child.stderr.setEncoding("utf8").on("data", (chunk: string) => { stderr += chunk; });
     child.once("error", reject);
     child.once("close", (code, signal) => resolve({ code, signal, stdout, stderr }));
@@ -90,12 +99,13 @@ afterAll(async () => { await broker?.stop(); });
 
 brokerSuite("pi-fabric nats send over a real authenticated broker", () => {
   const scenarios = [
-    { label: "followUp immediate reply", kind: "followUp", inputMode: "argv", awaitReplySeconds: 5, sendReply: true },
-    { label: "steer from text file", kind: "steer", inputMode: "file", awaitReplySeconds: undefined, sendReply: false },
-    { label: "followUp reply timeout", kind: "followUp", inputMode: "argv", awaitReplySeconds: 1, sendReply: false },
-    { label: "steer from stdin", kind: "steer", inputMode: "stdin", awaitReplySeconds: undefined, sendReply: false },
+    { label: "followUp immediate reply", kind: "followUp", inputMode: "argv", awaitReplySeconds: 5, sendReply: true, routeChange: false },
+    { label: "followUp changed route reply", kind: "followUp", inputMode: "argv", awaitReplySeconds: 15, sendReply: false, routeChange: true },
+    { label: "steer from text file", kind: "steer", inputMode: "file", awaitReplySeconds: undefined, sendReply: false, routeChange: false },
+    { label: "followUp reply timeout", kind: "followUp", inputMode: "argv", awaitReplySeconds: 1, sendReply: false, routeChange: false },
+    { label: "steer from stdin", kind: "steer", inputMode: "stdin", awaitReplySeconds: undefined, sendReply: false, routeChange: false },
   ] as const;
-  it.each(scenarios)("routes and withdraws a $label sender", async ({ kind, inputMode, awaitReplySeconds, sendReply }) => {
+  it.each(scenarios)("routes and withdraws a $label sender", async ({ kind, inputMode, awaitReplySeconds, sendReply, routeChange }) => {
     if (!broker) throw new Error("NATS fixture unavailable");
     const fixture = broker;
     const sessionId = randomUUID();
@@ -114,6 +124,9 @@ brokerSuite("pi-fabric nats send over a real authenticated broker", () => {
       hostId: rootId, rootId, identity: ownerIdentity,
     });
     let ownerPlane: FabricControlPlane | undefined;
+    let replacementPlane: FabricControlPlane | undefined;
+    let replacementDirectory: ParticipantDirectory | undefined;
+    let replacementTransport: FabricTransport | undefined;
     let replyDelivery: Promise<void> | undefined;
     const received: Array<{ operation: string; targetId: string; text: string | undefined; data: unknown; from: MeshIdentity; senderLive: boolean }> = [];
     try {
@@ -200,9 +213,65 @@ brokerSuite("pi-fabric nats send over a real authenticated broker", () => {
         "--name", `test ${kind}`, "--idempotency-key", `nats-send-${kind}-${sessionId}`, "--timeout-ms", "15000",
         ...(awaitReplySeconds === undefined ? [] : ["--await-reply-seconds", String(awaitReplySeconds)]),
       ];
-      const cli = await runCli(args, env, inputMode === "stdin" ? message : "");
+      let cli: Awaited<ReturnType<typeof runCli>>;
+      let routeChangeElapsedMs: number | undefined;
+      if (routeChange) {
+        let resolveFirstLine!: (line: string) => void;
+        const firstLine = new Promise<string>(resolve => { resolveFirstLine = resolve; });
+        const cliPromise = runCli(args, env, "", resolveFirstLine);
+        const acknowledgement = JSON.parse(await firstLine) as Record<string, unknown>;
+        expect(acknowledgement).toMatchObject({ queued: true, acknowledged: true, routed: "mesh" });
+        const senderId = received[0]!.from.id;
+        const correlationId = (received[0]!.data as { replyCorrelationId: string }).replyCorrelationId;
+        const originalIncarnation = ownerDirectory.ownerIncarnation;
+        await ownerPlane?.close();
+        ownerPlane = undefined;
+        await ownerDirectory.close();
+        await ownerTransport.close();
+
+        const replacementMeshRoot = path.join(fixture.root, `replacement-mesh-${sessionId}`);
+        const replacementStateDir = path.join(fixture.root, `replacement-transport-${sessionId}`);
+        fs.mkdirSync(replacementMeshRoot, { mode: 0o700 });
+        fs.mkdirSync(replacementStateDir, { mode: 0o700 });
+        const replacementMesh = new MeshStore(replacementMeshRoot, 64 * 1024, 1_000);
+        replacementTransport = await openNatsTransport({
+          ...fixture.runtimeOptions(fixture.users.machineB), hostId: rootId, name: `fixture-resumed-${kind}`,
+        });
+        replacementDirectory = new ParticipantDirectory(replacementMesh, {
+          enabled: true, transport: replacementTransport, transportStateDir: replacementStateDir,
+          hostId: rootId, rootId, identity: ownerIdentity,
+        });
+        await replacementDirectory.start();
+        await replacementDirectory.publishBeforeLaunch({ ...record, startedAt: Date.now(), updatedAt: Date.now() });
+        const replacementView = replacementDirectory.participantView;
+        if (!replacementView) throw new Error("replacement NATS view is unavailable");
+        const replacementSignal = AbortSignal.timeout(5_000);
+        while (!replacementView.resolve(rootId)?.live ||
+          replacementView.resolve(rootId)?.ownerIncarnation === originalIncarnation) {
+          await replacementView.whenChanged(rootId, replacementSignal);
+        }
+        replacementPlane = new FabricControlPlane(replacementMesh, ownerIdentity, {
+          enabled: true, hostId: rootId, transport: replacementTransport, participants: replacementView,
+          ownerIncarnation: replacementDirectory.ownerIncarnation, controlIncarnationFence: "enforce",
+          expectedNatsInboxStream: "FABRIC_IN_machine-b", relayOperatorMachine: PATH_B_OPERATOR_MACHINE,
+          canConsumeMesh: () => replacementDirectory?.canConsumeMesh() === true,
+          pollMs: 20, acknowledgementTimeoutMs: 5_000,
+        });
+        replacementPlane.start(() => ({ accepted: false, error: "unexpected replacement control request" }));
+        await sleep(250); // Let the sender's NATS presence watch observe the committed route change.
+        const senderRoute = replacementView.resolve(senderId);
+        if (!senderRoute?.live) throw new Error("sender route disappeared during target reconnect");
+        const staleReplyStartedAt = Date.now();
+        const delivery = replacementPlane.request(senderRoute.ownerHostId, senderId, "followUp", {
+          message: "reply from resumed target", data: { inReplyTo: correlationId },
+          ownerIncarnation: senderRoute.ownerIncarnation,
+        }, senderRoute.ownerIdentityId, { idempotencyKey: `stale-route-${sessionId}`, timeoutMs: 5_000 });
+        void delivery.catch(() => undefined);
+        cli = await cliPromise;
+        routeChangeElapsedMs = Date.now() - staleReplyStartedAt;
+      } else cli = await runCli(args, env, inputMode === "stdin" ? message : "");
       expect(cli.signal).toBeNull();
-      expect(cli.code, `${cli.stdout}\n${cli.stderr}`).toBe(awaitReplySeconds === 1 && !sendReply ? 2 : 0);
+      expect(cli.code, `${cli.stdout}\n${cli.stderr}`).toBe(routeChange ? 1 : awaitReplySeconds === 1 && !sendReply ? 2 : 0);
       expect(cli.stderr).toBe("");
       const outputLines = cli.stdout.trim().split(/\r?\n/).map((line) => JSON.parse(line) as Record<string, unknown>);
       const output = outputLines[0]!;
@@ -210,12 +279,16 @@ brokerSuite("pi-fabric nats send over a real authenticated broker", () => {
       expect(typeof output.messageId).toBe("string");
       expect(received).toHaveLength(1);
       expect(received[0]).toMatchObject({ operation: kind, targetId: rootId, text: message, senderLive: true });
-      if (sendReply) expect(received[0]!.data).toEqual({ replyCorrelationId: expect.stringMatching(/^[a-f0-9]{64}$/) });
+      if (sendReply || routeChange) expect(received[0]!.data).toEqual({ replyCorrelationId: expect.stringMatching(UUID_PATTERN_FOR_TEST) });
       expect(received[0]!.from).toMatchObject({ name: `test ${kind}`, kind: "agent" });
       expect(received[0]!.from.id).toMatch(/^provider:cli:[0-9a-f]{32}$/);
       expect(received[0]!.from.sessionId).toMatch(/^[0-9a-f-]{36}$/);
       expect(output.senderId).toBe(received[0]!.from.id);
-      if (awaitReplySeconds !== undefined) {
+      if (routeChange) {
+        expect(outputLines).toHaveLength(2);
+        expect(outputLines[1]).toEqual({ error: `reply from ${rootId} arrived on a changed route; not accepted` });
+        expect(routeChangeElapsedMs).toBeLessThan(5_000);
+      } else if (awaitReplySeconds !== undefined) {
         expect(outputLines).toHaveLength(2);
         if (sendReply) {
           if (!replyDelivery) throw new Error("target did not schedule its followUp reply");
@@ -229,11 +302,12 @@ brokerSuite("pi-fabric nats send over a real authenticated broker", () => {
 
       const senderId = received[0]!.from.id;
       const senderHostId = `runtime:${senderId.slice("provider:cli:".length)}`;
-      const presenceKv = ownerTransport.kv("presence");
-      const leaseKv = ownerTransport.kv("leases");
+      const monitorTransport = replacementTransport ?? ownerTransport;
+      const presenceKv = monitorTransport.kv("presence");
+      const leaseKv = monitorTransport.kv("leases");
       await waitForGone(presenceKv, `machine-a.p.${tokenFor(senderId)}`);
       await waitForGone(leaseKv, `machine-a.h.${tokenFor(senderHostId)}`);
-      expect(view.resolve(senderId)).toBeUndefined();
+      expect((replacementDirectory?.participantView ?? view).resolve(senderId)).toBeUndefined();
       if (sendReply) {
         const retry = await runCli(args, env);
         expect(retry.signal).toBeNull();
@@ -246,8 +320,14 @@ brokerSuite("pi-fabric nats send over a real authenticated broker", () => {
         await waitForGone(leaseKv, `machine-a.h.${tokenFor(senderHostId)}`);
       }
     } finally {
-      try { await ownerPlane?.close(); } finally {
-        try { await ownerDirectory.close(); } finally { await ownerTransport.close(); }
+      try { await replacementPlane?.close(); } finally {
+        try { await replacementDirectory?.close(); } finally {
+          try { await replacementTransport?.close(); } finally {
+            try { await ownerPlane?.close(); } finally {
+              try { await ownerDirectory.close(); } finally { await ownerTransport.close(); }
+            }
+          }
+        }
       }
     }
   }, 45_000);

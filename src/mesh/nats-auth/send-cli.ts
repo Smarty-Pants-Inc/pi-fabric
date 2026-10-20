@@ -62,6 +62,8 @@ type SendReply = {
   at: number;
 };
 
+type StaleReplyRoute = { staleRoute: string };
+type AwaitedReply = SendReply | StaleReplyRoute;
 type SendOutcome = { result: FabricControlResult; senderId: string; reply?: SendReply | null };
 type Acknowledged = (result: FabricControlResult, senderId: string) => void;
 
@@ -255,6 +257,48 @@ function removePrivateRoot(root: string, identity: DirectoryIdentity): void {
 
 function presenceToken(id: string): string { return createHash("sha256").update(id).digest("hex").slice(0, 32); }
 
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+/** The random nonce is stored by logical idempotency key so a safe CLI retry reuses it. */
+function loadOrCreateReplyCorrelation(statePath: string, receiptKey: string): string {
+  // `statePath` is an fd-pinned private directory returned by openPrivateDir.
+  const file = path.join(statePath, `reply-${receiptKey}`);
+  const noFollow = process.platform === "win32" ? 0 : fs.constants.O_NOFOLLOW ?? 0;
+  try {
+    let fd: number;
+    try {
+      fd = fs.openSync(file, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | noFollow, 0o600);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      const before = fs.lstatSync(file);
+      if (before.isSymbolicLink()) throw new SendCliError("reply correlation receipt is unsafe");
+      const readFd = fs.openSync(file, fs.constants.O_RDONLY | noFollow);
+      try {
+        const stat = fs.fstatSync(readFd);
+        const owner = process.getuid?.();
+        if (!stat.isFile() || stat.nlink !== 1 || owner !== undefined && stat.uid !== owner ||
+          process.platform !== "win32" && (stat.mode & 0o7777) !== 0o600 ||
+          before.dev !== stat.dev || before.ino !== stat.ino || stat.size < 36 || stat.size > 37) {
+          throw new SendCliError("reply correlation receipt is unsafe");
+        }
+        const value = fs.readFileSync(readFd, "utf8");
+        const id = value.endsWith("\n") ? value.slice(0, -1) : "";
+        if (value !== `${id}\n` || !UUID_PATTERN.test(id)) throw new SendCliError("reply correlation receipt is invalid");
+        return id;
+      } finally { fs.closeSync(readFd); }
+    }
+    const id = randomUUID();
+    try {
+      fs.writeFileSync(fd, `${id}\n`, { encoding: "utf8" });
+      fs.fsyncSync(fd);
+    } finally { fs.closeSync(fd); }
+    return id;
+  } catch (error) {
+    if (error instanceof SendCliError) throw error;
+    throw new SendCliError("could not access reply correlation state");
+  }
+}
+
 function replyFor(
   command: { operation: string; targetId: string; message?: string; data?: unknown },
   from: MeshIdentity,
@@ -275,9 +319,9 @@ function replyFor(
   };
 }
 
-function waitForReply(reply: Promise<SendReply>, timeoutMs: number, signal: AbortSignal): Promise<SendReply | null> {
+function waitForReply(reply: Promise<AwaitedReply>, timeoutMs: number, signal: AbortSignal): Promise<AwaitedReply | null> {
   return new Promise((resolve, reject) => {
-    const finish = (result: SendReply | null, error?: unknown): void => {
+    const finish = (result: AwaitedReply | null, error?: unknown): void => {
       clearTimeout(timer);
       signal.removeEventListener("abort", onAbort);
       if (error !== undefined) reject(error); else resolve(result);
@@ -389,9 +433,9 @@ async function openAndSend(options: SendOptions, onAcknowledged: Acknowledged): 
   let plane: FabricControlPlane | undefined;
   let result: FabricControlResult | undefined;
   let reply: SendReply | null | undefined;
-  let resolveReply: ((value: SendReply) => void) | undefined;
+  let resolveReply: ((value: AwaitedReply) => void) | undefined;
   let awaitingReply = false;
-  const replyPromise = options.awaitReplySeconds === undefined ? undefined : new Promise<SendReply>((resolve) => { resolveReply = resolve; });
+  const replyPromise = options.awaitReplySeconds === undefined ? undefined : new Promise<AwaitedReply>((resolve) => { resolveReply = resolve; });
   let failure: unknown;
   try {
     transport = await openFabricTransport({ config: meshConfig, hostId, mesh, signal });
@@ -411,11 +455,13 @@ async function openAndSend(options: SendOptions, onAcknowledged: Acknowledged): 
     if (!view) throw new SendCliError("NATS participant view is unavailable");
     const target = await waitForLiveRoute(view, options.to, signal);
     if (!target.capabilities.includes(options.kind)) throw new SendCliError(`target does not advertise ${options.kind}`);
-    // Bind reply correlation to this logical idempotent request and the exact route sent to.
-    const replyCorrelationId = options.awaitReplySeconds === undefined ? undefined : createHash("sha256")
-      .update(JSON.stringify([stable.token, options.to, options.kind, options.idempotencyKey,
+    // Receipt identity is hashed only for its filename; the correlation value itself is random.
+    const replyReceiptKey = createHash("sha256")
+      .update(JSON.stringify([options.to, options.kind, options.idempotencyKey,
         target.machine, target.ownerHostId, target.ownerIdentityId, target.ownerIncarnation]))
       .digest("hex");
+    const replyCorrelationId = options.awaitReplySeconds === undefined ? undefined
+      : loadOrCreateReplyCorrelation(localState.path, replyReceiptKey);
     plane = new FabricControlPlane(mesh, identity, {
       enabled: true,
       hostId,
@@ -432,9 +478,16 @@ async function openAndSend(options: SendOptions, onAcknowledged: Acknowledged): 
       const senderRoute = view.resolve(from.id);
       const sameRequestedRoute = from.id === options.to && senderRoute?.live === true &&
         routeFingerprint(senderRoute) === routeFingerprint(target);
-      const received = awaitingReply && replyPromise && replyCorrelationId && sameRequestedRoute
+      const received = awaitingReply && replyPromise && replyCorrelationId
         ? replyFor(command, from, identity.id, options.to, replyCorrelationId) : undefined;
-      if (!received || !resolveReply) {
+      if (received && !sameRequestedRoute && resolveReply) {
+        const staleRoute = `reply from ${options.to} arrived on a changed route; not accepted`;
+        awaitingReply = false;
+        resolveReply({ staleRoute: options.to });
+        resolveReply = undefined;
+        return { accepted: false, error: staleRoute };
+      }
+      if (!received || !sameRequestedRoute || !resolveReply) {
         return { accepted: false, error: "CLI accepts only followUp replies from the requested target with matching correlation" };
       }
       reply = received;
@@ -486,8 +539,12 @@ async function openAndSend(options: SendOptions, onAcknowledged: Acknowledged): 
     }
     onAcknowledged(result, identity.id);
     if (options.awaitReplySeconds !== undefined) {
-      reply = await waitForReply(replyPromise!, options.awaitReplySeconds * 1_000, lifetime.signal);
+      const awaited = await waitForReply(replyPromise!, options.awaitReplySeconds * 1_000, lifetime.signal);
       awaitingReply = false;
+      if (awaited && "staleRoute" in awaited) {
+        throw new SendCliError(`reply from ${awaited.staleRoute} arrived on a changed route; not accepted`);
+      }
+      reply = awaited;
       if (reply) await plane.settleNatsInbox();
     }
   } catch (error) {

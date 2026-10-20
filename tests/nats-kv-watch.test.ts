@@ -436,7 +436,12 @@ describe.skipIf(!binary)("real authenticated NATS KV snapshot/ready/reset", () =
   }, 50_000);
 
   it("reacquires 20+ participant leases after an outage beyond TTL and closes lost lineage idempotently", async () => {
-    const participantCount = 21;
+    const participantCount = 22;
+    const retiredIndex = 1;
+    const retiredOwnerLive = { value: true };
+    const retiredReconnect = deferred<void>();
+    const leaseWrites: string[][] = Array.from({ length: participantCount }, () => []);
+    const leaseStores: TransportKv[] = [];
     const directories: ParticipantDirectory[] = [];
     for (let index = 0; index < participantCount; index++) {
       const id = `session:lease-recovery-${String(index).padStart(2, "0")}`;
@@ -449,9 +454,31 @@ describe.skipIf(!binary)("real authenticated NATS KV snapshot/ready/reset", () =
       fs.mkdirSync(transportStateDir, { mode: 0o700 });
       const transport = await openNatsTransport({ ...harness.runtimeOptions(harness.users.machineA), hostId: id });
       recoveryTransports.push(transport);
+      if (index === retiredIndex) transport.onVerifiedReconnect?.(() => retiredReconnect.resolve());
+      const leaseStore = transport.kv("leases");
+      leaseStores.push(leaseStore);
+      const trackedLeaseStore: TransportKv = {
+        ttlMs: leaseStore.ttlMs,
+        get: leaseStore.get.bind(leaseStore),
+        put: async <V>(key: string, owner: string, value: V, ifRevision: number, signal?: AbortSignal): Promise<number> => {
+          const revision = await leaseStore.put(key, owner, value, ifRevision, signal);
+          leaseWrites[index]!.push(key);
+          return revision;
+        },
+        delete: leaseStore.delete.bind(leaseStore),
+        watch: leaseStore.watch.bind(leaseStore),
+      };
+      const trackedTransport = new Proxy(transport, {
+        get(target, property) {
+          if (property === "kv") return (bucket: TransportBucket) => bucket === "leases" ? trackedLeaseStore : target.kv(bucket);
+          const value = Reflect.get(target, property, target) as unknown;
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      }) as FabricTransport;
       const directory = new ParticipantDirectory(mesh, {
         enabled: true, hostId: id, rootId: id, identity: { id, name: id, kind: "main" },
-        transport, transportStateDir,
+        transport: trackedTransport, transportStateDir,
+        ...(index === retiredIndex ? { live: () => retiredOwnerLive.value } : {}),
       });
       directory.registerSource((): FabricParticipantRecord[] => {
         const now = Date.now();
@@ -473,7 +500,12 @@ describe.skipIf(!binary)("real authenticated NATS KV snapshot/ready/reset", () =
       const peers = directory.list({ scope: "project" });
       return peers.length === active.length && peers.every(peer => !peer.stale && directory.participantView?.resolve(peer.id)?.live === true);
     });
-    await waitFor(() => allVisible(directories), "initial 21-participant directory", 30_000);
+    await waitFor(() => allVisible(directories), "initial 22-participant directory", 30_000);
+    const retiredDirectory = directories[retiredIndex]!;
+    const retiredId = `session:lease-recovery-${String(retiredIndex).padStart(2, "0")}`;
+    const retiredLeaseKey = `${A}.h.${createHash("sha256").update(retiredId).digest("hex").slice(0, 32)}`;
+    expect(await leaseStores[retiredIndex]!.get(retiredLeaseKey)).toBeDefined();
+    retiredOwnerLive.value = false;
 
     const server = harness.serverProcess;
     if (!server) throw new Error("Path B NATS server process is unavailable");
@@ -490,13 +522,24 @@ describe.skipIf(!binary)("real authenticated NATS KV snapshot/ready/reset", () =
     await expect(directories[0]!.closeLineage()).resolves.toBeUndefined();
     await expect(directories[0]!.closeLineage()).resolves.toBeUndefined();
     await expect(directories[0]!.close()).resolves.toBeUndefined();
+    for (const writes of leaseWrites) writes.length = 0;
 
     await bounded(harness.start(), "NATS restart after expired lease TTL", 25_000);
-    const survivors = directories.slice(1);
-    await waitFor(() => allVisible(survivors), "20 participant lease reacquisition and replay", 35_000);
-    for (const directory of survivors) {
+    await bounded(retiredReconnect.promise, "retired owner's verified reconnect", 25_000);
+    const liveIndexes = Array.from({ length: participantCount }, (_, index) => index)
+      .filter(index => index !== 0 && index !== retiredIndex);
+    const survivors = liveIndexes.map(index => directories[index]!);
+    await waitFor(() => allVisible(survivors), "20 live participant lease reacquisition and replay", 35_000);
+    for (let index = 0; index < liveIndexes.length; index++) {
+      const directoryIndex = liveIndexes[index]!;
+      const directory = directories[directoryIndex]!;
       expect(directory.list({ scope: "project" })).toHaveLength(survivors.length);
+      const leaseKey = `${A}.h.${createHash("sha256").update(directory.options.hostId).digest("hex").slice(0, 32)}`;
+      expect(leaseWrites[directoryIndex]).toContain(leaseKey);
     }
+    expect(retiredDirectory.canConsumeMesh()).toBe(false);
+    expect(leaseWrites[retiredIndex]).toEqual([]);
+    expect(await leaseStores[liveIndexes[0]!]!.get(retiredLeaseKey)).toBeUndefined();
     const peerId = survivors[0]!.options.hostId;
     const projectedKey = `topology/participants/${createHash("sha256").update(peerId).digest("hex")}`;
     const projected = readParticipantFiles(survivors[1]!.mesh.root, { maxAgeMs: 0 }).find(entry => entry.key === projectedKey);

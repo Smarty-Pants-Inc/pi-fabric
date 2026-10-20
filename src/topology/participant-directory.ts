@@ -1199,7 +1199,10 @@ export class ParticipantDirectory implements FabricParticipantSource {
       });
       this.#transportLease = lease;
       this.#transportReconnectUnsubscribe = transport.onVerifiedReconnect?.(() => {
-        if (!this.#closed && !this.#transportLost) void this.#renewTransportLease().catch(() => undefined);
+        if (this.#closed || this.#transportLost) return;
+        const live = this.#live();
+        this.#lifecycleTick(live);
+        if (live) void this.#renewTransportLease().catch(() => undefined);
       });
       this.#participantView = new KvParticipantDirectory({
         transport, lease, identityId: this.options.identity.id,

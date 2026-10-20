@@ -2,6 +2,7 @@
 import type { MeshIdentity } from "../mesh/event-log.js";
 import type { FabricMessageSender } from "../protocol.js";
 import type { FabricPrincipal } from "../fabric-provenance.js";
+import type { PlacementTerminalRecord } from "../placement/terminal.js";
 
 /** The Fabric runtime that consumes an inbox: FabricControlPlane options.hostId (stable across reloads). */
 export interface TransportOwner {
@@ -105,6 +106,8 @@ export interface FabricTransport {
   inbox(signal: AbortSignal): AsyncIterable<TransportDelivery<TransportEnvelope>>;
   /** NATS only; the file adapter throws TransportUnsupportedError. */
   kv(bucket: TransportBucket): TransportKv;
+  /** Best-effort Placement terminal receipt; only implemented by carriers with their agreed store. */
+  writePlacementTerminal?(record: PlacementTerminalRecord): Promise<void>;
   /** For drain and rollback (§8.3). File: computed from the control-plane cursor. */
   drainState(signal?: AbortSignal): Promise<TransportDrainState>;
   /** Ends iterators (in-hand deliveries are neither acked nor nacked), settles publishes, closes. */

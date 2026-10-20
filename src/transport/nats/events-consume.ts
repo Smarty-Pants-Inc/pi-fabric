@@ -21,6 +21,9 @@ export const NATS_EVENT_RETRY_DELAY_SCHEDULE_MS = [1_000, 5_000, 15_000, MAX_RET
 const MAX_ACK_PENDING = 128;
 type StreamKind = "ev" | "gh";
 
+/* FLAGGED integration resolution for review-fleet-lead: keep main-11's explicit
+ * accepted/retry, bounded receipts, and poison TERM semantics; main-17's retry
+ * schedule and max_deliver=-1 are already present in this base. */
 export type NatsActorEventDisposition = "accepted" | "retry";
 
 const normalizeRetryDelaySchedule = (schedule?: readonly number[]): number[] => {

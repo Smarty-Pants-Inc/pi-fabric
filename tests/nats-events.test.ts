@@ -259,7 +259,7 @@ describe.skipIf(!binary)("NATS Mesh events on a real JetStream server", () => {
       });
       const reopenedDurable = await connection.manager.consumers.info(natsEventsStreamName(org), `ev_${hashToken(actorId)}`);
       expect(reopenedDurable.config.deliver_policy).toBe(DeliverPolicy.StartTime);
-      expect(reopenedDurable.config.opt_start_time).toBe(startAt);
+      expect(Date.parse(reopenedDurable.config.opt_start_time ?? "")).toBe(Date.parse(startAt));
       await new Promise(resolve => setTimeout(resolve, 100));
       expect(seen).toEqual(["after-start", "after-start"]);
     } finally {

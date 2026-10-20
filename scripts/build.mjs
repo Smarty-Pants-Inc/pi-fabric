@@ -90,6 +90,7 @@ const lazyEntryPoints = [
   "src/cli/decisions.ts",
   "src/mesh/nats-auth/cli.ts",
   "src/mesh/nats-auth/send-cli.ts",
+  "src/mesh/nats-auth/dispatch-cli.ts",
   // First-use host custody and participant snapshots keep stable lazy paths.
   "src/topology/host-leases.ts",
   "src/topology/participant-view.ts",

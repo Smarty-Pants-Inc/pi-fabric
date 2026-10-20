@@ -5,7 +5,7 @@ import { credsAuthenticator, type NatsConnection } from "@nats-io/nats-core";
 import { jetstream, jetstreamManager, type JetStreamClient, type JetStreamManager } from "@nats-io/jetstream";
 import { AuthorizationError, PermissionViolationError, connect, type NodeConnectionOptions, type Status, type TlsOptions } from "@nats-io/transport-node";
 import { pathBMachines } from "../../mesh/nats-auth/mint.js";
-import { PATH_B_OPERATOR_MACHINE_PATTERN, roleTemplateWithPathB } from "../../mesh/nats-auth/permissions.js";
+import { legacyRoleTemplateWithPathB, PATH_B_OPERATOR_MACHINE_PATTERN, roleTemplateWithPathB } from "../../mesh/nats-auth/permissions.js";
 import { validateMachine } from "./subjects.js";
 import { TransportUnavailableError } from "../types.js";
 
@@ -76,6 +76,8 @@ const MESH = /^[0-9a-f]{32}$/;
 const MAX_MESHES = 64;
 const MAX_CREDENTIALS_BYTES = 64 * 1024;
 const MISMATCH = "NATS USER.INFO machine tag mismatch";
+export const NATS_KV_FLOW_CONTROL_WARNING = "NATS user lacks KV flow-control grants; KV watches will stall; re-issue credentials";
+let warnedLegacyPermissions = false;
 
 /**
  * Read a creds file through one descriptor: open (no symlink follow, nonblocking for FIFOs), fstat the same fd,
@@ -186,12 +188,27 @@ const transportSecurity = (options: NatsTransportSecurityOptions): Pick<NodeConn
 const tagValues = (tags: readonly string[], key: string): string[] =>
   tags.filter((tag) => tag.startsWith(`${key}:`)).map((tag) => tag.slice(key.length + 1));
 
-interface ExpectedPermissions {
+interface PermissionSet {
   readonly pubAllow: ReadonlySet<string>;
   readonly pubDeny: ReadonlySet<string>;
   readonly subAllow: ReadonlySet<string>;
   readonly subDeny: ReadonlySet<string>;
 }
+
+interface ExpectedPermissions extends PermissionSet {
+  readonly legacy: PermissionSet;
+}
+
+/** Expand one role template for the signed identity exactly as nats-server expands it. */
+const expandPermissions = (template: ReturnType<typeof roleTemplateWithPathB>, machine: string, meshes: readonly string[], auth: ReturnType<typeof readNatsCredentials>): PermissionSet => {
+  const expand = (subjects: readonly string[]): Set<string> => new Set(subjects.flatMap((subject) => {
+    const fixed = subject.replaceAll("{{subject()}}", auth.subject).replaceAll("{{tag(machine)}}", machine);
+    const out = fixed.includes("{{tag(mesh)}}") ? meshes.map((mesh) => fixed.replaceAll("{{tag(mesh)}}", mesh)) : [fixed];
+    if (out.some((value) => value.includes("{{"))) throw new Error("unexpected NATS permission template");
+    return out;
+  }));
+  return { pubAllow: expand(template.pub.allow), pubDeny: expand(template.pub.deny), subAllow: expand(template.sub.allow), subDeny: new Set() };
+};
 
 /** Server-expanded #1276 scope for this signed user, built by the same roleTemplateWithPathB and validators as mint. */
 const expectedPermissions = (role: "agent" | "operator", machine: string, policy: NatsPermissionPolicy, auth: ReturnType<typeof readNatsCredentials>): ExpectedPermissions => {
@@ -208,14 +225,12 @@ const expectedPermissions = (role: "agent" | "operator", machine: string, policy
   } else if (!PATH_B_OPERATOR_MACHINE_PATTERN.test(machine) || meshes.length !== 0) {
     throw new Error(MISMATCH);
   }
-  const template = roleTemplateWithPathB(role, { custodyStream: policy.custodyStream, livenessStream: policy.livenessStream }, machines);
-  const expand = (subjects: readonly string[]): Set<string> => new Set(subjects.flatMap((subject) => {
-    const fixed = subject.replaceAll("{{subject()}}", auth.subject).replaceAll("{{tag(machine)}}", machine);
-    const out = fixed.includes("{{tag(mesh)}}") ? meshes.map((mesh) => fixed.replaceAll("{{tag(mesh)}}", mesh)) : [fixed];
-    if (out.some((value) => value.includes("{{"))) throw new Error("unexpected NATS permission template");
-    return out;
-  }));
-  return { pubAllow: expand(template.pub.allow), pubDeny: expand(template.pub.deny), subAllow: expand(template.sub.allow), subDeny: new Set() };
+  const input = { custodyStream: policy.custodyStream, livenessStream: policy.livenessStream };
+  const template = roleTemplateWithPathB(role, input, machines);
+  // The installed d231bd15 account is a deliberate rollout exception. It is a separate frozen template, not a
+  // subtraction from the current one, because other runtime lanes add grants to the current template as well.
+  const legacy = role === "agent" ? legacyRoleTemplateWithPathB("agent", input, machines) : template;
+  return { ...expandPermissions(template, machine, meshes, auth), legacy: expandPermissions(legacy, machine, meshes, auth) };
 };
 
 /** Absent list = empty; present list must be strings. Unknown keys refuse. */
@@ -231,6 +246,11 @@ const permissionLists = (value: unknown): { allow: Set<string>; deny: Set<string
 
 const sameSet = (actual: ReadonlySet<string>, expected: ReadonlySet<string>): boolean =>
   actual.size === expected.size && [...expected].every((subject) => actual.has(subject));
+
+const matchesPermissions = (actual: { allow: Set<string>; deny: Set<string> }, expected: PermissionSet, subscribe: boolean): boolean =>
+  subscribe
+    ? sameSet(actual.allow, expected.subAllow) && sameSet(actual.deny, expected.subDeny)
+    : sameSet(actual.allow, expected.pubAllow) && sameSet(actual.deny, expected.pubDeny);
 
 const verifyIdentity = async (nc: NatsConnection, timeoutMs: number, auth: ReturnType<typeof readNatsCredentials>, expected: ExpectedPermissions): Promise<unknown> => {
   const response = await nc.request("$SYS.REQ.USER.INFO", new Uint8Array(), { timeout: timeoutMs }).catch((cause: unknown) => {
@@ -248,8 +268,14 @@ const verifyIdentity = async (nc: NatsConnection, timeoutMs: number, auth: Retur
     Object.keys(permissions).some((key) => key !== "publish" && key !== "subscribe")) throw new NatsAuthorizationError(MISMATCH);
   const publish = permissionLists(permissions.publish);
   const subscribe = permissionLists(permissions.subscribe);
-  if (!publish || !subscribe || !sameSet(publish.allow, expected.pubAllow) || !sameSet(publish.deny, expected.pubDeny) ||
-    !sameSet(subscribe.allow, expected.subAllow) || !sameSet(subscribe.deny, expected.subDeny)) throw new NatsAuthorizationError(MISMATCH);
+  if (!publish || !subscribe) throw new NatsAuthorizationError(MISMATCH);
+  const current = matchesPermissions(publish, expected, false) && matchesPermissions(subscribe, expected, true);
+  const legacy = matchesPermissions(publish, expected.legacy, false) && matchesPermissions(subscribe, expected.legacy, true);
+  if (!current && !legacy) throw new NatsAuthorizationError(MISMATCH);
+  if (!current && !warnedLegacyPermissions) {
+    warnedLegacyPermissions = true;
+    console.warn(NATS_KV_FLOW_CONTROL_WARNING);
+  }
   return value;
 };
 

@@ -40,7 +40,7 @@ const MAX_AWAIT_REPLY_SECONDS = 24 * 60 * 60;
 const PRESENCE_SETTLE_MS = 3_000;
 const PRESENCE_SETTLE_POLL_MS = 100;
 
-type SendOptions = {
+export type NatsSendOptions = {
   to: string;
   kind: "followUp" | "steer";
   text: string;
@@ -54,17 +54,29 @@ type SendOptions = {
   awaitReplySeconds?: number;
   org?: string;
   pathBMachines?: string[];
+  placementRunId?: string;
+  findTimeoutMs?: number;
+  onTaskDispatched?: () => void;
+  onReply?: (reply: NatsSendReply) => void;
+  messageForSender?: (senderId: string, targetId: string) => string;
 };
 
-type SendReply = {
+export type NatsSendReply = {
   from: { id: string; name: string; kind: MeshIdentity["kind"]; sessionId?: string };
   text: string;
   at: number;
 };
 
 type StaleReplyRoute = { staleRoute: string };
-type AwaitedReply = SendReply | StaleReplyRoute;
-type SendOutcome = { result: FabricControlResult; senderId: string; reply?: SendReply | null };
+type AwaitedReply = NatsSendReply | StaleReplyRoute;
+export type NatsSendOutcome = {
+  result: FabricControlResult;
+  senderId: string;
+  targetId: string;
+  childSession: string | null;
+  model: string | null;
+  reply?: NatsSendReply | null;
+};
 type Acknowledged = (result: FabricControlResult, senderId: string) => void;
 
 class SendCliError extends Error {}
@@ -81,7 +93,7 @@ const absolutePath = (value: string | undefined, flag: string): string => {
   return value;
 };
 
-const parseOptions = (argv: readonly string[]): SendOptions | "help" => {
+const parseOptions = (argv: readonly string[]): NatsSendOptions | "help" => {
   if (argv.length === 1 && (argv[0] === "--help" || argv[0] === "-h" || argv[0] === "help")) return "help";
   const valuedFlags = new Set([
     "--to", "--kind", "--text", "--text-file", "--creds", "--ca", "--servers", "--machine",
@@ -222,7 +234,7 @@ function policyConfig(): { custodyStream: string; livenessStream: string; pathBM
   return { custodyStream, livenessStream, pathBMachines: [...pathBMachines], operatorMachine };
 }
 
-function stableSenderIdentity(options: SendOptions, stateHome: string): { token: string; sessionId: string } {
+function stableSenderIdentity(options: NatsSendOptions, stateHome: string): { token: string; sessionId: string } {
   const digest = createHash("sha256").update(options.machine).update("\0").update(path.resolve(options.creds)).update("\0").update(options.name).update("\0").update(stateHome).digest();
   const bytes = Buffer.from(digest.subarray(0, 16));
   bytes[6] = (bytes[6]! & 0x0f) | 0x40;
@@ -305,7 +317,7 @@ function replyFor(
   senderId: string,
   requestedTargetId: string,
   correlationId: string,
-): SendReply | undefined {
+): NatsSendReply | undefined {
   if (command.operation !== "followUp" || command.targetId !== senderId || from.id !== requestedTargetId ||
     !isPlainObject(command.data) || command.data.inReplyTo !== correlationId || typeof command.message !== "string" ||
     !command.message || Buffer.byteLength(command.message, "utf8") > MAX_TEXT_BYTES ||
@@ -348,6 +360,34 @@ async function waitForLiveRoute(
   }
 }
 
+async function waitForPlacementTarget(
+  owner: ParticipantDirectory,
+  view: NonNullable<ParticipantDirectory["participantView"]>,
+  runId: string,
+  timeoutMs: number,
+  signal: AbortSignal,
+): Promise<{ id: string; route: NonNullable<ReturnType<typeof view.resolve>>; sessionId: string | null; model: string | null }> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    signal.throwIfAborted();
+    const matches = owner.list({ scope: "project", kinds: ["root"], fresh: true })
+      .filter((record) => record.placementRunId === runId && record.interactive !== false)
+      .flatMap((record) => {
+        const route = view.resolve(record.id);
+        return route?.live && route.capabilities.includes("followUp") &&
+          route.ownerHostId === record.ownerHostId && route.ownerIdentityId === record.ownerIdentityId &&
+          route.ownerIncarnation === record.ownerIncarnation
+          ? [{ id: record.id, route, sessionId: record.sessionId ?? null, model: record.model ?? null }]
+          : [];
+      });
+    if (matches.length > 1) throw new SendCliError(`placement run ${runId} has multiple live followUp agents`);
+    if (matches.length === 1) return matches[0]!;
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) throw new SendCliError(`no live followUp agent found for placement run ${runId}`);
+    await sleep(Math.min(PRESENCE_SETTLE_POLL_MS, remaining), undefined, { signal });
+  }
+}
+
 async function waitForSettledPresence(
   view: NonNullable<ParticipantDirectory["participantView"]>,
   directory: ParticipantDirectory,
@@ -373,7 +413,7 @@ async function waitForSettledPresence(
   }
 }
 
-async function openAndSend(options: SendOptions, onAcknowledged: Acknowledged): Promise<SendOutcome> {
+export async function openAndSend(options: NatsSendOptions, onAcknowledged: Acknowledged): Promise<NatsSendOutcome> {
   const policy = policyConfig();
   const configuredStateHome = process.env.XDG_STATE_HOME?.trim() || path.join(os.homedir(), ".local", "state");
   if (!path.isAbsolute(configuredStateHome) || configuredStateHome.includes("\0")) throw new SendCliError("XDG_STATE_HOME must be an absolute path");
@@ -432,7 +472,10 @@ async function openAndSend(options: SendOptions, onAcknowledged: Acknowledged): 
   let directory: ParticipantDirectory | undefined;
   let plane: FabricControlPlane | undefined;
   let result: FabricControlResult | undefined;
-  let reply: SendReply | null | undefined;
+  let targetId = options.to;
+  let childSession: string | null = null;
+  let model: string | null = null;
+  let reply: NatsSendReply | null | undefined;
   let resolveReply: ((value: AwaitedReply) => void) | undefined;
   let awaitingReply = false;
   const replyPromise = options.awaitReplySeconds === undefined ? undefined : new Promise<AwaitedReply>((resolve) => { resolveReply = resolve; });
@@ -453,11 +496,17 @@ async function openAndSend(options: SendOptions, onAcknowledged: Acknowledged): 
     signal.throwIfAborted();
     const view = directory.participantView;
     if (!view) throw new SendCliError("NATS participant view is unavailable");
-    const target = await waitForLiveRoute(view, options.to, signal);
+    const found = options.placementRunId
+      ? await waitForPlacementTarget(directory, view, options.placementRunId, options.findTimeoutMs ?? 0, signal)
+      : { id: options.to, route: await waitForLiveRoute(view, options.to, signal), sessionId: null, model: null };
+    const target = found.route;
+    targetId = found.id;
+    childSession = found.sessionId;
+    model = found.model;
     if (!target.capabilities.includes(options.kind)) throw new SendCliError(`target does not advertise ${options.kind}`);
     // Receipt identity is hashed only for its filename; the correlation value itself is random.
     const replyReceiptKey = createHash("sha256")
-      .update(JSON.stringify([options.to, options.kind, options.idempotencyKey,
+      .update(JSON.stringify([targetId, options.kind, options.idempotencyKey,
         target.machine, target.ownerHostId, target.ownerIdentityId, target.ownerIncarnation]))
       .digest("hex");
     const replyCorrelationId = options.awaitReplySeconds === undefined ? undefined
@@ -476,14 +525,14 @@ async function openAndSend(options: SendOptions, onAcknowledged: Acknowledged): 
     });
     plane.start((command, from) => {
       const senderRoute = view.resolve(from.id);
-      const sameRequestedRoute = from.id === options.to && senderRoute?.live === true &&
+      const sameRequestedRoute = from.id === targetId && senderRoute?.live === true &&
         routeFingerprint(senderRoute) === routeFingerprint(target);
       const received = awaitingReply && replyPromise && replyCorrelationId
-        ? replyFor(command, from, identity.id, options.to, replyCorrelationId) : undefined;
+        ? replyFor(command, from, identity.id, targetId, replyCorrelationId) : undefined;
       if (received && !sameRequestedRoute && resolveReply) {
-        const staleRoute = `reply from ${options.to} arrived on a changed route; not accepted`;
+        const staleRoute = `reply from ${targetId} arrived on a changed route; not accepted`;
         awaitingReply = false;
-        resolveReply({ staleRoute: options.to });
+        resolveReply({ staleRoute: targetId });
         resolveReply = undefined;
         return { accepted: false, error: staleRoute };
       }
@@ -492,6 +541,7 @@ async function openAndSend(options: SendOptions, onAcknowledged: Acknowledged): 
       }
       reply = received;
       awaitingReply = false;
+      try { options.onReply?.(received); } catch { /* timing observation must not hold the verified inbox */ }
       resolveReply(received);
       resolveReply = undefined;
       return { accepted: true, messageId: command.commandId };
@@ -520,10 +570,13 @@ async function openAndSend(options: SendOptions, onAcknowledged: Acknowledged): 
     const settled = await waitForSettledPresence(view, directory, identity.id, signal);
     if (!settled.live || !directory.canConsumeMesh()) throw new SendCliError("sender presence is not live");
     signal.throwIfAborted();
+    const message = options.messageForSender?.(identity.id, targetId) ?? options.text;
+    if (!message || Buffer.byteLength(message, "utf8") > MAX_TEXT_BYTES) throw new SendCliError("message text must be nonempty and at most 512 KiB");
     if (options.awaitReplySeconds !== undefined) awaitingReply = true;
+    options.onTaskDispatched?.();
     try {
-      result = await plane.request(target.ownerHostId, options.to, options.kind, {
-        message: options.text,
+      result = await plane.request(target.ownerHostId, targetId, options.kind, {
+        message,
         ...(replyCorrelationId === undefined ? {} : { data: { replyCorrelationId } }),
         ownerIncarnation: target.ownerIncarnation,
       }, target.ownerIdentityId, {
@@ -563,7 +616,12 @@ async function openAndSend(options: SendOptions, onAcknowledged: Acknowledged): 
   }
   if (failure !== undefined) throw failure;
   if (!result) throw new SendCliError("Fabric send did not produce an acknowledgement");
-  return { result, senderId: identity.id, ...(options.awaitReplySeconds === undefined ? {} : { reply: reply ?? null }) };
+  return {
+    result, senderId: identity.id, targetId,
+    childSession,
+    model,
+    ...(options.awaitReplySeconds === undefined ? {} : { reply: reply ?? null }),
+  };
 }
 
 const errorText = (error: unknown): string => {

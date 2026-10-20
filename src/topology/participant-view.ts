@@ -216,56 +216,62 @@ export class KvParticipantDirectory implements ParticipantView {
   async #watch(bucket: TransportBucket): Promise<void> {
     const presence = bucket === "presence";
     const kv = presence ? this.#presence : this.#leases;
-    try {
-      for await (const event of kv.watch<unknown>(">", this.#abort.signal)) {
-        if (this.#closed) break;
-        if (event.type === "reset") {
-          if (presence) { this.#presenceReady = false; this.#records.clear(); this.#presenceRevisions.clear(); }
-          else { this.#leasesReady = false; this.#hosts.clear(); this.#leaseRevisions.clear(); }
-          continue;
-        }
-        if (event.type === "ready") {
-          const wasReady = this.ready;
-          if (presence) this.#presenceReady = true; else this.#leasesReady = true;
-          if (!wasReady && this.ready) for (const waiter of [...this.#waiters]) waiter.changed();
-          if (presence) this.#requestCleanup();
-          continue;
-        }
-        const key = event.type === "put" ? event.entry.key : event.key;
-        const revision = event.type === "put" ? event.entry.revision : event.revision;
-        if (!machineFromKey(key, presence ? "p" : "h") || !Number.isSafeInteger(revision) || revision <= 0) continue;
-        const revisions = presence ? this.#presenceRevisions : this.#leaseRevisions;
-        if (revision <= (revisions.get(key) ?? 0)) continue;
-        revisions.set(key, revision);
-        if (presence) {
-          this.#records.delete(key);
-          if (event.type === "put") {
-            const record = presenceValue(event.entry);
-            if (record) this.#records.set(key, { ...event.entry, value: freezeJson(cloneJson(record)) });
+    while (!this.#closed && !this.#abort.signal.aborted) {
+      let retryAfterReconnect = false;
+      try {
+        for await (const event of kv.watch<unknown>(">", this.#abort.signal)) {
+          if (this.#closed) break;
+          if (event.type === "reset") {
+            if (presence) { this.#presenceReady = false; this.#records.clear(); this.#presenceRevisions.clear(); }
+            else { this.#leasesReady = false; this.#hosts.clear(); this.#leaseRevisions.clear(); }
+            continue;
           }
-        } else {
-          this.#hosts.delete(key);
-          if (event.type === "put") {
-            const lease = leaseValue(event.entry);
-            if (lease) this.#hosts.set(key, { ...event.entry, value: freezeJson(cloneJson(lease)) });
+          if (event.type === "ready") {
+            const wasReady = this.ready;
+            if (presence) this.#presenceReady = true; else this.#leasesReady = true;
+            if (!wasReady && this.ready) for (const waiter of [...this.#waiters]) waiter.changed();
+            if (presence) this.#requestCleanup();
+            continue;
           }
+          const key = event.type === "put" ? event.entry.key : event.key;
+          const revision = event.type === "put" ? event.entry.revision : event.revision;
+          if (!machineFromKey(key, presence ? "p" : "h") || !Number.isSafeInteger(revision) || revision <= 0) continue;
+          const revisions = presence ? this.#presenceRevisions : this.#leaseRevisions;
+          if (revision <= (revisions.get(key) ?? 0)) continue;
+          revisions.set(key, revision);
+          if (presence) {
+            this.#records.delete(key);
+            if (event.type === "put") {
+              const record = presenceValue(event.entry);
+              if (record) this.#records.set(key, { ...event.entry, value: freezeJson(cloneJson(record)) });
+            }
+          } else {
+            this.#hosts.delete(key);
+            if (event.type === "put") {
+              const lease = leaseValue(event.entry);
+              if (lease) this.#hosts.set(key, { ...event.entry, value: freezeJson(cloneJson(lease)) });
+            }
+          }
+          for (const waiter of [...this.#waiters]) {
+            if (presence ? key.endsWith(`.p.${tokenFor(waiter.id)}`) :
+              [...this.#records.values()].some(entry => entry.value.id === waiter.id &&
+                this.#hostKey(entry) === key)) waiter.changed();
+          }
+          if (presence && this.#pendingCleanup.has(key)) this.#requestCleanup();
         }
-        for (const waiter of [...this.#waiters]) {
-          if (presence ? key.endsWith(`.p.${tokenFor(waiter.id)}`) :
-            [...this.#records.values()].some(entry => entry.value.id === waiter.id &&
-              this.#hostKey(entry) === key)) waiter.changed();
-        }
-        if (presence && this.#pendingCleanup.has(key)) this.#requestCleanup();
+      } catch (error) {
+        if (!this.#closed && errorCode(error) === "FABRIC_TRANSPORT_UNAVAILABLE") {
+          retryAfterReconnect = true;
+          this.#report(error);
+        } else if (!this.#closed) this.#report(error);
       }
-    } catch (error) {
-      if (!this.#closed) this.#report(error);
-    } finally {
-      if (presence) { this.#presenceReady = false; this.#records.clear(); }
-      else { this.#leasesReady = false; this.#hosts.clear(); }
-      if (!this.#closed) {
-        this.#watchFailed = true;
-        for (const waiter of [...this.#waiters]) waiter.fail(new DirectoryNotReadyError());
-      }
+      if (presence) { this.#presenceReady = false; this.#records.clear(); this.#presenceRevisions.clear(); }
+      else { this.#leasesReady = false; this.#hosts.clear(); this.#leaseRevisions.clear(); }
+      if (this.#closed || this.#abort.signal.aborted) return;
+      if (retryAfterReconnect) continue;
+      this.#watchFailed = true;
+      for (const waiter of [...this.#waiters]) waiter.fail(new DirectoryNotReadyError());
+      return;
     }
   }
 

@@ -444,7 +444,8 @@ class NatsTransportImpl implements FabricTransport {
 
   #waitForSession(signal: AbortSignal): Promise<NatsSession> {
     if (this.#terminalError) return Promise.reject(this.#terminalError);
-    if (this.#session && !this.#session.connection.nc.isClosed() && !this.#session.connection.nc.isDraining()) return Promise.resolve(this.#session);
+    if (this.#session && this.#session.connection.isVerified() &&
+      !this.#session.connection.nc.isClosed() && !this.#session.connection.nc.isDraining()) return Promise.resolve(this.#session);
     if (this.#closed) return Promise.reject(new TransportUnavailableError("NATS transport is closed"));
     signal.throwIfAborted();
     return new Promise<NatsSession>((resolve, reject) => {
@@ -456,6 +457,7 @@ class NatsTransportImpl implements FabricTransport {
   }
 
   #resolveWaiters(session: NatsSession): void {
+    if (!session.connection.isVerified()) return;
     for (const waiter of [...this.#waiters]) {
       this.#waiters.delete(waiter);
       if (waiter.onAbort) waiter.signal.removeEventListener("abort", waiter.onAbort);
@@ -475,12 +477,30 @@ class NatsTransportImpl implements FabricTransport {
     this.#session = session;
     this.#sessionChannels.setConnection(session.connection.nc);
     session.unsubscribe = session.connection.onStatus((status) => {
-      if (status.type === "disconnect" || status.type === "close") this.#loseSession(session);
+      if (this.#closed || this.#session !== session) return;
+      if (status.type === "disconnect") {
+        // Native reconnect keeps this verified session and its ordered KV clients. Invalidate
+        // Fabric-facing views/inbox before the client's next dial; the connection gate remains
+        // closed until USER.INFO passes and the verified reconnect status is delivered.
+        this.#epoch += 1;
+        this.#activeInbox?.controller.abort();
+        this.#sessionChannels.setConnection(undefined);
+      } else if (status.type === "reconnect") {
+        this.#sessionChannels.setConnection(session.connection.nc);
+        this.#resolveWaiters(session);
+        // A retained outbox row retries only after the native session was re-verified.
+        void this.#eventPublisher?.retry();
+      }
     });
-    void (session.connection as NatsConnectionHandle & { closed(): Promise<void | Error> }).closed().then(() => this.#loseSession(session));
+    void session.connection.closed().then((error) => {
+      if (authorizationFailure(error)) {
+        this.#terminalError = error instanceof Error ? error : new Error("NATS authorization failed");
+        this.#activeInbox?.controller.abort();
+        this.#rejectWaiters(this.#terminalError);
+      }
+      this.#loseSession(session);
+    });
     this.#resolveWaiters(session);
-    // A retained outbox row retries against the NEW verified publisher, with its original event id.
-    void this.#eventPublisher?.retry();
   }
 
   #loseSession(session: NatsSession): void {
@@ -491,12 +511,16 @@ class NatsTransportImpl implements FabricTransport {
     this.#activeInbox?.controller.abort();
     session.unsubscribe?.();
     void session.connection.close().catch(() => undefined);
+    if (this.#terminalError) {
+      this.#rejectWaiters(this.#terminalError);
+      return;
+    }
     this.#scheduleReconnect();
   }
 
   #scheduleReconnect(): void {
     if (this.#reconnectTask || this.#closed || this.#terminalError) return;
-    // ponytail: replace transparent client reconnect with one fully verified reopen path.
+    // Preserve a bounded full reopen only for hard closes; ordinary broker restarts use the native verified session.
     this.#reconnectTask = this.#reconnectLoop().finally(() => {
       this.#reconnectTask = undefined;
       // A just-installed session can close before this loop has settled.
@@ -531,8 +555,8 @@ class NatsTransportImpl implements FabricTransport {
     if (this.#terminalError) throw this.#terminalError;
     if (this.#closed) throw new TransportUnavailableError("NATS transport is closed");
     const session = this.#session;
-    if (!session || session.connection.nc.isClosed() || session.connection.nc.isDraining()) {
-      if (session) this.#loseSession(session);
+    if (!session || !session.connection.isVerified() || session.connection.nc.isClosed() || session.connection.nc.isDraining()) {
+      if (session && (session.connection.nc.isClosed() || session.connection.nc.isDraining())) this.#loseSession(session);
       throw new TransportUnavailableError("NATS transport is temporarily unavailable");
     }
     return session;
@@ -628,6 +652,7 @@ class NatsTransportImpl implements FabricTransport {
           }
           const consumer = await session.js.consumers.get(this.#stream, consumerPolicy.durable);
           messages = await consumer.consume({ max_messages: 16, callback: (msg) => {
+            if (!session.connection.isVerified()) return; // Native reconnect may replay SUBs before USER.INFO.
             if (!signal.aborted && !controller.signal.aborted && !this.#closed && this.#session === session && !queue.destroyed) queue.push(msg);
           } });
           this.#activeInbox = { controller, messages, queue };
@@ -635,10 +660,18 @@ class NatsTransportImpl implements FabricTransport {
           try {
             for await (const msg of queue as AsyncIterable<JsMsg>) {
               if (signal.aborted || controller.signal.aborted || this.#closed || this.#session !== session) break;
+              if (!session.connection.isVerified()) { controller.abort(); break; }
               let decoded;
               try { decoded = this.#decode(msg); }
               catch { await msg.term("malformed transport envelope"); continue; }
               const payload = decoded.envelope;
+              const assertCurrentDelivery = (): void => {
+                if (this.#terminalError) throw this.#terminalError;
+                if (this.#closed) throw new TransportUnavailableError("NATS transport is closed");
+                if (this.#session !== session || !session.connection.isVerified()) {
+                  throw new TransportUnavailableError("NATS inbox delivery is suspended until USER.INFO re-verifies");
+                }
+              };
               let finished = false;
               const delivery: TransportDelivery<TransportEnvelope> = {
                 payload,
@@ -646,15 +679,16 @@ class NatsTransportImpl implements FabricTransport {
                 verification: "bridge",
                 attempt: msg.info.deliveryCount,
                 sequence: msg.info.streamSequence,
-                working: () => { if (!finished) msg.working(); },
+                working: () => { if (!finished && this.#session === session && session.connection.isVerified()) msg.working(); },
                 ack: async () => {
                   if (finished) return;
+                  assertCurrentDelivery();
                   const confirmed = await msg.ackAck();
                   if (!confirmed) throw new Error("transport broker ACK was not confirmed");
                   finished = true;
                 },
-                nak: (delayMs?: number) => { if (!finished) msg.nak(delayMs); },
-                term: async (reason: string) => { if (!finished) { msg.term(reason); finished = true; } },
+                nak: (delayMs?: number) => { if (!finished) { assertCurrentDelivery(); msg.nak(delayMs); } },
+                term: async (reason: string) => { if (!finished) { assertCurrentDelivery(); msg.term(reason); finished = true; } },
               };
               yield delivery;
             }

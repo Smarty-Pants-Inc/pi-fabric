@@ -11,7 +11,7 @@ import { Kvm, type KV, type KvEntry } from "@nats-io/kv";
 import { PermissionViolationError } from "@nats-io/transport-node";
 import { NATS_KV_FLOW_CONTROL_WARNING, type SubscribeNatsStatus } from "./connection.js";
 import type { TransportKv, TransportKvEntry, TransportKvEvent } from "../types.js";
-import { KvConflictError, TransportDeniedError, TransportInvalidError, TransportUncertainError } from "../types.js";
+import { KvConflictError, TransportDeniedError, TransportInvalidError, TransportUnavailableError, TransportUncertainError } from "../types.js";
 import { publishFailure } from "./errors.js";
 
 export const LEASES_BUCKET = "fabric_leases";
@@ -37,6 +37,8 @@ export interface NatsKvPolicy {
 }
 
 const apiCode = (error: unknown): number | undefined => error instanceof JetStreamApiError ? error.apiError().err_code : undefined;
+const isUnavailable = (error: unknown): boolean => typeof error === "object" && error !== null &&
+  (error as { readonly code?: unknown }).code === "FABRIC_TRANSPORT_UNAVAILABLE";
 const abort = (signal?: AbortSignal): void => signal?.throwIfAborted();
 
 const validateMachine = (machine: string): string => {
@@ -215,17 +217,18 @@ export class NatsKvStore implements TransportKv {
     let endEpoch: (() => void) | undefined;
     let flowControlFailure: Error | undefined;
     const stop = (): void => { releaseReconnect?.(); endEpoch?.(); };
+    const pauseUntilReconnect = (): void => {
+      if (!disconnected) {
+        disconnected = true;
+        reconnect = new Promise<void>((resolve) => { releaseReconnect = resolve; });
+      }
+      invalidate?.();
+    };
     // Keep connection observation across snapshot generations, including setup and
     // the reconnect wait. Re-subscribing per generation can miss a disconnect.
     signal.addEventListener("abort", stop, { once: true });
     const unsubscribe = this.#onStatus?.((status) => {
-      if (status.type === "disconnect") {
-        if (!disconnected) {
-          disconnected = true;
-          reconnect = new Promise<void>((resolve) => { releaseReconnect = resolve; });
-        }
-        invalidate?.();
-      }
+      if (status.type === "disconnect") pauseUntilReconnect();
       if (status.type === "reconnect" || status.type === "close") {
         disconnected = false;
         closed = status.type === "close";
@@ -282,6 +285,7 @@ export class NatsKvStore implements TransportKv {
             const initial = await consumer.info(true);
             const apply = (msg: JsMsg): void => {
               if (reset || signal.aborted || ended) return;
+              if (this.#onStatus?.isVerified?.() === false) { pauseUntilReconnect(); return; }
               try {
                 const info = msg.info;
                 // Recreation status is asynchronous; reject a new generation's data
@@ -338,9 +342,16 @@ export class NatsKvStore implements TransportKv {
               if (reset || signal.aborted || closed) end();
             }
           } catch (error) {
-            // A disconnect during consumer creation still owes the caller reset,
-            // then a fresh snapshot after reconnect, not a terminal request error.
-            if (!reset && !signal.aborted && !closed) throw error;
+            // Gate failures can race the asynchronous `disconnect` status. Preserve the
+            // directory gap and await verified reconnect rather than killing its watch task.
+            if (!reset && !signal.aborted && !closed) {
+              if (error instanceof TransportUnavailableError || isUnavailable(error)) {
+                const verified = this.#onStatus?.isVerified?.();
+                if (verified === false) pauseUntilReconnect();
+                else if (this.#onStatus) gap();
+                else throw error;
+              } else throw error;
+            }
           }
           for await (const event of queue) yield event as TransportKvEvent<V>;
           if (flowControlFailure) failure = flowControlFailure;

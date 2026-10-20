@@ -18,7 +18,7 @@ const refuses = (value: Record<string, unknown>, field?: string) => {
 describe.sequential("NATS transport policy and TLS configuration", () => {
   it("normalizes the complete policy without reading credentials or CA and copies mutable inputs", () => {
     const input = nats(), before = structuredClone(input), actual = normalizeFabricConfig(config(input)).mesh.nats;
-    expect(actual).toEqual({ replicas: 1, inboxLanes: 8, ...input });
+    expect(actual).toEqual({ replicas: 1, inboxLanes: 8, ephemeralHost: false, ephemeralInactiveSeconds: 3_600, ...input });
     expect(actual).not.toBe(input); expect(actual.servers).not.toBe(input.servers);
     expect(actual.pathBMachines).not.toBe(input.pathBMachines); expect(actual.tls).not.toBe(input.tls);
     expect(input).toEqual(before);
@@ -78,7 +78,7 @@ describe.sequential("NATS transport policy and TLS configuration", () => {
   it("retains only approved FILE rollback machine and hold authority", () => {
     const rollbackHoldUntil = "2030-01-02T03:04:05Z";
     expect(normalizeFabricConfig({ mesh: { transport: "file", nats: { ...nats(), rollbackHoldUntil } } }).mesh.nats)
-      .toEqual({ replicas: 1, inboxLanes: 8, machine: "ryzen2", rollbackHoldUntil });
+      .toEqual({ replicas: 1, inboxLanes: 8, ephemeralHost: false, ephemeralInactiveSeconds: 3_600, machine: "ryzen2", rollbackHoldUntil });
   });
   it("inherits a whitelisted independent policy snapshot across different child workspace settings", () => {
     const parent = normalizeFabricConfig(config(nats())).mesh, before = structuredClone(parent);

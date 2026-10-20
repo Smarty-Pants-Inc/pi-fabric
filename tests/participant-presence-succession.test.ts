@@ -137,6 +137,13 @@ describe("#14115 initial own Main presence succession", () => {
     expect(f.presence.mutations).toEqual([{ key: pkey(), expected: 0, revision: publication.revision }]);
   });
 
+  it("preserves placement run-id metadata through the authenticated NATS presence projection", async () => {
+    const f = fixture(); f.lease(); const view = f.view();
+    await view.publish(root(NEXT, { placementRunId: "sandbox-run-1" }));
+    expect(await liveRoute(view)).toMatchObject({ live: true });
+    expect(view.get(ROOT)).toMatchObject({ id: ROOT, placementRunId: "sandbox-run-1" });
+  });
+
   it.each(["idle", "stopped"])("resumes the same Main immediately while its %s predecessor presence remains inside the 600s TTL", async status => {
     const f = fixture(), previous = f.stale({ status }); f.lease();
     const view = f.view(); await ready(view);

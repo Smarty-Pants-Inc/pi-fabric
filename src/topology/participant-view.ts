@@ -22,6 +22,7 @@ import {
   type TransportKvEntry,
 } from "../transport/types.js";
 import type { FabricKvHostLease, FabricParticipantInfo, FabricParticipantListOptions, FabricParticipantRecord } from "./types.js";
+import { isPlacementRunId } from "./placement-run-id.js";
 
 /** The lease task owns acquisition, monotonic expiry, successor evidence and release. */
 export interface ParticipantLeaseGate {
@@ -54,7 +55,7 @@ const MACHINE_TOKEN = /^[a-z0-9][a-z0-9-]{0,31}$/;
 const KEY_TOKEN = /^[a-f0-9]{32}$/;
 const RUNNER_TOKEN = /^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$/;
 const KV_CAPABILITIES = new Set(["steer", "followUp", "stop", "ask", "actor-bindings", "attach", "fabric"]);
-const KV_TRANSPORTS = new Set(["host", "hosted", "auto", "process", "tmux", "screen", "localterm", "herdr"]);
+const KV_TRANSPORTS = new Set(["host", "hosted", "auto", "process", "sandbox", "tmux", "screen", "localterm", "herdr"]);
 const KV_TERMINAL = new Set(["completed", "failed", "cancelled", "stopped", "timed_out", "done", "aborted"]);
 const tokenFor = (id: string): string => createHash("sha256").update(id).digest("hex").slice(0, 32);
 const objectValue = (value: unknown): value is Record<string, unknown> =>
@@ -100,8 +101,9 @@ export function presenceValue(entry: TransportKvEntry<unknown>): FabricParticipa
       typeof capability === "string" && KV_CAPABILITIES.has(capability)) ||
     !finiteValue(value.startedAt) || !finiteValue(value.updatedAt) ||
     (value.interactive !== undefined && typeof value.interactive !== "boolean") ||
-    !["sessionId", "cwd", "label", "role", "project", "projectRoot", "repository", "model", "thinking", "parentId", "finalAnswerReceiptId"]
+    !["sessionId", "cwd", "label", "role", "project", "projectRoot", "repository", "model", "thinking", "parentId", "finalAnswerReceiptId", "placementRunId"]
       .every(key => value[key] === undefined || typeof value[key] === "string") ||
+    value.placementRunId !== undefined && !isPlacementRunId(value.placementRunId) ||
     value.remoteHost !== undefined || value.bridgeVia !== undefined || value.stopReason !== undefined) return undefined;
   return value as unknown as FabricParticipantRecord;
 }

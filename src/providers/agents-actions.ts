@@ -31,7 +31,7 @@ const runProperties = {
   },
   transport: {
     type: "string",
-    enum: ["auto", "process", "tmux", "screen", "localterm", "herdr"],
+    enum: ["auto", "process", "sandbox", "tmux", "screen", "localterm", "herdr"],
   },
   model: {
     type: "string",

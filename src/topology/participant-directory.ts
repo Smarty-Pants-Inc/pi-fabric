@@ -6,6 +6,7 @@ import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { MeshBackgroundQueue, MeshBackgroundRetry, isMeshWriteDeferred } from "../core/atomic-write.js";
 import { participantProject, ParticipantRoleGrant, repositoryOf } from "./project-identity.js";
+import { isPlacementRunId, placementRunIdForParticipant } from "./placement-run-id.js";
 import { mainPublicationFenced, MainPublicationFencedError } from "./main-publication-fence.js";
 import type { FabricMainAgentInfo } from "../main-agent.js";
 import { DirectoryNotReadyError, TransportUnavailableError, type FabricTransport } from "../transport/types.js";
@@ -323,6 +324,7 @@ const transports = new Set([
   "hosted",
   "auto",
   "process",
+  "sandbox",
   "tmux",
   "screen",
   "localterm",
@@ -370,8 +372,11 @@ const optionalStrings = (value: Record<string, unknown>, keys: readonly string[]
 const placementFields = ["placementRunId", "placementKind", "placementHost", "expectedSeconds"] as const;
 const placementPresenceValid = (value: Record<string, unknown>): boolean => {
   const count = placementFields.filter(key => value[key] !== undefined).length;
-  return count === 0 || count === placementFields.length
-    && typeof value.placementRunId === "string" && /^[a-z0-9](?:[a-z0-9-]{0,55}[a-z0-9])?$/.test(value.placementRunId)
+  if (count === 0) return true;
+  // Island Main roots publish only the Pod-injected run correlation; process-placement
+  // records additionally carry the launcher admission metadata below.
+  if (count === 1 && isPlacementRunId(value.placementRunId)) return true;
+  return count === placementFields.length && isPlacementRunId(value.placementRunId)
     && (value.placementKind === "process" || value.placementKind === "remote")
     && typeof value.placementHost === "string" && /^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/.test(value.placementHost)
     && Number.isSafeInteger(value.expectedSeconds) && (value.expectedSeconds as number) >= 1 && (value.expectedSeconds as number) <= 604_800;
@@ -2705,8 +2710,12 @@ export class ParticipantDirectory implements FabricParticipantSource {
       text: _text,
       error: _error,
       ownerIncarnation: _incarnation,
+      placementRunId: _placementRunId,
       ...operational
     } = candidate as FabricParticipantRecord & { task?: unknown; text?: unknown; error?: unknown };
+    const placementRunId = candidate.kind === "root" && candidate.id === this.options.rootId && candidate.rootId === this.options.rootId
+      ? placementRunIdForParticipant(candidate.kind)
+      : undefined;
     return {
       ...operational,
       format: 1,
@@ -2718,6 +2727,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
           ? { status: "reloading", reloadUntil: this.#reloadUntil }
           : { capabilities: [], status: "stopping" }
         : {}),
+      ...(placementRunId ? { placementRunId } : {}),
       controlProtocol: "v1",
       livenessLeaseFiles: 1,
     };

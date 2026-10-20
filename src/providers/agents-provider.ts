@@ -459,7 +459,7 @@ export class AgentsProvider implements FabricProvider {
   /** Session registry of `provider:` participants; stop/steer/followUp route there. */
   providerParticipants: ProviderParticipantRegistry | undefined;
   readonly description =
-    "The user-facing Main target, one-shot Pi or Claude Code agents, and persistent mailbox actors over process, tmux, screen, LocalTerm, or Herdr";
+    "The user-facing Main target, one-shot Pi or Claude Code agents, and persistent mailbox actors over process, sandbox, tmux, screen, LocalTerm, or Herdr";
 
   constructor(
     readonly manager: AgentManager,

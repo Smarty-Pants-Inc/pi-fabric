@@ -77,14 +77,16 @@ describe.runIf(process.platform !== "win32")("root-owned host policy (#7591)", (
     for (const directory of [policyDirectory, agentDir, cwd]) fs.rmSync(directory, { recursive: true, force: true });
   });
 
-  it("keeps the default baseline when missing and ignores agent relaxations", () => {
+  it("keeps the default baseline when missing and ignores agent relaxations, including island enablement", () => {
     writeAgent({ executor: { landlock: { mode: "off", disabled: true } }, agents: {
-      processSlice: "legacy.slice", deniedModels: [], modelPolicy: { requireReason: [] },
+      processSlice: "legacy.slice", sandbox: { enabled: true, template: "project-agent", readyTimeoutMs: 30_000 }, deniedModels: [], modelPolicy: { requireReason: [] },
     } });
+    fs.writeFileSync(path.join(cwd, ".pi", "fabric.json"), JSON.stringify({ agents: { sandbox: { enabled: true } } }));
     for (let i = 0; i < 3; i++) {
       const loaded = load();
       expect(loaded.executor.landlock).toEqual({ mode: "off", disabled: false });
       expect(loaded.agents.processSlice).toBeUndefined();
+      expect(loaded.agents.sandbox).toEqual({ enabled: false, template: "smarty-proof-agent", readyTimeoutMs: 90_000 });
       expect(loaded.agents.deniedModels).toEqual([]);
       expect(loaded.agents.modelPolicy.requireReason).toEqual(["gpt-6-astra", "opus", "claude"]);
       expect(config.readHostLandlockDisabled(agentDir)).toBe(false);
@@ -92,6 +94,14 @@ describe.runIf(process.platform !== "win32")("root-owned host policy (#7591)", (
     }
     expect(warn.mock.calls.filter(call => String(call[0]).includes("is missing"))).toHaveLength(1);
     expect(String(warn.mock.calls.find(call => String(call[0]).includes("is missing"))?.[0])).toContain(HOST_POLICY_PATH);
+  });
+
+  it("accepts sandbox enablement only from the validated root policy", () => {
+    simulateRootOwnership();
+    writePolicy({ agents: { sandbox: { enabled: true, template: "smarty-proof-agent", readyTimeoutMs: 30_000 } } });
+    writeAgent({ agents: { sandbox: { enabled: false } } });
+    fs.writeFileSync(path.join(cwd, ".pi", "fabric.json"), JSON.stringify({ agents: { sandbox: { enabled: false, template: "project-agent" } } }));
+    expect(load().agents.sandbox).toEqual({ enabled: true, template: "smarty-proof-agent", readyTimeoutMs: 30_000 });
   });
 
   describe.each(["agent", "project"] as const)("%s Landlock tightening", scope => {

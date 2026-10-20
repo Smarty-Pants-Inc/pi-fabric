@@ -6,7 +6,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import type { ConsumerInfo, JetStreamManager } from "@nats-io/jetstream";
+import { JetStreamApiError, type ConsumerInfo, type JetStreamManager } from "@nats-io/jetstream";
 import { PATH_B_OPERATOR_MACHINE } from "../src/mesh/nats-auth/permissions.js";
 import { openNatsTransport } from "../src/transport/nats/inbox.js";
 import type { FabricTransport, TransportKv } from "../src/transport/types.js";
@@ -86,11 +86,36 @@ async function waitForConsumerGone(manager: JetStreamManager, hostId: string): P
   const deadline = Date.now() + 5_000;
   while (Date.now() < deadline) {
     try { await manager.consumers.info(stream, durable); }
-    catch { return; }
+    catch (error) {
+      if (error instanceof JetStreamApiError) {
+        let code: number;
+        try { code = error.apiError().err_code; } catch { code = error.code; }
+        if (code === 10014) return;
+      }
+      throw error;
+    }
     await sleep(50);
   }
   throw new Error(`CLI inbox durable ${durable} remained after shutdown`);
 }
+
+const managerWithInfoError = (error: unknown): JetStreamManager => ({
+  consumers: { info: async () => { throw error; } },
+} as unknown as JetStreamManager);
+
+describe("CLI inbox durable cleanup", () => {
+  it("accepts JetStream consumer-not-found as confirmed deletion", async () => {
+    const missing = new JetStreamApiError({ code: 404, err_code: 10014, description: "consumer not found" });
+    await expect(waitForConsumerGone(managerWithInfoError(missing), "runtime:test")).resolves.toBeUndefined();
+  });
+
+  it.each([
+    ["JetStream permission failure", new JetStreamApiError({ code: 403, err_code: 10000, description: "permission denied" })],
+    ["connection failure", new Error("connection closed")],
+  ] as const)("rethrows %s instead of treating it as deletion", async (_name, error) => {
+    await expect(waitForConsumerGone(managerWithInfoError(error), "runtime:test")).rejects.toBe(error);
+  });
+});
 
 async function waitForGone(kv: TransportKv, key: string): Promise<void> {
   const deadline = Date.now() + 5_000;

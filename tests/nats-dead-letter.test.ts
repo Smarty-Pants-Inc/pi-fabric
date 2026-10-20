@@ -8,6 +8,7 @@ import { runTransportAdmin } from "../src/transport/nats/admin.js";
 import { consumeDeadLetters, ensureDeadLetterConsumer, type DeadLetterEnvelope, type DeadLetterSink } from "../src/transport/nats/dead-letter.js";
 import { openNatsConnection, type NatsConnectionHandle } from "../src/transport/nats/connection.js";
 import { ensureTransportStream } from "../src/transport/nats/provision.js";
+import { DEFAULT_INBOX_MAX_AGE_MS } from "../src/transport/nats/inbox-policy.js";
 import { ADVISORY_CAPTURE_STREAM, transportAdvisoryStreamSubject, transportDurableName, transportInboxFilter, transportInboxStream, transportInboxSubject } from "../src/transport/nats/subjects.js";
 import { createPathBHarness, openJetStream, resolveNatsBinary, PATH_B_MACHINES, PATH_B_POLICY_ENV, type PathBHarness, type PathBUser } from "./helpers/nats-cluster.js";
 
@@ -361,7 +362,7 @@ describe.skipIf(!binary)("standard durable MAX_DELIVERIES operator with actual P
     const after = await receiver.manager.consumers.info(stream, durable);
     expect({ pending: after.num_pending, ackPending: after.num_ack_pending, ackFloor: after.ack_floor }).toEqual({ pending: before.num_pending, ackPending: before.num_ack_pending, ackFloor: before.ack_floor });
     const policy = await bootstrap.manager.streams.info(stream);
-    expect(policy.config.max_age).toBe(0);
+    expect(policy.config.max_age).toBe(DEFAULT_INBOX_MAX_AGE_MS * 1_000_000);
     expect(policy.config.discard).toBe("new");
     expect(policy.config.max_bytes).toBe(1_073_741_824);
     expect(policy.state.messages).toBe(3);

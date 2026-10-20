@@ -118,6 +118,9 @@ const lazyEntryPoints = [
   "src/agents/result.ts",
   "src/agents/veda-cli.ts",
   "src/agents/transports/placement.ts",
+  // Placement admission, intent construction and terminal receipts load only at first use.
+  "src/placement/client.ts",
+  "src/placement/terminal.ts",
   // Also loaded by the worker as a Pi extension (-e) for confined children.
   "src/agents/write-guard.ts",
   // Also loaded by the worker (-e) so extensions: false children keep

@@ -8,7 +8,8 @@ import {
   type JsMsg,
 } from "@nats-io/jetstream";
 import { Kvm, type KV, type KvEntry } from "@nats-io/kv";
-import type { SubscribeNatsStatus } from "./connection.js";
+import { PermissionViolationError } from "@nats-io/transport-node";
+import { NATS_KV_FLOW_CONTROL_WARNING, type SubscribeNatsStatus } from "./connection.js";
 import type { TransportKv, TransportKvEntry, TransportKvEvent } from "../types.js";
 import { KvConflictError, TransportDeniedError, TransportInvalidError, TransportUncertainError } from "../types.js";
 import { publishFailure } from "./errors.js";
@@ -171,12 +172,14 @@ export class NatsKvStore implements TransportKv {
     if (signal.aborted) return;
     const stream = `KV_${this.#policy.bucket}`;
     const subjectPrefix = `$KV.${this.#policy.bucket}.`;
+    const flowControlPrefix = `$JS.FC.${stream}.`;
     let disconnected = false;
     let closed = false;
     let reconnect = Promise.resolve();
     let releaseReconnect: (() => void) | undefined;
     let invalidate: (() => void) | undefined;
     let endEpoch: (() => void) | undefined;
+    let flowControlFailure: Error | undefined;
     const stop = (): void => { releaseReconnect?.(); endEpoch?.(); };
     // Keep connection observation across snapshot generations, including setup and
     // the reconnect wait. Re-subscribing per generation can miss a disconnect.
@@ -195,6 +198,11 @@ export class NatsKvStore implements TransportKv {
         if (closed) invalidate?.();
         releaseReconnect?.();
       }
+      if (!flowControlFailure && status.type === "error" && status.error instanceof PermissionViolationError && status.error.operation === "publish" &&
+        status.error.subject.startsWith(flowControlPrefix)) {
+        flowControlFailure = new TransportDeniedError(NATS_KV_FLOW_CONTROL_WARNING, { cause: status.error });
+        endEpoch?.();
+      }
     });
     try {
       while (!signal.aborted && !closed) {
@@ -207,7 +215,7 @@ export class NatsKvStore implements TransportKv {
         let reset = false;
         let ready = false;
         let ended = false;
-        let failure: unknown;
+        let failure: unknown = flowControlFailure;
         let delivered = 0;
         const emit = (event: TransportKvEvent<V>): void => { if (!ended && !queue.destroyed) queue.push(event); };
         const end = (): void => {
@@ -269,6 +277,7 @@ export class NatsKvStore implements TransportKv {
             if (initial.num_pending === 0) markReady();
             if (!reset && !signal.aborted && !closed) {
               messages = await consumer.consume({ callback: apply });
+              if (failure || flowControlFailure) messages.stop();
               statusTask = (async () => {
                 for await (const status of messages!.status()) {
                   switch (status.type) {
@@ -300,6 +309,7 @@ export class NatsKvStore implements TransportKv {
             if (!reset && !signal.aborted && !closed) throw error;
           }
           for await (const event of queue) yield event as TransportKvEvent<V>;
+          if (flowControlFailure) failure = flowControlFailure;
           if (failure) throw failure;
           if (!reset) return;
         } finally {

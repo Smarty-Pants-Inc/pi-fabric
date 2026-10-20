@@ -1,6 +1,7 @@
 import { closeSync, constants as fsConstants, fstatSync, openSync, readFileSync } from "node:fs";
 import { Buffer } from "node:buffer";
 import { isIP } from "node:net";
+import { setTimeout as sleep } from "node:timers/promises";
 import { credsAuthenticator, type Msg, type NatsConnection, type Subscription } from "@nats-io/nats-core";
 import { jetstream, jetstreamManager, type JetStreamClient, type JetStreamManager } from "@nats-io/jetstream";
 import { AuthorizationError, PermissionViolationError, connect, type NodeConnectionOptions, type Status, type TlsOptions } from "@nats-io/transport-node";
@@ -60,7 +61,7 @@ export interface NatsConnectionHandle {
   readonly js: JetStreamClient;
   readonly manager: JetStreamManager;
   readonly userInfo?: unknown;
-  /** Resolves a typed retryable error on hard loss or the terminal USER.INFO re-verification failure. */
+  /** Resolves a typed retryable error on hard loss, or a terminal error for a USER.INFO identity/permission mismatch. */
   closed(): Promise<void | Error>;
   /** False while native reconnect is in progress or USER.INFO is being re-verified. */
   isVerified(): boolean;
@@ -376,7 +377,8 @@ const open = async (
   });
   // Official connect has no signal option: its timeout bounds dialing. Once a handle exists,
   // cancellation closes it immediately, including during USER.INFO and provisioning awaits.
-  const onAbort = (): void => { void nc.close().catch(() => undefined); };
+  const verificationRetryAbort = new AbortController();
+  const onAbort = (): void => { verificationRetryAbort.abort(); void nc.close().catch(() => undefined); };
   const removeAbort = (): void => signal?.removeEventListener("abort", onAbort);
   signal?.addEventListener("abort", onAbort, { once: true });
   try {
@@ -424,6 +426,7 @@ const open = async (
     let authFailure!: (error: NatsAuthorizationError) => void;
     const authFailurePromise = new Promise<Error>((resolve) => { authFailure = resolve; });
     const nativeClosed = nc.closed().then((cause) => {
+      verificationRetryAbort.abort();
       removeAbort();
       if (closing) return undefined;
       if (cause) return connectionFailure(cause, "NATS connection lost; native reconnect ended");
@@ -444,27 +447,37 @@ const open = async (
       if (closing) return statusTask ?? Promise.resolve();
       closing = true;
       verified = false;
+      verificationRetryAbort.abort();
       removeAbort();
       const task = (async () => { await nc.close(); await statusTask; listeners.clear(); })();
       return task;
     };
     statusTask = (async () => {
+      let verificationRetryAttempt = 0;
       for await (const status of nc.status()) {
         if (status.type === "disconnect") verified = false;
         if (status.type === "reconnect") {
-          try {
-            if (verify) await verify(nc, timeoutMs, auth);
-            if (nc.isClosed() || nc.isDraining()) throw new TransportUnavailableError("NATS closed during USER.INFO re-verification");
-            verified = true;
-            reconnectAttempt = 0;
-          } catch (cause) {
-            const error = cause instanceof NatsAuthorizationError ? cause :
-              new NatsAuthorizationError("NATS USER.INFO re-verification failed", { cause });
-            verified = false;
-            authFailure(error);
-            notify({ type: "close" });
-            void close().catch(() => undefined);
-            return;
+          for (;;) {
+            if (closing || verificationRetryAbort.signal.aborted || nc.isClosed() || nc.isDraining()) return;
+            try {
+              if (verify) await verify(nc, timeoutMs, auth);
+              if (nc.isClosed() || nc.isDraining()) throw new TransportUnavailableError("NATS closed during USER.INFO re-verification");
+              verified = true;
+              reconnectAttempt = 0;
+              verificationRetryAttempt = 0;
+              break;
+            } catch (cause) {
+              verified = false;
+              if (cause instanceof NatsAuthorizationError) {
+                authFailure(cause);
+                notify({ type: "close" });
+                void close().catch(() => undefined);
+                return;
+              }
+              if (closing || verificationRetryAbort.signal.aborted || nc.isClosed() || nc.isDraining()) return;
+              const base = Math.min(5_000, 500 * 2 ** Math.min(verificationRetryAttempt++, 4));
+              await sleep(base + Math.floor(Math.random() * 250), undefined, { signal: verificationRetryAbort.signal }).catch(() => undefined);
+            }
           }
         }
         notify(status);

@@ -297,8 +297,18 @@ export class NatsLocalProjection {
       for (const [key, pending] of [...this.#pendingEntries]) {
         if (this.#closed || !this.options.leaseLive()) break;
         if (this.#pendingEntries.get(key) !== pending) continue;
-        try { await this.#put(pending.bucket, pending.entry); }
-        catch (error) { failures.push(error); }
+        try {
+          const kv = pending.bucket === "presence" ? this.#presence : this.#leases;
+          const current = await kv.get<unknown>(pending.entry.key, AbortSignal.timeout(5_000));
+          if (this.#closed || !this.options.leaseLive()) break;
+          if (this.#pendingEntries.get(key) !== pending) continue;
+          if (!current) {
+            await this.#remove(pending.bucket, pending.entry.key, pending.entry.revision, markerFor(pending.entry));
+            if (this.#pendingEntries.get(key) === pending) this.#pendingEntries.delete(key);
+            continue;
+          }
+          await this.#put(pending.bucket, current);
+        } catch (error) { failures.push(error); }
       }
       if (failures.length) throw new AggregateError(failures, "NATS local projection lease recovery failed");
     })().finally(() => {

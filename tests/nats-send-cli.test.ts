@@ -6,6 +6,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import type { ConsumerInfo, JetStreamManager } from "@nats-io/jetstream";
 import { PATH_B_OPERATOR_MACHINE } from "../src/mesh/nats-auth/permissions.js";
 import { openNatsTransport } from "../src/transport/nats/inbox.js";
 import type { FabricTransport, TransportKv } from "../src/transport/types.js";
@@ -13,7 +14,8 @@ import { FabricControlPlane } from "../src/topology/control-plane.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
-import { createPathBHarness, PATH_B_MACHINES, PATH_B_POLICY_ENV, resolveNatsBinary, type PathBHarness } from "./helpers/nats-cluster.js";
+import { createPathBHarness, openJetStream, PATH_B_MACHINES, PATH_B_POLICY_ENV, resolveNatsBinary, type PathBHarness } from "./helpers/nats-cluster.js";
+import { transportDurableName, transportInboxStream } from "../src/transport/nats/subjects.js";
 
 const binary = resolveNatsBinary() ?? "";
 if (!binary && process.env.NATS_AUTH_REQUIRED === "1") throw new Error("NATS_AUTH_REQUIRED=1 but no nats-server executable was found");
@@ -23,6 +25,13 @@ const cliEntry = fileURLToPath(new URL(builtNodeCli ? "../dist/cli/index.js" : "
 const cliRuntime = builtNodeCli ? "node" : process.versions.bun ? process.execPath : "bun";
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 const tokenFor = (id: string) => createHash("sha256").update(id).digest("hex").slice(0, 32);
+const cliHostId = (machine: string, creds: string, name: string, stateHome: string): string => {
+  const bytes = Buffer.from(createHash("sha256").update(machine).update("\0").update(path.resolve(creds)).update("\0")
+    .update(name).update("\0").update(path.resolve(stateHome)).digest().subarray(0, 16));
+  bytes[6] = (bytes[6]! & 0x0f) | 0x40;
+  bytes[8] = (bytes[8]! & 0x3f) | 0x80;
+  return `runtime:${bytes.toString("hex")}`;
+};
 const UUID_PATTERN_FOR_TEST = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const brokerSuite = describe.skipIf(!binary || process.platform !== "linux");
 
@@ -60,6 +69,27 @@ function runCli(
     child.once("error", reject);
     child.once("close", (code, signal) => resolve({ code, signal, stdout, stderr }));
   });
+}
+
+async function waitForConsumer(manager: JetStreamManager, hostId: string): Promise<ConsumerInfo> {
+  const stream = transportInboxStream("machine-a"), durable = transportDurableName(hostId);
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    try { return await manager.consumers.info(stream, durable); }
+    catch { await sleep(50); }
+  }
+  throw new Error(`CLI inbox durable ${durable} was not created`);
+}
+
+async function waitForConsumerGone(manager: JetStreamManager, hostId: string): Promise<void> {
+  const stream = transportInboxStream("machine-a"), durable = transportDurableName(hostId);
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    try { await manager.consumers.info(stream, durable); }
+    catch { return; }
+    await sleep(50);
+  }
+  throw new Error(`CLI inbox durable ${durable} remained after shutdown`);
 }
 
 async function waitForGone(kv: TransportKv, key: string): Promise<void> {
@@ -124,6 +154,7 @@ brokerSuite("pi-fabric nats send over a real authenticated broker", () => {
       hostId: rootId, rootId, identity: ownerIdentity,
     });
     let ownerPlane: FabricControlPlane | undefined;
+    let inspector: Awaited<ReturnType<typeof fixture.connect>> | undefined;
     let replacementPlane: FabricControlPlane | undefined;
     let replacementDirectory: ParticipantDirectory | undefined;
     let replacementTransport: FabricTransport | undefined;
@@ -143,9 +174,11 @@ brokerSuite("pi-fabric nats send over a real authenticated broker", () => {
       if (!view) throw new Error("target NATS view is unavailable");
       const routeSignal = AbortSignal.timeout(5_000);
       while (!view.resolve(rootId)?.live) await view.whenChanged(rootId, routeSignal);
+      const stateHome = path.join(fixture.root, `nats-send-state-${sessionId}`);
+      const cliName = `test ${kind}`;
       const env: NodeJS.ProcessEnv = { ...process.env, ...PATH_B_POLICY_ENV,
         PI_FABRIC_MESH_TRANSPORT: "nats", PI_FABRIC_MESH_HOST_TRANSPORT: "nats",
-        XDG_STATE_HOME: path.join(fixture.root, "nats-send-state") };
+        XDG_STATE_HOME: stateHome };
       delete env.PI_FABRIC_MESH_NATS;
       delete env.NODE_EXTRA_CA_CERTS;
       delete env.NODE_TLS_REJECT_UNAUTHORIZED;
@@ -210,16 +243,22 @@ brokerSuite("pi-fabric nats send over a real authenticated broker", () => {
         "--creds", fixture.users.machineA.credsPath, "--ca", fixture.tls!.caFile,
         "--servers", `tls://localhost:${port}`, "--machine", "machine-a",
         "--org", "tristar", "--path-b-machines", "machine-a,machine-b",
-        "--name", `test ${kind}`, "--idempotency-key", `nats-send-${kind}-${sessionId}`, "--timeout-ms", "15000",
+        "--name", cliName, "--idempotency-key", `nats-send-${kind}-${sessionId}`, "--timeout-ms", "15000",
         ...(awaitReplySeconds === undefined ? [] : ["--await-reply-seconds", String(awaitReplySeconds)]),
       ];
+      inspector = await fixture.connect(fixture.users.bootstrap);
+      const admin = await openJetStream(inspector);
+      const expectedSenderHostId = cliHostId("machine-a", fixture.users.machineA.credsPath, cliName, stateHome);
+      let senderConsumer: ConsumerInfo | undefined;
       let cli: Awaited<ReturnType<typeof runCli>>;
       let routeChangeElapsedMs: number | undefined;
       if (routeChange) {
         let resolveFirstLine!: (line: string) => void;
         const firstLine = new Promise<string>(resolve => { resolveFirstLine = resolve; });
         const cliPromise = runCli(args, env, "", resolveFirstLine);
+        const consumerPromise = waitForConsumer(admin.manager, expectedSenderHostId);
         const acknowledgement = JSON.parse(await firstLine) as Record<string, unknown>;
+        senderConsumer = await consumerPromise;
         expect(acknowledgement).toMatchObject({ queued: true, acknowledged: true, routed: "mesh" });
         const senderId = received[0]!.from.id;
         const correlationId = (received[0]!.data as { replyCorrelationId: string }).replyCorrelationId;
@@ -269,7 +308,12 @@ brokerSuite("pi-fabric nats send over a real authenticated broker", () => {
         void delivery.catch(() => undefined);
         cli = await cliPromise;
         routeChangeElapsedMs = Date.now() - staleReplyStartedAt;
-      } else cli = await runCli(args, env, inputMode === "stdin" ? message : "");
+      } else {
+        const cliPromise = runCli(args, env, inputMode === "stdin" ? message : "");
+        senderConsumer = await waitForConsumer(admin.manager, expectedSenderHostId);
+        cli = await cliPromise;
+      }
+      expect(senderConsumer?.config.inactive_threshold).toBe(3_600 * 1_000_000_000);
       expect(cli.signal).toBeNull();
       expect(cli.code, `${cli.stdout}\n${cli.stderr}`).toBe(routeChange ? 1 : awaitReplySeconds === 1 && !sendReply ? 2 : 0);
       expect(cli.stderr).toBe("");
@@ -307,6 +351,8 @@ brokerSuite("pi-fabric nats send over a real authenticated broker", () => {
       const leaseKv = monitorTransport.kv("leases");
       await waitForGone(presenceKv, `machine-a.p.${tokenFor(senderId)}`);
       await waitForGone(leaseKv, `machine-a.h.${tokenFor(senderHostId)}`);
+      await waitForConsumerGone(admin.manager, senderHostId);
+      expect(senderHostId).toBe(expectedSenderHostId);
       expect((replacementDirectory?.participantView ?? view).resolve(senderId)).toBeUndefined();
       if (sendReply) {
         const retry = await runCli(args, env);
@@ -318,13 +364,16 @@ brokerSuite("pi-fabric nats send over a real authenticated broker", () => {
         expect(received).toHaveLength(1);
         await waitForGone(presenceKv, `machine-a.p.${tokenFor(senderId)}`);
         await waitForGone(leaseKv, `machine-a.h.${tokenFor(senderHostId)}`);
+        await waitForConsumerGone(admin.manager, senderHostId);
       }
     } finally {
-      try { await replacementPlane?.close(); } finally {
-        try { await replacementDirectory?.close(); } finally {
-          try { await replacementTransport?.close(); } finally {
-            try { await ownerPlane?.close(); } finally {
-              try { await ownerDirectory.close(); } finally { await ownerTransport.close(); }
+      try { await inspector?.close(); } finally {
+        try { await replacementPlane?.close(); } finally {
+          try { await replacementDirectory?.close(); } finally {
+            try { await replacementTransport?.close(); } finally {
+              try { await ownerPlane?.close(); } finally {
+                try { await ownerDirectory.close(); } finally { await ownerTransport.close(); }
+              }
             }
           }
         }

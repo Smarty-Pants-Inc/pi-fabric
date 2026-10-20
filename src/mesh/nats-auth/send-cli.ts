@@ -13,6 +13,7 @@ import { ParticipantDirectory } from "../../topology/participant-directory.js";
 import type { FabricParticipantRecord } from "../../topology/types.js";
 import { pathBMachines } from "./mint.js";
 import { PATH_B_OPERATOR_MACHINE } from "./permissions.js";
+import { DEFAULT_INBOX_MAX_AGE_MS, isValidInboxMaxAgeMs } from "../../transport/nats/inbox-policy.js";
 
 const SEND_USAGE = [
   "Usage: pi-fabric nats send --to <participant-id> --kind <followUp|steer>",
@@ -206,7 +207,8 @@ function readTextStream(fd: number): string {
   return decodeTextInput(Buffer.concat(chunks, total), "stdin");
 }
 
-function policyConfig(): { custodyStream: string; livenessStream: string; pathBMachines: string[]; operatorMachine: string } {
+function policyConfig(): { custodyStream: string; livenessStream: string; pathBMachines: string[]; operatorMachine: string;
+  ephemeralHost: boolean; ephemeralInactiveSeconds: number; inboxMaxAgeMs: number } {
   const raw = process.env.PI_FABRIC_MESH_NATS;
   let source: Record<string, unknown> | undefined;
   if (raw !== undefined) {
@@ -226,12 +228,22 @@ function policyConfig(): { custodyStream: string; livenessStream: string; pathBM
     ? rawMachines
     : typeof rawMachines === "string" ? rawMachines.split(",").map((machine) => machine.trim()) : undefined;
   const operatorMachine = source?.operatorMachine ?? PATH_B_OPERATOR_MACHINE;
+  const ephemeralHost = source?.ephemeralHost === undefined ? true : source.ephemeralHost;
+  const ephemeralInactiveSeconds = source?.ephemeralInactiveSeconds === undefined ? 3_600 : source.ephemeralInactiveSeconds;
+  const inboxMaxAgeMs = source?.inboxMaxAgeMs === undefined ? DEFAULT_INBOX_MAX_AGE_MS : source.inboxMaxAgeMs;
   if (typeof custodyStream !== "string" || !custodyStream || typeof livenessStream !== "string" || !livenessStream ||
     !pathBMachines || pathBMachines.length === 0 || !pathBMachines.every((machine) => typeof machine === "string" && machine.length > 0) ||
     typeof operatorMachine !== "string" || !operatorMachine) {
     throw new SendCliError("NATS policy requires custodyStream, livenessStream, pathBMachines, and operatorMachine");
   }
-  return { custodyStream, livenessStream, pathBMachines: [...pathBMachines], operatorMachine };
+  if (typeof ephemeralHost !== "boolean") throw new SendCliError("mesh.nats.ephemeralHost must be a boolean");
+  if (typeof ephemeralInactiveSeconds !== "number" || !Number.isSafeInteger(ephemeralInactiveSeconds) ||
+    ephemeralInactiveSeconds < 300 || ephemeralInactiveSeconds > 86_400) {
+    throw new SendCliError("mesh.nats.ephemeralInactiveSeconds must be an integer from 300 through 86400");
+  }
+  if (!isValidInboxMaxAgeMs(inboxMaxAgeMs)) throw new SendCliError("mesh.nats.inboxMaxAgeMs must be a bounded positive number of milliseconds");
+  return { custodyStream, livenessStream, pathBMachines: [...pathBMachines], operatorMachine,
+    ephemeralHost, ephemeralInactiveSeconds, inboxMaxAgeMs };
 }
 
 function stableSenderIdentity(options: NatsSendOptions, stateHome: string): { token: string; sessionId: string } {
@@ -451,6 +463,9 @@ export async function openAndSend(options: NatsSendOptions, onAcknowledged: Ackn
         ...(options.org === undefined ? {} : { org: options.org }),
         tls: { caFile: options.ca },
         operatorMachine: policy.operatorMachine,
+        ephemeralHost: policy.ephemeralHost,
+        ephemeralInactiveSeconds: policy.ephemeralInactiveSeconds,
+        inboxMaxAgeMs: policy.inboxMaxAgeMs,
       },
     };
     mesh = new MeshStore(meshRoot, meshConfig.maxEventBytes, meshConfig.maxReadEvents, {

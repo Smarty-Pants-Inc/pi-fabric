@@ -79,7 +79,7 @@ brokerSuite("pi-fabric nats dispatch by real placement-run presence", () => {
       expectedCode: 0,
     },
     {
-      name: "retries an acknowledged dispatch after a reply timeout without accepting another run",
+      name: "dedupes a timed-out dispatch retry and refuses changed content or unsafe bindings",
       runIds: ["dispatch-fixture-retry"],
       replyRunId: (_runId: string) => null,
       expectedCode: 2,
@@ -246,6 +246,52 @@ brokerSuite("pi-fabric nats dispatch by real placement-run presence", () => {
         });
         expect(retriedRecords[1]!.t_task_dispatched).toMatch(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{9}Z$/);
         expect(retriedRecords[1]!.t_ack).toMatch(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{9}Z$/);
+        expect(owner.directory.participantView?.resolve(owner.id)?.live).toBe(true);
+        expect(received).toEqual(accepted);
+        expect(received).toHaveLength(1);
+
+        const bindingDir = path.join(env.XDG_STATE_HOME!, "pi-fabric", "nats-dispatch");
+        const bindingFile = path.join(bindingDir, `${createHash("sha256").update(owner.runId).digest("hex")}.json`);
+        const bindingBytes = fs.readFileSync(bindingFile, "utf8");
+        expect(JSON.parse(bindingBytes)).toEqual({
+          format: 1,
+          contentSha256: createHash("sha256").update(JSON.stringify([fs.readFileSync(taskFile, "utf8"), owner.id])).digest("hex"),
+        });
+        expect(fs.readdirSync(bindingDir)).toEqual([path.basename(bindingFile)]);
+        expect(fs.statSync(bindingDir).mode & 0o777).toBe(0o700);
+        expect(fs.statSync(bindingFile).mode & 0o777).toBe(0o600);
+
+        // A new process and receipt path must not hide a changed task behind the stable run-id key.
+        fs.writeFileSync(taskFile, "Complete a different task instead of the previously accepted work.");
+        const refusedOut = path.join(caseRoot, "changed-task-results.jsonl");
+        const changedArgs = argsFor(owner.runId);
+        changedArgs[changedArgs.indexOf("--out") + 1] = refusedOut;
+        const changed = await runCli(changedArgs, env);
+        expect(changed).toMatchObject({ code: 1, signal: null, stderr: "" });
+        const refused = JSON.parse(changed.stdout) as Record<string, unknown>;
+        expect(refused).toMatchObject({
+          runId: owner.runId, error: "run id reused with different content",
+          t_task_dispatched: null, t_ack: null, t_answer_received: null,
+          answer_ok: false, answer_text_sha256: null,
+        });
+        expect(JSON.parse(fs.readFileSync(refusedOut, "utf8"))).toEqual(refused);
+        expect(fs.readFileSync(bindingFile, "utf8")).toBe(bindingBytes);
+
+        // Neither malformed state nor a symlink may reset or redirect the binding, even with a live target.
+        const symlinkTarget = path.join(caseRoot, "binding-symlink-target.json");
+        fs.writeFileSync(symlinkTarget, bindingBytes, { mode: 0o600 });
+        for (const unsafe of ["malformed", "symlink"] as const) {
+          fs.unlinkSync(bindingFile);
+          if (unsafe === "malformed") fs.writeFileSync(bindingFile, "{", { mode: 0o600 });
+          else fs.symlinkSync(symlinkTarget, bindingFile);
+          const invalid = await runCli(changedArgs, env);
+          expect(invalid).toMatchObject({ code: 1, signal: null, stderr: "" });
+          expect(JSON.parse(invalid.stdout)).toMatchObject({
+            error: "could not safely persist dispatch run binding", t_task_dispatched: null, t_ack: null,
+          });
+          expect(received).toEqual(accepted);
+        }
+        expect(fs.readFileSync(symlinkTarget, "utf8")).toBe(bindingBytes);
         expect(owner.directory.participantView?.resolve(owner.id)?.live).toBe(true);
         expect(received).toEqual(accepted);
         expect(received).toHaveLength(1);

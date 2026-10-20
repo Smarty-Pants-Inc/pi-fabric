@@ -346,6 +346,46 @@ describe.skipIf(!binary || process.platform === "win32")("verified transport reo
     } finally { await f.close(); }
   }, 90_000);
 
+  it("retries a transient USER.INFO timeout on native reconnect and resumes the inbox", async () => {
+    const f = await fixture(false);
+    const relay = f.relays[0]!;
+    let inbox: AsyncIterator<import("../src/transport/types.js").TransportDelivery<TransportEnvelope>> | undefined;
+    try {
+      inbox = f.runtime.inbox(f.abort.signal)[Symbol.asyncIterator]();
+      const initial = inbox.next();
+      await f.runtime.send(command("before-transient-verification-timeout"));
+      const delivered = (await bounded(initial, "pre-timeout inbox delivery")).value!;
+      await delivered.ack();
+      const resumedInbox = inbox.next();
+      void resumedInbox.catch(() => undefined);
+
+      relay.subjects.length = 0;
+      relay.commands.length = 0;
+      relay.dropNextVerification = true;
+      relay.disconnect();
+      relay.enabled = true;
+      await bounded(relay.verification.promise, "first reconnect USER.INFO request is dropped", 10_000);
+      expect(relay.subjects).toEqual(["$SYS.REQ.USER.INFO"]);
+      expect(await outcome(() => f.runtime.send(command("blocked-during-transient-verification"))))
+        .toBeInstanceOf(TransportUnavailableError);
+      expect(await outcome(() => f.runtime.kv("presence").get("machine-a.h.reconnect-timeout")))
+        .toBeInstanceOf(TransportUnavailableError);
+
+      const retry = command("after-transient-verification-timeout");
+      await sendAfterReopen(f.runtime, retry);
+      const resumed = (await bounded(resumedInbox, "existing inbox resumes after retry verification")).value!;
+      expect(resumed.payload.id).toBe(retry.id);
+      await resumed.ack();
+      expect(relay.subjects.filter((subject) => subject === "$SYS.REQ.USER.INFO")).toHaveLength(2);
+      expect(await f.runtime.drainState()).toEqual({ pending: 0, ackPending: 0 });
+      expect(relay.errors).toEqual([]);
+    } finally {
+      f.abort.abort();
+      await inbox?.return?.();
+      await f.close();
+    }
+  }, 90_000);
+
   it("re-verifies changed USER.INFO permissions before native reconnect sends or inbox delivery resume", async () => {
     const f = await fixture(false);
     const broker = f.brokers[0]!;

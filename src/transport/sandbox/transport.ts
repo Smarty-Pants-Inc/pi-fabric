@@ -320,7 +320,9 @@ export class SandboxTransport implements AgentTransportAdapter {
       isAlive: async () => !settled,
       stop: async () => {
         if (settled) return;
-        if (!(await stopChild("sandbox stop was not confirmed"))) throw new Error("Sandbox child stop was not confirmed; placement custody retained");
+        if (!(await stopChild("sandbox stop was not confirmed"))) {
+          throw new Error(`Sandbox child stop was not confirmed: ${lostContact ?? "placement custody retained"}`);
+        }
         await finish(() => terminal("failed", "stopped", "", { error: "Sandbox task stopped", reason: "child stop was confirmed" }));
       },
     };

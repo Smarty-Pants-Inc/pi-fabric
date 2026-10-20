@@ -255,6 +255,47 @@ describe("sandbox agent transport", () => {
     expect(terminal.records.get(RUN_ID)).toMatchObject({ placementRunId: RUN_ID, state: "never-started", reason: "placement refused (POLICY_REFUSED)" });
   });
 
+  it("stops a running sandbox task and resolves its handle only after the child owner confirms stop", async () => {
+    const directory = scratch();
+    const api = await fakePlacementServer({ post: intent => result(intent.runId, "admitted"), watch: () => [] });
+    const mesh = meshFor();
+    const stopCalls: Array<[string, string]> = [];
+    mesh.awaitResult = async () => new Promise<SandboxTaskResult>(() => {});
+    mesh.stop = async (childSession, runId) => { stopCalls.push([childSession, runId]); return { confirmed: true }; };
+    const terminal = new FakeTerminal();
+    const transport = new SandboxTransport(config(), { placement: api.placement, mesh, terminal, meshTransport: "nats", org: "smarty-dev", now: () => BASE_NOW,
+      resolveRepository: () => ({ repository: "https://github.com/Smarty-Pants-Inc/smarty-dev", cwd: "." }) });
+
+    const handle = await transport.launch(launchRequest(directory));
+    expect(await handle.isAlive()).toBe(true);
+    await handle.stop();
+    await handle.closed;
+
+    expect(stopCalls).toEqual([[CHILD, RUN_ID]]);
+    expect(await handle.isAlive()).toBe(false);
+    expect(JSON.parse(fs.readFileSync(path.join(directory, "status.json"), "utf8"))).toMatchObject({ status: "stopped", error: "Sandbox task stopped" });
+    expect(terminal.records.get(RUN_ID)).toMatchObject({ placementRunId: RUN_ID, state: "failed", reason: "child stop was confirmed" });
+  });
+
+  it("refuses an operator stop when the bound child owner cannot confirm exit", async () => {
+    const directory = scratch();
+    const api = await fakePlacementServer({ post: intent => result(intent.runId, "admitted"), watch: () => [] });
+    const mesh = meshFor();
+    let rejectResult!: (error: Error) => void;
+    mesh.awaitResult = async () => new Promise<SandboxTaskResult>((_resolve, reject) => { rejectResult = reject; });
+    mesh.stop = async () => ({ confirmed: false, reason: "bound child route changed" });
+    const terminal = new FakeTerminal();
+    const transport = new SandboxTransport(config(), { placement: api.placement, mesh, terminal, meshTransport: "nats", org: "smarty-dev", now: () => BASE_NOW,
+      resolveRepository: () => ({ repository: "https://github.com/Smarty-Pants-Inc/smarty-dev", cwd: "." }) });
+
+    const handle = await transport.launch(launchRequest(directory));
+    await expect(handle.stop()).rejects.toThrow("Sandbox child stop was not confirmed: bound child route changed");
+    expect(handle.lostContact?.()).toBe("bound child route changed");
+    rejectResult(new Error("sandbox result unavailable"));
+    await handle.closed;
+    expect(terminal.records.get(RUN_ID)).toMatchObject({ state: "failed", reason: "sandbox result path failed; remote exit is unconfirmed" });
+  });
+
   it("watches a delayed placement until it is admitted, then binds and completes", async () => {
     const directory = scratch();
     const api = await fakePlacementServer({
@@ -317,10 +358,36 @@ describe("sandbox agent transport", () => {
     const child = await mesh.waitForPresence(RUN_ID, { timeoutMs: 5_000 });
     await mesh.deliverTask(child.id, "actual task text");
     expect(requests[0]?.slice(0, 3)).toEqual([route.ownerHostId, CHILD, "followUp"]);
-    expect(requests[0]?.[3]).toMatchObject({ ownerIncarnation: route.ownerIncarnation, message: "actual task text", triggerTurn: true });
+    expect(requests[0]?.[3]).toMatchObject({ ownerIncarnation: route.ownerIncarnation, message: "actual task text", triggerTurn: true,
+      data: { sandboxControl: { protocol: "pi-fabric-sandbox-stop-v1", runId: RUN_ID } } });
     const pending = mesh.awaitResult(child.id, RUN_ID, Date.now() + 10_000);
     expect(captureSandboxFinalAnswer({ id: CHILD, kind: "main" }, "mesh", `FABRIC-RESULT ${RUN_ID}\nresult from the bound child`)).toBe(true);
     await expect(pending).resolves.toMatchObject({ runId: RUN_ID, participantId: CHILD, text: "result from the bound child" });
+  });
+
+  it("refuses a stop for another run id and sends a bound stop only over the current child route", async () => {
+    const route = { machine: "island", ownerHostId: "runtime:child", ownerIdentityId: CHILD, ownerIncarnation: "incarnation-1", capabilities: ["followUp"], live: true };
+    const participant = { id: CHILD, kind: "root", placementRunId: RUN_ID, ownerHostId: route.ownerHostId,
+      ownerIdentityId: route.ownerIdentityId, ownerIncarnation: route.ownerIncarnation, interactive: true };
+    const requests: unknown[][] = [];
+    const mesh = createSandboxFabricMesh({
+      transport: { kind: "nats" } as never,
+      participants: { get: () => participant, list: () => [participant] } as never,
+      participantView: { resolve: () => route, whenChanged: async () => {}, leaseLive: () => true } as never,
+      control: { request: async (...args: unknown[]) => { requests.push(args); return { queued: true, acknowledged: true }; } } as never,
+      canSend: () => true,
+    });
+    const child = await mesh.waitForPresence(RUN_ID, { timeoutMs: 5_000 });
+    const stop = mesh.stop;
+    if (!stop) throw new Error("sandbox mesh does not expose stop");
+
+    await expect(stop(child.id, `${RUN_ID}-other`)).resolves.toMatchObject({ confirmed: false });
+    expect(requests).toHaveLength(0);
+    await expect(stop(child.id, RUN_ID)).resolves.toEqual({ confirmed: true });
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.slice(0, 3)).toEqual([route.ownerHostId, CHILD, "stop"]);
+    expect(requests[0]?.[3]).toMatchObject({ ownerIncarnation: route.ownerIncarnation,
+      data: { sandboxControl: { protocol: "pi-fabric-sandbox-stop-v1", runId: RUN_ID } } });
   });
 
   it("refuses delivery if the run-bound child's owner incarnation changes", async () => {

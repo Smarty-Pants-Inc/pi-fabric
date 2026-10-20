@@ -13,6 +13,9 @@ interface ChildRoute {
   ownerIncarnation: string;
 }
 
+const SANDBOX_CONTROL_PROTOCOL = "pi-fabric-sandbox-stop-v1";
+const SANDBOX_STOP_TIMEOUT_MS = 45_000;
+
 export interface SandboxFabricMeshOptions {
   transport: FabricTransport;
   participants: Pick<FabricParticipantSource, "get" | "list">;
@@ -100,7 +103,44 @@ export const createSandboxFabricMesh = (options: SandboxFabricMeshOptions): Sand
         ownerIncarnation: route.ownerIncarnation,
         message: text,
         triggerTurn: true,
+        data: { sandboxControl: { protocol: SANDBOX_CONTROL_PROTOCOL, runId: bound.runId } },
       }, route.ownerIdentityId, { ...(signal ? { signal } : {}) });
+    },
+
+    async stop(childSession, runId) {
+      const bound = routes.get(childSession);
+      if (!bound || bound.runId !== runId) return { confirmed: false, reason: "Sandbox stop refused: child session is not bound to this run id" };
+      if (!canSend()) return { confirmed: false, reason: "Sandbox stop refused: Fabric NATS control plane is not ready" };
+      const participant = participants.get(childSession, Date.now(), { fresh: true });
+      let route;
+      try { route = participantView.resolve(childSession); } catch { return { confirmed: false, reason: "Sandbox stop refused: child route is unavailable" }; }
+      if (!participant || participant.id !== childSession || participant.kind !== "root" || participant.interactive === false ||
+        participant.placementRunId !== runId || participant.ownerHostId !== bound.ownerHostId ||
+        participant.ownerIdentityId !== bound.ownerIdentityId || participant.ownerIncarnation !== bound.ownerIncarnation ||
+        !route?.live || route.ownerHostId !== bound.ownerHostId || route.ownerIdentityId !== bound.ownerIdentityId ||
+        route.ownerIncarnation !== bound.ownerIncarnation || !route.capabilities.includes("followUp")) {
+        return { confirmed: false, reason: "Sandbox stop refused: run binding or current child owner changed" };
+      }
+      try {
+        const receipt = await control.request(route.ownerHostId, childSession, "stop", {
+          ownerIncarnation: route.ownerIncarnation,
+          data: { sandboxControl: { protocol: SANDBOX_CONTROL_PROTOCOL, runId } },
+        }, route.ownerIdentityId, { timeoutMs: SANDBOX_STOP_TIMEOUT_MS });
+        if (receipt.acknowledged !== true) return { confirmed: false, reason: "Sandbox stop was not acknowledged by the bound child owner" };
+        const current = participants.get(childSession, Date.now(), { fresh: true });
+        const currentRoute = participantView.resolve(childSession);
+        if (!current || current.kind !== "root" || current.placementRunId !== runId ||
+          current.ownerHostId !== bound.ownerHostId || current.ownerIdentityId !== bound.ownerIdentityId ||
+          current.ownerIncarnation !== bound.ownerIncarnation || !currentRoute?.live ||
+          currentRoute.ownerHostId !== bound.ownerHostId || currentRoute.ownerIdentityId !== bound.ownerIdentityId ||
+          currentRoute.ownerIncarnation !== bound.ownerIncarnation) {
+          return { confirmed: false, reason: "Sandbox stop was acknowledged, but the bound child route changed before confirmation" };
+        }
+        routes.delete(childSession);
+        return { confirmed: true };
+      } catch (error) {
+        return { confirmed: false, reason: error instanceof Error ? error.message : "Sandbox stop acknowledgement failed" };
+      }
     },
 
     awaitResult(childSession, runId, deadline, signal): Promise<SandboxTaskResult> {

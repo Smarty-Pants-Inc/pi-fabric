@@ -36,7 +36,7 @@ const MAX_AWAIT_REPLY_SECONDS = 24 * 60 * 60;
 const PRESENCE_SETTLE_MS = 3_000;
 const PRESENCE_SETTLE_POLL_MS = 100;
 
-type SendOptions = {
+export type NatsSendOptions = {
   to: string;
   kind: "followUp" | "steer";
   text: string;
@@ -50,15 +50,27 @@ type SendOptions = {
   awaitReplySeconds?: number;
   org?: string;
   pathBMachines?: string[];
+  placementRunId?: string;
+  findTimeoutMs?: number;
+  onTaskDispatched?: () => void;
+  onReply?: (reply: NatsSendReply) => void;
+  messageForSender?: (senderId: string, targetId: string) => string;
 };
 
-type SendReply = {
+export type NatsSendReply = {
   from: { id: string; name: string; kind: MeshIdentity["kind"]; sessionId?: string };
   text: string;
   at: number;
 };
 
-type SendOutcome = { result: FabricControlResult; senderId: string; reply?: SendReply | null };
+export type NatsSendOutcome = {
+  result: FabricControlResult;
+  senderId: string;
+  targetId: string;
+  childSession: string | null;
+  model: string | null;
+  reply?: NatsSendReply | null;
+};
 type Acknowledged = (result: FabricControlResult, senderId: string) => void;
 
 class SendCliError extends Error {}
@@ -75,7 +87,7 @@ const absolutePath = (value: string | undefined, flag: string): string => {
   return value;
 };
 
-const parseOptions = (argv: readonly string[]): SendOptions | "help" => {
+const parseOptions = (argv: readonly string[]): NatsSendOptions | "help" => {
   if (argv.length === 1 && (argv[0] === "--help" || argv[0] === "-h" || argv[0] === "help")) return "help";
   const valuedFlags = new Set([
     "--to", "--kind", "--text", "--text-file", "--creds", "--ca", "--servers", "--machine",
@@ -187,7 +199,7 @@ function policyConfig(): { custodyStream: string; livenessStream: string; pathBM
   return { custodyStream, livenessStream, pathBMachines: [...pathBMachines], operatorMachine };
 }
 
-function stableSenderIdentity(options: SendOptions, stateHome: string): { token: string; sessionId: string } {
+function stableSenderIdentity(options: NatsSendOptions, stateHome: string): { token: string; sessionId: string } {
   const digest = createHash("sha256").update(options.machine).update("\0").update(path.resolve(options.creds)).update("\0").update(options.name).update("\0").update(stateHome).digest();
   const bytes = Buffer.from(digest.subarray(0, 16));
   bytes[6] = (bytes[6]! & 0x0f) | 0x40;
@@ -222,7 +234,7 @@ function removePrivateRoot(root: string, identity: DirectoryIdentity): void {
 
 function presenceToken(id: string): string { return createHash("sha256").update(id).digest("hex").slice(0, 32); }
 
-function replyFor(command: { operation: string; targetId: string; message?: string }, from: MeshIdentity, targetId: string): SendReply | undefined {
+function replyFor(command: { operation: string; targetId: string; message?: string }, from: MeshIdentity, targetId: string): NatsSendReply | undefined {
   if (command.operation !== "followUp" || command.targetId !== targetId || typeof command.message !== "string" ||
     !command.message || Buffer.byteLength(command.message, "utf8") > MAX_TEXT_BYTES ||
     !from.id || from.id.length > 256 || /[\u0000-\u001f\u007f]/.test(from.id) ||
@@ -235,9 +247,9 @@ function replyFor(command: { operation: string; targetId: string; message?: stri
   };
 }
 
-function waitForReply(reply: Promise<SendReply>, timeoutMs: number, signal: AbortSignal): Promise<SendReply | null> {
+function waitForReply(reply: Promise<NatsSendReply>, timeoutMs: number, signal: AbortSignal): Promise<NatsSendReply | null> {
   return new Promise((resolve, reject) => {
-    const finish = (result: SendReply | null, error?: unknown): void => {
+    const finish = (result: NatsSendReply | null, error?: unknown): void => {
       clearTimeout(timer);
       signal.removeEventListener("abort", onAbort);
       if (error !== undefined) reject(error); else resolve(result);
@@ -261,6 +273,34 @@ async function waitForLiveRoute(
     const route = directory.resolve(id);
     if (route?.live) return route;
     await directory.whenChanged(id, signal);
+  }
+}
+
+async function waitForPlacementTarget(
+  owner: ParticipantDirectory,
+  view: NonNullable<ParticipantDirectory["participantView"]>,
+  runId: string,
+  timeoutMs: number,
+  signal: AbortSignal,
+): Promise<{ id: string; route: NonNullable<ReturnType<typeof view.resolve>>; sessionId: string | null; model: string | null }> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    signal.throwIfAborted();
+    const matches = owner.list({ scope: "project", kinds: ["root"], fresh: true })
+      .filter((record) => record.placementRunId === runId && record.interactive !== false)
+      .flatMap((record) => {
+        const route = view.resolve(record.id);
+        return route?.live && route.capabilities.includes("followUp") &&
+          route.ownerHostId === record.ownerHostId && route.ownerIdentityId === record.ownerIdentityId &&
+          route.ownerIncarnation === record.ownerIncarnation
+          ? [{ id: record.id, route, sessionId: record.sessionId ?? null, model: record.model ?? null }]
+          : [];
+      });
+    if (matches.length > 1) throw new SendCliError(`placement run ${runId} has multiple live followUp agents`);
+    if (matches.length === 1) return matches[0]!;
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) throw new SendCliError(`no live followUp agent found for placement run ${runId}`);
+    await sleep(Math.min(PRESENCE_SETTLE_POLL_MS, remaining), undefined, { signal });
   }
 }
 
@@ -289,7 +329,7 @@ async function waitForSettledPresence(
   }
 }
 
-async function openAndSend(options: SendOptions, onAcknowledged: Acknowledged): Promise<SendOutcome> {
+export async function openAndSend(options: NatsSendOptions, onAcknowledged: Acknowledged): Promise<NatsSendOutcome> {
   const policy = policyConfig();
   const configuredStateHome = process.env.XDG_STATE_HOME?.trim() || path.join(os.homedir(), ".local", "state");
   if (!path.isAbsolute(configuredStateHome) || configuredStateHome.includes("\0")) throw new SendCliError("XDG_STATE_HOME must be an absolute path");
@@ -348,10 +388,13 @@ async function openAndSend(options: SendOptions, onAcknowledged: Acknowledged): 
   let directory: ParticipantDirectory | undefined;
   let plane: FabricControlPlane | undefined;
   let result: FabricControlResult | undefined;
-  let reply: SendReply | null | undefined;
-  let resolveReply: ((value: SendReply) => void) | undefined;
+  let targetId = options.to;
+  let childSession: string | null = null;
+  let model: string | null = null;
+  let reply: NatsSendReply | null | undefined;
+  let resolveReply: ((value: NatsSendReply) => void) | undefined;
   let awaitingReply = false;
-  const replyPromise = options.awaitReplySeconds === undefined ? undefined : new Promise<SendReply>((resolve) => { resolveReply = resolve; });
+  const replyPromise = options.awaitReplySeconds === undefined ? undefined : new Promise<NatsSendReply>((resolve) => { resolveReply = resolve; });
   let failure: unknown;
   try {
     transport = await openFabricTransport({ config: meshConfig, hostId, mesh, signal });
@@ -369,7 +412,13 @@ async function openAndSend(options: SendOptions, onAcknowledged: Acknowledged): 
     signal.throwIfAborted();
     const view = directory.participantView;
     if (!view) throw new SendCliError("NATS participant view is unavailable");
-    const target = await waitForLiveRoute(view, options.to, signal);
+    const found = options.placementRunId
+      ? await waitForPlacementTarget(directory, view, options.placementRunId, options.findTimeoutMs ?? 0, signal)
+      : { id: options.to, route: await waitForLiveRoute(view, options.to, signal), sessionId: null, model: null };
+    const target = found.route;
+    targetId = found.id;
+    childSession = found.sessionId;
+    model = found.model;
     if (!target.capabilities.includes(options.kind)) throw new SendCliError(`target does not advertise ${options.kind}`);
     plane = new FabricControlPlane(mesh, identity, {
       enabled: true,
@@ -388,6 +437,7 @@ async function openAndSend(options: SendOptions, onAcknowledged: Acknowledged): 
       if (!received || !resolveReply) return { accepted: false, error: "CLI accepts only its first awaited followUp reply" };
       reply = received;
       awaitingReply = false;
+      try { options.onReply?.(received); } catch { /* timing observation must not hold the verified inbox */ }
       resolveReply(received);
       resolveReply = undefined;
       return { accepted: true, messageId: command.commandId };
@@ -416,8 +466,12 @@ async function openAndSend(options: SendOptions, onAcknowledged: Acknowledged): 
     const settled = await waitForSettledPresence(view, directory, identity.id, signal);
     if (!settled.live || !directory.canConsumeMesh()) throw new SendCliError("sender presence is not live");
     signal.throwIfAborted();
-    result = await plane.request(target.ownerHostId, options.to, options.kind, {
-      message: options.text,
+    const message = options.messageForSender?.(identity.id, targetId) ?? options.text;
+    if (!message || Buffer.byteLength(message, "utf8") > MAX_TEXT_BYTES) throw new SendCliError("message text must be nonempty and at most 512 KiB");
+    if (options.awaitReplySeconds !== undefined) awaitingReply = true;
+    options.onTaskDispatched?.();
+    result = await plane.request(target.ownerHostId, targetId, options.kind, {
+      message,
       ownerIncarnation: target.ownerIncarnation,
     }, target.ownerIdentityId, {
       idempotencyKey: options.idempotencyKey,
@@ -425,7 +479,6 @@ async function openAndSend(options: SendOptions, onAcknowledged: Acknowledged): 
       signal,
     });
     if (result.acknowledged !== true) throw new SendCliError("Fabric request was not acknowledged");
-    if (options.awaitReplySeconds !== undefined) awaitingReply = true;
     onAcknowledged(result, identity.id);
     if (options.awaitReplySeconds !== undefined) {
       reply = await waitForReply(replyPromise!, options.awaitReplySeconds * 1_000, lifetime.signal);
@@ -448,7 +501,12 @@ async function openAndSend(options: SendOptions, onAcknowledged: Acknowledged): 
   }
   if (failure !== undefined) throw failure;
   if (!result) throw new SendCliError("Fabric send did not produce an acknowledgement");
-  return { result, senderId: identity.id, ...(options.awaitReplySeconds === undefined ? {} : { reply: reply ?? null }) };
+  return {
+    result, senderId: identity.id, targetId,
+    childSession,
+    model,
+    ...(options.awaitReplySeconds === undefined ? {} : { reply: reply ?? null }),
+  };
 }
 
 const errorText = (error: unknown): string => {

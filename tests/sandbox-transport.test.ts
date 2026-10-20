@@ -207,7 +207,7 @@ const meshFor = (resultValue = taskResult()): SandboxMesh & { delivered: Array<{
     readyTimeouts,
     waitForPresence: async (runId, options) => { presenceRunIds.push(runId); readyTimeouts.push(options.timeoutMs); return { id: CHILD, placementRunId: runId }; },
     deliverTask: async (childSession, text) => { delivered.push({ childSession, text }); },
-    awaitResult: async (childSession, deadline) => { awaited.push({ childSession, deadline }); return resultValue; },
+    awaitResult: async (childSession, _runId, deadline) => { awaited.push({ childSession, deadline }); return resultValue; },
     stop: async () => ({ confirmed: true }),
   };
 };
@@ -316,9 +316,9 @@ describe("sandbox agent transport", () => {
     const api = await fakePlacementServer({ allowAnyRunId: true, post: intent => result(intent.runId, "admitted"), watch: () => [] });
     const terminal = new FakeTerminal();
     const mesh = meshFor();
-    mesh.awaitResult = async (childSession, deadline) => {
+    mesh.awaitResult = async (childSession, runId, deadline) => {
       mesh.awaited.push({ childSession, deadline });
-      return taskResult("completed", "manager round-trip result", mesh.presenceRunIds[0]!, childSession);
+      return taskResult("completed", "manager round-trip result", runId, childSession);
     };
     const manager = new AgentManager(process.cwd(), {
       ...DEFAULT_FABRIC_CONFIG.agents,

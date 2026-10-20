@@ -250,6 +250,10 @@ export class SandboxTransport implements AgentTransportAdapter {
     };
     try { writeJsonAtomic(statusFile, base, { space: 2, durable: true }); }
     catch { return failBeforeStart(new SandboxProtocolError("Could not persist sandbox run status before delivery"), "local run status could not be persisted"); }
+    let resultWait: Promise<SandboxTaskResult>;
+    try { resultWait = mesh.awaitResult(child.id, runId, deadlineAt, request.signal); }
+    catch (error) { resultWait = Promise.reject(error); }
+    void resultWait.catch(() => undefined);
     const resultPrefix = `FABRIC-RESULT ${runId}\n`;
     const returnInstructions = `When complete, send exactly one follow-up to the spawner with the final answer. Call agents.followUp({ id: ${JSON.stringify(parentSession)}, message: ${JSON.stringify(resultPrefix)} + answer }). The message must begin with the exact prefix ${JSON.stringify(resultPrefix)}; append your final answer after it.`;
     const deliveredTask = `${task}\n\n${returnInstructions}`;
@@ -323,7 +327,7 @@ export class SandboxTransport implements AgentTransportAdapter {
 
     void (async () => {
       try {
-        const result = await this.#awaitResult(mesh, child.id, runId, deadlineAt);
+        const result = await this.#awaitResult(resultWait, deadlineAt);
         if (settled) return;
         this.#validateTaskResult(result, child.id, runId);
         lostContact = undefined;
@@ -404,13 +408,13 @@ export class SandboxTransport implements AgentTransportAdapter {
     throw new SandboxSpawnTimeoutError();
   }
 
-  async #awaitResult(mesh: SandboxTransportDependencies["mesh"] & {}, childSession: string, runId: string, deadlineAt: number): Promise<SandboxTaskResult> {
+  async #awaitResult(resultWait: Promise<SandboxTaskResult>, deadlineAt: number): Promise<SandboxTaskResult> {
     const remaining = deadlineAt - this.#now();
     if (remaining <= 0) throw Object.assign(new Error("Sandbox task execution deadline expired"), { code: "sandbox.execution.timeout" });
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       return await Promise.race([
-        mesh.awaitResult(childSession, deadlineAt),
+        resultWait,
         new Promise<never>((_, reject) => {
           timer = setTimeout(() => reject(Object.assign(new Error("Sandbox task execution deadline expired"), { code: "sandbox.execution.timeout" })), remaining);
           timer.unref?.();

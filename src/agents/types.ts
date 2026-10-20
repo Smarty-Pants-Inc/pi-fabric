@@ -19,6 +19,17 @@ import type { AgentUndeliveredMessage } from "./terminal-target.js";
 /** Fabric run transports plus adapter-owned ("hosted") runs. */
 export type AgentRunTransport = FabricAgentTransport | "hosted";
 
+export type AgentPlacementKind = "process" | "remote";
+
+/** Trusted admission snapshot shared with transport and task-presence publication. */
+export interface AgentPlacementAdmission {
+  placementRunId: string;
+  placementKind: AgentPlacementKind;
+  placementHost: string;
+  expectedSeconds: number;
+  executionDeadline: string;
+}
+
 /**
  * A terminal outcome Fabric cannot vouch for: the run may or may not have done
  * its work (an interrupted claimed request, an unreachable hosted run). Fabric
@@ -303,6 +314,11 @@ export interface AgentRunRecord {
   processStartTime?: string;
   /** Latest native runner session; joins Pi gateway session_id to this run. */
   runnerSessionId?: string;
+  /** Placement-only presence metadata; absent when Placement API is disabled. */
+  placementRunId?: string;
+  placementKind?: AgentPlacementKind;
+  placementHost?: string;
+  expectedSeconds?: number;
   /** Distinct native Pi sessions observed during this run, in first-seen order. */
   runnerSessionIds?: string[];
   /** Parent Main participant and its Pi/Fabric session, not the child session. */
@@ -524,6 +540,8 @@ export interface AgentTransportLaunch {
   requires?: string[];
   /** Host-derived incompatibility, never accepted from guest arguments. */
   placementLocalReason?: string | undefined;
+  /** Placement API admission; absent means the exact legacy transport path. */
+  placementAdmission?: AgentPlacementAdmission;
   /** Report the default policy's actual local/remote launch boundary once; host-owned audit only. */
   onWritePolicyDisposition?: (disposition: "local" | "remote") => void;
   /** Trusted spawn facts needed by the island broker intent. */

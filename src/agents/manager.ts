@@ -86,6 +86,9 @@ import { TmuxTransport } from "./transports/tmux-transport.js";
 import type { SandboxTransportDependencies } from "../transport/sandbox/types.js";
 import { resolveAgentSpawner } from "./spawner.js";
 import { senderAgent, senderHeaderValue } from "../guards/sender-headers.js";
+import { PlacementAdmissionError, makePlacementIntent, awaitPlacementAdmission, placementBindingMatches } from "../placement/spawn.js";
+import type { PlacementOutcome } from "../placement/client.js";
+import type { PlacementTerminalRecord, PlacementTerminalState } from "../placement/terminal.js";
 import type {
   AgentSpawner,
   AgentChildQuestionRequest,
@@ -103,6 +106,7 @@ import type {
   AgentTransportAdapter,
   AgentTransportHandle,
   AgentTransportLaunch,
+  AgentPlacementAdmission,
   AgentUsage,
 } from "./types.js";
 import { FOLLOW_UP_RUNNING_TASK_MESSAGE, type AgentAdmissionAlarm, type AgentFollowUpAlarm, type AgentFollowUpDelivery } from "./types.js";
@@ -752,6 +756,8 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   relaunchPending?: Promise<boolean>;
   /** Terminal results do not discharge execution custody or admission permits. */
   executionExited?: boolean;
+  /** Placement terminal receipt is best-effort and scheduled at most once after proven exit. */
+  placementTerminalScheduled?: boolean;
   launchCancelled?: boolean;
   /** The monitor returned so the explicit stop owns terminal publication. */
   monitorYieldedToStop?: boolean;
@@ -1335,6 +1341,7 @@ export class AgentManager {
   readonly #meshRoot: string | undefined;
   readonly #meshTransport: Pick<FabricMeshConfig, "transport" | "hostTransport" | "nats"> | undefined;
   readonly #taskPresence: AgentTaskPresence | undefined;
+  readonly #placementTerminalWriter: ((record: PlacementTerminalRecord) => Promise<void>) | undefined;
   /** Transport invokes this after assembling its worker env. Bind only config,
    * never a request-bearing launch closure; the worker's native child inherits it. */
   readonly #childMeshEnvironment: ((environment: NodeJS.ProcessEnv) => NodeJS.ProcessEnv) | undefined;
@@ -1485,6 +1492,8 @@ export class AgentManager {
       taskPresence?: AgentTaskPresence;
       /** Island placement, presence, child-return, and terminal-KV seams. */
       sandbox?: SandboxTransportDependencies;
+      /** Best-effort carrier-specific Placement terminal receipt writer. */
+      placementTerminalWriter?: (record: PlacementTerminalRecord) => Promise<void>;
       projectRoot?: string;
       /** Root-owned return address; never inferred from a child request or inherited by nested agents. */
       completionRecipient?: CompletionRecipient | (() => CompletionRecipient);
@@ -1577,6 +1586,7 @@ export class AgentManager {
     this.#meshRoot = options.meshRoot ?? process.env.PI_FABRIC_MESH_ROOT;
     this.#meshTransport = options.meshTransport && structuredClone(options.meshTransport);
     this.#taskPresence = options.taskPresence;
+    this.#placementTerminalWriter = options.placementTerminalWriter;
     this.#childMeshEnvironment = this.#meshTransport?.transport === "nats"
       ? childMeshTransportEnvironment.bind(undefined, this.#meshTransport) : undefined;
     this.#projectRoot =
@@ -1611,6 +1621,16 @@ export class AgentManager {
           const { SandboxTransport } = await import("../transport/sandbox/transport.js");
           return new SandboxTransport(config.sandbox, {
             ...options.sandbox,
+            ...(!options.sandbox?.terminal && this.#placementTerminalWriter ? {
+              terminal: { put: async (_key, record) => {
+                const { makePlacementTerminalRecord } = await import("../placement/terminal.js");
+                await this.#placementTerminalWriter!(makePlacementTerminalRecord(record.placementRunId, record.state, {
+                  at: Date.parse(record.at),
+                  ...(record.exitCode !== undefined ? { exitCode: record.exitCode } : {}),
+                  ...(record.reason ? { reason: record.reason } : {}),
+                }));
+              } },
+            } : {}),
             ...(this.#meshTransport?.transport ? { meshTransport: this.#meshTransport.transport } : {}),
           }).launch(launch);
         },
@@ -2221,6 +2241,40 @@ export class AgentManager {
     }
   }
 
+  #schedulePlacementTerminalWrite(
+    placementRunId: string,
+    state: PlacementTerminalState,
+    options: { exitCode?: number; reason?: string } = {},
+  ): void {
+    const writer = this.#placementTerminalWriter;
+    if (!writer) {
+      diagnostics.warn("src/agents/manager.ts", `[pi-fabric] Placement terminal receipt for ${placementRunId} failed (FABRIC_PLACEMENT_TERMINAL_WRITE_FAILED); execution result is unchanged.`);
+      return;
+    }
+    void import("../placement/terminal.js").then(({ makePlacementTerminalRecord }) =>
+      writer(makePlacementTerminalRecord(placementRunId, state, options))).catch(error => {
+      const code = error && typeof error === "object" && "code" in error && typeof error.code === "string"
+        ? error.code : "FABRIC_PLACEMENT_TERMINAL_WRITE_FAILED";
+      diagnostics.warn("src/agents/manager.ts", `[pi-fabric] Placement terminal receipt for ${placementRunId} failed (${code}); execution result is unchanged.`);
+    });
+  }
+
+  #scheduleManagedPlacementTerminal(managed: ManagedAgent): void {
+    const admission = managed.launch.placementAdmission;
+    if (!admission || managed.placementTerminalScheduled || !managed.settled || !managed.executionExited
+      || managed.lostContact || managed.transport.lostContact?.()) return;
+    const result = managed.latestRecord ?? readRecord(managed.statusFile);
+    if (!result || !terminalStatuses.has(result.status)) return;
+    managed.placementTerminalScheduled = true;
+    const state: PlacementTerminalState = result.status === "completed" ? "finished" : "failed";
+    const exitCode = typeof result.exitCode === "number" && Number.isSafeInteger(result.exitCode)
+      && result.exitCode >= -255 && result.exitCode <= 255 ? result.exitCode : undefined;
+    this.#schedulePlacementTerminalWrite(admission.placementRunId, state, {
+      ...(exitCode !== undefined ? { exitCode } : {}),
+      ...(state === "failed" ? { reason: result.status } : {}),
+    });
+  }
+
   /** Effective bounds for a child; requested bounds outside the caller's throw. */
   childThinkingBounds(requested?: FabricThinkingBounds): FabricThinkingBounds {
     return childThinkingBounds(this.#thinkingBounds?.() ?? {}, requested);
@@ -2539,7 +2593,16 @@ export class AgentManager {
     const name = safeName(request.name ?? request.task.split("\n", 1)[0] ?? "Fabric agent");
     const prompt = promptMetadata(request.task, path.join(this.#runRoot, id, "task.txt"));
     const callerSignal = signal;
-    const assertAuthorized = this.#assertLaunchAuthorized.bind(this, id, authorize);
+    let placementAdmission: AgentPlacementAdmission | undefined;
+    const assertAuthorized = (): true => {
+      if (placementAdmission) {
+        const deadline = Date.parse(placementAdmission.executionDeadline);
+        if (!Number.isSafeInteger(deadline) || deadline <= Date.now()) {
+          throw new PlacementAdmissionError({ status: "refused", code: "LOCAL_BINDING_NOT_ADMITTED" });
+        }
+      }
+      return this.#assertLaunchAuthorized(id, authorize);
+    };
     let routeDispatch: ReturnType<typeof import("./model-route.js")["prepareRouteDispatch"]> | undefined;
     if (request.routeDecision) {
       const { prepareRouteDispatch } = await import("./model-route.js");
@@ -2562,6 +2625,9 @@ export class AgentManager {
     const routerStartState = routerStart ?? { settled: true, admission: undefined };
     let presenceAttempted = false;
     let presenceWithdrawn = false;
+    let placementRunId: string | undefined;
+    let placementTerminalScheduled = false;
+    let transportLaunchReturned = false;
     const startPrepared = async (release: () => void, signal = admissionSignal): Promise<AgentHandleInfo> => {
       try {
         while (this.#releasePaused && !request.residentStartupProbe) await this.#waitForRelease(signal);
@@ -2725,7 +2791,7 @@ export class AgentManager {
           : routedActor ? request.sessionFile : routeDispatch?.bindSession(agentCwd) ?? request.sessionFile;
         const adapter = await this.#resolveTransport(request.transport ?? this.config.transport);
         const runRoute = createRunRouteMetadata({ ...routeFacts, runner, transport: adapter.kind });
-        const timeoutMs = effectiveAgentTimeoutMs(
+        let timeoutMs = effectiveAgentTimeoutMs(
           this.config.timeoutMs,
           request.timeoutMs,
         );
@@ -2760,7 +2826,82 @@ export class AgentManager {
         const systemPrompt = [request.systemPrompt?.trim(), componentGuidance, spawnerGuidance]
           .filter((section): section is string => Boolean(section))
           .join("\n\n") || undefined;
-        const deadlineAt = Date.now() + timeoutMs;
+        const placementApiConfig = this.config.placementApi;
+        const placementKind = this.config.placement?.default === "remote" ? "remote" : "process";
+        const legacyPlacementLocalReason = this.#meshTransport?.transport === "nats" && (!placementApiConfig || placementKind !== "process")
+          ? "NATS task custody and host credentials require the owning host's native worker"
+          : writePolicy && !applyTaskWriteDefault
+          ? "explicit or inherited write policy requires the local worker; one-shot placement cannot forward confinement"
+          : isClaudeModel(model, runner, this.config.veda.backend) && request.modelReason
+            ? "Claude exception reason requires the local worker"
+          : this.#spawner?.kind === "actor" || this.#spawner?.kind === "agent" || this.#currentDepth > 0
+            ? "not a Main task spawn"
+          : request.actorId || request.actorName || request.sessionFile || request.sessionSeed || request.routeDecision || request.residentStartupProbe
+            ? "actor, routed, or inherited session requires the local worker"
+          : inheritedSessionPins?.length
+            ? "inherited account pins require the local worker"
+          : !extensions
+            ? "extensions disabled require the local worker"
+          : runner !== "pi" || kernel === "python" || request.recursive || request.worktree || request.tools || request.schema || imagesFile || request.systemPrompt || request.nice !== undefined || request.bashIdleSeconds !== undefined || residency === "durable" || !["low", "medium", "high", "xhigh", "max"].includes(thinking) || this.config.budgetUsd > 0 || this.config.maxTokensPerChild > 0
+            ? "requested worker features cannot be preserved by one-shot placement"
+          : timeoutMs > 240 * 60_000 ? "launcher supports at most 240 minutes" : undefined;
+        const placementApiLocalReason = placementApiConfig && request.needs?.includes("local")
+          ? "reserved need: local pins to the Main host"
+          : legacyPlacementLocalReason;
+        let deadlineAt = Date.now() + timeoutMs;
+        if (placementApiConfig) {
+          if (hostedAdapter || adapter.kind !== "process") {
+            throw new PlacementAdmissionError({ status: "refused", code: "LOCAL_TRANSPORT_UNSUPPORTED" });
+          }
+          if (placementApiLocalReason) {
+            throw new PlacementAdmissionError({ status: "refused", code: "LOCAL_TRANSPORT_UNSUPPORTED" });
+          }
+          if (!this.#placementTerminalWriter) {
+            throw new PlacementAdmissionError({ status: "refused", code: "LOCAL_TERMINAL_WRITER_UNAVAILABLE" });
+          }
+          const parentSession = this.#sessionId?.() ?? this.#fabricSessionId;
+          const { PlacementClient } = await import("../placement/client.js");
+          const intent = makePlacementIntent({
+            runId: id,
+            kind: placementKind,
+            org: process.env.SMARTY_ORG || "smarty-pants",
+            parentSession,
+            role: "task-agent",
+            complexity: request.complexity ?? "normal",
+            model,
+            thinking,
+            needs: request.needs ?? [],
+            projectRoot: this.#projectRoot,
+            cwd: agentCwd,
+            timeoutMs,
+          });
+          const client = new PlacementClient(placementApiConfig);
+          const outcome = await awaitPlacementAdmission(client, intent, signal);
+          if (outcome.status !== "admitted") throw new PlacementAdmissionError(outcome);
+          placementRunId = id;
+          if (signal?.aborted || this.#closing) throw Object.assign(new Error("Agent launch aborted after Placement admission"), { launchOutcome: "unlaunched" });
+          const binding = await client.getBinding(id);
+          if ("code" in binding) throw new PlacementAdmissionError(binding as PlacementOutcome);
+          if (binding.status !== "admitted") {
+            throw new PlacementAdmissionError({ status: "refused", code: "LOCAL_BINDING_NOT_ADMITTED" });
+          }
+          if (!placementBindingMatches(outcome, binding)) {
+            throw new PlacementAdmissionError({ status: "refused", code: "LOCAL_BINDING_MISMATCH" });
+          }
+          const executionDeadline = Date.parse(binding.executionDeadline);
+          if (!Number.isSafeInteger(executionDeadline) || executionDeadline <= Date.now()) {
+            throw new PlacementAdmissionError({ status: "refused", code: "LOCAL_BINDING_NOT_ADMITTED" });
+          }
+          placementAdmission = {
+            placementRunId: id,
+            placementKind,
+            placementHost: binding.host,
+            expectedSeconds: binding.expectedSeconds,
+            executionDeadline: binding.executionDeadline,
+          };
+          timeoutMs = Math.max(1, Math.min(timeoutMs, executionDeadline - Date.now()));
+          deadlineAt = executionDeadline;
+        }
         const launchContext: FabricRunnerLaunchContext = {
           id,
           name,
@@ -2802,6 +2943,8 @@ export class AgentManager {
             usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
             ...(kernel ? { kernel } : {}), ...(model ? { model } : {}),
             ...(thinking ? { thinking } : {}),
+            ...(placementAdmission ? { placementRunId: placementAdmission.placementRunId, placementKind: placementAdmission.placementKind,
+              placementHost: placementAdmission.placementHost, expectedSeconds: placementAdmission.expectedSeconds } : {}),
             ...(request.actorId ? { actorId: request.actorId } : {}),
             ...(request.actorName ? { actorName: request.actorName } : {}),
             ...(this.#spawner ? { spawner: this.#spawner } : {}),
@@ -3007,24 +3150,9 @@ export class AgentManager {
           ...(request.requires ? { requires: [...request.requires] } : {}),
           ...(this.#spawnerSessionId ? { parentSession: this.#spawnerSessionId } : {}),
           ...(request.complexity ? { complexity: request.complexity } : {}),
+          ...(placementAdmission ? { placementAdmission } : {}),
           ...(applyTaskWriteDefault ? { onWritePolicyDisposition } : {}),
-          placementLocalReason: this.#meshTransport?.transport === "nats"
-            ? "NATS task custody and host credentials require the owning host's native worker"
-            : writePolicy && !applyTaskWriteDefault
-            ? "explicit or inherited write policy requires the local worker; one-shot placement cannot forward confinement"
-            : isClaudeModel(model, runner, this.config.veda.backend) && request.modelReason
-              ? "Claude exception reason requires the local worker"
-            : this.#spawner?.kind === "actor" || this.#spawner?.kind === "agent" || this.#currentDepth > 0
-            ? "not a Main task spawn"
-            : request.actorId || request.actorName || request.sessionFile || request.sessionSeed || request.routeDecision || request.residentStartupProbe
-              ? "actor, routed, or inherited session requires the local worker"
-              : inheritedSessionPins?.length
-                ? "inherited account pins require the local worker"
-                : !extensions
-                  ? "extensions disabled require the local worker"
-                  : runner !== "pi" || kernel === "python" || request.recursive || request.worktree || request.tools || request.schema || imagesFile || request.systemPrompt || request.nice !== undefined || request.bashIdleSeconds !== undefined || residency === "durable" || !["low", "medium", "high", "xhigh", "max"].includes(thinking) || this.config.budgetUsd > 0 || this.config.maxTokensPerChild > 0
-                    ? "requested worker features cannot be preserved by one-shot placement"
-                    : timeoutMs > 240 * 60_000 ? "launcher supports at most 240 minutes" : undefined,
+          placementLocalReason: placementApiConfig ? placementApiLocalReason : legacyPlacementLocalReason,
           signal,
           onUnconfirmedExit: this.#handleUnconfirmedExit.bind(this, id, runDirectory, adapter.kind),
           ...(authorize ? { authorize: assertAuthorized } : {}),
@@ -3037,6 +3165,7 @@ export class AgentManager {
         while (this.#releasePaused && !request.residentStartupProbe) await this.#waitForRelease(signal);
         assertAuthorized();
         const transport = await this.#launchTransport(adapter, launch, request.residentStartupProbe === true);
+        transportLaunchReturned = true;
         const queued = this.#queued.get(id);
         const lifecycle = createAgentLifecycle<AgentRunResult>(release);
         if (queued) {
@@ -3225,6 +3354,11 @@ export class AgentManager {
         }
         // Cover preparation writes and worktree creation as well as transport failures,
         // without releasing admission while an unconfirmed worker retains custody.
+        if (placementRunId && !placementTerminalScheduled && !transportLaunchReturned && !this.#runs.has(id)
+          && (error as { launchOutcome?: string } | undefined)?.launchOutcome !== "unknown") {
+          placementTerminalScheduled = true;
+          this.#schedulePlacementTerminalWrite(placementRunId, "never-started", { reason: "spawn-aborted-before-worker-launch" });
+        }
         if ((error as { launchOutcome?: string } | undefined)?.launchOutcome !== "unknown") {
           release();
           if (presenceAttempted && !presenceWithdrawn && !this.#runs.has(id)) {
@@ -3462,6 +3596,7 @@ export class AgentManager {
       this.#stopRecoveryRetry(managed);
       delete managed.lostContact;
       managed.executionExited = true;
+      this.#scheduleManagedPlacementTerminal(managed);
       if (this.#releaseHeldPermit(managed)) released++;
     }
     return released;
@@ -5642,6 +5777,7 @@ export class AgentManager {
     if (lost === undefined && !alive && nativeClosed) {
       managed.executionExited = true;
       this.#retentionRevision++;
+      this.#scheduleManagedPlacementTerminal(managed);
       // Only this exact transport's positive exit probe discharges a transient
       // manager mark. Unknown/lost transport identity never reaches this branch.
       delete managed.lostContact;
@@ -5706,6 +5842,7 @@ export class AgentManager {
       }
       managed.executionExited = true;
       delete managed.lostContact;
+      this.#scheduleManagedPlacementTerminal(managed);
       fs.rmSync(path.join(managed.runDirectory, "unresolved-worker.json"), { force: true });
       if (!this.#releaseHeldPermit(managed)) {
         this.#retentionRevision++;
@@ -6922,6 +7059,7 @@ export class AgentManager {
     this.#invalidateUiList();
     const reported = this.#withTransportMetadata(result, managed) as AgentRunResult;
     finishAgentSettlement(managed, reported);
+    this.#scheduleManagedPlacementTerminal(managed);
     managed.task = "";
     delete managed.lastRetriedTransportFailure;
     delete managed.relaunchFailure;
@@ -7631,6 +7769,12 @@ export class AgentManager {
       ...((managed.promptRetentionMismatch || record.promptRetentionMismatch)
         ? { promptRetentionMismatch: true } : {}),
       cwd: managed.cwd,
+      ...(managed.launch.placementAdmission ? {
+        placementRunId: managed.launch.placementAdmission.placementRunId,
+        placementKind: managed.launch.placementAdmission.placementKind,
+        placementHost: managed.launch.placementAdmission.placementHost,
+        expectedSeconds: managed.launch.placementAdmission.expectedSeconds,
+      } : {}),
       runner: managed.runner,
       ...(managed.kernel ? { kernel: managed.kernel } : {}),
       ...(managed.transport.fabricRelease ? { fabricRelease: managed.transport.fabricRelease } : {}),

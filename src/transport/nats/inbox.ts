@@ -7,6 +7,7 @@ import {
   type JetStreamClient,
   type JetStreamManager,
 } from "@nats-io/jetstream";
+import type { PlacementTerminalRecord } from "../../placement/terminal.js";
 import type {
   FabricTransport,
   FabricTransportOptions,
@@ -33,7 +34,10 @@ import { ensureTransportConsumer, ensureTransportStream, type TransportStreamPol
 import { ADVISORY_CAPTURE_STREAM } from "./subjects.js";
 import { openNatsConnection, type NatsConnectionHandle, type NatsPermissionPolicy } from "./connection.js";
 import type { TlsOptions } from "@nats-io/transport-node";
-import { LEASE_TTL_MS, PRESENCE_TTL_MS, openNatsKvForMachine, type NatsKvStore } from "./kv.js";
+import {
+  LEASE_TTL_MS, PRESENCE_TTL_MS, PLACEMENT_TERMINAL_BUCKET, PLACEMENT_TERMINAL_TTL_MS,
+  openNatsKv, openNatsKvForMachine, type NatsKvStore,
+} from "./kv.js";
 
 const DEFAULT_MAX_BYTES = 1_073_741_824;
 const DEFAULT_MAX_MESSAGE_BYTES = 1_048_576;
@@ -336,6 +340,7 @@ class NatsTransportImpl implements FabricTransport {
   #inboxActive = false;
   #activeInbox: { readonly controller: AbortController; messages?: ConsumerMessages; queue?: Readable } | undefined;
   readonly #kvStores: Readonly<Record<"leases" | "presence", TransportKv>>;
+  #placementTerminalStore: { readonly epoch: number; readonly store: NatsKvStore } | undefined;
   readonly #waiters = new Set<ReadyWaiter>();
 
   private constructor(session: NatsSession, options: ResolvedNatsOptions) {
@@ -620,6 +625,28 @@ class NatsTransportImpl implements FabricTransport {
 
   kv(bucket: "leases" | "presence"): TransportKv {
     return this.#kvStores[bucket];
+  }
+
+  async writePlacementTerminal(record: PlacementTerminalRecord): Promise<void> {
+    const { PlacementTerminalWriteError } = await import("../../placement/terminal.js");
+    try {
+      const session = this.#assertOpen();
+      const epoch = this.#epoch;
+      let current = this.#placementTerminalStore;
+      if (!current || current.epoch !== epoch) {
+        const store = await openNatsKv(session.js, {
+          bucket: PLACEMENT_TERMINAL_BUCKET,
+          ttlMs: PLACEMENT_TERMINAL_TTL_MS,
+        }, this.#options.provision, session.connection.onStatus);
+        if (this.#session !== session || this.#epoch !== epoch) throw new PlacementTerminalWriteError();
+        current = { epoch, store };
+        this.#placementTerminalStore = current;
+      }
+      await current.store.writePlacementTerminal(record);
+    } catch (error) {
+      if (error instanceof PlacementTerminalWriteError) throw error;
+      throw new PlacementTerminalWriteError(error);
+    }
   }
 
   async drainState(signal?: AbortSignal): Promise<{ pending: number; ackPending: number }> {

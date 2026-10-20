@@ -1,4 +1,5 @@
 import { appendDeliveryOutcome } from "../mesh/delivery-outcomes.js";
+import { captureSandboxFinalAnswer } from "../agents/completion-inbox.js";
 import { interruptErrorCode } from "../interrupt-authority.js";
 import { boundAgentSpawner } from "../agents/spawner.js";
 import { FabricTargetTerminalError, terminalRejectionFields } from "../agents/terminal-target.js";
@@ -1029,6 +1030,10 @@ export class AgentMessageRouter {
     }
     if (command.operation === "cancel") {
       return { accepted: false, error: "Cancel commands are handled by the control plane" };
+    }
+    if (command.operation === "followUp" && this.mainAgent.local && this.mainAgent.matches(command.targetId) &&
+      captureSandboxFinalAnswer(from, verification, command.message ?? "")) {
+      return { accepted: true, messageId: command.commandId };
     }
     if (command.operation === "stop") {
       try {

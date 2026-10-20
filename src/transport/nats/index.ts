@@ -9,6 +9,8 @@ export {
   PRESENCE_TTL_MS,
   LEASES_BUCKET,
   PRESENCE_BUCKET,
+  PLACEMENT_TERMINAL_BUCKET,
+  PLACEMENT_TERMINAL_TTL_MS,
   NatsKvConflictError,
   openNatsKv,
   openNatsKvForMachine,

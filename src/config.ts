@@ -9,6 +9,8 @@ import { normalizeAgentRouterConfig, type FabricAgentRouterConfig } from "./agen
 export type { FabricAgentRouterConfig } from "./agents/router-config.js";
 import { normalizeAgentPlacement, type AgentPlacementConfig } from "./agents/placement-config.js";
 import type { SandboxTransportConfig } from "./transport/sandbox/types.js";
+import { normalizePlacementApiConfig, type PlacementApiConfig } from "./placement/config.js";
+export type { PlacementApiConfig } from "./placement/config.js";
 import { normalizeWakeTextConfig, type FabricWakeTextConfig } from "./actors/wake-text.js";
 import type { LandlockSettings } from "./core/landlock.js";
 import { DEFAULT_JEV_CONFIG, normalizeJevConfig, type FabricJevConfig } from "./jev/config.js";
@@ -253,6 +255,8 @@ export interface FabricAgentConfig {
   /** Host-only opt-in process task placement; workspace files cannot override it. */
   placement?: AgentPlacementConfig;
   sandbox: SandboxTransportConfig;
+  /** Host-only Placement API client; absent means the legacy path is unchanged. */
+  placementApi?: PlacementApiConfig;
   /** User/workspace Pi default; package defaults intentionally leave this unset. */
   model?: string;
   /** Root deny baseline unioned with agent-dir additions; workspace lists are ignored. */
@@ -1483,6 +1487,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
     ...(sandbox.placementUrl !== undefined ? { placementUrl: sandboxPlacementUrlValue(sandbox.placementUrl) } : {}),
     readyTimeoutMs: boundedInteger(sandbox.readyTimeoutMs, DEFAULT_FABRIC_CONFIG.agents.sandbox.readyTimeoutMs, 1_000, 90_000),
   };
+  const placementApi = normalizePlacementApiConfig(agents.placementApi);
   const claude = objectValue(agents.claude);
   const veda = objectValue(agents.veda);
   const capture = objectValue(input.capture);
@@ -1803,6 +1808,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
       processMemoryMaxBytes: processMemoryMaxBytesValue(agents.processMemoryMaxBytes),
       ...(placement ? { placement } : {}),
       sandbox: sandboxConfig,
+      ...(placementApi ? { placementApi } : {}),
       ...(router ? { router } : {}),
       ...(agentModel ? { model: agentModel } : {}),
       ...(typeof agents.modelRouting === "object" && agents.modelRouting !== null && !Array.isArray(agents.modelRouting)
@@ -2524,6 +2530,7 @@ const resolveFabricConfig = (
       delete agents.processMemoryMaxBytes;
       delete agents.placement;
       delete agents.sandbox; // Host-only: a lane cannot enable island execution.
+      delete agents.placementApi; // Host-only Placement endpoint and timeouts.
       delete agents.deadRootFilter; // Host-only: a lane cannot drop the fleet's exemptions.
       delete agents.stuckPreparingMs; // Host-only: a lane cannot silence the stuck-preparing owner notice.
       document.agents = agents;

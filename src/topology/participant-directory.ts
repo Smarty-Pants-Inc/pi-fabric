@@ -369,6 +369,18 @@ const remoteHostValid = (value: unknown): boolean =>
 
 const optionalStrings = (value: Record<string, unknown>, keys: readonly string[]): boolean =>
   keys.every((key) => value[key] === undefined || typeof value[key] === "string");
+const placementFields = ["placementRunId", "placementKind", "placementHost", "expectedSeconds"] as const;
+const placementPresenceValid = (value: Record<string, unknown>): boolean => {
+  const count = placementFields.filter(key => value[key] !== undefined).length;
+  if (count === 0) return true;
+  // Island Main roots publish only the Pod-injected run correlation; process-placement
+  // records additionally carry the launcher admission metadata below.
+  if (count === 1 && isPlacementRunId(value.placementRunId)) return true;
+  return count === placementFields.length && isPlacementRunId(value.placementRunId)
+    && (value.placementKind === "process" || value.placementKind === "remote")
+    && typeof value.placementHost === "string" && /^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/.test(value.placementHost)
+    && Number.isSafeInteger(value.expectedSeconds) && (value.expectedSeconds as number) >= 1 && (value.expectedSeconds as number) <= 604_800;
+};
 
 let ownProcessIdentity: { pid: number; host: string; startTime?: string } | undefined;
 /** This process's identity, read once: stable for the process's life. */
@@ -401,6 +413,7 @@ const participantFromEntry = (entry: MeshStateEntry): FabricParticipantRecord | 
     // a malformed one drops this record alone, never the listing (smarty-dev#2045).
     !optionalStrings(value, ["sessionId", "herdrPane", "cwd", "label", "role", "project", "projectRoot", "repository", "model", "thinking", "parentId", "actorOwnershipToken", "finalAnswerReceiptId", "placementRunId"]) ||
     value.placementRunId !== undefined && !isPlacementRunId(value.placementRunId) ||
+    !placementPresenceValid(value) ||
     // v1 of the bridge mirrors root presence only; remote agents and actors come in v2.
     (value.remoteHost !== undefined && kind !== "root") ||
     typeof value.id !== "string" ||

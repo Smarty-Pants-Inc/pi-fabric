@@ -101,6 +101,7 @@ import { FabricControlPlane } from "./topology/control-plane.js";
 import { ParticipantDirectory, type FabricPeerListOptions } from "./topology/participant-directory.js";
 import type { FabricTransport } from "./transport/types.js";
 import { rootParticipantName, validName } from "./topology/participant-name.js";
+import { createSandboxFabricMesh } from "./transport/sandbox/fabric-mesh.js";
 import { herdrNameLookup, herdrPaneId, readHerdrAgentName } from "./topology/herdr-name.js";
 import type {
   FabricParticipantInfo,
@@ -1264,6 +1265,25 @@ export class FabricRuntimeState {
       actorChildStore ? (ids) => actorChildStore.consumeLiveBatch(ids) : undefined);
     this.#completionInbox = completionInbox;
     const firstSeenAgents = new Map<string, number>();
+    const sandboxDependencies = transport?.kind === "nats" && agentConfig.sandbox.enabled
+      ? await (async () => {
+          const { createSandboxFabricMesh } = await import("./transport/sandbox/fabric-mesh.js");
+          const participantView = participants.participantView;
+          if (!participantView) throw new Error("Sandbox requires the live NATS participant view");
+          return {
+            meshTransport: "nats" as const,
+            org: process.env.SMARTY_ORG?.trim() || "smarty-pants",
+            mesh: createSandboxFabricMesh({
+              transport,
+              participants,
+              participantView,
+              control: this.#control!,
+              canSend: () => controlInboxBound && meshActivationReady && natsPublicationReady &&
+                this.#bindingFresh() && live.current() && participants.canConsumeMesh(),
+            }),
+          };
+        })()
+      : undefined;
     let markStoppedDelivered = (_id: string): void => {};
     recordMainRelease(sessionId, loadedFabricRoot(import.meta.url));
     this.#agents = new AgentManager(context.cwd, agentConfig, {
@@ -1283,6 +1303,19 @@ export class FabricRuntimeState {
       projectRoot,
       hostId,
       identityId: identity.id,
+      ...(sandboxDependencies ? { sandbox: sandboxDependencies } : {}),
+      placementTerminalWriter: async (record) => {
+        if (transport) {
+          if (!transport.writePlacementTerminal) {
+            const { PlacementTerminalWriteError } = await import("./placement/terminal.js");
+            throw new PlacementTerminalWriteError();
+          }
+          await transport.writePlacementTerminal(record);
+          return;
+        }
+        const { writePlacementTerminalFile } = await import("./placement/terminal.js");
+        writePlacementTerminalFile(meshRoot, hostId, record);
+      },
       ...(transport ? {
         meshTransport: structuredClone({ transport: meshConfig.transport,
           ...(meshConfig.hostTransport ? { hostTransport: meshConfig.hostTransport } : {}), nats: meshConfig.nats }),

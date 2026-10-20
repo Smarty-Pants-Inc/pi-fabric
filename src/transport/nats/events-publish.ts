@@ -6,6 +6,7 @@ import type { NatsConnectionHandle } from "./connection.js";
 import { ensureNatsEventsStream, natsEventsStreamName, type NatsEventsStreamOptions } from "./provision.js";
 
 const WRONG_LAST_SEQUENCE = 10071;
+const MAX_EVENT_MESSAGE_BYTES = 1_048_576;
 const PUBLISH_ATTEMPT_TIMEOUT_MS = 1_000;
 const MAX_PUBLISH_ATTEMPTS = 8;
 const TRANSIENT = new Set(["TimeoutError", "NoResponders", "ConnectionError", "ClosedConnectionError"]);
@@ -123,7 +124,8 @@ export const openNatsEventsPublisher = async (
   const stream = natsEventsStreamName(org);
   const { js, manager } = connection;
   const info = await ensureNatsEventsStream(manager, options);
-  const maxMessageBytes = info.config.max_msg_size;
+  // The stream may be server-unbounded (max_msg_size: -1); enforce a hard 1 MiB application cap anyway.
+  const maxMessageBytes = Math.min(options.maxMessageBytes ?? MAX_EVENT_MESSAGE_BYTES, MAX_EVENT_MESSAGE_BYTES);
   const lastSequence = async (): Promise<number> => {
     const sequence = (await manager.streams.info(stream)).state.last_seq;
     if (!validSequence(sequence)) throw new Error("Invalid NATS events stream sequence");

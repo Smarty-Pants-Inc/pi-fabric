@@ -227,7 +227,7 @@ const startGroup = async (
           try {
             const disposition = await options.onMessage(decoded.event, decoded.messageId, ack);
             if (disposition === "accepted") await ack();
-            else if (!acknowledged) nakTransiently(message, retryDelayScheduleMs);
+            else if (!acknowledged && connection.isVerified()) nakTransiently(message, retryDelayScheduleMs);
           } catch {
             if (!acknowledged && connection.isVerified()) nakTransiently(message, retryDelayScheduleMs);
             continue;

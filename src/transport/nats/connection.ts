@@ -6,15 +6,27 @@ import { credsAuthenticator, type Msg, type NatsConnection, type Subscription } 
 import { jetstream, jetstreamManager, type JetStreamClient, type JetStreamManager } from "@nats-io/jetstream";
 import { AuthorizationError, PermissionViolationError, connect, type NodeConnectionOptions, type Status, type TlsOptions } from "@nats-io/transport-node";
 import { pathBMachines } from "../../mesh/nats-auth/mint.js";
-import { legacyRoleTemplateWithPathB, PATH_B_OPERATOR_MACHINE_PATTERN, roleTemplateWithPathB } from "../../mesh/nats-auth/permissions.js";
+import { legacyRoleTemplateWithPathB, pathBEventGrantAllowlist, PATH_B_OPERATOR_MACHINE_PATTERN, roleTemplateWithPathB } from "../../mesh/nats-auth/permissions.js";
 import { validateMachine } from "./subjects.js";
 import { TransportUnavailableError } from "../types.js";
 
 /** Persistent identity/scope verification failure. The connection is closed, not retried. */
 export class NatsAuthorizationError extends Error {
-  readonly code = "FABRIC_NATS_AUTHORIZATION";
+  readonly code: "FABRIC_NATS_AUTHORIZATION" | "FABRIC_CREDENTIAL_OVERBROAD" = "FABRIC_NATS_AUTHORIZATION";
   readonly persisted = false;
   constructor(message: string, options?: ErrorOptions) { super(message, options); this.name = "NatsAuthorizationError"; }
+}
+
+/** Refusal for permission subjects outside the host-configured Path B event scopes. */
+export class NatsCredentialOverbroadError extends NatsAuthorizationError {
+  override readonly code = "FABRIC_CREDENTIAL_OVERBROAD";
+  readonly subjects: readonly string[];
+  constructor(subjects: readonly string[]) {
+    const offending = [...new Set(subjects)].sort();
+    super(`NATS credential has overbroad permission subjects: ${JSON.stringify(offending)}`);
+    this.name = "NatsCredentialOverbroadError";
+    this.subjects = Object.freeze(offending);
+  }
 }
 
 export type NatsStatusListener = (status: Status) => void;
@@ -29,6 +41,8 @@ export interface NatsPermissionPolicy {
   readonly events?: boolean;
   /** Optional org scope for service subjects and session channels. */
   readonly org?: string;
+  /** Host-configured orgs whose Path B event subjects may be additive publish grants. */
+  readonly eventOrgs?: readonly string[];
 }
 
 interface NatsTransportSecurityOptions {
@@ -209,7 +223,8 @@ interface PermissionSet {
 
 interface ExpectedPermissions extends PermissionSet {
   readonly legacy: PermissionSet;
-  readonly allowAdditionalPermissions: boolean;
+  readonly additionalPublishAllow: ReadonlySet<string>;
+  readonly allowAdditionalDeny: boolean;
 }
 
 /** Expand one role template for the signed identity exactly as nats-server expands it. */
@@ -249,10 +264,15 @@ const expectedPermissions = (role: "agent" | "operator", machine: string, policy
   const legacy = role === "agent" && policy.org === undefined
     ? legacyRoleTemplateWithPathB("agent", input, machines)
     : template;
+  // Configured event orgs are host-owned. The primary org is always included, even for direct
+  // callers that omit eventOrgs; additive grants stay limited to these scopes across rollout templates.
+  const eventSubjects = pathBEventGrantAllowlist(policy.eventOrgs ?? []);
+  if (policy.org !== undefined) eventSubjects.push(...pathBEventGrantAllowlist([policy.org]));
   return {
     ...expandPermissions(template, machine, meshes, auth),
     legacy: expandPermissions(legacy, machine, meshes, auth),
-    allowAdditionalPermissions: role === "agent",
+    additionalPublishAllow: new Set(role === "agent" ? eventSubjects : []),
+    allowAdditionalDeny: role === "agent",
   };
 };
 
@@ -277,12 +297,14 @@ const matchesPermissions = (
   actual: { allow: Set<string>; deny: Set<string> },
   expected: PermissionSet,
   subscribe: boolean,
-  allowAdditional: boolean,
+  additionalPublishAllow: ReadonlySet<string> = new Set(),
+  allowAdditionalDeny = false,
 ): boolean => {
-  const matches = allowAdditional ? containsSet : sameSet;
-  return subscribe
-    ? matches(actual.allow, expected.subAllow) && matches(actual.deny, expected.subDeny)
-    : matches(actual.allow, expected.pubAllow) && matches(actual.deny, expected.pubDeny);
+  if (subscribe) return sameSet(actual.allow, expected.subAllow) && sameSet(actual.deny, expected.subDeny);
+  const publishAllowsMatch = containsSet(actual.allow, expected.pubAllow) &&
+    [...actual.allow].every(subject => expected.pubAllow.has(subject) || additionalPublishAllow.has(subject));
+  const denyMatches = allowAdditionalDeny ? containsSet(actual.deny, expected.pubDeny) : sameSet(actual.deny, expected.pubDeny);
+  return publishAllowsMatch && denyMatches;
 };
 
 const responsesAtLeast = (actual: unknown, expected: PermissionSet, allowAdditional: boolean): boolean => {
@@ -316,12 +338,18 @@ const verifyIdentity = async (nc: NatsConnection, timeoutMs: number, auth: Retur
   const publish = permissionLists(permissions.publish);
   const subscribe = permissionLists(permissions.subscribe);
   if (!publish || !subscribe) throw new NatsAuthorizationError(MISMATCH);
-  const current = matchesPermissions(publish, expected, false, expected.allowAdditionalPermissions) &&
-    matchesPermissions(subscribe, expected, true, expected.allowAdditionalPermissions) &&
-    responsesAtLeast(permissions.responses, expected, expected.allowAdditionalPermissions);
+  const extraPublish = [...publish.allow].filter(subject => !expected.pubAllow.has(subject));
+  const unauthorizedPublish = extraPublish.filter(subject => !expected.additionalPublishAllow.has(subject));
+  const extraSubscribe = [...subscribe.allow].filter(subject => !expected.subAllow.has(subject));
+  if (unauthorizedPublish.length || extraSubscribe.length) {
+    throw new NatsCredentialOverbroadError([...unauthorizedPublish, ...extraSubscribe]);
+  }
+  const current = matchesPermissions(publish, expected, false, expected.additionalPublishAllow, expected.allowAdditionalDeny) &&
+    matchesPermissions(subscribe, expected, true) &&
+    responsesAtLeast(permissions.responses, expected, false);
   // Operator grants and the frozen d231bd15 rollout exception are exact; neither can fall through to a superset.
-  const legacy = matchesPermissions(publish, expected.legacy, false, false) &&
-    matchesPermissions(subscribe, expected.legacy, true, false) &&
+  const legacy = matchesPermissions(publish, expected.legacy, false) &&
+    matchesPermissions(subscribe, expected.legacy, true) &&
     responsesAtLeast(permissions.responses, expected.legacy, false);
   if (!current && !legacy) throw new NatsAuthorizationError(MISMATCH);
   if (!current && !warnedLegacyPermissions) {
@@ -515,6 +543,7 @@ export const openNatsConnection = async (options: NatsConnectionOptions): Promis
     pathBMachines: options.pathBMachines,
     ...(options.events === undefined ? {} : { events: options.events }),
     ...(options.org === undefined ? {} : { org: options.org }),
+    ...(options.eventOrgs === undefined ? {} : { eventOrgs: options.eventOrgs }),
   };
   return open(options, (nc, timeoutMs, auth) => verifyIdentity(nc, timeoutMs, auth, expected!), (auth) => {
     // Fail closed before dialing: missing/invalid policy or a signed identity that cannot match.

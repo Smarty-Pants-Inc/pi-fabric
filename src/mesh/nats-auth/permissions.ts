@@ -177,6 +177,12 @@ function pathBEventAllows({ events, org }: PathBEventsOptions): string[] {
   ];
 }
 
+/** Exact additive event subjects minted for a configured set of orgs, reusing the mint template builder. */
+export const pathBEventGrantAllowlist = (orgs: readonly string[]): string[] => {
+  if (!Array.isArray(orgs) || !Array.from(orgs).every(org => typeof org === "string")) fail("event orgs");
+  return pathBUnique(orgs.flatMap(org => pathBEventAllows({ events: true, org })));
+};
+
 const PATH_B_MACHINE = /^[a-z0-9][a-z0-9-]{0,31}$/;
 const PATH_B_MACHINE_TAG = "{{tag(machine)}}";
 const SERVICE_ORG = /^[a-z0-9][a-z0-9-]{0,62}$/;

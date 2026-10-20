@@ -336,7 +336,7 @@ describe("host-only NATS inbox retention settings (smarty-dev#15310)", () => {
     }
   });
 
-  it("does not let a trusted project enable ephemeral retention or change the host threshold", () => {
+  it("does not let a trusted project change host retention or set event grant scopes", () => {
     const cwd = temporaryDirectory(); const agentDir = temporaryDirectory(); fs.mkdirSync(path.join(cwd, ".pi"));
     const originalNatsEnv = process.env.PI_FABRIC_MESH_NATS;
     const originalTransportEnv = process.env.PI_FABRIC_MESH_TRANSPORT;
@@ -346,13 +346,19 @@ describe("host-only NATS inbox retention settings (smarty-dev#15310)", () => {
     delete process.env.PI_FABRIC_MESH_HOST_TRANSPORT;
     try {
       fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ mesh: {
-        transport: "nats", hostTransport: "nats", nats: { ...nats, ephemeralHost: false, ephemeralInactiveSeconds: 600 },
+        transport: "nats", hostTransport: "nats", nats: { ...nats, eventOrgs: ["smarty-pants-inc", "versehq"], ephemeralHost: false, ephemeralInactiveSeconds: 600 },
       } }));
       fs.writeFileSync(path.join(cwd, ".pi", "fabric.json"), JSON.stringify({ mesh: {
-        nats: { ephemeralHost: true, ephemeralInactiveSeconds: 900, inboxMaxAgeMs: 60_000 },
+        nats: { ephemeralHost: true, ephemeralInactiveSeconds: 900, inboxMaxAgeMs: 60_000, eventOrgs: ["foreign-org"] },
       } }));
       const config = loadFabricConfigForScope({ cwd, agentDir, projectTrusted: true }, "project");
-      expect(config.mesh.nats).toMatchObject({ ephemeralHost: false, ephemeralInactiveSeconds: 600, inboxMaxAgeMs: 7 * 24 * 60 * 60_000 });
+      expect(config.mesh.nats).toMatchObject({ ephemeralHost: false, ephemeralInactiveSeconds: 600, inboxMaxAgeMs: 7 * 24 * 60 * 60_000,
+        eventOrgs: ["smarty-pants-inc", "versehq"] });
+      fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ mesh: {
+        transport: "nats", hostTransport: "nats", nats,
+      } }));
+      const projectCannotSet = loadFabricConfigForScope({ cwd, agentDir, projectTrusted: true }, "project");
+      expect(projectCannotSet.mesh.nats.eventOrgs).toEqual([]);
     } finally {
       if (originalNatsEnv === undefined) delete process.env.PI_FABRIC_MESH_NATS;
       else process.env.PI_FABRIC_MESH_NATS = originalNatsEnv;

@@ -1277,6 +1277,7 @@ export class ActorManager {
         servers: nats.servers!, credentials: nats.credentials!, machine: nats.machine!,
         custodyStream: nats.custodyStream!, livenessStream: nats.livenessStream!, pathBMachines: nats.pathBMachines!,
         events: true, org: nats.org!,
+        ...(nats.eventOrgs === undefined ? {} : { eventOrgs: nats.eventOrgs }),
         ...(nats.tls ? { tls: nats.tls } : {}),
         name: `fabric-events-${this.identity.id}`,
       });

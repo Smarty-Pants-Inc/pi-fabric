@@ -582,7 +582,7 @@ const meshNatsInboxMaxAgeMs = (value: unknown): number => {
 /** Messaging/rollback settings fail visibly in the same typed config-error family as E9. */
 export class FabricMeshNatsConfigError extends Error {
   readonly code = "FABRIC_MESH_TRANSPORT_CONFIG";
-  constructor(readonly field: "operatorMachine" | "rollbackHoldUntil" | "servers" | "custodyStream" | "livenessStream" | "pathBMachines" | "tls" | "org" | "allowInsecureLoopback" | "verifyMachine" | "ephemeralHost" | "ephemeralInactiveSeconds" | "events" | "provision" | "inboxMaxAgeMs", requirement: string) {
+  constructor(readonly field: "operatorMachine" | "rollbackHoldUntil" | "servers" | "custodyStream" | "livenessStream" | "pathBMachines" | "tls" | "org" | "eventOrgs" | "allowInsecureLoopback" | "verifyMachine" | "ephemeralHost" | "ephemeralInactiveSeconds" | "events" | "provision" | "inboxMaxAgeMs", requirement: string) {
     super(`mesh.nats.${field} ${requirement}`);
     this.name = "FabricMeshNatsConfigError";
   }
@@ -595,6 +595,8 @@ export interface FabricMeshNatsConfig {
   events?: boolean;
   /** Org slug for event and service subjects; required when events is true or a session channel is opened. */
   org?: string;
+  /** Host-owned event grant scopes; defaults to [org] and never comes from a workspace layer. */
+  eventOrgs?: string[];
   /** Explicit event-stream provisioning gate; normalized configs supply false. Does not grant admin rights. */
   provision?: boolean;
   /** Messaging connection settings. No credential is read while loading config. */
@@ -630,10 +632,22 @@ const meshNatsFlag = (value: unknown, field: "events" | "provision"): boolean =>
   throw new FabricMeshNatsConfigError(field, "must be a boolean");
 };
 
+const isMeshNatsOrgSlug = (value: unknown): value is string =>
+  typeof value === "string" && /^[a-z0-9][a-z0-9-]{0,62}$/.exec(value)?.[0] === value && value !== "sys";
+
 const meshNatsOrg = (value: unknown, events = false): string | undefined => {
   if (value === undefined && !events) return undefined;
-  if (typeof value === "string" && /^[a-z0-9][a-z0-9-]{0,62}$/.exec(value)?.[0] === value && value !== "sys") return value;
+  if (isMeshNatsOrgSlug(value)) return value;
   throw new FabricMeshNatsConfigError("org", "must be a non-sys org slug (1..63 lowercase letters, digits or hyphens, starting with a letter or digit); required when events is true");
+};
+
+const meshNatsEventOrgs = (value: unknown, org?: string): string[] => {
+  const configured = value === undefined ? [] : value;
+  if (!Array.isArray(configured) || configured.length > 64 || !Array.from(configured).every(isMeshNatsOrgSlug) ||
+    new Set(configured).size !== configured.length) {
+    throw new FabricMeshNatsConfigError("eventOrgs", "must be an array of up to 64 unique non-sys org slugs");
+  }
+  return [...new Set([...(org === undefined ? [] : [org]), ...configured])];
 };
 
 const meshNatsString = (value: unknown, field: "credentials" | "machine"): string | undefined => {
@@ -766,6 +780,7 @@ const meshNatsConfig = (value: unknown, transport: FabricMeshTransport): FabricM
   }
   const events = meshNatsFlag(messaging.events, "events");
   const org = meshNatsOrg(messaging.org, events);
+  const eventOrgs = meshNatsEventOrgs(messaging.eventOrgs, org);
   const provision = meshNatsFlag(messaging.provision, "provision");
   const servers = meshNatsServers(messaging.servers);
   const custodyStream = meshNatsStream(messaging.custodyStream, "custodyStream");
@@ -785,7 +800,7 @@ const meshNatsConfig = (value: unknown, transport: FabricMeshTransport): FabricM
   return {
     replicas: meshNatsReplicas(nats.replicas),
     servers, custodyStream, livenessStream, pathBMachines, tls,
-    events, provision,
+    events, provision, eventOrgs,
     ...(org !== undefined ? { org } : {}),
     ...(credentials !== undefined ? { credentials } : {}),
     ...(machine !== undefined ? { machine } : {}),
@@ -2605,6 +2620,7 @@ const resolveFabricConfig = (
       delete nats.ephemeralHost; // Host-only: a workspace cannot retain its own inbox durable.
       delete nats.ephemeralInactiveSeconds;
       delete nats.inboxMaxAgeMs; // Host-only: a workspace cannot alter shared inbox stream retention.
+      delete nats.eventOrgs; // Host-only: a workspace cannot widen event credential scopes.
       mesh.nats = nats;
       document.mesh = mesh;
       const executor = { ...objectValue(document.executor) };

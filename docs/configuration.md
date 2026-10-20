@@ -1148,8 +1148,11 @@ credentials, machine inventory and custody/liveness policy remain required):
 `mesh.nats.org` is a GitHub login slug, required when events are enabled. The
 active values are `smarty-pants-inc` and `versehq` (Playful's login is `versehq`,
 not `playful`). Values are 1–63 lowercase letters, digits or hyphens, starting
-with a letter or digit; `sys` is reserved. Stream names uppercase the slug and
-replace hyphens with `_`. `mesh.nats.provision` **defaults to false**;
+with a letter or digit; `sys` is reserved.
+
+Host-only `mesh.nats.eventOrgs` defaults to `[org]` and lists the orgs whose event subjects may be granted; a workspace cannot set it.
+
+Stream names uppercase the slug and replace hyphens with `_`. `mesh.nats.provision` **defaults to false**;
 both flags must be booleans. FILE transport keeps them off. In NATS mode the
 existing `PI_FABRIC_MESH_NATS` replacement snapshot supplies these keys when
 present.

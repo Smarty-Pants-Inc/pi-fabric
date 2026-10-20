@@ -1,5 +1,30 @@
-import { describe, expect, it } from "vitest";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { describe, expect, it, vi } from "vitest";
+import { decodeAndVerifyNatsJwt } from "../src/mesh/nats-auth/jwt.js";
+import { createNatsAccount, createNatsOperator, mintNatsUser, type NatsMintOutput } from "../src/mesh/nats-auth/mint.js";
 import { NatsPermissionsError, PATH_B_ADVISORY_DURABLE, PATH_B_OPERATOR_MACHINE, pathBRoleTemplate, roleTemplate, roleTemplateWithPathB, type RoleTemplate } from "../src/mesh/nats-auth/permissions.js";
+
+const artifact = (output: NatsMintOutput<unknown>, name: string): string =>
+  new TextDecoder().decode(output.artifacts.find(entry => entry.name === name)!.bytes).trim();
+const fixture = (events?: boolean) => {
+  const streams = { custodyStream: "TEST_CUSTODY", livenessStream: "TEST_LIVENESS" };
+  const policy = { ...streams, pathBMachines: ["ryzen2"], ...(events === undefined ? {} : { events }), org: "smarty-dev" };
+  const operator = createNatsOperator({ operatorName: "events-test" });
+  const operatorJwt = artifact(operator, "operator.jwt");
+  const account = createNatsAccount({
+    ...policy, name: "smarty-dev", operatorJwt, operatorSigningSeed: artifact(operator, "operator-signing.nk"),
+    jetstream: { memStorage: 0, diskStorage: 1, streams: 1, consumers: 1 },
+  });
+  const accountJwt = artifact(account, "account.jwt");
+  const input = {
+    ...policy, operatorJwt, accountJwt, accountPublicKey: account.metadata.account.publicKey,
+    signingSeed: artifact(account, "signing-agent.nk"), role: "agent", host: "ryzen2",
+    lane: "test", session: "test", release: "test", meshes: ["0".repeat(32)],
+  };
+  return { streams, policy, account, accountJwt, input };
+};
 
 const matches = (pattern: string, subject: string): boolean => {
   const p = pattern.split("."), s = subject.split(".");
@@ -17,6 +42,119 @@ const maySubscribe = (template: RoleTemplate, subject: string): boolean =>
 // Keep reason (#4280): pure grant-shape checks catch trust-boundary wildcard regressions before
 // account signing. The CLI-to-real-broker test is the real-path proof; these do not replace it.
 describe("Path B NATS grants", () => {
+  it("adds only the exact opted-in org event grants and preserves default/operator scope", () => {
+    const streams = { custodyStream: "TEST_CUSTODY", livenessStream: "TEST_LIVENESS" };
+    const machines = ["ryzen2"];
+    const base = roleTemplateWithPathB("agent", streams, machines);
+    const scoped = roleTemplateWithPathB("agent", streams, machines, { org: "smarty-dev" });
+    const event = roleTemplateWithPathB("agent", streams, machines, { events: true, org: "smarty-dev" });
+    const grants = [
+      "fabric.ev.smarty-dev.>",
+      ...["FABRIC_EV_SMARTY_DEV", "GITHUB_SMARTY_DEV"].flatMap(stream => [
+        `$JS.API.STREAM.INFO.${stream}`,
+        `$JS.API.STREAM.MSG.GET.${stream}`,
+        `$JS.API.CONSUMER.DURABLE.CREATE.${stream}.>`,
+        `$JS.API.CONSUMER.CREATE.${stream}.>`,
+        `$JS.API.CONSUMER.INFO.${stream}.>`,
+        `$JS.API.CONSUMER.MSG.NEXT.${stream}.>`,
+        `$JS.API.CONSUMER.DELETE.${stream}.>`,
+        `$JS.API.CONSUMER.UPDATE.${stream}.>`,
+        `$JS.ACK.${stream}.>`,
+      ]),
+    ];
+    expect(new Set(event.pub.allow)).toEqual(new Set([...scoped.pub.allow, ...grants]));
+    expect(event.pub.deny).toEqual(scoped.pub.deny);
+    expect(event.sub).toEqual(scoped.sub);
+    expect(roleTemplateWithPathB("agent", streams, machines, { events: false, org: "smarty-dev" })).toEqual(scoped);
+    expect(roleTemplateWithPathB("agent", streams, machines)).toEqual(base);
+    expect(roleTemplateWithPathB("operator", streams, machines, { events: true, org: "smarty-dev" }))
+      .toEqual(roleTemplateWithPathB("operator", streams, machines));
+    expect(event.pub.allow).not.toContain("github.>");
+    expect(() => roleTemplateWithPathB("agent", streams, machines, { events: true, org: "sys" })).toThrow();
+  });
+
+  it("mints the exact event-enabled account scope and refuses mismatched agent issuance", () => {
+    for (const events of [undefined, false, true]) {
+      const { streams, policy, account, accountJwt, input } = fixture(events);
+      const keys = decodeAndVerifyNatsJwt(accountJwt).claims.nats.signing_keys as { role: string; template: ReturnType<typeof roleTemplate> }[];
+      const agent = keys.find(key => key.role === "agent")!.template;
+      const expectedAgent = roleTemplateWithPathB("agent", streams, policy.pathBMachines, policy);
+      expect(agent).toEqual({
+        pub: expectedAgent.pub,
+        sub: expectedAgent.sub,
+        ...(expectedAgent.allow_responses ? { resp: expectedAgent.allow_responses } : {}),
+        subs: -1, data: -1, payload: -1,
+      });
+      expect(keys.find(key => key.role === "operator")!.template)
+        .toEqual({ ...roleTemplateWithPathB("operator", streams, policy.pathBMachines), subs: -1, data: -1, payload: -1 });
+      expect(mintNatsUser(input).metadata.role).toBe("agent");
+      if (events === true) {
+        expect(() => mintNatsUser({ ...input, events: false })).toThrow("scope template differs");
+        expect(() => mintNatsUser({ ...input, org: "other-org" })).toThrow("scope template differs");
+      } else {
+        expect(mintNatsUser({ ...input, events: false }).metadata.role).toBe("agent");
+        expect(() => mintNatsUser({ ...input, events: true })).toThrow("scope template differs");
+      }
+      expect(mintNatsUser({
+        ...policy, operatorJwt: input.operatorJwt, accountJwt, accountPublicKey: account.metadata.account.publicKey,
+        role: "operator", signingSeed: artifact(account, "signing-operator.nk"), job: "compaction", runId: "test",
+      }).metadata.role).toBe("operator");
+    }
+  });
+
+  // USER.INFO is the trust boundary here; only network I/O is substituted. Existing broker suites prove server expansion.
+  it.skipIf(process.platform === "win32")("verifies opted-in event grants, rejects missing or foreign-org scope, and retains agent supersets", async () => {
+    const { streams, policy, input } = fixture(true);
+    const user = mintNatsUser(input);
+    const subject = user.metadata.publicKey;
+    const template = roleTemplateWithPathB("agent", streams, policy.pathBMachines, policy);
+    const expand = (subjects: string[]) => subjects.map(value => value
+      .replaceAll("{{subject()}}", subject).replaceAll("{{tag(machine)}}", "ryzen2").replaceAll("{{tag(mesh)}}", input.meshes[0]!));
+    const allowed = expand(template.pub.allow);
+    let publish = allowed;
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "nats-events-auth-"));
+    const credentials = path.join(root, "user.creds");
+    fs.writeFileSync(credentials, user.artifacts[0]!.bytes, { mode: 0o600 });
+    const connect = vi.fn(async () => {
+      let finish!: () => void;
+      const closed = new Promise<void>(resolve => { finish = resolve; });
+      return {
+        request: async () => ({ data: new TextEncoder().encode(JSON.stringify({ data: { user: subject, permissions: {
+          publish: { allow: publish, deny: expand(template.pub.deny) }, subscribe: { allow: expand(template.sub.allow) },
+          ...(template.allow_responses ? { responses: { ...template.allow_responses, ttl: 120_000_000_000 } } : {}),
+        } } })) }),
+        closed: () => closed,
+        status: async function* () {},
+        close: async () => { finish(); },
+      };
+    });
+    vi.doMock("@nats-io/transport-node", async importOriginal => ({
+      ...await importOriginal<typeof import("@nats-io/transport-node")>(), connect,
+    }));
+    vi.doMock("@nats-io/jetstream", () => ({ jetstream: () => ({}), jetstreamManager: async () => ({}) }));
+    try {
+      const { openNatsConnection } = await import("../src/transport/nats/connection.js");
+      const baseOptions = { ...streams, pathBMachines: policy.pathBMachines, org: policy.org, credentials, machine: "ryzen2", servers: "tls://localhost:4222" };
+      const options = { ...baseOptions, events: true };
+      await (await openNatsConnection(options)).close();
+      for (const off of [baseOptions, { ...baseOptions, events: false }]) await (await openNatsConnection(off)).close();
+      await expect(openNatsConnection({ ...options, org: "other-org" })).rejects.toThrow("machine tag mismatch");
+      publish = allowed.filter(value => value !== "fabric.ev.smarty-dev.>");
+      await expect(openNatsConnection(options)).rejects.toThrow("machine tag mismatch");
+      publish = [...allowed, "github.>"];
+      await (await openNatsConnection(options)).close();
+      publish = expand(roleTemplateWithPathB("agent", streams, policy.pathBMachines, { org: policy.org }).pub.allow);
+      await expect(openNatsConnection(options)).rejects.toThrow("machine tag mismatch");
+      publish = allowed;
+      for (const off of [baseOptions, { ...baseOptions, events: false }]) await (await openNatsConnection(off)).close();
+    } finally {
+      vi.doUnmock("@nats-io/transport-node");
+      vi.doUnmock("@nats-io/jetstream");
+      vi.resetModules();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("keeps agent application and API writes bound to its machine tag", () => {
     const template = pathBRoleTemplate("agent", "ryzen1");
     expect(mayPublish(template, "fabric.in.ryzen2.abcd.cmd.1234.ryzen1")).toBe(true);

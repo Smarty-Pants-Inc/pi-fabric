@@ -1,7 +1,8 @@
 import { closeSync, constants as fsConstants, fstatSync, openSync, readFileSync } from "node:fs";
 import { Buffer } from "node:buffer";
 import { isIP } from "node:net";
-import { credsAuthenticator, type NatsConnection } from "@nats-io/nats-core";
+import { setTimeout as sleep } from "node:timers/promises";
+import { credsAuthenticator, type Msg, type NatsConnection, type Subscription } from "@nats-io/nats-core";
 import { jetstream, jetstreamManager, type JetStreamClient, type JetStreamManager } from "@nats-io/jetstream";
 import { AuthorizationError, PermissionViolationError, connect, type NodeConnectionOptions, type Status, type TlsOptions } from "@nats-io/transport-node";
 import { pathBMachines } from "../../mesh/nats-auth/mint.js";
@@ -17,13 +18,16 @@ export class NatsAuthorizationError extends Error {
 }
 
 export type NatsStatusListener = (status: Status) => void;
-export type SubscribeNatsStatus = (listener: NatsStatusListener) => () => void;
+export type SubscribeNatsStatus = ((listener: NatsStatusListener) => () => void) & { isVerified?: () => boolean };
 
 /** Expected #1276 Path B policy inputs. The same values the account scope was minted from. */
 export interface NatsPermissionPolicy {
   readonly custodyStream: string;
   readonly livenessStream: string;
   readonly pathBMachines: readonly string[];
+  /** Optional shared-org event grants; absent/false preserves the existing Path B scope. */
+  readonly events?: boolean;
+  /** Optional org scope for service subjects and session channels. */
   readonly org?: string;
 }
 
@@ -57,8 +61,10 @@ export interface NatsConnectionHandle {
   readonly js: JetStreamClient;
   readonly manager: JetStreamManager;
   readonly userInfo?: unknown;
-  /** Native reconnect is disabled. Resolves a typed retryable error on loss; explicit close resolves void. */
+  /** Resolves a typed retryable error on hard loss, or a terminal error for a USER.INFO identity/permission mismatch. */
   closed(): Promise<void | Error>;
+  /** False while native reconnect is in progress or USER.INFO is being re-verified. */
+  isVerified(): boolean;
   onStatus: SubscribeNatsStatus;
   close(): Promise<void>;
 }
@@ -203,6 +209,7 @@ interface PermissionSet {
 
 interface ExpectedPermissions extends PermissionSet {
   readonly legacy: PermissionSet;
+  readonly allowAdditionalPermissions: boolean;
 }
 
 /** Expand one role template for the signed identity exactly as nats-server expands it. */
@@ -236,13 +243,17 @@ const expectedPermissions = (role: "agent" | "operator", machine: string, policy
     throw new Error(MISMATCH);
   }
   const input = { custodyStream: policy.custodyStream, livenessStream: policy.livenessStream };
-  const template = roleTemplateWithPathB(role, input, machines, policy.org);
-  // Keep the installed no-org account as a separate frozen rollout exception. New org-scoped
-  // session-channel credentials must match the current template, including its response limit.
+  const template = roleTemplateWithPathB(role, input, machines, policy);
+  // The installed d231bd15 account is a deliberate frozen rollout exception, only for unscoped credentials.
+  // Org-scoped session-channel or event identities must not fall back to this older grant set.
   const legacy = role === "agent" && policy.org === undefined
     ? legacyRoleTemplateWithPathB("agent", input, machines)
     : template;
-  return { ...expandPermissions(template, machine, meshes, auth), legacy: expandPermissions(legacy, machine, meshes, auth) };
+  return {
+    ...expandPermissions(template, machine, meshes, auth),
+    legacy: expandPermissions(legacy, machine, meshes, auth),
+    allowAdditionalPermissions: role === "agent",
+  };
 };
 
 /** Absent list = empty; present list must be strings. Unknown keys refuse. */
@@ -259,10 +270,34 @@ const permissionLists = (value: unknown): { allow: Set<string>; deny: Set<string
 const sameSet = (actual: ReadonlySet<string>, expected: ReadonlySet<string>): boolean =>
   actual.size === expected.size && [...expected].every((subject) => actual.has(subject));
 
-const matchesPermissions = (actual: { allow: Set<string>; deny: Set<string> }, expected: PermissionSet, subscribe: boolean): boolean =>
-  subscribe
-    ? sameSet(actual.allow, expected.subAllow) && sameSet(actual.deny, expected.subDeny)
-    : sameSet(actual.allow, expected.pubAllow) && sameSet(actual.deny, expected.pubDeny);
+const containsSet = (actual: ReadonlySet<string>, expected: ReadonlySet<string>): boolean =>
+  [...expected].every((subject) => actual.has(subject));
+
+const matchesPermissions = (
+  actual: { allow: Set<string>; deny: Set<string> },
+  expected: PermissionSet,
+  subscribe: boolean,
+  allowAdditional: boolean,
+): boolean => {
+  const matches = allowAdditional ? containsSet : sameSet;
+  return subscribe
+    ? matches(actual.allow, expected.subAllow) && matches(actual.deny, expected.subDeny)
+    : matches(actual.allow, expected.pubAllow) && matches(actual.deny, expected.pubDeny);
+};
+
+const responsesAtLeast = (actual: unknown, expected: PermissionSet, allowAdditional: boolean): boolean => {
+  if (!expected.responses) {
+    if (!allowAdditional) return actual === undefined || actual === null;
+    return actual === undefined || actual === null || isPlainObject(actual) &&
+      Number.isSafeInteger(actual.max) && (actual.max as number) > 0 &&
+      Number.isSafeInteger(actual.ttl) && (actual.ttl as number) > 0;
+  }
+  if (!isPlainObject(actual)) return false;
+  if (!allowAdditional) return Object.keys(actual).length === 2 &&
+    actual.max === expected.responses.max && actual.ttl === expected.responses.ttl;
+  return Number.isSafeInteger(actual.max) && (actual.max as number) >= expected.responses.max &&
+    Number.isSafeInteger(actual.ttl) && (actual.ttl as number) >= expected.responses.ttl;
+};
 
 const verifyIdentity = async (nc: NatsConnection, timeoutMs: number, auth: ReturnType<typeof readNatsCredentials>, expected: ExpectedPermissions): Promise<unknown> => {
   const response = await nc.request("$SYS.REQ.USER.INFO", new Uint8Array(), { timeout: timeoutMs }).catch((cause: unknown) => {
@@ -273,7 +308,7 @@ const verifyIdentity = async (nc: NatsConnection, timeoutMs: number, auth: Retur
     throw new NatsAuthorizationError("NATS USER.INFO response is invalid", { cause });
   }
   // USER.INFO returns the authenticated user and expanded permissions, not JWT tags. Tie the locally decoded tags to
-  // the server-authenticated subject, then require the exact expanded scope: no missing, extra or response rights.
+  // the server-authenticated subject. Agent permissions may be supersets; operator permissions remain exact.
   const data = isPlainObject(value) && isPlainObject(value.data) ? value.data : undefined;
   const permissions = data?.permissions;
   if (!data || data.user !== auth.subject || !isPlainObject(permissions) ||
@@ -281,15 +316,13 @@ const verifyIdentity = async (nc: NatsConnection, timeoutMs: number, auth: Retur
   const publish = permissionLists(permissions.publish);
   const subscribe = permissionLists(permissions.subscribe);
   if (!publish || !subscribe) throw new NatsAuthorizationError(MISMATCH);
-  const responsesMatch = (permission: PermissionSet): boolean => {
-    const responses = permissions.responses;
-    return permission.responses
-      ? isPlainObject(responses) && Object.keys(responses).length === 2 &&
-        responses.max === permission.responses.max && responses.ttl === permission.responses.ttl
-      : responses === undefined || responses === null;
-  };
-  const current = matchesPermissions(publish, expected, false) && matchesPermissions(subscribe, expected, true) && responsesMatch(expected);
-  const legacy = matchesPermissions(publish, expected.legacy, false) && matchesPermissions(subscribe, expected.legacy, true) && responsesMatch(expected.legacy);
+  const current = matchesPermissions(publish, expected, false, expected.allowAdditionalPermissions) &&
+    matchesPermissions(subscribe, expected, true, expected.allowAdditionalPermissions) &&
+    responsesAtLeast(permissions.responses, expected, expected.allowAdditionalPermissions);
+  // Operator grants and the frozen d231bd15 rollout exception are exact; neither can fall through to a superset.
+  const legacy = matchesPermissions(publish, expected.legacy, false, false) &&
+    matchesPermissions(subscribe, expected.legacy, true, false) &&
+    responsesAtLeast(permissions.responses, expected.legacy, false);
   if (!current && !legacy) throw new NatsAuthorizationError(MISMATCH);
   if (!current && !warnedLegacyPermissions) {
     warnedLegacyPermissions = true;
@@ -314,15 +347,28 @@ const open = async (
   const security = transportSecurity(options);
   const auth = readNatsCredentials(options.credentials);
   prepare(auth);
+  let verified = false;
+  let initialVerificationComplete = false;
+  let reconnectAttempt = 0;
+  const reconnectDelayHandler = (): number => {
+    if (initialVerificationComplete) verified = false;
+    const base = Math.min(5_000, 500 * 2 ** Math.min(reconnectAttempt++, 4));
+    return base + Math.floor(Math.random() * 250);
+  };
   const nc = await connect({
     ...security,
     ...(options.name ? { name: options.name } : {}),
     timeout: timeoutMs,
-    // A new physical connection must pass USER.INFO before any JS/KV client is exposed.
-    // Native reconnect replays subscriptions/outbound frames before asynchronous status observers run.
-    // The transport owner must reopen through openNatsConnection and recreate its clients instead.
-    reconnect: false,
-    maxReconnectAttempts: 0,
+    // Native reconnect replays SUBs before `reconnect` status. The synchronous dial hook
+    // closes the app-send gate before replay; the guarded facade blocks PUB/REQ/SUB until
+    // USER.INFO passes. This client version has no reconnectBufSize option: prepare() resets
+    // its outbound DataBuffer before dial, so pre-disconnect PUBs are not replayed.
+    reconnect: true,
+    maxReconnectAttempts: -1,
+    reconnectTimeWait: 500,
+    reconnectJitter: 250,
+    reconnectJitterTLS: 250,
+    reconnectDelayHandler,
     authenticator: credsAuthenticator(auth.bytes),
     inboxPrefix: `_INBOX.${auth.subject}`,
   }).catch((cause: unknown) => {
@@ -331,43 +377,121 @@ const open = async (
   });
   // Official connect has no signal option: its timeout bounds dialing. Once a handle exists,
   // cancellation closes it immediately, including during USER.INFO and provisioning awaits.
-  const onAbort = (): void => { void nc.close().catch(() => undefined); };
+  const verificationRetryAbort = new AbortController();
+  const onAbort = (): void => { verificationRetryAbort.abort(); void nc.close().catch(() => undefined); };
   const removeAbort = (): void => signal?.removeEventListener("abort", onAbort);
   signal?.addEventListener("abort", onAbort, { once: true });
   try {
     signal?.throwIfAborted();
     const userInfo = verify ? await verify(nc, timeoutMs, auth) : undefined;
     signal?.throwIfAborted();
-    const manager = await jetstreamManager(nc, { timeout: timeoutMs });
+    verified = true;
+    initialVerificationComplete = true;
+    reconnectAttempt = 0;
+    const gated = new Set<PropertyKey>([
+      "publish", "publishMessage", "respondMessage", "request", "requestMany", "subscribe", "flush", "drain",
+      Symbol.asyncDispose,
+    ]);
+    const guardedNc = new Proxy(nc, {
+      get(target, property) {
+        if (property === "isVerified") return () => verified;
+        const value = Reflect.get(target, property, target) as unknown;
+        if (typeof value !== "function") return value;
+        const bound = value.bind(target) as (...args: unknown[]) => unknown;
+        if (!gated.has(property)) return bound;
+        return (...args: unknown[]): unknown => {
+          if (!verified) throw new TransportUnavailableError("NATS USER.INFO re-verification is pending");
+          const result = bound(...args);
+          if (property === "subscribe") {
+            const subscription = result as Subscription & { callback?: (error: Error | null, message: Msg) => void };
+            const callback = subscription.callback;
+            if (typeof callback === "function") {
+              subscription.callback = (error, message) => {
+                // The native protocol replays subscriptions before the async `reconnect`
+                // status. Do not expose any replayed data until USER.INFO has re-verified.
+                // Errors still reach the consumer so it can close or fail its operation.
+                if (verified || error) callback.call(subscription, error, message);
+              };
+            }
+          }
+          return result;
+        };
+      },
+    });
+    const manager = await jetstreamManager(guardedNc, { timeout: timeoutMs });
     signal?.throwIfAborted();
-    const js = jetstream(nc, { timeout: timeoutMs });
+    const js = jetstream(guardedNc, { timeout: timeoutMs });
     const listeners = new Set<NatsStatusListener>();
     let closing = false;
-    const closed = nc.closed().then((cause) => {
+    let authFailure!: (error: NatsAuthorizationError) => void;
+    const authFailurePromise = new Promise<Error>((resolve) => { authFailure = resolve; });
+    const nativeClosed = nc.closed().then((cause) => {
+      verificationRetryAbort.abort();
       removeAbort();
-      return closing ? undefined : new TransportUnavailableError("NATS connection lost; reopen and reverify before use", { cause });
+      if (closing) return undefined;
+      if (cause) return connectionFailure(cause, "NATS connection lost; native reconnect ended");
+      return new TransportUnavailableError("NATS connection lost; native reconnect ended");
     });
-    const statusTask = (async () => {
+    const closed = Promise.race([nativeClosed, authFailurePromise]);
+    const notify = (status: Status): void => {
+      for (const listener of listeners) {
+        try { listener(status); } catch { /* One observer must not prevent shutdown. */ }
+      }
+    };
+    const onStatus: SubscribeNatsStatus = Object.assign(
+      (listener: NatsStatusListener) => { listeners.add(listener); return () => { listeners.delete(listener); }; },
+      { isVerified: () => verified },
+    );
+    let statusTask!: Promise<void>;
+    const close = (): Promise<void> => {
+      if (closing) return statusTask ?? Promise.resolve();
+      closing = true;
+      verified = false;
+      verificationRetryAbort.abort();
+      removeAbort();
+      const task = (async () => { await nc.close(); await statusTask; listeners.clear(); })();
+      return task;
+    };
+    statusTask = (async () => {
+      let verificationRetryAttempt = 0;
       for await (const status of nc.status()) {
-        for (const listener of listeners) {
-          try { listener(status); } catch { /* One observer must not prevent shutdown. */ }
+        if (status.type === "disconnect") verified = false;
+        if (status.type === "reconnect") {
+          for (;;) {
+            if (closing || verificationRetryAbort.signal.aborted || nc.isClosed() || nc.isDraining()) return;
+            try {
+              if (verify) await verify(nc, timeoutMs, auth);
+              if (nc.isClosed() || nc.isDraining()) throw new TransportUnavailableError("NATS closed during USER.INFO re-verification");
+              verified = true;
+              reconnectAttempt = 0;
+              verificationRetryAttempt = 0;
+              break;
+            } catch (cause) {
+              verified = false;
+              if (cause instanceof NatsAuthorizationError) {
+                authFailure(cause);
+                notify({ type: "close" });
+                void close().catch(() => undefined);
+                return;
+              }
+              if (closing || verificationRetryAbort.signal.aborted || nc.isClosed() || nc.isDraining()) return;
+              const base = Math.min(5_000, 500 * 2 ** Math.min(verificationRetryAttempt++, 4));
+              await sleep(base + Math.floor(Math.random() * 250), undefined, { signal: verificationRetryAbort.signal }).catch(() => undefined);
+            }
+          }
         }
+        notify(status);
       }
     })();
     return {
-      nc,
+      nc: guardedNc,
       js,
       manager,
       ...(userInfo === undefined ? {} : { userInfo }),
       closed: () => closed,
-      onStatus: (listener) => { listeners.add(listener); return () => { listeners.delete(listener); }; },
-      close: async () => {
-        closing = true;
-        removeAbort();
-        await nc.close();
-        await statusTask;
-        listeners.clear();
-      },
+      isVerified: () => verified,
+      onStatus,
+      close,
     };
   } catch (error) {
     removeAbort();
@@ -386,8 +510,11 @@ export const openNatsConnection = async (options: NatsConnectionOptions): Promis
   if (typeof options.machine !== "string") throw new Error("NATS machine is required");
   const machine = validateMachine(options.machine);
   const policy: NatsPermissionPolicy = {
-    custodyStream: options.custodyStream, livenessStream: options.livenessStream,
-    pathBMachines: options.pathBMachines, ...(options.org === undefined ? {} : { org: options.org }),
+    custodyStream: options.custodyStream,
+    livenessStream: options.livenessStream,
+    pathBMachines: options.pathBMachines,
+    ...(options.events === undefined ? {} : { events: options.events }),
+    ...(options.org === undefined ? {} : { org: options.org }),
   };
   return open(options, (nc, timeoutMs, auth) => verifyIdentity(nc, timeoutMs, auth, expected!), (auth) => {
     // Fail closed before dialing: missing/invalid policy or a signed identity that cannot match.

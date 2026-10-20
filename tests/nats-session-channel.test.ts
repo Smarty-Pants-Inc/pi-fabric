@@ -105,7 +105,7 @@ describe.skipIf(!binary)("session channels over real org-scoped NATS", () => {
   if (!binary) it.skip(process.platform === "win32"
     ? "Windows check does not install nats-server; the pinned real-broker acceptance runs on Ubuntu"
     : "set NATS_BIN or put nats-server on PATH to run real-broker session-channel tests", () => undefined);
-  it("verifies the shared org role's exact grants through the real broker USER.INFO", async () => {
+  it("verifies the shared org role's required grants through the real broker USER.INFO", async () => {
     const verified = await openNatsConnection({ ...fixture!.runtimeOptions(fixture!.users.machineA), org: identity.org });
     try {
       expect(verified.userInfo).toMatchObject({

@@ -127,7 +127,7 @@ describe.skipIf(!binary)("real nats-server Path B module", () => {
       expect(advisory.config.max_age).toBe(30 * 24 * 60 * 60 * 1_000 * 1_000_000);
 
       const inbox = await admin.manager.streams.info(transportInboxStream("machine-a"));
-      expect(inbox.config.max_age).toBe(0);
+      expect(inbox.config.max_age).toBe(7 * 24 * 60 * 60_000 * 1_000_000);
       expect(inbox.config.max_bytes).toBe(1_073_741_824);
       expect(inbox.config.max_msg_size).toBe(1_048_576);
       expect(inbox.config.allow_direct).toBe(false);

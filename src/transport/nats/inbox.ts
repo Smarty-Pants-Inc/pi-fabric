@@ -21,6 +21,7 @@ import type {
 import { TransportInvalidError, TransportUncertainError, TransportUnavailableError } from "../types.js";
 import { fabricPathBProbeEpochNs, hasFabricPathBProbeObserver, recordFabricPathBProbe, transportProbeCommandId } from "../probe-hooks.js";
 import { publishFailure } from "./errors.js";
+import { DEFAULT_INBOX_MAX_AGE_MS, isValidInboxMaxAgeMs } from "./inbox-policy.js";
 import {
   transportAdvisoryStreamSubject,
   transportDurableName,
@@ -40,6 +41,8 @@ import {
   LEASE_TTL_MS, PRESENCE_TTL_MS, PLACEMENT_TERMINAL_BUCKET, PLACEMENT_TERMINAL_TTL_MS,
   openNatsKv, openNatsKvForMachine, type NatsKvStore,
 } from "./kv.js";
+import type { MeshEventPublisherBinding, MeshStore } from "../../mesh/store.js";
+import type { NatsEventsPublisher } from "./events-publish.js";
 
 const DEFAULT_MAX_BYTES = 1_073_741_824;
 const DEFAULT_MAX_MESSAGE_BYTES = 1_048_576;
@@ -61,6 +64,8 @@ export interface NatsTransportOptions extends NatsPermissionPolicy {
   readonly credentials: string;
   readonly tls?: TlsOptions;
   readonly maxBytes?: number;
+  /** Inbox stream max_age in milliseconds. Existing maxAgeMs is a legacy direct-options alias. */
+  readonly inboxMaxAgeMs?: number;
   readonly maxAgeMs?: number;
   readonly maxMessageBytes?: number;
   readonly duplicateWindowMs?: number;
@@ -70,14 +75,18 @@ export interface NatsTransportOptions extends NatsPermissionPolicy {
   readonly ephemeralHost?: boolean;
   /** Idle expiration in seconds when ephemeralHost is enabled (300..86400). */
   readonly ephemeralInactiveSeconds?: number;
+  /** Mesh event publisher binding; only required when events is enabled. */
+  readonly mesh?: MeshStore;
   readonly signal?: AbortSignal;
 }
 
 type OpenOptions = NatsTransportOptions | FabricTransportOptions;
-type ResolvedNatsOptions = Required<Pick<NatsTransportOptions, "servers" | "machine" | "hostId" | "credentials" | "custodyStream" | "livenessStream" | "pathBMachines" | "maxBytes" | "maxMessageBytes" | "duplicateWindowMs" | "requestTimeoutMs" | "provision" | "ephemeralHost" | "ephemeralInactiveSeconds">> & {
+type ResolvedNatsOptions = Required<Pick<NatsTransportOptions, "servers" | "machine" | "hostId" | "credentials" | "custodyStream" | "livenessStream" | "pathBMachines" | "maxBytes" | "maxMessageBytes" | "duplicateWindowMs" | "requestTimeoutMs" | "provision" | "ephemeralHost" | "ephemeralInactiveSeconds" | "inboxMaxAgeMs">> & {
   readonly org?: string;
   readonly name?: string;
   readonly tls?: TlsOptions;
+  readonly events: boolean;
+  readonly mesh?: MeshStore;
   readonly signal?: AbortSignal;
 };
 
@@ -108,16 +117,20 @@ const normalizeOptions = (options: OpenOptions): ResolvedNatsOptions => {
       maxMessageBytes: options.maxMessageBytes ?? DEFAULT_MAX_MESSAGE_BYTES,
       duplicateWindowMs: options.duplicateWindowMs ?? DEFAULT_DUPLICATE_WINDOW_MS,
       requestTimeoutMs: options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
-      provision: options.provision ?? false,
+      // Event-mode runtimes never provision streams, including through the direct-options port.
+      provision: options.events === true ? false : options.provision ?? false,
       ephemeralHost: options.ephemeralHost ?? false,
       ephemeralInactiveSeconds: options.ephemeralInactiveSeconds ?? DEFAULT_EPHEMERAL_INACTIVE_SECONDS,
+      inboxMaxAgeMs: options.inboxMaxAgeMs ?? options.maxAgeMs ?? DEFAULT_INBOX_MAX_AGE_MS,
+      events: options.events ?? false,
+      ...(options.mesh === undefined ? {} : { mesh: options.mesh }),
       ...(options.signal === undefined ? {} : { signal: options.signal }),
     } as ResolvedNatsOptions;
   }
   const config = options.config as unknown as { nats?: {
     servers?: string | readonly string[]; machine?: string; credentials?: string;
     custodyStream?: string; livenessStream?: string; pathBMachines?: readonly string[]; org?: string; tls?: TlsOptions;
-    ephemeralHost?: boolean; ephemeralInactiveSeconds?: number;
+    ephemeralHost?: boolean; ephemeralInactiveSeconds?: number; inboxMaxAgeMs?: number; events?: boolean; provision?: boolean;
   } };
   const nats = config.nats;
   // Production config never enables plaintext; the loopback opt-in is a direct test option only.
@@ -147,6 +160,9 @@ const normalizeOptions = (options: OpenOptions): ResolvedNatsOptions => {
     provision: false,
     ephemeralHost: nats?.ephemeralHost ?? false,
     ephemeralInactiveSeconds: nats?.ephemeralInactiveSeconds ?? DEFAULT_EPHEMERAL_INACTIVE_SECONDS,
+    inboxMaxAgeMs: nats?.inboxMaxAgeMs ?? DEFAULT_INBOX_MAX_AGE_MS,
+    events: nats?.events ?? false,
+    mesh: options.mesh,
     ...(options.signal === undefined ? {} : { signal: options.signal }),
   } as ResolvedNatsOptions;
 };
@@ -155,7 +171,7 @@ const streamPolicy = (name: string, subjects: readonly string[], options: Resolv
   name,
   subjects,
   maxBytes: overrides.maxBytes ?? options.maxBytes,
-  maxAgeMs: overrides.maxAgeMs ?? 0,
+  maxAgeMs: overrides.maxAgeMs ?? options.inboxMaxAgeMs,
   maxMessageBytes: overrides.maxMessageBytes ?? options.maxMessageBytes,
   duplicateWindowMs: overrides.duplicateWindowMs ?? options.duplicateWindowMs,
   replicas: 1,
@@ -189,6 +205,7 @@ interface NatsSession {
   readonly js: JetStreamClient;
   readonly manager: JetStreamManager;
   readonly kvStores: Readonly<Record<"leases" | "presence", NatsKvStore>>;
+  readonly eventsPublisher?: NatsEventsPublisher;
   unsubscribe?: () => void;
 }
 
@@ -209,6 +226,7 @@ const openNatsSession = async (options: ResolvedNatsOptions, signal?: AbortSigna
     custodyStream: options.custodyStream,
     livenessStream: options.livenessStream,
     pathBMachines: options.pathBMachines,
+    events: options.events,
     ...(options.org === undefined ? {} : { org: options.org }),
     ...(options.tls === undefined ? {} : { tls: options.tls }),
     timeoutMs: options.requestTimeoutMs,
@@ -230,15 +248,27 @@ const openNatsSession = async (options: ResolvedNatsOptions, signal?: AbortSigna
     assertAlive();
     const presence = await openNatsKvForMachine(connection.js, "presence", options.machine, options.provision, connection.onStatus);
     assertAlive();
-    await ensureTransportStream(manager, streamPolicy(transportInboxStream(options.machine), [transportInboxStreamSubject(options.machine)], options, {
-      maxAgeMs: 0,
-    }), options.provision);
+    await ensureTransportStream(manager, {
+      ...streamPolicy(transportInboxStream(options.machine), [transportInboxStreamSubject(options.machine)], options),
+      allowUnboundedMaxAge: true,
+    }, options.provision);
     assertAlive();
     const consumerPolicy = transportConsumerPolicy(options);
     const consumer = await ensureTransportConsumer(manager.consumers, consumerPolicy);
     assertAlive();
     if (consumer.config.description !== consumerPolicy.description) throw new TransportInvalidError("transport inbox owner description mismatch");
-    return { connection, js: connection.js, manager, kvStores: { leases, presence } };
+    let eventsPublisher: NatsEventsPublisher | undefined;
+    if (options.events) {
+      const { openNatsEventsPublisher } = await import("./index.js");
+      assertAlive();
+      // Fabric-store owns stream creation with admin credentials. Even mesh.nats.provision=true
+      // cannot grant runtime creation: require the existing FABRIC_EV_<NORMALIZED_ORG> stream.
+      // Its canonical layout/policy belongs to provision.ts; GitHub uses its separate GITHUB stream.
+      eventsPublisher = await openNatsEventsPublisher(connection, { org: options.org!, provision: false });
+      assertAlive();
+    }
+    return { connection, js: connection.js, manager, kvStores: { leases, presence },
+      ...(eventsPublisher ? { eventsPublisher } : {}) };
   } catch (error) {
     await connection.close().catch(() => undefined);
     signal?.throwIfAborted();
@@ -363,7 +393,10 @@ class NatsTransportImpl implements FabricTransport {
   readonly #kvStores: Readonly<Record<"leases" | "presence", TransportKv>>;
   #placementTerminalStore: { readonly epoch: number; readonly store: NatsKvStore } | undefined;
   readonly #waiters = new Set<ReadyWaiter>();
+  readonly #verifiedReconnectListeners = new Set<() => void>();
   readonly #sessionChannels = new NatsSessionChannelManager();
+  #eventPublisher: MeshEventPublisherBinding | undefined;
+  #hasInstalledSession = false;
 
   private constructor(session: NatsSession, options: ResolvedNatsOptions) {
     this.#session = session;
@@ -382,6 +415,8 @@ class NatsTransportImpl implements FabricTransport {
     rawOptions.signal?.throwIfAborted();
     const options = normalizeOptions(rawOptions);
     if (!options.hostId) throw new Error("hostId is required");
+    if (typeof options.events !== "boolean") throw new Error("NATS transport events must be a boolean");
+    if (options.events && (!options.org || !options.mesh)) throw new Error("NATS transport events require org and mesh");
     for (const [key, value] of Object.entries(options)) {
       if (["servers", "machine", "hostId", "name", "credentials", "ephemeralHost"].includes(key)) continue;
       if (typeof value === "number" && (!Number.isSafeInteger(value) || value <= 0)) throw new Error(`${key} must be positive`);
@@ -390,7 +425,23 @@ class NatsTransportImpl implements FabricTransport {
     if (!Number.isSafeInteger(options.ephemeralInactiveSeconds) || options.ephemeralInactiveSeconds < 300 || options.ephemeralInactiveSeconds > 86_400) {
       throw new Error("ephemeralInactiveSeconds must be an integer from 300 through 86400");
     }
+    if (!isValidInboxMaxAgeMs(options.inboxMaxAgeMs)) throw new Error("inboxMaxAgeMs must be a bounded positive number of milliseconds");
     const transport = new NatsTransportImpl(await openNatsSession(options, options.signal), options);
+    try {
+      if (options.events) {
+        transport.#eventPublisher = options.mesh!.bindEventPublisher(`nats:${options.org!}`, event => {
+          const publisher = transport.#assertOpen().eventsPublisher;
+          if (!publisher) throw new TransportUnavailableError("NATS event publisher is unavailable");
+          return publisher.publish(event);
+        }, event => {
+          if (typeof event.id !== "string" || !validMessageId(event.id)) throw new TransportInvalidError("invalid NATS event id");
+          if (event.topic.split(".").some(token => token.length === 0)) throw new TransportInvalidError("invalid NATS event topic");
+        });
+      }
+    } catch (error) {
+      await transport.close().catch(() => undefined);
+      throw error;
+    }
     // Cover an abort between acquisition and owner-listener registration.
     if (options.signal?.aborted) {
       await transport.close().catch(() => undefined);
@@ -405,7 +456,8 @@ class NatsTransportImpl implements FabricTransport {
 
   #waitForSession(signal: AbortSignal): Promise<NatsSession> {
     if (this.#terminalError) return Promise.reject(this.#terminalError);
-    if (this.#session && !this.#session.connection.nc.isClosed() && !this.#session.connection.nc.isDraining()) return Promise.resolve(this.#session);
+    if (this.#session && this.#session.connection.isVerified() &&
+      !this.#session.connection.nc.isClosed() && !this.#session.connection.nc.isDraining()) return Promise.resolve(this.#session);
     if (this.#closed) return Promise.reject(new TransportUnavailableError("NATS transport is closed"));
     signal.throwIfAborted();
     return new Promise<NatsSession>((resolve, reject) => {
@@ -417,6 +469,7 @@ class NatsTransportImpl implements FabricTransport {
   }
 
   #resolveWaiters(session: NatsSession): void {
+    if (!session.connection.isVerified()) return;
     for (const waiter of [...this.#waiters]) {
       this.#waiters.delete(waiter);
       if (waiter.onAbort) waiter.signal.removeEventListener("abort", waiter.onAbort);
@@ -433,13 +486,50 @@ class NatsTransportImpl implements FabricTransport {
   }
 
   #installSession(session: NatsSession): void {
+    const reinstalled = this.#hasInstalledSession;
+    this.#hasInstalledSession = true;
     this.#session = session;
     this.#sessionChannels.setConnection(session.connection.nc);
     session.unsubscribe = session.connection.onStatus((status) => {
-      if (status.type === "disconnect" || status.type === "close") this.#loseSession(session);
+      if (this.#closed || this.#session !== session) return;
+      if (status.type === "disconnect") {
+        // Native reconnect keeps this verified session and its ordered KV clients. Invalidate
+        // Fabric-facing views/inbox before the client's next dial; the connection gate remains
+        // closed until USER.INFO passes and the verified reconnect status is delivered.
+        this.#epoch += 1;
+        this.#activeInbox?.controller.abort();
+        this.#sessionChannels.setConnection(undefined);
+      } else if (status.type === "reconnect") {
+        this.#sessionChannels.setConnection(session.connection.nc);
+        this.#resolveWaiters(session);
+        this.#notifyVerifiedReconnect();
+        // A retained outbox row retries only after the native session was re-verified.
+        void this.#eventPublisher?.retry();
+      }
     });
-    void (session.connection as NatsConnectionHandle & { closed(): Promise<void | Error> }).closed().then(() => this.#loseSession(session));
+    void session.connection.closed().then((error) => {
+      if (authorizationFailure(error)) {
+        this.#terminalError = error instanceof Error ? error : new Error("NATS authorization failed");
+        this.#activeInbox?.controller.abort();
+        this.#rejectWaiters(this.#terminalError);
+      }
+      this.#loseSession(session);
+    });
     this.#resolveWaiters(session);
+    // A hard close uses the bounded full-reopen path; the new session is already verified.
+    if (reinstalled) this.#notifyVerifiedReconnect();
+  }
+
+  #notifyVerifiedReconnect(): void {
+    for (const listener of [...this.#verifiedReconnectListeners]) {
+      try { listener(); } catch { /* One observer cannot block a verified transport session. */ }
+    }
+  }
+
+  onVerifiedReconnect(listener: () => void): () => void {
+    if (this.#closed) return () => undefined;
+    this.#verifiedReconnectListeners.add(listener);
+    return () => { this.#verifiedReconnectListeners.delete(listener); };
   }
 
   #loseSession(session: NatsSession): void {
@@ -450,12 +540,16 @@ class NatsTransportImpl implements FabricTransport {
     this.#activeInbox?.controller.abort();
     session.unsubscribe?.();
     void session.connection.close().catch(() => undefined);
+    if (this.#terminalError) {
+      this.#rejectWaiters(this.#terminalError);
+      return;
+    }
     this.#scheduleReconnect();
   }
 
   #scheduleReconnect(): void {
     if (this.#reconnectTask || this.#closed || this.#terminalError) return;
-    // ponytail: replace transparent client reconnect with one fully verified reopen path.
+    // Preserve a bounded full reopen only for hard closes; ordinary broker restarts use the native verified session.
     this.#reconnectTask = this.#reconnectLoop().finally(() => {
       this.#reconnectTask = undefined;
       // A just-installed session can close before this loop has settled.
@@ -490,8 +584,8 @@ class NatsTransportImpl implements FabricTransport {
     if (this.#terminalError) throw this.#terminalError;
     if (this.#closed) throw new TransportUnavailableError("NATS transport is closed");
     const session = this.#session;
-    if (!session || session.connection.nc.isClosed() || session.connection.nc.isDraining()) {
-      if (session) this.#loseSession(session);
+    if (!session || !session.connection.isVerified() || session.connection.nc.isClosed() || session.connection.nc.isDraining()) {
+      if (session && (session.connection.nc.isClosed() || session.connection.nc.isDraining())) this.#loseSession(session);
       throw new TransportUnavailableError("NATS transport is temporarily unavailable");
     }
     return session;
@@ -591,6 +685,7 @@ class NatsTransportImpl implements FabricTransport {
           }
           const consumer = await session.js.consumers.get(this.#stream, consumerPolicy.durable);
           messages = await consumer.consume({ max_messages: 16, callback: (msg) => {
+            if (!session.connection.isVerified()) return; // Native reconnect may replay SUBs before USER.INFO.
             if (!signal.aborted && !controller.signal.aborted && !this.#closed && this.#session === session && !queue.destroyed) queue.push(msg);
           } });
           this.#activeInbox = { controller, messages, queue };
@@ -598,10 +693,18 @@ class NatsTransportImpl implements FabricTransport {
           try {
             for await (const msg of queue as AsyncIterable<JsMsg>) {
               if (signal.aborted || controller.signal.aborted || this.#closed || this.#session !== session) break;
+              if (!session.connection.isVerified()) { controller.abort(); break; }
               let decoded;
               try { decoded = this.#decode(msg); }
               catch { await msg.term("malformed transport envelope"); continue; }
               const payload = decoded.envelope;
+              const assertCurrentDelivery = (): void => {
+                if (this.#terminalError) throw this.#terminalError;
+                if (this.#closed) throw new TransportUnavailableError("NATS transport is closed");
+                if (this.#session !== session || !session.connection.isVerified()) {
+                  throw new TransportUnavailableError("NATS inbox delivery is suspended until USER.INFO re-verifies");
+                }
+              };
               let finished = false;
               const delivery: TransportDelivery<TransportEnvelope> = {
                 payload,
@@ -609,9 +712,10 @@ class NatsTransportImpl implements FabricTransport {
                 verification: "bridge",
                 attempt: msg.info.deliveryCount,
                 sequence: msg.info.streamSequence,
-                working: () => { if (!finished) msg.working(); },
+                working: () => { if (!finished && this.#session === session && session.connection.isVerified()) msg.working(); },
                 ack: async () => {
                   if (finished) return;
+                  assertCurrentDelivery();
                   const confirmed = await msg.ackAck();
                   if (!confirmed) throw new Error("transport broker ACK was not confirmed");
                   if (hasFabricPathBProbeObserver()) recordFabricPathBProbe({ type: "inbox-ack-confirmed", atNs: fabricPathBProbeEpochNs(), carrier: "nats",
@@ -620,8 +724,8 @@ class NatsTransportImpl implements FabricTransport {
                     sequence: msg.info.streamSequence, attempt: msg.info.deliveryCount });
                   finished = true;
                 },
-                nak: (delayMs?: number) => { if (!finished) msg.nak(delayMs); },
-                term: async (reason: string) => { if (!finished) { msg.term(reason); finished = true; } },
+                nak: (delayMs?: number) => { if (!finished) { assertCurrentDelivery(); msg.nak(delayMs); } },
+                term: async (reason: string) => { if (!finished) { assertCurrentDelivery(); msg.term(reason); finished = true; } },
               };
               yield delivery;
             }
@@ -694,6 +798,7 @@ class NatsTransportImpl implements FabricTransport {
   close(): Promise<void> {
     if (this.#closed) return this.#closeTask ?? Promise.resolve();
     this.#closed = true;
+    this.#verifiedReconnectListeners.clear();
     this.#options.signal?.removeEventListener("abort", this.#onOwnerAbort);
     this.#closeController.abort(this.#options.signal?.reason);
     this.#sessionChannels.close();
@@ -703,8 +808,12 @@ class NatsTransportImpl implements FabricTransport {
     this.#session = undefined;
     session?.unsubscribe?.();
     const reconnect = this.#reconnectTask;
+    const eventsClosed = this.#eventPublisher?.close();
     this.#closeTask = (async () => {
+      // Join the bounded in-flight attempt before closing its connection. Unsent/uncertain rows
+      // remain durable for reload; close never republishes under a new local event id.
       try {
+        await eventsClosed;
         if (session) {
           if (this.#options.ephemeralHost) {
             let timer: ReturnType<typeof setTimeout> | undefined;

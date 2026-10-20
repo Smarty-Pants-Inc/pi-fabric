@@ -411,6 +411,12 @@ export const meshOutageAlarmSink = (owner: () => { mesh: Pick<MeshStore, "publis
 export const MESH_WAL_CAP_ALARM_TOPIC = "fabric.alarm.mesh-wal-cap";
 const MESH_WAL_CAP_ALARM_MS = 10 * 60 * 1_000;
 
+/** Transport-owned publisher. Closing stops work and joins the in-flight attempt; durable rows stay local. */
+export interface MeshEventPublisherBinding {
+  retry(): Promise<void>;
+  close(): Promise<void>;
+}
+
 export class MeshStore {
   readonly #lock: MeshLock;
   readonly #state: StateBackend;
@@ -424,6 +430,7 @@ export class MeshStore {
   readonly #wakeRouteCache = new Map<string, unknown>();
   /** This store's census registration (directory identity), released once by closeState(). */
   #censusRecord: string | undefined;
+  #eventPublisher: MeshEventPublisherBinding | undefined;
 
   constructor(
     readonly root: string,
@@ -475,6 +482,9 @@ export class MeshStore {
 
   /** Releases the state database handle (sqlite, shadow); the file backend holds none. */
   closeState(): void {
+    // The transport joins this same close before releasing its connection. A synchronous state
+    // teardown can at least stop admission now; no detached worker may start another publish.
+    void this.#eventPublisher?.close();
     closeResidentWakeRetryCursor(this.root);
     this.#wakeRouteCache.clear();
     this.#state.close();
@@ -498,6 +508,66 @@ export class MeshStore {
   }
 
   // Events (event-log.ts).
+
+  /** Bind only from an opened transport. No NATS runtime dependency, dial or import lives in MeshStore.
+   * Local commits still return their local sequence; forwarding never rewrites the local/control log.
+   * A forwarding failure cannot reject a committed publish and invite a fresh event id from its caller. */
+  bindEventPublisher(scope: string, publish: (event: MeshEvent) => Promise<unknown>, validate?: (event: MeshEvent) => void): MeshEventPublisherBinding {
+    if (this.#eventPublisher) throw new Error("Mesh event publisher is already bound");
+    let closed = false;
+    let queued: NodeJS.Immediate | undefined;
+    let pending: Promise<void> | undefined;
+    const retry = (): Promise<void> => {
+      if (closed) return Promise.resolve();
+      if (pending) return pending;
+      const run = async (): Promise<void> => {
+        // Serialize send + checkpoint across stores/processes, but NEVER hold the shared mesh
+        // lock across network I/O. A live/foreign delivery-custody holder is not age-reclaimed.
+        const release = await acquireMeshCustodyLock(path.join(this.#events.eventOutboxDirectory(scope), ".delivery"), 0,
+          { hostQualified: true, lockProtocol: this.#lock.lockProtocol });
+        try {
+          while (!closed) {
+            const event = await this.#events.nextOutboxEvent(scope);
+            if (!event || closed) return;
+            // Includes a retry after an uncertain answer: the immutable row keeps the ORIGINAL id
+            // and resolved body. Never call local publish(), stamp data again or allocate another id.
+            await publish(event);
+            this.#events.ackOutboxEvent(scope, event);
+          }
+        } finally { release(); }
+      };
+      const task = run().catch(error => {
+        diagnostics.warn("src/mesh/store.ts", `[pi-fabric] mesh event forwarding deferred (original ids retained): ${String(error)}`);
+      }).finally(() => { if (pending === task) pending = undefined; });
+      pending = task;
+      return task;
+    };
+    const schedule = (): void => {
+      if (closed || queued) return;
+      // This is driven by a real committed append, not registration/idle work. Even a partial
+      // transaction schedules it; setImmediate leaves the synchronous mesh critical section first.
+      queued = setImmediate(() => { queued = undefined; void retry(); });
+    };
+    this.#events.enableOutbox(scope, schedule, validate);
+    const binding: MeshEventPublisherBinding = {
+      retry,
+      close: () => {
+        closed = true;
+        if (queued) clearImmediate(queued);
+        queued = undefined;
+        return pending ?? Promise.resolve();
+      },
+    };
+    this.#eventPublisher = binding;
+    // Recover rows from a previous activation only after an actual transport open.
+    schedule();
+    return binding;
+  }
+
+  /** Reuse owner maintenance/reconnect, not a second polling timer. No-op with events disabled. */
+  retryEventPublications(): Promise<void> {
+    return this.#eventPublisher?.retry() ?? Promise.resolve();
+  }
 
   async publish(input: MeshPublishInput): Promise<MeshEvent> {
     // Due schedules go first so the log keeps due-time order relative to this event; damaged

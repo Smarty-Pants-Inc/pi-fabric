@@ -10,16 +10,18 @@ import {
   type JetStreamClient,
   type PushConsumer,
 } from "@nats-io/jetstream";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { openNatsConnection, type NatsConnectionHandle } from "../src/transport/nats/connection.js";
 import { openNatsTransport } from "../src/transport/nats/inbox.js";
 import { MeshStore } from "../src/mesh/store.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
-import { readParticipantFiles } from "../src/topology/participant-files.js";
+import * as participantFiles from "../src/topology/participant-files.js";
+import { readParticipantFile, readParticipantFiles } from "../src/topology/participant-files.js";
+import { NatsLocalProjection } from "../src/topology/nats-local-projection.js";
 import { KvParticipantDirectory } from "../src/topology/participant-view.js";
 import type { FabricKvHostLease, FabricParticipantRecord } from "../src/topology/types.js";
 import { openNatsKv, openNatsKvForMachine, type NatsKvStore } from "../src/transport/nats/kv.js";
-import { TransportUnavailableError, type TransportKvEvent } from "../src/transport/types.js";
+import { TransportUnavailableError, type FabricTransport, type TransportBucket, type TransportKv, type TransportKvEvent } from "../src/transport/types.js";
 import { ensureTransportStream } from "../src/transport/nats/provision.js";
 import { transportInboxStream, transportInboxStreamSubject } from "../src/transport/nats/subjects.js";
 import { createPathBHarness, resolveNatsBinary, type PathBHarness } from "./helpers/nats-cluster.js";
@@ -269,6 +271,83 @@ describe.skipIf(!binary)("real authenticated NATS KV snapshot/ready/reset", () =
       } finally { await restart; }
     } finally { await transport.close(); }
   }, 40_000);
+
+  it("does not resurrect a participant deleted while lease admission is suspended", async () => {
+    const id = "session:projection-outage-delete", incarnation = "projection-outage-delete-1";
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "nats-kv-projection-replay-"));
+    fs.chmodSync(root, 0o700);
+    const mesh = new MeshStore(path.join(root, "mesh"), 65_536, 1_000);
+    const transport = await openNatsTransport({ ...harness.runtimeOptions(harness.users.machineA), hostId: id });
+    const presence = transport.kv("presence");
+    const key = `${transport.self.machine}.p.${createHash("sha256").update(id).digest("hex").slice(0, 32)}`;
+    const record: FabricParticipantRecord = {
+      format: 1, id, rootId: id, kind: "root", ownerHostId: id, ownerIdentityId: id,
+      ownerIncarnation: incarnation, sessionId: id.slice("session:".length), name: "Projection outage delete",
+      status: "idle", runner: "pi", transport: "host", capabilities: ["followUp"],
+      controlProtocol: "v1", startedAt: Date.now(), updatedAt: Date.now(),
+    };
+    const owner = `${id}#${incarnation}`;
+    let leaseLive = false;
+    let holdTombstone = false;
+    const tombstoneHeld = deferred<void>(), releaseTombstone = deferred<void>(), tombstoneConsumed = deferred<void>();
+    const gatedPresence: TransportKv = {
+      ttlMs: presence.ttlMs,
+      get: (...args) => presence.get(...args),
+      put: (...args) => presence.put(...args),
+      delete: (...args) => presence.delete(...args),
+      async *watch<V>(prefix: string, signal: AbortSignal): AsyncIterable<TransportKvEvent<V>> {
+        for await (const event of presence.watch<V>(prefix, signal)) {
+          if (holdTombstone && event.type === "gone" && event.key === key) {
+            tombstoneHeld.resolve();
+            await releaseTombstone.promise;
+          }
+          yield event;
+          if (holdTombstone && event.type === "gone" && event.key === key) tombstoneConsumed.resolve();
+        }
+      },
+    };
+    const projectionTransport = {
+      kind: "nats" as const,
+      self: transport.self,
+      kv(bucket: TransportBucket) { return bucket === "presence" ? gatedPresence : transport.kv(bucket); },
+    } as unknown as FabricTransport;
+    const projection = new NatsLocalProjection({ mesh, transport: projectionTransport, leaseLive: () => leaseLive });
+    const writer = vi.spyOn(participantFiles, "writeParticipantFileIf");
+    const observerAbort = new AbortController();
+    const observer = presence.watch<unknown>(key, observerAbort.signal)[Symbol.asyncIterator]();
+    try {
+      const revision = await presence.put(key, owner, record, 0);
+      projection.start();
+      await bounded(projection.whenReady(), "initial suspended projection snapshot");
+      expect(readParticipantFile(mesh.root, `topology/participants/${createHash("sha256").update(id).digest("hex")}`)).toBeUndefined();
+      expect((await bounded(observer.next(), "participant watch snapshot")).value)
+        .toMatchObject({ type: "put", entry: { key, revision } });
+      expect((await bounded(observer.next(), "participant watch ready")).value).toEqual({ type: "ready" });
+
+      holdTombstone = true;
+      expect(await presence.delete(key, revision)).toBe(true);
+      expect((await bounded(observer.next(), "participant deletion event")).value).toMatchObject({ type: "gone", key });
+      await bounded(tombstoneHeld.promise, "projection watch pauses before its tombstone");
+      leaseLive = true;
+      await bounded(projection.resumeAfterLeaseRecovery(), "projection replay after lease recovery");
+      expect(writer).not.toHaveBeenCalled();
+      expect(readParticipantFile(mesh.root, `topology/participants/${createHash("sha256").update(id).digest("hex")}`)).toBeUndefined();
+
+      releaseTombstone.resolve();
+      await bounded(tombstoneConsumed.promise, "projection consumes the tombstone");
+      expect(writer).not.toHaveBeenCalled();
+      expect(readParticipantFile(mesh.root, `topology/participants/${createHash("sha256").update(id).digest("hex")}`)).toBeUndefined();
+    } finally {
+      releaseTombstone.resolve();
+      observerAbort.abort();
+      await observer.return?.();
+      await projection.close();
+      await transport.close();
+      mesh.closeState();
+      fs.rmSync(root, { recursive: true, force: true });
+      vi.restoreAllMocks();
+    }
+  }, 30_000);
 
   it("recovers both participant directories, KV watches and routed sends after a real same-store server restart", async () => {
     const mainId = "session:directory-restart-main", callerId = "session:directory-restart-caller";

@@ -20,6 +20,7 @@ import type {
 } from "../types.js";
 import { TransportInvalidError, TransportUncertainError, TransportUnavailableError } from "../types.js";
 import { publishFailure } from "./errors.js";
+import { DEFAULT_INBOX_MAX_AGE_MS, isValidInboxMaxAgeMs } from "./inbox-policy.js";
 import {
   transportAdvisoryStreamSubject,
   transportDurableName,
@@ -61,6 +62,8 @@ export interface NatsTransportOptions extends NatsPermissionPolicy {
   readonly credentials: string;
   readonly tls?: TlsOptions;
   readonly maxBytes?: number;
+  /** Inbox stream max_age in milliseconds. Existing maxAgeMs is a legacy direct-options alias. */
+  readonly inboxMaxAgeMs?: number;
   readonly maxAgeMs?: number;
   readonly maxMessageBytes?: number;
   readonly duplicateWindowMs?: number;
@@ -77,7 +80,7 @@ export interface NatsTransportOptions extends NatsPermissionPolicy {
 }
 
 type OpenOptions = NatsTransportOptions | FabricTransportOptions;
-type ResolvedNatsOptions = Required<Pick<NatsTransportOptions, "servers" | "machine" | "hostId" | "credentials" | "custodyStream" | "livenessStream" | "pathBMachines" | "maxBytes" | "maxMessageBytes" | "duplicateWindowMs" | "requestTimeoutMs" | "provision" | "ephemeralHost" | "ephemeralInactiveSeconds" | "events">> & {
+type ResolvedNatsOptions = Required<Pick<NatsTransportOptions, "servers" | "machine" | "hostId" | "credentials" | "custodyStream" | "livenessStream" | "pathBMachines" | "maxBytes" | "maxMessageBytes" | "duplicateWindowMs" | "requestTimeoutMs" | "provision" | "ephemeralHost" | "ephemeralInactiveSeconds" | "inboxMaxAgeMs" | "events">> & {
   readonly org?: string;
   readonly name?: string;
   readonly tls?: TlsOptions;
@@ -116,6 +119,7 @@ const normalizeOptions = (options: OpenOptions): ResolvedNatsOptions => {
       provision: options.events === true ? false : options.provision ?? false,
       ephemeralHost: options.ephemeralHost ?? false,
       ephemeralInactiveSeconds: options.ephemeralInactiveSeconds ?? DEFAULT_EPHEMERAL_INACTIVE_SECONDS,
+      inboxMaxAgeMs: options.inboxMaxAgeMs ?? options.maxAgeMs ?? DEFAULT_INBOX_MAX_AGE_MS,
       events: options.events ?? false,
       ...(options.mesh === undefined ? {} : { mesh: options.mesh }),
       ...(options.signal === undefined ? {} : { signal: options.signal }),
@@ -124,7 +128,7 @@ const normalizeOptions = (options: OpenOptions): ResolvedNatsOptions => {
   const config = options.config as unknown as { nats?: {
     servers?: string | readonly string[]; machine?: string; credentials?: string;
     custodyStream?: string; livenessStream?: string; pathBMachines?: readonly string[]; org?: string; tls?: TlsOptions;
-    ephemeralHost?: boolean; ephemeralInactiveSeconds?: number; events?: boolean;
+    ephemeralHost?: boolean; ephemeralInactiveSeconds?: number; inboxMaxAgeMs?: number; events?: boolean;
   } };
   const nats = config.nats;
   // Production config never enables plaintext; the loopback opt-in is a direct test option only.
@@ -154,6 +158,7 @@ const normalizeOptions = (options: OpenOptions): ResolvedNatsOptions => {
     provision: false,
     ephemeralHost: nats?.ephemeralHost ?? false,
     ephemeralInactiveSeconds: nats?.ephemeralInactiveSeconds ?? DEFAULT_EPHEMERAL_INACTIVE_SECONDS,
+    inboxMaxAgeMs: nats?.inboxMaxAgeMs ?? DEFAULT_INBOX_MAX_AGE_MS,
     events: nats?.events ?? false,
     mesh: options.mesh,
     ...(options.signal === undefined ? {} : { signal: options.signal }),
@@ -164,7 +169,7 @@ const streamPolicy = (name: string, subjects: readonly string[], options: Resolv
   name,
   subjects,
   maxBytes: overrides.maxBytes ?? options.maxBytes,
-  maxAgeMs: overrides.maxAgeMs ?? 0,
+  maxAgeMs: overrides.maxAgeMs ?? options.inboxMaxAgeMs,
   maxMessageBytes: overrides.maxMessageBytes ?? options.maxMessageBytes,
   duplicateWindowMs: overrides.duplicateWindowMs ?? options.duplicateWindowMs,
   replicas: 1,
@@ -240,9 +245,10 @@ const openNatsSession = async (options: ResolvedNatsOptions, signal?: AbortSigna
     assertAlive();
     const presence = await openNatsKvForMachine(connection.js, "presence", options.machine, options.provision, connection.onStatus);
     assertAlive();
-    await ensureTransportStream(manager, streamPolicy(transportInboxStream(options.machine), [transportInboxStreamSubject(options.machine)], options, {
-      maxAgeMs: 0,
-    }), options.provision);
+    await ensureTransportStream(manager, {
+      ...streamPolicy(transportInboxStream(options.machine), [transportInboxStreamSubject(options.machine)], options),
+      allowUnboundedMaxAge: true,
+    }, options.provision);
     assertAlive();
     const consumerPolicy = transportConsumerPolicy(options);
     const consumer = await ensureTransportConsumer(manager.consumers, consumerPolicy);
@@ -414,6 +420,7 @@ class NatsTransportImpl implements FabricTransport {
     if (!Number.isSafeInteger(options.ephemeralInactiveSeconds) || options.ephemeralInactiveSeconds < 300 || options.ephemeralInactiveSeconds > 86_400) {
       throw new Error("ephemeralInactiveSeconds must be an integer from 300 through 86400");
     }
+    if (!isValidInboxMaxAgeMs(options.inboxMaxAgeMs)) throw new Error("inboxMaxAgeMs must be a bounded positive number of milliseconds");
     const transport = new NatsTransportImpl(await openNatsSession(options, options.signal), options);
     try {
       if (options.events) {

@@ -18,7 +18,7 @@ const refuses = (value: Record<string, unknown>, field?: string) => {
 describe.sequential("NATS transport policy and TLS configuration", () => {
   it("normalizes the complete policy without reading credentials or CA and copies mutable inputs", () => {
     const input = nats(), before = structuredClone(input), actual = normalizeFabricConfig(config(input)).mesh.nats;
-    expect(actual).toEqual({ replicas: 1, inboxLanes: 8, events: false, provision: false, ephemeralHost: false, ephemeralInactiveSeconds: 3_600, ...input });
+    expect(actual).toEqual({ replicas: 1, inboxLanes: 8, events: false, provision: false, ephemeralHost: false, ephemeralInactiveSeconds: 3_600, inboxMaxAgeMs: 7 * 24 * 60 * 60_000, ...input });
     expect(actual).not.toBe(input); expect(actual.servers).not.toBe(input.servers);
     expect(actual.pathBMachines).not.toBe(input.pathBMachines); expect(actual.tls).not.toBe(input.tls);
     expect(input).toEqual(before);
@@ -93,22 +93,30 @@ describe.sequential("NATS transport policy and TLS configuration", () => {
   it("retains only approved FILE rollback machine and hold authority", () => {
     const rollbackHoldUntil = "2030-01-02T03:04:05Z";
     expect(normalizeFabricConfig({ mesh: { transport: "file", nats: { ...nats(), rollbackHoldUntil } } }).mesh.nats)
-      .toEqual({ replicas: 1, inboxLanes: 8, events: false, provision: false, ephemeralHost: false, ephemeralInactiveSeconds: 3_600, machine: "ryzen2", rollbackHoldUntil });
+      .toEqual({ replicas: 1, inboxLanes: 8, events: false, provision: false, ephemeralHost: false, ephemeralInactiveSeconds: 3_600, inboxMaxAgeMs: 7 * 24 * 60 * 60_000, machine: "ryzen2", rollbackHoldUntil });
   });
   it("propagates the opt-in event mode and org to mesh children", () => {
     const parent = normalizeFabricConfig(config({ ...nats(), events: true })).mesh;
     const child = childMeshTransportEnvironment(parent, {});
-    expect(JSON.parse(child.PI_FABRIC_MESH_NATS!)).toMatchObject({ events: true, org: "smarty-pants-inc" });
+    expect(JSON.parse(child.PI_FABRIC_MESH_NATS!)).toMatchObject({ events: true, org: "smarty-pants-inc", ephemeralHost: true });
+  });
+  it("forces child inbox durables ephemeral and inherits the configured inbox age", () => {
+    const parent = normalizeFabricConfig(config({ ...nats(), ephemeralHost: false, ephemeralInactiveSeconds: 600, inboxMaxAgeMs: 86_400_000 })).mesh;
+    const child = childMeshTransportEnvironment(parent, {});
+    expect(JSON.parse(child.PI_FABRIC_MESH_NATS!)).toMatchObject({
+      ephemeralHost: true, ephemeralInactiveSeconds: 600, inboxMaxAgeMs: 86_400_000,
+    });
   });
   it("inherits a whitelisted independent policy snapshot across different child workspace settings", () => {
     const parent = normalizeFabricConfig(config(nats())).mesh, before = structuredClone(parent);
     const environment = { OTHER: "retained", PI_FABRIC_MESH_STATE_BACKEND: "file" };
     const child = childMeshTransportEnvironment(parent, environment);
     const snapshot = JSON.parse(child.PI_FABRIC_MESH_NATS!);
-    expect(snapshot).toEqual({ ...nats(), inboxLanes: 8 }); expect(snapshot).not.toHaveProperty("replicas");
+    expect(snapshot).toEqual({ ...nats(), inboxLanes: 8, ephemeralHost: true, ephemeralInactiveSeconds: 3_600,
+      inboxMaxAgeMs: 7 * 24 * 60 * 60_000 }); expect(snapshot).not.toHaveProperty("replicas");
     expect(parent).toEqual(before); expect(environment).toEqual({ OTHER: "retained", PI_FABRIC_MESH_STATE_BACKEND: "file" });
     for (const key of keys) if (child[key] !== undefined) process.env[key] = child[key];
     const resolved = normalizeFabricConfig(config({ ...nats(), custodyStream: "WRONG", tls: { caFile: "/wrong" } })).mesh;
-    expect(resolved.nats).toEqual(parent.nats); expect(resolved.stateBackend).toBe("file");
+    expect(resolved.nats).toEqual({ ...parent.nats, ephemeralHost: true }); expect(resolved.stateBackend).toBe("file");
   });
 });

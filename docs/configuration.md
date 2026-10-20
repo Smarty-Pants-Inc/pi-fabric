@@ -1091,6 +1091,39 @@ Shared state keeps a persistent revision clock (`highWater` in the mesh `state.j
 
 If `state.json` is empty or unparseable, reads return an empty table and every write fails with `invalid state format`. This barrier keeps Fabric from issuing a revision that an earlier caller still holds. To repair a root, stop every Fabric process that uses it, inspect the file, fix it or move it aside, and then start the processes again. Moving the file aside restarts revisions. That is safe only while no process runs, because each process reads fresh revisions after it starts.
 
+### NATS inbox retention (smarty-dev#15310)
+
+`mesh.nats.inboxMaxAgeMs` bounds inbox message age (default `604800000`, seven
+days; range `60000` through `7776000000`, 60 seconds through 90 days). A newly
+created `FABRIC_IN_<machine>` stream uses this `max_age`; incompatible nonzero
+ages still fail verification. Existing inbox streams with `max_age: 0` are
+accepted as legacy and are **not** updated by runtime startup or the provisioning
+command. To change a stream's age or retention mode, use a separately reviewed,
+explicit admin migration; NATS does not permit changing retention mode in place.
+
+Main hosts keep durable inbox consumers by default. Short-lived child processes
+inherit the NATS policy with `ephemeralHost: true`, and `pi-fabric nats send`
+and `dispatch` also default to `ephemeralHost: true` with the one-hour inactive
+threshold. An explicit `PI_FABRIC_MESH_NATS` JSON value for `ephemeralHost` or
+`ephemeralInactiveSeconds` overrides the CLI default. Placement pod templates
+must set the same fields in their own `PI_FABRIC_MESH_NATS` environment; the pod
+should use `ephemeralHost: true` and `ephemeralInactiveSeconds: 3600` unless its
+lifetime needs a different threshold. Clean shutdown deletes these consumers;
+server-side inactivity expiry cleans up after unclean exits.
+
+The admin provisioning command defaults new inbox streams to seven days and
+accepts an explicit `--inbox-max-age-ms` value when provisioning a different
+configured age. It verifies existing streams only and never updates them.
+Bounded age removes old and acknowledged traffic but also means an unacked
+message older than the configured age can expire. The stream's byte limit still
+applies sooner at high throughput.
+
+Longer term, `WorkQueue` retention is likely a closer fit than `Interest`: each
+inbox message is addressed to one host and should have one disjoint durable
+consumer, so an ACK can release it immediately. That change requires proving
+consumer filters cannot overlap and checking offline/replay behavior; it is not
+part of this fix, and the current `Limits` retention policy remains unchanged.
+
 ### NATS events: alpha
 
 `mesh.nats.events` **defaults to false**. With `mesh.transport: "nats"`, opt in

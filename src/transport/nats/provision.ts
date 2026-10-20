@@ -33,6 +33,8 @@ export interface TransportStreamPolicy {
   readonly discard?: DiscardPolicy;
   /** Existing Fabric event streams may be server-unbounded; publishers still enforce the application cap. */
   readonly allowUnboundedMaxMessageBytes?: boolean;
+  /** Explicit legacy compatibility for an existing stream with max_age: 0; never updates it. */
+  readonly allowUnboundedMaxAge?: boolean;
 }
 
 export const transportStreamConfig = (policy: TransportStreamPolicy): Partial<StreamConfig> => ({
@@ -52,14 +54,17 @@ export const transportStreamConfig = (policy: TransportStreamPolicy): Partial<St
   allow_direct: false,
 });
 
-export const assertTransportStream = (info: StreamInfo, wanted: Partial<StreamConfig>, allowUnboundedMaxMessageBytes = false): void => {
+export const assertTransportStream = (info: StreamInfo, wanted: Partial<StreamConfig>, allowUnboundedMaxMessageBytes = false,
+  allowUnboundedMaxAge = false): void => {
   const maxMessageBytesMatch = info.config.max_msg_size === wanted.max_msg_size ||
     (allowUnboundedMaxMessageBytes && info.config.max_msg_size === -1);
+  const maxAgeMatch = info.config.max_age === wanted.max_age ||
+    (allowUnboundedMaxAge && info.config.max_age === 0);
   const same = info.config.storage === wanted.storage &&
     info.config.retention === wanted.retention &&
     info.config.discard === wanted.discard &&
     info.config.max_bytes === wanted.max_bytes &&
-    info.config.max_age === wanted.max_age &&
+    maxAgeMatch &&
     maxMessageBytesMatch &&
     info.config.max_msgs === wanted.max_msgs &&
     info.config.max_msgs_per_subject === wanted.max_msgs_per_subject &&
@@ -84,7 +89,7 @@ export const ensureTransportStream = async (manager: JetStreamManager, policy: T
       info = await manager.streams.info(policy.name);
     }
   }
-  assertTransportStream(info, wanted, policy.allowUnboundedMaxMessageBytes);
+  assertTransportStream(info, wanted, policy.allowUnboundedMaxMessageBytes, policy.allowUnboundedMaxAge);
   return info;
 };
 

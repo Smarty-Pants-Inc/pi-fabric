@@ -41,9 +41,10 @@ async function provision(fixture: PathBHarness): Promise<void> {
   }
 }
 
-function runCli(args: string[], env: NodeJS.ProcessEnv): Promise<{ code: number | null; signal: NodeJS.Signals | null; stdout: string; stderr: string }> {
+function runCli(args: string[], env: NodeJS.ProcessEnv, stdin = ""): Promise<{ code: number | null; signal: NodeJS.Signals | null; stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
-    const child = spawn(cliRuntime, [cliEntry, "nats", "send", ...args], { cwd: repoRoot, env, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(cliRuntime, [cliEntry, "nats", "send", ...args], { cwd: repoRoot, env, stdio: ["pipe", "pipe", "pipe"] });
+    child.stdin.end(stdin);
     let stdout = "", stderr = "";
     child.stdout.setEncoding("utf8").on("data", (chunk: string) => { stdout += chunk; });
     child.stderr.setEncoding("utf8").on("data", (chunk: string) => { stderr += chunk; });
@@ -75,7 +76,7 @@ describe("pi-fabric nats send input", () => {
     expect(result.code).toBe(1);
     expect(result.signal).toBeNull();
     expect(result.stderr).toBe("");
-    expect(JSON.parse(result.stdout)).toMatchObject({ error: "provide exactly one of --text and --text-file" });
+    expect(JSON.parse(result.stdout)).toMatchObject({ error: "provide exactly one of --text, --text-file, or --text -" });
   });
 });
 
@@ -89,11 +90,12 @@ afterAll(async () => { await broker?.stop(); });
 
 brokerSuite("pi-fabric nats send over a real authenticated broker", () => {
   const scenarios = [
-    { label: "followUp reply", kind: "followUp", inputFlag: "--text", awaitReplySeconds: 5, sendReply: true },
-    { label: "steer", kind: "steer", inputFlag: "--text-file", awaitReplySeconds: undefined, sendReply: false },
-    { label: "followUp reply timeout", kind: "followUp", inputFlag: "--text", awaitReplySeconds: 1, sendReply: false },
+    { label: "followUp immediate reply", kind: "followUp", inputMode: "argv", awaitReplySeconds: 5, sendReply: true },
+    { label: "steer from text file", kind: "steer", inputMode: "file", awaitReplySeconds: undefined, sendReply: false },
+    { label: "followUp reply timeout", kind: "followUp", inputMode: "argv", awaitReplySeconds: 1, sendReply: false },
+    { label: "steer from stdin", kind: "steer", inputMode: "stdin", awaitReplySeconds: undefined, sendReply: false },
   ] as const;
-  it.each(scenarios)("routes and withdraws a $label sender", async ({ kind, inputFlag, awaitReplySeconds, sendReply }) => {
+  it.each(scenarios)("routes and withdraws a $label sender", async ({ kind, inputMode, awaitReplySeconds, sendReply }) => {
     if (!broker) throw new Error("NATS fixture unavailable");
     const fixture = broker;
     const sessionId = randomUUID();
@@ -135,29 +137,30 @@ brokerSuite("pi-fabric nats send over a real authenticated broker", () => {
         canConsumeMesh: () => ownerDirectory.canConsumeMesh(), pollMs: 20, acknowledgementTimeoutMs: 5_000,
       });
       ownerPlane = targetPlane;
-      ownerPlane.start((command, from) => {
+      ownerPlane.start(async (command, from) => {
         const senderRoute = view.resolve(from.id);
         received.push({ operation: command.operation, targetId: command.targetId, text: command.message,
           from, senderLive: senderRoute?.live === true });
         if (sendReply && command.operation === "followUp") {
           const senderId = from.id;
           const replyText = `FABRIC-RESULT ${sessionId}\nreply from fixture Main`;
-          replyDelivery = new Promise<void>((resolve, reject) => {
-            setTimeout(() => {
-              const route = view.resolve(senderId);
-              if (!route?.live) { reject(new Error("sender route disappeared before its reply")); return; }
-              void targetPlane.request(route.ownerHostId, senderId, "followUp", {
-                message: replyText, ownerIncarnation: route.ownerIncarnation,
-              }, route.ownerIdentityId, { idempotencyKey: `reply-${sessionId}`, timeoutMs: 5_000 }).then(() => resolve(), reject);
-            }, 100);
-          });
+          const deliverReply = async (): Promise<void> => {
+            const route = view.resolve(senderId);
+            if (!route?.live) throw new Error("sender route disappeared before its reply");
+            await targetPlane.request(route.ownerHostId, senderId, "followUp", {
+              message: replyText, ownerIncarnation: route.ownerIncarnation,
+            }, route.ownerIdentityId, { idempotencyKey: `reply-${sessionId}`, timeoutMs: 5_000 });
+          };
+          // Withhold the original ACK until the CLI receives and acknowledges this reply.
+          replyDelivery = deliverReply();
+          await replyDelivery;
         }
         return { accepted: true, messageId: command.commandId };
       });
 
       const message = `real NATS ${kind} from a non-Pi Node CLI`;
       const textFile = path.join(fixture.root, `message-${sessionId}.txt`);
-      if (inputFlag === "--text-file") fs.writeFileSync(textFile, message, { mode: 0o600, flag: "wx" });
+      if (inputMode === "file") fs.writeFileSync(textFile, message, { mode: 0o600, flag: "wx" });
       const env: NodeJS.ProcessEnv = { ...process.env, ...PATH_B_POLICY_ENV,
         PI_FABRIC_MESH_TRANSPORT: "nats", PI_FABRIC_MESH_HOST_TRANSPORT: "nats",
         XDG_STATE_HOME: path.join(fixture.root, "nats-send-state") };
@@ -167,15 +170,17 @@ brokerSuite("pi-fabric nats send over a real authenticated broker", () => {
       delete env.SSL_CERT_FILE;
       delete env.SSL_CERT_DIR;
       const port = new URL(fixture.serverUrl).port;
+      const textArgs = inputMode === "file" ? ["--text-file", textFile]
+        : inputMode === "stdin" ? ["--text", "-"] : ["--text", message];
       const args = [
-        "--to", rootId, "--kind", kind, inputFlag, inputFlag === "--text" ? message : textFile,
+        "--to", rootId, "--kind", kind, ...textArgs,
         "--creds", fixture.users.machineA.credsPath, "--ca", fixture.tls!.caFile,
         "--servers", `tls://localhost:${port}`, "--machine", "machine-a",
         "--org", "tristar", "--path-b-machines", "machine-a,machine-b",
         "--name", `test ${kind}`, "--idempotency-key", `nats-send-${kind}-${sessionId}`, "--timeout-ms", "15000",
         ...(awaitReplySeconds === undefined ? [] : ["--await-reply-seconds", String(awaitReplySeconds)]),
       ];
-      const cli = await runCli(args, env);
+      const cli = await runCli(args, env, inputMode === "stdin" ? message : "");
       expect(cli.signal).toBeNull();
       expect(cli.code, `${cli.stdout}\n${cli.stderr}`).toBe(awaitReplySeconds === 1 && !sendReply ? 2 : 0);
       expect(cli.stderr).toBe("");

@@ -16,7 +16,9 @@ import { PATH_B_OPERATOR_MACHINE } from "./permissions.js";
 
 const SEND_USAGE = [
   "Usage: pi-fabric nats send --to <participant-id> --kind <followUp|steer>",
-  "  (--text <text> | --text-file <absolute-file>) --creds <absolute-file> --ca <absolute-file>",
+  "  (--text <text> | --text-file <absolute-file> | --text -) --creds <absolute-file> --ca <absolute-file>",
+  "  --text <text> is kept for compatibility but is less private because content appears in process argv; prefer --text-file or --text -.",
+  "  --text-file reads up to 512 KiB of UTF-8 from a file; --text - reads up to 512 KiB of UTF-8 from stdin.",
   "  --servers <tls://host:port[,tls://host:port...]> --machine <machine>",
   "  [--name <host-name>] [--idempotency-key <key>] [--timeout-ms <ms>]",
   "  [--await-reply-seconds <seconds>] [--org <org>] [--path-b-machines <csv>]",
@@ -99,8 +101,10 @@ const parseOptions = (argv: readonly string[]): SendOptions | "help" => {
   const kind = required("--kind");
   if (kind !== "followUp" && kind !== "steer") throw new SendCliError("--kind must be followUp or steer");
   const hasText = values.has("--text"), hasTextFile = values.has("--text-file");
-  if (hasText === hasTextFile) throw new SendCliError("provide exactly one of --text and --text-file");
-  const text = hasText ? required("--text") : readTextFile(absolutePath(values.get("--text-file"), "--text-file"));
+  if (hasText === hasTextFile) throw new SendCliError("provide exactly one of --text, --text-file, or --text -");
+  const text = hasText
+    ? required("--text") === "-" ? readTextStream(0) : required("--text")
+    : readTextFile(absolutePath(values.get("--text-file"), "--text-file"));
   if (!text || Buffer.byteLength(text, "utf8") > MAX_TEXT_BYTES) throw new SendCliError("message text must be nonempty and at most 512 KiB");
   const rawServers = required("--servers");
   const servers = rawServers.split(",").map((server) => server.trim());
@@ -144,6 +148,16 @@ const parseOptions = (argv: readonly string[]): SendOptions | "help" => {
   };
 };
 
+function decodeTextInput(bytes: Buffer, source: "--text-file" | "stdin"): string {
+  if (bytes.byteLength > MAX_TEXT_BYTES) {
+    throw new SendCliError(source === "--text-file"
+      ? "--text-file must be a regular file no larger than 512 KiB"
+      : "stdin message must be no larger than 512 KiB");
+  }
+  try { return new TextDecoder("utf-8", { fatal: true }).decode(bytes); }
+  catch { throw new SendCliError(source === "--text-file" ? "--text-file must contain valid UTF-8" : "stdin message must contain valid UTF-8"); }
+}
+
 function readTextFile(file: string): string {
   let bytes: Buffer;
   try {
@@ -154,9 +168,26 @@ function readTextFile(file: string): string {
     if (error instanceof SendCliError) throw error;
     throw new SendCliError("could not read --text-file");
   }
-  if (bytes.byteLength > MAX_TEXT_BYTES) throw new SendCliError("--text-file must be a regular file no larger than 512 KiB");
-  try { return new TextDecoder("utf-8", { fatal: true }).decode(bytes); }
-  catch { throw new SendCliError("--text-file must contain valid UTF-8"); }
+  return decodeTextInput(bytes, "--text-file");
+}
+
+function readTextStream(fd: number): string {
+  const chunks: Buffer[] = [];
+  const buffer = Buffer.alloc(64 * 1024);
+  let total = 0;
+  try {
+    for (;;) {
+      const count = fs.readSync(fd, buffer, 0, Math.min(buffer.byteLength, MAX_TEXT_BYTES + 1 - total), null);
+      if (count === 0) break;
+      total += count;
+      if (total > MAX_TEXT_BYTES) throw new SendCliError("stdin message must be no larger than 512 KiB");
+      chunks.push(Buffer.from(buffer.subarray(0, count)));
+    }
+  } catch (error) {
+    if (error instanceof SendCliError) throw error;
+    throw new SendCliError("could not read stdin");
+  }
+  return decodeTextInput(Buffer.concat(chunks, total), "stdin");
 }
 
 function policyConfig(): { custodyStream: string; livenessStream: string; pathBMachines: string[]; operatorMachine: string } {
@@ -416,16 +447,22 @@ async function openAndSend(options: SendOptions, onAcknowledged: Acknowledged): 
     const settled = await waitForSettledPresence(view, directory, identity.id, signal);
     if (!settled.live || !directory.canConsumeMesh()) throw new SendCliError("sender presence is not live");
     signal.throwIfAborted();
-    result = await plane.request(target.ownerHostId, options.to, options.kind, {
-      message: options.text,
-      ownerIncarnation: target.ownerIncarnation,
-    }, target.ownerIdentityId, {
-      idempotencyKey: options.idempotencyKey,
-      timeoutMs: options.timeoutMs,
-      signal,
-    });
-    if (result.acknowledged !== true) throw new SendCliError("Fabric request was not acknowledged");
     if (options.awaitReplySeconds !== undefined) awaitingReply = true;
+    try {
+      result = await plane.request(target.ownerHostId, options.to, options.kind, {
+        message: options.text,
+        ownerIncarnation: target.ownerIncarnation,
+      }, target.ownerIdentityId, {
+        idempotencyKey: options.idempotencyKey,
+        timeoutMs: options.timeoutMs,
+        signal,
+      });
+      if (result.acknowledged !== true) throw new SendCliError("Fabric request was not acknowledged");
+    } catch (error) {
+      awaitingReply = false;
+      resolveReply = undefined;
+      throw error;
+    }
     onAcknowledged(result, identity.id);
     if (options.awaitReplySeconds !== undefined) {
       reply = await waitForReply(replyPromise!, options.awaitReplySeconds * 1_000, lifetime.signal);

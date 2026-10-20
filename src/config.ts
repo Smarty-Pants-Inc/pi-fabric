@@ -568,7 +568,7 @@ const meshNatsEphemeralInactiveSeconds = (value: unknown): number => {
 /** Messaging/rollback settings fail visibly in the same typed config-error family as E9. */
 export class FabricMeshNatsConfigError extends Error {
   readonly code = "FABRIC_MESH_TRANSPORT_CONFIG";
-  constructor(readonly field: "operatorMachine" | "rollbackHoldUntil" | "servers" | "custodyStream" | "livenessStream" | "pathBMachines" | "tls" | "org" | "allowInsecureLoopback" | "verifyMachine" | "ephemeralHost" | "ephemeralInactiveSeconds", requirement: string) {
+  constructor(readonly field: "operatorMachine" | "rollbackHoldUntil" | "servers" | "custodyStream" | "livenessStream" | "pathBMachines" | "org" | "tls" | "allowInsecureLoopback" | "verifyMachine" | "ephemeralHost" | "ephemeralInactiveSeconds", requirement: string) {
     super(`mesh.nats.${field} ${requirement}`);
     this.name = "FabricMeshNatsConfigError";
   }
@@ -584,10 +584,10 @@ export interface FabricMeshNatsConfig {
   livenessStream?: string;
   /** Explicit runtime inventory (1..64 unique, non-operator machine literals). */
   pathBMachines?: string[];
+  /** Organization used by service-facing NATS clients and session-channel subjects. */
+  org?: string;
   /** Required trust anchor in NATS mode. Config never reads the CA or permits verification overrides. */
   tls?: { ca?: string; caFile?: string };
-  /** Organization token used by the Fabric session-channel subjects. Required only when opening a channel. */
-  org?: string;
   /** Host credential file path, consumed only by the NATS adapter. */
   credentials?: string;
   /** Literal machine id; the adapter must also verify it against the credential. */
@@ -609,6 +609,14 @@ const meshNatsString = (value: unknown, field: "credentials" | "machine"): strin
   if (typeof value !== "string") throw new Error(`mesh.nats.${field} must be a string`);
   if (field === "machine" && /^[a-z0-9][a-z0-9-]{0,31}$/.exec(value)?.[0] !== value) {
     throw new Error("mesh.nats.machine must match /^[a-z0-9][a-z0-9-]{0,31}$/");
+  }
+  return value;
+};
+
+const meshNatsOrg = (value: unknown): string | undefined => {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string" || !/^[a-z0-9][a-z0-9-]{0,62}$/.test(value) || value === "sys") {
+    throw new FabricMeshNatsConfigError("org", "must be a non-system org name");
   }
   return value;
 };
@@ -656,14 +664,6 @@ const meshNatsPathBMachines = (value: unknown): string[] => {
     throw new FabricMeshNatsConfigError("pathBMachines", "is required in NATS mode and must contain 1..64 unique non-operator machine literals");
   }
   return [...value] as string[];
-};
-
-const meshNatsOrg = (value: unknown): string | undefined => {
-  if (value === undefined) return undefined;
-  if (typeof value !== "string" || /^[a-z0-9][a-z0-9-]{0,62}$/.exec(value)?.[0] !== value) {
-    throw new FabricMeshNatsConfigError("org", "must match /^[a-z0-9][a-z0-9-]{0,62}$/");
-  }
-  return value;
 };
 
 const meshNatsTls = (value: unknown): NonNullable<FabricMeshNatsConfig["tls"]> => {

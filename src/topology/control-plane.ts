@@ -1711,6 +1711,12 @@ export class FabricControlPlane {
       : "persisted claims/outcomes and correlated ACK log, not UI quiet" };
   }
 
+  /** Join in-flight NATS inbox deliveries before a short-lived owner withdraws after handling a reply. */
+  async settleNatsInbox(): Promise<void> {
+    if (this.#transport.kind !== "nats") return;
+    while (this.#natsWork.size) await Promise.allSettled([...this.#natsWork]);
+  }
+
   async close(): Promise<void> {
     if (this.#closed) return;
     if (this.#transport.kind === "nats") return this.#closeNats();

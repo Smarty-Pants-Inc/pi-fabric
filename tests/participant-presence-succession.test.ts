@@ -10,7 +10,7 @@ import type { FabricKvHostLease, FabricParticipantRecord } from "../src/topology
 import { KvConflictError, type FabricTransport, type TransportKv, type TransportKvEntry, type TransportKvEvent } from "../src/transport/types.js";
 
 const MACHINE = "machine-a", ROOT = "session:presence-resume", SESSION = "presence-resume";
-const OLD = "predecessor-activation", NEXT = "resumed-activation";
+const OLD = "predecessor-activation", NEXT = "resumed-activation", ACTOR = "4fa9b312d07343829e63a471a1e79872";
 const token = (id: string) => createHash("sha256").update(id).digest("hex").slice(0, 32);
 const pkey = (id = ROOT) => `${MACHINE}.p.${token(id)}`;
 const hkey = (id = ROOT) => `${MACHINE}.h.${token(id)}`;
@@ -80,8 +80,9 @@ function root(incarnation = NEXT, change: Partial<FabricParticipantRecord> = {})
     startedAt: incarnation === OLD ? 1_000 : 2_000, updatedAt: incarnation === OLD ? 1_100 : 2_100, ...change };
 }
 function hostLease(incarnation = NEXT, change: Partial<FabricKvHostLease> = {}): FabricKvHostLease {
+  const now = Date.now();
   return { id: ROOT, identityId: ROOT, rootId: ROOT, incarnation, pid: process.pid,
-    pidStartTime: "12345", bootId: "fixture-boot", updatedAt: 2_000, expiresAt: 17_000, ...change };
+    pidStartTime: "12345", bootId: "fixture-boot", updatedAt: now, expiresAt: now + 15_000, ...change };
 }
 const opened: KvParticipantDirectory[] = [];
 afterEach(async () => { await Promise.all(opened.splice(0).map(view => view.close())); });
@@ -94,9 +95,9 @@ function fixture() {
     kv: bucket => bucket === "presence" ? presence : leases,
     async send() { throw new Error("KV-only seam must not send"); }, async *inbox() { throw new Error("KV-only seam must not receive"); },
     async drainState() { return { pending: 0, ackPending: 0 }; }, async close() {} };
-  const view = (incarnation = NEXT) => {
-    const value = new KvParticipantDirectory({ transport, lease: gate, identityId: ROOT, rootId: ROOT,
-      ownerIncarnation: incarnation, operationTimeoutMs: 1_000 });
+  const view = (incarnation = NEXT, hostId = ROOT, identityId = ROOT) => {
+    const value = new KvParticipantDirectory({ transport: { ...transport, self: { machine: MACHINE, hostId } }, lease: gate,
+      identityId, rootId: ROOT, ownerIncarnation: incarnation, operationTimeoutMs: 1_000 });
     opened.push(value); value.start(); return value;
   };
   const stale = (change: Partial<FabricParticipantRecord> = {}) => {
@@ -105,7 +106,7 @@ function fixture() {
   };
   const lease = (incarnation = NEXT, change: Partial<FabricKvHostLease> = {}) => {
     const value = hostLease(incarnation, change);
-    return leases.seed(hkey(), `${value.id}#${value.incarnation}`, value);
+    return leases.seed(hkey(value.id), `${value.id}#${value.incarnation}`, value);
   };
   const observer = () => {
     const value = new KvParticipantDirectory({ transport: { ...transport, self: { machine: "machine-b", hostId: "observer-host" } },
@@ -135,6 +136,48 @@ describe("#14115 initial own Main presence succession", () => {
     expect(f.presence.rows.get(pkey())).toMatchObject({ owner: `${ROOT}#${NEXT}`, revision: publication.revision, value: root() });
     expect(await liveRoute(view)).toMatchObject({ live: true, ownerIncarnation: NEXT });
     expect(f.presence.mutations).toEqual([{ key: pkey(), expected: 0, revision: publication.revision }]);
+  });
+
+  it("lets the resident successor take over a root-owned durable actor row and keeps the CAS routable", async () => {
+    const f = fixture();
+    const main = root(OLD, { id: ACTOR, kind: "actor", parentId: ROOT, rootId: ROOT });
+    const previous = f.presence.seed(pkey(ACTOR), `${ROOT}#${OLD}`, main);
+    const resident = "resident:presence-resume";
+    f.lease(NEXT, { id: resident, identityId: resident, rootId: ROOT });
+    const successor = { ...main, ownerHostId: resident, ownerIdentityId: resident, ownerIncarnation: NEXT,
+      name: "dev-supervisor", updatedAt: 2_100 };
+    const view = f.view(NEXT, resident, resident);
+    const publication = await view.publish(successor);
+    expect(f.presence.rows.get(pkey(ACTOR))).toMatchObject({ owner: `${resident}#${NEXT}`, revision: publication.revision, value: successor });
+    expect(f.presence.mutations).toEqual([{ key: pkey(ACTOR), expected: previous.revision, revision: publication.revision }]);
+    expect(view.get(ACTOR)).toMatchObject({ id: ACTOR, ownerHostId: resident, stale: false });
+    expect(f.presence.deletes).toEqual([]);
+  });
+
+  it.each(["absent", "expired"] as const)("replaces an actor row from a different root with a %s owner lease", async leaseState => {
+    const f = fixture(); f.lease();
+    const previousRecord = root(OLD, { id: ACTOR, kind: "actor", rootId: "session:other-root", ownerHostId: "other-host",
+      ownerIdentityId: "session:other-root", parentId: "session:other-root" });
+    const previous = f.presence.seed(pkey(ACTOR), `other-host#${OLD}`, previousRecord);
+    if (leaseState === "expired") f.lease(OLD, { id: "other-host", rootId: previousRecord.rootId,
+      identityId: previousRecord.ownerIdentityId, expiresAt: Date.now() - 1 });
+    const successor = root(NEXT, { id: ACTOR, kind: "actor", parentId: ROOT });
+    const publication = await f.view().publish(successor);
+    expect(f.presence.rows.get(pkey(ACTOR))).toMatchObject({ owner: `${ROOT}#${NEXT}`, revision: publication.revision, value: successor });
+    expect(f.presence.mutations).toEqual([{ key: pkey(ACTOR), expected: previous.revision, revision: publication.revision }]);
+  });
+
+  it("keeps a live different-root actor owner in conflict", async () => {
+    const f = fixture(); f.lease();
+    const previousRecord = root(OLD, { id: ACTOR, kind: "actor", rootId: "session:other-root", ownerHostId: "other-host",
+      ownerIdentityId: "session:other-root", parentId: "session:other-root" });
+    const previous = f.presence.seed(pkey(ACTOR), `other-host#${OLD}`, previousRecord);
+    f.lease(OLD, { id: "other-host", rootId: previousRecord.rootId, identityId: previousRecord.ownerIdentityId });
+    await expect(f.view().publish(root(NEXT, { id: ACTOR, kind: "actor", parentId: ROOT })))
+      .rejects.toMatchObject({ code: "FABRIC_KV_CONFLICT" });
+    expect(f.presence.rows.get(pkey(ACTOR))).toEqual(previous);
+    expect(f.presence.mutations).toEqual([]);
+    expect(f.presence.deletes).toEqual([]);
   });
 
   it("preserves placement run-id metadata through the authenticated NATS presence projection", async () => {
@@ -390,11 +433,12 @@ describe("#14115 initial own Main presence succession", () => {
     expect(f.presence.deletes).toEqual([]);
   });
 
-  it("ordinary child publication cannot use Main-only takeover either", async () => {
+  it("allows a successor incarnation to replace its own same-lineage actor row", async () => {
     const f = fixture(); f.lease();
     const child = root(NEXT, { id: "actor:run", kind: "actor", parentId: ROOT });
     const previous = f.presence.seed(pkey(child.id), `${ROOT}#${OLD}`, { ...child, ownerIncarnation: OLD });
-    await expect(f.view().publish(child)).rejects.toBeDefined();
-    expect(f.presence.rows.get(pkey(child.id))).toEqual(previous);
+    const publication = await f.view().publish(child);
+    expect(f.presence.rows.get(pkey(child.id))).toMatchObject({ revision: publication.revision, value: child });
+    expect(f.presence.mutations).toEqual([{ key: pkey(child.id), expected: previous.revision, revision: publication.revision }]);
   });
 });

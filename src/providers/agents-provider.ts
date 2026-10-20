@@ -295,6 +295,10 @@ const actorRequest = (
       )
     : undefined;
   const topics = stringArray(args.topics);
+  const eventsStartAt = args.eventsStartAt;
+  if (eventsStartAt !== undefined && typeof eventsStartAt !== "number" && typeof eventsStartAt !== "string") {
+    throw new Error("eventsStartAt must be a nonnegative epoch millisecond or ISO timestamp");
+  }
   const records = normalizeActorRecords(args.records);
   const tools = stringArray(args.tools);
   const requires = Array.isArray(args.requires)
@@ -363,6 +367,7 @@ const actorRequest = (
     runner,
     ...(kernel !== undefined ? { kernel } : {}),
     ...(events ? { events } : {}),
+    ...(eventsStartAt !== undefined ? { eventsStartAt } : {}),
     ...(topics ? { topics } : {}),
     ...(args.delivery === "mailbox" ||
     args.delivery === "steer" ||

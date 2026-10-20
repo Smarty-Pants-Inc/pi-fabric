@@ -1348,7 +1348,12 @@ The **owning host** (Main for local actors, resident for durable actors) resolve
 
 **Platform boundary:** File-backed instructions require Linux and a genuine, accessible `/proc/self/fd`. The owner pins the canonical root with an `O_DIRECTORY` handle, checks its identity, then opens each canonical path component relative to pinned directory descriptors with `O_NOFOLLOW`. An ancestor link swapped between containment checks and opening cannot redirect the read outside the root; all handles close on success or refusal. Static in-root symlinks still work because they are canonicalized before that no-follow walk. Node does not expose a portable handle-relative open or Windows reparse-safe equivalent, so Windows/macOS/other hosts refuse **all** file-backed sources (including reparse-point paths) before filesystem access or actor mutation; use inline `instructions` there. Missing/inaccessible procfs also fails closed; there is no pathname-only fallback. This assumes the host controls mount topology/procfs; it does not defend against a privileged mount replacement.
 
-The actor has a fixed runner, persistent runner session, serial mailbox, and optional subscriptions to parent-session events or durable mesh topics:
+The actor has a fixed runner, persistent runner session, serial mailbox, and optional
+subscriptions to parent-session events or durable mesh topics. For NATS mesh events,
+`eventsStartAt` on `agents.create` accepts epoch milliseconds or an ISO-8601 timestamp
+and sets `DeliverPolicy.StartTime` only when each durable is first created. If omitted,
+`DeliverPolicy.All` replays all retained events; reopening an existing durable or changing
+topics does not reset its cursor.
 
 ```ts
 return agents.create({

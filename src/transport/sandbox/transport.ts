@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import type { AgentRunRecord, AgentTransportAdapter, AgentTransportHandle, AgentTransportLaunch } from "../../agents/types.js";
 import { writeJsonAtomic } from "../../core/atomic-write.js";
+import { SandboxPlacementHttp } from "./placement-http.js";
 import { SANDBOX_PLACEMENT_WAIT_MS, SANDBOX_READY_TIMEOUT_MS, type SandboxBinding, type SandboxPlacement, type SandboxSpawnIntent, type SandboxSpawnResult, type SandboxTaskResult, type SandboxTerminalRecord, type SandboxTerminalState, type SandboxTransportConfig, type SandboxTransportDependencies, writeSandboxTerminalRecord } from "./types.js";
 import { buildSandboxIntent } from "./intent.js";
 
@@ -140,7 +141,9 @@ export class SandboxTransport implements AgentTransportAdapter {
   readonly #now: () => number;
   readonly #sleep: (milliseconds: number, signal?: AbortSignal) => Promise<void>;
 
-  constructor(readonly config: SandboxTransportConfig, readonly dependencies: SandboxTransportDependencies = {}) {
+  readonly dependencies: SandboxTransportDependencies;
+  constructor(readonly config: SandboxTransportConfig, dependencies: SandboxTransportDependencies = {}) {
+    this.dependencies = { ...dependencies, placement: dependencies.placement ?? new SandboxPlacementHttp(config.placementUrl) };
     this.#now = dependencies.now ?? Date.now;
     this.#sleep = dependencies.sleep ?? timeoutSleep;
   }
@@ -247,7 +250,10 @@ export class SandboxTransport implements AgentTransportAdapter {
     };
     try { writeJsonAtomic(statusFile, base, { space: 2, durable: true }); }
     catch { return failBeforeStart(new SandboxProtocolError("Could not persist sandbox run status before delivery"), "local run status could not be persisted"); }
-    try { await mesh.deliverTask(child.id, task); }
+    const resultPrefix = `FABRIC-RESULT ${runId}\n`;
+    const returnInstructions = `When complete, send exactly one follow-up to the spawner with the final answer. Call agents.followUp({ id: ${JSON.stringify(parentSession)}, message: ${JSON.stringify(resultPrefix)} + answer }). The message must begin with the exact prefix ${JSON.stringify(resultPrefix)}; append your final answer after it.`;
+    const deliveredTask = `${task}\n\n${returnInstructions}`;
+    try { await mesh.deliverTask(child.id, deliveredTask); }
     catch {
       base = { ...base, warnings: [...(base.warnings ?? []), "Task delivery acknowledgement was not received; awaiting the single result without retry."] };
       try { writeJsonAtomic(statusFile, base, { space: 2, durable: true }); } catch { /* the running status was persisted before the single delivery attempt */ }
@@ -361,13 +367,18 @@ export class SandboxTransport implements AgentTransportAdapter {
   async #waitForAdmission(placement: SandboxPlacement, intent: SandboxSpawnIntent, signal?: AbortSignal): Promise<SandboxSpawnResult> {
     const deadline = this.#now() + SANDBOX_PLACEMENT_WAIT_MS;
     let last: SandboxSpawnResult | undefined;
+    let hasSpawnResult = false;
     let retry = 0;
     while (this.#now() < deadline) {
       abortIfNeeded(signal);
       const remaining = Math.max(1, deadline - this.#now());
       const operationSignal = signal ? AbortSignal.any([signal, AbortSignal.timeout(remaining)]) : AbortSignal.timeout(remaining);
       try {
-        last = validateSpawnResult(await placement.requestSpawn(intent, operationSignal), intent.runId);
+        const snapshot = hasSpawnResult
+          ? await placement.getSpawn(intent.runId, operationSignal)
+          : await placement.requestSpawn(intent, operationSignal);
+        last = validateSpawnResult(snapshot, intent.runId);
+        hasSpawnResult = true;
       } catch (error) {
         if (!responseErrorIsRetryable(error)) throw error;
         await this.#sleep(Math.min(1_000 * 2 ** Math.min(retry++, 5), remaining), signal);

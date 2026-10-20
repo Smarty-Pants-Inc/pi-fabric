@@ -1333,6 +1333,20 @@ const prewalkModeValue = (
 ): FabricPrewalkMode =>
   value === "in-place" || value === "trajectory" ? value : fallback;
 
+const sandboxPlacementUrlValue = (value: unknown): string => {
+  const candidate = value === undefined ? "http://smarty-placement.smarty-island.svc:8080" : value;
+  if (typeof candidate !== "string" || candidate.length > 512) throw new Error("Invalid agents.sandbox.placementUrl");
+  let url: URL;
+  try { url = new URL(candidate); } catch { throw new Error("Invalid agents.sandbox.placementUrl"); }
+  const octets = url.hostname.split(".");
+  const tailnetIp = octets.length === 4 && octets.every(part => /^\d{1,3}$/u.test(part) && Number(part) <= 255) &&
+    Number(octets[0]) === 100 && Number(octets[1]) >= 64 && Number(octets[1]) <= 127;
+  const service = url.hostname === "smarty-placement.smarty-island.svc" && url.port === "8080";
+  if (url.protocol !== "http:" || url.username || url.password || url.pathname !== "/" || url.search || url.hash ||
+    !(service || tailnetIp && url.port === "30880")) throw new Error("agents.sandbox.placementUrl must use the in-cluster HTTP endpoint or a tailnet IPv4 NodePort");
+  return url.origin;
+};
+
 const transportValue = (
   value: unknown,
   fallback: FabricAgentTransport,
@@ -1504,6 +1518,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
   const sandboxConfig: SandboxTransportConfig = {
     enabled: booleanValue(sandbox.enabled, DEFAULT_FABRIC_CONFIG.agents.sandbox.enabled),
     template: sandboxTemplate,
+    ...(sandbox.placementUrl !== undefined ? { placementUrl: sandboxPlacementUrlValue(sandbox.placementUrl) } : {}),
     readyTimeoutMs: boundedInteger(sandbox.readyTimeoutMs, DEFAULT_FABRIC_CONFIG.agents.sandbox.readyTimeoutMs, 1_000, 90_000),
   };
   const placementApi = normalizePlacementApiConfig(agents.placementApi);

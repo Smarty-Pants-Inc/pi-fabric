@@ -308,6 +308,8 @@ export interface FabricActorRequest extends FabricActorBatching {
   instructions: string;
   /** Asynchronous observations of session-bound Pi events plus synthetic tool_error. */
   events?: FabricActorHostEvent[];
+  /** NATS event replay floor (epoch milliseconds or an ISO timestamp), applied when the actor durable is created. */
+  eventsStartAt?: number | string;
   topics?: string[];
   /** Defaults to mailbox. steer/followUp require an explicit triggerTurn choice. */
   delivery?: FabricActorDelivery;
@@ -429,6 +431,7 @@ export interface FabricActorInfo extends FabricActorBatching {
   kernel?: FabricKernel;
   pythonRuntime?: FabricPythonRuntime;
   events: FabricActorHostEvent[];
+  eventsStartAt?: number;
   topics: string[];
   delivery: FabricActorDelivery;
   responseMode: FabricActorResponseMode;

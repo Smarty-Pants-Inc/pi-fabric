@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import type { AgentRunRecord, AgentTransportAdapter, AgentTransportHandle, AgentTransportLaunch } from "../../agents/types.js";
 import { writeJsonAtomic } from "../../core/atomic-write.js";
+import { diagnostics } from "../../core/diagnostics.js";
 import { SandboxPlacementHttp } from "./placement-http.js";
 import { SANDBOX_PLACEMENT_WAIT_MS, SANDBOX_READY_TIMEOUT_MS, type SandboxBinding, type SandboxPlacement, type SandboxSpawnIntent, type SandboxSpawnResult, type SandboxTaskResult, type SandboxTerminalRecord, type SandboxTerminalState, type SandboxTransportConfig, type SandboxTransportDependencies, writeSandboxTerminalRecord } from "./types.js";
 import { buildSandboxIntent } from "./intent.js";
@@ -162,8 +163,14 @@ export class SandboxTransport implements AgentTransportAdapter {
         ...(options.exitCode !== undefined ? { exitCode: options.exitCode } : {}),
         ...(options.reason ? { reason: options.reason } : {}),
       };
-      await writeSandboxTerminalRecord(this.dependencies.terminal, record);
-      terminalWritten = true;
+      try {
+        await writeSandboxTerminalRecord(this.dependencies.terminal, record);
+        terminalWritten = true;
+      } catch (error) {
+        const code = isObject(error) && typeof error.code === "string" ? error.code : "FABRIC_PLACEMENT_TERMINAL_WRITE_FAILED";
+        diagnostics.warn("src/transport/sandbox/transport.ts",
+          `[pi-fabric] Placement terminal receipt for ${runId} failed (${code}); execution result is unchanged.`);
+      }
     };
     const failBeforeStart = async (error: Error, reason: string): Promise<never> => {
       await writeTerminal("never-started", { reason }).catch(() => undefined);

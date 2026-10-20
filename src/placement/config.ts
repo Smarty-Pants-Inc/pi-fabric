@@ -19,12 +19,21 @@ const tailnetIpv4 = (hostname: string): boolean => {
     && Number(octets[0]) === 100 && Number(octets[1]) >= 64 && Number(octets[1]) <= 127;
 };
 
+export const isLoopbackPlacementUrl = (candidate: string, url: URL): boolean => {
+  const authority = /^http:\/\/([^/?#\\]*)/iu.exec(candidate)?.[1];
+  const match = authority?.match(/^127\.0\.0\.1:(\d+)$/u);
+  if (url.protocol !== "http:" || url.hostname !== "127.0.0.1" || !match) return false;
+  const port = Number(match[1]);
+  return Number.isInteger(port) && port >= 1024 && port <= 65_535 && Number(url.port) === port;
+};
+
 const allowedUrl = (value: string): string | undefined => {
   try {
     const url = new URL(value);
     if (url.username || url.password || url.pathname !== "/" || url.search || url.hash || url.protocol !== "http:") return;
     if (url.origin === "http://smarty-placement.smarty-island.svc:8080") return url.origin;
     if (url.port === "30880" && tailnetIpv4(url.hostname)) return url.origin;
+    if (isLoopbackPlacementUrl(value, url)) return url.origin;
   } catch { /* Use one fixed error below; never echo config input. */ }
   return;
 };

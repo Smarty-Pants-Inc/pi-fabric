@@ -4049,7 +4049,7 @@ export class ActorManager {
       // A losing race deadline is still a live old-generation timer. The shared
       // bounded-settlement helper clears it when drains finish first (#4383).
       if (!await settleWithin([drains], this.#closeGraceMs)) {
-        await this.agents.close();
+        await this.agents.close({ persistentSessionReload: this.identity.kind === "main" });
         await settleWithin([drains], this.#closeGraceMs);
       }
       // Retry every durable join before AgentManager.close. Failed sinks keep

@@ -130,21 +130,99 @@ describe("actor runs that end before inference (#15195)", () => {
     expect(alarms(h.mesh)).toHaveLength(0);
   });
 
-  it("does not fence a persistent session run when close suspends it for reload", async () => {
-    const h = fixture(true, 5_000);
-    const actor = await actorRequest(h.actors, "reload-reviewer");
-    await h.mesh.publish({ topic: "review.requests", from: identity, kind: "notification", text: "HANG during session reload" });
-    await waitFor(() => h.actors.status(actor.id).inFlightRun !== undefined);
-    const runId = h.actors.status(actor.id).inFlightRun!.id;
+  it("recovers an unstarted session delivery once after Main reload exceeds close grace", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "actor-session-reload-unstarted-"));
+    roots.push(root);
+    const meshRoot = path.join(root, "mesh");
+    const cursorPath = path.join(root, "actors", "mesh-cursor.json");
+    const attemptsPath = path.join(root, "worker-attempts");
+    const workerPath = path.join(root, "slow-stop-worker.mjs");
+    fs.writeFileSync(workerPath, `
+import fs from "node:fs";
+const args = new Map();
+for (let i = 2; i < process.argv.length; i += 2) args.set(process.argv[i].slice(2), process.argv[i + 1]);
+const statusFile = args.get("status-file");
+const task = fs.readFileSync(args.get("task-file"), "utf8");
+const attemptsPath = ${JSON.stringify(attemptsPath)};
+const attempt = fs.existsSync(attemptsPath) ? Number(fs.readFileSync(attemptsPath, "utf8")) + 1 : 1;
+fs.writeFileSync(attemptsPath, String(attempt));
+const now = Date.now();
+const running = { id: args.get("id"), name: args.get("name"), task, status: "running", runner: args.get("runner") ?? "pi",
+  transport: args.get("transport"), sessionId: String(process.pid), cwd: args.get("cwd"), startedAt: now, updatedAt: now,
+  turns: 0, toolCalls: 0, text: "", exitCode: null,
+  usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } };
+const writeStatus = record => {
+  const temporary = statusFile + "." + process.pid + ".tmp";
+  fs.writeFileSync(temporary, JSON.stringify(record));
+  fs.renameSync(temporary, statusFile);
+};
+let stopping = false;
+const stop = () => {
+  if (stopping) return;
+  stopping = true;
+  setTimeout(() => {
+    const ended = Date.now();
+    writeStatus({ ...running, status: "stopped", updatedAt: ended, finishedAt: ended, error: "Agent stopped", exitCode: 0 });
+    process.exit(0);
+  }, 300);
+};
+process.on("SIGTERM", stop);
+process.on("SIGINT", stop);
+writeStatus(running);
+if (attempt > 1) setTimeout(() => {
+  const ended = Date.now();
+  writeStatus({ ...running, status: "completed", inferenceStarted: true, updatedAt: ended, finishedAt: ended,
+    turns: 1, text: "recovered once", exitCode: 0 });
+  process.exit(0);
+}, 25);
+else setInterval(() => {}, 1_000);
+`);
+    const makeAgents = () => new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: true, sessionExport: false }, {
+      runRoot: path.join(root, "runs"), workerPath, identityId: identity.id, mainAgentId: identity.id,
+    });
+    const makeActors = (mesh: MeshStore, agents: AgentManager, closeGraceMs: number) => new ActorManager(
+      "session-reload", identity, mesh, { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, agents, () => {}, {
+        actorRoot: path.join(root, "actors"), persistent: true, closeGraceMs, meshCursorPath: cursorPath,
+        meshReplayAgeMs: 60_000, meshRetentionSweepPath: false,
+      },
+    );
+    const mesh = new MeshStore(meshRoot, 64 * 1024, 100);
+    const agents = makeAgents();
+    const actors = makeActors(mesh, agents, 30);
+    closers.push(async () => { await actors.close(); await agents.close(); });
+    const actor = await actorRequest(actors, "reload-reviewer");
+    await mesh.publish({ topic: "review.requests", from: identity, kind: "ci-complete",
+      data: { replayId: "session-reload:ci-complete@1" }, text: "LIVE_WITHOUT_PROGRESS reload delivery" });
+    await waitFor(() => actors.status(actor.id).inFlightRun !== undefined);
+    const firstRunId = actors.status(actor.id).inFlightRun!.id;
     await waitFor(() => {
-      const run = h.agents.status(runId);
+      const run = agents.status(firstRunId);
       return run.status === "running" && "turns" in run && run.turns === 0;
     });
-    await h.actors.close();
-    const result = await h.agents.wait(runId);
-    expect(result.status).toBe("stopped");
-    expect(result).not.toHaveProperty("stopIntent");
-  }, 15_000);
+    const closeOptions: Array<{ persistentSessionReload?: boolean }> = [];
+    const realClose = agents.close.bind(agents);
+    vi.spyOn(agents, "close").mockImplementation((options) => {
+      closeOptions.push(options ?? {});
+      return realClose(options);
+    });
+    await actors.close();
+    expect(closeOptions).toEqual([{ persistentSessionReload: true }]);
+    const stopped = JSON.parse(fs.readFileSync(path.join(agents.runDirectory(firstRunId)!, "status.json"), "utf8")) as Record<string, unknown>;
+    expect(stopped).toMatchObject({ status: "stopped", turns: 0 });
+    expect(stopped).not.toHaveProperty("stopIntent");
+
+    // Simulate the CI crash window: the queue is durable but the saved mesh cursor reset to the start.
+    fs.writeFileSync(cursorPath, JSON.stringify({ format: 1, cursor: 0 }));
+    const reloadedMesh = new MeshStore(meshRoot, 64 * 1024, 100);
+    const reloadedAgents = makeAgents();
+    const reloadedActors = makeActors(reloadedMesh, reloadedAgents, 5_000);
+    closers.push(async () => { await reloadedActors.close(); await reloadedAgents.close(); });
+    const replies = () => reloadedActors.messages(actor.id).filter(message => message.direction === "out" && !message.error);
+    await waitFor(() => replies().length === 1 && reloadedActors.status(actor.id).status === "idle" && reloadedActors.status(actor.id).queued === 0, 15_000);
+    expect(replies()).toHaveLength(1);
+    expect(replies()[0]?.text).toBe("recovered once");
+    expect(fs.readFileSync(attemptsPath, "utf8")).toBe("2");
+  }, 20_000);
 
   it("does not re-drive an activation being removed and records removal provenance in run status", async () => {
     const h = fixture();

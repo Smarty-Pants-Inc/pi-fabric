@@ -1416,6 +1416,7 @@ export class AgentManager {
     | { revision: number; value: Array<AgentRunRecord | AgentHandleInfo> }
     | undefined;
   #closing = false;
+  #persistentSessionReload: boolean | undefined;
   #releasePaused = false;
   #releaseEpoch = 0;
   #releaseCheckpoint: { epoch: number; disk: string; workers: unknown } | undefined;
@@ -5317,7 +5318,9 @@ export class AgentManager {
       receiptScope: "retained run input/journal/fence bytes and bounded transport observations, not UI quiet or whole-attempt containment" };
   }
 
-  close(): Promise<void> {
+  /** A persistent Main reload suspends session actor runs; ordinary close is terminal. */
+  close(options: { persistentSessionReload?: boolean } = {}): Promise<void> {
+    this.#persistentSessionReload ??= options.persistentSessionReload === true;
     this.#closing = true;
     this.#referenceScan.close();
     for (const walk of this.#archiveRecovery.values()) walk.return(0);
@@ -5353,9 +5356,14 @@ export class AgentManager {
     const running = tracked.filter((managed) => !managed.settled);
     const lastEventAt = new Map(running.map((managed) => [managed.id, lastEventTime(managed)]));
     const stopped = await Promise.allSettled([
-      ...tracked.map((managed) => this.#stop(managed.id, false, false, managed.actorId
-        ? this.#stopIntentCaller(managed.residency === "durable" ? "residency-teardown" : "session-reset")
-        : undefined)),
+      ...tracked.map((managed) => {
+        const caller = managed.actorId
+          ? managed.residency === "durable"
+            ? this.#stopIntentCaller("residency-teardown")
+            : this.#persistentSessionReload === true ? undefined : this.#stopIntentCaller("session-reset")
+          : undefined;
+        return this.#stop(managed.id, false, false, caller);
+      }),
       ...[...this.#unregisteredTransports].map(async (transport) => {
         if (!await this.#stopUnregisteredTransport(transport)) throw new Error("Unregistered execution exit unconfirmed");
       }),

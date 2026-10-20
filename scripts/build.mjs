@@ -101,6 +101,7 @@ const lazyEntryPoints = [
   "src/transport/index.ts",
   "src/transport/nats/index.ts",
   "src/transport/sandbox/transport.ts",
+  "src/transport/sandbox/fabric-mesh.ts",
   "src/thinking-control.ts",
   "src/compaction/owner.ts",
   "src/compaction/orphan-repair.ts",

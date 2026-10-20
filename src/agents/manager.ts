@@ -1624,6 +1624,16 @@ export class AgentManager {
           const { SandboxTransport } = await import("../transport/sandbox/transport.js");
           return new SandboxTransport(config.sandbox, {
             ...options.sandbox,
+            ...(!options.sandbox?.terminal && this.#placementTerminalWriter ? {
+              terminal: { put: async (_key, record) => {
+                const { makePlacementTerminalRecord } = await import("../placement/terminal.js");
+                await this.#placementTerminalWriter!(makePlacementTerminalRecord(record.placementRunId, record.state, {
+                  at: Date.parse(record.at),
+                  ...(record.exitCode !== undefined ? { exitCode: record.exitCode } : {}),
+                  ...(record.reason ? { reason: record.reason } : {}),
+                }));
+              } },
+            } : {}),
             ...(this.#meshTransport?.transport ? { meshTransport: this.#meshTransport.transport } : {}),
           }).launch(launch);
         },

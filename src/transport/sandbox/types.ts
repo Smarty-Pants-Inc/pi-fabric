@@ -91,7 +91,7 @@ export interface SandboxTaskResult {
 export interface SandboxMesh {
   waitForPresence(runId: string, options: { timeoutMs: number; signal?: AbortSignal }): Promise<SandboxParticipant>;
   deliverTask(childSession: string, text: string): Promise<void>;
-  awaitResult(childSession: string, deadline: number): Promise<SandboxTaskResult>;
+  awaitResult(childSession: string, runId: string, deadline: number, signal?: AbortSignal): Promise<SandboxTaskResult>;
   stop?(childSession: string, runId: string): Promise<{ confirmed: boolean; reason?: string }>;
 }
 

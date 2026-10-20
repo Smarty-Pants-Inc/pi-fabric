@@ -1199,6 +1199,17 @@ runtime publishing and filter changes remain blocked until approved and minted.
 Absent/false preserves existing grants, and the operator gains no event rights.
 Minting and exact `USER.INFO` verification use the same options.
 
+Actor event durables keep server `max_deliver: -1` and use a client-side cap of
+100 unaccepted deliveries. At the cap, the consumer publishes a `fabric.deadletter`
+MeshEvent to `fabric.ev.<org>.fabric.deadletter`, carrying the original event id,
+subject and stream sequence, delivery count, consumer, and a fixed redacted error
+summary; it then TERMs the source delivery. The dead-letter event is stored in the
+org event stream, and a structured `fabric.alarm` warning names the consumer and
+event id. Events whose subject or type is already `fabric.deadletter` are TERMed
+with one structured warning instead, preventing recursive dead-lettering. If
+publishing the record fails, the source is NAKed with the existing retry
+backoff and remains eligible for another attempt.
+
 Mail services can publish through the plain-Node CLI:
 
 ```sh

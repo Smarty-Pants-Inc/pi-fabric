@@ -16,6 +16,8 @@ import { TransportUnavailableError } from "../types.js";
 
 const CONSUMER_NOT_FOUND = 10014;
 const ACK_WAIT_NS = 60_000 * 1_000_000;
+const TRANSIENT_NAK_DELAY_MS = 2_000;
+const DELIVERY_BACKOFF_NS = [1_000, 5_000, 15_000, 30_000, 30_000].map(ms => ms * 1_000_000);
 const MAX_ACK_PENDING = 128;
 type StreamKind = "ev" | "gh";
 
@@ -28,8 +30,8 @@ export interface NatsActorEventsConsumerOptions {
   readonly eventsStartAt?: number | string | Date;
   /** Explicit admin-only stream creation; runtime event mode always passes false. */
   readonly provision?: boolean;
-  /** Persist the actor queue and message-ID receipt, then confirm ACK before starting the actor drain. */
-  readonly onMessage: (event: MeshEvent, messageId: string, ack: () => Promise<void>) => Promise<void>;
+  /** Persist the actor queue and message-ID receipt before ACK; return false when ownership/custody says retry. */
+  readonly onMessage: (event: MeshEvent, messageId: string, ack: () => Promise<void>) => Promise<void | boolean>;
 }
 
 export interface NatsActorEventsConsumer {
@@ -116,7 +118,7 @@ const startGroup = async (
     ack_wait: ACK_WAIT_NS,
     max_deliver: 5,
     max_ack_pending: MAX_ACK_PENDING,
-    backoff: [],
+    backoff: [...DELIVERY_BACKOFF_NS],
     inactive_threshold: 0,
   });
   const assertCompatible = (info: ConsumerInfo): void => {
@@ -152,7 +154,16 @@ const startGroup = async (
     }
   }
   assertCompatible(info);
-  if (!created && subjects.length > 0) await api.update(stream, durable, mutableConfig(subjects));
+  if (!created) {
+    // Migrate old durables (backoff: []) through CONSUMER.UPDATE without resetting
+    // their cursor. A dormant GitHub durable keeps its last filter while receiving
+    // the new retry policy; active groups replace the filter with current topics.
+    const retainedFilters = info.config.filter_subjects?.length
+      ? [...info.config.filter_subjects]
+      : info.config.filter_subject ? [info.config.filter_subject] : [];
+    const filters = subjects.length > 0 ? subjects : retainedFilters;
+    if (filters.length > 0) await api.update(stream, durable, mutableConfig(filters));
+  }
 
   let active: DeliveryRun | undefined;
   let failure: Error | undefined;
@@ -177,12 +188,12 @@ const startGroup = async (
       try {
         for await (const message of messages) {
           if (run.stopping || closing) {
-            if (connection.isVerified()) message.nak();
+            if (connection.isVerified()) message.nak(TRANSIENT_NAK_DELAY_MS);
             break;
           }
           if (!connection.isVerified()) continue; // Do not admit buffered deliveries while USER.INFO is pending.
           if (!allowed.has(message.subject)) {
-            message.nak();
+            message.nak(TRANSIENT_NAK_DELAY_MS);
             continue;
           }
           let acknowledged = false;
@@ -193,12 +204,25 @@ const startGroup = async (
             if (!confirmed) throw new Error("NATS actor event ACK was not confirmed");
             acknowledged = true;
           };
+          let decoded: ReturnType<typeof decodeEvent>;
+          try { decoded = decodeEvent(message, options.org); }
+          catch {
+            // Malformed/poison envelopes cannot become valid on retry. Drop them
+            // after the durable's max_deliver=5 budget; immediate NAK is deliberate.
+            if (connection.isVerified()) message.nak();
+            continue;
+          }
           try {
-            const { event, messageId } = decodeEvent(message, options.org);
-            await options.onMessage(event, messageId, ack);
+            const accepted = await options.onMessage(decoded.event, decoded.messageId, ack);
+            if (accepted === false) {
+              if (!acknowledged && connection.isVerified()) message.nak(TRANSIENT_NAK_DELAY_MS);
+              continue;
+            }
             await ack();
           } catch {
-            if (!acknowledged && connection.isVerified()) message.nak();
+            // Callback/storage/ACK failures are transient. An immediate NAK
+            // would spend all five deliveries at once; keep the retry delayed.
+            if (!acknowledged && connection.isVerified()) message.nak(TRANSIENT_NAK_DELAY_MS);
             continue;
           }
         }

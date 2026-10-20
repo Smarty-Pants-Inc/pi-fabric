@@ -246,7 +246,7 @@ describe.skipIf(!binary)("NATS Mesh events on a real JetStream server", () => {
       });
       const firstDurable = await connection.manager.consumers.info(natsEventsStreamName(org), `ev_${hashToken(actorId)}`);
       expect(firstDurable.config.deliver_policy).toBe(DeliverPolicy.StartTime);
-      expect(firstDurable.config.opt_start_time).toBe(startAt);
+      expect(Date.parse(firstDurable.config.opt_start_time ?? "")).toBe(Date.parse(startAt));
       await new Promise(resolve => setTimeout(resolve, 150));
       await publisher.publish(event("after-start", "mail.paul"));
       await waitFor(() => seen.filter(id => id === "after-start").length >= 2);

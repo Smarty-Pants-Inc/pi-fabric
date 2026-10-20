@@ -291,6 +291,72 @@ describe("host-only control incarnation rollout fence (#7514)", () => {
     }
   });
 });
+describe("host-only ephemeral NATS inbox settings (smarty-dev#15310)", () => {
+  const nats = {
+    servers: ["tls://nats.example.test:4222"],
+    credentials: "/run/fabric/runtime.creds",
+    machine: "machine-a",
+    custodyStream: "FABRIC_CUSTODY",
+    livenessStream: "FABRIC_LIVENESS",
+    operatorMachine: "fabric-ops",
+    pathBMachines: ["machine-a"],
+    tls: { ca: "test-ca" },
+  };
+
+  const normalizeNats = (overrides: Record<string, unknown> = {}) => {
+    vi.stubEnv("PI_FABRIC_MESH_TRANSPORT", "nats");
+    vi.stubEnv("PI_FABRIC_MESH_HOST_TRANSPORT", "nats");
+    vi.stubEnv("PI_FABRIC_MESH_NATS", JSON.stringify({ ...nats, ...overrides }));
+    return normalizeFabricConfig({}).mesh.nats;
+  };
+
+  it("defaults to a persistent host and a one-hour idle threshold, and accepts configured bounds", () => {
+    expect(DEFAULT_FABRIC_CONFIG.mesh.nats).toMatchObject({ ephemeralHost: false, ephemeralInactiveSeconds: 3_600 });
+    expect(normalizeNats()).toMatchObject({ ephemeralHost: false, ephemeralInactiveSeconds: 3_600 });
+    expect(normalizeNats({ ephemeralHost: true, ephemeralInactiveSeconds: 300 }))
+      .toMatchObject({ ephemeralHost: true, ephemeralInactiveSeconds: 300 });
+    expect(normalizeNats({ ephemeralHost: true, ephemeralInactiveSeconds: 86_400 }))
+      .toMatchObject({ ephemeralHost: true, ephemeralInactiveSeconds: 86_400 });
+  });
+
+  it("rejects invalid opt-in values and thresholds", () => {
+    for (const value of [null, 1, "true"]) {
+      expect(() => normalizeNats({ ephemeralHost: value })).toThrow("mesh.nats.ephemeralHost must be a boolean");
+    }
+    for (const value of [299, 86_401, 300.5, "300", null]) {
+      expect(() => normalizeNats({ ephemeralInactiveSeconds: value }))
+        .toThrow("mesh.nats.ephemeralInactiveSeconds must be an integer from 300 through 86400");
+    }
+  });
+
+  it("does not let a trusted project enable ephemeral retention or change the host threshold", () => {
+    const cwd = temporaryDirectory(); const agentDir = temporaryDirectory(); fs.mkdirSync(path.join(cwd, ".pi"));
+    const originalNatsEnv = process.env.PI_FABRIC_MESH_NATS;
+    const originalTransportEnv = process.env.PI_FABRIC_MESH_TRANSPORT;
+    const originalHostTransportEnv = process.env.PI_FABRIC_MESH_HOST_TRANSPORT;
+    delete process.env.PI_FABRIC_MESH_NATS;
+    delete process.env.PI_FABRIC_MESH_TRANSPORT;
+    delete process.env.PI_FABRIC_MESH_HOST_TRANSPORT;
+    try {
+      fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ mesh: {
+        transport: "nats", hostTransport: "nats", nats: { ...nats, ephemeralHost: false, ephemeralInactiveSeconds: 600 },
+      } }));
+      fs.writeFileSync(path.join(cwd, ".pi", "fabric.json"), JSON.stringify({ mesh: {
+        nats: { ephemeralHost: true, ephemeralInactiveSeconds: 900 },
+      } }));
+      const config = loadFabricConfigForScope({ cwd, agentDir, projectTrusted: true }, "project");
+      expect(config.mesh.nats).toMatchObject({ ephemeralHost: false, ephemeralInactiveSeconds: 600 });
+    } finally {
+      if (originalNatsEnv === undefined) delete process.env.PI_FABRIC_MESH_NATS;
+      else process.env.PI_FABRIC_MESH_NATS = originalNatsEnv;
+      if (originalTransportEnv === undefined) delete process.env.PI_FABRIC_MESH_TRANSPORT;
+      else process.env.PI_FABRIC_MESH_TRANSPORT = originalTransportEnv;
+      if (originalHostTransportEnv === undefined) delete process.env.PI_FABRIC_MESH_HOST_TRANSPORT;
+      else process.env.PI_FABRIC_MESH_HOST_TRANSPORT = originalHostTransportEnv;
+    }
+  });
+});
+
 describe("host-only stuckPreparingMs (smarty-dev#6337)", () => {
   it("defaults to ten minutes and clamps to [1 s, 7 d]", () => {
     expect(DEFAULT_FABRIC_CONFIG.agents.stuckPreparingMs).toBe(600_000);

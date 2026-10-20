@@ -142,6 +142,19 @@ describe.skipIf(!binary)("authenticated Path B transport", () => {
     await expect(openNatsConnection({ ...harness.runtimeOptions(harness.users.machineA), custodyStream: "OTHER_CUSTODY" })).rejects.toThrow();
   });
 
+  it("accepts the exact agent permission set plus one extra publish deny", async () => {
+    const extraDeny = "fabric.in.sandbox1.>";
+    const fixture = await createPathBHarness({ binary: binary!, tls: {}, additionalAgentDeny: [extraDeny] });
+    try {
+      const connection = await openNatsConnection(fixture.runtimeOptions(fixture.users.machineA));
+      try {
+        expect(connection.userInfo).toMatchObject({
+          data: { permissions: { publish: { deny: expect.arrayContaining([extraDeny]) } } },
+        });
+      } finally { await connection.close(); }
+    } finally { await fixture.stop(); }
+  });
+
   it("accepts additional Path B event grants for both configured orgs", async () => {
     const eventOrgs = ["smarty-pants-inc", "versehq"] as const;
     const fixture = await createPathBHarness({

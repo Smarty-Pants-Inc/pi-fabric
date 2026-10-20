@@ -73,6 +73,8 @@ export interface PathBHarnessOptions {
   readonly identityFactory?: (root: string) => PathBIdentity | Promise<PathBIdentity>;
   /** Additional publish allows for agent superset-verification tests. */
   readonly additionalAgentPublish?: readonly string[];
+  /** Additional publish denies for agent least-authority verification tests. */
+  readonly additionalAgentDeny?: readonly string[];
   /** Remove expected publish allows for fail-closed identity-check tests. */
   readonly removeAgentPublish?: readonly string[];
   /** Additional signed mesh bindings for multi-tag template expansion tests. */
@@ -131,7 +133,7 @@ function faultedAgentTemplate(options: PathBHarnessOptions): RoleTemplate {
   return {
     pub: {
       allow: [...base.pub.allow.filter((subject) => !removedPublish.has(subject)), ...(options.additionalAgentPublish ?? [])],
-      deny: base.pub.deny.filter((subject) => !removedDeny.has(subject)),
+      deny: [...base.pub.deny.filter((subject) => !removedDeny.has(subject)), ...(options.additionalAgentDeny ?? [])],
     },
     sub: { allow: [...base.sub.allow, ...(options.additionalAgentSubscribe ?? [])] },
     ...(base.allow_responses ? { allow_responses: base.allow_responses } : {}),

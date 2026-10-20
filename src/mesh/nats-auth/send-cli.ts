@@ -22,6 +22,8 @@ const SEND_USAGE = [
   "  --servers <tls://host:port[,tls://host:port...]> --machine <machine>",
   "  [--name <host-name>] [--idempotency-key <key>] [--timeout-ms <ms>]",
   "  [--await-reply-seconds <seconds>] [--org <org>] [--path-b-machines <csv>]",
+  "  With --await-reply-seconds, the target receives data.replyCorrelationId and",
+  "  must echo it as data.inReplyTo in its followUp reply.",
   "",
   "A stable private host receipt is kept under XDG_STATE_HOME (or ~/.local/state).",
   "Keep --machine, --creds path, --name, and state home stable to reuse host identity and idempotency.",
@@ -253,8 +255,15 @@ function removePrivateRoot(root: string, identity: DirectoryIdentity): void {
 
 function presenceToken(id: string): string { return createHash("sha256").update(id).digest("hex").slice(0, 32); }
 
-function replyFor(command: { operation: string; targetId: string; message?: string }, from: MeshIdentity, targetId: string): SendReply | undefined {
-  if (command.operation !== "followUp" || command.targetId !== targetId || typeof command.message !== "string" ||
+function replyFor(
+  command: { operation: string; targetId: string; message?: string; data?: unknown },
+  from: MeshIdentity,
+  senderId: string,
+  requestedTargetId: string,
+  correlationId: string,
+): SendReply | undefined {
+  if (command.operation !== "followUp" || command.targetId !== senderId || from.id !== requestedTargetId ||
+    !isPlainObject(command.data) || command.data.inReplyTo !== correlationId || typeof command.message !== "string" ||
     !command.message || Buffer.byteLength(command.message, "utf8") > MAX_TEXT_BYTES ||
     !from.id || from.id.length > 256 || /[\u0000-\u001f\u007f]/.test(from.id) ||
     typeof from.name !== "string" || from.name.length > 128 || /[\u0000-\u001f\u007f]/.test(from.name) ||
@@ -402,6 +411,11 @@ async function openAndSend(options: SendOptions, onAcknowledged: Acknowledged): 
     if (!view) throw new SendCliError("NATS participant view is unavailable");
     const target = await waitForLiveRoute(view, options.to, signal);
     if (!target.capabilities.includes(options.kind)) throw new SendCliError(`target does not advertise ${options.kind}`);
+    // Bind reply correlation to this logical idempotent request and the exact route sent to.
+    const replyCorrelationId = options.awaitReplySeconds === undefined ? undefined : createHash("sha256")
+      .update(JSON.stringify([stable.token, options.to, options.kind, options.idempotencyKey,
+        target.machine, target.ownerHostId, target.ownerIdentityId, target.ownerIncarnation]))
+      .digest("hex");
     plane = new FabricControlPlane(mesh, identity, {
       enabled: true,
       hostId,
@@ -415,8 +429,14 @@ async function openAndSend(options: SendOptions, onAcknowledged: Acknowledged): 
       canConsumeMesh: () => directory?.canConsumeMesh() === true,
     });
     plane.start((command, from) => {
-      const received = awaitingReply && replyPromise ? replyFor(command, from, identity.id) : undefined;
-      if (!received || !resolveReply) return { accepted: false, error: "CLI accepts only its first awaited followUp reply" };
+      const senderRoute = view.resolve(from.id);
+      const sameRequestedRoute = from.id === options.to && senderRoute?.live === true &&
+        routeFingerprint(senderRoute) === routeFingerprint(target);
+      const received = awaitingReply && replyPromise && replyCorrelationId && sameRequestedRoute
+        ? replyFor(command, from, identity.id, options.to, replyCorrelationId) : undefined;
+      if (!received || !resolveReply) {
+        return { accepted: false, error: "CLI accepts only followUp replies from the requested target with matching correlation" };
+      }
       reply = received;
       awaitingReply = false;
       resolveReply(received);
@@ -451,6 +471,7 @@ async function openAndSend(options: SendOptions, onAcknowledged: Acknowledged): 
     try {
       result = await plane.request(target.ownerHostId, options.to, options.kind, {
         message: options.text,
+        ...(replyCorrelationId === undefined ? {} : { data: { replyCorrelationId } }),
         ownerIncarnation: target.ownerIncarnation,
       }, target.ownerIdentityId, {
         idempotencyKey: options.idempotencyKey,

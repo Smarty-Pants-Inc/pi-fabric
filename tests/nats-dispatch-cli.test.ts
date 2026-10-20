@@ -64,17 +64,35 @@ async function waitForGone(kv: TransportKv, key: string): Promise<void> {
 
 beforeAll(async () => {
   if (!binary) return;
-  broker = await createPathBHarness({ binary, tls: {}, org: "tristar" });
+  broker = await createPathBHarness({ binary, tls: {}, org: "dispatch-fixture" });
   await provision(broker);
 }, 30_000);
 
 afterAll(async () => { await broker?.stop(); });
 
 brokerSuite("pi-fabric nats dispatch by real placement-run presence", () => {
-  it("finds three real Fabric roots and records their acknowledged replies", async () => {
+  it.each([
+    {
+      name: "finds three real Fabric roots and records their acknowledged replies",
+      runIds: ["dispatch-fixture-1", "dispatch-fixture-2", "dispatch-fixture-3"],
+      replyRunId: (runId: string) => runId,
+      expectedCode: 0,
+    },
+    {
+      name: "retries an acknowledged dispatch after a reply timeout without accepting another run",
+      runIds: ["dispatch-fixture-retry"],
+      replyRunId: (_runId: string) => null,
+      expectedCode: 2,
+    },
+    {
+      name: "does not attribute a longer run ID reply to dispatch-fixture-1",
+      runIds: ["dispatch-fixture-1"],
+      replyRunId: (_runId: string) => "dispatch-fixture-10",
+      expectedCode: 1,
+    },
+  ])("$name", async ({ runIds, replyRunId, expectedCode }) => {
     if (!broker) throw new Error("NATS fixture unavailable");
     const fixture = broker;
-    const runIds = ["tristar-burst-one", "tristar-burst-two", "tristar-burst-three"];
     const received: Array<{ runId: string; targetId: string; senderId: string; message: string; senderLive: boolean }> = [];
     const replyDeliveries: Promise<unknown>[] = [];
     const owners: Array<{
@@ -92,14 +110,14 @@ brokerSuite("pi-fabric nats dispatch by real placement-run presence", () => {
         const runId = runIds[index]!;
         const sessionId = randomUUID();
         const id = `session:${sessionId}`;
-        const identity: MeshIdentity = { id, name: `TriStar child ${index + 1}`, kind: "main", sessionId };
+        const identity: MeshIdentity = { id, name: `Generated fixture child ${index + 1}`, kind: "main", sessionId };
         const meshRoot = path.join(fixture.root, `dispatch-owner-mesh-${index}-${sessionId}`);
         const transportStateDir = path.join(fixture.root, `dispatch-owner-transport-${index}-${sessionId}`);
         fs.mkdirSync(meshRoot, { mode: 0o700 });
         fs.mkdirSync(transportStateDir, { mode: 0o700 });
         const mesh = new MeshStore(meshRoot, 64 * 1024, 1_000);
         const transport: FabricTransport = await openNatsTransport({
-          ...fixture.runtimeOptions(fixture.users.machineB), hostId: id, name: `tristar-root-${index + 1}`,
+          ...fixture.runtimeOptions(fixture.users.machineB), hostId: id, name: `dispatch-fixture-root-${index + 1}`,
         });
         const directory = new ParticipantDirectory(mesh, {
           enabled: true, transport, transportStateDir,
@@ -141,9 +159,12 @@ brokerSuite("pi-fabric nats dispatch by real placement-run presence", () => {
           const senderRoute = view.resolve(from.id);
           if (!senderRoute?.live) return { accepted: false, error: "dispatch sender is not live" };
           received.push({ runId, targetId: command.targetId, senderId: from.id, message: command.message ?? "", senderLive: true });
-          replyDeliveries.push(plane.request(senderRoute.ownerHostId, from.id, "followUp", {
-            message: `FABRIC-RESULT ${runId}\nanswer-${runId}`, ownerIncarnation: senderRoute.ownerIncarnation,
-          }, senderRoute.ownerIdentityId, { idempotencyKey: `result-${runId}`, timeoutMs: 10_000 }));
+          const resultRunId = replyRunId(runId);
+          if (resultRunId !== null) {
+            replyDeliveries.push(plane.request(senderRoute.ownerHostId, from.id, "followUp", {
+              message: `FABRIC-RESULT ${resultRunId}\nanswer-${runId}`, ownerIncarnation: senderRoute.ownerIncarnation,
+            }, senderRoute.ownerIdentityId, { idempotencyKey: `result-${runId}`, timeoutMs: 10_000 }));
+          }
           return { accepted: true, messageId: command.commandId };
         });
         owners.push({ runId, id, sessionId, model: `test-model-${index + 1}`, transport, directory, plane });
@@ -154,13 +175,14 @@ brokerSuite("pi-fabric nats dispatch by real placement-run presence", () => {
     }
 
     try {
-      const taskFile = path.join(fixture.root, "dispatch-task.txt");
-      const outFile = path.join(fixture.root, "dispatch-results.jsonl");
+      const caseRoot = fs.mkdtempSync(path.join(fixture.root, "dispatch-case-"));
+      const taskFile = path.join(caseRoot, "dispatch-task.txt");
+      const outFile = path.join(caseRoot, "dispatch-results.jsonl");
       fs.writeFileSync(taskFile, "Complete the assigned task and return the result marker.", { mode: 0o600, flag: "wx" });
       const env: NodeJS.ProcessEnv = {
         ...process.env, ...PATH_B_POLICY_ENV,
         PI_FABRIC_MESH_TRANSPORT: "nats", PI_FABRIC_MESH_HOST_TRANSPORT: "nats",
-        XDG_STATE_HOME: path.join(fixture.root, "dispatch-state"),
+        XDG_STATE_HOME: path.join(caseRoot, "dispatch-state"),
       };
       delete env.PI_FABRIC_MESH_NATS;
       delete env.PI_FABRIC_RUN_ID;
@@ -169,13 +191,14 @@ brokerSuite("pi-fabric nats dispatch by real placement-run presence", () => {
       delete env.SSL_CERT_FILE;
       delete env.SSL_CERT_DIR;
       const port = new URL(fixture.serverUrl).port;
-      const outcomes = await Promise.all(owners.map((owner) => runCli([
-        "--run-id", owner.runId, "--task-file", taskFile, "--out", outFile,
+      const argsFor = (runId: string) => [
+        "--run-id", runId, "--task-file", taskFile, "--out", outFile,
         "--creds", fixture.users.machineA.credsPath, "--ca", fixture.tls!.caFile,
-        "--servers", `tls://localhost:${port}`, "--machine", "machine-a", "--org", "tristar",
-        "--path-b-machines", "machine-a,machine-b", "--find-timeout-seconds", "30", "--await-reply-seconds", "30",
-      ], env)));
-      expect(outcomes.filter((outcome) => outcome.code !== 0).map((outcome) => ({ code: outcome.code, stderr: outcome.stderr, stdout: outcome.stdout })))
+        "--servers", `tls://localhost:${port}`, "--machine", "machine-a", "--org", "dispatch-fixture",
+        "--path-b-machines", "machine-a,machine-b", "--find-timeout-seconds", "30", "--await-reply-seconds", expectedCode === 2 ? "1" : "30",
+      ];
+      const outcomes = await Promise.all(owners.map((owner) => runCli(argsFor(owner.runId), env)));
+      expect(outcomes.filter((outcome) => outcome.code !== expectedCode).map((outcome) => ({ code: outcome.code, stderr: outcome.stderr, stdout: outcome.stdout })))
         .toEqual([]);
       expect(outcomes.every((outcome) => outcome.signal === null && outcome.stderr === "")).toBe(true);
       const records = fs.readFileSync(outFile, "utf8").trim().split(/\r?\n/).map((line) => JSON.parse(line) as Record<string, unknown>);
@@ -186,12 +209,18 @@ brokerSuite("pi-fabric nats dispatch by real placement-run presence", () => {
         if (!record) throw new Error(`missing dispatch record ${owner.runId}`);
         expect(record).toMatchObject({
           runId: owner.runId, childSession: owner.sessionId, model: owner.model,
-          answer_ok: true,
-          answer_text_sha256: createHash("sha256").update(`FABRIC-RESULT ${owner.runId}\nanswer-${owner.runId}`).digest("hex"),
+          answer_ok: expectedCode === 0,
+          answer_text_sha256: expectedCode === 2 ? null : createHash("sha256")
+            .update(`FABRIC-RESULT ${replyRunId(owner.runId)}\nanswer-${owner.runId}`).digest("hex"),
         });
-        for (const field of ["t_task_dispatched", "t_ack", "t_answer_received"] as const) {
+        for (const field of ["t_task_dispatched", "t_ack", ...(expectedCode === 2 ? [] : ["t_answer_received"])] as const) {
           expect(record[field]).toMatch(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{9}Z$/);
         }
+        if (expectedCode === 2) {
+          expect(record).toMatchObject({ t_answer_received: null, error: "timed out waiting for the child reply" });
+        } else if (expectedCode === 1) {
+          expect(record.error).toBe("reply did not start with the expected FABRIC-RESULT marker");
+        } else expect(record.error).toBeUndefined();
         expect(record.model).toBe(`test-model-${index + 1}`);
       }
       expect(received).toHaveLength(owners.length);
@@ -199,6 +228,28 @@ brokerSuite("pi-fabric nats dispatch by real placement-run presence", () => {
       expect(received.every((item) => item.senderLive && item.message.includes(`agents.followUp(\"${item.senderId}\"`) &&
         item.message.includes(`FABRIC-RESULT ${item.runId}\\n<answer>`))).toBe(true);
       await Promise.all(replyDeliveries);
+
+      if (expectedCode === 2) {
+        const owner = owners[0]!;
+        expect(owner.directory.participantView?.resolve(owner.id)?.live).toBe(true);
+        const accepted = [...received];
+        // Reuse the exact task, sender identity inputs, options, and live target after the acknowledged timeout.
+        const retry = await runCli(argsFor(owner.runId), env);
+        expect(retry).toMatchObject({ code: 2, signal: null, stderr: "" });
+        const retriedRecords = fs.readFileSync(outFile, "utf8").trim().split(/\r?\n/)
+          .map((line) => JSON.parse(line) as Record<string, unknown>);
+        expect(retriedRecords).toHaveLength(2);
+        expect(retriedRecords[1]).toMatchObject({
+          runId: owner.runId, childSession: owner.sessionId, model: owner.model,
+          answer_ok: false, answer_text_sha256: null, t_answer_received: null,
+          error: "timed out waiting for the child reply",
+        });
+        expect(retriedRecords[1]!.t_task_dispatched).toMatch(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{9}Z$/);
+        expect(retriedRecords[1]!.t_ack).toMatch(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{9}Z$/);
+        expect(owner.directory.participantView?.resolve(owner.id)?.live).toBe(true);
+        expect(received).toEqual(accepted);
+        expect(received).toHaveLength(1);
+      }
 
       const presenceKv = owners[0]!.transport.kv("presence");
       const leaseKv = owners[0]!.transport.kv("leases");

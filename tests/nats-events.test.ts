@@ -3,12 +3,13 @@ import { Buffer } from "node:buffer";
 import { afterEach, describe, expect, it } from "vitest";
 import { openBootstrapNatsConnection, openNatsConnection } from "../src/transport/nats/connection.js";
 import { NatsEventsIdConflictError, openNatsEventsPublisher } from "../src/transport/nats/events-publish.js";
-import { NATS_EVENT_RETRY_DELAY_SCHEDULE_MS, startNatsActorEventsConsumer } from "../src/transport/nats/events-consume.js";
+import { NATS_EVENT_RETRY_DELAY_SCHEDULE_MS, startNatsActorEventsConsumer, type NatsActorEventsSetupFailure } from "../src/transport/nats/events-consume.js";
 import type { MeshEvent } from "../src/mesh/event-log.js";
 import { ensureNatsEventsStream, ensureTransportStream, natsEventsStreamName, natsGithubStreamName, transportStreamConfig } from "../src/transport/nats/provision.js";
 import { hashToken } from "../src/transport/nats/subjects.js";
 import { createPathBHarness, PATH_B_PERMISSION_POLICY, resolveNatsBinary, type PathBHarness } from "./helpers/nats-cluster.js";
-import { DeliverPolicy, DiscardPolicy, RetentionPolicy, StorageType, type StreamConfig, type StreamInfo } from "@nats-io/jetstream";
+import { AckPolicy, DeliverPolicy, DiscardPolicy, JetStreamApiError, JetStreamError, ReplayPolicy, RetentionPolicy, StorageType, type ConsumerInfo, type StreamConfig, type StreamInfo } from "@nats-io/jetstream";
+import { AuthorizationError, InvalidArgumentError, NoRespondersError, PermissionViolationError, RequestError, TimeoutError } from "@nats-io/transport-node";
 
 const binary = resolveNatsBinary() ?? "";
 if (!binary && process.env.NATS_AUTH_REQUIRED === "1") throw new Error("NATS_AUTH_REQUIRED=1 but no nats-server executable was found");
@@ -78,6 +79,189 @@ describe("NATS event stream names", () => {
     const ordinaryInfo = { config: { ...config, name: ordinary.name, subjects: [...ordinary.subjects] }, state: { last_seq: 0 } } as StreamInfo;
     const ordinaryManager = { streams: { info: async () => ordinaryInfo } } as unknown as Parameters<typeof ensureTransportStream>[0];
     await expect(ensureTransportStream(ordinaryManager, ordinary, false)).rejects.toThrow("configuration mismatch");
+  });
+});
+
+// Keep: setup failures and broker leader transitions cannot be reached cheaply by the real-server flow.
+describe("NATS event consumer setup failures with fake JetStream", () => {
+  const org = "smarty-pants-inc";
+  const actorId = `${org}:setup/actor`;
+  const topics = ["mail.inbound", `github.${org}.repo.pulls.shard1of1`];
+  type SetupStep = "info" | "add" | "update" | "get" | "consume";
+  type Kind = "ev" | "gh";
+  const resources = (kind: Kind) => ({
+    stream: kind === "ev" ? natsEventsStreamName(org) : natsGithubStreamName(org),
+    durable: `${kind}_${hashToken(actorId)}`,
+  });
+  const missingConsumer = () => new JetStreamApiError({ code: 404, err_code: 10014, description: "consumer not found" });
+  const apiError = (status: number, code: number, description = "private broker detail") =>
+    new JetStreamApiError({ code: status, err_code: code, description });
+  const statusError = (code: number) => Object.assign(new JetStreamError("private status detail"), { name: "JetStreamStatusError", code });
+  const wrapper = (cause?: unknown) => Object.assign(new Error("private request detail", { cause }), { name: "JetStreamNotEnabled" });
+  const fakeJs = ({ kind = "ev", missing = false, recoverCreate = false, incompatible = false }: {
+    kind?: Kind; missing?: boolean; recoverCreate?: boolean; incompatible?: boolean;
+  } = {}) => {
+    const target = resources(kind);
+    const calls: Array<{ step: SetupStep | "close" | "delete"; stream: string; durable: string }> = [];
+    let failureStep: SetupStep | undefined;
+    let failureCause: unknown;
+    let created = false;
+    const checkpoint = (step: SetupStep, stream: string, durable: string) => {
+      calls.push({ step, stream, durable });
+      if (stream === target.stream && step === failureStep) throw failureCause;
+    };
+    const info = (durable: string) => ({
+      config: { durable_name: incompatible && durable === target.durable ? "wrong-durable" : durable,
+        ack_policy: AckPolicy.Explicit, replay_policy: ReplayPolicy.Instant },
+    }) as ConsumerInfo;
+    const connection = {
+      isVerified: () => true,
+      manager: { consumers: {
+        info: async (stream: string, durable: string) => {
+          checkpoint("info", stream, durable);
+          if (missing && stream === target.stream && !created) throw missingConsumer();
+          return info(durable);
+        },
+        add: async (stream: string, config: { durable_name: string }) => {
+          if (recoverCreate) created = true;
+          checkpoint("add", stream, config.durable_name);
+          created = true;
+          return info(config.durable_name);
+        },
+        update: async (stream: string, durable: string) => {
+          checkpoint("update", stream, durable);
+          return info(durable);
+        },
+        delete: async (stream: string, durable: string) => { calls.push({ step: "delete", stream, durable }); return true; },
+      } },
+      js: { consumers: { get: async (stream: string, durable: string) => {
+        checkpoint("get", stream, durable);
+        return { consume: async () => {
+          checkpoint("consume", stream, durable);
+          return {
+            async *[Symbol.asyncIterator]() { /* No deliveries are needed to exercise setup. */ },
+            closed: async () => undefined,
+            close: async () => { calls.push({ step: "close", stream, durable }); },
+          };
+        } };
+      } } },
+    } as unknown as Parameters<typeof startNatsActorEventsConsumer>[0];
+    return { connection, calls, setFailure(step: SetupStep, cause: unknown) { failureStep = step; failureCause = cause; } };
+  };
+  const start = (connection: Parameters<typeof startNatsActorEventsConsumer>[0]) =>
+    startNatsActorEventsConsumer(connection, { org, actorId, topics, onMessage: async () => "accepted" });
+  const expectFailure = async (promise: Promise<unknown>, cause: unknown, kind: Kind, code: string, retryable: boolean) => {
+    const error: NatsActorEventsSetupFailure | undefined = await promise.then(() => undefined, error => error);
+    expect(error).toBeInstanceOf(Error);
+    expect(error?.cause).toBe(cause);
+    expect(error?.setup).toEqual({ ...resources(kind), code, retryable });
+  };
+
+  it.each((["ev", "gh"] as const).flatMap(kind =>
+    (["info", "add", "update", "get", "consume"] as const).map(step => ({ kind, step }))))(
+    "preserves the cause and exact $kind resources when $step fails", async ({ kind, step }) => {
+      const fake = fakeJs({ kind, missing: step === "add" });
+      const cause = new TimeoutError();
+      fake.setFailure(step, cause);
+      await expectFailure(start(fake.connection), cause, kind, "TIMEOUT", true);
+      expect(fake.calls).toContainEqual({ step, ...resources(kind) });
+      expect(fake.calls.some(call => call.step === "delete")).toBe(false);
+    });
+
+  const permission = new PermissionViolationError("private permission detail", "publish", "private.subject");
+  const cyclicRequest = new RequestError("private cyclic detail");
+  cyclicRequest.cause = cyclicRequest;
+  it.each([
+    { label: "timeout", cause: new TimeoutError(), code: "TIMEOUT", retryable: true },
+    { label: "no responders", cause: new NoRespondersError("private.subject"), code: "NO_RESPONDERS", retryable: true },
+    { label: "wrapped timeout", cause: new RequestError("private", { cause: new TimeoutError() }), code: "TIMEOUT", retryable: true },
+    { label: "nested no responders", cause: wrapper(new RequestError("private", { cause: new NoRespondersError("private.subject") })), code: "NO_RESPONDERS", retryable: true },
+    { label: "API timeout", cause: apiError(408, 10000), code: "JS_API_10000", retryable: true },
+    { label: "API unavailable", cause: apiError(503, 10008), code: "JS_API_10008", retryable: true },
+    { label: "API status fallback", cause: apiError(503, 0), code: "JS_STATUS_503", retryable: true },
+    { label: "cluster unavailable", cause: apiError(500, 10008), code: "JS_API_10008", retryable: true },
+    { label: "cluster leader transition", cause: apiError(500, 10009), code: "JS_API_10009", retryable: true },
+    { label: "not-ready status", cause: apiError(500, 10000, "consumer is not yet current"), code: "JS_API_10000", retryable: true },
+    { label: "meta leader transition", cause: apiError(500, 10000, "no JetStream meta leader"), code: "JS_API_10000", retryable: true },
+    { label: "pull timeout status", cause: statusError(408), code: "JS_STATUS_408", retryable: true },
+    { label: "pull unavailable status", cause: statusError(503), code: "JS_STATUS_503", retryable: true },
+    { label: "permission denial", cause: permission, code: "PermissionViolationError", retryable: false },
+    { label: "wrapped permission denial", cause: wrapper(new RequestError("private", { cause: permission })), code: "PermissionViolationError", retryable: false },
+    { label: "authorization veto", cause: new AuthorizationError("private", { cause: new TimeoutError() }), code: "AuthorizationError", retryable: false },
+    { label: "API permission denial", cause: apiError(403, 10076, "cluster not ready"), code: "JS_API_10076", retryable: false },
+    { label: "API authorization veto", cause: apiError(401, 10008), code: "JS_API_10008", retryable: false },
+    { label: "account disabled", cause: wrapper(apiError(503, 10039)), code: "JS_API_10039", retryable: false },
+    { label: "account permission veto", cause: apiError(503, 10076), code: "JS_API_10076", retryable: false },
+    { label: "malformed config", cause: apiError(400, 10093), code: "JS_API_10093", retryable: false },
+    { label: "malformed config veto", cause: apiError(400, 10000, "consumer is not yet current"), code: "JS_API_10000", retryable: false },
+    { label: "missing stream", cause: apiError(404, 10059), code: "JS_API_10059", retryable: false },
+    { label: "invalid config option", cause: new TypeError("private invalid option"), code: "TypeError", retryable: false },
+    { label: "SDK invalid config", cause: new InvalidArgumentError("private invalid config", { cause: new TimeoutError() }), code: "InvalidArgumentError", retryable: false },
+    { label: "unknown API failure", cause: apiError(500, 10000), code: "JS_API_10000", retryable: false },
+    { label: "unknown error", cause: new Error("timeout: cluster not ready"), code: "UNKNOWN", retryable: false },
+    { label: "unrecognized wrapper", cause: new Error("private", { cause: new TimeoutError() }), code: "UNKNOWN", retryable: false },
+    { label: "empty request wrapper", cause: new RequestError("private"), code: "UNKNOWN", retryable: false },
+    { label: "empty JS wrapper", cause: wrapper(), code: "UNKNOWN", retryable: false },
+    { label: "cyclic request wrapper", cause: cyclicRequest, code: "UNKNOWN", retryable: false },
+    { label: "untrusted name and code", cause: Object.assign(new Error("private"), { name: "private tenant detail", code: "private broker detail" }), code: "UNKNOWN", retryable: false },
+    { label: "non-Error throw", cause: "private timeout detail", code: "UNKNOWN", retryable: false },
+    { label: "unknown status", cause: statusError(409), code: "JS_STATUS_409", retryable: false },
+  ])("classifies $label without exposing broker messages as codes", async ({ cause, code, retryable }) => {
+    const fake = fakeJs();
+    fake.setFailure("info", cause);
+    await expectFailure(start(fake.connection), cause, "ev", code, retryable);
+  });
+
+  it.each((["ev", "gh"] as const).flatMap(kind =>
+    (["update", "get", "consume"] as const).map(step => ({ kind, step }))))(
+    "annotates $kind $step failures while updating topics", async ({ kind, step }) => {
+      const fake = fakeJs({ kind });
+      const consumer = await start(fake.connection);
+      try {
+        const cause = new TimeoutError();
+        fake.setFailure(step, cause);
+        await expectFailure(consumer.updateTopics(topics), cause, kind, "TIMEOUT", true);
+      } finally { await consumer.close(false); }
+    });
+
+  it("keeps incompatible existing consumers terminal without updating or resetting them", async () => {
+    const fake = fakeJs({ incompatible: true });
+    const error: NatsActorEventsSetupFailure | undefined = await start(fake.connection).then(() => undefined, error => error);
+    expect(error).toBeInstanceOf(Error);
+    expect(error?.cause).toBeInstanceOf(Error);
+    expect((error?.cause as Error).message).toContain("Incompatible NATS actor events consumer");
+    expect(error?.setup).toEqual({ ...resources("ev"), code: "UNKNOWN", retryable: false });
+    expect(fake.calls.map(call => call.step)).toEqual(["info"]);
+  });
+
+  it("recovers an expected 404 by creating the same durable without updating its new cursor", async () => {
+    const fake = fakeJs({ missing: true });
+    const consumer = await start(fake.connection);
+    try {
+      expect(fake.calls.filter(call => call.stream === resources("ev").stream).map(call => call.step))
+        .toEqual(["info", "add", "get", "consume"]);
+    } finally { await consumer.close(false); }
+  });
+
+  it("does not create a missing GitHub consumer when there are no GitHub topics", async () => {
+    const fake = fakeJs({ kind: "gh", missing: true });
+    const consumer = await startNatsActorEventsConsumer(fake.connection, {
+      org, actorId, topics: ["mail.inbound"], onMessage: async () => "accepted",
+    });
+    try {
+      expect(fake.calls.filter(call => call.stream === resources("gh").stream))
+        .toEqual([{ step: "info", ...resources("gh") }]);
+    } finally { await consumer.close(false); }
+  });
+
+  it("recovers a concurrent creation failure by reopening, never recreating the durable", async () => {
+    const fake = fakeJs({ missing: true, recoverCreate: true });
+    fake.setFailure("add", apiError(400, 10013, "consumer already exists"));
+    const consumer = await start(fake.connection);
+    try {
+      expect(fake.calls.filter(call => call.stream === resources("ev").stream).map(call => call.step))
+        .toEqual(["info", "add", "info", "update", "get", "consume"]);
+    } finally { await consumer.close(false); }
   });
 });
 

@@ -6,6 +6,7 @@ const REQUEST_TIMEOUT_MS = 10_000;
 const WATCH_TIMEOUT_MS = 30_000;
 const MAX_RESPONSE_BYTES = 64 * 1024;
 const MAX_NDJSON_LINE_BYTES = 16 * 1024;
+const MAX_WATCH_BYTES = 16 * (MAX_NDJSON_LINE_BYTES + 1);
 const PROFILE_ERROR = /profile/iu;
 
 export class SandboxPlacementHttpError extends Error {
@@ -75,6 +76,7 @@ export class SandboxPlacementHttp implements SandboxPlacement {
     const decoder = new TextDecoder();
     let buffered = "";
     let count = 0;
+    let totalBytes = 0;
     const parse = (line: string): SandboxSpawnResult => {
       if (line.length > MAX_NDJSON_LINE_BYTES) throw new Error("Placement watch line exceeds the response limit");
       count += 1;
@@ -85,6 +87,8 @@ export class SandboxPlacementHttp implements SandboxPlacement {
     try {
       while (true) {
         const { value, done } = await reader.read();
+        totalBytes += value?.byteLength ?? 0;
+        if (totalBytes > MAX_WATCH_BYTES) throw new Error("Placement watch exceeds the response limit");
         buffered += decoder.decode(value, { stream: !done });
         if (buffered.length > MAX_NDJSON_LINE_BYTES && !buffered.includes("\n")) throw new Error("Placement watch line exceeds the response limit");
         let newline = buffered.indexOf("\n");
@@ -122,8 +126,7 @@ export class SandboxPlacementHttp implements SandboxPlacement {
       ...init,
       signal: operationSignal(signal, timeoutMs),
     });
-    const text = await response.text();
-    if (text.length > MAX_RESPONSE_BYTES) throw new Error("Placement response exceeds the response limit");
+    const text = await this.#readBoundedText(response, MAX_RESPONSE_BYTES, "Placement response exceeds the response limit");
     let body: unknown;
     try { body = text ? JSON.parse(text) : undefined; }
     catch { throw new Error("Placement returned invalid JSON"); }
@@ -132,9 +135,38 @@ export class SandboxPlacementHttp implements SandboxPlacement {
   }
 
   async #readErrorBody(response: Response): Promise<unknown> {
-    const text = await response.text();
-    if (text.length > MAX_RESPONSE_BYTES) return { detail: "Placement error response exceeds the response limit" };
+    let text: string;
+    try { text = await this.#readBoundedText(response, MAX_RESPONSE_BYTES, "Placement error response exceeds the response limit"); }
+    catch (error) {
+      if (error instanceof Error && error.message === "Placement error response exceeds the response limit") {
+        return { detail: "Placement error response exceeds the response limit" };
+      }
+      throw error;
+    }
     try { return JSON.parse(text); }
     catch { return text.slice(0, 1_024); }
+  }
+
+  async #readBoundedText(response: Response, limit: number, overflow: string): Promise<string> {
+    if (!response.body) return "";
+    const reader = response.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let size = 0;
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        size += value.byteLength;
+        if (size > limit) {
+          await reader.cancel().catch(() => undefined);
+          throw new Error(overflow);
+        }
+        chunks.push(value);
+      }
+    } finally { reader.releaseLock(); }
+    const bytes = new Uint8Array(size);
+    let offset = 0;
+    for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+    return new TextDecoder().decode(bytes);
   }
 }

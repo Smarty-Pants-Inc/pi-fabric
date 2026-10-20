@@ -7,6 +7,8 @@ import path from "node:path";
 import { DEFAULT_FABRIC_CONFIG, normalizeFabricConfig } from "../src/config.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { placementRunIdForParticipant } from "../src/topology/placement-run-id.js";
+import { captureSandboxFinalAnswer, waitForSandboxFinalAnswer } from "../src/agents/completion-inbox.js";
+import { createSandboxFabricMesh } from "../src/transport/sandbox/fabric-mesh.js";
 import { buildSandboxIntent, DEFAULT_SANDBOX_PLACEMENT_URL, SandboxPlacementHttp, SandboxReadyTimeoutError, SandboxSpawnTimeoutError, SandboxTransport, SandboxUnsupportedError, type SandboxBinding, type SandboxMesh, type SandboxPlacement, type SandboxSpawnIntent, type SandboxSpawnResult, type SandboxTaskResult, type SandboxTerminalRecord, type SandboxTransportConfig } from "../src/transport/sandbox/index.js";
 
 const BASE_NOW = Date.parse("2026-02-01T00:00:00Z");
@@ -297,6 +299,56 @@ describe("sandbox agent transport", () => {
     expect(api.gets).toBe(1);
     expect(fallbacks).toEqual([RUN_ID]);
     expect(terminal.records.get(RUN_ID)?.state).toBe("finished");
+  });
+
+  it("binds NATS presence, delivers through control followUp, and awaits the run-scoped result", async () => {
+    const route = { machine: "island", ownerHostId: "runtime:child", ownerIdentityId: CHILD, ownerIncarnation: "incarnation-1", capabilities: ["followUp"], live: true };
+    const participant = { id: CHILD, kind: "root", placementRunId: RUN_ID, ownerHostId: route.ownerHostId,
+      ownerIdentityId: route.ownerIdentityId, ownerIncarnation: route.ownerIncarnation, interactive: true };
+    const view = { resolve: () => route, whenChanged: async () => {}, leaseLive: () => true };
+    const requests: unknown[][] = [];
+    const mesh = createSandboxFabricMesh({
+      transport: { kind: "nats" } as never,
+      participants: { get: () => participant, list: () => [participant] } as never,
+      participantView: view as never,
+      control: { request: async (...args: unknown[]) => { requests.push(args); return { queued: true }; } } as never,
+      canSend: () => true,
+    });
+    const child = await mesh.waitForPresence(RUN_ID, { timeoutMs: 5_000 });
+    await mesh.deliverTask(child.id, "actual task text");
+    expect(requests[0]?.slice(0, 3)).toEqual([route.ownerHostId, CHILD, "followUp"]);
+    expect(requests[0]?.[3]).toMatchObject({ ownerIncarnation: route.ownerIncarnation, message: "actual task text", triggerTurn: true });
+    const pending = mesh.awaitResult(child.id, RUN_ID, Date.now() + 10_000);
+    expect(captureSandboxFinalAnswer({ id: CHILD, kind: "main" }, "mesh", `FABRIC-RESULT ${RUN_ID}\nresult from the bound child`)).toBe(true);
+    await expect(pending).resolves.toMatchObject({ runId: RUN_ID, participantId: CHILD, text: "result from the bound child" });
+  });
+
+  it("refuses delivery if the run-bound child's owner incarnation changes", async () => {
+    let incarnation = "incarnation-1";
+    const participant = { id: CHILD, kind: "root", placementRunId: RUN_ID, ownerHostId: "runtime:child",
+      ownerIdentityId: CHILD, get ownerIncarnation() { return incarnation; }, interactive: true };
+    const mesh = createSandboxFabricMesh({
+      transport: { kind: "nats" } as never,
+      participants: { get: () => participant, list: () => [participant] } as never,
+      participantView: { resolve: () => ({ machine: "island", ownerHostId: "runtime:child", ownerIdentityId: CHILD,
+        get ownerIncarnation() { return incarnation; }, capabilities: ["followUp"], live: true }), whenChanged: async () => {}, leaseLive: () => true } as never,
+      control: { request: async () => ({ queued: true }) } as never,
+      canSend: () => true,
+    });
+    const child = await mesh.waitForPresence(RUN_ID, { timeoutMs: 5_000 });
+    incarnation = "incarnation-2";
+    await expect(mesh.deliverTask(child.id, "must not cross owner change")).rejects.toThrow(/owner changed/);
+  });
+
+  it("captures only a verified final answer from the exact child session", async () => {
+    const runId = "sandbox-result-capture-1";
+    const pending = waitForSandboxFinalAnswer(CHILD, runId, Date.now() + 10_000);
+    const text = `FABRIC-RESULT ${runId}\nexact return value`;
+    expect(captureSandboxFinalAnswer({ id: CHILD, kind: "main" }, undefined, text)).toBe(false);
+    expect(captureSandboxFinalAnswer({ id: "session:attacker", kind: "main" }, "mesh", text)).toBe(false);
+    expect(captureSandboxFinalAnswer({ id: CHILD, kind: "agent" }, "mesh", text)).toBe(false);
+    expect(captureSandboxFinalAnswer({ id: CHILD, kind: "main" }, "mesh", text)).toBe(true);
+    await expect(pending).resolves.toMatchObject({ runId, participantId: CHILD, status: "completed", text: "exact return value", exitCode: 0 });
   });
 
   it("does not retry profile for an unrelated Placement validation error", async () => {

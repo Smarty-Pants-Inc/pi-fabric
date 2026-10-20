@@ -549,7 +549,7 @@ const meshNatsReplicas = (value: unknown): number => {
 /** Messaging/rollback settings fail visibly in the same typed config-error family as E9. */
 export class FabricMeshNatsConfigError extends Error {
   readonly code = "FABRIC_MESH_TRANSPORT_CONFIG";
-  constructor(readonly field: "operatorMachine" | "rollbackHoldUntil" | "servers" | "custodyStream" | "livenessStream" | "pathBMachines" | "tls" | "allowInsecureLoopback" | "verifyMachine", requirement: string) {
+  constructor(readonly field: "operatorMachine" | "rollbackHoldUntil" | "servers" | "custodyStream" | "livenessStream" | "pathBMachines" | "org" | "tls" | "allowInsecureLoopback" | "verifyMachine", requirement: string) {
     super(`mesh.nats.${field} ${requirement}`);
     this.name = "FabricMeshNatsConfigError";
   }
@@ -565,6 +565,8 @@ export interface FabricMeshNatsConfig {
   livenessStream?: string;
   /** Explicit runtime inventory (1..64 unique, non-operator machine literals). */
   pathBMachines?: string[];
+  /** Optional org label for service-facing NATS clients. */
+  org?: string;
   /** Required trust anchor in NATS mode. Config never reads the CA or permits verification overrides. */
   tls?: { ca?: string; caFile?: string };
   /** Host credential file path, consumed only by the NATS adapter. */
@@ -584,6 +586,14 @@ const meshNatsString = (value: unknown, field: "credentials" | "machine"): strin
   if (typeof value !== "string") throw new Error(`mesh.nats.${field} must be a string`);
   if (field === "machine" && /^[a-z0-9][a-z0-9-]{0,31}$/.exec(value)?.[0] !== value) {
     throw new Error("mesh.nats.machine must match /^[a-z0-9][a-z0-9-]{0,31}$/");
+  }
+  return value;
+};
+
+const meshNatsOrg = (value: unknown): string | undefined => {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string" || !/^[a-z0-9][a-z0-9-]{0,62}$/.test(value) || value === "sys") {
+    throw new FabricMeshNatsConfigError("org", "must be a non-system org name");
   }
   return value;
 };
@@ -714,6 +724,7 @@ const meshNatsConfig = (value: unknown, transport: FabricMeshTransport): FabricM
   const tls = meshNatsTls(messaging.tls);
   const credentials = meshNatsString(messaging.credentials, "credentials");
   const machine = meshNatsString(messaging.machine, "machine");
+  const org = meshNatsOrg(messaging.org);
   const operatorMachine = validateFabricNatsOperatorMachine(messaging.operatorMachine, machine);
   const rollbackHoldUntil = meshNatsRollbackHoldUntil(messaging.rollbackHoldUntil);
   return {
@@ -721,6 +732,7 @@ const meshNatsConfig = (value: unknown, transport: FabricMeshTransport): FabricM
     servers, custodyStream, livenessStream, pathBMachines, tls,
     ...(credentials !== undefined ? { credentials } : {}),
     ...(machine !== undefined ? { machine } : {}),
+    ...(org !== undefined ? { org } : {}),
     operatorMachine,
     ...(rollbackHoldUntil !== undefined ? { rollbackHoldUntil } : {}),
     inboxLanes: boundedInteger(messaging.inboxLanes, 8, 1, Number.MAX_SAFE_INTEGER),

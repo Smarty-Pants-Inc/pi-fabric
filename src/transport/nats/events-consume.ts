@@ -12,6 +12,7 @@ import type { MeshEvent } from "../../mesh/event-log.js";
 import type { NatsConnectionHandle } from "./connection.js";
 import { ensureFabricEventsStream, natsEventsStreamName, natsGithubStreamName } from "./provision.js";
 import { hashToken } from "./subjects.js";
+import { TransportUnavailableError } from "../types.js";
 
 const CONSUMER_NOT_FOUND = 10014;
 const ACK_WAIT_NS = 60_000 * 1_000_000;
@@ -200,14 +201,19 @@ const startGroup = async (
     run.done = (async () => {
       try {
         for await (const message of messages) {
-          if (run.stopping || closing || !allowed.has(message.subject)) {
+          if (run.stopping || closing) {
+            if (connection.isVerified()) nakTransiently(message, retryDelayScheduleMs);
+            break;
+          }
+          if (!connection.isVerified()) continue; // Do not admit buffered deliveries while USER.INFO is pending.
+          if (!allowed.has(message.subject)) {
             nakTransiently(message, retryDelayScheduleMs);
-            if (run.stopping || closing) break;
             continue;
           }
           let acknowledged = false;
           const ack = async (): Promise<void> => {
             if (acknowledged) return;
+            if (!connection.isVerified()) throw new TransportUnavailableError("NATS event ACK is suspended until USER.INFO re-verifies");
             const confirmed = await message.ackAck();
             if (!confirmed) throw new Error("NATS actor event ACK was not confirmed");
             acknowledged = true;
@@ -223,7 +229,7 @@ const startGroup = async (
             if (disposition === "accepted") await ack();
             else if (!acknowledged) nakTransiently(message, retryDelayScheduleMs);
           } catch {
-            if (!acknowledged) nakTransiently(message, retryDelayScheduleMs);
+            if (!acknowledged && connection.isVerified()) nakTransiently(message, retryDelayScheduleMs);
             continue;
           }
         }

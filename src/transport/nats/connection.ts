@@ -1,7 +1,7 @@
 import { closeSync, constants as fsConstants, fstatSync, openSync, readFileSync } from "node:fs";
 import { Buffer } from "node:buffer";
 import { isIP } from "node:net";
-import { credsAuthenticator, type NatsConnection } from "@nats-io/nats-core";
+import { credsAuthenticator, type Msg, type NatsConnection, type Subscription } from "@nats-io/nats-core";
 import { jetstream, jetstreamManager, type JetStreamClient, type JetStreamManager } from "@nats-io/jetstream";
 import { AuthorizationError, PermissionViolationError, connect, type NodeConnectionOptions, type Status, type TlsOptions } from "@nats-io/transport-node";
 import { pathBMachines } from "../../mesh/nats-auth/mint.js";
@@ -17,7 +17,7 @@ export class NatsAuthorizationError extends Error {
 }
 
 export type NatsStatusListener = (status: Status) => void;
-export type SubscribeNatsStatus = (listener: NatsStatusListener) => () => void;
+export type SubscribeNatsStatus = ((listener: NatsStatusListener) => () => void) & { isVerified?: () => boolean };
 
 /** Expected #1276 Path B policy inputs. The same values the account scope was minted from. */
 export interface NatsPermissionPolicy {
@@ -60,8 +60,10 @@ export interface NatsConnectionHandle {
   readonly js: JetStreamClient;
   readonly manager: JetStreamManager;
   readonly userInfo?: unknown;
-  /** Native reconnect is disabled. Resolves a typed retryable error on loss; explicit close resolves void. */
+  /** Resolves a typed retryable error on hard loss or the terminal USER.INFO re-verification failure. */
   closed(): Promise<void | Error>;
+  /** False while native reconnect is in progress or USER.INFO is being re-verified. */
+  isVerified(): boolean;
   onStatus: SubscribeNatsStatus;
   close(): Promise<void>;
 }
@@ -344,15 +346,28 @@ const open = async (
   const security = transportSecurity(options);
   const auth = readNatsCredentials(options.credentials);
   prepare(auth);
+  let verified = false;
+  let initialVerificationComplete = false;
+  let reconnectAttempt = 0;
+  const reconnectDelayHandler = (): number => {
+    if (initialVerificationComplete) verified = false;
+    const base = Math.min(5_000, 500 * 2 ** Math.min(reconnectAttempt++, 4));
+    return base + Math.floor(Math.random() * 250);
+  };
   const nc = await connect({
     ...security,
     ...(options.name ? { name: options.name } : {}),
     timeout: timeoutMs,
-    // A new physical connection must pass USER.INFO before any JS/KV client is exposed.
-    // Native reconnect replays subscriptions/outbound frames before asynchronous status observers run.
-    // The transport owner must reopen through openNatsConnection and recreate its clients instead.
-    reconnect: false,
-    maxReconnectAttempts: 0,
+    // Native reconnect replays SUBs before `reconnect` status. The synchronous dial hook
+    // closes the app-send gate before replay; the guarded facade blocks PUB/REQ/SUB until
+    // USER.INFO passes. This client version has no reconnectBufSize option: prepare() resets
+    // its outbound DataBuffer before dial, so pre-disconnect PUBs are not replayed.
+    reconnect: true,
+    maxReconnectAttempts: -1,
+    reconnectTimeWait: 500,
+    reconnectJitter: 250,
+    reconnectJitterTLS: 250,
+    reconnectDelayHandler,
     authenticator: credsAuthenticator(auth.bytes),
     inboxPrefix: `_INBOX.${auth.subject}`,
   }).catch((cause: unknown) => {
@@ -368,36 +383,102 @@ const open = async (
     signal?.throwIfAborted();
     const userInfo = verify ? await verify(nc, timeoutMs, auth) : undefined;
     signal?.throwIfAborted();
-    const manager = await jetstreamManager(nc, { timeout: timeoutMs });
+    verified = true;
+    initialVerificationComplete = true;
+    reconnectAttempt = 0;
+    const gated = new Set<PropertyKey>([
+      "publish", "publishMessage", "respondMessage", "request", "requestMany", "subscribe", "flush", "drain",
+      Symbol.asyncDispose,
+    ]);
+    const guardedNc = new Proxy(nc, {
+      get(target, property) {
+        if (property === "isVerified") return () => verified;
+        const value = Reflect.get(target, property, target) as unknown;
+        if (typeof value !== "function") return value;
+        const bound = value.bind(target) as (...args: unknown[]) => unknown;
+        if (!gated.has(property)) return bound;
+        return (...args: unknown[]): unknown => {
+          if (!verified) throw new TransportUnavailableError("NATS USER.INFO re-verification is pending");
+          const result = bound(...args);
+          if (property === "subscribe") {
+            const subscription = result as Subscription & { callback?: (error: Error | null, message: Msg) => void };
+            const callback = subscription.callback;
+            if (typeof callback === "function") {
+              subscription.callback = (error, message) => {
+                // The native protocol replays subscriptions before the async `reconnect`
+                // status. Do not expose any replayed data until USER.INFO has re-verified.
+                // Errors still reach the consumer so it can close or fail its operation.
+                if (verified || error) callback.call(subscription, error, message);
+              };
+            }
+          }
+          return result;
+        };
+      },
+    });
+    const manager = await jetstreamManager(guardedNc, { timeout: timeoutMs });
     signal?.throwIfAborted();
-    const js = jetstream(nc, { timeout: timeoutMs });
+    const js = jetstream(guardedNc, { timeout: timeoutMs });
     const listeners = new Set<NatsStatusListener>();
     let closing = false;
-    const closed = nc.closed().then((cause) => {
+    let authFailure!: (error: NatsAuthorizationError) => void;
+    const authFailurePromise = new Promise<Error>((resolve) => { authFailure = resolve; });
+    const nativeClosed = nc.closed().then((cause) => {
       removeAbort();
-      return closing ? undefined : new TransportUnavailableError("NATS connection lost; reopen and reverify before use", { cause });
+      if (closing) return undefined;
+      if (cause) return connectionFailure(cause, "NATS connection lost; native reconnect ended");
+      return new TransportUnavailableError("NATS connection lost; native reconnect ended");
     });
-    const statusTask = (async () => {
+    const closed = Promise.race([nativeClosed, authFailurePromise]);
+    const notify = (status: Status): void => {
+      for (const listener of listeners) {
+        try { listener(status); } catch { /* One observer must not prevent shutdown. */ }
+      }
+    };
+    const onStatus: SubscribeNatsStatus = Object.assign(
+      (listener: NatsStatusListener) => { listeners.add(listener); return () => { listeners.delete(listener); }; },
+      { isVerified: () => verified },
+    );
+    let statusTask!: Promise<void>;
+    const close = (): Promise<void> => {
+      if (closing) return statusTask ?? Promise.resolve();
+      closing = true;
+      verified = false;
+      removeAbort();
+      const task = (async () => { await nc.close(); await statusTask; listeners.clear(); })();
+      return task;
+    };
+    statusTask = (async () => {
       for await (const status of nc.status()) {
-        for (const listener of listeners) {
-          try { listener(status); } catch { /* One observer must not prevent shutdown. */ }
+        if (status.type === "disconnect") verified = false;
+        if (status.type === "reconnect") {
+          try {
+            if (verify) await verify(nc, timeoutMs, auth);
+            if (nc.isClosed() || nc.isDraining()) throw new TransportUnavailableError("NATS closed during USER.INFO re-verification");
+            verified = true;
+            reconnectAttempt = 0;
+          } catch (cause) {
+            const error = cause instanceof NatsAuthorizationError ? cause :
+              new NatsAuthorizationError("NATS USER.INFO re-verification failed", { cause });
+            verified = false;
+            authFailure(error);
+            notify({ type: "close" });
+            void close().catch(() => undefined);
+            return;
+          }
         }
+        notify(status);
       }
     })();
     return {
-      nc,
+      nc: guardedNc,
       js,
       manager,
       ...(userInfo === undefined ? {} : { userInfo }),
       closed: () => closed,
-      onStatus: (listener) => { listeners.add(listener); return () => { listeners.delete(listener); }; },
-      close: async () => {
-        closing = true;
-        removeAbort();
-        await nc.close();
-        await statusTask;
-        listeners.clear();
-      },
+      isVerified: () => verified,
+      onStatus,
+      close,
     };
   } catch (error) {
     removeAbort();

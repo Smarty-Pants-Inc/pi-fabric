@@ -1,9 +1,10 @@
 import { createHash } from "node:crypto";
+import { performance } from "node:perf_hooks";
 import fs from "node:fs";
 import type { MeshIdentity, MeshStateEntry, MeshStore } from "../mesh/store.js";
 import { hostLeasePath, readHostLeaseCurrent, readHostLeases, removeHostLeaseIf, sameHostLeaseVersion, writeHostLease,
   TRANSPORT_HOST_LEASE_TTL_MS, type FabricHostLease } from "./host-leases.js";
-import { withHostLeaseLock, type HostLeaseMesh } from "./host-lease-lock.js";
+import { HostLeaseLockBusyError, withHostLeaseLock, type HostLeaseLockOptions, type HostLeaseMesh } from "./host-lease-lock.js";
 import { readParticipantFiles, removeParticipantFileIf, writeParticipantFileIf } from "./participant-files.js";
 import { leaseValue, presenceValue } from "./participant-view.js";
 import type { FabricKvHostLease, FabricParticipantRecord } from "./types.js";
@@ -11,6 +12,9 @@ import type { FabricTransport, TransportBucket, TransportKvEntry } from "../tran
 
 const PARTICIPANT_PREFIX = "topology/participants/";
 const MARKER = "natsProjection";
+const INITIAL_HOST_LEASE_LOCK_RETRY_MS = 10_000;
+const HOST_LEASE_LOCK_RETRY_BASE_MS = 10;
+const HOST_LEASE_LOCK_RETRY_MAX_MS = 250;
 const markerFor = (entry: TransportKvEntry<unknown>): NatsProjectionMarker => {
   const record = entry.value as Record<string, unknown>;
   const incarnation = typeof record.ownerIncarnation === "string" ? record.ownerIncarnation :
@@ -118,6 +122,7 @@ export class NatsLocalProjection {
   #started = false;
   #closed = false;
   #initialReadyResolved = false;
+  #initialLockRetryDeadline: number | undefined;
 
   constructor(readonly options: NatsLocalProjectionOptions) {
     if (options.transport.kind !== "nats") throw new TypeError("NATS local projection requires mesh.transport=nats");
@@ -232,6 +237,27 @@ export class NatsLocalProjection {
     });
   }
 
+  async #withHostLeaseLock<T>(file: string, operation: () => T, options: HostLeaseLockOptions = {}): Promise<T> {
+    let attempt = 0;
+    for (;;) {
+      if (!this.#closed) this.#abort.signal.throwIfAborted();
+      try {
+        return await withHostLeaseLock(this.options.mesh as unknown as HostLeaseMesh, file, operation,
+          { ...options, ...(this.#closed ? {} : { signal: this.#abort.signal }) });
+      } catch (error) {
+        if (this.#closed || this.#initialReadyResolved || !(error instanceof HostLeaseLockBusyError)) throw error;
+        const retryDeadline = this.#initialLockRetryDeadline ??= performance.now() + INITIAL_HOST_LEASE_LOCK_RETRY_MS;
+        const remaining = retryDeadline - performance.now();
+        if (remaining <= 0) throw error;
+        const backoff = Math.min(HOST_LEASE_LOCK_RETRY_MAX_MS,
+          HOST_LEASE_LOCK_RETRY_BASE_MS * 2 ** Math.min(attempt, 5));
+        const delay = Math.min(remaining, Math.floor(backoff * (0.5 + Math.random())));
+        attempt += 1;
+        await this.#waitBeforeRetry(delay);
+      }
+    }
+  }
+
   async #put(bucket: BucketKind, entry: TransportKvEntry<unknown>): Promise<void> {
     if (entry.machine !== this.options.transport.self.machine) return;
     const value = bucket === "presence" ? presenceValue(entry) : leaseValue(entry);
@@ -319,7 +345,7 @@ export class NatsLocalProjection {
       } catch { this.#leaseCache.delete(lease.id); }
     };
     let wrote = false;
-    await withHostLeaseLock(this.options.mesh as unknown as HostLeaseMesh, file, () => {
+    await this.#withHostLeaseLock(file, () => {
       this.#hostLeaseReconcileReads++;
       if (!this.options.leaseLive()) return;
       const current = readHostLeaseCurrent(this.options.mesh.root, lease.id);
@@ -418,7 +444,7 @@ export class NatsLocalProjection {
     if (!lease) { this.#hostLeaseIdsByKv.delete(key); return; }
     const file = hostLeasePath(this.options.mesh.root, hostId);
     let removed = false;
-    await withHostLeaseLock(this.options.mesh as unknown as HostLeaseMesh, file, () => {
+    await this.#withHostLeaseLock(file, () => {
       this.#hostLeaseReconcileReads++;
       const current = readHostLeaseCurrent(this.options.mesh.root, lease.id);
       const marker = this.#readHostMarker(lease.id);

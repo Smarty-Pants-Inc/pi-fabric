@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { readRunLogText } from "../src/run-log-source.js";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -26,13 +27,16 @@ describe("real worker tool-call stream guard", () => {
     const result = await manager.run({ task, thinking: "high", transport: "process" });
     const directory = path.join(root, result.id);
     const status = JSON.parse(fs.readFileSync(path.join(directory, "status.json"), "utf8"));
-    const events = fs.readFileSync(path.join(directory, "events.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    const events = readRunLogText(path.join(directory, "events.jsonl")).trim().split("\n").map(line => JSON.parse(line));
     const lifecycle = fs.readFileSync(path.join(directory, "lifecycle.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
     const evidenceDir = process.env.FABRIC_WHITESPACE_TEST_EVIDENCE_DIR;
     if (evidenceDir) {
       fs.mkdirSync(evidenceDir, { recursive: true });
       fs.writeFileSync(path.join(evidenceDir, task + "-result.json"), JSON.stringify(result, null, 2));
-      for (const file of ["status.json", "events.jsonl", "lifecycle.jsonl"]) fs.copyFileSync(path.join(directory, file), path.join(evidenceDir, task + "-" + file));
+      for (const file of ["status.json", "events.jsonl", "lifecycle.jsonl"]) {
+        if (file === "events.jsonl") fs.writeFileSync(path.join(evidenceDir, task + "-" + file), readRunLogText(path.join(directory, file)));
+        else fs.copyFileSync(path.join(directory, file), path.join(evidenceDir, task + "-" + file));
+      }
     }
     return { manager, result, status, events, lifecycle };
   };

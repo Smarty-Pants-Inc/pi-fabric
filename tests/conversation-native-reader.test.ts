@@ -480,8 +480,7 @@ describe("native conversation reader — paging and rollover", () => {
   });
 
   it.each([false, true])("reloads replacement coverage without old payload ghosts (follow=%s)", (follow) => {
-    const directory = fs.mkdtempSync(path.resolve(".native-replacement-"));
-    temporaryDirectories.push(directory);
+    const directory = makeWorkspace();
     const file = path.join(directory, "events.jsonl");
     const records = (prefix: string, padding: number) => Array.from({ length: 180 }, (_, index) => ({
       type: "message_end",
@@ -508,8 +507,7 @@ describe("native conversation reader — paging and rollover", () => {
   });
 
   it.each([false, true])("preserves loaded session pages but drops old run coverage on rollover (follow=%s)", (follow) => {
-    const directory = fs.mkdtempSync(path.resolve(".native-replacement-"));
-    temporaryDirectories.push(directory);
+    const directory = makeWorkspace();
     const session = writeSession(directory, [sessionHeader, ...Array.from({ length: 160 }, (_, index) => ({
       ...entryBase(`s${index}`, index ? `s${index - 1}` : null),
       type: "message", message: { role: "user", content: `session-${index}:${"s".repeat(4000)}`, timestamp: index },

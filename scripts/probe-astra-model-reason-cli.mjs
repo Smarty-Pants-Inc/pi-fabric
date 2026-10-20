@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import assert from 'node:assert/strict';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { RpcClient } from '@earendil-works/pi-coding-agent';
@@ -10,6 +10,7 @@ import { RpcClient } from '@earendil-works/pi-coding-agent';
 // Run after bun run build. Only inference is synthetic; CLI, extension and workers are real.
 const lane = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const candidate = path.resolve(process.argv[2] ?? 'dist/index.js');
+const { readRunLogText } = await import(new URL('./run-log-source.js', pathToFileURL(candidate)));
 const out = path.resolve(process.argv[3] ?? process.env.TASK_OUT ?? (() => { throw new Error('Supply a retained output directory'); })());
 fs.mkdirSync(out, { recursive: true });
 const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'astra-cli-'));
@@ -99,7 +100,7 @@ try {
     const spawned = lifecycle.find(event => event.kind === 'run.spawned' && event.data.runId === id);
     assert.ok(spawned, 'real run.spawned missing for ' + kind);
     assert.equal(spawned.data.payload.modelReason, reason);
-    const frames = fs.readFileSync(path.join(path.dirname(saved.file), 'events.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    const frames = readRunLogText(path.join(path.dirname(saved.file), 'events.jsonl')).trim().split('\n').map(line => JSON.parse(line));
     const state = frames.filter(frame => frame.type === 'response' && frame.command === 'get_state').at(-1);
     assert.ok(state, 'native Pi get_state missing for ' + kind);
     assert.equal(state.data.model.provider + '/' + state.data.model.id, record.model);

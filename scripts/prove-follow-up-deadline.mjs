@@ -3,10 +3,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 const [cli, scratch, out] = process.argv.slice(2);
 assert(cli && scratch && out, 'PI_CLI SCRATCH OUTPUT required');
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const { readRunLogText } = await import(pathToFileURL(path.join(root, 'dist/run-log-source.js')));
 fs.mkdirSync(scratch, { recursive: true }); fs.mkdirSync(out, { recursive: true });
 const transcript = path.join(out, 'native-proof.jsonl'); fs.writeFileSync(transcript, '');
 const record = value => fs.appendFileSync(transcript, JSON.stringify(value) + '\n');
@@ -151,7 +152,8 @@ try {
     await wait(()=>{try{return ['completed','failed','stopped'].includes(JSON.parse(fs.readFileSync(path.join(run,'status.json'))).status);}catch{return false;}});
     await guest(`return await agents.wait({id:${JSON.stringify(id)}});`);
     const after=await guest(`return await agents.status({id:${JSON.stringify(id)}});`);
-    for(const file of ["events.jsonl","status.json"]) fs.copyFileSync(path.join(run,file),path.join(out,"native-child-"+lane+"-"+file));
+    fs.writeFileSync(path.join(out,"native-child-"+lane+"-events.jsonl"),readRunLogText(path.join(run,"events.jsonl")));
+    fs.copyFileSync(path.join(run,"status.json"),path.join(out,"native-child-"+lane+"-status.json"));
     assert.equal(after.status,'completed',JSON.stringify(after));
     const session=fs.readFileSync(path.join(run,'session.jsonl'),'utf8').trim().split('\n').map(l=>JSON.parse(l));
     const delivered=session.filter(e=>e.type==='message'&&e.message?.role==='user'&&JSON.stringify(e.message.content).includes(marker));
@@ -185,7 +187,7 @@ try {
     }
     if(lane.startsWith('recovery')) {
       assert.equal(after.runnerSessionIds.length,1);
-      const log=fs.readFileSync(path.join(run,'events.jsonl'),'utf8').trim().split('\n').map(JSON.parse);
+      const log=readRunLogText(path.join(run,'events.jsonl')).trim().split('\n').map(JSON.parse);
       assert.equal(log.filter(e=>e.type==='fabric_provider_resume'&&e.phase==='starting').length,1);
       record({type:'same-session-recovery',lane,runnerSessionIds:after.runnerSessionIds,deliveryCount:delivered.length});
     }

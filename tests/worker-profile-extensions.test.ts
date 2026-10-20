@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { readRunLogText } from "../src/run-log-source.js";
 import os from "node:os";
 import path from "node:path";
 import http from "node:http";
@@ -68,7 +69,7 @@ const shim = (f: ReturnType<typeof fixture>, target: string) => {
   const file = f.file("pi-shell-shim", `#!/bin/sh\nexec ${shellQuote(process.execPath)} ${shellQuote(target)} "$@"\n`);
   fs.chmodSync(file, 0o700); return file;
 };
-const events = (file: string) => fs.readFileSync(file, "utf8").trim().split("\n").map(line => JSON.parse(line));
+const events = (file: string) => (path.basename(file) === "events.jsonl" ? readRunLogText(file) : fs.readFileSync(file, "utf8")).trim().split("\n").map(line => JSON.parse(line));
 const nativeEnabled = async (f: ReturnType<typeof fixture>) => {
   const settings = SettingsManager.create(f.root, f.profile, { projectTrusted: false });
   const native = await new DefaultPackageManager({ cwd: f.root, agentDir: f.profile, settingsManager: settings }).resolve(() => Promise.resolve("skip"));

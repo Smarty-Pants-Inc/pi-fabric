@@ -164,6 +164,41 @@ See the [interface & commands reference](docs/interface.md) for every view, keyb
 
 The managed-run retention sweep scans only immediate `pi-fabric-runs-*` children of the allocated data directory. A session-private temp directory therefore leaves abandoned roots unreachable by other sessions. For cross-session collection, the host launcher must export a stable, private file-data namespace **before Pi starts**, outside session-owned shell scratch. Share it only among sessions on the same physical host with the same stable PID namespace: retention uses local process-liveness evidence. Keep `TMPDIR` private, and do not share this data namespace across machines or isolated PID namespaces. This changes placement, not retention authority: dead-owner, orphan-grace, worker-exit and safe-tree checks still apply. It neither discovers older private parents nor adds recursive recovery of nested runs.
 
+### Terminal run logs and restore
+
+After a run's owner confirms that all writers have closed, Fabric may replace its
+`events.jsonl` with a lossless, checksummed `events.jsonl.zst`. The `logFile` field
+is a logical locator: use `agents.log` or the conversation/dashboard readers rather
+than opening that path directly. Mesh event logs and native session transcripts
+are not compressed by this feature. Compression and restore require runtime
+Zstd support; an unavailable compressor leaves plaintext intact and warns.
+Encoded and decoded logs are bounded at 128 MiB. Larger plaintext logs are left unchanged by compression; the owner logs
+the skipped byte size and cumulative oversized-skip count for its lifetime.
+Existing retention policies still apply to those plaintext logs. Arbitrary-size
+streaming compression, restore and bounded-memory paging are follow-up work.
+On supported POSIX systems, publication is atomic and no-replace: verified
+compressed bytes are published and file/directory fsynced before plaintext is
+retired. On Windows, compression leaves plaintext unchanged and does not create
+compressed artifacts or retire plaintext, even beside a matching existing `.zst`:
+Node's Windows API cannot durably sync directory metadata. This platform skip has
+reason `platform`; the codec warns once per process that compression is disabled
+on this platform. Windows can still read and additively restore checksummed
+`.zst` artifacts produced elsewhere; restore keeps the compressed source.
+The Windows compressor returns `platform` before any file access.
+Readers and restore still read `.zst` artifacts on Windows.
+
+To restore a retained run before using an older release, keep this release
+installed and run:
+
+```sh
+fabric-restore-run-log ./run/events.jsonl.zst
+fabric-restore-run-log --apply ./run/events.jsonl.zst
+```
+
+The first command verifies the artifact without writing. `--apply` restores the
+exact original bytes without removing the compressed copy or overwriting a
+different existing plaintext log. Restore each required artifact before downgrading.
+
 ## Reference
 
 - [Configuration](docs/configuration.md): `fabric.json`, code modes, tool capture, approvals, budgets, and [third-party model providers](docs/configuration.md#third-party-model-providers).

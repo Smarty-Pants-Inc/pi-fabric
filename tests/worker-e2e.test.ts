@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { readRunLogText } from "../src/run-log-source.js";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -283,8 +284,7 @@ if (process.argv.includes('--descendant')) {
       check: (r) => {
         expect(r.status).toBe("completed");
         expect(r.text).toBe("trusted");
-        const events = fs
-          .readFileSync(r.logFile!, "utf8")
+        const events = readRunLogText(r.logFile!)
           .trim()
           .split("\n")
           .map((line) => JSON.parse(line) as Record<string, unknown>);
@@ -400,7 +400,7 @@ if (process.argv.includes('--descendant')) {
     expect(result.error).toBeUndefined();
     expect(result.text).toBe("stream recovered");
     expect(result.toolCalls).toBe(0);
-    const events = fs.readFileSync(result.logFile!, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    const events = readRunLogText(result.logFile!).trim().split("\n").map((line) => JSON.parse(line));
     expect(events.filter((event) => event.type === "message_update")).toHaveLength(9);
     expect(events.some((event) => event.type === "fabric_recovery_error")).toBe(false);
   }, 90_000);
@@ -412,7 +412,7 @@ if (process.argv.includes('--descendant')) {
     expect(result.error).toBeUndefined();
     expect(result.text).toBe("silent reasoning recovered");
     expect(result.toolCalls).toBe(0);
-    const events = fs.readFileSync(result.logFile!, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    const events = readRunLogText(result.logFile!).trim().split("\n").map((line) => JSON.parse(line));
     expect(events.filter((event) => event.type === "message_start")).toEqual([
       { type: "message_start", message: { role: "assistant", content: [], stopReason: "stop" } },
     ]);
@@ -429,7 +429,7 @@ if (process.argv.includes('--descendant')) {
       expect(result.status).toBe("failed");
       expect(result.error).toContain("Error: Terminated");
       expect(result.error).toContain("no model stream or tool event for 60000ms");
-      const events = fs.readFileSync(result.logFile!, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+      const events = readRunLogText(result.logFile!).trim().split("\n").map((line) => JSON.parse(line));
       const pid = events.find((event) => event.type === "fake_child_pid").pid;
       expect(() => process.kill(pid, 0)).toThrow();
       expect(events.filter((event) => event.type === "fabric_recovery_error")).toHaveLength(1);
@@ -450,7 +450,7 @@ if (process.argv.includes('--descendant')) {
       expect(result.usage.output).toBe(retried ? 125 : 50);
       expect(result.toolCalls).toBe(1);
       expect(result.turns).toBe(1);
-      const log = fs.readFileSync(result.logFile!, "utf8");
+      const log = readRunLogText(result.logFile!);
       expect(log.length).toBeLessThan(10_000);
       const events = log.trim().split("\n").map((line) => JSON.parse(line));
       expect(events.find((event) => event.type === "turn_end")).toMatchObject({ toolResults: [], turnIndex: 1 });
@@ -484,7 +484,7 @@ if (process.argv.includes('--descendant')) {
     expect(result.status).toBe("completed");
     expect(result.text).toBe("image reviewed");
     expect(result.warnings).toBeUndefined();
-    const log = fs.readFileSync(result.logFile!, "utf8");
+    const log = readRunLogText(result.logFile!);
     expect(log.length).toBeLessThan(10_000);
     const events = log.trim().split("\n").map((line) => JSON.parse(line));
     const stub = { type: "image", elided: true, bytes: ((5 * 1024 * 1024 + 4) * 3) / 4, mimeType: "image/png" };
@@ -803,8 +803,7 @@ if (process.argv.includes('--descendant')) {
       attempts: 1,
       ...(error ? { error } : {}),
     });
-    const events = fs
-      .readFileSync(result.logFile!, "utf8")
+    const events = readRunLogText(result.logFile!)
       .trim()
       .split("\n")
       .map((line) => JSON.parse(line) as Record<string, unknown>);

@@ -25,7 +25,8 @@ import { isPrincipalDiagnostics, notifyDiagnostic } from "../core/diagnostics.js
 import { isActiveStatus, type FabricDashboardSnapshot, type FabricUiActor, type FabricUiAgent } from "./types.js";
 import { FabricWidget, isFabricWidgetStreaming, shouldShowFabricWidget } from "./widget.js";
 import { FabricWidgetRetention } from "./retention.js";
-import { AgentTranscriptReader, type FabricTranscriptSource } from "./transcript.js";
+import type { FabricTranscriptSource } from "./transcript.js";
+import type { AgentTranscriptReader } from "./transcript-reader.js";
 
 const WIDGET_ID = "pi-fabric";
 const ACTIVITY_REFRESH_MS = 100;
@@ -97,7 +98,7 @@ export class FabricUiController {
   #activityRunsDetailed = true;
   #activityRuns: FabricActivityRun[] = [];
   #activityView: ((detailed?: boolean) => FabricActivityRun[]) | undefined;
-  readonly #transcripts = new AgentTranscriptReader();
+  #transcripts: AgentTranscriptReader | undefined;
   readonly #conversationReaders = new Map<string, NativeConversationReader>();
   #activeConversationReader: string | undefined;
   #refreshGeneration = 0;
@@ -177,7 +178,7 @@ export class FabricUiController {
     this.#activityRunsDetailed = true;
     this.#activityRuns = [];
     this.#activityView = undefined;
-    this.#transcripts.clear();
+    this.#transcripts?.clear();
     for (const reader of this.#conversationReaders.values()) reader.clear();
     this.#conversationReaders.clear();
     this.#activeConversationReader = undefined;
@@ -448,9 +449,10 @@ export class FabricUiController {
     const epoch = this.#epoch;
     const current = (): boolean => epoch === this.#epoch;
     this.#refresh();
-    const [{ FabricDashboard }, { buildClaudeModelSource, buildModelSource }, { imageSafeCustom }] =
-      await Promise.all([import("./dashboard.js"), import("./model-picker.js"), import("./image-overlays.js")]);
+    const [{ FabricDashboard }, { buildClaudeModelSource, buildModelSource }, { imageSafeCustom }, { AgentTranscriptReader }] =
+      await Promise.all([import("./dashboard.js"), import("./model-picker.js"), import("./image-overlays.js"), import("./transcript-reader.js")]);
     if (!current()) return;
+    const transcripts = this.#transcripts ??= new AgentTranscriptReader();
     const modelSource = buildModelSource(context.modelRegistry, resolveAgentDir());
     let claudeModelSource: ModelSource | undefined;
     if (this.#snapshot.actors.some((actor) => actor.runner === "claude")) {
@@ -629,15 +631,15 @@ export class FabricUiController {
               done(undefined);
             },
             agentTranscript: (agent, followLatest) =>
-              this.#transcripts.read(this.#agentTranscriptSource(agent), followLatest),
+              transcripts.read(this.#agentTranscriptSource(agent), followLatest),
             actorTranscript: (actor, followLatest) =>
-              this.#transcripts.read(this.#actorTranscriptSource(actor), followLatest),
+              transcripts.read(this.#actorTranscriptSource(actor), followLatest),
             loadOlderTranscript: (target) =>
-              this.#transcripts.loadOlder(this.#transcriptSource(target)),
+              transcripts.loadOlder(this.#transcriptSource(target)),
             loadNewerTranscript: (target) =>
-              this.#transcripts.loadNewer(this.#transcriptSource(target)),
+              transcripts.loadNewer(this.#transcriptSource(target)),
             loadLatestTranscript: (target) =>
-              this.#transcripts.loadLatest(this.#transcriptSource(target)),
+              transcripts.loadLatest(this.#transcriptSource(target)),
             onActorModel,
             onActorThinking,
             onActorEvents,
@@ -799,6 +801,7 @@ export class FabricUiController {
       const directory = path.dirname(file);
       const names = directories.get(directory) ?? new Set<string>();
       names.add(path.basename(file));
+      if (path.basename(file) === "events.jsonl") names.add("events.jsonl.zst");
       directories.set(directory, names);
     }
     const epoch = this.#epoch;

@@ -60,6 +60,11 @@ const lazyEntryPoints = [
   "src/actors/slot-authority.ts",
   // Import-only per-materialization claim parsing, not idle registration work.
   "src/commands/slot-import.ts",
+  // Terminal log codecs, rollback and first-use transcript reading keep stable package-local paths.
+  "src/run-log-source.ts",
+  "src/ui/transcript-reader.ts",
+  "src/storage/run-log-compression.ts",
+  "src/storage/run-log-restore.ts",
   // First-use scratch removal: a stable entry keeps the shared verifier out of the startup graph.
   "src/storage/verified-remove.ts",
   // The resident's first operator cleanup reuses the offline final-check helper (smarty-dev#8090).

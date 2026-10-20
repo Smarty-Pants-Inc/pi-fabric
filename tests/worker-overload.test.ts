@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { readRunLogText } from "../src/run-log-source.js";
 import os from "node:os";
 import path from "node:path";
 import http from "node:http";
@@ -33,8 +34,8 @@ const until = async (ready: () => boolean): Promise<void> => {
     await new Promise(resolve => setTimeout(resolve, 20));
   }
 };
-const entries = (file: string): Array<Record<string, any>> => fs.existsSync(file)
-  ? fs.readFileSync(file, "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line)) : [];
+const entries = (file: string): Array<Record<string, any>> => fs.existsSync(file) || (path.basename(file) === "events.jsonl" && fs.existsSync(`${file}.zst`))
+  ? (path.basename(file) === "events.jsonl" ? readRunLogText(file) : fs.readFileSync(file, "utf8")).split("\n").filter(Boolean).map(line => JSON.parse(line)) : [];
 const events = (result: { logFile?: string }) => entries(result.logFile!);
 // Use the test's own timeout/abort, not a shorter startup+retry polling budget.
 // Watch the run directory so creating/replacing events.jsonl is observed too.
@@ -74,14 +75,14 @@ const waitForEvent = async (manager: Pick<AgentManager, "wait">, id: string, fil
     await closed;
   }
 };
-const explain = (result: AgentRunResult) => JSON.stringify(result) + "\n" + fs.readFileSync(result.logFile!, "utf8").slice(-16_000);
+const explain = (result: AgentRunResult) => JSON.stringify(result) + "\n" + readRunLogText(result.logFile!).slice(-16_000);
 const evidence = (name: string, result: AgentRunResult) => {
   const directory = process.env.FABRIC_OVERLOAD_TEST_EVIDENCE_DIR;
   if (!directory) return;
   fs.mkdirSync(directory, { recursive: true });
   fs.writeFileSync(path.join(directory, name + "-result.json"), JSON.stringify(result, null, 2));
   const run = path.dirname(result.logFile!);
-  for (const file of ["events.jsonl", "lifecycle.jsonl", "session.jsonl", "status.json"]) {
+  for (const file of ["events.jsonl", "events.jsonl.zst", "lifecycle.jsonl", "session.jsonl", "status.json"]) {
     if (fs.existsSync(path.join(run, file))) fs.copyFileSync(path.join(run, file), path.join(directory, name + "-" + file));
   }
 };

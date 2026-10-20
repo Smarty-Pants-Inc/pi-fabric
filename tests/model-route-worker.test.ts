@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { readRunLogText } from "../src/run-log-source.js";
 import { execFileSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
@@ -33,7 +34,7 @@ describe.skipIf(!fs.existsSync(workerPath))("shadow routing in real built worker
     }); managers.push(manager);
     const result = await manager.run({ task: "harmless lookup", model: pin.model, thinking: pin.effort,
       transport: "process", extensions: false, ...facts, ...(route ? { routeDecision: decision } : {}) });
-    const events = fs.readFileSync(path.join(root,"runs",result.id,"events.jsonl"),"utf8").trim().split("\n").map(line => JSON.parse(line));
+    const events = readRunLogText(path.join(root,"runs",result.id,"events.jsonl")).trim().split("\n").map(line => JSON.parse(line));
     const launch = events.find(event => event.type === "fake_route_launch");
     const rows = route ? fs.readFileSync(path.join(root,"agent/fabric/model-routing.jsonl"),"utf8").trim().split("\n").map(line => JSON.parse(line)) : [];
     const saved = JSON.parse(fs.readFileSync(path.join(root, "runs", result.id, "status.json"), "utf8"));

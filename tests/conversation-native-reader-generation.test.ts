@@ -23,9 +23,9 @@ const records = (kind: "session" | "events", generation: string, padding: number
     : { type: "message", id: `m${i}`, parentId: i ? `m${i - 1}` : null, timestamp: "2026-01-01T00:00:00.000Z", message: message(i, generation, padding) }),
 ];
 
-// Model genuine reuse independently of the host allocator: the real newly
-// opened descriptor supplies bytes/size/isFile, but its exact dev/ino are the
-// same across generations. Number-only callers also see collapsed Windows IDs.
+// Model genuine reuse independently of the host allocator: real path/descriptor
+// stats supply bytes/size/isFile, but both expose the same synthetic identity.
+// Number-only callers also see collapsed Windows IDs.
 const metadata = (current: () => { ino: bigint; birth: bigint; mtime: bigint }, classification = false) => {
   const project = <T extends fs.Stats | fs.BigIntStats>(stat: T, exact: boolean | undefined): T => {
     const value = current();
@@ -39,18 +39,20 @@ const metadata = (current: () => { ino: bigint; birth: bigint; mtime: bigint }, 
       return Reflect.get(target, key);
     } });
   };
+  const syntheticCaller = () => {
+    const stack = new Error().stack ?? "";
+    return stack.includes("openDescriptor") || (classification && stack.includes("classifyLog"));
+  };
   const real = fs.fstatSync.bind(fs);
   const descriptorStats = vi.spyOn(fs, "fstatSync").mockImplementation(((fd: number, options?: { bigint?: boolean }) => {
     const stat = options?.bigint ? real(fd, { bigint: true }) : real(fd);
-    return (new Error().stack ?? "").includes("openDescriptor") ? project(stat, options?.bigint) : stat;
+    return syntheticCaller() ? project(stat, options?.bigint) : stat;
   }) as typeof fs.fstatSync);
-  if (classification) {
-    const realPath = fs.lstatSync.bind(fs);
-    vi.spyOn(fs, "lstatSync").mockImplementation(((file: fs.PathLike, options?: { bigint?: boolean }) => {
-      const stat = options?.bigint ? realPath(file, { bigint: true }) : realPath(file);
-      return (new Error().stack ?? "").includes("classifyLog") ? project(stat, options?.bigint) : stat;
-    }) as typeof fs.lstatSync);
-  }
+  const realPath = fs.lstatSync.bind(fs);
+  vi.spyOn(fs, "lstatSync").mockImplementation(((file: fs.PathLike, options?: { bigint?: boolean }) => {
+    const stat = options?.bigint ? realPath(file, { bigint: true }) : realPath(file);
+    return syntheticCaller() ? project(stat, options?.bigint) : stat;
+  }) as typeof fs.lstatSync);
   return descriptorStats;
 };
 
@@ -257,6 +259,46 @@ describe("native reader descriptor generations", () => {
     expect(admitted.length).toBeGreaterThan(0);
     for (const fd of admitted) expect(() => real(fd)).toThrow();
     reader.clear();
+  });
+
+  it("preserves exact path and descriptor identities without O_NOFOLLOW", async () => {
+    // Recorded Windows boundary, not execution on Windows: keep real fixture
+    // bytes/open/read/close, but remove the platform's atomic no-follow flag.
+    vi.resetModules();
+    vi.doMock("node:fs", () => ({ default: new Proxy({}, { get(_target, key) {
+      return key === "constants" ? { ...fs.constants, O_NOFOLLOW: undefined } : Reflect.get(fs, key);
+    } }) }));
+    try {
+      await import("./fixtures/conversation-host.js");
+      const { NativeConversationReader: BoundaryReader } = await import("../src/ui/conversation-native-reader.js");
+      let ino = 15199648742414488n;
+      metadata(() => ({ ino, birth: 1000000n, mtime: 1000000n }), true);
+      for (const source of ["sessionFile", "eventsFile", "logFile"] as const) {
+        const kind = source === "sessionFile" ? "session" : "events";
+        const file = path.join(workspace(), source === "logFile" ? "log.jsonl" : `${kind}.jsonl`);
+        fs.writeFileSync(file, jsonl(records(kind, "old", 16, 1)));
+        const input = { id: "reader", status: "running", [source]: file };
+        const reader = new BoundaryReader();
+        const before = reader.read(input, false);
+        expect(before.error, source).toBeUndefined();
+        expect(before.messages).toEqual([message(0, "old", 16)]);
+        expect(Number(ino)).toBe(Number(ino + 1n));
+        const nextKind = source === "logFile" ? "session" : kind;
+        fs.writeFileSync(`${file}.new`, jsonl(records(nextKind, "new", 16, 1)));
+        fs.renameSync(`${file}.new`, file);
+        ino++;
+        const after = reader.read(input, false);
+        expect(after.error, source).toBeUndefined();
+        expect(after.messages).toEqual([message(0, "new", 16)]);
+        expect(after.sessionFile).toBe(nextKind === "session" ? file : undefined);
+        expect(after.eventsFile).toBe(nextKind === "events" ? file : undefined);
+        reader.clear();
+        ino = 15199648742414488n;
+      }
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
   });
 
   it.each([false, true])("rejects ambiguous reused-inode boundaries (suspended=%s)", (suspended) => {

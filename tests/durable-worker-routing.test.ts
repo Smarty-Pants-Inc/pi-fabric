@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { readRunLogText } from "../src/run-log-source.js";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -218,7 +219,7 @@ describe("real worker durable process protocol", () => {
     });
     managers.push(manager);
     const result = await manager.run({ task: "harmless", name: "fix-tests", runner, model: "openai-codex/gpt-5.6-sol", transport: "process", extensions: false });
-    const events = fs.readFileSync(path.join(root, "runs", result.id, "events.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    const events = readRunLogText(path.join(root, "runs", result.id, "events.jsonl")).trim().split("\n").map(line => JSON.parse(line));
     return { result, events, hook: path.join(fs.realpathSync(fixture), "guards", "sender-headers.js") };
   };
   const TASK_SENDER = { "X-Session-Id": "unmodified", "X-Smarty-Role": "task", "X-Smarty-Agent": "fix-tests", "X-Smarty-Spawner": "herdr-main-7" };

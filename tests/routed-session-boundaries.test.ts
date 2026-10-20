@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { readRunLogText } from "../src/run-log-source.js";
 import os from "node:os";
 import path from "node:path";
 import http from "node:http";
@@ -110,7 +111,7 @@ describe("R3 routed session boundaries", () => {
     try {
       const handle = await manager.spawn({ task: "Probe checkout with bash", routeDecision: await decision("route-offline/offline"), transport: "process", worktree: true, extensions: false, tools: ["bash"] }); child = handle.id;
       const result = await manager.wait(handle.id);
-      expect(result, JSON.stringify(result) + (result.logFile ? fs.readFileSync(result.logFile, "utf8").slice(-8000) : "")).toMatchObject({ status: "completed" });
+      expect(result, JSON.stringify(result) + (result.logFile ? readRunLogText(result.logFile).slice(-8000) : "")).toMatchObject({ status: "completed" });
       expect(requests).toHaveLength(2);
       expect(result.text).toContain("committed-worktree");
       // Native bash on Windows reports POSIX `pwd` (/tmp/..., /c/...); the same bash's `cygpath -w`

@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { readJsonlPage, readJsonlPageFromDescriptor } from "../src/log-tail.js";
@@ -6,9 +7,7 @@ import { compactTerminalRunLog } from "../src/worker/run-log.js";
 
 const roots: string[] = [];
 const logFile = (text: string): string => {
-  const scratch = path.resolve(".local");
-  fs.mkdirSync(scratch, { recursive: true });
-  const root = fs.mkdtempSync(path.join(scratch, "log-cursor-test-"));
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "log-cursor-test-"));
   roots.push(root);
   const file = path.join(root, "events.jsonl");
   fs.writeFileSync(file, text);

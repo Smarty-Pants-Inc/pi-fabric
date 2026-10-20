@@ -36,7 +36,7 @@ import { isRecoveredDurableStop } from "../agents/enodev-recovery.js";
 import type { ModelRouteDecision } from "../agents/model-route.js";
 import type { SpawnRouterAdmission } from "../agents/spawn-router.js";
 
-import { readJsonlPage } from "../log-tail.js";
+import { readJsonlPage, readRunLogPage } from "../log-tail.js";
 import { ActorChildCompletionStore, ActorChildCompletionWatch, ChildCompletionClaimLostError } from "./child-completions.js";
 import { pruneActorSessionBackups, recordMeshRetentionSweeper, startLockedMeshRetentionSweep } from "../storage/retention.js";
 import { spawn } from "node:child_process";
@@ -2771,7 +2771,11 @@ export class ActorManager {
           }
           const statusFile = path.join(runPath, "status.json");
           const eventsFile = path.join(runPath, "events.jsonl");
-          for (const file of [statusFile, eventsFile]) {
+          const compressedEventsFile = `${eventsFile}.zst`;
+          if (!fs.existsSync(eventsFile) && !fs.existsSync(compressedEventsFile)) {
+            throw new Error(`Run ${targetRunId} has no retained event log`);
+          }
+          for (const file of [statusFile, eventsFile, compressedEventsFile]) {
             if (fs.existsSync(file) && path.dirname(fs.realpathSync(file)) !== realRunPath) {
               throw new Error(`Run ${targetRunId} log file is outside retained run directory`);
             }
@@ -2783,7 +2787,7 @@ export class ActorManager {
             (statusRecord.actorId !== undefined && statusRecord.actorId !== actor.id)) {
             throw new Error(`Run ${targetRunId} does not belong to actor ${actor.id}`);
           }
-          const page = readJsonlPage(eventsFile, lines, opts.before, undefined, opts.beforeGeneration);
+          const page = readRunLogPage(eventsFile, lines, opts.before, undefined, opts.beforeGeneration);
           run = {
             runId: targetRunId,
             eventsFile,
@@ -6672,10 +6676,14 @@ export class ActorManager {
     if (!pending) this.#pendingRunArchives.set(actor.id, pending = new Set());
     pending.add(runId);
     const source = this.agents.runDirectory(runId) ?? this.agents.actorArchiveSources(actor.id, actor.sessionFile).get(runId);
-    await this.#logs.retainRun(actor, runId, source);
-    if (source) await this.agents.commitActorArchive(runId, actor.id, actor.sessionFile);
-    pending.delete(runId);
-    if (!pending.size) this.#pendingRunArchives.delete(actor.id);
+    try {
+      if (this.agents.runDirectory(runId)) await this.agents.finalizeRunLog(runId);
+      await this.#logs.retainRun(actor, runId, source);
+      if (source) await this.agents.commitActorArchive(runId, actor.id, actor.sessionFile);
+    } finally {
+      pending.delete(runId);
+      if (!pending.size) this.#pendingRunArchives.delete(actor.id);
+    }
   }
 
   /**

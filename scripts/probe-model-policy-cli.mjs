@@ -2,10 +2,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import assert from 'node:assert/strict';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { RpcClient } from '@earendil-works/pi-coding-agent';
 const lane = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const candidate = path.resolve(process.argv[2] ?? 'dist/index.js');
+const { readRunLogText } = await import(new URL('./run-log-source.js', pathToFileURL(candidate)));
 const out = path.resolve(process.argv[3] ?? process.env.TASK_OUT ?? (() => { throw new Error('Supply a retained output directory'); })());
 fs.mkdirSync(out, { recursive: true });
 const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'policy-cli-'));
@@ -68,12 +69,12 @@ try {
       for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
         const file = path.join(directory, entry.name);
         if (entry.isDirectory()) findLog(file);
-        else if (entry.name === 'events.jsonl' && path.basename(directory) === receipt.runId) logs.push(file);
+        else if (entry.name === 'status.json' && path.basename(directory) === receipt.runId) logs.push(path.join(directory, 'events.jsonl'));
       }
     };
     findLog(path.join(scratch, 'runs'));
     assert.equal(logs.length, 1, 'missing worker log for ' + receipt.runId);
-    const frames = fs.readFileSync(logs[0], 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    const frames = readRunLogText(logs[0]).trim().split('\n').map(line => JSON.parse(line));
     const state = frames.filter(frame => frame.type === 'response' && frame.command === 'get_state').at(-1);
     assert.equal(state.data.model.provider + '/' + state.data.model.id, receipt.model);
     assert.equal(state.data.thinkingLevel, receipt.thinking);

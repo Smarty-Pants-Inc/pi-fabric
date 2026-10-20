@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { readRunLogText } from "../src/run-log-source.js";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import os from "node:os";
@@ -54,7 +55,7 @@ describe("published Pi durable hosted adapter", () => {
     expect(result).toMatchObject({ status: "completed", transport: "hosted", text: "real durable answer" });
     expect(f.faux.state.callCount).toBe(1);
     expect(result.usage?.output).toBeGreaterThan(0);
-    expect(fs.readFileSync(path.join(manager.runDirectory(result.id)!, "events.jsonl"), "utf8")).toContain("real durable answer");
+    expect(readRunLogText(path.join(manager.runDirectory(result.id)!, "events.jsonl"))).toContain("real durable answer");
     const state = JSON.parse(fs.readFileSync(path.join(manager.runDirectory(result.id)!, "hosted.json"), "utf8"));
     expect(state.locator.runId).toBe(result.id);
     expect(state.context.idempotencyKey).toBe(result.id);

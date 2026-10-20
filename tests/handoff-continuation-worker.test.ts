@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { readRunLogText } from "../src/run-log-source.js";
 import os from "node:os";
 import path from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
@@ -63,7 +64,7 @@ describe.skipIf(!fs.existsSync(workerPath))("real trajectory executor continuati
       task: "Finish the implementation and verify it", model: "handoff-probe/executor", kernel: "typescript",
       recursive: true, extensions: true, transport: "process", sessionSeed: seed,
     });
-    const log = fs.readFileSync(path.join(directory, "runs", result.id, "events.jsonl"), "utf8");
+    const log = readRunLogText(path.join(directory, "runs", result.id, "events.jsonl"));
     expect(result, `${result.error}\n${result.stderr}\n${log.slice(-12_000)}`).toMatchObject({
       status: "completed", turns: 3, toolCalls: 2,
       text: "Finished original assignment directly after the failed handoff; verification passed.",

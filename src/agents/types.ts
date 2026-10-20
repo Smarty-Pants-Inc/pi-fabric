@@ -311,6 +311,7 @@ export interface AgentRunRecord {
   attachCommand?: string;
   branch?: string;
   worktree?: string;
+  /** Logical event-log locator; readers may select the adjacent compressed artifact. */
   logFile?: string;
   nestedAgents?: AgentRunRecord[];
   pendingMessages?: { steering: string[]; followUp: string[] };
@@ -319,7 +320,7 @@ export interface AgentRunRecord {
   compaction?: AgentCompactionStatus;
   /** Unconsumed outcome retained for its exact bound Main root/session. */
   completionDelivery?: { status: "undelivered"; addressedTo: string; redeliveredFrom?: string };
-  /** Terminal event-log optimization was skipped; the full original log remains. */
+  /** Terminal event-log optimization was skipped; retention still governs the unchanged plain log. */
   compactionSkipped?: string;
   /** Settlement diff summary of a worktree: true run; `worktree` stays the path. */
   worktreeResult?: AgentWorktreeResult;
@@ -429,6 +430,7 @@ export interface AgentWorkerOptions {
   imagesFile?: string;
   statusFile: string;
   lifecycleFile: string;
+  /** Logical event-log path; terminal readers may use the adjacent .zst artifact. */
   logFile: string;
   schemaFile?: string;
   /** Take the structured result from one fabric_reply tool call, not the final text (smarty-dev#967). */
@@ -622,6 +624,7 @@ export interface FabricLogLine {
 export interface FabricAgentLog {
   id: string;
   runDirectory: string;
+  /** Logical event-log path, retained even when the physical source is compressed. */
   logFile: string;
   status?: AgentRunRecord;
   events: FabricLogLine[];

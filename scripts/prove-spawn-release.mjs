@@ -7,9 +7,10 @@ import path from "node:path";
 import http from "node:http";
 import assert from "node:assert/strict";
 import { spawn, execFileSync } from "node:child_process";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const { readRunLogText } = await import(pathToFileURL(path.join(repo, "dist/run-log-source.js")));
 const out = process.env.TASK_OUT;
 assert(out, "TASK_OUT is required"); fs.mkdirSync(out, { recursive: true });
 const root = fs.mkdtempSync(path.join(process.env.TMPDIR ?? os.tmpdir(), "native-spawn-release-"));
@@ -115,7 +116,7 @@ try {
     else assert.equal(loaded.length, 0);
     fs.cpSync(run, path.join(out, "native-" + phase + "-run"), { recursive: true });
     // Native RPC redirects extension stdout to stderr before it owns stdout.
-    const printed = fs.readFileSync(value.result.logFile, "utf8").trim().split("\n").map(JSON.parse).flatMap(row => {
+    const printed = readRunLogText(value.result.logFile).trim().split("\n").map(JSON.parse).flatMap(row => {
       if (row.type === "release_origin") return [row];
       if (row.type !== "worker_stderr") return [];
       return row.text.trim().split("\n").flatMap(line => { try { const mark = JSON.parse(line); return mark.type === "release_origin" ? [mark] : []; } catch { return []; } });

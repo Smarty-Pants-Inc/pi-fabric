@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { readRunLogText } from "../src/run-log-source.js";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -35,7 +36,7 @@ describe.skipIf(!fs.existsSync(workerPath))("real worker model admission", () =>
     // The manager may win the overall deadline and return a synthetic result
     // without logFile. Inspect the durable log at its known run location either way.
     const logFile = path.join(directory, "runs", result.id, "events.jsonl");
-    const events = fs.readFileSync(logFile, "utf8").trim().split("\n").map(line => JSON.parse(line));
+    const events = readRunLogText(logFile).trim().split("\n").map(line => JSON.parse(line));
     const frames = events.filter(event => event.type === "fake_received").map(event => event.frame);
     return { manager, result, frames };
   };
@@ -102,7 +103,7 @@ describe.skipIf(!fs.existsSync(workerPath))("real worker model admission", () =>
       task: "probe model", model: "model-probe/requested", thinking: "high", extensions: true, transport: "process",
     })));
     for (const result of results) {
-      const log = fs.readFileSync(path.join(directory, "runs", result.id, "events.jsonl"), "utf8");
+      const log = readRunLogText(path.join(directory, "runs", result.id, "events.jsonl"));
       expect(result, `${result.error}\n${result.stderr}\n${log}`).toMatchObject({ status: "completed", model: "model-probe/requested", thinking: "high" });
       expect(result.text).toBe("model-probe/requested:high");
       expect(log).toContain("startup-hijacked:model-probe/mru");

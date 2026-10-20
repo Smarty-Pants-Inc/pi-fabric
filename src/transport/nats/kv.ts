@@ -2,13 +2,14 @@ import { Readable } from "node:stream";
 import {
   DeliverPolicy,
   JetStreamApiError,
+  JetStreamError,
   StorageType,
   type ConsumerMessages,
   type JetStreamClient,
   type JsMsg,
 } from "@nats-io/jetstream";
 import { Kvm, type KV, type KvEntry } from "@nats-io/kv";
-import { PermissionViolationError } from "@nats-io/transport-node";
+import { NoRespondersError, PermissionViolationError, RequestError, TimeoutError } from "@nats-io/transport-node";
 import { NATS_KV_FLOW_CONTROL_WARNING, type SubscribeNatsStatus } from "./connection.js";
 import type { TransportKv, TransportKvEntry, TransportKvEvent } from "../types.js";
 import { KvConflictError, TransportDeniedError, TransportInvalidError, TransportUnavailableError, TransportUncertainError } from "../types.js";
@@ -40,6 +41,40 @@ const apiCode = (error: unknown): number | undefined => error instanceof JetStre
 const isUnavailable = (error: unknown): boolean => typeof error === "object" && error !== null &&
   (error as { readonly code?: unknown }).code === "FABRIC_TRANSPORT_UNAVAILABLE";
 const abort = (signal?: AbortSignal): void => signal?.throwIfAborted();
+
+// Only recognized broker/request failures are transient. In particular, do not
+// unwrap arbitrary causes or retry auth, invalid consumer config, or bad KV data.
+const WATCH_NOT_READY = /^(?:no (?:jetstream )?meta leader|(?:jetstream )?cluster (?:is )?not ready|(?:stream|consumer) leader (?:is )?not (?:yet )?elected|consumer (?:is )?not (?:yet )?current)$/i;
+export const kvWatchRetryDelayMs = (attempt: number, jitter: number): number => {
+  const attemptIndex = Number.isSafeInteger(attempt) && attempt > 0 ? attempt - 1 : 0;
+  const base = Math.min(5_000, 250 * 2 ** Math.min(attemptIndex, 5));
+  const sample = Number.isFinite(jitter) ? Math.max(0, Math.min(1, jitter)) : 0.5;
+  return Math.round(Math.min(5_000, Math.max(250, base * (0.8 + sample * 0.4))));
+};
+
+export const kvWatchRetryCode = (error: unknown): string | undefined => {
+  for (let depth = 0; depth < 6 && error instanceof Error; depth++) {
+    if (error instanceof JetStreamApiError) {
+      const api = error.apiError();
+      if ([401, 403].includes(api.code) || [10039, 10076].includes(api.err_code)) return undefined;
+      if (api.code === 503 || api.code === 408 || [10008, 10009].includes(api.err_code) || WATCH_NOT_READY.test(api.description)) {
+        return Number.isSafeInteger(api.err_code) ? `JS_API_${api.err_code}` : `JS_STATUS_${api.code}`;
+      }
+      return undefined;
+    }
+    if (error instanceof TimeoutError) return "TIMEOUT";
+    if (error instanceof NoRespondersError) return "NO_RESPONDERS";
+    if (error instanceof JetStreamError && error.name === "JetStreamStatusError") {
+      const code = (error as JetStreamError & { readonly code?: number }).code;
+      return code === 503 || code === 408 ? `JS_STATUS_${code}` : undefined;
+    }
+    // The SDK wraps request no-responders in JetStreamNotEnabled, which is not
+    // publicly exported. The name alone is not enough: require a recognized cause.
+    if (!(error instanceof RequestError) && error.name !== "JetStreamNotEnabled") return undefined;
+    error = error.cause;
+  }
+  return undefined;
+};
 
 const validateMachine = (machine: string): string => {
   if (!MACHINE.test(machine)) throw new TransportInvalidError("invalid machine token");
@@ -216,7 +251,14 @@ export class NatsKvStore implements TransportKv {
     let invalidate: (() => void) | undefined;
     let endEpoch: (() => void) | undefined;
     let flowControlFailure: Error | undefined;
-    const stop = (): void => { releaseReconnect?.(); endEpoch?.(); };
+    let wakeRetry: (() => void) | undefined;
+    let retryAttempt = 0;
+    let retryDelay = 0;
+    let retryCode = "";
+    const diagnostic = (outcome: string, code = retryCode): void => {
+      console.warn(`[fabric:nats:kv-watch] ${JSON.stringify({ outcome, code, bucket: this.#policy.bucket, attempt: retryAttempt })}`);
+    };
+    const stop = (): void => { releaseReconnect?.(); wakeRetry?.(); endEpoch?.(); };
     const pauseUntilReconnect = (): void => {
       if (!disconnected) {
         disconnected = true;
@@ -232,17 +274,30 @@ export class NatsKvStore implements TransportKv {
       if (status.type === "reconnect" || status.type === "close") {
         disconnected = false;
         closed = status.type === "close";
-        if (closed) invalidate?.();
+        if (closed) { invalidate?.(); wakeRetry?.(); }
         releaseReconnect?.();
       }
       if (!flowControlFailure && status.type === "error" && status.error instanceof PermissionViolationError && status.error.operation === "publish" &&
         status.error.subject.startsWith(flowControlPrefix)) {
         flowControlFailure = new TransportDeniedError(NATS_KV_FLOW_CONTROL_WARNING, { cause: status.error });
+        wakeRetry?.();
         endEpoch?.();
       }
     });
     try {
       while (!signal.aborted && !closed) {
+        // Core reconnect is not a JetStream-readiness signal. Retry API failures
+        // independently, but keep the verified-connection gate and cancellation.
+        if (retryDelay > 0) {
+          await new Promise<void>((resolve) => {
+            const timer = setTimeout(resolve, retryDelay);
+            wakeRetry = () => { clearTimeout(timer); resolve(); };
+            if (signal.aborted || closed || flowControlFailure) wakeRetry();
+          });
+          wakeRetry = undefined;
+          retryDelay = 0;
+        }
+        if (flowControlFailure) throw flowControlFailure;
         if (disconnected) await reconnect;
         if (signal.aborted || closed) return;
         const queue = new Readable({ objectMode: true, read() {} });
@@ -353,10 +408,27 @@ export class NatsKvStore implements TransportKv {
               } else throw error;
             }
           }
-          for await (const event of queue) yield event as TransportKvEvent<V>;
+          for await (const event of queue) {
+            if ((event as TransportKvEvent<V>).type === "ready" && retryAttempt > 0) {
+              diagnostic("ready");
+              retryAttempt = 0;
+            }
+            yield event as TransportKvEvent<V>;
+          }
           if (flowControlFailure) failure = flowControlFailure;
           if (failure) throw failure;
           if (!reset) return;
+        } catch (error) {
+          if (signal.aborted || closed) return;
+          const code = kvWatchRetryCode(error);
+          if (!code || flowControlFailure) throw error;
+          // Discard any partial snapshot before starting a fresh ordered epoch.
+          // A failed setup may not have entered the queue drain at all.
+          if (!reset) { reset = true; end(); yield { type: "reset" }; }
+          retryCode = code;
+          retryAttempt++;
+          retryDelay = kvWatchRetryDelayMs(retryAttempt, Math.random());
+          diagnostic("retry");
         } finally {
           invalidate = undefined;
           endEpoch = undefined;
@@ -365,7 +437,11 @@ export class NatsKvStore implements TransportKv {
           queue.destroy();
         }
       }
+    } catch (error) {
+      if (retryAttempt > 0) { diagnostic("failed", "TERMINAL"); retryAttempt = 0; }
+      throw error;
     } finally {
+      if (retryAttempt > 0) diagnostic(signal.aborted ? "cancelled" : "closed");
       signal.removeEventListener("abort", stop);
       unsubscribe?.();
     }

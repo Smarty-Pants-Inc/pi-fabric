@@ -662,38 +662,97 @@ class NatsTransportImpl implements FabricTransport {
     if (this.#inboxActive) throw new TransportInvalidError("only one inbox iterator is allowed per transport");
     this.#inboxActive = true;
     const consumerPolicy = transportConsumerPolicy(this.#options);
+    const lifetime = AbortSignal.any([signal, this.#closeController.signal]);
+    let attempt = 0;
+    let recoveryCode = "FABRIC_NATS_INBOX_ENDED";
+    const diagnostic = (code: string, outcome: string): void => {
+      try { console.warn(`[pi-fabric] NATS inbox code=${code} host=${JSON.stringify(this.self.hostId)} durable=${JSON.stringify(consumerPolicy.durable)} stream=${JSON.stringify(this.#stream)} attempt=${attempt} outcome=${outcome}`); } catch {}
+    };
+    const terminalFailure = (error: unknown): boolean => {
+      let cause = error;
+      for (let depth = 0; cause && depth < 6; depth += 1) {
+        if (typeof cause !== "object") break;
+        const candidate = cause as { name?: string; code?: unknown; status?: unknown; message?: string; cause?: unknown };
+        if (["NatsAuthorizationError", "AuthorizationError", "PermissionViolationError", "UserAuthenticationExpiredError",
+          "InvalidArgumentError", "InvalidNameError", "InvalidSubjectError", "InvalidOperationError"].includes(candidate.name ?? "") ||
+          ["FABRIC_NATS_AUTHORIZATION", "FABRIC_TRANSPORT_DENIED", "FABRIC_TRANSPORT_INVALID", "FABRIC_TRANSPORT_UNSUPPORTED",
+            "AUTHORIZATION_VIOLATION", "PERMISSIONS_VIOLATION"].includes(String(candidate.code)) ||
+          [400, 401, 403].includes(Number(candidate.status)) || [400, 401, 403].includes(Number(candidate.code)) ||
+          /configuration mismatch|owner.*mismatch|permission|authorization|invalid (?:consumer|configuration|config)/i.test(candidate.message ?? "")) return true;
+        cause = candidate.cause;
+      }
+      return false;
+    };
     try {
-      while (!signal.aborted && !this.#closed) {
+      while (!lifetime.aborted) {
+        if (attempt > 0) {
+          const ceiling = Math.min(5_000, 250 * 2 ** Math.min(attempt - 1, 5));
+          const delay = Math.min(5_000, ceiling + Math.floor(Math.random() * Math.min(250, ceiling)));
+          diagnostic(recoveryCode, "retry");
+          try { await sleep(delay, undefined, { signal: lifetime }); }
+          catch { return; }
+        }
         let session: NatsSession;
-        try { session = await this.#waitForSession(signal); }
-        catch (error) { if (this.#closed) return; throw error; }
-        if (signal.aborted || this.#closed) return;
+        try { session = await this.#waitForSession(lifetime); }
+        catch (error) { if (lifetime.aborted) return; throw error; }
+        if (lifetime.aborted) return;
         const controller = new AbortController();
         const queue = new Readable({ objectMode: true, read() {} });
         let messages: ConsumerMessages | undefined;
+        let statusTask: Promise<void> | undefined;
         const end = (): void => { if (!queue.destroyed && !queue.readableEnded) queue.push(null); };
-        const stop = (): void => { end(); void messages?.close(); };
+        const stop = (): void => { end(); void messages?.close().catch(() => undefined); };
+        const assertCurrent = (): void => {
+          if (lifetime.aborted || controller.signal.aborted || this.#session !== session || !session.connection.isVerified()) {
+            throw new TransportUnavailableError("NATS inbox setup was suspended");
+          }
+        };
         this.#activeInbox = { controller, queue };
         signal.addEventListener("abort", stop, { once: true });
         this.#closeController.signal.addEventListener("abort", stop, { once: true });
         controller.signal.addEventListener("abort", stop, { once: true });
         try {
           try {
+          assertCurrent();
           const info = await ensureTransportConsumer(session.manager.consumers, consumerPolicy);
+          assertCurrent();
           if (info.config.filter_subject !== consumerPolicy.filterSubject || info.config.description !== consumerPolicy.description) {
             throw new TransportInvalidError("transport inbox owner/filter mismatch");
           }
           const consumer = await session.js.consumers.get(this.#stream, consumerPolicy.durable);
+          assertCurrent();
           messages = await consumer.consume({ max_messages: 16, callback: (msg) => {
             if (!session.connection.isVerified()) return; // Native reconnect may replay SUBs before USER.INFO.
             if (!signal.aborted && !controller.signal.aborted && !this.#closed && this.#session === session && !queue.destroyed) queue.push(msg);
           } });
           this.#activeInbox = { controller, messages, queue };
-          void messages.closed().then((error) => { if (error) queue.destroy(error); else end(); });
+          assertCurrent();
+          recoveryCode = "FABRIC_NATS_INBOX_ENDED";
+          const fail = (error: unknown): void => {
+            if (!lifetime.aborted && !controller.signal.aborted && !queue.destroyed) {
+              queue.destroy(error instanceof Error ? error : new TransportUnavailableError("NATS inbox consumer failed"));
+            }
+          };
+          void messages.closed().then((error) => { if (error) fail(error); else end(); }, fail);
+          // These informational events can otherwise leave a callback consumer waiting
+          // forever for a deleted durable. Close it and re-verify ownership before reuse.
+          statusTask = (async () => {
+            for await (const status of messages!.status()) {
+              if (lifetime.aborted || controller.signal.aborted) return;
+              if (["heartbeats_missed", "consumer_deleted", "consumer_not_found", "stream_not_found", "reset",
+                "ordered_consumer_recreated", "no_responders"].includes(status.type)) {
+                recoveryCode = `FABRIC_NATS_INBOX_${status.type.toUpperCase()}`;
+                controller.abort();
+                return;
+              }
+            }
+          })().catch(fail);
+          if (attempt > 0) diagnostic("FABRIC_NATS_INBOX_READY", "recovered");
           try {
             for await (const msg of queue as AsyncIterable<JsMsg>) {
               if (signal.aborted || controller.signal.aborted || this.#closed || this.#session !== session) break;
               if (!session.connection.isVerified()) { controller.abort(); break; }
+              attempt = 0;
               let decoded;
               try { decoded = this.#decode(msg); }
               catch { await msg.term("malformed transport envelope"); continue; }
@@ -730,24 +789,30 @@ class NatsTransportImpl implements FabricTransport {
               yield delivery;
             }
           } catch (error) {
-            if (!controller.signal.aborted && !signal.aborted) throw error;
+            if (!lifetime.aborted) throw error;
           }
           } catch (error) {
-            if (this.#closed) return;
-            if (!controller.signal.aborted && (session.connection.nc.isClosed() || session.connection.nc.isDraining())) this.#loseSession(session);
-            if (!(controller.signal.aborted && !signal.aborted && !this.#closed && this.#session !== session)) throw error;
+            if (lifetime.aborted) return;
+            if (terminalFailure(error)) {
+              diagnostic("FABRIC_NATS_INBOX_TERMINAL", "stopped");
+              // The control plane must retain terminal pauses, but not transient
+              // JetStream setup/consume failures or ordinary iterator completion.
+              throw new TransportInvalidError("NATS inbox authorization, ownership or configuration rejected", { cause: error });
+            }
+            recoveryCode = "FABRIC_NATS_INBOX_TRANSIENT";
+            if (session.connection.nc.isClosed() || session.connection.nc.isDraining()) this.#loseSession(session);
           }
         } finally {
           signal.removeEventListener("abort", stop);
           this.#closeController.signal.removeEventListener("abort", stop);
           controller.signal.removeEventListener("abort", stop);
-          if (messages) await messages.close();
+          if (messages) await messages.close().catch(() => undefined);
+          await statusTask;
           queue.destroy();
           if (this.#activeInbox?.controller === controller) this.#activeInbox = undefined;
         }
-        if (!signal.aborted && !this.#closed && this.#session !== session) continue;
-        if (!signal.aborted && !this.#closed && controller.signal.aborted) continue;
-        return;
+        if (lifetime.aborted) return;
+        attempt += 1;
       }
     } finally {
       this.#inboxActive = false;

@@ -39,8 +39,12 @@ export interface NatsActorEventsConsumer {
 }
 
 const apiCode = (error: unknown): number | undefined => {
-  if (!(error instanceof JetStreamApiError)) return undefined;
-  try { return error.apiError().err_code; } catch { return error.code; }
+  let current = error;
+  for (let depth = 0; depth < 4 && current instanceof Error; depth += 1, current = current.cause) {
+    if (!(current instanceof JetStreamApiError)) continue;
+    try { return current.apiError().err_code; } catch { return current.code; }
+  }
+  return undefined;
 };
 
 const validTopic = (topic: string): boolean => typeof topic === "string" &&
@@ -110,6 +114,20 @@ const startGroup = async (
   const stream = kind === "ev" ? natsEventsStreamName(options.org) : natsGithubStreamName(options.org);
   const durable = `${kind}_${hashToken(options.actorId)}`;
   const api = connection.manager.consumers;
+  const call = async <T>(op: string, operation: () => Promise<T>): Promise<T> => {
+    const started = performance.now();
+    try { return await operation(); }
+    catch (cause) {
+      const error = cause instanceof Error ? cause : new Error(String(cause));
+      const fields = error as Error & { code?: unknown; api?: { err_code?: unknown; description?: unknown } };
+      let apiError: { err_code?: unknown; description?: unknown } | undefined;
+      try { apiError = (error as Error & { apiError?: () => { err_code?: unknown; description?: unknown } }).apiError?.(); } catch { /* preserve the original failure */ }
+      const code = fields.code ?? "";
+      const errCode = fields.api?.err_code ?? apiError?.err_code ?? "";
+      const description = fields.api?.description ?? apiError?.description ?? error.message;
+      throw new Error(`${op} ${stream}/${durable} actor=${durable} failed after ${Math.round(performance.now() - started)}ms: ${error.name} ${code} ${errCode} ${String(description)}`, { cause });
+    }
+  };
   const mutableConfig = (filters: string[]) => ({
     filter_subject: "",
     filter_subjects: filters,
@@ -129,30 +147,30 @@ const startGroup = async (
 
   let info: ConsumerInfo;
   let created = false;
-  try { info = await api.info(stream, durable); }
+  try { info = await call("info", () => api.info(stream, durable)); }
   catch (error) {
     const code = apiCode(error);
     if (subjects.length === 0 && (code === CONSUMER_NOT_FOUND || code === 10059)) return undefined;
     if (code !== CONSUMER_NOT_FOUND) throw error;
     const startTime = options.eventsStartAt === undefined ? undefined : new Date(options.eventsStartAt).toISOString();
     try {
-      info = await api.add(stream, {
+      info = await call("add", () => api.add(stream, {
         ...mutableConfig(subjects),
         durable_name: durable,
         ack_policy: AckPolicy.Explicit,
         replay_policy: ReplayPolicy.Instant,
         deliver_policy: startTime === undefined ? DeliverPolicy.All : DeliverPolicy.StartTime,
         ...(startTime === undefined ? {} : { opt_start_time: startTime }),
-      });
+      }));
       created = true;
     } catch (createError) {
       // A concurrent opener may have created this actor's durable. Never recreate/reset its cursor.
-      try { info = await api.info(stream, durable); }
+      try { info = await call("info", () => api.info(stream, durable)); }
       catch { throw createError; }
     }
   }
   assertCompatible(info);
-  if (!created && subjects.length > 0) await api.update(stream, durable, mutableConfig(subjects));
+  if (!created && subjects.length > 0) await call("update", () => api.update(stream, durable, mutableConfig(subjects)));
 
   let active: DeliveryRun | undefined;
   let failure: Error | undefined;
@@ -167,9 +185,9 @@ const startGroup = async (
   };
   const startDelivery = async (): Promise<void> => {
     if (subjects.length === 0 || closing) return;
-    const consumer = await connection.js.consumers.get(stream, durable);
+    const consumer = await call("consumers.get", () => connection.js.consumers.get(stream, durable));
     // The connection's inboxPrefix (`_INBOX.<user pubkey>`) is honored by consumer.consume's request/reply path.
-    const messages = await consumer.consume({ max_messages: 1, abort_on_missing_resource: true });
+    const messages = await call("consume", () => consumer.consume({ max_messages: 1, abort_on_missing_resource: true }));
     const allowed = new Set(subjects);
     const run: DeliveryRun = { messages, stopping: false, done: Promise.resolve() };
     active = run;
@@ -236,7 +254,7 @@ const startGroup = async (
         if (closing) throw new Error("NATS actor events consumer is closed");
         if (failure) throw failure;
         await stopDelivery();
-        if (captured.length > 0) await api.update(stream, durable, mutableConfig(captured));
+        if (captured.length > 0) await call("update", () => api.update(stream, durable, mutableConfig(captured)));
         subjects = captured;
         await startDelivery();
       });

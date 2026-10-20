@@ -550,10 +550,22 @@ const meshNatsReplicas = (value: unknown): number => {
   throw new Error("mesh.nats.replicas must be a positive integer");
 };
 
+const meshNatsEphemeralHost = (value: unknown): boolean => {
+  if (value === undefined) return false;
+  if (typeof value === "boolean") return value;
+  throw new FabricMeshNatsConfigError("ephemeralHost", "must be a boolean");
+};
+
+const meshNatsEphemeralInactiveSeconds = (value: unknown): number => {
+  if (value === undefined) return 3_600;
+  if (typeof value === "number" && Number.isSafeInteger(value) && value >= 300 && value <= 86_400) return value;
+  throw new FabricMeshNatsConfigError("ephemeralInactiveSeconds", "must be an integer from 300 through 86400");
+};
+
 /** Messaging/rollback settings fail visibly in the same typed config-error family as E9. */
 export class FabricMeshNatsConfigError extends Error {
   readonly code = "FABRIC_MESH_TRANSPORT_CONFIG";
-  constructor(readonly field: "operatorMachine" | "rollbackHoldUntil" | "servers" | "custodyStream" | "livenessStream" | "pathBMachines" | "tls" | "allowInsecureLoopback" | "verifyMachine", requirement: string) {
+  constructor(readonly field: "operatorMachine" | "rollbackHoldUntil" | "servers" | "custodyStream" | "livenessStream" | "pathBMachines" | "tls" | "allowInsecureLoopback" | "verifyMachine" | "ephemeralHost" | "ephemeralInactiveSeconds", requirement: string) {
     super(`mesh.nats.${field} ${requirement}`);
     this.name = "FabricMeshNatsConfigError";
   }
@@ -581,6 +593,10 @@ export interface FabricMeshNatsConfig {
   rollbackHoldUntil?: string;
   /** Parallel inbox lanes; normalized configs supply 8, with a minimum of 1. */
   inboxLanes?: number;
+  /** Host-only: allow server-side expiration and clean-shutdown deletion of this host's inbox durable (default false). */
+  ephemeralHost?: boolean;
+  /** Server-side durable idle expiration in seconds when ephemeralHost is enabled (300..86400, default 3600). */
+  ephemeralInactiveSeconds?: number;
 }
 
 const meshNatsString = (value: unknown, field: "credentials" | "machine"): string | undefined => {
@@ -685,12 +701,14 @@ const meshNatsServers = (value: unknown): string[] => {
 const meshNatsConfig = (value: unknown, transport: FabricMeshTransport): FabricMeshNatsConfig => {
   const nats = objectValue(value);
   // FILE ignores messaging settings and inherited snapshots. Only the existing machine and hold
-  // remain rollback authority; no machine means the exact old default shape. Invalid authority refuses.
+  // remain rollback authority. Invalid authority refuses.
   if (transport === "file") {
     const machine = meshNatsString(nats.machine, "machine");
     const rollbackHoldUntil = meshNatsRollbackHoldUntil(nats.rollbackHoldUntil);
     return {
       replicas: meshNatsReplicas(nats.replicas), inboxLanes: 8,
+      ephemeralHost: meshNatsEphemeralHost(nats.ephemeralHost),
+      ephemeralInactiveSeconds: meshNatsEphemeralInactiveSeconds(nats.ephemeralInactiveSeconds),
       ...(machine !== undefined ? { machine } : {}),
       ...(rollbackHoldUntil !== undefined ? { rollbackHoldUntil } : {}),
     };
@@ -716,6 +734,8 @@ const meshNatsConfig = (value: unknown, transport: FabricMeshTransport): FabricM
   }
   const pathBMachines = meshNatsPathBMachines(messaging.pathBMachines);
   const tls = meshNatsTls(messaging.tls);
+  const ephemeralHost = meshNatsEphemeralHost(messaging.ephemeralHost);
+  const ephemeralInactiveSeconds = meshNatsEphemeralInactiveSeconds(messaging.ephemeralInactiveSeconds);
   const credentials = meshNatsString(messaging.credentials, "credentials");
   const machine = meshNatsString(messaging.machine, "machine");
   const operatorMachine = validateFabricNatsOperatorMachine(messaging.operatorMachine, machine);
@@ -728,6 +748,8 @@ const meshNatsConfig = (value: unknown, transport: FabricMeshTransport): FabricM
     operatorMachine,
     ...(rollbackHoldUntil !== undefined ? { rollbackHoldUntil } : {}),
     inboxLanes: boundedInteger(messaging.inboxLanes, 8, 1, Number.MAX_SAFE_INTEGER),
+    ephemeralHost,
+    ephemeralInactiveSeconds,
   };
 };
 
@@ -1088,7 +1110,7 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     lockProtocol: 1,
     stateBackend: "file",
     transport: "file",
-    nats: { replicas: 1, inboxLanes: 8 },
+    nats: { replicas: 1, inboxLanes: 8, ephemeralHost: false, ephemeralInactiveSeconds: 3_600 },
     enabled: true,
     announce: false,
     actorScope: "project",
@@ -2504,6 +2526,10 @@ const resolveFabricConfig = (
       const mesh = { ...objectValue(document.mesh) };
       delete mesh.controlIncarnationFence; // Host-only: a workspace cannot weaken the fence.
       delete mesh.hostTransport; // A workspace cannot replace or clear the host's rollout stamp.
+      const nats = { ...objectValue(mesh.nats) };
+      delete nats.ephemeralHost; // Host-only: a workspace cannot retain its own inbox durable.
+      delete nats.ephemeralInactiveSeconds;
+      mesh.nats = nats;
       document.mesh = mesh;
       const executor = { ...objectValue(document.executor) };
       const landlock = { ...objectValue(executor.landlock) };

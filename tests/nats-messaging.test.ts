@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { AckPolicy, DeliverPolicy, ReplayPolicy } from "@nats-io/jetstream";
+import { AckPolicy, DeliverPolicy, ReplayPolicy, type ConsumerAPI, type ConsumerInfo } from "@nats-io/jetstream";
 import { openNatsConnection } from "../src/transport/nats/connection.js";
 import {
   LEASE_TTL_MS,
@@ -11,6 +11,7 @@ import { consumeDeadLetters, type DeadLetterEnvelope } from "../src/transport/na
 import { runTransportAdmin } from "../src/transport/nats/admin.js";
 import { createPathBHarness, openJetStream, PATH_B_MACHINES, resolveNatsBinary, type PathBHarness } from "./helpers/nats-cluster.js";
 import { ensureTransportConsumer } from "../src/transport/nats/provision.js";
+import { normalizeFabricConfig } from "../src/config.js";
 import {
   transportAdvisoryStreamSubject,
   transportDurableName,
@@ -21,6 +22,57 @@ import {
 const binary = resolveNatsBinary() ?? "";
 if (!binary && process.env.NATS_AUTH_REQUIRED === "1") throw new Error("NATS_AUTH_REQUIRED=1 but no nats-server executable was found");
 const wait = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+const bounded = async <T>(promise: Promise<T>, label: string, timeoutMs = 5_000): Promise<T> => {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([promise, new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
+    })]);
+  } finally { if (timer) clearTimeout(timer); }
+};
+
+const consumerInfo = (inactiveThreshold?: number): ConsumerInfo => ({
+  config: {
+    durable_name: "policy-test",
+    description: "policy test",
+    filter_subject: "fabric.in.machine-a.policy-test",
+    ack_policy: AckPolicy.Explicit,
+    deliver_policy: DeliverPolicy.All,
+    replay_policy: ReplayPolicy.Instant,
+    ack_wait: 30_000_000_000,
+    max_deliver: 5,
+    backoff: Array.from({ length: 5 }, () => 30_000_000_000),
+    max_ack_pending: 128,
+    max_waiting: 1,
+    ...(inactiveThreshold === undefined ? {} : { inactive_threshold: inactiveThreshold }),
+  },
+} as unknown as ConsumerInfo);
+
+const consumerApi = (info: ConsumerInfo): ConsumerAPI => ({
+  info: async () => info,
+} as unknown as ConsumerAPI);
+
+describe("inbox consumer inactive-threshold policy", () => {
+  const basePolicy = {
+    stream: "FABRIC_IN_machine-a",
+    durable: "policy-test",
+    filterSubject: "fabric.in.machine-a.policy-test",
+    description: "policy test",
+    maxAckPending: 128,
+  };
+
+  it("accepts the configured ephemeral threshold and still refuses it for normal hosts", async () => {
+    const thresholdNs = 300 * 1_000_000_000;
+    await expect(ensureTransportConsumer(consumerApi(consumerInfo(thresholdNs)), {
+      ...basePolicy, inactiveThresholdNs: thresholdNs,
+    })).resolves.toMatchObject({ config: { inactive_threshold: thresholdNs } });
+    await expect(ensureTransportConsumer(consumerApi(consumerInfo(thresholdNs)), basePolicy))
+      .rejects.toThrow("NATS consumer configuration mismatch: policy-test");
+    await expect(ensureTransportConsumer(consumerApi(consumerInfo(0)), basePolicy))
+      .resolves.toMatchObject({ config: { inactive_threshold: 0 } });
+  });
+});
 
 // Formerly an anonymous server with verifyMachine:false; now the scoped Path B fixture with real agent
 // credentials, exact policy and the test-only loopback opt-in. Fixture-only bootstrap inspects config.
@@ -98,6 +150,68 @@ describe.skipIf(!binary)("real nats-server Path B module", () => {
       expect(await transport.drainState()).toEqual({ pending: 0, ackPending: 0 });
     } finally {
       await inspector.close();
+    }
+  }, 30_000);
+
+  it("sets server-side idle expiry for an ephemeral host and deletes its durable on clean close", async () => {
+    const runtime = shared.runtimeOptions(shared.users.machineA);
+    vi.stubEnv("PI_FABRIC_MESH_TRANSPORT", "nats");
+    vi.stubEnv("PI_FABRIC_MESH_HOST_TRANSPORT", "nats");
+    vi.stubEnv("PI_FABRIC_MESH_NATS", JSON.stringify({
+      ...runtime,
+      operatorMachine: "fabric-ops",
+      ephemeralHost: true,
+      ephemeralInactiveSeconds: 300,
+    }));
+    const hostId = "runtime-ephemeral-clean-exit";
+    const durable = transportDurableName(hostId);
+    let transport: Awaited<ReturnType<typeof openNatsTransport>> | undefined;
+    let inspector: Awaited<ReturnType<typeof shared.connect>> | undefined;
+    try {
+      const config = normalizeFabricConfig({}).mesh;
+      transport = await openNatsTransport({ config, hostId, mesh: {} as never });
+      transports.push(transport);
+      inspector = await shared.connect(shared.users.bootstrap);
+      const admin = await openJetStream(inspector);
+      const info = await admin.manager.consumers.info(transportInboxStream("machine-a"), durable);
+      expect(info.config.inactive_threshold).toBe(300 * 1_000_000_000);
+
+      const inboxAbort = new AbortController();
+      const inboxIterator = transport.inbox(inboxAbort.signal)[Symbol.asyncIterator]();
+      try {
+        const received = bounded(inboxIterator.next(), "ephemeral NATS inbox delivery");
+        const envelope = {
+          id: "ephemeral-inbox-reensure",
+          kind: "command" as const,
+          to: transport.self,
+          targetId: "ephemeral-inbox-target",
+          operation: "followUp",
+          from: { id: hostId, name: "ephemeral-test", kind: "main" as const },
+          body: { text: "re-ensure the existing ephemeral durable" },
+        };
+        await transport.send(envelope);
+        const result = await received;
+        expect(result.done).toBe(false);
+        if (result.done || !result.value) throw new Error("ephemeral inbox ended before delivery");
+        expect(result.value.payload).toMatchObject({ id: envelope.id, to: transport.self });
+        await result.value.ack();
+      } finally {
+        inboxAbort.abort();
+        await inboxIterator.return?.();
+      }
+
+      await transport.close();
+      let deleted = false;
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        try { await admin.manager.consumers.info(transportInboxStream("machine-a"), durable); }
+        catch { deleted = true; break; }
+        await wait(20);
+      }
+      expect(deleted).toBe(true);
+    } finally {
+      await transport?.close();
+      await inspector?.close();
+      vi.unstubAllEnvs();
     }
   }, 30_000);
 

@@ -115,7 +115,7 @@ brokerSuite("pi-fabric nats send over a real authenticated broker", () => {
     });
     let ownerPlane: FabricControlPlane | undefined;
     let replyDelivery: Promise<void> | undefined;
-    const received: Array<{ operation: string; targetId: string; text: string | undefined; from: MeshIdentity; senderLive: boolean }> = [];
+    const received: Array<{ operation: string; targetId: string; text: string | undefined; data: unknown; from: MeshIdentity; senderLive: boolean }> = [];
     try {
       await ownerDirectory.start();
       const record: FabricParticipantRecord = {
@@ -130,6 +130,15 @@ brokerSuite("pi-fabric nats send over a real authenticated broker", () => {
       if (!view) throw new Error("target NATS view is unavailable");
       const routeSignal = AbortSignal.timeout(5_000);
       while (!view.resolve(rootId)?.live) await view.whenChanged(rootId, routeSignal);
+      const env: NodeJS.ProcessEnv = { ...process.env, ...PATH_B_POLICY_ENV,
+        PI_FABRIC_MESH_TRANSPORT: "nats", PI_FABRIC_MESH_HOST_TRANSPORT: "nats",
+        XDG_STATE_HOME: path.join(fixture.root, "nats-send-state") };
+      delete env.PI_FABRIC_MESH_NATS;
+      delete env.NODE_EXTRA_CA_CERTS;
+      delete env.NODE_TLS_REJECT_UNAUTHORIZED;
+      delete env.SSL_CERT_FILE;
+      delete env.SSL_CERT_DIR;
+      const port = new URL(fixture.serverUrl).port;
       const targetPlane = new FabricControlPlane(ownerMesh, ownerIdentity, {
         enabled: true, hostId: rootId, transport: ownerTransport, participants: view,
         ownerIncarnation: ownerDirectory.ownerIncarnation, controlIncarnationFence: "enforce",
@@ -140,19 +149,39 @@ brokerSuite("pi-fabric nats send over a real authenticated broker", () => {
       ownerPlane.start(async (command, from) => {
         const senderRoute = view.resolve(from.id);
         received.push({ operation: command.operation, targetId: command.targetId, text: command.message,
-          from, senderLive: senderRoute?.live === true });
+          data: command.data, from, senderLive: senderRoute?.live === true });
         if (sendReply && command.operation === "followUp") {
           const senderId = from.id;
+          const correlationId = command.data && typeof command.data === "object" && !Array.isArray(command.data)
+            ? (command.data as { replyCorrelationId?: unknown }).replyCorrelationId : undefined;
+          if (typeof correlationId !== "string") throw new Error("CLI did not publish a reply correlation id");
           const replyText = `FABRIC-RESULT ${sessionId}\nreply from fixture Main`;
-          const deliverReply = async (): Promise<void> => {
+          const deliverReply = async (inReplyTo: string, key: string, text: string): Promise<void> => {
             const route = view.resolve(senderId);
             if (!route?.live) throw new Error("sender route disappeared before its reply");
             await targetPlane.request(route.ownerHostId, senderId, "followUp", {
-              message: replyText, ownerIncarnation: route.ownerIncarnation,
-            }, route.ownerIdentityId, { idempotencyKey: `reply-${sessionId}`, timeoutMs: 5_000 });
+              message: text, data: { inReplyTo }, ownerIncarnation: route.ownerIncarnation,
+            }, route.ownerIdentityId, { idempotencyKey: key, timeoutMs: 5_000 });
           };
-          // Withhold the original ACK until the CLI receives and acknowledges this reply.
-          replyDelivery = deliverReply();
+          const unrelatedEnv: NodeJS.ProcessEnv = { ...env,
+            XDG_STATE_HOME: path.join(fixture.root, `nats-send-unrelated-${sessionId}`) };
+          const unrelated = await runCli([
+            "--to", senderId, "--kind", "followUp", "--text", "unrelated sender message",
+            "--creds", fixture.users.machineA.credsPath, "--ca", fixture.tls!.caFile,
+            "--servers", `tls://localhost:${port}`, "--machine", "machine-a",
+            "--org", "tristar", "--path-b-machines", "machine-a,machine-b",
+            "--name", `unrelated ${sessionId}`, "--idempotency-key", `unrelated-${sessionId}`, "--timeout-ms", "5000",
+          ], unrelatedEnv);
+          expect(unrelated.signal).toBeNull();
+          expect(unrelated.code, `${unrelated.stdout}\n${unrelated.stderr}`).toBe(1);
+          expect(unrelated.stderr).toBe("");
+          expect(JSON.parse(unrelated.stdout)).toMatchObject({
+            error: expect.stringContaining("requested target with matching correlation"),
+          });
+          await expect(deliverReply("wrong-correlation", `wrong-reply-${sessionId}`, "wrong correlation reply"))
+            .rejects.toThrow("requested target with matching correlation");
+          // Withhold the original ACK until the CLI receives and acknowledges this real reply.
+          replyDelivery = deliverReply(correlationId, `reply-${sessionId}`, replyText);
           await replyDelivery;
         }
         return { accepted: true, messageId: command.commandId };
@@ -161,15 +190,6 @@ brokerSuite("pi-fabric nats send over a real authenticated broker", () => {
       const message = `real NATS ${kind} from a non-Pi Node CLI`;
       const textFile = path.join(fixture.root, `message-${sessionId}.txt`);
       if (inputMode === "file") fs.writeFileSync(textFile, message, { mode: 0o600, flag: "wx" });
-      const env: NodeJS.ProcessEnv = { ...process.env, ...PATH_B_POLICY_ENV,
-        PI_FABRIC_MESH_TRANSPORT: "nats", PI_FABRIC_MESH_HOST_TRANSPORT: "nats",
-        XDG_STATE_HOME: path.join(fixture.root, "nats-send-state") };
-      delete env.PI_FABRIC_MESH_NATS;
-      delete env.NODE_EXTRA_CA_CERTS;
-      delete env.NODE_TLS_REJECT_UNAUTHORIZED;
-      delete env.SSL_CERT_FILE;
-      delete env.SSL_CERT_DIR;
-      const port = new URL(fixture.serverUrl).port;
       const textArgs = inputMode === "file" ? ["--text-file", textFile]
         : inputMode === "stdin" ? ["--text", "-"] : ["--text", message];
       const args = [
@@ -190,6 +210,7 @@ brokerSuite("pi-fabric nats send over a real authenticated broker", () => {
       expect(typeof output.messageId).toBe("string");
       expect(received).toHaveLength(1);
       expect(received[0]).toMatchObject({ operation: kind, targetId: rootId, text: message, senderLive: true });
+      if (sendReply) expect(received[0]!.data).toEqual({ replyCorrelationId: expect.stringMatching(/^[a-f0-9]{64}$/) });
       expect(received[0]!.from).toMatchObject({ name: `test ${kind}`, kind: "agent" });
       expect(received[0]!.from.id).toMatch(/^provider:cli:[0-9a-f]{32}$/);
       expect(received[0]!.from.sessionId).toMatch(/^[0-9a-f-]{36}$/);
@@ -214,13 +235,12 @@ brokerSuite("pi-fabric nats send over a real authenticated broker", () => {
       await waitForGone(leaseKv, `machine-a.h.${tokenFor(senderHostId)}`);
       expect(view.resolve(senderId)).toBeUndefined();
       if (sendReply) {
-        const retryArgs = [...args];
-        const awaitIndex = retryArgs.indexOf("--await-reply-seconds");
-        if (awaitIndex >= 0) retryArgs.splice(awaitIndex, 2);
-        const retry = await runCli(retryArgs, env);
+        const retry = await runCli(args, env);
         expect(retry.signal).toBeNull();
-        expect(retry.code).toBe(0);
-        expect((JSON.parse(retry.stdout) as Record<string, unknown>).messageId).toBe(output.messageId);
+        expect(retry.code).toBe(2);
+        const retryLines = retry.stdout.trim().split(/\r?\n/).map((line) => JSON.parse(line) as Record<string, unknown>);
+        expect(retryLines[0]?.messageId).toBe(output.messageId);
+        expect(retryLines[1]).toEqual({ reply: null });
         expect(received).toHaveLength(1);
         await waitForGone(presenceKv, `machine-a.p.${tokenFor(senderId)}`);
         await waitForGone(leaseKv, `machine-a.h.${tokenFor(senderHostId)}`);

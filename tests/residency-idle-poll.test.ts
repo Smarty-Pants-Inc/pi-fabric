@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
+import { AgentManager } from "../src/agents/manager.js";
 import { ResidentHost } from "../src/residency/host.js";
 import { RESIDENT_HOST_FORMAT, residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
 import { ResidentRequestRetention } from "../src/residency/retention.js";
@@ -195,8 +196,20 @@ describe("idle resident host polling (smarty-dev#6729)", () => {
     // Freeze before construction/startup: fence and recovery latency are not idle time.
     const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
     const { root, host } = fixture(() => { idled++; });
+    const recover = AgentManager.prototype.recoverHostedRuns;
+    let recovered: Promise<string[]> | undefined;
+    const recovery = vi.spyOn(AgentManager.prototype, "recoverHostedRuns").mockImplementation(function (this: AgentManager, candidates, options) {
+      const pending = recover.call(this, candidates, options);
+      if (this === host.agents && candidates === undefined) recovered = pending;
+      return pending;
+    });
     try {
       await host.start();
+      // Readiness no longer joins discovery. Settle the real post-ready pass
+      // before the synthetic clock jump can intentionally lapse its lease.
+      expect(await waitUntil(() => recovered !== undefined)).toBe(true);
+      await recovered;
+      await new Promise<void>(resolve => setImmediate(resolve)); // host completion/finally custody
       let active = false;
       const checks = vi.spyOn(host.actors, "hasOwnedActors").mockImplementation(() => active);
       await sleep(200); // Start the continuously dead-and-empty observation window.
@@ -219,6 +232,7 @@ describe("idle resident host polling (smarty-dev#6729)", () => {
       await sleep(200);
       expect(idled).toBeGreaterThan(0);
     } finally {
+      recovery.mockRestore();
       clock.mockRestore();
       await host.close();
       fs.rmSync(root, { recursive: true, force: true });

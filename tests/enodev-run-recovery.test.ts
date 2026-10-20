@@ -499,14 +499,14 @@ describe.runIf(process.platform === "linux")("ENODEV-unconfirmed actor runs (sma
     }
   }, 60_000);
 
-  it("settles a run as lost when its activation is no longer pending, and logs it once", () => {
+  it("settles a run as lost when its activation is no longer pending, and logs it once", async () => {
     const runRoot = tempRoot();
     const lost = runDir(runRoot, "a".repeat(31) + "1", { activation: "item-dropped" });
     const kept = runDir(runRoot, "a".repeat(31) + "2", { activation: "item-pending" });
     const manager = new AgentManager(tempRoot(), { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0 },
       { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot });
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
-    manager.settleLostEnodevRuns(ACTOR, new Set(["item-pending"]));
+    await manager.settleLostEnodevRuns(ACTOR, new Set(["item-pending"]));
     expect(vetoed(lost)).toBe(false);
     expect(JSON.parse(fs.readFileSync(path.join(lost, "status.json"), "utf8"))).toMatchObject({ status: "completed", settledLost: true });
     expect(vetoed(kept)).toBe(true); // a pending activation is claimed by its own run request instead

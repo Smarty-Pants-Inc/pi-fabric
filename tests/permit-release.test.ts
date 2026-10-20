@@ -149,7 +149,7 @@ describe("held admission permits (smarty-dev#9855)", () => {
     await (await unknownLaunches(3)).exit();
     await manager.stop((await manager.spawn({ task: "frees", transport: "process", })).id).catch(() => undefined);
     expect(manager.heldPermits()).toBe(0);
-    manager.settleLostEnodevRuns("no-actor", new Set()); // another settle pass: nothing left to release
+    await manager.settleLostEnodevRuns("no-actor", new Set()); // another settle pass: nothing left to release
     // Capacity is exactly 3 again: three new unknown launches (live workers) are admitted, the fourth spawn waits.
     await unknownLaunches(3);
     const fourth = await manager.spawn({ task: "fourth", transport: "process" });
@@ -226,7 +226,7 @@ describe("a lost-contact run's saved answer", () => {
     expect(manager.status(handle.id)).toMatchObject({ status: "completed", text: "SAVED" });
     expect(manager.heldPermits()).toBe(0);
     expect(next.status).not.toBe("queued");
-    manager.settleLostEnodevRuns("no-actor", new Set()); // a second release attempt
+    await manager.settleLostEnodevRuns("no-actor", new Set()); // a second release attempt
     await manager.stop(next.id).catch(() => undefined);
     await manager.spawn({ task: "again", transport: "process" }).then(again => manager.stop(again.id)).catch(() => undefined);
     expect(saved()).toHaveLength(1);

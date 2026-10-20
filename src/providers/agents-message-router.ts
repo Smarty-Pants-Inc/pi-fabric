@@ -160,8 +160,8 @@ const sandboxControlRunId = (value: unknown): string | undefined => {
   return binding.runId;
 };
 const hasSandboxControl = (value: unknown): boolean => objectRecord(value) && Object.hasOwn(value, "sandboxControl");
-const verifiedSandboxMainCaller = (from: MeshIdentity, verification: "mesh" | "bridge" | undefined): boolean =>
-  (verification === "mesh" || verification === "bridge") && from.kind === "main" && from.id.startsWith("session:");
+const verifiedSandboxCaller = (from: MeshIdentity, verification: "mesh" | "bridge" | undefined): boolean =>
+  (verification === "mesh" || verification === "bridge") && (from.kind === "main" || from.kind === "actor") && from.id.trim().length > 0;
 
 const sandboxMainSettledAfterStop = async (context: ExtensionContext, signal?: AbortSignal): Promise<boolean> => {
   const deadline = Date.now() + SANDBOX_STOP_CONFIRMATION_MS;
@@ -185,7 +185,6 @@ export class AgentMessageRouter {
   #legacyDeliveryCount = 0;
   /** Retained dormant wake routes this router resolved; only they may take the one wake resend. */
   readonly #dormantRoutes = new WeakSet<FabricParticipantInfo>();
-  #sandboxRunOwner: { runId: string; sessionId: string } | undefined;
   constructor(
     readonly manager: Pick<AgentManager, "status" | "steer" | "followUp" | "stop">,
     readonly actorManager: Pick<ActorManager, "identity" | "status" | "validateDirectMessage" | "tell" | "ask" | "stop" | "steerRemote" | "resolveBinding" | "resolveActivationBinding"> & { owns?: (id: string) => boolean; mesh?: { root: string } },
@@ -1068,22 +1067,17 @@ export class AgentMessageRouter {
     if (command.operation === "stop" && sandboxRunId && this.mainAgent.local && command.targetId === this.mainAgent.id) {
       return this.#stopSandboxMain(command, from, signal, verification, sandboxRunId);
     }
-    let sandboxOwnerToBind: { runId: string; sessionId: string } | undefined;
     if (command.operation === "followUp" && sandboxRunId && this.mainAgent.local && command.targetId === this.mainAgent.id &&
       hasSandboxControl(command.data)) {
       const requestedRunId = sandboxControlRunId(command.data);
       if (!requestedRunId || requestedRunId !== sandboxRunId) {
         return { accepted: false, error: "Sandbox task delivery run binding does not match this Main session" };
       }
-      if (!verifiedSandboxMainCaller(from, verification)) {
-        return { accepted: false, error: "Sandbox task delivery requires an authenticated Main caller" };
+      if (!this.#isSandboxSpawnOwner(from, verification)) {
+        return { accepted: false, error: "Sandbox task delivery refused: caller does not match the trusted spawn return address" };
       }
       const routeError = this.#sandboxRouteRefusal(command, sandboxRunId, "followUp");
       if (routeError) return { accepted: false, error: routeError };
-      if (this.#sandboxRunOwner && (this.#sandboxRunOwner.runId !== sandboxRunId || this.#sandboxRunOwner.sessionId !== from.id)) {
-        return { accepted: false, error: "Sandbox task is already bound to a different authenticated owner" };
-      }
-      sandboxOwnerToBind = { runId: sandboxRunId, sessionId: from.id };
     }
     if (command.operation === "followUp" && this.mainAgent.local && this.mainAgent.matches(command.targetId) &&
       captureSandboxFinalAnswer(from, verification, command.message ?? "")) {
@@ -1175,7 +1169,6 @@ export class AgentMessageRouter {
         return { accepted: false, error: error instanceof Error ? error.message : String(error),
           ...(errorCode ? { errorCode, notRun: true } : {}) };
       }
-      if (sandboxOwnerToBind) this.#sandboxRunOwner = sandboxOwnerToBind;
       return {
         accepted: true,
         messageId: result.messageId,
@@ -1227,6 +1220,15 @@ export class AgentMessageRouter {
     return { accepted: false, error: `Owner does not control Fabric participant ${command.targetId}` };
   }
 
+  #isSandboxSpawnOwner(from: MeshIdentity, verification: "mesh" | "bridge" | undefined): boolean {
+    const address = this.#taskReturnAddress;
+    if (!verifiedSandboxCaller(from, verification) || !address?.spawnerId || from.id !== address.spawnerId) return false;
+    if (!address.spawnerSessionId) return true;
+    const expectedSession = address.spawnerSessionId.replace(/^session:/u, "");
+    const actualSession = from.sessionId?.trim() || (from.id.startsWith("session:") ? from.id.slice("session:".length) : undefined);
+    return expectedSession.length > 0 && actualSession === expectedSession;
+  }
+
   #sandboxRouteRefusal(command: FabricControlCommand, runId: string, capability: "followUp" | "stop"): string | undefined {
     if (!this.#nats || !command.ownerIncarnation) return "Sandbox control requires a fenced NATS owner route";
     try {
@@ -1255,9 +1257,8 @@ export class AgentMessageRouter {
     if (sandboxControlRunId(command.data) !== runId) {
       return { accepted: false, error: "Sandbox stop refused: requested run id does not match this Main session" };
     }
-    if (!verifiedSandboxMainCaller(from, verification) || this.#sandboxRunOwner?.runId !== runId ||
-      this.#sandboxRunOwner.sessionId !== from.id) {
-      return { accepted: false, error: "Sandbox stop refused: caller is not the authenticated owner of this run" };
+    if (!this.#isSandboxSpawnOwner(from, verification)) {
+      return { accepted: false, error: "Sandbox stop refused: caller does not match the trusted spawn return address" };
     }
     const routeError = this.#sandboxRouteRefusal(command, runId, "followUp");
     if (routeError) return { accepted: false, error: routeError };

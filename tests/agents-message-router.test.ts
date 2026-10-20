@@ -517,9 +517,14 @@ describe("sandbox Main stop authorization", () => {
   it("stops only the authenticated owner on the exact run-bound local route", async () => {
     const runId = "sandbox-owner-run";
     const childId = "session:sandbox-child";
-    const owner: MeshIdentity = { id: "session:sandbox-owner", name: "Sandbox owner", kind: "main" };
-    const attacker: MeshIdentity = { id: "session:sandbox-attacker", name: "Other Main", kind: "main" };
+    const owner: MeshIdentity = { id: "session:sandbox-owner", sessionId: "sandbox-owner", name: "Sandbox owner", kind: "main" };
+    const attacker: MeshIdentity = { id: "session:sandbox-attacker", sessionId: "sandbox-attacker", name: "Other Main", kind: "main" };
     vi.stubEnv("PI_FABRIC_RUN_ID", runId);
+    vi.stubEnv("PI_FABRIC_TASK_PROCESS_CHILD", "1");
+    vi.stubEnv("PI_FABRIC_PARENT_RUN", runId);
+    vi.stubEnv("PI_FABRIC_SPAWNER_ID", owner.id);
+    vi.stubEnv("PI_FABRIC_SPAWNER_SESSION_ID", "sandbox-owner");
+    vi.stubEnv("PI_FABRIC_ACTOR_ID", "");
     try {
       let incarnation = "incarnation-1";
       let idle = false;
@@ -545,18 +550,23 @@ describe("sandbox Main stop authorization", () => {
         steerRemote: vi.fn(), resolveBinding: vi.fn(), resolveActivationBinding: vi.fn() };
       const receive = new AgentMessageRouter(manager as never, actors as never, main as never, participants as never, control as never, binding => binding);
       const data = { sandboxControl: { protocol: "pi-fabric-sandbox-stop-v1", runId } };
-      const task = { version: 1, commandId: "sandbox-task", targetId: childId, operation: "followUp", replyTo: owner.id,
-        message: "Run the sandbox task", data, ownerIncarnation: incarnation, requestedAt: Date.now() } as FabricControlCommand;
-
-      await expect(receive.acceptControl(task, owner, undefined, "mesh")).resolves.toMatchObject({ accepted: true, messageId: "task-queued" });
+      const task = (sender: MeshIdentity): FabricControlCommand => ({ version: 1, commandId: `sandbox-task-${sender.id}`,
+        targetId: childId, operation: "followUp", replyTo: sender.id, message: "Run the sandbox task", data,
+        ownerIncarnation: incarnation, requestedAt: Date.now() });
       const stop = (sender: MeshIdentity, requestRunId = runId, ownerIncarnation = incarnation): FabricControlCommand => ({
         version: 1, commandId: `stop-${sender.id}-${requestRunId}`, targetId: childId, operation: "stop", replyTo: sender.id,
         data: { sandboxControl: { protocol: "pi-fabric-sandbox-stop-v1", runId: requestRunId } }, ownerIncarnation, requestedAt: Date.now(),
       });
 
-      await expect(receive.acceptControl(stop(attacker), attacker, undefined, "mesh")).resolves.toMatchObject({
-        accepted: false, error: "Sandbox stop refused: caller is not the authenticated owner of this run",
+      await expect(receive.acceptControl(task(attacker), attacker, undefined, "mesh")).resolves.toMatchObject({
+        accepted: false, error: "Sandbox task delivery refused: caller does not match the trusted spawn return address",
       });
+      await expect(receive.acceptControl(stop(attacker), attacker, undefined, "mesh")).resolves.toMatchObject({
+        accepted: false, error: "Sandbox stop refused: caller does not match the trusted spawn return address",
+      });
+      expect(main.deliverAgent).not.toHaveBeenCalled();
+      await expect(receive.acceptControl(task(owner), owner, undefined, "mesh")).resolves.toMatchObject({ accepted: true, messageId: "task-queued" });
+      expect(main.deliverAgent).toHaveBeenCalledOnce();
       await expect(receive.acceptControl(stop(owner, `${runId}-other`), owner, undefined, "mesh")).resolves.toMatchObject({
         accepted: false, error: "Sandbox stop refused: requested run id does not match this Main session",
       });

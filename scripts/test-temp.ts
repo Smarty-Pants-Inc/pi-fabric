@@ -251,7 +251,7 @@ const fleetRootsKey = Symbol.for("pi-fabric.test-owned-fleet-roots");
 const testControls = new Set([
   "PI_FABRIC_JEV_LIVE", "PI_FABRIC_JEV_LOCALTERM", "PI_FABRIC_NATS_REHEARSAL",
   "PI_FABRIC_ACTIVATION_TEST_PI_BINARY", "PI_FABRIC_ACTIVATION_TEST_WORKER",
-  "PI_FABRIC_TEST_PG_BIN", "PI_FABRIC_TEST_PID_DELAY_MS",
+  "PI_FABRIC_TEST_PG_BIN", "PI_FABRIC_TEST_PID_DELAY_MS", "PI_FABRIC_REQUIRE_NATS",
 ]);
 
 /** Run at config evaluation AND before each test file's source imports. */

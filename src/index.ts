@@ -6,5 +6,16 @@ export default createFabricExtension(import.meta.url);
 export * from "./audit/index.js";
 export * from "./entropy/index.js";
 export * from "./protocol.js";
+export { requestSessionChannelApi, SESSION_CHANNEL_API_GET, SESSION_CHANNEL_API_READY } from "./transport/nats/session-channel-api.js";
+export type { FabricSessionChannelApi } from "./transport/nats/session-channel-api.js";
 export { FabricModelDeniedError } from "./core/model-policy.js";
 export { FabricModelNotServedError } from "./core/model-served-error.js";
+export type {
+  CallerIdentity,
+  SessionChannel,
+  SessionChannelEvent,
+  SessionChannelOpenOptions,
+  SessionChannelReply,
+  SessionChannelRequest,
+  SessionChannelIdentity,
+} from "./transport/nats/session-channel.js";

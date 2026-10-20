@@ -69,11 +69,13 @@ export interface PathBHarnessOptions {
   readonly org?: string;
   /** Issue real CLI artifacts without changing the default hand-built fault-injection fixture. */
   readonly identityFactory?: (root: string) => PathBIdentity | Promise<PathBIdentity>;
-  /** Deliberately misissued grants for fail-closed identity-check tests. */
+  /** Additional publish allows for agent superset-verification tests. */
   readonly additionalAgentPublish?: readonly string[];
+  /** Remove expected publish allows for fail-closed identity-check tests. */
+  readonly removeAgentPublish?: readonly string[];
   /** Additional signed mesh bindings for multi-tag template expansion tests. */
   readonly additionalAgentMeshes?: readonly string[];
-  /** Deliberately misissued extra subscribe allows for fail-closed identity-check tests. */
+  /** Additional subscribe allows for agent superset-verification tests. */
   readonly additionalAgentSubscribe?: readonly string[];
   /** Deliberately widened operator subscriptions; production operator remains metadata-only. */
   readonly additionalOperatorSubscribe?: readonly string[];
@@ -117,9 +119,13 @@ function createTestTls(root: string, dnsNames: readonly string[], ipAddresses: r
 
 function faultedAgentTemplate(options: PathBHarnessOptions): RoleTemplate {
   const base = roleTemplateWithPathB("agent", { custodyStream: PATH_B_PERMISSION_POLICY.custodyStream, livenessStream: PATH_B_PERMISSION_POLICY.livenessStream }, PATH_B_MACHINES, options.org);
-  const removed = new Set(options.removeAgentDeny ?? []);
+  const removedPublish = new Set(options.removeAgentPublish ?? []);
+  const removedDeny = new Set(options.removeAgentDeny ?? []);
   return {
-    pub: { allow: [...base.pub.allow, ...(options.additionalAgentPublish ?? [])], deny: base.pub.deny.filter((subject) => !removed.has(subject)) },
+    pub: {
+      allow: [...base.pub.allow.filter((subject) => !removedPublish.has(subject)), ...(options.additionalAgentPublish ?? [])],
+      deny: base.pub.deny.filter((subject) => !removedDeny.has(subject)),
+    },
     sub: { allow: [...base.sub.allow, ...(options.additionalAgentSubscribe ?? [])] },
     ...(base.allow_responses ? { allow_responses: base.allow_responses } : {}),
   };

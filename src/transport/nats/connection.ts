@@ -203,6 +203,7 @@ interface PermissionSet {
 
 interface ExpectedPermissions extends PermissionSet {
   readonly legacy: PermissionSet;
+  readonly allowAdditionalPermissions: boolean;
 }
 
 /** Expand one role template for the signed identity exactly as nats-server expands it. */
@@ -240,7 +241,11 @@ const expectedPermissions = (role: "agent" | "operator", machine: string, policy
   // The installed d231bd15 account is a deliberate rollout exception. It is a separate frozen template, not a
   // subtraction from the current one, because other runtime lanes add grants to the current template as well.
   const legacy = role === "agent" ? legacyRoleTemplateWithPathB("agent", input, machines) : template;
-  return { ...expandPermissions(template, machine, meshes, auth), legacy: expandPermissions(legacy, machine, meshes, auth) };
+  return {
+    ...expandPermissions(template, machine, meshes, auth),
+    legacy: expandPermissions(legacy, machine, meshes, auth),
+    allowAdditionalPermissions: role === "agent",
+  };
 };
 
 /** Absent list = empty; present list must be strings. Unknown keys refuse. */
@@ -257,10 +262,33 @@ const permissionLists = (value: unknown): { allow: Set<string>; deny: Set<string
 const sameSet = (actual: ReadonlySet<string>, expected: ReadonlySet<string>): boolean =>
   actual.size === expected.size && [...expected].every((subject) => actual.has(subject));
 
-const matchesPermissions = (actual: { allow: Set<string>; deny: Set<string> }, expected: PermissionSet, subscribe: boolean): boolean =>
-  subscribe
-    ? sameSet(actual.allow, expected.subAllow) && sameSet(actual.deny, expected.subDeny)
-    : sameSet(actual.allow, expected.pubAllow) && sameSet(actual.deny, expected.pubDeny);
+const containsSet = (actual: ReadonlySet<string>, expected: ReadonlySet<string>): boolean =>
+  [...expected].every((subject) => actual.has(subject));
+
+const matchesPermissions = (
+  actual: { allow: Set<string>; deny: Set<string> },
+  expected: PermissionSet,
+  subscribe: boolean,
+  allowAdditional: boolean,
+): boolean => {
+  const matches = allowAdditional ? containsSet : sameSet;
+  return subscribe
+    ? matches(actual.allow, expected.subAllow) && matches(actual.deny, expected.subDeny)
+    : matches(actual.allow, expected.pubAllow) && matches(actual.deny, expected.pubDeny);
+};
+
+const responsesAtLeast = (actual: unknown, expected: PermissionSet, allowAdditional: boolean): boolean => {
+  if (!expected.responses) {
+    if (!allowAdditional) return actual === undefined || actual === null;
+    return actual === undefined || actual === null || isPlainObject(actual) &&
+      Number.isSafeInteger(actual.max) && (actual.max as number) > 0 &&
+      Number.isSafeInteger(actual.ttl) && (actual.ttl as number) > 0;
+  }
+  if (!isPlainObject(actual)) return false;
+  if (!allowAdditional && Object.keys(actual).length !== 2) return false;
+  return Number.isSafeInteger(actual.max) && (actual.max as number) >= expected.responses.max &&
+    Number.isSafeInteger(actual.ttl) && (actual.ttl as number) >= expected.responses.ttl;
+};
 
 const verifyIdentity = async (nc: NatsConnection, timeoutMs: number, auth: ReturnType<typeof readNatsCredentials>, expected: ExpectedPermissions): Promise<unknown> => {
   const response = await nc.request("$SYS.REQ.USER.INFO", new Uint8Array(), { timeout: timeoutMs }).catch((cause: unknown) => {
@@ -271,7 +299,7 @@ const verifyIdentity = async (nc: NatsConnection, timeoutMs: number, auth: Retur
     throw new NatsAuthorizationError("NATS USER.INFO response is invalid", { cause });
   }
   // USER.INFO returns the authenticated user and expanded permissions, not JWT tags. Tie the locally decoded tags to
-  // the server-authenticated subject, then require the exact expanded scope: no missing, extra or response rights.
+  // the server-authenticated subject. Agent permissions may be supersets; operator permissions remain exact.
   const data = isPlainObject(value) && isPlainObject(value.data) ? value.data : undefined;
   const permissions = data?.permissions;
   if (!data || data.user !== auth.subject || !isPlainObject(permissions) ||
@@ -279,15 +307,13 @@ const verifyIdentity = async (nc: NatsConnection, timeoutMs: number, auth: Retur
   const publish = permissionLists(permissions.publish);
   const subscribe = permissionLists(permissions.subscribe);
   if (!publish || !subscribe) throw new NatsAuthorizationError(MISMATCH);
-  const responsesMatch = (scope: PermissionSet): boolean => {
-    const actual = permissions.responses;
-    return scope.responses
-      ? isPlainObject(actual) && Object.keys(actual).length === 2 &&
-        actual.max === scope.responses.max && actual.ttl === scope.responses.ttl
-      : actual === undefined || actual === null;
-  };
-  const current = matchesPermissions(publish, expected, false) && matchesPermissions(subscribe, expected, true) && responsesMatch(expected);
-  const legacy = matchesPermissions(publish, expected.legacy, false) && matchesPermissions(subscribe, expected.legacy, true) && responsesMatch(expected.legacy);
+  const current = matchesPermissions(publish, expected, false, expected.allowAdditionalPermissions) &&
+    matchesPermissions(subscribe, expected, true, expected.allowAdditionalPermissions) &&
+    responsesAtLeast(permissions.responses, expected, expected.allowAdditionalPermissions);
+  // Only the frozen rollout exception is exact; a partial current template must not fall through as legacy.
+  const legacy = matchesPermissions(publish, expected.legacy, false, false) &&
+    matchesPermissions(subscribe, expected.legacy, true, false) &&
+    responsesAtLeast(permissions.responses, expected.legacy, false);
   if (!current && !legacy) throw new NatsAuthorizationError(MISMATCH);
   if (!current && !warnedLegacyPermissions) {
     warnedLegacyPermissions = true;

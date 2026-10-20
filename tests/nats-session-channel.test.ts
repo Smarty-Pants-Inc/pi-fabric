@@ -100,7 +100,7 @@ afterEach(async () => {
 afterAll(async () => { await fixture?.stop(); });
 
 describe("session channels over real org-scoped NATS", () => {
-  it("verifies the shared org role's exact grants through the real broker USER.INFO", async () => {
+  it("verifies the shared org role's required grants through the real broker USER.INFO", async () => {
     const verified = await openNatsConnection({ ...fixture!.runtimeOptions(fixture!.users.machineA), org: identity.org });
     try {
       expect(verified.userInfo).toMatchObject({

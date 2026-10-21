@@ -4980,6 +4980,43 @@ describe("#2726 resident actor live read views", () => {
     expect(unknown.queued).toBeUndefined();
   });
 
+  it("uses a matching owning-root read view for its own activation and refuses other ids", async () => {
+    const state = await passiveState();
+    const identity = {
+      actorId: state.actor.id, name: state.actor.name, rootId: state.actor.rootId!,
+      ownershipToken: state.actor.ownershipToken!, instructionsDigest: state.actor.instructionsDigest!,
+      roleStamp: "(role reviewer.md 0123456789ab)",
+    };
+    vi.stubEnv("PI_FABRIC_ACTOR_SELF", JSON.stringify(identity));
+    vi.stubEnv("PI_FABRIC_ACTOR_ID", identity.actorId);
+    try {
+      const ownerStatus = { ...state.actor, status: "running" as const, model: "owner-fresh-model" };
+      const actorStatus = vi.fn(async () => ownerStatus);
+      (state.provider as unknown as { residency?: ResidencyClient }).residency = { actorStatus } as unknown as ResidencyClient;
+      state.setLive({ ...state.live, name: state.actor.name, rootId: identity.rootId,
+        ownerHostId: residentHostId(identity.rootId), ownerIdentityId: identity.rootId,
+        actorOwnershipToken: identity.ownershipToken, status: "running" });
+
+      await expect(state.provider.invoke("actorStatus", { id: identity.actorId }, context)).resolves.toMatchObject({
+        id: identity.actorId, rootId: identity.rootId, ownershipToken: identity.ownershipToken,
+        model: "owner-fresh-model", roleStamp: identity.roleStamp,
+      });
+      expect(actorStatus).toHaveBeenCalledWith(identity.actorId, undefined);
+      actorStatus.mockResolvedValueOnce({ ...ownerStatus, instructionsDigest: "d".repeat(64) });
+      const changedDefinition = await state.provider.invoke("actorStatus", { id: identity.actorId }, context) as FabricActorReadInfo;
+      expect(changedDefinition).toMatchObject({ id: identity.actorId, status: "unknown", instructionsDigest: identity.instructionsDigest });
+      expect(changedDefinition).not.toHaveProperty("model");
+      await expect(state.provider.invoke("actorStatus", { id: "another-actor" }, context))
+        .rejects.toThrow("Unknown Fabric actor: another-actor");
+      expect(actorStatus).toHaveBeenCalledTimes(2);
+
+      vi.stubEnv("PI_FABRIC_ACTOR_SELF", "not-json");
+      await expect(state.provider.invoke("actorStatus", { id: identity.actorId }, context))
+        .rejects.toThrow("Fabric actor activation identity is unavailable");
+      expect(actorStatus).toHaveBeenCalledTimes(2);
+    } finally { vi.unstubAllEnvs(); }
+  });
+
   it("leaves owned local actors and global templates unchanged without reading a remote owner", async () => {
     const state = setup();
     const actor = await state.actors.create(createRequest as FabricActorRequest);

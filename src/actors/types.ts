@@ -13,6 +13,7 @@ export type { FabricActorActivationFilter } from "./activation-filter.js";
 import type { FabricActorRecordsOptions, FabricActorRecordsView } from "./records.js";
 export type { FabricActorRecord, FabricActorRecordsOptions, FabricActorRecordsView } from "./records.js";
 import type { FabricScope } from "../protocol.js";
+import type { FabricActorActivationIdentity } from "./activation-identity.js";
 
 // Pi's extension event union is closed; every member we want the actor host
 // to observe must appear in FABRIC_ACTOR_PI_HOST_EVENTS below. `project_trust`
@@ -548,7 +549,15 @@ export type FabricActorReadInfo = Omit<FabricActorInfo, "status" | "queued" | "m
   status: FabricActorStatus | "unknown";
   queued?: number;
   messages?: number;
+  roleStamp?: string;
 };
+
+/** The activation worker's read-only identity fallback when its owner has no live status view. */
+export type FabricActorSelfReadInfo = Pick<FabricActorActivationIdentity,
+  "name" | "rootId" | "ownershipToken" | "instructionsDigest" | "roleStamp"> & {
+    id: string;
+    status: "unknown";
+  };
 
 export interface FabricActorLog {
   actorId: string;

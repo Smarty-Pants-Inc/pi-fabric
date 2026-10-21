@@ -30,6 +30,7 @@ import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
 import { readFileRetrying, renameAtomic, syncDirectoryChain, trackTemporary, writeJsonAtomic } from "../core/atomic-write.js";
 import { discardWorkerCompletion, type CompletionRecipient } from "./completion-journal.js";
 import { processStartTime } from "../residency/process-identity.js";
+import { FABRIC_ACTOR_SELF_ENV, normalizeFabricActorActivationIdentity } from "../actors/activation-identity.js";
 import { countUnknownEnodevStarts, enodevDelivered, enodevUnresolvedRuns, noteEnodevDelivered, peekEnodevRun, settleEnodevRun,
   settleGoneEnodevLaunch, settleLostEnodevRun, ownedProcess, provenGoneEnodevLaunch, goneEnodevOutcome, savedEnodevAnswer, recoverDurableActorStop, type OwnedProcess } from "./enodev-recovery.js";
 import {
@@ -2321,6 +2322,13 @@ export class AgentManager {
     request = { ...request, ...(requestedReason !== undefined ? { modelReason: requestedReason } : {}),
       ...(needs !== undefined ? { needs } : {}), ...(requires !== undefined ? { requires } : {}) };
     delete request.opusReason;
+    const actorSelf = request.actorSelf === undefined
+      ? undefined
+      : normalizeFabricActorActivationIdentity(request.actorSelf);
+    if (request.actorSelf !== undefined && (!actorSelf || actorSelf.actorId !== request.actorId || actorSelf.name !== request.actorName)) {
+      throw new Error("Invalid actor activation identity for worker launch");
+    }
+    request = { ...request, ...(actorSelf ? { actorSelf } : {}) };
     // Snapshot trusted classification inputs before asynchronous preparation/queueing.
     const explicitRouteClass = request.routeClass ?? request.routeDecision?.routeClass;
     const routeFacts = {
@@ -3146,9 +3154,14 @@ export class AgentManager {
           cwd: agentCwd,
           workerPath: runnerLaunch.workerPath,
           workerArguments: [...runnerLaunch.workerArguments],
-          // Composition seam: AgentTransportLaunch.childEnvironment must be
-          // applied by the transport AFTER task identity/temp env assembly.
-          ...(this.#childMeshEnvironment ? { childEnvironment: this.#childMeshEnvironment } : {}),
+          // Apply mesh credentials first, then replace inherited actor identity with
+          // this exact activation tuple (or clear it for non-actor children).
+          childEnvironment: (environment) => {
+            const child = { ...(this.#childMeshEnvironment?.(environment) ?? environment) };
+            delete child[FABRIC_ACTOR_SELF_ENV];
+            if (actorSelf) child[FABRIC_ACTOR_SELF_ENV] = JSON.stringify(actorSelf);
+            return child;
+          },
           ...(request.needs ? { needs: [...request.needs] } : {}),
           ...(request.requires ? { requires: [...request.requires] } : {}),
           ...(this.#spawnerSessionId ? { parentSession: this.#spawnerSessionId } : {}),

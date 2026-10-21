@@ -6,6 +6,7 @@ import { eventReceipts, workKey } from "../topology/root-inbox-shared.js";
 import type { ImageContent } from "@earendil-works/pi-ai";
 import { formatAge } from "../residency/protocol.js";
 import { createHash, randomUUID } from "node:crypto";
+import { actorRoleStamp, normalizeFabricActorActivationIdentity } from "./activation-identity.js";
 import fs from "node:fs";
 import { readPiSessionHeader } from "../core/pi-session-header.js";
 import { ActorMeshMonitor } from "./mesh-monitor.js";
@@ -6112,6 +6113,16 @@ export class ActorManager {
     if (items.length > 1 && provenance && (external || foreign || items.some(event =>
         JSON.stringify(event.provenance?.principal) !== JSON.stringify(item.provenance?.principal)))) delete provenance.principal;
     const batched = items.length > 1 || (actor.batchWindowMs! > 0 && !this.#batchBypass(item));
+    const roleStamp = actorRoleStamp(actor.instructions, (actor as ManagedActor & { roleStamp?: unknown }).roleStamp);
+    const actorSelf = normalizeFabricActorActivationIdentity({
+      actorId: actor.id,
+      name: actor.name,
+      rootId: actor.rootId,
+      ownershipToken: this.#lineage(actor),
+      instructionsDigest: createHash("sha256").update(actor.instructions).digest("hex"),
+      ...(roleStamp ? { roleStamp } : {}),
+    });
+    if (!actorSelf) throw new Error(`Cannot prepare an invalid activation identity for Fabric actor ${actor.id}`);
     return {
       ...(provenance ? { provenance } : {}),
       // smarty-dev#8935: a restored activation may already have run to completion before a restart.
@@ -6128,6 +6139,7 @@ export class ActorManager {
       systemPrompt: this.#systemPrompt(actor),
       actorId: actor.id,
       actorName: actor.name,
+      actorSelf,
       ...(actor.routeClass !== undefined ? { routeClass: actor.routeClass } : {}),
       ...(typeof actor.protected === "boolean" ? { protected: actor.protected } : {}),
       ...(actor.principalScope ? { inheritedScope: actor.principalScope } : {}),

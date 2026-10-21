@@ -296,6 +296,7 @@ const statusFile = args.get("status-file");
 const task = fs.readFileSync(args.get("task-file"), "utf8");
 fs.mkdirSync(path.dirname(statusFile), { recursive: true });
 fs.writeFileSync(path.join(path.dirname(statusFile), "argv.json"), JSON.stringify(Object.fromEntries(args)));
+fs.writeFileSync(path.join(path.dirname(statusFile), "actor-self.json"), JSON.stringify(process.env.PI_FABRIC_ACTOR_SELF ?? null));
 let text = "done";
 if (task.includes("EDIT")) {
   fs.appendFileSync("README.md", "three\\n");
@@ -342,6 +343,25 @@ const launchArgs = (runRoot: string, id: string): Record<string, string> =>
   JSON.parse(fs.readFileSync(path.join(runRoot, id, "argv.json"), "utf8"));
 
 describe("agent manager spawning primitives", () => {
+  it("passes only the matching actor activation identity to its worker", async () => {
+    const cwd = tempRoot("pi-fabric-actor-self-env-");
+    const inherited = JSON.stringify({ actorId: "parent-actor", name: "parent", rootId: "session:root",
+      ownershipToken: "parent-lineage", instructionsDigest: "a".repeat(64) });
+    vi.stubEnv("PI_FABRIC_ACTOR_SELF", inherited);
+    const { manager, runRoot } = createManager(cwd);
+    const actorSelf = Object.freeze({ actorId: "actor-one", name: "worker", rootId: "session:root",
+      ownershipToken: JSON.stringify(["session:root", null, []]), instructionsDigest: "b".repeat(64), roleStamp: "(role reviewer.md 0123456789ab)" });
+    const actor = await manager.run({ task: "actor activation", transport: "process", actorId: actorSelf.actorId,
+      actorName: actorSelf.name, actorSelf });
+    expect(JSON.parse(fs.readFileSync(path.join(runRoot, actor.id, "actor-self.json"), "utf8"))).toBe(JSON.stringify(actorSelf));
+    expect(process.env.PI_FABRIC_ACTOR_SELF).toBe(inherited);
+
+    const task = await manager.run({ task: "ordinary nested task", transport: "process" });
+    expect(JSON.parse(fs.readFileSync(path.join(runRoot, task.id, "actor-self.json"), "utf8"))).toBeNull();
+    await expect(manager.run({ task: "mismatched activation", transport: "process", actorId: "different",
+      actorName: actorSelf.name, actorSelf })).rejects.toThrow(/Invalid actor activation identity/);
+  });
+
   it("passes write policy and lineage to Pi children with a per-parent child index", async () => {
     const cwd = tempRoot("pi-fabric-wp7-lineage-");
     const { manager, runRoot } = createManager(cwd, {
@@ -486,8 +506,9 @@ describe("worker child environment contract", () => {
     managers.push(manager);
     const result = await manager.run({ task: "report", runner: "pi", transport: "process", extensions: false, writableRoots: ["."] });
     expect(result.status).toBe("completed");
-    const report = JSON.parse(result.text) as { lineage: string; writePolicy: string; extensionModel: string | null; args: string[] };
+    const report = JSON.parse(result.text) as { lineage: string; writePolicy: string; extensionModel: string | null; actorSelf: string | null; args: string[] };
     expect(report.extensionModel).toBeNull();
+    expect(report.actorSelf).toBeNull();
     expect(report.args.some((arg) => arg.includes("provider-bridge"))).toBe(false);
     expect(readAgentLineage(report.lineage)).toMatchObject({ rootSessionId: "root-session", runId: result.id, depth: 1 });
     expect(JSON.parse(report.writePolicy)).toEqual({ readOnly: false, writableRoots: [root], shell: "deny" });
@@ -497,6 +518,13 @@ describe("worker child environment contract", () => {
     const guard = loaded.find(entry => entry === path.resolve(guardPath!));
     expect(guard).toBe(path.resolve(guardPath!));
     expect(fs.existsSync(guard!)).toBe(true);
+
+    const actorSelf = Object.freeze({ actorId: "actor-worker", name: "reviewer", rootId: "session:root",
+      ownershipToken: JSON.stringify(["session:root", null, []]), instructionsDigest: "c".repeat(64),
+      roleStamp: "(role reviewer.md 0123456789ab)" });
+    const actorResult = await manager.run({ task: "report", runner: "pi", transport: "process", extensions: false,
+      actorId: actorSelf.actorId, actorName: actorSelf.name, actorSelf });
+    expect(JSON.parse(actorResult.text).actorSelf).toBe(JSON.stringify(actorSelf));
   }, 30_000);
 });
 
@@ -594,7 +622,8 @@ describe("guest declarations", () => {
         'const s = await agents.run({ task: "t", seed: "snippet", seedMessages: 4, writePolicy: "unrestricted" });',
         "const files: string[] = r.worktreeResult?.changedFiles ?? [];",
         "const self = await agents.self();",
-        "return { files, inserted: r.worktreeResult?.diffstat.insertions, index: self.lineage?.childIndex, s: s.status };",
+        "const actorStatus = self.actor ? await agents.actorStatus({ id: self.actor.actorId }) : undefined;",
+        "return { files, inserted: r.worktreeResult?.diffstat.insertions, index: self.lineage?.childIndex, actorId: self.actor?.actorId, rootId: self.actor?.rootId, token: actorStatus?.ownershipToken, stamp: self.actor?.roleStamp, s: s.status };",
       ].join("\n"),
       GUEST_TYPE_DECLARATIONS,
     );

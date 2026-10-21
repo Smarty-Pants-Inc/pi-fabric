@@ -909,6 +909,9 @@ export class FabricControlPlane {
 
   get transportKind(): FabricTransport["kind"] { return this.#transport.kind; }
   get participantView(): ParticipantView | undefined { return this.options.participants; }
+  onVerifiedReconnect(listener: () => void): () => void {
+    return this.#transport.onVerifiedReconnect?.(listener) ?? (() => undefined);
+  }
 
   start(handler: FabricControlHandler): void {
     this.#handler = handler;
@@ -2186,8 +2189,7 @@ export class FabricControlPlane {
       Math.floor(options.timeoutMs ?? this.#ackTimeoutMs)));
     const timeoutMs = Math.min(NATS_HORIZON_MS, Math.max(this.#pollMs * 4, originalTimeoutMs - retryBudgetSpentMs));
     const ackGraceMs = Math.min(MAX_CONTROL_ACK_GRACE_MS, 2 * timeoutMs);
-    // E14.1: caller retries get new broker events; logical dedupe remains control-seen alone.
-    // Any same-request republish must reuse this id and the resolved bytes, never restamp them.
+    // The envelope id is generated once here; all transport-level retries reuse it.
     const commandEventId = randomUUID();
     let pending!: PendingControlRequest;
     const acceptance = new Promise<FabricControlAcceptance>((resolve, reject) => {

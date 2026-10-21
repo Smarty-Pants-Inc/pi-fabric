@@ -14,7 +14,7 @@ import type { NatsConnectionHandle } from "../src/transport/nats/connection.js";
 import { openNatsTransport, type NatsTransportOptions } from "../src/transport/nats/inbox.js";
 import { runTransportAdmin } from "../src/transport/nats/admin.js";
 import { openNatsKv, KV_MARKER_TTL_MS, KV_MAX_VALUE_SIZE, LEASE_TTL_MS, PRESENCE_TTL_MS } from "../src/transport/nats/kv.js";
-import { transportStreamConfig } from "../src/transport/nats/provision.js";
+import { INBOX_DUPLICATE_WINDOW_MS, transportStreamConfig } from "../src/transport/nats/provision.js";
 import { ADVISORY_CAPTURE_STREAM, transportAdvisoryStreamSubject, transportDurableName, transportInboxStream, transportInboxStreamSubject } from "../src/transport/nats/subjects.js";
 import { TransportInvalidError, type FabricTransport, type FabricTransportOptions } from "../src/transport/types.js";
 import { loadAgentNatsReplicas, loadGlobalFabricConfig } from "../src/config.js";
@@ -45,7 +45,7 @@ const base: NatsTransportOptions = {
 };
 const inboxPolicy = {
   name: INBOX, subjects: [transportInboxStreamSubject(MACHINE)], maxBytes: 1_073_741_824,
-  maxAgeMs: 7 * 24 * 60 * 60_000, maxMessageBytes: 1_048_576, duplicateWindowMs: 600_000,
+  maxAgeMs: 7 * 24 * 60 * 60_000, maxMessageBytes: 1_048_576, duplicateWindowMs: INBOX_DUPLICATE_WINDOW_MS,
 };
 const advisoryPolicy = {
   name: ADVISORY_CAPTURE_STREAM,

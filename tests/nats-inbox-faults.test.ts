@@ -8,11 +8,11 @@ import { setTimeout as delay } from "node:timers/promises";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { openNatsConnection, type NatsConnectionHandle } from "../src/transport/nats/connection.js";
 import { openNatsTransport, type NatsTransportOptions } from "../src/transport/nats/inbox.js";
-import { ensureTransportStream } from "../src/transport/nats/provision.js";
+import { ensureTransportStream, INBOX_DUPLICATE_WINDOW_MS } from "../src/transport/nats/provision.js";
 import { openNatsKvForMachine } from "../src/transport/nats/kv.js";
 import { transportDurableName, transportInboxStream, transportInboxStreamSubject } from "../src/transport/nats/subjects.js";
 import {
-  TransportCapacityError, TransportInvalidError, TransportUncertainError,
+  TransportCapacityError, TransportInvalidError,
   type FabricTransport, type TransportDelivery, type TransportEnvelope,
 } from "../src/transport/types.js";
 import { createPathBHarness, resolveNatsBinary, type PathBHarness, type PathBTlsFiles, type PathBUser } from "./helpers/nats-cluster.js";
@@ -205,7 +205,7 @@ describe.skipIf(!binary)("real machine-authenticated inbox faults", () => {
     await openNatsKvForMachine(js, "presence", "machine-a");
     await Promise.all([fixture.users.machineA, fixture.users.machineB].map((user) => ensureTransportStream(manager, {
       name: transportInboxStream(user.machine), subjects: [transportInboxStreamSubject(user.machine)],
-      maxBytes: MAX_BYTES, maxAgeMs: 0, maxMessageBytes: MAX_MESSAGE_BYTES, duplicateWindowMs: 600_000, replicas: 1,
+      maxBytes: MAX_BYTES, maxAgeMs: 0, maxMessageBytes: MAX_MESSAGE_BYTES, duplicateWindowMs: INBOX_DUPLICATE_WINDOW_MS, replicas: 1,
     })));
     inspector = await openNatsConnection(fixture.operatorOptions());
   }, 60_000);
@@ -401,30 +401,36 @@ describe.skipIf(!binary)("real machine-authenticated inbox faults", () => {
     expect(after.num_ack_pending).toBe(0);
   }, 15_000);
 
-  it("lost PubAck is uncertain with the exact frozen body; no blind retry, same-id retry dedupes", async () => {
+  it("retries a lost PubAck with frozen bytes and the stable envelope id; JetStream stores one message", async () => {
     const proxy = await WireFaults.open(fixture.serverUrl, fixture.tls!); proxies.push(proxy);
     const sender = await open(fixture.users.machineA, "uncertain-sender", { servers: proxy.url });
     const receiver = await open(fixture.users.machineB, "uncertain-receiver");
-    const body = { text: "frozen-before-wire" };
+    const body = { commandId: "command-lost-puback", text: "frozen-before-wire" };
     let stamps = 0;
-    const input = envelope(sender, receiver, "lost-puback", () => { stamps += 1; return body; });
+    const input = envelope(sender, receiver, "lost-puback-envelope", () => { stamps += 1; return body; });
+    const stream = transportInboxStream(receiver.self.machine);
+    const before = (await inspector.manager.streams.info(stream)).state.messages;
     proxy.loseNextPubAck();
-    const sending = sender.send(input).catch((error: unknown) => error);
+    const sending = sender.send(input);
     body.text = "mutated-after-publish";
-    const error = await bounded(sending, "lost PubAck uncertainty");
-    expect(error).toBeInstanceOf(TransportUncertainError);
-    expect(error).toMatchObject({ id: input.id, resolvedBody: { text: "frozen-before-wire" } });
+    const sent = await bounded(sending, "retried lost PubAck");
+    expect(sent).toMatchObject({ id: input.id, duplicate: true, envelope: { id: input.id, body: { commandId: "command-lost-puback", text: "frozen-before-wire" } } });
     expect(stamps).toBe(1);
     expect(proxy.pubAckDrops).toBe(1);
-    expect(proxy.publishes).toBe(1);
-    await pendingIs(receiver, 0, 1);
-    const retry = await sender.send({ ...input, body: (error as TransportUncertainError).resolvedBody });
-    expect(retry.duplicate).toBe(true);
     expect(proxy.publishes).toBe(2);
+    expect((await inspector.manager.streams.info(stream)).state.messages - before).toBe(1);
+    const messageReader = await fixture.connect(fixture.users.bootstrap);
+    let storedMessageId: string | undefined;
+    try {
+      const { jetstreamManager } = await import("@nats-io/jetstream");
+      storedMessageId = (await (await jetstreamManager(messageReader)).streams.getMessage(stream, { seq: sent.sequence }))?.header.get("Nats-Msg-Id");
+    } finally { await messageReader.close(); }
+    expect(storedMessageId).toBe(input.id);
+    await pendingIs(receiver, 0, 1);
     const signal = new AbortController();
     const iterator = receiver.inbox(signal.signal)[Symbol.asyncIterator]();
     const delivered = await next(iterator);
-    expect(delivered).toMatchObject({ sequence: retry.sequence, payload: { body: { text: "frozen-before-wire" } } });
+    expect(delivered).toMatchObject({ sequence: sent.sequence, payload: { body: { commandId: "command-lost-puback", text: "frozen-before-wire" } } });
     await delivered.ack();
     await pendingIs(receiver, 0);
     signal.abort();

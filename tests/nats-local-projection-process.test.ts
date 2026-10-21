@@ -7,7 +7,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { jetstream, jetstreamManager } from "@nats-io/jetstream";
 import { MeshStore } from "../src/mesh/store.js";
 import { hostLeasePath, readHostLease, writeHostLease, type FabricHostLease } from "../src/topology/host-leases.js";
-import { ensureTransportStream } from "../src/transport/nats/provision.js";
+import { ensureTransportStream, INBOX_DUPLICATE_WINDOW_MS } from "../src/transport/nats/provision.js";
 import { openNatsKv, LEASES_BUCKET, PRESENCE_BUCKET } from "../src/transport/nats/kv.js";
 import { transportInboxStream, transportInboxStreamSubject } from "../src/transport/nats/subjects.js";
 import { createPathBHarness, resolveNatsBinary, type PathBHarness } from "./helpers/nats-cluster.js";
@@ -124,7 +124,7 @@ describe.skipIf(!binary)("NATS projection multi-process startup", () => {
       maxBytes: 1_073_741_824,
       maxAgeMs: 0,
       maxMessageBytes: 1_048_576,
-      duplicateWindowMs: 600_000,
+      duplicateWindowMs: INBOX_DUPLICATE_WINDOW_MS,
       replicas: 1,
     });
   }, 30_000);

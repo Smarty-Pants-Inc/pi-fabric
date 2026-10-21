@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { JetStreamManager, StreamInfo } from "@nats-io/jetstream";
-import { assertTransportStream, ensureTransportStream, transportStreamConfig, type TransportStreamPolicy } from "../src/transport/nats/provision.js";
+import { assertTransportStream, ensureTransportStream, INBOX_DUPLICATE_WINDOW_MS, transportStreamConfig, type TransportStreamPolicy } from "../src/transport/nats/provision.js";
 
 const policy: TransportStreamPolicy = {
   name: "FABRIC_IN_machine-a",
@@ -8,7 +8,7 @@ const policy: TransportStreamPolicy = {
   maxBytes: 1_073_741_824,
   maxAgeMs: 24 * 60 * 60_000,
   maxMessageBytes: 1_048_576,
-  duplicateWindowMs: 600_000,
+  duplicateWindowMs: INBOX_DUPLICATE_WINDOW_MS,
   replicas: 1,
 };
 
@@ -17,8 +17,9 @@ const streamInfo = (maxAge: number): StreamInfo => ({
 } as unknown as StreamInfo);
 
 describe("NATS inbox stream age policy", () => {
-  it("sets the bounded seven-day max_age in the stream policy", () => {
+  it("sets the bounded max_age and retry-covering duplicate window in the stream policy", () => {
     expect(transportStreamConfig(policy).max_age).toBe(24 * 60 * 60_000 * 1_000_000);
+    expect(transportStreamConfig(policy).duplicate_window).toBe(INBOX_DUPLICATE_WINDOW_MS * 1_000_000);
     expect(() => assertTransportStream(streamInfo(transportStreamConfig(policy).max_age!), transportStreamConfig(policy))).not.toThrow();
   });
 

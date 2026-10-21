@@ -753,6 +753,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
   #natsClosing: Promise<void> | undefined;
   #transportRenewing: Promise<void> | undefined;
   #transportReconnectUnsubscribe: (() => void) | undefined;
+  #verifiedReconnectGeneration = 0;
+  #confirmedReconnectGeneration = 0;
   #natsConfirmedAt = 0;
   #transportRecovering = false;
   #transportLost = false;
@@ -1202,7 +1204,17 @@ export class ParticipantDirectory implements FabricParticipantSource {
         if (this.#closed || this.#transportLost) return;
         const live = this.#live();
         this.#lifecycleTick(live);
-        if (live) void this.#renewTransportLease().catch(() => undefined);
+        if (!live) return;
+        this.#verifiedReconnectGeneration += 1;
+        // Lease renewal alone can leave #natsPublished's cache looking fresh after a full
+        // JetStream restart. Re-advertise owned presence with a confirmed KV CAS before routing.
+        void this.#renewTransportLease().then(() => {
+          if (this.#closed || this.#transportLost || !lease.live()) return;
+          return this.#refreshNats(true);
+        }).catch(error => {
+          this.#refreshError = error;
+          this.#routingError = error;
+        });
       });
       this.#participantView = new KvParticipantDirectory({
         transport, lease, identityId: this.options.identity.id,
@@ -2827,6 +2839,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
       const commit = async (): Promise<void> => {
         assertLive();
         if (valid && !valid()) throw new ParticipantPublicationChangedError();
+        const reconnectGeneration = this.#verifiedReconnectGeneration;
+        const forcePresence = reconnectGeneration > this.#confirmedReconnectGeneration;
         const root = desired.get(this.options.rootId);
         this.#assertRootPublishable(root);
         if (root?.kind === "root" && this.#localRecords.get(root.id)?.kind !== "root") await this.resumeLineage();
@@ -2847,8 +2861,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
           this.#assertRootPublishable(record);
           if (record.kind === "actor" && this.options.actorRenewalAllowed && !this.options.actorRenewalAllowed(record)) continue;
           const previous = this.#natsPublished.get(id);
-          if (!previous || this.#natsChanged(previous, record)) {
-            await view.publish(record);
+          if (forcePresence || !previous || this.#natsChanged(previous, record)) {
+            await view.publish(record, forcePresence ? { force: true } : {});
             this.#natsPublished.set(id, record);
             this.#natsPublishedAt.set(id, Date.now());
           }
@@ -2866,6 +2880,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
         assertLive();
         this.#localRecords.clear();
         for (const [id, record] of this.#natsPublished) this.#localRecords.set(id, record);
+        if (forcePresence) this.#confirmedReconnectGeneration = reconnectGeneration;
         this.#natsConfirmedAt = Date.now();
         this.#leaseConfirmed = true;
         this.#refreshError = undefined;

@@ -903,8 +903,8 @@ describe("running-task followUp advisory (#3005)", () => {
   });
 });
 
-// Keep: NATS presence can briefly lag this sender's verified reconnect, but guessed/unknown targets must not inherit the peer-lease wait.
-describe("short NATS reconnect presence grace", () => {
+// Keep: NATS presence can lag new actor publication or this sender's verified reconnect; reconnect grace never shortens the baseline route wait.
+describe("NATS reconnect presence grace", () => {
   it("waits briefly for a target to reappear after this sender's verified reconnect", async () => {
     expect(NATS_RECONNECT_PRESENCE_GRACE_MS).toBeGreaterThan(0);
     expect(NATS_RECONNECT_PRESENCE_GRACE_MS).toBeLessThan(PEER_LEASE_WAIT_MS);
@@ -941,7 +941,7 @@ describe("short NATS reconnect presence grace", () => {
     expect(view.whenChanged).toHaveBeenCalled();
   });
 
-  it("expires the reconnect-only wait at its short budget", async () => {
+  it("keeps at least the baseline peer-lease wait when reconnect grace is shorter", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(100_000);
     try {
@@ -962,30 +962,47 @@ describe("short NATS reconnect presence grace", () => {
       const delivery = send.value.routeMessage("session:missing-after-reconnect", "must not wait long", undefined, "followUp")
         .then(result => ({ outcome: "ack" as const, result }), error => ({ outcome: "error" as const, error }));
       await waiting;
-      await vi.advanceTimersByTimeAsync(NATS_RECONNECT_PRESENCE_GRACE_MS);
+      const waitMs = Math.max(PEER_LEASE_WAIT_MS, NATS_RECONNECT_PRESENCE_GRACE_MS);
+      await vi.advanceTimersByTimeAsync(waitMs);
       const settled = await delivery;
       expect(settled.outcome).toBe("error");
       if (settled.outcome === "error") expect(settled.error).toMatchObject({ message: "Unknown Fabric participant: session:missing-after-reconnect (no live record in NATS presence)" });
-      expect(Date.now() - startedAt).toBe(NATS_RECONNECT_PRESENCE_GRACE_MS);
+      expect(Date.now() - startedAt).toBe(waitMs);
       expect(view.whenChanged).toHaveBeenCalledOnce();
       expect(request).not.toHaveBeenCalled();
     } finally { vi.useRealTimers(); }
   });
 
-  it("refuses an unknown participant immediately when no verified reconnect recently occurred", async () => {
-    let verifiedReconnect: (() => void) | undefined;
-    const view = { leaseLive: () => true, resolve: vi.fn(() => undefined),
-      whenChanged: vi.fn(async () => { throw new Error("an unknown target must not arm a long wait"); }) };
-    const request = vi.fn();
-    const control = { request, transportKind: "nats" as const, participantView: view,
-      onVerifiedReconnect: (listener: () => void) => { verifiedReconnect = listener; return () => { verifiedReconnect = undefined; }; } };
-    const send = router(unknown, [], control as unknown as Ports[4]);
-    expect(verifiedReconnect).toBeDefined();
-    const startedAt = Date.now();
-    await expect(send.value.routeMessage("session:unknown-without-reconnect", "must not wait", undefined, "followUp"))
-      .rejects.toThrow("Unknown Fabric participant: session:unknown-without-reconnect (no live record in NATS presence)");
-    expect(Date.now() - startedAt).toBeLessThan(500);
-    expect(view.whenChanged).not.toHaveBeenCalled();
-    expect(request).not.toHaveBeenCalled();
+  it("retains the pre-reconnect peer-lease wait for a missing target", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(100_000);
+    try {
+      let verifiedReconnect: (() => void) | undefined;
+      let enteredWait!: () => void;
+      const waiting = new Promise<void>(resolve => { enteredWait = resolve; });
+      const view = { leaseLive: () => true, resolve: vi.fn(() => undefined),
+        whenChanged: vi.fn((_id: string, signal: AbortSignal) => new Promise<void>((_resolve, reject) => {
+          enteredWait();
+          signal.addEventListener("abort", () => reject(signal.reason ?? new Error("presence wait aborted")), { once: true });
+        })) };
+      const request = vi.fn();
+      const control = { request, transportKind: "nats" as const, participantView: view,
+        onVerifiedReconnect: (listener: () => void) => { verifiedReconnect = listener; return () => { verifiedReconnect = undefined; }; } };
+      const send = router(unknown, [], control as unknown as Ports[4]);
+      expect(verifiedReconnect).toBeDefined();
+      const startedAt = Date.now();
+      const delivery = send.value.routeMessage("session:unknown-without-reconnect", "must wait only the existing budget", undefined, "followUp")
+        .then(result => ({ outcome: "ack" as const, result }), error => ({ outcome: "error" as const, error }));
+      await waiting;
+      expect(view.whenChanged).toHaveBeenCalledOnce();
+      expect(request).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(PEER_LEASE_WAIT_MS);
+      const settled = await delivery;
+      expect(settled.outcome).toBe("error");
+      if (settled.outcome === "error") expect(settled.error).toMatchObject({ message: "Unknown Fabric participant: session:unknown-without-reconnect (no live record in NATS presence)" });
+      expect(Date.now() - startedAt).toBe(PEER_LEASE_WAIT_MS);
+      expect(view.whenChanged).toHaveBeenCalledOnce();
+      expect(request).not.toHaveBeenCalled();
+    } finally { vi.useRealTimers(); }
   });
 });

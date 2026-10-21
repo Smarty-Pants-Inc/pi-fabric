@@ -315,11 +315,9 @@ export class AgentMessageRouter {
       signal?.throwIfAborted();
       // Only our private lookup refusal may replay resolution, never control.request's ACK failure.
       if (!(error instanceof PresenceResolutionRequired)) throw error;
-      let waitMs = PEER_LEASE_WAIT_MS;
-      if (this.#nats) {
-        waitMs = this.#recentReconnectPresenceGrace(error);
-        if (waitMs <= 0) throw error.original;
-      } else if (!recoverLease) throw error.original;
+      const reconnectGraceMs = this.#recentReconnectPresenceGrace(error);
+      if (!recoverLease && reconnectGraceMs <= 0) throw error.original;
+      const waitMs = Math.max(recoverLease ? PEER_LEASE_WAIT_MS : 0, reconnectGraceMs);
       await this.#waitForPresence(error, signal, budget, waitMs);
       try { return await attempt(); }
       catch (retryError) {

@@ -6,14 +6,54 @@ import { detachedPreview } from "../core/preview.js";
 import type { FabricMeshConfig, FabricRetentionConfig } from "../config.js";
 import type { MeshStore } from "../mesh/store.js";
 import { pruneActorRunArchives, pruneActorSessionBackups } from "../storage/retention.js";
-import { closeDirectory, openPrivateDir, writeArchiveFile, type PrivateDirectory } from "../storage/private-dir.js";
+import { openPrivateDir, writeArchiveFile, type PrivateDirectory } from "../storage/private-dir.js";
 import type { FabricActorMessage } from "./types.js";
 
-/** 0700 every directory of a copied tree, each through its own O_NOFOLLOW fd after fstat proves it ours; a link, a
- * file or a foreign entry is skipped, never followed (pi-fabric#875 round 1 P1-2). */
-const closeDirectories = (directory: string, depth = 0): void => {
-  if (depth > 64 || !closeDirectory(directory)) return;
-  for (const name of fs.readdirSync(directory)) closeDirectories(path.join(directory, name), depth + 1);
+export class ActorRunArchiveRefusedError extends Error {
+  readonly code = "FABRIC_ACTOR_RUN_ARCHIVE_REFUSED";
+  constructor(readonly runId: string, cause: unknown) {
+    super(`Actor run ${runId} archive refused: ${cause instanceof Error ? cause.message : String(cause)}`, { cause });
+    this.name = "ActorRunArchiveRefusedError";
+  }
+}
+
+export type ActorRunArchiveResult =
+  | { archived: true; receipt: { runId: string; directory: string } }
+  | { archived: false; reason: "no-source" };
+
+/** Every file owes a durable write; the reopenable name must still identify the held directory. */
+const confirmArchiveDirectory = (directory: string, held: PrivateDirectory): void => {
+  const confirm = (): void => {
+    const named = fs.lstatSync(directory), opened = held.fd === undefined ? fs.statSync(held.path) : fs.fstatSync(held.fd);
+    if (!named.isDirectory() || named.dev !== opened.dev || named.ino !== opened.ino) {
+      throw new Error(`Archive directory ${directory} changed while it was held`);
+    }
+  };
+  confirm();
+  syncDirectoryChain(directory);
+  confirm();
+};
+
+const copyArchiveFile = (held: PrivateDirectory, file: string, source: string): void => {
+  if (!writeArchiveFile(held, file, { source }, true)) {
+    throw new Error(`Archive entry ${file} exists and is not our regular file`);
+  }
+};
+
+/** Idempotent retries of partial nested copies use the same no-follow, durable entry protocol as the root. */
+const copyArchiveTree = (source: string, directory: string, anchor: string, depth = 0): void => {
+  if (depth > 64) throw new Error(`Archive tree ${source} exceeds maximum depth`);
+  if (!fs.lstatSync(source).isDirectory()) throw new Error(`Archive source ${source} is not a directory`);
+  const held = openPrivateDir(directory, anchor);
+  try {
+    if (held.fd !== undefined) fs.fchmodSync(held.fd, 0o700);
+    for (const file of fs.readdirSync(source)) {
+      const src = path.join(source, file);
+      if (fs.lstatSync(src).isDirectory()) copyArchiveTree(src, path.join(directory, file), anchor, depth + 1);
+      else copyArchiveFile(held, file, src);
+    }
+    confirmArchiveDirectory(directory, held);
+  } finally { held.close(); }
 };
 
 export const ACTOR_MESSAGE_HISTORY_LIMIT = 100;
@@ -93,67 +133,47 @@ export class ActorLogStore {
       Partial<Pick<FabricRetentionConfig, "terminalRunEventsAgeMs" | "terminalRunEventsMaxBytes">>,
   ) {}
 
-  async retainRun(actor: ActorLogTarget, runId: string, runDirectory: string | undefined): Promise<void> {
-    if (!runDirectory || !fs.existsSync(runDirectory)) return;
-    const dest = path.join(path.dirname(actor.sessionFile), "runs", runId);
-    // pi-fabric#875 round 2 P1-b: the archive destination is created or validated BEFORE anything is copied, by the
-    // trusted descriptor walk (private-dir.ts), and every copy goes through the held descriptor's path. A symlinked,
-    // foreign or group/other-writable step anywhere in the chain refuses the archive: the run stays unarchived (its
-    // source is untouched) and one line says why.
-    let held: PrivateDirectory;
-    // The anchor is the mesh root (the parent of the `actors` directory the session file lies in), else the actor's own
-    // directory: our own group-writable containers below it are tightened on first use (pi-fabric#875 round 3).
-    const sessionDirectory = path.dirname(path.resolve(actor.sessionFile));
-    const actorsAt = sessionDirectory.lastIndexOf(`${path.sep}actors${path.sep}`);
-    const anchor = actorsAt > 0 ? sessionDirectory.slice(0, actorsAt) : sessionDirectory;
-    try { held = openPrivateDir(dest, anchor); }
-    catch (error) {
-      diagnostics.warn("src/actors/log-store.ts", `[pi-fabric] actor run ${runId} not archived: ${(error as Error).message}`);
-      return;
-    }
+  async retainRun(actor: ActorLogTarget, runId: string, runDirectory: string | undefined): Promise<ActorRunArchiveResult> {
     try {
-      const receipt = path.join(runDirectory, "route-dispatch-receipt.json");
-      if (fs.existsSync(receipt)) {
-        const { readRouteDispatchReceipt } = await import("../agents/model-route.js");
-        const source = readRouteDispatchReceipt(receipt);
-        if (!source || source.runId !== runId) throw new Error("Mismatched route dispatch receipt");
-        // Durable archive confirmation precedes source cleanup (F2 custody): the file and the held directory are
-        // fsynced through their fds, then the chain above by path, which must still name the held directory.
-        if (!writeArchiveFile(held, "route-dispatch-receipt.json", { bytes: Buffer.from(JSON.stringify(source)) }, true)) {
-          throw new Error(`Archive entry ${path.join(dest, "route-dispatch-receipt.json")} exists and is not our regular file`);
+      if (!runDirectory) return { archived: false, reason: "no-source" };
+      const sourceDirectory = fs.lstatSync(runDirectory, { throwIfNoEntry: false });
+      if (!sourceDirectory) return { archived: false, reason: "no-source" };
+      if (!sourceDirectory.isDirectory()) throw new Error(`Archive source ${runDirectory} is not a directory`);
+      const dest = path.join(path.dirname(actor.sessionFile), "runs", runId);
+      // The trusted descriptor walk refuses unsafe ancestors before copying. Only Fabric-owned directories at or
+      // below the anchor may self-heal; a refusal must leave source custody intact, never resolve as success.
+      const sessionDirectory = path.dirname(path.resolve(actor.sessionFile));
+      const actorsAt = sessionDirectory.lastIndexOf(`${path.sep}actors${path.sep}`);
+      const anchor = actorsAt > 0 ? sessionDirectory.slice(0, actorsAt) : sessionDirectory;
+      const held = openPrivateDir(dest, anchor);
+      try {
+        const receipt = path.join(runDirectory, "route-dispatch-receipt.json");
+        if (fs.lstatSync(receipt, { throwIfNoEntry: false })) {
+          const { readRouteDispatchReceipt } = await import("../agents/model-route.js");
+          const source = readRouteDispatchReceipt(receipt);
+          if (!source || source.runId !== runId) throw new Error("Mismatched route dispatch receipt");
+          if (!writeArchiveFile(held, "route-dispatch-receipt.json", { bytes: Buffer.from(JSON.stringify(source)) }, true)) {
+            throw new Error("Archive entry route-dispatch-receipt.json exists and is not our regular file");
+          }
         }
-        const named = fs.statSync(dest), opened = fs.statSync(held.path);
-        if (named.dev !== opened.dev || named.ino !== opened.ino) throw new Error(`Archive directory ${dest} changed while it was held`);
-        syncDirectoryChain(dest);
-      }
-      // pi-fabric#875 round 4 SEC P1: no path write into the archive. Each entry is created O_EXCL|O_NOFOLLOW through
-      // the held fd, or replaced by rename only when it is our own regular file; anything else (a symlink planted while
-      // a healed directory was writable) refuses that entry, with one line, and the source is untouched.
-      for (const file of ["events.jsonl", "status.json", "reply.json", "task.txt", "relaunches.jsonl"]) {
-        const src = path.join(runDirectory, file);
-        if (!fs.existsSync(src)) continue;
-        try {
-          if (!writeArchiveFile(held, file, { source: src })) diagnostics.warn("src/actors/log-store.ts", `[pi-fabric] actor run ${runId}: archive entry ${file} exists and is not our regular file; not written`);
-        } catch (error) { diagnostics.warn("src/actors/log-store.ts", `[pi-fabric] actor run ${runId}: archive entry ${file} not written: ${(error as Error).message}`); }
-      }
-      const nested = path.join(runDirectory, "nested");
-      if (fs.existsSync(nested)) {
-        try {
-          // Copied only into a nested/ directory this archive creates now (fresh, 0700): never into existing entries.
-          fs.mkdirSync(path.join(held.path, "nested"), { mode: 0o700 });
-          fs.chmodSync(path.join(held.path, "nested"), 0o700); // our fresh directory; a umask 0400 left 0300 (unopenable)
-          if (!closeDirectory(path.join(held.path, "nested"))) throw new Error("the new nested directory is not ours");
-          fs.cpSync(nested, path.join(held.path, "nested"), { recursive: true });
-          // cpSync keeps the source's modes; a run made under umask 002 is 0775. Archived directories are 0700, like
-          // the archive itself (smarty-dev#9016), each through its own O_NOFOLLOW fd. Files keep their modes.
-          if (process.platform !== "win32") closeDirectories(path.join(held.path, "nested"));
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code === "EEXIST") diagnostics.warn("src/actors/log-store.ts", `[pi-fabric] actor run ${runId}: archive nested/ exists; not copied again`);
-          /* otherwise best-effort recursive run retention */
+        // Every present entry must succeed. Missing optional files are not refusals; unreadable files, symlinks,
+        // unsafe destination entries and I/O failures are. Never discharge custody after a best-effort copy.
+        for (const file of ["events.jsonl", "status.json", "reply.json", "task.txt", "relaunches.jsonl"]) {
+          const src = path.join(runDirectory, file);
+          if (fs.lstatSync(src, { throwIfNoEntry: false })) copyArchiveFile(held, file, src);
         }
-      }
-    } finally { held.close(); }
-    this.pruneRuns(actor);
+        const nested = path.join(runDirectory, "nested");
+        if (fs.lstatSync(nested, { throwIfNoEntry: false })) copyArchiveTree(nested, path.join(dest, "nested"), anchor);
+        // Apply the durable confirmation even to runs without a routing receipt, AFTER all copies have succeeded.
+        confirmArchiveDirectory(dest, held);
+      } finally { held.close(); }
+      // Retention sweeps run separately: pruning here could delete a just-copied prior run before cleanup commits.
+      return { archived: true, receipt: { runId, directory: dest } };
+    } catch (cause) {
+      const error = new ActorRunArchiveRefusedError(runId, cause);
+      diagnostics.error("src/actors/log-store.ts", `[pi-fabric] ${error.message}; source retained`);
+      throw error;
+    }
   }
 
   pruneRuns(actor: ActorLogTarget, now = Date.now()): void {

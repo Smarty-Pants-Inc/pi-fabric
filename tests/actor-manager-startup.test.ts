@@ -128,7 +128,7 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
     } finally { active = false; clearImmediate(heartbeat!); }
   }, 60_000);
 
-  it("yields Windows startup maintenance between actors without adding per-run filesystem work", async () => {
+  it("yields Windows startup trace archival between actors with bounded metadata work", async () => {
     const f = fixture(17);
     vi.spyOn(process, "platform", "get").mockReturnValue("win32");
     const lstat = fs.lstatSync;
@@ -138,8 +138,9 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
       if (path.basename(String(file)) === "status.json" && String(file).includes(`${path.sep}runs${path.sep}run-`)) {
         statusProbes++; probesThisTurn++;
         // Controlled metadata latency, independent of whether this host has NTFS.
-        // Eight actors share 72 candidates: four status probes/run at 2 ms each
-        // exceed the existing heartbeat bound. One actor still does identical work.
+        // Each candidate now has four pre-archive safety probes, one trace-archive scan,
+        // and four post-archive safety probes. Eight actors would do 72 candidates in a
+        // turn; yielding after one actor keeps that new durability work bounded.
         const until = performance.now() + 2;
         while (performance.now() < until) { /* slow filesystem metadata */ }
       }
@@ -162,10 +163,11 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
       f.make();
       await eventually(() => !fs.existsSync(f.runDir(16, 8)));
       await turn();
-      const probesPerActor = 9 * 4; // Nine expired runs, four status metadata probes each.
+      const probesPerRun = 9; // Four pre-archive probes, one archive scan, four post-archive probes.
+      const probesPerActor = 9 * probesPerRun; // Nine expired runs, bounded per actor.
       process.stdout.write(JSON.stringify({ probe: "Windows startup metadata latency", statusProbes, longestSliceMs: longest,
         maxProbesPerTurn: Math.max(...probesPerTurn), workTurns: probesPerTurn.length }) + "\n");
-      expect(statusProbes).toBe(17 * probesPerActor); // Same four status metadata probes per candidate as main.
+      expect(statusProbes).toBe(17 * probesPerActor); // Every candidate gets one archive scan and both safety walks.
       // Windows yields after every actor: no turn may carry a second actor's metadata
       // work (8 actors/turn would be 288 probes), and the sweep spans one turn per actor.
       expect(Math.max(...probesPerTurn)).toBe(probesPerActor);

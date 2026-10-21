@@ -66,14 +66,15 @@ const isShared = (root) => {
 
 function pinRoot() {
   try {
-    const root = realpath(tmpdir());
-    // A child may narrow TMPDIR, but changing its environment must not widen the run's root.
+    // A child may narrow TMPDIR to a path it creates only after startup. Honor the inherited
+    // private ceiling before resolving that child-local scratch path.
     if (inheritedRoot !== null) {
       const cap = realpath(inheritedRoot);
       // Descendants may narrow TMPDIR for their own scratch files, but the inherited
       // ceiling is the already-validated private test root and must not narrow with it.
       return isShared(cap) ? undefined : cap;
     }
+    const root = realpath(tmpdir());
     return isShared(root) ? undefined : root;
   } catch { return undefined; }
 }
@@ -125,10 +126,13 @@ function callerFrame() {
     && !line.includes("node:internal") && !line.includes("(node:fs") && !/^at (node:fs|fs\.)/.test(line)) ?? "unknown";
 }
 
-function registeredTempRoot(root) {
+function registeredTempRoot(root, referenceRoot) {
   try {
     if (!new RegExp(`^${testTempParentPrefix}[A-Za-z0-9]{6}$`).test(basename(root))) return;
-    const processTemp = realpath(tmpdir());
+    // Workers may narrow TMPDIR into a task grant. Validate against the original, inherited
+    // private run root instead, so the registered fixture remains its exact sibling.
+    if (typeof referenceRoot !== "string") return;
+    const processTemp = realpath(referenceRoot);
     if (dirname(root) !== dirname(processTemp)) return;
     const parent = lstat(dirname(root));
     const directory = lstat(root, { bigint: true });
@@ -149,7 +153,7 @@ function install() {
   const state = { report, root: pinRoot(), count: 0, allowedRoots: new Map(), allowTestDeletionRoot: undefined };
   state.allowTestDeletionRoot = (directory) => {
     const root = realpath(directory);
-    const pin = registeredTempRoot(root);
+    const pin = registeredTempRoot(root, state.root);
     if (!pin) throw new Error(`refusing unowned test deletion root: ${directory}`);
     state.allowedRoots.set(root, pin);
   };
@@ -298,6 +302,13 @@ export function allowTestDeletionRoot(directory) {
 
 const owner = /** @type {Record<symbol, unknown>} */ (process);
 owner[stateKey] ??= install();
+// The parent process's Map is not inherited by spawned workers. Revalidate the exact harness-issued
+// sibling root from the child environment so guarded Node workers can atomically publish their fixtures.
+const state = /** @type {{ allowTestDeletionRoot?: (root: string) => void }} */ (owner[stateKey]);
+if (inheritedRoot !== null && process.env.PI_TEST_TEMP_PARENT_DIR !== undefined) {
+  if (!state.allowTestDeletionRoot) throw new Error("test deletion guard cannot register the inherited test-data root");
+  state.allowTestDeletionRoot(process.env.PI_TEST_TEMP_PARENT_DIR);
+}
 
 // Children inherit the guard and its pinned ceiling, not a wider test-mutated TMPDIR.
 {

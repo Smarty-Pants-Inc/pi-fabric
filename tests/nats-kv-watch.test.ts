@@ -142,6 +142,76 @@ describe("NATS KV watch retry classification", () => {
   });
 });
 
+// Keep: terminal watch failures are a readiness/data-safety boundary and are
+// cheaper to inject deterministically here than through broker permissions/data.
+describe("participant watch terminal diagnostics", () => {
+  it.each([
+    { bucket: "presence" as const, code: "FABRIC_TRANSPORT_INVALID", expectedCode: "FABRIC_TRANSPORT_INVALID", retryFirst: false },
+    { bucket: "leases" as const, code: "FABRIC_TRANSPORT_DENIED", expectedCode: "FABRIC_TRANSPORT_DENIED", retryFirst: true },
+    { bucket: "presence" as const, code: "nats://user:secret@broker/$KV.private.client", expectedCode: "UNKNOWN", retryFirst: false },
+    { bucket: "leases" as const, code: undefined, expectedCode: "UNKNOWN", retryFirst: false },
+  ])("logs one safe terminal warning for $bucket ($expectedCode, retry=$retryFirst)", async ({ bucket, code, expectedCode, retryFirst }) => {
+    const releaseFailure = deferred<void>();
+    const failure = Object.assign(new Error("nats://user:secret@broker $KV.private.client confidential payload"), {
+      code, subject: "$KV.private.client", client: { credential: "secret", data: "confidential payload" },
+    });
+    const attempts: Record<TransportBucket, number> = { presence: 0, leases: 0 };
+    const kv = (watchedBucket: TransportBucket): TransportKv => ({
+      ttlMs: watchedBucket === "presence" ? 600_000 : 15_000,
+      get: async () => undefined,
+      put: async () => 1,
+      delete: async () => false,
+      async *watch<V>(_prefix: string, signal: AbortSignal): AsyncIterable<TransportKvEvent<V>> {
+        const aborted = deferred<void>();
+        const stop = () => aborted.resolve();
+        signal.addEventListener("abort", stop, { once: true });
+        try {
+          if (signal.aborted) return;
+          attempts[watchedBucket]++;
+          if (watchedBucket === bucket && retryFirst && attempts[watchedBucket] === 1) {
+            throw new TransportUnavailableError("transient watch failure");
+          }
+          yield { type: "ready" };
+          await (watchedBucket === bucket ? Promise.race([releaseFailure.promise, aborted.promise]) : aborted.promise);
+          if (!signal.aborted && watchedBucket === bucket) throw failure;
+        } finally { signal.removeEventListener("abort", stop); }
+      },
+    });
+    const transport = { kind: "nats", self: { machine: A, hostId: "watch-owner" }, kv } as unknown as FabricTransport;
+    const leaseAbort = new AbortController();
+    const directory = new KvParticipantDirectory({ transport, lease: { live: () => true, signal: leaseAbort.signal },
+      identityId: "watch-owner", rootId: "watch-owner", ownerIncarnation: "watch-one" });
+    const diagnostic = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const ready = directory.whenChanged("missing", leaseAbort.signal);
+      directory.start();
+      await bounded(ready, "fake participant watch snapshots");
+      expect(directory.ready).toBe(true);
+      expect(diagnostic).not.toHaveBeenCalled();
+
+      const changed = expect(directory.whenChanged("missing", leaseAbort.signal))
+        .rejects.toMatchObject({ code: "FABRIC_DIRECTORY_NOT_READY" });
+      releaseFailure.resolve();
+      releaseFailure.resolve();
+      await bounded(changed, "terminal participant watch failure");
+      expect(directory.ready).toBe(false);
+      expect(() => directory.resolve("missing")).toThrowError(expect.objectContaining({ code: "FABRIC_DIRECTORY_NOT_READY" }));
+      await expect(directory.whenChanged("missing", leaseAbort.signal)).rejects.toMatchObject({ code: "FABRIC_DIRECTORY_NOT_READY" });
+      directory.start(); // Repeated lifecycle/readiness handling must not log again.
+      await directory.close();
+
+      expect(attempts[bucket]).toBe(retryFirst ? 2 : 1);
+      expect(diagnostic.mock.calls).toEqual([[`[fabric:participants:kv-watch] ${JSON.stringify({
+        outcome: "failed", code: expectedCode, bucket, attempt: retryFirst ? 2 : 1,
+      })}`]]);
+    } finally {
+      releaseFailure.resolve();
+      await directory.close();
+      diagnostic.mockRestore();
+    }
+  });
+});
+
 let harness: PathBHarness;
 const connections: NatsConnectionHandle[] = [];
 const watches: Array<{ controller: AbortController; iterator: Watch }> = [];

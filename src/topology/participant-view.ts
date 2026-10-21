@@ -253,8 +253,11 @@ export class KvParticipantDirectory implements ParticipantView {
   async #watch(bucket: TransportBucket): Promise<void> {
     const presence = bucket === "presence";
     const kv = presence ? this.#presence : this.#leases;
+    let attempt = 0;
     while (!this.#closed && !this.#abort.signal.aborted) {
+      attempt++;
       let retryAfterReconnect = false;
+      let failureCode = "WATCH_ENDED";
       try {
         for await (const event of kv.watch<unknown>(">", this.#abort.signal)) {
           if (this.#closed) break;
@@ -302,14 +305,27 @@ export class KvParticipantDirectory implements ParticipantView {
         if (!this.#closed && errorCode(error) === "FABRIC_TRANSPORT_UNAVAILABLE") {
           retryAfterReconnect = true;
           this.#report(error);
-        } else if (!this.#closed) this.#report(error);
+        } else if (!this.#closed) {
+          const code = errorCode(error);
+          failureCode = typeof code === "string" && [
+            "FABRIC_TRANSPORT_INVALID", "FABRIC_TRANSPORT_DENIED", "FABRIC_TRANSPORT_CAPACITY",
+            "FABRIC_TRANSPORT_UNCERTAIN", "FABRIC_TRANSPORT_UNSUPPORTED", "FABRIC_KV_CONFLICT",
+            "FABRIC_DIRECTORY_NOT_READY",
+          ].includes(code) ? code : "UNKNOWN";
+          this.#report(error);
+        }
       }
       if (presence) { this.#presenceReady = false; this.#records.clear(); this.#presenceRevisions.clear(); }
       else { this.#leasesReady = false; this.#hosts.clear(); this.#leaseRevisions.clear(); }
       if (this.#closed || this.#abort.signal.aborted) return;
       if (retryAfterReconnect) continue;
       this.#watchFailed = true;
-      this.#failedWatches.add(bucket);
+      if (!this.#failedWatches.has(bucket)) {
+        this.#failedWatches.add(bucket);
+        try {
+          console.warn(`[fabric:participants:kv-watch] ${JSON.stringify({ outcome: "failed", code: failureCode, bucket, attempt })}`);
+        } catch { /* diagnostic only */ }
+      }
       for (const waiter of [...this.#waiters]) waiter.fail(new DirectoryNotReadyError());
       return;
     }

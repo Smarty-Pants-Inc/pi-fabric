@@ -3,11 +3,13 @@ import {
   AckPolicy,
   DeliverPolicy,
   JetStreamApiError,
+  JetStreamError,
   ReplayPolicy,
   type ConsumerInfo,
   type ConsumerMessages,
   type JsMsg,
 } from "@nats-io/jetstream";
+import { NoRespondersError, RequestError, TimeoutError } from "@nats-io/transport-node";
 import type { MeshEvent } from "../../mesh/event-log.js";
 import type { NatsConnectionHandle } from "./connection.js";
 import { ensureFabricEventsStream, natsEventsStreamName, natsGithubStreamName } from "./provision.js";
@@ -64,6 +66,63 @@ export interface NatsActorEventsConsumer {
   /** Stop and drain local delivery; remove=true also deletes every durable owned by this actor. */
   close(remove?: boolean): Promise<void>;
 }
+
+/** A setup error retains its original cause; metadata contains no broker error messages. */
+export type NatsActorEventsSetupFailure = Error & {
+  readonly setup: {
+    readonly stream: string;
+    readonly durable: string;
+    /** Allowlisted error class/enum or numeric JetStream API/status code, never a message. */
+    readonly code: string;
+    readonly retryable: boolean;
+  };
+};
+
+type SetupClassification = Pick<NatsActorEventsSetupFailure["setup"], "code" | "retryable">;
+const SETUP_NOT_READY = /^(?:no (?:jetstream )?meta leader|(?:jetstream )?cluster (?:is )?not ready|(?:stream|consumer) leader (?:is )?not (?:yet )?elected|consumer (?:is )?not (?:yet )?current)$/i;
+const TERMINAL_SETUP_ERRORS = new Set([
+  "AuthorizationError", "UserAuthenticationExpiredError", "PermissionViolationError",
+  "AuthenticationError", "PermissionError", "ProtocolError", "TypeError", "RangeError", "InvalidNameError", "InvalidArgumentError",
+]);
+const setupClassification = (cause: unknown): SetupClassification => {
+  const seen = new Set<Error>();
+  for (let depth = 0; depth < 6 && cause instanceof Error && !seen.has(cause); depth++) {
+    seen.add(cause);
+    if (TERMINAL_SETUP_ERRORS.has(cause.name)) return { code: cause.name, retryable: false };
+    if (cause instanceof JetStreamApiError) {
+      try {
+        const api = cause.apiError();
+        const code = Number.isSafeInteger(api.err_code) && api.err_code > 0 ? `JS_API_${api.err_code}` :
+          Number.isSafeInteger(api.code) && api.code > 0 ? `JS_STATUS_${api.code}` : "UNKNOWN";
+        const terminal = (api.code >= 400 && api.code < 500 && api.code !== 408) ||
+          [10039, 10076].includes(api.err_code);
+        return {
+          code,
+          retryable: !terminal && (api.code === 408 || api.code === 503 ||
+            [10008, 10009].includes(api.err_code) || SETUP_NOT_READY.test(api.description)),
+        };
+      } catch { return { code: "UNKNOWN", retryable: false }; }
+    }
+    if (cause instanceof TimeoutError) return { code: "TIMEOUT", retryable: true };
+    if (cause instanceof NoRespondersError) return { code: "NO_RESPONDERS", retryable: true };
+    if (cause instanceof JetStreamError && cause.name === "JetStreamStatusError") {
+      const status = (cause as JetStreamError & { readonly code?: number }).code;
+      return {
+        code: typeof status === "number" && Number.isSafeInteger(status) && status > 0 ? `JS_STATUS_${status}` : "UNKNOWN",
+        retryable: status === 408 || status === 503,
+      };
+    }
+    // JetStreamNotEnabled is an SDK wrapper without a public constructor export.
+    // A wrapper name alone is not evidence of a transient request failure.
+    if (!(cause instanceof RequestError) && cause.name !== "JetStreamNotEnabled") break;
+    cause = cause.cause;
+  }
+  return { code: "UNKNOWN", retryable: false };
+};
+const setupFailure = (cause: unknown, stream: string, durable: string): NatsActorEventsSetupFailure =>
+  Object.assign(new Error("NATS actor events consumer setup failed", { cause }), {
+    setup: { stream, durable, ...setupClassification(cause) },
+  });
 
 const apiCode = (error: unknown): number | undefined => {
   if (!(error instanceof JetStreamApiError)) return undefined;
@@ -138,6 +197,10 @@ const startGroup = async (
   const stream = kind === "ev" ? natsEventsStreamName(options.org) : natsGithubStreamName(options.org);
   const durable = `${kind}_${hashToken(options.actorId)}`;
   const api = connection.manager.consumers;
+  const setup = async <T>(operation: () => Promise<T>): Promise<T> => {
+    try { return await operation(); }
+    catch (cause) { throw setupFailure(cause, stream, durable); }
+  };
   const mutableConfig = (filters: string[]) => ({
     filter_subject: "",
     filter_subjects: filters,
@@ -155,32 +218,36 @@ const startGroup = async (
     }
   };
 
-  let info: ConsumerInfo;
-  let created = false;
-  try { info = await api.info(stream, durable); }
-  catch (error) {
-    const code = apiCode(error);
-    if (subjects.length === 0 && (code === CONSUMER_NOT_FOUND || code === 10059)) return undefined;
-    if (code !== CONSUMER_NOT_FOUND) throw error;
-    const startTime = options.eventsStartAt === undefined ? undefined : new Date(options.eventsStartAt).toISOString();
-    try {
-      info = await api.add(stream, {
-        ...mutableConfig(subjects),
-        durable_name: durable,
-        ack_policy: AckPolicy.Explicit,
-        replay_policy: ReplayPolicy.Instant,
-        deliver_policy: startTime === undefined ? DeliverPolicy.All : DeliverPolicy.StartTime,
-        ...(startTime === undefined ? {} : { opt_start_time: startTime }),
-      });
-      created = true;
-    } catch (createError) {
-      // A concurrent opener may have created this actor's durable. Never recreate/reset its cursor.
-      try { info = await api.info(stream, durable); }
-      catch { throw createError; }
+  const opened = await setup(async () => {
+    let info: ConsumerInfo;
+    let created = false;
+    try { info = await api.info(stream, durable); }
+    catch (error) {
+      const code = apiCode(error);
+      if (subjects.length === 0 && (code === CONSUMER_NOT_FOUND || code === 10059)) return false;
+      if (code !== CONSUMER_NOT_FOUND) throw error;
+      const startTime = options.eventsStartAt === undefined ? undefined : new Date(options.eventsStartAt).toISOString();
+      try {
+        info = await api.add(stream, {
+          ...mutableConfig(subjects),
+          durable_name: durable,
+          ack_policy: AckPolicy.Explicit,
+          replay_policy: ReplayPolicy.Instant,
+          deliver_policy: startTime === undefined ? DeliverPolicy.All : DeliverPolicy.StartTime,
+          ...(startTime === undefined ? {} : { opt_start_time: startTime }),
+        });
+        created = true;
+      } catch (createError) {
+        // A concurrent opener may have created this actor's durable. Never recreate/reset its cursor.
+        try { info = await api.info(stream, durable); }
+        catch { throw createError; }
+      }
     }
-  }
-  assertCompatible(info);
-  if (!created && subjects.length > 0) await api.update(stream, durable, mutableConfig(subjects));
+    assertCompatible(info);
+    if (!created && subjects.length > 0) await api.update(stream, durable, mutableConfig(subjects));
+    return true;
+  });
+  if (!opened) return undefined;
 
   let active: DeliveryRun | undefined;
   let failure: Error | undefined;
@@ -195,9 +262,11 @@ const startGroup = async (
   };
   const startDelivery = async (): Promise<void> => {
     if (subjects.length === 0 || closing) return;
-    const consumer = await connection.js.consumers.get(stream, durable);
-    // The connection's inboxPrefix (`_INBOX.<user pubkey>`) is honored by consumer.consume's request/reply path.
-    const messages = await consumer.consume({ max_messages: 1, abort_on_missing_resource: true });
+    const messages = await setup(async () => {
+      const consumer = await connection.js.consumers.get(stream, durable);
+      // The connection's inboxPrefix (`_INBOX.<user pubkey>`) is honored by consumer.consume's request/reply path.
+      return consumer.consume({ max_messages: 1, abort_on_missing_resource: true });
+    });
     const allowed = new Set(subjects);
     const run: DeliveryRun = { messages, stopping: false, done: Promise.resolve() };
     active = run;
@@ -270,7 +339,7 @@ const startGroup = async (
         if (closing) throw new Error("NATS actor events consumer is closed");
         if (failure) throw failure;
         await stopDelivery();
-        if (captured.length > 0) await api.update(stream, durable, mutableConfig(captured));
+        if (captured.length > 0) await setup(() => api.update(stream, durable, mutableConfig(captured)));
         subjects = captured;
         await startDelivery();
       });

@@ -109,6 +109,38 @@ describe("activation projection", () => {
     expect(() => window.verifySystem(journal, [head([journal[0], journal[3]]), current])).toThrow(/system records/);
   });
 
+  // Real Pi 1.2 forced-prompt projection renders sections into content. The same
+  // native renderer also accepts Pi 1.1 content records; neither changes authority.
+  it.each(["content", "sections"] as const)("accepts a rendered native system head from %s records", shape => {
+    const tool = { name: "read", description: "Read a file", parameters: { type: "object" } };
+    const record = { role: "system" as const, content: shape === "content" ? "BASE\n\nRULES" : "",
+      ...(shape === "sections" ? { sections: { preamble: "BASE", rules: "RULES" } } : {}),
+      toolsAdded: [tool], timestamp: 1 };
+    const journal = [record, user("current activation")];
+    const head = getCurrentSystemMessage(journal)!;
+    const rendered = { role: "system" as const, content: getCurrentSystemPrompt(journal),
+      toolsAdded: head.toolsAdded!, timestamp: head.timestamp };
+    const window = new ActivationWindow([record]);
+    expect(() => window.verifySystem(journal, [head])).not.toThrow();
+    expect(() => window.verifySystem(journal, [rendered])).not.toThrow();
+    expect(() => window.verifySystem(journal, [{ ...rendered, content: "FORGED" }])).toThrow(/system prompt/);
+    expect(() => window.verifySystem(journal, [{ ...rendered, toolsAdded: [] }])).toThrow(/system prompt/);
+    expect(() => window.verifySystem(journal, [{ ...rendered, toolsAdded: [{ ...tool, parameters: { type: "string" } }] }])).toThrow(/system prompt/);
+    expect(() => window.verifySystem(journal, [{ ...rendered, timestamp: 2 }])).toThrow(/system prompt/);
+  });
+
+  it("rejects a rewritten earlier section even when a later patch hides it in the rendered head", () => {
+    const system = (preamble: string) => ({ role: "system" as const, content: "", sections: { preamble }, timestamp: 1 });
+    const first = system("ORIGINAL");
+    const journal = [first, system("CURRENT")];
+    const running = [{ role: "system" as const, content: getCurrentSystemPrompt(journal), timestamp: 1 }];
+    const window = new ActivationWindow(journal);
+    expect(() => window.verifySystem(journal, running)).not.toThrow();
+    const forged = [system("FORGED"), journal[1]!];
+    expect(getCurrentSystemPrompt(forged)).toBe(getCurrentSystemPrompt(journal));
+    expect(() => window.verifySystem(forged, running)).toThrow(/system records/);
+  });
+
   it("projects a large prior activation without a token ceiling on the current activation", () => {
     const old = [user("x".repeat(900_000)), assistant("old", 240_000)];
     const current = user("y".repeat(100_000));
@@ -1521,6 +1553,59 @@ describe("native activation window (offline; opted-in success needs exact native
     }
     expect(s.requests).toHaveLength(2);
   }, 2 * HANG_GUARD_MS + 30_000);
+
+  it.skipIf(!selectedNativeBinary).each(["sections", "rendered", "rewrite"] as const)("checks the real native actor system projection (%s)", async shape => {
+    const s = await setup(0, 0, "NO_TOOL_ROUNDS");
+    const headsFile = path.join(s.dir, "system-heads.json");
+    // Ask Pi itself to project the exact rendered prompt, as before_agent_start
+    // extensions can do. Capture at the real provider boundary before the guard.
+    fs.writeFileSync(path.join(s.dir, "noop.ts"), `
+      import fs from 'node:fs';
+      import {getCurrentSystemMessage, getCurrentSystemPrompt} from '@earendil-works/pi-ai';
+      import {sessionEntryToContextMessages} from '@earendil-works/pi-coding-agent';
+      export default function(pi) {
+        ${shape === "sections" ? "" : `pi.on('before_agent_start', event => ({systemPrompt:event.systemPrompt${shape === "rewrite" ? " + '\\n\\nFORGED_SYSTEM_PROMPT'" : ""}}));`}
+        pi.on('before_provider_headers', (_event, ctx) => {
+          const provider = ctx.modelRegistry.getProvider(ctx.model.provider);
+          const stream = provider.streamSimple;
+          provider.streamSimple = function(model, context, options) {
+            const journal = ctx.sessionManager.getBranch().flatMap(entry => entry.type === 'message' ? sessionEntryToContextMessages(entry) : []);
+            fs.writeFileSync(${JSON.stringify(headsFile)}, JSON.stringify({
+              journal:getCurrentSystemMessage(journal), running:getCurrentSystemMessage(context.messages),
+              journalPrompt:getCurrentSystemPrompt(journal), runningPrompt:getCurrentSystemPrompt(context.messages)
+            }));
+            return stream.call(this, model, context, options);
+          };
+        });
+      }
+    `);
+    const launch = ProcessTransport.prototype.launch;
+    vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(function (this: ProcessTransport, request) {
+      return launch.call(this, { ...request, workerArguments: [...request.workerArguments,
+        "--fabric-extension", path.join(s.dir, "noop.ts")] });
+    });
+    const journal = path.join(s.dir, "actor.jsonl");
+    const result = await s.manager.run({ task: "CURRENT_NATIVE_SYSTEM_PROJECTION", model: "window-test/offline",
+      actorId: "system-projection", sessionFile: journal, inferenceContext: "activation", tools: [], extensions: false, transport: "process" });
+    expect(fs.existsSync(headsFile), explain(result)).toBe(true);
+    const heads = JSON.parse(fs.readFileSync(headsFile, "utf8"));
+    expect(heads.journal.content).toBe("");
+    expect(heads.journal.sections.preamble).toBeTypeOf("string");
+    if (shape === "sections") expect(heads.running.sections).toEqual(heads.journal.sections);
+    else {
+      expect(heads.running.sections).toBeUndefined();
+      expect(heads.running.content).toBe(heads.runningPrompt);
+    }
+    if (shape === "rewrite") {
+      expect(heads.runningPrompt).not.toBe(heads.journalPrompt);
+      expect(result, explain(result)).toMatchObject({ status: "failed", error: expect.stringContaining("Activation window lost its native system prompt") });
+      expect(s.requestCount).toBe(0);
+    } else {
+      expect(heads.runningPrompt).toBe(heads.journalPrompt);
+      expect(result, explain(result)).toMatchObject({ status: "completed", text: "useful current result" });
+      expect(s.requestCount).toBe(1);
+    }
+  }, TEST_GUARD_MS);
 
   it.skipIf(!selectedNativeBinary)("two real activations retain full journals and current tool pairs, without Fabric tool enablement", async () => {
     const s = await setup();

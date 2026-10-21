@@ -996,7 +996,7 @@ type FabricActorReadInfo = Omit<FabricActorInfo, "status" | "queued" | "messages
   messages?: number;
   roleStamp?: string;
 };
-type FabricActorSelfReadInfo = Pick<FabricActorActivationIdentity,
+type FabricActorSelfReadInfo = Partial<FabricActorReadInfo> & Pick<FabricActorActivationIdentity,
   "name" | "rootId" | "ownershipToken" | "instructionsDigest" | "roleStamp"> & {
     id: string;
     status: "unknown";

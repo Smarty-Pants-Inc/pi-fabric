@@ -553,7 +553,7 @@ export type FabricActorReadInfo = Omit<FabricActorInfo, "status" | "queued" | "m
 };
 
 /** The activation worker's read-only identity fallback when its owner has no live status view. */
-export type FabricActorSelfReadInfo = Pick<FabricActorActivationIdentity,
+export type FabricActorSelfReadInfo = Partial<FabricActorReadInfo> & Pick<FabricActorActivationIdentity,
   "name" | "rootId" | "ownershipToken" | "instructionsDigest" | "roleStamp"> & {
     id: string;
     status: "unknown";

@@ -30,7 +30,7 @@ import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
 import { readFileRetrying, renameAtomic, syncDirectoryChain, trackTemporary, writeJsonAtomic } from "../core/atomic-write.js";
 import { discardWorkerCompletion, type CompletionRecipient } from "./completion-journal.js";
 import { processStartTime } from "../residency/process-identity.js";
-import { FABRIC_ACTOR_SELF_ENV, normalizeFabricActorActivationIdentity } from "../actors/activation-identity.js";
+import { FABRIC_ACTOR_SELF_ENV, normalizeFabricActorActivationIdentity, type FabricActorActivationIdentity } from "../actors/activation-identity.js";
 import { countUnknownEnodevStarts, enodevDelivered, enodevUnresolvedRuns, noteEnodevDelivered, peekEnodevRun, settleEnodevRun,
   settleGoneEnodevLaunch, settleLostEnodevRun, ownedProcess, provenGoneEnodevLaunch, goneEnodevOutcome, savedEnodevAnswer, recoverDurableActorStop, type OwnedProcess } from "./enodev-recovery.js";
 import {
@@ -257,6 +257,21 @@ const MAX_LOG_DETAIL_CHARS = 900;
 const RETENTION_SWEEP_INTERVAL_MS = 15 * 60 * 1_000;
 /** Unsuccessful managed prompts are retained only up to the existing UI bound, in bytes. */
 const TERMINAL_PROMPT_RETENTION_MAX_BYTES = MAX_UI_TEXT_CHARS;
+
+const childEnvironmentForLaunch = (
+  meshEnvironment: ((environment: NodeJS.ProcessEnv) => NodeJS.ProcessEnv) | undefined,
+  actorSelf: FabricActorActivationIdentity | undefined,
+): ((environment: NodeJS.ProcessEnv) => NodeJS.ProcessEnv) | undefined => {
+  if (!meshEnvironment && !actorSelf) return undefined;
+  // Keep this callback out of the launch frame: transports may retain it while
+  // owning the worker, so it must not close over the full AgentRunRequest/task.
+  return (environment) => {
+    const child = { ...(meshEnvironment?.(environment) ?? environment) };
+    delete child[FABRIC_ACTOR_SELF_ENV];
+    if (actorSelf) child[FABRIC_ACTOR_SELF_ENV] = JSON.stringify(actorSelf);
+    return child;
+  };
+};
 
 type AgentPromptMetadata = {
   promptSha256: string;
@@ -3148,6 +3163,7 @@ export class AgentManager {
         ) {
           throw new Error(`The ${runnerAdapter.label} runner returned an invalid worker launch`);
         }
+        const childEnvironment = childEnvironmentForLaunch(this.#childMeshEnvironment, actorSelf);
         const launch: AgentTransportLaunch = {
           id,
           name,
@@ -3156,12 +3172,7 @@ export class AgentManager {
           workerArguments: [...runnerLaunch.workerArguments],
           // Apply mesh credentials first, then replace inherited actor identity with
           // this exact activation tuple (or clear it for non-actor children).
-          childEnvironment: (environment) => {
-            const child = { ...(this.#childMeshEnvironment?.(environment) ?? environment) };
-            delete child[FABRIC_ACTOR_SELF_ENV];
-            if (actorSelf) child[FABRIC_ACTOR_SELF_ENV] = JSON.stringify(actorSelf);
-            return child;
-          },
+          ...(childEnvironment ? { childEnvironment } : {}),
           ...(request.needs ? { needs: [...request.needs] } : {}),
           ...(request.requires ? { requires: [...request.requires] } : {}),
           ...(this.#spawnerSessionId ? { parentSession: this.#spawnerSessionId } : {}),

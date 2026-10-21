@@ -2,8 +2,8 @@ import { Buffer } from "node:buffer";
 import { Readable } from "node:stream";
 import { setTimeout as sleep } from "node:timers/promises";
 import {
-  JetStreamApiError,
   JetStreamApiCodes,
+  JetStreamApiError,
   type ConsumerMessages,
   type JsMsg,
   type JetStreamClient,
@@ -321,21 +321,34 @@ const authorizationFailure = (error: unknown): boolean => {
 };
 
 export class NatsInboxResourceNotFoundError extends TransportInvalidError {
-  constructor(cause: unknown) {
-    super("NATS inbox JetStream stream or consumer was not found", { cause });
+  constructor(cause: unknown, message = "NATS inbox JetStream stream or consumer was not found") {
+    super(message, { cause });
     this.name = "NatsInboxResourceNotFoundError";
   }
 }
 
 /** Converts terminal inbox setup failures to transport errors, preserving their original cause. */
-export const classifyNatsInboxTerminalError = (error: unknown): Error | undefined => {
+export const classifyNatsInboxTerminalError = (
+  error: unknown,
+  resources?: { readonly stream: string; readonly durable: string },
+): Error | undefined => {
   let cause = error;
   for (let depth = 0; cause && depth < 6; depth += 1) {
     if (cause instanceof JetStreamApiError) {
       try {
         const api = cause.apiError();
-        if (api.code === 404 || api.err_code === JetStreamApiCodes.ConsumerNotFound ||
-            api.err_code === JetStreamApiCodes.StreamNotFound) return new NatsInboxResourceNotFoundError(error);
+        const missingStream = api.err_code === JetStreamApiCodes.StreamNotFound;
+        const missingConsumer = api.err_code === JetStreamApiCodes.ConsumerNotFound;
+        // Preserve the legacy bare HTTP 404 classification, but do not treat other
+        // JetStream 404 codes (for example, message-not-found) as missing resources.
+        if (missingStream || missingConsumer || (api.code === 404 && api.err_code === 0)) {
+          const message = resources && missingStream
+            ? `NATS inbox stream ${JSON.stringify(resources.stream)} is missing or deleted`
+            : resources && missingConsumer
+              ? `NATS inbox durable consumer ${JSON.stringify(resources.durable)} on stream ${JSON.stringify(resources.stream)} is missing or deleted`
+              : undefined;
+          return new NatsInboxResourceNotFoundError(error, message);
+        }
       } catch { /* Preserve classification of the outer error below. */ }
     }
     if (typeof cause !== "object") break;
@@ -918,7 +931,10 @@ class NatsTransportImpl implements FabricTransport {
           }
           } catch (error) {
             if (lifetime.aborted) return;
-            const terminalError = classifyNatsInboxTerminalError(error);
+            const terminalError = classifyNatsInboxTerminalError(error, {
+              stream: this.#stream,
+              durable: consumerPolicy.durable,
+            });
             if (terminalError) {
               diagnostic(terminalError instanceof NatsInboxResourceNotFoundError ?
                 "FABRIC_NATS_INBOX_RESOURCE_NOT_FOUND" : "FABRIC_NATS_INBOX_TERMINAL", "stopped");

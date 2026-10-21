@@ -1157,6 +1157,14 @@ both flags must be booleans. FILE transport keeps them off. In NATS mode the
 existing `PI_FABRIC_MESH_NATS` replacement snapshot supplies these keys when
 present.
 
+The host-level `mesh.nats.eventReceiptLimit` bounds each actor's persisted
+broker-message-ID LRU (default `4096`, range `1`–`65536`). A repeated ID still
+in that window is not enqueued again; its recency update is durably checkpointed
+before the broker ACK. New receipts evict the least-recently-used IDs when the
+configured limit is reached, so only IDs retained in the bounded window are
+deduplicated after that eviction. Child processes inherit the configured limit;
+workspace configuration cannot override it.
+
 **Two streams, no overlap:** `FABRIC_EV_SMARTY_PANTS_INC` owns only
 `fabric.ev.smarty-pants-inc.>`; `GITHUB_SMARTY_PANTS_INC` is the existing
 fabric-store stream for `github.smarty-pants-inc.>`. The equivalent names for

@@ -35,6 +35,7 @@ async function bounded<T>(promise: Promise<T>, label: string, ms = 7_000): Promi
 }
 
 interface Frame { readonly line: string; readonly subject: string; readonly reply?: string; readonly body: Buffer }
+interface ApiFault { readonly code: number; readonly err_code: number; readonly description: string }
 
 /** Transparent loopback fault injector: frame boundaries, not chunk boundaries. Authentication
  * and all stream/consumer behavior remain the real server's. It never logs credential frames. */
@@ -45,6 +46,8 @@ class WireFaults {
   pubAckDrops = 0;
   publishes = 0;
   progress = 0;
+  consumerInfoRequests = 0;
+  private consumerInfoFault?: { readonly error: ApiFault; skip: number; reply?: string };
   private dropAck = false;
   private pubAcksToLose = 0;
   private readonly lostReplies = new Set<string>();
@@ -102,9 +105,18 @@ class WireFaults {
     if (!Number.isSafeInteger(count) || count <= 0) throw new Error("PubAck drop count must be a positive safe integer");
     this.pubAcksToLose += count;
   }
+  failNextConsumerInfo(error: ApiFault, skip = 0): void { this.consumerInfoFault = { error, skip }; }
 
   private forward(frame: Frame, outbound: boolean): boolean {
     if (outbound) {
+      if (frame.subject.startsWith("$JS.API.CONSUMER.INFO.")) {
+        this.consumerInfoRequests += 1;
+        const fault = this.consumerInfoFault;
+        if (fault && !fault.reply) {
+          if (fault.skip > 0) fault.skip -= 1;
+          else if (frame.reply !== undefined) fault.reply = frame.reply;
+        }
+      }
       if (frame.subject.startsWith("$JS.API.CONSUMER.MSG.NEXT.")) {
         this.pullBatches.push((JSON.parse(frame.body.toString()) as { batch: number }).batch);
       }
@@ -147,7 +159,14 @@ class WireFaults {
         const hasReply = tokens.length === (outbound ? (headers ? 5 : 4) : (headers ? 6 : 5));
         const frame: Frame = { line, subject: tokens[1] ?? "", ...(hasReply ? { reply: tokens[replyIndex] } : {}),
           body: bytes.subarray(end + 2 + headers, end + 2 + length) };
-        if (this.forward(frame, outbound)) destination.write(bytes);
+        // Replace exactly one real API reply; authentication, provisioning and all
+        // subsequent consumer/pull/ACK operations still go through the real broker.
+        const fault = this.consumerInfoFault;
+        if (!outbound && fault?.reply === frame.subject) {
+          delete this.consumerInfoFault;
+          const body = JSON.stringify({ error: fault.error });
+          destination.write(`MSG ${frame.subject} ${tokens[2]} ${Buffer.byteLength(body)}\r\n${body}\r\n`);
+        } else if (this.forward(frame, outbound)) destination.write(bytes);
       }
     });
   }
@@ -403,6 +422,52 @@ describe.skipIf(!binary)("real machine-authenticated inbox faults", () => {
     expect(after.created).toBe(before.created);
     expect(after.num_pending).toBe(1);
     expect(after.num_ack_pending).toBe(0);
+  }, 15_000);
+
+  // Keep reason: the reported missing-resource bootstrap failure must pause the
+  // receiver, while ordinary JetStream failures must still reach real delivery.
+  it.each([
+    { resource: "stream", err_code: 10059, description: "stream not found", skip: 0 },
+    { resource: "durable consumer", err_code: 10014, description: "consumer not found", skip: 1 },
+  ])("makes a missing $resource 404 terminal during inbox setup", async ({ resource, err_code, description, skip }) => {
+    const proxy = await WireFaults.open(fixture.serverUrl, fixture.tls!); proxies.push(proxy);
+    const receiver = await open(fixture.users.machineB, `missing-${err_code}`, { servers: proxy.url });
+    const before = proxy.consumerInfoRequests;
+    // Stream absence is reported by ensureTransportConsumer. Consumer absence is
+    // injected after that check, at consumers.get, to exercise the deletion race.
+    proxy.failNextConsumerInfo({ code: 404, err_code, description }, skip);
+    const iterator = receiver.inbox(new AbortController().signal)[Symbol.asyncIterator]();
+    const error = await bounded(iterator.next().catch((error: unknown) => error), "missing resource terminal rejection");
+    expect(error).toBeInstanceOf(TransportInvalidError);
+    expect(error).toMatchObject({ code: "FABRIC_TRANSPORT_INVALID", cause: { status: 404, code: err_code } });
+    expect((error as Error).message).toContain(`${resource} `);
+    expect((error as Error).message).toContain(transportInboxStream(receiver.self.machine));
+    if (resource === "durable consumer") expect((error as Error).message).toContain(transportDurableName(receiver.self.hostId));
+    expect((error as Error).message).toMatch(/missing|deleted/);
+    expect(proxy.consumerInfoRequests - before).toBe(skip + 1);
+    expect(proxy.pullBatches).toHaveLength(0);
+    expect((await bounded(iterator.next(), "terminal iterator stays ended")).done).toBe(true);
+  }, 15_000);
+
+  it.each([
+    { code: 503, err_code: 10008, description: "JetStream temporarily unavailable" },
+    { code: 404, err_code: 10037, description: "no message found" },
+  ])("retries a non-resource JetStream $code/$err_code and delivers with a confirmed ACK", async (fault) => {
+    const proxy = await WireFaults.open(fixture.serverUrl, fixture.tls!); proxies.push(proxy);
+    const sender = await open(fixture.users.machineA, `retry-sender-${fault.err_code}`);
+    const receiver = await open(fixture.users.machineB, `retry-receiver-${fault.err_code}`, { servers: proxy.url });
+    const sent = await sender.send(envelope(sender, receiver, `retry-${fault.err_code}`));
+    const before = proxy.consumerInfoRequests;
+    proxy.failNextConsumerInfo(fault);
+    const signal = new AbortController();
+    const iterator = receiver.inbox(signal.signal)[Symbol.asyncIterator]();
+    const delivery = await next(iterator);
+    expect(delivery).toMatchObject({ sequence: sent.sequence, payload: { id: sent.id } });
+    expect(proxy.consumerInfoRequests - before).toBe(3); // failed setup, retry's check, consumers.get
+    await delivery.ack();
+    await pendingIs(receiver, 0);
+    signal.abort();
+    expect((await bounded(iterator.next(), "retried iterator end")).done).toBe(true);
   }, 15_000);
 
   it("retries a lost PubAck with frozen bytes and the stable envelope id; JetStream stores one message", async () => {

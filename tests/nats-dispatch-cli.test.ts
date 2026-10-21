@@ -257,10 +257,15 @@ brokerSuite("pi-fabric nats dispatch by real placement-run presence", () => {
         const bindingDir = path.join(env.XDG_STATE_HOME!, "pi-fabric", "nats-dispatch");
         const bindingFile = path.join(bindingDir, `${createHash("sha256").update(owner.runId).digest("hex")}.json`);
         const bindingBytes = fs.readFileSync(bindingFile, "utf8");
-        expect(JSON.parse(bindingBytes)).toEqual({
-          format: 1,
-          contentSha256: createHash("sha256").update(JSON.stringify([fs.readFileSync(taskFile, "utf8"), owner.id])).digest("hex"),
+        const bindingDirectoryStat = fs.statSync(bindingDir);
+        expect(JSON.parse(bindingBytes)).toMatchObject({
+          format: 2,
+          contentSha256: createHash("sha256").update(JSON.stringify([
+            fs.readFileSync(taskFile, "utf8"), owner.id, received[0]!.senderId,
+            { dev: bindingDirectoryStat.dev, ino: bindingDirectoryStat.ino, uid: bindingDirectoryStat.uid },
+          ])).digest("hex"),
         });
+        expect(JSON.parse(bindingBytes).createdAt).toEqual(expect.any(Number));
         expect(fs.readdirSync(bindingDir)).toEqual([path.basename(bindingFile)]);
         expect(fs.statSync(bindingDir).mode & 0o777).toBe(0o700);
         expect(fs.statSync(bindingFile).mode & 0o777).toBe(0o600);

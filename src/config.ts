@@ -566,6 +566,9 @@ const meshNatsEphemeralInactiveSeconds = (value: unknown): number => {
 };
 
 const DEFAULT_INBOX_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1_000;
+export const DEFAULT_NATS_EVENT_RECEIPT_LIMIT = 4_096;
+const MIN_NATS_EVENT_RECEIPT_LIMIT = 1;
+const MAX_NATS_EVENT_RECEIPT_LIMIT = 65_536;
 const MIN_INBOX_MAX_AGE_MS = 60 * 1_000;
 const MAX_INBOX_MAX_AGE_MS = 90 * 24 * 60 * 60 * 1_000;
 const isValidInboxMaxAgeMs = (value: unknown): value is number =>
@@ -579,10 +582,18 @@ const meshNatsInboxMaxAgeMs = (value: unknown): number => {
     `must be an integer from ${MIN_INBOX_MAX_AGE_MS} through ${MAX_INBOX_MAX_AGE_MS} milliseconds`);
 };
 
+const meshNatsEventReceiptLimit = (value: unknown): number => {
+  if (value === undefined) return DEFAULT_NATS_EVENT_RECEIPT_LIMIT;
+  if (typeof value === "number" && Number.isSafeInteger(value) && value >= MIN_NATS_EVENT_RECEIPT_LIMIT &&
+      value <= MAX_NATS_EVENT_RECEIPT_LIMIT) return value;
+  throw new FabricMeshNatsConfigError("eventReceiptLimit",
+    `must be an integer from ${MIN_NATS_EVENT_RECEIPT_LIMIT} through ${MAX_NATS_EVENT_RECEIPT_LIMIT}`);
+};
+
 /** Messaging/rollback settings fail visibly in the same typed config-error family as E9. */
 export class FabricMeshNatsConfigError extends Error {
   readonly code = "FABRIC_MESH_TRANSPORT_CONFIG";
-  constructor(readonly field: "operatorMachine" | "rollbackHoldUntil" | "servers" | "custodyStream" | "livenessStream" | "pathBMachines" | "tls" | "org" | "eventOrgs" | "allowInsecureLoopback" | "verifyMachine" | "ephemeralHost" | "ephemeralInactiveSeconds" | "events" | "provision" | "inboxMaxAgeMs", requirement: string) {
+  constructor(readonly field: "operatorMachine" | "rollbackHoldUntil" | "servers" | "custodyStream" | "livenessStream" | "pathBMachines" | "tls" | "org" | "eventOrgs" | "allowInsecureLoopback" | "verifyMachine" | "ephemeralHost" | "ephemeralInactiveSeconds" | "events" | "provision" | "inboxMaxAgeMs" | "eventReceiptLimit", requirement: string) {
     super(`mesh.nats.${field} ${requirement}`);
     this.name = "FabricMeshNatsConfigError";
   }
@@ -624,6 +635,8 @@ export interface FabricMeshNatsConfig {
   ephemeralInactiveSeconds?: number;
   /** Inbox stream message age limit in milliseconds (60 s..90 d, default 7 d); existing max_age:0 streams remain compatible. */
   inboxMaxAgeMs?: number;
+  /** Maximum persisted NATS actor event message-ID receipts per actor (1..65,536, default 4,096). */
+  eventReceiptLimit?: number;
 }
 
 const meshNatsFlag = (value: unknown, field: "events" | "provision"): boolean => {
@@ -761,6 +774,7 @@ const meshNatsConfig = (value: unknown, transport: FabricMeshTransport): FabricM
       ephemeralHost: meshNatsEphemeralHost(nats.ephemeralHost),
       ephemeralInactiveSeconds: meshNatsEphemeralInactiveSeconds(nats.ephemeralInactiveSeconds),
       inboxMaxAgeMs: DEFAULT_INBOX_MAX_AGE_MS,
+      eventReceiptLimit: DEFAULT_NATS_EVENT_RECEIPT_LIMIT,
       ...(machine !== undefined ? { machine } : {}),
       ...(rollbackHoldUntil !== undefined ? { rollbackHoldUntil } : {}),
     };
@@ -810,6 +824,7 @@ const meshNatsConfig = (value: unknown, transport: FabricMeshTransport): FabricM
     ephemeralHost,
     ephemeralInactiveSeconds,
     inboxMaxAgeMs,
+    eventReceiptLimit: meshNatsEventReceiptLimit(messaging.eventReceiptLimit),
   };
 };
 
@@ -1171,7 +1186,7 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     lockProtocol: 1,
     stateBackend: "file",
     transport: "file",
-    nats: { replicas: 1, inboxLanes: 8, events: false, provision: false, ephemeralHost: false, ephemeralInactiveSeconds: 3_600, inboxMaxAgeMs: DEFAULT_INBOX_MAX_AGE_MS },
+    nats: { replicas: 1, inboxLanes: 8, events: false, provision: false, ephemeralHost: false, ephemeralInactiveSeconds: 3_600, inboxMaxAgeMs: DEFAULT_INBOX_MAX_AGE_MS, eventReceiptLimit: DEFAULT_NATS_EVENT_RECEIPT_LIMIT },
     enabled: true,
     announce: false,
     actorScope: "project",
@@ -2621,6 +2636,7 @@ const resolveFabricConfig = (
       delete nats.ephemeralInactiveSeconds;
       delete nats.inboxMaxAgeMs; // Host-only: a workspace cannot alter shared inbox stream retention.
       delete nats.eventOrgs; // Host-only: a workspace cannot widen event credential scopes.
+      delete nats.eventReceiptLimit; // Host-only: a workspace cannot raise the actor's durable receipt-state bound.
       mesh.nats = nats;
       document.mesh = mesh;
       const executor = { ...objectValue(document.executor) };

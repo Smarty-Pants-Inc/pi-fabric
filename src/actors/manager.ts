@@ -22,6 +22,7 @@ import type { FabricCapabilityViewLease } from "../core/action-registry.js";
 import {
   DEFAULT_FABRIC_CONFIG,
   DEFAULT_ACTOR_BATCH_MAX_BYTES,
+  DEFAULT_NATS_EVENT_RECEIPT_LIMIT,
   type FabricAgentRunner,
   type FabricAgentTransport,
   type FabricMeshConfig,
@@ -363,8 +364,11 @@ const DELIVERED_EVENT_MEMORY = 4_096;
 /** Per durable actor: completed mesh subjects retained in its queue checkpoint. */
 const PROCESSED_KEY_MEMORY = 256;
 /** Actor queue snapshots retain recent broker receipts, never an unbounded history. */
-export const NATS_EVENT_RECEIPT_MEMORY = 4_096;
-export function rememberNatsEventReceipt(receipts: Set<string>, messageId: string): string[] {
+export const NATS_EVENT_RECEIPT_MEMORY = DEFAULT_NATS_EVENT_RECEIPT_LIMIT;
+export function rememberNatsEventReceipt(
+  receipts: Set<string>, messageId: string, limit = NATS_EVENT_RECEIPT_MEMORY,
+): string[] {
+  if (!Number.isSafeInteger(limit) || limit < 1) throw new Error("NATS event receipt limit must be a positive safe integer");
   if (receipts.has(messageId)) {
     receipts.delete(messageId);
     receipts.add(messageId);
@@ -372,7 +376,7 @@ export function rememberNatsEventReceipt(receipts: Set<string>, messageId: strin
   }
   receipts.add(messageId);
   const evicted: string[] = [];
-  while (receipts.size > NATS_EVENT_RECEIPT_MEMORY) {
+  while (receipts.size > limit) {
     const oldest = receipts.values().next().value;
     if (oldest === undefined) break;
     receipts.delete(oldest);
@@ -802,6 +806,7 @@ export class ActorManager {
   // smarty-dev#1439: resetSession callers that wait for the in-flight run to settle.
   readonly #pendingResets = new Map<string, Array<{ resolve(info: FabricActorInfo): void; reject(error: Error): void }>>();
   readonly #maxSessionBytes: number;
+  readonly #natsEventReceiptLimit: number;
   readonly #transientBlockCooldownMs: number;
   readonly #transientBlockMaxMs: number;
   // smarty-dev#6144 review round 3: read at every drain, never captured, so a live config reload that
@@ -1117,6 +1122,7 @@ export class ActorManager {
     this.#releasePaused = options.releasePaused ?? false;
     this.#closeGraceMs = Math.max(0, options.closeGraceMs ?? 30_000);
     this.#maxSessionBytes = Math.max(0, options.maxSessionBytes ?? DEFAULT_FABRIC_CONFIG.actors.maxSessionBytes);
+    this.#natsEventReceiptLimit = meshConfig.nats.eventReceiptLimit ?? NATS_EVENT_RECEIPT_MEMORY;
     this.#transientBlockCooldownMs = finitePositive(options.transientBlockCooldownMs)
       ? Math.floor(options.transientBlockCooldownMs) : ACTOR_TRANSIENT_BLOCK_BACKOFF_MS;
     this.#transientBlockMaxMs = Math.max(this.#transientBlockCooldownMs, finitePositive(options.transientBlockMaxMs)
@@ -1471,27 +1477,26 @@ export class ActorManager {
     });
   }
 
-  #trimNatsEventReceipts(receipts: Set<string>): void {
-    while (receipts.size > NATS_EVENT_RECEIPT_MEMORY) {
-      const oldest = receipts.values().next().value;
-      if (oldest === undefined) break;
-      receipts.delete(oldest);
-    }
-  }
-
   #persistNatsEventReceipt(actorId: string, messageId: string): boolean {
     const receipts = this.#natsEventReceipts.get(actorId) ?? new Set<string>();
     if (receipts.has(messageId)) {
-      rememberNatsEventReceipt(receipts, messageId);
+      const previous = [...receipts];
+      rememberNatsEventReceipt(receipts, messageId, this.#natsEventReceiptLimit);
       this.#natsEventReceipts.set(actorId, receipts);
-      return true;
+      if (this.#persistQueue(actorId, true)) return true;
+      receipts.clear();
+      for (const id of previous) receipts.add(id);
+      return false;
     }
-    const evicted = rememberNatsEventReceipt(receipts, messageId);
+    const evicted = rememberNatsEventReceipt(receipts, messageId, this.#natsEventReceiptLimit);
     this.#natsEventReceipts.set(actorId, receipts);
     if (this.#persistQueue(actorId, true)) return true;
     receipts.delete(messageId);
-    for (const id of evicted) receipts.add(id);
-    this.#trimNatsEventReceipts(receipts);
+    if (evicted.length) {
+      const retained = [...receipts];
+      receipts.clear();
+      for (const id of [...evicted, ...retained]) receipts.add(id);
+    }
     if (receipts.size === 0) this.#natsEventReceipts.delete(actorId);
     return false;
   }
@@ -1505,7 +1510,7 @@ export class ActorManager {
     if (!actor || actor.status === "stopped" || actor.removal || (!isWake && !subscribed) ||
         !this.#canManageCached(actorId) || !this.#slotCurrent(actor)) return "retry";
     if (this.#natsEventReceipts.get(actorId)?.has(messageId)) {
-      this.#persistNatsEventReceipt(actorId, messageId);
+      if (!this.#persistNatsEventReceipt(actorId, messageId)) return "retry";
       await ack();
       setImmediate(() => { const current = this.#actors.get(actorId); if (current) this.#ensureDrain(current); });
       return "accepted";
@@ -4666,22 +4671,35 @@ export class ActorManager {
     const createdAt = Date.now();
     const sequence = ++actor.latestActivationSequence;
     let addedNatsReceipt = false;
+    let previousNatsReceiptOrder: string[] | undefined;
+    let evictedNatsReceipts: string[] = [];
     const rememberNatsReceipt = (): void => {
       const id = options.natsEventReceiptId;
       if (id === undefined) return;
       const receipts = this.#natsEventReceipts.get(actor.id) ?? new Set<string>();
-      if (!receipts.has(id)) {
-        receipts.add(id);
-        this.#natsEventReceipts.set(actor.id, receipts);
-        addedNatsReceipt = true;
-      }
+      if (receipts.has(id)) previousNatsReceiptOrder = [...receipts];
+      else addedNatsReceipt = true;
+      evictedNatsReceipts = rememberNatsEventReceipt(receipts, id, this.#natsEventReceiptLimit);
+      this.#natsEventReceipts.set(actor.id, receipts);
     };
     const forgetNatsReceipt = (): void => {
-      if (!addedNatsReceipt || options.natsEventReceiptId === undefined) return;
+      if ((!addedNatsReceipt && previousNatsReceiptOrder === undefined) || options.natsEventReceiptId === undefined) return;
       const receipts = this.#natsEventReceipts.get(actor.id);
-      receipts?.delete(options.natsEventReceiptId);
-      if (receipts?.size === 0) this.#natsEventReceipts.delete(actor.id);
+      if (receipts) {
+        if (previousNatsReceiptOrder !== undefined) {
+          receipts.clear();
+          for (const id of previousNatsReceiptOrder) receipts.add(id);
+        } else {
+          receipts.delete(options.natsEventReceiptId);
+          const retained = [...receipts];
+          receipts.clear();
+          for (const id of [...evictedNatsReceipts, ...retained]) receipts.add(id);
+        }
+        if (receipts.size === 0) this.#natsEventReceipts.delete(actor.id);
+      }
       addedNatsReceipt = false;
+      previousNatsReceiptOrder = undefined;
+      evictedNatsReceipts = [];
     };
     if (options.coalesceKey && !options.batchQueued && !(actor.batchWindowMs! > 0)) {
       // Parked work (waiting for ownership, or restored after a restart) coalesces too (smarty-dev#1065).
@@ -9027,7 +9045,7 @@ export class ActorManager {
       const receipts = this.#natsEventReceipts.get(actor.id) ?? new Set<string>();
       for (const id of saved.natsEventReceipts) {
         if (typeof id !== "string" || id.length === 0) continue;
-        rememberNatsEventReceipt(receipts, id);
+        rememberNatsEventReceipt(receipts, id, this.#natsEventReceiptLimit);
       }
       if (receipts.size) this.#natsEventReceipts.set(actor.id, receipts);
     }

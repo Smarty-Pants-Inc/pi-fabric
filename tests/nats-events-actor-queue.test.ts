@@ -273,7 +273,7 @@ describe("NATS actor event queue admission", () => {
     expect(mocks.startConsumer).toHaveBeenCalledTimes(2);
   });
 
-  it("bounds the durable receipt history with LRU ordering", () => {
+  it("bounds the durable receipt history with default and configured LRU limits", () => {
     const receipts = new Set(["oldest", "recent"]);
     for (let index = 0; index < NATS_EVENT_RECEIPT_MEMORY - 2; index++) {
       rememberNatsEventReceipt(receipts, `receipt-${index}`);
@@ -284,6 +284,11 @@ describe("NATS actor event queue admission", () => {
     expect(receipts.has("oldest")).toBe(false);
     expect(receipts.has("recent")).toBe(true);
     expect(evicted).toEqual(["oldest"]);
+
+    const configured = new Set(["oldest", "recent"]);
+    rememberNatsEventReceipt(configured, "oldest", 2);
+    expect(rememberNatsEventReceipt(configured, "newest", 2)).toEqual(["recent"]);
+    expect([...configured]).toEqual(["oldest", "newest"]);
   });
 
   it("persists the Nats-Msg-Id as data.deliveryId with the queue receipt before ACK", async () => {
@@ -299,6 +304,7 @@ describe("NATS actor event queue admission", () => {
         ...DEFAULT_FABRIC_CONFIG.mesh.nats,
         events: true,
         org: "test-org",
+        eventReceiptLimit: 2,
         servers: ["tls://localhost:4222"],
         credentials: "/unused/user.creds",
         machine: "ryzen2",
@@ -337,10 +343,34 @@ describe("NATS actor event queue admission", () => {
     const saved = queueSnapshot(actor.id);
     expect(saved.items[0]?.payload.data).toMatchObject({ message: "inbound", deliveryId: "nats-msg-mail-1" });
     expect(saved.items[1]?.payload.data).toMatchObject({ wake: true, deliveryId: "nats-msg-wake-1" });
-    expect(saved.natsEventReceipts).toEqual(expect.arrayContaining(["nats-msg-mail-1", "nats-msg-wake-1"]));
+    expect(saved.natsEventReceipts).toEqual(["nats-msg-mail-1", "nats-msg-wake-1"]);
+
+    let resolveDuplicateAck!: () => void;
+    let duplicateAckEntered = false;
+    const duplicateAck = new Promise<void>(resolve => { resolveDuplicateAck = resolve; });
+    const acceptingDuplicate = onMessage(event, "nats-msg-mail-1", () => {
+      duplicateAckEntered = true;
+      expect(queueSnapshot(actor.id).natsEventReceipts).toEqual(["nats-msg-wake-1", "nats-msg-mail-1"]);
+      return duplicateAck;
+    });
+    expect(duplicateAckEntered).toBe(true);
+    expect(queueSnapshot(actor.id).items).toHaveLength(2); // The durable in-window duplicate was not re-enqueued.
+
+    let resolveThirdAck!: () => void;
+    const thirdAck = new Promise<void>(resolve => { resolveThirdAck = resolve; });
+    const thirdEvent: MeshEvent = { ...event, id: "mail-event-3", sequence: 9, data: { message: "newest" } };
+    const acceptingThird = onMessage(thirdEvent, "nats-msg-mail-3", () => {
+      expect(queueSnapshot(actor.id).natsEventReceipts).toEqual(["nats-msg-mail-1", "nats-msg-mail-3"]);
+      return thirdAck;
+    });
+    expect(queueSnapshot(actor.id).items).toHaveLength(3);
+    expect(queueSnapshot(actor.id).natsEventReceipts).toHaveLength(2);
+
     resolveAck();
     resolveWakeAck();
-    await Promise.all([accepting, acceptingWake]);
+    resolveDuplicateAck();
+    resolveThirdAck();
+    await Promise.all([accepting, acceptingWake, acceptingDuplicate, acceptingThird]);
 
     const previousCallback = mocks.onMessage;
     const idleActor = await actors.create({ name: "mail-idle", instructions: "Wait for a targeted wake.", topics: [],

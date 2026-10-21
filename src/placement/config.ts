@@ -21,7 +21,7 @@ const tailnetIpv4 = (hostname: string): boolean => {
 
 export const isLoopbackPlacementUrl = (candidate: string, url: URL): boolean => {
   const authority = /^http:\/\/([^/?#\\]*)/iu.exec(candidate)?.[1];
-  const match = authority?.match(/^127\.0\.0\.1:(\d+)$/u);
+  const match = authority?.match(/^127\.0\.0\.1:([1-9][0-9]*)$/u);
   if (url.protocol !== "http:" || url.hostname !== "127.0.0.1" || !match) return false;
   const port = Number(match[1]);
   return Number.isInteger(port) && port >= 1024 && port <= 65_535 && Number(url.port) === port;

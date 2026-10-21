@@ -1,0 +1,20 @@
+name: Platform regressions
+description: Existing explicit regression groups, once per platform rather than per shard
+runs:
+  using: composite
+  steps:
+    - name: Check CI workflow runtime configuration
+      shell: bash
+      run: bunx vitest run tests/ci-workflows.test.ts tests/ci-test-counts.test.ts
+    - name: Check Python kernel diagnostics
+      shell: bash
+      run: bunx vitest run tests/kernel-errors.test.ts
+    - name: Test verified-kernel ABI and provider dispatch on both platforms
+      shell: bash
+      run: bunx vitest run tests/verified-kernels.test.ts tests/verified-resources.test.ts tests/verified-providers.test.ts tests/verified-authority.test.ts tests/verified-lifecycle.test.ts tests/verified-storage.test.ts tests/verified-artifact.test.ts
+    - name: Check bundled verified-kernel behavior
+      shell: bash
+      run: bun run proof:dist
+    - name: Launcher and Pi host regressions
+      shell: bash
+      run: bunx vitest run tests/worker-e2e.test.ts tests/pi-binary.test.ts tests/script-runtime.test.ts tests/herdr-transport.test.ts tests/prewalk-handoff.test.ts tests/shell-middleware.test.ts

@@ -3,6 +3,7 @@
 //
 //   default          working tree against HEAD, for local iteration
 //   --base <ref>     <ref> against HEAD, for a CI push range or pull request
+//   --list-only      JSON test-file lists per phase, without executing tests
 //
 // README/docs Markdown changes also select the documentation style suite, so a
 // docs-only push still checks the writing rules those files are held to.
@@ -12,13 +13,39 @@
 // (bun run test:smoke) so a Linux or Windows break still surfaces quickly.
 import fs from "node:fs";
 import { execFileSync } from "node:child_process";
+import path from "node:path";
 
 const argv = process.argv.slice(2);
+// CI shards both selections, not just the direct run. Keep local selection unchanged.
+const shard = argv.find((arg) => arg.startsWith("--shard="))?.slice("--shard=".length);
+if (shard !== undefined) {
+  const match = /^(\d+)\/(\d+)$/.exec(shard);
+  if (!match || Number(match[1]) < 1 || Number(match[1]) > Number(match[2])) {
+    throw new Error(`Invalid --shard=${shard}; expected i/N with 1 <= i <= N`);
+  }
+}
+const reportDir = process.env.PI_TEST_REPORT_DIR;
+const recordSelection = (selection) => {
+  if (!reportDir) return;
+  fs.mkdirSync(reportDir, { recursive: true });
+  fs.writeFileSync(path.join(reportDir, "selection.json"), JSON.stringify({
+    shard, platform: process.platform, ...selection,
+  }, null, 2) + "\n");
+};
+const listOnly = argv.includes("--list-only");
+const emptySelection = (reason) => {
+  recordSelection({ reason, direct: [], related: [], phases: [] });
+  if (listOnly) console.log(JSON.stringify({ related: [], direct: [] }));
+};
+const selectionMessage = (message) => (listOnly ? console.error : console.log)(message);
 const baseIndex = argv.indexOf("--base");
 // Either source selects range mode: the CI script passes --base, and an
 // operator can export PI_TEST_BASE when running the file directly.
 const baseFromFlag = baseIndex >= 0;
-const base = baseFromFlag ? (argv[baseIndex + 1] ?? "") : (process.env.PI_TEST_BASE ?? "");
+const baseArgument = argv[baseIndex + 1];
+const base = baseFromFlag
+  ? (baseArgument && !baseArgument.startsWith("--") ? baseArgument : "")
+  : (process.env.PI_TEST_BASE ?? "");
 const rangeMode = baseFromFlag || process.env.PI_TEST_BASE !== undefined;
 
 const git = (args) => execFileSync("git", args, { encoding: "utf8" });
@@ -33,11 +60,13 @@ const changedPaths = (spec) =>
 let changed;
 if (rangeMode) {
   if (!base) {
-    console.log("no base provided (PI_TEST_BASE is empty); nothing to select");
+    emptySelection("no base provided");
+    selectionMessage("no base provided (PI_TEST_BASE is empty); nothing to select");
     process.exit(0);
   }
   if (/^0+$/.test(base)) {
-    console.log(`base ${base} is not a commit (new branch push); nothing to select`);
+    emptySelection("new branch push");
+    selectionMessage(`base ${base} is not a commit (new branch push); nothing to select`);
     process.exit(0);
   }
   try {
@@ -47,6 +76,7 @@ if (rangeMode) {
       .split("\n")
       .filter(Boolean);
   } catch {
+    emptySelection(`cannot resolve base ${base}`);
     console.error(`cannot resolve base ${base}; nothing to select`);
     process.exit(0);
   }
@@ -72,29 +102,67 @@ if (rangeMode) {
   changed = [...changed, ...untracked];
 }
 
-const files = [...new Set(changed)].filter((file) => fs.existsSync(file));
-const isTestFile = (file) => file.startsWith("tests/") && /\.test\.(?:ts|tsx)$/.test(file);
-const sourceTextEdges = new Map();
-for (const test of git(["ls-files", "--cached", "--others", "--exclude-standard", "--", "tests"])
-  .split("\n").filter(isTestFile)) {
-  for (const [, source] of fs.readFileSync(test, "utf8").matchAll(/["'`](src\/[^"'`]+)["'`]/g)) {
-    const tests = sourceTextEdges.get(source) ?? [];
-    tests.push(test);
-    sourceTextEdges.set(source, tests);
+// Both execution and listing must use this exact affected selection.
+function selectAffected(changed) {
+  const files = [...new Set(changed)].filter((file) => fs.existsSync(file));
+  const isTestFile = (file) => file.startsWith("tests/") && /\.test\.(?:ts|tsx)$/.test(file);
+  const sourceTextEdges = new Map();
+  for (const test of git(["ls-files", "--cached", "--others", "--exclude-standard", "--", "tests"])
+    .split("\n").filter(isTestFile)) {
+    for (const [, source] of fs.readFileSync(test, "utf8").matchAll(/["'`](src\/[^"'`]+)["'`]/g)) {
+      const tests = sourceTextEdges.get(source) ?? [];
+      tests.push(test);
+      sourceTextEdges.set(source, tests);
+    }
   }
+  // Docs carry their own style suite. A docs-only change selects nothing else,
+  // so without this mapping a shipped violation stays invisible to CI.
+  const DOCS_STYLE_TEST = "tests/documentation-style.test.ts";
+  const isDocsFile = (file) => file === "README.md" || file.startsWith("docs/");
+  const direct = [...new Set([
+    ...files.filter(isTestFile),
+    ...(files.some(isDocsFile) && fs.existsSync(DOCS_STYLE_TEST) ? [DOCS_STYLE_TEST] : []),
+    ...files.flatMap((file) => sourceTextEdges.get(file) ?? []),
+  ])];
+  const related = files.filter(
+    (file) => (file.startsWith("src/") || file.startsWith("tests/")) && !isTestFile(file),
+  );
+  return { direct, related };
 }
-// Docs carry their own style suite. A docs-only change selects nothing else,
-// so without this mapping a shipped violation stays invisible to CI.
-const DOCS_STYLE_TEST = "tests/documentation-style.test.ts";
-const isDocsFile = (file) => file === "README.md" || file.startsWith("docs/");
-const direct = [...new Set([
-  ...files.filter(isTestFile),
-  ...(files.some(isDocsFile) && fs.existsSync(DOCS_STYLE_TEST) ? [DOCS_STYLE_TEST] : []),
-  ...files.flatMap((file) => sourceTextEdges.get(file) ?? []),
-])];
-const related = files.filter(
-  (file) => (file.startsWith("src/") || file.startsWith("tests/")) && !isTestFile(file),
-);
+const { direct, related } = selectAffected(changed);
+
+if (listOnly) {
+  const selection = { related: [], direct: [] };
+  // This is the discovery-only API used by `vitest list --filesOnly`.
+  // `related` is a CLI subcommand, not a list flag: pass its source inputs as
+  // the related config option, with no filename filters, just as that command does.
+  // Never collect/import test suites or call start(), which would execute tests.
+  process.env.TEST = "true";
+  process.env.VITEST = "true";
+  process.env.NODE_ENV ??= "test";
+  for (const [phase, inputs] of Object.entries({ related, direct })) {
+    if (inputs.length === 0) continue;
+    const { createVitest } = await import("vitest/node");
+    const ctx = await createVitest("test", {
+      watch: false, run: true,
+      ...(phase === "related" ? { related: inputs } : {}),
+    });
+    try {
+      const specs = await ctx.getRelevantTestSpecifications(phase === "direct" ? inputs : []);
+      selection[phase] = [...new Set(specs.map((spec) =>
+        path.relative(process.cwd(), spec.moduleId).replaceAll("\\", "/")))].sort();
+    } finally {
+      await ctx.close();
+    }
+  }
+  console.log(JSON.stringify(selection));
+  process.exit(0);
+}
+
+recordSelection({ base, direct, related, phases: [
+  ...(related.length > 0 ? ["related"] : []),
+  ...(direct.length > 0 ? ["direct"] : []),
+] });
 
 if (direct.length === 0 && related.length === 0) {
   console.log(`${base ? `vs ${base}` : "dirty tree"}: no changed src/tests files; nothing to run`);
@@ -103,22 +171,31 @@ if (direct.length === 0 && related.length === 0) {
 
 // vitest 4: `related` is a subcommand, not a `run` flag.
 const runs = [];
-if (related.length > 0) runs.push(["vitest", "related", ...related]);
+if (related.length > 0) runs.push(["related", ["vitest", "related", ...related]]);
 // ponytail: vitest.config.cts computes exclusions with temp/env side effects, not a
 // reusable export. Let Vitest own discovery for suites covered by dedicated CI jobs.
 // Trade-off: any empty direct selection passes; actual test failures still fail.
 // Keep this off the related run so its existing no-tests behavior is unchanged.
-if (direct.length > 0) runs.push(["vitest", "run", "--passWithNoTests", ...direct]);
+if (direct.length > 0) runs.push(["direct", ["vitest", "run", "--passWithNoTests", ...direct]]);
+for (const [phase, args] of runs) {
+  // A shard can legitimately have no files in an otherwise non-empty selection.
+  if (shard) {
+    args.push(`--shard=${shard}`);
+    if (!args.includes("--passWithNoTests")) args.push("--passWithNoTests");
+  }
+  if (reportDir) args.push("--reporter=default", "--reporter=./scripts/ci-retry-reporter.ts",
+    "--reporter=json", `--outputFile.json=${path.resolve(reportDir, `${phase}.json`)}`);
+}
 console.log(
   `${base ? `vs ${base}` : "dirty tree"}: ${related.length} changed source file(s), ${direct.length} changed test file(s)`,
 );
-console.log(runs.map((args) => "vitest " + args.slice(2).join(" ")).join(" && "));
+console.log(runs.map(([, args]) => "vitest " + args.slice(2).join(" ")).join(" && "));
 if (argv.includes("--dry-run")) {
   console.log("dry run: selection printed, nothing executed");
   process.exit(0);
 }
 try {
-  for (const args of runs) execFileSync("bunx", args, { stdio: "inherit" });
+  for (const [, args] of runs) execFileSync("bunx", args, { stdio: "inherit" });
 } catch {
   process.exit(1);
 }

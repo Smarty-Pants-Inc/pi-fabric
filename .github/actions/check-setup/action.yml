@@ -1,0 +1,70 @@
+name: Hosted check setup
+description: Shared hosted prerequisites and optional restoration of the platform's gated build
+inputs:
+  dist-artifact:
+    description: Platform-specific dist archive produced by the gates job
+    required: false
+    default: ''
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@v4
+      with:
+        node-version-file: package.json
+    - uses: oven-sh/setup-bun@v2
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.14'
+    - name: Require GitHub-hosted test admission
+      # Do not spoof RUNNER_ENVIRONMENT or the parent-admission marker. The
+      # hosted-only guard inherits GitHub's real markers in every test job.
+      shell: bash
+      run: |
+        test "$GITHUB_ACTIONS" = true
+        test "$RUNNER_ENVIRONMENT" = github-hosted
+        test -d "$RUNNER_TEMP"
+    - name: Install runtime prerequisites
+      # Provision rg instead of letting Pi download it ad hoc in nested tests.
+      shell: bash
+      run: |
+        if [ "$RUNNER_OS" = "Windows" ]; then
+          mkdir -p /tmp
+          choco install ripgrep -y --no-progress
+        else
+          sudo apt-get update
+          sudo apt-get install -y ripgrep bubblewrap python3
+        fi
+    - name: Install dependencies
+      shell: bash
+      run: bun install --frozen-lockfile
+    - name: Install pinned nats-server for session-channel acceptance
+      # Every Linux shard keeps the exact qualified 2.14.7 broker on PATH.
+      if: runner.os == 'Linux'
+      shell: bash
+      run: bash scripts/install-pinned-nats-server.sh
+    - name: Download gated build
+      if: inputs.dist-artifact != ''
+      uses: actions/download-artifact@v4
+      with:
+        name: ${{ inputs.dist-artifact }}
+        path: ${{ runner.temp }}/gated-dist
+    - name: Restore gated build (including native executable modes)
+      if: inputs.dist-artifact != ''
+      shell: bash
+      # Git Bash tar treats a Windows drive letter (D:\...) as a remote-host
+      # prefix in BOTH the archive name and -C. Use Bash's POSIX $PWD paths
+      # (/d/...) and extract from inside the checkout instead of -C.
+      run: |
+        cd "$RUNNER_TEMP/gated-dist"
+        archive="$PWD/dist.tar"
+        cd "$GITHUB_WORKSPACE"
+        tar -xf "$archive"
+        # The gated build predates this job's checkout, so tests that compare
+        # dist mtimes with source mtimes would see it as stale. Only after
+        # proving it was built from this exact commit, mark it as fresh.
+        built="$(cat dist/.gated-source-sha 2>/dev/null || true)"
+        if [ "$built" != "$GITHUB_SHA" ]; then
+          echo "gated build is from '${built:-unknown}', not $GITHUB_SHA" >&2
+          exit 1
+        fi
+        find dist -exec touch {} +

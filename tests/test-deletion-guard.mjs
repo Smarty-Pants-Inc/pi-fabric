@@ -1,6 +1,7 @@
 // smarty-dev#11145: test-only deletion guard. Importing this module installs it (side effect).
 // Outside a verified GitHub-hosted job, deletion and rename operands, and copy/link destinations,
-// refuse paths outside the physical TMPDIR pinned at install. cp checks every kept recursive destination.
+// refuse paths outside the physical TMPDIR pinned at install, except explicitly registered,
+// marker-verified test-data roots. cp checks every kept recursive destination.
 // Hosted CI logs TEST_DELETION_REPORT: per outside operand, then delegates. Children inherit NODE_OPTIONS.
 // ponytail: a JS seam, not native race protection; helpers deleting through their own syscalls are out of reach.
 import fs from "node:fs";
@@ -14,6 +15,8 @@ import { isPromise } from "node:util/types";
 const REFUSAL = "test deletion outside private temp (smarty-dev#11145)";
 const REPORT = "TEST_DELETION_REPORT:";
 const stateKey = Symbol.for("pi-fabric.test-deletion-guard");
+const testTempParentPrefix = "pi-fabric-test-data-";
+const testTempParentMarker = ".pi-fabric-test-temp-parent.json";
 const windows = process.platform === "win32";
 
 const selfUrl = new URL(import.meta.url);
@@ -122,9 +125,34 @@ function callerFrame() {
     && !line.includes("node:internal") && !line.includes("(node:fs") && !/^at (node:fs|fs\.)/.test(line)) ?? "unknown";
 }
 
+function registeredTempRoot(root) {
+  try {
+    if (!new RegExp(`^${testTempParentPrefix}[A-Za-z0-9]{6}$`).test(basename(root))) return;
+    const processTemp = realpath(tmpdir());
+    if (dirname(root) !== dirname(processTemp)) return;
+    const parent = lstat(dirname(root));
+    const directory = lstat(root, { bigint: true });
+    const markerPath = join(root, testTempParentMarker);
+    const marker = lstat(markerPath, { bigint: true });
+    if (!parent.isDirectory() || parent.isSymbolicLink() || !directory.isDirectory() || directory.isSymbolicLink() ||
+      realpath(root) !== root || marker.isSymbolicLink() || !marker.isFile() || marker.nlink !== 1n || marker.size > 256n ||
+      isShared(root) || (typeof process.getuid === "function" &&
+        (directory.uid !== BigInt(process.getuid()) || (directory.mode & 0o777n) !== 0o700n ||
+         marker.uid !== BigInt(process.getuid()) || (marker.mode & 0o777n) !== 0o600n))) return;
+    if (fs.readFileSync(markerPath, "utf8") !== '{"format":1,"purpose":"pi-fabric-test-temp-parent"}') return;
+    return { dev: directory.dev, ino: directory.ino };
+  } catch { return; }
+}
+
 function install() {
   const report = hostedOnly("outside-temp deletion reporting");
-  const state = { report, root: pinRoot(), count: 0 };
+  const state = { report, root: pinRoot(), count: 0, allowedRoots: new Map(), allowTestDeletionRoot: undefined };
+  state.allowTestDeletionRoot = (directory) => {
+    const root = realpath(directory);
+    const pin = registeredTempRoot(root);
+    if (!pin) throw new Error(`refusing unowned test deletion root: ${directory}`);
+    state.allowedRoots.set(root, pin);
+  };
 
   /** An Error to refuse with, or undefined to delegate. */
   const check = (operation, input, followFinal = false) => {
@@ -133,7 +161,14 @@ function install() {
     try {
       raw = rawPath(input);
       if (raw === undefined) return undefined; // Node rejects it before any syscall.
-      outside = state.root === undefined || !within(state.root, resolveTarget(raw, followFinal));
+      const target = resolveTarget(raw, followFinal);
+      outside = !(state.root !== undefined && within(state.root, target)) && ![...state.allowedRoots].some(([root, pin]) => {
+        try {
+          const current = lstat(root, { bigint: true });
+          return current.isDirectory() && !current.isSymbolicLink() && current.dev === pin.dev && current.ino === pin.ino
+            && realpath(root) === root && within(root, target);
+        } catch { return false; }
+      });
     } catch {
       outside = true; // Unresolvable: fail closed.
     }
@@ -251,6 +286,14 @@ function install() {
     try { process.stderr.write(`TEST_DELETION_REPORT_TOTAL: ${JSON.stringify({ [key]: state.count })}\n`); } catch { /* exit */ }
   });
   return state;
+}
+
+/** Register the exact private test-data root created by scripts/test-temp.ts; never a shared parent. */
+export function allowTestDeletionRoot(directory) {
+  const state = /** @type {{ allowTestDeletionRoot?: (root: string) => void } | undefined} */
+    (/** @type {Record<symbol, unknown>} */ (process)[stateKey]);
+  if (!state?.allowTestDeletionRoot) throw new Error("test deletion guard is not installed");
+  state.allowTestDeletionRoot(directory);
 }
 
 const owner = /** @type {Record<symbol, unknown>} */ (process);

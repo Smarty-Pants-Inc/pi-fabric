@@ -120,6 +120,21 @@ const expectExternalIntact = () => {
   expect(lstatSync(externalDir).isDirectory()).toBe(true);
 };
 
+it("allows cleanup only inside the explicitly registered, marker-verified test-data root", () => {
+  requireGuard();
+  const root = process.env.PI_TEST_TEMP_PARENT_DIR;
+  expect(root).toBeDefined();
+  expect(inside(privateTemp, realpathSync(root!))).toBe(false);
+  const marker = join(root!, ".pi-fabric-test-temp-parent.json");
+  expect(fs.readFileSync(marker, "utf8")).toBe('{"format":1,"purpose":"pi-fabric-test-temp-parent"}');
+  const fixture = join(root!, "guard-registered-fixture-sentinel");
+  writeFileSync(fixture, "owned by this test");
+  fs.rmSync(fixture);
+  expect(existsSync(fixture)).toBe(false);
+  expect(() => fs.rmSync(externalFile)).toThrow(refusal);
+  expectExternalIntact();
+});
+
 const expectRefused = (outcome: Outcome, mode: Outcome["kind"]) => {
   expect(outcome.kind).toBe(mode);
   expect(String((outcome.error as Error | undefined)?.message)).toMatch(refusal);

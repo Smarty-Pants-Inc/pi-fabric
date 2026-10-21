@@ -1,14 +1,20 @@
 import { readFileSync } from "node:fs";
-import { isolateTestFleetEnvironment } from "../scripts/test-temp.js";
+import { resolve } from "node:path";
+import { isolateTestFleetEnvironment, testTempParentEnvironment } from "../scripts/test-temp.js";
+
+const testTempParent = process.env[testTempParentEnvironment];
+if (!testTempParent) throw new Error("Vitest test temp parent is missing");
+const ownedTestTempParent = resolve(testTempParent);
+// smarty-dev#11145: the guard remains pinned to process TMPDIR. The one unique, private
+// harness-owned sibling parent is registered explicitly so its fixtures can be cleaned safely.
+// Install before test imports. Node children inherit the same module through NODE_OPTIONS --import.
+const deletionGuard = await import(new URL("./test-deletion-guard.mjs", import.meta.url).href);
+deletionGuard.allowTestDeletionRoot(ownedTestTempParent);
 
 // Vitest runs setup before each test file's static imports. Config already scrubbed
-// the parent; give this file (and children spawned by it) its own private state.
+// the parent; give this file its own private fleet root beside (not under) its TMPDIR.
 // Tests can still opt into specific behavior with vi.stubEnv after this boundary.
-isolateTestFleetEnvironment();
-
-// smarty-dev#11145: refuse deletion outside this run's private TMPDIR; hosted CI reports instead.
-// Install before test imports. Node children inherit the same module through NODE_OPTIONS --import.
-await import(new URL("./test-deletion-guard.mjs", import.meta.url).href);
+isolateTestFleetEnvironment(ownedTestTempParent);
 
 // smarty-dev#6477: production sqlite mode opens only an imported root. In-process test fixtures that
 // build fresh sqlite roots keep doing so (state.db plus the moved marker, as an import leaves a fresh

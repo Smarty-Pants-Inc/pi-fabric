@@ -24,16 +24,19 @@ registerHooks({ resolve(specifier, context, nextResolve) {
 }});
 Object.defineProperty(process, "platform", { value: "win32" });
 const { default: config } = await import(pathToFileURL(path.resolve("vitest.config.cts")).href);
-const { isolatedTestTemp, isolateTestFleetEnvironment } = await import(pathToFileURL(path.resolve("scripts/test-temp.ts")).href);
+const { isolatedTestTemp, isolateTestFleetEnvironment, testTempParentEnvironment } = await import(pathToFileURL(path.resolve("scripts/test-temp.ts")).href);
 const root = config.test.env.TMPDIR;
+const testTempParent = config.test.env[testTempParentEnvironment];
 // smarty-dev#11145 r5: a private run child of the job root, never the shared job root itself.
 assert.equal(path.dirname(root), path.join(process.env.RUNNER_TEMP, "pi-fabric-vitest-job"));
 assert.match(path.basename(root), /^pi-fabric-vitest-run-[A-Za-z0-9]{6}$/);
 assert.deepEqual(isolatedTestTemp("pi-fabric-vitest-"), { TMPDIR: root, TMP: root, TEMP: root });
+assert.equal(path.dirname(testTempParent), path.dirname(root));
+assert.match(path.basename(testTempParent), /^pi-fabric-test-data-[A-Za-z0-9]{6}$/);
 const configFleet = path.dirname(process.env.PI_CODING_AGENT_DIR);
-const fileFleet = path.dirname(isolateTestFleetEnvironment().PI_CODING_AGENT_DIR);
+const fileFleet = path.dirname(isolateTestFleetEnvironment(testTempParent).PI_CODING_AGENT_DIR);
 assert.notEqual(configFleet, fileFleet, "fleet state must remain unique per file");
-for (const fleet of [configFleet, fileFleet]) assert.equal(path.dirname(fleet), root);
+for (const fleet of [configFleet, fileFleet]) assert.equal(path.dirname(fleet), testTempParent);
 if (process.env.WINDOWS_TEMP_PROBE_CHILD === "1") {
   console.log(JSON.stringify({ root, fleets: [configFleet, fileFleet] }));
   process.exit(Number(process.env.WINDOWS_TEMP_PROBE_EXIT));

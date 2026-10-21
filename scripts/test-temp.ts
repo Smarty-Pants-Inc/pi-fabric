@@ -95,9 +95,29 @@ export function cleanupIsolatedTestTemp(): void {
   for (const cleanup of ownedTempCleanups()) cleanup();
 }
 
+/** Create one unique private parent for mesh roots and test fixtures beside process TMPDIR. */
+export function isolatedTestTempParent(base: string): string {
+  const directory = mkdtempSync(join(resolve(base), testTempParentPrefix));
+  writeFileSync(join(directory, testTempParentMarker), JSON.stringify({ format: 1, purpose: "pi-fabric-test-temp-parent" }),
+    { mode: 0o600, flag: "wx" });
+  ownedTempCleanups().add(ownedRootCleanup(directory));
+  registerTestDeletionRoot(directory);
+  return directory;
+}
+
+/** If the test-only deletion guard is already loaded, authorize only this private owned root. */
+function registerTestDeletionRoot(directory: string): void {
+  const owner = process as typeof process & Record<symbol, unknown>;
+  const guard = owner[Symbol.for("pi-fabric.test-deletion-guard")] as { allowTestDeletionRoot?: (root: string) => void } | undefined;
+  guard?.allowTestDeletionRoot?.(directory);
+}
+
 // Launcher ownership is separate from the Windows runner's persistent MSYS job ownership.
 // These exact names deliberately survive isolateTestFleetEnvironment's production-selector scrub.
 export const testTempRunEnvironment = "PI_TEST_TEMP_RUN_DIR";
+export const testTempParentEnvironment = "PI_TEST_TEMP_PARENT_DIR";
+export const testTempParentMarker = ".pi-fabric-test-temp-parent.json";
+export const testTempParentPrefix = "pi-fabric-test-data-";
 export const testTempOwnerMarker = ".pi-fabric-vitest-owner.json";
 export const testTempRunPrefix = "pi-fabric-vitest-";
 type ProcessIdentity = (pid: number) => string | null | undefined;
@@ -255,7 +275,7 @@ const testControls = new Set([
 ]);
 
 /** Run at config evaluation AND before each test file's source imports. */
-export function isolateTestFleetEnvironment(): Record<string, string> {
+export function isolateTestFleetEnvironment(testTempParent?: string): Record<string, string> {
   rememberFleetHost(); // Preserve the hosted-only veto BEFORE removing fleet attribution below.
   // Scrub production/future selectors, not the exact test-only controls above.
   // Keep values verbatim: consumers own strict booleans and artifact selection.
@@ -273,7 +293,10 @@ export function isolateTestFleetEnvironment(): Record<string, string> {
   ]) delete process.env[key];
 
   // Keep Windows' stable TMP policy, but never share fleet state between workers/files.
-  const root = mkdtempSync(join(resolve(tmpdir()), "pi-fabric-test-fleet-"));
+  // Test workers use the run root as TMPDIR; put fleet and mesh roots beside it so archive
+  // tests exercise a durable destination outside TMPDIR while remaining inside the caller's
+  // private temp parent (the deletion guard's inherited ceiling).
+  const root = mkdtempSync(join(resolve(testTempParent ?? tmpdir()), "pi-fabric-test-fleet-"));
   const owner = process as typeof process & { [fleetRootsKey]?: Set<() => void> };
   if (!owner[fleetRootsKey]) {
     const roots = owner[fleetRootsKey] = new Set<() => void>();

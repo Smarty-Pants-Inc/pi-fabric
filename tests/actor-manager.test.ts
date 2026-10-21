@@ -26,6 +26,7 @@ import { actorParticipantRecord } from "../src/topology/records.js";
 import { writeParticipantFile } from "../src/topology/participant-files.js";
 import { LIVENESS_POLICY_KEY, writeHostLease } from "../src/topology/host-leases.js";
 import { modelExceptionGrant, withRootExceptionMetadata } from "./helpers/model-exceptions.js";
+import { testTempRoot } from "./helpers/test-temp-root.js";
 
 // smarty-dev#1031: Linux, Darwin and Windows support the Main publication fence (smarty-dev#8090;
 // follow-up smarty-dev#11335). Only unsupported platforms resolve pending with this refusal and keep the tree.
@@ -109,7 +110,7 @@ const setup = (
   agentOverrides: Partial<typeof DEFAULT_FABRIC_CONFIG.agents> = {},
   snapshotActorOwnership?: (fresh?: boolean) => ReadonlyMap<string, boolean>,
 ) => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-actor-test-"));
+  const root = testTempRoot("pi-fabric-actor-test-");
   roots.push(root);
   const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
   // Private legacy-control fixture: #11864 is explicitly listed; #1 remains unlisted.

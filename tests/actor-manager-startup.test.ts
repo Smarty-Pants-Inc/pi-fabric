@@ -1,7 +1,6 @@
 import fs from "node:fs";
 import { createHash } from "node:crypto";
 import { ActorChildCompletionStore } from "../src/actors/child-completions.js";
-import os from "node:os";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -10,6 +9,7 @@ import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
+import { testTempRoot } from "./helpers/test-temp-root.js";
 
 const roots: string[] = [];
 const managers: ActorManager[] = [];
@@ -21,7 +21,7 @@ afterEach(async () => {
 });
 
 function fixture(count: number) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-actor-startup-")); roots.push(root);
+  const root = testTempRoot("fabric-actor-startup-"); roots.push(root);
   const actorRoot = path.join(root, "actors"); fs.mkdirSync(actorRoot);
   const mesh = new MeshStore(path.join(root, "mesh"), 256 * 1024, 100);
   const identity: MeshIdentity = { id: "session:startup", name: "main", kind: "main", sessionId: "startup" };

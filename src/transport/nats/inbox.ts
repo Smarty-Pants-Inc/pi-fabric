@@ -342,9 +342,9 @@ export const classifyNatsInboxTerminalError = (
         // Preserve the legacy bare HTTP 404 classification, but do not treat other
         // JetStream 404 codes (for example, message-not-found) as missing resources.
         if (missingStream || missingConsumer || (api.code === 404 && api.err_code === 0)) {
-          const message = resources && missingStream
+          const message = resources && api.code === 404 && missingStream
             ? `NATS inbox stream ${JSON.stringify(resources.stream)} is missing or deleted`
-            : resources && missingConsumer
+            : resources && api.code === 404 && missingConsumer
               ? `NATS inbox durable consumer ${JSON.stringify(resources.durable)} on stream ${JSON.stringify(resources.stream)} is missing or deleted`
               : undefined;
           return new NatsInboxResourceNotFoundError(error, message);

@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { JetStreamApiCodes, JetStreamApiError } from "@nats-io/jetstream";
-import { NatsInboxResourceNotFoundError, openNatsTransport } from "../src/transport/nats/inbox.js";
+import { classifyNatsInboxTerminalError, NatsInboxResourceNotFoundError, openNatsTransport } from "../src/transport/nats/inbox.js";
 
 const mocks = vi.hoisted(() => ({
   consumerSetupAttempts: 0,
@@ -48,6 +48,17 @@ beforeEach(() => {
 });
 
 describe("NATS inbox terminal missing-resource errors", () => {
+  it("keeps non-resource JetStream 404s retryable while naming actual missing resources", () => {
+    const messageNotFound = new JetStreamApiError({ code: 404, err_code: 10037, description: "no message found" });
+    expect(classifyNatsInboxTerminalError(messageNotFound, { stream: "FABRIC_IN_machine-a", durable: "inbox" })).toBeUndefined();
+
+    const missingStream = new JetStreamApiError({ code: 404, err_code: JetStreamApiCodes.StreamNotFound, description: "stream not found" });
+    const terminal = classifyNatsInboxTerminalError(missingStream, { stream: "FABRIC_IN_machine-a", durable: "inbox" });
+    expect(terminal).toBeInstanceOf(NatsInboxResourceNotFoundError);
+    expect(terminal?.message).toBe('NATS inbox stream "FABRIC_IN_machine-a" is missing or deleted');
+    expect((terminal as Error & { cause?: unknown }).cause).toBe(missingStream);
+  });
+
   it.each([
     { label: "HTTP 404", status: 404, code: 0 },
     { label: "consumer not found", status: 500, code: JetStreamApiCodes.ConsumerNotFound },

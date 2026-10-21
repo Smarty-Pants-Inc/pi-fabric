@@ -1,0 +1,14 @@
+name: Hosted Linux user systemd
+description: Preserve the user bus for scope acceptance and affected cgroup tests
+runs:
+  using: composite
+  steps:
+    - name: Start a user systemd manager
+      shell: bash
+      run: |
+        sudo loginctl enable-linger "$USER"
+        bus="/run/user/$(id -u)/bus"
+        for _ in $(seq 1 150); do [ -S "$bus" ] && break; sleep 0.2; done
+        test -S "$bus"
+        echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
+        echo "DBUS_SESSION_BUS_ADDRESS=unix:path=$bus" >> "$GITHUB_ENV"

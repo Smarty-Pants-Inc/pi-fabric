@@ -51,8 +51,11 @@ runs:
     - name: Restore gated build (including native executable modes)
       if: inputs.dist-artifact != ''
       shell: bash
-      # A relative archive name avoids Git Bash tar treating a Windows drive
-      # letter as a remote-host prefix. -C still restores into the checkout.
+      # Git Bash tar treats a Windows drive letter (D:\...) as a remote-host
+      # prefix in BOTH the archive name and -C. Use Bash's POSIX $PWD paths
+      # (/d/...) and extract from inside the checkout instead of -C.
       run: |
         cd "$RUNNER_TEMP/gated-dist"
-        tar -xf dist.tar -C "$GITHUB_WORKSPACE"
+        archive="$PWD/dist.tar"
+        cd "$GITHUB_WORKSPACE"
+        tar -xf "$archive"

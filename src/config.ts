@@ -2635,6 +2635,7 @@ const resolveFabricConfig = (
       delete nats.ephemeralHost; // Host-only: a workspace cannot retain its own inbox durable.
       delete nats.ephemeralInactiveSeconds;
       delete nats.inboxMaxAgeMs; // Host-only: a workspace cannot alter shared inbox stream retention.
+      delete nats.org; // Host-only: a workspace cannot change the event org.
       delete nats.eventOrgs; // Host-only: a workspace cannot widen event credential scopes.
       delete nats.eventReceiptLimit; // Host-only: a workspace cannot raise the actor's durable receipt-state bound.
       mesh.nats = nats;

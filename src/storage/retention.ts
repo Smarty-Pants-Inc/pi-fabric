@@ -356,6 +356,28 @@ const archiveTraceMatches = (file: string, expected: RunSessionTraceArchiveEntry
   } catch { return false; }
   finally { if (fd !== undefined) { try { fs.closeSync(fd); } catch {} } }
 };
+const fsyncTraceArchive = (file: string, expected: RunSessionTraceArchiveEntry): string | undefined => {
+  let fd: number | undefined;
+  try {
+    const named = fs.lstatSync(file), owned = ownedStat(file);
+    if (!owned?.isFile() || named.nlink !== 1 || named.size !== expected.size || named.mtimeMs !== expected.mtimeMs) return;
+    fd = fs.openSync(file, fs.constants.O_RDWR | (fs.constants.O_NOFOLLOW ?? 0));
+    const held = fs.fstatSync(fd);
+    if (!held.isFile() || held.nlink !== 1 || held.dev !== named.dev || held.ino !== named.ino ||
+        held.size !== expected.size || held.mtimeMs !== expected.mtimeMs ||
+        expected.sha256 === undefined && !sameTraceIdentity(held, expected)) return;
+    const digest = hashTraceDescriptor(fd, expected.size);
+    if (!digest || expected.sha256 !== undefined && digest !== expected.sha256) return;
+    fs.fsyncSync(fd);
+    const after = fs.fstatSync(fd), current = fs.lstatSync(file);
+    if (!after.isFile() || after.nlink !== 1 || after.dev !== held.dev || after.ino !== held.ino ||
+        after.size !== expected.size || after.mtimeMs !== expected.mtimeMs || !current.isFile() ||
+        current.nlink !== 1 || current.dev !== held.dev || current.ino !== held.ino ||
+        current.size !== expected.size || current.mtimeMs !== expected.mtimeMs) return;
+    return digest;
+  } catch { return; }
+  finally { if (fd !== undefined) { try { fs.closeSync(fd); } catch {} } }
+};
 const copyTraceToStaging = (sourceFile: string, entry: RunSessionTraceArchiveEntry, stagingFile: string): string | undefined => {
   let source: number | undefined, target: number | undefined;
   try {
@@ -367,12 +389,15 @@ const copyTraceToStaging = (sourceFile: string, entry: RunSessionTraceArchiveEnt
     if (existing) {
       if (!ownedStat(stagingFile)?.isFile()) return;
       if (existing.size === entry.size && existing.mtimeMs === entry.mtimeMs) {
-        const prior = fs.openSync(stagingFile, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+        const prior = fs.openSync(stagingFile, fs.constants.O_RDWR | (fs.constants.O_NOFOLLOW ?? 0));
         try {
           const sourceHash = hashTraceDescriptor(source, entry.size);
           const stagedHash = hashTraceDescriptor(prior, entry.size);
           if (sourceHash && sourceHash === stagedHash && sameTraceIdentity(fs.fstatSync(source), entry) &&
-              sameTraceIdentity(fs.lstatSync(sourceFile), entry)) return sourceHash;
+              sameTraceIdentity(fs.lstatSync(sourceFile), entry)) {
+            fs.fsyncSync(prior);
+            return sourceHash;
+          }
         } finally { fs.closeSync(prior); }
       }
       fs.unlinkSync(stagingFile);
@@ -442,8 +467,7 @@ const traceManifest = (file: string): RunSessionTraceArchiveManifest | undefined
 /**
  * Move every raw Pi transcript/event log out of a run before retention can remove the run tree.
  * Durable copies live under the configured mesh root, never in a TMPDIR. The manifest records each
- * source identity before rename; EXDEV uses a staged, fsynced and SHA-256-verified copy whose
- * manifest is committed before the source is unlinked.
+ * source identity, and a staged, fsynced and SHA-256-verified copy is durable before the source is unlinked.
  */
 export const archiveRunSessionTraces = (directory: string, onlyPaths?: ReadonlyMap<string, fs.Stats>, meshRootArg?: string,
   archiveName?: string): boolean => {
@@ -557,7 +581,6 @@ export const archiveRunSessionTraces = (directory: string, onlyPaths?: ReadonlyM
     const persistManifest = (): void => writeJsonAtomic(manifestPath, manifest, { durable: true });
     if (!prior || manifest.files.length !== prior.files.length) persistManifest();
 
-    const syncDirectories = new Set([parent, archiveRoot, archive]);
     for (const entry of manifest.files) {
       const parts = entry.path.split("/");
       if (!entry.path || parts.some(part => !part || part === "." || part === "..")) return false;
@@ -570,35 +593,40 @@ export const archiveRunSessionTraces = (directory: string, onlyPaths?: ReadonlyM
       if (!sourceStat && !targetStat) return false;
       if (sourceStat && targetStat) {
         if (!entry.sha256 || !archiveTraceMatches(target, entry)) return false;
+        const targetDigest = fsyncTraceArchive(target, entry);
+        if (!targetDigest) return false;
         const sourceFd = fs.openSync(source, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
         try {
-          if (!sameTraceIdentity(fs.fstatSync(sourceFd), entry) || hashTraceDescriptor(sourceFd, entry.size) !== entry.sha256 ||
-              !sameTraceIdentity(fs.lstatSync(source), entry)) return false;
+          if (!sameTraceIdentity(fs.fstatSync(sourceFd), entry) || hashTraceDescriptor(sourceFd, entry.size) !== targetDigest ||
+              !sameTraceIdentity(fs.lstatSync(source), entry) || !archiveTraceMatches(target, entry)) return false;
           syncDirectoryChain(path.dirname(target));
           fs.unlinkSync(source);
         } finally { fs.closeSync(sourceFd); }
-        syncDirectories.add(path.dirname(source));
+        syncDirectoryChain(path.dirname(source));
         continue;
       }
-      if (targetStat) continue;
+      if (targetStat) {
+        const digest = fsyncTraceArchive(target, entry);
+        if (!digest) return false;
+        const hashed = entry.sha256 === undefined ? { ...entry, sha256: digest } : entry;
+        if (entry.sha256 === undefined) {
+          entries.set(entry.path, hashed);
+          manifest.files = [...entries.values()].sort((left, right) => left.path.localeCompare(right.path));
+          persistManifest();
+        }
+        syncDirectoryChain(path.dirname(target));
+        if (!archiveTraceMatches(target, hashed)) return false;
+        continue;
+      }
       const fd = fs.openSync(source, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
       try {
         if (!sameTraceIdentity(fs.fstatSync(fd), entry)) return false;
         fs.fsyncSync(fd);
       } finally { fs.closeSync(fd); }
       if (!sameTraceIdentity(ownedStat(source)!, entry)) return false;
-      try {
-        fs.renameSync(source, target);
-        const archived = ownedStat(target);
-        if (!archived || !sameTraceIdentity(archived, entry)) return false;
-        syncDirectories.add(path.dirname(source));
-        syncDirectories.add(path.dirname(target));
-        continue;
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "EXDEV") return false;
-      }
 
-      // Cross-device fallback: never unlink the source until the durable copy and its digest are recorded.
+      // Always stage and verify a durable destination before deleting the raw source,
+      // regardless of whether source and archive roots happen to share a filesystem.
       const stagingDirectory = path.join(archive, ".staging");
       mkdirPrivate(stagingDirectory, archive);
       const stagingFile = path.join(stagingDirectory, `${createHash("sha256").update(entry.path).digest("hex")}.tmp`);
@@ -616,6 +644,8 @@ export const archiveRunSessionTraces = (directory: string, onlyPaths?: ReadonlyM
       finally { fs.closeSync(stagedFd); }
       fs.linkSync(stagingFile, target);
       fs.unlinkSync(stagingFile);
+      const targetDigest = fsyncTraceArchive(target, hashed);
+      if (targetDigest !== digest) return false;
       syncDirectoryChain(path.dirname(target));
       if (!archiveTraceMatches(target, hashed)) return false;
       const sourceFd = fs.openSync(source, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
@@ -625,10 +655,8 @@ export const archiveRunSessionTraces = (directory: string, onlyPaths?: ReadonlyM
             hashTraceDescriptor(sourceFd, entry.size) !== digest || !archiveTraceMatches(target, hashed)) return false;
         fs.unlinkSync(source);
       } finally { fs.closeSync(sourceFd); }
-      syncDirectories.add(path.dirname(source));
-      syncDirectories.add(path.dirname(target));
+      syncDirectoryChain(path.dirname(source));
     }
-    for (const syncDirectory of syncDirectories) syncDirectoryChain(syncDirectory);
     return true;
   } catch { return false; }
 };

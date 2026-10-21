@@ -371,6 +371,34 @@ describe("host-only NATS inbox retention settings (smarty-dev#15310)", () => {
       else process.env.PI_FABRIC_MESH_HOST_TRANSPORT = originalHostTransportEnv;
     }
   });
+
+  it("ignores a workspace NATS org and defaults event scopes to the host org", () => {
+    const cwd = temporaryDirectory(); const agentDir = temporaryDirectory(); fs.mkdirSync(path.join(cwd, ".pi"));
+    const originalNatsEnv = process.env.PI_FABRIC_MESH_NATS;
+    const originalTransportEnv = process.env.PI_FABRIC_MESH_TRANSPORT;
+    const originalHostTransportEnv = process.env.PI_FABRIC_MESH_HOST_TRANSPORT;
+    delete process.env.PI_FABRIC_MESH_NATS;
+    delete process.env.PI_FABRIC_MESH_TRANSPORT;
+    delete process.env.PI_FABRIC_MESH_HOST_TRANSPORT;
+    try {
+      fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ mesh: {
+        transport: "nats", hostTransport: "nats", nats: { ...nats, org: "smarty-pants-inc" },
+      } }));
+      fs.writeFileSync(path.join(cwd, ".pi", "fabric.json"), JSON.stringify({ mesh: {
+        nats: { org: "versehq", eventOrgs: ["versehq"] },
+      } }));
+      const config = loadFabricConfigForScope({ cwd, agentDir, projectTrusted: true }, "project");
+      expect(config.mesh.nats.org).toBe("smarty-pants-inc");
+      expect(config.mesh.nats.eventOrgs).toEqual(["smarty-pants-inc"]);
+    } finally {
+      if (originalNatsEnv === undefined) delete process.env.PI_FABRIC_MESH_NATS;
+      else process.env.PI_FABRIC_MESH_NATS = originalNatsEnv;
+      if (originalTransportEnv === undefined) delete process.env.PI_FABRIC_MESH_TRANSPORT;
+      else process.env.PI_FABRIC_MESH_TRANSPORT = originalTransportEnv;
+      if (originalHostTransportEnv === undefined) delete process.env.PI_FABRIC_MESH_HOST_TRANSPORT;
+      else process.env.PI_FABRIC_MESH_HOST_TRANSPORT = originalHostTransportEnv;
+    }
+  });
 });
 
 describe("host-only stuckPreparingMs (smarty-dev#6337)", () => {

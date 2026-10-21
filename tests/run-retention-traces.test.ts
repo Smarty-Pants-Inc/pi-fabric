@@ -116,17 +116,9 @@ describe("raw trace retention", () => {
     for (const relative of tracePaths) expect(fs.readFileSync(path.join(f.archive, relative), "utf8")).toBe(`raw transcript: ${relative}\n`);
   });
 
-  it.skipIf(!HOSTED_ARCHIVES)("copies, syncs, and verifies traces when archive rename crosses filesystems", () => {
+  it.skipIf(!HOSTED_ARCHIVES)("copies, syncs, and verifies every trace before source removal", () => {
     const f = fixture("closed", true);
-    const realRename = fs.renameSync;
-    const rename = vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
-      if (String(from).startsWith(f.run + path.sep) && String(to).startsWith(f.archive + path.sep)) {
-        throw Object.assign(new Error("injected cross-device rename"), { code: "EXDEV" });
-      }
-      return realRename(from, to);
-    });
     f.sweep();
-    rename.mockRestore();
     expect(fs.existsSync(f.run)).toBe(false);
     const manifest = JSON.parse(fs.readFileSync(path.join(f.archive, ".manifest.json"), "utf8")) as {
       files: Array<{ path: string; size: number; sha256?: string }>;
@@ -140,22 +132,81 @@ describe("raw trace retention", () => {
     for (const relative of tracePaths) expect(fs.readFileSync(path.join(f.archive, relative), "utf8")).toBe(`raw transcript: ${relative}\n`);
   });
 
+  it.skipIf(!HOSTED_ARCHIVES)("fsyncs a matching pre-existing staging file before unlinking its source", () => {
+    const f = fixture("closed", true);
+    const source = path.join(f.run, "events.jsonl");
+    const target = path.join(f.archive, "events.jsonl");
+    const sourceStat = fs.statSync(source);
+    const onlyPaths = new Map([["events.jsonl", sourceStat]]);
+    fs.mkdirSync(f.archive, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(f.archive, ".manifest.json"), JSON.stringify({ format: 1, files: [{
+      path: "events.jsonl", dev: sourceStat.dev, ino: sourceStat.ino, size: sourceStat.size, mtimeMs: sourceStat.mtimeMs,
+    }] }), { mode: 0o600 });
+    const stagingDirectory = path.join(f.archive, ".staging");
+    const stagingFile = path.join(stagingDirectory, `${createHash("sha256").update("events.jsonl").digest("hex")}.tmp`);
+    fs.mkdirSync(stagingDirectory, { mode: 0o700 });
+    fs.writeFileSync(stagingFile, fs.readFileSync(source), { mode: 0o600 });
+    fs.utimesSync(stagingFile, new Date(sourceStat.mtimeMs), new Date(sourceStat.mtimeMs));
+
+    const realOpen = fs.openSync;
+    const realSync = fs.fsyncSync;
+    const realUnlink = fs.unlinkSync;
+    const stagingDescriptors = new Set<number>();
+    const order: string[] = [];
+    const open = vi.spyOn(fs, "openSync").mockImplementation((file, flags, mode) => {
+      const fd = realOpen(file, flags, mode);
+      if (path.resolve(String(file)) === path.resolve(stagingFile)) stagingDescriptors.add(fd);
+      return fd;
+    });
+    const sync = vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+      if (stagingDescriptors.has(fd)) order.push("staging-fsync");
+      realSync(fd);
+    });
+    const unlink = vi.spyOn(fs, "unlinkSync").mockImplementation(file => {
+      if (path.resolve(String(file)) === path.resolve(source)) order.push("source-unlink");
+      return realUnlink(file);
+    });
+    try {
+      expect(archiveRunSessionTraces(f.run, onlyPaths, f.meshRoot)).toBe(true);
+      expect(order).toEqual(["staging-fsync", "source-unlink"]);
+      expect(fs.existsSync(source)).toBe(false);
+    } finally { unlink.mockRestore(); sync.mockRestore(); open.mockRestore(); }
+  });
+
+  it.skipIf(!HOSTED_ARCHIVES)("keeps the raw source when an archive hash mismatches", () => {
+    const f = fixture("closed", true);
+    const source = path.join(f.run, "events.jsonl");
+    const target = path.join(f.archive, "events.jsonl");
+    const sourceStat = fs.statSync(source);
+    const sourceBytes = fs.readFileSync(source);
+    const onlyPaths = new Map([["events.jsonl", sourceStat]]);
+    const realLink = fs.linkSync;
+    const link = vi.spyOn(fs, "linkSync").mockImplementation((from, to) => {
+      realLink(from, to);
+      if (String(to) === target) {
+        const tampered = fs.readFileSync(target);
+        tampered.writeUInt8(tampered.readUInt8(0) ^ 1, 0);
+        fs.writeFileSync(target, tampered);
+        fs.utimesSync(target, new Date(sourceStat.mtimeMs), new Date(sourceStat.mtimeMs));
+      }
+    });
+    try {
+      expect(archiveRunSessionTraces(f.run, onlyPaths, f.meshRoot)).toBe(false);
+      expect(fs.readFileSync(source)).toEqual(sourceBytes);
+      expect(fs.statSync(source).ino).toBe(sourceStat.ino);
+      expect(fs.readFileSync(target)).not.toEqual(sourceBytes);
+    } finally { link.mockRestore(); }
+  });
+
   it.skipIf(!HOSTED_ARCHIVES)("does not unlink a source until the destination directory sync succeeds", () => {
     const f = fixture("closed", true);
     const source = path.join(f.run, "events.jsonl");
     const target = path.join(f.archive, "events.jsonl");
     const destination = path.resolve(f.archive);
-    const realRename = fs.renameSync;
     const realOpen = fs.openSync;
     const realSync = fs.fsyncSync;
     const directoryDescriptors = new Set<number>();
     let failedSyncs = 2;
-    const rename = vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
-      if (String(from).startsWith(f.run + path.sep) && String(to).startsWith(f.archive + path.sep)) {
-        throw Object.assign(new Error("injected cross-device rename"), { code: "EXDEV" });
-      }
-      return realRename(from, to);
-    });
     const open = vi.spyOn(fs, "openSync").mockImplementation((file, flags, mode) => {
       const fd = realOpen(file, flags, mode);
       if (path.resolve(String(file)) === destination) directoryDescriptors.add(fd);
@@ -179,7 +230,7 @@ describe("raw trace retention", () => {
       expect(fs.existsSync(source)).toBe(false);
       expect(fs.readFileSync(target, "utf8")).toBe("raw transcript: events.jsonl\n");
       expect(failedSyncs).toBe(0);
-    } finally { sync.mockRestore(); open.mockRestore(); rename.mockRestore(); }
+    } finally { sync.mockRestore(); open.mockRestore(); }
   });
 
   it("excludes the durable trace tree from deletion and compaction", () => {
@@ -209,20 +260,21 @@ describe("raw trace retention", () => {
     expect(fs.existsSync(events)).toBe(true);
   });
 
-  it.skipIf(!HOSTED_ARCHIVES).each(["closed", "orphaned"] as const)("does not remove a %s run if any trace rename fails, then retries the partial archive", kind => {
+  it.skipIf(!HOSTED_ARCHIVES).each(["closed", "orphaned"] as const)("does not remove a %s run if any trace archive link fails, then retries the partial archive", kind => {
     const f = fixture(kind, true);
     const failedSource = path.join(f.run, "route-session.jsonl");
-    const realRename = fs.renameSync;
-    const rename = vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
-      if (String(from) === failedSource) throw Object.assign(new Error("injected archive failure"), { code: "EIO" });
-      return realRename(from, to);
+    const failedTarget = path.join(f.archive, "route-session.jsonl");
+    const realLink = fs.linkSync;
+    const link = vi.spyOn(fs, "linkSync").mockImplementation((from, to) => {
+      if (String(to) === failedTarget) throw Object.assign(new Error("injected archive link failure"), { code: "EIO" });
+      realLink(from, to);
     });
     f.sweep();
     expect(fs.existsSync(f.run)).toBe(true);
     expect(fs.readFileSync(failedSource, "utf8")).toBe("raw transcript: route-session.jsonl\n");
     expect(fs.readFileSync(path.join(f.archive, "events.jsonl"), "utf8")).toBe("raw transcript: events.jsonl\n");
     expect(fs.readFileSync(path.join(f.run, "status.json"), "utf8")).toContain('"status":"completed"');
-    rename.mockRestore();
+    link.mockRestore();
     f.sweep();
     expect(fs.existsSync(f.run)).toBe(false);
     for (const relative of tracePaths) expect(fs.existsSync(path.join(f.archive, relative))).toBe(true);

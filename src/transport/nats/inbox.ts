@@ -2,6 +2,8 @@ import { Buffer } from "node:buffer";
 import { Readable } from "node:stream";
 import { setTimeout as sleep } from "node:timers/promises";
 import {
+  JetStreamApiError,
+  JetStreamApiCodes,
   type ConsumerMessages,
   type JsMsg,
   type JetStreamClient,
@@ -295,6 +297,39 @@ const authorizationFailure = (error: unknown): boolean => {
     } else break;
   }
   return false;
+};
+
+export class NatsInboxResourceNotFoundError extends TransportInvalidError {
+  constructor(cause: unknown) {
+    super("NATS inbox JetStream stream or consumer was not found", { cause });
+    this.name = "NatsInboxResourceNotFoundError";
+  }
+}
+
+/** Converts terminal inbox setup failures to transport errors, preserving their original cause. */
+export const classifyNatsInboxTerminalError = (error: unknown): Error | undefined => {
+  let cause = error;
+  for (let depth = 0; cause && depth < 6; depth += 1) {
+    if (cause instanceof JetStreamApiError) {
+      try {
+        const api = cause.apiError();
+        if (api.code === 404 || api.err_code === JetStreamApiCodes.ConsumerNotFound ||
+            api.err_code === JetStreamApiCodes.StreamNotFound) return new NatsInboxResourceNotFoundError(error);
+      } catch { /* Preserve classification of the outer error below. */ }
+    }
+    if (typeof cause !== "object") break;
+    const candidate = cause as { name?: string; code?: unknown; status?: unknown; message?: string; cause?: unknown };
+    if (["NatsAuthorizationError", "AuthorizationError", "PermissionViolationError", "UserAuthenticationExpiredError",
+      "InvalidArgumentError", "InvalidNameError", "InvalidSubjectError", "InvalidOperationError"].includes(candidate.name ?? "") ||
+      ["FABRIC_NATS_AUTHORIZATION", "FABRIC_TRANSPORT_DENIED", "FABRIC_TRANSPORT_INVALID", "FABRIC_TRANSPORT_UNSUPPORTED",
+        "AUTHORIZATION_VIOLATION", "PERMISSIONS_VIOLATION"].includes(String(candidate.code)) ||
+      [400, 401, 403].includes(Number(candidate.status)) || [400, 401, 403].includes(Number(candidate.code)) ||
+      /configuration mismatch|owner.*mismatch|permission|authorization|invalid (?:consumer|configuration|config)/i.test(candidate.message ?? "")) {
+      return new TransportInvalidError("NATS inbox authorization, ownership or configuration rejected", { cause: error });
+    }
+    cause = candidate.cause;
+  }
+  return undefined;
 };
 
 class RebindingKvStore implements TransportKv {
@@ -680,21 +715,6 @@ class NatsTransportImpl implements FabricTransport {
     const diagnostic = (code: string, outcome: string): void => {
       try { console.warn(`[pi-fabric] NATS inbox code=${code} host=${JSON.stringify(this.self.hostId)} durable=${JSON.stringify(consumerPolicy.durable)} stream=${JSON.stringify(this.#stream)} attempt=${attempt} outcome=${outcome}`); } catch {}
     };
-    const terminalFailure = (error: unknown): boolean => {
-      let cause = error;
-      for (let depth = 0; cause && depth < 6; depth += 1) {
-        if (typeof cause !== "object") break;
-        const candidate = cause as { name?: string; code?: unknown; status?: unknown; message?: string; cause?: unknown };
-        if (["NatsAuthorizationError", "AuthorizationError", "PermissionViolationError", "UserAuthenticationExpiredError",
-          "InvalidArgumentError", "InvalidNameError", "InvalidSubjectError", "InvalidOperationError"].includes(candidate.name ?? "") ||
-          ["FABRIC_NATS_AUTHORIZATION", "FABRIC_TRANSPORT_DENIED", "FABRIC_TRANSPORT_INVALID", "FABRIC_TRANSPORT_UNSUPPORTED",
-            "AUTHORIZATION_VIOLATION", "PERMISSIONS_VIOLATION"].includes(String(candidate.code)) ||
-          [400, 401, 403].includes(Number(candidate.status)) || [400, 401, 403].includes(Number(candidate.code)) ||
-          /configuration mismatch|owner.*mismatch|permission|authorization|invalid (?:consumer|configuration|config)/i.test(candidate.message ?? "")) return true;
-        cause = candidate.cause;
-      }
-      return false;
-    };
     try {
       while (!lifetime.aborted) {
         if (attempt > 0) {
@@ -805,11 +825,13 @@ class NatsTransportImpl implements FabricTransport {
           }
           } catch (error) {
             if (lifetime.aborted) return;
-            if (terminalFailure(error)) {
-              diagnostic("FABRIC_NATS_INBOX_TERMINAL", "stopped");
+            const terminalError = classifyNatsInboxTerminalError(error);
+            if (terminalError) {
+              diagnostic(terminalError instanceof NatsInboxResourceNotFoundError ?
+                "FABRIC_NATS_INBOX_RESOURCE_NOT_FOUND" : "FABRIC_NATS_INBOX_TERMINAL", "stopped");
               // The control plane must retain terminal pauses, but not transient
               // JetStream setup/consume failures or ordinary iterator completion.
-              throw new TransportInvalidError("NATS inbox authorization, ownership or configuration rejected", { cause: error });
+              throw terminalError;
             }
             recoveryCode = "FABRIC_NATS_INBOX_TRANSIENT";
             if (session.connection.nc.isClosed() || session.connection.nc.isDraining()) this.#loseSession(session);

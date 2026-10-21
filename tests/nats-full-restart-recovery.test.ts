@@ -10,7 +10,7 @@ import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { openNatsTransport } from "../src/transport/nats/inbox.js";
 import { openNatsKvForMachine } from "../src/transport/nats/kv.js";
 import { ensureTransportStream } from "../src/transport/nats/provision.js";
-import { transportInboxStream, transportInboxStreamSubject } from "../src/transport/nats/subjects.js";
+import { transportDurableName, transportInboxStream, transportInboxStreamSubject } from "../src/transport/nats/subjects.js";
 import type { FabricTransport } from "../src/transport/types.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
@@ -102,6 +102,7 @@ brokerSuite("real NATS full-stop recovery across participant views and routed AC
       const mesh = new MeshStore(meshRoot, 64 * 1024, 1_000);
       const transport = await openNatsTransport({
         ...harness.runtimeOptions(harness.users.machineA), hostId: id, name: `full-restart-${index}`,
+        ...(index === 0 ? { ephemeralHost: true, ephemeralInactiveSeconds: 300 } : {}),
       });
       const directory = new ParticipantDirectory(mesh, {
         enabled: true, transport, transportStateDir, hostId: id, rootId: id, identity,
@@ -180,5 +181,34 @@ brokerSuite("real NATS full-stop recovery across participant views and routed AC
     const recoveryDeadline = Date.now() + 30_000;
     await waitUntil(allViewsReady, "all participant views and leases ready after restart", recoveryDeadline);
     await sendRing("after-restart", recoveryDeadline);
+
+    const verifier = await harness.connect(harness.users.bootstrap);
+    try {
+      const manager = await jetstreamManager(verifier);
+      const ephemeral = owners[0]!;
+      const stream = transportInboxStream(MACHINE);
+      const durable = transportDurableName(ephemeral.id);
+      expect((await manager.consumers.info(stream, durable)).config.inactive_threshold).toBe(300_000_000_000);
+
+      const closeResults = await Promise.all(owners.map(async owner => {
+        const failures: Array<{ phase: string; error: string }> = [];
+        const summarize = (error: unknown): string => error instanceof AggregateError
+          ? `AggregateError: ${error.errors.map(summarize).join("; ")}`
+          : error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+        for (const [phase, close] of [
+          ["control", () => owner.control!.close()],
+          ["directory", () => owner.directory.close()],
+          ["transport", () => owner.transport.close()],
+        ] as const) {
+          try { await close(); } catch (error) { failures.push({ phase, error: summarize(error) }); }
+        }
+        try { owner.mesh.closeState(); } catch (error) { failures.push({ phase: "mesh", error: summarize(error) }); }
+        return { id: owner.id, failures };
+      }));
+      expect(closeResults.filter(result => result.failures.length > 0)).toEqual([]);
+      await expect(manager.consumers.info(stream, durable)).rejects.toMatchObject({ code: 10014, status: 404 });
+    } finally {
+      await verifier.close();
+    }
   }, 120_000);
 });

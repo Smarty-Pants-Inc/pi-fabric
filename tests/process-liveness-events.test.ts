@@ -268,6 +268,9 @@ describe.skipIf(process.platform !== "linux")("event-driven scope admission mark
     const handle = await f.launch;
     expect(handle.pid).toBe(f.children[teardownMarker === "valid" ? 0 : 1]!.pid);
     expect(spawn).toHaveBeenCalledTimes(teardownMarker === "valid" ? 1 : 2);
+    if (teardownMarker === "valid") {
+      expect(f.warn).toHaveBeenCalledWith("scope admission marker appeared during teardown; the admitted worker was stopped and will be reported lost");
+    } else expect(f.warn).toHaveBeenCalledOnce();
     expect(f.markerChecks()).toBe(4); // initial, deadline, pre-stop, then post-stop no-replay checks
     expect(handle.treeClosed).toBeUndefined();
     expectAdmissionCleaned(f);

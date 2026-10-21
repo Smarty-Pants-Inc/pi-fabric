@@ -1011,7 +1011,10 @@ export const spawnDetached = async (
       if (await handle.isAlive()) throw new Error("Scope termination is unconfirmed; custody retained");
       assertTransportLaunchAllowed(authority);
       // A gated shim never executed the worker, but that alone cannot authorize uncapped replay.
-      if (!capped && markerIsAdmitted()) return await admittedHandle(); // admitted during teardown: never replay
+      if (!capped && markerIsAdmitted()) {
+        scope.warn("scope admission marker appeared during teardown; the admitted worker was stopped and will be reported lost");
+        return await admittedHandle(); // admitted during teardown: never replay
+      }
       if (capped) {
         // The gate was never released: no worker ran. systemd-run launched (it had a pid), so
         // the executable was present: ANY exit status, diagnostic, signal, receipt mismatch or

@@ -3372,20 +3372,22 @@ export class MeshBridge {
       const pendingToRemote = cursor.toRemote.after < localHead;
       const pendingToLocal = cursor.toLocal.after < remoteHead;
       if (!pendingToRemote) this.#noteDirectionSuccess("toRemote", wallNow, now);
-      else this.#directionPendingSince.toRemote ??= now;
+      else this.#directionPendingSince.toRemote ??= this.#lastOkToRemoteMono ?? now;
       if (!pendingToLocal) this.#noteDirectionSuccess("toLocal", wallNow, now);
-      else this.#directionPendingSince.toLocal ??= now;
+      else this.#directionPendingSince.toLocal ??= this.#lastOkToLocalMono ?? now;
       // Probes observe heads only. Direction loops own forwarding wakes through notifications
       // and their bounded missed-notification safety timers; a probe must not trigger membership.
       const directionalAfter = this.options.directionStallAfterMs ?? BRIDGE_DIRECTION_STALL_AFTER_MS;
-      if (pendingToRemote && !pendingToLocal && now - this.#directionPendingSince.toRemote! >= directionalAfter) {
+      // Each cursor advance resets its own pending clock; progress in the other direction
+      // cannot hide a wedge, and a backlog that keeps advancing is not a stall.
+      if (pendingToRemote && now - this.#directionPendingSince.toRemote! >= directionalAfter) {
         direction = "toRemote";
-        await this.#raiseStall(direction, `no toRemote acknowledgement for ${Math.floor(now - this.#directionPendingSince.toRemote!)} ms while toLocal remains current`, true);
+        await this.#raiseStall(direction, `no toRemote acknowledgement for ${Math.floor(now - this.#directionPendingSince.toRemote!)} ms while toLocal ${pendingToLocal ? "has pending work" : "remains current"}`, true);
         return;
       }
-      if (pendingToLocal && !pendingToRemote && now - this.#directionPendingSince.toLocal! >= directionalAfter) {
+      if (pendingToLocal && now - this.#directionPendingSince.toLocal! >= directionalAfter) {
         direction = "toLocal";
-        await this.#raiseStall(direction, `no toLocal event receipt for ${Math.floor(now - this.#directionPendingSince.toLocal!)} ms while toRemote remains current`, true);
+        await this.#raiseStall(direction, `no toLocal event receipt for ${Math.floor(now - this.#directionPendingSince.toLocal!)} ms while toRemote ${pendingToRemote ? "has pending work" : "remains current"}`, true);
         return;
       }
 

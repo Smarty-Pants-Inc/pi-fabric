@@ -289,15 +289,26 @@ describe.skipIf(process.platform !== "linux")("event-driven scope admission mark
     f.finish();
   });
 
-  it.each(["deadline", "watcher error", "abort"] as const)("keeps an already admitted worker when %s ends the delayed-watch wait", async end => {
+  it.each(["deadline", "watcher error"] as const)("keeps an already admitted worker when %s ends the delayed-watch wait", async end => {
     const f = await fixtureAdmission();
     f.writeMarker(); // the scope shim has admitted/exec'd, but inotify has not reached this loop yet
     if (end === "deadline") await vi.advanceTimersByTimeAsync(5_000);
-    else if (end === "watcher error") f.watcher.emit("error", new Error("watch failed after marker publication"));
-    else f.controller.abort();
+    else f.watcher.emit("error", new Error("watch failed after marker publication"));
     const handle = await f.launch;
     expect(handle.pid).toBe(f.children[0]!.pid);
     expect(f.order).not.toContain("stop");
+    expect(spawn).toHaveBeenCalledOnce();
+    expect(f.warn).not.toHaveBeenCalled();
+    expectAdmissionCleaned(f);
+    f.finish();
+  });
+
+  it("stops an admitted scope when its launch authority is revoked", async () => {
+    const f = await fixtureAdmission();
+    f.writeMarker();
+    f.controller.abort();
+    await expect(f.launch).rejects.toThrow("Agent launch aborted");
+    expect(f.order).toContain("stop");
     expect(spawn).toHaveBeenCalledOnce();
     expect(f.warn).not.toHaveBeenCalled();
     expectAdmissionCleaned(f);

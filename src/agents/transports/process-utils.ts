@@ -933,7 +933,10 @@ export const spawnDetached = async (
           finish(admitted);
         };
         const watcherFailed = (): void => finishIfMarkerAdmitted("scope admission watcher failed before an authenticated marker");
-        const aborted = (): void => finishIfMarkerAdmitted("scope admission aborted before an authenticated marker");
+        const aborted = (): void => {
+          admissionFailureReason = "scope admission aborted before an authenticated marker";
+          finish(false);
+        };
         const childClosed = (): void => {
           admissionFailureReason = "scope process closed before an authenticated marker";
           finish(false);
@@ -1000,7 +1003,7 @@ export const spawnDetached = async (
       // The watcher or deadline may have won the event-loop race after the
       // shim published its marker. Preserve an uncapped worker already admitted
       // before any teardown; capped launches remain fail-closed until release.
-      if (!capped && markerIsAdmitted()) return await admittedHandle();
+      if (!capped && !authority?.signal?.aborted && markerIsAdmitted()) return await admittedHandle();
       const admissionStopReason = cappedRefusal ?? (capped && admitted
         ? "capped scope boundary could not be verified; refusing uncapped fallback"
         : admissionFailureReason);

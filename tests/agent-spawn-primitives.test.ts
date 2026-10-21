@@ -16,6 +16,7 @@ import { typeCheckFabricCode } from "../src/runtime/type-checker.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { withRootExceptionMetadata, writeModelExceptions } from "./helpers/model-exceptions.js";
 import { AgentManager } from "../src/agents/manager.js";
+import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { checkedSeed, completedBranchPrefix, snippetTask } from "../src/agents/fork-seed.js";
 import { writeForkSession } from "../src/agents/handoff.js";
 import fabricWriteGuard, { readWritePolicy, writePolicyDenial } from "../src/agents/write-guard.js";
@@ -349,6 +350,14 @@ describe("agent manager spawning primitives", () => {
       ownershipToken: "parent-lineage", instructionsDigest: "a".repeat(64) });
     vi.stubEnv("PI_FABRIC_ACTOR_SELF", inherited);
     const { manager, runRoot } = createManager(cwd);
+    const receivedEnvironments: NodeJS.ProcessEnv[] = [];
+    const processLaunch = ProcessTransport.prototype.launch;
+    vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async function (this: ProcessTransport, request) {
+      const childEnvironment = request.childEnvironment?.({ ...process.env, PI_FABRIC_ACTOR_SELF: inherited });
+      expect(childEnvironment).toBeDefined();
+      receivedEnvironments.push(childEnvironment!);
+      return processLaunch.call(this, request);
+    });
     const actorSelf = Object.freeze({ actorId: "actor-one", name: "worker", rootId: "session:root",
       ownershipToken: JSON.stringify(["session:root", null, []]), instructionsDigest: "b".repeat(64), roleStamp: "(role reviewer.md 0123456789ab)" });
     const actor = await manager.run({ task: "actor activation", transport: "process", actorId: actorSelf.actorId,
@@ -358,6 +367,8 @@ describe("agent manager spawning primitives", () => {
 
     const task = await manager.run({ task: "ordinary nested task", transport: "process" });
     expect(JSON.parse(fs.readFileSync(path.join(runRoot, task.id, "actor-self.json"), "utf8"))).toBeNull();
+    expect(receivedEnvironments[0]!["PI_FABRIC_ACTOR_SELF"]).toBe(JSON.stringify(actorSelf));
+    expect(receivedEnvironments[1]).not.toHaveProperty("PI_FABRIC_ACTOR_SELF");
     await expect(manager.run({ task: "mismatched activation", transport: "process", actorId: "different",
       actorName: actorSelf.name, actorSelf })).rejects.toThrow(/Invalid actor activation identity/);
   });

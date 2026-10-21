@@ -258,11 +258,17 @@ const RETENTION_SWEEP_INTERVAL_MS = 15 * 60 * 1_000;
 /** Unsuccessful managed prompts are retained only up to the existing UI bound, in bytes. */
 const TERMINAL_PROMPT_RETENTION_MAX_BYTES = MAX_UI_TEXT_CHARS;
 
+const clearChildActorSelfEnvironment = (environment: NodeJS.ProcessEnv): NodeJS.ProcessEnv => {
+  const child = { ...environment };
+  delete child[FABRIC_ACTOR_SELF_ENV];
+  return child;
+};
+
 const childEnvironmentForLaunch = (
   meshEnvironment: ((environment: NodeJS.ProcessEnv) => NodeJS.ProcessEnv) | undefined,
   actorSelf: FabricActorActivationIdentity | undefined,
-): ((environment: NodeJS.ProcessEnv) => NodeJS.ProcessEnv) | undefined => {
-  if (!meshEnvironment && !actorSelf) return undefined;
+): ((environment: NodeJS.ProcessEnv) => NodeJS.ProcessEnv) => {
+  if (!meshEnvironment && !actorSelf) return clearChildActorSelfEnvironment;
   // Keep this callback out of the launch frame: transports may retain it while
   // owning the worker, so it must not close over the full AgentRunRequest/task.
   return (environment) => {
@@ -3172,7 +3178,7 @@ export class AgentManager {
           workerArguments: [...runnerLaunch.workerArguments],
           // Apply mesh credentials first, then replace inherited actor identity with
           // this exact activation tuple (or clear it for non-actor children).
-          ...(childEnvironment ? { childEnvironment } : {}),
+          childEnvironment,
           ...(request.needs ? { needs: [...request.needs] } : {}),
           ...(request.requires ? { requires: [...request.requires] } : {}),
           ...(this.#spawnerSessionId ? { parentSession: this.#spawnerSessionId } : {}),

@@ -9,9 +9,10 @@
 // writes mesh.nats.replicas into this file's PRIVATE PI_CODING_AGENT_DIR/fabric.json, which scripts/test-temp.ts
 // creates fresh per test file; spawned children inherit that env and so read the same config. Any existing config
 // there is preserved; the path is validated as the private test fleet's agent dir before the write.
-import { existsSync, readFileSync, realpathSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, realpathSync, renameSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
+import { testTempParentEnvironment, testTempParentMarker, testTempParentPrefix } from "../../scripts/test-temp.js";
 import { it } from "vitest";
 import { closeNatsStateBackend, MAX_MESSAGE_BYTES, natsStreamName, openNatsStateBackend, type NatsStateBackend } from "../../src/mesh/state-backend-nats.js";
 import { connectJetStream } from "../../src/mesh/state-backend-nats-client.js";
@@ -28,15 +29,50 @@ if (process.env.NATS_SERVER_REQUIRED === "1" && natsStateProfile === undefined) 
   throw new Error("NATS_SERVER_REQUIRED=1 but NATS_STATE_PROFILE is unset (single|cluster)");
 }
 
-/** The private fixture agent dir: <tmpdir>/pi-fabric-test-fleet-XXXX/agent, never the real home profile. */
+/** The marker-verified private TEST_PARENT created by scripts/test-temp.ts. */
+const privateTestParent = (): string => {
+  const raw = process.env[testTempParentEnvironment]?.trim();
+  if (!raw || !path.isAbsolute(raw)) throw new Error("NATS_STATE_PROFILE: test temp parent is not an absolute private path");
+  const parent = realpathSync(raw);
+  const temp = realpathSync(tmpdir());
+  const name = path.basename(parent);
+  const parentInfo = lstatSync(parent, { bigint: true });
+  const parentOfParent = lstatSync(path.dirname(parent));
+  const markerPath = path.join(parent, testTempParentMarker);
+  const marker = lstatSync(markerPath, { bigint: true });
+  if (path.dirname(parent) !== path.dirname(temp)
+    || !name.startsWith(testTempParentPrefix) || !/^[A-Za-z0-9]{6}$/.test(name.slice(testTempParentPrefix.length))
+    || !parentOfParent.isDirectory() || parentOfParent.isSymbolicLink()
+    || !parentInfo.isDirectory() || parentInfo.isSymbolicLink()
+    || marker.isSymbolicLink() || !marker.isFile() || marker.nlink !== 1n || marker.size > 256n
+    || (typeof process.getuid === "function"
+      && (parentInfo.uid !== BigInt(process.getuid()) || (parentInfo.mode & 0o777n) !== 0o700n
+        || marker.uid !== BigInt(process.getuid()) || (marker.mode & 0o777n) !== 0o600n))
+    || readFileSync(markerPath, "utf8") !== '{"format":1,"purpose":"pi-fabric-test-temp-parent"}') {
+    throw new Error(`NATS_STATE_PROFILE: refusing unverified test temp parent: ${parent}`);
+  }
+  return parent;
+};
+
+/** The private fixture agent dir: a fleet child of TEST_PARENT, never the real home profile. */
 const privateAgentDir = (): string => {
   const raw = process.env.PI_CODING_AGENT_DIR?.trim();
   if (!raw || !path.isAbsolute(raw)) throw new Error("NATS_STATE_PROFILE: PI_CODING_AGENT_DIR is not an absolute private test path");
   const dir = realpathSync(raw);
   const fleet = path.dirname(dir);
-  const temp = realpathSync(tmpdir());
+  const parent = privateTestParent();
+  const fleetName = path.basename(fleet);
+  const fleetInfo = lstatSync(fleet, { bigint: true });
+  const agentInfo = lstatSync(dir, { bigint: true });
   const home = realpathSync(homedir());
-  if (path.basename(dir) !== "agent" || !path.basename(fleet).startsWith("pi-fabric-test-fleet-") || path.dirname(fleet) !== temp
+  if (path.basename(dir) !== "agent" || path.dirname(fleet) !== parent
+    || !fleetName.startsWith("pi-fabric-test-fleet-")
+    || !/^[A-Za-z0-9]{6}$/.test(fleetName.slice("pi-fabric-test-fleet-".length))
+    || !fleetInfo.isDirectory() || fleetInfo.isSymbolicLink()
+    || !agentInfo.isDirectory() || agentInfo.isSymbolicLink()
+    || (typeof process.getuid === "function"
+      && (fleetInfo.uid !== BigInt(process.getuid()) || (fleetInfo.mode & 0o777n) !== 0o700n
+        || agentInfo.uid !== BigInt(process.getuid())))
     || dir === path.join(home, ".pi", "agent") || dir.startsWith(path.join(home, ".pi") + path.sep)) {
     throw new Error(`NATS_STATE_PROFILE: refusing to write config outside the private test fleet: ${dir}`);
   }

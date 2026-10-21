@@ -26,6 +26,7 @@ import { actorParticipantRecord } from "../src/topology/records.js";
 import { writeParticipantFile } from "../src/topology/participant-files.js";
 import { LIVENESS_POLICY_KEY, writeHostLease } from "../src/topology/host-leases.js";
 import { modelExceptionGrant, withRootExceptionMetadata } from "./helpers/model-exceptions.js";
+import { itPosixArchive } from "./helpers/platform-archive.js";
 import { testTempRoot } from "./helpers/test-temp-root.js";
 
 // smarty-dev#1031: Linux, Darwin and Windows support the Main publication fence (smarty-dev#8090;
@@ -3459,7 +3460,7 @@ describe("ActorManager", () => {
     expect(listener).toHaveBeenCalledTimes(beforeUnsubscribedUpdate);
   });
 
-  it("keeps a persistent actor identity and processes direct mailbox messages", async () => {
+  itPosixArchive("keeps a persistent actor identity and processes direct mailbox messages", async () => {
     const { actors, agents } = setup();
     const actor = await actors.create({
       name: "reviewer",
@@ -4734,7 +4735,7 @@ describe("ActorManager", () => {
     expect(notices()).toHaveLength(2);
   }, 60_000);
 
-  it("stays ambient and retains the failed run when a directive run fails", async () => {
+  itPosixArchive("stays ambient and retains the failed run when a directive run fails", async () => {
     const { actors, agents, root } = setup();
     const actor = await actors.create({
       name: "supervisor",
@@ -5231,7 +5232,7 @@ describe("ActorManager", () => {
     expect(actor.topics).toEqual(["hooks.ci"]);
   });
 
-  it("retains completed-run logs and exposes them via readLog", async () => {
+  itPosixArchive("retains completed-run logs and exposes them via readLog", async () => {
     const { actors, agents } = setup();
     const actor = await actors.create({
       name: "reviewer",
@@ -6195,7 +6196,7 @@ describe("ActorManager extensions flag (read-only Pi actors)", () => {
 // smarty-dev#2184 item 8: a resident-host removal waited for the actor's in-flight run and
 // blocked the host's whole request queue.
 describe("ActorManager removal behind an in-flight run", () => {
-  it.each([true, false])("#169 round 3 joins the previous run after an ownership reload before removal (wait %s)", async (wait) => {
+  itPosixArchive.each([true, false])("#169 round 3 joins the previous run after an ownership reload before removal (wait %s)", async (wait) => {
     let owned = true;
     const { actors, agents, mesh, root } = setup(true, () => owned);
     let release!: () => void;
@@ -6279,7 +6280,7 @@ describe("ActorManager removal behind an in-flight run", () => {
     }
   }, 30_000);
 
-  it("returns at once, names the run, lets a same-name create through, and finishes after the run", async () => {
+  itPosixArchive("returns at once, names the run, lets a same-name create through, and finishes after the run", async () => {
     const { actors, agents, root } = setup(true);
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
@@ -6336,7 +6337,7 @@ describe("ActorManager removal behind an in-flight run", () => {
     });
     return { release, runId };
   };
-  it.each(["acceptance", "unrelated update"])("#169 security S2 syncs the final pending-decision replacement after %s", async (phase) => {
+  itPosixArchive.each(["acceptance", "unrelated update"])("#169 security S2 syncs the final pending-decision replacement after %s", async (phase) => {
     const { actors, agents, root } = setup(true);
     const { release, runId } = hangingRun(agents);
     const actor = await actors.create({ name: "pending-decision", instructions: "Work." });
@@ -6403,7 +6404,7 @@ describe("ActorManager removal behind an in-flight run", () => {
     }
   });
 
-  it.each(process.platform === "win32" ? [1] : [1, 2])("#169 round 3 refuses the pending removal decision at barrier %i", async (barrier) => {
+  itPosixArchive.each(process.platform === "win32" ? [1] : [1, 2])("#169 round 3 refuses the pending removal decision at barrier %i", async (barrier) => {
     const { actors, agents, root } = setup(true);
     const { release, runId } = hangingRun(agents);
     const actor = await actors.create({ name: "pending-sync", instructions: "Work." });
@@ -6516,7 +6517,7 @@ describe("ActorManager removal behind an in-flight run", () => {
 
   // smarty-dev#11335: Linux, Darwin and Windows reach the injected directory/presence failures at and after
   // the root tree delete; unsupported platforms refuse first (smarty-dev#8090), so skip only those platforms.
-  it.skipIf(rootTreeDeletionRefused).each(["directory", "presence"] as const)("smarty-dev#2339 F1: retains %s cleanup after registry revocation and drains it on restart without deleting a successor", async (failure) => {
+  it.skipIf(process.platform === "win32" || rootTreeDeletionRefused).each(["directory", "presence"] as const)("smarty-dev#2339 F1: retains %s cleanup after registry revocation and drains it on restart without deleting a successor", async (failure) => {
     const { actors: initial, agents, root, mesh, identity, meshConfig } = setup(true);
     await initial.close();
     const actorRoot = path.join(root, "actors");
@@ -6584,7 +6585,7 @@ describe("ActorManager removal behind an in-flight run", () => {
     }
   });
 
-  it("finishes an accepted removal after its owner restarts, keeping a same-name successor", async () => {
+  itPosixArchive("finishes an accepted removal after its owner restarts, keeping a same-name successor", async () => {
     const { actors, agents, root, mesh, identity, meshConfig } = setup(true);
     const { release, runId } = hangingRun(agents);
     const actor = await actors.create({ name: "reviewer", instructions: "Review.", responseMode: "text" });
@@ -6628,7 +6629,7 @@ describe("#169 round 2 removal coordination", () => {
     return { release, runId };
   };
 
-  it.each([false, true])("keeps each caller's wait policy during held acceptance (first wait=%s)", async (firstWait) => {
+  itPosixArchive.each([false, true])("keeps each caller's wait policy during held acceptance (first wait=%s)", async (firstWait) => {
     const { actors, agents, root } = setup(true);
     const run = liveRun(agents);
     const actor = await actors.create({ name: "mixed waits", instructions: "Work." });
@@ -6742,7 +6743,7 @@ describe("#169 round 2 removal coordination", () => {
     expect(fs.existsSync(dir)).toBe(false);
   });
 
-  it("recovery waits for paused acceptance and the actual live drain before deleting history", async () => {
+  itPosixArchive("recovery waits for paused acceptance and the actual live drain before deleting history", async () => {
     const { actors, agents, root } = setup(true);
     const run = liveRun(agents);
     const actor = await actors.create({ name: "recovering", instructions: "Work." });

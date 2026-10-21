@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { itPosixArchive } from "./helpers/platform-archive.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
@@ -98,7 +99,7 @@ describe("AgentManager close storage", () => {
     expect(consumed).toHaveBeenCalledExactlyOnceWith(child.id);
   });
 
-  it.skipIf(!hostedDelete).each([false, true] as const)("active one-shot expiry archives every raw trace before removal (archive failure=%s)", async failArchive => {
+  it.skipIf(process.platform === "win32" || !hostedDelete).each([false, true] as const)("active one-shot expiry archives every raw trace before removal (archive failure=%s)", async failArchive => {
     let sweep: (() => void) | undefined;
     const interval = globalThis.setInterval;
     const timer = vi.spyOn(globalThis, "setInterval").mockImplementation(((callback: () => void, ms?: number, ...args: unknown[]) => {
@@ -111,7 +112,7 @@ describe("AgentManager close storage", () => {
       retention: { ...DEFAULT_FABRIC_CONFIG.retention, oneShotRunMs: 1_000 },
     }, durableMeshRoot);
     let clock: ReturnType<typeof vi.spyOn> | undefined;
-    let renameFault: ReturnType<typeof vi.spyOn> | undefined;
+    let unlinkFault: ReturnType<typeof vi.spyOn> | undefined;
     try {
       const result = await manager.run({ task: "raw trace expiry", transport: "process", extensions: false });
       const run = manager.runDirectory(result.id)!;
@@ -126,10 +127,10 @@ describe("AgentManager close storage", () => {
       expect(sweep).toBeTypeOf("function");
       const routeTrace = path.join(run, "route-session.jsonl");
       if (failArchive) {
-        const realRename = fs.renameSync;
-        renameFault = vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
-          if (String(from) === routeTrace) throw Object.assign(new Error("injected archive failure"), { code: "EIO" });
-          return realRename(from, to);
+        const realUnlink = fs.unlinkSync;
+        unlinkFault = vi.spyOn(fs, "unlinkSync").mockImplementation(file => {
+          if (String(file) === routeTrace) throw Object.assign(new Error("injected archive failure"), { code: "EIO" });
+          return realUnlink(file);
         });
       }
       clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 2_000);
@@ -139,7 +140,7 @@ describe("AgentManager close storage", () => {
         await vi.waitFor(() => expect(fs.existsSync(path.join(archive, "events.jsonl"))).toBe(true), { timeout: 2_000 });
         expect(fs.existsSync(run)).toBe(true);
         expect(fs.readFileSync(routeTrace, "utf8")).toBe("raw route session\n");
-        renameFault!.mockRestore();
+        unlinkFault!.mockRestore();
         sweep!();
       }
       await vi.waitFor(() => expect(fs.existsSync(run)).toBe(false), { timeout: 2_000 });
@@ -153,7 +154,7 @@ describe("AgentManager close storage", () => {
       await manager.close();
       timer.mockRestore();
       detachedSweep.mockRestore();
-      renameFault?.mockRestore();
+      unlinkFault?.mockRestore();
     }
   }, 15_000);
 
@@ -168,7 +169,7 @@ describe("AgentManager close storage", () => {
     await expect(manager.spawn({ task: "late" })).rejects.toThrow("closing");
   });
 
-  it("retains a stopped prompt and closed managed root with retainRuns:false", async () => {
+  itPosixArchive("retains a stopped prompt and closed managed root with retainRuns:false", async () => {
     const { manager, root } = setup(false);
     const task = "HANG";
     const handle = await manager.spawn({ task, runner: "pi", extensions: false });
@@ -263,7 +264,7 @@ describe("AgentManager close storage", () => {
     expect(fs.existsSync(root)).toBe(true);
   });
 
-  it.runIf(hostedDelete)("removes a managed root holding a finished run's pi-durable journal (#229)", async () => {
+  it.runIf(process.platform !== "win32" && hostedDelete)("removes a managed root holding a finished run's pi-durable journal (#229)", async () => {
     const { manager, root } = setup(false);
     const result = await manager.run({ task: "hello", runner: "pi", extensions: false });
     // The pi-durable runner journals beside status.json in the run directory.
@@ -335,7 +336,7 @@ describe("AgentManager close storage", () => {
     await vi.waitFor(() => expect(fs.existsSync(sentinel)).toBe(false), { timeout: 20_000 });
   });
 
-  it.runIf(hostedDelete)("removes an explicit caller root after stopping a worker with retainRuns:false", async () => {
+  it.runIf(process.platform !== "win32" && hostedDelete)("removes an explicit caller root after stopping a worker with retainRuns:false", async () => {
     const caller = fs.mkdtempSync(path.join(os.tmpdir(), "caller-stopped-root-"));
     roots.push(caller);
     const { manager, root } = setup(false, { runRoot: caller });
@@ -441,7 +442,7 @@ describe("AgentManager close storage", () => {
     }
   }, 30_000);
 
-  it("cancels queued admissions on close without launching and retains the active stopped prompt", async () => {
+  itPosixArchive("cancels queued admissions on close without launching and retains the active stopped prompt", async () => {
     const { manager, root } = setup(false);
     const active = await manager.spawn({ task: "HANG", extensions: false });
     const launch = vi.spyOn(ProcessTransport.prototype, "launch");

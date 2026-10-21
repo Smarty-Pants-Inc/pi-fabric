@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { inspect } from "node:util";
 import { ProtocolError } from "@nats-io/nats-core";
@@ -1526,8 +1526,8 @@ describe("NATS_STATE_PROFILE harness helper (private fixture config only, no ser
     const raw = readRaw();
     return raw === undefined ? undefined : JSON.parse(raw) as Record<string, unknown>;
   };
-  const importHelper = async (profile: string) => {
-    vi.stubEnv("PI_CODING_AGENT_DIR", fixtureDir!);
+  const importHelper = async (profile: string, agentDir = fixtureDir!) => {
+    vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
     vi.stubEnv("NATS_STATE_PROFILE", profile);
     vi.stubEnv("NATS_SERVER_REQUIRED", "");
     vi.resetModules();
@@ -1552,5 +1552,17 @@ describe("NATS_STATE_PROFILE harness helper (private fixture config only, no ser
     const before = readRaw();
     await expect(importHelper("triple")).rejects.toThrow(/NATS_STATE_PROFILE/);
     expect(readRaw()).toBe(before);
+  });
+
+  it.skipIf(!inFleet)("refuses the old unmarked fleet location directly under process TMPDIR", async () => {
+    const processTemp = process.env.TMPDIR;
+    if (!processTemp) throw new Error("TMPDIR is required for the private fixture");
+    const fleet = mkdtempSync(path.join(processTemp, "pi-fabric-test-fleet-"));
+    const agent = path.join(fleet, "agent");
+    mkdirSync(agent);
+    try {
+      await expect(importHelper("single", agent)).rejects.toThrow(/refusing to write config outside the private test fleet/);
+      expect(existsSync(path.join(agent, "fabric.json"))).toBe(false);
+    } finally { rmSync(fleet, { recursive: true, force: true }); }
   });
 });

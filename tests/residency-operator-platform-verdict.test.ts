@@ -21,6 +21,7 @@ import {
 import { hostLeasePath, writeHostLease } from "../src/topology/host-leases.js";
 import { actorTreeDeletionHooks, mainPublicationFenced } from "../src/topology/main-publication-fence.js";
 import { writeParticipantFile } from "../src/topology/participant-files.js";
+import { testTempRoot } from "./helpers/test-temp-root.js";
 
 // #4664: never execute a product deletion, INCLUDING metadata/locks. All nine fs deletion APIs
 // record their calls; metadata disappearance is emulated by rename into this fixture's own trash.
@@ -129,7 +130,7 @@ const guardDeletions = (root: string, actorRoots: string[], calls: Call[]) => {
 };
 
 const safeFixture = async () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "resident-platform-verdict-"));
+  const root = testTempRoot("resident-platform-verdict-");
   const meshRoot = path.join(root, "mesh"), rootId = "session:platform-verdict";
   const config: ResidentHostConfig = {
     format: 1, rootId, sessionId: "platform-verdict", cwd: root, projectRoot: root, meshRoot,

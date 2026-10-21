@@ -4,6 +4,7 @@ import { ActorChildCompletionStore } from "../src/actors/child-completions.js";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { itPosixArchive } from "./helpers/platform-archive.js";
 import { ACTOR_RETENTION_BATCH_SIZE, ActorManager } from "../src/actors/manager.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { AgentManager } from "../src/agents/manager.js";
@@ -63,7 +64,7 @@ async function eventually(predicate: () => boolean, timeoutMs = 10_000) {
 }
 
 describe("ActorManager bounded startup (#4250 item 4)", () => {
-  it("loads 200 real-shaped actors in one linear read and eventually sweeps 2,000 runs in bounded event-loop slices", async () => {
+  itPosixArchive("loads 200 real-shaped actors in one linear read and eventually sweeps 2,000 runs in bounded event-loop slices", async () => {
     const f = fixture(200);
     const rawOwnership = vi.fn(() => true);
     const snapshot = vi.fn(() => new Map(f.records.map((record) => [record.id, true])));
@@ -128,7 +129,7 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
     } finally { active = false; clearImmediate(heartbeat!); }
   }, 60_000);
 
-  it("yields Windows startup trace archival between actors with bounded metadata work", async () => {
+  itPosixArchive("yields Windows startup trace archival between actors with bounded metadata work", async () => {
     const f = fixture(17);
     vi.spyOn(process, "platform", "get").mockReturnValue("win32");
     const lstat = fs.lstatSync;
@@ -177,7 +178,7 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
     } finally { active = false; clearImmediate(heartbeat!); }
   });
 
-  it.each(["ownership", "publication"] as const)("rechecks Windows %s between actor maintenance turns", async (fence) => {
+  itPosixArchive.each(["ownership", "publication"] as const)("rechecks Windows %s between actor maintenance turns", async (fence) => {
     const f = fixture(3);
     vi.spyOn(process, "platform", "get").mockReturnValue("win32");
     const ownership = new Map(f.records.map(record => [record.id, true]));
@@ -231,7 +232,7 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
     expect(f.agents.list()).toEqual([]);
   });
 
-  it("rechecks lease/cede/ownership after the initial yield and preserves live/unknown workers", async () => {
+  itPosixArchive("rechecks lease/cede/ownership after the initial yield and preserves live/unknown workers", async () => {
     const f = fixture(3);
     const ownership = new Map(f.records.map((record) => [record.id, true]));
     const manager = f.make({ canManageActor: (id) => ownership.get(id), snapshotActorOwnership: () => new Map(ownership) });
@@ -305,7 +306,7 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
     } finally { release(); await vi.advanceTimersByTimeAsync(maintenanceTurns); vi.useRealTimers(); }
   });
 
-  it.each(["resumeQueued", "resumeAfterRelease", "poll"] as const)("retries deferred startup retention after publication through %s", async boundary => {
+  itPosixArchive.each(["resumeQueued", "resumeAfterRelease", "poll"] as const)("retries deferred startup retention after publication through %s", async boundary => {
     const f = fixture(1); let published = false;
     const manager = f.make({ canConsumeMesh: () => published });
     await turn(); await turn();
@@ -317,7 +318,7 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
     await eventually(() => !fs.existsSync(f.runDir(0, 8)));
   });
 
-  it("rechecks publication between maintenance slices and retries an interrupted startup sweep", async () => {
+  itPosixArchive("rechecks publication between maintenance slices and retries an interrupted startup sweep", async () => {
     const f = fixture(17); let published = true;
     const manager = f.make({ canConsumeMesh: () => published });
     // A callback queued behind the first maintenance slice withdraws publication

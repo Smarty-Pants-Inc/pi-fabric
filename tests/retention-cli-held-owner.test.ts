@@ -3,6 +3,7 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
+import { testTempRoot } from "./helpers/test-temp-root.js";
 
 // This is a real-bundle entry test. Fail before the first test if the checked-in
 // CLI no longer takes the hard dry-run / native-fence path audited for this case.
@@ -63,7 +64,7 @@ const recordParentDeleters = (): void => {
 const makeFixture = () => {
   const tmp = process.env.TMPDIR;
   if (!tmp) throw new Error("TMPDIR is required for the private fixture");
-  const privateRoot = fs.mkdtempSync(path.join(tmp, "fs-retlock-1072-r4-"));
+  const privateRoot = testTempRoot("fs-retlock-1072-r4-");
   roots.push(privateRoot);
   const meshRoot = path.join(privateRoot, "scratchmesh");
   const residencyRoot = path.join(meshRoot, "residency", "scratch-host");

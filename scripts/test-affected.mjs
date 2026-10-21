@@ -3,6 +3,7 @@
 //
 //   default          working tree against HEAD, for local iteration
 //   --base <ref>     <ref> against HEAD, for a CI push range or pull request
+//   --list-only      JSON test-file lists per phase, without executing tests
 //
 // README/docs Markdown changes also select the documentation style suite, so a
 // docs-only push still checks the writing rules those files are held to.
@@ -31,7 +32,12 @@ const recordSelection = (selection) => {
     shard, platform: process.platform, ...selection,
   }, null, 2) + "\n");
 };
-const emptySelection = (reason) => recordSelection({ reason, direct: [], related: [], phases: [] });
+const listOnly = argv.includes("--list-only");
+const emptySelection = (reason) => {
+  recordSelection({ reason, direct: [], related: [], phases: [] });
+  if (listOnly) console.log(JSON.stringify({ related: [], direct: [] }));
+};
+const selectionMessage = (message) => (listOnly ? console.error : console.log)(message);
 const baseIndex = argv.indexOf("--base");
 // Either source selects range mode: the CI script passes --base, and an
 // operator can export PI_TEST_BASE when running the file directly.
@@ -55,12 +61,12 @@ let changed;
 if (rangeMode) {
   if (!base) {
     emptySelection("no base provided");
-    console.log("no base provided (PI_TEST_BASE is empty); nothing to select");
+    selectionMessage("no base provided (PI_TEST_BASE is empty); nothing to select");
     process.exit(0);
   }
   if (/^0+$/.test(base)) {
     emptySelection("new branch push");
-    console.log(`base ${base} is not a commit (new branch push); nothing to select`);
+    selectionMessage(`base ${base} is not a commit (new branch push); nothing to select`);
     process.exit(0);
   }
   try {
@@ -96,29 +102,62 @@ if (rangeMode) {
   changed = [...changed, ...untracked];
 }
 
-const files = [...new Set(changed)].filter((file) => fs.existsSync(file));
-const isTestFile = (file) => file.startsWith("tests/") && /\.test\.(?:ts|tsx)$/.test(file);
-const sourceTextEdges = new Map();
-for (const test of git(["ls-files", "--cached", "--others", "--exclude-standard", "--", "tests"])
-  .split("\n").filter(isTestFile)) {
-  for (const [, source] of fs.readFileSync(test, "utf8").matchAll(/["'`](src\/[^"'`]+)["'`]/g)) {
-    const tests = sourceTextEdges.get(source) ?? [];
-    tests.push(test);
-    sourceTextEdges.set(source, tests);
+// Both execution and listing must use this exact affected selection.
+function selectAffected(changed) {
+  const files = [...new Set(changed)].filter((file) => fs.existsSync(file));
+  const isTestFile = (file) => file.startsWith("tests/") && /\.test\.(?:ts|tsx)$/.test(file);
+  const sourceTextEdges = new Map();
+  for (const test of git(["ls-files", "--cached", "--others", "--exclude-standard", "--", "tests"])
+    .split("\n").filter(isTestFile)) {
+    for (const [, source] of fs.readFileSync(test, "utf8").matchAll(/["'`](src\/[^"'`]+)["'`]/g)) {
+      const tests = sourceTextEdges.get(source) ?? [];
+      tests.push(test);
+      sourceTextEdges.set(source, tests);
+    }
   }
+  // Docs carry their own style suite. A docs-only change selects nothing else,
+  // so without this mapping a shipped violation stays invisible to CI.
+  const DOCS_STYLE_TEST = "tests/documentation-style.test.ts";
+  const isDocsFile = (file) => file === "README.md" || file.startsWith("docs/");
+  const direct = [...new Set([
+    ...files.filter(isTestFile),
+    ...(files.some(isDocsFile) && fs.existsSync(DOCS_STYLE_TEST) ? [DOCS_STYLE_TEST] : []),
+    ...files.flatMap((file) => sourceTextEdges.get(file) ?? []),
+  ])];
+  const related = files.filter(
+    (file) => (file.startsWith("src/") || file.startsWith("tests/")) && !isTestFile(file),
+  );
+  return { direct, related };
 }
-// Docs carry their own style suite. A docs-only change selects nothing else,
-// so without this mapping a shipped violation stays invisible to CI.
-const DOCS_STYLE_TEST = "tests/documentation-style.test.ts";
-const isDocsFile = (file) => file === "README.md" || file.startsWith("docs/");
-const direct = [...new Set([
-  ...files.filter(isTestFile),
-  ...(files.some(isDocsFile) && fs.existsSync(DOCS_STYLE_TEST) ? [DOCS_STYLE_TEST] : []),
-  ...files.flatMap((file) => sourceTextEdges.get(file) ?? []),
-])];
-const related = files.filter(
-  (file) => (file.startsWith("src/") || file.startsWith("tests/")) && !isTestFile(file),
-);
+const { direct, related } = selectAffected(changed);
+
+if (listOnly) {
+  const selection = { related: [], direct: [] };
+  // This is the discovery-only API used by `vitest list --filesOnly`.
+  // `related` is a CLI subcommand, not a list flag: pass its source inputs as
+  // the related config option, with no filename filters, just as that command does.
+  // Never collect/import test suites or call start(), which would execute tests.
+  process.env.TEST = "true";
+  process.env.VITEST = "true";
+  process.env.NODE_ENV ??= "test";
+  for (const [phase, inputs] of Object.entries({ related, direct })) {
+    if (inputs.length === 0) continue;
+    const { createVitest } = await import("vitest/node");
+    const ctx = await createVitest("test", {
+      watch: false, run: true,
+      ...(phase === "related" ? { related: inputs } : {}),
+    });
+    try {
+      const specs = await ctx.getRelevantTestSpecifications(phase === "direct" ? inputs : []);
+      selection[phase] = [...new Set(specs.map((spec) =>
+        path.relative(process.cwd(), spec.moduleId).replaceAll("\\", "/")))].sort();
+    } finally {
+      await ctx.close();
+    }
+  }
+  console.log(JSON.stringify(selection));
+  process.exit(0);
+}
 
 recordSelection({ base, direct, related, phases: [
   ...(related.length > 0 ? ["related"] : []),

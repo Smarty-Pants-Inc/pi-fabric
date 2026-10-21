@@ -4,6 +4,7 @@ import path from "node:path";
 import { spawnSync, execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
+import { compareFileParity } from "../scripts/ci-test-counts.mjs";
 
 const countsScript = fileURLToPath(new URL("../scripts/ci-test-counts.mjs", import.meta.url));
 const affectedScript = fileURLToPath(new URL("../scripts/test-affected.mjs", import.meta.url));
@@ -27,8 +28,58 @@ function receipt(root: string, index: number, phases = ["direct"]) {
   });
   return directory;
 }
-const aggregate = (root: string) => spawnSync(process.execPath, [countsScript, root, "ubuntu-latest", "2"], {
-  encoding: "utf8", env: { ...process.env, GITHUB_STEP_SUMMARY: path.join(root, "summary.md") },
+const aggregate = (root: string) => {
+  const selection = path.join(root, "unsharded.json");
+  // Inject discovery results: these tests must not discover or run real suites.
+  const files = ["tests/example-1.test.ts", "tests/example-2.test.ts"];
+  const phases = JSON.parse(fs.readFileSync(path.join(root, "affected-ubuntu-latest-1", "selection.json"), "utf8")).phases;
+  json(selection, { related: phases.includes("related") ? files : [], direct: phases.includes("direct") ? files : [] });
+  return spawnSync(process.execPath, [countsScript, root, "ubuntu-latest", "2", selection], {
+    encoding: "utf8", env: { ...process.env, GITHUB_STEP_SUMMARY: path.join(root, "summary.md") },
+  });
+};
+
+describe("file-level shard parity (pure, injected unsharded selection)", () => {
+  const a = "tests/a.test.ts";
+  const b = "tests/b.test.ts";
+  const expected = { related: [a, b], direct: [a] };
+
+  it("accepts equal unions, including cross-phase overlap and empty shards", () => {
+    const result = compareFileParity(expected, [
+      { related: [b], direct: [a] }, { related: [a], direct: [] },
+    ]);
+    expect(result.related).toEqual({ expected: 2, actual: 2, missing: [], extra: [], duplicated: [], ok: true });
+    expect(result.direct.ok).toBe(true);
+    expect(compareFileParity({ related: [], direct: [] }, [{ related: [], direct: [] }]).direct.ok).toBe(true);
+  });
+
+  it("reports missing files independently per phase", () => {
+    const result = compareFileParity(expected, [{ related: [a], direct: [] }]);
+    expect(result.related.missing).toEqual([b]);
+    expect(result.direct.missing).toEqual([a]);
+    expect(result.related.ok).toBe(false);
+    expect(result.direct.ok).toBe(false);
+  });
+
+  it("reports extra files, including an unexpectedly populated empty phase", () => {
+    const result = compareFileParity({ related: [a], direct: [] }, [{ related: [a, b], direct: [b] }]);
+    expect(result.related.extra).toEqual([b]);
+    expect(result.direct.extra).toEqual([b]);
+    expect(result.related.ok).toBe(false);
+    expect(result.direct.ok).toBe(false);
+  });
+
+  it("rejects a duplicated file even when the union equals the selection", () => {
+    const result = compareFileParity(expected, [
+      { related: [a, b], direct: [a] }, { related: [b], direct: [a] },
+    ]);
+    expect(result.related.duplicated).toEqual([b]);
+    expect(result.direct.duplicated).toEqual([a]);
+    expect(result.related.missing).toEqual([]);
+    expect(result.related.extra).toEqual([]);
+    expect(result.related.ok).toBe(false);
+    expect(result.direct.ok).toBe(false);
+  });
 });
 
 describe("affected-test count receipts", () => {
@@ -71,7 +122,11 @@ describe("affected-test count receipts", () => {
     json(path.join(directory, "selection.json"), selection);
     const report = JSON.parse(fs.readFileSync(path.join(directory, "direct.json"), "utf8"));
     json(path.join(directory, "direct.json"), { ...report, testResults: [{ name: "/work/tests/example-1.test.ts" }] });
-    expect(aggregate(root).status).not.toBe(0);
+    const result = aggregate(root);
+    expect(result.status).not.toBe(0);
+    expect(result.stdout).toContain("missing: tests/example-2.test.ts");
+    expect(result.stdout).toContain("duplicated: tests/example-1.test.ts");
+    expect(fs.readFileSync(path.join(root, "summary.md"), "utf8")).toContain("**direct: FAIL**");
   });
 
   it("reports zero selection explicitly rather than requiring an unrelated PR's test count", () => {

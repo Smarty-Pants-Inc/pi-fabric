@@ -264,18 +264,27 @@ jobs:
     if: always()
     needs: [linux-gates, linux-tests, linux-acceptance, linux-runtime]
     runs-on: ubuntu-latest
+    env:
+      FABRIC_TEST_SKIP_NATS: '1'
+      PI_TEST_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
     steps:
+      - run: git config --global core.autocrlf false
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
         with:
-          node-version-file: package.json
+          fetch-depth: 0
+      - uses: ./.github/actions/check-setup
+        with:
+          dist-artifact: dist-ubuntu-latest
+      - name: Discover unsharded affected test files (no test execution)
+        shell: bash
+        run: node scripts/test-affected.mjs --list-only > "$RUNNER_TEMP/unsharded-selection.json"
       - uses: actions/download-artifact@v4
         with:
           pattern: affected-ubuntu-latest-*
           path: ${{ runner.temp }}/affected
-      - name: Merge shard receipts, print parity counts, and require actor-manager
+      - name: Merge shard receipts and require file-level parity
         shell: bash
-        run: set -o pipefail; node scripts/ci-test-counts.mjs "$RUNNER_TEMP/affected" ubuntu-latest 10 | tee "$RUNNER_TEMP/merged-receipt.md" >> "$GITHUB_STEP_SUMMARY"
+        run: set -o pipefail; node scripts/ci-test-counts.mjs "$RUNNER_TEMP/affected" ubuntu-latest 10 "$RUNNER_TEMP/unsharded-selection.json" | tee "$RUNNER_TEMP/merged-receipt.md"
       - name: Upload merged shard receipt
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -297,18 +306,27 @@ jobs:
     if: always()
     needs: [windows-gates, windows-tests, windows-acceptance]
     runs-on: windows-latest
+    env:
+      FABRIC_TEST_SKIP_NATS: '1'
+      PI_TEST_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
     steps:
+      - run: git config --global core.autocrlf false
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
         with:
-          node-version-file: package.json
+          fetch-depth: 0
+      - uses: ./.github/actions/check-setup
+        with:
+          dist-artifact: dist-windows-latest
+      - name: Discover unsharded affected test files (no test execution)
+        shell: bash
+        run: node scripts/test-affected.mjs --list-only > "$RUNNER_TEMP/unsharded-selection.json"
       - uses: actions/download-artifact@v4
         with:
           pattern: affected-windows-latest-*
           path: ${{ runner.temp }}/affected
-      - name: Merge shard receipts and print parity counts
+      - name: Merge shard receipts and require file-level parity
         shell: bash
-        run: set -o pipefail; node scripts/ci-test-counts.mjs "$RUNNER_TEMP/affected" windows-latest 10 | tee "$RUNNER_TEMP/merged-receipt.md" >> "$GITHUB_STEP_SUMMARY"
+        run: set -o pipefail; node scripts/ci-test-counts.mjs "$RUNNER_TEMP/affected" windows-latest 10 "$RUNNER_TEMP/unsharded-selection.json" | tee "$RUNNER_TEMP/merged-receipt.md"
       - name: Upload merged shard receipt
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

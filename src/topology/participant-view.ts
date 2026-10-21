@@ -469,7 +469,7 @@ export class KvParticipantDirectory implements ParticipantView {
     return this.#remember(key, record, revision);
   }
 
-  /** On-change publication; only an initial own-root create may succeed a fenced predecessor. */
+  /** On-change publication; only an initial own-root or restored durable actor may succeed a fenced predecessor. */
   publish(record: FabricParticipantRecord, options: { force?: boolean } = {}): Promise<KvPresencePublication> {
     const copy = this.#ownRecord(record), key = this.#key(copy.id);
     return this.#serial(key, async () => {
@@ -494,27 +494,32 @@ export class KvParticipantDirectory implements ParticipantView {
       let revision: number;
       try { revision = await this.#update(key, copy, owned?.revision ?? 0); }
       catch (error) {
-        // Only the initial own-root create may replace a predecessor. Children,
-        // owned revisions and same-incarnation conflicts never acquire a read revision.
-        if (owned || errorCode(error) !== "FABRIC_KV_CONFLICT" || copy.kind !== "root" ||
-          copy.id !== this.options.rootId || copy.id !== this.options.identityId) throw error;
+        // Restored durable actors retain their IDs across resident incarnations.
+        // Agents, session actors, owned revisions and same-incarnation conflicts
+        // must never acquire a read revision to displace another publisher.
+        const ownRoot = copy.kind === "root" && copy.id === this.options.rootId && copy.id === this.options.identityId;
+        const durableActor = copy.kind === "actor" && copy.residency === "durable";
+        if (owned || errorCode(error) !== "FABRIC_KV_CONFLICT" || !ownRoot && !durableActor) throw error;
         const current = await this.#presence.get<unknown>(key, this.#signal());
         const predecessor = current && presenceValue(current);
-        if (!current || current.key !== key || !predecessor || predecessor.kind !== "root" ||
+        if (!current || current.key !== key || !predecessor || predecessor.kind !== copy.kind ||
           predecessor.id !== copy.id || predecessor.rootId !== copy.rootId ||
           predecessor.ownerHostId !== copy.ownerHostId || predecessor.ownerIdentityId !== copy.ownerIdentityId ||
-          predecessor.sessionId !== copy.sessionId || predecessor.ownerIncarnation === copy.ownerIncarnation) {
-          throw new TransportInvalidError("Presence create conflict is not an owned predecessor root");
+          predecessor.sessionId !== copy.sessionId || predecessor.ownerIncarnation === copy.ownerIncarnation ||
+          durableActor && (predecessor.residency !== "durable" || predecessor.parentId !== copy.parentId)) {
+          throw new TransportInvalidError("Presence create conflict is not an owned predecessor");
         }
         // Custody's clean/native-exit proof plus exclusive lease create establishes
         // succession, not UUID ordering or a possibly stale lease watch snapshot.
+        // The SAME host key must directly contain our new incarnation: absence,
+        // malformed data or a still-live predecessor lease cannot authorize a CAS.
         const leaseKey = `${this.options.transport.self.machine}.h.${tokenFor(copy.ownerHostId)}`;
         const currentLease = await this.#leases.get<unknown>(leaseKey, this.#signal());
         const lease = currentLease && leaseValue(currentLease);
         if (!currentLease || currentLease.key !== leaseKey || currentLease.owner !== this.#owner() || !lease ||
           lease.id !== copy.ownerHostId || lease.rootId !== copy.rootId ||
           lease.identityId !== copy.ownerIdentityId || lease.incarnation !== copy.ownerIncarnation) {
-          throw new TransportUnavailableError("Current owner lease does not authorize root succession");
+          throw new TransportUnavailableError("Current owner lease does not authorize presence succession");
         }
         this.#assertWritable(); // Reads may outlive the monotonic lease window.
         revision = await this.#update(key, copy, current.revision); // One CAS; never retry/adopt a lost revision.
@@ -525,7 +530,7 @@ export class KvParticipantDirectory implements ParticipantView {
           const confirmedLease = confirmed && leaseValue(confirmed);
           if (!confirmed || confirmed.key !== currentLease.key || confirmed.revision !== currentLease.revision ||
             confirmed.owner !== currentLease.owner || !confirmedLease || canonicalJson(confirmedLease) !== canonicalJson(lease)) {
-            throw new TransportUnavailableError("Owner lease changed during root succession");
+            throw new TransportUnavailableError("Owner lease changed during presence succession");
           }
           this.#assertWritable();
         } catch (error) {
@@ -533,7 +538,7 @@ export class KvParticipantDirectory implements ParticipantView {
           // now aborted. A newer presence writer wins; never retry or delete it.
           try { await this.#presence.put(key, current.owner, predecessor, revision, this.#signal(true)); }
           catch (undoError) { this.#report(undoError); }
-          throw new TransportUnavailableError("Owner lease no longer authorizes root succession", { cause: error });
+          throw new TransportUnavailableError("Owner lease no longer authorizes presence succession", { cause: error });
         }
       }
       return this.#admitted(key, copy, revision);

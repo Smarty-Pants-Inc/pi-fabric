@@ -2,20 +2,22 @@ import fs from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import path from "node:path";
 import * as nodeModule from "node:module";
-import { getCurrentSystemMessage, type Provider, type ProviderRequestOptions } from "@earendil-works/pi-ai";
+import { getCurrentSystemMessage, getSystemMessageText, type Provider, type ProviderRequestOptions } from "@earendil-works/pi-ai";
 import { buildSessionContext, convertToLlm, getPackageDir, sessionEntryToContextMessages, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 type AgentMessage = ReturnType<typeof buildSessionContext>["messages"][number];
 
 const isSystem = (message: AgentMessage): boolean => (message as { role?: string }).role === "system";
 const systemHead = (messages: readonly AgentMessage[], checkpoint = false): string => {
   const head = getCurrentSystemMessage(messages as Parameters<typeof getCurrentSystemMessage>[0]);
+  if (!head) return JSON.stringify(null);
+  // Pi may project the journal's sectioned prompt into rendered content (e.g.
+  // before_agent_start's systemPrompt). Compare its native rendering, not the
+  // storage shape, while retaining the tool declarations and timestamp checks.
+  const { sections: _sections, timestamp, ...semanticHead } = head;
   // Pi timestamps a native compaction checkpoint when it appends the marker.
   // Only that timestamp may differ; raw system records remain byte-witnessed.
-  if (head && checkpoint) {
-    const { timestamp: _timestamp, ...semanticHead } = head;
-    return JSON.stringify(semanticHead);
-  }
-  return JSON.stringify(head ?? null);
+  return JSON.stringify({ ...semanticHead, content: getSystemMessageText(head),
+    ...(!checkpoint ? { timestamp } : {}) });
 };
 
 /** A native startup snapshot, never a guessed prompt marker or a journal edit. */

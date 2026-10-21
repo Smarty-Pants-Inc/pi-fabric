@@ -85,27 +85,28 @@ function hostLease(incarnation = NEXT, change: Partial<FabricKvHostLease> = {}):
 }
 const opened: KvParticipantDirectory[] = [];
 afterEach(async () => { await Promise.all(opened.splice(0).map(view => view.close())); });
-function fixture() {
+function fixture(hostId = ROOT) {
   const presence = new RecordOnlyKv(600_000), leases = new RecordOnlyKv(15_000);
   let live = true;
   const abort = new AbortController();
   const gate: ParticipantLeaseGate = { live: () => live, signal: abort.signal };
-  const transport: FabricTransport = { kind: "nats", self: { machine: MACHINE, hostId: ROOT },
+  const transport: FabricTransport = { kind: "nats", self: { machine: MACHINE, hostId },
     kv: bucket => bucket === "presence" ? presence : leases,
     async send() { throw new Error("KV-only seam must not send"); }, async *inbox() { throw new Error("KV-only seam must not receive"); },
     async drainState() { return { pending: 0, ackPending: 0 }; }, async close() {} };
   const view = (incarnation = NEXT) => {
-    const value = new KvParticipantDirectory({ transport, lease: gate, identityId: ROOT, rootId: ROOT,
+    const value = new KvParticipantDirectory({ transport, lease: gate, identityId: hostId, rootId: ROOT,
       ownerIncarnation: incarnation, operationTimeoutMs: 1_000 });
     opened.push(value); value.start(); return value;
   };
   const stale = (change: Partial<FabricParticipantRecord> = {}) => {
     const record = root(OLD, change);
-    return presence.seed(pkey(), `${record.ownerHostId}#${record.ownerIncarnation}`, record);
+    if (record.kind === "actor" && !("sessionId" in change)) delete record.sessionId;
+    return presence.seed(pkey(record.id), `${record.ownerHostId}#${record.ownerIncarnation}`, record);
   };
   const lease = (incarnation = NEXT, change: Partial<FabricKvHostLease> = {}) => {
-    const value = hostLease(incarnation, change);
-    return leases.seed(hkey(), `${value.id}#${value.incarnation}`, value);
+    const value = hostLease(incarnation, { id: hostId, identityId: hostId, ...change });
+    return leases.seed(hkey(hostId), `${value.id}#${value.incarnation}`, value);
   };
   const observer = () => {
     const value = new KvParticipantDirectory({ transport: { ...transport, self: { machine: "machine-b", hostId: "observer-host" } },
@@ -125,7 +126,7 @@ async function liveRoute(view: KvParticipantDirectory) {
   return view.resolve(ROOT)!;
 }
 
-// Acceptance ledger: initial own Main only; stale same-lineage replacement; valid current
+// Acceptance ledger: initial own Main or durable actor; stale same-lineage replacement; valid current
 // host lease read directly; monotonic live gate rechecked across awaits; one fenced CAS;
 // refusal leaves exact bytes/revision intact; child admission and normal create unchanged.
 describe("#14115 initial own Main presence succession", () => {
@@ -390,11 +391,83 @@ describe("#14115 initial own Main presence succession", () => {
     expect(f.presence.deletes).toEqual([]);
   });
 
-  it("ordinary child publication cannot use Main-only takeover either", async () => {
+  it("session actor publication cannot take over a retained predecessor", async () => {
     const f = fixture(); f.lease();
     const child = root(NEXT, { id: "actor:run", kind: "actor", parentId: ROOT });
     const previous = f.presence.seed(pkey(child.id), `${ROOT}#${OLD}`, { ...child, ownerIncarnation: OLD });
     await expect(f.view().publish(child)).rejects.toBeDefined();
     expect(f.presence.rows.get(pkey(child.id))).toEqual(previous);
+  });
+});
+
+// Regression: SP factory-0 at 653b2b3c retained an actor row after its resident
+// lease vanished; every same-ID watchdog restore failed the root-only CAS gate.
+describe("durable resident actor presence succession", () => {
+  const HOST = "resident:presence-restore", ACTOR = "actor:retained";
+  function resident() {
+    const f = fixture(HOST);
+    const { sessionId: _sessionId, ...base } = root();
+    const record: FabricParticipantRecord = { ...base, id: ACTOR, kind: "actor", residency: "durable", parentId: ROOT,
+      ownerHostId: HOST, ownerIdentityId: HOST };
+    const previous = f.stale({ ...record, ownerIncarnation: OLD });
+    f.lease();
+    return { ...f, record, previous };
+  }
+
+  it("CAS-replaces a retained same-ID actor under the directly verified exclusive successor lease", async () => {
+    const f = resident(), view = f.view();
+    const receipt = await view.publish(f.record);
+    expect(f.presence.rows.get(pkey(ACTOR))).toMatchObject({ revision: receipt.revision, value: f.record });
+    expect(f.presence.mutations).toEqual([{ key: pkey(ACTOR), expected: f.previous.revision, revision: receipt.revision }]);
+    await ready(view);
+    const signal = AbortSignal.timeout(1_000);
+    while (!view.resolve(ACTOR)?.live) await view.whenChanged(ACTOR, signal);
+    expect(view.get(ACTOR)).toMatchObject({ id: ACTOR, stale: false, ownerIncarnation: NEXT });
+    expect(f.presence.deletes).toEqual([]);
+  });
+
+  it.each(["predecessor live", "lease absent", "lease unreadable", "malformed lease"])("refuses actor succession with %s, even after the lease watch was ready", async failure => {
+    const f = resident(), view = f.view(); await ready(view);
+    if (failure === "predecessor live") f.lease(OLD);
+    if (failure === "lease absent") f.leases.rows.delete(hkey(HOST));
+    if (failure === "lease unreadable") f.leases.beforeGet = () => { throw new Error("lease KV unavailable"); };
+    if (failure === "malformed lease") f.lease(NEXT, { pid: 0 });
+    await expect(view.publish(f.record)).rejects.toBeDefined();
+    expect(f.presence.rows.get(pkey(ACTOR))).toEqual(f.previous);
+    expect(f.presence.mutations).toEqual([]);
+  });
+
+  it.each([
+    { kind: "agent" }, { residency: "session" }, { parentId: "other-parent" },
+    { ownerHostId: "other-resident" }, { ownerIdentityId: "other-identity" },
+    { rootId: "other-root" }, { ownerIncarnation: NEXT },
+  ] as const)("refuses an incompatible retained actor ($kind $residency $parentId $ownerHostId $ownerIdentityId $rootId $ownerIncarnation)", async change => {
+    const f = resident();
+    const previous = f.stale({ ...f.record, ownerIncarnation: OLD, ...change });
+    await expect(f.view().publish(f.record)).rejects.toBeDefined();
+    expect(f.presence.rows.get(pkey(ACTOR))).toEqual(previous);
+    expect(f.presence.mutations).toEqual([]);
+  });
+
+  it("never retries or adopts a concurrent actor presence CAS winner", async () => {
+    const f = resident();
+    let winner: TransportKvEntry<unknown> | undefined;
+    f.presence.beforePut = (key, expected) => {
+      if (expected > 0 && !winner) winner = f.presence.seed(key, `${HOST}#winner`, { ...f.record, ownerIncarnation: "winner" });
+    };
+    await expect(f.view().publish(f.record)).rejects.toMatchObject({ code: "FABRIC_KV_CONFLICT" });
+    expect(winner).toBeDefined();
+    expect(f.presence.rows.get(pkey(ACTOR))).toEqual(winner);
+    expect(f.presence.mutations).toEqual([]);
+  });
+
+  it("restores the actor predecessor using only its own successful CAS revision if the lease changes", async () => {
+    const f = resident();
+    f.presence.beforePut = (_key, expected) => { if (expected === f.previous.revision) f.lease(OLD); };
+    await expect(f.view().publish(f.record)).rejects.toMatchObject({ code: "FABRIC_TRANSPORT_UNAVAILABLE" });
+    expect(f.presence.rows.get(pkey(ACTOR))).toMatchObject({ owner: f.previous.owner, value: f.previous.value });
+    expect(f.presence.mutations).toHaveLength(2);
+    expect(f.presence.mutations[1]!.expected).toBe(f.presence.mutations[0]!.revision);
+    expect(f.presence.deletes).toEqual([]);
   });
 });

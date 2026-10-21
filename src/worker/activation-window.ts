@@ -5,11 +5,27 @@ import * as nodeModule from "node:module";
 import { getCurrentSystemMessage, getSystemMessageText, type Provider, type ProviderRequestOptions } from "@earendil-works/pi-ai";
 import { buildSessionContext, convertToLlm, getPackageDir, sessionEntryToContextMessages, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 type AgentMessage = ReturnType<typeof buildSessionContext>["messages"][number];
+type NativeSystemProjection = { forceSystemPrompt?: string | undefined; hiddenTools: readonly string[] };
 
 const isSystem = (message: AgentMessage): boolean => (message as { role?: string }).role === "system";
-const systemHead = (messages: readonly AgentMessage[], checkpoint = false): string => {
-  const head = getCurrentSystemMessage(messages as Parameters<typeof getCurrentSystemMessage>[0]);
+const systemHead = (messages: readonly AgentMessage[], checkpoint = false, projection?: NativeSystemProjection): string => {
+  let head = getCurrentSystemMessage(messages as Parameters<typeof getCurrentSystemMessage>[0]);
   if (!head) return JSON.stringify(null);
+  if (projection) {
+    // Pi 1.2 projects prepareLoadout's hidden declarations out of the request,
+    // and before_agent_start's forced prompt into it, without journaling either.
+    // Project only the journal head using the finalized native startup options;
+    // never learn acceptable changes from the (potentially rewritten) request.
+    if (projection.hiddenTools.length) {
+      const { toolsAdded, ...rest } = head;
+      const visible = toolsAdded?.filter(tool => !projection.hiddenTools.includes(tool.name));
+      head = { ...rest, ...(visible?.length ? { toolsAdded: visible } : {}) };
+    }
+    if (projection.forceSystemPrompt !== undefined) {
+      head = { role: "system", content: projection.forceSystemPrompt,
+        ...(head.toolsAdded ? { toolsAdded: head.toolsAdded } : {}), timestamp: head.timestamp };
+    }
+  }
   // Pi may project the journal's sectioned prompt into rendered content (e.g.
   // before_agent_start's systemPrompt). Compare its native rendering, not the
   // storage shape, while retaining the tool declarations and timestamp checks.
@@ -28,7 +44,12 @@ export class ActivationWindow {
   private system: readonly string[];
   private current: string[] = [];
   private compacted = false;
+  private projection: NativeSystemProjection | undefined;
   private pending: { summary: string; messages: string[] } | undefined;
+
+  setNativeProjection(options: NativeSystemProjection): void {
+    this.projection = { forceSystemPrompt: options.forceSystemPrompt, hiddenTools: [...options.hiddenTools] };
+  }
 
   authorizeCompaction(summary: string, messages: AgentMessage[]): void {
     if (this.pending) throw new Error("Activation compaction is already pending");
@@ -47,8 +68,9 @@ export class ActivationWindow {
   /**
    * Checks the system prompt that reaches the model. The journal's system records must
    * start with the startup witness and may only grow during the activation, and the
-   * running context's system head must be the replay of exactly those records: a
-   * rewritten earlier record, in the journal or in the running context, fails closed.
+   * running context's system head must be their replay plus Pi's witnessed native
+   * startup projection. A rewritten earlier record still fails closed, including
+   * changes to records whose text or tools the native projection hides.
    */
   verifySystem(journal: readonly AgentMessage[], running: readonly AgentMessage[]): void {
     const records = journal.filter(isSystem);
@@ -57,7 +79,7 @@ export class ActivationWindow {
       throw new Error("Activation window lost its native system records");
     }
     this.system = encoded;
-    if (systemHead(running, this.compacted) !== systemHead(records, this.compacted)) {
+    if (systemHead(running, this.compacted) !== systemHead(records, this.compacted, this.projection)) {
       throw new Error("Activation window lost its native system prompt");
     }
   }
@@ -136,6 +158,7 @@ function reportWindowRefusal(tokens: number, contextWindow: number): void {
 /** Loaded only by an explicitly selected actor worker; adds no tools or trust. */
 export default async function activationWindow(pi: ExtensionAPI): Promise<void> {
   let window: ActivationWindow | undefined;
+  let promptOptions: NativeSystemProjection | undefined;
   try {
     if (String(process.ppid) !== process.env.PI_FABRIC_ACTIVATION_WORKER_PID || !process.env.PI_FABRIC_ACTIVATION_NONCE) {
       throw new Error("Activation window requires the worker launch binding");
@@ -176,6 +199,19 @@ export default async function activationWindow(pi: ExtensionAPI): Promise<void> 
           protocol: 1,
           hook,
         })}\n`);
+      } catch (error) {
+        failClosed(error);
+      }
+    });
+    pi.on("before_agent_start", event => {
+      // This hook loads FIRST. Pi shares these options across the complete hook
+      // chain, then finalizes hiddenTools via prepareLoadout before agent_start.
+      promptOptions = event.systemPromptOptions;
+    });
+    pi.on("agent_start", () => {
+      try {
+        if (!window || !promptOptions) throw new Error("Activation window lost native startup options");
+        window.setNativeProjection(promptOptions);
       } catch (error) {
         failClosed(error);
       }

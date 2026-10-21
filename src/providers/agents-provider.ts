@@ -9,6 +9,7 @@ import type { JevRequest, JevResponse } from "../jev/types.js";
 import { formatAge, residentHostId, RESIDENT_HOST_FORMAT, ResidentOutcomeUnknownError, ResidentActorAuthorizationError, assertResidentActorMain, assertResidentActorToolCeiling, type ResidentActorCaller, type ResidentActorMutation } from "../residency/protocol.js";
 import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
 import { ActorManager, ActorRegistryOwnershipError, parseBashTimeoutSeconds } from "../actors/manager.js";
+import { actorActivationIdentityFromEnvironment, type FabricActorActivationIdentity } from "../actors/activation-identity.js";
 import { slotAdmissionFor } from "../actors/slot-admission.js";
 import { participantProject, recordedProjectLead, repositoryOf, resolveProjectAgent } from "../topology/project-identity.js";
 import { GlobalActorRegistry } from "../actors/global-registry.js";
@@ -21,6 +22,7 @@ import type {
   FabricActorHostEvent,
   FabricActorInfo,
   FabricActorReadInfo,
+  FabricActorSelfReadInfo,
   FabricActorMessage,
   FabricActorRequest,
   FabricActorCreateRequest,
@@ -1182,8 +1184,13 @@ export class AgentsProvider implements FabricProvider {
       }
       case "self": {
         const self = await this.participants.self();
+        const actor = actorActivationIdentityFromEnvironment();
         const lineage = readAgentLineage();
-        return lineage ? { ...self, lineage } : self;
+        return {
+          ...self,
+          ...(actor ? { actor } : {}),
+          ...(lineage ? { lineage } : {}),
+        };
       }
       case "main": {
         const address = this.#taskReturnAddress;
@@ -1588,8 +1595,14 @@ export class AgentsProvider implements FabricProvider {
         return result;
       }
       case "actorStatus": {
-        await this.actorManager.reconcileSessionOrphans();
         const id = String(args.id);
+        const ownActor = actorActivationIdentityFromEnvironment();
+        if (ownActor || process.env.PI_FABRIC_ACTOR_ID) {
+          if (!ownActor) throw new Error("Fabric actor activation identity is unavailable");
+          if (id !== ownActor.actorId) throw new Error(`Unknown Fabric actor: ${id}`);
+          return await this.#ownActorStatus(ownActor, context.signal);
+        }
+        await this.actorManager.reconcileSessionOrphans();
         let actor: FabricActorInfo | undefined;
         try {
           actor = this.actorManager.status(id);
@@ -2159,6 +2172,38 @@ export class AgentsProvider implements FabricProvider {
       if (!handedOff) await this.#recordCreationStartFailed(request, "actor");
       throw error;
     }
+  }
+
+  async #ownActorStatus(
+    identity: FabricActorActivationIdentity,
+    signal?: AbortSignal,
+  ): Promise<FabricActorReadInfo | FabricActorSelfReadInfo> {
+    signal?.throwIfAborted();
+    // When its owning root exposes the read-only resident API, use that fresh
+    // status only if the actor still has this activation's immutable lineage.
+    try {
+      const resident = await this.#residentActorOwner(identity.actorId, signal);
+      if (resident?.id === identity.actorId) {
+        const status = await resident.client.actorStatus(resident.id, signal);
+        if (status.id === identity.actorId && status.name === identity.name && status.rootId === identity.rootId &&
+            status.ownershipToken === identity.ownershipToken && status.instructionsDigest === identity.instructionsDigest) {
+          return { ...status, ...(identity.roleStamp ? { roleStamp: identity.roleStamp } : {}) };
+        }
+      }
+    } catch {
+      signal?.throwIfAborted();
+      // The immutable activation tuple is sufficient when the owner is offline.
+    }
+    signal?.throwIfAborted();
+    return {
+      id: identity.actorId,
+      name: identity.name,
+      rootId: identity.rootId,
+      ownershipToken: identity.ownershipToken,
+      instructionsDigest: identity.instructionsDigest,
+      ...(identity.roleStamp ? { roleStamp: identity.roleStamp } : {}),
+      status: "unknown",
+    };
   }
 
   #actorsWithLiveState(): FabricActorReadInfo[] {

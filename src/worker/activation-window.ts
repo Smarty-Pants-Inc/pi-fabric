@@ -3,9 +3,21 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import path from "node:path";
 import * as nodeModule from "node:module";
 import { getCurrentSystemMessage, getSystemMessageText, type Provider, type ProviderRequestOptions } from "@earendil-works/pi-ai";
-import { buildSessionContext, convertToLlm, getPackageDir, sessionEntryToContextMessages, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { buildSessionContext, convertToLlm, getPackageDir, sessionEntryToContextMessages, type ExtensionAPI, type ExtensionContext, type NormalizedBuildSystemPromptOptions } from "@earendil-works/pi-coding-agent";
 type AgentMessage = ReturnType<typeof buildSessionContext>["messages"][number];
 type NativeSystemProjection = { forceSystemPrompt?: string | undefined; hiddenTools: readonly string[] };
+
+const deepFreeze = <T>(value: T): T => {
+  if (value && typeof value === "object" && !Object.isFrozen(value)) {
+    Object.freeze(value);
+    for (const nested of Object.values(value)) deepFreeze(nested);
+  }
+  return value;
+};
+const stableJson = (value: unknown): string | undefined => JSON.stringify(value, (_key, nested: unknown) =>
+  nested && typeof nested === "object" && !Array.isArray(nested)
+    ? Object.fromEntries(Object.entries(nested).sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0))
+    : nested);
 
 const isSystem = (message: AgentMessage): boolean => (message as { role?: string }).role === "system";
 const systemHead = (messages: readonly AgentMessage[], checkpoint = false, projection?: NativeSystemProjection): string => {
@@ -158,7 +170,7 @@ function reportWindowRefusal(tokens: number, contextWindow: number): void {
 /** Loaded only by an explicitly selected actor worker; adds no tools or trust. */
 export default async function activationWindow(pi: ExtensionAPI): Promise<void> {
   let window: ActivationWindow | undefined;
-  let promptOptions: NativeSystemProjection | undefined;
+  let promptOptions: { live: NormalizedBuildSystemPromptOptions; frozen: NormalizedBuildSystemPromptOptions } | undefined;
   try {
     if (String(process.ppid) !== process.env.PI_FABRIC_ACTIVATION_WORKER_PID || !process.env.PI_FABRIC_ACTIVATION_NONCE) {
       throw new Error("Activation window requires the worker launch binding");
@@ -204,14 +216,20 @@ export default async function activationWindow(pi: ExtensionAPI): Promise<void> 
       }
     });
     pi.on("before_agent_start", event => {
-      // This hook loads FIRST. Pi shares these options across the complete hook
-      // chain, then finalizes hiddenTools via prepareLoadout before agent_start.
-      promptOptions = event.systemPromptOptions;
+      try {
+        // This hook loads FIRST. Witness the complete options now, before any
+        // later extension can mutate the shared object or its nested values.
+        promptOptions = { live: event.systemPromptOptions, frozen: deepFreeze(structuredClone(event.systemPromptOptions)) };
+      } catch (error) {
+        failClosed(error);
+      }
     });
     pi.on("agent_start", () => {
       try {
-        if (!window || !promptOptions) throw new Error("Activation window lost native startup options");
-        window.setNativeProjection(promptOptions);
+        if (!window || !promptOptions || stableJson(promptOptions.live) !== stableJson(promptOptions.frozen)) {
+          throw new Error("Activation window lost native startup options");
+        }
+        window.setNativeProjection(promptOptions.frozen);
       } catch (error) {
         failClosed(error);
       }

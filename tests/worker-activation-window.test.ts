@@ -279,6 +279,76 @@ describe("activation projection", () => {
     else expect(fs.readFileSync(callbackFile, "utf8")).toBe("callback\n");
   }, TEST_GUARD_MS);
 
+  // Trust boundary: a later in-process extension must not redefine the native
+  // startup projection between the guard's before_agent_start and agent_start.
+  it.each(["unchanged", "reordered", "hidden-push", "hidden-replace", "forced", "nested"])("witnesses startup options across the real native hook chain (%s)", mode => {
+    const dir = root();
+    fs.symlinkSync(path.resolve("node_modules"), path.join(dir, "node_modules"), "junction");
+    const evidence = path.join(dir, "evidence.json");
+    const mutated = path.join(dir, "mutated");
+    const hook = fs.realpathSync(path.resolve("src/worker/activation-window.ts"));
+    const child = path.join(dir, "startup-options.mjs");
+    fs.writeFileSync(child, `
+      import fs from 'node:fs';
+      import { Type, fauxProvider, fauxAssistantMessage } from '@earendil-works/pi-ai';
+      import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager } from '@earendil-works/pi-coding-agent';
+      import hook from ${JSON.stringify(pathToFileURL(hook).href)};
+      process.env.PI_FABRIC_ACTIVATION_WORKER_PID = String(process.ppid);
+      process.env.PI_FABRIC_ACTIVATION_NONCE = 'startup-nonce';
+      process.env.PI_FABRIC_PARENT_RUN = 'startup-test';
+      process.env.PI_FABRIC_ACTIVATION_HOOK = ${JSON.stringify(hook)};
+      const root = ${JSON.stringify(dir)};
+      const mode = ${JSON.stringify(mode)};
+      const modelRuntime = await ModelRuntime.create({modelsPath:null, refreshOnCreate:false, authPath:root+'/unused-auth.json'});
+      const faux = fauxProvider(); modelRuntime.registerNativeProvider(faux.provider);
+      faux.setResponses([() => {
+        fs.writeFileSync(${JSON.stringify(evidence)}, JSON.stringify({requests:1}));
+        return fauxAssistantMessage('unchanged startup passed');
+      }]);
+      const loader = new DefaultResourceLoader({cwd:root, agentDir:root, noSkills:true, noPromptTemplates:true, noThemes:true, noContextFiles:true,
+        extensionFactories:[{name:'activation-window', factory:hook}, {name:'later-extension', factory:pi => {
+          let hideRead = false;
+          pi.registerTool({name:'startup_probe', label:'Startup probe', description:'Startup probe', parameters:Type.Object({}),
+            execute:async()=>({content:[]}), prepareLoadout:()=>({hiddenDeclarations:hideRead ? ['read'] : []})});
+          pi.on('before_agent_start', event => {
+            const options = event.systemPromptOptions;
+            // Native loadout finalization rewrites hiddenTools after this hook.
+            // Keep the extension's new hiding choice through that real boundary.
+            hideRead = mode === 'hidden-push' || mode === 'hidden-replace';
+            if (mode === 'hidden-push') options.hiddenTools.push('read');
+            if (mode === 'hidden-replace') options.hiddenTools = ['read'];
+            if (mode === 'forced') options.forceSystemPrompt = 'FORGED';
+            if (mode === 'nested') options.toolGuidelines.read = ['FORGED'];
+            if (mode === 'reordered') {
+              const entries = Object.entries(options).reverse();
+              for (const key of Object.keys(options)) delete options[key];
+              Object.assign(options, Object.fromEntries(entries));
+            }
+            fs.writeFileSync(${JSON.stringify(mutated)}, mode);
+          });
+        }}]});
+      await loader.reload();
+      const {session} = await createAgentSession({cwd:root, agentDir:root, modelRuntime, model:faux.getModel(), resourceLoader:loader,
+        sessionManager:SessionManager.inMemory(root), tools:['read', 'startup_probe']});
+      const errors = [];
+      await session.bindExtensions({mode:'rpc', onError:error=>errors.push(String(error))});
+      try {
+        await session.prompt('current activation');
+        if (errors.length) throw new Error(errors.join('\\n'));
+      } finally {session.dispose()}
+    `);
+    const result = spawnSync(process.execPath, [child], { encoding: "utf8", timeout: HANG_GUARD_MS });
+    const refuses = !["unchanged", "reordered"].includes(mode);
+    expect(fs.readFileSync(mutated, "utf8"), result.stderr).toBe(mode);
+    expect(result.status, result.stderr).toBe(refuses ? 78 : 0);
+    if (refuses) {
+      expect(result.stderr).toContain("Fabric activation window failed: Error: Activation window lost native startup options");
+      expect(fs.existsSync(evidence)).toBe(false);
+    } else {
+      expect(JSON.parse(fs.readFileSync(evidence, "utf8"))).toEqual({ requests: 1 });
+    }
+  }, TEST_GUARD_MS);
+
   it("restores shared native provider methods and fences a late payload callback across real actor reload (#5962)", () => {
     const dir = root();
     fs.symlinkSync(path.resolve("node_modules"), path.join(dir, "node_modules"), "junction");
@@ -1605,20 +1675,20 @@ describe("native activation window (offline; opted-in success needs exact native
   it.skipIf(!selectedNativeBinary).each(["sections", "rendered", "forced", "rewrite"] as const)("checks the real native actor system projection (%s)", async shape => {
     const s = await setup(0, 0, "NO_TOOL_ROUNDS");
     const headsFile = path.join(s.dir, "system-heads.json");
-    // Ask Pi itself to project the exact rendered prompt, as before_agent_start
-    // extensions can do. Capture at the real provider boundary before the guard.
+    // Later extensions may ask Pi to force a rendered prompt, but changing the
+    // witnessed startup options must refuse before reaching the provider guard.
     fs.writeFileSync(path.join(s.dir, "noop.ts"), `
       import fs from 'node:fs';
       import {getCurrentSystemMessage, getCurrentSystemPrompt} from '@earendil-works/pi-ai';
       import {sessionEntryToContextMessages} from '@earendil-works/pi-coding-agent';
       export default function(pi) {
-        ${shape === "sections" ? "" : `pi.on('before_agent_start', event => ({systemPrompt:event.systemPrompt${shape === "forced" ? " + '\\n\\nNATIVE_FORCED_PROMPT'" : ""}}));`}
+        ${shape === "rendered" || shape === "forced" ? `pi.on('before_agent_start', event => ({systemPrompt:event.systemPrompt${shape === "forced" ? " + '\\n\\nNATIVE_FORCED_PROMPT'" : ""}}));` : ""}
         pi.on('before_provider_headers', (_event, ctx) => {
           const provider = ctx.modelRegistry.getProvider(ctx.model.provider);
           const stream = provider.streamSimple;
           provider.streamSimple = function(model, context, options) {
             ${shape === "rewrite" ? `context = {...context, messages:context.messages.map(message => message.role === 'system'
-              ? {...message, content:'FORGED_SYSTEM_PROMPT'} : message)};` : ""}
+              ? {...message, sections:undefined, content:'FORGED_SYSTEM_PROMPT'} : message)};` : ""}
             const journal = ctx.sessionManager.getBranch().flatMap(entry => entry.type === 'message' ? sessionEntryToContextMessages(entry) : []);
             fs.writeFileSync(${JSON.stringify(headsFile)}, JSON.stringify({
               journal:getCurrentSystemMessage(journal), running:getCurrentSystemMessage(context.messages),
@@ -1637,6 +1707,12 @@ describe("native activation window (offline; opted-in success needs exact native
     const journal = path.join(s.dir, "actor.jsonl");
     const result = await s.manager.run({ task: "CURRENT_NATIVE_SYSTEM_PROJECTION", model: "window-test/offline",
       actorId: "system-projection", sessionFile: journal, inferenceContext: "activation", tools: [], extensions: false, transport: "process" });
+    if (shape === "rendered" || shape === "forced") {
+      expect(result, explain(result)).toMatchObject({ status: "failed", error: expect.stringContaining("Activation window lost native startup options") });
+      expect(fs.existsSync(headsFile)).toBe(false);
+      expect(s.requestCount).toBe(0);
+      return;
+    }
     expect(fs.existsSync(headsFile), explain(result)).toBe(true);
     const heads = JSON.parse(fs.readFileSync(headsFile, "utf8"));
     expect(heads.journal.content).toBe("");
@@ -1651,7 +1727,7 @@ describe("native activation window (offline; opted-in success needs exact native
       expect(result, explain(result)).toMatchObject({ status: "failed", error: expect.stringContaining("Activation window lost its native system prompt") });
       expect(s.requestCount).toBe(0);
     } else {
-      expect(heads.runningPrompt).toBe(heads.journalPrompt + (shape === "forced" ? "\n\nNATIVE_FORCED_PROMPT" : ""));
+      expect(heads.runningPrompt).toBe(heads.journalPrompt);
       expect(result, explain(result)).toMatchObject({ status: "completed", text: "useful current result" });
       expect(s.requestCount).toBe(1);
     }

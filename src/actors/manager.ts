@@ -40,7 +40,7 @@ import type { SpawnRouterAdmission } from "../agents/spawn-router.js";
 
 import { readJsonlPage } from "../log-tail.js";
 import { ActorChildCompletionStore, ActorChildCompletionWatch, ChildCompletionClaimLostError } from "./child-completions.js";
-import { pruneActorSessionBackups, recordMeshRetentionSweeper, startLockedMeshRetentionSweep } from "../storage/retention.js";
+import { archiveRunSessionTraces, pruneActorSessionBackups, recordMeshRetentionSweeper, RUN_SESSION_TRACE_ARCHIVE_DIRECTORY, startLockedMeshRetentionSweep } from "../storage/retention.js";
 import { spawn } from "node:child_process";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
@@ -4025,6 +4025,11 @@ export class ActorManager {
         await operatorCheck();
         await this.#bindings.delete(id);
         await operatorCheck();
+        if (fs.existsSync(cleanup.sessionDir) && !archiveRunSessionTraces(cleanup.sessionDir, undefined,
+          path.join(this.mesh.root, RUN_SESSION_TRACE_ARCHIVE_DIRECTORY),
+          `actor-session-${createHash("sha256").update(cleanup.sessionDir).digest("hex").slice(0, 24)}`)) {
+          throw new Error("raw session trace archive failed; actor cleanup refused");
+        }
         fs.rmSync(cleanup.sessionDir, { recursive: true, force: true });
       }, async () => {
         revoked();
@@ -4420,8 +4425,14 @@ export class ActorManager {
     );
     this.#registry.releaseReadCache();
     // Fenced like every whole-tree delete (smarty-dev#8090); without the fence the tree is kept, shutdown goes on.
-    await deleteRootActorTree(this.mesh.root, this.#rootId, () => fs.rmSync(this.#actorRoot, { recursive: true, force: true }))
-      .catch(error => diagnostics.warn("src/actors/manager.ts", `[pi-fabric] actor root ${this.#actorRoot} kept: ${errorText(error)}`));
+    await deleteRootActorTree(this.mesh.root, this.#rootId, () => {
+      if (fs.existsSync(this.#actorRoot) && !archiveRunSessionTraces(this.#actorRoot, undefined,
+        path.join(this.mesh.root, RUN_SESSION_TRACE_ARCHIVE_DIRECTORY),
+        `actor-root-${createHash("sha256").update(path.resolve(this.#actorRoot)).digest("hex").slice(0, 24)}`)) {
+        throw new Error("raw session trace archive failed; actor root cleanup refused");
+      }
+      fs.rmSync(this.#actorRoot, { recursive: true, force: true });
+    }).catch(error => diagnostics.warn("src/actors/manager.ts", `[pi-fabric] actor root ${this.#actorRoot} kept: ${errorText(error)}`));
   }
 
   /**

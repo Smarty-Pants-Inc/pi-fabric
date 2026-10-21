@@ -63,7 +63,8 @@ export const sweepResidentRuns = (
           hasPreservedResidentResult(runsRoot, entry.name) && !expired()) {
         // A referenced candidate is kept as is; compaction would veto it on the same reference.
         const name = entry.name, bytes = options.measure?.(run) ?? 0;
-        if (removeUnreferencedRun(run, stat, () => referencedNow(name), options.dryRun, "sweepResidentRuns", bytes)) { removed.push(run); options.onRemove?.(run, bytes); }
+        if (removeUnreferencedRun(run, stat, () => referencedNow(name), options.dryRun, "sweepResidentRuns", bytes,
+          options.acceptPidReuse === true)) { removed.push(run); options.onRemove?.(run, bytes); }
       } else {
         compactTerminalRunEvents(run, {
           ...(options.terminalRunEventsAgeMs !== undefined ? { terminalRunEventsAgeMs: options.terminalRunEventsAgeMs } : {}),
@@ -260,8 +261,10 @@ export class ResidentRequestRetention {
               hasPreservedResidentResult(directory, entry.name) &&
               boundedRunTree(file, unitExpired) && !unitExpired() &&
               actorReferenceFingerprint(this.actorRoots) === fingerprint) {
-            // smarty-dev#7916: only the judged run inode, verified; a failure retries next scan.
-            verifiedRemove(file, stat, { deleter: "residentRunRetention", fallback: () => { fs.rmSync(file, { recursive: true, force: true }); return true; } });
+            // The final archive, tree and registry checks run immediately before the verified removal.
+            removeUnreferencedRun(file, stat,
+              () => actorReferenceFingerprint(this.actorRoots) !== fingerprint || !boundedRunTree(file, unitExpired),
+              false, "residentRunRetention");
             continue;
           }
           const compacted = compactTerminalRunEvents(file, { ...this.retention, now, expired: unitExpired,
@@ -366,8 +369,9 @@ export class ResidentRequestRetention {
               !runTreeExitVeto(file, 0, undefined, true) && canRemoveTerminalRun(file) &&
               hasPreservedResidentResult(directory, entry.name) &&
               actorReferenceFingerprint(this.actorRoots) === fingerprint) {
-            // Windows main sweep: verifiedRemove runs main's removal unchanged off Linux (smarty-dev#7858).
-            verifiedRemove(file, stat, { deleter: "residentRunRetention", fallback: () => { fs.rmSync(file, { recursive: true, force: true }); return true; } });
+            // Windows main sweep: the archive check precedes main's path removal fallback unchanged.
+            removeUnreferencedRun(file, stat, () => actorReferenceFingerprint(this.actorRoots) !== fingerprint,
+              false, "residentRunRetention");
             continue;
           }
           compactTerminalRunEvents(file, { ...this.retention, now,

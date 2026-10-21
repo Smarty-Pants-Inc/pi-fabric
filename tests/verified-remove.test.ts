@@ -121,14 +121,6 @@ const FIXTURES: Record<string, () => Fixture> = {
     const target = path.join(directory, "events.jsonl");
     return { target, act: () => compactTerminalRunEvents(directory, { now: NOW, terminalRunEventsMaxBytes: 1024 }) };
   },
-  pruneActorSessionBackups: () => {
-    const directory = tmp("fabric-vr-backups-");
-    const session = path.join(directory, "session.jsonl");
-    write(session, "live");
-    const names = ["20260920T150000000Z", "20260921T150000000Z", "20260922T150000000Z"].map(stamp => `${session}.${stamp}.bak`);
-    names.forEach((name, index) => { write(name, name); const at = 1_000 + index; fs.utimesSync(name, at, at); });
-    return { target: names[0]!, act: () => pruneActorSessionBackups(session) };
-  },
   sweepScratch: () => {
     const tempRoot = tmp("fabric-vr-scratch-");
     const target = createScratch("output", tempRoot);
@@ -289,7 +281,7 @@ describe.skipIf(process.platform !== "linux")("verified removal: every routed re
     expect(shape(path.dirname(target))).toEqual(before);
   });
 
-  it("a future-dated backup name never costs the newest backup (design 3)", () => {
+  it("retains every raw session backup, including future-dated names", () => {
     const directory = tmp("fabric-vr-future-");
     const session = path.join(directory, "session.jsonl");
     write(session, "live");
@@ -297,7 +289,6 @@ describe.skipIf(process.platform !== "linux")("verified removal: every routed re
     const order = ["20260920T150000000Z", "20991231T235959999Z", "20260925T150000000Z"].map(stamp => `${session}.${stamp}.bak`);
     order.forEach((name, index) => { write(name, name); const at = 1_000 + index; fs.utimesSync(name, at, at); });
     pruneActorSessionBackups(session);
-    expect(fs.existsSync(order[2]!)).toBe(true);
-    expect(fs.existsSync(order[0]!)).toBe(false);
+    expect(order.every(name => fs.existsSync(name))).toBe(true);
   });
 });

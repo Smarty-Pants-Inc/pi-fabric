@@ -177,7 +177,13 @@ const runCachedRetryCase = async (operation: "spawnBound" | "createActor") => {
     }
     if (operation === "spawnBound") {
       await waitFor(() => fs.existsSync(residentResultPath(fixture.config.residencyRoot, first.id)));
+      const runDirectory = fixture.host.agents.runDirectory(first.id)!;
+      const trace = path.join(runDirectory, "session.jsonl");
+      fs.writeFileSync(trace, "resident raw session transcript\n");
       await fixture.client.cleanupAgent(first.id);
+      const archived = path.join(path.dirname(runDirectory), ".pi-fabric-session-traces", `run-${path.basename(runDirectory)}`, "session.jsonl");
+      expect(fs.existsSync(trace)).toBe(false);
+      expect(fs.readFileSync(archived, "utf8")).toBe("resident raw session transcript\n");
     } else await fixture.client.removeActor(first.id);
     await fixture.scan(Math.max(...ids.map(id => fixture.ack(id).acknowledgedAt)) + RESIDENT_REQUEST_RETENTION_MS + 1, () => ids.every(id => !fixture.retained(id)));
     for (const id of ids) {
@@ -187,6 +193,40 @@ const runCachedRetryCase = async (operation: "spawnBound" | "createActor") => {
     expect(create).toHaveBeenCalledTimes(1);
   } finally { await fixture.close(); }
 };
+it("offline cleanup archives every trace and refuses run/result deletion after a partial archive failure", async () => {
+  const fixture = await setup();
+  fixture.config.agents.retainRuns = true;
+  try {
+    const handle = await fixture.client.spawnAgent({ task: "offline trace cleanup", transport: "process", extensions: false }, AbortSignal.timeout(5_000));
+    await waitFor(() => fs.existsSync(residentResultPath(fixture.config.residencyRoot, handle.id)));
+    const runDirectory = fixture.host.agents.runDirectory(handle.id)!;
+    const trace = path.join(runDirectory, "session.jsonl");
+    fs.writeFileSync(trace, "offline raw transcript\n");
+    const metadata = path.join(fixture.config.residencyRoot, "agents", `${handle.id}.json`);
+    const result = residentResultPath(fixture.config.residencyRoot, handle.id);
+    await fixture.host.close();
+
+    const realRename = fs.renameSync;
+    const rename = vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      if (String(from) === trace) throw Object.assign(new Error("injected trace archive failure"), { code: "EIO" });
+      return realRename(from, to);
+    });
+    await expect(fixture.client.cleanupAgent(handle.id)).rejects.toThrow();
+    rename.mockRestore();
+    const archive = path.join(path.dirname(runDirectory), ".pi-fabric-session-traces", `run-${path.basename(runDirectory)}`);
+    expect(fs.existsSync(runDirectory)).toBe(true);
+    expect(fs.readFileSync(trace, "utf8")).toBe("offline raw transcript\n");
+    expect(fs.existsSync(path.join(archive, "events.jsonl"))).toBe(true);
+    expect(fs.existsSync(metadata)).toBe(true);
+    expect(fs.existsSync(result)).toBe(true);
+
+    await expect(fixture.client.cleanupAgent(handle.id)).resolves.toMatchObject({ cleaned: true });
+    expect(fs.existsSync(runDirectory)).toBe(false);
+    expect(fs.readFileSync(path.join(archive, "session.jsonl"), "utf8")).toBe("offline raw transcript\n");
+    expect(fs.existsSync(metadata)).toBe(false);
+    expect(fs.existsSync(result)).toBe(false);
+  } finally { await fixture.close(); }
+}, 30_000);
 it.each(["spawnBound"] as const)("later cached %s retries acknowledge their own generation, preserve one entity and collect both exchanges", runCachedRetryCase, 30_000);
 // off Linux #1031 refuses removal (accepted gap smarty-dev#11335); pi-fabric#1079 unskips
 it.skipIf(process.platform !== "linux").each(["createActor"] as const)("later cached %s retries acknowledge their own generation, preserve one entity and collect both exchanges", runCachedRetryCase, 30_000);

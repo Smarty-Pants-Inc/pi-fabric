@@ -30,12 +30,15 @@ describe("six-hour terminal run compaction", () => {
     const directoryMtime = fs.statSync(run).mtimeMs;
     const status = fs.readFileSync(path.join(run, "status.json"), "utf8");
     const inode = fs.statSync(path.join(run, "events.jsonl")).ino;
+    const originalEventMtime = fs.statSync(path.join(run, "events.jsonl")).mtimeMs;
     expect(compactTerminalRunEvents(run, { now: now - 1 })).toBe(false);
     expect(compactTerminalRunEvents(run, { now })).toBe(true);
     const lines = fs.readFileSync(path.join(run, "events.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
     expect(lines[0]).toMatchObject({ fabricTruncated: true });
     expect(lines.slice(1)).toEqual(Array.from({ length: 200 }, (_, i) => ({ sequence: i + 201 })));
     expect(fs.statSync(path.join(run, "events.jsonl")).ino).not.toBe(inode);
+    expect(fs.readFileSync(path.join(run, "events.jsonl.raw"), "utf8")).toBe(log);
+    expect(fs.statSync(path.join(run, "events.jsonl.raw")).mtimeMs).toBe(originalEventMtime);
     expect(fs.statSync(run).mtimeMs).toBe(directoryMtime);
     expect(fs.readFileSync(path.join(run, "status.json"), "utf8")).toBe(status);
     expect(fs.readFileSync(path.join(run, "reply.json"), "utf8")).toBe('{"text":"retained result"}');
@@ -44,6 +47,9 @@ describe("six-hour terminal run compaction", () => {
     expect(snapshot(run)).toEqual(before);
     expect(pruneActorRunArchives({ runsDirectory: path.join(root, "runs"), retentionMs: 7 * 24 * HOUR, now })).toEqual([]);
     expect(pruneActorRunArchives({ runsDirectory: path.join(root, "runs"), retentionMs: 7 * 24 * HOUR, now: 4 * HOUR + 7 * 24 * HOUR })).toEqual([run]);
+    const archived = path.join(root, "runs", RUN_SESSION_TRACE_ARCHIVE_DIRECTORY, "run-old");
+    expect(fs.readFileSync(path.join(archived, "events.jsonl.raw"), "utf8")).toBe(log);
+    expect(fs.existsSync(path.join(archived, "events.jsonl"))).toBe(true);
   });
 
   it.each([
@@ -82,6 +88,17 @@ describe("six-hour terminal run compaction", () => {
     const after = snapshot(run);
     expect(compactTerminalRunEvents(run, { now })).toBe(false);
     expect(snapshot(run)).toEqual(after);
+  });
+
+  it("refuses to compact when an existing raw event snapshot does not match", () => {
+    const { run } = make();
+    const file = path.join(run, "events.jsonl");
+    const original = fs.readFileSync(file, "utf8");
+    fs.writeFileSync(`${file}.raw`, "wrong snapshot\n");
+    const before = snapshot(run);
+    expect(compactTerminalRunEvents(run, { now })).toBe(false);
+    expect(snapshot(run)).toEqual(before);
+    expect(fs.readFileSync(file, "utf8")).toBe(original);
   });
 
   it("keeps closed one-shot events byte-for-byte until expiry, then archives the full log before removal", () => {
@@ -159,7 +176,7 @@ describe("six-hour terminal run compaction", () => {
     expect(snapshot(run)).toEqual(before);
   });
 
-  it("existing owned actor maintenance keeps the newest ordinary backup, including numeric suffixes, and preserves malformed orphans", () => {
+  it("existing actor maintenance retains every raw session backup, including malformed orphans", () => {
     const { root } = make(); const sessionFile = path.join(root, "session.jsonl");
     const names = ["session.jsonl.20260927T150000000Z.bak", "session.jsonl.20260927T150000000Z-2.bak", "session.jsonl.20260927T150000000Z-10.bak", "session.jsonl.20260926T150000000Z.bak", "session.jsonl.20260925T150000000Z.id.orphan-noheader.bak"];
     for (const name of names) fs.writeFileSync(path.join(root, name), name);
@@ -168,7 +185,7 @@ describe("six-hour terminal run compaction", () => {
     fs.writeFileSync(sessionFile, "live session");
     const store = new ActorLogStore({ maxEventBytes: 8192 }, { eventContextChars: 1000 }, { actorRunArchiveMs: 7 * 24 * HOUR });
     store.pruneRuns({ sessionFile }, now);
-    expect(fs.readdirSync(root).filter(name => name.endsWith(".bak")).sort()).toEqual([names[2], names[4]].sort());
+    expect(fs.readdirSync(root).filter(name => name.endsWith(".bak")).sort()).toEqual(names.sort());
     expect(fs.readFileSync(sessionFile, "utf8")).toBe("live session");
   });
 });

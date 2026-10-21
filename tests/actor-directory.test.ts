@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -69,6 +70,26 @@ afterEach(async () => {
 });
 
 describe("ActorDirectory", () => {
+  it.skipIf(UNSUPPORTED_PLATFORM)("archives every raw session transcript before actor-root close cleanup", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-directory-trace-close-"));
+    roots.push(root);
+    const { directory } = open(root, "trace-close", { persistent: false });
+    const project = await directory.create({ scope: "project", name: "trace-project", instructions: "Work." });
+    const session = await directory.create({ scope: "session", name: "trace-session", instructions: "Work." });
+    const projectRoot = path.dirname(path.dirname(project.sessionFile!));
+    const sessionRoot = path.dirname(path.dirname(session.sessionFile!));
+    const projectTrace = "project raw transcript\n";
+    const sessionTrace = "session raw transcript\n";
+    fs.writeFileSync(project.sessionFile!, projectTrace);
+    fs.writeFileSync(session.sessionFile!, sessionTrace);
+    await directory.close();
+    const archive = path.join(root, "mesh", ".pi-fabric-session-traces");
+    const archiveName = (directory: string) => `actor-root-${createHash("sha256").update(path.resolve(directory)).digest("hex").slice(0, 24)}`;
+    expect(fs.existsSync(projectRoot)).toBe(false);
+    expect(fs.existsSync(sessionRoot)).toBe(false);
+    expect(fs.readFileSync(path.join(archive, archiveName(projectRoot), project.id, "session.jsonl"), "utf8")).toBe(projectTrace);
+    expect(fs.readFileSync(path.join(archive, archiveName(sessionRoot), session.id, "session.jsonl"), "utf8")).toBe(sessionTrace);
+  });
   // #6087 admission data safety: session mutations must reach the secondary
   // manager, not silently change the project registry or lose its subscriptions.
   it.each(["project", "session"] as const)("forwards setTopics to the %s owner and persists only that registry", async scope => {
@@ -91,6 +112,20 @@ describe("ActorDirectory", () => {
     expect(restored.status(target.id)).toMatchObject({ id: target.id, scope, topics: [] });
     expect(restored.status(other.id).topics).toEqual(other.topics);
   });
+  it.skipIf(UNSUPPORTED_PLATFORM)("archives a removed actor session before deleting its actor directory", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-directory-trace-remove-"));
+    roots.push(root);
+    const { directory } = open(root, "trace-remove");
+    const actor = await directory.create({ scope: "project", name: "trace-remove", instructions: "Work." });
+    const sessionDir = path.dirname(actor.sessionFile!);
+    const trace = "actor removal raw session\n";
+    fs.writeFileSync(actor.sessionFile!, trace);
+    await expect(directory.remove(actor.id)).resolves.toMatchObject({ removed: true });
+    const archiveName = `actor-session-${createHash("sha256").update(sessionDir).digest("hex").slice(0, 24)}`;
+    expect(fs.existsSync(sessionDir)).toBe(false);
+    expect(fs.readFileSync(path.join(root, "mesh", ".pi-fabric-session-traces", archiveName, "session.jsonl"), "utf8")).toBe(trace);
+  });
+
   it("#6087 routes guest setTopics through the real provider to a secondary session actor and a global template", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-provider-topics-"));
     roots.push(root);

@@ -128,6 +128,53 @@ describe("Agent prompt retention at manager close (#11663)", () => {
     expect(() => manager.listForUi()).not.toThrow();
   });
 
+  it("archives raw traces before pruning artifacts from a failed terminal run", async () => {
+    const { root, manager } = fixture();
+    const handle = await manager.spawn({ task: "FAIL_DIRECTIVE\narchive terminal artifacts", transport: "process" });
+    await expect(manager.wait(handle.id)).resolves.toMatchObject({ status: "failed" });
+    const directory = manager.runDirectory(handle.id)!;
+    const traces = new Map([
+      ["events.jsonl", "raw events transcript\n"],
+      ["route-session.jsonl", "raw route transcript\n"],
+      ["session.jsonl", "raw Pi session transcript\n"],
+    ]);
+    for (const [name, content] of traces) fs.writeFileSync(path.join(directory, name), content);
+    const handoff = path.join(directory, "handoff-session");
+    fs.mkdirSync(handoff);
+    fs.writeFileSync(path.join(handoff, "fork-1.jsonl"), "raw handoff transcript\n");
+
+    await manager.close();
+
+    const archive = path.join(root, ".pi-fabric-session-traces", `run-${handle.id}`);
+    for (const [name, content] of traces) {
+      expect(fs.existsSync(path.join(directory, name))).toBe(false);
+      expect(fs.readFileSync(path.join(archive, name), "utf8")).toBe(content);
+      expect(removalIntents).not.toContain(path.join(directory, name));
+    }
+    expect(fs.readFileSync(path.join(archive, "handoff-session", "fork-1.jsonl"), "utf8")).toBe("raw handoff transcript\n");
+    expect(fs.readFileSync(path.join(directory, "task.txt"), "utf8")).toContain("archive terminal artifacts");
+  });
+
+  it("keeps a failed terminal tree when raw trace archival fails", async () => {
+    const { manager } = fixture();
+    const handle = await manager.spawn({ task: "FAIL_DIRECTIVE\nkeep trace after archive failure", transport: "process" });
+    await expect(manager.wait(handle.id)).resolves.toMatchObject({ status: "failed" });
+    const directory = manager.runDirectory(handle.id)!;
+    const trace = path.join(directory, "route-session.jsonl");
+    fs.writeFileSync(path.join(directory, "events.jsonl"), "raw events transcript\n");
+    fs.writeFileSync(trace, "raw route transcript\n");
+    const rename = fs.renameSync.bind(fs);
+    const spy = vi.spyOn(fs, "renameSync").mockImplementation((source, target) => {
+      if (String(source) === trace) throw Object.assign(new Error("injected archive failure"), { code: "EIO" });
+      return rename(source, target);
+    });
+    try { await manager.close(); } finally { spy.mockRestore(); }
+    expect(fs.existsSync(directory)).toBe(true);
+    expect(fs.readFileSync(trace, "utf8")).toBe("raw route transcript\n");
+    expect(removalIntents).not.toContain(directory);
+    expect(removalIntents).not.toContain(trace);
+  });
+
   // Stop, AbortSignal cancellation and deadline all use the same managed
   // terminal retention path; the real prompt verifier is never mocked.
   it.each(["stopped", "cancelled", "timed_out"] as const)("retains the verified current prompt after %s", async (outcome) => {

@@ -8,6 +8,7 @@ const roots: string[] = [];
 const DAY = 24 * 60 * 60 * 1_000;
 const tracePaths = [
   "events.jsonl",
+  "events.jsonl.raw",
   "session.jsonl",
   "route-session.jsonl",
   "handoff-session/fork-1.jsonl",

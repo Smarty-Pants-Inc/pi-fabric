@@ -2,6 +2,7 @@ import fs from "node:fs";
 import { retentionV2Enabled } from "./retention-platform.js";
 import path from "node:path";
 import { syncDirectoryChain, writeFileAtomic, writeJsonAtomic } from "../core/atomic-write.js";
+import { ensureTraceSnapshot } from "./trace-snapshot.js";
 import { ownedStat, processAlive } from "./scratch.js";
 import { boundedRunTree } from "./reference-scan.js";
 import { countRefusal, removalTallyOn, verifiedRemove } from "./verified-remove.js";
@@ -245,7 +246,7 @@ const recordAgeReference = (record: RunRecordSummary, fallback: number): number 
 // Every file the worker and manager write into a run directory. A missing name made the run
 // unremovable forever: 54k expired actor runs with reply.json piled up in /tmp (smarty-dev#2010).
 const runFiles = new Set([
-  "task.txt", "task.txt.provenance.json", "status.json", "events.jsonl", "lifecycle.jsonl", "steer.jsonl", "schema.json", "images.json",
+  "task.txt", "task.txt.provenance.json", "status.json", "events.jsonl", "events.jsonl.raw", "lifecycle.jsonl", "steer.jsonl", "schema.json", "images.json",
   // Manager-owned exact settlement and byte-evicted legacy nested history.
   // Neither artifact substitutes for the worker status/receipt/exit proof.
   "manager-result.json", "manager-nested.json",
@@ -266,7 +267,7 @@ interface RunSessionTraceArchiveEntry { path: string; dev: number; ino: number; 
 interface RunSessionTraceArchiveManifest { format: 1; files: RunSessionTraceArchiveEntry[] }
 const sessionTranscriptName = /^(?:.*[-_.])?session(?:[-_.][^/]*)?\.jsonl(?:\.[^/]*)?$/i;
 const rawSessionTrace = (name: string, inHandoffSession: boolean): boolean =>
-  name === "events.jsonl" || sessionTranscriptName.test(name) ||
+  (name === "events.jsonl" || name === "events.jsonl.raw") || sessionTranscriptName.test(name) ||
   (inHandoffSession && /\.jsonl(?:\.[^/]*)?$/i.test(name));
 const traceIdentity = (stat: fs.Stats): Omit<RunSessionTraceArchiveEntry, "path"> =>
   ({ dev: stat.dev, ino: stat.ino, size: stat.size, mtimeMs: stat.mtimeMs });
@@ -300,7 +301,8 @@ const traceManifest = (file: string): RunSessionTraceArchiveManifest | undefined
  * can be retried and a missing or replaced trace fails closed. Archive paths preserve each trace's
  * relative name and same-filesystem rename preserves its mtime.
  */
-export const archiveRunSessionTraces = (directory: string): boolean => {
+export const archiveRunSessionTraces = (directory: string, onlyPaths?: ReadonlyMap<string, fs.Stats>, archiveDirectory?: string,
+  archiveName?: string): boolean => {
   const root = path.resolve(directory);
   if (!ownedStat(root)?.isDirectory()) return false;
   const files: RunSessionTraceArchiveEntry[] = [];
@@ -309,35 +311,47 @@ export const archiveRunSessionTraces = (directory: string): boolean => {
     let entries: fs.Dirent[];
     try { entries = fs.readdirSync(current, { withFileTypes: true }); } catch { return false; }
     for (const entry of entries) {
+      if (!relative && entry.name === RUN_SESSION_TRACE_ARCHIVE_DIRECTORY) continue;
       const source = path.join(current, entry.name);
       const rel = relative ? path.join(relative, entry.name) : entry.name;
+      const relativeName = rel.split(path.sep).join("/");
+      if (onlyPaths && !onlyPaths.has(relativeName) &&
+          ![...onlyPaths.keys()].some(selected => selected.startsWith(`${relativeName}/`))) continue;
       let stat: fs.Stats;
       try { stat = fs.lstatSync(source); } catch { return false; }
-      if (stat.isSymbolicLink()) return false;
+      if (stat.isSymbolicLink()) {
+        if (rawSessionTrace(entry.name, inHandoffSession)) return false;
+        continue; // Recursive removal unlinks a link, never the trace it names.
+      }
       if (stat.isDirectory()) {
         if (!ownedStat(source)?.isDirectory() || !collect(source, rel, depth + 1, inHandoffSession || entry.name === "handoff-session")) return false;
       } else if (stat.isFile()) {
         if (rawSessionTrace(entry.name, inHandoffSession)) {
           const owned = ownedStat(source);
           if (!owned?.isFile()) return false;
-          files.push({ path: rel.split(path.sep).join("/"), ...traceIdentity(owned) });
+          const expected = onlyPaths?.get(relativeName);
+          if (expected && !sameTraceIdentity(owned, { path: relativeName, ...traceIdentity(expected) })) return false;
+          files.push({ path: relativeName, ...traceIdentity(owned) });
         }
       } else if (rawSessionTrace(entry.name, inHandoffSession)) return false;
     }
     return true;
   };
   if (!collect(root, "", 0, false)) return false;
+  if (files.length > 0 && typeof process.getuid !== "function") return false;
   files.sort((left, right) => left.path.localeCompare(right.path));
 
   const parent = path.dirname(root);
-  const archiveRoot = path.join(parent, RUN_SESSION_TRACE_ARCHIVE_DIRECTORY);
-  const archive = path.join(archiveRoot, `run-${path.basename(root)}`);
+  const archiveRoot = archiveDirectory ? path.resolve(archiveDirectory) : path.join(parent, RUN_SESSION_TRACE_ARCHIVE_DIRECTORY);
+  const name = archiveName ?? `run-${path.basename(root)}`;
+  if (!/^[A-Za-z0-9._-]{1,200}$/.test(name) || name === "." || name === "..") return false;
+  const archive = path.join(archiveRoot, name);
   const manifestPath = path.join(archive, RUN_SESSION_TRACE_ARCHIVE_MANIFEST);
   try {
     const archiveStat = lstatIfPresent(archive);
     if (!archiveStat && files.length === 0) return true;
     if (archiveStat && (!archiveStat.isDirectory() || archiveStat.isSymbolicLink() || !ownedStat(archive)?.isDirectory())) return false;
-    mkdirPrivate(archiveRoot, parent);
+    mkdirPrivate(archiveRoot, path.dirname(archiveRoot));
     mkdirPrivate(archive, archiveRoot);
     const manifestStat = lstatIfPresent(manifestPath);
     let prior: RunSessionTraceArchiveManifest | undefined;
@@ -640,8 +654,13 @@ export const canRemoveTerminalRun = (directory: string, expired: Deadline = noDe
   return !!record?.status && TERMINAL_STATUSES.has(record.status) && safeRunTree(directory, false, 0, expired, acceptPidReuse);
 };
 const safeRootContents = (root: string, childrenStopped: boolean): boolean => {
-  try { return fs.readdirSync(root).every((name) => name === RUN_ROOT_OWNER_FILE || safeRunTree(path.join(root, name), childrenStopped)); }
-  catch { return false; }
+  try {
+    return fs.readdirSync(root).every((name) => {
+      if (name === RUN_ROOT_OWNER_FILE) return true;
+      if (name === RUN_SESSION_TRACE_ARCHIVE_DIRECTORY) return !!ownedStat(path.join(root, name))?.isDirectory();
+      return safeRunTree(path.join(root, name), childrenStopped);
+    });
+  } catch { return false; }
 };
 export const canRemoveManagedRunRoot = (root: string): boolean => {
   if (!ownedStat(root)?.isDirectory()) return false;
@@ -1070,6 +1089,7 @@ export const compactTerminalRunEvents = (
         runTreeExitVeto(directory, 0, expired, true) || !canRemoveTerminalRun(directory, expired) ||
         expired() || options.isRetained?.()) return false;
     const next = Buffer.concat([EVENT_TAIL_MARKER, retained]);
+    if (!options.dryRun && !ensureTraceSnapshot(file, `${file}.raw`, stat)) return false;
     let replaced = false;
     try {
       // The judged events.jsonl goes through the one verified removal (smarty-dev#7916): verified, moved into the
@@ -1109,8 +1129,7 @@ const publishExclusive = (file: string, data: Buffer): boolean => {
   finally { try { fs.unlinkSync(temp); } catch { /* never created */ } }
 };
 
-/** Immutable, ordinary rotation history only. Malformed-session orphan backups are
- * recovery evidence, not rotation history, and keep their existing exemption. */
+/** Session rotation backups are raw transcripts; no age/size policy may unlink them before a durable archive path exists. */
 export const pruneActorSessionBackups = (sessionFile: string, options: {
   dryRun?: boolean; onPrune?: (change: { path: string; bytes: number }) => void;
   /** Asked right before each unlink; true stops the prune there (smarty-dev#7766: a hold or epoch change mid-prune). */
@@ -1146,10 +1165,9 @@ export const pruneActorSessionBackups = (sessionFile: string, options: {
       if (keep.has(backup.name)) continue;
       const file = path.join(directory, backup.name);
       if (options.stop?.()) break;
-      if (!verifiedRemove(file, backup.stat, { deleter: "pruneActorSessionBackups", ...(options.dryRun ? { dryRun: true } : {}),
-        fallback: () => { fs.unlinkSync(file); return true; } }).removed) continue;
-      options.onPrune?.({ path: file, bytes: backup.stat.size });
-      removed.push(file);
+      // These .bak files are complete raw Pi session transcripts, not disposable indexes. Until they can
+      // be moved to the durable trace archive, retain them and report the refusal instead of unlinking them.
+      countRefusal("pruneActorSessionBackups", "raw session transcript retained", file, backup.stat.size);
     }
     return removed;
   } catch { return []; }
@@ -1207,7 +1225,8 @@ export const pruneActorRunArchives = (options: {
     }
     const bytes = options.measure?.(directory) ?? 0;
     const isRetained = options.isRetained;
-    if (!removeUnreferencedRun(directory, judged, isRetained && (() => isRetained(entry.name, true)), options.dryRun, "pruneActorRunArchives", bytes)) continue;
+    if (!removeUnreferencedRun(directory, judged, isRetained && (() => isRetained(entry.name, true)), options.dryRun, "pruneActorRunArchives", bytes,
+      options.acceptPidReuse === true)) continue;
     removed.push(directory);
     options.onRemove?.(directory, bytes);
   }
@@ -1227,11 +1246,23 @@ export const pruneActorRunArchives = (options: {
  * next sweep treats it as an ordinary run entry. */
 export const removeUnreferencedRun = (
   directory: string, judged: fs.Stats | undefined, referenced?: () => boolean, dryRun = false, deleter = "removeUnreferencedRun",
-  bytes = 0,
+  bytes = 0, acceptPidReuse = false,
 ): boolean => {
   const check = (): boolean => { try { return !!referenced?.(); } catch { return true; } };
   if (check()) { countRefusal(deleter, "referenced at the final check", directory, bytes); return false; }
-  return verifiedRemove(directory, judged, { deleter, ...(dryRun ? { dryRun: true } : {}), proceed: () => !check(),
+  let finalJudged = judged;
+  if (!dryRun) {
+    if (!archiveRunSessionTraces(directory)) {
+      countRefusal(deleter, "raw session trace archive failed", directory, bytes); return false;
+    }
+    const archived = ownedStat(directory);
+    if (!archived?.isDirectory() || judged && (archived.dev !== judged.dev || archived.ino !== judged.ino) ||
+        !canRemoveTerminalRun(directory, noDeadline, acceptPidReuse)) {
+      countRefusal(deleter, "run tree changed during trace archival", directory, bytes); return false;
+    }
+    finalJudged = archived;
+  }
+  return verifiedRemove(directory, finalJudged, { deleter, ...(dryRun ? { dryRun: true } : {}), proceed: () => !check(),
     fallback: () => mainRemoveUnreferencedRun(directory, referenced, check) }).removed;
 };
 /** Main's path-based tombstone removal, unchanged: the non-Linux fallback only (smarty-dev#7858). */

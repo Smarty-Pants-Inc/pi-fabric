@@ -160,6 +160,7 @@ import {
   markRunRootClosed,
   claimTempRunSweep,
   removeEmptyRunRoot,
+  RUN_SESSION_TRACE_ARCHIVE_DIRECTORY,
   type TempRunSweepRequest,
 } from "../storage/retention.js";
 import { retentionV2Enabled } from "../storage/retention-platform.js";
@@ -3768,10 +3769,12 @@ export class AgentManager {
             (readRecord(path.join(directory, "status.json")) as AgentRunRecord & { queuedArchiveCommitted?: boolean } | undefined)?.queuedArchiveCommitted) && !runTreeExitVeto(directory)) {
           writeJsonAtomic(path.join(directory, "status.json"), { id: queued.info.id, status: queued.terminal.status, queuedArchiveCommitted: true,
             startedAt: queued.terminal.startedAt, updatedAt: queued.terminal.updatedAt, finishedAt: queued.terminal.finishedAt }, { durable: true });
-          try {
-            fs.rmSync(path.join(directory, "queued-result.json"), { force: true });
-            fs.rmSync(directory, { recursive: true, force: true });
-          } catch { /* Its committed terminal state is collectible later. */ }
+          if (archiveRunSessionTraces(directory)) {
+            try {
+              fs.rmSync(path.join(directory, "queued-result.json"), { force: true });
+              fs.rmSync(directory, { recursive: true, force: true });
+            } catch { /* Its committed terminal state is collectible later. */ }
+          }
         }
         queued.outcomeSaved = true;
         return true;
@@ -4469,7 +4472,7 @@ export class AgentManager {
       directory = fs.opendirSync(this.#runRoot);
       let entry: fs.Dirent | null;
       while (!expired() && (entry = directory.readSync())) {
-        if (this.#managedTempRoot && entry.name === ".fabric-owner.json") continue;
+        if (entry.name === RUN_SESSION_TRACE_ARCHIVE_DIRECTORY || (this.#managedTempRoot && entry.name === ".fabric-owner.json")) continue;
         if (this.#runs.has(entry.name) || this.#queued.has(entry.name)) continue;
         const run = path.join(this.#runRoot, entry.name);
         if (!entry.isDirectory()) { refs.add("*"); continue; }
@@ -4604,6 +4607,7 @@ export class AgentManager {
         directory = fs.opendirSync(this.#runRoot);
         let entry: fs.Dirent | null;
         while ((entry = directory.readSync())) {
+          if (entry.name === RUN_SESSION_TRACE_ARCHIVE_DIRECTORY) continue;
           if (!(this.#managedTempRoot && entry.name === ".fabric-owner.json") && !this.#runs.has(entry.name) && !this.#queued.has(entry.name)) {
             const run = path.join(this.#runRoot, entry.name), stat = ownedStat(run);
             if (!entry.isDirectory() || !stat?.isDirectory()) protect("*");
@@ -5572,7 +5576,7 @@ export class AgentManager {
             const directory = path.join(this.#runRoot, result.id);
             this.#commitArchive(directory, result, "shutdown");
             if (this.#queued.has(result.id) && !this.#queued.get(result.id)?.routeSaveFailure &&
-                !fs.existsSync(path.join(directory, "status.json")) && !runTreeExitVeto(directory)) fs.rmSync(directory, { recursive: true, force: true });
+                !fs.existsSync(path.join(directory, "status.json")) && !runTreeExitVeto(directory)) await removeTree(directory);
           }
           break;
         }
@@ -7359,6 +7363,9 @@ export class AgentManager {
     // kept uncompacted. status.json stays compact and taskless.
     if (keepResult && resultFile) managed.resultFingerprint = writePrivateJsonAtomic(resultFile, omitRetainedTasks(record));
     writeJsonAtomic(managed.statusFile, omitRetainedTasks(compactUiRecord(this.#withTransportMetadata(record, managed, false))), { space: 2 });
+    if (!archiveRunSessionTraces(managed.runDirectory)) {
+      throw new Error("raw session trace archive failed; terminal prompt cleanup refused");
+    }
     for (const entry of fs.readdirSync(managed.runDirectory)) {
       if (entry === "status.json" || (entry === "task.txt" && currentMatches) || (entry === MANAGER_RESULT_FILE && keepResult)) continue;
       await removeTree(path.join(managed.runDirectory, entry));

@@ -14,6 +14,7 @@
 import fs from "node:fs";
 import { randomUUID } from "node:crypto";
 import { performance } from "node:perf_hooks";
+import { ensureTraceSnapshot } from "../storage/trace-snapshot.js";
 
 export const RUN_LOG_FLUSH_MS = 500;
 
@@ -349,6 +350,9 @@ export const compactTerminalRunLog = (filePath: string, status: string): RunLogC
       current.size !== original.size || current.mtimeMs !== original.mtimeMs ||
       held.size !== original.size || held.mtimeMs !== original.mtimeMs) {
       throw new Error("Run log changed during terminal compaction");
+    }
+    if (!ensureTraceSnapshot(filePath, `${filePath}.raw`, original, source, true)) {
+      throw new Error("Raw events.jsonl snapshot could not be verified; full log retained");
     }
     // Windows may reject replacement while our source handle is open. Both
     // source and temp have been synced; release every owned handle before commit.

@@ -55,14 +55,13 @@ const deadRootMesh = (actorStatus = "idle") => {
 // MeshRetentionApplyDisabledError before it reads the mesh; pi-fabric#1014 SEC P2-1).
 // Each fence still decides what the plan lists; `applied` names the plan.
 describe("mesh-wide age-based run retention", () => {
-  // Dry run (smarty-dev#7916): the plan lists what an apply would remove; the disk is unchanged.
-  it("plans a dead root's old terminal runs, keeps its latest, in-flight and young runs, and caps .bak files", async () => {
+  // Dry run (smarty-dev#7916): the plan lists safe retention work; raw session backups are kept, and disk is unchanged.
+  it("plans a dead root's old terminal runs, keeps latest/in-flight/young runs and every session backup", async () => {
     const mesh = deadRootMesh();
     const plan = await sweepMeshRetention(mesh.root, { now: NOW, dryRun: true, runRetentionMs: 7 * DAY });
     expect(plan.skipped).toEqual([]);
     expect(plan.removedRuns.sort()).toEqual([mesh.old, mesh.orphan].sort());
-    expect(plan.changes.map(change => change.path).filter(file => file.endsWith(".bak")).sort()).toEqual(
-      ["20260920T150000000Z", "20260921T150000000Z"].map(stamp => path.join(mesh.actor, `session.jsonl.${stamp}.bak`)));
+    expect(plan.changes.map(change => change.path).filter(file => file.endsWith(".bak"))).toEqual([]);
     for (const kept of [mesh.old, mesh.orphan, mesh.latest, mesh.young, mesh.inflight]) expect(fs.existsSync(path.join(kept, "reply.json"))).toBe(true);
     expect(fs.readdirSync(mesh.actor).filter(name => name.endsWith(".bak"))).toHaveLength(3);
   });
@@ -652,13 +651,13 @@ describe("final pre-delete check fences", () => {
     let calls = 0;
     expect(removeUnreferencedRun(target, judged(), () => ++calls > 1)).toBe(false);
     expect(calls).toBe(2);
-    expect(fs.readdirSync(runs)).toEqual(["target"]);
+    expect(fs.readdirSync(runs).sort()).toEqual([".pi-fabric-session-traces", "target"].sort());
     expect(fs.readFileSync(path.join(target, "reply.json"), "utf8")).toBe('{"text":"done"}');
     expect(removeUnreferencedRun(target, judged(), () => { throw new Error("unreadable"); })).toBe(false);
     expect(removeUnreferencedRun(target, judged(), () => false, true)).toBe(true);
-    expect(fs.readdirSync(runs)).toEqual(["target"]);
+    expect(fs.readdirSync(runs).sort()).toEqual([".pi-fabric-session-traces", "target"].sort());
     expect(removeUnreferencedRun(target, judged(), () => false)).toBe(true);
-    expect(fs.readdirSync(runs)).toEqual([]);
+    expect(fs.readdirSync(runs)).toEqual([".pi-fabric-session-traces"]);
   });
 });
 
@@ -833,15 +832,14 @@ describe.skipIf(process.platform !== "linux")("apply disabled at the public boun
     return { mesh, resident };
   };
 
-  it("plans expired, unreferenced runs and old backups, keeps latest, in-flight and young; apply rejects and changes nothing", async () => {
+  it("plans expired, unreferenced runs but keeps every session backup; apply rejects and changes nothing", async () => {
     const { mesh, resident } = await withState();
     const before = tree(mesh.root);
     const plan = await sweepMeshRetention(mesh.root, { now: NOW, dryRun: true, runRetentionMs: 7 * DAY });
     expect(tree(mesh.root)).toEqual(before);
     expect(plan.summary.applyRefusal).toBeUndefined();
     expect(plan.removedRuns.sort()).toEqual([mesh.old, mesh.orphan, resident].sort());
-    expect(plan.changes.map(change => change.path)).toEqual(expect.arrayContaining([
-      path.join(mesh.actor, "session.jsonl.20260920T150000000Z.bak"), path.join(mesh.actor, "session.jsonl.20260921T150000000Z.bak")]));
+    expect(plan.changes.map(change => change.path).filter(file => file.endsWith(".bak"))).toEqual([]);
     await expect(sweepMeshRetention(mesh.root, { now: NOW, dryRun: false, runRetentionMs: 7 * DAY }))
       .rejects.toBeInstanceOf(MeshRetentionApplyDisabledError);
     expect(tree(mesh.root)).toEqual(before);

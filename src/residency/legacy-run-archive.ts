@@ -15,7 +15,7 @@ export interface LegacyRunArchivePolicy {
 const DEFAULT_AGE_MS = 48 * 60 * 60 * 1000;
 const terminal = new Set(["completed", "failed", "stopped"]);
 const files = new Set([
-  "task.txt", "task.txt.provenance.json", "status.json", "events.jsonl", "lifecycle.jsonl", "reply.json",
+  "task.txt", "task.txt.provenance.json", "status.json", "events.jsonl", "events.jsonl.raw", "lifecycle.jsonl", "reply.json",
   "schema.json", "images.json", "steer.jsonl", "relaunches.jsonl", "session.jsonl", "route-session.jsonl",
 ]);
 const gone = (error: unknown): boolean => ["ENOENT", "ESRCH"].includes((error as NodeJS.ErrnoException).code ?? "");

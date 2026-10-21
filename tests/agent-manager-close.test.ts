@@ -16,9 +16,9 @@ import * as retention from "../src/storage/retention.js";
 const hostedDelete = hostedOnly("AgentManager close deletion");
 const managers: AgentManager[] = [];
 const roots: string[] = [];
-const setup = (retainRuns = true, extra: ConstructorParameters<typeof AgentManager>[2] = {}) => {
+const setup = (retainRuns = true, extra: ConstructorParameters<typeof AgentManager>[2] = {}, meshRootOverride?: string) => {
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "manager-close-test-"));
-  const meshRoot = fs.mkdtempSync(path.join(os.tmpdir(), "manager-close-mesh-"));
+  const meshRoot = meshRootOverride ?? fs.mkdtempSync(path.join(os.tmpdir(), "manager-close-mesh-"));
   roots.push(tempRoot, meshRoot);
   vi.spyOn(os, "tmpdir").mockReturnValue(tempRoot);
   vi.stubEnv("PI_FABRIC_RUN_ROOT", undefined);
@@ -98,7 +98,7 @@ describe("AgentManager close storage", () => {
     expect(consumed).toHaveBeenCalledExactlyOnceWith(child.id);
   });
 
-  it.each([false, true] as const)("active one-shot expiry archives every raw trace before removal (archive failure=%s)", async failArchive => {
+  it.skipIf(!hostedDelete).each([false, true] as const)("active one-shot expiry archives every raw trace before removal (archive failure=%s)", async failArchive => {
     let sweep: (() => void) | undefined;
     const interval = globalThis.setInterval;
     const timer = vi.spyOn(globalThis, "setInterval").mockImplementation(((callback: () => void, ms?: number, ...args: unknown[]) => {
@@ -106,9 +106,10 @@ describe("AgentManager close storage", () => {
       return interval(callback, ms, ...args);
     }) as typeof setInterval);
     const detachedSweep = vi.spyOn(retention, "claimTempRunSweep").mockReturnValue(false);
+    const durableMeshRoot = fs.mkdtempSync(path.join(os.userInfo().homedir, ".pi-fabric-manager-close-mesh-"));
     const { manager, meshRoot } = setup(false, {
       retention: { ...DEFAULT_FABRIC_CONFIG.retention, oneShotRunMs: 1_000 },
-    });
+    }, durableMeshRoot);
     let clock: ReturnType<typeof vi.spyOn> | undefined;
     let renameFault: ReturnType<typeof vi.spyOn> | undefined;
     try {

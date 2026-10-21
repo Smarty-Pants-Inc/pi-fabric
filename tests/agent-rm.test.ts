@@ -2,8 +2,11 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
+import { hostedOnly } from "../scripts/hosted-only.mjs";
 import { removeTree } from "../src/agents/rm.js";
 import { runSessionTraceArchivePath } from "../src/storage/retention.js";
+
+const HOSTED_ARCHIVES = hostedOnly("outside-TMPDIR recursive trace archive tests");
 
 describe("removeTree", () => {
   it("removes a directory tree", async () => {
@@ -14,9 +17,9 @@ describe("removeTree", () => {
     expect(fs.existsSync(dir)).toBe(false);
   });
 
-  it("archives raw traces before recursive cleanup", async () => {
+  it.skipIf(!HOSTED_ARCHIVES)("archives raw traces before recursive cleanup", async () => {
     const parent = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-rm-traces-"));
-    const meshRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-rm-mesh-"));
+    const meshRoot = fs.mkdtempSync(path.join(os.userInfo().homedir, ".pi-fabric-rm-mesh-"));
     const directory = path.join(parent, "run");
     fs.mkdirSync(directory);
     const traces = new Map([["session.jsonl", "raw session\n"], ["route-session.jsonl", "raw route\n"], ["events.jsonl", "raw events\n"]]);
@@ -41,9 +44,9 @@ describe("removeTree", () => {
     fs.rmSync(meshRoot, { recursive: true, force: true });
   });
 
-  it("refuses recursive cleanup when trace archival fails", async () => {
+  it.skipIf(!HOSTED_ARCHIVES)("refuses recursive cleanup when trace archival fails", async () => {
     const parent = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-rm-trace-failure-"));
-    const meshRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-rm-mesh-failure-"));
+    const meshRoot = fs.mkdtempSync(path.join(os.userInfo().homedir, ".pi-fabric-rm-mesh-failure-"));
     const directory = path.join(parent, "run");
     fs.mkdirSync(directory);
     for (const name of ["session.jsonl", "route-session.jsonl", "events.jsonl"]) fs.writeFileSync(path.join(directory, name), `raw ${name}\n`);

@@ -250,9 +250,6 @@ export const compactTerminalRunLog = (filePath: string, status: string): RunLogC
       skip(`MAX_TERMINAL_LOG_BYTES=${MAX_TERMINAL_LOG_BYTES}`);
     }
     checkWork();
-    // Canonical must actually exist in this durable file, not only in stdout
-    // or a best-effort append callback. Fail closed if fsync is rejected.
-    fs.fsyncSync(source);
     const index = new Map<string, ToolCorrelation>();
     const correlation = (id: string): ToolCorrelation => {
       let entry = index.get(id);
@@ -340,6 +337,14 @@ export const compactTerminalRunLog = (filePath: string, status: string): RunLogC
       afterBytes += bytes.length;
     }
     if (!compacted) return outcome;
+    checkWork();
+    // Preserve the original bytes before any durability barrier can fail. The
+    // source fsync below still precedes publication of the compacted generation.
+    if (!ensureTraceSnapshot(filePath, `${filePath}.raw`, original, source, true)) {
+      throw new Error("Raw events.jsonl snapshot could not be verified; full log retained");
+    }
+    checkWork();
+    fs.fsyncSync(source);
     checkWork();
     fs.fsyncSync(target);
     fs.closeSync(target);

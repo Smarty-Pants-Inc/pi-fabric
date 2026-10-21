@@ -2,6 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { expect, it, vi } from "vitest";
+import { hostedOnly } from "../scripts/hosted-only.mjs";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { ResidencyClient } from "../src/residency/client.js";
 import { ResidentHost } from "../src/residency/host.js";
@@ -29,15 +30,18 @@ const mainParticipants = (config: ResidentHostConfig) => {
   return participants;
 };
 
+const HOSTED_ARCHIVES = hostedOnly("outside-TMPDIR residency trace archive tests");
 const waitFor = async (predicate: () => boolean) => {
   const deadline = Date.now() + 5_000;
   while (!predicate() && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
   expect(predicate()).toBe(true);
 };
-const setup = async () => {
+const setup = async (durableArchiveRoot = false) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-completed-retention-"));
   const rootId = "session:completed-retention";
-  const meshRoot = path.join(root, "mesh");
+  const meshRoot = durableArchiveRoot
+    ? fs.mkdtempSync(path.join(os.userInfo().homedir, ".pi-fabric-completed-mesh-"))
+    : path.join(root, "mesh");
   const config: ResidentHostConfig = {
     format: 1, rootId, sessionId: "completed-retention", cwd: root, projectRoot: root,
     meshRoot, actorRoot: path.join(root, "actors"), residencyRoot: residentRoot(meshRoot, rootId),
@@ -79,6 +83,7 @@ const setup = async () => {
       due?.mockRestore(); sweep.mockRestore();
       await client.close(); await host.close(); await participants.close(); vi.restoreAllMocks();
       fs.rmSync(root, { recursive: true, force: true });
+      if (durableArchiveRoot) fs.rmSync(meshRoot, { recursive: true, force: true });
     },
   };
 };
@@ -151,7 +156,7 @@ it.each(["missing", "stub", "running", "wrong id", "wrong transport", "unreadabl
 }, 15_000);
 
 const runCachedRetryCase = async (operation: "spawnBound" | "createActor") => {
-  const fixture = await setup();
+  const fixture = await setup(true);
   try {
     const create = operation === "spawnBound" ? vi.spyOn(fixture.host.agents, "spawn") : vi.spyOn(fixture.host.actors, "create");
     const request = { transport: "process" as const, idempotencyKey: "later-retry" };
@@ -194,8 +199,8 @@ const runCachedRetryCase = async (operation: "spawnBound" | "createActor") => {
     expect(create).toHaveBeenCalledTimes(1);
   } finally { await fixture.close(); }
 };
-it("offline cleanup archives every trace and refuses run/result deletion after a partial archive failure", async () => {
-  const fixture = await setup();
+it.skipIf(!HOSTED_ARCHIVES)("offline cleanup archives every trace and refuses run/result deletion after a partial archive failure", async () => {
+  const fixture = await setup(true);
   fixture.config.agents.retainRuns = true;
   try {
     const handle = await fixture.client.spawnAgent({ task: "offline trace cleanup", transport: "process", extensions: false }, AbortSignal.timeout(5_000));
@@ -228,6 +233,6 @@ it("offline cleanup archives every trace and refuses run/result deletion after a
     expect(fs.existsSync(result)).toBe(false);
   } finally { await fixture.close(); }
 }, 30_000);
-it.each(["spawnBound"] as const)("later cached %s retries acknowledge their own generation, preserve one entity and collect both exchanges", runCachedRetryCase, 30_000);
+it.skipIf(!HOSTED_ARCHIVES).each(["spawnBound"] as const)("later cached %s retries acknowledge their own generation, preserve one entity and collect both exchanges", runCachedRetryCase, 30_000);
 // off Linux #1031 refuses removal (accepted gap smarty-dev#11335); pi-fabric#1079 unskips
-it.skipIf(process.platform !== "linux").each(["createActor"] as const)("later cached %s retries acknowledge their own generation, preserve one entity and collect both exchanges", runCachedRetryCase, 30_000);
+it.skipIf(process.platform !== "linux" || !HOSTED_ARCHIVES).each(["createActor"] as const)("later cached %s retries acknowledge their own generation, preserve one entity and collect both exchanges", runCachedRetryCase, 30_000);

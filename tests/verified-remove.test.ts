@@ -28,9 +28,9 @@ afterEach(() => {
 const tmp = (prefix: string) => { const root = fs.mkdtempSync(path.join(os.tmpdir(), prefix)); roots.push(root); return root; };
 const write = (file: string, data: string) => { fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, data); };
 const LOG = Array.from({ length: 401 }, (_, sequence) => JSON.stringify({ sequence }) + "\n").join("");
-const run = (directory: string, status: Record<string, unknown> = { status: "completed", finishedAt: 1 }) => {
+const run = (directory: string, status: Record<string, unknown> = { status: "completed", finishedAt: 1 }, includeTrace = true) => {
   write(path.join(directory, "status.json"), JSON.stringify({ transport: "process", sessionId: DEAD, ...status }));
-  write(path.join(directory, "events.jsonl"), LOG);
+  if (includeTrace) write(path.join(directory, "events.jsonl"), LOG);
   write(path.join(directory, "reply.json"), '{"text":"done"}');
   return directory;
 };
@@ -88,25 +88,25 @@ interface Fixture { target: string; act: () => unknown }
 const FIXTURES: Record<string, () => Fixture> = {
   pruneActorRunArchives: () => {
     const runs = tmp("fabric-vr-archives-");
-    const target = run(path.join(runs, "old"));
+    const target = run(path.join(runs, "old"), undefined, false);
     return { target, act: () => pruneActorRunArchives({ runsDirectory: runs, retentionMs: DAY, now: NOW }) };
   },
   sweepResidentRuns: () => {
     const residency = tmp("fabric-vr-resident-");
-    const target = old(run(path.join(residency, "runs", "old")));
+    const target = old(run(path.join(residency, "runs", "old"), undefined, false));
     return { target, act: () => sweepResidentRuns(path.join(residency, "runs"), NOW, 10_000, { retentionMs: DAY }) };
   },
   "pruneClosedRunRoot (sweepTempRunRoots)": () => {
     const tempRoot = tmp("fabric-vr-closed-");
     const root = path.join(tempRoot, FABRIC_RUN_ROOT_PREFIX + "closed");
-    const target = run(path.join(root, "old"));
+    const target = run(path.join(root, "old"), undefined, false);
     write(path.join(root, ".fabric-owner.json"), JSON.stringify({ pid: Number(DEAD), startedAt: 1, heartbeatAt: 1, closedAt: 1, childrenStopped: true }));
     return { target, act: () => sweepTempRunRoots({ tempRoot, now: 100 * DAY, orphanedTempRunRetentionMs: 6 * 3600_000, oneShotRunRetentionMs: DAY }) };
   },
   "sweepTempRunRoots (orphaned root)": () => {
     const tempRoot = tmp("fabric-vr-orphan-");
     const root = path.join(tempRoot, FABRIC_RUN_ROOT_PREFIX + "orphan");
-    const target = run(path.join(root, "old"));
+    const target = run(path.join(root, "old"), undefined, false);
     write(path.join(root, ".fabric-owner.json"), JSON.stringify({ pid: Number(DEAD), startedAt: 1, heartbeatAt: 1, orphanedAt: 1 }));
     return { target, act: () => sweepTempRunRoots({ tempRoot, now: 100 * DAY, orphanedTempRunRetentionMs: 6 * 3600_000, oneShotRunRetentionMs: DAY }) };
   },

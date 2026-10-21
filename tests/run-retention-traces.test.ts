@@ -3,12 +3,14 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { FABRIC_RUN_ROOT_PREFIX, isTraceArchivePath, markRunRootActive, markRunRootClosed, RUN_SESSION_TRACE_ARCHIVE_DIRECTORY,
+import { hostedOnly } from "../scripts/hosted-only.mjs";
+import { FABRIC_RUN_ROOT_PREFIX, archiveRunSessionTraces, isTraceArchivePath, markRunRootActive, markRunRootClosed, RUN_SESSION_TRACE_ARCHIVE_DIRECTORY,
   runSessionTraceArchivePath, sweepTempRunRoots, removeUnreferencedRun, compactTerminalRunEvents, pruneActorRunArchives,
   pruneActorSessionBackups, removeEmptyRunRoot } from "../src/storage/retention.js";
 import { sweepResidentRuns } from "../src/residency/retention.js";
 
 const roots: string[] = [];
+const HOSTED_ARCHIVES = hostedOnly("outside-TMPDIR trace archive tests");
 const DAY = 24 * 60 * 60 * 1_000;
 const tracePaths = [
   "events.jsonl",
@@ -24,9 +26,11 @@ afterEach(() => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
-function fixture(kind: "closed" | "orphaned") {
+function fixture(kind: "closed" | "orphaned", durableArchiveRoot = false) {
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-trace-retention-"));
-  const meshRoot = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-trace-mesh-"));
+  const meshBase = durableArchiveRoot ? os.userInfo().homedir : os.tmpdir();
+  const meshPrefix = durableArchiveRoot ? ".pi-fabric-trace-mesh-" : "fabric-trace-mesh-";
+  const meshRoot = fs.mkdtempSync(path.join(meshBase, meshPrefix));
   roots.push(tempRoot, meshRoot);
   const runRoot = path.join(tempRoot, `${FABRIC_RUN_ROOT_PREFIX}${kind}`);
   const run = path.join(runRoot, "run-1");
@@ -60,8 +64,24 @@ function fixture(kind: "closed" | "orphaned") {
 }
 
 describe("raw trace retention", () => {
-  it.each(["closed", "orphaned"] as const)("archives every raw transcript before removing a %s temp run", kind => {
-    const f = fixture(kind);
+  it("rejects temporary and reaped archive roots without creating them", () => {
+    const source = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-archive-placement-source-"));
+    roots.push(source);
+    fs.writeFileSync(path.join(source, "events.jsonl"), "raw events\n");
+    const meshRoots = [
+      path.join(os.tmpdir(), `fabric-unsafe-mesh-${process.pid}-${Date.now()}`),
+      path.join("/tmp", `pi-fabric-runs-placement-${process.pid}-${Date.now()}`),
+      path.join("/srv/scratch/paul/smarty-pi-tmp", `placement-${process.pid}-${Date.now()}`),
+    ];
+    for (const meshRoot of meshRoots) {
+      expect(archiveRunSessionTraces(source, undefined, meshRoot)).toBe(false);
+      expect(fs.existsSync(path.join(meshRoot, RUN_SESSION_TRACE_ARCHIVE_DIRECTORY))).toBe(false);
+      expect(fs.readFileSync(path.join(source, "events.jsonl"), "utf8")).toBe("raw events\n");
+    }
+  });
+
+  it.skipIf(!HOSTED_ARCHIVES).each(["closed", "orphaned"] as const)("archives every raw transcript before removing a %s temp run", kind => {
+    const f = fixture(kind, true);
     const result = f.sweep();
     if (kind === "closed") expect(result.removedRuns).toEqual([f.run]);
     else expect(result.removedRuns).toEqual([]); // Orphan collection is reported at the root boundary.
@@ -75,8 +95,8 @@ describe("raw trace retention", () => {
     expect(fs.existsSync(f.runRoot), "the archive does not depend on the temporary run root").toBe(false);
   });
 
-  it("moves a pre-existing sibling archive into the durable mesh trace tree", () => {
-    const f = fixture("closed");
+  it.skipIf(!HOSTED_ARCHIVES)("moves a pre-existing sibling archive into the durable mesh trace tree", () => {
+    const f = fixture("closed", true);
     const legacyRoot = path.join(f.runRoot, ".pi-fabric-session-traces", `run-${path.basename(f.run)}`);
     fs.mkdirSync(legacyRoot, { recursive: true });
     const legacyFile = path.join(legacyRoot, "session.jsonl");
@@ -87,8 +107,8 @@ describe("raw trace retention", () => {
     expect(fs.readFileSync(durableLegacy, "utf8")).toBe("previously archived transcript\n");
   });
 
-  it("keeps an archive after its entire TMPDIR-style parent is removed", () => {
-    const f = fixture("closed");
+  it.skipIf(!HOSTED_ARCHIVES)("keeps an archive after its entire TMPDIR-style parent is removed", () => {
+    const f = fixture("closed", true);
     f.sweep();
     fs.rmSync(f.tempRoot, { recursive: true, force: true });
     expect(fs.existsSync(f.runRoot)).toBe(false);
@@ -96,8 +116,8 @@ describe("raw trace retention", () => {
     for (const relative of tracePaths) expect(fs.readFileSync(path.join(f.archive, relative), "utf8")).toBe(`raw transcript: ${relative}\n`);
   });
 
-  it("copies, syncs, and verifies traces when archive rename crosses filesystems", () => {
-    const f = fixture("closed");
+  it.skipIf(!HOSTED_ARCHIVES)("copies, syncs, and verifies traces when archive rename crosses filesystems", () => {
+    const f = fixture("closed", true);
     const realRename = fs.renameSync;
     const rename = vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
       if (String(from).startsWith(f.run + path.sep) && String(to).startsWith(f.archive + path.sep)) {
@@ -118,6 +138,48 @@ describe("raw trace retention", () => {
       expect(entry.sha256).toBe(createHash("sha256").update(bytes).digest("hex"));
     }
     for (const relative of tracePaths) expect(fs.readFileSync(path.join(f.archive, relative), "utf8")).toBe(`raw transcript: ${relative}\n`);
+  });
+
+  it.skipIf(!HOSTED_ARCHIVES)("does not unlink a source until the destination directory sync succeeds", () => {
+    const f = fixture("closed", true);
+    const source = path.join(f.run, "events.jsonl");
+    const target = path.join(f.archive, "events.jsonl");
+    const destination = path.resolve(f.archive);
+    const realRename = fs.renameSync;
+    const realOpen = fs.openSync;
+    const realSync = fs.fsyncSync;
+    const directoryDescriptors = new Set<number>();
+    let failedSyncs = 2;
+    const rename = vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      if (String(from).startsWith(f.run + path.sep) && String(to).startsWith(f.archive + path.sep)) {
+        throw Object.assign(new Error("injected cross-device rename"), { code: "EXDEV" });
+      }
+      return realRename(from, to);
+    });
+    const open = vi.spyOn(fs, "openSync").mockImplementation((file, flags, mode) => {
+      const fd = realOpen(file, flags, mode);
+      if (path.resolve(String(file)) === destination) directoryDescriptors.add(fd);
+      else directoryDescriptors.delete(fd);
+      return fd;
+    });
+    const sync = vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+      if (directoryDescriptors.has(fd) && fs.existsSync(target) && fs.existsSync(source) && failedSyncs > 0) {
+        failedSyncs--;
+        throw Object.assign(new Error("injected destination directory fsync failure"), { code: "EIO" });
+      }
+      realSync(fd);
+    });
+    try {
+      expect(archiveRunSessionTraces(f.run, undefined, f.meshRoot)).toBe(false);
+      expect(fs.existsSync(source)).toBe(true);
+      expect(fs.readFileSync(target, "utf8")).toBe("raw transcript: events.jsonl\n");
+      expect(archiveRunSessionTraces(f.run, undefined, f.meshRoot)).toBe(false);
+      expect(fs.existsSync(source)).toBe(true);
+      expect(archiveRunSessionTraces(f.run, undefined, f.meshRoot)).toBe(true);
+      expect(fs.existsSync(source)).toBe(false);
+      expect(fs.readFileSync(target, "utf8")).toBe("raw transcript: events.jsonl\n");
+      expect(failedSyncs).toBe(0);
+    } finally { sync.mockRestore(); open.mockRestore(); rename.mockRestore(); }
   });
 
   it("excludes the durable trace tree from deletion and compaction", () => {
@@ -147,8 +209,8 @@ describe("raw trace retention", () => {
     expect(fs.existsSync(events)).toBe(true);
   });
 
-  it.each(["closed", "orphaned"] as const)("does not remove a %s run if any trace rename fails, then retries the partial archive", kind => {
-    const f = fixture(kind);
+  it.skipIf(!HOSTED_ARCHIVES).each(["closed", "orphaned"] as const)("does not remove a %s run if any trace rename fails, then retries the partial archive", kind => {
+    const f = fixture(kind, true);
     const failedSource = path.join(f.run, "route-session.jsonl");
     const realRename = fs.renameSync;
     const rename = vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {

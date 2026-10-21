@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { hostedOnly } from "../scripts/hosted-only.mjs";
 
 const removalIntents = vi.hoisted(() => [] as string[]);
 const sweepIntents = vi.hoisted(() => [] as string[]);
@@ -31,9 +32,10 @@ const managers: AgentManager[] = [];
 const roots: string[] = [];
 const workerPath = path.resolve("tests/fixtures/fake-worker.mjs");
 const nativeTempRoot = os.tmpdir();
+const HOSTED_ARCHIVES = hostedOnly("outside-TMPDIR agent trace archive tests");
 const queuedRollbackIntents: string[] = [];
 
-const fixture = (agents: Partial<typeof DEFAULT_FABRIC_CONFIG.agents> = {}, explicitRoot = false) => {
+const fixture = (agents: Partial<typeof DEFAULT_FABRIC_CONFIG.agents> = {}, explicitRoot = false, durableArchiveRoot = false) => {
   const tempRoot = fs.mkdtempSync(path.join(nativeTempRoot, "agent-prompt-retention-"));
   roots.push(tempRoot);
   // Keep the real managed ownership/sweep path inside this fixture on every host.
@@ -43,7 +45,9 @@ const fixture = (agents: Partial<typeof DEFAULT_FABRIC_CONFIG.agents> = {}, expl
   vi.stubEnv("PI_FABRIC_DEPTH", "0");
   for (const key of ["PI_FABRIC_BUDGET", "PI_FABRIC_BUDGET_FILE", "PI_FABRIC_BUDGET_ID"]) vi.stubEnv(key, undefined);
   const runRoot = explicitRoot ? path.join(tempRoot, "explicit-runs") : undefined;
-  const meshRoot = fs.mkdtempSync(path.join(nativeTempRoot, "agent-prompt-mesh-"));
+  const meshBase = durableArchiveRoot ? os.userInfo().homedir : nativeTempRoot;
+  const meshPrefix = durableArchiveRoot ? ".pi-fabric-agent-prompt-mesh-" : "agent-prompt-mesh-";
+  const meshRoot = fs.mkdtempSync(path.join(meshBase, meshPrefix));
   roots.push(meshRoot);
   const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, sessionExport: false, ...agents, retainRuns: false }, {
     workerPath, meshRoot, ...(runRoot ? { runRoot } : {}),
@@ -130,8 +134,8 @@ describe("Agent prompt retention at manager close (#11663)", () => {
     expect(() => manager.listForUi()).not.toThrow();
   });
 
-  it("archives raw traces before pruning artifacts from a failed terminal run", async () => {
-    const { meshRoot, manager } = fixture();
+  it.skipIf(!HOSTED_ARCHIVES)("archives raw traces before pruning artifacts from a failed terminal run", async () => {
+    const { meshRoot, manager } = fixture({}, false, true);
     const handle = await manager.spawn({ task: "FAIL_DIRECTIVE\narchive terminal artifacts", transport: "process" });
     await expect(manager.wait(handle.id)).resolves.toMatchObject({ status: "failed" });
     const directory = manager.runDirectory(handle.id)!;
@@ -157,8 +161,8 @@ describe("Agent prompt retention at manager close (#11663)", () => {
     expect(fs.readFileSync(path.join(directory, "task.txt"), "utf8")).toContain("archive terminal artifacts");
   });
 
-  it("keeps a failed terminal tree when raw trace archival fails", async () => {
-    const { manager } = fixture();
+  it.skipIf(!HOSTED_ARCHIVES)("keeps a failed terminal tree when raw trace archival fails", async () => {
+    const { manager } = fixture({}, false, true);
     const handle = await manager.spawn({ task: "FAIL_DIRECTIVE\nkeep trace after archive failure", transport: "process" });
     await expect(manager.wait(handle.id)).resolves.toMatchObject({ status: "failed" });
     const directory = manager.runDirectory(handle.id)!;

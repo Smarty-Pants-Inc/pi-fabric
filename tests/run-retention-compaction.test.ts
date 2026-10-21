@@ -2,16 +2,20 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { hostedOnly } from "../scripts/hosted-only.mjs";
 import { compactTerminalRunEvents, pruneActorRunArchives, markRunRootActive, markRunRootClosed, sweepTempRunRoots, FABRIC_RUN_ROOT_PREFIX, runSessionTraceArchivePath, runTreeExitVeto } from "../src/storage/retention.js";
 import { ActorLogStore } from "../src/actors/log-store.js";
 
 const roots: string[] = [];
+const HOSTED_ARCHIVES = hostedOnly("outside-TMPDIR trace archive tests");
 const HOUR = 3600000;
 const now = 10 * HOUR;
 const log = Array.from({ length: 401 }, (_, sequence) => JSON.stringify({ sequence }) + "\n").join("");
-const make = (record: Record<string, unknown> = {}) => {
+const make = (record: Record<string, unknown> = {}, durableArchiveRoot = false) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-tail-"));
-  const meshRoot = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-tail-mesh-"));
+  const meshBase = durableArchiveRoot ? os.userInfo().homedir : os.tmpdir();
+  const meshPrefix = durableArchiveRoot ? ".pi-fabric-tail-mesh-" : "fabric-tail-mesh-";
+  const meshRoot = fs.mkdtempSync(path.join(meshBase, meshPrefix));
   roots.push(root, meshRoot);
   const run = path.join(root, "runs", "old"); fs.mkdirSync(run, { recursive: true });
   fs.writeFileSync(path.join(run, "status.json"), JSON.stringify({ status: "completed", finishedAt: 4 * HOUR, transport: "process", sessionId: "2147483647", ...record }));
@@ -26,8 +30,8 @@ const snapshot = (run: string) => fs.readdirSync(run).sort().map(name => {
 afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
 
 describe("six-hour terminal run compaction", () => {
-  it("atomically keeps the final 200 events at six hours even below the byte cap, with status/result and TTL unchanged", () => {
-    const { root, meshRoot, run } = make();
+  it.skipIf(!HOSTED_ARCHIVES)("atomically keeps the final 200 events at six hours even below the byte cap, with status/result and TTL unchanged", () => {
+    const { root, meshRoot, run } = make({}, true);
     fs.utimesSync(run, 4 * HOUR / 1000, 4 * HOUR / 1000);
     const directoryMtime = fs.statSync(run).mtimeMs;
     const status = fs.readFileSync(path.join(run, "status.json"), "utf8");
@@ -103,8 +107,8 @@ describe("six-hour terminal run compaction", () => {
     expect(fs.readFileSync(file, "utf8")).toBe(original);
   });
 
-  it("keeps closed one-shot events byte-for-byte until expiry, then archives the full log before removal", () => {
-    const { root, meshRoot, run } = make();
+  it.skipIf(!HOSTED_ARCHIVES)("keeps closed one-shot events byte-for-byte until expiry, then archives the full log before removal", () => {
+    const { root, meshRoot, run } = make({}, true);
     const managed = path.join(root, FABRIC_RUN_ROOT_PREFIX + "closed");
     fs.mkdirSync(managed);
     const moved = path.join(managed, "old");

@@ -2,6 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { hostedOnly } from "../scripts/hosted-only.mjs";
 import { MESH_RETENTION_APPLY_DISABLED_CODE, MeshRetentionApplyDisabledError, summaryLines, sweepMeshRetention } from "../src/storage/retention-cli.js";
 import { MeshStore } from "../src/mesh/store.js";
 import { claimMeshRetentionSweep, MESH_RETENTION_SWEEP_PREFIX, recordMeshRetentionSweeper, removeUnreferencedRun, runSessionTraceArchivePath, startLockedMeshRetentionSweep } from "../src/storage/retention.js";
@@ -16,6 +17,7 @@ import { appendResidentLog } from "../src/residency/launcher.js";
 const DAY = 24 * 60 * 60 * 1_000;
 const NOW = Date.now();
 const roots: string[] = [];
+const HOSTED_ARCHIVES = hostedOnly("outside-TMPDIR mesh trace archive tests");
 afterEach(() => { vi.restoreAllMocks(); for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
 const write = (file: string, data: string) => { fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, data); };
 const tmp = (prefix: string) => { const root = fs.mkdtempSync(path.join(os.tmpdir(), prefix)); roots.push(root); return root; };
@@ -644,9 +646,10 @@ describe("final pre-delete check fences", () => {
     expect(fs.existsSync(path.join(resident, "reply.json"))).toBe(true);
   });
 
-  it.skipIf(process.platform !== "linux")("re-checks after the graveyard move and restores a run referenced in between", () => {
+  it.skipIf(process.platform !== "linux" || !HOSTED_ARCHIVES)("re-checks after the graveyard move and restores a run referenced in between", () => {
     const runs = tmp("fabric-tombstone-");
-    const meshRoot = tmp("fabric-tombstone-mesh-");
+    const meshRoot = fs.mkdtempSync(path.join(os.userInfo().homedir, ".pi-fabric-tombstone-mesh-"));
+    roots.push(meshRoot);
     const target = run(path.join(runs, "target"), { status: "completed", finishedAt: 1 });
     const judged = () => fs.lstatSync(target);
     const remove = (referenced?: () => boolean, dryRun = false) =>

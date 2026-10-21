@@ -280,6 +280,38 @@ const pathWithin = (target: string, root: string): boolean => {
   const relative = path.relative(path.resolve(root), path.resolve(target));
   return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
 };
+const physicalPath = (target: string): string | undefined => {
+  const tail: string[] = [];
+  for (let current = path.resolve(target); ; current = path.dirname(current)) {
+    try {
+      const real = fs.realpathSync(current);
+      return tail.length ? path.join(real, ...tail) : real;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT" && code !== "ENOTDIR") return;
+      try { if (fs.lstatSync(current).isSymbolicLink()) return; }
+      catch (statError) {
+        const statCode = (statError as NodeJS.ErrnoException).code;
+        if (statCode !== "ENOENT" && statCode !== "ENOTDIR") return;
+      }
+      const parent = path.dirname(current);
+      if (parent === current) return;
+      tail.unshift(path.basename(current));
+    }
+  }
+};
+const unsafeTraceArchiveRoot = (root: string): boolean => {
+  const physicalRoot = physicalPath(root), physicalTmp = physicalPath(os.tmpdir());
+  if (!physicalRoot || !physicalTmp || pathWithin(physicalRoot, physicalTmp)) return true;
+  if (physicalRoot.split(path.sep).includes("smarty-pi-tmp")) return true;
+  const physicalSlashTmp = process.platform === "win32" ? undefined : physicalPath("/tmp");
+  if (physicalSlashTmp) {
+    const relative = path.relative(physicalSlashTmp, physicalRoot);
+    const first = relative.split(path.sep)[0];
+    if (relative !== "" && relative !== ".." && !relative.startsWith(`..${path.sep}`) && first?.startsWith("pi-fabric-runs-")) return true;
+  }
+  return false;
+};
 const configuredMeshRoot = (meshRoot?: string): string | undefined => {
   const value = meshRoot ?? process.env.PI_FABRIC_MESH_ROOT;
   return value && path.isAbsolute(value) ? path.resolve(value) : undefined;
@@ -288,9 +320,12 @@ export const isTraceArchivePath = (target: string, meshRoot?: string): boolean =
   const root = configuredMeshRoot(meshRoot);
   return root !== undefined && pathWithin(target, path.join(root, RUN_SESSION_TRACE_ARCHIVE_DIRECTORY));
 };
-export const runSessionTraceArchivePath = (meshRoot: string, directory: string, archiveName?: string): string =>
-  path.join(path.resolve(meshRoot), RUN_SESSION_TRACE_ARCHIVE_DIRECTORY, safeTraceSegment(os.hostname()),
-    safeTraceSegment(path.basename(path.dirname(path.resolve(directory)))), `run-${safeTraceSegment(archiveName ?? path.basename(path.resolve(directory)))}`);
+export const runSessionTraceArchivePath = (meshRoot: string, directory: string, archiveName?: string): string => {
+  const source = path.resolve(directory);
+  const sourceKey = createHash("sha256").update(source).digest("hex").slice(0, 24);
+  return path.join(path.resolve(meshRoot), RUN_SESSION_TRACE_ARCHIVE_DIRECTORY, safeTraceSegment(os.hostname()),
+    safeTraceSegment(path.basename(path.dirname(source))), `run-${safeTraceSegment(archiveName ?? path.basename(source))}-${sourceKey}`);
+};
 const hashTraceDescriptor = (fd: number, size: number): string | undefined => {
   const hash = createHash("sha256"), buffer = Buffer.allocUnsafe(64 * 1024);
   try {
@@ -493,7 +528,7 @@ export const archiveRunSessionTraces = (directory: string, onlyPaths?: ReadonlyM
   if (!meshRoot || !archive || typeof process.getuid !== "function" || isTraceArchivePath(root, meshRoot)) return false;
   files.sort((left, right) => left.path.localeCompare(right.path));
   const archiveRoot = path.dirname(path.dirname(path.dirname(archive)));
-  if (pathWithin(archive, root) || pathWithin(root, archive)) return false;
+  if (pathWithin(archive, root) || pathWithin(root, archive) || unsafeTraceArchiveRoot(archiveRoot)) return false;
   const manifestPath = path.join(archive, RUN_SESSION_TRACE_ARCHIVE_MANIFEST);
   try {
     const archiveStat = lstatIfPresent(archive);
@@ -501,6 +536,7 @@ export const archiveRunSessionTraces = (directory: string, onlyPaths?: ReadonlyM
     if (archiveStat && (!archiveStat.isDirectory() || archiveStat.isSymbolicLink() || !ownedStat(archive)?.isDirectory())) return false;
     mkdirPrivate(archiveRoot, path.dirname(archiveRoot));
     mkdirPrivate(archive, archiveRoot);
+    if (unsafeTraceArchiveRoot(archiveRoot)) return false;
     const manifestStat = lstatIfPresent(manifestPath);
     let prior: RunSessionTraceArchiveManifest | undefined;
     if (manifestStat) {
@@ -538,6 +574,7 @@ export const archiveRunSessionTraces = (directory: string, onlyPaths?: ReadonlyM
         try {
           if (!sameTraceIdentity(fs.fstatSync(sourceFd), entry) || hashTraceDescriptor(sourceFd, entry.size) !== entry.sha256 ||
               !sameTraceIdentity(fs.lstatSync(source), entry)) return false;
+          syncDirectoryChain(path.dirname(target));
           fs.unlinkSync(source);
         } finally { fs.closeSync(sourceFd); }
         syncDirectories.add(path.dirname(source));

@@ -279,9 +279,10 @@ describe("activation projection", () => {
     else expect(fs.readFileSync(callbackFile, "utf8")).toBe("callback\n");
   }, TEST_GUARD_MS);
 
-  // Trust boundary: a later in-process extension must not redefine the native
-  // startup projection between the guard's before_agent_start and agent_start.
-  it.each(["unchanged", "reordered", "hidden-push", "hidden-replace", "forced", "nested"])("witnesses startup options across the real native hook chain (%s)", mode => {
+  // Trust boundary and pi-fabric#1520 real catch: a prepareLoadout tool must be
+  // able to hide the six core declarations, but a later extension must not
+  // redefine the unjournaled projection between the two startup hooks.
+  it.each(["unchanged", "reordered", "prepare-loadout", "journaled-sections", "hidden-push", "hidden-replace", "selected-push", "selected-replace", "delete-slot", "forced", "nested"])("witnesses startup options across the real native hook chain (%s)", mode => {
     const dir = root();
     fs.symlinkSync(path.resolve("node_modules"), path.join(dir, "node_modules"), "junction");
     const evidence = path.join(dir, "evidence.json");
@@ -290,8 +291,10 @@ describe("activation projection", () => {
     const child = path.join(dir, "startup-options.mjs");
     fs.writeFileSync(child, `
       import fs from 'node:fs';
-      import { Type, fauxProvider, fauxAssistantMessage } from '@earendil-works/pi-ai';
-      import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager } from '@earendil-works/pi-coding-agent';
+      import { Type, fauxProvider, fauxAssistantMessage, getCurrentSystemMessage } from '@earendil-works/pi-ai';
+      import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager } from ${JSON.stringify(selectedNativeBinary
+        ? pathToFileURL(path.join(path.dirname(selectedNativeBinary), "index.js")).href
+        : "@earendil-works/pi-coding-agent")};
       import hook from ${JSON.stringify(pathToFileURL(hook).href)};
       process.env.PI_FABRIC_ACTIVATION_WORKER_PID = String(process.ppid);
       process.env.PI_FABRIC_ACTIVATION_NONCE = 'startup-nonce';
@@ -301,35 +304,44 @@ describe("activation projection", () => {
       const mode = ${JSON.stringify(mode)};
       const modelRuntime = await ModelRuntime.create({modelsPath:null, refreshOnCreate:false, authPath:root+'/unused-auth.json'});
       const faux = fauxProvider(); modelRuntime.registerNativeProvider(faux.provider);
-      faux.setResponses([() => {
-        fs.writeFileSync(${JSON.stringify(evidence)}, JSON.stringify({requests:1}));
+      faux.setResponses([context => {
+        fs.writeFileSync(${JSON.stringify(evidence)}, JSON.stringify({requests:1,
+          tools:getCurrentSystemMessage(context.messages)?.toolsAdded?.map(tool=>tool.name),
+          ...(mode === 'journaled-sections' ? {guidance:getCurrentSystemMessage(context.messages)?.sections?.fabric_execution} : {})}));
         return fauxAssistantMessage('unchanged startup passed');
       }]);
       const loader = new DefaultResourceLoader({cwd:root, agentDir:root, noSkills:true, noPromptTemplates:true, noThemes:true, noContextFiles:true,
         extensionFactories:[{name:'activation-window', factory:hook}, {name:'later-extension', factory:pi => {
-          let hideRead = false;
+          let hidden = [];
           pi.registerTool({name:'startup_probe', label:'Startup probe', description:'Startup probe', parameters:Type.Object({}),
-            execute:async()=>({content:[]}), prepareLoadout:()=>({hiddenDeclarations:hideRead ? ['read'] : []})});
+            execute:async()=>({content:[], details:undefined}), prepareLoadout:()=>({hiddenDeclarations:hidden})});
           pi.on('before_agent_start', event => {
+            fs.writeFileSync(${JSON.stringify(mutated)}, mode);
             const options = event.systemPromptOptions;
             // Native loadout finalization rewrites hiddenTools after this hook.
             // Keep the extension's new hiding choice through that real boundary.
-            hideRead = mode === 'hidden-push' || mode === 'hidden-replace';
+            hidden = mode === 'prepare-loadout' ? ['read', 'grep', 'find', 'ls', 'bash', 'write']
+              : mode === 'hidden-push' || mode === 'hidden-replace' ? ['read'] : [];
             if (mode === 'hidden-push') options.hiddenTools.push('read');
             if (mode === 'hidden-replace') options.hiddenTools = ['read'];
+            if (mode === 'selected-push') options.selectedTools.push('nonexistent');
+            if (mode === 'selected-replace') options.selectedTools = ['startup_probe'];
+            if (mode === 'delete-slot') { delete options.hiddenTools; options.hiddenTools = []; }
+            if (mode === 'journaled-sections') options.sections.fabric_execution = 'JOURNALED_GUIDANCE';
             if (mode === 'forced') options.forceSystemPrompt = 'FORGED';
             if (mode === 'nested') options.toolGuidelines.read = ['FORGED'];
             if (mode === 'reordered') {
               const entries = Object.entries(options).reverse();
-              for (const key of Object.keys(options)) delete options[key];
-              Object.assign(options, Object.fromEntries(entries));
+              // Reorder ordinary fields, preserving Pi's witnessed finalization slots.
+              const ordinary = entries.filter(([key])=>!['selectedTools', 'hiddenTools'].includes(key));
+              for (const [key] of ordinary) delete options[key];
+              Object.assign(options, Object.fromEntries(ordinary));
             }
-            fs.writeFileSync(${JSON.stringify(mutated)}, mode);
           });
         }}]});
       await loader.reload();
       const {session} = await createAgentSession({cwd:root, agentDir:root, modelRuntime, model:faux.getModel(), resourceLoader:loader,
-        sessionManager:SessionManager.inMemory(root), tools:['read', 'startup_probe']});
+        sessionManager:SessionManager.inMemory(root), tools:['read', 'grep', 'find', 'ls', 'bash', 'write', 'startup_probe']});
       const errors = [];
       await session.bindExtensions({mode:'rpc', onError:error=>errors.push(String(error))});
       try {
@@ -338,14 +350,16 @@ describe("activation projection", () => {
       } finally {session.dispose()}
     `);
     const result = spawnSync(process.execPath, [child], { encoding: "utf8", timeout: HANG_GUARD_MS });
-    const refuses = !["unchanged", "reordered"].includes(mode);
+    const refuses = !["unchanged", "reordered", "prepare-loadout", "journaled-sections"].includes(mode);
     expect(fs.readFileSync(mutated, "utf8"), result.stderr).toBe(mode);
     expect(result.status, result.stderr).toBe(refuses ? 78 : 0);
     if (refuses) {
       expect(result.stderr).toContain("Fabric activation window failed: Error: Activation window lost native startup options");
       expect(fs.existsSync(evidence)).toBe(false);
     } else {
-      expect(JSON.parse(fs.readFileSync(evidence, "utf8"))).toEqual({ requests: 1 });
+      expect(JSON.parse(fs.readFileSync(evidence, "utf8"))).toEqual({ requests: 1,
+        tools: mode === "prepare-loadout" ? ["startup_probe"] : ["read", "grep", "find", "ls", "bash", "write", "startup_probe"],
+        ...(mode === "journaled-sections" ? { guidance: "<fabric_execution>\nJOURNALED_GUIDANCE\n</fabric_execution>" } : {}) });
     }
   }, TEST_GUARD_MS);
 

@@ -167,10 +167,59 @@ function reportWindowRefusal(tokens: number, contextWindow: number): void {
   } catch { /* the fail-closed exit below still stops the run, untyped */ }
 }
 
+/**
+ * Pi rewrites selectedTools and finalizes hiddenTools after before_agent_start.
+ * Check BEFORE those overwrites, so normalization cannot erase an extension's
+ * mutation. Only Pi's one hiddenTools finalization may change the witness; freeze
+ * that finalized result at agent_start, never the pre-loadout hidden list.
+ */
+function witnessStartupOptions(options: NormalizedBuildSystemPromptOptions): () => NormalizedBuildSystemPromptOptions {
+  let expected = deepFreeze(structuredClone(options));
+  // Fabric adds execution/skill sections in its later hook. Pi journals those
+  // deltas, so verifySystem checks them against the raw append-only witness.
+  // They are not an unjournaled projection like forced text or hidden tools.
+  const unjournaled = ({ sections: _sections, ...rest }: NormalizedBuildSystemPromptOptions) => stableJson(rest);
+  const fields = ["selectedTools", "hiddenTools"] as const;
+  let finalized = false;
+  const descriptors = fields.map(field => {
+    let value = options[field];
+    const get = () => value;
+    const set = (next: string[]) => {
+      try {
+        if (unjournaled(options) !== unjournaled(expected) || (field === "selectedTools"
+          ? stableJson(next) !== stableJson(expected.selectedTools) : finalized)) {
+          throw new Error("Activation window lost native startup options");
+        }
+        if (field === "hiddenTools") {
+          expected = deepFreeze({ ...expected, hiddenTools: structuredClone(next) });
+          finalized = true;
+        }
+        value = next;
+      } catch (error) {
+        failClosed(error);
+      }
+    };
+    Object.defineProperty(options, field, { enumerable: true, configurable: true, get, set });
+    return { field, get, set };
+  });
+  return () => {
+    if (!finalized || unjournaled(options) !== unjournaled(expected) || descriptors.some(({ field, get, set }) => {
+      const live = Object.getOwnPropertyDescriptor(options, field);
+      return live?.get !== get || live?.set !== set;
+    })) throw new Error("Activation window lost native startup options");
+    // Later native request preparation may reuse the options. Do not instrument
+    // that path, or freeze Pi's live object: retain only our detached snapshot.
+    for (const { field } of descriptors) {
+      Object.defineProperty(options, field, { value: options[field], enumerable: true, configurable: true, writable: true });
+    }
+    return deepFreeze(structuredClone(options));
+  };
+}
+
 /** Loaded only by an explicitly selected actor worker; adds no tools or trust. */
 export default async function activationWindow(pi: ExtensionAPI): Promise<void> {
   let window: ActivationWindow | undefined;
-  let promptOptions: { live: NormalizedBuildSystemPromptOptions; frozen: NormalizedBuildSystemPromptOptions } | undefined;
+  let finalizePromptOptions: (() => NormalizedBuildSystemPromptOptions) | undefined;
   try {
     if (String(process.ppid) !== process.env.PI_FABRIC_ACTIVATION_WORKER_PID || !process.env.PI_FABRIC_ACTIVATION_NONCE) {
       throw new Error("Activation window requires the worker launch binding");
@@ -217,19 +266,17 @@ export default async function activationWindow(pi: ExtensionAPI): Promise<void> 
     });
     pi.on("before_agent_start", event => {
       try {
-        // This hook loads FIRST. Witness the complete options now, before any
-        // later extension can mutate the shared object or its nested values.
-        promptOptions = { live: event.systemPromptOptions, frozen: deepFreeze(structuredClone(event.systemPromptOptions)) };
+        // This hook loads FIRST. Retain the between-hooks mutation refusal,
+        // while allowing Pi's subsequent native loadout finalization.
+        finalizePromptOptions = witnessStartupOptions(event.systemPromptOptions);
       } catch (error) {
         failClosed(error);
       }
     });
     pi.on("agent_start", () => {
       try {
-        if (!window || !promptOptions || stableJson(promptOptions.live) !== stableJson(promptOptions.frozen)) {
-          throw new Error("Activation window lost native startup options");
-        }
-        window.setNativeProjection(promptOptions.frozen);
+        if (!window || !finalizePromptOptions) throw new Error("Activation window lost native startup options");
+        window.setNativeProjection(finalizePromptOptions());
       } catch (error) {
         failClosed(error);
       }

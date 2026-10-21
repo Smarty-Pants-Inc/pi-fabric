@@ -922,11 +922,25 @@ export const spawnDetached = async (
     // this same worker on checked legacy monitoring, without replay or receipt.
     const admittedHandle = async () => await armTreeObservation() ? { ...handle, treeClosed: treeClosed! } : handle;
     try {
+      let admissionFailureReason = "scope admission timed out before an authenticated marker";
       const admitted = await (async (): Promise<boolean> => {
         let watcher: fs.FSWatcher | undefined;
         let deadline: ReturnType<typeof setTimeout> | undefined;
         let finish!: (admitted: boolean) => void;
-        const ended = (): void => finish(false);
+        const finishIfMarkerAdmitted = (reason: string): void => {
+          const admitted = markerIsAdmitted();
+          if (!admitted) admissionFailureReason = reason;
+          finish(admitted);
+        };
+        const watcherFailed = (): void => finishIfMarkerAdmitted("scope admission watcher failed before an authenticated marker");
+        const aborted = (): void => {
+          admissionFailureReason = "scope admission aborted before an authenticated marker";
+          finish(false);
+        };
+        const childClosed = (): void => {
+          admissionFailureReason = "scope process closed before an authenticated marker";
+          finish(false);
+        };
         try {
           return await new Promise<boolean>(resolve => {
             let settled = false;
@@ -940,22 +954,24 @@ export const spawnDetached = async (
             watcher = fs.watch(path.dirname(marker), { persistent: false }, (_event, filename) => {
               if (filename?.toString() === path.basename(marker) && markerIsAdmitted()) finish(true);
             });
-            watcher.once("error", ended);
-            child.once("close", ended);
-            authority?.signal?.addEventListener("abort", ended, { once: true });
+            watcher.once("error", watcherFailed);
+            child.once("close", childClosed);
+            authority?.signal?.addEventListener("abort", aborted, { once: true });
             if (markerIsAdmitted()) finish(true);
-            else if (nativeClosed || authority?.signal?.aborted) finish(false);
-            else if (!settled) deadline = setTimeout(ended, 5_000);
+            else if (nativeClosed) childClosed();
+            else if (authority?.signal?.aborted) aborted();
+            else if (!settled) deadline = setTimeout(() => finishIfMarkerAdmitted("scope admission timed out before an authenticated marker"), 5_000);
           });
         } catch {
           // An unavailable directory watch uses the checked legacy fallback
           // below, never a marker polling loop or an unverified tree receipt.
+          admissionFailureReason = "scope admission directory watcher could not be created";
           return false;
         } finally {
           clearTimeout(deadline);
           watcher?.close();
-          child.removeListener("close", ended);
-          authority?.signal?.removeEventListener("abort", ended);
+          child.removeListener("close", childClosed);
+          authority?.signal?.removeEventListener("abort", aborted);
         }
       })();
       if (admitted && !capped) return await admittedHandle();
@@ -984,6 +1000,13 @@ export const spawnDetached = async (
           return { ...handle, treeClosed: treeClosed!, cgroup: boundary.relative };
         }
       }
+      // The watcher or deadline may have won the event-loop race after the
+      // shim published its marker. Preserve an uncapped worker already admitted
+      // before any teardown; capped launches remain fail-closed until release.
+      if (!capped && !authority?.signal?.aborted && markerIsAdmitted()) return await admittedHandle();
+      const admissionStopReason = cappedRefusal ?? (capped && admitted
+        ? "capped scope boundary could not be verified; refusing uncapped fallback"
+        : admissionFailureReason);
       // Unproven capped admission: EOF makes the shim exit 125 before the worker runs.
       gate?.destroy();
       if (!nativeClosed || (boundary && !boundaryReleased)) await handle.stop();
@@ -991,7 +1014,10 @@ export const spawnDetached = async (
       if (await handle.isAlive()) throw new Error("Scope termination is unconfirmed; custody retained");
       assertTransportLaunchAllowed(authority);
       // A gated shim never executed the worker, but that alone cannot authorize uncapped replay.
-      if (!capped && markerIsAdmitted()) return await admittedHandle(); // admitted during teardown: never replay
+      if (!capped && markerIsAdmitted()) {
+        scope.warn("scope admission marker appeared during teardown; the admitted worker was stopped and will be reported lost");
+        return await admittedHandle(); // admitted during teardown: never replay
+      }
       if (capped) {
         // The gate was never released: no worker ran. systemd-run launched (it had a pid), so
         // the executable was present: ANY exit status, diagnostic, signal, receipt mismatch or
@@ -999,7 +1025,9 @@ export const spawnDetached = async (
         throw new TaskScopeAdmissionError(scopeUnit!, cappedRefusal ?? (exitStatus
           ? `scope exited before release (code ${exitStatus.code}, signal ${exitStatus.signal})` : "scope admission timed out"));
       }
-      scope.warn(spawnError?.message ?? "systemd-run failed or scope admission timed out");
+      // Report the stop only when the authorized uncapped fallback will proceed;
+      // capped refusals and revoked launches already surface their own errors.
+      scope.warn(admissionStopReason);
       return await spawnDetached(workerPath, workerArguments, cwd, authority, environment, undefined, termGraceMs, executionCustodian);
     } finally {
       if (!gateReleased) gate?.destroy();

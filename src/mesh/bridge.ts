@@ -1,6 +1,6 @@
 import { copyFabricPrincipal, type FabricPrincipal } from "../fabric-provenance.js";
 import { createHash } from "node:crypto";
-import { isMeshIncarnationPending, isMeshSnapshotRetriesExhausted, isMeshLockTimeout,
+import { MeshSnapshotRetriesExhaustedError, isMeshIncarnationPending, isMeshSnapshotRetriesExhausted, isMeshLockTimeout,
   MESH_INCARNATION_PENDING_CODE, MESH_SNAPSHOT_RETRIES_EXHAUSTED_CODE, MESH_LOCK_TIMEOUT_CODE, meshDeferredSummary } from "../core/atomic-write.js";
 import { performance as monotonicClock } from "node:perf_hooks";
 import fs from "node:fs";
@@ -537,7 +537,7 @@ const contentDigest = (value: unknown): string => createHash("sha256").update(JS
 export const BRIDGE_HANDOFF_PREFIX = "topology/handoffs/";
 /** Every state row a held event's ownership check reads (holds(): its records and #reservedNow()). */
 const HELD_STATE_PREFIXES = [HOST_PREFIX, PARTICIPANT_PREFIX, BRIDGE_HANDOFF_PREFIX] as const;
-/** #mirror: plans made before the transaction before the last one plans inside it. */
+/** #mirror: bounded plan attempts; eligible steady SQLite passes never plan inside the fence. */
 const MIRROR_PLAN_ATTEMPTS = 3;
 /** A mirror plan made before the transaction no longer matches its snapshot: roll back, plan again. */
 class MirrorPlanStale extends Error {}
@@ -1866,7 +1866,9 @@ export class StoreBridgeSide implements BridgeSide {
         if (!partial) for (const entry of scan.voided) ops.push({ kind: "delete", key: entry.key, ifVersion: entry.version, onConflict: "skip" });
         return { ops, leases, removed, judged: { leases: scan.leases, now: scan.now } };
     });
-    for (let attempt = 0; ; attempt += 1) {
+    const optimisticOnly = !final && this.store.stateBackend === "sqlite" &&
+      (this.#recovered || (partial && this.#hasCommittedPass));
+    for (let attempt = 0; attempt < MIRROR_PLAN_ATTEMPTS; attempt += 1) {
       // Participant files are read before the state transaction and revalidated in it by their
       // directory stamp (R11): only a change in between reads them again under the lock.
       const filesStamp = meshDirectoryStamp(this.store.root, "participants");
@@ -1876,11 +1878,15 @@ export class StoreBridgeSide implements BridgeSide {
       // first on the committed state at a recorded revision; the transaction uses it only when the change
       // feed proves no host, participant or handoff row changed since and the participant directory stamp is
       // unchanged, so it still decides on the snapshot it commits on (security review rounds 2/3, F1/F2).
-      // A stale plan rolls back and plans again; the last attempt, a backend without a revision view, and
-      // the first complete pass while recovery is pending (whose replay must run on the transaction's
-      // snapshot) plan inside, as before. A repeated partial pass may use an early plan without replay.
+      // A stale plan rolls back and plans again. Eligible steady SQLite passes plan outside on every
+      // attempt, then refuse on exhaustion. Other backends, final withdrawal and initial complete
+      // recovery retain the authoritative fallback; recovery replays on the transaction's snapshot.
+      // A repeated partial pass may use an early plan without replay.
       const early = (this.#recovered || (partial && this.#hasCommittedPass)) &&
-        attempt < MIRROR_PLAN_ATTEMPTS - 1 ? this.store.stateView() : undefined;
+        (optimisticOnly || attempt < MIRROR_PLAN_ATTEMPTS - 1) ? this.store.stateView() : undefined;
+      if (optimisticOnly && early === undefined && !halted()) {
+        throw new MeshSnapshotRetriesExhaustedError(attempt + 1);
+      }
       // Handoffs consult all leases when deciding whether a native identity has reappeared.
       const judgesLeaseLiveness = early !== undefined && early.view.listAll(BRIDGE_HANDOFF_PREFIX).length > 0;
       const planned = early && !halted() ? compute(early.view, files) : undefined;
@@ -1975,7 +1981,10 @@ export class StoreBridgeSide implements BridgeSide {
           }),
         });
       } catch (error) {
-        if (error instanceof MirrorPlanStale) continue;
+        if (error instanceof MirrorPlanStale) {
+          if (attempt + 1 === MIRROR_PLAN_ATTEMPTS) throw new MeshSnapshotRetriesExhaustedError(MIRROR_PLAN_ATTEMPTS);
+          continue;
+        }
         throw error;
       } finally {
         this.#skippedRoots = undefined;

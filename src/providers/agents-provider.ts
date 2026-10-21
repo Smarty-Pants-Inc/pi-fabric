@@ -3,6 +3,7 @@ import { diagnostics } from "../core/diagnostics.js";
 import { createHash, randomUUID } from "node:crypto";
 import { actorInstructionsSource, resolveActorInstructions, assertActorInstructionReplacement } from "../actors/instructions-file.js";
 import { readTaskReturnAddress } from "../agents/task-return-address.js";
+import { sandboxResultPrefix, type SandboxAutoReturn } from "../agents/sandbox-auto-return.js";
 import type { RouteEvaluate } from "../agents/model-route.js";
 import type { SpawnRouterAdmission } from "../agents/spawn-router.js";
 import type { JevRequest, JevResponse } from "../jev/types.js";
@@ -483,6 +484,7 @@ export class AgentsProvider implements FabricProvider {
     /** Current host effort, including child processes where the Main target is remote. */
     readonly callerThinking: () => string | undefined = () => undefined,
     readonly routeEvaluate: (request: JevRequest, signal: AbortSignal, context: FabricInvocationContext) => Promise<JevResponse> = async () => { throw new Error("Jev routing unavailable"); },
+    readonly sandboxAutoReturn?: SandboxAutoReturn<FabricAgentMessageResult>,
   ) {
     this.#spawnEnvironment = snapshotAgentSpawnEnvironment();
     // Bind authority at bootstrap, not to mutable adapter or invocation metadata.
@@ -1948,6 +1950,14 @@ export class AgentsProvider implements FabricProvider {
     return this.routeMessage(target, message, undefined, "followUp");
   }
 
+  async sendSandboxAutoReturn(message: string): Promise<FabricAgentMessageResult> {
+    const autoReturn = this.sandboxAutoReturn;
+    if (!autoReturn?.hasTaskReceipt || !message.startsWith(sandboxResultPrefix(autoReturn.runId))) {
+      throw new Error("Sandbox auto-return is not armed for this task");
+    }
+    return this.#router.routeMessage(autoReturn.spawnerId, message, undefined, "followUp");
+  }
+
   async routeMessage(
     id: string,
     message: string,
@@ -1970,7 +1980,15 @@ export class AgentsProvider implements FabricProvider {
         this.providerParticipants, this.participants, this.control, id, kind, message, data,
       ) as Promise<FabricAgentMessageResult>;
     }
-    return this.#router.routeMessage(id, message, data, kind, context, options);
+    const send = (): Promise<FabricAgentMessageResult> => this.#router.routeMessage(id, message, data, kind, context, options);
+    if (kind === "followUp" && this.sandboxAutoReturn) {
+      const targetId = id === "spawner" ? this.#router.spawner?.id
+        : id.trim() === "main" ? this.#taskReturnAddress?.spawnerId ?? this.mainAgent.id
+          : id.trim();
+      const result = await this.sandboxAutoReturn.sendExplicitResult(targetId ?? "", message, send);
+      if (result.handled) return result.result;
+    }
+    return send();
   }
 
   /** Flush pending coalesced lifecycle deliveries; used by tests and shutdown. */

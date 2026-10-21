@@ -5,6 +5,7 @@ import { diagnostics } from "../../core/diagnostics.js";
 import { SandboxPlacementHttp } from "./placement-http.js";
 import { SANDBOX_PLACEMENT_WAIT_MS, SANDBOX_READY_TIMEOUT_MS, type SandboxBinding, type SandboxPlacement, type SandboxSpawnIntent, type SandboxSpawnResult, type SandboxTaskResult, type SandboxTerminalRecord, type SandboxTerminalState, type SandboxTransportConfig, type SandboxTransportDependencies, writeSandboxTerminalRecord } from "./types.js";
 import { buildSandboxIntent } from "./intent.js";
+import { sandboxResultPrefix, sandboxTaskMessage } from "../../agents/sandbox-auto-return.js";
 
 const EMPTY_USAGE = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } as const;
 const NAME = /^[A-Za-z0-9][A-Za-z0-9_.:/@+-]{0,255}$/u;
@@ -326,9 +327,9 @@ export class SandboxTransport implements AgentTransportAdapter {
     try { resultWait = mesh.awaitResult(child.id, runId, deadlineAt, request.signal); }
     catch (error) { resultWait = Promise.reject(error); }
     void resultWait.catch(() => undefined);
-    const resultPrefix = `FABRIC-RESULT ${runId}\n`;
-    const returnInstructions = `When complete, send exactly one follow-up to the spawner with the final answer. Call agents.followUp({ id: ${JSON.stringify(parentSession)}, message: ${JSON.stringify(resultPrefix)} + answer }). The message must begin with the exact prefix ${JSON.stringify(resultPrefix)}; append your final answer after it.`;
-    const deliveredTask = `${task}\n\n${returnInstructions}`;
+    const resultPrefix = sandboxResultPrefix(runId);
+    const returnInstructions = `Fabric automatically returns your final assistant text to the spawner when this task settles. Do not send a second FABRIC-RESULT after it has been returned. If automatic return is unavailable, send exactly one result follow-up with agents.followUp({ id: ${JSON.stringify(parentSession)}, message: ${JSON.stringify(resultPrefix)} + answer }); the message must begin with that exact prefix. Use ordinary followUps only for updates.`;
+    const deliveredTask = sandboxTaskMessage(runId, `${task}\n\n${returnInstructions}`);
     try { await mesh.deliverTask(child.id, deliveredTask, request.signal); }
     catch {
       base = { ...base, warnings: [...(base.warnings ?? []), "Task delivery acknowledgement was not received; awaiting the single result without retry."] };

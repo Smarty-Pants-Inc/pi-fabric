@@ -163,7 +163,8 @@ import { participantProject, ParticipantRoleGrant } from "./topology/project-ide
 import { AgentManager } from "./agents/manager.js";
 import { AgentCompletionInbox } from "./agents/completion-inbox.js";
 import { ActorChildCompletionStore } from "./actors/child-completions.js";
-import { resolveAgentSpawner } from "./agents/spawner.js";
+import { boundAgentSpawner, resolveAgentSpawner } from "./agents/spawner.js";
+import { sandboxAutoReturnForChildRoot, type SandboxAutoReturn } from "./agents/sandbox-auto-return.js";
 import { rememberStoppedAtClose, restoreStoppedRuns, STOPPED_AGENTS_ENTRY, type StoppedAgentsEntryData } from "./agents/stopped-runs.js";
 import { ShellEventInbox } from "./core/shell-inbox.js";
 import { FabricShellTimingBridge } from "./core/shell-timing.js";
@@ -271,6 +272,8 @@ export class FabricRuntimeState {
   #lifecycle: LifecycleBroker | undefined;
   #residency: ResidencyClient | undefined;
   #agentsProvider: AgentsProvider | undefined;
+  #sandboxAutoReturn: SandboxAutoReturn<FabricAgentMessageResult> | undefined;
+  readonly #sandboxAutoReturnUnsubscribe: Array<() => void> = [];
   #compact: CompactController | undefined;
   #schema: SchemaController | undefined;
   #componentSupervisor: FabricComponentSupervisor | undefined;
@@ -911,6 +914,11 @@ export class FabricRuntimeState {
     const sessionId = context.sessionManager.getSessionId();
     const role = this.#roleGrant.roleFor(sessionId, context.cwd);
     const { identity, mainAgentId } = resolveFabricIdentity(sessionId);
+    this.#sandboxAutoReturn = sandboxAutoReturnForChildRoot({
+      runId: process.env.PI_FABRIC_RUN_ID,
+      spawner: boundAgentSpawner(),
+      isRoot: identity.kind === "main",
+    }) as SandboxAutoReturn<FabricAgentMessageResult> | undefined;
     await builtins.install(createProviderComponent({
       provider: "cache",
       description: "Local prompt-cache observations and scoped native warming",
@@ -1789,9 +1797,11 @@ export class FabricRuntimeState {
         void pending.then(() => owner.pending.delete(pending), () => owner.pending.delete(pending));
         return pending;
       },
+      this.#sandboxAutoReturn,
     );
     agentsProvider.providerParticipants = providerParticipants;
     this.#agentsProvider = agentsProvider;
+    this.#installSandboxAutoReturn(agentsProvider, this.#sandboxAutoReturn);
     actorControlProvider = agentsProvider;
     if (transport) {
       // Publish native recovery and sources before control/spawn admission opens.
@@ -2654,6 +2664,65 @@ export class FabricRuntimeState {
     await repairs?.flush();
   }
 
+  #installSandboxAutoReturn(
+    provider: AgentsProvider,
+    autoReturn: SandboxAutoReturn<FabricAgentMessageResult> | undefined,
+  ): void {
+    if (!autoReturn) return;
+    let active = true;
+    let lastAssistantStopReason: string | undefined;
+    this.#sandboxAutoReturnUnsubscribe.push(() => { active = false; });
+    const subscribe = (event: string, handler: (...args: any[]) => unknown): void => {
+      const callback = (...args: any[]): unknown => active ? handler(...args) : undefined;
+      const unsubscribe = (this.pi.on as (name: string, callback: (...args: any[]) => unknown) => unknown)(event, callback);
+      if (typeof unsubscribe === "function") this.#sandboxAutoReturnUnsubscribe.push(unsubscribe as () => void);
+    };
+    const textOf = (content: unknown): string => {
+      if (typeof content === "string") return content;
+      if (!Array.isArray(content)) return "";
+      return content.map(part => {
+        if (typeof part !== "object" || part === null || Array.isArray(part)) return "";
+        const block = part as { type?: unknown; text?: unknown };
+        return block.type === "text" && typeof block.text === "string" ? block.text : "";
+      }).join("");
+    };
+    subscribe("message_start", event => {
+      const message = (event as { message?: { role?: unknown; content?: unknown; provenance?: unknown } }).message;
+      if (message?.role !== "user") return;
+      if (autoReturn.receiveTask({ message: textOf(message.content), provenance: message.provenance })) {
+        lastAssistantStopReason = undefined;
+      }
+    });
+    subscribe("message_end", event => {
+      const message = (event as { message?: { role?: unknown; content?: unknown; stopReason?: unknown } }).message;
+      if (message?.role !== "assistant" || !autoReturn.hasTaskReceipt) return;
+      autoReturn.recordAssistantText(textOf(message.content));
+      lastAssistantStopReason = typeof message.stopReason === "string" ? message.stopReason : undefined;
+    });
+    subscribe("agent_settled", async (event, context) => {
+      const settled = event as { outcome?: unknown; aborted?: unknown } | undefined;
+      const outcome = typeof settled?.outcome === "string" ? settled.outcome
+        : settled?.aborted === true || (context as ExtensionContext | undefined)?.signal?.aborted ? "aborted"
+          : lastAssistantStopReason === "error" || lastAssistantStopReason === "aborted" ? lastAssistantStopReason
+            : "unknown";
+      try {
+        await autoReturn.sendAutomaticResult(outcome, message => provider.sendSandboxAutoReturn(message));
+      } catch (error) {
+        const code = error && typeof error === "object" && "code" in error && typeof error.code === "string"
+          ? error.code : error instanceof Error ? error.name : "UnknownError";
+        try {
+          this.pi.appendEntry("pi-fabric.sandbox-result-failure", {
+            runId: autoReturn.runId, spawnerId: autoReturn.spawnerId, code,
+          });
+        } catch { /* the parent result wait still owns terminal failure publication */ }
+        diagnostics.warn("src/fabric-runtime-state.ts",
+          `[pi-fabric] sandbox result send failed (${code}); the parent result wait will publish terminal failure if no result arrived`);
+      } finally {
+        lastAssistantStopReason = undefined;
+      }
+    });
+  }
+
   async #closeInternal(): Promise<void> {
     const transport = this.#transport;
     const transportAbort = this.#transportAbort;
@@ -2678,6 +2747,8 @@ export class FabricRuntimeState {
 
   async #closeInternalSteps(): Promise<void> {
     const transportAbort = this.#transportAbort;
+    for (const unsubscribe of this.#sandboxAutoReturnUnsubscribe.splice(0)) unsubscribe();
+    this.#sandboxAutoReturn = undefined;
     this.#stopHerdrLookup?.();
     this.#stopHerdrLookup = undefined;
     // /fabric reload and bootstrap replacement rebuild Fabric, not the creating

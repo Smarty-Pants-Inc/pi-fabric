@@ -24,7 +24,7 @@ import { KvParticipantDirectory } from "../src/topology/participant-view.js";
 import type { FabricKvHostLease, FabricParticipantRecord } from "../src/topology/types.js";
 import { kvWatchRetryCode, kvWatchRetryDelayMs, openNatsKv, openNatsKvForMachine, type NatsKvStore } from "../src/transport/nats/kv.js";
 import { TransportUnavailableError, type FabricTransport, type TransportBucket, type TransportKv, type TransportKvEvent } from "../src/transport/types.js";
-import { ensureTransportStream } from "../src/transport/nats/provision.js";
+import { ensureTransportStream, INBOX_DUPLICATE_WINDOW_MS } from "../src/transport/nats/provision.js";
 import { transportInboxStream, transportInboxStreamSubject } from "../src/transport/nats/subjects.js";
 import { createPathBHarness, resolveNatsBinary, type PathBHarness } from "./helpers/nats-cluster.js";
 
@@ -246,9 +246,9 @@ describe.skipIf(!binary)("real authenticated NATS KV snapshot/ready/reset", () =
     await openNatsKvForMachine(js, "leases", A);
     await openNatsKvForMachine(js, "presence", A);
     await ensureTransportStream(manager, { name: transportInboxStream(A), subjects: [transportInboxStreamSubject(A)],
-      maxBytes: 1_073_741_824, maxAgeMs: 0, maxMessageBytes: 1_048_576, duplicateWindowMs: 600_000, replicas: 1 });
+      maxBytes: 1_073_741_824, maxAgeMs: 0, maxMessageBytes: 1_048_576, duplicateWindowMs: INBOX_DUPLICATE_WINDOW_MS, replicas: 1 });
     await ensureTransportStream(manager, { name: transportInboxStream(B), subjects: [transportInboxStreamSubject(B)],
-      maxBytes: 1_073_741_824, maxAgeMs: 0, maxMessageBytes: 1_048_576, duplicateWindowMs: 600_000, replicas: 1 });
+      maxBytes: 1_073_741_824, maxAgeMs: 0, maxMessageBytes: 1_048_576, duplicateWindowMs: INBOX_DUPLICATE_WINDOW_MS, replicas: 1 });
   }, 30_000);
 
   afterEach(async () => {

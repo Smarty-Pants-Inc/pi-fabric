@@ -470,12 +470,23 @@ export class KvParticipantDirectory implements ParticipantView {
   }
 
   /** On-change publication; only an initial own-root create may succeed a fenced predecessor. */
-  publish(record: FabricParticipantRecord): Promise<KvPresencePublication> {
+  publish(record: FabricParticipantRecord, options: { force?: boolean } = {}): Promise<KvPresencePublication> {
     const copy = this.#ownRecord(record), key = this.#key(copy.id);
     return this.#serial(key, async () => {
       this.#assertWritable();
       if (this.#pendingCleanup.has(key)) throw new TransportUnavailableError("Presence awaits uncertain admission cleanup");
       const owned = this.#owned.get(key);
+      if (options.force) {
+        // A verified broker reconnect invalidates the local freshness shortcut: read the
+        // current KV revision and confirm an exact owner/value before refreshing it.
+        const current = await this.#presence.get<unknown>(key, this.#signal());
+        if (current && !this.#same(current, copy) && (!owned || !this.#same(current, owned.record))) {
+          throw new TransportInvalidError("Reconnect presence refresh does not own the current KV record");
+        }
+        this.#assertWritable();
+        const revision = await this.#update(key, copy, current?.revision ?? 0);
+        return this.#admitted(key, copy, revision);
+      }
       if (owned && canonicalJson(owned.record) === canonicalJson(copy) &&
         performance.now() - owned.writtenAt < KV_PRESENCE_REFRESH_MS) {
         return { key, revision: owned.revision, rollback: () => this.#serial(key, () => this.#removeRevision(key, owned.revision)) };

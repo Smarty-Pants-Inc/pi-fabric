@@ -124,7 +124,7 @@ describe("hosted sharded required checks", () => {
       ...(platform === "linux" ? ["linux-runtime"] : [])]);
     expect(aggregate.steps?.at(-1)?.if).toBe("always()");
     expect(aggregate.steps?.at(-1)?.run).toContain('job.result !== "success"');
-    expect(aggregate.steps?.find((step) => step.name === "Print per-shard counts and sums")?.run).toContain(`${os} 10`);
+    expect(aggregate.steps?.find((step) => step.name === "Merge shard receipts and require file-level parity")?.run).toContain(`${os} 10`);
   });
 
   it("keeps hosted-only admission, pinned brokers, systemd, and singleton smoke/cleanup/package semantics", () => {

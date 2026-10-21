@@ -13,6 +13,7 @@ import type { FabricInvocationContext } from "../src/protocol.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
+import { runSessionTraceArchivePath } from "../src/storage/retention.js";
 
 // smarty-dev#8090, follow-up smarty-dev#11335: Linux, Darwin and Windows support the Main publication fence.
 // Only unsupported platforms resolve removal with this named refusal pending and the tree kept.
@@ -83,12 +84,13 @@ describe("ActorDirectory", () => {
     fs.writeFileSync(project.sessionFile!, projectTrace);
     fs.writeFileSync(session.sessionFile!, sessionTrace);
     await directory.close();
-    const archive = path.join(root, "mesh", ".pi-fabric-session-traces");
     const archiveName = (directory: string) => `actor-root-${createHash("sha256").update(path.resolve(directory)).digest("hex").slice(0, 24)}`;
+    const projectArchive = runSessionTraceArchivePath(path.join(root, "mesh"), projectRoot, archiveName(projectRoot));
+    const sessionArchive = runSessionTraceArchivePath(path.join(root, "mesh"), sessionRoot, archiveName(sessionRoot));
     expect(fs.existsSync(projectRoot)).toBe(false);
     expect(fs.existsSync(sessionRoot)).toBe(false);
-    expect(fs.readFileSync(path.join(archive, archiveName(projectRoot), project.id, "session.jsonl"), "utf8")).toBe(projectTrace);
-    expect(fs.readFileSync(path.join(archive, archiveName(sessionRoot), session.id, "session.jsonl"), "utf8")).toBe(sessionTrace);
+    expect(fs.readFileSync(path.join(projectArchive, project.id, "session.jsonl"), "utf8")).toBe(projectTrace);
+    expect(fs.readFileSync(path.join(sessionArchive, session.id, "session.jsonl"), "utf8")).toBe(sessionTrace);
   });
   // #6087 admission data safety: session mutations must reach the secondary
   // manager, not silently change the project registry or lose its subscriptions.
@@ -123,7 +125,8 @@ describe("ActorDirectory", () => {
     await expect(directory.remove(actor.id)).resolves.toMatchObject({ removed: true });
     const archiveName = `actor-session-${createHash("sha256").update(sessionDir).digest("hex").slice(0, 24)}`;
     expect(fs.existsSync(sessionDir)).toBe(false);
-    expect(fs.readFileSync(path.join(root, "mesh", ".pi-fabric-session-traces", archiveName, "session.jsonl"), "utf8")).toBe(trace);
+    const archive = runSessionTraceArchivePath(path.join(root, "mesh"), sessionDir, archiveName);
+    expect(fs.readFileSync(path.join(archive, "session.jsonl"), "utf8")).toBe(trace);
   });
 
   it("#6087 routes guest setTopics through the real provider to a secondary session actor and a global template", async () => {

@@ -911,7 +911,8 @@ export class ResidencyClient {
         commit();
       }
       throwIfAborted(signal);
-      if (runDirectoryPresent && !removeUnreferencedRun(metadata.runDirectory, runDirectoryStat, undefined, false, "residentClientCleanup")) {
+      if (runDirectoryPresent && !removeUnreferencedRun(metadata.runDirectory, runDirectoryStat, undefined, false, "residentClientCleanup", 0, false,
+        this.options.config.meshRoot)) {
         throw new Error("resident cleanup refused; run tree or raw session trace archive could not be verified");
       }
       fs.rmSync(this.#metadataPath(metadata.id), { force: true });

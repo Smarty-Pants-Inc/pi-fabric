@@ -1,4 +1,6 @@
 import fs from "node:fs";
+import { createHash } from "node:crypto";
+import os from "node:os";
 import { retentionV2Enabled } from "./retention-platform.js";
 import path from "node:path";
 import { syncDirectoryChain, writeFileAtomic, writeJsonAtomic } from "../core/atomic-write.js";
@@ -261,9 +263,10 @@ const runFile = (name: string): boolean => runFiles.has(name) ||
   /^manager-restored-result-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.json$/.test(name) ||
   /^oversized-event-prefix(-\d+)?\.txt$/.test(name);
 
-export const RUN_SESSION_TRACE_ARCHIVE_DIRECTORY = ".pi-fabric-session-traces";
+export const RUN_SESSION_TRACE_ARCHIVE_DIRECTORY = "traces";
+const LEGACY_RUN_SESSION_TRACE_ARCHIVE_DIRECTORY = ".pi-fabric-session-traces";
 const RUN_SESSION_TRACE_ARCHIVE_MANIFEST = ".manifest.json";
-interface RunSessionTraceArchiveEntry { path: string; dev: number; ino: number; size: number; mtimeMs: number }
+interface RunSessionTraceArchiveEntry { path: string; dev: number; ino: number; size: number; mtimeMs: number; sha256?: string }
 interface RunSessionTraceArchiveManifest { format: 1; files: RunSessionTraceArchiveEntry[] }
 const sessionTranscriptName = /^(?:.*[-_.])?session(?:[-_.][^/]*)?\.jsonl(?:\.[^/]*)?$/i;
 const rawSessionTrace = (name: string, inHandoffSession: boolean): boolean =>
@@ -271,12 +274,118 @@ const rawSessionTrace = (name: string, inHandoffSession: boolean): boolean =>
   (inHandoffSession && /\.jsonl(?:\.[^/]*)?$/i.test(name));
 const traceIdentity = (stat: fs.Stats): Omit<RunSessionTraceArchiveEntry, "path"> =>
   ({ dev: stat.dev, ino: stat.ino, size: stat.size, mtimeMs: stat.mtimeMs });
+const safeTraceSegment = (value: string): string => /^[A-Za-z0-9._-]{1,160}$/.test(value) && value !== "." && value !== ".."
+  ? value : `id-${createHash("sha256").update(value).digest("hex").slice(0, 32)}`;
+const pathWithin = (target: string, root: string): boolean => {
+  const relative = path.relative(path.resolve(root), path.resolve(target));
+  return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+};
+const configuredMeshRoot = (meshRoot?: string): string | undefined => {
+  const value = meshRoot ?? process.env.PI_FABRIC_MESH_ROOT;
+  return value && path.isAbsolute(value) ? path.resolve(value) : undefined;
+};
+export const isTraceArchivePath = (target: string, meshRoot?: string): boolean => {
+  const root = configuredMeshRoot(meshRoot);
+  return root !== undefined && pathWithin(target, path.join(root, RUN_SESSION_TRACE_ARCHIVE_DIRECTORY));
+};
+export const runSessionTraceArchivePath = (meshRoot: string, directory: string, archiveName?: string): string =>
+  path.join(path.resolve(meshRoot), RUN_SESSION_TRACE_ARCHIVE_DIRECTORY, safeTraceSegment(os.hostname()),
+    safeTraceSegment(path.basename(path.dirname(path.resolve(directory)))), `run-${safeTraceSegment(archiveName ?? path.basename(path.resolve(directory)))}`);
+const hashTraceDescriptor = (fd: number, size: number): string | undefined => {
+  const hash = createHash("sha256"), buffer = Buffer.allocUnsafe(64 * 1024);
+  try {
+    for (let offset = 0; offset < size;) {
+      const length = Math.min(buffer.length, size - offset);
+      let read = 0;
+      while (read < length) {
+        const count = fs.readSync(fd, buffer, read, length - read, offset + read);
+        if (count <= 0) return;
+        read += count;
+      }
+      hash.update(buffer.subarray(0, length));
+      offset += length;
+    }
+    return hash.digest("hex");
+  } catch { return; }
+};
+const archiveTraceMatches = (file: string, expected: RunSessionTraceArchiveEntry): boolean => {
+  if (!expected.sha256) return false;
+  let fd: number | undefined;
+  try {
+    const named = fs.lstatSync(file), owned = ownedStat(file);
+    if (!owned?.isFile() || named.nlink !== 1 || named.size !== expected.size || named.mtimeMs !== expected.mtimeMs) return false;
+    fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+    const held = fs.fstatSync(fd);
+    return sameTraceIdentity(held, expected) || held.isFile() && held.nlink === 1 && held.size === expected.size &&
+      held.mtimeMs === expected.mtimeMs && hashTraceDescriptor(fd, expected.size) === expected.sha256;
+  } catch { return false; }
+  finally { if (fd !== undefined) { try { fs.closeSync(fd); } catch {} } }
+};
+const copyTraceToStaging = (sourceFile: string, entry: RunSessionTraceArchiveEntry, stagingFile: string): string | undefined => {
+  let source: number | undefined, target: number | undefined;
+  try {
+    const sourceNamed = fs.lstatSync(sourceFile);
+    source = fs.openSync(sourceFile, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+    const sourceHeld = fs.fstatSync(source);
+    if (!sameTraceIdentity(sourceHeld, entry) || !sameTraceIdentity(sourceNamed, entry)) return;
+    const existing = lstatIfPresent(stagingFile);
+    if (existing) {
+      if (!ownedStat(stagingFile)?.isFile()) return;
+      if (existing.size === entry.size && existing.mtimeMs === entry.mtimeMs) {
+        const prior = fs.openSync(stagingFile, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+        try {
+          const sourceHash = hashTraceDescriptor(source, entry.size);
+          const stagedHash = hashTraceDescriptor(prior, entry.size);
+          if (sourceHash && sourceHash === stagedHash && sameTraceIdentity(fs.fstatSync(source), entry) &&
+              sameTraceIdentity(fs.lstatSync(sourceFile), entry)) return sourceHash;
+        } finally { fs.closeSync(prior); }
+      }
+      fs.unlinkSync(stagingFile);
+    }
+    target = fs.openSync(stagingFile, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW ?? 0), 0o600);
+    const buffer = Buffer.allocUnsafe(64 * 1024);
+    for (let offset = 0; offset < entry.size;) {
+      const length = Math.min(buffer.length, entry.size - offset);
+      let read = 0;
+      while (read < length) {
+        const count = fs.readSync(source, buffer, read, length - read, offset + read);
+        if (count <= 0) return;
+        read += count;
+      }
+      let written = 0;
+      while (written < length) {
+        const count = fs.writeSync(target, buffer, written, length - written);
+        if (count <= 0) return;
+        written += count;
+      }
+      offset += length;
+    }
+    fs.fchmodSync(target, 0o600);
+    fs.futimesSync(target, entry.mtimeMs / 1_000, entry.mtimeMs / 1_000);
+    fs.fsyncSync(target);
+    const targetStat = fs.fstatSync(target);
+    fs.closeSync(target); target = undefined;
+    const staged = fs.openSync(stagingFile, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+    try {
+      const sourceHash = hashTraceDescriptor(source, entry.size);
+      const stagedHash = hashTraceDescriptor(staged, entry.size);
+      if (!sourceHash || sourceHash !== stagedHash || targetStat.size !== entry.size || targetStat.mtimeMs !== entry.mtimeMs ||
+          !sameTraceIdentity(fs.fstatSync(source), entry) || !sameTraceIdentity(fs.lstatSync(sourceFile), entry)) return;
+      return sourceHash;
+    } finally { fs.closeSync(staged); }
+  } catch { return; }
+  finally {
+    if (target !== undefined) { try { fs.closeSync(target); } catch {} }
+    if (source !== undefined) { try { fs.closeSync(source); } catch {} }
+  }
+};
 const validTraceArchiveEntry = (value: unknown): value is RunSessionTraceArchiveEntry => {
   if (!value || typeof value !== "object") return false;
   const entry = value as Partial<RunSessionTraceArchiveEntry>;
   const normalized = typeof entry.path === "string" ? entry.path.split("/").join(path.sep) : "";
   return typeof entry.path === "string" && !!entry.path && !path.isAbsolute(normalized) && normalized !== ".." && !normalized.startsWith(`..${path.sep}`) &&
-    [entry.dev, entry.ino, entry.size, entry.mtimeMs].every(item => typeof item === "number" && Number.isFinite(item) && item >= 0);
+    [entry.dev, entry.ino, entry.size, entry.mtimeMs].every(item => typeof item === "number" && Number.isFinite(item) && item >= 0) &&
+    (entry.sha256 === undefined || typeof entry.sha256 === "string" && /^[a-f0-9]{64}$/.test(entry.sha256));
 };
 const sameTraceIdentity = (stat: fs.Stats, entry: RunSessionTraceArchiveEntry): boolean =>
   stat.isFile() && !stat.isSymbolicLink() && stat.nlink === 1 && stat.dev === entry.dev && stat.ino === entry.ino &&
@@ -297,21 +406,21 @@ const traceManifest = (file: string): RunSessionTraceArchiveManifest | undefined
 };
 /**
  * Move every raw Pi transcript/event log out of a run before retention can remove the run tree.
- * The durable manifest records each original inode before the first rename, so a partial archive
- * can be retried and a missing or replaced trace fails closed. Archive paths preserve each trace's
- * relative name and same-filesystem rename preserves its mtime.
+ * Durable copies live under the configured mesh root, never in a TMPDIR. The manifest records each
+ * source identity before rename; EXDEV uses a staged, fsynced and SHA-256-verified copy whose
+ * manifest is committed before the source is unlinked.
  */
-export const archiveRunSessionTraces = (directory: string, onlyPaths?: ReadonlyMap<string, fs.Stats>, archiveDirectory?: string,
+export const archiveRunSessionTraces = (directory: string, onlyPaths?: ReadonlyMap<string, fs.Stats>, meshRootArg?: string,
   archiveName?: string): boolean => {
   const root = path.resolve(directory);
+  const meshRoot = configuredMeshRoot(meshRootArg);
   if (!ownedStat(root)?.isDirectory()) return false;
   const files: RunSessionTraceArchiveEntry[] = [];
-  const collect = (current: string, relative: string, depth: number, inHandoffSession: boolean): boolean => {
+  const collect = (current: string, relative: string, depth: number, inHandoffSession: boolean, inLegacyArchive = false): boolean => {
     if (depth > 64) return false;
     let entries: fs.Dirent[];
     try { entries = fs.readdirSync(current, { withFileTypes: true }); } catch { return false; }
     for (const entry of entries) {
-      if (!relative && entry.name === RUN_SESSION_TRACE_ARCHIVE_DIRECTORY) continue;
       const source = path.join(current, entry.name);
       const rel = relative ? path.join(relative, entry.name) : entry.name;
       const relativeName = rel.split(path.sep).join("/");
@@ -319,14 +428,18 @@ export const archiveRunSessionTraces = (directory: string, onlyPaths?: ReadonlyM
           ![...onlyPaths.keys()].some(selected => selected.startsWith(`${relativeName}/`))) continue;
       let stat: fs.Stats;
       try { stat = fs.lstatSync(source); } catch { return false; }
+      if (!relative && entry.name === LEGACY_RUN_SESSION_TRACE_ARCHIVE_DIRECTORY) {
+        if (!stat.isDirectory() || !ownedStat(source)?.isDirectory() || !collect(source, rel, depth + 1, inHandoffSession, true)) return false;
+        continue;
+      }
       if (stat.isSymbolicLink()) {
-        if (rawSessionTrace(entry.name, inHandoffSession)) return false;
+        if (inLegacyArchive || rawSessionTrace(entry.name, inHandoffSession)) return false;
         continue; // Recursive removal unlinks a link, never the trace it names.
       }
       if (stat.isDirectory()) {
-        if (!ownedStat(source)?.isDirectory() || !collect(source, rel, depth + 1, inHandoffSession || entry.name === "handoff-session")) return false;
+        if (!ownedStat(source)?.isDirectory() || !collect(source, rel, depth + 1, inHandoffSession || entry.name === "handoff-session", inLegacyArchive)) return false;
       } else if (stat.isFile()) {
-        if (rawSessionTrace(entry.name, inHandoffSession)) {
+        if (inLegacyArchive || rawSessionTrace(entry.name, inHandoffSession)) {
           const owned = ownedStat(source);
           if (!owned?.isFile()) return false;
           const expected = onlyPaths?.get(relativeName);
@@ -338,14 +451,49 @@ export const archiveRunSessionTraces = (directory: string, onlyPaths?: ReadonlyM
     return true;
   };
   if (!collect(root, "", 0, false)) return false;
-  if (files.length > 0 && typeof process.getuid !== "function") return false;
-  files.sort((left, right) => left.path.localeCompare(right.path));
-
   const parent = path.dirname(root);
-  const archiveRoot = archiveDirectory ? path.resolve(archiveDirectory) : path.join(parent, RUN_SESSION_TRACE_ARCHIVE_DIRECTORY);
-  const name = archiveName ?? `run-${path.basename(root)}`;
-  if (!/^[A-Za-z0-9._-]{1,200}$/.test(name) || name === "." || name === "..") return false;
-  const archive = path.join(archiveRoot, name);
+  const archive = meshRoot ? runSessionTraceArchivePath(meshRoot, root, archiveName) : undefined;
+  const traceName = safeTraceSegment(archiveName ?? path.basename(root));
+  const legacyRoots = new Set<string>([
+    path.join(parent, LEGACY_RUN_SESSION_TRACE_ARCHIVE_DIRECTORY, `run-${traceName}`),
+    ...(meshRoot ? [
+      path.join(meshRoot, LEGACY_RUN_SESSION_TRACE_ARCHIVE_DIRECTORY, traceName),
+      path.join(meshRoot, LEGACY_RUN_SESSION_TRACE_ARCHIVE_DIRECTORY, `run-${traceName}`),
+    ] : []),
+  ]);
+  const externalSources = new Map<string, string>();
+  const collectLegacy = (current: string, relative: string, namespace: string, depth: number): boolean => {
+    if (depth > 64) return false;
+    let entries: fs.Dirent[];
+    try { entries = fs.readdirSync(current, { withFileTypes: true }); } catch { return false; }
+    for (const entry of entries) {
+      const source = path.join(current, entry.name);
+      const relativePath = relative ? path.join(relative, entry.name) : entry.name;
+      const mapped = `${namespace}/${relativePath.split(path.sep).join("/")}`;
+      const stat = lstatIfPresent(source);
+      if (!stat || stat.isSymbolicLink()) return false;
+      if (stat.isDirectory()) {
+        if (!ownedStat(source)?.isDirectory() || !collectLegacy(source, relativePath, namespace, depth + 1)) return false;
+      } else if (stat.isFile()) {
+        const owned = ownedStat(source);
+        if (!owned?.isFile()) return false;
+        files.push({ path: mapped, ...traceIdentity(owned) });
+        externalSources.set(mapped, source);
+      } else return false;
+    }
+    return true;
+  };
+  for (const legacyRoot of legacyRoots) {
+    const legacyStat = lstatIfPresent(legacyRoot);
+    if (!legacyStat) continue;
+    if (!legacyStat.isDirectory() || legacyStat.isSymbolicLink() || !ownedStat(legacyRoot)?.isDirectory()) return false;
+    if (!collectLegacy(legacyRoot, "", `.legacy/${safeTraceSegment(path.basename(path.dirname(legacyRoot)))}/${safeTraceSegment(path.basename(legacyRoot))}`, 0)) return false;
+  }
+  if (files.length === 0) return true;
+  if (!meshRoot || !archive || typeof process.getuid !== "function" || isTraceArchivePath(root, meshRoot)) return false;
+  files.sort((left, right) => left.path.localeCompare(right.path));
+  const archiveRoot = path.dirname(path.dirname(path.dirname(archive)));
+  if (pathWithin(archive, root) || pathWithin(root, archive)) return false;
   const manifestPath = path.join(archive, RUN_SESSION_TRACE_ARCHIVE_MANIFEST);
   try {
     const archiveStat = lstatIfPresent(archive);
@@ -362,39 +510,86 @@ export const archiveRunSessionTraces = (directory: string, onlyPaths?: ReadonlyM
     const entries = new Map((prior?.files ?? []).map(entry => [entry.path, entry]));
     for (const file of files) {
       const existing = entries.get(file.path);
-      if (existing && (existing.dev !== file.dev || existing.ino !== file.ino || existing.size !== file.size || existing.mtimeMs !== file.mtimeMs)) return false;
+      if (existing && (existing.dev !== file.dev || existing.ino !== file.ino || existing.size !== file.size || existing.mtimeMs !== file.mtimeMs ||
+          existing.sha256 !== undefined && file.sha256 !== undefined && existing.sha256 !== file.sha256)) return false;
       if (!existing) entries.set(file.path, file);
     }
     const manifest: RunSessionTraceArchiveManifest = {
       format: 1,
       files: [...entries.values()].sort((left, right) => left.path.localeCompare(right.path)),
     };
-    if (!prior || manifest.files.length !== prior.files.length) writeJsonAtomic(manifestPath, manifest, { durable: true });
+    const persistManifest = (): void => writeJsonAtomic(manifestPath, manifest, { durable: true });
+    if (!prior || manifest.files.length !== prior.files.length) persistManifest();
 
     const syncDirectories = new Set([parent, archiveRoot, archive]);
     for (const entry of manifest.files) {
       const parts = entry.path.split("/");
       if (!entry.path || parts.some(part => !part || part === "." || part === "..")) return false;
-      const source = path.join(root, ...parts);
+      const source = externalSources.get(entry.path) ?? path.join(root, ...parts);
       const target = path.join(archive, ...parts);
       if (path.dirname(target) !== archive) mkdirPrivate(path.dirname(target), archive);
-      const sourceStat = lstatIfPresent(source), targetStat = lstatIfPresent(target);
+      let sourceStat = lstatIfPresent(source), targetStat = lstatIfPresent(target);
       if (sourceStat && (!ownedStat(source)?.isFile() || !sameTraceIdentity(sourceStat, entry))) return false;
-      if (targetStat && (!ownedStat(target)?.isFile() || !sameTraceIdentity(targetStat, entry))) return false;
-      if (sourceStat && targetStat || !sourceStat && !targetStat) return false;
-      if (sourceStat) {
-        const fd = fs.openSync(source, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+      if (targetStat && (!ownedStat(target)?.isFile() || !(sameTraceIdentity(targetStat, entry) || archiveTraceMatches(target, entry)))) return false;
+      if (!sourceStat && !targetStat) return false;
+      if (sourceStat && targetStat) {
+        if (!entry.sha256 || !archiveTraceMatches(target, entry)) return false;
+        const sourceFd = fs.openSync(source, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
         try {
-          if (!sameTraceIdentity(fs.fstatSync(fd), entry)) return false;
-          fs.fsyncSync(fd);
-        } finally { fs.closeSync(fd); }
-        if (!sameTraceIdentity(ownedStat(source)!, entry)) return false;
+          if (!sameTraceIdentity(fs.fstatSync(sourceFd), entry) || hashTraceDescriptor(sourceFd, entry.size) !== entry.sha256 ||
+              !sameTraceIdentity(fs.lstatSync(source), entry)) return false;
+          fs.unlinkSync(source);
+        } finally { fs.closeSync(sourceFd); }
+        syncDirectories.add(path.dirname(source));
+        continue;
+      }
+      if (targetStat) continue;
+      const fd = fs.openSync(source, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+      try {
+        if (!sameTraceIdentity(fs.fstatSync(fd), entry)) return false;
+        fs.fsyncSync(fd);
+      } finally { fs.closeSync(fd); }
+      if (!sameTraceIdentity(ownedStat(source)!, entry)) return false;
+      try {
         fs.renameSync(source, target);
         const archived = ownedStat(target);
         if (!archived || !sameTraceIdentity(archived, entry)) return false;
         syncDirectories.add(path.dirname(source));
         syncDirectories.add(path.dirname(target));
+        continue;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EXDEV") return false;
       }
+
+      // Cross-device fallback: never unlink the source until the durable copy and its digest are recorded.
+      const stagingDirectory = path.join(archive, ".staging");
+      mkdirPrivate(stagingDirectory, archive);
+      const stagingFile = path.join(stagingDirectory, `${createHash("sha256").update(entry.path).digest("hex")}.tmp`);
+      const digest = copyTraceToStaging(source, entry, stagingFile);
+      if (!digest) return false;
+      syncDirectoryChain(stagingDirectory);
+      const hashed: RunSessionTraceArchiveEntry = { ...entry, sha256: digest };
+      entries.set(entry.path, hashed);
+      manifest.files = [...entries.values()].sort((left, right) => left.path.localeCompare(right.path));
+      persistManifest();
+      const stagedStat = ownedStat(stagingFile), targetAfterCopy = lstatIfPresent(target);
+      if (!stagedStat?.isFile() || stagedStat.size !== entry.size || stagedStat.mtimeMs !== entry.mtimeMs || targetAfterCopy) return false;
+      const stagedFd = fs.openSync(stagingFile, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+      try { if (hashTraceDescriptor(stagedFd, entry.size) !== digest) return false; }
+      finally { fs.closeSync(stagedFd); }
+      fs.linkSync(stagingFile, target);
+      fs.unlinkSync(stagingFile);
+      syncDirectoryChain(path.dirname(target));
+      if (!archiveTraceMatches(target, hashed)) return false;
+      const sourceFd = fs.openSync(source, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+      try {
+        sourceStat = fs.lstatSync(source);
+        if (!sameTraceIdentity(fs.fstatSync(sourceFd), entry) || !sameTraceIdentity(sourceStat, entry) ||
+            hashTraceDescriptor(sourceFd, entry.size) !== digest || !archiveTraceMatches(target, hashed)) return false;
+        fs.unlinkSync(source);
+      } finally { fs.closeSync(sourceFd); }
+      syncDirectories.add(path.dirname(source));
+      syncDirectories.add(path.dirname(target));
     }
     for (const syncDirectory of syncDirectories) syncDirectoryChain(syncDirectory);
     return true;
@@ -650,6 +845,7 @@ const runTreeRefusal = (root: string, acceptPidReuse: boolean): string => {
 /** Explicit resident roots have no managed-temp owner. Require terminal status
  * plus checked process absence, and veto nested survivors and unresolved markers. */
 export const canRemoveTerminalRun = (directory: string, expired: Deadline = noDeadline, acceptPidReuse = false): boolean => {
+  if (isTraceArchivePath(directory)) return false;
   const record = readJson<RunRecordSummary>(path.join(directory, "status.json"));
   return !!record?.status && TERMINAL_STATUSES.has(record.status) && safeRunTree(directory, false, 0, expired, acceptPidReuse);
 };
@@ -657,7 +853,7 @@ const safeRootContents = (root: string, childrenStopped: boolean): boolean => {
   try {
     return fs.readdirSync(root).every((name) => {
       if (name === RUN_ROOT_OWNER_FILE) return true;
-      if (name === RUN_SESSION_TRACE_ARCHIVE_DIRECTORY) return !!ownedStat(path.join(root, name))?.isDirectory();
+      if (name === LEGACY_RUN_SESSION_TRACE_ARCHIVE_DIRECTORY) return !!ownedStat(path.join(root, name))?.isDirectory();
       return safeRunTree(path.join(root, name), childrenStopped);
     });
   } catch { return false; }
@@ -674,7 +870,8 @@ const recoverEnodevTask = (directory: string): void => {
 };
 /** Main's path-based recursive removal: the non-Linux fallback of verifiedRemove only (smarty-dev#7858). */
 const rmTree = (target: string) => (): boolean => { fs.rmSync(target, { recursive: true, force: true }); return true; };
-export const removeEmptyRunRoot = (root: string): boolean => {
+export const removeEmptyRunRoot = (root: string, meshRoot?: string): boolean => {
+  if (isTraceArchivePath(root, meshRoot)) return false;
   try {
     const judged = ownedStat(root);
     if (!judged?.isDirectory() || !validOwner(readJson<RunRootOwner>(ownerPath(root)))) return false;
@@ -683,16 +880,17 @@ export const removeEmptyRunRoot = (root: string): boolean => {
   } catch { return false; }
 };
 const pruneClosedRunRoot = (
-  root: string, owner: RunRootOwner, orphanMs: number, oneShotMs: number, now: number, expired: () => boolean,
+  root: string, owner: RunRootOwner, orphanMs: number, oneShotMs: number, now: number, expired: () => boolean, meshRoot?: string,
 ): string[] => {
   const removed: string[] = [];
+  if (isTraceArchivePath(root, meshRoot)) return removed;
   // Every run started after its root, so no run of a root younger than the shortest retention is due.
   if (now - owner.startedAt < Math.min(orphanMs, oneShotMs)) return removed;
   let entries: fs.Dirent[];
   try { entries = fs.readdirSync(root, { withFileTypes: true }); } catch { return removed; }
   for (const entry of entries) {
     if (expired()) break;
-    if (!entry.isDirectory() || entry.name === RUN_SESSION_TRACE_ARCHIVE_DIRECTORY) continue;
+    if (!entry.isDirectory() || entry.name === LEGACY_RUN_SESSION_TRACE_ARCHIVE_DIRECTORY) continue;
     const directory = path.join(root, entry.name);
     // Age first: a young run is kept either way, so it needs no full tree walk (smarty-dev#2010).
     const record = readJson<RunRecordSummary>(path.join(directory, "status.json"));
@@ -702,7 +900,7 @@ const pruneClosedRunRoot = (
     if (now - reference < retention) continue;
     if (!processAlive(owner.pid)) { recoverActorRunArchives(directory, expired); recoverEnodevTask(directory); }
     if (!safeRunTree(directory, owner.childrenStopped === true, 0, expired)) { countRefusal("pruneClosedRunRoot", "run tree is not proven safe", directory); continue; }
-    if (!archiveRunSessionTraces(directory)) { countRefusal("pruneClosedRunRoot", "raw session trace archive failed", directory); continue; }
+    if (!archiveRunSessionTraces(directory, undefined, meshRoot)) { countRefusal("pruneClosedRunRoot", "raw session trace archive failed", directory); continue; }
     // Archive moves change the run directory's mtime; judge the post-archive tree and walk it again.
     const judged = ownedStat(directory);
     if (!judged?.isDirectory() || !safeRunTree(directory, owner.childrenStopped === true, 0, expired)) {
@@ -815,6 +1013,7 @@ export const claimTempRunSweep = (tempRoot: string, minIntervalMs: number, now =
 };
 export interface TempRunSweepRequest extends TerminalRunEventsRetention {
   tempRoot: string;
+  meshRoot?: string;
   currentRoot?: string;
   orphanedTempRunRetentionMs: number;
   oneShotRunRetentionMs: number;
@@ -851,15 +1050,16 @@ export const sweepTempRunRoots = (options: TempRunSweepRequest & {
     if (expired()) break;
     if (!entry.isDirectory() || !/^pi-fabric-runs-[A-Za-z0-9_-]+$/.test(entry.name)) continue;
     const root = path.join(options.tempRoot, entry.name);
+    if (isTraceArchivePath(root, options.meshRoot)) continue;
     if (options.currentRoot && path.resolve(root) === path.resolve(options.currentRoot)) continue;
     if (!ownedStat(root)?.isDirectory()) continue;
     const owner = readJson<RunRootOwner>(ownerPath(root));
     if (!validOwner(owner)) continue;
     if (owner.closedAt !== undefined) {
       result.removedRuns.push(...pruneClosedRunRoot(
-        root, owner, options.orphanedTempRunRetentionMs, options.oneShotRunRetentionMs, now, expired,
+        root, owner, options.orphanedTempRunRetentionMs, options.oneShotRunRetentionMs, now, expired, options.meshRoot,
       ));
-      if (removeEmptyRunRoot(root)) result.removedRoots.push(root);
+      if (removeEmptyRunRoot(root, options.meshRoot)) result.removedRoots.push(root);
       continue;
     }
     if (processAlive(owner.pid)) continue;
@@ -874,12 +1074,12 @@ export const sweepTempRunRoots = (options: TempRunSweepRequest & {
     try { runs = fs.readdirSync(root, { withFileTypes: true }); } catch { continue; }
     for (const run of runs) {
       if (expired()) break;
-      if (run.name === RUN_ROOT_OWNER_FILE || run.name === RUN_SESSION_TRACE_ARCHIVE_DIRECTORY || !run.isDirectory()) continue;
+      if (run.name === RUN_ROOT_OWNER_FILE || run.name === LEGACY_RUN_SESSION_TRACE_ARCHIVE_DIRECTORY || !run.isDirectory()) continue;
       const directory = path.join(root, run.name);
       recoverActorRunArchives(directory, expired);
       recoverEnodevTask(directory);
       if (!safeRunTree(directory, false, 0, expired)) { countRefusal("sweepTempRunRoots", "run tree is not proven safe", directory); continue; }
-      if (!archiveRunSessionTraces(directory)) { countRefusal("sweepTempRunRoots", "raw session trace archive failed", directory); continue; }
+      if (!archiveRunSessionTraces(directory, undefined, options.meshRoot)) { countRefusal("sweepTempRunRoots", "raw session trace archive failed", directory); continue; }
       const judged = ownedStat(directory);
       if (!judged?.isDirectory() || !safeRunTree(directory, false, 0, expired)) {
         countRefusal("sweepTempRunRoots", "run tree changed during trace archival", directory); continue;
@@ -887,7 +1087,7 @@ export const sweepTempRunRoots = (options: TempRunSweepRequest & {
       // Reported as the root's removal once it is empty, as before.
       verifiedRemove(directory, judged, { deleter: "sweepTempRunRoots", fallback: rmTree(directory) });
     }
-    if (removeEmptyRunRoot(root)) result.removedRoots.push(root);
+    if (removeEmptyRunRoot(root, options.meshRoot)) result.removedRoots.push(root);
   }
   return result;
 };
@@ -1002,6 +1202,7 @@ export const actorRunReferencedNow = (actorRoots: readonly string[], runId: stri
 export interface TerminalRunEventsRetention {
   terminalRunEventsAgeMs?: number;
   terminalRunEventsMaxBytes?: number;
+  meshRoot?: string;
 }
 
 const TERMINAL_EVENT_TAIL_LINES = 200;
@@ -1023,7 +1224,8 @@ export const compactTerminalRunEvents = (
   const expired = options.expired ?? noDeadline;
   const directoryStat = ownedStat(directory);
   if (!Number.isSafeInteger(ageMs) || ageMs < 0 || !Number.isSafeInteger(maxBytes) ||
-      maxBytes < EVENT_TAIL_MARKER.length || expired() || options.isRetained?.() || !directoryStat?.isDirectory()) return false;
+      maxBytes < EVENT_TAIL_MARKER.length || expired() || options.isRetained?.() || !directoryStat?.isDirectory() ||
+      isTraceArchivePath(directory, options.meshRoot)) return false;
   const record = readJson<RunRecordSummary>(path.join(directory, "status.json"));
   if (!record?.status || !TERMINAL_STATUSES.has(record.status) ||
       now - recordAgeReference(record, ownedStat(directory)?.mtimeMs ?? now) < ageMs) return false;
@@ -1131,12 +1333,12 @@ const publishExclusive = (file: string, data: Buffer): boolean => {
 
 /** Session rotation backups are raw transcripts; no age/size policy may unlink them before a durable archive path exists. */
 export const pruneActorSessionBackups = (sessionFile: string, options: {
-  dryRun?: boolean; onPrune?: (change: { path: string; bytes: number }) => void;
+  dryRun?: boolean; meshRoot?: string; onPrune?: (change: { path: string; bytes: number }) => void;
   /** Asked right before each unlink; true stops the prune there (smarty-dev#7766: a hold or epoch change mid-prune). */
   stop?: () => boolean;
 } = {}): string[] => {
   const directory = path.dirname(sessionFile);
-  if (!ownedStat(directory)?.isDirectory()) return [];
+  if (isTraceArchivePath(directory, options.meshRoot) || !ownedStat(directory)?.isDirectory()) return [];
   const prefix = `${path.basename(sessionFile)}.`;
   try {
     const backups = fs.readdirSync(directory).flatMap(name => {
@@ -1175,6 +1377,7 @@ export const pruneActorSessionBackups = (sessionFile: string, options: {
 
 export const pruneActorRunArchives = (options: {
   runsDirectory: string;
+  meshRoot?: string;
   latestRunId?: string;
   retentionMs: number;
   terminalRunEventsAgeMs?: number;
@@ -1196,7 +1399,7 @@ export const pruneActorRunArchives = (options: {
 }): string[] => {
   const now = options.now ?? Date.now();
   const removed: string[] = [];
-  if (!ownedStat(options.runsDirectory)?.isDirectory()) return removed;
+  if (isTraceArchivePath(options.runsDirectory, options.meshRoot) || !ownedStat(options.runsDirectory)?.isDirectory()) return removed;
   let entries: fs.Dirent[];
   try { entries = fs.readdirSync(options.runsDirectory, { withFileTypes: true }); } catch { return removed; }
   for (const entry of entries) {
@@ -1217,7 +1420,7 @@ export const pruneActorRunArchives = (options: {
       compactTerminalRunEvents(directory, {
         ...(options.terminalRunEventsAgeMs !== undefined ? { terminalRunEventsAgeMs: options.terminalRunEventsAgeMs } : {}),
         ...(options.terminalRunEventsMaxBytes !== undefined ? { terminalRunEventsMaxBytes: options.terminalRunEventsMaxBytes } : {}),
-        now, isRetained: () => !!options.isRetained?.(entry.name),
+        now, isRetained: () => !!options.isRetained?.(entry.name), ...(options.meshRoot ? { meshRoot: options.meshRoot } : {}),
         ...(options.dryRun !== undefined ? { dryRun: options.dryRun } : {}),
         ...(options.onCompact ? { onCompact: options.onCompact } : {}),
       });
@@ -1226,7 +1429,7 @@ export const pruneActorRunArchives = (options: {
     const bytes = options.measure?.(directory) ?? 0;
     const isRetained = options.isRetained;
     if (!removeUnreferencedRun(directory, judged, isRetained && (() => isRetained(entry.name, true)), options.dryRun, "pruneActorRunArchives", bytes,
-      options.acceptPidReuse === true)) continue;
+      options.acceptPidReuse === true, options.meshRoot)) continue;
     removed.push(directory);
     options.onRemove?.(directory, bytes);
   }
@@ -1246,13 +1449,14 @@ export const pruneActorRunArchives = (options: {
  * next sweep treats it as an ordinary run entry. */
 export const removeUnreferencedRun = (
   directory: string, judged: fs.Stats | undefined, referenced?: () => boolean, dryRun = false, deleter = "removeUnreferencedRun",
-  bytes = 0, acceptPidReuse = false,
+  bytes = 0, acceptPidReuse = false, meshRoot?: string,
 ): boolean => {
+  if (isTraceArchivePath(directory, meshRoot)) return false;
   const check = (): boolean => { try { return !!referenced?.(); } catch { return true; } };
   if (check()) { countRefusal(deleter, "referenced at the final check", directory, bytes); return false; }
   let finalJudged = judged;
   if (!dryRun) {
-    if (!archiveRunSessionTraces(directory)) {
+    if (!archiveRunSessionTraces(directory, undefined, meshRoot)) {
       countRefusal(deleter, "raw session trace archive failed", directory, bytes); return false;
     }
     const archived = ownedStat(directory);

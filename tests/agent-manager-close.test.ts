@@ -8,7 +8,7 @@ import { AgentManager } from "../src/agents/manager.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { activeBudgetState, appendBudgetLedger, readBudgetLedger } from "../src/agents/budget-ledger.js";
-import { hasUnresolvedWorker, runTreeExitVeto } from "../src/storage/retention.js";
+import { hasUnresolvedWorker, runSessionTraceArchivePath, runTreeExitVeto } from "../src/storage/retention.js";
 import { processAlive } from "../src/storage/scratch.js";
 import * as agentRemoval from "../src/agents/rm.js";
 import * as retention from "../src/storage/retention.js";
@@ -18,18 +18,19 @@ const managers: AgentManager[] = [];
 const roots: string[] = [];
 const setup = (retainRuns = true, extra: ConstructorParameters<typeof AgentManager>[2] = {}) => {
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "manager-close-test-"));
-  roots.push(tempRoot);
+  const meshRoot = fs.mkdtempSync(path.join(os.tmpdir(), "manager-close-mesh-"));
+  roots.push(tempRoot, meshRoot);
   vi.spyOn(os, "tmpdir").mockReturnValue(tempRoot);
   vi.stubEnv("PI_FABRIC_RUN_ROOT", undefined);
   vi.stubEnv("PI_FABRIC_DEPTH", "0");
   for (const key of ["PI_FABRIC_BUDGET", "PI_FABRIC_BUDGET_FILE", "PI_FABRIC_BUDGET_ID"]) vi.stubEnv(key, undefined);
   const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, maxConcurrent: 1, retainRuns, transport: "process", sessionExport: false }, {
-    workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
+    workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), meshRoot,
     sweepPath: path.resolve("dist/storage/sweep-main.js"), ...extra,
   });
   managers.push(manager);
   const name = fs.readdirSync(tempRoot).find((name) => name.startsWith("pi-fabric-runs-"));
-  return { manager, tempRoot, root: name ? path.join(tempRoot, name) : extra.runRoot! };
+  return { manager, tempRoot, meshRoot, root: name ? path.join(tempRoot, name) : extra.runRoot! };
 };
 afterEach(async () => {
   await Promise.allSettled(managers.splice(0).map((manager) => manager.close()));
@@ -105,7 +106,7 @@ describe("AgentManager close storage", () => {
       return interval(callback, ms, ...args);
     }) as typeof setInterval);
     const detachedSweep = vi.spyOn(retention, "claimTempRunSweep").mockReturnValue(false);
-    const { manager, root } = setup(false, {
+    const { manager, meshRoot } = setup(false, {
       retention: { ...DEFAULT_FABRIC_CONFIG.retention, oneShotRunMs: 1_000 },
     });
     let clock: ReturnType<typeof vi.spyOn> | undefined;
@@ -132,7 +133,7 @@ describe("AgentManager close storage", () => {
       }
       clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 2_000);
       sweep!();
-      const archive = path.join(root, retention.RUN_SESSION_TRACE_ARCHIVE_DIRECTORY, `run-${result.id}`);
+      const archive = runSessionTraceArchivePath(meshRoot, run, result.id);
       if (failArchive) {
         await vi.waitFor(() => expect(fs.existsSync(path.join(archive, "events.jsonl"))).toBe(true), { timeout: 2_000 });
         expect(fs.existsSync(run)).toBe(true);
@@ -247,7 +248,7 @@ describe("AgentManager close storage", () => {
     // existing real-delete tests below belong to hosted CI, not a fleet lane.
     vi.spyOn(retention, "claimTempRunSweep").mockReturnValue(false);
     const remove = vi.spyOn(agentRemoval, "removeTree").mockResolvedValue(undefined);
-    const { manager, root } = setup(false);
+    const { manager, root, meshRoot } = setup(false);
     const result = await manager.run({ task: "hello", runner: "pi", extensions: false });
     const directory = path.join(root, result.id);
     const store = path.join(directory, "durable", "initial", "store");
@@ -256,7 +257,7 @@ describe("AgentManager close storage", () => {
     fs.writeFileSync(path.join(store, "main.jsonl"), "{}\n");
     expect(retention.canRemoveTerminalRun(directory)).toBe(true);
     await manager.close();
-    expect(remove).toHaveBeenCalledWith(directory);
+    expect(remove).toHaveBeenCalledWith(directory, undefined, meshRoot);
     expect(fs.readFileSync(path.join(store, "main.jsonl"), "utf8")).toBe("{}\n");
     expect(fs.existsSync(root)).toBe(true);
   });

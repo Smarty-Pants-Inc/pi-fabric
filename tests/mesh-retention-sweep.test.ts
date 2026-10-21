@@ -4,7 +4,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MESH_RETENTION_APPLY_DISABLED_CODE, MeshRetentionApplyDisabledError, summaryLines, sweepMeshRetention } from "../src/storage/retention-cli.js";
 import { MeshStore } from "../src/mesh/store.js";
-import { claimMeshRetentionSweep, MESH_RETENTION_SWEEP_PREFIX, recordMeshRetentionSweeper, removeUnreferencedRun, startLockedMeshRetentionSweep } from "../src/storage/retention.js";
+import { claimMeshRetentionSweep, MESH_RETENTION_SWEEP_PREFIX, recordMeshRetentionSweeper, removeUnreferencedRun, runSessionTraceArchivePath, startLockedMeshRetentionSweep } from "../src/storage/retention.js";
 import { spawn, type ChildProcess } from "node:child_process";
 import { ActorManager, FABRIC_RETENTION_SWEEP_LOCK_ALARM_TOPIC, MESH_RETENTION_SWEEP_INTERVAL_MS } from "../src/actors/manager.js";
 import { AgentManager } from "../src/agents/manager.js";
@@ -646,18 +646,22 @@ describe("final pre-delete check fences", () => {
 
   it.skipIf(process.platform !== "linux")("re-checks after the graveyard move and restores a run referenced in between", () => {
     const runs = tmp("fabric-tombstone-");
+    const meshRoot = tmp("fabric-tombstone-mesh-");
     const target = run(path.join(runs, "target"), { status: "completed", finishedAt: 1 });
     const judged = () => fs.lstatSync(target);
+    const remove = (referenced?: () => boolean, dryRun = false) =>
+      removeUnreferencedRun(target, judged(), referenced, dryRun, "removeUnreferencedRun", 0, false, meshRoot);
     let calls = 0;
-    expect(removeUnreferencedRun(target, judged(), () => ++calls > 1)).toBe(false);
+    expect(remove(() => ++calls > 1)).toBe(false);
     expect(calls).toBe(2);
-    expect(fs.readdirSync(runs).sort()).toEqual([".pi-fabric-session-traces", "target"].sort());
+    expect(fs.readdirSync(runs)).toEqual(["target"]);
     expect(fs.readFileSync(path.join(target, "reply.json"), "utf8")).toBe('{"text":"done"}');
-    expect(removeUnreferencedRun(target, judged(), () => { throw new Error("unreadable"); })).toBe(false);
-    expect(removeUnreferencedRun(target, judged(), () => false, true)).toBe(true);
-    expect(fs.readdirSync(runs).sort()).toEqual([".pi-fabric-session-traces", "target"].sort());
-    expect(removeUnreferencedRun(target, judged(), () => false)).toBe(true);
-    expect(fs.readdirSync(runs)).toEqual([".pi-fabric-session-traces"]);
+    expect(remove(() => { throw new Error("unreadable"); })).toBe(false);
+    expect(remove(() => false, true)).toBe(true);
+    expect(fs.readdirSync(runs)).toEqual(["target"]);
+    expect(remove(() => false)).toBe(true);
+    expect(fs.readdirSync(runs)).toEqual([]);
+    expect(fs.existsSync(path.join(runSessionTraceArchivePath(meshRoot, target), "events.jsonl"))).toBe(true);
   });
 });
 

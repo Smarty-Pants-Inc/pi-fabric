@@ -22,7 +22,7 @@ vi.mock("../src/agents/rm.js", () => ({
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { AgentManager } from "../src/agents/manager.js";
 import type { AgentRunRecord } from "../src/agents/types.js";
-import { sweepTempRunRoots } from "../src/storage/retention.js";
+import { runSessionTraceArchivePath, sweepTempRunRoots } from "../src/storage/retention.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { processAlive } from "../src/storage/scratch.js";
 import { fakeManagerHeapWorker } from "./fixtures/manager-heap-probe.js";
@@ -43,12 +43,14 @@ const fixture = (agents: Partial<typeof DEFAULT_FABRIC_CONFIG.agents> = {}, expl
   vi.stubEnv("PI_FABRIC_DEPTH", "0");
   for (const key of ["PI_FABRIC_BUDGET", "PI_FABRIC_BUDGET_FILE", "PI_FABRIC_BUDGET_ID"]) vi.stubEnv(key, undefined);
   const runRoot = explicitRoot ? path.join(tempRoot, "explicit-runs") : undefined;
+  const meshRoot = fs.mkdtempSync(path.join(nativeTempRoot, "agent-prompt-mesh-"));
+  roots.push(meshRoot);
   const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, sessionExport: false, ...agents, retainRuns: false }, {
-    workerPath, ...(runRoot ? { runRoot } : {}),
+    workerPath, meshRoot, ...(runRoot ? { runRoot } : {}),
   });
   managers.push(manager);
   const root = runRoot ?? path.join(tempRoot, fs.readdirSync(tempRoot).find(name => name.startsWith("pi-fabric-runs-"))!);
-  return { root, tempRoot, manager };
+  return { root, tempRoot, meshRoot, manager };
 };
 
 // Queued rollback bypasses removeTree. Keep this narrow fence registered through
@@ -129,7 +131,7 @@ describe("Agent prompt retention at manager close (#11663)", () => {
   });
 
   it("archives raw traces before pruning artifacts from a failed terminal run", async () => {
-    const { root, manager } = fixture();
+    const { meshRoot, manager } = fixture();
     const handle = await manager.spawn({ task: "FAIL_DIRECTIVE\narchive terminal artifacts", transport: "process" });
     await expect(manager.wait(handle.id)).resolves.toMatchObject({ status: "failed" });
     const directory = manager.runDirectory(handle.id)!;
@@ -145,7 +147,7 @@ describe("Agent prompt retention at manager close (#11663)", () => {
 
     await manager.close();
 
-    const archive = path.join(root, ".pi-fabric-session-traces", `run-${handle.id}`);
+    const archive = runSessionTraceArchivePath(meshRoot, directory, handle.id);
     for (const [name, content] of traces) {
       expect(fs.existsSync(path.join(directory, name))).toBe(false);
       expect(fs.readFileSync(path.join(archive, name), "utf8")).toBe(content);

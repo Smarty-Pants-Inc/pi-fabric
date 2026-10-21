@@ -7,6 +7,7 @@ import { ResidencyClient } from "../src/residency/client.js";
 import { ResidentHost } from "../src/residency/host.js";
 import { ResidentRequestRetention } from "../src/residency/retention.js";
 import { RESIDENT_REQUEST_RETENTION_MS, residentRequestGeneration } from "../src/residency/request-expiry.js";
+import { runSessionTraceArchivePath } from "../src/storage/retention.js";
 import { readResidentRequestDecision, residentRoot, residentResultPath, type ResidentHostConfig } from "../src/residency/protocol.js";
 import type { FabricMainAgentTarget } from "../src/main-agent.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
@@ -181,7 +182,7 @@ const runCachedRetryCase = async (operation: "spawnBound" | "createActor") => {
       const trace = path.join(runDirectory, "session.jsonl");
       fs.writeFileSync(trace, "resident raw session transcript\n");
       await fixture.client.cleanupAgent(first.id);
-      const archived = path.join(path.dirname(runDirectory), ".pi-fabric-session-traces", `run-${path.basename(runDirectory)}`, "session.jsonl");
+      const archived = path.join(runSessionTraceArchivePath(fixture.config.meshRoot, runDirectory), "session.jsonl");
       expect(fs.existsSync(trace)).toBe(false);
       expect(fs.readFileSync(archived, "utf8")).toBe("resident raw session transcript\n");
     } else await fixture.client.removeActor(first.id);
@@ -213,7 +214,7 @@ it("offline cleanup archives every trace and refuses run/result deletion after a
     });
     await expect(fixture.client.cleanupAgent(handle.id)).rejects.toThrow();
     rename.mockRestore();
-    const archive = path.join(path.dirname(runDirectory), ".pi-fabric-session-traces", `run-${path.basename(runDirectory)}`);
+    const archive = runSessionTraceArchivePath(fixture.config.meshRoot, runDirectory);
     expect(fs.existsSync(runDirectory)).toBe(true);
     expect(fs.readFileSync(trace, "utf8")).toBe("offline raw transcript\n");
     expect(fs.existsSync(path.join(archive, "events.jsonl"))).toBe(true);

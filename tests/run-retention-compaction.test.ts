@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { compactTerminalRunEvents, pruneActorRunArchives, markRunRootActive, markRunRootClosed, sweepTempRunRoots, FABRIC_RUN_ROOT_PREFIX, RUN_SESSION_TRACE_ARCHIVE_DIRECTORY, runTreeExitVeto } from "../src/storage/retention.js";
+import { compactTerminalRunEvents, pruneActorRunArchives, markRunRootActive, markRunRootClosed, sweepTempRunRoots, FABRIC_RUN_ROOT_PREFIX, runSessionTraceArchivePath, runTreeExitVeto } from "../src/storage/retention.js";
 import { ActorLogStore } from "../src/actors/log-store.js";
 
 const roots: string[] = [];
@@ -10,12 +10,14 @@ const HOUR = 3600000;
 const now = 10 * HOUR;
 const log = Array.from({ length: 401 }, (_, sequence) => JSON.stringify({ sequence }) + "\n").join("");
 const make = (record: Record<string, unknown> = {}) => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-tail-")); roots.push(root);
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-tail-"));
+  const meshRoot = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-tail-mesh-"));
+  roots.push(root, meshRoot);
   const run = path.join(root, "runs", "old"); fs.mkdirSync(run, { recursive: true });
   fs.writeFileSync(path.join(run, "status.json"), JSON.stringify({ status: "completed", finishedAt: 4 * HOUR, transport: "process", sessionId: "2147483647", ...record }));
   fs.writeFileSync(path.join(run, "events.jsonl"), log);
   fs.writeFileSync(path.join(run, "reply.json"), '{"text":"retained result"}');
-  return { root, run };
+  return { root, meshRoot, run };
 };
 const snapshot = (run: string) => fs.readdirSync(run).sort().map(name => {
   const file = path.join(run, name); const stat = fs.statSync(file);
@@ -25,7 +27,7 @@ afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursiv
 
 describe("six-hour terminal run compaction", () => {
   it("atomically keeps the final 200 events at six hours even below the byte cap, with status/result and TTL unchanged", () => {
-    const { root, run } = make();
+    const { root, meshRoot, run } = make();
     fs.utimesSync(run, 4 * HOUR / 1000, 4 * HOUR / 1000);
     const directoryMtime = fs.statSync(run).mtimeMs;
     const status = fs.readFileSync(path.join(run, "status.json"), "utf8");
@@ -45,9 +47,9 @@ describe("six-hour terminal run compaction", () => {
     const before = snapshot(run);
     expect(compactTerminalRunEvents(run, { now })).toBe(false);
     expect(snapshot(run)).toEqual(before);
-    expect(pruneActorRunArchives({ runsDirectory: path.join(root, "runs"), retentionMs: 7 * 24 * HOUR, now })).toEqual([]);
-    expect(pruneActorRunArchives({ runsDirectory: path.join(root, "runs"), retentionMs: 7 * 24 * HOUR, now: 4 * HOUR + 7 * 24 * HOUR })).toEqual([run]);
-    const archived = path.join(root, "runs", RUN_SESSION_TRACE_ARCHIVE_DIRECTORY, "run-old");
+    expect(pruneActorRunArchives({ runsDirectory: path.join(root, "runs"), meshRoot, retentionMs: 7 * 24 * HOUR, now })).toEqual([]);
+    expect(pruneActorRunArchives({ runsDirectory: path.join(root, "runs"), meshRoot, retentionMs: 7 * 24 * HOUR, now: 4 * HOUR + 7 * 24 * HOUR })).toEqual([run]);
+    const archived = runSessionTraceArchivePath(meshRoot, run);
     expect(fs.readFileSync(path.join(archived, "events.jsonl.raw"), "utf8")).toBe(log);
     expect(fs.existsSync(path.join(archived, "events.jsonl"))).toBe(true);
   });
@@ -102,7 +104,7 @@ describe("six-hour terminal run compaction", () => {
   });
 
   it("keeps closed one-shot events byte-for-byte until expiry, then archives the full log before removal", () => {
-    const { root, run } = make();
+    const { root, meshRoot, run } = make();
     const managed = path.join(root, FABRIC_RUN_ROOT_PREFIX + "closed");
     fs.mkdirSync(managed);
     const moved = path.join(managed, "old");
@@ -111,11 +113,11 @@ describe("six-hour terminal run compaction", () => {
     const original = fs.readFileSync(eventFile, "utf8");
     const originalMtime = fs.statSync(eventFile).mtimeMs;
     markRunRootActive(managed, 4 * HOUR); markRunRootClosed(managed, 4 * HOUR, true);
-    const sweep = (at: number) => sweepTempRunRoots({ tempRoot: root, now: at, orphanedTempRunRetentionMs: 24 * HOUR, oneShotRunRetentionMs: 24 * HOUR });
+    const sweep = (at: number) => sweepTempRunRoots({ tempRoot: root, meshRoot, now: at, orphanedTempRunRetentionMs: 24 * HOUR, oneShotRunRetentionMs: 24 * HOUR });
     expect(sweep(now).removedRuns).toEqual([]);
     expect(fs.readFileSync(eventFile, "utf8")).toBe(original);
     expect(sweep(28 * HOUR).removedRuns).toEqual([moved]);
-    const archived = path.join(managed, RUN_SESSION_TRACE_ARCHIVE_DIRECTORY, "run-old", "events.jsonl");
+    const archived = path.join(runSessionTraceArchivePath(meshRoot, moved), "events.jsonl");
     expect(fs.existsSync(moved)).toBe(false);
     expect(fs.readFileSync(archived, "utf8")).toBe(original);
     expect(fs.statSync(archived).mtimeMs).toBe(originalMtime);

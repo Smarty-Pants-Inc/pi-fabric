@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { removeTree } from "../src/agents/rm.js";
+import { runSessionTraceArchivePath } from "../src/storage/retention.js";
 
 describe("removeTree", () => {
   it("removes a directory tree", async () => {
@@ -15,6 +16,7 @@ describe("removeTree", () => {
 
   it("archives raw traces before recursive cleanup", async () => {
     const parent = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-rm-traces-"));
+    const meshRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-rm-mesh-"));
     const directory = path.join(parent, "run");
     fs.mkdirSync(directory);
     const traces = new Map([["session.jsonl", "raw session\n"], ["route-session.jsonl", "raw route\n"], ["events.jsonl", "raw events\n"]]);
@@ -25,19 +27,23 @@ describe("removeTree", () => {
       fs.utimesSync(file, new Date(1_000), new Date(1_000));
       mtimes.set(name, fs.statSync(file).mtimeMs);
     }
-    await removeTree(directory);
+    await removeTree(directory, undefined, meshRoot);
     expect(fs.existsSync(directory)).toBe(false);
-    const archive = path.join(parent, ".pi-fabric-session-traces", "run-run");
+    const archive = runSessionTraceArchivePath(meshRoot, directory);
     for (const [name, content] of traces) {
       const file = path.join(archive, name);
       expect(fs.readFileSync(file, "utf8")).toBe(content);
       expect(fs.statSync(file).mtimeMs).toBe(mtimes.get(name));
     }
+    await expect(removeTree(archive, undefined, meshRoot)).rejects.toThrow("durable session trace archives are excluded from cleanup");
+    expect(fs.existsSync(path.join(archive, "session.jsonl"))).toBe(true);
     fs.rmSync(parent, { recursive: true, force: true });
+    fs.rmSync(meshRoot, { recursive: true, force: true });
   });
 
   it("refuses recursive cleanup when trace archival fails", async () => {
     const parent = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-rm-trace-failure-"));
+    const meshRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-rm-mesh-failure-"));
     const directory = path.join(parent, "run");
     fs.mkdirSync(directory);
     for (const name of ["session.jsonl", "route-session.jsonl", "events.jsonl"]) fs.writeFileSync(path.join(directory, name), `raw ${name}\n`);
@@ -51,14 +57,15 @@ describe("removeTree", () => {
     await expect(removeTree(directory, async (target, options) => {
       deleteCalls++;
       return fs.promises.rm(target, options);
-    })).rejects.toThrow("raw session trace archive failed");
+    }, meshRoot)).rejects.toThrow("raw session trace archive failed");
     expect(deleteCalls).toBe(0);
     expect(fs.existsSync(directory)).toBe(true);
     expect(fs.readFileSync(failedSource, "utf8")).toBe("raw route-session.jsonl\n");
     rename.mockRestore();
-    await removeTree(directory);
+    await removeTree(directory, undefined, meshRoot);
     expect(fs.existsSync(directory)).toBe(false);
     fs.rmSync(parent, { recursive: true, force: true });
+    fs.rmSync(meshRoot, { recursive: true, force: true });
   });
 
   it.each(["ENOTEMPTY", "EBUSY"])("retries on transient %s and then succeeds", async (code) => {

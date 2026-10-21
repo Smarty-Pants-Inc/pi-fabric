@@ -379,7 +379,7 @@ export class ResidentHost {
   #stateProjector: Promise<StateProjector | undefined> | undefined;
   readonly #publications = new Set<Promise<unknown>>();
   #effectiveConfig: (() => ResidentHostConfig) | undefined;
-  readonly #retention: ResidentHostConfig["retention"] & { retainRuns: boolean };
+  readonly #retention: ResidentHostConfig["retention"] & { retainRuns: boolean; meshRoot: string };
 
   constructor(
     readonly config: ResidentHostConfig,
@@ -406,7 +406,7 @@ export class ResidentHost {
     this.#deliveryOutboxPath = path.join(config.residencyRoot, "delivery-outbox");
     // All resident collectors share one mutable policy, not the constructor's
     // config snapshot (nor the process-wide default object).
-    this.#retention = { ...config.retention, retainRuns: config.agents.retainRuns };
+    this.#retention = { ...config.retention, retainRuns: config.agents.retainRuns, meshRoot: config.meshRoot };
     this.#requestRetention = new ResidentRequestRetention(config.residencyRoot,
       [...new Set(Object.values(residentActorRoots(config)))], this.#retention,
       (directory, expired = () => false) => {

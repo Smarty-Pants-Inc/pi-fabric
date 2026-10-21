@@ -15,6 +15,7 @@ import type { AgentWriteReceipt } from "./write-receipt.js";
 import type { InheritedSessionPin } from "./session-pins.js";
 import type { AgentWorktreeResult } from "./worktree-manager.js";
 import type { AgentUndeliveredMessage } from "./terminal-target.js";
+import type { FabricActorActivationIdentity } from "../actors/activation-identity.js";
 
 /** Fabric run transports plus adapter-owned ("hosted") runs. */
 export type AgentRunTransport = FabricAgentTransport | "hosted";
@@ -174,6 +175,8 @@ export interface AgentRunRequest {
   inferenceContext?: "full-history" | "activation";
   actorId?: string;
   actorName?: string;
+  /** Host-only immutable identity for this actor activation; never a provider argument. */
+  actorSelf?: FabricActorActivationIdentity;
   capabilityRequirements?: string[];
   capabilityDigest?: string;
   meshRoot?: string;

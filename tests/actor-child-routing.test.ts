@@ -12,7 +12,7 @@ import { CapturedToolCatalog } from "../src/capture/catalog.js";
 import { DEFAULT_FABRIC_CONFIG, normalizeFabricConfig } from "../src/config.js";
 import { FabricRuntimeState } from "../src/fabric-runtime-state.js";
 import { MeshStore } from "../src/mesh/store.js";
-import type { AgentHandleInfo, AgentRunResult } from "../src/agents/types.js";
+import type { AgentHandleInfo, AgentRunRequest, AgentRunResult } from "../src/agents/types.js";
 import type { FabricActorValidWhileSource } from "../src/actors/types.js";
 
 const roots: string[] = [];
@@ -56,14 +56,16 @@ const setup = async (residency: "session" | "durable", notifyOnComplete = true, 
   const owner = makeOwner();
   cleanups.push(() => owner.close());
   const actor = await owner.create({
-    name: "independent-review", instructions: "Review without leaking your sub-results.",
+    name: "independent-review", instructions: "Review without leaking your sub-results.\n\n(role reviewer.md 0123456789ab)",
     residency, delivery: "mailbox", responseMode, transport: "process", model: "fixture/review",
     ...(validWhile ? { validWhile } : {}),
   });
   const actorRunId = "a".repeat(32);
   let endActivation!: () => void;
   const activation = new Promise<void>((resolve) => { endActivation = resolve; });
+  const actorRequests: AgentRunRequest[] = [];
   vi.spyOn(ownerAgents, "run").mockImplementationOnce(async (request, _signal, onStart) => {
+    actorRequests.push(request);
     onStart?.({ id: actorRunId, name: actor.name, status: "running", runner: "pi", transport: "process", cwd: root });
     await activation;
     return {
@@ -82,6 +84,7 @@ const setup = async (residency: "session" | "durable", notifyOnComplete = true, 
   vi.stubEnv("PI_FABRIC_SESSION_ID", "root-main");
   vi.stubEnv("PI_FABRIC_ACTOR_ID", actor.id);
   vi.stubEnv("PI_FABRIC_ACTOR_NAME", actor.name);
+  vi.stubEnv("PI_FABRIC_ACTOR_SELF", JSON.stringify(actorRequests[0]!.actorSelf));
   vi.stubEnv("PI_FABRIC_PARENT_RUN", actorRunId);
   vi.stubEnv("PI_FABRIC_GRANTED_RISKS", "agent");
   vi.stubEnv("PI_FABRIC_ACTOR_SESSION_FILE", actor.sessionFile);
@@ -129,10 +132,28 @@ const setup = async (residency: "session" | "durable", notifyOnComplete = true, 
   const spawn = (task = "private review sub-result") => runtime.registry.invoke("agents.spawn", {
     task, name: "review-subtask", transport: "process", model: "fixture/review",
   }, invocation) as Promise<AgentHandleInfo>;
-  return { actor, actorRunId, owner, ownerAgents, mesh, runtime, invocation, rootDeliveries, sendMessage, boundary, spawn, endActivation, makeOwner, resolveModel, initialize };
+  return { actor, actorRunId, actorRequests, owner, ownerAgents, mesh, runtime, invocation, rootDeliveries, sendMessage, boundary, spawn, endActivation, makeOwner, resolveModel, initialize };
 };
 
 describe.each(["session", "durable"] as const)("%s actor process children", (residency) => {
+  it("exposes only its immutable activation identity through agents.self and actorStatus", async () => {
+    const h = await setup(residency);
+    const identity = h.actorRequests[0]!.actorSelf!;
+    expect(identity).toEqual({ actorId: h.actor.id, name: h.actor.name, rootId: h.actor.rootId,
+      ownershipToken: h.actor.ownershipToken, instructionsDigest: h.actor.instructionsDigest,
+      roleStamp: "(role reviewer.md 0123456789ab)" });
+    expect(await h.runtime.registry.invoke("agents.self", {}, h.invocation)).toMatchObject({ actor: identity });
+    await expect(h.runtime.registry.invoke("agents.actorStatus", { id: h.actor.id }, h.invocation)).resolves.toMatchObject({
+      id: identity.actorId, name: identity.name, rootId: identity.rootId, ownershipToken: identity.ownershipToken,
+      instructionsDigest: identity.instructionsDigest, roleStamp: identity.roleStamp, status: "unknown",
+    });
+
+    const other = await h.owner.create({ name: "other-reviewer", instructions: "A different actor.",
+      residency, delivery: "mailbox", transport: "process", model: "fixture/review" });
+    await expect(h.runtime.registry.invoke("agents.actorStatus", { id: other.id }, h.invocation))
+      .rejects.toThrow(`Unknown Fabric actor: ${other.id}`);
+  });
+
   it("records the actor and activation run as spawner, never the root Main", async () => {
     const h = await setup(residency);
     const child = await h.spawn();

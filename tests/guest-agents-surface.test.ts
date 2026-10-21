@@ -262,10 +262,10 @@ describe("guest agents surface", () => {
   it.each([false, true])("types per-filter telemetry and expiry (fullCodeMode=%s)", fullCodeMode => {
     const code = `await agents.setActivationFilter({ id: "reviewer", activationFilter: ["hold"], expiresAt: Date.now() + 60000, deadLetterReplayMaxAgeMs: 0 });
       const actor = await agents.actorStatus({ id: "reviewer" });
-      const count: number = actor.filterSkipped.count;
-      const key: string | null = actor.filterSkipped.lastKey;
-      const topic: string | null = actor.filterSkipped.lastTopic;
-      const at: number | null = actor.filterSkipped.lastAt;
+      const count: number | undefined = actor.filterSkipped?.count;
+      const key: string | null | undefined = actor.filterSkipped?.lastKey;
+      const topic: string | null | undefined = actor.filterSkipped?.lastTopic;
+      const at: number | null | undefined = actor.filterSkipped?.lastAt;
       const expiry: number | undefined = actor.activationFilterExpiresAt;
       const maxAgeMs: number | undefined = actor.deadLetterReplayMaxAgeMs;
       await agents.create({ name: "backlog", instructions: "Supervise", deadLetterReplayMaxAgeMs: 0 });

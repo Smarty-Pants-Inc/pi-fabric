@@ -879,6 +879,14 @@ type FabricActorTemplate = Omit<FabricActorRequestBase, "validWhile" | "timeout_
 };
 // Mirror actors/types.ts: guest programs use the same live actor states and diagnostics.
 type FabricActorStatus = "dormant" | "idle" | "queued" | "preparing" | "waiting" | "running" | "stopped" | "failed" | "failing-preparation";
+interface FabricActorActivationIdentity {
+  actorId: string;
+  name: string;
+  rootId: string;
+  ownershipToken: string;
+  instructionsDigest: string;
+  roleStamp?: string;
+}
 interface FabricActorInfo extends FabricActorBatching {
   /** Resolution marker (alias name or closest); does not replace the effective model. */
   via?: string;
@@ -893,6 +901,8 @@ interface FabricActorInfo extends FabricActorBatching {
   instructionsLength?: number;
   scope: "session" | "project";
   name: string;
+  rootId?: string;
+  ownershipToken?: string;
   /** The session that owns and runs the actor, whoever reads it; binding.sessionId is the reading session. */
   ownerSessionId?: string;
   status: FabricActorStatus;
@@ -984,7 +994,13 @@ type FabricActorReadInfo = Omit<FabricActorInfo, "status" | "queued" | "messages
   status: FabricActorInfo["status"] | "unknown";
   queued?: number;
   messages?: number;
+  roleStamp?: string;
 };
+type FabricActorSelfReadInfo = Partial<FabricActorReadInfo> & Pick<FabricActorActivationIdentity,
+  "name" | "rootId" | "ownershipToken" | "instructionsDigest" | "roleStamp"> & {
+    id: string;
+    status: "unknown";
+  };
 interface FabricModelSwitchRequest {
   /** provider/id, a models.aliases name, or a search term; resolution tries aliases first, then exact matches, then the closest fuzzy match (recency from pi-model-sort breaks ties) against authenticated models. */
   model: string;
@@ -1136,7 +1152,7 @@ interface FabricAgentsApi {
   list(args?: { scope?: FabricParticipantScope }): Promise<Array<FabricAgentResult | FabricAgentHandle | FabricParticipantInfo>>;
   members(args?: { scope?: FabricParticipantScope; kinds?: FabricParticipantKind[]; includeStale?: boolean }): Promise<FabricParticipantInfo[]>;
   /** lineage mirrors PI_FABRIC_LINEAGE in child workers. */
-  self(): Promise<FabricParticipantInfo & { lineage?: {
+  self(): Promise<FabricParticipantInfo & { actor?: FabricActorActivationIdentity; lineage?: {
     version: 1; rootSessionId: string; parentSessionId?: string; parentRunId?: string;
     runId: string; depth: number; childIndex: number; worker: true;
   } }>;
@@ -1207,7 +1223,7 @@ interface FabricAgentsApi {
   setFollowUpMode(args: { id: string; mode: "all" | "one-at-a-time" }): Promise<{ queued: true; messageId: string }>;
   /** Advisory compaction of a running Pi-runner child at its next safe turn boundary. */
   compact(args: { id: string; instructions?: string }): Promise<{ queued: true; messageId: string }>;
-  actorStatus(args: FabricAgentTargetArgs): Promise<FabricActorReadInfo>;
+  actorStatus(args: FabricAgentTargetArgs): Promise<FabricActorReadInfo | FabricActorSelfReadInfo>;
   /** Inspect session (default) or the selected live durable host without changing authority. */
   slotStatus(args?: FabricSlotStatusOptions): Promise<FabricSlotStatus>;
   /** Read a live actor's instruction text and its sha256 digest. Writes nothing. */

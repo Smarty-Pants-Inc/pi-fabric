@@ -2679,9 +2679,9 @@ export class AgentManager {
           ...(process.env.PI_FABRIC_ACTOR_SESSION_FILE && this.#spawner?.kind === "actor" ? { actorSessionFile: process.env.PI_FABRIC_ACTOR_SESSION_FILE, spawner: this.#spawner, notify: this.config.notifyOnComplete, actorOnly: !routeDispatch } : {}) }, { durable: true });
         if (process.env.PI_FABRIC_ACTOR_SESSION_FILE && this.#spawner?.kind === "actor") new ActorChildCompletionStore(process.env.PI_FABRIC_ACTOR_SESSION_FILE).trackArchiveSource(id, runDirectory);
       }
-      // Actor-log custody is a separate sink from the terminal routing save.
-      // Establish it before dispatch; only a confirmed archive can release it.
-      if (routedActor && request.sessionFile) {
+      // Actor-log custody is a separate sink from terminal routing, for ALL actor activations (not just routed
+      // ones). Establish it before dispatch so close, explicit cleanup and offline sweeps cannot bypass a refusal.
+      if (request.actorId && request.sessionFile) {
         writeJsonAtomic(path.join(runDirectory, ACTOR_RUN_ARCHIVE_PENDING_FILE), { format: 1, runId: id,
           actorId: request.actorId, sessionFile: request.sessionFile }, { durable: true });
       }
@@ -5535,7 +5535,8 @@ export class AgentManager {
           if (this.#onStoppedAtClose) for (const result of results) {
             const directory = path.join(this.#runRoot, result.id);
             this.#commitArchive(directory, result, "shutdown");
-            if (this.#queued.has(result.id) && !this.#queued.get(result.id)?.routeSaveFailure && !fs.existsSync(path.join(directory, "status.json"))) fs.rmSync(directory, { recursive: true, force: true });
+            if (this.#queued.has(result.id) && !this.#queued.get(result.id)?.routeSaveFailure &&
+                !fs.existsSync(path.join(directory, "status.json")) && !runTreeExitVeto(directory)) fs.rmSync(directory, { recursive: true, force: true });
           }
           break;
         }

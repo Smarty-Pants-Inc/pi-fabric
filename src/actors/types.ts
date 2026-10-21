@@ -521,6 +521,8 @@ export interface FabricActorInfo extends FabricActorBatching {
   createdAt: number;
   updatedAt: number;
   lastRunId?: string;
+  /** Source directories retained for retry because their actor-run archive has not succeeded. */
+  pendingRunArchives?: number;
   /** Accepted activation without a worker: bounded setup, or waiting for admission. */
   preparing?: {
     phase: string;

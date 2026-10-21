@@ -3495,7 +3495,7 @@ export class ActorManager {
     // agents.stop/remove: an explicit stop is terminal, never restarted at a session start (smarty-dev#9241).
     actor.stopReason = "explicit";
     actor.updatedAt = Date.now();
-    actor.stoppedAt = actor.updatedAt;
+    actor.stoppedAt ??= actor.updatedAt;
     // Explicit stop wins over an ownership abort: do not park/retry the abandoned activation.
     if (actor.abortController) actor.cancelAbort = actor.abortController;
     delete actor.ownershipAbort;
@@ -5683,7 +5683,7 @@ export class ActorManager {
             this.#clearSettledWindows(actor.id);
             actor.status = "stopped";
             actor.stopReason = "directive";
-            actor.stoppedAt = Date.now();
+            actor.stoppedAt ??= Date.now();
             this.#takeQueued(actor).forEach((queued) =>
               queued.reject?.(
                 new Error(
@@ -7237,15 +7237,17 @@ export class ActorManager {
    */
   #alarmActorStates(actor: ManagedActor, now: number): void {
     if (actor.status === "stopped" && !actor.removal && (actor.residency === "durable" || actor.supervisorFor)) {
-      const since = actor.stoppedAt ?? actor.updatedAt;
-      const stopKind = actor.stopReason === "host-exit" ? "relaunch" : actor.stopReason ? "stop" : actor.lastError ? "error" : "stop";
-      this.#alarmActorState(actor, "actor-stopped", since, actorAlarmSlot(now, since, ACTOR_STOPPED_ALARM_AFTER_MS), now, () => ({
-        actorId: actor.id, actorName: actor.name, ownerRoot: actor.rootId, reason: stopKind,
-        ...(actor.stopReason ? { stopReason: actor.stopReason } : {}),
-        ...(actor.lastError ? { lastErrorCode: classifyActivationFailure({ lastError: actor.lastError, error: actor.lastError }).code } : {}),
-        since, stoppedForMs: now - since, residency: actor.residency, ...(actor.supervisorFor ? { supervisorFor: actor.supervisorFor } : {}) }),
-        () => { const current = this.#actors.get(actor.id); return current?.status === "stopped" && !current.removal &&
-          (current.stoppedAt ?? current.updatedAt) === since; });
+      const since = actor.stoppedAt;
+      if (since !== undefined) {
+        const stopKind = actor.stopReason === "host-exit" ? "relaunch" : actor.stopReason ? "stop" : actor.lastError ? "error" : "stop";
+        this.#alarmActorState(actor, "actor-stopped", since, actorAlarmSlot(now, since, ACTOR_STOPPED_ALARM_AFTER_MS), now, () => ({
+          actorId: actor.id, actorName: actor.name, ownerRoot: actor.rootId, reason: stopKind,
+          ...(actor.stopReason ? { stopReason: actor.stopReason } : {}),
+          ...(actor.lastError ? { lastErrorCode: classifyActivationFailure({ lastError: actor.lastError, error: actor.lastError }).code } : {}),
+          since, stoppedForMs: now - since, residency: actor.residency, ...(actor.supervisorFor ? { supervisorFor: actor.supervisorFor } : {}) }),
+          () => { const current = this.#actors.get(actor.id); return current?.status === "stopped" && !current.removal &&
+            current.stoppedAt === since; });
+      }
     }
     const run = actor.inFlightRun;
     if (run && now - run.startedAt > ACTOR_RUN_STUCK_MIN_MS) {
@@ -8200,12 +8202,39 @@ export class ActorManager {
     this.#withOwnershipRead(() => this.#loadActorsNow(onlyMissing));
   }
 
+  #stoppedEpisodeAt(source: Record<string, unknown>, actorId: string): number {
+    const evidence: number[] = [];
+    const lastRunId = typeof source.lastRunId === "string" && /^[a-f0-9]{32}$/.test(source.lastRunId)
+      ? source.lastRunId : undefined;
+    if (lastRunId) {
+      const run = readRunRecord(path.join(this.#actorRoot, actorId, "runs", lastRunId, "status.json"));
+      const directiveStop = run?.status === "completed" && typeof run.value === "object" && run.value !== null &&
+        (run.value as { action?: unknown }).action === "stop";
+      if (run?.id === lastRunId && (run.status === "stopped" || directiveStop) &&
+          typeof run.finishedAt === "number" && Number.isFinite(run.finishedAt) && run.finishedAt >= 0) {
+        evidence.push(run.finishedAt);
+      }
+      try {
+        for (const message of this.#registry.messages(source, MESSAGE_HISTORY_LIMIT)) {
+          if (typeof message !== "object" || message === null || Array.isArray(message)) continue;
+          const candidate = message as Partial<FabricActorMessage>;
+          if (candidate.action === "stop" && candidate.runId === lastRunId && typeof candidate.createdAt === "number" &&
+              Number.isFinite(candidate.createdAt) && candidate.createdAt >= 0) evidence.push(candidate.createdAt);
+        }
+      } catch { /* A missing or unreadable actor log falls back to the first-load timestamp. */ }
+    }
+    if (evidence.length) return Math.min(...evidence);
+    return typeof source.updatedAt === "number" && Number.isFinite(source.updatedAt) && source.updatedAt >= 0
+      ? source.updatedAt : Date.now();
+  }
+
   #loadActorsNow(onlyMissing: boolean): void {
     const loaded: ManagedActor[] = [];
     let added = 0;
     const firstLoads: ManagedActor[] = [];
     const restoreInputs = new Map<string, ActorQueueRestoreInputs>();
     const restartedIds: string[] = [];
+    let migratedStoppedEpisode = false;
     let parsed: unknown;
     try {
       parsed = this.#registry.read();
@@ -8277,6 +8306,11 @@ export class ActorManager {
       // custody instead of carrying a retired host's idle decision through reload.
       const status = record.status === "stopped" && !restarted ? "stopped" : "idle";
       const stopReason = status === "stopped" ? persistedStopReason(source) : undefined;
+      const stoppedAt = status === "stopped"
+        ? typeof source.stoppedAt === "number" && Number.isFinite(source.stoppedAt) && source.stoppedAt >= 0
+          ? source.stoppedAt : this.#stoppedEpisodeAt(source, record.id)
+        : undefined;
+      if (status === "stopped" && stoppedAt !== source.stoppedAt) migratedStoppedEpisode = true;
       const delivery: FabricActorDelivery =
         record.delivery === "steer" ||
         record.delivery === "followUp" ||
@@ -8434,8 +8468,7 @@ export class ActorManager {
         updatedAt: restarted ? Date.now() : typeof record.updatedAt === "number" ? record.updatedAt : Date.now(),
         ...(typeof record.presenceError === "string" ? { presenceError: record.presenceError } : {}),
         ...(stopReason ? { stopReason } : {}),
-        ...(status === "stopped" && Number.isFinite((source as { stoppedAt?: unknown }).stoppedAt)
-          ? { stoppedAt: (source as { stoppedAt: number }).stoppedAt } : {}),
+        ...(stoppedAt !== undefined ? { stoppedAt } : {}),
         ...(status === "stopped" && record.sessionOrphan && record.sessionOrphan.oldRoot === record.rootId &&
             typeof record.sessionOrphan.oldHost === "string" && typeof record.sessionOrphan.reason === "string" &&
             Number.isFinite(record.sessionOrphan.orphanedAt) && Number.isFinite(record.sessionOrphan.lastUpdated)
@@ -8483,9 +8516,9 @@ export class ActorManager {
       if (this.#ownershipDecision(actor.id) && this.#slotCurrent(actor)) this.#pendingPresence.add(actor.id);
     }
     this.#schedulePresenceRetry();
-    // Persist each restart (running, no orphan marker) so peers and the next load agree. It keeps
-    // the actor's id, definition, filters, topics, mailbox and the session's mesh cursor.
-    if (restartedIds.length) this.#scheduleRegistrySave(true, 1);
+    // Persist each restart (running, no orphan marker) and each legacy stop-episode migration so peers and the next
+    // load agree. Both keep the actor's id, definition, filters, topics, mailbox and the session's mesh cursor.
+    if (restartedIds.length || migratedStoppedEpisode) this.#scheduleRegistrySave(true, 1);
     // After every own file, whose counters the predecessors' activations shift against.
     const claimed = new Set(firstLoads.filter(actor => this.#takeOverPredecessors(actor, restoreInputs.get(actor.id))).map(actor => actor.id));
     // smarty-dev#8935: this host's ENODEV-unconfirmed runs of an activation no longer pending settle as lost, only

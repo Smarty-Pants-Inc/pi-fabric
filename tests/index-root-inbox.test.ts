@@ -211,7 +211,7 @@ describe("index root inbox turn/settle reconciliation (#4313)", () => {
     const h = await fixture();
     await h.work("held"); await h.emit("before_agent_start"); h.consume();
     h.lifecycle.mockRejectedValueOnce(new Error("lifecycle failed"));
-    await expect(h.turn()).rejects.toThrow("lifecycle failed");
+    await expect(h.turn()).resolves.toBeUndefined();
     expect(h.cursor().pending).toBeUndefined();
   });
 

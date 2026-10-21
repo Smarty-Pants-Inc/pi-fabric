@@ -139,6 +139,7 @@ import { installSelfReload, reloadTargetUiHold, RELOAD_HELD_TOPIC, RELOADED_TOPI
 export const FABRIC_MANAGED_HOST_VERSION = 1;
 export type { FabricManagedHostOptions } from "./managed-host.js";
 import type { FabricManagedHostOptions } from "./managed-host.js";
+import type { FabricLifecycleEventType } from "./lifecycle/types.js";
 
 export function createFabricExtension(entryUrl: string) {
 // Absolute path to the Fabric skills bundled with this extension. Resolved
@@ -1082,18 +1083,44 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     return undefined;
   });
 
-  pi.on("input", async (event, context) => {
+  // Pi awaits these hooks on its prompt/turn path. Mesh publication stays ordered
+  // on the runtime's background queue, but must never hold up the host.
+  let lifecyclePublishWarningShown = false;
+  const reportLifecyclePublishFailure = (error: unknown): void => {
+    if (lifecyclePublishWarningShown) return;
+    lifecyclePublishWarningShown = true;
+    diagnostics.warn("src/extension.ts", `[pi-fabric] host lifecycle publish failed: ${error instanceof Error ? error.message : String(error)}`);
+  };
+  const flushHostLifecycle = async (event: FabricLifecycleEventType, payload: unknown): Promise<void> => {
+    // Exit/settle paths give normal publishes time to flush before a child exits.
+    // Timing out only releases Pi; it neither cancels nor reorders queued writes.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        state.publishHostLifecycle(event, payload),
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(() => reject(new Error(`${event} publication timed out after 5000 ms`)), 5_000);
+        }),
+      ]);
+    } catch (error) {
+      reportLifecyclePublishFailure(error);
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+
+  pi.on("input", (event, context) => {
     if (!state.initialized) return;
     state.prewalk.observeTask(
       context.sessionManager.getSessionId(),
       event.text,
     );
-    await state.publishHostLifecycle("pi.input", event);
+    void state.publishHostLifecycle("pi.input", event).catch(reportLifecyclePublishFailure);
   });
 
-  pi.on("agent_start", async (event) => {
+  pi.on("agent_start", (event) => {
     fabricUi.setHostStreaming(true);
-    if (state.initialized) await state.publishHostLifecycle("pi.agent_start", event);
+    if (state.initialized) void state.publishHostLifecycle("pi.agent_start", event).catch(reportLifecyclePublishFailure);
   });
 
   pi.on("agent_end", async (event, context) => {
@@ -1104,7 +1131,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     } catch (error) {
       diagnostics.warn("src/extension.ts", `[pi-fabric] thinking revert failed: ${error instanceof Error ? error.message : String(error)}`);
     }
-    if (state.initialized) await state.publishHostLifecycle("pi.agent_end", event);
+    if (state.initialized) await flushHostLifecycle("pi.agent_end", event);
   });
 
   pi.on("turn_end", async (event, context) => {
@@ -1112,7 +1139,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     try {
       // Speculation never crosses a turn boundary, including type errors and aborts.
       if (state.initialized) state.resetSpeculation();
-      if (state.initialized) await state.publishHostLifecycle("pi.turn_end", event);
+      if (state.initialized) void state.publishHostLifecycle("pi.turn_end", event).catch(reportLifecyclePublishFailure);
       // Only enqueue the compiler here, without waiting for its scan/lock.
       if (entropyEvidenceThisTurn) {
         entropyEvidenceThisTurn = false;
@@ -1191,7 +1218,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
       (trigger: AutoCompactionTrigger, committed: boolean) =>
         state.compact.noteAutoCompaction(trigger, committed),
     );
-    await state.publishHostLifecycle("pi.agent_settled", event);
+    await flushHostLifecycle("pi.agent_settled", event);
     if (settledCompleted(event, context)) {
       // Records addressed to this root past its processing cursor (smarty-dev#754 C4), same hook.
       // The shadow root inbox reconciles in the outer finally for every settle outcome.
@@ -1356,7 +1383,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     };
   });
 
-  pi.on("tool_execution_end", async (event, context) => {
+  pi.on("tool_execution_end", (event, context) => {
     if (!state.initialized) return;
     if (event.toolName === "fabric_exec") entropyEvidenceThisTurn = true;
     state.noteMainActivity(context);
@@ -1374,7 +1401,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
         getActiveRepairCompiler()?.observe(classified);
       }
       state.dispatchHostEvent("tool_error", event, context);
-      await state.publishHostLifecycle("pi.tool_error", event);
+      void state.publishHostLifecycle("pi.tool_error", event).catch(reportLifecyclePublishFailure);
     }
   });
 
@@ -1404,7 +1431,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
       else diagnostics.warn("src/extension.ts", `[pi-fabric] ${warning}`);
     }
     if (!state.initialized) return;
-    await state.publishHostLifecycle("pi.session_compact", event);
+    void state.publishHostLifecycle("pi.session_compact", event).catch(reportLifecyclePublishFailure);
   });
 
   registerCompactionRecovery(pi, {

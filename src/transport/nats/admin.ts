@@ -24,14 +24,14 @@ const requiredEnv = (name: string): string => {
   return value;
 };
 
-const streamPolicy = (name: string, subjects: readonly string[], maxAgeMs: number, maxMessageBytes = MAX_MESSAGE_BYTES): TransportStreamPolicy => ({
+const streamPolicy = (name: string, subjects: readonly string[], maxAgeMs: number, maxMessageBytes = MAX_MESSAGE_BYTES, replicas = 1): TransportStreamPolicy => ({
   name,
   subjects,
   maxBytes: MAX_BYTES,
   maxAgeMs,
   maxMessageBytes,
   duplicateWindowMs: DUPLICATE_WINDOW_MS,
-  replicas: 1,
+  replicas,
 });
 
 const inboxMaxAgeMsArg = (args: readonly string[]): number => {
@@ -128,7 +128,7 @@ async function provision(args: readonly string[]): Promise<void> {
   });
   try {
     // This is deliberately first: advisories are otherwise lost before the operator consumer exists.
-    await ensureTransportStream(connection.manager, streamPolicy(ADVISORY_CAPTURE_STREAM, [transportAdvisoryStreamSubject], 30 * 24 * 60 * 60_000, 64 * 1024));
+    await ensureTransportStream(connection.manager, streamPolicy(ADVISORY_CAPTURE_STREAM, [transportAdvisoryStreamSubject], 30 * 24 * 60 * 60_000, 64 * 1024, replicas));
     await ensureDeadLetterConsumer(connection.manager);
     await openNatsKv(connection.js, { bucket: "fabric_leases", ttlMs: 15_000, markerTtlMs: 5 * 60_000, replicas });
     await openNatsKv(connection.js, { bucket: "fabric_presence", ttlMs: 10 * 60_000, markerTtlMs: 5 * 60_000, replicas });
@@ -141,8 +141,9 @@ async function provision(args: readonly string[]): Promise<void> {
     }
     process.stdout.write(`${JSON.stringify({ ok: true, advisory: ADVISORY_CAPTURE_STREAM, machines, inboxMaxAgeMs })}\n`);
   } catch (error) {
-    // Preserve advisory failures; type only inbox refusals without changing provision.ts's checks.
-    if (error instanceof Error && machines.some((machine) => error.message === `NATS stream configuration mismatch: ${transportInboxStream(machine)}`)) {
+    // Preserve unrelated advisory failures; type stream-policy refusals without changing provision.ts's checks.
+    if (error instanceof Error && (error.message === `NATS stream configuration mismatch: ${ADVISORY_CAPTURE_STREAM}` ||
+      machines.some((machine) => error.message === `NATS stream configuration mismatch: ${transportInboxStream(machine)}`))) {
       throw new TransportInvalidError(error.message, { cause: error });
     }
     throw error;

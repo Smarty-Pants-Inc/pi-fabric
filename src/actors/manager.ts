@@ -93,6 +93,17 @@ import { launchScope, normalizeScope, processSender, senderStamp, senderTrusted 
 import { WARNING_RETENTION_CAP } from "../worker/provider-error.js";
 import { activationBlockClass, classifyActivationFailure, TRANSIENT_ACTIVATION_BLOCK_CODES, type ActivationBlockClass } from "./activation-failure.js";
 
+interface NatsActorEventsSession {
+  connection: import("../transport/nats/connection.js").NatsConnectionHandle;
+  startConsumer: typeof import("../transport/nats/events-consume.js").startNatsActorEventsConsumer;
+}
+
+interface NatsActorEventsSetupState {
+  attempt: number;
+  retryable: boolean;
+  timer?: NodeJS.Timeout;
+}
+
 export interface ActorModelRouteInput {
   routeClass: string; protected: unknown; pinModel: unknown; pinThinking: unknown; modelReason?: string;
   parentSessionId: string; actorId: string; activationId: string;
@@ -938,15 +949,13 @@ export class ActorManager {
   readonly #natsEventConsumers = new Map<string, import("../transport/nats/events-consume.js").NatsActorEventsConsumer>();
   readonly #natsEventConsumerTopics = new Map<string, string[]>();
   readonly #natsEventConsumerActive = new Set<string>();
-  #natsEventsSession: {
-    connection: import("../transport/nats/connection.js").NatsConnectionHandle;
-    startConsumer: typeof import("../transport/nats/events-consume.js").startNatsActorEventsConsumer;
-  } | undefined;
-  #natsEventsOpening: Promise<{
-    connection: import("../transport/nats/connection.js").NatsConnectionHandle;
-    startConsumer: typeof import("../transport/nats/events-consume.js").startNatsActorEventsConsumer;
-  }> | undefined;
+  #natsEventsSession: NatsActorEventsSession | undefined;
+  #natsEventsOpening: Promise<NatsActorEventsSession> | undefined;
   #natsEventsSyncPending: Promise<void> | undefined;
+  #natsEventsSyncAgain = false;
+  readonly #natsEventSetupQueue = new Set<string>();
+  readonly #natsEventSetups = new Map<string, Promise<void>>();
+  readonly #natsEventSetupFailures = new Map<string, NatsActorEventsSetupState>();
   // Independent of registry objects: ownership/reload may replace them during a drain.
   readonly #processedKeys = new Map<string, Set<string>>();
   // Admission times belong to the manager, not replaceable registry objects.
@@ -1255,10 +1264,7 @@ export class ActorManager {
     });
   }
 
-  async #natsEventsRuntime(): Promise<{
-    connection: import("../transport/nats/connection.js").NatsConnectionHandle;
-    startConsumer: typeof import("../transport/nats/events-consume.js").startNatsActorEventsConsumer;
-  }> {
+  async #natsEventsRuntime(): Promise<NatsActorEventsSession> {
     if (this.#natsEventsSession) return this.#natsEventsSession;
     if (this.#natsEventsOpening) return this.#natsEventsOpening;
     const nats = this.meshConfig.nats;
@@ -1298,7 +1304,10 @@ export class ActorManager {
 
   async #syncNatsEventConsumers(): Promise<void> {
     if (!this.#natsEventsEnabled() || !this.#persistent || this.#closing) return;
-    if (this.#natsEventsSyncPending) return this.#natsEventsSyncPending;
+    if (this.#natsEventsSyncPending) {
+      this.#natsEventsSyncAgain = true;
+      return this.#natsEventsSyncPending;
+    }
     const syncing = (async () => {
       this.#syncActorsFromRegistry();
       this.#refreshOwnership();
@@ -1325,34 +1334,112 @@ export class ActorManager {
           else this.#natsEventConsumerActive.delete(actorId);
         }
       }
-      const candidates = [...this.#actors.values()].filter(actor => actor.status !== "stopped" &&
-        !actor.removal && this.#canManageCached(actor.id) && this.#slotCurrent(actor) && !this.#natsEventConsumers.has(actor.id));
-      if (!candidates.length) return;
-      const { connection, startConsumer } = await this.#natsEventsRuntime();
-      for (const actor of candidates) {
-        // Ownership or topics may have changed while connection setup yielded.
-        const current = this.#actors.get(actor.id);
-        if (!current || current.status === "stopped" || current.removal ||
-            !this.#canManageCached(current.id) || !this.#slotCurrent(current)) continue;
-        const consumer = await startConsumer(connection, {
-          org: this.meshConfig.nats.org!, actorId: current.id, topics: [...current.topics],
-          ...(current.eventsStartAt !== undefined ? { eventsStartAt: current.eventsStartAt } : {}),
-          provision: false,
-          onMessage: (event, messageId, ack) => this.#acceptNatsActorEvent(current.id, event, messageId, ack),
-        });
-        this.#natsEventConsumers.set(current.id, consumer);
-        this.#natsEventConsumerTopics.set(current.id, [...current.topics]);
-        this.#natsEventConsumerActive.add(current.id);
+      for (const [actorId, failure] of this.#natsEventSetupFailures) {
+        if (this.#actors.has(actorId)) continue;
+        if (failure.timer) clearTimeout(failure.timer);
+        this.#natsEventSetupFailures.delete(actorId);
       }
+      const candidates = [...this.#actors.values()].filter(actor => this.#natsEventSetupEligible(actor.id));
+      if (!candidates.length) return;
+      const session = await this.#natsEventsRuntime();
+      if (this.#closing) return;
+      for (const actor of candidates) this.#natsEventSetupQueue.add(actor.id);
+      this.#startNatsEventSetups(session);
     })();
     const pending = syncing.finally(() => {
       if (this.#natsEventsSyncPending === pending) this.#natsEventsSyncPending = undefined;
+      if (this.#natsEventsSyncAgain) {
+        this.#natsEventsSyncAgain = false;
+        this.#scheduleNatsEventsSync();
+      }
     });
     this.#natsEventsSyncPending = pending;
     return pending;
   }
 
+  #natsEventSetupEligible(actorId: string): boolean {
+    const actor = this.#actors.get(actorId);
+    const failure = this.#natsEventSetupFailures.get(actorId);
+    return !this.#closing && !!actor && actor.status !== "stopped" && !actor.removal &&
+      this.#canManageCached(actorId) && this.#slotCurrent(actor) && !this.#natsEventConsumers.has(actorId) &&
+      !this.#natsEventSetups.has(actorId) && !failure?.timer && failure?.retryable !== false;
+  }
+
+  #startNatsEventSetups(session: NatsActorEventsSession): void {
+    // Creation, registry/ownership changes and setup completion drive this queue. The
+    // existing mesh-monitor safety net covers missed changes; only failures arm retries.
+    if (this.#closing || this.#natsEventsSession !== session) return;
+    while (this.#natsEventSetups.size < 8 && this.#natsEventSetupQueue.size) {
+      const actorId = this.#natsEventSetupQueue.values().next().value!;
+      this.#natsEventSetupQueue.delete(actorId);
+      this.#refreshOwnership(actorId);
+      if (!this.#natsEventSetupEligible(actorId)) continue;
+      const task = this.#setupNatsActorConsumer(actorId, session).finally(() => {
+        this.#natsEventSetups.delete(actorId);
+        this.#startNatsEventSetups(session);
+        this.#scheduleNatsEventsSync();
+      });
+      this.#natsEventSetups.set(actorId, task);
+    }
+  }
+
+  async #setupNatsActorConsumer(actorId: string, session: NatsActorEventsSession): Promise<void> {
+    const actor = this.#actors.get(actorId)!;
+    const topics = [...actor.topics];
+    const failure: NatsActorEventsSetupState = {
+      attempt: (this.#natsEventSetupFailures.get(actorId)?.attempt ?? 0) + 1, retryable: true,
+    };
+    this.#natsEventSetupFailures.set(actorId, failure);
+    try {
+      const consumer = await session.startConsumer(session.connection, {
+        org: this.meshConfig.nats.org!, actorId, topics,
+        ...(actor.eventsStartAt !== undefined ? { eventsStartAt: actor.eventsStartAt } : {}),
+        provision: false,
+        onMessage: (event, messageId, ack) => this.#acceptNatsActorEvent(actorId, event, messageId, ack),
+      });
+      this.#refreshOwnership(actorId);
+      const current = this.#actors.get(actorId);
+      // Setup may outlive ownership, slot custody, removal, or the entire session.
+      if (this.#closing || this.#natsEventsSession !== session || !current || current.status === "stopped" || current.removal ||
+          !this.#canManageCached(actorId) || !this.#slotCurrent(current)) {
+        await consumer.close(!this.#closing && (!current || !!current.removal));
+      } else {
+        // Publish each success immediately, without waiting for any other setup.
+        this.#natsEventConsumers.set(actorId, consumer);
+        this.#natsEventConsumerTopics.set(actorId, topics);
+        this.#natsEventConsumerActive.add(actorId);
+      }
+      if (this.#natsEventSetupFailures.get(actorId) === failure) this.#natsEventSetupFailures.delete(actorId);
+    } catch (error) {
+      // Consume the lazy transport's setup contract structurally. Never log the
+      // underlying Error/message: server replies can contain credentials or URLs.
+      const setup = error instanceof Error && "setup" in error ? error.setup as {
+        stream?: unknown; durable?: unknown; code?: unknown; retryable?: unknown;
+      } | undefined : undefined;
+      const safe = (value: unknown): string => typeof value === "string" && /^[a-zA-Z0-9_-]{1,128}$/.test(value) ? value : "unknown";
+      failure.retryable = setup?.retryable === true;
+      diagnostics.warn("src/actors/manager.ts", "[pi-fabric] NATS actor event setup failed", {
+        stream: safe(setup?.stream), durable: safe(setup?.durable), code: safe(setup?.code), attempt: failure.attempt,
+      });
+      if (!this.#closing && failure.retryable && this.#natsEventSetupFailures.get(actorId) === failure) {
+        const ceiling = Math.min(30_000, 1_000 * 2 ** Math.min(failure.attempt, 5));
+        const delay = 1_000 + Math.floor(Math.random() * (ceiling - 1_000 + 1));
+        failure.timer = setTimeout(() => {
+          delete failure.timer;
+          this.#scheduleNatsEventsSync();
+        }, delay);
+        failure.timer.unref();
+      }
+    }
+  }
+
   async #removeNatsActorConsumer(actorId: string, remove: boolean): Promise<void> {
+    this.#natsEventSetupQueue.delete(actorId);
+    if (remove) {
+      const failure = this.#natsEventSetupFailures.get(actorId);
+      if (failure?.timer) clearTimeout(failure.timer);
+      this.#natsEventSetupFailures.delete(actorId);
+    }
     const consumer = this.#natsEventConsumers.get(actorId);
     if (!consumer) return;
     await consumer.close(remove);
@@ -1362,7 +1449,13 @@ export class ActorManager {
   }
 
   async #closeNatsEvents(): Promise<void> {
+    this.#natsEventSetupQueue.clear();
+    for (const failure of this.#natsEventSetupFailures.values()) {
+      if (failure.timer) clearTimeout(failure.timer);
+    }
     await this.#natsEventsSyncPending?.catch(() => undefined);
+    await Promise.allSettled([...this.#natsEventSetups.values()]);
+    this.#natsEventSetupFailures.clear();
     const session = this.#natsEventsSession ?? await this.#natsEventsOpening?.catch(() => undefined);
     await Promise.all([...this.#natsEventConsumers.values()].map(consumer => consumer.close(false).catch(error => {
       diagnostics.warn("src/actors/manager.ts", `[pi-fabric] NATS actor event consumer close deferred: ${errorText(error)}`);

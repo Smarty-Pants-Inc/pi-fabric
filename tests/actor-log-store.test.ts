@@ -142,6 +142,27 @@ describe("ActorLogStore", () => {
     } finally { fs.chmodSync(volume, 0o700); }
   });
 
+  it.each(["events.jsonl", "nested/child/events.jsonl"])("rejects a source symlink at %s even without O_NOFOLLOW", async file => {
+    const { root, actor, store } = setup();
+    const source = path.join(root, "source"), entry = path.join(source, file), target = path.join(root, "trace.jsonl");
+    fs.mkdirSync(path.dirname(entry), { recursive: true });
+    fs.writeFileSync(target, "only trace\n");
+    fs.symlinkSync(target, entry);
+    // Windows has no O_NOFOLLOW. Exercise the same source-open behavior on
+    // POSIX too, while keeping real files and the production copy/receipt path.
+    const open = fs.openSync;
+    vi.spyOn(fs, "openSync").mockImplementation((name, flags, mode) =>
+      open(name, name === entry && typeof flags === "number" ? flags & ~(fs.constants.O_NOFOLLOW ?? 0) : flags, mode));
+    await expect(store.retainRun(actor, "latest", source)).rejects.toBeInstanceOf(ActorRunArchiveRefusedError);
+    expect(fs.lstatSync(entry).isSymbolicLink()).toBe(true);
+    expect(fs.readFileSync(target, "utf8")).toBe("only trace\n");
+    expect(fs.existsSync(path.join(root, "actor", "runs", "latest", file))).toBe(false);
+    fs.unlinkSync(entry);
+    fs.writeFileSync(entry, "only trace\n");
+    await expect(store.retainRun(actor, "latest", source)).resolves.toMatchObject({ archived: true });
+    expect(fs.readFileSync(path.join(root, "actor", "runs", "latest", file), "utf8")).toBe("only trace\n");
+  });
+
   it.each(["events.jsonl", "nested/child/events.jsonl"])("rejects a refused %s entry, retaining bytes for a successful retry", async file => {
     const { root, actor, store } = setup();
     const source = path.join(root, "source"), dest = path.join(root, "actor", "runs", "latest");

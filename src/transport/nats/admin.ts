@@ -5,7 +5,7 @@ import { openBootstrapNatsConnection, openNatsConnection, type NatsPermissionPol
 import { consumeDeadLetters, ensureDeadLetterConsumer, type DeadLetterEnvelope, type DeadLetterSink } from "./dead-letter.js";
 import { openNatsKv } from "./kv.js";
 import { DEFAULT_INBOX_MAX_AGE_MS, isValidInboxMaxAgeMs } from "./inbox-policy.js";
-import { ensureTransportStream, type TransportStreamPolicy } from "./provision.js";
+import { ensureTransportStream, INBOX_DUPLICATE_WINDOW_MS, type TransportStreamPolicy } from "./provision.js";
 import {
   ADVISORY_CAPTURE_STREAM,
   transportAdvisoryStreamSubject,
@@ -17,20 +17,21 @@ import {
 
 const MAX_BYTES = 1_073_741_824;
 const MAX_MESSAGE_BYTES = 1_048_576;
-const DUPLICATE_WINDOW_MS = 10 * 60_000;
+const ADVISORY_DUPLICATE_WINDOW_MS = 10 * 60_000;
 const requiredEnv = (name: string): string => {
   const value = process.env[name]?.trim();
   if (!value) throw new Error(`${name} is required`);
   return value;
 };
 
-const streamPolicy = (name: string, subjects: readonly string[], maxAgeMs: number, maxMessageBytes = MAX_MESSAGE_BYTES, replicas = 1): TransportStreamPolicy => ({
+const streamPolicy = (name: string, subjects: readonly string[], maxAgeMs: number, maxMessageBytes = MAX_MESSAGE_BYTES,
+  replicas = 1, duplicateWindowMs = INBOX_DUPLICATE_WINDOW_MS): TransportStreamPolicy => ({
   name,
   subjects,
   maxBytes: MAX_BYTES,
   maxAgeMs,
   maxMessageBytes,
-  duplicateWindowMs: DUPLICATE_WINDOW_MS,
+  duplicateWindowMs,
   replicas,
 });
 
@@ -128,7 +129,8 @@ async function provision(args: readonly string[]): Promise<void> {
   });
   try {
     // This is deliberately first: advisories are otherwise lost before the operator consumer exists.
-    await ensureTransportStream(connection.manager, streamPolicy(ADVISORY_CAPTURE_STREAM, [transportAdvisoryStreamSubject], 30 * 24 * 60 * 60_000, 64 * 1024, replicas));
+    await ensureTransportStream(connection.manager, streamPolicy(ADVISORY_CAPTURE_STREAM, [transportAdvisoryStreamSubject],
+      30 * 24 * 60 * 60_000, 64 * 1024, replicas, ADVISORY_DUPLICATE_WINDOW_MS));
     await ensureDeadLetterConsumer(connection.manager);
     await openNatsKv(connection.js, { bucket: "fabric_leases", ttlMs: 15_000, markerTtlMs: 5 * 60_000, replicas });
     await openNatsKv(connection.js, { bucket: "fabric_presence", ttlMs: 10 * 60_000, markerTtlMs: 5 * 60_000, replicas });

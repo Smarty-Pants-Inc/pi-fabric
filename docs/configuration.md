@@ -1103,6 +1103,15 @@ accepted as legacy and are **not** updated by runtime startup or the provisionin
 command. To change a stream's age or retention mode, use a separately reviewed,
 explicit admin migration; NATS does not permit changing retention mode in place.
 
+Uncertain publishes retry with the same envelope ID and frozen bytes, capped
+at the minimum of the command deadline and the stream's actual
+`duplicate_window` minus 30 seconds; without a valid command deadline, the
+retry horizon defaults to 30 seconds. On expiry, the error remains a
+`TransportUncertainError` with `retryExpired: true` and
+`expiryCode: FABRIC_TRANSPORT_UNCERTAIN_EXPIRED`, because the message may already
+have been persisted. Existing inbox streams with the current 10-minute
+`duplicate_window` remain unchanged.
+
 Main hosts keep durable inbox consumers by default. Short-lived child processes
 inherit the NATS policy with `ephemeralHost: true`, and `pi-fabric nats send`
 and `dispatch` also default to `ephemeralHost: true` with the one-hour inactive

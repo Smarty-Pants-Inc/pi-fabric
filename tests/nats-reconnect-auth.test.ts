@@ -12,7 +12,7 @@ import { PATH_B_OPERATOR_MACHINE, roleTemplateWithPathB } from "../src/mesh/nats
 import * as connectionModule from "../src/transport/nats/connection.js";
 import { openNatsTransport } from "../src/transport/nats/inbox.js";
 import { openNatsKvForMachine } from "../src/transport/nats/kv.js";
-import { ensureTransportConsumer, ensureTransportStream } from "../src/transport/nats/provision.js";
+import { ensureTransportConsumer, ensureTransportStream, INBOX_DUPLICATE_WINDOW_MS } from "../src/transport/nats/provision.js";
 import { TransportUnavailableError, type FabricTransport, type FabricTransportOptions, type TransportEnvelope } from "../src/transport/types.js";
 import { ADVISORY_CAPTURE_STREAM, transportAdvisoryStreamSubject, transportDurableName, transportInboxFilter, transportInboxStream, transportInboxStreamSubject, transportInboxSubject } from "../src/transport/nats/subjects.js";
 import { createPathBHarness, PATH_B_MACHINES, PATH_B_PERMISSION_POLICY, PATH_B_TEST_MESH, resolveNatsBinary, type PathBHarness, type PathBIdentity, type PathBUser } from "./helpers/nats-cluster.js";
@@ -22,7 +22,7 @@ const binary = resolveNatsBinary();
 if (!binary && process.env.NATS_AUTH_REQUIRED === "1") throw new Error("NATS_AUTH_REQUIRED=1 but no nats-server executable was found");
 const HOST = "reconnect-security-runtime";
 const REVOKED_GRANT = "fabric.in.*.*.*.*.{{tag(machine)}}";
-const policy = { maxBytes: 1_073_741_824, maxAgeMs: 0, maxMessageBytes: 1_048_576, duplicateWindowMs: 600_000, replicas: 1 as const };
+const policy = { maxBytes: 1_073_741_824, maxAgeMs: 0, maxMessageBytes: 1_048_576, duplicateWindowMs: INBOX_DUPLICATE_WINDOW_MS, replicas: 1 as const };
 const dnsUrl = (h: PathBHarness) => `tls://localhost:${new URL(h.serverUrl).port}`;
 
 async function bounded<T>(promise: Promise<T>, label: string, ms = 10_000): Promise<T> {
@@ -124,7 +124,7 @@ async function prepareFixture(withSecond: boolean) {
     for (const broker of brokers) {
       const nc = await raw(broker, broker.users.bootstrap);
       const manager = await jetstreamManager(nc);
-      await ensureTransportStream(manager, { ...policy, name: ADVISORY_CAPTURE_STREAM, subjects: [transportAdvisoryStreamSubject], maxAgeMs: 30 * 86_400_000, maxMessageBytes: 65_536 });
+      await ensureTransportStream(manager, { ...policy, duplicateWindowMs: 10 * 60_000, name: ADVISORY_CAPTURE_STREAM, subjects: [transportAdvisoryStreamSubject], maxAgeMs: 30 * 86_400_000, maxMessageBytes: 65_536 });
       for (const machine of PATH_B_MACHINES) await ensureTransportStream(manager, { ...policy, name: transportInboxStream(machine), subjects: [transportInboxStreamSubject(machine)] });
       for (const bucket of ["leases", "presence"] as const) await openNatsKvForMachine(jetstream(nc), bucket, "machine-a", true);
       await ensureTransportConsumer(manager.consumers, { stream: transportInboxStream("machine-a"), durable: transportDurableName(HOST),

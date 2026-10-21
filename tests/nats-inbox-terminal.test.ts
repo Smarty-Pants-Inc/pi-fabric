@@ -30,7 +30,10 @@ vi.mock("../src/transport/nats/kv.js", () => ({
   }),
 }));
 vi.mock("../src/transport/nats/provision.js", () => ({
-  ensureTransportStream: async () => undefined,
+  INBOX_DUPLICATE_WINDOW_MS: 10 * 60_000,
+  ensureTransportStream: async (_manager: unknown, policy: { duplicateWindowMs: number }) => ({
+    config: { duplicate_window: policy.duplicateWindowMs * 1_000_000 },
+  }),
   ensureTransportConsumer: async (_api: unknown, policy: { description: string }) => {
     mocks.consumerSetupAttempts++;
     if (mocks.consumerSetupAttempts > 1) throw mocks.failure;

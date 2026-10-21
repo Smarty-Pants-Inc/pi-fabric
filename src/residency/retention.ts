@@ -77,7 +77,16 @@ export const sweepResidentRuns = (
   } finally { directory.closeSync(); }
   return removed;
 };
-
+const boundedRunTreeAtJudgedPath = (run: string, judged: fs.Stats, expired: () => boolean): boolean => {
+  try {
+    const current = fs.lstatSync(run);
+    const owned = ownedStat(run);
+    return !!owned?.isDirectory() && current.dev === judged.dev && current.ino === judged.ino && boundedRunTree(run, expired);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") return false;
+  }
+  return boundedMovedRunTree(run, judged, expired);
+};
 
 const SAMPLE_INTERVAL_MS = 60_000;
 const directories = ["acknowledgements", "decisions", "responses", "runs"] as const;
@@ -125,6 +134,38 @@ const actorReferenceFingerprint = (roots: readonly string[]): string => {
     }
     return JSON.stringify(identities);
   } catch { return "unsafe"; }
+};
+
+/** The verified remover has renamed `run` before its final callback. Re-find only the same judged
+ * directory inode in its private graveyard; an ambiguous or mismatched entry vetoes removal. */
+const boundedMovedRunTree = (run: string, judged: fs.Stats, expired: () => boolean): boolean => {
+  const graveyard = path.join(path.dirname(run), `.retention-graveyard-${process.pid}`);
+  const before = ownedStat(graveyard);
+  if (!before?.isDirectory() || (before.mode & 0o077) !== 0) return false;
+  let directory: fs.Dir | undefined;
+  let moved: string | undefined;
+  let complete = false;
+  try {
+    directory = fs.opendirSync(graveyard);
+    let count = 0;
+    while (!expired()) {
+      const entry = directory.readSync();
+      if (!entry) { complete = true; break; }
+      if (++count > 64) return false;
+      if (!entry.name.startsWith(`${path.basename(run)}.`)) continue;
+      if (!entry.isDirectory()) return false;
+      const candidate = path.join(graveyard, entry.name);
+      const stat = ownedStat(candidate);
+      if (!stat?.isDirectory() || stat.dev !== judged.dev || stat.ino !== judged.ino || moved) return false;
+      moved = candidate;
+    }
+  } catch { return false; }
+  finally { try { directory?.closeSync(); } catch { /* fail closed below */ } }
+  const after = ownedStat(graveyard);
+  if (!complete || !moved || expired() || !after?.isDirectory() || after.dev !== before.dev || after.ino !== before.ino ||
+      (after.mode & 0o077) !== 0) return false;
+  const stat = ownedStat(moved);
+  return !!stat?.isDirectory() && stat.dev === judged.dev && stat.ino === judged.ino && boundedRunTree(moved, expired);
 };
 
 const validAck = (value: ResidentResponseAcknowledgement | undefined, id: string): value is ResidentResponseAcknowledgement =>
@@ -264,7 +305,7 @@ export class ResidentRequestRetention {
               actorReferenceFingerprint(this.actorRoots) === fingerprint) {
             // The final archive, tree and registry checks run immediately before the verified removal.
             removeUnreferencedRun(file, stat,
-              () => actorReferenceFingerprint(this.actorRoots) !== fingerprint || !boundedRunTree(file, unitExpired),
+              () => actorReferenceFingerprint(this.actorRoots) !== fingerprint || !boundedRunTreeAtJudgedPath(file, stat, unitExpired),
               false, "residentRunRetention", 0, false, this.retention.meshRoot);
             continue;
           }

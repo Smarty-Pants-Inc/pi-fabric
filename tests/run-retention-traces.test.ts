@@ -8,6 +8,7 @@ import { FABRIC_RUN_ROOT_PREFIX, archiveRunSessionTraces, isTraceArchivePath, ma
   runSessionTraceArchivePath, sweepTempRunRoots, removeUnreferencedRun, compactTerminalRunEvents, pruneActorRunArchives,
   pruneActorSessionBackups, removeEmptyRunRoot } from "../src/storage/retention.js";
 import { sweepResidentRuns } from "../src/residency/retention.js";
+import { testTempRoot } from "./helpers/test-temp-root.js";
 
 const roots: string[] = [];
 const HOSTED_ARCHIVES = hostedOnly("outside-TMPDIR trace archive tests");
@@ -64,6 +65,44 @@ function fixture(kind: "closed" | "orphaned", durableArchiveRoot = false) {
 }
 
 describe("raw trace retention", () => {
+  it.skipIf(process.platform === "win32")("vetoes a moved-tree identity mismatch, restores the run, and keeps the archived raw trace", () => {
+    const root = testTempRoot("resident-moved-identity-");
+    roots.push(root);
+    const runs = path.join(root, "runs"), meshRoot = path.join(root, "mesh"), run = path.join(runs, "run-identity");
+    fs.mkdirSync(run, { recursive: true });
+    fs.writeFileSync(path.join(run, "status.json"), JSON.stringify({ status: "completed", transport: "process", sessionId: "2147483647" }));
+    fs.writeFileSync(path.join(run, "events.jsonl"), "raw resident trace\n");
+    expect(() => process.kill(2147483647, 0)).toThrow(expect.objectContaining({ code: "ESRCH" }));
+    const judged = fs.statSync(run);
+    let checks = 0;
+    let mismatchObserved = false;
+    const referenced = (): boolean => {
+      checks++;
+      if (checks === 1) return false;
+      let moved: string;
+      if (process.platform === "linux") {
+        const grave = path.join(runs, `.retention-graveyard-${process.pid}`);
+        const name = fs.readdirSync(grave).find(entry => entry.startsWith(`${path.basename(run)}.`));
+        if (!name) return true;
+        moved = path.join(grave, name);
+      } else moved = path.join(runs, `.retention-tombstone-${path.basename(run)}`);
+      const current = fs.statSync(moved);
+      // Simulate a stale/mismatched identity in the final path judgment without changing the held tree.
+      mismatchObserved = current.dev !== judged.dev || current.ino !== judged.ino + 1;
+      return mismatchObserved;
+    };
+
+    const removed = removeUnreferencedRun(run, judged, referenced, false, "residentMovedIdentityTest", 0, false, meshRoot);
+    const archive = runSessionTraceArchivePath(meshRoot, run);
+    expect(removed).toBe(false);
+    expect(checks).toBe(2);
+    expect(mismatchObserved).toBe(true);
+    expect(fs.existsSync(run)).toBe(true);
+    expect(fs.readFileSync(path.join(run, "status.json"), "utf8")).toContain("completed");
+    expect(fs.existsSync(path.join(run, "events.jsonl"))).toBe(false);
+    expect(fs.readFileSync(path.join(archive, "events.jsonl"), "utf8")).toBe("raw resident trace\n");
+  });
+
   it("rejects temporary and reaped archive roots without creating them", () => {
     const source = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-archive-placement-source-"));
     roots.push(source);

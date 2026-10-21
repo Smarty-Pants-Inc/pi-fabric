@@ -84,7 +84,7 @@ describe("unscoped legacy process liveness", () => {
 });
 
 type MarkerFailure = "symlink" | "unowned" | "directory" | "mismatched" | "empty";
-type AdmissionOptions = { present?: boolean; race?: boolean; armFailure?: boolean; markerFailure?: MarkerFailure; teardownMarker?: "valid" | MarkerFailure };
+type AdmissionOptions = { present?: boolean; race?: boolean; armFailure?: boolean; markerFailure?: MarkerFailure; teardownMarker?: "valid" | MarkerFailure; admitOnCheck?: number };
 async function fixtureAdmission(options: AdmissionOptions = {}) {
   vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
   const directory = root();
@@ -162,9 +162,13 @@ async function fixtureAdmission(options: AdmissionOptions = {}) {
     return watcher;
   });
   const nativeLstat = fs.lstatSync.bind(fs);
-  const lstat = vi.spyOn(fs, "lstatSync").mockImplementation(((file: fs.PathLike, options?: unknown) => {
-    if (String(file) === marker) order.push("check");
-    const stat = nativeLstat(file, options as never);
+  let markerChecks = 0;
+  const lstat = vi.spyOn(fs, "lstatSync").mockImplementation(((file: fs.PathLike, fsOptions?: unknown) => {
+    if (String(file) === marker) {
+      order.push("check");
+      if (++markerChecks === options.admitOnCheck) writeMarker();
+    }
+    const stat = nativeLstat(file, fsOptions as never);
     if (String(file) === marker && markerFailure === "unowned") stat.uid = process.getuid!() + 1;
     return stat;
   }) as typeof fs.lstatSync);
@@ -264,7 +268,7 @@ describe.skipIf(process.platform !== "linux")("event-driven scope admission mark
     const handle = await f.launch;
     expect(handle.pid).toBe(f.children[teardownMarker === "valid" ? 0 : 1]!.pid);
     expect(spawn).toHaveBeenCalledTimes(teardownMarker === "valid" ? 1 : 2);
-    expect(f.markerChecks()).toBe(2);
+    expect(f.markerChecks()).toBe(4); // initial, deadline, pre-stop, then post-stop no-replay checks
     expect(handle.treeClosed).toBeUndefined();
     expectAdmissionCleaned(f);
     f.finish();
@@ -278,6 +282,34 @@ describe.skipIf(process.platform !== "linux")("event-driven scope admission mark
     expect(f.markerChecks()).toBe(1);
     expect(f.timeout).not.toHaveBeenCalled();
     expect(spawn).toHaveBeenCalledOnce();
+    expectAdmissionCleaned(f);
+    f.finish();
+  });
+
+  it.each(["deadline", "watcher error", "abort"] as const)("keeps an already admitted worker when %s ends the delayed-watch wait", async end => {
+    const f = await fixtureAdmission();
+    f.writeMarker(); // the scope shim has admitted/exec'd, but inotify has not reached this loop yet
+    if (end === "deadline") await vi.advanceTimersByTimeAsync(5_000);
+    else if (end === "watcher error") f.watcher.emit("error", new Error("watch failed after marker publication"));
+    else f.controller.abort();
+    const handle = await f.launch;
+    expect(handle.pid).toBe(f.children[0]!.pid);
+    expect(f.order).not.toContain("stop");
+    expect(spawn).toHaveBeenCalledOnce();
+    expect(f.warn).not.toHaveBeenCalled();
+    expectAdmissionCleaned(f);
+    f.finish();
+  });
+
+  it("rechecks the marker immediately before teardown when admission races the completed wait", async () => {
+    const f = await fixtureAdmission({ admitOnCheck: 3 });
+    await vi.advanceTimersByTimeAsync(5_000); // initial and deadline checks miss it
+    const handle = await f.launch; // the pre-stop check sees the newly published marker
+    expect(handle.pid).toBe(f.children[0]!.pid);
+    expect(f.markerChecks()).toBe(3);
+    expect(f.order).not.toContain("stop");
+    expect(spawn).toHaveBeenCalledOnce();
+    expect(f.warn).not.toHaveBeenCalled();
     expectAdmissionCleaned(f);
     f.finish();
   });
@@ -296,9 +328,10 @@ describe.skipIf(process.platform !== "linux")("event-driven scope admission mark
     expect(vi.mocked(spawn).mock.calls[1]![1]).toEqual([expect.stringContaining("worker.mjs")]);
     expect(f.timeout.mock.calls.filter(([, ms]) => ms === 5_000)).toHaveLength(1);
     expect(f.timeout.mock.calls.some(([, ms]) => ms === 10)).toBe(false);
-    expect(f.markerChecks()).toBe(2); // initial check plus the existing no-replay check AFTER teardown
+    expect(f.markerChecks()).toBe(4); // initial, deadline, pre-stop, then the no-replay check AFTER teardown
     expect(f.order.indexOf("watch-close")).toBeLessThan(f.order.indexOf("stop"));
     expect(f.warn).toHaveBeenCalledOnce();
+    expect(f.warn).toHaveBeenCalledWith("scope admission timed out before an authenticated marker");
     expectAdmissionCleaned(f);
     f.finish();
   });

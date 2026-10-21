@@ -59,3 +59,12 @@ runs:
         archive="$PWD/dist.tar"
         cd "$GITHUB_WORKSPACE"
         tar -xf "$archive"
+        # The gated build predates this job's checkout, so tests that compare
+        # dist mtimes with source mtimes would see it as stale. Only after
+        # proving it was built from this exact commit, mark it as fresh.
+        built="$(cat dist/.gated-source-sha 2>/dev/null || true)"
+        if [ "$built" != "$GITHUB_SHA" ]; then
+          echo "gated build is from '${built:-unknown}', not $GITHUB_SHA" >&2
+          exit 1
+        fi
+        find dist -exec touch {} +

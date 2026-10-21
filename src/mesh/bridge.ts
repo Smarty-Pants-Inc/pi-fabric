@@ -740,9 +740,16 @@ const bridgeIncarnationWithFloor = (
   return next;
 };
 
+export interface StoreBridgeMirrorPhaseObservation {
+  phase: "compute" | "leaseRead" | "leaseDigest";
+  holdMs: number;
+}
+
 export interface StoreBridgeSideOptions {
   /** Optional raw callback for local reproduction; observer failures are ignored. */
   observeWriteFence?: BridgeFenceObservationCallback;
+  /** Optional synchronous phase callback for local reproduction; observer failures are ignored. */
+  observeMirrorPhase?: (observation: StoreBridgeMirrorPhaseObservation) => void;
 }
 
 export class StoreBridgeSide implements BridgeSide {
@@ -756,6 +763,7 @@ export class StoreBridgeSide implements BridgeSide {
   #leaseProcess: Promise<BridgeLeaseProcess | undefined> | undefined;
   readonly #fenceObservations = new BridgeFenceObservationBuffer();
   readonly #fenceObservers = new Set<BridgeFenceObservationCallback>();
+  readonly #observeMirrorPhase: StoreBridgeSideOptions["observeMirrorPhase"];
 
   constructor(
     readonly store: MeshStore,
@@ -766,6 +774,7 @@ export class StoreBridgeSide implements BridgeSide {
     options: StoreBridgeSideOptions = {},
   ) {
     if (options.observeWriteFence) this.#fenceObservers.add(options.observeWriteFence);
+    this.#observeMirrorPhase = options.observeMirrorPhase;
     if (!validBridgeName(peer)) throw new Error(`Invalid bridge peer name: ${peer}`);
     assertBridgeStateBackend(store.root, store.stateBackend);
     // A skipped root's effects are deferred, not successful no-ops: CommitOutbox catches the
@@ -818,6 +827,17 @@ export class StoreBridgeSide implements BridgeSide {
     return measureBridgeFence(this.store.withStateWriteFence.bind(this.store), operation, {
       peer: this.peer, site, scope: "state-write-fence", attempt, optimized, fallback, retry: attempt > 0,
     }, observation => this.#observeFence(observation));
+  }
+
+  #measureMirrorPhase<T>(phase: StoreBridgeMirrorPhaseObservation["phase"], op: () => T): T {
+    const observer = this.#observeMirrorPhase;
+    if (!observer) return op();
+    const startedAt = monotonicClock.now();
+    try { return op(); }
+    finally {
+      try { observer({ phase, holdMs: monotonicClock.now() - startedAt }); }
+      catch { /* phase telemetry is advisory */ }
+    }
   }
 
   #scanInWriteBatch<T>(attempt: number, optimized: boolean, fallback: boolean, operation: () => T): T {
@@ -1073,7 +1093,7 @@ export class StoreBridgeSide implements BridgeSide {
     hostEntries: MeshStateEntry[], participantEntries: MeshStateEntry[], handoffEntries: readonly MeshStateEntry[],
   ): { presence: BridgePresence; voided: MeshStateEntry[]; leases: ReadonlyMap<string, FabricHostLease>; now: number } {
     const now = this.now();
-    const leases = readHostLeases(this.store.root);
+    const leases = this.#measureMirrorPhase("leaseRead", () => readHostLeases(this.store.root));
     const handoffs = bridgeHandoffScope(handoffEntries, hostEntries, participantEntries, () => leases, now, this.peer);
     const reserved = new Set<string>(handoffs.reserved);
     // Only a handoff in force to this link waives a (dead) native's own ids (smarty-dev#9074).
@@ -1519,16 +1539,17 @@ export class StoreBridgeSide implements BridgeSide {
       rememberLeaseIdentifier(participant.ownerIdentityId);
       rememberLeaseIdentifier(participant.rootId);
     }
-    const leaseIncarnationDigest = (leases: ReadonlyMap<string, FabricHostLease>, includeAll = false): string => contentDigest(
-      [...leases.values()].filter(lease => includeAll || consultedLeaseIdentifiers.has(lease.id) ||
-        consultedLeaseIdentifiers.has(lease.identityId) || consultedLeaseIdentifiers.has(lease.rootId))
-        .sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0)
-        .map(lease => includeAll ? lease : ({
-          id: lease.id, rootId: lease.rootId, identityId: lease.identityId, ...incarnationOf(lease),
-          bridgeSupersededTokens: bridgeSupersededTokensOf(lease.bridgeSupersededTokens),
-          bridgeSupersededTokenSeen: bridgeSupersededSeenOf(lease.bridgeSupersededTokenSeen),
-        })),
-    );
+    const leaseIncarnationDigest = (leases: ReadonlyMap<string, FabricHostLease>, includeAll = false): string =>
+      this.#measureMirrorPhase("leaseDigest", () => contentDigest(
+        [...leases.values()].filter(lease => includeAll || consultedLeaseIdentifiers.has(lease.id) ||
+          consultedLeaseIdentifiers.has(lease.identityId) || consultedLeaseIdentifiers.has(lease.rootId))
+          .sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0)
+          .map(lease => includeAll ? lease : ({
+            id: lease.id, rootId: lease.rootId, identityId: lease.identityId, ...incarnationOf(lease),
+            bridgeSupersededTokens: bridgeSupersededTokensOf(lease.bridgeSupersededTokens),
+            bridgeSupersededTokenSeen: bridgeSupersededSeenOf(lease.bridgeSupersededTokenSeen),
+          })),
+      ));
     // Recompute only the collision protection from the raw records and current leases. The
     // commit-time check uses the entries captured by the early plan, which stateUnchangedSince
     // proves are still current, so it does not perform a topology scan while holding state.db.
@@ -1601,7 +1622,7 @@ export class StoreBridgeSide implements BridgeSide {
     // The pass's plan on one state view: admission, reservations and the CAS versions. undefined: halted.
     const compute = (view: MeshBatchView, participantFiles: ReturnType<typeof participantFileSnapshot>):
       { ops: MeshBatchOperation[]; leases: BridgeLease[]; removed: BridgeUnlease[];
-        judged: { leases: ReadonlyMap<string, FabricHostLease>; now: number } } | undefined => {
+        judged: { leases: ReadonlyMap<string, FabricHostLease>; now: number } } | undefined => this.#measureMirrorPhase("compute", () => {
         const leases: BridgeLease[] = [];
         const removed: BridgeUnlease[] = [];
         const hostEntries = view.listAll(HOST_PREFIX);
@@ -1844,7 +1865,7 @@ export class StoreBridgeSide implements BridgeSide {
         // A handoff a native voided goes in this commit: the void lasts if that native leaves again.
         if (!partial) for (const entry of scan.voided) ops.push({ kind: "delete", key: entry.key, ifVersion: entry.version, onConflict: "skip" });
         return { ops, leases, removed, judged: { leases: scan.leases, now: scan.now } };
-    };
+    });
     for (let attempt = 0; ; attempt += 1) {
       // Participant files are read before the state transaction and revalidated in it by their
       // directory stamp (R11): only a change in between reads them again under the lock.
@@ -1886,7 +1907,8 @@ export class StoreBridgeSide implements BridgeSide {
               // The topology entries themselves come from the early raw scan: stateUnchangedSince
               // proves that snapshot is still current, avoiding a full topology scan in the fence.
               const needsLeaseValidation = judgesLeaseLiveness || consultedLeaseIdentifiers.size > 0;
-              const currentLeases = needsLeaseValidation ? readHostLeases(this.store.root) : planned.judged.leases;
+              const currentLeases = needsLeaseValidation
+                ? this.#measureMirrorPhase("leaseRead", () => readHostLeases(this.store.root)) : planned.judged.leases;
               const leaseStable = !needsLeaseValidation || leaseIncarnationDigest(planned.judged.leases, judgesLeaseLiveness) ===
                 leaseIncarnationDigest(currentLeases, judgesLeaseLiveness);
               if (!leaseStable || (judgesLeaseLiveness && !sameLeaseLiveness(planned.judged.leases, planned.judged.now, this.now()))) {

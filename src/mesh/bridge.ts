@@ -3371,10 +3371,12 @@ export class MeshBridge {
       const now = monotonicClock.now();
       const pendingToRemote = cursor.toRemote.after < localHead;
       const pendingToLocal = cursor.toLocal.after < remoteHead;
+      // Start the deadline when pending work is observed, not at the last success:
+      // time spent idle (or awaiting this probe) is not time spent stalled.
       if (!pendingToRemote) this.#noteDirectionSuccess("toRemote", wallNow, now);
-      else this.#directionPendingSince.toRemote ??= this.#lastOkToRemoteMono ?? now;
+      else this.#directionPendingSince.toRemote ??= now;
       if (!pendingToLocal) this.#noteDirectionSuccess("toLocal", wallNow, now);
-      else this.#directionPendingSince.toLocal ??= this.#lastOkToLocalMono ?? now;
+      else this.#directionPendingSince.toLocal ??= now;
       // Probes observe heads only. Direction loops own forwarding wakes through notifications
       // and their bounded missed-notification safety timers; a probe must not trigger membership.
       const directionalAfter = this.options.directionStallAfterMs ?? BRIDGE_DIRECTION_STALL_AFTER_MS;

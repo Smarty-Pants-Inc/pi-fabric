@@ -5,7 +5,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
-import { ActorLogStore } from "../src/actors/log-store.js";
+import { ActorLogStore, ActorRunArchiveRefusedError } from "../src/actors/log-store.js";
+import { diagnostics } from "../src/core/diagnostics.js";
 
 // smarty-dev#9016: a host started from a login shell runs under umask 002 (Ubuntu USERGROUPS_ENAB + pam_umask). Run
 // directories it created were 0775, and verified retention (pi-fabric#850) refuses group-writable trees, so those
@@ -100,34 +101,34 @@ it.skipIf(process.platform === "win32")("does not follow a symlink swapped in at
     if (String(file).endsWith(tail)) swap();
     return (open as (...args: unknown[]) => unknown)(file, ...rest);
   }) as typeof fs.openSync);
-  await store.retainRun({ sessionFile }, "run-1", source);
+  await expect(store.retainRun({ sessionFile }, "run-1", source)).rejects.toBeInstanceOf(ActorRunArchiveRefusedError);
   vi.restoreAllMocks();
   expect(swapped).toBe(true);
   expect(mode(outside)).toBe(0o755);
 });
 
 // pi-fabric#875 round 2 P1-b: the destination chain is validated BEFORE any copy. An unsafe chain refuses the archive.
-it.skipIf(process.platform === "win32")("does not archive below a group-writable ancestor above the anchor, and warns", async () => {
+it.skipIf(process.platform === "win32")("refuses archival below a group-writable ancestor above the anchor, and logs an error", async () => {
   const { root, source, sessionFile, store } = archiveFixture();
   // The fixture has no actors/ directory: the anchor is the actor's own directory, so `root` is above it.
   fs.chmodSync(root, 0o775);
-  const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
-  await store.retainRun({ sessionFile }, "run-1", source);
+  const logged = vi.spyOn(diagnostics, "error");
+  await expect(store.retainRun({ sessionFile }, "run-1", source)).rejects.toBeInstanceOf(ActorRunArchiveRefusedError);
   expect(fs.existsSync(path.join(root, "actor", "runs"))).toBe(false);
-  expect(warn).toHaveBeenCalledWith(expect.stringMatching(/not archived: .*writable by group or others/));
+  expect(logged).toHaveBeenCalledWith("src/actors/log-store.ts", expect.stringMatching(/archive refused: .*writable by group or others/));
   expect(fs.existsSync(path.join(source, "status.json"))).toBe(true);
 });
 
-it.skipIf(process.platform === "win32")("does not archive through a symlinked destination, and warns", async () => {
+it.skipIf(process.platform === "win32")("refuses archival through a symlinked destination, and logs an error", async () => {
   const { root, source, sessionFile, store } = archiveFixture();
   const outside = path.join(root, "outside");
   fs.mkdirSync(outside, { mode: 0o700 });
   fs.mkdirSync(path.join(root, "actor", "runs"), { mode: 0o700 });
   fs.symlinkSync(outside, path.join(root, "actor", "runs", "run-1"));
-  const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
-  await store.retainRun({ sessionFile }, "run-1", source);
+  const logged = vi.spyOn(diagnostics, "error");
+  await expect(store.retainRun({ sessionFile }, "run-1", source)).rejects.toBeInstanceOf(ActorRunArchiveRefusedError);
   expect(fs.readdirSync(outside)).toEqual([]);
-  expect(warn).toHaveBeenCalledWith(expect.stringMatching(/not archived: .*symbolic link/));
+  expect(logged).toHaveBeenCalledWith("src/actors/log-store.ts", expect.stringMatching(/archive refused: .*symbolic link/));
 });
 
 // pi-fabric#875 round 3: our own group-writable containers at or below the caller's Fabric root (the anchor) are
@@ -182,13 +183,13 @@ it.skipIf(process.platform === "win32")("never writes through a symlink planted 
   const victim = path.join(root, "victim");
   fs.writeFileSync(victim, "victim", { mode: 0o600 });
   fs.symlinkSync(victim, path.join(archive, "status.json"));
-  const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
-  await store.retainRun({ sessionFile }, "run-1", source);
+  const logged = vi.spyOn(diagnostics, "error");
+  await expect(store.retainRun({ sessionFile }, "run-1", source)).rejects.toBeInstanceOf(ActorRunArchiveRefusedError);
   expect(fs.readFileSync(victim, "utf8")).toBe("victim");
   expect(fs.lstatSync(path.join(archive, "status.json")).isSymbolicLink()).toBe(true);
-  expect(warn).toHaveBeenCalledWith(expect.stringMatching(/archive entry status\.json exists and is not our regular file/));
+  expect(logged).toHaveBeenCalledWith("src/actors/log-store.ts", expect.stringMatching(/Archive entry status\.json exists and is not our regular file/));
   expect(mode(archive)).toBe(0o755); // healed
-  expect(fs.readFileSync(path.join(archive, "reply.json"), "utf8")).toBe('{"text":"archived"}');
+  expect(fs.existsSync(path.join(source, "reply.json"))).toBe(true);
 });
 
 it.skipIf(process.platform === "win32")("writes new archive entries 0600, and replaces an existing entry only when it is our own regular file", async () => {
@@ -274,12 +275,12 @@ describe.skipIf(process.platform === "win32")("without a traversable fd base (da
     const victim = path.join(root, "victim");
     fs.writeFileSync(victim, "victim", { mode: 0o600 });
     fs.symlinkSync(victim, path.join(archive, "status.json"));
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
-    await store.retainRun({ sessionFile }, "run-1", source);
+    const logged = vi.spyOn(diagnostics, "error");
+    await expect(store.retainRun({ sessionFile }, "run-1", source)).rejects.toBeInstanceOf(ActorRunArchiveRefusedError);
     expect(fs.readFileSync(victim, "utf8")).toBe("victim");
-    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/archive entry status\.json exists and is not our regular file/));
+    expect(logged).toHaveBeenCalledWith("src/actors/log-store.ts", expect.stringMatching(/Archive entry status\.json exists and is not our regular file/));
     expect(mode(archive)).toBe(0o755);
-    expect(mode(path.join(archive, "reply.json"))).toBe(0o600);
+    expect(fs.existsSync(path.join(source, "reply.json"))).toBe(true);
     const fresh = await (async () => {
       const again = archiveFixture();
       await again.store.retainRun({ sessionFile: again.sessionFile }, "run-2", again.source);
@@ -367,5 +368,5 @@ it.skipIf(process.platform === "win32")("archives an actor run's nested tree wit
   for (const directory of [archived, path.join(archived, "child"), path.join(archived, "child", "nested"), path.join(archived, "child", "nested", "grandchild")]) {
     expect(mode(directory), directory).toBe(0o700);
   }
-  expect(mode(path.join(archived, "child", "nested", "grandchild", "status.json"))).toBe(0o644);
+  expect(mode(path.join(archived, "child", "nested", "grandchild", "status.json"))).toBe(0o600);
 });

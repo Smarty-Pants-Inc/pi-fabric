@@ -45,7 +45,7 @@ import os from "node:os";
 import { fileURLToPath } from "node:url";
 import { processIsAlive, scriptSpawnArgs } from "../agents/transports/process-utils.js";
 import { processStartTime } from "../residency/process-identity.js";
-import { ActorLogStore, ACTOR_MESSAGE_ENVELOPE_BYTES, ACTOR_MESSAGE_HISTORY_LIMIT as MESSAGE_HISTORY_LIMIT } from "./log-store.js";
+import { ActorLogStore, ACTOR_MESSAGE_ENVELOPE_BYTES, ACTOR_MESSAGE_HISTORY_LIMIT as MESSAGE_HISTORY_LIMIT, type ActorRunArchiveResult } from "./log-store.js";
 import { FABRIC_ACTOR_HOST_EVENTS, FabricActorBatchPolicyError, MAX_ACTOR_BATCH_EVENTS, DEFAULT_DEAD_LETTER_REPLAY_MAX_AGE_MS, normalizeDeadLetterReplayMaxAgeMs, normalizeActorActivation, normalizeActorBatching, parseEventsStartAt, validateActorCoalesceKey, validateActorDedupeKey, validateActorInferenceContext, type FabricActorInferenceContext } from "./types.js";
 import { ACTOR_ACTIVATION_HEADER } from "../agents/enodev-recovery.js";
 import { activationFilterSkip, normalizeActorActivationFilter, type FabricActorActivationFilter } from "./activation-filter.js";
@@ -5822,7 +5822,7 @@ export class ActorManager {
           try {
             let archived = false;
             if (runId) {
-              archived = await this.#retainRunLog(actor, runId).then(() => true, () => false);
+              archived = await this.#retainRunLog(actor, runId).then(result => result.archived, () => false);
             }
             // Release the in-memory handle and tmp run dir for completed runs;
             // failed runs are retained for agents.status(actor.lastRunId).
@@ -5831,7 +5831,7 @@ export class ActorManager {
             if (previousRunId && previousRunId !== runId) priorArchives.add(previousRunId);
             for (const priorRunId of priorArchives) {
               if (priorRunId === runId) continue;
-              const priorArchived = await this.#retainRunLog(actor, priorRunId).then(() => true, () => false);
+              const priorArchived = await this.#retainRunLog(actor, priorRunId).then(result => result.archived, () => false);
               if (priorArchived) {
                 const cleaned = await this.agents.cleanup(priorRunId).catch(() => ({ cleaned: false }));
                 if (cleaned.cleaned) this.#slotRunIds.get(actor.id)?.delete(priorRunId);
@@ -7141,15 +7141,24 @@ export class ActorManager {
     for (const entry of entries.slice(-DELIVERED_EVENT_MEMORY / 2)) this.#delivered.add(`${actor.id}\0${entry.event.id}`);
   }
 
-  async #retainRunLog(actor: ManagedActor, runId: string): Promise<void> {
+  async #retainRunLog(actor: ManagedActor, runId: string): Promise<ActorRunArchiveResult> {
     let pending = this.#pendingRunArchives.get(actor.id);
     if (!pending) this.#pendingRunArchives.set(actor.id, pending = new Set());
     pending.add(runId);
-    const source = this.agents.runDirectory(runId) ?? this.agents.actorArchiveSources(actor.id, actor.sessionFile).get(runId);
-    await this.#logs.retainRun(actor, runId, source);
-    if (source) await this.agents.commitActorArchive(runId, actor.id, actor.sessionFile);
-    pending.delete(runId);
-    if (!pending.size) this.#pendingRunArchives.delete(actor.id);
+    try {
+      const source = this.agents.runDirectory(runId) ?? this.agents.actorArchiveSources(actor.id, actor.sessionFile).get(runId);
+      const result = await this.#logs.retainRun(actor, runId, source);
+      // Only a verified copy discharges the durable source veto, including on close/restarted-owner retries.
+      if (result.archived) await this.agents.commitActorArchive(runId, actor.id, actor.sessionFile);
+      // A previously archived/cleaned prior run may have no source. That is not an archive receipt or cleanup authority.
+      pending.delete(runId);
+      if (!pending.size) this.#pendingRunArchives.delete(actor.id);
+      return result;
+    } catch (error) {
+      // Keep both the retry join and the on-disk veto. Raw reasons stay in local diagnostics, not public envelopes.
+      diagnostics.error("src/actors/manager.ts", `[pi-fabric] actor ${actor.id} run ${runId} archive refused; source retained for retry: ${error instanceof Error ? error.message : String(error)}`);
+      throw error;
+    }
   }
 
   /**
@@ -9493,6 +9502,7 @@ export class ActorManager {
       createdAt: actor.createdAt,
       updatedAt: actor.updatedAt,
       ...(actor.lastRunId ? { lastRunId: actor.lastRunId } : {}),
+      pendingRunArchives: this.#pendingRunArchives.get(actor.id)?.size ?? 0,
       ...(actor.inFlightRun
         ? {
             inFlightRun: {

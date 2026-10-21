@@ -2,6 +2,21 @@ import { performance } from "node:perf_hooks";
 import { AsyncLocalStorage } from "node:async_hooks";
 import fs from "node:fs";
 import type { MeshStore } from "../src/mesh/store.js";
+import type { StoreBridgeSide } from "../src/mesh/bridge.js";
+import { isMeshSnapshotRetriesExhausted, MESH_SNAPSHOT_RETRIES_EXHAUSTED_CODE } from "../src/core/atomic-write.js";
+
+export type SnapshotExhaustion = { code: typeof MESH_SNAPSHOT_RETRIES_EXHAUSTED_CODE;
+  installationSide: "local" | "remote"; direction: "toLocal" | "toRemote"; phase: string; at: number };
+export function summarizeSnapshotExhaustions(events: SnapshotExhaustion[], load: { from: number; to: number }) {
+  return Object.fromEntries((["toLocal", "toRemote"] as const).map(direction => {
+    const values = events.filter(event => event.direction === direction);
+    const loadCount = values.filter(event => event.at >= load.from && event.at < load.to).length;
+    return [direction, { installationSide: direction === "toLocal" ? "local" : "remote", count: values.length,
+      loadCount, loadPerMinute: load.to > load.from ? loadCount * 60000 / (load.to - load.from) : null,
+      byPhase: Object.fromEntries([...new Set(values.map(event => event.phase))].map(phase =>
+        [phase, values.filter(event => event.phase === phase).length])) }];
+  }));
+}
 
 /** Completion callbacks must be synchronous, immediate, and use the performance clock. */
 export type MirrorPhaseEvent = { phase: "compute" | "leaseRead" | "leaseDigest"; holdMs: number };
@@ -34,6 +49,23 @@ export function observeFences(hubDatabase: string) {
     phaseObservations: PhaseSample[]; invalidPhaseEvents: number };
   const batchScope = new AsyncLocalStorage<{ lockClass: NativeLockClass; active: boolean }>();
   const restorers: Array<() => void> = [];
+  const snapshotExhaustions: SnapshotExhaustion[] = [];
+  const observeMirror = (side: StoreBridgeSide, installationSide: "local" | "remote") => {
+    const original = side.mirror;
+    const wrapped: StoreBridgeSide["mirror"] = async (...args) => {
+      try { return await original.apply(side, args); }
+      catch (error) {
+        // Advisory only: one record per actual failed installation call, never per
+        // traffic-loop log/streak. Preserve the exact native rejection and arguments.
+        try { if (isMeshSnapshotRetriesExhausted(error)) snapshotExhaustions.push({
+          code: MESH_SNAPSHOT_RETRIES_EXHAUSTED_CODE, installationSide,
+          direction: installationSide === "local" ? "toLocal" : "toRemote", phase, at: Date.now() }); } catch { /* observation cannot affect admission */ }
+        throw error;
+      }
+    };
+    side.mirror = wrapped;
+    restorers.push(() => { if (side.mirror === wrapped) side.mirror = original; });
+  };
   let phaseHookSeen = false;
   const outsidePhaseEvents = { compute: 0, leaseRead: 0, leaseDigest: 0, invalid: 0 };
   const transactions = new WeakMap<object, Tx>();
@@ -237,7 +269,7 @@ export function observeFences(hubDatabase: string) {
     });
   };
   return {
-    attach,
+    attach, observeMirror,
     observe: (observation: Observation) => { if (active) {
       if (observation.site.startsWith("mirror.")) active.site = "StoreBridgeSide.mirror";
       active.observations.push({ ...observation });
@@ -256,7 +288,7 @@ export function observeFences(hubDatabase: string) {
     result: () => ({ holds, callbacks, queries: Object.fromEntries(Object.entries(queries).map(([key, entry]) =>
       [key, { calls: entry.calls, totalMs: entry.totalMs, maxMs: entry.maxMs, p50Ms: percentile(entry.samples, .5),
         p99Ms: percentile(entry.samples, .99), sql: entry.sql }])),
-      io, listAllInside, listAllOutside, topologyScansInside, kvFullScansInside, busyBegins, stacks,
+      io, listAllInside, listAllOutside, topologyScansInside, kvFullScansInside, busyBegins, stacks, snapshotExhaustions,
       outsidePhaseEvents: { ...outsidePhaseEvents }, phaseHookSeen, bridgeTransactions: summarizeBridgeTransactions(holds),
       fullScanFallbackCallbacks: callbacks.filter(callback => callback.scans > 0).length }),
     restore: () => { dbProto.exec = originalExec; dbProto.prepare = originalPrepare;
@@ -350,5 +382,5 @@ export function percentile(values: number[], quantile: number): number {
 
 export function distribution(values: number[]) {
   return { n: values.length, totalMs: values.reduce((sum, value) => sum + value, 0),
-    p50Ms: percentile(values, .5), p99Ms: percentile(values, .99), maxMs: values.reduce((max, value) => Math.max(max, value), 0) };
+    p50Ms: percentile(values, .5), p95Ms: percentile(values, .95), p99Ms: percentile(values, .99), maxMs: values.reduce((max, value) => Math.max(max, value), 0) };
 }

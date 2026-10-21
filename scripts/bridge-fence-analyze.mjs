@@ -16,7 +16,7 @@ const safePhase = phase => phases.includes(phase) ? phase : "other";
 function dist(values) {
   const ordered = values.slice().sort((a, b) => a - b);
   const at = q => ordered.length ? ordered[Math.max(0, Math.ceil(ordered.length * q) - 1)] : null;
-  return { n: ordered.length, p50Ms: at(.5), p99Ms: at(.99), maxMs: ordered.at(-1) ?? null };
+  return { n: ordered.length, p50Ms: at(.5), p95Ms: at(.95), p99Ms: at(.99), maxMs: ordered.at(-1) ?? null };
 }
 function txGroups(holds) {
   const group = values => {
@@ -63,17 +63,42 @@ function analyzeLive(out, summary, terminal, config, seed, reports) {
   const initial = backup?.initial, end = backup?.end, delta = backup?.delta;
   const holds = reports.flatMap((report, reportIndex) => (report.metrics?.holds ?? []).map((tx, transactionIndex) => ({ ...tx, reportIndex, transactionIndex })));
   const bridgeTransactions = txGroups(holds);
-  const samples = summary.ageSamples ?? reports.flatMap(report => report.ageSamples ?? []);
-  const validAge = sample => Number.isInteger(sample.link) && sample.link >= 0 && sample.link < 6 && phases.includes(sample.phase) &&
+  const bidirectional = config.bidirectional === true;
+  const samples = (summary.ageSamples ?? reports.flatMap(report => report.ageSamples ?? [])).map(sample =>
+    ({ ...sample, direction: sample.direction ?? (bidirectional ? null : "toLocal") }));
+  const directions = ["toLocal", "toRemote"];
+  const validAge = sample => directions.includes(sample.direction) && Number.isInteger(sample.link) && sample.link >= 0 && sample.link < 6 && phases.includes(sample.phase) &&
     finite(sample.deliveryMs) && sample.deliveryMs >= 0 && finite(sample.sourceAppendToReceiptObservationMs) && sample.sourceAppendToReceiptObservationMs >= 0;
   const age = values => ({ samples: values.length, deliveryMs: dist(values.map(value => value.deliveryMs)),
     sourceAppendToReceiptObservationMs: dist(values.map(value => value.sourceAppendToReceiptObservationMs)) });
   const safeSamples = samples.filter(validAge);
+  const ageByDirection = Object.fromEntries(directions.map(direction => {
+    const values = safeSamples.filter(sample => sample.direction === direction);
+    return [direction, { ...age(values), byPhase: Object.fromEntries(phases.map(phase =>
+      [phase, age(values.filter(sample => sample.phase === phase))]).filter(([, value]) => value.samples)) }];
+  }));
   const ageByPhase = Object.fromEntries(phases.map(phase => [phase, age(safeSamples.filter(sample => sample.phase === phase))]).filter(([, value]) => value.samples));
   const ageByLink = Array.from({ length: 6 }, (_, link) => {
     const values = safeSamples.filter(sample => sample.link === link);
-    return { link, ...age(values), byPhase: Object.fromEntries(phases.map(phase => [phase, age(values.filter(sample => sample.phase === phase))]).filter(([, value]) => value.samples)) };
+    return { link, ...age(values), byDirection: Object.fromEntries(directions.map(direction => [direction, age(values.filter(sample => sample.direction === direction))])),
+      byPhase: Object.fromEntries(phases.map(phase => [phase, age(values.filter(sample => sample.phase === phase))]).filter(([, value]) => value.samples)) };
   });
+  const load = summary.windows?.load;
+  const loadWindowOk = finite(load?.from) && finite(load?.to) && load.to - load.from === config.loadMs;
+  const inLoad = event => loadWindowOk && event.at >= load.from && event.at < load.to;
+  const sideOk = event => directions.includes(event.direction) && event.installationSide === (event.direction === "toLocal" ? "local" : "remote") &&
+    finite(event.at) && [...phases, "barrier"].includes(event.phase);
+  const rawExhaustions = reports.slice(0, 6).flatMap(report => report.metrics?.snapshotExhaustions ?? []);
+  const exhaustions = rawExhaustions.filter(event => sideOk(event) && event.code === "FABRIC_MESH_SNAPSHOT_RETRIES_EXHAUSTED");
+  const actualMirrorExhaustions = { samples: exhaustions.length, invalidSamples: rawExhaustions.length - exhaustions.length,
+    loadWindowMs: loadWindowOk ? load.to - load.from : null,
+    basis: "Actual typed thrown StoreBridgeSide.mirror errors by FAILED INSTALLATION side; local.mirror=toLocal, remote.mirror=toRemote. Traffic-loop/streak log lines are not counted.",
+    byDirection: Object.fromEntries(directions.map(direction => {
+      const values = exhaustions.filter(event => event.direction === direction), loadCount = values.filter(inLoad).length;
+      return [direction, { installationSide: direction === "toLocal" ? "local" : "remote", count: values.length, loadCount,
+        loadPerMinute: loadWindowOk ? loadCount * 60000 / (load.to - load.from) : null,
+        byPhase: Object.fromEntries([...phases, "barrier"].map(phase => [phase, values.filter(event => event.phase === phase).length])) }];
+    })) };
   const exitZero = children => Array.isArray(children) && children.every(child => child.exitCode === 0 && child.signalCode === null);
   const sourcePins = summary.sourcePins ?? {}, endPins = summary.endSourcePins ?? {};
   const sourceNames = [...new Set([...Object.keys(sourcePins), ...Object.keys(endPins)])].sort();
@@ -128,7 +153,8 @@ function analyzeLive(out, summary, terminal, config, seed, reports) {
     executingAnalyzerMatchesPin: sourcePins["scripts/bridge-fence-analyze.mjs"] === createHash("sha256").update(fs.readFileSync(new URL(import.meta.url))).digest("hex"),
     pinnedLiveConfig: sha(config.backupSha256) && config.backupSha256.startsWith("912705ad") &&
       typeof config.fixtureSeed === "string" && /^[A-Za-z0-9-]{8,80}$/.test(config.fixtureSeed) && config.deliveriesPerLink === 32 &&
-      config.batch === 32 && config.loadMs === 60000 && config.idleMs === 20000 && config.feedRetained === 4096,
+      config.batch === 32 && config.loadMs === 60000 && config.idleMs === 20000 && config.feedRetained === 4096 &&
+      (config.bidirectional === undefined || typeof config.bidirectional === "boolean"),
     actualBackupCopyProof: install?.sha256 === config.backupSha256 && install?.copyHash === config.backupSha256 && install?.bootstrapPreservedSeparately === true &&
       backup?.copySha256 === config.backupSha256 && seed.backup?.sha256 === config.backupSha256 && seed.backup?.copySha256 === config.backupSha256 &&
       equal(seed.backup?.initial, install?.initial) && install?.namespaceCheck?.collisions === 0 && install?.namespaceCheck?.malformedJson === 0 &&
@@ -152,6 +178,16 @@ function analyzeLive(out, summary, terminal, config, seed, reports) {
       ["drops", "duplicates", "outOfOrder", "invalid"].every(key => summary.correctness[key] === 0) &&
       [summary.correctness.sentByWriter, summary.correctness.deliveredByWriter].every(values => values?.length === 6 && values.every(value => value === 32)) &&
       reports.slice(0, 6).every(report => report.sent === 32 && report.delivered === 32),
+    exactBidirectionalSplitWhenRequested: !bidirectional || (directions.every(direction =>
+      summary.correctness?.byDirection?.[direction]?.ok === true && summary.correctness.byDirection[direction].sent === 96 &&
+      summary.correctness.byDirection[direction].delivered === 96 && ageByDirection[direction].samples === 96 &&
+      reports.slice(0, 6).every(report => report.directionCounts?.[direction]?.sent === 16 && report.directionCounts[direction].delivered === 16) &&
+      ageByLink.every(link => link.byDirection[direction].samples === 16))),
+    typedMirrorErrorCollectorsPresent: loadWindowOk && reports.slice(0, 6).every(report => Array.isArray(report.metrics?.snapshotExhaustions)) &&
+      actualMirrorExhaustions.invalidSamples === 0 && directions.every(direction => {
+        const raw = actualMirrorExhaustions.byDirection[direction], saved = summary.snapshotExhaustions?.byDirection?.[direction];
+        return saved?.count === raw.count && saved?.loadCount === raw.loadCount && saved?.loadPerMinute === raw.loadPerMinute;
+      }),
     everyLinkProgress: progress.length === 6 && new Set(progress.map(writer => writer.index)).size === 6 && progress.every(writer =>
       Number.isInteger(writer.index) && writer.index >= 0 && writer.index < 6 && writer.sent === 32 && writer.delivered === 32 && Array.isArray(writer.progress) && writer.progress.length > 0),
     all192AgesJoined: samples.length === 192 && safeSamples.length === 192 && ageByLink.every(link => link.samples === 32) && summary.deliveryAge?.missingJoins === 0,
@@ -170,7 +206,7 @@ function analyzeLive(out, summary, terminal, config, seed, reports) {
     liveView: { profile: "live-backup-b", ok: evidenceGaps.length === 0, assertions, evidenceGaps,
       configuration: { ...pickNumbers(config, ["sessions", "batch", "deliveriesPerLink", "cpuWorkers", "cpuCount", "loadMs", "idleMs", "readEveryMs", "controlEveryMs", "heartbeatMs", "feedRetained"]),
         cpuSet: typeof config.cpuSet === "string" && /^\d+(?:-\d+)?(?:,\d+(?:-\d+)?)*$/.test(config.cpuSet) ? config.cpuSet : null,
-        backupSha256: sha(config.backupSha256) ? config.backupSha256 : null },
+        backupSha256: sha(config.backupSha256) ? config.backupSha256 : null, bidirectional },
       backup: { initial: snapshotView(initial), end: snapshotView(end),
         copyHashMatchesPin: assertions.actualBackupCopyProof, sourceStartEndUnchanged: assertions.stagedSourceStartEndUnchanged,
         nativeKvDelta: pickNumbers(delta, ["unchanged", "changed", "removed", "added"]),
@@ -183,9 +219,17 @@ function analyzeLive(out, summary, terminal, config, seed, reports) {
         fractionsPass: bridgeTransactions.steady.go,
         basis: "Same actual bridge-class TX ranked by hold; load/drain/idlebusy p99 AND max a/hold >= .5, complete and consistent. Startup and stop remain in all-phase tail. Nonstartup authoritative work is fallback-or-recovery, not silently excluded. No marginal-percentile addition." },
       age: { ...age(safeSamples), invalidSamples: samples.length - safeSamples.length, missingJoins: summary.deliveryAge?.missingJoins ?? null,
-        byPhase: ageByPhase, byLink: ageByLink, origins: "deliveryMs: destination append minus source append; observationMs: receipt observation minus source append. Same-host clocks; not recipient runtime age." },
+        byDirection: ageByDirection, byPhase: ageByPhase, byLink: ageByLink,
+        origins: "deliveryMs: destination append minus source append, joined on the actual source append ID -> destination data.bridge.id, direction and link; observationMs: receipt observation minus source append. Same-host clocks; not recipient runtime age. p95 is event-age p95, NOT p95 of per-minute maxima; no destination-local-ID uniqueness claim." },
+      actualMirrorExhaustions,
       correctness: { ok: summary.correctness?.ok === true,
-        ...pickNumbers(summary.correctness, ["historicalEvents", "sent", "delivered", "drops", "duplicates", "outOfOrder", "invalid"]) },
+        ...pickNumbers(summary.correctness, ["historicalEvents", "sent", "delivered", "drops", "duplicates", "outOfOrder", "invalid"]),
+        byDirection: Object.fromEntries(directions.map(direction => {
+          const check = summary.correctness?.byDirection?.[direction] ?? (!bidirectional && direction === "toLocal" ? summary.correctness : null);
+          return [direction, { exercised: bidirectional || direction === "toLocal", ok: check ? check.ok === true : null,
+            ...pickNumbers(check, ["sent", "delivered", "drops", "duplicates", "outOfOrder", "invalid"]) }];
+        })) },
+      identityScope: "Exact synthetic native source root/sender, destination recipient, bridge origin/source ID, payload and per-source order checked by native log traversals. Production root/incarnation/admission/dedupe algorithms are unchanged; no takeover/incarnation-race coverage or destination-local-ID uniqueness asserted.",
       progress: progress.map(writer => ({ ...pickNumbers(writer, ["index", "sent", "delivered", "deliveredDuringLoad"]),
         samples: Array.isArray(writer.progress) ? writer.progress.length : 0 })),
       ambientHostPressure: Object.fromEntries(["load", "drain", "idlebusy"].map(phase => [phase, pickNumbers(pressure?.[phase], ["elapsedMs", "ambientCpuBusyPct", "cpuPsiSomePct", "ioPsiSomePct", "memoryPsiSomePct"])])),
@@ -302,7 +346,7 @@ else {
   const [before, after] = results;
   const live = before.config.profile === "live-backup-b" || after.config.profile === "live-backup-b";
   const sameConfig = ["loadMs", "idleMs", "batch", "sessions", "readEveryMs", "controlEveryMs", "heartbeatMs", "feedRetained", "targetDbBytes", "profile", "seedMs",
-    ...(live ? ["backupSha256", "fixtureSeed", "deliveriesPerLink", "cpuWorkers", "cpuSet", "cpuCount"] : [])]
+    ...(live ? ["backupSha256", "fixtureSeed", "deliveriesPerLink", "bidirectional", "cpuWorkers", "cpuSet", "cpuCount"] : [])]
     .every(key => before.config[key] === after.config[key]);
   const sameSeed = live ? equal(before.backup?.initial, after.backup?.initial) && equal(before.seed.drivers, after.seed.drivers) &&
     before.seed.historicalEvents === after.seed.historicalEvents : ["historicalEvents", "stateRows", "hostRows", "participantRows", "controlSeenRows", "hostLeaseFiles", "participantFiles"]

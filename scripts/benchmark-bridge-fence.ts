@@ -12,7 +12,8 @@ import { MeshStore, type MeshEvent, type MeshIdentity, type MeshBatchOperation }
 import { SqliteStateStore } from "../src/mesh/state-sqlite.js";
 import { writeHostLease } from "../src/topology/host-leases.js";
 import { writeParticipantFile } from "../src/topology/participant-files.js";
-import { distribution, observeFences } from "./bridge-fence-metrics.js";
+import { distribution, observeFences, summarizeSnapshotExhaustions,
+  type SnapshotExhaustion } from "./bridge-fence-metrics.js";
 import { configurePrivateFeed, inventory, sizes } from "./bridge-fence-inventory.js";
 import { seedProductionExtras, seedHistoricalMetadata, seedProductionFiles } from "./bridge-fence-profile.js";
 import { backupManifest, backupSourceHash, captureBackup, backupDelta, installBackup, seedBackupDrivers, seedBackupFiles, cpuWorker, pressureSample, pressureWindow, harnessAffinity, ownedSchedule, ownedScheduleWindow,
@@ -37,7 +38,8 @@ import { backupManifest, backupSourceHash, captureBackup, backupDelta, installBa
  *
  * Reader pacing is the workload, not production polling. MeshBridge.run uses its REAL
  * filesystem notifications and bounded safety-net timers. One outstanding 32-event source
- * batch per link bounds backlog. The producer waits for real destination publish receipts.
+ * batch per link bounds backlog (live --bidirectional: 16 each way, still 32 TOTAL).
+ * The producer waits for real destination publish receipts.
  * This is a saturated bounded-window workload, NOT a claim that 100k new deliveries fit 30 s.
  */
 const RUNNER = fileURLToPath(new URL("./bridge-fence-runner.mjs", import.meta.url));
@@ -55,7 +57,62 @@ function configureProfile(profile: string, fixtureSeed = "") {
   if (liveBackup) { fixture = backupManifest(fixtureSeed); HUB_ID = fixture.hubId; }
 }
 const historyId = (n: number) => `${fixture?.historyPrefix ?? "fence-history-"}${n}`;
-const deliveryId = (writer: number, ordinal: number) => `${fixture?.deliveryPrefix ?? "fence-delivery-"}${writer}-${ordinal}`;
+type Direction = "toLocal" | "toRemote";
+export type BridgeDiagnosticKind = "dropped" | "refused" | "skipped";
+export type BridgeDiagnosticAttribution = "cohort" | "unrelated" | "unattributable";
+export type BridgeDiagnosticClassification = { direction: Direction; kind: BridgeDiagnosticKind; attribution: BridgeDiagnosticAttribution };
+export type BridgeDiagnosticAccounting = {
+  total: number;
+  byDirection: Record<Direction, Record<BridgeDiagnosticKind, Record<BridgeDiagnosticAttribution, number>>>;
+};
+const DIAGNOSTIC_KINDS: BridgeDiagnosticKind[] = ["dropped", "refused", "skipped"];
+const DIAGNOSTIC_ATTRIBUTIONS: BridgeDiagnosticAttribution[] = ["cohort", "unrelated", "unattributable"];
+const diagnosticBucket = () => ({ cohort: 0, unrelated: 0, unattributable: 0 });
+const diagnosticDirection = () => ({ dropped: diagnosticBucket(), refused: diagnosticBucket(), skipped: diagnosticBucket() });
+export function createBridgeDiagnosticAccounting(): BridgeDiagnosticAccounting {
+  return { total: 0, byDirection: { toLocal: diagnosticDirection(), toRemote: diagnosticDirection() } };
+}
+export function classifyBridgeDiagnostic(line: string, expectedIds: ReadonlyMap<string, Direction>): BridgeDiagnosticClassification | undefined {
+  const header = /^(toLocal|toRemote): (dropped|refused|skipped)\b/.exec(line);
+  if (!header) return undefined;
+  const direction = header[1] as Direction, kind = header[2] as BridgeDiagnosticKind;
+  // Parse only complete native line shapes; the captured ID is compared as a whole token.
+  const eventId = kind === "dropped"
+    ? /^to(?:Local|Remote): dropped idempotency conflict sequence \d+ event (\S+) key \S+$/.exec(line)?.[1] ??
+      /^to(?:Local|Remote): dropped \S+ (\S+) from \S+:/.exec(line)?.[1]
+    : kind === "refused"
+      ? /^to(?:Local|Remote): refused \S+ (\S+):/.exec(line)?.[1]
+      : /^to(?:Local|Remote): skipped \S+ (\S+) \(sequence \d+\):/.exec(line)?.[1];
+  const attribution: BridgeDiagnosticAttribution = eventId === undefined ? "unattributable"
+    : expectedIds.has(eventId) ? "cohort" : "unrelated";
+  return { direction, kind, attribution };
+}
+export function recordBridgeDiagnostic(accounting: BridgeDiagnosticAccounting, line: string,
+  expectedIds: ReadonlyMap<string, Direction>): BridgeDiagnosticClassification | undefined {
+  const classification = classifyBridgeDiagnostic(line, expectedIds);
+  if (!classification) return undefined;
+  accounting.total++;
+  accounting.byDirection[classification.direction][classification.kind][classification.attribution]++;
+  return classification;
+}
+export function countsAsBridgeDiagnosticDrop(classification: BridgeDiagnosticClassification, bidirectional: boolean): boolean {
+  // Preserve the legacy toLocal-any-diagnostic rule; bidirectional runs count only exact cohort IDs.
+  return bidirectional ? classification.attribution === "cohort" : classification.direction === "toLocal";
+}
+export function aggregateBridgeDiagnosticAccounting(values: BridgeDiagnosticAccounting[]): BridgeDiagnosticAccounting {
+  const aggregate = createBridgeDiagnosticAccounting();
+  for (const value of values) {
+    aggregate.total += value.total;
+    for (const direction of ["toLocal", "toRemote"] as const) for (const kind of DIAGNOSTIC_KINDS)
+      for (const attribution of DIAGNOSTIC_ATTRIBUTIONS)
+        aggregate.byDirection[direction][kind][attribution] += value.byDirection[direction][kind][attribution];
+  }
+  return aggregate;
+}
+const deliveryId = (writer: number, ordinal: number, direction: Direction = "toLocal") =>
+  `${fixture?.deliveryPrefix ?? "fence-delivery-"}${writer}-${ordinal}${direction === "toRemote" ? "-toRemote" : ""}`;
+const sourceRoot = (writer: number) => fixture?.sources[writer] ?? `session:fence-spoke-${String(writer).padStart(8, "0")}`;
+const recipient = (writer: number, direction: Direction) => direction === "toLocal" ? HUB_ID : sourceRoot(writer);
 const peerName = (n: number) => fixture?.peers[n] ?? `spoke${n}`;
 const hubName = () => fixture?.localName ?? "hub";
 // Inventory's legacy key-derived labels are forbidden on an imported live copy.
@@ -79,7 +136,7 @@ const object = (value: unknown): value is Record<string, unknown> => typeof valu
 type Config = { scratch: string; out: string; hub: string; label: string; loadMs: number; idleMs: number; batch: number; token: string;
   sessions: number; readEveryMs: number; controlEveryMs: number; heartbeatMs: number; feedRetained: number; targetDbBytes: number;
   profile: string; seedMs: number; stateBackup: string; backupSha256: string; fixtureSeed: string;
-  cpuWorkers: number; deliveriesPerLink: number; cpuSet: string; cpuCount: number };
+  cpuWorkers: number; deliveriesPerLink: number; cpuSet: string; cpuCount: number; bidirectional: boolean };
 type Message = { kind: string; until?: number };
 const mail: Message[] = [];
 let receive: ((value: Message) => void) | undefined;
@@ -119,11 +176,12 @@ async function native(store: MeshStore, id: string) {
   writeHostLease(store.root, { id, rootId: id, identityId: id, startedAt: now - 60000, updatedAt: now, expiresAt: now + 600000 });
   return who;
 }
-function payload(writer: number, ordinal: number) {
+function payload(writer: number, ordinal: number, direction: Direction = "toLocal") {
   const bytes = productionB ? (ordinal % 100 === 99 ? 3600 : 850 + (ordinal * 17 + (writer + 1) * 43) % 501)
     : 850 + ((ordinal * 1543 + (writer + 1) * 317) % 2751);
   const command = productionB && writer >= 0 && ordinal % 2 === 1 ? {
-    version: 1, commandId: `${fixture?.commandPrefix ?? "fence-command-"}${writer}-${ordinal}`, targetId: HUB_ID, operation: "followUp", replyTo: HUB_ID,
+    version: 1, commandId: `${fixture?.commandPrefix ?? "fence-command-"}${writer}-${ordinal}${direction === "toRemote" ? "-toRemote" : ""}`,
+    targetId: recipient(writer, direction), operation: "followUp", replyTo: HUB_ID,
   } : {};
   const data = { ...command, writer, ordinal, message: `local-only command ${writer}:${ordinal}`, body: "" };
   data.body = "x".repeat(bytes - Buffer.byteLength(JSON.stringify(data)));
@@ -239,38 +297,58 @@ async function writer(config: Config, index: number) {
   const metrics = observeFences(path.join(config.hub, "state.db"));
   const hub = openStore(config.hub); metrics.attach(hub);
   const far = createStore(path.join(config.scratch, `spoke-${index}`));
-  const from = await native(far, fixture?.sources[index] ?? `session:fence-spoke-${String(index).padStart(8, "0")}`);
+  const from = await native(far, sourceRoot(index));
+  const directions: Direction[] = config.bidirectional ? ["toLocal", "toRemote"] : ["toLocal"];
+  const perDirection = config.deliveriesPerLink / directions.length;
+  const directionCounts = { toLocal: { sent: 0, delivered: 0, deliveredDuringLoad: 0 },
+    toRemote: { sent: 0, delivered: 0, deliveredDuringLoad: 0 } };
   let delivered = 0, sent = 0, logDrops = 0, deliveredDuringLoad = 0, loadUntil = Infinity;
+  const diagnosticAccounting = createBridgeDiagnosticAccounting();
+  const expectedDiagnosticIds = new Map<string, Direction>();
   let bridgePhase = "startup";
   const sourceObservations: Array<BridgeFenceObservation & { phase: string }> = [];
-  const sourceEvents = new Map<string, { createdAt: number; publicationReturnedAt: number }>();
-  const destinationEvents = new Map<string, { createdAt: number; receiptObservedAt: number; phase: string }>();
+  const sourceEvents = new Map<string, { direction: Direction; createdAt: number; publicationReturnedAt: number }>();
+  const destinationEvents = new Map<string, { direction: Direction; createdAt: number; receiptObservedAt: number; phase: string }>();
   const progress: Array<{ at: number; phase: string; sent: number; delivered: number }> = [];
   const recordProgress = () => { if (liveBackup) progress.push({ at: Date.now(), phase: bridgePhase, sent, delivered }); };
   let deliveryWake: (() => void) | undefined;
   let runError: unknown;
-  const note = (events: MeshEvent[]) => {
-    const matching = events.filter(event => isDeliveryTopic(event.topic) && object(event.data) && event.data.writer === index);
+  const note = (direction: Direction, events: MeshEvent[]) => {
+    const matching = events.filter(event => {
+      if (!isDeliveryTopic(event.topic) || !object(event.data) || event.data.writer !== index) return false;
+      if (!config.bidirectional) return true;
+      const data = event.data;
+      return event.verification === "bridge" && Number.isInteger(data.ordinal) && object(data.bridge) &&
+        data.bridge.from === (direction === "toLocal" ? peerName(index) : hubName()) &&
+        data.bridge.id === deliveryId(index, Number(data.ordinal), direction);
+    });
     if (liveBackup) for (const event of matching) {
       const data = event.data as Record<string, unknown>;
       if (object(data.bridge) && typeof data.bridge.id === "string") destinationEvents.set(data.bridge.id,
-        { createdAt: event.createdAt, receiptObservedAt: Date.now(), phase: Date.now() <= loadUntil ? "load" : "drain" });
+        { direction, createdAt: event.createdAt, receiptObservedAt: Date.now(), phase: Date.now() <= loadUntil ? "load" : "drain" });
     }
     const count = matching.length;
-    delivered += count;
-    if (Date.now() <= loadUntil) deliveredDuringLoad += count;
+    delivered += count; directionCounts[direction].delivered += count;
+    if (Date.now() <= loadUntil) { deliveredDuringLoad += count; directionCounts[direction].deliveredDuringLoad += count; }
     recordProgress(); deliveryWake?.();
   };
-  const batch = hub.publishBatch.bind(hub), single = hub.publish.bind(hub);
-  hub.publishBatch = async inputs => { const events = await batch(inputs); note(events); return events; };
-  hub.publish = async input => { const event = await single(input); note([event]); return event; };
-  const bridge = new MeshBridge({ localName: hubName(), remoteName: peerName(index),
-    local: new StoreBridgeSide(hub, peerName(index), Date.now, productionB, {
-      observeWriteFence: observation => { metrics.observe(observation); sourceObservations.push({ ...observation, phase: bridgePhase }); },
-      ...(liveBackup ? { observeMirrorPhase: metrics.observeMirrorPhase } : {}),
-    }), remote: new StoreBridgeSide(far, hubName(), Date.now, productionB),
+  for (const direction of directions) {
+    const destination = direction === "toLocal" ? hub : far;
+    const batch = destination.publishBatch.bind(destination), single = destination.publish.bind(destination);
+    destination.publishBatch = async inputs => { const events = await batch(inputs); note(direction, events); return events; };
+    destination.publish = async input => { const event = await single(input); note(direction, [event]); return event; };
+  }
+  const local = new StoreBridgeSide(hub, peerName(index), Date.now, productionB, {
+    observeWriteFence: observation => { metrics.observe(observation); sourceObservations.push({ ...observation, phase: bridgePhase }); },
+    ...(liveBackup ? { observeMirrorPhase: metrics.observeMirrorPhase } : {}),
+  });
+  const remote = new StoreBridgeSide(far, hubName(), Date.now, productionB);
+  if (liveBackup) { metrics.observeMirror(local, "local"); metrics.observeMirror(remote, "remote"); }
+  const bridge = new MeshBridge({ localName: hubName(), remoteName: peerName(index), local, remote,
     cursorPath: path.join(config.scratch, `cursor-${index}.json`),
-    log: line => { if (/toLocal: (dropped|refused|skipped)/.test(line)) logDrops++;
+    log: line => {
+      const diagnostic = recordBridgeDiagnostic(diagnosticAccounting, line, expectedDiagnosticIds);
+      if (diagnostic && countsAsBridgeDiagnosticDrop(diagnostic, config.bidirectional)) logDrops++;
       // Native metric lines contain only fixed labels + our synthetic peer; keep those unchanged.
       // Other diagnostics may contain imported identity values, so retain only an aggregate-safe hash.
       const safeLine = !liveBackup || /^bridge (write-fence|delivery-age) v1 /.test(line) ? line : `native diagnostic redacted sha256=${hash(line)}`;
@@ -278,8 +356,8 @@ async function writer(config: Config, index: number) {
   let running: Promise<void> | undefined;
   let endLoad: ReturnType<typeof setTimeout> | undefined;
   const partial = (reason: string) => writeJson(path.join(config.out, `writer-${index}.partial.json`), {
-    ok: false, partial: true, reason, pid: process.pid, index, sent, delivered, deliveredDuringLoad, phase: bridgePhase,
-    sourceObservations, progress, metrics: metrics.result() });
+    ok: false, partial: true, reason, pid: process.pid, index, sent, delivered, deliveredDuringLoad, logDrops, phase: bridgePhase,
+    diagnosticAccounting, sourceObservations, directionCounts, progress, metrics: metrics.result() });
   const interrupted = () => { partial("owned SIGTERM"); process.exit(143); };
   process.once("SIGTERM", interrupted);
   try {
@@ -292,26 +370,39 @@ async function writer(config: Config, index: number) {
     endLoad = setTimeout(() => { metrics.phase("drain"); bridgePhase = "drain"; recordProgress(); }, Math.max(0, loadUntil - Date.now()));
     running = bridge.run().catch(error => { runError = error; deliveryWake?.(); });
     while (Date.now() < go.until && (!config.deliveriesPerLink || sent < config.deliveriesPerLink)) {
-      const count = config.deliveriesPerLink ? Math.min(config.batch, config.deliveriesPerLink - sent) : config.batch;
-      const inputs = Array.from({ length: count }, (_, n) => ({ id: deliveryId(index, sent + n),
-        topic: deliveryTopic(sent + n), kind: productionB && (sent + n) % 2 === 1 ? "followUp" : "ask",
-        from, to: HUB_ID, data: payload(index, sent + n) }));
-      let committed = 0;
-      while (committed < inputs.length) {
-        const written = await far.publishBatch(inputs.slice(committed));
-        if (liveBackup && !written.length) throw new Error("source publication made no progress");
-        if (liveBackup) for (const event of written) sourceEvents.set(event.id, { createdAt: event.createdAt, publicationReturnedAt: Date.now() });
-        committed += written.length;
+      // Offer both bounded source batches before waiting for either direction. The
+      // native bridge alone schedules forwarding, admission, retries and backoff.
+      for (const direction of directions) {
+        const counts = directionCounts[direction];
+        const count = config.deliveriesPerLink ? Math.min(config.batch, perDirection - counts.sent) : config.batch;
+        const inputs = Array.from({ length: count }, (_, n) => {
+          const id = deliveryId(index, counts.sent + n, direction);
+          expectedDiagnosticIds.set(id, direction);
+          return { id, topic: deliveryTopic(counts.sent + n),
+            kind: productionB && (counts.sent + n) % 2 === 1 ? "followUp" : "ask",
+            from: direction === "toLocal" ? from : identity(HUB_ID), to: recipient(index, direction),
+            data: payload(index, counts.sent + n, direction) };
+        });
+        const source = direction === "toLocal" ? far : hub;
+        let committed = 0;
+        while (committed < inputs.length) {
+          const written = await source.publishBatch(inputs.slice(committed));
+          if (liveBackup && !written.length) throw new Error("source publication made no progress");
+          if (liveBackup) for (const event of written) sourceEvents.set(event.id,
+            { direction, createdAt: event.createdAt, publicationReturnedAt: Date.now() });
+          committed += written.length;
+        }
+        counts.sent += committed; sent += committed; recordProgress();
       }
-      sent += committed; recordProgress();
       const bound = go.until + 90000;
-      while (delivered < sent) {
+      const pending = () => directions.some(direction => directionCounts[direction].delivered < directionCounts[direction].sent);
+      while (pending()) {
         if (runError) throw runError;
         if (Date.now() >= bound) throw new Error(`writer ${index}: delivery timeout (${delivered}/${sent})`);
         await new Promise<void>(resolve => {
           const timer = setTimeout(() => { deliveryWake = undefined; resolve(); }, Math.min(20000, bound - Date.now()));
           deliveryWake = () => { clearTimeout(timer); deliveryWake = undefined; resolve(); };
-          if (delivered >= sent || runError) deliveryWake();
+          if (!pending() || runError) deliveryWake();
         });
       }
     }
@@ -333,12 +424,13 @@ async function writer(config: Config, index: number) {
     metrics.phase("stop"); bridgePhase = "stop";
     await bridge.stop(); await running;
     if (runError) throw runError;
-    const ageSamples: Array<{ link: number; phase: string; deliveryMs: number; sourceAppendToReceiptObservationMs: number }> = [];
+    const ageSamples: Array<{ link: number; direction: Direction; phase: string; deliveryMs: number; sourceAppendToReceiptObservationMs: number }> = [];
     let missingAgeJoins = 0;
-    if (liveBackup) for (let ordinal = 0; ordinal < config.deliveriesPerLink; ordinal++) {
-      const id = deliveryId(index, ordinal), source = sourceEvents.get(id), destination = destinationEvents.get(id);
-      if (!source || !destination || ![source.createdAt, destination.createdAt, destination.receiptObservedAt].every(Number.isFinite)) { missingAgeJoins++; continue; }
-      ageSamples.push({ link: index, phase: destination.phase, deliveryMs: Math.max(0, destination.createdAt - source.createdAt),
+    if (liveBackup) for (const direction of directions) for (let ordinal = 0; ordinal < perDirection; ordinal++) {
+      const id = deliveryId(index, ordinal, direction), source = sourceEvents.get(id), destination = destinationEvents.get(id);
+      if (!source || !destination || source.direction !== direction || destination.direction !== direction ||
+        ![source.createdAt, destination.createdAt, destination.receiptObservedAt].every(Number.isFinite)) { missingAgeJoins++; continue; }
+      ageSamples.push({ link: index, direction, phase: destination.phase, deliveryMs: Math.max(0, destination.createdAt - source.createdAt),
         sourceAppendToReceiptObservationMs: Math.max(0, destination.receiptObservedAt - source.createdAt) });
     }
     if (liveBackup) writeJson(path.join(config.out, `writer-${index}.age-evidence.json`), {
@@ -347,8 +439,9 @@ async function writer(config: Config, index: number) {
       clock: "actual source append createdAt joined to destination data.bridge.id and destination append createdAt; publication return and receipt observation are separate wall-clock events" });
     recordProgress();
     writeJson(path.join(config.out, `writer-${index}.json`), { ok: sent === delivered && logDrops === 0 &&
-        (!liveBackup || (sent === 32 && ageSamples.length === 32 && missingAgeJoins === 0)),
-      pid: process.pid, role: "writer", index, sent, delivered, deliveredDuringLoad, logDrops, sourceObservations,
+        (!liveBackup || (sent === 32 && ageSamples.length === 32 && missingAgeJoins === 0 &&
+          directions.every(direction => directionCounts[direction].sent === perDirection && directionCounts[direction].delivered === perDirection))),
+      pid: process.pid, role: "writer", index, sent, delivered, deliveredDuringLoad, logDrops, diagnosticAccounting, sourceObservations, directionCounts,
       ...(liveBackup ? { ageSamples, missingAgeJoins, progress } : {}), metrics: metrics.result() });
   } catch (error) { partial(errorText(error)); throw error; }
   finally {
@@ -487,7 +580,7 @@ function pins() {
     "src/mesh/commit-outbox.ts", "src/mesh/bridge-delivery-age.ts", "src/topology/host-leases.ts", "src/topology/participant-files.ts", "scripts/benchmark-bridge-fence.ts", "scripts/bridge-fence-metrics.ts", "scripts/bridge-fence-inventory.ts", "scripts/bridge-fence-profile.ts", "scripts/bridge-fence-backup.ts", "scripts/bridge-fence-analyze.mjs", "scripts/bridge-fence-runner.mjs"]; 
   return Object.fromEntries(names.map(name => [name, hash(fs.readFileSync(name, "utf8"))]));
 }
-function validateLog(hub: MeshStore, sent: number[]) {
+function validateLog(hub: MeshStore, sent: number[], bidirectional = false, direction: Direction = "toLocal", link?: number) {
   const expected = sent.map(() => 0), seen = new Set<string>();
   let history = 0, historicalNext = 0, delivered = 0, duplicates = 0, outOfOrder = 0, invalid = 0;
   let historicalMinPayloadBytes = Infinity, historicalMaxPayloadBytes = 0;
@@ -509,29 +602,43 @@ function validateLog(hub: MeshStore, sent: number[]) {
         history++;
       }
       if (!isDeliveryTopic(event.topic)) continue;
-      delivered++;
       const data = event.data;
+      // A bidirectional store contains its native source appends too. Exclude only
+      // the exact synthetic opposite-direction source, never a bridged receipt.
+      if (bidirectional && event.verification === "mesh" && object(data) && Number.isInteger(data.writer) && Number.isInteger(data.ordinal)) {
+        const writer = Number(data.writer), ordinal = Number(data.ordinal), opposite = direction === "toLocal" ? "toRemote" : "toLocal";
+        if (writer >= 0 && writer < WRITERS && event.id === deliveryId(writer, ordinal, opposite) &&
+          event.from.id === (opposite === "toLocal" ? sourceRoot(writer) : HUB_ID)) continue;
+      }
+      delivered++;
       if (!object(data) || !Number.isInteger(data.writer) || !Number.isInteger(data.ordinal)) { invalid++; continue; }
       const writer = Number(data.writer), ordinal = Number(data.ordinal), marker = `${writer}:${ordinal}`;
       if (seen.has(marker)) duplicates++;
       seen.add(marker);
       if (writer < 0 || writer >= WRITERS || ordinal !== expected[writer]) outOfOrder++;
       if (writer >= 0 && writer < WRITERS) expected[writer] = expected[writer]! + 1;
-      const want = payload(writer, ordinal);
-      if (event.verification !== "bridge" || event.to !== HUB_ID || !object(data.bridge) ||
-        data.bridge.from !== peerName(writer) || data.bridge.id !== deliveryId(writer, ordinal) ||
-        data.body !== want.body || data.message !== want.message) invalid++;
+      const want = payload(writer, ordinal, direction);
+      const { bridge: _bridge, ...actualPayload } = data;
+      const sender = direction === "toLocal" ? sourceRoot(writer) : HUB_ID;
+      if (event.verification !== "bridge" || event.to !== recipient(writer, direction) || !object(data.bridge) ||
+        data.bridge.from !== (direction === "toLocal" ? peerName(writer) : hubName()) || data.bridge.id !== deliveryId(writer, ordinal, direction) ||
+        event.from.id !== sender || event.from.name !== sender || event.from.kind !== "main" ||
+        event.topic !== deliveryTopic(ordinal) || event.kind !== (productionB && ordinal % 2 === 1 ? "followUp" : "ask") ||
+        JSON.stringify(actualPayload) !== JSON.stringify(want) || (link !== undefined && writer !== link)) invalid++;
     }
     if (page.nextOffset === cursor || page.events.length === 0) break;
     cursor = page.nextOffset;
   }
   const drops = sent.reduce((sum, value) => sum + value, 0) - seen.size;
-  return { ok: history === HISTORY && historicalNext === HISTORY && drops === 0 && duplicates === 0 && outOfOrder === 0 && invalid === 0 &&
-      (!liveBackup || (sent.length === 6 && sent.every(count => count === 32) && delivered === 192)) &&
+  const expectedHistory = direction === "toLocal" ? HISTORY : 0;
+  return { ok: history === expectedHistory && historicalNext === expectedHistory && drops === 0 && duplicates === 0 && outOfOrder === 0 && invalid === 0 &&
+      (!liveBackup || (sent.length === 6 && sent.every((count, index) => count ===
+        (link === undefined || link === index ? (bidirectional ? 16 : 32) : 0)) && delivered === sent.reduce((sum, count) => sum + count, 0))) &&
       expected.every((count, i) => count === sent[i]),
     historicalEvents: history, historicalPayloadBytes: { min: historicalMinPayloadBytes, max: historicalMaxPayloadBytes },
     sent: sent.reduce((sum, value) => sum + value, 0), delivered, drops, duplicates, outOfOrder, invalid,
-    sentByWriter: sent, deliveredByWriter: expected, checked: "full real MeshStore.tail traversal, exact per-source ordinal and bridge stamp, payload, recipient and verification" };
+    sentByWriter: sent, deliveredByWriter: expected,
+    checked: "full real MeshStore.tail traversal; logical source bridge-stamp uniqueness, per-source order, exact payload/topic/kind/sender/recipient/verification. Destination-local event ID uniqueness is NOT asserted" };
 }
 function summarize(reports: Array<Record<string, any>>, windows: Record<string, { from: number; to: number }>) {
   const all = reports.flatMap(report => report.metrics.holds as Array<{ site: string; phase: string; began: number; ended: number;
@@ -608,6 +715,8 @@ async function controller() {
     !Number.isSafeInteger(targetDbBytes) || targetDbBytes < 6000000 || targetDbBytes > 30000000) throw new Error("invalid bounded calibration options");
   const stateBackup = option("--state-backup", "")!, backupSha256 = option("--backup-sha256", "")!;
   const cpuWorkers = Number(option("--cpu-workers", "0")), deliveriesPerLink = Number(option("--deliveries-per-link", "0"));
+  // Opt-in only: deliveries-per-link stays TOTAL across directions (16+16, not 32+32).
+  const bidirectional = flags.includes("--bidirectional");
   const affinity = liveBackup ? harnessAffinity() : { cpuSet: "", cpus: [] as number[] };
   const ownDomain = liveBackup ? pressureSample() : undefined;
   if (!Number.isInteger(cpuWorkers) || cpuWorkers < 0 || cpuWorkers > 12 ||
@@ -615,14 +724,14 @@ async function controller() {
       ownDomain.cgroupPressure.cpu?.some == null)) ||
     (liveBackup && (!path.isAbsolute(stateBackup) || !/^[0-9a-f]{64}$/.test(backupSha256) || sessions !== 100 ||
       batch !== 32 || deliveriesPerLink !== 32 || feedRetained !== 4096 || flags.includes("--target-db-bytes"))) ||
-    (!liveBackup && (cpuWorkers !== 0 || deliveriesPerLink !== 0 || stateBackup || backupSha256 || fixtureSeed)))
+    (!liveBackup && (cpuWorkers !== 0 || deliveriesPerLink !== 0 || stateBackup || backupSha256 || fixtureSeed || bidirectional)))
     throw new Error("invalid live-backup options; exact 100 sessions / 6x32 / default feed required, CPU workers 0..12 only in live profile, entire harness must inherit taskset affinity of 4..6 CPUs in a fresh fence-b-*.scope with readable dedicated CPU PSI");
   const seedMs = Number(option("--seed-ms", productionB ? "300000" : "90000"));
   if (!Number.isInteger(seedMs) || seedMs < 90000 || seedMs > 600000) throw new Error("invalid bounded preparation budget");
   const config: Config = { scratch, out, hub: path.join(scratch, "hub"), label: option("--label", "baseline")!, loadMs, idleMs, batch,
     sessions, readEveryMs, controlEveryMs, heartbeatMs, feedRetained, targetDbBytes, profile, seedMs,
     token: hash(`${process.pid}:${Date.now()}:${scratch}`), stateBackup, backupSha256, fixtureSeed, cpuWorkers, deliveriesPerLink,
-    cpuSet: affinity.cpuSet, cpuCount: affinity.cpus.length }; 
+    cpuSet: affinity.cpuSet, cpuCount: affinity.cpus.length, bidirectional }; 
   const configFile = path.join(out, "config.json"); writeJson(configFile, config);
   writeJson(path.join(scratch, "owner.json"), { token: config.token, pid: process.pid, out });
   const startPins = pins(); writeJson(path.join(out, "source-pins.json"), startPins);
@@ -738,9 +847,34 @@ async function controller() {
     const cpuReports = (await bounded(Promise.all(cpuChildren.map(child => wait(child, "cpuReport"))), 5000, "CPU terminal reports")).map((message, index) => {
       writeJson(path.join(out, `cpu-${index}.json`), message.report); return message.report as Record<string, any>;
     });
-    const correctness = validateLog(hub, reports.slice(0, WRITERS).map(report => Number(report.sent)));
-    const ageSamples = reports.slice(0, WRITERS).flatMap(report => report.ageSamples ?? []) as Array<{
-      link: number; phase: string; deliveryMs: number; sourceAppendToReceiptObservationMs: number }>;
+    const writerReports = reports.slice(0, WRITERS);
+    let correctness = validateLog(hub, writerReports.map(report => Number(config.bidirectional ? report.directionCounts.toLocal.sent : report.sent)), config.bidirectional);
+    if (config.bidirectional) {
+      const toLocal = correctness;
+      const remoteChecks = writerReports.map((_report, index) => {
+        const far = openStore(path.join(config.scratch, `spoke-${index}`));
+        try { return validateLog(far, writerReports.map((value, link) => link === index ? Number(value.directionCounts.toRemote.sent) : 0),
+          true, "toRemote", index); }
+        finally { far.closeState(); }
+      });
+      const sumRemote = (key: "sent" | "delivered" | "drops" | "duplicates" | "outOfOrder" | "invalid") =>
+        remoteChecks.reduce((sum, check) => sum + check[key], 0);
+      const toRemote = { ok: remoteChecks.every(check => check.ok),
+        sent: sumRemote("sent"), delivered: sumRemote("delivered"), drops: sumRemote("drops"),
+        duplicates: sumRemote("duplicates"), outOfOrder: sumRemote("outOfOrder"), invalid: sumRemote("invalid"),
+        sentByWriter: remoteChecks.map((check, index) => check.sentByWriter[index]),
+        deliveredByWriter: remoteChecks.map((check, index) => check.deliveredByWriter[index]), links: remoteChecks };
+      correctness = { ...toLocal, ok: toLocal.ok && toRemote.ok,
+        sent: toLocal.sent + toRemote.sent, delivered: toLocal.delivered + toRemote.delivered,
+        drops: toLocal.drops + toRemote.drops, duplicates: toLocal.duplicates + toRemote.duplicates,
+        outOfOrder: toLocal.outOfOrder + toRemote.outOfOrder, invalid: toLocal.invalid + toRemote.invalid,
+        sentByWriter: writerReports.map(report => Number(report.sent)),
+        deliveredByWriter: writerReports.map((_, index) => toLocal.deliveredByWriter[index]! + toRemote.deliveredByWriter[index]!) };
+      // Keep per-direction traversal receipts as well as the legacy 192-total fields.
+      Object.assign(correctness, { byDirection: { toLocal, toRemote } });
+    }
+    const ageSamples = writerReports.flatMap(report => report.ageSamples ?? []) as Array<{
+      link: number; direction: Direction; phase: string; deliveryMs: number; sourceAppendToReceiptObservationMs: number }>;
     const missingAgeJoins = reports.slice(0, WRITERS).reduce((sum, report) => sum + Number(report.missingAgeJoins ?? 0), 0);
     let backup: Record<string, unknown> | undefined;
     if (liveBackup) {
@@ -753,6 +887,9 @@ async function controller() {
     const endPins = pins();
     const sourceUnchanged = JSON.stringify(startPins) === JSON.stringify(endPins);
     const summary = summarize(reports, windows);
+    const diagnosticAccounting = aggregateBridgeDiagnosticAccounting(writerReports.map(report =>
+      report.diagnosticAccounting as BridgeDiagnosticAccounting));
+    const snapshotExhaustions = writerReports.flatMap(report => report.metrics.snapshotExhaustions ?? []) as SnapshotExhaustion[];
     result = { ok: correctness.ok && reports.every(report => report.ok) && cpuReports.every(report => report.ok) && sourceUnchanged &&
         (!liveBackup || (ageSamples.length === 192 && missingAgeJoins === 0 && backup?.sourceUnchanged === true &&
           Object.values(harnessScheduling).every(window => window.valid) && Object.values(phasePressure).every(window => window.ownScopeAttested))), label: config.label, scratch, out,
@@ -762,18 +899,30 @@ async function controller() {
         mechanism: config.feedRetained === 4096 ? "unmodified production default" : "explicit private-root SqliteStateStore.openSync options wrapper; actual engine retention, no fabricated rows" },
       readerRates: reports.slice(WRITERS).map(report => ({ index: report.index, phases: report.phaseRates })),
       profile: config.profile, archiveEnabled: productionB, keyedControlFraction: productionB ? 0.5 : 0,
-      trafficModel: liveBackup ? `Finite exact six-link x32 burst; all bridges + 100 isolated native-root session stores remain active for common 60s; driver-only work writes, NOT legacy 44/31/25 imported row mix; normal <=90s quiet drain and 20s busy-idle; CPU workers only in load/idlebusy; native admission/expiry/history/retention unchanged; no forced stale/fallback injection` : `${productionB ? "50% ordinary fleet.work, 50% keyed fabric.control.command" : "ordinary fleet.work"}; saturated producer with <=32 outstanding events/link; ${config.sessions} independent session MeshStores; ${productionB ? "state updates split 44% topology control-seen /31% actors /25% mesh to retain aggregate feed mix; exact live submix unknown; " : ""}each offers reads every ${config.readEveryMs}ms, control outcome every ${config.controlEveryMs}ms, native lease/participant files every ${config.heartbeatMs}ms; deterministic phase staggering, missed ticks counted, no catch-up burst; no forced stale/fallback injection`,
+      trafficModel: liveBackup ? `Finite exact six-link x32 TOTAL burst (${config.bidirectional ? "16 toLocal + 16 toRemote per link" : "32 toLocal per link, legacy default"}); all bridges + 100 isolated native-root session stores remain active for common 60s; driver-only work writes, NOT legacy 44/31/25 imported row mix; normal <=90s quiet drain and 20s busy-idle; CPU workers only in load/idlebusy; native admission/expiry/history/retention unchanged; no forced stale/fallback injection` : `${productionB ? "50% ordinary fleet.work, 50% keyed fabric.control.command" : "ordinary fleet.work"}; saturated producer with <=32 outstanding events/link; ${config.sessions} independent session MeshStores; ${productionB ? "state updates split 44% topology control-seen /31% actors /25% mesh to retain aggregate feed mix; exact live submix unknown; " : ""}each offers reads every ${config.readEveryMs}ms, control outcome every ${config.controlEveryMs}ms, native lease/participant files every ${config.heartbeatMs}ms; deterministic phase staggering, missed ticks counted, no catch-up burst; no forced stale/fallback injection`,
       deliveredDuringLoad: reports.slice(0, WRITERS).reduce((sum, report) => sum + Number(report.deliveredDuringLoad), 0),
       deliveredDuringLoadByWriter: reports.slice(0, WRITERS).map(report => report.deliveredDuringLoad),
       deliveriesPerSecond: reports.slice(0, WRITERS).reduce((sum, report) => sum + Number(report.deliveredDuringLoad), 0) / config.loadMs * 1000,
       deliveriesPerSecondIncludingDrain: correctness.delivered / (windows.drain.to - windows.load.from) * 1000,
-      correctness, ...summary, sourceUnchanged, sourcePins: startPins, endSourcePins: endPins,
-      ...(liveBackup ? { backup, ageSamples, deliveryAge: { samples: ageSamples.length, missingJoins: missingAgeJoins,
+      correctness, ...summary,
+      diagnosticAccounting: { aggregate: diagnosticAccounting,
+        byWriter: writerReports.map(report => ({ index: report.index,
+          logDrops: report.logDrops, accounting: report.diagnosticAccounting })) },
+      sourceUnchanged, sourcePins: startPins, endSourcePins: endPins,
+      ...(liveBackup ? { backup, bidirectional: config.bidirectional,
+        snapshotExhaustions: { method: "typed thrown exhaustion from each actual StoreBridgeSide.mirror call, not traffic-loop/streak logs; local.mirror=toLocal, remote.mirror=toRemote",
+          events: snapshotExhaustions, byDirection: summarizeSnapshotExhaustions(snapshotExhaustions, windows.load!) },
+        ageSamples, deliveryAge: { samples: ageSamples.length, missingJoins: missingAgeJoins,
+        byDirection: Object.fromEntries((["toLocal", "toRemote"] as const).map(direction => {
+          const values = ageSamples.filter(sample => sample.direction === direction);
+          return [direction, { samples: values.length, deliveryMs: distribution(values.map(value => value.deliveryMs)),
+            sourceAppendToReceiptObservationMs: distribution(values.map(value => value.sourceAppendToReceiptObservationMs)) }];
+        })),
         deliveryMs: distribution(ageSamples.map(value => value.deliveryMs)),
         sourceAppendToReceiptObservationMs: distribution(ageSamples.map(value => value.sourceAppendToReceiptObservationMs)),
         clock: "deliveryMs=max(0,destination native append createdAt-source native append createdAt); observationMs=max(0,successful destination publication receipt observed wall time-source createdAt). All 192 synthetic event IDs joined via data.bridge.id, no payload timestamps. Native control-only age logs remain unchanged." },
         writerProgress: reports.slice(0, WRITERS).map(report => ({ index: report.index, progress: report.progress, sent: report.sent,
-          delivered: report.delivered, deliveredDuringLoad: report.deliveredDuringLoad })), cpuWorkers: config.cpuWorkers, cpuReports, phasePressure, harnessScheduling, harnessResponse,
+          delivered: report.delivered, deliveredDuringLoad: report.deliveredDuringLoad, directionCounts: report.directionCounts })), cpuWorkers: config.cpuWorkers, cpuReports, phasePressure, harnessScheduling, harnessResponse,
         ownedCpuChildren: cpuChildren.map(value => ({ pid: value.child.pid, exitCode: value.child.exitCode, signalCode: value.child.signalCode })),
         cpuChildren: cpuChildren.map(value => ({ pid: value.child.pid, exitCode: value.child.exitCode, signalCode: value.child.signalCode })) } : {}),
       ownedChildren: children.map(value => ({ pid: value.child.pid, exitCode: value.child.exitCode, signalCode: value.child.signalCode })),
@@ -825,5 +974,7 @@ async function main() {
   } finally { restoreFeed(); process.removeListener("disconnect", disconnected); }
   process.disconnect?.();
 }
-try { await main(); }
-catch (error) { process.stderr.write(`${errorText(error)}\n`); process.exitCode = 1; process.disconnect?.(); }
+if (process.argv[1] && [fileURLToPath(import.meta.url), RUNNER].includes(path.resolve(process.argv[1]))) {
+  try { await main(); }
+  catch (error) { process.stderr.write(`${errorText(error)}\n`); process.exitCode = 1; process.disconnect?.(); }
+}

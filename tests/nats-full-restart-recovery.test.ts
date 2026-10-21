@@ -25,8 +25,8 @@ const PARTICIPANTS = 22;
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 describe("NATS inbox duplicate window", () => {
-  it("matches the 24-hour command deduplication horizon", () => {
-    expect(INBOX_DUPLICATE_WINDOW_MS).toBe(24 * 60 * 60_000);
+  it("preserves the existing ten-minute inbox deduplication window", () => {
+    expect(INBOX_DUPLICATE_WINDOW_MS).toBe(10 * 60_000);
   });
 });
 

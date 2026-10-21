@@ -17,8 +17,8 @@ const STREAM_NOT_FOUND = 10059;
 const STREAM_EXISTS = 10058;
 const CONSUMER_NOT_FOUND = 10014;
 const nanos = (ms: number): number => ms * 1_000_000;
-/** Covers the existing 24-hour maximum NATS control-command timeout so same-ID retries remain deduplicated. */
-export const INBOX_DUPLICATE_WINDOW_MS = 24 * 60 * 60_000;
+/** Preserve the existing inbox deduplication window; longer retries require a separate migration. */
+export const INBOX_DUPLICATE_WINDOW_MS = 10 * 60_000;
 const code = (error: unknown): number | undefined => {
   if (!(error instanceof JetStreamApiError)) return undefined;
   try { return error.apiError().err_code; } catch { return error.code; }

@@ -16,14 +16,15 @@ const streamInfo = (maxAge: number): StreamInfo => ({
   config: { ...transportStreamConfig(policy), max_age: maxAge },
 } as unknown as StreamInfo);
 
-describe("NATS inbox stream age policy", () => {
-  it("sets the bounded max_age and retry-covering duplicate window in the stream policy", () => {
+describe("NATS inbox stream age and deduplication policy", () => {
+  it("sets the bounded max_age and preserves the ten-minute duplicate window", () => {
     expect(transportStreamConfig(policy).max_age).toBe(24 * 60 * 60_000 * 1_000_000);
-    expect(transportStreamConfig(policy).duplicate_window).toBe(INBOX_DUPLICATE_WINDOW_MS * 1_000_000);
+    expect(INBOX_DUPLICATE_WINDOW_MS).toBe(10 * 60_000);
+    expect(transportStreamConfig(policy).duplicate_window).toBe(10 * 60_000 * 1_000_000);
     expect(() => assertTransportStream(streamInfo(transportStreamConfig(policy).max_age!), transportStreamConfig(policy))).not.toThrow();
   });
 
-  it("accepts an existing unbounded inbox only under explicit legacy compatibility and never updates it", async () => {
+  it("accepts the existing ten-minute duplicate window and unbounded legacy age without updating it", async () => {
     let adds = 0;
     const manager = {
       streams: {
@@ -33,6 +34,7 @@ describe("NATS inbox stream age policy", () => {
     } as unknown as JetStreamManager;
     const result = await ensureTransportStream(manager, { ...policy, allowUnboundedMaxAge: true }, false);
     expect(result.config.max_age).toBe(0);
+    expect(result.config.duplicate_window).toBe(10 * 60_000 * 1_000_000);
     expect(adds).toBe(0);
     expect(() => assertTransportStream(streamInfo(0), transportStreamConfig(policy))).toThrow("configuration mismatch");
   });

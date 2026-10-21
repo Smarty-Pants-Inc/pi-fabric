@@ -52,6 +52,7 @@ const DEFAULT_DUPLICATE_WINDOW_MS = INBOX_DUPLICATE_WINDOW_MS;
 const ADVISORY_DUPLICATE_WINDOW_MS = 10 * 60 * 1_000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 5_000;
 const DEFAULT_PUBLISH_RETRY_HORIZON_MS = 30_000;
+const PUBLISH_RETRY_WINDOW_SAFETY_MS = 30_000;
 const PUBLISH_RETRY_INITIAL_MS = 250;
 const PUBLISH_RETRY_MAX_MS = 5_000;
 const DEFAULT_EPHEMERAL_INACTIVE_SECONDS = 3_600;
@@ -216,6 +217,7 @@ interface NatsSession {
   readonly connection: NatsConnectionHandle;
   readonly js: JetStreamClient;
   readonly manager: JetStreamManager;
+  readonly duplicateWindowMs: number;
   readonly kvStores: Readonly<Record<"leases" | "presence", NatsKvStore>>;
   readonly eventsPublisher?: NatsEventsPublisher;
   unsubscribe?: () => void;
@@ -262,10 +264,15 @@ const openNatsSession = async (options: ResolvedNatsOptions, signal?: AbortSigna
     assertAlive();
     const presence = await openNatsKvForMachine(connection.js, "presence", options.machine, options.provision, connection.onStatus, options.replicas);
     assertAlive();
-    await ensureTransportStream(manager, {
+    const inboxStream = await ensureTransportStream(manager, {
       ...streamPolicy(transportInboxStream(options.machine), [transportInboxStreamSubject(options.machine)], options),
       allowUnboundedMaxAge: true,
     }, options.provision);
+    const duplicateWindowNs = inboxStream.config.duplicate_window;
+    if (!Number.isSafeInteger(duplicateWindowNs) || duplicateWindowNs <= 0 || duplicateWindowNs % 1_000_000 !== 0) {
+      throw new TransportInvalidError("NATS inbox stream has an invalid duplicate window");
+    }
+    const duplicateWindowMs = duplicateWindowNs / 1_000_000;
     assertAlive();
     const consumerPolicy = transportConsumerPolicy(options);
     const consumer = await ensureTransportConsumer(manager.consumers, consumerPolicy);
@@ -281,7 +288,7 @@ const openNatsSession = async (options: ResolvedNatsOptions, signal?: AbortSigna
       eventsPublisher = await openNatsEventsPublisher(connection, { org: options.org!, provision: false });
       assertAlive();
     }
-    return { connection, js: connection.js, manager, kvStores: { leases, presence },
+    return { connection, js: connection.js, manager, duplicateWindowMs, kvStores: { leases, presence },
       ...(eventsPublisher ? { eventsPublisher } : {}) };
   } catch (error) {
     await connection.close().catch(() => undefined);
@@ -425,6 +432,20 @@ class RebindingKvStore implements TransportKv {
     }
   }
 }
+
+class NatsPublishRetryExpiredError extends TransportUncertainError {
+  override readonly name = "NatsPublishRetryExpiredError";
+  readonly retryExpired = true;
+  readonly expiryCode = "FABRIC_TRANSPORT_UNCERTAIN_EXPIRED" as const;
+
+  constructor(error: TransportUncertainError) {
+    super(error.id, error.resolvedBody, { cause: error });
+    this.message = `transport outcome uncertain for ${error.id}; the safe retry window expired`;
+  }
+}
+
+const retryHorizonFailure = (error: Error): Error => error instanceof TransportUncertainError
+  ? new NatsPublishRetryExpiredError(error) : error;
 
 class NatsTransportImpl implements FabricTransport {
   readonly kind = "nats" as const;
@@ -680,20 +701,22 @@ class NatsTransportImpl implements FabricTransport {
       ? bodyRecord.deadlineAt : undefined;
     const commandDeadline = typeof requestedDeadline === "number" && Number.isSafeInteger(requestedDeadline) && requestedDeadline > startedAt
       ? requestedDeadline : startedAt + DEFAULT_PUBLISH_RETRY_HORIZON_MS;
-    // The stream's exact-config duplicate window is the upper bound for same-ID retries.
-    const retryDeadline = Math.min(commandDeadline, startedAt + this.#options.duplicateWindowMs);
+    // Keep same-ID retries 30s inside the actual, verified stream dedupe window.
+    const safeRetryWindowMs = Math.max(0, prepared.session.duplicateWindowMs - PUBLISH_RETRY_WINDOW_SAFETY_MS);
+    const retryDeadline = Math.min(commandDeadline, startedAt + safeRetryWindowMs);
     const retrySignal = AbortSignal.any([this.#closeController.signal, ...(signal ? [signal] : []), AbortSignal.timeout(Math.max(1, retryDeadline - startedAt))]);
     let delayMs = PUBLISH_RETRY_INITIAL_MS;
     let lastFailure: Error | undefined;
     let uncertainFailure: TransportUncertainError | undefined;
     let ack;
     for (;;) {
-      if (lastFailure && Date.now() >= retryDeadline) throw uncertainFailure ?? lastFailure;
+      if (lastFailure && Date.now() >= retryDeadline) throw retryHorizonFailure(uncertainFailure ?? lastFailure);
       let session: NatsSession;
       try {
         session = this.#assertOpen();
       } catch (error) {
-        if (lastFailure && retryablePublishFailure(error) && Date.now() < retryDeadline) {
+        if (lastFailure && retryablePublishFailure(error)) {
+          if (Date.now() >= retryDeadline) throw retryHorizonFailure(uncertainFailure ?? lastFailure);
           await this.#waitForPublishRetry(retrySignal, delayMs, retryDeadline, lastFailure, signal);
           delayMs = Math.min(PUBLISH_RETRY_MAX_MS, delayMs * 2);
           continue;
@@ -712,7 +735,8 @@ class NatsTransportImpl implements FabricTransport {
         const failure = publishFailure(error, prepared.resolved.id, prepared.resolved.body);
         if (failure instanceof TransportUncertainError) uncertainFailure = failure;
         lastFailure = failure;
-        if (!retryablePublishFailure(failure) || Date.now() >= retryDeadline) throw uncertainFailure ?? failure;
+        if (!retryablePublishFailure(failure)) throw uncertainFailure ?? failure;
+        if (Date.now() >= retryDeadline) throw retryHorizonFailure(uncertainFailure ?? failure);
         await this.#waitForPublishRetry(retrySignal, delayMs, retryDeadline, failure, signal);
         delayMs = Math.min(PUBLISH_RETRY_MAX_MS, delayMs * 2);
       }
@@ -739,7 +763,9 @@ class NatsTransportImpl implements FabricTransport {
         if (lastFailure instanceof TransportUncertainError) throw lastFailure;
         throw callerSignal.reason ?? error;
       }
-      if (this.#closed || this.#terminalError || Date.now() >= retryDeadline || error === signal.reason) throw lastFailure;
+      if (this.#closed || this.#terminalError) throw lastFailure;
+      if (Date.now() >= retryDeadline) throw retryHorizonFailure(lastFailure);
+      if (error === signal.reason) throw lastFailure;
       throw error;
     }
   }

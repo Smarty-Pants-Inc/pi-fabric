@@ -38,9 +38,10 @@ describe("affected-test count receipts", () => {
     receipt(root, 2, ["related", "direct"]);
     const result = aggregate(root);
     expect(result.status, result.stderr).toBe(0);
-    expect(result.stdout).toContain("| 1/2 | direct | 3 | 2 | 0 | 1 | 0 |");
-    expect(result.stdout).toContain("| **SUM** | **direct** | 6 | 4 | 0 | 2 | 0 |");
-    expect(result.stdout).toContain("| **SUM** | **related** | 6 | 4 | 0 | 2 | 0 |");
+    expect(result.stdout).toContain("| 1/2 | direct | 1 | 3 | 2 | 0 | 1 | 0 | tests/example-1.test.ts |");
+    expect(result.stdout).toContain("| **SUM** | **direct** | **2** | **6 | 4 | 0 | 2 | 0** | — |");
+    expect(result.stdout).toContain("| **SUM** | **related** | **2** | **6 | 4 | 0 | 2 | 0** | — |");
+    expect(result.stdout).toContain("Linux actor-manager test file present: false.");
     expect(fs.readFileSync(path.join(root, "summary.md"), "utf8")).toBe(result.stdout.trimEnd() + "\n");
   });
 
@@ -79,7 +80,7 @@ describe("affected-test count receipts", () => {
     receipt(root, 2, []);
     const result = aggregate(root);
     expect(result.status, result.stderr).toBe(0);
-    expect(result.stdout).toContain("| 2/2 | no selected tests | 0 | 0 | 0 | 0 | 0 |");
+    expect(result.stdout).toContain("| 2/2 | no selected tests | 0 | 0 | 0 | 0 | 0 | 0 | — |");
   });
 });
 
@@ -106,6 +107,8 @@ describe("affected selector shard forwarding (dry run only)", () => {
     expect(result.stdout.match(/--shard=1\/10/g)).toHaveLength(2);
     expect(result.stdout).toContain("--reporter=./scripts/ci-retry-reporter.ts");
     expect(result.stdout).toContain("related.json");
+    expect(result.stdout).toContain("--reporter=json");
+    expect(result.stdout).toContain("--outputFile.json=");
     expect(result.stdout).toContain("direct.json");
     expect(JSON.parse(fs.readFileSync(path.join(reports, "selection.json"), "utf8")).phases).toEqual(["related", "direct"]);
     // No Vitest report means --dry-run did not run the suite.

@@ -273,9 +273,17 @@ jobs:
         with:
           pattern: affected-ubuntu-latest-*
           path: ${{ runner.temp }}/affected
-      - name: Print per-shard counts and sums
+      - name: Merge shard receipts, print parity counts, and require actor-manager
         shell: bash
-        run: node scripts/ci-test-counts.mjs "$RUNNER_TEMP/affected" ubuntu-latest 10
+        run: set -o pipefail; node scripts/ci-test-counts.mjs "$RUNNER_TEMP/affected" ubuntu-latest 10 | tee "$RUNNER_TEMP/merged-receipt.md" >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload merged shard receipt
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: merged-affected-ubuntu-latest
+          path: ${{ runner.temp }}/merged-receipt.md
+          if-no-files-found: error
+          retention-days: 7
       - name: Require every Linux dependency to succeed
         if: always()
         env:
@@ -298,9 +306,17 @@ jobs:
         with:
           pattern: affected-windows-latest-*
           path: ${{ runner.temp }}/affected
-      - name: Print per-shard counts and sums
+      - name: Merge shard receipts and print parity counts
         shell: bash
-        run: node scripts/ci-test-counts.mjs "$RUNNER_TEMP/affected" windows-latest 10
+        run: set -o pipefail; node scripts/ci-test-counts.mjs "$RUNNER_TEMP/affected" windows-latest 10 | tee "$RUNNER_TEMP/merged-receipt.md" >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload merged shard receipt
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: merged-affected-windows-latest
+          path: ${{ runner.temp }}/merged-receipt.md
+          if-no-files-found: error
+          retention-days: 7
       - name: Require every Windows dependency to succeed
         if: always()
         env:

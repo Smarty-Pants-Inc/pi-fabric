@@ -83,6 +83,28 @@ async function fixture(populated: boolean, watchdog: Record<string, unknown> = {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-lease-process-"));
   const hubRoot = path.join(root, "hub"), farRoot = path.join(root, "far");
   fs.mkdirSync(hubRoot); fs.mkdirSync(farRoot);
+  const mesh = new MeshStore(hubRoot, 64 * 1024, 100);
+  const farMesh = new MeshStore(farRoot, 64 * 1024, 100);
+  // Seed durable backlogs and their cursors before either process starts, so both directions
+  // are already pending at the first probe (publishBatch may confirm only a short prefix).
+  if (Array.isArray(watchdog.backlogDirections)) {
+    for (const direction of watchdog.backlogDirections) {
+      const source = direction === "toRemote" ? mesh : farMesh;
+      const from: MeshIdentity = direction === "toRemote" ? owner : { id: remoteId, name: "remote", kind: "main" };
+      const events = Array.from({ length: 20 }, (_, index) => ({ topic: "ops.owner", kind: "pr.wake", from,
+        to: direction === "toRemote" ? remoteId : owner.id, data: { path: "watchdog-backlog", index } }));
+      for (let index = 0; index < events.length;) index += (await source.publishBatch(events.slice(index))).length;
+    }
+    // Inbound events must really deliver, not merely advance over an unaddressed recipient.
+    const now = Date.now();
+    await mesh.put({ key: `topology/hosts/${createHash("sha256").update(owner.id).digest("hex")}`, identity: owner,
+      value: { format: 1, id: owner.id, rootId: owner.id, identity: owner, startedAt: now, updatedAt: now,
+        expiresAt: now + 600_000, incarnationToken: "owner-native-generation" } });
+    writeHostLease(hubRoot, { id: owner.id, rootId: owner.id, identityId: owner.id, startedAt: now, updatedAt: now,
+      expiresAt: now + 600_000, incarnationToken: "owner-native-generation" });
+    fs.writeFileSync(path.join(root, "cursor.json"), JSON.stringify({ format: 1, local: "hub", remote: "far",
+      toRemote: { after: 0, mark: 0 }, toLocal: { after: 0, mark: 0 } }));
+  }
   const program = path.join(root, "native.mjs");
   const source = String.raw`
     import { Transform } from "node:stream";
@@ -100,6 +122,16 @@ async function fixture(populated: boolean, watchdog: Record<string, unknown> = {
     const send = value => process.send?.(value);
     process.on("uncaughtException", error => { send({ kind: "failure", error: String(error.stack) }); process.exit(1); });
     process.on("unhandledRejection", error => { send({ kind: "failure", error: String(error?.stack || error) }); process.exit(1); });
+    // Limit delayed source reads to one event so the real cursor advances but stays behind.
+    function slowTail(side, delayMs) {
+      if (delayMs === undefined) return;
+      const tail = side.tail.bind(side);
+      side.tail = async (after, offset) => {
+        await new Promise(resolve => setTimeout(resolve, delayMs));
+        const page = await tail(after, offset), first = page.events[0];
+        return first ? { events: [first], through: first.sequence } : page;
+      };
+    }
     let gates = [], sourceReadPaused = false, releaseSourceRead, bridgeForStop;
     process.on("message", message => {
       if (message.op === "wall-clock-offset") wallClockOffsetMs = message.offsetMs;
@@ -148,6 +180,7 @@ async function fixture(populated: boolean, watchdog: Record<string, unknown> = {
       const input = new Gate(), output = new Gate(); gates = [input, output];
       process.stdin.pipe(input); output.pipe(process.stdout);
       const side = new StoreBridgeSide(store, "hub", Date.now, true);
+      slowTail(side, watchdog.toLocalTailDelayMs === undefined ? undefined : 0);
       if (watchdog.inboundTailStall) side.tail = async (after, offset) => ({ events: [], through: after, ...(offset !== undefined ? { offset } : {}) });
       send({ kind: "ready", pid: process.pid });
       await serveBridgeAgent(side, input, output);
@@ -155,11 +188,21 @@ async function fixture(populated: boolean, watchdog: Record<string, unknown> = {
       process.exit(0);
     } else {
       const local = new StoreBridgeSide(store, "far", Date.now, true);
+      slowTail(local, watchdog.toRemoteTailDelayMs);
+      if (watchdog.outboundTailStall) local.tail = async (after, offset) => ({ events: [], through: after, ...(offset !== undefined ? { offset } : {}) });
       const localTail = local.tail.bind(local);
       local.tail = async (after, offset) => {
         if (sourceReadPaused) await new Promise(resolve => { releaseSourceRead = resolve; send({ kind: "source-read-blocked" }); });
         return localTail(after, offset);
       };
+      if (watchdog.toLocalTailDelayMs) {
+        // Delay the hub's receipt, not the remote traffic FIFO that also serves watchdog heads.
+        const publish = local.publishWithReceipt.bind(local);
+        local.publishWithReceipt = async (...args) => {
+          await new Promise(resolve => setTimeout(resolve, watchdog.toLocalTailDelayMs));
+          return publish(...args);
+        };
+      }
       const remote = new RemoteBridgeSide(process.stdin, process.stdout, 120000);
       const bridge = new MeshBridge({ localName: "hub", remoteName: "far", local, remote, cursorPath: cursor,
         log: line => send({ kind: "bridge-log", line }),
@@ -205,8 +248,6 @@ async function fixture(populated: boolean, watchdog: Record<string, unknown> = {
     child.stdout!.on("error", error => { transportErrors.push(`${name}.stdout: ${error.message}`); });
   }
   bridge.stdout!.pipe(agent.stdin!); agent.stdout!.pipe(bridge.stdin!);
-  const mesh = new MeshStore(hubRoot, 64 * 1024, 100);
-  const farMesh = new MeshStore(farRoot, 64 * 1024, 100);
   cleanup.push(async () => {
     const failures: unknown[] = [];
     try {
@@ -398,6 +439,61 @@ describe.skipIf(process.platform !== "linux")("mirrored lease bridge alarms via 
     expect(reason).toMatch(/^mesh-bridge: stall v1 host=.* peer=far direction=toLocal at=.* lastOkToRemote=.* lastOkToLocal=.* stallId=\d+ reason=no toLocal event receipt .* while toRemote remains current restartCount=unknown\n$/);
     expect(f.stallAlarms()).toHaveLength(1);
   }, 30_000);
+
+  // Keep reason: smarty-dev#15695, a wedged direction hidden by a slow-but-moving peer direction.
+  it.each(["toRemote", "toLocal"] as const)("restarts a wedged %s while the opposite cursor is pending and advancing", async direction => {
+    const stallAfterMs = 4_000;
+    const opposite = direction === "toRemote" ? "toLocal" : "toRemote";
+    const f = await fixture(true, { intervalMs: 20, probeTimeoutMs: 1_000, stallAfterMs: 30_000,
+      directionStallAfterMs: stallAfterMs, outboundTailStall: direction === "toRemote", inboundTailStall: direction === "toLocal",
+      [`${opposite}TailDelayMs`]: 1_000, backlogDirections: ["toRemote", "toLocal"] });
+    await changed(f.hubRoot, () => f.sample());
+    await f.bridgeMessages.wait("watchdog");
+    const cursor = () => JSON.parse(fs.readFileSync(path.join(f.root, "cursor.json"), "utf8"));
+    const before = cursor();
+    const started = performance.now();
+    await waitFor(() => f.stallAlarms().length > 0, stallAfterMs + 2_000);
+    expect(performance.now() - started).toBeLessThan(stallAfterMs + 2_000);
+    const after = cursor();
+    expect(after[direction].after).toBe(before[direction].after);
+    expect(after[opposite].after).toBeGreaterThan(before[opposite].after);
+    expect(after[opposite].after).toBeLessThan(20);
+    const target = opposite === "toRemote" ? f.farMesh : f.mesh;
+    expect(target.read({ topic: "ops.owner", after: 0 }).some(event => event.verification === "bridge")).toBe(true);
+    expect(f.stallAlarms()).toHaveLength(1);
+    expect(f.stallAlarms()[0]).toMatchObject({ kind: "bridge-stall", data: { direction,
+      reason: expect.stringContaining(`while ${opposite} has pending work`) } });
+    await waitFor(() => f.bridge.exitCode !== null);
+    expect(f.bridge.exitCode).toBe(1);
+    expect(f.diagnostics()).not.toMatch(/EPIPE/);
+  }, 40_000);
+
+  it.each(["toRemote", "toLocal"] as const)("does not restart a behind-but-advancing %s over multiple stall windows", async direction => {
+    const stallAfterMs = 4_000;
+    const f = await fixture(true, { intervalMs: 20, probeTimeoutMs: 1_000, stallAfterMs: 30_000,
+      directionStallAfterMs: stallAfterMs, [`${direction}TailDelayMs`]: 1_000, backlogDirections: [direction] });
+    await changed(f.hubRoot, () => f.sample());
+    await f.bridgeMessages.wait("watchdog");
+    await sleep(stallAfterMs * 3);
+    const cursor = JSON.parse(fs.readFileSync(path.join(f.root, "cursor.json"), "utf8"));
+    expect(cursor[direction].after).toBeGreaterThan(1);
+    expect(cursor[direction].after).toBeLessThan(20);
+    const target = direction === "toRemote" ? f.farMesh : f.mesh;
+    expect(target.read({ topic: "ops.owner", after: 0 }).some(event => event.verification === "bridge")).toBe(true);
+    expect(f.stallAlarms()).toEqual([]);
+    f.healthy();
+  }, 40_000);
+
+  it("does not stall either idle direction over multiple directional stall windows", async () => {
+    const f = await fixture(true, { intervalMs: 20, probeTimeoutMs: 100, stallAfterMs: 5_000, directionStallAfterMs: 100 });
+    await changed(f.hubRoot, () => f.sample());
+    await f.bridgeMessages.wait("watchdog");
+    await sleep(350);
+    expect(f.stallAlarms()).toEqual([]);
+    expect(f.mesh.latestSequence()).toBe(0);
+    expect(f.farMesh.latestSequence()).toBe(0);
+    f.healthy();
+  }, 10_000);
 
   it("detects a directional stall without reporting callbacks and ignores wall-clock jumps", async () => {
     const f = await fixture(true, { callbacks: false, intervalMs: 20, probeTimeoutMs: 100,

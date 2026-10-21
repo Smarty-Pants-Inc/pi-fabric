@@ -2426,6 +2426,7 @@ export class RemoteBridgeSide implements BridgeSide {
     const timeoutMs = options.timeoutMs ?? this.callTimeoutMs;
     return new Promise<T>((resolve, reject) => {
       if (op === "mirror") this.#mirrorPending = { id, error: new BridgeMirrorDeferredError(false, timeoutMs) };
+      let timeoutCheck: ReturnType<typeof setImmediate> | undefined;
       const timer = setTimeout(() => {
         if (op === "mirror") {
           const error = new BridgeMirrorDeferredError(true, timeoutMs);
@@ -2437,17 +2438,22 @@ export class RemoteBridgeSide implements BridgeSide {
         }
         const error = new Error(`Bridge agent did not answer ${op} within ${timeoutMs} ms`);
         if (options.fatalTimeout === false) {
-          const pending = this.#pending.get(id);
-          if (pending) {
-            this.#pending.delete(id);
-            pending.reject(error);
-          }
+          // After a delayed timer phase, let already-readable replies reach the I/O phase
+          // before declaring a missed heartbeat. A silent peer still times out this turn.
+          timeoutCheck = setImmediate(() => {
+            const pending = this.#pending.get(id);
+            if (pending) {
+              this.#pending.delete(id);
+              pending.reject(error);
+            }
+          });
           return;
         }
         this.close(error);
       }, timeoutMs);
       const settle = <V>(done: (value: V) => void) => (value: V): void => {
         clearTimeout(timer);
+        if (timeoutCheck !== undefined) clearImmediate(timeoutCheck);
         done(value);
       };
       this.#pending.set(id, { resolve: settle(resolve as (value: unknown) => void), reject: settle(reject) });
@@ -2969,6 +2975,7 @@ export class MeshBridge {
   #factoryDeferrals = 0;
   #factoryLoggedAt = Number.NEGATIVE_INFINITY;
   #lastCursorAfter: Partial<Record<Direction, number>> = {};
+  #directionHeads: Partial<Record<Direction, number>> = {};
   #directionPendingSince: Partial<Record<Direction, number>> = {};
   #lastOkToRemote: number | undefined;
   #lastOkToLocal: number | undefined;
@@ -2976,6 +2983,7 @@ export class MeshBridge {
   #lastOkToLocalMono: number | undefined;
   #lastRoundTripAt: number | undefined;
   #stallActive = false;
+  #stallDirection: Direction | "both" | undefined;
   #watchdogTask: Promise<void> | undefined;
   #watchdogWake: (() => void) | undefined;
   readonly #deliveryAge: BridgeDeliveryAgeMonitor;
@@ -3315,7 +3323,12 @@ export class MeshBridge {
       this.#lastOkToLocal = at;
       this.#lastOkToLocalMono = monotonicAt;
     }
-    delete this.#directionPendingSince[direction];
+    // A still-pending backlog restarts at actual cursor progress, not the next probe.
+    // Crossing its last sampled head ends that backlog: later work must not inherit idle time.
+    const head = this.#directionHeads[direction];
+    if (head !== undefined && this.#cursor && this.#cursor[direction].after < head) {
+      this.#directionPendingSince[direction] = monotonicAt;
+    } else delete this.#directionPendingSince[direction];
   }
 
   #clearStallReason(): void {
@@ -3329,10 +3342,18 @@ export class MeshBridge {
     catch { this.#log("could not atomically write the bridge stall reason file"); }
   }
 
+  #clearStallOnProgress(direction: Direction): void {
+    if (!this.#stallActive || (this.#stallDirection !== "both" && this.#stallDirection !== direction)) return;
+    this.#stallActive = false;
+    this.#stallDirection = undefined;
+    this.#clearStallReason();
+  }
+
   async #raiseStall(direction: Direction | "both", reason: string, fatal: boolean): Promise<void> {
     if (this.#stopped) return;
     if (!this.#stallActive) {
       this.#stallActive = true;
+      this.#stallDirection = direction;
       const atMs = Date.now();
       const at = new Date(atMs).toISOString();
       const safeReason = reason.replace(/[\r\n]/g, " ");
@@ -3369,8 +3390,11 @@ export class MeshBridge {
       }
       const wallNow = Date.now();
       const now = monotonicClock.now();
+      this.#directionHeads = { toRemote: localHead, toLocal: remoteHead };
       const pendingToRemote = cursor.toRemote.after < localHead;
       const pendingToLocal = cursor.toLocal.after < remoteHead;
+      // Start the deadline when pending work is observed, not at the last success:
+      // time spent idle (or awaiting this probe) is not time spent stalled.
       if (!pendingToRemote) this.#noteDirectionSuccess("toRemote", wallNow, now);
       else this.#directionPendingSince.toRemote ??= now;
       if (!pendingToLocal) this.#noteDirectionSuccess("toLocal", wallNow, now);
@@ -3378,14 +3402,16 @@ export class MeshBridge {
       // Probes observe heads only. Direction loops own forwarding wakes through notifications
       // and their bounded missed-notification safety timers; a probe must not trigger membership.
       const directionalAfter = this.options.directionStallAfterMs ?? BRIDGE_DIRECTION_STALL_AFTER_MS;
-      if (pendingToRemote && !pendingToLocal && now - this.#directionPendingSince.toRemote! >= directionalAfter) {
+      // Each cursor advance resets its own pending clock; progress in the other direction
+      // cannot hide a wedge, and a backlog that keeps advancing is not a stall.
+      if (pendingToRemote && now - this.#directionPendingSince.toRemote! >= directionalAfter) {
         direction = "toRemote";
-        await this.#raiseStall(direction, `no toRemote acknowledgement for ${Math.floor(now - this.#directionPendingSince.toRemote!)} ms while toLocal remains current`, true);
+        await this.#raiseStall(direction, `no toRemote acknowledgement for ${Math.floor(now - this.#directionPendingSince.toRemote!)} ms while toLocal ${pendingToLocal ? "has pending work" : "remains current"}`, true);
         return;
       }
-      if (pendingToLocal && !pendingToRemote && now - this.#directionPendingSince.toLocal! >= directionalAfter) {
+      if (pendingToLocal && now - this.#directionPendingSince.toLocal! >= directionalAfter) {
         direction = "toLocal";
-        await this.#raiseStall(direction, `no toLocal event receipt for ${Math.floor(now - this.#directionPendingSince.toLocal!)} ms while toRemote remains current`, true);
+        await this.#raiseStall(direction, `no toLocal event receipt for ${Math.floor(now - this.#directionPendingSince.toLocal!)} ms while toRemote ${pendingToRemote ? "has pending work" : "remains current"}`, true);
         return;
       }
 
@@ -3396,10 +3422,8 @@ export class MeshBridge {
       // direction earns its longer independent stall deadline.
       if (toRemoteWorking || toLocalWorking) {
         this.#lastRoundTripAt = now;
-        if (this.#stallActive) {
-          this.#stallActive = false;
-          this.#clearStallReason();
-        }
+        // A successful head probe is not event-delivery recovery. Only a real receipt
+        // in the stalled direction (or restart) ends its alarm episode.
         this.options.notifyWatchdog?.();
         return;
       }
@@ -3892,6 +3916,7 @@ export class MeshBridge {
               cursor.after = page.events[index + committed.length - 1]!.sequence;
               forwarded += committed.length;
               this.#save(); // Advance only after the destination confirms the prefix durably.
+              this.#clearStallOnProgress(direction);
               for (const id of ids) seen.delete(id);
               this.#reportUnaddressed();
               index += committed.length - 1;
@@ -3951,6 +3976,7 @@ export class MeshBridge {
             if (result.delivered) {
               if (result.sequence !== undefined) cursor.mark = Math.max(cursor.mark, result.sequence);
               forwarded += 1;
+              this.#clearStallOnProgress(direction);
             } else dropped += 1;
             this.#clearRelayGrace(direction, event);
           }
@@ -4029,6 +4055,7 @@ export class MeshBridge {
             cursor.after = event.sequence;
             forwarded += 1;
             this.#save();
+            this.#clearStallOnProgress(direction);
             // Only this newly inserted ID is covered by the checkpoint; recovery IDs stay.
             seen.delete(event.id);
             this.#reportUnaddressed();

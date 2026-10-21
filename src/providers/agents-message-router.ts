@@ -30,6 +30,8 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 // MeshStore's default stale window; recovery waits, never weakens mesh locking.
 export const RESIDENT_MESH_STALE_WINDOW_MS = 30_000;
+/** A missing NATS presence may settle only briefly after this sender's verified reconnect. */
+export const NATS_RECONNECT_PRESENCE_GRACE_MS = 8_000;
 
 export class FabricParticipantNotYetMirroredError extends Error {
   override readonly name = "FabricParticipantNotYetMirroredError";
@@ -185,6 +187,7 @@ export class AgentMessageRouter {
   #legacyDeliveryCount = 0;
   /** Retained dormant wake routes this router resolved; only they may take the one wake resend. */
   readonly #dormantRoutes = new WeakSet<FabricParticipantInfo>();
+  #lastVerifiedReconnectAt = 0;
   constructor(
     readonly manager: Pick<AgentManager, "status" | "steer" | "followUp" | "stop">,
     readonly actorManager: Pick<ActorManager, "identity" | "status" | "validateDirectMessage" | "tell" | "ask" | "stop" | "steerRemote" | "resolveBinding" | "resolveActivationBinding"> & { owns?: (id: string) => boolean; mesh?: { root: string } },
@@ -192,14 +195,16 @@ export class AgentMessageRouter {
     readonly participants: Pick<FabricParticipantSource, "get" | "scheduleRefresh" | "writeStalled" | "lastKnown"> & Partial<Pick<FabricParticipantSource, "peers" | "list" | "lineageAlive" | "routingUnavailable" | "refreshRoutingView" | "retainedRouteAllowed">> & {
       resolveRoutingLease?: (id: string, signal?: AbortSignal, budget?: MirrorLeaseWaitBudget) => Promise<boolean>;
     },
-    readonly control: (Pick<FabricControlPlane, "request"> & {
+    readonly control: (Pick<FabricControlPlane, "request"> & Partial<Pick<FabricControlPlane, "onVerifiedReconnect">> & {
       readonly transportKind?: "file" | "nats";
       readonly participantView?: ParticipantView | undefined;
     }) | undefined,
     readonly resolvePiRunBinding: (binding: FabricActorRunBinding, runner: FabricAgentRunner, context: FabricInvocationContext, requiredPin?: boolean, role?: string) => FabricActorRunBinding | Promise<FabricActorRunBinding>,
     readonly residency?: Pick<ResidencyClient, "ensureActor" | "hostId"> & { options: { config: { rootId: string; meshRoot: string } } },
     readonly spawner = boundAgentSpawner(),
-  ) {}
+  ) {
+    this.control?.onVerifiedReconnect?.(() => { this.#lastVerifiedReconnectAt = Date.now(); });
+  }
 
   get #nats(): boolean { return this.control?.transportKind === "nats"; }
 
@@ -234,7 +239,8 @@ export class AgentMessageRouter {
     if (capability && !route.capabilities.includes(capability)) throw unsupported(participant, capability);
   }
 
-  async #waitForPresence(required: PresenceResolutionRequired, signal: AbortSignal | undefined, budget: RouterWaitBudget): Promise<void> {
+  async #waitForPresence(required: PresenceResolutionRequired, signal: AbortSignal | undefined, budget: RouterWaitBudget,
+    waitMs = PEER_LEASE_WAIT_MS): Promise<void> {
     signal?.throwIfAborted();
     if (budget.waited) throw required.original;
     const view = this.control?.participantView;
@@ -248,7 +254,7 @@ export class AgentMessageRouter {
     const abort = (): void => controller.abort(signal!.reason);
     signal?.addEventListener("abort", abort, { once: true });
     if (signal?.aborted) abort();
-    const timer = setTimeout(() => controller.abort(timeout), PEER_LEASE_WAIT_MS);
+    const timer = setTimeout(() => controller.abort(timeout), Math.max(1, Math.floor(waitMs)));
     try {
       for (;;) {
         controller.signal.throwIfAborted();
@@ -281,6 +287,15 @@ export class AgentMessageRouter {
     }
   }
 
+  #recentReconnectPresenceGrace(error: PresenceResolutionRequired): number {
+    const missing = error.original instanceof FabricParticipantStaleError ||
+      error.original.message.startsWith("Unknown Fabric participant:");
+    if (!this.#nats || !missing || this.#lastVerifiedReconnectAt <= 0) return 0;
+    const elapsed = Date.now() - this.#lastVerifiedReconnectAt;
+    return elapsed >= 0 && elapsed < NATS_RECONNECT_PRESENCE_GRACE_MS
+      ? NATS_RECONNECT_PRESENCE_GRACE_MS - elapsed : 0;
+  }
+
   async #withPresence<T>(operation: (authority?: FabricParticipantInfo, budget?: RouterWaitBudget) => Promise<T>, id: string | undefined, recoverLease: boolean, signal?: AbortSignal): Promise<T> {
     const budget: RouterWaitBudget = {};
     const attempt = (): Promise<T> => {
@@ -300,8 +315,10 @@ export class AgentMessageRouter {
       signal?.throwIfAborted();
       // Only our private lookup refusal may replay resolution, never control.request's ACK failure.
       if (!(error instanceof PresenceResolutionRequired)) throw error;
-      if (!recoverLease) throw error.original;
-      await this.#waitForPresence(error, signal, budget);
+      const reconnectGraceMs = this.#recentReconnectPresenceGrace(error);
+      if (!recoverLease && reconnectGraceMs <= 0) throw error.original;
+      const waitMs = Math.max(recoverLease ? PEER_LEASE_WAIT_MS : 0, reconnectGraceMs);
+      await this.#waitForPresence(error, signal, budget, waitMs);
       try { return await attempt(); }
       catch (retryError) {
         if (retryError instanceof PresenceResolutionRequired) throw retryError.original;

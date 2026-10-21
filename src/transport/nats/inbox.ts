@@ -34,7 +34,7 @@ import {
   validateMachine,
   hashToken,
 } from "./subjects.js";
-import { ensureTransportConsumer, ensureTransportStream, type TransportConsumerPolicy, type TransportStreamPolicy } from "./provision.js";
+import { ensureTransportConsumer, ensureTransportStream, INBOX_DUPLICATE_WINDOW_MS, type TransportConsumerPolicy, type TransportStreamPolicy } from "./provision.js";
 import { ADVISORY_CAPTURE_STREAM } from "./subjects.js";
 import { openNatsConnection, type NatsConnectionHandle, type NatsPermissionPolicy } from "./connection.js";
 import { NatsSessionChannelManager, type SessionChannel, type SessionChannelIdentity, type SessionChannelOpenOptions } from "./session-channel.js";
@@ -48,12 +48,19 @@ import type { NatsEventsPublisher } from "./events-publish.js";
 
 const DEFAULT_MAX_BYTES = 1_073_741_824;
 const DEFAULT_MAX_MESSAGE_BYTES = 1_048_576;
-const DEFAULT_DUPLICATE_WINDOW_MS = 10 * 60 * 1_000;
+const DEFAULT_DUPLICATE_WINDOW_MS = INBOX_DUPLICATE_WINDOW_MS;
+const ADVISORY_DUPLICATE_WINDOW_MS = 10 * 60 * 1_000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 5_000;
+const DEFAULT_PUBLISH_RETRY_HORIZON_MS = 30_000;
+const PUBLISH_RETRY_WINDOW_SAFETY_MS = 30_000;
+const PUBLISH_RETRY_INITIAL_MS = 250;
+const PUBLISH_RETRY_MAX_MS = 5_000;
 const DEFAULT_EPHEMERAL_INACTIVE_SECONDS = 3_600;
 const EPHEMERAL_DELETE_TIMEOUT_MS = 1_000;
 const utf8 = new TextEncoder();
 const validMessageId = (id: string): boolean => id.length > 0 && id === id.trim() && !/[\u0000-\u001f\u007f]/.test(id);
+const retryablePublishFailure = (error: unknown): error is TransportUncertainError | TransportUnavailableError =>
+  error instanceof TransportUncertainError || error instanceof TransportUnavailableError;
 
 /** Direct options keep the module independently testable; the factory passes FabricTransportOptions. */
 export interface NatsTransportOptions extends NatsPermissionPolicy {
@@ -210,6 +217,7 @@ interface NatsSession {
   readonly connection: NatsConnectionHandle;
   readonly js: JetStreamClient;
   readonly manager: JetStreamManager;
+  readonly duplicateWindowMs: number;
   readonly kvStores: Readonly<Record<"leases" | "presence", NatsKvStore>>;
   readonly eventsPublisher?: NatsEventsPublisher;
   unsubscribe?: () => void;
@@ -247,6 +255,7 @@ const openNatsSession = async (options: ResolvedNatsOptions, signal?: AbortSigna
         maxAgeMs: 30 * 24 * 60 * 60 * 1_000,
         maxBytes: Math.max(options.maxBytes, 64 * 1024 * 1024),
         maxMessageBytes: 64 * 1024,
+        duplicateWindowMs: ADVISORY_DUPLICATE_WINDOW_MS,
         replicas: 1,
       }), true);
       assertAlive();
@@ -255,10 +264,15 @@ const openNatsSession = async (options: ResolvedNatsOptions, signal?: AbortSigna
     assertAlive();
     const presence = await openNatsKvForMachine(connection.js, "presence", options.machine, options.provision, connection.onStatus, options.replicas);
     assertAlive();
-    await ensureTransportStream(manager, {
+    const inboxStream = await ensureTransportStream(manager, {
       ...streamPolicy(transportInboxStream(options.machine), [transportInboxStreamSubject(options.machine)], options),
       allowUnboundedMaxAge: true,
     }, options.provision);
+    const duplicateWindowNs = inboxStream.config.duplicate_window;
+    if (!Number.isSafeInteger(duplicateWindowNs) || duplicateWindowNs <= 0 || duplicateWindowNs % 1_000_000 !== 0) {
+      throw new TransportInvalidError("NATS inbox stream has an invalid duplicate window");
+    }
+    const duplicateWindowMs = duplicateWindowNs / 1_000_000;
     assertAlive();
     const consumerPolicy = transportConsumerPolicy(options);
     const consumer = await ensureTransportConsumer(manager.consumers, consumerPolicy);
@@ -274,7 +288,7 @@ const openNatsSession = async (options: ResolvedNatsOptions, signal?: AbortSigna
       eventsPublisher = await openNatsEventsPublisher(connection, { org: options.org!, provision: false });
       assertAlive();
     }
-    return { connection, js: connection.js, manager, kvStores: { leases, presence },
+    return { connection, js: connection.js, manager, duplicateWindowMs, kvStores: { leases, presence },
       ...(eventsPublisher ? { eventsPublisher } : {}) };
   } catch (error) {
     await connection.close().catch(() => undefined);
@@ -418,6 +432,20 @@ class RebindingKvStore implements TransportKv {
     }
   }
 }
+
+class NatsPublishRetryExpiredError extends TransportUncertainError {
+  override readonly name = "NatsPublishRetryExpiredError";
+  readonly retryExpired = true;
+  readonly expiryCode = "FABRIC_TRANSPORT_UNCERTAIN_EXPIRED" as const;
+
+  constructor(error: TransportUncertainError) {
+    super(error.id, error.resolvedBody, { cause: error });
+    this.message = `transport outcome uncertain for ${error.id}; the safe retry window expired`;
+  }
+}
+
+const retryHorizonFailure = (error: Error): Error => error instanceof TransportUncertainError
+  ? new NatsPublishRetryExpiredError(error) : error;
 
 class NatsTransportImpl implements FabricTransport {
   readonly kind = "nats" as const;
@@ -666,15 +694,52 @@ class NatsTransportImpl implements FabricTransport {
 
   async send<T>(envelope: TransportEnvelope<T>, signal?: AbortSignal): Promise<TransportSent<T>> {
     const prepared = this.#wire(envelope, signal);
+    const startedAt = Date.now();
+    const body = prepared.resolved.body;
+    const bodyRecord = body && typeof body === "object" && !Array.isArray(body) ? body as Record<string, unknown> : undefined;
+    const requestedDeadline = prepared.resolved.kind === "command" && typeof bodyRecord?.commandId === "string"
+      ? bodyRecord.deadlineAt : undefined;
+    const commandDeadline = typeof requestedDeadline === "number" && Number.isSafeInteger(requestedDeadline) && requestedDeadline > startedAt
+      ? requestedDeadline : startedAt + DEFAULT_PUBLISH_RETRY_HORIZON_MS;
+    // Keep same-ID retries 30s inside the actual, verified stream dedupe window.
+    const safeRetryWindowMs = Math.max(0, prepared.session.duplicateWindowMs - PUBLISH_RETRY_WINDOW_SAFETY_MS);
+    const retryDeadline = Math.min(commandDeadline, startedAt + safeRetryWindowMs);
+    const retrySignal = AbortSignal.any([this.#closeController.signal, ...(signal ? [signal] : []), AbortSignal.timeout(Math.max(1, retryDeadline - startedAt))]);
+    let delayMs = PUBLISH_RETRY_INITIAL_MS;
+    let lastFailure: Error | undefined;
+    let uncertainFailure: TransportUncertainError | undefined;
     let ack;
-    try {
-      ack = await prepared.session.js.publish(prepared.subject, prepared.bytes, {
-        msgID: prepared.resolved.id,
-        timeout: this.#options.requestTimeoutMs,
-        expect: { streamName: this.#streamFor(prepared.resolved.to.machine) },
-      });
-    } catch (error) {
-      throw publishFailure(error, prepared.resolved.id, prepared.resolved.body);
+    for (;;) {
+      if (lastFailure && Date.now() >= retryDeadline) throw retryHorizonFailure(uncertainFailure ?? lastFailure);
+      let session: NatsSession;
+      try {
+        session = this.#assertOpen();
+      } catch (error) {
+        if (lastFailure && retryablePublishFailure(error)) {
+          if (Date.now() >= retryDeadline) throw retryHorizonFailure(uncertainFailure ?? lastFailure);
+          await this.#waitForPublishRetry(retrySignal, delayMs, retryDeadline, lastFailure, signal);
+          delayMs = Math.min(PUBLISH_RETRY_MAX_MS, delayMs * 2);
+          continue;
+        }
+        throw uncertainFailure ?? error;
+      }
+      try {
+        const remaining = Math.max(1, retryDeadline - Date.now());
+        ack = await session.js.publish(prepared.subject, prepared.bytes, {
+          msgID: prepared.resolved.id,
+          timeout: Math.min(this.#options.requestTimeoutMs, remaining),
+          expect: { streamName: this.#streamFor(prepared.resolved.to.machine) },
+        });
+        break;
+      } catch (error) {
+        const failure = publishFailure(error, prepared.resolved.id, prepared.resolved.body);
+        if (failure instanceof TransportUncertainError) uncertainFailure = failure;
+        lastFailure = failure;
+        if (!retryablePublishFailure(failure)) throw uncertainFailure ?? failure;
+        if (Date.now() >= retryDeadline) throw retryHorizonFailure(uncertainFailure ?? failure);
+        await this.#waitForPublishRetry(retrySignal, delayMs, retryDeadline, failure, signal);
+        delayMs = Math.min(PUBLISH_RETRY_MAX_MS, delayMs * 2);
+      }
     }
     if (signal?.aborted) throw new TransportUncertainError(prepared.resolved.id, prepared.resolved.body, { cause: signal.reason });
     if (hasFabricPathBProbeObserver()) recordFabricPathBProbe({ type: "transport-puback", atNs: fabricPathBProbeEpochNs(), carrier: "nats",
@@ -682,6 +747,27 @@ class NatsTransportImpl implements FabricTransport {
       kind: prepared.resolved.kind, operation: prepared.resolved.operation, targetId: prepared.resolved.targetId,
       sequence: ack.seq, duplicate: ack.duplicate });
     return { id: prepared.resolved.id, sequence: ack.seq, duplicate: ack.duplicate, envelope: prepared.resolved };
+  }
+
+  async #waitForPublishRetry(
+    signal: AbortSignal, delayMs: number, retryDeadline: number, lastFailure: Error, callerSignal?: AbortSignal,
+  ): Promise<void> {
+    try {
+      // Never reuse a connection until its identity has been verified after reconnect.
+      await this.#waitForSession(signal);
+      const remaining = retryDeadline - Date.now();
+      if (remaining <= 0) throw lastFailure;
+      await sleep(Math.min(delayMs, remaining), undefined, { signal });
+    } catch (error) {
+      if (callerSignal?.aborted) {
+        if (lastFailure instanceof TransportUncertainError) throw lastFailure;
+        throw callerSignal.reason ?? error;
+      }
+      if (this.#closed || this.#terminalError) throw lastFailure;
+      if (Date.now() >= retryDeadline) throw retryHorizonFailure(lastFailure);
+      if (error === signal.reason) throw lastFailure;
+      throw error;
+    }
   }
 
   #streamFor(machine: string): string { return transportInboxStream(validateMachine(machine)); }

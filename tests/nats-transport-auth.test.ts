@@ -6,7 +6,7 @@ import { NatsAuthorizationError, openNatsConnection } from "../src/transport/nat
 import { runTransportAdmin } from "../src/transport/nats/admin.js";
 import { openNatsTransport } from "../src/transport/nats/inbox.js";
 import { openNatsKvForMachine } from "../src/transport/nats/kv.js";
-import { ensureTransportStream } from "../src/transport/nats/provision.js";
+import { ensureTransportStream, INBOX_DUPLICATE_WINDOW_MS } from "../src/transport/nats/provision.js";
 import { ADVISORY_CAPTURE_STREAM, transportAdvisoryStreamSubject, transportInboxStream, transportInboxStreamSubject } from "../src/transport/nats/subjects.js";
 import { createPathBHarness, PATH_B_POLICY_ENV, resolveNatsBinary, type PathBHarness, type PathBUser } from "./helpers/nats-cluster.js";
 
@@ -44,8 +44,8 @@ describe.skipIf(!binary)("authenticated Path B transport", () => {
       const bootstrap = await fixture.connect(fixture.users.bootstrap);
       const manager = await jetstreamManager(bootstrap);
       const js = jetstream(bootstrap);
-      const policy = { maxBytes: 1_073_741_824, maxAgeMs: 0, maxMessageBytes: 1_048_576, duplicateWindowMs: 600_000, replicas: 1 as const };
-      await ensureTransportStream(manager, { ...policy, name: ADVISORY_CAPTURE_STREAM, subjects: [transportAdvisoryStreamSubject], maxAgeMs: 30 * 86_400_000, maxMessageBytes: 65_536 });
+      const policy = { maxBytes: 1_073_741_824, maxAgeMs: 0, maxMessageBytes: 1_048_576, duplicateWindowMs: INBOX_DUPLICATE_WINDOW_MS, replicas: 1 as const };
+      await ensureTransportStream(manager, { ...policy, duplicateWindowMs: 10 * 60_000, name: ADVISORY_CAPTURE_STREAM, subjects: [transportAdvisoryStreamSubject], maxAgeMs: 30 * 86_400_000, maxMessageBytes: 65_536 });
       await openNatsKvForMachine(js, "leases", MACHINE_A, true);
       await openNatsKvForMachine(js, "presence", MACHINE_A, true);
       for (const machine of [MACHINE_A, MACHINE_B]) await ensureTransportStream(manager, { ...policy, name: transportInboxStream(machine), subjects: [transportInboxStreamSubject(machine)] });
@@ -332,8 +332,8 @@ describe.skipIf(!binary)("authenticated Path B transport over verified TLS", () 
     try {
       const manager = await jetstreamManager(bootstrap);
       const js = jetstream(bootstrap);
-      const policy = { maxBytes: 1_073_741_824, maxAgeMs: 0, maxMessageBytes: 1_048_576, duplicateWindowMs: 600_000, replicas: 1 as const };
-      await ensureTransportStream(manager, { ...policy, name: ADVISORY_CAPTURE_STREAM, subjects: [transportAdvisoryStreamSubject], maxAgeMs: 30 * 86_400_000, maxMessageBytes: 65_536 });
+      const policy = { maxBytes: 1_073_741_824, maxAgeMs: 0, maxMessageBytes: 1_048_576, duplicateWindowMs: INBOX_DUPLICATE_WINDOW_MS, replicas: 1 as const };
+      await ensureTransportStream(manager, { ...policy, duplicateWindowMs: 10 * 60_000, name: ADVISORY_CAPTURE_STREAM, subjects: [transportAdvisoryStreamSubject], maxAgeMs: 30 * 86_400_000, maxMessageBytes: 65_536 });
       await openNatsKvForMachine(js, "leases", MACHINE_A, true);
       await openNatsKvForMachine(js, "presence", MACHINE_A, true);
       for (const machine of [MACHINE_A, MACHINE_B]) await ensureTransportStream(manager, { ...policy, name: transportInboxStream(machine), subjects: [transportInboxStreamSubject(machine)] });

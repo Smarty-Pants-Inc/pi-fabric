@@ -35,7 +35,7 @@ const sameBytes = (left: number, right: number, size: number): boolean => {
 
 /** Keep one exact, same-directory copy of a raw trace before a later compactor rewrites its live name. */
 export const ensureTraceSnapshot = (sourceFile: string, snapshotFile: string, expected: fs.Stats,
-  sourceDescriptor?: number, preferHardLink = false): boolean => {
+  sourceDescriptor?: number, preferHardLink = false, syncDirectory = true): boolean => {
   if (path.dirname(path.resolve(sourceFile)) !== path.dirname(path.resolve(snapshotFile))) return false;
   let source = sourceDescriptor;
   let ownsSource = false;
@@ -59,10 +59,13 @@ export const ensureTraceSnapshot = (sourceFile: string, snapshotFile: string, ex
       try {
         const held = fs.fstatSync(existingFd);
         if (!generationMatches(held, existing) || !generationMatches(fs.fstatSync(source), opened)) return false;
-        if (held.dev === opened.dev && held.ino === opened.ino) return generationMatches(fs.lstatSync(sourceFile), opened);
-        if (!sameGeneration(existing, existing)) return false;
-        return sameBytes(source, existingFd, expected.size) && generationMatches(fs.fstatSync(source), opened) &&
-          generationMatches(fs.lstatSync(sourceFile), opened);
+        const matches = held.dev === opened.dev && held.ino === opened.ino
+          ? generationMatches(fs.lstatSync(sourceFile), opened)
+          : sameGeneration(existing, existing) && sameBytes(source, existingFd, expected.size) &&
+            generationMatches(fs.fstatSync(source), opened) && generationMatches(fs.lstatSync(sourceFile), opened);
+        if (!matches) return false;
+        if (syncDirectory) syncDirectoryChain(path.dirname(snapshotFile));
+        return true;
       } finally { fs.closeSync(existingFd); }
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") return false;
@@ -78,7 +81,7 @@ export const ensureTraceSnapshot = (sourceFile: string, snapshotFile: string, ex
         const linked = fs.lstatSync(snapshotFile);
         if (!sameSourceGeneration(linked, opened) || linked.dev !== opened.dev || linked.ino !== opened.ino ||
             !sameSourceGeneration(fs.fstatSync(source), opened) || !sameSourceGeneration(fs.lstatSync(sourceFile), opened)) return false;
-        syncDirectoryChain(path.dirname(snapshotFile));
+        if (syncDirectory) syncDirectoryChain(path.dirname(snapshotFile));
         return sameSourceGeneration(fs.fstatSync(source), opened) && sameSourceGeneration(fs.lstatSync(sourceFile), opened);
       }
     }
@@ -117,7 +120,7 @@ export const ensureTraceSnapshot = (sourceFile: string, snapshotFile: string, ex
     fs.unlinkSync(temporary); temporary = undefined; ownsTemporary = false;
     const final = fs.lstatSync(snapshotFile);
     if (final.nlink !== 1 || !final.isFile() || final.size !== expected.size || final.mtimeMs !== expected.mtimeMs) return false;
-    syncDirectoryChain(path.dirname(snapshotFile));
+    if (syncDirectory) syncDirectoryChain(path.dirname(snapshotFile));
     return generationMatches(fs.fstatSync(source), opened) && generationMatches(fs.lstatSync(sourceFile), opened);
   } catch { return false; }
   finally {

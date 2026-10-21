@@ -338,9 +338,9 @@ export const compactTerminalRunLog = (filePath: string, status: string): RunLogC
     }
     if (!compacted) return outcome;
     checkWork();
-    // Preserve the original bytes before any durability barrier can fail. The
-    // source fsync below still precedes publication of the compacted generation.
-    if (!ensureTraceSnapshot(filePath, `${filePath}.raw`, original, source, true)) {
+    // Preserve the original bytes before any durability barrier can fail. Defer
+    // the namespace barrier until after file fsyncs so the source flush remains first.
+    if (!ensureTraceSnapshot(filePath, `${filePath}.raw`, original, source, true, false)) {
       throw new Error("Raw events.jsonl snapshot could not be verified; full log retained");
     }
     checkWork();

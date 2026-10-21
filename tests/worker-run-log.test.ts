@@ -714,17 +714,26 @@ describe("worker run log", () => {
     const foreign = path.join(directory, "foreign.compact.tmp");
     fs.writeFileSync(foreign, "not ours");
     const inode = fs.statSync(file).ino;
-    let syncs = 0;
     const fsync = fs.fsyncSync;
+    const open = fs.openSync;
+    const descriptors = new Map<number, string>();
+    const openSpy = failure === "rename" ? undefined : vi.spyOn(fs, "openSync").mockImplementation((name, flags, mode) => {
+      const fd = open(name, flags, mode);
+      descriptors.set(fd, String(name));
+      return fd;
+    });
     const spy = failure === "rename"
       ? vi.spyOn(fs, "renameSync").mockImplementation(() => { throw new Error("injected rename failure"); })
       : vi.spyOn(fs, "fsyncSync").mockImplementation((fd) => {
-        if (++syncs === (failure === "source-fsync" ? 1 : 2)) throw Object.assign(new Error("injected EIO fsync failure"), { code: "EIO" });
+        const target = descriptors.get(fd);
+        if (failure === "source-fsync" ? target === file : target?.endsWith(".compact.tmp")) {
+          throw Object.assign(new Error(`injected EIO ${failure} failure`), { code: "EIO" });
+        }
         fsync(fd);
       });
     try {
       expect(compactTerminalRunLog(file, "completed")).toMatchObject({ compacted: 0, error: expect.stringContaining("injected") });
-    } finally { spy.mockRestore(); }
+    } finally { spy.mockRestore(); openSpy?.mockRestore(); }
     expect(fs.readFileSync(file, "utf8")).toBe(text);
     expect(fs.statSync(file).ino).toBe(inode);
     expect(fs.readdirSync(directory).sort()).toEqual(["events.jsonl", "events.jsonl.raw", "foreign.compact.tmp"]);

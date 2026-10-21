@@ -30,6 +30,52 @@ const baseRequest: FabricActorRequest = {
 };
 
 describe("GlobalActorRegistry", () => {
+  it.each([
+    ["ISO", "2026-10-20T12:34:56.789Z", Date.parse("2026-10-20T12:34:56.789Z")],
+    ["ISO offset", "2026-10-20T12:34:56.789+05:30", Date.parse("2026-10-20T12:34:56.789+05:30")],
+    ["epoch", 1_797_000_000_123, 1_797_000_000_123],
+    ["max Date epoch", 8_640_000_000_000_000, 8_640_000_000_000_000],
+  ] as const)("persists, reloads, and converts eventsStartAt from %s input", (_label, input, expected) => {
+    const { registry, agentDir } = setup();
+    const created = registry.create({ ...baseRequest, name: `reviewer-${_label.toLowerCase()}`, eventsStartAt: input });
+    expect(created.eventsStartAt).toBe(expected);
+
+    const stored = JSON.parse(fs.readFileSync(path.join(agentDir, "fabric", "actors", "global-actors.json"), "utf8")) as {
+      actors: Array<{ id: string; eventsStartAt?: number }>;
+    };
+    expect(stored.actors.find((actor) => actor.id === created.id)?.eventsStartAt).toBe(expected);
+
+    const restored = new GlobalActorRegistry(agentDir, 64 * 1024);
+    const definition = restored.resolve(created.id)!;
+    expect(definition.eventsStartAt).toBe(expected);
+    expect(restored.toRequest(definition).eventsStartAt).toBe(expected);
+  });
+
+  it("keeps and changes eventsStartAt across partial updates and reloads", () => {
+    const { registry, agentDir } = setup();
+    const originalAt = Date.parse("2026-10-20T12:34:56.789Z");
+    const original = registry.create({ ...baseRequest, eventsStartAt: originalAt });
+    const unrelated = registry.update(original.id, { instructions: "Updated instructions." });
+    expect(unrelated.eventsStartAt).toBe(originalAt);
+
+    const reloaded = new GlobalActorRegistry(agentDir, 64 * 1024);
+    expect(reloaded.resolve(original.id)?.eventsStartAt).toBe(originalAt);
+    const changedAt = "2026-10-21T12:34:56.789+02:00";
+    const changed = reloaded.update(original.id, { eventsStartAt: changedAt });
+    expect(changed.eventsStartAt).toBe(Date.parse(changedAt));
+    expect(new GlobalActorRegistry(agentDir, 64 * 1024).resolve(original.id)?.eventsStartAt).toBe(Date.parse(changedAt));
+  });
+
+  it.each([
+    ["invalid ISO", "not-an-instant"],
+    ["zone-less ISO", "2026-10-20T12:34:56.789"],
+    ["epoch beyond Date range", 8_640_000_000_000_001],
+  ] as const)("rejects %s eventsStartAt with the ActorManager validation error", (_label, eventsStartAt) => {
+    const { registry } = setup();
+    expect(() => registry.create({ ...baseRequest, eventsStartAt }))
+      .toThrow("eventsStartAt must be a nonnegative epoch millisecond or ISO timestamp");
+  });
+
   it("round-trips explicit occurrence dedupe independently of resource coalescing", () => {
     const { registry, agentDir } = setup();
     const original = registry.create({ ...baseRequest, dedupeKey: "data.key", coalesceKey: "payload.number" });
@@ -228,6 +274,7 @@ describe("GlobalActorRegistry", () => {
       delivery: "mailbox",
       triggerTurn: false,
     });
+    expect(reloaded.resolve("legacy-mailbox")).not.toHaveProperty("eventsStartAt");
     expect(reloaded.resolve("legacy-steer")).toMatchObject({
       delivery: "steer",
       triggerTurn: false,

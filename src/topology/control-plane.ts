@@ -804,6 +804,7 @@ export class FabricControlPlane {
   #natsInbox: Promise<void> | undefined;
   #natsInboxRetryTimer: NodeJS.Timeout | undefined;
   #natsInboxRetryDelayMs = 1_000;
+  #natsInboxRetryAttempt = 0;
   #natsWorkingTimer: NodeJS.Timeout | undefined;
   #natsCleanupTimer: NodeJS.Timeout | undefined;
   #natsCleanupAt = Infinity;
@@ -2338,10 +2339,13 @@ export class FabricControlPlane {
       if (this.#natsInboxRetryTimer) return;
       // B exposes no public reopen event. A failed entry/iteration or live
       // readiness hold alone arms one bounded one-shot; healthy idle never polls.
+      this.#natsInboxRetryAttempt++;
+      diagnostics.warn("src/topology/control-plane.ts", `[pi-fabric] NATS control inbox code=FABRIC_NATS_CONTROL_INBOX_RETRY host=${JSON.stringify(this.options.hostId)} attempt=${this.#natsInboxRetryAttempt} outcome=retry`);
+      const delayMs = this.#natsInboxRetryDelayMs;
       this.#natsInboxRetryTimer = setTimeout(() => {
         this.#natsInboxRetryTimer = undefined;
         this.#bindNatsInbox();
-      }, this.#natsInboxRetryDelayMs);
+      }, delayMs);
       this.#natsInboxRetryTimer.unref();
       this.#natsInboxRetryDelayMs = Math.min(30_000, this.#natsInboxRetryDelayMs * 2);
       return;
@@ -2366,8 +2370,12 @@ export class FabricControlPlane {
         try {
           for (;;) {
             const next = await inbox.next();
-            if (next.done) return; // normal termination is not retryable
+            if (next.done) return; // unexpected completion rebinds below, never a sticky pause
             if (!this.#natsSessionLive(session)) return; // leave this delivery unacked
+            if (this.#natsInboxRetryAttempt > 0) {
+              diagnostics.warn("src/topology/control-plane.ts", `[pi-fabric] NATS control inbox code=FABRIC_NATS_CONTROL_INBOX_READY host=${JSON.stringify(this.options.hostId)} attempt=${this.#natsInboxRetryAttempt} outcome=recovered`);
+            }
+            this.#natsInboxRetryAttempt = 0;
             this.#natsInboxRetryDelayMs = 1_000;
             const receipt: NatsControlReceipt = { delivery: next.value, session, workingUntil: Infinity };
             this.#natsReceipts.add(receipt);
@@ -2377,16 +2385,16 @@ export class FabricControlPlane {
         } finally { await inbox.return?.(); } // join before opening another iterator
       } catch (error) {
         if (!session.signal.aborted) {
-          try { console.warn(`[pi-fabric] NATS control inbox stopped: ${error instanceof Error ? error.message : String(error)}`); } catch {}
-          if (isObject(error) && error.code === "FABRIC_TRANSPORT_UNAVAILABLE") {
-            if (this.#natsSessionLive(session)) {
-              this.#stopNatsInbox(session);
-              this.#bindNatsInbox(true);
-            }
-          } else this.pause(error);
+          if (!(isObject(error) && error.code === "FABRIC_TRANSPORT_UNAVAILABLE")) {
+            diagnostics.warn("src/topology/control-plane.ts", `[pi-fabric] NATS control inbox code=FABRIC_NATS_CONTROL_INBOX_TERMINAL host=${JSON.stringify(this.options.hostId)} attempt=${this.#natsInboxRetryAttempt} outcome=stopped`);
+            this.pause(error);
+          }
         }
       } finally {
-        if (!session.signal.aborted) this.pause(new TransportUnavailableError("NATS control inbox ended"));
+        // Transport recovery and normal completion are not authority loss. Rebind
+        // only while this exact owner is still live; explicit pauses and retired
+        // leases remain terminal in #natsSessionLive and #bindNatsInbox.
+        if (this.#natsSessionLive(session)) this.#bindNatsInbox(true);
         this.#stopNatsInbox(session);
       }
     })();

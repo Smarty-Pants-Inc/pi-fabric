@@ -64,6 +64,8 @@ export interface NatsTransportOptions extends NatsPermissionPolicy {
   readonly credentials: string;
   readonly tls?: TlsOptions;
   readonly maxBytes?: number;
+  /** Leases, presence and inbox replicas; omitted preserves the single-replica policy. */
+  readonly replicas?: number;
   /** Inbox stream max_age in milliseconds. Existing maxAgeMs is a legacy direct-options alias. */
   readonly inboxMaxAgeMs?: number;
   readonly maxAgeMs?: number;
@@ -81,7 +83,7 @@ export interface NatsTransportOptions extends NatsPermissionPolicy {
 }
 
 type OpenOptions = NatsTransportOptions | FabricTransportOptions;
-type ResolvedNatsOptions = Required<Pick<NatsTransportOptions, "servers" | "machine" | "hostId" | "credentials" | "custodyStream" | "livenessStream" | "pathBMachines" | "maxBytes" | "maxMessageBytes" | "duplicateWindowMs" | "requestTimeoutMs" | "provision" | "ephemeralHost" | "ephemeralInactiveSeconds" | "inboxMaxAgeMs">> & {
+type ResolvedNatsOptions = Required<Pick<NatsTransportOptions, "servers" | "machine" | "hostId" | "credentials" | "custodyStream" | "livenessStream" | "pathBMachines" | "maxBytes" | "maxMessageBytes" | "duplicateWindowMs" | "requestTimeoutMs" | "provision" | "ephemeralHost" | "ephemeralInactiveSeconds" | "inboxMaxAgeMs" | "replicas">> & {
   readonly org?: string;
   readonly name?: string;
   readonly tls?: TlsOptions;
@@ -114,6 +116,7 @@ const normalizeOptions = (options: OpenOptions): ResolvedNatsOptions => {
       ...(options.org === undefined ? {} : { org: options.org }),
       ...(options.tls === undefined ? {} : { tls: options.tls }),
       maxBytes: options.maxBytes ?? DEFAULT_MAX_BYTES,
+      replicas: options.replicas === undefined ? 1 : options.replicas,
       maxMessageBytes: options.maxMessageBytes ?? DEFAULT_MAX_MESSAGE_BYTES,
       duplicateWindowMs: options.duplicateWindowMs ?? DEFAULT_DUPLICATE_WINDOW_MS,
       requestTimeoutMs: options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
@@ -130,7 +133,7 @@ const normalizeOptions = (options: OpenOptions): ResolvedNatsOptions => {
   const config = options.config as unknown as { nats?: {
     servers?: string | readonly string[]; machine?: string; credentials?: string;
     custodyStream?: string; livenessStream?: string; pathBMachines?: readonly string[]; org?: string; tls?: TlsOptions;
-    ephemeralHost?: boolean; ephemeralInactiveSeconds?: number; inboxMaxAgeMs?: number; events?: boolean; provision?: boolean;
+    ephemeralHost?: boolean; ephemeralInactiveSeconds?: number; inboxMaxAgeMs?: number; events?: boolean; provision?: boolean; replicas?: number;
   } };
   const nats = config.nats;
   // Production config never enables plaintext; the loopback opt-in is a direct test option only.
@@ -154,6 +157,7 @@ const normalizeOptions = (options: OpenOptions): ResolvedNatsOptions => {
     ...(nats?.org === undefined ? {} : { org: nats.org }),
     ...(nats?.tls === undefined ? {} : { tls: nats.tls }),
     maxBytes: DEFAULT_MAX_BYTES,
+    replicas: nats?.replicas === undefined ? 1 : nats.replicas,
     maxMessageBytes: DEFAULT_MAX_MESSAGE_BYTES,
     duplicateWindowMs: DEFAULT_DUPLICATE_WINDOW_MS,
     requestTimeoutMs: 5_000,
@@ -174,7 +178,7 @@ const streamPolicy = (name: string, subjects: readonly string[], options: Resolv
   maxAgeMs: overrides.maxAgeMs ?? options.inboxMaxAgeMs,
   maxMessageBytes: overrides.maxMessageBytes ?? options.maxMessageBytes,
   duplicateWindowMs: overrides.duplicateWindowMs ?? options.duplicateWindowMs,
-  replicas: 1,
+  replicas: overrides.replicas ?? options.replicas,
 });
 
 const transportConsumerPolicy = (options: ResolvedNatsOptions): TransportConsumerPolicy => ({
@@ -241,12 +245,13 @@ const openNatsSession = async (options: ResolvedNatsOptions, signal?: AbortSigna
         maxAgeMs: 30 * 24 * 60 * 60 * 1_000,
         maxBytes: Math.max(options.maxBytes, 64 * 1024 * 1024),
         maxMessageBytes: 64 * 1024,
+        replicas: 1,
       }), true);
       assertAlive();
     }
-    const leases = await openNatsKvForMachine(connection.js, "leases", options.machine, options.provision, connection.onStatus);
+    const leases = await openNatsKvForMachine(connection.js, "leases", options.machine, options.provision, connection.onStatus, options.replicas);
     assertAlive();
-    const presence = await openNatsKvForMachine(connection.js, "presence", options.machine, options.provision, connection.onStatus);
+    const presence = await openNatsKvForMachine(connection.js, "presence", options.machine, options.provision, connection.onStatus, options.replicas);
     assertAlive();
     await ensureTransportStream(manager, {
       ...streamPolicy(transportInboxStream(options.machine), [transportInboxStreamSubject(options.machine)], options),
@@ -272,6 +277,10 @@ const openNatsSession = async (options: ResolvedNatsOptions, signal?: AbortSigna
   } catch (error) {
     await connection.close().catch(() => undefined);
     signal?.throwIfAborted();
+    // provision.ts owns the exact checks; type only this inbox's refusal, not advisory/event failures.
+    if (error instanceof Error && error.message === `NATS stream configuration mismatch: ${transportInboxStream(options.machine)}`) {
+      throw new TransportInvalidError(error.message, { cause: error });
+    }
     throw error;
   }
 };
@@ -417,6 +426,9 @@ class NatsTransportImpl implements FabricTransport {
     if (!options.hostId) throw new Error("hostId is required");
     if (typeof options.events !== "boolean") throw new Error("NATS transport events must be a boolean");
     if (options.events && (!options.org || !options.mesh)) throw new Error("NATS transport events require org and mesh");
+    if (!Number.isSafeInteger(options.replicas) || options.replicas <= 0) {
+      throw new TransportInvalidError("NATS transport replicas must be a positive safe integer");
+    }
     for (const [key, value] of Object.entries(options)) {
       if (["servers", "machine", "hostId", "name", "credentials", "ephemeralHost"].includes(key)) continue;
       if (typeof value === "number" && (!Number.isSafeInteger(value) || value <= 0)) throw new Error(`${key} must be positive`);
@@ -662,38 +674,97 @@ class NatsTransportImpl implements FabricTransport {
     if (this.#inboxActive) throw new TransportInvalidError("only one inbox iterator is allowed per transport");
     this.#inboxActive = true;
     const consumerPolicy = transportConsumerPolicy(this.#options);
+    const lifetime = AbortSignal.any([signal, this.#closeController.signal]);
+    let attempt = 0;
+    let recoveryCode = "FABRIC_NATS_INBOX_ENDED";
+    const diagnostic = (code: string, outcome: string): void => {
+      try { console.warn(`[pi-fabric] NATS inbox code=${code} host=${JSON.stringify(this.self.hostId)} durable=${JSON.stringify(consumerPolicy.durable)} stream=${JSON.stringify(this.#stream)} attempt=${attempt} outcome=${outcome}`); } catch {}
+    };
+    const terminalFailure = (error: unknown): boolean => {
+      let cause = error;
+      for (let depth = 0; cause && depth < 6; depth += 1) {
+        if (typeof cause !== "object") break;
+        const candidate = cause as { name?: string; code?: unknown; status?: unknown; message?: string; cause?: unknown };
+        if (["NatsAuthorizationError", "AuthorizationError", "PermissionViolationError", "UserAuthenticationExpiredError",
+          "InvalidArgumentError", "InvalidNameError", "InvalidSubjectError", "InvalidOperationError"].includes(candidate.name ?? "") ||
+          ["FABRIC_NATS_AUTHORIZATION", "FABRIC_TRANSPORT_DENIED", "FABRIC_TRANSPORT_INVALID", "FABRIC_TRANSPORT_UNSUPPORTED",
+            "AUTHORIZATION_VIOLATION", "PERMISSIONS_VIOLATION"].includes(String(candidate.code)) ||
+          [400, 401, 403].includes(Number(candidate.status)) || [400, 401, 403].includes(Number(candidate.code)) ||
+          /configuration mismatch|owner.*mismatch|permission|authorization|invalid (?:consumer|configuration|config)/i.test(candidate.message ?? "")) return true;
+        cause = candidate.cause;
+      }
+      return false;
+    };
     try {
-      while (!signal.aborted && !this.#closed) {
+      while (!lifetime.aborted) {
+        if (attempt > 0) {
+          const ceiling = Math.min(5_000, 250 * 2 ** Math.min(attempt - 1, 5));
+          const delay = Math.min(5_000, ceiling + Math.floor(Math.random() * Math.min(250, ceiling)));
+          diagnostic(recoveryCode, "retry");
+          try { await sleep(delay, undefined, { signal: lifetime }); }
+          catch { return; }
+        }
         let session: NatsSession;
-        try { session = await this.#waitForSession(signal); }
-        catch (error) { if (this.#closed) return; throw error; }
-        if (signal.aborted || this.#closed) return;
+        try { session = await this.#waitForSession(lifetime); }
+        catch (error) { if (lifetime.aborted) return; throw error; }
+        if (lifetime.aborted) return;
         const controller = new AbortController();
         const queue = new Readable({ objectMode: true, read() {} });
         let messages: ConsumerMessages | undefined;
+        let statusTask: Promise<void> | undefined;
         const end = (): void => { if (!queue.destroyed && !queue.readableEnded) queue.push(null); };
-        const stop = (): void => { end(); void messages?.close(); };
+        const stop = (): void => { end(); void messages?.close().catch(() => undefined); };
+        const assertCurrent = (): void => {
+          if (lifetime.aborted || controller.signal.aborted || this.#session !== session || !session.connection.isVerified()) {
+            throw new TransportUnavailableError("NATS inbox setup was suspended");
+          }
+        };
         this.#activeInbox = { controller, queue };
         signal.addEventListener("abort", stop, { once: true });
         this.#closeController.signal.addEventListener("abort", stop, { once: true });
         controller.signal.addEventListener("abort", stop, { once: true });
         try {
           try {
+          assertCurrent();
           const info = await ensureTransportConsumer(session.manager.consumers, consumerPolicy);
+          assertCurrent();
           if (info.config.filter_subject !== consumerPolicy.filterSubject || info.config.description !== consumerPolicy.description) {
             throw new TransportInvalidError("transport inbox owner/filter mismatch");
           }
           const consumer = await session.js.consumers.get(this.#stream, consumerPolicy.durable);
+          assertCurrent();
           messages = await consumer.consume({ max_messages: 16, callback: (msg) => {
             if (!session.connection.isVerified()) return; // Native reconnect may replay SUBs before USER.INFO.
             if (!signal.aborted && !controller.signal.aborted && !this.#closed && this.#session === session && !queue.destroyed) queue.push(msg);
           } });
           this.#activeInbox = { controller, messages, queue };
-          void messages.closed().then((error) => { if (error) queue.destroy(error); else end(); });
+          assertCurrent();
+          recoveryCode = "FABRIC_NATS_INBOX_ENDED";
+          const fail = (error: unknown): void => {
+            if (!lifetime.aborted && !controller.signal.aborted && !queue.destroyed) {
+              queue.destroy(error instanceof Error ? error : new TransportUnavailableError("NATS inbox consumer failed"));
+            }
+          };
+          void messages.closed().then((error) => { if (error) fail(error); else end(); }, fail);
+          // These informational events can otherwise leave a callback consumer waiting
+          // forever for a deleted durable. Close it and re-verify ownership before reuse.
+          statusTask = (async () => {
+            for await (const status of messages!.status()) {
+              if (lifetime.aborted || controller.signal.aborted) return;
+              if (["heartbeats_missed", "consumer_deleted", "consumer_not_found", "stream_not_found", "reset",
+                "ordered_consumer_recreated", "no_responders"].includes(status.type)) {
+                recoveryCode = `FABRIC_NATS_INBOX_${status.type.toUpperCase()}`;
+                controller.abort();
+                return;
+              }
+            }
+          })().catch(fail);
+          if (attempt > 0) diagnostic("FABRIC_NATS_INBOX_READY", "recovered");
           try {
             for await (const msg of queue as AsyncIterable<JsMsg>) {
               if (signal.aborted || controller.signal.aborted || this.#closed || this.#session !== session) break;
               if (!session.connection.isVerified()) { controller.abort(); break; }
+              attempt = 0;
               let decoded;
               try { decoded = this.#decode(msg); }
               catch { await msg.term("malformed transport envelope"); continue; }
@@ -730,24 +801,30 @@ class NatsTransportImpl implements FabricTransport {
               yield delivery;
             }
           } catch (error) {
-            if (!controller.signal.aborted && !signal.aborted) throw error;
+            if (!lifetime.aborted) throw error;
           }
           } catch (error) {
-            if (this.#closed) return;
-            if (!controller.signal.aborted && (session.connection.nc.isClosed() || session.connection.nc.isDraining())) this.#loseSession(session);
-            if (!(controller.signal.aborted && !signal.aborted && !this.#closed && this.#session !== session)) throw error;
+            if (lifetime.aborted) return;
+            if (terminalFailure(error)) {
+              diagnostic("FABRIC_NATS_INBOX_TERMINAL", "stopped");
+              // The control plane must retain terminal pauses, but not transient
+              // JetStream setup/consume failures or ordinary iterator completion.
+              throw new TransportInvalidError("NATS inbox authorization, ownership or configuration rejected", { cause: error });
+            }
+            recoveryCode = "FABRIC_NATS_INBOX_TRANSIENT";
+            if (session.connection.nc.isClosed() || session.connection.nc.isDraining()) this.#loseSession(session);
           }
         } finally {
           signal.removeEventListener("abort", stop);
           this.#closeController.signal.removeEventListener("abort", stop);
           controller.signal.removeEventListener("abort", stop);
-          if (messages) await messages.close();
+          if (messages) await messages.close().catch(() => undefined);
+          await statusTask;
           queue.destroy();
           if (this.#activeInbox?.controller === controller) this.#activeInbox = undefined;
         }
-        if (!signal.aborted && !this.#closed && this.#session !== session) continue;
-        if (!signal.aborted && !this.#closed && controller.signal.aborted) continue;
-        return;
+        if (lifetime.aborted) return;
+        attempt += 1;
       }
     } finally {
       this.#inboxActive = false;

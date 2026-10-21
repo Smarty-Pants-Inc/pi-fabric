@@ -8,7 +8,7 @@ import { parsePerCallRouting } from "./agents/per-call-config.js";
 import { normalizeAgentRouterConfig, type FabricAgentRouterConfig } from "./agents/router-config.js";
 export type { FabricAgentRouterConfig } from "./agents/router-config.js";
 import { normalizeAgentPlacement, type AgentPlacementConfig } from "./agents/placement-config.js";
-import { normalizePlacementApiConfig, type PlacementApiConfig } from "./placement/config.js";
+import { isLoopbackPlacementUrl, normalizePlacementApiConfig, type PlacementApiConfig } from "./placement/config.js";
 export type { PlacementApiConfig } from "./placement/config.js";
 import type { SandboxTransportConfig } from "./transport/sandbox/types.js";
 import { normalizeWakeTextConfig, type FabricWakeTextConfig } from "./actors/wake-text.js";
@@ -1373,7 +1373,7 @@ const sandboxPlacementUrlValue = (value: unknown): string => {
     Number(octets[0]) === 100 && Number(octets[1]) >= 64 && Number(octets[1]) <= 127;
   const service = url.hostname === "smarty-placement.smarty-island.svc" && url.port === "8080";
   if (url.protocol !== "http:" || url.username || url.password || url.pathname !== "/" || url.search || url.hash ||
-    !(service || tailnetIp && url.port === "30880")) throw new Error("agents.sandbox.placementUrl must use the in-cluster HTTP endpoint or a tailnet IPv4 NodePort");
+    !(service || tailnetIp && url.port === "30880" || isLoopbackPlacementUrl(candidate, url))) throw new Error("agents.sandbox.placementUrl must use the in-cluster HTTP endpoint or a tailnet IPv4 NodePort");
   return url.origin;
 };
 

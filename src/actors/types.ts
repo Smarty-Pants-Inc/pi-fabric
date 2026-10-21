@@ -255,6 +255,22 @@ export function normalizeDeadLetterReplayMaxAgeMs(value: unknown): number | unde
   return value;
 }
 
+const MAX_EVENTS_START_AT_MS = 8_640_000_000_000_000;
+const EXPLICIT_EVENTS_START_AT_ZONE = /(?:Z|[+-]\d{2}:\d{2})$/i;
+
+export const parseEventsStartAt = (value: unknown): number => {
+  const timestamp = typeof value === "string" ? value.trim() : undefined;
+  const at = typeof value === "number"
+    ? value
+    : timestamp !== undefined && EXPLICIT_EVENTS_START_AT_ZONE.test(timestamp)
+      ? Date.parse(timestamp)
+      : Number.NaN;
+  if (!Number.isSafeInteger(at) || at < 0 || at > MAX_EVENTS_START_AT_MS) {
+    throw new Error("eventsStartAt must be a nonnegative epoch millisecond or ISO timestamp");
+  }
+  return at;
+};
+
 /** Window batching retains each observation; 0 keeps single-event activation. */
 export interface FabricActorBatching {
   batchWindowMs?: number;

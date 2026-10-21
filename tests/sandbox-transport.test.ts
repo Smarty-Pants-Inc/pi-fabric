@@ -704,9 +704,40 @@ describe("sandbox agent transport", () => {
     expect(normalizeFabricConfig({ agents: { transport: "sandbox" } }).agents.transport).toBe("sandbox");
     expect(normalizeFabricConfig({}).agents.sandbox).toEqual({ enabled: false, template: "smarty-proof-agent", readyTimeoutMs: 90_000 });
     expect(DEFAULT_SANDBOX_PLACEMENT_URL).toBe("http://smarty-placement.smarty-island.svc:8080");
-    expect(normalizeFabricConfig({ agents: { sandbox: { enabled: true, template: "smarty-proof-agent", readyTimeoutMs: 30_000, placementUrl: "http://100.125.29.10:30880" } } }).agents.sandbox)
-      .toEqual({ enabled: true, template: "smarty-proof-agent", readyTimeoutMs: 30_000, placementUrl: "http://100.125.29.10:30880" });
-    expect(() => normalizeFabricConfig({ agents: { sandbox: { placementUrl: "https://smarty-placement.smarty-island.svc:8443" } } })).toThrow(/plain HTTP|NodePort/);
-    expect(() => normalizeFabricConfig({ agents: { sandbox: { placementUrl: "http://user:secret@100.125.29.10:30880" } } })).toThrow(/plain HTTP|NodePort/);
+
+    for (const placementUrl of [
+      "http://smarty-placement.smarty-island.svc:8080",
+      "http://100.125.29.10:30880",
+      "http://127.0.0.1:1024",
+      "http://127.0.0.1:18080",
+      "http://127.0.0.1:65535",
+    ]) {
+      expect(normalizeFabricConfig({ agents: { sandbox: { enabled: true, template: "smarty-proof-agent", readyTimeoutMs: 30_000, placementUrl } } }).agents.sandbox)
+        .toEqual({ enabled: true, template: "smarty-proof-agent", readyTimeoutMs: 30_000, placementUrl });
+    }
+
+    for (const placementUrl of [
+      "https://smarty-placement.smarty-island.svc:8443",
+      "http://user:secret@100.125.29.10:30880",
+      "http://localhost:18080",
+      "http://127.0.0.2:18080",
+      "http://127.1:18080",
+      "http://2130706433:18080",
+      "http://0x7f000001:18080",
+      "http://0.0.0.0:18080",
+      "http://[::1]:18080",
+      "http://127.0.0.1",
+      "http://127.0.0.1:80",
+      "http://127.0.0.1:1023",
+      "http://127.0.0.1:65536",
+      "https://127.0.0.1:18080",
+      "http://u:p@127.0.0.1:18080",
+      "http://127.0.0.1:18080/x",
+    ]) {
+      const expectedError = placementUrl === "http://127.0.0.1:65536"
+        ? "Invalid agents.sandbox.placementUrl"
+        : "agents.sandbox.placementUrl must use the in-cluster HTTP endpoint or a tailnet IPv4 NodePort";
+      expect(() => normalizeFabricConfig({ agents: { sandbox: { placementUrl } } })).toThrow(expectedError);
+    }
   });
 });

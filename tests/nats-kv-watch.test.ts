@@ -4,12 +4,14 @@ import os from "node:os";
 import path from "node:path";
 import {
   DeliverPolicy,
+  JetStreamApiError,
   jetstream,
   jetstreamManager,
   type ConsumerMessages,
   type JetStreamClient,
   type PushConsumer,
 } from "@nats-io/jetstream";
+import { AuthorizationError, InvalidArgumentError, NoRespondersError, PermissionViolationError, RequestError, TimeoutError } from "@nats-io/transport-node";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { openNatsConnection, type NatsConnectionHandle } from "../src/transport/nats/connection.js";
 import { openNatsTransport } from "../src/transport/nats/inbox.js";
@@ -20,7 +22,7 @@ import { readParticipantFile, readParticipantFiles } from "../src/topology/parti
 import { NatsLocalProjection } from "../src/topology/nats-local-projection.js";
 import { KvParticipantDirectory } from "../src/topology/participant-view.js";
 import type { FabricKvHostLease, FabricParticipantRecord } from "../src/topology/types.js";
-import { openNatsKv, openNatsKvForMachine, type NatsKvStore } from "../src/transport/nats/kv.js";
+import { kvWatchRetryCode, kvWatchRetryDelayMs, openNatsKv, openNatsKvForMachine, type NatsKvStore } from "../src/transport/nats/kv.js";
 import { TransportUnavailableError, type FabricTransport, type TransportBucket, type TransportKv, type TransportKvEvent } from "../src/transport/types.js";
 import { ensureTransportStream } from "../src/transport/nats/provision.js";
 import { transportInboxStream, transportInboxStreamSubject } from "../src/transport/nats/subjects.js";
@@ -92,6 +94,54 @@ const gateConsumer = (js: JetStreamClient) => {
   return { client, created: created.promise, release: () => release.resolve() };
 };
 
+// Keep: election/API failures are hard to force deterministically at this trust
+// boundary. Use the installed SDK's exception classes, not message-only stand-ins.
+describe("NATS KV watch retry classification", () => {
+  const api = (description: string, err_code = 19999, code = 500) => new JetStreamApiError({ description, err_code, code });
+  it.each([
+    ["no meta leader", api("no meta leader"), "JS_API_19999"],
+    ["cluster not ready", api("JetStream cluster not ready"), "JS_API_19999"],
+    ["system temporarily unavailable", api("JetStream system temporarily unavailable", 10008, 503), "JS_API_10008"],
+    ["cluster cannot handle request", api("JetStream cluster can not handle request", 10009), "JS_API_10009"],
+    ["stream leader not elected", api("stream leader not elected"), "JS_API_19999"],
+    ["consumer leader not elected", api("consumer leader not elected"), "JS_API_19999"],
+    ["consumer not current", api("consumer is not current"), "JS_API_19999"],
+    ["consumer not yet current", api("consumer not yet current"), "JS_API_19999"],
+    ["API 503", api("service unavailable", 19998, 503), "JS_API_19998"],
+    ["API timeout", api("request timeout", 19998, 408), "JS_API_19998"],
+    ["request timeout", new TimeoutError(), "TIMEOUT"],
+    ["wrapped request timeout", new RequestError("request failed", { cause: new TimeoutError() }), "TIMEOUT"],
+    ["no responders", new NoRespondersError("$JS.API.CONSUMER.CREATE.KV_fabric_presence"), "NO_RESPONDERS"],
+    ["wrapped no responders", new RequestError("request failed", { cause: new NoRespondersError("$JS.API.INFO") }), "NO_RESPONDERS"],
+    ["SDK disabled wrapper with no responders cause", Object.assign(new Error("jetstream is not enabled", {
+      cause: new RequestError("request failed", { cause: new NoRespondersError("$JS.API.INFO") }),
+    }), { name: "JetStreamNotEnabled" }), "NO_RESPONDERS"],
+  ])("retries %s", (_label, error, code) => {
+    expect(kvWatchRetryCode(error)).toBe(code);
+  });
+
+  it.each([
+    ["authorization", new AuthorizationError("authentication timeout", { cause: new TimeoutError() })],
+    ["permission", new PermissionViolationError("permissions violation", "publish", "$JS.API.INFO")],
+    ["configuration", new InvalidArgumentError("invalid consumer config", { cause: new TimeoutError() })],
+    ["API permission", api("permission denied", 10008, 403)],
+    ["API invalid config", api("invalid consumer configuration", 10012, 400)],
+    ["JetStream disabled for account", api("JetStream not enabled for account", 10039, 503)],
+    ["JetStream disabled", api("JetStream not enabled", 10076, 503)],
+    ["missing stream", api("stream not found", 10059, 404)],
+    ["missing consumer", api("consumer not found", 10014, 404)],
+    ["unknown API failure", api("internal error", 19999)],
+    ["arbitrary timeout text", new Error("timeout")],
+    ["arbitrary not-ready text", new Error("consumer is not current")],
+    ["arbitrary wrapper", new Error("invalid config", { cause: new TimeoutError() })],
+    ["disabled without a transient cause", Object.assign(new Error("jetstream is not enabled"), { name: "JetStreamNotEnabled" })],
+    ["unrecognized request failure", new RequestError("request failed", { cause: new Error("unknown") })],
+    ["non-error shape", { code: 503, message: "no meta leader" }],
+  ])("keeps %s terminal", (_label, error) => {
+    expect(kvWatchRetryCode(error)).toBeUndefined();
+  });
+});
+
 let harness: PathBHarness;
 const connections: NatsConnectionHandle[] = [];
 const watches: Array<{ controller: AbortController; iterator: Watch }> = [];
@@ -153,6 +203,91 @@ describe.skipIf(!binary)("real authenticated NATS KV snapshot/ready/reset", () =
     expect(await next(iterator)).toEqual({ type: "put", entry: { key, machine: A, owner: OWNER, value: { n: 1 }, revision } });
     controller.abort();
     expect(await bounded(iterator.next(), "aborted empty watch")).toEqual({ done: true, value: undefined });
+  });
+
+  it.each(["create", "info", "consume", "closed"] as const)("retries a transient %s failure without a core reconnect, then emits reset/snapshot/ready", async (stage) => {
+    const { connection, store } = await presence(A);
+    const key = `${A}.p.retry-${stage}`;
+    const revision = await store.put(key, OWNER, { n: 1 }, 0);
+    const unavailable = new JetStreamApiError({ code: 503, err_code: 10008, description: "JetStream system temporarily unavailable" });
+    const consumed = deferred<ConsumerMessages>();
+    let attempts = 0;
+    const getPushConsumer: JetStreamClient["consumers"]["getPushConsumer"] = async (...args) => {
+      const first = ++attempts === 1;
+      if (first && stage === "create") throw unavailable;
+      const consumer = await connection.js.consumers.getPushConsumer(...args);
+      return {
+        info: (cached) => first && stage === "info" ? Promise.reject(unavailable) : consumer.info(cached),
+        delete: () => consumer.delete(),
+        isPullConsumer: () => consumer.isPullConsumer(),
+        isPushConsumer: () => consumer.isPushConsumer(),
+        consume: async (options) => {
+          if (first && stage === "consume") throw new RequestError("request failed", { cause: new TimeoutError() });
+          const messages = await consumer.consume(options);
+          if (first) consumed.resolve(messages);
+          return messages;
+        },
+      };
+    };
+    const client = Object.create(connection.js) as JetStreamClient;
+    Object.defineProperty(client, "consumers", { value: { getPushConsumer } });
+    const recoveringStore = await openNatsKv(client, { bucket: "fabric_presence" }, false, connection.onStatus);
+    const diagnostic = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const { iterator, controller } = watch(recoveringStore, key);
+    try {
+      if (stage === "closed") {
+        expect(await snapshot(iterator)).toHaveLength(1);
+        (await consumed.promise).stop(new TimeoutError());
+      }
+      expect(await next(iterator)).toEqual({ type: "reset" });
+      expect(await snapshot(iterator)).toEqual([{ type: "put", entry: { key, machine: A, owner: OWNER, value: { n: 1 }, revision } }]);
+      expect(attempts).toBe(2);
+      expect(diagnostic.mock.calls.map(([line]) => JSON.parse(String(line).slice("[fabric:nats:kv-watch] ".length))))
+        .toEqual([
+          { outcome: "retry", code: stage === "consume" || stage === "closed" ? "TIMEOUT" : "JS_API_10008", bucket: "fabric_presence", attempt: 1 },
+          { outcome: "ready", code: stage === "consume" || stage === "closed" ? "TIMEOUT" : "JS_API_10008", bucket: "fabric_presence", attempt: 1 },
+        ]);
+      const updated = await store.put(key, OWNER, { n: 2 }, revision);
+      expect(await next(iterator)).toMatchObject({ type: "put", entry: { key, revision: updated } });
+    } finally {
+      controller.abort();
+      await iterator.return?.();
+      diagnostic.mockRestore();
+    }
+  });
+
+  it("bounds exponential retry backoff with jitter and cancels the pending retry timer", async () => {
+    expect([
+      kvWatchRetryDelayMs(1, 0), kvWatchRetryDelayMs(1, 1),
+      kvWatchRetryDelayMs(2, 0), kvWatchRetryDelayMs(2, 0.5), kvWatchRetryDelayMs(2, 1),
+      kvWatchRetryDelayMs(3, 0.5), kvWatchRetryDelayMs(4, 0.5), kvWatchRetryDelayMs(5, 0.5),
+      kvWatchRetryDelayMs(6, 0), kvWatchRetryDelayMs(6, 1), kvWatchRetryDelayMs(100, 1),
+    ]).toEqual([250, 300, 400, 500, 600, 1_000, 2_000, 4_000, 4_000, 5_000, 5_000]);
+
+    const { connection } = await presence(A);
+    let attempts = 0;
+    const getPushConsumer: JetStreamClient["consumers"]["getPushConsumer"] = async () => {
+      attempts++;
+      throw new JetStreamApiError({ code: 503, err_code: 10008, description: "JetStream system temporarily unavailable" });
+    };
+    const client = Object.create(connection.js) as JetStreamClient;
+    Object.defineProperty(client, "consumers", { value: { getPushConsumer } });
+    const store = await openNatsKv(client, { bucket: "fabric_presence" }, false, connection.onStatus);
+    const diagnostic = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const { iterator, controller } = watch(store, `${A}.p.retry-backoff`);
+    try {
+      expect((await iterator.next()).value).toEqual({ type: "reset" });
+      expect(attempts).toBe(1);
+      const pending = iterator.next();
+      controller.abort();
+      expect(await pending).toEqual({ done: true, value: undefined });
+      expect(attempts).toBe(1);
+      expect(diagnostic.mock.calls.at(-1)?.[0]).toBe('[fabric:nats:kv-watch] {"outcome":"cancelled","code":"JS_API_10008","bucket":"fabric_presence","attempt":1}');
+    } finally {
+      controller.abort();
+      await iterator.return?.();
+      diagnostic.mockRestore();
+    }
   });
 
   it("emits every last-per-subject snapshot entry, including the last, before ready", async () => {

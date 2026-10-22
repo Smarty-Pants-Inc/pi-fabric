@@ -43,6 +43,30 @@ const writeStatus = (
 const sweepAt = (tempRoot: string, now: number) =>
   sweepTempRunRoots({ tempRoot, now, orphanedTempRunRetentionMs: 6 * HOUR, oneShotRunRetentionMs: DAY });
 
+const taskTmpRunFixture = (tempRoot: string, kind: "closed" | "orphaned", mismatch = false) => {
+  const root = path.join(tempRoot, `${FABRIC_RUN_ROOT_PREFIX}${kind}`);
+  fs.mkdirSync(root);
+  fs.writeFileSync(path.join(root, ".fabric-owner.json"), JSON.stringify({
+    pid: 2_147_483_647, startedAt: 1, heartbeatAt: 1,
+    ...(kind === "closed" ? { closedAt: 1, childrenStopped: true } : { orphanedAt: 1 }),
+  }));
+  const run = path.join(root, "run");
+  writeStatus(run, { status: "completed", transport: "process", sessionId: "2147483647", finishedAt: 1 });
+  const parent = os.tmpdir();
+  const temporary = path.join(parent, kind === "closed" ? "r.ABC123" : "r.DEF456"); roots.push(temporary);
+  expect(Buffer.byteLength(temporary, "utf8")).toBeLessThanOrEqual(51);
+  fs.mkdirSync(temporary, { mode: 0o700 });
+  fs.writeFileSync(path.join(temporary, "payload"), "task scratch", { mode: 0o600 });
+  const parentStat = fs.lstatSync(parent), temporaryStat = fs.lstatSync(temporary);
+  const runTmp = path.join(run, "tmp"); fs.mkdirSync(runTmp, { mode: 0o700 });
+  fs.writeFileSync(path.join(runTmp, "task-tmp.json"), JSON.stringify({
+    format: 1, runId: path.basename(run), path: temporary,
+    dev: String(temporaryStat.dev), ino: String(temporaryStat.ino + (mismatch ? 1 : 0)),
+    parent, parentDev: String(parentStat.dev), parentIno: String(parentStat.ino),
+  }), { mode: 0o600 });
+  return { root, run, temporary };
+};
+
 afterEach(() => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
@@ -674,6 +698,34 @@ describe("temporal retention", () => {
     const result = sweepTempRunRoots({ tempRoot, now: 100 * DAY, orphanedTempRunRetentionMs: 6 * HOUR, oneShotRunRetentionMs: DAY });
     expect(result).toEqual({ removedRoots: [], removedRuns: [] });
     expect(hasUnresolvedWorker(path.join(orphaned, "parent"))).toBe(true);
+  });
+
+  it.runIf(process.platform === "linux")("removes recorded task-temp directories before closed and orphaned run trees", () => {
+    const tempRoot = temporaryDirectory();
+    const fixtures = [taskTmpRunFixture(tempRoot, "closed"), taskTmpRunFixture(tempRoot, "orphaned")];
+    const result = sweepTempRunRoots({ tempRoot, now: 100 * DAY, orphanedTempRunRetentionMs: 0, oneShotRunRetentionMs: 0 });
+    expect(result.removedRuns).toEqual([fixtures[0]!.run]);
+    expect(result.removedRoots).toContain(fixtures[1]!.root);
+    for (const fixture of fixtures) {
+      expect(fs.existsSync(fixture.temporary)).toBe(false);
+      expect(fs.existsSync(fixture.run)).toBe(false);
+    }
+  });
+
+  it.runIf(process.platform === "linux")("keeps and warns about mismatched task-temp directories while removing closed and orphaned runs", () => {
+    const tempRoot = temporaryDirectory();
+    const fixtures = [taskTmpRunFixture(tempRoot, "closed", true), taskTmpRunFixture(tempRoot, "orphaned", true)];
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const result = sweepTempRunRoots({ tempRoot, now: 100 * DAY, orphanedTempRunRetentionMs: 0, oneShotRunRetentionMs: 0 });
+    expect(result.removedRuns).toEqual([fixtures[0]!.run]);
+    expect(result.removedRoots).toContain(fixtures[1]!.root);
+    for (const fixture of fixtures) {
+      expect(fs.existsSync(fixture.run)).toBe(false);
+      expect(fs.existsSync(fixture.temporary)).toBe(true);
+      expect(warning.mock.calls.flat().join(" ")).toContain(fixture.temporary);
+    }
+    expect(warning.mock.calls.flat().join(" ")).toContain("task temporary directory cleanup skipped");
+    expect(warning.mock.calls.flat().join(" ")).toContain("directory identity does not match its recorded custody");
   });
 
   it("removes dead temporary run roots after six hours", () => {

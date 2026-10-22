@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import { retentionV2Enabled } from "./retention-platform.js";
 import path from "node:path";
+import { diagnostics } from "../core/diagnostics.js";
 import { writeFileAtomic, writeJsonAtomic } from "../core/atomic-write.js";
 import { ownedStat, processAlive } from "./scratch.js";
 import { boundedRunTree } from "./reference-scan.js";
@@ -23,6 +24,16 @@ interface RunRootOwner {
   orphanedAt?: number;
   closedAt?: number;
   childrenStopped?: boolean;
+}
+interface TaskTmpAssociation {
+  format: 1;
+  runId: string;
+  path: string;
+  dev: string;
+  ino: string;
+  parent: string;
+  parentDev: string;
+  parentIno: string;
 }
 interface RunRecordSummary {
   id?: string;
@@ -98,6 +109,8 @@ export const UNRESOLVED_WORKER_FILE = "unresolved-worker.json";
 /** A sweep's wall-clock budget; walks stop when it returns true (smarty-dev#2010). */
 type Deadline = () => boolean;
 const noDeadline: Deadline = () => false;
+const TASK_TMP_ASSOCIATION_FILE = "task-tmp.json";
+const TASK_TMP_MAX_PATH_BYTES = 51;
 const TASK_FINAL_ANSWER_LOCK = ".task-final-answer.lock";
 const TASK_FINAL_ANSWER_LOCK_STALE_MS = 30_000;
 /** The final-answer writer's exact mkdir-lock shape. Ownerless, malformed, young, linked, or live locks veto retention. */
@@ -527,6 +540,85 @@ const recoverEnodevTask = (directory: string): void => {
 };
 /** Main's path-based recursive removal: the non-Linux fallback of verifiedRemove only (smarty-dev#7858). */
 const rmTree = (target: string) => (): boolean => { fs.rmSync(target, { recursive: true, force: true }); return true; };
+const sameTaskTmpIdentity = (stat: fs.Stats, dev: string, ino: string): boolean => String(stat.dev) === dev && String(stat.ino) === ino;
+const safeTaskTmpParent = (candidate: string): boolean => {
+  try {
+    if (!path.isAbsolute(candidate) || path.resolve(candidate) !== candidate || fs.realpathSync.native(candidate) !== candidate) return false;
+    const chain: string[] = [];
+    for (let current = candidate; ; current = path.dirname(current)) {
+      chain.unshift(current);
+      if (path.dirname(current) === current) break;
+    }
+    const uid = process.getuid?.();
+    for (const directory of chain) {
+      const stat = fs.lstatSync(directory);
+      if (!stat.isDirectory() || stat.isSymbolicLink() || (uid !== undefined && stat.uid !== uid && stat.uid !== 0) ||
+          ((stat.mode & 0o022) !== 0 && !(stat.uid === 0 && (stat.mode & 0o1000) !== 0))) return false;
+    }
+    return Buffer.byteLength(path.join(candidate, "r.XXXXXX"), "utf8") <= TASK_TMP_MAX_PATH_BYTES;
+  } catch { return false; }
+};
+/** Remove only the exact short task-temp directory recorded by this run. Custody failures leave it in place, but do not
+ * block deletion of the already-safe run tree: the next sweep cannot recover a path after its association is gone. */
+const removeAssociatedTaskTmp = (directory: string, deleter: string): void => {
+  const associationFile = path.join(directory, "tmp", TASK_TMP_ASSOCIATION_FILE);
+  const warn = (reason: string, target = associationFile, count = true): void => {
+    if (count) countRefusal(deleter, `task temporary directory ${reason}`, target);
+    diagnostics.warn("src/storage/retention.ts", `[pi-fabric] task temporary directory cleanup skipped: ${reason}; leaving ${target}; run-tree removal will continue`);
+  };
+  let pin: fs.Stats;
+  try { pin = fs.lstatSync(associationFile); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") warn("association is unreadable");
+    return;
+  }
+  const uid = process.getuid?.();
+  if (!pin.isFile() || pin.isSymbolicLink() || pin.nlink !== 1 || (uid !== undefined && pin.uid !== uid) ||
+      (process.platform !== "win32" && (pin.mode & 0o777) !== 0o600) || pin.size > 4096) {
+    warn("association identity is unsafe"); return;
+  }
+  let fd: number | undefined;
+  let value: TaskTmpAssociation;
+  try {
+    fd = fs.openSync(associationFile, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0));
+    const opened = fs.fstatSync(fd);
+    if (!opened.isFile() || opened.nlink !== 1 || opened.dev !== pin.dev || opened.ino !== pin.ino || opened.uid !== pin.uid ||
+        opened.mode !== pin.mode || opened.size !== pin.size || opened.size > 4096) { warn("association changed while being read"); return; }
+    value = JSON.parse(fs.readFileSync(fd, "utf8")) as TaskTmpAssociation;
+    const after = fs.fstatSync(fd), current = fs.lstatSync(associationFile);
+    if (!after.isFile() || after.nlink !== 1 || after.dev !== pin.dev || after.ino !== pin.ino || after.uid !== pin.uid ||
+        after.mode !== pin.mode || after.size !== pin.size || current.isSymbolicLink() || current.nlink !== 1 ||
+        current.dev !== pin.dev || current.ino !== pin.ino || current.uid !== pin.uid || current.mode !== pin.mode || current.size !== pin.size) {
+      warn("association changed while being read"); return;
+    }
+  } catch { warn("association is malformed or unreadable"); return; }
+  finally { if (fd !== undefined) { try { fs.closeSync(fd); } catch { /* read/identity checks already failed closed */ } } }
+  if (!value || typeof value !== "object" || value.format !== 1 || typeof value.runId !== "string" ||
+      typeof value.path !== "string" || typeof value.parent !== "string" || value.runId !== path.basename(directory) ||
+      !path.isAbsolute(value.path) || !path.isAbsolute(value.parent) || path.resolve(value.path) !== value.path ||
+      path.dirname(value.path) !== value.parent || !/^r\.[A-Za-z0-9]{6}$/.test(path.basename(value.path)) ||
+      Buffer.byteLength(value.path, "utf8") > TASK_TMP_MAX_PATH_BYTES ||
+      ![value.dev, value.ino, value.parentDev, value.parentIno].every(item => typeof item === "string" && /^\d+$/.test(item))) {
+    warn("association contents are invalid"); return;
+  }
+  let temporary: fs.Stats;
+  try { temporary = fs.lstatSync(value.path); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") warn("directory identity is unreadable", value.path);
+    return;
+  }
+  let parent: fs.Stats, physical: string;
+  try { parent = fs.lstatSync(value.parent); physical = fs.realpathSync.native(value.path); }
+  catch { warn("directory or parent identity is unreadable", value.path); return; }
+  if (!safeTaskTmpParent(value.parent) || !parent.isDirectory() || parent.isSymbolicLink() ||
+      !sameTaskTmpIdentity(parent, value.parentDev, value.parentIno) || !temporary.isDirectory() || temporary.isSymbolicLink() ||
+      (uid !== undefined && temporary.uid !== uid) || (process.platform !== "win32" && (temporary.mode & 0o777) !== 0o700) ||
+      !sameTaskTmpIdentity(temporary, value.dev, value.ino) || physical !== value.path) {
+    warn("directory identity does not match its recorded custody", value.path); return;
+  }
+  const result = verifiedRemove(value.path, temporary, { deleter, fallback: rmTree(value.path) });
+  if (!result.removed) warn(`verified removal was refused (${result.reason ?? "unknown reason"})`, value.path, false);
+};
 export const removeEmptyRunRoot = (root: string): boolean => {
   try {
     const judged = ownedStat(root);
@@ -561,6 +653,7 @@ const pruneClosedRunRoot = (
     // The judged stat: taken after recovery, before the safety walk; the removal requires it unchanged.
     const judged = ownedStat(directory);
     if (!safeRunTree(directory, owner.childrenStopped === true, 0, expired)) { countRefusal("pruneClosedRunRoot", "run tree is not proven safe", directory); continue; }
+    removeAssociatedTaskTmp(directory, "pruneClosedRunRoot");
     if (verifiedRemove(directory, judged, { deleter: "pruneClosedRunRoot", fallback: rmTree(directory) }).removed) removed.push(directory);
   }
   return removed;
@@ -733,6 +826,7 @@ export const sweepTempRunRoots = (options: TempRunSweepRequest & {
       recoverEnodevTask(directory);
       const judged = ownedStat(directory);
       if (!safeRunTree(directory, false, 0, expired)) { countRefusal("sweepTempRunRoots", "run tree is not proven safe", directory); continue; }
+      removeAssociatedTaskTmp(directory, "sweepTempRunRoots");
       // Reported as the root's removal once it is empty, as before.
       verifiedRemove(directory, judged, { deleter: "sweepTempRunRoots", fallback: rmTree(directory) });
     }

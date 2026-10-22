@@ -4026,8 +4026,13 @@ export class ActorManager {
         await operatorCheck();
       });
       if (cleanup.presenceKey === this.#presenceKey(cleanup.id)) {
-        await this.#writePresence(cleanup.id);
-        if (this.#pendingPresence.has(cleanup.id)) throw new Error("presence deletion pending");
+        if (!this.#actors.has(cleanup.id) && this.mesh.get(cleanup.presenceKey, { fresh: true }) === undefined) {
+          this.#pendingPresence.delete(cleanup.id);
+          this.#presenceRevisions.delete(cleanup.id);
+        } else {
+          await this.#writePresence(cleanup.id);
+          if (this.#pendingPresence.has(cleanup.id)) throw new Error("presence deletion pending");
+        }
       } else {
         await this.mesh.delete({ key: cleanup.presenceKey });
       }

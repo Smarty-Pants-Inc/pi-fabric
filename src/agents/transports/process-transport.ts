@@ -232,7 +232,7 @@ const prepareTaskTemporaryDirectory = (
     const nonWorktreeRoot = roots.find(root => !isInside(root, realCwd) && !isInside(realCwd, root));
     const root = nonWorktreeRoot ?? roots[roots.length - 1]!;
     if (!containedByRoot(root, cwd, roots)) throw new Error("writable root changed outside the effective policy");
-    temporary = fs.mkdtempSync(path.join(root, ".pi-fabric-task-tmp-"));
+    temporary = fs.mkdtempSync(path.join(root, "t."));
     fs.chmodSync(temporary, 0o700);
     if (process.platform !== "win32" && (fs.statSync(temporary).mode & 0o777) !== 0o700) {
       throw new Error("private task temporary directory is not mode 0700");
@@ -240,6 +240,12 @@ const prepareTaskTemporaryDirectory = (
     if (!containedByRoot(temporary, cwd, roots)) throw new Error("private task temporary directory escaped writable roots");
   }
 
+  const absoluteTemporary = path.isAbsolute(temporary) ? temporary : path.resolve(cwd, temporary);
+  const physicalTemporary = fs.realpathSync.native(absoluteTemporary);
+  if ([temporary, absoluteTemporary, physicalTemporary].some(candidate =>
+      Buffer.byteLength(`${candidate}/p.XXXXXX`, "utf8") > 60)) {
+    throw new Error(`Task temporary directory exceeds the 60-byte bootstrap limit: ${temporary}`);
+  }
   const childEnvironment = { ...environment, TMPDIR: temporary, TMP: temporary, TEMP: temporary };
   const childArguments = [...workerArguments];
   for (let index = 0; index < childArguments.length; index += 2) {

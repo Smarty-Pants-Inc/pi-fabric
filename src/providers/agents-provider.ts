@@ -10,7 +10,7 @@ import type { JevRequest, JevResponse } from "../jev/types.js";
 import { formatAge, residentHostId, RESIDENT_HOST_FORMAT, ResidentOutcomeUnknownError, ResidentActorAuthorizationError, assertResidentActorMain, assertResidentActorToolCeiling, type ResidentActorCaller, type ResidentActorMutation } from "../residency/protocol.js";
 import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
 import { ActorManager, ActorRegistryOwnershipError, parseBashTimeoutSeconds } from "../actors/manager.js";
-import { actorActivationIdentityFromEnvironment, type FabricActorActivationIdentity } from "../actors/activation-identity.js";
+import { FABRIC_ACTOR_SELF_ENV, actorActivationIdentityFromEnvironment, type FabricActorActivationIdentity } from "../actors/activation-identity.js";
 import { slotAdmissionFor } from "../actors/slot-admission.js";
 import { participantProject, recordedProjectLead, repositoryOf, resolveProjectAgent } from "../topology/project-identity.js";
 import { GlobalActorRegistry } from "../actors/global-registry.js";
@@ -1599,7 +1599,10 @@ export class AgentsProvider implements FabricProvider {
       case "actorStatus": {
         const id = String(args.id);
         const ownActor = actorActivationIdentityFromEnvironment();
-        if (ownActor || process.env.PI_FABRIC_ACTOR_ID) {
+        // Older in-process managers can select a newer worker/extension without
+        // supplying the activation tuple. Absence keeps the pre-tuple read path;
+        // a present but malformed tuple must still fail closed.
+        if (process.env[FABRIC_ACTOR_SELF_ENV] !== undefined) {
           if (!ownActor) throw new Error("Fabric actor activation identity is unavailable");
           if (id !== ownActor.actorId) throw new Error(`Unknown Fabric actor: ${id}`);
           return await this.#ownActorStatus(ownActor, context.signal);

@@ -558,6 +558,80 @@ const leaseNames = (dir: string, uncached: boolean): readonly string[] => {
   return names;
 };
 
+interface LeaseDirectoryWatch {
+  watcher: fs.FSWatcher | undefined;
+  dirtyNames: Set<string>;
+  unavailableNames: Set<string>;
+  dirtyAll: boolean;
+  eventGeneration: number;
+  scannedEventGeneration: number;
+  directoryStamp: string | undefined;
+}
+const leaseDirectoryWatches = new Map<string, LeaseDirectoryWatch>();
+let leaseWatchExitHookInstalled = false;
+
+const closeLeaseDirectoryWatches = (): void => {
+  for (const state of leaseDirectoryWatches.values()) {
+    const watcher = state.watcher;
+    state.watcher = undefined;
+    try { watcher?.close(); } catch { /* process shutdown */ }
+  }
+};
+
+const leaseDirectoryStamp = (dir: string): string | undefined => {
+  try {
+    const stat = fs.statSync(dir, { bigint: true });
+    if (!stat.isDirectory()) return undefined;
+    return `${stat.dev}:${stat.ino}:${stat.mtimeNs}:${stat.ctimeNs}`;
+  } catch { return undefined; }
+};
+
+const armLeaseDirectoryWatch = (dir: string, state: LeaseDirectoryWatch): boolean => {
+  if (process.platform === "win32") return false;
+  if (state.watcher) return true;
+  try {
+    const watcher = fs.watch(dir, { persistent: false });
+    state.watcher = watcher;
+    if (!leaseWatchExitHookInstalled) {
+      process.once("exit", closeLeaseDirectoryWatches);
+      leaseWatchExitHookInstalled = true;
+    }
+    const invalidateDirectory = (): void => {
+      if (state.watcher !== watcher) return;
+      state.watcher = undefined;
+      state.dirtyAll = true;
+      state.dirtyNames.clear();
+      try { watcher.close(); } catch { /* re-arm follows a full read */ }
+    };
+    watcher.on("change", (_event, filename) => {
+      if (state.watcher !== watcher) return;
+      if (filename === null || filename.toString() === "") {
+        invalidateDirectory();
+        return;
+      }
+      const name = filename.toString();
+      // Atomic lease writes rename a temporary sibling over a final .json path.
+      if (!name.endsWith(".json")) return;
+      state.eventGeneration += 1;
+      state.dirtyNames.add(name);
+    });
+    watcher.on("error", invalidateDirectory);
+    watcher.on("close", invalidateDirectory);
+    return true;
+  } catch {
+    state.watcher = undefined;
+    return false;
+  }
+};
+
+const leasesFromCache = (known: LeaseSlots, unavailable: ReadonlySet<string>): Map<string, FabricHostLease> => {
+  const leases = new Map<string, FabricHostLease>();
+  for (const [name, slot] of known) {
+    if (name.endsWith(".json") && !unavailable.has(name) && slot.lease) leases.set(slot.lease.id, slot.lease);
+  }
+  return leases;
+};
+
 /** Every host's file lease, by host id. Unreadable or misnamed files are skipped. */
 /**
  * `problems`, when given, collects every lease file or directory that exists but could not be
@@ -570,32 +644,93 @@ export const readHostLeases = (meshRoot: string, problems?: string[]): Map<strin
     const code = (error as NodeJS.ErrnoException)?.code ?? "EUNKNOWN";
     if (code !== "ENOENT") problems?.push(`${file}: ${code}`);
   };
-  let names: readonly string[];
-  try {
-    names = leaseNames(dir, problems !== undefined);
-  } catch (error) {
-    failed(dir, error);
-    return new Map();
-  }
   const known = cache.get(dir) ?? new Map();
   cache.set(dir, known);
-  const leases = new Map<string, FabricHostLease>();
-  const present = new Set<string>();
-  for (const name of names) {
-    if (!name.endsWith(".json")) continue;
-    present.add(name);
-    let stat: fs.BigIntStats;
+  let state = leaseDirectoryWatches.get(dir);
+  const fullScan = (uncached: boolean): Map<string, FabricHostLease> => {
+    let names: readonly string[];
     try {
-      stat = fs.statSync(path.join(dir, name), { bigint: true });
+      names = leaseNames(dir, uncached);
     } catch (error) {
-      failed(path.join(dir, name), error);
-      continue;
+      failed(dir, error);
+      if (state) state.dirtyAll = true;
+      return new Map();
     }
-    const lease = cachedLease(known, dir, name, stat, problems);
-    if (lease) leases.set(lease.id, lease);
+    const leases = new Map<string, FabricHostLease>();
+    const present = new Set<string>();
+    for (const name of names) {
+      if (!name.endsWith(".json")) continue;
+      present.add(name);
+      let stat: fs.BigIntStats;
+      try {
+        stat = fs.statSync(path.join(dir, name), { bigint: true });
+      } catch (error) {
+        failed(path.join(dir, name), error);
+        if (state) {
+          state.unavailableNames.add(name);
+          if ((error as NodeJS.ErrnoException)?.code === "ENOENT") known.delete(name);
+          else state.dirtyNames.add(name);
+        }
+        continue;
+      }
+      state?.unavailableNames.delete(name);
+      const lease = cachedLease(known, dir, name, stat, problems);
+      if (lease) leases.set(lease.id, lease);
+    }
+    for (const name of known.keys()) if (!present.has(name)) known.delete(name);
+    if (state) for (const name of state.unavailableNames) if (!present.has(name)) state.unavailableNames.delete(name);
+    return leases;
+  };
+  // Census and Windows retain the exact full-list/full-stat path: both require fresh truth.
+  if (problems !== undefined || process.platform === "win32") return fullScan(problems !== undefined);
+
+  if (!state) {
+    state = { watcher: undefined, dirtyNames: new Set(), unavailableNames: new Set(), dirtyAll: true,
+      eventGeneration: 0, scannedEventGeneration: 0, directoryStamp: undefined };
+    leaseDirectoryWatches.set(dir, state);
+    // Adopt the directory before the initial full scan so changes during that scan are queued.
+    armLeaseDirectoryWatch(dir, state);
   }
-  for (const name of known.keys()) if (!present.has(name)) known.delete(name);
-  return leases;
+
+  // The directory stamp is the cheap dropped-event gate: atomic temp+rename writes
+  // change its mtime/ctime even when the watcher notification was lost.
+  const currentDirectoryStamp = leaseDirectoryStamp(dir);
+  const eventSeen = state.eventGeneration !== state.scannedEventGeneration;
+  const fullScanRequired = state.dirtyAll || !state.watcher ||
+    (!eventSeen && currentDirectoryStamp !== state.directoryStamp);
+  if (fullScanRequired) {
+    const uncached = state.dirtyAll || state.directoryStamp === undefined;
+    state.dirtyAll = false;
+    state.dirtyNames.clear();
+    const leases = fullScan(uncached);
+    state.directoryStamp = currentDirectoryStamp;
+    state.scannedEventGeneration = state.eventGeneration;
+    if (!state.watcher) armLeaseDirectoryWatch(dir, state);
+    return leases;
+  }
+
+  const dirtyNames = [...state.dirtyNames];
+  state.dirtyNames.clear();
+  for (const name of dirtyNames) {
+    if (!name.endsWith(".json")) continue;
+    const file = path.join(dir, name);
+    try {
+      const stat = fs.statSync(file, { bigint: true });
+      cachedLease(known, dir, name, stat);
+      state.unavailableNames.delete(name);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code === "ENOENT") {
+        known.delete(name);
+        state.unavailableNames.delete(name);
+      } else {
+        state.unavailableNames.add(name);
+        state.dirtyNames.add(name); // Preserve the old per-read retry for transient stat failures.
+      }
+    }
+  }
+  state.scannedEventGeneration = state.eventGeneration;
+  state.directoryStamp = currentDirectoryStamp;
+  return leasesFromCache(known, state.unavailableNames);
 };
 
 /** Cheap topology-cache invalidation; freshness itself always uses effectiveLiveness. */

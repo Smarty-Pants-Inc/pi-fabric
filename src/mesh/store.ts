@@ -8,7 +8,7 @@ import path from "node:path";
 import { delay, MeshLock, type MeshStoreContext } from "./mesh-lock.js";
 import { isNamespaceRace } from "../core/atomic-write.js";
 import { acquireMeshCustodyLock, withMeshCustody } from "./custody-lock.js";
-import type { MeshReadOptions, MeshStateEntry, MeshBatchResult, MeshBatchView } from "./state-file.js";
+import type { MeshReadOptions, MeshStateEntry, MeshBatchResult, MeshBatchView, StateFile } from "./state-file.js";
 import { createStateBackend, isMeshStateWalCap, type MeshStateBackendKind, type StateBackend, type StateBackendBatchInput,
   type StateBackendDiagnostics } from "./state-backend.js";
 import { EventLog, type MeshEvent, type MeshIdentity, type MeshPublishInput, type MeshTailResult } from "./event-log.js";
@@ -932,6 +932,12 @@ export class MeshStore {
 
   listAllShared(prefix = "", options: MeshReadOptions = {}): readonly Readonly<MeshStateEntry>[] {
     return this.#state.listAllShared(prefix, options);
+  }
+
+  /** Internal FILE-only version lookup, including tombstones, on a pinned stateToken. */
+  fileSnapshotVersion(snapshot: object, key: string): number {
+    if (this.#state.kind !== "file") throw new Error("Pinned FILE versions require the file state backend");
+    return (this.#state as StateBackend & Pick<StateFile, "snapshotVersion">).snapshotVersion(snapshot, key);
   }
 
   put(input: { key: string; value: unknown; identity: MeshIdentity; ifVersion?: number }): Promise<MeshStateEntry> {

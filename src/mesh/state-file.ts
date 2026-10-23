@@ -809,6 +809,11 @@ export class StateFile implements StateBackend {
     return this.#readCachedState(options.fresh === true, options.fresh === true, options.background === true, options.displayOnly === true);
   }
 
+  /** Internal read-only CAS lookup on the exact opaque token used by a shared-row scan. */
+  snapshotVersion(snapshot: object, key: string): number {
+    return stateSlot(snapshot as MeshStateFile, key).version;
+  }
+
   /**
    * listAll without the copies: the parsed entries themselves, which the caller must not change.
    * For an index that copies only the entries whose version moved (smarty-dev#557).

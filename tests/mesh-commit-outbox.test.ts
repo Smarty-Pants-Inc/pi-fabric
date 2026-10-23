@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { COMMIT_OUTBOX_PREFIX, CommitOutbox, withStateFence } from "../src/mesh/commit-outbox.js";
-import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
+import { MeshStore, type MeshBatchView, type MeshIdentity } from "../src/mesh/store.js";
 import { MeshStateWalCapError } from "../src/mesh/state-sqlite.js";
 import { MeshBackgroundRetry } from "../src/core/atomic-write.js";
 
@@ -253,6 +253,107 @@ describe("CommitOutbox", () => {
       expect(log.at(-1)).toBe("999:replay");
       expect(mesh.listAll(outbox.prefix, { fresh: true })).toEqual([]);
     } finally { mesh.closeState(); }
+  });
+
+  // SA-03/data safety: a prior successful effect is not proof after its retry fails.
+  it.each(["file", "sqlite"].flatMap(backend => [false, true].map(async => ({ backend, async }))))(
+    "SA-03 retains the exact failed replay after a successful effect and retirement fault ($backend, async=$async)", async mode => {
+    const mesh = new MeshStore(meshRoot(), 64 * 1024, 100, { stateBackend: mode.backend as "file" | "sqlite" });
+    let fail = false;
+    const handler = (payload: { n: number }) => { if (fail && payload.n === 1) throw new Error("current bytes unreadable"); };
+    const outbox = new CommitOutbox(mesh, "dual-fault", identity, mode.async ? {} : { touch: handler },
+      mode.async ? { touch: async payload => { await Promise.resolve(); handler(payload); } } : {});
+    const replay = async (throughRecovery = false) => {
+      let view!: MeshBatchView;
+      await mesh.writeBatch({ identity, ops: [], afterCommit: current => { view = current; } });
+      if (mode.async) await outbox.plan().replayAsync(view);
+      else if (throughRecovery) await outbox.recover();
+      else outbox.plan().replay(view);
+    };
+    try {
+      let emptyView!: MeshBatchView;
+      await mesh.writeBatch({ identity, ops: [], afterCommit: current => { emptyView = current; } });
+      const plan = outbox.plan();
+      let view!: MeshBatchView;
+      await mesh.writeBatch({ identity, ops: [], prepare: () => plan.stage([], [1, 2].map(n => ({
+        kind: "touch", key: `k${n}`, payload: { n },
+      })), { durable: true }), afterCommit: current => { view = current; } });
+      if (mode.async) await plan.runAsync(view); else plan.run(view);
+      expect(outbox.retiring).toBe(2);
+      const before = mesh.get(outbox.rowKey("k1"), { fresh: true });
+      const retirement = vi.spyOn(mesh, "writeBatch").mockRejectedValueOnce(new Error("retire failed after effect"));
+      await expect(outbox.retire()).rejects.toThrow("retire failed after effect");
+      retirement.mockRestore();
+      fail = true;
+      await replay(true);
+      await outbox.retire();
+      expect(mesh.get(outbox.rowKey("k1"), { fresh: true })).toEqual(before);
+      expect(mesh.get(outbox.rowKey("k2"), { fresh: true })).toBeUndefined();
+      // The opportunistic stage() retirement path must not use the failed proof either.
+      await mesh.writeBatch({ identity, ops: [], prepare: () => outbox.plan().stage([
+        { kind: "put", key: "unrelated/change", value: true },
+      ], []) });
+      expect(mesh.get(outbox.rowKey("k1"), { fresh: true })).toEqual(before);
+      fail = false;
+      await replay();
+      // A late plan on an older empty snapshot cannot prune the newer completion proof.
+      const late = outbox.plan();
+      if (mode.async) await late.runAsync(emptyView); else late.run(emptyView);
+      expect(outbox.retiring).toBe(1);
+      await outbox.retire();
+      expect(mesh.listAll(outbox.prefix, { fresh: true })).toEqual([]);
+    } finally { mesh.closeState(); }
+  });
+
+  it.each(["file", "sqlite"] as const)("SA-03 fences a queued retirement against an in-flight retry and a newer completion (%s)", async backend => {
+    const mesh = new MeshStore(meshRoot(), 64 * 1024, 100, { stateBackend: backend });
+    let block = false;
+    let releaseRetry!: () => void;
+    const retryGate = new Promise<void>(resolve => { releaseRetry = resolve; });
+    const outbox = new CommitOutbox(mesh, "inflight-retry", identity, {}, { touch: async (payload: { n: number }) => {
+      if (block && payload.n === 1) { await retryGate; throw new Error("older retry failed"); }
+    } });
+    const record = async (n: number) => {
+      const plan = outbox.plan();
+      let view!: MeshBatchView;
+      await mesh.writeBatch({ identity, ops: [], prepare: () => plan.stage([], [{ kind: "touch", key: "same", payload: { n } }],
+        { durable: true }), afterCommit: current => { view = current; } });
+      return { plan, view };
+    };
+    let retry: Promise<number> | undefined;
+    let retiring: Promise<void> | undefined;
+    let releaseRetirement!: () => void;
+    try {
+      const first = await record(1);
+      await first.plan.runAsync(first.view);
+      const before = mesh.get(outbox.rowKey("same"), { fresh: true });
+      const original = mesh.writeBatch.bind(mesh);
+      const retirementGate = new Promise<void>(resolve => { releaseRetirement = resolve; });
+      const snapshot = vi.spyOn(mesh, "writeBatch").mockImplementationOnce(async input => {
+        await retirementGate;
+        return original(input);
+      });
+      retiring = outbox.retire(); // Captures the old done map, but has not acquired writer custody.
+      block = true;
+      retry = outbox.plan().replayAsync(first.view);
+      releaseRetirement();
+      await retiring;
+      snapshot.mockRestore();
+      expect(mesh.get(outbox.rowKey("same"), { fresh: true })).toEqual(before);
+      const newer = await record(2);
+      const newerRow = mesh.get(outbox.rowKey("same"), { fresh: true });
+      await newer.plan.runAsync(newer.view);
+      releaseRetry();
+      await retry;
+      expect(mesh.get(outbox.rowKey("same"), { fresh: true })).toEqual(newerRow);
+      expect(outbox.retiring).toBe(1); // The old failure cannot invalidate the newer success.
+      await outbox.retire();
+      expect(mesh.get(outbox.rowKey("same"), { fresh: true })).toBeUndefined();
+    } finally {
+      releaseRetirement?.(); releaseRetry();
+      await retiring; await retry;
+      mesh.closeState();
+    }
   });
 
   it("does not take the lock to recover when nothing is pending", async () => {

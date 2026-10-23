@@ -81,6 +81,56 @@ describe("bridge mirror commit outbox", () => {
     expect(hub.listAll(outbox.prefix, { fresh: true })).toEqual([]);
   });
 
+  // SA-03: unlike SA-01's fresh pending rows, this row still has a prior done proof.
+  it.each(["file", "sqlite"].flatMap(backend => [false, true].flatMap(deferred =>
+    ["EACCES", "invalid"].map(fault => ({ backend, deferred, fault })))))(
+    "SA-03 keeps a completed lease row after retirement failure then strict read failure ($backend, deferred=$deferred, $fault)", async mode => {
+    const hub = store(mode.backend === "sqlite" ? "sqlite" : undefined);
+    const now = Date.now(), peer = remote(`dual-fault-${mode.backend}-${mode.deferred}-${mode.fault}`, now);
+    peer.host.incarnationToken = "same-incarnation";
+    const side = new StoreBridgeSide(hub, "ryzen2", () => now, false, mode.deferred);
+    const retire = CommitOutbox.prototype.retire;
+    let failures = 0;
+    const retirement = vi.spyOn(CommitOutbox.prototype, "retire").mockImplementation(async function (this: CommitOutbox, eligible) {
+      if (this.retiring > 0) { failures += 1; throw new Error("retire failed after successful install"); }
+      return retire.call(this, eligible);
+    });
+    if (mode.deferred) {
+      await side.mirror(peer.presence);
+      await expect(side.flushLeaseEffects()).rejects.toThrow("retire failed after successful install");
+    } else await expect(side.mirror(peer.presence)).rejects.toThrow("retire failed after successful install");
+    retirement.mockRestore();
+    expect(failures).toBeGreaterThan(0);
+    const outbox = new CommitOutbox(hub, "bridge/ryzen2", bridgeIdentity, {});
+    const rowKey = outbox.rowKey(`lease:${peer.host.id}`);
+    const before = hub.get(rowKey, { fresh: true });
+    const target = hostLeasePath(hub.root, peer.host.id);
+    const bytes = fs.readFileSync(target);
+    expect(before).toBeDefined();
+    expect(readHostLease(hub.root, peer.host.id)?.incarnationToken).toBe("same-incarnation");
+    if (mode.fault === "invalid") fs.writeFileSync(target, "{invalid current lease bytes");
+    const currentBytes = fs.readFileSync(target);
+    const read = fs.readFileSync.bind(fs);
+    const fault = vi.spyOn(fs, "readFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, ...args: unknown[]) => {
+      if (String(file) === target && mode.fault === "EACCES") {
+        throw Object.assign(new Error("current file unreadable after successful install"), { code: "EACCES" });
+      }
+      return Reflect.apply(read, fs, [file, ...args]);
+    }) as typeof fs.readFileSync);
+    await side.mirror(peer.presence);
+    await side.flushLeaseEffects();
+    expect(fault.mock.calls.some(([file]) => String(file) === target)).toBe(true);
+    fault.mockRestore();
+    expect(fs.readFileSync(target)).toEqual(currentBytes);
+    expect(hub.get(rowKey, { fresh: true })).toEqual(before);
+    // Restoring the real file permits the same row/version to be replayed and retired.
+    fs.writeFileSync(target, bytes);
+    await side.mirror(peer.presence);
+    await side.flushLeaseEffects();
+    expect(hub.listAll(outbox.prefix, { fresh: true })).toEqual([]);
+    expect(fs.readFileSync(target)).toEqual(bytes);
+  });
+
   it.each([false, true].flatMap(deferred => ["lease", "replay", "unlease"].map(effect => ({ deferred, effect }))))(
     "SA-01 unreadable current native bytes never use the cached mirror ($effect, deferred=$deferred)", async ({ deferred, effect }) => {
     const hub = store("sqlite");

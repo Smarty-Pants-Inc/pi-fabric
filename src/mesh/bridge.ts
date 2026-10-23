@@ -1591,7 +1591,8 @@ export class StoreBridgeSide implements BridgeSide {
     return {
       get,
       listAll: (prefix) => [...this.store.listAllShared(prefix, { snapshot })],
-      version: (key) => get(key)?.version ?? 0,
+      // Rows and retained tombstones must come from the SAME pinned snapshot.
+      version: (key) => this.store.fileSnapshotVersion(snapshot, key),
     };
   }
 

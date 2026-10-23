@@ -669,6 +669,13 @@ export class AgentMessageRouter {
       }
       throw error;
     }
+    if (kind === "followUp" && result?.stalled && result.reason?.startsWith("provider-")) {
+      throw new Error(
+        `Fabric followUp to ${id} was accepted but is not being delivered. ` +
+          `The target reports ${result.reason}; wait for the provider attempt or recovery. Triggering agents.steer is held too. ` +
+          "The message is still held, not withdrawn.",
+      );
+    }
     // smarty-dev#1826: an ack alone hid a Main whose held followUps no boundary would release.
     // Older owners never report `stalled`, so their results pass unchanged.
     if (kind === "followUp" && result?.stalled) {

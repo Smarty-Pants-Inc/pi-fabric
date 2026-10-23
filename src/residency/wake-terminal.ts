@@ -20,11 +20,10 @@ const RESIDENT_WAKE_TERMINAL_LEASE_MAX_BYTES = 65_536;
 /** Raw terminal evidence only; other lease/participant readers keep their own contracts. */
 const readTerminalHostLeaseJson = (file: string): Record<string, unknown> | undefined => {
   const { O_RDONLY, O_NOFOLLOW, O_NONBLOCK } = fs.constants;
-  if (O_NOFOLLOW === undefined || O_NONBLOCK === undefined) return;
   let fd: number | undefined;
   try {
-    // A substituted FIFO must not block before the descriptor can be checked.
-    fd = fs.openSync(file, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+    // Use supported platform flags; nonblocking prevents FIFO substitution from stalling.
+    fd = fs.openSync(file, O_RDONLY | (O_NOFOLLOW ?? 0) | (O_NONBLOCK ?? 0));
     const before = fs.fstatSync(fd, { bigint: true });
     const uid = process.getuid?.();
     const safe = (stat: fs.BigIntStats): boolean => stat.isFile() &&

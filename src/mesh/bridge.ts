@@ -3550,7 +3550,6 @@ export class MeshBridge {
     this.#presenceAt = syncedAt;
     this.#syncedPresenceVersion = presenceVersion;
     this.#syncedLeaseVersion = leaseVersion;
-    this.#leaseRenewAt = syncedAt + BRIDGE_LEASE_MS / 2;
     // Origin updates normally renew mirrors. A source with a long lease and no heartbeat
     // still needs its capped, held projection to remain live: one lease deadline, 1 s before
     // the 15 s mirror cap (transport/commit headroom), not an unconditional 5 s presence loop.
@@ -3559,6 +3558,10 @@ export class MeshBridge {
       .map(host => typeof host.observedAt === "number" && Number.isFinite(host.observedAt)
         ? syncedAt + host.expiresAt - host.observedAt : host.expiresAt)
       .filter(expiry => Number.isFinite(expiry) && expiry > syncedAt);
+    // Coalesce pending heartbeats for half the authority actually sampled, not half
+    // the 15 s cap: a partly spent native TTL needs an earlier flush (#13645).
+    this.#leaseRenewAt = syncedAt + Math.min(BRIDGE_LEASE_MS,
+      ...expiries.map(expiry => expiry - syncedAt)) / 2;
     this.#expiryAt = Math.min(Infinity, ...expiries,
       ...(expiries.some(expiry => expiry > syncedAt + BRIDGE_LEASE_MS) ? [syncedAt + BRIDGE_LEASE_MS - 1_000] : []));
     // A completed mirror invalidates pending membership observations immediately, even when

@@ -12,6 +12,7 @@ import { MeshStore, type MeshIdentity, type MeshStateEntry } from "../src/mesh/s
 import { watchBridgeStore } from "../src/mesh/change-notifier.js";
 import { readHostLeases, writeHostLease } from "../src/topology/host-leases.js";
 import { writeParticipantFile } from "../src/topology/participant-files.js";
+import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 
 const roots: string[] = [];
 const cleanups: Array<() => Promise<unknown> | void> = [];
@@ -549,6 +550,45 @@ describe("notification-driven bridge (smarty-dev#7299 A5)", () => {
       expect(readHostLeases(f.hub.root).get(lane.id)?.expiresAt).toBe(lane.host.expiresAt + 5_000);
     }
     expect(live.failure()).toBeUndefined();
+  });
+
+  // #13645: a 15 s native lease can have only 10 s left when sampled. Coalescing
+  // for half the fixed mirror cap (7.5 s), then spending 4 s in the mirror write,
+  // creates a sender-visible authority gap even though the origin has renewed.
+  // Keep reason: recorded remote-owner trust boundary; never relax sender admission.
+  it("flushes pending renewals against the sampled remaining life before a delayed commit", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    const f = fixture(true, "sqlite");
+    const lane = await native(f.far, "remaining-life", 10_000);
+    const live = await launch(f.bridge);
+    const initial = readHostLeases(f.hub.root).get(lane.id)!;
+    const mirror = f.local.mirror.bind(f.local);
+    vi.spyOn(f.local, "mirror").mockImplementation(async (...args) => {
+      await new Promise(resolve => setTimeout(resolve, 4_000));
+      return mirror(...args);
+    });
+    const senderId = "session:deadline-sender-00000000";
+    const directory = new ParticipantDirectory(f.hub, { enabled: true, hostId: senderId, rootId: senderId,
+      identity: { id: senderId, name: "sender", kind: "main" } });
+    cleanups.push(() => directory.close());
+    await vi.advanceTimersByTimeAsync(5_000);
+    writeHostLease(f.far.root, { id: lane.id, rootId: lane.id, identityId: lane.id,
+      startedAt: lane.host.startedAt, updatedAt: Date.now(), expiresAt: Date.now() + 15_000 });
+    await settle(); // Real native watch -> RPC notification -> pending half-lease flush.
+    try {
+      await vi.advanceTimersByTimeAsync(5_500);
+      await settle();
+      expect(initial.expiresAt).toBeLessThan(Date.now());
+      expect(directory.get(lane.id)).toMatchObject({ remoteHost: "far", stale: false });
+      expect(directory.get(lane.id)?.bridgeStale).toBeUndefined();
+      expect(f.local.holds(lane.id)).toBe(true);
+      expect(readHostLeases(f.hub.root).get(lane.id)!.expiresAt).toBeGreaterThan(Date.now());
+      expect(live.failure()).toBeUndefined();
+    } finally {
+      // Settle the old head's later commit too, so the RED run has no stranded timer.
+      await vi.advanceTimersByTimeAsync(5_000);
+      await settle();
+    }
   });
 
   it("skips an equal unchanged mirror lease while retaining the committed ownership fence", async () => {

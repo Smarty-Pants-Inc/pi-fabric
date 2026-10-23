@@ -7,7 +7,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { Readable, Writable } from "node:stream";
 import { ownProcessIncarnation, readPhysicalHostIdentity, readFileRetrying, writeFileAtomic, writeJsonAtomic } from "../core/atomic-write.js";
-import { type BridgeLeaseProcess, type FabricHostLease, type FabricMirrorLease, MIRROR_FRESH_MS, hostLeaseCacheGeneration, hostLeaseExpiry, hostLeasePath, hostLiveness, readHostLease, readHostLeases, removeHostLeaseIf, STATE_LEASE_RENEW_MS, writeHostLease, writeHostLeaseAsync } from "../topology/host-leases.js";
+import { type BridgeLeaseProcess, type FabricHostLease, type FabricMirrorLease, MIRROR_FRESH_MS, hostLeaseCacheGeneration, hostLeaseExpiry, hostLeasePath, hostLeasePredecessor, hostLiveness, readHostLease, readHostLeases, removeHostLeaseIf, STATE_LEASE_RENEW_MS, writeHostLease, writeHostLeaseAsync } from "../topology/host-leases.js";
 import { meshDirectoryStamp } from "../topology/publication-generation.js";
 import type { FabricHostRecord, FabricParticipantRecord } from "../topology/types.js";
 import { ROOT_ID_PREFIX } from "../topology/root-inbox-shared.js";
@@ -815,6 +815,10 @@ export class StoreBridgeSide implements BridgeSide {
   #leaseEffectsTail: Promise<void> = Promise.resolve();
   // Active only during one mirror commit attempt, including recovery and post-commit retries.
   #skippedRoots: ReadonlySet<string> | undefined;
+  // A failed retirement can leave #done populated after an otherwise successful
+  // install. Later skipped-root passes (and explicit flushes) must preserve that
+  // row too, until a pass can legitimately judge the root again.
+  #retainedOutboxRoots: ReadonlySet<string> = new Set();
   #leaseProcess: Promise<BridgeLeaseProcess | undefined> | undefined;
   #mirrorDepth = 0;
   #mirrorIdle: Promise<void> = Promise.resolve();
@@ -857,6 +861,9 @@ export class StoreBridgeSide implements BridgeSide {
         // A lease without an incarnation is a mirror lease of an earlier release (or a writer from
         // before lease incarnations): root and identity decide it, as before.
         if (participantFilePresent(this.store.root, keyFor(PARTICIPANT_PREFIX, gone.id))) return;
+        // Unknown current bytes are not absence, even when the peer cache still
+        // contains our old mirror. Throw so the outbox retains this effect.
+        hostLeasePredecessor(this.store.root, gone.id);
         removeHostLeaseIf(this.store.root, gone.id, (lease) => !nativeLeaseLive(lease, this.now()) &&
           lease.id === gone.id && lease.rootId === gone.rootId && lease.identityId === gone.identityId &&
           lease.incarnationToken === gone.incarnationToken && (lease.startedAt === undefined || lease.startedAt === gone.startedAt));
@@ -885,7 +892,15 @@ export class StoreBridgeSide implements BridgeSide {
   /** Wait for queued post-commit lease installs and their outbox retirement. */
   async flushLeaseEffects(): Promise<void> {
     await this.#leaseEffectsTail;
-    await this.#outbox.retire();
+    await this.#retireOutbox();
+  }
+
+  #retireOutbox(retained = this.#retainedOutboxRoots): Promise<void> {
+    return this.#outbox.retire(retained.size === 0 ? undefined : entry => {
+      const row = entry.value;
+      return !isObject(row) || !isObject(row.payload) || typeof row.payload.rootId !== "string" ||
+        !retained.has(row.payload.rootId);
+    });
   }
 
   async latestSequence(): Promise<number> {
@@ -1568,10 +1583,14 @@ export class StoreBridgeSide implements BridgeSide {
     const committed = this.store.stateView();
     if (committed) return committed.view;
     const snapshot = this.store.stateToken({ fresh: true });
-    const get = (key: string): MeshStateEntry | undefined => this.store.get(key, { snapshot });
+    // Internal read-only planning can reuse the pinned snapshot's shared rows.
+    // Public get/listAll keep their defensive deep-copy contract; cloning the
+    // fleet twice per plan here made FILE notifications copy megabytes.
+    const entries = new Map(this.store.listAllShared("", { snapshot }).map(entry => [entry.key, entry]));
+    const get = (key: string): MeshStateEntry | undefined => entries.get(key);
     return {
       get,
-      listAll: (prefix) => this.store.listAll(prefix, { snapshot }),
+      listAll: (prefix) => [...this.store.listAllShared(prefix, { snapshot })],
       version: (key) => get(key)?.version ?? 0,
     };
   }
@@ -1617,9 +1636,11 @@ export class StoreBridgeSide implements BridgeSide {
       add(ids, host.id); add(identifiers, host.id); add(identifiers, host.identity.id); add(identifiers, host.rootId);
     }
     for (const entry of handoffs) {
-      if (!isObject(entry.value) || typeof entry.value.id !== "string" || !relevant(entry.value.id)) continue;
+      if (!isObject(entry.value) || typeof entry.value.id !== "string" ||
+        !relevant(entry.value.id, entry.value.sessionId, entry.value.name)) continue;
       hasHandoff = true;
       add(ids, entry.value.id); add(identifiers, entry.value.id);
+      add(identifiers, entry.value.sessionId); add(identifiers, entry.value.name);
     }
     for (const lease of leases.values()) {
       if ((hasHandoff && scope === undefined) || relevant(lease.id, lease.identityId, lease.rootId) ||
@@ -1647,6 +1668,7 @@ export class StoreBridgeSide implements BridgeSide {
   #scheduleLeaseEffects(plan: CommitOutboxPlan, custodyIds: readonly string[], expectedVersions: ReadonlyMap<string, number>,
     snapshot: ReadonlyMap<string, FabricHostLease>, halted: () => boolean,
     allowedLeaseCount?: number): void {
+    const retained = this.#retainedOutboxRoots;
     const work = this.#leaseEffectsTail.then(async () => {
       await this.#mirrorIdle;
       await new Promise<void>(resolve => setImmediate(resolve));
@@ -1667,7 +1689,7 @@ export class StoreBridgeSide implements BridgeSide {
           await plan.runAsync(view, effectHalted);
         } finally { this.#expectedLeaseVersions = previousVersions; }
       });
-      await this.#outbox.retire();
+      await this.#retireOutbox(retained);
     });
     this.#leaseEffectsTail = work.catch(() => undefined);
   }
@@ -1695,7 +1717,7 @@ export class StoreBridgeSide implements BridgeSide {
       else plan.replay(view);
       return true;
     });
-    if (replayed) await this.#outbox.retire();
+    if (replayed) await this.#retireOutbox();
     return replayed;
   }
 
@@ -1835,6 +1857,10 @@ export class StoreBridgeSide implements BridgeSide {
       }
       return [...protectionRoots].sort();
     };
+    // Recovery may legitimately remove a mirror's ONLY surviving history file
+    // before a same-token reconnect reinstalls it. Keep that locally captured
+    // evidence for this pass only; never accept history from incoming records.
+    let recoveryLeaseEvidence: ReadonlyMap<string, FabricHostLease> | undefined;
     // The pass's plan on one state view: admission, reservations and the CAS versions. undefined: halted.
     const compute = (view: MeshBatchView, participantFiles: ReturnType<typeof participantFileSnapshot>,
       leaseSnapshot: ReadonlyMap<string, FabricHostLease>):
@@ -1884,6 +1910,9 @@ export class StoreBridgeSide implements BridgeSide {
         }
         for (const lease of scan.leases.values()) {
           if (!isNonRootHostId(lease.id, lease.rootId)) remember(lease.rootId, lease);
+        }
+        for (const lease of recoveryLeaseEvidence?.values() ?? []) {
+          if (!scan.leases.has(lease.id) && !isNonRootHostId(lease.id, lease.rootId)) remember(lease.rootId, lease);
         }
         // Mark protected direct roots before any host/participant can target their keys under
         // a different claimed root. Protection cannot depend on presence array order.
@@ -2159,26 +2188,24 @@ export class StoreBridgeSide implements BridgeSide {
         addScope(value.rootId); addScope(value.id); addScope(value.ownerHostId); addScope(value.ownerIdentityId);
         if (isIdentity(value.identity)) addScope(value.identity.id);
       }
-      for (const root of batchRoots) {
-        for (const { record } of presence.hosts) if (record.rootId === root) {
-          addScope(record.id); addScope(record.identity.id); addScope(record.rootId);
-        }
-        for (const participant of presence.participants) if (participant.rootId === root) {
-          addScope(participant.id); addScope(participant.ownerHostId); addScope(participant.ownerIdentityId); addScope(participant.rootId);
-        }
-        for (const entry of hostEntries) {
-          const host = hostOf(entry.key, entry.value);
-          if (host?.rootId === root) { addScope(host.id); addScope(host.identity.id); addScope(host.rootId); }
-        }
-        for (const entry of participantEntries) if (isObject(entry.value) && entry.value.rootId === root) {
-          addScope(entry.value.id); addScope(entry.value.ownerHostId); addScope(entry.value.ownerIdentityId); addScope(entry.value.rootId);
-        }
+      // One fleet walk per batch, not one per selected root (32 * fleet *
+      // batches at restart). This is exactly the same root-membership closure.
+      for (const { record } of presence.hosts) if (batchRoots.has(record.rootId)) {
+        addScope(record.id); addScope(record.identity.id); addScope(record.rootId);
+      }
+      for (const participant of presence.participants) if (batchRoots.has(participant.rootId)) {
+        addScope(participant.id); addScope(participant.ownerHostId); addScope(participant.ownerIdentityId); addScope(participant.rootId);
+      }
+      for (const entry of hostEntries) {
+        const host = hostOf(entry.key, entry.value);
+        if (host && batchRoots.has(host.rootId)) { addScope(host.id); addScope(host.identity.id); addScope(host.rootId); }
+      }
+      for (const entry of participantEntries) if (isObject(entry.value) && typeof entry.value.rootId === "string" && batchRoots.has(entry.value.rootId)) {
+        addScope(entry.value.id); addScope(entry.value.ownerHostId); addScope(entry.value.ownerIdentityId); addScope(entry.value.rootId);
       }
       for (const lease of leaseBatch) { addScope(lease.id); addScope(lease.rootId); addScope(lease.identityId); }
       for (const gone of removedBatch) { addScope(gone.id); addScope(gone.rootId); addScope(gone.identityId); }
       const custodyIds = this.#candidateLeaseCustodyIds(presence, hostEntries, handoffEntries, leaseSnapshot, outboxEntries, batchScope);
-      const more = planned.ops.length > batchOps.length || leaseCandidates.length > leaseBatch.length ||
-        removedCandidates.length > removedBatch.length;
       let preparedLeaseGeneration = leaseGeneration;
       const externalInputsStable = (identifiers?: ReadonlySet<string>): boolean => {
         if (participantDirectoryGeneration(this.store.root) !== filesGeneration ||
@@ -2204,11 +2231,74 @@ export class StoreBridgeSide implements BridgeSide {
         }
         return true;
       };
+      // Custody acquisition yields per id. A global topology revision taken BEFORE
+      // those yields is not a progress condition: unrelated Pi heartbeats can always
+      // invalidate it. Re-admit from a complete CURRENT view outside SQLite instead.
+      // This deliberately reads every reservation, alias and handoff, not just the
+      // selected host versions. Only newly required work for THIS batch forces a
+      // re-selection; unrelated new operations cannot starve an already-safe batch.
+      let admitted = planned;
+      let admission = early;
+      let admissionFilesGeneration = filesGeneration;
+      let admissionFiles = files;
+      let admissionFilesStamp = filesStamp;
+      let admissionLeases = leaseSnapshot;
+      let admissionHasHandoffs = judgesLeaseLiveness;
+      const touchesBatch = (op: MeshBatchOperation, view: MeshBatchView): boolean => {
+        if (batchOpKeys.has(op.key)) return true;
+        const value = op.kind === "put" ? op.value : view.get(op.key)?.value;
+        return isObject(value) && [value.id, value.rootId, value.ownerHostId, value.ownerIdentityId,
+          isObject(value.identity) ? value.identity.id : undefined].some(id => typeof id === "string" && batchScope.has(id));
+      };
+      const admitCurrent = (leaseOnly: boolean): void => {
+        if (!early) return;
+        const current = this.store.stateView();
+        if (!current) throw new MirrorPlanStale("current admission view unavailable");
+        if (externalInputsStable(judgesLeaseLiveness ? undefined : batchScope) &&
+          (this.store.stateRevision() === early.revision || this.store.stateUnchangedSince(early.revision, HELD_STATE_PREFIXES))) {
+          // The complete plan is still proven, but effects need the CURRENT host
+          // rows, including earlier batches of this pass, not the carried pre-view.
+          if (leaseOnly) admission = current;
+          return;
+        }
+        const stamp = meshDirectoryStamp(this.store.root, "participants");
+        const generation = participantDirectoryGeneration(this.store.root);
+        const currentFiles = participantFileSnapshot(this.store.root);
+        const currentLeases = readHostLeases(this.store.root);
+        const currentLeaseGeneration = hostLeaseCacheGeneration(this.store.root);
+        const fresh = this.store.stateView();
+        if (!fresh) throw new MirrorPlanStale("current admission view unavailable");
+        const result = compute(fresh.view, currentFiles, currentLeases);
+        if (!result) throw new MirrorPlanStale("current admission halted");
+        if (participantDirectoryGeneration(this.store.root) !== generation ||
+          meshDirectoryStamp(this.store.root, "participants") !== stamp) {
+          throw new MirrorPlanStale("participant files changed during current admission");
+        }
+        const currentHandoffs = fresh.view.listAll(BRIDGE_HANDOFF_PREFIX);
+        const required = this.#candidateLeaseCustodyIds(presence, fresh.view.listAll(HOST_PREFIX),
+          currentHandoffs, currentLeases, fresh.view.listAll(this.#outbox.prefix), batchScope);
+        if (required.some(id => !this.#leaseCustodyIds?.has(id))) {
+          throw new MirrorPlanStale("current admission requires additional lease custody");
+        }
+        if (result.ops.some(op => !batchOpKeys.has(op.key) && touchesBatch(op, fresh.view))) {
+          throw new MirrorPlanStale("current admission requires selected state operations");
+        }
+        admitted = result;
+        admission = fresh;
+        admissionFilesGeneration = generation;
+        admissionFiles = currentFiles;
+        admissionFilesStamp = stamp;
+        admissionLeases = currentLeases;
+        preparedLeaseGeneration = currentLeaseGeneration;
+        admissionHasHandoffs = currentHandoffs.length > 0;
+      };
       this.#skippedRoots = skippedRoots;
+      this.#retainedOutboxRoots = skippedRoots;
       let preparedRevision: string | undefined;
       let committedRevision = early?.revision;
       try {
         if (!partial && !recoveryAttempted && outboxEntries.length > 0 && planned) {
+          recoveryLeaseEvidence = leaseSnapshot;
           const recovered = await this.#recoverOutbox(outboxEntries, halted, () => {
             if (!externalInputsStable()) throw new MirrorPlanStale(lastStale);
             if (early && !this.store.stateUnchangedSince(early.revision, HELD_STATE_PREFIXES)) throw new MirrorPlanStale("topology changed before outbox recovery");
@@ -2227,14 +2317,11 @@ export class StoreBridgeSide implements BridgeSide {
         if (early && batchOps.length === 0) {
           await this.#withLeaseCustody(custodyIds, () => {
             if (halted()) return;
-            if (!externalInputsStable(batchScope)) throw new MirrorPlanStale(lastStale);
-            if (!this.store.stateUnchangedSince(early.revision, HELD_STATE_PREFIXES)) {
-              throw new MirrorPlanStale("topology changed before lease-only effects");
-            }
-            const view = this.#currentView();
-            this.#leaseSnapshotsByView.set(view, leaseSnapshot);
-            const result = compute(view, files, leaseSnapshot);
-            if (!result || result.ops.length !== 0) throw new MirrorPlanStale("lease-only recompute requires state operations");
+            admitCurrent(true);
+            const view = admission!.view;
+            committedRevision = admission!.revision;
+            this.#leaseSnapshotsByView.set(view, admissionLeases);
+            const result = admitted;
             leases = result.leases.filter(lease => selectedLeases.has(lease.id)).map(lease => {
               const sample = lease.mirror;
               if (!sample) return lease;
@@ -2249,7 +2336,7 @@ export class StoreBridgeSide implements BridgeSide {
             }));
             for (const gone of removed) expected.set(gone.key, view.version(gone.key));
             if (this.deferLeaseInstalls) {
-              this.#scheduleLeaseEffects(plan, custodyIds, expected, leaseSnapshot, halted,
+              this.#scheduleLeaseEffects(plan, custodyIds, expected, admissionLeases, halted,
                 partial ? leases.length : undefined);
             } else {
               this.#expectedLeaseVersions = expected;
@@ -2266,11 +2353,11 @@ export class StoreBridgeSide implements BridgeSide {
               } finally { this.#expectedLeaseVersions = undefined; }
             }
           });
-          await this.#outbox.retire();
+          await this.#retireOutbox();
         } else {
 
         await this.#withLeaseCustody(custodyIds, async () => {
-          if (!externalInputsStable(batchScope)) throw new MirrorPlanStale(lastStale);
+          admitCurrent(false);
           await this.store.writeBatch({
             identity: this.#identity(),
             lockClass: "bridge",
@@ -2281,14 +2368,14 @@ export class StoreBridgeSide implements BridgeSide {
             // participant or host-lease files inside prepare.
             prepare: (view) => {
               if (halted()) return plan.stage([], []);
-              if (early && (participantDirectoryGeneration(this.store.root) !== filesGeneration ||
+              if (admission && (participantDirectoryGeneration(this.store.root) !== admissionFilesGeneration ||
                 hostLeaseCacheGeneration(this.store.root) !== preparedLeaseGeneration)) throw new MirrorPlanStale("file generation changed while acquiring SQLite");
               let result: ReturnType<typeof compute>;
-              if (early && planned && this.store.stateUnchangedSince(early.revision, HELD_STATE_PREFIXES)) {
-                if (judgesLeaseLiveness && !sameLeaseLiveness(planned.judged.leases, planned.judged.now, this.now(), batchScope)) {
+              if (admission && this.store.stateUnchangedSince(admission.revision, HELD_STATE_PREFIXES)) {
+                if (admissionHasHandoffs && !sameLeaseLiveness(admitted.judged.leases, admitted.judged.now, this.now())) {
                   throw new MirrorPlanStale("consulted native lease liveness changed while acquiring SQLite");
                 }
-                result = planned;
+                result = admitted;
               } else if (early) throw new MirrorPlanStale("topology changed while acquiring SQLite");
               else result = compute(view,
                 meshDirectoryStamp(this.store.root, "participants") === filesStamp ? files : participantFileSnapshot(this.store.root),
@@ -2341,9 +2428,9 @@ export class StoreBridgeSide implements BridgeSide {
                 if (!expected.has(key)) expected.set(key, committed.view.version(key));
               }
               for (const gone of removed) if (!expected.has(gone.key)) expected.set(gone.key, committed.view.version(gone.key));
-              this.#leaseSnapshotsByView.set(committed.view, leaseSnapshot);
+              this.#leaseSnapshotsByView.set(committed.view, admissionLeases);
               if (this.deferLeaseInstalls) {
-                this.#scheduleLeaseEffects(plan, custodyIds, expected, leaseSnapshot, halted,
+                this.#scheduleLeaseEffects(plan, custodyIds, expected, admissionLeases, halted,
                   partial ? leases.length : undefined);
                 return;
               }
@@ -2360,16 +2447,21 @@ export class StoreBridgeSide implements BridgeSide {
             },
           });
         });
-        await this.#outbox.retire();
+        await this.#retireOutbox();
         }
         for (const lease of leaseBatch) processedEffects.add(`lease:${lease.id}`);
         for (const gone of removedBatch) processedEffects.add(`unlease:${gone.id}`);
+        const more = admitted.ops.some(op => !batchOpKeys.has(op.key)) ||
+          admitted.leases.some(lease => !processedEffects.has(`lease:${lease.id}`)) ||
+          admitted.removed.some(gone => !processedEffects.has(`unlease:${gone.id}`));
         if (more && !halted()) {
-          carry = early && committedRevision !== undefined ? {
-            filesStamp, filesGeneration, files, leaseSnapshot, leaseGeneration,
-            early: { revision: committedRevision, view: early.view },
-            planned: { ...planned, ops: planned.ops.filter(op => !batchOpKeys.has(op.key)) },
-            handoffEntries, hostEntries, participantEntries, outboxEntries,
+          carry = admission && committedRevision !== undefined ? {
+            filesStamp: admissionFilesStamp, filesGeneration: admissionFilesGeneration, files: admissionFiles,
+            leaseSnapshot: admissionLeases, leaseGeneration: preparedLeaseGeneration,
+            early: { revision: committedRevision, view: admission.view },
+            planned: { ...admitted, ops: admitted.ops.filter(op => !batchOpKeys.has(op.key)) },
+            handoffEntries: admission.view.listAll(BRIDGE_HANDOFF_PREFIX), hostEntries: admission.view.listAll(HOST_PREFIX),
+            participantEntries: admission.view.listAll(PARTICIPANT_PREFIX), outboxEntries,
           } : undefined;
           recoveryAttempted = true;
           // All custody has been released. A successful batch resets the stale-attempt
@@ -2411,7 +2503,7 @@ export class StoreBridgeSide implements BridgeSide {
     // row, with this process's watch callback still pending. Neither the committed mirror
     // view nor a process-local generation is authority for overwriting that current file.
     const captured = this.#leaseSnapshotsByView.get(view)?.get(lease.id);
-    const prior = readHostLease(this.store.root, lease.id);
+    const prior = hostLeasePredecessor(this.store.root, lease.id);
     if (participantFilePresent(this.store.root, keyFor(PARTICIPANT_PREFIX, lease.id))) return undefined;
     if (prior && nativeLeaseLive(prior, this.now())) return undefined;
     const sameOwner = (left: FabricHostLease, right: FabricHostLease): boolean =>

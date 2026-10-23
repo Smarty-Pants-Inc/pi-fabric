@@ -3,7 +3,34 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { hostLeaseCacheGeneration, hostLeaseGeneration, hostLeasePath, readHostLeases, removeHostLease, writeHostLease, type FabricHostLease } from "../src/topology/host-leases.js";
+import { hostLeaseCacheGeneration, hostLeaseGeneration, hostLeasePath, hostLeasePredecessor, readHostLease, readHostLeases, removeHostLease, writeHostLease, type FabricHostLease } from "../src/topology/host-leases.js";
+
+describe("strict host lease authority reads", () => {
+  const roots: string[] = [];
+  afterEach(() => {
+    vi.restoreAllMocks();
+    for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+  });
+  it("distinguishes ENOENT from unreadable/invalid current bytes without falling back to a warmed peer cache", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-lease-strict-"));
+    roots.push(root);
+    const id = "host:strict", lease = { id, rootId: id, identityId: id, updatedAt: 1000, expiresAt: 61000 };
+    expect(hostLeasePredecessor(root, id)).toBeUndefined(); // legitimate missing-file creation
+    writeHostLease(root, lease);
+    expect(readHostLease(root, id)).toEqual(lease); // warm the lenient peer cache
+    const target = hostLeasePath(root, id), read = fs.readFileSync.bind(fs);
+    const fault = vi.spyOn(fs, "readFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, ...args: unknown[]) => {
+      if (String(file) === target) throw Object.assign(new Error("unreadable current bytes"), { code: "EACCES" });
+      return Reflect.apply(read, fs, [file, ...args]);
+    }) as typeof fs.readFileSync);
+    expect(() => hostLeasePredecessor(root, id)).toThrow("unreadable current bytes");
+    fault.mockRestore();
+    fs.writeFileSync(target, "not a lease");
+    expect(() => hostLeasePredecessor(root, id)).toThrow("Invalid host lease");
+    writeHostLease(root, { ...lease, incarnationToken: "native-current" });
+    expect(hostLeasePredecessor(root, id)?.incarnationToken).toBe("native-current");
+  });
+});
 
 // smarty-dev#7978 follow-on: an inotify cache must avoid directory enumeration and per-file stats on clean reads.
 describe.skipIf(process.platform === "win32")("host lease watcher cache", () => {

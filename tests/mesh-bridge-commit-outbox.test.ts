@@ -46,6 +46,105 @@ const remote = (name: string, now: number) => {
 };
 
 describe("bridge mirror commit outbox", () => {
+  // Trust boundary: a completed-but-not-retired effect is still protected work.
+  // A skipped root must remain byte-exact without blocking unrelated retirements.
+  it.each(["file", "sqlite"] as const)("%s retains completed skipped-root rows after a retirement failure, including explicit flush", async backend => {
+    const hub = store(backend === "sqlite" ? "sqlite" : undefined);
+    const now = Date.now();
+    let clock = now;
+    const a = remote("retained-completed-a", now), b = remote("retained-completed-b", now);
+    a.host.incarnationToken = "A";
+    b.host.incarnationToken = "B";
+    const input = { hosts: [...a.presence.hosts, ...b.presence.hosts], participants: [a.participant, b.participant] };
+    const side = new StoreBridgeSide(hub, "ryzen2", () => clock);
+    const retirement = vi.spyOn(CommitOutbox.prototype, "retire").mockRejectedValueOnce(new Error("retire failed after install"));
+    await expect(side.mirror(input)).rejects.toThrow("retire failed after install");
+    retirement.mockRestore();
+    const outbox = new CommitOutbox(hub, "bridge/ryzen2", bridgeIdentity, {});
+    const aKey = outbox.rowKey(`lease:${a.host.id}`), bKey = outbox.rowKey(`lease:${b.host.id}`);
+    const before = { row: hub.get(aKey, { fresh: true }), host: hub.get(hostKey(a.host.id), { fresh: true }),
+      participant: hub.get(participantKey(a.host.id), { fresh: true }), lease: fs.readFileSync(hostLeasePath(hub.root, a.host.id)) };
+    expect(before.row).toBeDefined();
+    expect(hub.get(bKey, { fresh: true })).toBeDefined();
+    const { incarnationToken: _token, ...tokenless } = a.host;
+    clock += 1000;
+    await side.mirror({ hosts: [{ record: tokenless, observedAt: clock, expiresAt: clock }, ...b.presence.hosts],
+      participants: [a.participant, b.participant] }, clock);
+    await side.flushLeaseEffects();
+    expect(hub.get(aKey, { fresh: true })).toEqual(before.row);
+    expect(hub.get(hostKey(a.host.id), { fresh: true })).toEqual(before.host);
+    expect(hub.get(participantKey(a.host.id), { fresh: true })).toEqual(before.participant);
+    expect(fs.readFileSync(hostLeasePath(hub.root, a.host.id))).toEqual(before.lease);
+    expect(hub.get(bKey, { fresh: true })).toBeUndefined();
+    await side.mirror(input, clock);
+    await side.flushLeaseEffects();
+    expect(hub.listAll(outbox.prefix, { fresh: true })).toEqual([]);
+  });
+
+  it.each([false, true].flatMap(deferred => ["lease", "replay", "unlease"].map(effect => ({ deferred, effect }))))(
+    "SA-01 unreadable current native bytes never use the cached mirror ($effect, deferred=$deferred)", async ({ deferred, effect }) => {
+    const hub = store("sqlite");
+    const now = Date.now();
+    const peer = remote(`read-error-${effect}-${deferred}`, now);
+    peer.host.incarnationToken = "mirror-A";
+    const side = new StoreBridgeSide(hub, "ryzen2", () => now, false, deferred);
+    await side.mirror(peer.presence);
+    await side.flushLeaseEffects();
+    const cached = readHostLease(hub.root, peer.host.id)!;
+    const outbox = new CommitOutbox(hub, "bridge/ryzen2", bridgeIdentity, {});
+    if (effect !== "lease") {
+      if (effect === "unlease") {
+        await hub.delete({ key: hostKey(peer.host.id) });
+        await hub.delete({ key: participantKey(peer.host.id) });
+      }
+      await hub.writeBatch({ identity: bridgeIdentity, ops: [], prepare: () => outbox.plan().stage([], [{
+        kind: effect === "unlease" ? "unlease" : "lease", key: `lease:${peer.host.id}`,
+        payload: { ...cached, key: hostKey(peer.host.id) },
+      }], { durable: true }) });
+    }
+    const target = hostLeasePath(hub.root, peer.host.id);
+    const native = { ...cached, incarnationToken: "native-B", updatedAt: now + 1,
+      writer: { pid: process.pid, host: "native", releaseSha: "test", lockProtocol: 1, stateBackend: "sqlite", startedAt: now } };
+    const watch = fs.watch.bind(fs);
+    vi.spyOn(fs, "watch").mockImplementation(((...args: unknown[]) => {
+      const index = args.findIndex(arg => typeof arg === "function");
+      if (index >= 0) args[index] = () => undefined;
+      return Reflect.apply(watch, fs, args);
+    }) as typeof fs.watch);
+    fs.writeFileSync(`${target}.native`, JSON.stringify({ format: 1, ...native }));
+    fs.renameSync(`${target}.native`, target);
+    const bytes = fs.readFileSync(target);
+    const read = fs.readFileSync.bind(fs);
+    const fault = vi.spyOn(fs, "readFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, ...args: unknown[]) => {
+      if (String(file) === target) throw Object.assign(new Error("current native file unreadable"), { code: "EACCES" });
+      return Reflect.apply(read, fs, [file, ...args]);
+    }) as typeof fs.readFileSync);
+    if (effect === "lease") await side.mirror({ hosts: [{ record: { ...peer.host,
+      identity: { ...peer.identity, name: "changed" } }, expiresAt: now + 60000 }], participants: [peer.participant] });
+    else await side.mirror(effect === "unlease" ? { hosts: [], participants: [] } : peer.presence);
+    await side.flushLeaseEffects();
+    expect(fault.mock.calls.some(([file]) => String(file) === target)).toBe(true);
+    fault.mockRestore();
+    expect(fs.readFileSync(target)).toEqual(bytes);
+    expect(readHostLease(hub.root, peer.host.id)?.incarnationToken).toBe("native-B");
+    expect(hub.get(outbox.rowKey(`lease:${peer.host.id}`), { fresh: true })).toBeDefined();
+  });
+
+  it.each([false, true])("SA-01 ENOENT still permits legitimate lease recreation (deferred=%s)", async deferred => {
+    const hub = store("sqlite"), now = Date.now(), peer = remote(`missing-current-${deferred}`, now);
+    const side = new StoreBridgeSide(hub, "ryzen2", () => now, false, deferred);
+    await side.mirror(peer.presence);
+    await side.flushLeaseEffects();
+    const file = hostLeasePath(hub.root, peer.host.id);
+    const prior = readHostLease(hub.root, peer.host.id);
+    expect(prior).toBeDefined();
+    fs.rmSync(file);
+    await side.mirror(peer.presence);
+    await side.flushLeaseEffects();
+    expect(readHostLease(hub.root, peer.host.id)).toEqual(prior);
+    expect(side.holds(peer.host.id, peer.identity)).toBe(true);
+  });
+
   // SA-01: model another process's atomic writes while this process's watcher delivery is
   // deliberately held. Raw installs do not bump its module-local generation counters.
   it.each([false, true].flatMap(deferred => ["lease", "participant", "legacy-lease"].map(claim => ({ deferred, claim }))))(

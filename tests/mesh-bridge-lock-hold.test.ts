@@ -542,23 +542,52 @@ describe("bridge catch-up SQLite write-lock holds (smarty-dev#10391), real store
           index += published.length;
         }
         const leaseDirectory = `${path.join(hub.root, "host-leases")}${path.sep}`;
+        // Exactly 150 NEW catch-up installs are the controlled I/O workload.
+        // The existing remote root also receives a fresh observation; long steps
+        // can refresh all roots again. Report those real writes, but never count
+        // or delay them as if they were additional new catch-up installations.
+        const catchupTargets = new Set(Array.from({ length: 150 }, (_, index) => hostLeasePath(hub.root, `session:catchup-${index}`)));
+        for (const target of catchupTargets) expect(fs.existsSync(target)).toBe(false);
+        const delayedTargets = new Set<string>();
+        const firstCatchupInstall = (target: unknown): boolean => {
+          const file = String(target);
+          if (!catchupTargets.has(file) || delayedTargets.has(file)) return false;
+          delayedTargets.add(file);
+          return true;
+        };
+        // A 2 ms syscall injection (300 ms total) was smaller than the full
+        // 500-event flow's run-to-run noise. Keep the SAME 150 installs, with a
+        // declared 20 ms controlled delay so the unchanged p95 ordering assertion
+        // tests serialization, not whether two unrelated 6-second runs tie.
+        const installDelayMs = 20;
         const delay = new Int32Array(new SharedArrayBuffer(4));
-        let syncLeaseWrites = 0, asyncLeaseWrites = 0;
+        let syncLeaseWrites = 0, asyncLeaseWrites = 0, delayedCatchupWrites = 0;
+        const installs = new Map<string, Array<{ observedAt: number | undefined; sourceObservedAt: number | undefined; updatedAt: number }>>();
+        const recordInstall = (target: unknown): void => {
+          const lease = JSON.parse(fs.readFileSync(String(target), "utf8")) as FabricHostLease;
+          const samples = installs.get(lease.id) ?? [];
+          samples.push({ observedAt: lease.mirror?.observedAt, sourceObservedAt: lease.mirror?.sourceObservedAt, updatedAt: lease.updatedAt });
+          installs.set(lease.id, samples);
+        };
         const originalSyncRename = fs.renameSync.bind(fs);
         const originalAsyncRename = fs.promises.rename.bind(fs.promises);
         syncRename = vi.spyOn(fs, "renameSync").mockImplementation((source, target) => {
           if (!deferred && String(target).startsWith(leaseDirectory) && String(target).endsWith(".json")) {
             syncLeaseWrites += 1;
-            Atomics.wait(delay, 0, 0, 2);
+            if (firstCatchupInstall(target)) { delayedCatchupWrites += 1; Atomics.wait(delay, 0, 0, installDelayMs); }
           }
-          return originalSyncRename(source, target);
+          const result = originalSyncRename(source, target);
+          if (!deferred && String(target).startsWith(leaseDirectory) && String(target).endsWith(".json")) recordInstall(target);
+          return result;
         });
         asyncRename = vi.spyOn(fs.promises, "rename").mockImplementation(async (source, target) => {
           if (deferred && String(target).startsWith(leaseDirectory) && String(target).endsWith(".json")) {
             asyncLeaseWrites += 1;
-            await new Promise(resolve => setTimeout(resolve, 2));
+            if (firstCatchupInstall(target)) { delayedCatchupWrites += 1; await new Promise(resolve => setTimeout(resolve, installDelayMs)); }
           }
-          return originalAsyncRename(source, target);
+          const result = await originalAsyncRename(source, target);
+          if (deferred && String(target).startsWith(leaseDirectory) && String(target).endsWith(".json")) recordInstall(target);
+          return result;
         });
         const started = performance.now();
         const result = await bridge.step();
@@ -570,12 +599,22 @@ describe("bridge catch-up SQLite write-lock holds (smarty-dev#10391), real store
         const percentile = (fraction: number): number => ages[Math.min(ages.length - 1,
           Math.ceil((ages.length - 1) * fraction))] ?? 0;
         const measurement = { mode: suffix, forwarded: result.toLocal, delivered: ages.length,
-          leaseWrites: deferred ? asyncLeaseWrites : syncLeaseWrites, stepMs: +stepMs.toFixed(1),
+          leaseWrites: deferred ? asyncLeaseWrites : syncLeaseWrites, delayedCatchupWrites, installDelayMs, stepMs: +stepMs.toFixed(1),
           deliveryP50Ms: +percentile(0.5).toFixed(1), deliveryP95Ms: +percentile(0.95).toFixed(1),
           deliveryMaxMs: +Math.max(0, ...ages).toFixed(1) };
+        console.log(JSON.stringify({ scenario: "150-lease write causality", ...measurement,
+          distinctLeaseIds: installs.size, catchupIds: [...installs.keys()].filter(id => id.startsWith("session:catchup-")).length,
+          refreshWrites: [...installs.values()].reduce((sum, samples) => sum + Math.max(0, samples.length - 1), 0),
+          existingRootWrites: [...installs].filter(([id]) => !id.startsWith("session:catchup-")).reduce((sum, [, samples]) => sum + samples.length, 0) }));
         expect(result.toLocal).toBe(EVENTS);
         expect(ages).toHaveLength(EVENTS);
-        expect(measurement.leaseWrites).toBe(150);
+        expect(measurement.delayedCatchupWrites).toBe(150);
+        expect(delayedTargets.size).toBe(150);
+        expect([...installs.keys()].filter(id => id.startsWith("session:catchup-"))).toHaveLength(150);
+        for (let index = 0; index < 150; index++) {
+          const id = `session:catchup-${index}`;
+          expect(readHostLease(hub.root, id)).toMatchObject({ id, rootId: id, identityId: id, mirrorLease: 1 });
+        }
         return measurement;
       } finally {
         await local.flushLeaseEffects();
@@ -640,6 +679,99 @@ describe("bridge catch-up SQLite write-lock holds (smarty-dev#10391), real store
     expect(Math.max(0, ...batches)).toBeLessThanOrEqual(BATCH_MAX_EVENTS);
     expect(maxHoldMs).toBeLessThanOrEqual(CEILING_HOLD_MS);
   }, 60000);
+
+  // Keep reason: trust-boundary races at the real lease gate. Recompute the COMPLETE
+  // admission snapshot after custody, not just the selected host versions: another key
+  // can reserve a name/id, void a handoff, or introduce a native file-first claim.
+  it.each(["unrelated-host", "unrelated-participant", "reservation-alias", "handoff-alias", "native-file-alias"] as const)(
+    "lease-only batch re-admits current dependencies after custody: %s", async change => {
+      const mesh = store();
+      const now = Date.now();
+      let clock = now;
+      const id = "session:lease-current-selected";
+      const identity: MeshIdentity = { id, name: "selected", kind: "main" };
+      const hash = (value: string) => createHash("sha256").update(value).digest("hex");
+      const host = { format: 1 as const, id, rootId: id, identity, incarnationToken: "selected-A",
+        startedAt: now - 1000, updatedAt: now, expiresAt: now + 120000 };
+      const source = (sample: number) => ({ hosts: [{ record: { ...host, updatedAt: sample },
+        observedAt: sample, expiresAt: sample + 12000 }], participants: [] });
+      const side = new StoreBridgeSide(mesh, "far", () => clock);
+      await side.mirror(source(now), now);
+      const before = readHostLease(mesh.root, id)!;
+      const other = "session:lease-current-other";
+      const otherIdentity: MeshIdentity = { id: other, name: "other", kind: "main" };
+      const custody = mesh.leaseCustody.bind(mesh);
+      let injected = false;
+      mesh.leaseCustody = (file, operation, timeout, signal) => custody(file, async () => {
+        if (!injected) {
+          injected = true;
+          if (change === "unrelated-host") await mesh.put({ key: `topology/hosts/${hash(other)}`, identity: otherIdentity,
+            value: { ...host, id: other, rootId: other, identity: otherIdentity } });
+          else if (change === "handoff-alias") await mesh.put({ key: `topology/handoffs/${hash(other)}`, identity: otherIdentity,
+            value: { format: 1, id: other, sessionId: other.slice("session:".length), name: id, link: "another-link",
+              handedOffAt: now, operator: "test", hub: "hub" } });
+          else {
+            const entry = { key: `topology/participants/${hash(other)}`, version: 1, updatedAt: clock, updatedBy: otherIdentity,
+              value: { format: 1 as const, id: other, kind: "root" as const, rootId: other, ownerHostId: other,
+                ownerIdentityId: other, name: change === "unrelated-participant" ? "other" : id, label: "other",
+                status: "idle" as const, runner: "pi" as const, transport: "host" as const,
+                capabilities: ["steer"], controlProtocol: "v1" as const, startedAt: now, updatedAt: clock } };
+            if (change === "native-file-alias") writeParticipantFile(mesh.root, entry);
+            else await mesh.put({ key: entry.key, value: entry.value, identity: otherIdentity });
+          }
+        }
+        return operation();
+      }, timeout, signal);
+      clock += 1000;
+      await side.mirror(source(clock), clock);
+      expect(injected).toBe(true);
+      const after = readHostLease(mesh.root, id);
+      if (change.startsWith("unrelated-")) {
+        expect(after?.mirror?.sourceObservedAt).toBe(clock);
+        expect(after?.expiresAt).toBe(clock + 12000);
+        expect(side.holds(id, identity)).toBe(true);
+      } else {
+        // A different key reserving this id is a dependency even though the
+        // selected host's version and lease bytes never changed during custody.
+        expect(after?.mirror?.sourceObservedAt ?? before.mirror!.sourceObservedAt).toBe(before.mirror!.sourceObservedAt);
+        expect(side.holds(id, identity)).toBe(false);
+      }
+    });
+
+  it("unselected newly-needed state writes do not starve a selected lease-only batch", async () => {
+    const mesh = store();
+    const now = Date.now();
+    let clock = now;
+    const ids = ["session:lease-stable-selected", ...Array.from({ length: 31 }, (_, index) => `session:lease-stable-${index}`),
+      "session:lease-repair-unselected"];
+    const identities = ids.map(id => ({ id, name: id, kind: "main" as const }));
+    const hosts = identities.map(identity => ({ format: 1 as const, id: identity.id, rootId: identity.id, identity,
+      incarnationToken: "A", startedAt: now - 1000, updatedAt: now, expiresAt: now + 120000 }));
+    const presence = { hosts: hosts.map(record => ({ record, observedAt: now, expiresAt: now + 12000 })), participants: [] };
+    const side = new StoreBridgeSide(mesh, "far", () => clock);
+    await side.mirror(presence, now);
+    const selectedLeaseFile = hostLeasePath(mesh.root, ids[0]!);
+    const custody = mesh.leaseCustody.bind(mesh);
+    let injected = 0;
+    mesh.leaseCustody = (file, operation, timeout, signal) => custody(file, async () => {
+      // Churn the OTHER mirror on every acquisition of the selected gate. A
+      // full-plan `ops.length === 0` test, or the old global revision guard,
+      // cannot make progress, even though this selected lease remains safe.
+      if (file === selectedLeaseFile) {
+        injected++;
+        const record = hosts.at(-1)!;
+        const key = `topology/hosts/${createHash("sha256").update(record.id).digest("hex")}`;
+        await mesh.put({ key, identity: identities.at(-1)!, value: { ...record, remoteHost: "far", name: `repair-${injected}` } });
+      }
+      return operation();
+    }, timeout, signal);
+    clock += 1000;
+    await side.mirror({ ...presence, hosts: presence.hosts.map(host => ({ ...host,
+      record: { ...host.record, updatedAt: clock }, observedAt: clock, expiresAt: clock + 12000 })) }, clock);
+    expect(injected).toBeGreaterThan(0);
+    expect(readHostLease(mesh.root, ids[0]!)?.mirror?.sourceObservedAt).toBe(clock);
+    expect(side.holds(ids[0]!, identities[0]!)).toBe(true);
+  });
 
   // The pre-check runs outside the fence; a file the check reads can change before the fence. Each case changes
   // one between the two: the proof must fail, and the full check then decides inside the fence.

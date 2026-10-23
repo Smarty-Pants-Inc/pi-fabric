@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MeshBridge, RemoteBridgeSide, serveBridgeAgent, StoreBridgeSide } from "../src/mesh/bridge.js";
-import { CommitOutbox } from "../src/mesh/commit-outbox.js";
+import { CommitOutbox, type CommitOutboxPlan } from "../src/mesh/commit-outbox.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { hostLeasePath, readHostLease, writeHostLease } from "../src/topology/host-leases.js";
 import { writeParticipantFile } from "../src/topology/participant-files.js";
@@ -145,13 +145,24 @@ describe("trusted-hub relayed incarnation skips", () => {
       const stale = fixture("relayed-root", token, now, true);
       // Force the warmed early plan to retry on the second pass, without touching lease evidence.
       const write = store.writeBatch.bind(store);
-      const retry = pass === 1 ? vi.spyOn(store, "writeBatch").mockImplementationOnce(async input => {
+      const custody = store.leaseCustody.bind(store);
+      const views = vi.spyOn(store, "stateView");
+      const injected = vi.fn();
+      const retry = pass === 1 ? vi.spyOn(store, "leaseCustody").mockImplementationOnce(async (file, operation, timeout, options) => {
+        // Unchanged mirrors bypass writeBatch. Intervene at the actual custody boundary,
+        // and require a fresh early plan so this cannot become a non-executing attack.
+        injected();
         await write({ identity, ops: [{ kind: "put", key: "topology/hosts/retry-probe", value: {} }] });
-        return write(input);
+        return custody(file, operation, timeout, options);
       }) : undefined;
       await expect(side.mirror({ hosts: [...stale.presence.hosts, ...normals.flatMap(v => v.presence.hosts)],
         participants: [stale.participant, ...normals.map(v => v.participant)] }, undefined, true)).resolves.toBeUndefined();
-      if (retry) { expect(retry).toHaveBeenCalledTimes(2); retry.mockRestore(); }
+      if (retry) {
+        expect(injected).toHaveBeenCalledOnce();
+        expect(views.mock.calls.length).toBeGreaterThan(1);
+        retry.mockRestore();
+      }
+      views.mockRestore();
       expect(store.get(hostKey(id), { fresh: true })).toEqual(beforeHost);
       expect(store.get(participantKey(id), { fresh: true })).toEqual(beforeParticipant);
       expect(fs.readFileSync(hostLeasePath(store.root, id))).toEqual(beforeLease);
@@ -164,11 +175,26 @@ describe("trusted-hub relayed incarnation skips", () => {
     // Allowed counterexamples: same-token recovery/renewal, then a genuine new token; pending work may be superseded.
     for (const token of ["relay-B", "relay-C"]) {
       const allowed = fixture("relayed-root", token, now + 1_000, true);
+      const staged = vi.fn();
+      const originalPlan = CommitOutbox.prototype.plan;
+      const planSpy = vi.spyOn(CommitOutbox.prototype, "plan").mockImplementation(function (this: CommitOutbox): CommitOutboxPlan {
+        const plan = originalPlan.call(this);
+        return { ...plan, stage: (ops, effects, options) => {
+          for (const effect of effects) if (effect.key === `lease:${id}`) {
+            expect(effect).toMatchObject({ kind: "lease", payload: { incarnationToken: token } });
+            staged();
+          }
+          return plan.stage(ops, effects, options);
+        } };
+      });
       await side.mirror({ hosts: [...allowed.presence.hosts, ...normals.flatMap(v => v.presence.hosts)],
         participants: [allowed.participant, ...normals.map(v => v.participant)] }, undefined, true);
+      expect(staged).toHaveBeenCalledOnce();
+      planSpy.mockRestore();
       expect(store.get(hostKey(id), { fresh: true })?.value).toMatchObject({ incarnationToken: token });
       expect(readHostLease(store.root, id)).toMatchObject({ incarnationToken: token, bridgeSupersededTokens: expect.arrayContaining(["relay-A"]) });
-      expect(store.get(rowKey, { fresh: true })?.value).toMatchObject({ kind: "lease", payload: { incarnationToken: token } });
+      // The same payload was staged above; successful installs now retire before return.
+      expect(store.get(rowKey, { fresh: true })).toBeUndefined();
     }
     expect(warning).toHaveBeenCalledTimes(3);
   });

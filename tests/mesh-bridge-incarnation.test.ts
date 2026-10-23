@@ -38,6 +38,18 @@ const store = (stateBackend: "file" | "sqlite") => {
   stores.push(hub);
   return hub;
 };
+// Intervene after the early plan but before REAL per-id custody. Lease-only passes do
+// not call writeBatch; a writeBatch spy silently missed those attacks after batching.
+const beforeLeaseCustody = (hub: MeshStore, intervene: () => void | Promise<void>) => {
+  const custody = hub.leaseCustody.bind(hub);
+  const injected = vi.fn(intervene);
+  const views = vi.spyOn(hub, "stateView");
+  const spy = vi.spyOn(hub, "leaseCustody").mockImplementationOnce(async (file, operation, timeout, options) => {
+    await injected();
+    return custody(file, operation, timeout, options);
+  });
+  return { injected, views, restore: () => { spy.mockRestore(); views.mockRestore(); } };
+};
 const key = (prefix: string, id: string) => prefix + createHash("sha256").update(id).digest("hex");
 const hostKey = (id: string) => key("topology/hosts/", id);
 const participantKey = (id: string) => key("topology/participants/", id);
@@ -224,12 +236,25 @@ describe("bridge incarnation admission at persisted trust boundaries (smarty-dev
         now = NOW + pass * 9_000;
         const sourceAt = now + (pass % 2 ? -600_000 : 600_000);
         const write = hub.writeBatch.bind(hub);
-        const retry = pass === 1 && backend === "sqlite" ? vi.spyOn(hub, "writeBatch").mockImplementationOnce(async input => {
+        const retry = pass === 1 && backend === "sqlite" ? beforeLeaseCustody(hub, async () => {
           await write({ identity: bridgeIdentity, ops: [{ kind: "put", key: "topology/hosts/retry-probe", value: {} }] });
-          return write(input);
         }) : undefined;
+        const staged = vi.fn();
+        const originalPlan = CommitOutbox.prototype.plan;
+        const planSpy = vi.spyOn(CommitOutbox.prototype, "plan").mockImplementation(function (this: CommitOutbox): CommitOutboxPlan {
+          const plan = originalPlan.call(this);
+          return { ...plan, stage: (ops, effects, options) => {
+            for (const effect of effects) if (effect.key === `lease:${identity.id}`) {
+              expect(effect).toMatchObject({ kind: "lease", payload: { incarnationToken: host.incarnationToken, startedAt: highFloor } });
+              staged();
+            }
+            return plan.stage(ops, effects, options);
+          } };
+        });
         await expect(side.mirror(plusUnrelated(legacy(sourceAt)), now)).resolves.toBeUndefined();
-        if (retry) { expect(retry).toHaveBeenCalledTimes(2); retry.mockRestore(); }
+        if (retry) { expect(retry.injected).toHaveBeenCalledOnce(); expect(retry.views.mock.calls.length).toBeGreaterThan(1); retry.restore(); }
+        expect(staged).toHaveBeenCalledOnce();
+        planSpy.mockRestore();
         expect(JSON.stringify(hub.get(participantKey(identity.id), { fresh: true }))).toBe(participantBytes);
         const { updatedAt: _updated, expiresAt: _expires, ...authorityFields } = authority;
         expect(hub.get(hostKey(identity.id), { fresh: true })?.value).toMatchObject({ ...authorityFields, startedAt: highFloor });
@@ -238,8 +263,9 @@ describe("bridge incarnation admission at persisted trust boundaries (smarty-dev
           mirror: { observedAt: now, sourceObservedAt: sourceAt, sourceExpiresAt: sourceAt + 8_000 } });
         expect(side.holds(identity.id, identity)).toBe(true);
         expect(hub.get(hostKey(unrelated.id), { fresh: true })?.value).toMatchObject({ incarnationToken: "U" });
-        expect(hub.get(pending.rowKey(`lease:${identity.id}`), { fresh: true })?.value).toMatchObject({ kind: "lease",
-          payload: { incarnationToken: host.incarnationToken, startedAt: highFloor } });
+        // Successful effects retire before mirror resolves; the staged payload above and
+        // the installed file prove the same authority at their actual execution boundaries.
+        expect(hub.get(pending.rowKey(`lease:${identity.id}`), { fresh: true })).toBeUndefined();
       }
       // Actual persistence reopen, then another fresh bounded renewal.
       hub.closeState();
@@ -294,12 +320,11 @@ describe("bridge incarnation admission at persisted trust boundaries (smarty-dev
       if (shape === "sibling-duplicate") input.hosts.push({ record: { ...host, id: `${identity.id}-sibling` }, expiresAt: host.expiresAt });
       for (let pass = 0; pass < 3; pass++) {
         const write = hub.writeBatch.bind(hub);
-        const retry = pass === 1 && backend === "sqlite" ? vi.spyOn(hub, "writeBatch").mockImplementationOnce(async batch => {
+        const retry = pass === 1 && backend === "sqlite" ? beforeLeaseCustody(hub, async () => {
           await write({ identity: bridgeIdentity, ops: [{ kind: "put", key: "topology/hosts/retry-probe", value: {} }] });
-          return write(batch);
         }) : undefined;
         await expect(side.mirror(plusUnrelated(input), NOW)).resolves.toBeUndefined();
-        if (retry) { expect(retry).toHaveBeenCalledTimes(2); retry.mockRestore(); }
+        if (retry) { expect(retry.injected).toHaveBeenCalledOnce(); expect(retry.views.mock.calls.length).toBeGreaterThan(1); retry.restore(); }
         expect(hub.get(hostKey(identity.id), { fresh: true })).toEqual(before.host);
         expect(hub.get(participantKey(identity.id), { fresh: true })).toEqual(before.participant);
         expect(fs.readFileSync(hostLeasePath(hub.root, identity.id))).toEqual(before.lease);
@@ -363,7 +388,10 @@ describe("bridge incarnation admission at persisted trust boundaries (smarty-dev
     it("preserves a previously completed but still pending lease row when this pass root-skips", async () => {
       const hub = store(backend);
       const side = new StoreBridgeSide(hub, "ryzen2", () => NOW);
-      await side.mirror(presence); // afterCommit succeeded; its row still awaits retirement
+      // A successful install followed by a retirement failure leaves real pending work.
+      const retire = vi.spyOn(CommitOutbox.prototype, "retire").mockRejectedValueOnce(new Error("injected retirement failure"));
+      await expect(side.mirror(presence)).rejects.toThrow("injected retirement failure");
+      retire.mockRestore();
       const outbox = new CommitOutbox(hub, "bridge/ryzen2", bridgeIdentity, {});
       const row = hub.get(outbox.rowKey(`lease:${identity.id}`), { fresh: true });
       const bytes = fs.readFileSync(hostLeasePath(hub.root, identity.id));
@@ -381,9 +409,10 @@ describe("bridge incarnation admission at persisted trust boundaries (smarty-dev
       const side = new StoreBridgeSide(hub, "ryzen2", () => now);
       await side.mirror(presence);
       const participantBefore = hub.get(participantKey(identity.id), { fresh: true });
-      const write = hub.writeBatch.bind(hub);
-      vi.spyOn(hub, "writeBatch").mockImplementationOnce(input => { now += 20_000; return write(input); });
+      const delayed = beforeLeaseCustody(hub, () => { now += 20_000; });
       await side.mirror(legacy(NOW - 600_000, 5_000), NOW);
+      expect(delayed.injected).toHaveBeenCalledOnce();
+      delayed.restore();
       expect(readHostLease(hub.root, identity.id)).toMatchObject({ expiresAt: NOW + 5_000,
         mirror: { observedAt: NOW, sourceObservedAt: NOW - 600_000 } });
       expect(hub.get(participantKey(identity.id), { fresh: true })).toEqual(participantBefore);
@@ -401,16 +430,21 @@ describe("bridge incarnation admission at persisted trust boundaries (smarty-dev
     const participantBefore = hub.get(participantKey(identity.id), { fresh: true });
     const write = hub.writeBatch.bind(hub);
     let interveningHost: unknown, interveningLease: Buffer | undefined;
-    const retry = vi.spyOn(hub, "writeBatch").mockImplementationOnce(async input => {
+    const retry = beforeLeaseCustody(hub, async () => {
       await write({ identity, ops: [{ kind: "put", key: hostKey(identity.id), value: { ...tokenlessHost, remoteHost: "ryzen2" } }] });
       writeHostLease(hub.root, tokenlessLease);
       interveningHost = hub.get(hostKey(identity.id), { fresh: true });
       interveningLease = fs.readFileSync(hostLeasePath(hub.root, identity.id));
-      return write(input);
     });
-    await expect(side.mirror({ hosts: [{ record: tokenlessHost, observedAt: NOW, expiresAt: NOW + 8_000 }],
+    // Unrelated work ensures even an initially skipped root crosses a real custody boundary.
+    const unrelated = { ...host, id: "session:monotonic-unrelated", rootId: "session:monotonic-unrelated",
+      identity: { ...identity, id: "session:monotonic-unrelated" } };
+    await expect(side.mirror({ hosts: [{ record: tokenlessHost, observedAt: NOW, expiresAt: NOW + 8_000 },
+      { record: unrelated, expiresAt: unrelated.expiresAt }],
       participants: [{ ...participant, name: "must-not-replace" }] }, NOW)).resolves.toBeUndefined();
-    expect(retry).toHaveBeenCalledTimes(2);
+    expect(retry.injected).toHaveBeenCalledOnce();
+    expect(retry.views.mock.calls.length).toBeGreaterThan(1);
+    retry.restore();
     expect(hub.get(hostKey(identity.id), { fresh: true })).toEqual(interveningHost);
     expect(hub.get(participantKey(identity.id), { fresh: true })).toEqual(participantBefore);
     expect(fs.readFileSync(hostLeasePath(hub.root, identity.id))).toEqual(interveningLease);
@@ -438,16 +472,14 @@ describe("bridge incarnation admission at persisted trust boundaries (smarty-dev
     const ownerBefore = { host: hub.get(hostKey(ownerHost.id), { fresh: true }),
       participant: hub.get(participantKey(ownerParticipant.id), { fresh: true }),
       lease: fs.readFileSync(hostLeasePath(hub.root, ownerHost.id)) };
-    const write = hub.writeBatch.bind(hub);
-    let batches = 0;
-    vi.spyOn(hub, "writeBatch").mockImplementation(async input => {
-      batches += 1;
-      if (batches === 1) writeHostLease(hub.root, { ...collisionLease, rootId: ownerHost.rootId, identityId: ownerIdentity.id });
-      return write(input);
+    const collision = beforeLeaseCustody(hub, () => {
+      writeHostLease(hub.root, { ...collisionLease, rootId: ownerHost.rootId, identityId: ownerIdentity.id });
     });
 
     const malformed = { hosts: [{ record: collisionHost, expiresAt: collisionHost.expiresAt }], participants: [] };
     await expect(side.mirror(malformed, NOW)).resolves.toBeUndefined();
+    expect(collision.injected).toHaveBeenCalledOnce();
+    collision.restore();
     expect(hub.get(hostKey(ownerHost.id), { fresh: true })).toEqual(ownerBefore.host);
     expect(hub.get(participantKey(ownerParticipant.id), { fresh: true })).toEqual(ownerBefore.participant);
     expect(fs.readFileSync(hostLeasePath(hub.root, ownerHost.id))).toEqual(ownerBefore.lease);
@@ -466,24 +498,19 @@ describe("bridge incarnation admission at persisted trust boundaries (smarty-dev
     const stableLeaseStamp = originalStamp(hub.root, "host-leases");
     vi.spyOn(publicationGeneration, "meshDirectoryStamp").mockImplementation((root, name) =>
       name === "host-leases" ? stableLeaseStamp : originalStamp(root, name));
-    const writeBatch = hub.writeBatch.bind(hub);
-    let batches = 0;
     let changedLease: Buffer | undefined;
-    vi.spyOn(hub, "writeBatch").mockImplementation(input => {
-      batches += 1;
-      if (batches === 1) {
-        // The early plan saw A. B supersedes A but has the SAME root, so the collision-protection
-        // set remains unchanged. Keep the observed directory stamp fixed to exercise the stale
-        // bytes' stamp shortcut on every platform.
-        writeHostLease(hub.root, newerLease);
-        changedLease = fs.readFileSync(leasePath);
-        expect(publicationGeneration.meshDirectoryStamp(hub.root, "host-leases")).toBe(stableLeaseStamp);
-      }
-      return writeBatch(input);
+    const changed = beforeLeaseCustody(hub, () => {
+      // The early plan saw A. B supersedes A but has the SAME root, so the collision-protection
+      // set remains unchanged. Keep the observed directory stamp fixed on every platform.
+      writeHostLease(hub.root, newerLease);
+      changedLease = fs.readFileSync(leasePath);
+      expect(publicationGeneration.meshDirectoryStamp(hub.root, "host-leases")).toBe(stableLeaseStamp);
     });
 
     await expect(side.mirror(presence)).rejects.toMatchObject({ code: "FABRIC_BRIDGE_STALE_INCARNATION" });
-    expect(batches).toBe(1); // the stale plan rolls back; recomputation refuses A before a second write
+    expect(changed.injected).toHaveBeenCalledOnce();
+    expect(changed.views.mock.calls.length).toBeGreaterThan(1);
+    changed.restore();
     expect(hub.listAll("", { fresh: true })).toEqual(before);
     expect(changedLease).toBeDefined();
     expect(fs.readFileSync(leasePath)).toEqual(changedLease);
@@ -505,20 +532,14 @@ describe("bridge incarnation admission at persisted trust boundaries (smarty-dev
     const before = hub.listAll("", { fresh: true });
     const leaseBefore = fs.readFileSync(hostLeasePath(hub.root, identity.id));
     const views = vi.spyOn(hub, "stateView");
-    const writeBatch = hub.writeBatch.bind(hub);
-    let batches = 0;
     let installedBytes: Buffer | undefined;
-    vi.spyOn(hub, "writeBatch").mockImplementation(input => {
-      batches += 1;
-      if (batches === 1) {
-        // The early compute has finished, but the real transaction has not started.
-        expect(views).toHaveBeenCalledOnce();
-        if (leaseChanges) {
-          writeHostLease(hub.root, newerLease);
-          installedBytes = fs.readFileSync(hostLeasePath(hub.root, identity.id));
-        }
+    const changed = beforeLeaseCustody(hub, () => {
+      // The early compute has finished; neither lease-only execution nor a writer has entered.
+      expect(views).toHaveBeenCalledOnce();
+      if (leaseChanges) {
+        writeHostLease(hub.root, newerLease);
+        installedBytes = fs.readFileSync(hostLeasePath(hub.root, identity.id));
       }
-      return writeBatch(input);
     });
 
     if (leaseChanges) {
@@ -533,7 +554,9 @@ describe("bridge incarnation admission at persisted trust boundaries (smarty-dev
       expect(fs.readFileSync(hostLeasePath(hub.root, identity.id))).toEqual(leaseBefore);
       expect(side.holds(identity.id, identity)).toBe(true);
     }
-    expect(batches).toBe(1);
+    expect(changed.injected).toHaveBeenCalledOnce();
+    if (leaseChanges) expect(changed.views.mock.calls.length).toBeGreaterThan(1);
+    changed.restore();
     expect(hub.listAll("topology/handoffs/", { fresh: true })).toEqual([]);
     expect(removals).toEqual([]);
   });
@@ -585,7 +608,7 @@ describe("bridge incarnation admission at persisted trust boundaries (smarty-dev
   // Keep reason: Luna's #7397 P2, an older unsampled effect erased sampled authority.
   it.each(([
     { path: "replay", inflated: false }, { path: "replay", inflated: true },
-    { path: "afterCommit", inflated: false }, { path: "afterCommit", inflated: true },
+    { path: "install", inflated: false }, { path: "install", inflated: true },
   ] as const).flatMap(test => [{ ...test, sameDeadline: false }, { ...test, sameDeadline: true }]))(
     "retains sampled M1 and repairs history at the unsampled $path checkpoint (inflated=$inflated, equal-deadline=$sameDeadline)", async ({ path, inflated, sameDeadline }) => {
     const hub = store("file");
@@ -625,27 +648,31 @@ describe("bridge incarnation admission at persisted trust boundaries (smarty-dev
       });
       await new StoreBridgeSide(hub, "ryzen2", () => NOW).mirror(incoming, NOW);
     } else {
-      const write = hub.writeBatch.bind(hub);
-      let delayed: NonNullable<Parameters<MeshStore["writeBatch"]>[0]["afterCommit"]> | undefined;
-      const intercept = vi.spyOn(hub, "writeBatch").mockImplementation(input => {
-        const { afterCommit, ...withoutAfterCommit } = input;
-        delayed = afterCommit;
-        return write(withoutAfterCommit);
-      });
-      // Commit an unsampled effect, withholding only its real afterCommit callback.
-      await new StoreBridgeSide(hub, "ryzen2", () => NOW - 1_000).mirror({ hosts: [{
-        record: { ...host, updatedAt: pending.updatedAt }, expiresAt: pending.expiresAt }], participants: [participant] });
-      intercept.mockRestore();
-      expect(delayed).toBeTypeOf("function");
-      // An intervening pass publishes sampled M1 before the older callback regains custody.
-      await new StoreBridgeSide(hub, "ryzen2", () => NOW).mirror(incoming, NOW);
-      await hub.put({ key: hostKey(identity.id), identity, value: { ...host, remoteHost: "ryzen2", mirrorLease: 1,
+      // Persist the effect's trusted history BEFORE planning. Only the newer lease
+      // file changes in the install gap, so the expected host-version fence remains valid.
+      await hub.put({ key: hostKey(identity.id), identity, value: { ...host, remoteHost: "ryzen2",
         bridgeSupersededTokens: ["effect-predecessor"], bridgeSupersededTokenSeen: { "effect-predecessor": 1 } } });
-      writeHostLease(hub.root, sampled);
-      await hub.writeBatch({ identity: bridgeIdentity, ops: [], afterCommit: view => {
-        delayed!(view);
-        checkpoint = capture(); // No later mirror pass can repair this checkpoint.
-      } });
+      const custody = hub.leaseCustody.bind(hub);
+      let acquisitions = 0;
+      const injected = vi.fn();
+      vi.spyOn(hub, "leaseCustody").mockImplementation(async (file, operation, timeout, options) => {
+        if (++acquisitions !== 2) return custody(file, operation, timeout, options);
+        // This is the old effect's REAL deferred reacquisition, after commit but before
+        // install. A file-first same-token sample arrives without changing the SQL owner.
+        // The real handler must merge it; no expected-version check is bypassed.
+        injected();
+        writeHostLease(hub.root, sampled);
+        return custody(file, async () => {
+          const result = await operation();
+          checkpoint = capture(); // Before retirement; no later pass can conceal lost M1.
+          return result;
+        }, timeout, options);
+      });
+      const delayed = new StoreBridgeSide(hub, "ryzen2", () => NOW - 1_000, false, true);
+      await delayed.mirror({ hosts: [{ record: { ...host, updatedAt: pending.updatedAt }, expiresAt: pending.expiresAt }],
+        participants: [participant] });
+      await delayed.flushLeaseEffects();
+      expect(injected).toHaveBeenCalledOnce();
     }
     expect(checkpoint).toBeDefined();
     expect(checkpoint!.lease).toMatchObject({ mirror: sample, updatedAt: NOW, expiresAt: deadline,
@@ -655,6 +682,40 @@ describe("bridge incarnation admission at persisted trust boundaries (smarty-dev
       Math.min(BRIDGE_LEASE_MS, sample.sourceExpiresAt - sample.sourceObservedAt));
     expect(checkpoint!.routing).toBe("live");
     expect(checkpoint!.liveness).toEqual({ updatedAt: NOW, expiresAt: deadline });
+    expect(removals).toEqual([]);
+  });
+
+  it("cancels an older deferred install after a newer host commit without touching sampled file bytes", async () => {
+    const hub = store("file");
+    const custody = hub.leaseCustody.bind(hub);
+    let acquisitions = 0, oldVersion: number | undefined, newVersion: number | undefined;
+    let sampledBytes: Buffer | undefined;
+    const checkpoint = vi.fn();
+    vi.spyOn(hub, "leaseCustody").mockImplementation(async (file, operation, timeout, options) => {
+      if (++acquisitions !== 2) return custody(file, operation, timeout, options);
+      oldVersion = hub.get(hostKey(identity.id), { fresh: true })!.version;
+      // A complete newer mirror commit changes the host revision. Unlike the file-first
+      // cases above, this MUST cancel the old effect at the expected-version guard.
+      await new StoreBridgeSide(hub, "ryzen2", () => NOW).mirror({
+        hosts: [{ record: host, observedAt: NOW, expiresAt: NOW + 5_000 }], participants: [participant],
+      }, NOW);
+      newVersion = hub.get(hostKey(identity.id), { fresh: true })!.version;
+      sampledBytes = fs.readFileSync(hostLeasePath(hub.root, identity.id));
+      return custody(file, async () => {
+        const result = await operation();
+        expect(fs.readFileSync(hostLeasePath(hub.root, identity.id))).toEqual(sampledBytes);
+        checkpoint();
+        return result;
+      }, timeout, options);
+    });
+    const old = new StoreBridgeSide(hub, "ryzen2", () => NOW - 1_000, false, true);
+    await old.mirror({ hosts: [{ record: host, expiresAt: NOW + 4_000 }], participants: [participant] });
+    await old.flushLeaseEffects();
+    expect(newVersion).toBeGreaterThan(oldVersion!);
+    expect(sampledBytes).toBeDefined();
+    expect(checkpoint).toHaveBeenCalledOnce();
+    expect(readHostLease(hub.root, identity.id)).toMatchObject({ incarnationToken: host.incarnationToken,
+      expiresAt: NOW + 5_000, mirror: { observedAt: NOW, sourceObservedAt: NOW } });
     expect(removals).toEqual([]);
   });
 

@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { isMeshWriteDeferred } from "../core/atomic-write.js";
-import type { MeshBatchOperation, MeshBatchView, MeshIdentity, MeshStore } from "./store.js";
+import type { MeshBatchOperation, MeshBatchView, MeshIdentity, MeshStateEntry, MeshStore } from "./store.js";
 
 // State-domain helpers for lock call sites (smarty-dev#6477 L2b, plan R3 and R11).
 //
@@ -264,10 +264,17 @@ export class CommitOutbox {
   }
 
   /** Independently version-fenced retirement, yielding custody every 64 rows. A newer recording
-   * survives; a failed batch leaves its rows and every later batch pending for retry. */
-  async retire(): Promise<void> {
+   * survives; a failed batch leaves its rows and every later batch pending for retry.
+   * `eligible` preserves completed work whose authority the caller currently cannot judge.
+   * Evaluate it on a fresh read OUTSIDE writer custody; the delete still proves the exact
+   * completed version, so a newer recording cannot be retired by this observation. */
+  async retire(eligible?: (entry: MeshStateEntry) => boolean): Promise<void> {
     if (this.#done.size === 0) return;
-    const done = [...this.#done];
+    const current = eligible ? new Map(this.mesh.listAll(this.prefix, { fresh: true }).map(entry => [entry.key, entry])) : undefined;
+    const done = [...this.#done].filter(([key]) => {
+      const entry = current?.get(key);
+      return !entry || eligible!(entry);
+    });
     for (let start = 0; start < done.length; start += RETIRE_BATCH_SIZE) {
       const batch = done.slice(start, start + RETIRE_BATCH_SIZE);
       await this.mesh.writeBatch({

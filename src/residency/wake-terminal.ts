@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { assertMeshStateReadable, type MeshStore } from "../mesh/store.js";
@@ -13,6 +14,41 @@ import { canonicalResidentWakeConfig, readWakeJson, retainedRoutesAt } from "./w
  * beyond expiry (default native TTL is 15 s; longer/reload leases scale with it). */
 export const RESIDENT_WAKE_TERMINAL_MIN_GRACE_MS = 60_000;
 const RESIDENT_WAKE_TERMINAL_GRACE_TTLS = 3;
+// Generous native-lease headroom, not permission to read arbitrary extension payloads.
+const RESIDENT_WAKE_TERMINAL_LEASE_MAX_BYTES = 65_536;
+
+/** Raw terminal evidence only; other lease/participant readers keep their own contracts. */
+const readTerminalHostLeaseJson = (file: string): Record<string, unknown> | undefined => {
+  const { O_RDONLY, O_NOFOLLOW, O_NONBLOCK } = fs.constants;
+  if (O_NOFOLLOW === undefined || O_NONBLOCK === undefined) return;
+  let fd: number | undefined;
+  try {
+    // A substituted FIFO must not block before the descriptor can be checked.
+    fd = fs.openSync(file, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+    const before = fs.fstatSync(fd, { bigint: true });
+    const uid = process.getuid?.();
+    const safe = (stat: fs.BigIntStats): boolean => stat.isFile() &&
+      (uid === undefined || stat.uid === BigInt(uid)) && stat.size > 0n &&
+      stat.size <= BigInt(RESIDENT_WAKE_TERMINAL_LEASE_MAX_BYTES);
+    if (!safe(before)) return;
+    const length = Number(before.size);
+    const bytes = Buffer.alloc(length + 1);
+    // Read the whole admitted snapshot, then require EOF: even a growing file can
+    // supply at most cap + 1 bytes. A short read is doubt, never a valid JSON prefix.
+    if (fs.readSync(fd, bytes, 0, length, 0) !== length ||
+        fs.readSync(fd, bytes, length, 1, length) !== 0) return;
+    const after = fs.fstatSync(fd, { bigint: true });
+    const named = fs.lstatSync(file, { bigint: true });
+    const unchanged = (stat: fs.BigIntStats): boolean => safe(stat) &&
+      (["dev", "ino", "size", "mtimeNs", "ctimeNs", "uid", "mode", "nlink"] as const)
+        .every(field => stat[field] === before[field]);
+    // Nanosecond stamps detect in-place changes, including truncate/regrow; the
+    // pathname must still name the same regular snapshot, not a replaced inode.
+    if (!unchanged(after) || !unchanged(named)) return;
+    return JSON.parse(bytes.subarray(0, length).toString("utf8")) as Record<string, unknown>;
+  } catch { return; }
+  finally { if (fd !== undefined) fs.closeSync(fd); }
+};
 
 const nativeRootLeasePastGrace = (meshRoot: string, rootId: string, now: number): boolean => {
   const lease = readHostLeaseCurrent(meshRoot, rootId);
@@ -37,7 +73,7 @@ const nativeRootLeasePastGrace = (meshRoot: string, rootId: string, now: number)
   // optional fields the reader rejects: two different snapshots must not combine
   // an old expiry with new provenance or hide invalid incarnation/reload metadata.
   // This check runs on observation AND again under both terminal fences.
-  const raw = readWakeJson<Record<string, unknown>>(hostLeasePath(meshRoot, rootId));
+  const raw = readTerminalHostLeaseJson(hostLeasePath(meshRoot, rootId));
   if (!raw || typeof raw !== "object" || Array.isArray(raw) || raw.format !== 1 ||
       Object.hasOwn(raw, "mirrorLease") || Object.hasOwn(raw, "mirror")) return false;
   return (["id", "rootId", "identityId", "updatedAt", "expiresAt", "startedAt", "incarnationToken", "reloadUntil"] as const)

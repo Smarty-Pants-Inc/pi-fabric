@@ -30,6 +30,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { isMeshIncarnationPending, isMeshSnapshotRetriesExhausted, isMeshLockTimeout, MeshLockTimeoutError } from "../core/atomic-write.js";
+import type { LockTimingContext } from "./commit-stats.js";
 import type { MeshIdentity } from "./event-log.js";
 import { isMeshStateBackendKind, MESH_STATE_BACKEND_KIND_LIST, type MeshStateBackendKind } from "./state-backend-kinds.js";
 import type { MeshStoreContext } from "./mesh-lock.js";
@@ -132,6 +133,8 @@ export interface StateBackendBatchInput {
   beforeCommit?: () => void;
   /** Lock-stats class for the bridge's own writes; never inferred from the identity text. */
   lockClass?: "bridge";
+  /** Low-cardinality diagnostic labels; never inferred from caller-supplied identity or payloads. */
+  lockTiming?: LockTimingContext;
   /** R11: file reads before the transaction, re-checked by stamp inside it. */
   fileRead?: MeshStateFileRead;
   /** R11: file effects after COMMIT (L2b's outbox). */
@@ -233,7 +236,7 @@ export interface StateBackend {
    * attempt, `operation` on that snapshot, ROLLBACK; a busy write lock throws `MeshStateBusyError`
    * before `operation` runs (nothing happened: retry after releasing `.lock`).
    */
-  withWriteFence<T>(operation: () => T): T;
+  withWriteFence<T>(operation: () => T, timing?: LockTimingContext): T;
 
   /**
    * Durability barrier (smarty-dev#9313): resolves once every state commit made before the call, by
@@ -764,6 +767,7 @@ export class SqliteStateBackend implements StateBackend {
           ...(input.afterCommit ? { afterCommit: input.afterCommit } : {}),
           ...(input.beforeCommit || this.#slotClaimGuard ? { beforeCommit } : {}),
           ...(input.lockClass ? { lockClass: input.lockClass } : {}),
+          ...(input.lockTiming ? { lockTiming: input.lockTiming } : {}),
         }));
       } catch (error) {
         if (error !== FILE_READ_CHANGED) throw error;
@@ -790,11 +794,11 @@ export class SqliteStateBackend implements StateBackend {
     await this.#write((store) => store.confirmWritable(onAcquired));
   }
 
-  withWriteFence<T>(operation: () => T): T {
+  withWriteFence<T>(operation: () => T, timing?: LockTimingContext): T {
     const store = this.#read(() => this.#open());
     let entered = false;
     try {
-      return store.fenceSync(() => { entered = true; return operation(); });
+      return store.fenceSync(() => { entered = true; return operation(); }, timing);
     } catch (error) {
       if (entered || !(error instanceof MeshLockTimeoutError) || error instanceof MeshStateBusyError) throw error;
       this.#busyTimeouts += 1;
@@ -1125,7 +1129,7 @@ export class ShadowStateBackend implements StateBackend {
 
   // state.json is the authority and its writers take `.lock`; the shadow database is never read
   // for a decision, so fencing it would only add busy refusals.
-  withWriteFence<T>(operation: () => T): T { return this.#file.withWriteFence(operation); }
+  withWriteFence<T>(operation: () => T, timing?: LockTimingContext): T { return this.#file.withWriteFence(operation, timing); }
 
   // state.json is the authority; the shadow database is a copy rebuilt from it, so only the file syncs.
   sync(budgetMs: number): Promise<void> { return this.#file.sync(budgetMs); }

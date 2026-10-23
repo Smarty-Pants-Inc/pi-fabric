@@ -9,6 +9,7 @@ import { FabricIdempotencyKeyReusedError } from "./control-idempotency.js";
 import { readJsonlPage } from "../log-tail.js";
 import { MeshArchive, MeshArchiveLookupUnavailableError, MeshArchiveRecoveryChanged, type MeshArchiveEntry, type MeshArchiveRecoveryPlan } from "./archive.js";
 import { delay, errorCode, type MeshLock, type MeshStoreContext } from "./mesh-lock.js";
+import type { LockTimingContext } from "./commit-stats.js";
 import { jsonClone } from "./state-file.js";
 import { verifiedRemove } from "../storage/verified-remove.js";
 import { prepareKeyedPublishNamespace, receiptDirectoryBarrier, type ReceiptNamespace, type KeyedPublishPrefix, type LiveNamespaceBarrier } from "./receipt-namespace.js";
@@ -1021,7 +1022,7 @@ export class EventLog {
    * in order, before the batch resolves (smarty-dev#6729). A failed suffix is retried by
    * the caller after checkpointing the returned committed prefix.
    */
-  async publishBatch(inputs: MeshPublishInput[]): Promise<MeshEvent[]> {
+  async publishBatch(inputs: MeshPublishInput[], timing?: LockTimingContext): Promise<MeshEvent[]> {
     if (!inputs.length || inputs.length > 256) throw new Error("Mesh publish batch must contain 1..256 events");
     inputs = inputs.map(input => this.#capturePublication(input));
     const recoveryDeadline = Date.now() + this.#lock.lockTimeoutMs;
@@ -1060,7 +1061,7 @@ export class EventLog {
           // Compaction stays under the lock, as on main (off-lock compaction: smarty-dev#7002).
           this.#compactEventLog();
           return events;
-        }, undefined, "bridge");
+        }, undefined, "bridge", false, timing);
       } catch (error) {
         // A hold that failed after committing a prefix never retries; its committed receipts
         // still finish (best effort: an intent left behind recovers like a death after append).

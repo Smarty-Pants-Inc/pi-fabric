@@ -1,13 +1,13 @@
 import { copyFabricPrincipal, type FabricPrincipal } from "../fabric-provenance.js";
 import { createHash } from "node:crypto";
-import { isMeshIncarnationPending, isMeshSnapshotRetriesExhausted, isMeshLockTimeout,
+import { isMeshIncarnationPending, isMeshSnapshotRetriesExhausted, isMeshLockTimeout, MeshSnapshotRetriesExhaustedError,
   MESH_INCARNATION_PENDING_CODE, MESH_SNAPSHOT_RETRIES_EXHAUSTED_CODE, MESH_LOCK_TIMEOUT_CODE, meshDeferredSummary } from "../core/atomic-write.js";
 import { performance as monotonicClock } from "node:perf_hooks";
 import fs from "node:fs";
 import path from "node:path";
 import type { Readable, Writable } from "node:stream";
 import { ownProcessIncarnation, readPhysicalHostIdentity, readFileRetrying, writeFileAtomic, writeJsonAtomic } from "../core/atomic-write.js";
-import { type BridgeLeaseProcess, type FabricHostLease, type FabricMirrorLease, MIRROR_FRESH_MS, hostLeaseExpiry, hostLeasePath, hostLiveness, readHostLease, readHostLeases, removeHostLeaseIf, STATE_LEASE_RENEW_MS, writeHostLease } from "../topology/host-leases.js";
+import { type BridgeLeaseProcess, type FabricHostLease, type FabricMirrorLease, MIRROR_FRESH_MS, hostLeaseExpiry, hostLeasePath, hostLiveness, hostLeaseDirectoryStamp, readHostLease, readHostLeases, removeHostLeaseIf, STATE_LEASE_RENEW_MS, writeHostLease } from "../topology/host-leases.js";
 import { meshDirectoryStamp } from "../topology/publication-generation.js";
 import type { FabricHostRecord, FabricParticipantRecord } from "../topology/types.js";
 import { ROOT_ID_PREFIX } from "../topology/root-inbox-shared.js";
@@ -531,7 +531,7 @@ const contentDigest = (value: unknown): string => createHash("sha256").update(JS
 export const BRIDGE_HANDOFF_PREFIX = "topology/handoffs/";
 /** Every state row a held event's ownership check reads (holds(): its records and #reservedNow()). */
 const HELD_STATE_PREFIXES = [HOST_PREFIX, PARTICIPANT_PREFIX, BRIDGE_HANDOFF_PREFIX] as const;
-/** #mirror: plans made before the transaction before the last one plans inside it. */
+/** #mirror: bounded optimistic snapshot/lease-stamp validations before a retryable refusal. */
 const MIRROR_PLAN_ATTEMPTS = 3;
 /** A mirror plan made before the transaction no longer matches its snapshot: roll back, plan again. */
 class MirrorPlanStale extends Error {}
@@ -583,9 +583,22 @@ const nativeLeaseLive = (lease: FabricHostLease, now: number): boolean =>
   (lease.writer !== undefined || lease.session !== undefined) &&
   Math.max(lease.expiresAt, lease.session?.expiresAt ?? -Infinity, lease.reloadUntil ?? -Infinity) >= now;
 
-/** smarty-dev#10391: every lease bridgeHandoffScope judged at `then` is judged the same at `now`, either way. */
-const sameLeaseLiveness = (leases: ReadonlyMap<string, FabricHostLease>, then: number, now: number): boolean =>
-  [...leases.values()].every((lease) => nativeLeaseLive(lease, then) === nativeLeaseLive(lease, now));
+/** The open clock interval in which no native lease's live/dead judgment can change. */
+interface LeaseLivenessWindow { after: number; through: number }
+const leaseLivenessWindow = (leases: ReadonlyMap<string, FabricHostLease>, at: number): LeaseLivenessWindow => {
+  let after = Number.NEGATIVE_INFINITY, through = Number.POSITIVE_INFINITY;
+  for (const lease of leases.values()) {
+    if (lease.writer === undefined && lease.session === undefined) continue;
+    const deadline = Math.max(lease.expiresAt, lease.session?.expiresAt ?? Number.NEGATIVE_INFINITY,
+      lease.reloadUntil ?? Number.NEGATIVE_INFINITY);
+    if (deadline < at) after = Math.max(after, deadline);
+    else if (deadline > at) through = Math.min(through, deadline);
+  }
+  return { after, through };
+};
+/** A handoff-sensitive mirror may commit only while its prepared liveness judgments still hold. */
+const leaseLivenessUnchanged = (window: LeaseLivenessWindow | undefined, now: number): boolean =>
+  !!window && now > window.after && now <= window.through;
 
 /**
  * The handoffs as `peer`'s link sees them. A handoff is void when any native record (host or
@@ -1170,7 +1183,10 @@ export class StoreBridgeSide implements BridgeSide {
 
   async publishBatch(events: Array<{ event: BridgePublish; held?: string[] }>, fromHub = false): Promise<Array<{ sequence: number }>> {
     await this.store.prepareLock();
-    const published = await this.store.publishBatch(events.map(({ event, held }) => this.#publication(event, held ?? [], fromHub)));
+    const published = await this.store.publishBatch(
+      events.map(({ event, held }) => this.#publication(event, held ?? [], fromHub)),
+      { operation: "bridge-event-batch", phase: "event-batch" },
+    );
     return published.map(({ sequence }) => ({ sequence }));
   }
 
@@ -1281,7 +1297,7 @@ export class StoreBridgeSide implements BridgeSide {
             }
             try { return { value: commit() }; }
             finally { this.#proven.clear(); }
-          });
+          }, { operation: "bridge-notification-fence", phase: "notification-fence" });
           if (outcome !== HELD_FENCE_STALE) return outcome.value;
         }
       },
@@ -1462,6 +1478,9 @@ export class StoreBridgeSide implements BridgeSide {
       const incarnation = await ownProcessIncarnation();
       return host && incarnation ? { ...host, link: this.peer, pid: process.pid, incarnation } : undefined;
     })()) : undefined;
+    // Replay a committed outbox outside the SQLite writer lock before the first complete plan.
+    // Its file effects are idempotent and the rows remain durable until the next state commit retires them.
+    if (!partial && !this.#recovered) await this.#outbox.recover();
     let leases: BridgeLease[] = [];
     let removed: BridgeUnlease[] = [];
     // One idempotency key per host: a later lease write or removal supersedes an earlier one.
@@ -1474,34 +1493,6 @@ export class StoreBridgeSide implements BridgeSide {
     // same pass proceed. The set spans plan retries so one root produces one warning per pass.
     const skippedRoots = new Set<string>();
     const preservedRoots = new Set<string>();
-    // Match every complete lease value consulted by this presence. A collision can resolve an
-    // incoming identifier through a lease to a root that is not incoming, so the consulted set
-    // includes lease ids, identity ids and root ids that touch any raw claim.
-    const consultedLeaseIdentifiers = new Set<string>();
-    const rememberLeaseIdentifier = (value: unknown): void => {
-      if (typeof value === "string") consultedLeaseIdentifiers.add(value);
-    };
-    for (const { record } of presence.hosts) {
-      rememberLeaseIdentifier(record.id);
-      rememberLeaseIdentifier(record.identity.id);
-      rememberLeaseIdentifier(record.rootId);
-    }
-    for (const participant of presence.participants) {
-      rememberLeaseIdentifier(participant.id);
-      rememberLeaseIdentifier(participant.ownerHostId);
-      rememberLeaseIdentifier(participant.ownerIdentityId);
-      rememberLeaseIdentifier(participant.rootId);
-    }
-    const leaseIncarnationDigest = (leases: ReadonlyMap<string, FabricHostLease>, includeAll = false): string => contentDigest(
-      [...leases.values()].filter(lease => includeAll || consultedLeaseIdentifiers.has(lease.id) ||
-        consultedLeaseIdentifiers.has(lease.identityId) || consultedLeaseIdentifiers.has(lease.rootId))
-        .sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0)
-        .map(lease => includeAll ? lease : ({
-          id: lease.id, rootId: lease.rootId, identityId: lease.identityId, ...incarnationOf(lease),
-          bridgeSupersededTokens: bridgeSupersededTokensOf(lease.bridgeSupersededTokens),
-          bridgeSupersededTokenSeen: bridgeSupersededSeenOf(lease.bridgeSupersededTokenSeen),
-        })),
-    );
     // Recompute only the collision protection from the raw records and current leases. The
     // commit-time check uses the entries captured by the early plan, which stateUnchangedSince
     // proves are still current, so it does not perform a topology scan while holding state.db.
@@ -1572,9 +1563,9 @@ export class StoreBridgeSide implements BridgeSide {
       return [...protectionRoots].sort();
     };
     // The pass's plan on one state view: admission, reservations and the CAS versions. undefined: halted.
-    const compute = (view: MeshBatchView, participantFiles: ReturnType<typeof participantFileSnapshot>):
+    const compute = (view: MeshBatchView, participantFiles: ReturnType<typeof participantFileSnapshot>, livenessSensitive: boolean):
       { ops: MeshBatchOperation[]; leases: BridgeLease[]; removed: BridgeUnlease[];
-        judged: { leases: ReadonlyMap<string, FabricHostLease>; now: number } } | undefined => {
+        judged: { livenessWindow?: LeaseLivenessWindow } } | undefined => {
         const leases: BridgeLease[] = [];
         const removed: BridgeUnlease[] = [];
         const hostEntries = view.listAll(HOST_PREFIX);
@@ -1816,32 +1807,32 @@ export class StoreBridgeSide implements BridgeSide {
         }
         // A handoff a native voided goes in this commit: the void lasts if that native leaves again.
         if (!partial) for (const entry of scan.voided) ops.push({ kind: "delete", key: entry.key, ifVersion: entry.version, onConflict: "skip" });
-        return { ops, leases, removed, judged: { leases: scan.leases, now: scan.now } };
+        return { ops, leases, removed, judged: livenessSensitive
+          ? { livenessWindow: leaseLivenessWindow(scan.leases, scan.now) } : {} };
     };
     for (let attempt = 0; ; attempt += 1) {
-      // Participant files are read before the state transaction and revalidated in it by their
-      // directory stamp (R11): only a change in between reads them again under the lock.
+      if (attempt >= MIRROR_PLAN_ATTEMPTS) throw new MeshSnapshotRetriesExhaustedError(attempt);
+      // Participant and lease inputs are read outside state.db custody. Their cheap mutation stamps
+      // are checked under the write fence and once more at the commit boundary.
       const filesStamp = meshDirectoryStamp(this.store.root, "participants");
       const files = participantFileSnapshot(this.store.root);
-      // smarty-dev#10391: the plan reads every host, participant and handoff row. Planned inside the
-      // transaction it held state.db's write lock for the whole scan on every presence pass. It is planned
-      // first on the committed state at a recorded revision; the transaction uses it only when the change
-      // feed proves no host, participant or handoff row changed since and the participant directory stamp is
-      // unchanged, so it still decides on the snapshot it commits on (security review rounds 2/3, F1/F2).
-      // A stale plan rolls back and plans again; the last attempt, a backend without a revision view, and
-      // the first complete pass while recovery is pending (whose replay must run on the transaction's
-      // snapshot) plan inside, as before. A repeated partial pass may use an early plan without replay.
-      const early = (this.#recovered || (partial && this.#hasCommittedPass)) &&
-        attempt < MIRROR_PLAN_ATTEMPTS - 1 ? this.store.stateView() : undefined;
-      // Handoffs consult all leases when deciding whether a native identity has reappeared.
+      const early = this.store.stateView();
+      // Handoffs consult every lease when deciding whether a native identity has reappeared.
       const judgesLeaseLiveness = early !== undefined && early.view.listAll(BRIDGE_HANDOFF_PREFIX).length > 0;
-      const planned = early && !halted() ? compute(early.view, files) : undefined;
+      const leaseStampBefore = early ? hostLeaseDirectoryStamp(this.store.root) : undefined;
+      const planned = early && !halted() ? compute(early.view, files, judgesLeaseLiveness) : undefined;
+      const leaseStampAfter = early ? hostLeaseDirectoryStamp(this.store.root) : undefined;
+      if (early && planned && (leaseStampBefore === undefined || leaseStampBefore !== leaseStampAfter)) continue;
+      const leaseStamp = early && planned ? leaseStampAfter : undefined;
       const plan = this.#outbox.plan();
       this.#skippedRoots = skippedRoots;
       try {
         await this.store.writeBatch({
           identity: this.#identity(),
           lockClass: "bridge",
+          lockTiming: early
+            ? { operation: "bridge-presence-mirror", preparePhase: "mirror-revalidate", commitPhase: "mirror-commit" }
+            : { operation: "bridge-presence-mirror", phase: "mirror-fallback" },
           ops: [],
           // Admission, reservations and CAS all observe ONE authoritative snapshot under the
           // write lock. No native takeover can fit between that observation and this commit
@@ -1851,35 +1842,18 @@ export class StoreBridgeSide implements BridgeSide {
             const sameFiles = meshDirectoryStamp(this.store.root, "participants") === filesStamp;
             let result: ReturnType<typeof compute>;
             if (early && planned && sameFiles && this.store.stateUnchangedSince(early.revision, HELD_STATE_PREFIXES)) {
-              // Lease files are outside state.db, so the plan's state revision cannot prove them
-              // unchanged. When a lease can affect this plan, read the current lease map under the
-              // fence and ALWAYS compare the complete consulted digest, regardless of directory
-              // stamps. Handoffs consult every lease; otherwise raw presence identifiers select
-              // the digest. With no consulted lease, do no in-fence lease scan.
-              // The topology entries themselves come from the early raw scan: stateUnchangedSince
-              // proves that snapshot is still current, avoiding a full topology scan in the fence.
-              const needsLeaseValidation = judgesLeaseLiveness || consultedLeaseIdentifiers.size > 0;
-              const currentLeases = needsLeaseValidation ? readHostLeases(this.store.root) : planned.judged.leases;
-              const leaseStable = !needsLeaseValidation || leaseIncarnationDigest(planned.judged.leases, judgesLeaseLiveness) ===
-                leaseIncarnationDigest(currentLeases, judgesLeaseLiveness);
-              if (!leaseStable || (judgesLeaseLiveness && !sameLeaseLiveness(planned.judged.leases, planned.judged.now, this.now()))) {
+              // No lease JSON is read under writer custody: atomic lease-file entry mutations change
+              // this cheap directory/version stamp, so any authority or collision change retries outside.
+              if (leaseStamp === undefined || hostLeaseDirectoryStamp(this.store.root) !== leaseStamp ||
+                (judgesLeaseLiveness && !leaseLivenessUnchanged(planned.judged.livenessWindow, this.now()))) {
                 throw new MirrorPlanStale();
               }
-              // State revision and participant-file stamp prove the topology inputs are unchanged;
-              // the digest above proves the only external protection input (consulted leases) is too.
-              // Rewalking the whole topology under SQLite's prepare fence would add O(topology) lock time.
               result = planned;
             } else if (early) throw new MirrorPlanStale();
             else {
+              // Non-SQLite backends have no revision view; retain their existing synchronous fence path.
               const participantFiles = sameFiles ? files : participantFileSnapshot(this.store.root);
-              // Refuse stale presence BEFORE recovery can touch any lease file. A successful
-              // preflight then replays on this same transaction's snapshot and recomputes, so
-              // recovered lease authority participates in admission and handoff judgments too.
-              result = compute(view, participantFiles);
-              if (!partial && !this.#recovered && result && view.listAll(this.#outbox.prefix).length > 0) {
-                plan.replay(view);
-                result = compute(view, participantFiles);
-              }
+              result = compute(view, participantFiles, false);
             }
             if (!result) return plan.stage([], []);
             // Cap sampled authority at its ORIGINAL translated source deadline after the lock wait.
@@ -1912,10 +1886,17 @@ export class StoreBridgeSide implements BridgeSide {
                 !skippedRoots.has(row.payload.rootId);
             });
           },
-          // After the commit, on the committed owner, never a fresh per-record state read.
-          // Partial snapshots may commit admitted lease updates, but must neither replay nor retry
-          // any prior unlease effect until a complete snapshot can authorize withdrawal.
-          afterCommit: (view) => {
+          ...(early && planned ? { beforeCommit: () => {
+            if (meshDirectoryStamp(this.store.root, "participants") !== filesStamp || leaseStamp === undefined ||
+              hostLeaseDirectoryStamp(this.store.root) !== leaseStamp ||
+              (judgesLeaseLiveness && !leaseLivenessUnchanged(planned.judged.livenessWindow, this.now()))) {
+              throw new MirrorPlanStale();
+            }
+          } } : {}),
+          // File effects are idempotent, durable outbox work and run after SQLite releases its writer lock.
+          // Partial snapshots may apply admitted leases, but cannot replay or retry an unlease until a
+          // complete snapshot authorizes withdrawal.
+          commitOutbox: ({ view }) => {
             if (!partial) { plan.run(view, halted); return; }
             let allowedLeaseEffects = 0;
             plan.run(view, () => {

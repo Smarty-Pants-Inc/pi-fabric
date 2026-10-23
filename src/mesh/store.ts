@@ -6,6 +6,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { delay, MeshLock, type MeshStoreContext } from "./mesh-lock.js";
+import type { LockTimingContext } from "./commit-stats.js";
 import { isNamespaceRace } from "../core/atomic-write.js";
 import { acquireMeshCustodyLock, withMeshCustody } from "./custody-lock.js";
 import type { MeshReadOptions, MeshStateEntry, MeshBatchResult, MeshBatchView } from "./state-file.js";
@@ -581,10 +582,10 @@ export class MeshStore {
     return event;
   }
 
-  async publishBatch(inputs: MeshPublishInput[]): Promise<MeshEvent[]> {
+  async publishBatch(inputs: MeshPublishInput[], lockTiming?: LockTimingContext): Promise<MeshEvent[]> {
     const stamped = inputs.map((input) => ({ ...input, sender: input.sender ?? processSender() }));
     if (this.#scheduleDue()) await this.releaseDueSchedules().catch(() => undefined);
-    const events = await this.#events.publishBatch(stamped);
+    const events = await this.#events.publishBatch(stamped, lockTiming);
     await this.#wakeAfterPublish(events);
     return events;
   }
@@ -985,8 +986,8 @@ export class MeshStore {
    * The R20 write fence (StateBackend.withWriteFence): `operation` runs synchronously while no state
    * commit can happen. Only with `.lock` held or no lock at all: never take `.lock` inside it.
    */
-  withStateWriteFence<T>(operation: () => T): T {
-    return this.#state.withWriteFence(operation);
+  withStateWriteFence<T>(operation: () => T, timing?: LockTimingContext): T {
+    return this.#state.withWriteFence(operation, timing);
   }
 
   stateStamp(): string | undefined {

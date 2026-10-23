@@ -611,6 +611,26 @@ export const hostLeasesStamp = (meshRoot: string): string | undefined => {
   }
 };
 
+/** Cheap mutation stamp for a mirror plan: no lease JSON is opened or parsed. Every supported
+ * lease writer replaces or removes a directory entry atomically. POSIX directory metadata is one
+ * stat; Windows requires an entry listing and metadata-only stat of each lease file. */
+export const hostLeaseDirectoryStamp = (meshRoot: string): string | undefined => {
+  const dir = path.join(meshRoot, LEASE_DIR);
+  try {
+    if (process.platform !== "win32") {
+      const stat = fs.statSync(dir, { bigint: true });
+      return `${stat.dev}:${stat.ino}:${stat.mtimeNs}:${stat.ctimeNs}`;
+    }
+    return fs.readdirSync(dir).filter(name => name.endsWith(".json")).sort().map(name => {
+      const stat = fs.statSync(path.join(dir, name), { bigint: true });
+      return `${name}:${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
+    }).join("|");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code === "ENOENT") return "absent";
+    return undefined;
+  }
+};
+
 /** One host's file lease, from the same cache; for a single-participant lookup. */
 export const readHostLease = (meshRoot: string, hostId: string): FabricHostLease | undefined =>
   readHostLeaseSnapshot(meshRoot, hostId)?.lease;

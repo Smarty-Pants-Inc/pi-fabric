@@ -214,7 +214,7 @@ export class CommitOutbox {
     await this.mesh.writeBatch({
       identity: this.identity,
       ops: [],
-      afterCommit: (view) => {
+      commitOutbox: ({ view }) => {
         for (const entry of view.listAll(this.prefix)) {
           const stored = rowOf(entry.value);
           if (!stored || stored.scope !== this.scope) continue;
@@ -242,7 +242,7 @@ export class CommitOutbox {
   }
 
   /** `stamp`: the recording a staged effect ran; the row is retired only if it still holds that one.
-   * A newer same-key recording committed before this (late) afterCommit stays pending (smarty-dev#7023). */
+   * A newer same-key recording committed before this late post-commit effect stays pending (smarty-dev#7023). */
   #execute(row: string, kind: string, payload: unknown, view: MeshBatchView, replay: boolean, stamp?: string): boolean {
     const handler = this.handlers[kind];
     // An unknown kind belongs to another release of this writer: leave its row alone.

@@ -157,7 +157,7 @@ describe("owner-matched unlease (smarty-dev#6477 L2b owner review, P2)", () => {
     // Only the mirror's own batch (recovery of earlier rows runs as usual).
     const spy = vi.spyOn(hub, "writeBatch").mockImplementation(async (input) => {
       if (input.lockClass !== "bridge") return writeBatch(input);
-      const { afterCommit: _dropped, ...rest } = input;
+      const { commitOutbox: _dropped, ...rest } = input;
       return writeBatch(rest);
     });
     await side.mirror({ hosts: [], participants: [] });
@@ -205,7 +205,7 @@ describe("owner-matched unlease (smarty-dev#6477 L2b owner review, P2)", () => {
 });
 
 describe("stale lease effect after a replacement mirror (pi-fabric#640 review round 2)", () => {
-  it("overlapping SQLite bridge writers: the stale afterCommit keeps the replacement's lease and liveness", async () => {
+  it("overlapping SQLite bridge writers: the stale outbox effect keeps the replacement's lease and liveness", async () => {
     const hub = store("sqlite");
     expect(hub.stateBackend).toBe("sqlite");
     // A second writer for the same peer, through another connection to the same database.
@@ -221,16 +221,18 @@ describe("stale lease effect after a replacement mirror (pi-fabric#640 review ro
     let staleEffects = 0;
     const writeBatch = hub.writeBatch.bind(hub);
     vi.spyOn(hub, "writeBatch").mockImplementation(async (input) => {
-      if (input.lockClass !== "bridge" || !input.afterCommit) return writeBatch(input);
-      const { afterCommit, ...rest } = input;
-      // The first writer commits its mirror; before its effect reacquires the store, the second
+      if (input.lockClass !== "bridge" || !input.commitOutbox) return writeBatch(input);
+      const { commitOutbox, ...rest } = input;
+      let replayStale: (() => void) | undefined;
+      // The first writer commits its mirror; before its deferred effect runs, the second
       // writer installs the replacement mirror and writes its lease.
-      const results = await writeBatch(rest);
+      const results = await writeBatch({ ...rest, commitOutbox: (effects) => { replayStale = () => commitOutbox(effects); } });
       await replacing.mirror({ hosts: [{ record: restarted, expiresAt: now + 60_000 }], participants: [peer.participant] });
       replacementLease = readHostLease(hub.root, peer.identity.id);
       expect(replacementLease?.startedAt).toBe(restarted.startedAt);
-      // The stale effect then runs on the committed state, which now holds the replacement.
-      await writeBatch({ identity: bridgeIdentity, ops: [], afterCommit: (view) => { staleEffects += 1; afterCommit(view); } });
+      // The stale effect then runs on the original committed snapshot, after the replacement.
+      replayStale?.();
+      staleEffects += 1;
       return results;
     });
     await stale.mirror(peer.presence);
@@ -265,15 +267,17 @@ describe("out-of-order live lease effects of one incarnation (smarty-dev#6939)",
     let olderEffects = 0;
     const writeBatch = hub.writeBatch.bind(hub);
     vi.spyOn(hub, "writeBatch").mockImplementation(async (input) => {
-      if (input.lockClass !== "bridge" || !input.afterCommit) return writeBatch(input);
-      const { afterCommit, ...rest } = input;
+      if (input.lockClass !== "bridge" || !input.commitOutbox) return writeBatch(input);
+      const { commitOutbox, ...rest } = input;
+      let replayOlder: (() => void) | undefined;
       // The older batch commits; before its effect runs, the newer batch commits and writes its lease.
-      const results = await writeBatch(rest);
+      const results = await writeBatch({ ...rest, commitOutbox: (effects) => { replayOlder = () => commitOutbox(effects); } });
       await newer.mirror({ hosts: [{ record: peer.host, expiresAt: now + 14_000 }], participants: [peer.participant] });
       newerLease = readHostLease(hub.root, peer.identity.id);
       expect(newerLease).toMatchObject({ startedAt: peer.host.startedAt, expiresAt: now + 14_000 });
-      // The older effect runs last, on a state that still holds the same incarnation.
-      await writeBatch({ identity: bridgeIdentity, ops: [], afterCommit: (view) => { olderEffects += 1; afterCommit(view); } });
+      // The older effect runs last, on its original snapshot, while the same incarnation is held.
+      replayOlder?.();
+      olderEffects += 1;
       return results;
     });
     const writes = vi.spyOn(fs, "renameSync");
@@ -323,10 +327,11 @@ describe("legacy outbox rows without an incarnation (pi-fabric#640 review round 
     // A lease file without an incarnation, whose state record is absent.
     const unstamped = { id: gone.identity.id, rootId: gone.identity.id, identityId: gone.identity.id, updatedAt: now, expiresAt: now + 60_000 };
     writeHostLease(hub.root, unstamped);
-    // Only the replay runs effects: this pass's own afterCommit is dropped.
+    // Only recovery runs effects: this pass's own commitOutbox is dropped.
     const writeBatch = hub.writeBatch.bind(hub);
     vi.spyOn(hub, "writeBatch").mockImplementation(async (input) => {
-      const { afterCommit: _dropped, ...rest } = input;
+      if (input.lockClass !== "bridge") return writeBatch(input);
+      const { commitOutbox: _dropped, ...rest } = input;
       return writeBatch(rest);
     });
     const writes = vi.spyOn(fs, "renameSync");

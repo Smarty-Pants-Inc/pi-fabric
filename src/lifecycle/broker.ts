@@ -86,6 +86,8 @@ export class LifecycleBroker {
   readonly #unsaved = new Map<string, number>();
   /** Accepted delivery is never replayed to recover a storage receipt. */
   readonly #delivered = new Map<string, { entry: MeshStateEntry; subscription: FabricLifecycleSubscription }>();
+  /** Canonical entries only: target ownership/liveness and delivery gates are still read every drain. */
+  #subscriptions: { revision: string; entries: readonly MeshStateEntry[] } | undefined;
 
   constructor(
     readonly mesh: MeshStore,
@@ -424,8 +426,24 @@ export class LifecycleBroker {
     }
   }
 
-  async #drain(): Promise<void> {
+  #subscriptionEntries(): readonly MeshStateEntry[] {
+    // Capture BEFORE the listing/any awaited delivery. A state-only remote join during a drain
+    // must invalidate its entries on the next wake, even if the event log did not change.
+    const revision = this.mesh.stateRevision();
+    const cached = this.#subscriptions;
+    if (revision !== undefined && cached &&
+        this.mesh.stateUnchangedSince(cached.revision, [FABRIC_LIFECYCLE_SUBSCRIPTION_PREFIX])) {
+      this.#subscriptions = { revision, entries: cached.entries };
+      return cached.entries;
+    }
+    // Other backends, unknown revisions and a trimmed/gapped feed all retain the canonical scan.
     const entries = this.mesh.listAll(FABRIC_LIFECYCLE_SUBSCRIPTION_PREFIX);
+    this.#subscriptions = revision === undefined ? undefined : { revision, entries };
+    return entries;
+  }
+
+  async #drain(): Promise<void> {
+    const entries = this.#subscriptionEntries();
     const listed = new Set<string>();
     let latestSequence: number | undefined;
     // One directory rebuild serves every subscription in this cycle that still
@@ -433,7 +451,8 @@ export class LifecycleBroker {
     let directory: Map<string, FabricParticipantInfo> | undefined;
     for (const entry of entries) {
       if (this.options.canConsumeMesh?.() === false) { this.#dirty = true; return; }
-      const subscription = lifecycleSubscriptionFromValue(entry.value);
+      // The parser returns its input. Keep cached canonical values private from delivery handlers.
+      const subscription = lifecycleSubscriptionFromValue(structuredClone(entry.value));
       if (!subscription || entry.key !== subscriptionKey(subscription.id)) continue;
       listed.add(subscription.id);
       if (this.#delivered.has(subscription.id)) {

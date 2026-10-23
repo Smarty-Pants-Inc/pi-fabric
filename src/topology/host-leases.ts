@@ -8,7 +8,7 @@ import { watchBridgeStore } from "../mesh/change-notifier.js";
 import { FabricPeerLeaseStaleError, PEER_LEASE_WAIT_MS } from "../agents/peer-lease-stale.js";
 import type { MeshStateEntry } from "../mesh/store.js";
 import { TransportUnavailableError, type TransportKv, type TransportKvEntry, type TransportOwner } from "../transport/types.js";
-import { HostLeaseLockBusyError, HostLeaseLockLostError, withHostLeaseLock, type HostLeaseLockOptions, type HostLeaseMesh } from "./host-lease-lock.js";
+import { HostLeaseLockBusyError, HostLeaseLockLostError, hostLeaseAdditionsGatePath, withHostLeaseFileCustody, withHostLeaseLock, type HostLeaseLockOptions, type HostLeaseMesh } from "./host-lease-lock.js";
 
 // Host lease renewals outside the shared state (smarty-dev#816). Every heartbeat rewrote the
 // whole shared state under the one mesh lock, and heartbeats were 78% of all locked writes. Each
@@ -267,6 +267,22 @@ const fileName = (hostId: string): string =>
 export const hostLeasePath = (meshRoot: string, hostId: string): string =>
   path.join(meshRoot, LEASE_DIR, fileName(hostId));
 
+/** Holds the additions namespace and every existing per-host lease gate in path order.
+ * Call before reading lease JSON; additions are blocked by the namespace gate and replacements
+ * are blocked by their target gate until the caller releases custody after COMMIT. */
+export const withHostLeaseDirectoryCustody = async <T>(mesh: HostLeaseMesh,
+  operation: () => T | Promise<T>): Promise<T> => mesh.leaseCustody(hostLeaseAdditionsGatePath(mesh.root), async () => {
+  const directory = path.join(mesh.root, LEASE_DIR);
+  let names: string[];
+  try { names = fs.readdirSync(directory).filter(name => /^[0-9a-f]{32}\.json$/.test(name)).sort(); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") names = []; else throw error; }
+  const files = names.map(name => path.join(directory, name));
+  const acquire = (index: number): Promise<T> => index === files.length
+    ? Promise.resolve().then(operation)
+    : mesh.leaseCustody(files[index]!, () => acquire(index + 1));
+  return acquire(0);
+});
+
 export const writeHostLease = (meshRoot: string, lease: FabricHostLease): void =>
   writeJsonAtomic(hostLeasePath(meshRoot, lease.id), { format: 1, ...lease });
 
@@ -443,6 +459,17 @@ export const removeOwnedHostLease = async (mesh: HostLeaseMesh, owner: FabricHos
 /** The exact observed renewal version, including deadlines/session metadata, not only its UUID. */
 export const sameHostLeaseVersion = (left: FabricHostLease | undefined, right: FabricHostLease | undefined): boolean =>
   JSON.stringify(left) === JSON.stringify(right);
+
+/** Exact-version atomic replacement. Caller holds the target lease-custody gate through this check/write. */
+export const writeHostLeaseVersionIf = (meshRoot: string, expected: FabricHostLease | undefined,
+  replacement: FabricHostLease): boolean => {
+  if (expected && expected.id !== replacement.id) return false;
+  const file = hostLeasePath(meshRoot, replacement.id);
+  const current = readHostLeaseCurrent(meshRoot, replacement.id);
+  if (!sameHostLeaseVersion(current, expected) || (!current && fs.existsSync(file))) return false;
+  writeHostLease(meshRoot, replacement);
+  return true;
+};
 
 /** Reaper compare-and-delete. Caller holds the TARGET's leaseCustody gate, as renew/claim do.
  * The detached-file check also keeps an unfenced historical replacement rather than unlinking it. */

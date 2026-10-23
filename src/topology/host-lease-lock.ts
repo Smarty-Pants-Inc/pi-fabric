@@ -10,6 +10,23 @@ export interface HostLeaseMesh {
   readonly root: string;
   leaseCustody<T>(file: string, operation: () => T | Promise<T>, timeoutMs?: number, options?: { ownIncarnation?: string | undefined }): Promise<T>;
 }
+
+export const hostLeaseAdditionsGatePath = (root: string): string => path.join(root, "host-leases", ".additions");
+
+/** Lease namespace custody blocks new filenames while a mirror brackets its directory snapshot.
+ * Existing renewals need only their per-host gate. A creator takes additions before its host gate;
+ * if a prior removal races the initial existence check, retry in that same stable order. */
+export const withHostLeaseFileCustody = async <T>(mesh: HostLeaseMesh, file: string,
+  operation: () => T | Promise<T>, timeoutMs = 0, options: { ownIncarnation?: string | undefined } = {}): Promise<T> => {
+  const target = () => mesh.leaseCustody(file, operation, timeoutMs, options);
+  if (!fs.existsSync(file)) return mesh.leaseCustody(hostLeaseAdditionsGatePath(mesh.root), target, timeoutMs, options);
+  let missing = false;
+  const current = await mesh.leaseCustody(file, () => {
+    if (!fs.existsSync(file)) { missing = true; return undefined; }
+    return operation();
+  }, timeoutMs, options);
+  return missing ? mesh.leaseCustody(hostLeaseAdditionsGatePath(mesh.root), target, timeoutMs, options) : current as T;
+};
 export interface HostLeaseLockOptions {
   signal?: AbortSignal;
   ownIncarnation?: string | undefined;
@@ -101,7 +118,7 @@ export const withHostLeaseLock = async <T>(mesh: HostLeaseMesh, file: string,
     let acquired = false, enteredCustody = false, seen: string | undefined;
     let value!: T;
     try {
-      await mesh.leaseCustody(file, () => {
+      await withHostLeaseFileCustody(mesh, file, () => {
         enteredCustody = true;
         options.signal?.throwIfAborted();
         const staging = fs.mkdtempSync(`${lock}.pending-`);

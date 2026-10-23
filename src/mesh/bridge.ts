@@ -7,11 +7,12 @@ import fs from "node:fs";
 import path from "node:path";
 import type { Readable, Writable } from "node:stream";
 import { ownProcessIncarnation, readPhysicalHostIdentity, readFileRetrying, writeFileAtomic, writeJsonAtomic } from "../core/atomic-write.js";
-import { type BridgeLeaseProcess, type FabricHostLease, type FabricMirrorLease, MIRROR_FRESH_MS, hostLeaseExpiry, hostLeasePath, hostLiveness, hostLeaseDirectoryStamp, readHostLease, readHostLeases, removeHostLeaseIf, STATE_LEASE_RENEW_MS, writeHostLease } from "../topology/host-leases.js";
+import { type BridgeLeaseProcess, type FabricHostLease, type FabricMirrorLease, MIRROR_FRESH_MS, hostLeaseExpiry, hostLeasePath, hostLiveness, hostLeaseDirectoryStamp, readHostLease, readHostLeaseCurrent, readHostLeases, removeHostLeaseIf, sameHostLeaseVersion, STATE_LEASE_RENEW_MS, withHostLeaseDirectoryCustody, writeHostLeaseVersionIf } from "../topology/host-leases.js";
+import { withHostLeaseFileCustody } from "../topology/host-lease-lock.js";
 import { meshDirectoryStamp } from "../topology/publication-generation.js";
 import type { FabricHostRecord, FabricParticipantRecord } from "../topology/types.js";
 import { ROOT_ID_PREFIX } from "../topology/root-inbox-shared.js";
-import { participantFilePresent, readParticipantFiles } from "../topology/participant-files.js";
+import { participantFilePresent, readParticipantFiles, withParticipantFileDirectoryCustody } from "../topology/participant-files.js";
 import { FABRIC_MESH_OUTAGE_ALARM_TOPIC, isMeshAlarmTarget, meshCursorGeneration, type MeshBatchOperation, type MeshBatchView, type MeshEvent, type MeshIdentity, type MeshPublishInput, type MeshStateEntry, type MeshStore } from "./store.js";
 import { CommitOutbox, type CommitOutboxEffect } from "./commit-outbox.js";
 import { assertBridgeStateBackend, isMeshRetryableBusy, isMeshStateWalCap } from "./state-backend.js";
@@ -533,6 +534,12 @@ export const BRIDGE_HANDOFF_PREFIX = "topology/handoffs/";
 const HELD_STATE_PREFIXES = [HOST_PREFIX, PARTICIPANT_PREFIX, BRIDGE_HANDOFF_PREFIX] as const;
 /** #mirror: bounded optimistic snapshot/lease-stamp validations before a retryable refusal. */
 const MIRROR_PLAN_ATTEMPTS = 3;
+// SQLite mirror batches have at most 64 topology operations, 64 outbox rows, and 16 retirements
+// (144 total). Each host row's lease effect stays durable in the same commit. The file backend
+// retains its single-writer batch; both backends apply effects only after releasing snapshot custody.
+const MIRROR_STATE_BATCH_SIZE = 64;
+const MIRROR_EFFECT_BATCH_SIZE = 64;
+const MIRROR_RETIRE_BATCH_SIZE = 16;
 /** A mirror plan made before the transaction no longer matches its snapshot: roll back, plan again. */
 class MirrorPlanStale extends Error {}
 /** #heldFence: pre-check attempts before the full check runs inside the fence. */
@@ -592,7 +599,7 @@ const leaseLivenessWindow = (leases: ReadonlyMap<string, FabricHostLease>, at: n
     const deadline = Math.max(lease.expiresAt, lease.session?.expiresAt ?? Number.NEGATIVE_INFINITY,
       lease.reloadUntil ?? Number.NEGATIVE_INFINITY);
     if (deadline < at) after = Math.max(after, deadline);
-    else if (deadline > at) through = Math.min(through, deadline);
+    else if (deadline >= at) through = Math.min(through, deadline);
   }
   return { after, through };
 };
@@ -667,7 +674,7 @@ interface BridgeLease { id: string; rootId: string; identityId: string; updatedA
  * A removed mirror's lease identity, as its lease file carries it (root, identity, start and token).
  * A row without root, identity and incarnation (an older release's) proves no owner: it removes nothing.
  */
-interface BridgeUnlease { key: string; id: string; rootId?: string; identityId?: string; startedAt?: number; incarnationToken?: string }
+interface BridgeUnlease { key: string; id: string; version?: number; rootId?: string; identityId?: string; startedAt?: number; incarnationToken?: string }
 
 const incarnationOf = (record: { startedAt?: unknown; incarnationToken?: unknown }): { startedAt?: number; incarnationToken?: string } => ({
   ...(typeof record.startedAt === "number" && Number.isFinite(record.startedAt) ? { startedAt: record.startedAt } : {}),
@@ -772,18 +779,25 @@ export class StoreBridgeSide implements BridgeSide {
       if (rootId && this.#skippedRoots?.has(rootId)) throw new Error("Skipped root lease effect deferred");
     };
     this.#outbox = new CommitOutbox(store, `bridge/${peer}`, this.#identity(), {
-      lease: (lease: BridgeLease, view, replay) => { retainSkipped(lease.rootId); this.#applyLease(lease, view, replay); },
+      lease: (lease: BridgeLease, _view, replay) => { retainSkipped(lease.rootId); this.#applyLease(lease, replay); },
       // A removal (live or replayed) unlinks only the removed mirror's own lease: a replacement
       // owner that wrote its file lease before its state record keeps it (L2b owner review, P2).
-      unlease: (gone: BridgeUnlease, view) => {
+      unlease: (gone: BridgeUnlease) => {
         retainSkipped(gone.rootId);
-        if (view.get(gone.key) || typeof gone.rootId !== "string" || typeof gone.identityId !== "string" ||
+        if (this.store.get(gone.key, { fresh: true }) || typeof gone.rootId !== "string" || typeof gone.identityId !== "string" ||
           typeof gone.startedAt !== "number") return;
-        // A lease without an incarnation is a mirror lease of an earlier release (or a writer from
-        // before lease incarnations): root and identity decide it, as before.
-        removeHostLeaseIf(this.store.root, gone.id, (lease) => lease.id === gone.id && lease.rootId === gone.rootId &&
-          lease.identityId === gone.identityId && lease.incarnationToken === gone.incarnationToken &&
-          (lease.startedAt === undefined || lease.startedAt === gone.startedAt));
+        const onDisk = readHostLeaseCurrent(this.store.root, gone.id);
+        if (!onDisk || onDisk.rootId !== gone.rootId || onDisk.identityId !== gone.identityId ||
+            onDisk.incarnationToken !== gone.incarnationToken || (onDisk.startedAt !== undefined && onDisk.startedAt !== gone.startedAt)) return;
+        // Recheck the current owner/version immediately before exact-version removal. The target
+        // host gate remains held, so native claim/renew and another mirror cannot cross this fence.
+        if (this.store.get(gone.key, { fresh: true })) return;
+        removeHostLeaseIf(this.store.root, gone.id, lease => sameHostLeaseVersion(lease, onDisk));
+      },
+    }, {
+      withEffectCustody: (_kind, payload, operation) => {
+        const id = isObject(payload) && typeof payload.id === "string" ? payload.id : undefined;
+        return id ? withHostLeaseFileCustody(this.store, hostLeasePath(this.store.root, id), operation) : operation();
       },
     });
   }
@@ -1480,14 +1494,15 @@ export class StoreBridgeSide implements BridgeSide {
     })()) : undefined;
     // Replay a committed outbox outside the SQLite writer lock before the first complete plan.
     // Its file effects are idempotent and the rows remain durable until the next state commit retires them.
-    if (!partial && !this.#recovered) await this.#outbox.recover();
+    if (!partial && !this.#recovered) await this.#outbox.recover(halted);
     let leases: BridgeLease[] = [];
     let removed: BridgeUnlease[] = [];
-    // One idempotency key per host: a later lease write or removal supersedes an earlier one.
-    const effects = (): CommitOutboxEffect[] => [
-      ...leases.map((lease) => ({ kind: "lease", key: `lease:${lease.id}`, payload: lease })),
-      ...removed.map((gone) => ({ kind: "unlease", key: `lease:${gone.id}`, payload: gone })),
-    ];
+    // Each state batch durably stages its file effects. Defer applying them until all topology
+    // rows are committed, so newly-created lease files do not inflate every later custody scan.
+    const stagedEffects = new Set<string>();
+    const pendingEffects: Array<{ plan: ReturnType<CommitOutbox["plan"]>; view: MeshBatchView }> = [];
+    const mirrorStateBatchSize = this.store.stateBackend === "sqlite" ? MIRROR_STATE_BATCH_SIZE : Number.MAX_SAFE_INTEGER;
+    const mirrorEffectBatchSize = this.store.stateBackend === "sqlite" ? MIRROR_EFFECT_BATCH_SIZE : Number.MAX_SAFE_INTEGER;
     // A trusted hub can carry a stale projection from another link. That projection is
     // non-authoritative: keep the destination's newer mirror and let unrelated roots in this
     // same pass proceed. The set spans plan retries so one root produces one warning per pass.
@@ -1800,8 +1815,8 @@ export class StoreBridgeSide implements BridgeSide {
           if (key.startsWith(HOST_PREFIX) && isObject(value) && typeof value.id === "string") {
             const gone = hostOf(key, value);
             removed.push(gone
-              ? { key, id: gone.id, rootId: gone.rootId, identityId: gone.identity.id, ...incarnationOf(gone) }
-              : { key, id: value.id });
+              ? { key, id: gone.id, version, rootId: gone.rootId, identityId: gone.identity.id, ...incarnationOf(gone) }
+              : { key, id: value.id, version });
           }
           ops.push({ kind: "delete", key, ifVersion: version, onConflict: "skip" });
         }
@@ -1810,109 +1825,140 @@ export class StoreBridgeSide implements BridgeSide {
         return { ops, leases, removed, judged: livenessSensitive
           ? { livenessWindow: leaseLivenessWindow(scan.leases, scan.now) } : {} };
     };
-    for (let attempt = 0; ; attempt += 1) {
-      if (attempt >= MIRROR_PLAN_ATTEMPTS) throw new MeshSnapshotRetriesExhaustedError(attempt);
-      // Participant and lease inputs are read outside state.db custody. Their cheap mutation stamps
-      // are checked under the write fence and once more at the commit boundary.
-      const filesStamp = meshDirectoryStamp(this.store.root, "participants");
-      const files = participantFileSnapshot(this.store.root);
-      const early = this.store.stateView();
-      // Handoffs consult every lease when deciding whether a native identity has reappeared.
-      const judgesLeaseLiveness = early !== undefined && early.view.listAll(BRIDGE_HANDOFF_PREFIX).length > 0;
-      const leaseStampBefore = early ? hostLeaseDirectoryStamp(this.store.root) : undefined;
-      const planned = early && !halted() ? compute(early.view, files, judgesLeaseLiveness) : undefined;
-      const leaseStampAfter = early ? hostLeaseDirectoryStamp(this.store.root) : undefined;
-      if (early && planned && (leaseStampBefore === undefined || leaseStampBefore !== leaseStampAfter)) continue;
-      const leaseStamp = early && planned ? leaseStampAfter : undefined;
-      const plan = this.#outbox.plan();
+    for (;;) {
+      let retries = 0;
+      let more = false;
+      let committedView: MeshBatchView | undefined;
+      let plan: ReturnType<CommitOutbox["plan"]> | undefined;
+      let stagedKeys: string[] = [];
+      for (;;) {
+        if (retries >= MIRROR_PLAN_ATTEMPTS) throw new MeshSnapshotRetriesExhaustedError(retries);
+        committedView = undefined;
+        stagedKeys = [];
+        more = false;
+        plan = this.#outbox.plan();
+        this.#skippedRoots = skippedRoots;
+        try {
+          // Stable cross-namespace order: host lease additions + every extant per-host lease gate,
+          // then participant namespace + every extant per-file gate. Writers use the same gates.
+          // They cover only one bounded commit at a time, never the event-loop yielding effects.
+          await withHostLeaseDirectoryCustody(this.store, () => withParticipantFileDirectoryCustody(this.store, async () => {
+            const filesStamp = meshDirectoryStamp(this.store.root, "participants");
+            const files = participantFileSnapshot(this.store.root);
+            const early = this.store.stateView();
+            const judgesLeaseLiveness = early !== undefined && early.view.listAll(BRIDGE_HANDOFF_PREFIX).length > 0;
+            const leaseStampBefore = early ? hostLeaseDirectoryStamp(this.store.root) : undefined;
+            const planned = early && !halted() ? compute(early.view, files, judgesLeaseLiveness) : undefined;
+            const leaseStampAfter = early ? hostLeaseDirectoryStamp(this.store.root) : undefined;
+            if (early && planned && (leaseStampBefore === undefined || leaseStampBefore !== leaseStampAfter)) throw new MirrorPlanStale();
+            const leaseStamp = early && planned ? leaseStampAfter : undefined;
+            await this.store.writeBatch({
+              identity: this.#identity(),
+              lockClass: "bridge",
+              lockTiming: early
+                ? { operation: "bridge-presence-mirror", preparePhase: "mirror-revalidate", commitPhase: "mirror-commit" }
+                : { operation: "bridge-presence-mirror", phase: "mirror-fallback" },
+              ops: [],
+              prepare: (view) => {
+                if (halted()) return plan!.stage([], []);
+                const sameFiles = meshDirectoryStamp(this.store.root, "participants") === filesStamp;
+                let result: ReturnType<typeof compute>;
+                if (early && planned && sameFiles && this.store.stateUnchangedSince(early.revision, HELD_STATE_PREFIXES)) {
+                  if (leaseStamp === undefined || hostLeaseDirectoryStamp(this.store.root) !== leaseStamp ||
+                    (judgesLeaseLiveness && !leaseLivenessUnchanged(planned.judged.livenessWindow, this.now()))) throw new MirrorPlanStale();
+                  result = planned;
+                } else if (early) throw new MirrorPlanStale();
+                else {
+                  const participantFiles = sameFiles ? files : participantFileSnapshot(this.store.root);
+                  result = compute(view, participantFiles, false);
+                }
+                if (!result) return plan!.stage([], []);
+                const deadlines = new Map<string, number>();
+                leases = result.leases.map(lease => {
+                  const sample = lease.mirror;
+                  if (!sample) return lease;
+                  const origin = sample.observedAt + Math.min(BRIDGE_LEASE_MS, sample.sourceExpiresAt - sample.sourceObservedAt);
+                  const until = Math.min(lease.expiresAt, origin);
+                  deadlines.set(keyFor(HOST_PREFIX, lease.id), until);
+                  return { ...lease, expiresAt: until };
+                });
+                removed = result.removed;
+                const fullOps = deadlines.size === 0 ? result.ops : result.ops.map(op => {
+                  const until = op.kind === "put" ? deadlines.get(op.key) : undefined;
+                  return op.kind === "put" && until !== undefined && isObject(op.value)
+                    ? { ...op, value: { ...op.value, expiresAt: until } } : op;
+                });
+                const stateOps = fullOps.slice(0, mirrorStateBatchSize);
+                const stateKeys = new Set(stateOps.map(op => op.key));
+                let batchLeases = leases.filter(lease => stateKeys.has(keyFor(HOST_PREFIX, lease.id)) &&
+                  !stagedEffects.has(`lease:${lease.id}`));
+                const batchUnleases = removed.filter(gone => stateKeys.has(gone.key) &&
+                  !stagedEffects.has(`unlease:${gone.key}`));
+                // Once all row writes/removals are committed, renew unchanged lease files in
+                // bounded durable outbox batches too. That keeps first-mirror readiness explicit.
+                if (stateOps.length === 0) batchLeases = leases.filter(lease => !stagedEffects.has(`lease:${lease.id}`))
+                  .slice(0, mirrorEffectBatchSize);
+                const batchEffects: CommitOutboxEffect[] = [
+                  ...batchLeases.map(lease => ({ kind: "lease", key: `lease:${lease.id}`, payload: lease })),
+                  ...batchUnleases.map(gone => ({ kind: "unlease", key: `lease:${gone.id}`, payload: gone })),
+                ];
+                stagedKeys = [
+                  ...batchLeases.map(lease => `lease:${lease.id}`),
+                  ...batchUnleases.map(gone => `unlease:${gone.key}`),
+                ];
+                const batchEffectKeys = new Set(stagedKeys);
+                more = fullOps.length > stateOps.length ||
+                  leases.some(lease => !stagedEffects.has(`lease:${lease.id}`) && !batchEffectKeys.has(`lease:${lease.id}`)) ||
+                  removed.some(gone => !stagedEffects.has(`unlease:${gone.key}`) && !batchEffectKeys.has(`unlease:${gone.key}`));
+                const staged = plan!.stage(stateOps, batchEffects, {
+                  durable: stateOps.length === 0 && batchEffects.length > 0,
+                  maxRetire: MIRROR_RETIRE_BATCH_SIZE,
+                });
+                return staged.filter(op => {
+                  if (op.kind !== "delete" || !op.key.startsWith(this.#outbox.prefix)) return true;
+                  const row = view.get(op.key)?.value;
+                  return !isObject(row) || !isObject(row.payload) || typeof row.payload.rootId !== "string" ||
+                    !skippedRoots.has(row.payload.rootId);
+                });
+              },
+              ...(early && planned ? { beforeCommit: () => {
+                if (meshDirectoryStamp(this.store.root, "participants") !== filesStamp || leaseStamp === undefined ||
+                  hostLeaseDirectoryStamp(this.store.root) !== leaseStamp ||
+                  (judgesLeaseLiveness && !leaseLivenessUnchanged(planned.judged.livenessWindow, this.now()))) throw new MirrorPlanStale();
+              } } : {}),
+              commitOutbox: ({ view }) => { committedView = view; },
+            });
+          }));
+          break;
+        } catch (error) {
+          this.#skippedRoots = undefined;
+          if (error instanceof MirrorPlanStale) { retries += 1; continue; }
+          throw error;
+        } finally {
+          this.#skippedRoots = undefined;
+        }
+      }
+      if (partial && committedView && plan) {
+        this.#skippedRoots = skippedRoots;
+        try { await plan.runAsync(committedView, halted); }
+        finally { this.#skippedRoots = undefined; }
+      } else if (committedView && plan) pendingEffects.push({ plan, view: committedView });
+      if (halted()) break;
+      for (const key of stagedKeys) stagedEffects.add(key);
+      if (!more) break;
+      await new Promise<void>(resolve => setImmediate(resolve));
+    }
+    if (!partial && !halted()) {
+      // Effects are durable in the row commits above. Apply each batch's effects only after the
+      // last topology batch; the stored views keep per-batch stamp checks, and runAsync yields
+      // between bounded effect batches without an extra state transaction or early retirement.
       this.#skippedRoots = skippedRoots;
       try {
-        await this.store.writeBatch({
-          identity: this.#identity(),
-          lockClass: "bridge",
-          lockTiming: early
-            ? { operation: "bridge-presence-mirror", preparePhase: "mirror-revalidate", commitPhase: "mirror-commit" }
-            : { operation: "bridge-presence-mirror", phase: "mirror-fallback" },
-          ops: [],
-          // Admission, reservations and CAS all observe ONE authoritative snapshot under the
-          // write lock. No native takeover can fit between that observation and this commit
-          // (security review rounds 2/3, F1/F2), including recreation over retained tombstones.
-          prepare: (view) => {
-            if (halted()) return plan.stage([], []);
-            const sameFiles = meshDirectoryStamp(this.store.root, "participants") === filesStamp;
-            let result: ReturnType<typeof compute>;
-            if (early && planned && sameFiles && this.store.stateUnchangedSince(early.revision, HELD_STATE_PREFIXES)) {
-              // No lease JSON is read under writer custody: atomic lease-file entry mutations change
-              // this cheap directory/version stamp, so any authority or collision change retries outside.
-              if (leaseStamp === undefined || hostLeaseDirectoryStamp(this.store.root) !== leaseStamp ||
-                (judgesLeaseLiveness && !leaseLivenessUnchanged(planned.judged.livenessWindow, this.now()))) {
-                throw new MirrorPlanStale();
-              }
-              result = planned;
-            } else if (early) throw new MirrorPlanStale();
-            else {
-              // Non-SQLite backends have no revision view; retain their existing synchronous fence path.
-              const participantFiles = sameFiles ? files : participantFileSnapshot(this.store.root);
-              result = compute(view, participantFiles, false);
-            }
-            if (!result) return plan.stage([], []);
-            // Cap sampled authority at its ORIGINAL translated source deadline after the lock wait.
-            // A sample that expired during the wait stays expired; neither its observation nor its
-            // authority is renewed by committing it (#10068; independent review P2).
-            const deadlines = new Map<string, number>();
-            leases = result.leases.map((lease) => {
-              const sample = lease.mirror;
-              if (!sample) return lease;
-              const origin = sample.observedAt + Math.min(BRIDGE_LEASE_MS, sample.sourceExpiresAt - sample.sourceObservedAt);
-              const until = Math.min(lease.expiresAt, origin);
-              deadlines.set(keyFor(HOST_PREFIX, lease.id), until);
-              return { ...lease, expiresAt: until };
-            });
-            removed = result.removed;
-            // The changed host row, when this pass writes one, carries the lease's own deadline.
-            const ops = deadlines.size === 0 ? result.ops : result.ops.map((op) => {
-              const until = op.kind === "put" ? deadlines.get(op.key) : undefined;
-              return op.kind === "put" && until !== undefined && isObject(op.value)
-                ? { ...op, value: { ...op.value, expiresAt: until } } : op;
-            });
-            // A changing commit records its lease effects in the same commit; a lease-only renewal
-            // commits nothing, records nothing and loses nothing in a crash (the next pass redoes it).
-            return plan.stage(ops, effects()).filter(op => {
-              // An effect completed on a previous pass may still await retirement. A skipped
-              // root preserves even that pending row; unrelated retirement still proceeds.
-              if (op.kind !== "delete" || !op.key.startsWith(this.#outbox.prefix)) return true;
-              const row = view.get(op.key)?.value;
-              return !isObject(row) || !isObject(row.payload) || typeof row.payload.rootId !== "string" ||
-                !skippedRoots.has(row.payload.rootId);
-            });
-          },
-          ...(early && planned ? { beforeCommit: () => {
-            if (meshDirectoryStamp(this.store.root, "participants") !== filesStamp || leaseStamp === undefined ||
-              hostLeaseDirectoryStamp(this.store.root) !== leaseStamp ||
-              (judgesLeaseLiveness && !leaseLivenessUnchanged(planned.judged.livenessWindow, this.now()))) {
-              throw new MirrorPlanStale();
-            }
-          } } : {}),
-          // File effects are idempotent, durable outbox work and run after SQLite releases its writer lock.
-          // Partial snapshots may apply admitted leases, but cannot replay or retry an unlease until a
-          // complete snapshot authorizes withdrawal.
-          commitOutbox: ({ view }) => {
-            if (!partial) { plan.run(view, halted); return; }
-            let allowedLeaseEffects = 0;
-            plan.run(view, () => {
-              if (halted()) return true;
-              if (allowedLeaseEffects < leases.length) { allowedLeaseEffects += 1; return false; }
-              return true;
-            });
-          },
-        });
-      } catch (error) {
-        if (error instanceof MirrorPlanStale) continue;
-        throw error;
-      } finally {
-        this.#skippedRoots = undefined;
-      }
-      break;
+        for (const pending of pendingEffects) {
+          if (halted()) break;
+          await pending.plan.runAsync(pending.view, halted);
+        }
+      } finally { this.#skippedRoots = undefined; }
     }
     if (!final) {
       this.#hasCommittedPass = true;
@@ -1921,8 +1967,11 @@ export class StoreBridgeSide implements BridgeSide {
     }
   }
 
-  #applyLease(lease: BridgeLease, view: MeshBatchView, replay: boolean): void {
-    const entry = view.get(keyFor(HOST_PREFIX, lease.id));
+  #applyLease(lease: BridgeLease, replay: boolean): void {
+    // The target lease gate is held by CommitOutbox. This fresh row/version and the staged row
+    // stamp are checked after custody, never on the pre-commit snapshot.
+    const key = keyFor(HOST_PREFIX, lease.id);
+    const entry = this.store.get(key, { fresh: true });
     const held = entry && mirrorLinkOf(entry.value) === this.peer ? hostOf(entry.key, entry.value) : undefined;
     if (!held || held.identity.id !== lease.identityId || held.rootId !== lease.rootId) return;
     // Only the incarnation the lease was planned for: an overlapping writer may have installed a
@@ -1937,7 +1986,7 @@ export class StoreBridgeSide implements BridgeSide {
     const sourceDeadline = sample ? sample.observedAt +
       Math.min(BRIDGE_LEASE_MS, sample.sourceExpiresAt - sample.sourceObservedAt) : undefined;
     if (sourceDeadline !== undefined) lease = { ...lease, expiresAt: Math.min(lease.expiresAt, sourceDeadline) };
-    const onDisk = readHostLease(this.store.root, lease.id);
+    const onDisk = readHostLeaseCurrent(this.store.root, lease.id);
     // Recovery must not erase newer file authority while its state row is still catching up.
     if (onDisk?.rootId === lease.rootId) {
       // Disk history is local proof that this outbox token was superseded. An old recovery
@@ -1982,7 +2031,14 @@ export class StoreBridgeSide implements BridgeSide {
         JSON.stringify(onDisk.mirror) === JSON.stringify(repaired.mirror) &&
         JSON.stringify(history.tokens) === JSON.stringify(bridgeSupersededTokensOf(onDisk.bridgeSupersededTokens)) &&
         JSON.stringify(history.seen) === JSON.stringify(bridgeSupersededSeenOf(onDisk.bridgeSupersededTokenSeen))) return;
-    writeHostLease(this.store.root, repaired);
+    const current = this.store.get(key, { fresh: true });
+    if (!entry || !current || current.version !== entry.version || mirrorLinkOf(current.value) !== this.peer) return;
+    const currentHost = hostOf(current.key, current.value);
+    if (!currentHost || currentHost.rootId !== lease.rootId || currentHost.identity.id !== lease.identityId ||
+        currentHost.startedAt !== lease.startedAt || currentHost.incarnationToken !== lease.incarnationToken) return;
+    // Exact file-version CAS under the same per-host gate; a superseding renewal cannot be
+    // overwritten between the current-owner/version check and the atomic replacement.
+    writeHostLeaseVersionIf(this.store.root, onDisk, repaired);
   }
 
   async bridgedIds(after: number): Promise<BridgedIds> {

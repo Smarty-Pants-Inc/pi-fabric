@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { COMMIT_OUTBOX_PREFIX, CommitOutbox, withStateFence } from "../src/mesh/commit-outbox.js";
-import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
+import { MeshStore, type MeshBatchView, type MeshIdentity } from "../src/mesh/store.js";
 import { MeshStateWalCapError } from "../src/mesh/state-sqlite.js";
 import { MeshBackgroundRetry } from "../src/core/atomic-write.js";
 
@@ -180,6 +180,31 @@ describe("CommitOutbox", () => {
     }
   });
 
+  it("checks the exact staged row stamp after asynchronous custody is acquired", async () => {
+    const mesh = store();
+    const log: string[] = [];
+    let custodyChecks = 0;
+    const outbox = new CommitOutbox(mesh, "scope-async-stamp", identity, effects(log), {
+      withEffectCustody: async (_kind, _payload, operation) => {
+        custodyChecks += 1;
+        expect((mesh.get(outbox.rowKey("same"), { fresh: true })?.value as { payload: { n: number } }).payload.n).toBe(2);
+        await Promise.resolve();
+        operation();
+      },
+    });
+    const older = outbox.plan();
+    let olderView!: import("../src/mesh/store.js").MeshBatchView;
+    await mesh.writeBatch({ identity, ops: [], prepare: () => older.stage([{ kind: "put", key: "subject/1", value: 1 }],
+      [{ kind: "touch", key: "same", payload: { n: 1 } }]), commitOutbox: ({ view }) => { olderView = view; } });
+    const newer = outbox.plan();
+    await mesh.writeBatch({ identity, ops: [], prepare: () => newer.stage([{ kind: "put", key: "subject/2", value: 2 }],
+      [{ kind: "touch", key: "same", payload: { n: 2 } }]), commitOutbox: () => {} });
+    expect(await older.runAsync(olderView)).toBe(0);
+    expect(custodyChecks).toBe(1);
+    expect(log).toEqual([]);
+    expect((mesh.get(outbox.rowKey("same"), { fresh: true })?.value as { payload: { n: number } }).payload.n).toBe(2);
+  });
+
   it.each(["file", "sqlite"] as const)("a late older afterCommit leaves a newer same-key row pending; a crash before its effect replays it once (%s, smarty-dev#7023)", async (backend) => {
     const root = meshRoot();
     const mesh = new MeshStore(root, 64 * 1024, 100, { stateBackend: backend });
@@ -195,9 +220,10 @@ describe("CommitOutbox", () => {
       await commit(2, "same");
       const newer = mesh.get(outbox.rowKey("same"), { fresh: true });
       expect((newer?.value as { payload: { n: number } }).payload.n).toBe(2);
-      // The older afterCommit runs late, on a view that already holds the newer row.
-      await mesh.writeBatch({ identity, ops: [], afterCommit: (view) => { expect(older.run(view)).toBe(1); } });
-      expect(log).toEqual(["1"]);
+      // The older afterCommit runs late, on a view that already holds the newer row; its exact
+      // staged stamp no longer owns the effect, so it must not run or retire the replacement.
+      await mesh.writeBatch({ identity, ops: [], afterCommit: async view => { expect(await older.runAsync(view)).toBe(0); } });
+      expect(log).toEqual([]);
       expect(outbox.retiring).toBe(0);
       // A later batch commits and retires what ran: the newer row must survive it.
       const later = outbox.plan();
@@ -214,7 +240,7 @@ describe("CommitOutbox", () => {
       const restarted = new CommitOutbox(reopened, "scope-late", identity, effects(log));
       expect(await restarted.recover()).toBe(1);
       expect(await restarted.recover()).toBe(0);
-      expect(log).toEqual(["1", "3", "2:replay"]);
+      expect(log).toEqual(["3", "2:replay"]);
       expect(reopened.listAll(restarted.prefix, { fresh: true })).toEqual([]);
     } finally {
       reopened.closeState();
@@ -227,9 +253,11 @@ describe("CommitOutbox", () => {
     const outbox = new CommitOutbox(mesh, "bounded-retire", identity, effects(log));
     try {
       const plan = outbox.plan();
+      let committedView!: MeshBatchView;
       await mesh.writeBatch({ identity, ops: [], prepare: () => plan.stage([], Array.from({ length: 137 }, (_, n) => ({
         kind: "touch", key: `k${n}`, payload: { n },
-      })), { durable: true }), afterCommit: view => { plan.run(view); } });
+      })), { durable: true }), commitOutbox: ({ view }) => { committedView = view; } });
+      await plan.runAsync(committedView);
       const original = mesh.writeBatch.bind(mesh), sizes: number[] = [];
       const batch = vi.spyOn(mesh, "writeBatch").mockImplementation(async input => {
         sizes.push(input.ops.length);

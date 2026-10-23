@@ -1251,28 +1251,15 @@ export class ParticipantDirectory implements FabricParticipantSource {
     while (!view.ready) await view.whenChanged(this.options.identity.id, signal);
   }
 
-  // An exit before close() finished withdrawing (a /quit or SIGTERM that ends the process
-  // while close waits for a busy mesh lock, or a shutdown step that threw first) must not
-  // leave this host fresh: synchronously drop its lease file so its records expire with
-  // the stored lease, as close() would (smarty-dev#6622). A published reload keeps both, but
-  // only when its withdrawal committed: otherwise the reload lease would keep stale child or
-  // legacy entries alive after the process is gone (smarty-dev#6622, review round 2). A close()
-  // still awaiting its withdrawal has not committed either (round 4).
+  // Abrupt exit cannot await the host-qualified lease-custody gate. Do not mutate the lease
+  // unguarded from Node's synchronous `exit` event; the persisted deadline is the fail-closed
+  // cleanup if close() did not complete its fenced withdrawal.
   #installExitHook(): void {
     this.#withdrawn = false;
     this.#withdrawalFailed = false;
     this.#withdrawalPending = false;
     if (this.#exitHook) return;
-    this.#exitHook = () => {
-      if (this.#withdrawn || !this.options.enabled) return;
-      if (this.#reloadPublished && !this.#withdrawalFailed && !this.#withdrawalPending) return;
-      try {
-        // Only this incarnation's lease, by its UUID receipt rather than a repeatable start
-        // time: a reloaded or superseding successor keeps the lease it wrote.
-        const owner = this.#leaseOwner();
-        removeHostLeaseIf(this.mesh.root, this.options.hostId, (lease) => sameHostLeaseOwner(lease, owner));
-      } catch { /* Best-effort exit cleanup. */ }
-    };
+    this.#exitHook = () => undefined;
     process.once("exit", this.#exitHook);
   }
 

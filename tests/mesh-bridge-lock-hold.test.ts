@@ -345,6 +345,7 @@ describe("bridge catch-up SQLite write-lock holds (smarty-dev#10391), real store
   // judge every lease the same, or the plan runs again. Both directions; the clock is the side's own.
   it.each([
     ["expires", 0, 20_000, true],
+    ["is exactly at the deadline", 10_000, 10_001, true],
     ["becomes live (clock back)", 20_000, 0, false],
   ] as const)("mirror plan: a native lease that %s before the transaction re-plans", async (_name, planAt, txAt, kept) => {
     const hub = store();

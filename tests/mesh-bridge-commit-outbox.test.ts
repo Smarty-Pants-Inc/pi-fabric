@@ -6,12 +6,13 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { BridgeOwnershipError, StoreBridgeSide, type BridgePublish } from "../src/mesh/bridge.js";
 import { CommitOutbox } from "../src/mesh/commit-outbox.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
-import { hostLiveness, readHostLease, readHostLeases, writeHostLease } from "../src/topology/host-leases.js";
-import { writeParticipantFile } from "../src/topology/participant-files.js";
+import { hostLiveness, hostLeasePath, readHostLease, readHostLeases, writeHostLease } from "../src/topology/host-leases.js";
+import { hostLeaseAdditionsGatePath, withHostLeaseFileCustody } from "../src/topology/host-lease-lock.js";
+import { readParticipantFile, writeParticipantFileIf } from "../src/topology/participant-files.js";
 import type { FabricHostRecord, FabricParticipantRecord } from "../src/topology/types.js";
 
-// smarty-dev#6477 L2b (R11): the bridge mirror's host-lease effects run after its state commit from
-// rows recorded in that commit, and its participant-file reads happen before the transaction.
+// smarty-dev#6477 L2b (R11): mirror state batches durably record host-lease effects, apply them
+// after the topology batches, and capture participant files before each transaction.
 const roots: string[] = [];
 afterEach(() => {
   vi.restoreAllMocks();
@@ -68,10 +69,11 @@ describe("bridge mirror commit outbox", () => {
     expect(readHostLease(hub.root, peer.identity.id)?.identityId).toBe(peer.identity.id);
     const rows = new CommitOutbox(hub, "bridge/ryzen2", bridgeIdentity, {});
     expect(batches[0]!.keys).toContain(rows.rowKey(`lease:${peer.identity.id}`));
-    // A lease-only renewal commits nothing and records nothing; it still renews the lease file.
+    // A lease-only effect uses a bounded durable outbox row, so a crash before its file write
+    // leaves fail-closed replay work even though the state topology itself did not change.
     fs.rmSync(path.join(hub.root, "host-leases"), { recursive: true, force: true });
     await side.mirror(peer.presence);
-    expect(batches[1]!.keys).toEqual([]);
+    expect(batches[1]!.keys).toContain(rows.rowKey(`lease:${peer.identity.id}`));
     expect(readHostLease(hub.root, peer.identity.id)).toBeDefined();
   });
 
@@ -132,21 +134,106 @@ describe("bridge mirror commit outbox", () => {
       .toEqual([expect.objectContaining({ kind: "unlease", key: `lease:${peer.identity.id}` })]);
   });
 
-  it("reads participant files before the transaction and again only when their directory moved", async () => {
-    const hub = store();
+  it("holds lease and participant namespace custody from the input snapshot through COMMIT", async () => {
+    const hub = store("sqlite");
     const now = Date.now();
     const peer = remote("epsilon", now);
     const side = new StoreBridgeSide(hub, "ryzen2");
-    // A native file for the same id lands between the pre-read and the commit: the stamp moved,
-    // so the transaction reads again and the mirror never covers the native.
+    let entered!: () => void;
+    let release!: () => void;
+    const atWriteBatch = new Promise<void>(resolve => { entered = resolve; });
+    const holdWriteBatch = new Promise<void>(resolve => { release = resolve; });
     const writeBatch = hub.writeBatch.bind(hub);
-    vi.spyOn(hub, "writeBatch").mockImplementationOnce(async (input) => {
-      writeParticipantFile(hub.root, { key: participantKey(peer.identity.id), version: 1, updatedAt: now, updatedBy: peer.identity,
-        value: { ...peer.participant } });
+    vi.spyOn(hub, "writeBatch").mockImplementationOnce(async input => {
+      entered();
+      await holdWriteBatch;
       return writeBatch(input);
     });
-    await side.mirror(peer.presence);
-    expect(hub.get(participantKey(peer.identity.id), { fresh: true })).toBeUndefined();
+    const mirroring = side.mirror(peer.presence);
+    await atWriteBatch;
+
+    // Both are legal writers using the same gates as production. They must wait until the
+    // mirror's file/state snapshot has committed; neither can sneak in after capture but before
+    // the SQL transaction's prepare/COMMIT boundary.
+    let leaseWriterEntered = false;
+    let participantWriterEntered = false;
+    const replacement = { ...peer.host, startedAt: now + 10_000, updatedAt: now + 10_000 };
+    const leaseWriter = withHostLeaseFileCustody(hub, hostLeasePath(hub.root, peer.identity.id), async () => {
+      leaseWriterEntered = true;
+      expect(hub.get(hostKey(peer.identity.id), { fresh: true })?.value).toMatchObject({ remoteHost: "ryzen2" });
+      writeHostLease(hub.root, { id: peer.identity.id, rootId: peer.identity.id, identityId: peer.identity.id,
+        startedAt: replacement.startedAt, updatedAt: replacement.updatedAt, expiresAt: now + 60_000 });
+      await hub.put({ key: hostKey(peer.identity.id), identity: peer.identity, value: replacement });
+    }, 5_000);
+    const participantWriter = writeParticipantFileIf(hub, participantKey(peer.identity.id), () => {
+      participantWriterEntered = true;
+      expect(hub.get(participantKey(peer.identity.id), { fresh: true })?.value).toMatchObject({ remoteHost: "ryzen2" });
+      return { key: participantKey(peer.identity.id), version: 1, updatedAt: now + 1, updatedBy: peer.identity,
+        value: { ...peer.participant, status: "running", updatedAt: now + 1 } };
+    });
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(leaseWriterEntered).toBe(false);
+    expect(participantWriterEntered).toBe(false);
+    release();
+    await Promise.all([mirroring, leaseWriter, participantWriter]);
+    expect(leaseWriterEntered).toBe(true);
+    expect(participantWriterEntered).toBe(true);
+    expect(hub.get(hostKey(peer.identity.id), { fresh: true })?.value).toMatchObject({ startedAt: replacement.startedAt });
+    expect(readHostLease(hub.root, peer.identity.id)?.startedAt).toBe(replacement.startedAt);
+    expect(readParticipantFile(hub.root, participantKey(peer.identity.id))?.value).toMatchObject({ status: "running" });
+  });
+
+  it("batches a large first mirror, yields between batches, and releases SQLite for heartbeats", async () => {
+    const hub = store("sqlite");
+    const now = Date.now();
+    const peers = Array.from({ length: 80 }, (_, index) => remote(`batch-${index}`, now));
+    const presence = { hosts: peers.flatMap(peer => peer.presence.hosts),
+      participants: peers.flatMap(peer => peer.presence.participants) };
+    const side = new StoreBridgeSide(hub, "ryzen2", () => now);
+    const original = hub.writeBatch.bind(hub);
+    const batchSizes: number[] = [];
+    let bridgeBatches = 0;
+    let heartbeatDone = false;
+    let firstCommitted!: () => void;
+    let releaseFirst!: () => void;
+    const firstBridgeCommit = new Promise<void>(resolve => { firstCommitted = resolve; });
+    const waitForHeartbeat = new Promise<void>(resolve => { releaseFirst = resolve; });
+    let heartbeatBeforeSecond = false;
+    vi.spyOn(hub, "writeBatch").mockImplementation(async input => {
+      if (input.lockClass !== "bridge" || !input.prepare) return original(input);
+      const ordinal = ++bridgeBatches;
+      if (ordinal === 2) {
+        heartbeatBeforeSecond = heartbeatDone;
+        const first = peers[0]!;
+        const rows = new CommitOutbox(hub, "bridge/ryzen2", bridgeIdentity, {});
+        expect(hub.get(hostKey(first.identity.id), { fresh: true })).toBeDefined();
+        expect(hub.get(rows.rowKey(`lease:${first.identity.id}`), { fresh: true })).toBeDefined();
+        // The row commit is visible but the file effect is still pending, so liveness fails closed.
+        expect(readHostLease(hub.root, first.identity.id)).toBeUndefined();
+      }
+      const prepare = input.prepare;
+      const result = await original({ ...input, prepare: view => {
+        const ops = prepare(view);
+        batchSizes.push(ops.length);
+        return ops;
+      } });
+      if (ordinal === 1) { firstCommitted(); await waitForHeartbeat; }
+      return result;
+    });
+    const mirror = side.mirror(presence);
+    await firstBridgeCommit;
+    const heartbeat = hub.put({ key: "heartbeat/concurrent", identity: bridgeIdentity, value: { at: now } })
+      .then(() => { heartbeatDone = true; releaseFirst(); });
+    await Promise.all([mirror, heartbeat]);
+    expect(heartbeatBeforeSecond).toBe(true);
+    expect(bridgeBatches).toBeGreaterThan(1);
+    expect(Math.max(...batchSizes)).toBeLessThanOrEqual(144);
+    for (const peer of peers) {
+      expect(hub.get(hostKey(peer.identity.id), { fresh: true })).toBeDefined();
+      expect(hub.get(participantKey(peer.identity.id), { fresh: true })).toBeDefined();
+      expect(readHostLease(hub.root, peer.identity.id)).toBeDefined();
+    }
+    expect(hub.get("heartbeat/concurrent", { fresh: true })?.value).toEqual({ at: now });
   });
 });
 
@@ -218,25 +305,29 @@ describe("stale lease effect after a replacement mirror (pi-fabric#640 review ro
     const stale = new StoreBridgeSide(hub, "ryzen2");
     const replacing = new StoreBridgeSide(other, "ryzen2");
     let replacementLease: ReturnType<typeof readHostLease>;
-    let staleEffects = 0;
+    let staleCommitted = false;
+    let replacementStarted = false;
     const writeBatch = hub.writeBatch.bind(hub);
-    vi.spyOn(hub, "writeBatch").mockImplementation(async (input) => {
-      if (input.lockClass !== "bridge" || !input.commitOutbox) return writeBatch(input);
-      const { commitOutbox, ...rest } = input;
-      let replayStale: (() => void) | undefined;
-      // The first writer commits its mirror; before its deferred effect runs, the second
-      // writer installs the replacement mirror and writes its lease.
-      const results = await writeBatch({ ...rest, commitOutbox: (effects) => { replayStale = () => commitOutbox(effects); } });
-      await replacing.mirror({ hosts: [{ record: restarted, expiresAt: now + 60_000 }], participants: [peer.participant] });
-      replacementLease = readHostLease(hub.root, peer.identity.id);
-      expect(replacementLease?.startedAt).toBe(restarted.startedAt);
-      // The stale effect then runs on the original committed snapshot, after the replacement.
-      replayStale?.();
-      staleEffects += 1;
-      return results;
+    vi.spyOn(hub, "writeBatch").mockImplementation(async input => {
+      const result = await writeBatch(input);
+      if (input.lockClass === "bridge") staleCommitted = true;
+      return result;
+    });
+    const leaseCustody = hub.leaseCustody.bind(hub);
+    vi.spyOn(hub, "leaseCustody").mockImplementation(async (file, operation, timeoutMs, options) => {
+      // The stale commit's directory custody has been released by the time its async effect
+      // reacquires the additions gate. Install a replacement row/stamp in that gap.
+      if (staleCommitted && !replacementStarted &&
+          (file === hostLeaseAdditionsGatePath(hub.root) || file === hostLeasePath(hub.root, peer.identity.id))) {
+        replacementStarted = true;
+        await replacing.mirror({ hosts: [{ record: restarted, expiresAt: now + 60_000 }], participants: [peer.participant] });
+        replacementLease = readHostLease(hub.root, peer.identity.id);
+        expect(replacementLease?.startedAt).toBe(restarted.startedAt);
+      }
+      return leaseCustody(file, operation, timeoutMs, options);
     });
     await stale.mirror(peer.presence);
-    expect(staleEffects).toBe(1);
+    expect(replacementStarted).toBe(true);
     const entry = hub.get(hostKey(peer.identity.id), { fresh: true });
     expect(entry?.value).toMatchObject({ startedAt: restarted.startedAt, remoteHost: "ryzen2" });
     // The replacement's lease survives the stale effect...
@@ -250,43 +341,27 @@ describe("stale lease effect after a replacement mirror (pi-fabric#640 review ro
   });
 });
 
-describe("out-of-order live lease effects of one incarnation (smarty-dev#6939)", () => {
-  it("concurrent SQLite mirror batches: the older effect, run last, never shortens the newer lease", async () => {
+describe("same-incarnation live lease effects (smarty-dev#6939)", () => {
+  it("serialized SQLite mirrors preserve the later lease deadline", async () => {
     const hub = store("sqlite");
     expect(hub.stateBackend).toBe("sqlite");
     const other = new MeshStore(hub.root, 64 * 1024, 100, { stateBackend: "sqlite" });
     opened.push(other);
     const now = Date.now();
     const peer = remote("xi", now);
-    // Two writers for the same peer, host and incarnation, through two connections to one database.
     const older = new StoreBridgeSide(hub, "ryzen2", () => now);
     const newer = new StoreBridgeSide(other, "ryzen2", () => now);
-    // The newer writer has nothing to recover: only live effects run below.
     await newer.mirror({ hosts: [], participants: [] });
-    let newerLease: ReturnType<typeof readHostLease>;
-    let olderEffects = 0;
-    const writeBatch = hub.writeBatch.bind(hub);
-    vi.spyOn(hub, "writeBatch").mockImplementation(async (input) => {
-      if (input.lockClass !== "bridge" || !input.commitOutbox) return writeBatch(input);
-      const { commitOutbox, ...rest } = input;
-      let replayOlder: (() => void) | undefined;
-      // The older batch commits; before its effect runs, the newer batch commits and writes its lease.
-      const results = await writeBatch({ ...rest, commitOutbox: (effects) => { replayOlder = () => commitOutbox(effects); } });
-      await newer.mirror({ hosts: [{ record: peer.host, expiresAt: now + 14_000 }], participants: [peer.participant] });
-      newerLease = readHostLease(hub.root, peer.identity.id);
-      expect(newerLease).toMatchObject({ startedAt: peer.host.startedAt, expiresAt: now + 14_000 });
-      // The older effect runs last, on its original snapshot, while the same incarnation is held.
-      replayOlder?.();
-      olderEffects += 1;
-      return results;
-    });
     const writes = vi.spyOn(fs, "renameSync");
     await older.mirror({ hosts: [{ record: peer.host, expiresAt: now + 8_000 }], participants: [peer.participant] });
-    expect(olderEffects).toBe(1);
-    expect(hub.get(hostKey(peer.identity.id), { fresh: true })?.value).toMatchObject({ startedAt: peer.host.startedAt, remoteHost: "ryzen2" });
-    // The newer lease and its expiry survive; the older effect wrote no lease file.
+    expect(readHostLease(hub.root, peer.identity.id)?.expiresAt).toBe(now + 8_000);
+    await newer.mirror({ hosts: [{ record: peer.host, expiresAt: now + 14_000 }], participants: [peer.participant] });
+    const newerLease = readHostLease(hub.root, peer.identity.id);
+    expect(newerLease).toMatchObject({ startedAt: peer.host.startedAt, expiresAt: now + 14_000 });
+    expect(hub.get(hostKey(peer.identity.id), { fresh: true })?.value)
+      .toMatchObject({ startedAt: peer.host.startedAt, remoteHost: "ryzen2" });
     expect(readHostLease(hub.root, peer.identity.id)).toEqual(newerLease);
-    expect(writes.mock.calls.filter(([, to]) => leaseWrite(String(to)))).toHaveLength(1);
+    expect(writes.mock.calls.filter(([, to]) => leaseWrite(String(to)))).toHaveLength(2);
   });
 
   it("a live effect still replaces a later-expiring lease of another incarnation", async () => {

@@ -195,6 +195,29 @@ const waitFor = async (check: () => boolean): Promise<void> => {
   expect(check()).toBe(true);
 };
 
+describe("bridge startup lock-timeout retry", () => {
+  it("retries a remote agent's first mirror lock timeout without restarting the bridge", async () => {
+    let agent!: StoreBridgeSide;
+    const { hub, far, bridge, logs } = setup(undefined, { agent: store => agent = new StoreBridgeSide(store, "dev1") });
+    const lane = await addRoot(hub, "startup-lane");
+    await addRoot(far, "startup-agent");
+    const original = agent.mirror.bind(agent);
+    const attempts: number[] = [];
+    vi.spyOn(agent, "mirror").mockImplementation(async (...args) => {
+      attempts.push(Date.now());
+      if (attempts.length === 1) throw lockTimeout();
+      return original(...args);
+    });
+    try {
+      await bridge.start();
+      expect(attempts).toHaveLength(2);
+      expect(attempts[1]! - attempts[0]!).toBeGreaterThanOrEqual(80);
+      expect(logs.filter(line => line.includes("bridge startup") && line.includes("retrying"))).toHaveLength(1);
+      expect(far.get(`topology/hosts/${hash(lane.hostId)}`)?.value).toMatchObject({ id: lane.hostId, remoteHost: "dev1" });
+    } finally { await bridge.stop(); }
+  });
+});
+
 // smarty-dev#2129: use the real directory writer, not a state entry moved by hand.
 describe("real participant directory over a pipe", () => {
   const native = async (store: MeshStore, mode: "files" | "both") => {
@@ -1194,6 +1217,37 @@ describe("mesh bridge", () => {
     let d: number | undefined;
     for (let i = 0; i < 8; i += 1) { d = walCapRetryDelay(d); seq.push(d); }
     expect(seq).toEqual([1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000, 30_000]);
+  });
+
+  it("re-arms presence after an idle post-link-up lock-timeout before the half-lease deadline", async () => {
+    const failed = lockTimeout();
+    const mirrorAt: number[] = [];
+    const { bridge, debugs } = setup(undefined, {
+      local: (store, peer) => {
+        const side = new StoreBridgeSide(store, peer);
+        const mirror = side.mirror.bind(side);
+        side.mirror = async (presence, observedAt, fromHub) => {
+          mirrorAt.push(Date.now());
+          if (mirrorAt.length === 2) throw failed;
+          return mirror(presence, observedAt, fromHub);
+        };
+        return side;
+      },
+    });
+    const running = bridge.run();
+    try {
+      await waitForCondition(() => mirrorAt.length === 1 && debugs.some(line => line.startsWith("presence sync: settled")),
+        2_000, "link-up presence completed");
+      // Link-up left both sides idle with no expiring hosts to drive another sync.
+      await new Promise(resolve => setTimeout(resolve, 20));
+      await expect(bridge.syncPresence()).rejects.toBe(failed);
+      const failedAt = mirrorAt[1]!;
+      await waitForCondition(() => mirrorAt.length >= 3, 2_000, "re-armed presence retry");
+      expect(mirrorAt[2]! - failedAt).toBeLessThanOrEqual(BRIDGE_LEASE_MS / 2);
+    } finally {
+      await bridge.stop();
+      await running;
+    }
   });
 
   it.each([new Error("Timed out waiting for the Fabric mesh lock"), Object.assign(new Error("unauthorized"), { code: "DENIED" })])(

@@ -61,8 +61,9 @@ export interface CommitOutboxEffect {
 
 /** Runs one effect. `view` is the committed state. `replay` is true for a row recovered after a
  * crash or retried after a failure: it may be older than files written since, so a handler must
- * never let it regress them. Must be synchronous and must not call the store's writers. */
+ * never let it regress them. Synchronous handlers must not call the store's writers. */
 export type CommitOutboxHandler = (payload: any, view: MeshBatchView, replay: boolean) => void;
+export type CommitOutboxAsyncHandler = (payload: any, view: MeshBatchView, replay: boolean) => void | Promise<void>;
 
 /** `stamp` names the exact recording: an afterCommit retires the row only while it still holds it. */
 interface OutboxRow { format: 1; scope: string; kind: string; key: string; payload: unknown; recordedAt: number; stamp?: string }
@@ -97,9 +98,13 @@ export interface CommitOutboxPlan {
    * how many effects ran.
    */
   replay(view: MeshBatchView): number;
+  /** Asynchronous equivalent for effects that must not block the writer's event loop. */
+  replayAsync(view: MeshBatchView): Promise<number>;
   /** For the same batch's `afterCommit`: runs this plan's effects, then retries failed rows.
    * Returns how many of this plan's effects ran. */
   run(view: MeshBatchView, halted?: () => boolean): number;
+  /** Asynchronous equivalent for post-commit effects; no state lock is held while it runs. */
+  runAsync(view: MeshBatchView, halted?: () => boolean): Promise<number>;
 }
 
 type StagedEffect = { row: string; effect: CommitOutboxEffect; stamp: string };
@@ -118,6 +123,7 @@ export class CommitOutbox {
     readonly scope: string,
     readonly identity: MeshIdentity,
     readonly handlers: Readonly<Record<string, CommitOutboxHandler>>,
+    readonly asyncHandlers: Readonly<Record<string, CommitOutboxAsyncHandler>> = {},
   ) {
     this.prefix = `${COMMIT_OUTBOX_PREFIX}${digest(scope).slice(0, 32)}/`;
   }
@@ -147,6 +153,16 @@ export class CommitOutbox {
         replayed ||= count > 0;
         return count;
       },
+      replayAsync: async (view) => {
+        let count = 0;
+        for (const entry of view.listAll(this.prefix)) {
+          const stored = rowOf(entry.value);
+          if (!stored || stored.scope !== this.scope) continue;
+          if (await this.#executeAsync(entry.key, stored.kind, stored.payload, view, true)) count += 1;
+        }
+        replayed ||= count > 0;
+        return count;
+      },
       stage: (ops, effects, options = {}) => {
         // Replayed rows are deleted in this batch even when it has nothing else to commit.
         const result = this.#stage(ops, effects, replayed ? { ...options, durable: true } : options);
@@ -158,6 +174,11 @@ export class CommitOutbox {
         if (ran) return 0;
         ran = true;
         return this.#run(staged, view, halted);
+      },
+      runAsync: async (view, halted) => {
+        if (ran) return 0;
+        ran = true;
+        return this.#runAsync(staged, view, halted);
       },
     };
   }
@@ -205,6 +226,22 @@ export class CommitOutbox {
     return ran;
   }
 
+  async #runAsync(staged: readonly StagedEffect[], view: MeshBatchView, halted?: () => boolean): Promise<number> {
+    for (const row of [...this.#done.keys()]) if (!view.get(row)) this.#done.delete(row);
+    const ready = staged.filter(() => !halted?.());
+    const results = await Promise.all(ready.map(({ row, effect, stamp }) =>
+      this.#executeAsync(row, effect.kind, effect.payload, view, false, stamp)));
+    let ran = results.filter(Boolean).length;
+    const failed = [...this.#failed].map(row => ({ row, entry: view.get(row) }));
+    await Promise.all(failed.map(async ({ row, entry }) => {
+      if (halted?.()) return;
+      const stored = rowOf(entry?.value);
+      if (!stored) { this.#failed.delete(row); return; }
+      await this.#executeAsync(row, stored.kind, stored.payload, view, true);
+    }));
+    return ran;
+  }
+
   /** Runs every pending row of this scope on the committed state (after a crash or restart), then
    * deletes the rows that ran. Returns how many effects ran. */
   async recover(): Promise<number> {
@@ -245,10 +282,26 @@ export class CommitOutbox {
    * A newer same-key recording committed before this (late) afterCommit stays pending (smarty-dev#7023). */
   #execute(row: string, kind: string, payload: unknown, view: MeshBatchView, replay: boolean, stamp?: string): boolean {
     const handler = this.handlers[kind];
-    // An unknown kind belongs to another release of this writer: leave its row alone.
+    // An unknown kind (including async-only work) belongs to the async runner or another release.
     if (!handler) return false;
     try {
       handler(payload, view, replay);
+    } catch {
+      this.#failed.add(row);
+      return false;
+    }
+    this.#failed.delete(row);
+    const entry = view.get(row);
+    if (entry && (stamp === undefined || rowOf(entry.value)?.stamp === stamp)) this.#done.set(row, entry.version);
+    return true;
+  }
+
+  async #executeAsync(row: string, kind: string, payload: unknown, view: MeshBatchView, replay: boolean,
+    stamp?: string): Promise<boolean> {
+    const asyncHandler = this.asyncHandlers[kind];
+    if (!asyncHandler) return this.#execute(row, kind, payload, view, replay, stamp);
+    try {
+      await asyncHandler(payload, view, replay);
     } catch {
       this.#failed.add(row);
       return false;

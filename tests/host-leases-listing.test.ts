@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { hostLeasePath, readHostLeases, removeHostLease, writeHostLease, type FabricHostLease } from "../src/topology/host-leases.js";
+import { hostLeaseCacheGeneration, hostLeasePath, readHostLeases, removeHostLease, writeHostLease, type FabricHostLease } from "../src/topology/host-leases.js";
 
 // smarty-dev#7978 follow-on: an inotify cache must avoid directory enumeration and per-file stats on clean reads.
 describe.skipIf(process.platform === "win32")("host lease watcher cache", () => {
@@ -52,6 +52,20 @@ describe.skipIf(process.platform === "win32")("host lease watcher cache", () => 
     expect(leaseListings()).toBe(0);
     expect(directoryStats()).toBe(10); // one cheap stamp check per read
     expect(leaseStats()).toBe(0);
+  });
+
+  it("exposes a no-I/O cache generation for locked snapshot validation", () => {
+    const { root, stat, readdir } = setup();
+    readHostLeases(root);
+    stat.mockClear();
+    readdir.mockClear();
+    const before = hostLeaseCacheGeneration(root);
+    expect(hostLeaseCacheGeneration(root)).toBe(before);
+    expect(stat).not.toHaveBeenCalled();
+    expect(readdir).not.toHaveBeenCalled();
+
+    writeHostLease(root, lease("host:0", 3_000));
+    expect(hostLeaseCacheGeneration(root)).toBeGreaterThan(before);
   });
 
   it("refreshes only a new, renewed, or removed lease after its filename event", () => {

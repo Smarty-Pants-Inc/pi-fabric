@@ -22,6 +22,7 @@ import { BridgeRelayUnavailableError, startBridgeRelay } from "./mesh/bridge-rel
 import { BRIDGE_DELIVERY_AGE_ALERT_MS, type BridgeDeliveryAgeAlarm } from "./mesh/bridge-delivery-age.js";
 import { publishBridgeLegacyBaselineAlarm, type BridgeLegacyBaselineAlarm } from "./mesh/bridge-baseline-alarms.js";
 import { BridgeHandoffRefusedError, BridgeHandoffUsageError, handOffNativeIdentity, handoffRootId, listHandoffs, revokeHandoff } from "./mesh/bridge-handoff.js";
+import { isMeshRetryableBusy } from "./mesh/state-backend.js";
 import { MeshStore, meshAlarmRecipient, type MeshStoreOptions } from "./mesh/store.js";
 import { systemdWatchdogNotify } from "./mesh/systemd-watchdog.js";
 
@@ -111,14 +112,45 @@ export const openBridgeStore = (
   });
 };
 const log = (message: string): void => void process.stderr.write(`mesh-bridge: ${message}\n`);
+const STARTUP_LOCK_RETRY_BUDGET_MS = 3 * 60_000;
+const STARTUP_LOCK_RETRY_MIN_MS = 100;
+const STARTUP_LOCK_RETRY_MAX_MS = 2_000;
+
+const prepareStoreLock = async (store: MeshStore, signal?: AbortSignal): Promise<boolean> => {
+  const deadline = Date.now() + STARTUP_LOCK_RETRY_BUDGET_MS;
+  let delayMs = STARTUP_LOCK_RETRY_MIN_MS;
+  let resolveAbort!: (ready: false) => void;
+  const aborted = new Promise<false>(resolve => { resolveAbort = resolve; });
+  const onAbort = (): void => resolveAbort(false);
+  if (signal?.aborted) return false;
+  signal?.addEventListener("abort", onAbort, { once: true });
+  try {
+    for (;;) {
+      if (signal?.aborted) return false;
+      try {
+        const prepared = await Promise.race([store.prepareLock().then(() => true), aborted]);
+        return prepared;
+      } catch (error) {
+        const remaining = deadline - Date.now();
+        if (!isMeshRetryableBusy(error) || remaining <= 0) throw error;
+        const waitMs = Math.min(delayMs, remaining);
+        log(`mesh state busy during bridge startup; retrying in ${waitMs} ms`);
+        const continued = await Promise.race([new Promise<true>(resolve => setTimeout(() => resolve(true), waitMs)), aborted]);
+        if (!continued) return false;
+        delayMs = Math.min(delayMs * 2, STARTUP_LOCK_RETRY_MAX_MS);
+      }
+    }
+  } finally { signal?.removeEventListener("abort", onAbort); }
+};
 
 const runAgent = async (flags: Map<string, string>): Promise<void> => {
   const peer = required(flags, "peer");
-  const side = new StoreBridgeSide(openBridgeStore(required(flags, "mesh"), flags), peer, Date.now, true);
+  const side = new StoreBridgeSide(openBridgeStore(required(flags, "mesh"), flags), peer, Date.now, true, true);
   const logLevel = flags.get("log-level") ?? "info";
   if (logLevel !== "info" && logLevel !== "debug") throw new Error("--log-level must be info or debug");
-  await side.store.prepareLock();
+  await prepareStoreLock(side.store);
   await serveBridgeAgent(side, process.stdin, process.stdout, logLevel === "debug" ? log : undefined);
+  await side.flushLeaseEffects();
 };
 
 /** Grace period after clean stdin EOF before terminating a stuck transport child. */
@@ -160,7 +192,7 @@ export const runBridge = async (
   if (!(Number.isSafeInteger(factoryRate.burst) && factoryRate.burst > 0)) throw new Error("--factory-burst must be a positive integer");
   if (!(Number.isSafeInteger(factoryRate.bytesPerMinute) && factoryRate.bytesPerMinute > 0)) throw new Error("--factory-bytes must be a positive integer of bytes a minute");
   if (!(Number.isSafeInteger(factoryRate.byteBurst) && factoryRate.byteBurst > 0)) throw new Error("--factory-byte-burst must be a positive integer");
-  const local = new StoreBridgeSide(openBridgeStore(required(flags, "mesh"), flags), remoteName, Date.now, true);
+  const local = new StoreBridgeSide(openBridgeStore(required(flags, "mesh"), flags), remoteName, Date.now, true, true);
   const argv = transportCommand(flags, command);
   if (signal.aborted) {
     local.store.closeState();
@@ -168,21 +200,12 @@ export const runBridge = async (
   }
   // Prepare before starting the link, not inside a short registry/mesh try. Readiness is
   // immutable for this store; an unknown identity still permits conservative publication.
-  let removePrepareAbort: (() => void) | undefined;
-  const abortedDuringPrepare = new Promise<void>((resolve) => {
-    if (signal.aborted) { resolve(); return; }
-    const onAbort = (): void => resolve();
-    signal.addEventListener("abort", onAbort, { once: true });
-    removePrepareAbort = () => signal.removeEventListener("abort", onAbort);
-  });
   let prepared: boolean;
   try {
-    prepared = await Promise.race([local.store.prepareLock().then(() => true), abortedDuringPrepare.then(() => false)]);
+    prepared = await prepareStoreLock(local.store, signal);
   } catch (error) {
     local.store.closeState();
     throw error;
-  } finally {
-    removePrepareAbort?.();
   }
   if (!prepared || signal.aborted) {
     local.store.closeState();

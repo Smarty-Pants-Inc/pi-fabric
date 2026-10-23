@@ -3504,7 +3504,12 @@ export class MeshBridge {
     const syncedAt = Date.now();
     const presenceVersion = this.#presenceVersion;
     const leaseVersion = this.#leaseVersion;
-    const [local, claimed] = await Promise.all([this.options.local.presence(), this.options.remote.presence()]);
+    const localPresence = this.options.local.presence();
+    // StoreBridgeSide.presence() scans synchronously before returning its promise. That
+    // hub work precedes the remote request; do not charge it to the inbound sample's
+    // 15 s lease. Still anchor BEFORE the RPC, never after its reply or mirror commit.
+    const inboundObservedAt = Date.now();
+    const [local, claimed] = await Promise.all([localPresence, this.options.remote.presence()]);
     const claimedValue: unknown = claimed;
     const claimedHosts = isObject(claimedValue) && Array.isArray(claimedValue.hosts)
       ? claimedValue.hosts.filter((host): host is BridgeHost => isObject(host)) : [];
@@ -3545,7 +3550,7 @@ export class MeshBridge {
       ? ` (${outbound.dropped} hosts pass the frame budget)` : ""}`);
     this.options.debug?.(`presence sync: inbound ${remote.hosts.length} hosts/${remote.participants.length} participants; outbound ${outbound.presence.hosts.length} hosts/${outbound.presence.participants.length} participants; partial=${partial} dropped=${droppedCount}`);
     // Both settle before a failure is reported, so no local write outlives this pass.
-    const results = await Promise.allSettled([this.options.remote.mirror(outboundPresence), this.options.local.mirror(inboundPresence, syncedAt)]);
+    const results = await Promise.allSettled([this.options.remote.mirror(outboundPresence), this.options.local.mirror(inboundPresence, inboundObservedAt)]);
     // A transient failure must not hide a simultaneous permanent/transport failure.
     const failures = results.filter((result) => result.status === "rejected");
     const stale = failures.find(result => result.reason instanceof BridgeStaleIncarnationError);

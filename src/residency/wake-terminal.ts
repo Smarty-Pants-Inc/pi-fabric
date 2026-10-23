@@ -2,7 +2,7 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { assertMeshStateReadable, type MeshStore } from "../mesh/store.js";
 import { ParticipantDirectory } from "../topology/participant-directory.js";
-import { hostLeasePath, readHostLeaseCurrent, type FabricHostLease } from "../topology/host-leases.js";
+import { hostLeasePath, readHostLeaseCurrent } from "../topology/host-leases.js";
 import { participantFilePresent } from "../topology/participant-files.js";
 import { isLiveLegacyRootEntry } from "../topology/legacy-root-liveness.js";
 import { acquireMainPublicationFence } from "../topology/main-publication-fence.js";
@@ -14,7 +14,8 @@ import { canonicalResidentWakeConfig, readWakeJson, retainedRoutesAt } from "./w
 export const RESIDENT_WAKE_TERMINAL_MIN_GRACE_MS = 60_000;
 const RESIDENT_WAKE_TERMINAL_GRACE_TTLS = 3;
 
-const nativeRootLeasePastGrace = (lease: FabricHostLease | undefined, rootId: string, now: number): boolean => {
+const nativeRootLeasePastGrace = (meshRoot: string, rootId: string, now: number): boolean => {
+  const lease = readHostLeaseCurrent(meshRoot, rootId);
   // Bridge/transport projections do not share the native Main writer's
   // lease/publication protocol; their expiry is not fenced absence.
   // A missing lease (even after clean close/reaping) carries no expiry evidence.
@@ -29,7 +30,19 @@ const nativeRootLeasePastGrace = (lease: FabricHostLease | undefined, rootId: st
     RESIDENT_WAKE_TERMINAL_GRACE_TTLS * (lease.expiresAt - lease.updatedAt));
   const terminalAfter = lease.expiresAt + grace;
   // Overflow, malformed clocks and the exact boundary cannot authorize an ACK.
-  return Number.isSafeInteger(terminalAfter) && now > terminalAfter;
+  if (!Number.isSafeInteger(terminalAfter) || now <= terminalAfter) return false;
+  // The shared reader validates the lease schema but drops unrecognized mirrorLease
+  // values. Only ABSENT raw provenance can certify a native lease, never a dropped
+  // discriminator. Read raw LAST and require congruent identity/timing, including
+  // optional fields the reader rejects: two different snapshots must not combine
+  // an old expiry with new provenance or hide invalid incarnation/reload metadata.
+  // This check runs on observation AND again under both terminal fences.
+  const raw = readWakeJson<Record<string, unknown>>(hostLeasePath(meshRoot, rootId));
+  if (!raw || typeof raw !== "object" || Array.isArray(raw) || raw.format !== 1 ||
+      Object.hasOwn(raw, "mirrorLease") || Object.hasOwn(raw, "mirror")) return false;
+  return (["id", "rootId", "identityId", "updatedAt", "expiresAt", "startedAt", "incarnationToken", "reloadUntil"] as const)
+    .every(field => raw[field] === lease[field]) &&
+    canonicalResidentWakeConfig({ session: raw.session }) === canonicalResidentWakeConfig({ session: lease.session });
 };
 
 /** Exceptional-path only: owner.json describes the resident, never its originating Main. */
@@ -45,8 +58,7 @@ export function residentWakeTerminalRoot(mesh: Pick<MeshStore, "root" | "listAll
     assertMeshStateReadable(mesh.root);
     const rootId = routes.rootId;
     const now = Date.now();
-    const lease = readHostLeaseCurrent(mesh.root, rootId);
-    if (!nativeRootLeasePastGrace(lease, rootId, now)) return;
+    if (!nativeRootLeasePastGrace(mesh.root, rootId, now)) return;
     // A read-only directory is never started: no heartbeat, registration or timer.
     // Use the resident's identity so legacy Main advertisements are not excluded as self.
     const directory = new ParticipantDirectory(store, { enabled: true, hostId: routes.hostId,
@@ -76,8 +88,7 @@ export function residentWakeTerminalRoot(mesh: Pick<MeshStore, "root" | "listAll
     // This is only an observation/prefilter. Terminal callers MUST retain native
     // publication AND lease custody through their final check, receipt and ACK.
     if (directory.get(rootId, Date.now(), { fresh: true })) return;
-    const current = readHostLeaseCurrent(mesh.root, rootId);
-    if (!nativeRootLeasePastGrace(current, rootId, Date.now())) return;
+    if (!nativeRootLeasePastGrace(mesh.root, rootId, Date.now())) return;
     return rootId;
   } catch { return; } // Unknown liveness/configuration must retain the existing retry.
 }

@@ -151,7 +151,8 @@ describe("foreign-holder diagnostics project owner metadata", () => {
       expect(error.holderToken).toBe(VALID_TOKEN);
       expect(error.holderNamespace).toBe(FOREIGN_NAMESPACE);
       expect(error.recoveryArgv).toEqual(expectedArgv);
-      expect(error.recovery).toBe(`fabric-mesh-backend lock-recover --root ${root} --lock custody --holder ${VALID_TOKEN}`);
+      const recoveryRoot = process.platform === "win32" ? `'${root.replace(/'/g, "''")}'` : root;
+      expect(error.recovery).toBe(`fabric-mesh-backend lock-recover --root ${recoveryRoot} --lock custody --holder ${VALID_TOKEN}`);
       expect(error.message).toContain(error.recovery);
       expect(fs.readFileSync(path.join(lock, "owner"), "utf8")).toBe(record);
     } finally {

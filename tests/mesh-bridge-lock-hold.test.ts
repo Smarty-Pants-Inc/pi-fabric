@@ -1,12 +1,15 @@
+import { spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { PassThrough } from "node:stream";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 import { MESH_ARCHIVE_CONFIG } from "../src/mesh/archive.js";
-import { MeshBridge, StoreBridgeSide } from "../src/mesh/bridge.js";
+import { MeshBridge, RemoteBridgeSide, serveBridgeAgent, StoreBridgeSide } from "../src/mesh/bridge.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { hostLeasePath, readHostLease, writeHostLease, type FabricHostLease } from "../src/topology/host-leases.js";
+import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { writeParticipantFile } from "../src/topology/participant-files.js";
 
 // smarty-dev#10391: a bridge catch-up must never hold state.db's SQLite write lock above 100 ms.
@@ -104,12 +107,20 @@ afterAll(() => { proto.exec = original; statementProto.all = originalAll; });
 
 const roots: string[] = [];
 const stores: MeshStore[] = [];
+const children: ChildProcess[] = [];
 const scratch = () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-lock-hold-"));
   roots.push(root);
   return root;
 };
-afterEach(() => {
+afterEach(async () => {
+  for (const child of children.splice(0)) {
+    if (child.exitCode === null && child.signalCode === null) {
+      const closed = new Promise<void>(resolve => child.once("close", () => resolve()));
+      child.kill("SIGKILL");
+      await closed;
+    }
+  }
   for (const store of stores.splice(0)) store.closeState();
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
@@ -171,7 +182,261 @@ const populate = async (mesh: MeshStore) => {
   }
 };
 
+const populateCatchupRoots = async (mesh: MeshStore, count: number) => {
+  const now = Date.now();
+  const ops: Array<{ kind: "put"; key: string; value: unknown; identity: MeshIdentity }> = [];
+  for (let n = 0; n < count; n++) {
+    const id = `session:catchup-${n}`;
+    const identity: MeshIdentity = { id, name: `catchup-${n}`, kind: "main" };
+    const hash = createHash("sha256").update(id).digest("hex");
+    ops.push({ kind: "put", key: `topology/hosts/${hash}`, identity,
+      value: { format: 1, id, rootId: id, identity, startedAt: now, updatedAt: now, expiresAt: now + 120000 } });
+    ops.push({ kind: "put", key: `topology/participants/${hash}`, identity,
+      value: { format: 1, id, kind: "root", rootId: id, ownerHostId: id, ownerIdentityId: id,
+        name: `catchup-${n}`, label: `restarting agent ${n}`, status: "idle", runner: "pi", transport: "host",
+        capabilities: ["steer", "followUp"], startedAt: now, updatedAt: now, controlProtocol: "v1" } });
+  }
+  for (let at = 0; at < ops.length; at += 200) await mesh.writeBatch({ identity: ops[at]!.identity, ops: ops.slice(at, at + 200) });
+  for (let n = 0; n < count; n++) {
+    const id = `session:catchup-${n}`;
+    writeHostLease(mesh.root, { id, rootId: id, identityId: id, updatedAt: now, expiresAt: now + 120000, startedAt: now });
+  }
+};
+
+const PI_HEARTBEAT_AGENT = `
+import { createJiti } from "jiti";
+import { pathToFileURL } from "node:url";
+import { createInterface } from "node:readline";
+import fs from "node:fs";
+const jiti = createJiti(pathToFileURL(process.cwd() + "/index.js").href);
+const { MeshStore } = await jiti.import("./src/mesh/store.ts");
+const { ParticipantDirectory } = await jiti.import("./src/topology/participant-directory.ts");
+const { readHostLease } = await jiti.import("./src/topology/host-leases.ts");
+const root = process.argv[1];
+const count = Number(process.argv[2]);
+const mesh = new MeshStore(root, 65536, 1000, { stateBackend: "sqlite" });
+const dirs = [];
+const identities = [];
+let measuring = false;
+const emit = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
+const sqlite = process.getBuiltinModule("node:sqlite");
+const proto = sqlite.DatabaseSync.prototype;
+const originalExec = proto.exec;
+const opened = new WeakMap();
+let measuredOpen = 0;
+let fileOpsInHold = 0;
+let checkpointsInHold = 0;
+let scansInHold = 0;
+proto.exec = function(sql) {
+  const statement = sql.trim().toUpperCase();
+  if (statement === "BEGIN IMMEDIATE") {
+    originalExec.call(this, sql);
+    const active = { began: performance.now(), measured: measuring };
+    opened.set(this, active);
+    if (active.measured) measuredOpen++;
+    return;
+  }
+  if (measuredOpen > 0 && statement.includes("WAL_CHECKPOINT")) checkpointsInHold++;
+  const active = opened.get(this);
+  try { originalExec.call(this, sql); }
+  finally {
+    if (active && (statement === "COMMIT" || statement === "ROLLBACK")) {
+      opened.delete(this);
+      if (active.measured) {
+        measuredOpen--;
+        emit({ type: "hold", ms: performance.now() - active.began, db: this.location() ?? "" });
+      }
+    }
+  }
+};
+const statementProto = sqlite.StatementSync.prototype;
+const originalAll = statementProto.all;
+statementProto.all = function(...args) {
+  if (measuredOpen > 0 && this.sourceSQL?.includes("key >= ?") &&
+      typeof args[0] === "string" && /^topology\\/(hosts|participants|handoffs)\\//.test(args[0])) scansInHold++;
+  return originalAll.apply(this, args);
+};
+for (const name of ["accessSync", "existsSync", "lstatSync", "mkdirSync", "openSync", "readFileSync", "readdirSync",
+  "renameSync", "rmSync", "statSync", "unlinkSync", "writeFileSync", "appendFileSync"]) {
+  const original = fs[name].bind(fs);
+  fs[name] = (...args) => { if (measuredOpen > 0) fileOpsInHold++; return original(...args); };
+}
+for (let index = 0; index < count; index++) {
+  const id = "session:pi-sim-" + index;
+  const identity = { id, name: "main", kind: "main" };
+  const now = Date.now();
+  const record = { format: 1, id, kind: "root", rootId: id, ownerHostId: id, ownerIdentityId: id,
+    name: "main", label: "simulated Pi " + index, status: "idle", runner: "pi", transport: "host",
+    capabilities: ["steer", "followUp"], startedAt: now, updatedAt: now, controlProtocol: "v1" };
+  const directory = new ParticipantDirectory(mesh, { enabled: true, hostId: id, rootId: id, identity,
+    heartbeatMs: 500, leaseMs: 5000, reapDeadHosts: false });
+  directory.registerSource(() => [record]);
+  const refresh = directory.refresh.bind(directory);
+  directory.refresh = async () => {
+    const began = Date.now();
+    try {
+      await refresh();
+      const lease = readHostLease(root, id);
+      if (measuring) emit({ type: "heartbeat", id, ok: true, began, ended: Date.now(),
+        updatedAt: lease?.updatedAt ?? 0, expiresAt: lease?.expiresAt ?? 0 });
+    } catch (error) {
+      const lease = readHostLease(root, id);
+      if (measuring) emit({ type: "heartbeat", id, ok: false, began, ended: Date.now(),
+        code: typeof error?.code === "string" ? error.code : "ERROR",
+        updatedAt: lease?.updatedAt ?? 0, expiresAt: lease?.expiresAt ?? 0 });
+      throw error;
+    }
+  };
+  await directory.start();
+  dirs.push(directory);
+  identities.push(id);
+}
+const initial = identities.map(id => { const lease = readHostLease(root, id); return { id, updatedAt: lease?.updatedAt ?? 0, expiresAt: lease?.expiresAt ?? 0 }; });
+emit({ type: "ready", ids: identities, leases: initial, readyAt: Date.now() });
+const input = createInterface({ input: process.stdin });
+await new Promise(resolve => input.on("line", line => {
+  if (line === "measure") {
+    measuring = true;
+    for (const directory of dirs) void directory.refresh().catch(() => undefined);
+  } else if (line === "stop") resolve();
+}));
+measuring = false;
+input.close();
+await Promise.all(dirs.map(directory => directory.close()));
+mesh.closeState();
+emit({ type: "audit", fileOpsInHold, checkpointsInHold, scansInHold });
+`;
+
 describe("bridge catch-up SQLite write-lock holds (smarty-dev#10391), real stores and state.db", () => {
+  it("restarting agent catches up 500 pending events in <=500 ms holds while 20 Pi heartbeats renew", async () => {
+    const hub = store(), far = store();
+    const localId = await native(hub, "session:agent-restart-hub");
+    const remoteId = await native(far, "session:agent-restart-root");
+    await populate(hub);
+    await populateCatchupRoots(hub, 2500);
+    for (let index = 0; index < EVENTS;) {
+      const inputs = Array.from({ length: Math.min(256, EVENTS - index) }, (_, n) =>
+        ({ topic: "fleet.work.hold", kind: "ask", from: localId, to: remoteId.id, text: String(index + n) }));
+      index += (await hub.publishBatch(inputs)).length;
+    }
+    const cursorPath = path.join(scratch(), "agent-restart-cursor.json");
+    fs.writeFileSync(cursorPath, JSON.stringify({ format: 1, local: "hub", remote: "far",
+      toRemote: { after: 0, mark: 0 }, toLocal: { after: 0, mark: 0 } }));
+    const messages: Array<Record<string, unknown>> = [];
+    let stdout = "", stderr = "";
+    let readyResolve!: (value: Record<string, unknown>) => void;
+    let readyReject!: (error: Error) => void;
+    const ready = new Promise<Record<string, unknown>>((resolve, reject) => { readyResolve = resolve; readyReject = reject; });
+    const child = spawn(process.execPath, ["--input-type=module", "-e", PI_HEARTBEAT_AGENT, far.root, "20"],
+      { cwd: process.cwd(), stdio: ["pipe", "pipe", "pipe"] });
+    children.push(child);
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => {
+      stdout += chunk;
+      let newline: number;
+      while ((newline = stdout.indexOf("\n")) >= 0) {
+        const line = stdout.slice(0, newline);
+        stdout = stdout.slice(newline + 1);
+        if (!line) continue;
+        try {
+          const message = JSON.parse(line) as Record<string, unknown>;
+          messages.push(message);
+          if (message.type === "ready") readyResolve(message);
+        } catch { /* a non-JSON child line is reported from stderr if startup fails */ }
+      }
+    });
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk: string) => { stderr += chunk; });
+    child.once("error", readyReject);
+    const childDone = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(resolve =>
+      child.once("close", (code, signal) => resolve({ code, signal })));
+    let serving: Promise<void> | undefined;
+    let bridge: MeshBridge | undefined;
+    let input: PassThrough | undefined;
+    let catchupStartedAt = 0, catchupEndedAt = 0;
+    let fileOpsInHold = 0;
+    const fsTable = fs as unknown as Record<string, (...args: unknown[]) => unknown>;
+    const fsNames = ["accessSync", "existsSync", "lstatSync", "mkdirSync", "openSync", "readFileSync", "readdirSync",
+      "renameSync", "rmSync", "statSync", "unlinkSync", "writeFileSync", "appendFileSync"];
+    const originalFs = new Map<string, (...args: unknown[]) => unknown>();
+    for (const name of fsNames) {
+      const original = fsTable[name]!;
+      originalFs.set(name, original);
+      fsTable[name] = (...args) => { if (writesOpen > 0) fileOpsInHold++; return original.apply(fs, args); };
+    }
+    try {
+      const readyTimer = setTimeout(() => readyReject(new Error(`Pi heartbeat child did not start: ${stderr}`)), 30_000);
+      const readyMessage = await ready.finally(() => clearTimeout(readyTimer));
+      expect(readyMessage.ids).toHaveLength(20);
+      input = new PassThrough();
+      const output = new PassThrough();
+      serving = serveBridgeAgent(new StoreBridgeSide(far, "hub"), input, output);
+      const remote = new RemoteBridgeSide(output, input);
+      bridge = new MeshBridge({ localName: "hub", remoteName: "far", local: new StoreBridgeSide(hub, "far"), remote, cursorPath });
+      const batches = countBatches(far);
+      holds = [];
+      inFenceScans = 0;
+      catchupStartedAt = Date.now();
+      child.stdin.write("measure\n");
+      await bridge.start();
+      const result = await bridge.step();
+      catchupEndedAt = Date.now();
+      await bridge.stop();
+      child.stdin.write("stop\n");
+      const stopped = await childDone;
+      expect(stopped.code, stderr).toBe(0);
+      await serving;
+      const bridgeHolds = holds.filter(hold => hold.db.includes(far.root));
+      const childHolds = messages.filter(message => message.type === "hold" &&
+        typeof message.db === "string" && message.db.includes(far.root)).map(message => Number(message.ms));
+      const measuredHolds = [...bridgeHolds.map(hold => hold.ms), ...childHolds];
+      const heartbeatMessages = messages.filter(message => message.type === "heartbeat" &&
+        Number(message.ended) >= catchupStartedAt && Number(message.ended) <= catchupEndedAt);
+      const successfulHeartbeats = heartbeatMessages.filter(message => message.ok === true);
+      const heartbeatsById = new Map<string, Array<Record<string, unknown>>>();
+      for (const sample of successfulHeartbeats) {
+        if (typeof sample.id !== "string") continue;
+        const list = heartbeatsById.get(sample.id) ?? [];
+        list.push(sample);
+        heartbeatsById.set(sample.id, list);
+      }
+      const audit = messages.find(message => message.type === "audit");
+      const maxHoldMs = Math.max(0, ...measuredHolds);
+      console.log(JSON.stringify({ scenario: "remote-agent restart", pendingEvents: EVENTS, mirroredRoots: 2500,
+        piHeartbeats: heartbeatsById.size, agentTransactions: measuredHolds.length,
+        maxAgentHoldMs: +maxHoldMs.toFixed(2), batches: batches.length, audit }));
+      expect(result).toMatchObject({ toRemote: EVENTS, dropped: 0 });
+      expect(far.read({ limit: 1000 }).filter(event => event.topic === "fleet.work.hold").map(event => event.text))
+        .toEqual(Array.from({ length: EVENTS }, (_, index) => String(index)));
+      expect(measuredHolds.length).toBeGreaterThan(0);
+      expect(measuredHolds.every(hold => hold <= 500)).toBe(true);
+      expect(heartbeatsById.size).toBe(20);
+      expect(heartbeatMessages.every(sample => Number(sample.expiresAt) > Number(sample.ended))).toBe(true);
+      const readyAt = Number(readyMessage.readyAt);
+      for (const samples of heartbeatsById.values()) {
+        expect(samples.length).toBeGreaterThan(0);
+        const renewalTimes = [readyAt, ...samples.map(sample => Number(sample.ended)), catchupEndedAt].sort((a, b) => a - b);
+        expect(Math.max(0, ...renewalTimes.slice(1).map((time, index) => time - renewalTimes[index]!))).toBeLessThan(5000);
+      }
+      expect(inFenceScans).toBe(0);
+      expect(fileOpsInHold).toBe(0);
+      expect(audit).toMatchObject({ fileOpsInHold: 0, checkpointsInHold: 0, scansInHold: 0 });
+      expect(Math.max(0, ...batches)).toBeLessThanOrEqual(BATCH_MAX_EVENTS);
+    } finally {
+      await bridge?.stop();
+      if (child.exitCode === null && child.signalCode === null) {
+        child.stdin.write("stop\n");
+        const stopped = await childDone;
+        expect(stopped.code, stderr).toBe(0);
+      }
+      if (input && serving) input.end();
+      if (serving) await serving.catch(() => undefined);
+      for (const [name, original] of originalFs) fsTable[name] = original;
+      const index = children.indexOf(child);
+      if (index >= 0) children.splice(index, 1);
+    }
+  }, 180_000);
+
   it.each(["toLocal", "toRemote"] as const)(`${EVENTS} events %s: no topology scan inside a write transaction, batches of ${BATCH_MAX_EVENTS} at most`, async direction => {
     const hub = store(), far = store();
     const localId = await native(hub, "session:hold-local"), remoteId = await native(far, "session:hold-remote");

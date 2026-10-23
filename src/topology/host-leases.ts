@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import os from "node:os";
 import fs from "node:fs";
 import path from "node:path";
-import { isMeshLockTimeout, readFileRetrying, writeJsonAtomic, type PhysicalHostIdentity } from "../core/atomic-write.js";
+import { isMeshLockTimeout, readFileRetrying, writeJsonAtomic, writeJsonAtomicAsync, type PhysicalHostIdentity } from "../core/atomic-write.js";
 import { effectiveLiveness, type Liveness } from "./liveness.js";
 import { watchBridgeStore } from "../mesh/change-notifier.js";
 import { FabricPeerLeaseStaleError, PEER_LEASE_WAIT_MS } from "../agents/peer-lease-stale.js";
@@ -267,8 +267,41 @@ const fileName = (hostId: string): string =>
 export const hostLeasePath = (meshRoot: string, hostId: string): string =>
   path.join(meshRoot, LEASE_DIR, fileName(hostId));
 
-export const writeHostLease = (meshRoot: string, lease: FabricHostLease): void =>
-  writeJsonAtomic(hostLeasePath(meshRoot, lease.id), { format: 1, ...lease });
+const leaseCacheGenerations = new Map<string, number>();
+const leaseDirectoryInvalidations = new Map<string, number>();
+const leaseFileGenerations = new Map<string, number>();
+const touchHostLeaseDirectory = (dir: string, name?: string): void => {
+  leaseCacheGenerations.set(dir, (leaseCacheGenerations.get(dir) ?? 0) + 1);
+  if (name) {
+    const file = path.join(dir, name);
+    leaseFileGenerations.set(file, (leaseFileGenerations.get(file) ?? 0) + 1);
+  } else {
+    leaseDirectoryInvalidations.set(dir, (leaseDirectoryInvalidations.get(dir) ?? 0) + 1);
+  }
+};
+
+/** In-memory invalidation token for a pre-read lease snapshot; never stats or reads files. */
+export const hostLeaseCacheGeneration = (meshRoot: string): number =>
+  leaseCacheGenerations.get(path.join(meshRoot, LEASE_DIR)) ?? 0;
+
+/** In-memory per-lease change token; unknown watcher events invalidate every lease without I/O. */
+export const hostLeaseGeneration = (meshRoot: string, hostId: string): string => {
+  const dir = path.join(meshRoot, LEASE_DIR), file = path.join(dir, fileName(hostId));
+  return `${leaseDirectoryInvalidations.get(dir) ?? 0}:${leaseFileGenerations.get(file) ?? 0}`;
+};
+
+export const writeHostLease = (meshRoot: string, lease: FabricHostLease): void => {
+  const file = hostLeasePath(meshRoot, lease.id);
+  writeJsonAtomic(file, { format: 1, ...lease });
+  touchHostLeaseDirectory(path.dirname(file), path.basename(file));
+};
+
+/** Atomic host-lease install for post-commit work that must not block the shared JS thread. */
+export const writeHostLeaseAsync = async (meshRoot: string, lease: FabricHostLease): Promise<void> => {
+  const file = hostLeasePath(meshRoot, lease.id);
+  await writeJsonAtomicAsync(file, { format: 1, ...lease });
+  touchHostLeaseDirectory(path.dirname(file), path.basename(file));
+};
 
 export class FabricHostLeaseSupersededError extends Error {
   override readonly name: string = "FabricHostLeaseSupersededError";
@@ -434,7 +467,9 @@ export const removeOwnedHostLease = async (mesh: HostLeaseMesh, owner: FabricHos
         throw new FabricHostLeaseContestedError(owner.id, owner.identityId, owner.startedAt);
       }
       if (!current || !sameHostLeaseOwner(current, owner)) return false;
-      fs.rmSync(hostLeasePath(mesh.root, owner.id), { force: true });
+      const file = hostLeasePath(mesh.root, owner.id);
+      fs.rmSync(file, { force: true });
+      touchHostLeaseDirectory(path.dirname(file), path.basename(file));
       return true;
     }, { lease: { incarnationToken: captured.incarnationToken!, expiresAt: captured.expiresAt } });
   } catch (error) { if (error instanceof HostLeaseLockLostError) return false; throw error; }
@@ -449,8 +484,11 @@ export const sameHostLeaseVersion = (left: FabricHostLease | undefined, right: F
 export const removeHostLeaseVersionUnderCustody = (meshRoot: string, expected: FabricHostLease): boolean =>
   removeHostLeaseIf(meshRoot, expected.id, current => sameHostLeaseVersion(current, expected));
 
-export const removeHostLease = (meshRoot: string, hostId: string): void =>
-  fs.rmSync(path.join(meshRoot, LEASE_DIR, fileName(hostId)), { force: true });
+export const removeHostLease = (meshRoot: string, hostId: string): void => {
+  const file = hostLeasePath(meshRoot, hostId);
+  fs.rmSync(file, { force: true });
+  touchHostLeaseDirectory(path.dirname(file), path.basename(file));
+};
 
 /**
  * Removes a host's file lease only when `owned` accepts it (smarty-dev#6477 L2b owner review): a
@@ -479,6 +517,7 @@ export const removeHostLeaseIf = (meshRoot: string, hostId: string, owned: (leas
     return false;
   } finally {
     fs.rmSync(aside, { force: true });
+    touchHostLeaseDirectory(path.dirname(file), path.basename(file));
   }
 };
 
@@ -601,6 +640,7 @@ const armLeaseDirectoryWatch = (dir: string, state: LeaseDirectoryWatch): boolea
       state.watcher = undefined;
       state.dirtyAll = true;
       state.dirtyNames.clear();
+      touchHostLeaseDirectory(dir);
       try { watcher.close(); } catch { /* re-arm follows a full read */ }
     };
     watcher.on("change", (_event, filename) => {
@@ -614,6 +654,7 @@ const armLeaseDirectoryWatch = (dir: string, state: LeaseDirectoryWatch): boolea
       if (!name.endsWith(".json")) return;
       state.eventGeneration += 1;
       state.dirtyNames.add(name);
+      touchHostLeaseDirectory(dir, name);
     });
     watcher.on("error", invalidateDirectory);
     watcher.on("close", invalidateDirectory);
@@ -648,12 +689,14 @@ export const readHostLeases = (meshRoot: string, problems?: string[]): Map<strin
   cache.set(dir, known);
   let state = leaseDirectoryWatches.get(dir);
   const fullScan = (uncached: boolean): Map<string, FabricHostLease> => {
+    const previous = new Map([...known.entries()].flatMap(([name, slot]) => slot.lease ? [[name, slot.lease] as const] : []));
     let names: readonly string[];
     try {
       names = leaseNames(dir, uncached);
     } catch (error) {
       failed(dir, error);
       if (state) state.dirtyAll = true;
+      touchHostLeaseDirectory(dir);
       return new Map();
     }
     const leases = new Map<string, FabricHostLease>();
@@ -679,6 +722,10 @@ export const readHostLeases = (meshRoot: string, problems?: string[]): Map<strin
     }
     for (const name of known.keys()) if (!present.has(name)) known.delete(name);
     if (state) for (const name of state.unavailableNames) if (!present.has(name)) state.unavailableNames.delete(name);
+    const current = new Map([...known.entries()].flatMap(([name, slot]) => slot.lease ? [[name, slot.lease] as const] : []));
+    for (const name of new Set([...previous.keys(), ...current.keys()])) {
+      if (!sameHostLeaseVersion(previous.get(name), current.get(name))) touchHostLeaseDirectory(dir, name);
+    }
     return leases;
   };
   // Census and Windows retain the exact full-list/full-stat path: both require fresh truth.

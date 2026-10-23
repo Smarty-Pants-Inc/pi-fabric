@@ -148,6 +148,58 @@ describe("bridge mirror commit outbox", () => {
     await side.mirror(peer.presence);
     expect(hub.get(participantKey(peer.identity.id), { fresh: true })).toBeUndefined();
   });
+
+  it("skips unchanged lease installs and lets delivery proceed while changed installs are async", async () => {
+    const hub = store("sqlite");
+    let now = Date.now();
+    const owners = Array.from({ length: 150 }, (_, index) => remote(`bulk-${index}`, now));
+    const presence = {
+      hosts: owners.flatMap(owner => owner.presence.hosts),
+      participants: owners.flatMap(owner => owner.presence.participants),
+    };
+    const side = new StoreBridgeSide(hub, "hub", () => now, false, true);
+    const originalRename = fs.promises.rename.bind(fs.promises);
+    let block = true, blocked = 0;
+    let releaseRename!: () => void;
+    const release = new Promise<void>(resolve => { releaseRename = resolve; });
+    const rename = vi.spyOn(fs.promises, "rename").mockImplementation(async (source, target) => {
+      if (block && leaseWrite(String(target))) { blocked += 1; await release; }
+      return originalRename(source, target);
+    });
+    try {
+      await side.mirror(presence);
+      await vi.waitFor(() => expect(blocked).toBeGreaterThan(0), { timeout: 10_000 });
+      const delivery = await side.publish({ topic: "fleet.work.probe", kind: "ask",
+        from: { id: "session:hub", name: "main", kind: "main" }, to: "session:destination",
+        text: "delivery remains live", data: { bridge: { from: "hub", id: "async-install-probe", via: "hub" } } }, [], true);
+      expect(delivery.sequence).toBeGreaterThan(0);
+      expect(hub.read({ after: delivery.sequence - 1, limit: 1 })[0]?.text).toBe("delivery remains live");
+      block = false;
+      releaseRename();
+      await side.flushLeaseEffects();
+      expect(readHostLeases(hub.root).size).toBe(150);
+      expect(rename.mock.calls.filter(([, target]) => leaseWrite(String(target)))).toHaveLength(150);
+
+      rename.mockClear();
+      await side.mirror(presence);
+      await side.flushLeaseEffects();
+      expect(rename.mock.calls.filter(([, target]) => leaseWrite(String(target)))).toHaveLength(0);
+
+      now += 100;
+      const changed = {
+        hosts: presence.hosts.map(host => ({ ...host, record: { ...host.record, updatedAt: now, expiresAt: now + 60_000 }, expiresAt: now + 60_000 })),
+        participants: presence.participants,
+      };
+      await side.mirror(changed);
+      await side.flushLeaseEffects();
+      expect(rename.mock.calls.filter(([, target]) => leaseWrite(String(target)))).toHaveLength(150);
+    } finally {
+      block = false;
+      releaseRename();
+      await side.flushLeaseEffects();
+      rename.mockRestore();
+    }
+  }, 60_000);
 });
 
 describe("owner-matched unlease (smarty-dev#6477 L2b owner review, P2)", () => {

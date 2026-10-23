@@ -260,7 +260,8 @@ describe("ACK relay to a non-participant hub sender (smarty-dev#9751)", () => {
 });
 
 describe("notification-driven bridge (smarty-dev#7299 A5)", () => {
-  it("exits a native process with no watches when stdin ends before a queued hello runs", () => {
+  it.each(["", "native queued-hello diagnostic\n", "hosted-only (outside-temp deletion reporting): unexpected\n"])(
+    "exits a native process with no watches when stdin ends before a queued hello runs (stderr=%j)", stderrProbe => {
     const f = fixture(false);
     const source = String.raw`
       import fs from "node:fs";
@@ -295,11 +296,15 @@ describe("notification-driven bridge (smarty-dev#7299 A5)", () => {
       await serving;
       output.end(); store.closeState();
       console.log(JSON.stringify({ installed, active }));
+      process.stderr.write(${JSON.stringify(stderrProbe)});
     `;
     const program = path.join(f.root, "queued-hello.mjs");
     buildSync({ stdin: { contents: source, resolveDir: process.cwd() }, outfile: program, bundle: true, platform: "node", format: "esm", packages: "external" });
     const child = spawnSync(process.execPath, [program], { encoding: "utf8", timeout: 3_000 });
-    expect({ error: child.error?.message, status: child.status, stderr: child.stderr }).toEqual({ error: undefined, status: 0, stderr: "" });
+    // The inherited deletion guard stays enabled. Strip ONLY its exact known local
+    // sentinel; the injected real-child diagnostics (including a near miss) survive.
+    const stderr = child.stderr.replace(/^hosted-only \(outside-temp deletion reporting\): push and let CI run it\r?\n/gm, "");
+    expect({ error: child.error?.message, status: child.status, stderr }).toEqual({ error: undefined, status: 0, stderr: stderrProbe });
     expect(JSON.parse(child.stdout.trim())).toEqual({ installed: 0, active: 0 });
   });
 
@@ -526,7 +531,10 @@ describe("notification-driven bridge (smarty-dev#7299 A5)", () => {
     const f = fixture();
     const lanes = [];
     for (let index = 0; index < 20; index++) lanes.push(await native(f.far, `batch-${index}`, 15_000));
+    const silent = await native(f.far, "batch-silent", 15_000);
     const live = await launch(f.bridge);
+    const silentLease = readHostLeases(f.hub.root).get(silent.id)!;
+    const nativeRows = [...lanes, silent].map(lane => f.far.get(key("hosts", lane.id), { fresh: true }));
     const hubBatch = vi.spyOn(f.hub, "writeBatch");
     const farBatch = vi.spyOn(f.far, "writeBatch");
     const mirrors = vi.spyOn(f.local, "mirror");
@@ -544,11 +552,35 @@ describe("notification-driven bridge (smarty-dev#7299 A5)", () => {
     await until(() => mirrors.mock.calls.length === 1);
     await settle();
     expect(hubBatch).toHaveBeenCalledTimes(1);
-    expect(farBatch).toHaveBeenCalledTimes(1);
+    // No hub natives exist to mirror back. A no-op pass must not rewrite native
+    // rows or extend the silent origin just because its neighbors renewed.
+    expect([...lanes, silent].map(lane => f.far.get(key("hosts", lane.id), { fresh: true }))).toEqual(nativeRows);
+    expect(readHostLeases(f.hub.root).get(silent.id)).toMatchObject({ expiresAt: silentLease.expiresAt,
+      mirror: { sourceExpiresAt: silent.host.expiresAt } });
     for (const lane of lanes) {
       expect(f.local.holds(lane.id)).toBe(true);
       expect(readHostLeases(f.hub.root).get(lane.id)?.expiresAt).toBe(lane.host.expiresAt + 5_000);
+      expect(readHostLeases(f.far.root).get(lane.id)?.expiresAt).toBe(lane.host.expiresAt + 5_000);
     }
+
+    // Cross the original TTL: renewed authority must actually carry a command
+    // and its ACK, while the untouched silent lane must not gain that authority.
+    await vi.advanceTimersByTimeAsync(7_501);
+    await settle();
+    const lane = lanes[0]!;
+    expect(f.local.holds(lane.id)).toBe(true);
+    expect(f.local.holds(silent.id)).toBe(false);
+    const factory: MeshIdentity = { id: "factory-host:renewal-probe", name: "factory-host", kind: "agent" };
+    for (const target of [lane, silent]) await f.hub.publish({ topic: "fabric.control.command", kind: "steer",
+      from: factory, to: target.id, data: { version: 1, commandId: `renewal-${target.id}`, replyTo: factory.id,
+        targetId: target.id, operation: "steer" } });
+    await until(() => events(f.far).some(event => event.topic === "fabric.control.command" && event.to === lane.id));
+    await f.far.publish({ topic: "fabric.control.ack", kind: "ack", from: lane.identity, to: factory.id,
+      data: { version: 1, commandId: `renewal-${lane.id}`, targetId: lane.id, accepted: true } });
+    await until(() => events(f.hub).some(event => event.topic === "fabric.control.ack"));
+    expect(events(f.hub).filter(event => event.topic === "fabric.control.ack").map(event => event.from.id)).toEqual([lane.id]);
+    expect(events(f.far).filter(event => event.topic === "fabric.control.command").map(event => event.to)).toEqual([lane.id]);
+    expect(readHostLeases(f.hub.root).has(silent.id)).toBe(false);
     expect(live.failure()).toBeUndefined();
   });
 

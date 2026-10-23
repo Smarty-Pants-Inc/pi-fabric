@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { BridgeOwnershipError, StoreBridgeSide, type BridgePublish } from "../src/mesh/bridge.js";
 import { CommitOutbox } from "../src/mesh/commit-outbox.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
-import { hostLiveness, readHostLease, readHostLeases, writeHostLease } from "../src/topology/host-leases.js";
+import { hostLeaseGeneration, hostLeasePath, hostLiveness, readHostLease, readHostLeases, writeHostLease } from "../src/topology/host-leases.js";
 import { writeParticipantFile } from "../src/topology/participant-files.js";
 import type { FabricHostRecord, FabricParticipantRecord } from "../src/topology/types.js";
 
@@ -46,6 +46,125 @@ const remote = (name: string, now: number) => {
 };
 
 describe("bridge mirror commit outbox", () => {
+  // SA-01: model another process's atomic writes while this process's watcher delivery is
+  // deliberately held. Raw installs do not bump its module-local generation counters.
+  it.each([false, true].flatMap(deferred => ["lease", "participant", "legacy-lease"].map(claim => ({ deferred, claim }))))(
+    "keeps native authority before its SQL row ($claim, deferred=$deferred) with delayed watchers", async ({ deferred, claim }) => {
+    const hub = store("sqlite");
+    const now = Date.now();
+    const peer = remote(`native-gap-${deferred}`, now);
+    peer.host.incarnationToken = "old-mirror-token";
+    const watch = fs.watch.bind(fs);
+    vi.spyOn(fs, "watch").mockImplementation(((...args: unknown[]) => {
+      const callback = args.findIndex(arg => typeof arg === "function");
+      if (callback >= 0) args[callback] = () => undefined;
+      return Reflect.apply(watch, fs, args);
+    }) as typeof fs.watch);
+      const target = { ...peer, host: { ...peer.host, id: `${peer.host.id}-${claim}` },
+        identity: { ...peer.identity, id: `${peer.identity.id}-${claim}` } };
+      target.host.identity = target.identity;
+      target.host.rootId = target.identity.id;
+      const participant = { ...peer.participant, id: target.identity.id, rootId: target.identity.id,
+        ownerHostId: target.identity.id, ownerIdentityId: target.identity.id };
+      const presence = { hosts: [{ record: target.host, expiresAt: now + 60_000, observedAt: now }], participants: [participant] };
+      const nativeLease = { id: target.host.id, rootId: target.host.rootId, identityId: target.identity.id,
+        startedAt: now + 1, incarnationToken: "native-successor-token", updatedAt: now + 1, expiresAt: now + 60_000,
+        ...(claim === "lease" ? { writer: { pid: process.pid, host: "native", releaseSha: "test", lockProtocol: 1,
+          stateBackend: "sqlite", startedAt: now + 1 } } : {}) };
+      const install = (file: string, value: unknown): void => {
+        fs.mkdirSync(path.dirname(file), { recursive: true });
+        fs.writeFileSync(`${file}.native-tmp`, JSON.stringify({ format: 1, ...(value as object) }));
+        fs.renameSync(`${file}.native-tmp`, file);
+      };
+      let injected = false;
+      const inject = (): void => {
+        if (injected) return;
+        injected = true;
+        expect(hub.get(hostKey(target.host.id), { fresh: true })?.value).toMatchObject({ remoteHost: "ryzen2" });
+        const generation = hostLeaseGeneration(hub.root, target.host.id);
+        if (claim === "participant") install(path.join(hub.root, "participants", `${participantKey(target.host.id).split("/").at(-1)}.json`), {
+          key: participantKey(target.host.id), version: 1, updatedAt: now + 1, updatedBy: target.identity, value: participant,
+        });
+        else install(hostLeasePath(hub.root, target.host.id), nativeLease);
+        expect(hostLeaseGeneration(hub.root, target.host.id)).toBe(generation);
+      };
+      const custody = hub.leaseCustody.bind(hub);
+      let acquisitions = 0;
+      const custodySpy = vi.spyOn(hub, "leaseCustody").mockImplementation((file, operation, timeout, options) => {
+        if (deferred && ++acquisitions === 2) inject();
+        return custody(file, operation, timeout, options);
+      });
+      const writeBatch = hub.writeBatch.bind(hub);
+      const batchSpy = vi.spyOn(hub, "writeBatch").mockImplementation(input => {
+        if (deferred || !input.commitOutbox) return writeBatch(input);
+        const commitOutbox = input.commitOutbox;
+        return writeBatch({ ...input, commitOutbox: committed => { inject(); return commitOutbox(committed); } });
+      });
+      const side = new StoreBridgeSide(hub, "ryzen2", () => now, false, deferred);
+      try {
+        await side.mirror(presence);
+        await side.flushLeaseEffects();
+        expect(injected).toBe(true);
+        if (claim === "participant") expect(readHostLease(hub.root, target.host.id)).toBeUndefined();
+        else expect(readHostLease(hub.root, target.host.id)).toEqual(nativeLease);
+        expect(side.holds(target.identity.id, target.identity)).toBe(false);
+      } finally { custodySpy.mockRestore(); batchSpy.mockRestore(); }
+  });
+
+  it("merges current same-incarnation history and keeps its newer sample after deferred custody reacquisition", async () => {
+    const hub = store("sqlite");
+    const now = Date.now();
+    const peer = remote("same-incarnation-gap", now);
+    peer.host.incarnationToken = "same-owner-token";
+    const presence = { hosts: [{ record: peer.host, expiresAt: now + 60_000, observedAt: now }], participants: [peer.participant] };
+    await new StoreBridgeSide(hub, "ryzen2", () => now).mirror(presence);
+    // History must be locally persisted authority, never a remote's claimed history.
+    const held = hub.get(hostKey(peer.host.id), { fresh: true })!;
+    await hub.put({ key: held.key, identity: held.updatedBy, value: { ...(held.value as object),
+      bridgeSupersededTokens: ["planned-retired"], bridgeSupersededTokenSeen: { "planned-retired": 1 } } });
+    const custody = hub.leaseCustody.bind(hub);
+    let acquisitions = 0;
+    vi.spyOn(hub, "leaseCustody").mockImplementation((file, operation, timeout, options) => {
+      if (++acquisitions === 2) {
+        const current = readHostLease(hub.root, peer.host.id)!;
+        writeHostLease(hub.root, { ...current, updatedAt: now + 2_000, expiresAt: now + 17_000,
+          mirror: { ...current.mirror!, observedAt: now + 2_000, sourceObservedAt: now + 2_000 },
+          bridgeSupersededTokens: ["current-retired"], bridgeSupersededTokenSeen: { "current-retired": 1 } });
+      }
+      return custody(file, operation, timeout, options);
+    });
+    const side = new StoreBridgeSide(hub, "ryzen2", () => now + 1_000, false, true);
+    await side.mirror({ ...presence, hosts: [{ ...presence.hosts[0]!, observedAt: now + 1_000 }] });
+    await side.flushLeaseEffects();
+    const current = readHostLease(hub.root, peer.host.id)!;
+    expect(acquisitions).toBe(2);
+    expect(current.incarnationToken).toBe("same-owner-token");
+    expect(current.mirror?.observedAt).toBe(now + 2_000);
+    expect(current.expiresAt).toBe(now + 17_000);
+    expect(current.bridgeSupersededTokens).toEqual(expect.arrayContaining(["current-retired", "planned-retired"]));
+  });
+
+  it.each([false, true])("recovery keeps a native file-first owner with deferred installs=%s", async deferred => {
+    const hub = store("sqlite");
+    const now = Date.now();
+    const peer = remote(`native-recovery-${deferred}`, now);
+    const dead = new CommitOutbox(hub, "bridge/ryzen2", bridgeIdentity, {});
+    const lease = { id: peer.host.id, rootId: peer.host.rootId, identityId: peer.identity.id,
+      startedAt: now, incarnationToken: "mirror-token", updatedAt: now, expiresAt: now + 30_000 };
+    await hub.writeBatch({ identity: bridgeIdentity, ops: [], prepare: () => dead.plan().stage([{
+      kind: "put", key: hostKey(peer.host.id), identity: peer.identity,
+      value: { ...peer.host, incarnationToken: "mirror-token", remoteHost: "ryzen2" },
+    }], [{ kind: "lease", key: `lease:${peer.host.id}`, payload: lease }]) });
+    const nativeLease = { ...lease, incarnationToken: "native-token", startedAt: now + 1,
+      writer: { pid: process.pid, host: "native", releaseSha: "test", lockProtocol: 1, stateBackend: "sqlite", startedAt: now + 1 } };
+    writeHostLease(hub.root, nativeLease);
+    const side = new StoreBridgeSide(hub, "ryzen2", () => now, false, deferred);
+    await side.mirror({ hosts: [], participants: [] });
+    await side.flushLeaseEffects();
+    expect(readHostLease(hub.root, peer.host.id)).toEqual(nativeLease);
+    expect(hub.listAll(dead.prefix, { fresh: true })).toEqual([]);
+  });
+
   it("records lease rows in a changing commit, writes the lease after it and never uses exclusive()", async () => {
     const hub = store();
     const side = new StoreBridgeSide(hub, "ryzen2");

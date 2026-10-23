@@ -1746,14 +1746,23 @@ describe("malformed direct RPC recovery custody", () => {
     const legacy = fixture("recovery-root", undefined, NOW, NOW + 120_000);
     const unrelated = fixture("recovery-unrelated", "U", NOW, NOW + 120_000);
     for (let pass = 0; pass < 3; pass++) {
+      // A real participant change keeps this a state-changing pass. Equal lease-only
+      // renewals need no writeBatch, so a writer spy on an unchanged pass proved no retry.
+      const progress = { ...unrelated.participant, status: `pass-${pass}` };
       const write = f.work.writeBatch.bind(f.work);
+      const retryKey = "topology/hosts/retry-probe";
       const retry = pass === 1 && backend === "sqlite" ? vi.spyOn(f.work, "writeBatch").mockImplementationOnce(async batch => {
-        await write({ identity, ops: [{ kind: "put", key: "topology/hosts/retry-probe", value: {} }] });
+        await write({ identity, ops: [{ kind: "put", key: retryKey, value: { concurrent: true } }] });
         return write(batch);
       }) : undefined;
-      await remote.mirror({ hosts: [{ record: { ...legacy.host, updatedAt: NaN }, expiresAt: NOW + 120_000,
-        observedAt: NOW + 20_000 }, ...unrelated.presence.hosts], participants: [legacy.participant, unrelated.participant] });
-      if (retry) { expect(retry).toHaveBeenCalledTimes(2); retry.mockRestore(); }
+      try {
+        await remote.mirror({ hosts: [{ record: { ...legacy.host, updatedAt: NaN }, expiresAt: NOW + 120_000,
+          observedAt: NOW + 20_000 }, ...unrelated.presence.hosts], participants: [legacy.participant, progress] });
+        if (retry) expect(f.work.get(retryKey, { fresh: true })?.value).toEqual({ concurrent: true });
+      } finally { retry?.mockRestore(); }
+      // The concurrent topology commit must not lose the admitted update, nor replay
+      // pending effects for the malformed root. Both outcomes, not writer counts, matter.
+      expect(f.work.get(participantKey(unrelated.host.id), { fresh: true })?.value).toMatchObject({ status: progress.status });
       expect(f.work.get(hostKey(b.host.id), { fresh: true })).toEqual(before.host);
       expect(f.work.get(participantKey(b.host.id), { fresh: true })).toEqual(before.participant);
       expect(fs.readFileSync(hostLeasePath(f.work.root, b.host.id))).toEqual(before.lease);
@@ -1795,10 +1804,9 @@ describe("commit-time lease identity digest", () => {
       reserved: [],
     };
     const write = store.writeBatch.bind(store);
-    let batches = 0;
-    vi.spyOn(store, "writeBatch").mockImplementation(async input => {
-      batches += 1;
-      if (batches === 1) writeHostLease(store.root, retargetedLease);
+    let retargeted = false;
+    const writer = vi.spyOn(store, "writeBatch").mockImplementation(async input => {
+      if (!retargeted) { retargeted = true; writeHostLease(store.root, retargetedLease); }
       return write(input);
     });
 
@@ -1809,7 +1817,21 @@ describe("commit-time lease identity digest", () => {
     expect(fs.readFileSync(hostLeasePath(store.root, ownerBefore.host.id))).toEqual(before.lease);
     expect(readHostLease(store.root, claimant.host.id)).toMatchObject(retargetedLease);
     expect(store.get(hostKey(claimant.host.id), { fresh: true })).toBeUndefined();
-    expect(batches).toBe(backend === "sqlite" ? 2 : 1);
+    expect(retargeted).toBe(true);
+    writer.mockRestore();
+
+    // Counterexample: the same foreign lease, without its newly introduced owner
+    // alias, must no longer block that owner's legitimate incarnation transition.
+    // This orphaned, noncanonical ghost is not native owner evidence: without a
+    // cross-root alias both legitimate direct roots can be admitted.
+    writeHostLease(store.root, ghostLease);
+    await side.mirror(candidate, NOW);
+    expect(store.get(hostKey(ownerNext.host.id), { fresh: true })?.value).toMatchObject({
+      incarnationToken: "B1", bridgeSupersededTokens: ["B0"],
+    });
+    expect(readHostLease(store.root, ownerNext.host.id)).toMatchObject({ incarnationToken: "B1" });
+    expect(store.get(hostKey(claimant.host.id), { fresh: true })?.value).toMatchObject({ incarnationToken: "X", remoteHost: "intel1" });
+    expect(readHostLease(store.root, claimant.host.id)).toMatchObject({ identityId: claimant.host.id, incarnationToken: "X" });
   });
 });
 

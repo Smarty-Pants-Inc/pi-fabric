@@ -7,7 +7,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { Readable, Writable } from "node:stream";
 import { ownProcessIncarnation, readPhysicalHostIdentity, readFileRetrying, writeFileAtomic, writeJsonAtomic } from "../core/atomic-write.js";
-import { type BridgeLeaseProcess, type FabricHostLease, type FabricMirrorLease, MIRROR_FRESH_MS, hostLeaseCacheGeneration, hostLeaseGeneration, hostLeaseExpiry, hostLeasePath, hostLiveness, readHostLease, readHostLeases, removeHostLeaseIf, STATE_LEASE_RENEW_MS, writeHostLease, writeHostLeaseAsync } from "../topology/host-leases.js";
+import { type BridgeLeaseProcess, type FabricHostLease, type FabricMirrorLease, MIRROR_FRESH_MS, hostLeaseCacheGeneration, hostLeaseExpiry, hostLeasePath, hostLiveness, readHostLease, readHostLeases, removeHostLeaseIf, STATE_LEASE_RENEW_MS, writeHostLease, writeHostLeaseAsync } from "../topology/host-leases.js";
 import { meshDirectoryStamp } from "../topology/publication-generation.js";
 import type { FabricHostRecord, FabricParticipantRecord } from "../topology/types.js";
 import { ROOT_ID_PREFIX } from "../topology/root-inbox-shared.js";
@@ -812,7 +812,6 @@ export class StoreBridgeSide implements BridgeSide {
   #leaseCustodyIds: ReadonlySet<string> | undefined;
   #expectedLeaseVersions: ReadonlyMap<string, number> | undefined;
   readonly #leaseSnapshotsByView = new WeakMap<object, ReadonlyMap<string, FabricHostLease>>();
-  readonly #lastWrittenLeases = new Map<string, string>();
   #leaseEffectsTail: Promise<void> = Promise.resolve();
   // Active only during one mirror commit attempt, including recovery and post-commit retries.
   #skippedRoots: ReadonlySet<string> | undefined;
@@ -857,10 +856,10 @@ export class StoreBridgeSide implements BridgeSide {
           typeof gone.startedAt !== "number") return;
         // A lease without an incarnation is a mirror lease of an earlier release (or a writer from
         // before lease incarnations): root and identity decide it, as before.
-        const removed = removeHostLeaseIf(this.store.root, gone.id, (lease) => lease.id === gone.id && lease.rootId === gone.rootId &&
-          lease.identityId === gone.identityId && lease.incarnationToken === gone.incarnationToken &&
-          (lease.startedAt === undefined || lease.startedAt === gone.startedAt));
-        if (removed) this.#lastWrittenLeases.delete(gone.id);
+        if (participantFilePresent(this.store.root, keyFor(PARTICIPANT_PREFIX, gone.id))) return;
+        removeHostLeaseIf(this.store.root, gone.id, (lease) => !nativeLeaseLive(lease, this.now()) &&
+          lease.id === gone.id && lease.rootId === gone.rootId && lease.identityId === gone.identityId &&
+          lease.incarnationToken === gone.incarnationToken && (lease.startedAt === undefined || lease.startedAt === gone.startedAt));
       },
     }, this.deferLeaseInstalls ? {
       lease: async (lease: BridgeLease, view, replay) => {
@@ -1646,14 +1645,13 @@ export class StoreBridgeSide implements BridgeSide {
   }
 
   #scheduleLeaseEffects(plan: CommitOutboxPlan, custodyIds: readonly string[], expectedVersions: ReadonlyMap<string, number>,
-    snapshot: ReadonlyMap<string, FabricHostLease>, generations: ReadonlyMap<string, string>, halted: () => boolean,
+    snapshot: ReadonlyMap<string, FabricHostLease>, halted: () => boolean,
     allowedLeaseCount?: number): void {
     const work = this.#leaseEffectsTail.then(async () => {
       await this.#mirrorIdle;
       await new Promise<void>(resolve => setImmediate(resolve));
     }).then(async () => {
       await this.#withLeaseCustody(custodyIds, async () => {
-        if ([...generations].some(([id, generation]) => hostLeaseGeneration(this.store.root, id) !== generation)) return;
         if (halted()) return;
         const view = this.#currentView();
         this.#leaseSnapshotsByView.set(view, snapshot);
@@ -2113,7 +2111,7 @@ export class StoreBridgeSide implements BridgeSide {
       const filesGenerationBefore = carry?.filesGeneration ?? participantDirectoryGeneration(this.store.root);
       const files = carry?.files ?? participantFileSnapshot(this.store.root);
       const filesGeneration = carry?.filesGeneration ?? participantDirectoryGeneration(this.store.root);
-      if (filesGenerationBefore !== filesGeneration) { carry = undefined; continue; }
+      if (filesGenerationBefore !== filesGeneration) { lastStale = "participant files changed while reading"; carry = undefined; continue; }
       const leaseSnapshot = carry?.leaseSnapshot ?? readHostLeases(this.store.root);
       const leaseGeneration = carry?.leaseGeneration ?? hostLeaseCacheGeneration(this.store.root);
       const early = carry?.early ?? (this.store.stateBackend === "sqlite" ? this.store.stateView()
@@ -2184,7 +2182,10 @@ export class StoreBridgeSide implements BridgeSide {
       let preparedLeaseGeneration = leaseGeneration;
       const externalInputsStable = (identifiers?: ReadonlySet<string>): boolean => {
         if (participantDirectoryGeneration(this.store.root) !== filesGeneration ||
-          meshDirectoryStamp(this.store.root, "participants") !== filesStamp) return false;
+          meshDirectoryStamp(this.store.root, "participants") !== filesStamp) {
+          lastStale = "participant files changed before lease custody";
+          return false;
+        }
         // Custody acquisition yields once per selected host. Unrelated native heartbeats
         // can change the directory on every acquisition at fleet scale: rejecting the old
         // GLOBAL generation here starved every batch forever. Re-read outside state custody
@@ -2192,9 +2193,16 @@ export class StoreBridgeSide implements BridgeSide {
         // into its ids), then fence the short writer-acquisition gap with the new generation.
         const currentLeases = readHostLeases(this.store.root);
         preparedLeaseGeneration = hostLeaseCacheGeneration(this.store.root);
-        return leaseIncarnationDigest(leaseSnapshot, identifiers === undefined, identifiers) ===
-          leaseIncarnationDigest(currentLeases, identifiers === undefined, identifiers) &&
-          (!judgesLeaseLiveness || sameLeaseLiveness(leaseSnapshot, planned.judged.now, this.now(), identifiers));
+        if (leaseIncarnationDigest(leaseSnapshot, identifiers === undefined, identifiers) !==
+          leaseIncarnationDigest(currentLeases, identifiers === undefined, identifiers)) {
+          lastStale = "consulted lease authority changed before lease custody";
+          return false;
+        }
+        if (judgesLeaseLiveness && !sameLeaseLiveness(leaseSnapshot, planned.judged.now, this.now(), identifiers)) {
+          lastStale = "consulted native lease liveness changed before lease custody";
+          return false;
+        }
+        return true;
       };
       this.#skippedRoots = skippedRoots;
       let preparedRevision: string | undefined;
@@ -2202,9 +2210,9 @@ export class StoreBridgeSide implements BridgeSide {
       try {
         if (!partial && !recoveryAttempted && outboxEntries.length > 0 && planned) {
           const recovered = await this.#recoverOutbox(outboxEntries, halted, () => {
-            if (!externalInputsStable()) throw new MirrorPlanStale();
-            if (early && !this.store.stateUnchangedSince(early.revision, HELD_STATE_PREFIXES)) throw new MirrorPlanStale();
-            if (!compute(this.#currentView(), files, leaseSnapshot)) throw new MirrorPlanStale();
+            if (!externalInputsStable()) throw new MirrorPlanStale(lastStale);
+            if (early && !this.store.stateUnchangedSince(early.revision, HELD_STATE_PREFIXES)) throw new MirrorPlanStale("topology changed before outbox recovery");
+            if (!compute(this.#currentView(), files, leaseSnapshot)) throw new MirrorPlanStale("outbox recovery plan unavailable");
           }, leaseSnapshot);
           recoveryAttempted = true;
           if (recovered) { carry = undefined; attempt = -1; continue; }
@@ -2219,13 +2227,14 @@ export class StoreBridgeSide implements BridgeSide {
         if (early && batchOps.length === 0) {
           await this.#withLeaseCustody(custodyIds, () => {
             if (halted()) return;
-            if (!externalInputsStable(batchScope) || !this.store.stateUnchangedSince(early.revision, HELD_STATE_PREFIXES)) {
-              throw new MirrorPlanStale();
+            if (!externalInputsStable(batchScope)) throw new MirrorPlanStale(lastStale);
+            if (!this.store.stateUnchangedSince(early.revision, HELD_STATE_PREFIXES)) {
+              throw new MirrorPlanStale("topology changed before lease-only effects");
             }
             const view = this.#currentView();
             this.#leaseSnapshotsByView.set(view, leaseSnapshot);
             const result = compute(view, files, leaseSnapshot);
-            if (!result || result.ops.length !== 0) throw new MirrorPlanStale();
+            if (!result || result.ops.length !== 0) throw new MirrorPlanStale("lease-only recompute requires state operations");
             leases = result.leases.filter(lease => selectedLeases.has(lease.id)).map(lease => {
               const sample = lease.mirror;
               if (!sample) return lease;
@@ -2239,10 +2248,8 @@ export class StoreBridgeSide implements BridgeSide {
               return [key, view.version(key)] as const;
             }));
             for (const gone of removed) expected.set(gone.key, view.version(gone.key));
-            const generations = new Map([...leases.map(lease => lease.id), ...removed.map(gone => gone.id)]
-              .map(id => [id, hostLeaseGeneration(this.store.root, id)] as const));
             if (this.deferLeaseInstalls) {
-              this.#scheduleLeaseEffects(plan, custodyIds, expected, leaseSnapshot, generations, halted,
+              this.#scheduleLeaseEffects(plan, custodyIds, expected, leaseSnapshot, halted,
                 partial ? leases.length : undefined);
             } else {
               this.#expectedLeaseVersions = expected;
@@ -2263,7 +2270,7 @@ export class StoreBridgeSide implements BridgeSide {
         } else {
 
         await this.#withLeaseCustody(custodyIds, async () => {
-          if (!externalInputsStable(batchScope)) throw new MirrorPlanStale();
+          if (!externalInputsStable(batchScope)) throw new MirrorPlanStale(lastStale);
           await this.store.writeBatch({
             identity: this.#identity(),
             lockClass: "bridge",
@@ -2279,7 +2286,7 @@ export class StoreBridgeSide implements BridgeSide {
               let result: ReturnType<typeof compute>;
               if (early && planned && this.store.stateUnchangedSince(early.revision, HELD_STATE_PREFIXES)) {
                 if (judgesLeaseLiveness && !sameLeaseLiveness(planned.judged.leases, planned.judged.now, this.now(), batchScope)) {
-                  throw new MirrorPlanStale();
+                  throw new MirrorPlanStale("consulted native lease liveness changed while acquiring SQLite");
                 }
                 result = planned;
               } else if (early) throw new MirrorPlanStale("topology changed while acquiring SQLite");
@@ -2336,9 +2343,7 @@ export class StoreBridgeSide implements BridgeSide {
               for (const gone of removed) if (!expected.has(gone.key)) expected.set(gone.key, committed.view.version(gone.key));
               this.#leaseSnapshotsByView.set(committed.view, leaseSnapshot);
               if (this.deferLeaseInstalls) {
-                const generations = new Map([...leases.map(lease => lease.id), ...removed.map(gone => gone.id)]
-                  .map(id => [id, hostLeaseGeneration(this.store.root, id)] as const));
-                this.#scheduleLeaseEffects(plan, custodyIds, expected, leaseSnapshot, generations, halted,
+                this.#scheduleLeaseEffects(plan, custodyIds, expected, leaseSnapshot, halted,
                   partial ? leases.length : undefined);
                 return;
               }
@@ -2401,10 +2406,22 @@ export class StoreBridgeSide implements BridgeSide {
     const sourceDeadline = sample ? sample.observedAt +
       Math.min(BRIDGE_LEASE_MS, sample.sourceExpiresAt - sample.sourceObservedAt) : undefined;
     if (sourceDeadline !== undefined) lease = { ...lease, expiresAt: Math.min(lease.expiresAt, sourceDeadline) };
-    // Mirror planning captured one in-memory lease snapshot before state commit. Use that value
-    // for replay ordering; never re-read each lease file in the install path.
-    const snapshot = this.#leaseSnapshotsByView.get(view);
-    const prior = snapshot ? snapshot.get(lease.id) : undefined;
+    // These handlers run OUTSIDE SQLite writer custody, under this id's lease gate. A
+    // different process may have written its native lease/participant claim before its SQL
+    // row, with this process's watch callback still pending. Neither the committed mirror
+    // view nor a process-local generation is authority for overwriting that current file.
+    const captured = this.#leaseSnapshotsByView.get(view)?.get(lease.id);
+    const prior = readHostLease(this.store.root, lease.id);
+    if (participantFilePresent(this.store.root, keyFor(PARTICIPANT_PREFIX, lease.id))) return undefined;
+    if (prior && nativeLeaseLive(prior, this.now())) return undefined;
+    const sameOwner = (left: FabricHostLease, right: FabricHostLease): boolean =>
+      left.id === right.id && left.rootId === right.rootId && left.identityId === right.identityId &&
+      left.incarnationToken === right.incarnationToken &&
+      (left.incarnationToken !== undefined || left.startedAt === right.startedAt);
+    // A live replacement may replace the predecessor it actually observed. Recovery may
+    // not replace a different current owner; nor may a deferred effect replace an owner
+    // that arrived in the custody gap. Same-token renewals/history repairs still merge below.
+    if (prior && !sameOwner(prior, lease) && (replay || !captured || !sameOwner(prior, captured))) return undefined;
     if (prior?.rootId === lease.rootId) {
       if (olderBridgeIncarnation(lease, bridgeSupersededTokensOf(prior.bridgeSupersededTokens))) return undefined;
       if (bridgeIncarnationWithFloor(lease, [prior]).startedAt !== incarnationOf(lease).startedAt) return undefined;
@@ -2436,14 +2453,9 @@ export class StoreBridgeSide implements BridgeSide {
       ...(history.tokens.length > 0 ? { bridgeSupersededTokens: history.tokens } : {}),
       ...(Object.keys(history.seen).length > 0 ? { bridgeSupersededTokenSeen: history.seen } : {}) };
     const digest = contentDigest(repaired);
-    if (snapshot) {
-      if (prior && contentDigest(prior) === digest) {
-        this.#lastWrittenLeases.set(lease.id, digest);
-        return undefined;
-      }
-      this.#lastWrittenLeases.delete(lease.id);
-    }
-    if (this.#lastWrittenLeases.get(lease.id) === digest) return undefined;
+    // Only current bytes prove an unchanged install. A local last-written digest could
+    // otherwise suppress recreation after another process removed/replaced the file.
+    if (prior && contentDigest(prior) === digest) return undefined;
     return repaired;
   }
 
@@ -2451,14 +2463,12 @@ export class StoreBridgeSide implements BridgeSide {
     const repaired = this.#leaseToInstall(lease, view, replay);
     if (!repaired) return;
     writeHostLease(this.store.root, repaired);
-    this.#lastWrittenLeases.set(lease.id, contentDigest(repaired));
   }
 
   async #applyLeaseAsync(lease: BridgeLease, view: MeshBatchView, replay: boolean): Promise<void> {
     const repaired = this.#leaseToInstall(lease, view, replay);
     if (!repaired) return;
     await writeHostLeaseAsync(this.store.root, repaired);
-    this.#lastWrittenLeases.set(lease.id, contentDigest(repaired));
   }
 
   async bridgedIds(after: number): Promise<BridgedIds> {
@@ -3409,6 +3419,7 @@ export class MeshBridge {
   #ready = false;
   readonly #relayDeliveries = new Set<Promise<void>>();
   #wake: (() => void) | undefined;
+  readonly #startupRetryWakes = new Set<() => void>();
   #notificationMode = false;
   #changesPending = false;
   #notificationError: Error | undefined;
@@ -3753,8 +3764,18 @@ export class MeshBridge {
         const remaining = retryDeadline - Date.now();
         if (this.#stopped || !isBridgeRetryable(error) || remaining <= 0) throw error;
         const waitMs = Math.min(retryMs, remaining);
-        this.#log(`bridge startup ${meshBusyLabel(error)}; retrying in ${waitMs} ms`);
-        await new Promise<void>(resolve => setTimeout(resolve, waitMs));
+        this.#log(`bridge startup ${meshBusyLabel(error)}; retrying in ${waitMs} ms` +
+          (isMeshSnapshotRetriesExhausted(error) ? `: ${(error as Error).message}` : ""));
+        await new Promise<void>(resolve => {
+          const wake = (): void => {
+            clearTimeout(timer);
+            this.#startupRetryWakes.delete(wake);
+            resolve();
+          };
+          const timer = setTimeout(wake, waitMs);
+          this.#startupRetryWakes.add(wake);
+          if (this.#stopped) wake();
+        });
         retryMs = Math.min(retryMs * 2, LOCK_RETRY_MAX_MS);
       }
     }
@@ -4997,6 +5018,7 @@ export class MeshBridge {
     };
     this.#stopped = true;
     this.#ready = false;
+    for (const wake of this.#startupRetryWakes) wake();
     this.#wake?.();
     this.#watchdogWake?.();
     for (const direction of ["toRemote", "toLocal"] as const) this.#directionWake[direction]?.();

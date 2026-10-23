@@ -196,6 +196,73 @@ const waitFor = async (check: () => boolean): Promise<void> => {
 };
 
 describe("bridge startup lock-timeout retry", () => {
+  it.each([1, 4])("settles run on stop during startup backoff after attempt %s", async attempt => {
+    const { bridge, logs } = setup(undefined, { stopMs: 100 });
+    const side = bridge.options.local as StoreBridgeSide;
+    const attempts: number[] = [];
+    vi.spyOn(side, "latestCursor").mockImplementation(async () => { attempts.push(Date.now()); throw lockTimeout(); });
+    let failure: unknown;
+    const running = bridge.run().catch(error => { failure = error; });
+    try {
+      await waitFor(() => attempts.length >= attempt);
+      // Startup has its own finite retry budget and per-attempt diagnostics. These
+      // are not the runtime loop's single coalesced line or configurable WAL backoff.
+      expect(logs.filter(line => line.startsWith("bridge startup") && line.includes("retrying"))).toHaveLength(attempt);
+      const before = attempts.length;
+      const started = Date.now();
+      await bridge.stop();
+      await running;
+      expect(attempts).toHaveLength(before);
+      expect(failure).toBeUndefined();
+      expect(Date.now() - started).toBeLessThan(500);
+    } finally { await bridge.stop(); await running; }
+  });
+
+  it("settles startup when its fourth retry log stops before wake registration", async () => {
+    const { bridge, logs } = setup(undefined, { stopMs: 100 });
+    const side = bridge.options.local as StoreBridgeSide;
+    let attempts = 0;
+    let stoppedAt = 0;
+    let stopping: Promise<void> | undefined;
+    vi.spyOn(side, "latestCursor").mockImplementation(async () => { attempts += 1; throw lockTimeout(); });
+    bridge.options.log = line => {
+      logs.push(line);
+      if (line.startsWith("bridge startup") && attempts === 4) {
+        stoppedAt = Date.now();
+        stopping = bridge.stop();
+      }
+    };
+    const running = bridge.run();
+    try {
+      await running;
+      await stopping;
+      expect(stoppedAt).toBeGreaterThan(0);
+      expect(attempts).toBe(4);
+      expect(Date.now() - stoppedAt).toBeLessThan(500);
+    } finally { await bridge.stop(); await running; }
+  });
+
+  it("keeps all four startup backoffs when not stopped and then succeeds", async () => {
+    const { bridge, logs } = setup();
+    const side = bridge.options.local as StoreBridgeSide;
+    const original = side.latestCursor.bind(side);
+    const attempts: number[] = [];
+    vi.spyOn(side, "latestCursor").mockImplementation(async () => {
+      attempts.push(Date.now());
+      if (attempts.length <= 4) throw lockTimeout();
+      return original();
+    });
+    try {
+      await bridge.start();
+      // Five initialization attempts, then the ordinary presence head read.
+      expect(attempts).toHaveLength(6);
+      for (let index = 1; index <= 4; index += 1) {
+        expect(attempts[index]! - attempts[index - 1]!).toBeGreaterThanOrEqual(80 * 2 ** (index - 1));
+      }
+      expect(logs.filter(line => line.startsWith("bridge startup"))).toHaveLength(4);
+    } finally { await bridge.stop(); }
+  });
+
   it("retries a remote agent's first mirror lock timeout without restarting the bridge", async () => {
     let agent!: StoreBridgeSide;
     const { hub, far, bridge, logs } = setup(undefined, { agent: store => agent = new StoreBridgeSide(store, "dev1") });
@@ -1151,59 +1218,64 @@ describe("mesh bridge", () => {
     }
   });
 
-  it("wakes a capped lock backoff on stop and makes no further pass", async () => {
-    let calls = 0;
-    const { bridge, logs } = setup(undefined, {
-      stopMs: 100,
-      local: (store, peer) => {
-        const side = new StoreBridgeSide(store, peer);
-        side.latestCursor = async () => { calls++; throw lockTimeout(); };
-        return side;
-      },
-    });
+  it("wakes a capped runtime lock backoff on stop and makes no further pass", async () => {
+    const { bridge, logs } = setup(undefined, { stopMs: 100 });
+    await bridge.start();
+    // latestCursor runs inside start()'s separate bounded retry loop, not run()'s
+    // coalesced, interruptible backoff. Enter runtime first, then fail its real read.
+    const side = bridge.options.local as StoreBridgeSide;
+    const attempts: number[] = [];
+    vi.spyOn(side, "presence").mockImplementation(async () => { attempts.push(Date.now()); throw lockTimeout(); });
     const running = bridge.run();
-    await waitFor(() => calls >= 4); // 100, 200, 400 ms backoffs; now waiting 800 ms
-    expect(logs.filter(line => line.includes("retrying"))).toHaveLength(1);
-    const before = calls;
-    const started = Date.now();
-    await bridge.stop();
-    await running;
-    expect(Date.now() - started).toBeLessThan(500);
-    expect(calls).toBe(before);
+    try {
+      await waitFor(() => attempts.length >= 4); // 100, 200, 400 ms; now waiting 800 ms
+      expect(logs.filter(line => line.includes("retrying"))).toHaveLength(1);
+      expect(logs.some(line => line.startsWith("bridge startup"))).toBe(false);
+      for (let index = 1; index < 4; index++) {
+        expect(attempts[index]! - attempts[index - 1]!).toBeGreaterThanOrEqual(90 * 2 ** (index - 1));
+      }
+      const before = attempts.length;
+      const started = Date.now();
+      await bridge.stop();
+      await running;
+      expect(Date.now() - started).toBeLessThan(500);
+      expect(attempts).toHaveLength(before);
+    } finally { await bridge.stop(); await running; }
   });
 
-  it("retries a WAL-cap refusal on the next cycle, logs it once with the reader report, and never stops (pi-fabric#694 P1 2)", async () => {
-    let calls = 0;
+  it("retries a runtime WAL-cap refusal on the next cycle, logs it once with the reader report, and forwards once (pi-fabric#694 P1 2)", async () => {
+    const { hub, far, bridge, logs } = setup(undefined, { stopMs: 100, walCapRetryMinMs: 40 });
+    const lane = await addRoot(hub, "wal-lane");
+    const forge = await addRoot(far, "wal-forge");
+    await bridge.start();
+    const side = bridge.options.local as StoreBridgeSide;
+    const original = side.presence.bind(side);
     const at: number[] = [];
-    const { bridge, logs } = setup(undefined, {
-      stopMs: 100,
-      walCapRetryMinMs: 40,
-      local: (store, peer) => {
-        const side = new StoreBridgeSide(store, peer);
-        const original = side.latestCursor.bind(side);
-        side.latestCursor = async (...args: Parameters<typeof original>) => {
-          calls += 1;
-          at.push(Date.now());
-          if (calls <= 3) throw new MeshStateWalCapError(9 * 1024 * 1024, 8 * 1024 * 1024, "pid 4242 (pinner)");
-          return original(...args);
-        };
-        return side;
-      },
+    vi.spyOn(side, "presence").mockImplementation(async () => {
+      at.push(Date.now());
+      if (at.length <= 3) throw new MeshStateWalCapError(9 * 1024 * 1024, 8 * 1024 * 1024, "pid 4242 (pinner)");
+      return original();
     });
+    const sent = await far.publish({ topic: "fleet.work.wal.1", kind: "ask", from: forge.identity,
+      to: lane.hostId, text: "retained through WAL pressure" });
     let failure: unknown;
     const running = bridge.run().catch((error: unknown) => { failure = error; });
     try {
-      await waitFor(() => calls >= 4); // three refusals retried on later cycles, then the start pass reads the cursor
+      await waitFor(() => on(hub, "fleet.work.wal.1").length === 1);
+      expect(at.length).toBeGreaterThanOrEqual(4);
       const capLogs = logs.filter((line) => line.includes("mesh state WAL cap; retrying"));
-      expect(capLogs).toHaveLength(1); // three refusals within a minute: one line
+      expect(capLogs).toHaveLength(1); // three runtime refusals within a minute: one line
+      expect(logs.some(line => line.startsWith("bridge startup"))).toBe(false);
       // pi-fabric#893 round 3: sizes and a reader count only, never the readers' pids or command lines.
       expect(capLogs[0]).toContain("WAL reader(s)");
       expect(capLogs[0]).not.toMatch(/4242|pinner/);
       expect(isMeshRetryableBusy(new MeshStateWalCapError(2, 1))).toBe(true);
-      // Backed off, never a tight loop: waits of 40, 80, 160 ms between the four calls.
       expect(capLogs[0]).toContain("retrying in 40 ms");
-      expect(at[1]! - at[0]!).toBeGreaterThanOrEqual(35);
-      expect(at[3]! - at[2]!).toBeGreaterThanOrEqual(150);
+      for (let index = 1; index < 4; index++) {
+        expect(at[index]! - at[index - 1]!).toBeGreaterThanOrEqual(35 * 2 ** (index - 1));
+      }
+      expect(on(hub, "fleet.work.wal.1").map(event => (event.data as { bridge: { id: string } }).bridge.id)).toEqual([sent.id]);
+      expect(logs.some(line => /dropped|refused/.test(line))).toBe(false);
       expect(failure).toBeUndefined();
     } finally {
       await bridge.stop();

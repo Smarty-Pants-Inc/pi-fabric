@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { AckPolicy, DeliverPolicy, ReplayPolicy, type ConsumerAPI, type ConsumerInfo } from "@nats-io/jetstream";
+import { AckPolicy, DeliverPolicy, JetStreamApiError, ReplayPolicy, type ConsumerAPI, type ConsumerInfo } from "@nats-io/jetstream";
 import { openNatsConnection } from "../src/transport/nats/connection.js";
 import {
   LEASE_TTL_MS,
@@ -49,9 +49,14 @@ const consumerInfo = (inactiveThreshold?: number): ConsumerInfo => ({
   },
 } as unknown as ConsumerInfo);
 
-const consumerApi = (info: ConsumerInfo): ConsumerAPI => ({
-  info: async () => info,
-} as unknown as ConsumerAPI);
+const consumerApi = (info: ConsumerInfo) => ({
+  info: vi.fn(async () => info),
+  update: vi.fn(async (_stream: string, _durable: string, patch: Record<string, unknown>) => ({
+    ...info, config: { ...info.config, ...patch },
+  })),
+  add: vi.fn(),
+  delete: vi.fn(),
+});
 
 describe("inbox consumer inactive-threshold policy", () => {
   const basePolicy = {
@@ -62,15 +67,89 @@ describe("inbox consumer inactive-threshold policy", () => {
     maxAckPending: 128,
   };
 
-  it("accepts the configured ephemeral threshold and still refuses it for normal hosts", async () => {
-    const thresholdNs = 300 * 1_000_000_000;
-    await expect(ensureTransportConsumer(consumerApi(consumerInfo(thresholdNs)), {
-      ...basePolicy, inactiveThresholdNs: thresholdNs,
+  it.each([604_800_000_000_000, 300_000_000_000])("accepts an exact bounded threshold %s without mutation", async thresholdNs => {
+    const api = consumerApi(consumerInfo(thresholdNs));
+    await expect(ensureTransportConsumer(api as unknown as ConsumerAPI, {
+      ...basePolicy, ...(thresholdNs === 604_800_000_000_000 ? {} : { inactiveThresholdNs: thresholdNs }),
     })).resolves.toMatchObject({ config: { inactive_threshold: thresholdNs } });
-    await expect(ensureTransportConsumer(consumerApi(consumerInfo(thresholdNs)), basePolicy))
-      .rejects.toThrow("NATS consumer configuration mismatch: policy-test");
-    await expect(ensureTransportConsumer(consumerApi(consumerInfo(0)), basePolicy))
-      .resolves.toMatchObject({ config: { inactive_threshold: 0 } });
+    expect(api.update).not.toHaveBeenCalled();
+    expect(api.add).not.toHaveBeenCalled();
+    expect(api.delete).not.toHaveBeenCalled();
+  });
+
+  it.each([undefined, 0])("updates only the legacy threshold %s in place", async thresholdNs => {
+    const info = { ...consumerInfo(thresholdNs), num_pending: 7, num_ack_pending: 2,
+      ack_floor: { consumer_seq: 3, stream_seq: 4 }, delivered: { consumer_seq: 5, stream_seq: 6 } } as ConsumerInfo;
+    const api = consumerApi(info);
+    const updated = await ensureTransportConsumer(api as unknown as ConsumerAPI, basePolicy);
+    expect(updated).toEqual({ ...info, config: { ...info.config, inactive_threshold: 604_800_000_000_000 } });
+    expect(api.update).toHaveBeenCalledExactlyOnceWith(basePolicy.stream, basePolicy.durable, { inactive_threshold: 604_800_000_000_000 });
+    expect(api.add).not.toHaveBeenCalled();
+    expect(api.delete).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { filter_subject: "fabric.in.machine-a.>" }, { filter_subjects: ["fabric.in.machine-a.>"] },
+    { ack_policy: AckPolicy.None }, { description: "another owner" }, { durable_name: "another-durable" },
+    { deliver_subject: "push" }, { headers_only: true }, { replay_policy: ReplayPolicy.Original },
+    { max_waiting: 2 }, { deliver_policy: DeliverPolicy.New }, { ack_wait: 1 }, { max_deliver: 6 },
+    { max_ack_pending: 129 }, { backoff: [1] },
+  ])("refuses incompatible nonthreshold fields before mutation: %j", async patch => {
+    const info = consumerInfo(0);
+    Object.assign(info.config, patch);
+    const before = structuredClone(info);
+    const api = consumerApi(info);
+    await expect(ensureTransportConsumer(api as unknown as ConsumerAPI, basePolicy)).rejects.toThrow("consumer configuration mismatch");
+    expect(info).toEqual(before);
+    expect(api.update).not.toHaveBeenCalled();
+    expect(api.add).not.toHaveBeenCalled();
+    expect(api.delete).not.toHaveBeenCalled();
+  });
+
+  it.each([1, 300_000_000_000, 777_600_000_000_000])("refuses a differing nonzero threshold %s without mutation", async thresholdNs => {
+    const api = consumerApi(consumerInfo(thresholdNs));
+    await expect(ensureTransportConsumer(api as unknown as ConsumerAPI, basePolicy)).rejects.toThrow("consumer configuration mismatch");
+    expect(api.update).not.toHaveBeenCalled();
+    expect(api.add).not.toHaveBeenCalled();
+    expect(api.delete).not.toHaveBeenCalled();
+  });
+
+  it.each([0, -1, NaN, Infinity, 0.5, Number.MAX_SAFE_INTEGER + 1])("refuses invalid low-level threshold %s before API calls", async inactiveThresholdNs => {
+    const api = consumerApi(consumerInfo(0));
+    await expect(ensureTransportConsumer(api as unknown as ConsumerAPI, { ...basePolicy, inactiveThresholdNs }))
+      .rejects.toThrow("inactiveThresholdNs must be a positive safe integer");
+    expect(api.info).not.toHaveBeenCalled();
+    expect(api.update).not.toHaveBeenCalled();
+    expect(api.add).not.toHaveBeenCalled();
+  });
+
+  it("creates a bounded durable by default", async () => {
+    const api = consumerApi(consumerInfo(604_800_000_000_000));
+    api.info.mockRejectedValueOnce(new JetStreamApiError({ code: 404, err_code: 10014, description: "consumer not found" }));
+    api.add.mockResolvedValue(consumerInfo(604_800_000_000_000));
+    await ensureTransportConsumer(api as unknown as ConsumerAPI, basePolicy);
+    expect(api.add).toHaveBeenCalledWith(basePolicy.stream, expect.objectContaining({ inactive_threshold: 604_800_000_000_000 }));
+    expect(api.update).not.toHaveBeenCalled();
+    expect(api.delete).not.toHaveBeenCalled();
+  });
+
+  it("checks a concurrent-create winner before migrating its legacy threshold", async () => {
+    const info = consumerInfo(0);
+    info.config.filter_subject = "fabric.in.machine-a.>";
+    const api = consumerApi(info);
+    api.info.mockRejectedValueOnce(new JetStreamApiError({ code: 404, err_code: 10014, description: "consumer not found" }));
+    api.add.mockRejectedValueOnce(new Error("concurrent create"));
+    await expect(ensureTransportConsumer(api as unknown as ConsumerAPI, basePolicy)).rejects.toThrow("consumer configuration mismatch");
+    expect(api.update).not.toHaveBeenCalled();
+    expect(api.delete).not.toHaveBeenCalled();
+    expect(info.config.inactive_threshold).toBe(0);
+  });
+
+  it("revalidates the update result", async () => {
+    const api = consumerApi(consumerInfo(0));
+    api.update.mockResolvedValueOnce(consumerInfo(0));
+    await expect(ensureTransportConsumer(api as unknown as ConsumerAPI, basePolicy)).rejects.toThrow("consumer configuration mismatch");
+    expect(api.delete).not.toHaveBeenCalled();
   });
 });
 
@@ -137,7 +216,7 @@ describe.skipIf(!binary)("real nats-server Path B module", () => {
         stream: transportInboxStream("machine-a"),
         durable,
         filterSubject: transportInboxFilter("machine-a", "runtime-provision"),
-        description: "test consumer",
+        description: JSON.stringify({ fabricHostId: "runtime-provision", machine: "machine-a" }),
         maxAckPending: 128,
       });
       expect(consumer.config.ack_policy).toBe("explicit");
@@ -145,7 +224,7 @@ describe.skipIf(!binary)("real nats-server Path B module", () => {
       expect(consumer.config.ack_wait).toBe(30_000_000_000);
       expect(consumer.config.max_deliver).toBe(5);
       expect(consumer.config.max_ack_pending).toBe(128);
-      expect(consumer.config.inactive_threshold ?? 0).toBe(0);
+      expect(consumer.config.inactive_threshold).toBe(604_800_000_000_000);
       expect(consumer.config.filter_subject).toBe(transportInboxFilter("machine-a", "runtime-provision"));
       expect(await transport.drainState()).toEqual({ pending: 0, ackPending: 0 });
     } finally {

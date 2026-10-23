@@ -1112,15 +1112,61 @@ retry horizon defaults to 30 seconds. On expiry, the error remains a
 have been persisted. Existing inbox streams with the current 10-minute
 `duplicate_window` remain unchanged.
 
-Main hosts keep durable inbox consumers by default. Short-lived child processes
-inherit the NATS policy with `ephemeralHost: true`, and `pi-fabric nats send`
-and `dispatch` also default to `ephemeralHost: true` with the one-hour inactive
-threshold. An explicit `PI_FABRIC_MESH_NATS` JSON value for `ephemeralHost` or
-`ephemeralInactiveSeconds` overrides the CLI default. Placement pod templates
-must set the same fields in their own `PI_FABRIC_MESH_NATS` environment; the pod
-should use `ephemeralHost: true` and `ephemeralInactiveSeconds: 3600` unless its
-lifetime needs a different threshold. Clean shutdown deletes these consumers;
-server-side inactivity expiry cleans up after unclean exits.
+Every host's durable inbox consumer has server-side inactivity expiry.
+`mesh.nats.inboxConsumerInactiveMs` defaults to `604800000` (seven days) and
+accepts integer milliseconds from `60000` through `7776000000` (60 seconds
+through 90 days). This host-only setting is inherited by child processes; a
+workspace cannot change it. Runtime startup updates a compatible legacy durable
+with `inactive_threshold: 0` in place, preserving its delivery and ACK state.
+It never deletes or recreates that consumer to apply the setting. Other
+consumer-policy mismatches still fail verification. A host that returns after
+its consumer has expired creates a new durable; replay is limited by the
+inbox stream's retained messages.
+
+Short-lived child processes inherit the NATS policy with `ephemeralHost: true`,
+and `pi-fabric nats send` and `dispatch` also default to `ephemeralHost: true`
+with a one-hour inactive threshold. The effective ephemeral threshold is no
+longer than `inboxConsumerInactiveMs`. An explicit `PI_FABRIC_MESH_NATS` JSON
+value for `ephemeralHost` or `ephemeralInactiveSeconds` overrides the CLI
+default. Placement pod templates must set the same fields in their own
+`PI_FABRIC_MESH_NATS` environment; the pod should use `ephemeralHost: true`
+and `ephemeralInactiveSeconds: 3600` unless its lifetime needs a different
+threshold. Clean shutdown deletes only these explicitly ephemeral consumers;
+server-side inactivity expiry cleans up after unclean exits. Fabric adds no
+consumer-cleanup polling.
+
+[NATS documents `InactiveThreshold` as editable](https://docs.nats.io/nats-concepts/jetstream/consumers#general),
+and [nats-server 2.14.7 updates its timer in place](https://github.com/nats-io/nats-server/blob/v2.14.7/server/consumer.go#L2614-L2622).
+[NATS 2.15.0 introduces a default limit of 1,000 consumers per stream](https://github.com/nats-io/nats-server/releases/tag/v2.15.0)
+unless stream or account limits specify otherwise. The limit prevents new
+consumer creation; it does not remove existing consumers. Older abandoned
+durables that no runtime reopens still need separately authorized cleanup;
+this change performs no bulk migration.
+
+To inspect abandoned durables, use the existing bootstrap-admin credentials
+(`PI_FABRIC_NATS_SERVERS` and `PI_FABRIC_NATS_CREDENTIALS`, as for provisioning):
+
+```sh
+./bin/fabric-transport-admin stale-consumers --machine machine-a --older-than 24h --ca-file /absolute/path/to/ca.pem
+```
+
+`--older-than` defaults to `24h` and accepts positive integer durations ending
+in `ms`, `s`, `m`, `h` or `d`. The JSON report lists all aged per-host durables
+whose host description, durable name and filter agree, including rows that are
+not cleanup candidates. Each row includes `durable_name`, `last_active`,
+`num_pending`, `num_ack_pending`, presence and lease observations, `eligible`
+and exclusion reasons. `last_active` is the latest broker delivery or ACK
+activity timestamp, falling back to creation time; it is not consumer-pull
+activity telemetry. `presence.row_exists` means a validated, unexpired
+presence row was observed. `presence.live` also requires a matching unexpired
+host lease. Pending messages, unexpired nonterminal presence, a live lease or
+unknown snapshot evidence prevent eligibility. Malformed identities and
+incomplete snapshots are reported as diagnostics, not treated as host absence.
+
+This is a read-only, non-atomic snapshot, not authorization to remove anything.
+It does not pull or ACK messages, create a KV watcher, change role grants,
+provision streams, or delete consumers. It reads no inbox message payloads.
+Cleanup of existing abandoned consumers remains a separate approved operation.
 
 The admin provisioning command defaults new inbox streams to seven days and
 accepts an explicit `--inbox-max-age-ms` value when provisioning a different

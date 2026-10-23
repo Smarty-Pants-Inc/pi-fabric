@@ -5,6 +5,7 @@ import { openBootstrapNatsConnection, openNatsConnection, type NatsPermissionPol
 import { consumeDeadLetters, ensureDeadLetterConsumer, type DeadLetterEnvelope, type DeadLetterSink } from "./dead-letter.js";
 import { openNatsKv } from "./kv.js";
 import { DEFAULT_INBOX_MAX_AGE_MS, isValidInboxMaxAgeMs } from "./inbox-policy.js";
+import { parseStaleConsumerAge, reportStaleConsumers } from "./stale-consumers.js";
 import { ensureTransportStream, INBOX_DUPLICATE_WINDOW_MS, type TransportStreamPolicy } from "./provision.js";
 import {
   ADVISORY_CAPTURE_STREAM,
@@ -214,6 +215,36 @@ async function orphan(args: readonly string[]): Promise<void> {
   }
 }
 
+async function staleConsumers(args: readonly string[]): Promise<void> {
+  const values = new Map<string, string>();
+  for (let index = 1; index < args.length; index += 2) {
+    const flag = args[index]!;
+    if (!["--machine", "--older-than", "--ca-file"].includes(flag)) throw new Error(`unsupported stale-consumers argument: ${flag}`);
+    if (values.has(flag)) throw new Error(`${flag} must not be specified more than once`);
+    const value = args[index + 1];
+    if (!value || value.startsWith("--")) throw new Error(`${flag} requires a value`);
+    values.set(flag, value);
+  }
+  const target = values.get("--machine");
+  if (!target) throw new Error("stale-consumers requires --machine <inbox-machine>");
+  const machine = validateMachine(target);
+  if (machine.trim() !== machine) throw new Error("invalid machine token");
+  const olderThanMs = parseStaleConsumerAge(values.get("--older-than"));
+  // Explicit bootstrap admin authority, exactly as provision. No new operator/runtime grants.
+  // The report uses metadata and raw presence/lease MSG.GET only; it never provisions or opens KV.
+  const connection = await openBootstrapNatsConnection({
+    servers: requiredEnv("PI_FABRIC_NATS_SERVERS"),
+    credentials: requiredEnv("PI_FABRIC_NATS_CREDENTIALS"),
+    name: "fabric-transport-admin-stale-consumers",
+    ...caFileArg(args),
+  });
+  try {
+    process.stdout.write(`${JSON.stringify(await reportStaleConsumers(connection.manager, machine, olderThanMs))}\n`);
+  } finally {
+    await connection.close();
+  }
+}
+
 async function dlq(args: readonly string[]): Promise<void> {
   const machine = operatorMachineArg(args);
   const machines = machinesArg(args);
@@ -255,6 +286,7 @@ export async function runTransportAdmin(args: readonly string[]): Promise<number
   else if (command === "drain") await drain(args);
   else if (command === "orphan") await orphan(args);
   else if (command === "dlq") await dlq(args);
-  else throw new Error("usage: fabric-transport-admin provision [--inbox-max-age-ms <ms>] [--ca-file <absolute path>]|dlq|drain|orphan [--ca-file <absolute path>]");
+  else if (command === "stale-consumers") await staleConsumers(args);
+  else throw new Error("usage: fabric-transport-admin provision [--inbox-max-age-ms <ms>] [--ca-file <absolute path>]|dlq|drain|orphan [--ca-file <absolute path>]|stale-consumers --machine <machine> [--older-than 24h] [--ca-file <absolute path>]");
   return 0;
 }

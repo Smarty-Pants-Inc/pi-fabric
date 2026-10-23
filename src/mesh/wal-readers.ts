@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 
 /**
- * Reader-age report: which processes pin a SQLite WAL by holding a WAL read mark.
+ * Reader report: which processes pin a SQLite WAL by holding a WAL read mark.
  *
  * SQLite's WAL-mode readers hold a POSIX fcntl() SHARED (F_RDLCK) lock on one read-mark byte of the
  * `-shm` file for as long as their read transaction lasts; while that lock is held, checkpoints
@@ -26,19 +26,14 @@ export interface WalReader {
   pid: number;
   /** Read-mark slot i (0..4), lock byte 123+i. */
   slot: number;
-  /** /proc/PID/stat state letter (R, S, D, Z, ...). */
-  state?: string;
-  /** Process age in milliseconds. */
-  ageMs?: number;
-  /** Short command line. */
-  cmd?: string;
+  /** Printable kernel /proc/PID/comm, at most 15 UTF-8 bytes; never a command line. */
+  comm?: string;
 }
 
 const WALINDEX_LOCK_OFFSET = 120;
 const WAL_READ_LOCK_FIRST = WALINDEX_LOCK_OFFSET + 3; // 123
 const WAL_NREADER = 5; // 123..127
-const CLK_TCK = 100;
-const CMD_MAX = 60;
+const COMM_MAX_BYTES = 15;
 
 const readText = (path: string): string | undefined => {
   try { return fs.readFileSync(path, "utf8"); } catch { return undefined; }
@@ -48,25 +43,16 @@ const readText = (path: string): string | undefined => {
 const devMajor = (dev: bigint): bigint => ((dev >> 8n) & 0xfffn) | ((dev >> 32n) & ~0xfffn);
 const devMinor = (dev: bigint): bigint => (dev & 0xffn) | ((dev >> 12n) & ~0xffn);
 
-const procDetails = (pid: number, uptimeSec: number | undefined): Pick<WalReader, "state" | "ageMs" | "cmd"> => {
-  const out: Pick<WalReader, "state" | "ageMs" | "cmd"> = {};
-  try {
-    const stat = readText(`/proc/${pid}/stat`);
-    if (stat !== undefined) {
-      // Fields after "comm" (which may contain spaces/parens): [0]=state (field 3) ... [19]=starttime (field 22).
-      const rest = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/);
-      if (rest[0]) out.state = rest[0];
-      const startTicks = Number(rest[19]);
-      if (uptimeSec !== undefined && Number.isFinite(startTicks)) {
-        const age = Math.round((uptimeSec - startTicks / CLK_TCK) * 1000);
-        if (Number.isFinite(age) && age >= 0) out.ageMs = age;
-      }
-    }
-    // comm only (the executable's short name), never cmdline: arguments may hold secrets (smarty-dev#6787).
-    const comm = readText(`/proc/${pid}/comm`)?.trim();
-    if (comm) out.cmd = comm.length > CMD_MAX ? comm.slice(0, CMD_MAX) : comm;
-  } catch { /* report what we have */ }
-  return out;
+const safeComm = (value: unknown): string | undefined =>
+  typeof value === "string" && value.length > 0 && Buffer.byteLength(value, "utf8") <= COMM_MAX_BYTES
+    && !/[\p{C}\p{Zl}\p{Zp}]/u.test(value) ? value : undefined;
+
+/** Fresh kernel fact for a validated PID. Never read cmdline or shorten arbitrary text into a prefix. */
+export const walReaderComm = (pid: number): string | undefined => {
+  if (process.platform !== "linux" || !Number.isSafeInteger(pid) || pid <= 0) return undefined;
+  const text = readText(`/proc/${pid}/comm`);
+  // Remove only procfs's record delimiter, not whitespace within the kernel name.
+  return safeComm(text?.endsWith("\n") ? text.slice(0, -1) : text);
 };
 
 /**
@@ -90,7 +76,7 @@ export function walReaderPids(dbPath: string): WalReader[] {
       const m = /^\d+:\s+POSIX\s+\S+\s+READ\s+(-?\d+)\s+([0-9a-fA-F]+):([0-9a-fA-F]+):(\d+)\s+(\d+)\s+(\d+|EOF)\s*$/.exec(line.trim());
       if (!m) continue;
       const pid = Number(m[1]);
-      if (!(pid > 0)) continue;
+      if (!Number.isSafeInteger(pid) || pid <= 0) continue;
       if (BigInt(m[4]!) !== inode) continue;
       const start = Number(m[5]);
       const end = m[6] === "EOF" ? Number.POSITIVE_INFINITY : Number(m[6]);
@@ -104,16 +90,14 @@ export function walReaderPids(dbPath: string): WalReader[] {
     // s_dev /proc/locks prints; fall back to an inode-only match when nothing matched both.
     const hits = exact.length > 0 ? exact : inodeOnly;
     const seen = new Set<string>();
-    let uptimeSec: number | undefined;
-    try { uptimeSec = Number((readText("/proc/uptime") ?? "").split(/\s+/)[0]); if (!Number.isFinite(uptimeSec)) uptimeSec = undefined; } catch { uptimeSec = undefined; }
-    const details = new Map<number, Pick<WalReader, "state" | "ageMs" | "cmd">>();
+    const names = new Map<number, string | undefined>();
     for (const hit of hits) {
       const key = `${hit.pid}:${hit.slot}`;
       if (seen.has(key)) continue;
       seen.add(key);
-      let d = details.get(hit.pid);
-      if (d === undefined) { d = procDetails(hit.pid, uptimeSec); details.set(hit.pid, d); }
-      found.push({ pid: hit.pid, slot: hit.slot, ...d });
+      if (!names.has(hit.pid)) names.set(hit.pid, walReaderComm(hit.pid));
+      const comm = names.get(hit.pid);
+      found.push({ pid: hit.pid, slot: hit.slot, ...(comm === undefined ? {} : { comm }) });
     }
     found.sort((a, b) => a.pid - b.pid || a.slot - b.slot);
   } catch { /* never throw: return what we have */ }
@@ -141,7 +125,7 @@ export function walWriterPid(dbPath: string): number | undefined {
       const m = /^\d+:\s+POSIX\s+\S+\s+WRITE\s+(-?\d+)\s+([0-9a-fA-F]+):([0-9a-fA-F]+):(\d+)\s+(\d+)\s+(\d+|EOF)\s*$/.exec(line.trim());
       if (!m) continue;
       const pid = Number(m[1]);
-      if (!(pid > 0) || BigInt(m[4]!) !== st.ino) continue;
+      if (!Number.isSafeInteger(pid) || pid <= 0 || BigInt(m[4]!) !== st.ino) continue;
       const start = Number(m[5]);
       const end = m[6] === "EOF" ? Number.POSITIVE_INFINITY : Number(m[6]);
       if (!(start <= WALINDEX_LOCK_OFFSET && WALINDEX_LOCK_OFFSET <= end)) continue;
@@ -153,21 +137,14 @@ export function walWriterPid(dbPath: string): number | undefined {
   } catch { return undefined; }
 }
 
-const formatAge = (ms: number): string => {
-  const s = Math.floor(ms / 1000);
-  if (s < 60) return `${s}s`;
-  const m = Math.floor(s / 60);
-  if (m < 60) return `${m}m`;
-  const h = Math.floor(m / 60);
-  if (h < 48) return `${h}h`;
-  return `${Math.floor(h / 24)}d`;
-};
-
-/** One short line per reader, e.g. "pid 1234 (D, 12m, node ...) slot 2"; "none" when empty. */
-export function formatWalReaders(list: readonly WalReader[]): string {
-  if (list.length === 0) return "no WAL readers found";
-  return list.map((r) => {
-    const info = [r.state, r.ageMs === undefined ? undefined : formatAge(r.ageMs), r.cmd].filter((x): x is string => x !== undefined && x.length > 0);
-    return `pid ${r.pid}${info.length > 0 ? ` (${info.join(", ")})` : ""} slot ${r.slot}`;
-  }).join("; ");
+/** Only validated pid + comm facts, e.g. "pid 1234 (node)"; no internal slot or surplus fields. */
+export function formatWalReaders(list: readonly Pick<WalReader, "pid" | "comm">[]): string {
+  const lines: string[] = [];
+  for (const reader of list) {
+    const pid = reader?.pid;
+    if (typeof pid !== "number" || !Number.isSafeInteger(pid) || pid <= 0) continue;
+    const comm = safeComm(reader.comm);
+    lines.push(`pid ${pid}${comm === undefined ? "" : ` (${comm})`}`);
+  }
+  return lines.join("; ") || "no WAL readers found";
 }

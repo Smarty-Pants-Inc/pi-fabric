@@ -29,7 +29,8 @@
  */
 import fs from "node:fs";
 import path from "node:path";
-import { isMeshIncarnationPending, isMeshSnapshotRetriesExhausted, isMeshLockTimeout, MeshLockTimeoutError } from "../core/atomic-write.js";
+import { isMeshIncarnationPending, isMeshSnapshotRetriesExhausted, isMeshLockTimeout, MeshLockTimeoutError,
+  MESH_STATE_WAL_CAP_CODE, isMeshStateWalCap } from "../core/atomic-write.js";
 import type { MeshIdentity } from "./event-log.js";
 import { isMeshStateBackendKind, MESH_STATE_BACKEND_KIND_LIST, type MeshStateBackendKind } from "./state-backend-kinds.js";
 import type { MeshStoreContext } from "./mesh-lock.js";
@@ -319,10 +320,8 @@ export const isSqliteBusy = (error: unknown): boolean => {
 };
 const sqliteBusy = isSqliteBusy;
 
-/** `MeshStateWalCapError` (state-sqlite.ts) by its code: a write refused while a pinned reader holds the WAL above the cap. */
-export const MESH_STATE_WAL_CAP_CODE = "FABRIC_MESH_STATE_WAL_CAP";
-export const isMeshStateWalCap = (error: unknown): boolean =>
-  error instanceof Error && (error as { code?: unknown }).code === MESH_STATE_WAL_CAP_CODE;
+/** Keep the historic state-backend exports while sharing the predicate with atomic-write.ts. */
+export { MESH_STATE_WAL_CAP_CODE, isMeshStateWalCap };
 
 /**
  * A refusal a caller retries (smarty-dev#6477): pending process identity, snapshot validation exhaustion,

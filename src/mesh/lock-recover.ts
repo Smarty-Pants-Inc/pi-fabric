@@ -138,6 +138,23 @@ const namespaceOf = (fields: string[], kind: "mesh" | "custody"): string | null 
   return undefined;
 };
 
+/**
+ * The only owner-metadata boundary for safe diagnostics, audit and return values. The caller has already validated
+ * the complete record and positive safe-integer pid. Match atomic-write's bounded native namespace/token grammar
+ * locally, without an eager dependency. Never use these labels for token equality, namespace verdicts or fencing.
+ * Only these three public fields leave this boundary; other owner-record fields are deliberately not retained.
+ */
+const projectOwner = (holder: unknown, holderPid: number, holderNamespace: unknown): Pick<LockRecoverAudit, "holder" | "holderPid" | "holderNamespace"> => {
+  const uuid = "[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}";
+  const token = typeof holder === "string" && (holder.length === 32 || holder.length === 36) &&
+    new RegExp(`^(?:[0-9A-Fa-f]{32}|${uuid})$`).test(holder) ? holder : "invalid-token";
+  const namespace = holderNamespace === null ? null : holderNamespace === "" ? "" :
+    typeof holderNamespace === "string" && holderNamespace.length <= 128 &&
+      new RegExp(`^(?:linux:(?:[0-9a-f]{32}|-):${uuid}:\\d+|darwin:(?:${uuid}|-):${uuid}:host|win32:${uuid}:\\d+:host)(?![\\s\\S])`).test(holderNamespace)
+        ? holderNamespace : "invalid-namespace";
+  return { holder: token, holderPid, holderNamespace: namespace };
+};
+
 export const recoverMeshLock = async (root: string, options: MeshLockRecoverOptions): Promise<MeshLockRecoverResult> => {
   const lock = path.join(root, options.lock === "mesh" ? ".lock" : MESH_CUSTODY_LOCK_NAME);
   const stat = fs.lstatSync(lock, { throwIfNoEntry: false });
@@ -151,13 +168,9 @@ export const recoverMeshLock = async (root: string, options: MeshLockRecoverOpti
   if (!owner.endsWith("\n") || namespace === undefined || !Number.isSafeInteger(pid) || pid <= 0) {
     throw new MeshLockRecoverRefusedError(`${lock} does not hold a complete owner record`);
   }
+  const diagnostic = projectOwner(fields[0], pid, namespace);
   if (fields[0] !== options.holder) {
-    // Diagnostic projection only: admission above and the recovery/audit below keep the exact raw tokens.
-    const tokenLabel = (token: string | undefined): string => typeof token === "string" &&
-      (token.length === 32 || token.length === 36) &&
-      /^(?:[0-9A-Fa-f]{32}|[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})$/.test(token)
-        ? token : "invalid-token";
-    throw new MeshLockRecoverRefusedError(`${lock} is held by ${tokenLabel(fields[0])}, not ${tokenLabel(options.holder)}`);
+    throw new MeshLockRecoverRefusedError(`${lock} is held by ${diagnostic.holder}, not ${projectOwner(options.holder, pid, namespace).holder}`);
   }
   // pi-fabric#923 (fabric-store decisions): a record without a namespace is UNPROVEN (its pid may name nothing here
   // although it is alive in another namespace); no previous-boot inference (VM clones share a machine id). The safe
@@ -169,8 +182,8 @@ export const recoverMeshLock = async (root: string, options: MeshLockRecoverOpti
   const provenDead = verdict === "pid" && !(options.alive ?? alive)(pid);
   if (!provenDead && options.unsafeHolderStopped !== true) {
     throw new MeshLockRecoverRefusedError(verdict === "pid"
-      ? `holder pid ${pid} is running here: it is not recovered`
-      : `the holder is in ${verdict === "foreign" ? `another PID namespace (${String(namespace)})` : "a PID namespace this process cannot prove"}; run this inside that namespace, or pass the unsafe override once the holder is stopped`);
+      ? `holder pid ${diagnostic.holderPid} is running here: it is not recovered`
+      : `the holder is in ${verdict === "foreign" ? `another PID namespace (${String(diagnostic.holderNamespace)})` : "a PID namespace this process cannot prove"}; run this inside that namespace, or pass the unsafe override once the holder is stopped`);
   }
   // The same directory and the same bytes as checked above, right before acting.
   const current = fs.lstatSync(lock, { throwIfNoEntry: false });
@@ -182,13 +195,15 @@ export const recoverMeshLock = async (root: string, options: MeshLockRecoverOpti
   // pi-fabric#923 round 5: the safe form's host-local proof holds only while the root path names the root it checked.
   if (provenDead && pin && !pin.unchanged()) throw new MeshLockRecoverRefusedError(`${root} was replaced after its filesystem was checked; nothing was done`);
   const mode = provenDead ? "safe" : "unsafe";
-  const audit: LockRecoverAudit = { at: new Date().toISOString(), root, lock, mode, holder: options.holder, holderPid: pid,
-    holderNamespace: namespace, verdict, operator: operator() };
+  // Project BEFORE serialization/append, not just CLI formatting: a safe audit remains safe even if the audit or
+  // rename fails. Only an admitted UNSAFE recovery retains the historical raw metadata and warning contract.
+  const metadata = provenDead ? diagnostic : { holder: options.holder, holderPid: pid, holderNamespace: namespace };
+  const audit: LockRecoverAudit = { at: new Date().toISOString(), root, lock, mode, ...metadata, verdict, operator: operator() };
   // The audit is written BEFORE the rename: a recovery that happened is always on record. A failed audit refuses.
   appendAudit(path.join(root, "lock-recoveries.jsonl"), `${JSON.stringify(audit)}\n`, options.auditMaxBytes ?? AUDIT_MAX_BYTES, options.platform);
   const fence = `${lock}.dead.${createHash("sha256").update(`${stat.dev}:${stat.ino}:${owner}`).digest("hex")}`;
   fs.renameSync(lock, fence);
-  return { recovered: true, mode, lock, fence, holderPid: pid, holderNamespace: namespace, verdict, audit,
+  return { recovered: true, mode, lock, fence, holderPid: metadata.holderPid, holderNamespace: metadata.holderNamespace, verdict, audit,
     ...(provenDead ? {} : { warning: `UNSAFE override by ${audit.operator.user} (uid ${String(audit.operator.uid)}, pid ${audit.operator.pid}, parent pid ${audit.operator.ppid} ${audit.operator.parentExecutable}, host ${audit.operator.host}): ${lock} of holder ${options.holder} (pid ${pid}, namespace ${String(namespace)}) was recovered on the operator's word that the holder is stopped. If it is still running, its release can remove its successor's lock and two writers can run.` }) };
   } finally { pin?.close(); }
 };

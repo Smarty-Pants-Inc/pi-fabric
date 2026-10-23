@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { writeJsonAtomic } from "../src/core/atomic-write.js";
@@ -26,17 +26,28 @@ const cleanups: Array<() => void> = [];
 afterEach(() => {
   vi.restoreAllMocks();
   for (const close of cleanups.splice(0).reverse()) close();
+  vi.unstubAllEnvs();
 });
 
-async function fixture() {
+interface FixtureRuntime {
+  MeshStore?: typeof MeshStore;
+  stateBackend?: "file" | "sqlite";
+  rootId?: string;
+  ensureResidentWakeArchive?: typeof wake.ensureResidentWakeArchive;
+  retryResidentWakes?: typeof wake.retryResidentWakes;
+}
+async function fixture(runtime: FixtureRuntime = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-wake-terminal-"));
   let allowed = false, now = Date.now();
   vi.spyOn(Date, "now").mockImplementation(() => now);
   const meshRoot = path.join(root, "mesh");
-  const openMesh = () => new MeshStore(meshRoot, 65_536, 100, { canWakeResidents: () => allowed });
+  const Store = runtime.MeshStore ?? MeshStore;
+  const openMesh = () => new Store(meshRoot, 65_536, 100, {
+    ...(runtime.stateBackend ? { stateBackend: runtime.stateBackend } : {}), canWakeResidents: () => allowed });
   let mesh = openMesh();
-  const rootId = "session:wake-terminal";
-  const config: ResidentHostConfig = { format: 1, rootId, sessionId: "wake-terminal", cwd: root,
+  const rootId = runtime.rootId ?? "session:wake-terminal";
+  const sessionId = rootId.slice("session:".length);
+  const config: ResidentHostConfig = { format: 1, rootId, sessionId, cwd: root,
     projectRoot: root, meshRoot, actorRoot: path.join(root, "actors"), residencyRoot: residentRoot(meshRoot, rootId),
     fullCodeMode: true, agents: { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0 },
     mesh: DEFAULT_FABRIC_CONFIG.mesh, retention: DEFAULT_FABRIC_CONFIG.retention,
@@ -53,32 +64,41 @@ async function fixture() {
   fs.writeFileSync(routesFile, JSON.stringify({ format: 1, rootId, hostId: "host:resident",
     configJson: canonicalResidentWakeConfig(config),
     actors: [{ id: "actor:listener", name: "listener", topics: ["terminal.delivery"] }] }));
-  await wake.ensureResidentWakeArchive(mesh);
+  await (runtime.ensureResidentWakeArchive ?? wake.ensureResidentWakeArchive)(mesh);
   cleanups.push(() => { mesh.closeState(); fs.rmSync(root, { recursive: true, force: true }); });
   const read = <T>(file: string) => wake.readWakeJson<T>(file);
   const pending = () => residentUnacknowledgedDeliveries(meshRoot).get(directory);
-  const publishPending = async () => {
+  const publishPending = async (topic = "terminal.delivery") => {
     const before = allowed;
     allowed = false; // Real append/archive/index, but no publication-time launch.
-    try { return await mesh.publish({ topic: "terminal.delivery", from }); }
+    try { return await mesh.publish({ topic, from }); }
     finally { allowed = before; }
   };
   const launch = vi.fn(async (_file: string, _config: ResidentHostConfig) => {});
-  const retry = wake.retryResidentWakes;
-  vi.spyOn(wake, "retryResidentWakes").mockImplementation((store, _launch, at, canWake) =>
-    retry(store, launch, at, canWake));
+  if (!runtime.retryResidentWakes) {
+    const retry = wake.retryResidentWakes;
+    vi.spyOn(wake, "retryResidentWakes").mockImplementation((store, _launch, at, canWake) =>
+      retry(store, launch, at, canWake));
+  }
   return { root, meshRoot, config, directory, configFile, routesFile, failureFile, terminalFile,
     participantKey, participantFile, main, launch, read, pending, publishPending,
     get mesh() { return mesh; }, get now() { return now; },
     advance() { now += 5 * 60_000; }, // Beyond both maximum backoff and attempt-claim lease.
+    advancePastTerminalGrace() { now += 300_000; }, // Well past the fixed positive TTL and terminal grace.
     drift() { fs.writeFileSync(configFile, JSON.stringify({ ...config, cwd: path.join(root, "changed") })); },
     repair() { fs.writeFileSync(configFile, JSON.stringify(config)); },
-    async sweep() { allowed = true; await mesh.retryResidentWakes(); },
+    async sweep() {
+      allowed = true;
+      if (runtime.retryResidentWakes) await runtime.retryResidentWakes(mesh, launch, now, () => allowed);
+      else await mesh.retryResidentWakes();
+    },
     reopen() { mesh.closeState(); mesh = openMesh(); },
-    rootLease(live: boolean) {
-      const expiresAt = live ? now + 86_400_000 : now - 1;
-      writeHostLease(meshRoot, { id: rootId, rootId, identityId: rootId, updatedAt: now - 1_000, expiresAt,
-        session: { id: config.sessionId, startedAt: now - 1_000, updatedAt: now - 1_000, expiresAt } });
+    rootLease(live: boolean, expiredForMs = 10 * 60_000, ttlMs = 15_000) {
+      const expiresAt = live ? now + 86_400_000 : now - expiredForMs;
+      const updatedAt = live ? now - 1_000 : expiresAt - ttlMs;
+      const startedAt = live ? updatedAt : updatedAt - ttlMs;
+      writeHostLease(meshRoot, { id: rootId, rootId, identityId: rootId, updatedAt, expiresAt,
+        startedAt, session: { id: config.sessionId, startedAt, updatedAt, expiresAt } });
     },
     async rootPresence(storage: "file" | "state", reload = false) {
       const participant: FabricParticipantRecord = { format: 1, id: rootId, rootId, ownerHostId: rootId,
@@ -103,6 +123,41 @@ async function fixture() {
 }
 type Fixture = Awaited<ReturnType<typeof fixture>>;
 
+const lockStatsKey = Symbol.for("pi-fabric.mesh.lock-stats");
+type LockStatsRecorder = { stats?: unknown; flush(): void; dispose(): void };
+type LockStatsRuntime = FixtureRuntime & { lockStatsHost(): string; close(): void };
+async function lockStatsRuntime(): Promise<LockStatsRuntime> {
+  const globals = globalThis as typeof globalThis & { [lockStatsKey]?: LockStatsRecorder };
+  globals[lockStatsKey]?.dispose();
+  delete globals[lockStatsKey];
+  vi.stubEnv("PI_FABRIC_LOCK_STATS", "1");
+  vi.resetModules();
+  const [store, wakeApi, stats] = await Promise.all([
+    import("../src/mesh/store.js"), import("../src/residency/wake.js"), import("../src/mesh/commit-stats.js"),
+  ]);
+  if (!globals[lockStatsKey]?.stats) throw new Error("Native mesh lock-stats recorder is not active");
+  return {
+    MeshStore: store.MeshStore,
+    ensureResidentWakeArchive: wakeApi.ensureResidentWakeArchive,
+    retryResidentWakes: wakeApi.retryResidentWakes,
+    lockStatsHost: stats.lockStatsHost,
+    close() {
+      globals[lockStatsKey]?.dispose();
+      delete globals[lockStatsKey];
+      vi.resetModules();
+      vi.unstubAllEnvs();
+    },
+  };
+}
+function nativeCustodyCount(root: string, host: string): number {
+  const globals = globalThis as typeof globalThis & { [lockStatsKey]?: LockStatsRecorder };
+  globals[lockStatsKey]?.flush();
+  const file = path.join(root, "lock-stats", `${host}-${process.pid}.json`);
+  if (!fs.existsSync(file)) return 0;
+  const stats = JSON.parse(fs.readFileSync(file, "utf8")) as { minutes?: Array<{ classes?: { custody?: { n?: number } } }> };
+  return stats.minutes?.reduce((total, minute) => total + (minute.classes?.custody?.n ?? 0), 0) ?? 0;
+}
+
 /** Real Main activation, lease CAS and participant publication, not a raw
  * writeHostLease substitute for the native writer protocol under test. */
 async function nativeMain(f: Fixture) {
@@ -123,6 +178,11 @@ interface TerminalRecord {
   error: string; failedAt: number;
 }
 interface FailureRecord { delivery: WakeDelivery; error?: string; failures?: number; nextRetryAt?: number; claimId?: string }
+const differentOrUnknownTerminalDelivery = new Set([
+  "high-sequence", "mismatched-id", "id-type", "sequence-type", "missing-id", "missing-sequence",
+  "fractional-sequence", "unsafe-sequence", "zero-sequence", "delivery-null", "delivery-array",
+  "missing-delivery", "bad-json",
+]);
 async function interruptedTerminal(f: Fixture, relation: "same" | "higher" | "lower", backedOff = false) {
   const first = await f.publishPending();
   const second = relation === "same" ? first : await f.publishPending();
@@ -130,6 +190,7 @@ async function interruptedTerminal(f: Fixture, relation: "same" | "higher" | "lo
   const receiptEvent = relation === "higher" ? second : first;
   if (relation === "higher") fs.writeFileSync(residentWakeIndexPath(f.meshRoot), JSON.stringify({ format: 1,
     op: "pending", root: f.directory, delivery: { id: event.id, sequence: event.sequence } }) + "\n");
+  f.rootLease(false); // Interrupted terminal recovery must carry valid past-grace lease evidence.
   const terminal: TerminalRecord = { format: 1, rootId: f.config.rootId,
     delivery: { id: receiptEvent.id, sequence: receiptEvent.sequence }, code: "RESIDENT_WAKE_CONFIG_MISMATCH",
     error: "ResidentWakeConfigMismatch: interrupted receipt", failedAt: f.now - 1_000 };
@@ -227,6 +288,22 @@ function expectOutsideLock(probe: ReturnType<typeof observe>) {
     (typeof row.value.error === "string" && !row.value.claimId))), "failure/terminal receipt recording must not hold mesh.exclusive").toEqual([]);
   expect.soft(probe.warningHeld, "warnings must not run under mesh.exclusive").not.toContain(true);
 }
+async function terminalizeDeadDelivery(f: Fixture) {
+  const event = await f.publishPending();
+  f.drift();
+  f.rootLease(false);
+  await f.sweep();
+  const terminalBytes = fs.readFileSync(f.terminalFile, "utf8");
+  expect(f.pending()).toBeUndefined();
+  expect(f.read<TerminalRecord>(f.terminalFile)).toMatchObject({ delivery: { id: event.id, sequence: event.sequence } });
+  expect(fs.existsSync(f.failureFile)).toBe(false);
+  return { event, terminalBytes };
+}
+function changeRetainedTopic(f: Fixture, topic: string): void {
+  const routes = JSON.parse(fs.readFileSync(f.routesFile, "utf8")) as { actors: Array<{ topics: string[] }> };
+  routes.actors[0]!.topics = [topic];
+  fs.writeFileSync(f.routesFile, JSON.stringify(routes));
+}
 
 describe("terminal resident wake disposition", () => {
   it("records a dead ROOT config mismatch once, ACKs it, and never reacquires retry claims on eligible sweeps", async () => {
@@ -308,7 +385,7 @@ describe("terminal resident wake disposition", () => {
     const event = await f.publishPending();
     const main = await nativeMain(f);
     try {
-      f.advance(); // Expire the actual native lease and presence, with their UUID/owner intact.
+      f.advancePastTerminalGrace(); // Expire the actual native lease and presence well past grace, with UUID/owner intact.
       expect(f.rootParticipant()).toBeUndefined();
       const expired = readHostLeaseCurrent(f.meshRoot, f.config.rootId)!;
       expect(expired.expiresAt).toBeLessThan(f.now);
@@ -348,7 +425,7 @@ describe("terminal resident wake disposition", () => {
     const event = await f.publishPending();
     const main = await nativeMain(f);
     try {
-      f.advance();
+      f.advancePastTerminalGrace();
       expect(f.rootParticipant()).toBeUndefined();
       const expired = readHostLeaseCurrent(f.meshRoot, f.config.rootId)!;
       f.drift();
@@ -393,6 +470,7 @@ describe("terminal resident wake disposition", () => {
     const f = await fixture();
     const event = await f.publishPending();
     f.drift();
+    f.rootLease(false); // Reach the native gate; missing lease evidence would refuse before custody.
     const probe = observe(f);
     await f.mesh.leaseCustody(hostLeasePath(f.meshRoot, f.config.rootId), () => f.sweep());
     expect.soft(f.pending()).toEqual({ id: event.id, sequence: event.sequence });
@@ -423,6 +501,135 @@ describe("terminal resident wake disposition", () => {
       error: "Error: injected launch failure" });
     expect.soft(fs.existsSync(f.terminalFile)).toBe(false); // Ordinary failures are never terminalized.
     expect.soft(probe.counts()).toMatchObject({ claims: 2, errors: 2, terminals: 0 });
+    expectOutsideLock(probe);
+  });
+
+  describe.each(["maintenance", "publication"] as const)("independent event after terminal evidence in %s", consumer => {
+    it("repairs config, renews a native Main, changes the retained route, and serves event 2", async () => {
+      const f = await fixture();
+      const { terminalBytes } = await terminalizeDeadDelivery(f);
+      f.repair();
+      const main = await nativeMain(f);
+      try {
+        f.advance();
+        await main.directory.refresh(); // Native renewal and participant publication make the originating root live again.
+        expect(readHostLeaseCurrent(f.meshRoot, f.config.rootId)?.expiresAt).toBeGreaterThan(f.now);
+        expect(f.rootParticipant()).toMatchObject({ id: f.config.rootId, kind: "root", stale: false });
+        changeRetainedTopic(f, "terminal.delivery.v2");
+        const event2 = await f.publishPending("terminal.delivery.v2");
+        expect(f.pending()).toEqual({ id: event2.id, sequence: event2.sequence });
+        const probe = observe(f);
+        if (consumer === "publication") await wake.wakeResidentActors(f.mesh, [event2], f.launch);
+        for (let n = 0; n < 4; n++) { f.advance(); await f.sweep(); }
+        expect(f.launch).toHaveBeenCalledOnce();
+        expect(f.launch).toHaveBeenCalledWith(f.configFile, f.config);
+        expect(f.read(wake.residentWakeRequestPath(f.directory))).toMatchObject({ id: event2.id, sequence: event2.sequence });
+        expect(f.pending()).toBeUndefined();
+        expect(fs.existsSync(f.failureFile)).toBe(false);
+        expect(fs.readFileSync(f.terminalFile, "utf8")).toBe(terminalBytes);
+        expect(probe.acks).toMatchObject([{ delivery: { id: event2.id, sequence: event2.sequence }, terminalRecorded: false }]);
+        expect(probe.writes.filter(row => row.file === f.terminalFile)).toEqual([]);
+        expectOutsideLock(probe);
+      } finally { await main.directory.close(); }
+    });
+
+    it.each(["malformed", "unverifiable", "archive-unavailable", "valid-historical-different"] as const)(
+      "does not borrow or quarantine an independently pending delivery when history is %s", async mode => {
+        const f = await fixture();
+        const { event: event1 } = await terminalizeDeadDelivery(f);
+        f.repair();
+        const main = await nativeMain(f);
+        try {
+          f.advance();
+          await main.directory.refresh();
+          if (mode === "malformed") fs.writeFileSync(f.terminalFile, "not-json");
+          else if (mode === "unverifiable") {
+            const terminal = f.read<TerminalRecord>(f.terminalFile)!;
+            fs.writeFileSync(f.terminalFile, JSON.stringify({ ...terminal,
+              delivery: { ...terminal.delivery, id: "not-the-archived-event" } }));
+          } else if (mode === "archive-unavailable") {
+            const archive = MeshArchive.fromRoot(f.meshRoot)!;
+            const index = path.join(archive.dir, "sequence-index", String(Math.floor(event1.sequence / 1024)), `${event1.sequence}.json`);
+            fs.renameSync(index, `${index}.historical-unavailable`);
+          }
+          const terminalBytes = fs.readFileSync(f.terminalFile, "utf8");
+          const event2 = await f.publishPending();
+          const probe = observe(f);
+          if (consumer === "publication") await wake.wakeResidentActors(f.mesh, [event2], f.launch);
+          for (let n = 0; n < 4; n++) { f.advance(); await f.sweep(); }
+          expect(f.launch).toHaveBeenCalledOnce();
+          expect(f.read(wake.residentWakeRequestPath(f.directory))).toMatchObject({ id: event2.id, sequence: event2.sequence });
+          expect(f.pending()).toBeUndefined();
+          expect(fs.readFileSync(f.terminalFile, "utf8")).toBe(terminalBytes);
+          expect(probe.acks).toMatchObject([{ delivery: { id: event2.id, sequence: event2.sequence }, terminalRecorded: false }]);
+          expect(probe.writes.filter(row => row.file === f.terminalFile)).toEqual([]);
+          expectOutsideLock(probe);
+        } finally { await main.directory.close(); }
+      });
+
+    it("records ordinary event-2 failure backoff despite unusable historical evidence", async () => {
+      const f = await fixture();
+      const { terminalBytes } = await terminalizeDeadDelivery(f);
+      f.repair();
+      const main = await nativeMain(f);
+      try {
+        f.advance();
+        await main.directory.refresh();
+        changeRetainedTopic(f, "terminal.delivery.v2");
+        const event2 = await f.publishPending("terminal.delivery.v2");
+        const probe = observe(f);
+        f.launch.mockRejectedValue(new Error("injected event-2 launch failure"));
+        if (consumer === "publication") {
+          await wake.wakeResidentActors(f.mesh, [event2], f.launch);
+          for (let n = 0; n < 4; n++) await f.sweep(); // Respect the newly recorded backoff.
+        } else {
+          for (let n = 0; n < 4; n++) await f.sweep();
+        }
+        expect(f.launch).toHaveBeenCalledOnce();
+        const failure = f.read<FailureRecord>(f.failureFile)!;
+        expect(failure).toMatchObject({ delivery: { id: event2.id, sequence: event2.sequence },
+          error: "Error: injected event-2 launch failure", failures: 1 });
+        expect(failure.nextRetryAt).toBeGreaterThan(f.now);
+        expect(fs.readFileSync(f.terminalFile, "utf8")).toBe(terminalBytes);
+        expect(probe.writes.filter(row => row.file === f.terminalFile)).toEqual([]);
+        expect(f.read<wake.ResidentWakeRequest>(wake.residentWakeRequestPath(f.directory))).toEqual({
+          format: 1, id: event2.id, sequence: event2.sequence, requestedAt: f.now,
+        }); // The durable intent, not a borrowed terminal ACK, preserves the failed delivery.
+        if (consumer === "maintenance") {
+          expect(f.pending()).toBeUndefined(); // Maintenance ACKs only after that exact intent is durable.
+          expect(failure.claimId).toBeUndefined(); // Failed launch releases the attempt claim into timed backoff.
+          expect(probe.acks).toEqual([{ delivery: { id: event2.id, sequence: event2.sequence }, terminalRecorded: false }]);
+        } else {
+          expect(f.pending()).toEqual({ id: event2.id, sequence: event2.sequence });
+          expect(probe.acks).toEqual([]); // Publication failure retains its index watermark.
+        }
+        expectOutsideLock(probe);
+      } finally { await main.directory.close(); }
+    });
+  });
+
+  it("terminalizes a five-hour expired ROOT lease once on the real SQLite MeshStore backend", async () => {
+    const rootId = `session:${randomUUID()}`;
+    const f = await fixture({ stateBackend: "sqlite", rootId });
+    expect(f.mesh.stateBackend).toBe("sqlite");
+    await f.mesh.put({ key: "round2/sqlite-backend-proof", identity: f.main, value: { backend: "sqlite" } });
+    expect(fs.existsSync(path.join(f.meshRoot, "state.db"))).toBe(true);
+    const event = await f.publishPending();
+    f.drift();
+    f.rootLease(false, 5 * 60 * 60_000, 15_000); // Default Main TTL, expired well beyond grace with valid epoch fields.
+    expect(fs.existsSync(hostLeasePath(f.meshRoot, f.config.rootId))).toBe(true);
+    const probe = observe(f);
+    await f.sweep();
+    const receiptBytes = fs.readFileSync(f.terminalFile, "utf8");
+    expect(f.pending()).toBeUndefined();
+    expect(f.read<TerminalRecord>(f.terminalFile)).toMatchObject({
+      rootId, delivery: { id: event.id, sequence: event.sequence }, code: "RESIDENT_WAKE_CONFIG_MISMATCH" });
+    for (let n = 0; n < 8; n++) { f.advance(); await f.sweep(); }
+    expect(fs.readFileSync(f.terminalFile, "utf8")).toBe(receiptBytes);
+    expect(f.pending()).toBeUndefined();
+    expect(f.launch).not.toHaveBeenCalled();
+    expect(probe.counts()).toMatchObject({ claims: 1, errors: 0, terminals: 1, warnings: 1 });
+    expect(probe.acks).toMatchObject([{ delivery: { id: event.id, sequence: event.sequence }, terminalRecorded: true }]);
     expectOutsideLock(probe);
   });
 
@@ -479,6 +686,7 @@ describe("terminal resident wake disposition", () => {
     const f = await fixture();
     const event = await f.publishPending();
     f.drift();
+    f.rootLease(false); // Recovery after restart needs valid past-grace evidence for terminal custody.
     const terminal: TerminalRecord = { format: 1, rootId: f.config.rootId, delivery: { id: event.id, sequence: event.sequence },
       code: "RESIDENT_WAKE_CONFIG_MISMATCH", error: "ResidentWakeConfigMismatch: interrupted wake", failedAt: f.now - 1_000 };
     writeJsonAtomic(f.terminalFile, terminal, { durable: true });
@@ -533,12 +741,20 @@ describe("terminal resident wake disposition", () => {
       fs.writeFileSync(f.failureFile, failureBytes);
       const probe = observe(f); // Config remains valid: an erroneous fall-through WOULD launch.
       for (let n = 0; n < 4; n++) { await f.sweep(); f.advance(); }
-      expect.soft(f.pending()).toEqual({ id: event.id, sequence: event.sequence });
-      expect.soft(fs.readFileSync(f.failureFile, "utf8")).toBe(failureBytes);
       expect.soft(fs.readFileSync(f.terminalFile, "utf8")).toBe(terminalBytes);
-      expect.soft(f.launch).not.toHaveBeenCalled();
-      expect.soft(probe.acks).toEqual([]);
-      expect.soft(probe.counts()).toMatchObject({ claims: 0, errors: 0, terminals: 0, warnings: 0 });
+      if (differentOrUnknownTerminalDelivery.has(mode)) {
+        expect.soft(f.launch).toHaveBeenCalledOnce(); // A valid ordinary wake, not a borrowed terminal ACK.
+        expect.soft(f.read(wake.residentWakeRequestPath(f.directory))).toMatchObject({ id: event.id, sequence: event.sequence });
+        expect.soft(f.pending()).toBeUndefined();
+        expect.soft(fs.existsSync(f.failureFile)).toBe(false);
+        expect.soft(probe.acks).toMatchObject([{ delivery: { id: event.id, sequence: event.sequence }, terminalRecorded: false }]);
+      } else {
+        expect.soft(f.pending()).toEqual({ id: event.id, sequence: event.sequence });
+        expect.soft(fs.readFileSync(f.failureFile, "utf8")).toBe(failureBytes);
+        expect.soft(f.launch).not.toHaveBeenCalled();
+        expect.soft(probe.acks).toEqual([]); // Exact but untrusted authority never ACKs the delivery.
+        expect.soft(probe.counts()).toMatchObject({ claims: 0, errors: 0, terminals: 0, warnings: 0 });
+      }
       expectOutsideLock(probe);
     });
 
@@ -572,12 +788,20 @@ describe("terminal resident wake disposition", () => {
       fs.writeFileSync(f.failureFile, failureBytes);
       const probe = observe(f);
       for (let n = 0; n < 4; n++) { await f.sweep(); f.advance(); }
-      expect.soft(f.pending()).toEqual(pending);
-      expect.soft(fs.readFileSync(f.failureFile, "utf8")).toBe(failureBytes);
       expect.soft(fs.readFileSync(f.terminalFile, "utf8")).toBe(terminalBytes);
-      expect.soft(f.launch).not.toHaveBeenCalled();
-      expect.soft(probe.acks).toEqual([]);
-      expect.soft(probe.counts()).toMatchObject({ claims: 0, errors: 0, terminals: 0, warnings: 0 });
+      if (mode === "unrelated-committed-event") {
+        expect.soft(f.launch).toHaveBeenCalledOnce();
+        expect.soft(f.read(wake.residentWakeRequestPath(f.directory))).toMatchObject({ id: event.id, sequence: event.sequence });
+        expect.soft(f.pending()).toBeUndefined();
+        expect.soft(fs.existsSync(f.failureFile)).toBe(false);
+        expect.soft(probe.acks).toMatchObject([{ delivery: { id: event.id, sequence: event.sequence }, terminalRecorded: false }]);
+      } else {
+        expect.soft(f.pending()).toEqual(pending);
+        expect.soft(fs.readFileSync(f.failureFile, "utf8")).toBe(failureBytes);
+        expect.soft(f.launch).not.toHaveBeenCalled();
+        expect.soft(probe.acks).toEqual([]);
+        expect.soft(probe.counts()).toMatchObject({ claims: 0, errors: 0, terminals: 0, warnings: 0 });
+      }
       expectOutsideLock(probe);
     });
 
@@ -635,7 +859,7 @@ describe("terminal resident wake disposition", () => {
     it.each(["higher", "lower"] as const)("records fresh exact mismatch evidence rather than reusing a different %s receipt", async relation => {
       const f = await fixture();
       const { event, terminal } = await interruptedTerminal(f, relation);
-      f.drift();
+      f.drift(); f.rootLease(false); // A new terminal record needs valid expired lease evidence.
       const probe = observe(f);
       if (consumer === "maintenance") await f.sweep();
       else await wake.wakeResidentActors(f.mesh, [event], f.launch);
@@ -654,7 +878,7 @@ describe("terminal resident wake disposition", () => {
   it("a terminal ACK cannot consume a newer matching delivery, which can wake after config repair", async () => {
     const f = await fixture();
     const first = await f.publishPending();
-    f.drift();
+    f.drift(); f.rootLease(false); // Supply aged valid lease evidence before terminalizing event 1.
     let newer: Awaited<ReturnType<Fixture["publishPending"]>> | undefined;
     const exclusive = f.mesh.exclusive.bind(f.mesh);
     vi.spyOn(f.mesh, "exclusive").mockImplementation(async <T>(operation: () => T, timeout?: number): Promise<T> => {
@@ -679,5 +903,48 @@ describe("terminal resident wake disposition", () => {
     expect.soft(fs.existsSync(f.failureFile)).toBe(false);
     expect.soft(f.read<TerminalRecord>(f.terminalFile)).toEqual(receipt);
     expect.soft(warnings).toHaveBeenCalledOnce();
+  });
+
+  it("uses zero actual native mesh-lock custody for a terminal idle root across sweeps and reopen", async () => {
+    const runtime = await lockStatsRuntime();
+    cleanups.push(() => runtime.close());
+    const f = await fixture(runtime);
+    const event1 = await f.publishPending();
+    f.drift();
+    f.rootLease(false);
+    await f.sweep();
+    const terminalBytes = fs.readFileSync(f.terminalFile, "utf8");
+    expect(f.pending()).toBeUndefined();
+    const initialCustody = nativeCustodyCount(f.meshRoot, runtime.lockStatsHost());
+    expect(initialCustody).toBeGreaterThan(0); // Positive control: the native recorder saw real first acquisitions.
+    const idleAcquisitions: number[] = [];
+    let before = initialCustody;
+    for (let n = 0; n < 3; n++) {
+      f.advance(); await f.sweep();
+      const after = nativeCustodyCount(f.meshRoot, runtime.lockStatsHost());
+      idleAcquisitions.push(after - before); before = after;
+    }
+    f.reopen(); // Close the real native recovery cursor, then measure post-reopen sweeps too.
+    for (let n = 0; n < 3; n++) {
+      f.advance(); await f.sweep();
+      const after = nativeCustodyCount(f.meshRoot, runtime.lockStatsHost());
+      idleAcquisitions.push(after - before); before = after;
+    }
+    console.info(JSON.stringify({ probe: "terminal-idle-native-lock-stats", delivery: event1.id,
+      sweeps: idleAcquisitions.length, idleCustodyAcquisitions: idleAcquisitions }));
+    expect(idleAcquisitions).toEqual([0, 0, 0, 0, 0, 0]);
+    expect(fs.readFileSync(f.terminalFile, "utf8")).toBe(terminalBytes);
+    expect(f.pending()).toBeUndefined();
+    expect(f.launch).not.toHaveBeenCalled();
+    f.repair(); // Repair alone cannot recreate a nudge that the terminal ACK already consumed.
+    for (let n = 0; n < 4; n++) { f.advance(); await f.sweep(); }
+    expect(f.launch).not.toHaveBeenCalled();
+    expect(f.pending()).toBeUndefined();
+    const event2 = await f.publishPending();
+    for (let n = 0; n < 4; n++) { f.advance(); await f.sweep(); }
+    expect(f.launch).toHaveBeenCalledOnce();
+    expect(f.read(wake.residentWakeRequestPath(f.directory))).toMatchObject({ id: event2.id, sequence: event2.sequence });
+    expect(f.pending()).toBeUndefined();
+    expect(fs.readFileSync(f.terminalFile, "utf8")).toBe(terminalBytes);
   });
 });

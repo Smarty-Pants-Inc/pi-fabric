@@ -1,13 +1,36 @@
-import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { assertMeshStateReadable, type MeshStore } from "../mesh/store.js";
 import { ParticipantDirectory } from "../topology/participant-directory.js";
-import { hostLeasePath, readHostLeaseCurrent } from "../topology/host-leases.js";
+import { hostLeasePath, readHostLeaseCurrent, type FabricHostLease } from "../topology/host-leases.js";
 import { participantFilePresent } from "../topology/participant-files.js";
 import { isLiveLegacyRootEntry } from "../topology/legacy-root-liveness.js";
 import { acquireMainPublicationFence } from "../topology/main-publication-fence.js";
 import { canonicalResidentWakeConfig, readWakeJson, retainedRoutesAt } from "./wake-index.js";
+
+/** Terminal disposition is irreversible for this delivery: a late heartbeat is
+ * not Main-death proof. Wait at least one minute AND three actual host-lease TTLs
+ * beyond expiry (default native TTL is 15 s; longer/reload leases scale with it). */
+export const RESIDENT_WAKE_TERMINAL_MIN_GRACE_MS = 60_000;
+const RESIDENT_WAKE_TERMINAL_GRACE_TTLS = 3;
+
+const nativeRootLeasePastGrace = (lease: FabricHostLease | undefined, rootId: string, now: number): boolean => {
+  // Bridge/transport projections do not share the native Main writer's
+  // lease/publication protocol; their expiry is not fenced absence.
+  // A missing lease (even after clean close/reaping) carries no expiry evidence.
+  // Without consuming a native close proof, retain retry rather than infer death.
+  if (!lease || lease.id !== rootId || lease.rootId !== rootId || lease.identityId !== rootId ||
+      lease.mirror !== undefined || lease.mirrorLease === 1 ||
+      !Number.isSafeInteger(now) || now <= 0 || !Number.isSafeInteger(lease.updatedAt) || lease.updatedAt <= 0 ||
+      !Number.isSafeInteger(lease.expiresAt) || lease.expiresAt <= lease.updatedAt ||
+      (lease.reloadUntil !== undefined && (!Number.isSafeInteger(lease.reloadUntil) ||
+        lease.reloadUntil <= 0 || lease.reloadUntil > lease.expiresAt))) return false;
+  const grace = Math.max(RESIDENT_WAKE_TERMINAL_MIN_GRACE_MS,
+    RESIDENT_WAKE_TERMINAL_GRACE_TTLS * (lease.expiresAt - lease.updatedAt));
+  const terminalAfter = lease.expiresAt + grace;
+  // Overflow, malformed clocks and the exact boundary cannot authorize an ACK.
+  return Number.isSafeInteger(terminalAfter) && now > terminalAfter;
+};
 
 /** Exceptional-path only: owner.json describes the resident, never its originating Main. */
 export function residentWakeTerminalRoot(mesh: Pick<MeshStore, "root" | "listAll">, root: string): string | undefined {
@@ -23,15 +46,7 @@ export function residentWakeTerminalRoot(mesh: Pick<MeshStore, "root" | "listAll
     const rootId = routes.rootId;
     const now = Date.now();
     const lease = readHostLeaseCurrent(mesh.root, rootId);
-    if (lease) {
-      // Bridge/transport projections do not share the native Main writer's
-      // lease/publication protocol; their expiry is not fenced absence.
-      if (lease.rootId !== rootId || lease.identityId !== rootId || lease.expiresAt >= now ||
-          lease.mirror !== undefined || lease.mirrorLease === 1) return;
-    } else {
-      try { fs.lstatSync(hostLeasePath(mesh.root, rootId)); return; }
-      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") return; }
-    }
+    if (!nativeRootLeasePastGrace(lease, rootId, now)) return;
     // A read-only directory is never started: no heartbeat, registration or timer.
     // Use the resident's identity so legacy Main advertisements are not excluded as self.
     const directory = new ParticipantDirectory(store, { enabled: true, hostId: routes.hostId,
@@ -62,12 +77,7 @@ export function residentWakeTerminalRoot(mesh: Pick<MeshStore, "root" | "listAll
     // publication AND lease custody through their final check, receipt and ACK.
     if (directory.get(rootId, Date.now(), { fresh: true })) return;
     const current = readHostLeaseCurrent(mesh.root, rootId);
-    if (current ? current.rootId !== rootId || current.identityId !== rootId || current.expiresAt >= Date.now() ||
-        current.mirror !== undefined || current.mirrorLease === 1 : lease !== undefined) return;
-    if (!current) {
-      try { fs.lstatSync(hostLeasePath(mesh.root, rootId)); return; }
-      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") return; }
-    }
+    if (!nativeRootLeasePastGrace(current, rootId, Date.now())) return;
     return rootId;
   } catch { return; } // Unknown liveness/configuration must retain the existing retry.
 }

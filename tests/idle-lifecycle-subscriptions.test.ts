@@ -124,16 +124,33 @@ describe.each(["file", "sqlite"] as const)("idle lifecycle subscription entries 
     await f.start();
     const log = fs.statSync(path.join(f.root, "events.jsonl"));
     const sub = f.value("state-only");
-    await f.put(sub);
-    await until(() => f.read(sub.id)?.lastEventId === event.id);
+    const proofs = vi.spyOn(f.receiver, "stateUnchangedSince");
+    // Observe real drains; do not manufacture a wake or extend the wait.
+    const checkpoint = async (phase: string, mutate: () => Promise<unknown>, check: () => boolean) => {
+      const before = { revision: f.receiver.stateRevision() ?? null, scans: f.scans(), proofs: proofs.mock.calls.length,
+        ownershipChecks: f.ownership.mock.calls.length };
+      try {
+        await mutate();
+        await until(check);
+      } catch (cause) {
+        throw new Error(`state-only ${backend} ${phase}: ${JSON.stringify({ before,
+          after: { revision: f.receiver.stateRevision() ?? null, scans: f.scans(), proofs: proofs.mock.calls.length,
+            lastProof: { call: proofs.mock.calls.at(-1), result: proofs.mock.results.at(-1) },
+            ownershipChecks: f.ownership.mock.calls.length },
+          subscription: f.read(sub.id) ?? null, deliveries: f.deliveries.map(row => row.event.id),
+        })}`, { cause });
+      }
+    };
+    await checkpoint("join", () => f.put(sub), () => f.read(sub.id)?.lastEventId === event.id);
     expect(f.deliveries.map(row => row.event.id)).toEqual([event.id]);
     // Another host rewinds the canonical cursor: unchanged log is not a reason to skip the new entry.
-    await f.put({ ...sub, updatedAt: 3 });
-    await until(() => f.deliveries.length === 2 && f.read(sub.id)?.lastEventId === event.id);
+    await checkpoint("cursor rewind", () => f.put({ ...sub, updatedAt: 3 }),
+      () => f.deliveries.length === 2 && f.read(sub.id)?.lastEventId === event.id);
     expect(f.deliveries.map(row => row.event.id)).toEqual([event.id, event.id]);
     const scanned = f.scans();
-    await f.publisher.unsubscribe(sub.id);
-    await until(() => f.scans() > scanned);
+    await checkpoint("deletion", async () => {
+      expect(await f.publisher.unsubscribe(sub.id)).toEqual({ removed: true });
+    }, () => f.scans() > scanned);
     const after = fs.statSync(path.join(f.root, "events.jsonl"));
     expect([after.size, after.mtimeMs]).toEqual([log.size, log.mtimeMs]);
     // Even a later received event cannot activate the deleted cached subscription.

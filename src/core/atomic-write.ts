@@ -821,12 +821,16 @@ export const alarmForeignHolder = (error: MeshLockForeignHolderError): void => {
 export const isMeshLockTimeout = (error: unknown): error is Error & { code: typeof MESH_LOCK_TIMEOUT_CODE } =>
   error instanceof Error && "code" in error && error.code === MESH_LOCK_TIMEOUT_CODE;
 
+/** Shared with state-backend.ts so the core deferred-write path does not import the storage backend. */
+export const MESH_STATE_WAL_CAP_CODE = "FABRIC_MESH_STATE_WAL_CAP";
+export const isMeshStateWalCap = (error: unknown): boolean =>
+  error instanceof Error && (error as { code?: unknown }).code === MESH_STATE_WAL_CAP_CODE;
+
 /** A write that wrote nothing and may succeed later: pending identity, snapshot validation exhaustion,
- * a lock timeout, or a SQLite WAL-cap refusal
- * (`FABRIC_MESH_STATE_WAL_CAP`, state-backend.ts isMeshStateWalCap; smarty-dev#7451 item 8). */
+ * a lock timeout, or a SQLite WAL-cap refusal (`FABRIC_MESH_STATE_WAL_CAP`; smarty-dev#7451 item 8). */
 export const isMeshWriteDeferred = (error: unknown): error is Error =>
   isMeshIncarnationPending(error) || isMeshSnapshotRetriesExhausted(error) || isMeshLockTimeout(error) ||
-  (error instanceof Error && (error as { code?: unknown }).code === "FABRIC_MESH_STATE_WAL_CAP");
+  isMeshStateWalCap(error);
 
 /** Best-effort protocol writes may swallow conflicts, but not retryable admission refusals.
  * Retain the historical name and the same refusals that previously carried the timeout code. */
@@ -924,9 +928,22 @@ export const emitMeshJournalAlarm = (alarm: Parameters<typeof meshJournalAlarmLi
  * readers' pids and command lines, which can carry secrets: only its sizes and reader count are logged. */
 export const meshDeferredSummary = (error: unknown): string => {
   if (isMeshIncarnationPending(error) || isMeshSnapshotRetriesExhausted(error) || isMeshLockTimeout(error)) return error.message;
-  const capped = error as { walBytes?: unknown; capBytes?: unknown; readerCount?: unknown };
-  return `FABRIC_MESH_STATE_WAL_CAP: the SQLite WAL is ${String(capped.walBytes)} bytes, above the ${String(capped.capBytes)}-byte cap; `
-    + `${typeof capped.readerCount === "number" ? capped.readerCount : "unknown"} WAL reader(s)`;
+  if (isMeshStateWalCap(error)) {
+    const capped = error as { walBytes?: unknown; capBytes?: unknown; readerCount?: unknown };
+    const readers = typeof capped.readerCount === "number" ? capped.readerCount : "unknown";
+    if (typeof capped.walBytes !== "number" || !Number.isFinite(capped.walBytes)
+        || typeof capped.capBytes !== "number" || !Number.isFinite(capped.capBytes)) {
+      return `FABRIC_MESH_STATE_WAL_CAP (sizes not available); ${readers} WAL reader(s)`;
+    }
+    return `FABRIC_MESH_STATE_WAL_CAP: the SQLite WAL is ${String(capped.walBytes)} bytes, above the ${String(capped.capBytes)}-byte cap; `
+      + `${readers} WAL reader(s)`;
+  }
+  const details = error as { code?: unknown; message?: unknown } | null | undefined;
+  const code = details?.code;
+  const message = error instanceof Error ? error.message
+    : typeof details?.message === "string" ? details.message : String(error);
+  const prefix = (typeof code === "string" && code.length > 0) || typeof code === "number" ? `${String(code)}: ` : "";
+  return `${prefix}${message}`;
 };
 
 type PendingAlarm = { alarm: MeshOutageAlarm; attempts: number; firstAt: number };

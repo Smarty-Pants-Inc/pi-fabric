@@ -3,12 +3,13 @@ import childProcess from "node:child_process";
 import fs from "node:fs";
 import { PassThrough } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { MESH_ALARM_ATTEMPT_MS, MESH_ALARM_MAX_ATTEMPTS, MESH_JOURNAL_ALARM_TAG, MESH_OUTAGE_ALARM_AFTER_MS, MESH_OUTAGE_ALARM_TAG, MESH_OUTAGE_RECOVERY_SUCCESSES, MeshBackgroundQueue, MeshBackgroundRetry, type MeshOutageAlarm } from "../src/core/atomic-write.js";
+import { MESH_ALARM_ATTEMPT_MS, MESH_ALARM_MAX_ATTEMPTS, MESH_JOURNAL_ALARM_TAG, MESH_OUTAGE_ALARM_AFTER_MS, MESH_OUTAGE_ALARM_TAG, MESH_OUTAGE_RECOVERY_SUCCESSES, MeshBackgroundQueue, MeshBackgroundRetry, MeshIncarnationPendingError, MeshSnapshotRetriesExhaustedError, meshDeferredSummary, type MeshOutageAlarm } from "../src/core/atomic-write.js";
 import { FABRIC_MESH_OUTAGE_ALARM_TOPIC, meshAlarmRecipient, meshOutageAlarmSink } from "../src/mesh/store.js";
 
 const CHIEF = "session:0a1b2c3d-0000-4000-8000-00000000c0f5";
 import { parse9729 } from "./helpers/alarm-contract.js";
 import { MeshLockTimeoutError } from "../src/mesh.js";
+import { MeshStateWalCapError } from "../src/mesh/state-sqlite.js";
 
 const busy = () => new MeshLockTimeoutError(" held by pid 123 (alive, running)", 6, 8020);
 // Safety gate: ALL alarm tests use an inert child. No unit test writes live journal alarms.
@@ -387,15 +388,53 @@ describe("background outage alarm (smarty-dev#8825)", () => {
     vi.unstubAllEnvs();
   });
 
-  // pi-fabric#893 round 3: a WAL-cap refusal's message carries reader pids and command lines; the retry line never does.
-  it("logs a WAL-cap retry without the readers' pids or command lines", () => {
+  // smarty-dev#16197: only a real WAL-cap code gets the WAL summary; arbitrary reader-shaped fields are not enough.
+  const readerFields = { walBytes: 120, capBytes: 96, readerCount: 1,
+    readers: "pid 4242 (S, 3m, node --token=wal-reader-secret) slot 0" };
+  it.each([
+    { name: "SQLITE_BUSY", error: Object.assign(new Error("SQLite reported a busy database"), { code: "SQLITE_BUSY", ...readerFields }),
+      code: "SQLITE_BUSY", message: "SQLite reported a busy database" },
+    { name: "plain Error", error: Object.assign(new Error("plain application failure"), readerFields),
+      code: undefined, message: "plain application failure" },
+    { name: "coded Error", error: Object.assign(new Error("filesystem operation failed"), { code: "EIO", ...readerFields }),
+      code: "EIO", message: "filesystem operation failed" },
+    { name: "code-only object", error: { code: "EIO" }, code: "EIO", message: undefined },
+  ])("preserves $name without adding WAL reader details", ({ error, code, message }) => {
+    const summary = meshDeferredSummary(error);
+    if (message) expect(summary).toContain(message);
+    if (code) expect(summary).toContain(code);
+    expect(summary).not.toContain("FABRIC_MESH_STATE_WAL_CAP");
+    expect(summary).not.toMatch(/120 bytes|96-byte cap|WAL reader/);
+    expect(summary).not.toContain("wal-reader-secret");
+  });
+
+  it("keeps pending, snapshot and lock-timeout summaries verbatim", () => {
+    for (const error of [new MeshIncarnationPendingError(), new MeshSnapshotRetriesExhaustedError(3), busy()]) {
+      expect(meshDeferredSummary(error)).toBe(error.message);
+    }
+  });
+
+  it.each([{}, { walBytes: 120 }, { capBytes: 96 }])(
+    "summarizes a bridge-reconstructed WAL-cap error without inventing sizes (%j)", fields => {
+      const reconstructed = Object.assign(new Error("WAL readers: pid 4242 (node --token=wal-reader-secret)"),
+        { code: "FABRIC_MESH_STATE_WAL_CAP", ...fields });
+      const summary = meshDeferredSummary(reconstructed);
+      expect(summary).toContain("FABRIC_MESH_STATE_WAL_CAP");
+      expect(summary).toMatch(/sizes? (?:are )?not available/i);
+      expect(summary).not.toContain("undefined");
+      expect(summary).not.toMatch(/4242|wal-reader-secret|--token/);
+    });
+
+  // pi-fabric#893 round 3: a real WAL-cap refusal carries reader pids and command lines; the retry line never does.
+  it("logs a real WAL-cap retry with full size and reader-count text, not reader secrets", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    const refused = Object.assign(new Error("Fabric mesh state write refused ... (WAL readers: pid 4242 (S, 3m, node --token=hunter2) slot 0)"),
-      { code: "FABRIC_MESH_STATE_WAL_CAP", walBytes: 120, capBytes: 96, readerCount: 1 });
+    const walBytes = 120 * 1024 * 1024, capBytes = 96 * 1024 * 1024, readerCount = 2;
+    const refused = new MeshStateWalCapError(walBytes, capBytes,
+      "pid 4242 (S, 3m, node --token=wal-reader-secret-command) slot 0", readerCount);
     new MeshBackgroundRetry("poll", 100, 400).failure(refused);
     const lines = warn.mock.calls.map(([line]) => String(line)).join("\n");
-    expect(lines).toContain("120 bytes, above the 96-byte cap; 1 WAL reader(s)");
-    expect(lines).not.toMatch(/4242|hunter2|--token/);
+    expect(lines).toContain(`${walBytes} bytes, above the ${capBytes}-byte cap; ${readerCount} WAL reader(s)`);
+    expect(lines).not.toMatch(/4242|wal-reader-secret-command|--token/);
   });
 
   // pi-fabric#893 CODE P2: any failure, deferred or not, breaks the recovery streak.

@@ -959,8 +959,12 @@ export class MeshStore {
       if (isMeshStateWalCap(error) && now - this.#walCapAlarmAt >= MESH_WAL_CAP_ALARM_MS) {
         this.#walCapAlarmAt = now;
         const { walBytes, capBytes, readerCount } = error as { walBytes?: number; capBytes?: number; readerCount?: number };
-        const text = `mesh state write refused by the SQLite WAL cap (${String(walBytes)} > ${String(capBytes)} bytes; `
-          + `${readerCount ?? 0} WAL reader(s))`;
+        const hasSizes = typeof walBytes === "number" && Number.isFinite(walBytes)
+          && typeof capBytes === "number" && Number.isFinite(capBytes);
+        const text = hasSizes
+          ? `mesh state write refused by the SQLite WAL cap (${String(walBytes)} > ${String(capBytes)} bytes; `
+            + `${readerCount ?? 0} WAL reader(s))`
+          : `mesh state write refused by the SQLite WAL cap (sizes not available; ${readerCount ?? 0} WAL reader(s))`;
         // The journal alarm line #9729 pages on; no mesh root path, no reader pids (pi-fabric#893 rounds 4-5).
         diagnostics.warn("src/mesh/store.ts", meshJournalAlarmLine({ label: "mesh state writes", state: "outage", sinceMs: now,
           reason: `SQLite WAL cap: ${text}`, walBytes, capBytes, readerCount: readerCount ?? 0 }));

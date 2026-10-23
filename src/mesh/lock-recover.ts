@@ -151,7 +151,14 @@ export const recoverMeshLock = async (root: string, options: MeshLockRecoverOpti
   if (!owner.endsWith("\n") || namespace === undefined || !Number.isSafeInteger(pid) || pid <= 0) {
     throw new MeshLockRecoverRefusedError(`${lock} does not hold a complete owner record`);
   }
-  if (fields[0] !== options.holder) throw new MeshLockRecoverRefusedError(`${lock} is held by ${fields[0]}, not ${options.holder}`);
+  if (fields[0] !== options.holder) {
+    // Diagnostic projection only: admission above and the recovery/audit below keep the exact raw tokens.
+    const tokenLabel = (token: string | undefined): string => typeof token === "string" &&
+      (token.length === 32 || token.length === 36) &&
+      /^(?:[0-9A-Fa-f]{32}|[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})$/.test(token)
+        ? token : "invalid-token";
+    throw new MeshLockRecoverRefusedError(`${lock} is held by ${tokenLabel(fields[0])}, not ${tokenLabel(options.holder)}`);
+  }
   // pi-fabric#923 (fabric-store decisions): a record without a namespace is UNPROVEN (its pid may name nothing here
   // although it is alive in another namespace); no previous-boot inference (VM clones share a machine id). The safe
   // form recovers only a holder of OUR namespace whose pid is gone; everything else is the audited unsafe override.

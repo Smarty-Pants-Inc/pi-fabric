@@ -116,7 +116,7 @@ import { verifiedRemove } from "../storage/verified-remove.js";
 import { MeshBatchConflictError, type MeshBatchOperation, type MeshBatchResult, type MeshBatchView,
   type MeshReadOptions, type MeshStateEntry } from "./state-file.js";
 import type { MeshIdentity } from "./event-log.js";
-import { formatWalReaders, walReaderPids, walWriterPid } from "./wal-readers.js";
+import { formatWalReaders, walReaderComm, walReaderPids, walWriterPid, type WalReader } from "./wal-readers.js";
 import { createLockEvents, lockHeldEventThreshold, type MeshLockClass } from "./commit-stats.js";
 import { assertPrivatePath, assertPrivateStateRoot, filesystemRefusal, MeshStateUnsupportedError, openPrivateStateDb } from "./state-gate.js";
 
@@ -386,10 +386,28 @@ export class MeshStateRetiredError extends Error {
 /** A write refused while the WAL is above `walHardCapBytes` (a reader is pinning it). Retryable later. */
 export class MeshStateWalCapError extends Error {
   readonly code = "FABRIC_MESH_STATE_WAL_CAP";
-  constructor(readonly walBytes: number, readonly capBytes: number, readonly readers = "", readonly readerCount = 0) {
-    super(`Fabric mesh state write refused: the SQLite WAL is ${walBytes} bytes, above the ${capBytes}-byte cap; `
-      + `a reader is pinning the WAL; restart it or roll back${readers ? ` (WAL readers: ${readers})` : ""}`);
+  readonly walBytes: number | undefined;
+  readonly capBytes: number | undefined;
+  readonly readerCount: number | undefined;
+  readonly readers: string;
+  constructor(walBytes: number, capBytes: number, readers: string | readonly WalReader[] = "", readerCount = 0) {
+    const size = typeof walBytes === "number" && Number.isFinite(walBytes) && walBytes >= 0 ? walBytes : undefined;
+    const cap = typeof capBytes === "number" && Number.isFinite(capBytes) && capBytes > 0 ? capBytes : undefined;
+    // Legacy strings are accepted but never retained. Re-read comm so caller text is not promoted to a kernel fact.
+    const safeReaders = Array.isArray(readers) ? formatWalReaders(readers.flatMap((reader) => {
+      const pid: unknown = reader?.pid;
+      if (typeof pid !== "number" || !Number.isSafeInteger(pid) || pid <= 0) return [];
+      const comm = walReaderComm(pid);
+      return [{ pid, ...(comm === undefined ? {} : { comm }) }];
+    })) : "";
+    super(`Fabric mesh state write refused: ${size === undefined || cap === undefined ? "SQLite WAL sizes not available"
+      : `the SQLite WAL is ${size} bytes, above the ${cap}-byte cap`}; `
+      + `a reader is pinning the WAL; restart it or roll back${safeReaders ? ` (WAL readers: ${safeReaders})` : ""}`);
     this.name = "MeshStateWalCapError";
+    this.walBytes = size;
+    this.capBytes = cap;
+    this.readerCount = typeof readerCount === "number" && Number.isSafeInteger(readerCount) && readerCount >= 0 ? readerCount : undefined;
+    this.readers = safeReaders;
   }
 }
 
@@ -1967,7 +1985,7 @@ export class SqliteStateStore {
     }
     if (size > this.#walHardCapBytes) {
       const readers = walReaderPids(this.file);
-      throw new MeshStateWalCapError(size, this.#walHardCapBytes, formatWalReaders(readers), readers.length);
+      throw new MeshStateWalCapError(size, this.#walHardCapBytes, readers, readers.length);
     }
   }
 

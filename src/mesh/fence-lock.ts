@@ -190,9 +190,10 @@ export const holdMeshFenceSync = <T>(root: string, timeoutMs: number, operation:
         if (pin !== FOREIGN_LOCK) return () => releaseFenceLock(lock, record, {}, pin);
       }
       if (Date.now() >= deadline) {
-        let pid: string | undefined;
-        try { pid = fs.readFileSync(path.join(lock, "owner"), "utf8").split("\n")[1]; } catch { /* ownerless or gone */ }
-        throw new MeshFenceBusyError(` (${path.basename(lock)} ${lock}${pid ? `, held by pid ${pid}` : ""})`, attempts, maxGapMs);
+        let pid = NaN;
+        try { pid = Number(fs.readFileSync(path.join(lock, "owner"), "utf8").split("\n")[1]); } catch { /* ownerless or gone */ }
+        const holder = Number.isSafeInteger(pid) && pid > 0 ? `held by pid ${pid}` : "owner pid unreadable";
+        throw new MeshFenceBusyError(` (${path.basename(lock)} ${lock}, ${holder})`, attempts, maxGapMs);
       }
       sleepSync(Math.min(Math.max(1, deadline - Date.now()), 2 + Math.floor(Math.random() * 4)));
     }

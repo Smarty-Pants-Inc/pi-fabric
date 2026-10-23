@@ -24,6 +24,9 @@ describe("resident wake fairness across active meshes", () => {
     const claimRoots: number[] = [];
     const claimReads: number[] = [];
     let custody: { mesh: MeshStore; discovery: boolean; entries: number; reads: number; roots: Set<string> } | undefined;
+    let activeMesh: MeshStore | undefined;
+    let routeReadsInsideCustody = 0;
+    let routeReadsOutsideCustody = 0;
     let custodyCalls = 0;
     let openedDirectories = 0;
     let closedDirectories = 0;
@@ -86,15 +89,20 @@ describe("resident wake fairness across active meshes", () => {
       const open = fs.openSync;
       vi.spyOn(fs, "openSync").mockImplementation(((file: fs.PathLike, ...args: unknown[]) => {
         const fd = (open as (...args: unknown[]) => number)(file, ...args);
+        const at = String(file);
+        const parent = path.dirname(at);
+        if (activeMesh && residentRoots.has(parent) && path.dirname(parent) === path.join(activeMesh.root, "residency") &&
+            path.basename(at) === "wake-routes.json") {
+          visited.get(activeMesh)!.add(parent);
+          if (custody) routeReadsInsideCustody++;
+          else routeReadsOutsideCustody++;
+        }
         if (custody) {
-          const at = String(file);
-          const parent = path.dirname(at);
           if (parent === path.join(custody.mesh.root, "wake-overflow")) {
             custody.reads++;
             custody.roots.add(path.join(custody.mesh.root, "residency", path.basename(at, ".json")));
           } else if (residentRoots.has(parent)) {
             custody.roots.add(parent);
-            if (!custody.discovery && path.basename(at) === "wake-routes.json") visited.get(custody.mesh)!.add(parent);
           }
         }
         return fd;
@@ -118,13 +126,18 @@ describe("resident wake fairness across active meshes", () => {
         });
         return directory;
       }) as typeof fs.opendirSync);
+      const retryForMesh = async (mesh: MeshStore): Promise<void> => {
+        activeMesh = mesh;
+        try { await retryResidentWakes(mesh, launch, now); }
+        finally { activeMesh = undefined; }
+      };
 
       // No draining/deleting page-one fixtures to manufacture progress. Every
       // receipt remains in backoff while the same 33 meshes alternate custody.
       for (let round = 0; round < 2; round++) {
         for (const mesh of meshes) {
           custodyCalls = 0;
-          await retryResidentWakes(mesh, launch, now);
+          await retryForMesh(mesh);
         }
         const counts = meshes.map(mesh => visited.get(mesh)!.size);
         if (round === 0) firstRound = counts;
@@ -134,7 +147,7 @@ describe("resident wake fairness across active meshes", () => {
       // closeState must release them rather than relying on EOF or process exit.
       for (const mesh of meshes) {
         custodyCalls = 0;
-        await retryResidentWakes(mesh, launch, now);
+        await retryForMesh(mesh);
       }
       openBeforeCleanup = nativeDirectories.size;
       expect(firstRound).toEqual(Array(meshCount).fill(128));
@@ -144,6 +157,8 @@ describe("resident wake fairness across active meshes", () => {
       expect(claimRoots.length).toBeGreaterThan(0);
       expect(Math.max(...claimRoots)).toBeLessThanOrEqual(1);
       expect(Math.max(...claimReads)).toBeLessThanOrEqual(1);
+      expect(routeReadsOutsideCustody, "retained route files are opened outside global mesh custody").toBeGreaterThan(0);
+      expect(routeReadsInsideCustody, "retained route files are not opened under global mesh custody").toBe(0);
       expect(launch).not.toHaveBeenCalled();
       for (const [file, contents] of retainedFiles) expect(fs.readFileSync(file, "utf8")).toBe(contents);
     } finally {

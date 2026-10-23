@@ -12,6 +12,7 @@ import { canonicalResidentWakeConfig, residentUnacknowledgedDeliveries, Resident
   residentWakeIndexPath, RESIDENT_WAKE_INDEX_MAX_ROOTS, RESIDENT_WAKE_RETRY_SCAN_MAX_PAGES,
   RESIDENT_WAKE_RETRY_SCAN_PAGE_ENTRIES } from "../src/residency/wake-index.js";
 import * as wake from "../src/residency/wake.js";
+import { writeHostLease } from "../src/topology/host-leases.js";
 
 const from = { id: "publisher", name: "publisher", kind: "main" as const };
 const fixture = (count: number, canWakeResidents?: () => boolean) => {
@@ -30,6 +31,12 @@ const fixture = (count: number, canWakeResidents?: () => boolean) => {
   });
   const close = () => { vi.restoreAllMocks(); mesh.closeState(); fs.rmSync(root, { recursive: true, force: true }); };
   return { root, mesh, residents, close };
+};
+// Backoff/admission checks need a live originating Main: a dead Main's exact
+// restart-config mismatch now has a terminal disposition instead of retry debt.
+const keepRootMainsLive = (f: ReturnType<typeof fixture>) => {
+  for (const config of f.residents) writeHostLease(f.mesh.root, { id: config.rootId, rootId: config.rootId,
+    identityId: config.rootId, updatedAt: Date.now(), expiresAt: Date.now() + 86_400_000 });
 };
 const failureAt = (root: string) => wake.readWakeJson<{
   delivery: { id: string; sequence: number }; error: string; failedAt: number; nextRetryAt: number;
@@ -276,11 +283,12 @@ describe("publication wake isolation and maintenance backoff", () => {
       if (staysOpen) expect(await direct).toBe(true);
       else await expect(direct).rejects.toThrow("admission closed");
       expect(fs.existsSync(wake.residentWakeRequestPath(config.residencyRoot))).toBe(staysOpen);
-      expect(exclusive).toHaveBeenCalledOnce();
+      expect(exclusive).toHaveBeenCalledTimes(staysOpen ? 1 : 0);
     } finally { release?.(); f.close(); }
   });
   it.each([1, 3, 10])("unrelated publication does not await %i ConfigMismatch-style failed roots", async count => {
     const f = fixture(count);
+    keepRootMainsLive(f);
     let slow = false;
     const launch = vi.fn(async (_file: string, config: ResidentHostConfig) => {
       // Same IPC outcome as a native launcher refusing its restart config. Slow
@@ -379,6 +387,7 @@ describe("publication wake isolation and maintenance backoff", () => {
 
   it("a matching publication still waits for its own wake, even during retry backoff", async () => {
     const f = fixture(1);
+    keepRootMainsLive(f);
     let finish!: () => void;
     let started!: () => void;
     const entered = new Promise<void>(resolve => { started = resolve; });
@@ -408,6 +417,7 @@ describe("publication wake isolation and maintenance backoff", () => {
   it("the existing ActorManager retention interval retries without bypassing the store wake gate", async () => {
     let allowed = true;
     const f = fixture(1, () => allowed);
+    keepRootMainsLive(f);
     const config = f.residents[0]!;
     const configFile = path.join(config.residencyRoot, "config.json");
     const saved = fs.readFileSync(configFile, "utf8");
@@ -447,14 +457,19 @@ describe("publication wake isolation and maintenance backoff", () => {
       expect(launch).not.toHaveBeenCalled();
       allowed = true;
       await vi.waitFor(() => expect(launch).toHaveBeenCalledOnce(), { timeout: 5_000, interval: 10 });
-      expect(fs.existsSync(path.join(config.residencyRoot, "wake-failure.json"))).toBe(false);
+      await vi.waitFor(() => {
+        expect(fs.existsSync(path.join(config.residencyRoot, "wake-failure.json"))).toBe(false);
+        expect(residentUnacknowledgedDeliveries(f.mesh.root).size).toBe(0);
+      }, { timeout: 5_000, interval: 10 });
     } finally { await actors?.close(); await agents.close(); f.close(); }
   });
 
-  it.each([[1, false], [1, true], [2, false], [2, true], [3, false], [3, true], [4, false], [4, true]] as const)(
+  it.each([[1, false], [1, true], [2, false], [2, true], [3, false], [3, true],
+    [4, false], [4, true], [5, false], [5, true]] as const)(
     "rechecks maintenance admission after custody wait %i (gate stays open: %s)", async (heldCall, staysOpen) => {
     let allowed = true;
     const f = fixture(1, () => allowed);
+    keepRootMainsLive(f);
     const config = f.residents[0]!;
     const configFile = path.join(config.residencyRoot, "config.json");
     const saved = fs.readFileSync(configFile, "utf8");
@@ -486,9 +501,10 @@ describe("publication wake isolation and maintenance backoff", () => {
       release();
       await sweeping;
       expect(launch).toHaveBeenCalledTimes(staysOpen ? 1 : 0);
-      // Waits 1/2/3 precede intent commit; wait 4 is its ACK, so intent
-      // was admitted before revocation but launch must still be suppressed.
-      expect(fs.existsSync(wake.residentWakeRequestPath(config.residencyRoot))).toBe(staysOpen || heldCall === 4);
+      // Waits 1-3 cover candidate discovery, observation and keyed revalidation;
+      // wait 4 gates intent commit, and wait 5 gates its post-intent ACK. Closing
+      // before commit must leave no intent; closing at ACK must still suppress launch.
+      expect(fs.existsSync(wake.residentWakeRequestPath(config.residencyRoot))).toBe(staysOpen || heldCall === 5);
       if (!staysOpen) {
         expect(fs.readFileSync(path.join(config.residencyRoot, "wake-failure.json"), "utf8")).toBe(before);
         allowed = true;
@@ -500,6 +516,7 @@ describe("publication wake isolation and maintenance backoff", () => {
 
   it("retains real config refusals, backs off repeated sweeps, and recovers repaired config at the next due retry", async () => {
     const f = fixture(1);
+    keepRootMainsLive(f);
     const config = f.residents[0]!;
     const configFile = path.join(config.residencyRoot, "config.json");
     const saved = fs.readFileSync(configFile, "utf8");

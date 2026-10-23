@@ -437,6 +437,81 @@ describe("bridge catch-up SQLite write-lock holds (smarty-dev#10391), real store
     }
   }, 180_000);
 
+  it("measures toLocal delivery age with 150 lease writes, synchronous versus deferred", async () => {
+    const measure = async (deferred: boolean) => {
+      const hub = store(), far = store();
+      const suffix = deferred ? "deferred" : "synchronous";
+      const localId = await native(hub, `session:age-local-${suffix}`);
+      const remoteId = await native(far, `session:age-remote-${suffix}`);
+      await populate(hub);
+      const local = new StoreBridgeSide(hub, "far", Date.now, false, deferred);
+      const bridge = new MeshBridge({ localName: "hub", remoteName: "far", local,
+        remote: new StoreBridgeSide(far, "hub"), cursorPath: path.join(scratch(), `age-${suffix}.json`) });
+      let syncRename: ReturnType<typeof vi.spyOn> | undefined;
+      let asyncRename: ReturnType<typeof vi.spyOn> | undefined;
+      try {
+        await bridge.start();
+        await local.flushLeaseEffects();
+        await populateCatchupRoots(far, 150);
+        const sourceCreatedAt = new Map<string, number>();
+        for (let index = 0; index < EVENTS;) {
+          const inputs = Array.from({ length: Math.min(256, EVENTS - index) }, (_, offset) =>
+            ({ topic: "fleet.work.hold", kind: "ask", from: remoteId, to: localId.id, text: `age-${suffix}:${index + offset}` }));
+          const published = await far.publishBatch(inputs);
+          for (const event of published) if (event.text !== undefined) sourceCreatedAt.set(event.text, event.createdAt);
+          index += published.length;
+        }
+        const leaseDirectory = `${path.join(hub.root, "host-leases")}${path.sep}`;
+        const delay = new Int32Array(new SharedArrayBuffer(4));
+        let syncLeaseWrites = 0, asyncLeaseWrites = 0;
+        const originalSyncRename = fs.renameSync.bind(fs);
+        const originalAsyncRename = fs.promises.rename.bind(fs.promises);
+        syncRename = vi.spyOn(fs, "renameSync").mockImplementation((source, target) => {
+          if (!deferred && String(target).startsWith(leaseDirectory) && String(target).endsWith(".json")) {
+            syncLeaseWrites += 1;
+            Atomics.wait(delay, 0, 0, 2);
+          }
+          return originalSyncRename(source, target);
+        });
+        asyncRename = vi.spyOn(fs.promises, "rename").mockImplementation(async (source, target) => {
+          if (deferred && String(target).startsWith(leaseDirectory) && String(target).endsWith(".json")) {
+            asyncLeaseWrites += 1;
+            await new Promise(resolve => setTimeout(resolve, 2));
+          }
+          return originalAsyncRename(source, target);
+        });
+        const started = performance.now();
+        const result = await bridge.step();
+        const stepMs = performance.now() - started;
+        const delivered = hub.read({ limit: 1000 }).filter(event => event.topic === "fleet.work.hold" &&
+          event.text?.startsWith(`age-${suffix}:`));
+        const ages = delivered.map(event => event.createdAt - (sourceCreatedAt.get(event.text!) ?? event.createdAt)).sort((a, b) => a - b);
+        await local.flushLeaseEffects();
+        const percentile = (fraction: number): number => ages[Math.min(ages.length - 1,
+          Math.ceil((ages.length - 1) * fraction))] ?? 0;
+        const measurement = { mode: suffix, forwarded: result.toLocal, delivered: ages.length,
+          leaseWrites: deferred ? asyncLeaseWrites : syncLeaseWrites, stepMs: +stepMs.toFixed(1),
+          deliveryP50Ms: +percentile(0.5).toFixed(1), deliveryP95Ms: +percentile(0.95).toFixed(1),
+          deliveryMaxMs: +Math.max(0, ...ages).toFixed(1) };
+        expect(result.toLocal).toBe(EVENTS);
+        expect(ages).toHaveLength(EVENTS);
+        expect(measurement.leaseWrites).toBe(150);
+        return measurement;
+      } finally {
+        await local.flushLeaseEffects();
+        syncRename?.mockRestore();
+        asyncRename?.mockRestore();
+        await bridge.stop();
+      }
+    };
+
+    const synchronous = await measure(false);
+    const deferred = await measure(true);
+    console.log(JSON.stringify({ scenario: "toLocal delivery age during 150 mirrored lease installs",
+      clock: "source and destination createdAt on the same test-process wall clock", synchronous, deferred }));
+    expect(deferred.deliveryP95Ms).toBeLessThan(synchronous.deliveryP95Ms);
+  }, 60_000);
+
   it.each(["toLocal", "toRemote"] as const)(`${EVENTS} events %s: no topology scan inside a write transaction, batches of ${BATCH_MAX_EVENTS} at most`, async direction => {
     const hub = store(), far = store();
     const localId = await native(hub, "session:hold-local"), remoteId = await native(far, "session:hold-remote");
@@ -670,6 +745,7 @@ describe("bridge catch-up SQLite write-lock holds (smarty-dev#10391), real store
     const hubId = await native(hub, "session:hold-hub");
     await populate(hub);
     const links: MeshBridge[] = [];
+    const sourceCreatedAt = new Map<string, number>();
     for (let n = 0; n < SPOKES; n++) {
       const far = store();
       const from = await native(far, `session:hold-spoke-${n}`);
@@ -680,7 +756,9 @@ describe("bridge catch-up SQLite write-lock holds (smarty-dev#10391), real store
       for (let index = 0; index < EVENTS;) {
         const inputs = Array.from({ length: Math.min(256, EVENTS - index) }, (_, k) =>
           ({ topic: "fleet.work.hold", kind: "ask", from, to: hubId.id, text: `${n}:${index + k}` }));
-        index += (await far.publishBatch(inputs)).length;
+        const published = await far.publishBatch(inputs);
+        for (const event of published) if (event.text !== undefined) sourceCreatedAt.set(event.text, event.createdAt);
+        index += published.length;
       }
       links.push(bridge);
     }
@@ -731,7 +809,16 @@ describe("bridge catch-up SQLite write-lock holds (smarty-dev#10391), real store
     scans.drain = inFenceScans;
     const drain = report(holds.filter(hold => hold.db === database), started, performance.now());
     const p99 = waits.slice().sort((a, b) => a - b)[Math.min(waits.length - 1, Math.floor(waits.length * 0.99))] ?? 0;
+    const deliveryAges = received().flatMap(event => {
+      const createdAt = event.text === undefined ? undefined : sourceCreatedAt.get(event.text);
+      return createdAt === undefined ? [] : [Math.max(0, event.createdAt - createdAt)];
+    }).sort((a, b) => a - b);
+    const deliveryP = (fraction: number): number => deliveryAges[Math.min(deliveryAges.length - 1,
+      Math.ceil((deliveryAges.length - 1) * fraction))] ?? 0;
     console.log(JSON.stringify({ phase: "drain", bridges: SPOKES, events: SPOKES * EVENTS, delivered: count,
+      toLocalAgeClock: "source and destination createdAt on the same test-process clock",
+      toLocalDeliveryP50Ms: +deliveryP(0.5).toFixed(1), toLocalDeliveryP95Ms: +deliveryP(0.95).toFixed(1),
+      toLocalDeliveryMaxMs: +Math.max(0, ...deliveryAges).toFixed(1),
       drainMs: +drainMs.toFixed(0), probes: waits.length, probeP99Ms: +p99.toFixed(1),
       probeMaxMs: +Math.max(0, ...waits).toFixed(1), inFenceScans: scans.drain, maxBatchEvents: Math.max(0, ...batches), ...drain }));
     // Steady state: the backlog is gone and nothing new arrives. The bridges run their live loop
@@ -770,6 +857,7 @@ describe("bridge catch-up SQLite write-lock holds (smarty-dev#10391), real store
     expect(scans).toEqual({ drain: 0, idle: 0, busy: 0 });
     expect(Math.max(0, ...batches)).toBeLessThanOrEqual(BATCH_MAX_EVENTS);
     expect(waits.length).toBeGreaterThan(0);
+    expect(deliveryAges).toHaveLength(SPOKES * EVENTS);
     // Gross-regression ceilings only (see CEILING_*).
     expect(drain.maxHoldMs).toBeLessThanOrEqual(CEILING_HOLD_MS);
     expect(drain.heldPct).toBeLessThanOrEqual(CEILING_DRAIN_PCT);

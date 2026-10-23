@@ -196,23 +196,23 @@ const waitFor = async (check: () => boolean): Promise<void> => {
   expect(check()).toBe(true);
 };
 
-describe("lossy WAL-cap redaction", () => {
+describe("safe WAL-cap diagnostics through bridge transport", () => {
   const secret = "REVIEW_SYNTHETIC_READER_SECRET";
-  const readerList = `pid 4242 (S, 3m, env REVIEW_ENV=${secret} node --token=${secret}) slot 0`;
-  const refused = () => new MeshStateWalCapError(120 * 1024 * 1024, 96 * 1024 * 1024, readerList, 2);
+  const walBytes = 120 * 1024 * 1024;
+  const capBytes = 96 * 1024 * 1024;
+  const readerFacts = [{ pid: 4242, slot: 0, comm: "node", state: "S", ageMs: 180_000,
+    cmd: `node --token=${secret}`, argv: [`--token=${secret}`], env: { REVIEW_ENV: secret }, surplus: secret }] as never;
+  const refused = () => new MeshStateWalCapError(walBytes, capBytes, readerFacts, 1);
   const expectSafeSummary = (summary: string) => {
     expect(summary).toContain("FABRIC_MESH_STATE_WAL_CAP");
-    expect(summary).toMatch(/sizes (?:are )?not available/i);
-    expect(summary).not.toContain("undefined");
-    expect(summary).not.toContain(secret);
+    expect(summary).toContain(`${walBytes} bytes, above the ${capBytes}-byte cap; 1 WAL reader(s)`);
+    expect(summary.includes(secret)).toBe(false);
+    expect(summary.includes("pid 4242")).toBe(false);
+    expect(summary.includes("slot 0")).toBe(false);
   };
-  const expectSafeLog = (line: string) => {
-    expect(line).toContain("sizes not available");
-    expect(line).not.toContain("undefined");
-    expect(line).not.toContain(secret);
-  };
+  const expectSafeLog = (line: string) => expectSafeSummary(line);
 
-  it("redacts a fieldless WAL-cap frame decoded by the real RemoteBridgeSide", async () => {
+  it("decodes the safe size/count summary through the real RemoteBridgeSide", async () => {
     const input = new PassThrough();
     const output = new PassThrough();
     const remote = new RemoteBridgeSide(input, output, 1_000);
@@ -221,17 +221,19 @@ describe("lossy WAL-cap redaction", () => {
     try {
       const request = JSON.parse(await requestFrame) as { id: number; op: string };
       expect(request.op).toBe("latestSequence");
-      input.write(`${JSON.stringify({ id: request.id, ok: false, error: refused().message })}\n`);
+      const frame = { id: request.id, ok: false, code: "FABRIC_MESH_LOCK_TIMEOUT", error: meshDeferredSummary(refused()) };
+      expect(JSON.stringify(frame).includes(secret)).toBe(false);
+      input.write(`${JSON.stringify(frame)}\n`);
       const decoded = await call;
       expect(decoded).toBeInstanceOf(Error);
-      expect(decoded).not.toHaveProperty("code");
+      expect(decoded).toHaveProperty("code", "FABRIC_MESH_LOCK_TIMEOUT");
       expectSafeSummary(meshDeferredSummary(decoded));
     } finally {
       remote.close(new Error("test complete"));
     }
   });
 
-  it("redacts a real serveBridgeAgent refusal in MeshBridge startup logs and keeps timeout backoff", async () => {
+  it("keeps the safe size/count summary in MeshBridge startup logs and retains timeout backoff", async () => {
     const { bridge, logs } = setup(undefined, {
       stopMs: 200,
       walCapRetryMinMs: 25,
@@ -255,7 +257,7 @@ describe("lossy WAL-cap redaction", () => {
     expect(failure).toBeUndefined();
   });
 
-  it("redacts a real serveBridgeAgent refusal in forwarding-direction logs", async () => {
+  it("keeps the safe size/count summary in forwarding-direction logs", async () => {
     vi.spyOn(Math, "random").mockReturnValue(0);
     let readCalls = 0;
     const { bridge, logs } = setup(undefined, {
@@ -1236,7 +1238,7 @@ describe("mesh bridge", () => {
     expect(calls).toBe(before);
   });
 
-  it("retries a WAL-cap refusal on the next cycle, logs it once with the reader report, and never stops (pi-fabric#694 P1 2)", async () => {
+  it("retries a WAL-cap refusal on the next cycle, logs one safe size/count summary, and never stops (pi-fabric#694 P1 2)", async () => {
     let calls = 0;
     const at: number[] = [];
     const { bridge, logs } = setup(undefined, {
@@ -1248,7 +1250,8 @@ describe("mesh bridge", () => {
         side.latestCursor = async (...args: Parameters<typeof original>) => {
           calls += 1;
           at.push(Date.now());
-          if (calls <= 3) throw new MeshStateWalCapError(9 * 1024 * 1024, 8 * 1024 * 1024, "pid 4242 (pinner)");
+          if (calls <= 3) throw new MeshStateWalCapError(9 * 1024 * 1024, 8 * 1024 * 1024,
+            [{ pid: 4242, slot: 0, comm: "pinner" }]);
           return original(...args);
         };
         return side;
@@ -1260,7 +1263,7 @@ describe("mesh bridge", () => {
       await waitFor(() => calls >= 4); // three refusals retried on later cycles, then the start pass reads the cursor
       const capLogs = logs.filter((line) => line.includes("mesh state WAL cap; retrying"));
       expect(capLogs).toHaveLength(1); // three refusals within a minute: one line
-      // pi-fabric#893 round 3: sizes and a reader count only, never the readers' pids or command lines.
+      // smarty-dev#16197: the retry summary contains sizes and a reader count, not reader facts.
       expect(capLogs[0]).toContain("WAL reader(s)");
       expect(capLogs[0]).not.toMatch(/4242|pinner/);
       expect(isMeshRetryableBusy(new MeshStateWalCapError(2, 1))).toBe(true);

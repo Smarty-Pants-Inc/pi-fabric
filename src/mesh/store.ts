@@ -951,29 +951,34 @@ export class MeshStore {
   // MESH_WAL_CAP_ALARM_TOPIC event per store at most every MESH_WAL_CAP_ALARM_MS. The event goes to events.jsonl,
   // which the cap does not gate. The refusal itself is rethrown unchanged (callers retry it, item 8).
   // smarty-dev#9513: the event names the refused operation's own writer (a delete has none: the store's process), and
-  // carries a reader COUNT, never reader pids or command lines (those stay in the error for the local operator).
+  // carries only validated sizes and a reader COUNT, never reader pids or comm. Errors can cross the bridge too.
   #walCapAlarmAt = Number.NEGATIVE_INFINITY;
   #alarmWalCap<T>(write: Promise<T>, identity?: MeshIdentity): Promise<T> {
     return write.catch((error: unknown) => {
       const now = Date.now();
       if (isMeshStateWalCap(error) && now - this.#walCapAlarmAt >= MESH_WAL_CAP_ALARM_MS) {
         this.#walCapAlarmAt = now;
-        const { walBytes, capBytes, readerCount } = error as { walBytes?: number; capBytes?: number; readerCount?: number };
-        const hasSizes = typeof walBytes === "number" && Number.isFinite(walBytes)
-          && typeof capBytes === "number" && Number.isFinite(capBytes);
+        const fields = error as { walBytes?: unknown; capBytes?: unknown; readerCount?: unknown };
+        const walBytes = typeof fields.walBytes === "number" && Number.isFinite(fields.walBytes) && fields.walBytes >= 0
+          ? fields.walBytes : undefined;
+        const capBytes = typeof fields.capBytes === "number" && Number.isFinite(fields.capBytes) && fields.capBytes > 0
+          ? fields.capBytes : undefined;
+        const readerCount = typeof fields.readerCount === "number" && Number.isSafeInteger(fields.readerCount) && fields.readerCount >= 0
+          ? fields.readerCount : undefined;
+        const hasSizes = walBytes !== undefined && capBytes !== undefined;
         const text = hasSizes
           ? `mesh state write refused by the SQLite WAL cap (${String(walBytes)} > ${String(capBytes)} bytes; `
-            + `${readerCount ?? 0} WAL reader(s))`
-          : `mesh state write refused by the SQLite WAL cap (sizes not available; ${readerCount ?? 0} WAL reader(s))`;
+            + `${readerCount ?? "unknown"} WAL reader(s))`
+          : `mesh state write refused by the SQLite WAL cap (sizes not available; ${readerCount ?? "unknown"} WAL reader(s))`;
         // The journal alarm line #9729 pages on; no mesh root path, no reader pids (pi-fabric#893 rounds 4-5).
         diagnostics.warn("src/mesh/store.ts", meshJournalAlarmLine({ label: "mesh state writes", state: "outage", sinceMs: now,
-          reason: `SQLite WAL cap: ${text}`, walBytes, capBytes, readerCount: readerCount ?? 0 }));
+          reason: `SQLite WAL cap: ${text}`, walBytes, capBytes, readerCount }));
         const from: MeshIdentity = identity ?? { id: `mesh-store:${process.pid}`, name: "Fabric mesh store", kind: "agent" };
         // publish() can throw synchronously (a size or validation refusal): it must never replace the WAL-cap error.
         const recipient = meshAlarmRecipient(); // no recipient: the log line only, never a broadcast
         try {
           if (recipient) void this.publish({ topic: MESH_WAL_CAP_ALARM_TOPIC, to: recipient, kind: "mesh-wal-cap", from, text,
-            data: { root: this.root, walBytes, capBytes, readerCount: readerCount ?? 0, writer: identity ? identity.id : null } })
+            data: { root: this.root, walBytes, capBytes, readerCount, writer: identity ? identity.id : null } })
             .catch(() => undefined);
         } catch { /* the alarm is best effort */ }
       }

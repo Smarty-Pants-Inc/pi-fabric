@@ -2185,7 +2185,10 @@ export const serveBridgeAgent = (side: StoreBridgeSide, input: Readable, output:
               // This topology FIFO installs before hello's response and later snapshots.
               unsubscribe = side.subscribeChanges(
                 (kind) => reply({ notification: "change", kind }),
-                (error) => { reply({ notification: "failure", error: error.message }); input.destroy(error); finish(); },
+                (error) => {
+                  reply({ notification: "failure", error: isMeshStateWalCap(error) ? meshDeferredSummary(error) : error.message });
+                  input.destroy(error); finish();
+                },
               );
               if (closed) { finish(); return; }
             }
@@ -2200,7 +2203,9 @@ export const serveBridgeAgent = (side: StoreBridgeSide, input: Readable, output:
               return;
             }
             reply({
-              id: request.id, ok: false, error: error instanceof Error ? error.message : String(error),
+              // Select the typed WAL summary before the existing busy-to-timeout wire remap loses its fields.
+              id: request.id, ok: false, error: isMeshStateWalCap(error) ? meshDeferredSummary(error)
+                : error instanceof Error ? error.message : String(error),
               ...(error instanceof BridgeStaleIncarnationError ? { code: error.code,
                 ...(safeDiagnosticId(error.rootId) && isCanonicalRootId(error.rootId) ? { rootId: error.rootId } : {}),
                 ...(safeDiagnosticId(error.hostId) ? { hostId: error.hostId } : {}) }

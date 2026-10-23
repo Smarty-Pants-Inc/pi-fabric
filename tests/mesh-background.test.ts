@@ -389,50 +389,82 @@ describe("background outage alarm (smarty-dev#8825)", () => {
     vi.unstubAllEnvs();
   });
 
-  // smarty-dev#16197: redaction may recognize a cap code or distinctive message, never reader-shaped fields alone.
+  // smarty-dev#16197: provenance is the typed Error/code pair, not marker-shaped caller text.
+  const secret = "REVIEW_SYNTHETIC_READER_SECRET";
+  const readerFacts = [{ pid: 4242, slot: 0, comm: "node", state: "S", ageMs: 180_000,
+    cmd: `node --token=${secret}`, argv: [`--token=${secret}`], env: { REVIEW_ENV: secret }, surplus: secret }] as never;
   const readerFields = { walBytes: 120, capBytes: 96, readerCount: 1,
     readers: "pid 4242 (S, 3m, node --token=wal-reader-secret) slot 0" };
-  describe("lossy WAL-cap redaction", () => {
-    const secret = "REVIEW_SYNTHETIC_READER_SECRET";
-    const readerList = `pid 4242 (S, 3m, env REVIEW_ENV=${secret} node --token=${secret}) slot 0`;
-    const refused = () => new MeshStateWalCapError(120, 96, readerList, 1);
-    const expectRedactedWithoutSizes = (summary: string) => {
-      expect(summary).toContain("FABRIC_MESH_STATE_WAL_CAP");
-      expect(summary).toMatch(/sizes (?:are )?not available/i);
-      expect(summary).not.toContain("undefined");
-      expect(summary).not.toContain(secret);
-    };
+  const refused = () => new MeshStateWalCapError(120, 96, readerFacts, 1);
+  const expectNoSyntheticSecret = (text: string) => expect(text.includes(secret)).toBe(false);
 
-    it("redacts a genuine cap error reconstructed with only its message", () => {
-      const copied = new Error(refused().message);
-      expectRedactedWithoutSizes(meshDeferredSummary(copied));
-    });
-
-    it("redacts a plain JSON code/message envelope after its Error prototype and fields are lost", () => {
+  describe("safe WAL-cap diagnostic provenance", () => {
+    it("keeps a safe producer message safe through lossy representations and wrappers", () => {
       const original = refused();
-      const envelope = JSON.parse(JSON.stringify({ code: original.code, message: original.message })) as Record<string, unknown>;
-      expectRedactedWithoutSizes(meshDeferredSummary(envelope));
-    });
+      expectNoSyntheticSecret(original.message);
+      const rebuilt = new Error(original.message);
+      expect(meshDeferredSummary(rebuilt)).toBe(original.message);
+      expectNoSyntheticSecret(meshDeferredSummary(rebuilt));
 
-    it.each([
-      { name: "WAL code only", error: { code: "FABRIC_MESH_STATE_WAL_CAP", message: `env REVIEW_ENV=${secret} node --token=${secret}` } },
-      { name: "code marker in message", error: new Error(`remote FABRIC_MESH_STATE_WAL_CAP: env REVIEW_ENV=${secret} node --token=${secret}`) },
-      { name: "reader-list marker only", error: new Error(`Bridge agent: WAL readers: ${readerList}`) },
-    ])("redacts independent WAL origin evidence: $name", ({ error }) => {
-      expectRedactedWithoutSizes(meshDeferredSummary(error));
-    });
+      const asString = original.message;
+      expect(meshDeferredSummary(asString)).toBe(asString);
+      expectNoSyntheticSecret(meshDeferredSummary(asString));
 
-    it("keeps numeric sizes for a coded JSON envelope when those fields survive", () => {
-      const original = refused();
       const envelope = JSON.parse(JSON.stringify({ code: original.code, message: original.message,
         walBytes: original.walBytes, capBytes: original.capBytes, readerCount: original.readerCount })) as Record<string, unknown>;
-      const summary = meshDeferredSummary(envelope);
-      expect(summary).toContain("120 bytes, above the 96-byte cap; 1 WAL reader(s)");
-      expect(summary).not.toContain("undefined");
-      expect(summary).not.toContain(secret);
+      const envelopeSummary = meshDeferredSummary(envelope);
+      expect(envelopeSummary).toBe(`${original.code}: ${original.message}`);
+      expectNoSyntheticSecret(envelopeSummary);
+
+      const nested = new Error(`State refusal: ${original.message}`, { cause: original });
+      expect(meshDeferredSummary(nested)).toBe(nested.message);
+      expectNoSyntheticSecret(meshDeferredSummary(nested));
+
+      const nestedTimeout = Object.assign(new Error(`Timed out after producer refusal: ${original.message}`, { cause: original }),
+        { code: "FABRIC_MESH_LOCK_TIMEOUT" });
+      expect(meshDeferredSummary(nestedTimeout)).toBe(nestedTimeout.message);
+      expectNoSyntheticSecret(meshDeferredSummary(nestedTimeout));
+
+      const rewritten = Object.assign(new Error(`Rewritten producer refusal: ${original.message}`), { code: original.code });
+      const rewrittenSummary = meshDeferredSummary(rewritten);
+      expect(rewrittenSummary).toContain("sizes not available");
+      expectNoSyntheticSecret(rewrittenSummary);
+      const truncated = Object.assign(new Error(original.message.slice(0, 48)), { code: original.code });
+      expect(meshDeferredSummary(truncated)).toContain("sizes not available");
+      expectNoSyntheticSecret(meshDeferredSummary(truncated));
     });
 
-    it("preserves narrow retry classification for message-only Errors and plain envelopes", () => {
+    it("uses size/count summaries only for typed WAL errors and does not infer them from JSON fields", () => {
+      const original = refused();
+      const typedSummary = meshDeferredSummary(original);
+      expect(typedSummary).toContain("120 bytes, above the 96-byte cap; 1 WAL reader(s)");
+      expectNoSyntheticSecret(typedSummary);
+
+      const plainEnvelope = JSON.parse(JSON.stringify({ code: original.code, message: original.message,
+        walBytes: 999, capBytes: 111, readerCount: 77 })) as Record<string, unknown>;
+      const summary = meshDeferredSummary(plainEnvelope);
+      expect(summary).toBe(`${original.code}: ${original.message}`);
+      expect(summary).not.toMatch(/999 bytes|111-byte cap|77 WAL reader\(s\)|sizes not available/i);
+      expectNoSyntheticSecret(summary);
+
+      const missingSizes = Object.assign(new Error("safe typed producer error"), { code: original.code, readerCount: 1 });
+      expect(meshDeferredSummary(missingSizes)).toContain("sizes not available");
+    });
+
+    it("keeps ordinary marker-looking errors and the SQLITE_BUSY reader diagnostic verbatim", () => {
+      const ordinary = [
+        new Error("SQLite WAL checkpoint could not complete"),
+        new Error("Could not inspect WAL readers: database is busy"),
+        new Error("Fabric mesh state write refused: the SQLite WAL is unavailable"),
+        new Error("ordinary diagnostic includes FABRIC_MESH_STATE_WAL_CAP as text"),
+      ];
+      for (const error of ordinary) expect(meshDeferredSummary(error)).toBe(error.message);
+
+      const busyDiagnostic = Object.assign(new Error("Could not inspect WAL readers: database is busy"), { code: "SQLITE_BUSY" });
+      expect(meshDeferredSummary(busyDiagnostic)).toBe("SQLITE_BUSY: Could not inspect WAL readers: database is busy");
+    });
+
+    it("preserves narrow retry classification for rebuilt messages and plain envelopes", () => {
       const original = refused();
       const messageOnly = new Error(original.message);
       const envelope = { code: original.code, message: original.message };
@@ -440,72 +472,42 @@ describe("background outage alarm (smarty-dev#8825)", () => {
       expect(isMeshRetryableBusy(envelope)).toBe(false);
     });
 
-    it("does not relabel SQLITE_BUSY or unrelated WAL checkpoint errors", () => {
-      const ordinary = [
-        Object.assign(new Error("SQLite reported a busy database"), { code: "SQLITE_BUSY" }),
-        new Error("SQLite WAL checkpoint could not complete"),
-      ];
-      for (const error of ordinary) {
-        const summary = meshDeferredSummary(error);
-        expect(summary).toContain(error.message);
-        expect(summary).not.toContain("FABRIC_MESH_STATE_WAL_CAP");
-        expect(summary).not.toMatch(/sizes? (?:are )?not available|WAL reader\(s\)/i);
+    it("does not infer WAL-cap origin from unrelated reader-shaped fields alone", () => {
+      const error = Object.assign(new Error("unrelated application failure"), readerFields);
+      expect(meshDeferredSummary(error)).toBe(error.message);
+      expect(isMeshRetryableBusy(error)).toBe(false);
+    });
+
+    it.each([
+      { name: "SQLITE_BUSY", error: Object.assign(new Error("SQLite reported a busy database"), { code: "SQLITE_BUSY", ...readerFields }),
+        code: "SQLITE_BUSY", message: "SQLite reported a busy database", expected: "SQLITE_BUSY: SQLite reported a busy database" },
+      { name: "plain Error", error: Object.assign(new Error("plain application failure"), readerFields),
+        code: undefined, message: "plain application failure", expected: "plain application failure" },
+      { name: "coded Error", error: Object.assign(new Error("filesystem operation failed"), { code: "EIO", ...readerFields }),
+        code: "EIO", message: "filesystem operation failed", expected: "EIO: filesystem operation failed" },
+      { name: "code-only object", error: { code: "EIO" }, code: "EIO", message: undefined, expected: "EIO: [object Object]" },
+    ])("preserves $name without adding WAL size summaries", ({ error, code, message, expected }) => {
+      const summary = meshDeferredSummary(error);
+      expect(summary).toBe(expected);
+      if (message) expect(summary).toContain(message);
+      if (code) expect(summary).toContain(code);
+      expect(summary).not.toMatch(/120 bytes|96-byte cap|WAL reader\(s\)/);
+      expect(summary).not.toContain("wal-reader-secret");
+    });
+
+    it("keeps pending, snapshot and lock-timeout summaries verbatim", () => {
+      for (const error of [new MeshIncarnationPendingError(), new MeshSnapshotRetriesExhaustedError(3), busy()]) {
+        expect(meshDeferredSummary(error)).toBe(error.message);
       }
     });
 
-    it("does not infer WAL-cap origin from reader-shaped fields alone", () => {
-      const error = Object.assign(new Error("unrelated application failure"), readerFields);
-      const summary = meshDeferredSummary(error);
-      expect(summary).toBe(error.message);
-      expect(summary).not.toContain("FABRIC_MESH_STATE_WAL_CAP");
-      expect(isMeshRetryableBusy(error)).toBe(false);
+    it("logs the typed WAL size/count summary on the background retry path", () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      new MeshBackgroundRetry("poll", 100, 400).failure(refused());
+      const lines = warn.mock.calls.map(([line]) => String(line)).join("\n");
+      expect(lines).toContain("120 bytes, above the 96-byte cap; 1 WAL reader(s)");
+      expectNoSyntheticSecret(lines);
     });
-  });
-
-  it.each([
-    { name: "SQLITE_BUSY", error: Object.assign(new Error("SQLite reported a busy database"), { code: "SQLITE_BUSY", ...readerFields }),
-      code: "SQLITE_BUSY", message: "SQLite reported a busy database" },
-    { name: "plain Error", error: Object.assign(new Error("plain application failure"), readerFields),
-      code: undefined, message: "plain application failure" },
-    { name: "coded Error", error: Object.assign(new Error("filesystem operation failed"), { code: "EIO", ...readerFields }),
-      code: "EIO", message: "filesystem operation failed" },
-    { name: "code-only object", error: { code: "EIO" }, code: "EIO", message: undefined },
-  ])("preserves $name without adding WAL reader details", ({ error, code, message }) => {
-    const summary = meshDeferredSummary(error);
-    if (message) expect(summary).toContain(message);
-    if (code) expect(summary).toContain(code);
-    expect(summary).not.toContain("FABRIC_MESH_STATE_WAL_CAP");
-    expect(summary).not.toMatch(/120 bytes|96-byte cap|WAL reader/);
-    expect(summary).not.toContain("wal-reader-secret");
-  });
-
-  it("keeps pending, snapshot and lock-timeout summaries verbatim", () => {
-    for (const error of [new MeshIncarnationPendingError(), new MeshSnapshotRetriesExhaustedError(3), busy()]) {
-      expect(meshDeferredSummary(error)).toBe(error.message);
-    }
-  });
-
-  it.each([{}, { walBytes: 120 }, { capBytes: 96 }])(
-    "summarizes a bridge-reconstructed WAL-cap error without inventing sizes (%j)", fields => {
-      const reconstructed = Object.assign(new Error("WAL readers: pid 4242 (node --token=wal-reader-secret)"),
-        { code: "FABRIC_MESH_STATE_WAL_CAP", ...fields });
-      const summary = meshDeferredSummary(reconstructed);
-      expect(summary).toContain("FABRIC_MESH_STATE_WAL_CAP");
-      expect(summary).toMatch(/sizes? (?:are )?not available/i);
-      expect(summary).not.toContain("undefined");
-      expect(summary).not.toMatch(/4242|wal-reader-secret|--token/);
-    });
-
-  // pi-fabric#893 round 3: a real WAL-cap refusal carries reader pids and command lines; the retry line never does.
-  it("logs a real WAL-cap retry with full size and reader-count text, not reader secrets", () => {
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    const walBytes = 120 * 1024 * 1024, capBytes = 96 * 1024 * 1024, readerCount = 2;
-    const refused = new MeshStateWalCapError(walBytes, capBytes,
-      "pid 4242 (S, 3m, node --token=wal-reader-secret-command) slot 0", readerCount);
-    new MeshBackgroundRetry("poll", 100, 400).failure(refused);
-    const lines = warn.mock.calls.map(([line]) => String(line)).join("\n");
-    expect(lines).toContain(`${walBytes} bytes, above the ${capBytes}-byte cap; ${readerCount} WAL reader(s)`);
-    expect(lines).not.toMatch(/4242|wal-reader-secret-command|--token/);
   });
 
   // pi-fabric#893 CODE P2: any failure, deferred or not, breaks the recovery streak.

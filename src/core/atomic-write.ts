@@ -924,15 +924,12 @@ export const emitMeshJournalAlarm = (alarm: Parameters<typeof meshJournalAlarmLi
   mirrorMeshJournalLine(line);
 };
 
-/** A log-safe description of a deferred write (pi-fabric#893 round 3). A WAL-cap refusal's message embeds the pinning
- * readers' pids and command lines, which can carry secrets: only its validated sizes and reader count are logged. */
+/** A log-safe description of a deferred write (pi-fabric#893 round 3). Only a typed WAL-cap refusal selects the
+ * numeric/count-only summary; ordinary errors and messages retain their own diagnostics. */
 export const meshDeferredSummary = (error: unknown): string => {
   const details = error as { code?: unknown; message?: unknown } | null | undefined;
   const code = details?.code;
-  const rawMessage = typeof details?.message === "string" ? details.message : typeof error === "string" ? error : "";
-  // Redaction is broader than retry authorization: the wire can drop fields/prototypes or remap the code to a timeout.
-  if (code === MESH_STATE_WAL_CAP_CODE || rawMessage.includes(MESH_STATE_WAL_CAP_CODE)
-      || rawMessage.includes("Fabric mesh state write refused: the SQLite WAL is ") || rawMessage.includes("WAL readers:")) {
+  if (isMeshStateWalCap(error)) {
     const capped = error as { walBytes?: unknown; capBytes?: unknown; readerCount?: unknown };
     const readers = typeof capped.readerCount === "number" && Number.isSafeInteger(capped.readerCount) && capped.readerCount >= 0
       ? capped.readerCount : "unknown";

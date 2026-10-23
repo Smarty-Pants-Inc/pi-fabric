@@ -45,25 +45,27 @@ describe.skipIf(process.platform !== "linux")("walReaderPids", () => {
     expect(pid).toBe(proc.pid);
     const readers = walReaderPids(db);
     const mine = readers.filter((r) => r.pid === pid);
+    const nativeComm = fs.readFileSync(`/proc/${pid}/comm`, "utf8").trim();
     expect(mine.length).toBeGreaterThan(0);
-    for (const r of mine) {
-      expect(r.slot).toBeGreaterThanOrEqual(0);
-      expect(r.slot).toBeLessThanOrEqual(4);
-      expect(r.state).toMatch(/^[A-Za-z]$/);
-      expect(r.ageMs).toBeGreaterThanOrEqual(0);
-      expect(r.ageMs).toBeLessThan(10 * 60_000);
-      expect(r.cmd).toBeTruthy();
+    for (const reader of mine) {
+      expect(reader.slot).toBeGreaterThanOrEqual(0);
+      expect(reader.slot).toBeLessThanOrEqual(4);
+      expect(reader.comm).toBe(nativeComm);
+      expect(reader).not.toHaveProperty("cmd");
+      expect(reader).not.toHaveProperty("state");
+      expect(reader).not.toHaveProperty("ageMs");
     }
     expect(walReaderPids(path.join(dir, "missing.db"))).toEqual([]);
-    expect(formatWalReaders(mine)).toMatch(new RegExp(`^pid ${pid} \\([A-Za-z], \\d+s, .+\\) slot [0-4]`));
+    expect(formatWalReaders(mine).split("; ").every((line) => line === `pid ${pid} (${nativeComm})`)).toBe(true);
     proc.stdin!.end();
     await new Promise((resolve) => proc.once("exit", resolve));
     child = undefined;
     expect(walReaderPids(db).filter((r) => r.pid === pid)).toEqual([]);
   }, 30_000);
 
-  it("formats readers compactly and never throws", () => {
-    expect(formatWalReaders([{ pid: 1234, slot: 2, state: "D", ageMs: 12 * 60_000, cmd: "node ..." }])).toBe("pid 1234 (D, 12m, node ...) slot 2");
+  it("formats only the validated pid and native comm, and never throws", () => {
+    expect(formatWalReaders([{ pid: 1234, slot: 2, comm: "node", state: "D", ageMs: 12 * 60_000, cmd: "node ..." } as never]))
+      .toBe("pid 1234 (node)");
     expect(formatWalReaders([])).toBe("no WAL readers found");
     expect(walReaderPids("\0bad")).toEqual([]);
   });

@@ -913,7 +913,7 @@ export class StoreBridgeSide implements BridgeSide {
     let scanNext = false;
     let eventsNext = false;
     let retryMs = LOCK_RETRY_MIN_MS;
-    let baseline: ReturnType<typeof snapshot>;
+    let baseline: ReturnType<typeof snapshot> | undefined;
     // File snapshots are private, copy-on-write parses. Observe their read-only entries once,
     // instead of cloning the whole topology for each projection on every catch-up notification.
     // Cache content by object, never by version: legacy writers can reuse revision labels.
@@ -984,10 +984,10 @@ export class StoreBridgeSide implements BridgeSide {
       try {
         const next = capture();
         retryMs = LOCK_RETRY_MIN_MS;
-        if (next.digest !== baseline.digest) {
-          const previousExpiry = new Map(baseline.native.hosts.map(host => [host.record.id, host.expiresAt]));
+        if (!baseline || next.digest !== baseline.digest) {
+          const previousExpiry = new Map(baseline?.native.hosts.map(host => [host.record.id, host.expiresAt]) ?? []);
           const shortened = next.native.hosts.some(host => host.expiresAt < (previousExpiry.get(host.record.id) ?? -Infinity));
-          const kind = next.topology !== baseline.topology || shortened ? "presence" : "lease";
+          const kind = !baseline || next.topology !== baseline.topology || shortened ? "presence" : "lease";
           baseline = next;
           changed(kind);
         }
@@ -1021,7 +1021,15 @@ export class StoreBridgeSide implements BridgeSide {
       burst ??= setImmediate(tick);
     }, failed);
     try { baseline = capture(); }
-    catch (error) { close(); throw error; }
+    catch (error) {
+      if (!isMeshRetryableBusy(error)) { close(); throw error; }
+      // Keep installed watches and let the other side subscribe. A zero-wait SQLite
+      // baseline fence can starve under sustained writes; throwing here blocks every
+      // post-link mirror and even watchdog startup. Retry actual contention as in flush.
+      queued = true;
+      retryTimer = setTimeout(() => { retryTimer = undefined; flush(); }, retryMs);
+      retryMs = Math.min(retryMs * 2, LOCK_RETRY_MAX_MS);
+    }
     return () => {
       active = false;
       if (retryTimer !== undefined) clearTimeout(retryTimer);

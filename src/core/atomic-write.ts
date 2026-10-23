@@ -777,19 +777,31 @@ export class MeshLockTimeoutError extends Error {
  */
 export class MeshLockForeignHolderError extends MeshLockTimeoutError {
   readonly foreignCode: "FABRIC_MESH_LOCK_FOREIGN_HOLDER" | "FABRIC_MESH_LOCK_UNPROVEN_HOLDER";
-  /** The exact operator command that recovers this lock (pi-fabric#923: a stuck mesh lock stalls the fleet). */
+  /** Operator recovery command for valid owner metadata; malformed tokens remain non-operational placeholders. */
   readonly recovery: string;
   /** The same command as an argument vector: the safe form for a program to run. */
   readonly recoveryArgv: string[];
+  readonly holderNamespace: string;
+  readonly holderToken: string;
   constructor(holder: string, attempts: number, maxGapMs: number, readonly verdict: "foreign" | "unproven",
-    readonly holderNamespace: string, readonly lockPath = "", readonly holderToken = "") {
+    holderNamespace: unknown, readonly lockPath = "", holderToken: unknown = "") {
+    // Project disk metadata before retaining it or formatting any diagnostics. Keep this local: the namespace
+    // reader is optional/lazy, and these checks must not alter owner bytes or reclaim decisions.
+    const uuid = "[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}";
+    const token = typeof holderToken === "string" && (holderToken.length === 32 || holderToken.length === 36) &&
+      new RegExp(`^(?:[0-9A-Fa-f]{32}|${uuid})$`).test(holderToken) ? holderToken : "invalid-token";
+    const namespace = holderNamespace === "" ? "" : typeof holderNamespace === "string" && holderNamespace.length <= 128 &&
+      new RegExp(`^(?:linux:(?:[0-9a-f]{32}|-):${uuid}:\\d+|darwin:(?:${uuid}|-):${uuid}:host|win32:${uuid}:\\d+:host)(?![\\s\\S])`).test(holderNamespace)
+        ? holderNamespace : "invalid-namespace";
     super(holder, attempts, maxGapMs);
+    this.holderNamespace = namespace;
+    this.holderToken = token;
     this.foreignCode = verdict === "foreign" ? "FABRIC_MESH_LOCK_FOREIGN_HOLDER" : "FABRIC_MESH_LOCK_UNPROVEN_HOLDER";
     const kind = path.basename(lockPath) === ".lock" ? "mesh" : "custody";
-    this.recoveryArgv = ["fabric-mesh-backend", "lock-recover", "--root", path.dirname(lockPath), "--lock", kind, "--holder", holderToken];
+    this.recoveryArgv = ["fabric-mesh-backend", "lock-recover", "--root", path.dirname(lockPath), "--lock", kind, "--holder", token];
     this.recovery = renderRecoveryCommand(this.recoveryArgv);
-    const where = verdict === "foreign" ? `another PID namespace (${holderNamespace})`
-      : holderNamespace ? `a PID namespace this process cannot prove (${holderNamespace})` : "no recorded PID namespace (a record from before protocol 3)";
+    const where = verdict === "foreign" ? `another PID namespace (${namespace})`
+      : namespace ? `a PID namespace this process cannot prove (${namespace})` : "no recorded PID namespace (a record from before protocol 3)";
     this.message = `${this.foreignCode}: ${this.message}; the holder of ${lockPath} is in ${where}, so it is never reclaimed on pid evidence. ` +
       `Recover it from inside the holder's namespace with: ${this.recovery} ; or, once the holder is STOPPED, add --unsafe-holder-stopped`;
     this.name = "MeshLockForeignHolderError";

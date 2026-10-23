@@ -15,6 +15,7 @@ import { diagnostics } from "./diagnostics.js";
 import { randomUUID } from "node:crypto";
 import childProcess from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
 export interface PhysicalHostIdentity { machineId: string; bootId: string }
@@ -924,9 +925,18 @@ export const emitMeshJournalAlarm = (alarm: Parameters<typeof meshJournalAlarmLi
  * readers' pids and command lines, which can carry secrets: only its sizes and reader count are logged. */
 export const meshDeferredSummary = (error: unknown): string => {
   if (isMeshIncarnationPending(error) || isMeshSnapshotRetriesExhausted(error) || isMeshLockTimeout(error)) return error.message;
-  const capped = error as { walBytes?: unknown; capBytes?: unknown; readerCount?: unknown };
-  return `FABRIC_MESH_STATE_WAL_CAP: the SQLite WAL is ${String(capped.walBytes)} bytes, above the ${String(capped.capBytes)}-byte cap; `
-    + `${typeof capped.readerCount === "number" ? capped.readerCount : "unknown"} WAL reader(s)`;
+  if (!(error instanceof Error)) return "Deferred mesh write";
+  const capped = error as Error & { code?: unknown; walBytes?: unknown; capBytes?: unknown; readerCount?: unknown; peer?: unknown };
+  const remote = capped.code === "FABRIC_REMOTE_MESH_STATE_WAL_CAP";
+  if (!remote && capped.code !== "FABRIC_MESH_STATE_WAL_CAP") return error.message;
+  const count = (value: unknown): number | "unknown" =>
+    typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : "unknown";
+  const peer = typeof capped.peer === "string" && /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$/.test(capped.peer) ? capped.peer : "unknown";
+  const hostname = remote ? "" : os.hostname();
+  const host = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,252}$/.test(hostname) ? hostname : "unknown";
+  return `${remote ? `REMOTE FABRIC_REMOTE_MESH_STATE_WAL_CAP (peer ${peer})` : `LOCAL FABRIC_MESH_STATE_WAL_CAP (host ${host})`}: `
+    + `the SQLite WAL is ${count(capped.walBytes)} bytes, above the ${count(capped.capBytes)}-byte cap; `
+    + `${count(capped.readerCount)} WAL reader(s)`;
 };
 
 type PendingAlarm = { alarm: MeshOutageAlarm; attempts: number; firstAt: number };

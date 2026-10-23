@@ -14,7 +14,7 @@ import { ROOT_ID_PREFIX } from "../topology/root-inbox-shared.js";
 import { participantFilePresent, readParticipantFiles } from "../topology/participant-files.js";
 import { FABRIC_MESH_OUTAGE_ALARM_TOPIC, isMeshAlarmTarget, meshCursorGeneration, type MeshBatchOperation, type MeshBatchView, type MeshEvent, type MeshIdentity, type MeshPublishInput, type MeshStateEntry, type MeshStore } from "./store.js";
 import { CommitOutbox, type CommitOutboxEffect } from "./commit-outbox.js";
-import { assertBridgeStateBackend, isMeshRetryableBusy, isMeshStateWalCap } from "./state-backend.js";
+import { assertBridgeStateBackend, isMeshRetryableBusy, isMeshStateWalCap, MESH_STATE_WAL_CAP_CODE } from "./state-backend.js";
 import { BridgeDeliveryAgeMonitor, type BridgeDeliveryAgeAlarm } from "./bridge-delivery-age.js";
 import { watchBridgeStore, type BridgeChange } from "./change-notifier.js";
 import { BRIDGE_BATCH_MAX_EVENTS } from "./event-log.js";
@@ -109,10 +109,13 @@ const WAL_CAP_RETRY_MAX_MS = 30_000;
 /** The next wait after a WAL-cap refusal: `min` first, then doubling, at most 30 s. */
 export const walCapRetryDelay = (previous: number | undefined, min = WAL_CAP_RETRY_MIN_MS): number =>
   previous === undefined ? min : Math.min(Math.max(previous * 2, min), WAL_CAP_RETRY_MAX_MS);
+const REMOTE_WAL_CAP_CODE = "FABRIC_REMOTE_MESH_STATE_WAL_CAP";
+const isBridgeWalCap = (error: unknown): boolean => isMeshStateWalCap(error) || error instanceof RemoteMeshStateWalCapError;
 const meshBusyLabel = (error: unknown): string =>
   isMeshIncarnationPending(error) ? "mesh incarnation pending"
     : isMeshSnapshotRetriesExhausted(error) ? "mesh snapshot retries exhausted"
-      : isMeshStateWalCap(error) ? "mesh state WAL cap" : "mesh lock timeout";
+      : error instanceof RemoteMeshStateWalCapError ? "remote mesh state WAL cap"
+        : isMeshStateWalCap(error) ? "mesh state WAL cap" : "mesh lock timeout";
 const MAX_RPC_LINE_BYTES = 16 * 1024 * 1024;
 /** A read page's event bytes stay under this, well inside one frame with its JSON envelope. */
 export const BRIDGE_PAGE_BYTES = 8 * 1024 * 1024;
@@ -2066,6 +2069,19 @@ type RpcOp = "hello" | "latestSequence" | "latestCursor" | "tail" | "read" | "pr
 
 interface RpcRequest { id: number; op: RpcOp; args?: unknown }
 
+interface WalCapDiagnostics { walBytes?: number; capBytes?: number; readerCount?: number; readers?: string }
+/** Keep optional legacy metadata bounded; raw reader diagnostics are never part of a log message. */
+const walCapDiagnostics = (value: unknown): WalCapDiagnostics => {
+  const fields = isObject(value) ? value : {};
+  const diagnostics: WalCapDiagnostics = {};
+  for (const key of ["walBytes", "capBytes", "readerCount"] as const) {
+    const count = fields[key];
+    if (typeof count === "number" && Number.isSafeInteger(count) && count >= 0) diagnostics[key] = count;
+  }
+  if (typeof fields.readers === "string") diagnostics.readers = fields.readers.slice(0, 4_096).replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
+  return diagnostics;
+};
+
 /** Diagnostic class only: never used to grant authority or bypass publication fences. */
 const rpcKind = (request: RpcRequest): string => {
   const singleton = request.op === "publish" || request.op === "publishReceipt";
@@ -2185,6 +2201,11 @@ export const serveBridgeAgent = (side: StoreBridgeSide, input: Readable, output:
             if (closed) { finish(); return; }
             reply({ id: request.id, ok: true, result });
           } catch (error) {
+            if (isMeshStateWalCap(error)) {
+              reply({ id: request.id, ok: false, code: MESH_STATE_WAL_CAP_CODE,
+                error: meshDeferredSummary(error), ...walCapDiagnostics(error) });
+              return;
+            }
             if (isIdempotencyKeyReused(error)) {
               // Exact code only; never forward the store's key, causes or payload.
               reply({ id: request.id, ok: false, code: FABRIC_IDEMPOTENCY_KEY_REUSED,
@@ -2314,7 +2335,24 @@ export class BridgeMirrorDeferredError extends Error {
     this.code = timedOut ? "FABRIC_BRIDGE_STALE" : "FABRIC_BRIDGE_MIRROR_PENDING";
   }
 }
-const isBridgeRetryable = (error: unknown): boolean => error instanceof BridgeMirrorDeferredError || isMeshRetryableBusy(error);
+/** Remote origin and peer are hub-owned: never copied from the peer's error fields or message. */
+class RemoteMeshStateWalCapError extends Error {
+  readonly code = REMOTE_WAL_CAP_CODE;
+  readonly origin = "remote";
+  readonly retryable = true;
+  readonly walBytes?: number;
+  readonly capBytes?: number;
+  readonly readerCount?: number;
+  readonly readers?: string;
+  constructor(readonly peer: string | undefined, diagnostics: WalCapDiagnostics) {
+    super("Remote mesh WAL cap refusal");
+    this.name = "RemoteMeshStateWalCapError";
+    Object.assign(this, diagnostics);
+    this.message = meshDeferredSummary(this);
+  }
+}
+const isBridgeRetryable = (error: unknown): boolean =>
+  error instanceof BridgeMirrorDeferredError || isBridgeWalCap(error) || isMeshRetryableBusy(error);
 
 /** The hub's view of the remote side, over the transport's stdio. */
 export class RemoteBridgeSide implements BridgeSide {
@@ -2345,8 +2383,11 @@ export class RemoteBridgeSide implements BridgeSide {
    * Every call has a deadline. A slow mirror degrades this host without closing the transport;
    * exactly one mirror remains in flight until its late answer or close(). Other RPC deadlines
    * remain fatal. stop() still bounds its waits and closes the transport (security review F3).
+   * `peer` is trusted local configuration, never remote hello/presence/error metadata; legacy callers may omit it.
    */
-  constructor(readonly input: Readable, readonly output: Writable, readonly callTimeoutMs = DEFAULT_CALL_TIMEOUT_MS) {
+  constructor(readonly input: Readable, readonly output: Writable, readonly callTimeoutMs = DEFAULT_CALL_TIMEOUT_MS,
+    readonly peer?: string) {
+    if (peer !== undefined && !validBridgeName(peer)) throw new Error("Invalid bridge peer name");
     let onClosed!: (error: Error) => void;
     this.closed = new Promise((resolve) => (onClosed = resolve));
     this.#onClosed = onClosed;
@@ -2354,7 +2395,7 @@ export class RemoteBridgeSide implements BridgeSide {
       input,
       (line) => {
         let response: { id?: unknown; ok?: unknown; result?: unknown; error?: unknown; code?: unknown; notification?: unknown; kind?: unknown;
-          rootId?: unknown; hostId?: unknown };
+          rootId?: unknown; hostId?: unknown; walBytes?: unknown; capBytes?: unknown; readerCount?: unknown; readers?: unknown };
         try {
           response = JSON.parse(line) as typeof response;
         } catch {
@@ -2378,19 +2419,26 @@ export class RemoteBridgeSide implements BridgeSide {
         const staleError = response.code === FABRIC_BRIDGE_STALE_INCARNATION ? new BridgeStaleIncarnationError(
           safeDiagnosticId(response.rootId) && isCanonicalRootId(response.rootId) ? response.rootId : undefined,
           safeDiagnosticId(response.hostId) ? response.hostId : undefined) : undefined;
+        const walCapError = response.code === MESH_STATE_WAL_CAP_CODE || response.code === REMOTE_WAL_CAP_CODE
+          ? new RemoteMeshStateWalCapError(this.peer, walCapDiagnostics(response)) : undefined;
         const mirrorPending = this.#mirrorPending;
         if (mirrorPending && mirrorPending.id === response.id) {
           const late = mirrorPending.error.timedOut;
           this.#mirrorPending = undefined;
-          if (late && response.ok !== true && response.code !== MESH_LOCK_TIMEOUT_CODE &&
+          if (late && response.ok !== true && !walCapError && response.code !== MESH_LOCK_TIMEOUT_CODE &&
             response.code !== MESH_INCARNATION_PENDING_CODE && response.code !== MESH_SNAPSHOT_RETRIES_EXHAUSTED_CODE) {
             this.close(staleError ?? new Error(`Bridge agent: ${String(response.error)}`));
             return;
           }
-          if (late) for (const subscriber of this.#subscribers) subscriber.changed("presence");
+          // A late WAL refusal releases the RPC gate, not the loop's existing backoff.
+          if (late && (response.ok === true || !walCapError)) for (const subscriber of this.#subscribers) subscriber.changed("presence");
         }
         if (response.ok === true) pending.resolve(response.result);
         else {
+          if (walCapError) {
+            pending.reject(walCapError);
+            return;
+          }
           if (response.code === FABRIC_IDEMPOTENCY_KEY_REUSED) {
             pending.reject(new FabricIdempotencyKeyReusedError());
             return;
@@ -3760,7 +3808,7 @@ export class MeshBridge {
         // A late ACK may arrive while the other half of syncPresence is still settling.
         // Its already-latched wake must also bypass the mirror backoff installed here.
         this.#directionBackoff[direction] = !(this.#directionMirrorBackoff[direction] && this.#presenceVersion !== presenceVersion);
-        if (error instanceof BridgeMirrorDeferredError || isMeshStateWalCap(error))
+        if (error instanceof BridgeMirrorDeferredError || isBridgeWalCap(error))
           delay = walCapDelay = walCapRetryDelay(walCapDelay, this.options.walCapRetryMinMs);
         else {
           // Equal jitter over the upper half of a capped exponential delay spreads independent bridges
@@ -3770,7 +3818,7 @@ export class MeshBridge {
         }
         retryMs = Math.min(retryMs * 2, LOCK_RETRY_MAX_MS);
         if (!reported) {
-          this.#log(`${error instanceof BridgeMirrorDeferredError ? "bridge mirror degraded" : meshBusyLabel(error)} (${direction}); retrying in ${delay} ms: ${(error as Error).message}`);
+          this.#log(`${error instanceof BridgeMirrorDeferredError ? "bridge mirror degraded" : meshBusyLabel(error)} (${direction}); retrying in ${delay} ms: ${meshDeferredSummary(error)}`);
           reported = true;
         }
       }
@@ -4426,12 +4474,12 @@ export class MeshBridge {
           backingOff = !(mirrorBackingOff && this.#presenceVersion !== presenceVersion);
           delay = retryMs;
           retryMs = Math.min(retryMs * 2, LOCK_RETRY_MAX_MS);
-          if (error instanceof BridgeMirrorDeferredError || isMeshStateWalCap(error)) {
+          if (error instanceof BridgeMirrorDeferredError || isBridgeWalCap(error)) {
             walCapDelay = walCapRetryDelay(walCapDelay, this.options.walCapRetryMinMs);
             delay = walCapDelay;
             const now = Date.now();
             if (now - walCapLoggedAt >= WAL_CAP_LOG_MS) {
-              this.#log(`${error instanceof BridgeMirrorDeferredError ? "bridge mirror degraded" : "mesh state WAL cap"}; retrying in ${delay} ms: ${meshDeferredSummary(error)}`); // no reader pids
+              this.#log(`${error instanceof BridgeMirrorDeferredError ? "bridge mirror degraded" : meshBusyLabel(error)}; retrying in ${delay} ms: ${meshDeferredSummary(error)}`); // no reader pids
               walCapLoggedAt = now;
             }
           } else if (!reportedTimeout) {

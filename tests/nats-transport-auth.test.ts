@@ -2,7 +2,8 @@ import * as realFs from "node:fs";
 import path from "node:path";
 import { jetstream, jetstreamManager } from "@nats-io/jetstream";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { NatsAuthorizationError, openNatsConnection } from "../src/transport/nats/connection.js";
+import { NatsAuthorizationError, NatsCredentialOverbroadError, openNatsConnection } from "../src/transport/nats/connection.js";
+import { pathBEventGrantAllowlist } from "../src/mesh/nats-auth/permissions.js";
 import { runTransportAdmin } from "../src/transport/nats/admin.js";
 import { openNatsTransport } from "../src/transport/nats/inbox.js";
 import { openNatsKvForMachine } from "../src/transport/nats/kv.js";
@@ -94,7 +95,7 @@ describe.skipIf(!binary)("authenticated Path B transport", () => {
     try {
       const authenticated = await fixture.connect(fixture.users.maintainer);
       await authenticated.close();
-      await expect(openNatsConnection(fixture.operatorOptions())).rejects.toThrow("machine tag mismatch");
+      await expect(openNatsConnection(fixture.operatorOptions())).rejects.toMatchObject({ code: "FABRIC_CREDENTIAL_OVERBROAD" });
     } finally { await fixture.stop(); }
   });
 
@@ -130,7 +131,7 @@ describe.skipIf(!binary)("authenticated Path B transport", () => {
     });
   });
 
-  it("fails closed when expected policy fields are missing, while accepting extra machine grants", async () => {
+  it("fails closed on missing policy fields while accepting a narrower machine inventory", async () => {
     for (const field of ["custodyStream", "livenessStream", "pathBMachines"] as const) {
       const options: Record<string, unknown> = { ...harness.runtimeOptions(harness.users.machineA) };
       delete options[field];
@@ -141,32 +142,110 @@ describe.skipIf(!binary)("authenticated Path B transport", () => {
     await expect(openNatsConnection({ ...harness.runtimeOptions(harness.users.machineA), custodyStream: "OTHER_CUSTODY" })).rejects.toThrow();
   });
 
-  it.each([">", "fabric.>", "fabric.in.*.*.*.*.machine-b", "$JS.API.STREAM.NAMES", "fabric.in.*.*.*.*.machine-a.>"])("accepts a server-expanded extra publish grant: %s", async (grant) => {
-    const fixture = await createPathBHarness({ binary: binary!, tls: {}, additionalAgentPublish: [grant] });
+  it("accepts the exact agent permission set plus one extra publish deny", async () => {
+    const extraDeny = "fabric.in.sandbox1.>";
+    const fixture = await createPathBHarness({ binary: binary!, tls: {}, additionalAgentDeny: [extraDeny] });
     try {
       const connection = await openNatsConnection(fixture.runtimeOptions(fixture.users.machineA));
       try {
         expect(connection.userInfo).toMatchObject({
-          data: { permissions: { publish: { allow: expect.arrayContaining([grant]) } } },
+          data: { permissions: { publish: { deny: expect.arrayContaining([extraDeny]) } } },
         });
       } finally { await connection.close(); }
-    } finally {
-      await fixture.stop();
-    }
+    } finally { await fixture.stop(); }
   });
 
-  it.each([">", "fabric.>", "_INBOX.>"])("accepts an extra subscribe grant: %s", async (grant) => {
-    const fixture = await createPathBHarness({ binary: binary!, tls: {}, additionalAgentSubscribe: [grant] });
+  it("accepts additional Path B event grants for both configured orgs", async () => {
+    const eventOrgs = ["smarty-pants-inc", "versehq"] as const;
+    const fixture = await createPathBHarness({
+      binary: binary!, tls: {}, org: eventOrgs[0], events: true,
+      additionalAgentPublish: pathBEventGrantAllowlist([eventOrgs[1]]),
+    });
     try {
-      const connection = await openNatsConnection(fixture.runtimeOptions(fixture.users.machineA));
+      const connection = await openNatsConnection({
+        ...fixture.runtimeOptions(fixture.users.machineA), events: true, org: eventOrgs[0], eventOrgs,
+      });
       try {
         expect(connection.userInfo).toMatchObject({
-          data: { permissions: { subscribe: { allow: expect.arrayContaining([grant]) } } },
+          data: { permissions: { publish: { allow: expect.arrayContaining(pathBEventGrantAllowlist([eventOrgs[1]])) } } },
         });
       } finally { await connection.close(); }
+    } finally { await fixture.stop(); }
+  });
+
+  it("refuses the second org event scope when only one org is configured", async () => {
+    const fixture = await createPathBHarness({
+      binary: binary!, tls: {}, org: "smarty-pants-inc", events: true,
+      additionalAgentPublish: pathBEventGrantAllowlist(["versehq"]),
+    });
+    try {
+      const error = await openNatsConnection({
+        ...fixture.runtimeOptions(fixture.users.machineA), events: true, org: "smarty-pants-inc", eventOrgs: ["smarty-pants-inc"],
+      }).then(() => undefined, cause => cause);
+      expect(error).toBeInstanceOf(NatsCredentialOverbroadError);
+      expect(error).toMatchObject({ code: "FABRIC_CREDENTIAL_OVERBROAD", subjects: expect.arrayContaining(["fabric.ev.versehq.>"]) });
+      expect((error as Error).message).toContain("fabric.ev.versehq.>");
+      expect((error as Error).message).not.toContain(fixture.users.machineA.credsPath);
+    } finally { await fixture.stop(); }
+  });
+
+  it("keeps the single-org event behavior when eventOrgs is omitted", async () => {
+    const fixture = await createPathBHarness({ binary: binary!, tls: {}, org: "smarty-pants-inc", events: true });
+    try {
+      const connection = await openNatsConnection({
+        ...fixture.runtimeOptions(fixture.users.machineA), events: true, org: "smarty-pants-inc",
+      });
+      expect(connection.userInfo).toBeDefined();
+      await connection.close();
+    } finally { await fixture.stop(); }
+  });
+
+  it("forwards host eventOrgs through NATS transport config into real USER.INFO verification", async () => {
+    const eventOrgs = ["smarty-pants-inc", "versehq"] as const;
+    const fixture = await createPathBHarness({
+      binary: binary!, tls: {}, org: eventOrgs[0], events: true,
+      additionalAgentPublish: pathBEventGrantAllowlist([eventOrgs[1]]),
+    });
+    let bootstrap: Awaited<ReturnType<PathBHarness["connect"]>> | undefined;
+    let runtime: Awaited<ReturnType<typeof openNatsTransport>> | undefined;
+    try {
+      bootstrap = await fixture.connect(fixture.users.bootstrap);
+      const manager = await jetstreamManager(bootstrap);
+      const js = jetstream(bootstrap);
+      const policy = { maxBytes: 1_073_741_824, maxAgeMs: 0, maxMessageBytes: 1_048_576, duplicateWindowMs: 600_000, replicas: 1 as const };
+      await openNatsKvForMachine(js, "leases", MACHINE_A, true);
+      await openNatsKvForMachine(js, "presence", MACHINE_A, true);
+      await ensureTransportStream(manager, { ...policy, name: transportInboxStream(MACHINE_A), subjects: [transportInboxStreamSubject(MACHINE_A)] });
+      const nats = { ...fixture.runtimeOptions(fixture.users.machineA), events: false, org: eventOrgs[0], eventOrgs };
+      runtime = await openNatsTransport({
+        config: { transport: "nats", nats }, hostId: "runtime-config-event-orgs", mesh: {},
+      } as unknown as Parameters<typeof openNatsTransport>[0]);
+      expect(runtime.self).toMatchObject({ machine: MACHINE_A, hostId: "runtime-config-event-orgs" });
     } finally {
-      await fixture.stop();
+      try { await runtime?.close(); }
+      finally { await fixture.stop(); }
     }
+  }, 30_000);
+
+  it.each([">", "fabric.>", "$JS.API.>", "$JS.>", "_INBOX.>", "fabric.ev.foreign-org.>",
+    "$JS.API.STREAM.INFO.GITHUB_FOREIGN_ORG", "$JS.ACK.GITHUB_FOREIGN_ORG.>",
+    "fabric.in.*.*.*.*.machine-b", "$JS.API.STREAM.INFO.FABRIC_IN_machine-b"])("refuses an overbroad extra publish grant and names it: %s", async (grant) => {
+    const fixture = await createPathBHarness({ binary: binary!, tls: {}, additionalAgentPublish: [grant] });
+    try {
+      const error = await openNatsConnection(fixture.runtimeOptions(fixture.users.machineA)).then(() => undefined, cause => cause);
+      expect(error).toBeInstanceOf(NatsCredentialOverbroadError);
+      expect(error).toMatchObject({ code: "FABRIC_CREDENTIAL_OVERBROAD", subjects: expect.arrayContaining([grant]) });
+      expect((error as Error).message).toContain(grant);
+    } finally { await fixture.stop(); }
+  });
+
+  it.each([">", "fabric.>", "_INBOX.>"])("refuses an extra subscribe grant instead of treating it as a publish addition: %s", async (grant) => {
+    const fixture = await createPathBHarness({ binary: binary!, tls: {}, additionalAgentSubscribe: [grant] });
+    try {
+      const error = await openNatsConnection(fixture.runtimeOptions(fixture.users.machineA)).then(() => undefined, cause => cause);
+      expect(error).toBeInstanceOf(NatsCredentialOverbroadError);
+      expect(error).toMatchObject({ code: "FABRIC_CREDENTIAL_OVERBROAD", subjects: expect.arrayContaining([grant]) });
+    } finally { await fixture.stop(); }
   });
 
   it("refuses an agent when an expected publish allow is missing", async () => {

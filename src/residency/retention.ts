@@ -4,7 +4,7 @@ import { writeJsonAtomic } from "../core/atomic-write.js";
 import { ownedStat } from "../storage/scratch.js";
 import { retentionV2Enabled } from "../storage/retention-platform.js";
 import { boundedRunTree } from "../storage/reference-scan.js";
-import { actorRunReferencedNow, canRemoveTerminalRun, removeUnreferencedRun, runTreeExitVeto, compactTerminalRunEvents, retainedActorRunIds, type RegistryReferences, type TerminalRunEventsRetention } from "../storage/retention.js";
+import { actorRunReferencedNow, canRemoveTerminalRun, isTraceArchivePath, removeUnreferencedRun, runTreeExitVeto, compactTerminalRunEvents, retainedActorRunIds, type RegistryReferences, type TerminalRunEventsRetention } from "../storage/retention.js";
 import { hasPreservedResidentResult } from "./preserved-result.js";
 import { verifiedRemove } from "../storage/verified-remove.js";
 import { advanceResidentRequestExpiry, residentRequestGeneration, RESIDENT_REQUEST_RETENTION_MS } from "./request-expiry.js";
@@ -33,7 +33,7 @@ export const sweepResidentRuns = (
     onCompact?: (change: { path: string; beforeBytes: number; afterBytes: number }) => void } = {},
 ): string[] => {
   const removed: string[] = [];
-  if (!ownedStat(runsRoot)?.isDirectory()) return removed;
+  if (isTraceArchivePath(runsRoot, options.meshRoot) || !ownedStat(runsRoot)?.isDirectory()) return removed;
   const started = performance.now();
   const expired = () => performance.now() - started >= budgetMs;
   const actorRoots = options.actorRoots ?? [];
@@ -63,11 +63,13 @@ export const sweepResidentRuns = (
           hasPreservedResidentResult(runsRoot, entry.name) && !expired()) {
         // A referenced candidate is kept as is; compaction would veto it on the same reference.
         const name = entry.name, bytes = options.measure?.(run) ?? 0;
-        if (removeUnreferencedRun(run, stat, () => referencedNow(name), options.dryRun, "sweepResidentRuns", bytes)) { removed.push(run); options.onRemove?.(run, bytes); }
+        if (removeUnreferencedRun(run, stat, () => referencedNow(name), options.dryRun, "sweepResidentRuns", bytes,
+          options.acceptPidReuse === true, options.meshRoot)) { removed.push(run); options.onRemove?.(run, bytes); }
       } else {
         compactTerminalRunEvents(run, {
           ...(options.terminalRunEventsAgeMs !== undefined ? { terminalRunEventsAgeMs: options.terminalRunEventsAgeMs } : {}),
           ...(options.terminalRunEventsMaxBytes !== undefined ? { terminalRunEventsMaxBytes: options.terminalRunEventsMaxBytes } : {}),
+          ...(options.meshRoot ? { meshRoot: options.meshRoot } : {}),
           ...(options.dryRun ? { dryRun: true } : {}), ...(options.onCompact ? { onCompact: options.onCompact } : {}),
           now, expired, isRetained: () => referencedNow(path.basename(run)) });
       }
@@ -75,7 +77,16 @@ export const sweepResidentRuns = (
   } finally { directory.closeSync(); }
   return removed;
 };
-
+const boundedRunTreeAtJudgedPath = (run: string, judged: fs.Stats, expired: () => boolean): boolean => {
+  try {
+    const current = fs.lstatSync(run);
+    const owned = ownedStat(run);
+    return !!owned?.isDirectory() && current.dev === judged.dev && current.ino === judged.ino && boundedRunTree(run, expired);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") return false;
+  }
+  return boundedMovedRunTree(run, judged, expired);
+};
 
 const SAMPLE_INTERVAL_MS = 60_000;
 const directories = ["acknowledgements", "decisions", "responses", "runs"] as const;
@@ -123,6 +134,38 @@ const actorReferenceFingerprint = (roots: readonly string[]): string => {
     }
     return JSON.stringify(identities);
   } catch { return "unsafe"; }
+};
+
+/** The verified remover has renamed `run` before its final callback. Re-find only the same judged
+ * directory inode in its private graveyard; an ambiguous or mismatched entry vetoes removal. */
+const boundedMovedRunTree = (run: string, judged: fs.Stats, expired: () => boolean): boolean => {
+  const graveyard = path.join(path.dirname(run), `.retention-graveyard-${process.pid}`);
+  const before = ownedStat(graveyard);
+  if (!before?.isDirectory() || (before.mode & 0o077) !== 0) return false;
+  let directory: fs.Dir | undefined;
+  let moved: string | undefined;
+  let complete = false;
+  try {
+    directory = fs.opendirSync(graveyard);
+    let count = 0;
+    while (!expired()) {
+      const entry = directory.readSync();
+      if (!entry) { complete = true; break; }
+      if (++count > 64) return false;
+      if (!entry.name.startsWith(`${path.basename(run)}.`)) continue;
+      if (!entry.isDirectory()) return false;
+      const candidate = path.join(graveyard, entry.name);
+      const stat = ownedStat(candidate);
+      if (!stat?.isDirectory() || stat.dev !== judged.dev || stat.ino !== judged.ino || moved) return false;
+      moved = candidate;
+    }
+  } catch { return false; }
+  finally { try { directory?.closeSync(); } catch { /* fail closed below */ } }
+  const after = ownedStat(graveyard);
+  if (!complete || !moved || expired() || !after?.isDirectory() || after.dev !== before.dev || after.ino !== before.ino ||
+      (after.mode & 0o077) !== 0) return false;
+  const stat = ownedStat(moved);
+  return !!stat?.isDirectory() && stat.dev === judged.dev && stat.ino === judged.ino && boundedRunTree(moved, expired);
 };
 
 const validAck = (value: ResidentResponseAcknowledgement | undefined, id: string): value is ResidentResponseAcknowledgement =>
@@ -260,8 +303,10 @@ export class ResidentRequestRetention {
               hasPreservedResidentResult(directory, entry.name) &&
               boundedRunTree(file, unitExpired) && !unitExpired() &&
               actorReferenceFingerprint(this.actorRoots) === fingerprint) {
-            // smarty-dev#7916: only the judged run inode, verified; a failure retries next scan.
-            verifiedRemove(file, stat, { deleter: "residentRunRetention", fallback: () => { fs.rmSync(file, { recursive: true, force: true }); return true; } });
+            // The final archive, tree and registry checks run immediately before the verified removal.
+            removeUnreferencedRun(file, stat,
+              () => actorReferenceFingerprint(this.actorRoots) !== fingerprint || !boundedRunTreeAtJudgedPath(file, stat, unitExpired),
+              false, "residentRunRetention", 0, false, this.retention.meshRoot);
             continue;
           }
           const compacted = compactTerminalRunEvents(file, { ...this.retention, now, expired: unitExpired,
@@ -366,8 +411,9 @@ export class ResidentRequestRetention {
               !runTreeExitVeto(file, 0, undefined, true) && canRemoveTerminalRun(file) &&
               hasPreservedResidentResult(directory, entry.name) &&
               actorReferenceFingerprint(this.actorRoots) === fingerprint) {
-            // Windows main sweep: verifiedRemove runs main's removal unchanged off Linux (smarty-dev#7858).
-            verifiedRemove(file, stat, { deleter: "residentRunRetention", fallback: () => { fs.rmSync(file, { recursive: true, force: true }); return true; } });
+            // Windows main sweep: the archive check precedes main's path removal fallback unchanged.
+            removeUnreferencedRun(file, stat, () => actorReferenceFingerprint(this.actorRoots) !== fingerprint,
+              false, "residentRunRetention", 0, false, this.retention.meshRoot);
             continue;
           }
           compactTerminalRunEvents(file, { ...this.retention, now,

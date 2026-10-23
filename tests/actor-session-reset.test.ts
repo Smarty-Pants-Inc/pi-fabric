@@ -464,7 +464,7 @@ describe("actor session reset (smarty-dev#1439)", () => {
     expect(backups(actor.sessionFile!)).toEqual([]);
   });
 
-  it("keeps only the newest backup", async () => {
+  it("preserves every raw session backup", async () => {
     const { actors } = setup();
     const actor = await actors.create({ name: "churn", instructions: "Churn." });
     const archived: string[] = [];
@@ -476,15 +476,15 @@ describe("actor session reset (smarty-dev#1439)", () => {
       archived.push(path.basename(data.sessionReset.archived));
     }
     expect(new Set(archived).size).toBe(4);
-    expect(backups(actor.sessionFile!)).toEqual(archived.slice(-1).sort());
+    expect(backups(actor.sessionFile!)).toEqual(archived.sort());
     // A reset without a session file archives nothing, but creates its header atomically.
     fs.rmSync(actor.sessionFile!);
     await actors.resetSession(actor.id);
     expect(resets(actors, actor.id).at(-1)!.data).toMatchObject({ sessionReset: { archived: null, bytes: 0 } });
-    expect(backups(actor.sessionFile!)).toEqual(archived.slice(-1).sort());
+    expect(backups(actor.sessionFile!)).toEqual(archived.sort());
   });
 
-  it("orders same-millisecond backups by their suffix when it prunes", async () => {
+  it("preserves all same-millisecond backup suffixes", async () => {
     const { actors } = setup();
     const actor = await actors.create({ name: "fast", instructions: "Churn." });
     const dir = path.dirname(actor.sessionFile!);
@@ -502,9 +502,7 @@ describe("actor session reset (smarty-dev#1439)", () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(new Date("2026-09-27T15:00:00.000Z"));
     try { await actors.resetSession(actor.id); } finally { vi.useRealTimers(); }
-    expect(backups(actor.sessionFile!)).toEqual([`session.jsonl.${stamp}-2.bak`]);
-    expect(backups(actor.sessionFile!)).not.toContain(`session.jsonl.${stamp}-1.bak`);
-    expect(backups(actor.sessionFile!)).not.toContain(`session.jsonl.${stamp}.bak`);
+    expect(backups(actor.sessionFile!)).toEqual([`session.jsonl.${stamp}.bak`, `session.jsonl.${stamp}-1.bak`, `session.jsonl.${stamp}-2.bak`].sort());
   });
 
   it("preserves a native session tail published after terminal status before reset", async () => {
@@ -518,8 +516,8 @@ describe("actor session reset (smarty-dev#1439)", () => {
     expect(archived).toContain("fake actor advice");
   });
 
-  // review/astra F1 on #101: a pruned name was reused, sorted oldest and deleted at once.
-  it("keeps the newest backup when every reset lands in the same millisecond", async () => {
+  // Each rotation is a raw session transcript; pruning must not discard the earlier copies.
+  it("preserves every backup when resets land in the same millisecond", async () => {
     const { actors } = setup();
     const actor = await actors.create({ name: "frozen", instructions: "Churn." });
     const archived: string[] = [];
@@ -539,13 +537,11 @@ describe("actor session reset (smarty-dev#1439)", () => {
     }
     expect(new Set(archived).size).toBe(4);
     const kept = backups(actor.sessionFile!);
-    expect(kept).toHaveLength(1);
-    expect(kept.sort()).toEqual(archived.slice(-1).sort());
+    expect(kept).toHaveLength(4);
+    expect(kept.sort()).toEqual(archived.sort());
     const dir = path.dirname(actor.sessionFile!);
     const contents = kept.map((name) => fs.readFileSync(path.join(dir, name), "utf8")).join("\n");
-    expect(contents).not.toContain("charlie");
-    expect(contents).toContain("delta");
-    expect(contents).not.toContain("bravo");
+    for (const word of ["alpha", "bravo", "charlie", "delta"]) expect(contents).toContain(word);
   });
 
   it("rejects a reset of an actor another host owns", async () => {

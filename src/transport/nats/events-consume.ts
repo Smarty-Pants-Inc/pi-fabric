@@ -1,4 +1,5 @@
 import { Buffer } from "node:buffer";
+import { headers } from "@nats-io/nats-core";
 import {
   AckPolicy,
   DeliverPolicy,
@@ -15,12 +16,15 @@ import type { NatsConnectionHandle } from "./connection.js";
 import { ensureFabricEventsStream, natsEventsStreamName, natsGithubStreamName } from "./provision.js";
 import { hashToken } from "./subjects.js";
 import { TransportUnavailableError } from "../types.js";
+import { diagnostics } from "../../core/diagnostics.js";
 
 const CONSUMER_NOT_FOUND = 10014;
 const ACK_WAIT_NS = 60_000 * 1_000_000;
 const MAX_RETRY_DELAY_MS = 30_000;
 export const NATS_EVENT_RETRY_DELAY_SCHEDULE_MS = [1_000, 5_000, 15_000, MAX_RETRY_DELAY_MS] as const;
 const MAX_ACK_PENDING = 128;
+const DEFAULT_MAX_DELIVERIES = 100;
+const DEAD_LETTER_TOPIC = "fabric.deadletter";
 type StreamKind = "ev" | "gh";
 
 /* FLAGGED integration resolution for review-fleet-lead: keep main-11's explicit
@@ -41,6 +45,11 @@ const transientNakDelay = (deliveryCount: number, schedule: readonly number[]): 
   const count = Number.isSafeInteger(deliveryCount) && deliveryCount > 0 ? deliveryCount : 1;
   return schedule[Math.min(count - 1, schedule.length - 1)]!;
 };
+const normalizeMaxDeliveries = (value?: number): number => {
+  if (value === undefined) return DEFAULT_MAX_DELIVERIES;
+  if (!Number.isSafeInteger(value) || value <= 0) throw new Error("NATS event maxDeliveries must be a positive integer");
+  return value;
+};
 const nakTransiently = (message: JsMsg, schedule: readonly number[]): void => {
   // Consumer backoff paces AckWait expiry, not NAK; schedule transient retries explicitly.
   message.nak(transientNakDelay(message.info.deliveryCount, schedule));
@@ -57,6 +66,8 @@ export interface NatsActorEventsConsumerOptions {
   readonly provision?: boolean;
   /** Transient NAK delays in milliseconds; defaults to 1s, 5s, 15s, then 30s (capped and repeated). */
   readonly retryDelayScheduleMs?: readonly number[];
+  /** Client-side cap for consecutive unaccepted deliveries before dead-lettering; default 100. */
+  readonly maxDeliveries?: number;
   /** Persist the actor queue and message-ID receipt before ACK; non-accepted outcomes are retried. */
   readonly onMessage: (event: MeshEvent, messageId: string, ack: () => Promise<void>) => Promise<NatsActorEventDisposition>;
 }
@@ -182,6 +193,51 @@ const decodeEvent = (message: JsMsg, org: string): { event: MeshEvent; messageId
 };
 
 interface DeliveryRun { messages: ConsumerMessages; done: Promise<void>; stopping: boolean }
+interface NatsEventDeadLetterRecord {
+  readonly id: string;
+  readonly subject: string;
+  readonly streamSequence: number;
+  readonly deliveries: number;
+  /** Fixed, bounded summaries only: never serialize handler-provided exception text or cause. */
+  readonly lastError: "handler threw; details redacted" | "handler returned retry";
+  readonly consumer: string;
+}
+const warnDeadLetter = (outcome: "published" | "loop_guard_terminated", record: Omit<NatsEventDeadLetterRecord, "lastError">): void => {
+  try {
+    diagnostics.warn("src/transport/nats/events-consume.ts", `[pi-fabric] fabric.alarm ${JSON.stringify({
+      outcome: outcome === "published" ? "dead_letter_published" : "dead_letter_loop_guard_terminated",
+      eventId: record.id,
+      subject: record.subject,
+      streamSequence: record.streamSequence,
+      deliveries: record.deliveries,
+      consumer: record.consumer,
+    })}`);
+  } catch { /* an alarm line never masks message custody */ }
+};
+const publishDeadLetter = async (
+  connection: NatsConnectionHandle,
+  org: string,
+  actorId: string,
+  record: NatsEventDeadLetterRecord,
+): Promise<void> => {
+  const subject = subjectForEventTopic(org, DEAD_LETTER_TOPIC);
+  const id = `fabric-dlq-${record.consumer}-${record.streamSequence}`;
+  const event: MeshEvent = {
+    id,
+    sequence: 0, // JetStream assigns the stream sequence; decodeEvent stamps it when the durable reads the record.
+    topic: DEAD_LETTER_TOPIC,
+    kind: DEAD_LETTER_TOPIC,
+    from: { id: actorId, name: record.consumer, kind: "actor" },
+    data: record,
+    createdAt: Date.now(),
+  };
+  const messageHeaders = headers();
+  messageHeaders.set("Nats-Msg-Id", id);
+  connection.nc.publish(subject, Buffer.from(JSON.stringify(event), "utf8"), { headers: messageHeaders });
+  // Core publish has no PubAck; flush proves the broker processed the publication. The stable message ID
+  // lets the stream's duplicate window suppress a retry after an ambiguous flush result.
+  await connection.nc.flush();
+};
 interface ManagedGroup {
   update(subjects: string[]): Promise<void>;
   close(remove: boolean): Promise<void>;
@@ -193,6 +249,7 @@ const startGroup = async (
   kind: StreamKind,
   subjects: string[],
   retryDelayScheduleMs: readonly number[],
+  maxDeliveries: number,
 ): Promise<ManagedGroup | undefined> => {
   const stream = kind === "ev" ? natsEventsStreamName(options.org) : natsGithubStreamName(options.org);
   const durable = `${kind}_${hashToken(options.actorId)}`;
@@ -296,13 +353,54 @@ const startGroup = async (
             message.term("invalid NATS MeshEvent envelope");
             continue;
           }
+          const retryOrDeadLetter = async (lastError: NatsEventDeadLetterRecord["lastError"]): Promise<void> => {
+            if (acknowledged || !connection.isVerified()) return;
+            const deliveries = message.info.deliveryCount;
+            if (!Number.isSafeInteger(deliveries) || deliveries < maxDeliveries) {
+              nakTransiently(message, retryDelayScheduleMs);
+              return;
+            }
+            const deadLetterSubject = subjectForEventTopic(options.org, DEAD_LETTER_TOPIC);
+            if (message.subject === deadLetterSubject || decoded.event.topic === DEAD_LETTER_TOPIC || decoded.event.kind === DEAD_LETTER_TOPIC) {
+              message.term("NATS Fabric dead-letter loop guard");
+              warnDeadLetter("loop_guard_terminated", {
+                id: decoded.event.id, subject: message.subject, streamSequence: message.info.streamSequence,
+                deliveries, consumer: durable,
+              });
+              return;
+            }
+            const record = {
+              id: decoded.event.id,
+              subject: message.subject,
+              streamSequence: message.info.streamSequence,
+              deliveries,
+              lastError,
+              consumer: durable,
+            };
+            try {
+              await publishDeadLetter(connection, options.org, options.actorId, record);
+            } catch {
+              // A failed or uncertain core publish keeps ownership of the original event: retry with the
+              // same deterministic Nats-Msg-Id so JetStream dedupes an accepted-but-unconfirmed attempt.
+              if (connection.isVerified()) nakTransiently(message, retryDelayScheduleMs);
+              return;
+            }
+            if (!connection.isVerified()) return; // Preserve the source until this identity is re-verified.
+            message.term("NATS actor event delivery cap reached");
+            warnDeadLetter("published", record);
+          };
+          let disposition: NatsActorEventDisposition;
           try {
-            const disposition = await options.onMessage(decoded.event, decoded.messageId, ack);
-            if (disposition === "accepted") await ack();
-            else if (!acknowledged && connection.isVerified()) nakTransiently(message, retryDelayScheduleMs);
+            disposition = await options.onMessage(decoded.event, decoded.messageId, ack);
           } catch {
-            if (!acknowledged && connection.isVerified()) nakTransiently(message, retryDelayScheduleMs);
+            await retryOrDeadLetter("handler threw; details redacted");
             continue;
+          }
+          if (disposition === "accepted") {
+            try { await ack(); }
+            catch { if (!acknowledged && connection.isVerified()) nakTransiently(message, retryDelayScheduleMs); }
+          } else {
+            await retryOrDeadLetter("handler returned retry");
           }
         }
         const error = await messages.closed();
@@ -368,14 +466,15 @@ export const startNatsActorEventsConsumer = async (
   if (typeof options.actorId !== "string" || options.actorId.length === 0) throw new Error("NATS event actorId is required");
   if (typeof options.onMessage !== "function") throw new Error("NATS event onMessage callback is required");
   const retryDelayScheduleMs = normalizeRetryDelaySchedule(options.retryDelayScheduleMs);
+  const maxDeliveries = normalizeMaxDeliveries(options.maxDeliveries);
   if (options.provision === true) await ensureFabricEventsStream(connection.manager, options.org, true);
   const planned = topicPlans(options.org, options.actorId, options.topics);
   const groups = new Map<StreamKind, ManagedGroup>();
   try {
-    const eventGroup = await startGroup(connection, options, "ev", planned.ev, retryDelayScheduleMs);
+    const eventGroup = await startGroup(connection, options, "ev", planned.ev, retryDelayScheduleMs, maxDeliveries);
     if (!eventGroup) throw new Error("NATS Fabric events durable could not be opened");
     groups.set("ev", eventGroup);
-    const githubGroup = await startGroup(connection, options, "gh", planned.gh, retryDelayScheduleMs);
+    const githubGroup = await startGroup(connection, options, "gh", planned.gh, retryDelayScheduleMs, maxDeliveries);
     if (githubGroup) groups.set("gh", githubGroup);
   } catch (error) {
     await Promise.all([...groups.values()].map(group => group.close(false).catch(() => undefined)));
@@ -401,7 +500,7 @@ export const startNatsActorEventsConsumer = async (
         await groups.get("ev")!.update(next.ev);
         let github = groups.get("gh");
         if (next.gh.length > 0 && !github) {
-          github = await startGroup(connection, options, "gh", next.gh, retryDelayScheduleMs);
+          github = await startGroup(connection, options, "gh", next.gh, retryDelayScheduleMs, maxDeliveries);
           if (github) groups.set("gh", github);
         } else if (github) {
           await github.update(next.gh);

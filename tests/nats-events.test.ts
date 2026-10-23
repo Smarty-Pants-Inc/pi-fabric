@@ -1,9 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { Buffer } from "node:buffer";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { openBootstrapNatsConnection, openNatsConnection } from "../src/transport/nats/connection.js";
 import { NatsEventsIdConflictError, openNatsEventsPublisher } from "../src/transport/nats/events-publish.js";
 import { NATS_EVENT_RETRY_DELAY_SCHEDULE_MS, startNatsActorEventsConsumer, type NatsActorEventsSetupFailure } from "../src/transport/nats/events-consume.js";
+import { diagnostics } from "../src/core/diagnostics.js";
 import type { MeshEvent } from "../src/mesh/event-log.js";
 import { ensureNatsEventsStream, ensureTransportStream, natsEventsStreamName, natsGithubStreamName, transportStreamConfig } from "../src/transport/nats/provision.js";
 import { hashToken } from "../src/transport/nats/subjects.js";
@@ -27,6 +28,10 @@ const fixture = async (): Promise<PathBHarness> => {
   fixtures.push(value);
   return value;
 };
+const openProductionRuntime = (server: PathBHarness, org: string) => openNatsConnection({
+  ...server.runtimeOptions(server.users.machineA), events: true, org,
+  name: `nats-events-runtime-${org}`,
+});
 const open = async (server: PathBHarness, org: string) => {
   const connection = await openBootstrapNatsConnection({
     servers: `tls://localhost:${new URL(server.serverUrl).port}`,
@@ -46,6 +51,13 @@ const event = (id: string, topic: string, createdAt = Date.now()): Omit<MeshEven
 describe("NATS event stream names", () => {
   it("uses a bounded default transient retry schedule", () => {
     expect(NATS_EVENT_RETRY_DELAY_SCHEDULE_MS).toEqual([1_000, 5_000, 15_000, 30_000]);
+  });
+
+  it.each([0, -1, 1.5, Number.NaN])("rejects a non-positive-integer delivery cap (%s)", async maxDeliveries => {
+    await expect(startNatsActorEventsConsumer({} as never, {
+      org: "example", actorId: "actor", topics: [], maxDeliveries,
+      onMessage: async () => "accepted" as const,
+    })).rejects.toThrow("NATS event maxDeliveries must be a positive integer");
   });
 
   it("normalizes GitHub login slugs with uppercase and underscores", () => {
@@ -495,6 +507,227 @@ describe.skipIf(!binary)("NATS Mesh events on a real JetStream server", () => {
       await connection.close();
     }
   }, 15_000);
+
+  it("dead-letters a permanently failing valid event once at the cap and leaves recoverable work alone", async () => {
+    const org = `events-${randomUUID().slice(0, 8)}`;
+    const server = await createPathBHarness({ binary, tls: {}, org, events: true });
+    fixtures.push(server);
+    const bootstrap = await openBootstrapNatsConnection({
+      servers: `tls://localhost:${new URL(server.serverUrl).port}`,
+      credentials: server.users.bootstrap.credsPath,
+      tls: { caFile: server.tls!.caFile },
+      name: `nats-events-dead-letter-bootstrap-${org}`,
+    });
+    let runtime: Awaited<ReturnType<typeof openNatsConnection>> | undefined;
+    let failedConsumer: Awaited<ReturnType<typeof startNatsActorEventsConsumer>> | undefined;
+    let recoveringConsumer: Awaited<ReturnType<typeof startNatsActorEventsConsumer>> | undefined;
+    const warningLines: string[] = [];
+    const warning = vi.spyOn(diagnostics, "warn").mockImplementation((_source, ...args) => {
+      warningLines.push(args.map(String).join(" "));
+    });
+    try {
+      await ensureNatsEventsStream(bootstrap.manager, { org, provision: true });
+      const runtimeConnection = await openProductionRuntime(server, org);
+      runtime = runtimeConnection;
+      const publisher = await openNatsEventsPublisher(runtimeConnection, { org, provision: false });
+      const stream = natsEventsStreamName(org);
+      const failingActor = `${org}:always-fails`;
+      const recoveringActor = `${org}:recovers`;
+      const failingDurable = `ev_${hashToken(failingActor)}`;
+      const recoveringDurable = `ev_${hashToken(recoveringActor)}`;
+      const failedAttempts: string[] = [];
+      const recoveringAttempts: string[] = [];
+
+      failedConsumer = await startNatsActorEventsConsumer(runtimeConnection, {
+        org, actorId: failingActor, topics: ["mail.poison"], retryDelayScheduleMs: [40], maxDeliveries: 3,
+        onMessage: async received => { failedAttempts.push(received.id); throw new Error("private handler details must not be copied"); },
+      });
+      recoveringConsumer = await startNatsActorEventsConsumer(runtimeConnection, {
+        org, actorId: recoveringActor, topics: ["mail.recover"], retryDelayScheduleMs: [40], maxDeliveries: 3,
+        onMessage: async (received, _messageId, ack) => {
+          recoveringAttempts.push(received.id);
+          if (recoveringAttempts.length < 3) throw new Error("temporary failure");
+          await ack();
+          return "accepted";
+        },
+      });
+      expect((await bootstrap.manager.consumers.info(stream, failingDurable)).config.max_deliver).toBe(-1);
+      await publisher.publish(event("always-fails", "mail.poison"));
+      await publisher.publish(event("recovers-on-third", "mail.recover"));
+      await waitFor(() => failedAttempts.length === 3 && recoveringAttempts.length === 3);
+      await new Promise(resolve => setTimeout(resolve, 150));
+
+      expect(failedAttempts).toEqual(["always-fails", "always-fails", "always-fails"]);
+      expect(recoveringAttempts).toEqual(["recovers-on-third", "recovers-on-third", "recovers-on-third"]);
+      const failingInfo = await bootstrap.manager.consumers.info(stream, failingDurable);
+      const recoveringInfo = await bootstrap.manager.consumers.info(stream, recoveringDurable);
+      expect(failingInfo.delivered?.consumer_seq).toBe(3);
+      expect(failingInfo.ack_floor?.consumer_seq).toBe(3);
+      expect([failingInfo.num_ack_pending, failingInfo.num_pending]).toEqual([0, 0]);
+      expect(recoveringInfo.delivered?.consumer_seq).toBe(3);
+      expect(recoveringInfo.ack_floor?.consumer_seq).toBe(3);
+      expect([recoveringInfo.num_ack_pending, recoveringInfo.num_pending]).toEqual([0, 0]);
+
+      const stored = await bootstrap.manager.streams.info(stream);
+      expect(stored.state.last_seq).toBe(3); // two inputs plus exactly one durable dead-letter record
+      const rawLetter = await bootstrap.manager.streams.getMessage(stream, { seq: 3 });
+      if (!rawLetter) throw new Error("dead-letter record was not stored in the event stream");
+      const letter = JSON.parse(Buffer.from(rawLetter.data).toString("utf8")) as MeshEvent;
+      expect(letter).toMatchObject({ topic: "fabric.deadletter", kind: "fabric.deadletter" });
+      expect(letter.data).toEqual({
+        id: "always-fails",
+        subject: `fabric.ev.${org}.mail.poison`,
+        streamSequence: 1,
+        deliveries: 3,
+        lastError: "handler threw; details redacted",
+        consumer: failingDurable,
+      });
+      expect(JSON.stringify(letter)).not.toContain("private handler details");
+      expect(rawLetter.header.get("Nats-Msg-Id")).toBe(letter.id);
+      expect(warningLines).toHaveLength(1);
+      expect(warningLines[0]).toContain("[pi-fabric] fabric.alarm");
+      expect(warningLines[0]).toContain('"outcome":"dead_letter_published"');
+      expect(warningLines[0]).toContain('"eventId":"always-fails"');
+    } finally {
+      warning.mockRestore();
+      await Promise.all([failedConsumer?.close(false), recoveringConsumer?.close(false)]);
+      await runtime?.close();
+      await bootstrap.close();
+    }
+  }, 30_000);
+
+  it("TERMs dead-letter subject/type events at the cap without creating recursive letters", async () => {
+    const org = `events-${randomUUID().slice(0, 8)}`;
+    const server = await createPathBHarness({ binary, tls: {}, org, events: true });
+    fixtures.push(server);
+    const bootstrap = await openBootstrapNatsConnection({
+      servers: `tls://localhost:${new URL(server.serverUrl).port}`,
+      credentials: server.users.bootstrap.credsPath,
+      tls: { caFile: server.tls!.caFile },
+      name: `nats-events-loop-guard-bootstrap-${org}`,
+    });
+    let runtime: Awaited<ReturnType<typeof openNatsConnection>> | undefined;
+    let consumer: Awaited<ReturnType<typeof startNatsActorEventsConsumer>> | undefined;
+    const warningLines: string[] = [];
+    const warning = vi.spyOn(diagnostics, "warn").mockImplementation((_source, ...args) => {
+      warningLines.push(args.map(String).join(" "));
+    });
+    try {
+      await ensureNatsEventsStream(bootstrap.manager, { org, provision: true });
+      const runtimeConnection = await openProductionRuntime(server, org);
+      runtime = runtimeConnection;
+      const publisher = await openNatsEventsPublisher(runtimeConnection, { org, provision: false });
+      const stream = natsEventsStreamName(org);
+      const actorId = `${org}:dead-letter-loop-guard`;
+      const durable = `ev_${hashToken(actorId)}`;
+      const attempts: string[] = [];
+      consumer = await startNatsActorEventsConsumer(runtimeConnection, {
+        org, actorId, topics: ["fabric.deadletter", "mail.kind-loop"], retryDelayScheduleMs: [40], maxDeliveries: 1,
+        onMessage: async received => { attempts.push(received.id); throw new Error("loop-guard test failure"); },
+      });
+      expect((await bootstrap.manager.consumers.info(stream, durable)).config.max_deliver).toBe(-1);
+      await publisher.publish(event("loop-by-subject", "fabric.deadletter"));
+      await publisher.publish({ ...event("loop-by-type", "mail.kind-loop"), kind: "fabric.deadletter" });
+      await waitFor(() => attempts.length === 2);
+      await new Promise(resolve => setTimeout(resolve, 150));
+
+      expect(attempts).toEqual(["loop-by-subject", "loop-by-type"]);
+      const info = await bootstrap.manager.consumers.info(stream, durable);
+      expect(info.delivered?.consumer_seq).toBe(2);
+      expect(info.ack_floor?.consumer_seq).toBe(2);
+      expect([info.num_ack_pending, info.num_pending]).toEqual([0, 0]);
+      expect((await bootstrap.manager.streams.info(stream)).state.last_seq).toBe(2);
+      expect(warningLines).toHaveLength(2);
+      expect(warningLines.every(line => line.includes("[pi-fabric] fabric.alarm"))).toBe(true);
+      expect(warningLines.every(line => line.includes('"outcome":"dead_letter_loop_guard_terminated"'))).toBe(true);
+      expect(warningLines[0]).toContain('"eventId":"loop-by-subject"');
+      expect(warningLines[1]).toContain('"eventId":"loop-by-type"');
+    } finally {
+      warning.mockRestore();
+      await consumer?.close(false);
+      await runtime?.close();
+      await bootstrap.close();
+    }
+  }, 30_000);
+
+  it("NAKs when the core dead-letter publish fails and retries the same record", async () => {
+    const org = `events-${randomUUID().slice(0, 8)}`;
+    const server = await createPathBHarness({ binary, tls: {}, org, events: true });
+    fixtures.push(server);
+    const bootstrap = await openBootstrapNatsConnection({
+      servers: `tls://localhost:${new URL(server.serverUrl).port}`,
+      credentials: server.users.bootstrap.credsPath,
+      tls: { caFile: server.tls!.caFile },
+      name: `nats-events-publish-failure-bootstrap-${org}`,
+    });
+    let runtime: Awaited<ReturnType<typeof openNatsConnection>> | undefined;
+    let consumer: Awaited<ReturnType<typeof startNatsActorEventsConsumer>> | undefined;
+    const warningLines: string[] = [];
+    const warning = vi.spyOn(diagnostics, "warn").mockImplementation((_source, ...args) => {
+      warningLines.push(args.map(String).join(" "));
+    });
+    try {
+      await ensureNatsEventsStream(bootstrap.manager, { org, provision: true });
+      const runtimeConnection = await openProductionRuntime(server, org);
+      runtime = runtimeConnection;
+      const publisher = await openNatsEventsPublisher(runtimeConnection, { org, provision: false });
+      const stream = natsEventsStreamName(org);
+      const actorId = `${org}:dlq-publish-failure`;
+      const durable = `ev_${hashToken(actorId)}`;
+      const deadLetterSubject = `fabric.ev.${org}.fabric.deadletter`;
+      const originalPublish = runtimeConnection.nc.publish.bind(runtimeConnection.nc);
+      let failedOnce = false;
+      const interceptedNc = new Proxy(runtimeConnection.nc, {
+        get(target, property) {
+          if (property === "publish") return (subject: string, ...args: unknown[]) => {
+            if (subject === deadLetterSubject && !failedOnce) {
+              failedOnce = true;
+              throw new Error("simulated core publish failure");
+            }
+            return originalPublish(subject, ...(args as Parameters<typeof runtimeConnection.nc.publish> extends [string, ...infer R] ? R : never));
+          };
+          const value = Reflect.get(target, property, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+      const interceptedConnection = new Proxy(runtimeConnection, {
+        get(target, property) {
+          if (property === "nc") return interceptedNc;
+          const value = Reflect.get(target, property, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+      const attempts: string[] = [];
+      consumer = await startNatsActorEventsConsumer(interceptedConnection, {
+        org, actorId, topics: ["mail.retry-dlq"], retryDelayScheduleMs: [40], maxDeliveries: 2,
+        onMessage: async received => { attempts.push(received.id); throw new Error("handler failure"); },
+      });
+      expect((await bootstrap.manager.consumers.info(stream, durable)).config.max_deliver).toBe(-1);
+      await publisher.publish(event("retry-dlq-after-publish-error", "mail.retry-dlq"));
+      await waitFor(() => attempts.length === 3);
+      await new Promise(resolve => setTimeout(resolve, 150));
+
+      expect(failedOnce).toBe(true);
+      expect(attempts).toEqual(Array(3).fill("retry-dlq-after-publish-error"));
+      const info = await bootstrap.manager.consumers.info(stream, durable);
+      expect(info.delivered?.consumer_seq).toBe(3); // third delivery proves the failed cap-attempt was NAKed
+      expect(info.ack_floor?.consumer_seq).toBe(3);
+      expect([info.num_ack_pending, info.num_pending]).toEqual([0, 0]);
+      expect((await bootstrap.manager.streams.info(stream)).state.last_seq).toBe(2);
+      expect(warningLines).toHaveLength(1);
+      expect(warningLines[0]).toContain('"outcome":"dead_letter_published"');
+      const rawLetter = await bootstrap.manager.streams.getMessage(stream, { seq: 2 });
+      if (!rawLetter) throw new Error("retry dead-letter record was not stored in the event stream");
+      const letter = JSON.parse(Buffer.from(rawLetter.data).toString("utf8")) as MeshEvent;
+      expect(letter.data).toMatchObject({ id: "retry-dlq-after-publish-error", deliveries: 3, consumer: durable });
+      expect(rawLetter.header.get("Nats-Msg-Id")).toBe(letter.id);
+    } finally {
+      warning.mockRestore();
+      await consumer?.close(false);
+      await runtime?.close();
+      await bootstrap.close();
+    }
+  }, 30_000);
 
   it("terminates malformed poison envelopes without invoking the handler", async () => {
     const server = await fixture();

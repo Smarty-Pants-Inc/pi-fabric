@@ -31,13 +31,14 @@ import type { FabricMainAgentTarget } from "../src/main-agent.js";
 import { RESIDENT_HOST_FORMAT, residentResultPath, type ResidentHostConfig } from "../src/residency/protocol.js";
 import { processStartTime, residentProcessAlive } from "../src/residency/process-identity.js";
 import { launchLog, same } from "./helpers/owned-processes.js";
+import { testTempRoot } from "./helpers/test-temp-root.js";
 
 beforeEach(() => installInProcessResidentFence());
 
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const fixture = (retention: Partial<ResidentHostConfig["retention"]> = {}, canonicalRoot = false) => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-host-review-"));
+  const root = testTempRoot("fabric-host-review-");
   const config: ResidentHostConfig = {
     format: RESIDENT_HOST_FORMAT, rootId: "session:review", sessionId: "review",
     cwd: process.cwd(), projectRoot: process.cwd(), meshRoot: path.join(root, "mesh"),
@@ -1107,7 +1108,7 @@ describe("resident retention config reload", () => {
       while (fs.statSync(path.join(run, "events.jsonl")).size > 128 * 1024 && Date.now() < deadline) await delay(10);
       expect(sweep).toHaveBeenCalled();
       expect(sweep.mock.calls.every(call => call[2] === 5)).toBe(true);
-      expect(policies).toContainEqual({ ...next.retention, retainRuns: config.agents.retainRuns });
+      expect(policies).toContainEqual({ ...next.retention, meshRoot: config.meshRoot, retainRuns: config.agents.retainRuns });
       due.mockRestore(); sweep.mockRestore();
       expect(fs.statSync(path.join(run, "events.jsonl")).size).toBeLessThanOrEqual(128 * 1024);
       expect(config.retention).toEqual(initialRetention);

@@ -31,6 +31,11 @@ describe("Placement API configuration URL policy", () => {
     expect(normalizePlacementApiConfig(validConfig({ url }))?.url).toBe(url);
   });
 
+  it("rejects a leading-zero loopback port through Fabric configuration normalization", () => {
+    expect(() => normalizeFabricConfig({ agents: { placementApi: validConfig({ url: "http://127.0.0.1:018080" }) } }))
+      .toThrow("Invalid agents.placementApi configuration");
+  });
+
   it("sends a configured loopback URL through the real PlacementClient", async () => {
     let receivedPath: string | undefined;
     let receivedIntent: PlacementIntent | undefined;
@@ -98,6 +103,7 @@ describe("Placement API configuration URL policy", () => {
     "http://127.0.0.1",
     "http://127.0.0.1:80",
     "http://127.0.0.1:1023",
+    "http://127.0.0.1:018080",
     "http://127.0.0.1:65536",
     "https://127.0.0.1:18080",
     "http://u:p@127.0.0.1:18080",

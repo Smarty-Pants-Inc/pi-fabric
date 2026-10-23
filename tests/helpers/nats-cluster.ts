@@ -73,6 +73,8 @@ export interface PathBHarnessOptions {
   readonly identityFactory?: (root: string) => PathBIdentity | Promise<PathBIdentity>;
   /** Additional publish allows for agent superset-verification tests. */
   readonly additionalAgentPublish?: readonly string[];
+  /** Additional publish denies for agent least-authority verification tests. */
+  readonly additionalAgentDeny?: readonly string[];
   /** Remove expected publish allows for fail-closed identity-check tests. */
   readonly removeAgentPublish?: readonly string[];
   /** Additional signed mesh bindings for multi-tag template expansion tests. */
@@ -131,7 +133,7 @@ function faultedAgentTemplate(options: PathBHarnessOptions): RoleTemplate {
   return {
     pub: {
       allow: [...base.pub.allow.filter((subject) => !removedPublish.has(subject)), ...(options.additionalAgentPublish ?? [])],
-      deny: base.pub.deny.filter((subject) => !removedDeny.has(subject)),
+      deny: [...base.pub.deny.filter((subject) => !removedDeny.has(subject)), ...(options.additionalAgentDeny ?? [])],
     },
     sub: { allow: [...base.sub.allow, ...(options.additionalAgentSubscribe ?? [])] },
     ...(base.allow_responses ? { allow_responses: base.allow_responses } : {}),
@@ -294,6 +296,7 @@ export class PathBHarness {
   readonly configText: string;
   readonly binary: string;
   readonly tls: PathBTlsFiles | undefined;
+  readonly org: string | undefined;
   serverVersion = "";
   private child: ChildProcess | undefined;
   get processId(): number | undefined { return this.child?.pid; }
@@ -306,8 +309,10 @@ export class PathBHarness {
     configText: string;
     binary: string;
     tls?: PathBTlsFiles;
+    org?: string;
   }) {
     this.tls = input.tls;
+    this.org = input.org;
     this.root = input.root;
     this.serverUrl = input.serverUrl;
     this.monitorUrl = input.monitorUrl;
@@ -457,6 +462,7 @@ export class PathBHarness {
         users,
         configText: fullConfig,
         binary,
+        ...(options.org === undefined ? {} : { org: options.org }),
         ...(tlsFiles ? { tls: {
           caFile: tlsFiles.caFile, untrustedCaFile: tlsFiles.untrustedCaFile,
           certFile: tlsFiles.certFile, keyFile: tlsFiles.keyFile,
@@ -537,6 +543,7 @@ export class PathBHarness {
       credentials: user.credsPath,
       machine: user.machine,
       ...PATH_B_PERMISSION_POLICY,
+      ...(this.org === undefined ? {} : { org: this.org }),
       ...(this.tls ? { tls: { caFile: this.tls.caFile } } : {}),
     };
   }

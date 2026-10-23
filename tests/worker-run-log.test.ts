@@ -124,7 +124,7 @@ const denyHeldReplacement = (file: string, held: number, code?: "EPERM" | "EBUSY
   } finally { rename?.mockRestore(); sleep?.mockRestore(); }
   expect(fs.readFileSync(file).equals(original)).toBe(true);
   expect(fs.statSync(file, { bigint: true }).ino).toBe(identity.ino);
-  expect(fs.readdirSync(path.dirname(file))).toEqual(["events.jsonl"]);
+  expect(fs.readdirSync(path.dirname(file))).toEqual(["events.jsonl", "events.jsonl.raw"]);
 };
 
 const readTranscript = (text: string) => new NativeConversationReader().read({ id: "run", status: "running", logFile: logFile(text) });
@@ -309,6 +309,25 @@ describe("worker run log", () => {
     expect(readTranscript(compacted).streaming).toEqual(readTranscript(live).streaming);
   });
 
+  it("snapshots the exact raw events.jsonl bytes before worker compaction", () => {
+    const live = write(capEvents(largeResultText("raw events snapshot")).events, true, false).text;
+    const file = logFile(live);
+    const originalMtime = fs.statSync(file).mtimeMs;
+    expect(compactTerminalRunLog(file, "completed")).toMatchObject({ compacted: 1 });
+    expect(fs.readFileSync(`${file}.raw`, "utf8")).toBe(live);
+    expect(fs.statSync(`${file}.raw`).mtimeMs).toBe(originalMtime);
+  });
+
+  it("refuses worker compaction when an existing raw events snapshot differs", () => {
+    const live = write(capEvents(largeResultText("wrong raw snapshot")).events, true, false).text;
+    const file = logFile(live);
+    fs.writeFileSync(`${file}.raw`, "not the source log\n");
+    expect(compactTerminalRunLog(file, "completed")).toMatchObject({ compacted: 0,
+      error: expect.stringContaining("Raw events.jsonl snapshot could not be verified") });
+    expect(fs.readFileSync(file, "utf8")).toBe(live);
+    expect(fs.readFileSync(`${file}.raw`, "utf8")).toBe("not the source log\n");
+  });
+
   it("exports the small-result retention threshold as exactly 8KiB", () => {
     expect(MIN_ELIDED_TOOL_RESULT_BYTES).toBe(8 * 1024);
   });
@@ -363,7 +382,7 @@ describe("worker run log", () => {
       expect(outcome.afterBytes).toBeLessThan(outcome.beforeBytes);
     } finally { spy.mockRestore(); }
     expect(fs.readFileSync(file, "utf8")).not.toBe(text);
-    expect(fs.readdirSync(path.dirname(file))).toEqual(["events.jsonl"]);
+    expect(fs.readdirSync(path.dirname(file))).toEqual(["events.jsonl", "events.jsonl.raw"]);
   });
 
   it("closes every owned source/temp descriptor after fsync and before replacement", () => {
@@ -386,7 +405,7 @@ describe("worker run log", () => {
     });
     const syncSpy = vi.spyOn(fs, "fsyncSync").mockImplementation((fd) => { fsync(fd); synced.push(fd); });
     const renameSpy = vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
-      expect(synced).toHaveLength(2);
+      expect(synced.length).toBeGreaterThan(1);
       expect(owned.size).toBe(0);
       rename(from, to);
     });
@@ -418,7 +437,7 @@ describe("worker run log", () => {
     } finally { rename.mockRestore(); sleep.mockRestore(); clock.mockRestore(); unlink.mockRestore(); }
     expect(fs.readFileSync(file).equals(original)).toBe(true);
     expect(fs.statSync(file).ino).toBe(inode);
-    expect(fs.readdirSync(path.dirname(file))).toEqual(["events.jsonl"]);
+    expect(fs.readdirSync(path.dirname(file))).toEqual(["events.jsonl", "events.jsonl.raw"]);
   });
 
   it.each(["identity", "size", "mtime"])("rechecks source %s before retrying replacement", (change) => {
@@ -442,7 +461,7 @@ describe("worker run log", () => {
       expect(rename).toHaveBeenCalledTimes(1);
     } finally { rename.mockRestore(); }
     expect(fs.readFileSync(file, "utf8")).toBe(change === "size" ? `${text}external append\n` : text);
-    expect(fs.readdirSync(path.dirname(file))).toEqual(["events.jsonl"]);
+    expect(fs.readdirSync(path.dirname(file))).toEqual(["events.jsonl", "events.jsonl.raw"]);
   });
 
   it("keeps the terminal work deadline while backing off persistent replacement contention", () => {
@@ -465,7 +484,7 @@ describe("worker run log", () => {
       expect(elapsed).toBe(MAX_TERMINAL_LOG_WORK_MS);
     } finally { rename.mockRestore(); sleep.mockRestore(); clock.mockRestore(); }
     expect(fs.readFileSync(file, "utf8")).toBe(text);
-    expect(fs.readdirSync(path.dirname(file))).toEqual(["events.jsonl"]);
+    expect(fs.readdirSync(path.dirname(file))).toEqual(["events.jsonl", "events.jsonl.raw"]);
   });
 
   it("uses a write-capable source for Windows-style FlushFileBuffers and real fsync", () => {
@@ -502,7 +521,7 @@ describe("worker run log", () => {
       expect(sourceFlags & (fs.constants.O_CREAT | fs.constants.O_TRUNC | fs.constants.O_APPEND)).toBe(0);
       const noFollow = fs.constants.O_NOFOLLOW ?? 0;
       expect(sourceFlags & noFollow).toBe(noFollow);
-      expect(synced).toHaveLength(2);
+      expect(synced.length).toBeGreaterThan(1);
       expect(synced[0]).toBe(source);
       expect(writes.mock.calls.every(([fd]) => fd !== source)).toBe(true);
     } finally { openSpy.mockRestore(); syncSpy.mockRestore(); writes.mockRestore(); }
@@ -695,20 +714,29 @@ describe("worker run log", () => {
     const foreign = path.join(directory, "foreign.compact.tmp");
     fs.writeFileSync(foreign, "not ours");
     const inode = fs.statSync(file).ino;
-    let syncs = 0;
     const fsync = fs.fsyncSync;
+    const open = fs.openSync;
+    const descriptors = new Map<number, string>();
+    const openSpy = failure === "rename" ? undefined : vi.spyOn(fs, "openSync").mockImplementation((name, flags, mode) => {
+      const fd = open(name, flags, mode);
+      descriptors.set(fd, String(name));
+      return fd;
+    });
     const spy = failure === "rename"
       ? vi.spyOn(fs, "renameSync").mockImplementation(() => { throw new Error("injected rename failure"); })
       : vi.spyOn(fs, "fsyncSync").mockImplementation((fd) => {
-        if (++syncs === (failure === "source-fsync" ? 1 : 2)) throw Object.assign(new Error("injected EIO fsync failure"), { code: "EIO" });
+        const target = descriptors.get(fd);
+        if (failure === "source-fsync" ? target === file : target?.endsWith(".compact.tmp")) {
+          throw Object.assign(new Error(`injected EIO ${failure} failure`), { code: "EIO" });
+        }
         fsync(fd);
       });
     try {
       expect(compactTerminalRunLog(file, "completed")).toMatchObject({ compacted: 0, error: expect.stringContaining("injected") });
-    } finally { spy.mockRestore(); }
+    } finally { spy.mockRestore(); openSpy?.mockRestore(); }
     expect(fs.readFileSync(file, "utf8")).toBe(text);
     expect(fs.statSync(file).ino).toBe(inode);
-    expect(fs.readdirSync(directory).sort()).toEqual(["events.jsonl", "foreign.compact.tmp"]);
+    expect(fs.readdirSync(directory).sort()).toEqual(["events.jsonl", "events.jsonl.raw", "foreign.compact.tmp"]);
   });
 
   it("invalidates growing replacements when Windows file IDs round to the same number", () => {

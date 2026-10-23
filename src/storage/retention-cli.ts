@@ -506,7 +506,7 @@ const sweep = async (meshRoot: string, options: {
     };
     const compactRuns = (runs: string, veto: () => boolean = gate, owner?: string) => {
       for (const run of directories(runs)) if (!early.has(path.basename(run))) {
-        compactTerminalRunEvents(run, { ...options, dryRun, onCompact: change => changes.push(change),
+        compactTerminalRunEvents(run, { ...options, meshRoot, dryRun, onCompact: change => changes.push(change),
           isRetained: () => veto() || referencedNow(path.basename(run), owner),
         });
       }
@@ -523,7 +523,7 @@ const sweep = async (meshRoot: string, options: {
         // the runs --apply deletes (review round 3). Sizes are taken before the final check, which also
         // re-discovers the registry roots, and the check and delete run back to back (review round 4).
         removedRuns.push(...sweepResidentRuns(path.join(root, "runs"), now, 10 * 60 * 1_000, {
-          actorRoots: registries, references: checked, retainRuns: false, requireRegistries: true, dryRun, acceptPidReuse: true,
+          actorRoots: registries, references: checked, retainRuns: false, requireRegistries: true, dryRun, acceptPidReuse: true, meshRoot,
           isRetained: () => veto(), measure: treeBytes,
           onRemove: (run, bytes) => changes.push({ path: run, beforeBytes: bytes, afterBytes: 0 }),
           onCompact: change => changes.push(change),
@@ -583,7 +583,7 @@ const sweep = async (meshRoot: string, options: {
                 !absent(path.join(registryRoot, `offline-removal-${id}.json`))) continue;
             const inFlight = typeof row?.inFlightRun?.id === "string" ? row.inFlightRun.id : undefined;
             pruneActorRunArchives({
-              runsDirectory: path.join(actorRoot, "runs"), retentionMs: options.runRetentionMs, now, dryRun, acceptPidReuse: true,
+              runsDirectory: path.join(actorRoot, "runs"), meshRoot, retentionMs: options.runRetentionMs, now, dryRun, acceptPidReuse: true,
               ...(typeof row?.lastRunId === "string" ? { latestRunId: row.lastRunId } : {}),
               isRetained: (run, final) => gate() || run === inFlight || (final ? referencedNow(run, registryRoot) : early.has(run)),
               // Sized before the final check; check and delete back to back (review round 4).
@@ -594,7 +594,7 @@ const sweep = async (meshRoot: string, options: {
             // Rotation history of an actor whose writer is joined: keep only the newest backup.
             if (row && row.inFlightRun === undefined && row.preparing === undefined && ["idle", "stopped"].includes(row.status) &&
                 typeof row.sessionFile === "string" && path.resolve(row.sessionFile) === path.join(path.resolve(actorRoot), "session.jsonl")) {
-              pruneActorSessionBackups(row.sessionFile, { dryRun, stop: gate, onPrune: change => changes.push({ path: change.path, beforeBytes: change.bytes, afterBytes: 0 }) });
+              pruneActorSessionBackups(row.sessionFile, { meshRoot, dryRun, stop: gate, onPrune: change => changes.push({ path: change.path, beforeBytes: change.bytes, afterBytes: 0 }) });
             }
           }
         } catch (error) { skipped.push({ path: registryRoot, reason: String(error) }); }

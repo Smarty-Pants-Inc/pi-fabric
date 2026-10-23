@@ -2,15 +2,21 @@ type UserConfig = import("vitest/config").ViteUserConfig;
 
 // Vite loads a CommonJS config bundle in memory; ESM configs emit into node_modules/.vite-temp
 // before cacheDir can take effect. Keep this entry .cts so plain `vitest run` is read-only-install safe.
-const { join } = require("node:path") as typeof import("node:path");
+const { dirname, join, resolve } = require("node:path") as typeof import("node:path");
 const { hostedOnly } = require("./scripts/hosted-only.mjs") as typeof import("./scripts/hosted-only.mjs");
-const { isolatedTestTemp, isolateTestFleetEnvironment } = require("./scripts/test-temp.ts") as typeof import("./scripts/test-temp.js");
+const { isolatedTestTemp, isolatedTestTempParent, isolateTestFleetEnvironment, testTempParentEnvironment, testTempRunEnvironment } = require("./scripts/test-temp.ts") as typeof import("./scripts/test-temp.js");
 
 // Assign the caller-owned run root before Vitest snapshots its environment, forks workers,
-// or allocates fleet state. Every later fixture temp directory stays beneath this root.
+// or allocates fleet state. Fleet and archive fixtures use siblings inside its caller-owned parent.
 const temp = isolatedTestTemp("pi-fabric-vitest-");
 Object.assign(process.env, temp);
-const fleet = isolateTestFleetEnvironment();
+// Keep the caller-owned run root available to each test file. Its parent is still private
+// under smarty-test-env (or runner-owned on Windows); place mesh roots and archive fixtures
+// there as siblings of this process's TMPDIR.
+process.env[testTempRunEnvironment] = temp.TMPDIR;
+const testTempParent = isolatedTestTempParent(dirname(resolve(temp.TMPDIR)));
+process.env[testTempParentEnvironment] = testTempParent;
+const fleet = isolateTestFleetEnvironment(testTempParent);
 // Vitest appends vitest/<project hash>/results.json. The pinned run root already falls back to
 // os.tmpdir() when TMPDIR is absent (including Windows); teardown owns the cache's lifetime too.
 const cacheDir = join(temp.TMPDIR, "vite");
@@ -75,7 +81,7 @@ const policyConstants = (name: string) => ({
 
 const sharedTests = {
   environment: "node",
-  env: { ...temp, ...fleet },
+  env: { ...temp, ...fleet, [testTempRunEnvironment]: temp.TMPDIR, [testTempParentEnvironment]: testTempParent },
   setupFiles: ["./tests/fleet-isolation-setup.ts"],
   include: ["tests/**/*.test.ts"],
   ...(excludedSuites.length > 0 ? { exclude: excludedSuites } : {}),

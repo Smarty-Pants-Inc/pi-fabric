@@ -311,8 +311,8 @@ describe("host-only NATS inbox retention settings (smarty-dev#15310)", () => {
   };
 
   it("defaults to a persistent host and a one-hour idle threshold, and accepts configured bounds", () => {
-    expect(DEFAULT_FABRIC_CONFIG.mesh.nats).toMatchObject({ ephemeralHost: false, ephemeralInactiveSeconds: 3_600, inboxMaxAgeMs: 7 * 24 * 60 * 60_000 });
-    expect(normalizeNats()).toMatchObject({ ephemeralHost: false, ephemeralInactiveSeconds: 3_600, inboxMaxAgeMs: 7 * 24 * 60 * 60_000 });
+    expect(DEFAULT_FABRIC_CONFIG.mesh.nats).toMatchObject({ ephemeralHost: false, ephemeralInactiveSeconds: 3_600, inboxMaxAgeMs: 7 * 24 * 60 * 60_000, eventReceiptLimit: 4_096 });
+    expect(normalizeNats()).toMatchObject({ ephemeralHost: false, ephemeralInactiveSeconds: 3_600, inboxMaxAgeMs: 7 * 24 * 60 * 60_000, eventReceiptLimit: 4_096 });
     expect(normalizeNats({ ephemeralHost: true, ephemeralInactiveSeconds: 300 }))
       .toMatchObject({ ephemeralHost: true, ephemeralInactiveSeconds: 300 });
     expect(normalizeNats({ ephemeralHost: true, ephemeralInactiveSeconds: 86_400 }))
@@ -320,6 +320,8 @@ describe("host-only NATS inbox retention settings (smarty-dev#15310)", () => {
     expect(normalizeNats({ inboxMaxAgeMs: 60_000 })).toMatchObject({ inboxMaxAgeMs: 60_000 });
     expect(normalizeNats({ inboxMaxAgeMs: 90 * 24 * 60 * 60_000 }))
       .toMatchObject({ inboxMaxAgeMs: 90 * 24 * 60 * 60_000 });
+    expect(normalizeNats({ eventReceiptLimit: 128 })).toMatchObject({ eventReceiptLimit: 128 });
+    expect(normalizeNats({ eventReceiptLimit: 65_536 })).toMatchObject({ eventReceiptLimit: 65_536 });
   });
 
   it("rejects invalid opt-in values and thresholds", () => {
@@ -336,7 +338,7 @@ describe("host-only NATS inbox retention settings (smarty-dev#15310)", () => {
     }
   });
 
-  it("does not let a trusted project enable ephemeral retention or change the host threshold", () => {
+  it("does not let a trusted project change host retention or set event grant scopes", () => {
     const cwd = temporaryDirectory(); const agentDir = temporaryDirectory(); fs.mkdirSync(path.join(cwd, ".pi"));
     const originalNatsEnv = process.env.PI_FABRIC_MESH_NATS;
     const originalTransportEnv = process.env.PI_FABRIC_MESH_TRANSPORT;
@@ -346,13 +348,48 @@ describe("host-only NATS inbox retention settings (smarty-dev#15310)", () => {
     delete process.env.PI_FABRIC_MESH_HOST_TRANSPORT;
     try {
       fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ mesh: {
-        transport: "nats", hostTransport: "nats", nats: { ...nats, ephemeralHost: false, ephemeralInactiveSeconds: 600 },
+        transport: "nats", hostTransport: "nats", nats: { ...nats, eventOrgs: ["smarty-pants-inc", "versehq"], ephemeralHost: false, ephemeralInactiveSeconds: 600, eventReceiptLimit: 256 },
       } }));
       fs.writeFileSync(path.join(cwd, ".pi", "fabric.json"), JSON.stringify({ mesh: {
-        nats: { ephemeralHost: true, ephemeralInactiveSeconds: 900, inboxMaxAgeMs: 60_000 },
+        nats: { ephemeralHost: true, ephemeralInactiveSeconds: 900, inboxMaxAgeMs: 60_000, eventOrgs: ["foreign-org"], eventReceiptLimit: 1 },
       } }));
       const config = loadFabricConfigForScope({ cwd, agentDir, projectTrusted: true }, "project");
-      expect(config.mesh.nats).toMatchObject({ ephemeralHost: false, ephemeralInactiveSeconds: 600, inboxMaxAgeMs: 7 * 24 * 60 * 60_000 });
+      expect(config.mesh.nats).toMatchObject({ ephemeralHost: false, ephemeralInactiveSeconds: 600, inboxMaxAgeMs: 7 * 24 * 60 * 60_000,
+        eventOrgs: ["smarty-pants-inc", "versehq"], eventReceiptLimit: 256 });
+      fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ mesh: {
+        transport: "nats", hostTransport: "nats", nats,
+      } }));
+      const projectCannotSet = loadFabricConfigForScope({ cwd, agentDir, projectTrusted: true }, "project");
+      expect(projectCannotSet.mesh.nats.eventOrgs).toEqual([]);
+      expect(projectCannotSet.mesh.nats.eventReceiptLimit).toBe(4_096);
+    } finally {
+      if (originalNatsEnv === undefined) delete process.env.PI_FABRIC_MESH_NATS;
+      else process.env.PI_FABRIC_MESH_NATS = originalNatsEnv;
+      if (originalTransportEnv === undefined) delete process.env.PI_FABRIC_MESH_TRANSPORT;
+      else process.env.PI_FABRIC_MESH_TRANSPORT = originalTransportEnv;
+      if (originalHostTransportEnv === undefined) delete process.env.PI_FABRIC_MESH_HOST_TRANSPORT;
+      else process.env.PI_FABRIC_MESH_HOST_TRANSPORT = originalHostTransportEnv;
+    }
+  });
+
+  it("ignores a workspace NATS org and defaults event scopes to the host org", () => {
+    const cwd = temporaryDirectory(); const agentDir = temporaryDirectory(); fs.mkdirSync(path.join(cwd, ".pi"));
+    const originalNatsEnv = process.env.PI_FABRIC_MESH_NATS;
+    const originalTransportEnv = process.env.PI_FABRIC_MESH_TRANSPORT;
+    const originalHostTransportEnv = process.env.PI_FABRIC_MESH_HOST_TRANSPORT;
+    delete process.env.PI_FABRIC_MESH_NATS;
+    delete process.env.PI_FABRIC_MESH_TRANSPORT;
+    delete process.env.PI_FABRIC_MESH_HOST_TRANSPORT;
+    try {
+      fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ mesh: {
+        transport: "nats", hostTransport: "nats", nats: { ...nats, org: "smarty-pants-inc" },
+      } }));
+      fs.writeFileSync(path.join(cwd, ".pi", "fabric.json"), JSON.stringify({ mesh: {
+        nats: { org: "versehq", eventOrgs: ["versehq"] },
+      } }));
+      const config = loadFabricConfigForScope({ cwd, agentDir, projectTrusted: true }, "project");
+      expect(config.mesh.nats.org).toBe("smarty-pants-inc");
+      expect(config.mesh.nats.eventOrgs).toEqual(["smarty-pants-inc"]);
     } finally {
       if (originalNatsEnv === undefined) delete process.env.PI_FABRIC_MESH_NATS;
       else process.env.PI_FABRIC_MESH_NATS = originalNatsEnv;
@@ -439,6 +476,22 @@ describe("executor.powershell opt-in (smarty-dev#9826)", () => {
     // A project layer cannot withdraw it either: the key is host-only.
     fs.writeFileSync(path.join(cwd, ".pi", "fabric.json"), JSON.stringify({ executor: { powershell: "refuse" } }));
     expect(loadFabricConfig(options).executor.powershell).toBe("allow");
+  });
+});
+
+describe("sandbox Placement loopback URL policy", () => {
+  it.each([
+    "http://127.0.0.1:1024",
+    "http://127.0.0.1:18080",
+    "http://127.0.0.1:65535",
+  ])("accepts the canonical loopback endpoint %s", placementUrl => {
+    expect(normalizeFabricConfig({ agents: { sandbox: { placementUrl } } }).agents.sandbox.placementUrl)
+      .toBe(placementUrl);
+  });
+
+  it("rejects a loopback endpoint with a leading-zero port", () => {
+    expect(() => normalizeFabricConfig({ agents: { sandbox: { placementUrl: "http://127.0.0.1:018080" } } }))
+      .toThrow("agents.sandbox.placementUrl");
   });
 });
 

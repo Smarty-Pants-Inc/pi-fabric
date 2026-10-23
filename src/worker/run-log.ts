@@ -14,6 +14,7 @@
 import fs from "node:fs";
 import { randomUUID } from "node:crypto";
 import { performance } from "node:perf_hooks";
+import { ensureTraceSnapshot } from "../storage/trace-snapshot.js";
 
 export const RUN_LOG_FLUSH_MS = 500;
 
@@ -249,9 +250,6 @@ export const compactTerminalRunLog = (filePath: string, status: string): RunLogC
       skip(`MAX_TERMINAL_LOG_BYTES=${MAX_TERMINAL_LOG_BYTES}`);
     }
     checkWork();
-    // Canonical must actually exist in this durable file, not only in stdout
-    // or a best-effort append callback. Fail closed if fsync is rejected.
-    fs.fsyncSync(source);
     const index = new Map<string, ToolCorrelation>();
     const correlation = (id: string): ToolCorrelation => {
       let entry = index.get(id);
@@ -340,6 +338,14 @@ export const compactTerminalRunLog = (filePath: string, status: string): RunLogC
     }
     if (!compacted) return outcome;
     checkWork();
+    // Preserve the original bytes before any durability barrier can fail. Defer
+    // the namespace barrier until after file fsyncs so the source flush remains first.
+    if (!ensureTraceSnapshot(filePath, `${filePath}.raw`, original, source, true, false)) {
+      throw new Error("Raw events.jsonl snapshot could not be verified; full log retained");
+    }
+    checkWork();
+    fs.fsyncSync(source);
+    checkWork();
     fs.fsyncSync(target);
     fs.closeSync(target);
     target = undefined;
@@ -349,6 +355,9 @@ export const compactTerminalRunLog = (filePath: string, status: string): RunLogC
       current.size !== original.size || current.mtimeMs !== original.mtimeMs ||
       held.size !== original.size || held.mtimeMs !== original.mtimeMs) {
       throw new Error("Run log changed during terminal compaction");
+    }
+    if (!ensureTraceSnapshot(filePath, `${filePath}.raw`, original, source, true)) {
+      throw new Error("Raw events.jsonl snapshot could not be verified; full log retained");
     }
     // Windows may reject replacement while our source handle is open. Both
     // source and temp have been synced; release every owned handle before commit.

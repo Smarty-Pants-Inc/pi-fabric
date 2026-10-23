@@ -3,7 +3,8 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createProcessIncarnationReader, readPhysicalHostIdentity, readPhysicalMachineId, type IncarnationCommandRunner } from "../src/core/atomic-write.js";
-import { runTreeExitVeto } from "../src/storage/retention.js";
+import { archiveRunSessionTraces, pruneActorRunArchives, runSessionTraceArchivePath, runTreeExitVeto } from "../src/storage/retention.js";
+import { testTempRoot } from "./helpers/test-temp-root.js";
 
 const roots: string[] = [];
 afterEach(() => {
@@ -37,6 +38,27 @@ const withoutPhysicalEvidence = () => {
 const gone = () => { throw Object.assign(new Error("confirmed absent PID"), { code: "ESRCH" }); };
 
 describe("Windows-simulated retained process identity", () => {
+  it.runIf(process.platform === "win32")("retains an expired run when raw trace archival is unavailable", () => {
+    const root = testTempRoot("retention-win32-archive-"); roots.push(root);
+    const meshRoot = path.join(root, "mesh"), runs = path.join(root, "runs"), id = "a".repeat(32);
+    const directory = path.join(runs, id), trace = path.join(directory, "events.jsonl");
+    fs.mkdirSync(directory, { recursive: true });
+    const bytes = '{"type":"private raw trace"}\n';
+    fs.writeFileSync(trace, bytes);
+    fs.writeFileSync(path.join(directory, "status.json"), JSON.stringify({ status: "completed", transport: "process",
+      sessionId: "2147483647", finishedAt: 1 }));
+    const kill = process.kill.bind(process);
+    vi.spyOn(process, "kill").mockImplementation((...args) => {
+      if (args[0] === 2147483647) throw Object.assign(new Error("confirmed absent PID"), { code: "ESRCH" });
+      return kill(...args);
+    });
+
+    expect(archiveRunSessionTraces(directory, undefined, meshRoot)).toBe(false);
+    expect(pruneActorRunArchives({ runsDirectory: runs, meshRoot, retentionMs: 0, now: Date.now() + 1 })).toEqual([]);
+    expect(fs.existsSync(directory)).toBe(true);
+    expect(fs.readFileSync(trace, "utf8")).toBe(bytes);
+    expect(fs.existsSync(runSessionTraceArchivePath(meshRoot, directory))).toBe(false);
+  });
   it.each([undefined, "not-a-pid"])("keeps the nested cleanup veto for saved PID %j even after native exit", async sessionId => {
     withoutPhysicalEvidence();
     const run = vi.fn<IncarnationCommandRunner>().mockRejectedValue(Object.assign(new Error("Windows start identity denied"), { code: "EACCES" }));

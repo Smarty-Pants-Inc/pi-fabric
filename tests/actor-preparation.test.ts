@@ -2,6 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { itPosixArchive } from "./helpers/platform-archive.js";
 import { ACTOR_PREPARATION_TIMEOUT_MS, FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, ActorManager, ActorPreparationError, ActorPreparationTimeoutError } from "../src/actors/manager.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import * as predicate from "../src/actors/predicate.js";
@@ -145,7 +146,7 @@ describe("round-three accepted-work regressions (#3167)", () => {
 describe("round-four launch-preparation recovery (#3167)", () => {
   const scenarios = [false, true].flatMap((queued) => [false, true].flatMap((recreate) =>
     (["text", "directive"] as const).map((responseMode) => ({ queued, recreate, responseMode }))));
-  it.each(scenarios)("durably retries confirmed-unlaunched auth (queued=$queued, recreate=$recreate, mode=$responseMode) exactly once", async ({ queued, recreate, responseMode }) => {
+  itPosixArchive.each(scenarios)("durably retries confirmed-unlaunched auth (queued=$queued, recreate=$recreate, mode=$responseMode) exactly once", async ({ queued, recreate, responseMode }) => {
     const gate = deferred<void>();
     const authStarted = deferred<void>();
     const recovered = deferred<void>();

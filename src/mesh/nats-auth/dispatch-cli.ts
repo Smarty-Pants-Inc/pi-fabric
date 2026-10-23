@@ -1,9 +1,8 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
-import { openPrivateDir } from "../../storage/private-dir.js";
 import { openAndSend, type NatsSendOptions, type NatsSendReply } from "./send-cli.js";
+import { bindDispatchRunContent } from "./dispatch-binding.js";
 import { pathBMachines } from "./mint.js";
 
 const USAGE = [
@@ -127,60 +126,6 @@ function readTask(file: string): string {
   catch { throw new DispatchCliError("--task-file must contain valid UTF-8"); }
 }
 
-function bindRunContent(runId: string, task: string, targetId: string): void {
-  const configuredStateHome = process.env.XDG_STATE_HOME?.trim() || path.join(os.homedir(), ".local", "state");
-  if (!path.isAbsolute(configuredStateHome) || configuredStateHome.includes("\0")) {
-    throw new DispatchCliError("XDG_STATE_HOME must be an absolute path");
-  }
-  const sha256 = (value: string): string => createHash("sha256").update(value, "utf8").digest("hex");
-  // JSON frames the decoded task and actual resolved target unambiguously; never persist task plaintext.
-  const contentSha256 = sha256(JSON.stringify([task, targetId]));
-  const bytes = Buffer.from(`${JSON.stringify({ format: 1, contentSha256 })}\n`, "utf8");
-  try {
-    // Independent of sender credentials and --out: changing a receipt path cannot reset a run's binding.
-    const directory = openPrivateDir(path.join(configuredStateHome, "pi-fabric", "nats-dispatch"));
-    try {
-      const uid = process.getuid?.();
-      if (directory.fd === undefined || uid === undefined) throw new Error("private binding state unavailable");
-      const root = fs.fstatSync(directory.fd);
-      if (root.uid !== uid || (root.mode & 0o7777) !== 0o700) throw new Error("unsafe binding directory");
-      const file = path.join(directory.path, `${sha256(runId)}.json`);
-      let fd: number;
-      let created = false;
-      try {
-        fd = fs.openSync(file, fs.constants.O_RDWR | fs.constants.O_CREAT | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW ?? 0), 0o600);
-        created = true;
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-        fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0));
-      }
-      try {
-        if (created) fs.fchmodSync(fd, 0o600);
-        const stat = fs.fstatSync(fd);
-        if (!stat.isFile() || stat.uid !== uid || stat.nlink !== 1 || (stat.mode & 0o7777) !== 0o600) {
-          throw new Error("unsafe binding file");
-        }
-        if (created) {
-          fs.writeFileSync(fd, bytes);
-        } else {
-          if (stat.size !== bytes.length) throw new Error("malformed binding file");
-          const stored = fs.readFileSync(fd, "utf8");
-          // Accept only our exact versioned hash-only representation, not permissively parsed state.
-          if (!/^\{"format":1,"contentSha256":"[a-f0-9]{64}"\}\n$/.test(stored)) throw new Error("malformed binding file");
-          if (stored !== bytes.toString("utf8")) throw new DispatchCliError("run id reused with different content");
-        }
-        // Even an existing binding may have been just written by a concurrent process: make it durable before send.
-        fs.fsyncSync(fd);
-        fs.fsyncSync(directory.fd);
-      } finally { fs.closeSync(fd); }
-      // Never remove or overwrite a failed/torn binding: subsequent attempts must fail closed too.
-    } finally { directory.close(); }
-  } catch (error) {
-    if (error instanceof DispatchCliError) throw error;
-    throw new DispatchCliError("could not safely persist dispatch run binding");
-  }
-}
-
 const safeError = (error: unknown): string => {
   const message = error instanceof Error ? error.message : "NATS dispatch failed";
   return message.replace(/[\r\n\u0000-\u001f\u007f]/g, " ").slice(0, 500) || "NATS dispatch failed";
@@ -261,7 +206,7 @@ export async function runNatsDispatchCli(argv: string[]): Promise<number> {
       findTimeoutMs: options.findTimeoutSeconds * 1_000,
       messageForSender: (senderId, targetId, replyCorrelationId) => {
         if (!replyCorrelationId) throw new DispatchCliError("dispatch reply correlation is unavailable");
-        bindRunContent(options.runId, task, targetId);
+        bindDispatchRunContent(options.runId, task, targetId, senderId);
         const answer = `FABRIC-RESULT ${options.runId}\n<answer>`;
         return `${task}\n\nWhen done, call agents.followUp({ id: ${JSON.stringify(senderId)}, message: ${JSON.stringify(answer)}, data: { inReplyTo: ${JSON.stringify(replyCorrelationId)} } }).`;
       },

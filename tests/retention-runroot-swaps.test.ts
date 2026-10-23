@@ -64,7 +64,7 @@ const fixture = (kind: Kind) => {
   fs.mkdirSync(run, { recursive: true, mode: 0o700 });
   fs.chmodSync(root, 0o700); fs.chmodSync(run, 0o700);
   fs.writeFileSync(path.join(run, "status.json"), JSON.stringify({ id: "run", status: "completed", finishedAt: 1, transport: "process", sessionId: String(DEAD_PID) }), { mode: 0o600 });
-  fs.writeFileSync(path.join(run, "events.jsonl"), '{"sequence":0}\n', { mode: 0o600 });
+  fs.writeFileSync(path.join(run, "reply.json"), '{"text":"retained result"}', { mode: 0o600 });
   fs.writeFileSync(path.join(root, ".fabric-owner.json"), JSON.stringify({ pid: DEAD_PID, startedAt: 1, heartbeatAt: 1,
     ...(kind === "closed" ? { closedAt: 1, childrenStopped: true } : { orphanedAt: 1 }) }), { mode: 0o600 });
   // Old enough that only the judged mtime (not a fresh one) is eligible either way.
@@ -106,7 +106,7 @@ describe.skipIf(process.platform !== "linux")("run-root deleters remove only the
       expect(renames.map(call => call.op)).toEqual(["renameSync(graveyard move, called through)"]);
       const unlinks = deletions().filter(call => call.op === "unlinkSync").map(call => path.basename(call.args[0]!)).sort();
       const rmdirs = deletions().filter(call => call.op === "rmdirSync").map(call => path.basename(call.args[0]!));
-      expect(unlinks).toEqual(["events.jsonl", "status.json"]);
+      expect(unlinks).toEqual(["reply.json", "status.json"]);
       expect(rmdirs).toHaveLength(2);
       expect(rmdirs[0]).toMatch(/^run\.[0-9a-f-]{36}$/);
       expect(rmdirs[1]).toBe(`.retention-graveyard-${process.pid}`);

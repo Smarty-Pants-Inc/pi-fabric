@@ -120,6 +120,50 @@ const expectExternalIntact = () => {
   expect(lstatSync(externalDir).isDirectory()).toBe(true);
 };
 
+describe.skipIf(hosted)("registered sibling test-data root", () => {
+  it("allows cleanup only inside the explicitly registered, marker-verified test-data root", () => {
+    requireGuard();
+    const root = process.env.PI_TEST_TEMP_PARENT_DIR;
+    expect(root).toBeDefined();
+    expect(inside(privateTemp, realpathSync(root!))).toBe(false);
+    const marker = join(root!, ".pi-fabric-test-temp-parent.json");
+    expect(fs.readFileSync(marker, "utf8")).toBe('{"format":1,"purpose":"pi-fabric-test-temp-parent"}');
+    const fixture = join(root!, "guard-registered-fixture-sentinel");
+    writeFileSync(fixture, "owned by this test");
+    fs.rmSync(fixture);
+    expect(existsSync(fixture)).toBe(false);
+    expect(() => fs.rmSync(externalFile)).toThrow(refusal);
+    expectExternalIntact();
+  });
+
+  it("revalidates the registered root in spawned Node workers with narrowed TMPDIR", () => {
+    requireGuard();
+    const root = process.env.PI_TEST_TEMP_PARENT_DIR!;
+    const childTemp = join(root, `guard-child-tmp-${process.pid}`);
+    const environment = { ...process.env, TMPDIR: childTemp, TMP: childTemp, TEMP: childTemp };
+    const result = runChild("registered-test-data-root-child.mjs", `
+import fs from "node:fs";
+import path from "node:path";
+fs.mkdirSync(process.env.TMPDIR, { recursive: true });
+const root = process.env.PI_TEST_TEMP_PARENT_DIR;
+if (!root) throw new Error("missing inherited test-data root");
+const source = path.join(root, "child-source-" + process.pid + ".txt");
+const target = path.join(root, "child-target-" + process.pid + ".txt");
+fs.writeFileSync(source, "owned child fixture");
+fs.renameSync(source, target);
+fs.rmSync(target);
+let refused = false;
+try { fs.rmSync(process.argv[2]); }
+catch (error) { if (error?.code === "ERR_TEST_DELETION_GUARD") refused = true; else throw error; }
+if (!refused) throw new Error("unregistered sibling deletion was not refused");
+process.stdout.write("registered-root-cleanup-ok");
+`, [externalFile], environment);
+    fs.rmSync(childTemp, { recursive: true, force: true });
+    expect(result.stdout).toContain("registered-root-cleanup-ok");
+    expectExternalIntact();
+  });
+});
+
 const expectRefused = (outcome: Outcome, mode: Outcome["kind"]) => {
   expect(outcome.kind).toBe(mode);
   expect(String((outcome.error as Error | undefined)?.message)).toMatch(refusal);

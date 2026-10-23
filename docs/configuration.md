@@ -1148,11 +1148,22 @@ credentials, machine inventory and custody/liveness policy remain required):
 `mesh.nats.org` is a GitHub login slug, required when events are enabled. The
 active values are `smarty-pants-inc` and `versehq` (Playful's login is `versehq`,
 not `playful`). Values are 1–63 lowercase letters, digits or hyphens, starting
-with a letter or digit; `sys` is reserved. Stream names uppercase the slug and
-replace hyphens with `_`. `mesh.nats.provision` **defaults to false**;
+with a letter or digit; `sys` is reserved.
+
+Host-only `mesh.nats.eventOrgs` defaults to `[org]` and lists the orgs whose event subjects may be granted; a workspace cannot set it.
+
+Stream names uppercase the slug and replace hyphens with `_`. `mesh.nats.provision` **defaults to false**;
 both flags must be booleans. FILE transport keeps them off. In NATS mode the
 existing `PI_FABRIC_MESH_NATS` replacement snapshot supplies these keys when
 present.
+
+The host-level `mesh.nats.eventReceiptLimit` bounds each actor's persisted
+broker-message-ID LRU (default `4096`, range `1`–`65536`). A repeated ID still
+in that window is not enqueued again; its recency update is durably checkpointed
+before the broker ACK. New receipts evict the least-recently-used IDs when the
+configured limit is reached, so only IDs retained in the bounded window are
+deduplicated after that eviction. Child processes inherit the configured limit;
+workspace configuration cannot override it.
 
 **Two streams, no overlap:** `FABRIC_EV_SMARTY_PANTS_INC` owns only
 `fabric.ev.smarty-pants-inc.>`; `GITHUB_SMARTY_PANTS_INC` is the existing
@@ -1195,6 +1206,17 @@ durables. These exact additions are pending product-owner approval; event-mode
 runtime publishing and filter changes remain blocked until approved and minted.
 Absent/false preserves existing grants, and the operator gains no event rights.
 Minting and exact `USER.INFO` verification use the same options.
+
+Actor event durables keep server `max_deliver: -1` and use a client-side cap of
+100 unaccepted deliveries. At the cap, the consumer publishes a `fabric.deadletter`
+MeshEvent to `fabric.ev.<org>.fabric.deadletter`, carrying the original event id,
+subject and stream sequence, delivery count, consumer, and a fixed redacted error
+summary; it then TERMs the source delivery. The dead-letter event is stored in the
+org event stream, and a structured `fabric.alarm` warning names the consumer and
+event id. Events whose subject or type is already `fabric.deadletter` are TERMed
+with one structured warning instead, preventing recursive dead-lettering. If
+publishing the record fails, the source is NAKed with the existing retry
+backoff and remains eligible for another attempt.
 
 Mail services can publish through the plain-Node CLI:
 

@@ -54,12 +54,11 @@ describe.skipIf(process.platform !== "linux")("offline retained mesh sweep", () 
     const plan = await sweepMeshRetention(root, { now: 7 * 3600000, dryRun: true });
     expect(snapshot(root)).toEqual(before);
     expect(plan.skipped).toEqual([]);
-    expect(plan.changes).toHaveLength(3);
+    expect(plan.changes).toHaveLength(2);
     expect(plan.bytesBefore).toBeGreaterThan(plan.bytesAfter);
     expect(plan.changes.map(change => change.path).sort()).toEqual([
       path.join(host, "runs", "terminal", "events.jsonl"),
       path.join(actor, "runs", "archive", "events.jsonl"),
-      path.join(actor, "session.jsonl.20260927T150000000Z.bak"),
     ].sort());
     expect(plan.summary.applyRefusal).toBeUndefined();
     await applyRejects(root, { now: 7 * 3600000 });
@@ -87,7 +86,6 @@ describe.skipIf(process.platform !== "linux")("offline retained mesh sweep", () 
     expect(plan.changes.map(change => change.path).sort()).toEqual([
       path.join(host, "runs", "terminal", "events.jsonl"),
       path.join(actor, "runs", "archive", "events.jsonl"),
-      path.join(actor, "session.jsonl.20260927T150000000Z.bak"),
     ].sort());
     fs.mkdirSync(`${file}.lock`);
     const locked = snapshot(root);
@@ -197,15 +195,16 @@ describe.skipIf(process.platform !== "linux")("offline retained mesh sweep", () 
     expect(fs.statSync(report).mode & 0o777).toBe(0o600);
   });
 
-  it("re-checks the gate before EACH session-backup unlink (smarty-dev#7766)", () => {
+  it("retains raw session backups even when the sweep stop gate is requested", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-backups-")); roots.push(dir);
     const session = path.join(dir, "session.jsonl");
     write(session, "");
     for (const stamp of ["20260927T150000000Z", "20260928T150000000Z", "20260929T150000000Z", "20260930T150000000Z"]) write(`${session}.${stamp}.bak`, "x");
     let asked = 0;
     // A hold lands after the first unlink: the remaining older backups stay.
-    expect(pruneActorSessionBackups(session, { stop: () => asked++ > 0 })).toHaveLength(1);
-    expect(fs.readdirSync(dir).filter(name => name.endsWith(".bak"))).toHaveLength(3);
+    expect(pruneActorSessionBackups(session, { stop: () => asked++ > 0 })).toEqual([]);
+    expect(asked).toBe(2);
+    expect(fs.readdirSync(dir).filter(name => name.endsWith(".bak"))).toHaveLength(4);
   });
 
   it("never accepts an approval whose owner cannot be proven (smarty-dev#7766)", async () => {
@@ -268,7 +267,8 @@ createJiti(pathToFileURL(process.cwd() + "/index.js").href).import(${JSON.string
     const report = path.join(root, "report.json");
     const dry = spawnSync(process.execPath, ["-e", runner, root, "--dry-run", "--report", report], { encoding: "utf8", timeout: 60_000 });
     expect(dry.status, dry.stderr).toBe(0);
-    expect(dry.stderr).toMatch(/^pruneActorSessionBackups: would delete 1 \(3 bytes\), refused 0$/m);
+    expect(dry.stderr).toMatch(/^pruneActorSessionBackups: would delete 0 \(0 bytes\), refused 1$/m);
+    expect(dry.stderr).toMatch(/^  refused 1 \(0\.000 GiB\): raw session transcript retained$/m);
     expect(dry.stderr).toMatch(/^WOULD_FREE_GIB=\d+\.\d{3}$/m);
     expect(fs.existsSync(old)).toBe(true);
     const prior = fs.readFileSync(report, "utf8");

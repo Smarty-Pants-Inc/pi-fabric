@@ -4,7 +4,7 @@ import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { decodeAndVerifyNatsJwt } from "../src/mesh/nats-auth/jwt.js";
 import { createNatsAccount, createNatsOperator, mintNatsUser, type NatsMintOutput } from "../src/mesh/nats-auth/mint.js";
-import { NatsPermissionsError, PATH_B_ADVISORY_DURABLE, PATH_B_OPERATOR_MACHINE, pathBRoleTemplate, roleTemplate, roleTemplateWithPathB, type RoleTemplate } from "../src/mesh/nats-auth/permissions.js";
+import { NatsPermissionsError, PATH_B_ADVISORY_DURABLE, PATH_B_OPERATOR_MACHINE, pathBEventGrantAllowlist, pathBRoleTemplate, roleTemplate, roleTemplateWithPathB, type RoleTemplate } from "../src/mesh/nats-auth/permissions.js";
 
 const artifact = (output: NatsMintOutput<unknown>, name: string): string =>
   new TextDecoder().decode(output.artifacts.find(entry => entry.name === name)!.bytes).trim();
@@ -134,15 +134,18 @@ describe("Path B NATS grants", () => {
     vi.doMock("@nats-io/jetstream", () => ({ jetstream: () => ({}), jetstreamManager: async () => ({}) }));
     try {
       const { openNatsConnection } = await import("../src/transport/nats/connection.js");
-      const baseOptions = { ...streams, pathBMachines: policy.pathBMachines, org: policy.org, credentials, machine: "ryzen2", servers: "tls://localhost:4222" };
+      const eventOrgs = [policy.org, "versehq"];
+      const baseOptions = { ...streams, pathBMachines: policy.pathBMachines, org: policy.org, eventOrgs, credentials, machine: "ryzen2", servers: "tls://localhost:4222" };
       const options = { ...baseOptions, events: true };
       await (await openNatsConnection(options)).close();
       for (const off of [baseOptions, { ...baseOptions, events: false }]) await (await openNatsConnection(off)).close();
-      await expect(openNatsConnection({ ...options, org: "other-org" })).rejects.toThrow("machine tag mismatch");
+      await expect(openNatsConnection({ ...options, org: "other-org" })).rejects.toMatchObject({ code: "FABRIC_CREDENTIAL_OVERBROAD" });
       publish = allowed.filter(value => value !== "fabric.ev.smarty-dev.>");
       await expect(openNatsConnection(options)).rejects.toThrow("machine tag mismatch");
-      publish = [...allowed, "github.>"];
+      publish = [...allowed, ...pathBEventGrantAllowlist(["versehq"])];
       await (await openNatsConnection(options)).close();
+      publish = [...allowed, "github.>"];
+      await expect(openNatsConnection(options)).rejects.toMatchObject({ code: "FABRIC_CREDENTIAL_OVERBROAD" });
       publish = expand(roleTemplateWithPathB("agent", streams, policy.pathBMachines, { org: policy.org }).pub.allow);
       await expect(openNatsConnection(options)).rejects.toThrow("machine tag mismatch");
       publish = allowed;

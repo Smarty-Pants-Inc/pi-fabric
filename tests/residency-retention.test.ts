@@ -11,7 +11,8 @@ import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { ResidentHost, sweepResidentRuns } from "../src/residency/host.js";
 import * as expiry from "../src/residency/request-expiry.js";
 import { ResidentRequestRetention } from "../src/residency/retention.js";
-import { compactTerminalRunEvents } from "../src/storage/retention.js";
+import { testTempRoot } from "./helpers/test-temp-root.js";
+import { compactTerminalRunEvents, runSessionTraceArchivePath } from "../src/storage/retention.js";
 import { verifiedRemoveTestHooks } from "../src/storage/verified-remove.js";
 import { acknowledgeResidentResponse, abandonResidentRequest, commitResidentRequest, readResidentRequestDecision, registerResidentCancellation, residentHostId, residentRoot, residentHostStateNote, residentCommandForOwner, type ResidentCommand, type ResidentHostConfig } from "../src/residency/protocol.js";
 
@@ -47,6 +48,25 @@ describe("resident terminal event retention", () => {
     fs.writeFileSync(path.join(run, "reply.json"), '{"text":"keep reply"}');
     return run;
   };
+
+  it.skipIf(process.platform === "win32")("removes an expired unreferenced run through the moved-tree check and preserves its raw trace in the archive", () => {
+    const dir = root();
+    const meshRoot = testTempRoot("resident-retention-archive-");
+    roots.push(meshRoot);
+    const run = make(dir, "expired-unreferenced", "completed");
+    const trace = path.join(run, "events.jsonl");
+    const raw = "raw resident session trace\n";
+    fs.writeFileSync(trace, raw);
+    expect(() => process.kill(2147483647, 0)).toThrow(expect.objectContaining({ code: "ESRCH" }));
+    fs.utimesSync(run, day / 1_000, day / 1_000);
+    const retention = new ResidentRequestRetention(dir, [], { retainRuns: false, meshRoot });
+    try {
+      retention.sweep(now, new Set(), 10_000);
+      expect(fs.existsSync(run)).toBe(false);
+      const archive = runSessionTraceArchivePath(meshRoot, run);
+      expect(fs.readFileSync(path.join(archive, "events.jsonl"), "utf8")).toBe(raw);
+    } finally { retention.close(); }
+  });
 
   it("does not repeat exit/removal status proofs for an already bounded historical event log", () => {
     const dir = root(), run = make(dir, "history-0", "completed");

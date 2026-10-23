@@ -2,6 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { hostedOnly } from "../scripts/hosted-only.mjs";
 import { ActorLogStore, ActorRunArchiveRefusedError } from "../src/actors/log-store.js";
 import { ActorManager } from "../src/actors/manager.js";
 import { AgentManager } from "../src/agents/manager.js";
@@ -13,6 +14,7 @@ import { MeshStore } from "../src/mesh/store.js";
 // Only model work is replaced by the existing process worker fixture; permissions, copies, fsyncs and deletion are real.
 interface Fixture { root: string; volume: string; mesh: MeshStore; actors: ActorManager; agents: AgentManager }
 const fixtures: Fixture[] = [];
+const HOSTED_ARCHIVES = hostedOnly("outside-TMPDIR actor run archive custody tests");
 beforeEach(() => {
   for (const key of ["PI_FABRIC_DEPTH", "PI_FABRIC_BUDGET", "PI_FABRIC_BUDGET_FILE", "PI_FABRIC_BUDGET_ID",
     "PI_FABRIC_ACTOR_SESSION_FILE", "PI_FABRIC_RUN_ROOT"]) vi.stubEnv(key, undefined);
@@ -27,14 +29,14 @@ afterEach(async () => {
   vi.restoreAllMocks(); vi.unstubAllEnvs();
 });
 
-function fixture(): Fixture {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "actor-run-archive-custody-"));
+function fixture(outsideTmp = false): Fixture {
+  const root = fs.mkdtempSync(path.join(outsideTmp ? os.homedir() : os.tmpdir(), "actor-run-archive-custody-"));
   const volume = path.join(root, "volume"), meshRoot = path.join(volume, "mesh");
   fs.mkdirSync(volume, { mode: 0o700 });
   const mesh = new MeshStore(meshRoot, 64 * 1024, 100);
   const agents = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, runner: "pi", transport: "process",
     model: "test/archive", deniedModels: [], budgetUsd: 0, retainRuns: false, sessionExport: false, extensions: false,
-  }, { runRoot: path.join(root, "runs"), workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
+  }, { runRoot: path.join(root, "runs"), meshRoot, workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
     preparePiModel: async model => model });
   const identity = { id: "session:archive-test", name: "Main", kind: "main" as const, sessionId: "archive-test" };
   const actors = new ActorManager(identity.sessionId, identity, mesh,
@@ -68,8 +70,8 @@ describe("actor archive custody through real filesystem cleanup", () => {
     expect(logged).toHaveBeenCalledWith("src/actors/manager.ts", expect.stringContaining("writable by group or others"));
   });
 
-  it("copies a verified archive before real cleanup removes a successful source", async () => {
-    const f = fixture(), actor = await create(f);
+  it.skipIf(!HOSTED_ARCHIVES)("copies a verified archive before real cleanup removes a successful source", async () => {
+    const f = fixture(true), actor = await create(f);
     const retain = vi.spyOn(ActorLogStore.prototype, "retainRun"), cleanup = vi.spyOn(f.agents, "cleanup");
     const result = await f.actors.ask(actor.id, "Complete this run."); await idle(f);
     const source = retain.mock.calls.find(([, id]) => id === result.runId)![2]!;
@@ -81,8 +83,8 @@ describe("actor archive custody through real filesystem cleanup", () => {
     expect(f.actors.status(actor.id).pendingRunArchives).toBe(0);
   });
 
-  it.skipIf(process.platform === "win32")("keeps a refused prior run through later successful activations, then retries and cleans it", async () => {
-    const f = fixture(), actor = await create(f);
+  it.skipIf(!HOSTED_ARCHIVES || process.platform === "win32")("keeps a refused prior run through later successful activations, then retries and cleans it", async () => {
+    const f = fixture(true), actor = await create(f);
     const cleanup = vi.spyOn(f.agents, "cleanup");
     fs.chmodSync(f.volume, 0o777);
     const a = await f.actors.ask(actor.id, "First run."); await idle(f);
@@ -106,8 +108,8 @@ describe("actor archive custody through real filesystem cleanup", () => {
     expect(f.actors.status(actor.id).pendingRunArchives).toBe(0);
   }, 30000);
 
-  it.skipIf(process.platform === "win32").each([false, true])("close keeps custody unless the archive really succeeds (repair=%s)", async repair => {
-    const f = fixture(), actor = await create(f);
+  it.skipIf(!HOSTED_ARCHIVES || process.platform === "win32").each([false, true])("close keeps custody unless the archive really succeeds (repair=%s)", async repair => {
+    const f = fixture(true), actor = await create(f);
     const retain = vi.spyOn(ActorLogStore.prototype, "retainRun");
     const logged = vi.spyOn(diagnostics, "error");
     fs.chmodSync(f.volume, 0o777);

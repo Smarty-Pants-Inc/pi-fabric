@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { archiveRunSessionTraces, isTraceArchivePath } from "../storage/retention.js";
 
 const RETRYABLE_RM_CODES = new Set(["ENOTEMPTY", "EBUSY", "EPERM", "EMFILE"]);
 const RM_RETRY_BACKOFF_MS = 5;
@@ -19,7 +20,14 @@ const defaultRemove: RemoveFn = (target, options) => fs.promises.rm(target, opti
  * so agent cleanup and shutdown do not flake on that race. The `rm`
  * argument is a seam for tests; production callers omit it.
  */
-export const removeTree = async (target: string, rm: RemoveFn = defaultRemove): Promise<void> => {
+export const removeTree = async (target: string, rm: RemoveFn = defaultRemove, meshRoot?: string): Promise<void> => {
+  if (isTraceArchivePath(target, meshRoot)) throw new Error("durable session trace archives are excluded from cleanup");
+  let stat: fs.Stats | undefined;
+  try { stat = fs.lstatSync(target); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+  if (stat?.isDirectory() && !stat.isSymbolicLink() && !archiveRunSessionTraces(target, undefined, meshRoot)) {
+    throw new Error("raw session trace archive failed; recursive cleanup refused");
+  }
   for (let attempt = 0; attempt < RM_MAX_ATTEMPTS; attempt++) {
     try {
       await rm(target, { recursive: true, force: true });

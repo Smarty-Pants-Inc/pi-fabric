@@ -39,6 +39,8 @@ const contained = (root, target) => {
 const assertIsolated = () => {
   const root = path.dirname(process.env.PI_CODING_AGENT_DIR);
   assert(root !== sentinel && !contained(sentinel, root), "test root must not be inside the inherited fleet sentinel");
+  const processTemp = fs.realpathSync(process.env.TMPDIR);
+  assert(!contained(processTemp, fs.realpathSync(root)), "test mesh roots must be outside the process TMPDIR");
   for (const key of keys) {
     assert(process.env[key], key + " must be explicitly isolated, not defaulted");
     assert(contained(root, process.env[key]), key + " inherited a fleet path");

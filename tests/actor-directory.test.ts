@@ -1,7 +1,9 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { hostedOnly } from "../scripts/hosted-only.mjs";
 import { ActorDirectory } from "../src/actors/directory.js";
 import { SessionActorOrphans } from "../src/actors/session-orphans.js";
 import { GlobalActorRegistry } from "../src/actors/global-registry.js";
@@ -12,6 +14,7 @@ import type { FabricInvocationContext } from "../src/protocol.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
+import { runSessionTraceArchivePath } from "../src/storage/retention.js";
 
 // smarty-dev#8090, follow-up smarty-dev#11335: Linux, Darwin and Windows support the Main publication fence.
 // Only unsupported platforms resolve removal with this named refusal pending and the tree kept.
@@ -19,6 +22,7 @@ const UNSUPPORTED_PLATFORM = process.platform !== "linux" && process.platform !=
 const REFUSAL = `Root actor tree deletion needs the Main publication fence, which this platform \\(${process.platform}\\) lacks \\(smarty-dev#8090\\); follow-up smarty-dev#11335; the root session:alpha actor tree is kept`;
 const UNSUPPORTED_PLATFORM_PENDING = new RegExp(`^removal cleanup failed: ${REFUSAL} \\(a later remove or host start finishes it\\)$`);
 const roots: string[] = [];
+const HOSTED_ARCHIVES = hostedOnly("outside-TMPDIR actor trace archive tests");
 const directories: ActorDirectory[] = [];
 const agents: AgentManager[] = [];
 
@@ -26,6 +30,7 @@ const open = (
   root: string,
   sessionId: string,
   options: { persistent?: boolean; meshCursorPath?: string; canManageActor?: (id: string) => boolean | undefined } = {},
+  meshRoot = path.join(root, "mesh"),
 ) => {
   const identity: MeshIdentity = {
     id: `session:${sessionId}`,
@@ -38,10 +43,10 @@ const open = (
     runRoot: path.join(root, `runs-${sessionId}-${agents.length}`),
   });
   agents.push(manager);
-  const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
+  const mesh = new MeshStore(meshRoot, 64 * 1024, 100);
   const actorRoots = {
-    project: path.join(root, "mesh", "actors"),
-    session: path.join(root, "mesh", "actors", sessionId),
+    project: path.join(meshRoot, "actors"),
+    session: path.join(meshRoot, "actors", sessionId),
   };
   const directory = new ActorDirectory([
     sessionId,
@@ -59,7 +64,7 @@ const open = (
     },
   ], actorRoots, "project");
   directories.push(directory);
-  return { directory, actorRoots, mesh, manager };
+  return { directory, actorRoots, mesh, manager, meshRoot };
 };
 
 afterEach(async () => {
@@ -69,6 +74,28 @@ afterEach(async () => {
 });
 
 describe("ActorDirectory", () => {
+  it.skipIf(UNSUPPORTED_PLATFORM || !HOSTED_ARCHIVES)("archives every raw session transcript before actor-root close cleanup", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-directory-trace-close-"));
+    const meshRoot = fs.mkdtempSync(path.join(os.userInfo().homedir, ".pi-fabric-directory-mesh-"));
+    roots.push(root, meshRoot);
+    const { directory } = open(root, "trace-close", { persistent: false }, meshRoot);
+    const project = await directory.create({ scope: "project", name: "trace-project", instructions: "Work." });
+    const session = await directory.create({ scope: "session", name: "trace-session", instructions: "Work." });
+    const projectRoot = path.dirname(path.dirname(project.sessionFile!));
+    const sessionRoot = path.dirname(path.dirname(session.sessionFile!));
+    const projectTrace = "project raw transcript\n";
+    const sessionTrace = "session raw transcript\n";
+    fs.writeFileSync(project.sessionFile!, projectTrace);
+    fs.writeFileSync(session.sessionFile!, sessionTrace);
+    await directory.close();
+    const archiveName = (directory: string) => `actor-root-${createHash("sha256").update(path.resolve(directory)).digest("hex").slice(0, 24)}`;
+    const projectArchive = runSessionTraceArchivePath(meshRoot, projectRoot, archiveName(projectRoot));
+    const sessionArchive = runSessionTraceArchivePath(meshRoot, sessionRoot, archiveName(sessionRoot));
+    expect(fs.existsSync(projectRoot)).toBe(false);
+    expect(fs.existsSync(sessionRoot)).toBe(false);
+    expect(fs.readFileSync(path.join(projectArchive, project.id, "session.jsonl"), "utf8")).toBe(projectTrace);
+    expect(fs.readFileSync(path.join(sessionArchive, session.id, "session.jsonl"), "utf8")).toBe(sessionTrace);
+  });
   // #6087 admission data safety: session mutations must reach the secondary
   // manager, not silently change the project registry or lose its subscriptions.
   it.each(["project", "session"] as const)("forwards setTopics to the %s owner and persists only that registry", async scope => {
@@ -91,6 +118,22 @@ describe("ActorDirectory", () => {
     expect(restored.status(target.id)).toMatchObject({ id: target.id, scope, topics: [] });
     expect(restored.status(other.id).topics).toEqual(other.topics);
   });
+  it.skipIf(UNSUPPORTED_PLATFORM || !HOSTED_ARCHIVES)("archives a removed actor session before deleting its actor directory", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-directory-trace-remove-"));
+    const meshRoot = fs.mkdtempSync(path.join(os.userInfo().homedir, ".pi-fabric-directory-mesh-"));
+    roots.push(root, meshRoot);
+    const { directory } = open(root, "trace-remove", {}, meshRoot);
+    const actor = await directory.create({ scope: "project", name: "trace-remove", instructions: "Work." });
+    const sessionDir = path.dirname(actor.sessionFile!);
+    const trace = "actor removal raw session\n";
+    fs.writeFileSync(actor.sessionFile!, trace);
+    await expect(directory.remove(actor.id)).resolves.toMatchObject({ removed: true });
+    const archiveName = `actor-session-${createHash("sha256").update(sessionDir).digest("hex").slice(0, 24)}`;
+    expect(fs.existsSync(sessionDir)).toBe(false);
+    const archive = runSessionTraceArchivePath(meshRoot, sessionDir, archiveName);
+    expect(fs.readFileSync(path.join(archive, "session.jsonl"), "utf8")).toBe(trace);
+  });
+
   it("#6087 routes guest setTopics through the real provider to a secondary session actor and a global template", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-provider-topics-"));
     roots.push(root);

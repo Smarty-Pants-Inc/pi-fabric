@@ -13,6 +13,7 @@ import {
 import { GlobalActorRegistry } from "../src/actors/global-registry.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore, type MeshEvent, type MeshIdentity } from "../src/mesh/store.js";
+import { testTempRoot } from "./helpers/test-temp-root.js";
 
 // Real queued-item envelopes from fleet run records (smarty-dev#1579 item 4).
 const fixture = JSON.parse(fs.readFileSync(path.resolve("tests/fixtures/activation-filter-envelopes.json"), "utf8")) as {
@@ -219,7 +220,7 @@ afterEach(async () => {
 });
 const identity: MeshIdentity = { id: "session:test", name: "main", kind: "main", sessionId: "test" };
 const from: MeshIdentity = { id: "session:forwarder", name: "forwarder", kind: "main", sessionId: "forwarder" };
-const setup = (root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-activation-filter-")), actorQueueLimit = DEFAULT_FABRIC_CONFIG.mesh.actorQueueLimit) => {
+const setup = (root = testTempRoot("pi-fabric-activation-filter-"), actorQueueLimit = DEFAULT_FABRIC_CONFIG.mesh.actorQueueLimit) => {
   if (!roots.includes(root)) roots.push(root);
   const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
   const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {

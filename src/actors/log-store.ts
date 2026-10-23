@@ -127,7 +127,7 @@ interface ActorLogTarget {
 /** Archive I/O and message bounds only; ownership and sweep eligibility stay with the manager. */
 export class ActorLogStore {
   constructor(
-    readonly mesh: Pick<MeshStore, "maxEventBytes">,
+    readonly mesh: Pick<MeshStore, "maxEventBytes"> & Partial<Pick<MeshStore, "root">>,
     readonly config: Pick<FabricMeshConfig, "eventContextChars">,
     readonly retention: Pick<FabricRetentionConfig, "actorRunArchiveMs"> &
       Partial<Pick<FabricRetentionConfig, "terminalRunEventsAgeMs" | "terminalRunEventsMaxBytes">>,
@@ -177,9 +177,13 @@ export class ActorLogStore {
   }
 
   pruneRuns(actor: ActorLogTarget, now = Date.now()): void {
-    pruneActorSessionBackups(actor.sessionFile);
+    const actorDirectory = path.dirname(path.resolve(actor.sessionFile));
+    const actorsAt = actorDirectory.lastIndexOf(`${path.sep}actors${path.sep}`);
+    const meshRoot = this.mesh.root ?? (actorsAt > 0 ? actorDirectory.slice(0, actorsAt) : undefined);
+    pruneActorSessionBackups(actor.sessionFile, { ...(meshRoot ? { meshRoot } : {}) });
     pruneActorRunArchives({
       runsDirectory: path.join(path.dirname(actor.sessionFile), "runs"),
+      ...(meshRoot ? { meshRoot } : {}),
       ...(actor.lastRunId ? { latestRunId: actor.lastRunId } : {}),
       retentionMs: this.retention.actorRunArchiveMs,
       ...(this.retention.terminalRunEventsAgeMs !== undefined

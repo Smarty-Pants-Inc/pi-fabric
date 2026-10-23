@@ -2,9 +2,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { hostedOnly } from "../scripts/hosted-only.mjs";
 import { MESH_RETENTION_APPLY_DISABLED_CODE, MeshRetentionApplyDisabledError, summaryLines, sweepMeshRetention } from "../src/storage/retention-cli.js";
 import { MeshStore } from "../src/mesh/store.js";
-import { claimMeshRetentionSweep, MESH_RETENTION_SWEEP_PREFIX, recordMeshRetentionSweeper, removeUnreferencedRun, startLockedMeshRetentionSweep } from "../src/storage/retention.js";
+import { claimMeshRetentionSweep, MESH_RETENTION_SWEEP_PREFIX, recordMeshRetentionSweeper, removeUnreferencedRun, runSessionTraceArchivePath, startLockedMeshRetentionSweep } from "../src/storage/retention.js";
 import { spawn, type ChildProcess } from "node:child_process";
 import { ActorManager, FABRIC_RETENTION_SWEEP_LOCK_ALARM_TOPIC, MESH_RETENTION_SWEEP_INTERVAL_MS } from "../src/actors/manager.js";
 import { AgentManager } from "../src/agents/manager.js";
@@ -16,6 +17,7 @@ import { appendResidentLog } from "../src/residency/launcher.js";
 const DAY = 24 * 60 * 60 * 1_000;
 const NOW = Date.now();
 const roots: string[] = [];
+const HOSTED_ARCHIVES = hostedOnly("outside-TMPDIR mesh trace archive tests");
 afterEach(() => { vi.restoreAllMocks(); for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
 const write = (file: string, data: string) => { fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, data); };
 const tmp = (prefix: string) => { const root = fs.mkdtempSync(path.join(os.tmpdir(), prefix)); roots.push(root); return root; };
@@ -55,14 +57,13 @@ const deadRootMesh = (actorStatus = "idle") => {
 // MeshRetentionApplyDisabledError before it reads the mesh; pi-fabric#1014 SEC P2-1).
 // Each fence still decides what the plan lists; `applied` names the plan.
 describe("mesh-wide age-based run retention", () => {
-  // Dry run (smarty-dev#7916): the plan lists what an apply would remove; the disk is unchanged.
-  it("plans a dead root's old terminal runs, keeps its latest, in-flight and young runs, and caps .bak files", async () => {
+  // Dry run (smarty-dev#7916): the plan lists safe retention work; raw session backups are kept, and disk is unchanged.
+  it("plans a dead root's old terminal runs, keeps latest/in-flight/young runs and every session backup", async () => {
     const mesh = deadRootMesh();
     const plan = await sweepMeshRetention(mesh.root, { now: NOW, dryRun: true, runRetentionMs: 7 * DAY });
     expect(plan.skipped).toEqual([]);
     expect(plan.removedRuns.sort()).toEqual([mesh.old, mesh.orphan].sort());
-    expect(plan.changes.map(change => change.path).filter(file => file.endsWith(".bak")).sort()).toEqual(
-      ["20260920T150000000Z", "20260921T150000000Z"].map(stamp => path.join(mesh.actor, `session.jsonl.${stamp}.bak`)));
+    expect(plan.changes.map(change => change.path).filter(file => file.endsWith(".bak"))).toEqual([]);
     for (const kept of [mesh.old, mesh.orphan, mesh.latest, mesh.young, mesh.inflight]) expect(fs.existsSync(path.join(kept, "reply.json"))).toBe(true);
     expect(fs.readdirSync(mesh.actor).filter(name => name.endsWith(".bak"))).toHaveLength(3);
   });
@@ -645,20 +646,25 @@ describe("final pre-delete check fences", () => {
     expect(fs.existsSync(path.join(resident, "reply.json"))).toBe(true);
   });
 
-  it.skipIf(process.platform !== "linux")("re-checks after the graveyard move and restores a run referenced in between", () => {
+  it.skipIf(process.platform !== "linux" || !HOSTED_ARCHIVES)("re-checks after the graveyard move and restores a run referenced in between", () => {
     const runs = tmp("fabric-tombstone-");
+    const meshRoot = fs.mkdtempSync(path.join(os.userInfo().homedir, ".pi-fabric-tombstone-mesh-"));
+    roots.push(meshRoot);
     const target = run(path.join(runs, "target"), { status: "completed", finishedAt: 1 });
     const judged = () => fs.lstatSync(target);
+    const remove = (referenced?: () => boolean, dryRun = false) =>
+      removeUnreferencedRun(target, judged(), referenced, dryRun, "removeUnreferencedRun", 0, false, meshRoot);
     let calls = 0;
-    expect(removeUnreferencedRun(target, judged(), () => ++calls > 1)).toBe(false);
+    expect(remove(() => ++calls > 1)).toBe(false);
     expect(calls).toBe(2);
     expect(fs.readdirSync(runs)).toEqual(["target"]);
     expect(fs.readFileSync(path.join(target, "reply.json"), "utf8")).toBe('{"text":"done"}');
-    expect(removeUnreferencedRun(target, judged(), () => { throw new Error("unreadable"); })).toBe(false);
-    expect(removeUnreferencedRun(target, judged(), () => false, true)).toBe(true);
+    expect(remove(() => { throw new Error("unreadable"); })).toBe(false);
+    expect(remove(() => false, true)).toBe(true);
     expect(fs.readdirSync(runs)).toEqual(["target"]);
-    expect(removeUnreferencedRun(target, judged(), () => false)).toBe(true);
+    expect(remove(() => false)).toBe(true);
     expect(fs.readdirSync(runs)).toEqual([]);
+    expect(fs.existsSync(path.join(runSessionTraceArchivePath(meshRoot, target), "events.jsonl"))).toBe(true);
   });
 });
 
@@ -833,15 +839,14 @@ describe.skipIf(process.platform !== "linux")("apply disabled at the public boun
     return { mesh, resident };
   };
 
-  it("plans expired, unreferenced runs and old backups, keeps latest, in-flight and young; apply rejects and changes nothing", async () => {
+  it("plans expired, unreferenced runs but keeps every session backup; apply rejects and changes nothing", async () => {
     const { mesh, resident } = await withState();
     const before = tree(mesh.root);
     const plan = await sweepMeshRetention(mesh.root, { now: NOW, dryRun: true, runRetentionMs: 7 * DAY });
     expect(tree(mesh.root)).toEqual(before);
     expect(plan.summary.applyRefusal).toBeUndefined();
     expect(plan.removedRuns.sort()).toEqual([mesh.old, mesh.orphan, resident].sort());
-    expect(plan.changes.map(change => change.path)).toEqual(expect.arrayContaining([
-      path.join(mesh.actor, "session.jsonl.20260920T150000000Z.bak"), path.join(mesh.actor, "session.jsonl.20260921T150000000Z.bak")]));
+    expect(plan.changes.map(change => change.path).filter(file => file.endsWith(".bak"))).toEqual([]);
     await expect(sweepMeshRetention(mesh.root, { now: NOW, dryRun: false, runRetentionMs: 7 * DAY }))
       .rejects.toBeInstanceOf(MeshRetentionApplyDisabledError);
     expect(tree(mesh.root)).toEqual(before);

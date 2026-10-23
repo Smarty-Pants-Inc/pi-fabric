@@ -30,7 +30,7 @@ import {
 } from "./handover.js";
 import { kernelFenceAvailable } from "./file-lock.js";
 import { assertNoWatchdogCustody } from "./watchdog-custody.js";
-import { runTreeExitVeto, runTreeResourceVeto } from "../storage/retention.js";
+import { removeUnreferencedRun, runTreeExitVeto, runTreeResourceVeto } from "../storage/retention.js";
 import type { FabricOwnedModelGuidance } from "../components/model-guidance.js";
 import type { FabricMainAgentTarget } from "../main-agent.js";
 import { MeshStore, meshOutageAlarmSink, type MeshStateEntry } from "../mesh/store.js";
@@ -869,7 +869,8 @@ export class ResidencyClient {
     }
     // A proven absent tree has no descendant files left to remove (saved-result
     // cleanup). Other stat errors fail closed; every existing tree needs strict exit evidence.
-    const runDirectoryPresent = fs.lstatSync(metadata.runDirectory, { throwIfNoEntry: false }) !== undefined;
+    const runDirectoryStat = fs.lstatSync(metadata.runDirectory, { throwIfNoEntry: false });
+    const runDirectoryPresent = runDirectoryStat !== undefined;
     const exitVeto = runDirectoryPresent ? runTreeExitVeto(metadata.runDirectory, 0, undefined, true) : undefined;
     if (exitVeto) {
       throw new Error(
@@ -910,7 +911,10 @@ export class ResidencyClient {
         commit();
       }
       throwIfAborted(signal);
-      if (runDirectoryPresent) fs.rmSync(metadata.runDirectory, { recursive: true, force: true });
+      if (runDirectoryPresent && !removeUnreferencedRun(metadata.runDirectory, runDirectoryStat, undefined, false, "residentClientCleanup", 0, false,
+        this.options.config.meshRoot)) {
+        throw new Error("resident cleanup refused; run tree or raw session trace archive could not be verified");
+      }
       fs.rmSync(this.#metadataPath(metadata.id), { force: true });
       fs.rmSync(residentResultPath(this.options.config.residencyRoot, metadata.id), { force: true });
       this.#completions.forget(metadata.id);

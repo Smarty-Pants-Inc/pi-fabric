@@ -2,8 +2,8 @@ import { Buffer } from "node:buffer";
 import { Readable } from "node:stream";
 import { setTimeout as sleep } from "node:timers/promises";
 import {
-  JetStreamApiError,
   JetStreamApiCodes,
+  JetStreamApiError,
   type ConsumerMessages,
   type JsMsg,
   type JetStreamClient,
@@ -69,6 +69,8 @@ export interface NatsTransportOptions extends NatsPermissionPolicy {
   readonly hostId: string;
   readonly name?: string;
   readonly org?: string;
+  /** Configured host event subjects accepted as additive publish grants. */
+  readonly eventOrgs?: readonly string[];
   /** Scoped runtime agent credentials; verified against the exact USER.INFO scope. */
   readonly credentials: string;
   readonly tls?: TlsOptions;
@@ -94,6 +96,7 @@ export interface NatsTransportOptions extends NatsPermissionPolicy {
 type OpenOptions = NatsTransportOptions | FabricTransportOptions;
 type ResolvedNatsOptions = Required<Pick<NatsTransportOptions, "servers" | "machine" | "hostId" | "credentials" | "custodyStream" | "livenessStream" | "pathBMachines" | "maxBytes" | "maxMessageBytes" | "duplicateWindowMs" | "requestTimeoutMs" | "provision" | "ephemeralHost" | "ephemeralInactiveSeconds" | "inboxMaxAgeMs" | "replicas">> & {
   readonly org?: string;
+  readonly eventOrgs?: readonly string[];
   readonly name?: string;
   readonly tls?: TlsOptions;
   readonly events: boolean;
@@ -123,6 +126,7 @@ const normalizeOptions = (options: OpenOptions): ResolvedNatsOptions => {
       livenessStream: options.livenessStream,
       pathBMachines: options.pathBMachines,
       ...(options.org === undefined ? {} : { org: options.org }),
+      ...(options.eventOrgs === undefined ? {} : { eventOrgs: options.eventOrgs }),
       ...(options.tls === undefined ? {} : { tls: options.tls }),
       maxBytes: options.maxBytes ?? DEFAULT_MAX_BYTES,
       replicas: options.replicas === undefined ? 1 : options.replicas,
@@ -141,7 +145,7 @@ const normalizeOptions = (options: OpenOptions): ResolvedNatsOptions => {
   }
   const config = options.config as unknown as { nats?: {
     servers?: string | readonly string[]; machine?: string; credentials?: string;
-    custodyStream?: string; livenessStream?: string; pathBMachines?: readonly string[]; org?: string; tls?: TlsOptions;
+    custodyStream?: string; livenessStream?: string; pathBMachines?: readonly string[]; org?: string; eventOrgs?: readonly string[]; tls?: TlsOptions;
     ephemeralHost?: boolean; ephemeralInactiveSeconds?: number; inboxMaxAgeMs?: number; events?: boolean; provision?: boolean; replicas?: number;
   } };
   const nats = config.nats;
@@ -164,6 +168,7 @@ const normalizeOptions = (options: OpenOptions): ResolvedNatsOptions => {
     livenessStream: nats?.livenessStream as string,
     pathBMachines: nats?.pathBMachines as readonly string[],
     ...(nats?.org === undefined ? {} : { org: nats.org }),
+    ...(nats?.eventOrgs === undefined ? {} : { eventOrgs: nats.eventOrgs }),
     ...(nats?.tls === undefined ? {} : { tls: nats.tls }),
     maxBytes: DEFAULT_MAX_BYTES,
     replicas: nats?.replicas === undefined ? 1 : nats.replicas,
@@ -242,6 +247,7 @@ const openNatsSession = async (options: ResolvedNatsOptions, signal?: AbortSigna
     pathBMachines: options.pathBMachines,
     events: options.events,
     ...(options.org === undefined ? {} : { org: options.org }),
+    ...(options.eventOrgs === undefined ? {} : { eventOrgs: options.eventOrgs }),
     ...(options.tls === undefined ? {} : { tls: options.tls }),
     timeoutMs: options.requestTimeoutMs,
     ...(signal === undefined ? {} : { signal }),
@@ -306,7 +312,8 @@ const authorizationFailure = (error: unknown): boolean => {
   for (let depth = 0; cause && depth < 6; depth += 1) {
     if (typeof cause === "object" && cause !== null) {
       const candidate = cause as { readonly name?: unknown; readonly code?: unknown; readonly cause?: unknown };
-      if (candidate.name === "NatsAuthorizationError" || candidate.code === "FABRIC_NATS_AUTHORIZATION") return true;
+      if (candidate.name === "NatsAuthorizationError" || candidate.code === "FABRIC_NATS_AUTHORIZATION" ||
+        candidate.code === "FABRIC_CREDENTIAL_OVERBROAD") return true;
       cause = candidate.cause;
     } else break;
   }
@@ -314,21 +321,34 @@ const authorizationFailure = (error: unknown): boolean => {
 };
 
 export class NatsInboxResourceNotFoundError extends TransportInvalidError {
-  constructor(cause: unknown) {
-    super("NATS inbox JetStream stream or consumer was not found", { cause });
+  constructor(cause: unknown, message = "NATS inbox JetStream stream or consumer was not found") {
+    super(message, { cause });
     this.name = "NatsInboxResourceNotFoundError";
   }
 }
 
 /** Converts terminal inbox setup failures to transport errors, preserving their original cause. */
-export const classifyNatsInboxTerminalError = (error: unknown): Error | undefined => {
+export const classifyNatsInboxTerminalError = (
+  error: unknown,
+  resources?: { readonly stream: string; readonly durable: string },
+): Error | undefined => {
   let cause = error;
   for (let depth = 0; cause && depth < 6; depth += 1) {
     if (cause instanceof JetStreamApiError) {
       try {
         const api = cause.apiError();
-        if (api.code === 404 || api.err_code === JetStreamApiCodes.ConsumerNotFound ||
-            api.err_code === JetStreamApiCodes.StreamNotFound) return new NatsInboxResourceNotFoundError(error);
+        const missingStream = api.err_code === JetStreamApiCodes.StreamNotFound;
+        const missingConsumer = api.err_code === JetStreamApiCodes.ConsumerNotFound;
+        // Preserve the legacy bare HTTP 404 classification, but do not treat other
+        // JetStream 404 codes (for example, message-not-found) as missing resources.
+        if (missingStream || missingConsumer || (api.code === 404 && api.err_code === 0)) {
+          const message = resources && api.code === 404 && missingStream
+            ? `NATS inbox stream ${JSON.stringify(resources.stream)} is missing or deleted`
+            : resources && api.code === 404 && missingConsumer
+              ? `NATS inbox durable consumer ${JSON.stringify(resources.durable)} on stream ${JSON.stringify(resources.stream)} is missing or deleted`
+              : undefined;
+          return new NatsInboxResourceNotFoundError(error, message);
+        }
       } catch { /* Preserve classification of the outer error below. */ }
     }
     if (typeof cause !== "object") break;
@@ -911,7 +931,10 @@ class NatsTransportImpl implements FabricTransport {
           }
           } catch (error) {
             if (lifetime.aborted) return;
-            const terminalError = classifyNatsInboxTerminalError(error);
+            const terminalError = classifyNatsInboxTerminalError(error, {
+              stream: this.#stream,
+              durable: consumerPolicy.durable,
+            });
             if (terminalError) {
               diagnostic(terminalError instanceof NatsInboxResourceNotFoundError ?
                 "FABRIC_NATS_INBOX_RESOURCE_NOT_FOUND" : "FABRIC_NATS_INBOX_TERMINAL", "stopped");

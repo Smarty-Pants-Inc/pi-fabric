@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { hostedOnly } from "../scripts/hosted-only.mjs";
 
 const removalIntents = vi.hoisted(() => [] as string[]);
 const sweepIntents = vi.hoisted(() => [] as string[]);
@@ -22,7 +23,7 @@ vi.mock("../src/agents/rm.js", () => ({
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { AgentManager } from "../src/agents/manager.js";
 import type { AgentRunRecord } from "../src/agents/types.js";
-import { sweepTempRunRoots } from "../src/storage/retention.js";
+import { runSessionTraceArchivePath, sweepTempRunRoots } from "../src/storage/retention.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { processAlive } from "../src/storage/scratch.js";
 import { fakeManagerHeapWorker } from "./fixtures/manager-heap-probe.js";
@@ -31,9 +32,10 @@ const managers: AgentManager[] = [];
 const roots: string[] = [];
 const workerPath = path.resolve("tests/fixtures/fake-worker.mjs");
 const nativeTempRoot = os.tmpdir();
+const HOSTED_ARCHIVES = hostedOnly("outside-TMPDIR agent trace archive tests");
 const queuedRollbackIntents: string[] = [];
 
-const fixture = (agents: Partial<typeof DEFAULT_FABRIC_CONFIG.agents> = {}, explicitRoot = false) => {
+const fixture = (agents: Partial<typeof DEFAULT_FABRIC_CONFIG.agents> = {}, explicitRoot = false, durableArchiveRoot = false) => {
   const tempRoot = fs.mkdtempSync(path.join(nativeTempRoot, "agent-prompt-retention-"));
   roots.push(tempRoot);
   // Keep the real managed ownership/sweep path inside this fixture on every host.
@@ -43,12 +45,16 @@ const fixture = (agents: Partial<typeof DEFAULT_FABRIC_CONFIG.agents> = {}, expl
   vi.stubEnv("PI_FABRIC_DEPTH", "0");
   for (const key of ["PI_FABRIC_BUDGET", "PI_FABRIC_BUDGET_FILE", "PI_FABRIC_BUDGET_ID"]) vi.stubEnv(key, undefined);
   const runRoot = explicitRoot ? path.join(tempRoot, "explicit-runs") : undefined;
+  const meshBase = durableArchiveRoot ? os.userInfo().homedir : nativeTempRoot;
+  const meshPrefix = durableArchiveRoot ? ".pi-fabric-agent-prompt-mesh-" : "agent-prompt-mesh-";
+  const meshRoot = fs.mkdtempSync(path.join(meshBase, meshPrefix));
+  roots.push(meshRoot);
   const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, sessionExport: false, ...agents, retainRuns: false }, {
-    workerPath, ...(runRoot ? { runRoot } : {}),
+    workerPath, meshRoot, ...(runRoot ? { runRoot } : {}),
   });
   managers.push(manager);
   const root = runRoot ?? path.join(tempRoot, fs.readdirSync(tempRoot).find(name => name.startsWith("pi-fabric-runs-"))!);
-  return { root, tempRoot, manager };
+  return { root, tempRoot, meshRoot, manager };
 };
 
 // Queued rollback bypasses removeTree. Keep this narrow fence registered through
@@ -126,6 +132,53 @@ describe("Agent prompt retention at manager close (#11663)", () => {
     expect(rawStatus(taskPath)).not.toContain(JSON.stringify(prompt));
     expect(manager.readLog(failed.id).status?.task).toBe("");
     expect(() => manager.listForUi()).not.toThrow();
+  });
+
+  it.skipIf(!HOSTED_ARCHIVES)("archives raw traces before pruning artifacts from a failed terminal run", async () => {
+    const { meshRoot, manager } = fixture({}, false, true);
+    const handle = await manager.spawn({ task: "FAIL_DIRECTIVE\narchive terminal artifacts", transport: "process" });
+    await expect(manager.wait(handle.id)).resolves.toMatchObject({ status: "failed" });
+    const directory = manager.runDirectory(handle.id)!;
+    const traces = new Map([
+      ["events.jsonl", "raw events transcript\n"],
+      ["route-session.jsonl", "raw route transcript\n"],
+      ["session.jsonl", "raw Pi session transcript\n"],
+    ]);
+    for (const [name, content] of traces) fs.writeFileSync(path.join(directory, name), content);
+    const handoff = path.join(directory, "handoff-session");
+    fs.mkdirSync(handoff);
+    fs.writeFileSync(path.join(handoff, "fork-1.jsonl"), "raw handoff transcript\n");
+
+    await manager.close();
+
+    const archive = runSessionTraceArchivePath(meshRoot, directory, handle.id);
+    for (const [name, content] of traces) {
+      expect(fs.existsSync(path.join(directory, name))).toBe(false);
+      expect(fs.readFileSync(path.join(archive, name), "utf8")).toBe(content);
+      expect(removalIntents).not.toContain(path.join(directory, name));
+    }
+    expect(fs.readFileSync(path.join(archive, "handoff-session", "fork-1.jsonl"), "utf8")).toBe("raw handoff transcript\n");
+    expect(fs.readFileSync(path.join(directory, "task.txt"), "utf8")).toContain("archive terminal artifacts");
+  });
+
+  it.skipIf(!HOSTED_ARCHIVES)("keeps a failed terminal tree when raw trace archival fails", async () => {
+    const { manager } = fixture({}, false, true);
+    const handle = await manager.spawn({ task: "FAIL_DIRECTIVE\nkeep trace after archive failure", transport: "process" });
+    await expect(manager.wait(handle.id)).resolves.toMatchObject({ status: "failed" });
+    const directory = manager.runDirectory(handle.id)!;
+    const trace = path.join(directory, "route-session.jsonl");
+    fs.writeFileSync(path.join(directory, "events.jsonl"), "raw events transcript\n");
+    fs.writeFileSync(trace, "raw route transcript\n");
+    const rename = fs.renameSync.bind(fs);
+    const spy = vi.spyOn(fs, "renameSync").mockImplementation((source, target) => {
+      if (String(source) === trace) throw Object.assign(new Error("injected archive failure"), { code: "EIO" });
+      return rename(source, target);
+    });
+    try { await manager.close(); } finally { spy.mockRestore(); }
+    expect(fs.existsSync(directory)).toBe(true);
+    expect(fs.readFileSync(trace, "utf8")).toBe("raw route transcript\n");
+    expect(removalIntents).not.toContain(directory);
+    expect(removalIntents).not.toContain(trace);
   });
 
   // Stop, AbortSignal cancellation and deadline all use the same managed

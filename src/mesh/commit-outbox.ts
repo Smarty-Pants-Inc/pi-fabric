@@ -181,7 +181,8 @@ export class CommitOutbox {
     let retiring = 0;
     for (const [row, version] of this.#done) {
       if (!byRow.has(row)) {
-        staged.push({ kind: "delete", key: row, ifVersion: version, onConflict: "skip" });
+        staged.push({ kind: "delete", key: row, ifVersion: version, onConflict: "skip",
+          condition: () => this.#done.get(row) === version });
         if (++retiring === RETIRE_BATCH_SIZE) break;
       }
     }
@@ -190,7 +191,10 @@ export class CommitOutbox {
 
   #run(staged: readonly StagedEffect[], view: MeshBatchView, halted?: () => boolean): number {
     let ran = 0;
-    for (const row of [...this.#done.keys()]) if (!view.get(row)) this.#done.delete(row);
+    // A late afterCommit may hold an older empty snapshot, not proof that a newer row retired.
+    for (const [row, version] of [...this.#done]) {
+      if (!view.get(row) && view.version(row) >= version) this.#done.delete(row);
+    }
     for (const { row, effect, stamp } of staged) {
       if (halted?.()) return ran;
       if (this.#execute(row, effect.kind, effect.payload, view, false, stamp)) ran += 1;
@@ -235,7 +239,9 @@ export class CommitOutbox {
       const batch = done.slice(start, start + RETIRE_BATCH_SIZE);
       await this.mesh.writeBatch({
         identity: this.identity,
-        ops: batch.map(([key, version]): MeshBatchOperation => ({ kind: "delete", key, ifVersion: version, onConflict: "skip" })),
+        // Selection can precede another replay while this batch waits for state custody.
+        ops: batch.map(([key, version]): MeshBatchOperation => ({ kind: "delete", key, ifVersion: version, onConflict: "skip",
+          condition: () => this.#done.get(key) === version })),
       });
       for (const [key, version] of batch) if (this.#done.get(key) === version) this.#done.delete(key);
     }
@@ -247,15 +253,20 @@ export class CommitOutbox {
     const handler = this.handlers[kind];
     // An unknown kind belongs to another release of this writer: leave its row alone.
     if (!handler) return false;
+    const entry = view.get(row);
+    const version = entry && (stamp === undefined || rowOf(entry.value)?.stamp === stamp) ? entry.version : undefined;
+    // Retrying this recording suspends its old completion proof, including for queued deletes.
+    // Neither an old stamp nor an older execution may invalidate a newer recording's proof.
+    if (version !== undefined && this.#done.get(row) === version) this.#done.delete(row);
     try {
       handler(payload, view, replay);
     } catch {
+      if (version !== undefined && this.#done.get(row) === version) this.#done.delete(row);
       this.#failed.add(row);
       return false;
     }
     this.#failed.delete(row);
-    const entry = view.get(row);
-    if (entry && (stamp === undefined || rowOf(entry.value)?.stamp === stamp)) this.#done.set(row, entry.version);
+    if (version !== undefined && version >= (this.#done.get(row) ?? 0)) this.#done.set(row, version);
     return true;
   }
 }

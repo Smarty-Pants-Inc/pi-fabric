@@ -10,6 +10,7 @@ import { fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai";
 import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager,
   type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { MainAgentController } from "../src/main-agent.js";
+import { meshDeferredSummary } from "../src/core/atomic-write.js";
 import { ActorManager } from "../src/actors/manager.js";
 import { AgentMessageRouter } from "../src/providers/agents-message-router.js";
 import { AgentsProvider } from "../src/providers/agents-provider.js";
@@ -194,6 +195,92 @@ const waitFor = async (check: () => boolean): Promise<void> => {
   while (!check() && Date.now() < until) await new Promise((resolve) => setTimeout(resolve, 10));
   expect(check()).toBe(true);
 };
+
+describe("lossy WAL-cap redaction", () => {
+  const secret = "REVIEW_SYNTHETIC_READER_SECRET";
+  const readerList = `pid 4242 (S, 3m, env REVIEW_ENV=${secret} node --token=${secret}) slot 0`;
+  const refused = () => new MeshStateWalCapError(120 * 1024 * 1024, 96 * 1024 * 1024, readerList, 2);
+  const expectSafeSummary = (summary: string) => {
+    expect(summary).toContain("FABRIC_MESH_STATE_WAL_CAP");
+    expect(summary).toMatch(/sizes (?:are )?not available/i);
+    expect(summary).not.toContain("undefined");
+    expect(summary).not.toContain(secret);
+  };
+  const expectSafeLog = (line: string) => {
+    expect(line).toContain("sizes not available");
+    expect(line).not.toContain("undefined");
+    expect(line).not.toContain(secret);
+  };
+
+  it("redacts a fieldless WAL-cap frame decoded by the real RemoteBridgeSide", async () => {
+    const input = new PassThrough();
+    const output = new PassThrough();
+    const remote = new RemoteBridgeSide(input, output, 1_000);
+    const requestFrame = new Promise<string>(resolve => output.once("data", chunk => resolve(String(chunk))));
+    const call = remote.latestSequence().catch(error => error);
+    try {
+      const request = JSON.parse(await requestFrame) as { id: number; op: string };
+      expect(request.op).toBe("latestSequence");
+      input.write(`${JSON.stringify({ id: request.id, ok: false, error: refused().message })}\n`);
+      const decoded = await call;
+      expect(decoded).toBeInstanceOf(Error);
+      expect(decoded).not.toHaveProperty("code");
+      expectSafeSummary(meshDeferredSummary(decoded));
+    } finally {
+      remote.close(new Error("test complete"));
+    }
+  });
+
+  it("redacts a real serveBridgeAgent refusal in MeshBridge startup logs and keeps timeout backoff", async () => {
+    const { bridge, logs } = setup(undefined, {
+      stopMs: 200,
+      walCapRetryMinMs: 25,
+      agent: store => {
+        const side = new StoreBridgeSide(store, "dev1");
+        vi.spyOn(side, "latestSequence").mockImplementation(async () => { throw refused(); });
+        return side;
+      },
+    });
+    let failure: unknown;
+    const running = bridge.run().catch(error => { failure = error; });
+    try {
+      await waitFor(() => logs.some(line => line.includes("retrying in")));
+      const line = logs.find(entry => entry.includes("retrying in"))!;
+      expect(line).toContain("mesh lock timeout; retrying in 100 ms");
+      expectSafeLog(line);
+    } finally {
+      await bridge.stop();
+      await running;
+    }
+    expect(failure).toBeUndefined();
+  });
+
+  it("redacts a real serveBridgeAgent refusal in forwarding-direction logs", async () => {
+    vi.spyOn(Math, "random").mockReturnValue(0);
+    let readCalls = 0;
+    const { bridge, logs } = setup(undefined, {
+      stopMs: 200,
+      agent: store => {
+        const side = new StoreBridgeSide(store, "dev1");
+        vi.spyOn(side, "read").mockImplementation(async () => { readCalls++; throw refused(); });
+        return side;
+      },
+    });
+    let failure: unknown;
+    const running = bridge.run().catch(error => { failure = error; });
+    try {
+      await waitFor(() => logs.some(line => line.includes("toLocal") && line.includes("retrying in")));
+      const line = logs.find(entry => entry.includes("toLocal") && entry.includes("retrying in"))!;
+      expect(line).toContain("mesh lock timeout (toLocal); retrying in 200 ms");
+      expect(readCalls).toBe(1);
+      expectSafeLog(line);
+    } finally {
+      await bridge.stop();
+      await running;
+    }
+    expect(failure).toBeUndefined();
+  });
+});
 
 // smarty-dev#2129: use the real directory writer, not a state entry moved by hand.
 describe("real participant directory over a pipe", () => {

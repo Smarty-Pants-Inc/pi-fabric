@@ -925,21 +925,25 @@ export const emitMeshJournalAlarm = (alarm: Parameters<typeof meshJournalAlarmLi
 };
 
 /** A log-safe description of a deferred write (pi-fabric#893 round 3). A WAL-cap refusal's message embeds the pinning
- * readers' pids and command lines, which can carry secrets: only its sizes and reader count are logged. */
+ * readers' pids and command lines, which can carry secrets: only its validated sizes and reader count are logged. */
 export const meshDeferredSummary = (error: unknown): string => {
-  if (isMeshIncarnationPending(error) || isMeshSnapshotRetriesExhausted(error) || isMeshLockTimeout(error)) return error.message;
-  if (isMeshStateWalCap(error)) {
+  const details = error as { code?: unknown; message?: unknown } | null | undefined;
+  const code = details?.code;
+  const rawMessage = typeof details?.message === "string" ? details.message : typeof error === "string" ? error : "";
+  // Redaction is broader than retry authorization: the wire can drop fields/prototypes or remap the code to a timeout.
+  if (code === MESH_STATE_WAL_CAP_CODE || rawMessage.includes(MESH_STATE_WAL_CAP_CODE)
+      || rawMessage.includes("Fabric mesh state write refused: the SQLite WAL is ") || rawMessage.includes("WAL readers:")) {
     const capped = error as { walBytes?: unknown; capBytes?: unknown; readerCount?: unknown };
-    const readers = typeof capped.readerCount === "number" ? capped.readerCount : "unknown";
-    if (typeof capped.walBytes !== "number" || !Number.isFinite(capped.walBytes)
-        || typeof capped.capBytes !== "number" || !Number.isFinite(capped.capBytes)) {
+    const readers = typeof capped.readerCount === "number" && Number.isSafeInteger(capped.readerCount) && capped.readerCount >= 0
+      ? capped.readerCount : "unknown";
+    if (typeof capped.walBytes !== "number" || !Number.isFinite(capped.walBytes) || capped.walBytes < 0
+        || typeof capped.capBytes !== "number" || !Number.isFinite(capped.capBytes) || capped.capBytes <= 0) {
       return `FABRIC_MESH_STATE_WAL_CAP (sizes not available); ${readers} WAL reader(s)`;
     }
     return `FABRIC_MESH_STATE_WAL_CAP: the SQLite WAL is ${String(capped.walBytes)} bytes, above the ${String(capped.capBytes)}-byte cap; `
       + `${readers} WAL reader(s)`;
   }
-  const details = error as { code?: unknown; message?: unknown } | null | undefined;
-  const code = details?.code;
+  if (isMeshIncarnationPending(error) || isMeshSnapshotRetriesExhausted(error) || isMeshLockTimeout(error)) return error.message;
   const message = error instanceof Error ? error.message
     : typeof details?.message === "string" ? details.message : String(error);
   const prefix = (typeof code === "string" && code.length > 0) || typeof code === "number" ? `${String(code)}: ` : "";

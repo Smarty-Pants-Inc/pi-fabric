@@ -3778,7 +3778,7 @@ export class MeshBridge {
         }
         retryMs = Math.min(retryMs * 2, LOCK_RETRY_MAX_MS);
         if (!reported) {
-          this.#log(`${error instanceof BridgeMirrorDeferredError ? "bridge mirror degraded" : meshBusyLabel(error)} (${direction}); retrying in ${delay} ms: ${(error as Error).message}`);
+          this.#log(`${error instanceof BridgeMirrorDeferredError ? "bridge mirror degraded" : meshBusyLabel(error)} (${direction}); retrying in ${delay} ms: ${meshDeferredSummary(error)}`);
           reported = true;
         }
       }
@@ -4443,7 +4443,7 @@ export class MeshBridge {
               walCapLoggedAt = now;
             }
           } else if (!reportedTimeout) {
-            this.#log(`${meshBusyLabel(error)}; retrying in ${delay} ms: ${(error as Error).message}`);
+            this.#log(`${meshBusyLabel(error)}; retrying in ${delay} ms: ${meshDeferredSummary(error)}`);
             reportedTimeout = true;
           }
         }

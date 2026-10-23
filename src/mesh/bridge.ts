@@ -1,7 +1,7 @@
 import { copyFabricPrincipal, type FabricPrincipal } from "../fabric-provenance.js";
 import { createHash } from "node:crypto";
 import { isMeshIncarnationPending, isMeshSnapshotRetriesExhausted, isMeshLockTimeout,
-  MESH_INCARNATION_PENDING_CODE, MESH_SNAPSHOT_RETRIES_EXHAUSTED_CODE, MESH_LOCK_TIMEOUT_CODE, meshDeferredSummary } from "../core/atomic-write.js";
+  MESH_INCARNATION_PENDING_CODE, MESH_SNAPSHOT_RETRIES_EXHAUSTED_CODE, MESH_LOCK_TIMEOUT_CODE, MeshSnapshotRetriesExhaustedError, meshDeferredSummary } from "../core/atomic-write.js";
 import { performance as monotonicClock } from "node:perf_hooks";
 import fs from "node:fs";
 import path from "node:path";
@@ -592,7 +592,7 @@ const contentDigest = (value: unknown): string => createHash("sha256").update(JS
 export const BRIDGE_HANDOFF_PREFIX = "topology/handoffs/";
 /** Every state row a held event's ownership check reads (holds(): its records and #reservedNow()). */
 const HELD_STATE_PREFIXES = [HOST_PREFIX, PARTICIPANT_PREFIX, BRIDGE_HANDOFF_PREFIX] as const;
-/** #mirror: plans made before the transaction before the last one plans inside it. */
+/** Maximum stale mirror plans per batch; exhaustion returns to the bridge's busy backoff. */
 const MIRROR_PLAN_ATTEMPTS = 3;
 /** A mirror plan made before the transaction no longer matches its snapshot: roll back, plan again. */
 class MirrorPlanStale extends Error {}
@@ -1074,18 +1074,27 @@ export class StoreBridgeSide implements BridgeSide {
     // mesh, for each bridge: on a busy hub each state write woke every bridge into a full scan under the lock,
     // so the bridges' share grew with the load (the idle spin). It is taken first; the fence then only proves
     // that no such row changed since its revision (the pending writer has committed by then) and that both
-    // file directories kept their stamps. A failed proof takes it again; the last try runs inside the fence.
+    // file directories kept their stamps. All file checks stay OUTSIDE the SQLite fence;
+    // inside it only the state change feed and in-memory watcher generations are consulted.
+    // A failed proof defers to flush's bounded busy backoff, never to an in-fence full scan.
     const files = (): string => `${meshDirectoryStamp(this.store.root, PARTICIPANT_FILE_DIR)}|${meshDirectoryStamp(this.store.root, HOST_LEASE_DIR)}`;
+    const generations = (): string => `${participantDirectoryGeneration(this.store.root)}:${hostLeaseCacheGeneration(this.store.root)}`;
     const capture = (): ReturnType<typeof snapshot> => {
       if (this.store.stateBackend !== "sqlite") return snapshot();
-      for (let attempt = 0; attempt < HELD_FENCE_ATTEMPTS - 1; attempt += 1) {
+      ensureParticipantDirectoryWatch(this.store.root);
+      for (let attempt = 0; attempt < HELD_FENCE_ATTEMPTS; attempt += 1) {
         const revision = this.store.stateRevision();
         const stamps = files();
         const value = snapshot();
-        if (revision !== undefined && this.store.withStateWriteFence(() =>
-          this.store.stateUnchangedSince(revision, HELD_STATE_PREFIXES) && files() === stamps)) return value;
+        const generation = generations();
+        if (files() !== stamps) continue;
+        const proven = revision !== undefined && this.store.withStateWriteFence(() =>
+          this.store.stateUnchangedSince(revision, HELD_STATE_PREFIXES) && generations() === generation);
+        // A synchronous file writer can run before fs.watch delivers its callback. This
+        // post-fence check stays outside SQLite and prevents adopting a false baseline.
+        if (proven && files() === stamps && generations() === generation) return value;
       }
-      return this.store.withStateWriteFence(snapshot);
+      throw new MeshSnapshotRetriesExhaustedError(HELD_FENCE_ATTEMPTS);
     };
     const flush = (): void => {
       queued = false;
@@ -1371,8 +1380,9 @@ export class StoreBridgeSide implements BridgeSide {
    * participant or handoff row changed since (the change feed), no participant file was added, replaced or
    * removed (the directory stamp), the lease files it used are unchanged (each held id's own file; the whole
    * directory when a handoff row exists, since handoffs read every lease), and every held lease is still live.
-   * A failed proof releases the fence and checks again, twice; the third attempt runs the full check in the
-   * fence, as before. admit() still calls holds() for each id inside the fence; after the proof, holds()
+   * A failed proof releases the fence and checks again, at most three times; exhaustion returns to
+   * the caller's busy backoff, never to a full topology scan inside SQLite. admit() still calls holds()
+   * for each id inside the fence; after the proof, holds()
    * answers from the proven pre-check. A link that does not hold an id at the pre-check refuses it without
    * taking the fence (refusing is fail-closed; the caller's one refresh-and-retry still applies). The file
    * backend (no state revision) keeps the full check in its `.lock` passthrough fence, unchanged.
@@ -1381,8 +1391,8 @@ export class StoreBridgeSide implements BridgeSide {
     const identityOf = (id: string): MeshIdentity | undefined => id === from.id ? from : undefined;
     return {
       fence: <R>(commit: () => R): R => {
-        for (let attempt = 0; ; attempt += 1) {
-          const observed = attempt < HELD_FENCE_ATTEMPTS - 1 ? this.#heldObservation(held, from) : undefined;
+        for (let attempt = 0; attempt < HELD_FENCE_ATTEMPTS; attempt += 1) {
+          const observed = this.#heldObservation(held, from);
           const outcome = this.store.withStateWriteFence(() => {
             if (observed !== undefined) {
               if (!(observed.until > this.now() && this.store.stateUnchangedSince(observed.revision, HELD_STATE_PREFIXES) &&
@@ -1394,6 +1404,7 @@ export class StoreBridgeSide implements BridgeSide {
           });
           if (outcome !== HELD_FENCE_STALE) return outcome.value;
         }
+        throw new MeshSnapshotRetriesExhaustedError(HELD_FENCE_ATTEMPTS);
       },
       admit: () => {
         for (const id of held) {
@@ -2075,27 +2086,48 @@ export class StoreBridgeSide implements BridgeSide {
         return { ops, leases, removed, judged: { leases: scan.leases, now: scan.now } };
     };
     let recoveryAttempted = recoveryAlreadyAttempted;
+    // A successful SQLite batch changes only its selected keys. Keep the unconsumed
+    // plan, advancing its proof boundary to that batch's EXACT commit (never a later
+    // head). Rebuilding all 2,500 roots for every 32-root batch was quadratic. Any
+    // external topology/file change still discards this carry and plans afresh.
+    let carry: {
+      filesStamp: string; filesGeneration: number; files: ReturnType<typeof participantFileSnapshot>;
+      leaseSnapshot: ReadonlyMap<string, FabricHostLease>; leaseGeneration: number;
+      early: NonNullable<ReturnType<MeshStore["stateView"]>>;
+      planned: NonNullable<ReturnType<typeof compute>>;
+      handoffEntries: MeshStateEntry[]; hostEntries: MeshStateEntry[]; participantEntries: MeshStateEntry[];
+      outboxEntries: MeshStateEntry[];
+    } | undefined;
+    let lastStale = "external mirror inputs changed";
     for (let attempt = 0; ; attempt += 1) {
+      if (attempt >= MIRROR_PLAN_ATTEMPTS) {
+        const error = new MeshSnapshotRetriesExhaustedError(attempt);
+        error.message += ` (${lastStale})`;
+        throw error;
+      }
+      // No writer or lease gate is held here. Let native heartbeats and watcher callbacks
+      // settle before retrying a stale plan rather than spinning in the microtask queue.
+      if (attempt > 0) await new Promise<void>(resolve => setImmediate(resolve));
       ensureParticipantDirectoryWatch(this.store.root);
-      const filesStamp = meshDirectoryStamp(this.store.root, "participants");
-      const filesGenerationBefore = participantDirectoryGeneration(this.store.root);
-      const files = participantFileSnapshot(this.store.root);
-      const filesGeneration = participantDirectoryGeneration(this.store.root);
-      if (filesGenerationBefore !== filesGeneration) continue;
-      const leaseSnapshot = readHostLeases(this.store.root);
-      const leaseGeneration = hostLeaseCacheGeneration(this.store.root);
-      const early = this.store.stateBackend === "sqlite" ? this.store.stateView()
-        : attempt < MIRROR_PLAN_ATTEMPTS - 1 ? this.store.stateView() : undefined;
+      const filesStamp = carry?.filesStamp ?? meshDirectoryStamp(this.store.root, "participants");
+      const filesGenerationBefore = carry?.filesGeneration ?? participantDirectoryGeneration(this.store.root);
+      const files = carry?.files ?? participantFileSnapshot(this.store.root);
+      const filesGeneration = carry?.filesGeneration ?? participantDirectoryGeneration(this.store.root);
+      if (filesGenerationBefore !== filesGeneration) { carry = undefined; continue; }
+      const leaseSnapshot = carry?.leaseSnapshot ?? readHostLeases(this.store.root);
+      const leaseGeneration = carry?.leaseGeneration ?? hostLeaseCacheGeneration(this.store.root);
+      const early = carry?.early ?? (this.store.stateBackend === "sqlite" ? this.store.stateView()
+        : attempt < MIRROR_PLAN_ATTEMPTS - 1 ? this.store.stateView() : undefined);
       if (this.store.stateBackend === "sqlite" && !early) throw new Error("SQLite bridge mirror requires a revisioned state view");
       const snapshotView = early?.view ?? this.#currentView();
-      const handoffEntries = snapshotView.listAll(BRIDGE_HANDOFF_PREFIX);
+      const handoffEntries = carry?.handoffEntries ?? snapshotView.listAll(BRIDGE_HANDOFF_PREFIX);
       const judgesLeaseLiveness = handoffEntries.length > 0;
-      const planned = halted() ? undefined : compute(snapshotView, files, leaseSnapshot);
+      const planned = halted() ? undefined : carry?.planned ?? compute(snapshotView, files, leaseSnapshot);
       if (halted()) break;
       if (!planned) break;
-      const hostEntries = snapshotView.listAll(HOST_PREFIX);
-      const participantEntries = snapshotView.listAll(PARTICIPANT_PREFIX);
-      const outboxEntries = this.store.listAll(this.#outbox.prefix, { fresh: true });
+      const hostEntries = carry?.hostEntries ?? snapshotView.listAll(HOST_PREFIX);
+      const participantEntries = carry?.participantEntries ?? snapshotView.listAll(PARTICIPANT_PREFIX);
+      const outboxEntries = carry?.outboxEntries ?? this.store.listAll(this.#outbox.prefix, { fresh: true });
       const groups = new Map<string, MeshBatchOperation[]>();
       for (const op of planned.ops) {
         const value = op.kind === "put" ? op.value : snapshotView.get(op.key)?.value;
@@ -2150,20 +2182,23 @@ export class StoreBridgeSide implements BridgeSide {
       const more = planned.ops.length > batchOps.length || leaseCandidates.length > leaseBatch.length ||
         removedCandidates.length > removedBatch.length;
       let preparedLeaseGeneration = leaseGeneration;
-      const externalInputsStable = (identifiers: ReadonlySet<string> = consultedLeaseIdentifiers): boolean => {
+      const externalInputsStable = (identifiers?: ReadonlySet<string>): boolean => {
         if (participantDirectoryGeneration(this.store.root) !== filesGeneration ||
           meshDirectoryStamp(this.store.root, "participants") !== filesStamp) return false;
-        if (process.platform !== "win32" && hostLeaseCacheGeneration(this.store.root) !== leaseGeneration) return false;
+        // Custody acquisition yields once per selected host. Unrelated native heartbeats
+        // can change the directory on every acquisition at fleet scale: rejecting the old
+        // GLOBAL generation here starved every batch forever. Re-read outside state custody
+        // and compare the complete values that can affect this batch (including new aliases
+        // into its ids), then fence the short writer-acquisition gap with the new generation.
         const currentLeases = readHostLeases(this.store.root);
-        const currentGeneration = hostLeaseCacheGeneration(this.store.root);
-        if (process.platform !== "win32" && currentGeneration !== leaseGeneration) return false;
-        preparedLeaseGeneration = currentGeneration;
-        return leaseIncarnationDigest(leaseSnapshot, judgesLeaseLiveness, identifiers) ===
-          leaseIncarnationDigest(currentLeases, judgesLeaseLiveness, identifiers) &&
+        preparedLeaseGeneration = hostLeaseCacheGeneration(this.store.root);
+        return leaseIncarnationDigest(leaseSnapshot, identifiers === undefined, identifiers) ===
+          leaseIncarnationDigest(currentLeases, identifiers === undefined, identifiers) &&
           (!judgesLeaseLiveness || sameLeaseLiveness(leaseSnapshot, planned.judged.now, this.now(), identifiers));
       };
-      if (batchOps.length === 0 && leaseBatch.length === 0 && removedBatch.length === 0) break;
       this.#skippedRoots = skippedRoots;
+      let preparedRevision: string | undefined;
+      let committedRevision = early?.revision;
       try {
         if (!partial && !recoveryAttempted && outboxEntries.length > 0 && planned) {
           const recovered = await this.#recoverOutbox(outboxEntries, halted, () => {
@@ -2172,8 +2207,11 @@ export class StoreBridgeSide implements BridgeSide {
             if (!compute(this.#currentView(), files, leaseSnapshot)) throw new MirrorPlanStale();
           }, leaseSnapshot);
           recoveryAttempted = true;
-          if (recovered) continue;
+          if (recovered) { carry = undefined; attempt = -1; continue; }
         }
+        // A pending unlease can be the ONLY remaining work after its state deletion
+        // committed. Recover it before declaring an otherwise empty pass complete.
+        if (batchOps.length === 0 && leaseBatch.length === 0 && removedBatch.length === 0) break;
 
         const plan = this.#outbox.plan();
         const selectedLeases = new Set(leaseBatch.map(lease => lease.id));
@@ -2232,20 +2270,26 @@ export class StoreBridgeSide implements BridgeSide {
             ops: [],
             // State admission is planned before the writer lock when SQLite can provide a revision.
             // The locked path only validates in-memory filesystem generations and recomputes from
-            // the transaction view on fallback; no participant or host-lease I/O runs in prepare.
+            // the transaction view on the file backend's fallback. SQLite never reads
+            // participant or host-lease files inside prepare.
             prepare: (view) => {
               if (halted()) return plan.stage([], []);
-              if (participantDirectoryGeneration(this.store.root) !== filesGeneration ||
-                hostLeaseCacheGeneration(this.store.root) !== preparedLeaseGeneration) throw new MirrorPlanStale();
+              if (early && (participantDirectoryGeneration(this.store.root) !== filesGeneration ||
+                hostLeaseCacheGeneration(this.store.root) !== preparedLeaseGeneration)) throw new MirrorPlanStale("file generation changed while acquiring SQLite");
               let result: ReturnType<typeof compute>;
               if (early && planned && this.store.stateUnchangedSince(early.revision, HELD_STATE_PREFIXES)) {
                 if (judgesLeaseLiveness && !sameLeaseLiveness(planned.judged.leases, planned.judged.now, this.now(), batchScope)) {
                   throw new MirrorPlanStale();
                 }
                 result = planned;
-              } else if (early) throw new MirrorPlanStale();
-              else result = compute(view, files, leaseSnapshot);
+              } else if (early) throw new MirrorPlanStale("topology changed while acquiring SQLite");
+              else result = compute(view,
+                meshDirectoryStamp(this.store.root, "participants") === filesStamp ? files : participantFileSnapshot(this.store.root),
+                readHostLeases(this.store.root));
               if (!result) return plan.stage([], []);
+              // Capture the actual transaction's PRE-commit boundary, not the earlier
+              // plan's revision (unrelated state commits may have intervened).
+              preparedRevision = early ? this.store.stateRevision() : undefined;
               const deadlines = new Map<string, number>();
               leases = result.leases.filter(lease => selectedLeases.has(lease.id)).map(lease => {
                 const sample = lease.mirror;
@@ -2271,6 +2315,18 @@ export class StoreBridgeSide implements BridgeSide {
             // The outbox is outside state custody. Lease gates remain held until this awaited
             // synchronous drain finishes, so host-lease ownership and version checks stay fenced.
             commitOutbox: (committed) => {
+              // MeshCommitEffects.stamp can already be a later writer's head after
+              // the async adapter yields. SQLite's documented revision is store:epoch:
+              // commit_no and a changing transaction advances it exactly once. Derive
+              // THIS commit from the revision read in prepare, or decline plan reuse
+              // if that format/counter is unavailable. Never adopt committed.stamp.
+              committedRevision = preparedRevision;
+              if (preparedRevision && committed.results.some(result => result.applied)) {
+                const match = /^(.*:)([0-9]+)$/.exec(preparedRevision);
+                const commit = match ? Number(match[2]) : NaN;
+                committedRevision = match && Number.isSafeInteger(commit) && Number.isSafeInteger(commit + 1)
+                  ? `${match[1]}${commit + 1}` : undefined;
+              }
               const expected = new Map<string, number>();
               for (const result of committed.results) if (result.applied) expected.set(result.key, result.version);
               for (const lease of leases) {
@@ -2304,11 +2360,21 @@ export class StoreBridgeSide implements BridgeSide {
         for (const lease of leaseBatch) processedEffects.add(`lease:${lease.id}`);
         for (const gone of removedBatch) processedEffects.add(`unlease:${gone.id}`);
         if (more && !halted()) {
-          await this.#mirror(presence, final, observedAt, fromHub, processedEffects, true);
-          return;
+          carry = early && committedRevision !== undefined ? {
+            filesStamp, filesGeneration, files, leaseSnapshot, leaseGeneration,
+            early: { revision: committedRevision, view: early.view },
+            planned: { ...planned, ops: planned.ops.filter(op => !batchOpKeys.has(op.key)) },
+            handoffEntries, hostEntries, participantEntries, outboxEntries,
+          } : undefined;
+          recoveryAttempted = true;
+          // All custody has been released. A successful batch resets the stale-attempt
+          // budget, not the observation time, and gives native heartbeats a fair turn.
+          await new Promise<void>(resolve => setImmediate(resolve));
+          attempt = -1;
+          continue;
         }
       } catch (error) {
-        if (error instanceof MirrorPlanStale) continue;
+        if (error instanceof MirrorPlanStale) { lastStale = error.message || "external mirror inputs changed"; carry = undefined; continue; }
         throw error;
       } finally {
         this.#skippedRoots = undefined;

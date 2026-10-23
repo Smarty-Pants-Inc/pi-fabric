@@ -696,7 +696,14 @@ export const readHostLeases = (meshRoot: string, problems?: string[]): Map<strin
     } catch (error) {
       failed(dir, error);
       if (state) state.dirtyAll = true;
-      touchHostLeaseDirectory(dir);
+      // Repeated reads of an absent directory are the SAME empty observation, not
+      // fresh unknown changes to every host. Invalidating on each read discarded all
+      // but the last deferred bridge batch before its first lease could be installed.
+      if ((error as NodeJS.ErrnoException)?.code === "ENOENT") {
+        if (known.size > 0 || state?.directoryStamp !== undefined) touchHostLeaseDirectory(dir);
+        known.clear();
+        if (state) { state.directoryStamp = undefined; state.unavailableNames.clear(); }
+      } else touchHostLeaseDirectory(dir);
       return new Map();
     }
     const leases = new Map<string, FabricHostLease>();

@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { hostLeaseCacheGeneration, hostLeasePath, readHostLeases, removeHostLease, writeHostLease, type FabricHostLease } from "../src/topology/host-leases.js";
+import { hostLeaseCacheGeneration, hostLeaseGeneration, hostLeasePath, readHostLeases, removeHostLease, writeHostLease, type FabricHostLease } from "../src/topology/host-leases.js";
 
 // smarty-dev#7978 follow-on: an inotify cache must avoid directory enumeration and per-file stats on clean reads.
 describe.skipIf(process.platform === "win32")("host lease watcher cache", () => {
@@ -66,6 +66,26 @@ describe.skipIf(process.platform === "win32")("host lease watcher cache", () => 
 
     writeHostLease(root, lease("host:0", 3_000));
     expect(hostLeaseCacheGeneration(root)).toBeGreaterThan(before);
+  });
+
+  it("keeps repeated absent-directory observations stable but invalidates a removed directory", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-lease-watch-absent-"));
+    roots.push(root);
+    expect(readHostLeases(root).size).toBe(0);
+    const absent = hostLeaseGeneration(root, "host:pending");
+    readHostLeases(root);
+    readHostLeases(root);
+    expect(hostLeaseGeneration(root, "host:pending")).toBe(absent);
+
+    writeHostLease(root, lease("host:pending", 1_000));
+    expect(readHostLeases(root).get("host:pending")?.updatedAt).toBe(1_000);
+    const present = hostLeaseGeneration(root, "host:pending");
+    fs.rmSync(path.join(root, "host-leases"), { recursive: true, force: true });
+    expect(readHostLeases(root).size).toBe(0);
+    expect(hostLeaseGeneration(root, "host:pending")).not.toBe(present);
+    const removed = hostLeaseGeneration(root, "host:pending");
+    expect(readHostLeases(root).size).toBe(0);
+    expect(hostLeaseGeneration(root, "host:pending")).toBe(removed);
   });
 
   it("refreshes only a new, renewed, or removed lease after its filename event", () => {

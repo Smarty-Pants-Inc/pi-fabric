@@ -105,6 +105,17 @@ statementProto.all = function (this: { sourceSQL: string }, ...args: unknown[]) 
 };
 afterAll(() => { proto.exec = original; statementProto.all = originalAll; });
 
+// Child close and transport completion are the normal lifecycle events. These deadlines are
+// safety nets only: a failed fixture must not leave heartbeats running after Vitest times out.
+const bounded = async <T>(work: Promise<T>, timeoutMs: number, failure: () => string): Promise<T> => {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([work, new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => reject(new Error(failure())), timeoutMs);
+    })]);
+  } finally { if (timer !== undefined) clearTimeout(timer); }
+};
+
 const roots: string[] = [];
 const stores: MeshStore[] = [];
 const children: ChildProcess[] = [];
@@ -118,7 +129,7 @@ afterEach(async () => {
     if (child.exitCode === null && child.signalCode === null) {
       const closed = new Promise<void>(resolve => child.once("close", () => resolve()));
       child.kill("SIGKILL");
-      await closed;
+      await bounded(closed, 2000, () => `Heartbeat child ${child.pid} did not close after SIGKILL`);
     }
   }
   for (const store of stores.splice(0)) store.closeState();
@@ -294,12 +305,15 @@ for (let index = 0; index < count; index++) {
 const initial = identities.map(id => { const lease = readHostLease(root, id); return { id, updatedAt: lease?.updatedAt ?? 0, expiresAt: lease?.expiresAt ?? 0 }; });
 emit({ type: "ready", ids: identities, leases: initial, readyAt: Date.now() });
 const input = createInterface({ input: process.stdin });
-await new Promise(resolve => input.on("line", line => {
-  if (line === "measure") {
-    measuring = true;
-    for (const directory of dirs) void directory.refresh().catch(() => undefined);
-  } else if (line === "stop") resolve();
-}));
+await new Promise(resolve => {
+  input.once("close", resolve); // Parent teardown/EOF must stop heartbeats too, not only a stop line.
+  input.on("line", line => {
+    if (line === "measure") {
+      measuring = true;
+      for (const directory of dirs) void directory.refresh().catch(() => undefined);
+    } else if (line === "stop") resolve();
+  });
+});
 measuring = false;
 input.close();
 await Promise.all(dirs.map(directory => directory.close()));
@@ -308,7 +322,41 @@ emit({ type: "audit", fileOpsInHold, checkpointsInHold, scansInHold });
 `;
 
 describe("bridge catch-up SQLite write-lock holds (smarty-dev#10391), real stores and state.db", () => {
+  it("bridge.stop ends the stdio agent without waiting for a later explicit input.end", async () => {
+    const hub = store(), far = store();
+    await native(hub, "session:stdio-stop-hub");
+    await native(far, "session:stdio-stop-far");
+    const input = new PassThrough(), output = new PassThrough();
+    const serving = serveBridgeAgent(new StoreBridgeSide(far, "hub"), input, output);
+    const remote = new RemoteBridgeSide(output, input, 1000);
+    const bridge = new MeshBridge({ localName: "hub", remoteName: "far", local: new StoreBridgeSide(hub, "far"),
+      remote, cursorPath: path.join(scratch(), "stdio-stop.json"), stopMs: 500 });
+    try {
+      await bridge.start();
+      await bounded(bridge.stop(), 1000, () => "Bridge stop did not settle");
+      // Counterexample to a universal serve/stop deadlock: RemoteBridgeSide.closeGracefully
+      // ends its output (the agent's input), so the server can settle without explicit input.end.
+      expect(input.writableEnded).toBe(true);
+      await bounded(serving, 500, () => "Bridge agent did not finish after its input ended");
+    } finally {
+      remote.close();
+      input.end();
+      output.destroy();
+      await bounded(bridge.stop(), 1000, () => "Bridge stop exceeded teardown deadline");
+      await bounded(serving, 500, () => "Bridge agent exceeded teardown deadline");
+    }
+  }, 5000);
+
   it("restarting agent catches up 500 pending events in <=500 ms holds while 20 Pi heartbeats renew", async () => {
+    // A Promise.race alone cannot interrupt a microtask-only mirror retry. Check a monotonic
+    // deadline through the existing bridge clock seam on every plan as well, leaving teardown
+    // time inside this test's explicit 90-second ceiling. Fleet-sized setup and a second
+    // presence reconciliation are included; production retries remain independently bounded.
+    const operationDeadline = performance.now() + 75_000;
+    const bridgeClock = () => {
+      if (performance.now() >= operationDeadline) throw new Error("Restart catch-up exceeded its 75-second operation deadline");
+      return Date.now();
+    };
     const hub = store(), far = store();
     const localId = await native(hub, "session:agent-restart-hub");
     const remoteId = await native(far, "session:agent-restart-root");
@@ -348,13 +396,19 @@ describe("bridge catch-up SQLite write-lock holds (smarty-dev#10391), real store
     child.stderr.setEncoding("utf8");
     child.stderr.on("data", (chunk: string) => { stderr += chunk; });
     child.once("error", readyReject);
+    child.stdin.on("error", readyReject); // A child that exits early must not cause an unhandled EPIPE.
     const childDone = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(resolve =>
-      child.once("close", (code, signal) => resolve({ code, signal })));
+      child.once("close", (code, signal) => {
+        readyReject(new Error(`Pi heartbeat child closed before ready (${code ?? signal}): ${stderr}`));
+        resolve({ code, signal });
+      }));
     let serving: Promise<void> | undefined;
     let bridge: MeshBridge | undefined;
     let input: PassThrough | undefined;
+    let output: PassThrough | undefined;
     let catchupStartedAt = 0, catchupEndedAt = 0;
-    let fileOpsInHold = 0;
+    let phase: "mirror" | "publication" = "mirror";
+    let mirrorFileOpsInHold = 0, publicationFileOpsInHold = 0;
     const fsTable = fs as unknown as Record<string, (...args: unknown[]) => unknown>;
     const fsNames = ["accessSync", "existsSync", "lstatSync", "mkdirSync", "openSync", "readFileSync", "readdirSync",
       "renameSync", "rmSync", "statSync", "unlinkSync", "writeFileSync", "appendFileSync"];
@@ -362,30 +416,44 @@ describe("bridge catch-up SQLite write-lock holds (smarty-dev#10391), real store
     for (const name of fsNames) {
       const original = fsTable[name]!;
       originalFs.set(name, original);
-      fsTable[name] = (...args) => { if (writesOpen > 0) fileOpsInHold++; return original.apply(fs, args); };
+      fsTable[name] = (...args) => {
+        if (writesOpen > 0) {
+          if (phase === "mirror") mirrorFileOpsInHold++;
+          else publicationFileOpsInHold++;
+        }
+        return original.apply(fs, args);
+      };
     }
     try {
-      const readyTimer = setTimeout(() => readyReject(new Error(`Pi heartbeat child did not start: ${stderr}`)), 30_000);
-      const readyMessage = await ready.finally(() => clearTimeout(readyTimer));
+      const readyMessage = await bounded(ready, Math.max(1, operationDeadline - performance.now()),
+        () => `Pi heartbeat child did not start: ${stderr}`);
       expect(readyMessage.ids).toHaveLength(20);
       input = new PassThrough();
-      const output = new PassThrough();
-      serving = serveBridgeAgent(new StoreBridgeSide(far, "hub"), input, output);
+      output = new PassThrough();
+      serving = serveBridgeAgent(new StoreBridgeSide(far, "hub", bridgeClock), input, output);
       const remote = new RemoteBridgeSide(output, input);
-      bridge = new MeshBridge({ localName: "hub", remoteName: "far", local: new StoreBridgeSide(hub, "far"), remote, cursorPath });
+      bridge = new MeshBridge({ localName: "hub", remoteName: "far", local: new StoreBridgeSide(hub, "far", bridgeClock),
+        remote, cursorPath, stopMs: 500, log: line => {
+          if (line.startsWith("bridge startup")) console.log(JSON.stringify({ scenario: "remote-agent restart", stage: line,
+            elapsedMs: Date.now() - catchupStartedAt, mirroredHosts: far.listAll("topology/hosts/", { fresh: true }).length }));
+        } });
       const batches = countBatches(far);
       holds = [];
       inFenceScans = 0;
       catchupStartedAt = Date.now();
       child.stdin.write("measure\n");
       await bridge.start();
+      console.log(JSON.stringify({ scenario: "remote-agent restart", stage: "presence installed", elapsedMs: Date.now() - catchupStartedAt,
+        mirroredHosts: far.listAll("topology/hosts/", { fresh: true }).length }));
+      phase = "publication";
       const result = await bridge.step();
       catchupEndedAt = Date.now();
       await bridge.stop();
-      child.stdin.write("stop\n");
-      const stopped = await childDone;
+      input.end(); // Do not make the serving join depend solely on remote.closeGracefully's EOF.
+      child.stdin.end("stop\n");
+      const stopped = await bounded(childDone, 2000, () => `Pi heartbeat child did not stop: ${stderr}`);
       expect(stopped.code, stderr).toBe(0);
-      await serving;
+      await bounded(serving, 500, () => "Bridge agent did not finish after bridge.stop()");
       const bridgeHolds = holds.filter(hold => hold.db.includes(far.root));
       const childHolds = messages.filter(message => message.type === "hold" &&
         typeof message.db === "string" && message.db.includes(far.root)).map(message => Number(message.ms));
@@ -404,7 +472,11 @@ describe("bridge catch-up SQLite write-lock holds (smarty-dev#10391), real store
       const maxHoldMs = Math.max(0, ...measuredHolds);
       console.log(JSON.stringify({ scenario: "remote-agent restart", pendingEvents: EVENTS, mirroredRoots: 2500,
         piHeartbeats: heartbeatsById.size, agentTransactions: measuredHolds.length,
-        maxAgentHoldMs: +maxHoldMs.toFixed(2), batches: batches.length, audit }));
+        maxAgentHoldMs: +maxHoldMs.toFixed(2), batches: batches.length, mirrorFileOpsInHold,
+        // Lead-authorized OPTION A: held-publication stat checks and the durable
+        // event append intentionally remain in SQLite custody. Measure, never call
+        // that full path zero-I/O or silently omit its cost.
+        heldPublicationFileOpsInHold: publicationFileOpsInHold, audit }));
       expect(result).toMatchObject({ toRemote: EVENTS, dropped: 0 });
       expect(far.read({ limit: 1000 }).filter(event => event.topic === "fleet.work.hold").map(event => event.text))
         .toEqual(Array.from({ length: EVENTS }, (_, index) => String(index)));
@@ -419,23 +491,31 @@ describe("bridge catch-up SQLite write-lock holds (smarty-dev#10391), real store
         expect(Math.max(0, ...renewalTimes.slice(1).map((time, index) => time - renewalTimes[index]!))).toBeLessThan(5000);
       }
       expect(inFenceScans).toBe(0);
-      expect(fileOpsInHold).toBe(0);
-      expect(audit).toMatchObject({ fileOpsInHold: 0, checkpointsInHold: 0, scansInHold: 0 });
+      expect(mirrorFileOpsInHold).toBe(0);
+      expect(audit).toMatchObject({ checkpointsInHold: 0, scansInHold: 0 });
+      // The independent Pi writer's I/O is reported separately from bridge mirrors.
+      // The full flow's retained ownership-fenced publication I/O is a measured residual.
       expect(Math.max(0, ...batches)).toBeLessThanOrEqual(BATCH_MAX_EVENTS);
     } finally {
-      await bridge?.stop();
-      if (child.exitCode === null && child.signalCode === null) {
-        child.stdin.write("stop\n");
-        const stopped = await childDone;
-        expect(stopped.code, stderr).toBe(0);
+      try {
+        // Stop the independent writer before waiting on a possibly stale mirror, and do not
+        // repeat an unbounded graceful shutdown on the failure path. afterEach retains custody
+        // of the child if this bounded reap itself fails.
+        input?.end();
+        if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+        await bounded(childDone, 2000, () => `Pi heartbeat child did not close during teardown: ${stderr}`);
+        await bounded(bridge?.stop() ?? Promise.resolve(), 500, () => "Bridge stop exceeded teardown deadline");
+        if (serving) await bounded(serving, 500, () => "Bridge agent exceeded teardown deadline");
+      } finally {
+        output?.destroy();
+        for (const [name, original] of originalFs) fsTable[name] = original;
+        if (child.exitCode !== null || child.signalCode !== null) {
+          const index = children.indexOf(child);
+          if (index >= 0) children.splice(index, 1);
+        }
       }
-      if (input && serving) input.end();
-      if (serving) await serving.catch(() => undefined);
-      for (const [name, original] of originalFs) fsTable[name] = original;
-      const index = children.indexOf(child);
-      if (index >= 0) children.splice(index, 1);
     }
-  }, 180_000);
+  }, 90_000);
 
   it("measures toLocal delivery age with 150 lease writes, synchronous versus deferred", async () => {
     const measure = async (deferred: boolean) => {
@@ -661,21 +741,32 @@ describe("bridge catch-up SQLite write-lock holds (smarty-dev#10391), real store
     const bridge = new MeshBridge({ localName: "hub", remoteName: "far", local: side,
       remote: new StoreBridgeSide(far, "hub"), cursorPath: path.join(scratch(), "cursor.json") });
     await bridge.start(); // the recovery pass; later passes plan before their transaction
-    const identity: MeshIdentity = { id: "session:plan-other", name: "other", kind: "main" };
-    await hub.put({ key: `topology/handoffs/${createHash("sha256").update(identity.id).digest("hex")}`, value: { id: identity.id }, identity });
+    const identity = await native(far, "session:plan-other");
+    const handoffKey = `topology/handoffs/${createHash("sha256").update(identity.id).digest("hex")}`;
+    await hub.put({ key: handoffKey, value: { format: 1, id: identity.id, sessionId: "plan-other", link: "far",
+      handedOffAt: Date.now(), operator: "test", hub: "hub" }, identity });
     const writeBatch = hub.writeBatch.bind(hub);
-    let batches = 0;
+    let injected = false;
     hub.writeBatch = (input) => {
-      batches += 1;
-      if (batches === 1 && leaseChanges) {
-        const now = Date.now();
-        writeHostLease(hub.root, { id: identity.id, rootId: identity.id, identityId: identity.id, updatedAt: now, expiresAt: now + 60000, startedAt: now });
+      if (!injected && input.lockClass === "bridge") {
+        injected = true;
+        if (leaseChanges) {
+          const now = Date.now();
+          // A native returning on the handed-off identity voids that grant even
+          // before it installs a state record. A renewal without native evidence
+          // would not establish this counterexample.
+          writeHostLease(hub.root, { id: identity.id, rootId: identity.id, identityId: identity.id,
+            updatedAt: now, expiresAt: now + 60000, startedAt: now,
+            session: { id: "returning-main", startedAt: now, updatedAt: now, expiresAt: now + 60000 } });
+        }
       }
       return writeBatch(input);
     };
     const presence = await new StoreBridgeSide(far, "hub").presence();
     await side.mirror(presence);
-    expect(batches).toBe(leaseChanges ? 2 : 1);
+    expect(injected).toBe(true);
+    expect(side.holds(identity.id)).toBe(!leaseChanges);
+    expect(hub.get(handoffKey, { fresh: true }) !== undefined).toBe(!leaseChanges);
     expect(side.holds("session:plan-spoke")).toBe(true);
     await bridge.stop();
   });
@@ -700,17 +791,23 @@ describe("bridge catch-up SQLite write-lock holds (smarty-dev#10391), real store
     // The moved Main's native lease, live until T0 + 10 s.
     writeHostLease(hub.root, { id, rootId: id, identityId: id, updatedAt: T0, expiresAt: T0 + 10_000, startedAt: T0,
       session: { id: "main-session", startedAt: T0, updatedAt: T0, expiresAt: T0 + 10_000 } });
+    const far = store();
+    await native(far, id);
+    const presence = await new StoreBridgeSide(far, "hub").presence();
     const writeBatch = hub.writeBatch.bind(hub);
-    let batches = 0;
     hub.writeBatch = (input) => {
-      batches += 1;
       clock = T0 + txAt; // time passes (or steps back) between the plan and its transaction
       return writeBatch(input);
     };
-    await side.mirror({ hosts: [], participants: [] });
+    await side.mirror(presence);
     // A native lease live at the transaction's time voids (deletes) the handoff; a dead one keeps it.
     expect(hub.get(key, { fresh: true }) !== undefined).toBe(kept);
-    expect(batches).toBe(2);
+    // The persisted authority outcome is the contract, not a fixed number of
+    // writeBatch calls. The expired native can be replaced by this link's mirror;
+    // the native that becomes live must keep its own session lease instead.
+    expect(readHostLease(hub.root, id)?.rootId).toBe(id);
+    if (!kept) expect(readHostLease(hub.root, id)?.session?.id).toBe("main-session");
+    else expect(readHostLease(hub.root, id)?.mirrorLease).toBe(1);
   });
 
   it("the change-feed proof: other keys pass, a host, participant or handoff row since the revision fails", async () => {

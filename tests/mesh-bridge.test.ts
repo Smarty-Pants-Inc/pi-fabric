@@ -1089,7 +1089,7 @@ describe("mesh bridge", () => {
     }
   });
 
-  it("backs off after the first SQLite ownership-fence refusal without losing or duplicating the event", async () => {
+  it("retries the initial SQLite ownership-fence refusal without losing or duplicating the event", async () => {
     const hub = new MeshStore(scratch(), 64 * 1024, 100, { stateBackend: "sqlite" });
     const { far, bridge, logs } = setup(undefined, { hub, presenceMs: 0, stopMs: 100 });
     const lane = await addRoot(hub, "lane");
@@ -1121,15 +1121,17 @@ describe("mesh bridge", () => {
       });
       let failure: unknown;
       running = bridge.run().catch((error: unknown) => { failure = error; });
+      await waitFor(() => publishTimes.length >= 2);
       await waitFor(() => on(hub, "fleet.work.fence.1").length === 1);
-      await waitFor(() => logs.some((line) => line.includes("retrying")));
       const received = on(hub, "fleet.work.fence.1");
       expect(failFence).toBe(false);
       expect(publishTimes).toHaveLength(2);
-      expect(publishTimes[1]! - publishTimes[0]!).toBeGreaterThanOrEqual(80);
       expect(received).toHaveLength(1);
+      expect(received[0]).toMatchObject({ verification: "bridge" });
       expect(received.map((event) => (event.data as { bridge: { id: string } }).bridge.id)).toEqual([sent.id]);
-      expect(logs.filter((line) => line.includes("retrying"))).toHaveLength(1);
+      const cursor = JSON.parse(fs.readFileSync(bridge.options.cursorPath, "utf8")) as { toLocal: { after: number } };
+      expect(cursor.toLocal.after).toBeGreaterThanOrEqual(sent.sequence);
+      expect(logs.some((line) => line.includes(" (toLocal); retrying in "))).toBe(false);
       expect(logs.some((line) => /dropped|refused/.test(line))).toBe(false);
       expect(failure).toBeUndefined();
     } finally {

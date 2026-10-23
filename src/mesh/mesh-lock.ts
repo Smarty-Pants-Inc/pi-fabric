@@ -105,6 +105,101 @@ export const errorCode = (error: unknown): string | undefined =>
     ? error.code
     : undefined;
 
+/** Internal completion diagnostic, never an admission/retry decision. Durations are monotonic milliseconds. */
+export interface InitialMeshLockDiagnostics {
+  fenceRefusals: number;
+  retainedOffLockMs: number;
+  recovered: boolean;
+}
+interface InitialMeshLockTiming {
+  fenceRefusals: number;
+  retainedOffLockMs: number;
+  offLockSince?: number;
+}
+const finishRetainedOffLock = (timing: InitialMeshLockTiming): void => {
+  if (timing.offLockSince === undefined) return;
+  timing.retainedOffLockMs += Math.max(0, performance.now() - timing.offLockSince);
+  delete timing.offLockSince;
+};
+
+interface InitialMeshLockAdmission {
+  root: string;
+  active: boolean;
+  consumed: boolean;
+  timing?: InitialMeshLockTiming;
+  signal?: AbortSignal;
+  isPreAppendRefusal: (error: unknown) => boolean;
+  admission?: ReturnType<typeof createMeshLockAdmission>;
+  expiresAt?: number;
+  retryError?: unknown;
+}
+const initialAdmissionScope = new AsyncLocalStorage<InitialMeshLockAdmission>();
+const initialAcquisitionScope = new AsyncLocalStorage<{ admission: InitialMeshLockAdmission; active: boolean }>();
+
+/** Held ingress only: retain ONE existing ticket for at most twice the ordinary acquisition budget.
+ * EventLog designates the initial acquisition; schedules and after-append receipt locks never borrow it.
+ * Only a refusal certified by that acquisition can replay the publication. Sleeps are outside .lock. */
+export async function withInitialMeshLockAdmission<T>(root: string, operation: () => Promise<T>,
+  options: { signal?: AbortSignal; isPreAppendRefusal: (error: unknown) => boolean;
+    onDiagnostics?: (diagnostics: InitialMeshLockDiagnostics) => void }): Promise<T> {
+  if (initialAdmissionScope.getStore()?.active) return operation();
+  const admission: InitialMeshLockAdmission = { root, active: true, consumed: false, ...options,
+    ...(options.onDiagnostics ? { timing: { fenceRefusals: 0, retainedOffLockMs: 0 } } : {}) };
+  return initialAdmissionScope.run(admission, async () => {
+    let attempt = 0;
+    let recovered = false;
+    try {
+      for (;;) {
+        admission.signal?.throwIfAborted();
+        admission.retryError = undefined;
+        try {
+          const result = await operation();
+          recovered = true;
+          return result;
+        } catch (error) {
+          if (admission.consumed || !admission.admission || admission.retryError !== error) throw error;
+          const remaining = Math.min(admission.admission.deadline - Date.now(), admission.expiresAt! - performance.now());
+          if (remaining <= 0) throw error;
+          await delay(Math.min(remaining, Math.min(20, 2 * 2 ** Math.min(attempt++, 4))), admission.signal);
+        }
+      }
+    } finally {
+      admission.active = false;
+      admission.consumed = true;
+      admission.admission?.ticket.close();
+      if (admission.timing) {
+        finishRetainedOffLock(admission.timing);
+        // Publication has settled and custody is gone. A diagnostic must never change its outcome.
+        try { options.onDiagnostics?.({ fenceRefusals: admission.timing.fenceRefusals,
+          retainedOffLockMs: admission.timing.retainedOffLockMs, recovered }); } catch { /* diagnostic only */ }
+      }
+    }
+  });
+}
+
+/** Explicitly mark the event acquisition, not the first arbitrary lock in a store publication. */
+export async function withInitialMeshLockAcquisition<T>(root: string, acquire: () => Promise<T>): Promise<T> {
+  const admission = initialAdmissionScope.getStore();
+  if (!admission?.active || admission.consumed || admission.root !== root) return acquire();
+  const scope = { admission, active: true };
+  return initialAcquisitionScope.run(scope, async () => {
+    try { return await acquire(); }
+    finally { scope.active = false; }
+  });
+}
+
+/** Irreversible BEFORE any possible append/recovery effect, including a batch's first prefix.
+ * Effects anywhere in the root-bound operation (including appendLocked schedule release) disarm
+ * replay. The acquisition designation only gates ticket borrowing, not this effect boundary.
+ * Keep the physical ticket until canonical release; it is never shared with receipt finalization. */
+export function consumeInitialMeshLockAdmission(root: string): void {
+  const admission = initialAdmissionScope.getStore();
+  if (admission?.active && admission.root === root) {
+    admission.consumed = true;
+    if (admission.timing) finishRetainedOffLock(admission.timing);
+  }
+}
+
 const PROCESS_STATES: Record<string, string> = {
   R: "running", S: "sleeping", D: "uninterruptible I/O wait", T: "stopped", t: "stopped by tracer",
   Z: "zombie", X: "dead", I: "idle",
@@ -289,7 +384,7 @@ export class MeshLock {
     // fence's fd-pinned release). A check-then-rename by name let a holder that stalled past staleMs, and was
     // reclaimed, remove its successor's lock. Before a pin exists, and off Linux, the release is main's below.
     let pin: number | undefined;
-    const releaseOwned = (): void => {
+    const releaseCanonical = (): void => {
       const held = pin;
       pin = undefined;
       if (held !== undefined) { releaseFenceLock(this.#lockPath, ownerRecord, {}, held); return; }
@@ -312,9 +407,41 @@ export class MeshLock {
         // Already replaced/removed, unreadable, or cleanup failed: never delete canonical.
       }
     };
+    // Borrow only the explicitly designated, ordinary initial event acquisition. Existing try/short
+    // scopes and migrations retain their bounds, even if called inside a held ingress lifetime.
+    const designated = initialAcquisitionScope.getStore();
+    const candidate = designated?.active && designated.admission.active && !designated.admission.consumed &&
+      designated.admission.root === this.root ? designated.admission : undefined;
+    const initial = candidate && !bounded && !scope?.active && !acrossAwait && lockTimeoutMs === this.#lockTimeoutMs
+      ? candidate : undefined;
+    if (candidate && !initial) candidate.consumed = true;
+    const lifetime = initialAdmissionScope.getStore();
+    const timing = lifetime?.active && lifetime.root === this.root ? lifetime.timing : undefined;
+    let canonicalReleasedAt: number | undefined;
+    const acquiredCanonical = (): void => {
+      if (timing) finishRetainedOffLock(timing);
+      canonicalReleasedAt = undefined;
+    };
+    const releaseOwned = (): void => {
+      releaseCanonical();
+      if (timing && !lifetime?.consumed && lifetime?.admission?.ticket.queued) {
+        canonicalReleasedAt = performance.now();
+        if (timing.fenceRefusals > 0) timing.offLockSince ??= canonicalReleasedAt;
+      }
+    };
+    const signal = initial?.signal && this.#writeAbortSignal
+      ? AbortSignal.any([initial.signal, this.#writeAbortSignal]) : initial?.signal ?? this.#writeAbortSignal;
+    signal?.throwIfAborted();
     // smarty-dev#9805: only the canonical mesh lock opts into early free-lock reaping of a stalled head receipt.
-    const admission = createMeshLockAdmission(this.root, token, waitMs, { stalledHeadBypassLock: this.#lockPath });
+    const admission = initial?.admission ?? createMeshLockAdmission(this.root, token, initial ? 2 * waitMs : waitMs,
+      { stalledHeadBypassLock: this.#lockPath });
+    if (initial && !initial.admission) {
+      initial.admission = admission;
+      initial.expiresAt = performance.now() + 2 * waitMs;
+    }
     const { ticket, deadline } = admission;
+    let retain = false;
+    let operationEntered = false;
     let budgetSpent = false;
     let budgetTimer: ReturnType<typeof setTimeout> | undefined;
     // The shared admission helper fixes the relative budget only after setup; expiry cannot grant admission.
@@ -332,10 +459,11 @@ export class MeshLock {
         // Date is lease time (it may jump); performance may be a separate diagnostic clock.
         // Lazy arming keeps uncontended acquisitions free of another clock read or timer.
         // Spent means strictly past the budget (+1 ms), so an attempt due exactly at the deadline still runs.
-        budgetTimer ??= setTimeout(() => { budgetSpent = true; }, Math.max(0, deadline - Date.now()) + 1);
+        const remaining = initial ? Math.min(deadline - Date.now(), initial.expiresAt! - performance.now()) : deadline - Date.now();
+        budgetTimer ??= setTimeout(() => { budgetSpent = true; }, Math.max(0, remaining) + 1);
         const pending = ticket.queued
-          ? ticket.wait(ms, this.#writeAbortSignal, deadline)
-          : delay(ms, this.#writeAbortSignal);
+          ? ticket.wait(Math.min(ms, Math.max(0, remaining)), signal, deadline)
+          : delay(Math.min(ms, Math.max(0, remaining)), signal);
         // Invocation includes synchronous watch setup: retain its fixed-deadline refusal.
         // After yielding, wall-clock lease time can jump independently of the relative timer.
         waitSetupExpired = Date.now() > deadline;
@@ -353,8 +481,14 @@ export class MeshLock {
         return new MeshLockTimeoutError(describeLockHolder(ownerPath), attempts, maxGapMs);
       };
       while (true) {
-        this.#writeAbortSignal?.throwIfAborted();
-        if (!ticket.mayContend()) {
+        signal?.throwIfAborted();
+        const mayContend = ticket.mayContend();
+        if (timing && !lifetime?.admission?.ticket.queued) finishRetainedOffLock(timing);
+        if (initial && (performance.now() > initial.expiresAt! || Date.now() > deadline)) {
+          if (!mayContend || (attempts === 0 && ticket.queued)) throw admission.expire(this.#lockPath, this.root, "mesh-lock", lockClass);
+          throw timeout();
+        }
+        if (!mayContend) {
           if (!budgetSpent && Date.now() < deadline) {
             // Woken when the predecessor's receipt goes; the short poll is only a safety net.
             await wait(Math.min(20, Math.max(0, deadline - Date.now())));
@@ -379,6 +513,7 @@ export class MeshLock {
             // Keep the B68 three-line wire, but never overwrite an owner published by a
             // successor while this initializer was stopped after canonical mkdir.
             fs.mkdirSync(this.#lockPath, { mode: 0o700 });
+            acquiredCanonical();
             const ownershipLost = () => Object.assign(new Error("Fabric mesh lock ownership lost during acquisition"), {
               code: "FABRIC_MESH_LOCK_OWNERSHIP_LOST",
             });
@@ -420,6 +555,7 @@ export class MeshLock {
               // New-format competitors publish nonempty owners atomically. This does not fence
               // old-format writers that create an empty canonical after the absence check.
               fs.renameSync(staging, this.#lockPath);
+              acquiredCanonical();
             } finally {
               // ponytail: no judgment precedes this. `staging` is this attempt's own unpublished mkdtemp name (random
               // suffix, never published under it, never a recovery or rename target); after a successful publish the
@@ -455,7 +591,9 @@ export class MeshLock {
       }
       if (timed) lockHeldAt = performance.now();
       try {
-        this.#writeAbortSignal?.throwIfAborted();
+        signal?.throwIfAborted();
+        if (initial && (performance.now() > initial.expiresAt! || Date.now() > deadline)) throw timeout();
+        operationEntered = true;
         return acrossAwait ? await operation() : operation();
       } catch (error) {
         // A failed write (a version conflict above all) means this store's view is behind: the
@@ -467,14 +605,30 @@ export class MeshLock {
         if (timed) holdMs = performance.now() - lockHeldAt;
       }
     } catch (error) {
+      if (initial) {
+        const preAppendRefusal = initial.isPreAppendRefusal(error);
+        if (timing && preAppendRefusal) timing.fenceRefusals += 1;
+        retain = !initial.consumed && (preAppendRefusal || (!operationEntered &&
+          error instanceof MeshLockTimeoutError && !(error instanceof MeshLockForeignHolderError)));
+        if (retain) {
+          initial.retryError = error;
+          // Start at actual canonical release, not at the requested retry sleep. A pre-busy
+          // initial queue wait has no release timestamp and contributes nothing.
+          if (timing && canonicalReleasedAt !== undefined) timing.offLockSince ??= canonicalReleasedAt;
+        } else initial.consumed = true;
+      }
       if (timed && lockHeldAt < 0 && error instanceof MeshLockTimeoutError && !(error instanceof MeshLockQueueExpiredError)) {
         failedWaitMs = performance.now() - lockWaitStart;
       }
       throw error;
     } finally {
       clearTimeout(budgetTimer);
-      ticket.close();
-      // Recorded after the ticket closes, so bookkeeping never delays a FIFO follower.
+      if (!retain) {
+        if (initial) initial.consumed = true;
+        ticket.close();
+        if (initial && timing) finishRetainedOffLock(timing);
+      }
+      // Recorded after canonical release; a retained pre-append refusal keeps only advisory admission.
       if (holdMs >= 0) {
         lockStats?.acquired(this.root, lockClass, lockHeldAt - lockWaitStart, holdMs);
         if (this.#lockHeldEventMs > 0 && holdMs > this.#lockHeldEventMs) lockEvents?.held(this.root, "mesh-lock", lockClass, holdMs);

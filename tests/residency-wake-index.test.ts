@@ -8,6 +8,7 @@ import { residentRoot } from "../src/residency/protocol.js";
 import * as wake from "../src/residency/wake.js";
 import * as index from "../src/residency/wake-index.js";
 import * as atomic from "../src/core/atomic-write.js";
+import { writeHostLease } from "../src/topology/host-leases.js";
 import { canonicalResidentWakeConfig } from "../src/residency/wake-index.js";
 
 const fixture = () => {
@@ -292,6 +293,8 @@ describe("archive-coupled resident wake retry index", () => {
     vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
       await wake.ensureResidentWakeArchive(f.mesh);
+      writeHostLease(f.mesh.root, { id: "session:index", rootId: "session:index", identityId: "session:index",
+        updatedAt: Date.now(), expiresAt: Date.now() + 86_400_000 });
       fs.writeFileSync(configFile, JSON.stringify({ ...JSON.parse(saved), actorRoot: "/foreign-actor-root" }));
       const event = await f.mesh.publish({ topic: "indexed.delivery", from: f.from });
       expect(launch).not.toHaveBeenCalled();

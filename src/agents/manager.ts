@@ -201,6 +201,9 @@ import {
   AGENT_STATUS_POLL_INTERVAL_MS,
 } from "./constants.js";
 const NESTED_SNAPSHOT_POLL_MS = 500;
+/** A Placement binding runs off this host: a remote kind, or a host that is neither the full local hostname nor its first label. */
+const remoteKindOrHost = (kind: string, host: string, localHostname: string): boolean =>
+  kind === "remote" || ![localHostname, localHostname.split(".", 1)[0]].includes(host.toLowerCase());
 const TRANSPORT_EXIT_GRACE_MS = 1_000;
 /** smarty-dev#9855: a standing held-permit alarm repeats this often. */
 const ADMISSION_REALARM_MS = 6 * 60 * 60 * 1_000;
@@ -3008,7 +3011,10 @@ export class AgentManager {
           if (!Number.isSafeInteger(executionDeadline) || executionDeadline <= Date.now()) {
             throw new PlacementAdmissionError({ status: "refused", code: "LOCAL_BINDING_NOT_ADMITTED" });
           }
-          if (writePolicy !== undefined && binding.host.toLowerCase() !== os.hostname().toLowerCase()) {
+          // A write policy cannot be forwarded to another host. "Local" uses the same names the process
+          // transport accepts for a local binding: the full hostname or its first label.
+          const localHostname = os.hostname().toLowerCase().replace(/\.$/u, "");
+          if (writePolicy !== undefined && remoteKindOrHost(placementKind, binding.host, localHostname)) {
             throw new PlacementAdmissionError({ status: "refused", code: "LOCAL_TRANSPORT_UNSUPPORTED" });
           }
           placementAdmission = {

@@ -398,7 +398,35 @@ const promptFileMatches = (filePath: string, expectedSha256: string, expectedByt
 /** Host-only provenance: public model fields never confer an implicit/default exemption. */
 export interface AgentModelSelection {
   modelSource?: "explicit" | "default" | "inherited" | "route";
+  /**
+   * Host-only (#16357): the exception lane this host captured from the SAME bound root at actor
+   * creation. Used only when that root's fresh record is unavailable; never a caller value.
+   */
+  persistedLane?: AgentExceptionLane | undefined;
 }
+
+/** basename(root Main cwd) as read from the bound ROOT record, with the root it was read from. */
+export interface AgentExceptionLane {
+  rootId: string;
+  lane: string;
+}
+
+/** A persisted lane is exactly one non-empty path segment captured from one named root. */
+export function validAgentExceptionLane(value: unknown): value is AgentExceptionLane {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const { rootId, lane } = value as Record<string, unknown>;
+  return typeof rootId === "string" && rootId.length > 0 && rootId.length <= 512 &&
+    typeof lane === "string" && lane.length > 0 && lane.length <= 255 && lane !== "." && lane !== ".." &&
+    !lane.includes("/") && !lane.includes("\\") && !lane.includes("\0");
+}
+
+/** An error's class for a lane-unresolved denial: never its message, paths or secrets (#16331). */
+const laneLookupErrorClass = (error: unknown): string => {
+  const name = error instanceof Error ? error.name : typeof error;
+  const code = (error as { code?: unknown } | null | undefined)?.code;
+  const safeName = /^[A-Za-z_$][\w$]{0,63}$/.test(name) ? name : "Error";
+  return typeof code === "string" && /^[A-Z][A-Z0-9_]{0,31}$/.test(code) ? `${safeName} ${code}` : safeName;
+};
 export interface AgentModelAdmission {
   model?: string | undefined;
   thinking?: FabricThinking | undefined;
@@ -452,6 +480,8 @@ class AgentTaskPresenceError extends Error {
 export interface AgentLaunchPreparationOptions {
   timeoutMs: number;
   onPreparing?: () => void;
+  /** The actor's lane persisted at creation (#16357); admission falls back to it only for its own root. */
+  exceptionLane?: AgentExceptionLane | undefined;
 }
 
 export class AgentLaunchPreparationTimeoutError extends Error {
@@ -801,6 +831,8 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   requestedThinking?: AgentRunRequest["thinking"];
   actorId?: string;
   actorName?: string;
+  /** #16357: the actor's creation-time lane, re-offered to a relaunch's admission. In memory only. */
+  exceptionLane?: AgentExceptionLane;
   spawner?: AgentSpawner;
   capabilityRequirements?: string[];
   capabilityDigest?: string;
@@ -1793,13 +1825,46 @@ export class AgentManager {
     return requiredPin ? requested : clampThinkingToBounds(requested, this.childThinkingBounds(bounds));
   }
 
-  #exceptionLane(): string | undefined {
-    try {
-      const cwd = this.#rootSessionCwd?.();
-      if (typeof cwd !== "string" || !path.isAbsolute(cwd)) return undefined;
-      const lane = path.basename(cwd);
-      return lane && lane !== "." && lane !== ".." ? lane : undefined;
-    } catch { return undefined; }
+  /**
+   * The bound ROOT lane, read fresh. Undefined only when no root binding exists at all
+   * (unchanged lane-mismatch); a missing/stale record or a failed lookup is `unresolved`.
+   */
+  #rootLane(): { lane: string } | { unresolved: string } | undefined {
+    if (!this.#rootSessionCwd) return undefined;
+    let cwd: string | undefined;
+    try { cwd = this.#rootSessionCwd(); }
+    catch (error) { return { unresolved: `root session lookup failed (${laneLookupErrorClass(error)})` }; }
+    if (typeof cwd !== "string") return { unresolved: "root session record is missing or not fresh" };
+    if (!path.isAbsolute(cwd)) return { unresolved: "root session cwd is not absolute" };
+    const lane = path.basename(cwd);
+    return lane && lane !== "." && lane !== ".." ? { lane } : { unresolved: "root session cwd names no lane" };
+  }
+
+  /**
+   * #16357: the lane to persist on an actor at creation, read from this host's bound root now.
+   * Undefined when that root is unknown or its lane is unresolved: nothing is captured then.
+   */
+  exceptionLaneCapture(): AgentExceptionLane | undefined {
+    const rootId = this.#mainAgentId;
+    const root = this.#rootLane();
+    if (!rootId || !root || !("lane" in root)) return undefined;
+    const capture = { rootId, lane: root.lane };
+    return validAgentExceptionLane(capture) ? capture : undefined;
+  }
+
+  /**
+   * The fresh root lane always wins, so every resolvable case is unchanged. Only when the bound
+   * root's record is unavailable may the lane persisted at creation stand in, and only when it was
+   * captured from this same root: never a wider value. Otherwise the denial is lane-unresolved.
+   */
+  #exceptionLane(persisted?: AgentExceptionLane): { lane?: string; unresolved?: string } {
+    const root = this.#rootLane();
+    if (!root) return {};
+    if ("lane" in root) return { lane: root.lane };
+    if (validAgentExceptionLane(persisted) && this.#mainAgentId && persisted.rootId === this.#mainAgentId) {
+      return { lane: persisted.lane };
+    }
+    return { unresolved: root.unresolved };
   }
 
   /**
@@ -1807,20 +1872,26 @@ export class AgentManager {
    * `/etc/smarty/model-exceptions.json` source now; direct embedders remain subject
    * to the reader's trusted-source checks. Fabric-created children are never `lead`.
    */
-  admitModelException(model: string | undefined, modelReason: unknown, runner: FabricAgentRunner = this.config.runner, role = "task", thinking?: FabricThinking): Readonly<ModelExceptionEntry> {
+  admitModelException(model: string | undefined, modelReason: unknown, runner: FabricAgentRunner = this.config.runner, role = "task", thinking?: FabricThinking, persistedLane?: AgentExceptionLane): Readonly<ModelExceptionEntry> {
+    const lane = this.#exceptionLane(persistedLane);
     return admitModelException({
       path: this.config.modelExceptionsPath, reason: modelReason,
-      model: this.#exceptionModel(model, runner), role, lane: this.#exceptionLane(),
+      model: this.#exceptionModel(model, runner), role, lane: lane.lane,
+      ...(lane.unresolved ? { laneUnresolved: lane.unresolved } : {}),
       host: os.hostname().split(".")[0]!, thinking: thinking ?? this.#effectiveThinking(),
     }).entry;
   }
 
   /** Compatibility API. Call with the RESOLVED selector and actual effective effort. */
-  assertExplicitModelReason(model: unknown, modelReason: unknown, runner: FabricAgentRunner = this.config.runner, inheritedDefault?: string, role = "task", thinking?: FabricThinking): Readonly<ModelExceptionEntry> | undefined {
+  assertExplicitModelReason(model: unknown, modelReason: unknown, runner: FabricAgentRunner = this.config.runner, inheritedDefault?: string, role = "task", thinking?: FabricThinking, persistedLane?: AgentExceptionLane): Readonly<ModelExceptionEntry> | undefined {
     const selector = typeof model === "string" ? model.trim() : undefined;
     if (!this.modelReasonRequired(selector, runner)) return;
     if (this.#validModelReason(modelReason)) {
-      if (isClaudeModel(selector, runner, this.config.veda.backend)) return this.admitModelException(selector, modelReason, runner, role, thinking);
+      if (isClaudeModel(selector, runner, this.config.veda.backend)) {
+        return persistedLane
+          ? this.admitModelException(selector, modelReason, runner, role, thinking, persistedLane)
+          : this.admitModelException(selector, modelReason, runner, role, thinking);
+      }
       return;
     }
     if (isClaudeModel(selector, runner, this.config.veda.backend)) {
@@ -1860,12 +1931,18 @@ export class AgentManager {
       return { model, thinking: options.thinking, fallback: false };
     }
     const thinking = this.#effectiveThinking(options.thinking, options.thinkingBounds, options.requiredPin);
+    // #16357: host-only; consulted only when the bound root's own record is unavailable.
+    const persistedLane = options.persistedLane;
     if (this.#nativeClaudeRequiresReason(runner)) {
-      const approvedGrant = this.assertExplicitModelReason(model, modelReason, runner, undefined, role, thinking);
+      const approvedGrant = persistedLane
+        ? this.assertExplicitModelReason(model, modelReason, runner, undefined, role, thinking, persistedLane)
+        : this.assertExplicitModelReason(model, modelReason, runner, undefined, role, thinking);
       return { model, thinking, fallback: false, approvedRef: approvedGrant?.issue, approvedGrant };
     }
     if (this.#validModelReason(modelReason)) {
-      const approvedGrant = this.assertExplicitModelReason(model, modelReason, runner, undefined, role, thinking);
+      const approvedGrant = persistedLane
+        ? this.assertExplicitModelReason(model, modelReason, runner, undefined, role, thinking, persistedLane)
+        : this.assertExplicitModelReason(model, modelReason, runner, undefined, role, thinking);
       return { model, thinking, fallback: false, approvedRef: approvedGrant?.issue, approvedGrant };
     }
     // A supplied but malformed Claude exception refuses, never silently switches.
@@ -2544,12 +2621,15 @@ export class AgentManager {
     // resolve before the reason check, even when the alias itself says "claude".
     // Trusted role snapshot: Fabric-created children are task or actor:<name>, never lead.
     const policyRole = request.actorName ? `actor:${request.actorName}` : "task";
+    // #16357: only the host's own actor launch options carry an actor's creation-time lane.
+    const persistedLane = request.actorName && preparation?.exceptionLane ? { persistedLane: preparation.exceptionLane } : {};
     // Alternate runners retain their pre-queue catalog/backend admission. Pi
     // model/auth preparation stays post-permit unless a durable route needs it.
     const alternatePrepared = runner === "claude" || runner === "veda";
     if (alternatePrepared) {
       applyAdmission(await this.prepareModelWithReason(model, request.modelReason, runner, {
         modelSource, thinking: effectiveThinking(), thinkingBounds, signal, timeoutMs: preparation?.timeoutMs, role: policyRole,
+        ...persistedLane,
       }));
     }
     // Strict route pins cannot resolve to another selector. Admit their reason
@@ -2562,6 +2642,7 @@ export class AgentManager {
     if (routePin) {
       applyAdmission(await this.resolveModelReasonPolicy(model, request.modelReason, runner, {
         modelSource: "route", thinking: routePin.effort, requiredPin: true, resolveFallback: resolveRouteFallback, role: policyRole,
+        ...persistedLane,
       }));
       // LIVE storage/admission may demote to its pin. Admit that alternative
       // before recording either branch, so a safe live choice cannot conceal an
@@ -2569,6 +2650,7 @@ export class AgentManager {
       if (request.routeDecision?.mode === "live" && request.routeDecision.pin.model !== model) {
         const pin = await this.resolveModelReasonPolicy(request.routeDecision.pin.model, request.modelReason, runner, {
           modelSource: "route", thinking: request.routeDecision.pin.effort, requiredPin: true, resolveFallback: resolveRouteFallback, role: policyRole,
+          ...persistedLane,
         });
         policyPinAdmission = pin;
         if (pin.fallback && pin.model && pin.thinking) {
@@ -2675,11 +2757,11 @@ export class AgentManager {
           ? await this.resolveModelReasonPolicy(selected, request.modelReason, runner, {
             modelSource: request.modelSource ?? modelSource, thinking: effectiveThinking(), thinkingBounds, requiredPin: Boolean(routePin),
             resolveFallback: key => this.prepareModelForAdmission(key, runner, undefined, false, signal, preparation?.timeoutMs),
-            role: policyRole,
+            role: policyRole, ...persistedLane,
           })
           : await this.prepareModelWithReason(selected, request.modelReason, runner, {
             modelSource: routePin ? "route" : request.modelSource ?? modelSource, thinking: effectiveThinking(), thinkingBounds,
-            requiredPin: Boolean(routePin), signal, timeoutMs: preparation?.timeoutMs, role: policyRole,
+            requiredPin: Boolean(routePin), signal, timeoutMs: preparation?.timeoutMs, role: policyRole, ...persistedLane,
           });
         // Do not rewrite an already recorded route dispatch/header if policy changed.
         if (routeDispatch && admitted.fallback) throw new Error("Model reason policy changed after route admission; no worker started (smarty-dev#2264)");
@@ -3255,6 +3337,7 @@ export class AgentManager {
           ...(routePin ? { routePin } : {}),
           ...(request.actorId ? { actorId: request.actorId } : {}),
           ...(request.actorName ? { actorName: request.actorName } : {}),
+          ...(persistedLane.persistedLane ? { exceptionLane: persistedLane.persistedLane } : {}),
           ...(this.#spawner ? { spawner: this.#spawner } : {}),
           ...(request.capabilityRequirements
             ? { capabilityRequirements: [...request.capabilityRequirements] }
@@ -3722,6 +3805,8 @@ export class AgentManager {
       error: error instanceof Error ? error.message : String(error),
       ...(status === "failed" && error instanceof AgentLaunchPreparationTimeoutError && error.launchOutcome === "unlaunched"
         ? { launchPreparationTimeoutMs: error.timeoutMs } : {}),
+      ...(status === "failed" && error instanceof FabricModelExceptionDeniedError && error.denial === "lane-unresolved"
+        ? { launchDenial: "lane-unresolved" as const } : {}),
       startedAt: queued.enqueuedAt, updatedAt: now, finishedAt: now,
       turns: 0, toolCalls: 0, text: "",
       usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
@@ -6202,7 +6287,8 @@ export class AgentManager {
       let admission: AgentModelAdmission;
       if (managed.runner !== "pi" && managed.runner !== "pi-durable") {
         admission = await this.prepareModelWithReason(managed.model, managed.modelReason, managed.runner, { modelSource: "explicit",
-          thinking: record.thinking ?? managed.thinking, requiredPin: true, role: policyRole });
+          thinking: record.thinking ?? managed.thinking, requiredPin: true, role: policyRole,
+          ...(managed.actorName && managed.exceptionLane ? { persistedLane: managed.exceptionLane } : {}) });
         while (this.#releasePaused) await this.#waitForRelease(managed.abortSignal);
         if (cancelled()) return false;
       } else {
@@ -6210,7 +6296,7 @@ export class AgentManager {
         // its concrete selector as explicit; refuse a newly protected alias/default.
         admission = await this.prepareModelWithReason(managed.routePin?.model ?? managed.model, managed.modelReason,
           managed.runner, { modelSource: "explicit", thinking: managed.routePin?.effort ?? record.thinking ?? managed.thinking, requiredPin: true,
-            role: policyRole });
+            role: policyRole, ...(managed.actorName && managed.exceptionLane ? { persistedLane: managed.exceptionLane } : {}) });
         while (this.#releasePaused) await this.#waitForRelease(managed.abortSignal);
         if (cancelled()) return false;
         const model = admission.model;

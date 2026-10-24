@@ -431,8 +431,14 @@ at or below the grant's ceiling. There are no model prefixes or alternate
 backend/provenance matches. Roles are `task`, `actor:<name>`, or `lane`; Fabric
 children are never leads. The lane is the cwd basename of the ROOT session's
 bound participant record, supplied by the host, not an environment variable,
-child cwd, request argument, manager cwd or project root. Missing root binding
-refuses with `lane-mismatch`. The host is `os.hostname().split('.')[0]`.
+child cwd, request argument, manager cwd or project root. A host with no root
+binding refuses with `lane-mismatch`; a root record that is missing, not fresh,
+unreadable or not absolute refuses with `lane-unresolved` (with the lookup's
+error class, never its path), and an actor keeps retrying that refusal with its
+bounded preparation backoff. The lane is `basename(root Main cwd)`,
+so a grant for `smarty-pants` does not match a Main in `worktrees/<lane>`; each
+actor captures it once at creation and uses that copy only while its own root's
+record is unavailable. The host is `os.hostname().split('.')[0]`.
 Omitted thinking resolves to the actual effective host default, not low/off;
 child bounds clamp ordinary launches, while route-pin effort remains exact.
 
@@ -1491,7 +1497,8 @@ the backlog behind it (queue plus overflow) (smarty-dev#6337).
 A failed activation records `activationBlocked` on the actor, and routers (factory review
 routing) skip a blocked actor. Its `class` says whether it can recover by itself
 (smarty-dev#6509). A `transient` block comes from a provider stream or network error, a 5xx or
-429, a timeout, or a preparation or lock timeout (code `preparation-timeout`). It records
+429, a timeout, a preparation or lock timeout (code `preparation-timeout`), or a model-exception
+root lane that could not be read (code `lane-unresolved`, smarty-dev#16357). It records
 `blockedAt` and `backoffMs`, and expires at `retryAt`: after `actors.transientBlockCooldownMs`
 (default 10 minutes). After expiry, the actor info and the published actor record show
 `activationBlockExpired` instead, so routers admit the actor again. Its next activation, queued

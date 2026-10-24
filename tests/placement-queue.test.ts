@@ -208,13 +208,18 @@ describe("durable actor placement QUEUE", () => {
   it("backs off repeated QUEUE responses and caps the local retry delay", async () => {
     const f = new Fixture();
     const queueTimes: number[] = [];
-    f.decide = async request => { queueTimes.push(Date.now()); throw queued(request); };
+    f.decide = async request => {
+      queueTimes.push(Date.now());
+      // Keep the first checkpoint pending long enough to inspect under a loaded runner;
+      // subsequent responses exercise the local exponential backoff.
+      throw queued(request, queueTimes.length === 1 ? 2 : 0);
+    };
     const actor = await f.actor();
     const accepted = f.actors.tell(actor.id, SECRET_TASK);
     await f.idle();
     const first = f.checkpoint(actor.sessionFile!).items[0]!.placementQueue!;
     assert.equal(first.retryCount, undefined);
-    assert.ok(first.retryAt - queueTimes[0]! >= 250);
+    assert.ok(first.retryAt - queueTimes[0]! >= 2_000);
 
     await f.until(f.actors, () => f.requests.length === 2 && f.actors.inFlightCount() === 0);
     const second = f.checkpoint(actor.sessionFile!).items[0]!.placementQueue!;

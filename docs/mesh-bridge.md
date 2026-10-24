@@ -335,6 +335,68 @@ not event/frame limits or the default. For example, `--max-state-bytes 67108864`
 `--ssh-port` and `--ssh-known-hosts FILE` (which also sets `StrictHostKeyChecking=yes`) reach a
 host without a global `~/.ssh/config` entry.
 
+### Expected outbound roots (no injection)
+
+Add the independent, default-off `--emit-expected-roots` flag to **run mode only** to publish
+an expected-root receipt without injecting any malformed presence. Enable this flag alone on
+**all six hubs**; reserve the partial-probe flag below for **epyc1 only**:
+
+```sh
+mesh-bridge run --mesh ~/proj/.pi/fabric/mesh --name hub-a --remote peer-b \
+  --cursor ~/.local/state/mesh-bridge/peer-b.cursor.json --emit-expected-roots \
+  --ssh peer-b --ssh-key ~/.ssh/mesh-bridge
+```
+
+The receipt is `<dirname(cursorPath)>/<remoteName>/probe-roots.json`, normally
+`~/.local/state/mesh-bridge/<peer>/probe-roots.json`. Its top-level fields are:
+
+- `version: 1` and `peer`: the configured remote name.
+- `roots`: full, sorted canonical root IDs of the **actual ACKed outbound mirror projection**,
+  after admission and transport adaptation, not a raw source scan. Legacy partial completion
+  can include baseline-held roots omitted from the source cycle.
+- `count`: the length of `roots`.
+- `digest`: the hexadecimal SHA-256 digest of `JSON.stringify(roots)` (the sorted array).
+- `cycleTime`: the source cycle's start time as an ISO UTC timestamp.
+- `partial`: whether the source cycle was partial (`true`) or complete (`false`), even when a
+  legacy receiver was sent a completed projection without a partial marker.
+- `cycles`: the existing probe history, `[{cycle, roots, digest}]`; empty for emitter-only runs.
+  Later emitter updates in the same process retain every successfully recorded probe cycle.
+
+Emitter-only writes are attempted at most once per **30 seconds per peer**, including failures,
+when a new mirror ACK is available. This adds no timer, injection, or mirror throttling. A legacy
+partial skipped before its first complete baseline has no ACK and produces no receipt. Each
+write atomically replaces the receipt using a same-directory temporary file plus rename; files
+are mode **0600**, with the per-peer directory created mode **0700**. Receipt writes are bounded
+to 8 MiB. Write failures log at most once per minute per peer and **never fail presence mirroring
+or the bridge loop**; a previous receipt may therefore be stale, so check `cycleTime`.
+With neither flag, the receipt path is not written and no receipt sorting, hashing or filesystem
+work is done. Remove the emitter flag and restart to stop emission; existing files remain.
+
+### Bounded partial probe (epyc1 only)
+
+For a bounded hub-side diagnostic of legacy partial-presence completion on **epyc1 only**, add
+`--partial-probe-after-baseline` to `mesh-bridge run` (default 30 cycles), or use
+`--partial-probe-after-baseline=N` for an integer from 1 through the hard cap of 50.
+The probe is off by default and only activates for a peer that does not support partial
+presence, after that same peer ACKs a complete baseline. Each active sync adds one malformed
+participant with a non-string id to a fresh in-memory local snapshot immediately before admission;
+the normal classifier drops it and naturally marks the scan partial. The malformed row is never
+persisted or forwarded, and the existing legacy completion and ownership/lease fences still apply.
+After each successful mirror ACK, the bridge atomically retains all completed cycles' full sorted
+outbound root IDs and SHA-256 digests in `<dirname(cursorPath)>/<remoteName>/probe-roots.json`
+(up to 8 MiB), then logs `presence PROBE:` with the cycle, drop count, legacy completion count,
+root count, digest and absolute `rootsFile` path. The receipt also has the top-level expected-root
+fields documented above. Probe cycles write after **every ACK**, bypassing the emitter's 30-second
+limit, even when `--emit-expected-roots` is absent. With both flags, each probe cycle makes only
+one write containing both the complete cycle history and current expected-root metadata. A failed
+probe receipt never claims that cycle: it safely disables further probe injection/recording for
+the process lifetime, emits a bounded warning, and leaves mirroring and the bridge loop running.
+The independent emitter, if enabled, can continue after its attempt limit permits. After N
+successfully recorded ACK-backed cycles the probe logs a disable notice and stops injecting for
+the process lifetime. Roll back by removing the probe flag and restarting the bridge; retained
+receipts remain available for inspection. Agent mode is unchanged. The emitter and probe are
+independent: enabling the emitter alone never activates the epyc1-only injection.
+
 When a bridge stops providing fresh observations, its authority expires within 15 s. A retained
 root is not proof that the Main ended. Before publication, routing waits once for renewal and
 then returns `FABRIC_PEER_LEASE_STALE` if freshness remains unknown; the attempt was not published.

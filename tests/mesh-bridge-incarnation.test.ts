@@ -224,12 +224,15 @@ describe("bridge incarnation admission at persisted trust boundaries (smarty-dev
         now = NOW + pass * 9_000;
         const sourceAt = now + (pass % 2 ? -600_000 : 600_000);
         const write = hub.writeBatch.bind(hub);
-        const retry = pass === 1 && backend === "sqlite" ? vi.spyOn(hub, "writeBatch").mockImplementationOnce(async input => {
+        const custody = hub.leaseCustody.bind(hub);
+        // smarty-dev#13645: this renewal-only SQLite pass commits nothing (no transaction to retry), so
+        // the unrelated topology writer lands between its plan and its effect, at the host gate.
+        const racer = pass === 1 && backend === "sqlite" ? vi.spyOn(hub, "leaseCustody").mockImplementationOnce(async (...args) => {
           await write({ identity: bridgeIdentity, ops: [{ kind: "put", key: "topology/hosts/retry-probe", value: {} }] });
-          return write(input);
+          return custody(...args);
         }) : undefined;
         await expect(side.mirror(plusUnrelated(legacy(sourceAt)), now)).resolves.toBeUndefined();
-        if (retry) { expect(retry).toHaveBeenCalledTimes(2); retry.mockRestore(); }
+        if (racer) { expect(racer).toHaveBeenCalled(); expect(hub.get("topology/hosts/retry-probe", { fresh: true })).toBeDefined(); racer.mockRestore(); }
         expect(JSON.stringify(hub.get(participantKey(identity.id), { fresh: true }))).toBe(participantBytes);
         const { updatedAt: _updated, expiresAt: _expires, ...authorityFields } = authority;
         expect(hub.get(hostKey(identity.id), { fresh: true })?.value).toMatchObject({ ...authorityFields, startedAt: highFloor });
@@ -399,6 +402,8 @@ describe("bridge incarnation admission at persisted trust boundaries (smarty-dev
     if (initiallySkipped) writeHostLease(hub.root, { ...oldLease, incarnationToken: "conflicting-current" });
     const { incarnationToken: _token, ...tokenlessHost } = host;
     const participantBefore = hub.get(participantKey(identity.id), { fresh: true });
+    const hostBefore = hub.get(hostKey(identity.id), { fresh: true });
+    const leaseBefore = fs.readFileSync(hostLeasePath(hub.root, identity.id));
     const write = hub.writeBatch.bind(hub);
     let interveningHost: unknown, interveningLease: Buffer | undefined;
     const retry = vi.spyOn(hub, "writeBatch").mockImplementationOnce(async input => {
@@ -410,6 +415,16 @@ describe("bridge incarnation admission at persisted trust boundaries (smarty-dev
     });
     await expect(side.mirror({ hosts: [{ record: tokenlessHost, observedAt: NOW, expiresAt: NOW + 8_000 }],
       participants: [{ ...participant, name: "must-not-replace" }] }, NOW)).resolves.toBeUndefined();
+    if (initiallySkipped) {
+      // smarty-dev#13645: the skipped root leaves nothing to write, so this pass is a lease-only probe
+      // with no transaction for the race to enter: every row and the conflicting lease stay byte-exact.
+      expect(retry).not.toHaveBeenCalled();
+      expect(hub.get(hostKey(identity.id), { fresh: true })).toEqual(hostBefore);
+      expect(hub.get(participantKey(identity.id), { fresh: true })).toEqual(participantBefore);
+      expect(fs.readFileSync(hostLeasePath(hub.root, identity.id))).toEqual(leaseBefore);
+      expect(removals).toEqual([]);
+      return;
+    }
     expect(retry).toHaveBeenCalledTimes(2);
     expect(hub.get(hostKey(identity.id), { fresh: true })).toEqual(interveningHost);
     expect(hub.get(participantKey(identity.id), { fresh: true })).toEqual(participantBefore);

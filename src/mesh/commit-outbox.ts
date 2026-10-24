@@ -105,7 +105,9 @@ export interface CommitOutboxPlan {
   replay(view: MeshBatchView): number;
   /** Synchronous effects for legacy callers that do not require asynchronous file custody. */
   run(view: MeshBatchView, halted?: () => boolean): number;
-  /** Post-COMMIT effects with asynchronous custody; callers await this before declaring readiness. */
+  /** Post-COMMIT effects with asynchronous custody; callers await this before declaring readiness.
+   * It reads each staged row fresh but does not prune retired rows: call CommitOutbox.pruneDone()
+   * once before a pass's runAsync calls (one listing, not one read per retired row per batch). */
   runAsync(view: MeshBatchView, halted?: () => boolean): Promise<number>;
 }
 
@@ -222,9 +224,21 @@ export class CommitOutbox {
     return ran;
   }
 
+  /** Whether this scope stores a row this outbox has not run at its current version (a pending or
+   * failed effect, or another instance's recording), from ONE fresh listing. */
+  hasUnconfirmed(): boolean {
+    return this.mesh.listAll(this.prefix, { fresh: true }).some(entry => this.#done.get(entry.key) !== entry.version);
+  }
+
+  /** Forgets ran rows that are no longer stored (retired), from ONE fresh listing of this scope. */
+  pruneDone(): void {
+    if (this.#done.size === 0) return;
+    const stored = new Set(this.mesh.listAll(this.prefix, { fresh: true }).map(entry => entry.key));
+    for (const row of [...this.#done.keys()]) if (!stored.has(row)) this.#done.delete(row);
+  }
+
   async #runAsync(staged: readonly StagedEffect[], view: MeshBatchView, halted?: () => boolean): Promise<number> {
     let ran = 0;
-    for (const row of [...this.#done.keys()]) if (!this.mesh.get(row, { fresh: true })) this.#done.delete(row);
     let completed = 0;
     for (const { row, effect, stamp, durable } of staged) {
       if (halted?.()) return ran;
@@ -296,7 +310,11 @@ export class CommitOutbox {
     try {
       const current = fresh ? this.mesh.get(row, { fresh: true }) : view.get(row);
       const superseded = current && stamp !== undefined && rowOf(current.value)?.stamp !== stamp;
-      if ((durable && !current) || (superseded && (durable || this.#done.get(row) !== current.version))) return false;
+      // A non-durable effect has no row of its own. It defers to a recording committed after the view
+      // it was planned on (a newer decision), never to one that view already held or this outbox ran.
+      const recordedSincePlan = (): boolean => view.get(row)?.version !== current!.version;
+      if ((durable && !current) || (superseded &&
+        (durable || (this.#done.get(row) !== current.version && recordedSincePlan())))) return false;
       handler(payload, view, replay);
     } catch {
       this.#failed.add(row);

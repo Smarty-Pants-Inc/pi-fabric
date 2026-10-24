@@ -205,6 +205,33 @@ describe("CommitOutbox", () => {
     expect((mesh.get(outbox.rowKey("same"), { fresh: true })?.value as { payload: { n: number } }).payload.n).toBe(2);
   });
 
+  it("a non-durable effect defers only to a same-key row recorded after its planning view (smarty-dev#13645)", async () => {
+    const mesh = new MeshStore(meshRoot(), 64 * 1024, 100, { stateBackend: "sqlite" });
+    try {
+      const log: string[] = [];
+      const outbox = new CommitOutbox(mesh, "scope-non-durable", identity, effects(log),
+        { withEffectCustody: async (_kind, _payload, operation) => operation() });
+      // Another writer instance's recording of the same key: run there, never retired.
+      const other = new CommitOutbox(mesh, "scope-non-durable", identity, effects([]));
+      const record = (n: number) => mesh.writeBatch({ identity, ops: [], prepare: () =>
+        other.plan().stage([{ kind: "put", key: `subject/${n}`, value: n }], [{ kind: "touch", key: "same", payload: { n } }]) });
+      await record(1);
+      const planned = mesh.stateView()!.view;
+      // The planning view already held that row: the newer non-durable decision runs.
+      const renewal = outbox.plan();
+      expect(renewal.stage([], [{ kind: "touch", key: "same", payload: { n: 2 } }])).toEqual([]);
+      expect(await renewal.runAsync(planned)).toBe(1);
+      // A recording committed after that view is a newer decision: a late renewal planned on the
+      // old view defers to it and leaves it pending.
+      await record(3);
+      const late = outbox.plan();
+      late.stage([], [{ kind: "touch", key: "same", payload: { n: 4 } }]);
+      expect(await late.runAsync(planned)).toBe(0);
+      expect(log).toEqual(["2"]);
+      expect((mesh.get(outbox.rowKey("same"), { fresh: true })?.value as { payload: { n: number } }).payload.n).toBe(3);
+    } finally { mesh.closeState(); }
+  });
+
   it.each(["file", "sqlite"] as const)("a late older afterCommit leaves a newer same-key row pending; a crash before its effect replays it once (%s, smarty-dev#7023)", async (backend) => {
     const root = meshRoot();
     const mesh = new MeshStore(root, 64 * 1024, 100, { stateBackend: backend });

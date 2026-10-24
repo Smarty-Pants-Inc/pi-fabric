@@ -65,10 +65,12 @@ export const writeParticipantFileIf = async (
 ): Promise<boolean> => {
   const file = fileOf(mesh.root, key);
   if (!file) throw new Error(`Not a participant key: ${key}`);
-  const write = (): boolean => {
-    const entry = decide(readFresh(file));
+  const write = (requireSameIdentity = false): boolean | typeof RETRY_ADDITION => {
+    const current = readFresh(file);
+    const entry = decide(current);
     if (!entry) return false;
     if (entry.key !== key) throw new Error(`Participant entry key mismatch: ${entry.key}`);
+    if (requireSameIdentity && (identityOf(current) === undefined || identityOf(current) !== identityOf(entry))) return RETRY_ADDITION;
     new AtomicFileWriter(file).write(JSON.stringify({ format: 1, ...entry }),
       options.durable === undefined ? {} : { durable: options.durable });
     if (options.durable && JSON.stringify(readFresh(file)) !== JSON.stringify(entry)) {
@@ -77,14 +79,22 @@ export const writeParticipantFileIf = async (
     rescan(path.dirname(file));
     return true;
   };
+  // smarty-dev#13645: an update of an existing record whose identity fields stay the same needs
+  // only its own key receipt. A directory-custody holder (the mesh bridge) holds the receipts of
+  // every record that can alias its incoming ids, and additions and identity changes still take
+  // the namespace gate below, so unrelated heartbeats never queue behind a mirror's custody.
+  if (fs.existsSync(file)) {
+    const result = await withKeyLock(mesh, file, () => fs.existsSync(file) ? write(true) : RETRY_ADDITION, options);
+    if (result !== RETRY_ADDITION) return result;
+  }
   for (;;) {
-    // Additions take the namespace gate before their per-key receipt. Existing entries release
-    // that short check before waiting on their key, so unrelated renewals remain concurrent.
+    // Additions and identity changes take the namespace gate before their per-key receipt. Existing
+    // entries release that short check before waiting on their key.
     const { withCommitFence: _withCommitFence, ...namespaceOptions } = options;
     const namespace = await withParticipantNamespaceLock(mesh, async () => {
       if (fs.existsSync(file)) return { present: true as const };
       try {
-        return { present: false as const, result: await withKeyLock(mesh, file, write, { ...options, tryOnly: true }) };
+        return { present: false as const, result: await withKeyLock(mesh, file, () => write() as boolean, { ...options, tryOnly: true }) };
       } catch (error) {
         if (!(error instanceof ParticipantFileLockBusyError)) throw error;
         return { present: false as const, contended: true as const };
@@ -97,6 +107,14 @@ export const writeParticipantFileIf = async (
 };
 
 const RETRY_ADDITION = Symbol("participant-file-addition-raced-removal");
+
+/** The identity fields a mirror's participant snapshot keys admission and collisions on. */
+const identityOf = (entry: MeshStateEntry | undefined): string | undefined => {
+  const value = entry?.value;
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  return JSON.stringify([record.id, record.rootId, record.ownerHostId, record.ownerIdentityId, record.name, record.sessionId]);
+};
 
 /** Removes a record under its per-key receipt; the namespace gate is only for additions. */
 export const removeParticipantFileIf = async (

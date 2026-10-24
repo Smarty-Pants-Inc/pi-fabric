@@ -412,7 +412,9 @@ const sessionServicesValid = (value: unknown, kind: FabricParticipantKind): bool
   });
 };
 
-const participantFromEntry = (entry: MeshStateEntry): FabricParticipantRecord | undefined => {
+/** The participant record this directory reads from an entry, or undefined when it refuses the entry.
+ * Exported for the mesh bridge, which never writes a mirror row its own host's readers must refuse. */
+export const participantFromEntry = (entry: MeshStateEntry): FabricParticipantRecord | undefined => {
   if (!isObject(entry.value) || entry.value.format !== 1 || entry.value.stopReason === "owner-root-gone") return undefined;
   const value = entry.value as Partial<FabricParticipantRecord> & Record<string, unknown>;
   const kind = participantKind(value.kind);

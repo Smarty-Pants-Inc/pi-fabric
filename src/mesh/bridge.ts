@@ -13,6 +13,7 @@ import { meshDirectoryStamp } from "../topology/publication-generation.js";
 import type { FabricHostRecord, FabricParticipantRecord } from "../topology/types.js";
 import { ROOT_ID_PREFIX } from "../topology/root-inbox-shared.js";
 import { participantFilePresent, readParticipantFiles, withParticipantFileDirectoryCustody } from "../topology/participant-files.js";
+import { participantFromEntry } from "../topology/participant-directory.js";
 import { FABRIC_MESH_OUTAGE_ALARM_TOPIC, isMeshAlarmTarget, meshCursorGeneration, type MeshBatchOperation, type MeshBatchView, type MeshEvent, type MeshIdentity, type MeshPublishInput, type MeshStateEntry, type MeshStore } from "./store.js";
 import { CommitOutbox, type CommitOutboxEffect } from "./commit-outbox.js";
 import { assertBridgeStateBackend, isMeshRetryableBusy, isMeshStateWalCap } from "./state-backend.js";
@@ -551,23 +552,6 @@ const contentDigest = (value: unknown): string => createHash("sha256").update(JS
   isObject(item) ? Object.fromEntries(Object.entries(item).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)) : item,
 )).digest("hex");
 
-const mirrorInputFingerprint = (presence: BridgeMirrorPresence, fromHub: boolean): string => contentDigest({
-  fromHub,
-  hosts: presence.hosts.map(({ observedAt: _observedAt, expiresAt: _expiresAt, record, ...host }) => ({
-    ...host, record: { ...record, updatedAt: undefined, expiresAt: undefined },
-  })).sort((a, b) => a.record.id.localeCompare(b.record.id)),
-  participants: presence.participants.map(({ updatedAt: _updatedAt, ...participant }) => participant)
-    .sort((a, b) => a.id.localeCompare(b.id)),
-  dropped: presence.dropped,
-  partial: presence.partial,
-  droppedCount: presence.droppedCount,
-});
-
-const mirrorSafeThrough = (presence: BridgeMirrorPresence, liveAt: number): number => presence.hosts.reduce((until, host) =>
-  Math.min(until, liveAt + Math.min(BRIDGE_LEASE_MS,
-    Math.max(0, host.expiresAt - (typeof host.observedAt === "number" ? host.observedAt : liveAt)))),
-  liveAt + BRIDGE_LEASE_MS);
-
 // ---------------------------------------------------------------------------------------------
 // Handoffs (smarty-dev#9074). A Main moved from the hub to a remote host keeps its session id, so
 // its own dead native records on the hub reserve that id and the bridge refuses the moved Main
@@ -583,11 +567,12 @@ export const BRIDGE_HANDOFF_PREFIX = "topology/handoffs/";
 const HELD_STATE_PREFIXES = [HOST_PREFIX, PARTICIPANT_PREFIX, BRIDGE_HANDOFF_PREFIX] as const;
 /** #mirror: bounded optimistic snapshot/lease-stamp validations before a retryable refusal. */
 const MIRROR_PLAN_ATTEMPTS = 3;
+
 // SQLite mirror batches have at most 64 topology operations, 64 outbox rows, and 16 retirements
-// (144 total). Each host row's lease effect stays durable in the same commit. The file backend
-// retains its single-writer batch; both backends apply effects only after releasing snapshot custody.
+// (144 total). Each new or changed host row's lease effect stays durable in the same commit; the
+// renewals of unchanged rows commit nothing (see #mirror). The file backend retains its
+// single-writer batch; both backends apply effects only after releasing snapshot custody.
 const MIRROR_STATE_BATCH_SIZE = 64;
-const MIRROR_EFFECT_BATCH_SIZE = 64;
 const MIRROR_RETIRE_BATCH_SIZE = 16;
 /** A mirror plan made before the transaction no longer matches its snapshot: roll back, plan again. */
 class MirrorPlanStale extends Error {}
@@ -812,7 +797,7 @@ export class StoreBridgeSide implements BridgeSide {
   // Active only during one mirror commit attempt, including recovery and afterCommit retries.
   #skippedRoots: ReadonlySet<string> | undefined;
   #leaseProcess: Promise<BridgeLeaseProcess | undefined> | undefined;
-  #mirrorFastCache: { fingerprint: string; revision: string; safeThrough: number; ignoredStateKeys: ReadonlySet<string> } | undefined;
+  readonly #reportedUnreadable = new Set<string>();
 
   constructor(
     readonly store: MeshStore,
@@ -1526,6 +1511,8 @@ export class StoreBridgeSide implements BridgeSide {
 
   async #mirror(presence: BridgeMirrorPresence, final: boolean, observedAt?: number, fromHub = false): Promise<void> {
     await this.store.prepareLock();
+    // This host's own participant-directory reader decides which mirror rows are readable here.
+    const readsParticipant = (entry: MeshStateEntry): boolean => participantFromEntry(entry) !== undefined;
     const halted = (): boolean => this.#fenced && !final;
     const now = this.now();
     // A host live when the snapshot was requested stays admissible: a pass (slow presence read,
@@ -1547,15 +1534,6 @@ export class StoreBridgeSide implements BridgeSide {
       incomingAuthorityIds.add(participant.ownerIdentityId);
     }
     const partial = presenceIsPartial(presence);
-    const fingerprint = mirrorInputFingerprint(presence, fromHub);
-    const fastCache = this.#mirrorFastCache;
-    const fastRevision = this.store.stateRevision();
-    if (!final && !partial && this.#recovered && fastCache && fastRevision !== undefined &&
-      fastCache.fingerprint === fingerprint && now < fastCache.safeThrough &&
-      this.store.stateUnchangedSince(fastCache.revision, HELD_STATE_PREFIXES,
-        { ignore: fastCache.ignoredStateKeys, versions: new Map() }) &&
-      this.store.listAll(this.#outbox.prefix, { fresh: true }).length === 0) return;
-    this.#mirrorFastCache = undefined;
     // Stamp the existing mirror lease with LOCAL writer evidence, outside state custody.
     // A peer's claimed pid/host is never used, including for one-hop re-exports.
     const bridgeProcess = this.monitorLease ? await (this.#leaseProcess ??= (async () => {
@@ -1572,14 +1550,21 @@ export class StoreBridgeSide implements BridgeSide {
     // rows are committed, so newly-created lease files do not inflate every later custody scan.
     const stagedEffects = new Set<string>();
     const pendingEffects: Array<{ plan: ReturnType<CommitOutbox["plan"]>; view: MeshBatchView }> = [];
-    let completedIgnoreStateKeys: ReadonlySet<string> = new Set();
     const mirrorStateBatchSize = this.store.stateBackend === "sqlite" ? MIRROR_STATE_BATCH_SIZE : Number.MAX_SAFE_INTEGER;
-    const mirrorEffectBatchSize = this.store.stateBackend === "sqlite" ? MIRROR_EFFECT_BATCH_SIZE : Number.MAX_SAFE_INTEGER;
     // A trusted hub can carry a stale projection from another link. That projection is
     // non-authoritative: keep the destination's newer mirror and let unrelated roots in this
     // same pass proceed. The set spans plan retries so one root produces one warning per pass.
     const skippedRoots = new Set<string>();
     const preservedRoots = new Set<string>();
+    // Participant records this host's directory would refuse; reported once per id (bounded), not per pass.
+    const unreadableParticipants = new Set<string>();
+    const reportUnreadable = (): void => {
+      const fresh = [...unreadableParticipants].filter(id => !this.#reportedUnreadable.has(id));
+      if (!fresh.length || this.#reportedUnreadable.size >= 1_000) return;
+      for (const id of fresh.slice(0, 1_000 - this.#reportedUnreadable.size)) this.#reportedUnreadable.add(id);
+      console.warn(`bridge ${this.peer}: not mirroring ${fresh.length} participant record(s) this host's participant ` +
+        `directory refuses as malformed (${fresh.slice(0, 3).join(", ")}${fresh.length > 3 ? ", ..." : ""})`);
+    };
     // Recompute only the collision protection from the raw records and current leases. The
     // commit-time check uses the entries captured by the early plan, which stateUnchangedSince
     // proves are still current, so it does not perform a topology scan while holding state.db.
@@ -1849,10 +1834,16 @@ export class StoreBridgeSide implements BridgeSide {
           if (remoteHostOf(participant) !== undefined && (!fromHub || participant.bridgeVia !== this.peer ||
               participant.remoteHost !== owner.remoteHost)) continue;
           if (owner.id !== participant.id || owner.identity.id !== participant.ownerIdentityId || owner.rootId !== participant.rootId) continue;
-          wanted.set(keyFor(PARTICIPANT_PREFIX, participant.id), {
-            value: { ...participant, remoteHost: participant.remoteHost ?? this.peer },
-            identity: owner.identity,
-          });
+          const key = keyFor(PARTICIPANT_PREFIX, participant.id);
+          const value = { ...participant, remoteHost: participant.remoteHost ?? this.peer };
+          // smarty-dev#13645: never write a mirror row this host's own participant directory refuses.
+          // Every reader would drop it and publish one malformed-mirror refusal per row; thousands of
+          // those single-event appends crowd the event log while a first mirror catches up.
+          if (!readsParticipant({ key, value, version: 0, updatedAt: now, updatedBy: owner.identity })) {
+            unreadableParticipants.add(participant.id);
+            continue;
+          }
+          wanted.set(key, { value, identity: owner.identity });
         }
         const mirrored = new Map([...hostEntries, ...participantEntries].map((entry) => [entry.key, entry]));
         const ops: MeshBatchOperation[] = [];
@@ -1897,6 +1888,61 @@ export class StoreBridgeSide implements BridgeSide {
         return { ops, leases, removed, judged: livenessSensitive
           ? { livenessWindow: leaseLivenessWindow(scan.leases, scan.now) } : {} };
     };
+    // Cap sampled authority at its ORIGINAL translated source deadline after any wait. A sample
+    // that expired meanwhile stays expired; committing it renews neither its observation nor its
+    // authority (#10068; independent review P2). A changed host row carries the lease's deadline.
+    const capSampled = (result: NonNullable<ReturnType<typeof compute>>): { ops: MeshBatchOperation[]; leases: BridgeLease[] } => {
+      const deadlines = new Map<string, number>();
+      const capped = result.leases.map(lease => {
+        const sample = lease.mirror;
+        if (!sample) return lease;
+        const origin = sample.observedAt + Math.min(BRIDGE_LEASE_MS, sample.sourceExpiresAt - sample.sourceObservedAt);
+        const until = Math.min(lease.expiresAt, origin);
+        deadlines.set(keyFor(HOST_PREFIX, lease.id), until);
+        return { ...lease, expiresAt: until };
+      });
+      const ops = deadlines.size === 0 ? result.ops : result.ops.map(op => {
+        const until = op.kind === "put" ? deadlines.get(op.key) : undefined;
+        return op.kind === "put" && until !== undefined && isObject(op.value)
+          ? { ...op, value: { ...op.value, expiresAt: until } } : op;
+      });
+      return { ops, leases: capped };
+    };
+    const leaseEffects = (renewals: readonly BridgeLease[]): CommitOutboxEffect[] =>
+      renewals.map(lease => ({ kind: "lease", key: `lease:${lease.id}`, payload: lease }));
+    // smarty-dev#13645 P2-b: a pass that writes no state row has no COMMIT for namespace custody
+    // to protect. Plan once on a committed snapshot WITHOUT the namespace gates. When that plan only
+    // renews the leases of unchanged rows, stage the renewals non-durably (main's lease-only
+    // semantics: a crash loses a renewal and leaves the earlier-expiring lease, fail closed) and
+    // apply each under its own host gate, where #applyLease rereads the owner row and writes by
+    // exact file version. Any row write, omission, voided handoff, refusal, halt or backend without
+    // a revision view falls through: its inputs are captured again under the gates before COMMIT.
+    // A side's first pass installs its rows, so it skips this probe rather than plan the fleet twice.
+    // Handoff rows (a void depends on liveness at COMMIT) and unconfirmed outbox rows of this scope
+    // (replay and retirement commit) also take the transaction path below.
+    const probe = this.#hasCommittedPass && !halted() && this.store.stateRevision() !== undefined &&
+      !this.#outbox.hasUnconfirmed() ? this.store.stateView() : undefined;
+    if (probe && probe.view.listAll(BRIDGE_HANDOFF_PREFIX).length === 0) {
+      let probed: ReturnType<typeof compute> | undefined;
+      try { probed = compute(probe.view, participantFileSnapshot(this.store.root), false); }
+      catch { probed = undefined; } // Refusals are decided again on the custody snapshot below.
+      if (probed && probed.ops.length === 0 && probed.removed.length === 0 && !halted()) {
+        const renewals = this.#outbox.plan();
+        leases = capSampled(probed).leases;
+        renewals.stage([], leaseEffects(leases));
+        this.#skippedRoots = skippedRoots;
+        try {
+          this.#outbox.pruneDone();
+          await renewals.runAsync(probe.view, halted);
+        } finally { this.#skippedRoots = undefined; }
+        if (!final) {
+          this.#hasCommittedPass = true;
+          if (!partial) this.#recovered = true;
+        }
+        reportUnreadable();
+        return;
+      }
+    }
     type CachedMirrorPlan = {
       revision: string;
       participantDirectoryStamp: string;
@@ -1992,20 +2038,7 @@ export class StoreBridgeSide implements BridgeSide {
               activePlan = cachedPlan;
               cachedPlan.participantDirectoryStamp = filesStamp;
             } else if (planRevision !== undefined && planned && leaseStamp !== undefined) {
-              const deadlines = new Map<string, number>();
-              const cachedLeases = planned.leases.map(lease => {
-                const sample = lease.mirror;
-                if (!sample) return lease;
-                const origin = sample.observedAt + Math.min(BRIDGE_LEASE_MS, sample.sourceExpiresAt - sample.sourceObservedAt);
-                const until = Math.min(lease.expiresAt, origin);
-                deadlines.set(keyFor(HOST_PREFIX, lease.id), until);
-                return { ...lease, expiresAt: until };
-              });
-              const cachedOps = deadlines.size === 0 ? planned.ops : planned.ops.map(op => {
-                const until = op.kind === "put" ? deadlines.get(op.key) : undefined;
-                return op.kind === "put" && until !== undefined && isObject(op.value)
-                  ? { ...op, value: { ...op.value, expiresAt: until } } : op;
-              });
+              const { ops: cachedOps, leases: cachedLeases } = capSampled(planned);
               cachedPlan = activePlan = { revision: planRevision,
                 participantDirectoryStamp: filesStamp, participantAuthorityStamp: participantAuthority ?? "unknown",
                 handoffSensitive: judgesLeaseLiveness, leaseStamp,
@@ -2035,20 +2068,7 @@ export class StoreBridgeSide implements BridgeSide {
                     : participantFileSnapshot(this.store.root);
                   const result = compute(view, participantFiles, false);
                   if (!result) return plan!.stage([], []);
-                  const deadlines = new Map<string, number>();
-                  const cachedLeases = result.leases.map(lease => {
-                    const sample = lease.mirror;
-                    if (!sample) return lease;
-                    const origin = sample.observedAt + Math.min(BRIDGE_LEASE_MS, sample.sourceExpiresAt - sample.sourceObservedAt);
-                    const until = Math.min(lease.expiresAt, origin);
-                    deadlines.set(keyFor(HOST_PREFIX, lease.id), until);
-                    return { ...lease, expiresAt: until };
-                  });
-                  const cachedOps = deadlines.size === 0 ? result.ops : result.ops.map(op => {
-                    const until = op.kind === "put" ? deadlines.get(op.key) : undefined;
-                    return op.kind === "put" && until !== undefined && isObject(op.value)
-                      ? { ...op, value: { ...op.value, expiresAt: until } } : op;
-                  });
+                  const { ops: cachedOps, leases: cachedLeases } = capSampled(result);
                   current = { revision: "", participantDirectoryStamp: filesStamp,
                     participantAuthorityStamp: participantAuthority ?? "unknown", handoffSensitive: false,
                     leaseStamp: "", leaseAuthorityStamp: "unknown", livenessWindow: undefined,
@@ -2067,12 +2087,12 @@ export class StoreBridgeSide implements BridgeSide {
                   !stagedEffects.has(`lease:${lease.id}`));
                 const batchUnleases = removed.filter(gone => stateKeys.has(gone.key) &&
                   !stagedEffects.has(`unlease:${gone.key}`));
-                // Once all row writes/removals are committed, renew unchanged lease files in
-                // bounded durable outbox batches too. That keeps first-mirror readiness explicit.
-                if (stateOps.length === 0) batchLeases = leases.filter(lease => !stagedEffects.has(`lease:${lease.id}`))
-                  .slice(0, mirrorEffectBatchSize);
+                // Once every row write/removal has committed, the unchanged rows' renewals are
+                // staged together and non-durably (main's lease-only semantics; nothing to COMMIT).
+                // New and changed rows' lease effects stay durable in their rows' commit above.
+                if (stateOps.length === 0) batchLeases = leases.filter(lease => !stagedEffects.has(`lease:${lease.id}`));
                 const batchEffects: CommitOutboxEffect[] = [
-                  ...batchLeases.map(lease => ({ kind: "lease", key: `lease:${lease.id}`, payload: lease })),
+                  ...leaseEffects(batchLeases),
                   ...batchUnleases.map(gone => ({ kind: "unlease", key: `lease:${gone.id}`, payload: gone })),
                 ];
                 stagedKeys = [
@@ -2083,10 +2103,7 @@ export class StoreBridgeSide implements BridgeSide {
                 more = fullOps.length > stateOps.length ||
                   leases.some(lease => !stagedEffects.has(`lease:${lease.id}`) && !batchEffectKeys.has(`lease:${lease.id}`)) ||
                   removed.some(gone => !stagedEffects.has(`unlease:${gone.key}`) && !batchEffectKeys.has(`unlease:${gone.key}`));
-                const staged = plan!.stage(stateOps, batchEffects, {
-                  durable: stateOps.length === 0 && batchEffects.length > 0,
-                  maxRetire: MIRROR_RETIRE_BATCH_SIZE,
-                });
+                const staged = plan!.stage(stateOps, batchEffects, { maxRetire: MIRROR_RETIRE_BATCH_SIZE });
                 return staged.filter(op => {
                   if (op.kind !== "delete" || !op.key.startsWith(this.#outbox.prefix)) return true;
                   const row = view.get(op.key)?.value;
@@ -2117,10 +2134,7 @@ export class StoreBridgeSide implements BridgeSide {
               activePlan.ownVersions.clear();
             }
           }
-          if (activePlan) {
-            completedIgnoreStateKeys = activePlan.ignoredStateKeys;
-            activePlan.remainingOps = activePlan.remainingOps.slice(batchStateOps.length);
-          }
+          if (activePlan) activePlan.remainingOps = activePlan.remainingOps.slice(batchStateOps.length);
           break;
         } catch (error) {
           this.#skippedRoots = undefined;
@@ -2147,6 +2161,7 @@ export class StoreBridgeSide implements BridgeSide {
       // between bounded effect batches without an extra state transaction or early retirement.
       this.#skippedRoots = skippedRoots;
       try {
+        this.#outbox.pruneDone();
         for (const pending of pendingEffects) {
           if (halted()) break;
           await pending.plan.runAsync(pending.view, halted);
@@ -2158,12 +2173,7 @@ export class StoreBridgeSide implements BridgeSide {
       // A complete committed pass ends recovery; partial passes cannot certify pending omissions.
       if (!partial) this.#recovered = true;
     }
-    const revision = this.store.stateRevision();
-    if (!final && !partial && !halted() && this.#recovered && revision !== undefined &&
-      this.store.listAll(this.#outbox.prefix, { fresh: true }).length === 0) {
-      this.#mirrorFastCache = { fingerprint, revision, safeThrough: mirrorSafeThrough(presence, liveAt),
-        ignoredStateKeys: completedIgnoreStateKeys };
-    }
+    reportUnreadable();
   }
 
   #applyLease(lease: BridgeLease, replay: boolean): void {

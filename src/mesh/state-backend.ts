@@ -729,10 +729,11 @@ export class SqliteStateBackend implements StateBackend {
     const after = Number(stamp.slice(lineage.length + 1));
     if (lineageOf(current) !== lineage || !Number.isSafeInteger(after)) return false;
     const feed = this.#read(() => store.changesSince(after));
-    const expectedVersions = exceptKeys instanceof Map ? exceptKeys
-      : exceptKeys && !(exceptKeys instanceof Set) ? exceptKeys.versions : undefined;
-    const ignored = exceptKeys instanceof Set ? exceptKeys
-      : exceptKeys && !(exceptKeys instanceof Map) ? exceptKeys.ignore : undefined;
+    const pair = exceptKeys !== undefined && "ignore" in exceptKeys && "versions" in exceptKeys ? exceptKeys : undefined;
+    const expectedVersions: ReadonlyMap<string, number> | undefined = pair ? pair.versions
+      : exceptKeys instanceof Map ? exceptKeys : undefined;
+    const ignored: ReadonlySet<string> | undefined = pair ? pair.ignore
+      : exceptKeys instanceof Set ? exceptKeys : undefined;
     return feed.complete && !feed.changes.some(change => prefixes.some(prefix => change.key.startsWith(prefix)) &&
       !ignored?.has(change.key) && (!expectedVersions || change.version > (expectedVersions.get(change.key) ?? -1)));
   }

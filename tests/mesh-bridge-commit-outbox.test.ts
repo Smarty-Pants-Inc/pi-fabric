@@ -69,12 +69,95 @@ describe("bridge mirror commit outbox", () => {
     expect(readHostLease(hub.root, peer.identity.id)?.identityId).toBe(peer.identity.id);
     const rows = new CommitOutbox(hub, "bridge/ryzen2", bridgeIdentity, {});
     expect(batches[0]!.keys).toContain(rows.rowKey(`lease:${peer.identity.id}`));
-    // A lease-only effect uses a bounded durable outbox row, so a crash before its file write
-    // leaves fail-closed replay work even though the state topology itself did not change.
+    // A lease-only renewal commits nothing and records nothing; it still renews the lease file.
     fs.rmSync(path.join(hub.root, "host-leases"), { recursive: true, force: true });
     await side.mirror(peer.presence);
-    expect(batches[1]!.keys).toContain(rows.rowKey(`lease:${peer.identity.id}`));
+    expect(batches[1]!.keys).toEqual([]);
     expect(readHostLease(hub.root, peer.identity.id)).toBeDefined();
+  });
+
+  it("SQLite lease-only pass: no state transaction, no namespace custody, each renewal under its host gate", async () => {
+    const hub = store("sqlite");
+    let now = Date.now();
+    const peer = remote("lease-only", now);
+    const side = new StoreBridgeSide(hub, "ryzen2", () => now);
+    await side.mirror(peer.presence);
+    const first = readHostLease(hub.root, peer.identity.id)!;
+    expect(first).toBeDefined();
+    const rows = new CommitOutbox(hub, "bridge/ryzen2", bridgeIdentity, {});
+    // The first pass's install row stays until a later state commit retires it.
+    const installRow = hub.get(rows.rowKey(`lease:${peer.identity.id}`), { fresh: true });
+    const bridgeBatches = vi.fn();
+    const writeBatch = hub.writeBatch.bind(hub);
+    vi.spyOn(hub, "writeBatch").mockImplementation(async input => {
+      if (input.lockClass === "bridge") bridgeBatches(input);
+      return writeBatch(input);
+    });
+    const gates: string[] = [];
+    const leaseCustody = hub.leaseCustody.bind(hub);
+    vi.spyOn(hub, "leaseCustody").mockImplementation(async (file, operation, timeoutMs, options) => {
+      gates.push(file);
+      return leaseCustody(file, operation, timeoutMs, options);
+    });
+    now += 1_000;
+    await side.mirror(peer.presence);
+    // Nothing to COMMIT: no bridge transaction, no new outbox row, no lease-namespace gate.
+    expect(bridgeBatches).not.toHaveBeenCalled();
+    expect(hub.get(rows.rowKey(`lease:${peer.identity.id}`), { fresh: true })?.version).toBe(installRow?.version);
+    expect(gates).not.toContain(hostLeaseAdditionsGatePath(hub.root));
+    // The renewal itself ran under the target's own gate and moved the deadline.
+    expect(gates).toEqual([hostLeasePath(hub.root, peer.identity.id)]);
+    expect(readHostLease(hub.root, peer.identity.id)!.expiresAt).toBeGreaterThan(first.expiresAt);
+  });
+
+  it("SQLite lease-only pass: a native that takes the id after the plan keeps its row and lease", async () => {
+    const hub = store("sqlite");
+    let now = Date.now();
+    const peer = remote("lease-race", now);
+    const side = new StoreBridgeSide(hub, "ryzen2", () => now);
+    await side.mirror(peer.presence);
+    const native = { ...peer.host, startedAt: now + 5_000, updatedAt: now + 5_000, expiresAt: now + 90_000 };
+    const nativeLease = { id: peer.identity.id, rootId: peer.identity.id, identityId: peer.identity.id,
+      startedAt: native.startedAt, updatedAt: native.updatedAt, expiresAt: native.expiresAt };
+    const leaseCustody = hub.leaseCustody.bind(hub);
+    let tookOver = false;
+    vi.spyOn(hub, "leaseCustody").mockImplementation(async (file, operation, timeoutMs, options) => {
+      // After the lease-only plan, before its renewal enters the gate: the native claims the id under
+      // that same gate (lease file, then its own host row).
+      if (!tookOver && file === hostLeasePath(hub.root, peer.identity.id)) {
+        tookOver = true;
+        await leaseCustody(file, async () => {
+          writeHostLease(hub.root, nativeLease);
+          await hub.put({ key: hostKey(peer.identity.id), identity: peer.identity, value: native });
+        }, timeoutMs, options);
+      }
+      return leaseCustody(file, operation, timeoutMs, options);
+    });
+    now += 1_000;
+    await side.mirror(peer.presence);
+    expect(tookOver).toBe(true);
+    // The renewal reread the owner row under the gate: it is the native's now, so nothing was written.
+    expect(hub.get(hostKey(peer.identity.id), { fresh: true })?.value).not.toHaveProperty("remoteHost");
+    expect(readHostLease(hub.root, peer.identity.id)).toMatchObject({ startedAt: native.startedAt, expiresAt: native.expiresAt });
+  });
+
+  it("never mirrors a participant record this host's participant directory refuses as malformed", async () => {
+    const hub = store("sqlite");
+    const now = Date.now();
+    const good = remote("readable", now);
+    const bad = remote("unreadable", now);
+    const badParticipant = { ...bad.participant, capabilities: ["steer", "not-a-capability"] } as unknown as FabricParticipantRecord;
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const side = new StoreBridgeSide(hub, "ryzen2");
+    const presence = { hosts: [...good.presence.hosts, ...bad.presence.hosts], participants: [good.participant, badParticipant] };
+    await side.mirror(presence);
+    await side.mirror(presence);
+    // Its host still mirrors; only the row every local reader would refuse is withheld.
+    expect(hub.get(hostKey(bad.identity.id), { fresh: true })).toBeDefined();
+    expect(hub.get(participantKey(bad.identity.id), { fresh: true })).toBeUndefined();
+    expect(hub.get(participantKey(good.identity.id), { fresh: true })?.value).toMatchObject({ remoteHost: "ryzen2" });
+    const lines = warn.mock.calls.map(([line]) => String(line)).filter(line => line.includes("refuses as malformed"));
+    expect(lines).toEqual([expect.stringContaining(bad.identity.id)]);
   });
 
   it("crash after the mirror commit, before the lease write: the next pass writes it once and deletes the row", async () => {

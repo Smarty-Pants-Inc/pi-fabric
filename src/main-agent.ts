@@ -588,7 +588,7 @@ export class MainAgentController implements FabricMainAgentTarget {
   #bindingMutation: Promise<unknown> = Promise.resolve();
   #wake: ReturnType<typeof setInterval> | undefined;
   #preflightWake: ReturnType<typeof setInterval> | undefined;
-  #operation: AbortSignal | undefined;
+  #operation: { kind: "compact" | "tree"; signal: AbortSignal | undefined } | undefined;
 
   constructor(
     readonly pi: ExtensionAPI,
@@ -829,7 +829,8 @@ export class MainAgentController implements FabricMainAgentTarget {
     const operatorHalted = this.#halted && !peerSteerWake;
     if (operatorHalted) item.deliveryReason = "operator-halt";
     const providerHeld = triggerTurn && request.delivery !== "nextTurn" &&
-      !this.#context?.signal?.aborted && (this.#providerHeld() || this.#providerAttemptInFlight);
+      !this.#context?.signal?.aborted && (this.#providerHeld() || this.#providerAttemptInFlight ||
+        (this.#providerFailed && this.#context && (promptPending(this.#context) || !this.#context.isIdle())));
     if (providerHeld && request.delivery === "steer") {
       item.deliverAs = request.delivery;
       item.triggerTurn = true;
@@ -1521,15 +1522,18 @@ export class MainAgentController implements FabricMainAgentTarget {
     // wake, not to infer operator intent from a generic native controller.
     on("session_before_compact", (event: { signal?: AbortSignal }) => {
       this.#stopOperation();
-      this.#operation = event.signal;
+      this.#operation = { kind: "compact", signal: event.signal };
     });
     on("session_compact_failed", (event: { reason?: string; aborted?: boolean; willRetry?: boolean; errorMessage?: string }, ctx) => {
       this.#context = ctx;
       // A seen signal distinguishes cancellation from the recoverable native
       // deadline, not an operator from an SDK/extension caller. Escape/halt is explicit.
+      // Pi also reports aborted for extension vetoes, even with an un-aborted signal;
+      // without a signal the envelope alone cannot establish cancellation either.
       const decline = takeCompactionDecline(this.pi);
-      const operation = decline && decline.reason === event.reason ? decline.signal : this.#operation;
-      const cancelled = ctx.signal?.aborted || (event.aborted && isCompactionCancelled(operation));
+      const operation = decline && decline.reason === event.reason ? decline.signal
+        : this.#operation?.kind === "compact" ? this.#operation.signal : undefined;
+      const cancelled = ctx.signal?.aborted || isCompactionCancelled(operation);
       // Exact Pi no-op outcomes, with or without the host's error envelope. A provider
       // error merely quoting these phrases is still a recoverable failure, not a no-op.
       const message = event.errorMessage?.replace(/^Compaction failed: /, "");
@@ -1556,7 +1560,13 @@ export class MainAgentController implements FabricMainAgentTarget {
       // Later peer deliveries retain permission after a veto; errors await recovery,
       // but only a real owner stop survives reload.
       if (event.reason === "manual" && ctx.isIdle()) this.#release(false);
+      // Terminal compaction failure cancels its deferred wake too; retiring an
+      // operation alone must not cancel an unrelated preflight waiter.
+      this.#stopWake();
       this.#stopOperation();
+      // Transfer recoverable failures back to the provider deadline (possibly already due).
+      // Its callback still waits for all completion handlers and prompt preflight to end.
+      if (!cancelled && this.#providerFailed) this.#scheduleProviderWake();
     });
     on("session_compact", (event: { reason?: string }, ctx) => {
       this.#context = ctx;
@@ -1569,13 +1579,14 @@ export class MainAgentController implements FabricMainAgentTarget {
       this.#providerCompacted();
       // Retain the signal through EVERY completion handler, in both drain modes.
       if (event.reason === "manual") this.#wakeWhenIdle();
-      else this.#stopOperation();
+      else { this.#stopWake(); this.#stopOperation(); }
     });
     on("agent_start", (_event, ctx) => {
       resetPrincipalDiagnosticTurn(this.pi, ctx);
       // The HOLD-induced restart belongs to the interrupted turn, not a fresh abort budget.
       if (!this.#interruptResume) this.#interruptUsedThisTurn = false;
       this.#interruptResume = false;
+      this.#stopWake();
       this.#stopOperation();
       this.#providerFailureRecorded = false;
       this.#stopProviderWake();
@@ -1644,14 +1655,14 @@ export class MainAgentController implements FabricMainAgentTarget {
     // leaves them to that run's boundaries.
     // The operation's own abort signal says whether the user cancelled it: Pi can report that
     // cancel after Main is idle again, or not at all (review/astra on pi-fabric#102).
-    on("session_before_tree", (event: { signal?: AbortSignal }) => { this.#stopOperation(); this.#operation = event.signal; });
+    on("session_before_tree", (event: { signal?: AbortSignal }) => { this.#stopOperation(); this.#operation = { kind: "tree", signal: event.signal }; });
     // A branch summary on /tree navigation is the same: busy without a run. A cancelled one
     // emits nothing, so its followUps wait for the next run.
     on("session_tree", (_event, ctx) => {
       this.#context = ctx;
       this.#wakeWhenIdle();
     });
-    on("agent_start", (_event, ctx) => { this.#context = ctx; this.#suspended = false; this.#stopWake(); });
+    on("agent_start", (_event, ctx) => { this.#context = ctx; this.#suspended = false; });
     this.#replay();
     this.#resumeProviderAfterAttach();
     if (this.#held.length && context.isIdle()) this.#release(true);
@@ -1786,17 +1797,18 @@ export class MainAgentController implements FabricMainAgentTarget {
     // Only an operation whose abort signal Fabric saw, and that was not aborted, wakes Main: a
     // cancel stops the wait at once, before Main is idle, and its followUps wait (appended by
     // session_compact_failed, or held for the next run). Without the signal, success is unknown.
-    if (this.#wake) return;
+    // Completion transfers idle authority from the generic waiter to this signal.
+    this.#stopWake();
     const operation = this.#operation;
     // Retain cancellation evidence while later completion handlers still run.
     this.#wake = setInterval(() => {
       if (this.#contextRetired()) return;
       // Drain-off uses #closed to stop holding, not to end a manual operation. Close
       // itself cancels this timer; only the real idle boundary retires its signal.
-      if (!this.#context || !operation || operation.aborted) {
+      if (!this.#context || !operation?.signal || operation.signal.aborted) {
         if (this.#operation === operation) this.#stopOperation();
         this.#stopWake();
-      } else if (this.#context?.isIdle()) {
+      } else if (this.#context?.isIdle() && !promptPending(this.#context)) {
         if (this.#operation === operation) this.#stopOperation();
         this.#held.length ? this.#release(true) : this.#stopWake();
         this.#armProviderDeadTimer();                      // the operation's idle edge; no-op unless pending
@@ -1809,9 +1821,16 @@ export class MainAgentController implements FabricMainAgentTarget {
     // Handled input and failed validation clear isPromptPending without any run/settle
     // event. Observe that completion only after admission is journalled. If a run starts,
     // leave FIFO delivery to its boundaries; halt/reload/close cancel this waiter too.
-    if (this.#preflightWake) return;
+    if (this.#preflightWake || this.#wake) return;
+    // Cancelled /tree emits no completion event. Its cancellation predates this
+    // new wait even if Pi is busy again. At idle a cancelled compaction has ended too.
+    // A signal that aborts after capture still vetoes its own deferred wake.
+    if (isCompactionCancelled(this.#operation?.signal) &&
+      (this.#operation?.kind === "tree" || this.#context?.isIdle())) this.#stopOperation();
+    const operation = this.#operation;
     this.#preflightWake = setInterval(() => {
       if (this.#contextRetired()) return;
+      if (isCompactionCancelled(operation?.signal)) { this.#stopWake(); return; }
       const ctx = this.#context;
       // A no-run preflight may also leave an async compaction handler finishing. Busy
       // alone is not proof of agent_start; that event explicitly cancels this waiter.
@@ -1839,7 +1858,8 @@ export class MainAgentController implements FabricMainAgentTarget {
   }
 
   #stopOperation(): void {
-    // Retiring a compaction signal must not cancel a scheduled provider retry.
+    // Retire only operation-owned completion polling, not an unrelated preflight
+    // waiter or provider deadline. Terminal boundaries cancel those explicitly.
     if (this.#wake) clearInterval(this.#wake);
     this.#wake = undefined;
     this.#operation = undefined;
@@ -1948,7 +1968,10 @@ export class MainAgentController implements FabricMainAgentTarget {
   #providerHoldReason(): string {
     const dead = this.#providerDead;
     if (!dead) {
-      return this.#providerAttemptInFlight ? "provider-retry in flight" : `provider-backoff until ${new Date(this.#providerRetryAt).toISOString()}`;
+      if (this.#providerAttemptInFlight) return "provider-retry in flight";
+      return Date.now() < this.#providerRetryAt
+        ? `provider-backoff until ${new Date(this.#providerRetryAt).toISOString()}`
+        : "provider-retry waiting for idle";
     }
     const alarmed = dead.kind === "unclassified" ? `; ${dead.failures ?? UNCLASSIFIED_PROVIDER_DEAD_AFTER} failures in a row, ops alarmed, held until owner input`
       : "; ops alarmed, held until owner input";
@@ -2225,7 +2248,7 @@ export class MainAgentController implements FabricMainAgentTarget {
 
   #release(triggerTurn: boolean, closing = false): void {
     if (this.#reloading) return;
-    if (!closing && this.#context && promptPending(this.#context)) {
+    if (!closing && triggerTurn && !this.#halted && !this.#context?.signal?.aborted && this.#context && promptPending(this.#context)) {
       this.#wakeAfterPreflight();
       return;
     }
@@ -2245,6 +2268,12 @@ export class MainAgentController implements FabricMainAgentTarget {
       this.#stopProviderWake();
       if (!this.#held.length) this.#providerReleaseUntil = undefined;
       this.#scheduleProviderWake();
+      return;
+    }
+    // Expiry is permission to retry, not proof that Pi can accept a new run.
+    if (!closing && this.#providerFailed && triggerTurn && !this.#halted && !this.#context?.signal?.aborted &&
+      this.#context && !this.#context.isIdle()) {
+      this.#wakeAfterPreflight();
       return;
     }
     this.#stopWake();

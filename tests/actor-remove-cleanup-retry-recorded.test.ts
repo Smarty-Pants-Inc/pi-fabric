@@ -9,8 +9,8 @@ import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { mainPublicationFenced } from "../src/topology/main-publication-fence.js";
 import { failActorTreeRemoval } from "./helpers/actor-tree-removal.js";
 
-// Supplement to actor-directory.test.ts "#169 round 1 ... exhausted retries": the same exact-id cleanup retry contract,
-// recorded instead of deleting (smarty-dev#4664: no product actor tree is actually deleted locally). The first cleanup
+// Supplement to actor-directory.test.ts "... cleanup-only id after exhausted retries": the same exact-id cleanup retry
+// contract, recorded instead of deleting (no product actor tree is actually deleted locally). The first cleanup
 // runs the REAL verifiedRemove with the manager's own options; failActorTreeRemoval faults its first tree mutation
 // (Linux: the graveyard move; elsewhere: main's path fallback), so the cleanup stays pending. The explicit exact-id
 // retry runs the same REAL verifier with dryRun: true only: it verifies the judged tree under the held fence and

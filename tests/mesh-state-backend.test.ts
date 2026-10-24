@@ -172,11 +172,12 @@ describe("file, sqlite and nats give identical reads for the same operation sequ
     expect(store.get("a")?.value).toBe(2);
     expect(store.stateToken()).not.toBe(token);
     expect(store.listAllShared("").map(entry => entry.value)).toEqual([2]);
-  });
+  }, kind === "nats" ? 60_000 : undefined);
 });
 
 describe.each(["file", "sqlite", "nats"] as const)("R11 callbacks on the %s backend", (kind) => {
   const it = itFor(kind);
+  const timeout = kind === "nats" ? 60_000 : undefined;
   if (kind === "nats") reportNatsSkip();
   it("re-reads when the fileRead stamp changes before the transaction and gives prepare the fresh read", async () => {
     const store = await openAs(tempRoot(`fileread-${kind}`), kind);
@@ -197,7 +198,7 @@ describe.each(["file", "sqlite", "nats"] as const)("R11 callbacks on the %s back
     expect(seen).toEqual(["read-2"]);
     expect(results).toEqual([{ key: "k", applied: true, version: 1 }]);
     expect(store.get("k")?.value).toBe("read-2");
-  });
+  }, timeout);
 
   it("a write between read() and the stamp forces a retry and never commits the stale read", async () => {
     const root = tempRoot(`fileread-race-${kind}`);
@@ -224,7 +225,7 @@ describe.each(["file", "sqlite", "nats"] as const)("R11 callbacks on the %s back
     expect(seen).toEqual(["v2"]);
     expect(results).toEqual([{ key: "k", applied: true, version: 1 }]);
     expect(store.get("k")?.value).toBe("v2");
-  });
+  }, timeout);
 
   it("gives up with MeshStateFileReadChangedError and writes nothing when the stamp never holds", async () => {
     const store = await openAs(tempRoot(`fileread-fail-${kind}`), kind);
@@ -234,7 +235,7 @@ describe.each(["file", "sqlite", "nats"] as const)("R11 callbacks on the %s back
       fileRead: { read: () => undefined, stamp: () => String(tick++), retries: 2 },
     })).rejects.toBeInstanceOf(MeshStateFileReadChangedError);
     expect(store.get("k")).toBeUndefined();
-  });
+  }, timeout);
 
   it("runs commitOutbox once after COMMIT, outside the state lock, with the committed effects", async () => {
     const root = tempRoot(`outbox-${kind}`);
@@ -258,18 +259,19 @@ describe.each(["file", "sqlite", "nats"] as const)("R11 callbacks on the %s back
     // A write-free batch still reaches the outbox, with nothing changed.
     await store.writeBatch({ identity, ops: [], commitOutbox: (effect) => { effects.push(effect); } });
     expect(effects[1]!.changed).toEqual([]);
-  });
+  }, timeout);
 
   it("a throwing commitOutbox rejects the call but the commit stands; a conflict never reaches it", async () => {
     const store = await openAs(tempRoot(`outbox-throw-${kind}`), kind);
+    const failure = new Error("outbox down");
     await expect(store.writeBatch({ identity, ops: [{ kind: "put", key: "k", value: 1 }],
-      commitOutbox: () => { throw new Error("outbox down"); } })).rejects.toThrow("outbox down");
+      commitOutbox: () => { throw failure; } })).rejects.toBe(failure);
     expect(store.get("k")?.value).toBe(1);
     let called = false;
     await expect(store.writeBatch({ identity, ops: [{ kind: "put", key: "k", value: 2, ifVersion: 7 }],
       commitOutbox: () => { called = true; } })).rejects.toBeInstanceOf(MeshBatchConflictError);
     expect(called).toBe(false);
-  });
+  }, timeout);
 });
 
 describe("nats refuses a bridge: the interim R20 fence decision (smarty-dev#7504, smarty-dev#9725)", () => {

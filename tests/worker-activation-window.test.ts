@@ -109,6 +109,63 @@ describe("activation projection", () => {
     expect(() => window.verifySystem(journal, [head([journal[0], journal[3]]), current])).toThrow(/system records/);
   });
 
+  // Real Pi 1.2 forced-prompt projection renders sections into content. The same
+  // native renderer also accepts Pi 1.1 content records; neither changes authority.
+  it.each(["content", "sections"] as const)("accepts a rendered native system head from %s records", shape => {
+    const tool = { name: "read", description: "Read a file", parameters: { type: "object" } };
+    const record = { role: "system" as const, content: shape === "content" ? "BASE\n\nRULES" : "",
+      ...(shape === "sections" ? { sections: { preamble: "BASE", rules: "RULES" } } : {}),
+      toolsAdded: [tool], timestamp: 1 };
+    const journal = [record, user("current activation")];
+    const head = getCurrentSystemMessage(journal)!;
+    const rendered = { role: "system" as const, content: getCurrentSystemPrompt(journal),
+      toolsAdded: head.toolsAdded!, timestamp: head.timestamp };
+    const window = new ActivationWindow([record]);
+    expect(() => window.verifySystem(journal, [head])).not.toThrow();
+    expect(() => window.verifySystem(journal, [rendered])).not.toThrow();
+    expect(() => window.verifySystem(journal, [{ ...rendered, content: "FORGED" }])).toThrow(/system prompt/);
+    expect(() => window.verifySystem(journal, [{ ...rendered, toolsAdded: [] }])).toThrow(/system prompt/);
+    expect(() => window.verifySystem(journal, [{ ...rendered, toolsAdded: [{ ...tool, parameters: { type: "string" } }] }])).toThrow(/system prompt/);
+    expect(() => window.verifySystem(journal, [{ ...rendered, timestamp: 2 }])).toThrow(/system prompt/);
+  });
+
+  it.each([false, true])("accepts only the witnessed factory native projection (forced prompt: %s)", forced => {
+    const names = ["read", "grep", "find", "ls", "bash", "write", "fabric_exec", "fabric_reply"];
+    const tools = names.map(name => ({ name, description: name, parameters: { type: "object" } }));
+    const record = { role: "system" as const, content: "", sections: { preamble: "FACTORY_PROMPT" }, toolsAdded: tools, timestamp: 1 };
+    const current = user("current factory envelope");
+    const window = new ActivationWindow([record]);
+    const projection = { hiddenTools: names.slice(0, 6),
+      forceSystemPrompt: forced ? "NATIVE_NON_IDENTITY_PROMPT" : undefined };
+    window.setNativeProjection(projection);
+    // The snapshot must not follow later mutations of the shared hook options.
+    projection.hiddenTools.length = 0;
+    projection.forceSystemPrompt = "FORGED";
+    const running = { role: "system" as const, content: forced ? "NATIVE_NON_IDENTITY_PROMPT" : "FACTORY_PROMPT",
+      toolsAdded: tools.slice(6), timestamp: 1 };
+    expect(() => window.verifySystem([record, current], [running, current])).not.toThrow();
+    expect(() => window.verifySystem([record, current], [{ ...running, content: "FORGED" }, current])).toThrow(/system prompt/);
+    expect(() => window.verifySystem([record, current], [{ ...running, toolsAdded: [] }, current])).toThrow(/system prompt/);
+    expect(() => window.verifySystem([record, current], [{ ...running, toolsAdded: [tools[0]!] }, current])).toThrow(/system prompt/);
+    expect(() => window.verifySystem([record, current], [{ ...running, timestamp: 2 }, current])).toThrow(/system prompt/);
+    // Even hidden tool bytes and prompt text masked by a forced prompt remain witnessed.
+    expect(() => window.verifySystem([{ ...record, toolsAdded: [{ ...tools[0]!, description: "FORGED" }, ...tools.slice(1)] }, current],
+      [running, current])).toThrow(/system records/);
+    expect(() => window.verifySystem([{ ...record, sections: { preamble: "FORGED" } }, current], [running, current])).toThrow(/system records/);
+  });
+
+  it("rejects a rewritten earlier section even when a later patch hides it in the rendered head", () => {
+    const system = (preamble: string) => ({ role: "system" as const, content: "", sections: { preamble }, timestamp: 1 });
+    const first = system("ORIGINAL");
+    const journal = [first, system("CURRENT")];
+    const running = [{ role: "system" as const, content: getCurrentSystemPrompt(journal), timestamp: 1 }];
+    const window = new ActivationWindow(journal);
+    expect(() => window.verifySystem(journal, running)).not.toThrow();
+    const forged = [system("FORGED"), journal[1]!];
+    expect(getCurrentSystemPrompt(forged)).toBe(getCurrentSystemPrompt(journal));
+    expect(() => window.verifySystem(forged, running)).toThrow(/system records/);
+  });
+
   it("projects a large prior activation without a token ceiling on the current activation", () => {
     const old = [user("x".repeat(900_000)), assistant("old", 240_000)];
     const current = user("y".repeat(100_000));
@@ -220,6 +277,90 @@ describe("activation projection", () => {
     }
     if (mode === "no-callback") expect(fs.existsSync(callbackFile)).toBe(false);
     else expect(fs.readFileSync(callbackFile, "utf8")).toBe("callback\n");
+  }, TEST_GUARD_MS);
+
+  // Trust boundary and pi-fabric#1520 real catch: a prepareLoadout tool must be
+  // able to hide the six core declarations, but a later extension must not
+  // redefine the unjournaled projection between the two startup hooks.
+  it.each(["unchanged", "reordered", "prepare-loadout", "journaled-sections", "hidden-push", "hidden-replace", "selected-push", "selected-replace", "delete-slot", "forced", "nested"])("witnesses startup options across the real native hook chain (%s)", mode => {
+    const dir = root();
+    fs.symlinkSync(path.resolve("node_modules"), path.join(dir, "node_modules"), "junction");
+    const evidence = path.join(dir, "evidence.json");
+    const mutated = path.join(dir, "mutated");
+    const hook = fs.realpathSync(path.resolve("src/worker/activation-window.ts"));
+    const child = path.join(dir, "startup-options.mjs");
+    fs.writeFileSync(child, `
+      import fs from 'node:fs';
+      import { Type, fauxProvider, fauxAssistantMessage, getCurrentSystemMessage } from '@earendil-works/pi-ai';
+      import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager } from ${JSON.stringify(selectedNativeBinary
+        ? pathToFileURL(path.join(path.dirname(selectedNativeBinary), "index.js")).href
+        : "@earendil-works/pi-coding-agent")};
+      import hook from ${JSON.stringify(pathToFileURL(hook).href)};
+      process.env.PI_FABRIC_ACTIVATION_WORKER_PID = String(process.ppid);
+      process.env.PI_FABRIC_ACTIVATION_NONCE = 'startup-nonce';
+      process.env.PI_FABRIC_PARENT_RUN = 'startup-test';
+      process.env.PI_FABRIC_ACTIVATION_HOOK = ${JSON.stringify(hook)};
+      const root = ${JSON.stringify(dir)};
+      const mode = ${JSON.stringify(mode)};
+      const modelRuntime = await ModelRuntime.create({modelsPath:null, refreshOnCreate:false, authPath:root+'/unused-auth.json'});
+      const faux = fauxProvider(); modelRuntime.registerNativeProvider(faux.provider);
+      faux.setResponses([context => {
+        fs.writeFileSync(${JSON.stringify(evidence)}, JSON.stringify({requests:1,
+          tools:getCurrentSystemMessage(context.messages)?.toolsAdded?.map(tool=>tool.name),
+          ...(mode === 'journaled-sections' ? {guidance:getCurrentSystemMessage(context.messages)?.sections?.fabric_execution} : {})}));
+        return fauxAssistantMessage('unchanged startup passed');
+      }]);
+      const loader = new DefaultResourceLoader({cwd:root, agentDir:root, noSkills:true, noPromptTemplates:true, noThemes:true, noContextFiles:true,
+        extensionFactories:[{name:'activation-window', factory:hook}, {name:'later-extension', factory:pi => {
+          let hidden = [];
+          pi.registerTool({name:'startup_probe', label:'Startup probe', description:'Startup probe', parameters:Type.Object({}),
+            execute:async()=>({content:[], details:undefined}), prepareLoadout:()=>({hiddenDeclarations:hidden})});
+          pi.on('before_agent_start', event => {
+            fs.writeFileSync(${JSON.stringify(mutated)}, mode);
+            const options = event.systemPromptOptions;
+            // Native loadout finalization rewrites hiddenTools after this hook.
+            // Keep the extension's new hiding choice through that real boundary.
+            hidden = mode === 'prepare-loadout' ? ['read', 'grep', 'find', 'ls', 'bash', 'write']
+              : mode === 'hidden-push' || mode === 'hidden-replace' ? ['read'] : [];
+            if (mode === 'hidden-push') options.hiddenTools.push('read');
+            if (mode === 'hidden-replace') options.hiddenTools = ['read'];
+            if (mode === 'selected-push') options.selectedTools.push('nonexistent');
+            if (mode === 'selected-replace') options.selectedTools = ['startup_probe'];
+            if (mode === 'delete-slot') { delete options.hiddenTools; options.hiddenTools = []; }
+            if (mode === 'journaled-sections') options.sections.fabric_execution = 'JOURNALED_GUIDANCE';
+            if (mode === 'forced') options.forceSystemPrompt = 'FORGED';
+            if (mode === 'nested') options.toolGuidelines.read = ['FORGED'];
+            if (mode === 'reordered') {
+              const entries = Object.entries(options).reverse();
+              // Reorder ordinary fields, preserving Pi's witnessed finalization slots.
+              const ordinary = entries.filter(([key])=>!['selectedTools', 'hiddenTools'].includes(key));
+              for (const [key] of ordinary) delete options[key];
+              Object.assign(options, Object.fromEntries(ordinary));
+            }
+          });
+        }}]});
+      await loader.reload();
+      const {session} = await createAgentSession({cwd:root, agentDir:root, modelRuntime, model:faux.getModel(), resourceLoader:loader,
+        sessionManager:SessionManager.inMemory(root), tools:['read', 'grep', 'find', 'ls', 'bash', 'write', 'startup_probe']});
+      const errors = [];
+      await session.bindExtensions({mode:'rpc', onError:error=>errors.push(String(error))});
+      try {
+        await session.prompt('current activation');
+        if (errors.length) throw new Error(errors.join('\\n'));
+      } finally {session.dispose()}
+    `);
+    const result = spawnSync(process.execPath, [child], { encoding: "utf8", timeout: HANG_GUARD_MS });
+    const refuses = !["unchanged", "reordered", "prepare-loadout", "journaled-sections"].includes(mode);
+    expect(fs.readFileSync(mutated, "utf8"), result.stderr).toBe(mode);
+    expect(result.status, result.stderr).toBe(refuses ? 78 : 0);
+    if (refuses) {
+      expect(result.stderr).toContain("Fabric activation window failed: Error: Activation window lost native startup options");
+      expect(fs.existsSync(evidence)).toBe(false);
+    } else {
+      expect(JSON.parse(fs.readFileSync(evidence, "utf8"))).toEqual({ requests: 1,
+        tools: mode === "prepare-loadout" ? ["startup_probe"] : ["read", "grep", "find", "ls", "bash", "write", "startup_probe"],
+        ...(mode === "journaled-sections" ? { guidance: "<fabric_execution>\nJOURNALED_GUIDANCE\n</fabric_execution>" } : {}) });
+    }
   }, TEST_GUARD_MS);
 
   it("restores shared native provider methods and fences a late payload callback across real actor reload (#5962)", () => {
@@ -393,7 +534,7 @@ describe("native activation window (offline; opted-in success needs exact native
   };
   const setup = async (toolRounds = 0, oversizedRound = 0, toolTask?: string,
     api: "openai-completions" | "google-generative-ai" = "openai-completions", fabric = false, runtimeTool = false,
-    contextWindow = fabric || runtimeTool ? 128000 : 8000, finalText = "useful current result") => {
+    contextWindow = fabric || runtimeTool ? 128000 : 8000, finalText = "useful current result", structuredReply = false) => {
     const dir = root();
     const requests: Array<Record<string, any>> = [];
     let requestCount = 0;
@@ -418,7 +559,11 @@ describe("native activation window (offline; opted-in success needs exact native
           id: "offline", object: "chat.completion.chunk", created: 1, model: "offline",
           choices: [{ index: 0, delta, finish_reason }],
         })}\n\n`);
-        if (useTool) {
+        if (structuredReply) {
+          chunk({ role: "assistant", tool_calls: [{ index: 0, id: "factory-reply", type: "function",
+            function: { name: "fabric_reply", arguments: JSON.stringify({ action: "silent" }) } }] });
+          chunk({}, "tool_calls");
+        } else if (useTool) {
           chunk({ role: "assistant", tool_calls: [{ index: 0, id: toolRounds ? `read-${round}` : "read-current", type: "function", function: { name: runtimeTool ? "fabric_exec" : "read", arguments: JSON.stringify(runtimeTool
             ? { code: "return 1" } : { path: path.join(dir, toolRounds ? `task-${round}.txt` : "task.txt") }) } }] });
           chunk({}, "tool_calls");
@@ -1474,13 +1619,14 @@ describe("native activation window (offline; opted-in success needs exact native
 
   it.skipIf(!selectedNativeBinary)("3704 journals and replays full Fabric guidance during real actor activations", async () => {
     const s = await setup(0, 0, "NO_TOOL_ROUNDS", "openai-completions", true);
+    vi.stubEnv("PI_FABRIC_FULL_CODE_MODE", "true");
     const mesh = new MeshStore(path.join(s.dir, "mesh"), 2 * 1024 * 1024, 100);
     const actors = new ActorManager("fabric-window-test", {id: "owner", name: "owner", kind: "main", sessionId: "fabric-window-test"}, mesh,
       {...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20}, s.manager, () => {},
       {actorRoot: path.join(s.dir, "actors"), persistent: true});
     managers.push(actors);
     const actor = await actors.create({name: "fabric-actor", instructions: "Act on each event.", inferenceContext: "activation",
-      model: "window-test/offline", kernel: "typescript", tools: ["read", "bash"], extensions: true, transport: "process", delivery: "mailbox"});
+      model: "window-test/offline", kernel: "typescript", tools: ["read", "grep", "find", "ls", "bash", "write"], extensions: true, transport: "process", delivery: "mailbox"});
     const journal = path.join(s.dir, "actors", actor.id, "session.jsonl");
     const run = vi.spyOn(s.manager, "run");
     for (const task of ["FIRST_FABRIC_ACTIVATION", "SECOND_FABRIC_ACTIVATION"]) {
@@ -1500,17 +1646,106 @@ describe("native activation window (offline; opted-in success needs exact native
       const system = getCurrentSystemMessage(records as never)!;
       expect(system.content).toBe("");
       expect(system.sections).toBeDefined();
-      expect(system.toolsAdded?.some(tool => tool.name === "fabric_exec")).toBe(true);
-      const wire = JSON.stringify(s.requests.at(-1));
-      expect(wire).toContain("Configured fabric_exec kernel");
-      expect(JSON.stringify(system)).toContain("Configured fabric_exec kernel");
+      expect(system.toolsAdded?.map(tool => tool.name)).toEqual(["read", "grep", "find", "ls", "bash", "write", "fabric_exec"]);
+      const lastRequest = s.requests.at(-1)!;
+      const wire = JSON.stringify(lastRequest);
+      expect(wire).not.toContain("Configured fabric_exec kernel");
+      expect(JSON.stringify(system)).not.toContain("Configured fabric_exec kernel");
+      expect(lastRequest.tools.map((tool: { function: { name: string } }) => tool.function.name)).toEqual(["fabric_exec"]);
+      const fabricTool = lastRequest.tools.find((tool: { function?: { name?: string } }) =>
+        tool.function?.name === "fabric_exec");
+      expect(fabricTool).toBeDefined();
+      const fabricToolWire = JSON.stringify(fabricTool);
+      expect(fabricToolWire).toContain("payloads are literal: read files with native tools first");
+      expect(fabricToolWire).toContain("Only exact supplied keys exist: payloads.body becomes π.body");
+      expect(fabricToolWire).toContain("QuickJS lacks host globals: process, fetch");
+      expect(fabricToolWire).toContain("Globals: tools, mcp, memory");
+      expect(fabricToolWire).not.toContain("promptGuidelines");
       // Witness every rendered section, not merely the presence of our guidance.
-      const wireSystem = s.requests.at(-1)!.messages.find((message: {role: string}) =>
+      const wireSystem = lastRequest.messages.find((message: {role: string}) =>
         message.role === "system" || message.role === "developer");
       expect(wireSystem.content).toBe(getCurrentSystemPrompt(records as never));
     }
     expect(s.requests).toHaveLength(2);
   }, 2 * HANG_GUARD_MS + 30_000);
+
+  it.skipIf(!selectedNativeBinary)("accepts the factory directive actor's native hidden declarations while retaining all eight in its journal", async () => {
+    const s = await setup(0, 0, "NO_TOOL_ROUNDS", "openai-completions", true, false, 128000, "", true);
+    vi.stubEnv("PI_FABRIC_FULL_CODE_MODE", "true");
+    const journal = path.join(s.dir, "factory-actor.jsonl");
+    const result = await s.manager.run({ task: "FACTORY_LABEL_ENVELOPE", model: "window-test/offline",
+      actorId: "factory-directive", sessionFile: journal, inferenceContext: "activation", extensions: true,
+      tools: ["read", "grep", "find", "ls", "bash", "write"], transport: "process",
+      schema: { type: "object", properties: { action: { type: "string" } }, required: ["action"], additionalProperties: false },
+      replyTool: true });
+    expect(result, explain(result)).toMatchObject({ status: "completed", inferenceStarted: true });
+    expect(s.requests).toHaveLength(1);
+    expect(s.requests[0]!.tools.map((tool: { function: { name: string } }) => tool.function.name)).toEqual(["fabric_exec", "fabric_reply"]);
+    const head = getCurrentSystemMessage(buildSessionContext(SessionManager.open(journal).getBranch()).messages)!;
+    expect(head.toolsAdded?.map(tool => tool.name)).toEqual(["read", "grep", "find", "ls", "bash", "write", "fabric_exec", "fabric_reply"]);
+    expect(s.requests[0]!.messages[0].content).toBe(getCurrentSystemPrompt([head]));
+  }, TEST_GUARD_MS);
+
+  it.skipIf(!selectedNativeBinary).each(["sections", "rendered", "forced", "rewrite"] as const)("checks the real native actor system projection (%s)", async shape => {
+    const s = await setup(0, 0, "NO_TOOL_ROUNDS");
+    const headsFile = path.join(s.dir, "system-heads.json");
+    // Later extensions may ask Pi to force a rendered prompt, but changing the
+    // witnessed startup options must refuse before reaching the provider guard.
+    fs.writeFileSync(path.join(s.dir, "noop.ts"), `
+      import fs from 'node:fs';
+      import {getCurrentSystemMessage, getCurrentSystemPrompt} from '@earendil-works/pi-ai';
+      import {sessionEntryToContextMessages} from '@earendil-works/pi-coding-agent';
+      export default function(pi) {
+        ${shape === "rendered" || shape === "forced" ? `pi.on('before_agent_start', event => ({systemPrompt:event.systemPrompt${shape === "forced" ? " + '\\n\\nNATIVE_FORCED_PROMPT'" : ""}}));` : ""}
+        pi.on('before_provider_headers', (_event, ctx) => {
+          const provider = ctx.modelRegistry.getProvider(ctx.model.provider);
+          const stream = provider.streamSimple;
+          provider.streamSimple = function(model, context, options) {
+            ${shape === "rewrite" ? `context = {...context, messages:context.messages.map(message => message.role === 'system'
+              ? {...message, sections:undefined, content:'FORGED_SYSTEM_PROMPT'} : message)};` : ""}
+            const journal = ctx.sessionManager.getBranch().flatMap(entry => entry.type === 'message' ? sessionEntryToContextMessages(entry) : []);
+            fs.writeFileSync(${JSON.stringify(headsFile)}, JSON.stringify({
+              journal:getCurrentSystemMessage(journal), running:getCurrentSystemMessage(context.messages),
+              journalPrompt:getCurrentSystemPrompt(journal), runningPrompt:getCurrentSystemPrompt(context.messages)
+            }));
+            return stream.call(this, model, context, options);
+          };
+        });
+      }
+    `);
+    const launch = ProcessTransport.prototype.launch;
+    vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(function (this: ProcessTransport, request) {
+      return launch.call(this, { ...request, workerArguments: [...request.workerArguments,
+        "--fabric-extension", path.join(s.dir, "noop.ts")] });
+    });
+    const journal = path.join(s.dir, "actor.jsonl");
+    const result = await s.manager.run({ task: "CURRENT_NATIVE_SYSTEM_PROJECTION", model: "window-test/offline",
+      actorId: "system-projection", sessionFile: journal, inferenceContext: "activation", tools: [], extensions: false, transport: "process" });
+    if (shape === "rendered" || shape === "forced") {
+      expect(result, explain(result)).toMatchObject({ status: "failed", error: expect.stringContaining("Activation window lost native startup options") });
+      expect(fs.existsSync(headsFile)).toBe(false);
+      expect(s.requestCount).toBe(0);
+      return;
+    }
+    expect(fs.existsSync(headsFile), explain(result)).toBe(true);
+    const heads = JSON.parse(fs.readFileSync(headsFile, "utf8"));
+    expect(heads.journal.content).toBe("");
+    expect(heads.journal.sections.preamble).toBeTypeOf("string");
+    if (shape === "sections") expect(heads.running.sections).toEqual(heads.journal.sections);
+    else {
+      expect(heads.running.sections).toBeUndefined();
+      expect(heads.running.content).toBe(heads.runningPrompt);
+    }
+    if (shape === "rewrite") {
+      expect(heads.runningPrompt).not.toBe(heads.journalPrompt);
+      expect(result, explain(result)).toMatchObject({ status: "failed", error: expect.stringContaining("Activation window lost its native system prompt") });
+      expect(s.requestCount).toBe(0);
+    } else {
+      expect(heads.runningPrompt).toBe(heads.journalPrompt);
+      expect(result, explain(result)).toMatchObject({ status: "completed", text: "useful current result" });
+      expect(s.requestCount).toBe(1);
+    }
+  }, TEST_GUARD_MS);
 
   it.skipIf(!selectedNativeBinary)("two real activations retain full journals and current tool pairs, without Fabric tool enablement", async () => {
     const s = await setup();

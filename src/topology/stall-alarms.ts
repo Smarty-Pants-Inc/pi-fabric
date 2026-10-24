@@ -6,6 +6,7 @@ import { writeJsonAtomic } from "../core/atomic-write.js";
 import type { SessionReceiptManager } from "../core/session-receipts.js";
 import { confirmedMainInboxIds } from "./root-inbox-shared.js";
 import { processStartTime, residentProcessAlive } from "../residency/process-identity.js";
+import { bridgeLeaseAlarms } from "./bridge-alarms.js";
 import type { HeldAgentMessage, MainAgentController } from "../main-agent.js";
 import type { MeshIdentity, MeshStore } from "../mesh/store.js";
 import type { FabricParticipantInfo, FabricParticipantSource } from "./types.js";
@@ -184,6 +185,7 @@ const absence = async (mesh: MeshStore, identity: MeshIdentity, rootId: string, 
  * NOT adoption authority: lineageAlive's positive-closure policy is unchanged. */
 export const rootPresenceAlarms = async (mesh: MeshStore, identity: MeshIdentity, hostId: string,
   participants: readonly FabricParticipantInfo[], thresholdMs = 15 * 60_000, now = Date.now()): Promise<void> => {
+  await bridgeLeaseAlarms(mesh, identity, now);
   const live = new Set(participants.filter(p => p.kind === "root" && !p.stale).map(p => p.id));
   // Re-arm even if the old members have since disappeared or changed owners.
   for (const entry of mesh.listAll("topology/root-absence/", { fresh: true })) {

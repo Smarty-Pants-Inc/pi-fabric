@@ -1,18 +1,23 @@
+# Follow smarty-dev's .mergify.yml auto-queue pattern for ready PRs.
+# `hold` is the opt-out; every queue keeps the same required checks.
+merge_protections_settings:
+  auto_merge_conditions: true
+
 merge_queue:
   mode: serial
   # Two speculative batches at once (chief-of-staff GO 10-12 01:42Z): a bisect or a slow batch no longer
   # blocks the whole line (10-11 23:54Z-02:00Z: one #864 bisect held every PR, P0 pi-fabric#936 included).
   # Revert to 1 if queue-draft resets rise or CI runners can't carry two batches.
   max_parallel_checks: 2
+  # Skip intermediate batch results for anti-flake protection; https://docs.mergify.com/merge-queue/batches/#skip-intermediate-results-anti-flake-protection; Paul 10-17 17:55Z via chief-of-staff (turn on Mergify features), smarty-dev#14537
+  skip_intermediate_results: true
   reset_on_external_merge: always
 
 # smarty-dev's plain rule (smarty-dev#865): the PR, its required checks and this queue are the
-# review. The Astra reviewer queues a ready PR after its success verdict; `hold` and DO NOT LAND
-# titles keep a PR out. queue_conditions require both review verdicts on the reviewed head. Only a
-# PR head carries review statuses, and Mergify's in-place update (merging main into the queued
-# PR, smarty-dev#455) makes a new head that never gets them. So merge_conditions only refuse a
-# failed review, as smarty-dev's .mergify.yml does (smarty-dev#440, #1537), and still require
-# fresh CI on the updated head (smarty-dev#2974).
+# review. Mergify queues a ready PR once queue_conditions pass; `hold` and DO NOT LAND
+# titles keep a PR out. merge_conditions recheck CI and opt-out vetoes on the updated head
+# (smarty-dev#2974), but review statuses only refuse failed reviews: queue updates create
+# a new head with no review statuses (smarty-dev#455).
 queue_rules:
   - name: default
     # ponytail: one Ubuntu+Windows run takes ~30 min under fleet load, so a serial queue of N PRs takes N
@@ -24,25 +29,38 @@ queue_rules:
     checks_timeout: 180 min
     merge_method: merge
     queue_conditions:
+      - -label ~= (?i)^(hold|do[ -]?not[ -]?merge|dnm|freeze|frozen)$
+      - -label ~= (?i)^(wip|work[ -]?in[ -]?progress|do[ -]?not[ -]?land|never[ -]?land)$
       - base = main
       - -draft
       - -label = hold
       - -title ~= (?i)do not land
       - check-success = review/astra
+      - -check-failure = review/security  # a failed security verdict refuses admission, label or not
       - check-success = check (ubuntu-latest)
+      # fork-sync labels every upstream sync needs-security-pass, so sync/upstream-* heads pushed to THIS repository
+      # are exempt here (R-no-security-slips); a same-named branch from an outside fork is not.
       - or:
           - check-success = review/security
           - and:
-              - -head ~= ^sync/upstream-
+              - head ~= ^sync/upstream-
+              - head-repo-full-name = Smarty-Pants-Inc/pi-fabric
+          - and:
+              # Upstream syncs (sync/upstream-*) queue like any PR; review/security runs after merge within 24 h (R-no-security-slips, smarty-dev#2264).
               - -label = needs-security-pass
     merge_conditions:
+      # Label and title opt-outs added after queueing stop the merge.
+      # Review statuses here only refuse a FAILED review: an in-place or batch update
+      # makes a new head with no review statuses (smarty-dev#455).
+      # queue_conditions require the reviews on the reviewed head.
+      - -check-failure = review/astra
+      - -label ~= (?i)^(hold|do[ -]?not[ -]?merge|dnm|freeze|frozen)$
+      - -label ~= (?i)^(wip|work[ -]?in[ -]?progress|do[ -]?not[ -]?land|never[ -]?land)$
       - base = main
-      - -draft
       - -label = hold
       - -title ~= (?i)do not land
-      - check-success = check (ubuntu-latest)
-      - -check-failure = review/astra
       - -check-failure = review/security
+      - check-success = check (ubuntu-latest)
 
 # Queue order (smarty-dev#6477, Paul 10-08: the SQLite store is the fleet's top priority and gets the merge
 # queue's top tier). A fleet-top PR is queued ahead of p0, and a p0 PR ahead of the rest. Neither interrupts a

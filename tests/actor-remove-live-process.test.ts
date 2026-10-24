@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { hostedOnly } from "../scripts/hosted-only.mjs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { ROOT_PARTICIPANT_FRESH_MS } from "../src/residency/operator-safety.js";
@@ -12,7 +13,7 @@ import { processHarness, type ResidentCall } from "./helpers/process-harness.js"
 // processes run the real ResidentHost, the real `fabric-actors` CLI (src/actors-cli.ts main over the resident request
 // channel) and a root Main (a real ParticipantDirectory), with real flock and a real SIGKILL; source loads through
 // jiti, so the installed package and the Pi Main launcher are out of scope (named post-install check: Ryzen 1).
-describe.skipIf(process.platform !== "linux")("live resident actor removal across processes (smarty-dev#8090)", () => {
+describe.skipIf(!hostedOnly("live actor removal across processes") || process.platform !== "linux")("live resident actor removal across processes (smarty-dev#8090)", () => {
   const STALE_PID = 2147483647;
   const seed = async (f: DeadRootFixture, ...names: string[]) => {
     const actors = [];

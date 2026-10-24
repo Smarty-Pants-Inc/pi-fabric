@@ -188,7 +188,9 @@ describe.skipIf(process.platform !== "linux")("compiled resident-drain refuses m
     // Positive allowlist: unrelated API credentials and SMARTY/fleet state are
     // absent, not merely filtered by a namespace. The only provider credential
     // is the ephemeral loopback key in this fixture's models.json.
-    const env: NodeJS.ProcessEnv = Object.fromEntries(["PATH", "LANG", "LC_ALL", "GITHUB_ACTIONS", "CI"].flatMap(key =>
+    // Carry runner evidence AND the test-only fleet veto together; neither confers fleet attribution.
+    const env: NodeJS.ProcessEnv = Object.fromEntries(["PATH", "LANG", "LC_ALL", "GITHUB_ACTIONS", "CI",
+      "RUNNER_ENVIRONMENT", "RUNNER_TEMP", "PI_TEST_FLEET_HOST"].flatMap(key =>
       process.env[key] === undefined ? [] : [[key, process.env[key]]]));
     // Preserve all preloads; narrow only the standard guard's physical ceiling.
     // HOME is a private sibling of the mutable work/temp tree, never inside it.
@@ -196,7 +198,9 @@ describe.skipIf(process.platform !== "linux")("compiled resident-drain refuses m
       PI_OFFLINE: "1", PI_CODING_AGENT_DIR: agentDir, PI_FABRIC_MESH_ROOT: meshRoot,
       PI_FABRIC_PROJECT_ROOT: root, PI_FABRIC_RUN_ROOT: path.join(root, "runs"), PI_FABRIC_AGENT_DIR: path.join(root, "exports"),
       PI_FABRIC_PI_BINARY: piBinary, PI_FABRIC_NODE_BINARY: node });
-    expect(env.GITHUB_ACTIONS).toBe(process.env.GITHUB_ACTIONS);
+    for (const key of ["GITHUB_ACTIONS", "RUNNER_ENVIRONMENT", "RUNNER_TEMP", "PI_TEST_FLEET_HOST"]) {
+      expect(env[key]).toBe(process.env[key]);
+    }
     expect(env.NODE_OPTIONS).toContain("test-deletion-guard.mjs");
     let launcher: ReturnType<typeof spawn> | undefined;
     let lifetime: ReturnType<typeof watchResidentChild> | undefined;

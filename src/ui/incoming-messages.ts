@@ -1,12 +1,13 @@
 // Type-only: Pi loads this startup graph as native ESM, where a runtime SDK
 // import evaluates a second, unbundled SDK (assert-build-artifacts.mjs).
-import type { ExtensionAPI, MessageRenderer } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, MessageRenderer } from "@earendil-works/pi-coding-agent";
 import { Box, Markdown, Spacer, Text, truncateToWidth, type MarkdownTheme } from "@earendil-works/pi-tui";
 import { createHash } from "node:crypto";
-import { detachedPreview } from "../core/preview.js";
+import { SessionEntryCursor, type SessionEntryCursorManager } from "../core/preview.js";
 import type { FabricIncomingMessageMode } from "../config.js";
 import { safeText } from "./format.js";
 import { highlightCode } from "./highlight.js";
+import { deliveryIdentity } from "../topology/root-inbox-shared.js";
 
 export const INCOMING_MESSAGE_TYPES = [
   "pi-fabric-agent-message", // Includes mail.inbound follow-up notices.
@@ -68,86 +69,144 @@ const rows = (message: IncomingMessage): Row[] => {
 };
 const receipt = (from: string, kind: string, value: string): string =>
   createHash("sha256").update(JSON.stringify([from, kind, value])).digest("hex");
+const contentDigest = (value: string): string => createHash("sha256").update(value).digest("hex");
 
-/**
- * A display-only index, separate from the authoritative delivery/inbox state.
- * Keep only stable scalar branch metadata. In particular, never retain the branch array or
- * any entry object. V8 slices retain their parent strings, so scalar IDs are detached first.
- * Entry keys are the detached string id, a private token object for id-less objects, or
- * the numeric index for non-objects; the key types never collide. The session version is `<session id>:<header version>`, or the bare session id without a header version.
- */
-type SessionSource = { getBranch: () => readonly unknown[]; getHeader?: () => unknown; getSessionId?: () => unknown };
+type SessionSource = SessionEntryCursorManager & { getHeader?: () => unknown };
+type DisplayMessage = { role?: unknown; customType?: unknown; details?: unknown; content?: unknown; timestamp?: unknown };
+type ReceiptMembership = Pick<ReadonlySet<string>, "has">;
+
+/** Display-only delivery receipts are updated at lifecycle/message boundaries, never at render time. */
 class DeliveredDisplayIndex {
-  #seen: readonly unknown[] = [];
-  #version: string | undefined;
-  #tokens = new WeakMap<object, object>();
+  #cursor = new SessionEntryCursor();
   #receipts = new Set<string>();
 
-  update(entries: readonly unknown[], session?: SessionSource): ReadonlySet<string> {
-    const header = record(session?.getHeader?.()).version;
-    const rawId = session?.getSessionId?.();
-    const sessionId = typeof rawId === "string" ? rawId : undefined;
-    const version = typeof header === "string" || typeof header === "number" ? `${sessionId ?? ""}:${header}` : sessionId;
-    const ids = entries.map((entry, index) => {
-      const id = record(entry).id;
-      if (typeof id === "string" && id) return detachedPreview(id, Infinity);
-      if (entry === null || typeof entry !== "object") return index;
-      let token = this.#tokens.get(entry);
-      if (!token) this.#tokens.set(entry, token = {});
-      return token;
-    });
-    const seen = this.#seen;
-    let start = seen.length;
-    // A known session version that differs from the last known one resets the index.
-    if ((version !== undefined && (this.#version ?? version) !== version) ||
-      ids.length < start || seen.some((id, index) => ids[index] !== id)) {
-      this.#receipts.clear();
-      start = 0;
+  reset(session: SessionSource): void {
+    this.#receipts.clear();
+    for (const entry of this.#cursor.reset(session).entries) this.#remember(entry);
+  }
+
+  addMessage(message: DisplayMessage | undefined): void {
+    if (message?.role === "custom") this.#remember({ ...message, type: "custom_message" });
+  }
+
+  get receipts(): ReadonlySet<string> { return this.#receipts; }
+
+  #remember(raw: unknown): void {
+    const entry = record(raw);
+    if (entry.type !== "custom_message" || entry.customType !== "pi-fabric-agent-message") return;
+    const details = record(entry.details);
+    const items = Array.isArray(details.items) ? details.items : [details];
+    for (const rawItem of items) {
+      const item = record(rawItem); const from = record(item.from).id;
+      if (typeof from !== "string") continue;
+      const add = (kind: string, value: unknown): void => {
+        if (typeof value === "string" && value) this.#receipts.add(receipt(from, kind, value));
+      };
+      add("id", item.id); add("delivery", item.deliveryId);
+      const data = record(item.data);
+      // Work keys/refs claim work on the carrier's named topic only, as in root-inbox.ts
+      // (#852 security P1); a carrier without data.topic hides no shadow by key or ref.
+      const topic = typeof data.topic === "string" && data.topic.trim() ? data.topic.trim() : undefined;
+      const identity = deliveryIdentity(data);
+      if (identity) add(identity.kind, identity.value);
+      else if (typeof data.key === "string" && data.key.trim()) { if (topic) add("topic-key", JSON.stringify([topic, data.key.trim()])); }
+      else if (typeof data.ref === "string" && data.ref.trim() && topic) add("topic-ref", JSON.stringify([topic, data.ref.trim()]));
     }
-    for (let index = start; index < entries.length; index++) {
-      const entry = record(entries[index]);
-      if (entry.type !== "custom_message" || entry.customType !== "pi-fabric-agent-message") continue;
-      const details = record(entry.details);
-      const items = Array.isArray(details.items) ? details.items : [details];
-      for (const raw of items) {
-        const item = record(raw); const from = record(item.from).id;
-        if (typeof from !== "string") continue;
-        const add = (kind: string, value: unknown): void => {
-          if (typeof value === "string" && value) this.#receipts.add(receipt(from, kind, value));
-        };
-        add("id", item.id); add("delivery", item.deliveryId);
-        const data = record(item.data);
-        // Work keys/refs claim work on the carrier's named topic only, as in root-inbox.ts
-        // (#852 security P1); a carrier without data.topic hides no shadow by key or ref.
-        const topic = typeof data.topic === "string" && data.topic.trim() ? data.topic.trim() : undefined;
-        if (typeof data.deliveryId === "string" && data.deliveryId) add("delivery", data.deliveryId);
-        else if (typeof data.messageId === "string" && data.messageId) add("id", data.messageId);
-        else if (typeof data.key === "string" && data.key.trim()) { if (topic) add("topic-key", JSON.stringify([topic, data.key.trim()])); }
-        else if (typeof data.ref === "string" && data.ref.trim() && topic) add("topic-ref", JSON.stringify([topic, data.ref.trim()]));
-      }
-    }
-    this.#seen = ids;
-    if (version !== undefined) this.#version = detachedPreview(version, Infinity);
-    return this.#receipts;
   }
 }
 
-/** Only earlier inbox carriers count; rendering the first carrier must not hide itself. */
-const priorInboxReceipts = (entries: readonly unknown[], message: IncomingMessage): Set<string> => {
-  const seen = new Set<string>();
-  for (const raw of entries) {
-    const entry = record(raw);
-    if (entry.type !== "custom_message" || entry.customType !== "pi-fabric-inbox") continue;
-    const at = typeof entry.timestamp === "string" ? Date.parse(entry.timestamp) : entry.timestamp;
-    if (entry.details === message.details || (entry.content === message.content && at === message.timestamp)) break;
-    const ids = record(entry.details).ids;
-    if (Array.isArray(ids)) for (const id of ids) if (typeof id === "string") seen.add(receipt("", "event", id));
+/** Index prior inbox ids once on session_start/tree change and incrementally on message_end. */
+export class PriorInboxReceiptIndex {
+  #cursor = new SessionEntryCursor();
+  #receiptPositions = new Map<string, number>();
+  #nextPosition = 0;
+  #byDetails = new WeakMap<object, number>();
+  #byContent = new WeakMap<object, Map<number, number>>();
+  #byMessageContentHash = new WeakMap<object, string>();
+  #byString = new Map<string, Map<number, number>>();
+  #retainedContentKeyChars = 0;
+
+  /** Internal size diagnostic: retained content keys, excluding map/value overhead. */
+  get retainedContentKeyChars(): number { return this.#retainedContentKeyChars; }
+
+  reset(session: SessionSource): void {
+    this.#receiptPositions.clear();
+    this.#nextPosition = 0;
+    this.#byDetails = new WeakMap();
+    this.#byContent = new WeakMap();
+    this.#byMessageContentHash = new WeakMap();
+    this.#byString.clear();
+    this.#retainedContentKeyChars = 0;
+    for (const entry of this.#cursor.reset(session).entries) this.#remember(entry);
   }
-  return seen;
-};
+
+  addMessage(message: DisplayMessage | undefined): void {
+    if (message?.role === "custom") this.#remember({ ...message, type: "custom_message" });
+  }
+
+  prior(message: IncomingMessage): ReceiptMembership {
+    const details = message.details;
+    if (details !== null && typeof details === "object") {
+      const found = this.#byDetails.get(details);
+      if (found !== undefined) return this.#before(found);
+    }
+    const at = typeof message.timestamp === "number" ? message.timestamp : Number.NaN;
+    if (typeof message.content === "string") {
+      const owner = message as object;
+      let key = this.#byMessageContentHash.get(owner);
+      if (!key) {
+        key = contentDigest(message.content);
+        this.#byMessageContentHash.set(owner, key);
+      }
+      const found = this.#byString.get(key)?.get(at);
+      if (found !== undefined) return this.#before(found);
+    } else if (message.content !== null && typeof message.content === "object") {
+      const found = this.#byContent.get(message.content)?.get(at);
+      if (found !== undefined) return this.#before(found);
+    }
+    // A live/custom message that is not yet represented in the branch historically saw every
+    // earlier inbox carrier. Its current receipt index is that exact prior-history result.
+    return this.#before(Number.POSITIVE_INFINITY);
+  }
+
+  #before(position: number): ReceiptMembership {
+    return { has: (id) => (this.#receiptPositions.get(id) ?? Number.POSITIVE_INFINITY) < position };
+  }
+
+  #remember(raw: unknown): void {
+    const entry = record(raw);
+    if (entry.type !== "custom_message" || entry.customType !== "pi-fabric-inbox") return;
+    const at = typeof entry.timestamp === "string" ? Date.parse(entry.timestamp) : entry.timestamp;
+    const before = this.#nextPosition;
+    const details = entry.details;
+    if (details !== null && typeof details === "object" && !this.#byDetails.has(details)) this.#byDetails.set(details, before);
+    if (typeof at === "number" && !Number.isNaN(at) && typeof entry.content === "string") {
+      const key = contentDigest(entry.content);
+      let byTime = this.#byString.get(key);
+      if (!byTime) {
+        this.#byString.set(key, byTime = new Map());
+        this.#retainedContentKeyChars += key.length;
+      }
+      if (!byTime.has(at)) byTime.set(at, before);
+    } else if (typeof at === "number" && !Number.isNaN(at) && entry.content !== null && typeof entry.content === "object") {
+      let byTime = this.#byContent.get(entry.content);
+      if (!byTime) this.#byContent.set(entry.content, byTime = new Map());
+      if (!byTime.has(at)) byTime.set(at, before);
+    }
+    const ids = record(details).ids;
+    if (Array.isArray(ids)) for (const id of ids) if (typeof id === "string") {
+      const key = receipt("", "event", id);
+      if (!this.#receiptPositions.has(key)) this.#receiptPositions.set(key, before);
+    }
+    this.#nextPosition++;
+  }
+
+}
+
+const EMPTY_RECEIPTS: ReceiptMembership = { has: () => false };
 
 /** Inbox rows whose event id repeats within this carrier or an earlier one (smarty-dev#5518). */
-const repeatedInboxRows = (all: readonly Row[], prior: ReadonlySet<string>): Row[] => {
+const repeatedInboxRows = (all: readonly Row[], prior: ReceiptMembership): Row[] => {
   const seen = new Set<string>();
   return all.filter(row => {
     const id = row.attributes.id;
@@ -158,8 +217,9 @@ const repeatedInboxRows = (all: readonly Row[], prior: ReadonlySet<string>): Row
   });
 };
 
-const unseenRows = (message: IncomingMessage, all: readonly Row[], delivered: ReadonlySet<string>): Row[] => {
+const unseenRows = (message: IncomingMessage, all: readonly Row[], delivered: ReceiptMembership, prior: ReceiptMembership): Row[] => {
   if (message.customType !== "pi-fabric-inbox") return [...all];
+  const alreadyDelivered = (id: string): boolean => delivered.has(id) || prior.has(id);
   const carried = record(message.details).receipts;
   const receipts = Array.isArray(carried) ? carried.filter((value): value is string => typeof value === "string") : [];
   // Native inbox receipts group each event's identity/work receipts behind its event hash.
@@ -168,19 +228,19 @@ const unseenRows = (message: IncomingMessage, all: readonly Row[], delivered: Re
   const seen = new Set<string>();
   return all.filter((row, index) => {
     const eventId = row.attributes.id;
-    if (eventId && (seen.has(eventId) || delivered.has(receipt("", "event", eventId)))) return false;
+    if (eventId && (seen.has(eventId) || alreadyDelivered(receipt("", "event", eventId)))) return false;
     if (eventId) seen.add(eventId);
     const start = boundaries[index]!;
     if (start >= 0) {
       const next = boundaries.slice(index + 1).find(value => value > start) ?? receipts.length;
       // Native identity receipts are definitive: do not fall back to a shared
       // work key when a distinct deliveryId/messageId says this is unseen work.
-      return !receipts.slice(start + 1, next).some(value => delivered.has(value));
+      return !receipts.slice(start + 1, next).some(alreadyDelivered);
     }
     const { from_id: from, id, key, ref, topic } = row.attributes;
     const scoped = (value: string | undefined) => topic && value ? JSON.stringify([topic, value]) : undefined;
     return !from || ![["id", id], ["topic-key", scoped(key)], ["topic-ref", scoped(ref)]].some(([kind, value]) =>
-      value && delivered.has(receipt(from, kind!, value)));
+      value && alreadyDelivered(receipt(from, kind!, value)));
   });
 };
 
@@ -232,20 +292,29 @@ const fullCarrier = (message: IncomingMessage, hidden: readonly Row[], theme: Pa
   return box;
 };
 
-/** No context/message hooks: native expanded fallback keeps the entire current rendering. */
+/** Native expanded fallback keeps the entire current rendering; indexes update off the render path. */
 export const registerIncomingMessageRenderers = (
   pi: ExtensionAPI,
   mode: () => FabricIncomingMessageMode,
 ): void => {
-  let session: SessionSource | undefined;
   const delivered = new DeliveredDisplayIndex();
-  pi.on("session_start", (_event, context) => {
-    session = context.sessionManager as unknown as SessionSource;
+  const priorInbox = new PriorInboxReceiptIndex();
+  const rebuild = (context: ExtensionContext): void => {
+    const session = context?.sessionManager as unknown as SessionSource | undefined;
+    if (!session) return;
+    delivered.reset(session);
+    priorInbox.reset(session);
+  };
+  pi.on("session_start", (_event, context) => rebuild(context));
+  pi.on("session_tree", (_event, context) => rebuild(context));
+  pi.on("message_end", (event) => {
+    const message = event.message as unknown as DisplayMessage;
+    delivered.addMessage(message);
+    priorInbox.addMessage(message);
   });
   for (const type of INCOMING_MESSAGE_TYPES) {
     pi.registerMessageRenderer(type, (message, options, theme) => {
-      const history = type === "pi-fabric-inbox" ? session?.getBranch() ?? [] : [];
-      const prior = priorInboxReceipts(history, message);
+      const prior = type === "pi-fabric-inbox" ? priorInbox.prior(message) : EMPTY_RECEIPTS;
       const all = rows(message);
       if (options.expanded || !incomingMessagesCollapsed(mode())) {
         if (type !== "pi-fabric-inbox") return undefined;
@@ -253,9 +322,8 @@ export const registerIncomingMessageRenderers = (
         const repeated = repeatedInboxRows(all, prior);
         return repeated.length ? fullCarrier(message, repeated, theme) : undefined;
       }
-      const receipts = new Set(type === "pi-fabric-inbox" ? delivered.update(history, session) : []);
-      for (const id of prior) receipts.add(id);
-      const visible = unseenRows(message, all, receipts);
+      const receipts = type === "pi-fabric-inbox" ? delivered.receipts : EMPTY_RECEIPTS;
+      const visible = unseenRows(message, all, receipts, prior);
       if (!visible.length) return { render: () => [], invalidate() {} };
       // In the org's own pane, principal replies are the local assistant's, not
       // incoming carriers. Other panes keep full org/principal-addressed bursts,

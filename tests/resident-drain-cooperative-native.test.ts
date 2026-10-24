@@ -269,7 +269,9 @@ describe.skipIf(process.platform !== "linux")("compiled cooperative drain preser
     };
     const observation = observeFixture(root, capture); const until = observation.until;
     const registry = new ActorRegistryStore(config.actorRoot);
-    const env: NodeJS.ProcessEnv = Object.fromEntries(["PATH", "LANG", "LC_ALL", "GITHUB_ACTIONS", "CI"].flatMap(key =>
+    // Carry runner evidence AND the test-only fleet veto together; neither confers fleet attribution.
+    const env: NodeJS.ProcessEnv = Object.fromEntries(["PATH", "LANG", "LC_ALL", "GITHUB_ACTIONS", "CI",
+      "RUNNER_ENVIRONMENT", "RUNNER_TEMP", "PI_TEST_FLEET_HOST"].flatMap(key =>
       process.env[key] === undefined ? [] : [[key, process.env[key]]]));
     const childIsolation = privateTemp.childEnvironment(owned.env.NODE_OPTIONS!);
     Object.assign(env, owned.env, childIsolation, { PI_OFFLINE: "1", PI_CODING_AGENT_DIR: agentDir,
@@ -278,7 +280,9 @@ describe.skipIf(process.platform !== "linux")("compiled cooperative drain preser
       PI_FABRIC_PI_BINARY: piBinary, PI_FABRIC_NODE_BINARY: node });
     // No report-mode spoofing or dropped guard/recording preload. The helper
     // verifies the original physical ceiling before making it strictly narrower.
-    expect(env.GITHUB_ACTIONS).toBe(process.env.GITHUB_ACTIONS);
+    for (const key of ["GITHUB_ACTIONS", "RUNNER_ENVIRONMENT", "RUNNER_TEMP", "PI_TEST_FLEET_HOST"]) {
+      expect(env[key]).toBe(process.env[key]);
+    }
     expect(env.NODE_OPTIONS).toContain("test-deletion-guard.mjs");
     if (recording) expect(env.NODE_OPTIONS).toContain(recording);
     expect(env.NODE_OPTIONS).toContain("launch-preload.mjs");

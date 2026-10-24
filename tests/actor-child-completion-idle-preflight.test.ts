@@ -189,23 +189,26 @@ it("releases completion watches on stop, transfer and 200 recorded actor removal
     }
     return remove(target, options);
   });
-  // Record the Linux verifier boundary, then run its real production dry-run verification. The manager catches
-  // failures, so record violations separately instead of allowing an assertion to disappear into pending cleanup.
+  // Check the verifier boundary on every fence platform: known actor, held fence and current judged inode. Linux records
+  // here and runs the real verifier's production dry run; elsewhere the real verifier runs the manager's rmSync
+  // fallback, which the recorder above records without deleting. The manager catches failures, so record violations
+  // separately instead of allowing an assertion to disappear into pending cleanup.
   const realVerifiedRemove = verifiedRemoval.verifiedRemove;
   const rootIds = new Map<string, string | undefined>();
   const violations: string[] = [];
   const treeRemoval = vi.spyOn(verifiedRemoval, "verifiedRemove").mockImplementation((target, judged, options) => {
     const file = path.resolve(target);
-    if (process.platform !== "linux" || path.dirname(file) !== actorRoot || !/^[a-f0-9]{32}$/.test(path.basename(file))) {
+    if (path.dirname(file) !== actorRoot || !/^[a-f0-9]{32}$/.test(path.basename(file))) {
       return realVerifiedRemove(target, judged, options);
     }
-    removals.push(file);
+    const linux = process.platform === "linux";
+    if (linux) removals.push(file);
     const rootId = rootIds.get(path.basename(file));
     if (!rootId) violations.push(`${file}: unknown actor`);
     else if (!mainPublicationFenced(mesh.root, rootId)) violations.push(`${file}: not under the Main publication fence`);
     const now = fs.lstatSync(file, { throwIfNoEntry: false });
     if (!judged || !now || now.dev !== judged.dev || now.ino !== judged.ino) violations.push(`${file}: judged inode is not the current tree`);
-    const result = realVerifiedRemove(target, judged, { ...options, dryRun: true });
+    const result = realVerifiedRemove(target, judged, linux ? { ...options, dryRun: true } : options);
     if (!result.removed) violations.push(`${file}: refused (${result.reason})`);
     return result;
   });

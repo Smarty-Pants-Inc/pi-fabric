@@ -1,4 +1,5 @@
 import type { MeshLockProtocol } from "../config.js";
+import { diagnostics } from "../core/diagnostics.js";
 import { MeshIncarnationPendingError, meshJournalAlarmLine, type MeshOutageAlarm } from "../core/atomic-write.js";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import fs from "node:fs";
@@ -11,7 +12,7 @@ import type { MeshReadOptions, MeshStateEntry, MeshBatchResult, MeshBatchView } 
 import { createStateBackend, isMeshStateWalCap, type MeshStateBackendKind, type StateBackend, type StateBackendBatchInput,
   type StateBackendDiagnostics } from "./state-backend.js";
 import { EventLog, type MeshEvent, type MeshIdentity, type MeshPublishInput, type MeshTailResult } from "./event-log.js";
-import { indexResidentDeliveries, type WakeSubscription } from "../residency/wake-index.js";
+import { closeResidentWakeRetryCursor, indexResidentDeliveries, type WakeSubscription } from "../residency/wake-index.js";
 import { writeFileAtomic } from "../core/atomic-write.js";
 import type { FabricMessageSender } from "../protocol.js";
 import { copyFabricPrincipal, type FabricPrincipal } from "../fabric-provenance.js";
@@ -387,7 +388,7 @@ export const meshAlarmRecipient = (env: NodeJS.ProcessEnv = process.env): string
     if (ALARM_SESSION.test(configured)) return configured;
     if (refusedAlarmTo !== configured) {
       refusedAlarmTo = configured;
-      console.warn(`[pi-fabric] PI_FABRIC_MESH_ALARM_TO refused (${JSON.stringify(configured.slice(0, 80))}): `
+      diagnostics.warn("src/mesh/store.ts", `[pi-fabric] PI_FABRIC_MESH_ALARM_TO refused (${JSON.stringify(configured.slice(0, 80))}): `
         + "only session:<uuid>; mesh alarms fall back to SMARTY_LEAD_SESSION or stderr only");
     }
   }
@@ -396,10 +397,10 @@ export const meshAlarmRecipient = (env: NodeJS.ProcessEnv = process.env): string
 };
 
 /** The MeshBackgroundRetry.alarmsTo sink of an owner: resolved at alarm time (owners assign their mesh after field init). */
-export const meshOutageAlarmSink = (owner: () => { mesh: Pick<MeshStore, "publish"> | undefined; from: MeshIdentity | undefined }) =>
+export const meshOutageAlarmSink = (owner: () => { mesh: Pick<MeshStore, "publish"> | undefined; from: MeshIdentity | undefined }, env: NodeJS.ProcessEnv = process.env) =>
   (alarm: MeshOutageAlarm): Promise<unknown> | void => {
     const { mesh, from } = owner();
-    const to = meshAlarmRecipient();
+    const to = meshAlarmRecipient(env);
     if (!mesh || !from || !to) return; // no recipient: the stderr line is the only sink, never a broadcast
     return mesh.publish({ topic: FABRIC_MESH_OUTAGE_ALARM_TOPIC, to, kind: `mesh-${alarm.state}`, from,
       text: `${alarm.label}: mesh writes ${alarm.state === "outage" ? "deferred" : "recovered"} after ${Math.floor(alarm.durationMs / 1_000)}s`,
@@ -410,6 +411,12 @@ export const meshOutageAlarmSink = (owner: () => { mesh: Pick<MeshStore, "publis
 export const MESH_WAL_CAP_ALARM_TOPIC = "fabric.alarm.mesh-wal-cap";
 const MESH_WAL_CAP_ALARM_MS = 10 * 60 * 1_000;
 
+/** Transport-owned publisher. Closing stops work and joins the in-flight attempt; durable rows stay local. */
+export interface MeshEventPublisherBinding {
+  retry(): Promise<void>;
+  close(): Promise<void>;
+}
+
 export class MeshStore {
   readonly #lock: MeshLock;
   readonly #state: StateBackend;
@@ -419,8 +426,11 @@ export class MeshStore {
   #scheduleCache:
     | { inode: number; size: number; modifiedAt: number; file: MeshScheduleFile; error?: string }
     | undefined;
+  /** Parsed wake routes are private to this store and revalidated under the publication lock. */
+  readonly #wakeRouteCache = new Map<string, unknown>();
   /** This store's census registration (directory identity), released once by closeState(). */
   #censusRecord: string | undefined;
+  #eventPublisher: MeshEventPublisherBinding | undefined;
 
   constructor(
     readonly root: string,
@@ -437,7 +447,7 @@ export class MeshStore {
       if (!fs.existsSync(path.join(this.root, "residency"))) return;
       const subscriptions = event.topic === "fabric.participant.lifecycle"
         ? this.#state.listAll("topology/subscriptions/", { fresh: true }).map(entry => entry.value as WakeSubscription) : [];
-      indexResidentDeliveries(this.root, event, subscriptions);
+      indexResidentDeliveries(this.root, event, subscriptions, this.#wakeRouteCache);
     });
     this.#schedulesPath = path.join(root, "schedules.json");
     fs.mkdirSync(root, { recursive: true, mode: 0o700 });
@@ -472,6 +482,11 @@ export class MeshStore {
 
   /** Releases the state database handle (sqlite, shadow); the file backend holds none. */
   closeState(): void {
+    // The transport joins this same close before releasing its connection. A synchronous state
+    // teardown can at least stop admission now; no detached worker may start another publish.
+    void this.#eventPublisher?.close();
+    closeResidentWakeRetryCursor(this.root);
+    this.#wakeRouteCache.clear();
     this.#state.close();
     // A closed sqlite backend cannot reopen and a closed shadow writes only through .lock: this
     // store no longer needs the record. Another open store of this process keeps it.
@@ -493,6 +508,66 @@ export class MeshStore {
   }
 
   // Events (event-log.ts).
+
+  /** Bind only from an opened transport. No NATS runtime dependency, dial or import lives in MeshStore.
+   * Local commits still return their local sequence; forwarding never rewrites the local/control log.
+   * A forwarding failure cannot reject a committed publish and invite a fresh event id from its caller. */
+  bindEventPublisher(scope: string, publish: (event: MeshEvent) => Promise<unknown>, validate?: (event: MeshEvent) => void): MeshEventPublisherBinding {
+    if (this.#eventPublisher) throw new Error("Mesh event publisher is already bound");
+    let closed = false;
+    let queued: NodeJS.Immediate | undefined;
+    let pending: Promise<void> | undefined;
+    const retry = (): Promise<void> => {
+      if (closed) return Promise.resolve();
+      if (pending) return pending;
+      const run = async (): Promise<void> => {
+        // Serialize send + checkpoint across stores/processes, but NEVER hold the shared mesh
+        // lock across network I/O. A live/foreign delivery-custody holder is not age-reclaimed.
+        const release = await acquireMeshCustodyLock(path.join(this.#events.eventOutboxDirectory(scope), ".delivery"), 0,
+          { hostQualified: true, lockProtocol: this.#lock.lockProtocol });
+        try {
+          while (!closed) {
+            const event = await this.#events.nextOutboxEvent(scope);
+            if (!event || closed) return;
+            // Includes a retry after an uncertain answer: the immutable row keeps the ORIGINAL id
+            // and resolved body. Never call local publish(), stamp data again or allocate another id.
+            await publish(event);
+            this.#events.ackOutboxEvent(scope, event);
+          }
+        } finally { release(); }
+      };
+      const task = run().catch(error => {
+        diagnostics.warn("src/mesh/store.ts", `[pi-fabric] mesh event forwarding deferred (original ids retained): ${String(error)}`);
+      }).finally(() => { if (pending === task) pending = undefined; });
+      pending = task;
+      return task;
+    };
+    const schedule = (): void => {
+      if (closed || queued) return;
+      // This is driven by a real committed append, not registration/idle work. Even a partial
+      // transaction schedules it; setImmediate leaves the synchronous mesh critical section first.
+      queued = setImmediate(() => { queued = undefined; void retry(); });
+    };
+    this.#events.enableOutbox(scope, schedule, validate);
+    const binding: MeshEventPublisherBinding = {
+      retry,
+      close: () => {
+        closed = true;
+        if (queued) clearImmediate(queued);
+        queued = undefined;
+        return pending ?? Promise.resolve();
+      },
+    };
+    this.#eventPublisher = binding;
+    // Recover rows from a previous activation only after an actual transport open.
+    schedule();
+    return binding;
+  }
+
+  /** Reuse owner maintenance/reconnect, not a second polling timer. No-op with events disabled. */
+  retryEventPublications(): Promise<void> {
+    return this.#eventPublisher?.retry() ?? Promise.resolve();
+  }
 
   async publish(input: MeshPublishInput): Promise<MeshEvent> {
     // Due schedules go first so the log keeps due-time order relative to this event; damaged
@@ -518,13 +593,22 @@ export class MeshStore {
     if (!events.length || !this.#canWakeResidents() || !fs.existsSync(path.join(this.root, "residency"))) return;
     try {
       const { wakeResidentActors } = await import("../residency/wake.js");
-      await wakeResidentActors(this, events);
+      await wakeResidentActors(this, events, undefined, undefined, () => this.#canWakeResidents());
     } catch (error) {
       // Already committed: throwing would invite a duplicate publish. The durable pending
-      // index and archived event survive even without a wake request; startup or the next
-      // publish retries the drain. Report failure rather than inventing delivery.
-      console.warn(`[pi-fabric] resident wake deferred: ${String(error)}`);
+      // index and archived event survive even without a wake request; scoped startup,
+      // maintenance or the next matching publish retries it. Report failure rather than inventing delivery.
+      diagnostics.warn("src/mesh/store.ts", `[pi-fabric] resident wake deferred: ${String(error)}`);
     }
+  }
+
+  /** Existing owner maintenance cadence only; respect publication's resident admission gate. */
+  async retryResidentWakes(): Promise<void> {
+    if (!this.#canWakeResidents() || !fs.existsSync(path.join(this.root, "residency"))) return;
+    const { retryResidentWakes } = await import("../residency/wake.js");
+    // Import preparation may have yielded to staging, drain or handover.
+    if (!this.#canWakeResidents()) return;
+    await retryResidentWakes(this, undefined, undefined, () => this.#canWakeResidents());
   }
 
   #scheduleDue(now = Date.now()): boolean {
@@ -878,7 +962,7 @@ export class MeshStore {
         const text = `mesh state write refused by the SQLite WAL cap (${String(walBytes)} > ${String(capBytes)} bytes; `
           + `${readerCount ?? 0} WAL reader(s))`;
         // The journal alarm line #9729 pages on; no mesh root path, no reader pids (pi-fabric#893 rounds 4-5).
-        console.warn(meshJournalAlarmLine({ label: "mesh state writes", state: "outage", sinceMs: now,
+        diagnostics.warn("src/mesh/store.ts", meshJournalAlarmLine({ label: "mesh state writes", state: "outage", sinceMs: now,
           reason: `SQLite WAL cap: ${text}`, walBytes, capBytes, readerCount: readerCount ?? 0 }));
         const from: MeshIdentity = identity ?? { id: `mesh-store:${process.pid}`, name: "Fabric mesh store", kind: "agent" };
         // publish() can throw synchronously (a size or validation refusal): it must never replace the WAL-cap error.

@@ -259,12 +259,13 @@ setInterval(() => {}, 1000);`;
   it("normalizes a remote stop read failure after healthy preflight without publication", async () => {
     const f = await fixture();
     try {
-      vi.spyOn(f.directory, "get").mockImplementation(() => { throw new Error("late stop read failed"); });
-      const probe = vi.spyOn(f.directory, "refreshRoutingView").mockRejectedValue(new Error("recovery unavailable"));
+      const failure = new Error("late stop read failed");
+      vi.spyOn(f.directory, "get").mockImplementation(() => { throw failure; });
+      const probe = vi.spyOn(f.directory, "refreshRoutingView");
       await expect(f.provider.invoke("stop", { id: "session:remote" }, f.invocation)).rejects.toMatchObject({
-        code: "FABRIC_DIRECTORY_UNAVAILABLE", retryable: true,
+        code: "FABRIC_DIRECTORY_UNAVAILABLE", retryable: true, cause: failure,
       });
-      expect(probe).toHaveBeenCalledOnce();
+      expect(probe).not.toHaveBeenCalled();
       expect(f.control.request).not.toHaveBeenCalled();
       expect(f.actors.stop).not.toHaveBeenCalled();
       expect(f.setActor).not.toHaveBeenCalled();

@@ -1,9 +1,11 @@
 import { createHash } from "node:crypto";
+import { diagnostics } from "../core/diagnostics.js";
 import { appendDeliveryOutcome } from "../mesh/delivery-outcomes.js";
 import { MeshBackgroundQueue } from "../core/atomic-write.js";
 import type { MeshEvent, MeshIdentity, MeshStore } from "../mesh/store.js";
 import {
-  INBOX_HORIZON_MS, ROOT_ID_PREFIX, crossIdentityReceipts, deliveryIdentity, eventReceipt, eventReceipts, topicWorkReceipt, workKey,
+  INBOX_HORIZON_MS, ROOT_ID_PREFIX, ROOT_INBOX_ACTION_KINDS, compareRootInboxEvents, crossIdentityReceipts, deliveryIdentity,
+  eventReceipt, eventReceipts, rootInboxBudget, topicWorkReceipt, workKey,
   type RootInboxBatch, type RootInboxEvent, type RootInboxReconcileOptions, type RootInboxSession,
 } from "./root-inbox-shared.js";
 
@@ -27,7 +29,11 @@ export {
  * event is skipped when the recipient has a confirmed native/inbox receipt for its sender and
  * work identity, persisted across reloads. Queued messages are not receipts. Addressed shadows
  * older than the configurable horizon are expired on first drain without buying model turns,
- * except answers, blockers, handoffs and completions: those remain actionable work.
+ * except answers, action kinds and completions: those remain actionable work.
+ *
+ * Ordinary durable admission stays bounded. Priority lookahead beyond that prefix is also offered,
+ * without moving its cursor or adding pending ids: the log and the pinned prefix recover it.
+ * Only shown rows are acknowledged; overflow is still work for the following turn.
  *
  * An event whose message entered a turn is acknowledged by id (smarty-dev#8962): it is never
  * injected again, whatever the session file confirms. A fully acknowledged batch moves the cursor
@@ -46,7 +52,7 @@ const STEER_GRACE_MS = 60_000;
  * that lands after the shadow was injected can duplicate it; confirmed receipts still suppress).
  * Name/alias-addressed events keep the grace; unaddressed events never hold the cursor.
  */
-const NEVER_EXPIRE_KINDS = new Set(["answer", "blocker", "handoff", "completion"]);
+const NEVER_EXPIRE_KINDS = new Set(["answer", "blocked", "blocker", "ask", "handoff", "done", "completion"]);
 const LATE_DELIVERY_HOUR_MS = 60 * 60_000;
 const inboxHorizonMs = (): number => {
   const text = process.env.PI_FABRIC_INBOX_HORIZON_MS;
@@ -84,7 +90,7 @@ const wakeCooldownMs = (): number => {
   if (value <= MAX_WAKE_COOLDOWN_MS) return value;
   if (!warnedWakeCooldownCap) {
     warnedWakeCooldownCap = true;
-    console.warn(`[pi-fabric] PI_FABRIC_INBOX_WAKE_COOLDOWN_MS=${value} exceeds ${MAX_WAKE_COOLDOWN_MS}; using ${MAX_WAKE_COOLDOWN_MS}`);
+    diagnostics.warn("src/topology/root-inbox.ts", `[pi-fabric] PI_FABRIC_INBOX_WAKE_COOLDOWN_MS=${value} exceeds ${MAX_WAKE_COOLDOWN_MS}; using ${MAX_WAKE_COOLDOWN_MS}`);
   }
   return MAX_WAKE_COOLDOWN_MS;
 };
@@ -96,11 +102,22 @@ interface RootInboxState {
   delivered?: string[];
   /** Receipt times parallel to delivered. Legacy string-only states migrate on first save. */
   deliveredAt?: number[];
+  /** Topic-scoped legacy key/ref claims already spent suppressing one shadow each. */
+  fallbacks?: string[];
+  /** Consumption times parallel to fallbacks; bounded with the delivered receipt ledger. */
+  fallbackAt?: number[];
+  /** Old native claims cannot regain suppression after their consumed marker is evicted. */
+  fallbackThrough?: number;
   /** High-water mark above `after`: no event at or below it is injected again. Never lowered. */
   ackedThrough?: number;
   /** Ids acked out of order above the mark, each with an upper bound of its mesh sequence. */
   acked?: Array<[string, number]>;
 }
+
+/** Only cursor-only progress is gated; receipt/pending changes stay dirty until saved. */
+const immediateSnapshot = (state: Partial<RootInboxState> | undefined): string => JSON.stringify([
+  state?.pending, state?.delivered, state?.deliveredAt, state?.fallbacks, state?.fallbackAt, state?.fallbackThrough,
+]);
 
 const sequenceOf = (value: unknown): number =>
   typeof value === "number" && Number.isSafeInteger(value) ? value : Number.NEGATIVE_INFINITY;
@@ -112,11 +129,13 @@ const parseAcks = (value: unknown): Array<[string, number]> => Array.isArray(val
 export class RootInbox {
   #state: RootInboxState | undefined;
   #saved: string | undefined;
+  #savedImmediate: string | undefined;
   #savedAt = 0;
   #wokeAt = Number.NEGATIVE_INFINITY;
   #dueAt = Number.POSITIVE_INFINITY;
   #delivered = new Map<string, number>();
   #acks = new Map<string, number>();
+  #fallbacks = new Map<string, number>();
   readonly #notifications = new MeshBackgroundQueue("root inbox wake notification");
   /** An ack is one-shot: its own queue retries a mesh lock timeout instead of dropping it. */
   readonly #ackWrites = new MeshBackgroundQueue("root inbox ack");
@@ -137,9 +156,9 @@ export class RootInbox {
 
   /**
    * The batch to deliver now. A pending batch the session holds is committed first; one it does
-   * not hold is delivered again. A new batch stops at the first addressed event younger than the
-   * steer grace (priority reads admit through an exact-session event first) and at the batch
-   * bounds, so the cursor never passes an event it has not admitted.
+   * not hold is delivered again. Ordinary admission stops at the steer grace (priority reads
+   * admit through an exact-session event first) and batch bounds, so the cursor never passes
+   * work it has not admitted. Ranked lookahead can offer newer work past that pending prefix.
    */
   async next(session: RootInboxSession, options: RootInboxReconcileOptions = {}): Promise<RootInboxBatch> {
     this.#dueAt = Number.POSITIVE_INFINITY;
@@ -157,13 +176,16 @@ export class RootInbox {
 
   async #next(session: RootInboxSession, options: RootInboxReconcileOptions, priority: boolean): Promise<RootInboxBatch> {
     const state = this.#load();
-    let receiptsChanged = this.#trimReceipts();
-    receiptsChanged = JSON.stringify(state) !== this.#saved || receiptsChanged;
-    receiptsChanged = this.#remember(session.delivered ?? [], session.deliveredAt) || receiptsChanged;
+    let saveImmediately = this.#trimReceipts();
+    saveImmediately = immediateSnapshot(state) !== this.#savedImmediate || saveImmediately;
+    // Canonical history without a finite timestamp is exact-replay evidence only; do not
+    // renew its ambiguous key/ref claim at read time.
+    saveImmediately = this.#remember(session.delivered ?? [], session.deliveredAt, true) || saveImmediately;
     let skippedStale = 0;
+    const reservations = new Set<string>();
     if (state.pending && options.turnEnd) await this.#alarmPending(state).catch(error => {
       // An observational alarm must never keep confirmed work wedged behind publication.
-      console.warn(`[pi-fabric] root inbox alarm: ${error instanceof Error ? error.message : String(error)}`);
+      diagnostics.warn("src/topology/root-inbox.ts", `[pi-fabric] root inbox alarm: ${error instanceof Error ? error.message : String(error)}`);
     });
     // An ack can land while this read awaits the mesh: it may commit this very batch.
     const held = state.pending;
@@ -172,7 +194,7 @@ export class RootInbox {
       const unacked = held.through <= this.#mark() ? [] : held.ids.filter((id) => !this.#acks.has(id));
       const holdsBatch = unacked.length === 0 || session.holdsBatch(held.ids);
       if (options.commitOnly && !holdsBatch) {
-        await this.#save(receiptsChanged);
+        await this.#save(saveImmediately);
         return { events: [], through: state.after };
       }
       const reread = this.#reread(state.after, held);
@@ -196,7 +218,8 @@ export class RootInbox {
         // A native delivery can arrive after the pending save. Recheck it on recovery too.
         const events = pending.filter((event) => {
           if (this.#stale(event)) { skippedStale++; return false; }
-          if (!this.#steered(event, session)) return true;
+          if (!this.#steered(event, session, reservations)) return true;
+          this.#consumeFallback(event, reservations);
           this.#remember(eventReceipts(event));
           return false;
         }).map((event) => this.#late(event));
@@ -205,7 +228,8 @@ export class RootInbox {
           // Retry a failed pending-cursor save before delivery: in-memory pending alone
           // is not durable admission, including after a mesh acquisition timeout.
           await this.#save(true);
-          return this.#unacked({ events, through: held.through, ...(skippedStale ? { skippedStale, horizonMs: this.#horizon() } : {}) });
+          return this.#offer({ events, through: held.through, ...(skippedStale ? { skippedStale, horizonMs: this.#horizon() } : {}) },
+            session, priority, reservations);
         }
       }
       state.after = Math.max(state.after, held.through);
@@ -213,23 +237,24 @@ export class RootInbox {
       await this.#save(true);
     }
     if (options.commitOnly) {
-      await this.#save(receiptsChanged);
+      await this.#save(saveImmediately);
       return { events: [], through: state.after };
     }
-    const batch = this.#scan(state.after, session, true, (event) => {
-      receiptsChanged = this.#remember(eventReceipts(event)) || receiptsChanged;
-    }, priority);
+    const batch = this.#scan(state.after, session, true, (event, reservations) => {
+      saveImmediately = this.#consumeFallback(event, reservations) || saveImmediately;
+      saveImmediately = this.#remember(eventReceipts(event)) || saveImmediately;
+    }, priority, reservations);
     skippedStale += batch.skippedStale ?? 0;
     if (skippedStale) { batch.skippedStale = skippedStale; batch.horizonMs = this.#horizon(); }
     if (batch.events.length === 0) {
       state.after = batch.through;
       // Expiry and new receipts are durable immediately: a restart must not repeat the summary.
-      await this.#save(receiptsChanged || skippedStale > 0);
+      await this.#save(saveImmediately || skippedStale > 0);
       return batch;
     }
     state.pending = { through: batch.through, ids: batch.events.map((event) => event.id), since: this.#now() };
     await this.#save(true);
-    return this.#unacked(batch);
+    return this.#offer(batch, session, priority, reservations);
   }
 
   /**
@@ -257,7 +282,7 @@ export class RootInbox {
     if (!idle()) return undefined;
     // A stale-only drain reports once but must not buy a model turn; nor does late actionable work.
     if (batch.events.length === 0) return batch.skippedStale ? batch : undefined;
-    const waking = batch.events.filter((event) => !event.deliveredLate);
+    const waking = rootInboxBudget(batch.events).shown.filter((event) => !(event as RootInboxEvent).deliveredLate);
     if (waking.length === 0) return batch;
     const reason = urgent ? "p0" : exact ? "addressed" : "idle";
     this.#wokeAt = this.#now();
@@ -292,10 +317,14 @@ export class RootInbox {
     // smarty-dev#5518: an ack is the inbox carrier entering a turn, so it is native consumption.
     // Resolve the batch's newly acked events before the cursor moves past them; next() then never
     // sees them, and the journal dedups an id it already holds (exactly once per event id).
-    const consumed = pending ? ids.filter((id) => pending.ids.includes(id) && !this.#acks.has(id)) : [];
-    const delivered = consumed.length ? this.#reread(state.after, { ...pending!, ids: consumed }) : [];
+    // Lookahead can be above the pending prefix. Its ack must retain its actual sequence:
+    // committing the prefix must not erase an out-of-order consumption receipt.
+    const consumed = ids.filter((id) => !this.#acks.has(id));
+    const through = Math.max(pending?.through ?? state.after, this.mesh.latestSequence());
+    const delivered = consumed.length ? this.#reread(state.after, { ids: consumed, through, since: this.#now() }) : [];
+    const sequences = new Map(delivered.map((event) => [event.id, event.sequence]));
     for (const id of ids) {
-      if (!this.#acks.has(id)) this.#acks.set(id, pending?.ids.includes(id) ? pending.through : state.after);
+      if (!this.#acks.has(id)) this.#acks.set(id, sequences.get(id) ?? through);
     }
     if (pending && pending.ids.every((id) => this.#acks.has(id))) {
       state.after = Math.max(state.after, pending.through);
@@ -308,7 +337,7 @@ export class RootInbox {
           "delivered", "consumed by Main inbox as itself", this.#now());
       } catch (error) {
         // Observational evidence must never undo the ack that keeps the event from re-injection.
-        console.warn(`[pi-fabric] root inbox delivery outcome: ${error instanceof Error ? error.message : String(error)}`);
+        diagnostics.warn("src/topology/root-inbox.ts", `[pi-fabric] root inbox delivery outcome: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
   }
@@ -336,9 +365,10 @@ export class RootInbox {
     const state = this.#load();
     const pending = state.pending && !session.holdsBatch(state.pending.ids) ? state.pending : undefined;
     const after = state.pending ? Math.max(state.after, state.pending.through) : state.after;
+    const reservations = new Set<string>();
     return [...(pending ? this.#reread(state.after, pending).filter((event) =>
-      !this.#acked(event) && !this.#stale(event) && !this.#steered(event, session)).map((event) => this.#late(event)) : []),
-    ...this.#scan(after, session, false, undefined, true).events];
+      !this.#acked(event) && !this.#stale(event) && !this.#steered(event, session, reservations)).map((event) => this.#late(event)) : []),
+    ...this.#scan(after, session, false, undefined, true, reservations).events];
   }
 
   /** Addressed to this session's own id on a work topic (not a name or alias). */
@@ -353,6 +383,57 @@ export class RootInbox {
   }
 
   #acked(event: MeshEvent): boolean { return event.sequence <= this.#mark() || this.#acks.has(event.id); }
+
+  /**
+   * Keep the ordinary 20-event/32-KiB durable prefix, plus a ranked tail window that fits the
+   * remaining persisted ack slots. Reserve every unacked pending id too, including missing ids,
+   * so a full lookahead window leaves enough headroom for the pinned prefix to make progress.
+   * Only the prefix is pending state; no cursor crosses intervening undisplayed work.
+   */
+  #offer(
+    batch: RootInboxBatch, session: RootInboxSession, priority: boolean, reservations: Set<string>,
+  ): RootInboxBatch {
+    const seen = new Set<string>();
+    const actions: RootInboxEvent[] = [], candidates: RootInboxEvent[] = [];
+    const consider = (event: RootInboxEvent): void => {
+      const receipts = eventReceipts(event);
+      if (receipts.some((id) => seen.has(id))) return;
+      for (const id of receipts) seen.add(id);
+      if (ROOT_INBOX_ACTION_KINDS.has(event.kind)) {
+        actions.push(event);
+        actions.sort(compareRootInboxEvents);
+        if (actions.length > MAX_ACKED_IDS) actions.pop();
+      } else {
+        candidates.push(event);
+        candidates.sort(compareRootInboxEvents);
+        if (candidates.length > MAX_BATCH_EVENTS) candidates.pop();
+      }
+    };
+    batch.events.forEach(consider);
+    // Reuse MAIN's scan protocol, including exact-session priority and one-use fallback claims.
+    // This is observational lookahead: suppressed tail events are consumed only on admission.
+    this.#scan(batch.through, session, false, undefined, priority, reservations).events.forEach(consider);
+    const window: RootInboxEvent[] = [];
+    let bytes = 0;
+    for (const event of candidates) {
+      const size = Math.min(Buffer.byteLength(event.text ?? ""), MAX_EVENT_TEXT_BYTES);
+      if (window.length && bytes + size > MAX_BATCH_TEXT_BYTES) break;
+      window.push(event);
+      bytes += size;
+    }
+    const ids = new Set(batch.events.map((event) => event.id));
+    const pendingSlots = this.#state!.pending?.ids.filter((id) => !this.#acks.has(id)).length ?? 0;
+    // Nonaction lookahead uses the same cumulative ack capacity as actions.
+    let remaining = Math.max(0, MAX_ACKED_IDS - this.#acks.size - pendingSlots);
+    const lookahead = [...actions, ...window].filter((event) => {
+      if (ids.has(event.id) || remaining === 0) return false;
+      ids.add(event.id);
+      remaining--;
+      return true;
+    });
+    // Keep the pinned prefix offered even at capacity; without lookahead it gets the next turn.
+    return this.#unacked({ ...batch, events: [...batch.events, ...lookahead] });
+  }
 
   /** Drop what an ack recorded while this read awaited the mesh. */
   #unacked(batch: RootInboxBatch): RootInboxBatch {
@@ -383,11 +464,24 @@ export class RootInbox {
     const theirs = Math.max(sequenceOf(value.after), sequenceOf(value.ackedThrough));
     if (theirs > this.#mark()) state.ackedThrough = theirs;
     for (const [id, bound] of parseAcks(value.acked)) if (!this.#acks.has(id)) this.#acks.set(id, bound);
+    if (typeof value.fallbackThrough === "number" && Number.isFinite(value.fallbackThrough)) {
+      state.fallbackThrough = Math.max(state.fallbackThrough ?? Number.NEGATIVE_INFINITY, value.fallbackThrough);
+    }
+    if (Array.isArray(value.fallbacks)) value.fallbacks.forEach((id, index) => {
+      if (typeof id !== "string") return;
+      const time = value.fallbackAt?.[index];
+      const at = typeof time === "number" && Number.isFinite(time) ? time : this.#fallbacks.get(id);
+      // A legacy marker without an observation time cannot prove that its one-use claim is current.
+      if (at === undefined) return;
+      this.#fallbacks.set(id, Math.max(this.#fallbacks.get(id) ?? Number.NEGATIVE_INFINITY, at));
+    });
     this.#syncAcks();
   }
 
   #scan(
-    after: number, session: RootInboxSession, bounded = true, onDelivered?: (event: MeshEvent) => void, priority = false,
+    after: number, session: RootInboxSession, bounded = true,
+    onDelivered?: (event: MeshEvent, reservations: ReadonlySet<string>) => void, priority = false,
+    reservations = new Set<string>(),
   ): RootInboxBatch {
     const now = this.#now();
     const names = new Set(this.names().filter((name) =>
@@ -400,11 +494,12 @@ export class RootInbox {
     // Priority reads admit the ordered prefix through the last eligible exact-session event now.
     // Active-turn reconciles keep the grace, so a steer into a running turn still wins.
     let bypassThrough = Number.NEGATIVE_INFINITY;
+    const priorityReservations = new Set(reservations);
     if (priority) for (let cursor = after; ;) {
       const page = this.mesh.read({ after: cursor, limit: pageSize });
       for (const event of page) {
         cursor = Math.max(cursor, event.sequence);
-        if (event.createdAt > cutoff && this.#exact(event) && !this.#acked(event) && !this.#steered(event, session)) {
+        if (event.createdAt > cutoff && this.#exact(event) && !this.#acked(event) && !this.#steered(event, session, priorityReservations)) {
           bypassThrough = event.sequence;
         }
       }
@@ -427,7 +522,7 @@ export class RootInbox {
         if (addressed(event)) {
           if (this.#acked(event)) { /* Delivered and acked, at or below the mark: never again. */ }
           else if (this.#stale(event)) skippedStale++;
-          else if (this.#steered(event, session)) onDelivered?.(event);
+          else if (this.#steered(event, session, reservations)) onDelivered?.(event, reservations);
           else if (!eventReceipts(event).some((id) => seen.has(id))) {
             const size = Math.min(Buffer.byteLength(event.text ?? ""), MAX_EVENT_TEXT_BYTES);
             if (bounded && (events.length >= MAX_BATCH_EVENTS || (events.length > 0 && bytes + size > MAX_BATCH_TEXT_BYTES))) {
@@ -446,25 +541,61 @@ export class RootInbox {
 
   // Positive delivery evidence only, qualified by sender and this recipient's state key.
   // Before Pi records a native message, its shadow remains recoverable (at least once).
-  #steered(event: MeshEvent, session: RootInboxSession): boolean {
+  #steered(event: MeshEvent, session: RootInboxSession, reservations?: Set<string>): boolean {
     const has = (id: string): boolean => this.#delivered.has(id) || session.delivered?.has(id) === true;
     if (eventReceipts(event).some(has) || crossIdentityReceipts(event.from.id, event.data).some(has)) return true;
+    const identity = deliveryIdentity(event.data);
+    // An explicit deliveryId/messageId/commandId is a stable event identity. Once the exact receipts above
+    // miss, this is distinct work: never let its shared key/ref fall back to a native carrier.
+    // #1226 also records originating event receipts on Main carriers, so exact matching stays the
+    // preferred path as carriers gain that metadata.
+    if (identity) return false;
     const key = workKey(event.data);
-    if (key === undefined) return false;
-    // A shadow that carries its own messageId/deliveryId still matches a follow-up or steer that
-    // carried the same work key on the same topic and no identity of its own: that carrier claimed
-    // the key there. A carrier with a different identity is distinct work (its key receipt is never
-    // recorded), and a key receipt on another topic or with no topic never suppresses (see above).
-    if (deliveryIdentity(event.data)) return has(topicWorkReceipt(event.from.id, "key", event.topic, key));
-    return session.holdsSteer(event.from.id, key, event.topic);
+    // smarty-dev#12140: a key/ref receipt is a native carrier's claim ("native-topic-*"), never a
+    // consumed mesh event's: a distinct legacy event with the same sender, topic and key still
+    // needs the key fallback only when it has no stable delivery identity of its own.
+    const data = event.data && typeof event.data === "object" ? event.data as { ref?: unknown } : undefined;
+    const kind: "key" | "ref" = key === undefined ? "ref" : "key";
+    const value = key ?? (typeof data?.ref === "string" && data.ref.trim() ? data.ref.trim() : undefined);
+    if (value === undefined) return false;
+    const claim = topicWorkReceipt(event.from.id, kind, event.topic, value);
+    const through = this.#state!.fallbackThrough;
+    // A key/ref claim needs a positive integer observation time with at most 60s of future skew.
+    // Invalid/missing/future timestamps are no proof; exact identity receipts were checked above.
+    const at = session.delivered?.has(claim) ? session.deliveredAt?.get(claim) : this.#delivered.get(claim);
+    if (typeof at !== "number" || !Number.isFinite(at) || !Number.isInteger(at) || at <= 0 || at > this.#now() + 60_000) return false;
+    const claimed = has(claim) || (kind === "key" && session.holdsSteer(event.from.id, value, event.topic));
+    // Canonical history can outlive its cursor receipt, even for an unused claim. Expiry
+    // and eviction must fail open rather than resurrect that old carrier's suppression.
+    if (at < this.#now() - this.#horizon()) return false;
+    if (through !== undefined && at <= through) return false;
+    if (!claimed || this.#fallbacks.has(claim) || reservations?.has(claim)) return false;
+    reservations?.add(claim);
+    return true;
   }
 
-  #remember(ids: Iterable<string>, times?: ReadonlyMap<string, number>): boolean {
+  #consumeFallback(event: MeshEvent, reservations: ReadonlySet<string>): boolean {
+    if (deliveryIdentity(event.data)) return false;
+    const data = event.data && typeof event.data === "object" ? event.data as { ref?: unknown } : undefined;
+    const key = workKey(event.data);
+    const kind: "key" | "ref" = key === undefined ? "ref" : "key";
+    const value = key ?? (typeof data?.ref === "string" && data.ref.trim() ? data.ref.trim() : undefined);
+    if (value === undefined) return false;
+    const claim = topicWorkReceipt(event.from.id, kind, event.topic, value);
+    if (!reservations.has(claim) || this.#fallbacks.has(claim)) return false;
+    this.#fallbacks.set(claim, this.#now());
+    return true;
+  }
+
+  #remember(ids: Iterable<string>, times?: ReadonlyMap<string, number>, canonicalHistory = false): boolean {
     let changed = false;
     const cutoff = this.#now() - this.#horizon();
     for (const id of ids) {
-      // Missing times (legacy/custom callers) retain the original observation time.
-      const at = times?.get(id) ?? this.#delivered.get(id) ?? this.#now();
+      // Timestamp-less canonical history remains available through session.delivered for exact
+      // identity replay checks, but must not be silently renewed into a key/ref claim.
+      const recorded = times?.get(id);
+      if (canonicalHistory && !Number.isFinite(recorded)) continue;
+      const at = Number.isFinite(recorded) ? recorded! : this.#delivered.get(id) ?? this.#now();
       if (at < cutoff) continue;
       const previous = this.#delivered.get(id);
       if (previous === undefined || at > previous) {
@@ -477,14 +608,40 @@ export class RootInbox {
 
   /** Oldest first, by canonical receipt time, not the most recent history scan. */
   #trimReceipts(): boolean {
-    const before = this.#delivered.size;
+    const before = this.#delivered.size + this.#fallbacks.size;
     const cutoff = this.#now() - this.#horizon();
-    let entries = [...this.#delivered].filter(([, at]) => at >= cutoff)
-      .sort((a, b) => a[1] - b[1]).slice(-MAX_DELIVERED_RECEIPTS);
     const state = this.#state!;
+    const retire = (id: string, at: number): void => {
+      // A restored canonical claim can be newer than its spent marker (clock skew or
+      // an undated marker). Retiring only the marker's age would revive that claim.
+      state.fallbackThrough = Math.max(state.fallbackThrough ?? Number.NEGATIVE_INFINITY, at,
+        this.#delivered.get(id) ?? Number.NEGATIVE_INFINITY);
+    };
+    for (const [id, at] of this.#fallbacks) if (at < cutoff) {
+      retire(id, at);
+      this.#fallbacks.delete(id);
+    }
+    const all: Array<["delivered" | "fallback", string, number]> = [
+      ...[...this.#delivered].filter(([, at]) => at >= cutoff).map(([id, at]): ["delivered", string, number] => ["delivered", id, at]),
+      ...[...this.#fallbacks].map(([id, at]): ["fallback", string, number] => ["fallback", id, at]),
+    ].sort((a, b) => a[2] - b[2]);
+    const entries = all.slice(-MAX_DELIVERED_RECEIPTS);
+    // Hashes do not expose receipt kind. Retire every evicted timestamp conservatively;
+    // the watermark affects only legacy fallback, never the exact-ID checks above it.
+    for (const [, id, at] of all.slice(0, -MAX_DELIVERED_RECEIPTS)) retire(id, at);
+    const baseThrough = state.fallbackThrough;
     const assign = (offset: number): void => {
-      state.delivered = entries.slice(offset).map(([id]) => id);
-      state.deliveredAt = entries.slice(offset).map(([, at]) => at);
+      if (baseThrough === undefined) delete state.fallbackThrough;
+      else state.fallbackThrough = baseThrough;
+      const kept = entries.slice(offset);
+      const delivered = kept.filter(([kind]) => kind === "delivered");
+      const fallbacks = kept.filter(([kind]) => kind === "fallback");
+      state.delivered = delivered.map(([, id]) => id);
+      state.deliveredAt = delivered.map(([, , at]) => at);
+      state.fallbacks = fallbacks.map(([, id]) => id);
+      state.fallbackAt = fallbacks.map(([, , at]) => at);
+      // Include the final watermark in every byte-budget candidate, not after sizing it.
+      for (const [, id, at] of entries.slice(0, offset)) retire(id, at);
     };
     // Account for the actual cursor and pending IDs too. Byte-size (not count) protects
     // configured small mesh values; count also caps memory at the default/larger limit.
@@ -497,9 +654,10 @@ export class RootInbox {
       else high = middle;
     }
     assign(low);
-    entries = entries.slice(low);
-    this.#delivered = new Map(entries);
-    return before !== entries.length;
+    const kept = entries.slice(low);
+    this.#delivered = new Map(kept.filter(([kind]) => kind === "delivered").map(([, id, at]) => [id, at]));
+    this.#fallbacks = new Map(kept.filter(([kind]) => kind === "fallback").map(([, id, at]) => [id, at]));
+    return before !== kept.length;
   }
 
   #horizon(): number { return this.options.horizonMs ?? inboxHorizonMs(); }
@@ -557,6 +715,7 @@ export class RootInbox {
     this.#state = {
       after: saved ? value!.after! : this.mesh.latestSequence(),
       ...(Array.isArray(value?.delivered) ? { delivered: value.delivered.filter((id): id is string => typeof id === "string") } : {}),
+      ...(Array.isArray(value?.fallbacks) ? { fallbacks: value.fallbacks.filter((id): id is string => typeof id === "string") } : {}),
       ...(pending && Array.isArray(pending.ids) && typeof pending.through === "number"
         ? { pending: { through: pending.through, ids: pending.ids.filter((id): id is string => typeof id === "string"),
           since: typeof pending.since === "number" && Number.isFinite(pending.since) ? pending.since : stored?.updatedAt ?? this.#now(),
@@ -567,11 +726,30 @@ export class RootInbox {
     };
     this.#acks = new Map(parseAcks(value?.acked));
     this.#syncAcks();
-    this.#delivered = new Map((this.#state.delivered ?? []).map((id, index) => {
+    // Missing legacy timestamps are intentionally not upgraded to read/load time: a key/ref
+    // claim without finite observation time must fail open. Exact canonical identity checks still
+    // use the session receipt set directly when its entry is available.
+    this.#delivered = new Map((this.#state.delivered ?? []).flatMap((id, index) => {
       const at = value?.deliveredAt?.[index];
-      return [id, typeof at === "number" && Number.isFinite(at) ? at : this.#now()];
+      return typeof at === "number" && Number.isFinite(at) && Number.isInteger(at) && at > 0 && at <= this.#now() + 60_000
+        ? [[id, at] as [string, number]] : [];
     }));
+    // Fallbacks are spent markers, not delivery proof. Keep every string marker, even
+    // with a missing/malformed age: dropping or immediately expiring it could resurrect
+    // a fresh key/ref claim. Future ages are intentionally retained. Invalid ages use
+    // the claim's valid observation time (or now) only for retention/eviction bookkeeping.
+    this.#fallbacks = new Map((Array.isArray(value?.fallbacks) ? value.fallbacks : []).flatMap((id, index) => {
+      if (typeof id !== "string") return [];
+      const time = value?.fallbackAt?.[index];
+      const at = typeof time === "number" && Number.isFinite(time) && Number.isInteger(time) && time > 0
+        ? time : this.#delivered.get(id) ?? this.#now();
+      return [[id, at] as [string, number]];
+    }));
+    if (typeof value?.fallbackThrough === "number" && Number.isFinite(value.fallbackThrough)) {
+      this.#state.fallbackThrough = value.fallbackThrough;
+    }
     this.#saved = saved ? JSON.stringify(value) : undefined;
+    this.#savedImmediate = saved ? immediateSnapshot(value) : undefined;
     this.#trimReceipts();
     this.#savedAt = saved ? this.#now() : 0;
     return this.#state;
@@ -583,8 +761,10 @@ export class RootInbox {
     const text = JSON.stringify(this.#state);
     if (text === this.#saved) return;
     if (!now && this.#now() - this.#savedAt < SAVE_INTERVAL_MS) return;
+    const immediate = immediateSnapshot(this.#state);
     await this.mesh.put({ key: this.key, value: JSON.parse(text) as RootInboxState, identity: this.identity });
     this.#saved = text;
+    this.#savedImmediate = immediate;
     this.#savedAt = this.#now();
   }
 

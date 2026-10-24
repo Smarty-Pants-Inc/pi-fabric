@@ -3,6 +3,7 @@ type UserConfig = import("vitest/config").ViteUserConfig;
 // Vite loads a CommonJS config bundle in memory; ESM configs emit into node_modules/.vite-temp
 // before cacheDir can take effect. Keep this entry .cts so plain `vitest run` is read-only-install safe.
 const { join } = require("node:path") as typeof import("node:path");
+const { hostedOnly } = require("./scripts/hosted-only.mjs") as typeof import("./scripts/hosted-only.mjs");
 const { isolatedTestTemp, isolateTestFleetEnvironment } = require("./scripts/test-temp.ts") as typeof import("./scripts/test-temp.js");
 
 // Assign the caller-owned run root before Vitest snapshots its environment, forks workers,
@@ -45,15 +46,27 @@ const hostedOnlyDeletionSuites = [
   "tests/windows-temp-root-native.test.ts", // diskpart formats a native NTFS VHD mounted outside TMPDIR.
 ];
 
-/** Unguarded or reverted deletion suites stay hosted-only; GitHub Actions always collects every suite. */
+/** Unguarded or reverted deletion suites require a GitHub-hosted runner with no fleet veto. */
 function productDeletionSuites(): string[] {
-  return process.env.GITHUB_ACTIONS === "true" ? [] : [...hostedOnlyDeletionSuites];
+  return hostedOnly("native/tool or reverted deletion suites") ? [] : [...hostedOnlyDeletionSuites];
 }
 
 const localRealDeleteSuites = productDeletionSuites();
-if (localRealDeleteSuites.length > 0) {
-  console.warn(`smarty-dev#4664: local run skips ${localRealDeleteSuites.length} native/tool or reverted deletion suites`);
-}
+
+// Generic CI checks do not own a broker. Exclude whole broker-capable suites before
+// affected-test discovery (including their fake cases); dedicated nats-* jobs run them.
+// Fake-only NATS suites stay in the generic cross-platform selection.
+const realBrokerNatsSuites = [
+  "tests/mesh-state-backend.test.ts",
+  "tests/mesh-state-backend-multiprocess.test.ts",
+  "tests/mesh-backend-migration-nats.test.ts",
+  "tests/state-backend-nats-election.test.ts",
+  "tests/state-backend-nats-publish-dedupe.test.ts",
+  "tests/state-backend-nats-pull-recovery.test.ts",
+  "tests/nats-auth-server.test.ts",
+];
+const excludedSuites = [...localRealDeleteSuites,
+  ...(process.env.FABRIC_TEST_SKIP_NATS === "1" ? realBrokerNatsSuites : [])];
 
 // Separate policy projects avoid writing a fixture read by unrelated config tests.
 const policyConstants = (name: string) => ({
@@ -65,7 +78,7 @@ const sharedTests = {
   env: { ...temp, ...fleet },
   setupFiles: ["./tests/fleet-isolation-setup.ts"],
   include: ["tests/**/*.test.ts"],
-  ...(localRealDeleteSuites.length > 0 ? { exclude: localRealDeleteSuites } : {}),
+  ...(excludedSuites.length > 0 ? { exclude: excludedSuites } : {}),
   // Real worker processes and cold TypeScript compilers share this suite.
   // Behavioral timeouts and performance budgets remain asserted by tests.
   testTimeout: 15_000,
@@ -91,7 +104,7 @@ module.exports = {
       {
         cacheDir,
         define: policyConstants("missing"),
-        test: { ...sharedTests, name: "default", exclude: [...localRealDeleteSuites,
+        test: { ...sharedTests, name: "default", exclude: [...excludedSuites,
           "tests/session-entry-retention.test.ts", "tests/host-policy.test.ts",
           "tests/process-slice-scope-e2e.test.ts"] },
       },

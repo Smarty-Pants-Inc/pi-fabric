@@ -19,21 +19,6 @@ const TICKET = /^\d{24}-\d+-[a-f0-9-]+$/;
 const GATED_BUDGET_MS = 2000;
 // The head refreshes its receipt this often; the stall bound is at least four heartbeats.
 const HEARTBEAT_MS = 50;
-// smarty-dev#9805: how long the next waiter must itself see the head's receipt unchanged, with the canonical .lock
-// absent, before one bypass probe (five missed heartbeats; far below the ordinary 80% fallback).
-const FREE_LOCK_BYPASS_MS = 250;
-
-/** Whether any waiter's receipt is queued in `directory` (one readdir; an absent directory has none). A newcomer that
- * finds one queues behind it instead of barging (smarty-dev#9805). */
-export const meshLockQueueBusy = (directory: string): boolean => {
-  // Fail open (pi-fabric#936 round 3): any stat or listing error (EACCES on a directory another user planted, EIO)
-  // means "nobody queued", the pre-#9805 contest, never a failed write. No throw on the common path either: a root
-  // that never queued has no directory, and an ENOENT exception per write costs more than the stat.
-  try {
-    if (!fs.statSync(directory, { throwIfNoEntry: false })) return false;
-    return fs.readdirSync(directory).some(name => TICKET.test(name));
-  } catch { return false; }
-};
 
 const pidAlive = (name: string): boolean => {
   try { process.kill(Number(name.split("-")[1]), 0); return true; }
@@ -64,6 +49,7 @@ export class MeshLockTicket {
   #nextAfterHead = false;
   #queueHead: string | undefined;
   #predecessorMtimeMs = 0;
+  #predecessorStat: fs.Stats | undefined;
   #observedBeat: string | undefined;
   #beatSeenAt = 0;
   #headCheckedAt = 0;
@@ -83,9 +69,9 @@ export class MeshLockTicket {
    * a queue whose ticket closes when the lock is taken (SQLite state writes): there a stale head never holds the lock.
    * A `.lock` holder keeps its receipt through its critical section, so a long hold would look stalled.
    * `stalledHeadBypassLock` (smarty-dev#9805): the canonical `.lock` directory path. Only the waiter directly behind
-   * the head may then probe early, once its own observation of the head's receipt is unchanged for
-   * FREE_LOCK_BYPASS_MS AND that path is absent. Its ticket stays queued (the head's receipt is untouched), so a
-   * lost race returns it to its place and a resumed head keeps its priority; mkdir/rename stays the only exclusion. */
+   * the head may reap its receipt early, once its own observation of the head's name and mtime is older than the stall
+   * bound and that path is absent. Reaping makes the follower the new FIFO head; a resumed head sees its missing ticket
+   * and falls back to the plain contest, while mkdir/rename stays the only exclusion fence. */
   constructor(root: string, token: string, budgetMs: number,
     options: { passStalledHead?: boolean; stalledHeadBypassLock?: string } = {}) {
     this.#directory = meshLockQueueDirectory(root);
@@ -130,7 +116,12 @@ export class MeshLockTicket {
     // caching index > 1 until that predecessor leaves; it may itself now be the stalled head (#9805).
     if (this.#bypassLock !== undefined && !this.#nextAfterHead && this.#queueHead !== undefined &&
       !fs.existsSync(path.join(this.#directory, this.#queueHead))) this.#predecessor = undefined;
-    if (this.#predecessor !== undefined && this.#waitingOn(this.#predecessor)) return this.#holdBack();
+    if (this.#predecessor !== undefined && this.#waitingOn(this.#predecessor)) {
+      const held = this.#holdBack();
+      if (held !== undefined) return held;
+      // The stalled head was reaped. Rescan so this ticket can become the new FIFO head.
+      this.#predecessor = undefined;
+    }
     for (;;) {
       let names: string[];
       try { names = fs.readdirSync(this.#directory).filter(name => TICKET.test(name)).sort(); }
@@ -144,8 +135,14 @@ export class MeshLockTicket {
       // Receipt names are host-monotonic, so a predecessor at index 0 stays head until its receipt goes (watched).
       this.#nextAfterHead = index === 1;
       this.#queueHead = names[0];
-      if (this.#waitingOn(this.#predecessor)) return this.#holdBack();
-      // The predecessor was dead or stale and is now unlinked: look again.
+      if (this.#waitingOn(this.#predecessor)) {
+        const held = this.#holdBack();
+        if (held !== undefined) return held;
+        // The stalled head was reaped. Rescan so this ticket can become the new FIFO head.
+        this.#predecessor = undefined;
+        continue;
+      }
+      // The predecessor was dead, stale, or reaped and is now unlinked: look again.
     }
   }
 
@@ -156,11 +153,23 @@ export class MeshLockTicket {
     const file = path.join(this.#directory, name);
     try {
       const stat = fs.lstatSync(file);
-      if (pidAlive(name) && Date.now() - stat.mtimeMs <= this.#staleMs) { this.#predecessorMtimeMs = stat.mtimeMs; return true; }
+      if (pidAlive(name) && Date.now() - stat.mtimeMs <= this.#staleMs) {
+        this.#predecessorMtimeMs = stat.mtimeMs;
+        this.#predecessorStat = stat;
+        return true;
+      }
+      this.#predecessorStat = undefined;
+      // A canonical holder retains its advisory receipt even if its event loop has been stalled past staleMs. The
+      // receipt can be reconsidered once the sole exclusion fence is gone; until then, fail closed and wait.
+      if (this.#bypassLock !== undefined && !this.#canonicalLockAbsent()) return true;
       // A receipt is a regular file (main unlinked it; an unlink never removes a directory): anything else is kept and
       // waited on, never handed to a recursive removal. verifiedRemove's `.retention-graveyard-*` never matches TICKET.
       if (!stat.isFile()) return true;
-      if (!verifiedRemove(file, stat, { deleter: "meshLockQueueReceipt", fallback: () => { fs.unlinkSync(file); return true; } }).removed) {
+      if (!verifiedRemove(file, stat, { deleter: "meshLockQueueReceipt", fallback: () => {
+        if (this.#bypassLock !== undefined && !this.#canonicalLockAbsent()) return false;
+        fs.unlinkSync(file);
+        return true;
+      } }).removed) {
         return fs.lstatSync(file, { throwIfNoEntry: false }) !== undefined;
       }
     } catch (error) {
@@ -171,9 +180,10 @@ export class MeshLockTicket {
 
   /** Past 80% of an ordinary budget (with `passStalledHead`, at any time), join the plain contest only if the head is
    * stalled: neither its heartbeat nor our first sight of it as head is within the stall bound. The second term
-   * keeps a head that has only just taken over from being judged by its old creation time. */
-  #holdBack(): boolean {
-    if (this.#bypassesFreeStalledHead()) return true;
+   * keeps a head that has only just taken over from being judged by its old creation time. Returns undefined when the
+   * canonical-lock follower reaped its stalled head and the caller must rescan. */
+  #holdBack(): boolean | undefined {
+    if (this.#reapStalledHead()) return undefined;
     const now = Date.now();
     if (now < this.#fallbackAt) {
       // smarty-dev#10516: a stalled head otherwise holds every waiter to 80% of its budget, and most then time out in
@@ -195,16 +205,46 @@ export class MeshLockTicket {
     return true;
   }
 
-  /** smarty-dev#9805: true for one probe by the waiter directly behind the head, when THIS waiter has seen the head's
-   * receipt (name and mtime, from #waitingOn's stat) unchanged for FREE_LOCK_BYPASS_MS and the canonical .lock is
-   * absent. Never closes the ticket or touches the head's receipt. Any .lock entry, or any stat error other than
-   * ENOENT, holds back: a live holder is never bypassed. Evaluated only on the existing wake/poll; no new timer. */
-  #bypassesFreeStalledHead(): boolean {
+  /** smarty-dev#9805: reap the receipt of a stalled head only from the waiter directly behind it. This waiter must
+   * have observed the same head name and mtime for #stallMs, and the canonical lock must be absent at the judgment.
+   * The judged stat goes through verifiedRemove, exactly like ordinary dead/stale receipt cleanup. A failed verification
+   * keeps the receipt and holds back; a successful removal asks mayContend() to rescan. */
+  #reapStalledHead(): boolean {
     if (this.#bypassLock === undefined || !this.#nextAfterHead || this.#predecessor === undefined) return false;
-    const at = performance.now();
+    const now = Date.now();
     const beat = `${this.#predecessor}:${this.#predecessorMtimeMs}`;
-    if (beat !== this.#observedBeat) { this.#observedBeat = beat; this.#beatSeenAt = at; return false; }
-    if (at - this.#beatSeenAt < FREE_LOCK_BYPASS_MS) return false;
+    if (beat !== this.#observedBeat) {
+      this.#observedBeat = beat;
+      this.#beatSeenAt = now;
+      return false;
+    }
+    if (now - this.#beatSeenAt <= this.#stallMs) return false;
+    if (!this.#canonicalLockAbsent()) return false;
+    const judged = this.#predecessorStat;
+    if (judged === undefined || !judged.isFile()) return false;
+    const file = path.join(this.#directory, this.#predecessor);
+    try {
+      const removed = verifiedRemove(file, judged, { deleter: "meshLockQueueReceipt", proceed: () => this.#canonicalLockAbsent(), fallback: () => {
+        if (!this.#canonicalLockAbsent()) return false;
+        fs.unlinkSync(file);
+        return true;
+      } }).removed;
+      if (!removed) {
+        // Do not spin on a permission or identity refusal. The next observation gets another full stall bound.
+        this.#beatSeenAt = now;
+        return false;
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    this.#predecessorStat = undefined;
+    this.#observedBeat = undefined;
+    return true;
+  }
+
+  /** The canonical guard is optional; when configured, only ENOENT proves absence and every other result holds back cleanup. */
+  #canonicalLockAbsent(): boolean {
+    if (this.#bypassLock === undefined) return true;
     try { fs.lstatSync(this.#bypassLock); return false; }
     catch (error) { return (error as NodeJS.ErrnoException).code === "ENOENT"; }
   }
@@ -221,14 +261,18 @@ export class MeshLockTicket {
   get queued(): boolean { return !this.#closed; }
 
   /** Sleep at most `ms`, waking early when the receipt this waiter depends on goes (non-head)
-   * or when .lock is released (head). A wake that arrived since the last wait returns at once. */
-  wait(ms: number, signal?: AbortSignal): Promise<void> {
+   * or when .lock is released (head). A wake that arrived since the last wait returns at once.
+   * An optional fixed acquisition deadline bounds the sleep after synchronous watch setup. */
+  wait(ms: number, signal?: AbortSignal, deadline?: number): Promise<void> {
     signal?.throwIfAborted();
     if (!this.#closed) {
       if (this.#head) this.#watchRelease();
       else if (this.#predecessor !== undefined) this.#watchPredecessor(this.#predecessor);
     }
+    signal?.throwIfAborted();
     if (this.#signalled) { this.#signalled = false; return Promise.resolve(); }
+    const sleepMs = deadline === undefined ? ms : Math.min(ms, deadline - Date.now());
+    if (deadline !== undefined && sleepMs <= 0) return Promise.resolve();
     return new Promise((resolve, reject) => {
       const finish = (): void => {
         clearTimeout(timer);
@@ -239,10 +283,11 @@ export class MeshLockTicket {
       };
       const onAbort = (): void => {
         clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
         this.#wake = undefined;
         reject(signal!.reason);
       };
-      const timer = setTimeout(finish, ms);
+      const timer = setTimeout(finish, sleepMs);
       this.#wake = finish;
       signal?.addEventListener("abort", onAbort, { once: true });
     });
@@ -258,7 +303,15 @@ export class MeshLockTicket {
   #open(target: string, onEvent: (name: string | null) => void): fs.FSWatcher | undefined {
     try {
       const watcher = fs.watch(target, { persistent: false }, (_event, name) => onEvent(name === null ? null : String(name)));
-      watcher.on("error", () => watcher.close());
+      watcher.on("error", () => {
+        watcher.close();
+        if (this.#predecessorWatcher === watcher) {
+          this.#predecessorWatcher = undefined;
+          this.#watched = undefined;
+        } else if (this.#rootWatcher === watcher) this.#rootWatcher = undefined;
+        else return; // A late error from a replaced/closed handle cannot disturb its successor.
+        this.#signal();
+      });
       return watcher;
     } catch (error) {
       // The receipt went between our stat and the watch: that is the wake itself.
@@ -271,8 +324,8 @@ export class MeshLockTicket {
   #watchPredecessor(name: string): void {
     if (this.#watched === name) return;
     this.#predecessorWatcher?.close();
-    this.#watched = name;
     this.#predecessorWatcher = this.#open(path.join(this.#directory, name), () => this.#signal());
+    this.#watched = this.#predecessorWatcher ? name : undefined;
   }
 
   /** The head is the only waiter that watches the mesh root, for .lock going away. */
@@ -280,6 +333,7 @@ export class MeshLockTicket {
     if (this.#rootWatcher) return;
     this.#predecessorWatcher?.close();
     this.#predecessorWatcher = undefined;
+    this.#watched = undefined;
     this.#rootWatcher = this.#open(this.#root, name => { if (name === null || name === ".lock") this.#signal(); });
   }
 

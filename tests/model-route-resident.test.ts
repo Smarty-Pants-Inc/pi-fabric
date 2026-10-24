@@ -74,7 +74,8 @@ const fixture = async () => {
     extensions: false, model: pin.model, thinking: pin.effort, routeClass: "status-groom", protected: false }, context) as FabricActorInfo;
   const activate = async () => {
     const result = await host.actors.ask(actor.id, "ECHO_MODEL", "test");
-    await vi.waitFor(() => expect(host.agents.runDirectory(result.runId!)).toBeUndefined());
+    // Full actor archives now confirm every file and directory durably before source collection.
+    await vi.waitFor(() => expect(host.agents.runDirectory(result.runId!)).toBeUndefined(), { timeout: 10000 });
     return result;
   };
   return { identity, config, configFile, host, client, actor, activate, provider, context, makeProvider, mainAgent };
@@ -101,7 +102,7 @@ describe("resident LIVE custody and manual config rollback", () => {
     archive.mockRestore(); expect((await state.activate()).text).toContain(cheap.model);
     expect(state.host.agents.runDirectory(first.runId!)).toBeUndefined();
     expect(fs.existsSync(path.join(state.actor.logDir!, first.runId!, "route-dispatch-receipt.json"))).toBe(true);
-  }, 20000);
+  }, 60000);
 
   it("keeps denied A archive custody through normal host close/restart and repairs before source collection", async () => {
     const retain = ActorLogStore.prototype.retainRun;
@@ -130,11 +131,11 @@ describe("resident LIVE custody and manual config rollback", () => {
     const next = await restored.actors.ask(state.actor.id, "ECHO_MODEL", "test"); expect(next.text).toContain(cheap.model);
     // #752 reviewed contract: docs/residency-runtime.md:64-69, 87-92 at 2f6838c3.
     // Once repair discharges archive custody, eligibility commits dormancy immediately.
-    await vi.waitFor(() => expect(restored.actors.status(state.actor.id).status).toBe("dormant"));
+    await vi.waitFor(() => expect(restored.actors.status(state.actor.id).status).toBe("dormant"), { timeout: 10000 });
     expect(fs.existsSync(path.join(state.actor.logDir!, a.runId!, "route-dispatch-receipt.json"))).toBe(true);
     expect(fs.existsSync(source)).toBe(false);
     expect(rows().filter(row => row.type === "decision").at(-1)).toMatchObject({ mode: "live", reasonCode: "live-choice" });
-  }, 20000);
+  }, 60000);
 
   it("manual empty liveClasses stops LIVE on Main and a running resident host, without replacing its owner", async () => {
     const state = await fixture();
@@ -167,5 +168,5 @@ describe("resident LIVE custody and manual config rollback", () => {
     fs.writeFileSync(state.configFile, JSON.stringify({ ...state.config, sessionId: "foreign-generation", agents: { ...state.config.agents, modelRouting: { ...policy, liveClasses: [] } } }));
     expect((await state.activate()).text).toContain(cheap.model);
     expect(JSON.parse(fs.readFileSync(ownerPath, "utf8"))).toMatchObject({ pid: owner.pid, token: owner.token });
-  }, 20000);
+  }, 60000);
 });

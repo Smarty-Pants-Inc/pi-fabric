@@ -22,7 +22,7 @@ export interface ProviderErrorClass {
   status?: number;
   /** The body's error type, only when it is one of the known types below. */
   type?: string;
-  /** A fixed gateway code Fabric recognises (today only compaction_affinity_missing). */
+  /** A fixed gateway code Fabric recognises (compaction_affinity_missing or model_not_found). */
   code?: string;
   /**
    * One short line for wake status reasons, notices, and alarms, built ONLY from the status, the
@@ -38,7 +38,11 @@ export interface ProviderErrorClass {
   basis: "diagnostic" | "status" | "body" | "text" | "default";
 }
 
-type FailedTurn = { stopReason?: unknown; errorMessage?: unknown; diagnostics?: unknown };
+type FailedTurn = { stopReason?: unknown; rawStopReason?: unknown; errorMessage?: unknown; diagnostics?: unknown; recovery?: unknown };
+
+export interface ModelRefusalClassification {
+  kind: "model-refusal";
+}
 
 // Anthropic/OpenAI error types that describe the request or the credentials, not load.
 const NON_RETRYABLE_TYPES = new Set([
@@ -50,7 +54,7 @@ const RETRYABLE_TYPES = new Set(["rate_limit_error", "overloaded_error", "api_er
 const AFFINITY = "compaction_affinity_missing";
 // The only body tokens a short line may carry (smarty-dev#8742 security review): known types, fixed codes.
 const KNOWN_TYPES = new Set([...NON_RETRYABLE_TYPES, ...RETRYABLE_TYPES]);
-const KNOWN_CODES = new Set([AFFINITY]);
+const KNOWN_CODES = new Set([AFFINITY, "model_not_found"]);
 const known = (value: string | undefined, allowed: ReadonlySet<string>): string | undefined =>
   value !== undefined && allowed.has(value) ? value : undefined;
 
@@ -80,6 +84,28 @@ const bodyOf = (message: string): ErrorBody | undefined => {
     const type = /"type"\s*:\s*"([a-z_]+_error)"/.exec(message.slice(start))?.[1];
     return type ? { type } : undefined;
   }
+};
+
+/** Structured refusal is authoritative only when no HTTP, body, or diagnostic evidence contradicts it. */
+export const classifyModelRefusal = (turn: FailedTurn | undefined): ModelRefusalClassification | undefined => {
+  if (turn?.stopReason !== "error" || turn.rawStopReason !== "refusal") return undefined;
+  const message = typeof turn.errorMessage === "string" ? turn.errorMessage : "";
+  if (statusOf(message) !== undefined || bodyOf(message) !== undefined) return undefined;
+  if (Array.isArray(turn.diagnostics) && turn.diagnostics.length > 0) return undefined;
+  return { kind: "model-refusal" };
+};
+
+const isRecordedModelRefusalDiagnostic = (diagnostic: unknown): boolean => {
+  if (!diagnostic || typeof diagnostic !== "object") return false;
+  const recorded = diagnostic as { type?: unknown; details?: unknown };
+  return recorded.type === "fabric_model_refusal" && !!recorded.details && typeof recorded.details === "object" &&
+    (recorded.details as { rawStopReason?: unknown }).rawStopReason === "refusal";
+};
+
+/** Fabric appends this marker only after classification, so later lifecycle hooks can retain that decision. */
+export const hasRecordedModelRefusal = (turn: FailedTurn | undefined): boolean => {
+  if (!turn || !Array.isArray(turn.diagnostics) || !turn.diagnostics.some(isRecordedModelRefusalDiagnostic)) return false;
+  return classifyModelRefusal({ ...turn, diagnostics: turn.diagnostics.filter(entry => !isRecordedModelRefusalDiagnostic(entry)) }) !== undefined;
 };
 
 // CLIProxyAPI's routing miss while it reloads after a restart (smarty-dev#1856): the whole reason is
@@ -113,6 +139,9 @@ const routingMiss = (status: number, body: ErrorBody | undefined, message: strin
  */
 export const classifyProviderError = (turn: FailedTurn | undefined): ProviderErrorClass | undefined => {
   if (turn?.stopReason !== "error") return undefined;
+  if (classifyModelRefusal(turn)) return { retryable: false, short: "model refusal", basis: "diagnostic" };
+  const recovery = turn.recovery as { retryable?: unknown } | undefined;
+  if (recovery?.retryable === false) return { retryable: false, short: "non-retryable", basis: "diagnostic" };
   const message = typeof turn.errorMessage === "string" ? turn.errorMessage : "";
   const diagnostics = Array.isArray(turn.diagnostics) ? turn.diagnostics as Array<{ type?: unknown }> : [];
   // A provider plan/usage limit (Pi's provider_limit, e.g. smarty_limit) is a 429 window: backoff fits.
@@ -130,9 +159,10 @@ export const classifyProviderError = (turn: FailedTurn | undefined): ProviderErr
     const short = head && code ? `${head}: ${code}` : head || code || (basis === "default" ? "unclassified" : "unknown provider error");
     return { retryable, ...(status === undefined ? {} : { status }), ...(type ? { type } : {}), ...(code ? { code } : {}), short, basis };
   };
-  if (body?.code === AFFINITY || body?.type === AFFINITY || body?.message?.includes(AFFINITY)) return verdict(false, "body");
+  const structuredAffinity = body?.code === AFFINITY || body?.type === AFFINITY;
   if (status !== undefined) {
     if (status === 408 || status === 429 || status >= 500) return verdict(true, "status");
+    if (structuredAffinity) return verdict(false, "body");
     const bodyType = body?.type ?? body?.code;
     if (status === 409) return bodyType !== undefined && NON_RETRYABLE_TYPES.has(bodyType) ? verdict(false, "body") : verdict(true, "status");
     if (bodyType !== undefined && RETRYABLE_TYPES.has(bodyType)) return verdict(true, "body");
@@ -141,10 +171,11 @@ export const classifyProviderError = (turn: FailedTurn | undefined): ProviderErr
     if (routingMiss(status, body, message)) return verdict(true, body ? "body" : "text");
     return verdict(false, bodyType === undefined ? "status" : "body");
   }
-  // ponytail: last resort, raw text. A message with no status or body (a gateway that drops both,
+  if (structuredAffinity) return verdict(false, "body");
+  // ponytail: last resort, raw text, only with no status and no body (a gateway that drops both,
   // a provider that rewrites the error) is matched on the gateway's exact error token only; any
   // other unstructured error is "default": backoff, but Main counts consecutive ones and alarms
   // after three (smarty-dev#8742), so an unrecognised dead provider is loud, not silent.
-  if (message.includes(AFFINITY)) return verdict(false, "text");
+  if (body === undefined && message.includes(AFFINITY)) return verdict(false, "text");
   return verdict(true, "default");
 };

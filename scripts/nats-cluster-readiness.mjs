@@ -1,4 +1,6 @@
 import { pathToFileURL } from "node:url";
+// Node >= 24 (package engines) strips the helper's types; the product adapter shares the same selection (#13112).
+import { selectNatsSyncAlways } from "../src/mesh/nats-monitor-config.ts";
 
 // Test/CI only: this module is not in the product startup graph. NATS monitor
 // endpoints have no readiness push event, so polling is the bounded observation
@@ -85,7 +87,7 @@ function summarize(observations) {
       healthJs: healthJs?.status ?? null,
       serverId: server?.server_id ?? null,
       serverName: server?.server_name ?? null,
-      syncAlways: server?.jetstream?.config?.sync_always === true,
+      syncAlways: selectNatsSyncAlways(server, jetstream) === true,
       routeCount: routez?.num_routes ?? null,
       peers,
       leader: metaCluster?.leader ?? null,
@@ -170,8 +172,9 @@ export async function waitForNatsCluster(nodes, options = {}) {
   do {
     const observations = targets.map(node => ({ ...node, results: {} }));
     await Promise.all(observations.flatMap(node => {
-      const paths = { health: "/healthz", healthJs: "/healthz?js-enabled-only=true", server: "/varz" };
-      if (targets.length > 1) Object.assign(paths, { routes: "/routez", jetstream: "/jsz?raft=true" });
+      // /jsz is read for every node: an explicit sync_always false there vetoes /varz (#13112).
+      const paths = { health: "/healthz", healthJs: "/healthz?js-enabled-only=true", server: "/varz", jetstream: "/jsz?raft=true" };
+      if (targets.length > 1) Object.assign(paths, { routes: "/routez" });
       return Object.entries(paths).map(async ([key, endpoint]) => {
         try {
           node.results[key] = { value: await readJson(`${node.monitorUrl}${endpoint}`, { fetchImpl, now, deadline }) };

@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -6,15 +7,17 @@ import { ActorManager } from "../src/actors/manager.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
+import { MeshLockTimeoutError } from "../src/core/atomic-write.js";
 import { MeshStore } from "../src/mesh/store.js";
 import * as verifier from "../src/storage/verified-remove.js";
 import { actorTreeDeletionHooks, mainPublicationFenced } from "../src/topology/main-publication-fence.js";
 import { fixture, mainDirectory } from "./helpers/dead-root-fixture.js";
+import { RESIDENT_HOST_FORMAT } from "../src/residency/protocol.js";
 import { ROOT_PARTICIPANT_FRESH_MS } from "../src/residency/operator-safety.js";
 import { processHarness } from "./helpers/process-harness.js";
 
 // smarty-dev#8090, LOCAL recorded-call boundary probe (#4664: it must never remove actor-tree bytes). Only the
-// actor-tree removal itself is intercepted: the live remove's verifiedRemove (smarty-dev#10074) of a directory at or
+// actor-tree removal itself is intercepted: the live remove's verifiedRemove of a directory at or
 // under an actor root, and every raw fs.rmSync / fs.promises.rm / fs.rmdirSync of one (fallback, nonpersistent
 // close), is recorded with the kernel fence state at that instant and NOT performed. The fence (real
 // flock), the final check, the hooks' ordering and the Main publication are all real. This proves the local delete
@@ -59,6 +62,76 @@ afterEach(() => {
   delete actorTreeDeletionHooks.beforeDelete;
   vi.restoreAllMocks();
   vi.unstubAllEnvs();
+});
+
+describe.skipIf(!["linux", "darwin", "win32"].includes(process.platform))("smarty-dev#16016 resident removal presence cleanup", () => {
+  it.each([
+    { state: "absent after the first failed cleanup", deletePresence: true, completes: true },
+    { state: "still present", deletePresence: false, completes: false },
+  ])("$state: a lock-timeout refresh cannot strand or bypass the cleanup marker", { timeout: 15_000 }, async ({ deletePresence, completes }) => {
+    const f = await fixture();
+    const send = async (command: Record<string, unknown>) => {
+      const requestId = randomUUID();
+      fs.writeFileSync(path.join(f.config.residencyRoot, "requests", `${requestId}.json`), JSON.stringify({
+        format: RESIDENT_HOST_FORMAT, rootId: f.config.rootId, requestId, createdAt: Date.now(), ...command,
+      }));
+      const responsePath = path.join(f.config.residencyRoot, "responses", `${requestId}.json`);
+      await vi.waitFor(() => expect(fs.existsSync(responsePath)).toBe(true), { timeout: 10_000 });
+      return JSON.parse(fs.readFileSync(responsePath, "utf8"));
+    };
+    let failingPresence: ReturnType<typeof vi.spyOn> | undefined;
+    let failingHeartbeat: ReturnType<typeof vi.spyOn> | undefined;
+    let suppressingScheduledRefresh: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      const created = await send({ operation: "createActor", request: { scope: "project", name: "presence cleanup", instructions: "Work.", residency: "durable" } });
+      expect(created.ok).toBe(true);
+      const actor = created.actor;
+      const presenceKey = `actors/${f.config.sessionId}/${actor.id}`;
+      await vi.waitFor(() => expect(f.host.mesh.get(presenceKey, { fresh: true })).toBeDefined());
+      const marker = path.join(f.config.actorRoot, `removal-${actor.id}.json`);
+      const removalsPath = path.join(f.config.residencyRoot, "removals.json");
+      const readRemovals = (): Array<{ id?: string }> => fs.existsSync(removalsPath)
+        ? JSON.parse(fs.readFileSync(removalsPath, "utf8")).removals : [];
+      // Let create-time participant updates settle, then hold resident refreshes at one lock-timeout
+      // so a later heartbeat cannot hide the pending-deletion regression.
+      await new Promise<void>(resolve => setTimeout(resolve, 1_100));
+      const lockTimeout = async (): Promise<void> => { throw new MeshLockTimeoutError("injected presence refresh contention", 1, 0); };
+      failingPresence = vi.spyOn(f.host.participants, "refreshPresence").mockImplementation(lockTimeout);
+      failingHeartbeat = vi.spyOn(f.host.participants, "refresh").mockImplementation(lockTimeout);
+      suppressingScheduledRefresh = vi.spyOn(f.host.participants, "scheduleRefresh").mockImplementation(() => {});
+
+      const first = await send({ operation: "removeActor", id: actor.id });
+      expect(first).toMatchObject({ ok: true, pending: expect.stringContaining("presence deletion pending") });
+      expect(fs.existsSync(marker)).toBe(true);
+      await vi.waitFor(() => expect(readRemovals().some(item => item.id === actor.id)).toBe(true));
+      const existingPresence = f.host.mesh.get(presenceKey, { fresh: true });
+      expect(existingPresence).toBeDefined();
+
+      if (deletePresence) {
+        await f.host.mesh.delete({ key: presenceKey, ifVersion: existingPresence!.version });
+        expect(f.host.mesh.get(presenceKey, { fresh: true })).toBeUndefined();
+      }
+      const refreshesBeforeRetry = failingPresence.mock.calls.length;
+      const retried = await send({ operation: "removeActor", id: actor.id });
+      if (completes) {
+        expect(retried).toMatchObject({ ok: true });
+        expect(retried.pending).toBeUndefined();
+        expect(fs.existsSync(marker)).toBe(false);
+        await vi.waitFor(() => expect(readRemovals().some(item => item.id === actor.id)).toBe(false));
+        expect(failingPresence.mock.calls).toHaveLength(refreshesBeforeRetry);
+        expect(f.host.mesh.get(presenceKey, { fresh: true })).toBeUndefined();
+      } else {
+        expect(retried).toMatchObject({ ok: true, pending: expect.stringContaining("presence deletion pending") });
+        expect(fs.existsSync(marker)).toBe(true);
+        expect(f.host.mesh.get(presenceKey, { fresh: true })).toBeDefined();
+        expect(readRemovals()).toContainEqual(expect.objectContaining({ id: actor.id }));
+        expect(failingPresence.mock.calls.length).toBeGreaterThan(refreshesBeforeRetry);
+      }
+    } finally {
+      vi.restoreAllMocks();
+      await f.close();
+    }
+  });
 });
 
 describe.skipIf(process.platform !== "linux")("live actor-tree removal boundary, recorded calls (smarty-dev#8090)", () => {

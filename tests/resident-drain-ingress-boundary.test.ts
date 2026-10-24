@@ -67,7 +67,7 @@ const event = (mesh: MeshStore, kind = "pi.agent_settled") => mesh.publish({ top
   kind, from: sourceIdentity, data: { version: 1, event: kind, source, occurredAt: 42 } });
 
 describe("resident control admission versus accepted receipt custody", () => {
-  it.each(["shared-lock", "after-shared", "after-local"] as const)("holds %s without handler/false ACK/claim loss, then resumes the same command once", async stage => {
+  it.each(["shared-lock", "after-shared"] as const)("holds %s without handler/false ACK/claim loss, then resumes the same command once", async stage => {
     const mesh = meshFixture(), plane = control(mesh);
     const original = await command(plane);
     const reached = deferred(), release = deferred(), acknowledged = deferred();
@@ -75,8 +75,7 @@ describe("resident control admission versus accepted receipt custody", () => {
     let suspended = false;
     vi.spyOn(MeshStore.prototype, "writeBatch").mockImplementation(async function(this: MeshStore, input) {
       const shared = this.root === mesh.root;
-      const local = this.root.startsWith(path.join(mesh.root, "control-seen"));
-      const match = input.prepare && !suspended && ((stage !== "after-local" && shared) || (stage === "after-local" && local));
+      const match = input.beforeCommit && !suspended && shared;
       if (!match) return write.call(this, input);
       suspended = true;
       if (stage === "shared-lock") {
@@ -113,7 +112,7 @@ describe("resident control admission versus accepted receipt custody", () => {
     expect(plane.releaseCheckpointReceipt()).toMatchObject({ admissionHeld: true });
   });
 
-  it.each(["shared-lock", "after-shared", "after-local"] as const)("expires an unpaused %s claim delayed past its deadline without losing its outcome/ACK", async stage => {
+  it.each(["shared-lock", "after-shared"] as const)("expires an unpaused %s claim delayed past its deadline without losing its outcome/ACK", async stage => {
     vi.useFakeTimers();
     const mesh = meshFixture(), plane = control(mesh);
     const original = await command(plane);
@@ -122,8 +121,7 @@ describe("resident control admission versus accepted receipt custody", () => {
     let suspended = false;
     vi.spyOn(MeshStore.prototype, "writeBatch").mockImplementation(async function(this: MeshStore, input) {
       const shared = this.root === mesh.root;
-      const local = this.root.startsWith(path.join(mesh.root, "control-seen"));
-      if (!input.prepare || suspended || !(stage === "after-local" ? local : shared)) return write.call(this, input);
+      if (!input.beforeCommit || suspended || !shared) return write.call(this, input);
       suspended = true;
       if (stage === "shared-lock") {
         reached.resolve(); await release.promise;
@@ -240,7 +238,7 @@ describe("resident control admission versus accepted receipt custody", () => {
     expect(plane.releaseCheckpointReceipt()).toMatchObject({ admissionHeld: true });
   });
 
-  it.each([true, false])("preserves a partial local claim across the release cut and spent deadline, then settles once on resume (fenced=%s)", async fenced => {
+  it.each([true, false])("preserves sole claim custody across the release cut and spent deadline, then settles once on resume (fenced=%s)", async fenced => {
     vi.useFakeTimers();
     const mesh = meshFixture(), plane = control(mesh, fenced), original = await command(plane);
     const reached = deferred(), release = deferred(), acknowledged = deferred();
@@ -248,7 +246,7 @@ describe("resident control admission versus accepted receipt custody", () => {
     let suspended = false;
     vi.spyOn(MeshStore.prototype, "writeBatch").mockImplementation(async function(this: MeshStore, input) {
       const committed = await write.call(this, input);
-      if (!suspended && input.prepare && this.root.startsWith(path.join(mesh.root, "control-seen"))) {
+      if (!suspended && input.beforeCommit && this.root === mesh.root) {
         suspended = true; reached.resolve(); await release.promise;
       }
       return committed;
@@ -256,7 +254,7 @@ describe("resident control admission versus accepted receipt custody", () => {
     const put = MeshStore.prototype.put;
     vi.spyOn(MeshStore.prototype, "put").mockImplementation(async function(this: MeshStore, input) {
       const committed = await put.call(this, input);
-      if (!fenced && !suspended && input.ifVersion === 0 && this.root.startsWith(path.join(mesh.root, "control-seen"))) {
+      if (!fenced && !suspended && input.ifVersion === 0 && this.root === mesh.root) {
         suspended = true; reached.resolve(); await release.promise;
       }
       return committed;
@@ -270,8 +268,9 @@ describe("resident control admission versus accepted receipt custody", () => {
     await vi.advanceTimersByTimeAsync(60_000);
     const local = new MeshStore(path.join(mesh.root, "control-seen", createHash("sha256").update("owner").digest("hex").slice(0, 32)), 64 * 1024, 100, { stateBackend: "file" });
     const key = "topology/control-seen/" + createHash("sha256").update("owner\0original").digest("hex");
-    expect(local.get(key, { fresh: true })?.value).toMatchObject({ commandId: "original", ownerIncarnation: plane.incarnation });
-    expect(local.get(key, { fresh: true })?.value).not.toHaveProperty("acceptance");
+    expect(mesh.get(key, { fresh: true })?.value).toMatchObject({ commandId: "original", ownerIncarnation: plane.incarnation });
+    expect(mesh.get(key, { fresh: true })?.value).not.toHaveProperty("acceptance");
+    expect(local.get(key, { fresh: true })).toBeUndefined();
     expect(handler).not.toHaveBeenCalled(); expect(mesh.read({ topic: "fabric.control.ack" })).toEqual([]);
     plane.resume(); plane.resume(); await acknowledged.promise;
     plane.pause(true); await plane.checkpointForRelease();

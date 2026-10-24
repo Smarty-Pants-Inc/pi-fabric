@@ -4,7 +4,8 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ActorDirectory } from "../src/actors/directory.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
-import type { AgentManager } from "../src/agents/manager.js";
+import { ActorSlotClaimRefusedError } from "../src/actors/slot-authority.js";
+import type { AgentManager, AgentModelAdmission } from "../src/agents/manager.js";
 import type { FabricActorRequest } from "../src/actors/types.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore, type MeshEvent } from "../src/mesh/store.js";
@@ -83,13 +84,26 @@ function coreDouble() {
   };
 }
 
+// Nonprotected fixture contract only; protected slot topics do not grant model exceptions.
+const assertModelAllowed: AgentManager["assertModelAllowed"] = (model, runner = DEFAULT_FABRIC_CONFIG.agents.runner) => {
+  if ((model !== undefined && model !== "test-model") || (runner !== "pi" && runner !== "pi-durable")) {
+    throw new Error(`Unexpected slot fixture model/runner: ${model}/${runner}`);
+  }
+};
+const resolveModelReasonPolicy = (
+  ...[model, _reason, runner, options = {}]: Parameters<AgentManager["resolveModelReasonPolicy"]>
+): AgentModelAdmission => {
+  assertModelAllowed(model, runner);
+  return { model, thinking: options.thinking, fallback: false };
+};
+
 function open(root = fs.mkdtempSync(path.join(os.tmpdir(), "actor-slot-manager-"))) {
   if (!roots.includes(root)) roots.push(root);
   const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
   const actorRoots = { project: path.join(root, "actors"), session: path.join(root, "actors", "alpha") };
   runner = vi.fn(() => { throw new Error("A worker must not launch in this safe suite"); });
   const agents = { config: DEFAULT_FABRIC_CONFIG.agents, resolveKernel: () => undefined, defaultModel: () => undefined,
-    assertModelAllowed: () => {}, run: runner, actorArchiveSources: () => new Map(), close: async () => {} } as unknown as AgentManager;
+    assertModelAllowed, resolveModelReasonPolicy, run: runner, actorArchiveSources: () => new Map(), close: async () => {} } as unknown as AgentManager;
   const directory = new ActorDirectory(["alpha", identity, mesh, DEFAULT_FABRIC_CONFIG.mesh, agents, () => {}, {
     persistent: true, rootId: identity.id, claimResidency: "session", releasePaused: true,
     resolvePiModel: model => resolveModel(model),
@@ -129,6 +143,23 @@ afterEach(async () => {
 });
 
 describe("manager protected birth/recovery seam", () => {
+  it("keeps the slot model-policy fixture synchronous and rejects unexpected/protected selectors before effects", async () => {
+    const { directory } = open();
+    for (const model of [undefined, "test-model"]) {
+      expect(resolveModelReasonPolicy(model, undefined, "pi", { thinking: "high" }))
+        .toEqual({ model, thinking: "high", fallback: false });
+    }
+    for (const model of ["unexpected-model", "anthropic/claude-opus-4-1"]) {
+      expect(() => resolveModelReasonPolicy(model, undefined, "pi")).toThrow("Unexpected slot fixture");
+      expect(() => assertModelAllowed(model, "pi")).toThrow("Unexpected slot fixture");
+      await expect(directory.create({ name: "rejected-model", instructions: "No effects.", model }))
+        .rejects.toThrow("Unexpected slot fixture");
+    }
+    expect(() => resolveModelReasonPolicy(undefined, undefined, "claude")).toThrow("Unexpected slot fixture");
+    expect(directory.listOwned()).toEqual([]);
+    expect(intents).toEqual([]);
+    expect(runner).not.toHaveBeenCalled();
+  });
   it("does not retain unrelated unknown-address input on an unenforced authority before recovery", () => {
     enforced = false;
     open();
@@ -196,6 +227,30 @@ describe("manager protected birth/recovery seam", () => {
     const files = fs.readdirSync(path.join(actorRoots[scope], actor.id)).filter(file => file.startsWith("queue-"));
     expect(files).toHaveLength(1);
     expect(fs.readFileSync(path.join(actorRoots[scope], actor.id, files[0]!), "utf8")).toContain(queued.messageId);
+    expect(runner).not.toHaveBeenCalled();
+  });
+
+  it("replays protected dead letters only after every recovery scope is ready, without another event", async () => {
+    const { directory, actorRoots } = open();
+    const id = "a".repeat(32);
+    intents.push(seed(actorRoots.session, id, "session"));
+    fs.mkdirSync(path.join(actorRoots.session, id), { recursive: true });
+    const deadLetter = path.join(actorRoots.session, id, "dead-letter.jsonl");
+    const backlog = { at: Date.now(), source: `mesh:${protectedTopic}`, event: event() };
+    fs.writeFileSync(deadLetter, `${JSON.stringify(backlog)}\n`);
+    const hold = deferred(), reached = deferred();
+    recover = async registryRoot => {
+      if (registryRoot === actorRoots.project) { reached.resolve(); await hold.promise; }
+    };
+    const recovering = directory.recoverProtectedActors();
+    await reached.promise;
+    await vi.waitFor(() => expect(new ActorRegistryStore(actorRoots.session).snapshot().actors).toHaveLength(1));
+    expect(fs.readFileSync(deadLetter, "utf8")).toContain("input-1");
+    expect(runner).not.toHaveBeenCalled();
+    hold.resolve();
+    await recovering;
+    expect(directory.status(id).queued).toBe(1);
+    expect(fs.existsSync(deadLetter)).toBe(false);
     expect(runner).not.toHaveBeenCalled();
   });
 
@@ -372,5 +427,53 @@ describe("manager protected birth/recovery seam", () => {
     expect(actor.topics).toEqual([protectedTopic]);
     expect(directory.listOwned().map(actor => actor.id)).toEqual([actor.id]);
     expect(intents).toEqual([]);
+    expect((await directory.setTopics(actor.id, [])).topics).toEqual([]);
+  });
+
+  it.each(["project", "session"] as const)("refuses %s protected topic clear before mutation; restart recovers original slot/topics/queue", async scope => {
+    const { directory, actorRoots, root } = open();
+    const actor = await directory.create(request(scope));
+    const queued = directory.tell(actor.id, "accepted before clear");
+    const history = directory.messages(actor.id);
+    const row = () => { const { status: _status, ...rest } = new ActorRegistryStore(actorRoots[scope]).snapshot().actors.find(row => row.id === actor.id)!; return rest; };
+    // tell() persists queue/history asynchronously; settle it before the baseline.
+    await vi.waitFor(() => expect(row()).toMatchObject({ messageHistory: { count: 1 } }));
+    const registryBefore = row();
+    expect(registryBefore).toMatchObject({ topics: [protectedTopic], rootId: identity.id });
+    const updatedAt = directory.status(actor.id).updatedAt;
+    for (const topics of [[], [protectedTopic], ["ordinary.work"], [protectedTopic, "ordinary.work"]]) {
+      const failure = await directory.setTopics(actor.id, topics).catch(error => error);
+      expect(failure).toBeInstanceOf(ActorSlotClaimRefusedError);
+      expect(failure).toMatchObject({ code: "FABRIC_ACTOR_SLOT_CLAIM_REFUSED", reason: "invalid", details: { issue: "smarty-dev#13463" } });
+    }
+    expect(directory.status(actor.id)).toMatchObject({ topics: [protectedTopic], queued: 1, updatedAt });
+    expect(directory.messages(actor.id)).toEqual(history);
+    expect(row()).toEqual(registryBefore);
+    expect(intents).toHaveLength(1);
+    expect(intents[0]).toMatchObject({ actorId: actor.id, state: "admitted", registryRoot: actorRoots[scope] });
+    await directory.close();
+    const restarted = open(root).directory;
+    await restarted.recoverProtectedActors();
+    expect(restarted.status(actor.id)).toMatchObject({ topics: [protectedTopic], queued: 1 });
+    expect((await restarted.create(request(scope))).id).toBe(actor.id);
+    const files = fs.readdirSync(path.join(actorRoots[scope], actor.id)).filter(file => file.startsWith("queue-"));
+    expect(files).toHaveLength(1);
+    expect(fs.readFileSync(path.join(actorRoots[scope], actor.id, files[0]!), "utf8")).toContain(queued.messageId);
+    expect(runner).not.toHaveBeenCalled();
+  });
+
+  it("refuses ordinary-to-protected topic upgrade without mutation; ordinary clear still succeeds", async () => {
+    const { directory, actorRoots } = open();
+    const ordinary = await directory.create({ name: "ordinary-topics", instructions: "unrelated", topics: ["ordinary.work"], scope: "project" });
+    const registryBefore = fs.readFileSync(path.join(actorRoots.project, "actors.json"), "utf8");
+    const updatedAt = directory.status(ordinary.id).updatedAt;
+    const failure = await directory.setTopics(ordinary.id, ["ordinary.work", protectedTopic]).catch(error => error);
+    expect(failure).toBeInstanceOf(ActorSlotClaimRefusedError);
+    expect(failure).toMatchObject({ code: "FABRIC_ACTOR_SLOT_CLAIM_REFUSED", reason: "invalid", details: { issue: "smarty-dev#13463" } });
+    expect(directory.status(ordinary.id)).toMatchObject({ topics: ["ordinary.work"], updatedAt });
+    expect(fs.readFileSync(path.join(actorRoots.project, "actors.json"), "utf8")).toBe(registryBefore);
+    expect(intents).toEqual([]);
+    expect((await directory.setTopics(ordinary.id, [])).topics).toEqual([]);
+    expect(runner).not.toHaveBeenCalled();
   });
 });

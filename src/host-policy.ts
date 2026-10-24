@@ -1,3 +1,4 @@
+import { diagnostics } from "./core/diagnostics.js";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -19,7 +20,7 @@ let warnedAgentDisabled = false;
 export const warnAgentLandlockDisabled = (): void => {
   if (warnedAgentDisabled) return;
   warnedAgentDisabled = true;
-  console.warn(`[pi-fabric] agent-dir executor.landlock.disabled is not trusted host policy; ignored; provision ${HOST_POLICY_PATH} as root`);
+  diagnostics.warn("src/host-policy.ts", `[pi-fabric] agent-dir executor.landlock.disabled is not trusted host policy; ignored; provision ${HOST_POLICY_PATH} as root`);
 };
 
 const trustedMode = (stat: fs.Stats): boolean => stat.uid === 0 && (stat.mode & 0o022) === 0;
@@ -41,6 +42,10 @@ const validatePolicy = (document: Record<string, unknown>): void => {
     }
   }
   const agents = object(document.agents, "agents");
+  const sandbox = object(agents.sandbox, "agents.sandbox");
+  if (sandbox.enabled !== undefined && typeof sandbox.enabled !== "boolean") throw new Error("agents.sandbox.enabled must be a boolean");
+  if (sandbox.template !== undefined && (typeof sandbox.template !== "string" || !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/u.test(sandbox.template))) throw new Error("agents.sandbox.template must be a DNS label");
+  if (sandbox.readyTimeoutMs !== undefined && (!Number.isSafeInteger(sandbox.readyTimeoutMs) || (sandbox.readyTimeoutMs as number) < 1_000 || (sandbox.readyTimeoutMs as number) > 90_000)) throw new Error("agents.sandbox.readyTimeoutMs must be between 1000 and 90000");
   if (agents.processSlice !== undefined && (typeof agents.processSlice !== "string"
     || !/^[a-zA-Z0-9_.-]+\.slice$/.test(agents.processSlice))) throw new Error("agents.processSlice must be a slice name");
   // smarty-dev#8257: match config and the launcher; an unusably small cap fails
@@ -108,14 +113,14 @@ export const readHostPolicy = (): HostPolicy => {
     if (missing) {
       if (!warnedMissing) {
         warnedMissing = true;
-        console.warn(`[pi-fabric] ${HOST_POLICY_PATH} is missing; agent-dir authority relaxations are disabled. Hosts must provision root-owned policy.`);
+        diagnostics.warn("src/host-policy.ts", `[pi-fabric] ${HOST_POLICY_PATH} is missing; agent-dir authority relaxations are disabled. Hosts must provision root-owned policy.`);
       }
       return { status: "missing" };
     }
     if (!warnedInvalid) {
       warnedInvalid = true;
       const reason = error instanceof Error ? error.message : String(error);
-      console.warn(`[pi-fabric] ignoring untrusted or unreadable host policy at ${HOST_POLICY_PATH}: ${reason}; strict Landlock enforce, no authority relaxations or escapes`);
+      diagnostics.warn("src/host-policy.ts", `[pi-fabric] ignoring untrusted or unreadable host policy at ${HOST_POLICY_PATH}: ${reason}; strict Landlock enforce, no authority relaxations or escapes`);
     }
     return { status: "invalid" };
   } finally {

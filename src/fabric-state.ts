@@ -1,4 +1,5 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { configureFabricDiagnostics, diagnostics, notifyDiagnostic } from "./core/diagnostics.js";
 import type { RootInboxBatch, RootInboxSession, RootInboxReconcileOptions } from "./topology/root-inbox-shared.js";
 import { resolveAgentDir } from "./core/agent-dir.js";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -23,6 +24,7 @@ import {
   type FabricSchemaMode,
 } from "./config.js";
 import { FabricSessionApprovals } from "./core/approval-controller.js";
+import type { SessionEntryCursorManager } from "./core/preview.js";
 import { readChildToolAllowlist } from "./core/child-tool-allowlist.js";
 import { NO_FOREGROUND, resolveForegroundTools, type FabricForegroundResolution } from "./core/foreground-tools.js";
 import { PrewalkController } from "./prewalk/controller.js";
@@ -53,6 +55,7 @@ import type {
   FabricProvider,
 } from "./protocol.js";
 import type { FabricRuntimeState } from "./fabric-runtime-state.js";
+import type { SessionChannel, SessionChannelOpenOptions } from "./transport/nats/session-channel.js";
 import type { FabricRuntimePaths } from "./runtime-paths.js";
 import type { FabricLoadedFileIdentity } from "./build-identity.js";
 
@@ -147,6 +150,10 @@ export class FabricState {
     return this.#current()?.initialized === true;
   }
 
+  openSessionChannel(options: SessionChannelOpenOptions): Promise<SessionChannel> {
+    return this.#required().openSessionChannel(options);
+  }
+
   // Lightweight bootstrap seam: true once configuration is loaded, with no
   // dependency on the heavyweight runtime. Rendering reads this instead of
   // initialized so a resumed session honors bootstrapped presentation
@@ -236,6 +243,7 @@ export class FabricState {
   }
 
   async bootstrap(context: ExtensionContext): Promise<void> {
+    if (!this.#managedHost) configureFabricDiagnostics(context.sessionManager?.getSessionId?.() ?? "");
     this.#shutDown = false;
     const generation = ++this.#generation;
     this.#cwd = context.cwd;
@@ -392,8 +400,11 @@ export class FabricState {
     return this.#runtime?.requestRootInboxWake() ?? false;
   }
 
-  async nextRecordsInboxMessage(entries: readonly unknown[]): Promise<{ customType: string; content: string; display: boolean; details: { ids: string[] } } | undefined> {
-    return this.#current()?.nextRecordsInboxMessage(entries);
+  resetRecordsInboxCursor(session: SessionEntryCursorManager): void {
+    this.#current()?.resetRecordsInboxCursor?.(session);
+  }
+  async nextRecordsInboxMessage(session: SessionEntryCursorManager): Promise<{ customType: string; content: string; display: boolean; details: { ids: string[] } } | undefined> {
+    return this.#current()?.nextRecordsInboxMessage?.(session);
   }
   observationHealth(): string[] { return this.#current()?.observationHealth() ?? []; }
   writeStalled(): Error | undefined { return this.#current()?.writeStalled(); }
@@ -583,7 +594,7 @@ export class FabricState {
     const line = probe.reason
       ? `[pi-fabric] agents.placement startup probe: ${probe.reason}; falling back to local`
       : `[pi-fabric] agents.placement startup probe: executable ${probe.executable}; default=${placement.default}`;
-    if (startup || line !== this.#placementProbeLine) console.warn(line);
+    if (startup || line !== this.#placementProbeLine) diagnostics.warn("src/fabric-state.ts", line);
     this.#placementProbeLine = line;
   }
 
@@ -676,7 +687,7 @@ export class FabricState {
           } catch (error) {
             // Keep the bootstrapped manifest usable for repair. The live control
             // plane records this read failure and watches for a corrected file.
-            if (context.hasUI) context.ui.notify(`Pi Fabric component configuration not applied: ${error instanceof Error ? error.message : String(error)}`, "error");
+            if (context.hasUI) notifyDiagnostic(context, "src/fabric-state.ts", `Pi Fabric component configuration not applied: ${error instanceof Error ? error.message : String(error)}`, "error");
           }
         }
         // Background timers read this ctx only while this activation's lifecycle holds. The

@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
+import { buildSync } from "esbuild";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai";
 import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager,
@@ -17,6 +18,7 @@ import {
   type BridgeSide,
   BRIDGE_LEASE_MS,
   BridgeOwnershipError,
+  BridgeMirrorDeferredError,
   checkBridgePublish,
   DEFAULT_FACTORY_RATE,
   isBridgedTopic,
@@ -56,6 +58,29 @@ const scratch = (): string => {
 };
 
 const hash = (id: string): string => createHash("sha256").update(id).digest("hex");
+
+const isProcessAlive = (pid: number): boolean => {
+  try { process.kill(pid, 0); return true; } catch { return false; }
+};
+
+const waitForCondition = async (predicate: () => boolean, timeoutMs: number, what: string): Promise<void> => {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error(`Timed out waiting for ${what}`);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+};
+
+const waitForExit = async (child: ReturnType<typeof spawn>, timeoutMs: number): Promise<{ code: number | null; signal: NodeJS.Signals | null }> => {
+  if (child.exitCode !== null || child.signalCode !== null) return { code: child.exitCode, signal: child.signalCode };
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`Child did not exit within ${timeoutMs} ms`)), timeoutMs);
+    child.once("close", (code, signal) => {
+      clearTimeout(timer);
+      resolve({ code, signal });
+    });
+  });
+};
 
 /** A live root session on a mesh, as the participant directory writes it. */
 /** A root's canonical id, as Fabric mints it (`session:<session id>`); its host id is the same. */
@@ -156,8 +181,13 @@ const command = (targetId: string, replyTo: string) => ({
 });
 
 const on = (store: MeshStore, topic: string): MeshEvent[] => store.read({ after: 0, limit: 100 }).filter((e) => e.topic === topic);
+// Presence/RPC timings share the opt-in debug channel; these assertions concern routing refusals.
+const notAddressedDebugs = (debugs: string[]): string[] => debugs.filter(line => line.includes(": not addressed across:"));
 
 const lockTimeout = (): Error => Object.assign(new Error("mesh busy"), { code: "FABRIC_MESH_LOCK_TIMEOUT" });
+const sqliteFenceBusy = (): Error => Object.assign(new Error("SQLite state fence busy"), {
+  code: "FABRIC_MESH_LOCK_TIMEOUT", busyCode: "FABRIC_MESH_STATE_BUSY",
+});
 
 const waitFor = async (check: () => boolean): Promise<void> => {
   const until = Date.now() + 3_000;
@@ -553,7 +583,7 @@ describe("presence mirror under contention (smarty-dev#2761)", () => {
     expect(logs.join("\n")).toContain("sender is not a live participant of the remote");
   });
 
-  it("single-flights an expired short-TTL mirror refresh across 100 concurrent refusal passes", async () => {
+  it("bounds 100 concurrent expired-mirror refusals to the existing pass plus one fresh single-flight wave", async () => {
     let now = 1_800_000_000_000;
     vi.spyOn(Date, "now").mockImplementation(() => now);
     const { hub, far, bridge, remote } = setup(undefined, { presenceMs: 60_000 });
@@ -575,12 +605,14 @@ describe("presence mirror under contention (smarty-dev#2761)", () => {
     await new Promise((resolve) => setTimeout(resolve, 20));
     release();
     const results = await passes;
-    expect(presence).toHaveBeenCalledTimes(1);
+    // Joiners cannot treat an existing pass as a fresh absence observation. They share
+    // one additional snapshot, not 100 serialized refreshes; the dead origin stays denied.
+    expect(presence).toHaveBeenCalledTimes(2);
     expect(results.every((result) => result.toLocal === 0)).toBe(true);
     expect(on(hub, "fabric.control.ack")).toHaveLength(0);
   });
 
-  it("bounds publication expiry recovery to one refresh and two pre-append attempts", async () => {
+  it("bounds publication expiry recovery to one refresh and two pre-append attempts, deferring a live origin without advancing its cursor", async () => {
     let now = 1_800_000_000_000;
     vi.spyOn(Date, "now").mockImplementation(() => now);
     const { hub, far, bridge, remote, logs } = setup(undefined, { presenceMs: 60_000 });
@@ -588,19 +620,35 @@ describe("presence mirror under contention (smarty-dev#2761)", () => {
     const root = await addRoot(far, "remote", 3_000);
     await bridge.start();
     await bridge.syncPresence();
-    await far.publish({ topic: "fabric.control.ack", kind: "ack", from: root.identity, to: lane.hostId, data: { targetId: root.hostId } });
+    const source = await far.publish({ topic: "fabric.control.ack", kind: "ack", from: root.identity, to: lane.hostId, data: { targetId: root.hostId } });
     const publish = hub.publish.bind(hub);
+    let induceExpiry = true;
     const publications = vi.spyOn(hub, "publish").mockImplementation(async (input) => {
-      now += 3_100;
-      writeHostLease(far.root, { id: root.hostId, rootId: root.hostId, identityId: root.identity.id, updatedAt: now, expiresAt: now + 3_000 });
+      if (induceExpiry) {
+        now += 3_100;
+        writeHostLease(far.root, { id: root.hostId, rootId: root.hostId, identityId: root.identity.id, updatedAt: now, expiresAt: now + 3_000 });
+      }
       return publish(input);
     });
     const presence = vi.spyOn(remote, "presence");
-    expect(await bridge.step()).toMatchObject({ toLocal: 0, dropped: 1 });
+    const deferred = await bridge.step().catch(error => {
+      expect(error).toBeInstanceOf(BridgeMirrorDeferredError);
+      return undefined;
+    });
+    if (deferred) expect(deferred).toMatchObject({ toLocal: 0, dropped: 0 });
     expect(publications).toHaveBeenCalledTimes(2);
     expect(presence).toHaveBeenCalledTimes(1);
     expect(on(hub, "fabric.control.ack")).toHaveLength(0);
-    expect(logs.join("\n")).toContain("no longer bound to bridge link");
+    const saved = () => JSON.parse(fs.readFileSync(bridge.options.cursorPath, "utf8")) as { toLocal: { after: number } };
+    expect(saved().toLocal.after).toBeLessThan(source.sequence);
+    expect(logs.some(line => line.includes(source.id) && /dropped|refused/.test(line))).toBe(false);
+    induceExpiry = false;
+    await bridge.syncPresence();
+    expect(await bridge.step()).toMatchObject({ toLocal: 1, dropped: 0 });
+    expect(on(hub, "fabric.control.ack").map(event => (event.data as { bridge: { id: string } }).bridge.id)).toEqual([source.id]);
+    expect(saved().toLocal.after).toBeGreaterThanOrEqual(source.sequence);
+    expect(await bridge.step()).toMatchObject({ toLocal: 0, dropped: 0 });
+    expect(on(hub, "fabric.control.ack")).toHaveLength(1);
   });
 
   it("single-flights a stale authority refresh across 100 concurrent refusal passes and never refreshes fresh messages", async () => {
@@ -952,6 +1000,56 @@ describe("mesh bridge", () => {
     }
   });
 
+  it("backs off after the first SQLite ownership-fence refusal without losing or duplicating the event", async () => {
+    const hub = new MeshStore(scratch(), 64 * 1024, 100, { stateBackend: "sqlite" });
+    const { far, bridge, logs } = setup(undefined, { hub, presenceMs: 0, stopMs: 100 });
+    const lane = await addRoot(hub, "lane");
+    const forge = await addRoot(far, "forge-main");
+    let running: Promise<void> | undefined;
+    try {
+      await bridge.start();
+      const sent = await far.publish({ topic: "fleet.work.fence.1", kind: "ask", from: forge.identity,
+        to: lane.identity.id, text: "delivered once" });
+      let inTargetPublish = false;
+      let failFence = true;
+      const publishTimes: number[] = [];
+      const originalPublish = hub.publish.bind(hub);
+      const originalFence = hub.withStateWriteFence.bind(hub);
+      vi.spyOn(hub, "publish").mockImplementation(async (...args) => {
+        const targeted = args[0].topic === "fleet.work.fence.1";
+        if (targeted) publishTimes.push(Date.now());
+        const previous = inTargetPublish;
+        inTargetPublish = previous || targeted;
+        try { return await originalPublish(...args); }
+        finally { inTargetPublish = previous; }
+      });
+      vi.spyOn(hub, "withStateWriteFence").mockImplementation((operation) => {
+        if (inTargetPublish && failFence) {
+          failFence = false;
+          throw sqliteFenceBusy();
+        }
+        return originalFence(operation);
+      });
+      let failure: unknown;
+      running = bridge.run().catch((error: unknown) => { failure = error; });
+      await waitFor(() => on(hub, "fleet.work.fence.1").length === 1);
+      await waitFor(() => logs.some((line) => line.includes("retrying")));
+      const received = on(hub, "fleet.work.fence.1");
+      expect(failFence).toBe(false);
+      expect(publishTimes).toHaveLength(2);
+      expect(publishTimes[1]! - publishTimes[0]!).toBeGreaterThanOrEqual(80);
+      expect(received).toHaveLength(1);
+      expect(received.map((event) => (event.data as { bridge: { id: string } }).bridge.id)).toEqual([sent.id]);
+      expect(logs.filter((line) => line.includes("retrying"))).toHaveLength(1);
+      expect(logs.some((line) => /dropped|refused/.test(line))).toBe(false);
+      expect(failure).toBeUndefined();
+    } finally {
+      await bridge.stop();
+      await running;
+      hub.closeState();
+    }
+  });
+
   it.each(["local", "remote"] as const)("releases new seen IDs only after successful %s checkpoints", async (where) => {
     const cursorPath = path.join(scratch(), "cursor.json");
     const { hub, far, bridge } = setup(cursorPath);
@@ -1131,8 +1229,12 @@ describe("mesh bridge", () => {
     await bridge.stop();
     expect(logs.filter((line) => line.includes("retrying"))).toHaveLength(1);
   });
-  it("mirrors each side's live roots into the other, marked remoteHost, and withdraws them on stop", async () => {
+  it("mirrors each side's live roots and lets stopped mirrors expire by lease TTL", async () => {
+    let now = Date.now();
+    vi.spyOn(Date, "now").mockImplementation(() => now);
     const { hub, far, bridge } = setup();
+    const hubAuthority = new StoreBridgeSide(hub, "forge", () => now);
+    const farAuthority = new StoreBridgeSide(far, "dev1", () => now);
     const lane = await addRoot(hub, "lane");
     const forgeRoot = await addRoot(far, "forge-main");
     await bridge.start();
@@ -1149,22 +1251,35 @@ describe("mesh bridge", () => {
     // A mirror is never mirrored back (no loops).
     await bridge.step();
     expect(far.get(`topology/hosts/${hash(forgeRoot.hostId)}`)!.value).not.toHaveProperty("remoteHost");
+    const beforeStop = { hubHost: hub.get(`topology/hosts/${hash(forgeRoot.hostId)}`),
+      hubParticipant: hub.get(`topology/participants/${hash(forgeRoot.identity.id)}`),
+      hubLease: readHostLeases(hub.root).get(forgeRoot.hostId),
+      farHost: far.get(`topology/hosts/${hash(lane.identity.id)}`),
+      farParticipant: far.get(`topology/participants/${hash(lane.identity.id)}`),
+      farLease: readHostLeases(far.root).get(lane.identity.id) };
 
     await bridge.stop();
-    expect(hub.get(`topology/hosts/${hash(forgeRoot.hostId)}`)).toBeUndefined();
-    expect(hub.get(`topology/participants/${hash(forgeRoot.identity.id)}`)).toBeUndefined();
-    expect(readHostLeases(hub.root).has(forgeRoot.hostId)).toBe(false);
-    expect(far.get(`topology/participants/${hash(lane.identity.id)}`)).toBeUndefined();
+    expect(hub.get(`topology/hosts/${hash(forgeRoot.hostId)}`)).toEqual(beforeStop.hubHost);
+    expect(hub.get(`topology/participants/${hash(forgeRoot.identity.id)}`)).toEqual(beforeStop.hubParticipant);
+    expect(readHostLeases(hub.root).get(forgeRoot.hostId)).toEqual(beforeStop.hubLease);
+    expect(far.get(`topology/hosts/${hash(lane.identity.id)}`)).toEqual(beforeStop.farHost);
+    expect(far.get(`topology/participants/${hash(lane.identity.id)}`)).toEqual(beforeStop.farParticipant);
+    expect(readHostLeases(far.root).get(lane.identity.id)).toEqual(beforeStop.farLease);
 
-    // A restarted bridge mirrors again over the deleted keys' tombstones.
+    // Restart can renew the retained projection before its lease expires.
     const again = new MeshBridge({
       localName: "dev1", remoteName: "forge", presenceMs: 0, cursorPath: path.join(scratch(), "c.json"),
-      local: new StoreBridgeSide(hub, "forge"), remote: new StoreBridgeSide(far, "dev1"),
+      local: new StoreBridgeSide(hub, "forge", () => now), remote: new StoreBridgeSide(far, "dev1", () => now),
     });
     await again.step();
     expect(hub.get(`topology/hosts/${hash(forgeRoot.hostId)}`)!.value).toMatchObject({ remoteHost: "forge" });
     expect(hub.get(`topology/participants/${hash(forgeRoot.identity.id)}`)!.value).toMatchObject({ remoteHost: "forge" });
     expect(far.get(`topology/participants/${hash(lane.identity.id)}`)!.value).toMatchObject({ remoteHost: "dev1" });
+
+    const expireAt = Math.max(beforeStop.hubLease!.expiresAt, beforeStop.farLease!.expiresAt) + 1;
+    now = expireAt;
+    expect(await hubAuthority.owned()).toEqual({ hosts: [], participants: [] });
+    expect(await farAuthority.owned()).toEqual({ hosts: [], participants: [] });
   });
 
   it("drops a remote root whose lease lapsed, and never replaces a native record", async () => {
@@ -1489,24 +1604,35 @@ describe("mesh bridge", () => {
   });
 
   // Security review F3: a silent remote cannot hold a stop or the loop.
-  it("stops within a bound and withdraws local mirrors when the remote stops answering", async () => {
+  it("stops within a bound without withdrawing mirrors when the remote stops answering", async () => {
+    let now = Date.now();
+    vi.spyOn(Date, "now").mockImplementation(() => now);
     const { hub, far, bridge, gate, remote } = setup(undefined, { callTimeoutMs: 60_000, stopMs: 300 });
+    const local = new StoreBridgeSide(hub, "forge", () => now);
     const forgeRoot = await addRoot(far, "forge-main");
     await bridge.start();
     await bridge.step();
-    expect(hub.get(`topology/participants/${hash(forgeRoot.identity.id)}`)).toBeDefined();
+    const hostKey = `topology/hosts/${hash(forgeRoot.hostId)}`;
+    const participantKey = `topology/participants/${hash(forgeRoot.identity.id)}`;
+    const leaseBefore = readHostLeases(hub.root).get(forgeRoot.hostId);
+    expect(leaseBefore).toBeDefined();
+    expect(hub.get(participantKey)).toBeDefined();
     gate.silent = true;
     const pass = bridge.step().catch((error: Error) => error);
     await new Promise((resolve) => setTimeout(resolve, 50));
     const started = Date.now();
     await bridge.stop();
     expect(Date.now() - started).toBeLessThan(2_000);
-    expect(hub.get(`topology/participants/${hash(forgeRoot.identity.id)}`)).toBeUndefined();
-    expect(hub.get(`topology/hosts/${hash(forgeRoot.hostId)}`)).toBeUndefined();
+    expect(hub.get(participantKey)).toBeDefined();
+    expect(hub.get(hostKey)).toBeDefined();
     await pass;
     await expect(remote.latestSequence()).rejects.toThrow(/stopped|closed/);
-    // The pass in flight did not put the mirror back.
-    expect(hub.get(`topology/participants/${hash(forgeRoot.identity.id)}`)).toBeUndefined();
+    // The pass in flight did not put the mirror back or withdraw it.
+    expect(hub.get(participantKey)).toBeDefined();
+    expect(hub.get(hostKey)).toBeDefined();
+    expect(readHostLeases(hub.root).get(forgeRoot.hostId)).toEqual(leaseBefore);
+    now = leaseBefore!.expiresAt + 1;
+    expect(await local.owned()).toEqual({ hosts: [], participants: [] });
   });
 
   it("closes the transport when a call passes its deadline", async () => {
@@ -1543,6 +1669,140 @@ describe("mesh bridge", () => {
       expect(alive(pid!)).toBe(false);
     }
   }, 20_000);
+
+  describe.skipIf(process.platform === "win32")("system bridge signal shutdown", () => {
+    type StopMode = "normal" | "hold" | "stuck";
+    const launch = async (mode: StopMode) => {
+      const root = scratch();
+      fs.symlinkSync(path.resolve("node_modules"), path.join(root, "node_modules"), "dir");
+      const cli = path.join(root, "mesh-bridge-cli.mjs");
+      const agent = path.join(root, "bridge-agent.mjs");
+      const cliSource = `
+        import { main } from ${JSON.stringify(path.resolve("src/mesh-bridge.ts"))};
+        main(process.argv.slice(2)).then(code => { process.exitCode = code; }, error => {
+          process.stderr.write(String(error) + "\\n"); process.exitCode = 2;
+        });
+      `;
+      const agentSource = `
+        import fs from "node:fs";
+        import { MeshStore } from ${JSON.stringify(path.resolve("src/mesh/store.ts"))};
+        import { StoreBridgeSide, serveBridgeAgent } from ${JSON.stringify(path.resolve("src/mesh/bridge.ts"))};
+        const [meshRoot, tracePath, mode] = process.argv.slice(2);
+        const trace = line => fs.appendFileSync(tracePath, line + "\\n");
+        const store = new MeshStore(meshRoot, 256 * 1024, 100);
+        const side = new StoreBridgeSide(store, "hub-a", Date.now, true);
+        process.stdin.on("end", () => trace("stdin-end"));
+        process.stdin.on("error", error => trace("stdin-error:" + error.code));
+        process.stdout.on("error", error => trace("stdout-error:" + error.code));
+        if (mode === "stuck") setInterval(() => {}, 1_000);
+        if (mode === "hold" || mode === "stuck") {
+          side.publish = async () => {
+            trace("publish-started");
+            if (mode === "stuck") await new Promise(() => {});
+            else await new Promise(resolve => process.stdin.once("end", resolve));
+            return { sequence: 1 };
+          };
+        }
+        trace("agent-ready:" + process.pid);
+        try { await serveBridgeAgent(side, process.stdin, process.stdout); }
+        finally { store.closeState(); trace("agent-exit"); }
+      `;
+      buildSync({ stdin: { contents: cliSource, resolveDir: process.cwd() }, outfile: cli,
+        bundle: true, platform: "node", format: "esm", packages: "external" });
+      buildSync({ stdin: { contents: agentSource, resolveDir: process.cwd() }, outfile: agent,
+        bundle: true, platform: "node", format: "esm", packages: "external" });
+      const hubRoot = path.join(root, "hub-mesh");
+      const peerRoot = path.join(root, "peer-mesh");
+      const hubStore = new MeshStore(hubRoot, 256 * 1024, 100);
+      const peerStore = new MeshStore(peerRoot, 256 * 1024, 100);
+      const hubMain = await addRoot(hubStore, "hub-main");
+      const peerMain = await addRoot(peerStore, "peer-main");
+      const tracePath = path.join(root, "transport.log");
+      let stderr = "";
+      const bridgeProcess = spawn(process.execPath, [cli, "run", "--mesh", hubRoot, "--name", "hub-a", "--remote", "peer-b",
+        "--cursor", path.join(root, "peer-b.cursor.json"), "--call-timeout-ms", "1000", "--",
+        process.execPath, agent, peerRoot, tracePath, mode], { stdio: ["ignore", "ignore", "pipe"] });
+      bridgeProcess.stderr.setEncoding("utf8");
+      bridgeProcess.stderr.on("data", chunk => { stderr += chunk; });
+      let transportPid: number | undefined;
+      const trace = (): string => fs.existsSync(tracePath) ? fs.readFileSync(tracePath, "utf8") : "";
+      const linked = async (): Promise<void> => {
+        await waitForCondition(() => {
+          if (bridgeProcess.exitCode !== null || bridgeProcess.signalCode !== null) {
+            throw new Error(`Bridge exited before linking: ${stderr}`);
+          }
+          return stderr.includes("linked hub-a <-> peer-b");
+        }, 5_000, "bridge link");
+        const ready = trace().match(/agent-ready:(\d+)/);
+        if (!ready) throw new Error(`Agent did not record its pid: ${trace()}`);
+        transportPid = Number(ready[1]);
+      };
+      const publishForward = async (): Promise<void> => {
+        await hubStore.publish({ topic: "fleet.work.stop-test.1", kind: "ask", from: hubMain.identity,
+          to: peerMain.identity.id, text: "stop while this forward is in flight" });
+      };
+      cleanups.push(async () => {
+        if (transportPid !== undefined && isProcessAlive(transportPid)) {
+          try { process.kill(transportPid, "SIGKILL"); } catch { /* Already exited. */ }
+        }
+        if (bridgeProcess.exitCode === null && bridgeProcess.signalCode === null) {
+          bridgeProcess.kill("SIGKILL");
+          await waitForExit(bridgeProcess, 2_000).catch(() => undefined);
+        }
+        hubStore.closeState();
+        peerStore.closeState();
+      });
+      return { bridgeProcess, linked, publishForward, trace, stderr: () => stderr,
+        transportPid: () => transportPid };
+    };
+
+    it.each(["SIGTERM", "SIGINT"] as const)("exits 0 on %s within five seconds and lets the remote agent consume clean stdin EOF", async (signal) => {
+      const fixture = await launch("normal");
+      await fixture.linked();
+      const started = Date.now();
+      fixture.bridgeProcess.kill(signal);
+      const exit = await waitForExit(fixture.bridgeProcess, 5_000);
+      expect(exit).toEqual({ code: 0, signal: null });
+      expect(Date.now() - started).toBeLessThan(5_000);
+      await waitForCondition(() => fixture.trace().includes("agent-exit"), 1_000, "remote agent exit");
+      expect(fixture.trace()).toContain("stdin-end");
+      expect(fixture.trace()).not.toMatch(/EPIPE|stdin-error|stdout-error/);
+      expect(isProcessAlive(fixture.transportPid()!)).toBe(false);
+      expect(fixture.stderr()).not.toMatch(/EPIPE/);
+    }, 12_000);
+
+    it("finishes an in-flight forward on SIGTERM without an orphan transport", async () => {
+      const fixture = await launch("hold");
+      await fixture.linked();
+      await fixture.publishForward();
+      await waitForCondition(() => fixture.trace().includes("publish-started"), 3_000, "in-flight remote publish");
+      const started = Date.now();
+      fixture.bridgeProcess.kill("SIGTERM");
+      const exit = await waitForExit(fixture.bridgeProcess, 5_000);
+      expect(exit).toEqual({ code: 0, signal: null });
+      expect(Date.now() - started).toBeLessThan(5_000);
+      await waitForCondition(() => fixture.trace().includes("agent-exit"), 1_000, "held agent exit after EOF");
+      expect(fixture.trace()).toContain("stdin-end");
+      expect(fixture.trace()).not.toMatch(/EPIPE|stdin-error|stdout-error/);
+      expect(isProcessAlive(fixture.transportPid()!)).toBe(false);
+      expect(fixture.stderr()).not.toMatch(/EPIPE/);
+    }, 12_000);
+
+    it("forces an immediate status-0 exit on a second signal and kills the transport child", async () => {
+      const fixture = await launch("stuck");
+      await fixture.linked();
+      await fixture.publishForward();
+      await waitForCondition(() => fixture.trace().includes("publish-started"), 3_000, "stuck in-flight remote publish");
+      fixture.bridgeProcess.kill("SIGTERM");
+      await waitForCondition(() => fixture.trace().includes("stdin-end"), 1_000, "first-signal stdin EOF");
+      const started = Date.now();
+      fixture.bridgeProcess.kill("SIGTERM");
+      const exit = await waitForExit(fixture.bridgeProcess, 1_000);
+      expect(exit).toEqual({ code: 0, signal: null });
+      expect(Date.now() - started).toBeLessThan(1_000);
+      await waitForCondition(() => !isProcessAlive(fixture.transportPid()!), 1_000, "transport child termination");
+    }, 12_000);
+  });
 
   // Review F4: a page never passes one transport frame, over a real pipe.
   it("delivers, in order, a backlog larger than one transport frame over a real pipe", async () => {
@@ -1857,7 +2117,7 @@ describe("work events for the hub factory (smarty-dev#9352)", () => {
     });
     expect(on(hub, "ops.owner")).toEqual([expect.objectContaining({ kind: "pr.wake", to: "factory", data: { rootId: spoke.identity.id, bridge: { from: "forge", id: wake.id } } })]);
     expect(hub.read({ after: 0, limit: 100 }).some((event) => event.to === "nobody")).toBe(false);
-    expect(debugs).toEqual([`toLocal: not addressed across: fleet.work.smarty-dev.1 ${nobody.id} from ${spoke.identity.id} to nobody`]);
+    expect(notAddressedDebugs(debugs)).toEqual([`toLocal: not addressed across: fleet.work.smarty-dev.1 ${nobody.id} from ${spoke.identity.id} to nobody`]);
     expect(countLines(logs)).toEqual(["bridge: 1 events not addressed across (topics: fleet.work.smarty-dev.1; toRemote 0, toLocal 1 (to factory 0))"]);
     // Once across, never again: the cursor and the stamp keep a second pass from repeating it.
     expect(await bridge.step()).toMatchObject({ toLocal: 0 });
@@ -1885,7 +2145,7 @@ describe("work events for the hub factory (smarty-dev#9352)", () => {
     expect(hub.read({ after: 0, limit: 100 }).map((event) => event.topic)).toEqual(["fleet.work.hub.1"]);
     expect(logs.join("\n")).toMatch(/fleet\.work\.x\.3 .*: sender is not a live participant of the remote/);
     expect(logs.join("\n")).toMatch(/fleet\.work\.x\.4 .*: sender claims a hub identity/);
-    expect(debugs.map((line) => line.replace(/ \S+ from .* to /, " -> "))).toEqual([
+    expect(notAddressedDebugs(debugs).map((line) => line.replace(/ \S+ from .* to /, " -> "))).toEqual([
       "toRemote: not addressed across: fleet.work.hub.1 -> factory",
       "toLocal: not addressed across: fabric.control.command -> factory",
       "toLocal: not addressed across: fabric.control.ack -> factory",
@@ -1910,7 +2170,7 @@ describe("work events for the hub factory (smarty-dev#9352)", () => {
     await send("fleet.work.a.2", "nobody");
     await bridge.step();
     expect(countLines(logs)).toHaveLength(1); // within the minute: counted, not logged
-    expect(debugs).toHaveLength(4); // every drop at debug
+    expect(notAddressedDebugs(debugs)).toHaveLength(4); // every drop at debug
     now += 60_000;
     await bridge.step(); // idle past the minute: nothing happens, so nothing is logged
     expect(countLines(logs)).toHaveLength(1);
@@ -2004,7 +2264,7 @@ describe("work events for the hub factory (smarty-dev#9352)", () => {
       ["fleet.work.pi.fabric.876", "factory", dotted.id],
       ["fleet.work..github.7", "factory", dotRepo.id],
     ]);
-    expect(debugs.map((line) => line.replace(/ \S+ from \S+ to /, " -> "))).toEqual([
+    expect(notAddressedDebugs(debugs).map((line) => line.replace(/ \S+ from \S+ to /, " -> "))).toEqual([
       ...malformed.map((topic) => `toLocal: not addressed across: ${topic} -> factory`),
       "toLocal: not addressed across: fleet.work.smarty-dev.2 -> factory-lead",
       "toLocal: not addressed across: fleet.work.smarty-dev.3 -> factory\u0000",
@@ -2257,7 +2517,7 @@ describe("pi-fabric#876 security pass (round 3)", () => {
     smuggled.forEach(([topic], index) => {
       expect(logs).toContain(`toLocal: dropped ${topic} ${ids[index]} from ${spoke.identity.id}: not allowed`);
     });
-    expect(debugs.map((line) => line.replace(/ \S+ from \S+ to /, " -> "))).toEqual(outside.map(([topic]) => `toLocal: not addressed across: ${topic} -> factory`));
+    expect(notAddressedDebugs(debugs).map((line) => line.replace(/ \S+ from \S+ to /, " -> "))).toEqual(outside.map(([topic]) => `toLocal: not addressed across: ${topic} -> factory`));
   });
 
   // (c): the factory exception is bound in bytes as well as events per window; over it, work waits.
@@ -2308,6 +2568,57 @@ describe("pi-fabric#876 security pass (round 3)", () => {
     expect(logs.some((line) => /: (dropped|refused) /.test(line))).toBe(false);
     // The default: 512 KiB a minute, burst 1 MiB, beside 30 events a minute, burst 60.
     expect(DEFAULT_FACTORY_RATE).toEqual({ perMinute: 30, burst: 60, bytesPerMinute: 512 * 1024, byteBurst: 1024 * 1024 });
+  });
+
+  it("falls back from a conflicting control batch, drops only that command and forwards the receipt-backed prefix/suffix", async () => {
+    const cursorPath = path.join(scratch(), "cursor.json");
+    const batchSizes: number[] = [];
+    const { hub, far, remote, bridge, logs } = setup(cursorPath, { presenceMs: 60_000 });
+    const lane = await addRoot(hub, "lane");
+    const spoke = await addRoot(far, "forge-main");
+    await remote.hello();
+    await bridge.start();
+    await bridge.step();
+    const publishBatch = remote.publishBatch;
+    expect(publishBatch).toBeDefined();
+    vi.spyOn(remote, "publishBatch").mockImplementation(async events => {
+      batchSizes.push(events.length);
+      return publishBatch!(events);
+    });
+    const publishCommand = (commandId: string, message: string) => hub.publish({
+      topic: "fabric.control.command", kind: "followUp", from: lane.identity, to: spoke.hostId,
+      data: { ...command(spoke.hostId, lane.hostId), commandId, message, ownerIncarnation: spoke.ownerIncarnation },
+    });
+
+    await publishCommand("reused-command-key", "original private body");
+    expect(await bridge.step()).toMatchObject({ toRemote: 1, dropped: 0 });
+    const prefix = await publishCommand("prefix-command-key", "prefix message");
+    const conflict = await publishCommand("reused-command-key", "edited private body");
+    const next = await publishCommand("next-command-key", "next message");
+    expect(await bridge.step()).toEqual({ toRemote: 2, toLocal: 0, dropped: 1 });
+    expect(batchSizes).toEqual([3]); // The prefix is committed with a receipt before the conflict is observed.
+
+    const deliveredCommands = on(far, "fabric.control.command");
+    expect(deliveredCommands.map(event => (event.data as { message: string }).message))
+      .toEqual(["original private body", "prefix message", "next message"]);
+    const deliveredPrefix = deliveredCommands.filter(event => (event.data as { commandId: string }).commandId === "prefix-command-key");
+    expect(deliveredPrefix).toHaveLength(1); // Single-event fallback reuses the prefix receipt instead of duplicating it.
+    expect((deliveredPrefix[0]!.data as { bridge: { id: string } }).bridge.id).toBe(prefix.id);
+    expect(logs.filter(line => line.includes("dropped idempotency conflict"))).toEqual([
+      `toRemote: dropped idempotency conflict sequence ${conflict.sequence} event ${conflict.id} key reused-command-key`,
+    ]);
+    expect(logs.join(" ")).not.toContain("edited private body");
+    expect(JSON.parse(fs.readFileSync(cursorPath, "utf8")).toRemote.after).toBe(next.sequence);
+    const later = await publishCommand("after-conflict-key", "still live");
+    expect(await bridge.step()).toMatchObject({ toRemote: 1, dropped: 0 });
+    expect((on(far, "fabric.control.command").at(-1)?.data as { bridge: { id: string } }).bridge.id).toBe(later.id);
+
+    await publishCommand("clean-batch-a", "clean a");
+    await publishCommand("clean-batch-b", "clean b");
+    expect(await bridge.step()).toMatchObject({ toRemote: 2, dropped: 0 });
+    expect(batchSizes).toEqual([3, 2]); // A conflict falls back; conflict-free controls remain batched.
+    expect(on(far, "fabric.control.command").map(event => (event.data as { message: string }).message).slice(-2))
+      .toEqual(["clean a", "clean b"]);
   });
 
   // (b): a live sender id must not carry a forged name, kind or session onto the hub.

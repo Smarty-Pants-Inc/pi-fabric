@@ -4,7 +4,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { AgentManager } from "../src/agents/manager.js";
+import principalDelivery from "../src/worker/principal-delivery.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import type { AgentRunRecord } from "../src/agents/types.js";
 import { canRemoveTerminalRun, hasUnresolvedWorker } from "../src/storage/retention.js";
@@ -27,13 +29,80 @@ async function joinTreeStopEntry(killer: EventEmitter): Promise<void> {
 }
 afterEach(() => {
   Object.defineProperty(process, "platform", platform);
-  vi.useRealTimers(); vi.restoreAllMocks(); vi.clearAllMocks();
+  vi.useRealTimers(); vi.restoreAllMocks(); vi.clearAllMocks(); vi.unstubAllEnvs();
   vi.mocked(spawn).mockReset();
 });
 
 // No real workers or descendants: taskkill and the captured worker are native-event mocks.
 // The unconfirmed native descendant intentionally has no Fabric status/identity file.
 describe("Windows tree-stop owner custody (#360 security R1)", () => {
+  it.each((["delivered", "cancelled", "queued"] as const).flatMap(state =>
+    [false, true].map(leftover => ({ state, leftover })),
+  ))("checks release immediately after proven stop with $state follow-up (leftover envelope: $leftover)", async ({ state, leftover }) => {
+    vi.useFakeTimers();
+    vi.spyOn(process, "emitWarning").mockImplementation(() => {});
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-tree-follow-up-"));
+    const worker = Object.assign(new EventEmitter(), { pid: 2147483647, unref: vi.fn(), kill: vi.fn() });
+    const killer = Object.assign(new EventEmitter(), { pid: 2147483646, kill: vi.fn() });
+    let exited = false;
+    vi.mocked(spawn).mockReturnValueOnce(worker as unknown as ChildProcess).mockReturnValueOnce(killer as unknown as ChildProcess);
+    vi.spyOn(process, "kill").mockImplementation(() => {
+      if (exited) throw Object.assign(new Error("worker absent"), { code: "ESRCH" });
+      return true;
+    });
+    const manager = new AgentManager(process.cwd(), {
+      ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: 60_000, maxConcurrent: 1, retainRuns: false, budgetUsd: 0,
+    }, { runRoot: root, workerPath: path.join(root, "mock-worker.mjs") });
+    try {
+      Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+      const handle = await manager.spawn({ task: "follow-up release", transport: "process" });
+      const run = manager.runDirectory(handle.id)!;
+      const receipt = manager.followUp(handle.id, "unique follow-up", undefined, undefined, { deadlineMs: 60_000 });
+      const directory = path.join(run, "deliveries");
+      fs.mkdirSync(directory, { recursive: true });
+      vi.stubEnv("PI_FABRIC_DELIVERY_DIR", directory);
+      const envelope = path.join(directory, receipt.messageId + ".json");
+      const content = JSON.stringify({
+        message: "unique follow-up", delivery: "followUp", followUpId: receipt.messageId,
+        provenance: { v: 1, channel: "fabric", via: "followUp", sender: { id: "sender", kind: "main", verified: "mesh" } },
+      });
+      fs.writeFileSync(envelope, content);
+      const handlers = new Map<string, (...args: any[]) => any>();
+      const sendUserMessage = vi.fn();
+      principalDelivery({
+        registerCommand: (_name: string, command: any) => handlers.set("command", command.handler),
+        on: (name: string, handler: any) => handlers.set(name, handler), sendUserMessage,
+      } as unknown as ExtensionAPI);
+      await handlers.get("command")!(receipt.messageId, { isIdle: () => false });
+      if (state === "delivered") {
+        await handlers.get("turn_end")!({ outcome: "completed" }, { isIdle: () => false });
+        const text = sendUserMessage.mock.calls[0]![0];
+        await handlers.get("context")!({ messages: [{ role: "user", content: [{ type: "text", text }] }] }, {});
+      } else if (state === "cancelled") manager.cancelFollowUp(handle.id, receipt.messageId);
+      expect(manager.status(handle.id).followUpDeliveries?.[0]?.state).toBe(state);
+      if (leftover) fs.writeFileSync(envelope, content);
+      else fs.rmSync(envelope, { force: true });
+      const stopping = manager.stop(handle.id);
+      await joinTreeStopEntry(killer);
+      killer.emit("close", 0); exited = true; worker.emit("exit", 0); worker.emit("close", 0);
+      await stopping;
+      // No timer/microtask flush: public stop has already joined positive host exit.
+      expect(hasUnresolvedWorker(run)).toBe(false);
+      if (state === "queued") {
+        await expect(manager.checkpointForRelease()).rejects.toThrow(/unresolved run tree/);
+      } else {
+        expect(manager.retentionReferences().has(handle.id)).toBe(false);
+        await expect(manager.checkpointForRelease()).resolves.toBeUndefined();
+      }
+    } finally {
+      exited = true; killer.emit("close", 0); worker.emit("exit", 0); worker.emit("close", 0);
+      const closing = manager.close();
+      await vi.advanceTimersByTimeAsync(30_000);
+      await closing;
+      Object.defineProperty(process, "platform", platform);
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
   it.each(["confirmed", "timeout", "stop-confirmed", "stop-failure"] as const)(
     "joins normal terminal cleanup to captured close without releasing uncertain custody (%s)", async outcome => {
       vi.useFakeTimers();
@@ -387,15 +456,16 @@ describe("Windows tree-stop owner custody (#360 security R1)", () => {
           expect(stopped, "closed failed attempt must not add seven seconds to logical stop").toBe(true);
           expect(hasUnresolvedWorker(run)).toBe(true);
           expect(manager.retentionReferences().has(handle.id)).toBe(true);
-          await expect(manager.cleanup(handle.id)).rejects.toThrow(/lost track/);
-          // Later monitoring must preserve the stop/terminal result without transferring custody.
+          await expect(manager.cleanup(handle.id)).rejects.toThrow(/lost track|running/);
+          // Later monitoring must preserve the custody failure without transferring custody.
           await vi.advanceTimersByTimeAsync(10_000);
         }
         // Keep Windows active through the later admission/close probe too;
         // restoring Linux here used to hide that launch's captured-close debt.
         const result = await manager.wait(handle.id);
-        expect(result.status).toBe(outcome === "terminal-before-error" ? "completed" : outcome === "failed-before-error" ? "failed" : "stopped");
-        if (outcome === "failed-before-error") expect(result.error).toBe("real worker failure");
+        const failedCandidate = outcome === "terminal-before-error" || outcome === "failed-before-error";
+        expect(result.status).toBe(failedCandidate ? "failed" : "stopped");
+        if (failedCandidate) expect(result.errorCode).toBe("CUSTODY_UNCONFIRMED");
         if (outcome === "confirmed") {
           expect(hasUnresolvedWorker(run)).toBe(false);
           expect(manager.retentionReferences().has(handle.id)).toBe(false);
@@ -411,7 +481,7 @@ describe("Windows tree-stop owner custody (#360 security R1)", () => {
         }
         expect(stopped, "the bounded stop must return without transferring custody").toBe(true);
         expect(spawn, "uncertain tree exit cannot launch a replacement worker").toHaveBeenCalledTimes(2);
-        if (outcome === "resume-error") expect(result.error).toMatch(/not relaunched/);
+        if (outcome === "resume-error") expect(result.error).toMatch(/unconfirmed|unknown|not relaunched/);
         // A terminal report must not free the uncertain tree's one native permit.
         vi.mocked(spawn).mockReturnValueOnce(worker as unknown as ChildProcess);
         const next = await manager.spawn({ task: "capacity probe", transport: "process" });

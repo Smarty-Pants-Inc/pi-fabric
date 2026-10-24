@@ -28,8 +28,12 @@ const USAGE = [
   "  mint user --break-glass --out-dir <dir>       1 h break-glass user; approval and stop-first runbook are the caller's duty",
   "  mint user --sys --out-dir <dir>               1 h SYS-only user (resolver claims update and own inbox only)",
   "  config --input - --out <file>                 render a public nats-server config",
+  "  send --to <id> --kind <followUp|steer> (--text <text>|--text-file <file>) ...",
+  "       [--name <host-name>] [--await-reply-seconds <seconds>] [--org <org>] [--path-b-machines <csv>]",
+  "  dispatch --run-id <runId> --task-file <f> --out <burst.jsonl> --creds --ca --servers --machine --org ...",
   "",
-  "Input: one JSON object on stdin. <dir> is an absolute path to a new directory; <file> an absolute path to a new file.",
+  "send and dispatch use org NATS policy from PI_FABRIC_MESH_NATS or the PI_FABRIC_NATS_* policy variables.",
+  "Input: one JSON object on stdin for mint/config. <dir> is an absolute path to a new directory; <file> an absolute path to a new file.",
 ].join("\n");
 
 const MAX_INPUT_BYTES = 1 << 20;
@@ -298,6 +302,8 @@ function reason(error: unknown): string {
 }
 
 export async function runNatsCli(argv: string[]): Promise<number> {
+  if (argv[0] === "send") return (await import("./send-cli.js")).runNatsSendCli(argv.slice(1));
+  if (argv[0] === "dispatch") return (await import("./dispatch-cli.js")).runNatsDispatchCli(argv.slice(1));
   if (argv.length === 1 && (argv[0] === "--help" || argv[0] === "-h" || argv[0] === "help")) {
     process.stdout.write(`${USAGE}\n`);
     return 0;

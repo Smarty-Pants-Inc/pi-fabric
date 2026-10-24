@@ -10,7 +10,7 @@
 //     beforeCheck      actorTreeDeletionHooks.beforeCheck: fence held, final check not run
 //     beforeDelete     actorTreeDeletionHooks.beforeDelete: fence held, final check passed, tree not removed
 //     fence-temp, fence-link, none   as for the remover
-//     Hooks, the live remove's verifiedRemove of a whole actor tree (Linux; smarty-dev#10074) and actor-tree
+//     Hooks, the live remove's verifiedRemove of a whole actor tree (Linux) and actor-tree
 //     fs.rmSync calls (fallback, whole-root close) record fence state; verifiedRemove also asserts the held fence.
 //     Optional `record-tree-deletes` mode skips only whole actor-tree removal for local probes; the default
 //     delegates to the real verifier/rmSync, so hosted CI deletes for real.

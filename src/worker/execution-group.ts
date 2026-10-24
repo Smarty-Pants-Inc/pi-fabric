@@ -1,6 +1,23 @@
 import fs from "node:fs";
+import path from "node:path";
+import { diagnostics } from "../core/diagnostics.js";
 import type { ChildProcess } from "node:child_process";
 
+/** Only an execution-specific cgroup can become empty while this worker lives.
+ * A shared user/session scope (including this worker) is not a tree receipt. */
+const executionCgroupEvents = (pid: number): string | undefined => {
+  try {
+    const scope = (file: string): string | undefined => fs.readFileSync(file, "utf8")
+      .split("\n").find(line => line.startsWith("0::"))?.slice(3);
+    const childScope = scope(`/proc/${pid}/cgroup`);
+    if (!childScope || childScope === "/" || childScope === scope("/proc/self/cgroup")) return undefined;
+    const root = "/sys/fs/cgroup";
+    const directory = path.resolve(root, `.${childScope}`);
+    if (!directory.startsWith(root + path.sep)) return undefined;
+    const events = path.join(directory, "cgroup.events");
+    return fs.existsSync(events) ? events : undefined;
+  } catch { return undefined; }
+};
 /** Background observation cadence for a live execution group. Each tick walks
  * only the child's own descendants; signal() and exited() refresh on demand, so
  * cleanup never relies on this timer having fired recently (#10009). */
@@ -28,7 +45,7 @@ const descendantWalkAvailable = (): boolean => {
   if (childrenAvailable !== undefined) return childrenAvailable;
   childrenAvailable = fs.existsSync(`/proc/${process.pid}/task/${process.pid}/children`);
   if (!childrenAvailable) {
-    process.stderr.write("[pi-fabric] /proc/<pid>/task/<tid>/children unavailable; execution-group custody falls back to a full /proc scan\n");
+    diagnostics.stderr("src/worker/execution-group.ts", "[pi-fabric] /proc/<pid>/task/<tid>/children unavailable; execution-group custody falls back to a full /proc scan\n");
   }
   return childrenAvailable;
 };
@@ -96,6 +113,7 @@ export const executionGroup = (child: ChildProcess) => {
   if (process.platform === "win32") throw new Error("Windows execution-tree custody is unsupported");
   const pid = child.pid;
   const owned = new Map<number, string>();
+  const forcedDescendants = new Set<string>();
   let previous = new Set<number>();
   let empty = false;
   let closed = false;
@@ -150,7 +168,10 @@ export const executionGroup = (child: ChildProcess) => {
     return current;
   };
   return {
+    cgroupEventsFile: process.platform === "linux" && pid ? executionCgroupEvents(pid) : undefined,
     observe(): void { if (process.platform === "linux") members(); },
+    /** Count every birth-checked descendant signalled, including closeChild escalation. */
+    forcedCleanupCount: (): number => forcedDescendants.size,
     /** Current live member pids (Linux); [] elsewhere. */
     members(): number[] { return process.platform === "linux" ? members().map(value => value.pid) : []; },
     exited(): boolean {
@@ -175,6 +196,10 @@ export const executionGroup = (child: ChildProcess) => {
         }
       } else if (child.exitCode !== null || child.signalCode !== null) {
         throw new Error(`Execution group ${pid} leader exited; birth-safe cleanup unavailable`);
+      }
+      if (process.platform === "linux") {
+        // The execution root itself is a descendant of the transport worker.
+        for (const value of members()) forcedDescendants.add(`${value.pid}:${value.started}`);
       }
       try { process.kill(-pid, signal); }
       catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }

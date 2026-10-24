@@ -1,8 +1,10 @@
-// smarty-dev#10074: the live actor-tree delete (#finishCleanup -> deleteRootActorTree) must not be redirected outside
-// the actor root when an ANCESTOR of the session directory is swapped for a symlink to a sentinel directory after the
-// removal's final check. A path-based recursive rmSync followed it; verifiedRemove (#7916) removes only the judged
-// inode, through a NOFOLLOW parent, and a refusal keeps the cleanup pending. Counterexamples: an in-tree symlink that
-// exists at judgment is removed as a link (never followed) and the tree still goes; a missing tree stays idempotent.
+// The live actor-tree delete (#finishCleanup -> deleteRootActorTree) must not be redirected outside the actor root
+// when an ANCESTOR of the session directory is swapped for a symlink to a sentinel directory after the removal's
+// final check. A path-based recursive rmSync followed it; on Linux verifiedRemove removes only the judged inode,
+// through a NOFOLLOW parent, and a refusal keeps the cleanup pending. Windows and Darwin keep main's path-based
+// rmSync fallback, which offers no judged-inode guarantee, so the swap and link cases are Linux-only.
+// Counterexamples: an in-tree symlink that exists at judgment is removed as a link (never followed) and the tree
+// still goes; a missing tree stays idempotent on every fence platform.
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -46,7 +48,7 @@ const setup = async () => {
   return { actorRoot, sessionDir, sentinel, sentinelIntact, actor, actors };
 };
 
-describe("smarty-dev#10074: actor-tree delete vs an ancestor swapped for a symlink", () => {
+describe("actor-tree delete vs an ancestor swapped for a symlink", () => {
   it.runIf(process.platform === "linux")("ancestor (the actor root) swapped right before the delete: the sentinel survives and cleanup stays pending", async () => {
     const { actorRoot, sessionDir, sentinel, sentinelIntact, actor, actors } = await setup();
     const real = `${actorRoot}.real`;
@@ -105,7 +107,7 @@ describe("smarty-dev#10074: actor-tree delete vs an ancestor swapped for a symli
     expect(sentinelIntact()).toBe(true);
   }, 30_000);
 
-  // Fence-supported platforms only (unsupported ones refuse before any delete, smarty-dev#8090).
+  // Fence-supported platforms only (unsupported ones refuse before any delete).
   it.runIf(["linux", "darwin", "win32"].includes(process.platform))("a session directory already gone before the removal: the cleanup completes (idempotent)", async () => {
     const { sessionDir, actor, actors } = await setup();
     fs.rmSync(sessionDir, { recursive: true, force: true });

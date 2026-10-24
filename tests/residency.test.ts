@@ -21,9 +21,11 @@ import { AgentCompletionInbox } from "../src/agents/completion-inbox.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { ActionRegistry } from "../src/core/action-registry.js";
 import { createMainExecutionCeilingError } from "../src/async-settlement.js";
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { ModelRegistry, ModelRuntime, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { InMemoryCredentialStore, InMemoryModelsStore } from "@earendil-works/pi-ai";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
-import type { FabricMainAgentDeliveryRequest, FabricMainAgentTarget } from "../src/main-agent.js";
+import { modelExceptionGrant, withRootExceptionMetadata } from "./helpers/model-exceptions.js";
+import { FOLLOW_UP_LIMITS, type FabricMainAgentDeliveryRequest, type FabricMainAgentTarget } from "../src/main-agent.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { ResidencyClient } from "../src/residency/client.js";
 import { ResidentHost, RESIDENT_RUN_RETENTION_MS } from "../src/residency/host.js";
@@ -60,7 +62,19 @@ const fakeWorker = path.resolve("tests/fixtures/fake-worker.mjs");
 const hasResidentHost = fs.existsSync(hostPath);
 const roots: string[] = [];
 
-beforeEach(() => installInProcessResidentFence());
+const trustedExceptionFixturePaths = new Set<string>();
+const realAdmitModelException = AgentManager.prototype.admitModelException;
+let restoreAdmissionFixture: (() => void) | undefined;
+beforeEach(() => {
+  installInProcessResidentFence();
+  trustedExceptionFixturePaths.clear();
+  const admission = vi.spyOn(AgentManager.prototype, "admitModelException").mockImplementation(function (this: AgentManager, ...args) {
+    const file = this.config.modelExceptionsPath;
+    if (!file || !trustedExceptionFixturePaths.has(file)) return realAdmitModelException.apply(this, args);
+    return withRootExceptionMetadata(file, () => realAdmitModelException.apply(this, args));
+  });
+  restoreAdmissionFixture = () => admission.mockRestore();
+});
 
 const delay = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
@@ -309,6 +323,7 @@ afterEach(async () => {
     // writes: retry ENOTEMPTY briefly instead of failing the suite on a loaded runner.
     fs.rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
   }
+  restoreAdmissionFixture?.();
   if (stopFailures.length > 0) throw stopFailures[0];
 });
 
@@ -1145,7 +1160,7 @@ describe("durable completion receipts", () => {
         const state = await rootHarness("fair-ancestry-drain");
         const main = await realMain(state, [], undefined, false);
         const from = { id: "bounded-actor", name: "actor", kind: "actor" as const };
-        for (let index = 0; index <= 1024; index++) {
+        for (let index = 0; index < FOLLOW_UP_LIMITS.senderItems; index++) {
           main.main.deliverAgent({ from, message: "tiny", delivery: "followUp", triggerTurn: true, data: { coalesceKey: "state" }, deliveryId: `prior-${index}` });
         }
         const prefix = residentDeliveryPrefix(state.identity.id);
@@ -1170,7 +1185,7 @@ describe("durable completion receipts", () => {
           expect(state.mesh.get(`${prefix}b-steer`)).toBeUndefined();
           expect(state.mesh.get(`${prefix}c-other`)).toBeUndefined();
           expect(main.sent.some((item) => item.options?.deliverAs === "steer")).toBe(true);
-          // Release and durably acknowledge the old carrier at a real Main boundary.
+          // Release and durably acknowledge all originals at a real Main boundary.
           main.main.flushHeldAtNextBoundary();
           main.emit("turn_end", { context: { pendingMessages: [] } });
           for (const item of main.sent) main.append(item);
@@ -1182,15 +1197,15 @@ describe("durable completion receipts", () => {
       } finally { synced.mockRestore(); }
     });
 
-    it("#169 round 1 leaves an over-bound replacement source in the resident mesh", { timeout: 15_000 }, async () => {
+    it("#169 round 1 leaves an over-quota same-key source in the resident mesh", { timeout: 15_000 }, async () => {
       // Barrier order and failures are covered by tests/atomic-write-durable.test.ts and the barrier regressions.
       const synced = vi.spyOn(fs, "fsyncSync").mockImplementation(() => {});
       try {
         const state = await rootHarness("ancestry-backpressure");
         const main = await realMain(state, [], undefined, false);
         const from = { id: "bounded-actor", name: "actor", kind: "actor" as const };
-        const maxAncestry = 1024;
-        for (let index = 0; index <= maxAncestry; index++) {
+        const maxItems = FOLLOW_UP_LIMITS.senderItems;
+        for (let index = 0; index < maxItems; index++) {
           main.main.deliverAgent({ from, message: "tiny", delivery: "followUp", triggerTurn: true, data: { coalesceKey: "state" }, deliveryId: `prior-${index}` });
         }
         const key = `${residentDeliveryPrefix(state.identity.id)}refused-source`;
@@ -1206,10 +1221,10 @@ describe("durable completion receipts", () => {
           await new Promise((resolve) => setTimeout(resolve, 100));
           expect(state.mesh.get(key)).toBeDefined();
           expect(deliver.mock.results.every((result) => result.type === "throw" && /queue is full/.test(String(result.value)))).toBe(true);
-          expect(main.main.queueDepth().pendingFollowUps).toBe(1);
+          expect(main.main.queueDepth().pendingFollowUps).toBe(maxItems);
           const saved = JSON.parse(fs.readFileSync(path.join(state.config.meshRoot, "main-followups", "root.json"), "utf8"));
-          expect(saved.items[0].supersedes).toHaveLength(maxAncestry);
-          expect(saved.items[0].deliveryId).toBe(`prior-${maxAncestry}`);
+          expect(saved.items.map((item: { deliveryId: string }) => item.deliveryId))
+            .toEqual(Array.from({ length: maxItems }, (_, index) => `prior-${index}`));
         } finally { await client.close(); await state.participants.close(); }
       } finally { synced.mockRestore(); }
     });
@@ -1479,7 +1494,8 @@ describe("durable completion receipts", () => {
     markUnresolvedWorker(seeded.runDirectory, "the Herdr server has been unreachable for 300 s");
     const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent });
     try {
-      await expect(client.cleanupAgent(seeded.id)).rejects.toThrow(/may still be running/);
+      expect(client.statusAgent(seeded.id).status).toBe("finishing");
+      await expect(client.cleanupAgent(seeded.id)).rejects.toThrow(/running durable/);
       expect(fs.existsSync(seeded.runDirectory)).toBe(true);
       expect(fs.existsSync(seeded.metadataPath)).toBe(true);
     } finally {
@@ -1600,7 +1616,8 @@ describe("durable completion receipts", () => {
     markUnresolvedWorker(path.join(seeded.runDirectory, "nested", "child"), "the Herdr server has been unreachable for 300 s");
     const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent });
     try {
-      await expect(client.cleanupAgent(seeded.id)).rejects.toThrow(/may still be running/);
+      expect(client.statusAgent(seeded.id).status).toBe("finishing");
+      await expect(client.cleanupAgent(seeded.id)).rejects.toThrow(/running durable/);
       expect(fs.existsSync(path.join(seeded.runDirectory, "nested", "child"))).toBe(true);
     } finally {
       await client.close();
@@ -1769,6 +1786,9 @@ describe("durable completion receipts", () => {
     const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent });
     try {
       expect(client.settledAgent(seeded.id)).toBeUndefined();
+      expect(client.statusAgent(seeded.id)).toMatchObject({ status: "finishing", text: "authoritative full result" });
+      expect(client.completionSettled(seeded.id)).toBe(false);
+      await expect(client.waitAgent(seeded.id, AbortSignal.timeout(30))).rejects.toThrow(/aborted/);
       const resultPath = residentResultPath(state.config.residencyRoot, seeded.id);
       fs.mkdirSync(path.dirname(resultPath), { recursive: true });
       fs.writeFileSync(resultPath, JSON.stringify({ ...seeded.result, status: "completed" }));
@@ -1776,6 +1796,43 @@ describe("durable completion receipts", () => {
       fs.rmSync(resultPath);
       fs.rmSync(ownerPath);
       expect(client.settledAgent(seeded.id)).toMatchObject({ status: "stopped" });
+    } finally {
+      await client.close();
+      await state.participants.close();
+    }
+  });
+
+  it("exposes a raw running worker's native finishing milestone without settling its result", async () => {
+    const state = await rootHarness("worker-finishing-milestone");
+    const seeded = await seedCompletion(state, "running");
+    const statusFile = path.join(seeded.runDirectory, "status.json");
+    fs.writeFileSync(statusFile, JSON.stringify({ ...seeded.result, finishingAt: Date.now() }));
+    const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent });
+    try {
+      expect(client.statusAgent(seeded.id)).toMatchObject({ status: "finishing", text: "authoritative full result" });
+      expect(client.completionSettled(seeded.id)).toBe(false);
+      await expect(client.waitAgent(seeded.id, AbortSignal.timeout(30))).rejects.toThrow(/aborted/);
+      fs.writeFileSync(statusFile, JSON.stringify({ ...seeded.result, status: "completed" }));
+      expect((await client.waitAgent(seeded.id)).status).toBe("completed");
+    } finally {
+      await client.close();
+      await state.participants.close();
+    }
+  });
+
+  it("masks an orphan terminal process candidate while persisted tree custody still sees a live writer", async () => {
+    const state = await rootHarness("orphan-finishing-tree");
+    const seeded = await seedCompletion(state);
+    const statusFile = path.join(seeded.runDirectory, "status.json");
+    fs.writeFileSync(statusFile, JSON.stringify({ ...seeded.result, sessionId: String(process.pid) }));
+    const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent });
+    try {
+      expect(client.statusAgent(seeded.id)).toMatchObject({ status: "finishing", text: "authoritative full result" });
+      expect(client.completionSettled(seeded.id)).toBe(false);
+      await expect(client.waitAgent(seeded.id, AbortSignal.timeout(30))).rejects.toThrow(/aborted/);
+      fs.writeFileSync(statusFile, JSON.stringify(seeded.result)); // captured persisted writer is now absent
+      expect(client.statusAgent(seeded.id).status).toBe("completed");
+      expect((await client.waitAgent(seeded.id)).status).toBe("completed");
     } finally {
       await client.close();
       await state.participants.close();
@@ -2835,8 +2892,9 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
   });
 
   it("resolves a model added to models.json after the resident host started, with no restart", { timeout: 60_000 }, async () => {
-    // pi-fabric#138: the resident host runs in its own Pi process; its registry, not the
-    // session's snapshot from host start, must discover the new exact id on ask and tell.
+    // pi-fabric#138: the resident host's own registry, not the session snapshot from
+    // host start, must discover the new exact id on ask and tell. The host is in-process
+    // solely to scope the metadata-only trust seam; registry/commands/worker execution are real.
     const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-resident-models-"));
     roots.push(agentDir);
     const modelsPath = path.join(agentDir, "models.json");
@@ -2852,7 +2910,29 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
     }));
     writeModels(["claude-late-5-5"]);
     vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
+    vi.stubEnv("PI_OFFLINE", "1");
+    // Normal bootstrap supplies ctx.modelRegistry; this in-process host needs it too.
+    const modelRegistry = new ModelRegistry(await ModelRuntime.create({
+      modelsPath,
+      credentials: new InMemoryCredentialStore(),
+      modelsStore: new InMemoryModelsStore(),
+      allowModelNetwork: false,
+    }));
+    expect(modelRegistry.getAvailable()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ provider: "probe-late", id: "claude-late-5-5" }),
+    ]));
     const state = await rootHarness("resident-late-model");
+    const boundRootRecord = state.participants.get(state.identity.id)!;
+    expect(boundRootRecord.kind).toBe("root");
+    expect(boundRootRecord.cwd).toBe(repo);
+    state.config.agents.modelExceptionsPath = path.join(agentDir, "model-exceptions.json");
+    fs.writeFileSync(state.config.agents.modelExceptionsPath, JSON.stringify({ version: 1, grants: [
+      "probe-late/claude-late-5-5",
+      "probe-late/claude-late-5-6",
+      "probe-late/claude-late-5-7",
+      "probe-missing/claude-late-5-9", // Preserve the unavailable-model rejection below.
+    ].map(model => modelExceptionGrant({ model, lane: path.basename(boundRootRecord.cwd!), role: "actor:late-model-witness" })) }));
+    trustedExceptionFixturePaths.add(state.config.agents.modelExceptionsPath);
     state.config.piModels = {
       available: [{ provider: "probe-late", id: "claude-late-5-5" }],
       aliases: {},
@@ -2874,13 +2954,18 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
     control.start(() => ({ accepted: false }));
     const ownerPid = () =>
       (JSON.parse(fs.readFileSync(path.join(state.config.residencyRoot, "owner.json"), "utf8")) as ResidentHostOwner).pid;
+    // The private root-metadata seam is deliberately process-local, never a child override.
+    const refreshModels = vi.spyOn(modelRegistry, "refresh");
+    const host = new ResidentHost(state.config, undefined, modelRegistry);
     try {
+      await host.start();
       const actor = await client.createActor({
-        name: "late model witness",
+        name: "late-model-witness",
         instructions: "Reply with the model of each run.",
         residency: "durable",
         runner: "pi",
         model: "probe-late/claude-late-5-5",
+        modelReason: "Test exception for #11864",
       });
       const pid = ownerPid();
       writeModels(["claude-late-5-5", "claude-late-5-6"]);
@@ -2889,11 +2974,15 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
         client.hostId,
         actor.id,
         "ask",
-        { message: "ECHO_MODEL ping", ownerIncarnation: await liveControlOwnerIncarnation(state.participants, actor.id), binding: { model: "probe-late/claude-late-5-6" } },
+        { message: "ECHO_MODEL ping", ownerIncarnation: await liveControlOwnerIncarnation(state.participants, actor.id), binding: { model: "probe-late/claude-late-5-6", modelReason: "Test exception for #11864" } },
         client.hostId,
         { timeoutMs: 20_000 },
       );
       expect(asked).toMatchObject({ text: "model probe-late/claude-late-5-6" });
+      expect(refreshModels).toHaveBeenCalledOnce();
+      expect(modelRegistry.getAvailable()).toEqual(expect.arrayContaining([
+        expect.objectContaining({ provider: "probe-late", id: "claude-late-5-6" }),
+      ]));
 
       writeModels(["claude-late-5-5", "claude-late-5-6", "claude-late-5-7"]);
       await new Promise((resolve) => setTimeout(resolve, 10_500)); // past the shared refresh throttle
@@ -2901,18 +2990,22 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
         client.hostId,
         actor.id,
         "followUp",
-        { message: "ECHO_MODEL pong", ownerIncarnation: await liveControlOwnerIncarnation(state.participants, actor.id), binding: { model: "probe-late/claude-late-5-7" } },
+        { message: "ECHO_MODEL pong", ownerIncarnation: await liveControlOwnerIncarnation(state.participants, actor.id), binding: { model: "probe-late/claude-late-5-7", modelReason: "Test exception for #11864" } },
         client.hostId,
       );
       await waitFor(() => state.mesh.read({ topic: "fabric.actor.output", limit: 50 })
         .some((event) => event.text?.includes("model probe-late/claude-late-5-7")), 15_000);
+      expect(refreshModels).toHaveBeenCalledTimes(2);
+      expect(modelRegistry.getAvailable()).toEqual(expect.arrayContaining([
+        expect.objectContaining({ provider: "probe-late", id: "claude-late-5-7" }),
+      ]));
 
       // A model that is still not configured fails after the refresh, not with a fuzzy stand-in.
       await expect(control.request(
         client.hostId,
         actor.id,
         "followUp",
-        { message: "nope", ownerIncarnation: await liveControlOwnerIncarnation(state.participants, actor.id), binding: { model: "probe-missing/claude-late-5-9" } },
+        { message: "nope", ownerIncarnation: await liveControlOwnerIncarnation(state.participants, actor.id), binding: { model: "probe-missing/claude-late-5-9", modelReason: "Test exception for #11864" } },
         client.hostId,
       )).rejects.toThrow(/not available to this Pi session/);
       expect(ownerPid()).toBe(pid);
@@ -2920,6 +3013,7 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
     } finally {
       await control.close();
       await client.close();
+      await host.close();
       await state.participants.close();
       await stopResident(state.config);
     }

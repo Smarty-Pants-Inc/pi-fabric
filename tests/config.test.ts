@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { HOST_POLICY_PATH } from "../src/host-policy.js";
 import {
   DEFAULT_FABRIC_CONFIG,
+  MODEL_EXCEPTIONS_PATH,
   MAX_EXECUTOR_MEMORY_LIMIT_BYTES,
   MAX_EXECUTOR_TIMEOUT_MS,
   QUICKJS_MAX_MEMORY_LIMIT_BYTES,
@@ -15,6 +16,7 @@ import {
   normalizeFabricConfig,
   saveFabricConfig,
 } from "../src/config.js";
+import { modelExceptionGrant } from "./helpers/model-exceptions.js";
 
 const temporaryDirectories: string[] = [];
 const originalCompactionEngineEnv = process.env.PI_FABRIC_COMPACTION_ENGINE;
@@ -26,6 +28,7 @@ const temporaryDirectory = (): string => {
 };
 
 afterEach(() => {
+  vi.unstubAllEnvs();
   for (const directory of temporaryDirectories.splice(0)) {
     fs.rmSync(directory, { recursive: true, force: true });
   }
@@ -47,19 +50,46 @@ describe("transient actor activation block cooldown (smarty-dev#6509)", () => {
 });
 
 describe("host-only explicit model exceptions (#3134)", () => {
-  it("defaults to Astra and supports an empty rollback or normalized override", () => {
-    expect(normalizeFabricConfig({}).agents.modelPolicy.requireReason).toEqual(["gpt-6-astra"]);
+  it("defaults to the fleet reason prefixes and supports an empty rollback or normalized override", () => {
+    expect(normalizeFabricConfig({}).agents.modelPolicy).toEqual({
+      requireReason: ["gpt-6-astra", "opus", "claude"],
+      fallbackThinking: "high",
+    });
     expect(normalizeFabricConfig({ agents: { modelPolicy: { requireReason: [] } } }).agents.modelPolicy.requireReason).toEqual([]);
     expect(normalizeFabricConfig({ agents: { modelPolicy: { requireReason: [" CLIPROXYAPI/GPT-6-ASTRA ", "cliproxyapi/gpt-6-astra"] } } }).agents.modelPolicy.requireReason).toEqual(["cliproxyapi/gpt-6-astra"]);
   });
-  it.each([true, false])("project cannot disable the host reason gate (trusted=%s)", projectTrusted => {
+  it("normalizes the indirect fallback model and thinking level", () => {
+    expect(normalizeFabricConfig({ agents: { modelPolicy: {
+      fallbackModel: " cliproxyapi/custom ", fallbackThinking: "medium",
+    } } }).agents.modelPolicy).toMatchObject({
+      fallbackModel: "cliproxyapi/custom",
+      fallbackThinking: "medium",
+    });
+    expect(normalizeFabricConfig({ agents: { modelPolicy: {
+      fallbackModel: " ", fallbackThinking: "invalid",
+    } } }).agents.modelPolicy).toEqual({
+      requireReason: ["gpt-6-astra", "opus", "claude"],
+      fallbackThinking: "high",
+    });
+  });
+  it.each([true, false])("project cannot disable the host reason gate or change fallback (trusted=%s)", projectTrusted => {
     const cwd = temporaryDirectory(); const agentDir = temporaryDirectory();
     fs.mkdirSync(path.join(cwd, ".pi"));
-    fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ agents: { modelPolicy: { requireReason: ["provider/expensive"] } } }));
-    fs.writeFileSync(path.join(cwd, ".pi", "fabric.json"), JSON.stringify({ agents: { modelPolicy: { requireReason: [] } } }));
-    expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.modelPolicy.requireReason).toEqual(["gpt-6-astra", "provider/expensive"]);
+    fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ agents: { modelPolicy: {
+      requireReason: ["provider/expensive"], fallbackModel: "cliproxyapi/host-fallback", fallbackThinking: "low",
+    } } }));
+    fs.writeFileSync(path.join(cwd, ".pi", "fabric.json"), JSON.stringify({ agents: { modelPolicy: {
+      requireReason: [], fallbackModel: "provider/workspace-fallback", fallbackThinking: "off",
+    } } }));
+    const loaded = loadFabricConfig({ cwd, agentDir, projectTrusted });
+    expect(loaded.agents.modelPolicy.requireReason).toEqual(["gpt-6-astra", "opus", "claude", "provider/expensive"]);
+    expect(loaded.agents.modelPolicy.fallbackModel).toBe("cliproxyapi/host-fallback");
+    expect(loaded.agents.modelPolicy.fallbackThinking).toBe("low");
     fs.unlinkSync(path.join(agentDir, "fabric.json"));
-    expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.modelPolicy.requireReason).toEqual(["gpt-6-astra"]);
+    const withoutHostPolicy = loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.modelPolicy;
+    expect(withoutHostPolicy.requireReason).toEqual(["gpt-6-astra", "opus", "claude"]);
+    expect(withoutHostPolicy.fallbackModel).toBeUndefined();
+    expect(withoutHostPolicy.fallbackThinking).toBe("high");
   });
 });
 describe("fleet model policy configuration (#2490)", () => {
@@ -89,6 +119,54 @@ describe("fleet model policy configuration (#2490)", () => {
     const config = loadFabricConfig({ cwd, agentDir, projectTrusted: true });
     expect(config.agents.deniedModels).toEqual([]);
     expect(config.agents.deniedModelReplacement).toBeUndefined();
+  });
+});
+
+describe("host-only model exception file location", () => {
+  it.each(["user", "profile"] as const)("pins the root-owned exception file regardless of %s directory, config, workspace or environment", source => {
+    const cwd = temporaryDirectory();
+    const root = temporaryDirectory();
+    const agentDir = source === "profile" ? path.join(root, "profiles", "work") : root;
+    fs.mkdirSync(agentDir, { recursive: true });
+    const redirected = path.join(temporaryDirectory(), "attacker-grants.json");
+    vi.stubEnv("PI_FABRIC_MODEL_EXCEPTIONS_PATH", redirected);
+    vi.stubEnv("MODEL_EXCEPTIONS_PATH", redirected);
+    fs.mkdirSync(path.join(cwd, ".pi"));
+    const attackerDocument = { version: 1, grants: [modelExceptionGrant({
+      issue: "Smarty-Pants-Inc/smarty-dev#1", model: "cliproxyapi-anthropic/claude-opus-5-5",
+      lane: path.basename(cwd),
+    })] };
+    fs.writeFileSync(path.join(agentDir, "model-exceptions.json"), JSON.stringify(attackerDocument));
+    fs.writeFileSync(redirected, JSON.stringify(attackerDocument));
+    fs.writeFileSync(path.join(cwd, ".pi", "model-exceptions.json"), JSON.stringify(attackerDocument));
+    fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ agents: {
+      modelExceptionsPath: redirected,
+      modelExceptions: attackerDocument.grants,
+      rootSessionCwd: cwd, lane: path.basename(cwd), host: os.hostname().split(".")[0],
+    } }));
+    fs.writeFileSync(path.join(cwd, ".pi", "fabric.json"), JSON.stringify({ agents: {
+      modelExceptionsPath: redirected,
+      modelExceptions: attackerDocument.grants,
+      rootSessionCwd: cwd, lane: path.basename(cwd), host: os.hostname().split(".")[0],
+    } }));
+
+    for (const projectTrusted of [true, false]) {
+      const options = { cwd, agentDir, projectTrusted };
+      const loadedConfigs = [loadFabricConfig(options), loadGlobalFabricConfig(agentDir),
+        loadFabricConfigForScope(options, "global"),
+        ...(projectTrusted ? [loadFabricConfigForScope(options, "project")] : [])];
+      loadedConfigs.map(loaded => {
+        expect(loaded.agents.modelExceptionsPath).toBe("/etc/smarty/model-exceptions.json");
+        expect(loaded.agents).not.toHaveProperty("modelExceptions");
+        expect(loaded.agents).not.toHaveProperty("rootSessionCwd");
+        expect(loaded.agents).not.toHaveProperty("lane");
+        expect(loaded.agents).not.toHaveProperty("host");
+      });
+      expect(normalizeFabricConfig({ agents: { modelExceptionsPath: redirected } }).agents.modelExceptionsPath)
+        .toBe("/etc/smarty/model-exceptions.json");
+    }
+    expect(MODEL_EXCEPTIONS_PATH).toBe("/etc/smarty/model-exceptions.json");
+    expect(DEFAULT_FABRIC_CONFIG.agents.modelExceptionsPath).toBe(MODEL_EXCEPTIONS_PATH);
   });
 });
 
@@ -213,6 +291,79 @@ describe("host-only control incarnation rollout fence (#7514)", () => {
     }
   });
 });
+describe("host-only NATS inbox retention settings (smarty-dev#15310)", () => {
+  const nats = {
+    servers: ["tls://nats.example.test:4222"],
+    credentials: "/run/fabric/runtime.creds",
+    machine: "machine-a",
+    custodyStream: "FABRIC_CUSTODY",
+    livenessStream: "FABRIC_LIVENESS",
+    operatorMachine: "fabric-ops",
+    pathBMachines: ["machine-a"],
+    tls: { ca: "test-ca" },
+  };
+
+  const normalizeNats = (overrides: Record<string, unknown> = {}) => {
+    vi.stubEnv("PI_FABRIC_MESH_TRANSPORT", "nats");
+    vi.stubEnv("PI_FABRIC_MESH_HOST_TRANSPORT", "nats");
+    vi.stubEnv("PI_FABRIC_MESH_NATS", JSON.stringify({ ...nats, ...overrides }));
+    return normalizeFabricConfig({}).mesh.nats;
+  };
+
+  it("defaults to a persistent host and a one-hour idle threshold, and accepts configured bounds", () => {
+    expect(DEFAULT_FABRIC_CONFIG.mesh.nats).toMatchObject({ ephemeralHost: false, ephemeralInactiveSeconds: 3_600, inboxMaxAgeMs: 7 * 24 * 60 * 60_000 });
+    expect(normalizeNats()).toMatchObject({ ephemeralHost: false, ephemeralInactiveSeconds: 3_600, inboxMaxAgeMs: 7 * 24 * 60 * 60_000 });
+    expect(normalizeNats({ ephemeralHost: true, ephemeralInactiveSeconds: 300 }))
+      .toMatchObject({ ephemeralHost: true, ephemeralInactiveSeconds: 300 });
+    expect(normalizeNats({ ephemeralHost: true, ephemeralInactiveSeconds: 86_400 }))
+      .toMatchObject({ ephemeralHost: true, ephemeralInactiveSeconds: 86_400 });
+    expect(normalizeNats({ inboxMaxAgeMs: 60_000 })).toMatchObject({ inboxMaxAgeMs: 60_000 });
+    expect(normalizeNats({ inboxMaxAgeMs: 90 * 24 * 60 * 60_000 }))
+      .toMatchObject({ inboxMaxAgeMs: 90 * 24 * 60 * 60_000 });
+  });
+
+  it("rejects invalid opt-in values and thresholds", () => {
+    for (const value of [null, 1, "true"]) {
+      expect(() => normalizeNats({ ephemeralHost: value })).toThrow("mesh.nats.ephemeralHost must be a boolean");
+    }
+    for (const value of [299, 86_401, 300.5, "300", null]) {
+      expect(() => normalizeNats({ ephemeralInactiveSeconds: value }))
+        .toThrow("mesh.nats.ephemeralInactiveSeconds must be an integer from 300 through 86400");
+    }
+    for (const value of [0, 59_999, 90 * 24 * 60 * 60_000 + 1, 60_000.5, "604800000", null]) {
+      expect(() => normalizeNats({ inboxMaxAgeMs: value }))
+        .toThrow("mesh.nats.inboxMaxAgeMs must be an integer from 60000 through 7776000000 milliseconds");
+    }
+  });
+
+  it("does not let a trusted project enable ephemeral retention or change the host threshold", () => {
+    const cwd = temporaryDirectory(); const agentDir = temporaryDirectory(); fs.mkdirSync(path.join(cwd, ".pi"));
+    const originalNatsEnv = process.env.PI_FABRIC_MESH_NATS;
+    const originalTransportEnv = process.env.PI_FABRIC_MESH_TRANSPORT;
+    const originalHostTransportEnv = process.env.PI_FABRIC_MESH_HOST_TRANSPORT;
+    delete process.env.PI_FABRIC_MESH_NATS;
+    delete process.env.PI_FABRIC_MESH_TRANSPORT;
+    delete process.env.PI_FABRIC_MESH_HOST_TRANSPORT;
+    try {
+      fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ mesh: {
+        transport: "nats", hostTransport: "nats", nats: { ...nats, ephemeralHost: false, ephemeralInactiveSeconds: 600 },
+      } }));
+      fs.writeFileSync(path.join(cwd, ".pi", "fabric.json"), JSON.stringify({ mesh: {
+        nats: { ephemeralHost: true, ephemeralInactiveSeconds: 900, inboxMaxAgeMs: 60_000 },
+      } }));
+      const config = loadFabricConfigForScope({ cwd, agentDir, projectTrusted: true }, "project");
+      expect(config.mesh.nats).toMatchObject({ ephemeralHost: false, ephemeralInactiveSeconds: 600, inboxMaxAgeMs: 7 * 24 * 60 * 60_000 });
+    } finally {
+      if (originalNatsEnv === undefined) delete process.env.PI_FABRIC_MESH_NATS;
+      else process.env.PI_FABRIC_MESH_NATS = originalNatsEnv;
+      if (originalTransportEnv === undefined) delete process.env.PI_FABRIC_MESH_TRANSPORT;
+      else process.env.PI_FABRIC_MESH_TRANSPORT = originalTransportEnv;
+      if (originalHostTransportEnv === undefined) delete process.env.PI_FABRIC_MESH_HOST_TRANSPORT;
+      else process.env.PI_FABRIC_MESH_HOST_TRANSPORT = originalHostTransportEnv;
+    }
+  });
+});
+
 describe("host-only stuckPreparingMs (smarty-dev#6337)", () => {
   it("defaults to ten minutes and clamps to [1 s, 7 d]", () => {
     expect(DEFAULT_FABRIC_CONFIG.agents.stuckPreparingMs).toBe(600_000);

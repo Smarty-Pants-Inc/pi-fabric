@@ -1,7 +1,8 @@
 import type { FabricActorInfo } from "../actors/types.js";
 import type { FabricAgentRunner, FabricAgentTransport } from "../config.js";
 import type { MeshIdentity } from "../mesh/store.js";
-import type { AgentUsage } from "../agents/types.js";
+import type { AgentPlacementKind, AgentUsage } from "../agents/types.js";
+import type { FabricHostLease } from "./host-leases.js";
 
 /** `provider`: work a Fabric provider registered through `context.participants`. */
 export type FabricParticipantKind = "root" | "agent" | "actor" | "provider";
@@ -36,6 +37,8 @@ export interface FabricParticipantRecord {
    * participant via the mesh peer sequence. Never reused after a peer leaves.
    */
   label?: string;
+  /** Pod-injected sandbox correlation or Placement API binding for process/remote runs. */
+  placementRunId?: string;
   /** The root's fleet role, for example "project-agent" (smarty-dev#784). */
   role?: string;
   /** The Herdr pane a root Main runs in (smarty-dev#6758); display only, never authority. */
@@ -75,6 +78,12 @@ export interface FabricParticipantRecord {
   capabilities: FabricParticipantCapability[];
   cwd?: string;
   sessionId?: string;
+  /** Placement API execution metadata, present only for enabled process/remote runs. */
+  placementKind?: AgentPlacementKind;
+  placementHost?: string;
+  expectedSeconds?: number;
+  /** Services that this Main session accepts over Fabric's NATS session channel. */
+  services?: Array<{ name: string; version: number }>;
   model?: string;
   thinking?: string;
   startedAt: number;
@@ -107,7 +116,17 @@ export interface FabricParticipantRecord {
   bridgeVia?: string;
 }
 
+/** KV lease payload. Process identity is evidence for the separate local successor gate, not TTL takeover. */
+export interface FabricKvHostLease extends FabricHostLease {
+  incarnation: string;
+  pid: number;
+  pidStartTime: string;
+  bootId: string;
+}
+
 export interface FabricParticipantInfo extends FabricParticipantRecord {
+  /** KV-only projection from the authenticated key, never a presence JSON authority field. */
+  machine?: string;
   local: boolean;
   stale: boolean;
   /** Retained remote routing attribution; transport freshness is unknown, not owner death. */
@@ -122,6 +141,10 @@ export interface FabricHostRecord {
   identity: MeshIdentity;
   /** UUID fence for token-capable host incarnations; start time is metadata. */
   incarnationToken?: string;
+  /** Locally observed tokens superseded by this mirror; bounded and absent on legacy records. */
+  bridgeSupersededTokens?: string[];
+  /** Root-local first-seen ordinals for retained superseded tokens; absent on legacy records. */
+  bridgeSupersededTokenSeen?: Record<string, number>;
   startedAt: number;
   updatedAt: number;
   expiresAt: number;

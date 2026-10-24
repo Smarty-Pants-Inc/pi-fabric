@@ -107,6 +107,19 @@ if (role === "main") {
   const isTree = file => { const resolved = path.resolve(String(file)); return resolved === actorRoot || path.dirname(resolved) === actorRoot; };
   const isWholeTree = file => { const resolved = path.resolve(String(file));
     return resolved === actorRoot || (path.dirname(resolved) === actorRoot && /^[a-f0-9]{32}$/.test(path.basename(resolved))); };
+  // smarty-dev#16444: a whole actor tree now leaves by ONE archive rename (performed: it deletes nothing), recorded
+  // with the fence state. The source may be the held-parent path (/proc/self/fd/<fd>/./<name>).
+  const rename = fs.renameSync;
+  fs.renameSync = (source, destination) => {
+    let resolved = path.resolve(String(source));
+    try {
+      resolved = path.join(fs.realpathSync(path.dirname(String(source))), path.basename(String(source)));
+      const realRoot = fs.realpathSync(actorRoot); // reported by the lexical actor root, as the other events are
+      if (resolved === realRoot || resolved.startsWith(realRoot + path.sep)) resolved = path.join(actorRoot, path.relative(realRoot, resolved));
+    } catch { /* as given */ }
+    if (isWholeTree(resolved)) calls.push({ kind: "archive", path: resolved, fenced: fenced() });
+    return rename(source, destination);
+  };
   const rm = fs.rmSync;
   fs.rmSync = (file, ...rest) => {
     if (isTree(file) && fs.existsSync(String(file)) && fs.statSync(String(file)).isDirectory()) {

@@ -27,6 +27,7 @@ import { runTreeExitVeto } from "../storage/retention.js";
 import { ownedStat, processAlive } from "../storage/scratch.js";
 import { ActorBindingStore } from "./binding-store.js";
 import { ActorRegistryStore } from "./registry-store.js";
+import { ARCHIVE_CHANGED, linkOf, moveActorTreeToArchive, reverifyChain, type ArchiveChain, type PinnedActorRoot } from "../storage/tree-archive.js";
 
 type Row = Record<string, unknown> & { id: string };
 
@@ -40,7 +41,6 @@ export const assertOwnershipProvable = (): void => {
 };
 
 /** The actor directory itself, pinned by identity: a real directory (not a link) owned by this user. */
-interface PinnedActorRoot { dev: number; ino: number }
 const pinActorRoot = (directory: string): PinnedActorRoot | undefined => {
   assertOwnershipProvable();
   let stat: fs.Stats;
@@ -57,24 +57,8 @@ const pinActorRoot = (directory: string): PinnedActorRoot | undefined => {
 };
 
 const ARCHIVE_EXDEV = "archive dir is on another filesystem or mount (EXDEV); refusing before any change (smarty-dev#8159)";
-const ARCHIVE_CHANGED = "archive path changed during removal; refusing (smarty-dev#8159)";
-
-/** The identity (st_dev, inode) of each archive path component, pinned at the first check. */
-interface ChainLink { path: string; dev: number; ino: number; follow: boolean }
-type ArchiveChain = ChainLink[];
-const linkOf = (file: string, stat: fs.Stats, follow = false): ChainLink => ({ path: file, dev: stat.dev, ino: stat.ino, follow });
-
-/** Re-verify the whole pinned chain: same identity, still a real directory (no link). Synchronous. */
-const reverifyChain = (chain: ArchiveChain): void => {
-  for (const link of chain) {
-    let stat: fs.Stats;
-    try { stat = link.follow ? fs.statSync(link.path) : fs.lstatSync(link.path); }
-    catch { throw new Error(`${ARCHIVE_CHANGED}: ${link.path}`); }
-    if (stat.dev !== link.dev || stat.ino !== link.ino || !stat.isDirectory() || (!link.follow && stat.isSymbolicLink())) {
-      throw new Error(`${ARCHIVE_CHANGED}: ${link.path}`);
-    }
-  }
-};
+// ARCHIVE_CHANGED, the pinned archive chain and moveActorTreeToArchive live in ../storage/tree-archive.ts (shared with
+// the live actor removal and root-tree reset since smarty-dev#16444).
 
 /** A real directory (lstat: not a link) owned by this OS user, or undefined when absent. */
 const ownedDirectory = (file: string): fs.Stats | undefined => {
@@ -147,37 +131,6 @@ const writeArchiveRecords = (archive: string, row: Row, assertion: MainStoppedAu
   }
   const lines = files.map(file => `${createHash("sha256").update(fs.readFileSync(file)).digest("hex")}  ${path.basename(file)}\n`).join("");
   writeFileAtomic(path.join(archive, "SHA256SUMS"), lines, { durable: true });
-};
-
-/** Move the pinned actor directory into the archive by one rename(2) to a child name of the fresh archive
- * directory. rename never follows the source: a swapped-in link moves as a link, and the post-check refuses
- * (moving it back). EXDEV refuses; there is no copy fallback. */
-// ponytail: the whole chain is re-verified synchronously right before each rename; the residual is the few
-// syscalls between that check and rename(2), open only to this same OS user (smarty-dev#7800 carries a
-// directory-fd based rename that closes it).
-const moveActorTreeToArchive = (actorDirectory: string, pin: PinnedActorRoot, archive: string, chain: ArchiveChain, name = "tree"): string => {
-  const target = path.join(archive, name);
-  reverifyChain(chain);
-  try { fs.lstatSync(target); throw new Error(`Archive target already exists: ${target}`); }
-  catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-  try { fs.renameSync(actorDirectory, target); }
-  catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "EXDEV") {
-      throw new Error(`Actor directory and archive root are on different filesystems (EXDEV); refusing, no copy: ${actorDirectory}`);
-    }
-    throw error;
-  }
-  const moved = fs.lstatSync(target);
-  if (moved.isSymbolicLink() || !moved.isDirectory() || moved.dev !== pin.dev || moved.ino !== pin.ino || moved.uid !== process.getuid!()) {
-    let restored = false;
-    try { fs.lstatSync(actorDirectory); }
-    catch {
-      try { reverifyChain(chain); fs.renameSync(target, actorDirectory); restored = true; } catch { /* reported below */ }
-    }
-    throw new Error(`Actor directory was replaced before the archive rename (moved entry is not the pinned directory); ` +
-      `${restored ? "moved back" : `left at ${target}`}; refusing`);
-  }
-  return target;
 };
 
 /** Evidence text kept with a --main-stopped assertion is capped at 64 KiB. */

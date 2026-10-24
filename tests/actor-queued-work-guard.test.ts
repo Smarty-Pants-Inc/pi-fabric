@@ -439,6 +439,7 @@ describe("queued-work guard, round 2 (pi-fabric#1572)", () => {
     const heldRefusal = await actors.remove(held.id).then(() => undefined, (error: unknown) => error);
     expect(heldRefusal).toMatchObject({ code: QUEUED_WORK, operation: "remove", actorId: held.id, counts: { archived: 0, heldDeadLetter: 2 } });
     expect(deadLetterLines(root, held.id)).toEqual(heldLines);
+    expect((heldRefusal as Error).message).not.toContain("requeue it first");
     expect(actors.status(held.id).status).toBe("running");
     const removing = actors.remove(held.id, { dropQueued: true });
     releaseHeld();
@@ -875,6 +876,63 @@ describe("queued-work guard, round 4: explicit stop of a busy actor (pi-fabric#1
 const archiveLinesOf = (archive: string) => fs.readFileSync(archive, "utf8").split("\n").filter(Boolean)
   .map(line => JSON.parse(line) as { kind: string; item?: { source?: string; payload?: unknown } });
 
+// pi-fabric#1572 round 6 (astra F2): judge the work left in each archive, not just the archive's existence.
+describe("queued-work guard, round 6: requeued stop archives (pi-fabric#1572)", () => {
+  const stoppedWithSuccessor = async (queuedAsk = false) => {
+    const fixture = setup(10);
+    const { root, actors } = fixture;
+    const old = await actors.create({ name: "requeue-old", instructions: "Supervise." });
+    const releaseOld = await holdWorker(actors, root, old.id);
+    actors.tell(old.id, "queued work");
+    const answer = queuedAsk ? actors.ask(old.id, "queued ask").catch((error: unknown) => error) : undefined;
+    const { archive } = stopArchive(await actors.stop(old.id, undefined, false, "actors.stop", { dropQueued: true }));
+    if (queuedAsk) expect(await answer).toBeInstanceOf(Error);
+    releaseOld();
+    await waitFor(() => actors.inFlightCount() === 0);
+    const fresh = await actors.create({ name: "requeue-successor", instructions: "Supervise." });
+    await holdWorker(actors, root, fresh.id);
+    return { ...fixture, old, fresh, archive, ledger: archive.replace(/\.jsonl$/, ".requeued.jsonl") };
+  };
+
+  it("plain remove succeeds after every stop-archived item has been requeued", async () => {
+    const { root, actors, old, fresh, archive } = await stoppedWithSuccessor();
+    await expect(actors.requeueArchived(fresh.id, archive)).resolves.toMatchObject({ requeued: 2, skipped: [] });
+    await expect(actors.remove(old.id)).resolves.toMatchObject({ removed: true });
+    expect(fs.existsSync(path.join(root, "actors", old.id))).toBe(false);
+    expect(actors.status(fresh.id).queued).toBe(2);
+  }, 30_000);
+
+  it("a partially requeued archive still refuses remove with the requeue hint", async () => {
+    const { actors, old, fresh, archive, ledger } = await stoppedWithSuccessor(true);
+    // A queued caller's ask is skipped by requeueArchived: only the other two items reach the ledger.
+    await expect(actors.requeueArchived(fresh.id, archive)).resolves.toMatchObject({ requeued: 2,
+      skipped: [expect.objectContaining({ reason: "a caller's ask, rejected when the actor stopped" })] });
+    expect(fs.readFileSync(ledger, "utf8").split("\n").filter(Boolean)).toHaveLength(2);
+    const bytes = fs.readFileSync(archive);
+    const refusal = await actors.remove(old.id).catch((error: unknown) => error);
+    expect(refusal).toMatchObject({ code: QUEUED_WORK, operation: "remove", counts: { archived: 1 } });
+    expect((refusal as Error).message).toContain("requeue it first (agents.requeueArchived");
+    expect(actors.status(old.id).status).toBe("stopped");
+    expect(fs.readFileSync(archive).equals(bytes)).toBe(true);
+  }, 30_000);
+
+  it.each(["corrupt", "invalid item id", "unreadable"])("a %s ledger still blocks remove even after all items were requeued", async (failure) => {
+    const { actors, old, fresh, archive, ledger } = await stoppedWithSuccessor();
+    await expect(actors.requeueArchived(fresh.id, archive)).resolves.toMatchObject({ requeued: 2, skipped: [] });
+    if (failure === "unreadable") {
+      fs.renameSync(ledger, `${ledger}.saved`);
+      fs.mkdirSync(ledger); // A directory is unreadable as a ledger, without relying on user permissions.
+    } else {
+      fs.appendFileSync(ledger, failure === "corrupt" ? "{torn\n" : '{"itemId":42}\n');
+    }
+    const refusal = await actors.remove(old.id).catch((error: unknown) => error);
+    expect(refusal).toMatchObject({ code: QUEUED_WORK, operation: "remove", counts: { archived: 1 } });
+    expect((refusal as Error).message).toContain("requeue it first (agents.requeueArchived");
+    expect(actors.status(old.id).status).toBe("stopped");
+    expect(fs.existsSync(archive)).toBe(true);
+  }, 30_000);
+});
+
 // pi-fabric#1572 round 5 (fabric-store N4): a plain remove of a LIVE actor never drops its queue or its callerless item in
 // flight. It is refused before any effect; with dropQueued all of it is archived first and travels with the removed tree.
 describe("queued-work guard, round 5: remove of a live actor (pi-fabric#1572)", () => {
@@ -922,6 +980,7 @@ describe("queued-work guard, round 5: remove of a live actor (pi-fabric#1572)", 
       expect(refusal).toMatchObject({ code: QUEUED_WORK, operation: "remove", actorId: old.id,
         counts: { archived: 0, heldDeadLetter: 0, queued: 2, parked: 0, overflow: 0, inFlight: 1, settled: 0 } });
       expect((refusal as Error).message).toMatch(/queued 2, parked 0, overflow 0, in-flight 1, settled 0\); remove refused and nothing changed.*dropQueued/);
+      expect((refusal as Error).message).not.toContain("requeue it first");
       unchanged();
     }
     // /fabric remove answers the refusal like /fabric stop does.

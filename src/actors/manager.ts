@@ -4314,9 +4314,31 @@ export class ActorManager {
     this.#assertRemovalKeepsNoWork(actorId);
   }
 
+  /** Round 6 (astra F2): only a fully readable archive and ledger prove there is no archived work left. */
+  #stopArchiveFullyRequeued(file: string): boolean {
+    try {
+      const bytes = fs.readFileSync(file);
+      const sha256 = createHash("sha256").update(bytes).digest("hex");
+      if (!file.endsWith(`-${sha256.slice(0, 12)}.jsonl`)) return false;
+      const lines = bytes.toString("utf8").split("\n").filter(Boolean).map(line => JSON.parse(line) as StoppedQueueLine);
+      const header = lines[0];
+      if (!header || header.kind !== "header" || header.format !== 1) return false;
+      const offered = new Set<string>();
+      for (const line of fs.readFileSync(file.replace(/\.jsonl$/, ".requeued.jsonl"), "utf8").split("\n").filter(Boolean)) {
+        const value = JSON.parse(line) as { itemId?: unknown } | null;
+        if (!value || typeof value.itemId !== "string") return false;
+        offered.add(value.itemId);
+      }
+      return lines.slice(1).every(line => {
+        const offer = this.#archivedOffer(line);
+        return offer !== undefined && offered.has(offer.itemId);
+      });
+    } catch { return false; } // Missing, unreadable, corrupt or torn: never authorize deletion.
+  }
+
   /**
    * smarty-dev#16416 round 2: removal refuses (FabricActorQueuedWorkError, before any effect) while the actor
-   * has stop archives in <actor dir>/stopped-queues/ or dead letters setActivationFilter holds. Round 5 (pi-fabric#1572,
+   * has stop archives with unrequeued items in <actor dir>/stopped-queues/ or dead letters setActivationFilter holds. Round 5 (pi-fabric#1572,
    * fabric-store N4): also while it holds live work its removal's stop would drop: queued, parked or overflow items,
    * a callerless item of the activation in flight, or pending settled windows. A caller's ask in flight is not
    * counted: its caller hears the run's abort. With dropQueued the removal's stop archives all of it to
@@ -4328,7 +4350,9 @@ export class ActorManager {
     if (!actor) return;
     let archived = 0;
     try {
-      archived = fs.readdirSync(this.#stoppedQueueDirectory(id)).filter(name => STOP_ARCHIVE_NAME.test(name)).length;
+      const directory = this.#stoppedQueueDirectory(id);
+      archived = fs.readdirSync(directory).filter(name => STOP_ARCHIVE_NAME.test(name) &&
+        !this.#stopArchiveFullyRequeued(path.join(directory, name))).length;
     } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
     const heldDeadLetter = this.#persistent && this.#deadLetterCount(id) > 0 ? this.#readDeadLetters(id).filter(entry => entry.heldBy).length : 0;
     const running = this.#runningActor(id) ?? actor;
@@ -4339,8 +4363,10 @@ export class ActorManager {
     throw new FabricActorQueuedWorkError("remove", id, counts,
       `Fabric actor ${actor.name} (${actor.id}) keeps work a removal would delete (stop archives ${archived}, held dead-letter ${heldDeadLetter}, ` +
       `queued ${counts.queued}, parked ${counts.parked}, overflow ${counts.overflow}, in-flight ${inFlight}, settled ${counts.settled}); ` +
-      `remove refused and nothing changed. Wait until it is idle, or requeue it first (agents.requeueArchived; clear the activationFilter for held ` +
-      `dead letters), or pass dropQueued: true to remove the actor and keep that work, archived, with its removed tree.`);
+      `remove refused and nothing changed. Wait until it is idle, ` +
+      (archived > 0 ? `or requeue it first (agents.requeueArchived), ` : "") +
+      (heldDeadLetter > 0 ? `or clear the activationFilter for held dead letters, ` : "") +
+      `or pass dropQueued: true to remove the actor and keep that work, archived, with its removed tree.`);
   }
 
   async #remove(id: string, operator = false, dropQueued = false): Promise<RemovalResult> {

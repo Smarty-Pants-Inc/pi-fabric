@@ -3932,8 +3932,8 @@ export class ActorManager {
       const live = new Set(registry.actors.map((actor) => actor.id));
       const files = fs.readdirSync(this.#actorRoot);
       for (const [id, cleanup] of this.#removalCleanup) {
-        // Losing a marker is not proof that a known inode obligation was discharged.
-        if (!("treeRemoval" in cleanup) && this.#revoked.has(id) && !files.includes(`removal-${id}.json`) &&
+        // Keep owned known-inode obligations without a marker; observers may forget the owner's settled cleanup.
+        if ((!("treeRemoval" in cleanup) || !this.#ownsCleanup(cleanup)) && this.#revoked.has(id) && !files.includes(`removal-${id}.json`) &&
             !this.#removeCalls.has(id) && !this.#finishCalls.has(id) && !this.#removals.has(id)) {
           this.#removalCleanup.delete(id);
           this.#revoked.delete(id);

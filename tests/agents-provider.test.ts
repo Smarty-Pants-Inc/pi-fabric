@@ -10,7 +10,7 @@ import { deliveryRoot, projectOf } from "../src/topology/project-identity.js";
 import os from "node:os";
 import path from "node:path";
 import { SessionManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ActorManager } from "../src/actors/manager.js";
 import { ActorBindingStore } from "../src/actors/binding-store.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
@@ -24,6 +24,7 @@ import type {
 } from "../src/lifecycle/types.js";
 import {
   DEFAULT_FABRIC_CONFIG,
+  MODEL_EXCEPTIONS_PATH,
   loadFabricConfig,
   normalizeFabricConfig,
   type FabricAgentConfig,
@@ -61,7 +62,10 @@ import type { AgentRunRecord, AgentRunRequest } from "../src/agents/types.js";
 import { captureRuntimeDeadline } from "./helpers/early-runtime-deadline.js";
 import { captureMontyTransport } from "./helpers/monty-transport.js";
 import { executeAfterAdmission } from "./helpers/admission-clock.js";
+import { failActorTreeRemoval } from "./helpers/actor-tree-removal.js";
 import { createMainExecutionCeilingError } from "../src/async-settlement.js";
+import { modelExceptionGrant, withRootExceptionMetadata } from "./helpers/model-exceptions.js";
+import type { FabricThinking } from "../src/thinking.js";
 
 vi.mock("node:child_process", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:child_process")>();
@@ -72,6 +76,45 @@ const roots: string[] = [];
 const actorManagers: ActorManager[] = [];
 const agentManagers: AgentManager[] = [];
 const controlPlanes: FabricControlPlane[] = [];
+// Private finite v1 controls: exact resolved model and role, #11864 only.
+// Root-metadata controls are POSIX-only; unsupported hosts must fail closed in production.
+const boundRootCwd = path.resolve("provider-fixtures", "bound-provider-root");
+const boundRootLane = path.basename(boundRootCwd);
+const writeProviderGrants = (file: string): void => {
+  const taskModels = ["cliproxyapi-anthropic/claude-opus-5-5", "claude-haiku-test"];
+  fs.writeFileSync(file, JSON.stringify({ version: 1, grants: [
+    ...taskModels.map(model => modelExceptionGrant({ model, lane: boundRootLane })),
+    modelExceptionGrant({ model: "cliproxyapi-anthropic/claude-opus-5-5", lane: boundRootLane, role: "actor:named-opus" }),
+    modelExceptionGrant({ model: "anthropic/claude-opus-5-5", lane: boundRootLane, role: "actor:registry-member" }),
+  ] }));
+};
+const legacyExceptionRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-provider-exceptions-"));
+const legacyExceptionPath = path.join(legacyExceptionRoot, "model-exceptions.json");
+writeProviderGrants(legacyExceptionPath);
+const originalModelExceptionsPath = DEFAULT_FABRIC_CONFIG.agents.modelExceptionsPath;
+DEFAULT_FABRIC_CONFIG.agents.modelExceptionsPath = legacyExceptionPath;
+const trustedExceptionFixturePaths = new Set<string>([legacyExceptionPath]);
+const realAdmitModelException = AgentManager.prototype.admitModelException;
+let restoreAdmissionFixture: (() => void) | undefined;
+
+beforeEach(testContext => {
+  trustedExceptionFixturePaths.clear();
+  trustedExceptionFixturePaths.add(legacyExceptionPath);
+  // Call-through only: never replace the real policy result or inject a production trust adapter.
+  const admission = vi.spyOn(AgentManager.prototype, "admitModelException").mockImplementation(function (this: AgentManager, ...args) {
+    const file = this.config.modelExceptionsPath;
+    if (!file || !trustedExceptionFixturePaths.has(file)) return realAdmitModelException.apply(this, args);
+    if (process.platform === "win32" || typeof process.getuid !== "function") testContext.skip();
+    return withRootExceptionMetadata(file, () => realAdmitModelException.apply(this, args));
+  });
+  restoreAdmissionFixture = () => admission.mockRestore();
+});
+
+afterAll(() => {
+  if (originalModelExceptionsPath === undefined) delete DEFAULT_FABRIC_CONFIG.agents.modelExceptionsPath;
+  else DEFAULT_FABRIC_CONFIG.agents.modelExceptionsPath = originalModelExceptionsPath;
+  fs.rmSync(legacyExceptionRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+});
 
 const usage = {
   input: 0,
@@ -84,8 +127,11 @@ const usage = {
 
 const visiblePiModels = [
   { provider: "cliproxyapi", id: "gpt-6.1-sol" },
+  { provider: "cliproxyapi", id: "gpt-6-luna" },
   { provider: "cliproxyapi-anthropic", id: "claude-opus-5-5" },
   { provider: "cliproxyapi", id: "gpt-6-astra" },
+  { provider: "openai-codex", id: "gpt-6-astra-xhigh" },
+  { provider: "cliproxyapi", id: "gpt-6-astra-preview" },
   { provider: "cliproxyapi", id: "gpt-6-sol" },
   { provider: "anthropic", id: "executor", name: "Executor" },
   { provider: "anthropic", id: "frontier", name: "Frontier" },
@@ -121,7 +167,7 @@ describe("records option", () => {
 
 describe("explicit Astra launch guard (#3134)", () => {
   const model = "cliproxyapi/gpt-6-astra";
-  const refusal = `model ${model} requires modelReason (named exception); omit model to use the role default pi default (inherited session model), see smarty-dev#3134`;
+  const refusal = new RegExp(`model ${model.replaceAll("/", "\\/")} requires modelReason.*#2264`);
   const reason = "  Explicit exception for a bounded compatibility probe  ";
   const argsFor = (action: string): Record<string, unknown> => action === "create" || action === "createActor"
     ? { name: "guard-probe", instructions: "Work." } : { task: "Work.", transport: "process" };
@@ -132,7 +178,7 @@ describe("explicit Astra launch guard (#3134)", () => {
     try {
       for (const modelReason of [undefined, "", " \t\n ", null, false, 1, {}]) {
         await expect(provider.invoke(action, { ...argsFor(action), model: ` ${model} `, modelReason }, context))
-          .rejects.toMatchObject({ message: refusal });
+          .rejects.toMatchObject({ message: expect.stringMatching(refusal) });
       }
       expect(agents.list()).toEqual([]);
       expect(actors.list()).toEqual([]);
@@ -143,14 +189,18 @@ describe("explicit Astra launch guard (#3134)", () => {
 
   it.each(["run", "spawn", "create", "createActor"] as const)("%s covers all Astra provider prefixes and the reason length boundary", async action => {
     const { provider, agents, actors } = setup([], [], undefined, { agentsConfig: { model: "cliproxyapi/gpt-6.1-sol" } });
-    for (const selection of ["gpt-6-astra", "openai-codex/gpt-6-astra-xhigh", "cliproxyapi/gpt-6-astra-preview"]) {
+    for (const [selection, canonical] of [
+      ["gpt-6-astra", "cliproxyapi/gpt-6-astra"],
+      ["openai-codex/gpt-6-astra-xhigh", "openai-codex/gpt-6-astra-xhigh"],
+      ["cliproxyapi/gpt-6-astra-preview", "cliproxyapi/gpt-6-astra-preview"],
+    ] as const) {
       await expect(provider.invoke(action, { ...argsFor(action), model: selection }, context))
-        .rejects.toThrow(`model ${selection} requires modelReason (named exception); omit model to use the role default cliproxyapi/gpt-6.1-sol, see smarty-dev#3134`);
+        .rejects.toThrow(new RegExp(`model ${canonical.replaceAll("/", "\\/")} requires modelReason.*#2264`));
     }
     const inherited = { ...context, extensionContext: { ...context.extensionContext, model: { provider: "provider", id: "session" } } as ExtensionContext };
-    await expect(provider.invoke(action, { ...argsFor(action), model }, inherited)).rejects.toThrow("role default provider/session, see smarty-dev#3134");
+    await expect(provider.invoke(action, { ...argsFor(action), model }, inherited)).rejects.toThrow(/role default provider\/session|#2264/);
     await expect(provider.invoke(action, { ...argsFor(action), model, modelReason: "x".repeat(201) }, context))
-      .rejects.toThrow("modelReason must be ≤200 chars");
+      .rejects.toThrow("modelReason must be nonblank and ≤200 chars");
     expect(agents.list()).toEqual([]); expect(actors.list()).toEqual([]);
     const receipt = await provider.invoke(action, { ...argsFor(action), model, modelReason: "x".repeat(200) }, context) as AgentRunRecord;
     if (action === "spawn") await agents.wait(receipt.id);
@@ -175,15 +225,22 @@ describe("explicit Astra launch guard (#3134)", () => {
     expect(cleared.modelReason).toBeUndefined();
   });
 
-  it("keeps existing actors and template imports running without a retroactive reason requirement", async () => {
-    const { provider, actors, agents, globalActors } = setup();
+  it("refuses unreasoned legacy explicit bindings while importing through a safe fallback", async () => {
+    const { provider, actors, agents, globalActors } = setup([], [], undefined, {
+      agentsConfig: { modelPolicy: { requireReason: [] } },
+    });
     const existing = await actors.create({ name: "pre-policy", instructions: "Work.", model });
-    const message = await provider.invoke("ask", { id: existing.id, message: "Work." }, context) as { runId: string };
-    expect(agents.status(message.runId)).toMatchObject({ model, status: "completed" });
-    expect(agents.status(message.runId).modelReason).toBeUndefined();
-    await expect(provider.invoke("setModel", { id: existing.id, model }, context)).rejects.toThrow("requires modelReason");
     const template = globalActors.create({ name: "pre-policy-template", instructions: "Work.", model });
-    expect(await provider.invoke("import", { id: template.id, as: "legacy-import" }, context)).toMatchObject({ model });
+    agents.config.modelPolicy = {
+      ...DEFAULT_FABRIC_CONFIG.agents.modelPolicy,
+      fallbackModel: "cliproxyapi/gpt-6-luna",
+      fallbackThinking: "high",
+    };
+    await expect(provider.invoke("ask", { id: existing.id, message: "Work." }, context))
+      .rejects.toThrow("requires modelReason");
+    expect(agents.list()).toEqual([]);
+    const imported = await provider.invoke("import", { id: template.id, as: "legacy-import" }, context) as FabricActorInfo;
+    expect(imported).toMatchObject({ model: "cliproxyapi/gpt-6-luna", thinking: "high" });
   });
 
   it("honors an empty rollback list and a provider-qualified override", async () => {
@@ -231,9 +288,13 @@ describe("explicit Astra launch guard (#3134)", () => {
     expect(globalActors.toRequest(definition)).toMatchObject({ model, modelReason: reason });
   });
 
-  it.each(["run", "spawn", "create", "createActor"] as const)("%s leaves omitted, inherited, other and alias model selections unaffected", async action => {
+  it.each(["run", "spawn", "create", "createActor"] as const)("%s keeps safe explicit and alias selections while demoting guarded defaults", async action => {
     const { provider, agents } = setup([], [], undefined, {
-      agentsConfig: { model }, modelsConfig: { aliases: { probe: { targets: [model] } } },
+      agentsConfig: {
+        model,
+        modelPolicy: { ...DEFAULT_FABRIC_CONFIG.agents.modelPolicy, fallbackModel: "cliproxyapi/gpt-6-luna", fallbackThinking: "high" },
+      },
+      modelsConfig: { aliases: { probe: { targets: ["cliproxyapi/gpt-6.1-sol"] } } },
     });
     const inherited = { ...context, extensionContext: { ...context.extensionContext, model: { provider: "cliproxyapi", id: "gpt-6-astra" } } as ExtensionContext };
     let sequence = 0;
@@ -244,6 +305,8 @@ describe("explicit Astra launch guard (#3134)", () => {
       const receipt = await provider.invoke(action, { ...argsFor(action), name: `guard-probe-${sequence++}`, ...selection }, invocation) as AgentRunRecord;
       if (action === "spawn") expect((await agents.wait(receipt.id)).status).toBe("completed");
       else if (action === "run") expect(receipt.status).toBe("completed");
+      if (!("model" in selection)) expect(receipt).toMatchObject({ model: "cliproxyapi/gpt-6-luna", thinking: "high" });
+      else expect(receipt.model).toBe("cliproxyapi/gpt-6.1-sol");
       expect(receipt).not.toHaveProperty("modelReason");
     }
   });
@@ -259,11 +322,485 @@ describe("explicit Astra launch guard (#3134)", () => {
         signal: undefined, parentToolCallId: "astra-guard-guest", context: context.extensionContext, onPartial() {},
       });
       expect(result.success, result.error).toBe(true);
-      expect(result.value).toBe(refusal);
+      expect(result.value).toEqual(expect.stringMatching(refusal));
       expect(agents.list()).toEqual([]);
       expect(actors.list()).toEqual([]);
       expect(globalActors.list()).toEqual([]);
     }
+  });
+});
+
+describe("public actor model-exception roles", () => {
+  const model = "cliproxyapi-anthropic/claude-opus-5-5";
+  const safeModel = "cliproxyapi/gpt-6.1-sol";
+  const reason = "Actor-only exception #1";
+  const writeActorGrant = (exceptionPath: string, thinking: FabricThinking = "max"): void => {
+    fs.writeFileSync(exceptionPath, JSON.stringify({ version: 1, grants: [modelExceptionGrant({
+      issue: "Smarty-Pants-Inc/smarty-dev#1", model, role: "actor:reviewer",
+      lane: boundRootLane, thinking,
+    })] }));
+  };
+
+  it.each(["run", "spawn", "create", "createActor", "setModel", "ask", "tell"] as const)(
+    "does not expose caller-selectable lane, host or root binding on %s", async action => {
+      const state = setup();
+      const descriptor = await state.provider.describe(action, context);
+      const properties = (descriptor?.inputSchema as { properties: Record<string, unknown> }).properties;
+      expect(properties).not.toHaveProperty("lane");
+      expect(properties).not.toHaveProperty("host");
+      expect(properties).not.toHaveProperty("rootSessionCwd");
+    },
+  );
+
+  it("denies an unbound ROOT despite forged caller lane/host/cwd and environment", async () => {
+    const state = setup([], [], undefined, { rootSessionCwd: () => undefined });
+    writeActorGrant(state.agents.config.modelExceptionsPath!);
+    vi.stubEnv("PI_FABRIC_LANE", boundRootLane);
+    vi.stubEnv("SMARTY_LANE", boundRootLane);
+    vi.stubEnv("PI_FABRIC_ROOT_CWD", boundRootCwd);
+    vi.stubEnv("HOSTNAME", os.hostname().split(".")[0]!);
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    try {
+      await expect(state.provider.invoke("create", { name: "reviewer", instructions: "Review.",
+        model, modelReason: reason, lane: boundRootLane, host: os.hostname().split(".")[0],
+        cwd: boundRootCwd, rootSessionCwd: boundRootCwd,
+      }, { ...context, cwd: boundRootCwd })).rejects.toMatchObject({
+        // #16331: an unreadable bound ROOT record is its own fail-closed denial, not a mismatch.
+        code: "FABRIC_MODEL_EXCEPTION_DENIED", denial: "lane-unresolved",
+      });
+      expect(state.actors.list()).toEqual([]);
+      expect(state.agents.list()).toEqual([]);
+      expect(launch).not.toHaveBeenCalled();
+    } finally { launch.mockRestore(); vi.unstubAllEnvs(); }
+  });
+
+  it.each(["low", "medium", "high"] as const)("applies the requested %s actor effort against a medium ceiling", async thinking => {
+    const state = setup();
+    writeActorGrant(state.agents.config.modelExceptionsPath!, "medium");
+    const create = () => state.provider.invoke("create", {
+      name: "reviewer", instructions: "Review.", model, modelReason: reason, thinking,
+    }, context);
+    if (thinking === "high") {
+      await expect(create()).rejects.toMatchObject({ code: "FABRIC_MODEL_EXCEPTION_DENIED", denial: "thinking-exceeds" });
+      expect(state.actors.list()).toEqual([]);
+      expect(state.agents.list()).toEqual([]);
+    } else {
+      await expect(create()).resolves.toMatchObject({ model, thinking, modelReason: reason });
+    }
+  });
+
+  it.each(["ask", "tell"] as const)("checks %s binding effort, not the manager default", async action => {
+    const state = setup([], [], undefined, { agentsConfig: { thinking: "low" } });
+    writeActorGrant(state.agents.config.modelExceptionsPath!, "medium");
+    const actor = await state.provider.invoke("create", {
+      name: "reviewer", instructions: "Review.", model: safeModel, thinking: "high",
+    }, context) as FabricActorInfo;
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    try {
+      await expect(state.provider.invoke(action, { id: actor.id, message: "Above-ceiling binding",
+        model, modelReason: reason, thinking: "high",
+      }, context)).rejects.toMatchObject({ code: "FABRIC_MODEL_EXCEPTION_DENIED", denial: "thinking-exceeds" });
+      expect(state.agents.list()).toEqual([]);
+      expect(launch).not.toHaveBeenCalled();
+      await expect(state.provider.invoke(action, { id: actor.id, message: "Below-ceiling binding",
+        model, modelReason: reason, thinking: "low",
+      }, context)).resolves.toBeDefined();
+    } finally { launch.mockRestore(); }
+  });
+
+  it.each(["session", "project", "global"] as const)("setModel checks existing high %s effort before mutation", async scope => {
+    const state = setup([], [], undefined, { agentsConfig: { thinking: "low" } });
+    writeActorGrant(state.agents.config.modelExceptionsPath!, "medium");
+    const actor = await state.provider.invoke("create", {
+      name: "reviewer", instructions: "Review.", model: safeModel, thinking: "high",
+      ...(scope === "global" ? { scope } : {}),
+    }, context) as FabricActorInfo;
+    const before = scope === "global"
+      ? structuredClone(state.globalActors.resolve(actor.id))
+      : structuredClone(state.actors.definition(actor.id));
+    await expect(state.provider.invoke("setModel", { id: actor.id, scope, model, modelReason: reason }, context))
+      .rejects.toMatchObject({ code: "FABRIC_MODEL_EXCEPTION_DENIED", denial: "thinking-exceeds" });
+    expect(scope === "global" ? state.globalActors.resolve(actor.id) : state.actors.definition(actor.id)).toEqual(before);
+    expect(state.agents.list()).toEqual([]);
+    await state.provider.invoke("setThinking", { id: actor.id, scope, thinking: "low" }, context);
+    await expect(state.provider.invoke("setModel", { id: actor.id, scope, model, modelReason: reason }, context))
+      .resolves.toMatchObject({ model, thinking: "low", modelReason: reason });
+  });
+
+  it("uses actor:<name> rather than task when admitting an actor-only host grant", async () => {
+    const state = setup();
+    writeActorGrant(state.agents.config.modelExceptionsPath!);
+    const actor = await state.provider.invoke("create", {
+      name: "reviewer", instructions: "Review.", model, modelReason: reason,
+    }, context) as FabricActorInfo;
+    expect(actor).toMatchObject({ model, modelReason: reason });
+  });
+
+  it("uses the same host row to refuse wrong actor names and task roles before side effects", async () => {
+    const state = setup();
+    writeActorGrant(state.agents.config.modelExceptionsPath!);
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    try {
+      await expect(state.provider.invoke("create", {
+        name: "wrong-name", instructions: "Review.", model, modelReason: reason,
+      }, context)).rejects.toMatchObject({
+        name: "FabricModelExceptionDeniedError", code: "FABRIC_MODEL_EXCEPTION_DENIED",
+        denial: "role-mismatch", ref: "Smarty-Pants-Inc/smarty-dev#1", role: "actor:wrong-name",
+      });
+      await expect(state.provider.invoke("run", {
+        task: "Task role must not borrow an actor grant", model, modelReason: reason, transport: "process",
+      }, context)).rejects.toMatchObject({
+        name: "FabricModelExceptionDeniedError", code: "FABRIC_MODEL_EXCEPTION_DENIED",
+        denial: "role-mismatch", ref: "Smarty-Pants-Inc/smarty-dev#1", role: "task",
+      });
+      expect(state.actors.list()).toEqual([]);
+      expect(state.agents.list()).toEqual([]);
+      expect(launch).not.toHaveBeenCalled();
+    } finally { launch.mockRestore(); }
+  });
+
+  it("admits reviewer bindings and refuses a wrong-role setter through public setModel", async () => {
+    const state = setup();
+    writeActorGrant(state.agents.config.modelExceptionsPath!);
+    const reviewer = await state.provider.invoke("create", {
+      name: "reviewer", instructions: "Review.", model: safeModel,
+    }, context) as FabricActorInfo;
+    const selected = await state.provider.invoke("setModel", {
+      id: reviewer.id, model, modelReason: reason,
+    }, context) as FabricActorInfo;
+    expect(selected).toMatchObject({ id: reviewer.id, model, modelReason: reason });
+
+    const wrong = await state.provider.invoke("create", {
+      name: "wrong-name", instructions: "Review.", model: safeModel,
+    }, context) as FabricActorInfo;
+    const wrongDefinition = structuredClone(state.actors.definition(wrong.id));
+    await expect(state.provider.invoke("setModel", {
+      id: wrong.id, model, modelReason: reason,
+    }, context)).rejects.toMatchObject({
+      name: "FabricModelExceptionDeniedError", code: "FABRIC_MODEL_EXCEPTION_DENIED",
+      denial: "role-mismatch", ref: "Smarty-Pants-Inc/smarty-dev#1", role: "actor:wrong-name",
+    });
+    expect(state.actors.definition(wrong.id)).toEqual(wrongDefinition);
+    expect(state.actors.status(wrong.id)).toMatchObject({ id: wrong.id, model: safeModel });
+  });
+
+  it.each(["ask", "tell"] as const)("applies the receiver actor role to %s bindings", async action => {
+    const state = setup();
+    writeActorGrant(state.agents.config.modelExceptionsPath!);
+    const reviewer = await state.provider.invoke("create", {
+      name: "reviewer", instructions: "Review.", model: safeModel,
+    }, context) as FabricActorInfo;
+    const wrong = await state.provider.invoke("create", {
+      name: "wrong-name", instructions: "Review.", model: safeModel,
+    }, context) as FabricActorInfo;
+    const args = (id: string) => ({ id, message: `role-bound ${action}`, model, modelReason: reason });
+
+    if (action === "ask") {
+      await expect(state.provider.invoke(action, args(reviewer.id), context)).resolves.toBeDefined();
+    } else {
+      await expect(state.provider.invoke(action, args(reviewer.id), context)).resolves.toMatchObject({ queued: true });
+    }
+    await expect(state.provider.invoke(action, args(wrong.id), context)).rejects.toMatchObject({
+      name: "FabricModelExceptionDeniedError", code: "FABRIC_MODEL_EXCEPTION_DENIED",
+      denial: "role-mismatch", ref: "Smarty-Pants-Inc/smarty-dev#1", role: "actor:wrong-name",
+    });
+  });
+
+  it.each(["empty host exception list", "missing host exception file"] as const)(
+    "leaves Main switchModel unaffected with a %s",
+    async label => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-main-model-exception-"));
+      roots.push(root);
+      const exceptionPath = path.join(root, "model-exceptions.json");
+      if (label.startsWith("empty")) fs.writeFileSync(exceptionPath, JSON.stringify({ version: 1, grants: [] }));
+      const switchModel = vi.fn(async () => ({ ok: true }));
+      const state = setup([], [], undefined, {
+        switchModel,
+        agentsConfig: {
+          modelExceptionsPath: exceptionPath,
+          modelPolicy: { requireReason: ["opus", "claude"] },
+        },
+      });
+      const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+      try {
+        await expect(state.provider.invoke("switchModel", { model }, context)).resolves.toMatchObject({
+          switched: true, model,
+        });
+        expect(switchModel).toHaveBeenCalledOnce();
+        expect(state.agents.list()).toEqual([]);
+        expect(launch).not.toHaveBeenCalled();
+      } finally { launch.mockRestore(); }
+    },
+  );
+
+  it("bridges a denied bogus #1 to the public guest with only safe error fields", async () => {
+    const state = setup();
+    writeActorGrant(state.agents.config.modelExceptionsPath!);
+    const registry = new ActionRegistry(); registry.register(state.provider);
+    const config = structuredClone(DEFAULT_FABRIC_CONFIG);
+    config.agents = structuredClone(state.agents.config);
+    config.approvals.agent = "allow";
+    const service = new FabricExecutionService(registry, config);
+    const result = await service.execute({
+      code: `try {
+        await agents.create(${JSON.stringify({ name: "wrong-name", instructions: "Review.", model, modelReason: reason })});
+        return { admitted: true };
+      } catch (error) {
+        return { name: error.name, code: error.code, message: error.message };
+      }`,
+      signal: undefined, parentToolCallId: "model-exception-guest", context: {
+        ...context.extensionContext, cwd: process.cwd(), hasUI: false,
+      } as ExtensionContext, onPartial() {},
+    });
+    expect(result.success).toBe(true);
+    expect(result.value).toEqual({
+      name: "FabricModelExceptionDeniedError",
+      code: "FABRIC_MODEL_EXCEPTION_DENIED",
+      message: expect.stringContaining("smarty-dev#1"),
+    });
+    expect(state.actors.list()).toEqual([]);
+    expect(state.agents.list()).toEqual([]);
+  });
+
+  it("bridges schema-valid missing reasons and unlisted refs, while schema-invalid inputs remain refused", async () => {
+    const state = setup();
+    writeActorGrant(state.agents.config.modelExceptionsPath!);
+    const registry = new ActionRegistry(); registry.register(state.provider);
+    const config = structuredClone(DEFAULT_FABRIC_CONFIG);
+    config.agents = structuredClone(state.agents.config);
+    config.approvals.agent = "allow";
+    const service = new FabricExecutionService(registry, config);
+    const executeCreate = (args: Record<string, unknown>) => service.execute({
+      code: `try {
+        const request = JSON.parse(${JSON.stringify(JSON.stringify(args))});
+        await agents.create(request);
+        return { admitted: true };
+      } catch (error) {
+        return { name: error.name, code: error.code, message: error.message };
+      }`,
+      signal: undefined, parentToolCallId: "model-exception-invalid-reason", context: {
+        ...context.extensionContext, cwd: process.cwd(), hasUI: false,
+      } as ExtensionContext, onPartial() {},
+    });
+    for (const modelReason of [undefined, "", "  "] as const) {
+      const args = { name: "reviewer", instructions: "Review.", model,
+        ...(modelReason === undefined ? {} : { modelReason }) };
+      const result = await executeCreate(args);
+      expect(result.success).toBe(true);
+      expect(result.value).toEqual({
+        name: "FabricModelExceptionDeniedError",
+        code: "FABRIC_MODEL_EXCEPTION_DENIED",
+        message: expect.stringContaining("requires"),
+      });
+    }
+    for (const modelReason of [false, "x".repeat(201)] as const) {
+      const result = await executeCreate({ name: "reviewer", instructions: "Review.", model, modelReason });
+      expect(result.success).toBe(true);
+      expect(result.value).toMatchObject({ message: expect.stringContaining("Invalid arguments for agents.create") });
+      expect(state.actors.list()).toEqual([]);
+      expect(state.agents.list()).toEqual([]);
+    }
+    fs.writeFileSync(state.agents.config.modelExceptionsPath!, JSON.stringify({ version: 1, grants: [] }));
+    const unlisted = await executeCreate({ name: "reviewer", instructions: "Review.", model, modelReason: reason });
+    expect(unlisted.success).toBe(true);
+    expect(unlisted.value).toEqual({
+      name: "FabricModelExceptionDeniedError",
+      code: "FABRIC_MODEL_EXCEPTION_DENIED",
+      message: expect.stringMatching(/smarty-dev#1.*(?:file-unavailable|unlisted)/),
+    });
+    expect(state.actors.list()).toEqual([]);
+    expect(state.agents.list()).toEqual([]);
+  });
+});
+
+describe("model reason policy boundary (#11864)", () => {
+  const opus = "cliproxyapi-anthropic/claude-opus-5-5";
+  const luna = "cliproxyapi/gpt-6-luna";
+  const issueReason = "#11864 bounded compatibility exception";
+  const nonIssueReason = "bounded compatibility exception without an issue";
+  const fallbackPolicy = {
+    requireReason: ["gpt-6-astra", "opus", "claude"],
+    fallbackModel: luna,
+    fallbackThinking: "high" as const,
+  };
+  const policy = { modelPolicy: fallbackPolicy };
+
+  it.each(["run", "spawn"] as const)("%s refuses bare Opus, then accepts opusReason and records worker/status evidence", async action => {
+    const state = setup([], [], undefined, { agentsConfig: policy });
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    try {
+      await expect(state.provider.invoke(action, {
+        task: "Opus boundary refusal",
+        model: opus,
+        transport: "process",
+      }, context)).rejects.toThrow(/#2264|named exception/);
+      expect(launch).not.toHaveBeenCalled();
+
+      const handle = await state.provider.invoke(action, {
+        task: "Opus named exception",
+        model: opus,
+        opusReason: issueReason,
+        transport: "process",
+      }, context) as AgentHandleInfo;
+      const result = action === "spawn" ? await state.agents.wait(handle.id) : handle;
+      expect(result).toMatchObject({ status: "completed", model: opus, modelReason: issueReason });
+      expect(state.agents.status(handle.id)).toMatchObject({ model: opus, modelReason: issueReason });
+      expect(launch.mock.calls.at(-1)?.[0].workerArguments).toEqual(expect.arrayContaining(["--model-reason", issueReason]));
+    } finally { launch.mockRestore(); }
+  });
+
+  it("F-01 guards Claude-code Veda defaults and aliases at the provider and actor boundary", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-veda-claude-home-")); roots.push(home);
+    const homedir = vi.spyOn(os, "homedir").mockReturnValue(home);
+    const state = setup([], [], undefined, { preparePiModel: prepareVisiblePiModel, agentsConfig: {
+      runner: "veda",
+      modelPolicy: { requireReason: ["claude", "opus"] },
+      veda: { ...DEFAULT_FABRIC_CONFIG.agents.veda, backend: "claude-code" },
+    } });
+    const concreteModel = "cliproxyapi-anthropic/claude-opus-5-5";
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    const exception = "#11864 bounded Veda Claude-code compatibility exception";
+    try {
+      for (const args of [
+        { task: "absent Veda model" },
+        { task: "configured undefined Veda model", model: undefined },
+        { task: "short Veda alias", model: "sonnet" },
+      ]) {
+        await expect(state.provider.invoke("run", { ...args, transport: "process" }, context))
+          .rejects.toThrow(/requires (?:modelReason|opusReason).*#2264|named exception/i);
+      }
+      expect(launch).not.toHaveBeenCalled();
+      expect(state.agents.list()).toEqual([]);
+
+      await expect(state.provider.invoke("create", { name: "unreasoned-claude-default", instructions: "Review." }, context))
+        .rejects.toThrow(/The Veda runner does not support persistent actors/);
+      expect(state.actors.list()).toEqual([]);
+
+      // Veda is a task runner, not an actor runner: a reason must not expand that API.
+      await expect(state.provider.invoke("create", {
+        name: "unsupported-veda-actor", instructions: "Review.", model: "sonnet", modelReason: exception,
+      }, context)).rejects.toThrow(/The Veda runner does not support persistent actors/);
+      const result = await state.provider.invoke("run", {
+        task: "reasoned Claude-code task", model: concreteModel, opusReason: exception, transport: "process",
+      }, context) as AgentRunRecord;
+      expect(result).toMatchObject({ status: "completed", model: concreteModel, modelReason: exception,
+        warnings: expect.arrayContaining([expect.stringMatching(/veda\/claude-code\/cliproxyapi-anthropic\/claude-opus-5-5/)]) });
+      const workerArguments = launch.mock.calls.at(-1)?.[0].workerArguments;
+      expect(workerArguments).toEqual(expect.arrayContaining(["--runner", "veda", "--model", concreteModel, "--model-reason", exception]));
+      const auditFile = path.join(home, ".local", "state", "smarty", "route", "opus-exceptions.jsonl");
+      const rows = fs.readFileSync(auditFile, "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line) as Record<string, unknown>);
+      const matched = rows.filter(row => row.reason === exception);
+      expect(matched).toHaveLength(1);
+      expect(matched[0]).toMatchObject({ reason: exception,
+        ref: "Smarty-Pants-Inc/smarty-dev#11864", issue: "Smarty-Pants-Inc/smarty-dev#11864",
+        role: "task", model: concreteModel, lane: boundRootLane, host: os.hostname().split(".")[0],
+        grant_id: expect.any(String), thinking: result.thinking, run_id: result.id, time: expect.any(String),
+      });
+
+      const otherBackend = setup([], [], undefined, { agentsConfig: {
+        runner: "veda", modelPolicy: { requireReason: ["claude", "opus"] },
+        veda: { ...DEFAULT_FABRIC_CONFIG.agents.veda, backend: "agy" },
+      } });
+      expect(await otherBackend.provider.invoke("run", { task: "non-Claude Veda compatibility", model: "sonnet", transport: "process" }, context))
+        .toMatchObject({ status: "completed", runner: "veda", model: "sonnet" });
+      const rollback = setup([], [], undefined, { agentsConfig: {
+        runner: "veda", modelPolicy: { requireReason: [] },
+        veda: { ...DEFAULT_FABRIC_CONFIG.agents.veda, backend: "claude-code" },
+      } });
+      expect(await rollback.provider.invoke("run", { task: "empty requireReason rollback", model: "sonnet", transport: "process" }, context))
+        .toMatchObject({ status: "completed", model: "sonnet" });
+      const customBackend = setup([], [], undefined, { agentsConfig: {
+        runner: "veda", modelPolicy: { requireReason: ["claude", "opus"] },
+        veda: { ...DEFAULT_FABRIC_CONFIG.agents.veda, backend: "private-custom-backend" },
+      } });
+      expect(await customBackend.provider.invoke("run", { task: "unknown backend uses its default", transport: "process" }, context))
+        .toMatchObject({ status: "completed", runner: "veda" });
+    } finally { launch.mockRestore(); homedir.mockRestore(); }
+  });
+
+  it("requires an explicit configured fallback for inherited Opus, with a safe absent-fallback countercase", async () => {
+    const inherited = { ...context, extensionContext: { ...context.extensionContext,
+      model: { provider: "cliproxyapi-anthropic", id: "claude-opus-5-5" },
+    } as ExtensionContext };
+    const configured = setup([], [], undefined, { agentsConfig: policy });
+    const safe = await configured.provider.invoke("spawn", { task: "inherited Opus with configured fallback", transport: "process" }, inherited) as AgentHandleInfo;
+    expect(safe).toMatchObject({ model: luna, thinking: "high" });
+    expect(await configured.agents.wait(safe.id)).toMatchObject({ status: "completed", model: luna, thinking: "high" });
+
+    const absent = setup([], [], undefined, { agentsConfig: { modelPolicy: {
+      requireReason: ["gpt-6-astra", "opus", "claude"], fallbackThinking: "high",
+    } } });
+    await expect(absent.provider.invoke("spawn", { task: "inherited Opus without configured fallback", transport: "process" }, inherited))
+      .rejects.toThrow(/fallbackModel|#2264|named exception/);
+    const absentClaude = setup([], [], undefined, { agentsConfig: {
+      runner: "claude", modelPolicy: { requireReason: ["gpt-6-astra", "opus", "claude"], fallbackThinking: "high" },
+    } });
+    await expect(absentClaude.provider.invoke("run", { task: "default Claude without configured fallback", runner: "claude", transport: "process" }, context))
+      .rejects.toThrow(/fallbackModel|#2264|named exception/);
+    expect(absent.agents.list()).toEqual([]); expect(absentClaude.agents.list()).toEqual([]);
+  });
+
+  it("guards an alias after it resolves to Opus, and requires an issue-bearing reason", async () => {
+    const state = setup([], [], undefined, {
+      agentsConfig: policy,
+      modelsConfig: { aliases: { guarded: { targets: [opus, luna] } } },
+    });
+    await expect(state.provider.invoke("run", { task: "guarded alias", model: "guarded", modelReason: nonIssueReason, transport: "process" }, context))
+      .rejects.toThrow(/#2264|named exception/);
+    const result = await state.provider.invoke("run", { task: "guarded alias", model: "guarded", opusReason: issueReason, transport: "process" }, context) as AgentRunRecord;
+    expect(result).toMatchObject({ status: "completed", model: opus, modelReason: issueReason });
+  });
+
+  it("demotes a protected route-pin alias indirectly, while an issue-bearing exception keeps the pin", async () => {
+    const state = setup([], [], undefined, {
+      agentsConfig: policy,
+      modelsConfig: { aliases: { guarded: { targets: [opus] } } },
+    });
+    const indirect = await state.provider.invoke("spawn", {
+      task: "protected route fallback", model: "auto", routeClass: "bounded-lookup",
+      pinModel: "guarded", pinThinking: "low", protected: true, transport: "process",
+    }, context) as AgentHandleInfo;
+    expect(indirect).toMatchObject({ model: luna, thinking: "high", routeDecision: { model: luna, effort: "high", reasonCode: "admission-blocked" } });
+    expect(await state.agents.wait(indirect.id)).toMatchObject({ status: "completed", model: luna, thinking: "high" });
+
+    const allowed = await state.provider.invoke("spawn", {
+      task: "protected route exception", model: "auto", routeClass: "bounded-lookup",
+      pinModel: "guarded", pinThinking: "low", protected: true, opusReason: issueReason, transport: "process",
+    }, context) as AgentHandleInfo;
+    expect(allowed).toMatchObject({ model: opus, modelReason: issueReason });
+    expect(await state.agents.wait(allowed.id)).toMatchObject({ status: "completed", model: opus, modelReason: issueReason });
+  });
+
+  it("applies the same issue-bearing guard to Claude runner selections", async () => {
+    const state = setup([], [], undefined, { agentsConfig: { ...policy, runner: "claude" } });
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    try {
+      await expect(state.provider.invoke("run", { task: "Claude refusal", runner: "claude", model: "claude/haiku", transport: "process" }, context))
+        .rejects.toThrow(/#2264|named exception/);
+      expect(launch).not.toHaveBeenCalled();
+      const result = await state.provider.invoke("run", { task: "Claude exception", runner: "claude", model: "claude-haiku-test", opusReason: issueReason, transport: "process" }, context) as AgentRunRecord;
+      expect(result).toMatchObject({ status: "completed", model: expect.stringContaining("haiku"), modelReason: issueReason });
+      expect(launch.mock.calls[0]![0].workerArguments).toEqual(expect.arrayContaining([
+        "--runner", "claude", "--model", "claude-haiku-test", "--model-reason", issueReason,
+      ]));
+    } finally { launch.mockRestore(); }
+  });
+
+  it("keeps direct actor creation and implicit inherited actor defaults at the same boundary", async () => {
+    const state = setup([], [], undefined, { agentsConfig: policy });
+    await expect(state.provider.invoke("create", { name: "bare-opus", instructions: "Review.", model: opus }, context))
+      .rejects.toThrow(/#2264|named exception/);
+    const actor = await state.provider.invoke("create", {
+      name: "named-opus", instructions: "Review.", model: opus, opusReason: issueReason,
+    }, context) as FabricActorInfo;
+    expect(state.actors.definition(actor.id)).toMatchObject({ model: opus, modelReason: issueReason });
+
+    const inherited = { ...context, extensionContext: { ...context.extensionContext,
+      model: { provider: "cliproxyapi-anthropic", id: "claude-opus-5-5" },
+    } as ExtensionContext };
+    const fallbackActor = await state.provider.invoke("create", { name: "inherited-opus", instructions: "Review." }, inherited) as FabricActorInfo;
+    expect(fallbackActor).toMatchObject({ model: luna, thinking: "high" });
+    expect(state.actors.definition(fallbackActor.id)).toMatchObject({ model: luna, thinking: "high" });
   });
 });
 
@@ -285,14 +822,21 @@ describe("fleet model policy (#2490)", () => {
     (state.provider as unknown as { residency: ResidencyClient }).residency = { spawnAgent } as unknown as ResidencyClient;
     const launch = vi.spyOn(ProcessTransport.prototype, "launch");
     try {
-      await expect(state.provider.invoke("spawn", { task: "must not submit", residency, transport: "process", ...(source === "explicit" ? { model: selector } : {}) }, context)).rejects.toMatchObject({ name: "FabricModelDeniedError", code: "FABRIC_MODEL_DENIED" });
+      // An unknown native alias cannot establish a canonical exception target on any host.
+      const denial = runner === "claude" && selector === "unknown-runtime-alias"
+        ? { code: "FABRIC_MODEL_EXCEPTION_DENIED", denial: "model-mismatch" }
+        : { name: "FabricModelDeniedError", code: "FABRIC_MODEL_DENIED" };
+      await expect(state.provider.invoke("spawn", { task: "must not submit", residency, transport: "process",
+        ...(source === "explicit" ? { model: selector } : {}), modelReason: "#11864 backend denial boundary" }, context))
+        .rejects.toMatchObject(denial);
       expect(state.agents.list()).toEqual([]); expect(fs.existsSync(path.join(state.root, "runs"))).toBe(false);
       expect(launch).not.toHaveBeenCalled(); expect(spawnAgent).not.toHaveBeenCalled();
     } finally { launch.mockRestore(); }
   });
 
   it.each(["session", "durable"] as const)("round 5 F5 forwards allowed canonical alternate targets for %s admission", async residency => {
-    const state = setup([], [], undefined, { preparePiModel: prepareVisiblePiModel, agentsConfig: { deniedModels: ["cliproxyapi/gpt-6-astra"], budgetUsd: 0, veda: { ...DEFAULT_FABRIC_CONFIG.agents.veda, backend: "pi" } } });
+    const state = setup([], [], undefined, { preparePiModel: prepareVisiblePiModel, agentsConfig: { deniedModels: ["cliproxyapi/gpt-6-astra"], budgetUsd: 0,
+      modelPolicy: { requireReason: [] }, veda: { ...DEFAULT_FABRIC_CONFIG.agents.veda, backend: "pi" } } });
     const spawnAgent = vi.fn(async (request: { model?: string }) => ({ id: "allowed-durable", name: "allowed", runner: "veda", transport: "process", cwd: process.cwd(), status: "running", model: request.model }));
     (state.provider as unknown as { residency: ResidencyClient }).residency = { spawnAgent } as unknown as ResidencyClient;
     for (const [runner, model, canonical] of [["veda", "veda/cliproxyapi/gpt-6.1-sol", "cliproxyapi/gpt-6.1-sol"], ["claude", "claude/haiku", "claude-haiku-test"]] as const) {
@@ -304,7 +848,7 @@ describe("fleet model policy (#2490)", () => {
   });
 
   it.each(["veda", "claude"] as const)("round 5 F5 preserves no-policy %s aliases for durable submission", async runner => {
-    const state = setup([], [], undefined, { agentsConfig: { deniedModels: [], budgetUsd: 0 } });
+    const state = setup([], [], undefined, { agentsConfig: { deniedModels: [], budgetUsd: 0, modelPolicy: { requireReason: [] } } });
     const spawnAgent = vi.fn(async (request: { model?: string }) => ({ id: "legacy-durable", name: "legacy", runner, transport: "process", cwd: process.cwd(), status: "running", model: request.model }));
     (state.provider as unknown as { residency: ResidencyClient }).residency = { spawnAgent } as unknown as ResidencyClient;
     const catalog = vi.spyOn(state.agents, "claudeModels");
@@ -760,6 +1304,7 @@ const setup = (
   control?: FabricControlPlane,
   options?: {
     cwd?: string;
+    rootSessionCwd?: () => string | undefined;
     identity?: MeshIdentity;
     ownsRuntime?: boolean;
     hostId?: string;
@@ -781,15 +1326,26 @@ const setup = (
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-agents-provider-"));
   roots.push(root);
   const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
+  const rootSessionRecord = { cwd: boundRootCwd };
+  // Private exact-key v1 controls: #11864 is listed; #1 remains unlisted.
+  // Only fixtures created here receive the test-only root-metadata seam.
+  const configuredExceptionPath = options?.agentsConfig?.modelExceptionsPath;
+  const useExceptionFixture = !configuredExceptionPath || configuredExceptionPath === MODEL_EXCEPTIONS_PATH;
+  const modelExceptionsPath = useExceptionFixture ? path.join(root, "model-exceptions.json") : configuredExceptionPath;
+  if (useExceptionFixture) {
+    writeProviderGrants(modelExceptionsPath);
+    trustedExceptionFixturePaths.add(modelExceptionsPath);
+  }
   const agents = new AgentManager(
     options?.cwd ?? process.cwd(),
-    { ...DEFAULT_FABRIC_CONFIG.agents, ...options?.agentsConfig },
+    { ...DEFAULT_FABRIC_CONFIG.agents, ...options?.agentsConfig, modelExceptionsPath },
     {
       workerPath: options?.workerPath ?? path.resolve("tests/fixtures/fake-worker.mjs"),
       claudeBinary: path.resolve("tests/fixtures/fake-claude.mjs"),
       vedaBinary: path.resolve("tests/fixtures/fake-veda.mjs"),
       runRoot: path.join(root, "runs"),
       hostId: options?.hostId ?? options?.identity?.id ?? "session:test",
+      rootSessionCwd: options?.rootSessionCwd ?? (() => rootSessionRecord.cwd),
       ...(options?.preparePiModel ? { preparePiModel: options.preparePiModel } : {}),
       ...(options?.onBackgroundComplete ? { onBackgroundComplete: options.onBackgroundComplete } : {}),
       ...(options?.onResultConsumed ? { onResultConsumed: options.onResultConsumed } : {}),
@@ -864,7 +1420,7 @@ const setup = (
       runner: "pi",
       transport: "host",
       capabilities: ["steer", "followUp", "fabric"],
-      cwd: process.cwd(),
+      cwd: rootSessionRecord.cwd,
       sessionId: "test",
       startedAt: 1,
       updatedAt: 1,
@@ -959,18 +1515,21 @@ describe("configured task model precedence (#2890, #6062)", () => {
   }
 
   it.each(callers)("unconfigured model inherits %s caller via %s, not the remote Main", async (kind, action) => {
-    const config = normalizeFabricConfig({ agents: { thinking: "high" } });
+    const config = normalizeFabricConfig({ agents: {
+      thinking: "high",
+      modelPolicy: { fallbackModel: "cliproxyapi/gpt-6-luna", fallbackThinking: "high" },
+    } });
     const { provider, agents } = setup([], [], undefined, callerOptions(kind, config.agents));
     const child = await provider.invoke(action, { task: "review", transport: "process" }, parentContext) as AgentHandleInfo;
-    expect(child).toMatchObject({ model: opus, thinking: "xhigh" });
+    expect(child).toMatchObject({ model: "cliproxyapi/gpt-6-luna", thinking: "high" });
     if (action === "spawn") await agents.wait(child.id);
   });
 
   it.each(callers)("explicit model/effort beats configured defaults for %s caller via %s", async (kind, action) => {
     const config = normalizeFabricConfig({ agents: { model: sol, thinking: "high" } });
     const { provider, agents } = setup([], [], undefined, callerOptions(kind, config.agents));
-    const child = await provider.invoke(action, { task: "review", transport: "process", model: opus, thinking: "low" }, parentContext) as AgentHandleInfo;
-    expect(child).toMatchObject({ model: opus, thinking: "low" });
+    const child = await provider.invoke(action, { task: "review", transport: "process", model: opus, thinking: "low", opusReason: "#11864 explicit model exception" }, parentContext) as AgentHandleInfo;
+    expect(child).toMatchObject({ model: opus, thinking: "low", modelReason: "#11864 explicit model exception" });
     if (action === "spawn") await agents.wait(child.id);
   });
 
@@ -1391,11 +1950,7 @@ describe("#169 round 1 agents.remove cleanup routing", () => {
     const actor = await owner.create({ name: "resident obligation", instructions: "Work.", residency: "durable" });
     expect(passive.list().map((entry) => entry.id)).toContain(actor.id); // Main had the pre-removal view.
     const dir = path.join(actorRoots.project, actor.id);
-    const rm = fs.rmSync.bind(fs);
-    const failing = vi.spyOn(fs, "rmSync").mockImplementation((target, options) => {
-      if (target === dir) throw new Error("cleanup unavailable");
-      return rm(target, options);
-    });
+    const failing = failActorTreeRemoval(dir, () => { throw new Error("cleanup unavailable"); });
     try { await owner.remove(actor.id); } finally { failing.mockRestore(); }
     const removeActor = vi.fn((id: string) => owner.remove(id));
     const provider = new AgentsProvider(state.agents, passive, state.globalActors, state.mainAgent, state.participants,
@@ -1424,11 +1979,7 @@ describe("#169 round 1 agents.remove cleanup routing", () => {
       state.control, state.lifecycle, undefined, undefined, undefined, () => DEFAULT_FABRIC_CONFIG.models);
     const actor = await directory.create({ scope, name: "retry worker", instructions: "Work." });
     const dir = path.join(actorRoots[scope], actor.id);
-    const rm = fs.rmSync.bind(fs);
-    const failing = vi.spyOn(fs, "rmSync").mockImplementation((target, options) => {
-      if (target === dir) throw new Error("cleanup unavailable");
-      return rm(target, options);
-    });
+    const failing = failActorTreeRemoval(dir, () => { throw new Error("cleanup unavailable"); });
     try {
       await expect(provider.invoke("remove", { id: actor.id }, context)).resolves.toMatchObject({ removed: true, cleaned: false });
       // No participant/presence entry remains. agents.actors must still expose the stopped obligation.
@@ -2103,6 +2654,8 @@ afterEach(async () => {
   await Promise.all(controlPlanes.splice(0).map((control) => control.close()));
   await Promise.all(actorManagers.splice(0).map((manager) => manager.close()));
   await Promise.all(agentManagers.splice(0).map((manager) => manager.close()));
+  restoreAdmissionFixture?.();
+  restoreAdmissionFixture = undefined;
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
 
@@ -4243,7 +4796,7 @@ return { first, second, tail: "continued" };`,
   });
 
   it("enumerates Claude models and preserves runner on actors", async () => {
-    const { provider } = setup();
+    const { provider } = setup([], [], undefined, { agentsConfig: { modelPolicy: { requireReason: [] } } });
     const models = (await provider.invoke("models", { runner: "claude" }, context)) as Array<{
       runner: string;
       key: string;
@@ -4419,6 +4972,43 @@ describe("#2726 resident actor live read views", () => {
     expect(unknown.removal).toEqual(state.actor.removal);
     expect(unknown.inFlightRun).toBeUndefined();
     expect(unknown.queued).toBeUndefined();
+  });
+
+  it("uses a matching owning-root read view for its own activation and refuses other ids", async () => {
+    const state = await passiveState();
+    const identity = {
+      actorId: state.actor.id, name: state.actor.name, rootId: state.actor.rootId!,
+      ownershipToken: state.actor.ownershipToken!, instructionsDigest: state.actor.instructionsDigest!,
+      roleStamp: "(role reviewer.md 0123456789ab)",
+    };
+    vi.stubEnv("PI_FABRIC_ACTOR_SELF", JSON.stringify(identity));
+    vi.stubEnv("PI_FABRIC_ACTOR_ID", identity.actorId);
+    try {
+      const ownerStatus = { ...state.actor, status: "running" as const, model: "owner-fresh-model" };
+      const actorStatus = vi.fn(async () => ownerStatus);
+      (state.provider as unknown as { residency?: ResidencyClient }).residency = { actorStatus } as unknown as ResidencyClient;
+      state.setLive({ ...state.live, name: state.actor.name, rootId: identity.rootId,
+        ownerHostId: residentHostId(identity.rootId), ownerIdentityId: identity.rootId,
+        actorOwnershipToken: identity.ownershipToken, status: "running" });
+
+      await expect(state.provider.invoke("actorStatus", { id: identity.actorId }, context)).resolves.toMatchObject({
+        id: identity.actorId, rootId: identity.rootId, ownershipToken: identity.ownershipToken,
+        model: "owner-fresh-model", roleStamp: identity.roleStamp,
+      });
+      expect(actorStatus).toHaveBeenCalledWith(identity.actorId, undefined);
+      actorStatus.mockResolvedValueOnce({ ...ownerStatus, instructionsDigest: "d".repeat(64) });
+      const changedDefinition = await state.provider.invoke("actorStatus", { id: identity.actorId }, context) as FabricActorReadInfo;
+      expect(changedDefinition).toMatchObject({ id: identity.actorId, status: "unknown", instructionsDigest: identity.instructionsDigest });
+      expect(changedDefinition).not.toHaveProperty("model");
+      await expect(state.provider.invoke("actorStatus", { id: "another-actor" }, context))
+        .rejects.toThrow("Unknown Fabric actor: another-actor");
+      expect(actorStatus).toHaveBeenCalledTimes(2);
+
+      vi.stubEnv("PI_FABRIC_ACTOR_SELF", "not-json");
+      await expect(state.provider.invoke("actorStatus", { id: identity.actorId }, context))
+        .rejects.toThrow("Fabric actor activation identity is unavailable");
+      expect(actorStatus).toHaveBeenCalledTimes(2);
+    } finally { vi.unstubAllEnvs(); }
   });
 
   it("leaves owned local actors and global templates unchanged without reading a remote owner", async () => {
@@ -4652,7 +5242,7 @@ describe("AgentsProvider shared actor definitions", () => {
   it("members reports the resolved run binding, not the project default or owner overlay (#7682)", async () => {
     const state = setup();
     const actor = await state.actors.create({ name: "registry-member", instructions: "Observe.",
-      model: "anthropic/claude-opus-5-5", thinking: "medium" });
+      model: "anthropic/claude-opus-5-5", modelReason: "#11864 registry member", thinking: "medium" });
     const directory = new ParticipantDirectory(state.mesh, { enabled: true,
       hostId: state.identity.id, rootId: state.mainAgent.id, identity: state.identity });
     directory.registerSource(() => state.actors.listOwned(true).map(info =>
@@ -4960,10 +5550,12 @@ describe("AgentsProvider shared actor definitions", () => {
     const workerPath = path.resolve("tests/fixtures/fake-worker.mjs");
     const ownerAgents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
       workerPath,
+      rootSessionCwd: () => boundRootCwd,
       runRoot: path.join(root, "owner-runs"),
     });
     const peerAgents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
       workerPath,
+      rootSessionCwd: () => boundRootCwd,
       runRoot: path.join(root, "peer-runs"),
     });
     agentManagers.push(ownerAgents, peerAgents);
@@ -6398,13 +6990,14 @@ describe("AgentsProvider switchModel", () => {
     ).rejects.toThrow(/not available to this Pi session/);
   });
 
-  it("passes Claude and Veda model strings through unchanged", async () => {
-    const { provider, agents } = setup();
+  it("passes Claude and Veda model strings through unchanged with the reason-policy rollback", async () => {
+    // Opaque native strings are not grant keys; this compatibility control has no exception policy.
+    const { provider, agents } = setup([], [], undefined, { agentsConfig: { modelPolicy: { requireReason: [] } } });
     const spawn = vi.spyOn(agents, "spawn");
 
     await provider.invoke(
       "spawn",
-      { task: "Claude pass-through", runner: "claude", model: "private/claude-model" },
+      { task: "Claude pass-through", runner: "claude", model: "private/claude-model", modelReason: "Native Claude passthrough probe #11864" },
       modelContext(),
     );
     await provider.invoke(

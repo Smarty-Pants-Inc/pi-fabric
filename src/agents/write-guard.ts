@@ -98,7 +98,10 @@ export const writePolicyDenial = (
   } catch {
     // Unresolvable paths fail closed.
   }
-  return `Fabric write policy refuses ${toolName} outside writable roots; ${scope}`;
+  const actorHint = process.env.PI_FABRIC_ACTOR_ID || process.env.PI_FABRIC_ACTOR_NAME
+    ? "; write outside actor scratch refused; use the shell or a trusted helper for factory state"
+    : "";
+  return `Fabric write policy refuses ${toolName} outside writable roots; ${scope}${actorHint}`;
 };
 
 /** Child-side guard loaded by the worker with -e only when a policy is set. */

@@ -95,6 +95,49 @@ describe("actor state alarms (smarty-dev#9332)", () => {
     expect(s.alarms("actor-stopped", actor.id)).toHaveLength(2);
   }, 60_000);
 
+  it("a legacy stopped actor keeps one alarm episode across idle-exit registry rewrites", async () => {
+    const s = setup(true);
+    const actor = await s.actors.create({ name: "legacy-stop", instructions: "Run", responseMode: "directive", residency: "durable" });
+    s.clock.skew = -11 * MINUTE;
+    const stop = await s.actors.ask(actor.id, "STOP_DIRECTIVE");
+    expect(stop.action).toBe("stop");
+    const stopAt = stop.createdAt;
+    await s.actors.close();
+
+    const registryFile = path.join(s.root, "actors", "actors.json");
+    const registry = JSON.parse(fs.readFileSync(registryFile, "utf8")) as { actors: Array<Record<string, unknown>> };
+    const legacy = registry.actors.find(row => row.id === actor.id)!;
+    delete legacy.stoppedAt;
+    legacy.updatedAt = stopAt + 2 * MINUTE;
+    fs.writeFileSync(registryFile, JSON.stringify(registry));
+    s.clock.skew = 0;
+
+    const firstReload = new ActorManager("test", { id: "session:test", name: "main", kind: "main", sessionId: "test" },
+      s.mesh, { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, s.agents, () => {}, {
+        actorRoot: path.join(s.root, "actors"), persistent: true, retentionSweepMs: 20 });
+    closers.push(() => firstReload.close());
+    await waitFor(() => s.alarms("actor-stopped", actor.id).length === 1);
+    await waitFor(() => {
+      const saved = JSON.parse(fs.readFileSync(registryFile, "utf8")) as { actors: Array<Record<string, unknown>> };
+      return saved.actors.find(row => row.id === actor.id)?.stoppedAt === stopAt;
+    });
+
+    await firstReload.close(); // the idle-exit rewrite advances updatedAt but keeps the migrated episode
+    const rewritten = JSON.parse(fs.readFileSync(registryFile, "utf8")) as { actors: Array<Record<string, unknown>> };
+    const rewrittenActor = rewritten.actors.find(row => row.id === actor.id)!;
+    expect(rewrittenActor.stoppedAt).toBe(stopAt);
+    expect(rewrittenActor.updatedAt).toBeGreaterThan(stopAt);
+
+    s.clock.skew = 11 * MINUTE;
+    const secondReload = new ActorManager("test", { id: "session:test", name: "main", kind: "main", sessionId: "test" },
+      s.mesh, { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, s.agents, () => {}, {
+        actorRoot: path.join(s.root, "actors"), persistent: true, retentionSweepMs: 20 });
+    closers.push(() => secondReload.close());
+    await settle();
+    expect(s.alarms("actor-stopped", actor.id)).toHaveLength(1);
+    expect(secondReload.status(actor.id).status).toBe("stopped");
+  }, 60_000);
+
   it("actor-event-dropped: one dropped callerless event alarms at once; more drops in the episode do not; 6 h later it re-alarms; a completed run ends it", async () => {
     const s = setup();
     const actor = await s.actors.create({ name: "dropper", instructions: "Respond.", responseMode: "directive", coalesce: false });

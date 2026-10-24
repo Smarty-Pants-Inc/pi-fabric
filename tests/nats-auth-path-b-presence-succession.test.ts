@@ -17,6 +17,8 @@ import { openFabricTransport } from "../src/transport/index.js";
 import { NatsKvStore } from "../src/transport/nats/kv.js";
 import { runTransportAdmin } from "../src/transport/nats/admin.js";
 import { KvParticipantDirectory } from "../src/topology/participant-view.js";
+import { readHostLease } from "../src/topology/host-leases.js";
+import { readParticipantFile } from "../src/topology/participant-files.js";
 import type { FabricKvHostLease, FabricParticipantRecord } from "../src/topology/types.js";
 import type { FabricTransport, TransportKv, TransportKvEntry } from "../src/transport/types.js";
 import { createPathBHarness, PATH_B_MACHINES, resolveNatsBinary, type PathBHarness } from "./helpers/nats-cluster.js";
@@ -171,7 +173,7 @@ function hostLease(id: string, incarnation: string, now: number): FabricKvHostLe
     bootId: "tls-succession-fixture", updatedAt: now, expiresAt: now + 15_000 };
 }
 
-async function successionFixture(label: string, incarnation = `successor-${label}`) {
+async function successionFixture(label: string, incarnation = `successor-${label}`, kind: "root" | "actor" = "root") {
   const serial = ++successionFixtureNumber;
   const root = fs.mkdtempSync(path.join(os.tmpdir(), `presence-boundary-${label}-${serial}-`));
   const id = `session:presence-boundary-${label}-${serial}`;
@@ -179,9 +181,15 @@ async function successionFixture(label: string, incarnation = `successor-${label
     mesh: new MeshStore(path.join(root, "mesh"), 65_536, 1_000) });
   const presence = transport.kv("presence"), leases = transport.kv("leases");
   const now = Date.now();
-  const predecessor = participant(id, `predecessor-${label}-${serial}`, "predecessor", now - 2_000);
-  const successor = participant(id, incarnation, "successor", now);
-  const pkey = key("machine-a", "p", id), hkey = key("machine-a", "h", id);
+  const record = (epoch: string, name: string, at: number): FabricParticipantRecord => {
+    const base = participant(id, epoch, name, at);
+    if (kind === "root") return base;
+    const { sessionId: _sessionId, ...actor } = base;
+    return { ...actor, id: `${id}:actor`, kind, residency: "durable", parentId: id };
+  };
+  const predecessor = record(`predecessor-${label}-${serial}`, "predecessor", now - 2_000);
+  const successor = record(incarnation, "successor", now);
+  const pkey = key("machine-a", "p", successor.id), hkey = key("machine-a", "h", id);
   const predecessorOwner = `${id}#${predecessor.ownerIncarnation}`;
   const successorOwner = `${id}#${successor.ownerIncarnation}`;
   const oldRevision = await presence.put(pkey, predecessorOwner, predecessor, 0);
@@ -211,6 +219,30 @@ async function successionFixture(label: string, incarnation = `successor-${label
 // AgentCompletionInbox is created by initialize but remote completion followUps enter the
 // Main control dispatcher, not AgentCompletionInbox.enqueue. No fake receiver is substituted.
 describe.skipIf(!binary || process.platform !== "linux")("#14115 real authenticated NATS succession", () => {
+  it("projects this Path B Main's NATS presence and lease into the local store", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "presence-local-projection-"));
+    const sessionId = `projection-${createHash("sha256").update(String(Date.now())).digest("hex").slice(0, 12)}`;
+    const id = `session:${sessionId}`;
+    const config = configFor(root, "machine-a");
+    const owner = main(root, sessionId, "presence-projection");
+    const localKey = `topology/participants/${createHash("sha256").update(id).digest("hex")}`;
+    try {
+      await owner.runtime.initialize(owner.context, config);
+      const projectRoot = process.env.PI_FABRIC_PROJECT_ROOT ?? owner.context.cwd;
+      const meshRoot = process.env.PI_FABRIC_MESH_ROOT ?? path.resolve(projectRoot,
+        owner.runtime.config.mesh.root ?? path.join(".pi", "fabric", "mesh"));
+      await vi.waitFor(() => expect(readParticipantFile(meshRoot, localKey)).toMatchObject({
+        key: localKey, updatedBy: { id }, value: { id, rootId: id, kind: "root", ownerIdentityId: id },
+      }), { timeout: 5_000 });
+      await vi.waitFor(() => expect(readHostLease(meshRoot, id)).toMatchObject({
+        id, rootId: id, identityId: id, incarnationToken: expect.any(String),
+      }), { timeout: 5_000 });
+    } finally {
+      try { await owner.runtime.shutdown("exit"); }
+      finally { fs.rmSync(root, { recursive: true, force: true }); }
+    }
+  }, 20_000);
+
   it("stops and resumes the same native Main inside the presence TTL, then receives a real completion followUp within seconds", async () => {
     for (const name of Object.keys(process.env)) if (name.startsWith("PI_FABRIC_")) vi.stubEnv(name, undefined);
     vi.stubEnv("SMARTY_AGENT", undefined);
@@ -326,8 +358,8 @@ describe.skipIf(!binary || process.platform !== "linux")("#14115 real authentica
     } finally { await Promise.all(views.map(view => view.close())); await transport.close(); }
   }, 15_000);
 
-  it("rechecks a replaced lease after the succession CAS and restores the predecessor without deleting", async () => {
-    const f = await successionFixture("replacement");
+  it.each(["root", "actor"] as const)("rechecks a replaced lease after the %s succession CAS and restores the predecessor without deleting", async kind => {
+    const f = await successionFixture(`replacement-${kind}`, undefined, kind);
     const replacementIncarnation = "rightful-replacement";
     const replacementLease = hostLease(f.id, replacementIncarnation, Date.now());
     const replacementOwner = `${f.id}#${replacementIncarnation}`;
@@ -352,7 +384,7 @@ describe.skipIf(!binary || process.platform !== "linux")("#14115 real authentica
       expect(presencePuts[1]).toMatchObject({ owner: f.predecessorOwner, value: f.predecessor });
       expect(presencePuts[1]!.ifRevision).toBeGreaterThan(f.oldRevision);
       expect(deletes.filter(item => item.key === f.pkey)).toEqual([]);
-      expect(await routeEventually(f.observer, f.id, route => !route.live && route.ownerIncarnation === f.predecessor.ownerIncarnation))
+      expect(await routeEventually(f.observer, f.successor.id, route => !route.live && route.ownerIncarnation === f.predecessor.ownerIncarnation))
         .toMatchObject({ live: false, ownerIncarnation: f.predecessor.ownerIncarnation });
     } finally {
       f.leaseAbort.abort();
@@ -360,6 +392,38 @@ describe.skipIf(!binary || process.platform !== "linux")("#14115 real authentica
       await f.transport.close();
     }
   }, 25_000);
+
+  it("restores a durable actor with the same ID only after its predecessor lease expires in the broker", async () => {
+    const f = await successionFixture("resident-restore", undefined, "actor");
+    try {
+      // The old lease is genuinely present first; neither wall-clock metadata nor
+      // the successor's local live gate may authorize taking its actor presence.
+      await f.leases.put(f.hkey, f.predecessorOwner,
+        hostLease(f.id, f.predecessor.ownerIncarnation!, Date.now()), f.initialLeaseRevision);
+      expect(await routeEventually(f.observer, f.successor.id, route => route.live))
+        .toMatchObject({ ownerIncarnation: f.predecessor.ownerIncarnation });
+      const before = await f.presence.get(f.pkey);
+      await expect(f.view.publish(f.successor)).rejects.toBeDefined();
+      expect(await f.presence.get(f.pkey)).toEqual(before);
+      const expiry = armLeaseGone(f.leases, f.hkey);
+      await expiry.ready;
+      await expiry.gone;
+      expect(await f.leases.get(f.hkey)).toBeUndefined();
+      expect(await f.presence.get(f.pkey)).toEqual(before);
+      // Same stable resident host ID, exclusive successor lease, retained actor ID.
+      await f.leases.put(f.hkey, f.successorOwner, hostLease(f.id, f.successor.ownerIncarnation!, Date.now()), 0);
+      const receipt = await f.view.publish(f.successor);
+      expect(receipt.revision).toBeGreaterThan(f.oldRevision);
+      expect(await f.presence.get(f.pkey)).toMatchObject({ revision: receipt.revision, owner: f.successorOwner, value: f.successor });
+      expect(await routeEventually(f.observer, f.successor.id, route => route.live && route.ownerIncarnation === f.successor.ownerIncarnation))
+        .toMatchObject({ live: true, ownerIncarnation: f.successor.ownerIncarnation });
+      expect(deletes.filter(item => item.key === f.pkey)).toEqual([]);
+    } finally {
+      f.leaseAbort.abort();
+      await Promise.allSettled([f.view.close(), f.observer.close()]);
+      await f.transport.close();
+    }
+  }, 40_000);
 
   it("waits for the real 15-second lease expiry, then undoes the fenced succession CAS", async () => {
     const f = await successionFixture("expiry");

@@ -1,5 +1,5 @@
 import type { RecordEnvelope, RecordsOps } from "./store.js";
-import { detachedPreview } from "../core/preview.js";
+import { detachedPreview, SessionEntryCursor, type SessionEntryCursorManager } from "../core/preview.js";
 
 /**
  * A consumer's reconcile by processing cursor (C4), for a root session: the records addressed to
@@ -72,6 +72,48 @@ export const sessionHoldsRecords = (entries: readonly unknown[], ids: readonly s
 export const recordsInboxSession = (entries: readonly unknown[]): RecordsInboxSession => ({
   holdsBatch: (ids) => sessionHoldsRecords(entries, ids),
 });
+
+const RECORDS_LOOKBACK = 500;
+const recordsReceiptIds = (entry: unknown): readonly string[] | undefined => {
+  const row = entry && typeof entry === "object" ? entry as { type?: unknown; customType?: unknown; details?: { ids?: unknown } } : undefined;
+  if (row?.type !== "custom_message" || row.customType !== RECORDS_INBOX_CUSTOM_TYPE || !Array.isArray(row.details?.ids)) return undefined;
+  return row.details.ids.filter((id): id is string => typeof id === "string");
+};
+
+/**
+ * Branch-local records receipt window. The old sessionHoldsRecords contract has a 500-entry
+ * lookback, so retain only that exact window and its ids, not the entries or transcript bodies.
+ * The cursor is rederived from Pi's active leaf at session_start and advances by point lookups.
+ */
+export class RecordsInboxCursor {
+  #cursor = new SessionEntryCursor();
+  #window: Array<readonly string[] | undefined> = [];
+  #initialized = false;
+
+  reset(manager: SessionEntryCursorManager): void {
+    if (typeof manager.getLeafEntry !== "function" || typeof manager.getEntry !== "function") {
+      this.#window = [];
+      this.#initialized = false;
+      return;
+    }
+    const read = this.#cursor.reset(manager, RECORDS_LOOKBACK);
+    this.#window = read.entries.map(recordsReceiptIds);
+    this.#initialized = true;
+  }
+
+  session(manager: SessionEntryCursorManager): RecordsInboxSession {
+    if (typeof manager.getLeafEntry !== "function" || typeof manager.getEntry !== "function") {
+      return recordsInboxSession(manager.getEntries?.() ?? []);
+    }
+    if (!this.#initialized) this.reset(manager);
+    const read = this.#cursor.read(manager);
+    if (read.reset) this.#window = read.entries.map(recordsReceiptIds);
+    else if (read.entries.length) this.#window.push(...read.entries.map(recordsReceiptIds));
+    if (this.#window.length > RECORDS_LOOKBACK) this.#window.splice(0, this.#window.length - RECORDS_LOOKBACK);
+    const window = this.#window;
+    return { holdsBatch: (ids) => window.some((held) => held !== undefined && ids.every((id) => held.includes(id))) };
+  }
+}
 
 const escapeXml = (value: string): string => value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
 

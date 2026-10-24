@@ -42,6 +42,7 @@ export const normalizeAgentRunRequest = (
   const transport =
     args.transport === "auto" ||
     args.transport === "process" ||
+    args.transport === "sandbox" ||
     args.transport === "tmux" ||
     args.transport === "screen" ||
     args.transport === "localterm" ||
@@ -75,7 +76,9 @@ export const normalizeAgentRunRequest = (
   }
   const requires = normalizeAgentRequires(args.requires);
   const needs = normalizeAgentCapabilityTokens(args.needs);
-  const timeoutMs = typeof args.timeoutMs === "number" && Number.isFinite(args.timeoutMs) && args.timeoutMs > defaults.timeoutMs ? args.timeoutMs : undefined;
+  // Preserve explicit bounds, including ignored tiny values, for the manager's
+  // deadline policy and typed receipt. Unset still inherits its configured default.
+  const timeoutMs = typeof args.timeoutMs === "number" && Number.isFinite(args.timeoutMs) ? args.timeoutMs : undefined;
   const kernel = checkedKernel(args.kernel);
   const nice = parseAgentNice(args.nice);
   const bashIdleSeconds = args.bashIdleSeconds;
@@ -103,7 +106,8 @@ export const normalizeAgentRunRequest = (
       : inheritedModel
         ? { model: inheritedModel }
         : {}),
-    ...(typeof args.modelReason === "string" ? { modelReason: args.modelReason } : {}),
+    ...(typeof (args.modelReason ?? args.opusReason) === "string"
+      ? { modelReason: (args.modelReason ?? args.opusReason) as string } : {}),
     ...(typeof args.persona === "string" && args.persona.trim()
       ? { persona: args.persona.trim() }
       : {}),

@@ -18,6 +18,12 @@ store open. Before this, it was ignored, and a typo silently opened a different 
 | `sqlite`, `shadow` | `SqliteStateBackend`, `ShadowStateBackend` | non-local filesystem (R16), no `node:sqlite` (R19) |
 | `nats` | the backend a host prepared with `openNatsStateBackend` for that root (`src/mesh/state-backend-nats.ts`); otherwise throws `MeshStateBackendNotBuiltError` (`FABRIC_MESH_STATE_BACKEND_NOT_BUILT`) | none |
 
+`sqlite` initialises a fresh private root automatically when `state.json` is absent and
+`state.db` is missing or zero-length. It uses the existing fenced `create` path (epoch 1 plus
+the moved marker); concurrent openers re-check under `custody.lock`, then `.lock`. File-backend
+`state.json`, even an empty envelope or zero-length file, still requires import. A moved marker without
+its database still reports a lost database, and a nonempty database without its marker is still refused.
+
 `nats` never falls back to `file`. A host that wrote local state while its peers wrote the
 shared stream would split the mesh.
 
@@ -295,3 +301,7 @@ this reason. An R3 cluster needs these TCP ports opened on `tailscale0` only:
 
 That ACL change needs the product owner's yes (smarty-dev#7504 c6095415747). Until then, tests run
 on one host, or across hosts through `ssh -L` tunnels.
+
+### NATS session channels
+
+See the [NATS session-channel guide](session-channel.md) for the in-process Pi API, request/reply and event wire format, replay-cache behavior, presence discovery, and alpha trust boundary.

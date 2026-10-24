@@ -1,10 +1,9 @@
 ---
 name: fabric-exec
 description: >-
-  Troubleshooting and advanced API reference for `fabric_exec` programs,
-  the TypeScript kernel, dynamic providers, agents, and schema recovery. Routine `pi.*`
-  coding calls are documented by ambient guidance; load this skill only after
-  an argument-shape error or when an advanced surface needs exact contracts.
+  On-demand TypeScript API and workflow reference for `fabric_exec`.
+  Load when authoring nontrivial programs, checking exact tool/provider contracts,
+  batching work, or recovering from argument, payload, or runtime errors.
 ---
 
 # fabric_exec — core reference
@@ -13,7 +12,19 @@ One program in the **TypeScript kernel**. Write TypeScript only in `code`. There
 
 QuickJS is isolated by default and receives static type checking; native Node/Bun is an explicit trusted-code escape hatch. Do not switch interpreters through shell commands to perform Fabric orchestration. Prefer one compact return value. Explicit log output is also included in the bounded tool result, so do not print raw intermediate payloads.
 
-## `pi` core tools (full code mode only)
+## Program workflow
+
+In full code mode and Schema enforce, `pi` and `extensions` are available inside `code`. In orchestration-only mode they are unavailable: read, search, edit, write, and run shell commands with Pi's native tools directly. Batch only Fabric operations in that mode. Schema enforce keeps its host mutation/effect gates even though `pi` exists.
+
+Batch independent, bounded operations in one program with `Promise.all`; await dependent steps sequentially. Keep search→read and edit→verify sequential when the first output decides the next action. Coalesce independent replacements from one file snapshot into one `pi.edit({path, edits:[...]})`; use `all:true` only for intentional repeated exact anchors. Return decisions, failures, and compact evidence rather than raw logs or unused intermediate values. For independent launches, prefer `Promise.allSettled` and preserve successful handles when another launch fails.
+
+For coding tasks, keep an acceptance ledger in reasoning or concise progress notes, not a separate tool call: define concrete checks, trace the execution path before editing, implement end to end, then run targeted tests and direct behavioral probes. Mechanically confirm requested public symbols, registrations, and configuration entries. Use the smallest checks that cover the ledger; escalate for failures or cross-cutting risk. Inspect failures and iterate instead of rerunning unchanged passing checks. A build alone is not completion.
+
+Use `display.name` and objective `display.description`; Fabric pairs them with verified outcomes in deterministic compaction. In a Main, a `fabric_exec` program ends after 10 min and `agents.run/wait` return after 60 s; spawned agents keep running and report back. A timed-out observation does not cancel the underlying work.
+
+QuickJS has no host globals: `process`, `fetch`, `btoa`/`atob`, `TextEncoder`/`TextDecoder`, `crypto`, `Buffer`, `URL`/`URLSearchParams`, `structuredClone`, `require`, `Bun`, or `Deno`. For environment, network, encoding, or hashing, use a shell command with `pi.bash` in full code mode or the native shell tool outside Fabric in orchestration-only mode. For data, use `JSON`, `String`, and `Array` builtins. The longer mode-aware recovery hint is returned only after a matching type or runtime error.
+
+## `pi` core tools (full code mode or Schema enforce)
 `pi.<tool>(arg)` — single arg: bare string (primary field) or options object, or a two-arg `(primary, options)` merge for the string-primary tools (`read`/`bash`/`powershell`/`ls`/`grep`/`find`): `pi.read('index.ts', { limit: 120 })` becomes `{ path: 'index.ts', limit: 120 }`, the positional string winning the primary field on conflict; a non-object second arg on those is still a type error. Positional tuple calls are accepted for `grep`/`find` (`pattern, path, limit`), `write` (`path, content`), and `edit` (`path, oldText, newText`).
 
 | Tool | Form | Returns |
@@ -37,7 +48,7 @@ Opt-in `monitor:{delivery:'wake',match:'literal',timeoutMs:300000,intervalMs:500
 
 Aliases are normalized to canonical fields before host validation. Command aliases include `cmd`/`shell`/`cmdline`/`script`/`commandLine`; pattern aliases include `query`/`regex`/`search` plus `q`/`expression`/`text` for grep and `name`/`filename`/`glob`/`include` for find. Path aliases include `file`, `file_path`, camel-case path variants, `dir`/`folder`/`directory`, and target-file variants. Edit text accepts `old`/`from`/`old_string`-style and `new`/`to`/`replacement`/`new_string`-style spellings, including inside `edits`; write content accepts `contents`/`body`/`text`/`data`/`fileContent`. `ic`/`caseInsensitive`→`ignoreCase`, `globPattern`→`glob`, `ctx`→`context`, `max`→`limit`, and `start`→`offset`.
 
-Shell `timeout` is in seconds; `timeoutMs` is converted from milliseconds. Numeric strings in `limit`, `timeout`, `offset`, and `context` coerce to numbers. `null`/`undefined` is omitted only for known optional fields; required fields remain invalid so authoritative host validation still reports them. Canonical fields win when both canonical and alias spellings are present. Unknown keys still fail the excess-property type check.
+For tests/probes whose nonzero exit is evidence, use `settle:true` and inspect `ok`, `output`, and `exitCode`; timeout/cancellation still reject. Set a known long suite's shell `timeout` once rather than retrying timed-out work. Shell `timeout` is in seconds; `timeoutMs` is converted from milliseconds. Numeric strings in `limit`, `timeout`, `offset`, and `context` coerce to numbers. `null`/`undefined` is omitted only for known optional fields; required fields remain invalid so authoritative host validation still reports them. Canonical fields win when both canonical and alias spellings are present. Unknown keys still fail the excess-property type check.
 
 `bash`/`powershell`/`edit`/`write` always resolve an envelope `{ ok, output, details }`, never a bare string, and the executor guards those envelopes: a string method or iteration applied to the envelope itself (`r.trim()`, `for (const line of r)`) throws a TypeError naming the fix (`.output`) instead of a context-free "not a function".
 
@@ -45,7 +56,7 @@ A captured extension that registers an exact core name may provide a compatible 
 
 ## Read economy
 
-Search before reading. Run `pi.grep`/`pi.find` first, then `pi.read({ path, offset, limit })` the matching range instead of unbounded whole-file reads:
+Search before reading. Run `pi.grep`/`pi.find` first, then `pi.read({ path, offset, limit })` the matching range instead of unbounded whole-file reads. Escape regex metacharacters or use `literal:true` for exact punctuated text. Keep fan-out search limits small and widen only on misses:
 
 ```ts
 // Locate the symbol, then read only the window around the hit.
@@ -55,7 +66,7 @@ const window = await pi.read({ path: "src/engine.ts", offset: 120, limit: 80 });
 
 An unbounded `pi.read('/x')` returns at most 2000 lines or 50KB (whichever is hit first); truncated output ends with a `[Showing lines a-b of N. Use offset=n to continue.]` notice — continue with `offset` only when you truly need the full file. Reserve whole-file reads for small files you will use in full (configs, tests or files you are about to edit, sources under a few hundred lines). Batching several large whole-file reads into one program inflates the single tool result, and that enlarged result stays in every later turn's context.
 
-Keep multiline or syntax-heavy payloads out of `code`: pass them through `payloads` and read the exact matching key from `π`. For example, `payloads: { content: text }` is read as `π.content`; do not invent a different reference such as `π.task`. Every `π.key` must exist in the same call's top-level `payloads` map. TypeScript still parses template-literal contents, including shell heredocs. The legacy `strings` argument is accepted as an alias.
+Keep multiline or syntax-heavy payloads out of `code`: pass them through `payloads` and read the exact matching key from `π`. For example, `payloads: { content: text }` is read as `π.content`; do not invent a different reference such as `π.task`. Every `π.key` must exist in the same call's top-level `payloads` map. Payload values are literal strings, not file loaders or placeholders: read files with native tools first; `@/path`, `file://` and bare `__TOKEN__` values are rejected. TypeScript still parses template-literal contents, including shell heredocs. The legacy `strings` argument is accepted as an alias.
 
 ## First-class provider calls
 Use direct proxies when the action is known. Parallelize only independent calls: provider effect footprints record conflicts for overlapping or unknown non-commutative resources, and Fabric does not silently reorder them. No-argument actions such as `schema.status()`, `state.get()`, and `compact.status()` take no options object. Provider calls still cross the same registry validation, approval, audit, timeout, and cancellation path as generic calls.
@@ -146,10 +157,18 @@ The guest TypeScript declarations contain the complete argument and return contr
 ## `tools` — discovery & generic calls
 Refs are namespaced (`pi.grep`, `extensions.<tool>`, `mcp.<server>.<tool>`, `schema.<action>`, `components.<action>`); bare names are rejected. `tools.providers()`→`[{name,description}]` · `tools.catalog({provider?,limit?})`→current provider/action head tree (navigation metadata, not session evidence) · `tools.search({query,limit?,searchMode?})`→`FabricAction[]` or, with `searchMode:"semantic"` (opt-in in /fabric settings → MCP), `{kind:"pi-fabric.action-search",actions,backend}` · `tools.describe({ref})`→full `FabricAction` (read `inputSchema` first) · `tools.call({ref,args?})` · `tools.list({provider?,namespace?,query?,limit?})` · `tools.models()`→Pi `[{provider,id,name,key}]`; `agents.models({runner:"claude"})`→Claude Code runtime models with canonical `claude/<value>` keys. Use `tools.call()` for refs discovered or computed at runtime, or names that cannot use property access—not as the default for known actions. In the default additive profile, nonconflicting `tools.<name>` members and `nativeTools.<name>` call native Pi tools. Native results differ from Fabric: schema-backed structured output (including structured errors), native bash `exit_code` without nonzero rejection, text for unstructured tools. `pi.*`, `mcp.*`, and `extensions.*` keep the contracts above. `fabric.tools` always provides Fabric discovery. With `executor.codemodeProfile: "native"`, `tools` is exclusively native, including colliding names; write JavaScript async function bodies without TypeScript-only syntax. Native globals return callable identifiers (`ALL_TOOLS`, `searchTools`), strings (`describeTool`), and namespace tool-name arrays. In additive mode those globals keep Fabric shapes; use `nativeDiscovery` for native discovery in either profile. Native mode opts into Pi's `codemode-store` entries; additive mode keeps Fabric's separate store. See [codemode compatibility](../../../docs/codemode-parity.md).
 
+The native `models` namespace is also available as `tools.models` in the additive profile (`fabric.tools.models` in native profile); `tools.models()` keeps legacy model listing in additive mode. Use `models.getAvailableOfType('classifier')` or `'image'`, then `models.classify(model,{state,questions})` or `models.generateImages(model,{input})`. Check native `stopReason`/`errorMessage`; classifier yes/no questions use `type:'bool'` and return `probability`.
+
+`state.*` logs transitions rather than storing arbitrary application values. Keep your own values in files or return them; use `mesh.put`/`mesh.get` only for small values another agent needs to read.
+
 ## Error recovery: read, describe, retry
 Read the line-numbered error → `await tools.describe({ref})` for the schema → match `inputSchema`, rerun (don't guess). Common mistakes: bare ref (`grep`→`pi.grep`); a non-object second arg on `read`/`bash`/`powershell`/`ls` (`(primary, optionsObject)` already merges on the string-primary tools; positional tuples exist only for `grep`/`find`/`write`/`edit`).
 
 ## Jev judgments and persistent programs
+
+Prefer existing CLIs and deterministic code for deterministic work: omit `jev.evaluate` and set `maxEvaluations:0` (host auto approvals remain independent). Use judgments only for explicit authorized batched questions. Code owns commands; never execute a model answer as shell source. `tasks.wait/watch` await bounded task receipts or monitor batches without polling/inference; prefer UI-only monitors when Main need not wake. Browser/macOS tools need no Fabric bridge.
+
+Inspect terminal `state` and `result`/`error`, not just a launch ID. Jev programs and detached tasks are session-owned, not restart-durable. `jev.status/stop` control programs; `tasks.stop` separately stops detached tasks. Observation timeout/cancellation does not cancel the task: retain its ID and a finite process deadline. For Main-turn advisors, spawn with `observe`, await `program.nextEvent()` without polling, and opt into bounded context fields. `program.advise` needs `jev.advise` and explicit delivery (default record-only). Return the observer ID without waiting in Main; Escape/Main abort cancels observers.
 
 `jev.evaluate` supplies typed semantic judgments. `jev.run`/`jev.spawn` execute one TypeScript artifact with schemas, limits, and exact `requires`; local state persists across loop iterations without a reasoning-model turn per tick. Credentials stay host-side: `/login jev`/`TYPESAFE_API_KEY` for direct aliases, the existing openrouter credential for `typesafe/…` ids, the existing `vercel-ai-gateway` credential for `typesafe-ai/…` ids, or a trusted credential command; `jev.status()` never retrieves a key. Jev is unavailable in Schema enforce and managed hosts.
 
@@ -170,4 +189,4 @@ Agent requests and persistent actors accept `runner: "pi-durable" | "pi" | "clau
 
 For Pi model selection, copy `key` from `agents.models({ runner: "pi" })`, reuse a successful handle's `model`, or use a configured alias. Never infer a model's version from an agent name or another model's version. Exact provider/model matches win; near-miss IDs resolve to the closest available model on that same provider. Check the returned handle's canonical `model`. Unknown providers and unrelated names still fail. For independent launches, await `Promise.allSettled` and inspect every result: an uncaught `Promise.all` rejection ends the program and can abort still-pending siblings. Preserve successful handles when retrying failures.
 
-Omit `timeoutMs` for agents and actors unless requesting longer than the configured `agents.timeoutMs` (24 hours by default, the policy ceiling). Per-call values below the configured default are ignored.
+Omit `timeoutMs` to keep `agents.timeoutMs` (24 hours by default, also the ceiling). For one-shot lane/audit timeboxes, an explicit value of at least `300000` ms (5 minutes) may shorten that default and hard-stops the owned native process tree with `timed_out`, preserving partial output and write receipts. Smaller shortenings are ignored to protect real work from tiny model-chosen budgets; the handle/result carries a typed `timeoutNote` (`AGENT_TIMEOUT_BELOW_SHORTENING_FLOOR`). Persistent actor overrides still only extend their default.

@@ -12,6 +12,7 @@ import { canonicalResidentWakeConfig, residentUnacknowledgedDeliveries, Resident
   residentWakeIndexPath, RESIDENT_WAKE_INDEX_MAX_ROOTS, RESIDENT_WAKE_RETRY_SCAN_MAX_PAGES,
   RESIDENT_WAKE_RETRY_SCAN_PAGE_ENTRIES } from "../src/residency/wake-index.js";
 import * as wake from "../src/residency/wake.js";
+import { writeHostLease } from "../src/topology/host-leases.js";
 
 const from = { id: "publisher", name: "publisher", kind: "main" as const };
 const fixture = (count: number, canWakeResidents?: () => boolean) => {
@@ -31,8 +32,14 @@ const fixture = (count: number, canWakeResidents?: () => boolean) => {
   const close = () => { vi.restoreAllMocks(); mesh.closeState(); fs.rmSync(root, { recursive: true, force: true }); };
   return { root, mesh, residents, close };
 };
+// Backoff/admission checks need a live originating Main: a dead Main's exact
+// restart-config mismatch now has a terminal disposition instead of retry debt.
+const keepRootMainsLive = (f: ReturnType<typeof fixture>) => {
+  for (const config of f.residents) writeHostLease(f.mesh.root, { id: config.rootId, rootId: config.rootId,
+    identityId: config.rootId, updatedAt: Date.now(), expiresAt: Date.now() + 86_400_000 });
+};
 const failureAt = (root: string) => wake.readWakeJson<{
-  delivery: { id: string; sequence: number }; error: string; failedAt: number; nextRetryAt: number;
+  delivery: { id: string; sequence: number }; error: string; failedAt: number; nextRetryAt: number; claimId?: string;
 }>(path.join(root, "wake-failure.json"))!;
 const maintenance = (mesh: MeshStore, launch: (file: string, config: ResidentHostConfig) => Promise<void>, now?: number) => {
   const retry = (wake as typeof wake & { retryResidentWakes:
@@ -142,9 +149,10 @@ describe("publication wake isolation and maintenance backoff", () => {
     } finally { f.close(); }
   });
 
-  it("round3 page cursor reaches all 5000 pinned roots with bounded custody work", async () => {
+  it("round3 page cursor reaches all 5000 pinned roots with bounded discovery and keyed reads", async () => {
     const f = fixture(5_000, () => false);
     const overflow = path.join(f.mesh.root, "wake-overflow");
+    const residency = path.join(f.mesh.root, "residency");
     fs.mkdirSync(overflow, { recursive: true });
     const now = Date.now();
     for (const [n, config] of f.residents.entries()) {
@@ -156,32 +164,58 @@ describe("publication wake isolation and maintenance backoff", () => {
         format: 1, delivery, nextRetryAt: now + 86_400_000,
       }));
     }
-    const visited = new Set<string>();
-    const discoveryReads: number[] = [], claimReads: number[] = [], heldMs: number[] = [];
-    let transaction: { discovery: boolean; reads: number } | undefined;
-    let calls = 0;
+    const discoveredRoots = new Set<string>(), observedRoots = new Set<string>();
+    const openedDirectories: string[] = [];
+    const discoveryEntries: number[] = [], claimReads: number[] = [], heldMs: number[] = [];
+    const discoveryPayloadReadsBySweep: string[][] = [], keyedReadsBySweep: string[][] = [];
+    const pendingDiscoveryFiles = new Set<string>();
+    let currentDiscoveryEntries = 0;
+    let currentSweepDiscoveryPayloadReads: string[] | undefined;
+    let currentSweepKeyedReads: string[] | undefined;
+    let custodyReads: Set<string> | undefined;
+    const opendir = fs.opendirSync;
+    vi.spyOn(fs, "opendirSync").mockImplementation(((...args: unknown[]) => {
+      const directory = String(args[0]);
+      openedDirectories.push(directory);
+      const dir = (opendir as (...args: unknown[]) => fs.Dir)(...args);
+      if (path.resolve(directory) !== path.resolve(overflow)) return dir;
+      const read = dir.readSync.bind(dir);
+      Object.defineProperty(dir, "readSync", { configurable: true, value: () => {
+        const entry = read();
+        if (entry) {
+          currentDiscoveryEntries++;
+          if (entry.name.endsWith(".json")) {
+            discoveredRoots.add(path.join(residency, path.basename(entry.name, ".json")));
+            pendingDiscoveryFiles.add(path.join(overflow, entry.name));
+          }
+        }
+        return entry;
+      } });
+      return dir;
+    }) as typeof fs.opendirSync);
     const exclusive = f.mesh.exclusive.bind(f.mesh);
-    vi.spyOn(f.mesh, "exclusive").mockImplementation(async <T>(operation: () => T, timeout?: number): Promise<T> => {
-      const discovery = calls++ === 0;
-      return exclusive(() => {
-        transaction = { discovery, reads: 0 };
+    vi.spyOn(f.mesh, "exclusive").mockImplementation(async <T>(operation: () => T, timeout?: number): Promise<T> =>
+      exclusive(() => {
+        const reads = new Set<string>();
+        custodyReads = reads;
         const start = performance.now();
         try { return operation(); }
         finally {
           heldMs.push(performance.now() - start);
-          (discovery ? discoveryReads : claimReads).push(transaction.reads);
-          transaction = undefined;
+          claimReads.push(reads.size);
+          custodyReads = undefined;
         }
-      }, timeout);
-    });
+      }, timeout));
     const open = fs.openSync;
     vi.spyOn(fs, "openSync").mockImplementation(((file: fs.PathLike, ...args: unknown[]) => {
-      if (transaction && path.dirname(String(file)) === overflow) {
-        transaction.reads++;
-        const limit = transaction.discovery ? (RESIDENT_WAKE_RETRY_SCAN_MAX_PAGES ?? 1) *
-          (RESIDENT_WAKE_RETRY_SCAN_PAGE_ENTRIES ?? RESIDENT_WAKE_INDEX_MAX_ROOTS) : 1;
-        if (transaction.reads > limit) throw new Error(`retry custody exceeded ${limit} overflow files (observed ${transaction.reads})`);
-        if (!transaction.discovery) visited.add(path.basename(String(file)));
+      const filename = String(file);
+      if (path.dirname(filename) === overflow) {
+        if (pendingDiscoveryFiles.delete(filename)) currentSweepDiscoveryPayloadReads?.push(filename);
+        else {
+          currentSweepKeyedReads?.push(filename);
+          if (custodyReads) custodyReads.add(filename);
+          observedRoots.add(path.join(residency, path.basename(filename, ".json")));
+        }
       }
       return (open as (...args: unknown[]) => number)(file, ...args);
     }) as typeof fs.openSync);
@@ -189,18 +223,40 @@ describe("publication wake isolation and maintenance backoff", () => {
     try {
       const sweeps = Math.ceil(f.residents.length / (wake.RESIDENT_WAKE_RETRY_MAX_CANDIDATES ?? RESIDENT_WAKE_INDEX_MAX_ROOTS));
       for (let sweep = 0; sweep < sweeps; sweep++) {
-        calls = 0;
+        currentDiscoveryEntries = 0;
+        currentSweepDiscoveryPayloadReads = [];
+        currentSweepKeyedReads = [];
         await maintenance(f.mesh, launch, now);
+        discoveryEntries.push(currentDiscoveryEntries);
+        discoveryPayloadReadsBySweep.push(currentSweepDiscoveryPayloadReads);
+        keyedReadsBySweep.push(currentSweepKeyedReads);
+        currentSweepDiscoveryPayloadReads = undefined;
+        currentSweepKeyedReads = undefined;
       }
-      expect(visited.size).toBe(5_000); // First pages remain pinned throughout; later pages cannot starve.
-      expect(Math.max(...discoveryReads)).toBeLessThanOrEqual((RESIDENT_WAKE_RETRY_SCAN_MAX_PAGES ?? 1) *
-        (RESIDENT_WAKE_RETRY_SCAN_PAGE_ENTRIES ?? RESIDENT_WAKE_INDEX_MAX_ROOTS));
-      expect(Math.max(...claimReads)).toBeLessThanOrEqual(1);
-      expect(launch).not.toHaveBeenCalled(); // Backoff is still authoritative.
+      const pageLimit = (RESIDENT_WAKE_RETRY_SCAN_MAX_PAGES ?? 1) *
+        (RESIDENT_WAKE_RETRY_SCAN_PAGE_ENTRIES ?? RESIDENT_WAKE_INDEX_MAX_ROOTS);
+      expect(sweeps).toBe(40);
+      expect(openedDirectories).toContain(overflow);
+      expect(discoveredRoots.size).toBe(5_000); // Every overflow page advances although first-page roots remain pinned.
+      expect(observedRoots.size).toBe(5_000); // Each candidate gets a separate keyed native read after discovery.
+      expect(discoveryEntries).toHaveLength(sweeps);
+      expect(discoveryEntries.reduce((sum, count) => sum + count, 0)).toBe(5_000);
+      expect(Math.max(...discoveryEntries)).toBeLessThanOrEqual(pageLimit);
+      expect(discoveryPayloadReadsBySweep).toHaveLength(sweeps);
+      expect(discoveryPayloadReadsBySweep.reduce((sum, reads) => sum + reads.length, 0)).toBe(5_000);
+      expect(Math.max(...discoveryPayloadReadsBySweep.map(reads => reads.length))).toBeLessThanOrEqual(pageLimit);
+      for (const reads of discoveryPayloadReadsBySweep) expect(new Set(reads).size).toBe(reads.length);
+      expect(keyedReadsBySweep).toHaveLength(sweeps);
+      expect(Math.max(...keyedReadsBySweep.map(reads => reads.length))).toBeLessThanOrEqual(RESIDENT_WAKE_INDEX_MAX_ROOTS);
+      for (const reads of keyedReadsBySweep) expect(new Set(reads).size).toBe(reads.length);
+      expect(Math.max(0, ...claimReads)).toBeLessThanOrEqual(1); // Each native claim/custody callback reads at most one keyed root.
+      expect(launch).not.toHaveBeenCalled(); // Backoff remains authoritative; bounded observation does not claim or launch.
       expect(residentUnacknowledgedDeliveries(f.mesh.root).size).toBe(5_000);
-      console.info(JSON.stringify({ probe: "5000-root-custody", sweeps, rootsVisited: visited.size,
-        maxDiscoveryFiles: Math.max(...discoveryReads), maxClaimFiles: Math.max(...claimReads),
-        totalHeldMs: heldMs.reduce((sum, ms) => sum + ms, 0), maxHeldMs: Math.max(...heldMs) }));
+      console.info(JSON.stringify({ probe: "5000-root-discovery-and-keyed-reads", sweeps, rootsDiscovered: discoveredRoots.size,
+        rootsObserved: observedRoots.size, maxDiscoveryEntries: Math.max(...discoveryEntries),
+        maxKeyedReadsPerSweep: Math.max(...keyedReadsBySweep.map(reads => reads.length)),
+        maxClaimFiles: Math.max(0, ...claimReads), totalHeldMs: heldMs.reduce((sum, ms) => sum + ms, 0),
+        maxHeldMs: Math.max(0, ...heldMs) }));
     } finally { f.close(); }
   }, 30_000);
 
@@ -276,11 +332,12 @@ describe("publication wake isolation and maintenance backoff", () => {
       if (staysOpen) expect(await direct).toBe(true);
       else await expect(direct).rejects.toThrow("admission closed");
       expect(fs.existsSync(wake.residentWakeRequestPath(config.residencyRoot))).toBe(staysOpen);
-      expect(exclusive).toHaveBeenCalledOnce();
+      expect(exclusive).toHaveBeenCalledTimes(staysOpen ? 1 : 0);
     } finally { release?.(); f.close(); }
   });
   it.each([1, 3, 10])("unrelated publication does not await %i ConfigMismatch-style failed roots", async count => {
     const f = fixture(count);
+    keepRootMainsLive(f);
     let slow = false;
     const launch = vi.fn(async (_file: string, config: ResidentHostConfig) => {
       // Same IPC outcome as a native launcher refusing its restart config. Slow
@@ -312,8 +369,74 @@ describe("publication wake isolation and maintenance backoff", () => {
     } finally { f.close(); }
   });
 
+  it("a nonmatching publication does not wait for pending-index custody", async () => {
+    let allowed = false;
+    const f = fixture(2, () => allowed);
+    let publishing: ReturnType<MeshStore["publish"]> | undefined;
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    let release!: () => void;
+    let markExclusiveStarted!: () => void;
+    const exclusiveStarted = new Promise<void>(resolve => { markExclusiveStarted = resolve; });
+    const exclusiveGate = new Promise<void>(resolve => { release = resolve; });
+    const exclusive = f.mesh.exclusive.bind(f.mesh);
+    vi.spyOn(f.mesh, "exclusive").mockImplementation(async <T>(operation: () => T, timeout?: number): Promise<T> => {
+      markExclusiveStarted();
+      await exclusiveGate;
+      return exclusive(operation, timeout);
+    });
+    try {
+      // Seed real pending work without launching; only the post-append
+      // dispatcher exclusive is gated, never custody needed by the append.
+      const matching = await f.mesh.publish({ topic: "stuck.delivery", from });
+      const pendingBefore = residentUnacknowledgedDeliveries(f.mesh.root);
+      expect(pendingBefore.size).toBe(2);
+      for (const delivery of pendingBefore.values()) expect(delivery).toMatchObject({ id: matching.id, sequence: matching.sequence });
+      const indexBefore = fs.readFileSync(residentWakeIndexPath(f.mesh.root), "utf8");
+      allowed = true;
+      publishing = f.mesh.publish({ topic: "unrelated.control", from });
+      const outcome = await Promise.race([
+        publishing.then(() => "published" as const),
+        exclusiveStarted.then(() => "blocked-on-exclusive" as const),
+        new Promise<"timed-out">(resolve => { deadline = setTimeout(() => resolve("timed-out"), 1_000); }),
+      ]);
+      expect(f.mesh.read().at(-1)).toMatchObject({ topic: "unrelated.control", sequence: matching.sequence + 1 });
+      expect(outcome).toBe("published");
+      const unrelated = await publishing;
+      expect(f.mesh.read().at(-1)?.id).toBe(unrelated.id);
+      expect(fs.readFileSync(residentWakeIndexPath(f.mesh.root), "utf8")).toBe(indexBefore);
+      expect(residentUnacknowledgedDeliveries(f.mesh.root)).toEqual(pendingBefore);
+      release();
+      await maintenance(f.mesh, async () => {});
+      expect(residentUnacknowledgedDeliveries(f.mesh.root).size).toBe(0);
+      for (const config of f.residents) expect(wake.readWakeJson<{ id: string }>(
+        wake.residentWakeRequestPath(config.residencyRoot))?.id).toBe(matching.id);
+    } finally {
+      if (deadline) clearTimeout(deadline);
+      release?.();
+      try { await publishing; } finally { f.close(); }
+    }
+  });
+
+  it("a malformed retained actor route does not suppress another matching resident", async () => {
+    const f = fixture(2, () => false);
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const event = await f.mesh.publish({ topic: "stuck.delivery", from });
+      // Metadata can change after the real append, before its dispatcher runs.
+      const bad = f.residents[0]!.residencyRoot, good = f.residents[1]!.residencyRoot;
+      const file = path.join(bad, "wake-routes.json");
+      fs.writeFileSync(file, JSON.stringify({ ...JSON.parse(fs.readFileSync(file, "utf8")), actors: [null] }));
+      await wake.wakeResidentActors(f.mesh, [event], async () => {});
+      expect(wake.readWakeJson<{ id: string }>(wake.residentWakeRequestPath(good))?.id).toBe(event.id);
+      const pending = residentUnacknowledgedDeliveries(f.mesh.root);
+      expect(pending.get(bad)?.id).toBe(event.id);
+      expect(pending.has(good)).toBe(false);
+    } finally { f.close(); }
+  });
+
   it("a matching publication still waits for its own wake, even during retry backoff", async () => {
     const f = fixture(1);
+    keepRootMainsLive(f);
     let finish!: () => void;
     let started!: () => void;
     const entered = new Promise<void>(resolve => { started = resolve; });
@@ -343,6 +466,7 @@ describe("publication wake isolation and maintenance backoff", () => {
   it("the existing ActorManager retention interval retries without bypassing the store wake gate", async () => {
     let allowed = true;
     const f = fixture(1, () => allowed);
+    keepRootMainsLive(f);
     const config = f.residents[0]!;
     const configFile = path.join(config.residencyRoot, "config.json");
     const saved = fs.readFileSync(configFile, "utf8");
@@ -382,24 +506,38 @@ describe("publication wake isolation and maintenance backoff", () => {
       expect(launch).not.toHaveBeenCalled();
       allowed = true;
       await vi.waitFor(() => expect(launch).toHaveBeenCalledOnce(), { timeout: 5_000, interval: 10 });
-      expect(fs.existsSync(path.join(config.residencyRoot, "wake-failure.json"))).toBe(false);
+      await vi.waitFor(() => {
+        expect(fs.existsSync(path.join(config.residencyRoot, "wake-failure.json"))).toBe(false);
+        expect(residentUnacknowledgedDeliveries(f.mesh.root).size).toBe(0);
+      }, { timeout: 5_000, interval: 10 });
     } finally { await actors?.close(); await agents.close(); f.close(); }
   });
 
-  it.each([[1, false], [1, true], [2, false], [2, true], [3, false], [3, true], [4, false], [4, true]] as const)(
-    "rechecks maintenance admission after custody wait %i (gate stays open: %s)", async (heldCall, staysOpen) => {
+  it.each([
+    ["claim-revalidation", false], ["claim-revalidation", true],
+    ["intent-commit", false], ["intent-commit", true],
+    ["post-intent-prelaunch-ack", false], ["post-intent-prelaunch-ack", true],
+    ["postlaunch-cleanup", false], ["postlaunch-cleanup", true],
+  ] as const)("rechecks maintenance admission at %s (gate stays open: %s)", async (phase, staysOpen) => {
     let allowed = true;
     const f = fixture(1, () => allowed);
+    keepRootMainsLive(f);
     const config = f.residents[0]!;
     const configFile = path.join(config.residencyRoot, "config.json");
+    const requestFile = wake.residentWakeRequestPath(config.residencyRoot);
+    const failureFile = path.join(config.residencyRoot, "wake-failure.json");
     const saved = fs.readFileSync(configFile, "utf8");
     const launch = vi.fn(async () => {});
-    vi.spyOn(console, "warn").mockImplementation(() => {});
     let release!: () => void;
+    let reached!: () => void;
+    const waiting = new Promise<void>(resolve => { reached = resolve; });
+    const held = new Promise<void>(resolve => { release = resolve; });
+    let fenced = false;
+    let sweeping: Promise<void> | undefined;
     try {
       fs.writeFileSync(configFile, JSON.stringify({ ...config, cwd: "unapproved-restart" }));
-      await f.mesh.publish({ topic: "stuck.delivery", from });
-      const before = fs.readFileSync(path.join(config.residencyRoot, "wake-failure.json"), "utf8");
+      const event = await f.mesh.publish({ topic: "stuck.delivery", from });
+      const before = fs.readFileSync(failureFile, "utf8");
       vi.spyOn(Date, "now").mockReturnValue(failureAt(config.residencyRoot).nextRetryAt);
       fs.writeFileSync(configFile, saved);
       const retry = wake.retryResidentWakes as (mesh: MeshStore, launch?: (file: string, config: ResidentHostConfig) => Promise<void>,
@@ -407,34 +545,70 @@ describe("publication wake isolation and maintenance backoff", () => {
       vi.spyOn(wake, "retryResidentWakes").mockImplementation((mesh, _launch, now, canWake = () => true) =>
         retry(mesh as MeshStore, launch, now, canWake));
       const exclusive = f.mesh.exclusive.bind(f.mesh);
-      let entered!: () => void;
-      const waiting = new Promise<void>(resolve => { entered = resolve; });
-      const held = new Promise<void>(resolve => { release = resolve; });
-      let calls = 0;
+      const actionAtFence = (): string => {
+        if (launch.mock.calls.length > 0) return "postlaunch-cleanup";
+        if (fs.existsSync(requestFile)) return "post-intent-prelaunch-ack";
+        return failureAt(config.residencyRoot).claimId ? "intent-commit" : "claim-revalidation";
+      };
       vi.spyOn(f.mesh, "exclusive").mockImplementation(async <T>(operation: () => T, timeout?: number): Promise<T> => {
-        if (++calls === heldCall) { entered(); await held; }
+        if (!fenced && actionAtFence() === phase) {
+          fenced = true;
+          reached();
+          await held;
+        }
         return exclusive(operation, timeout);
       });
-      const sweeping = f.mesh.retryResidentWakes();
-      await waiting;
+      sweeping = f.mesh.retryResidentWakes();
+      let fenceTimeout: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([waiting, new Promise<never>((_resolve, reject) => {
+          fenceTimeout = setTimeout(() => reject(new Error(`timed out waiting for native ${phase} action fence`)), 2_000);
+        })]);
+      } finally { if (fenceTimeout) clearTimeout(fenceTimeout); }
       allowed = staysOpen;
       release();
       await sweeping;
-      expect(launch).toHaveBeenCalledTimes(staysOpen ? 1 : 0);
-      // Waits 1/2/3 precede intent commit; wait 4 is its ACK, so intent
-      // was admitted before revocation but launch must still be suppressed.
-      expect(fs.existsSync(wake.residentWakeRequestPath(config.residencyRoot))).toBe(staysOpen || heldCall === 4);
-      if (!staysOpen) {
-        expect(fs.readFileSync(path.join(config.residencyRoot, "wake-failure.json"), "utf8")).toBe(before);
-        allowed = true;
-        await f.mesh.retryResidentWakes();
-        expect(launch).toHaveBeenCalledOnce(); // Revocation retained the durable nudge and released our claim.
+      expect(fenced).toBe(true);
+      const committedIntent = fs.existsSync(requestFile);
+      expect(committedIntent).toBe(staysOpen || phase === "post-intent-prelaunch-ack" || phase === "postlaunch-cleanup");
+      expect(launch).toHaveBeenCalledTimes(staysOpen || phase === "postlaunch-cleanup" ? 1 : 0);
+      if (staysOpen) {
+        expect(residentUnacknowledgedDeliveries(f.mesh.root).size).toBe(0);
+        expect(fs.existsSync(failureFile)).toBe(false);
+      } else if (phase === "claim-revalidation") {
+        expect(fs.readFileSync(failureFile, "utf8")).toBe(before);
+        expect(residentUnacknowledgedDeliveries(f.mesh.root).get(config.residencyRoot)).toMatchObject({ id: event.id, sequence: event.sequence });
+      } else if (phase === "intent-commit") {
+        expect(fs.readFileSync(failureFile, "utf8")).toBe(before); // Release only the claim; preserve the original durable failure.
+        expect(residentUnacknowledgedDeliveries(f.mesh.root).get(config.residencyRoot)).toMatchObject({ id: event.id, sequence: event.sequence });
+        expect(failureAt(config.residencyRoot)).toMatchObject({ delivery: { id: event.id, sequence: event.sequence } });
+        expect(failureAt(config.residencyRoot).claimId).toBeUndefined();
+      } else if (phase === "post-intent-prelaunch-ack") {
+        expect(fs.readFileSync(failureFile, "utf8")).toBe(before); // Intent ACK is distinct from the still-durable retry receipt.
+        expect(residentUnacknowledgedDeliveries(f.mesh.root).has(config.residencyRoot)).toBe(false);
+        expect(wake.readWakeJson<{ id: string; sequence?: number }>(requestFile)).toMatchObject({ id: event.id, sequence: event.sequence });
+        expect(failureAt(config.residencyRoot)).toMatchObject({ delivery: { id: event.id, sequence: event.sequence } });
+        expect(failureAt(config.residencyRoot).claimId).toBeUndefined();
+      } else {
+        expect(residentUnacknowledgedDeliveries(f.mesh.root).has(config.residencyRoot)).toBe(false);
+        expect(fs.existsSync(failureFile)).toBe(false); // Launch completed; postlaunch cleanup must finish, not revoke it.
       }
-    } finally { release?.(); f.close(); }
+      allowed = true;
+      await f.mesh.retryResidentWakes();
+      expect(launch).toHaveBeenCalledOnce(); // Prelaunch revocation recovers once; completed launch is not duplicated.
+      expect(fs.existsSync(requestFile)).toBe(true);
+      expect(residentUnacknowledgedDeliveries(f.mesh.root).has(config.residencyRoot)).toBe(false);
+      expect(fs.existsSync(failureFile)).toBe(false);
+    } finally {
+      release?.();
+      if (sweeping) await sweeping.catch(() => {});
+      f.close();
+    }
   });
 
   it("retains real config refusals, backs off repeated sweeps, and recovers repaired config at the next due retry", async () => {
     const f = fixture(1);
+    keepRootMainsLive(f);
     const config = f.residents[0]!;
     const configFile = path.join(config.residencyRoot, "config.json");
     const saved = fs.readFileSync(configFile, "utf8");

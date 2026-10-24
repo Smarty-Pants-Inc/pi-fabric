@@ -7,7 +7,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { AgentManager } from "../src/agents/manager.js";
+import type { AgentManager, AgentModelAdmission } from "../src/agents/manager.js";
 import { ActorDirectory } from "../src/actors/directory.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { ActorMeshMonitor } from "../src/actors/mesh-monitor.js";
@@ -56,6 +56,19 @@ function openMesh(root: string): MeshStore {
   return mesh;
 }
 
+// Nonprotected fixture contract only; protected slot topics do not grant model exceptions.
+const assertModelAllowed: AgentManager["assertModelAllowed"] = (model, runner = DEFAULT_FABRIC_CONFIG.agents.runner) => {
+  if ((model !== undefined && model !== "test-model") || (runner !== "pi" && runner !== "pi-durable")) {
+    throw new Error(`Unexpected slot fixture model/runner: ${model}/${runner}`);
+  }
+};
+const resolveModelReasonPolicy = (
+  ...[model, _reason, runner, options = {}]: Parameters<AgentManager["resolveModelReasonPolicy"]>
+): AgentModelAdmission => {
+  assertModelAllowed(model, runner);
+  return { model, thinking: options.thinking, fallback: false };
+};
+
 function openDirectory(mesh: MeshStore, actorRoots: ActorRoots, durable = false, meshCursorPath?: string): ActorDirectory {
   let launches = 0;
   // A deliberately non-executing AgentManager fixture, not a mocked create or
@@ -64,6 +77,7 @@ function openDirectory(mesh: MeshStore, actorRoots: ActorRoots, durable = false,
     config: DEFAULT_FABRIC_CONFIG.agents,
     resolveKernel: () => undefined,
     defaultModel: () => undefined,
+    assertModelAllowed, resolveModelReasonPolicy,
     actorArchiveSources: () => new Map(),
     run: async () => { launches++; throw new Error("Worker launch forbidden in native projection flow"); },
     close: async () => {},

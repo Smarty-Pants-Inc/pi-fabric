@@ -7,6 +7,11 @@ import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { FabricControlPlane, type FabricControlCommand, type FabricControlPlaneOptions } from "../src/topology/control-plane.js";
 import { AgentMessageRouter } from "../src/providers/agents-message-router.js";
+import { AgentsProvider } from "../src/providers/agents-provider.js";
+import { MainAgentController } from "../src/main-agent.js";
+import { MeshLock } from "../src/mesh/mesh-lock.js";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { FabricInvocationContext } from "../src/protocol.js";
 import { FabricParticipantStaleError, participantLeaseGraceMs, readHostLease, writeHostLease } from "../src/topology/host-leases.js";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
 import type { FabricActorInfo } from "../src/actors/types.js";
@@ -323,6 +328,127 @@ describe("same-key retry after proven-notRun resend (#4383)", () => {
     await expect(retry).resolves.toMatchObject({ messageId: "one-resend" });
     expect(command(sender).commandId).toBe(admittedId); expect(deliver).toHaveBeenCalledOnce();
   });
+});
+
+// A4 deletion experiment: public send -> real directory/control -> durable Main journal.
+// Short real TTLs keep the delayed-heartbeat fault bounded; no clock or lease mocks.
+describe("A4 public-entry delayed-heartbeat N20", () => {
+  it.each(["file", "sqlite"] as const)("admits all 20 once with %s state and FILE control", async stateBackend => {
+    const root = temp(), meshRoot = path.join(root, "mesh");
+    const stores: MeshStore[] = [];
+    const store = () => {
+      const mesh = new MeshStore(meshRoot, 65536, 2000, { stateBackend });
+      stores.push(mesh); return mesh;
+    };
+    const mesh = store(), reader = identity("session:a4-reader"), target = identity("session:a4-target");
+    const directory = (who: MeshIdentity, heartbeatMs: number, leaseMs: number) => {
+      const d = new ParticipantDirectory(store(), { enabled: true, hostId: who.id, rootId: who.id,
+        identity: who, reapDeadHosts: false, heartbeatMs, leaseMs });
+      d.registerSource(() => [{ format: 1, id: who.id, kind: "root", rootId: who.id,
+        ownerHostId: who.id, ownerIdentityId: who.id, name: who.id, status: "running", runner: "pi",
+        transport: "host", capabilities: ["followUp", "steer"], controlProtocol: "v1", startedAt: 1, updatedAt: 1 }]);
+      directories.push(d); return d;
+    };
+    await mesh.put({ key: "topology/liveness", identity: reader, value: { version: 1, hostLeases: "files" } });
+    const targetDirectory = directory(target, 100, 200), readerDirectory = directory(reader, 60000, 120000);
+    await targetDirectory.refresh(); await readerDirectory.refresh();
+    const epoch = targetDirectory.ownerIncarnation;
+    const leaseToken = readHostLease(meshRoot, target.id)!.incarnationToken;
+    const unknown = { cwd: root, status: (id: string) => { throw new Error(`Unknown Fabric agent: ${id}`); } };
+    const actors = { identity: reader, status: (id: string) => { throw new Error(`Unknown Fabric actor: ${id}`); }, owns: () => false };
+    const sender = new FabricControlPlane(store(), reader, { enabled: true, hostId: reader.id,
+      ownerIncarnation: readerDirectory.ownerIncarnation, canConsumeMesh: () => readerDirectory.canConsumeMesh(),
+      captureOwnerLease: (...args) => readerDirectory.captureControlOwnerLease(...args) });
+    const owner = new FabricControlPlane(store(), target, { enabled: true, hostId: target.id, ownerIncarnation: epoch,
+      canConsumeMesh: () => targetDirectory.canConsumeMesh() });
+    planes.push(sender, owner);
+    const pi = { on: () => () => {}, sendMessage: () => { throw new Error("Busy Main must journal, not send native input"); },
+      getThinkingLevel: () => "off" } as unknown as ExtensionAPI;
+    const main = new MainAgentController(pi, target.id, true, root, "a4-target");
+    const journal = path.join(root, "main-followups.json");
+    main.attachFollowUpDrain({ isIdle: () => false, hasPendingMessages: () => false,
+      sessionManager: { getEntries: () => [] } } as unknown as ExtensionContext, 60000, journal);
+    const receive = new AgentMessageRouter(unknown as unknown as Ports[0], actors as unknown as Ports[1], main,
+      targetDirectory, owner, b => b);
+    const admissions: Array<{ id: string; message: string; at: number }> = [];
+    owner.start(async (command, from, signal) => {
+      const result = await receive.acceptControl(command, from, signal);
+      if (result.accepted) {
+        const items = JSON.parse(fs.readFileSync(journal, "utf8")).items as Array<{ message: string }>;
+        expect(items.some(item => item.message === command.message)).toBe(true);
+        admissions.push({ id: command.commandId, message: command.message!, at: performance.now() });
+      }
+      return result;
+    });
+    sender.start(() => ({ accepted: false }));
+    const provider = new AgentsProvider(unknown as unknown as ConstructorParameters<typeof AgentsProvider>[0],
+      actors as unknown as ConstructorParameters<typeof AgentsProvider>[1], {} as never,
+      { id: reader.id, local: true, matches: (id: string) => id === reader.id } as never,
+      readerDirectory, sender, {} as never, () => false);
+    const delay = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
+    const rows: Array<Record<string, unknown>> = [];
+    try {
+      for (let i = 0; i < 20; i++) {
+        await targetDirectory.refresh();
+        const lease = readHostLease(meshRoot, target.id)!;
+        await delay(Math.max(0, lease.expiresAt - Date.now() + 15));
+        expect(targetDirectory.ownerIncarnation).toBe(epoch);
+        expect(readHostLease(meshRoot, target.id)!.incarnationToken).toBe(leaseToken);
+        // A real scratch mesh holder supplies the ordinary FILE contention signal.
+        let release!: () => void, entered!: () => void;
+        const held = new Promise<void>(resolve => { entered = resolve; });
+        const unlock = new Promise<void>(resolve => { release = resolve; });
+        const holder = new MeshLock(meshRoot, { lockTimeoutMs: 2000 }, () => {});
+        const holding = holder.withLockAcrossAwait(async () => { entered(); await unlock; });
+        await held;
+        // Normal heartbeat is the event source. This one delayed callback is the fault,
+        // not a replacement routing retry or safety-net polling protocol.
+        const renewal = delay(150).then(async () => { release(); await holding; await targetDirectory.refresh(); owner.resume(); });
+        const message = `a4-input-${i}`, started = performance.now();
+        let refusal: string | undefined, acknowledged = false;
+        try {
+          const result = await provider.invoke("followUp", { id: target.id, message, data: { input: i },
+            idempotencyKey: `a4-key-${i}` }, { signal: AbortSignal.timeout(5000), callId: `a4-call-${i}` } as unknown as FabricInvocationContext);
+          acknowledged = (result as { acknowledged?: boolean }).acknowledged === true;
+        } catch (error) { refusal = error instanceof Error ? `${error.name}: ${error.message}` : String(error); }
+        const settledMs = performance.now() - started;
+        await renewal;
+        const admitted = admissions.filter(item => item.message === message);
+        rows.push({ input: i, message, acknowledged, refusal: refusal ?? null, settledMs,
+          admissions: admitted.length, admissionMs: admitted[0] ? admitted[0].at - started : null });
+      }
+      const items = fs.existsSync(journal) ? JSON.parse(fs.readFileSync(journal, "utf8")).items as Array<{ message: string; data: unknown; deliveryId: string }> : [];
+      const times = rows.flatMap(row => typeof row.admissionMs === "number" ? [row.admissionMs] : []).sort((a, b) => a - b);
+      const percentile = (p: number) => times.length ? times[Math.ceil(times.length * p) - 1] : null;
+      const summary = { stateBackend, inputs: 20, commands: mesh.read({ topic: "fabric.control.command", limit: 100 }).length,
+        admissions: admissions.length, journalItems: items.length, duplicates: admissions.length - new Set(admissions.map(item => item.id)).size,
+        refusals: rows.filter(row => row.refusal !== null).length, p50: percentile(.5), p95: percentile(.95), p99: percentile(.99), rows };
+      console.info("A4_PUBLIC_N20", JSON.stringify(summary));
+      // A fresh stale-incarnation FILE may not extend canonical successor authority.
+      const hostKey = key("topology/hosts/", target.id), storedHost = mesh.get(hostKey, { fresh: true })!.value as Record<string, unknown>;
+      const currentLease = readHostLease(meshRoot, target.id)!;
+      await mesh.put({ key: hostKey, identity: target, value: { ...storedHost, expiresAt: Date.now() - 120000 } });
+      writeHostLease(meshRoot, { ...currentLease, incarnationToken: "stale-file-incarnation", updatedAt: Date.now(), expiresAt: Date.now() + 60000 });
+      try {
+        await expect(provider.invoke("followUp", { id: target.id, message: "must-not-revive", idempotencyKey: "a4-stale-file" },
+          { signal: AbortSignal.timeout(5000) } as unknown as FabricInvocationContext)).rejects.toThrow("Unknown Fabric participant");
+        expect(mesh.read({ topic: "fabric.control.command", limit: 100 })).toHaveLength(summary.commands);
+        expect(admissions).toHaveLength(summary.admissions);
+      } finally {
+        writeHostLease(meshRoot, currentLease);
+        await mesh.put({ key: hostKey, identity: target, value: storedHost });
+      }
+      expect(summary.refusals).toBe(0);
+      expect(summary.commands).toBe(20); expect(summary.admissions).toBe(20); expect(summary.duplicates).toBe(0);
+      expect(items.map(item => [item.message, item.data])).toEqual(Array.from({ length: 20 }, (_, i) => [`a4-input-${i}`, { input: i }]));
+      expect(new Set(items.map(item => item.deliveryId)).size).toBe(20);
+      expect(items.map(item => [item.message, item.deliveryId])).toEqual(admissions.map(item => [item.message, item.id]));
+    } finally {
+      await sender.close(); await owner.close(); main.closeFollowUpDrain();
+      await targetDirectory.close(); await readerDirectory.close();
+      stores.forEach(mesh => mesh.closeState());
+    }
+  }, 30000);
 });
 
 describe("mixed-host idle graph/IO bench (#4383)", () => {

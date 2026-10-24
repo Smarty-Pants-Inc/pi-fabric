@@ -241,8 +241,14 @@ describe("I-2 production-worker ingress retention", () => {
       copyRun(plain.run, path.join(source, "nested", "plain"));
       const nested = copyRun(attributed.run, path.join(source, "nested", "attributed"));
       if (kind !== "successful" && kind !== "latest") makeUnsafe(nested, kind);
+      // Source symlinks now refuse the entire archive instead of yielding a false success after a partial copy.
+      if (kind === "delivery-link" || kind === "sidecar-link" || kind === "directory-link") {
+        await expect(store.retainRun(actor, kind, source)).rejects.toMatchObject({ code: "FABRIC_ACTOR_RUN_ARCHIVE_REFUSED" });
+        expect(fs.readFileSync(path.join(nested, "events.jsonl"), "utf8")).not.toBe("");
+        continue;
+      }
       // Exercise production's selective top-level archive and recursive nested copy.
-      await store.retainRun(actor, kind, source);
+      await expect(store.retainRun(actor, kind, source)).resolves.toMatchObject({ archived: true });
       const archive = path.join(root, "runs", kind);
       expect(fs.readdirSync(path.join(archive, "nested", "attributed")).sort()).toEqual(fs.readdirSync(nested).sort());
       expect(fs.existsSync(path.join(archive, "deliveries"))).toBe(false);
@@ -254,7 +260,11 @@ describe("I-2 production-worker ingress retention", () => {
     store.pruneRuns(actor, base + 99);
     expect(store.retainedRunIds(actor)).toContain("successful");
     store.pruneRuns(actor, base + 60_001);
-    for (const kind of ["latest", ...unsafeKinds]) expect(store.retainedRunIds(actor), kind).toContain(kind);
+    for (const kind of ["latest", ...unsafeKinds]) {
+      if (kind === "delivery-link" || kind === "sidecar-link" || kind === "directory-link") {
+        expect(fs.existsSync(path.join(root, "sources", kind, "nested", "attributed", "events.jsonl"))).toBe(true);
+      } else expect(store.retainedRunIds(actor), kind).toContain(kind);
+    }
     expect(store.retainedRunIds(actor)).not.toContain("successful");
   }, 90000);
 });

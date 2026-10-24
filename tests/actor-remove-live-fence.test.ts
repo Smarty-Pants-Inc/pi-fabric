@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -6,15 +7,19 @@ import { ActorManager } from "../src/actors/manager.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
+import { MeshLockTimeoutError } from "../src/core/atomic-write.js";
 import { MeshStore } from "../src/mesh/store.js";
+import * as verifier from "../src/storage/verified-remove.js";
 import { actorTreeDeletionHooks, mainPublicationFenced } from "../src/topology/main-publication-fence.js";
 import { fixture, mainDirectory } from "./helpers/dead-root-fixture.js";
+import { RESIDENT_HOST_FORMAT } from "../src/residency/protocol.js";
 import { ROOT_PARTICIPANT_FRESH_MS } from "../src/residency/operator-safety.js";
 import { processHarness } from "./helpers/process-harness.js";
 
 // smarty-dev#8090, LOCAL recorded-call boundary probe (#4664: it must never remove actor-tree bytes). Only the
-// actor-tree removal itself is intercepted: every fs.rmSync / fs.promises.rm / fs.rmdirSync of a directory at or
-// under an actor root is recorded with the kernel fence state at that instant and NOT performed. The fence (real
+// actor-tree removal itself is intercepted: the live remove's verifiedRemove of a directory at or
+// under an actor root, and every raw fs.rmSync / fs.promises.rm / fs.rmdirSync of one (fallback, nonpersistent
+// close), is recorded with the kernel fence state at that instant and NOT performed. The fence (real
 // flock), the final check, the hooks' ordering and the Main publication are all real. This proves the local delete
 // boundary only (Decision C: supplemental); the actual deletion race is hosted (actor-remove-live-process.test.ts).
 type Call = { at: string; fenced: boolean; path?: string };
@@ -37,6 +42,15 @@ const guardActorTrees = (roots: string[], fenced: () => boolean, calls: Call[]) 
     if (inTree(file)) record(file); else rmdirSync(file, options);
   }) as typeof fs.rmdirSync);
   vi.spyOn(fs.promises, "rm").mockImplementation(async (file, options) => { if (inTree(file)) record(file); else await rm(file, options); });
+  // The live remove's boundary: the fence must be held at the call itself (not only at the hooks). Restored by
+  // vi.restoreAllMocks; non-targets run the real verifier.
+  const verified = verifier.verifiedRemove;
+  vi.spyOn(verifier, "verifiedRemove").mockImplementation((target, judged, options) => {
+    if (!inTree(target)) return verified(target, judged, options);
+    record(target);
+    expect(calls.at(-1)?.fenced, `verifiedRemove(${target}) without the held fence`).toBe(true);
+    return { removed: true, bytes: 0 };
+  });
 };
 const observeHooks = (fenced: () => boolean, calls: Call[], during?: Partial<Record<"beforeCheck" | "beforeDelete", () => Promise<void>>>) => {
   actorTreeDeletionHooks.beforeCheck = async () => { calls.push({ at: "beforeCheck", fenced: fenced() }); await during?.beforeCheck?.(); };
@@ -48,6 +62,76 @@ afterEach(() => {
   delete actorTreeDeletionHooks.beforeDelete;
   vi.restoreAllMocks();
   vi.unstubAllEnvs();
+});
+
+describe.skipIf(!["linux", "darwin", "win32"].includes(process.platform))("smarty-dev#16016 resident removal presence cleanup", () => {
+  it.each([
+    { state: "absent after the first failed cleanup", deletePresence: true, completes: true },
+    { state: "still present", deletePresence: false, completes: false },
+  ])("$state: a lock-timeout refresh cannot strand or bypass the cleanup marker", { timeout: 15_000 }, async ({ deletePresence, completes }) => {
+    const f = await fixture();
+    const send = async (command: Record<string, unknown>) => {
+      const requestId = randomUUID();
+      fs.writeFileSync(path.join(f.config.residencyRoot, "requests", `${requestId}.json`), JSON.stringify({
+        format: RESIDENT_HOST_FORMAT, rootId: f.config.rootId, requestId, createdAt: Date.now(), ...command,
+      }));
+      const responsePath = path.join(f.config.residencyRoot, "responses", `${requestId}.json`);
+      await vi.waitFor(() => expect(fs.existsSync(responsePath)).toBe(true), { timeout: 10_000 });
+      return JSON.parse(fs.readFileSync(responsePath, "utf8"));
+    };
+    let failingPresence: ReturnType<typeof vi.spyOn> | undefined;
+    let failingHeartbeat: ReturnType<typeof vi.spyOn> | undefined;
+    let suppressingScheduledRefresh: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      const created = await send({ operation: "createActor", request: { scope: "project", name: "presence cleanup", instructions: "Work.", residency: "durable" } });
+      expect(created.ok).toBe(true);
+      const actor = created.actor;
+      const presenceKey = `actors/${f.config.sessionId}/${actor.id}`;
+      await vi.waitFor(() => expect(f.host.mesh.get(presenceKey, { fresh: true })).toBeDefined());
+      const marker = path.join(f.config.actorRoot, `removal-${actor.id}.json`);
+      const removalsPath = path.join(f.config.residencyRoot, "removals.json");
+      const readRemovals = (): Array<{ id?: string }> => fs.existsSync(removalsPath)
+        ? JSON.parse(fs.readFileSync(removalsPath, "utf8")).removals : [];
+      // Let create-time participant updates settle, then hold resident refreshes at one lock-timeout
+      // so a later heartbeat cannot hide the pending-deletion regression.
+      await new Promise<void>(resolve => setTimeout(resolve, 1_100));
+      const lockTimeout = async (): Promise<void> => { throw new MeshLockTimeoutError("injected presence refresh contention", 1, 0); };
+      failingPresence = vi.spyOn(f.host.participants, "refreshPresence").mockImplementation(lockTimeout);
+      failingHeartbeat = vi.spyOn(f.host.participants, "refresh").mockImplementation(lockTimeout);
+      suppressingScheduledRefresh = vi.spyOn(f.host.participants, "scheduleRefresh").mockImplementation(() => {});
+
+      const first = await send({ operation: "removeActor", id: actor.id });
+      expect(first).toMatchObject({ ok: true, pending: expect.stringContaining("presence deletion pending") });
+      expect(fs.existsSync(marker)).toBe(true);
+      await vi.waitFor(() => expect(readRemovals().some(item => item.id === actor.id)).toBe(true));
+      const existingPresence = f.host.mesh.get(presenceKey, { fresh: true });
+      expect(existingPresence).toBeDefined();
+
+      if (deletePresence) {
+        await f.host.mesh.delete({ key: presenceKey, ifVersion: existingPresence!.version });
+        expect(f.host.mesh.get(presenceKey, { fresh: true })).toBeUndefined();
+      }
+      const refreshesBeforeRetry = failingPresence.mock.calls.length;
+      const retried = await send({ operation: "removeActor", id: actor.id });
+      if (completes) {
+        expect(retried).toMatchObject({ ok: true });
+        expect(retried.pending).toBeUndefined();
+        expect(fs.existsSync(marker)).toBe(false);
+        await vi.waitFor(() => expect(readRemovals().some(item => item.id === actor.id)).toBe(false));
+        expect(failingPresence.mock.calls).toHaveLength(refreshesBeforeRetry);
+        expect(f.host.mesh.get(presenceKey, { fresh: true })).toBeUndefined();
+      } else {
+        expect(retried).toMatchObject({ ok: true, pending: expect.stringContaining("presence deletion pending") });
+        expect(fs.existsSync(marker)).toBe(true);
+        expect(f.host.mesh.get(presenceKey, { fresh: true })).toBeDefined();
+        expect(readRemovals()).toContainEqual(expect.objectContaining({ id: actor.id }));
+        expect(failingPresence.mock.calls.length).toBeGreaterThan(refreshesBeforeRetry);
+      }
+    } finally {
+      vi.restoreAllMocks();
+      await f.close();
+    }
+  });
 });
 
 describe.skipIf(process.platform !== "linux")("live actor-tree removal boundary, recorded calls (smarty-dev#8090)", () => {
@@ -102,6 +186,60 @@ describe.skipIf(process.platform !== "linux")("live actor-tree removal boundary,
       for (const result of [first, second]) expect(result).toMatchObject({ cleaned: false, pending: expect.stringMatching(/kept|live|fresh/i) });
       expect(fenced()).toBe(false);
     } finally { vi.restoreAllMocks(); await main.close(); await f.close(); }
+  }, 60_000);
+
+  // Timing regression: the operator caller joins while the ordinary cleanup's lazy verifier import resolves (after
+  // the bindings await and any operator check placed before the import). The import must precede the final operator
+  // check, so the joined provenance is checked and the tree kept; the recorded verifier is never reached. Seam: the
+  // dynamic import's destructure reads the module namespace's verifiedRemove export, so a getter on it (the guard's
+  // spy, configurable under Vitest's module runner) observes exactly that resolution. Only an access whose caller is
+  // src/actors/manager.ts launches the join (binding and mesh lock releases read the same export from other modules).
+  it("an operator removal that joins while the ordinary cleanup's verifier import resolves gets the final operator check and keeps the tree", async () => {
+    const f = await fixture();
+    const main = mainDirectory(f.config.meshRoot, f.config.rootId);
+    let restoreExport = () => {};
+    let joined: ReturnType<typeof f.host.actors.remove> | undefined;
+    try {
+      const actor = await f.create("import-join");
+      const dir = path.join(f.config.actorRoot, actor.id);
+      fs.mkdirSync(dir, { recursive: true }); fs.writeFileSync(path.join(dir, "session.jsonl"), "history\n");
+      await main.refresh(); // a live Main with a fresh participant: ordinary removal is allowed, operator removal is not
+      const fenced = () => mainPublicationFenced(f.config.meshRoot, f.config.rootId);
+      const calls: Call[] = [];
+      guardActorTrees([dir], fenced, calls);
+      observeHooks(fenced, calls);
+      const recorded = verifier.verifiedRemove; // the guard's recording spy
+      const descriptor = Object.getOwnPropertyDescriptor(verifier, "verifiedRemove");
+      expect(descriptor?.configurable, "verifiedRemove namespace export is not configurable").toBe(true);
+      const managerSource = path.join("src", "actors", "manager.ts");
+      let launched = false;
+      Object.defineProperty(verifier, "verifiedRemove", { configurable: true, enumerable: descriptor!.enumerable ?? false, get() {
+        const caller = (new Error().stack ?? "").split("\n").filter(line => /^\s+at /.test(line))[1] ?? "";
+        if (!launched && caller.includes(managerSource)) {
+          launched = true; // sticky before remove() runs its synchronous escalation
+          calls.push({ at: "join", fenced: fenced() });
+          joined = f.host.actors.remove(actor.id, { wait: false, operator: true });
+          joined.catch(() => undefined);
+        }
+        return recorded;
+      } });
+      restoreExport = () => { Object.defineProperty(verifier, "verifiedRemove", descriptor!); restoreExport = () => {}; };
+      const ordinary = f.host.actors.remove(actor.id, { wait: false });
+      const first = await ordinary;
+      expect(joined, "the verifier import never resolved through the namespace export").toBeDefined();
+      const second = await joined!;
+      expect(calls).toEqual([
+        { at: "beforeCheck", fenced: true }, { at: "beforeDelete", fenced: true }, { at: "join", fenced: true }]);
+      expect(vi.mocked(recorded).mock.calls.filter(([target]) => path.resolve(String(target)) === path.resolve(dir))).toEqual([]);
+      for (const result of [first, second]) expect(result).toMatchObject({ cleaned: false, pending: expect.stringMatching(/kept|live|fresh/i) });
+      expect(fs.readFileSync(path.join(dir, "session.jsonl"), "utf8")).toBe("history\n");
+      expect(fenced()).toBe(false);
+    } finally {
+      restoreExport(); // the exact spy descriptor, before any mock restore
+      await joined?.catch(() => undefined);
+      await main.close(); await f.close();
+      vi.restoreAllMocks(); // the guard stays installed through every close and the temp-root teardown
+    }
   }, 60_000);
 
   it("counterexample: an ordinary removal with a live Main still removes the tree, only under the fence", async () => {
@@ -443,8 +581,9 @@ describe.skipIf(process.platform !== "linux")("live actor-tree removal boundary,
   // Decision C RECORDED boundary, native processes, NOT E2E: a real resident child (ResidentHost from config.json), a
   // separate real Main process (ParticipantDirectory) and the real `fabric-actors` CLI in its own process over the
   // resident request channel, with a real flock. The resident runs with recordTreeDeletes (argv): its whole actor-tree
-  // fs.rmSync is recorded with the fence state and not performed; everything else is real. This process guards its
-  // own actor root the same way (the seed and the persistent host close never delete trees, and guards stay through
+  // removal (verifiedRemove, or the raw fs.rmSync fallback) is recorded with the fence state and not performed;
+  // everything else is real. This process guards its own actor root the same way (the seed and the persistent host
+  // close never delete trees, and guards stay through
   // teardown). The real deletion is the hosted actor-remove-live-process.test.ts (b).
   it("native processes, recorded delete: a Main publish while the live operator removal awaits beforeDelete is refused; resumed, it succeeds fenced and the Main publishes after", async () => {
     const f = await fixture();

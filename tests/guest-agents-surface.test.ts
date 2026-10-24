@@ -191,6 +191,22 @@ describe("guest agents surface", () => {
       .toEqual([expect.objectContaining({ message: expect.stringContaining("not assignable to type 'string'") })]);
   });
 
+  // F-001: preserve the served guest/host compatibility boundary, not a text snapshot.
+  it.each([false, true])("types same-key Main payloads and optional legacy replacement receipts (fullCodeMode=%s)", fullCodeMode => {
+    const calls = ["followUp", "tell", "steer"].flatMap(method => [1, 2].map(revision =>
+      `await agents.${method}({ id: "session:main", message: "original ${revision}", data: { ...data, revision: ${revision} } })`));
+    const code = `const data: FabricMessageData = { coalesceKey: "status" };
+      const receipts = [${calls.join(",\n")}];
+      return receipts.map(receipt => {
+        const omitted: Pick<typeof receipt, "coalesced" | "replacedMessageId"> = {};
+        const legacy: Pick<typeof receipt, "coalesced" | "replacedMessageId"> = { coalesced: true, replacedMessageId: "legacy-message" };
+        const coalesced: true | undefined = receipt.coalesced;
+        const replacedMessageId: string | undefined = receipt.replacedMessageId;
+        return { omitted, legacy, coalesced, replacedMessageId };
+      });`;
+    expect(typeCheckFabricCode(code, guestTypeDeclarations(fullCodeMode), true).errors).toEqual([]);
+  });
+
   it.each([false, true])("types literal public message retry keys (fullCodeMode=%s)", fullCodeMode => {
     const code = `if (false) {
       await agents.followUp({ id: "session:peer", message: "unchanged", idempotencyKey: "follow-up-key" });
@@ -246,10 +262,10 @@ describe("guest agents surface", () => {
   it.each([false, true])("types per-filter telemetry and expiry (fullCodeMode=%s)", fullCodeMode => {
     const code = `await agents.setActivationFilter({ id: "reviewer", activationFilter: ["hold"], expiresAt: Date.now() + 60000, deadLetterReplayMaxAgeMs: 0 });
       const actor = await agents.actorStatus({ id: "reviewer" });
-      const count: number = actor.filterSkipped.count;
-      const key: string | null = actor.filterSkipped.lastKey;
-      const topic: string | null = actor.filterSkipped.lastTopic;
-      const at: number | null = actor.filterSkipped.lastAt;
+      const count: number | undefined = actor.filterSkipped?.count;
+      const key: string | null | undefined = actor.filterSkipped?.lastKey;
+      const topic: string | null | undefined = actor.filterSkipped?.lastTopic;
+      const at: number | null | undefined = actor.filterSkipped?.lastAt;
       const expiry: number | undefined = actor.activationFilterExpiresAt;
       const maxAgeMs: number | undefined = actor.deadLetterReplayMaxAgeMs;
       await agents.create({ name: "backlog", instructions: "Supervise", deadLetterReplayMaxAgeMs: 0 });
@@ -325,6 +341,66 @@ describe("guest agents surface", () => {
       const schema = AGENTS_ACTION_DESCRIPTORS.find(descriptor => descriptor.name === name)!.inputSchema as { properties: Record<string, unknown> };
       expect(schema.properties.modelReason).toMatchObject({ type: "string", maxLength: 200 });
     }
+  });
+
+  // Decision C keep reasons: public-schema trust boundary and preserving issue evidence
+  // through the actual guest-to-host bridge, not merely a source-text advertisement.
+  it.each([false, true])("types and advertises the opusReason request alias (fullCodeMode=%s)", fullCodeMode => {
+    const declarations = guestTypeDeclarations(fullCodeMode);
+    const calls = [
+      ['run', 'task: "probe"'], ['spawn', 'task: "probe"'],
+      ['create', 'name: "probe", instructions: "Work."'],
+      ['createActor', 'name: "probe", instructions: "Work."'],
+      ['setModel', 'id: "actor"'],
+    ] as const;
+    const runSchema = AGENTS_ACTION_DESCRIPTORS.find(action => action.name === "run")!.inputSchema as { properties: Record<string, unknown> };
+    const sharedAlias = runSchema.properties.opusReason;
+    for (const [name, args] of calls) {
+      expect(typeCheckFabricCode(`await agents.${name}({ ${args}, model: "provider/claude-opus-5.5", opusReason: "Review #123" });`, declarations, true).errors).toEqual([]);
+      expect(typeCheckFabricCode(`await agents.${name}({ ${args}, modelReason: "Canonical #123", opusReason: "Alias #456" });`, declarations, true).errors).toEqual([]);
+      expect(typeCheckFabricCode(`await agents.${name}({ ${args}, opusReason: 123 });`, declarations, true).errors.length).toBeGreaterThan(0);
+      const schema = AGENTS_ACTION_DESCRIPTORS.find(action => action.name === name)!.inputSchema as { properties: Record<string, unknown> };
+      expect(schema.properties.opusReason).toBe(sharedAlias);
+      expect(schema.properties.opusReason).toMatchObject({ type: "string", maxLength: 200,
+        description: expect.stringContaining("modelReason wins") });
+      expect(schema.properties.modelReason).toMatchObject({ description: expect.stringContaining("gpt-6-astra, opus, claude") });
+      expect(schema.properties.modelReason).toMatchObject({ description: expect.stringContaining("must name an issue") });
+    }
+  });
+
+  it("preserves both reason fields through every guest launch/model-binding bridge", async () => {
+    const calls: Array<{ ref: string; args: unknown }> = [];
+    const result = await new QuickJsRuntime().execute(
+      `const reasons = { modelReason: "Canonical #123", opusReason: "Alias #456" };
+       await agents.run({ task: "probe", ...reasons });
+       await agents.spawn({ task: "probe", ...reasons });
+       await agents.create({ name: "probe", instructions: "Work.", ...reasons });
+       await agents.createActor({ name: "alias-probe", instructions: "Work.", ...reasons });
+       await agents.setModel({ id: "actor", model: "provider/opus", ...reasons });
+       return "forwarded";`,
+      async (ref, args) => { calls.push({ ref, args }); return { id: "probe" }; },
+      { timeoutMs: 5_000, memoryLimitBytes: 32 * 1024 * 1024 },
+    );
+    expect(result.terminationReason).toBe("completed");
+    expect(result.value).toBe("forwarded");
+    const reasons = { modelReason: "Canonical #123", opusReason: "Alias #456" };
+    expect(calls).toEqual([
+      { ref: "agents.run", args: { task: "probe", ...reasons } },
+      { ref: "agents.spawn", args: { task: "probe", ...reasons } },
+      { ref: "agents.create", args: { name: "probe", instructions: "Work.", ...reasons } },
+      { ref: "agents.createActor", args: { name: "alias-probe", instructions: "Work.", ...reasons } },
+      { ref: "agents.setModel", args: { id: "actor", model: "provider/opus", ...reasons } },
+    ]);
+  });
+
+  it.each([false, true])("types policy/audit warnings on launch receipts (fullCodeMode=%s)", fullCodeMode => {
+    const code = `const run = await agents.run({ task: "probe" });
+      const spawn = await agents.spawn({ task: "probe" });
+      const wait = await agents.wait({ id: "probe" });
+      const warnings: Array<string[] | undefined> = [run.warnings, spawn.warnings, wait.warnings];
+      const omitted: Pick<typeof spawn, "warnings"> = {};
+      return { warnings, omitted };`;
+    expect(typeCheckFabricCode(code, guestTypeDeclarations(fullCodeMode), true).errors).toEqual([]);
   });
 
   it.each([false, true])("types model selection provenance without conflating effective models (fullCodeMode=%s)", fullCodeMode => {

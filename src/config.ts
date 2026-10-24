@@ -8,6 +8,9 @@ import { parsePerCallRouting } from "./agents/per-call-config.js";
 import { normalizeAgentRouterConfig, type FabricAgentRouterConfig } from "./agents/router-config.js";
 export type { FabricAgentRouterConfig } from "./agents/router-config.js";
 import { normalizeAgentPlacement, type AgentPlacementConfig } from "./agents/placement-config.js";
+import { isLoopbackPlacementUrl, normalizePlacementApiConfig, type PlacementApiConfig } from "./placement/config.js";
+export type { PlacementApiConfig } from "./placement/config.js";
+import type { SandboxTransportConfig } from "./transport/sandbox/types.js";
 import { normalizeWakeTextConfig, type FabricWakeTextConfig } from "./actors/wake-text.js";
 import type { LandlockSettings } from "./core/landlock.js";
 import { DEFAULT_JEV_CONFIG, normalizeJevConfig, type FabricJevConfig } from "./jev/config.js";
@@ -51,6 +54,7 @@ type FabricApprovalMode = "allow" | "ask" | "auto" | "deny";
 export type FabricAgentTransport =
   | "auto"
   | "process"
+  | "sandbox"
   | "tmux"
   | "screen"
   | "localterm"
@@ -81,6 +85,9 @@ type FabricCompactionEngine = "pi" | "fabric";
 type FabricActorScope = "project" | "session";
 
 export type FabricPythonRuntime = "cpython" | "monty";
+
+/** Fixed root-owned grant source; no config, environment, workspace, or agent directory may redirect it. */
+export const MODEL_EXCEPTIONS_PATH = "/etc/smarty/model-exceptions.json";
 
 /** Whether pi.powershell and extension powershell overrides may run (smarty-dev#9826). */
 export type FabricPowerShellPolicy = "refuse" | "allow";
@@ -247,13 +254,28 @@ export interface FabricAgentConfig {
   processMemoryMaxBytes?: number;
   /** Host-only opt-in process task placement; workspace files cannot override it. */
   placement?: AgentPlacementConfig;
+  sandbox: SandboxTransportConfig;
+  /** Host-only Placement API client; absent means the legacy path is unchanged. */
+  placementApi?: PlacementApiConfig;
   /** User/workspace Pi default; package defaults intentionally leave this unset. */
   model?: string;
   /** Root deny baseline unioned with agent-dir additions; workspace lists are ignored. */
   deniedModels: string[];
   /** Root/default reason baseline unioned with agent-dir additions; only root may relax. */
-  modelPolicy: { requireReason: string[] };
+  modelPolicy: {
+    requireReason: string[];
+    /** Model used for indirect/default resolution when the configured model is unavailable or denied. */
+    fallbackModel?: string;
+    /** Thinking level paired with the indirect fallback model. */
+    fallbackThinking?: FabricThinking;
+  };
   deniedModelReplacement?: string;
+  /**
+   * Internal trusted host path of `model-exceptions.json` (root-owned host source).
+   * Never read from any config file: normalization always uses MODEL_EXCEPTIONS_PATH.
+   * Direct embedders may set it, but every read validates the trusted source.
+   */
+  modelExceptionsPath?: string;
   /** Host-only file instructions root. Unset = ~/.local/share/smarty-dev/factory/current/. */
   instructionsRoot?: string;
   claude: FabricClaudeRunnerConfig;
@@ -531,10 +553,36 @@ const meshNatsReplicas = (value: unknown): number => {
   throw new Error("mesh.nats.replicas must be a positive integer");
 };
 
+const meshNatsEphemeralHost = (value: unknown): boolean => {
+  if (value === undefined) return false;
+  if (typeof value === "boolean") return value;
+  throw new FabricMeshNatsConfigError("ephemeralHost", "must be a boolean");
+};
+
+const meshNatsEphemeralInactiveSeconds = (value: unknown): number => {
+  if (value === undefined) return 3_600;
+  if (typeof value === "number" && Number.isSafeInteger(value) && value >= 300 && value <= 86_400) return value;
+  throw new FabricMeshNatsConfigError("ephemeralInactiveSeconds", "must be an integer from 300 through 86400");
+};
+
+const DEFAULT_INBOX_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1_000;
+const MIN_INBOX_MAX_AGE_MS = 60 * 1_000;
+const MAX_INBOX_MAX_AGE_MS = 90 * 24 * 60 * 60 * 1_000;
+const isValidInboxMaxAgeMs = (value: unknown): value is number =>
+  typeof value === "number" && Number.isSafeInteger(value) && value >= MIN_INBOX_MAX_AGE_MS &&
+  value <= MAX_INBOX_MAX_AGE_MS && Number.isSafeInteger(value * 1_000_000);
+
+const meshNatsInboxMaxAgeMs = (value: unknown): number => {
+  if (value === undefined) return DEFAULT_INBOX_MAX_AGE_MS;
+  if (isValidInboxMaxAgeMs(value)) return value;
+  throw new FabricMeshNatsConfigError("inboxMaxAgeMs",
+    `must be an integer from ${MIN_INBOX_MAX_AGE_MS} through ${MAX_INBOX_MAX_AGE_MS} milliseconds`);
+};
+
 /** Messaging/rollback settings fail visibly in the same typed config-error family as E9. */
 export class FabricMeshNatsConfigError extends Error {
   readonly code = "FABRIC_MESH_TRANSPORT_CONFIG";
-  constructor(readonly field: "operatorMachine" | "rollbackHoldUntil" | "servers" | "custodyStream" | "livenessStream" | "pathBMachines" | "tls" | "allowInsecureLoopback" | "verifyMachine", requirement: string) {
+  constructor(readonly field: "operatorMachine" | "rollbackHoldUntil" | "servers" | "custodyStream" | "livenessStream" | "pathBMachines" | "tls" | "org" | "allowInsecureLoopback" | "verifyMachine" | "ephemeralHost" | "ephemeralInactiveSeconds" | "events" | "provision" | "inboxMaxAgeMs", requirement: string) {
     super(`mesh.nats.${field} ${requirement}`);
     this.name = "FabricMeshNatsConfigError";
   }
@@ -543,6 +591,12 @@ export class FabricMeshNatsConfigError extends Error {
 export interface FabricMeshNatsConfig {
   /** Stream num_replicas on create; an existing stream with a different count is refused (default 1). */
   replicas: number;
+  /** Opt-in NATS event log; normalized configs supply false. */
+  events?: boolean;
+  /** Org slug for event and service subjects; required when events is true or a session channel is opened. */
+  org?: string;
+  /** Explicit event-stream provisioning gate; normalized configs supply false. Does not grant admin rights. */
+  provision?: boolean;
   /** Messaging connection settings. No credential is read while loading config. */
   servers?: string | string[];
   /** Required literal policy mapping in NATS mode; full permission verification stays in the lazy adapter. */
@@ -562,7 +616,25 @@ export interface FabricMeshNatsConfig {
   rollbackHoldUntil?: string;
   /** Parallel inbox lanes; normalized configs supply 8, with a minimum of 1. */
   inboxLanes?: number;
+  /** Host-only: allow server-side expiration and clean-shutdown deletion of this host's inbox durable (default false). */
+  ephemeralHost?: boolean;
+  /** Server-side durable idle expiration in seconds when ephemeralHost is enabled (300..86400, default 3600). */
+  ephemeralInactiveSeconds?: number;
+  /** Inbox stream message age limit in milliseconds (60 s..90 d, default 7 d); existing max_age:0 streams remain compatible. */
+  inboxMaxAgeMs?: number;
 }
+
+const meshNatsFlag = (value: unknown, field: "events" | "provision"): boolean => {
+  if (value === undefined) return false;
+  if (typeof value === "boolean") return value;
+  throw new FabricMeshNatsConfigError(field, "must be a boolean");
+};
+
+const meshNatsOrg = (value: unknown, events = false): string | undefined => {
+  if (value === undefined && !events) return undefined;
+  if (typeof value === "string" && /^[a-z0-9][a-z0-9-]{0,62}$/.exec(value)?.[0] === value && value !== "sys") return value;
+  throw new FabricMeshNatsConfigError("org", "must be a non-sys org slug (1..63 lowercase letters, digits or hyphens, starting with a letter or digit); required when events is true");
+};
 
 const meshNatsString = (value: unknown, field: "credentials" | "machine"): string | undefined => {
   if (value === undefined) return undefined;
@@ -666,12 +738,15 @@ const meshNatsServers = (value: unknown): string[] => {
 const meshNatsConfig = (value: unknown, transport: FabricMeshTransport): FabricMeshNatsConfig => {
   const nats = objectValue(value);
   // FILE ignores messaging settings and inherited snapshots. Only the existing machine and hold
-  // remain rollback authority; no machine means the exact old default shape. Invalid authority refuses.
+  // remain rollback authority. Invalid authority refuses.
   if (transport === "file") {
     const machine = meshNatsString(nats.machine, "machine");
     const rollbackHoldUntil = meshNatsRollbackHoldUntil(nats.rollbackHoldUntil);
     return {
-      replicas: meshNatsReplicas(nats.replicas), inboxLanes: 8,
+      replicas: meshNatsReplicas(nats.replicas), inboxLanes: 8, events: false, provision: false,
+      ephemeralHost: meshNatsEphemeralHost(nats.ephemeralHost),
+      ephemeralInactiveSeconds: meshNatsEphemeralInactiveSeconds(nats.ephemeralInactiveSeconds),
+      inboxMaxAgeMs: DEFAULT_INBOX_MAX_AGE_MS,
       ...(machine !== undefined ? { machine } : {}),
       ...(rollbackHoldUntil !== undefined ? { rollbackHoldUntil } : {}),
     };
@@ -689,6 +764,9 @@ const meshNatsConfig = (value: unknown, transport: FabricMeshTransport): FabricM
   for (const field of ["allowInsecureLoopback", "verifyMachine"] as const) {
     if (field in nats || field in messaging) throw new FabricMeshNatsConfigError(field, "is not supported in NATS config");
   }
+  const events = meshNatsFlag(messaging.events, "events");
+  const org = meshNatsOrg(messaging.org, events);
+  const provision = meshNatsFlag(messaging.provision, "provision");
   const servers = meshNatsServers(messaging.servers);
   const custodyStream = meshNatsStream(messaging.custodyStream, "custodyStream");
   const livenessStream = meshNatsStream(messaging.livenessStream, "livenessStream");
@@ -697,6 +775,9 @@ const meshNatsConfig = (value: unknown, transport: FabricMeshTransport): FabricM
   }
   const pathBMachines = meshNatsPathBMachines(messaging.pathBMachines);
   const tls = meshNatsTls(messaging.tls);
+  const ephemeralHost = meshNatsEphemeralHost(messaging.ephemeralHost);
+  const ephemeralInactiveSeconds = meshNatsEphemeralInactiveSeconds(messaging.ephemeralInactiveSeconds);
+  const inboxMaxAgeMs = meshNatsInboxMaxAgeMs(messaging.inboxMaxAgeMs);
   const credentials = meshNatsString(messaging.credentials, "credentials");
   const machine = meshNatsString(messaging.machine, "machine");
   const operatorMachine = validateFabricNatsOperatorMachine(messaging.operatorMachine, machine);
@@ -704,11 +785,16 @@ const meshNatsConfig = (value: unknown, transport: FabricMeshTransport): FabricM
   return {
     replicas: meshNatsReplicas(nats.replicas),
     servers, custodyStream, livenessStream, pathBMachines, tls,
+    events, provision,
+    ...(org !== undefined ? { org } : {}),
     ...(credentials !== undefined ? { credentials } : {}),
     ...(machine !== undefined ? { machine } : {}),
     operatorMachine,
     ...(rollbackHoldUntil !== undefined ? { rollbackHoldUntil } : {}),
     inboxLanes: boundedInteger(messaging.inboxLanes, 8, 1, Number.MAX_SAFE_INTEGER),
+    ephemeralHost,
+    ephemeralInactiveSeconds,
+    inboxMaxAgeMs,
   };
 };
 
@@ -889,12 +975,15 @@ export interface FabricConfig {
 export const MAX_EXECUTOR_TIMEOUT_MS = 24 * 3_600_000;
 
 export const MIN_AGENT_TIMEOUT_MS = 1_000;
+// ponytail: b4408352 protected real work from model-chosen tiny timeouts. Explicit
+// lane/audit timeboxes may shorten the default, but only at five minutes or more.
+export const MIN_AGENT_SHORTENING_TIMEOUT_MS = 300_000;
 export const MAX_AGENT_TIMEOUT_MS = 24 * 3_600_000;
 /** Default per-run wall-clock budget. It equals the policy ceiling on purpose:
  *  outside interactive Main, an orchestration program inherits agents.timeoutMs
  *  as its whole-program deadline floor, so any lower default truncates participants at a
- *  fraction of the maximum the policy already allows. Narrow one run by setting
- *  agents.timeoutMs explicitly; per-call values can only raise it. */
+ *  fraction of the maximum the policy already allows. Explicit one-shot timeboxes
+ *  may shorten it, subject to MIN_AGENT_SHORTENING_TIMEOUT_MS. */
 const DEFAULT_AGENT_TIMEOUT_MS = MAX_AGENT_TIMEOUT_MS;
 export const QUICKJS_MAX_MEMORY_LIMIT_BYTES = 0xffff_ffff;
 export const MAX_EXECUTOR_MEMORY_LIMIT_BYTES = Math.max(
@@ -980,8 +1069,13 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     runner: "pi",
     transport: "process",
     processMemoryMaxBytes: DEFAULT_PROCESS_MEMORY_MAX_BYTES,
+    sandbox: { enabled: false, template: "smarty-proof-agent", readyTimeoutMs: 90_000 },
     deniedModels: [],
-    modelPolicy: { requireReason: ["gpt-6-astra"] },
+    modelExceptionsPath: MODEL_EXCEPTIONS_PATH,
+    modelPolicy: {
+      requireReason: ["gpt-6-astra", "opus", "claude"],
+      fallbackThinking: "high",
+    },
     claude: { binary: "claude" },
     veda: { binary: "veda", backend: "agy", persona: "navigator-chat" },
     thinking: DEFAULT_FABRIC_THINKING,
@@ -1065,7 +1159,7 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     lockProtocol: 1,
     stateBackend: "file",
     transport: "file",
-    nats: { replicas: 1, inboxLanes: 8 },
+    nats: { replicas: 1, inboxLanes: 8, events: false, provision: false, ephemeralHost: false, ephemeralInactiveSeconds: 3_600, inboxMaxAgeMs: DEFAULT_INBOX_MAX_AGE_MS },
     enabled: true,
     announce: false,
     actorScope: "project",
@@ -1272,12 +1366,27 @@ const prewalkModeValue = (
 ): FabricPrewalkMode =>
   value === "in-place" || value === "trajectory" ? value : fallback;
 
+const sandboxPlacementUrlValue = (value: unknown): string => {
+  const candidate = value === undefined ? "http://smarty-placement.smarty-island.svc:8080" : value;
+  if (typeof candidate !== "string" || candidate.length > 512) throw new Error("Invalid agents.sandbox.placementUrl");
+  let url: URL;
+  try { url = new URL(candidate); } catch { throw new Error("Invalid agents.sandbox.placementUrl"); }
+  const octets = url.hostname.split(".");
+  const tailnetIp = octets.length === 4 && octets.every(part => /^\d{1,3}$/u.test(part) && Number(part) <= 255) &&
+    Number(octets[0]) === 100 && Number(octets[1]) >= 64 && Number(octets[1]) <= 127;
+  const service = url.hostname === "smarty-placement.smarty-island.svc" && url.port === "8080";
+  if (url.protocol !== "http:" || url.username || url.password || url.pathname !== "/" || url.search || url.hash ||
+    !(service || tailnetIp && url.port === "30880" || isLoopbackPlacementUrl(candidate, url))) throw new Error("agents.sandbox.placementUrl must use the in-cluster HTTP endpoint or a tailnet IPv4 NodePort");
+  return url.origin;
+};
+
 const transportValue = (
   value: unknown,
   fallback: FabricAgentTransport,
 ): FabricAgentTransport =>
   value === "auto" ||
   value === "process" ||
+  value === "sandbox" ||
   value === "tmux" ||
   value === "screen" ||
   value === "localterm" ||
@@ -1435,6 +1544,17 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
   const prewalk = objectValue(input.prewalk);
   const agents = objectValue(input.agents);
   const placement = normalizeAgentPlacement(agents.placement);
+  const sandbox = objectValue(agents.sandbox);
+  const sandboxTemplate = sandbox.template === undefined ? DEFAULT_FABRIC_CONFIG.agents.sandbox.template
+    : typeof sandbox.template === "string" && /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/u.test(sandbox.template)
+      ? sandbox.template : (() => { throw new Error("Invalid agents.sandbox.template"); })();
+  const sandboxConfig: SandboxTransportConfig = {
+    enabled: booleanValue(sandbox.enabled, DEFAULT_FABRIC_CONFIG.agents.sandbox.enabled),
+    template: sandboxTemplate,
+    ...(sandbox.placementUrl !== undefined ? { placementUrl: sandboxPlacementUrlValue(sandbox.placementUrl) } : {}),
+    readyTimeoutMs: boundedInteger(sandbox.readyTimeoutMs, DEFAULT_FABRIC_CONFIG.agents.sandbox.readyTimeoutMs, 1_000, 90_000),
+  };
+  const placementApi = normalizePlacementApiConfig(agents.placementApi);
   const claude = objectValue(agents.claude);
   const veda = objectValue(agents.veda);
   const capture = objectValue(input.capture);
@@ -1503,6 +1623,11 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
   const prewalkModel = stringValue(prewalk.model);
   const prewalkThinking = isFabricThinking(prewalk.thinking) ? prewalk.thinking : undefined;
   const agentModel = stringValue(agents.model);
+  const modelPolicy = objectValue(agents.modelPolicy);
+  const fallbackModel = stringValue(modelPolicy.fallbackModel)?.trim();
+  const fallbackThinking = isFabricThinking(modelPolicy.fallbackThinking)
+    ? modelPolicy.fallbackThinking
+    : undefined;
   const wakeText = normalizeWakeTextConfig(agents.wakeText);
   const router = normalizeAgentRouterConfig(agents.router);
   const deniedModelReplacement = stringValue(agents.deniedModelReplacement)?.trim();
@@ -1749,6 +1874,8 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
         ? { processSlice: agents.processSlice } : {}),
       processMemoryMaxBytes: processMemoryMaxBytesValue(agents.processMemoryMaxBytes),
       ...(placement ? { placement } : {}),
+      sandbox: sandboxConfig,
+      ...(placementApi ? { placementApi } : {}),
       ...(router ? { router } : {}),
       ...(agentModel ? { model: agentModel } : {}),
       ...(typeof agents.modelRouting === "object" && agents.modelRouting !== null && !Array.isArray(agents.modelRouting)
@@ -1787,12 +1914,15 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
             };
           })() }
         : {}),
+      modelExceptionsPath: MODEL_EXCEPTIONS_PATH,
       modelPolicy: {
-        requireReason: [...new Set((Array.isArray(objectValue(agents.modelPolicy).requireReason)
-          ? objectValue(agents.modelPolicy).requireReason as unknown[]
+        requireReason: [...new Set((Array.isArray(modelPolicy.requireReason)
+          ? modelPolicy.requireReason as unknown[]
           : DEFAULT_FABRIC_CONFIG.agents.modelPolicy.requireReason)
           .filter((model): model is string => typeof model === "string" && !!model.trim())
           .map(model => model.trim().toLowerCase()))],
+        ...(fallbackModel ? { fallbackModel } : {}),
+        fallbackThinking: fallbackThinking ?? "high",
       },
       deniedModels: [...new Set((Array.isArray(agents.deniedModels) ? agents.deniedModels : [])
         .filter((model): model is string => typeof model === "string" && !!model.trim())
@@ -2409,6 +2539,7 @@ const resolveFabricConfig = (
       agents: {
         ...(Object.hasOwn(agents, "processSlice") ? { processSlice: agents.processSlice } : {}),
         ...(Object.hasOwn(agents, "processMemoryMaxBytes") ? { processMemoryMaxBytes: agents.processMemoryMaxBytes } : {}),
+        ...(Object.hasOwn(agents, "sandbox") ? { sandbox: agents.sandbox } : {}),
         ...(Array.isArray(agents.deniedModels) ? { deniedModels: agents.deniedModels } : {}),
         ...(Array.isArray(requireReason) ? { modelPolicy: { requireReason } } : {}),
       },
@@ -2440,6 +2571,7 @@ const resolveFabricConfig = (
       const agents = { ...objectValue(document.agents) };
       delete agents.processSlice;
       delete agents.processMemoryMaxBytes; // Root-policy-only, like processSlice.
+      delete agents.sandbox; // Root-policy-only: only the host policy can enable island execution.
       const inheritedAgents = objectValue(merged.agents);
       // Agent-writable lists can add restrictions, never remove a root/default gate.
       const union = (base: unknown, extra: unknown): unknown[] => [
@@ -2464,12 +2596,19 @@ const resolveFabricConfig = (
       delete agents.processSlice;
       delete agents.processMemoryMaxBytes;
       delete agents.placement;
+      delete agents.sandbox; // Host-only: a lane cannot enable island execution.
+      delete agents.placementApi; // Host-only Placement endpoint and timeouts.
       delete agents.deadRootFilter; // Host-only: a lane cannot drop the fleet's exemptions.
       delete agents.stuckPreparingMs; // Host-only: a lane cannot silence the stuck-preparing owner notice.
       document.agents = agents;
       const mesh = { ...objectValue(document.mesh) };
       delete mesh.controlIncarnationFence; // Host-only: a workspace cannot weaken the fence.
       delete mesh.hostTransport; // A workspace cannot replace or clear the host's rollout stamp.
+      const nats = { ...objectValue(mesh.nats) };
+      delete nats.ephemeralHost; // Host-only: a workspace cannot retain its own inbox durable.
+      delete nats.ephemeralInactiveSeconds;
+      delete nats.inboxMaxAgeMs; // Host-only: a workspace cannot alter shared inbox stream retention.
+      mesh.nats = nats;
       document.mesh = mesh;
       const executor = { ...objectValue(document.executor) };
       const landlock = { ...objectValue(executor.landlock) };
@@ -2512,6 +2651,8 @@ const resolveFabricConfig = (
     merged.fullCodeMode = inheritedFullCodeMode === "true";
   }
   const normalized = normalizeFabricConfig(merged);
+  // Host-owned exceptions: no host/project config layer can supply or redirect them.
+  normalized.agents.modelExceptionsPath = MODEL_EXCEPTIONS_PATH;
   if (applyEnvironmentOverrides && process.env[FABRIC_THINKING_BOUNDS_ENV] !== undefined) {
     // A child only narrows its own bounds by the parent's; never widens them.
     const inherited = inheritedThinkingBounds();

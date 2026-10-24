@@ -27,7 +27,6 @@ import {
 import type { FabricParticipantSource } from "../topology/types.js";
 import { FABRIC_PARTICIPANT_LIFECYCLE_TOPIC } from "../lifecycle/types.js";
 import { actionArgNormalizer } from "./arg-normalization.js";
-import { deliverWithMessageNotice, outgoingMessageNotice } from "./message-id-notice.js";
 
 const emptySchema = { type: "object", properties: {}, additionalProperties: false };
 const INTERNAL_STATE_PREFIXES = ["topology/", "sessions/", "actors/", "residency/", "decisions/"];
@@ -465,9 +464,7 @@ export class MeshProvider implements FabricProvider {
         }
         if (dueAt === undefined && args.key !== undefined) throw new Error("mesh.publish key requires notBefore or afterMs");
         const dedupeKey = dueAt === undefined ? namespacedDedupeKey(args, context) : undefined;
-        const checked = typeof args.text === "string" ? await outgoingMessageNotice(args.text, context, this.identity.id) : undefined;
-        // One closure for both: a scheduled publish (upstream; the store releases it at dueAt,
-        // key replaces) keeps the originating principal and the outgoing-message notice path.
+        // A scheduled publish keeps the originating principal; the store releases it at dueAt.
         const publish = (text?: string) => {
           context.signal?.throwIfAborted();
           const message = {
@@ -485,30 +482,26 @@ export class MeshProvider implements FabricProvider {
           }
           return this.store.publish({ ...message, signal: context.signal, ...(dedupeKey === undefined ? {} : { dedupeKey }) });
         };
-        const event = checked
-          ? await deliverWithMessageNotice<Awaited<ReturnType<typeof publish>>>(args.text as string, checked, publish, "mesh.publish")
-          : await publish();
-        return checked?.notice ? { ...event, notice: checked.notice } : event;
+        return publish(typeof args.text === "string" ? args.text : undefined);
       }
       case "publishBatch": {
         assertPublishArguments(actionName, args, context);
         const events = args.events as Record<string, unknown>[];
         // Capture/validate the entire request before any append. The store owns per-event
         // receipts and bounded-prefix admission; never wrap an uncertain batch in a retry.
-        const inputs = await Promise.all(events.map(async event => {
+        const inputs = events.map(event => {
           const topic = String(event.topic);
           assertPublishTopic(topic);
-          const checked = typeof event.text === "string" ? await outgoingMessageNotice(event.text, context, this.identity.id) : undefined;
           const dedupeKey = namespacedDedupeKey(event, context);
           return {
             topic, from: this.identity, principal: invocationFabricPrincipal(context), signal: context.signal,
             ...(dedupeKey === undefined ? {} : { dedupeKey }),
             ...(typeof event.kind === "string" ? { kind: event.kind } : {}),
             ...(typeof event.to === "string" ? { to: event.to } : {}),
-            ...(checked ? { text: checked.text } : {}),
+            ...(typeof event.text === "string" ? { text: event.text } : {}),
             ...(event.data !== undefined ? { data: event.data } : {}),
           };
-        }));
+        });
         context.signal?.throwIfAborted();
         return this.store.publishBatch(inputs);
       }

@@ -1,5 +1,5 @@
 // Real-broker TLS control relay. It never synthesizes INFO/USER.INFO or permissions.
-// Hold only an authentication-verification request; all other client/server traffic flows unchanged.
+// Hold or drop only an authentication-verification request; all other client/server traffic flows unchanged.
 import fs from "node:fs";
 import { createServer, connect as tcpConnect, type AddressInfo, type Socket } from "node:net";
 import { connect as tlsConnect, createSecureContext, TLSSocket } from "node:tls";
@@ -31,6 +31,7 @@ export class ReconnectRelay {
 
   enabled = true;
   holdVerification = false;
+  dropNextVerification = false;
   private held: Array<() => void> = [];
   private readonly sockets = new Set<Socket>();
   private routeTarget: PathBHarness;
@@ -113,7 +114,10 @@ export class ReconnectRelay {
           // Record only protocol verbs and subjects, never CONNECT/JWT/seed/payload bytes.
           this.commands.push(words[0]!);
           if (publish) this.subjects.push(words[1]!);
-          if (publish && words[1] === "$SYS.REQ.USER.INFO" && this.holdVerification) {
+          if (publish && words[1] === "$SYS.REQ.USER.INFO" && this.dropNextVerification) {
+            this.dropNextVerification = false;
+            this.verification.resolve();
+          } else if (publish && words[1] === "$SYS.REQ.USER.INFO" && this.holdVerification) {
             heldOnThisConnection = true;
             this.held.push(() => { if (!secureUpstream.destroyed) secureUpstream.write(frame); });
             this.verification.resolve();

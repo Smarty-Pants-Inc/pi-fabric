@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { hostedOnly, isHostedOnlyAllowed } from "../scripts/hosted-only.mjs";
 import fs from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -6,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import * as offlineRemoval from "../src/actors/remove-offline.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { ROOT_PARTICIPANT_FRESH_MS } from "../src/residency/operator-safety.js";
+import * as treeRemoval from "../src/storage/verified-remove.js";
 import { actorTreeDeletionHooks, mainPublicationFenced } from "../src/topology/main-publication-fence.js";
 import { fixture, mainDirectory, type DeadRootFixture } from "./helpers/dead-root-fixture.js";
 
@@ -19,14 +21,20 @@ import { fixture, mainDirectory, type DeadRootFixture } from "./helpers/dead-roo
 // manager.remove. Decision C: native operator-bin integration with a RECORDED tree delete (supplemental); the real
 // deletion is the hosted-only test at the end. Not an installed Pi product E2E.
 //
-// LOCAL tests (names start "recorded:"): every fs.rmSync / fs.promises.rm / fs.rmdirSync of a directory at or under
-// the session actor root is recorded with the kernel fence state at that instant and NOT performed (#4664, same guard
-// as tests/actor-remove-live-fence.test.ts). The fence, the hooks, the operator check and the marker are real.
-// Safe local selection: bunx vitest run tests/actor-legacy-session-cleanup.test.ts -t "recorded:"
+// LOCAL tests (names start "recorded:"): the actor-tree delete is recorded with the kernel fence state at that instant
+// and NOT performed. On Linux the manager deletes the tree through verifiedRemove (a graveyard move, then
+// directory-relative unlink/rmdir through /proc/self/fd paths that a path-prefix guard on fs.rmSync never sees), so the
+// recorder sits at that boundary: an in-tree verifiedRemove call is the "rm" event, with its judged stat kept for the
+// identity assertion. The raw fs.rmSync / fs.promises.rm / fs.rmdirSync guard stays as a second net for a path-based
+// fallback, and a beforeOpen hook makes any in-tree call that still reaches the real helper refuse before its first
+// open (recorded as "unguarded", which fails the event expectations). The fence, the hooks, the operator check and the
+// marker are real. Safe local selection: bunx vitest run tests/actor-legacy-session-cleanup.test.ts -t "recorded:"
 type Call = { at: string; fenced: boolean; path?: string };
+/** One recorded in-tree verifiedRemove call: its target, the judged stat it was handed and the fence at that instant. */
+type Judged = { target: string; deleter: string; dryRun: boolean; fenced: boolean; dev?: number; ino?: number; directory?: boolean };
 
 const METADATA_LOCK = /\.lock(\.dead\.[0-9a-f]+)?$/;
-const guardActorTrees = (roots: string[], fenced: () => boolean, calls: Call[]) => {
+const guardActorTrees = (roots: string[], fenced: () => boolean, calls: Call[], judgedRemovals: Judged[] = []) => {
   const inTree = (file: unknown) => {
     const resolved = path.resolve(String(file));
     if (METADATA_LOCK.test(path.basename(resolved))) return false;
@@ -40,6 +48,22 @@ const guardActorTrees = (roots: string[], fenced: () => boolean, calls: Call[]) 
     if (inTree(file)) record(file); else rmdirSync(file, options);
   }) as typeof fs.rmdirSync);
   vi.spyOn(fs.promises, "rm").mockImplementation(async (file, options) => { if (inTree(file)) record(file); else await rm(file, options); });
+  // The actual Linux boundary: record an in-tree verifiedRemove (as the "rm" event) and report it removed, performing
+  // nothing. Every other target goes to the real helper unchanged.
+  const verify = treeRemoval.verifiedRemove;
+  vi.spyOn(treeRemoval, "verifiedRemove").mockImplementation((target, judged, options) => {
+    if (!inTree(target)) return verify(target, judged, options);
+    record(target);
+    judgedRemovals.push({ target: path.resolve(target), deleter: options.deleter, dryRun: options.dryRun === true, fenced: fenced(),
+      ...(judged ? { dev: judged.dev, ino: judged.ino, directory: judged.isDirectory() } : {}) });
+    return { removed: true, bytes: 0 };
+  });
+  // Fail safe: an in-tree call that bypassed the spy refuses before the real helper opens anything.
+  treeRemoval.verifiedRemoveTestHooks.beforeOpen = (target) => {
+    if (!inTree(target)) return;
+    calls.push({ at: "unguarded", path: path.resolve(target), fenced: fenced() });
+    throw new Error("recorded test: an actor-tree verifiedRemove reached the real helper");
+  };
 };
 const observe = (fenced: () => boolean, calls: Call[]) => {
   actorTreeDeletionHooks.beforeCheck = () => { calls.push({ at: "beforeCheck", fenced: fenced() }); };
@@ -51,12 +75,18 @@ const observe = (fenced: () => boolean, calls: Call[]) => {
 };
 
 afterEach(() => {
+  delete treeRemoval.verifiedRemoveTestHooks.beforeOpen;
   delete actorTreeDeletionHooks.beforeCheck;
   delete actorTreeDeletionHooks.beforeDelete;
   vi.restoreAllMocks();
 });
 
 const run = promisify(execFile);
+// The test deletion guard that Node children inherit through NODE_OPTIONS announces its hosted-only report mode once,
+// first, on stderr when the runner is not hosted-admitted (the bin inherits this env, so it decides the same). That one
+// exact line is expected test policy output, not product stderr; anything else stays and fails the err expectations.
+const GUARD_NOTICE = /^hosted-only \(outside-temp deletion reporting\): push and let CI run it\r?\n/;
+const productStderr = (stderr: string) => isHostedOnlyAllowed(process.env) ? stderr : stderr.replace(GUARD_NOTICE, "");
 /** The real operator bin, in its own process; the in-process resident answers over its request channel. */
 const bin = async (f: DeadRootFixture, action: "remove" | "stop", actor: string, ...flags: string[]) => {
   const cli = path.resolve("bin/fabric-actors");
@@ -64,11 +94,11 @@ const bin = async (f: DeadRootFixture, action: "remove" | "stop", actor: string,
   try {
     const { stdout, stderr } = await run(process.execPath, [cli, action, "--resident", f.config.residencyRoot, "--actor", actor,
       "--mesh-root", f.config.meshRoot, ...flags], { timeout: 60_000 });
-    return { code: 0, out: stdout, err: stderr };
+    return { code: 0, out: stdout, err: productStderr(stderr) };
   } catch (error) {
     const failed = error as { code?: unknown; stdout?: string; stderr?: string };
     if (typeof failed.code !== "number") throw error;
-    return { code: failed.code, out: failed.stdout ?? "", err: failed.stderr ?? "" };
+    return { code: failed.code, out: failed.stdout ?? "", err: productStderr(failed.stderr ?? "") };
   }
 };
 
@@ -100,11 +130,14 @@ describe.skipIf(process.platform !== "linux")("legacy session actor cleanup mark
     const f = await fixture();
     const fenced = () => mainPublicationFenced(f.config.meshRoot, f.config.rootId);
     const calls: Call[] = [];
+    const judged: Judged[] = [];
     try {
       const s = seedLegacy(f);
-      guardActorTrees([s.sessionRoot], fenced, calls);
+      const tree = fs.lstatSync(s.tree);
+      guardActorTrees([s.sessionRoot], fenced, calls, judged);
       observe(fenced, calls);
       // Before the request: a revoked row, an unflagged marker, nothing attempted.
+      expect(judged).toEqual([]);
       expect(s.registered()).toBe(false);
       const before = JSON.parse(fs.readFileSync(s.marker, "utf8"));
       expect(before).toMatchObject({ id: ID, owner: { rootId: f.config.rootId, residency: "session" } });
@@ -124,7 +157,11 @@ describe.skipIf(process.platform !== "linux")("legacy session actor cleanup mark
       expect(calls).toEqual([
         { at: "beforeCheck", fenced: true }, { at: "operatorCheck", fenced: true }, { at: "beforeDelete", fenced: true },
         { at: "rm", path: path.resolve(s.tree), fenced: true }]);
+      // The one tree delete was handed the judged inode of this exact tree, under the held fence, as a real apply.
+      expect(judged).toEqual([{ target: path.resolve(s.tree), deleter: "actor-tree", dryRun: false, fenced: true,
+        dev: tree.dev, ino: tree.ino, directory: true }]);
       expect(s.history()).toBe("history\n"); // recorded, never performed
+      expect(fs.readFileSync(path.join(s.tree, "history", "run.jsonl"), "utf8")).toBe("run\n");
       expect(fenced()).toBe(false);
     } finally { await f.close(); vi.restoreAllMocks(); } // guard kept through teardown
   }, 120_000);
@@ -134,14 +171,16 @@ describe.skipIf(process.platform !== "linux")("legacy session actor cleanup mark
     const main = mainDirectory(f.config.meshRoot, f.config.rootId);
     const fenced = () => mainPublicationFenced(f.config.meshRoot, f.config.rootId);
     const calls: Call[] = [];
+    const judged: Judged[] = [];
     try {
       const s = seedLegacy(f);
       await main.refresh(); // a fresh root participant whose Main (this process) is alive
-      guardActorTrees([s.sessionRoot], fenced, calls);
+      guardActorTrees([s.sessionRoot], fenced, calls, judged);
       observe(fenced, calls);
       await bin(f, "remove", ID, "--confirm-dead-root", f.config.rootId);
       await f.host.actors.removalSettled(ID)?.catch(() => undefined);
-      expect(calls.filter(call => call.at === "rm")).toEqual([]);
+      expect(calls.filter(call => call.at === "rm" || call.at === "unguarded")).toEqual([]);
+      expect(judged).toEqual([]);
       expect(JSON.parse(fs.readFileSync(s.marker, "utf8"))).toMatchObject({ id: ID, owner: { rootId: f.config.rootId, residency: "session" } });
       expect(s.history()).toBe("history\n");
       expect(s.registered()).toBe(false);
@@ -154,10 +193,12 @@ describe.skipIf(process.platform !== "linux")("legacy session actor cleanup mark
     const main = mainDirectory(f.config.meshRoot, f.config.rootId);
     const fenced = () => mainPublicationFenced(f.config.meshRoot, f.config.rootId);
     const calls: Call[] = [];
+    const judged: Judged[] = [];
     let mainOpen = true;
     try {
       const s = seedLegacy(f); // Main independently dead at acceptance
-      guardActorTrees([s.sessionRoot], fenced, calls);
+      const tree = fs.lstatSync(s.tree);
+      guardActorTrees([s.sessionRoot], fenced, calls, judged);
       observe(fenced, calls);
       // The host has committed the operator request; the fence is not yet taken. A real Main publishes now.
       const originalRemove = f.host.actors.remove.bind(f.host.actors);
@@ -175,7 +216,9 @@ describe.skipIf(process.platform !== "linux")("legacy session actor cleanup mark
       expect(f.host.actors.cleanupObligation(ID)).toBeDefined();
       expect(calls.some(call => call.at === "operatorCheck")).toBe(true);
       expect(calls.filter(call => call.at === "operatorCheck").every(call => call.fenced)).toBe(true);
-      expect(calls.filter(call => call.at === "beforeDelete" || call.at === "rm")).toEqual([]);
+      expect(calls.filter(call => call.at === "beforeDelete" || call.at === "rm" || call.at === "unguarded")).toEqual([]);
+      // The late Main's veto stopped the delete before the boundary: verifiedRemove was never handed the tree.
+      expect(judged).toEqual([]);
       expect(s.history()).toBe("history\n");
       expect(fenced()).toBe(false);
 
@@ -192,7 +235,11 @@ describe.skipIf(process.platform !== "linux")("legacy session actor cleanup mark
       expect(calls).toEqual([
         { at: "beforeCheck", fenced: true }, { at: "operatorCheck", fenced: true }, { at: "beforeDelete", fenced: true },
         { at: "rm", path: path.resolve(s.tree), fenced: true }]);
+      // The retry's one delete was handed this tree's judged inode under the held fence.
+      expect(judged).toEqual([{ target: path.resolve(s.tree), deleter: "actor-tree", dryRun: false, fenced: true,
+        dev: tree.dev, ino: tree.ino, directory: true }]);
       expect(s.history()).toBe("history\n"); // recorded, never performed
+      expect(fs.readFileSync(path.join(s.tree, "history", "run.jsonl"), "utf8")).toBe("run\n");
       expect(fenced()).toBe(false);
     } finally { if (mainOpen) await main.close(); await f.close(); vi.restoreAllMocks(); }
   }, 120_000);
@@ -257,7 +304,7 @@ describe.skipIf(process.platform !== "linux")("legacy session actor cleanup mark
 
   // HOSTED ONLY. NEVER RUN LOCALLY (#4664: it performs a real actor-tree deletion). The parent selects only the
   // "recorded:" tests locally; this one runs only in hosted CI as the real-path red/green proof. No interception.
-  it("hosted real deletion: the real bin's exact-id operator remove deletes the legacy session tree and its marker", async () => {
+  it.runIf(hostedOnly("legacy session actor deletion"))("hosted real deletion: the real bin's exact-id operator remove deletes the legacy session tree and its marker", async () => {
     const f = await fixture();
     try {
       const s = seedLegacy(f);

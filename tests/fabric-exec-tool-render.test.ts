@@ -94,14 +94,12 @@ const renderResult = (
 const nestedRows = (rendered: string): string[] => rendered.split("\n").slice(1);
 
 describe("registered fabric_exec compact transcript rendering", () => {
-  it.each([true, false])("advertises Main bounds in full-code mode %s", fullCodeMode => {
+  it.each([true, false])("renders without injecting workflow guidelines in full-code mode %s", fullCodeMode => {
     const state = stateFor("compact");
     state.config.fullCodeMode = fullCodeMode;
-    const guidelines = toolFor(state).promptGuidelines ?? [];
-    expect(guidelines).toHaveLength(7); // six visible clauses plus the QuickJS host-globals clause
-    expect(guidelines.join("\n")).toContain(
-      "In a Main, a fabric_exec program ends after 10 min and agents.run/wait return after 60 s; spawned agents keep running and report back.",
-    );
+    const tool = toolFor(state);
+    expect(tool.promptGuidelines).toBeUndefined();
+    expect(renderCall(tool, { code: "return 1", display: { name: "Probe", description: "Check the result" } })).toContain("Check the result");
   });
   it("infers Python compact titles while preserving explicit intent and neutral fallbacks", () => {
     const state = stateFor("compact");

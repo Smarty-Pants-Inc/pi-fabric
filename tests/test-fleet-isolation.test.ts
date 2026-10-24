@@ -156,10 +156,10 @@ test.each(["vitest.config.cts", "tests/fleet-isolation-setup.ts"])(
       fs.mkdirSync(path.join(sentinel, "agent"));
       fs.writeFileSync(path.join(sentinel, "agent", "fabric.json"), '{"sentinel":"unchanged"}\n');
       const testControls = {
-        PI_FABRIC_JEV_LIVE: "1", PI_FABRIC_JEV_LOCALTERM: "1",
+        PI_FABRIC_JEV_LIVE: "1", PI_FABRIC_JEV_LOCALTERM: "1", PI_FABRIC_NATS_REHEARSAL: "1",
         PI_FABRIC_ACTIVATION_TEST_PI_BINARY: "./exact artifact/native.exe",
         PI_FABRIC_ACTIVATION_TEST_WORKER: "./exact artifact/worker.js",
-        PI_FABRIC_TEST_PG_BIN: "./exact artifact/pg bin", PI_FABRIC_TEST_PID_DELAY_MS: "600",
+        PI_FABRIC_TEST_PG_BIN: "./exact artifact/pg bin", PI_FABRIC_TEST_PID_DELAY_MS: "600", PI_FABRIC_REQUIRE_NATS: "1",
       };
       const env: NodeJS.ProcessEnv = { ...process.env, ...testControls, FLEET_ISOLATION_SENTINEL: sentinel,
         FLEET_ISOLATION_ENTRY: path.join(repo, entry), FLEET_ISOLATION_TEST_CONTROLS: JSON.stringify(testControls) };
@@ -173,6 +173,7 @@ test.each(["vitest.config.cts", "tests/fleet-isolation-setup.ts"])(
         "PI_FABRIC_CAPABILITY_DIGEST", "PI_FABRIC_GRANTED_RISKS", "PI_FABRIC_TOOL_ALLOWLIST",
         "PI_FABRIC_FUTURE_SELECTOR", "PI_FABRIC_PI_BINARY", "PI_FABRIC_NODE_BINARY",
         "PI_FABRIC_PROFILE", "PI_FABRIC_JEV_LIVE_EXTRA", "PI_FABRIC_ACTIVATION_TEST_WORKER_EXTRA",
+        "PI_FABRIC_NATS_REHEARSAL_EXTRA", "pi_fabric_nats_rehearsal_foreign",
         "PI_FABRIC_TEST_FUTURE", "PI_FABRIC_TEST_PG_BIN_EXTRA", "pi_fabric_future_case_selector",
         "SMARTY_ROLE", "SMARTY_AGENT", "HERDR_WORKSPACE_ID"])
         env[key] = "production-main-sentinel";

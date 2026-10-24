@@ -23,6 +23,7 @@ import { watchBridgeStore } from "../mesh/change-notifier.js";
 import type { FabricMessageSender } from "../protocol.js";
 import { eventReceipts } from "./root-inbox-shared.js";
 import { FileTransport } from "../transport/file.js";
+import { fabricPathBProbeEpochNs, hasFabricPathBProbeObserver, recordFabricPathBProbe, type FabricPathBProbeEvent } from "../transport/probe-hooks.js";
 import { TransportInvalidError, TransportUncertainError, TransportUnavailableError, TransportUnsupportedError, type FabricTransport, type TransportDelivery, type TransportDrainState, type TransportEnvelope, type TransportSent } from "../transport/types.js";
 import type { ParticipantRoute, ParticipantView } from "./participant-view.js";
 import { assertNatsDrainReceiptForRelease, readNatsDrainReceipt } from "./nats-drain-receipt.js";
@@ -53,6 +54,8 @@ type NatsControlErrorCode = "FABRIC_CONTROL_ID_CONFLICT" | "FABRIC_SENDER_UNVERI
 // Keep this constant local: importing the optional UDS runtime would widen startup.
 const RELAY_ACK_RECOVERY_TTL_MS = 8_000;
 const RELAY_ACK_RECOVERY_LIMIT = 256;
+const ORIGIN_IDEMPOTENCY_TTL_MS = NATS_HORIZON_MS;
+const ORIGIN_IDEMPOTENCY_LIMIT = 100_000;
 const UNFENCED_SENDER_WARNING_MS = 60 * 60 * 1_000;
 // A cancellation owns a separate retry deadline, longer than a production mesh lock wait.
 const CANCELLATION_RETENTION_MS = 60_000;
@@ -468,6 +471,17 @@ const snapshotControlInput = (input: FabricControlInput): FabricControlInput => 
   binding: input.binding,
   bindingProvenance: input.bindingProvenance,
 })) as FabricControlInput;
+const controlRequestFingerprint = (operation: FabricControlOperation, input: FabricControlInput): string =>
+  controlBodyFingerprint({
+    operation,
+    ...(input.message !== undefined ? { message: input.message } : {}),
+    ...(input.data !== undefined ? { data: input.data } : {}),
+    ...(input.priority !== undefined ? { priority: input.priority } : {}),
+    ...(input.triggerTurn !== undefined ? { triggerTurn: input.triggerTurn } : {}),
+    ...(input.wakeCause !== undefined ? { wakeCause: input.wakeCause } : {}),
+    ...(input.binding !== undefined ? { binding: input.binding } : {}),
+    ...(input.bindingProvenance !== undefined ? { bindingProvenance: input.bindingProvenance } : {}),
+  }, input.principal);
 
 /** Trust owner-default provenance only from a validated member of that actor's root. */
 export const controlActorBindingOptions = (
@@ -556,6 +570,10 @@ interface RetainedRelayAcknowledgement {
   readonly authority: ControlAcknowledgementAuthority;
   readonly acknowledgement?: OwnerAcknowledgement;
 }
+interface OriginIdempotencyRecord {
+  readonly bodyFingerprint: string;
+  readonly expiresAt: number;
+}
 
 /** Never invoke a getter while capturing a late ACK; wire records must be plain own data. */
 const ownDataRecord = (value: unknown): Record<string, unknown> | undefined => {
@@ -572,6 +590,8 @@ const relayAcknowledgementKey = (commandId: string, idempotencyKey: string): str
 interface ClaimedControlCommand {
   event: MeshEvent;
   claimVersion: number;
+  /** A future-skew refusal must survive the shared claim's lock wait. */
+  futureSkewed?: boolean;
   acceptance?: FabricControlAcceptance;
   saved?: boolean;
   running?: boolean;
@@ -628,8 +648,30 @@ type OwnedControlCommand = ClaimedControlCommand | SavedControlAcknowledgement;
 export class FabricControlPlane {
   readonly incarnation: string;
   readonly #pending = new Map<string, PendingControlRequest>();
+  // Insertion order bounds sender-local key/fingerprint bindings; retain no request body.
+  readonly #originIdempotency = new Map<string, OriginIdempotencyRecord>();
   // Insertion order is LRU, shared by the authority-only and validated-ACK entries.
   readonly #relayAcknowledgements = new Map<string, RetainedRelayAcknowledgement>();
+
+  #bindOriginIdempotencyKey(commandId: string, idempotencyKey: string, bodyFingerprint: string): void {
+    const now = Date.now();
+    // Entries are inserted with one fixed TTL and never promoted, so expired records form a prefix.
+    for (const [key, entry] of this.#originIdempotency) {
+      if (entry.expiresAt > now) break;
+      this.#originIdempotency.delete(key);
+    }
+    // commandId already hashes the scoped caller key, avoiding retention of the raw key.
+    const key = commandId;
+    const existing = this.#originIdempotency.get(key);
+    if (existing) {
+      if (existing.bodyFingerprint !== bodyFingerprint) throw new FabricIdempotencyKeyReusedError(idempotencyKey);
+      return;
+    }
+    if (this.#originIdempotency.size >= ORIGIN_IDEMPOTENCY_LIMIT) {
+      throw new Error("Fabric origin idempotency window is full; retry after retained keys expire");
+    }
+    this.#originIdempotency.set(key, { bodyFingerprint, expiresAt: now + ORIGIN_IDEMPOTENCY_TTL_MS });
+  }
 
   #pruneRelayAcknowledgements(): void {
     const now = Date.now();
@@ -705,10 +747,8 @@ export class FabricControlPlane {
     { controller: AbortController; requesterId: string; targetId: string }
   >();
   readonly #activeHandlers = new Set<Promise<void>>();
-  // Retain progress across lock timeout AND lease loss. Shared claims owned by
-  // this runtime precede local claim admission; owned commands retain the exact
-  // outcome until its sequence and ACK commit, never replaying a completed handler.
-  readonly #sharedClaims = new Map<string, number>();
+  // Retain the shared claim and exact private outcome across lock timeout AND lease
+  // loss until its sequence and ACK commit, never replaying a completed handler.
   readonly #ownedCommands = new Map<string, OwnedControlCommand>();
   #ackWorker: Promise<void> | undefined;
   #ackPublicationFailed = false;
@@ -744,6 +784,7 @@ export class FabricControlPlane {
   readonly #bridgeTimeoutMs: number;
   readonly #inboxLanes: number;
   readonly #transport: FabricTransport;
+  #stopVerifiedReconnect: (() => void) | undefined;
   readonly #relayOperatorMachine: string | undefined;
   readonly #expectedNatsInboxStream: string | undefined;
   // File-only access stays behind the legacy branches, including reader/cursor semantics.
@@ -763,6 +804,7 @@ export class FabricControlPlane {
   #natsInbox: Promise<void> | undefined;
   #natsInboxRetryTimer: NodeJS.Timeout | undefined;
   #natsInboxRetryDelayMs = 1_000;
+  #natsInboxRetryAttempt = 0;
   #natsWorkingTimer: NodeJS.Timeout | undefined;
   #natsCleanupTimer: NodeJS.Timeout | undefined;
   #natsCleanupAt = Infinity;
@@ -771,8 +813,8 @@ export class FabricControlPlane {
   #lastSequence: number;
   // Drains run at start, on mesh event-log notifications and after this process's own
   // publishes. Idle has no timer: #retryTimer exists only for retained work (a failed or
-  // deferred drain's backoff, a gated drain, a retained owned outcome, or a shared claim's
-  // real expiry), #rearmTimer only for a failed watcher's bounded re-arm. The shared
+  // deferred drain's backoff, a gated drain, a retained owned outcome, or shared-state
+  // cleanup), #rearmTimer only for a failed watcher's bounded re-arm. The shared
   // observation carrier owns the sole degraded-only minute scan when re-arms exhaust.
   #started = false;
   #stopWatch: (() => void) | undefined;
@@ -792,7 +834,6 @@ export class FabricControlPlane {
   /** A wake no completed drain has served yet; a wake during a drain makes the loop run again. */
   #dirty = false;
   #draining = false;
-  #wakeScheduled = false;
   #leaseWatchdog: NodeJS.Timeout | undefined;
   #polling: Promise<void> | undefined;
   readonly #backgroundPoll = new MeshBackgroundRetry("control claim/ack poll")
@@ -817,8 +858,8 @@ export class FabricControlPlane {
    * This host's dedupe records with their outcomes. Only this host reads them, so they live in
    * its own store under the mesh root rather than the shared state that every runtime parses
    * and every heartbeat rewrites under the one lock (smarty-dev#643). The host id is stable
-   * across reloads. While runtimes before this change may run, each claim is also made in the
-   * shared state (see #acceptCommand).
+   * across reloads. For file delivery the shared create-only CAS owns admission; the first
+   * private save creates the outcome instead of taking another claim (see #acceptCommand).
    */
   readonly #seen: MeshStore;
 
@@ -868,6 +909,9 @@ export class FabricControlPlane {
 
   get transportKind(): FabricTransport["kind"] { return this.#transport.kind; }
   get participantView(): ParticipantView | undefined { return this.options.participants; }
+  onVerifiedReconnect(listener: () => void): () => void {
+    return this.#transport.onVerifiedReconnect?.(listener) ?? (() => undefined);
+  }
 
   start(handler: FabricControlHandler): void {
     this.#handler = handler;
@@ -1031,9 +1075,6 @@ export class FabricControlPlane {
     const ownerIncarnation = input.ownerIncarnation;
     options.signal?.throwIfAborted();
     const idempotencyKey = options.idempotencyKey ?? randomUUID();
-    const commandId = createHash("sha256")
-      .update(JSON.stringify([this.options.hostId, ownerHostId, ownerIdentityId, targetId, operation, idempotencyKey, notRunAttempt]))
-      .digest("hex");
     let mirroredOwner: PendingControlRequest["mirroredOwner"];
     const unavailable = (host: string): Error => new Error(
       `Fabric mesh bridge routing to remote host ${host} is unavailable for ${targetId}; ` +
@@ -1070,6 +1111,12 @@ export class FabricControlPlane {
       ...(input.bindingProvenance !== undefined ? { bindingProvenance: input.bindingProvenance } : {}),
     });
     const bodyFingerprint = controlBodyFingerprint(commandBody, input.principal);
+    const originFingerprint = controlRequestFingerprint(operation, input);
+    const commandId = createHash("sha256")
+      .update(JSON.stringify([this.options.hostId, ownerHostId, ownerIdentityId, targetId, operation, idempotencyKey, notRunAttempt]))
+      .digest("hex");
+    // Bind this caller key to its semantic request before any publication can occur.
+    this.#bindOriginIdempotencyKey(commandId, idempotencyKey, originFingerprint);
     const existingPending = this.#pending.get(commandId);
     if (existingPending) {
       if (existingPending.ownerIncarnation === ownerIncarnation &&
@@ -1399,10 +1446,9 @@ export class FabricControlPlane {
 
   /**
    * Win the owner's create-only claim for a timed-out command with a terminal "expired, not run"
-   * record (the same record the owner writes for a command it reads past its deadline). Both the
-   * owner's admission and its duplicate check read this claim before running the handler, so a
-   * win proves the message was never and will never be delivered. A lost race means the owner
-   * holds it, and the outcome stays unknown.
+   * record. The owner's admission uses the same CAS, so a win proves the message was never
+   * and will never be delivered. A lost race means the owner holds it: even an owner expiry
+   * saved privately is unknown to this sender until its ACK arrives.
    */
   async #withdrawUnclaimed(commandId: string, pending: PendingControlRequest): Promise<boolean> {
     // E14-X1: a NATS-era local claim cannot be disproved by winning the shared file claim.
@@ -1431,7 +1477,8 @@ export class FabricControlPlane {
       return true;
     } catch (error) {
       if (isLockTimeout(error)) return false;
-      // The owner may itself have recorded the expiry first.
+      // A previous withdrawal or older owner may have left a shared terminal expiry.
+      // Current owners save expiry privately; their bare shared claim proves no outcome.
       return expired(controlSeenRecord(this.mesh.get(key, { fresh: true })?.value));
     }
   }
@@ -1574,7 +1621,7 @@ export class FabricControlPlane {
     check();
     await this.#backgroundCancellations.checkpointForRelease();
     check();
-    if (this.#activeCommands.size || this.#pending.size || this.#resendWaits.size || this.#sharedClaims.size || this.#ownedCommands.size || this.#releasePublicationFailed) {
+    if (this.#activeCommands.size || this.#pending.size || this.#resendWaits.size || this.#ownedCommands.size || this.#releasePublicationFailed) {
       throw new Error("Control release has unsettled publication obligations");
     }
     const state = JSON.stringify(this.#readReleaseState());
@@ -1656,7 +1703,7 @@ export class FabricControlPlane {
   releaseCheckpointReceipt(): unknown {
     const saved = this.#releaseCheckpoint;
     if (!this.#paused || !saved || saved.epoch !== this.#releaseEpoch || this.#polling || this.#activeCommands.size ||
-        this.#activeHandlers.size || this.#pending.size || this.#resendWaits.size || this.#sharedClaims.size || this.#ownedCommands.size || this.#releasePublicationFailed) {
+        this.#activeHandlers.size || this.#pending.size || this.#resendWaits.size || this.#ownedCommands.size || this.#releasePublicationFailed) {
       throw new Error("Control release checkpoint receipt is unavailable or unsettled");
     }
     if (this.#transport.kind === "nats" && (this.#natsWork.size || this.#natsPublishes.size || this.#natsReceipts.size ||
@@ -1668,6 +1715,12 @@ export class FabricControlPlane {
     return { admissionHeld: true, state, receiptScope: this.#transport.kind === "nats"
       ? "persisted local outcomes and broker drain snapshot at checkpoint, not a fresh broker read"
       : "persisted claims/outcomes and correlated ACK log, not UI quiet" };
+  }
+
+  /** Join in-flight NATS inbox deliveries before a short-lived owner withdraws after handling a reply. */
+  async settleNatsInbox(): Promise<void> {
+    if (this.#transport.kind !== "nats") return;
+    while (this.#natsWork.size) await Promise.allSettled([...this.#natsWork]);
   }
 
   async close(): Promise<void> {
@@ -1688,7 +1741,6 @@ export class FabricControlPlane {
     this.#retryTimer = undefined;
     await this.#polling?.catch(() => undefined);
     if (!this.#paused) await this.#drain().catch(() => undefined);
-    this.#sharedClaims.clear();
     const cancellations: Promise<void>[] = [];
     for (const id of [...this.#pending.keys()]) {
       const pending = this.#clearPending(id);
@@ -1700,6 +1752,7 @@ export class FabricControlPlane {
     for (const active of this.#activeCommands.values()) active.controller.abort();
     await Promise.allSettled([...this.#activeHandlers]);
     this.#handler = undefined;
+    this.#originIdempotency.clear();
     this.#relayAcknowledgements.clear();
     const pendingAcknowledgements = [...this.#ownedCommands].filter(([, owned]) => owned.acknowledgement);
     if (this.#ackPublicationFailed || pendingAcknowledgements.length) {
@@ -1730,7 +1783,7 @@ export class FabricControlPlane {
     this.#polling = polling;
     try {
       const complete = await operation;
-      if (!this.#ownedCommands.size && !this.#sharedClaims.size) this.#backgroundPoll.success();
+      if (!this.#ownedCommands.size) this.#backgroundPoll.success();
       return complete;
     } catch (error) {
       if (!(error instanceof MeshConsumptionPausedError)) throw error;
@@ -1804,10 +1857,7 @@ export class FabricControlPlane {
   #wake(): void {
     if (this.#closed || !this.options.enabled || !this.#started) return;
     this.#dirty = true;
-    if (this.#wakeScheduled) return;
-    this.#wakeScheduled = true;
     queueMicrotask(() => {
-      this.#wakeScheduled = false;
       void this.#runDrains();
     });
   }
@@ -1872,15 +1922,10 @@ export class FabricControlPlane {
    * Empty state has no deadline; shared records are swept at the existing 15-minute cadence. */
   #scheduleSeenCleanup(): void {
     if (this.#closed || this.#paused || this.#retryTimer) return;
-    const now = Date.now();
     const legacyDeadline = this.#legacySeenPending
       ? this.#legacySeenCleanupAt + LEGACY_SEEN_CLEANUP_MS : Infinity;
-    // A spent claim may outlive its compacted input; keep custody but reconcile it on cadence.
-    const claimDeadlines = [...this.#sharedClaims.values()].map((deadline) =>
-      deadline > now ? deadline : now + LEGACY_SEEN_CLEANUP_MS);
     // An overdue deadline must wait until cleanup can act, not spin through its throttle.
-    const expiresAt = Math.max(this.#seenCleanupAt + this.#ackTimeoutMs,
-      Math.min(legacyDeadline, ...claimDeadlines));
+    const expiresAt = Math.max(this.#seenCleanupAt + this.#ackTimeoutMs, legacyDeadline);
     if (!Number.isFinite(expiresAt)) return;
     this.#retryTimer = setTimeout(() => {
       this.#retryTimer = undefined;
@@ -1924,6 +1969,17 @@ export class FabricControlPlane {
     }, () => this.#paused, () => this.options.canConsumeMesh?.() !== false, event => {
       // Release readback needs evidence at the exact cursor commit, not after an await.
       this.#lastSequence = event.sequence;
+      if (hasFabricPathBProbeObserver() && event.to === this.options.hostId && (event.topic === CONTROL_TOPIC || event.topic === ACK_TOPIC)) {
+        const data = ownDataRecord(event.data);
+        // Native FILE reader confirmation is an in-memory cursor commit, NOT a durable/broker ACK.
+        const confirmation = { type: "inbox-ack-confirmed", atNs: fabricPathBProbeEpochNs(), carrier: "file",
+          envelopeId: event.id, ...(typeof data?.commandId === "string" ? { commandId: data.commandId } : {}),
+          kind: event.topic === ACK_TOPIC ? "ack" : "command", operation: event.kind,
+          targetId: typeof data?.targetId === "string" ? data.targetId : event.to, sequence: event.sequence, attempt: 1,
+          confirmationSource: "native-file-reader", cursorPersistence: "in-memory",
+        } satisfies FabricPathBProbeEvent & { readonly confirmationSource: "native-file-reader"; readonly cursorPersistence: "in-memory" };
+        recordFabricPathBProbe(confirmation);
+      }
     }, () => {
       if (this.#acknowledgementsFull()) {
         this.#ackCapacityBlocked = true;
@@ -2108,8 +2164,6 @@ export class FabricControlPlane {
     options.signal?.throwIfAborted();
     const owner = captured ?? this.#captureNatsOwner(ownerHostId, ownerIdentityId, targetId, input.ownerIncarnation);
     const idempotencyKey = options.idempotencyKey ?? randomUUID();
-    const commandId = createHash("sha256")
-      .update(JSON.stringify([this.options.hostId, ownerHostId, ownerIdentityId, targetId, operation, idempotencyKey, notRunAttempt])).digest("hex");
     const commandBody = { targetId, operation, ownerIncarnation: owner.ownerIncarnation,
       ...(input.message !== undefined ? { message: input.message } : {}),
       ...(input.data !== undefined ? { data: input.data } : {}),
@@ -2120,6 +2174,11 @@ export class FabricControlPlane {
       ...(input.bindingProvenance !== undefined ? { bindingProvenance: input.bindingProvenance } : {}),
     };
     const bodyFingerprint = controlBodyFingerprint(commandBody, input.principal);
+    const originFingerprint = controlRequestFingerprint(operation, input);
+    const commandId = createHash("sha256")
+      .update(JSON.stringify([this.options.hostId, ownerHostId, ownerIdentityId, targetId, operation, idempotencyKey, notRunAttempt])).digest("hex");
+    // Bind this caller key to its semantic request before any publication can occur.
+    this.#bindOriginIdempotencyKey(commandId, idempotencyKey, originFingerprint);
     const existing = this.#pending.get(commandId);
     if (existing) {
       if (existing.bodyFingerprint !== bodyFingerprint) throw Object.assign(new Error("Fabric control id reused with different input"), { code: "FABRIC_CONTROL_ID_CONFLICT", notRun: true });
@@ -2130,8 +2189,7 @@ export class FabricControlPlane {
       Math.floor(options.timeoutMs ?? this.#ackTimeoutMs)));
     const timeoutMs = Math.min(NATS_HORIZON_MS, Math.max(this.#pollMs * 4, originalTimeoutMs - retryBudgetSpentMs));
     const ackGraceMs = Math.min(MAX_CONTROL_ACK_GRACE_MS, 2 * timeoutMs);
-    // E14.1: caller retries get new broker events; logical dedupe remains control-seen alone.
-    // Any same-request republish must reuse this id and the resolved bytes, never restamp them.
+    // The envelope id is generated once here; all transport-level retries reuse it.
     const commandEventId = randomUUID();
     let pending!: PendingControlRequest;
     const acceptance = new Promise<FabricControlAcceptance>((resolve, reject) => {
@@ -2217,7 +2275,13 @@ export class FabricControlPlane {
     if (session.signal.aborted || this.#natsSession !== session || this.#closed || this.#paused || !this.options.enabled) return false;
     try {
       if (!this.options.participants!.leaseLive()) {
-        // E11: actual lease loss is latched, never a retry or auto-resume.
+        if (this.options.participants!.leaseRecovering?.()) {
+          // A timed-out lease is admission-held until the directory re-acquires it by CAS.
+          this.#stopNatsInbox(session);
+          this.#bindNatsInbox(true);
+          return false;
+        }
+        // A conflicting owner or aborted lease is terminal, never a retry or auto-resume.
         this.pause(new MeshConsumptionPausedError());
         return false;
       }
@@ -2247,6 +2311,16 @@ export class FabricControlPlane {
   #startNats(): void {
     // E11: A2 owns the lease-loss notification and E8 reacquisition. No lease
     // polling, whenChanged(self), or automatic reacquisition lives in this plane.
+    if (!this.#stopVerifiedReconnect && this.#transport.onVerifiedReconnect) {
+      this.#stopVerifiedReconnect = this.#transport.onVerifiedReconnect(() => {
+        this.#natsInboxRetryDelayMs = 1_000;
+        if (this.#natsInboxRetryTimer) {
+          clearTimeout(this.#natsInboxRetryTimer);
+          this.#natsInboxRetryTimer = undefined;
+        }
+        this.#bindNatsInbox();
+      });
+    }
     if (!this.#natsWorkingTimer) {
       this.#natsWorkingTimer = setInterval(() => {
         const now = Date.now();
@@ -2267,10 +2341,13 @@ export class FabricControlPlane {
       if (this.#natsInboxRetryTimer) return;
       // B exposes no public reopen event. A failed entry/iteration or live
       // readiness hold alone arms one bounded one-shot; healthy idle never polls.
+      this.#natsInboxRetryAttempt++;
+      diagnostics.warn("src/topology/control-plane.ts", `[pi-fabric] NATS control inbox code=FABRIC_NATS_CONTROL_INBOX_RETRY host=${JSON.stringify(this.options.hostId)} attempt=${this.#natsInboxRetryAttempt} outcome=retry`);
+      const delayMs = this.#natsInboxRetryDelayMs;
       this.#natsInboxRetryTimer = setTimeout(() => {
         this.#natsInboxRetryTimer = undefined;
         this.#bindNatsInbox();
-      }, this.#natsInboxRetryDelayMs);
+      }, delayMs);
       this.#natsInboxRetryTimer.unref();
       this.#natsInboxRetryDelayMs = Math.min(30_000, this.#natsInboxRetryDelayMs * 2);
       return;
@@ -2279,6 +2356,7 @@ export class FabricControlPlane {
     if (this.#natsOutcomes.size) { this.#scheduleNatsOutcomeRetry(); return; }
     try {
       if (!this.options.participants!.leaseLive()) {
+        if (this.options.participants!.leaseRecovering?.()) { this.#bindNatsInbox(true); return; }
         this.pause(new MeshConsumptionPausedError()); return;
       }
       if (this.options.canConsumeMesh?.() === false) { this.#bindNatsInbox(true); return; }
@@ -2294,8 +2372,12 @@ export class FabricControlPlane {
         try {
           for (;;) {
             const next = await inbox.next();
-            if (next.done) return; // normal termination is not retryable
+            if (next.done) return; // unexpected completion rebinds below, never a sticky pause
             if (!this.#natsSessionLive(session)) return; // leave this delivery unacked
+            if (this.#natsInboxRetryAttempt > 0) {
+              diagnostics.warn("src/topology/control-plane.ts", `[pi-fabric] NATS control inbox code=FABRIC_NATS_CONTROL_INBOX_READY host=${JSON.stringify(this.options.hostId)} attempt=${this.#natsInboxRetryAttempt} outcome=recovered`);
+            }
+            this.#natsInboxRetryAttempt = 0;
             this.#natsInboxRetryDelayMs = 1_000;
             const receipt: NatsControlReceipt = { delivery: next.value, session, workingUntil: Infinity };
             this.#natsReceipts.add(receipt);
@@ -2305,16 +2387,16 @@ export class FabricControlPlane {
         } finally { await inbox.return?.(); } // join before opening another iterator
       } catch (error) {
         if (!session.signal.aborted) {
-          try { console.warn(`[pi-fabric] NATS control inbox stopped: ${error instanceof Error ? error.message : String(error)}`); } catch {}
-          if (isObject(error) && error.code === "FABRIC_TRANSPORT_UNAVAILABLE") {
-            if (this.#natsSessionLive(session)) {
-              this.#stopNatsInbox(session);
-              this.#bindNatsInbox(true);
-            }
-          } else this.pause(error);
+          if (!(isObject(error) && error.code === "FABRIC_TRANSPORT_UNAVAILABLE")) {
+            diagnostics.warn("src/topology/control-plane.ts", `[pi-fabric] NATS control inbox code=FABRIC_NATS_CONTROL_INBOX_TERMINAL host=${JSON.stringify(this.options.hostId)} attempt=${this.#natsInboxRetryAttempt} outcome=stopped`);
+            this.pause(error);
+          }
         }
       } finally {
-        if (!session.signal.aborted) this.pause(new TransportUnavailableError("NATS control inbox ended"));
+        // Transport recovery and normal completion are not authority loss. Rebind
+        // only while this exact owner is still live; explicit pauses and retired
+        // leases remain terminal in #natsSessionLive and #bindNatsInbox.
+        if (this.#natsSessionLive(session)) this.#bindNatsInbox(true);
         this.#stopNatsInbox(session);
       }
     })();
@@ -2793,6 +2875,8 @@ export class FabricControlPlane {
 
   async #closeNats(): Promise<void> {
     this.#closed = true; this.#started = false;
+    this.#stopVerifiedReconnect?.();
+    this.#stopVerifiedReconnect = undefined;
     clearTimeout(this.#natsInboxRetryTimer); this.#natsInboxRetryTimer = undefined;
     for (const cancel of this.#resendWaits) cancel();
     clearInterval(this.#natsWorkingTimer); this.#natsWorkingTimer = undefined;
@@ -2859,11 +2943,10 @@ export class FabricControlPlane {
     // it gets the expired answer below, never a silent skip, so its sender and the fleet see it.
     const lateDelivery = isObject(event.data) && isObject(event.data.bridge) &&
       now - event.createdAt <= MAX_CONTROL_ACK_GRACE_MS + this.#pollMs * 4;
-    if (now > deadlineAt + MAX_CONTROL_ACK_GRACE_MS + this.#pollMs * 4 && !lateDelivery && !this.#sharedClaims.has(key)) return;
+    if (now > deadlineAt + MAX_CONTROL_ACK_GRACE_MS + this.#pollMs * 4 && !lateDelivery) return;
     // Dedupe precedes the new-admission fence: completed earlier outcomes remain observable,
     // but their ACK names the claiming activation, never this publisher's new activation.
-    const duplicate = this.#sharedClaims.has(ownedKey)
-      ? controlSeenRecord(this.#seen.get(ownedKey)?.value) : this.#seenRecord(ownedKey);
+    const duplicate = this.#seenRecord(ownedKey);
     if (duplicate) {
       if (duplicate.hostId === this.options.hostId && duplicate.commandId === command.commandId &&
         duplicate.targetId === command.targetId) {
@@ -2888,65 +2971,10 @@ export class FabricControlPlane {
       }, this.incarnation, command.ownerIncarnation ?? null);
       return; // no claim, handler, or automatic notRun resend
     }
-    if ((now > deadlineAt || command.requestedAt - now > this.#ackTimeoutMs) && !this.#sharedClaims.has(key)) {
-      // A sender waits at most MAX_CONTROL_ACK_GRACE_MS past the deadline. An older command
-      // is history: a restarting owner replays the retained log from its start, and
-      // answering every past command added one locked publish each, thousands per
-      // relaunch wave (smarty-dev#367). Only a sender that may still wait gets an answer.
-      // An owner restarted past the deadline may have run it before, and a runtime before
-      // smarty-dev#643 claims only the shared key. No read proves it did not run (a read can be
-      // cached, and a claim can land after it): this runtime wins the shared claim first, with
-      // the same create-only put as admission, and records the expiry in it. Then no runtime,
-      // new or old, can claim or run it. Otherwise the claim holder's record answers, never
-      // notRun (review/astra F1 on #121). A runtime that admitted it in time and claims it now
-      // expires it before the handler (see #executeClaimedCommand).
-      const ownRecord = (record: FabricControlSeenRecord | undefined) =>
-        record?.hostId === this.options.hostId && record.commandId === command.commandId &&
-          record.targetId === command.targetId ? record : undefined;
-      const indeterminate = { accepted: false, error: "Fabric control outcome is indeterminate after owner restart" };
-      const local = ownRecord(controlSeenRecord(this.#seen.get(key)?.value));
-      let acceptance: FabricControlAcceptance;
-      let outcomeIncarnation: string | null = this.incarnation;
-      if (local) {
-        acceptance = local.acceptance ?? indeterminate;
-        outcomeIncarnation = local.ownerIncarnation ?? null;
-      }
-      else {
-        const expired = { accepted: false, error: CONTROL_COMMAND_EXPIRED, notRun: true } as const;
-        try {
-          await this.#putFenced(this.mesh, {
-            key,
-            value: {
-              format: 1,
-              hostId: this.options.hostId,
-              commandId: command.commandId,
-              targetId: command.targetId,
-              ownerIncarnation: this.incarnation,
-              expiresAt: Math.max(deadlineAt, now) + this.#ackTimeoutMs,
-              ...(command.deadlineAt !== undefined ? { explicitDeadline: true } : {}),
-              acceptance: expired,
-            } satisfies FabricControlSeenRecord,
-            identity: this.identity,
-            ifVersion: 0,
-          }, true);
-          acceptance = expired;
-        } catch (error) {
-          if (isMeshWriteDeferred(error) || isLockTimeout(error) || error instanceof MeshConsumptionPausedError) throw error;
-          const raced = ownRecord(controlSeenRecord(this.mesh.get(key, { fresh: true })?.value));
-          acceptance = raced?.acceptance ?? indeterminate;
-          outcomeIncarnation = raced?.ownerIncarnation ?? null;
-        }
-      }
-      await this.#publishAcknowledgement(command, acceptance, outcomeIncarnation);
-      return;
-    }
-
-    let claim;
     try {
-      // One claim authority across versions (smarty-dev#643, phase 1): runtimes before this
-      // change claim only the shared key, so this runtime claims it first and runs the command
-      // only when that claim wins too. The outcome is kept only in this host's own store.
-      if (!this.#sharedClaims.has(key)) await this.#putFenced(this.mesh, {
+      // One claim authority across drainers, older runtimes and sender withdrawal.
+      // The private store is only an outcome store, never a second admission claim.
+      await this.#putFenced(this.mesh, {
         key,
         value: {
           format: 1,
@@ -2954,32 +2982,16 @@ export class FabricControlPlane {
           commandId: command.commandId,
           targetId: command.targetId,
           ownerIncarnation: this.incarnation,
-          expiresAt: deadlineAt + this.#ackTimeoutMs,
+          expiresAt: Math.max(deadlineAt, now) + this.#ackTimeoutMs,
           ...(command.deadlineAt !== undefined ? { explicitDeadline: true } : {}),
-        } satisfies FabricControlSeenRecord,
-        identity: this.identity,
-        ifVersion: 0,
-      }, true);
-      // Retain a committed shared claim even if PREPARE landed during the await.
-      this.#sharedClaims.set(key, deadlineAt + MAX_CONTROL_ACK_GRACE_MS + this.#pollMs * 4);
-      this.#assertAdmission();
-      claim = await this.#putFenced(this.#seen, {
-        key,
-        value: {
-          format: 1,
-          hostId: this.options.hostId,
-          commandId: command.commandId,
-          targetId: command.targetId,
-          ownerIncarnation: this.incarnation,
-          expiresAt: deadlineAt + this.#ackTimeoutMs,
         } satisfies FabricControlSeenRecord,
         identity: this.identity,
         ifVersion: 0,
       }, true);
     } catch (error) {
       if (isMeshWriteDeferred(error) || isLockTimeout(error) || error instanceof MeshConsumptionPausedError) throw error;
-      this.#sharedClaims.delete(key);
-      const raced = this.#seenRecord(key);
+      // A pre-CAS read may be cached; only fresh outcome/claim readback can answer the loser.
+      const raced = this.#seenRecord(key, true);
       if (
         raced?.hostId === this.options.hostId &&
         raced.commandId === command.commandId &&
@@ -2997,8 +3009,9 @@ export class FabricControlPlane {
       return;
     }
 
-    this.#sharedClaims.delete(key);
-    const admitted = { event, claimVersion: claim.version };
+    // Take custody before any post-CAS admission check: PREPARE/lease loss during
+    // the await must retain this command. Its first private outcome save creates it.
+    const admitted = { event, claimVersion: 0, futureSkewed: command.requestedAt - now > this.#ackTimeoutMs };
     this.#ownedCommands.set(key, admitted);
     await this.#runOwnedCommand(key, admitted);
   }
@@ -3143,7 +3156,9 @@ export class FabricControlPlane {
         assertMeshConsumption(this.options.canConsumeMesh);
         if (!owned.acceptance) this.#assertAdmission();
         if (owned.acceptance) acceptance = owned.acceptance;
-        else if (Date.now() > deadlineAt) acceptance = { accepted: false, error: CONTROL_COMMAND_EXPIRED, notRun: true };
+        else if (Date.now() > deadlineAt || owned.futureSkewed || command.requestedAt - Date.now() > this.#ackTimeoutMs) {
+          acceptance = { accepted: false, error: CONTROL_COMMAND_EXPIRED, notRun: true };
+        }
         else if (this.#handler) {
           this.#warnUnfencedSenderDelivery(command, from);
           acceptance = await this.#handler(command, from, controller.signal, verification);
@@ -3257,8 +3272,8 @@ export class FabricControlPlane {
 
   // This host's record for a command: its own store (with the outcome) first, then the shared
   // state, where every claim is also made and where runtimes before smarty-dev#643 keep outcomes.
-  #seenRecord(key: string): FabricControlSeenRecord | undefined {
-    return controlSeenRecord(this.#seen.get(key)?.value) ?? controlSeenRecord(this.mesh.get(key)?.value);
+  #seenRecord(key: string, fresh = false): FabricControlSeenRecord | undefined {
+    return controlSeenRecord(this.#seen.get(key, { fresh })?.value) ?? controlSeenRecord(this.mesh.get(key, { fresh })?.value);
   }
 
   async #cleanupSeen(now: number): Promise<void> {

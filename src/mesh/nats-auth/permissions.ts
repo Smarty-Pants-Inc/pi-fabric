@@ -18,6 +18,7 @@ export type NatsRole = "agent" | "principal" | "maintainer" | "break-glass";
 export interface RoleTemplate {
   pub: { allow: string[]; deny: string[] };
   sub: { allow: string[] };
+  allow_responses?: { readonly max: number };
 }
 
 export interface RoleStreams {
@@ -28,7 +29,7 @@ export interface RoleStreams {
 export class NatsPermissionsError extends Error {
   readonly field: string;
   constructor(field: string) {
-    // Never carries the offending value: stream names and roles come from caller configuration.
+    // Never carries the offending value: stream names, roles and orgs come from caller configuration.
     super(`invalid ${field}`);
     this.name = "NatsPermissionsError";
     this.field = field;
@@ -151,8 +152,54 @@ export function roleTemplate(role: NatsRole, input: RoleStreams): RoleTemplate {
 export type PathBRole = "agent" | "operator";
 export interface PathBRoleTemplate extends RoleTemplate {}
 
+/** Alpha shared-org event grants; absent/false keeps the existing Path B scope unchanged. */
+export interface PathBEventsOptions {
+  events?: boolean;
+  org?: string;
+}
+
+function pathBEventAllows({ events, org }: PathBEventsOptions): string[] {
+  if (events !== undefined && typeof events !== "boolean") fail("events");
+  if (events !== true) return [];
+  if (typeof org !== "string" || /^[a-z0-9][a-z0-9-]{0,62}$/.exec(org)?.[0] !== org || org === "sys") fail("org");
+  // Shared org authority, NOT actor isolation: smarty-dev#15355. No github.> publish grant.
+  const streamOrg = org.toUpperCase().replaceAll("-", "_");
+  const streams = [`FABRIC_EV_${streamOrg}`, `GITHUB_${streamOrg}`];
+  return [
+    `fabric.ev.${org}.>`,
+    ...streams.flatMap(stream => [
+      `$JS.API.STREAM.INFO.${stream}`,
+      `$JS.API.STREAM.MSG.GET.${stream}`,
+      `$JS.API.CONSUMER.DURABLE.CREATE.${stream}.>`,
+      ...["CREATE", "INFO", "MSG.NEXT", "DELETE", "UPDATE"].map((verb) => `$JS.API.CONSUMER.${verb}.${stream}.>`),
+      `$JS.ACK.${stream}.>`,
+    ]),
+  ];
+}
+
 const PATH_B_MACHINE = /^[a-z0-9][a-z0-9-]{0,31}$/;
 const PATH_B_MACHINE_TAG = "{{tag(machine)}}";
+const SERVICE_ORG = /^[a-z0-9][a-z0-9-]{0,62}$/;
+export const SESSION_CHANNEL_OPERATIONS = ["snapshot", "history", "input", "model", "abort"] as const;
+
+function serviceOrg(value: unknown): string {
+  if (typeof value !== "string" || SERVICE_ORG.exec(value)?.[0] !== value) fail("org");
+  return value;
+}
+
+type PathBPolicyInput = string | PathBEventsOptions;
+
+function pathBPolicy(value: PathBPolicyInput = {}): PathBEventsOptions {
+  const options = typeof value === "string" ? { org: value } : value;
+  if (options === null || typeof options !== "object" || Array.isArray(options)) fail("events");
+  if (options.events !== undefined && typeof options.events !== "boolean") fail("events");
+  const org = options.org === undefined ? undefined : serviceOrg(options.org);
+  if (options.events === true && (org === undefined || org === "sys")) fail("org");
+  return {
+    ...(options.events === undefined ? {} : { events: options.events }),
+    ...(org === undefined ? {} : { org }),
+  };
+}
 
 function pathBMachine(value: string): string {
   if (value !== PATH_B_MACHINE_TAG && !PATH_B_MACHINE.test(value)) fail("machine");
@@ -204,18 +251,21 @@ const PATH_B_RESERVED_MUTATIONS = [
   "$JS.API.ACCOUNT.STREAM.CANCEL_MOVE.*.FABRIC_ADV",
 ];
 
-function pathBRuntime(roleMachine: string, machines: readonly string[] = []): PathBRoleTemplate {
+function pathBRuntime(roleMachine: string, machines: readonly string[] = [], options: PathBPolicyInput = {}): PathBRoleTemplate {
+  const policy = pathBPolicy(options);
   if (PATH_B_OPERATOR_MACHINE_PATTERN.test(roleMachine)) fail("machine");
   const inbox = `FABRIC_IN_${roleMachine}`;
   const privateInboxes = roleMachine === PATH_B_MACHINE_TAG ? machines.map((machine) => `FABRIC_IN_${pathBMachine(machine)}`) : [inbox];
-  const ownInbox = `_INBOX.{{subject()}}.>`;
   const allow = [
+    ...pathBEventAllows(policy),
     `fabric.in.*.*.*.*.${roleMachine}`,
     `$JS.API.STREAM.INFO.${inbox}`,
     ...["CREATE", "INFO", "MSG.NEXT", "DELETE"].map((verb) => `$JS.API.CONSUMER.${verb}.${inbox}.>`),
     `$JS.ACK.${inbox}.>`,
     `$KV.fabric_presence.${roleMachine}.>`,
     `$KV.fabric_leases.${roleMachine}.>`,
+    "$JS.FC.KV_fabric_presence.>",
+    "$JS.FC.KV_fabric_leases.>",
     "$JS.API.STREAM.INFO.KV_fabric_presence",
     "$JS.API.STREAM.INFO.KV_fabric_leases",
     "$JS.API.STREAM.MSG.GET.KV_fabric_presence",
@@ -239,7 +289,19 @@ function pathBRuntime(roleMachine: string, machines: readonly string[] = []): Pa
     "$JS.API.CONSUMER.MSG.NEXT.FABRIC_ADV.>",
     ...PATH_B_RESERVED_MUTATIONS,
   ];
-  return { pub: { allow: pathBUnique(allow), deny }, sub: { allow: [ownInbox] } };
+  if (policy.org !== undefined) {
+    const scopedOrg = policy.org;
+    // Alpha deliberately shares one org runtime user across agents and callers. That user can read
+    // service requests and race replies; its subject wildcard is the accepted same-org trust boundary.
+    const serviceSubject = `fabric.svc.${scopedOrg}.>`;
+    allow.push(serviceSubject);
+    return {
+      pub: { allow: pathBUnique(allow), deny },
+      sub: { allow: [OWN_INBOX, serviceSubject] },
+      allow_responses: { max: 16 },
+    };
+  }
+  return { pub: { allow: pathBUnique(allow), deny }, sub: { allow: [OWN_INBOX] } };
 }
 
 function pathBOperator(roleMachine: string, machines: readonly string[]): PathBRoleTemplate {
@@ -277,11 +339,12 @@ function pathBOperator(roleMachine: string, machines: readonly string[]): PathBR
       `$JS.API.DIRECT.GET.${stream}.>`,
     ]),
   ];
-  return { pub: { allow: pathBUnique(allow), deny }, sub: { allow: [`_INBOX.{{subject()}}.>`] } };
+  return { pub: { allow: pathBUnique(allow), deny }, sub: { allow: [OWN_INBOX] } };
 }
 
 /** Compose Path B with the existing role only when the mint input explicitly opts in. */
-export function roleTemplateWithPathB(role: NatsRole | "operator", input: RoleStreams, machines: readonly string[] = []): RoleTemplate {
+export function roleTemplateWithPathB(role: NatsRole | "operator", input: RoleStreams, machines: readonly string[] = [], options: PathBPolicyInput = {}): RoleTemplate {
+  const policy = pathBPolicy(options);
   if (role === "operator") {
     const path = pathBOperator(PATH_B_MACHINE_TAG, machines);
     const base = roleTemplate("maintainer", input);
@@ -292,10 +355,11 @@ export function roleTemplateWithPathB(role: NatsRole | "operator", input: RoleSt
   }
   const base = roleTemplate(role, input);
   if (role === "agent") {
-    const path = pathBRuntime(PATH_B_MACHINE_TAG, machines);
+    const path = pathBRuntime(PATH_B_MACHINE_TAG, machines, policy);
     return {
       pub: { allow: pathBUnique([...base.pub.allow, ...path.pub.allow]), deny: pathBUnique([...base.pub.deny, ...path.pub.deny]) },
       sub: { allow: path.sub.allow },
+      ...(path.allow_responses ? { allow_responses: path.allow_responses } : {}),
     };
   }
   if (role === "break-glass") return base;
@@ -307,8 +371,61 @@ export function roleTemplateWithPathB(role: NatsRole | "operator", input: RoleSt
   };
 }
 
-export function pathBRoleTemplate(role: PathBRole, machine = PATH_B_MACHINE_TAG, machines: readonly string[] = []): PathBRoleTemplate {
-  if (role === "agent") return pathBRuntime(pathBMachine(machine), machines);
+export function pathBRoleTemplate(role: PathBRole, machine = PATH_B_MACHINE_TAG, machines: readonly string[] = [], options: PathBPolicyInput = {}): PathBRoleTemplate {
+  const policy = pathBPolicy(options);
+  if (role === "agent") return pathBRuntime(pathBMachine(machine), machines, policy);
   if (role === "operator") return pathBOperator(pathBMachine(machine), machines);
   throw new Error("invalid Path B role");
+}
+
+/**
+ * Frozen d231bd15 runtime scope for rollout verification. Do not derive this by removing the current flow-control
+ * grants: later runtime lanes may add session/event subjects to the current template, and the installed account's
+ * old scope must remain accepted only when it matches this exact pre-change set.
+ */
+const legacyPathBRuntime = (roleMachine: string, machines: readonly string[] = []): PathBRoleTemplate => {
+  if (PATH_B_OPERATOR_MACHINE_PATTERN.test(roleMachine)) fail("machine");
+  const inbox = `FABRIC_IN_${roleMachine}`;
+  const privateInboxes = roleMachine === PATH_B_MACHINE_TAG ? machines.map((machine) => `FABRIC_IN_${pathBMachine(machine)}`) : [inbox];
+  const allow = [
+    `fabric.in.*.*.*.*.${roleMachine}`,
+    `$JS.API.STREAM.INFO.${inbox}`,
+    ...["CREATE", "INFO", "MSG.NEXT", "DELETE"].map((verb) => `$JS.API.CONSUMER.${verb}.${inbox}.>`),
+    `$JS.ACK.${inbox}.>`,
+    `$KV.fabric_presence.${roleMachine}.>`,
+    `$KV.fabric_leases.${roleMachine}.>`,
+    "$JS.API.STREAM.INFO.KV_fabric_presence",
+    "$JS.API.STREAM.INFO.KV_fabric_leases",
+    "$JS.API.STREAM.MSG.GET.KV_fabric_presence",
+    "$JS.API.STREAM.MSG.GET.KV_fabric_leases",
+    ...["CREATE", "INFO", "DELETE"].flatMap((verb) => [
+      `$JS.API.CONSUMER.${verb}.KV_fabric_presence.>`,
+      `$JS.API.CONSUMER.${verb}.KV_fabric_leases.>`,
+    ]),
+    JS_INFO,
+    USER_INFO,
+  ];
+  const deny = [
+    "$JS.API.STREAM.CREATE.>",
+    "$JS.API.STREAM.UPDATE.>",
+    "$JS.API.STREAM.DELETE.>",
+    "$JS.API.STREAM.PURGE.>",
+    ...privateInboxes.map((stream) => `$JS.API.STREAM.MSG.GET.${stream}`),
+    "$JS.API.STREAM.MSG.DELETE.>",
+    "$JS.API.DIRECT.GET.>",
+    "$JS.API.CONSUMER.*.FABRIC_ADV.>",
+    "$JS.API.CONSUMER.MSG.NEXT.FABRIC_ADV.>",
+    ...PATH_B_RESERVED_MUTATIONS,
+  ];
+  return { pub: { allow: pathBUnique(allow), deny }, sub: { allow: [OWN_INBOX] } };
+};
+
+/** Frozen d231bd15 agent scope, including its old role grants and no later runtime additions. */
+export function legacyRoleTemplateWithPathB(role: "agent", input: RoleStreams, machines: readonly string[] = []): RoleTemplate {
+  const base = roleTemplate(role, input);
+  const path = legacyPathBRuntime(PATH_B_MACHINE_TAG, machines);
+  return {
+    pub: { allow: pathBUnique([...base.pub.allow, ...path.pub.allow]), deny: pathBUnique([...base.pub.deny, ...path.pub.deny]) },
+    sub: { allow: path.sub.allow },
+  };
 }

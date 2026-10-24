@@ -1,6 +1,6 @@
 import path from "node:path";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import type { AgentManager } from "../src/agents/manager.js";
+import type { AgentManager, AgentModelAdmission } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import {
   MeshIncarnationPendingError,
@@ -114,8 +114,22 @@ vi.mock("../src/topology/main-publication-fence.js", async importOriginal => ({
 
 const root = path.join(process.cwd(), ".local", "actor-host-relay-deferred");
 const identity: MeshIdentity = { id: "relay-main", name: "relay-main", kind: "main", sessionId: "relay" };
+// Nonprotected fixture contract only: never stand in for protected-model admission.
+const assertModelAllowed: AgentManager["assertModelAllowed"] = (model, runner = DEFAULT_FABRIC_CONFIG.agents.runner) => {
+  if (model !== undefined || (runner !== "pi" && runner !== "pi-durable")) {
+    throw new Error(`Unexpected relay fixture model/runner: ${model}/${runner}`);
+  }
+};
+const resolveModelReasonPolicy = (
+  ...[model, _reason, runner, options = {}]: Parameters<AgentManager["resolveModelReasonPolicy"]>
+): AgentModelAdmission => {
+  assertModelAllowed(model, runner);
+  return { model, thinking: options.thinking, fallback: false };
+};
 const agents = {
   config: DEFAULT_FABRIC_CONFIG.agents,
+  assertModelAllowed,
+  resolveModelReasonPolicy,
   resolveKernel: () => undefined,
   defaultModel: () => undefined,
   resolvePythonRuntime: () => undefined,
@@ -155,6 +169,17 @@ const makeManager = (mesh: MeshStore, options: NonNullable<ConstructorParameters
     meshRetentionSweepPath: false,
     ...options,
   });
+
+it("keeps the relay model-policy fixture synchronous and rejects unexpected/protected selectors", () => {
+  expect(agents.resolveModelReasonPolicy(undefined, undefined, "pi", { thinking: "high" }))
+    .toEqual({ model: undefined, thinking: "high", fallback: false });
+  for (const model of ["test-model", "unexpected-model", "anthropic/claude-opus-4-1"]) {
+    expect(() => agents.resolveModelReasonPolicy(model, undefined, "pi")).toThrow("Unexpected relay fixture");
+    expect(() => agents.assertModelAllowed(model, "pi")).toThrow("Unexpected relay fixture");
+  }
+  expect(() => agents.resolveModelReasonPolicy(undefined, undefined, "claude")).toThrow("Unexpected relay fixture");
+  expect(agents.run).not.toHaveBeenCalled();
+});
 
 it.each(deferredErrors)("retries resident host relay with images after %s and commits the original payload", async (_label, makeError) => {
   const mesh = new MeshStore(root, 65_536, 100);

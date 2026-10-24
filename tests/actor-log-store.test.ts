@@ -2,7 +2,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ActorLogStore, ACTOR_MESSAGE_HISTORY_LIMIT } from "../src/actors/log-store.js";
+import { ActorLogStore, ActorRunArchiveRefusedError, ACTOR_MESSAGE_HISTORY_LIMIT } from "../src/actors/log-store.js";
+import { diagnostics } from "../src/core/diagnostics.js";
+import * as privateDir from "../src/storage/private-dir.js";
+import * as atomicWrite from "../src/core/atomic-write.js";
 import type { FabricActorMessage } from "../src/actors/types.js";
 
 const roots: string[] = [];
@@ -101,19 +104,100 @@ describe("ActorLogStore", () => {
     expect(JSON.parse(fs.readFileSync(file, "utf8"))).toEqual(receipt);
   });
 
-  it("copies the archive protocol and nested runs, tolerating missing sources and nested-copy failure", async () => {
+  // Keep: data safety; these are real source/archive trees at the custody boundary, not mock cleanup counts.
+  it("returns no-source explicitly and verifies durable copies including repeat nested archives", async () => {
     const { root, actor, store } = setup();
-    await store.retainRun(actor, "missing", undefined);
+    for (const source of [undefined, path.join(root, "absent")]) {
+      await expect(store.retainRun(actor, "missing", source)).resolves.toEqual({ archived: false, reason: "no-source" });
+    }
     expect(store.retainedRunIds(actor)).toEqual([]);
     const source = path.join(root, "source");
-    fs.mkdirSync(path.join(source, "nested"), { recursive: true });
-    for (const file of ["events.jsonl", "status.json", "task.txt", "relaunches.jsonl", "private.txt", "nested/child"]) fs.writeFileSync(path.join(source, file), file);
-    await store.retainRun(actor, "latest", source);
+    fs.mkdirSync(path.join(source, "nested", "child"), { recursive: true });
+    for (const file of ["events.jsonl", "status.json", "task.txt", "relaunches.jsonl", "private.txt", "nested/child/events.jsonl"]) fs.writeFileSync(path.join(source, file), file);
     const dest = path.join(root, "actor", "runs", "latest");
+    const result = { archived: true, receipt: { runId: "latest", directory: dest } };
+    await expect(store.retainRun(actor, "latest", source)).resolves.toEqual(result);
+    await expect(store.retainRun(actor, "latest", source)).resolves.toEqual(result);
     expect(fs.readdirSync(dest).sort()).toEqual(["events.jsonl", "nested", "relaunches.jsonl", "status.json", "task.txt"]);
-    expect(fs.readFileSync(path.join(dest, "nested", "child"), "utf8")).toBe("nested/child");
-    vi.spyOn(fs, "cpSync").mockImplementation(() => { throw new Error("nested unavailable"); });
-    await expect(store.retainRun(actor, "other", source)).resolves.toBeUndefined();
-    expect(store.retainedRunIds(actor)).toEqual(["latest", "other"]);
+    expect(fs.readFileSync(path.join(dest, "nested", "child", "events.jsonl"), "utf8")).toBe("nested/child/events.jsonl");
+    if (process.platform !== "win32") expect(fs.statSync(path.join(dest, "nested", "child")).mode & 0o777).toBe(0o700);
+  });
+
+  it.skipIf(process.platform === "win32")("throws a typed, logged refusal for a real 0777 volume ancestor and leaves its source intact", async () => {
+    const { root, store } = setup();
+    const volume = path.join(root, "volume"), source = path.join(root, "source");
+    fs.mkdirSync(volume); fs.mkdirSync(source);
+    fs.writeFileSync(path.join(source, "events.jsonl"), "only copy\n");
+    // An owned anchor itself self-heals; the unsafe local-path volume ABOVE that anchor must not be changed.
+    const actor = { sessionFile: path.join(volume, "mesh", "actors", "a", "session.jsonl") };
+    fs.chmodSync(volume, 0o777);
+    const logged = vi.spyOn(diagnostics, "error");
+    try {
+      await expect(store.retainRun(actor, "latest", source)).rejects.toMatchObject({
+        name: "ActorRunArchiveRefusedError", code: "FABRIC_ACTOR_RUN_ARCHIVE_REFUSED", runId: "latest",
+      });
+      expect(fs.readFileSync(path.join(source, "events.jsonl"), "utf8")).toBe("only copy\n");
+      expect(logged).toHaveBeenCalledWith("src/actors/log-store.ts", expect.stringContaining("writable by group or others"));
+      expect(fs.statSync(volume).mode & 0o777).toBe(0o777);
+    } finally { fs.chmodSync(volume, 0o700); }
+  });
+
+  it.each(["events.jsonl", "nested/child/events.jsonl"])("rejects a source symlink at %s even without O_NOFOLLOW", async file => {
+    const { root, actor, store } = setup();
+    const source = path.join(root, "source"), entry = path.join(source, file), target = path.join(root, "trace.jsonl");
+    fs.mkdirSync(path.dirname(entry), { recursive: true });
+    fs.writeFileSync(target, "only trace\n");
+    fs.symlinkSync(target, entry);
+    // Windows has no O_NOFOLLOW. Exercise the same source-open behavior on
+    // POSIX too, while keeping real files and the production copy/receipt path.
+    const open = fs.openSync;
+    vi.spyOn(fs, "openSync").mockImplementation((name, flags, mode) =>
+      open(name, name === entry && typeof flags === "number" ? flags & ~(fs.constants.O_NOFOLLOW ?? 0) : flags, mode));
+    await expect(store.retainRun(actor, "latest", source)).rejects.toBeInstanceOf(ActorRunArchiveRefusedError);
+    expect(fs.lstatSync(entry).isSymbolicLink()).toBe(true);
+    expect(fs.readFileSync(target, "utf8")).toBe("only trace\n");
+    expect(fs.existsSync(path.join(root, "actor", "runs", "latest", file))).toBe(false);
+    fs.unlinkSync(entry);
+    fs.writeFileSync(entry, "only trace\n");
+    await expect(store.retainRun(actor, "latest", source)).resolves.toMatchObject({ archived: true });
+    expect(fs.readFileSync(path.join(root, "actor", "runs", "latest", file), "utf8")).toBe("only trace\n");
+  });
+
+  it.each(["events.jsonl", "nested/child/events.jsonl"])("rejects a refused %s entry, retaining bytes for a successful retry", async file => {
+    const { root, actor, store } = setup();
+    const source = path.join(root, "source"), dest = path.join(root, "actor", "runs", "latest");
+    fs.mkdirSync(path.dirname(path.join(source, file)), { recursive: true });
+    fs.writeFileSync(path.join(source, file), "retained bytes\n");
+    const write = privateDir.writeArchiveFile;
+    const failure = vi.spyOn(privateDir, "writeArchiveFile").mockImplementation((held, name, content, durable) =>
+      name === path.basename(file) ? false : write(held, name, content, durable));
+    await expect(store.retainRun(actor, "latest", source)).rejects.toBeInstanceOf(ActorRunArchiveRefusedError);
+    expect(fs.readFileSync(path.join(source, file), "utf8")).toBe("retained bytes\n");
+    failure.mockRestore();
+    await expect(store.retainRun(actor, "latest", source)).resolves.toMatchObject({ archived: true });
+    expect(fs.readFileSync(path.join(dest, file), "utf8")).toBe("retained bytes\n");
+  });
+
+  it.each(["copy", "directory-sync", "file-sync"])("never returns a receipt after a %s failure, even without a route receipt", async stage => {
+    const { root, actor, store } = setup();
+    const source = path.join(root, "source"); fs.mkdirSync(source);
+    fs.writeFileSync(path.join(source, "events.jsonl"), "only trace\n");
+    const fail = () => { throw new Error(`${stage} failed`); };
+    if (stage === "copy") vi.spyOn(privateDir, "writeArchiveFile").mockImplementation(fail);
+    else if (stage === "directory-sync") vi.spyOn(atomicWrite, "syncDirectoryChain").mockImplementation(fail);
+    else vi.spyOn(fs, "fsyncSync").mockImplementation(fail);
+    await expect(store.retainRun(actor, "latest", source)).rejects.toMatchObject({
+      code: "FABRIC_ACTOR_RUN_ARCHIVE_REFUSED", message: expect.stringContaining(`${stage} failed`),
+    });
+    expect(fs.readFileSync(path.join(source, "events.jsonl"), "utf8")).toBe("only trace\n");
+  });
+
+  it("rejects an existing non-file destination instead of silently skipping the trace", async () => {
+    const { root, actor, store } = setup();
+    const source = path.join(root, "source"), dest = path.join(root, "actor", "runs", "latest");
+    fs.mkdirSync(source); fs.writeFileSync(path.join(source, "events.jsonl"), "only trace\n");
+    fs.mkdirSync(path.join(dest, "events.jsonl"), { recursive: true });
+    await expect(store.retainRun(actor, "latest", source)).rejects.toBeInstanceOf(ActorRunArchiveRefusedError);
+    expect(fs.readFileSync(path.join(source, "events.jsonl"), "utf8")).toBe("only trace\n");
   });
 });

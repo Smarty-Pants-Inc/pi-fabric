@@ -9,51 +9,19 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Never cancel GitHub or Mergify queue candidates, including queue-draft PRs.
+  cancel-in-progress: ${{ github.event_name != 'merge_group' && !startsWith(github.ref, 'refs/heads/gh-readonly-queue/') && !startsWith(github.ref, 'refs/heads/mergify/') && !startsWith(github.head_ref, 'mergify/') }}
+
 jobs:
-  check:
-    # Real-broker suites belong to nats-state-conformance and nats-auth, not the
-    # generic affected/smoke selection on either platform. Scope this to check
-    # so the dedicated jobs keep their broker-required gates and explicit lists.
-    env:
-      FABRIC_TEST_SKIP_NATS: '1'
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+  linux-gates:
+    runs-on: ubuntu-latest
     steps:
       - run: git config --global core.autocrlf false
       - uses: actions/checkout@v4
-        with:
-          # The affected-test selection diffs the push range or the pull-request
-          # base, so that base commit has to be present in history.
-          fetch-depth: 0
-      - uses: actions/setup-node@v4
-        with:
-          node-version-file: package.json
-      - uses: oven-sh/setup-bun@v2
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.14'
-      - name: Install runtime prerequisites
-        # pi's grep tool downloads rg on first use when it is absent; on shared
-        # runners that ad-hoc GitHub Releases download is rate-limited, so
-        # provision rg on PATH up front to keep nested-grep tests hermetic.
-        shell: bash
-        run: |
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            # Non-login Git Bash children warn on stderr when its /tmp is absent.
-            # Keep command output deterministic without stripping real warnings.
-            mkdir -p /tmp
-            choco install ripgrep -y --no-progress
-          else
-            sudo apt-get update
-            sudo apt-get install -y ripgrep bubblewrap python3
-          fi
-      - name: Install dependencies
-        run: bun install --frozen-lockfile
+      - uses: ./.github/actions/check-setup
       - name: Install pinned Bend proof compiler
-        if: runner.os == 'Linux'
         shell: bash
         run: |
           curl --proto '=https' --tlsv1.2 -fsSL -o "$RUNNER_TEMP/bend.tar.gz" https://github.com/bendlang/bend/releases/download/v2.0.36/bend-2.0.36-linux-x64.tar.gz
@@ -61,21 +29,41 @@ jobs:
           tar -xzf "$RUNNER_TEMP/bend.tar.gz" -C "$RUNNER_TEMP"
           echo "$RUNNER_TEMP/bend/bin" >> "$GITHUB_PATH"
       - name: Check proofs, reproduce executable kernels, and reject invalid mutations
-        if: runner.os == 'Linux'
         env:
           BEND_NO_TELEMETRY: '1'
         run: bun run proof:check
       - name: Type check
         run: bun run typecheck
-      # smarty-dev#8121: one exact compiler for the static native helpers (native/toolchain.json). The build
-      # requires it on Linux and fails unless both helpers equal the expected sha256 for that toolchain.
       - name: Fetch the pinned native toolchain
-        if: runner.os == 'Linux'
         run: node scripts/native-toolchain.mjs fetch
-      # smarty-dev#7858: the Windows verified-removal helper is built here by the pinned Windows zig (native/toolchain.json
-      # zig.x86_64-windows); the build requires its bytes to equal expected.windows, the same as the Linux cross-build.
+      - name: Build
+        env:
+          FABRIC_NATIVE_CC_PINNED: '1'
+        run: bun run build
+      - name: Archive gated build
+        shell: bash
+        # Record the exact source commit, so a shard can prove the build is
+        # of its own checkout before it refreshes the restored mtimes.
+        run: |
+          printf '%s\n' "$GITHUB_SHA" > dist/.gated-source-sha
+          tar -cf "$RUNNER_TEMP/dist.tar" dist
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: dist-ubuntu-latest
+          path: ${{ runner.temp }}/dist.tar
+          if-no-files-found: error
+          retention-days: 1
+
+  windows-gates:
+    runs-on: windows-latest
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/check-setup
+      - name: Type check
+        run: bun run typecheck
+      # Keep the native Windows build, not a Linux cross-build substitute.
       - name: Fetch the pinned zig for the Windows helper
-        if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $zip = Join-Path $env:RUNNER_TEMP 'zig.zip'
@@ -83,76 +71,159 @@ jobs:
           if ((Get-FileHash $zip -Algorithm SHA256).Hash.ToLower() -ne '68659eb5f1e4eb1437a722f1dd889c5a322c9954607f5edcf337bc3684a75a7e') { throw 'zig zip sha256 mismatch' }
           & "$env:SystemRoot\System32\tar.exe" -xf $zip -C $env:RUNNER_TEMP
           "FABRIC_WIN_ZIG=$(Join-Path $env:RUNNER_TEMP 'zig-x86_64-windows-0.16.0\zig.exe')" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-      # Some integration tests execute the published worker entrypoints in dist.
       - name: Build
-        env:
-          FABRIC_NATIVE_CC_PINNED: ${{ runner.os == 'Linux' && '1' || '' }}
         run: bun run build
-      # Pi installs packages without peer or dev dependencies; the agent and memory
-      # workers run outside Pi's module aliases, so their imports must resolve there.
-      - name: Package install smoke (no peers, as pi install)
+      - name: Archive gated build
+        shell: pwsh
+        run: |
+          Set-Content -NoNewline -Path dist/.gated-source-sha -Value "$env:GITHUB_SHA`n"
+          & "$env:SystemRoot\System32\tar.exe" -cf (Join-Path $env:RUNNER_TEMP 'dist.tar') dist
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: dist-windows-latest
+          path: ${{ runner.temp }}/dist.tar
+          if-no-files-found: error
+          retention-days: 1
+
+  linux-tests:
+    name: Linux affected (${{ matrix.shard }}/10)
+    needs: linux-gates
+    runs-on: ubuntu-latest
+    env:
+      # Real-broker conformance stays in the unchanged dedicated nats-* jobs.
+      FABRIC_TEST_SKIP_NATS: '1'
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/check-setup
+        with:
+          dist-artifact: dist-ubuntu-latest
+      - uses: ./.github/actions/check-systemd
+      - name: Affected tests
+        env:
+          PI_TEST_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          PI_TEST_REPORT_DIR: ${{ runner.temp }}/affected
+        run: bun run test:affected --shard=${{ matrix.shard }}/10
+      - name: Upload shard counts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: affected-ubuntu-latest-${{ matrix.shard }}
+          path: ${{ runner.temp }}/affected/
+          if-no-files-found: error
+          retention-days: 7
+
+  windows-tests:
+    name: Windows affected (${{ matrix.shard }}/10)
+    needs: windows-gates
+    runs-on: windows-latest
+    env:
+      FABRIC_TEST_SKIP_NATS: '1'
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/check-setup
+        with:
+          dist-artifact: dist-windows-latest
+      - name: Affected tests
+        env:
+          PI_TEST_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          PI_TEST_REPORT_DIR: ${{ runner.temp }}/affected
+        run: bun run test:affected --shard=${{ matrix.shard }}/10
+      - name: Upload shard counts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: affected-windows-latest-${{ matrix.shard }}
+          path: ${{ runner.temp }}/affected/
+          if-no-files-found: error
+          retention-days: 7
+
+  linux-acceptance:
+    needs: linux-gates
+    runs-on: ubuntu-latest
+    env:
+      FABRIC_TEST_SKIP_NATS: '1'
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/check-setup
+        with:
+          dist-artifact: dist-ubuntu-latest
+      - name: Session-channel real-broker acceptance
         if: runner.os == 'Linux'
+        env:
+          PI_FABRIC_REQUIRE_NATS: '1'
+          NATS_EXPECTED_SERVER_VERSION: '2.14.7'
+        run: bunx vitest run --retry=0 tests/nats-session-channel.test.ts
+      - name: Package install smoke (no peers, as pi install)
         run: bun run smoke:package-install
-      - name: Check CI workflow runtime configuration
-        run: bunx vitest run tests/ci-workflows.test.ts
-      - name: Check Python kernel diagnostics
-        run: bunx vitest run tests/kernel-errors.test.ts
-      - name: Test verified-kernel ABI and provider dispatch on both platforms
-        run: bunx vitest run tests/verified-kernels.test.ts tests/verified-resources.test.ts tests/verified-providers.test.ts tests/verified-authority.test.ts tests/verified-lifecycle.test.ts tests/verified-storage.test.ts tests/verified-artifact.test.ts
-      - name: Check bundled verified-kernel behavior
-        run: bun run proof:dist
-      - name: Test Windows type-checker regression
-        if: runner.os == 'Windows'
-        run: bunx vitest run tests/type-checker.test.ts
-      - name: Launcher and Pi host regressions
-        run: bunx vitest run tests/worker-e2e.test.ts tests/pi-binary.test.ts tests/script-runtime.test.ts tests/herdr-transport.test.ts tests/prewalk-handoff.test.ts tests/shell-middleware.test.ts
+      - uses: ./.github/actions/check-regressions
       - name: Real Pi provider-dead path (smarty-dev#8742)
-        # A real Pi process (RPC mode) loads the built dist/ and talks to a local stub provider.
         if: runner.os == 'Linux'
         env:
           FABRIC_8742_REAL_PI: '1'
         run: bunx vitest run tests/main-provider-dead-real-pi.test.ts
       - name: Real Pi extension-hidden tools (smarty-dev#5492)
-        # A real Pi process (RPC mode) loads the built dist/ and a fixture extension that hides three of its
-        # tools through pi.setActiveTools; fabric_exec's catalog, the prompt roster and invocation must agree.
         if: runner.os == 'Linux'
         env:
           FABRIC_5492_REAL_PI: '1'
         run: bunx vitest run tests/extension-hidden-tools-real-pi.test.ts
       - name: Real Pi sender headers (smarty-dev#6207)
-        # A real Pi process (RPC mode) loads the built dist/; a Main request and its process child's request
-        # reach a local stub that records the HTTP headers: X-Smarty-* on the wire, once, never caller-set.
         if: runner.os == 'Linux'
         env:
           FABRIC_6207_REAL_PI: '1'
         run: bunx vitest run tests/sender-headers-real-pi.test.ts
-      # smarty-dev#8953: agents.processSlice runs workers in systemd --user scopes. GitHub-hosted ubuntu boots
-      # systemd as PID 1 but starts no user manager for the runner: linger starts one, with its session bus.
-      - name: Start a user systemd manager
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          sudo loginctl enable-linger "$USER"
-          bus="/run/user/$(id -u)/bus"
-          for _ in $(seq 1 150); do [ -S "$bus" ] && break; sleep 0.2; done
-          test -S "$bus"
-          echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
-          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=$bus" >> "$GITHUB_ENV"
+      - uses: ./.github/actions/check-systemd
       - name: Process-slice scope E2E (required on Linux)
-        if: runner.os == 'Linux'
         env:
-          FABRIC_SCOPE_E2E_REQUIRED: "1"
+          FABRIC_SCOPE_E2E_REQUIRED: '1'
         run: bunx vitest run --project scope-e2e
-      - name: Affected tests
-        env:
-          # Pull requests compare against the target branch; pushes compare
-          # against the tip they replaced. An unusable base selects nothing.
-          PI_TEST_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
-        run: bun run test:affected
+
+  windows-acceptance:
+    needs: windows-gates
+    runs-on: windows-latest
+    env:
+      FABRIC_TEST_SKIP_NATS: '1'
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/check-setup
+        with:
+          dist-artifact: dist-windows-latest
+      - uses: ./.github/actions/check-regressions
+      - name: Test Windows type-checker regression
+        run: bunx vitest run tests/type-checker.test.ts
+      # Preserve the Windows smoke floor too; the old matrix ran it on both OSes.
       - name: Platform smoke floor
-        # Curated cross-platform surface (path and executable resolution, native
-        # binaries, spawn, process and watcher fallbacks) so a Linux or Windows
-        # break surfaces even when the affected selection is empty.
+        run: bun run test:smoke
+
+  linux-runtime:
+    # Packaging/upload must not race ahead of a failing or incomplete shard.
+    needs: [linux-gates, linux-tests, linux-acceptance]
+    runs-on: ubuntu-latest
+    env:
+      FABRIC_TEST_SKIP_NATS: '1'
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/check-setup
+        with:
+          dist-artifact: dist-ubuntu-latest
+      - uses: ./.github/actions/check-systemd
+      - name: Platform smoke floor
         run: bun run test:smoke
       - name: Package tested Linux runtime
         if: runner.os == 'Linux' && github.event_name == 'push'
@@ -169,16 +240,8 @@ jobs:
           bun --version > "$output/BUN-VERSION"
           tar -czf "$output/fabric-runtime.tar.gz" -C "$stage" .
           (cd "$output" && sha256sum fabric-runtime.tar.gz > SHA256SUMS)
-      # smarty-dev#8467: the compiled bundle in a real Pi process leaves no mesh state temp or
-      # lock staging entry behind when it ends during a large write loop on a busy mesh: a normal
-      # exit, SIGTERM, and SIGKILL (whose staged temp the next start on the same root reaps)
-      # (pi-fabric#606). It runs the Pi pinned in devDependencies, installed above by
-      # `bun install --frozen-lockfile`, against the dist/ built above, placed like the real-Pi
-      # two-reload gate (smarty-dev#8382): after the runtime is packaged, so the earlier steps and
-      # the recorded NODE-VERSION keep the runner's Node, and before the upload, so only a runtime
-      # that passed it is uploaded. Pi 0.87 needs Node >= 22.19 and dist/ is built for node24.
+      # Preserve Node 24 and package -> real-Pi exit cleanup -> upload ordering.
       - uses: actions/setup-node@v4
-        if: runner.os == 'Linux'
         with:
           node-version: 24
       - name: Real Pi exit cleanup e2e (smarty-dev#8467)
@@ -195,6 +258,90 @@ jobs:
           path: ${{ runner.temp }}/fabric-artifact/
           if-no-files-found: error
           retention-days: 7
+
+  check-linux:
+    name: check (ubuntu-latest)
+    if: always()
+    needs: [linux-gates, linux-tests, linux-acceptance, linux-runtime]
+    runs-on: ubuntu-latest
+    env:
+      FABRIC_TEST_SKIP_NATS: '1'
+      PI_TEST_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/check-setup
+        with:
+          dist-artifact: dist-ubuntu-latest
+      - name: Discover unsharded affected test files (no test execution)
+        shell: bash
+        run: node scripts/test-affected.mjs --list-only > "$RUNNER_TEMP/unsharded-selection.json"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: affected-ubuntu-latest-*
+          path: ${{ runner.temp }}/affected
+      - name: Merge shard receipts and require file-level parity
+        shell: bash
+        run: set -o pipefail; node scripts/ci-test-counts.mjs "$RUNNER_TEMP/affected" ubuntu-latest 10 "$RUNNER_TEMP/unsharded-selection.json" | tee "$RUNNER_TEMP/merged-receipt.md"
+      - name: Upload merged shard receipt
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: merged-affected-ubuntu-latest
+          path: ${{ runner.temp }}/merged-receipt.md
+          if-no-files-found: error
+          retention-days: 7
+      - name: Require every Linux dependency to succeed
+        if: always()
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        shell: bash
+        run: |
+          node --input-type=module -e 'const jobs = JSON.parse(process.env.RESULTS); if (Object.values(jobs).some(job => job.result !== "success")) { console.error(jobs); process.exit(1); }'
+
+  check-windows:
+    name: check (windows-latest)
+    if: always()
+    needs: [windows-gates, windows-tests, windows-acceptance]
+    runs-on: windows-latest
+    env:
+      FABRIC_TEST_SKIP_NATS: '1'
+      PI_TEST_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/check-setup
+        with:
+          dist-artifact: dist-windows-latest
+      - name: Discover unsharded affected test files (no test execution)
+        shell: bash
+        run: node scripts/test-affected.mjs --list-only > "$RUNNER_TEMP/unsharded-selection.json"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: affected-windows-latest-*
+          path: ${{ runner.temp }}/affected
+      - name: Merge shard receipts and require file-level parity
+        shell: bash
+        run: set -o pipefail; node scripts/ci-test-counts.mjs "$RUNNER_TEMP/affected" windows-latest 10 "$RUNNER_TEMP/unsharded-selection.json" | tee "$RUNNER_TEMP/merged-receipt.md"
+      - name: Upload merged shard receipt
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: merged-affected-windows-latest
+          path: ${{ runner.temp }}/merged-receipt.md
+          if-no-files-found: error
+          retention-days: 7
+      - name: Require every Windows dependency to succeed
+        if: always()
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        shell: bash
+        run: |
+          node --input-type=module -e 'const jobs = JSON.parse(process.env.RESULTS); if (Object.values(jobs).some(job => job.result !== "success")) { console.error(jobs); process.exit(1); }'
 
   nats-state-conformance:
     # The StateBackend contract suites on a real nats-server (smarty-dev#7504 phase 2): JetStream with
@@ -285,9 +432,19 @@ jobs:
         if: matrix.profile == 'cluster'
         # The fixture owns another three-node cluster on unique ports, so only its own leader is paused.
         run: bunx vitest run --retry=0 tests/state-backend-nats-election.test.ts
+      - name: Transport replicas and real R3 inbox delivery
+        if: matrix.profile == 'cluster'
+        # The test owns a separate three-node cluster and private scratch, not the shared conformance streams.
+        env:
+          NATS_EXPECTED_SERVER_VERSION: '2.14.7'
+          NATS_SERVER_REQUIRED: '1'
+        run: bunx vitest run --retry=0 tests/nats-transport-replicas.test.ts
       - name: Publish retry deduplication on R3
         if: matrix.profile == 'cluster'
         run: bunx vitest run --retry=0 tests/state-backend-nats-publish-dedupe.test.ts
+      - name: Lost first pull recovery on R3
+        if: matrix.profile == 'cluster'
+        run: bunx vitest run --retry=0 tests/state-backend-nats-pull-recovery.test.ts
       - name: Server logs (all nodes)
         if: failure()
         shell: bash

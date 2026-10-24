@@ -8,7 +8,7 @@ import { writeJsonAtomic } from "../core/atomic-write.js";
 import type { FabricAgentTransport } from "../config.js";
 import { isFabricThinking, type FabricThinking } from "../thinking.js";
 import { resolveActorDeliveryPolicy } from "./delivery-policy.js";
-import { FABRIC_ACTOR_HOST_EVENTS, MAX_ACTOR_BATCH_EVENTS, normalizeDeadLetterReplayMaxAgeMs, normalizeActorActivation, normalizeActorBatching, validateActorCoalesceKey, validateActorDedupeKey, validateActorInferenceContext } from "./types.js";
+import { FABRIC_ACTOR_HOST_EVENTS, MAX_ACTOR_BATCH_EVENTS, normalizeDeadLetterReplayMaxAgeMs, normalizeActorActivation, normalizeActorBatching, parseEventsStartAt, validateActorCoalesceKey, validateActorDedupeKey, validateActorInferenceContext } from "./types.js";
 import { normalizeActorActivationFilter, type FabricActorActivationFilter } from "./activation-filter.js";
 import { normalizeActorRecords } from "./records.js";
 import type {
@@ -218,6 +218,9 @@ export class GlobalActorRegistry {
       name: patch.name ?? existing.name,
       instructions: patch.instructions ?? existing.instructions,
       events: patch.events ?? existing.events,
+      ...(patch.eventsStartAt !== undefined
+        ? { eventsStartAt: patch.eventsStartAt }
+        : existing.eventsStartAt !== undefined ? { eventsStartAt: existing.eventsStartAt } : {}),
       topics: patch.topics ?? existing.topics,
       delivery: patch.delivery ?? existing.delivery,
       responseMode: patch.responseMode ?? existing.responseMode,
@@ -332,6 +335,7 @@ export class GlobalActorRegistry {
       name,
       instructions: def.instructions,
       events: [...def.events],
+      ...(def.eventsStartAt !== undefined ? { eventsStartAt: def.eventsStartAt } : {}),
       topics: [...def.topics],
       delivery: def.delivery,
       responseMode: def.responseMode,
@@ -436,6 +440,7 @@ export class GlobalActorRegistry {
       name,
       instructions,
       events,
+      ...(def.eventsStartAt !== undefined ? { eventsStartAt: parseEventsStartAt(def.eventsStartAt) } : {}),
       topics,
       delivery: deliveryPolicy.delivery,
       responseMode,
@@ -572,7 +577,9 @@ export class GlobalActorRegistry {
       let activation: FabricActorActivationPolicy | undefined;
       try { activation = normalizeActorActivation(record.activation); } catch { /* unreadable policy is off */ }
       let records: FabricActorRequest["records"];
+      let eventsStartAt: number | undefined;
       try {
+        eventsStartAt = record.eventsStartAt !== undefined ? parseEventsStartAt(record.eventsStartAt) : undefined;
         validateActorInferenceContext(record.inferenceContext, runner);
         validateActorCoalesceKey(record.coalesceKey);
         validateActorDedupeKey(record.dedupeKey);
@@ -591,6 +598,7 @@ export class GlobalActorRegistry {
         name: record.name,
         instructions: record.instructions,
         events,
+        ...(eventsStartAt !== undefined ? { eventsStartAt } : {}),
         topics,
         delivery,
         responseMode,

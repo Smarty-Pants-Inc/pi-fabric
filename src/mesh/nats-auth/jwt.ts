@@ -353,15 +353,24 @@ function limits(value: unknown): Record<string, number> {
 }
 
 function template(value: unknown): Record<string, unknown> {
-  const input = record(value, "signingKeys.template", ["pub", "sub"]);
+  const input = record(value, "signingKeys.template", ["pub", "sub"], ["allow_responses"]);
   const pub = record(input.pub, "signingKeys.template", ["allow", "deny"]);
   const sub = record(input.sub, "signingKeys.template", ["allow"], ["deny"]);
   const subOut: Record<string, unknown> = { allow: subjects(sub.allow, "signingKeys.template", false) };
   if (sub.deny !== undefined) subOut.deny = subjects(sub.deny, "signingKeys.template", true);
   // Go NewUserScope defaults: subs/data/payload -1 (user limits explicit on the template, absent on scoped users).
+  let allowResponses: { max: number } | undefined;
+  if (input.allow_responses !== undefined) {
+    const response = record(input.allow_responses, "signingKeys.template.allow_responses", ["max"]);
+    if (typeof response.max !== "number" || !Number.isSafeInteger(response.max) || response.max !== 16) {
+      fail("signingKeys.template.allow_responses");
+    }
+    allowResponses = { max: response.max };
+  }
   return {
     pub: { allow: subjects(pub.allow, "signingKeys.template", false), deny: subjects(pub.deny, "signingKeys.template", true) },
     sub: subOut,
+    ...(allowResponses ? { resp: allowResponses } : {}),
     subs: NO_LIMIT,
     data: NO_LIMIT,
     payload: NO_LIMIT,

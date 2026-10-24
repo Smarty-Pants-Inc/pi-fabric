@@ -12,7 +12,7 @@ import { PATH_B_OPERATOR_MACHINE, roleTemplateWithPathB } from "../src/mesh/nats
 import * as connectionModule from "../src/transport/nats/connection.js";
 import { openNatsTransport } from "../src/transport/nats/inbox.js";
 import { openNatsKvForMachine } from "../src/transport/nats/kv.js";
-import { ensureTransportConsumer, ensureTransportStream } from "../src/transport/nats/provision.js";
+import { ensureTransportConsumer, ensureTransportStream, INBOX_DUPLICATE_WINDOW_MS } from "../src/transport/nats/provision.js";
 import { TransportUnavailableError, type FabricTransport, type FabricTransportOptions, type TransportEnvelope } from "../src/transport/types.js";
 import { ADVISORY_CAPTURE_STREAM, transportAdvisoryStreamSubject, transportDurableName, transportInboxFilter, transportInboxStream, transportInboxStreamSubject, transportInboxSubject } from "../src/transport/nats/subjects.js";
 import { createPathBHarness, PATH_B_MACHINES, PATH_B_PERMISSION_POLICY, PATH_B_TEST_MESH, resolveNatsBinary, type PathBHarness, type PathBIdentity, type PathBUser } from "./helpers/nats-cluster.js";
@@ -21,8 +21,8 @@ import { ReconnectRelay } from "./helpers/nats-reconnect-server.js";
 const binary = resolveNatsBinary();
 if (!binary && process.env.NATS_AUTH_REQUIRED === "1") throw new Error("NATS_AUTH_REQUIRED=1 but no nats-server executable was found");
 const HOST = "reconnect-security-runtime";
-const EXTRA_GRANT = "reconnect.unexpected.publish";
-const policy = { maxBytes: 1_073_741_824, maxAgeMs: 0, maxMessageBytes: 1_048_576, duplicateWindowMs: 600_000, replicas: 1 as const };
+const REVOKED_GRANT = "fabric.in.*.*.*.*.{{tag(machine)}}";
+const policy = { maxBytes: 1_073_741_824, maxAgeMs: 0, maxMessageBytes: 1_048_576, duplicateWindowMs: INBOX_DUPLICATE_WINDOW_MS, replicas: 1 as const };
 const dnsUrl = (h: PathBHarness) => `tls://localhost:${new URL(h.serverUrl).port}`;
 
 async function bounded<T>(promise: Promise<T>, label: string, ms = 10_000): Promise<T> {
@@ -46,16 +46,17 @@ function identityFactories() {
   const operatorJwt = encodeOperatorJwt({ name: "reconnect-test", signingKeys: [operatorSigning.getPublicKey()], systemAccount: system.getPublicKey() }, signer(operator), clock);
   const systemAccountJwt = encodeAccountJwt({ name: "SYS", subject: system.getPublicKey(), signingKeys: [], limits: { mem_storage: 0, disk_storage: 0 } }, signer(operatorSigning), clock);
   const template = roleTemplateWithPathB("agent", { custodyStream: PATH_B_PERMISSION_POLICY.custodyStream, livenessStream: PATH_B_PERMISSION_POLICY.livenessStream }, PATH_B_MACHINES);
-  const accountJwt = (extra: boolean) => encodeAccountJwt({
+  const accountJwt = (revokeMachineAInbox = false) => encodeAccountJwt({
     name: "reconnect-app", subject: account.getPublicKey(),
     limits: { conn: -1, leaf: -1, subs: -1, data: -1, payload: -1, mem_storage: 0, disk_storage: 4_294_967_296, streams: 64, consumer: 256 },
     signingKeys: [
-      { key: agent.getPublicKey(), role: "agent", template: { ...template, pub: { ...template.pub, allow: [...template.pub.allow, ...(extra ? [EXTRA_GRANT] : [])] } } },
+      { key: agent.getPublicKey(), role: "agent", template: { ...template, pub: { ...template.pub,
+        allow: template.pub.allow.filter(subject => !(revokeMachineAInbox && subject === REVOKED_GRANT)) } } },
       { key: admin.getPublicKey(), role: "maintainer", template: { pub: { allow: [">"], deny: [] }, sub: { allow: ["_INBOX.{{subject()}}.>"] } } },
     ],
   }, signer(operatorSigning), clock);
-  const exact = accountJwt(false);
-  const changed = accountJwt(true);
+  const exact = accountJwt();
+  const revoked = accountJwt(true);
   let original: PathBIdentity | undefined;
   const first = (root: string): PathBIdentity => {
     const user = (machine: PathBUser["machine"], role: "agent" | "maintainer", name: string): PathBUser => {
@@ -75,7 +76,9 @@ function identityFactories() {
   };
   return {
     first,
-    second: (): PathBIdentity => { if (!original) throw new Error("first identity was not created"); return { ...original, appAccountJwt: changed }; },
+    current: (): PathBIdentity => { if (!original) throw new Error("first identity was not created"); return original; },
+    second: (): PathBIdentity => { if (!original) throw new Error("first identity was not created"); return { ...original, appAccountJwt: revoked }; },
+    revoked: (): PathBIdentity => { if (!original) throw new Error("first identity was not created"); return { ...original, appAccountJwt: revoked }; },
     clear: () => { for (const key of pairs) key.clear(); },
   };
 }
@@ -90,19 +93,23 @@ async function prepareFixture(withSecond: boolean) {
   let closing = false;
   const abort = new AbortController();
   const close = async () => {
+    if (closing) return;
     closing = true;
     abort.abort();
-    await Promise.all(connections.map((nc) => nc.close()));
-    await Promise.all(runtimes.map((runtime) => runtime.close()));
-    for (const relay of relays) relay.disconnect();
-    // Break held verification first, then join opens; seeded RED must not leak late runtimes.
-    await Promise.allSettled([...openings]);
-    for (const relay of [...relays].reverse()) await relay.stop();
-    for (const broker of [...brokers].reverse()) await broker.stop();
+    try {
+      await Promise.all(connections.map((nc) => nc.close()));
+      await Promise.all(runtimes.map((runtime) => runtime.close()));
+      for (const relay of relays) relay.disconnect();
+      // Break held verification first, then join opens; seeded RED must not leak late runtimes.
+      await Promise.allSettled([...openings]);
+      for (const relay of [...relays].reverse()) await relay.stop();
+      for (const broker of [...brokers].reverse()) await broker.stop();
+    } finally { identities.clear(); }
   };
   try {
     const first = await createPathBHarness({ binary: binary!, identityFactory: identities.first, tls: { dnsNames: ["localhost"], ipAddresses: [] } });
     brokers.push(first);
+    const initialIdentity = identities.current();
     if (withSecond) brokers.push(await createPathBHarness({ binary: binary!, identityFactory: identities.second, tls: { dnsNames: ["localhost"], ipAddresses: [] } }));
     for (const broker of brokers) relays.push(await ReconnectRelay.create(broker));
     // Both configured URLs initially reach the exact scope, regardless of client randomization.
@@ -117,7 +124,7 @@ async function prepareFixture(withSecond: boolean) {
     for (const broker of brokers) {
       const nc = await raw(broker, broker.users.bootstrap);
       const manager = await jetstreamManager(nc);
-      await ensureTransportStream(manager, { ...policy, name: ADVISORY_CAPTURE_STREAM, subjects: [transportAdvisoryStreamSubject], maxAgeMs: 30 * 86_400_000, maxMessageBytes: 65_536 });
+      await ensureTransportStream(manager, { ...policy, duplicateWindowMs: 10 * 60_000, name: ADVISORY_CAPTURE_STREAM, subjects: [transportAdvisoryStreamSubject], maxAgeMs: 30 * 86_400_000, maxMessageBytes: 65_536 });
       for (const machine of PATH_B_MACHINES) await ensureTransportStream(manager, { ...policy, name: transportInboxStream(machine), subjects: [transportInboxStreamSubject(machine)] });
       for (const bucket of ["leases", "presence"] as const) await openNatsKvForMachine(jetstream(nc), bucket, "machine-a", true);
       await ensureTransportConsumer(manager.consumers, { stream: transportInboxStream("machine-a"), durable: transportDurableName(HOST),
@@ -133,9 +140,8 @@ async function prepareFixture(withSecond: boolean) {
       void tracked.then(() => openings.delete(tracked), () => openings.delete(tracked));
       return tracked;
     };
-    return { brokers, relays, raw, abort, close, trackRuntime };
+    return { brokers, relays, raw, abort, close, trackRuntime, identities, initialIdentity };
   } catch (error) { await close(); throw error; }
-  finally { identities.clear(); }
 }
 
 async function fixture(withSecond: boolean, ownerSignal?: AbortSignal) {
@@ -340,6 +346,128 @@ describe.skipIf(!binary || process.platform === "win32")("verified transport reo
     } finally { await f.close(); }
   }, 90_000);
 
+  it("retries a transient USER.INFO timeout on native reconnect and resumes the inbox", async () => {
+    const f = await fixture(false);
+    const relay = f.relays[0]!;
+    let inbox: AsyncIterator<import("../src/transport/types.js").TransportDelivery<TransportEnvelope>> | undefined;
+    try {
+      inbox = f.runtime.inbox(f.abort.signal)[Symbol.asyncIterator]();
+      const initial = inbox.next();
+      await f.runtime.send(command("before-transient-verification-timeout"));
+      const delivered = (await bounded(initial, "pre-timeout inbox delivery")).value!;
+      await delivered.ack();
+      const resumedInbox = inbox.next();
+      void resumedInbox.catch(() => undefined);
+
+      relay.subjects.length = 0;
+      relay.commands.length = 0;
+      relay.dropNextVerification = true;
+      relay.disconnect();
+      relay.enabled = true;
+      await bounded(relay.verification.promise, "first reconnect USER.INFO request is dropped", 10_000);
+      expect(relay.subjects).toEqual(["$SYS.REQ.USER.INFO"]);
+      expect(await outcome(() => f.runtime.send(command("blocked-during-transient-verification"))))
+        .toBeInstanceOf(TransportUnavailableError);
+      expect(await outcome(() => f.runtime.kv("presence").get("machine-a.h.reconnect-timeout")))
+        .toBeInstanceOf(TransportUnavailableError);
+
+      const retry = command("after-transient-verification-timeout");
+      await sendAfterReopen(f.runtime, retry);
+      const resumed = (await bounded(resumedInbox, "existing inbox resumes after retry verification")).value!;
+      expect(resumed.payload.id).toBe(retry.id);
+      await resumed.ack();
+      expect(relay.subjects.filter((subject) => subject === "$SYS.REQ.USER.INFO")).toHaveLength(2);
+      expect(await f.runtime.drainState()).toEqual({ pending: 0, ackPending: 0 });
+      expect(relay.errors).toEqual([]);
+    } finally {
+      f.abort.abort();
+      await inbox?.return?.();
+      await f.close();
+    }
+  }, 90_000);
+
+  it("re-verifies changed USER.INFO permissions before native reconnect sends or inbox delivery resume", async () => {
+    const f = await fixture(false);
+    const broker = f.brokers[0]!;
+    const relay = f.relays[0]!;
+    let inbox: AsyncIterator<import("../src/transport/types.js").TransportDelivery<TransportEnvelope>> | undefined;
+    try {
+      inbox = f.runtime.inbox(f.abort.signal)[Symbol.asyncIterator]();
+      const first = inbox.next();
+      await f.runtime.send(command("before-permission-restart"));
+      const delivered = (await bounded(first, "pre-restart authenticated inbox delivery")).value!;
+      await delivered.ack();
+      const pendingAck = inbox.next();
+      await f.runtime.send(command("ack-must-wait-for-reverification"));
+      const heldDelivery = (await bounded(pendingAck, "pre-restart delivery retained for gated ACK")).value!;
+      let inboxError: unknown;
+      let earlyDelivery: unknown;
+      const waiting = inbox.next().then((result) => {
+        if (!result.done) earlyDelivery = result.value;
+      }, (error) => { inboxError = error; });
+
+      relay.holdVerification = true;
+      relay.subjects.length = 0;
+      relay.commands.length = 0;
+      relay.disconnect();
+      // Keep the runtime on the disabled relay while the persisted account ACL changes during its outage.
+      const updatedIdentity = f.identities.revoked();
+      expect(broker.configText.includes(f.initialIdentity.appAccountJwt)).toBe(true);
+      const updatedConfig = broker.configText.replace(f.initialIdentity.appAccountJwt, updatedIdentity.appAccountJwt);
+      expect(updatedConfig).not.toBe(broker.configText);
+      const configPath = path.join(broker.root, "nats.conf");
+      fs.writeFileSync(configPath, updatedConfig, { mode: 0o600 });
+      fs.chmodSync(configPath, 0o600);
+      const resolverJwt = path.join(broker.root, "resolver", `${f.initialIdentity.appAccount}.jwt`);
+      fs.writeFileSync(resolverJwt, updatedIdentity.appAccountJwt, { mode: 0o600 });
+      fs.chmodSync(resolverJwt, 0o600);
+      await bounded(broker.restart(), "same-store broker restart with reduced account grants", 25_000);
+      relay.enabled = true;
+      await bounded(relay.verification.promise, "reconnect USER.INFO on the real broker", 10_000);
+
+      const outbound = command("must-not-publish-before-reverification");
+      expect(await outcome(() => heldDelivery.ack())).toBeInstanceOf(TransportUnavailableError);
+      expect(await outcome(() => f.runtime.send(outbound))).toBeInstanceOf(TransportUnavailableError);
+      expect(await outcome(() => f.runtime.kv("presence").put("machine-a.h.reconnect-auth", HOST, { forbidden: true }, 0)))
+        .toBeInstanceOf(TransportUnavailableError);
+      expect(relay.subjects).toEqual(["$SYS.REQ.USER.INFO"]);
+
+      const permissionProbe = await f.raw(broker, broker.users.machineA);
+      const livePermissions = (await permissionProbe.request("$SYS.REQ.USER.INFO", new Uint8Array(), { timeout: 2_000 }))
+        .json<{ data: { permissions: { publish: { allow: string[] } } } }>().data.permissions.publish.allow;
+      expect(livePermissions).not.toContain("fabric.in.*.*.*.*.machine-a");
+      await permissionProbe.close();
+      const observer = await f.raw(broker, broker.users.bootstrap);
+      const manager = await jetstreamManager(observer);
+      const incoming = { ...command("unverified-inbound"), createdAt: Date.now() };
+      await jetstream(observer).publish(transportInboxSubject("machine-a", HOST, "cmd", incoming.targetId, "machine-b"),
+        new TextEncoder().encode(JSON.stringify({ format: 1, sourceMachine: "machine-b", envelope: incoming })));
+      await observer.flush();
+      expect((await manager.consumers.info(transportInboxStream("machine-a"), transportDurableName(HOST))).delivered.stream_seq)
+        .toBe(heldDelivery.sequence);
+      await delay(100);
+      expect(earlyDelivery).toBeUndefined();
+      expect(relay.subjects).toEqual(["$SYS.REQ.USER.INFO"]);
+
+      relay.releaseVerification();
+      await bounded(relay.verificationClosed.promise, "mismatched USER.INFO connection close", 5_000);
+      await bounded(waiting, "terminal inbox authorization failure", 5_000);
+      expectTypedVerificationError(inboxError);
+      expectTypedVerificationError(await outcome(() => f.runtime.send(outbound)));
+      expectTypedVerificationError(await outcome(() => f.runtime.kv("presence").get("machine-a.h.reconnect-auth")));
+      expect(relay.subjects).toEqual(["$SYS.REQ.USER.INFO"]);
+      expect(relay.errors).toEqual([]);
+      const finalConsumer = await manager.consumers.info(transportInboxStream("machine-a"), transportDurableName(HOST));
+      expect(finalConsumer.delivered.stream_seq).toBe(heldDelivery.sequence);
+      expect(finalConsumer.ack_floor.stream_seq).toBe(delivered.sequence);
+      await observer.close();
+    } finally {
+      f.abort.abort();
+      await inbox?.return?.();
+      await f.close();
+    }
+  }, 90_000);
+
   it("refuses a second configured server's changed account scope with no publication or inbound delivery", async () => {
     const f = await fixture(true);
     try {
@@ -353,8 +481,9 @@ describe.skipIf(!binary || process.platform === "win32")("verified transport reo
       }
       expect(infos[0]!.data.user).toBe(first.users.machineA.publicKey);
       expect(infos[1]!.data.user).toBe(infos[0]!.data.user);
-      expect(infos[1]!.data.permissions.publish.allow).toEqual(expect.arrayContaining([EXTRA_GRANT]));
-      expect(infos[1]!.data.permissions.publish.allow.filter((s) => s !== EXTRA_GRANT).sort()).toEqual([...infos[0]!.data.permissions.publish.allow].sort());
+      const removedGrant = "fabric.in.*.*.*.*.machine-a";
+      expect(infos[1]!.data.permissions.publish.allow).not.toContain(removedGrant);
+      expect([...infos[1]!.data.permissions.publish.allow, removedGrant].sort()).toEqual([...infos[0]!.data.permissions.publish.allow].sort());
       const received: unknown[] = [];
       let inboxError: unknown;
       const iterator = f.runtime.inbox(f.abort.signal)[Symbol.asyncIterator]();

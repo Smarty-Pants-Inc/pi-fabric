@@ -2,6 +2,7 @@ import { isDeepStrictEqual } from "node:util";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { FabricActivityRun } from "../activity/types.js";
 import type { FabricState } from "../fabric-state.js";
+import type { FabricPeerListOptions } from "../topology/participant-directory.js";
 import type { MeshEvent, MeshStateEntry } from "../mesh/store.js";
 import type { AgentHandleInfo, AgentRunRecord } from "../agents/types.js";
 import { safeText } from "./format.js";
@@ -131,7 +132,11 @@ export const createDashboardSnapshot = (
     }
   });
   const main = state.mainAgentInfo(context);
-  const peers = typeof state.peerInfos === "function" ? state.peerInfos({ background: true }) : [];
+  // Project participants already carry this refresh's liveness/collision checks. Let the
+  // directory project peers with its own rootId, rather than listing the project twice.
+  const peerOptions: FabricPeerListOptions = { background: true,
+    ...(typeof state.participantInfos === "function" ? { displayParticipants: participants } : {}) };
+  const peers = typeof state.peerInfos === "function" ? state.peerInfos(peerOptions) : [];
   const globalActors = state.globalActors.list();
   const componentGraph = typeof state.componentGraph === "function"
     ? state.componentGraph() : { components: [], edges: [], cycles: [] };

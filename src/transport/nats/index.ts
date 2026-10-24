@@ -1,5 +1,7 @@
 export { openNatsTransport } from "./inbox.js";
 export { NatsAuthorizationError, openNatsConnection, readNatsCredentials } from "./connection.js";
+export { openNatsEventsPublisher } from "./events-publish.js";
+export { startNatsActorEventsConsumer } from "./events-consume.js";
 export type { NatsConnectionHandle, NatsConnectionOptions } from "./connection.js";
 export {
   KV_MARKER_TTL_MS,
@@ -9,6 +11,8 @@ export {
   PRESENCE_TTL_MS,
   LEASES_BUCKET,
   PRESENCE_BUCKET,
+  PLACEMENT_TERMINAL_BUCKET,
+  PLACEMENT_TERMINAL_TTL_MS,
   NatsKvConflictError,
   openNatsKv,
   openNatsKvForMachine,

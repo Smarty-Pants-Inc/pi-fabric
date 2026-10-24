@@ -1,7 +1,6 @@
 // Linux process/boot trust boundary; existing hosted-only guards remain untouched.
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
-import { once } from "node:events";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -9,16 +8,22 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { buildSync } from "esbuild";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
-import { isBridgedTopic, StoreBridgeSide } from "../src/mesh/bridge.js";
+import { BRIDGE_STALL_ALARM_TOPIC, bridgeStallReasonPath, isBridgedTopic, StoreBridgeSide } from "../src/mesh/bridge.js";
 import { BRIDGE_LEASE_ALARM_AFTER_MS } from "../src/topology/bridge-alarms.js";
 import { rootPresenceAlarms } from "../src/topology/stall-alarms.js";
 import { MIRROR_FRESH_MS, readHostLease, writeHostLease, type FabricHostLease } from "../src/topology/host-leases.js";
 import { processIncarnation, readPhysicalHostIdentity } from "../src/core/atomic-write.js";
+import { writeParticipantFile } from "../src/topology/participant-files.js";
 const owner: MeshIdentity = { id: "session:11111111-1111-4111-8111-111111111111", name: "owner", kind: "main" };
 const remoteId = "session:22222222-2222-4222-8222-222222222222";
 const hostKey = `topology/hosts/${createHash("sha256").update(remoteId).digest("hex")}`;
 const cleanup: Array<() => Promise<void>> = [];
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close(); vi.unstubAllEnvs(); });
+async function waitFor(check: () => boolean, timeoutMs = 3_000): Promise<void> {
+  const deadline = performance.now() + timeoutMs;
+  while (!check() && performance.now() < deadline) await sleep(5);
+  expect(check()).toBe(true);
+}
 function changed<T>(root: string, check: () => T | undefined, timeoutMs = 20_000): Promise<T> {
   return new Promise((resolve, reject) => {
     let watcher: fs.FSWatcher | undefined;
@@ -36,44 +41,119 @@ function messages(child: ChildProcess) {
     if (previous) return Promise.resolve(previous);
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => done(new Error(`missing ${kind}: ${JSON.stringify(receipts)}`)), 20_000);
-      const receive = (item: any) => { if (item.kind === kind) done(undefined, item); };
+      const receive = (item: any) => {
+        if (item.kind === `${kind}-failed` || item.kind === "failure") done(new Error(`${item.kind}: ${String(item.error)}`));
+        else if (item.kind === kind) done(undefined, item);
+      };
       const exit = (code: number | null) => done(new Error(`child exited ${code} awaiting ${kind}`));
       function done(error?: Error, item?: any) { clearTimeout(timer); child.off("message", receive); child.off("exit", exit); error ? reject(error) : resolve(item); }
       child.on("message", receive); child.on("exit", exit);
     });
   }};
 }
+const childAlive = (child: ChildProcess): boolean => child.exitCode === null && child.signalCode === null;
+async function sendChildMessage(child: ChildProcess, message: Record<string, unknown>): Promise<void> {
+  if (!childAlive(child) || !child.connected) return;
+  await new Promise<void>((resolve, reject) => {
+    child.send(message, error => {
+      if (!error || ((error as NodeJS.ErrnoException).code === "EPIPE" && !childAlive(child))) resolve();
+      else reject(error);
+    });
+  });
+}
+function waitForExit(child: ChildProcess): Promise<void> {
+  if (!childAlive(child)) return Promise.resolve();
+  return new Promise(resolve => {
+    const onExit = () => { child.off("exit", onExit); resolve(); };
+    child.once("exit", onExit);
+    if (!childAlive(child)) onExit();
+  });
+}
 async function terminate(child: ChildProcess) {
-  if (child.exitCode !== null || child.signalCode !== null) return;
-  const exited = once(child, "exit");
-  if (child.connected) child.send({ op: "shutdown" });
+  if (!childAlive(child)) return;
+  if (process.platform === "linux") child.kill("SIGCONT");
+  const exited = waitForExit(child);
+  let sendError: unknown;
+  try { await sendChildMessage(child, { op: "shutdown" }); } catch (error) { sendError = error; }
   const timer = setTimeout(() => child.kill("SIGKILL"), 2_000);
   try { await exited; } finally { clearTimeout(timer); }
+  if (sendError) throw sendError;
 }
-async function fixture(populated: boolean) {
+async function fixture(populated: boolean, watchdog: Record<string, unknown> = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-lease-process-"));
   const hubRoot = path.join(root, "hub"), farRoot = path.join(root, "far");
   fs.mkdirSync(hubRoot); fs.mkdirSync(farRoot);
+  const mesh = new MeshStore(hubRoot, 64 * 1024, 100);
+  const farMesh = new MeshStore(farRoot, 64 * 1024, 100);
+  // Seed durable backlogs and their cursors before either process starts, so both directions
+  // are already pending at the first probe (publishBatch may confirm only a short prefix).
+  if (Array.isArray(watchdog.backlogDirections)) {
+    for (const direction of watchdog.backlogDirections) {
+      const source = direction === "toRemote" ? mesh : farMesh;
+      const from: MeshIdentity = direction === "toRemote" ? owner : { id: remoteId, name: "remote", kind: "main" };
+      const events = Array.from({ length: 20 }, (_, index) => ({ topic: "ops.owner", kind: "pr.wake", from,
+        to: direction === "toRemote" ? remoteId : owner.id, data: { path: "watchdog-backlog", index } }));
+      for (let index = 0; index < events.length;) index += (await source.publishBatch(events.slice(index))).length;
+    }
+    // Inbound events must really deliver, not merely advance over an unaddressed recipient.
+    const now = Date.now();
+    await mesh.put({ key: `topology/hosts/${createHash("sha256").update(owner.id).digest("hex")}`, identity: owner,
+      value: { format: 1, id: owner.id, rootId: owner.id, identity: owner, startedAt: now, updatedAt: now,
+        expiresAt: now + 600_000, incarnationToken: "owner-native-generation" } });
+    writeHostLease(hubRoot, { id: owner.id, rootId: owner.id, identityId: owner.id, startedAt: now, updatedAt: now,
+      expiresAt: now + 600_000, incarnationToken: "owner-native-generation" });
+    fs.writeFileSync(path.join(root, "cursor.json"), JSON.stringify({ format: 1, local: "hub", remote: "far",
+      toRemote: { after: 0, mark: 0 }, toLocal: { after: 0, mark: 0 } }));
+  }
   const program = path.join(root, "native.mjs");
   const source = String.raw`
     import { Transform } from "node:stream";
     import { MeshStore } from ${JSON.stringify(path.resolve("src/mesh/store.ts"))};
-    import { MeshBridge, StoreBridgeSide, RemoteBridgeSide, serveBridgeAgent } from ${JSON.stringify(path.resolve("src/mesh/bridge.ts"))};
+    import { BRIDGE_STALL_ALARM_TOPIC, MeshBridge, StoreBridgeSide, RemoteBridgeSide, serveBridgeAgent } from ${JSON.stringify(path.resolve("src/mesh/bridge.ts"))};
     import { writeHostLease } from ${JSON.stringify(path.resolve("src/topology/host-leases.ts"))};
-    const [role, root, cursor, populated] = process.argv.slice(2);
+    const [role, root, cursor, populated, watchdogWire = "{}"] = process.argv.slice(2);
+    const watchdog = JSON.parse(watchdogWire);
+    let wallClockOffsetMs = 0;
+    if (role === "bridge") {
+      const realDateNow = Date.now.bind(Date);
+      Date.now = () => realDateNow() + wallClockOffsetMs;
+    }
     const store = new MeshStore(root, 64 * 1024, 100);
     const send = value => process.send?.(value);
     process.on("uncaughtException", error => { send({ kind: "failure", error: String(error.stack) }); process.exit(1); });
     process.on("unhandledRejection", error => { send({ kind: "failure", error: String(error?.stack || error) }); process.exit(1); });
-    let gates = [];
+    // Limit delayed source reads to one event so the real cursor advances but stays behind.
+    function slowTail(side, delayMs) {
+      if (delayMs === undefined) return;
+      const tail = side.tail.bind(side);
+      side.tail = async (after, offset) => {
+        await new Promise(resolve => setTimeout(resolve, delayMs));
+        const page = await tail(after, offset), first = page.events[0];
+        return first ? { events: [first], through: first.sequence } : page;
+      };
+    }
+    let gates = [], sourceReadPaused = false, releaseSourceRead, bridgeForStop;
     process.on("message", message => {
+      if (message.op === "wall-clock-offset") wallClockOffsetMs = message.offsetMs;
+      if (message.op === "pause-source-read") { sourceReadPaused = true; send({ kind: "source-read-paused" }); }
+      if (message.op === "resume-source-read") {
+        sourceReadPaused = false; releaseSourceRead?.(); releaseSourceRead = undefined;
+        send({ kind: "source-read-resumed" });
+      }
       if (message.op === "pause") { gates.forEach(gate => gate.paused = true); send({ kind: "paused" }); }
       if (message.op === "resume" || message.op === "shutdown") {
         gates.forEach(gate => { gate.paused = false; for (const bytes of gate.queued.splice(0)) gate.push(bytes); gate.bytes = 0; });
         send({ kind: "resumed" });
       }
       // Never invoke populated bridge.stop/withdraw locally.
-      if (message.op === "shutdown") { store.closeState(); process.exit(0); }
+      if (message.op === "publish") void store.publish(message.event)
+        .then(result => send({ kind: "published", sequence: result.sequence }))
+        .catch(error => send({ kind: "publish-failed", error: String(error) }));
+      if (message.op === "shutdown") {
+        const stopping = watchdog.stopBridgeOnShutdown && bridgeForStop ? bridgeForStop.stop() : undefined;
+        if (stopping) void stopping.then(() => { store.closeState(); process.exit(0); });
+        else { store.closeState(); process.exit(0); }
+      }
     });
     if (role === "agent") {
       if (populated === "yes") {
@@ -99,12 +179,53 @@ async function fixture(populated: boolean) {
       }
       const input = new Gate(), output = new Gate(); gates = [input, output];
       process.stdin.pipe(input); output.pipe(process.stdout);
+      const side = new StoreBridgeSide(store, "hub", Date.now, true);
+      slowTail(side, watchdog.toLocalTailDelayMs === undefined ? undefined : 0);
+      if (watchdog.inboundTailStall) side.tail = async (after, offset) => ({ events: [], through: after, ...(offset !== undefined ? { offset } : {}) });
       send({ kind: "ready", pid: process.pid });
-      await serveBridgeAgent(new StoreBridgeSide(store, "hub", Date.now, true), input, output);
+      await serveBridgeAgent(side, input, output);
+      store.closeState();
+      process.exit(0);
     } else {
       const local = new StoreBridgeSide(store, "far", Date.now, true);
+      slowTail(local, watchdog.toRemoteTailDelayMs);
+      if (watchdog.outboundTailStall) local.tail = async (after, offset) => ({ events: [], through: after, ...(offset !== undefined ? { offset } : {}) });
+      const localTail = local.tail.bind(local);
+      local.tail = async (after, offset) => {
+        if (sourceReadPaused) await new Promise(resolve => { releaseSourceRead = resolve; send({ kind: "source-read-blocked" }); });
+        return localTail(after, offset);
+      };
+      if (watchdog.toLocalTailDelayMs) {
+        // Delay the hub's receipt, not the remote traffic FIFO that also serves watchdog heads.
+        const publish = local.publishWithReceipt.bind(local);
+        local.publishWithReceipt = async (...args) => {
+          await new Promise(resolve => setTimeout(resolve, watchdog.toLocalTailDelayMs));
+          return publish(...args);
+        };
+      }
       const remote = new RemoteBridgeSide(process.stdin, process.stdout, 120000);
-      const bridge = new MeshBridge({ localName: "hub", remoteName: "far", local, remote, cursorPath: cursor });
+      const bridge = new MeshBridge({ localName: "hub", remoteName: "far", local, remote, cursorPath: cursor,
+        log: line => send({ kind: "bridge-log", line }),
+        watchdogIntervalMs: watchdog.intervalMs, watchdogProbeTimeoutMs: watchdog.probeTimeoutMs,
+        watchdogStallAfterMs: watchdog.stallAfterMs, directionStallAfterMs: watchdog.directionStallAfterMs,
+        ...(watchdog.callbacks === false ? {} : {
+          notifyWatchdog: () => send({ kind: "watchdog" }),
+          publishStallAlarm: async alarm => {
+            const event = await store.publish({ topic: BRIDGE_STALL_ALARM_TOPIC, kind: "bridge-stall",
+              from: { id: "bridge:hub", name: "mesh-bridge", kind: "main" }, to: ${JSON.stringify(owner.id)}, text: alarm.reason, data: alarm });
+            send({ kind: "stall-alarm", alarm, sequence: event.sequence });
+          },
+          publishDeliveryAgeAlarm: async alarm => {
+            const event = await store.publish({ topic: "ops.owner",
+              kind: alarm.state === "outage" ? "bridge.delivery-age.alarm" : "bridge.delivery-age.recovered",
+              from: { id: "bridge:hub", name: "mesh-bridge", kind: "main" }, to: ${JSON.stringify(owner.id)},
+              text: alarm.direction + " " + alarm.reason + " delivery-age episode " + alarm.state, data: alarm });
+            send({ kind: "delivery-age-alarm", alarm, sequence: event.sequence });
+          },
+        }),
+      });
+      bridgeForStop = bridge;
+      await remote.hello();
       send({ kind: "ready", pid: process.pid });
       await bridge.run(); send({ kind: "ended" });
     }
@@ -112,29 +233,48 @@ async function fixture(populated: boolean) {
   buildSync({ stdin: { contents: source, resolveDir: process.cwd() }, outfile: program,
     bundle: true, platform: "node", format: "esm", packages: "external" });
   const launch = (role: string, meshRoot: string) => spawn(process.execPath,
-    [program, role, meshRoot, path.join(root, "cursor.json"), populated ? "yes" : "no"], { stdio: ["pipe", "pipe", "pipe", "ipc"] });
+    [program, role, meshRoot, path.join(root, "cursor.json"), populated ? "yes" : "no", JSON.stringify(watchdog)],
+    { stdio: ["pipe", "pipe", "pipe", "ipc"] });
   const agent = launch("agent", farRoot), agentMessages = messages(agent);
   const bridge = launch("bridge", hubRoot), bridgeMessages = messages(bridge);
   let stderr = "";
-  for (const child of [bridge, agent]) child.stderr!.on("data", bytes => { stderr += String(bytes); });
+  const transportErrors: string[] = [];
+  for (const [name, child] of [["bridge", bridge], ["agent", agent]] as const) {
+    child.stderr!.on("data", bytes => {
+      // The local deletion guard announces its hosted-only report mode in every child; it is not product stderr.
+      stderr += String(bytes).replace(/^hosted-only \(outside-temp deletion reporting\): push and let CI run it\r?\n/gm, "");
+    });
+    child.stdin!.on("error", error => { transportErrors.push(`${name}.stdin: ${error.message}`); });
+    child.stdout!.on("error", error => { transportErrors.push(`${name}.stdout: ${error.message}`); });
+  }
   bridge.stdout!.pipe(agent.stdin!); agent.stdout!.pipe(bridge.stdin!);
-  bridge.stdin!.on("error", () => {}); agent.stdin!.on("error", () => {});
-  const mesh = new MeshStore(hubRoot, 64 * 1024, 100);
   cleanup.push(async () => {
-    if (agent.connected) agent.send({ op: "resume" });
-    await terminate(bridge); await terminate(agent); mesh.closeState();
-    fs.rmSync(root, { recursive: true, force: true }); // only this fixture's temp, after owned handles join
+    const failures: unknown[] = [];
+    try {
+      if (childAlive(agent)) {
+        if (process.platform === "linux") agent.kill("SIGCONT");
+        await sendChildMessage(agent, { op: "resume" });
+      }
+    } catch (error) { failures.push(error); }
+    try { await terminate(bridge); } catch (error) { failures.push(error); }
+    try { await terminate(agent); } catch (error) { failures.push(error); }
+    if (transportErrors.length) failures.push(new Error(`bridge fixture transport errors: ${transportErrors.join("; ")}`));
+    mesh.closeState(); farMesh.closeState();
+    fs.rmSync(root, { recursive: true, force: true }); // only this fixture's temp, after both child exits
+    if (failures.length) throw new AggregateError(failures, "bridge fixture cleanup failed");
   });
   await Promise.all([agentMessages.wait("ready"), bridgeMessages.wait("ready")]);
   const lease = () => readHostLease(hubRoot, remoteId);
   const sample = () => lease()?.mirror?.observedAt;
   const sweep = (now = Date.now(), store = mesh) => rootPresenceAlarms(store, owner, owner.id, [], 900_000, now);
   const alarms = () => mesh.read({ topic: "ops.owner", after: 0, limit: 100 }).filter(event => event.kind.startsWith("bridge.lease."));
+  const stallAlarms = () => mesh.read({ topic: BRIDGE_STALL_ALARM_TOPIC, after: 0, limit: 100 });
   const healthy = () => {
-    expect(stderr).toBe(""); expect(bridge.exitCode).toBeNull(); expect(agent.exitCode).toBeNull();
+    expect(stderr).toBe(""); expect(transportErrors).toEqual([]); expect(bridge.exitCode).toBeNull(); expect(agent.exitCode).toBeNull();
     expect([...bridgeMessages.receipts, ...agentMessages.receipts].filter(item => item.kind === "failure" || item.kind === "ended")).toEqual([]);
   };
-  return { root, hubRoot, mesh, bridge, agent, agentMessages, lease, sample, sweep, alarms, healthy };
+  return { root, hubRoot, farRoot, mesh, farMesh, bridge, agent, bridgeMessages, agentMessages, lease, sample, sweep,
+    alarms, stallAlarms, diagnostics: () => stderr, healthy };
 }
 // Keep reason: real process liveness/cross-host provenance; unit mocks cannot establish idle renewal.
 describe.skipIf(process.platform !== "linux")("mirrored lease bridge alarms via the committed owner sweep", () => {
@@ -232,8 +372,247 @@ describe.skipIf(process.platform !== "linux")("mirrored lease bridge alarms via 
     expect(alarms).toHaveLength(1);
     expect(alarms[0]).toMatchObject({ kind: "bridge.lease.alarm", data: { link: "stalled" } });
   });
-  it("carries bridge owner alarms only to a canonical session, never a factory/broadcast address", () => {
-    for (const kind of ["bridge.lease.alarm", "bridge.lease.recovered"]) {
+  it("keeps an idle healthy link alive with repeated notifications and no alarm", async () => {
+    const f = await fixture(true, { intervalMs: 20, probeTimeoutMs: 60, stallAfterMs: 150, directionStallAfterMs: 150 });
+    await changed(f.hubRoot, () => f.sample());
+    await waitFor(() => f.bridgeMessages.receipts.filter(item => item.kind === "watchdog").length >= 4);
+    expect(f.stallAlarms()).toEqual([]);
+    expect(f.bridge.exitCode).toBeNull();
+    expect(f.agent.exitCode).toBeNull();
+  }, 10_000);
+
+  it("stops watchdog pings and publishes one v1 alarm/reason when the real remote process is frozen", async () => {
+    const f = await fixture(true, { intervalMs: 25, probeTimeoutMs: 30, stallAfterMs: 120, directionStallAfterMs: 900 });
+    await changed(f.hubRoot, () => f.sample());
+    await waitFor(() => f.bridgeMessages.receipts.filter(item => item.kind === "watchdog").length >= 3);
+    expect(f.stallAlarms()).toEqual([]);
+    expect(f.bridge.exitCode).toBeNull();
+    f.agent.kill("SIGSTOP");
+    const message = await f.bridgeMessages.wait("stall-alarm");
+    const notificationsAtAlarm = f.bridgeMessages.receipts.filter(item => item.kind === "watchdog").length;
+    await sleep(120);
+    const notificationsAfterAlarm = f.bridgeMessages.receipts.filter(item => item.kind === "watchdog").length;
+    expect(notificationsAtAlarm).toBeGreaterThanOrEqual(3);
+    expect(notificationsAfterAlarm).toBe(notificationsAtAlarm);
+    expect(f.bridge.exitCode).toBeNull();
+    expect(f.stallAlarms()).toHaveLength(1);
+    const alarm = f.stallAlarms()[0]!;
+    expect(alarm).toMatchObject({ topic: BRIDGE_STALL_ALARM_TOPIC, kind: "bridge-stall", to: owner.id,
+      data: { v: 1, host: "hub", peer: "far", direction: "both" } });
+    expect((alarm.data as Record<string, unknown>).reason).toEqual(expect.stringMatching(/^no successful round trip for \d+ ms$/));
+    const data = alarm.data as Record<string, unknown>;
+    expect(Object.keys(data).sort()).toEqual(["at", "direction", "host", "lastOkToLocal", "lastOkToRemote", "peer", "reason", "stallId", "v"]);
+    expect(data.at).toEqual(expect.stringMatching(/^\d{4}-\d{2}-\d{2}T.*Z$/));
+    expect(data.lastOkToLocal).toEqual(expect.stringMatching(/^\d{4}-\d{2}-\d{2}T.*Z$/));
+    expect(data.lastOkToRemote).toEqual(expect.stringMatching(/^\d{4}-\d{2}-\d{2}T.*Z$/));
+    expect(data.stallId).toEqual(expect.stringMatching(/^\d+$/));
+    expect(message.alarm).toMatchObject(data);
+    const reasonPath = bridgeStallReasonPath(path.join(f.root, "cursor.json"));
+    const reason = fs.readFileSync(reasonPath, "utf8");
+    expect(reason).toMatch(/^mesh-bridge: stall v1 host=.* peer=far direction=both at=.* lastOkToRemote=.* lastOkToLocal=.* stallId=\d+ reason=no successful round trip for \d+ ms restartCount=unknown\n$/);
+    expect(f.stallAlarms()).toHaveLength(1);
+  }, 10_000);
+
+  it("exits non-zero with one directional alarm when inbound events stall but outbound delivery still works", async () => {
+    const f = await fixture(true, { intervalMs: 20, probeTimeoutMs: 100, stallAfterMs: 1_500,
+      directionStallAfterMs: 150, inboundTailStall: true });
+    await changed(f.hubRoot, () => f.sample());
+    const publishedAfter = f.agentMessages.receipts.length;
+    f.agent.send({ op: "publish", event: { topic: "ops.owner", kind: "pr.wake",
+      from: { id: remoteId, name: "remote", kind: "main" }, to: owner.id, data: { path: "inbound" } } });
+    await f.agentMessages.wait("published", publishedAfter);
+    await f.mesh.publish({ topic: "ops.owner", kind: "pr.wake", from: owner, to: remoteId, data: { path: "outbound" } });
+    await waitFor(() => f.farMesh.read({ topic: "ops.owner", after: 0 }).some(event => (event.data as { path?: string } | undefined)?.path === "outbound"));
+    await f.bridgeMessages.wait("stall-alarm");
+    await waitFor(() => f.bridge.exitCode !== null, 3_000);
+    expect(f.bridge.exitCode).toBe(1);
+    expect(f.bridge.signalCode).toBeNull();
+    await waitFor(() => f.agent.exitCode !== null, 3_000);
+    expect(f.agent.exitCode).toBe(0);
+    expect(f.diagnostics()).not.toMatch(/EPIPE/);
+    expect(f.stallAlarms()).toHaveLength(1);
+    const alarm = f.stallAlarms()[0]!;
+    expect(alarm).toMatchObject({ kind: "bridge-stall", to: owner.id,
+      data: { v: 1, peer: "far", direction: "toLocal" } });
+    expect((alarm.data as Record<string, unknown>).reason).toEqual(expect.stringMatching(/no toLocal event receipt/));
+    const reason = fs.readFileSync(bridgeStallReasonPath(path.join(f.root, "cursor.json")), "utf8");
+    expect(reason).toMatch(/^mesh-bridge: stall v1 host=.* peer=far direction=toLocal at=.* lastOkToRemote=.* lastOkToLocal=.* stallId=\d+ reason=no toLocal event receipt .* while toRemote remains current restartCount=unknown\n$/);
+    expect(f.stallAlarms()).toHaveLength(1);
+  }, 30_000);
+
+  // Keep reason: smarty-dev#15695, a wedged direction hidden by a slow-but-moving peer direction.
+  it.each(["toRemote", "toLocal"] as const)("restarts a wedged %s while the opposite cursor is pending and advancing", async direction => {
+    const stallAfterMs = 4_000;
+    const opposite = direction === "toRemote" ? "toLocal" : "toRemote";
+    const f = await fixture(true, { intervalMs: 20, probeTimeoutMs: 1_000, stallAfterMs: 30_000,
+      directionStallAfterMs: stallAfterMs, outboundTailStall: direction === "toRemote", inboundTailStall: direction === "toLocal",
+      [`${opposite}TailDelayMs`]: 1_000, backlogDirections: ["toRemote", "toLocal"] });
+    await changed(f.hubRoot, () => f.sample());
+    await f.bridgeMessages.wait("watchdog");
+    const cursor = () => JSON.parse(fs.readFileSync(path.join(f.root, "cursor.json"), "utf8"));
+    const before = cursor();
+    const started = performance.now();
+    await waitFor(() => f.stallAlarms().length > 0, stallAfterMs + 2_000);
+    expect(performance.now() - started).toBeLessThan(stallAfterMs + 2_000);
+    const after = cursor();
+    expect(after[direction].after).toBe(before[direction].after);
+    expect(after[opposite].after).toBeGreaterThan(before[opposite].after);
+    expect(after[opposite].after).toBeLessThan(20);
+    const target = opposite === "toRemote" ? f.farMesh : f.mesh;
+    expect(target.read({ topic: "ops.owner", after: 0 }).some(event => event.verification === "bridge")).toBe(true);
+    expect(f.stallAlarms()).toHaveLength(1);
+    expect(f.stallAlarms()[0]).toMatchObject({ kind: "bridge-stall", data: { direction,
+      reason: expect.stringContaining(`while ${opposite} has pending work`) } });
+    await waitFor(() => f.bridge.exitCode !== null);
+    expect(f.bridge.exitCode).toBe(1);
+    expect(f.diagnostics()).not.toMatch(/EPIPE/);
+  }, 40_000);
+
+  it.each(["toRemote", "toLocal"] as const)("does not restart a behind-but-advancing %s over multiple stall windows", async direction => {
+    const stallAfterMs = 4_000;
+    const f = await fixture(true, { intervalMs: 20, probeTimeoutMs: 1_000, stallAfterMs: 30_000,
+      directionStallAfterMs: stallAfterMs, [`${direction}TailDelayMs`]: 1_000, backlogDirections: [direction] });
+    await changed(f.hubRoot, () => f.sample());
+    await f.bridgeMessages.wait("watchdog");
+    await sleep(stallAfterMs * 3);
+    const cursor = JSON.parse(fs.readFileSync(path.join(f.root, "cursor.json"), "utf8"));
+    expect(cursor[direction].after).toBeGreaterThan(1);
+    expect(cursor[direction].after).toBeLessThan(20);
+    const target = direction === "toRemote" ? f.farMesh : f.mesh;
+    expect(target.read({ topic: "ops.owner", after: 0 }).some(event => event.verification === "bridge")).toBe(true);
+    expect(f.stallAlarms()).toEqual([]);
+    f.healthy();
+  }, 40_000);
+
+  it("does not stall either idle direction over multiple directional stall windows", async () => {
+    const f = await fixture(true, { intervalMs: 20, probeTimeoutMs: 100, stallAfterMs: 5_000, directionStallAfterMs: 100 });
+    await changed(f.hubRoot, () => f.sample());
+    await f.bridgeMessages.wait("watchdog");
+    await sleep(350);
+    expect(f.stallAlarms()).toEqual([]);
+    expect(f.mesh.latestSequence()).toBe(0);
+    expect(f.farMesh.latestSequence()).toBe(0);
+    f.healthy();
+  }, 10_000);
+
+  it("detects a directional stall without reporting callbacks and ignores wall-clock jumps", async () => {
+    const f = await fixture(true, { callbacks: false, intervalMs: 20, probeTimeoutMs: 100,
+      stallAfterMs: 1_500, directionStallAfterMs: 500, inboundTailStall: true });
+    await changed(f.hubRoot, () => f.sample());
+    const publishedAfter = f.agentMessages.receipts.length;
+    f.agent.send({ op: "publish", event: { topic: "ops.owner", kind: "pr.wake",
+      from: { id: remoteId, name: "remote", kind: "main" }, to: owner.id, data: { path: "inbound-no-callbacks" } } });
+    await f.agentMessages.wait("published", publishedAfter);
+    await f.mesh.publish({ topic: "ops.owner", kind: "pr.wake", from: owner, to: remoteId, data: { path: "outbound-no-callbacks" } });
+    await waitFor(() => f.farMesh.read({ topic: "ops.owner", after: 0 }).some(event =>
+      (event.data as { path?: string } | undefined)?.path === "outbound-no-callbacks"));
+
+    // A forward wall-clock jump cannot make the direction appear stalled early.
+    f.bridge.send({ op: "wall-clock-offset", offsetMs: 600_000 });
+    await sleep(120);
+    expect(f.bridge.exitCode).toBeNull();
+    // A backward jump cannot mask the elapsed monotonic stall deadline.
+    f.bridge.send({ op: "wall-clock-offset", offsetMs: -600_000 });
+    await waitFor(() => f.bridge.exitCode !== null, 3_000);
+    expect(f.bridge.exitCode).toBe(1);
+    expect(f.bridge.signalCode).toBeNull();
+    expect(f.bridgeMessages.receipts.filter(item => item.kind === "watchdog" || item.kind === "stall-alarm")).toEqual([]);
+    await waitFor(() => f.agent.exitCode !== null, 3_000);
+    expect(f.agent.exitCode).toBe(0);
+    expect(f.diagnostics()).not.toMatch(/EPIPE/);
+  }, 10_000);
+
+  it("does not treat a quiet but healthy direction as a stall while outbound events are acknowledged", async () => {
+    const f = await fixture(true, { intervalMs: 20, probeTimeoutMs: 60, stallAfterMs: 150, directionStallAfterMs: 150 });
+    await changed(f.hubRoot, () => f.sample());
+    await f.mesh.publish({ topic: "ops.owner", kind: "pr.wake", from: owner, to: remoteId, data: { path: "outbound" } });
+    await waitFor(() => f.farMesh.read({ topic: "ops.owner", after: 0 }).some(event => (event.data as { path?: string } | undefined)?.path === "outbound"));
+    await sleep(250);
+    expect(f.stallAlarms()).toEqual([]);
+    expect(f.bridge.exitCode).toBeNull();
+    expect(f.agent.exitCode).toBeNull();
+    expect(f.bridgeMessages.receipts.filter(item => item.kind === "watchdog").length).toBeGreaterThanOrEqual(3);
+  }, 10_000);
+
+  it("alarms on a 65-second source-cursor backlog without stalling or withholding the watchdog", async () => {
+    vi.stubEnv("PI_FABRIC_MESH_ALARM_TO", owner.id);
+    const f = await fixture(true, { intervalMs: 1_000, probeTimeoutMs: 500, stallAfterMs: 1_500,
+      directionStallAfterMs: 180_000, stopBridgeOnShutdown: true });
+    await changed(f.hubRoot, () => f.sample()); // ready precedes the async cursor initialization in this fixture
+    const now = Date.now(), ownerIncarnation = `fixture:${owner.id}`;
+    const ownerHostKey = `topology/hosts/${createHash("sha256").update(owner.id).digest("hex")}`;
+    const ownerParticipantKey = `topology/participants/${createHash("sha256").update(owner.id).digest("hex")}`;
+    await f.mesh.put({ key: ownerHostKey, identity: owner, value: { format: 1, id: owner.id, rootId: owner.id,
+      identity: owner, startedAt: now, updatedAt: now, expiresAt: now + 600_000, incarnationToken: ownerIncarnation } });
+    writeHostLease(f.hubRoot, { id: owner.id, rootId: owner.id, identityId: owner.id, startedAt: now,
+      updatedAt: now, expiresAt: now + 600_000, incarnationToken: ownerIncarnation });
+    writeParticipantFile(f.hubRoot, { key: ownerParticipantKey, version: 1, updatedAt: now, updatedBy: owner,
+      value: { format: 1, id: owner.id, kind: "root", rootId: owner.id, ownerHostId: owner.id,
+        ownerIdentityId: owner.id, ownerIncarnation, name: "owner", label: "OWNER", status: "idle",
+        runner: "pi", transport: "host", capabilities: ["followUp", "steer"], sessionId: "owner",
+        startedAt: now, updatedAt: now, controlProtocol: "v1" } });
+
+    const blockedAfter = f.bridgeMessages.receipts.length;
+    f.bridge.send({ op: "pause-source-read" });
+    await f.bridgeMessages.wait("source-read-paused", blockedAfter);
+    const beforeWatchdogs = f.bridgeMessages.receipts.filter(item => item.kind === "watchdog").length;
+    const command = (commandId: string) => ({ topic: "fabric.control.command", kind: "followUp", from: owner,
+      to: remoteId, data: { version: 1, commandId, targetId: remoteId, operation: "followUp", replyTo: owner.id,
+        ownerIncarnation: "remote-native-generation", requestedAt: Date.now(), deadlineAt: Date.now() + 120_000,
+        message: commandId } });
+    const old = await f.mesh.publish(command("cursor-backlog-old"));
+    await f.bridgeMessages.wait("source-read-blocked", blockedAfter);
+    expect(f.farMesh.read({ topic: "fabric.control.command", after: 0, limit: 10 })).toEqual([]);
+    const heldAt = Date.now();
+    await sleep(65_000);
+    expect(Date.now() - heldAt).toBeGreaterThanOrEqual(65_000);
+    expect(f.bridgeMessages.receipts.filter(item => item.kind === "watchdog").length).toBeGreaterThan(beforeWatchdogs);
+    expect(f.stallAlarms()).toEqual([]);
+    expect(f.bridge.exitCode).toBeNull(); expect(f.agent.exitCode).toBeNull();
+
+    f.bridge.send({ op: "resume-source-read" });
+    await f.bridgeMessages.wait("source-read-resumed");
+    await waitFor(() => f.farMesh.read({ topic: "fabric.control.command", after: 0, limit: 10 })
+      .some(event => (event.data as { commandId?: string }).commandId === "cursor-backlog-old"));
+    const oldAtDestination = f.farMesh.read({ topic: "fabric.control.command", after: 0, limit: 10 })
+      .find(event => (event.data as { commandId?: string }).commandId === "cursor-backlog-old")!;
+    expect(oldAtDestination.createdAt - old.createdAt).toBeGreaterThanOrEqual(65_000);
+    expect(oldAtDestination.createdAt - old.createdAt).toBeLessThan(120_000);
+    await waitFor(() => f.mesh.read({ topic: "ops.owner", after: 0, limit: 100 })
+      .some(event => event.kind === "bridge.delivery-age.alarm"));
+    const alarm = f.mesh.read({ topic: "ops.owner", after: 0, limit: 100 })
+      .find(event => event.kind === "bridge.delivery-age.alarm")!;
+    expect(alarm).toMatchObject({ to: owner.id, data: { direction: "toRemote", reason: "delivery-age" } });
+
+    await f.mesh.publish(command("cursor-backlog-fresh"));
+    await waitFor(() => f.farMesh.read({ topic: "fabric.control.command", after: 0, limit: 10 })
+      .some(event => (event.data as { commandId?: string }).commandId === "cursor-backlog-fresh"));
+    await waitFor(() => f.mesh.read({ topic: "ops.owner", after: 0, limit: 100 })
+      .some(event => event.kind === "bridge.delivery-age.recovered"));
+    const ageEvents = f.mesh.read({ topic: "ops.owner", after: 0, limit: 100 })
+      .filter(event => event.kind === "bridge.delivery-age.alarm" || event.kind === "bridge.delivery-age.recovered");
+    expect(ageEvents.map(event => event.kind)).toEqual(["bridge.delivery-age.alarm", "bridge.delivery-age.recovered"]);
+    expect(f.stallAlarms()).toEqual([]);
+    expect(f.bridge.exitCode).toBeNull(); expect(f.agent.exitCode).toBeNull();
+    expect(f.bridgeMessages.receipts.filter(item => item.kind === "watchdog").length).toBeGreaterThan(beforeWatchdogs);
+
+    await terminate(f.bridge);
+    const telemetry = f.bridgeMessages.receipts.filter(item => item.kind === "bridge-log").map(item => String(item.line));
+    expect(telemetry.some(line => /^bridge delivery-age v1 peer=far minute=.*toRemote count=.*deliveryMaxMs=\d+.*cursorLagSequences=\d+ cursorLagSeconds=\d+/.test(line))).toBe(true);
+    const staleLine = telemetry.find(line => line.includes("toRemote") && /cursorLagSeconds=(6[0-9]|[7-9][0-9]|1[01][0-9])/.test(line));
+    expect(staleLine).toBeDefined();
+    expect(staleLine).toMatch(/cursorLagSequences=1 cursorLagSeconds=(6[0-9]|[7-9][0-9]|1[01][0-9])/);
+    console.log(`REAL_BRIDGE_TELEMETRY_SAMPLE ${staleLine}`);
+    expect(old.sequence).toBe(1);
+  }, 100_000);
+
+  it("carries bridge alarms only to a canonical session, never a factory/broadcast address", () => {
+    expect(isBridgedTopic({ topic: BRIDGE_STALL_ALARM_TOPIC, kind: "bridge-stall", to: owner.id })).toBe(true);
+    expect(isBridgedTopic({ topic: BRIDGE_STALL_ALARM_TOPIC, kind: "other", to: owner.id })).toBe(false);
+    for (const to of [undefined, "factory", "org", "topic:fabric.alarm.bridge-stall", "session:not-a-uuid"]) {
+      expect(isBridgedTopic({ topic: BRIDGE_STALL_ALARM_TOPIC, kind: "bridge-stall", to })).toBe(false);
+    }
+    for (const kind of ["bridge.lease.alarm", "bridge.lease.recovered", "bridge.delivery-age.alarm", "bridge.delivery-age.recovered"]) {
       expect(isBridgedTopic({ topic: "ops.owner", kind, to: owner.id })).toBe(true);
       for (const to of [undefined, "factory", "org", "topic:ops.owner", "session:not-a-uuid"]) {
         expect(isBridgedTopic({ topic: "ops.owner", kind, to })).toBe(false);

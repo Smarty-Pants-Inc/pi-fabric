@@ -15,9 +15,21 @@ import type { AgentWriteReceipt } from "./write-receipt.js";
 import type { InheritedSessionPin } from "./session-pins.js";
 import type { AgentWorktreeResult } from "./worktree-manager.js";
 import type { AgentUndeliveredMessage } from "./terminal-target.js";
+import type { FabricActorActivationIdentity } from "../actors/activation-identity.js";
 
 /** Fabric run transports plus adapter-owned ("hosted") runs. */
 export type AgentRunTransport = FabricAgentTransport | "hosted";
+
+export type AgentPlacementKind = "process" | "remote";
+
+/** Trusted admission snapshot shared with transport and task-presence publication. */
+export interface AgentPlacementAdmission {
+  placementRunId: string;
+  placementKind: AgentPlacementKind;
+  placementHost: string;
+  expectedSeconds: number;
+  executionDeadline: string;
+}
 
 /**
  * A terminal outcome Fabric cannot vouch for: the run may or may not have done
@@ -55,6 +67,18 @@ export interface AgentSessionSeed {
   sourceModel?: { provider: string; modelId: string };
   sourceThinkingLevel?: string;
   outerToolResult: AgentToolResultMessage;
+}
+
+export type AgentRunStopPath = "agents.stop" | "actors.stop" | "actors.remove" | "session-reset" | "residency-teardown" | "deadline";
+export type AgentRunStopCaller = { by: Pick<AgentSpawner, "kind" | "id">; path: AgentRunStopPath };
+export interface AgentRunStopIntent {
+  reason: "explicit" | "deadline";
+  requestedAt: number;
+  /** Optional only for legacy records written before stop-caller provenance was added. */
+  by?: Pick<AgentSpawner, "kind" | "id">;
+  /** Optional only for legacy records written before stop-caller provenance was added. */
+  path?: AgentRunStopPath;
+  recoveryRecord?: Record<string, unknown>;
 }
 
 /** Record-only host classification; it never grants permission to route. */
@@ -104,8 +128,14 @@ export interface AgentRunRequest {
   pythonRuntime?: FabricPythonRuntime;
   transport?: FabricAgentTransport;
   model?: string;
-  /** Caller-supplied justification for an explicit model selection. */
+  /** Host-only selection provenance; never normalized from public arguments. */
+  modelSource?: "explicit" | "default" | "inherited" | "route";
+  /** Host-only original target retained across pre-admission fallback/forwarding. */
+  modelPolicyOriginalModel?: string;
+  /** Caller-supplied justification for a protected model selection. */
   modelReason?: string;
+  /** Compatibility alias; modelReason wins when both are supplied. */
+  opusReason?: string;
   /** Veda persona name; only used when runner is "veda". */
   persona?: string;
   thinking?: FabricThinking;
@@ -145,6 +175,8 @@ export interface AgentRunRequest {
   inferenceContext?: "full-history" | "activation";
   actorId?: string;
   actorName?: string;
+  /** Host-only immutable identity for this actor activation; never a provider argument. */
+  actorSelf?: FabricActorActivationIdentity;
   capabilityRequirements?: string[];
   capabilityDigest?: string;
   meshRoot?: string;
@@ -200,9 +232,19 @@ export interface AgentCompactionStatus {
   error?: string;
 }
 
+export interface AgentTimeoutIgnoredNote {
+  code: "AGENT_TIMEOUT_BELOW_SHORTENING_FLOOR";
+  requestedTimeoutMs: number;
+  effectiveTimeoutMs: number;
+  minimumTimeoutMs: number;
+}
+
 export interface AgentRunRecord {
-  /** Manager-owned durable intent distinguishing operator/deadline stops from worker checkpoints. */
-  stopIntent?: { reason: "explicit" | "deadline"; requestedAt: number };
+  /** A tiny explicit shortening was ignored to protect real work. */
+  timeoutNote?: AgentTimeoutIgnoredNote;
+  /** Manager-owned durable intent distinguishing operator/deadline stops from worker checkpoints.
+   * by/path are absent only on legacy records written before stop-caller provenance was added. */
+  stopIntent?: AgentRunStopIntent;
   /** Canonical Fabric package root selected for the process worker at spawn time. */
   fabricRelease?: string;
   /** Admitted memory-capped task cgroup (smarty-dev#8257); absent when uncapped. */
@@ -253,6 +295,8 @@ export interface AgentRunRecord {
   capabilityDigest?: string;
   recursive?: boolean;
   residency?: FabricParticipantResidency;
+  /** smarty-dev#15878: the run's short private TMPDIR outside its run directory; cleanup follows the run. */
+  temporaryDirectory?: string;
   startedAt: number;
   updatedAt: number;
   finishedAt?: number;
@@ -297,6 +341,11 @@ export interface AgentRunRecord {
   processStartTime?: string;
   /** Latest native runner session; joins Pi gateway session_id to this run. */
   runnerSessionId?: string;
+  /** Placement-only presence metadata; absent when Placement API is disabled. */
+  placementRunId?: string;
+  placementKind?: AgentPlacementKind;
+  placementHost?: string;
+  expectedSeconds?: number;
   /** Distinct native Pi sessions observed during this run, in first-seen order. */
   runnerSessionIds?: string[];
   /** Parent Main participant and its Pi/Fabric session, not the child session. */
@@ -339,10 +388,17 @@ export interface AgentRunResult extends AgentRunRecord {
   /** Failed admission only: model/auth timed out before any transport launch was attempted.
    * The receipt remains terminal; an actor may separately retry its unlaunched activation. */
   launchPreparationTimeoutMs?: number;
+  /** Failed admission only (smarty-dev#16357): the bound root lane was unresolved, so no worker started.
+   * The receipt remains terminal; an actor may separately retry its unlaunched activation. */
+  launchDenial?: "lane-unresolved";
   status: "completed" | "failed" | "stopped" | "timed_out";
 }
 
 export interface AgentHandleInfo {
+  /** A tiny explicit shortening was ignored to protect real work. */
+  timeoutNote?: AgentTimeoutIgnoredNote;
+  /** Policy switch/audit diagnostics are present on receipts and final results. */
+  warnings?: string[];
   /** Spawn admission: unavailable discovery never blocks launch, but is explicit in the receipt. */
   modelVerification?: "verified" | "unverified";
   finalAnswerReceipt?: { id: string; recordedAt: number };
@@ -397,6 +453,8 @@ export interface AgentHandleInfo {
 }
 
 export interface AgentWorkerOptions {
+  /** Host-issued policy notices retained in every worker status record. */
+  modelPolicyWarnings?: string[];
   /** Spawn-selected Fabric package root, retained in the durable run record. */
   fabricRelease?: string;
   /** Host-created record metadata, independent of the route header/decision. */
@@ -514,8 +572,13 @@ export interface AgentTransportLaunch {
   requires?: string[];
   /** Host-derived incompatibility, never accepted from guest arguments. */
   placementLocalReason?: string | undefined;
+  /** Placement API admission; absent means the exact legacy transport path. */
+  placementAdmission?: AgentPlacementAdmission;
   /** Report the default policy's actual local/remote launch boundary once; host-owned audit only. */
   onWritePolicyDisposition?: (disposition: "local" | "remote") => void;
+  /** Trusted spawn facts needed by the island broker intent. */
+  parentSession?: string;
+  complexity?: AgentRunRequest["complexity"];
   /** Host-only carrier inheritance, after the worker environment is assembled. */
   childEnvironment?: (environment: NodeJS.ProcessEnv) => NodeJS.ProcessEnv;
   /** Manager close or explicit run/actor revocation, never a returned queued receipt's guest deadline. */
@@ -629,8 +692,10 @@ export interface AgentAdmissionAlarm {
   maxConcurrent: number;
   at: number;
   message: string;
-  /** pi-fabric#939 round 4: one owner alarm when a held run's recovered answer cannot be saved (names the run). */
-  kind?: "recovered-answer-save-failed";
+  /** pi-fabric#939 round 4: one owner alarm when a held run's recovered answer cannot be saved (names the run).
+   * pi-fabric#1554 P2-4: one alarm when a child launches without a short TMPDIR that fits the fleet bash guard
+   * (names the first such run; at most once per caller TMPDIR per 6 h). */
+  kind?: "recovered-answer-save-failed" | "short-tmpdir-unavailable";
   runId?: string;
 }
 

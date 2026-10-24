@@ -2,7 +2,7 @@ import { spawnSync } from "node:child_process";
 import fs, { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import { sweepStaleTestTemp, testTempOwnerMarker, testTempProcessIdentity } from "../scripts/test-temp.js";
 
@@ -22,10 +22,34 @@ registerHooks({ resolve(specifier, context, nextResolve) {
   }
   return nextResolve(specifier, context);
 }});
+const simulatedWindows = process.platform !== "win32";
 Object.defineProperty(process, "platform", { value: "win32" });
+process.env.SystemRoot ??= "C:\\Windows";
+const childProcess = await import("node:child_process");
+const realExecFileSync = childProcess.default.execFileSync.bind(childProcess.default);
+const aclCalls = [];
+if (simulatedWindows) childProcess.default.execFileSync = (file, args, options) => {
+  if (String(file).toLowerCase().endsWith("powershell.exe") && options?.env?.PI_FABRIC_TEST_TEMP_DIRECTORY) {
+    aclCalls.push({
+      marker: process.env.PI_TEST_TEMP_JOB_DIR ?? null,
+      target: options?.env?.PI_FABRIC_TEST_TEMP_DIRECTORY ?? null,
+      modulePath: Object.entries(options?.env ?? {}).find(([key]) => key.toLowerCase() === "psmodulepath")?.[1] ?? null,
+    });
+    return Buffer.alloc(0);
+  }
+  return realExecFileSync(file, args, options);
+};
 const { default: config } = await import(pathToFileURL(path.resolve("vitest.config.cts")).href);
 const { isolatedTestTemp, isolateTestFleetEnvironment } = await import(pathToFileURL(path.resolve("scripts/test-temp.ts")).href);
 const root = config.test.env.TMPDIR;
+if (simulatedWindows) {
+  assert.equal(aclCalls.length, process.env.WINDOWS_TEMP_PROBE_CHILD === "1" ? 0 : 1);
+  if (aclCalls.length) assert.deepEqual(aclCalls[0], {
+    marker: null,
+    target: root,
+    modulePath: "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\Modules",
+  });
+}
 // smarty-dev#11145 r5: a private run child of the job root, never the shared job root itself.
 assert.equal(path.dirname(root), path.join(process.env.RUNNER_TEMP, "pi-fabric-vitest-job"));
 assert.match(path.basename(root), /^pi-fabric-vitest-run-[A-Za-z0-9]{6}$/);
@@ -231,11 +255,77 @@ describe("test temporary-storage isolation", () => {
       rmSync(runnerTemp, { recursive: true, force: true });
     }
   });
+  it("isolates os.homedir and model-policy audit logs from the original home", () => {
+    const helper = new URL("../scripts/test-temp.ts", import.meta.url).href;
+    const result = spawnSync(process.execPath, ["--experimental-transform-types", "--input-type=module", "-e", `
+      import { homedir } from "node:os";
+      import { dirname, join, sep } from "node:path";
+      import { isolateTestFleetEnvironment } from ${JSON.stringify(helper)};
+      const originalHome = homedir();
+      const env = isolateTestFleetEnvironment();
+      const home = homedir();
+      const fleetRoot = dirname(env.PI_CODING_AGENT_DIR);
+      const auditLog = join(home, ".local/state/smarty/route/opus-exceptions.jsonl");
+      process.stdout.write(JSON.stringify({ originalHome, home, fleetRoot, auditLog, sep, env }));
+    `], { env: { ...process.env, RUNNER_TEMP: "" }, encoding: "utf8", timeout: 10_000 });
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stderr).toBe(0);
+    const probe = JSON.parse(result.stdout) as { originalHome: string; home: string; fleetRoot: string; auditLog: string; sep: string; env: Record<string, string> };
+    expect(probe.home).toBe(join(probe.fleetRoot, "home"));
+    expect(probe.home).not.toBe(probe.originalHome);
+    expect(probe.auditLog.startsWith(probe.fleetRoot + probe.sep)).toBe(true);
+    if (process.platform === "win32") expect(probe.env.USERPROFILE).toBe(probe.home);
+    else expect(probe.env.HOME).toBe(probe.home);
+  });
+
+  // `bun run test` is `node scripts/run-tests.mjs`, which imports ./test-temp.ts through Node's own type
+  // stripping: no Vitest or .js->.ts test resolver. Its source edges must resolve there, on every OS.
+  it("imports the launcher's helper natively, while its former .js wrapper edge fails there", () => {
+    const scripts = new URL("../scripts/", import.meta.url);
+    expect(readFileSync(new URL("run-tests.mjs", scripts), "utf8")).toContain('from "./test-temp.ts";');
+    const source = readFileSync(new URL("test-temp.ts", scripts), "utf8");
+    const leaf = 'from "../src/storage/windows-powershell-command.ts";';
+    expect(source).toContain(leaf);
+    const fixture = mkdtempSync(join(tmpdir(), "native-launcher-import-"));
+    try {
+      // Failing counterexample: the actual helper with only the former wrapper specifier restored.
+      // Every relative edge stays anchored in scripts/ so nothing else differs from the real file.
+      const reverted = source.replace(leaf, 'from "../src/storage/windows-powershell.js";')
+        .replace(/from "(\.\.?\/[^"]+)";/g, (_, specifier: string) => `from ${JSON.stringify(new URL(specifier, scripts).href)};`);
+      writeFileSync(join(fixture, "package.json"), '{"type":"module"}\n');
+      writeFileSync(join(fixture, "test-temp.ts"), reverted);
+      const result = spawnSync(process.execPath, ["--input-type=module", "-e", `
+        const helper = await import(${JSON.stringify(new URL("test-temp.ts", scripts).href)});
+        let refused = null;
+        try { await import(${JSON.stringify(pathToFileURL(join(fixture, "test-temp.ts")).href)}); }
+        catch (error) { refused = { code: error.code, url: error.url }; }
+        process.stdout.write(JSON.stringify({ refused, exports: [helper.launcherTestTemp, helper.cleanupIsolatedTestTemp,
+          helper.isolatedTestTemp, helper.isolateTestFleetEnvironment].map(value => typeof value) }));
+      `], { cwd: repo, env: process.env, encoding: "utf8", timeout: 10_000 });
+      expect(result.error).toBeUndefined();
+      expect(result.status, result.stderr).toBe(0);
+      const probe = JSON.parse(result.stdout) as { refused: { code: string; url: string } | null; exports: string[] };
+      expect(probe.exports).toEqual(["function", "function", "function", "function"]);
+      expect(probe.refused).toEqual({ code: "ERR_MODULE_NOT_FOUND",
+        url: new URL("../src/storage/windows-powershell.js", scripts).href });
+    } finally {
+      rmSync(fixture, { recursive: true, force: true });
+    }
+  });
+
   // smarty-dev#11145 r5: the Windows job temp adopts only a run directory this helper created.
   const helper = new URL("../scripts/test-temp.ts", import.meta.url).href;
   const windowsTemp = (env: Record<string, string>) => {
     const result = spawnSync("bun", ["-e", `
+      const simulatedWindows = process.platform !== "win32";
       Object.defineProperty(process, "platform", { value: "win32" });
+      process.env.SystemRoot ??= "C:\\\\Windows";
+      const childProcess = await import("node:child_process");
+      const realExecFileSync = childProcess.default.execFileSync.bind(childProcess.default);
+      if (simulatedWindows) childProcess.default.execFileSync = (file, args, options) => {
+        if (String(file).toLowerCase().endsWith("powershell.exe") && options?.env?.PI_FABRIC_TEST_TEMP_DIRECTORY) return Buffer.alloc(0);
+        return realExecFileSync(file, args, options);
+      };
       const { isolatedTestTemp } = await import(${JSON.stringify(helper)});
       const first = isolatedTestTemp("pi-fabric-vitest-");
       Object.assign(process.env, first); // as vitest.config does
@@ -246,6 +336,44 @@ describe("test temporary-storage isolation", () => {
     expect(result.status, result.stderr).toBe(0);
     return JSON.parse(result.stdout) as { first: string; again: string; marker: string };
   };
+
+  it("fails closed before exporting the Windows run marker when ACL protection fails", () => {
+    const fixture = mkdtempSync(join(tmpdir(), "windows-acl-failure-"));
+    try {
+      const result = spawnSync("bun", ["-e", `
+        Object.defineProperty(process, "platform", { value: "win32" });
+        process.env.SystemRoot ??= "C:\\\\Windows";
+        delete process.env.PI_TEST_TEMP_JOB_DIR;
+        const childProcess = await import("node:child_process");
+        const realExecFileSync = childProcess.default.execFileSync.bind(childProcess.default);
+        let setterCalls = 0;
+        childProcess.default.execFileSync = (file, args, options) => {
+          if (String(file).toLowerCase().endsWith("powershell.exe") && options?.env?.PI_FABRIC_TEST_TEMP_DIRECTORY) {
+            setterCalls += 1;
+            throw new Error("simulated ACL setter failure");
+          }
+          return realExecFileSync(file, args, options);
+        };
+        const { isolatedTestTemp } = await import(${JSON.stringify(helper)});
+        try {
+          isolatedTestTemp("pi-fabric-vitest-");
+          process.stdout.write(JSON.stringify({ unexpectedSuccess: true, setterCalls, marker: process.env.PI_TEST_TEMP_JOB_DIR ?? null }));
+          process.exitCode = 1;
+        } catch (error) {
+          process.stdout.write(JSON.stringify({ unexpectedSuccess: false, setterCalls, marker: process.env.PI_TEST_TEMP_JOB_DIR ?? null, message: String(error) }));
+        }
+      `], { env: { ...process.env, RUNNER_TEMP: fixture, TMPDIR: fixture, TMP: fixture, TEMP: fixture }, encoding: "utf8", timeout: 10_000 });
+      expect(result.error).toBeUndefined();
+      expect(result.status, result.stderr).toBe(0);
+      const outcome = JSON.parse(result.stdout) as { unexpectedSuccess: boolean; setterCalls: number; marker: string | null; message: string };
+      expect(outcome.unexpectedSuccess).toBe(false);
+      expect(outcome.setterCalls).toBe(1);
+      expect(outcome.marker).toBeNull();
+      expect(outcome.message).toMatch(/Windows test temp directory ACL protection failed before marker export/);
+    } finally {
+      rmSync(fixture, { recursive: true, force: true });
+    }
+  });
 
   it("never adopts a pre-existing job-named directory named by a forged marker", () => {
     const fixture = mkdtempSync(join(tmpdir(), "forged-job-"));

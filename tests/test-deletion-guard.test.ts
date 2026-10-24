@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import { isHostedOnlyAllowed } from "../scripts/hosted-only.mjs";
 import fs, {
   chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, realpathSync, rmSync as namedRmSync, symlinkSync, writeFileSync,
 } from "node:fs";
@@ -12,7 +13,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 // smarty-dev#11145: tests/test-deletion-guard.mjs (imported by tests/fleet-isolation-setup.ts, inherited by
 // children through NODE_OPTIONS --import) refuses deletes outside the run's private TMPDIR locally and only
-// reports them under GITHUB_ACTIONS=true. External fixtures here are NEVER deleted by this file: a sibling
+// reports them only on a verified GitHub-hosted runner. External fixtures here are NEVER deleted by this file: a sibling
 // mkdtemp under dirname(TMPDIR), inside test-env's private parent but outside Vitest's guard root,
 // left for the owner to clean.
 
@@ -21,7 +22,7 @@ const guardUrl = new URL(`./${guardFile}`, import.meta.url).href;
 const refusal = /test deletion outside private temp \(smarty-dev#11145\)/;
 const privateTemp = tmpdir();
 const posix = process.platform !== "win32";
-const hosted = process.env.GITHUB_ACTIONS === "true";
+const hosted = isHostedOnlyAllowed(process.env);
 
 // RED first: every outside attempt is gated on the installed guard, so a missing guard fails without deleting.
 const requireGuard = () =>
@@ -224,6 +225,21 @@ console.log(JSON.stringify({ siblingError, outsideError, status: fs.existsSync(s
   rootExists: fs.existsSync(root) }));
 `;
 
+// Synthetic runner evidence is confined to config-only and recorded-delegate probes below.
+// It never admits/imports a hosted test module or performs a native deletion.
+const hostedRunnerProbe = `
+if (process.env.GITHUB_ACTIONS === "true") {
+  delete process.env.SMARTY_ROLE;
+  delete process.env.PI_TEST_FLEET_HOST;
+  process.env.RUNNER_ENVIRONMENT = "github-hosted";
+  const runner = process.platform === "win32" ? process.env.TMPDIR : "/home/runner/work/_temp";
+  process.env.RUNNER_TEMP = runner;
+  const stat = fs.statSync, realpath = fs.realpathSync;
+  fs.statSync = (p, ...args) => String(p) === runner ? { isDirectory: () => true } : stat(p, ...args);
+  fs.realpathSync = Object.assign((p, ...args) => String(p) === runner ? runner : realpath(p, ...args), realpath);
+}
+`;
+
 // The recorder replaces every deleter BEFORE the explicit guard import, so report mode wraps the
 // recorder: even a report-mode guard that forwards the call cannot delete the external target.
 const reportChild = `
@@ -238,6 +254,7 @@ for (const name of ["rm", "rmdir", "unlink"]) {
 }
 syncBuiltinESMExports();
 const [guard, target] = process.argv.slice(2);
+${hostedRunnerProbe}
 await import(guard);
 function reportCallerMarker() { fs.rmSync(target); }
 reportCallerMarker();
@@ -277,6 +294,73 @@ const withoutGuard = (options = "") => {
   }
   return kept.join(" ");
 };
+
+// No inherited preload: install record-only deleters before explicitly importing the guard.
+// The native account home is only resolved/read, never populated or passed to a native deleter.
+const homeRootChild = `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+import { homedir, userInfo } from "node:os";
+const [guard, privateRoot, fleetHome, mode] = process.argv.slice(2);
+const initialNodeOptions = process.env.NODE_OPTIONS ?? "";
+if (initialNodeOptions !== "") throw new Error("unexpected inherited preload");
+const accountHome = fs.realpathSync.native(userInfo().homedir);
+const root = mode === "private-fleet" ? privateRoot : accountHome;
+Object.assign(process.env, { HOME: fleetHome, USERPROFILE: fleetHome, TMPDIR: root, TMP: root, TEMP: root });
+const calls = [], invoke = [];
+for (const name of ["rm", "rmdir", "unlink"]) {
+  fs[name + "Sync"] = (path) => { calls.push({ name: name + "Sync", path: String(path) }); };
+  fs[name] = (path, done) => { calls.push({ name, path: String(path) }); done(null); };
+  fs.promises[name] = async (path) => { calls.push({ name: "promises." + name, path: String(path) }); };
+  invoke.push([name + "Sync", path => fs[name + "Sync"](path)],
+    [name, path => new Promise((ok, no) => fs[name](path, error => error ? no(error) : ok()))],
+    ["promises." + name, path => fs.promises[name](path)]);
+}
+syncBuiltinESMExports();
+await import(guard);
+const target = mode === "private-fleet" ? fleetHome : accountHome;
+const results = [];
+for (const [name, call] of invoke) {
+  const before = calls.length;
+  let code = null, message = null;
+  try { await call(target); } catch (error) { code = error.code; message = error.message; }
+  results.push({ name, code, message, calls: calls.slice(before) });
+}
+console.log("HOME_ROOT:" + JSON.stringify({ initialNodeOptions, accountHome, root, target,
+  redirectedHome: homedir(), nodeOptions: process.env.NODE_OPTIONS, results }));
+`;
+
+it.each(["private-fleet", "native-home"] as const)(
+  "uses native account home rather than redirected fleet HOME: %s", (mode) => {
+    const root = mkdtempSync(join(fixtures, "home-root-"));
+    const fleetHome = join(root, "home");
+    mkdirSync(fleetHome);
+    const result = runChild(`home-root-${mode}.mjs`, homeRootChild,
+      [guardUrl, root, fleetHome, mode],
+      { ...process.env, NODE_OPTIONS: "", GITHUB_ACTIONS: "false", HOME: fleetHome, USERPROFILE: fleetHome });
+    const line = result.stdout.split(/\r?\n/).find(entry => entry.startsWith("HOME_ROOT:"));
+    expect(line, result.stdout + result.stderr).toBeDefined();
+    const output = JSON.parse(line!.slice("HOME_ROOT:".length)) as { initialNodeOptions: string;
+      accountHome: string; root: string; target: string; redirectedHome: string; nodeOptions: string;
+      results: Array<{ name: string; code: string | null; message: string | null;
+        calls: Array<{ name: string; path: string }> }> };
+    expect(inside(privateTemp, root)).toBe(true);
+    expect(output.initialNodeOptions).toBe("");
+    expect(output.redirectedHome).toBe(fleetHome);
+    const preload = output.nodeOptions.match(/--import=(\S+)/)?.[1];
+    expect(preload).toBeDefined();
+    expect(new URL(preload!).searchParams.get("root")).toBe(mode === "private-fleet" ? realpathSync(root) : sep);
+    expect(output.root).toBe(mode === "private-fleet" ? root : output.accountHome);
+    expect(output.target).toBe(mode === "private-fleet" ? fleetHome : output.accountHome);
+    expect(output.results.map(entry => entry.name)).toEqual(["rm", "rmdir", "unlink"]
+      .flatMap(name => [name + "Sync", name, "promises." + name]));
+    for (const entry of output.results) {
+      expect(entry.code).toBe(mode === "private-fleet" ? null : "ERR_TEST_DELETION_GUARD");
+      if (mode === "native-home") expect(entry.message).toMatch(refusal);
+      else expect(entry.message).toBeNull();
+      expect(entry.calls).toEqual(mode === "private-fleet" ? [{ name: entry.name, path: fleetHome }] : []);
+    }
+  });
 
 // Every mutating delegate is a recorder installed before the guard. Only the explicitly known
 // inside -> NEW destination rename may reach native fs; even RED cannot overwrite an outside victim.
@@ -375,6 +459,7 @@ for (const name of ["rename", "copyFile", "cp", "link", "symlink"]) {
   };
 }
 syncBuiltinESMExports();
+${hostedRunnerProbe}
 await import(guard);
 // Read the static named bindings after synchronization, alongside the live module namespaces.
 const namedSync = { rename: renameSync, copyFile: copyFileSync, cp: cpSync, link: linkSync, symlink: symlinkSync };
@@ -501,7 +586,9 @@ it("keeps native Windows deletion hosted-only without invoking its test callback
     let enabled: unknown;
     const describe = { runIf: (value: unknown) => (_name: string, _callback: unknown) => { enabled = value; } };
     vm.runInNewContext(`describe.runIf(${condition})("Windows verified removal", () => {})`,
-      { describe, process: { platform, env: { GITHUB_ACTIONS: hosted } } });
+      { describe, process: { platform, env: { GITHUB_ACTIONS: hosted } },
+        hostedOnly: () => isHostedOnlyAllowed({ GITHUB_ACTIONS: hosted, RUNNER_ENVIRONMENT: "github-hosted",
+          RUNNER_TEMP: "/home/runner/work/_temp" }, () => "/home/runner/work/_temp") });
     expect(enabled).toBe(expected);
   }
 });
@@ -513,7 +600,12 @@ const hostedOnlySuites = ["tests/actor-child-completion-idle-preflight.test.ts",
   "tests/actor-remove-dead-root.test.ts", "tests/agent-manager.test.ts", "tests/agent-release-observation.test.ts",
   "tests/agents-provider.test.ts", "tests/residency-commit-fence.test.ts", "tests/residency-stopped-writer-retention.test.ts",
   "tests/residency.test.ts", "tests/routed-session-boundaries.test.ts", "tests/stall-alarms.test.ts",
-  "tests/task-write-policy.test.ts", "tests/temp-run-sweep.test.ts", "tests/verified-remove-windows.test.ts", "tests/windows-temp-root-native.test.ts"];
+  "tests/task-write-policy.test.ts", "tests/temp-run-sweep.test.ts", "tests/mesh-state-windows-acl.test.ts",
+  "tests/verified-remove-windows.test.ts", "tests/windows-temp-root-native.test.ts"];
+const natsBrokerSuites = ["tests/mesh-state-backend.test.ts", "tests/mesh-state-backend-multiprocess.test.ts",
+  "tests/mesh-backend-migration-nats.test.ts", "tests/state-backend-nats-election.test.ts",
+  "tests/state-backend-nats-publish-dedupe.test.ts", "tests/state-backend-nats-pull-recovery.test.ts",
+  "tests/nats-auth-server.test.ts"];
 const guardableSuites = ["tests/actor-directory.test.ts",
   "tests/mesh-backend-migration-nats.test.ts",
   "tests/state-backend-nats.test.ts", "tests/residency-operator-actors.test.ts", "tests/mesh-publish-batch-hold.test.ts",
@@ -530,6 +622,7 @@ registerHooks({ resolve(specifier, context, nextResolve) {
   return nextResolve(specifier, context);
 }});
 const [configUrl] = process.argv.slice(2);
+${hostedRunnerProbe}
 const mod = await import(configUrl);
 const config = mod.default;
 const project = config.test.projects.find((entry) => entry.test.name === "default");
@@ -539,9 +632,12 @@ const out = { include: project.test.include, exclude: project.test.exclude ?? []
 console.log("CONFIG:" + JSON.stringify(out));
 `;
 
-it.each([[undefined, false], ["false", false], ["true", true]] as const)(
-  "vitest.config.cts keeps native/tool, Bun and reverted deletion hosted-only (GITHUB_ACTIONS=%s)", (value, hosted) => {
-    const env: NodeJS.ProcessEnv = { ...process.env, GITHUB_ACTIONS: value,
+it.each([[undefined, false, "0"], ["false", false, "0"], ["true", true, "0"],
+  [undefined, false, "1"], ["false", false, "1"], ["true", true, "1"]] as const)(
+  "vitest.config.cts keeps native/tool, Bun and reverted deletion hosted-only (GITHUB_ACTIONS=%s, hosted=%s, FABRIC_TEST_SKIP_NATS=%s)", (value, hosted, skipNats) => {
+    // The broker capability gate is independent of deletion safety. Pin both
+    // branches instead of inheriting the outer generic-CI job's NATS skip flag.
+    const env: NodeJS.ProcessEnv = { ...process.env, GITHUB_ACTIONS: value, FABRIC_TEST_SKIP_NATS: skipNats,
       NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --experimental-transform-types` };
     if (value === undefined) delete env.GITHUB_ACTIONS;
     const result = runChild(`config-child-${value}.mjs`, configChild,
@@ -552,16 +648,22 @@ it.each([[undefined, false], ["false", false], ["true", true]] as const)(
       rootExclude: string[]; suites: string[]; projects: Array<{ name: string; exclude: string[] }> };
     expect(output.include).toEqual(["tests/**/*.test.ts"]);
     const required = hosted ? [] : hostedOnlySuites;
+    const brokerExcluded = skipNats === "1" ? natsBrokerSuites : [];
     expect(output.suites).toEqual(required);
-    expect(output.rootExclude).toEqual(required);
+    expect(output.rootExclude).toEqual([...required, ...brokerExcluded]);
     for (const project of output.projects) {
       for (const suite of hostedOnlySuites) expect(project.exclude.includes(suite), `${project.name}: ${suite}`).toBe(!hosted);
-      for (const suite of guardableSuites) expect(project.exclude, `${project.name}: guarded Node fs stays local`).not.toContain(suite);
+      for (const suite of natsBrokerSuites) expect(project.exclude.includes(suite), `${project.name}: broker capability`).toBe(skipNats === "1");
+      for (const suite of guardableSuites.filter(suite => !brokerExcluded.includes(suite))) {
+        expect(project.exclude, `${project.name}: guarded Node fs stays local`).not.toContain(suite);
+      }
     }
     // Native/tool and Bun counterexamples stay excluded; a guarded actor suite and the migration suites
     // no longer disappear just because they import deleting product code (pi-fabric#1151).
     expect(output.exclude.includes("tests/verified-remove-windows.test.ts")).toBe(!hosted);
     expect(output.exclude.includes("tests/temp-run-sweep.test.ts")).toBe(!hosted);
+    // Native Windows ACL fixtures live below USERPROFILE, outside TMPDIR: never collected locally.
+    expect(output.exclude.includes("tests/mesh-state-windows-acl.test.ts")).toBe(!hosted);
     expect(output.exclude).not.toContain("tests/actor-directory.test.ts");
   });
 
@@ -622,7 +724,7 @@ describe("deletion guard in child processes", () => {
     expectExternalIntact();
   });
 
-  it("reports once without throwing under GITHUB_ACTIONS=true and never reaches the real deleter", () => {
+  it("reports once on a simulated GitHub-hosted runner and never reaches the real deleter", () => {
     requireGuard();
     const nodeOptions = withoutGuard(process.env.NODE_OPTIONS);
     expect(nodeOptions).not.toContain(guardFile);

@@ -16,6 +16,7 @@ import { connect, credsAuthenticator, nkeys, type NatsConnection } from "@nats-i
 import { encodeAccountJwt, encodeOperatorJwt, encodeUserJwt, formatUserCreds, type ScopedSigningKey } from "../../src/mesh/nats-auth/jwt.js";
 import { PATH_B_OPERATOR_MACHINE, roleTemplateWithPathB, type RoleTemplate } from "../../src/mesh/nats-auth/permissions.js";
 import { renderNatsServerConfig } from "../../src/mesh/nats-auth/server-config.js";
+import { startTime } from "./owned-processes.js";
 
 export const PATH_B_MACHINES = ["machine-a", "machine-b"] as const;
 export type PathBMachine = (typeof PATH_B_MACHINES)[number];
@@ -64,16 +65,24 @@ export interface PathBIdentity {
 
 export interface PathBHarnessOptions {
   readonly binary?: string;
+  /** Opt into the shared runtime user's org-scoped session-channel grants. */
+  readonly org?: string;
+  /** Mint the runtime agent with the opt-in shared-org event grants. Requires org. */
+  readonly events?: boolean;
   /** Issue real CLI artifacts without changing the default hand-built fault-injection fixture. */
   readonly identityFactory?: (root: string) => PathBIdentity | Promise<PathBIdentity>;
-  /** Deliberately misissued grants for fail-closed identity-check tests. */
+  /** Additional publish allows for agent superset-verification tests. */
   readonly additionalAgentPublish?: readonly string[];
+  /** Remove expected publish allows for fail-closed identity-check tests. */
+  readonly removeAgentPublish?: readonly string[];
   /** Additional signed mesh bindings for multi-tag template expansion tests. */
   readonly additionalAgentMeshes?: readonly string[];
-  /** Deliberately misissued extra subscribe allows for fail-closed identity-check tests. */
+  /** Additional subscribe allows for agent superset-verification tests. */
   readonly additionalAgentSubscribe?: readonly string[];
   /** Deliberately widened operator subscriptions; production operator remains metadata-only. */
   readonly additionalOperatorSubscribe?: readonly string[];
+  /** Deliberately add response permission; production operator has no response grant. */
+  readonly additionalOperatorResponses?: { readonly max: number };
   /** Deliberately removed agent publish denies for fail-closed identity-check tests. */
   readonly removeAgentDeny?: readonly string[];
   /** Serve client TLS from an owned ephemeral test CA (openssl subprocess). Server cert SANs default to localhost/127.0.0.1. */
@@ -113,11 +122,19 @@ function createTestTls(root: string, dnsNames: readonly string[], ipAddresses: r
 }
 
 function faultedAgentTemplate(options: PathBHarnessOptions): RoleTemplate {
-  const base = roleTemplateWithPathB("agent", { custodyStream: PATH_B_PERMISSION_POLICY.custodyStream, livenessStream: PATH_B_PERMISSION_POLICY.livenessStream }, PATH_B_MACHINES);
-  const removed = new Set(options.removeAgentDeny ?? []);
+  const policy = options.events === true
+    ? { events: true, ...(options.org === undefined ? {} : { org: options.org }) }
+    : options.org;
+  const base = roleTemplateWithPathB("agent", { custodyStream: PATH_B_PERMISSION_POLICY.custodyStream, livenessStream: PATH_B_PERMISSION_POLICY.livenessStream }, PATH_B_MACHINES, policy);
+  const removedPublish = new Set(options.removeAgentPublish ?? []);
+  const removedDeny = new Set(options.removeAgentDeny ?? []);
   return {
-    pub: { allow: [...base.pub.allow, ...(options.additionalAgentPublish ?? [])], deny: base.pub.deny.filter((subject) => !removed.has(subject)) },
+    pub: {
+      allow: [...base.pub.allow.filter((subject) => !removedPublish.has(subject)), ...(options.additionalAgentPublish ?? [])],
+      deny: base.pub.deny.filter((subject) => !removedDeny.has(subject)),
+    },
     sub: { allow: [...base.sub.allow, ...(options.additionalAgentSubscribe ?? [])] },
+    ...(base.allow_responses ? { allow_responses: base.allow_responses } : {}),
   };
 }
 
@@ -220,19 +237,42 @@ function httpJson(url: string): Promise<{ status: number; value?: Record<string,
   });
 }
 
-async function childExited(child: ChildProcess, timeoutMs: number): Promise<boolean> {
-  if (child.exitCode !== null || child.signalCode !== null) return true;
-  return Promise.race([
-    new Promise<boolean>((resolve) => child.once("exit", () => resolve(true))),
-    sleep(timeoutMs).then(() => false),
-  ]);
+/** Deadlines observe rejection immediately and never leave their timer behind.
+ * A timeout is a failure, not cancellation: callers still owe native cleanup in finally.
+ */
+export async function teardownWithin<T>(label: string, operation: () => Promise<T>, timeoutMs = 1_000): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([Promise.resolve().then(operation), new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
+    })]);
+  } finally { clearTimeout(timer); }
 }
 
+async function childExited(child: ChildProcess, timeoutMs: number): Promise<boolean> {
+  if (!child.pid || child.exitCode !== null || child.signalCode !== null) return true;
+  return new Promise(resolve => {
+    const finish = (exited: boolean) => { clearTimeout(timer); child.off("exit", exitedListener); resolve(exited); };
+    const exitedListener = () => finish(true);
+    const timer = setTimeout(() => finish(false), timeoutMs);
+    child.once("exit", exitedListener);
+    if (child.exitCode !== null || child.signalCode !== null) finish(true);
+  });
+}
+
+const childBirths = new WeakMap<ChildProcess, string>();
 async function stopChild(child: ChildProcess): Promise<void> {
-  if (child.exitCode !== null || child.signalCode !== null) return;
-  child.kill("SIGTERM");
+  if (!child.pid || child.exitCode !== null || child.signalCode !== null) return;
+  const signal = (value: NodeJS.Signals) => {
+    if (child.exitCode !== null || child.signalCode !== null) return;
+    if (process.platform === "linux" && (!childBirths.get(child) || startTime(child.pid!) !== childBirths.get(child))) {
+      throw new Error("owned nats-server birth is unconfirmed; refusing signal");
+    }
+    child.kill(value); // Direct captured child only, never a host-wide/group/name kill.
+  };
+  signal("SIGTERM");
   if (await childExited(child, 2_000)) return;
-  child.kill("SIGKILL");
+  signal("SIGKILL");
   if (!(await childExited(child, 2_000))) throw new Error("owned nats-server child did not stop");
 }
 
@@ -256,6 +296,7 @@ export class PathBHarness {
   readonly tls: PathBTlsFiles | undefined;
   serverVersion = "";
   private child: ChildProcess | undefined;
+  get processId(): number | undefined { return this.child?.pid; }
   private readonly connections = new Set<NatsConnection>();
   private constructor(input: {
     root: string;
@@ -327,7 +368,11 @@ export class PathBHarness {
           {
             key: maintainerSigning.getPublicKey(),
             role: "operator",
-            template: { ...operatorTemplate, sub: { allow: [...operatorTemplate.sub.allow, ...(options.additionalOperatorSubscribe ?? [])] } },
+            template: {
+              ...operatorTemplate,
+              ...(options.additionalOperatorResponses === undefined ? {} : { allow_responses: options.additionalOperatorResponses }),
+              sub: { allow: [...operatorTemplate.sub.allow, ...(options.additionalOperatorSubscribe ?? [])] },
+            },
           },
           { key: principalSigning.getPublicKey(), role: "principal", template: roleTemplateWithPathB("principal", streams, PATH_B_MACHINES) },
           {
@@ -345,6 +390,7 @@ export class PathBHarness {
           const tags = role === "agent"
             ? [`role:${role}`, `machine:${machine}`, ...[PATH_B_TEST_MESH, ...(options.additionalAgentMeshes ?? [])].map((mesh) => `mesh:${mesh}`)]
             : [`role:${role}`, `machine:${machine}`];
+          if (options.org !== undefined && role === "agent") tags.push(`org:${options.org}`);
           const jwt = encodeUserJwt(
             {
               name,
@@ -436,6 +482,7 @@ export class PathBHarness {
       env: { PATH: process.env.PATH ?? "", HOME: this.root, TMPDIR: this.root, LANG: "C" },
       stdio: ["ignore", "ignore", "ignore"],
     });
+    if (process.platform === "linux" && this.child.pid) childBirths.set(this.child, startTime(this.child.pid));
     let spawnFailed = false;
     this.child.once("error", () => { spawnFailed = true; });
     const deadline = Date.now() + START_TIMEOUT_MS;
@@ -457,10 +504,15 @@ export class PathBHarness {
     throw new Error("nats-server did not become JetStream-ready");
   }
 
+  /** Captured native child handle for teardown exit evidence (not just logical idle). */
+  get serverProcess(): ChildProcess | undefined { return this.child; }
+
   async restart(): Promise<void> {
-    await this.closeConnections();
-    if (this.child) await stopChild(this.child);
-    this.child = undefined;
+    try { await this.closeConnections(); }
+    finally {
+      if (this.child) await stopChild(this.child);
+      this.child = undefined;
+    }
     await this.start();
   }
 
@@ -507,20 +559,30 @@ export class PathBHarness {
       return publicShape(response.json<unknown>());
     } finally {
       this.connections.delete(nc);
-      await nc.close();
+      await teardownWithin("NATS user-info connection close", () => nc.close());
     }
   }
 
   async closeConnections(): Promise<void> {
-    await Promise.allSettled([...this.connections].map((nc) => nc.close()));
+    const connections = [...this.connections];
     this.connections.clear();
+    const results = await Promise.allSettled(connections.map(nc => teardownWithin("NATS connection close", () => nc.close())));
+    const failures = results.flatMap(result => result.status === "rejected" ? [result.reason] : []);
+    if (failures.length) throw new AggregateError(failures, failures.map(String).join("; "));
   }
 
   async stop(): Promise<void> {
-    await this.closeConnections();
-    if (this.child) await stopChild(this.child);
-    this.child = undefined;
-    fs.rmSync(this.root, { recursive: true, force: true });
+    const failures: unknown[] = [];
+    try { await this.closeConnections(); } catch (error) { failures.push(error); }
+    finally {
+      try { if (this.child) await stopChild(this.child); } catch (error) { failures.push(error); }
+      finally {
+        if (!this.child || this.child.exitCode !== null || this.child.signalCode !== null) this.child = undefined;
+        // Even a failed native/connection join cannot bypass private-root cleanup.
+        try { fs.rmSync(this.root, { recursive: true, force: true }); } catch (error) { failures.push(error); }
+      }
+    }
+    if (failures.length) throw new AggregateError(failures, failures.map(String).join("; "));
   }
 
 }

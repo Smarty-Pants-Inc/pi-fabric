@@ -2,11 +2,14 @@ import { Buffer } from "node:buffer";
 import { Readable } from "node:stream";
 import { setTimeout as sleep } from "node:timers/promises";
 import {
+  JetStreamApiError,
+  JetStreamApiCodes,
   type ConsumerMessages,
   type JsMsg,
   type JetStreamClient,
   type JetStreamManager,
 } from "@nats-io/jetstream";
+import type { PlacementTerminalRecord } from "../../placement/terminal.js";
 import type {
   FabricTransport,
   FabricTransportOptions,
@@ -18,7 +21,9 @@ import type {
   TransportSent,
 } from "../types.js";
 import { TransportInvalidError, TransportUncertainError, TransportUnavailableError } from "../types.js";
+import { fabricPathBProbeEpochNs, hasFabricPathBProbeObserver, recordFabricPathBProbe, transportProbeCommandId } from "../probe-hooks.js";
 import { publishFailure } from "./errors.js";
+import { DEFAULT_INBOX_MAX_AGE_MS, isValidInboxMaxAgeMs } from "./inbox-policy.js";
 import {
   transportAdvisoryStreamSubject,
   transportDurableName,
@@ -29,18 +34,33 @@ import {
   validateMachine,
   hashToken,
 } from "./subjects.js";
-import { ensureTransportConsumer, ensureTransportStream, type TransportStreamPolicy } from "./provision.js";
+import { ensureTransportConsumer, ensureTransportStream, INBOX_DUPLICATE_WINDOW_MS, type TransportConsumerPolicy, type TransportStreamPolicy } from "./provision.js";
 import { ADVISORY_CAPTURE_STREAM } from "./subjects.js";
 import { openNatsConnection, type NatsConnectionHandle, type NatsPermissionPolicy } from "./connection.js";
+import { NatsSessionChannelManager, type SessionChannel, type SessionChannelIdentity, type SessionChannelOpenOptions } from "./session-channel.js";
 import type { TlsOptions } from "@nats-io/transport-node";
-import { LEASE_TTL_MS, PRESENCE_TTL_MS, openNatsKvForMachine, type NatsKvStore } from "./kv.js";
+import {
+  LEASE_TTL_MS, PRESENCE_TTL_MS, PLACEMENT_TERMINAL_BUCKET, PLACEMENT_TERMINAL_TTL_MS,
+  openNatsKv, openNatsKvForMachine, type NatsKvStore,
+} from "./kv.js";
+import type { MeshEventPublisherBinding, MeshStore } from "../../mesh/store.js";
+import type { NatsEventsPublisher } from "./events-publish.js";
 
 const DEFAULT_MAX_BYTES = 1_073_741_824;
 const DEFAULT_MAX_MESSAGE_BYTES = 1_048_576;
-const DEFAULT_DUPLICATE_WINDOW_MS = 10 * 60 * 1_000;
+const DEFAULT_DUPLICATE_WINDOW_MS = INBOX_DUPLICATE_WINDOW_MS;
+const ADVISORY_DUPLICATE_WINDOW_MS = 10 * 60 * 1_000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 5_000;
+const DEFAULT_PUBLISH_RETRY_HORIZON_MS = 30_000;
+const PUBLISH_RETRY_WINDOW_SAFETY_MS = 30_000;
+const PUBLISH_RETRY_INITIAL_MS = 250;
+const PUBLISH_RETRY_MAX_MS = 5_000;
+const DEFAULT_EPHEMERAL_INACTIVE_SECONDS = 3_600;
+const EPHEMERAL_DELETE_TIMEOUT_MS = 1_000;
 const utf8 = new TextEncoder();
 const validMessageId = (id: string): boolean => id.length > 0 && id === id.trim() && !/[\u0000-\u001f\u007f]/.test(id);
+const retryablePublishFailure = (error: unknown): error is TransportUncertainError | TransportUnavailableError =>
+  error instanceof TransportUncertainError || error instanceof TransportUnavailableError;
 
 /** Direct options keep the module independently testable; the factory passes FabricTransportOptions. */
 export interface NatsTransportOptions extends NatsPermissionPolicy {
@@ -48,22 +68,36 @@ export interface NatsTransportOptions extends NatsPermissionPolicy {
   readonly machine: string;
   readonly hostId: string;
   readonly name?: string;
+  readonly org?: string;
   /** Scoped runtime agent credentials; verified against the exact USER.INFO scope. */
   readonly credentials: string;
   readonly tls?: TlsOptions;
   readonly maxBytes?: number;
+  /** Leases, presence and inbox replicas; omitted preserves the single-replica policy. */
+  readonly replicas?: number;
+  /** Inbox stream max_age in milliseconds. Existing maxAgeMs is a legacy direct-options alias. */
+  readonly inboxMaxAgeMs?: number;
   readonly maxAgeMs?: number;
   readonly maxMessageBytes?: number;
   readonly duplicateWindowMs?: number;
   readonly requestTimeoutMs?: number;
   readonly provision?: boolean;
+  /** Host-only opt-in to expiring this host's own inbox durable. */
+  readonly ephemeralHost?: boolean;
+  /** Idle expiration in seconds when ephemeralHost is enabled (300..86400). */
+  readonly ephemeralInactiveSeconds?: number;
+  /** Mesh event publisher binding; only required when events is enabled. */
+  readonly mesh?: MeshStore;
   readonly signal?: AbortSignal;
 }
 
 type OpenOptions = NatsTransportOptions | FabricTransportOptions;
-type ResolvedNatsOptions = Required<Pick<NatsTransportOptions, "servers" | "machine" | "hostId" | "credentials" | "custodyStream" | "livenessStream" | "pathBMachines" | "maxBytes" | "maxMessageBytes" | "duplicateWindowMs" | "requestTimeoutMs" | "provision">> & {
+type ResolvedNatsOptions = Required<Pick<NatsTransportOptions, "servers" | "machine" | "hostId" | "credentials" | "custodyStream" | "livenessStream" | "pathBMachines" | "maxBytes" | "maxMessageBytes" | "duplicateWindowMs" | "requestTimeoutMs" | "provision" | "ephemeralHost" | "ephemeralInactiveSeconds" | "inboxMaxAgeMs" | "replicas">> & {
+  readonly org?: string;
   readonly name?: string;
   readonly tls?: TlsOptions;
+  readonly events: boolean;
+  readonly mesh?: MeshStore;
   readonly signal?: AbortSignal;
 };
 
@@ -88,18 +122,27 @@ const normalizeOptions = (options: OpenOptions): ResolvedNatsOptions => {
       custodyStream: options.custodyStream,
       livenessStream: options.livenessStream,
       pathBMachines: options.pathBMachines,
+      ...(options.org === undefined ? {} : { org: options.org }),
       ...(options.tls === undefined ? {} : { tls: options.tls }),
       maxBytes: options.maxBytes ?? DEFAULT_MAX_BYTES,
+      replicas: options.replicas === undefined ? 1 : options.replicas,
       maxMessageBytes: options.maxMessageBytes ?? DEFAULT_MAX_MESSAGE_BYTES,
       duplicateWindowMs: options.duplicateWindowMs ?? DEFAULT_DUPLICATE_WINDOW_MS,
       requestTimeoutMs: options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
-      provision: options.provision ?? false,
+      // Event-mode runtimes never provision streams, including through the direct-options port.
+      provision: options.events === true ? false : options.provision ?? false,
+      ephemeralHost: options.ephemeralHost ?? false,
+      ephemeralInactiveSeconds: options.ephemeralInactiveSeconds ?? DEFAULT_EPHEMERAL_INACTIVE_SECONDS,
+      inboxMaxAgeMs: options.inboxMaxAgeMs ?? options.maxAgeMs ?? DEFAULT_INBOX_MAX_AGE_MS,
+      events: options.events ?? false,
+      ...(options.mesh === undefined ? {} : { mesh: options.mesh }),
       ...(options.signal === undefined ? {} : { signal: options.signal }),
     } as ResolvedNatsOptions;
   }
   const config = options.config as unknown as { nats?: {
     servers?: string | readonly string[]; machine?: string; credentials?: string;
-    custodyStream?: string; livenessStream?: string; pathBMachines?: readonly string[]; tls?: TlsOptions;
+    custodyStream?: string; livenessStream?: string; pathBMachines?: readonly string[]; org?: string; tls?: TlsOptions;
+    ephemeralHost?: boolean; ephemeralInactiveSeconds?: number; inboxMaxAgeMs?: number; events?: boolean; provision?: boolean; replicas?: number;
   } };
   const nats = config.nats;
   // Production config never enables plaintext; the loopback opt-in is a direct test option only.
@@ -120,12 +163,19 @@ const normalizeOptions = (options: OpenOptions): ResolvedNatsOptions => {
     custodyStream: nats?.custodyStream as string,
     livenessStream: nats?.livenessStream as string,
     pathBMachines: nats?.pathBMachines as readonly string[],
+    ...(nats?.org === undefined ? {} : { org: nats.org }),
     ...(nats?.tls === undefined ? {} : { tls: nats.tls }),
     maxBytes: DEFAULT_MAX_BYTES,
+    replicas: nats?.replicas === undefined ? 1 : nats.replicas,
     maxMessageBytes: DEFAULT_MAX_MESSAGE_BYTES,
     duplicateWindowMs: DEFAULT_DUPLICATE_WINDOW_MS,
     requestTimeoutMs: 5_000,
     provision: false,
+    ephemeralHost: nats?.ephemeralHost ?? false,
+    ephemeralInactiveSeconds: nats?.ephemeralInactiveSeconds ?? DEFAULT_EPHEMERAL_INACTIVE_SECONDS,
+    inboxMaxAgeMs: nats?.inboxMaxAgeMs ?? DEFAULT_INBOX_MAX_AGE_MS,
+    events: nats?.events ?? false,
+    mesh: options.mesh,
     ...(options.signal === undefined ? {} : { signal: options.signal }),
   } as ResolvedNatsOptions;
 };
@@ -134,10 +184,19 @@ const streamPolicy = (name: string, subjects: readonly string[], options: Resolv
   name,
   subjects,
   maxBytes: overrides.maxBytes ?? options.maxBytes,
-  maxAgeMs: overrides.maxAgeMs ?? 0,
+  maxAgeMs: overrides.maxAgeMs ?? options.inboxMaxAgeMs,
   maxMessageBytes: overrides.maxMessageBytes ?? options.maxMessageBytes,
   duplicateWindowMs: overrides.duplicateWindowMs ?? options.duplicateWindowMs,
-  replicas: 1,
+  replicas: overrides.replicas ?? options.replicas,
+});
+
+const transportConsumerPolicy = (options: ResolvedNatsOptions): TransportConsumerPolicy => ({
+  stream: transportInboxStream(options.machine),
+  durable: transportDurableName(options.hostId),
+  filterSubject: transportInboxFilter(options.machine, options.hostId),
+  description: JSON.stringify({ fabricHostId: options.hostId, machine: options.machine }),
+  maxAckPending: 128,
+  ...(options.ephemeralHost ? { inactiveThresholdNs: options.ephemeralInactiveSeconds * 1_000_000_000 } : {}),
 });
 
 const isTransportEnvelope = (value: unknown): value is TransportEnvelope => {
@@ -158,7 +217,9 @@ interface NatsSession {
   readonly connection: NatsConnectionHandle;
   readonly js: JetStreamClient;
   readonly manager: JetStreamManager;
+  readonly duplicateWindowMs: number;
   readonly kvStores: Readonly<Record<"leases" | "presence", NatsKvStore>>;
+  readonly eventsPublisher?: NatsEventsPublisher;
   unsubscribe?: () => void;
 }
 
@@ -179,6 +240,8 @@ const openNatsSession = async (options: ResolvedNatsOptions, signal?: AbortSigna
     custodyStream: options.custodyStream,
     livenessStream: options.livenessStream,
     pathBMachines: options.pathBMachines,
+    events: options.events,
+    ...(options.org === undefined ? {} : { org: options.org }),
     ...(options.tls === undefined ? {} : { tls: options.tls }),
     timeoutMs: options.requestTimeoutMs,
     ...(signal === undefined ? {} : { signal }),
@@ -192,31 +255,48 @@ const openNatsSession = async (options: ResolvedNatsOptions, signal?: AbortSigna
         maxAgeMs: 30 * 24 * 60 * 60 * 1_000,
         maxBytes: Math.max(options.maxBytes, 64 * 1024 * 1024),
         maxMessageBytes: 64 * 1024,
+        duplicateWindowMs: ADVISORY_DUPLICATE_WINDOW_MS,
+        replicas: 1,
       }), true);
       assertAlive();
     }
-    const leases = await openNatsKvForMachine(connection.js, "leases", options.machine, options.provision, connection.onStatus);
+    const leases = await openNatsKvForMachine(connection.js, "leases", options.machine, options.provision, connection.onStatus, options.replicas);
     assertAlive();
-    const presence = await openNatsKvForMachine(connection.js, "presence", options.machine, options.provision, connection.onStatus);
+    const presence = await openNatsKvForMachine(connection.js, "presence", options.machine, options.provision, connection.onStatus, options.replicas);
     assertAlive();
-    await ensureTransportStream(manager, streamPolicy(transportInboxStream(options.machine), [transportInboxStreamSubject(options.machine)], options, {
-      maxAgeMs: 0,
-    }), options.provision);
+    const inboxStream = await ensureTransportStream(manager, {
+      ...streamPolicy(transportInboxStream(options.machine), [transportInboxStreamSubject(options.machine)], options),
+      allowUnboundedMaxAge: true,
+    }, options.provision);
+    const duplicateWindowNs = inboxStream.config.duplicate_window;
+    if (!Number.isSafeInteger(duplicateWindowNs) || duplicateWindowNs <= 0 || duplicateWindowNs % 1_000_000 !== 0) {
+      throw new TransportInvalidError("NATS inbox stream has an invalid duplicate window");
+    }
+    const duplicateWindowMs = duplicateWindowNs / 1_000_000;
     assertAlive();
-    const description = JSON.stringify({ fabricHostId: options.hostId, machine: options.machine });
-    const consumer = await ensureTransportConsumer(manager.consumers, {
-      stream: transportInboxStream(options.machine),
-      durable: transportDurableName(options.hostId),
-      filterSubject: transportInboxFilter(options.machine, options.hostId),
-      description,
-      maxAckPending: 128,
-    });
+    const consumerPolicy = transportConsumerPolicy(options);
+    const consumer = await ensureTransportConsumer(manager.consumers, consumerPolicy);
     assertAlive();
-    if (consumer.config.description !== description) throw new TransportInvalidError("transport inbox owner description mismatch");
-    return { connection, js: connection.js, manager, kvStores: { leases, presence } };
+    if (consumer.config.description !== consumerPolicy.description) throw new TransportInvalidError("transport inbox owner description mismatch");
+    let eventsPublisher: NatsEventsPublisher | undefined;
+    if (options.events) {
+      const { openNatsEventsPublisher } = await import("./index.js");
+      assertAlive();
+      // Fabric-store owns stream creation with admin credentials. Even mesh.nats.provision=true
+      // cannot grant runtime creation: require the existing FABRIC_EV_<NORMALIZED_ORG> stream.
+      // Its canonical layout/policy belongs to provision.ts; GitHub uses its separate GITHUB stream.
+      eventsPublisher = await openNatsEventsPublisher(connection, { org: options.org!, provision: false });
+      assertAlive();
+    }
+    return { connection, js: connection.js, manager, duplicateWindowMs, kvStores: { leases, presence },
+      ...(eventsPublisher ? { eventsPublisher } : {}) };
   } catch (error) {
     await connection.close().catch(() => undefined);
     signal?.throwIfAborted();
+    // provision.ts owns the exact checks; type only this inbox's refusal, not advisory/event failures.
+    if (error instanceof Error && error.message === `NATS stream configuration mismatch: ${transportInboxStream(options.machine)}`) {
+      throw new TransportInvalidError(error.message, { cause: error });
+    }
     throw error;
   }
 };
@@ -231,6 +311,39 @@ const authorizationFailure = (error: unknown): boolean => {
     } else break;
   }
   return false;
+};
+
+export class NatsInboxResourceNotFoundError extends TransportInvalidError {
+  constructor(cause: unknown) {
+    super("NATS inbox JetStream stream or consumer was not found", { cause });
+    this.name = "NatsInboxResourceNotFoundError";
+  }
+}
+
+/** Converts terminal inbox setup failures to transport errors, preserving their original cause. */
+export const classifyNatsInboxTerminalError = (error: unknown): Error | undefined => {
+  let cause = error;
+  for (let depth = 0; cause && depth < 6; depth += 1) {
+    if (cause instanceof JetStreamApiError) {
+      try {
+        const api = cause.apiError();
+        if (api.code === 404 || api.err_code === JetStreamApiCodes.ConsumerNotFound ||
+            api.err_code === JetStreamApiCodes.StreamNotFound) return new NatsInboxResourceNotFoundError(error);
+      } catch { /* Preserve classification of the outer error below. */ }
+    }
+    if (typeof cause !== "object") break;
+    const candidate = cause as { name?: string; code?: unknown; status?: unknown; message?: string; cause?: unknown };
+    if (["NatsAuthorizationError", "AuthorizationError", "PermissionViolationError", "UserAuthenticationExpiredError",
+      "InvalidArgumentError", "InvalidNameError", "InvalidSubjectError", "InvalidOperationError"].includes(candidate.name ?? "") ||
+      ["FABRIC_NATS_AUTHORIZATION", "FABRIC_TRANSPORT_DENIED", "FABRIC_TRANSPORT_INVALID", "FABRIC_TRANSPORT_UNSUPPORTED",
+        "AUTHORIZATION_VIOLATION", "PERMISSIONS_VIOLATION"].includes(String(candidate.code)) ||
+      [400, 401, 403].includes(Number(candidate.status)) || [400, 401, 403].includes(Number(candidate.code)) ||
+      /configuration mismatch|owner.*mismatch|permission|authorization|invalid (?:consumer|configuration|config)/i.test(candidate.message ?? "")) {
+      return new TransportInvalidError("NATS inbox authorization, ownership or configuration rejected", { cause: error });
+    }
+    cause = candidate.cause;
+  }
+  return undefined;
 };
 
 class RebindingKvStore implements TransportKv {
@@ -320,6 +433,20 @@ class RebindingKvStore implements TransportKv {
   }
 }
 
+class NatsPublishRetryExpiredError extends TransportUncertainError {
+  override readonly name = "NatsPublishRetryExpiredError";
+  readonly retryExpired = true;
+  readonly expiryCode = "FABRIC_TRANSPORT_UNCERTAIN_EXPIRED" as const;
+
+  constructor(error: TransportUncertainError) {
+    super(error.id, error.resolvedBody, { cause: error });
+    this.message = `transport outcome uncertain for ${error.id}; the safe retry window expired`;
+  }
+}
+
+const retryHorizonFailure = (error: Error): Error => error instanceof TransportUncertainError
+  ? new NatsPublishRetryExpiredError(error) : error;
+
 class NatsTransportImpl implements FabricTransport {
   readonly kind = "nats" as const;
   readonly self: TransportOwner;
@@ -336,7 +463,12 @@ class NatsTransportImpl implements FabricTransport {
   #inboxActive = false;
   #activeInbox: { readonly controller: AbortController; messages?: ConsumerMessages; queue?: Readable } | undefined;
   readonly #kvStores: Readonly<Record<"leases" | "presence", TransportKv>>;
+  #placementTerminalStore: { readonly epoch: number; readonly store: NatsKvStore } | undefined;
   readonly #waiters = new Set<ReadyWaiter>();
+  readonly #verifiedReconnectListeners = new Set<() => void>();
+  readonly #sessionChannels = new NatsSessionChannelManager();
+  #eventPublisher: MeshEventPublisherBinding | undefined;
+  #hasInstalledSession = false;
 
   private constructor(session: NatsSession, options: ResolvedNatsOptions) {
     this.#session = session;
@@ -355,11 +487,36 @@ class NatsTransportImpl implements FabricTransport {
     rawOptions.signal?.throwIfAborted();
     const options = normalizeOptions(rawOptions);
     if (!options.hostId) throw new Error("hostId is required");
+    if (typeof options.events !== "boolean") throw new Error("NATS transport events must be a boolean");
+    if (options.events && (!options.org || !options.mesh)) throw new Error("NATS transport events require org and mesh");
+    if (!Number.isSafeInteger(options.replicas) || options.replicas <= 0) {
+      throw new TransportInvalidError("NATS transport replicas must be a positive safe integer");
+    }
     for (const [key, value] of Object.entries(options)) {
-      if (["servers", "machine", "hostId", "name", "credentials"].includes(key)) continue;
+      if (["servers", "machine", "hostId", "name", "credentials", "ephemeralHost"].includes(key)) continue;
       if (typeof value === "number" && (!Number.isSafeInteger(value) || value <= 0)) throw new Error(`${key} must be positive`);
     }
+    if (typeof options.ephemeralHost !== "boolean") throw new Error("ephemeralHost must be a boolean");
+    if (!Number.isSafeInteger(options.ephemeralInactiveSeconds) || options.ephemeralInactiveSeconds < 300 || options.ephemeralInactiveSeconds > 86_400) {
+      throw new Error("ephemeralInactiveSeconds must be an integer from 300 through 86400");
+    }
+    if (!isValidInboxMaxAgeMs(options.inboxMaxAgeMs)) throw new Error("inboxMaxAgeMs must be a bounded positive number of milliseconds");
     const transport = new NatsTransportImpl(await openNatsSession(options, options.signal), options);
+    try {
+      if (options.events) {
+        transport.#eventPublisher = options.mesh!.bindEventPublisher(`nats:${options.org!}`, event => {
+          const publisher = transport.#assertOpen().eventsPublisher;
+          if (!publisher) throw new TransportUnavailableError("NATS event publisher is unavailable");
+          return publisher.publish(event);
+        }, event => {
+          if (typeof event.id !== "string" || !validMessageId(event.id)) throw new TransportInvalidError("invalid NATS event id");
+          if (event.topic.split(".").some(token => token.length === 0)) throw new TransportInvalidError("invalid NATS event topic");
+        });
+      }
+    } catch (error) {
+      await transport.close().catch(() => undefined);
+      throw error;
+    }
     // Cover an abort between acquisition and owner-listener registration.
     if (options.signal?.aborted) {
       await transport.close().catch(() => undefined);
@@ -374,7 +531,8 @@ class NatsTransportImpl implements FabricTransport {
 
   #waitForSession(signal: AbortSignal): Promise<NatsSession> {
     if (this.#terminalError) return Promise.reject(this.#terminalError);
-    if (this.#session && !this.#session.connection.nc.isClosed() && !this.#session.connection.nc.isDraining()) return Promise.resolve(this.#session);
+    if (this.#session && this.#session.connection.isVerified() &&
+      !this.#session.connection.nc.isClosed() && !this.#session.connection.nc.isDraining()) return Promise.resolve(this.#session);
     if (this.#closed) return Promise.reject(new TransportUnavailableError("NATS transport is closed"));
     signal.throwIfAborted();
     return new Promise<NatsSession>((resolve, reject) => {
@@ -386,6 +544,7 @@ class NatsTransportImpl implements FabricTransport {
   }
 
   #resolveWaiters(session: NatsSession): void {
+    if (!session.connection.isVerified()) return;
     for (const waiter of [...this.#waiters]) {
       this.#waiters.delete(waiter);
       if (waiter.onAbort) waiter.signal.removeEventListener("abort", waiter.onAbort);
@@ -402,27 +561,70 @@ class NatsTransportImpl implements FabricTransport {
   }
 
   #installSession(session: NatsSession): void {
+    const reinstalled = this.#hasInstalledSession;
+    this.#hasInstalledSession = true;
     this.#session = session;
+    this.#sessionChannels.setConnection(session.connection.nc);
     session.unsubscribe = session.connection.onStatus((status) => {
-      if (status.type === "disconnect" || status.type === "close") this.#loseSession(session);
+      if (this.#closed || this.#session !== session) return;
+      if (status.type === "disconnect") {
+        // Native reconnect keeps this verified session and its ordered KV clients. Invalidate
+        // Fabric-facing views/inbox before the client's next dial; the connection gate remains
+        // closed until USER.INFO passes and the verified reconnect status is delivered.
+        this.#epoch += 1;
+        this.#activeInbox?.controller.abort();
+        this.#sessionChannels.setConnection(undefined);
+      } else if (status.type === "reconnect") {
+        this.#sessionChannels.setConnection(session.connection.nc);
+        this.#resolveWaiters(session);
+        this.#notifyVerifiedReconnect();
+        // A retained outbox row retries only after the native session was re-verified.
+        void this.#eventPublisher?.retry();
+      }
     });
-    void (session.connection as NatsConnectionHandle & { closed(): Promise<void | Error> }).closed().then(() => this.#loseSession(session));
+    void session.connection.closed().then((error) => {
+      if (authorizationFailure(error)) {
+        this.#terminalError = error instanceof Error ? error : new Error("NATS authorization failed");
+        this.#activeInbox?.controller.abort();
+        this.#rejectWaiters(this.#terminalError);
+      }
+      this.#loseSession(session);
+    });
     this.#resolveWaiters(session);
+    // A hard close uses the bounded full-reopen path; the new session is already verified.
+    if (reinstalled) this.#notifyVerifiedReconnect();
+  }
+
+  #notifyVerifiedReconnect(): void {
+    for (const listener of [...this.#verifiedReconnectListeners]) {
+      try { listener(); } catch { /* One observer cannot block a verified transport session. */ }
+    }
+  }
+
+  onVerifiedReconnect(listener: () => void): () => void {
+    if (this.#closed) return () => undefined;
+    this.#verifiedReconnectListeners.add(listener);
+    return () => { this.#verifiedReconnectListeners.delete(listener); };
   }
 
   #loseSession(session: NatsSession): void {
     if (this.#closed || this.#session !== session) return;
     this.#session = undefined;
+    this.#sessionChannels.setConnection(undefined);
     this.#epoch += 1;
     this.#activeInbox?.controller.abort();
     session.unsubscribe?.();
     void session.connection.close().catch(() => undefined);
+    if (this.#terminalError) {
+      this.#rejectWaiters(this.#terminalError);
+      return;
+    }
     this.#scheduleReconnect();
   }
 
   #scheduleReconnect(): void {
     if (this.#reconnectTask || this.#closed || this.#terminalError) return;
-    // ponytail: replace transparent client reconnect with one fully verified reopen path.
+    // Preserve a bounded full reopen only for hard closes; ordinary broker restarts use the native verified session.
     this.#reconnectTask = this.#reconnectLoop().finally(() => {
       this.#reconnectTask = undefined;
       // A just-installed session can close before this loop has settled.
@@ -457,8 +659,8 @@ class NatsTransportImpl implements FabricTransport {
     if (this.#terminalError) throw this.#terminalError;
     if (this.#closed) throw new TransportUnavailableError("NATS transport is closed");
     const session = this.#session;
-    if (!session || session.connection.nc.isClosed() || session.connection.nc.isDraining()) {
-      if (session) this.#loseSession(session);
+    if (!session || !session.connection.isVerified() || session.connection.nc.isClosed() || session.connection.nc.isDraining()) {
+      if (session && (session.connection.nc.isClosed() || session.connection.nc.isDraining())) this.#loseSession(session);
       throw new TransportUnavailableError("NATS transport is temporarily unavailable");
     }
     return session;
@@ -492,18 +694,92 @@ class NatsTransportImpl implements FabricTransport {
 
   async send<T>(envelope: TransportEnvelope<T>, signal?: AbortSignal): Promise<TransportSent<T>> {
     const prepared = this.#wire(envelope, signal);
+    const startedAt = Date.now();
+    const body = prepared.resolved.body;
+    const bodyRecord = body && typeof body === "object" && !Array.isArray(body) ? body as Record<string, unknown> : undefined;
+    const requestedDeadline = prepared.resolved.kind === "command" && typeof bodyRecord?.commandId === "string"
+      ? bodyRecord.deadlineAt : undefined;
+    const commandDeadline = typeof requestedDeadline === "number" && Number.isSafeInteger(requestedDeadline) && requestedDeadline > startedAt
+      ? requestedDeadline : startedAt + DEFAULT_PUBLISH_RETRY_HORIZON_MS;
+    // Keep same-ID retries 30s inside the actual, verified stream dedupe window.
+    const safeRetryWindowMs = Math.max(0, prepared.session.duplicateWindowMs - PUBLISH_RETRY_WINDOW_SAFETY_MS);
+    const retryDeadline = Math.min(commandDeadline, startedAt + safeRetryWindowMs);
+    const retrySignal = AbortSignal.any([this.#closeController.signal, ...(signal ? [signal] : []), AbortSignal.timeout(Math.max(1, retryDeadline - startedAt))]);
+    let delayMs = PUBLISH_RETRY_INITIAL_MS;
+    let lastFailure: Error | undefined;
+    let uncertainFailure: TransportUncertainError | undefined;
     let ack;
-    try {
-      ack = await prepared.session.js.publish(prepared.subject, prepared.bytes, {
-        msgID: prepared.resolved.id,
-        timeout: this.#options.requestTimeoutMs,
-        expect: { streamName: this.#streamFor(prepared.resolved.to.machine) },
-      });
-    } catch (error) {
-      throw publishFailure(error, prepared.resolved.id, prepared.resolved.body);
+    for (;;) {
+      if (lastFailure && Date.now() >= retryDeadline) throw retryHorizonFailure(uncertainFailure ?? lastFailure);
+      let session: NatsSession;
+      try {
+        session = this.#assertOpen();
+      } catch (error) {
+        if (lastFailure && retryablePublishFailure(error)) {
+          if (Date.now() >= retryDeadline) throw retryHorizonFailure(uncertainFailure ?? lastFailure);
+          await this.#waitForPublishRetry(retrySignal, delayMs, retryDeadline, lastFailure, signal);
+          delayMs = Math.min(PUBLISH_RETRY_MAX_MS, delayMs * 2);
+          continue;
+        }
+        throw uncertainFailure ?? error;
+      }
+      const remaining = Math.max(1, retryDeadline - Date.now());
+      // Do not begin another wire attempt unless its configured PubAck timeout can
+      // fit inside the safe dedupe horizon. A clipped timeout can race the horizon
+      // abort and add a third publication after the outcome is already uncertain.
+      if (lastFailure && remaining < this.#options.requestTimeoutMs) {
+        throw retryHorizonFailure(uncertainFailure ?? lastFailure);
+      }
+      try {
+        ack = await session.js.publish(prepared.subject, prepared.bytes, {
+          msgID: prepared.resolved.id,
+          timeout: Math.min(this.#options.requestTimeoutMs, remaining),
+          expect: { streamName: this.#streamFor(prepared.resolved.to.machine) },
+        });
+        break;
+      } catch (error) {
+        const failure = publishFailure(error, prepared.resolved.id, prepared.resolved.body);
+        if (failure instanceof TransportUncertainError) uncertainFailure = failure;
+        lastFailure = failure;
+        if (!retryablePublishFailure(failure)) throw uncertainFailure ?? failure;
+        if (Date.now() >= retryDeadline) throw retryHorizonFailure(uncertainFailure ?? failure);
+        await this.#waitForPublishRetry(retrySignal, delayMs, retryDeadline, failure, signal);
+        delayMs = Math.min(PUBLISH_RETRY_MAX_MS, delayMs * 2);
+      }
     }
     if (signal?.aborted) throw new TransportUncertainError(prepared.resolved.id, prepared.resolved.body, { cause: signal.reason });
+    if (hasFabricPathBProbeObserver()) recordFabricPathBProbe({ type: "transport-puback", atNs: fabricPathBProbeEpochNs(), carrier: "nats",
+      envelopeId: prepared.resolved.id, ...(transportProbeCommandId(prepared.resolved) ? { commandId: transportProbeCommandId(prepared.resolved)! } : {}),
+      kind: prepared.resolved.kind, operation: prepared.resolved.operation, targetId: prepared.resolved.targetId,
+      sequence: ack.seq, duplicate: ack.duplicate });
     return { id: prepared.resolved.id, sequence: ack.seq, duplicate: ack.duplicate, envelope: prepared.resolved };
+  }
+
+  async #waitForPublishRetry(
+    signal: AbortSignal, delayMs: number, retryDeadline: number, lastFailure: Error, callerSignal?: AbortSignal,
+  ): Promise<void> {
+    try {
+      // Never reuse a connection until its identity has been verified after reconnect.
+      await this.#waitForSession(signal);
+      const remaining = retryDeadline - Date.now();
+      if (remaining <= 0) throw lastFailure;
+      await sleep(Math.min(delayMs, remaining), undefined, { signal });
+    } catch (error) {
+      if (callerSignal?.aborted) {
+        if (lastFailure instanceof TransportUncertainError) throw lastFailure;
+        throw callerSignal.reason ?? error;
+      }
+      if (this.#closed || this.#terminalError) throw lastFailure;
+      // timers/promises rejects with AbortError, not signal.reason. The internal
+      // retry timer is the retry-deadline boundary, so never leak that wrapper
+      // instead of the classified uncertainty when its callback runs slightly early.
+      if (signal.aborted) {
+        if (callerSignal?.aborted) throw callerSignal.reason ?? error;
+        throw retryHorizonFailure(lastFailure);
+      }
+      if (Date.now() >= retryDeadline) throw retryHorizonFailure(lastFailure);
+      throw error;
+    }
   }
 
   #streamFor(machine: string): string { return transportInboxStream(validateMachine(machine)); }
@@ -530,49 +806,94 @@ class NatsTransportImpl implements FabricTransport {
     signal.throwIfAborted();
     if (this.#inboxActive) throw new TransportInvalidError("only one inbox iterator is allowed per transport");
     this.#inboxActive = true;
-    const durable = transportDurableName(this.self.hostId);
-    const filter = transportInboxFilter(this.self.machine, this.self.hostId);
-    const description = JSON.stringify({ fabricHostId: this.self.hostId, machine: this.self.machine });
+    const consumerPolicy = transportConsumerPolicy(this.#options);
+    const lifetime = AbortSignal.any([signal, this.#closeController.signal]);
+    let attempt = 0;
+    let recoveryCode = "FABRIC_NATS_INBOX_ENDED";
+    const diagnostic = (code: string, outcome: string): void => {
+      try { console.warn(`[pi-fabric] NATS inbox code=${code} host=${JSON.stringify(this.self.hostId)} durable=${JSON.stringify(consumerPolicy.durable)} stream=${JSON.stringify(this.#stream)} attempt=${attempt} outcome=${outcome}`); } catch {}
+    };
     try {
-      while (!signal.aborted && !this.#closed) {
+      while (!lifetime.aborted) {
+        if (attempt > 0) {
+          const ceiling = Math.min(5_000, 250 * 2 ** Math.min(attempt - 1, 5));
+          const delay = Math.min(5_000, ceiling + Math.floor(Math.random() * Math.min(250, ceiling)));
+          diagnostic(recoveryCode, "retry");
+          try { await sleep(delay, undefined, { signal: lifetime }); }
+          catch { return; }
+        }
         let session: NatsSession;
-        try { session = await this.#waitForSession(signal); }
-        catch (error) { if (this.#closed) return; throw error; }
-        if (signal.aborted || this.#closed) return;
+        try { session = await this.#waitForSession(lifetime); }
+        catch (error) { if (lifetime.aborted) return; throw error; }
+        if (lifetime.aborted) return;
         const controller = new AbortController();
         const queue = new Readable({ objectMode: true, read() {} });
         let messages: ConsumerMessages | undefined;
+        let statusTask: Promise<void> | undefined;
         const end = (): void => { if (!queue.destroyed && !queue.readableEnded) queue.push(null); };
-        const stop = (): void => { end(); void messages?.close(); };
+        const stop = (): void => { end(); void messages?.close().catch(() => undefined); };
+        const assertCurrent = (): void => {
+          if (lifetime.aborted || controller.signal.aborted || this.#session !== session || !session.connection.isVerified()) {
+            throw new TransportUnavailableError("NATS inbox setup was suspended");
+          }
+        };
         this.#activeInbox = { controller, queue };
         signal.addEventListener("abort", stop, { once: true });
         this.#closeController.signal.addEventListener("abort", stop, { once: true });
         controller.signal.addEventListener("abort", stop, { once: true });
         try {
           try {
-          const info = await ensureTransportConsumer(session.manager.consumers, {
-            stream: this.#stream,
-            durable,
-            filterSubject: filter,
-            description,
-            maxAckPending: 128,
-          });
-          if (info.config.filter_subject !== filter || info.config.description !== description) {
+          assertCurrent();
+          const info = await ensureTransportConsumer(session.manager.consumers, consumerPolicy);
+          assertCurrent();
+          if (info.config.filter_subject !== consumerPolicy.filterSubject || info.config.description !== consumerPolicy.description) {
             throw new TransportInvalidError("transport inbox owner/filter mismatch");
           }
-          const consumer = await session.js.consumers.get(this.#stream, durable);
+          const consumer = await session.js.consumers.get(this.#stream, consumerPolicy.durable);
+          assertCurrent();
           messages = await consumer.consume({ max_messages: 16, callback: (msg) => {
+            if (!session.connection.isVerified()) return; // Native reconnect may replay SUBs before USER.INFO.
             if (!signal.aborted && !controller.signal.aborted && !this.#closed && this.#session === session && !queue.destroyed) queue.push(msg);
           } });
           this.#activeInbox = { controller, messages, queue };
-          void messages.closed().then((error) => { if (error) queue.destroy(error); else end(); });
+          assertCurrent();
+          recoveryCode = "FABRIC_NATS_INBOX_ENDED";
+          const fail = (error: unknown): void => {
+            if (!lifetime.aborted && !controller.signal.aborted && !queue.destroyed) {
+              queue.destroy(error instanceof Error ? error : new TransportUnavailableError("NATS inbox consumer failed"));
+            }
+          };
+          void messages.closed().then((error) => { if (error) fail(error); else end(); }, fail);
+          // These informational events can otherwise leave a callback consumer waiting
+          // forever for a deleted durable. Close it and re-verify ownership before reuse.
+          statusTask = (async () => {
+            for await (const status of messages!.status()) {
+              if (lifetime.aborted || controller.signal.aborted) return;
+              if (["heartbeats_missed", "consumer_deleted", "consumer_not_found", "stream_not_found", "reset",
+                "ordered_consumer_recreated", "no_responders"].includes(status.type)) {
+                recoveryCode = `FABRIC_NATS_INBOX_${status.type.toUpperCase()}`;
+                controller.abort();
+                return;
+              }
+            }
+          })().catch(fail);
+          if (attempt > 0) diagnostic("FABRIC_NATS_INBOX_READY", "recovered");
           try {
             for await (const msg of queue as AsyncIterable<JsMsg>) {
               if (signal.aborted || controller.signal.aborted || this.#closed || this.#session !== session) break;
+              if (!session.connection.isVerified()) { controller.abort(); break; }
+              attempt = 0;
               let decoded;
               try { decoded = this.#decode(msg); }
               catch { await msg.term("malformed transport envelope"); continue; }
               const payload = decoded.envelope;
+              const assertCurrentDelivery = (): void => {
+                if (this.#terminalError) throw this.#terminalError;
+                if (this.#closed) throw new TransportUnavailableError("NATS transport is closed");
+                if (this.#session !== session || !session.connection.isVerified()) {
+                  throw new TransportUnavailableError("NATS inbox delivery is suspended until USER.INFO re-verifies");
+                }
+              };
               let finished = false;
               const delivery: TransportDelivery<TransportEnvelope> = {
                 payload,
@@ -580,37 +901,50 @@ class NatsTransportImpl implements FabricTransport {
                 verification: "bridge",
                 attempt: msg.info.deliveryCount,
                 sequence: msg.info.streamSequence,
-                working: () => { if (!finished) msg.working(); },
+                working: () => { if (!finished && this.#session === session && session.connection.isVerified()) msg.working(); },
                 ack: async () => {
                   if (finished) return;
+                  assertCurrentDelivery();
                   const confirmed = await msg.ackAck();
                   if (!confirmed) throw new Error("transport broker ACK was not confirmed");
+                  if (hasFabricPathBProbeObserver()) recordFabricPathBProbe({ type: "inbox-ack-confirmed", atNs: fabricPathBProbeEpochNs(), carrier: "nats",
+                    envelopeId: payload.id, ...(transportProbeCommandId(payload) ? { commandId: transportProbeCommandId(payload)! } : {}),
+                    kind: payload.kind, operation: payload.operation, targetId: payload.targetId,
+                    sequence: msg.info.streamSequence, attempt: msg.info.deliveryCount });
                   finished = true;
                 },
-                nak: (delayMs?: number) => { if (!finished) msg.nak(delayMs); },
-                term: async (reason: string) => { if (!finished) { msg.term(reason); finished = true; } },
+                nak: (delayMs?: number) => { if (!finished) { assertCurrentDelivery(); msg.nak(delayMs); } },
+                term: async (reason: string) => { if (!finished) { assertCurrentDelivery(); msg.term(reason); finished = true; } },
               };
               yield delivery;
             }
           } catch (error) {
-            if (!controller.signal.aborted && !signal.aborted) throw error;
+            if (!lifetime.aborted) throw error;
           }
           } catch (error) {
-            if (this.#closed) return;
-            if (!controller.signal.aborted && (session.connection.nc.isClosed() || session.connection.nc.isDraining())) this.#loseSession(session);
-            if (!(controller.signal.aborted && !signal.aborted && !this.#closed && this.#session !== session)) throw error;
+            if (lifetime.aborted) return;
+            const terminalError = classifyNatsInboxTerminalError(error);
+            if (terminalError) {
+              diagnostic(terminalError instanceof NatsInboxResourceNotFoundError ?
+                "FABRIC_NATS_INBOX_RESOURCE_NOT_FOUND" : "FABRIC_NATS_INBOX_TERMINAL", "stopped");
+              // The control plane must retain terminal pauses, but not transient
+              // JetStream setup/consume failures or ordinary iterator completion.
+              throw terminalError;
+            }
+            recoveryCode = "FABRIC_NATS_INBOX_TRANSIENT";
+            if (session.connection.nc.isClosed() || session.connection.nc.isDraining()) this.#loseSession(session);
           }
         } finally {
           signal.removeEventListener("abort", stop);
           this.#closeController.signal.removeEventListener("abort", stop);
           controller.signal.removeEventListener("abort", stop);
-          if (messages) await messages.close();
+          if (messages) await messages.close().catch(() => undefined);
+          await statusTask;
           queue.destroy();
           if (this.#activeInbox?.controller === controller) this.#activeInbox = undefined;
         }
-        if (!signal.aborted && !this.#closed && this.#session !== session) continue;
-        if (!signal.aborted && !this.#closed && controller.signal.aborted) continue;
-        return;
+        if (lifetime.aborted) return;
+        attempt += 1;
       }
     } finally {
       this.#inboxActive = false;
@@ -620,6 +954,34 @@ class NatsTransportImpl implements FabricTransport {
 
   kv(bucket: "leases" | "presence"): TransportKv {
     return this.#kvStores[bucket];
+  }
+
+  async writePlacementTerminal(record: PlacementTerminalRecord): Promise<void> {
+    const { PlacementTerminalWriteError } = await import("../../placement/terminal.js");
+    try {
+      const session = this.#assertOpen();
+      const epoch = this.#epoch;
+      let current = this.#placementTerminalStore;
+      if (!current || current.epoch !== epoch) {
+        const store = await openNatsKv(session.js, {
+          bucket: PLACEMENT_TERMINAL_BUCKET,
+          ttlMs: PLACEMENT_TERMINAL_TTL_MS,
+        }, this.#options.provision, session.connection.onStatus);
+        if (this.#session !== session || this.#epoch !== epoch) throw new PlacementTerminalWriteError();
+        current = { epoch, store };
+        this.#placementTerminalStore = current;
+      }
+      await current.store.writePlacementTerminal(record);
+    } catch (error) {
+      if (error instanceof PlacementTerminalWriteError) throw error;
+      throw new PlacementTerminalWriteError(error);
+    }
+  }
+
+  openSessionChannel(identity: SessionChannelIdentity, options: SessionChannelOpenOptions): Promise<SessionChannel> {
+    if (!this.#options.org) throw new Error("mesh.nats.org is required to open a Fabric session channel");
+    if (!this.#session) throw this.#unavailable();
+    return this.#sessionChannels.open({ ...identity, org: this.#options.org, hostId: this.self.hostId }, options);
   }
 
   async drainState(signal?: AbortSignal): Promise<{ pending: number; ackPending: number }> {
@@ -633,17 +995,36 @@ class NatsTransportImpl implements FabricTransport {
   close(): Promise<void> {
     if (this.#closed) return this.#closeTask ?? Promise.resolve();
     this.#closed = true;
+    this.#verifiedReconnectListeners.clear();
     this.#options.signal?.removeEventListener("abort", this.#onOwnerAbort);
     this.#closeController.abort(this.#options.signal?.reason);
+    this.#sessionChannels.close();
     this.#activeInbox?.controller.abort();
     this.#rejectWaiters(new TransportUnavailableError("NATS transport is closed"));
     const session = this.#session;
     this.#session = undefined;
     session?.unsubscribe?.();
     const reconnect = this.#reconnectTask;
+    const eventsClosed = this.#eventPublisher?.close();
     this.#closeTask = (async () => {
-      try { if (session) await session.connection.close(); }
-      finally { if (reconnect) await reconnect; }
+      // Join the bounded in-flight attempt before closing its connection. Unsent/uncertain rows
+      // remain durable for reload; close never republishes under a new local event id.
+      try {
+        await eventsClosed;
+        if (session) {
+          if (this.#options.ephemeralHost) {
+            let timer: ReturnType<typeof setTimeout> | undefined;
+            try {
+              await Promise.race([
+                session.manager.consumers.delete(this.#stream, transportDurableName(this.self.hostId)).then(() => undefined),
+                new Promise<void>((resolve) => { timer = setTimeout(resolve, EPHEMERAL_DELETE_TIMEOUT_MS); }),
+              ]);
+            } catch { /* best-effort cleanup must not block shutdown */ }
+            finally { if (timer) clearTimeout(timer); }
+          }
+          await session.connection.close();
+        }
+      } finally { if (reconnect) await reconnect; }
     })();
     return this.#closeTask;
   }

@@ -352,6 +352,7 @@ switch (behavior) {
           scope: process.env.PI_FABRIC_SCOPE ?? null,
           scopeFile: process.env.PI_FABRIC_SCOPE_FILE ?? null,
           extensionModel: process.env.PI_FABRIC_EXTENSION_MODEL ?? null,
+          actorSelf: process.env.PI_FABRIC_ACTOR_SELF ?? null,
           args: process.argv.slice(2),
         }),
       },

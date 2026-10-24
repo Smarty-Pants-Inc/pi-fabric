@@ -13,6 +13,7 @@ export type { FabricActorActivationFilter } from "./activation-filter.js";
 import type { FabricActorRecordsOptions, FabricActorRecordsView } from "./records.js";
 export type { FabricActorRecord, FabricActorRecordsOptions, FabricActorRecordsView } from "./records.js";
 import type { FabricScope } from "../protocol.js";
+import type { FabricActorActivationIdentity } from "./activation-identity.js";
 
 // Pi's extension event union is closed; every member we want the actor host
 // to observe must appear in FABRIC_ACTOR_PI_HOST_EVENTS below. `project_trust`
@@ -145,9 +146,13 @@ export type FabricActorBindingScope = "session" | "project";
 export type FabricActorStorageScope = "session" | "project";
 
 export interface FabricActorRunBinding {
-  model?: string;
-  modelReason?: string;
-  thinking?: FabricThinking;
+  /** Host-only provenance/notices; public binding extraction must not copy these. */
+  modelSource?: "explicit" | "default" | "inherited" | "route";
+  modelPolicyOriginalModel?: string | undefined;
+  model?: string | undefined;
+  modelReason?: string | undefined;
+  opusReason?: string | undefined;
+  thinking?: FabricThinking | undefined;
 }
 
 /** Raw per-call fields from the actor's own root; omitted fields stay owner-defaulted. */
@@ -251,6 +256,22 @@ export function normalizeDeadLetterReplayMaxAgeMs(value: unknown): number | unde
   return value;
 }
 
+const MAX_EVENTS_START_AT_MS = 8_640_000_000_000_000;
+const EXPLICIT_EVENTS_START_AT_ZONE = /(?:Z|[+-]\d{2}:\d{2})$/i;
+
+export const parseEventsStartAt = (value: unknown): number => {
+  const timestamp = typeof value === "string" ? value.trim() : undefined;
+  const at = typeof value === "number"
+    ? value
+    : timestamp !== undefined && EXPLICIT_EVENTS_START_AT_ZONE.test(timestamp)
+      ? Date.parse(timestamp)
+      : Number.NaN;
+  if (!Number.isSafeInteger(at) || at < 0 || at > MAX_EVENTS_START_AT_MS) {
+    throw new Error("eventsStartAt must be a nonnegative epoch millisecond or ISO timestamp");
+  }
+  return at;
+};
+
 /** Window batching retains each observation; 0 keeps single-event activation. */
 export interface FabricActorBatching {
   batchWindowMs?: number;
@@ -304,6 +325,8 @@ export interface FabricActorRequest extends FabricActorBatching {
   instructions: string;
   /** Asynchronous observations of session-bound Pi events plus synthetic tool_error. */
   events?: FabricActorHostEvent[];
+  /** NATS event replay floor (epoch milliseconds or an ISO timestamp), applied when the actor durable is created. */
+  eventsStartAt?: number | string;
   topics?: string[];
   /** Defaults to mailbox. steer/followUp require an explicit triggerTurn choice. */
   delivery?: FabricActorDelivery;
@@ -337,8 +360,13 @@ export interface FabricActorRequest extends FabricActorBatching {
   /** Host-only backend snapshot for persistent/resident sessions; not a provider argument. */
   pythonRuntime?: FabricPythonRuntime;
   model?: string;
+  /** Host-only selection provenance, not a public provider field. */
+  modelSource?: "explicit" | "default" | "inherited" | "route";
+  modelPolicyOriginalModel?: string;
   /** Named model exception (non-blank, ≤200 chars), retained on activation runs. */
   modelReason?: string;
+  /** Compatibility alias; modelReason wins when both are supplied. */
+  opusReason?: string;
   thinking?: FabricThinking;
   /** Opt-in per-activation shadow Choice; requires explicit model/effort pins. */
   routeClass?: "status-groom";
@@ -420,6 +448,7 @@ export interface FabricActorInfo extends FabricActorBatching {
   kernel?: FabricKernel;
   pythonRuntime?: FabricPythonRuntime;
   events: FabricActorHostEvent[];
+  eventsStartAt?: number;
   topics: string[];
   delivery: FabricActorDelivery;
   responseMode: FabricActorResponseMode;
@@ -493,6 +522,8 @@ export interface FabricActorInfo extends FabricActorBatching {
   createdAt: number;
   updatedAt: number;
   lastRunId?: string;
+  /** Source directories retained for retry because their actor-run archive has not succeeded. */
+  pendingRunArchives?: number;
   /** Accepted activation without a worker: bounded setup, or waiting for admission. */
   preparing?: {
     phase: string;
@@ -520,7 +551,15 @@ export type FabricActorReadInfo = Omit<FabricActorInfo, "status" | "queued" | "m
   status: FabricActorStatus | "unknown";
   queued?: number;
   messages?: number;
+  roleStamp?: string;
 };
+
+/** The activation worker's read-only identity fallback when its owner has no live status view. */
+export type FabricActorSelfReadInfo = Partial<FabricActorReadInfo> & Pick<FabricActorActivationIdentity,
+  "name" | "rootId" | "ownershipToken" | "instructionsDigest" | "roleStamp"> & {
+    id: string;
+    status: "unknown";
+  };
 
 export interface FabricActorLog {
   actorId: string;

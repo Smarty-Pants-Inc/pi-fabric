@@ -31,7 +31,7 @@ const runProperties = {
   },
   transport: {
     type: "string",
-    enum: ["auto", "process", "tmux", "screen", "localterm", "herdr"],
+    enum: ["auto", "process", "sandbox", "tmux", "screen", "localterm", "herdr"],
   },
   model: {
     type: "string",
@@ -43,7 +43,12 @@ const runProperties = {
   modelReason: {
     type: "string",
     maxLength: 200,
-    description: "Named exception for an explicit model selection, recorded on the run/actor and spawn event. Required and non-blank for agents.modelPolicy.requireReason (default gpt-6-astra on any provider); omit model to use the role default. See smarty-dev#3134.",
+    description: "Named exception for an explicit model selection, recorded on the run/actor and spawn event. Required and non-blank for agents.modelPolicy.requireReason (defaults: gpt-6-astra, opus, claude on any provider). Claude/Opus exceptions must name an issue (#N or an http(s) /issues/N URL); arbitrary reasons do not grant an exception. Omit model to use the role default. See smarty-dev#3134.",
+  },
+  opusReason: {
+    type: "string",
+    maxLength: 200,
+    description: "Compatibility alias for modelReason; modelReason wins when both are supplied. Claude/Opus exceptions must name an issue (#N or an http(s) /issues/N URL).",
   },
   persona: {
     type: "string",
@@ -78,7 +83,7 @@ const runProperties = {
   timeoutMs: {
     type: "number",
     description:
-      "Optional longer wall-clock limit in milliseconds. Omit to use agents.timeoutMs (60 minutes by default); values below the configured default are ignored.",
+      "Optional hard wall-clock limit in milliseconds for lane/audit timeboxes, capped at 86400000 (24 hours). One-shot tasks may shorten agents.timeoutMs only with values >=300000 (5 minutes); smaller shortenings are ignored with a typed timeoutNote to protect real work from tiny model-chosen budgets. Omit to keep agents.timeoutMs (24 hours by default). Persistent actor overrides only extend their default.",
   },
   extensions: { type: "boolean" },
   recursive: { type: "boolean" },
@@ -532,6 +537,13 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
           },
         },
         topics: { type: "array", items: { type: "string" } },
+        eventsStartAt: {
+          oneOf: [
+            { type: "integer", minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+            { type: "string", minLength: 1, pattern: "^\\d{4}-\\d{2}-\\d{2}T" },
+          ],
+          description: "Epoch milliseconds or an ISO-8601 timestamp for the first NATS durable; omitted replays all retained events.",
+        },
         delivery: {
           type: "string",
           enum: ["mailbox", "steer", "followUp", "nextTurn"],
@@ -562,6 +574,7 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
         kernel: runProperties.kernel,
         model: strictModelProperty,
         modelReason: runProperties.modelReason,
+        opusReason: runProperties.opusReason,
         thinking: runProperties.thinking,
         tools: runProperties.tools,
         transport: runProperties.transport,
@@ -791,6 +804,7 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
         id: { type: "string" },
         model: { type: "string" },
         modelReason: runProperties.modelReason,
+        opusReason: runProperties.opusReason,
         scope: actorBindingScopeSchema,
       },
       required: ["id"],

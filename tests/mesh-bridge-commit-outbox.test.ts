@@ -395,7 +395,7 @@ describe("R20 bridge write fence on SQLite (smarty-dev#6477 L2b owner review, P1
     await hub.put({ key: "probe/after", value: 1, identity: bridgeIdentity });
   });
 
-  it("a busy write lock refuses the fenced event before its stamp and the publish retries after it is free", async () => {
+  it("a busy write lock refuses before the event stamp; the same event publishes after it is free", async () => {
     const hub = store("sqlite");
     const peer = remote("iota", Date.now());
     const side = new StoreBridgeSide(hub, "ryzen2");
@@ -404,16 +404,14 @@ describe("R20 bridge write fence on SQLite (smarty-dev#6477 L2b owner review, P1
     const raw = await rawDatabase(hub.root);
     raw.exec("BEGIN IMMEDIATE");
     const checks = vi.spyOn(side, "holds");
-    let settled = false;
-    const publishing = side.publish(event("e3", peer.identity), [peer.identity.id]).finally(() => { settled = true; });
-    await new Promise((resolve) => setTimeout(resolve, 60));
-    expect(settled).toBe(false);
-    // Refused before the ownership check and the append, never published unfenced.
+    const retriedEvent = event("e3", peer.identity);
+    await expect(side.publish(retriedEvent, [peer.identity.id])).rejects.toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
+    // Refused before the ownership check and the append, never published unfenced or stamped.
     expect(checks).not.toHaveBeenCalled();
     expect(hub.latestSequence()).toBe(before);
     raw.exec("ROLLBACK");
     raw.close();
-    const published = await publishing;
+    const published = await side.publish(retriedEvent, [peer.identity.id]);
     expect(published.sequence).toBeGreaterThan(before);
     // The sender's id, with the identity the event carries (checked against its record, pi-fabric#876).
     expect(checks).toHaveBeenCalledWith(peer.identity.id, expect.objectContaining({ id: peer.identity.id, name: peer.identity.name, kind: peer.identity.kind }));

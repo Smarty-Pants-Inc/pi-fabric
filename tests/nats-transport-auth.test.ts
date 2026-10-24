@@ -2,11 +2,11 @@ import * as realFs from "node:fs";
 import path from "node:path";
 import { jetstream, jetstreamManager } from "@nats-io/jetstream";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { openNatsConnection } from "../src/transport/nats/connection.js";
+import { NatsAuthorizationError, openNatsConnection } from "../src/transport/nats/connection.js";
 import { runTransportAdmin } from "../src/transport/nats/admin.js";
 import { openNatsTransport } from "../src/transport/nats/inbox.js";
 import { openNatsKvForMachine } from "../src/transport/nats/kv.js";
-import { ensureTransportStream } from "../src/transport/nats/provision.js";
+import { ensureTransportStream, INBOX_DUPLICATE_WINDOW_MS } from "../src/transport/nats/provision.js";
 import { ADVISORY_CAPTURE_STREAM, transportAdvisoryStreamSubject, transportInboxStream, transportInboxStreamSubject } from "../src/transport/nats/subjects.js";
 import { createPathBHarness, PATH_B_POLICY_ENV, resolveNatsBinary, type PathBHarness, type PathBUser } from "./helpers/nats-cluster.js";
 
@@ -44,8 +44,8 @@ describe.skipIf(!binary)("authenticated Path B transport", () => {
       const bootstrap = await fixture.connect(fixture.users.bootstrap);
       const manager = await jetstreamManager(bootstrap);
       const js = jetstream(bootstrap);
-      const policy = { maxBytes: 1_073_741_824, maxAgeMs: 0, maxMessageBytes: 1_048_576, duplicateWindowMs: 600_000, replicas: 1 as const };
-      await ensureTransportStream(manager, { ...policy, name: ADVISORY_CAPTURE_STREAM, subjects: [transportAdvisoryStreamSubject], maxAgeMs: 30 * 86_400_000, maxMessageBytes: 65_536 });
+      const policy = { maxBytes: 1_073_741_824, maxAgeMs: 0, maxMessageBytes: 1_048_576, duplicateWindowMs: INBOX_DUPLICATE_WINDOW_MS, replicas: 1 as const };
+      await ensureTransportStream(manager, { ...policy, duplicateWindowMs: 10 * 60_000, name: ADVISORY_CAPTURE_STREAM, subjects: [transportAdvisoryStreamSubject], maxAgeMs: 30 * 86_400_000, maxMessageBytes: 65_536 });
       await openNatsKvForMachine(js, "leases", MACHINE_A, true);
       await openNatsKvForMachine(js, "presence", MACHINE_A, true);
       for (const machine of [MACHINE_A, MACHINE_B]) await ensureTransportStream(manager, { ...policy, name: transportInboxStream(machine), subjects: [transportInboxStreamSubject(machine)] });
@@ -76,7 +76,7 @@ describe.skipIf(!binary)("authenticated Path B transport", () => {
     }
   }, 30_000);
 
-  it("verifies USER.INFO against the signed user and exact own-source grant", async () => {
+  it("verifies USER.INFO against the signed user and required grants", async () => {
     const connection = await openNatsConnection(harness.runtimeOptions(harness.users.machineA));
     expect(connection.userInfo).toBeDefined();
     await connection.close();
@@ -95,6 +95,13 @@ describe.skipIf(!binary)("authenticated Path B transport", () => {
       const authenticated = await fixture.connect(fixture.users.maintainer);
       await authenticated.close();
       await expect(openNatsConnection(fixture.operatorOptions())).rejects.toThrow("machine tag mismatch");
+    } finally { await fixture.stop(); }
+  });
+
+  it("refuses a report-only operator with a response grant", async () => {
+    const fixture = await createPathBHarness({ binary: binary!, tls: {}, additionalOperatorResponses: { max: 16 } });
+    try {
+      await expect(openNatsConnection(fixture.operatorOptions())).rejects.toThrow(NatsAuthorizationError);
     } finally { await fixture.stop(); }
   });
 
@@ -123,32 +130,51 @@ describe.skipIf(!binary)("authenticated Path B transport", () => {
     });
   });
 
-  it("fails closed when any expected policy field is missing", async () => {
+  it("fails closed when expected policy fields are missing, while accepting extra machine grants", async () => {
     for (const field of ["custodyStream", "livenessStream", "pathBMachines"] as const) {
       const options: Record<string, unknown> = { ...harness.runtimeOptions(harness.users.machineA) };
       delete options[field];
       await expect(openNatsConnection(options as unknown as ConnectionOptions)).rejects.toThrow();
     }
-    await expect(openNatsConnection({ ...harness.runtimeOptions(harness.users.machineA), pathBMachines: [MACHINE_A] })).rejects.toThrow();
+    const narrowedInventory = await openNatsConnection({ ...harness.runtimeOptions(harness.users.machineA), pathBMachines: [MACHINE_A] });
+    await narrowedInventory.close();
     await expect(openNatsConnection({ ...harness.runtimeOptions(harness.users.machineA), custodyStream: "OTHER_CUSTODY" })).rejects.toThrow();
   });
 
-  it.each([">", "fabric.>", "fabric.in.*.*.*.*.machine-b", "$JS.API.STREAM.NAMES", "fabric.in.*.*.*.*.machine-a.>"])("refuses a server-expanded extra publish grant: %s", async (grant) => {
+  it.each([">", "fabric.>", "fabric.in.*.*.*.*.machine-b", "$JS.API.STREAM.NAMES", "fabric.in.*.*.*.*.machine-a.>"])("accepts a server-expanded extra publish grant: %s", async (grant) => {
     const fixture = await createPathBHarness({ binary: binary!, tls: {}, additionalAgentPublish: [grant] });
     try {
-      await expect(openNatsConnection(fixture.runtimeOptions(fixture.users.machineA))).rejects.toThrow();
+      const connection = await openNatsConnection(fixture.runtimeOptions(fixture.users.machineA));
+      try {
+        expect(connection.userInfo).toMatchObject({
+          data: { permissions: { publish: { allow: expect.arrayContaining([grant]) } } },
+        });
+      } finally { await connection.close(); }
     } finally {
       await fixture.stop();
     }
   });
 
-  it.each([">", "fabric.>", "_INBOX.>"])("refuses an extra subscribe grant: %s", async (grant) => {
+  it.each([">", "fabric.>", "_INBOX.>"])("accepts an extra subscribe grant: %s", async (grant) => {
     const fixture = await createPathBHarness({ binary: binary!, tls: {}, additionalAgentSubscribe: [grant] });
     try {
-      await expect(openNatsConnection(fixture.runtimeOptions(fixture.users.machineA))).rejects.toThrow();
+      const connection = await openNatsConnection(fixture.runtimeOptions(fixture.users.machineA));
+      try {
+        expect(connection.userInfo).toMatchObject({
+          data: { permissions: { subscribe: { allow: expect.arrayContaining([grant]) } } },
+        });
+      } finally { await connection.close(); }
     } finally {
       await fixture.stop();
     }
+  });
+
+  it("refuses an agent when an expected publish allow is missing", async () => {
+    const expected = "$JS.FC.KV_fabric_presence.>";
+    const fixture = await createPathBHarness({ binary: binary!, tls: {}, removeAgentPublish: [expected] });
+    try {
+      await expect(openNatsConnection(fixture.runtimeOptions(fixture.users.machineA))).rejects.toThrow(NatsAuthorizationError);
+    } finally { await fixture.stop(); }
   });
 
   it.each(["$JS.API.DIRECT.GET.>", "$JS.API.STREAM.DELETE.>", "$JS.API.STREAM.CREATE.FABRIC_CUSTODY"])("refuses a removed publish deny: %s", async (subject) => {
@@ -306,8 +332,8 @@ describe.skipIf(!binary)("authenticated Path B transport over verified TLS", () 
     try {
       const manager = await jetstreamManager(bootstrap);
       const js = jetstream(bootstrap);
-      const policy = { maxBytes: 1_073_741_824, maxAgeMs: 0, maxMessageBytes: 1_048_576, duplicateWindowMs: 600_000, replicas: 1 as const };
-      await ensureTransportStream(manager, { ...policy, name: ADVISORY_CAPTURE_STREAM, subjects: [transportAdvisoryStreamSubject], maxAgeMs: 30 * 86_400_000, maxMessageBytes: 65_536 });
+      const policy = { maxBytes: 1_073_741_824, maxAgeMs: 0, maxMessageBytes: 1_048_576, duplicateWindowMs: INBOX_DUPLICATE_WINDOW_MS, replicas: 1 as const };
+      await ensureTransportStream(manager, { ...policy, duplicateWindowMs: 10 * 60_000, name: ADVISORY_CAPTURE_STREAM, subjects: [transportAdvisoryStreamSubject], maxAgeMs: 30 * 86_400_000, maxMessageBytes: 65_536 });
       await openNatsKvForMachine(js, "leases", MACHINE_A, true);
       await openNatsKvForMachine(js, "presence", MACHINE_A, true);
       for (const machine of [MACHINE_A, MACHINE_B]) await ensureTransportStream(manager, { ...policy, name: transportInboxStream(machine), subjects: [transportInboxStreamSubject(machine)] });

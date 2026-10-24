@@ -2,6 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
@@ -50,6 +51,11 @@ type Presence = { status?: string; activationBlocked?: Block; activationBlockExp
 const fixture = (cooldownMs = COOLDOWN_MS) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-6509-e2e-"));
   roots.push(root);
+  // Simulated upstream provider state belongs to this disposable fixture, not any
+  // activation's private scratch. Do not add it to the actor's writable roots.
+  const providerStateDir = path.join(root, "fake-provider-state");
+  fs.mkdirSync(providerStateDir, { mode: 0o700 });
+  vi.stubEnv("FAKE_PI_RPC_STATE_DIR", providerStateDir);
   const piBinary = path.resolve("tests/fixtures/fake-pi-rpc.mjs");
   fs.chmodSync(piBinary, 0o755);
   const meshRoot = path.join(root, "mesh");
@@ -69,16 +75,13 @@ const fixture = (cooldownMs = COOLDOWN_MS) => {
   const router = new MeshStore(meshRoot, 65_536, 100);
   const from: MeshIdentity = { id: "session:router", name: "router", kind: "main", sessionId: "router" };
   const token = randomUUID().replace(/-/g, "");
-  closers.push(async () => {
-    for (const marker of ["TRANSIENT_FAILS", "AUTH_FAILS"]) fs.rmSync(path.join(os.tmpdir(), `fake-pi-rpc-${marker}-${token}`), { force: true });
-  });
   const start = async (onIdle?: ConstructorParameters<typeof ResidentHost>[1]) => {
     const host = new ResidentHost(config, onIdle);
     closers.push(() => host.close());
     await host.start();
     return host;
   };
-  return { config, router, token, start,
+  return { config, router, token, start, providerStateDir,
     presence: (id: string): Presence => router.get(`actors/${config.sessionId}/${id}`)?.value as Presence,
     // Factory review routing: skip an actor whose published record is blocked or not live.
     routable: (id: string): boolean => {
@@ -101,6 +104,50 @@ const settled = (host: ResidentHost, id: string) => {
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 describe("transient activation block on a resident host, end to end (smarty-dev#6509)", () => {
+  // Keep reason: recorded fixture regression when each activation gained private TMPDIR.
+  it("fake provider counters survive distinct activation TMPDIRs only with explicit upstream state", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-6509-provider-state-"));
+    roots.push(root);
+    const stateDir = path.join(root, "provider");
+    fs.mkdirSync(stateDir, { mode: 0o700 });
+    if (process.platform !== "win32") expect(fs.statSync(stateDir).mode & 0o777).toBe(0o700);
+    for (const marker of ["TRANSIENT_FAILS", "AUTH_FAILS"]) {
+      const token = randomUUID().replace(/-/g, "");
+      const counter = `fake-pi-rpc-${marker}-${token}`;
+      const scratches = Array.from({ length: 3 }, () => fs.mkdtempSync(path.join(root, "activation-")));
+      expect(new Set(scratches).size).toBe(3);
+      const activate = (scratch: string, state: string | undefined) => {
+        const env: NodeJS.ProcessEnv = { ...process.env, TMPDIR: scratch, TMP: scratch, TEMP: scratch };
+        // Delete rather than pass an empty value: absence must exercise os.tmpdir().
+        delete env.FAKE_PI_RPC_STATE_DIR;
+        if (state !== undefined) env.FAKE_PI_RPC_STATE_DIR = state;
+        const child = spawnSync(process.execPath, [path.resolve("tests/fixtures/fake-pi-rpc.mjs")], {
+          env, input: `${JSON.stringify({ type: "prompt", message: `${marker}=2#${token}` })}\n`,
+          encoding: "utf8", timeout: 5_000,
+        });
+        expect(child.error).toBeUndefined();
+        expect(child.signal).toBeNull();
+        expect(child.status, child.stderr).toBe(0);
+        const frames = child.stdout.trim().split("\n").map(line => JSON.parse(line));
+        const message = frames.find(frame => frame.type === "message_end")?.message;
+        expect(message).toBeDefined();
+        if (message.stopReason === "error") {
+          expect(message.errorMessage).toBe(marker === "AUTH_FAILS" ? "401 Unauthorized: invalid x-api-key" : "fetch failed");
+        }
+        return message.stopReason;
+      };
+      expect(scratches.map(scratch => activate(scratch, stateDir))).toEqual(["error", "error", "stop"]);
+      expect(fs.readFileSync(path.join(stateDir, counter), "utf8")).toBe("2");
+      for (const scratch of scratches) expect(fs.existsSync(path.join(scratch, counter))).toBe(false);
+      // No explicit state: every fresh activation starts at its own first failure.
+      expect(scratches.map(scratch => activate(scratch, undefined))).toEqual(["error", "error", "error"]);
+      for (const scratch of scratches) expect(fs.readFileSync(path.join(scratch, counter), "utf8")).toBe("1");
+      expect(activate(scratches[0]!, undefined)).toBe("error");
+      expect(activate(scratches[0]!, undefined)).toBe("stop");
+      expect(fs.readFileSync(path.join(stateDir, counter), "utf8")).toBe("2");
+    }
+  }, 30_000);
+
   // Keep reason: resident/router trust boundary and the recorded #10049/#9890 deaf actor incident.
   it("10049 a resident mailbox directive actor refuses an oversized item through the actual hook and routes NEXT_REVIEW without manual reset", async () => {
     const s = fixture();
@@ -286,7 +333,18 @@ await import(${JSON.stringify(new URL("./fixtures/fake-pi-overflow.mjs", import.
       backoffMs: COOLDOWN_MS, expiredAt: blocked.retryAt });
 
     // The router routes the next request: the probe runs on the real worker, succeeds, and clears the block.
-    const failedRun = host.actors.status(actor.id).lastRunId;
+    const failedRun = host.actors.status(actor.id).lastRunId!;
+    const actorScratch = (runId: string): string => {
+      const runRoot = path.join(path.dirname(actor.sessionFile!), "runs", runId);
+      const frames = fs.readFileSync(path.join(runRoot, "events.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+      const policy = frames.find(frame => frame.type === "write_policy.actor")?.policy;
+      // smarty-dev#15878: a short private TMPDIR when one fits the host's temp path, else the run's own tmp.
+      const recorded = (JSON.parse(fs.readFileSync(path.join(runRoot, "status.json"), "utf8")) as { temporaryDirectory?: string }).temporaryDirectory;
+      expect(policy?.writableRoots).toEqual([recorded ?? path.join(s.config.residencyRoot, "runs", runId, "tmp")]);
+      expect(policy.writableRoots).not.toContain(s.providerStateDir);
+      return policy.writableRoots[0];
+    };
+    const failedScratch = actorScratch(failedRun);
     await s.route(`review 2 TRANSIENT_FAILS=1#${s.token}`);
     await waitFor(() => host.actors.status(actor.id).lastRunId !== failedRun && settled(host, actor.id) &&
       host.actors.status(actor.id).activationBlockExpired === undefined, "the probe to complete");
@@ -294,6 +352,8 @@ await import(${JSON.stringify(new URL("./fixtures/fake-pi-overflow.mjs", import.
     const out = host.actors.messages(actor.id).filter((message) => message.direction === "out");
     expect(out.at(-1)).not.toHaveProperty("error");
     expect(out.at(-1)?.text).toContain("validated actor response");
+    expect(actorScratch(host.actors.status(actor.id).lastRunId!)).not.toBe(failedScratch);
+    expect(fs.readFileSync(path.join(s.providerStateDir, `fake-pi-rpc-TRANSIENT_FAILS-${s.token}`), "utf8")).toBe("1");
     await waitFor(() => s.presence(actor.id) !== undefined && s.presence(actor.id)!.activationBlockExpired === undefined, "the clear to be published");
     expect(s.presence(actor.id)).not.toHaveProperty("activationBlocked");
     expect(s.routable(actor.id)).toBe(true);

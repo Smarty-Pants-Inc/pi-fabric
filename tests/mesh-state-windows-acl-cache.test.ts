@@ -49,10 +49,14 @@ const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
 // afterEach unstubs it. The value is read by the gate at each call, so the same module instance can switch.
 const ENFORCE = "PI_FABRIC_MESH_STATE_ACL_ENFORCE";
 const ADVISORY = "FABRIC_MESH_STATE_ACL_ADVISORY";
+const UNVERIFIED = "FABRIC_MESH_STATE_ACL_UNVERIFIED";
 const enforceAcl = () => vi.stubEnv(ENFORCE, "1");
+// P2-B: either ACL code reaching process.emitWarning or the GLOBAL console.warn/error is a channel violation in every row.
+const channelViolations: string[] = [];
 
-beforeEach(() => vi.resetModules());
+beforeEach(() => { vi.resetModules(); channelViolations.length = 0; });
 afterEach(() => {
+  expect(channelViolations).toEqual([]);
   vi.restoreAllMocks();
   vi.unstubAllEnvs();
   Object.defineProperty(process, "platform", platform);
@@ -90,23 +94,26 @@ const fixture = async (owner = USER, withGate = false) => {
   }
   Object.defineProperty(process, "platform", { ...platform, value: "win32" });
   vi.stubEnv("SystemRoot", "C:\\Windows");
-  // The reader's own UNVERIFIED notice still uses emitWarning; the gate's advisory uses console/stderr (Pi's setupCli
-  // silences emitWarning). Advisory lines are captured and swallowed; everything else calls through.
-  const warning = vi.spyOn(process, "emitWarning").mockImplementation(() => undefined);
+  // Both codes travel on the modules' dedicated stderr route (Pi's setupCli silences emitWarning; app console spies
+  // must not see them). `warning` records each reader UNVERIFIED stderr line, advisory lines are kept apart; both are
+  // swallowed. Any ACL code at emitWarning or the global console is a channel violation; everything else calls through.
+  const warning = vi.fn((_line: string): void => undefined);
+  vi.spyOn(process, "emitWarning").mockImplementation(((...args: unknown[]) => {
+    if (JSON.stringify(args.map(String)).includes("FABRIC_MESH_STATE_ACL_")) channelViolations.push(`emitWarning ${String(args[0])}`);
+  }) as typeof process.emitWarning);
   const advisoryLines: string[] = [];
-  let viaConsole = false;
   const write = process.stderr.write.bind(process.stderr) as (...args: unknown[]) => boolean;
   vi.spyOn(process.stderr, "write").mockImplementation(((chunk: unknown, ...rest: unknown[]) => {
-    if (String(chunk).includes(ADVISORY)) { if (!viaConsole) advisoryLines.push(String(chunk)); return true; }
+    if (String(chunk).includes(ADVISORY)) { advisoryLines.push(String(chunk)); return true; }
+    if (String(chunk).includes(UNVERIFIED)) { warning(String(chunk)); return true; }
     return write(chunk, ...rest);
   }) as typeof process.stderr.write);
   for (const level of ["warn", "error"] as const) {
     const original = console[level].bind(console);
     vi.spyOn(console, level).mockImplementation((...args: unknown[]) => {
       const text = args.map(String).join(" ");
-      if (text.includes(ADVISORY)) { advisoryLines.push(text); return; }
-      viaConsole = true;
-      try { original(...args); } finally { viaConsole = false; }
+      if (text.includes(ADVISORY) || text.includes(UNVERIFIED)) { channelViolations.push(`console.${level} ${text}`); return; }
+      original(...args);
     });
   }
   const stats = new Map<string, fs.BigIntStats>();
@@ -311,22 +318,31 @@ describe("Windows mesh ACL identity cache — Decision C MOCKED unit contract", 
   it.each(["ENOENT", "ETIMEDOUT", "nonzero"])("CACHE-10 warned fail-open %s never becomes a cached proof", async kind => {
     const f = await fixture();
     f.state.failure = Object.assign(new Error(`mocked native ${kind}`), kind === "nonzero" ? { status: 1 } : { code: kind });
-    expect(f.judge()).toBeUndefined();
-    expect(f.judge()).toBeUndefined();
+    // The pure reader keeps no tooling-failure memory: every call re-runs the child and reports the accepted gap.
+    const onUnverified = vi.fn();
+    expect(f.judge({ ...request(), onUnverified })).toBeUndefined();
+    expect(f.judge({ ...request(), onUnverified })).toBeUndefined();
     expect(f.native).toHaveBeenCalledTimes(2);
-    expect(f.warning).toHaveBeenCalledTimes(1);
+    expect(onUnverified).toHaveBeenCalledTimes(2);
+    expect(f.warning).toHaveBeenCalledTimes(1); // one visible stderr notice per root, with its literal code
+    expect(f.warning.mock.calls[0]![0]).toContain(`${UNVERIFIED}: `);
+    expect(f.warning.mock.calls[0]![0]).toContain(`mocked native ${kind}`);
+    expect(f.warning.mock.calls[0]![0]).toContain(ROOT);
     f.state.failure = undefined;
     f.unsafe(ROOT);
-    expect(f.judge()).toContain(`grants ${OTHER}`);
+    expect(f.judge({ ...request(), onUnverified })).toContain(`grants ${OTHER}`);
     expect(f.native).toHaveBeenCalledTimes(3);
+    expect(onUnverified).toHaveBeenCalledTimes(2); // a real proof, refusing or not, is never reported as a tooling gap
   });
 
   it.each(["ENOBUFS", "ERR_CHILD_PROCESS_STDIO_MAXBUFFER"])("CACHE-11 overflow %s never caches incomplete proof", async code => {
     const f = await fixture();
     f.state.failure = Object.assign(new Error("mocked overflow"), { code });
-    expect(f.judge()).toMatch(/incomplete Windows ACL snapshot/);
-    expect(f.judge()).toMatch(/incomplete Windows ACL snapshot/);
+    const onUnverified = vi.fn();
+    expect(f.judge({ ...request(), onUnverified })).toMatch(/incomplete Windows ACL snapshot/);
+    expect(f.judge({ ...request(), onUnverified })).toMatch(/incomplete Windows ACL snapshot/);
     expect(f.native).toHaveBeenCalledTimes(2);
+    expect(onUnverified).not.toHaveBeenCalled(); // incomplete evidence is a refusal, not the accepted tooling gap
     expect(f.warning).not.toHaveBeenCalled();
     f.state.failure = undefined;
     f.unsafe(ROOT);
@@ -941,4 +957,90 @@ describe("Windows mesh ACL identity cache — Decision C MOCKED unit contract", 
       expect(openOutcome(f, sqliteOpen)).toMatchObject({ code: "FABRIC_MESH_STATE_UNSUPPORTED" });
       expect(f.native).toHaveBeenCalledTimes(2);
     });
+
+  // P2-A: REAL gate -> REAL default reader whose child cannot run. Default: one attempt, one visible UNVERIFIED stderr
+  // line, then the remembered gap skips repeat reads. Exact ENFORCE=1 re-runs the child on EVERY call (also after the
+  // advisory fallback) and keeps the original fail-open; the gap never becomes a verified admission, so a repaired
+  // tool's first enforced proof is real evidence and refuses an unsafe ACE. No protect request (no ACL mutation).
+  it.each(["ENOENT", "ETIMEDOUT", "nonzero"])(
+    "ADVISORY-06 tooling gap %s: default reads once and remembers; ENFORCE=1 re-reads every call and fails open", async kind => {
+      const f = await fixture(USER, true);
+      f.state.failure = Object.assign(new Error(`mocked native ${kind}`), kind === "nonzero" ? { status: 1 } : { code: kind });
+      const sqliteOpen = vi.fn(() => ({ close: vi.fn() }) as never);
+      unsetEnforce();
+      expect(openOutcome(f, sqliteOpen)).toBeUndefined();
+      expect(f.native).toHaveBeenCalledTimes(1); // a single attempt, not one per gate step
+      for (const value of [undefined, "0", "true"]) {
+        vi.stubEnv(ENFORCE, value);
+        expect(openOutcome(f, sqliteOpen), String(value)).toBeUndefined();
+      }
+      expect(f.native).toHaveBeenCalledTimes(1); // remembered: no repeat child for this root
+      expect(f.warning).toHaveBeenCalledTimes(1);
+      expect(f.warning.mock.calls[0]![0]).toContain(`${UNVERIFIED}: `);
+      expect(f.warning.mock.calls[0]![0]).toContain(ROOT);
+      expect(f.advisories()).toEqual([]); // a tooling gap is not an ACL finding
+
+      enforceAcl();
+      for (let call = 1; call <= 3; call += 1) {
+        const before = f.native.mock.calls.length;
+        expect(openOutcome(f, sqliteOpen), `enforced ${call}`).toBeUndefined(); // original fail-open retained
+        expect(f.native.mock.calls.length - before, `enforced ${call}`).toBeGreaterThanOrEqual(1);
+      }
+      expect(sqliteOpen).toHaveBeenCalledTimes(7);
+      const enforcedReads = f.native.mock.calls.length;
+      unsetEnforce(); // rollback stays permissive and still remembered
+      expect(openOutcome(f, sqliteOpen)).toBeUndefined();
+      expect(f.native).toHaveBeenCalledTimes(enforcedReads);
+      expect(f.warning).toHaveBeenCalledTimes(1); // deduped per root across every mode
+      for (const call of f.native.mock.calls) {
+        expect(JSON.parse((call[2] as { env: NodeJS.ProcessEnv }).env.PI_FABRIC_STATE_ACL!).protect).toBeNull();
+      }
+
+      // Never a verified admission: the repaired tool's first enforced read is real evidence and refuses.
+      f.state.failure = undefined;
+      f.unsafe(ROOT);
+      enforceAcl();
+      expect(openOutcome(f, sqliteOpen)).toMatchObject({ code: "FABRIC_MESH_STATE_UNSUPPORTED",
+        message: expect.stringContaining(`grants ${OTHER}`) });
+      expect(f.native).toHaveBeenCalledTimes(enforcedReads + 1);
+      expect(sqliteOpen).toHaveBeenCalledTimes(8);
+    });
+
+  // Counterexamples: an incomplete or malformed snapshot is evidence of a FINDING, never the accepted tooling gap. Default
+  // warns once with the ADVISORY code (no UNVERIFIED line); ENFORCE=1 refuses before the opener on every call.
+  it.each(["ENOBUFS", "ERR_CHILD_PROCESS_STDIO_MAXBUFFER", "malformed"] as const)(
+    "ADVISORY-07 %s is an advisory finding by default and an enforced refusal, never an UNVERIFIED gap", async kind => {
+      const f = await fixture(USER, true);
+      if (kind === "malformed") f.state.output = () => "not JSON";
+      else f.state.failure = Object.assign(new Error("mocked overflow"), { code: kind });
+      const sqliteOpen = vi.fn(() => ({ close: vi.fn() }) as never);
+      unsetEnforce();
+      expect(openOutcome(f, sqliteOpen)).toBeUndefined();
+      expect(f.advisories()).toEqual([expect.stringMatching(kind === "malformed" ? /unreadable Windows ACL snapshot/ : /incomplete Windows ACL snapshot/)]);
+      enforceAcl();
+      for (let call = 0; call < 2; call += 1) {
+        expect(openOutcome(f, sqliteOpen)).toMatchObject({ code: "FABRIC_MESH_STATE_UNSUPPORTED" });
+      }
+      expect(sqliteOpen).toHaveBeenCalledTimes(1);
+      expect(f.native).toHaveBeenCalledTimes(3);
+      expect(f.warning).not.toHaveBeenCalled();
+      expect(f.advisories()).toHaveLength(1);
+    });
+
+  it("ADVISORY-08 a verified safe proof prints nothing and keeps its identity-cache admission in both modes", async () => {
+    const f = await fixture(USER, true);
+    const sqliteOpen = vi.fn(() => ({ close: vi.fn() }) as never);
+    unsetEnforce();
+    expect(openOutcome(f, sqliteOpen)).toBeUndefined();
+    const first = f.native.mock.calls.length;
+    expect(first).toBeGreaterThanOrEqual(1);
+    enforceAcl();
+    expect(openOutcome(f, sqliteOpen)).toBeUndefined();
+    unsetEnforce();
+    expect(openOutcome(f, sqliteOpen)).toBeUndefined();
+    expect(f.native).toHaveBeenCalledTimes(first); // the reader's verified cache, not the gate's advisory memory
+    expect(sqliteOpen).toHaveBeenCalledTimes(3);
+    expect(f.warning).not.toHaveBeenCalled();
+    expect(f.advisories()).toEqual([]);
+  });
 });

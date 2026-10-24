@@ -6,6 +6,7 @@
  * Windows ACL findings are advisory unless PI_FABRIC_MESH_STATE_ACL_ENFORCE is exactly "1" at call time;
  * filesystem, file-type, inode and POSIX checks remain mandatory.
  */
+import { Console } from "node:console";
 import fs from "node:fs";
 import path from "node:path";
 import type { SqliteConnection, SqliteOpener } from "./state-sqlite.js";
@@ -372,12 +373,14 @@ const stateTargets = (root: string, db: string) => {
 // verified successful root-role proofs for stable root+DB identities (volume and lossless file IDs, never ctime).
 // Missing/unknown DB identity and unverified tooling fallbacks never cache there; enforced standalone target,
 // creation-parent and protect requests stay fresh. Enforcement gives a missing DB full pre/post-create snapshots.
-// The gate separately memoizes advisory findings, not admissions. Only enforcement creates N missing directories
-// with N creation-parent preflights plus protect/readback; those cannot satisfy the open's plan.
+// The gate separately memoizes advisory findings and accepted tooling gaps, not admissions. Only enforcement
+// creates N missing directories with N creation-parent preflights plus protect/readback; those cannot satisfy the open's plan.
 type AclTargets = { role?: "root" | "directory" | "file" | "ancestor" | "creation-parent"; files: string[]; directories: string[]; requireDatabase?: boolean };
 // Read on every call: removing the setting restores advisory startup without changing any ACL.
 const windowsAclEnforced = (): boolean => process.env.PI_FABRIC_MESH_STATE_ACL_ENFORCE === "1";
-// Never evict: a busy root must not start warning again on each poll after other roots fill the bound.
+// Private stderr channel: Pi may suppress emitWarning, and application console spies must not see ACL diagnostics.
+const aclDiagnostics = new Console({ stdout: process.stderr, stderr: process.stderr });
+// Advisory findings and tooling gaps only, never proof. Do not evict and restart warnings on each busy-root poll.
 const warnedWindowsAclRoots = new Set<string>();
 const MAX_WINDOWS_ACL_WARNINGS = 64;
 const windowsAclFinding = (root: string, why: string, cause?: unknown): void => {
@@ -388,19 +391,23 @@ const windowsAclFinding = (root: string, why: string, cause?: unknown): void => 
   const key = path.resolve(root).toLowerCase();
   if (warnedWindowsAclRoots.has(key) || warnedWindowsAclRoots.size >= MAX_WINDOWS_ACL_WARNINGS) return;
   warnedWindowsAclRoots.add(key);
-  console.warn(`[pi-fabric] FABRIC_MESH_STATE_ACL_ADVISORY: Fabric mesh SQLite state Windows ACL privacy finding for ${root}: ${why}. `
+  aclDiagnostics.warn(`[pi-fabric] FABRIC_MESH_STATE_ACL_ADVISORY: Fabric mesh SQLite state Windows ACL privacy finding for ${root}: ${why}. `
     + "Continuing with advisory ACL checks. Set PI_FABRIC_MESH_STATE_ACL_ENFORCE=1 to enforce refusal; "
     + "remove/unset PI_FABRIC_MESH_STATE_ACL_ENFORCE to restore warning-only startup (no ACL changes needed).");
 };
 const assertWindowsAcl = (root: string, targets: AclTargets, protect: boolean): void => {
-  // This advisory cache is not a trust or security proof: skip only repeat ACL reads after a finding.
+  // This advisory cache is not a trust or security proof: skip repeat ACL reads after a finding or tooling gap.
   // Exact opt-in always consults the original reader, including its verified successful identity cache.
-  if (!windowsAclEnforced() && warnedWindowsAclRoots.has(path.resolve(root).toLowerCase())) return;
+  const key = path.resolve(root).toLowerCase();
+  if (!windowsAclEnforced() && warnedWindowsAclRoots.has(key)) return;
   let real: string;
   // The real chain is the parent's: the target itself is never followed; its reparse finding uses the same policy.
   try { real = path.join(fs.realpathSync.native(path.dirname(path.resolve(root))), path.basename(path.resolve(root))); }
   catch (error) { windowsAclFinding(root, "its real path is unreadable", error); return; }
-  const why = windowsStateAclRefusal({ root, real, protect, ...targets });
+  const why = windowsStateAclRefusal({ root, real, protect, ...targets, onUnverified: () => {
+    // Keep failures out of the reader's successful identity cache and out of enforced calls' memory.
+    if (!windowsAclEnforced() && warnedWindowsAclRoots.size < MAX_WINDOWS_ACL_WARNINGS) warnedWindowsAclRoots.add(key);
+  } });
   if (why) windowsAclFinding(root, why);
 };
 

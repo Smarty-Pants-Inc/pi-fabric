@@ -114,6 +114,116 @@ process.stderr.write("STEP end\n");
 process.stdout.write(JSON.stringify(report) + "\n");
 `;
 
+// P2-A: the same real setupCli()-first host, but the reader's child cannot run (missing, timeout, nonzero exit), one
+// fresh root per kind. Every recorded execFileSync is a real reader attempt; global console calls carrying either
+// ACL code are counted as channel violations (the modules must use their own stderr route).
+const PI_HOST_UNVERIFIED = String.raw`
+import childProcess from "node:child_process";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+import { createJiti } from "jiti";
+const [base] = process.argv.slice(1);
+const ENFORCE = "PI_FABRIC_MESH_STATE_ACL_ENFORCE";
+const setup = await import(pathToFileURL(path.resolve("node_modules/@earendil-works/pi-coding-agent/dist/cli/setup.js")).href);
+const emitWarning = process.emitWarning;
+setup.setupCli();
+const report = { emitWarningSilenced: process.emitWarning !== emitWarning, roots: {}, reads: {}, outcomes: {}, protects: [], consoleCalls: [] };
+for (const level of ["warn", "error"]) {
+  const original = console[level].bind(console);
+  console[level] = (...args) => {
+    const text = args.map(String).join(" ");
+    if (text.includes("FABRIC_MESH_STATE_ACL_")) report.consoleCalls.push(level + " " + text);
+    original(...args);
+  };
+}
+Object.defineProperty(process, "platform", { ...Object.getOwnPropertyDescriptor(process, "platform"), value: "win32" });
+if (!process.env.SystemRoot) process.env.SystemRoot = "C:\\Windows";
+const failures = {
+  missing: ["spawn powershell.exe ENOENT", { code: "ENOENT" }],
+  timeout: ["spawnSync powershell.exe ETIMEDOUT", { code: "ETIMEDOUT", status: null, signal: "SIGTERM" }],
+  nonzero: ["Command failed: powershell.exe exited 1", { status: 1 }],
+};
+let failure = "missing";
+let reads = 0;
+childProcess.execFileSync = (_file, _args, options) => {
+  const wire = JSON.parse(options.env.PI_FABRIC_STATE_ACL);
+  reads += 1;
+  if (wire.protect) report.protects.push(wire.protect);
+  const [message, fields] = failures[failure];
+  throw Object.assign(new Error(message), fields);
+};
+const jiti = createJiti(pathToFileURL(process.cwd() + "/index.js").href);
+const sqlite = await jiti.import("./src/mesh/state-sqlite.ts");
+const { assertFileStateWritable } = await jiti.import("./src/mesh/backend-fence.ts");
+const { createStateBackend } = await jiti.import("./src/mesh/state-backend.ts");
+const step = async (name, enforce, run) => {
+  process.stderr.write("STEP " + name + "\n");
+  if (enforce === undefined) delete process.env[ENFORCE]; else process.env[ENFORCE] = enforce;
+  const before = reads;
+  try { await run(); report.outcomes[name] = { ok: true }; }
+  catch (error) { report.outcomes[name] = { ok: false, code: error?.code, message: String(error?.message ?? error) }; }
+  report.reads[name] = reads - before;
+};
+const lifecycle = root => {
+  createStateBackend({ root, maxEventBytes: 1024, maxReadEvents: 16, lock: {} }, { stateBackend: "file" }).close();
+  createStateBackend({ root, maxEventBytes: 1024, maxReadEvents: 16, lock: {} }, { stateBackend: "sqlite" }).close();
+  for (let commit = 0; commit < 3; commit += 1) {
+    // The file-mode fence passes the gate, then refuses on backend=sqlite (authority, not ACL).
+    try { assertFileStateWritable(root); throw new Error("file fence unexpectedly admitted a sqlite root"); }
+    catch (error) { if (!/backend=sqlite/.test(String(error?.message))) throw error; }
+  }
+  for (let raise = 0; raise < 3; raise += 1) sqlite.lowerCheckpointFlag(sqlite.raiseCheckpointFlag(root, sqlite.ownerToken()));
+};
+const open = async root => (await sqlite.SqliteStateStore.open(root, 65_536, 1_000, { initialize: "create" })).close();
+const openSync = root => sqlite.SqliteStateStore.openSync(root, 65_536, 1_000, { initialize: "create" }).close();
+for (const kind of Object.keys(failures)) {
+  failure = kind;
+  const root = path.join(base, kind, "mesh");
+  report.roots[kind] = root;
+  await step(kind + ":default-open", undefined, () => open(root));
+  await step(kind + ":default-openSync", undefined, () => openSync(root));
+  await step(kind + ":default-lifecycle", undefined, () => lifecycle(root));
+  await step(kind + ":enforced-openSync", "1", () => openSync(root));
+  await step(kind + ":enforced-open", "1", () => open(root));
+  await step(kind + ":enforced-lifecycle", "1", () => lifecycle(root));
+  await step(kind + ":rollback-open", undefined, () => open(root));
+  await step(kind + ":zero-lifecycle", "0", () => lifecycle(root));
+}
+process.stderr.write("STEP end\n");
+process.stdout.write(JSON.stringify(report) + "\n");
+`;
+
+const UNVERIFIED = "FABRIC_MESH_STATE_ACL_UNVERIFIED";
+// P2-A/P2-B: both ACL codes travel on the modules' dedicated stderr route, never process.emitWarning (Pi's setupCli
+// silences it) nor the GLOBAL console.warn/error (an application's exact-count spies must not see them). Coded stderr
+// lines are captured and swallowed; anything else calls through. Violations are recorded, not swallowed silently.
+const captureDiagnostics = () => {
+  const lines: string[] = [];
+  const violations: string[] = [];
+  const coded = (args: unknown[]) => args.map(arg => (typeof arg === "string" ? arg : JSON.stringify(arg) ?? String(arg)))
+    .join(" ").includes("FABRIC_MESH_STATE_ACL_");
+  const write = process.stderr.write.bind(process.stderr) as (...args: unknown[]) => boolean;
+  vi.spyOn(process.stderr, "write").mockImplementation(((chunk: unknown, ...rest: unknown[]) => {
+    if (coded([String(chunk)])) { lines.push(String(chunk)); return true; }
+    return write(chunk, ...rest);
+  }) as typeof process.stderr.write);
+  vi.spyOn(process, "emitWarning").mockImplementation(((...args: unknown[]) => {
+    if (coded(args)) violations.push(`emitWarning ${String(args[0])}`);
+  }) as typeof process.emitWarning);
+  for (const level of ["warn", "error"] as const) {
+    const original = console[level].bind(console);
+    vi.spyOn(console, level).mockImplementation((...args: unknown[]) => {
+      if (coded(args)) { violations.push(`console.${level} ${args.map(String).join(" ")}`); return; }
+      original(...args);
+    });
+  }
+  return {
+    unverified: () => lines.filter(line => line.includes(UNVERIFIED)),
+    lines: () => [...lines],
+    violations: () => [...violations],
+  };
+};
+
 const runner = (entries: Entry[], extra: Entry = {}) => {
   const calls: unknown[] = [];
   const run = (input: string) => {
@@ -640,13 +750,27 @@ describe("Windows mesh state ACL policy (smarty-dev#8920)", () => {
   // F2 trust boundary: either pipe can exceed execFileSync's maxBuffer. Node 24's observed spawnSync shape is
   // ENOBUFS/errno -105/status null/SIGTERM; do not mistake that incomplete proof for a missing executable.
   it.each(["ENOBUFS", "ERR_CHILD_PROCESS_STDIO_MAXBUFFER"])("refuses %s from stdout or stderr overflow without warning", code => {
-    const warn = vi.spyOn(process, "emitWarning").mockImplementation(() => undefined);
+    const diagnostics = captureDiagnostics();
+    const onUnverified = vi.fn();
     for (const stream of ["stdout", "stderr"]) {
       const fail = () => { throw Object.assign(new Error(`${stream} maxBuffer exceeded`),
         { code, errno: -105, status: null, signal: "SIGTERM", [stream]: "truncated output" }); };
-      expect(windowsStateAclRefusal(request, fail)).toMatch(/incomplete Windows ACL snapshot .*buffer limit/);
+      expect(windowsStateAclRefusal({ ...request, onUnverified }, fail)).toMatch(/incomplete Windows ACL snapshot .*buffer limit/);
     }
-    expect(warn).not.toHaveBeenCalled();
+    expect(onUnverified).not.toHaveBeenCalled();
+    expect(diagnostics.lines()).toEqual([]);
+    expect(diagnostics.violations()).toEqual([]);
+  });
+
+  it("refuses malformed successful output without warning or reporting a tooling gap", () => {
+    const diagnostics = captureDiagnostics();
+    const onUnverified = vi.fn();
+    expect(windowsStateAclRefusal({ ...request, onUnverified }, () => "not JSON")).toMatch(/unreadable Windows ACL snapshot/);
+    expect(windowsStateAclRefusal({ ...request, onUnverified }, () => JSON.stringify({ userSid: USER, entries: [] })))
+      .toMatch(/invalid Windows ACL snapshot/);
+    expect(onUnverified).not.toHaveBeenCalled();
+    expect(diagnostics.lines()).toEqual([]);
+    expect(diagnostics.violations()).toEqual([]);
   });
 
   it.each([
@@ -656,27 +780,63 @@ describe("Windows mesh state ACL policy (smarty-dev#8920)", () => {
     ["ENOBUFS", { code: "ENOBUFS", errno: -105, status: null, signal: "SIGTERM" }],
     ["ERR_CHILD_PROCESS_STDIO_MAXBUFFER", { code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" }],
   ] as const)("refuses a new-root setter runner failure (%s), never warning or accepting an unprotected root", (kind, fields) => {
-    const warn = vi.spyOn(process, "emitWarning").mockImplementation(() => undefined);
+    const diagnostics = captureDiagnostics();
+    const onUnverified = vi.fn();
     const fail = () => { throw Object.assign(new Error(`native setter ${kind}`), fields); };
-    expect(windowsStateAclRefusal({ ...request, protect: true }, fail)).toMatch(/was created but its private ACL could not be set/);
-    expect(warn).not.toHaveBeenCalled();
+    expect(windowsStateAclRefusal({ ...request, protect: true, onUnverified }, fail)).toMatch(/was created but its private ACL could not be set/);
+    expect(onUnverified).not.toHaveBeenCalled();
+    expect(diagnostics.lines()).toEqual([]);
+    expect(diagnostics.violations()).toEqual([]);
   });
 
-  it("warns once and opens as before for existing-root read ENOENT, nonzero exit and timeout", () => {
-    const warn = vi.spyOn(process, "emitWarning").mockImplementation(() => undefined);
-    const fail = () => { throw Object.assign(new Error("spawn powershell.exe ENOENT"), { code: "ENOENT" }); };
-    expect(windowsStateAclRefusal(request, fail)).toBeUndefined();
-    expect(windowsStateAclRefusal(request, fail)).toBeUndefined();
-    for (const fields of [{ status: 1 }, { code: "ETIMEDOUT", status: null, signal: "SIGTERM" }]) {
-      expect(windowsStateAclRefusal(request, () => { throw Object.assign(new Error("native read failed"), fields); })).toBeUndefined();
+  // P2-A: visible on the dedicated stderr route with its literal code, once per root (case-insensitive), not once per
+  // process; every accepted gap is reported to the caller, and the pure reader keeps re-running its child.
+  it("warns once per root on stderr and opens as before for existing-root read ENOENT, nonzero exit and timeout", async () => {
+    vi.resetModules(); // a fresh reader: its per-root notice memory starts empty
+    const reader = await import("../src/mesh/windows-state-acl.js");
+    const diagnostics = captureDiagnostics();
+    const onUnverified = vi.fn();
+    let attempts = 0;
+    const failWith = (message: string, fields: Record<string, unknown>) => () => {
+      attempts += 1;
+      throw Object.assign(new Error(`${message}\nsecond line is not printed`), fields);
+    };
+    const missing = failWith("spawn powershell.exe ENOENT", { code: "ENOENT" });
+    expect(reader.windowsStateAclRefusal({ ...request, onUnverified }, missing)).toBeUndefined();
+    expect(reader.windowsStateAclRefusal({ ...request, onUnverified }, missing)).toBeUndefined();
+    const upper = { ...request, root: request.root.toUpperCase(), real: request.real.toUpperCase() };
+    for (const [message, fields] of [["Command failed: powershell.exe", { status: 1 }],
+      ["spawnSync powershell.exe ETIMEDOUT", { code: "ETIMEDOUT", status: null, signal: "SIGTERM" }]] as const) {
+      expect(reader.windowsStateAclRefusal({ ...upper, onUnverified }, failWith(message, fields))).toBeUndefined();
     }
-    expect(warn).toHaveBeenCalledTimes(1);
-    expect(String(warn.mock.calls[0]![0])).toMatch(/could not read Windows ACLs \(spawn powershell\.exe ENOENT\)/);
+    expect(attempts).toBe(4);
+    expect(onUnverified).toHaveBeenCalledTimes(4);
+    expect(diagnostics.unverified()).toHaveLength(1); // same root in another case: deduped
+    expect(diagnostics.unverified()[0]).toMatch(/FABRIC_MESH_STATE_ACL_UNVERIFIED: .*could not read Windows ACLs \(spawn powershell\.exe ENOENT\)/);
+    expect(diagnostics.unverified()[0]).toContain(request.root);
+    expect(diagnostics.unverified()[0]).not.toContain("second line");
+    const other = "C:\\Users\\me\\.pi\\other";
+    const third = "D:\\state\\mesh";
+    expect(reader.windowsStateAclRefusal({ root: other, real: other, files: [], directories: [], onUnverified },
+      failWith("spawnSync powershell.exe ETIMEDOUT", { code: "ETIMEDOUT" }))).toBeUndefined();
+    expect(reader.windowsStateAclRefusal({ root: third, real: third, files: [], directories: [], onUnverified },
+      failWith("Command failed: powershell.exe", { status: 1 }))).toBeUndefined();
+    expect(diagnostics.unverified()).toHaveLength(3); // another root's first gap is never hidden
+    expect(diagnostics.unverified()[1]).toContain(other);
+    expect(diagnostics.unverified()[1]).toContain("ETIMEDOUT");
+    expect(diagnostics.unverified()[2]).toContain(third);
+    expect(diagnostics.lines()).toHaveLength(3);
+    expect(diagnostics.violations()).toEqual([]);
   });
 });
 
 describe("state gate wiring on win32 (smarty-dev#8920)", () => {
-  afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); vi.doUnmock("../src/mesh/windows-state-acl.js"); vi.resetModules(); });
+  const channels: ReturnType<typeof captureDiagnostics>[] = [];
+  afterEach(() => {
+    const violations = channels.splice(0).flatMap(channel => channel.violations());
+    vi.restoreAllMocks(); vi.unstubAllEnvs(); vi.doUnmock("../src/mesh/windows-state-acl.js"); vi.resetModules();
+    expect(violations).toEqual([]);
+  });
   // ACL findings warn by default. Tests of the enforced refusal/creation sequence opt in explicitly, per test.
   const ENFORCE = "PI_FABRIC_MESH_STATE_ACL_ENFORCE";
   const ADVISORY = "FABRIC_MESH_STATE_ACL_ADVISORY";
@@ -1041,29 +1201,14 @@ describe("state gate wiring on win32 (smarty-dev#8920)", () => {
 
   // Warn-by-default, exact opt-in, tested switch back. One gate module instance per test: the setting is read at
   // each call, never captured at import. The recorded reader verdicts stay unsafe throughout; only the setting moves.
-  // Pi's setupCli() makes process.emitWarning a no-op, so the advisory travels through console/stderr, carrying its
-  // code in the text. Collect console.warn/error and direct stderr writes (a console write that reaches stderr is not
-  // counted twice); `quiet` swallows only advisory lines, everything else calls through. vi.restoreAllMocks undoes it.
-  const captureAdvisories = (quiet = true): (() => string[]) => {
-    const seen: string[] = [];
-    let viaConsole = false;
-    const write = process.stderr.write.bind(process.stderr) as (...args: unknown[]) => boolean;
-    vi.spyOn(process.stderr, "write").mockImplementation(((chunk: unknown, ...rest: unknown[]) => {
-      const text = String(chunk);
-      if (!viaConsole && text.includes(ADVISORY)) seen.push(text);
-      if (quiet && text.includes(ADVISORY)) return true;
-      return write(chunk, ...rest);
-    }) as typeof process.stderr.write);
-    for (const level of ["warn", "error"] as const) {
-      const original = console[level].bind(console);
-      vi.spyOn(console, level).mockImplementation((...args: unknown[]) => {
-        const text = args.map(String).join(" ");
-        if (text.includes(ADVISORY)) { seen.push(text); if (quiet) return; }
-        viaConsole = true;
-        try { original(...args); } finally { viaConsole = false; }
-      });
-    }
-    return () => [...seen];
+  // Pi's setupCli() makes process.emitWarning a no-op, so the advisory travels on the gate's dedicated stderr route,
+  // carrying its code in the text (P2-B: never the global console, whose exact-count spies belong to the app).
+  // Advisory stderr lines are collected and swallowed; a coded global console/emitWarning call is a violation that
+  // fails the row in afterEach. vi.restoreAllMocks undoes it.
+  const captureAdvisories = (): (() => string[]) => {
+    const diagnostics = captureDiagnostics();
+    channels.push(diagnostics);
+    return () => diagnostics.lines().filter(line => line.includes(ADVISORY));
   };
   const advisoriesOf = (capture: () => string[]) => capture();
   const quietWarnings = () => captureAdvisories();
@@ -1401,6 +1546,55 @@ describe("state gate wiring on win32 (smarty-dev#8920)", () => {
     });
   });
 
+  // P2-A: an accepted tooling gap (the reader calls onUnverified and returns undefined) is remembered by default, so
+  // the whole lifecycle makes ONE attempt; exact ENFORCE=1 consults the reader on every call, also after that fallback,
+  // and neither records nor reuses the memory. A gap seen only under enforcement leaves the default's first read intact.
+  it("tooling gap: default makes one reader attempt per root across the lifecycle; enforced calls always re-consult", async () => {
+    const base = tmp();
+    const first = path.join(base, "first", "mesh");
+    const enforcedFirst = path.join(base, "enforced", "mesh");
+    fs.mkdirSync(enforcedFirst, { recursive: true }); // existing: enforcement never creates (or protects) it here
+    const { calls } = await loadGateBy(input => { input.onUnverified?.(); return undefined; });
+    const sqlite = await import("../src/mesh/state-sqlite.js");
+    const { assertFileStateWritable } = await import("../src/mesh/backend-fence.js");
+    const { createStateBackend } = await import("../src/mesh/state-backend.js");
+    const advisories = captureAdvisories();
+    const delta = async (run: () => unknown): Promise<number> => { const before = calls.length; await run(); return calls.length - before; };
+    const lifecycle = (root: string) => async () => {
+      (await sqlite.SqliteStateStore.open(root, 1024, 16, { initialize: "create" })).close();
+      sqlite.SqliteStateStore.openSync(root, 1024, 16, { initialize: "create" }).close();
+      createStateBackend({ root, maxEventBytes: 1024, maxReadEvents: 16, lock: {} as never }, { stateBackend: "file" }).close();
+      createStateBackend({ root, maxEventBytes: 1024, maxReadEvents: 16, lock: {} as never }, { stateBackend: "sqlite" }).close();
+      for (let commit = 0; commit < 3; commit += 1) expect(() => assertFileStateWritable(root)).toThrow(/backend=sqlite/);
+      for (let raise = 0; raise < 3; raise += 1) sqlite.lowerCheckpointFlag(sqlite.raiseCheckpointFlag(root, sqlite.ownerToken()));
+    };
+    await asWindows(async () => {
+      vi.stubEnv(ENFORCE, undefined);
+      expect(await delta(async () => (await sqlite.SqliteStateStore.open(first, 1024, 16, { initialize: "create" })).close())).toBe(1);
+      expect(await delta(lifecycle(first))).toBe(0); // remembered: no repeat opens, fences or flags reads
+
+      enforceAcl();
+      for (const [name, run] of [
+        ["openSync", () => sqlite.SqliteStateStore.openSync(first, 1024, 16, { initialize: "create" }).close()],
+        ["open", async () => (await sqlite.SqliteStateStore.open(first, 1024, 16, { initialize: "create" })).close()],
+        ["file fence", () => expect(() => assertFileStateWritable(first)).toThrow(/backend=sqlite/)],
+        ["flag", () => sqlite.lowerCheckpointFlag(sqlite.raiseCheckpointFlag(first, sqlite.ownerToken()))],
+      ] as const) {
+        for (let round = 0; round < 2; round += 1) expect(await delta(run), `${name} ${round}`).toBeGreaterThanOrEqual(1);
+      }
+      expect(await delta(lifecycle(enforcedFirst))).toBeGreaterThan(0); // enforced-only gaps are not remembered
+
+      for (const off of [undefined, "0"]) {
+        vi.stubEnv(ENFORCE, off);
+        expect(await delta(lifecycle(first)), String(off)).toBe(0); // rollback stays permissive, still remembered
+      }
+      vi.stubEnv(ENFORCE, undefined);
+      expect(await delta(lifecycle(enforcedFirst))).toBe(1); // its first default attempt, then remembered
+    });
+    expect(calls.filter(call => call.protect)).toEqual([]); // no new-root protect: nothing mutates an ACL here
+    expect(advisories()).toEqual([]); // a tooling gap is not an ACL finding
+  });
+
   // After an advisory cache hit the mandatory type, link and inode checks still run on every call.
   it("an advisory cache hit keeps the mandatory type, link and inode refusals", async () => {
     const { gate, calls } = await loadGate("C:\\x grants S-1-1-0 write");
@@ -1475,5 +1669,54 @@ describe("state gate wiring on win32 (smarty-dev#8920)", () => {
     // The real reader ran: one recorded read per new root by default, one per enforced call, none once warned.
     expect(report.reads).toEqual({ "default-first-async": 1, "default-first-sync": 0, "enforced-first-sync": 1,
       "enforced-first-async": 1, "off-first-async": 0, "zero-first-sync": 0, "default-second-sync": 1 });
+    expect(result.stderr).not.toContain(UNVERIFIED);
+  }, 150_000);
+
+  // P2-A in the real host: after setupCli() the reader's tooling gap must still be visible on actual stderr, with its
+  // literal code, once per root. Default: one attempt per root, none for repeat opens, fences or flags. Exact
+  // ENFORCE=1 re-runs the reader on every call (also after the advisory fallback) and keeps fail-open; unset/0 stay
+  // permissive and remembered. No protect request is ever made; the global console carries neither code.
+  it("Pi host: after the real setupCli() a missing, timed-out or failing ACL reader is visible once per root; default reads once; enforced calls re-read and fail open", () => {
+    const result = childProcess.spawnSync(process.execPath,
+      ["--disable-warning=ExperimentalWarning", "--input-type=module", "-e", PI_HOST_UNVERIFIED, path.join(tmp(), "pi")],
+      { cwd: process.cwd(), encoding: "utf8", windowsHide: true, timeout: 120_000, maxBuffer: 4 * 1024 * 1024,
+        env: Object.fromEntries(Object.entries(process.env).filter(([name]) => name !== ENFORCE)) });
+    expect(result.error?.message ?? "").toBe("");
+    expect(result.status, result.stderr).toBe(0);
+    const report = JSON.parse(result.stdout.trim().split("\n").at(-1)!) as {
+      emitWarningSilenced: boolean; roots: Record<string, string>; reads: Record<string, number>; protects: string[];
+      consoleCalls: string[]; outcomes: Record<string, { ok: boolean; code?: string; message?: string }> };
+    expect(report.emitWarningSilenced).toBe(true);
+    const byStep = new Map<string, string[]>();
+    let current = "";
+    for (const line of result.stderr.split(/\r?\n/)) {
+      if (line.startsWith("STEP ")) { current = line.slice(5); byStep.set(current, []); }
+      else if (line.trim() !== "") byStep.get(current)?.push(line);
+    }
+    const coded = (step: string) => (byStep.get(step) ?? []).filter(line => line.includes("FABRIC_MESH_STATE_ACL_"));
+    const reasons = { missing: "spawn powershell.exe ENOENT", timeout: "ETIMEDOUT", nonzero: "exited 1" } as const;
+    const later = ["default-openSync", "default-lifecycle", "enforced-openSync", "enforced-open", "enforced-lifecycle",
+      "rollback-open", "zero-lifecycle"];
+    for (const [kind, reason] of Object.entries(reasons)) {
+      const root = path.win32.resolve(report.roots[kind]!); // the reader names roots in win32 form (host paths elsewhere)
+      expect(coded(`${kind}:default-open`), kind).toEqual([expect.stringContaining(`${UNVERIFIED}: `)]);
+      expect(coded(`${kind}:default-open`)[0]).toContain(root);
+      expect(coded(`${kind}:default-open`)[0]).toContain(reason);
+      for (const step of later) expect(coded(`${kind}:${step}`), `${kind}:${step}`).toEqual([]);
+      expect(report.reads[`${kind}:default-open`], kind).toBe(1); // single attempt
+      for (const step of ["default-openSync", "default-lifecycle", "rollback-open", "zero-lifecycle"]) {
+        expect(report.reads[`${kind}:${step}`], `${kind}:${step}`).toBe(0); // remembered
+      }
+      for (const step of ["enforced-openSync", "enforced-open"]) {
+        expect(report.reads[`${kind}:${step}`], `${kind}:${step}`).toBeGreaterThanOrEqual(1); // re-read every call
+      }
+      // Every enforced gate call re-reads: 2 constructors + 3 fences + 3 flag raises at least.
+      expect(report.reads[`${kind}:enforced-lifecycle`], kind).toBeGreaterThanOrEqual(8);
+      for (const step of ["default-open", ...later]) expect(report.outcomes[`${kind}:${step}`], `${kind}:${step}`).toEqual({ ok: true });
+    }
+    expect(result.stderr.split(UNVERIFIED).length - 1).toBe(3); // once per root, in total
+    expect(result.stderr).not.toContain(ADVISORY); // a tooling gap is not an ACL finding
+    expect(report.protects).toEqual([]);
+    expect(report.consoleCalls).toEqual([]);
   }, 150_000);
 });

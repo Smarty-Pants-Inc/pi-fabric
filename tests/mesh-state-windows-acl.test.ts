@@ -35,6 +35,7 @@ const UNSUPPORTED = { code: "FABRIC_MESH_STATE_UNSUPPORTED" };
 // the child's env only); afterEach unstubs. The gate reads the setting at each call.
 const ENFORCE = "PI_FABRIC_MESH_STATE_ACL_ENFORCE";
 const ADVISORY = "FABRIC_MESH_STATE_ACL_ADVISORY";
+const UNVERIFIED = "FABRIC_MESH_STATE_ACL_UNVERIFIED";
 const enforceAcl = () => vi.stubEnv(ENFORCE, "1");
 
 const created: string[] = [];
@@ -691,20 +692,22 @@ describe.runIf(process.env.GITHUB_ACTIONS === "true" && process.platform === "wi
     grant(root, EVERYONE, "(OI)(CI)(M)", MODIFY);
     expect(icaclsShow(root)).toMatch(/Everyone:\(OI\)\(CI\)\(M\)/);
     const sddl = readAcl(root).sddl;
-    // Call-through: the finding is still printed. The advisory uses console/stderr, which Pi's setupCli() leaves on
-    // (it silences process.emitWarning); its code is in the text. A console line reaching stderr counts once.
+    // Call-through: the finding is still printed. The advisory travels on the gate's dedicated stderr route, which
+    // Pi's setupCli() leaves on (it silences process.emitWarning); its code is in the text. The global console is
+    // never that route (P2-B: an app's console.warn/error spies must not see it), so console calls are counted apart.
     const advisoryLines: string[] = [];
-    let viaConsole = false;
-    const consoleWarn = console.warn.bind(console);
-    const warnings = vi.spyOn(console, "warn").mockImplementation((...args: unknown[]) => {
-      const text = args.map(String).join(" ");
-      if (text.includes(ADVISORY)) advisoryLines.push(text);
-      viaConsole = true;
-      try { consoleWarn(...args); } finally { viaConsole = false; }
+    const consoleLines: string[] = [];
+    const consoleSpies = (["warn", "error"] as const).map(level => {
+      const original = console[level].bind(console);
+      return vi.spyOn(console, level).mockImplementation((...args: unknown[]) => {
+        const text = args.map(String).join(" ");
+        if (text.includes(ADVISORY) || text.includes(UNVERIFIED)) consoleLines.push(text);
+        original(...args);
+      });
     });
     const stderrWrite = process.stderr.write.bind(process.stderr) as (...args: unknown[]) => boolean;
     const stderr = vi.spyOn(process.stderr, "write").mockImplementation(((chunk: unknown, ...rest: unknown[]) => {
-      if (!viaConsole && String(chunk).includes(ADVISORY)) advisoryLines.push(String(chunk));
+      if (String(chunk).includes(ADVISORY)) advisoryLines.push(String(chunk));
       return stderrWrite(chunk, ...rest);
     }) as typeof process.stderr.write);
     const advisories = () => [...advisoryLines];
@@ -750,19 +753,24 @@ describe.runIf(process.env.GITHUB_ACTIONS === "true" && process.platform === "wi
       expect(readAcl(root).sddl).toBe(sddl);
       expect(icaclsShow(root)).toMatch(/Everyone:\(OI\)\(CI\)\(M\)/);
       expect(advisories()).toHaveLength(1);
+      expect(consoleLines).toEqual([]); // the dedicated route, never the global console
       proofs.assertRealReads();
       // Advisory caching (P2): the first parent read warns and is remembered; default/0 repeats take no native read,
       // every enforced open reads afresh and refuses, and off again returns to the remembered advisory. The fresh
       // child seed above is what makes that first parent read see the real Everyone:(M) grant.
+      // Counts are cumulative in recorded order: `opens` iterates open (async) BEFORE openSync, so each enforced step
+      // adds exactly one fresh read to the step recorded just before it (CI 0710 trace: 1, 1, 2, 3, then 3).
       const proofsAt = (step: string) => steps.find(entry => entry.step === step)!.nativeProofs;
+      expect(steps.map(entry => entry.step)).toEqual(["default-unset", "explicit-0", "enforced-open", "enforced-openSync",
+        "enforced-fresh-process", "rollback-unset", "rollback-fresh-process"]);
       expect(proofsAt("default-unset")).toBe(1);
       expect(proofsAt("explicit-0")).toBe(proofsAt("default-unset"));
-      expect(proofsAt("enforced-openSync")).toBe(proofsAt("explicit-0") + 1);
-      expect(proofsAt("enforced-open")).toBe(proofsAt("enforced-openSync") + 1);
-      expect(proofsAt("rollback-unset")).toBe(proofsAt("enforced-open"));
+      expect(proofsAt("enforced-open")).toBe(proofsAt("explicit-0") + 1);
+      expect(proofsAt("enforced-openSync")).toBe(proofsAt("enforced-open") + 1);
+      expect(proofsAt("rollback-unset")).toBe(proofsAt("enforced-openSync"));
     } finally {
       try { console.log(JSON.stringify({ event: "native-rollback", root, steps, nativeProofs: proofs.count() })); }
-      finally { proofs.restore(); warnings.mockRestore(); stderr.mockRestore(); }
+      finally { proofs.restore(); for (const spy of consoleSpies) spy.mockRestore(); stderr.mockRestore(); }
     }
   }, 240_000);
 });

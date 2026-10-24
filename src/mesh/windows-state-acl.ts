@@ -30,6 +30,7 @@
  * runner failure refuses. Output overflow (incomplete evidence) and malformed successful output always refuse.
  */
 import childProcess from "node:child_process";
+import { Console } from "node:console";
 import fs from "node:fs";
 import path from "node:path";
 import { childProcessEnvironment } from "../core/atomic-write.js";
@@ -141,6 +142,8 @@ export interface WindowsStateAclRequest {
   protect?: boolean;
   /** Require the native snapshot to prove that state.db is present (no-create/post-create gate). */
   requireDatabase?: boolean;
+  /** Accepted read-only tooling fallback, not a verified admission; lets the gate remember advisory-only gaps. */
+  onUnverified?: () => void;
 }
 
 /** Runs the child with the request in PI_FABRIC_STATE_ACL and returns its stdout; throws when it cannot run. */
@@ -155,13 +158,18 @@ const runPowerShell: WindowsAclRunner = (request) => {
   });
 };
 
-let warned = false;
+// Private stderr channel: Pi may suppress emitWarning, and application console spies must not see ACL diagnostics.
+const aclDiagnostics = new Console({ stdout: process.stderr, stderr: process.stderr });
+// Never evict: a busy root must not start warning again after other roots fill the bound.
+const warnedUnverifiedRoots = new Set<string>();
+const MAX_UNVERIFIED_WARNINGS = 64;
 const warnUnverified = (root: string, error: unknown): void => {
-  if (warned) return;
-  warned = true;
+  const key = root.toLowerCase();
+  if (warnedUnverifiedRoots.has(key) || warnedUnverifiedRoots.size >= MAX_UNVERIFIED_WARNINGS) return;
+  warnedUnverifiedRoots.add(key);
   const reason = error instanceof Error ? error.message.split("\n")[0] : String(error);
-  process.emitWarning(`[pi-fabric] Fabric mesh SQLite state could not read Windows ACLs (${reason}); `
-    + `${root} and its ancestors are opened without an ACL check (smarty-dev#8920).`, { code: "FABRIC_MESH_STATE_ACL_UNVERIFIED" });
+  aclDiagnostics.warn(`[pi-fabric] FABRIC_MESH_STATE_ACL_UNVERIFIED: Fabric mesh SQLite state could not read Windows ACLs (${reason}); `
+    + `${root} and its ancestors are opened without an ACL check.`);
 };
 
 const record = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
@@ -313,6 +321,7 @@ const admissionDecision = (before: AdmissionIdentity, native: { root: NativePres
  * Default-runner Windows root admissions reuse only a complete verified proof with unchanged root/DB identities
  * and fresh component guards. Same-identity ACL edits by the trusted authority class are intentionally not re-read.
  * Other roles, protect/readback, injected runners, and unproven identities retain fresh native reads.
+ * Accepted tooling gaps notify onUnverified so callers can distinguish them from a verified success.
  */
 export const windowsStateAclRefusal = (request: WindowsStateAclRequest, run: WindowsAclRunner = runPowerShell): string | undefined => {
   const root = path.win32.resolve(request.root);
@@ -367,6 +376,7 @@ export const windowsStateAclRefusal = (request: WindowsStateAclRequest, run: Win
       return `${root} has an incomplete Windows ACL snapshot (native reader output exceeded its buffer limit)`;
     }
     warnUnverified(root, error);
+    request.onUnverified?.();
     return undefined;
   }
   let snapshot: unknown;

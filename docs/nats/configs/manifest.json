@@ -1,0 +1,42 @@
+{
+  "mode": "production",
+  "cores": [
+    "ryzen1",
+    "ryzen2",
+    "ryzen4"
+  ],
+  "leaves": [
+    "ryzen3",
+    "ryzen5",
+    "epyc1",
+    "m4",
+    "i9",
+    "m5"
+  ],
+  "max_payload": 262144,
+  "jetstream_domain": "fleet",
+  "core_ports": {
+    "ryzen1": 4222,
+    "ryzen2": 4222,
+    "ryzen4": 4222
+  },
+  "leaf_ports": {
+    "ryzen3": 4222,
+    "ryzen5": 4222,
+    "epyc1": 4222,
+    "m4": 4222,
+    "i9": 4222,
+    "m5": 4222
+  },
+  "monitor_ports": {
+    "core-ryzen1": 8222,
+    "core-ryzen2": 8222,
+    "core-ryzen4": 8222,
+    "leaf-ryzen3": 8222,
+    "leaf-ryzen5": 8222,
+    "leaf-epyc1": 8222,
+    "leaf-m4": 8222,
+    "leaf-i9": 8222,
+    "leaf-m5": 8222
+  }
+}

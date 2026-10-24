@@ -338,7 +338,9 @@ await import(${JSON.stringify(new URL("./fixtures/fake-pi-overflow.mjs", import.
       const runRoot = path.join(path.dirname(actor.sessionFile!), "runs", runId);
       const frames = fs.readFileSync(path.join(runRoot, "events.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
       const policy = frames.find(frame => frame.type === "write_policy.actor")?.policy;
-      expect(policy?.writableRoots).toEqual([path.join(s.config.residencyRoot, "runs", runId, "tmp")]);
+      // smarty-dev#15878: a short private TMPDIR when one fits the host's temp path, else the run's own tmp.
+      const recorded = (JSON.parse(fs.readFileSync(path.join(runRoot, "status.json"), "utf8")) as { temporaryDirectory?: string }).temporaryDirectory;
+      expect(policy?.writableRoots).toEqual([recorded ?? path.join(s.config.residencyRoot, "runs", runId, "tmp")]);
       expect(policy.writableRoots).not.toContain(s.providerStateDir);
       return policy.writableRoots[0];
     };

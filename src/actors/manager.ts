@@ -316,6 +316,8 @@ interface RemovalCleanup {
   owner?: { name: string; rootId: string; residency: FabricParticipantResidency; requestedAt: number };
   /** Sticky: an operator (dead-root) removal; its tree goes only after the host's final operator check. */
   operator?: true;
+  /** The original inode remains owed even after it leaves its name. Times/snapshots are per attempt. */
+  treeRemoval?: { dev: number; ino: number; uid: number; type: number; location: string; status: "outstanding" | "complete" };
 }
 
 type RemovalResult = { removed: boolean; cleaned?: boolean; pending?: string };
@@ -3929,8 +3931,9 @@ export class ActorManager {
       if (!Array.isArray(registry?.actors) || !registry.actors.every((actor) => actor && typeof actor.id === "string")) return;
       const live = new Set(registry.actors.map((actor) => actor.id));
       const files = fs.readdirSync(this.#actorRoot);
-      for (const id of this.#removalCleanup.keys()) {
-        if (this.#revoked.has(id) && !files.includes(`removal-${id}.json`) &&
+      for (const [id, cleanup] of this.#removalCleanup) {
+        // Keep owned known-inode obligations without a marker; observers may forget the owner's settled cleanup.
+        if ((!("treeRemoval" in cleanup) || !this.#ownsCleanup(cleanup)) && this.#revoked.has(id) && !files.includes(`removal-${id}.json`) &&
             !this.#removeCalls.has(id) && !this.#finishCalls.has(id) && !this.#removals.has(id)) {
           this.#removalCleanup.delete(id);
           this.#revoked.delete(id);
@@ -3970,8 +3973,36 @@ export class ActorManager {
           (cleanup.owner !== undefined && (!cleanup.owner || typeof cleanup.owner.name !== "string" ||
             typeof cleanup.owner.rootId !== "string" || !["session", "durable"].includes(cleanup.owner.residency) ||
             !Number.isFinite(cleanup.owner.requestedAt))) || (cleanup.operator !== undefined && cleanup.operator !== true)) return undefined;
+      try { this.#cleanupTreeRemoval(cleanup); }
+      catch { cleanup.pending = "invalid tree removal obligation; manual recovery required"; }
       return cleanup;
     } catch { return undefined; } // Skip only this unreadable/malformed marker.
+  }
+
+  /** A malformed extension stays an obligation, never a legacy absent-path cleanup. */
+  #cleanupTreeRemoval(cleanup: RemovalCleanup): RemovalCleanup["treeRemoval"] {
+    if (!("treeRemoval" in cleanup)) return undefined;
+    const tree = cleanup.treeRemoval;
+    if (!tree || typeof tree !== "object" || Array.isArray(tree) ||
+        ![tree.dev, tree.ino, tree.uid].every(value => Number.isSafeInteger(value) && value >= 0) ||
+        ![0o010000, 0o020000, 0o040000, 0o060000, 0o100000, 0o120000, 0o140000].includes(tree.type) ||
+        !["outstanding", "complete"].includes(tree.status) || typeof tree.location !== "string") {
+      throw new Error("invalid tree removal obligation; manual recovery required");
+    }
+    const root = path.resolve(this.#actorRoot);
+    const parts = path.relative(root, tree.location).split(path.sep);
+    const depth = parts.length - 1;
+    const name = parts[depth]!;
+    const suffixes = name.slice(cleanup.id.length + 1).split(".");
+    const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+    if (!path.isAbsolute(tree.location) || tree.location !== path.join(root, ...parts) ||
+        parts.some(part => !part || part === "." || part === "..") ||
+        (depth === 0 ? name !== cleanup.id :
+          !parts.slice(0, depth).every(part => /^\.retention-graveyard-[1-9][0-9]*$/.test(part)) ||
+          !name.startsWith(`${cleanup.id}.`) || suffixes.length !== depth || !suffixes.every(suffix => uuid.test(suffix)))) {
+      throw new Error("invalid tree removal location; manual recovery required");
+    }
+    return tree;
   }
 
   #cleanupPath(id: string): string {
@@ -3992,6 +4023,7 @@ export class ActorManager {
     };
     revoked();
     try {
+      this.#cleanupTreeRemoval(cleanup);
       await this.#joinStoppedRun(id);
       this.#assertSlotExecutionSettled(cleanup);
       // Persist only a decided escalation; a refused one rolled its flag back.
@@ -4015,16 +4047,97 @@ export class ActorManager {
         await this.#beforeOperatorCleanup(rootId);
         operatorChecked = true;
       };
-      await deleteRootActorTree(this.mesh.root, rootId, async () => {
-        await operatorCheck();
-        await this.#bindings.delete(id);
-        await operatorCheck();
-        fs.rmSync(cleanup.sessionDir, { recursive: true, force: true });
-      }, async () => {
-        revoked();
-        if (this.#ceded.has(id) || this.#removalCleanup.get(id) !== cleanup) throw new Error("cleanup ownership changed");
-        await operatorCheck();
-      });
+      // Capture the judged stat after the final check's last await. On Linux, verifiedRemove pins
+      // the parent with NOFOLLOW and verifies the judged inode before directory-relative removal.
+      // Off Linux, keep the existing path-based fallback unless the Windows helper is enabled and available.
+      // A refusal keeps cleanup pending for a later remove or host start.
+      let judged: fs.Stats | undefined;
+      let location = cleanup.sessionDir;
+      let parent: number | undefined;
+      try {
+        await deleteRootActorTree(this.mesh.root, rootId, async () => {
+          await operatorCheck();
+          await this.#bindings.delete(id);
+          // Lazy-load removal without replacing the final check's judged stat.
+          const { verifiedRemove } = await import("../storage/verified-remove.js");
+          await operatorCheck();
+          const tree = this.#cleanupTreeRemoval(cleanup);
+          // Re-establish durability even after an earlier write's directory sync failed.
+          if (tree && this.#persistent && this.meshConfig.enabled) {
+            writeJsonAtomic(this.#cleanupPath(id), cleanup, { durable: true });
+          }
+          if (tree?.status === "complete") return;
+          if (!judged) return; // Only an untouched legacy obligation may be already gone.
+          const result = verifiedRemove(location, judged, { deleter: "actor-tree",
+            fallback: () => { fs.rmSync(cleanup.sessionDir, { recursive: true, force: true }); return true; } });
+          if (!result.removed) {
+            if (tree && result.graveyard !== undefined) {
+              const relocated = { ...tree, location: result.graveyard };
+              // Publish the returned location before adopting it in memory. A failed save leaves
+              // the old, now missing location pending for manual recovery, not "already gone".
+              if (this.#persistent && this.meshConfig.enabled) {
+                writeJsonAtomic(this.#cleanupPath(id), { ...cleanup, treeRemoval: relocated }, { durable: true });
+              }
+              cleanup.treeRemoval = relocated;
+            }
+            throw new Error(`actor tree not removed: ${result.reason}`);
+          }
+          if (tree) {
+            // A positive helper result is the only discharge proof. Keep it through bookkeeping
+            // failures, and never clear presence, slots or the marker before this barrier.
+            cleanup.treeRemoval = { ...tree, status: "complete" };
+            if (this.#persistent && this.meshConfig.enabled) {
+              writeJsonAtomic(this.#cleanupPath(id), cleanup, { durable: true });
+            }
+          }
+        }, async () => {
+          revoked();
+          if (this.#ceded.has(id) || this.#removalCleanup.get(id) !== cleanup) throw new Error("cleanup ownership changed");
+          await operatorCheck();
+          const tree = this.#cleanupTreeRemoval(cleanup);
+          if (tree && process.platform !== "linux") throw new Error("tracked tree removal needs Linux; tree kept");
+          if (tree?.status === "complete") return;
+          let judgmentPath = location;
+          if (process.platform === "linux") {
+            location = tree?.location ?? path.resolve(cleanup.sessionDir);
+            // Open every route component without following links, then retain the parent through
+            // the hooks/import awaits. The helper independently reopens the lexical location and
+            // revalidates it against this judgment, refusing a changed route or target.
+            const flags = fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW;
+            const root = path.parse(location).root;
+            let route: number | undefined = fs.openSync(root, flags);
+            try {
+              const components = path.relative(root, path.dirname(location)).split(path.sep).filter(Boolean);
+              for (const component of components) {
+                const next = fs.openSync(`/proc/self/fd/${route}/${component}`, flags);
+                const previous = route;
+                route = next;
+                fs.closeSync(previous);
+              }
+              parent = route;
+              route = undefined;
+            } finally { if (route !== undefined) fs.closeSync(route); }
+            // Judge through the held parent, but leave pathname revalidation to the helper.
+            judgmentPath = `/proc/self/fd/${parent}/./${path.basename(location)}`;
+          }
+          judged = fs.lstatSync(judgmentPath, { throwIfNoEntry: false });
+          if (tree) {
+            if (!judged) throw new Error("outstanding tree location is missing; manual recovery required");
+            if (judged.dev !== tree.dev || judged.ino !== tree.ino || judged.uid !== tree.uid ||
+                (judged.mode & 0o170000) !== tree.type) {
+              throw new Error("outstanding tree identity changed; tree kept for manual recovery");
+            }
+          } else if (process.platform === "linux" && judged) {
+            cleanup.treeRemoval = { dev: judged.dev, ino: judged.ino, uid: judged.uid,
+              type: judged.mode & 0o170000, location: path.resolve(cleanup.sessionDir), status: "outstanding" };
+            this.#cleanupTreeRemoval(cleanup);
+            // The originally judged inode is owed durably BEFORE the helper can move anything.
+            if (this.#persistent && this.meshConfig.enabled) {
+              writeJsonAtomic(this.#cleanupPath(id), cleanup, { durable: true });
+            }
+          }
+        });
+      } finally { if (parent !== undefined) fs.closeSync(parent); }
       if (cleanup.presenceKey === this.#presenceKey(cleanup.id)) {
         if (!this.#actors.has(cleanup.id) && this.mesh.get(cleanup.presenceKey, { fresh: true }) === undefined) {
           this.#pendingPresence.delete(cleanup.id);

@@ -38,6 +38,8 @@ const stable = [
 ];
 const lazy = [
   "actors/slot-authority.js",
+  "mesh/invocation-context.js",
+  "failure-progress.js",
   "commands/slot-import.js",
   "config.js",
   "core/agent-dir.js",

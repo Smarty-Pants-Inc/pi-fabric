@@ -28,7 +28,6 @@ import {
 import { DEFAULT_FABRIC_CONFIG } from "./config.js";
 import { hostGlobalsGuidance, MISSING_HOST_GLOBALS, PAYLOADS_LITERAL_GUIDANCE } from "./core/system-guidance.js";
 import type { FabricState } from "./fabric-state.js";
-import { formatFailureProgress } from "./failure-progress.js";
 import {
   prepareFabricExecArguments,
   resolveFabricExecPayloads,
@@ -991,7 +990,9 @@ export const createFabricExecTool = (
         ? `Runtime error: ${result.error}${runtimeRecoveryHint ? `\n\n${runtimeRecoveryHint}` : ""}`
         : undefined;
       const fullFormattedValue = formatFabricValue(result.value, selectedResultFormat);
-      const failureProgress = formatFailureProgress(result.trace);
+      const failureProgress = result.trace.outcome === "succeeded"
+        ? undefined
+        : (await import("./failure-progress.js")).formatFailureProgress(result.trace);
       const residentPriority = result.residentOutcomes?.length
         ? formatResidentOutcomePriority(result.residentOutcomes)
         : undefined;
@@ -1020,7 +1021,23 @@ export const createFabricExecTool = (
       if (failureProgress) sections.push(failureProgress);
       if (repeat.warn) sections.push(fabricRepeatWarnText(repeat.count, FABRIC_REPEAT_BLOCK));
       const rawOutput = sections.join("\n\n");
+      // Mutation receipts and resident outcomes are both irreducible output evidence.
+      const priorityText = [residentPriority, failureProgress]
+        .filter((value): value is string => Boolean(value))
+        .join("\n\n");
+      const priorityOutput = priorityText
+        ? {
+            text: priorityText,
+            sections: [
+              logPrefix ? `Guest logs:\n${logPrefix}` : "",
+              formattedValue.text ?? "",
+              runtimeErrorDisplay ?? "",
+              repeat.warn ? fabricRepeatWarnText(repeat.count, FABRIC_REPEAT_BLOCK) : "",
+            ],
+          }
+        : undefined;
       const outputFormat =
+        !priorityOutput &&
         !residentPriority &&
         formattedValue.language &&
         formattedValue.text &&
@@ -1077,16 +1094,7 @@ export const createFabricExecTool = (
         outputBudget,
         fullRawOutput || "(no output)",
         outputArtifactWriter,
-        residentPriority ? {
-          text: residentPriority,
-          sections: [
-            logPrefix ? `Guest logs:\n${logPrefix}` : "",
-            formattedValue.text,
-            runtimeErrorDisplay ?? "",
-            failureProgress ?? "",
-            repeat.warn ? fabricRepeatWarnText(repeat.count, FABRIC_REPEAT_BLOCK) : "",
-          ],
-        } : undefined,
+        priorityOutput,
       )).text;
       // In-place prewalk continuation arrives as an in-band context message on
       // this boundary turn, so the loop must keep running: the executor's first

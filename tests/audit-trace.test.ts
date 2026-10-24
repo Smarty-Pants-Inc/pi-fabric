@@ -26,6 +26,40 @@ describe("agent message audit parity", () => {
     expect(projectFabricAuditArgs(ref, { id: "session:receiver", message: "private HOLD", priority: "interrupt", data: { private: true } }).value)
       .toEqual({ id: "session:receiver" });
   });
+
+  it("retains only allowlisted side-effect receipt identifiers", () => {
+    const recorder = new FabricExecutionTraceRecorder();
+    const followUp = recorder.issueCall("agents.followup", { id: "target", message: "private follow-up" });
+    followUp.resolved("agents", "followUp");
+    followUp.succeed({ queued: true, messageId: "message-1", deliveryId: "delivery-1", message: "private result" });
+    recorder.issueCall("agents.steer", { id: "target", message: "private steer" }).succeed({
+      queued: true, messageId: "message-2", deliveryId: "delivery-2", notice: "private notice",
+    });
+    recorder.issueCall("mesh.publish", { topic: "public-topic", text: "private text" }).succeed({
+      id: "event-1", sequence: 11, topic: "private-topic", text: "private text", data: { secret: "private data" },
+    });
+    recorder.issueCall("agents.create", { task: "private create" }).succeed({
+      id: "agent-1", label: "private label", result: "private result",
+    });
+    recorder.issueCall("agents.spawn", { task: "private spawn" }).succeed({
+      id: "agent-2", label: "private label", output: "private output",
+    });
+
+    const trace = recorder.seal("failed", []);
+    expect(trace.operations.map(({ ref, result }) => ({ ref, result }))).toEqual([
+      { ref: "agents.followup", result: { messageId: "message-1", deliveryId: "delivery-1" } },
+      { ref: "agents.steer", result: { messageId: "message-2", deliveryId: "delivery-2" } },
+      { ref: "mesh.publish", result: { id: "event-1", sequence: 11 } },
+      { ref: "agents.create", result: { id: "agent-1" } },
+      { ref: "agents.spawn", result: { id: "agent-2" } },
+    ]);
+    const serialized = JSON.stringify(trace);
+    for (const secret of [
+      "private follow-up", "private result", "private steer", "private notice",
+      "private-topic", "private text", "private data", "private create", "private label",
+      "private spawn", "private output",
+    ]) expect(serialized).not.toContain(secret);
+  });
 });
 
 const descriptor = {

@@ -696,7 +696,11 @@ export class FabricExecutionService {
       }
       const participants = this.#participants;
       const separator = ref.indexOf(".");
-      return this.registry.invoke(ref, args, {
+      let invocationSucceeded = false;
+      const { withMeshInvocationContext } = await import("./mesh/invocation-context.js");
+      return withMeshInvocationContext(
+        { signal: callContext.signal, deadlineAt: () => runtimeDeadline.at },
+        () => this.registry.invoke(ref, args, {
         ...callContext,
         // The registry resolves `provider.action` by this exact prefix, so the
         // view is bound to the provider that receives it.
@@ -738,8 +742,13 @@ export class FabricExecutionService {
         // Native images/state must stay intact; final output has its own bounds.
         maxResultChars: ref.startsWith("native.") || callContext.nativeToolResult ? 16_777_216 : this.config.executor.maxNestedResultChars,
         traceOperation,
-        observeInvocation,
-      });
+        observeInvocation(event) {
+          // The registry classifies the unbounded result; a resolved/bounded
+          // failure value is not permission for escaped mesh writers to detach.
+          if (event.type === "call_end") invocationSucceeded = event.success;
+          observeInvocation(event);
+        },
+      }), () => invocationSucceeded);
     };
     const nativeTransaction = this.nativeCodemode.begin(options.parentToolCallId, options.context, !python && codemodeProfile === "native");
     const loadNativeCatalog = async (context: typeof baseContext) => {

@@ -77,6 +77,10 @@ const lazyEntryPoints = [
   "src/agents/transports/process-utils.ts",
   "src/core/pid-namespace.ts",
   "src/mesh/state-projector.ts",
+  // Shared invocation context is loaded on first provider dispatch, not extension startup.
+  "src/mesh/invocation-context.ts",
+  // Failure-only receipt projection is loaded only when a run fails.
+  "src/failure-progress.ts",
   "src/judge/agent.ts",
   "src/core/landlock.ts",
   "src/core/pattern-kill.ts",

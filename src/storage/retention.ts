@@ -546,6 +546,15 @@ const removeShortTmpdirAfterRun = (temporary: string | undefined, deleter: strin
   const judged = temporary ? ownedShortTmpdir(temporary) : undefined;
   if (temporary && judged) verifiedRemove(temporary, judged, { deleter, fallback: rmTree(temporary) });
 };
+/** pi-fabric#1554 P2-2: verifiedRemove of a run tree named by its run id, then (only once that removed it) its recorded
+ * short TMPDIR outside it. For deleters that hold their own safety proof, such as resident run retention. */
+export const removeRunTreeAndShortTmpdir = (directory: string, judged: fs.Stats | undefined,
+  options: { deleter: string; fallback: () => boolean }): boolean => {
+  const temporary = recordedShortTmpdir(directory, path.basename(directory));
+  const removed = verifiedRemove(directory, judged, options).removed;
+  if (removed) removeShortTmpdirAfterRun(temporary, options.deleter);
+  return removed;
+};
 export const removeEmptyRunRoot = (root: string): boolean => {
   try {
     const judged = ownedStat(root);

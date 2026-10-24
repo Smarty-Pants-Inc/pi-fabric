@@ -678,8 +678,10 @@ export interface AgentAdmissionAlarm {
   maxConcurrent: number;
   at: number;
   message: string;
-  /** pi-fabric#939 round 4: one owner alarm when a held run's recovered answer cannot be saved (names the run). */
-  kind?: "recovered-answer-save-failed";
+  /** pi-fabric#939 round 4: one owner alarm when a held run's recovered answer cannot be saved (names the run).
+   * pi-fabric#1554 P2-4: one alarm when a child launches without a short TMPDIR that fits the fleet bash guard
+   * (names the first such run; at most once per caller TMPDIR per 6 h). */
+  kind?: "recovered-answer-save-failed" | "short-tmpdir-unavailable";
   runId?: string;
 }
 

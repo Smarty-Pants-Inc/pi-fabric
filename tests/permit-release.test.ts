@@ -7,7 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
-import type { AgentRunResult } from "../src/agents/types.js";
+import type { AgentAdmissionAlarm, AgentRunResult } from "../src/agents/types.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { admissionAlarmRecipient } from "../src/topology/stall-alarms.js";
@@ -29,7 +29,10 @@ const setup = (maxConcurrent = 20, onAdmissionAlarm?: (alarm: unknown) => void, 
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-permits-"));
   roots.push(root);
   const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent, budgetUsd: 0, retainRuns: true }, {
-    workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root, ...(onAdmissionAlarm ? { onAdmissionAlarm } : {}),
+    workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root,
+    // These count admission alarms. A test TMPDIR too long for a short child TMPDIR also raises the manager's
+    // short-tmpdir-unavailable alarm (pi-fabric#1554 P2-4, tests/short-child-tmpdir.test.ts); it is not one of them.
+    ...(onAdmissionAlarm ? { onAdmissionAlarm: (alarm: AgentAdmissionAlarm) => { if (alarm.kind !== "short-tmpdir-unavailable") onAdmissionAlarm(alarm); } } : {}),
     ...(onSettled ? { onSettled } : {}),
   });
   managers.push(manager);

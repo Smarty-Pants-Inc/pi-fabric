@@ -244,8 +244,10 @@ describe("actor coalesceKey for mesh events", () => {
     expect(tasks).toHaveLength(3);
     // In run order: PR 1 in the place of its first event, with the newest payload; then PR 2; then
     // the other topic's PR 1, which is not merged with this topic's.
-    expect(tasks[0]).toContain("rev-c");
-    expect(tasks[0]).not.toMatch(/rev-a|rev-b/);
+    const first = JSON.parse(tasks[0]!.slice(tasks[0]!.lastIndexOf("\n\n") + 2));
+    expect(first.payload.data.payload.revision).toBe("rev-c");
+    expect(first.coalesced.map((event: { payload: MeshEvent }) => (event.payload.data as { payload: { revision: string } }).payload.revision))
+      .toEqual(["rev-a", "rev-b", "rev-c"]);
     expect(tasks[1]).toContain("rev-x");
     expect(tasks[2]).toContain("rev-other");
   }, 30_000);
@@ -362,13 +364,18 @@ describe("actor coalesceKey for mesh events", () => {
     expect(tasks.map((task) => task.match(/rev-[a-z]+/)![0])).toEqual(["rev-b", "rev-x"]);   // PR 1 in its first place
   }, 30_000);
 
-  // Trust boundary: retroactive coalescing must carry the winning payload's authority,
-  // including after bootstrap. The reversed row also rejects an unconditional sender copy.
+  // Trust boundary: retain the newest primary's sender through bootstrap, but do not
+  // let its output principal launder foreign/external history, even when full data is omitted.
+  // All-trusted input is the counterexample: its principal must remain usable.
   it.each([
-    { label: "older trusted then newer foreign", olderTrusted: true, reverse: false },
-    { label: "older foreign then newer trusted", olderTrusted: false, reverse: false },
-    { label: "newer foreign before an older trusted sequence", olderTrusted: true, reverse: true },
-  ])("$label retains the winning sender through restore and retroactive coalescing", async ({ olderTrusted, reverse }) => {
+    { label: "older trusted then newer foreign", olderTrusted: true, newerTrusted: false, reverse: false, externalOlder: false, omitOlder: false },
+    { label: "older foreign then newer trusted", olderTrusted: false, newerTrusted: true, reverse: false, externalOlder: false, omitOlder: false },
+    { label: "newer foreign before an older trusted sequence", olderTrusted: true, newerTrusted: false, reverse: true, externalOlder: false, omitOlder: false },
+    { label: "both trusted", olderTrusted: true, newerTrusted: true, reverse: false, externalOlder: false, omitOlder: false },
+    { label: "omitted older foreign then newer trusted", olderTrusted: false, newerTrusted: true, reverse: false, externalOlder: false, omitOlder: true },
+    { label: "older external then newer trusted", olderTrusted: true, newerTrusted: true, reverse: false, externalOlder: true, omitOlder: false },
+    { label: "omitted older external then newer trusted", olderTrusted: true, newerTrusted: true, reverse: false, externalOlder: true, omitOlder: true },
+  ])("$label retains per-input authority through restore and retroactive coalescing", async ({ olderTrusted, newerTrusted, reverse, externalOlder, omitOlder }) => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-coalesce-trust-"));
     roots.push(root);
     const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
@@ -414,8 +421,12 @@ describe("actor coalesceKey for mesh events", () => {
     const foreign = senderStamp(normalizeScope({ principal: { id: "foreign-owner" }, grants: [{ resource: "mesh:coalesce.trust", actions: ["write"] }] }));
     actors.tell(actor.id, "coalesce-blocker");
     await waitFor(() => runs.length === 1);
-    const older = await mesh.publish({ topic: "coalesce.trust", from, sender: olderTrusted ? trusted : foreign, data: { key: "same", revision: "older" } });
-    const newer = await mesh.publish({ topic: "coalesce.trust", from, sender: olderTrusted ? foreign : trusted, data: { key: "same", revision: "newer" } });
+    const principal = { id: "principal:sender", binding: "voice-call" as const };
+    const older = await mesh.publish({ topic: "coalesce.trust", from, sender: olderTrusted ? trusted : foreign, principal,
+      ...(externalOlder ? { origin: "external", untrusted: true } as const : {}),
+      data: { key: "same", revision: "older", ...(omitOlder ? { detail: "x".repeat(40 * 1024) } : {}) } });
+    const newer = await mesh.publish({ topic: "coalesce.trust", from, sender: newerTrusted ? trusted : foreign, principal,
+      data: { key: "same", revision: "newer", ...(omitOlder ? { detail: "y".repeat(32 * 1024) } : {}) } });
     expect(newer.sequence).toBeGreaterThan(older.sequence);
     const admitted = reverse ? [newer, older] : [older, newer];
     // Drive the real monitor admission callback, without a watcher/timing race.
@@ -437,16 +448,27 @@ describe("actor coalesceKey for mesh events", () => {
     await waitFor(() => runs.length === 3 && actors.status(actor.id).status === "idle");
     const task = runs[2]!.task;
     const header = task.split("\n\n").find(part => part.startsWith("Fabric actor message from "))!;
-    const frame = JSON.parse(task.slice(task.lastIndexOf("\n\n") + 2)) as { source: string; payload: MeshEvent; untrusted?: true };
+    const frame = JSON.parse(task.slice(task.lastIndexOf("\n\n") + 2)) as {
+      source: string; payload: MeshEvent; untrusted?: true;
+      coalesced: Array<{ id: string; sequence: number; untrusted?: true; dataOmitted?: true }>;
+    };
     expect(frame.source).toBe("mesh:coalesce.trust");
     expect(frame.payload).toEqual(newer);
     expect(frame.payload.sender).toEqual(newer.sender);
-    if (olderTrusted) {
-      expect(header).toContain("UNTRUSTED input from a different or narrower principal");
+    expect(frame.coalesced.map(event => [event.id, event.sequence])).toEqual([older, newer].map(event => [event.id, event.sequence]));
+    if (omitOlder) expect(frame.coalesced[0]).toMatchObject({ dataOmitted: true });
+    const mixed = externalOlder || !olderTrusted || !newerTrusted;
+    if (mixed) {
+      expect(header).toContain(externalOlder ? "UNTRUSTED external input" : "UNTRUSTED input from a different or narrower principal");
       expect(frame.untrusted).toBe(true);
+      expect(frame.coalesced[externalOlder || !olderTrusted ? 0 : 1]).toMatchObject({ untrusted: true });
+      // Assert the real #runRequest output, not just a prompt warning.
+      expect(runs[2]!.provenance).not.toHaveProperty("principal");
     } else {
       expect(header).toBe("Fabric actor message from mesh:coalesce.trust:");
       expect(frame).not.toHaveProperty("untrusted");
+      expect(frame.coalesced.every(event => event.untrusted !== true)).toBe(true);
+      expect(runs[2]!.provenance?.principal).toEqual(principal);
     }
     expect(selected[0]!.sender).toEqual(newer.sender);
   });

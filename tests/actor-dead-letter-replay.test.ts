@@ -7,7 +7,7 @@ import type { AgentRunRequest, AgentRunResult } from "../src/agents/types.js";
 import { ACTOR_DEAD_LETTER_ARCHIVE_MAX_BYTES, ActorManager } from "../src/actors/manager.js";
 import { ActorMeshMonitor } from "../src/actors/mesh-monitor.js";
 import { GlobalActorRegistry } from "../src/actors/global-registry.js";
-import { DEFAULT_DEAD_LETTER_REPLAY_MAX_AGE_MS, normalizeDeadLetterReplayMaxAgeMs, type FabricActorRequest } from "../src/actors/types.js";
+import { DEFAULT_DEAD_LETTER_REPLAY_MAX_AGE_MS, normalizeDeadLetterReplayMaxAgeMs, type FabricActorActivationFilter, type FabricActorRequest } from "../src/actors/types.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore, type MeshEvent, type MeshIdentity } from "../src/mesh/store.js";
 import { normalizeScope, senderStamp } from "../src/scope.js";
@@ -33,6 +33,7 @@ type Entry = { at: number; source: string; event: MeshEvent };
 // Real registry, restart, mesh envelopes and queue checkpoint. Worker launches are held at the
 // run boundary, so assertions inspect accepted durable work without calling a model. No cleanup
 // deletes: the enclosing local probe records/retains product delete targets (#11199).
+const NOISE_FILTER: FabricActorActivationFilter = [{ id: "noise", kind: ["noise"] }];
 async function backlog(patch: Partial<FabricActorRequest> = {}, queueLimit = 16) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "dead-letter-replay-"));
   const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
@@ -457,8 +458,11 @@ describe("dead-letter replay age and current activation filter (#10630)", () => 
     expect(reloaded.status(w.actor.id).deadLetterReplayMaxAgeMs).toBe(0);
   });
 
+  // smarty-dev#16416 round 2: setActivationFilter refuses a NEW filter that would skip routed dead-letter backlog
+  // (queued-work guard). These cases test replay under a filter already set when the backlog formed: the actor is
+  // created with it, and re-applying it (which also triggers a replay) skips nothing newly.
   it("uses the current head-skip filter before replay and keeps unmatched events in order", async () => {
-    const w = await backlog();
+    const w = await backlog({ activationFilter: NOISE_FILTER });
     // Configure synchronously before the restart's queued replay microtask.
     const manager = w.open();
     await manager.setActivationFilter(w.actor.id, [{ id: "noise", kind: ["noise"] }]);
@@ -470,7 +474,7 @@ describe("dead-letter replay age and current activation filter (#10630)", () => 
   });
 
   it("archives raw stale entries before coalescing live keys by sequence, preserving FIFO and the current filter", async () => {
-    const w = await backlog({ coalesceKey: "payload.number" });
+    const w = await backlog({ coalesceKey: "payload.number", activationFilter: NOISE_FILTER });
     const now = Date.now();
     const staleAge = DEFAULT_DEAD_LETTER_REPLAY_MAX_AGE_MS + 60_000;
     // [key, mesh sequence, recorded age]: stale duplicates outrank every live event.
@@ -505,7 +509,7 @@ describe("dead-letter replay age and current activation filter (#10630)", () => 
     { ordering: "filtered entry is older", filteredSequence: 10, replayableSequence: 20 },
     { ordering: "filtered entry is newer", filteredSequence: 20, replayableSequence: 10 },
   ])("keeps same-key replayable work when a live entry is skipped ($ordering)", async ({ filteredSequence, replayableSequence }) => {
-    const w = await backlog({ coalesceKey: "payload.number" });
+    const w = await backlog({ coalesceKey: "payload.number", activationFilter: NOISE_FILTER });
     const now = Date.now();
     const filtered: Entry = {
       ...w.entries[0]!, at: now,
@@ -532,7 +536,7 @@ describe("dead-letter replay age and current activation filter (#10630)", () => 
   });
 
   it("retains eligible same-key work untouched beyond replay capacity while skipping newer noise", async () => {
-    const w = await backlog({ coalesceKey: "payload.number" }, 2);
+    const w = await backlog({ coalesceKey: "payload.number", activationFilter: NOISE_FILTER }, 2);
     const entries = w.entries.slice(6).map((entry, index) => ({
       ...entry,
       event: { ...entry.event, sequence: index + 1, kind: index === 3 ? "noise" : "work",
@@ -555,7 +559,7 @@ describe("dead-letter replay age and current activation filter (#10630)", () => 
   });
 
   it("removes and receipts every raw entry when a same-key live batch is entirely filtered", async () => {
-    const w = await backlog({ coalesceKey: "payload.number" });
+    const w = await backlog({ coalesceKey: "payload.number", activationFilter: NOISE_FILTER });
     const entries = w.entries.slice(6, 8).map(entry => ({
       ...entry, event: { ...entry.event, kind: "noise", data: { payload: { number: 77 } } },
     }));

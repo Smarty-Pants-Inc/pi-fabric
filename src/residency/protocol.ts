@@ -784,7 +784,7 @@ export interface ResidentCommandResponse {
   error?: string;
   errorCode?: "RESIDENT_ACTOR_FORBIDDEN" | "RESIDENT_COMMAND_UNSUPPORTED" | "RESIDENT_REQUEST_EXPIRED" | "FABRIC_MODEL_DENIED" | "ACTOR_SESSION_RESET_CANCELLED" | "FABRIC_ACTOR_QUEUED_WORK" | ResidentSlotErrorCode;
   /** Allowlisted FabricActorQueuedWorkError payload (smarty-dev#16416). */
-  queuedWork?: { operation: "stop" | "setActivationFilter"; actorId: string; counts: Record<string, number> };
+  queuedWork?: { operation: "stop" | "setActivationFilter" | "remove"; actorId: string; counts: Record<string, number> };
   /** Narrow native slot error payload; no arbitrary Error properties cross the wire. */
   slotError?: ResidentSlotErrorDetails;
   /** Allowlisted policy-refusal payload, never arbitrary host Error properties. */

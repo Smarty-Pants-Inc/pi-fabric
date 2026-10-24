@@ -324,6 +324,8 @@ export interface FabricActorRequeueResult {
   requeued: number;
   /** Items this call offered that the actor's activation filter skipped on arrival. */
   filtered: number;
+  /** Items a newer queued item with the same coalesce key already covers; that newer item kept its place and payload. */
+  superseded: number;
   /** Items an earlier call already offered; never offered twice. */
   alreadyRequeued: number;
   /** Items that cannot be fed again (a rejected caller's ask, a non-mesh/host/direct source). */
@@ -337,7 +339,7 @@ export interface FabricActorRequeueResult {
 export class FabricActorQueuedWorkError extends Error {
   readonly code = "FABRIC_ACTOR_QUEUED_WORK";
   constructor(
-    readonly operation: "stop" | "setActivationFilter",
+    readonly operation: "stop" | "setActivationFilter" | "remove",
     readonly actorId: string,
     readonly counts: Record<string, number>,
     message: string,
@@ -485,6 +487,8 @@ export interface FabricActorInfo extends FabricActorBatching {
   stoppedQueue?: FabricActorStoppedQueue;
   /** Only on an agents.setActivationFilter({ dropQueued: true }) result: items moved to the dead-letter queue. */
   movedToDeadLetter?: number;
+  /** Only on an agents.setActivationFilter({ dropQueued: true }) result: dead-letter backlog items now held in place. */
+  heldInDeadLetter?: number;
   scope: FabricActorStorageScope;
   name: string;
   /** sha256 (hex) of the actor's default instructions, as setInstructions stored them. */

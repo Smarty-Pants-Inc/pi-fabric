@@ -897,6 +897,8 @@ interface FabricActorRequeueResult {
   sha256: string;
   requeued: number;
   filtered: number;
+  /** Archived items a newer queued item with the same coalesce key already covers (it kept its place and payload). */
+  superseded: number;
   alreadyRequeued: number;
   skipped: Array<{ itemId: string; source: string; reason: string }>;
 }
@@ -905,6 +907,8 @@ interface FabricActorInfo extends FabricActorBatching {
   stoppedQueue?: { archive: string; sha256: string; counts: FabricActorQueueCounts };
   /** Only on agents.setActivationFilter({ dropQueued: true }): queued items moved to the dead-letter queue. */
   movedToDeadLetter?: number;
+  /** Only on agents.setActivationFilter({ dropQueued: true }): dead-letter backlog items now held in place. */
+  heldInDeadLetter?: number;
   /** Resolution marker (alias name or closest); does not replace the effective model. */
   via?: string;
   /** Canonical selection when via is present; session bindings may select a different model. */
@@ -1262,7 +1266,8 @@ interface FabricAgentsApi {
   /** Project-independent templates in the global registry. */
   actors(args: { scope: "global" }): Promise<FabricActorTemplate[]>;
   messages(args: { id: string; limit?: number }): Promise<FabricActorMessage[]>;
-  remove(args: { id: string }): Promise<{ removed: boolean; pending?: string; cleaned?: boolean }>;
+  /** Refused while the actor keeps stop archives or held dead letters, unless dropQueued: true keeps them with the removed tree. */
+  remove(args: { id: string; dropQueued?: boolean }): Promise<{ removed: boolean; pending?: string; cleaned?: boolean }>;
   /** Drop an actor's mailbox history without stopping the actor. */
   clearMessages(args: { id: string }): Promise<FabricActorInfo>;
   /** Fresh actor session, archived history and mailbox kept. The owning Main requests resident reset directly; an admitted activation settles at the fenced boundary while other commands remain serviceable. Explicit stop cancels work and any pending reset; it is not preparation for repair. */

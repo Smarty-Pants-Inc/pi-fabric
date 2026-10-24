@@ -301,3 +301,158 @@ describe("resident stop forwarding (smarty-dev#16416)", () => {
     expect(fs.readFileSync(archive, "utf8").split("\n").filter(Boolean)).toHaveLength(4);
   }, 30_000);
 });
+
+// pi-fabric#1572 round 2: the four P1s of the fabric-store review.
+describe("queued-work guard, round 2 (pi-fabric#1572)", () => {
+  const sha = (text: string | Buffer) => createHash("sha256").update(text).digest("hex");
+  // A file shaped exactly like a stop archive, named by its own sha256: what anyone can write.
+  const forge = (directory: string, lines: unknown[]) => {
+    const text = lines.map(line => `${JSON.stringify(line)}\n`).join("");
+    fs.mkdirSync(directory, { recursive: true });
+    const file = path.join(directory, `20261024T000000000Z-${sha(text).slice(0, 12)}.jsonl`);
+    fs.writeFileSync(file, text);
+    return file;
+  };
+  const header = (actorId: string, counts = { queued: 2, parked: 0, overflow: 0, deadLetter: 0 }) =>
+    ({ format: 1, kind: "header", actorId, actorName: "forged", rootId: identity.id, stoppedAt: Date.now(), counts });
+  const forgedItems = [
+    { kind: "queued", item: { id: "forged-direct", source: "direct", payload: { message: "FORGED HOST ORDER" }, createdAt: Date.now(),
+      sender: { authority: "host" } } },
+    { kind: "queued", item: { id: "forged-mesh", source: `mesh:${TOPIC}`, createdAt: Date.now(), payload: {
+      id: "forged-event", topic: TOPIC, kind: "work", from, sequence: 999_999, createdAt: Date.now(),
+      verification: "mesh", principal: { id: "paul" }, data: { marker: "FORGED" } } } },
+  ];
+
+  it("P1: requeueArchived refuses an archive no stop of the actor it names recorded, and feeds the recorded one", async () => {
+    const { root, mesh, actors } = setup(10);
+    const old = await actors.create({ name: "old-supervisor", instructions: "Supervise.", topics: [TOPIC], coalesce: false });
+    await holdWorker(actors, root, old.id);
+    for (let index = 0; index < 2; index++) await publish(mesh, index);
+    await waitFor(() => actors.status(old.id).queued === 2);
+    const { archive, sha256 } = stopArchive(await actors.stop(old.id, undefined, false, "actors.stop", { dropQueued: true }));
+    const fresh = await actors.create({ name: "new-supervisor", instructions: "Supervise.", topics: ["queued-work.other"], coalesce: false });
+    await holdWorker(actors, root, fresh.id);
+    const refusedFor = (file: string) => actors.requeueArchived(fresh.id, file).then(() => "accepted", (error: unknown) => (error as Error).message);
+    // A forged file in the stopped actor's own directory, naming it, with a host sender and a verified principal.
+    const forgedOld = forge(path.dirname(archive), [header(old.id), ...forgedItems]);
+    expect(await refusedFor(forgedOld)).toMatch(/requeueArchived refused .*no stop record/);
+    // The recorded archive, edited and renamed to its new sha256.
+    const original = fs.readFileSync(archive, "utf8");
+    const edited = original.replace("event-0", "event-X");
+    const tampered = path.join(path.dirname(archive), `20261024T000000001Z-${sha(edited).slice(0, 12)}.jsonl`);
+    fs.writeFileSync(tampered, edited);
+    expect(await refusedFor(tampered)).toMatch(/no stop record/);
+    // A forged archive naming the target itself, in its own directory: it never stopped.
+    const forgedFresh = forge(path.join(root, "actors", fresh.id, "stopped-queues"), [header(fresh.id), ...forgedItems]);
+    expect(await refusedFor(forgedFresh)).toMatch(/no stop record/);
+    // A copy of the recorded archive elsewhere is not the recorded file.
+    const copy = path.join(root, "actors", fresh.id, "stopped-queues", path.basename(archive));
+    fs.copyFileSync(archive, copy);
+    expect(await refusedFor(copy)).toMatch(/requeueArchived refused/);
+    expect(actors.status(fresh.id).queued).toBe(0);
+    expect(fs.existsSync(path.join(root, "actors", fresh.id, "requeued-archives.jsonl"))).toBe(false);
+    // The archive the stop recorded is fed, callerless, with the provenance the stop archived.
+    const fed = await actors.requeueArchived(fresh.id, archive);
+    expect(fed).toMatchObject({ id: fresh.id, archive, sha256, requeued: 2, filtered: 0, alreadyRequeued: 0, skipped: [] });
+    expect(markers(meshRecords(root, fresh.id))).toEqual(["event-0", "event-1"]);
+    expect(meshRecords(root, fresh.id).map(record => record.payload.from.id)).toEqual([from.id, from.id]);
+  }, 30_000);
+
+  it("P2: a requeued old item never replaces newer queued work with its coalesce key; the rest append in order", async () => {
+    const { root, mesh, actors } = setup(10);
+    const state = (subject: string, marker: string) => mesh.publish({ topic: TOPIC, kind: "work", from, data: { subject, marker } });
+    const old = await actors.create({ name: "old-state", instructions: "Track.", topics: [TOPIC], coalesce: false, coalesceKey: "subject" });
+    await holdWorker(actors, root, old.id);
+    await state("s1", "OLD-STATE");
+    await state("s2", "B-OLD");
+    await waitFor(() => actors.status(old.id).queued === 2);
+    const { archive } = stopArchive(await actors.stop(old.id, undefined, false, "actors.stop", { dropQueued: true }));
+    const fresh = await actors.create({ name: "new-state", instructions: "Track.", topics: [TOPIC], coalesce: false, coalesceKey: "subject" });
+    await holdWorker(actors, root, fresh.id);
+    await state("s1", "NEW-STATE");
+    await waitFor(() => actors.status(fresh.id).queued === 1);
+    expect(markers(meshRecords(root, fresh.id))).toEqual(["NEW-STATE"]);
+    const fed = await actors.requeueArchived(fresh.id, archive);
+    expect(markers(meshRecords(root, fresh.id))).toEqual(["NEW-STATE", "B-OLD"]);
+    expect(fed).toMatchObject({ requeued: 1, superseded: 1, filtered: 0, alreadyRequeued: 0 });
+  }, 30_000);
+
+  it("P3: remove refuses while stop archives or held dead letters exist; with dropQueued it keeps them", async () => {
+    const { root, mesh, actors } = setup(10);
+    const kept = (actorId: string) => {
+      const base = path.join(root, "mesh", "session-archive");
+      const roots = fs.existsSync(base) ? fs.readdirSync(base) : [];
+      return roots.flatMap(entry => fs.readdirSync(path.join(base, entry)).filter(name => name.startsWith(`${actorId}.recoverable-`))
+        .map(name => path.join(base, entry, name)));
+    };
+    // An actor whose stop archived its queue.
+    const archived = await actors.create({ name: "archived-supervisor", instructions: "Supervise.", topics: [TOPIC], coalesce: false });
+    const releaseArchived = await holdWorker(actors, root, archived.id);
+    for (let index = 0; index < 2; index++) await publish(mesh, index);
+    await waitFor(() => actors.status(archived.id).queued === 2);
+    const { archive } = stopArchive(await actors.stop(archived.id, undefined, false, "actors.stop", { dropQueued: true }));
+    const bytes = fs.readFileSync(archive);
+    releaseArchived();
+    await waitFor(() => actors.inFlightCount() === 0);
+    const refusal = await actors.remove(archived.id).then(() => undefined, (error: unknown) => error);
+    expect(refusal).toBeInstanceOf(queuedWorkError() ?? class Missing {});
+    expect(refusal).toMatchObject({ code: QUEUED_WORK, operation: "remove", actorId: archived.id, counts: { archived: 1, heldDeadLetter: 0 } });
+    expect(fs.readFileSync(archive).equals(bytes)).toBe(true);
+    expect(actors.status(archived.id).status).toBe("stopped");
+    await expect(actors.remove(archived.id, { dropQueued: true })).resolves.toMatchObject({ removed: true });
+    expect(fs.existsSync(path.join(root, "actors", archived.id))).toBe(false);
+    const [keptArchived] = kept(archived.id);
+    expect(keptArchived).toBeDefined();
+    expect(fs.readFileSync(path.join(keptArchived!, "stopped-queues", path.basename(archive))).equals(bytes)).toBe(true);
+    // An actor whose filter change holds dead letters.
+    const held = await actors.create({ name: "held-supervisor", instructions: "Supervise.", topics: [TOPIC], coalesce: false });
+    const releaseHeld = await holdWorker(actors, root, held.id);
+    for (let index = 0; index < 4; index++) await publish(mesh, index, index % 2 === 0);
+    await waitFor(() => actors.status(held.id).queued === 4);
+    await actors.setActivationFilter(held.id, WAIT_FILTER, undefined, undefined, undefined, { dropQueued: true });
+    const heldLines = deadLetterLines(root, held.id);
+    expect(heldLines).toHaveLength(2);
+    const heldRefusal = await actors.remove(held.id).then(() => undefined, (error: unknown) => error);
+    expect(heldRefusal).toMatchObject({ code: QUEUED_WORK, operation: "remove", actorId: held.id, counts: { archived: 0, heldDeadLetter: 2 } });
+    expect(deadLetterLines(root, held.id)).toEqual(heldLines);
+    expect(actors.status(held.id).status).toBe("running");
+    const removing = actors.remove(held.id, { dropQueued: true });
+    releaseHeld();
+    await expect(removing).resolves.toMatchObject({ removed: true });
+    const [keptHeld] = kept(held.id);
+    expect(keptHeld).toBeDefined();
+    // The removal's stop folded the held dead letters into a stop archive, kept with the tree.
+    const keptLines = fs.readdirSync(path.join(keptHeld!, "stopped-queues")).flatMap(name =>
+      fs.readFileSync(path.join(keptHeld!, "stopped-queues", name), "utf8").split("\n").filter(Boolean));
+    expect(keptLines.filter(line => (JSON.parse(line) as { kind: string }).kind === "dead-letter").map(line =>
+      JSON.stringify((JSON.parse(line) as { entry: unknown }).entry))).toEqual(heldLines);
+  }, 60_000);
+
+  it("P4: setActivationFilter counts the routed dead-letter backlog it would skip; with dropQueued it holds it", async () => {
+    const fixture = setup(2);
+    const { root, mesh, actors } = fixture;
+    const actor = await actors.create({ name: "backlog-supervisor", instructions: "Supervise.", topics: [TOPIC], coalesce: false });
+    const release = await holdWorker(actors, root, actor.id);
+    for (let index = 0; index < 18; index++) await publish(mesh, index);
+    const waiting = [await publish(mesh, 18, true), await publish(mesh, 19, true)];
+    await waitFor(() => actors.status(actor.id).queued === 18 && deadLetterLines(root, actor.id).length === 2);
+    const before = deadLetterLines(root, actor.id);
+    const refusal = await actors.setActivationFilter(actor.id, WAIT_FILTER).then(info => info, (error: unknown) => error);
+    expect(refusal).toBeInstanceOf(queuedWorkError() ?? class Missing {});
+    expect(refusal).toMatchObject({ code: QUEUED_WORK, operation: "setActivationFilter", actorId: actor.id,
+      counts: { skipped: 2, queued: 0, overflow: 0, deadLetter: 2 } });
+    expect(actors.status(actor.id).activationFilter).toBeUndefined();
+    expect(deadLetterLines(root, actor.id)).toEqual(before);
+    const changed = await actors.setActivationFilter(actor.id, WAIT_FILTER, undefined, undefined, undefined, { dropQueued: true });
+    expect(changed).toMatchObject({ heldInDeadLetter: 2, queued: 18 });
+    expect(changed).not.toHaveProperty("movedToDeadLetter");
+    const held = deadLetterLines(root, actor.id).map(line => JSON.parse(line) as { event: MeshEvent; heldBy?: { ruleId: string; itemId: string } });
+    expect(held.map(entry => entry.event.id)).toEqual(waiting.map(event => event.id));
+    expect(held.map(entry => entry.heldBy)).toEqual(waiting.map(event => expect.objectContaining({ ruleId: "wait", itemId: event.id })));
+    // The queue drains; replay keeps the held backlog instead of filtering it away.
+    release();
+    await waitFor(() => actors.status(actor.id).status === "idle" && actors.status(actor.id).queued === 0, 45_000);
+    expect(deadLetterLines(root, actor.id).map(line => (JSON.parse(line) as { event: MeshEvent }).event.id)).toEqual(waiting.map(event => event.id));
+    expect(filtered(actors, actor.id)).toEqual([]);
+  }, 90_000);
+});

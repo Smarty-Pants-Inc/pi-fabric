@@ -1018,12 +1018,13 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
   {
     name: "remove",
     description:
-      'Stop and remove a persistent actor. Default scope "project" removes a live project actor; scope "global" removes a project-independent template from the global registry.',
+      'Stop and remove a persistent actor. Default scope "project" removes a live project actor; scope "global" removes a project-independent template from the global registry. Refused while the actor keeps stop archives or held dead letters, unless dropQueued: true, which archives its remaining work and keeps all of it with the removed tree.',
     inputSchema: {
       type: "object",
       properties: {
         id: { type: "string" },
         scope: { type: "string", enum: ["project", "global"] },
+        dropQueued: { type: "boolean" },
       },
       required: ["id"],
       additionalProperties: false,

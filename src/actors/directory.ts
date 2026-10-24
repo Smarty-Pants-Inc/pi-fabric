@@ -143,7 +143,8 @@ export class ActorDirectory extends ActorManager {
         // Cross-scope predecessor removal is part of this create's mutation too.
         for (const actor of sameName.filter((actor) => actor.scope !== scope)) {
           options.checkActive?.();
-          await this.remove(actor.id, { wait: false });
+          // smarty-dev#16416 round 2: the replaced actor's archived and held work is kept with its tree, not refused.
+          await this.remove(actor.id, { wait: false, dropQueued: true });
         }
       },
     };

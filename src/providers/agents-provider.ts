@@ -1831,6 +1831,7 @@ export class AgentsProvider implements FabricProvider {
         return this.actorManager.resetSession(id, { beforeCommit: checkCommit });
       }
       case "remove": {
+        if (args.dropQueued !== undefined && typeof args.dropQueued !== "boolean") throw new Error("dropQueued must be a boolean");
         if (args.scope === "global") return this.globalActors.remove(String(args.id));
         // Foreign terminal history has its own retirement path; never widen removeActor.
         const retired = await this.actorManager.retireSessionOrphan(String(args.id), () => {
@@ -1862,7 +1863,7 @@ export class AgentsProvider implements FabricProvider {
             `${template.name} (${template.id}) is a global template: remove it with agents.remove({ id, scope: "global" })`);
         }
         const { actor, participant } = target;
-        if (actor && this.actorManager.owns(actor.id)) return this.actorManager.remove(actor.id);
+        if (actor && this.actorManager.owns(actor.id)) return this.actorManager.remove(actor.id, args.dropQueued === true ? { dropQueued: true } : {});
         const resident = await this.#residentActorOwner(actor?.id ?? participant!.id, context.signal);
         if (!resident) throw new Error("Only the owning root can remove this actor");
         return resident.client.removeActor(resident.id, context.signal);

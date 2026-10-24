@@ -17,8 +17,10 @@ count, and nothing changes. To stop it anyway, add `--drop-queued` (stop only). 
 deleted, into one archive file in the actor's directory, `<actor dir>/stopped-queues/<stamp>-<sha256-12>.jsonl`.
 The printed result carries `actor.stoppedQueue` with the archive path, its full sha256 and the counts. The actor's
 message log gets a `MOVED-TO <path>` line with the same sha256. To restore the work, recreate the actor and call
-`agents.requeueArchived({ id: <new actor>, archive: <path> })` from its root's Main (see agents.md). `remove`
-keeps its own semantics.
+`agents.requeueArchived({ id: <new actor>, archive: <path> })` from its root's Main (see agents.md). Only an
+archive recorded in the stopped actor's message log is accepted, so requeue before you remove that actor. `remove`
+refuses an actor that has stop archives or held dead letters; `agents.remove({ id, dropQueued: true })` keeps them
+with the removed tree.
 
 ## Offline remove (dead resident host): `--main-stopped` is an operator attestation (smarty-dev#7817)
 
